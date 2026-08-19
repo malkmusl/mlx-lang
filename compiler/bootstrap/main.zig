@@ -40,4 +40,6 @@ test {
     _ = @import("source_manager.zig");
     _ = @import("diagnostics.zig");
     _ = @import("lexer.zig");
+    _ = @import("ast.zig");
+    _ = @import("parser.zig");
 }
