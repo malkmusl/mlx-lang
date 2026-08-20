@@ -11,6 +11,7 @@ pub const LirBuilder = struct {
     sema: *Sema,
     lir: Lir,
     current_block: ?u32,
+    var_addresses: std.StringHashMap(u32),
 
     pub fn init(allocator: std.mem.Allocator, sema: *Sema) LirBuilder {
         return .{
@@ -18,10 +19,12 @@ pub const LirBuilder = struct {
             .sema = sema,
             .lir = Lir.init(allocator),
             .current_block = null,
+            .var_addresses = std.StringHashMap(u32).init(allocator),
         };
     }
 
     pub fn deinit(self: *LirBuilder) void {
+        self.var_addresses.deinit();
         self.lir.deinit();
     }
 
@@ -109,7 +112,33 @@ pub const LirBuilder = struct {
                 });
                 return result;
             },
-            .const_decl, .var_decl => {
+            .const_decl => {
+                const name_tok_idx = node.data.lhs;
+                const expr_node = node.data.rhs;
+                
+                const tok = self.sema.ast_tree.tokens[name_tok_idx];
+                const src = self.sema.diags.source_manager.getFile(0).?.content;
+                const ident_name = src[tok.start..tok.end];
+                
+                const expr_inst = (try self.lowerNode(expr_node)) orelse return null;
+                const type_id = self.sema.node_types.get(node_idx) orelse 0;
+                
+                const addr_inst = try self.emitInst(.{
+                    .opcode = .addr,
+                    .type_id = type_id,
+                    .data = .{ .addr = name_tok_idx },
+                });
+                
+                try self.var_addresses.put(ident_name, addr_inst);
+                
+                _ = try self.emitInst(.{
+                    .opcode = .store,
+                    .type_id = type_id,
+                    .data = .{ .store = .{ .ptr = addr_inst, .val = expr_inst } },
+                });
+                return expr_inst;
+            },
+            .var_decl => {
                 const type_id = self.sema.node_types.get(node_idx) orelse return null;
                 const rhs_inst = try self.lowerNode(node.data.rhs) orelse return null;
 
@@ -131,11 +160,17 @@ pub const LirBuilder = struct {
             },
             .identifier => {
                 const type_id = self.sema.node_types.get(node_idx) orelse return null;
-                // Placeholder load until we wire up symbol resolution to SSA
+                
+                const tok = self.sema.ast_tree.tokens[self.sema.ast_tree.nodes.get(node_idx).main_token];
+                const src = self.sema.diags.source_manager.getFile(0).?.content;
+                const ident_name = src[tok.start..tok.end];
+                
+                const addr_inst = self.var_addresses.get(ident_name) orelse return null;
+                
                 result = try self.emitInst(.{
                     .opcode = .load,
                     .type_id = type_id,
-                    .data = .{ .load = .{ .ptr = 0 } },
+                    .data = .{ .load = .{ .ptr = addr_inst } },
                 });
                 return result;
             },

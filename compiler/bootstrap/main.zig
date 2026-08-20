@@ -104,6 +104,13 @@ pub fn main(init: std.process.Init) !void {
         lir_builder.printLir();
 
         std.debug.print("AST has {d} nodes\n", .{ast.nodes.len});
+
+        var x86_gen = @import("x86_64_gen.zig").X86Gen.init(allocator, &lir_builder.lir);
+        defer x86_gen.deinit();
+        try x86_gen.generate(out);
+        
+        try stdout_file_writer.flush();
+
         std.debug.print("Done.\n", .{});
     } else {
         std.debug.print("Parsing failed with {d} error(s).\n", .{ engine.error_count });
