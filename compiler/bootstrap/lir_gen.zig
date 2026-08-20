@@ -12,6 +12,7 @@ pub const LirBuilder = struct {
     lir: Lir,
     current_block: ?u32,
     var_addresses: std.StringHashMap(u32),
+    param_counter: u32 = 0,
 
     pub fn init(allocator: std.mem.Allocator, sema: *Sema) LirBuilder {
         return .{
@@ -160,6 +161,15 @@ pub const LirBuilder = struct {
             },
             .identifier => {
                 const type_id = self.sema.node_types.get(node_idx) orelse return null;
+                const type_data = self.sema.type_pool.types.items[type_id];
+                
+                if (type_data.data == .function) {
+                    return try self.emitInst(.{
+                        .opcode = .func_sym,
+                        .type_id = type_id,
+                        .data = .{ .func_sym = node_idx },
+                    });
+                }
                 
                 const tok = self.sema.ast_tree.tokens[self.sema.ast_tree.nodes.get(node_idx).main_token];
                 const src = self.sema.diags.source_manager.getFile(0).?.content;
@@ -250,13 +260,94 @@ pub const LirBuilder = struct {
                 return null;
             },
             .fn_decl => {
+                const proto_idx = node.data.lhs;
+                const body = node.data.rhs;
+                
                 const fn_block = try self.newBlock();
                 self.current_block = fn_block;
-                const body = node.data.rhs;
+                self.param_counter = 0;
+                
+                const proto_node = self.sema.ast_tree.nodes.get(proto_idx);
+                _ = try self.emitInst(.{
+                    .opcode = .label,
+                    .type_id = 0,
+                    .data = .{ .label = proto_node.main_token }, // We pass the token index of the identifier!
+                });
+                
+                _ = try self.lowerNode(proto_idx);
                 _ = try self.lowerNode(body);
                 _ = try self.emitInst(.{ .opcode = .ret, .type_id = 0, .data = .{ .ret = null } });
-                self.current_block = 0; // return to root block
+                self.current_block = null; // return to root block
                 return null;
+            },
+            .fn_proto => {
+                const extra_start = node.data.lhs;
+                const extra_len = node.data.rhs;
+                
+                var i: u32 = 1;
+                while (i < extra_len) : (i += 1) {
+                    const param_idx = self.sema.ast_tree.extra_data[extra_start + i];
+                    _ = try self.lowerNode(param_idx);
+                }
+                return null;
+            },
+            .param_decl => {
+                const name_tok_idx = node.data.lhs;
+                const type_id = self.sema.node_types.get(node_idx) orelse 0;
+                
+                const param_inst = try self.emitInst(.{
+                    .opcode = .param,
+                    .type_id = type_id,
+                    .data = .{ .param = self.param_counter },
+                });
+                self.param_counter += 1;
+                
+                const addr_inst = try self.emitInst(.{
+                    .opcode = .addr,
+                    .type_id = type_id,
+                    .data = .{ .addr = name_tok_idx },
+                });
+                
+                _ = try self.emitInst(.{
+                    .opcode = .store,
+                    .type_id = type_id,
+                    .data = .{ .store = .{ .ptr = addr_inst, .val = param_inst } },
+                });
+                
+                const tok = self.sema.ast_tree.tokens[name_tok_idx];
+                const src = self.sema.diags.source_manager.getFile(0).?.content;
+                const ident_name = src[tok.start..tok.end];
+                try self.var_addresses.put(ident_name, addr_inst);
+                
+                return null;
+            },
+            .call => {
+                const target = node.data.lhs;
+                const extra_start = node.data.rhs;
+                
+                const target_inst = try self.lowerNode(target);
+                
+                const num_args = self.sema.ast_tree.extra_data[extra_start];
+                
+                const args_start = self.lir.extra_data.items.len;
+                var i: u32 = 0;
+                while (i < num_args) : (i += 1) {
+                    const arg_node = self.sema.ast_tree.extra_data[extra_start + 1 + i];
+                    const arg_inst = try self.lowerNode(arg_node);
+                    try self.lir.extra_data.append(self.allocator, arg_inst.?);
+                }
+                
+                const type_id = self.sema.node_types.get(node_idx) orelse 0;
+                
+                return try self.emitInst(.{
+                    .opcode = .call,
+                    .type_id = type_id,
+                    .data = .{ .call = .{ 
+                        .func = target_inst orelse 0, 
+                        .args_start = @as(u32, @intCast(args_start)), 
+                        .args_count = num_args 
+                    }},
+                });
             },
             .return_stmt => {
                 const expr = node.data.rhs;

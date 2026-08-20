@@ -105,7 +105,7 @@ pub fn main(init: std.process.Init) !void {
 
         std.debug.print("AST has {d} nodes\n", .{ast.nodes.len});
 
-        var x86_gen = @import("x86_64_gen.zig").X86Gen.init(allocator, &lir_builder.lir);
+        var x86_gen = @import("x86_64_gen.zig").X86Gen.init(allocator, &lir_builder.lir, ast, source_manager.getFile(0).?.content);
         defer x86_gen.deinit();
         try x86_gen.generate(out);
         
@@ -128,4 +128,5 @@ test {
     _ = @import("sema.zig");
     _ = @import("lir.zig");
     _ = @import("lir_gen.zig");
+    _ = @import("abi.zig");
 }

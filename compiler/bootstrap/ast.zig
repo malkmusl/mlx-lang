@@ -30,6 +30,8 @@ pub const Node = struct {
         
         // Declarations
         fn_decl,
+        fn_proto,
+        param_decl,
         var_decl,
         const_decl,
         test_decl,

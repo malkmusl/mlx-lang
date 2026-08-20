@@ -80,12 +80,10 @@ pub const Sema = struct {
             },
             .identifier => {
                 const tok = self.ast_tree.tokens[node.main_token];
-                // In a real compiler we'd look up the string. For now we use the token index as a unique ID 
-                // or we extract the string from source. We'll use a hack to pass the name.
-                // Actually, let's just use the string from the source manager.
                 const src = self.diags.source_manager.getFile(0).?.content;
                 const ident_name = src[tok.start..tok.end];
                 
+                // First check scope
                 if (scope.get(ident_name)) |sym| {
                     // Enforce move semantics
                     if (self.local_states.get(sym.decl_node)) |state| {
@@ -95,10 +93,52 @@ pub const Sema = struct {
                     }
                     try self.node_types.put(node_idx, sym.type_id);
                     return sym.type_id;
-                } else {
-                    try self.reportError(tok.start, "Use of undeclared identifier");
-                    return 0;
                 }
+                
+                // Then check builtin types
+                const builtin_prim: ?Type.Primitive = if (std.mem.eql(u8, ident_name, "comptime_int"))
+                    .comptime_int_type
+                else if (std.mem.eql(u8, ident_name, "comptime_float"))
+                    .comptime_float_type
+                else if (std.mem.eql(u8, ident_name, "bool"))
+                    .bool_type
+                else if (std.mem.eql(u8, ident_name, "f32"))
+                    .f32_type
+                else if (std.mem.eql(u8, ident_name, "f64"))
+                    .f64_type
+                else if (std.mem.eql(u8, ident_name, "void"))
+                    .void_type
+                else if (std.mem.eql(u8, ident_name, "type"))
+                    .type_type
+                else if (std.mem.eql(u8, ident_name, "anytype"))
+                    .anytype_type
+                else if (std.mem.eql(u8, ident_name, "anyopaque"))
+                    .anyopaque_type
+                else
+                    null;
+                
+                if (builtin_prim) |prim| {
+                    const ty = try self.type_pool.intern(.{ .primitive = prim }, .copyable);
+                    try self.node_types.put(node_idx, ty);
+                    return ty;
+                }
+                
+                // Check builtin integer types: u8, i8, u16, i16, u32, i32, u64, i64, usize, isize
+                if (ident_name.len >= 2) {
+                    const signed = ident_name[0] == 'i';
+                    const unsigned = ident_name[0] == 'u';
+                    if ((signed or unsigned) and ident_name.len <= 5) {
+                        const bits = std.fmt.parseInt(u16, ident_name[1..], 10) catch 0;
+                        if (bits > 0 and bits <= 128) {
+                            const ty = try self.type_pool.intern(.{ .integer = .{ .is_signed = signed, .bits = bits } }, .copyable);
+                            try self.node_types.put(node_idx, ty);
+                            return ty;
+                        }
+                    }
+                }
+                
+                try self.reportError(tok.start, "Use of undeclared identifier");
+                return 0;
             },
             .const_decl, .var_decl => {
                 const ident_tok = self.ast_tree.tokens[node.data.lhs];
@@ -246,12 +286,92 @@ pub const Sema = struct {
                 try self.node_types.put(node_idx, 0); // while evaluates to void
                 return 0;
             },
-            .fn_decl => {
-                const body = node.data.rhs;
-                const body_type = try self.analyzeNode(body, scope);
+            .fn_proto => {
+                const extra_start = node.data.lhs;
+                const extra_len = node.data.rhs;
                 
-                try self.node_types.put(node_idx, body_type);
-                return body_type;
+                const ret_type_node = self.ast_tree.extra_data[extra_start];
+                var ret_type: Type.Id = 0;
+                if (ret_type_node != std.math.maxInt(u32)) {
+                    ret_type = try self.analyzeNode(ret_type_node, scope);
+                }
+                
+                var i: u32 = 1;
+                while (i < extra_len) : (i += 1) {
+                    const param_idx = self.ast_tree.extra_data[extra_start + i];
+                    const param_node = self.ast_tree.nodes.get(param_idx);
+                    
+                    const param_type_node = param_node.data.rhs;
+                    const param_type = try self.analyzeNode(param_type_node, scope);
+                    
+                    const param_name_tok = param_node.data.lhs;
+                    const tok = self.ast_tree.tokens[param_name_tok];
+                    const src = self.diags.source_manager.getFile(0).?.content;
+                    const name = src[tok.start..tok.end];
+                    
+                    try scope.put(name, .{
+                        .name = name,
+                        .decl_node = param_idx,
+                        .type_id = param_type,
+                        .is_const = true,
+                    });
+                    
+                    try self.local_states.put(param_idx, .initialized);
+                    try self.node_types.put(param_idx, param_type);
+                }
+                
+                const fn_type = try self.type_pool.intern(.{ .function = .{ .ret_type = ret_type } }, .copyable);
+                try self.node_types.put(node_idx, fn_type);
+                return fn_type;
+            },
+            .fn_decl => {
+                var child_scope = Scope.init(self.allocator, scope);
+                defer child_scope.deinit();
+                
+                const proto = node.data.lhs;
+                const body = node.data.rhs;
+                
+                const fn_type = try self.analyzeNode(proto, &child_scope);
+                const body_type = try self.analyzeNode(body, &child_scope);
+                _ = body_type; // For now
+                
+                const proto_node = self.ast_tree.nodes.get(proto);
+                const name_tok_idx = proto_node.main_token;
+                const fn_tok = self.ast_tree.tokens[name_tok_idx];
+                const fn_src = self.diags.source_manager.getFile(0).?.content;
+                const fn_name = fn_src[fn_tok.start..fn_tok.end];
+                
+                try scope.put(fn_name, .{
+                    .name = fn_name,
+                    .decl_node = node_idx,
+                    .type_id = fn_type,
+                    .is_const = true,
+                });
+                
+                try self.node_types.put(node_idx, fn_type);
+                return fn_type;
+            },
+            .call => {
+                const target = node.data.lhs;
+                const extra_start = node.data.rhs;
+                
+                const target_type_id = try self.analyzeNode(target, scope);
+                
+                const num_args = self.ast_tree.extra_data[extra_start];
+                var i: u32 = 0;
+                while (i < num_args) : (i += 1) {
+                    const arg_node = self.ast_tree.extra_data[extra_start + 1 + i];
+                    _ = try self.analyzeNode(arg_node, scope);
+                }
+                
+                const target_type = self.type_pool.types.items[target_type_id];
+                var ret_type: Type.Id = 0;
+                if (target_type.data == .function) {
+                    ret_type = target_type.data.function.ret_type;
+                }
+                
+                try self.node_types.put(node_idx, ret_type);
+                return ret_type;
             },
             .return_stmt => {
                 const expr = node.data.rhs;

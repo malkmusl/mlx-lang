@@ -60,6 +60,7 @@ pub const Type = struct {
         @"union",
         tuple,
         error_union,
+        function,
     };
 
     pub const Data = union(Tag) {
@@ -73,6 +74,7 @@ pub const Type = struct {
         @"union": Aggregate,
         tuple: Aggregate,
         error_union: struct { err_set: Id, payload: Id },
+        function: struct { ret_type: Id },
     };
 
     data: Data,

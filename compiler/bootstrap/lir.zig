@@ -17,6 +17,8 @@ pub const Opcode = enum {
     load,
     store,
     addr,
+    func_sym,
+    label,
     
     // Control Flow
     br,
@@ -24,6 +26,7 @@ pub const Opcode = enum {
     call,
     ret,
     unreachable_inst,
+    param,
 };
 
 pub const Inst = struct {
@@ -43,12 +46,15 @@ pub const Inst = struct {
         load: struct { ptr: Index },
         store: struct { ptr: Index, val: Index },
         addr: u32, // ID of local variable/symbol
+        func_sym: u32, // ID of function identifier node
+        label: u32, // ID of function identifier node
         
         br: struct { dest: BasicBlock.Index },
         condbr: struct { cond: Index, true_dest: BasicBlock.Index, false_dest: BasicBlock.Index },
         call: struct { func: Index, args_start: u32, args_count: u32 },
         ret: ?Index,
         unreachable_inst: void,
+        param: u32, // Parameter index
     };
 
     opcode: Opcode,
@@ -76,12 +82,14 @@ pub const Lir = struct {
     allocator: std.mem.Allocator,
     insts: std.ArrayList(Inst),
     blocks: std.ArrayList(BasicBlock),
+    extra_data: std.ArrayList(u32), // Stores argument lists, etc.
 
     pub fn init(allocator: std.mem.Allocator) Lir {
         return .{
             .allocator = allocator,
             .insts = std.ArrayList(Inst).empty,
             .blocks = std.ArrayList(BasicBlock).empty,
+            .extra_data = std.ArrayList(u32).empty,
         };
     }
 
@@ -91,5 +99,6 @@ pub const Lir = struct {
         }
         self.blocks.deinit(self.allocator);
         self.insts.deinit(self.allocator);
+        self.extra_data.deinit(self.allocator);
     }
 };

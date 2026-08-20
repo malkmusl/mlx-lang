@@ -181,6 +181,7 @@ pub const Parser = struct {
             try self.reportError(2002, "Expected identifier after fn");
             return null;
         }
+        const name_tok = self.index;
         self.index += 1;
         
         if (self.tokens[self.index].tag != .l_paren) {
@@ -189,15 +190,66 @@ pub const Parser = struct {
         }
         self.index += 1;
         
+        var param_nodes = std.ArrayList(Node.Index).empty;
+        defer param_nodes.deinit(self.allocator);
+        
         while (self.index < self.tokens.len and self.tokens[self.index].tag != .r_paren) {
-            self.index += 1; // dummy parameter parse
+            const param_name_tok = self.index;
+            if (self.tokens[self.index].tag != .ident) {
+                try self.reportError(2005, "Expected parameter name");
+                return null;
+            }
+            self.index += 1;
+            
+            if (self.tokens[self.index].tag != .colon) {
+                try self.reportError(2006, "Expected ':' after parameter name");
+                return null;
+            }
+            self.index += 1;
+            
+            const type_expr = try self.parseExpr(0);
+            if (type_expr == null) return null;
+            
+            try self.nodes.append(self.allocator, .{
+                .tag = .param_decl,
+                .main_token = param_name_tok,
+                .data = .{ .lhs = param_name_tok, .rhs = type_expr.? },
+            });
+            try param_nodes.append(self.allocator, @as(u32, @intCast(self.nodes.len - 1)));
+            
+            if (self.tokens[self.index].tag == .comma) {
+                self.index += 1;
+            } else {
+                break;
+            }
         }
-        if (self.tokens[self.index].tag == .r_paren) self.index += 1;
+        if (self.tokens[self.index].tag == .r_paren) {
+            self.index += 1;
+        } else {
+            try self.reportError(2007, "Expected ')' after parameters");
+            return null;
+        }
         
         // return type
+        var ret_type: Node.Index = std.math.maxInt(u32);
         if (self.tokens[self.index].tag != .l_brace) {
-            _ = try self.parseExpr(0);
+            const rt = try self.parseExpr(0);
+            if (rt) |r| {
+                ret_type = r;
+            }
         }
+        
+        const extra_start = @as(u32, @intCast(self.extra_data.items.len));
+        try self.extra_data.append(self.allocator, ret_type);
+        try self.extra_data.appendSlice(self.allocator, param_nodes.items);
+        const extra_len = @as(u32, @intCast(self.extra_data.items.len - extra_start));
+        
+        try self.nodes.append(self.allocator, .{
+            .tag = .fn_proto,
+            .main_token = name_tok,
+            .data = .{ .lhs = extra_start, .rhs = extra_len },
+        });
+        const proto_idx = @as(u32, @intCast(self.nodes.len - 1));
         
         const body = try self.parseBlock();
         if (body == null) return null;
@@ -205,7 +257,7 @@ pub const Parser = struct {
         try self.nodes.append(self.allocator, .{
             .tag = .fn_decl,
             .main_token = start_tok,
-            .data = .{ .lhs = start_tok + 1, .rhs = body.? },
+            .data = .{ .lhs = proto_idx, .rhs = body.? },
         });
         
         return @as(u32, @intCast(self.nodes.len - 1));
@@ -275,6 +327,48 @@ pub const Parser = struct {
         
         while (self.index < self.tokens.len) {
             const op_tok = self.tokens[self.index];
+            
+            if (op_tok.tag == .l_paren) {
+                if (100 < binding_power) break;
+                const call_tok = self.index;
+                self.index += 1;
+                
+                var args = std.ArrayList(Node.Index).empty;
+                defer args.deinit(self.allocator);
+                
+                while (self.index < self.tokens.len and self.tokens[self.index].tag != .r_paren) {
+                    const arg = try self.parseExpr(0);
+                    if (arg == null) return null;
+                    try args.append(self.allocator, arg.?);
+                    
+                    if (self.tokens[self.index].tag == .comma) {
+                        self.index += 1;
+                    } else {
+                        break;
+                    }
+                }
+                
+                if (self.tokens[self.index].tag == .r_paren) {
+                    self.index += 1;
+                } else {
+                    try self.reportError(2008, "Expected ')' after function arguments");
+                    return null;
+                }
+                
+                const extra_start = @as(u32, @intCast(self.extra_data.items.len));
+                try self.extra_data.append(self.allocator, @as(u32, @intCast(args.items.len)));
+                try self.extra_data.appendSlice(self.allocator, args.items);
+                
+                try self.nodes.append(self.allocator, .{
+                    .tag = .call,
+                    .main_token = call_tok,
+                    .data = .{ .lhs = lhs.?, .rhs = extra_start },
+                });
+                
+                lhs = @as(u32, @intCast(self.nodes.len - 1));
+                continue;
+            }
+            
             const bp = getBindingPower(op_tok.tag);
             
             if (bp.left == 0) break;
