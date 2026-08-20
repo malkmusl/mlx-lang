@@ -63,11 +63,22 @@ pub const Node = struct {
         null_literal,
         undefined_literal,
         
-        // Types
+        // Types & Aggregates
         pointer_type,
         slice_type,
         array_type,
         optional_type,
         error_union_type,
+        struct_decl,
+        enum_decl,
+        union_decl,
+        tuple_type,
+        
+        // Builtins & Intrinsic
+        nocopy_builtin,
+        move_builtin,
+        typeof_builtin,
+        sizeof_builtin,
+        builtin_call,
     };
 };

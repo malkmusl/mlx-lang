@@ -15,6 +15,7 @@ pub const Parser = struct {
     extra_data: std.ArrayList(u32),
     diags: *DiagnosticEngine,
     source_id: u32,
+    trace_level: u32,
 
     pub fn init(allocator: std.mem.Allocator, tokens: []const Token, diags: *DiagnosticEngine, source_id: u32) Parser {
         return .{
@@ -25,10 +26,47 @@ pub const Parser = struct {
             .extra_data = .empty,
             .diags = diags,
             .source_id = source_id,
+            .trace_level = 0,
         };
     }
 
+    fn printIndent(self: *Parser) void {
+        var i: u32 = 0;
+        while (i < self.trace_level) : (i += 1) {
+            std.debug.print("  ", .{});
+        }
+    }
+
+    fn traceRuleEnter(self: *Parser, name: []const u8) void {
+        self.printIndent();
+        std.debug.print("-> ENTER: {s}\n", .{name});
+        self.trace_level += 1;
+    }
+
+    fn traceRuleExit(self: *Parser, name: []const u8) void {
+        if (self.trace_level > 0) self.trace_level -= 1;
+        self.printIndent();
+        std.debug.print("<- EXIT: {s}\n", .{name});
+    }
+
+    fn traceToken(self: *Parser, msg: []const u8, tok: Token) void {
+        const src = self.diags.source_manager.getFile(self.source_id).?.content;
+        const snippet = src[tok.start..tok.end];
+        self.printIndent();
+        std.debug.print("   TOKEN: {s} | Tag: {s} | Text: '{s}'\n", .{
+            msg, @tagName(tok.tag), snippet
+        });
+    }
+
+    fn consumeToken(self: *Parser, msg: []const u8) void {
+        const tok = self.tokens[self.index];
+        self.traceToken(msg, tok);
+        self.index += 1;
+    }
+
     pub fn parse(self: *Parser) !Ast {
+        self.traceRuleEnter("parse");
+        defer self.traceRuleExit("parse");
         // Source file is a series of top-level declarations
         var root_children = std.ArrayList(Node.Index).empty;
         defer root_children.deinit(self.allocator);
@@ -39,8 +77,8 @@ pub const Parser = struct {
                 continue;
             }
 
-            const decl_node = try self.parseTopLevelDecl();
-            if (decl_node != 0 or self.tokens[self.index - 1].tag != .invalid) {
+            const decl_node_opt = try self.parseTopLevelDecl();
+            if (decl_node_opt) |decl_node| {
                 try root_children.append(self.allocator, decl_node);
             } else {
                 // If it failed to parse, recover
@@ -71,7 +109,9 @@ pub const Parser = struct {
         };
     }
 
-    fn parseTopLevelDecl(self: *Parser) !Node.Index {
+    fn parseTopLevelDecl(self: *Parser) std.mem.Allocator.Error!?Node.Index {
+        self.traceRuleEnter("parseTopLevelDecl");
+        defer self.traceRuleExit("parseTopLevelDecl");
         const token = self.tokens[self.index];
         switch (token.tag) {
             .keyword_const, .keyword_var => {
@@ -83,57 +123,69 @@ pub const Parser = struct {
             else => {
                 // Report error
                 try self.reportError(2001, "Expected top-level declaration");
-                return 0; // 0 is invalid/dummy node index
+                return null;
             }
         }
     }
 
-    fn parseVarDecl(self: *Parser) !Node.Index {
+    fn parseVarDecl(self: *Parser) std.mem.Allocator.Error!?Node.Index {
+        self.traceRuleEnter("parseVarDecl");
+        defer self.traceRuleExit("parseVarDecl");
         const start_tok = self.index;
-        self.index += 1; // consume const/var
+        self.consumeToken("Consume const/var keyword");
         
         if (self.tokens[self.index].tag != .ident) {
             try self.reportError(2002, "Expected identifier after const/var");
-            return 0;
+            return null;
         }
-        self.index += 1;
+        self.consumeToken("Consume identifier");
         
         // type annotation optional for now
         if (self.tokens[self.index].tag == .colon) {
-            self.index += 1;
+            self.consumeToken("Consume colon");
             _ = try self.parseExpr(0); // parse type
         }
 
         if (self.tokens[self.index].tag != .equal) {
             try self.reportError(2003, "Expected '=' in variable declaration");
-            return 0;
+            return null;
         }
-        self.index += 1;
+        self.consumeToken("Consume '='");
 
         const expr = try self.parseExpr(0);
+        if (expr == null) return null;
+        
+        if (self.index < self.tokens.len and self.tokens[self.index].tag == .statement_end) {
+            self.index += 1;
+        } else {
+            try self.reportError(2004, "Expected ';' after variable declaration");
+            return null;
+        }
         
         try self.nodes.append(self.allocator, .{
             .tag = if (self.tokens[start_tok].tag == .keyword_const) .const_decl else .var_decl,
             .main_token = start_tok,
-            .data = .{ .lhs = start_tok + 1, .rhs = expr }, // lhs is ident token, rhs is expr node
+            .data = .{ .lhs = start_tok + 1, .rhs = expr.? }, // lhs is ident token, rhs is expr node
         });
         
         return @as(u32, @intCast(self.nodes.len - 1));
     }
 
-    fn parseFnDecl(self: *Parser) !Node.Index {
+    fn parseFnDecl(self: *Parser) std.mem.Allocator.Error!?Node.Index {
+        self.traceRuleEnter("parseFnDecl");
+        defer self.traceRuleExit("parseFnDecl");
         const start_tok = self.index;
         self.index += 1; // consume fn
         
         if (self.tokens[self.index].tag != .ident) {
             try self.reportError(2002, "Expected identifier after fn");
-            return 0;
+            return null;
         }
         self.index += 1;
         
         if (self.tokens[self.index].tag != .l_paren) {
             try self.reportError(2004, "Expected '(' for parameters");
-            return 0;
+            return null;
         }
         self.index += 1;
         
@@ -148,21 +200,24 @@ pub const Parser = struct {
         }
         
         const body = try self.parseBlock();
+        if (body == null) return null;
         
         try self.nodes.append(self.allocator, .{
             .tag = .fn_decl,
             .main_token = start_tok,
-            .data = .{ .lhs = start_tok + 1, .rhs = body },
+            .data = .{ .lhs = start_tok + 1, .rhs = body.? },
         });
         
         return @as(u32, @intCast(self.nodes.len - 1));
     }
 
-    fn parseBlock(self: *Parser) !Node.Index {
+    fn parseBlock(self: *Parser) std.mem.Allocator.Error!?Node.Index {
+        self.traceRuleEnter("parseBlock");
+        defer self.traceRuleExit("parseBlock");
         const start_tok = self.index;
         if (self.tokens[self.index].tag != .l_brace) {
             try self.reportError(2005, "Expected '{' for block");
-            return 0;
+            return null;
         }
         self.index += 1;
         
@@ -174,9 +229,12 @@ pub const Parser = struct {
                 self.index += 1;
                 continue;
             }
-            // dummy statement parse
-            const expr = try self.parseExpr(0);
-            try stmts.append(self.allocator, expr);
+            const stmt = try self.parseStatement();
+            if (stmt) |s| {
+                try stmts.append(self.allocator, s);
+            } else {
+                self.recover();
+            }
         }
         if (self.tokens[self.index].tag == .r_brace) self.index += 1;
         
@@ -192,22 +250,45 @@ pub const Parser = struct {
         return @as(u32, @intCast(self.nodes.len - 1));
     }
 
-    fn parseExpr(self: *Parser, binding_power: u8) !Node.Index {
+    fn parseStatement(self: *Parser) std.mem.Allocator.Error!?Node.Index {
+        self.traceRuleEnter("parseStatement");
+        defer self.traceRuleExit("parseStatement");
+        const token = self.tokens[self.index];
+        switch (token.tag) {
+            .keyword_const, .keyword_var => {
+                return self.parseVarDecl();
+            },
+            .keyword_fn => {
+                return self.parseFnDecl();
+            },
+            else => {
+                return self.parseExpr(0);
+            }
+        }
+    }
+
+    fn parseExpr(self: *Parser, binding_power: u8) std.mem.Allocator.Error!?Node.Index {
+        self.traceRuleEnter("parseExpr");
+        defer self.traceRuleExit("parseExpr");
         var lhs = try self.parsePrefix();
+        if (lhs == null) return null;
         
         while (self.index < self.tokens.len) {
             const op_tok = self.tokens[self.index];
             const bp = getBindingPower(op_tok.tag);
             
+            if (bp.left == 0) break;
             if (bp.left < binding_power) break;
             
+            const op_tok_idx = self.index;
             self.index += 1;
             const rhs = try self.parseExpr(bp.right);
+            if (rhs == null) return null;
             
             try self.nodes.append(self.allocator, .{
                 .tag = .binary_op,
-                .main_token = self.index - 1,
-                .data = .{ .lhs = lhs, .rhs = rhs },
+                .main_token = op_tok_idx,
+                .data = .{ .lhs = lhs.?, .rhs = rhs.? },
             });
             lhs = @as(u32, @intCast(self.nodes.len - 1));
         }
@@ -215,7 +296,9 @@ pub const Parser = struct {
         return lhs;
     }
 
-    fn parsePrefix(self: *Parser) !Node.Index {
+    fn parsePrefix(self: *Parser) std.mem.Allocator.Error!?Node.Index {
+        self.traceRuleEnter("parsePrefix");
+        defer self.traceRuleExit("parsePrefix");
         const tok = self.tokens[self.index];
         switch (tok.tag) {
             .integer, .ident, .string, .float => {
@@ -225,15 +308,138 @@ pub const Parser = struct {
                     .main_token = self.index,
                     .data = .{ .lhs = 0, .rhs = 0 },
                 });
-                self.index += 1;
+                self.consumeToken("Consume identifier/literal");
                 return @as(u32, @intCast(self.nodes.len - 1));
             },
+            .at => {
+                // Builtin invocation like @nocopy or @move
+                const start_tok = self.index;
+                self.consumeToken("Consume @");
+                
+                if (self.index >= self.tokens.len or self.tokens[self.index].tag != .ident) {
+                    try self.reportError(2007, "Expected builtin identifier after @");
+                    return null;
+                }
+                const builtin_tok = self.tokens[self.index];
+                const src = self.diags.source_manager.getFile(self.source_id).?.content;
+                const name = src[builtin_tok.start..builtin_tok.end];
+                self.consumeToken("Consume builtin name");
+
+                if (self.index >= self.tokens.len or self.tokens[self.index].tag != .l_paren) {
+                    try self.reportError(2008, "Expected '(' after builtin");
+                    return null;
+                }
+                self.consumeToken("Consume '('");
+                
+                const inner = try self.parseExpr(0);
+                if (inner == null) return null;
+                
+                if (self.index >= self.tokens.len or self.tokens[self.index].tag != .r_paren) {
+                    try self.reportError(2009, "Expected ')' after builtin argument");
+                    return null;
+                }
+                self.consumeToken("Consume ')'");
+
+                const tag: Node.Tag = if (std.mem.eql(u8, name, "nocopy")) .nocopy_builtin 
+                                      else if (std.mem.eql(u8, name, "move")) .move_builtin 
+                                      else if (std.mem.eql(u8, name, "typeOf")) .typeof_builtin 
+                                      else if (std.mem.eql(u8, name, "sizeOf")) .sizeof_builtin 
+                                      else .builtin_call;
+
+                try self.nodes.append(self.allocator, .{
+                    .tag = tag,
+                    .main_token = start_tok,
+                    .data = .{ .lhs = 0, .rhs = inner.? },
+                });
+                return @as(u32, @intCast(self.nodes.len - 1));
+            },
+            .keyword_if => return self.parseIfExpr(),
+            .keyword_while => return self.parseWhileLoop(),
+            .keyword_return => {
+                const start_tok = self.index;
+                self.consumeToken("Consume return");
+                const expr = try self.parseExpr(0);
+                try self.nodes.append(self.allocator, .{
+                    .tag = .return_stmt,
+                    .main_token = start_tok,
+                    .data = .{ .lhs = 0, .rhs = expr.? },
+                });
+                return @as(u32, @intCast(self.nodes.len - 1));
+            },
+            .l_brace => return self.parseBlock(),
+            .l_paren => {
+                self.consumeToken("Consume '('");
+                const expr = try self.parseExpr(0);
+                if (expr == null) return null;
+                if (self.index >= self.tokens.len or self.tokens[self.index].tag != .r_paren) {
+                    try self.reportError(2008, "Expected ')'");
+                    return null;
+                }
+                self.consumeToken("Consume ')'");
+                return expr;
+            },
             else => {
-                try self.reportError(2006, "Expected expression");
-                self.index += 1;
-                return 0;
+                try self.reportError(2007, "Unexpected token in expression");
+                return null;
             }
         }
+    }
+
+    fn parseIfExpr(self: *Parser) !?Node.Index {
+        self.traceRuleEnter("parseIfExpr");
+        defer self.traceRuleExit("parseIfExpr");
+        const start_tok = self.index;
+        self.consumeToken("Consume if");
+        
+        const cond = try self.parseExpr(0);
+        if (cond == null) return null;
+        
+        const then_branch = try self.parseExpr(0);
+        if (then_branch == null) return null;
+        
+        var else_branch: ?Node.Index = null;
+        if (self.index < self.tokens.len and self.tokens[self.index].tag == .keyword_else) {
+            self.consumeToken("Consume else");
+            else_branch = try self.parseExpr(0);
+            if (else_branch == null) return null;
+        }
+        
+        const extra_start = @as(u32, @intCast(self.extra_data.items.len));
+        try self.extra_data.append(self.allocator, cond.?);
+        try self.extra_data.append(self.allocator, then_branch.?);
+        if (else_branch) |e| {
+            try self.extra_data.append(self.allocator, e);
+        }
+        const extra_end = @as(u32, @intCast(self.extra_data.items.len));
+        
+        try self.nodes.append(self.allocator, .{
+            .tag = .if_stmt,
+            .main_token = start_tok,
+            .data = .{ .lhs = extra_start, .rhs = extra_end },
+        });
+        
+        return @as(u32, @intCast(self.nodes.len - 1));
+    }
+
+    fn parseWhileLoop(self: *Parser) !?Node.Index {
+        self.traceRuleEnter("parseWhileLoop");
+        defer self.traceRuleExit("parseWhileLoop");
+        const start_tok = self.index;
+        self.consumeToken("Consume while");
+        
+        const cond = try self.parseExpr(0);
+        if (cond == null) return null;
+        
+        const body = try self.parseExpr(0);
+        if (body == null) return null;
+        
+        try self.nodes.append(self.allocator, .{
+            .tag = .while_stmt,
+            .main_token = start_tok,
+            .data = .{ .lhs = cond.?, .rhs = body.? },
+        });
+        
+        return @as(u32, @intCast(self.nodes.len - 1));
     }
 
     fn recover(self: *Parser) void {

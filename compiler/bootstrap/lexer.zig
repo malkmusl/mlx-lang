@@ -552,6 +552,10 @@ pub const Lexer = struct {
         if (token.tag != .invalid and token.tag != .eof) {
             self.last_tag = token.tag;
         }
+        
+        const snippet = if (token.tag == .eof or token.start >= self.buffer.len) "EOF" else self.buffer[token.start..token.end];
+        std.debug.print("DEBUG LEX: {s} '{s}'\n", .{@tagName(token.tag), snippet});
+        
         return token;
     }
 
