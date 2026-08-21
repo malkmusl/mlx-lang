@@ -50,12 +50,18 @@ pub const Parser = struct {
     }
 
     fn traceToken(self: *Parser, msg: []const u8, tok: Token) void {
-        const src = self.diags.source_manager.getFile(self.source_id).?.content;
-        const snippet = src[tok.start..tok.end];
-        self.printIndent();
-        std.debug.print("   TOKEN: {s} | Tag: {s} | Text: '{s}'\n", .{
-            msg, @tagName(tok.tag), snippet
-        });
+        if (self.diags.source_manager.getFile(self.source_id)) |file| {
+            const snippet = file.content[tok.start..@min(tok.end, file.content.len)];
+            self.printIndent();
+            std.debug.print("   TOKEN: {s} | Tag: {s} | Text: '{s}'\n", .{
+                msg, @tagName(tok.tag), snippet
+            });
+        } else {
+            self.printIndent();
+            std.debug.print("   TOKEN: {s} | Tag: {s} | Span: {d}..{d}\n", .{
+                msg, @tagName(tok.tag), tok.start, tok.end
+            });
+        }
     }
 
     fn consumeToken(self: *Parser, msg: []const u8) void {
@@ -138,12 +144,19 @@ pub const Parser = struct {
             try self.reportError(2002, "Expected identifier after const/var");
             return null;
         }
+        const ident_tok = self.index;
         self.consumeToken("Consume identifier");
         
-        // type annotation optional for now
+        // Optional type annotation: `: TypeExpr`
+        var type_node: Node.Index = 0; // 0 = inferred
         if (self.tokens[self.index].tag == .colon) {
             self.consumeToken("Consume colon");
-            _ = try self.parseExpr(0); // parse type
+            const ty = try self.parseTypeExpr();
+            if (ty == null) {
+                try self.reportError(2005, "Expected type expression after ':'");
+                return null;
+            }
+            type_node = ty.?;
         }
 
         if (self.tokens[self.index].tag != .equal) {
@@ -155,20 +168,209 @@ pub const Parser = struct {
         const expr = try self.parseExpr(0);
         if (expr == null) return null;
         
+        // Skip optional statement_end (newline-based)
         if (self.index < self.tokens.len and self.tokens[self.index].tag == .statement_end) {
             self.index += 1;
-        } else {
-            try self.reportError(2004, "Expected ';' after variable declaration");
-            return null;
         }
+        
+        // Store type_node and init_expr in extra_data
+        // Layout: extra_data[extra_start + 0] = type_node, extra_data[extra_start + 1] = init_expr
+        const extra_start = @as(u32, @intCast(self.extra_data.items.len));
+        try self.extra_data.append(self.allocator, type_node);
+        try self.extra_data.append(self.allocator, expr.?);
         
         try self.nodes.append(self.allocator, .{
             .tag = if (self.tokens[start_tok].tag == .keyword_const) .const_decl else .var_decl,
             .main_token = start_tok,
-            .data = .{ .lhs = start_tok + 1, .rhs = expr.? }, // lhs is ident token, rhs is expr node
+            .data = .{ .lhs = ident_tok, .rhs = extra_start },
         });
         
         return @as(u32, @intCast(self.nodes.len - 1));
+    }
+
+    /// Parse a type expression in annotation position.
+    /// Handles: `*T`, `*const T`, `[*]T`, `[]T`, `?T`, `[N]T`, `E!T`, `!T`, identifiers.
+    fn parseTypeExpr(self: *Parser) std.mem.Allocator.Error!?Node.Index {
+        self.traceRuleEnter("parseTypeExpr");
+        defer self.traceRuleExit("parseTypeExpr");
+
+        const tok = self.tokens[self.index];
+
+        switch (tok.tag) {
+            // `*T` or `*const T`
+            .asterisk => {
+                const star_tok = self.index;
+                self.consumeToken("Consume *");
+                var is_const = false;
+                if (self.tokens[self.index].tag == .keyword_const) {
+                    is_const = true;
+                    self.consumeToken("Consume const");
+                }
+                const child = try self.parseTypeExpr() orelse return null;
+                // flags: bit0 = is_const
+                const flags: u32 = if (is_const) 1 else 0;
+                try self.nodes.append(self.allocator, .{
+                    .tag = .pointer_type,
+                    .main_token = star_tok,
+                    .data = .{ .lhs = child, .rhs = flags },
+                });
+                return @as(u32, @intCast(self.nodes.len - 1));
+            },
+
+            // `[N]T` or `[]T` or `[*]T`
+            .l_bracket => {
+                const lb_tok = self.index;
+                self.consumeToken("Consume [");
+
+                // `[]T` — slice
+                if (self.tokens[self.index].tag == .r_bracket) {
+                    self.consumeToken("Consume ]");
+                    var is_const = false;
+                    if (self.tokens[self.index].tag == .keyword_const) {
+                        is_const = true;
+                        self.consumeToken("Consume const");
+                    }
+                    const child = try self.parseTypeExpr() orelse return null;
+                    const flags: u32 = if (is_const) 1 else 0;
+                    try self.nodes.append(self.allocator, .{
+                        .tag = .slice_type,
+                        .main_token = lb_tok,
+                        .data = .{ .lhs = child, .rhs = flags },
+                    });
+                    return @as(u32, @intCast(self.nodes.len - 1));
+                }
+
+                // `[*]T` — many-item pointer
+                if (self.tokens[self.index].tag == .asterisk) {
+                    self.consumeToken("Consume *");
+                    if (self.tokens[self.index].tag != .r_bracket) {
+                        try self.reportError(2010, "Expected ']' after [*");
+                        return null;
+                    }
+                    self.consumeToken("Consume ]");
+                    var is_const = false;
+                    if (self.tokens[self.index].tag == .keyword_const) {
+                        is_const = true;
+                        self.consumeToken("Consume const");
+                    }
+                    const child = try self.parseTypeExpr() orelse return null;
+                    // flags: bit0 = is_const, bit1 = is_many
+                    const flags: u32 = (if (is_const) @as(u32, 1) else 0) | 2;
+                    try self.nodes.append(self.allocator, .{
+                        .tag = .pointer_type,
+                        .main_token = lb_tok,
+                        .data = .{ .lhs = child, .rhs = flags },
+                    });
+                    return @as(u32, @intCast(self.nodes.len - 1));
+                }
+
+                // `[N]T` — fixed-size array
+                const size_expr = try self.parseExpr(0) orelse {
+                    try self.reportError(2011, "Expected array size expression");
+                    return null;
+                };
+                if (self.tokens[self.index].tag != .r_bracket) {
+                    try self.reportError(2012, "Expected ']' after array size");
+                    return null;
+                }
+                self.consumeToken("Consume ]");
+                const elem_type = try self.parseTypeExpr() orelse return null;
+                const extra_start = @as(u32, @intCast(self.extra_data.items.len));
+                try self.extra_data.append(self.allocator, size_expr);
+                try self.extra_data.append(self.allocator, elem_type);
+                try self.nodes.append(self.allocator, .{
+                    .tag = .array_type,
+                    .main_token = lb_tok,
+                    .data = .{ .lhs = extra_start, .rhs = 0 },
+                });
+                return @as(u32, @intCast(self.nodes.len - 1));
+            },
+
+            // `?T` — optional
+            .question => {
+                const q_tok = self.index;
+                self.consumeToken("Consume ?");
+                const child = try self.parseTypeExpr() orelse return null;
+                try self.nodes.append(self.allocator, .{
+                    .tag = .optional_type,
+                    .main_token = q_tok,
+                    .data = .{ .lhs = child, .rhs = 0 },
+                });
+                return @as(u32, @intCast(self.nodes.len - 1));
+            },
+
+            // `!T` — inferred error union
+            .bang => {
+                const bang_tok = self.index;
+                self.consumeToken("Consume !");
+                const payload = try self.parseTypeExpr() orelse return null;
+                try self.nodes.append(self.allocator, .{
+                    .tag = .error_union_type,
+                    .main_token = bang_tok,
+                    .data = .{ .lhs = 0, .rhs = payload }, // lhs=0 = inferred error set
+                });
+                return @as(u32, @intCast(self.nodes.len - 1));
+            },
+
+            // Plain identifier — a named type like `i32`, `bool`, `MyStruct`, etc.
+            // Also handles `E!T` where `E` is the error set identifier.
+            .ident => {
+                const ident_tok = self.index;
+                self.consumeToken("Consume type identifier");
+                try self.nodes.append(self.allocator, .{
+                    .tag = .identifier,
+                    .main_token = ident_tok,
+                    .data = .{ .lhs = 0, .rhs = 0 },
+                });
+                const ident_node = @as(u32, @intCast(self.nodes.len - 1));
+
+                // Check for `E!T` — error union with explicit error set
+                if (self.tokens[self.index].tag == .bang) {
+                    const bang_tok = self.index;
+                    self.consumeToken("Consume ! in E!T");
+                    const payload = try self.parseTypeExpr() orelse return null;
+                    try self.nodes.append(self.allocator, .{
+                        .tag = .error_union_type,
+                        .main_token = bang_tok,
+                        .data = .{ .lhs = ident_node, .rhs = payload },
+                    });
+                    return @as(u32, @intCast(self.nodes.len - 1));
+                }
+
+                return ident_node;
+            },
+
+            // `fn(...) R` — inline function type
+            .keyword_fn => {
+                // Delegate to parseFnType (minimal, returns identifier-level node for now)
+                const fn_tok = self.index;
+                self.consumeToken("Consume fn keyword in type");
+                // Skip parameter list
+                if (self.tokens[self.index].tag == .l_paren) {
+                    self.consumeToken("Consume (");
+                    var depth: u32 = 1;
+                    while (self.index < self.tokens.len and depth > 0) {
+                        if (self.tokens[self.index].tag == .l_paren) depth += 1;
+                        if (self.tokens[self.index].tag == .r_paren) depth -= 1;
+                        self.consumeToken("Skip fn type param");
+                    }
+                }
+                // Return type
+                const ret = try self.parseTypeExpr() orelse return null;
+                // Represent as a pointer_type node with flags=0xFF as placeholder
+                try self.nodes.append(self.allocator, .{
+                    .tag = .pointer_type, // placeholder — stage 2 will add fn_type node
+                    .main_token = fn_tok,
+                    .data = .{ .lhs = ret, .rhs = 0xFF },
+                });
+                return @as(u32, @intCast(self.nodes.len - 1));
+            },
+
+            else => {
+                // Not a type expression — let caller handle the error
+                return null;
+            },
+        }
     }
 
     fn parseFnDecl(self: *Parser) std.mem.Allocator.Error!?Node.Index {
@@ -580,7 +782,10 @@ pub const Parser = struct {
 
 test "parser: empty file" {
     const allocator = std.testing.allocator;
-    var diags = DiagnosticEngine.init(allocator, undefined); // test doesn't actually render
+    var sm = @import("source_manager.zig").SourceManager.init(allocator);
+    defer sm.deinit();
+    _ = try sm.addFile("<test>", "");
+    var diags = DiagnosticEngine.init(allocator, &sm);
     defer diags.deinit();
     const tokens = [_]Token{ .{ .tag = .eof, .start = 0, .end = 0 } };
     var parser = Parser.init(allocator, &tokens, &diags, 0);
@@ -592,7 +797,10 @@ test "parser: empty file" {
 
 test "parser: basic var decl" {
     const allocator = std.testing.allocator;
-    var diags = DiagnosticEngine.init(allocator, undefined);
+    var sm = @import("source_manager.zig").SourceManager.init(allocator);
+    defer sm.deinit();
+    _ = try sm.addFile("<test>", "var a = 1");
+    var diags = DiagnosticEngine.init(allocator, &sm);
     defer diags.deinit();
 
     // var a = 1
@@ -617,7 +825,10 @@ test "parser: basic var decl" {
 
 test "parser: pratt expression precedence" {
     const allocator = std.testing.allocator;
-    var diags = DiagnosticEngine.init(allocator, undefined);
+    var sm = @import("source_manager.zig").SourceManager.init(allocator);
+    defer sm.deinit();
+    _ = try sm.addFile("<test>", "const x = 1 + 2 * 3");
+    var diags = DiagnosticEngine.init(allocator, &sm);
     defer diags.deinit();
 
     // 1 + 2 * 3
@@ -659,7 +870,10 @@ test "parser: pratt expression precedence" {
 
 test "parser: error recovery" {
     const allocator = std.testing.allocator;
-    var diags = DiagnosticEngine.init(allocator, undefined);
+    var sm = @import("source_manager.zig").SourceManager.init(allocator);
+    defer sm.deinit();
+    _ = try sm.addFile("<test>", "const = 1\nvar b = 2");
+    var diags = DiagnosticEngine.init(allocator, &sm);
     defer diags.deinit();
 
     // const = 1; var b = 2

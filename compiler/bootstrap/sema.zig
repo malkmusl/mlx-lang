@@ -141,44 +141,84 @@ pub const Sema = struct {
                 return 0;
             },
             .const_decl, .var_decl => {
-                const ident_tok = self.ast_tree.tokens[node.data.lhs];
+                // New layout:
+                //   node.lhs = ident token index
+                //   node.rhs = extra_start where:
+                //     extra_data[rhs + 0] = type annotation node (0 = inferred)
+                //     extra_data[rhs + 1] = init expression node
+                const ident_tok_idx = node.data.lhs;
+                const extra_start = node.data.rhs;
+                const type_node = self.ast_tree.extra_data[extra_start];
+                const init_node = self.ast_tree.extra_data[extra_start + 1];
+
                 const src = self.diags.source_manager.getFile(0).?.content;
+                const ident_tok = self.ast_tree.tokens[ident_tok_idx];
                 const name = src[ident_tok.start..ident_tok.end];
-                
-                const rhs_idx = node.data.rhs;
-                const rhs_type = try self.analyzeNode(rhs_idx, scope);
-                
-                // Enforce nocopy
-                const copyability = self.type_pool.types.items[rhs_type].copyability;
-                if (copyability != .copyable) {
-                    // Check if it's a move, otherwise error
-                    const rhs_node = self.ast_tree.nodes.get(rhs_idx);
-                    if (rhs_node.tag != .move_builtin and rhs_node.tag != .nocopy_builtin) {
-                        try self.reportError(ident_tok.start, "Cannot copy a non-copyable type"); // pass start index hack
+
+                // Analyze init expression → inferred type
+                const inferred_type = try self.analyzeNode(init_node, scope);
+
+                // Resolve annotated type if present
+                var declared_type: Type.Id = inferred_type;
+                if (type_node != 0) {
+                    declared_type = try self.resolveTypeExpr(type_node);
+
+                    // Type check: is the init expression coercible to the declared type?
+                    const from_ty = self.type_pool.types.items[inferred_type];
+                    const to_ty = self.type_pool.types.items[declared_type];
+
+                    if (!Type.isCoercible(from_ty, to_ty)) {
+                        var from_buf: [64]u8 = undefined;
+                        var to_buf: [64]u8 = undefined;
+                        const from_name = self.type_pool.typeName(inferred_type, &from_buf) catch "<unknown>";
+                        const to_name = self.type_pool.typeName(declared_type, &to_buf) catch "<unknown>";
+                        std.debug.print("TYPE ERROR: cannot coerce '{s}' to '{s}' for variable '{s}'\n", .{ from_name, to_name, name });
+                        try self.reportError(ident_tok.start, "ZIN-E4001: Type mismatch");
                     }
                 }
 
+                // Log the resolved type
+                {
+                    var name_buf: [64]u8 = undefined;
+                    const type_name = self.type_pool.typeName(declared_type, &name_buf) catch "<unknown>";
+                    std.debug.print("[sema] {s} {s}: {s}\n", .{
+                        if (node.tag == .const_decl) "const" else "var",
+                        name,
+                        type_name,
+                    });
+                }
+
+                // Enforce nocopy
+                const copyability = self.type_pool.types.items[declared_type].copyability;
+                if (copyability != .copyable) {
+                    const rhs_node = self.ast_tree.nodes.get(init_node);
+                    if (rhs_node.tag != .move_builtin and rhs_node.tag != .nocopy_builtin) {
+                        try self.reportError(ident_tok.start, "Cannot copy a non-copyable type");
+                    }
+                }
+
+                // Comptime eval for const declarations
                 if (node.tag == .const_decl) {
                     const comptime_vm = @import("comptime.zig");
                     var vm = comptime_vm.ComptimeVM.init(self.allocator, self.ast_tree, self);
-                    const val = vm.evaluate(rhs_idx, src);
+                    const val = vm.evaluate(init_node, src);
                     switch (val) {
-                        .integer => |i| std.debug.print("COMPTIME EVAL: '{s}' = {d}\n", .{ name, i }),
-                        .err => |e| std.debug.print("COMPTIME EVAL ERR: '{s}': {s}\n", .{ name, e }),
+                        .integer => |i| std.debug.print("[comptime] '{s}' = {d}\n", .{ name, i }),
+                        .err => |e| std.debug.print("[comptime] '{s}' cannot be evaluated at compile time: {s}\n", .{ name, e }),
                     }
                 }
 
                 try scope.put(name, .{
                     .name = name,
                     .decl_node = node_idx,
-                    .type_id = rhs_type,
+                    .type_id = declared_type,
                     .is_const = (node.tag == .const_decl),
                 });
-                
+
                 try self.local_states.put(node_idx, .initialized);
-                try self.node_types.put(node_idx, rhs_type);
-                
-                return rhs_type;
+                try self.node_types.put(node_idx, declared_type);
+
+                return declared_type;
             },
             .nocopy_builtin => {
                 // @nocopy(expr) -> wraps type
@@ -320,7 +360,12 @@ pub const Sema = struct {
                     try self.node_types.put(param_idx, param_type);
                 }
                 
-                const fn_type = try self.type_pool.intern(.{ .function = .{ .ret_type = ret_type } }, .copyable);
+                const fn_type = try self.type_pool.intern(.{ .function = .{
+                    .ret_type = ret_type,
+                    .params_start = 0,
+                    .params_len = 0,
+                    .is_var_args = false,
+                } }, .copyable);
                 try self.node_types.put(node_idx, fn_type);
                 return fn_type;
             },
@@ -400,5 +445,130 @@ pub const Sema = struct {
             },
             .message = msg,
         });
+    }
+
+    /// Resolve a type-expression AST node into a Type.Id.
+    /// Handles pointer_type, slice_type, optional_type, array_type, error_union_type,
+    /// and identifier nodes (mapped to builtin / user-defined types).
+    pub fn resolveTypeExpr(self: *Sema, node_idx: Node.Index) !Type.Id {
+        const node = self.ast_tree.nodes.get(node_idx);
+        const src = self.diags.source_manager.getFile(0).?.content;
+
+        switch (node.tag) {
+            .identifier => {
+                // Resolve built-in type names
+                const tok = self.ast_tree.tokens[node.main_token];
+                const name = src[tok.start..tok.end];
+                return self.resolveBuiltinTypeName(name, tok.start);
+            },
+
+            .pointer_type => {
+                const child = try self.resolveTypeExpr(node.data.lhs);
+                const flags = node.data.rhs;
+                const is_const = (flags & 1) != 0;
+                const is_many = (flags & 2) != 0;
+                const size: Type.PointerSize = if (is_many) .Many else .One;
+                return self.type_pool.intern(.{ .pointer = .{
+                    .child_type = child,
+                    .is_const = is_const,
+                    .is_volatile = false,
+                    .is_allowzero = false,
+                    .is_optional = false,
+                    .size = size,
+                    .sentinel = null,
+                }}, .copyable);
+            },
+
+            .slice_type => {
+                const child = try self.resolveTypeExpr(node.data.lhs);
+                const is_const = (node.data.rhs & 1) != 0;
+                return self.type_pool.intern(.{ .pointer = .{
+                    .child_type = child,
+                    .is_const = is_const,
+                    .is_volatile = false,
+                    .is_allowzero = false,
+                    .is_optional = false,
+                    .size = .Slice,
+                    .sentinel = null,
+                }}, .copyable);
+            },
+
+            .optional_type => {
+                const child = try self.resolveTypeExpr(node.data.lhs);
+                return self.type_pool.intern(.{ .optional = .{ .child_type = child } }, .copyable);
+            },
+
+            .array_type => {
+                // lhs = extra_start: [size_expr, elem_type]
+                const extra_start = node.data.lhs;
+                const elem_node = self.ast_tree.extra_data[extra_start + 1];
+                const elem_type = try self.resolveTypeExpr(elem_node);
+                // Evaluate size comptime (simplification: try to get the integer value)
+                const size_node_idx = self.ast_tree.extra_data[extra_start];
+                const size_node = self.ast_tree.nodes.get(size_node_idx);
+                var array_len: u64 = 0;
+                if (size_node.tag == .integer_literal) {
+                    const size_tok = self.ast_tree.tokens[size_node.main_token];
+                    const size_text = src[size_tok.start..size_tok.end];
+                    array_len = std.fmt.parseInt(u64, size_text, 10) catch 0;
+                }
+                return self.type_pool.intern(.{ .array = .{
+                    .child_type = elem_type,
+                    .len = array_len,
+                    .sentinel = null,
+                }}, .copyable);
+            },
+
+            .error_union_type => {
+                // lhs = error set node (0 = inferred), rhs = payload type node
+                const payload = try self.resolveTypeExpr(node.data.rhs);
+                const err_set: Type.Id = if (node.data.lhs != 0)
+                    try self.resolveTypeExpr(node.data.lhs)
+                else
+                    try self.type_pool.internPrimitive(.void_type); // placeholder for inferred
+                return self.type_pool.intern(.{ .error_union = .{ .err_set = err_set, .payload = payload }}, .copyable);
+            },
+
+            else => {
+                // Unknown type expression — return void as a fallback
+                return self.type_pool.internPrimitive(.void_type);
+            },
+        }
+    }
+
+    /// Resolve a plain identifier to a built-in type.
+    fn resolveBuiltinTypeName(self: *Sema, name: []const u8, start_byte: u32) !Type.Id {
+        // Primitive names
+        if (std.mem.eql(u8, name, "void"))       return self.type_pool.internPrimitive(.void_type);
+        if (std.mem.eql(u8, name, "noreturn"))   return self.type_pool.internPrimitive(.noreturn_type);
+        if (std.mem.eql(u8, name, "bool"))       return self.type_pool.internPrimitive(.bool_type);
+        if (std.mem.eql(u8, name, "type"))       return self.type_pool.internPrimitive(.type_type);
+        if (std.mem.eql(u8, name, "anytype"))    return self.type_pool.internPrimitive(.anytype_type);
+        if (std.mem.eql(u8, name, "anyopaque"))  return self.type_pool.internPrimitive(.anyopaque_type);
+        if (std.mem.eql(u8, name, "comptime_int"))   return self.type_pool.internPrimitive(.comptime_int_type);
+        if (std.mem.eql(u8, name, "comptime_float")) return self.type_pool.internPrimitive(.comptime_float_type);
+        // Float types
+        if (std.mem.eql(u8, name, "f16"))  return self.type_pool.internPrimitive(.f16_type);
+        if (std.mem.eql(u8, name, "f32"))  return self.type_pool.internPrimitive(.f32_type);
+        if (std.mem.eql(u8, name, "f64"))  return self.type_pool.internPrimitive(.f64_type);
+        if (std.mem.eql(u8, name, "f80"))  return self.type_pool.internPrimitive(.f80_type);
+        if (std.mem.eql(u8, name, "f128")) return self.type_pool.internPrimitive(.f128_type);
+        // Platform-sized integers
+        if (std.mem.eql(u8, name, "usize")) return self.type_pool.internSizeInt(false);
+        if (std.mem.eql(u8, name, "isize")) return self.type_pool.internSizeInt(true);
+        // Fixed-width integers: u8, i8, u16, i16 … u128, i128
+        if (name.len >= 2) {
+            const signed = name[0] == 'i';
+            const unsigned = name[0] == 'u';
+            if ((signed or unsigned) and name.len <= 5) {
+                const bits = std.fmt.parseInt(u16, name[1..], 10) catch 0;
+                if (bits > 0 and bits <= 128) {
+                    return self.type_pool.internInt(signed, bits);
+                }
+            }
+        }
+        // Unknown — report and return void
+        try self.reportError(start_byte, "ZIN-E3001: Unknown type name");
+        return self.type_pool.internPrimitive(.void_type);
     }
 };

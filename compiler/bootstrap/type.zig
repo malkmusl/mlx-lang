@@ -15,6 +15,7 @@ pub const Copyability = enum {
 pub const Type = struct {
     pub const Id = u32;
 
+    /// Single-token / keyword primitive types — no parameters.
     pub const Primitive = enum {
         void_type,
         noreturn_type,
@@ -22,59 +23,95 @@ pub const Type = struct {
         anytype_type,
         anyopaque_type,
         bool_type,
+        // Floating-point (all five Zig float widths)
+        f16_type,
         f32_type,
         f64_type,
+        f80_type,
+        f128_type,
+        // Comptime literals
         comptime_int_type,
         comptime_float_type,
+        // null / undefined sentinel
+        null_type,
+        undefined_type,
     };
 
+    /// Fixed-width signed/unsigned integer: u8, i8, u16, i16 … u128, i128.
     pub const Int = struct {
         is_signed: bool,
-        bits: u16,
+        bits: u16, // 1–128
     };
+
+    /// Platform-native pointer-width integer.
+    pub const SizeInt = struct {
+        is_signed: bool, // false = usize, true = isize
+    };
+
+    /// Pointer type: *T, *const T, [*]T, []T etc.
+    pub const PointerSize = enum { One, Many, Slice, C };
 
     pub const Pointer = struct {
         child_type: Id,
         is_const: bool,
+        is_volatile: bool,
+        is_allowzero: bool,
         is_optional: bool,
-        size: enum { One, Many, Slice },
+        size: PointerSize,
+        sentinel: ?u64, // only used for sentinel-terminated slices/many-pointers
     };
 
     pub const Optional = struct {
         child_type: Id,
     };
 
+    pub const Array = struct {
+        child_type: Id,
+        len: u64,
+        sentinel: ?u64,
+    };
+
+    /// A complete function type including parameter types and return type.
+    pub const Function = struct {
+        ret_type: Id,
+        params_start: u32, // index into TypePool.extra_type_ids
+        params_len: u32,
+        is_var_args: bool,
+    };
+
+    /// Stub for struct/enum/union — will be expanded when we implement aggregates.
     pub const Aggregate = struct {
-        // Just a stub for now, will contain fields
         id: u32,
     };
 
     pub const Tag = enum {
         primitive,
         integer,
+        size_int,      // usize / isize
         pointer,
         optional,
         array,
+        error_union,
+        function,
         @"struct",
         @"enum",
         @"union",
         tuple,
-        error_union,
-        function,
     };
 
     pub const Data = union(Tag) {
         primitive: Primitive,
         integer: Int,
+        size_int: SizeInt,
         pointer: Pointer,
         optional: Optional,
-        array: struct { child: Id, len: u64 },
+        array: Array,
+        error_union: struct { err_set: Id, payload: Id },
+        function: Function,
         @"struct": Aggregate,
         @"enum": Aggregate,
         @"union": Aggregate,
         tuple: Aggregate,
-        error_union: struct { err_set: Id, payload: Id },
-        function: struct { ret_type: Id },
     };
 
     data: Data,
@@ -83,40 +120,112 @@ pub const Type = struct {
     pub fn isCopyable(self: Type) bool {
         return self.copyability == .copyable;
     }
+
+    /// Returns true if this type is a comptime-only type.
+    pub fn isComptime(self: Type) bool {
+        return switch (self.data) {
+            .primitive => |p| p == .comptime_int_type or p == .comptime_float_type or p == .type_type,
+            else => false,
+        };
+    }
+
+    /// Returns true if this type is a numeric integer (including comptime_int).
+    pub fn isInteger(self: Type) bool {
+        return switch (self.data) {
+            .integer, .size_int => true,
+            .primitive => |p| p == .comptime_int_type,
+            else => false,
+        };
+    }
+
+    /// Returns true if this type is a floating-point (including comptime_float).
+    pub fn isFloat(self: Type) bool {
+        return switch (self.data) {
+            .primitive => |p| switch (p) {
+                .f16_type, .f32_type, .f64_type, .f80_type, .f128_type,
+                .comptime_float_type => true,
+                else => false,
+            },
+            else => false,
+        };
+    }
+
+    /// Check if `from` is coercible to `to` (Zig coercion rules, simplified).
+    /// Returns true if assignment `to = from` is valid without an explicit cast.
+    pub fn isCoercible(from: Type, to: Type) bool {
+        // Same type — always OK
+        if (std.meta.eql(from.data, to.data)) return true;
+
+        // comptime_int → any concrete integer or float
+        if (from.data == .primitive and from.data.primitive == .comptime_int_type) {
+            if (to.isInteger() or to.isFloat()) return true;
+        }
+
+        // comptime_float → any concrete float
+        if (from.data == .primitive and from.data.primitive == .comptime_float_type) {
+            if (to.isFloat()) return true;
+        }
+
+        // null → any optional
+        if (from.data == .primitive and from.data.primitive == .null_type) {
+            if (to.data == .optional) return true;
+        }
+
+        // undefined → any type (runtime undefined)
+        if (from.data == .primitive and from.data.primitive == .undefined_type) {
+            return true;
+        }
+
+        // Optional coercion: T → ?T
+        if (to.data == .optional) {
+            const inner_id = to.data.optional.child_type;
+            _ = inner_id; // TODO: recursive check when pool is available
+            // For now allow T → ?T if T matches child
+        }
+
+        return false;
+    }
 };
 
 pub const TypePool = struct {
     allocator: std.mem.Allocator,
     types: std.ArrayList(Type),
-    // For interning, we'd normally use a HashMap mapping from `Type.Data` to `Type.Id`.
-    // We'll use a simple ArrayHashMap for deduplication.
-    intern_map: std.HashMapUnmanaged(Type.Data, Type.Id, TypeDataHashContext, std.hash_map.default_max_load_percentage),
+    /// Flat list of Type.Id used for function parameter lists.
+    extra_type_ids: std.ArrayList(Type.Id),
+    intern_map: std.HashMapUnmanaged(
+        Type.Data,
+        Type.Id,
+        TypeDataHashContext,
+        std.hash_map.default_max_load_percentage,
+    ),
 
     pub fn init(allocator: std.mem.Allocator) TypePool {
         return .{
             .allocator = allocator,
             .types = std.ArrayList(Type).empty,
-            .intern_map = std.HashMapUnmanaged(Type.Data, Type.Id, TypeDataHashContext, std.hash_map.default_max_load_percentage).empty,
+            .extra_type_ids = std.ArrayList(Type.Id).empty,
+            .intern_map = std.HashMapUnmanaged(
+                Type.Data,
+                Type.Id,
+                TypeDataHashContext,
+                std.hash_map.default_max_load_percentage,
+            ).empty,
         };
     }
 
     pub fn deinit(self: *TypePool) void {
         self.types.deinit(self.allocator);
+        self.extra_type_ids.deinit(self.allocator);
         self.intern_map.deinit(self.allocator);
     }
 
+    /// Intern a type — returns an existing Id if an identical type already exists.
     pub fn intern(self: *TypePool, data: Type.Data, copyability: Copyability) !Type.Id {
         if (self.intern_map.get(data)) |id| {
-            // Note: If copyability differs for the same data, we might need to include it in the hash key.
-            // But usually, data defines the structure, and nocopy is a wrapper or derived property.
-            // Actually, @nocopy(struct) generates a new type or wraps it? 
-            // The spec says @nocopy is a type constructor. Let's assume nocopy is part of the type identity.
-            // For now, we'll just check if it exists.
             if (self.types.items[id].copyability == copyability) {
                 return id;
             }
         }
-
         const id = @as(Type.Id, @intCast(self.types.items.len));
         try self.types.append(self.allocator, .{ .data = data, .copyability = copyability });
         try self.intern_map.put(self.allocator, data, id);
@@ -125,6 +234,112 @@ pub const TypePool = struct {
 
     pub fn get(self: *const TypePool, id: Type.Id) Type {
         return self.types.items[id];
+    }
+
+    /// Append param type IDs for a function type; returns the start index.
+    pub fn appendParams(self: *TypePool, params: []const Type.Id) !u32 {
+        const start = @as(u32, @intCast(self.extra_type_ids.items.len));
+        try self.extra_type_ids.appendSlice(self.allocator, params);
+        return start;
+    }
+
+    /// Intern a named integer type: `u8`, `i32`, etc.
+    pub fn internInt(self: *TypePool, signed: bool, bits: u16) !Type.Id {
+        return self.intern(.{ .integer = .{ .is_signed = signed, .bits = bits } }, .copyable);
+    }
+
+    /// Intern `usize` or `isize`.
+    pub fn internSizeInt(self: *TypePool, signed: bool) !Type.Id {
+        return self.intern(.{ .size_int = .{ .is_signed = signed } }, .copyable);
+    }
+
+    /// Intern a primitive type.
+    pub fn internPrimitive(self: *TypePool, prim: Type.Primitive) !Type.Id {
+        return self.intern(.{ .primitive = prim }, .copyable);
+    }
+
+    /// Intern a simple single-pointer `*T` or `*const T`.
+    pub fn internPtr(self: *TypePool, child: Type.Id, is_const: bool) !Type.Id {
+        return self.intern(.{ .pointer = .{
+            .child_type = child,
+            .is_const = is_const,
+            .is_volatile = false,
+            .is_allowzero = false,
+            .is_optional = false,
+            .size = .One,
+            .sentinel = null,
+        }}, .copyable);
+    }
+
+    /// Intern a slice `[]T` or `[]const T`.
+    pub fn internSlice(self: *TypePool, child: Type.Id, is_const: bool) !Type.Id {
+        return self.intern(.{ .pointer = .{
+            .child_type = child,
+            .is_const = is_const,
+            .is_volatile = false,
+            .is_allowzero = false,
+            .is_optional = false,
+            .size = .Slice,
+            .sentinel = null,
+        }}, .copyable);
+    }
+
+    /// Intern `?T`.
+    pub fn internOptional(self: *TypePool, child: Type.Id) !Type.Id {
+        return self.intern(.{ .optional = .{ .child_type = child } }, .copyable);
+    }
+
+    /// Intern `[N]T`.
+    pub fn internArray(self: *TypePool, child: Type.Id, len: u64) !Type.Id {
+        return self.intern(.{ .array = .{ .child_type = child, .len = len, .sentinel = null } }, .copyable);
+    }
+
+    /// Print a human-readable type name.
+    pub fn typeName(self: *const TypePool, id: Type.Id, buf: []u8) ![]const u8 {
+        const ty = self.types.items[id];
+        return switch (ty.data) {
+            .primitive => |p| switch (p) {
+                .void_type => "void",
+                .noreturn_type => "noreturn",
+                .bool_type => "bool",
+                .type_type => "type",
+                .anytype_type => "anytype",
+                .anyopaque_type => "anyopaque",
+                .f16_type => "f16",
+                .f32_type => "f32",
+                .f64_type => "f64",
+                .f80_type => "f80",
+                .f128_type => "f128",
+                .comptime_int_type => "comptime_int",
+                .comptime_float_type => "comptime_float",
+                .null_type => "@TypeOf(null)",
+                .undefined_type => "@TypeOf(undefined)",
+            },
+            .integer => |i| try std.fmt.bufPrint(buf, "{s}{d}", .{ if (i.is_signed) "i" else "u", i.bits }),
+            .size_int => |s| if (s.is_signed) "isize" else "usize",
+            .optional => |o| blk: {
+                var inner_buf: [64]u8 = undefined;
+                const inner = try self.typeName(o.child_type, &inner_buf);
+                break :blk try std.fmt.bufPrint(buf, "?{s}", .{inner});
+            },
+            .pointer => |p| blk: {
+                var inner_buf: [64]u8 = undefined;
+                const inner = try self.typeName(p.child_type, &inner_buf);
+                const prefix: []const u8 = switch (p.size) {
+                    .One => if (p.is_const) "*const " else "*",
+                    .Many => if (p.is_const) "[*]const " else "[*]",
+                    .Slice => if (p.is_const) "[]const " else "[]",
+                    .C => "[*c]",
+                };
+                break :blk try std.fmt.bufPrint(buf, "{s}{s}", .{ prefix, inner });
+            },
+            .array => |a| blk: {
+                var inner_buf: [64]u8 = undefined;
+                const inner = try self.typeName(a.child_type, &inner_buf);
+                break :blk try std.fmt.bufPrint(buf, "[{d}]{s}", .{ a.len, inner });
+            },
+            else => try std.fmt.bufPrint(buf, "<type:{d}>", .{id}),
+        };
     }
 };
 
@@ -154,6 +369,10 @@ const TypeDataHashContext = struct {
     }
 };
 
+// ──────────────────────────────────────────
+//  Tests
+// ──────────────────────────────────────────
+
 test "TypePool interning" {
     const testing = std.testing;
     var pool = TypePool.init(testing.allocator);
@@ -161,20 +380,87 @@ test "TypePool interning" {
 
     const id1 = try pool.intern(.{ .primitive = .void_type }, .copyable);
     const id2 = try pool.intern(.{ .primitive = .void_type }, .copyable);
-    
     try testing.expectEqual(id1, id2);
 
-    const int1 = try pool.intern(.{ .integer = .{ .is_signed = true, .bits = 32 } }, .copyable);
-    const int2 = try pool.intern(.{ .integer = .{ .is_signed = true, .bits = 32 } }, .copyable);
-    const int3 = try pool.intern(.{ .integer = .{ .is_signed = false, .bits = 32 } }, .copyable);
-
+    const int1 = try pool.internInt(true, 32);
+    const int2 = try pool.internInt(true, 32);
+    const int3 = try pool.internInt(false, 32);
     try testing.expectEqual(int1, int2);
     try testing.expect(int1 != int3);
 }
 
+test "Float types" {
+    const testing = std.testing;
+    var pool = TypePool.init(testing.allocator);
+    defer pool.deinit();
+
+    const f16_id = try pool.internPrimitive(.f16_type);
+    const f32_id = try pool.internPrimitive(.f32_type);
+    const f64_id = try pool.internPrimitive(.f64_type);
+    const f80_id = try pool.internPrimitive(.f80_type);
+    const f128_id = try pool.internPrimitive(.f128_type);
+
+    try testing.expect(f16_id != f32_id);
+    try testing.expect(f32_id != f64_id);
+    try testing.expect(f64_id != f80_id);
+    try testing.expect(f80_id != f128_id);
+
+    const ty = pool.get(f64_id);
+    try testing.expect(ty.isFloat());
+}
+
+test "usize/isize" {
+    const testing = std.testing;
+    var pool = TypePool.init(testing.allocator);
+    defer pool.deinit();
+
+    const usize_id = try pool.internSizeInt(false);
+    const isize_id = try pool.internSizeInt(true);
+    try testing.expect(usize_id != isize_id);
+    try testing.expect(pool.get(usize_id).isInteger());
+    try testing.expect(pool.get(isize_id).isInteger());
+}
+
+test "coercibility" {
+    const testing = std.testing;
+    var pool = TypePool.init(testing.allocator);
+    defer pool.deinit();
+
+    const comptime_int_id = try pool.internPrimitive(.comptime_int_type);
+    const i32_id = try pool.internInt(true, 32);
+    const f64_id = try pool.internPrimitive(.f64_type);
+
+    const cti = pool.get(comptime_int_id);
+    const i32_ty = pool.get(i32_id);
+    const f64_ty = pool.get(f64_id);
+
+    try testing.expect(Type.isCoercible(cti, i32_ty));    // comptime_int → i32 ✅
+    try testing.expect(Type.isCoercible(cti, f64_ty));    // comptime_int → f64 ✅
+    try testing.expect(!Type.isCoercible(f64_ty, i32_ty)); // f64 → i32 ❌
+    try testing.expect(Type.isCoercible(i32_ty, i32_ty)); // i32 → i32 ✅
+}
+
+test "typeName formatting" {
+    const testing = std.testing;
+    var pool = TypePool.init(testing.allocator);
+    defer pool.deinit();
+
+    var buf: [64]u8 = undefined;
+    const i32_id = try pool.internInt(true, 32);
+    const name = try pool.typeName(i32_id, &buf);
+    try testing.expectEqualStrings("i32", name);
+
+    const u64_id = try pool.internInt(false, 64);
+    const uname = try pool.typeName(u64_id, &buf);
+    try testing.expectEqualStrings("u64", uname);
+
+    const usize_id = try pool.internSizeInt(false);
+    const sname = try pool.typeName(usize_id, &buf);
+    try testing.expectEqualStrings("usize", sname);
+}
+
 test "Copyability combinations" {
     const testing = std.testing;
-    
     try testing.expectEqual(Copyability.combine(.copyable, .copyable), .copyable);
     try testing.expectEqual(Copyability.combine(.copyable, .explicit_nocopy), .contains_nocopy);
     try testing.expectEqual(Copyability.combine(.contains_nocopy, .explicit_nocopy), .contains_nocopy);

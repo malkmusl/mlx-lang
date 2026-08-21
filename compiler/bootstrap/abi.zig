@@ -63,7 +63,7 @@ pub const ArgClass = enum {
 pub fn classifyType(ty: Type) ArgClass {
     return switch (ty.data) {
         .primitive => |prim| switch (prim) {
-            .void_type, .noreturn_type => .NO_CLASS,
+            .void_type, .noreturn_type, .null_type, .undefined_type => .NO_CLASS,
             .bool_type,
             .comptime_int_type,
             .comptime_float_type,
@@ -71,11 +71,14 @@ pub fn classifyType(ty: Type) ArgClass {
             .anytype_type,
             .anyopaque_type,
             => .INTEGER,
-            .f32_type, .f64_type => .SSE,
+            // Float types → SSE registers
+            .f16_type, .f32_type, .f64_type, .f80_type, .f128_type => .SSE,
         },
         .integer => .INTEGER,
+        .size_int => .INTEGER, // usize/isize — pointer-width integer
         .pointer => .INTEGER,
         .function => .INTEGER, // function pointer
+        .optional => .INTEGER, // small optional fits in register (stage 0 simplification)
         // Aggregates: simplification — pass as MEMORY for now
         else => .MEMORY,
     };

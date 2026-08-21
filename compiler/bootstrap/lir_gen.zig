@@ -114,10 +114,14 @@ pub const LirBuilder = struct {
                 return result;
             },
             .const_decl => {
-                const name_tok_idx = node.data.lhs;
-                const expr_node = node.data.rhs;
+                // New layout: lhs = ident_tok, rhs = extra_start
+                // extra_data[rhs + 0] = type_node (0 = inferred)
+                // extra_data[rhs + 1] = init_expr node
+                const ident_tok_idx = node.data.lhs;
+                const extra_start = node.data.rhs;
+                const expr_node = self.sema.ast_tree.extra_data[extra_start + 1];
                 
-                const tok = self.sema.ast_tree.tokens[name_tok_idx];
+                const tok = self.sema.ast_tree.tokens[ident_tok_idx];
                 const src = self.sema.diags.source_manager.getFile(0).?.content;
                 const ident_name = src[tok.start..tok.end];
                 
@@ -127,7 +131,7 @@ pub const LirBuilder = struct {
                 const addr_inst = try self.emitInst(.{
                     .opcode = .addr,
                     .type_id = type_id,
-                    .data = .{ .addr = name_tok_idx },
+                    .data = .{ .addr = ident_tok_idx },
                 });
                 
                 try self.var_addresses.put(ident_name, addr_inst);
@@ -140,16 +144,27 @@ pub const LirBuilder = struct {
                 return expr_inst;
             },
             .var_decl => {
-                const type_id = self.sema.node_types.get(node_idx) orelse return null;
-                const rhs_inst = try self.lowerNode(node.data.rhs) orelse return null;
+                // New layout: lhs = ident_tok, rhs = extra_start
+                // extra_data[rhs + 0] = type_node (0 = inferred)
+                // extra_data[rhs + 1] = init_expr node
+                const ident_tok_idx = node.data.lhs;
+                const extra_start = node.data.rhs;
+                const init_node = self.sema.ast_tree.extra_data[extra_start + 1];
 
-                // Emulate variable allocation (addr) + store
-                // We'll use the AST node index as a pseudo ID for the local variable
+                const type_id = self.sema.node_types.get(node_idx) orelse return null;
+                const rhs_inst = try self.lowerNode(init_node) orelse return null;
+
+                const tok = self.sema.ast_tree.tokens[ident_tok_idx];
+                const src = self.sema.diags.source_manager.getFile(0).?.content;
+                const ident_name = src[tok.start..tok.end];
+
                 const addr_inst = try self.emitInst(.{
                     .opcode = .addr,
                     .type_id = type_id,
-                    .data = .{ .addr = node_idx },
+                    .data = .{ .addr = ident_tok_idx },
                 });
+
+                try self.var_addresses.put(ident_name, addr_inst);
 
                 result = try self.emitInst(.{
                     .opcode = .store,
