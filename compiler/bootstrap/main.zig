@@ -155,4 +155,6 @@ test {
     _ = @import("abi.zig");
     _ = @import("x86_64_encoder.zig");
     _ = @import("elf64.zig");
+    _ = @import("os_linux.zig");
+    _ = @import("posix.zig");
 }
