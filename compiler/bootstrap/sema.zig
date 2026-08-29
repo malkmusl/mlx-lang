@@ -5,7 +5,9 @@ const Type = @import("type.zig").Type;
 const TypePool = @import("type.zig").TypePool;
 const Scope = @import("scope.zig").Scope;
 const DiagnosticEngine = @import("diagnostics.zig").DiagnosticEngine;
+const Phase = @import("diagnostics.zig").Phase;
 const Token = @import("token.zig").Token;
+const builtin = @import("builtin.zig");
 
 pub const LocalState = enum {
     uninitialized,
@@ -25,6 +27,12 @@ pub const Sema = struct {
     local_states: std.AutoHashMap(Node.Index, LocalState),
     // Map from expression Node.Index to its resolved Type.Id
     node_types: std.AutoHashMap(Node.Index, Type.Id),
+    // Comptime values materialized by builtin evaluation.
+    const_values: std.AutoHashMap(Node.Index, u64),
+    // Type-valued expressions map to the type value they denote.
+    type_values: std.AutoHashMap(Node.Index, Type.Id),
+    unsafe_depth: u32,
+    eval_branch_quota: u64,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -41,12 +49,18 @@ pub const Sema = struct {
             .root_scope = root_scope,
             .local_states = std.AutoHashMap(Node.Index, LocalState).init(allocator),
             .node_types = std.AutoHashMap(Node.Index, Type.Id).init(allocator),
+            .const_values = std.AutoHashMap(Node.Index, u64).init(allocator),
+            .type_values = std.AutoHashMap(Node.Index, Type.Id).init(allocator),
+            .unsafe_depth = 0,
+            .eval_branch_quota = 1_000_000,
         };
     }
 
     pub fn deinit(self: *Sema) void {
         self.local_states.deinit();
         self.node_types.deinit();
+        self.const_values.deinit();
+        self.type_values.deinit();
     }
 
     pub fn analyze(self: *Sema) !void {
@@ -76,8 +90,38 @@ pub const Sema = struct {
             .integer_literal => {
                 const ty = try self.type_pool.intern(.{ .primitive = .comptime_int_type }, .copyable);
                 try self.node_types.put(node_idx, ty);
+                const tok = self.ast_tree.tokens[node.main_token];
+                const src = self.diags.source_manager.getFile(0).?.content;
+                if (std.fmt.parseInt(u64, src[tok.start..tok.end], 0)) |value| {
+                    try self.const_values.put(node_idx, value);
+                } else |_| {}
                 return ty;
             },
+            .float_literal => {
+                const ty = try self.type_pool.internPrimitive(.comptime_float_type);
+                try self.node_types.put(node_idx, ty);
+                return ty;
+            },
+            .bool_literal => {
+                const ty = try self.type_pool.internPrimitive(.bool_type);
+                const tok = self.ast_tree.tokens[node.main_token];
+                const src = self.diags.source_manager.getFile(0).?.content;
+                try self.const_values.put(node_idx, if (std.mem.eql(u8, src[tok.start..tok.end], "true")) 1 else 0);
+                try self.node_types.put(node_idx, ty);
+                return ty;
+            },
+            .string_literal => {
+                const u8_type = try self.type_pool.internInt(false, 8);
+                const ty = try self.type_pool.internSlice(u8_type, true);
+                try self.node_types.put(node_idx, ty);
+                return ty;
+            },
+            .pointer_type, .slice_type, .array_type, .optional_type, .error_union_type => {
+                const ty = try self.resolveTypeExpr(node_idx);
+                try self.node_types.put(node_idx, ty);
+                return ty;
+            },
+            .struct_decl, .enum_decl, .union_decl => return self.analyzeAggregateType(node_idx, scope),
             .identifier => {
                 const tok = self.ast_tree.tokens[node.main_token];
                 const src = self.diags.source_manager.getFile(0).?.content;
@@ -129,7 +173,7 @@ pub const Sema = struct {
                     const unsigned = ident_name[0] == 'u';
                     if ((signed or unsigned) and ident_name.len <= 5) {
                         const bits = std.fmt.parseInt(u16, ident_name[1..], 10) catch 0;
-                        if (bits > 0 and bits <= 128) {
+                        if (bits > 0 and bits <= 4096) {
                             const ty = try self.type_pool.intern(.{ .integer = .{ .is_signed = signed, .bits = bits } }, .copyable);
                             try self.node_types.put(node_idx, ty);
                             return ty;
@@ -188,11 +232,14 @@ pub const Sema = struct {
                     });
                 }
 
-                // Enforce nocopy
-                const copyability = self.type_pool.types.items[declared_type].copyability;
+                // A fresh rvalue may initialize non-copyable storage. The forbidden
+                // operation is reading an existing addressable value by copy; such a
+                // transfer must be written with @move.
+                const copyability = self.type_pool.types.items[inferred_type].copyability;
                 if (copyability != .copyable) {
                     const rhs_node = self.ast_tree.nodes.get(init_node);
-                    if (rhs_node.tag != .move_builtin and rhs_node.tag != .nocopy_builtin) {
+                    const copies_storage = rhs_node.tag == .identifier or rhs_node.tag == .field_access;
+                    if (copies_storage and !self.sourceIsMoved(init_node, scope)) {
                         try self.reportError(6002, .sema, ident_tok.start, "Cannot copy a non-copyable type");
                     }
                 }
@@ -217,64 +264,81 @@ pub const Sema = struct {
 
                 try self.local_states.put(node_idx, .initialized);
                 try self.node_types.put(node_idx, declared_type);
+                if (self.type_values.get(init_node)) |type_value| {
+                    try self.type_values.put(node_idx, type_value);
+                }
+                if (self.const_values.get(init_node)) |const_value| {
+                    try self.const_values.put(node_idx, const_value);
+                }
 
                 return declared_type;
             },
-            .nocopy_builtin => {
-                // @nocopy(expr) -> wraps type
-                // Wait, our parser AST puts the wrapped node in rhs
-                const inner = node.data.rhs;
-                const inner_type = try self.analyzeNode(inner, scope);
-                // Return a nocopy version of inner type
-                const ty = try self.type_pool.intern(self.type_pool.types.items[inner_type].data, .explicit_nocopy);
-                try self.node_types.put(node_idx, ty);
-                return ty;
-            },
-            .move_builtin => {
-                const inner = node.data.rhs;
-                const inner_type = try self.analyzeNode(inner, scope);
-
-                // Find the declaration to transition to moved
-                const inner_node = self.ast_tree.nodes.get(inner);
-                if (inner_node.tag == .identifier) {
-                    const tok = self.ast_tree.tokens[inner_node.main_token];
-                    const src = self.diags.source_manager.getFile(0).?.content;
-                    const name = src[tok.start..tok.end];
-
-                    if (scope.get(name)) |sym| {
-                        try self.local_states.put(sym.decl_node, .moved);
-                    }
-                }
-
-                try self.node_types.put(node_idx, inner_type);
-                return inner_type;
-            },
-            .typeof_builtin => {
-                const inner = node.data.rhs;
-                const inner_type = try self.analyzeNode(inner, scope);
-                _ = inner_type;
-
-                // Return a type_type
-                const ty = try self.type_pool.intern(.{ .primitive = .type_type }, .copyable);
-                try self.node_types.put(node_idx, ty);
-                return ty;
-            },
-            .sizeof_builtin => {
-                const inner = node.data.rhs;
-                const inner_type = try self.analyzeNode(inner, scope);
-                _ = inner_type;
-
-                // Return comptime_int
-                const ty = try self.type_pool.intern(.{ .primitive = .comptime_int_type }, .copyable);
-                try self.node_types.put(node_idx, ty);
-                return ty;
-            },
+            .builtin_call => return self.analyzeBuiltin(node_idx, scope),
             .binary_op => {
                 // Simple pass through for now
                 const lhs = try self.analyzeNode(node.data.lhs, scope);
                 _ = try self.analyzeNode(node.data.rhs, scope);
                 try self.node_types.put(node_idx, lhs);
                 return lhs;
+            },
+            .unary_op => {
+                const operand_type = try self.analyzeNode(node.data.lhs, scope);
+                const operator = self.ast_tree.tokens[node.main_token].tag;
+                if (operator == .keyword_try) {
+                    const operand = self.type_pool.get(operand_type);
+                    if (operand.data != .error_union) {
+                        try self.reportError(4014, .sema, self.ast_tree.tokens[node.main_token].start, "try requires an error-union operand");
+                        try self.node_types.put(node_idx, operand_type);
+                        return operand_type;
+                    }
+                    const payload = operand.data.error_union.payload;
+                    try self.node_types.put(node_idx, payload);
+                    return payload;
+                }
+                try self.node_types.put(node_idx, operand_type);
+                return operand_type;
+            },
+            .tuple_literal => {
+                const extra_start = node.data.lhs;
+                const count = self.ast_tree.extra_data[extra_start];
+                var fields = std.ArrayList(TypePool.AggregateFieldInput).empty;
+                defer fields.deinit(self.allocator);
+                var i: u32 = 0;
+                while (i < count) : (i += 1) {
+                    const element_type = try self.analyzeNode(self.ast_tree.extra_data[extra_start + 1 + i], scope);
+                    try fields.append(self.allocator, .{ .name = "", .type_id = element_type });
+                }
+                const ty = self.type_pool.internAggregate(.tuple, fields.items, null, null) catch {
+                    try self.reportError(5005, .@"comptime", self.ast_tree.tokens[node.main_token].start, "Tuple layout could not be computed");
+                    return self.type_pool.internPrimitive(.void_type);
+                };
+                try self.node_types.put(node_idx, ty);
+                return ty;
+            },
+            .field_access => {
+                const base_type = try self.analyzeNode(node.data.lhs, scope);
+                const base = self.type_pool.get(base_type);
+                if (base.data == .primitive and base.data.primitive == .anyopaque_type) {
+                    try self.node_types.put(node_idx, base_type);
+                    return base_type;
+                }
+                const field_token = self.ast_tree.tokens[node.main_token];
+                const src = self.diags.source_manager.getFile(0).?.content;
+                if (self.type_pool.aggregateField(base_type, src[field_token.start..field_token.end])) |field| {
+                    try self.node_types.put(node_idx, field.type_id);
+                    return field.type_id;
+                }
+                const tok = self.ast_tree.tokens[node.main_token];
+                try self.reportError(3001, .resolve, tok.start, "Unknown field or declaration");
+                try self.node_types.put(node_idx, base_type);
+                return base_type;
+            },
+            .unsafe_block => {
+                self.unsafe_depth += 1;
+                defer self.unsafe_depth -= 1;
+                const ty = try self.analyzeNode(node.data.lhs, scope);
+                try self.node_types.put(node_idx, ty);
+                return ty;
             },
             .block => {
                 const extra_start = node.data.lhs;
@@ -433,11 +497,502 @@ pub const Sema = struct {
         }
     }
 
-    fn reportError(self: *Sema, code: u32, phase: @import("diagnostics.zig").Phase, start_byte: u32, msg: []const u8) !void {
+    fn analyzeBuiltin(self: *Sema, node_idx: Node.Index, scope: *Scope) std.mem.Allocator.Error!Type.Id {
+        const node = self.ast_tree.nodes.get(node_idx);
+        const src = self.diags.source_manager.getFile(0).?.content;
+        const name_token = self.ast_tree.tokens[node.data.lhs];
+        const name = src[name_token.start..name_token.end];
+        const kind = builtin.lookup(name) orelse {
+            try self.reportError(3001, .resolve, name_token.start, "Unknown builtin");
+            return self.putBuiltinResult(node_idx, try self.type_pool.internPrimitive(.void_type));
+        };
+
+        const extra_start = node.data.rhs;
+        const arg_count = self.ast_tree.extra_data[extra_start];
+        const args = self.ast_tree.extra_data[extra_start + 1 .. extra_start + 1 + arg_count];
+        if (builtin.arity(kind)) |expected| {
+            if (!expected.accepts(args.len)) {
+                try self.reportError(5005, .@"comptime", name_token.start, "Invalid builtin argument count");
+                return self.putBuiltinResult(node_idx, try self.type_pool.internPrimitive(.void_type));
+            }
+        }
+
+        switch (kind) {
+            .typeOf => {
+                const value_type = try self.analyzeNode(args[0], scope);
+                try self.type_values.put(node_idx, value_type);
+                return self.putBuiltinResult(node_idx, try self.type_pool.internPrimitive(.type_type));
+            },
+            .nocopy => {
+                const wrapped = try self.resolveBuiltinTypeArg(args[0], scope) orelse {
+                    try self.reportError(5005, .@"comptime", name_token.start, "@nocopy requires a type argument");
+                    return self.putBuiltinResult(node_idx, try self.type_pool.internPrimitive(.type_type));
+                };
+                const wrapped_type = self.type_pool.get(wrapped);
+                const nocopy_type = try self.type_pool.intern(wrapped_type.data, .explicit_nocopy);
+                try self.type_values.put(node_idx, nocopy_type);
+                return self.putBuiltinResult(node_idx, try self.type_pool.internPrimitive(.type_type));
+            },
+            .move => {
+                const arg_node = self.ast_tree.nodes.get(args[0]);
+                const value_type = try self.analyzeNode(args[0], scope);
+                if (arg_node.tag != .identifier and arg_node.tag != .field_access) {
+                    try self.reportError(6003, .sema, name_token.start, "@move source must be addressable storage");
+                    return self.putBuiltinResult(node_idx, value_type);
+                }
+                if (arg_node.tag == .identifier) {
+                    const token = self.ast_tree.tokens[arg_node.main_token];
+                    const value_name = src[token.start..token.end];
+                    if (scope.get(value_name)) |symbol| {
+                        try self.local_states.put(symbol.decl_node, .moved);
+                    }
+                }
+                if (self.type_pool.get(value_type).isCopyable()) {
+                    try self.reportWarning(6001, .sema, name_token.start, "Redundant move of a copyable value");
+                }
+                return self.putBuiltinResult(node_idx, value_type);
+            },
+            .sizeOf, .alignOf, .bitSizeOf => {
+                const type_value = try self.resolveBuiltinTypeArg(args[0], scope) orelse {
+                    try self.reportError(5005, .@"comptime", name_token.start, "Layout builtin requires a type argument");
+                    return self.putBuiltinResult(node_idx, try self.type_pool.internPrimitive(.comptime_int_type));
+                };
+                const value = switch (kind) {
+                    .sizeOf => self.type_pool.sizeOf(type_value) catch {
+                        try self.reportError(5005, .@"comptime", name_token.start, "Type has no runtime size");
+                        return self.putBuiltinResult(node_idx, try self.type_pool.internPrimitive(.comptime_int_type));
+                    },
+                    .alignOf => self.type_pool.alignOf(type_value) catch {
+                        try self.reportError(5005, .@"comptime", name_token.start, "Type has no runtime alignment");
+                        return self.putBuiltinResult(node_idx, try self.type_pool.internPrimitive(.comptime_int_type));
+                    },
+                    .bitSizeOf => self.type_pool.bitSizeOf(type_value) catch {
+                        try self.reportError(5005, .@"comptime", name_token.start, "Type has no runtime bit size");
+                        return self.putBuiltinResult(node_idx, try self.type_pool.internPrimitive(.comptime_int_type));
+                    },
+                    else => unreachable,
+                };
+                try self.const_values.put(node_idx, value);
+                return self.putBuiltinResult(node_idx, try self.type_pool.internPrimitive(.comptime_int_type));
+            },
+            .isInteger,
+            .isFloat,
+            .isStruct,
+            .isEnum,
+            .isUnion,
+            .isPointer,
+            .isSlice,
+            .isArray,
+            .isOptional,
+            .isErrorUnion,
+            .isCopyable,
+            => {
+                const type_value = try self.resolveBuiltinTypeArg(args[0], scope) orelse {
+                    try self.reportError(5005, .@"comptime", name_token.start, "Type predicate requires a type argument");
+                    return self.putBoolBuiltinResult(node_idx, false);
+                };
+                const ty = self.type_pool.get(type_value);
+                const result = switch (kind) {
+                    .isInteger => ty.isInteger(),
+                    .isFloat => ty.isFloat(),
+                    .isStruct => ty.data == .@"struct",
+                    .isEnum => ty.data == .@"enum",
+                    .isUnion => ty.data == .@"union",
+                    .isPointer => ty.data == .pointer and ty.data.pointer.size != .Slice,
+                    .isSlice => ty.data == .pointer and ty.data.pointer.size == .Slice,
+                    .isArray => ty.data == .array,
+                    .isOptional => ty.data == .optional,
+                    .isErrorUnion => ty.data == .error_union,
+                    .isCopyable => ty.isCopyable(),
+                    else => unreachable,
+                };
+                return self.putBoolBuiltinResult(node_idx, result);
+            },
+            .Vector => {
+                _ = try self.analyzeNode(args[0], scope);
+                const len = self.const_values.get(args[0]) orelse {
+                    try self.reportError(5001, .@"comptime", name_token.start, "@Vector length must be comptime-known");
+                    return self.putBuiltinResult(node_idx, try self.type_pool.internPrimitive(.type_type));
+                };
+                if (len == 0 or len > std.math.maxInt(u32)) {
+                    try self.reportError(4002, .sema, name_token.start, "Invalid vector length");
+                    return self.putBuiltinResult(node_idx, try self.type_pool.internPrimitive(.type_type));
+                }
+                const child_type = try self.resolveBuiltinTypeArg(args[1], scope) orelse {
+                    try self.reportError(5005, .@"comptime", name_token.start, "@Vector element must be a type");
+                    return self.putBuiltinResult(node_idx, try self.type_pool.internPrimitive(.type_type));
+                };
+                const child = self.type_pool.get(child_type);
+                if (!child.isInteger() and !child.isFloat() and !(child.data == .primitive and child.data.primitive == .bool_type)) {
+                    try self.reportError(4001, .sema, name_token.start, "Vector element type must be integer, float, or bool");
+                }
+                const vector_type = try self.type_pool.intern(.{ .vector = .{ .len = @intCast(len), .child_type = child_type } }, .copyable);
+                try self.type_values.put(node_idx, vector_type);
+                return self.putBuiltinResult(node_idx, try self.type_pool.internPrimitive(.type_type));
+            },
+            .intCast,
+            .floatCast,
+            .floatFromInt,
+            .intFromFloat,
+            .ptrCast,
+            .alignCast,
+            .bitCast,
+            .ptrFromInt,
+            .enumFromInt,
+            => return self.analyzeCastBuiltin(kind, node_idx, args, scope, name_token.start),
+            .intFromPtr => {
+                const source_type = try self.analyzeNode(args[0], scope);
+                if (self.type_pool.get(source_type).data != .pointer) {
+                    try self.reportError(4003, .sema, name_token.start, "@intFromPtr requires a pointer");
+                }
+                return self.putBuiltinResult(node_idx, try self.type_pool.internSizeInt(false));
+            },
+            .intFromEnum => {
+                const source_type = try self.analyzeNode(args[0], scope);
+                if (self.type_pool.get(source_type).data != .@"enum") {
+                    try self.reportError(4003, .sema, name_token.start, "@intFromEnum requires an enum value");
+                    return self.putBuiltinResult(node_idx, try self.type_pool.internSizeInt(false));
+                }
+                const backing = (self.type_pool.aggregateInfo(source_type) orelse unreachable).backing_type orelse unreachable;
+                return self.putBuiltinResult(node_idx, backing);
+            },
+            .discardError => {
+                const value_type = try self.analyzeNode(args[0], scope);
+                if (self.type_pool.get(value_type).data != .error_union) {
+                    try self.reportError(4001, .sema, name_token.start, "@discardError requires an error union");
+                }
+                return self.putBuiltinResult(node_idx, try self.type_pool.internPrimitive(.void_type));
+            },
+            .compileError => {
+                const message = self.stringLiteralContent(args[0]) orelse "@compileError requires a string literal";
+                try self.reportError(5003, .@"comptime", self.ast_tree.tokens[node.main_token].start, message);
+                return self.putBuiltinResult(node_idx, try self.type_pool.internPrimitive(.noreturn_type));
+            },
+            .setEvalBranchQuota => {
+                _ = try self.analyzeNode(args[0], scope);
+                self.eval_branch_quota = self.const_values.get(args[0]) orelse {
+                    try self.reportError(5001, .@"comptime", name_token.start, "Evaluation quota must be comptime-known");
+                    return self.putBuiltinResult(node_idx, try self.type_pool.internPrimitive(.void_type));
+                };
+                return self.putBuiltinResult(node_idx, try self.type_pool.internPrimitive(.void_type));
+            },
+            .import => {
+                if (self.stringLiteralContent(args[0]) == null) {
+                    try self.reportError(5001, .@"comptime", name_token.start, "@import path must be a comptime string literal");
+                }
+                return self.putBuiltinResult(node_idx, try self.type_pool.internPrimitive(.anyopaque_type));
+            },
+            .fieldCount => {
+                const aggregate_type = try self.resolveBuiltinTypeArg(args[0], scope) orelse {
+                    try self.reportError(5005, .@"comptime", name_token.start, "@fieldCount requires a type argument");
+                    return self.putBuiltinResult(node_idx, try self.type_pool.internPrimitive(.comptime_int_type));
+                };
+                const info = self.type_pool.aggregateInfo(aggregate_type) orelse {
+                    try self.reportError(5005, .@"comptime", name_token.start, "@fieldCount requires an aggregate type");
+                    return self.putBuiltinResult(node_idx, try self.type_pool.internPrimitive(.comptime_int_type));
+                };
+                try self.const_values.put(node_idx, info.fields_len);
+                return self.putBuiltinResult(node_idx, try self.type_pool.internPrimitive(.comptime_int_type));
+            },
+            .fieldType => {
+                const aggregate_type = try self.resolveBuiltinTypeArg(args[0], scope) orelse {
+                    try self.reportError(5005, .@"comptime", name_token.start, "@fieldType requires an aggregate type");
+                    return self.putBuiltinResult(node_idx, try self.type_pool.internPrimitive(.type_type));
+                };
+                const field_name = self.stringLiteralContent(args[1]) orelse {
+                    try self.reportError(5001, .@"comptime", name_token.start, "@fieldType field name must be a comptime string");
+                    return self.putBuiltinResult(node_idx, try self.type_pool.internPrimitive(.type_type));
+                };
+                const field = self.type_pool.aggregateField(aggregate_type, field_name) orelse {
+                    try self.reportError(5005, .@"comptime", name_token.start, "Unknown aggregate field");
+                    return self.putBuiltinResult(node_idx, try self.type_pool.internPrimitive(.type_type));
+                };
+                try self.type_values.put(node_idx, field.type_id);
+                return self.putBuiltinResult(node_idx, try self.type_pool.internPrimitive(.type_type));
+            },
+            .hasField => {
+                const aggregate_type = try self.resolveBuiltinTypeArg(args[0], scope) orelse {
+                    try self.reportError(5005, .@"comptime", name_token.start, "@hasField requires an aggregate type");
+                    return self.putBoolBuiltinResult(node_idx, false);
+                };
+                const field_name = self.stringLiteralContent(args[1]) orelse {
+                    try self.reportError(5001, .@"comptime", name_token.start, "@hasField field name must be a comptime string");
+                    return self.putBoolBuiltinResult(node_idx, false);
+                };
+                return self.putBoolBuiltinResult(node_idx, self.type_pool.aggregateField(aggregate_type, field_name) != null);
+            },
+            .offsetOf => {
+                const aggregate_type = try self.resolveBuiltinTypeArg(args[0], scope) orelse {
+                    try self.reportError(5005, .@"comptime", name_token.start, "@offsetOf requires an aggregate type");
+                    return self.putBuiltinResult(node_idx, try self.type_pool.internPrimitive(.comptime_int_type));
+                };
+                const field_name = self.stringLiteralContent(args[1]) orelse {
+                    try self.reportError(5001, .@"comptime", name_token.start, "@offsetOf field name must be a comptime string");
+                    return self.putBuiltinResult(node_idx, try self.type_pool.internPrimitive(.comptime_int_type));
+                };
+                const field = self.type_pool.aggregateField(aggregate_type, field_name) orelse {
+                    try self.reportError(5005, .@"comptime", name_token.start, "Unknown aggregate field");
+                    return self.putBuiltinResult(node_idx, try self.type_pool.internPrimitive(.comptime_int_type));
+                };
+                try self.const_values.put(node_idx, field.offset);
+                return self.putBuiltinResult(node_idx, try self.type_pool.internPrimitive(.comptime_int_type));
+            },
+            .field => {
+                const aggregate_type = try self.analyzeNode(args[0], scope);
+                const field_name = self.stringLiteralContent(args[1]) orelse {
+                    try self.reportError(5001, .@"comptime", name_token.start, "@field field name must be a comptime string");
+                    return self.putBuiltinResult(node_idx, try self.type_pool.internPrimitive(.void_type));
+                };
+                const field = self.type_pool.aggregateField(aggregate_type, field_name) orelse {
+                    try self.reportError(5005, .@"comptime", name_token.start, "Unknown aggregate field");
+                    return self.putBuiltinResult(node_idx, try self.type_pool.internPrimitive(.void_type));
+                };
+                try self.reportError(9001, .lowering, name_token.start, "Dynamic aggregate field lowering is not available in Stage 0 yet");
+                return self.putBuiltinResult(node_idx, field.type_id);
+            },
+            .tagOf => {
+                const value_type = try self.analyzeNode(args[0], scope);
+                const info = self.type_pool.aggregateInfo(value_type) orelse {
+                    try self.reportError(5005, .@"comptime", name_token.start, "@tagOf requires an enum or tagged union value");
+                    return self.putBuiltinResult(node_idx, try self.type_pool.internPrimitive(.void_type));
+                };
+                const backing = info.backing_type orelse {
+                    try self.reportError(5005, .@"comptime", name_token.start, "@tagOf requires an enum or tagged union value");
+                    return self.putBuiltinResult(node_idx, try self.type_pool.internPrimitive(.void_type));
+                };
+                return self.putBuiltinResult(node_idx, backing);
+            },
+            .typeInfo,
+            .hasDecl,
+            .decl,
+            .languageVersion,
+            => {
+                try self.reportError(5005, .@"comptime", name_token.start, "Reflection builtin requires aggregate/module metadata not implemented in Stage 0 yet");
+                return self.putBuiltinResult(node_idx, try self.type_pool.internPrimitive(.anyopaque_type));
+            },
+            .atomicLoad,
+            .atomicRmw,
+            .atomicStore,
+            .cmpxchgStrong,
+            .cmpxchgWeak,
+            .fence,
+            .splat,
+            .shuffle,
+            .reduce,
+            .select,
+            => {
+                for (args) |arg| _ = try self.analyzeNode(arg, scope);
+                try self.reportError(9001, .lowering, name_token.start, "Builtin lowering is not available in the Stage-0 backend yet");
+                return self.putBuiltinResult(node_idx, try self.type_pool.internPrimitive(.void_type));
+            },
+        }
+    }
+
+    fn sourceIsMoved(self: *Sema, node_idx: Node.Index, scope: *Scope) bool {
+        const node = self.ast_tree.nodes.get(node_idx);
+        if (node.tag != .identifier) return false;
+        const token = self.ast_tree.tokens[node.main_token];
+        const src = self.diags.source_manager.getFile(0).?.content;
+        const symbol = scope.get(src[token.start..token.end]) orelse return false;
+        return (self.local_states.get(symbol.decl_node) orelse return false) == .moved;
+    }
+
+    fn analyzeAggregateType(self: *Sema, node_idx: Node.Index, scope: *Scope) std.mem.Allocator.Error!Type.Id {
+        if (self.type_values.get(node_idx)) |_| return self.type_pool.internPrimitive(.type_type);
+
+        const node = self.ast_tree.nodes.get(node_idx);
+        const kind: TypePool.AggregateKind = switch (node.tag) {
+            .struct_decl => .@"struct",
+            .enum_decl => .@"enum",
+            .union_decl => .@"union",
+            else => unreachable,
+        };
+        const backing_node = self.ast_tree.extra_data[node.data.lhs];
+        var backing_type: ?Type.Id = null;
+        if (backing_node != std.math.maxInt(u32)) {
+            backing_type = try self.resolveBuiltinTypeArg(backing_node, scope) orelse {
+                try self.reportError(5005, .@"comptime", self.ast_tree.tokens[node.main_token].start, "Aggregate backing/tag must be a type");
+                return self.type_pool.internPrimitive(.type_type);
+            };
+            if (kind == .@"enum" and !self.type_pool.get(backing_type.?).isInteger()) {
+                try self.reportError(4001, .sema, self.ast_tree.tokens[node.main_token].start, "Enum backing type must be an integer");
+            }
+        }
+
+        var fields = std.ArrayList(TypePool.AggregateFieldInput).empty;
+        defer fields.deinit(self.allocator);
+        const src = self.diags.source_manager.getFile(0).?.content;
+        var extra_index = node.data.lhs + 1;
+        while (extra_index < node.data.rhs) : (extra_index += 1) {
+            const member_index = self.ast_tree.extra_data[extra_index];
+            const member = self.ast_tree.nodes.get(member_index);
+            const name_token = self.ast_tree.tokens[member.main_token];
+            const member_type: Type.Id = switch (member.tag) {
+                .field_decl => try self.resolveBuiltinTypeArg(member.data.lhs, scope) orelse {
+                    try self.reportError(5005, .@"comptime", name_token.start, "Struct field type could not be resolved");
+                    continue;
+                },
+                .union_member => if (member.data.lhs == std.math.maxInt(u32))
+                    try self.type_pool.internPrimitive(.void_type)
+                else
+                    try self.resolveBuiltinTypeArg(member.data.lhs, scope) orelse {
+                        try self.reportError(5005, .@"comptime", name_token.start, "Union member type could not be resolved");
+                        continue;
+                    },
+                .enum_member => backing_type orelse {
+                    try self.reportError(5005, .@"comptime", name_token.start, "Enum has no backing type");
+                    continue;
+                },
+                else => continue,
+            };
+            if (member.data.rhs != std.math.maxInt(u32)) _ = try self.analyzeNode(member.data.rhs, scope);
+            try fields.append(self.allocator, .{
+                .name = src[name_token.start..name_token.end],
+                .type_id = member_type,
+            });
+        }
+
+        const aggregate_type = self.type_pool.internAggregate(kind, fields.items, backing_type, null) catch {
+            try self.reportError(5005, .@"comptime", self.ast_tree.tokens[node.main_token].start, "Aggregate layout could not be computed");
+            return self.type_pool.internPrimitive(.type_type);
+        };
+        try self.type_values.put(node_idx, aggregate_type);
+        const result_type = try self.type_pool.internPrimitive(.type_type);
+        try self.node_types.put(node_idx, result_type);
+        return result_type;
+    }
+
+    fn analyzeCastBuiltin(
+        self: *Sema,
+        kind: builtin.Kind,
+        node_idx: Node.Index,
+        args: []const u32,
+        scope: *Scope,
+        start_byte: u32,
+    ) std.mem.Allocator.Error!Type.Id {
+        const target_type = try self.resolveBuiltinTypeArg(args[0], scope) orelse {
+            try self.reportError(4003, .sema, start_byte, "Cast target must be a type");
+            return self.putBuiltinResult(node_idx, try self.type_pool.internPrimitive(.void_type));
+        };
+        const source_type = try self.analyzeNode(args[1], scope);
+        const target = self.type_pool.get(target_type);
+        const source = self.type_pool.get(source_type);
+
+        const valid = switch (kind) {
+            .intCast => target.isInteger() and source.isInteger(),
+            .floatCast => target.isFloat() and source.isFloat(),
+            .floatFromInt => target.isFloat() and source.isInteger(),
+            .intFromFloat => target.isInteger() and source.isFloat(),
+            .ptrCast, .alignCast => target.data == .pointer and source.data == .pointer,
+            .bitCast => blk: {
+                const target_bits = self.type_pool.bitSizeOf(target_type) catch break :blk false;
+                const source_bits = self.type_pool.bitSizeOf(source_type) catch break :blk false;
+                break :blk target_bits == source_bits;
+            },
+            .ptrFromInt => target.data == .pointer and source.isInteger(),
+            .enumFromInt => target.data == .@"enum" and source.isInteger(),
+            else => false,
+        };
+        if (!valid) try self.reportError(4003, .sema, start_byte, "Invalid cast operands");
+        const requires_float_lowering = kind == .floatCast or kind == .floatFromInt or kind == .intFromFloat or
+            (kind == .bitCast and (target.isFloat() or source.isFloat()));
+        if (valid and requires_float_lowering) {
+            try self.reportError(9001, .lowering, start_byte, "Floating-point builtin lowering is not available in Stage 0 yet");
+        }
+        if (valid and kind == .intCast) {
+            if (self.const_values.get(args[1])) |value| {
+                if (!integerValueFits(target, value)) {
+                    try self.reportError(4002, .sema, start_byte, "Integer value is out of range for cast target");
+                } else {
+                    try self.const_values.put(node_idx, value);
+                }
+            }
+        } else if (valid and (kind == .bitCast or kind == .ptrFromInt or kind == .enumFromInt)) {
+            if (self.const_values.get(args[1])) |value| try self.const_values.put(node_idx, value);
+        }
+        if ((kind == .ptrFromInt or kind == .ptrCast) and self.unsafe_depth == 0) {
+            try self.reportError(7004, .sema, start_byte, "Pointer provenance cast requires unsafe block");
+        }
+        return self.putBuiltinResult(node_idx, target_type);
+    }
+
+    fn integerValueFits(target: Type, value: u64) bool {
+        return switch (target.data) {
+            .integer => |int| if (int.is_signed)
+                int.bits > 64 or value <= (@as(u64, 1) << @intCast(int.bits - 1)) - 1
+            else
+                int.bits >= 64 or value <= (@as(u64, 1) << @intCast(int.bits)) - 1,
+            .size_int => true,
+            else => false,
+        };
+    }
+
+    fn resolveBuiltinTypeArg(self: *Sema, node_idx: Node.Index, scope: *Scope) std.mem.Allocator.Error!?Type.Id {
+        const node = self.ast_tree.nodes.get(node_idx);
+        switch (node.tag) {
+            .identifier => {
+                const token = self.ast_tree.tokens[node.main_token];
+                const src = self.diags.source_manager.getFile(0).?.content;
+                if (scope.get(src[token.start..token.end])) |symbol| {
+                    if (self.type_values.get(symbol.decl_node)) |type_value| return type_value;
+                }
+                return try self.resolveTypeExpr(node_idx);
+            },
+            .pointer_type, .slice_type, .array_type, .optional_type, .error_union_type => {
+                return try self.resolveTypeExpr(node_idx);
+            },
+            .struct_decl, .enum_decl, .union_decl => {
+                _ = try self.analyzeAggregateType(node_idx, scope);
+                return self.type_values.get(node_idx);
+            },
+            .builtin_call => {
+                _ = try self.analyzeNode(node_idx, scope);
+                return self.type_values.get(node_idx);
+            },
+
+            else => return null,
+        }
+    }
+
+    fn putBuiltinResult(self: *Sema, node_idx: Node.Index, type_id: Type.Id) std.mem.Allocator.Error!Type.Id {
+        try self.node_types.put(node_idx, type_id);
+        return type_id;
+    }
+
+    fn putBoolBuiltinResult(self: *Sema, node_idx: Node.Index, value: bool) std.mem.Allocator.Error!Type.Id {
+        try self.const_values.put(node_idx, @intFromBool(value));
+        return self.putBuiltinResult(node_idx, try self.type_pool.internPrimitive(.bool_type));
+    }
+
+    fn stringLiteralContent(self: *Sema, node_idx: Node.Index) ?[]const u8 {
+        const node = self.ast_tree.nodes.get(node_idx);
+        if (node.tag != .string_literal) return null;
+        const token = self.ast_tree.tokens[node.main_token];
+        const src = self.diags.source_manager.getFile(0).?.content;
+        const raw = src[token.start..token.end];
+        if (raw.len < 2) return null;
+        return raw[1 .. raw.len - 1];
+    }
+
+    fn reportError(self: *Sema, code: u32, phase: Phase, start_byte: u32, msg: []const u8) !void {
         try self.diags.report(.{
             .code = code,
             .phase = phase,
             .severity = .@"error",
+            .primary_span = .{
+                .file_id = 0,
+                .start_byte = start_byte,
+                .end_byte = start_byte + 1,
+            },
+            .message = msg,
+        });
+    }
+
+    fn reportWarning(self: *Sema, code: u32, phase: Phase, start_byte: u32, msg: []const u8) !void {
+        try self.diags.report(.{
+            .code = code,
+            .phase = phase,
+            .severity = .warning,
             .primary_span = .{
                 .file_id = 0,
                 .start_byte = start_byte,
@@ -459,21 +1014,49 @@ pub const Sema = struct {
                 // Resolve built-in type names
                 const tok = self.ast_tree.tokens[node.main_token];
                 const name = src[tok.start..tok.end];
+                if (self.root_scope.get(name)) |symbol| {
+                    if (self.type_values.get(symbol.decl_node)) |type_value| return type_value;
+                }
                 return self.resolveBuiltinTypeName(name, tok.start);
+            },
+
+            .builtin_call => {
+                if (self.type_values.get(node_idx)) |type_value| return type_value;
+                try self.reportError(5005, .@"comptime", self.ast_tree.tokens[node.main_token].start, "Builtin expression does not denote a type");
+                return self.type_pool.internPrimitive(.void_type);
+            },
+
+            .struct_decl, .enum_decl, .union_decl => {
+                if (self.type_values.get(node_idx)) |type_value| return type_value;
+                _ = try self.analyzeAggregateType(node_idx, self.root_scope);
+                return self.type_values.get(node_idx) orelse self.type_pool.internPrimitive(.void_type);
             },
 
             .pointer_type => {
                 const child = try self.resolveTypeExpr(node.data.lhs);
-                const flags = node.data.rhs;
+                var flags = node.data.rhs;
+                var explicit_alignment: ?u64 = null;
+                if ((flags & 0x8000_0000) != 0) {
+                    const qualifier_start = flags & 0x7fff_ffff;
+                    flags = self.ast_tree.extra_data[qualifier_start];
+                    const alignment_node = self.ast_tree.extra_data[qualifier_start + 1];
+                    explicit_alignment = self.comptimeInteger(alignment_node);
+                    if (explicit_alignment == null or explicit_alignment.? == 0 or !std.math.isPowerOfTwo(explicit_alignment.?)) {
+                        try self.reportError(7002, .sema, self.ast_tree.tokens[node.main_token].start, "Pointer alignment must be a comptime power of two");
+                        explicit_alignment = null;
+                    }
+                }
                 const is_const = (flags & 1) != 0;
                 const is_many = (flags & 2) != 0;
+                const is_volatile = (flags & 8) != 0;
                 const size: Type.PointerSize = if (is_many) .Many else .One;
                 return self.type_pool.intern(.{ .pointer = .{
                     .child_type = child,
                     .is_const = is_const,
-                    .is_volatile = false,
+                    .is_volatile = is_volatile,
                     .is_allowzero = false,
                     .is_optional = false,
+                    .alignment = explicit_alignment,
                     .size = size,
                     .sentinel = null,
                 } }, .copyable);
@@ -488,6 +1071,7 @@ pub const Sema = struct {
                     .is_volatile = false,
                     .is_allowzero = false,
                     .is_optional = false,
+                    .alignment = null,
                     .size = .Slice,
                     .sentinel = null,
                 } }, .copyable);
@@ -536,6 +1120,15 @@ pub const Sema = struct {
         }
     }
 
+    fn comptimeInteger(self: *Sema, node_idx: Node.Index) ?u64 {
+        if (self.const_values.get(node_idx)) |value| return value;
+        const node = self.ast_tree.nodes.get(node_idx);
+        if (node.tag != .integer_literal) return null;
+        const token = self.ast_tree.tokens[node.main_token];
+        const src = self.diags.source_manager.getFile(0).?.content;
+        return std.fmt.parseInt(u64, src[token.start..token.end], 0) catch null;
+    }
+
     /// Resolve a plain identifier to a built-in type.
     fn resolveBuiltinTypeName(self: *Sema, name: []const u8, start_byte: u32) !Type.Id {
         // Primitive names
@@ -562,7 +1155,7 @@ pub const Sema = struct {
             const unsigned = name[0] == 'u';
             if ((signed or unsigned) and name.len <= 5) {
                 const bits = std.fmt.parseInt(u16, name[1..], 10) catch 0;
-                if (bits > 0 and bits <= 128) {
+                if (bits > 0 and bits <= 4096) {
                     return self.type_pool.internInt(signed, bits);
                 }
             }

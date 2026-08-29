@@ -5,6 +5,7 @@ const TypePool = @import("type.zig").TypePool;
 const Sema = @import("sema.zig").Sema;
 const Lir = @import("lir.zig").Lir;
 const Inst = @import("lir.zig").Inst;
+const builtin = @import("builtin.zig");
 
 pub const LirBuilder = struct {
     allocator: std.mem.Allocator,
@@ -32,7 +33,7 @@ pub const LirBuilder = struct {
     pub fn generate(self: *LirBuilder) !void {
         std.debug.print("-> ENTER: LirBuilder.generate\n", .{});
         defer std.debug.print("<- EXIT: LirBuilder.generate\n", .{});
-        
+
         // Ensure at least one block exists
         try self.lir.blocks.append(self.allocator, @import("lir.zig").BasicBlock.init());
         self.current_block = 0;
@@ -42,7 +43,7 @@ pub const LirBuilder = struct {
 
         const extra_start = root_node.data.lhs;
         const extra_end = root_node.data.rhs;
-        
+
         var i: u32 = extra_start;
         while (i < extra_end) : (i += 1) {
             const child_idx = self.sema.ast_tree.extra_data[i];
@@ -53,18 +54,18 @@ pub const LirBuilder = struct {
     fn emitInst(self: *LirBuilder, inst: Inst) !Inst.Index {
         const idx = @as(Inst.Index, @intCast(self.lir.insts.items.len));
         try self.lir.insts.append(self.allocator, inst);
-        
+
         if (self.current_block) |blk_idx| {
             try self.lir.blocks.items[blk_idx].insts.append(self.allocator, idx);
         }
-        
+
         return idx;
     }
 
     fn lowerNode(self: *LirBuilder, node_idx: Node.Index) std.mem.Allocator.Error!?Inst.Index {
         const node = self.sema.ast_tree.nodes.get(node_idx);
         std.debug.print("-> ENTER: LirBuilder.lowerNode | Tag: {s}\n", .{@tagName(node.tag)});
-        
+
         var result: ?Inst.Index = null;
         defer {
             std.debug.print("<- EXIT: LirBuilder.lowerNode | Tag: {s} | Result: ", .{@tagName(node.tag)});
@@ -78,7 +79,7 @@ pub const LirBuilder = struct {
                 const tok = self.sema.ast_tree.tokens[node.main_token];
                 const text = src[tok.start..tok.end];
                 const val = std.fmt.parseInt(u64, text, 10) catch 0;
-                
+
                 result = try self.emitInst(.{
                     .opcode = .const_i,
                     .type_id = type_id,
@@ -120,22 +121,22 @@ pub const LirBuilder = struct {
                 const ident_tok_idx = node.data.lhs;
                 const extra_start = node.data.rhs;
                 const expr_node = self.sema.ast_tree.extra_data[extra_start + 1];
-                
+
                 const tok = self.sema.ast_tree.tokens[ident_tok_idx];
                 const src = self.sema.diags.source_manager.getFile(0).?.content;
                 const ident_name = src[tok.start..tok.end];
-                
+
                 const expr_inst = (try self.lowerNode(expr_node)) orelse return null;
                 const type_id = self.sema.node_types.get(node_idx) orelse 0;
-                
+
                 const addr_inst = try self.emitInst(.{
                     .opcode = .addr,
                     .type_id = type_id,
                     .data = .{ .addr = ident_tok_idx },
                 });
-                
+
                 try self.var_addresses.put(ident_name, addr_inst);
-                
+
                 _ = try self.emitInst(.{
                     .opcode = .store,
                     .type_id = type_id,
@@ -177,7 +178,7 @@ pub const LirBuilder = struct {
             .identifier => {
                 const type_id = self.sema.node_types.get(node_idx) orelse return null;
                 const type_data = self.sema.type_pool.types.items[type_id];
-                
+
                 if (type_data.data == .function) {
                     return try self.emitInst(.{
                         .opcode = .func_sym,
@@ -185,13 +186,13 @@ pub const LirBuilder = struct {
                         .data = .{ .func_sym = node_idx },
                     });
                 }
-                
+
                 const tok = self.sema.ast_tree.tokens[self.sema.ast_tree.nodes.get(node_idx).main_token];
                 const src = self.sema.diags.source_manager.getFile(0).?.content;
                 const ident_name = src[tok.start..tok.end];
-                
+
                 const addr_inst = self.var_addresses.get(ident_name) orelse return null;
-                
+
                 result = try self.emitInst(.{
                     .opcode = .load,
                     .type_id = type_id,
@@ -202,41 +203,41 @@ pub const LirBuilder = struct {
             .block => {
                 const extra_start = node.data.lhs;
                 const extra_end = node.data.rhs;
-                
+
                 var i: u32 = extra_start;
                 var last_inst: ?Inst.Index = null;
                 while (i < extra_end) : (i += 1) {
                     const child_idx = self.sema.ast_tree.extra_data[i];
                     last_inst = try self.lowerNode(child_idx);
                 }
-                
+
                 return last_inst;
             },
             .if_stmt => {
                 const extra_start = node.data.lhs;
                 const extra_end = node.data.rhs;
-                
+
                 const cond_idx = self.sema.ast_tree.extra_data[extra_start];
                 const cond_inst = (try self.lowerNode(cond_idx)) orelse return null;
-                
+
                 const then_block = try self.newBlock();
                 const else_block = try self.newBlock();
                 const merge_block = try self.newBlock();
-                
+
                 const has_else = extra_end > extra_start + 2;
-                
+
                 _ = try self.emitInst(.{
                     .opcode = .condbr,
                     .type_id = 0,
                     .data = .{ .condbr = .{ .cond = cond_inst, .true_dest = then_block, .false_dest = if (has_else) else_block else merge_block } },
                 });
-                
+
                 // Then branch
                 self.current_block = then_block;
                 const then_idx = self.sema.ast_tree.extra_data[extra_start + 1];
                 const then_inst = try self.lowerNode(then_idx);
                 _ = try self.emitInst(.{ .opcode = .br, .type_id = 0, .data = .{ .br = .{ .dest = merge_block } } });
-                
+
                 // Else branch
                 if (has_else) {
                     self.current_block = else_block;
@@ -244,21 +245,21 @@ pub const LirBuilder = struct {
                     _ = try self.lowerNode(else_idx);
                     _ = try self.emitInst(.{ .opcode = .br, .type_id = 0, .data = .{ .br = .{ .dest = merge_block } } });
                 }
-                
+
                 self.current_block = merge_block;
-                
+
                 return then_inst;
             },
             .while_stmt => {
                 const cond_node = node.data.lhs;
                 const body_node = node.data.rhs;
-                
+
                 const cond_block = try self.newBlock();
                 const body_block = try self.newBlock();
                 const end_block = try self.newBlock();
-                
+
                 _ = try self.emitInst(.{ .opcode = .br, .type_id = 0, .data = .{ .br = .{ .dest = cond_block } } });
-                
+
                 self.current_block = cond_block;
                 const cond_inst = (try self.lowerNode(cond_node)) orelse return null;
                 _ = try self.emitInst(.{
@@ -266,29 +267,29 @@ pub const LirBuilder = struct {
                     .type_id = 0,
                     .data = .{ .condbr = .{ .cond = cond_inst, .true_dest = body_block, .false_dest = end_block } },
                 });
-                
+
                 self.current_block = body_block;
                 _ = try self.lowerNode(body_node);
                 _ = try self.emitInst(.{ .opcode = .br, .type_id = 0, .data = .{ .br = .{ .dest = cond_block } } });
-                
+
                 self.current_block = end_block;
                 return null;
             },
             .fn_decl => {
                 const proto_idx = node.data.lhs;
                 const body = node.data.rhs;
-                
+
                 const fn_block = try self.newBlock();
                 self.current_block = fn_block;
                 self.param_counter = 0;
-                
+
                 const proto_node = self.sema.ast_tree.nodes.get(proto_idx);
                 _ = try self.emitInst(.{
                     .opcode = .label,
                     .type_id = 0,
                     .data = .{ .label = proto_node.main_token }, // We pass the token index of the identifier!
                 });
-                
+
                 _ = try self.lowerNode(proto_idx);
                 _ = try self.lowerNode(body);
                 _ = try self.emitInst(.{ .opcode = .ret, .type_id = 0, .data = .{ .ret = null } });
@@ -298,7 +299,7 @@ pub const LirBuilder = struct {
             .fn_proto => {
                 const extra_start = node.data.lhs;
                 const extra_len = node.data.rhs;
-                
+
                 var i: u32 = 1;
                 while (i < extra_len) : (i += 1) {
                     const param_idx = self.sema.ast_tree.extra_data[extra_start + i];
@@ -309,73 +310,78 @@ pub const LirBuilder = struct {
             .param_decl => {
                 const name_tok_idx = node.data.lhs;
                 const type_id = self.sema.node_types.get(node_idx) orelse 0;
-                
+
                 const param_inst = try self.emitInst(.{
                     .opcode = .param,
                     .type_id = type_id,
                     .data = .{ .param = self.param_counter },
                 });
                 self.param_counter += 1;
-                
+
                 const addr_inst = try self.emitInst(.{
                     .opcode = .addr,
                     .type_id = type_id,
                     .data = .{ .addr = name_tok_idx },
                 });
-                
+
                 _ = try self.emitInst(.{
                     .opcode = .store,
                     .type_id = type_id,
                     .data = .{ .store = .{ .ptr = addr_inst, .val = param_inst } },
                 });
-                
+
                 const tok = self.sema.ast_tree.tokens[name_tok_idx];
                 const src = self.sema.diags.source_manager.getFile(0).?.content;
                 const ident_name = src[tok.start..tok.end];
                 try self.var_addresses.put(ident_name, addr_inst);
-                
+
                 return null;
             },
             .builtin_call => {
-                // Multi-arg builtin: extra_data[rhs+0]=arg_count, extra_data[rhs+1..]=args
-                // The builtin name is determined by the token at the byte after '@' (main_token+1)
-                // We detect @print by checking which builtin it is via the source text.
-                // lhs = builtin name token index (actually the @ token index in main_token)
+                if (self.sema.const_values.get(node_idx)) |value| {
+                    result = try self.emitInst(.{
+                        .opcode = .const_i,
+                        .type_id = self.sema.node_types.get(node_idx) orelse 0,
+                        .data = .{ .const_i = value },
+                    });
+                    return result;
+                }
+
+                const name_token = self.sema.ast_tree.tokens[node.data.lhs];
+                const src = self.sema.diags.source_manager.getFile(0).?.content;
+                const kind = builtin.lookup(src[name_token.start..name_token.end]) orelse return null;
                 const extra_start = node.data.rhs;
-                const num_args = self.sema.ast_tree.extra_data[extra_start];
-
-                // Get the builtin identifier token (one after '@')
-                const at_tok = self.sema.ast_tree.tokens[node.main_token];
-                _ = at_tok;
-                // The ident token for the builtin name is at main_token+1 in the token stream
-                // (the '@' was consumed, then the ident was consumed)
-                // We can detect print by examining args: if the first arg is a string_literal
-                // we treat it as @print.
-
-                std.debug.print("[lir_gen] builtin_call: extra_start={d} num_args={d} extra_data.len={d}\n", .{ extra_start, num_args, self.sema.ast_tree.extra_data.len });
-                if (extra_start < self.sema.ast_tree.extra_data.len) {
-                    std.debug.print("[lir_gen] builtin_call: extra_data[{d}]={d}\n", .{ extra_start, self.sema.ast_tree.extra_data[extra_start] });
+                const arg_count = self.sema.ast_tree.extra_data[extra_start];
+                const value_arg: ?u32 = switch (kind) {
+                    .move, .discardError, .intFromPtr, .intFromEnum, .tagOf => 0,
+                    .intCast,
+                    .floatCast,
+                    .floatFromInt,
+                    .intFromFloat,
+                    .ptrCast,
+                    .alignCast,
+                    .bitCast,
+                    .ptrFromInt,
+                    .enumFromInt,
+                    => 1,
+                    else => null,
+                };
+                if (value_arg) |arg_index| {
+                    if (arg_index < arg_count) {
+                        result = try self.lowerNode(self.sema.ast_tree.extra_data[extra_start + 1 + arg_index]);
+                    }
                 }
-                const args_start_lir = self.lir.extra_data.items.len;
-                var i: u32 = 0;
-                while (i < num_args) : (i += 1) {
-                    const arg_idx = extra_start + 1 + i;
-                    if (arg_idx >= self.sema.ast_tree.extra_data.len) break;
-                    const arg_node = self.sema.ast_tree.extra_data[arg_idx];
-                    const arg_node_tag = self.sema.ast_tree.nodes.get(arg_node).tag;
-                    std.debug.print("[lir_gen] builtin_call: arg[{d}] = node {d} (tag={s})\n", .{ i, arg_node, @tagName(arg_node_tag) });
-                    const arg_inst = (try self.lowerNode(arg_node)) orelse continue;
-                    try self.lir.extra_data.append(self.allocator, arg_inst);
-                }
-
-                const type_id = self.sema.node_types.get(node_idx) orelse 0;
+                return result;
+            },
+            .unary_op, .unsafe_block => {
+                result = try self.lowerNode(node.data.lhs);
+                return result;
+            },
+            .tuple_literal => {
                 result = try self.emitInst(.{
-                    .opcode = .print,
-                    .type_id = type_id,
-                    .data = .{ .print = .{
-                        .args_start = @as(u32, @intCast(args_start_lir)),
-                        .args_count = num_args,
-                    }},
+                    .opcode = .tuple_literal,
+                    .type_id = self.sema.node_types.get(node_idx) orelse 0,
+                    .data = .{ .tuple_literal = node_idx },
                 });
                 return result;
             },
@@ -391,35 +397,6 @@ pub const LirBuilder = struct {
                 const target = node.data.lhs;
                 const extra_start = node.data.rhs;
                 const num_args = self.sema.ast_tree.extra_data[extra_start];
-
-                // Check if this is a call to a builtin (@print)
-                const target_node = self.sema.ast_tree.nodes.get(target);
-                if (target_node.tag == .identifier) {
-                    const tok = self.sema.ast_tree.tokens[target_node.main_token];
-                    // Get source from primary file (file 0)
-                    const src = self.sema.diags.source_manager.getFile(0).?.content;
-                    const name = src[tok.start..tok.end];
-                    if (std.mem.eql(u8, name, "@print") or std.mem.eql(u8, name, "print")) {
-                        // Emit all args as LIR instructions
-                        const args_start_lir = self.lir.extra_data.items.len;
-                        var i: u32 = 0;
-                        while (i < num_args) : (i += 1) {
-                            const arg_node = self.sema.ast_tree.extra_data[extra_start + 1 + i];
-                            const arg_inst = (try self.lowerNode(arg_node)) orelse continue;
-                            try self.lir.extra_data.append(self.allocator, arg_inst);
-                        }
-                        const type_id = self.sema.node_types.get(node_idx) orelse 0;
-                        result = try self.emitInst(.{
-                            .opcode = .print,
-                            .type_id = type_id,
-                            .data = .{ .print = .{
-                                .args_start = @as(u32, @intCast(args_start_lir)),
-                                .args_count = num_args,
-                            }},
-                        });
-                        return result;
-                    }
-                }
 
                 // Normal call
                 const target_inst = try self.lowerNode(target);
@@ -437,11 +414,7 @@ pub const LirBuilder = struct {
                 return try self.emitInst(.{
                     .opcode = .call,
                     .type_id = type_id,
-                    .data = .{ .call = .{
-                        .func = target_inst orelse 0,
-                        .args_start = @as(u32, @intCast(args_start)),
-                        .args_count = num_args
-                    }},
+                    .data = .{ .call = .{ .func = target_inst orelse 0, .args_start = @as(u32, @intCast(args_start)), .args_count = num_args } },
                 });
             },
             .return_stmt => {
@@ -453,7 +426,6 @@ pub const LirBuilder = struct {
             else => return null, // Unimplemented for now
         }
     }
-
 
     fn newBlock(self: *LirBuilder) !u32 {
         const blk_idx = @as(u32, @intCast(self.lir.blocks.items.len));
@@ -467,18 +439,18 @@ pub const LirBuilder = struct {
             std.debug.print("Block {d}:\n", .{blk_idx});
             for (blk.insts.items) |inst_idx| {
                 const inst = self.lir.insts.items[inst_idx];
-                std.debug.print("  %{d} = {s} ", .{inst_idx, @tagName(inst.opcode)});
+                std.debug.print("  %{d} = {s} ", .{ inst_idx, @tagName(inst.opcode) });
                 switch (inst.opcode) {
                     .const_i => std.debug.print("{d}", .{inst.data.const_i}),
-                    .add => std.debug.print("%{d}, %{d}", .{inst.data.add.lhs, inst.data.add.rhs}),
-                    .sub => std.debug.print("%{d}, %{d}", .{inst.data.sub.lhs, inst.data.sub.rhs}),
-                    .mul => std.debug.print("%{d}, %{d}", .{inst.data.mul.lhs, inst.data.mul.rhs}),
-                    .div => std.debug.print("%{d}, %{d}", .{inst.data.div.lhs, inst.data.div.rhs}),
+                    .add => std.debug.print("%{d}, %{d}", .{ inst.data.add.lhs, inst.data.add.rhs }),
+                    .sub => std.debug.print("%{d}, %{d}", .{ inst.data.sub.lhs, inst.data.sub.rhs }),
+                    .mul => std.debug.print("%{d}, %{d}", .{ inst.data.mul.lhs, inst.data.mul.rhs }),
+                    .div => std.debug.print("%{d}, %{d}", .{ inst.data.div.lhs, inst.data.div.rhs }),
                     .addr => std.debug.print("local_{d}", .{inst.data.addr}),
                     .load => std.debug.print("ptr: %{d}", .{inst.data.load.ptr}),
-                    .store => std.debug.print("ptr: %{d}, val: %{d}", .{inst.data.store.ptr, inst.data.store.val}),
+                    .store => std.debug.print("ptr: %{d}, val: %{d}", .{ inst.data.store.ptr, inst.data.store.val }),
                     .br => std.debug.print("dest: block_{d}", .{inst.data.br.dest}),
-                    .condbr => std.debug.print("cond: %{d}, true_dest: block_{d}, false_dest: block_{d}", .{inst.data.condbr.cond, inst.data.condbr.true_dest, inst.data.condbr.false_dest}),
+                    .condbr => std.debug.print("cond: %{d}, true_dest: block_{d}, false_dest: block_{d}", .{ inst.data.condbr.cond, inst.data.condbr.true_dest, inst.data.condbr.false_dest }),
                     .ret => if (inst.data.ret) |r| std.debug.print("val: %{d}", .{r}) else std.debug.print("void", .{}),
                     else => std.debug.print("...", .{}),
                 }

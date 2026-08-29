@@ -21,6 +21,10 @@ pub const ComptimeVM = struct {
     }
 
     pub fn evaluate(self: *ComptimeVM, node_idx: Node.Index, src: []const u8) Value {
+        const sema = @as(*@import("sema.zig").Sema, @ptrCast(@alignCast(self.sema)));
+        if (sema.const_values.get(node_idx)) |value| return .{ .integer = value };
+        if (sema.type_values.get(node_idx)) |type_value| return .{ .integer = type_value };
+
         const node = self.ast_tree.nodes.get(node_idx);
         std.debug.print("-> ENTER: ComptimeVM.evaluate | Tag: {s}\n", .{@tagName(node.tag)});
         defer std.debug.print("<- EXIT: ComptimeVM.evaluate | Tag: {s}\n", .{@tagName(node.tag)});
@@ -35,7 +39,7 @@ pub const ComptimeVM = struct {
             .binary_op => {
                 const lhs_val = self.evaluate(node.data.lhs, src);
                 const rhs_val = self.evaluate(node.data.rhs, src);
-                
+
                 if (lhs_val == .err) return lhs_val;
                 if (rhs_val == .err) return rhs_val;
 
@@ -50,34 +54,6 @@ pub const ComptimeVM = struct {
                     },
                     else => return .{ .err = "Unsupported operator in comptime" },
                 }
-            },
-            .typeof_builtin => {
-                const sema = @as(*@import("sema.zig").Sema, @ptrCast(@alignCast(self.sema)));
-                // @typeOf evaluates to a Type ID value
-                if (sema.node_types.get(node_idx)) |type_id| {
-                    // Normally a comptime type value would have a `.type` variant in Value
-                    // For now, let's just use `.integer = type_id` to show it works
-                    return .{ .integer = type_id };
-                }
-                return .{ .err = "Type not resolved" };
-            },
-            .sizeof_builtin => {
-                const sema = @as(*@import("sema.zig").Sema, @ptrCast(@alignCast(self.sema)));
-                const inner = node.data.rhs;
-                if (sema.node_types.get(inner)) |type_id| {
-                    const ty = sema.type_pool.get(type_id);
-                    // Dummy size calculation based on primitive
-                    const size: u64 = switch (ty.data) {
-                        .primitive => |p| switch (p) {
-                            .comptime_int_type => 8, // dummy
-                            .type_type => 4, // dummy
-                            else => 1,
-                        },
-                        else => 0,
-                    };
-                    return .{ .integer = size };
-                }
-                return .{ .err = "Size of type not resolved" };
             },
             else => return .{ .err = "Expression cannot be evaluated at comptime" },
         }

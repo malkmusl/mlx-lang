@@ -28,7 +28,8 @@ pub const Node = struct {
         inline_hint: bool = false,
         noinline_hint: bool = false,
         extern_decl: bool = false,
-        _padding: u3 = 0,
+        comptime_param: bool = false,
+        _padding: u2 = 0,
     };
 
     pub const Data = struct {
@@ -134,6 +135,7 @@ pub const Node = struct {
         continue_stmt,
         defer_stmt,
         errdefer_stmt,
+        unsafe_block,
 
         // Expressions
         binary_op,
@@ -152,6 +154,7 @@ pub const Node = struct {
         bool_literal,
         null_literal,
         undefined_literal,
+        tuple_literal,
 
         // Type expressions (appear in type-annotation position)
         pointer_type, // *T, *const T, [*]T, [*]const T
@@ -164,13 +167,12 @@ pub const Node = struct {
         struct_decl,
         enum_decl,
         union_decl,
+        field_decl,
+        enum_member,
+        union_member,
         tuple_type,
 
         // Builtins & Intrinsics
-        nocopy_builtin,
-        move_builtin,
-        typeof_builtin,
-        sizeof_builtin,
         builtin_call,
     };
 };

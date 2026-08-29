@@ -114,8 +114,8 @@ pub const X86Gen = struct {
         if (std.mem.eql(u8, name, "rbx")) return .rbx;
         if (std.mem.eql(u8, name, "rsi")) return .rsi;
         if (std.mem.eql(u8, name, "rdi")) return .rdi;
-        if (std.mem.eql(u8, name, "r8"))  return .r8;
-        if (std.mem.eql(u8, name, "r9"))  return .r9;
+        if (std.mem.eql(u8, name, "r8")) return .r8;
+        if (std.mem.eql(u8, name, "r9")) return .r9;
         if (std.mem.eql(u8, name, "r10")) return .r10;
         if (std.mem.eql(u8, name, "r11")) return .r11;
         if (std.mem.eql(u8, name, "r12")) return .r12;
@@ -194,13 +194,15 @@ pub const X86Gen = struct {
                 const op = try self.allocateOp(inst_idx);
                 if (op == .mem) {
                     try writer.print("  mov rax, {d}\n", .{inst.data.const_i});
-                    try writer.print("  mov ", .{}); try printOp(writer, op); try writer.print(", rax\n", .{});
+                    try writer.print("  mov ", .{});
+                    try printOp(writer, op);
+                    try writer.print(", rax\n", .{});
                 } else {
                     try writer.print("  mov {s}, {d}\n", .{ op.reg, inst.data.const_i });
                 }
             },
             .add => {
-                const op  = try self.allocateOp(inst_idx);
+                const op = try self.allocateOp(inst_idx);
                 const lhs = try self.allocateOp(inst.data.add.lhs);
                 const rhs = try self.allocateOp(inst.data.add.rhs);
                 const lreg = try opToReg(writer, lhs, "rax");
@@ -208,7 +210,9 @@ pub const X86Gen = struct {
                     try writer.print("  mov rax, {s}\n", .{lreg});
                     const rreg = try opToReg(writer, rhs, "rcx");
                     try writer.print("  add rax, {s}\n", .{rreg});
-                    try writer.print("  mov ", .{}); try printOp(writer, op); try writer.print(", rax\n", .{});
+                    try writer.print("  mov ", .{});
+                    try printOp(writer, op);
+                    try writer.print(", rax\n", .{});
                 } else {
                     if (!std.mem.eql(u8, op.reg, lreg)) try writer.print("  mov {s}, {s}\n", .{ op.reg, lreg });
                     const rreg = try opToReg(writer, rhs, "rcx");
@@ -216,7 +220,7 @@ pub const X86Gen = struct {
                 }
             },
             .sub => {
-                const op  = try self.allocateOp(inst_idx);
+                const op = try self.allocateOp(inst_idx);
                 const lhs = try self.allocateOp(inst.data.sub.lhs);
                 const rhs = try self.allocateOp(inst.data.sub.rhs);
                 const lreg = try opToReg(writer, lhs, "rax");
@@ -224,7 +228,9 @@ pub const X86Gen = struct {
                     try writer.print("  mov rax, {s}\n", .{lreg});
                     const rreg = try opToReg(writer, rhs, "rcx");
                     try writer.print("  sub rax, {s}\n", .{rreg});
-                    try writer.print("  mov ", .{}); try printOp(writer, op); try writer.print(", rax\n", .{});
+                    try writer.print("  mov ", .{});
+                    try printOp(writer, op);
+                    try writer.print(", rax\n", .{});
                 } else {
                     if (!std.mem.eql(u8, op.reg, lreg)) try writer.print("  mov {s}, {s}\n", .{ op.reg, lreg });
                     const rreg = try opToReg(writer, rhs, "rcx");
@@ -232,7 +238,7 @@ pub const X86Gen = struct {
                 }
             },
             .mul => {
-                const op  = try self.allocateOp(inst_idx);
+                const op = try self.allocateOp(inst_idx);
                 const lhs = try self.allocateOp(inst.data.mul.lhs);
                 const rhs = try self.allocateOp(inst.data.mul.rhs);
                 const lreg = try opToReg(writer, lhs, "rax");
@@ -240,13 +246,15 @@ pub const X86Gen = struct {
                 const rreg = try opToReg(writer, rhs, "rcx");
                 try writer.print("  imul rax, {s}\n", .{rreg});
                 if (op == .mem) {
-                    try writer.print("  mov ", .{}); try printOp(writer, op); try writer.print(", rax\n", .{});
+                    try writer.print("  mov ", .{});
+                    try printOp(writer, op);
+                    try writer.print(", rax\n", .{});
                 } else {
                     try writer.print("  mov {s}, rax\n", .{op.reg});
                 }
             },
             .div => {
-                const op  = try self.allocateOp(inst_idx);
+                const op = try self.allocateOp(inst_idx);
                 const lhs = try self.allocateOp(inst.data.div.lhs);
                 const rhs = try self.allocateOp(inst.data.div.rhs);
                 const lreg = try opToReg(writer, lhs, "rax");
@@ -255,7 +263,9 @@ pub const X86Gen = struct {
                 const rreg = try opToReg(writer, rhs, "rcx");
                 try writer.print("  idiv {s}\n", .{rreg});
                 if (op == .mem) {
-                    try writer.print("  mov ", .{}); try printOp(writer, op); try writer.print(", rax\n", .{});
+                    try writer.print("  mov ", .{});
+                    try printOp(writer, op);
+                    try writer.print(", rax\n", .{});
                 } else {
                     try writer.print("  mov {s}, rax\n", .{op.reg});
                 }
@@ -266,7 +276,9 @@ pub const X86Gen = struct {
                 const slot = try self.getOrAllocSlot(var_id);
                 if (op == .mem) {
                     try writer.print("  lea rax, [rbp - {d}]\n", .{slot});
-                    try writer.print("  mov ", .{}); try printOp(writer, op); try writer.print(", rax\n", .{});
+                    try writer.print("  mov ", .{});
+                    try printOp(writer, op);
+                    try writer.print(", rax\n", .{});
                 } else {
                     try writer.print("  lea {s}, [rbp - {d}]\n", .{ op.reg, slot });
                 }
@@ -284,7 +296,9 @@ pub const X86Gen = struct {
                 const ptr_reg = try opToReg(writer, ptr_op, "rax");
                 if (op == .mem) {
                     try writer.print("  mov rcx, qword [{s}]\n", .{ptr_reg});
-                    try writer.print("  mov ", .{}); try printOp(writer, op); try writer.print(", rcx\n", .{});
+                    try writer.print("  mov ", .{});
+                    try printOp(writer, op);
+                    try writer.print(", rcx\n", .{});
                 } else {
                     try writer.print("  mov {s}, qword [{s}]\n", .{ op.reg, ptr_reg });
                 }
@@ -295,7 +309,8 @@ pub const X86Gen = struct {
                 if (param_idx < abi.integer_arg_regs.len) {
                     const arg_reg = abi.integer_arg_regs[param_idx];
                     if (op == .mem) {
-                        try writer.print("  mov ", .{}); try printOp(writer, op);
+                        try writer.print("  mov ", .{});
+                        try printOp(writer, op);
                         try writer.print(", {s}\n", .{arg_reg});
                     } else {
                         try writer.print("  mov {s}, {s}\n", .{ op.reg, arg_reg });
@@ -304,7 +319,9 @@ pub const X86Gen = struct {
                     const stack_offset: i32 = 16 + @as(i32, @intCast((param_idx - 6) * 8));
                     try writer.print("  mov rax, qword [rbp + {d}]\n", .{stack_offset});
                     if (op == .mem) {
-                        try writer.print("  mov ", .{}); try printOp(writer, op); try writer.print(", rax\n", .{});
+                        try writer.print("  mov ", .{});
+                        try printOp(writer, op);
+                        try writer.print(", rax\n", .{});
                     } else {
                         try writer.print("  mov {s}, rax\n", .{op.reg});
                     }
@@ -318,7 +335,9 @@ pub const X86Gen = struct {
                 const fn_name = self.src[fn_tok.start..fn_tok.end];
                 if (op == .mem) {
                     try writer.print("  lea rax, [rel {s}]\n", .{fn_name});
-                    try writer.print("  mov ", .{}); try printOp(writer, op); try writer.print(", rax\n", .{});
+                    try writer.print("  mov ", .{});
+                    try printOp(writer, op);
+                    try writer.print(", rax\n", .{});
                 } else {
                     try writer.print("  lea {s}, [rel {s}]\n", .{ op.reg, fn_name });
                 }
@@ -362,7 +381,9 @@ pub const X86Gen = struct {
                 switch (func_op) {
                     .reg => |r| try writer.print("  call {s}\n", .{r}),
                     .mem => {
-                        try writer.print("  mov rax, ", .{}); try printOp(writer, func_op); try writer.print("\n", .{});
+                        try writer.print("  mov rax, ", .{});
+                        try printOp(writer, func_op);
+                        try writer.print("\n", .{});
                         try writer.print("  call rax\n", .{});
                     },
                 }
@@ -372,7 +393,9 @@ pub const X86Gen = struct {
                     try writer.print("  add rsp, {d}\n", .{adjust});
                 }
                 if (op == .mem) {
-                    try writer.print("  mov ", .{}); try printOp(writer, op); try writer.print(", rax\n", .{});
+                    try writer.print("  mov ", .{});
+                    try printOp(writer, op);
+                    try writer.print(", rax\n", .{});
                 } else if (!std.mem.eql(u8, op.reg, "rax")) {
                     try writer.print("  mov {s}, rax\n", .{op.reg});
                 }
@@ -383,7 +406,9 @@ pub const X86Gen = struct {
                 switch (cond_op) {
                     .reg => |r| try writer.print("  test {s}, {s}\n", .{ r, r }),
                     .mem => {
-                        try writer.print("  mov rax, ", .{}); try printOp(writer, cond_op); try writer.print("\n", .{});
+                        try writer.print("  mov rax, ", .{});
+                        try printOp(writer, cond_op);
+                        try writer.print("\n", .{});
                         try writer.print("  test rax, rax\n", .{});
                     },
                 }
@@ -394,8 +419,14 @@ pub const X86Gen = struct {
                 if (inst.data.ret) |r| {
                     const val_op = try self.allocateOp(r);
                     switch (val_op) {
-                        .reg => |reg| { if (!std.mem.eql(u8, reg, "rax")) try writer.print("  mov rax, {s}\n", .{reg}); },
-                        .mem => { try writer.print("  mov rax, ", .{}); try printOp(writer, val_op); try writer.print("\n", .{}); },
+                        .reg => |reg| {
+                            if (!std.mem.eql(u8, reg, "rax")) try writer.print("  mov rax, {s}\n", .{reg});
+                        },
+                        .mem => {
+                            try writer.print("  mov rax, ", .{});
+                            try printOp(writer, val_op);
+                            try writer.print("\n", .{});
+                        },
                     }
                 }
                 try writer.print("  mov rsp, rbp\n  pop rbp\n  ret\n", .{});
@@ -423,13 +454,13 @@ pub const X86Gen = struct {
                 const tok = self.ast_tree.tokens[node.main_token];
                 // Token text includes surrounding quotes — strip them.
                 const raw = self.src[tok.start..tok.end];
-                const content = if (raw.len >= 2 and raw[0] == '"') raw[1..raw.len-1] else raw;
+                const content = if (raw.len >= 2 and raw[0] == '"') raw[1 .. raw.len - 1] else raw;
                 const str_off: u64 = @as(u64, @intCast(self.rodata.items.len));
                 try self.string_offsets.put(@as(lir.Inst.Index, @intCast(idx)), str_off);
                 // Unescape \n → 0x0A
                 var i: usize = 0;
                 while (i < content.len) : (i += 1) {
-                    if (content[i] == '\\' and i + 1 < content.len and content[i+1] == 'n') {
+                    if (content[i] == '\\' and i + 1 < content.len and content[i + 1] == 'n') {
                         try self.rodata.append(self.allocator, 0x0A);
                         i += 1;
                     } else {
@@ -459,10 +490,10 @@ pub const X86Gen = struct {
             // Pattern: call main; mov rdi, rax; xor rax,rax; mov rax,60; syscall
             // For void main: ret in main doesn't set rax, so we zero rdi first
             try enc.defineSymbol("_start");
-            try enc.emitMovRegImm64(.rdi, 0);   // pre-zero exit code (void main case)
+            try enc.emitMovRegImm64(.rdi, 0); // pre-zero exit code (void main case)
             try enc.emitCallRel("main");
-            try enc.emitMovRegReg(.rdi, .rax);   // use main's return value if any
-            try enc.emitMovRegImm64(.rax, 60);   // SYS_exit
+            try enc.emitMovRegReg(.rdi, .rax); // use main's return value if any
+            try enc.emitMovRegImm64(.rax, 60); // SYS_exit
             try enc.emitSyscall();
         }
 
@@ -503,7 +534,7 @@ pub const X86Gen = struct {
 
             // ── arithmetic ───────────────────────────────────────────────────
             .add => {
-                const op  = try self.allocateOp(inst_idx);
+                const op = try self.allocateOp(inst_idx);
                 const lhs = try self.allocateOp(inst.data.add.lhs);
                 const rhs = try self.allocateOp(inst.data.add.rhs);
                 const lreg = try opToRegBin(enc, lhs, .rax);
@@ -523,7 +554,7 @@ pub const X86Gen = struct {
             },
 
             .sub => {
-                const op  = try self.allocateOp(inst_idx);
+                const op = try self.allocateOp(inst_idx);
                 const lhs = try self.allocateOp(inst.data.sub.lhs);
                 const rhs = try self.allocateOp(inst.data.sub.rhs);
                 const lreg = try opToRegBin(enc, lhs, .rax);
@@ -543,7 +574,7 @@ pub const X86Gen = struct {
             },
 
             .mul => {
-                const op  = try self.allocateOp(inst_idx);
+                const op = try self.allocateOp(inst_idx);
                 const lhs = try self.allocateOp(inst.data.mul.lhs);
                 const rhs = try self.allocateOp(inst.data.mul.rhs);
                 const lreg = try opToRegBin(enc, lhs, .rax);
@@ -742,69 +773,8 @@ pub const X86Gen = struct {
                 }
             },
 
-            // ── tuple literal ─────────────────────────────────────────────────
-            // Tuple literals are just passed as separate arguments to @print.
-            // We don't need to do anything here; the print handler reads them directly.
             .tuple_literal => {
-                // Nothing to emit — args are lowered individually by the print handler
-                std.debug.print("[X86Gen-bin]   tuple_literal %{d}: skipped (handled by print)\n", .{inst_idx});
-            },
-
-            // ── @print / write syscall ────────────────────────────────────────
-            // print { args_start, args_count }:
-            //   arg[0] = format string (string_literal inst)
-            //   remaining args = values for format specifiers (not yet formatted)
-            // For now: only handle the simple case of @print("str\n") with no format args,
-            // OR @print("str {d}\n", int) with one integer argument.
-            .print => {
-                const args_start = inst.data.print.args_start;
-                const args_count = inst.data.print.args_count;
-                std.debug.print("[X86Gen-bin]   print args_count={d}\n", .{args_count});
-
-                if (args_count == 0) {
-                    std.debug.print("[X86Gen-bin]   print: no args, skipping\n", .{});
-                    return;
-                }
-
-                // arg[0] must be the format string (a string_literal inst)
-                const fmt_inst_idx = self.lir.extra_data.items[args_start];
-                const fmt_inst = self.lir.insts.items[fmt_inst_idx];
-
-                if (fmt_inst.opcode != .string_literal) {
-                    std.debug.print("[X86Gen-bin]   print: arg[0] is not string_literal, skipping\n", .{});
-                    return;
-                }
-
-                // Compute string vaddr and length
-                const str_off = self.string_offsets.get(fmt_inst_idx) orelse {
-                    std.debug.print("[X86Gen-bin]   print: string offset not found!\n", .{});
-                    return;
-                };
-                const str_vaddr: i64 = @as(i64, @bitCast(self.rodata_vaddr + str_off));
-
-                // Compute length by finding the next string offset or end of rodata
-                var str_len: usize = 0;
-                {
-                    // Walk through all string_literal insts to find this string's length
-                    var next_off: u64 = @as(u64, @intCast(self.rodata.items.len)); // end of rodata
-                    var it = self.string_offsets.iterator();
-                    while (it.next()) |entry| {
-                        if (entry.value_ptr.* > str_off and entry.value_ptr.* < next_off) {
-                            next_off = entry.value_ptr.*;
-                        }
-                    }
-                    str_len = @as(usize, @intCast(next_off - str_off));
-                }
-
-                std.debug.print("[X86Gen-bin]   print: write(1, 0x{x}, {d})\n", .{ @as(u64, @bitCast(str_vaddr)), str_len });
-
-                // Emit: write(1, str_ptr, str_len)
-                // syscall: rax=1, rdi=1 (stdout), rsi=str_ptr, rdx=str_len
-                try enc.emitMovRegImm64(.rax, 1);          // SYS_write
-                try enc.emitMovRegImm64(.rdi, 1);          // fd=stdout
-                try enc.emitMovRegImm64(.rsi, str_vaddr);  // buf ptr
-                try enc.emitMovRegImm64(.rdx, @as(i64, @intCast(str_len))); // len
-                try enc.emitSyscall();
+                std.debug.print("[X86Gen-bin]   tuple lowering is not implemented for %{d}\n", .{inst_idx});
             },
 
             else => {
@@ -825,10 +795,14 @@ fn emitStoreViaPtr(enc: *Encoder, ptr_r: Reg, val_r: Reg) !void {
     const rex_byte: u8 = 0x48 |
         (if (needs_rex_r) @as(u8, 0x04) else 0) |
         (if (needs_rex_b) @as(u8, 0x01) else 0);
-    const modrm_byte: u8 = (@as(u8, @truncate(val_idx)) & 7) << 3 | (@as(u8, @truncate(ptr_idx)) & 7);
+    const ptr_low: u8 = @as(u8, @truncate(ptr_idx)) & 7;
+    const mod_bits: u8 = if (ptr_low == 5) 0b01 else 0b00;
+    const modrm_byte: u8 = mod_bits << 6 | (@as(u8, @truncate(val_idx)) & 7) << 3 | ptr_low;
     try enc.buf.append(enc.allocator, rex_byte);
     try enc.buf.append(enc.allocator, 0x89);
     try enc.buf.append(enc.allocator, modrm_byte);
+    if (ptr_low == 4) try enc.buf.append(enc.allocator, 0x24); // [rsp]/[r12] SIB
+    if (ptr_low == 5) try enc.buf.append(enc.allocator, 0x00); // [rbp]/[r13]+disp8(0)
 }
 
 /// MOV dst_reg, [ptr_reg]   (REX.W 8B ModRM(00, dst, ptr))
@@ -840,8 +814,24 @@ fn emitLoadViaPtr(enc: *Encoder, dst_r: Reg, ptr_r: Reg) !void {
     const rex_byte: u8 = 0x48 |
         (if (needs_rex_r) @as(u8, 0x04) else 0) |
         (if (needs_rex_b) @as(u8, 0x01) else 0);
-    const modrm_byte: u8 = (@as(u8, @truncate(dst_idx)) & 7) << 3 | (@as(u8, @truncate(ptr_idx)) & 7);
+    const ptr_low: u8 = @as(u8, @truncate(ptr_idx)) & 7;
+    const mod_bits: u8 = if (ptr_low == 5) 0b01 else 0b00;
+    const modrm_byte: u8 = mod_bits << 6 | (@as(u8, @truncate(dst_idx)) & 7) << 3 | ptr_low;
     try enc.buf.append(enc.allocator, rex_byte);
     try enc.buf.append(enc.allocator, 0x8B);
     try enc.buf.append(enc.allocator, modrm_byte);
+    if (ptr_low == 4) try enc.buf.append(enc.allocator, 0x24); // [rsp]/[r12] SIB
+    if (ptr_low == 5) try enc.buf.append(enc.allocator, 0x00); // [rbp]/[r13]+disp8(0)
+}
+
+test "pointer loads and stores encode r12/r13 base registers" {
+    var enc = Encoder.init(std.testing.allocator);
+    defer enc.deinit();
+
+    try emitStoreViaPtr(&enc, .r13, .r12);
+    try std.testing.expectEqualSlices(u8, &.{ 0x4d, 0x89, 0x65, 0x00 }, enc.buf.items);
+
+    enc.buf.clearRetainingCapacity();
+    try emitLoadViaPtr(&enc, .r14, .r12);
+    try std.testing.expectEqualSlices(u8, &.{ 0x4d, 0x8b, 0x34, 0x24 }, enc.buf.items);
 }

@@ -5,7 +5,7 @@ const Tag = Token.Tag;
 pub const Lexer = struct {
     buffer: [:0]const u8,
     index: u32,
-    
+
     paren_level: u32,
     bracket_level: u32,
     last_tag: ?Tag,
@@ -163,7 +163,7 @@ pub const Lexer = struct {
                             result.end = self.index;
                             return self.emit(result);
                         }
-                        
+
                         // Invalid char
                         self.index += 1;
                         result.tag = .invalid;
@@ -182,13 +182,18 @@ pub const Lexer = struct {
                     },
                 },
                 .int_or_float => switch (c) {
-                    // Very simplistic int/float for now, just to get structural tests passing
                     'a'...'z', 'A'...'Z', '0'...'9', '.', '_' => {
-                        // TODO: proper float/int lexing according to zig rules
                         self.index += 1;
                     },
                     else => {
-                        result.tag = .integer; // Assume int for simplistic lexer
+                        const number = self.buffer[result.start..self.index];
+                        const is_hex = std.mem.startsWith(u8, number, "0x") or std.mem.startsWith(u8, number, "0X");
+                        const has_fraction = std.mem.indexOfScalar(u8, number, '.') != null;
+                        const has_exponent = if (is_hex)
+                            std.mem.indexOfAny(u8, number, "pP") != null
+                        else
+                            std.mem.indexOfAny(u8, number, "eE") != null;
+                        result.tag = if (has_fraction or has_exponent) .float else .integer;
                         result.end = self.index;
                         return self.emit(result);
                     },
@@ -552,18 +557,18 @@ pub const Lexer = struct {
         if (token.tag != .invalid and token.tag != .eof) {
             self.last_tag = token.tag;
         }
-        
+
         const snippet = if (token.tag == .eof or token.start >= self.buffer.len) "EOF" else self.buffer[token.start..token.end];
-        std.debug.print("DEBUG LEX: {s} '{s}'\n", .{@tagName(token.tag), snippet});
-        
+        std.debug.print("DEBUG LEX: {s} '{s}'\n", .{ @tagName(token.tag), snippet });
+
         return token;
     }
 
     fn shouldEmitStatementEnd(self: *Lexer) bool {
         if (self.paren_level > 0 or self.bracket_level > 0) return false;
-        
+
         const last = self.last_tag orelse return false;
-        
+
         // RequiresContinuation prevents statement_end
         if (requiresContinuation(last)) return false;
 
@@ -575,28 +580,57 @@ pub const Lexer = struct {
 fn requiresContinuation(tag: Tag) bool {
     return switch (tag) {
         // Arithmetic
-        .plus, .minus, .asterisk, .slash, .percent,
-        .plus_percent, .minus_percent, .asterisk_percent,
-        .plus_pipe, .minus_pipe, .asterisk_pipe,
-        
+        .plus,
+        .minus,
+        .asterisk,
+        .slash,
+        .percent,
+        .plus_percent,
+        .minus_percent,
+        .asterisk_percent,
+        .plus_pipe,
+        .minus_pipe,
+        .asterisk_pipe,
+
         // Comparisons
-        .equal_equal, .bang_equal, .angle_bracket_left, .angle_bracket_left_equal,
-        .angle_bracket_right, .angle_bracket_right_equal,
-        
+        .equal_equal,
+        .bang_equal,
+        .angle_bracket_left,
+        .angle_bracket_left_equal,
+        .angle_bracket_right,
+        .angle_bracket_right_equal,
+
         // Logical
-        .ampersand_ampersand, .pipe_pipe,
-        
+        .ampersand_ampersand,
+        .pipe_pipe,
+
         // Bitwise
-        .ampersand, .pipe, .caret,
-        
+        .ampersand,
+        .pipe,
+        .caret,
+
         // Shifts
-        .shl, .shr, .shl_percent, .shr_percent, .shl_pipe, .shl_percent_pipe,
-        
+        .shl,
+        .shr,
+        .shl_percent,
+        .shr_percent,
+        .shl_pipe,
+        .shl_percent_pipe,
+
         // Assignments (including compound)
-        .equal, .plus_equal, .minus_equal, .asterisk_equal, .slash_equal, .percent_equal,
-        
+        .equal,
+        .plus_equal,
+        .minus_equal,
+        .asterisk_equal,
+        .slash_equal,
+        .percent_equal,
+
         // Punctuation
-        .comma, .dot, .dot_dot, .arrow, .colon,
+        .comma,
+        .dot,
+        .dot_dot,
+        .arrow,
+        .colon,
         => true,
         else => false,
     };
@@ -604,10 +638,22 @@ fn requiresContinuation(tag: Tag) bool {
 
 fn canTerminate(tag: Tag) bool {
     return switch (tag) {
-        .ident, .integer, .float, .string, .byte_string, .char,
-        .keyword_true, .keyword_false, .keyword_null, .keyword_undefined,
-        .r_paren, .r_bracket, .r_brace,
-        .keyword_return, .keyword_break, .keyword_continue,
+        .ident,
+        .integer,
+        .float,
+        .string,
+        .byte_string,
+        .char,
+        .keyword_true,
+        .keyword_false,
+        .keyword_null,
+        .keyword_undefined,
+        .r_paren,
+        .r_bracket,
+        .r_brace,
+        .keyword_return,
+        .keyword_break,
+        .keyword_continue,
         => true,
         else => false,
     };
@@ -624,82 +670,40 @@ fn expectTokens(src: [:0]const u8, expected_tags: []const Tag) !void {
 }
 
 test "lexer: keywords and identifiers" {
-    try expectTokens(
-        "const var fn comptime ident_123 pub",
-        &.{ .keyword_const, .keyword_var, .keyword_fn, .keyword_comptime, .ident, .keyword_pub }
-    );
+    try expectTokens("const var fn comptime ident_123 pub", &.{ .keyword_const, .keyword_var, .keyword_fn, .keyword_comptime, .ident, .keyword_pub });
 }
 
 test "lexer: numbers and strings (simple)" {
-    try expectTokens(
-        "123 3.14 \"hello\" 'a'",
-        &.{ .integer, .integer, .string, .char }
-    );
+    try expectTokens("123 3.14 \"hello\" 'a'", &.{ .integer, .float, .string, .char });
 }
 
 test "lexer: basic operators" {
-    try expectTokens(
-        "+ - * / % == != <= >= << >>",
-        &.{
-            .plus, .minus, .asterisk, .slash, .percent,
-            .equal_equal, .bang_equal, .angle_bracket_left_equal, .angle_bracket_right_equal,
-            .shl, .shr
-        }
-    );
+    try expectTokens("+ - * / % == != <= >= << >>", &.{ .plus, .minus, .asterisk, .slash, .percent, .equal_equal, .bang_equal, .angle_bracket_left_equal, .angle_bracket_right_equal, .shl, .shr });
 }
 
 test "lexer: shift combine operators" {
-    try expectTokens(
-        "+<< -<< +%<< +|<< +%<<= +|<<=",
-        &.{
-            .plus_shl, .minus_shl, .plus_percent_shl, .plus_pipe_shl,
-            .plus_percent_shl_equal, .plus_pipe_shl_equal
-        }
-    );
-    try expectTokens(
-        "&<< |>> ^<< <<& >>|",
-        &.{
-            .ampersand_shl, .pipe_shr, .caret_shl, .shl_ampersand, .shr_pipe
-        }
-    );
+    try expectTokens("+<< -<< +%<< +|<< +%<<= +|<<=", &.{ .plus_shl, .minus_shl, .plus_percent_shl, .plus_pipe_shl, .plus_percent_shl_equal, .plus_pipe_shl_equal });
+    try expectTokens("&<< |>> ^<< <<& >>|", &.{ .ampersand_shl, .pipe_shr, .caret_shl, .shl_ampersand, .shr_pipe });
 }
 
 test "lexer: newline filtering" {
     // newline after ident emits statement_end
-    try expectTokens(
-        "a\nb",
-        &.{ .ident, .statement_end, .ident }
-    );
+    try expectTokens("a\nb", &.{ .ident, .statement_end, .ident });
 
     // newline after + does NOT emit statement_end (RequiresContinuation)
-    try expectTokens(
-        "a +\nb",
-        &.{ .ident, .plus, .ident }
-    );
+    try expectTokens("a +\nb", &.{ .ident, .plus, .ident });
 
     // newline inside parens does NOT emit statement_end
-    try expectTokens(
-        "(\na\n)",
-        &.{ .l_paren, .ident, .r_paren }
-    );
+    try expectTokens("(\na\n)", &.{ .l_paren, .ident, .r_paren });
 
     // newline inside brackets does NOT emit statement_end
-    try expectTokens(
-        "[\na\n]",
-        &.{ .l_bracket, .ident, .r_bracket }
-    );
+    try expectTokens("[\na\n]", &.{ .l_bracket, .ident, .r_bracket });
 
     // newline after { does not emit (unless braces logic changes, but our logic only prevents inside paren/bracket)
     // Wait, `{` is not in CanTerminate, so it doesn't emit
-    try expectTokens(
-        "{\na",
-        &.{ .l_brace, .ident }
-    );
+    try expectTokens("{\na", &.{ .l_brace, .ident });
 }
 
 test "lexer: comments" {
-    try expectTokens(
-        "a // this is a comment\nb /* block \n comment */ c",
-        &.{ .ident, .statement_end, .ident, .ident }
-    );
+    try expectTokens("a // this is a comment\nb /* block \n comment */ c", &.{ .ident, .statement_end, .ident, .ident });
 }

@@ -191,6 +191,7 @@ test {
     _ = @import("diagnostics.zig");
     _ = @import("lexer.zig");
     _ = @import("ast.zig");
+    _ = @import("builtin.zig");
     _ = @import("parser.zig");
     _ = @import("type.zig");
     _ = @import("scope.zig");
@@ -199,6 +200,7 @@ test {
     _ = @import("lir_gen.zig");
     _ = @import("abi.zig");
     _ = @import("x86_64_encoder.zig");
+    _ = @import("x86_64_gen.zig");
     _ = @import("elf64.zig");
     _ = @import("os_linux.zig");
     _ = @import("posix.zig");

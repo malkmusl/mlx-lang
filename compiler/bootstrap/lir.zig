@@ -5,21 +5,21 @@ pub const Opcode = enum {
     const_i,
     const_f,
     copy,
-    
+
     // Arithmetic
     add,
     sub,
     mul,
     div,
     rem,
-    
+
     // Memory
     load,
     store,
     addr,
     func_sym,
     label,
-    
+
     // Control Flow
     br,
     condbr,
@@ -31,7 +31,6 @@ pub const Opcode = enum {
 
     // Builtins and Literals
     builtin_sym,
-    print,
     string_literal,
     tuple_literal,
 };
@@ -43,19 +42,19 @@ pub const Inst = struct {
         const_i: u64,
         const_f: f64,
         copy: Index,
-        
+
         add: struct { lhs: Index, rhs: Index },
         sub: struct { lhs: Index, rhs: Index },
         mul: struct { lhs: Index, rhs: Index },
         div: struct { lhs: Index, rhs: Index },
         rem: struct { lhs: Index, rhs: Index },
-        
+
         load: struct { ptr: Index },
         store: struct { ptr: Index, val: Index },
         addr: u32, // ID of local variable/symbol
         func_sym: u32, // ID of function identifier node
         label: u32, // ID of function identifier node
-        
+
         br: struct { dest: BasicBlock.Index },
         condbr: struct { cond: Index, true_dest: BasicBlock.Index, false_dest: BasicBlock.Index },
         call: struct { func: Index, args_start: u32, args_count: u32 },
@@ -65,9 +64,8 @@ pub const Inst = struct {
         param: u32, // Parameter index
 
         builtin_sym: u32,
-        print: struct { args_start: u32, args_count: u32 },
         string_literal: u32, // AST node index
-        tuple_literal: u32,  // AST node index
+        tuple_literal: u32, // AST node index
     };
 
     opcode: Opcode,
@@ -77,7 +75,7 @@ pub const Inst = struct {
 
 pub const BasicBlock = struct {
     pub const Index = u32;
-    
+
     insts: std.ArrayList(Inst.Index),
 
     pub fn init() BasicBlock {

@@ -1,23 +1,19 @@
 const std = @import("std");
 const sm = @import("source_manager.zig");
 
-pub const Phase = enum {
-    source, lexer, parser, resolve, sema, @"comptime", lowering, codegen, linker, stdlib
-};
+pub const Phase = enum { source, lexer, parser, resolve, sema, @"comptime", lowering, codegen, linker, stdlib };
 
-pub const Severity = enum {
-    @"error", warning, note, help
-};
+pub const Severity = enum { @"error", warning, note, help };
 
 pub const Family = enum {
-    source_and_lexer,      // ZIN-E1000..1999
-    parser_and_grammar,    // ZIN-E2000..2999
-    name_module_resolve,   // ZIN-E3000..3999
-    types_sema_control,    // ZIN-E4000..4999
-    comptime_reflection,   // ZIN-E5000..5999
-    copyability_init,      // ZIN-E6000..6999
+    source_and_lexer, // ZIN-E1000..1999
+    parser_and_grammar, // ZIN-E2000..2999
+    name_module_resolve, // ZIN-E3000..3999
+    types_sema_control, // ZIN-E4000..4999
+    comptime_reflection, // ZIN-E5000..5999
+    copyability_init, // ZIN-E6000..6999
     pointer_memory_safety, // ZIN-E7000..7999
-    abi_extern_target,     // ZIN-E8000..8999
+    abi_extern_target, // ZIN-E8000..8999
     lowering_codegen_link, // ZIN-E9000..9999
 };
 
@@ -79,12 +75,14 @@ pub const DiagnosticEngine = struct {
         for (self.diagnostics.items) |diag| {
             const loc = self.source_manager.getLineCol(diag.primary_span.file_id, diag.primary_span.start_byte) orelse continue;
             const file = self.source_manager.getFile(diag.primary_span.file_id) orelse continue;
-            
-            try writer.print("{s}:{d}:{d}: {s}: ZIN-E{d:0>4}: {s}\n", .{
+
+            const code_kind: u8 = if (diag.severity == .warning) 'W' else 'E';
+            try writer.print("{s}:{d}:{d}: {s}: ZIN-{c}{d:0>4}: {s}\n", .{
                 file.path,
                 loc.line,
                 loc.column,
                 @tagName(diag.severity),
+                code_kind,
                 diag.code,
                 diag.message,
             });
