@@ -2,7 +2,7 @@ const std = @import("std");
 const sm = @import("source_manager.zig");
 const diag = @import("diagnostics.zig");
 
-pub fn main(init: std.process.Init) !void {
+pub fn main(init: std.process.Init) !u8 {
     const allocator = init.gpa;
     const io = init.io;
     var stdout_buffer: [1024]u8 = undefined;
@@ -16,7 +16,7 @@ pub fn main(init: std.process.Init) !void {
 
     if (args.len < 2) {
         std.debug.print("Usage: zin0 <source.zin> [--emit=asm]\n", .{});
-        return;
+        return 1;
     }
     const path = args[1];
 
@@ -37,7 +37,7 @@ pub fn main(init: std.process.Init) !void {
     const max_size = 10 * 1024 * 1024;
     const content_unterm = std.Io.Dir.readFileAlloc(.cwd(), io, path, allocator, @enumFromInt(max_size)) catch |err| {
         std.debug.print("Failed to read file '{s}': {}\n", .{ path, err });
-        return;
+        return 1;
     };
     defer allocator.free(content_unterm);
 
@@ -68,7 +68,7 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("Fatal parse error: {}\n", .{err});
         try engine.render(out);
         try stdout_file_writer.flush();
-        return;
+        return 1;
     };
     defer ast.deinit(allocator);
 
@@ -77,7 +77,7 @@ pub fn main(init: std.process.Init) !void {
 
     if (engine.error_count > 0) {
         std.debug.print("Compilation failed with {d} error(s).\n", .{engine.error_count});
-        return;
+        return 1;
     }
 
     // Stage 5/6/7: Type + Sema
@@ -92,16 +92,27 @@ pub fn main(init: std.process.Init) !void {
     const sema_mod = @import("sema.zig");
     var sema = sema_mod.Sema.init(allocator, ast, &engine, &type_pool, &root_scope);
     defer sema.deinit();
-    sema.analyze() catch |err| std.debug.print("Sema failed: {}\n", .{err});
+    sema.analyze() catch |err| {
+        std.debug.print("Sema failed: {}\n", .{err});
+        return 1;
+    };
 
     try engine.render(out);
     try stdout_file_writer.flush();
+
+    if (engine.error_count > 0) {
+        std.debug.print("Compilation failed with {d} error(s).\n", .{engine.error_count});
+        return 1;
+    }
 
     // Stage 9: LIR
     const lir_gen_mod = @import("lir_gen.zig");
     var lir_builder = lir_gen_mod.LirBuilder.init(allocator, &sema);
     defer lir_builder.deinit();
-    lir_builder.generate() catch |err| std.debug.print("LIR gen failed: {}\n", .{err});
+    lir_builder.generate() catch |err| {
+        std.debug.print("LIR gen failed: {}\n", .{err});
+        return 1;
+    };
     lir_builder.printLir();
 
     std.debug.print("AST has {d} nodes\n", .{ast.nodes.len});
@@ -125,20 +136,54 @@ pub fn main(init: std.process.Init) !void {
         var enc = @import("x86_64_encoder.zig").Encoder.init(allocator);
         defer enc.deinit();
 
+        // Phase 1: generate binary to discover code size and collect rodata strings.
+        // rodata_vaddr is 0 here — string addresses will be wrong, but we need code size.
         x86_gen.generateBinary(&enc) catch |err| {
             std.debug.print("Binary code generation failed: {}\n", .{err});
-            return;
+            return 1;
         };
 
-        @import("elf64.zig").writeExecutable(allocator, io, &enc, "_start", out_path) catch |err| {
+        // Compute rodata_vaddr from ELF layout:
+        //   TEXT_FILE_OFFSET = 0x1000, TEXT_VADDR = 0x401000
+        //   rodata starts at page-aligned offset after .text
+        const elf64_mod = @import("elf64.zig");
+        const text_size: u64 = @as(u64, @intCast(enc.buf.items.len));
+        const rodata_file_off: u64 = elf64_mod.alignUp(0x1000 + text_size, 0x1000);
+        const rodata_vaddr: u64 = 0x401000 + (rodata_file_off - 0x1000);
+        std.debug.print("[zin0] rodata_vaddr = 0x{x} (text_size={d})\n", .{ rodata_vaddr, text_size });
+
+        if (x86_gen.rodata.items.len > 0) {
+            // Phase 2: set rodata_vaddr and regenerate with correct string addresses.
+            x86_gen.rodata_vaddr = rodata_vaddr;
+            // Reset encoder and virtual register allocator for clean re-generation.
+            enc.buf.clearRetainingCapacity();
+            enc.fixups.clearRetainingCapacity();
+            enc.symbols.clearRetainingCapacity();
+            x86_gen.vreg_to_op.clearRetainingCapacity();
+            x86_gen.addr_to_slot.clearRetainingCapacity();
+            x86_gen.next_gp_reg = 0;
+            x86_gen.next_stack_slot = 8;
+            // Clear rodata so strings don't accumulate across two generateBinary calls
+            x86_gen.rodata.clearRetainingCapacity();
+            x86_gen.string_offsets.clearRetainingCapacity();
+
+            x86_gen.generateBinary(&enc) catch |err| {
+                std.debug.print("Binary code generation (phase 2) failed: {}\n", .{err});
+                return 1;
+            };
+        }
+
+        // writeExecutable with rodata slice
+        elf64_mod.writeExecutable(allocator, io, &enc, "_start", out_path, x86_gen.rodata.items) catch |err| {
             std.debug.print("ELF64 write failed: {}\n", .{err});
-            return;
+            return 1;
         };
         std.debug.print("[zin0] wrote '{s}' — done.\n", .{out_path});
     }
 
     try stdout_file_writer.flush();
     std.debug.print("Done.\n", .{});
+    return 0;
 }
 
 test {

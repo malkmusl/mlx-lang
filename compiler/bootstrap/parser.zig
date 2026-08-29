@@ -53,14 +53,10 @@ pub const Parser = struct {
         if (self.diags.source_manager.getFile(self.source_id)) |file| {
             const snippet = file.content[tok.start..@min(tok.end, file.content.len)];
             self.printIndent();
-            std.debug.print("   TOKEN: {s} | Tag: {s} | Text: '{s}'\n", .{
-                msg, @tagName(tok.tag), snippet
-            });
+            std.debug.print("   TOKEN: {s} | Tag: {s} | Text: '{s}'\n", .{ msg, @tagName(tok.tag), snippet });
         } else {
             self.printIndent();
-            std.debug.print("   TOKEN: {s} | Tag: {s} | Span: {d}..{d}\n", .{
-                msg, @tagName(tok.tag), tok.start, tok.end
-            });
+            std.debug.print("   TOKEN: {s} | Tag: {s} | Span: {d}..{d}\n", .{ msg, @tagName(tok.tag), tok.start, tok.end });
         }
     }
 
@@ -95,7 +91,7 @@ pub const Parser = struct {
         // Add root node
         const extra_start = @as(u32, @intCast(self.extra_data.items.len));
         try self.extra_data.appendSlice(self.allocator, root_children.items);
-        
+
         try self.nodes.append(self.allocator, .{
             .tag = .root,
             .main_token = 0,
@@ -104,7 +100,7 @@ pub const Parser = struct {
                 .rhs = extra_start + @as(u32, @intCast(root_children.items.len)),
             },
         });
-        
+
         const root_index = @as(Node.Index, @intCast(self.nodes.len - 1));
         _ = root_index; // normally would return or store this if AST doesn't assume last node is root
 
@@ -118,20 +114,70 @@ pub const Parser = struct {
     fn parseTopLevelDecl(self: *Parser) std.mem.Allocator.Error!?Node.Index {
         self.traceRuleEnter("parseTopLevelDecl");
         defer self.traceRuleExit("parseTopLevelDecl");
-        const token = self.tokens[self.index];
-        switch (token.tag) {
-            .keyword_const, .keyword_var => {
-                return self.parseVarDecl();
-            },
-            .keyword_fn => {
-                return self.parseFnDecl();
-            },
-            else => {
-                // Report error
-                try self.reportError(2001, "Expected top-level declaration");
-                return null;
+
+        var flags: Node.DeclFlags = .{};
+        var extern_name_token: u32 = std.math.maxInt(u32);
+
+        while (self.index < self.tokens.len) {
+            switch (self.tokens[self.index].tag) {
+                .keyword_pub => {
+                    flags.public = true;
+                    self.consumeToken("Consume pub modifier");
+                },
+                .keyword_export => {
+                    flags.exported = true;
+                    self.consumeToken("Consume export modifier");
+                },
+                .keyword_inline => {
+                    flags.inline_hint = true;
+                    self.consumeToken("Consume inline modifier");
+                },
+                .keyword_noinline => {
+                    flags.noinline_hint = true;
+                    self.consumeToken("Consume noinline modifier");
+                },
+                .keyword_extern => {
+                    flags.extern_decl = true;
+                    self.consumeToken("Consume extern modifier");
+                    if (self.index < self.tokens.len and self.tokens[self.index].tag == .l_paren) {
+                        self.consumeToken("Consume '(' after extern");
+                        if (self.index >= self.tokens.len or self.tokens[self.index].tag != .string) {
+                            try self.reportError(2001, "Expected ABI string in extern modifier");
+                            return null;
+                        }
+                        extern_name_token = self.index;
+                        self.consumeToken("Consume extern ABI string");
+                        if (self.index >= self.tokens.len or self.tokens[self.index].tag != .r_paren) {
+                            try self.reportError(2003, "Expected ')' after extern ABI string");
+                            return null;
+                        }
+                        self.consumeToken("Consume ')' after extern ABI string");
+                    }
+                },
+                else => break,
             }
         }
+
+        if (self.index >= self.tokens.len) {
+            try self.reportError(2001, "Expected declaration after modifier");
+            return null;
+        }
+
+        const token = self.tokens[self.index];
+        const decl = switch (token.tag) {
+            .keyword_const, .keyword_var => try self.parseVarDecl(),
+            .keyword_fn => try self.parseFnDecl(),
+            else => {
+                try self.reportError(2001, "Expected top-level declaration");
+                return null;
+            },
+        };
+
+        if (decl) |decl_idx| {
+            self.nodes.items(.decl_flags)[decl_idx] = flags;
+            self.nodes.items(.extern_name_token)[decl_idx] = extern_name_token;
+        }
+        return decl;
     }
 
     fn parseVarDecl(self: *Parser) std.mem.Allocator.Error!?Node.Index {
@@ -139,14 +185,14 @@ pub const Parser = struct {
         defer self.traceRuleExit("parseVarDecl");
         const start_tok = self.index;
         self.consumeToken("Consume const/var keyword");
-        
+
         if (self.tokens[self.index].tag != .ident) {
             try self.reportError(2002, "Expected identifier after const/var");
             return null;
         }
         const ident_tok = self.index;
         self.consumeToken("Consume identifier");
-        
+
         // Optional type annotation: `: TypeExpr`
         var type_node: Node.Index = 0; // 0 = inferred
         if (self.tokens[self.index].tag == .colon) {
@@ -167,24 +213,24 @@ pub const Parser = struct {
 
         const expr = try self.parseExpr(0);
         if (expr == null) return null;
-        
+
         // Skip optional statement_end (newline-based)
         if (self.index < self.tokens.len and self.tokens[self.index].tag == .statement_end) {
             self.index += 1;
         }
-        
+
         // Store type_node and init_expr in extra_data
         // Layout: extra_data[extra_start + 0] = type_node, extra_data[extra_start + 1] = init_expr
         const extra_start = @as(u32, @intCast(self.extra_data.items.len));
         try self.extra_data.append(self.allocator, type_node);
         try self.extra_data.append(self.allocator, expr.?);
-        
+
         try self.nodes.append(self.allocator, .{
             .tag = if (self.tokens[start_tok].tag == .keyword_const) .const_decl else .var_decl,
             .main_token = start_tok,
             .data = .{ .lhs = ident_tok, .rhs = extra_start },
         });
-        
+
         return @as(u32, @intCast(self.nodes.len - 1));
     }
 
@@ -378,23 +424,23 @@ pub const Parser = struct {
         defer self.traceRuleExit("parseFnDecl");
         const start_tok = self.index;
         self.index += 1; // consume fn
-        
+
         if (self.tokens[self.index].tag != .ident) {
             try self.reportError(2002, "Expected identifier after fn");
             return null;
         }
         const name_tok = self.index;
         self.index += 1;
-        
+
         if (self.tokens[self.index].tag != .l_paren) {
             try self.reportError(2004, "Expected '(' for parameters");
             return null;
         }
         self.index += 1;
-        
+
         var param_nodes = std.ArrayList(Node.Index).empty;
         defer param_nodes.deinit(self.allocator);
-        
+
         while (self.index < self.tokens.len and self.tokens[self.index].tag != .r_paren) {
             const param_name_tok = self.index;
             if (self.tokens[self.index].tag != .ident) {
@@ -402,23 +448,23 @@ pub const Parser = struct {
                 return null;
             }
             self.index += 1;
-            
+
             if (self.tokens[self.index].tag != .colon) {
                 try self.reportError(2006, "Expected ':' after parameter name");
                 return null;
             }
             self.index += 1;
-            
+
             const type_expr = try self.parseExpr(0);
             if (type_expr == null) return null;
-            
+
             try self.nodes.append(self.allocator, .{
                 .tag = .param_decl,
                 .main_token = param_name_tok,
                 .data = .{ .lhs = param_name_tok, .rhs = type_expr.? },
             });
             try param_nodes.append(self.allocator, @as(u32, @intCast(self.nodes.len - 1)));
-            
+
             if (self.tokens[self.index].tag == .comma) {
                 self.index += 1;
             } else {
@@ -431,7 +477,7 @@ pub const Parser = struct {
             try self.reportError(2007, "Expected ')' after parameters");
             return null;
         }
-        
+
         // return type
         var ret_type: Node.Index = std.math.maxInt(u32);
         if (self.tokens[self.index].tag != .l_brace) {
@@ -440,28 +486,28 @@ pub const Parser = struct {
                 ret_type = r;
             }
         }
-        
+
         const extra_start = @as(u32, @intCast(self.extra_data.items.len));
         try self.extra_data.append(self.allocator, ret_type);
         try self.extra_data.appendSlice(self.allocator, param_nodes.items);
         const extra_len = @as(u32, @intCast(self.extra_data.items.len - extra_start));
-        
+
         try self.nodes.append(self.allocator, .{
             .tag = .fn_proto,
             .main_token = name_tok,
             .data = .{ .lhs = extra_start, .rhs = extra_len },
         });
         const proto_idx = @as(u32, @intCast(self.nodes.len - 1));
-        
+
         const body = try self.parseBlock();
         if (body == null) return null;
-        
+
         try self.nodes.append(self.allocator, .{
             .tag = .fn_decl,
             .main_token = start_tok,
             .data = .{ .lhs = proto_idx, .rhs = body.? },
         });
-        
+
         return @as(u32, @intCast(self.nodes.len - 1));
     }
 
@@ -474,10 +520,10 @@ pub const Parser = struct {
             return null;
         }
         self.index += 1;
-        
+
         var stmts = std.ArrayList(Node.Index).empty;
         defer stmts.deinit(self.allocator);
-        
+
         while (self.index < self.tokens.len and self.tokens[self.index].tag != .r_brace) {
             if (self.tokens[self.index].tag == .statement_end) {
                 self.index += 1;
@@ -491,16 +537,16 @@ pub const Parser = struct {
             }
         }
         if (self.tokens[self.index].tag == .r_brace) self.index += 1;
-        
+
         const extra_start = @as(u32, @intCast(self.extra_data.items.len));
         try self.extra_data.appendSlice(self.allocator, stmts.items);
-        
+
         try self.nodes.append(self.allocator, .{
             .tag = .block,
             .main_token = start_tok,
             .data = .{ .lhs = extra_start, .rhs = extra_start + @as(u32, @intCast(stmts.items.len)) },
         });
-        
+
         return @as(u32, @intCast(self.nodes.len - 1));
     }
 
@@ -515,9 +561,26 @@ pub const Parser = struct {
             .keyword_fn => {
                 return self.parseFnDecl();
             },
+            .keyword_return => {
+                const ret_tok = self.index;
+                self.index += 1; // consume 'return'
+                // optional expression after return
+                const expr = try self.parseExpr(0);
+                // skip optional statement_end
+                if (self.index < self.tokens.len and self.tokens[self.index].tag == .statement_end) {
+                    self.index += 1;
+                }
+                const expr_node: Node.Index = expr orelse 0;
+                try self.nodes.append(self.allocator, .{
+                    .tag = .return_stmt,
+                    .main_token = ret_tok,
+                    .data = .{ .lhs = 0, .rhs = expr_node },
+                });
+                return @as(u32, @intCast(self.nodes.len - 1));
+            },
             else => {
                 return self.parseExpr(0);
-            }
+            },
         }
     }
 
@@ -526,61 +589,61 @@ pub const Parser = struct {
         defer self.traceRuleExit("parseExpr");
         var lhs = try self.parsePrefix();
         if (lhs == null) return null;
-        
+
         while (self.index < self.tokens.len) {
             const op_tok = self.tokens[self.index];
-            
+
             if (op_tok.tag == .l_paren) {
                 if (100 < binding_power) break;
                 const call_tok = self.index;
                 self.index += 1;
-                
+
                 var args = std.ArrayList(Node.Index).empty;
                 defer args.deinit(self.allocator);
-                
+
                 while (self.index < self.tokens.len and self.tokens[self.index].tag != .r_paren) {
                     const arg = try self.parseExpr(0);
                     if (arg == null) return null;
                     try args.append(self.allocator, arg.?);
-                    
+
                     if (self.tokens[self.index].tag == .comma) {
                         self.index += 1;
                     } else {
                         break;
                     }
                 }
-                
+
                 if (self.tokens[self.index].tag == .r_paren) {
                     self.index += 1;
                 } else {
                     try self.reportError(2008, "Expected ')' after function arguments");
                     return null;
                 }
-                
+
                 const extra_start = @as(u32, @intCast(self.extra_data.items.len));
                 try self.extra_data.append(self.allocator, @as(u32, @intCast(args.items.len)));
                 try self.extra_data.appendSlice(self.allocator, args.items);
-                
+
                 try self.nodes.append(self.allocator, .{
                     .tag = .call,
                     .main_token = call_tok,
                     .data = .{ .lhs = lhs.?, .rhs = extra_start },
                 });
-                
+
                 lhs = @as(u32, @intCast(self.nodes.len - 1));
                 continue;
             }
-            
+
             const bp = getBindingPower(op_tok.tag);
-            
+
             if (bp.left == 0) break;
             if (bp.left < binding_power) break;
-            
+
             const op_tok_idx = self.index;
             self.index += 1;
             const rhs = try self.parseExpr(bp.right);
             if (rhs == null) return null;
-            
+
             try self.nodes.append(self.allocator, .{
                 .tag = .binary_op,
                 .main_token = op_tok_idx,
@@ -588,7 +651,7 @@ pub const Parser = struct {
             });
             lhs = @as(u32, @intCast(self.nodes.len - 1));
         }
-        
+
         return lhs;
     }
 
@@ -597,21 +660,38 @@ pub const Parser = struct {
         defer self.traceRuleExit("parsePrefix");
         const tok = self.tokens[self.index];
         switch (tok.tag) {
-            .integer, .ident, .string, .float => {
-                const tag: Node.Tag = if (tok.tag == .ident) .identifier else .integer_literal; // simplified
+            .string => {
                 try self.nodes.append(self.allocator, .{
-                    .tag = tag,
+                    .tag = .string_literal,
                     .main_token = self.index,
                     .data = .{ .lhs = 0, .rhs = 0 },
                 });
-                self.consumeToken("Consume identifier/literal");
+                self.consumeToken("Consume string literal");
+                return @as(u32, @intCast(self.nodes.len - 1));
+            },
+            .integer, .float => {
+                try self.nodes.append(self.allocator, .{
+                    .tag = .integer_literal,
+                    .main_token = self.index,
+                    .data = .{ .lhs = 0, .rhs = 0 },
+                });
+                self.consumeToken("Consume integer/float literal");
+                return @as(u32, @intCast(self.nodes.len - 1));
+            },
+            .ident => {
+                try self.nodes.append(self.allocator, .{
+                    .tag = .identifier,
+                    .main_token = self.index,
+                    .data = .{ .lhs = 0, .rhs = 0 },
+                });
+                self.consumeToken("Consume identifier");
                 return @as(u32, @intCast(self.nodes.len - 1));
             },
             .at => {
-                // Builtin invocation like @nocopy or @move
+                // Builtin invocation like @nocopy, @move, @print(fmt, args...)
                 const start_tok = self.index;
                 self.consumeToken("Consume @");
-                
+
                 if (self.index >= self.tokens.len or self.tokens[self.index].tag != .ident) {
                     try self.reportError(2007, "Expected builtin identifier after @");
                     return null;
@@ -626,28 +706,60 @@ pub const Parser = struct {
                     return null;
                 }
                 self.consumeToken("Consume '('");
-                
-                const inner = try self.parseExpr(0);
-                if (inner == null) return null;
-                
-                if (self.index >= self.tokens.len or self.tokens[self.index].tag != .r_paren) {
-                    try self.reportError(2009, "Expected ')' after builtin argument");
-                    return null;
+
+                // Determine if this is a known multi-arg builtin
+                const is_multi_arg = std.mem.eql(u8, name, "print") or
+                    std.mem.eql(u8, name, "import");
+
+                if (is_multi_arg) {
+                    // Parse multiple arguments like a normal call
+                    var args = std.ArrayList(Node.Index).empty;
+                    defer args.deinit(self.allocator);
+
+                    while (self.index < self.tokens.len and self.tokens[self.index].tag != .r_paren) {
+                        const arg = try self.parseExpr(0);
+                        if (arg == null) return null;
+                        try args.append(self.allocator, arg.?);
+                        if (self.tokens[self.index].tag == .comma) {
+                            self.index += 1;
+                        } else {
+                            break;
+                        }
+                    }
+                    if (self.index < self.tokens.len and self.tokens[self.index].tag == .r_paren) {
+                        self.consumeToken("Consume ')'");
+                    }
+
+                    const extra_start = @as(u32, @intCast(self.extra_data.items.len));
+                    try self.extra_data.append(self.allocator, @as(u32, @intCast(args.items.len)));
+                    try self.extra_data.appendSlice(self.allocator, args.items);
+
+                    try self.nodes.append(self.allocator, .{
+                        .tag = .builtin_call,
+                        .main_token = start_tok,
+                        .data = .{ .lhs = @as(u32, @intCast(self.index - 1)), .rhs = extra_start },
+                    });
+                    return @as(u32, @intCast(self.nodes.len - 1));
+                } else {
+                    // Single-arg builtin (legacy: @nocopy, @move, etc.)
+                    const inner = try self.parseExpr(0);
+                    if (inner == null) return null;
+
+                    if (self.index >= self.tokens.len or self.tokens[self.index].tag != .r_paren) {
+                        try self.reportError(2009, "Expected ')' after builtin argument");
+                        return null;
+                    }
+                    self.consumeToken("Consume ')'");
+
+                    const tag: Node.Tag = if (std.mem.eql(u8, name, "nocopy")) .nocopy_builtin else if (std.mem.eql(u8, name, "move")) .move_builtin else if (std.mem.eql(u8, name, "typeOf")) .typeof_builtin else if (std.mem.eql(u8, name, "sizeOf")) .sizeof_builtin else .builtin_call;
+
+                    try self.nodes.append(self.allocator, .{
+                        .tag = tag,
+                        .main_token = start_tok,
+                        .data = .{ .lhs = 0, .rhs = inner.? },
+                    });
+                    return @as(u32, @intCast(self.nodes.len - 1));
                 }
-                self.consumeToken("Consume ')'");
-
-                const tag: Node.Tag = if (std.mem.eql(u8, name, "nocopy")) .nocopy_builtin 
-                                      else if (std.mem.eql(u8, name, "move")) .move_builtin 
-                                      else if (std.mem.eql(u8, name, "typeOf")) .typeof_builtin 
-                                      else if (std.mem.eql(u8, name, "sizeOf")) .sizeof_builtin 
-                                      else .builtin_call;
-
-                try self.nodes.append(self.allocator, .{
-                    .tag = tag,
-                    .main_token = start_tok,
-                    .data = .{ .lhs = 0, .rhs = inner.? },
-                });
-                return @as(u32, @intCast(self.nodes.len - 1));
             },
             .keyword_if => return self.parseIfExpr(),
             .keyword_while => return self.parseWhileLoop(),
@@ -677,7 +789,7 @@ pub const Parser = struct {
             else => {
                 try self.reportError(2007, "Unexpected token in expression");
                 return null;
-            }
+            },
         }
     }
 
@@ -686,20 +798,20 @@ pub const Parser = struct {
         defer self.traceRuleExit("parseIfExpr");
         const start_tok = self.index;
         self.consumeToken("Consume if");
-        
+
         const cond = try self.parseExpr(0);
         if (cond == null) return null;
-        
+
         const then_branch = try self.parseExpr(0);
         if (then_branch == null) return null;
-        
+
         var else_branch: ?Node.Index = null;
         if (self.index < self.tokens.len and self.tokens[self.index].tag == .keyword_else) {
             self.consumeToken("Consume else");
             else_branch = try self.parseExpr(0);
             if (else_branch == null) return null;
         }
-        
+
         const extra_start = @as(u32, @intCast(self.extra_data.items.len));
         try self.extra_data.append(self.allocator, cond.?);
         try self.extra_data.append(self.allocator, then_branch.?);
@@ -707,13 +819,13 @@ pub const Parser = struct {
             try self.extra_data.append(self.allocator, e);
         }
         const extra_end = @as(u32, @intCast(self.extra_data.items.len));
-        
+
         try self.nodes.append(self.allocator, .{
             .tag = .if_stmt,
             .main_token = start_tok,
             .data = .{ .lhs = extra_start, .rhs = extra_end },
         });
-        
+
         return @as(u32, @intCast(self.nodes.len - 1));
     }
 
@@ -722,34 +834,52 @@ pub const Parser = struct {
         defer self.traceRuleExit("parseWhileLoop");
         const start_tok = self.index;
         self.consumeToken("Consume while");
-        
+
         const cond = try self.parseExpr(0);
         if (cond == null) return null;
-        
+
         const body = try self.parseExpr(0);
         if (body == null) return null;
-        
+
         try self.nodes.append(self.allocator, .{
             .tag = .while_stmt,
             .main_token = start_tok,
             .data = .{ .lhs = cond.?, .rhs = body.? },
         });
-        
+
         return @as(u32, @intCast(self.nodes.len - 1));
     }
 
     fn recover(self: *Parser) void {
+        const start_index = self.index;
         while (self.index < self.tokens.len) {
             const tag = self.tokens[self.index].tag;
             if (tag == .statement_end or tag == .r_brace or tag == .eof) {
-                self.index += 1;
+                if (tag != .eof) self.index += 1;
                 break;
             }
-            if (tag == .keyword_fn or tag == .keyword_const or tag == .keyword_pub) {
-                break; // Found start of next decl
+            if (isDeclarationStart(tag)) {
+                if (self.index == start_index) self.index += 1;
+                break;
             }
             self.index += 1;
         }
+    }
+
+    fn isDeclarationStart(tag: Tag) bool {
+        return switch (tag) {
+            .keyword_pub,
+            .keyword_export,
+            .keyword_inline,
+            .keyword_noinline,
+            .keyword_extern,
+            .keyword_const,
+            .keyword_var,
+            .keyword_fn,
+            .keyword_test,
+            => true,
+            else => false,
+        };
     }
 
     fn reportError(self: *Parser, code: u32, msg: []const u8) !void {
@@ -768,7 +898,7 @@ pub const Parser = struct {
     }
 
     const BindingPower = struct { left: u8, right: u8 };
-    
+
     fn getBindingPower(tag: Tag) BindingPower {
         return switch (tag) {
             .asterisk, .slash, .percent => .{ .left = 50, .right = 51 },
@@ -787,7 +917,7 @@ test "parser: empty file" {
     _ = try sm.addFile("<test>", "");
     var diags = DiagnosticEngine.init(allocator, &sm);
     defer diags.deinit();
-    const tokens = [_]Token{ .{ .tag = .eof, .start = 0, .end = 0 } };
+    const tokens = [_]Token{.{ .tag = .eof, .start = 0, .end = 0 }};
     var parser = Parser.init(allocator, &tokens, &diags, 0);
     var ast_tree = try parser.parse();
     defer ast_tree.deinit(allocator);
@@ -837,9 +967,9 @@ test "parser: pratt expression precedence" {
         .{ .tag = .ident, .start = 6, .end = 7 },
         .{ .tag = .equal, .start = 8, .end = 9 },
         .{ .tag = .integer, .start = 10, .end = 11 }, // 1
-        .{ .tag = .plus, .start = 12, .end = 13 },    // +
+        .{ .tag = .plus, .start = 12, .end = 13 }, // +
         .{ .tag = .integer, .start = 14, .end = 15 }, // 2
-        .{ .tag = .asterisk, .start = 16, .end = 17 },// *
+        .{ .tag = .asterisk, .start = 16, .end = 17 }, // *
         .{ .tag = .integer, .start = 18, .end = 19 }, // 3
         .{ .tag = .eof, .start = 19, .end = 19 },
     };
@@ -856,7 +986,7 @@ test "parser: pratt expression precedence" {
     // 4: binary_op (1 + (2 * 3)) -> lhs 0, rhs 3
     // 5: const_decl -> lhs ident, rhs 4
     // 6: root
-    
+
     const tags = ast_tree.nodes.items(.tag);
     const data = ast_tree.nodes.items(.data);
     try std.testing.expectEqual(tags[3], .binary_op);
@@ -894,13 +1024,77 @@ test "parser: error recovery" {
     defer ast_tree.deinit(allocator);
 
     try std.testing.expectEqual(diags.error_count, 1);
-    
+
     // The second var decl should be parsed correctly despite the first failing
     const tags = ast_tree.nodes.items(.tag);
-    
+
     // Nodes:
     // 0: int (2)
     // 1: var_decl (b)
     // 2: root
     try std.testing.expectEqual(tags[1], .var_decl);
+}
+
+test "parser: declaration modifiers are preserved" {
+    const allocator = std.testing.allocator;
+    const source = "pub extern(\"syscall\") fn raw() {}";
+
+    var sm = @import("source_manager.zig").SourceManager.init(allocator);
+    defer sm.deinit();
+    _ = try sm.addFile("<test>", source);
+
+    var diags = DiagnosticEngine.init(allocator, &sm);
+    defer diags.deinit();
+
+    const tokens = [_]Token{
+        .{ .tag = .keyword_pub, .start = 0, .end = 3 },
+        .{ .tag = .keyword_extern, .start = 4, .end = 10 },
+        .{ .tag = .l_paren, .start = 10, .end = 11 },
+        .{ .tag = .string, .start = 11, .end = 20 },
+        .{ .tag = .r_paren, .start = 20, .end = 21 },
+        .{ .tag = .keyword_fn, .start = 22, .end = 24 },
+        .{ .tag = .ident, .start = 25, .end = 28 },
+        .{ .tag = .l_paren, .start = 28, .end = 29 },
+        .{ .tag = .r_paren, .start = 29, .end = 30 },
+        .{ .tag = .l_brace, .start = 31, .end = 32 },
+        .{ .tag = .r_brace, .start = 32, .end = 33 },
+        .{ .tag = .eof, .start = 33, .end = 33 },
+    };
+
+    var parser = Parser.init(allocator, &tokens, &diags, 0);
+    var ast_tree = try parser.parse();
+    defer ast_tree.deinit(allocator);
+
+    try std.testing.expectEqual(@as(u32, 0), diags.error_count);
+    const tags = ast_tree.nodes.items(.tag);
+    const fn_decl_idx = std.mem.indexOfScalar(Node.Tag, tags, .fn_decl).?;
+    const fn_decl = ast_tree.nodes.get(fn_decl_idx);
+    try std.testing.expect(fn_decl.decl_flags.public);
+    try std.testing.expect(fn_decl.decl_flags.extern_decl);
+    try std.testing.expectEqual(@as(u32, 3), fn_decl.extern_name_token);
+}
+
+test "parser: recovery always makes progress at declaration modifiers" {
+    const allocator = std.testing.allocator;
+    const source = "pub nope";
+
+    var sm = @import("source_manager.zig").SourceManager.init(allocator);
+    defer sm.deinit();
+    _ = try sm.addFile("<test>", source);
+
+    var diags = DiagnosticEngine.init(allocator, &sm);
+    defer diags.deinit();
+
+    const tokens = [_]Token{
+        .{ .tag = .keyword_pub, .start = 0, .end = 3 },
+        .{ .tag = .ident, .start = 4, .end = 8 },
+        .{ .tag = .eof, .start = 8, .end = 8 },
+    };
+
+    var parser = Parser.init(allocator, &tokens, &diags, 0);
+    var ast_tree = try parser.parse();
+    defer ast_tree.deinit(allocator);
+
+    try std.testing.expectEqual(@as(u32, 1), diags.error_count);
+    try std.testing.expectEqual(@as(u32, tokens.len - 1), parser.index);
 }

@@ -5,7 +5,7 @@ pub const Ast = struct {
     tokens: []const Token,
     nodes: std.MultiArrayList(Node),
     extra_data: []const u32,
-    
+
     pub fn deinit(self: *Ast, allocator: std.mem.Allocator) void {
         allocator.free(self.tokens);
         self.nodes.deinit(allocator);
@@ -17,8 +17,19 @@ pub const Node = struct {
     tag: Tag,
     main_token: u32,
     data: Data,
+    decl_flags: DeclFlags = .{},
+    extern_name_token: u32 = std.math.maxInt(u32),
 
     pub const Index = u32;
+
+    pub const DeclFlags = packed struct(u8) {
+        public: bool = false,
+        exported: bool = false,
+        inline_hint: bool = false,
+        noinline_hint: bool = false,
+        extern_decl: bool = false,
+        _padding: u3 = 0,
+    };
 
     pub const Data = struct {
         lhs: Index,
@@ -102,10 +113,9 @@ pub const Node = struct {
     ///   main_token = `while` token
     ///   lhs = condition node
     ///   rhs = body block node
-
     pub const Tag = enum {
         root,
-        
+
         // Declarations
         fn_decl,
         fn_proto,
@@ -113,7 +123,7 @@ pub const Node = struct {
         var_decl,
         const_decl,
         test_decl,
-        
+
         // Statements
         block,
         if_stmt,
@@ -124,7 +134,7 @@ pub const Node = struct {
         continue_stmt,
         defer_stmt,
         errdefer_stmt,
-        
+
         // Expressions
         binary_op,
         unary_op,
@@ -132,7 +142,7 @@ pub const Node = struct {
         field_access,
         array_access,
         slice,
-        
+
         // Literals & Primitives
         identifier,
         integer_literal,
@@ -142,20 +152,20 @@ pub const Node = struct {
         bool_literal,
         null_literal,
         undefined_literal,
-        
+
         // Type expressions (appear in type-annotation position)
-        pointer_type,    // *T, *const T, [*]T, [*]const T
-        slice_type,      // []T, []const T
-        array_type,      // [N]T
-        optional_type,   // ?T
+        pointer_type, // *T, *const T, [*]T, [*]const T
+        slice_type, // []T, []const T
+        array_type, // [N]T
+        optional_type, // ?T
         error_union_type, // E!T or !T
-        
+
         // Aggregate type declarations
         struct_decl,
         enum_decl,
         union_decl,
         tuple_type,
-        
+
         // Builtins & Intrinsics
         nocopy_builtin,
         move_builtin,

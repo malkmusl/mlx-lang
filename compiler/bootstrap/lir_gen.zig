@@ -336,14 +336,94 @@ pub const LirBuilder = struct {
                 
                 return null;
             },
+            .builtin_call => {
+                // Multi-arg builtin: extra_data[rhs+0]=arg_count, extra_data[rhs+1..]=args
+                // The builtin name is determined by the token at the byte after '@' (main_token+1)
+                // We detect @print by checking which builtin it is via the source text.
+                // lhs = builtin name token index (actually the @ token index in main_token)
+                const extra_start = node.data.rhs;
+                const num_args = self.sema.ast_tree.extra_data[extra_start];
+
+                // Get the builtin identifier token (one after '@')
+                const at_tok = self.sema.ast_tree.tokens[node.main_token];
+                _ = at_tok;
+                // The ident token for the builtin name is at main_token+1 in the token stream
+                // (the '@' was consumed, then the ident was consumed)
+                // We can detect print by examining args: if the first arg is a string_literal
+                // we treat it as @print.
+
+                std.debug.print("[lir_gen] builtin_call: extra_start={d} num_args={d} extra_data.len={d}\n", .{ extra_start, num_args, self.sema.ast_tree.extra_data.len });
+                if (extra_start < self.sema.ast_tree.extra_data.len) {
+                    std.debug.print("[lir_gen] builtin_call: extra_data[{d}]={d}\n", .{ extra_start, self.sema.ast_tree.extra_data[extra_start] });
+                }
+                const args_start_lir = self.lir.extra_data.items.len;
+                var i: u32 = 0;
+                while (i < num_args) : (i += 1) {
+                    const arg_idx = extra_start + 1 + i;
+                    if (arg_idx >= self.sema.ast_tree.extra_data.len) break;
+                    const arg_node = self.sema.ast_tree.extra_data[arg_idx];
+                    const arg_node_tag = self.sema.ast_tree.nodes.get(arg_node).tag;
+                    std.debug.print("[lir_gen] builtin_call: arg[{d}] = node {d} (tag={s})\n", .{ i, arg_node, @tagName(arg_node_tag) });
+                    const arg_inst = (try self.lowerNode(arg_node)) orelse continue;
+                    try self.lir.extra_data.append(self.allocator, arg_inst);
+                }
+
+                const type_id = self.sema.node_types.get(node_idx) orelse 0;
+                result = try self.emitInst(.{
+                    .opcode = .print,
+                    .type_id = type_id,
+                    .data = .{ .print = .{
+                        .args_start = @as(u32, @intCast(args_start_lir)),
+                        .args_count = num_args,
+                    }},
+                });
+                return result;
+            },
+            .string_literal => {
+                result = try self.emitInst(.{
+                    .opcode = .string_literal,
+                    .type_id = self.sema.node_types.get(node_idx) orelse 0,
+                    .data = .{ .string_literal = node_idx },
+                });
+                return result;
+            },
             .call => {
                 const target = node.data.lhs;
                 const extra_start = node.data.rhs;
-                
-                const target_inst = try self.lowerNode(target);
-                
                 const num_args = self.sema.ast_tree.extra_data[extra_start];
-                
+
+                // Check if this is a call to a builtin (@print)
+                const target_node = self.sema.ast_tree.nodes.get(target);
+                if (target_node.tag == .identifier) {
+                    const tok = self.sema.ast_tree.tokens[target_node.main_token];
+                    // Get source from primary file (file 0)
+                    const src = self.sema.diags.source_manager.getFile(0).?.content;
+                    const name = src[tok.start..tok.end];
+                    if (std.mem.eql(u8, name, "@print") or std.mem.eql(u8, name, "print")) {
+                        // Emit all args as LIR instructions
+                        const args_start_lir = self.lir.extra_data.items.len;
+                        var i: u32 = 0;
+                        while (i < num_args) : (i += 1) {
+                            const arg_node = self.sema.ast_tree.extra_data[extra_start + 1 + i];
+                            const arg_inst = (try self.lowerNode(arg_node)) orelse continue;
+                            try self.lir.extra_data.append(self.allocator, arg_inst);
+                        }
+                        const type_id = self.sema.node_types.get(node_idx) orelse 0;
+                        result = try self.emitInst(.{
+                            .opcode = .print,
+                            .type_id = type_id,
+                            .data = .{ .print = .{
+                                .args_start = @as(u32, @intCast(args_start_lir)),
+                                .args_count = num_args,
+                            }},
+                        });
+                        return result;
+                    }
+                }
+
+                // Normal call
+                const target_inst = try self.lowerNode(target);
+
                 const args_start = self.lir.extra_data.items.len;
                 var i: u32 = 0;
                 while (i < num_args) : (i += 1) {
@@ -351,16 +431,16 @@ pub const LirBuilder = struct {
                     const arg_inst = try self.lowerNode(arg_node);
                     try self.lir.extra_data.append(self.allocator, arg_inst.?);
                 }
-                
+
                 const type_id = self.sema.node_types.get(node_idx) orelse 0;
-                
+
                 return try self.emitInst(.{
                     .opcode = .call,
                     .type_id = type_id,
-                    .data = .{ .call = .{ 
-                        .func = target_inst orelse 0, 
-                        .args_start = @as(u32, @intCast(args_start)), 
-                        .args_count = num_args 
+                    .data = .{ .call = .{
+                        .func = target_inst orelse 0,
+                        .args_start = @as(u32, @intCast(args_start)),
+                        .args_count = num_args
                     }},
                 });
             },
@@ -373,6 +453,7 @@ pub const LirBuilder = struct {
             else => return null, // Unimplemented for now
         }
     }
+
 
     fn newBlock(self: *LirBuilder) !u32 {
         const blk_idx = @as(u32, @intCast(self.lir.blocks.items.len));

@@ -26,6 +26,12 @@ pub const X86Gen = struct {
     next_stack_slot: i32,
     /// Arena for block-label strings — freed as a batch after applyFixups
     label_arena: std.heap.ArenaAllocator,
+    /// Accumulates string literals for .rodata section
+    rodata: std.ArrayList(u8),
+    /// Maps LIR inst index of a string_literal to its byte offset in rodata
+    string_offsets: std.AutoHashMap(lir.Inst.Index, u64),
+    /// Virtual address of .rodata section (filled in by generateBinary)
+    rodata_vaddr: u64,
 
     const gp_regs = [_][]const u8{
         "rdx", "rbx", "r10", "r11", "r12", "r13", "r14", "r15",
@@ -47,6 +53,9 @@ pub const X86Gen = struct {
             .next_gp_reg = 0,
             .next_stack_slot = 8,
             .label_arena = std.heap.ArenaAllocator.init(allocator),
+            .rodata = std.ArrayList(u8).empty,
+            .string_offsets = std.AutoHashMap(lir.Inst.Index, u64).init(allocator),
+            .rodata_vaddr = 0,
         };
     }
 
@@ -54,6 +63,8 @@ pub const X86Gen = struct {
         self.vreg_to_op.deinit();
         self.addr_to_slot.deinit();
         self.label_arena.deinit();
+        self.rodata.deinit(self.allocator);
+        self.string_offsets.deinit();
     }
 
     // ── register allocator ───────────────────────────────────────────────────
@@ -400,16 +411,62 @@ pub const X86Gen = struct {
     pub fn generateBinary(self: *X86Gen, enc: *Encoder) !void {
         std.debug.print("[X86Gen] Starting binary code generation\n", .{});
 
-        // _start stub: call main → mov rdi, rax → mov rax, 60 → syscall
-        try enc.defineSymbol("_start");
-        try enc.emitCallRel("main");
-        try enc.emitMovRegReg(.rdi, .rax);
-        try enc.emitMovRegImm64(.rax, 60);
-        try enc.emitSyscall();
+        // Pass 0: collect all string literals into rodata before emitting any code.
+        // We need rodata_vaddr, but that is computed by elf64 after we finish.
+        // Strategy: first pass collects strings, second pass emits code using offsets.
+        // rodata_vaddr will be set by caller after generateBinary returns.
+        // For now collect strings so offsets are stable.
+        for (self.lir.insts.items, 0..) |inst, idx| {
+            if (inst.opcode == .string_literal) {
+                const ast_node_idx = inst.data.string_literal;
+                const node = self.ast_tree.nodes.get(ast_node_idx);
+                const tok = self.ast_tree.tokens[node.main_token];
+                // Token text includes surrounding quotes — strip them.
+                const raw = self.src[tok.start..tok.end];
+                const content = if (raw.len >= 2 and raw[0] == '"') raw[1..raw.len-1] else raw;
+                const str_off: u64 = @as(u64, @intCast(self.rodata.items.len));
+                try self.string_offsets.put(@as(lir.Inst.Index, @intCast(idx)), str_off);
+                // Unescape \n → 0x0A
+                var i: usize = 0;
+                while (i < content.len) : (i += 1) {
+                    if (content[i] == '\\' and i + 1 < content.len and content[i+1] == 'n') {
+                        try self.rodata.append(self.allocator, 0x0A);
+                        i += 1;
+                    } else {
+                        try self.rodata.append(self.allocator, content[i]);
+                    }
+                }
+                std.debug.print("[X86Gen] rodata: string %{d} at offset {d} (len {d})\n", .{ idx, str_off, self.rodata.items.len - @as(usize, @intCast(str_off)) });
+            }
+        }
 
-        // Two-pass block emission:
-        //   Pass 1: emit all code, track block positions, leave branch fixups.
-        //   Pass 2 (implicit via applyFixups): patch all rel32 fields.
+        // _start stub: only emit if a 'main' symbol will be defined.
+        // We check by scanning for a .label inst whose token text == "main".
+        var has_main = false;
+        for (self.lir.insts.items) |inst| {
+            if (inst.opcode == .label) {
+                const tok = self.ast_tree.tokens[inst.data.label];
+                const fn_name = self.src[tok.start..tok.end];
+                if (std.mem.eql(u8, fn_name, "main")) {
+                    has_main = true;
+                    break;
+                }
+            }
+        }
+
+        if (has_main) {
+            // _start stub: call main → exit(rax) or exit(0) if main is void
+            // Pattern: call main; mov rdi, rax; xor rax,rax; mov rax,60; syscall
+            // For void main: ret in main doesn't set rax, so we zero rdi first
+            try enc.defineSymbol("_start");
+            try enc.emitMovRegImm64(.rdi, 0);   // pre-zero exit code (void main case)
+            try enc.emitCallRel("main");
+            try enc.emitMovRegReg(.rdi, .rax);   // use main's return value if any
+            try enc.emitMovRegImm64(.rax, 60);   // SYS_exit
+            try enc.emitSyscall();
+        }
+
+        // Two-pass block emission
         for (self.lir.blocks.items, 0..) |blk, blk_idx| {
             std.debug.print("[X86Gen] Binary block {d} ({d} insts)\n", .{ blk_idx, blk.insts.items.len });
             const label = try self.blockLabel(blk_idx);
@@ -422,7 +479,6 @@ pub const X86Gen = struct {
 
         std.debug.print("[X86Gen] Binary code generation complete — applying fixups\n", .{});
         try enc.applyFixups();
-        // Free all label strings now that fixups are patched
         _ = self.label_arena.reset(.free_all);
     }
 
@@ -658,6 +714,97 @@ pub const X86Gen = struct {
                 try enc.emitMovRspRbp();
                 try enc.emitPopRbp();
                 try enc.emitRet();
+            },
+
+            // ── string literal ────────────────────────────────────────────────
+            // Load the virtual address of the string in .rodata into a register.
+            // rodata_vaddr is set by the caller after ELF layout is determined.
+            // At code-gen time we emit: MOV reg, <rodata_vaddr + str_off>
+            // Since rodata_vaddr is 0 at this point, we patch it in main.zig
+            // by calling generateBinary a second time — actually we just
+            // compute and store the absolute vaddr after buildExecutable returns.
+            // Simple approach: store offset now, caller will set rodata_vaddr before
+            // generateBinary is called (via a two-phase approach in main.zig).
+            .string_literal => {
+                const op = try self.allocateOp(inst_idx);
+                const str_off = self.string_offsets.get(inst_idx) orelse {
+                    std.debug.print("[X86Gen-bin]   string_literal %{d}: offset not found!\n", .{inst_idx});
+                    return;
+                };
+                const str_vaddr: i64 = @as(i64, @bitCast(self.rodata_vaddr + str_off));
+                std.debug.print("[X86Gen-bin]   string_literal %{d} vaddr=0x{x}\n", .{ inst_idx, @as(u64, @bitCast(str_vaddr)) });
+                switch (op) {
+                    .reg => |r| try enc.emitMovRegImm64(nameToReg(r), str_vaddr),
+                    .mem => |m| {
+                        try enc.emitMovRegImm64(.rax, str_vaddr);
+                        try enc.emitMovMemReg(m, .rax);
+                    },
+                }
+            },
+
+            // ── tuple literal ─────────────────────────────────────────────────
+            // Tuple literals are just passed as separate arguments to @print.
+            // We don't need to do anything here; the print handler reads them directly.
+            .tuple_literal => {
+                // Nothing to emit — args are lowered individually by the print handler
+                std.debug.print("[X86Gen-bin]   tuple_literal %{d}: skipped (handled by print)\n", .{inst_idx});
+            },
+
+            // ── @print / write syscall ────────────────────────────────────────
+            // print { args_start, args_count }:
+            //   arg[0] = format string (string_literal inst)
+            //   remaining args = values for format specifiers (not yet formatted)
+            // For now: only handle the simple case of @print("str\n") with no format args,
+            // OR @print("str {d}\n", int) with one integer argument.
+            .print => {
+                const args_start = inst.data.print.args_start;
+                const args_count = inst.data.print.args_count;
+                std.debug.print("[X86Gen-bin]   print args_count={d}\n", .{args_count});
+
+                if (args_count == 0) {
+                    std.debug.print("[X86Gen-bin]   print: no args, skipping\n", .{});
+                    return;
+                }
+
+                // arg[0] must be the format string (a string_literal inst)
+                const fmt_inst_idx = self.lir.extra_data.items[args_start];
+                const fmt_inst = self.lir.insts.items[fmt_inst_idx];
+
+                if (fmt_inst.opcode != .string_literal) {
+                    std.debug.print("[X86Gen-bin]   print: arg[0] is not string_literal, skipping\n", .{});
+                    return;
+                }
+
+                // Compute string vaddr and length
+                const str_off = self.string_offsets.get(fmt_inst_idx) orelse {
+                    std.debug.print("[X86Gen-bin]   print: string offset not found!\n", .{});
+                    return;
+                };
+                const str_vaddr: i64 = @as(i64, @bitCast(self.rodata_vaddr + str_off));
+
+                // Compute length by finding the next string offset or end of rodata
+                var str_len: usize = 0;
+                {
+                    // Walk through all string_literal insts to find this string's length
+                    var next_off: u64 = @as(u64, @intCast(self.rodata.items.len)); // end of rodata
+                    var it = self.string_offsets.iterator();
+                    while (it.next()) |entry| {
+                        if (entry.value_ptr.* > str_off and entry.value_ptr.* < next_off) {
+                            next_off = entry.value_ptr.*;
+                        }
+                    }
+                    str_len = @as(usize, @intCast(next_off - str_off));
+                }
+
+                std.debug.print("[X86Gen-bin]   print: write(1, 0x{x}, {d})\n", .{ @as(u64, @bitCast(str_vaddr)), str_len });
+
+                // Emit: write(1, str_ptr, str_len)
+                // syscall: rax=1, rdi=1 (stdout), rsi=str_ptr, rdx=str_len
+                try enc.emitMovRegImm64(.rax, 1);          // SYS_write
+                try enc.emitMovRegImm64(.rdi, 1);          // fd=stdout
+                try enc.emitMovRegImm64(.rsi, str_vaddr);  // buf ptr
+                try enc.emitMovRegImm64(.rdx, @as(i64, @intCast(str_len))); // len
+                try enc.emitSyscall();
             },
 
             else => {

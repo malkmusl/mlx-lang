@@ -6,25 +6,19 @@ set -e
 ZIN_FILE=${1:-tests/07_functions.zin}
 EXPECTED=${2:-15}
 
+TMP_DIR=$(mktemp -d)
+OUT_PATH="$TMP_DIR/out"
+trap 'rm -rf -- "$TMP_DIR"' EXIT
+
 echo "Building compiler..."
 zig build
 
-echo "Compiling $ZIN_FILE to ASM..."
-./zig-out/bin/zin0 "$ZIN_FILE" > out.s
-
-echo "=== Generated ASM ==="
-cat out.s
-echo "====================="
-
-echo "Assembling out.s..."
-nasm -f elf64 out.s -o out.o
-
-echo "Linking..."
-ld out.o -o out
+echo "Compiling $ZIN_FILE to ELF..."
+./zig-out/bin/zin0 "$ZIN_FILE" "-o$OUT_PATH"
 
 echo "Executing..."
 set +e
-./out
+"$OUT_PATH"
 EXIT_CODE=$?
 set -e
 

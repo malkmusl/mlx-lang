@@ -24,9 +24,16 @@ pub const Opcode = enum {
     br,
     condbr,
     call,
+    syscall,
     ret,
     unreachable_inst,
     param,
+
+    // Builtins and Literals
+    builtin_sym,
+    print,
+    string_literal,
+    tuple_literal,
 };
 
 pub const Inst = struct {
@@ -52,9 +59,15 @@ pub const Inst = struct {
         br: struct { dest: BasicBlock.Index },
         condbr: struct { cond: Index, true_dest: BasicBlock.Index, false_dest: BasicBlock.Index },
         call: struct { func: Index, args_start: u32, args_count: u32 },
+        syscall: u32, // extra_start, first elem is arg_count
         ret: ?Index,
         unreachable_inst: void,
         param: u32, // Parameter index
+
+        builtin_sym: u32,
+        print: struct { args_start: u32, args_count: u32 },
+        string_literal: u32, // AST node index
+        tuple_literal: u32,  // AST node index
     };
 
     opcode: Opcode,

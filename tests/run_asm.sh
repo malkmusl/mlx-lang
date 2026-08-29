@@ -1,34 +1,32 @@
 #!/bin/bash
 set -e
 
-# Usage: ./tests/run_asm.sh tests/06_control_flow.zin
+# Usage: ./tests/run_asm.sh tests/06_control_flow.zin [expected_exit_code]
 
 ZIN_FILE=$1
+EXPECTED=${2:-5}
+
+TMP_DIR=$(mktemp -d)
+OUT_PATH="$TMP_DIR/out"
+trap 'rm -rf -- "$TMP_DIR"' EXIT
 
 echo "Building compiler..."
 zig build
 
-echo "Compiling $ZIN_FILE to LIR/ASM..."
-# Run the compiler, which will output to out.s
-./zig-out/bin/zin0 $ZIN_FILE > out.s
+echo "Compiling $ZIN_FILE to ELF..."
+./zig-out/bin/zin0 "$ZIN_FILE" "-o$OUT_PATH"
 
-echo "Assembling out.s to out.o..."
-nasm -f elf64 out.s -o out.o
-
-echo "Linking out.o to executable out..."
-ld out.o -o out
-
-echo "Executing out..."
+echo "Executing..."
 set +e
-./out
+"$OUT_PATH"
 EXIT_CODE=$?
 set -e
 
 echo "Program exited with code: $EXIT_CODE"
 
-if [ "$EXIT_CODE" -eq 5 ]; then
-    echo "SUCCESS: Program returned 5 as expected!"
+if [ "$EXIT_CODE" -eq "$EXPECTED" ]; then
+    echo "SUCCESS: Program returned $EXPECTED as expected!"
 else
-    echo "ERROR: Program did not return 5. Returned $EXIT_CODE."
+    echo "ERROR: Expected $EXPECTED but got $EXIT_CODE."
     exit 1
 fi

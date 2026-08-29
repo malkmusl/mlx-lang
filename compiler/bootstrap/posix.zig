@@ -164,9 +164,18 @@ pub fn readdir(fd: Fd, buf: []u8) OsError!usize {
 }
 
 test "posix runtime" {
-    // write
+    // read/write through a pipe; do not write to stdout because Zig's build
+    // runner uses it for its test protocol.
     const msg = "hello zin posix\n";
-    _ = try write(1, msg);
+    var fds: [2]Fd = undefined;
+    try pipe(&fds);
+    defer close(fds[0]) catch {};
+    defer close(fds[1]) catch {};
+
+    _ = try write(fds[1], msg);
+    var read_buf: [64]u8 = undefined;
+    const read_len = try read(fds[0], &read_buf);
+    try std.testing.expectEqualStrings(msg, read_buf[0..read_len]);
 
     // stat
     var st: Stat = undefined;
