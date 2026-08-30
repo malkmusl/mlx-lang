@@ -418,8 +418,10 @@ pub const LirBuilder = struct {
                 });
             },
             .return_stmt => {
-                const expr = node.data.rhs;
-                const expr_inst = try self.lowerNode(expr);
+                const expr_inst = if (node.data.rhs == std.math.maxInt(u32))
+                    null
+                else
+                    try self.lowerNode(node.data.rhs);
                 _ = try self.emitInst(.{ .opcode = .ret, .type_id = 0, .data = .{ .ret = expr_inst } });
                 return null;
             },

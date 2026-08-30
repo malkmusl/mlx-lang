@@ -56,7 +56,7 @@ pub const Node = struct {
     /// `fn_proto`:
     ///   main_token = ident token (function name)
     ///   lhs = extra_start (extra_data index)
-    ///   rhs = extra_len  (extra_data[lhs] = ret_type_node, [lhs+1..] = param nodes)
+    ///   rhs = extra_len  (extra_data[lhs] = required ret_type_node, [lhs+1..] = param nodes)
     ///
     /// `param_decl`:
     ///   main_token = ident token (param name)
@@ -114,6 +114,11 @@ pub const Node = struct {
     ///   main_token = `while` token
     ///   lhs = condition node
     ///   rhs = body block node
+    ///
+    /// `return_stmt`:
+    ///   main_token = `return` token
+    ///   lhs = 0
+    ///   rhs = expression node, or maxInt(u32) for a value-less return
     pub const Tag = enum {
         root,
 

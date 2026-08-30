@@ -288,6 +288,11 @@ pub const TypePool = struct {
         return start;
     }
 
+    pub fn functionParams(self: *const TypePool, function: Type.Function) []const Type.Id {
+        const start: usize = @intCast(function.params_start);
+        return self.extra_type_ids.items[start .. start + function.params_len];
+    }
+
     /// Intern a named integer type: `u8`, `i32`, etc.
     pub fn internInt(self: *TypePool, signed: bool, bits: u16) !Type.Id {
         return self.intern(.{ .integer = .{ .is_signed = signed, .bits = bits } }, .copyable);

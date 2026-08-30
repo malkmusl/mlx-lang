@@ -33,6 +33,7 @@ pub const Sema = struct {
     type_values: std.AutoHashMap(Node.Index, Type.Id),
     unsafe_depth: u32,
     eval_branch_quota: u64,
+    current_return_type: ?Type.Id,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -53,6 +54,7 @@ pub const Sema = struct {
             .type_values = std.AutoHashMap(Node.Index, Type.Id).init(allocator),
             .unsafe_depth = 0,
             .eval_branch_quota = 1_000_000,
+            .current_return_type = null,
         };
     }
 
@@ -137,6 +139,15 @@ pub const Sema = struct {
                     }
                     try self.node_types.put(node_idx, sym.type_id);
                     return sym.type_id;
+                }
+
+                // Function declarations are order-independent at module scope.
+                // Materialize a later function's signature on first reference;
+                // its body is still analyzed in the normal source traversal.
+                if (self.findRootFunction(ident_name)) |function_decl| {
+                    const function_type = try self.declareFunction(function_decl, self.root_scope);
+                    try self.node_types.put(node_idx, function_type);
+                    return function_type;
                 }
 
                 // Then check builtin types
@@ -291,6 +302,13 @@ pub const Sema = struct {
                         try self.node_types.put(node_idx, operand_type);
                         return operand_type;
                     }
+                    const return_type = if (self.current_return_type) |type_id|
+                        self.type_pool.get(type_id)
+                    else
+                        null;
+                    if (return_type == null or return_type.?.data != .error_union) {
+                        try self.reportError(4008, .sema, self.ast_tree.tokens[node.main_token].start, "try can only propagate from an error-capable function");
+                    }
                     const payload = operand.data.error_union.payload;
                     try self.node_types.put(node_idx, payload);
                     return payload;
@@ -347,11 +365,15 @@ pub const Sema = struct {
                 var child_scope = Scope.init(self.allocator, scope);
                 defer child_scope.deinit();
 
-                var last_type: Type.Id = 0; // default void
+                var last_type = try self.type_pool.internPrimitive(.void_type);
                 var i: u32 = extra_start;
                 while (i < extra_end) : (i += 1) {
                     const child_idx = self.ast_tree.extra_data[i];
                     last_type = try self.analyzeNode(child_idx, &child_scope);
+                    if (self.type_pool.get(last_type).data == .error_union and self.isDiscardedExpression(child_idx)) {
+                        const child = self.ast_tree.nodes.get(child_idx);
+                        try self.reportError(4008, .sema, self.ast_tree.tokens[child.main_token].start, "Error-union value must be handled explicitly");
+                    }
                 }
 
                 try self.node_types.put(node_idx, last_type);
@@ -395,39 +417,32 @@ pub const Sema = struct {
                 const extra_len = node.data.rhs;
 
                 const ret_type_node = self.ast_tree.extra_data[extra_start];
-                var ret_type: Type.Id = 0;
-                if (ret_type_node != std.math.maxInt(u32)) {
-                    ret_type = try self.analyzeNode(ret_type_node, scope);
-                }
+                const ret_type = try self.resolveBuiltinTypeArg(ret_type_node, scope) orelse {
+                    try self.reportError(4001, .sema, self.ast_tree.tokens[node.main_token].start, "Function return type could not be resolved");
+                    return self.type_pool.internPrimitive(.void_type);
+                };
 
+                var param_types = std.ArrayList(Type.Id).empty;
+                defer param_types.deinit(self.allocator);
                 var i: u32 = 1;
                 while (i < extra_len) : (i += 1) {
                     const param_idx = self.ast_tree.extra_data[extra_start + i];
                     const param_node = self.ast_tree.nodes.get(param_idx);
 
                     const param_type_node = param_node.data.rhs;
-                    const param_type = try self.analyzeNode(param_type_node, scope);
-
-                    const param_name_tok = param_node.data.lhs;
-                    const tok = self.ast_tree.tokens[param_name_tok];
-                    const src = self.diags.source_manager.getFile(0).?.content;
-                    const name = src[tok.start..tok.end];
-
-                    try scope.put(name, .{
-                        .name = name,
-                        .decl_node = param_idx,
-                        .type_id = param_type,
-                        .is_const = true,
-                    });
-
-                    try self.local_states.put(param_idx, .initialized);
+                    const param_type = try self.resolveBuiltinTypeArg(param_type_node, scope) orelse {
+                        try self.reportError(4001, .sema, self.ast_tree.tokens[param_node.main_token].start, "Function parameter type could not be resolved");
+                        continue;
+                    };
+                    try param_types.append(self.allocator, param_type);
                     try self.node_types.put(param_idx, param_type);
                 }
 
+                const params_start = try self.type_pool.appendParams(param_types.items);
                 const fn_type = try self.type_pool.intern(.{ .function = .{
                     .ret_type = ret_type,
-                    .params_start = 0,
-                    .params_len = 0,
+                    .params_start = params_start,
+                    .params_len = @intCast(param_types.items.len),
                     .is_var_args = false,
                 } }, .copyable);
                 try self.node_types.put(node_idx, fn_type);
@@ -440,22 +455,29 @@ pub const Sema = struct {
                 const proto = node.data.lhs;
                 const body = node.data.rhs;
 
-                const fn_type = try self.analyzeNode(proto, &child_scope);
-                const body_type = try self.analyzeNode(body, &child_scope);
-                _ = body_type; // For now
-
+                const fn_type = try self.declareFunction(node_idx, scope);
+                try self.bindFunctionParameters(proto, fn_type, &child_scope);
                 const proto_node = self.ast_tree.nodes.get(proto);
                 const name_tok_idx = proto_node.main_token;
                 const fn_tok = self.ast_tree.tokens[name_tok_idx];
-                const fn_src = self.diags.source_manager.getFile(0).?.content;
-                const fn_name = fn_src[fn_tok.start..fn_tok.end];
 
-                try scope.put(fn_name, .{
-                    .name = fn_name,
-                    .decl_node = node_idx,
-                    .type_id = fn_type,
-                    .is_const = true,
-                });
+                const function = self.type_pool.get(fn_type).data.function;
+                const previous_return_type = self.current_return_type;
+                self.current_return_type = function.ret_type;
+                defer self.current_return_type = previous_return_type;
+
+                _ = try self.analyzeNode(body, &child_scope);
+
+                const return_type = self.type_pool.get(function.ret_type);
+                const may_fall_through = !self.nodeDefinitelyReturns(body);
+                if (may_fall_through and !self.allowsSuccessfulFallthrough(function.ret_type)) {
+                    const code: u32 = if (isPrimitive(return_type, .noreturn_type)) 4010 else 4004;
+                    const message = if (code == 4010)
+                        "noreturn function has a returning path"
+                    else
+                        "Function can reach the end without returning a value";
+                    try self.reportError(code, .sema, fn_tok.start, message);
+                }
 
                 try self.node_types.put(node_idx, fn_type);
                 return fn_type;
@@ -467,28 +489,67 @@ pub const Sema = struct {
                 const target_type_id = try self.analyzeNode(target, scope);
 
                 const num_args = self.ast_tree.extra_data[extra_start];
+                const target_type = self.type_pool.get(target_type_id);
+                if (target_type.data != .function) {
+                    var i: u32 = 0;
+                    while (i < num_args) : (i += 1) {
+                        _ = try self.analyzeNode(self.ast_tree.extra_data[extra_start + 1 + i], scope);
+                    }
+                    try self.reportError(4001, .sema, self.ast_tree.tokens[node.main_token].start, "Called expression is not a function");
+                    return self.putBuiltinResult(node_idx, try self.type_pool.internPrimitive(.void_type));
+                }
+
+                const function = target_type.data.function;
+                const params = self.type_pool.functionParams(function);
+                if (num_args != params.len) {
+                    try self.reportError(4001, .sema, self.ast_tree.tokens[node.main_token].start, "Function argument count does not match its declaration");
+                }
                 var i: u32 = 0;
                 while (i < num_args) : (i += 1) {
                     const arg_node = self.ast_tree.extra_data[extra_start + 1 + i];
-                    _ = try self.analyzeNode(arg_node, scope);
+                    const arg_type = try self.analyzeNode(arg_node, scope);
+                    if (i < params.len) {
+                        const parameter_type = self.type_pool.get(params[i]);
+                        const accepts_anytype = isPrimitive(parameter_type, .anytype_type);
+                        if (!accepts_anytype and !Type.isCoercible(self.type_pool.get(arg_type), parameter_type)) {
+                            try self.reportError(4001, .sema, self.ast_tree.tokens[self.ast_tree.nodes.get(arg_node).main_token].start, "Function argument type does not match parameter type");
+                        }
+                    }
                 }
 
-                const target_type = self.type_pool.types.items[target_type_id];
-                var ret_type: Type.Id = 0;
-                if (target_type.data == .function) {
-                    ret_type = target_type.data.function.ret_type;
-                }
-
-                try self.node_types.put(node_idx, ret_type);
-                return ret_type;
+                try self.node_types.put(node_idx, function.ret_type);
+                return function.ret_type;
             },
             .return_stmt => {
-                const expr = node.data.rhs;
-                const expr_type = try self.analyzeNode(expr, scope);
-
-                // We should technically check this against the function's return type
-                try self.node_types.put(node_idx, expr_type);
-                return expr_type; // type is technically `noreturn`, but for now `expr_type` works
+                const expected_type = self.current_return_type orelse {
+                    try self.reportError(4001, .sema, self.ast_tree.tokens[node.main_token].start, "return used outside a function");
+                    return self.putBuiltinResult(node_idx, try self.type_pool.internPrimitive(.noreturn_type));
+                };
+                const expected = self.type_pool.get(expected_type);
+                if (node.data.rhs == std.math.maxInt(u32)) {
+                    const accepts_empty_return = isPrimitive(expected, .void_type) or
+                        (expected.data == .error_union and
+                            isPrimitive(self.type_pool.get(expected.data.error_union.payload), .void_type));
+                    if (!accepts_empty_return) {
+                        try self.reportError(4001, .sema, self.ast_tree.tokens[node.main_token].start, "Return value required by function return type");
+                    }
+                } else {
+                    const actual_type = try self.analyzeNode(node.data.rhs, scope);
+                    const actual = self.type_pool.get(actual_type);
+                    const return_matches = if (expected.data == .error_union)
+                        if (actual.data == .error_union)
+                            Type.isCoercible(actual, expected)
+                        else
+                            Type.isCoercible(actual, self.type_pool.get(expected.data.error_union.payload))
+                    else
+                        !isPrimitive(expected, .void_type) and Type.isCoercible(actual, expected);
+                    if (!return_matches) {
+                        try self.reportError(4001, .sema, self.ast_tree.tokens[node.main_token].start, "Returned expression does not match function return type");
+                    }
+                }
+                const noreturn_type = try self.type_pool.internPrimitive(.noreturn_type);
+                try self.node_types.put(node_idx, noreturn_type);
+                return noreturn_type;
             },
             else => {
                 // Return a dummy type
@@ -785,6 +846,117 @@ pub const Sema = struct {
                 try self.reportError(9001, .lowering, name_token.start, "Builtin lowering is not available in the Stage-0 backend yet");
                 return self.putBuiltinResult(node_idx, try self.type_pool.internPrimitive(.void_type));
             },
+        }
+    }
+
+    fn nodeDefinitelyReturns(self: *const Sema, node_idx: Node.Index) bool {
+        const node = self.ast_tree.nodes.get(node_idx);
+        return switch (node.tag) {
+            .return_stmt => true,
+            .block => blk: {
+                var index = node.data.lhs;
+                while (index < node.data.rhs) : (index += 1) {
+                    if (self.nodeDefinitelyReturns(self.ast_tree.extra_data[index])) break :blk true;
+                }
+                break :blk false;
+            },
+            .if_stmt => blk: {
+                const start = node.data.lhs;
+                if (node.data.rhs < start + 3) break :blk false;
+                break :blk self.nodeDefinitelyReturns(self.ast_tree.extra_data[start + 1]) and
+                    self.nodeDefinitelyReturns(self.ast_tree.extra_data[start + 2]);
+            },
+            .unsafe_block => self.nodeDefinitelyReturns(node.data.lhs),
+            else => false,
+        };
+    }
+
+    fn allowsSuccessfulFallthrough(self: *const Sema, return_type_id: Type.Id) bool {
+        const return_type = self.type_pool.get(return_type_id);
+        if (isPrimitive(return_type, .void_type)) return true;
+        if (return_type.data != .error_union) return false;
+        return isPrimitive(self.type_pool.get(return_type.data.error_union.payload), .void_type);
+    }
+
+    fn isDiscardedExpression(self: *const Sema, node_idx: Node.Index) bool {
+        return switch (self.ast_tree.nodes.get(node_idx).tag) {
+            .binary_op,
+            .unary_op,
+            .call,
+            .field_access,
+            .array_access,
+            .slice,
+            .identifier,
+            .integer_literal,
+            .float_literal,
+            .string_literal,
+            .char_literal,
+            .bool_literal,
+            .null_literal,
+            .undefined_literal,
+            .tuple_literal,
+            .builtin_call,
+            .if_stmt,
+            .match_stmt,
+            .unsafe_block,
+            => true,
+            else => false,
+        };
+    }
+
+    fn findRootFunction(self: *const Sema, name: []const u8) ?Node.Index {
+        const root = self.ast_tree.nodes.get(self.ast_tree.nodes.len - 1);
+        if (root.tag != .root) return null;
+        const src = self.diags.source_manager.getFile(0).?.content;
+        var index = root.data.lhs;
+        while (index < root.data.rhs) : (index += 1) {
+            const declaration_index = self.ast_tree.extra_data[index];
+            const declaration = self.ast_tree.nodes.get(declaration_index);
+            if (declaration.tag != .fn_decl) continue;
+            const prototype = self.ast_tree.nodes.get(declaration.data.lhs);
+            const token = self.ast_tree.tokens[prototype.main_token];
+            if (std.mem.eql(u8, src[token.start..token.end], name)) return declaration_index;
+        }
+        return null;
+    }
+
+    fn declareFunction(self: *Sema, declaration_index: Node.Index, scope: *Scope) std.mem.Allocator.Error!Type.Id {
+        const declaration = self.ast_tree.nodes.get(declaration_index);
+        const prototype_index = declaration.data.lhs;
+        const prototype = self.ast_tree.nodes.get(prototype_index);
+        const function_type = self.node_types.get(prototype_index) orelse try self.analyzeNode(prototype_index, scope);
+        const token = self.ast_tree.tokens[prototype.main_token];
+        const src = self.diags.source_manager.getFile(0).?.content;
+        const name = src[token.start..token.end];
+        try scope.put(name, .{
+            .name = name,
+            .decl_node = declaration_index,
+            .type_id = function_type,
+            .is_const = true,
+        });
+        try self.node_types.put(declaration_index, function_type);
+        return function_type;
+    }
+
+    fn bindFunctionParameters(self: *Sema, prototype_index: Node.Index, function_type: Type.Id, scope: *Scope) std.mem.Allocator.Error!void {
+        const prototype = self.ast_tree.nodes.get(prototype_index);
+        const function = self.type_pool.get(function_type).data.function;
+        const parameter_types = self.type_pool.functionParams(function);
+        const src = self.diags.source_manager.getFile(0).?.content;
+        var parameter_offset: u32 = 0;
+        while (parameter_offset < parameter_types.len) : (parameter_offset += 1) {
+            const parameter_index = self.ast_tree.extra_data[prototype.data.lhs + 1 + parameter_offset];
+            const parameter = self.ast_tree.nodes.get(parameter_index);
+            const token = self.ast_tree.tokens[parameter.main_token];
+            const name = src[token.start..token.end];
+            try scope.put(name, .{
+                .name = name,
+                .decl_node = parameter_index,
+                .type_id = parameter_types[parameter_offset],
+                .is_const = true,
+            });
+            try self.local_states.put(parameter_index, .initialized);
+            try self.node_types.put(parameter_index, parameter_types[parameter_offset]);
         }
     }
 
@@ -1165,3 +1337,7 @@ pub const Sema = struct {
         return self.type_pool.internPrimitive(.void_type);
     }
 };
+
+fn isPrimitive(ty: Type, primitive: Type.Primitive) bool {
+    return ty.data == .primitive and ty.data.primitive == primitive;
+}

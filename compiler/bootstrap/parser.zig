@@ -531,17 +531,15 @@ pub const Parser = struct {
             return null;
         }
 
-        // return type
-        var ret_type: Node.Index = std.math.maxInt(u32);
-        if (self.tokens[self.index].tag != .l_brace) {
-            const rt = try self.parseTypeExpr();
-            if (rt) |r| {
-                ret_type = r;
-            } else {
-                try self.reportError(2002, "Expected function return type");
-                return null;
-            }
+        // Zin functions always declare their return type explicitly.
+        if (self.tokens[self.index].tag == .l_brace) {
+            try self.reportError(2002, "Expected function return type");
+            return null;
         }
+        const ret_type = try self.parseTypeExpr() orelse {
+            try self.reportError(2002, "Expected function return type");
+            return null;
+        };
 
         const extra_start = @as(u32, @intCast(self.extra_data.items.len));
         try self.extra_data.append(self.allocator, ret_type);
@@ -629,21 +627,7 @@ pub const Parser = struct {
                 return @as(u32, @intCast(self.nodes.len - 1));
             },
             .keyword_return => {
-                const ret_tok = self.index;
-                self.index += 1; // consume 'return'
-                // optional expression after return
-                const expr = try self.parseExpr(0);
-                // skip optional statement_end
-                if (self.index < self.tokens.len and self.tokens[self.index].tag == .statement_end) {
-                    self.index += 1;
-                }
-                const expr_node: Node.Index = expr orelse 0;
-                try self.nodes.append(self.allocator, .{
-                    .tag = .return_stmt,
-                    .main_token = ret_tok,
-                    .data = .{ .lhs = 0, .rhs = expr_node },
-                });
-                return @as(u32, @intCast(self.nodes.len - 1));
+                return self.parseReturnStatement();
             },
             else => {
                 return self.parseExpr(0);
@@ -894,15 +878,7 @@ pub const Parser = struct {
             .keyword_if => return self.parseIfExpr(),
             .keyword_while => return self.parseWhileLoop(),
             .keyword_return => {
-                const start_tok = self.index;
-                self.consumeToken("Consume return");
-                const expr = try self.parseExpr(0);
-                try self.nodes.append(self.allocator, .{
-                    .tag = .return_stmt,
-                    .main_token = start_tok,
-                    .data = .{ .lhs = 0, .rhs = expr.? },
-                });
-                return @as(u32, @intCast(self.nodes.len - 1));
+                return self.parseReturnStatement();
             },
             .l_brace => return self.parseBlock(),
             .keyword_struct, .keyword_enum, .keyword_union => return self.parseAggregateType(),
@@ -922,6 +898,29 @@ pub const Parser = struct {
                 return null;
             },
         }
+    }
+
+    fn parseReturnStatement(self: *Parser) std.mem.Allocator.Error!?Node.Index {
+        const return_token = self.index;
+        self.consumeToken("Consume return");
+
+        var expression: Node.Index = std.math.maxInt(u32);
+        if (self.index < self.tokens.len) {
+            const next = self.tokens[self.index].tag;
+            if (next != .statement_end and next != .r_brace and next != .eof) {
+                expression = try self.parseExpr(0) orelse return null;
+            }
+        }
+        if (self.index < self.tokens.len and self.tokens[self.index].tag == .statement_end) {
+            self.index += 1;
+        }
+
+        try self.nodes.append(self.allocator, .{
+            .tag = .return_stmt,
+            .main_token = return_token,
+            .data = .{ .lhs = 0, .rhs = expression },
+        });
+        return @intCast(self.nodes.len - 1);
     }
 
     /// Type-valued builtin arguments use the ordinary type grammar even though
@@ -1339,7 +1338,7 @@ test "parser: error recovery" {
 
 test "parser: declaration modifiers are preserved" {
     const allocator = std.testing.allocator;
-    const source = "pub extern(\"syscall\") fn raw() {}";
+    const source = "pub extern(\"syscall\") fn raw() void {}";
 
     var sm = @import("source_manager.zig").SourceManager.init(allocator);
     defer sm.deinit();
@@ -1358,9 +1357,10 @@ test "parser: declaration modifiers are preserved" {
         .{ .tag = .ident, .start = 25, .end = 28 },
         .{ .tag = .l_paren, .start = 28, .end = 29 },
         .{ .tag = .r_paren, .start = 29, .end = 30 },
-        .{ .tag = .l_brace, .start = 31, .end = 32 },
-        .{ .tag = .r_brace, .start = 32, .end = 33 },
-        .{ .tag = .eof, .start = 33, .end = 33 },
+        .{ .tag = .ident, .start = 31, .end = 35 },
+        .{ .tag = .l_brace, .start = 36, .end = 37 },
+        .{ .tag = .r_brace, .start = 37, .end = 38 },
+        .{ .tag = .eof, .start = 38, .end = 38 },
     };
 
     var parser = Parser.init(allocator, &tokens, &diags, 0);
