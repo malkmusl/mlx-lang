@@ -112,22 +112,36 @@ pub const Node = struct {
     ///
     /// `while_stmt`:
     ///   main_token = `while` token
-    ///   lhs = condition node
-    ///   rhs = body block node
+    ///   lhs = extra_start where:
+    ///     extra_data[lhs + 0] = label token, or maxInt(u32)
+    ///     extra_data[lhs + 1] = condition node
+    ///     extra_data[lhs + 2] = body block node
+    ///   rhs = lhs + 3
     ///
     /// `for_stmt`:
     ///   main_token = `for` token
     ///   lhs = extra_start where:
-    ///     extra_data[lhs + 0] = item capture token
-    ///     extra_data[lhs + 1] = index capture token, or maxInt(u32)
-    ///     extra_data[lhs + 2] = iterable/range node
-    ///     extra_data[lhs + 3] = body block node
-    ///   rhs = lhs + 4
+    ///     extra_data[lhs + 0] = label token, or maxInt(u32)
+    ///     extra_data[lhs + 1] = capture flags (bit0 = pointer capture)
+    ///     extra_data[lhs + 2] = item capture token
+    ///     extra_data[lhs + 3] = index capture token, or maxInt(u32)
+    ///     extra_data[lhs + 4] = iterable/range node
+    ///     extra_data[lhs + 5] = body block node
+    ///   rhs = lhs + 6
     ///
     /// `range`:
     ///   main_token = `..` token
     ///   lhs = inclusive start expression
     ///   rhs = exclusive end expression
+    ///
+    /// `array_literal`:
+    ///   main_token = `[` token
+    ///   lhs = extra_start where:
+    ///     extra_data[lhs + 0] = declared length node, or maxInt(u32) for `[_]`
+    ///     extra_data[lhs + 1] = element type node
+    ///     extra_data[lhs + 2] = element count
+    ///     extra_data[lhs + 3..] = element expression nodes
+    ///   rhs = lhs + 3 + element count
     ///
     /// `break_stmt` / `continue_stmt`:
     ///   main_token = keyword token
@@ -181,6 +195,7 @@ pub const Node = struct {
         null_literal,
         undefined_literal,
         tuple_literal,
+        array_literal,
 
         // Type expressions (appear in type-annotation position)
         pointer_type, // *T, *const T, [*]T, [*]const T

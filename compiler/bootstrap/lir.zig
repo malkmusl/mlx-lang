@@ -18,6 +18,8 @@ pub const Opcode = enum {
     load,
     store,
     addr,
+    alloca,
+    gep,
     func_sym,
     label,
 
@@ -29,12 +31,15 @@ pub const Opcode = enum {
     ret,
     ret_error,
     ret_error_union,
+    ret_error_slice,
+    ret_error_union_slice,
     unreachable_inst,
     param,
 
     // Error unions
     error_test,
     error_payload,
+    error_payload_part,
 
     // Builtins and Literals
     builtin_sym,
@@ -69,6 +74,8 @@ pub const Inst = struct {
         load: struct { ptr: Index },
         store: struct { ptr: Index, val: Index },
         addr: u32, // ID of local variable/symbol
+        alloca: struct { id: u32, size: u32, alignment: u32 },
+        gep: struct { base: Index, index: Index, stride: i32 },
         func_sym: u32, // ID of function identifier node
         label: u32, // ID of function identifier node
 
@@ -79,11 +86,14 @@ pub const Inst = struct {
         ret: ?Index,
         ret_error: Index,
         ret_error_union: Index,
+        ret_error_slice: struct { ptr: Index, len: Index },
+        ret_error_union_slice: struct { source: Index, len: Index },
         unreachable_inst: void,
         param: u32, // Parameter index
 
         error_test: Index,
         error_payload: Index,
+        error_payload_part: struct { source: Index, part: u8 },
 
         builtin_sym: u32,
         string_literal: u32, // AST node index

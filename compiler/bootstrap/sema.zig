@@ -16,6 +16,11 @@ pub const LocalState = enum {
     partially_moved,
 };
 
+const LoopContext = struct {
+    label_token: u32,
+    break_type: ?Type.Id = null,
+};
+
 pub const Sema = struct {
     allocator: std.mem.Allocator,
     ast_tree: ast.Ast,
@@ -34,7 +39,7 @@ pub const Sema = struct {
     unsafe_depth: u32,
     eval_branch_quota: u64,
     current_return_type: ?Type.Id,
-    loop_depth: u32,
+    loop_stack: std.ArrayList(LoopContext),
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -56,7 +61,7 @@ pub const Sema = struct {
             .unsafe_depth = 0,
             .eval_branch_quota = 1_000_000,
             .current_return_type = null,
-            .loop_depth = 0,
+            .loop_stack = std.ArrayList(LoopContext).empty,
         };
     }
 
@@ -65,6 +70,7 @@ pub const Sema = struct {
         self.node_types.deinit();
         self.const_values.deinit();
         self.type_values.deinit();
+        self.loop_stack.deinit(self.allocator);
     }
 
     pub fn analyze(self: *Sema) !void {
@@ -377,6 +383,31 @@ pub const Sema = struct {
                 try self.node_types.put(node_idx, ty);
                 return ty;
             },
+            .array_literal => {
+                const extra_start = node.data.lhs;
+                const length_node = self.ast_tree.extra_data[extra_start];
+                const element_type_node = self.ast_tree.extra_data[extra_start + 1];
+                const count = self.ast_tree.extra_data[extra_start + 2];
+                const element_type = try self.resolveTypeExpr(element_type_node);
+                const declared_length = if (length_node == std.math.maxInt(u32))
+                    @as(u64, count)
+                else
+                    self.comptimeInteger(length_node) orelse 0;
+                if (declared_length != count) {
+                    try self.reportError(4001, .sema, self.ast_tree.tokens[node.main_token].start, "Array literal element count does not match its declared length");
+                }
+                var index: u32 = 0;
+                while (index < count) : (index += 1) {
+                    const element_node = self.ast_tree.extra_data[extra_start + 3 + index];
+                    const actual_type = try self.analyzeNode(element_node, scope);
+                    if (!Type.isCoercible(self.type_pool.get(actual_type), self.type_pool.get(element_type))) {
+                        try self.reportError(4001, .sema, self.ast_tree.tokens[self.ast_tree.nodes.get(element_node).main_token].start, "Array element does not match the declared element type");
+                    }
+                }
+                const array_type = try self.type_pool.internArray(element_type, declared_length);
+                try self.node_types.put(node_idx, array_type);
+                return array_type;
+            },
             .field_access => {
                 const base_type = try self.analyzeNode(node.data.lhs, scope);
                 const base = self.type_pool.get(base_type);
@@ -464,47 +495,91 @@ pub const Sema = struct {
                 return result_type;
             },
             .while_stmt => {
-                const cond = node.data.lhs;
-                const body = node.data.rhs;
+                const extra_start = node.data.lhs;
+                const label_token = self.ast_tree.extra_data[extra_start];
+                const cond = self.ast_tree.extra_data[extra_start + 1];
+                const body = self.ast_tree.extra_data[extra_start + 2];
 
                 const condition_type = try self.analyzeNode(cond, scope);
                 if (!isPrimitive(self.type_pool.get(condition_type), .bool_type)) {
                     try self.reportError(4001, .sema, self.ast_tree.tokens[self.ast_tree.nodes.get(cond).main_token].start, "while condition must have type bool");
                 }
-                self.loop_depth += 1;
-                defer self.loop_depth -= 1;
+                try self.loop_stack.append(self.allocator, .{ .label_token = label_token });
                 _ = try self.analyzeNode(body, scope);
+                const loop = self.loop_stack.pop().?;
 
                 const void_type = try self.type_pool.internPrimitive(.void_type);
-                try self.node_types.put(node_idx, void_type);
-                return void_type;
+                var result_type = loop.break_type orelse void_type;
+                if (!isPrimitive(self.type_pool.get(result_type), .void_type) and
+                    self.const_values.get(cond) != 1)
+                {
+                    try self.reportError(4001, .sema, self.ast_tree.tokens[node.main_token].start, "A value-producing while loop must have a statically true condition");
+                    result_type = void_type;
+                }
+                try self.node_types.put(node_idx, result_type);
+                return result_type;
             },
             .for_stmt => {
                 const extra_start = node.data.lhs;
-                const item_token = self.ast_tree.extra_data[extra_start];
-                const index_token = self.ast_tree.extra_data[extra_start + 1];
-                const iterable_node = self.ast_tree.extra_data[extra_start + 2];
-                const body_node = self.ast_tree.extra_data[extra_start + 3];
+                const label_token = self.ast_tree.extra_data[extra_start];
+                const capture_flags = self.ast_tree.extra_data[extra_start + 1];
+                const item_token = self.ast_tree.extra_data[extra_start + 2];
+                const index_token = self.ast_tree.extra_data[extra_start + 3];
+                const iterable_node = self.ast_tree.extra_data[extra_start + 4];
+                const body_node = self.ast_tree.extra_data[extra_start + 5];
                 const iterable = self.ast_tree.nodes.get(iterable_node);
-
-                if (iterable.tag != .range) {
-                    _ = try self.analyzeNode(iterable_node, scope);
-                    try self.reportError(9001, .lowering, self.ast_tree.tokens[node.main_token].start, "Stage-0 for lowering currently supports ranges");
-                    const void_type = try self.type_pool.internPrimitive(.void_type);
-                    try self.node_types.put(node_idx, void_type);
-                    return void_type;
+                var item_type: Type.Id = undefined;
+                if (iterable.tag == .range) {
+                    const start_type = try self.analyzeNode(iterable.data.lhs, scope);
+                    const end_type = try self.analyzeNode(iterable.data.rhs, scope);
+                    const start_value = self.type_pool.get(start_type);
+                    const end_value = self.type_pool.get(end_type);
+                    if (!start_value.isInteger() or !end_value.isInteger() or
+                        (!Type.isCoercible(start_value, end_value) and !Type.isCoercible(end_value, start_value)))
+                    {
+                        try self.reportError(4001, .sema, self.ast_tree.tokens[iterable.main_token].start, "for range bounds must have compatible integer types");
+                    }
+                    try self.node_types.put(iterable_node, start_type);
+                    item_type = start_type;
+                    if ((capture_flags & 1) != 0) {
+                        try self.reportError(4001, .sema, self.ast_tree.tokens[item_token].start, "A range item has no address and cannot use pointer capture");
+                    }
+                } else {
+                    const iterable_type_id = try self.analyzeNode(iterable_node, scope);
+                    const iterable_type = self.type_pool.get(iterable_type_id);
+                    const child_type: Type.Id = switch (iterable_type.data) {
+                        .array => |array| array.child_type,
+                        .pointer => |pointer| if (pointer.size == .Slice)
+                            pointer.child_type
+                        else blk: {
+                            try self.reportError(4001, .sema, self.ast_tree.tokens[node.main_token].start, "for iterable must be an array, slice, or range");
+                            break :blk try self.type_pool.internPrimitive(.void_type);
+                        },
+                        else => blk: {
+                            try self.reportError(4001, .sema, self.ast_tree.tokens[node.main_token].start, "for iterable must be an array, slice, or range");
+                            break :blk try self.type_pool.internPrimitive(.void_type);
+                        },
+                    };
+                    if ((capture_flags & 1) != 0) {
+                        var is_const_storage = switch (iterable_type.data) {
+                            .pointer => |pointer| pointer.is_const,
+                            else => false,
+                        };
+                        if (iterable.tag == .identifier) {
+                            const iterable_token = self.ast_tree.tokens[iterable.main_token];
+                            const source = self.diags.source_manager.getFile(0).?.content;
+                            if (scope.get(source[iterable_token.start..iterable_token.end])) |symbol| {
+                                is_const_storage = is_const_storage or symbol.is_const;
+                            }
+                        }
+                        if (is_const_storage) {
+                            try self.reportError(4001, .sema, self.ast_tree.tokens[item_token].start, "Pointer capture requires a mutable iterable");
+                        }
+                        item_type = try self.type_pool.internPtr(child_type, false);
+                    } else {
+                        item_type = child_type;
+                    }
                 }
-
-                const start_type = try self.analyzeNode(iterable.data.lhs, scope);
-                const end_type = try self.analyzeNode(iterable.data.rhs, scope);
-                const start_value = self.type_pool.get(start_type);
-                const end_value = self.type_pool.get(end_type);
-                if (!start_value.isInteger() or !end_value.isInteger() or
-                    (!Type.isCoercible(start_value, end_value) and !Type.isCoercible(end_value, start_value)))
-                {
-                    try self.reportError(4001, .sema, self.ast_tree.tokens[iterable.main_token].start, "for range bounds must have compatible integer types");
-                }
-                try self.node_types.put(iterable_node, start_type);
 
                 var loop_scope = Scope.init(self.allocator, scope);
                 defer loop_scope.deinit();
@@ -513,7 +588,7 @@ pub const Sema = struct {
                 try loop_scope.put(src[item_tok.start..item_tok.end], .{
                     .name = src[item_tok.start..item_tok.end],
                     .decl_node = node_idx,
-                    .type_id = start_type,
+                    .type_id = item_type,
                     .is_const = true,
                 });
                 if (index_token != std.math.maxInt(u32)) {
@@ -527,24 +602,48 @@ pub const Sema = struct {
                     });
                 }
 
-                self.loop_depth += 1;
-                defer self.loop_depth -= 1;
+                try self.loop_stack.append(self.allocator, .{ .label_token = label_token });
                 _ = try self.analyzeNode(body_node, &loop_scope);
+                const loop = self.loop_stack.pop().?;
 
                 const void_type = try self.type_pool.internPrimitive(.void_type);
+                if (loop.break_type) |break_type| {
+                    if (!isPrimitive(self.type_pool.get(break_type), .void_type)) {
+                        try self.reportError(4001, .sema, self.ast_tree.tokens[node.main_token].start, "A finite for loop cannot produce a value because it may end without break");
+                    }
+                }
                 try self.node_types.put(node_idx, void_type);
                 return void_type;
             },
             .break_stmt, .continue_stmt => {
-                if (self.loop_depth == 0) {
+                if (self.loop_stack.items.len == 0) {
                     try self.reportError(4001, .sema, self.ast_tree.tokens[node.main_token].start, "Loop control statement used outside a loop");
-                }
-                if (node.data.lhs != std.math.maxInt(u32)) {
-                    try self.reportError(9001, .lowering, self.ast_tree.tokens[node.main_token].start, "Labeled loop control is not available in Stage 0 yet");
-                }
-                if (node.tag == .break_stmt and node.data.rhs != std.math.maxInt(u32)) {
-                    _ = try self.analyzeNode(node.data.rhs, scope);
-                    try self.reportError(9001, .lowering, self.ast_tree.tokens[node.main_token].start, "Break values are not available in Stage 0 yet");
+                } else {
+                    const target_index = self.findLoopTarget(node.data.lhs) orelse {
+                        try self.reportError(4001, .sema, self.ast_tree.tokens[node.main_token].start, "Unknown loop label");
+                        const noreturn_type = try self.type_pool.internPrimitive(.noreturn_type);
+                        try self.node_types.put(node_idx, noreturn_type);
+                        return noreturn_type;
+                    };
+                    if (node.tag == .break_stmt) {
+                        const break_type = if (node.data.rhs == std.math.maxInt(u32))
+                            try self.type_pool.internPrimitive(.void_type)
+                        else
+                            try self.analyzeNode(node.data.rhs, scope);
+                        if (self.loop_stack.items[target_index].break_type) |previous_type| {
+                            const previous = self.type_pool.get(previous_type);
+                            const current = self.type_pool.get(break_type);
+                            if (Type.isCoercible(current, previous)) {
+                                // Keep the wider/established result type.
+                            } else if (Type.isCoercible(previous, current)) {
+                                self.loop_stack.items[target_index].break_type = break_type;
+                            } else {
+                                try self.reportError(4001, .sema, self.ast_tree.tokens[node.main_token].start, "Break values for the same loop have incompatible types");
+                            }
+                        } else {
+                            self.loop_stack.items[target_index].break_type = break_type;
+                        }
+                    }
                 }
                 const noreturn_type = try self.type_pool.internPrimitive(.noreturn_type);
                 try self.node_types.put(node_idx, noreturn_type);
@@ -601,11 +700,11 @@ pub const Sema = struct {
 
                 const function = self.type_pool.get(fn_type).data.function;
                 const previous_return_type = self.current_return_type;
-                const previous_loop_depth = self.loop_depth;
+                const previous_loop_depth = self.loop_stack.items.len;
                 self.current_return_type = function.ret_type;
-                self.loop_depth = 0;
+                self.loop_stack.clearRetainingCapacity();
                 defer self.current_return_type = previous_return_type;
-                defer self.loop_depth = previous_loop_depth;
+                defer self.loop_stack.items.len = previous_loop_depth;
 
                 _ = try self.analyzeNode(body, &child_scope);
 
@@ -1036,6 +1135,7 @@ pub const Sema = struct {
             .null_literal,
             .undefined_literal,
             .tuple_literal,
+            .array_literal,
             .builtin_call,
             .if_stmt,
             .match_stmt,
@@ -1043,6 +1143,24 @@ pub const Sema = struct {
             => true,
             else => false,
         };
+    }
+
+    fn findLoopTarget(self: *const Sema, label_token: u32) ?usize {
+        if (self.loop_stack.items.len == 0) return null;
+        if (label_token == std.math.maxInt(u32)) return self.loop_stack.items.len - 1;
+
+        const source = self.diags.source_manager.getFile(0).?.content;
+        const wanted_token = self.ast_tree.tokens[label_token];
+        const wanted = source[wanted_token.start..wanted_token.end];
+        var index = self.loop_stack.items.len;
+        while (index > 0) {
+            index -= 1;
+            const candidate_token = self.loop_stack.items[index].label_token;
+            if (candidate_token == std.math.maxInt(u32)) continue;
+            const candidate = self.ast_tree.tokens[candidate_token];
+            if (std.mem.eql(u8, wanted, source[candidate.start..candidate.end])) return index;
+        }
+        return null;
     }
 
     fn findRootFunction(self: *const Sema, name: []const u8) ?Node.Index {
@@ -1207,8 +1325,9 @@ pub const Sema = struct {
             else => false,
         };
         if (!valid) try self.reportError(4003, .sema, start_byte, "Invalid cast operands");
-        const requires_float_lowering = kind == .floatCast or kind == .floatFromInt or kind == .intFromFloat or
-            (kind == .bitCast and (target.isFloat() or source.isFloat()));
+        // A same-width bitCast is representation-only and is lowered as an
+        // identity vreg operation, including GP-held floating bit patterns.
+        const requires_float_lowering = kind == .floatCast or kind == .floatFromInt or kind == .intFromFloat;
         if (valid and requires_float_lowering) {
             try self.reportError(9001, .lowering, start_byte, "Floating-point builtin lowering is not available in Stage 0 yet");
         }

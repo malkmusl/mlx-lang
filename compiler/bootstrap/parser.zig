@@ -768,6 +768,22 @@ pub const Parser = struct {
                 return @as(u32, @intCast(self.nodes.len - 1));
             },
             .ident => {
+                // A loop label is part of the loop expression, not an ordinary
+                // identifier followed by a binary operator.
+                if (self.index + 2 < self.tokens.len and
+                    self.tokens[self.index + 1].tag == .colon and
+                    (self.tokens[self.index + 2].tag == .keyword_while or
+                        self.tokens[self.index + 2].tag == .keyword_for))
+                {
+                    const label_token = self.index;
+                    self.consumeToken("Consume loop label");
+                    self.consumeToken("Consume loop label ':'");
+                    return switch (self.tokens[self.index].tag) {
+                        .keyword_while => self.parseWhileLoop(label_token),
+                        .keyword_for => self.parseForLoop(label_token),
+                        else => unreachable,
+                    };
+                }
                 try self.nodes.append(self.allocator, .{
                     .tag = .identifier,
                     .main_token = self.index,
@@ -823,6 +839,7 @@ pub const Parser = struct {
                 });
                 return @as(u32, @intCast(self.nodes.len - 1));
             },
+            .l_bracket => return self.parseArrayLiteral(),
             .at => {
                 const start_tok = self.index;
                 self.consumeToken("Consume @");
@@ -878,8 +895,8 @@ pub const Parser = struct {
                 return @as(u32, @intCast(self.nodes.len - 1));
             },
             .keyword_if => return self.parseIfExpr(),
-            .keyword_while => return self.parseWhileLoop(),
-            .keyword_for => return self.parseForLoop(),
+            .keyword_while => return self.parseWhileLoop(std.math.maxInt(u32)),
+            .keyword_for => return self.parseForLoop(std.math.maxInt(u32)),
             .keyword_return => {
                 return self.parseReturnStatement();
             },
@@ -922,6 +939,65 @@ pub const Parser = struct {
             .tag = .return_stmt,
             .main_token = return_token,
             .data = .{ .lhs = 0, .rhs = expression },
+        });
+        return @intCast(self.nodes.len - 1);
+    }
+
+    fn parseArrayLiteral(self: *Parser) std.mem.Allocator.Error!?Node.Index {
+        const bracket_token = self.index;
+        self.consumeToken("Consume array literal '['");
+
+        var length_node: Node.Index = std.math.maxInt(u32);
+        if (self.index < self.tokens.len and self.tokens[self.index].tag == .ident and
+            std.mem.eql(u8, self.tokenText(self.index), "_"))
+        {
+            self.consumeToken("Consume inferred array length '_'");
+        } else {
+            length_node = try self.parseExpr(0) orelse {
+                try self.reportError(2011, "Expected array literal length");
+                return null;
+            };
+        }
+        if (self.index >= self.tokens.len or self.tokens[self.index].tag != .r_bracket) {
+            try self.reportError(2012, "Expected ']' after array literal length");
+            return null;
+        }
+        self.consumeToken("Consume array literal ']'");
+
+        const element_type = try self.parseTypeExpr() orelse {
+            try self.reportError(2005, "Expected array element type");
+            return null;
+        };
+        if (self.index >= self.tokens.len or self.tokens[self.index].tag != .l_brace) {
+            try self.reportError(2003, "Expected '{' after array literal type");
+            return null;
+        }
+        self.consumeToken("Consume array literal '{'");
+
+        var elements = std.ArrayList(Node.Index).empty;
+        defer elements.deinit(self.allocator);
+        while (self.index < self.tokens.len and self.tokens[self.index].tag != .r_brace) {
+            const element = try self.parseExpr(0) orelse return null;
+            try elements.append(self.allocator, element);
+            if (self.index < self.tokens.len and self.tokens[self.index].tag == .comma) {
+                self.consumeToken("Consume array element comma");
+            } else {
+                break;
+            }
+        }
+        if (self.index >= self.tokens.len or self.tokens[self.index].tag != .r_brace) {
+            try self.reportError(2003, "Expected '}' after array literal");
+            return null;
+        }
+        self.consumeToken("Consume array literal '}'");
+
+        const extra_start: u32 = @intCast(self.extra_data.items.len);
+        try self.extra_data.appendSlice(self.allocator, &.{ length_node, element_type, @intCast(elements.items.len) });
+        try self.extra_data.appendSlice(self.allocator, elements.items);
+        try self.nodes.append(self.allocator, .{
+            .tag = .array_literal,
+            .main_token = bracket_token,
+            .data = .{ .lhs = extra_start, .rhs = @intCast(self.extra_data.items.len) },
         });
         return @intCast(self.nodes.len - 1);
     }
@@ -1133,7 +1209,7 @@ pub const Parser = struct {
         return @as(u32, @intCast(self.nodes.len - 1));
     }
 
-    fn parseWhileLoop(self: *Parser) !?Node.Index {
+    fn parseWhileLoop(self: *Parser, label_token: u32) !?Node.Index {
         self.traceRuleEnter("parseWhileLoop");
         defer self.traceRuleExit("parseWhileLoop");
         const start_tok = self.index;
@@ -1145,21 +1221,28 @@ pub const Parser = struct {
         const body = try self.parseExpr(0);
         if (body == null) return null;
 
+        const extra_start: u32 = @intCast(self.extra_data.items.len);
+        try self.extra_data.appendSlice(self.allocator, &.{ label_token, cond.?, body.? });
         try self.nodes.append(self.allocator, .{
             .tag = .while_stmt,
             .main_token = start_tok,
-            .data = .{ .lhs = cond.?, .rhs = body.? },
+            .data = .{ .lhs = extra_start, .rhs = extra_start + 3 },
         });
 
         return @as(u32, @intCast(self.nodes.len - 1));
     }
 
-    fn parseForLoop(self: *Parser) !?Node.Index {
+    fn parseForLoop(self: *Parser, label_token: u32) !?Node.Index {
         self.traceRuleEnter("parseForLoop");
         defer self.traceRuleExit("parseForLoop");
         const start_tok = self.index;
         self.consumeToken("Consume for");
 
+        var capture_flags: u32 = 0;
+        if (self.index < self.tokens.len and self.tokens[self.index].tag == .asterisk) {
+            capture_flags |= 1;
+            self.consumeToken("Consume for-loop pointer capture '*'");
+        }
         if (self.index >= self.tokens.len or self.tokens[self.index].tag != .ident) {
             try self.reportError(2002, "Expected for-loop item capture");
             return null;
@@ -1200,11 +1283,11 @@ pub const Parser = struct {
 
         const body = try self.parseBlock() orelse return null;
         const extra_start: u32 = @intCast(self.extra_data.items.len);
-        try self.extra_data.appendSlice(self.allocator, &.{ item_token, index_token, iterable, body });
+        try self.extra_data.appendSlice(self.allocator, &.{ label_token, capture_flags, item_token, index_token, iterable, body });
         try self.nodes.append(self.allocator, .{
             .tag = .for_stmt,
             .main_token = start_tok,
-            .data = .{ .lhs = extra_start, .rhs = extra_start + 4 },
+            .data = .{ .lhs = extra_start, .rhs = extra_start + 6 },
         });
         return @intCast(self.nodes.len - 1);
     }

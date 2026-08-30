@@ -163,8 +163,11 @@ pub fn main(init: std.process.Init) !u8 {
             x86_gen.vreg_to_op.clearRetainingCapacity();
             x86_gen.addr_to_slot.clearRetainingCapacity();
             x86_gen.error_tag_slots.clearRetainingCapacity();
+            x86_gen.error_payload_extra_slots.clearRetainingCapacity();
             x86_gen.next_gp_reg = 0;
             x86_gen.next_stack_slot = 8;
+            x86_gen.current_function_return_type = null;
+            x86_gen.current_hidden_payload_slot = null;
             // Clear rodata so strings don't accumulate across two generateBinary calls
             x86_gen.rodata.clearRetainingCapacity();
             x86_gen.string_offsets.clearRetainingCapacity();

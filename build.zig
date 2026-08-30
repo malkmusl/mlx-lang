@@ -15,6 +15,20 @@ pub fn build(b: *std.Build) void {
 
     b.installArtifact(exe);
 
+    const lsp = b.addExecutable(.{
+        .name = "zin-lsp",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("compiler/bootstrap/lsp.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    b.installArtifact(lsp);
+
+    const lsp_run = b.addRunArtifact(lsp);
+    const lsp_step = b.step("lsp", "Run the Zin language server");
+    lsp_step.dependOn(&lsp_run.step);
+
     const run_cmd = b.addRunArtifact(exe);
     if (b.args) |args| run_cmd.addArgs(args);
     const run_step = b.step("zin0", "Run the stage-0 bootstrap compiler scaffold");

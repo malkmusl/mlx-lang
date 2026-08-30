@@ -26,6 +26,7 @@ pub const X86Gen = struct {
     vreg_to_op: std.AutoHashMap(lir.Inst.Index, Operand),
     addr_to_slot: std.AutoHashMap(u32, i32),
     error_tag_slots: std.AutoHashMap(lir.Inst.Index, i32),
+    error_payload_extra_slots: std.AutoHashMap(lir.Inst.Index, i32),
     next_gp_reg: u8,
     next_stack_slot: i32,
     /// Arena for block-label strings — freed as a batch after applyFixups
@@ -36,6 +37,8 @@ pub const X86Gen = struct {
     string_offsets: std.AutoHashMap(lir.Inst.Index, u64),
     /// Virtual address of .rodata section (filled in by generateBinary)
     rodata_vaddr: u64,
+    current_function_return_type: ?u32,
+    current_hidden_payload_slot: ?i32,
 
     const gp_regs = [_][]const u8{
         "rdx", "rbx", "r10", "r11", "r12", "r13", "r14", "r15",
@@ -57,12 +60,15 @@ pub const X86Gen = struct {
             .vreg_to_op = std.AutoHashMap(lir.Inst.Index, Operand).init(allocator),
             .addr_to_slot = std.AutoHashMap(u32, i32).init(allocator),
             .error_tag_slots = std.AutoHashMap(lir.Inst.Index, i32).init(allocator),
+            .error_payload_extra_slots = std.AutoHashMap(lir.Inst.Index, i32).init(allocator),
             .next_gp_reg = 0,
             .next_stack_slot = 8,
             .label_arena = std.heap.ArenaAllocator.init(allocator),
             .rodata = std.ArrayList(u8).empty,
             .string_offsets = std.AutoHashMap(lir.Inst.Index, u64).init(allocator),
             .rodata_vaddr = 0,
+            .current_function_return_type = null,
+            .current_hidden_payload_slot = null,
         };
     }
 
@@ -70,6 +76,7 @@ pub const X86Gen = struct {
         self.vreg_to_op.deinit();
         self.addr_to_slot.deinit();
         self.error_tag_slots.deinit();
+        self.error_payload_extra_slots.deinit();
         self.label_arena.deinit();
         self.rodata.deinit(self.allocator);
         self.string_offsets.deinit();
@@ -163,6 +170,19 @@ pub const X86Gen = struct {
         return s;
     }
 
+    fn getOrAllocBlock(self: *X86Gen, var_id: u32, size: u32, alignment: u32) !i32 {
+        if (self.addr_to_slot.get(var_id)) |slot| return slot;
+        const safe_size: i32 = @intCast(@max(size, 1));
+        const safe_alignment: i32 = @intCast(@max(alignment, 1));
+        const unaligned_base = self.next_stack_slot + safe_size - 1;
+        const base = @divTrunc(unaligned_base + safe_alignment - 1, safe_alignment) * safe_alignment;
+        // The next qword slot spans [offset-7, offset]. Round strictly past
+        // the block's highest occupied offset so neither region overlaps.
+        self.next_stack_slot = (base + 15) & ~@as(i32, 7);
+        try self.addr_to_slot.put(var_id, base);
+        return base;
+    }
+
     fn getOrAllocErrorTagSlot(self: *X86Gen, instruction: lir.Inst.Index) !i32 {
         if (self.error_tag_slots.get(instruction)) |slot| return slot;
         const slot = self.next_stack_slot;
@@ -171,8 +191,64 @@ pub const X86Gen = struct {
         return slot;
     }
 
+    fn getOrAllocErrorPayloadExtraSlot(self: *X86Gen, instruction: lir.Inst.Index) !i32 {
+        if (self.error_payload_extra_slots.get(instruction)) |slot| return slot;
+        const slot = self.next_stack_slot;
+        self.next_stack_slot += 8;
+        try self.error_payload_extra_slots.put(instruction, slot);
+        return slot;
+    }
+
     fn isErrorUnion(self: *const X86Gen, type_id: u32) bool {
         return type_id < self.type_pool.types.items.len and self.type_pool.get(type_id).data == .error_union;
+    }
+
+    fn isSliceErrorUnion(self: *const X86Gen, type_id: u32) bool {
+        if (!self.isErrorUnion(type_id)) return false;
+        const payload_id = self.type_pool.get(type_id).data.error_union.payload;
+        const payload = self.type_pool.get(payload_id);
+        return payload.data == .pointer and payload.data.pointer.size == .Slice;
+    }
+
+    fn isByteType(self: *const X86Gen, type_id: u32) bool {
+        if (type_id >= self.type_pool.types.items.len) return false;
+        const bits = self.type_pool.bitSizeOf(type_id) catch return false;
+        return bits > 0 and bits <= 8;
+    }
+
+    fn isFloatType(self: *const X86Gen, type_id: u32) bool {
+        if (type_id >= self.type_pool.types.items.len) return false;
+        return self.type_pool.get(type_id).isFloat();
+    }
+
+    fn isFloatErrorUnion(self: *const X86Gen, type_id: u32) bool {
+        if (!self.isErrorUnion(type_id)) return false;
+        return self.isFloatType(self.type_pool.get(type_id).data.error_union.payload);
+    }
+
+    fn isMemoryErrorUnion(self: *const X86Gen, type_id: u32) bool {
+        if (!self.isErrorUnion(type_id)) return false;
+        const payload_id = self.type_pool.get(type_id).data.error_union.payload;
+        const size = self.type_pool.sizeOf(payload_id) catch return true;
+        const alignment = self.type_pool.alignOf(payload_id) catch return true;
+        return size > 16 or alignment > 16;
+    }
+
+    fn isRegisterAggregateErrorUnion(self: *const X86Gen, type_id: u32) bool {
+        if (!self.isErrorUnion(type_id) or self.isMemoryErrorUnion(type_id)) return false;
+        const payload_id = self.type_pool.get(type_id).data.error_union.payload;
+        return switch (self.type_pool.get(payload_id).data) {
+            .array, .@"struct", .@"union", .tuple => true,
+            else => false,
+        };
+    }
+
+    fn errorPayloadLayout(self: *const X86Gen, type_id: u32) struct { size: u32, alignment: u32 } {
+        const payload_id = self.type_pool.get(type_id).data.error_union.payload;
+        return .{
+            .size = @intCast(self.type_pool.sizeOf(payload_id) catch 8),
+            .alignment = @intCast(self.type_pool.alignOf(payload_id) catch 8),
+        };
     }
 
     fn condition(predicate: lir.CmpPredicate) Condition {
@@ -241,6 +317,17 @@ pub const X86Gen = struct {
                     try writer.print(", rax\n", .{});
                 } else {
                     try writer.print("  mov {s}, {d}\n", .{ op.reg, inst.data.const_i });
+                }
+            },
+            .const_f => {
+                const op = try self.allocateOp(inst_idx);
+                const bits: u64 = @bitCast(inst.data.const_f);
+                if (op == .mem) {
+                    try writer.print("  mov rax, {d}\n  mov ", .{bits});
+                    try printOp(writer, op);
+                    try writer.print(", rax\n", .{});
+                } else {
+                    try writer.print("  mov {s}, {d}\n", .{ op.reg, bits });
                 }
             },
             .add => {
@@ -328,6 +415,26 @@ pub const X86Gen = struct {
                     try writer.print("  mov {s}, rax\n", .{op.reg});
                 }
             },
+            .gep => {
+                const op = try self.allocateOp(inst_idx);
+                const base = try self.allocateOp(inst.data.gep.base);
+                const index = try self.allocateOp(inst.data.gep.index);
+                const base_reg = try opToReg(writer, base, "rax");
+                if (!std.mem.eql(u8, base_reg, "rax")) try writer.print("  mov rax, {s}\n", .{base_reg});
+                const index_reg = try opToReg(writer, index, "rcx");
+                if (!std.mem.eql(u8, index_reg, "rcx")) try writer.print("  mov rcx, {s}\n", .{index_reg});
+                const magnitude: u32 = @intCast(@abs(inst.data.gep.stride));
+                if (magnitude != 1) try writer.print("  imul rcx, {d}\n", .{magnitude});
+                try writer.print("  {s} rax, rcx\n", .{if (inst.data.gep.stride < 0) "sub" else "add"});
+                switch (op) {
+                    .reg => |register| if (!std.mem.eql(u8, register, "rax")) try writer.print("  mov {s}, rax\n", .{register}),
+                    .mem => {
+                        try writer.print("  mov ", .{});
+                        try printOp(writer, op);
+                        try writer.print(", rax\n", .{});
+                    },
+                }
+            },
             .addr => {
                 const op = try self.allocateOp(inst_idx);
                 const var_id = inst.data.addr;
@@ -341,29 +448,47 @@ pub const X86Gen = struct {
                     try writer.print("  lea {s}, [rbp - {d}]\n", .{ op.reg, slot });
                 }
             },
+            .alloca => {
+                const op = try self.allocateOp(inst_idx);
+                const allocation = inst.data.alloca;
+                const slot = try self.getOrAllocBlock(allocation.id, allocation.size, allocation.alignment);
+                if (op == .mem) {
+                    try writer.print("  lea rax, [rbp - {d}]\n  mov ", .{slot});
+                    try printOp(writer, op);
+                    try writer.print(", rax\n", .{});
+                } else {
+                    try writer.print("  lea {s}, [rbp - {d}]\n", .{ op.reg, slot });
+                }
+            },
             .store => {
                 const ptr_op = try self.allocateOp(inst.data.store.ptr);
                 const val_op = try self.allocateOp(inst.data.store.val);
                 const ptr_reg = try opToReg(writer, ptr_op, "rax");
                 const val_reg = try opToReg(writer, val_op, "rcx");
-                try writer.print("  mov qword [{s}], {s}\n", .{ ptr_reg, val_reg });
+                if (self.isByteType(inst.type_id)) {
+                    if (!std.mem.eql(u8, ptr_reg, "rdi")) try writer.print("  mov rdi, {s}\n", .{ptr_reg});
+                    if (!std.mem.eql(u8, val_reg, "rax")) try writer.print("  mov rax, {s}\n", .{val_reg});
+                    try writer.print("  mov byte [rdi], al\n", .{});
+                } else {
+                    try writer.print("  mov qword [{s}], {s}\n", .{ ptr_reg, val_reg });
+                }
             },
             .load => {
                 const op = try self.allocateOp(inst_idx);
                 const ptr_op = try self.allocateOp(inst.data.load.ptr);
                 const ptr_reg = try opToReg(writer, ptr_op, "rax");
                 if (op == .mem) {
-                    try writer.print("  mov rcx, qword [{s}]\n", .{ptr_reg});
+                    try writer.print("  {s} rcx, {s}[{s}]\n", .{ if (self.isByteType(inst.type_id)) "movzx" else "mov", if (self.isByteType(inst.type_id)) "byte " else "qword ", ptr_reg });
                     try writer.print("  mov ", .{});
                     try printOp(writer, op);
                     try writer.print(", rcx\n", .{});
                 } else {
-                    try writer.print("  mov {s}, qword [{s}]\n", .{ op.reg, ptr_reg });
+                    try writer.print("  {s} {s}, {s}[{s}]\n", .{ if (self.isByteType(inst.type_id)) "movzx" else "mov", op.reg, if (self.isByteType(inst.type_id)) "byte " else "qword ", ptr_reg });
                 }
             },
             .param => {
                 const op = try self.allocateOp(inst_idx);
-                const param_idx = inst.data.param;
+                const param_idx = inst.data.param + @intFromBool(if (self.current_function_return_type) |return_type| self.isMemoryErrorUnion(return_type) else false);
                 if (param_idx < abi.integer_arg_regs.len) {
                     const arg_reg = abi.integer_arg_regs[param_idx];
                     if (op == .mem) {
@@ -405,14 +530,30 @@ pub const X86Gen = struct {
                 const fn_tok = self.ast_tree.tokens[fn_tok_idx];
                 const fn_name = self.src[fn_tok.start..fn_tok.end];
                 try writer.print("global {s}\n{s}:\n", .{ fn_name, fn_name });
-                try writer.print("  push rbp\n  mov rbp, rsp\n  sub rsp, 256\n", .{});
+                try writer.print("  push rbp\n  mov rbp, rsp\n  sub rsp, 4096\n", .{});
+                self.current_function_return_type = inst.type_id;
+                self.current_hidden_payload_slot = null;
+                if (self.isMemoryErrorUnion(inst.type_id)) {
+                    const slot = try self.getOrAllocSlot(0xb000_0000 | inst.data.label);
+                    self.current_hidden_payload_slot = slot;
+                    try writer.print("  mov qword [rbp - {d}], rdi\n", .{slot});
+                }
             },
             .call => {
                 const op = try self.allocateOp(inst_idx);
                 const num_args = inst.data.call.args_count;
                 const args_extra_start = inst.data.call.args_start;
+                const memory_return = self.isMemoryErrorUnion(inst.type_id);
+                const register_aggregate_return = self.isRegisterAggregateErrorUnion(inst.type_id);
+                var memory_payload_slot: ?i32 = null;
+                if (memory_return or register_aggregate_return) {
+                    const layout = self.errorPayloadLayout(inst.type_id);
+                    const slot = try self.getOrAllocBlock(0xa000_0000 | inst_idx, @max(layout.size, 8), layout.alignment);
+                    memory_payload_slot = slot;
+                    if (memory_return) try writer.print("  lea rdi, [rbp - {d}]\n", .{slot});
+                }
                 var arg_classes_buf: [32]abi.ArgClass = undefined;
-                const n = @min(num_args, 32);
+                const n = @min(num_args + @intFromBool(memory_return), 32);
                 for (0..n) |i| arg_classes_buf[i] = .INTEGER;
                 const site = abi.describeCall(arg_classes_buf[0..n]);
                 if (site.stack_count > 0) {
@@ -425,12 +566,13 @@ pub const X86Gen = struct {
                     }
                     if (site.needs_stack_align) try writer.print("  sub rsp, 8\n", .{});
                 }
-                var i: u32 = @min(num_args, @as(u32, abi.integer_arg_regs.len));
+                const register_offset: u32 = @intFromBool(memory_return);
+                var i: u32 = @min(num_args, @as(u32, abi.integer_arg_regs.len) - register_offset);
                 while (i > 0) {
                     i -= 1;
                     const arg_inst = self.lir.extra_data.items[args_extra_start + i];
                     const arg_op = try self.allocateOp(arg_inst);
-                    const dest_reg = abi.integer_arg_regs[i];
+                    const dest_reg = abi.integer_arg_regs[i + register_offset];
                     const src_reg = try opToReg(writer, arg_op, "rax");
                     if (!std.mem.eql(u8, dest_reg, src_reg)) try writer.print("  mov {s}, {s}\n", .{ dest_reg, src_reg });
                 }
@@ -453,7 +595,40 @@ pub const X86Gen = struct {
                 if (self.isErrorUnion(inst.type_id)) {
                     const tag_slot = try self.getOrAllocErrorTagSlot(inst_idx);
                     try writer.print("  mov qword [rbp - {d}], rax\n", .{tag_slot});
-                    if (op == .mem) {
+                    if (self.isSliceErrorUnion(inst.type_id)) {
+                        const length_slot = try self.getOrAllocErrorPayloadExtraSlot(inst_idx);
+                        try writer.print("  mov qword [rbp - {d}], rcx\n", .{length_slot});
+                    }
+                    if (memory_return) {
+                        const slot = memory_payload_slot.?;
+                        if (op == .mem) {
+                            try writer.print("  lea rax, [rbp - {d}]\n  mov ", .{slot});
+                            try printOp(writer, op);
+                            try writer.print(", rax\n", .{});
+                        } else {
+                            try writer.print("  lea {s}, [rbp - {d}]\n", .{ op.reg, slot });
+                        }
+                    } else if (register_aggregate_return) {
+                        const slot = memory_payload_slot.?;
+                        const layout = self.errorPayloadLayout(inst.type_id);
+                        try writer.print("  lea rdi, [rbp - {d}]\n  mov qword [rdi], rdx\n", .{slot});
+                        if (layout.size > 8) try writer.print("  mov qword [rdi + 8], rcx\n", .{});
+                        if (op == .mem) {
+                            try writer.print("  lea rax, [rbp - {d}]\n  mov ", .{slot});
+                            try printOp(writer, op);
+                            try writer.print(", rax\n", .{});
+                        } else {
+                            try writer.print("  lea {s}, [rbp - {d}]\n", .{ op.reg, slot });
+                        }
+                    } else if (self.isFloatErrorUnion(inst.type_id)) {
+                        if (op == .mem) {
+                            try writer.print("  movq rax, xmm0\n  mov ", .{});
+                            try printOp(writer, op);
+                            try writer.print(", rax\n", .{});
+                        } else {
+                            try writer.print("  movq {s}, xmm0\n", .{op.reg});
+                        }
+                    } else if (op == .mem) {
                         try writer.print("  mov ", .{});
                         try printOp(writer, op);
                         try writer.print(", rdx\n", .{});
@@ -492,6 +667,17 @@ pub const X86Gen = struct {
                     try writer.print("  mov {s}, {s}\n", .{ op.reg, payload_reg });
                 }
             },
+            .error_payload_part => {
+                const op = try self.allocateOp(inst_idx);
+                const slot = try self.getOrAllocErrorPayloadExtraSlot(inst.data.error_payload_part.source);
+                if (op == .mem) {
+                    try writer.print("  mov rax, qword [rbp - {d}]\n  mov ", .{slot});
+                    try printOp(writer, op);
+                    try writer.print(", rax\n", .{});
+                } else {
+                    try writer.print("  mov {s}, qword [rbp - {d}]\n", .{ op.reg, slot });
+                }
+            },
             .br => try writer.print("  jmp .block_{d}\n", .{inst.data.br.dest}),
             .condbr => {
                 const cond_op = try self.allocateOp(inst.data.condbr.cond);
@@ -509,12 +695,34 @@ pub const X86Gen = struct {
             },
             .ret => {
                 if (self.isErrorUnion(inst.type_id)) {
-                    try writer.print("  mov rax, 0\n", .{});
                     if (inst.data.ret) |r| {
                         const val_op = try self.allocateOp(r);
-                        const val_reg = try opToReg(writer, val_op, "rdx");
-                        if (!std.mem.eql(u8, val_reg, "rdx")) try writer.print("  mov rdx, {s}\n", .{val_reg});
+                        if (self.isMemoryErrorUnion(inst.type_id)) {
+                            const source_reg = try opToReg(writer, val_op, "rsi");
+                            if (!std.mem.eql(u8, source_reg, "rsi")) try writer.print("  mov rsi, {s}\n", .{source_reg});
+                            try writer.print("  mov rdi, qword [rbp - {d}]\n", .{self.current_hidden_payload_slot.?});
+                            const layout = self.errorPayloadLayout(inst.type_id);
+                            var offset: u32 = 0;
+                            while (offset + 8 <= layout.size) : (offset += 8) {
+                                try writer.print("  mov rax, qword [rsi + {d}]\n  mov qword [rdi + {d}], rax\n", .{ offset, offset });
+                            }
+                            while (offset < layout.size) : (offset += 1) {
+                                try writer.print("  mov al, byte [rsi + {d}]\n  mov byte [rdi + {d}], al\n", .{ offset, offset });
+                            }
+                        } else if (self.isRegisterAggregateErrorUnion(inst.type_id)) {
+                            const source_reg = try opToReg(writer, val_op, "rsi");
+                            if (!std.mem.eql(u8, source_reg, "rsi")) try writer.print("  mov rsi, {s}\n", .{source_reg});
+                            try writer.print("  mov rdx, qword [rsi]\n", .{});
+                            if (self.errorPayloadLayout(inst.type_id).size > 8) try writer.print("  mov rcx, qword [rsi + 8]\n", .{});
+                        } else if (self.isFloatErrorUnion(inst.type_id)) {
+                            const val_reg = try opToReg(writer, val_op, "rdx");
+                            try writer.print("  movq xmm0, {s}\n", .{val_reg});
+                        } else {
+                            const val_reg = try opToReg(writer, val_op, "rdx");
+                            if (!std.mem.eql(u8, val_reg, "rdx")) try writer.print("  mov rdx, {s}\n", .{val_reg});
+                        }
                     }
+                    try writer.print("  mov rax, 0\n", .{});
                 } else if (inst.data.ret) |r| {
                     const val_op = try self.allocateOp(r);
                     switch (val_op) {
@@ -540,9 +748,51 @@ pub const X86Gen = struct {
                 const source = inst.data.ret_error_union;
                 const tag_slot = try self.getOrAllocErrorTagSlot(source);
                 const payload = try self.allocateOp(source);
-                const payload_reg = try opToReg(writer, payload, "rdx");
+                const payload_reg = try opToReg(writer, payload, if (self.isMemoryErrorUnion(inst.type_id)) "rsi" else "rdx");
+                if (self.isMemoryErrorUnion(inst.type_id)) {
+                    if (!std.mem.eql(u8, payload_reg, "rsi")) try writer.print("  mov rsi, {s}\n", .{payload_reg});
+                    try writer.print("  mov rdi, qword [rbp - {d}]\n", .{self.current_hidden_payload_slot.?});
+                    const layout = self.errorPayloadLayout(inst.type_id);
+                    var offset: u32 = 0;
+                    while (offset + 8 <= layout.size) : (offset += 8) {
+                        try writer.print("  mov rax, qword [rsi + {d}]\n  mov qword [rdi + {d}], rax\n", .{ offset, offset });
+                    }
+                    while (offset < layout.size) : (offset += 1) {
+                        try writer.print("  mov al, byte [rsi + {d}]\n  mov byte [rdi + {d}], al\n", .{ offset, offset });
+                    }
+                } else if (self.isRegisterAggregateErrorUnion(inst.type_id)) {
+                    if (!std.mem.eql(u8, payload_reg, "rsi")) try writer.print("  mov rsi, {s}\n", .{payload_reg});
+                    try writer.print("  mov rdx, qword [rsi]\n", .{});
+                    if (self.errorPayloadLayout(inst.type_id).size > 8) try writer.print("  mov rcx, qword [rsi + 8]\n", .{});
+                }
                 try writer.print("  mov rax, qword [rbp - {d}]\n", .{tag_slot});
-                if (!std.mem.eql(u8, payload_reg, "rdx")) try writer.print("  mov rdx, {s}\n", .{payload_reg});
+                if (self.isFloatErrorUnion(inst.type_id)) {
+                    try writer.print("  movq xmm0, {s}\n", .{payload_reg});
+                } else if (!self.isMemoryErrorUnion(inst.type_id) and !self.isRegisterAggregateErrorUnion(inst.type_id) and !std.mem.eql(u8, payload_reg, "rdx")) {
+                    try writer.print("  mov rdx, {s}\n", .{payload_reg});
+                }
+                try writer.print("  mov rsp, rbp\n  pop rbp\n  ret\n", .{});
+            },
+            .ret_error_slice => {
+                const pointer = try self.allocateOp(inst.data.ret_error_slice.ptr);
+                const length = try self.allocateOp(inst.data.ret_error_slice.len);
+                const pointer_reg = try opToReg(writer, pointer, "rdx");
+                const length_reg = try opToReg(writer, length, "rcx");
+                try writer.print("  mov rax, 0\n", .{});
+                if (!std.mem.eql(u8, pointer_reg, "rdx")) try writer.print("  mov rdx, {s}\n", .{pointer_reg});
+                if (!std.mem.eql(u8, length_reg, "rcx")) try writer.print("  mov rcx, {s}\n", .{length_reg});
+                try writer.print("  mov rsp, rbp\n  pop rbp\n  ret\n", .{});
+            },
+            .ret_error_union_slice => {
+                const source = inst.data.ret_error_union_slice.source;
+                const tag_slot = try self.getOrAllocErrorTagSlot(source);
+                const pointer = try self.allocateOp(source);
+                const length = try self.allocateOp(inst.data.ret_error_union_slice.len);
+                const pointer_reg = try opToReg(writer, pointer, "rdx");
+                const length_reg = try opToReg(writer, length, "rcx");
+                try writer.print("  mov rax, qword [rbp - {d}]\n", .{tag_slot});
+                if (!std.mem.eql(u8, pointer_reg, "rdx")) try writer.print("  mov rdx, {s}\n", .{pointer_reg});
+                if (!std.mem.eql(u8, length_reg, "rcx")) try writer.print("  mov rcx, {s}\n", .{length_reg});
                 try writer.print("  mov rsp, rbp\n  pop rbp\n  ret\n", .{});
             },
             else => try writer.print("  ; [unhandled] {s}\n", .{@tagName(inst.opcode)}),
@@ -646,6 +896,18 @@ pub const X86Gen = struct {
                 }
             },
 
+            .const_f => {
+                const op = try self.allocateOp(inst_idx);
+                const bits: u64 = @bitCast(inst.data.const_f);
+                switch (op) {
+                    .reg => |register| try enc.emitMovRegImm64(nameToReg(register), @bitCast(bits)),
+                    .mem => |slot| {
+                        try enc.emitMovRegImm64(.rax, @bitCast(bits));
+                        try enc.emitMovMemReg(slot, .rax);
+                    },
+                }
+            },
+
             // ── arithmetic ───────────────────────────────────────────────────
             .add => {
                 const op = try self.allocateOp(inst_idx);
@@ -723,6 +985,30 @@ pub const X86Gen = struct {
                 if (op == .mem) try enc.emitMovMemReg(op.mem, .rax);
             },
 
+            .gep => {
+                const op = try self.allocateOp(inst_idx);
+                const base = try self.allocateOp(inst.data.gep.base);
+                const index = try self.allocateOp(inst.data.gep.index);
+                const base_reg = try opToRegBin(enc, base, .rax);
+                try enc.emitMovRegReg(.rax, base_reg);
+                const index_reg = try opToRegBin(enc, index, .rcx);
+                try enc.emitMovRegReg(.rcx, index_reg);
+                const magnitude: u64 = @intCast(@abs(inst.data.gep.stride));
+                if (magnitude != 1) {
+                    try enc.emitMovRegImm64(.rdi, @intCast(magnitude));
+                    try enc.emitIMul(.rcx, .rdi);
+                }
+                if (inst.data.gep.stride < 0) {
+                    try enc.emitSub(.rax, .rcx);
+                } else {
+                    try enc.emitAdd(.rax, .rcx);
+                }
+                switch (op) {
+                    .reg => |register| try enc.emitMovRegReg(nameToReg(register), .rax),
+                    .mem => |slot| try enc.emitMovMemReg(slot, .rax),
+                }
+            },
+
             // ── memory ───────────────────────────────────────────────────────
             .addr => {
                 const op = try self.allocateOp(inst_idx);
@@ -733,6 +1019,19 @@ pub const X86Gen = struct {
                     .mem => |m| {
                         try enc.emitLeaRegMem(.rax, slot);
                         try enc.emitMovMemReg(m, .rax);
+                    },
+                }
+            },
+
+            .alloca => {
+                const op = try self.allocateOp(inst_idx);
+                const allocation = inst.data.alloca;
+                const slot = try self.getOrAllocBlock(allocation.id, allocation.size, allocation.alignment);
+                switch (op) {
+                    .reg => |register| try enc.emitLeaRegMem(nameToReg(register), slot),
+                    .mem => |destination| {
+                        try enc.emitLeaRegMem(.rax, slot);
+                        try enc.emitMovMemReg(destination, .rax);
                     },
                 }
             },
@@ -748,7 +1047,11 @@ pub const X86Gen = struct {
                 // For now: if ptr_r == rax, emit "mov [rax], val_r"
                 // Since our `addr` stores rbp-relative addresses in registers,
                 // we use the register as a pointer.
-                try emitStoreViaPtr(enc, ptr_r, val_r);
+                if (self.isByteType(inst.type_id)) {
+                    try emitStoreByteViaPtr(enc, ptr_r, val_r);
+                } else {
+                    try emitStoreViaPtr(enc, ptr_r, val_r);
+                }
             },
 
             .load => {
@@ -759,7 +1062,11 @@ pub const X86Gen = struct {
                     .reg => |r| nameToReg(r),
                     .mem => .rcx,
                 };
-                try emitLoadViaPtr(enc, dst_r, ptr_r);
+                if (self.isByteType(inst.type_id)) {
+                    try emitLoadByteViaPtr(enc, dst_r, ptr_r);
+                } else {
+                    try emitLoadViaPtr(enc, dst_r, ptr_r);
+                }
                 if (op == .mem) {
                     try enc.emitMovMemReg(op.mem, .rcx);
                 }
@@ -768,7 +1075,7 @@ pub const X86Gen = struct {
             // ── ABI: parameters ──────────────────────────────────────────────
             .param => {
                 const op = try self.allocateOp(inst_idx);
-                const param_idx = inst.data.param;
+                const param_idx = inst.data.param + @intFromBool(if (self.current_function_return_type) |return_type| self.isMemoryErrorUnion(return_type) else false);
                 const arg_regs_bin = [_]Reg{ .rdi, .rsi, .rdx, .rcx, .r8, .r9 };
                 if (param_idx < arg_regs_bin.len) {
                     const src_r = arg_regs_bin[param_idx];
@@ -810,7 +1117,14 @@ pub const X86Gen = struct {
                 try enc.defineSymbol(fn_name);
                 try enc.emitPushRbp();
                 try enc.emitMovRbpRsp();
-                try enc.emitSubRspImm32(256); // 256-byte frame
+                try enc.emitSubRspImm32(4096);
+                self.current_function_return_type = inst.type_id;
+                self.current_hidden_payload_slot = null;
+                if (self.isMemoryErrorUnion(inst.type_id)) {
+                    const slot = try self.getOrAllocSlot(0xb000_0000 | inst.data.label);
+                    self.current_hidden_payload_slot = slot;
+                    try enc.emitMovMemReg(slot, .rdi);
+                }
             },
 
             // ── call ─────────────────────────────────────────────────────────
@@ -819,14 +1133,24 @@ pub const X86Gen = struct {
                 const num_args = inst.data.call.args_count;
                 const args_extra_start = inst.data.call.args_start;
                 const arg_regs_bin = [_]Reg{ .rdi, .rsi, .rdx, .rcx, .r8, .r9 };
+                const memory_return = self.isMemoryErrorUnion(inst.type_id);
+                const register_aggregate_return = self.isRegisterAggregateErrorUnion(inst.type_id);
+                var memory_payload_slot: ?i32 = null;
+                if (memory_return or register_aggregate_return) {
+                    const layout = self.errorPayloadLayout(inst.type_id);
+                    const slot = try self.getOrAllocBlock(0xa000_0000 | inst_idx, @max(layout.size, 8), layout.alignment);
+                    memory_payload_slot = slot;
+                    if (memory_return) try enc.emitLeaRegMem(.rdi, slot);
+                }
 
                 // Move register args (last first to avoid clobbering)
-                var i: u32 = @min(num_args, @as(u32, arg_regs_bin.len));
+                const register_offset: u32 = @intFromBool(memory_return);
+                var i: u32 = @min(num_args, @as(u32, arg_regs_bin.len) - register_offset);
                 while (i > 0) {
                     i -= 1;
                     const arg_inst = self.lir.extra_data.items[args_extra_start + i];
                     const arg_op = try self.allocateOp(arg_inst);
-                    const dst_r = arg_regs_bin[i];
+                    const dst_r = arg_regs_bin[i + register_offset];
                     const src_r = try opToRegBin(enc, arg_op, .rax);
                     try enc.emitMovRegReg(dst_r, src_r);
                 }
@@ -846,7 +1170,45 @@ pub const X86Gen = struct {
                 if (self.isErrorUnion(inst.type_id)) {
                     const tag_slot = try self.getOrAllocErrorTagSlot(inst_idx);
                     try enc.emitMovMemReg(tag_slot, .rax);
-                    switch (op) {
+                    if (self.isSliceErrorUnion(inst.type_id)) {
+                        const length_slot = try self.getOrAllocErrorPayloadExtraSlot(inst_idx);
+                        try enc.emitMovMemReg(length_slot, .rcx);
+                    }
+                    if (memory_return) {
+                        const slot = memory_payload_slot.?;
+                        switch (op) {
+                            .reg => |register| try enc.emitLeaRegMem(nameToReg(register), slot),
+                            .mem => |destination| {
+                                try enc.emitLeaRegMem(.rax, slot);
+                                try enc.emitMovMemReg(destination, .rax);
+                            },
+                        }
+                    } else if (register_aggregate_return) {
+                        const slot = memory_payload_slot.?;
+                        const layout = self.errorPayloadLayout(inst.type_id);
+                        try enc.emitLeaRegMem(.rdi, slot);
+                        try emitStoreViaPtr(enc, .rdi, .rdx);
+                        if (layout.size > 8) {
+                            try enc.emitMovRegImm64(.r8, 8);
+                            try enc.emitAdd(.rdi, .r8);
+                            try emitStoreViaPtr(enc, .rdi, .rcx);
+                        }
+                        switch (op) {
+                            .reg => |register| try enc.emitLeaRegMem(nameToReg(register), slot),
+                            .mem => |destination| {
+                                try enc.emitLeaRegMem(.rax, slot);
+                                try enc.emitMovMemReg(destination, .rax);
+                            },
+                        }
+                    } else if (self.isFloatErrorUnion(inst.type_id)) {
+                        switch (op) {
+                            .reg => |r| try emitMovqGpFromXmm0(enc, nameToReg(r)),
+                            .mem => |m| {
+                                try emitMovqGpFromXmm0(enc, .rax);
+                                try enc.emitMovMemReg(m, .rax);
+                            },
+                        }
+                    } else switch (op) {
                         .reg => |r| try enc.emitMovRegReg(nameToReg(r), .rdx),
                         .mem => |m| try enc.emitMovMemReg(m, .rdx),
                     }
@@ -878,6 +1240,18 @@ pub const X86Gen = struct {
                 }
             },
 
+            .error_payload_part => {
+                const op = try self.allocateOp(inst_idx);
+                const slot = try self.getOrAllocErrorPayloadExtraSlot(inst.data.error_payload_part.source);
+                switch (op) {
+                    .reg => |register| try enc.emitMovRegMem(nameToReg(register), slot),
+                    .mem => |destination| {
+                        try enc.emitMovRegMem(.rax, slot);
+                        try enc.emitMovMemReg(destination, .rax);
+                    },
+                }
+            },
+
             // ── control flow ─────────────────────────────────────────────────
             .br => {
                 const label = try self.blockLabel(inst.data.br.dest);
@@ -896,12 +1270,28 @@ pub const X86Gen = struct {
 
             .ret => {
                 if (self.isErrorUnion(inst.type_id)) {
-                    try enc.emitMovRegImm64(.rax, 0);
                     if (inst.data.ret) |r| {
                         const val_op = try self.allocateOp(r);
-                        const val_r = try opToRegBin(enc, val_op, .rdx);
-                        try enc.emitMovRegReg(.rdx, val_r);
+                        const val_r = try opToRegBin(enc, val_op, if (self.isMemoryErrorUnion(inst.type_id)) .rsi else .rdx);
+                        if (self.isMemoryErrorUnion(inst.type_id)) {
+                            try enc.emitMovRegReg(.rsi, val_r);
+                            try enc.emitMovRegMem(.rdi, self.current_hidden_payload_slot.?);
+                            try emitMemoryCopy(enc, self.errorPayloadLayout(inst.type_id).size);
+                        } else if (self.isRegisterAggregateErrorUnion(inst.type_id)) {
+                            try enc.emitMovRegReg(.rsi, val_r);
+                            try emitLoadViaPtr(enc, .rdx, .rsi);
+                            if (self.errorPayloadLayout(inst.type_id).size > 8) {
+                                try enc.emitMovRegImm64(.r8, 8);
+                                try enc.emitAdd(.rsi, .r8);
+                                try emitLoadViaPtr(enc, .rcx, .rsi);
+                            }
+                        } else if (self.isFloatErrorUnion(inst.type_id)) {
+                            try emitMovqXmm0FromGp(enc, val_r);
+                        } else {
+                            try enc.emitMovRegReg(.rdx, val_r);
+                        }
                     }
+                    try enc.emitMovRegImm64(.rax, 0);
                 } else if (inst.data.ret) |r| {
                     const val_op = try self.allocateOp(r);
                     const val_r = try opToRegBin(enc, val_op, .rax);
@@ -925,9 +1315,54 @@ pub const X86Gen = struct {
                 const source = inst.data.ret_error_union;
                 const tag_slot = try self.getOrAllocErrorTagSlot(source);
                 const payload_op = try self.allocateOp(source);
-                const payload_reg = try opToRegBin(enc, payload_op, .rdx);
+                const payload_reg = try opToRegBin(enc, payload_op, if (self.isMemoryErrorUnion(inst.type_id)) .rsi else .rdx);
+                if (self.isMemoryErrorUnion(inst.type_id)) {
+                    try enc.emitMovRegReg(.rsi, payload_reg);
+                    try enc.emitMovRegMem(.rdi, self.current_hidden_payload_slot.?);
+                    try emitMemoryCopy(enc, self.errorPayloadLayout(inst.type_id).size);
+                } else if (self.isRegisterAggregateErrorUnion(inst.type_id)) {
+                    try enc.emitMovRegReg(.rsi, payload_reg);
+                    try emitLoadViaPtr(enc, .rdx, .rsi);
+                    if (self.errorPayloadLayout(inst.type_id).size > 8) {
+                        try enc.emitMovRegImm64(.r8, 8);
+                        try enc.emitAdd(.rsi, .r8);
+                        try emitLoadViaPtr(enc, .rcx, .rsi);
+                    }
+                }
                 try enc.emitMovRegMem(.rax, tag_slot);
-                try enc.emitMovRegReg(.rdx, payload_reg);
+                if (self.isFloatErrorUnion(inst.type_id)) {
+                    try emitMovqXmm0FromGp(enc, payload_reg);
+                } else if (!self.isMemoryErrorUnion(inst.type_id) and !self.isRegisterAggregateErrorUnion(inst.type_id)) {
+                    try enc.emitMovRegReg(.rdx, payload_reg);
+                }
+                try enc.emitMovRspRbp();
+                try enc.emitPopRbp();
+                try enc.emitRet();
+            },
+
+            .ret_error_slice => {
+                const pointer = try self.allocateOp(inst.data.ret_error_slice.ptr);
+                const length = try self.allocateOp(inst.data.ret_error_slice.len);
+                const pointer_reg = try opToRegBin(enc, pointer, .rdx);
+                const length_reg = try opToRegBin(enc, length, .rcx);
+                try enc.emitMovRegImm64(.rax, 0);
+                try enc.emitMovRegReg(.rdx, pointer_reg);
+                try enc.emitMovRegReg(.rcx, length_reg);
+                try enc.emitMovRspRbp();
+                try enc.emitPopRbp();
+                try enc.emitRet();
+            },
+
+            .ret_error_union_slice => {
+                const source = inst.data.ret_error_union_slice.source;
+                const tag_slot = try self.getOrAllocErrorTagSlot(source);
+                const pointer = try self.allocateOp(source);
+                const length = try self.allocateOp(inst.data.ret_error_union_slice.len);
+                const pointer_reg = try opToRegBin(enc, pointer, .rdx);
+                const length_reg = try opToRegBin(enc, length, .rcx);
+                try enc.emitMovRegMem(.rax, tag_slot);
+                try enc.emitMovRegReg(.rdx, pointer_reg);
+                try enc.emitMovRegReg(.rcx, length_reg);
                 try enc.emitMovRspRbp();
                 try enc.emitPopRbp();
                 try enc.emitRet();
@@ -991,6 +1426,22 @@ fn emitStoreViaPtr(enc: *Encoder, ptr_r: Reg, val_r: Reg) !void {
     if (ptr_low == 5) try enc.buf.append(enc.allocator, 0x00); // [rbp]/[r13]+disp8(0)
 }
 
+/// MOV byte [ptr_reg], val_reg.low8 (REX 88 /r)
+fn emitStoreByteViaPtr(enc: *Encoder, ptr_r: Reg, val_r: Reg) !void {
+    const ptr_idx = @intFromEnum(ptr_r);
+    const val_idx = @intFromEnum(val_r);
+    const rex_byte: u8 = 0x40 |
+        (if (val_idx >= 8) @as(u8, 0x04) else 0) |
+        (if (ptr_idx >= 8) @as(u8, 0x01) else 0);
+    const ptr_low: u8 = @as(u8, @truncate(ptr_idx)) & 7;
+    const mod_bits: u8 = if (ptr_low == 5) 0b01 else 0b00;
+    const modrm_byte: u8 = mod_bits << 6 | (@as(u8, @truncate(val_idx)) & 7) << 3 | ptr_low;
+    try enc.buf.append(enc.allocator, rex_byte);
+    try enc.buf.appendSlice(enc.allocator, &.{ 0x88, modrm_byte });
+    if (ptr_low == 4) try enc.buf.append(enc.allocator, 0x24);
+    if (ptr_low == 5) try enc.buf.append(enc.allocator, 0x00);
+}
+
 /// MOV dst_reg, [ptr_reg]   (REX.W 8B ModRM(00, dst, ptr))
 fn emitLoadViaPtr(enc: *Encoder, dst_r: Reg, ptr_r: Reg) !void {
     const ptr_idx = @intFromEnum(ptr_r);
@@ -1010,6 +1461,64 @@ fn emitLoadViaPtr(enc: *Encoder, dst_r: Reg, ptr_r: Reg) !void {
     if (ptr_low == 5) try enc.buf.append(enc.allocator, 0x00); // [rbp]/[r13]+disp8(0)
 }
 
+/// MOVZX dst_reg, byte [ptr_reg] (REX.W 0F B6 /r)
+fn emitLoadByteViaPtr(enc: *Encoder, dst_r: Reg, ptr_r: Reg) !void {
+    const ptr_idx = @intFromEnum(ptr_r);
+    const dst_idx = @intFromEnum(dst_r);
+    const needs_rex_r = dst_idx >= 8;
+    const needs_rex_b = ptr_idx >= 8;
+    const rex_byte: u8 = 0x48 |
+        (if (needs_rex_r) @as(u8, 0x04) else 0) |
+        (if (needs_rex_b) @as(u8, 0x01) else 0);
+    const ptr_low: u8 = @as(u8, @truncate(ptr_idx)) & 7;
+    const mod_bits: u8 = if (ptr_low == 5) 0b01 else 0b00;
+    const modrm_byte: u8 = mod_bits << 6 | (@as(u8, @truncate(dst_idx)) & 7) << 3 | ptr_low;
+    try enc.buf.append(enc.allocator, rex_byte);
+    try enc.buf.appendSlice(enc.allocator, &.{ 0x0f, 0xb6, modrm_byte });
+    if (ptr_low == 4) try enc.buf.append(enc.allocator, 0x24);
+    if (ptr_low == 5) try enc.buf.append(enc.allocator, 0x00);
+}
+
+/// MOVQ xmm0, src_gp (66 REX.W 0F 6E /r)
+fn emitMovqXmm0FromGp(enc: *Encoder, src: Reg) !void {
+    const source: u8 = @intFromEnum(src);
+    try enc.buf.append(enc.allocator, 0x66);
+    try enc.buf.append(enc.allocator, 0x48 | (if (source >= 8) @as(u8, 0x01) else 0));
+    try enc.buf.appendSlice(enc.allocator, &.{ 0x0f, 0x6e, 0xc0 | (source & 7) });
+}
+
+/// MOVQ dst_gp, xmm0 (66 REX.W 0F 7E /r)
+fn emitMovqGpFromXmm0(enc: *Encoder, destination: Reg) !void {
+    const target: u8 = @intFromEnum(destination);
+    try enc.buf.append(enc.allocator, 0x66);
+    try enc.buf.append(enc.allocator, 0x48 | (if (target >= 8) @as(u8, 0x01) else 0));
+    try enc.buf.appendSlice(enc.allocator, &.{ 0x0f, 0x7e, 0xc0 | (target & 7) });
+}
+
+/// Copy a compile-time-sized payload from rsi to rdi.
+fn emitMemoryCopy(enc: *Encoder, size: u32) !void {
+    var remaining = size;
+    while (remaining >= 8) {
+        try emitLoadViaPtr(enc, .rax, .rsi);
+        try emitStoreViaPtr(enc, .rdi, .rax);
+        remaining -= 8;
+        if (remaining > 0) {
+            try enc.emitMovRegImm64(.r8, 8);
+            try enc.emitAdd(.rsi, .r8);
+            try enc.emitAdd(.rdi, .r8);
+        }
+    }
+    while (remaining > 0) : (remaining -= 1) {
+        try emitLoadByteViaPtr(enc, .rax, .rsi);
+        try emitStoreByteViaPtr(enc, .rdi, .rax);
+        if (remaining > 1) {
+            try enc.emitMovRegImm64(.r8, 1);
+            try enc.emitAdd(.rsi, .r8);
+            try enc.emitAdd(.rdi, .r8);
+        }
+    }
+}
+
 test "pointer loads and stores encode r12/r13 base registers" {
     var enc = Encoder.init(std.testing.allocator);
     defer enc.deinit();
@@ -1020,4 +1529,32 @@ test "pointer loads and stores encode r12/r13 base registers" {
     enc.buf.clearRetainingCapacity();
     try emitLoadViaPtr(&enc, .r14, .r12);
     try std.testing.expectEqualSlices(u8, &.{ 0x4d, 0x8b, 0x34, 0x24 }, enc.buf.items);
+}
+
+test "byte pointer stores encode extended registers" {
+    var enc = Encoder.init(std.testing.allocator);
+    defer enc.deinit();
+
+    try emitStoreByteViaPtr(&enc, .r13, .r12);
+    try std.testing.expectEqualSlices(u8, &.{ 0x45, 0x88, 0x65, 0x00 }, enc.buf.items);
+}
+
+test "byte pointer load zero-extends" {
+    var enc = Encoder.init(std.testing.allocator);
+    defer enc.deinit();
+
+    try emitLoadByteViaPtr(&enc, .r14, .r12);
+    try std.testing.expectEqualSlices(u8, &.{ 0x4d, 0x0f, 0xb6, 0x34, 0x24 }, enc.buf.items);
+}
+
+test "SSE payload transport moves f64 bits through xmm0" {
+    var enc = Encoder.init(std.testing.allocator);
+    defer enc.deinit();
+
+    try emitMovqXmm0FromGp(&enc, .r9);
+    try emitMovqGpFromXmm0(&enc, .r10);
+    try std.testing.expectEqualSlices(u8, &.{
+        0x66, 0x49, 0x0f, 0x6e, 0xc1,
+        0x66, 0x49, 0x0f, 0x7e, 0xc2,
+    }, enc.buf.items);
 }
