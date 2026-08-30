@@ -7,7 +7,7 @@
 ///
 /// All instructions assume 64-bit (REX.W) operand size unless noted.
 const std = @import("std");
-const x86 = @import("x86_64.zig");
+const x86 = @import("target.zig");
 pub const Reg = x86.Register;
 
 pub const Condition = enum(u8) {
@@ -280,6 +280,44 @@ pub const Encoder = struct {
         try self.emit1(rex(true, needsRex(dst), false, needsRex(src)));
         try self.emit2(0x0F, 0xAF);
         try self.emit1(modrm(0b11, lo3(dst), lo3(src)));
+    }
+
+    pub fn emitAnd(self: *Encoder, dst: Reg, src: Reg) !void {
+        try self.emit1(rex(true, needsRex(src), false, needsRex(dst)));
+        try self.emit1(0x21);
+        try self.emit1(modrm(0b11, lo3(src), lo3(dst)));
+    }
+
+    pub fn emitOr(self: *Encoder, dst: Reg, src: Reg) !void {
+        try self.emit1(rex(true, needsRex(src), false, needsRex(dst)));
+        try self.emit1(0x09);
+        try self.emit1(modrm(0b11, lo3(src), lo3(dst)));
+    }
+
+    pub fn emitXor(self: *Encoder, dst: Reg, src: Reg) !void {
+        try self.emit1(rex(true, needsRex(src), false, needsRex(dst)));
+        try self.emit1(0x31);
+        try self.emit1(modrm(0b11, lo3(src), lo3(dst)));
+    }
+
+    /// Variable-count shift. x86_64 reads the low byte of rcx (`cl`).
+    pub fn emitShiftCl(self: *Encoder, dst: Reg, left: bool, arithmetic_right: bool) !void {
+        const extension: u3 = if (left) 4 else if (arithmetic_right) 7 else 5;
+        try self.emit1(rex(true, false, false, needsRex(dst)));
+        try self.emit1(0xD3);
+        try self.emit1(modrm(0b11, extension, lo3(dst)));
+    }
+
+    pub fn emitCqo(self: *Encoder) !void {
+        try self.emit2(0x48, 0x99);
+    }
+
+    /// DIV/IDIV r/m64. The dividend is in rdx:rax; quotient and remainder are
+    /// returned in rax and rdx respectively.
+    pub fn emitDivide(self: *Encoder, divisor: Reg, signed: bool) !void {
+        try self.emit1(rex(true, false, false, needsRex(divisor)));
+        try self.emit1(0xF7);
+        try self.emit1(modrm(0b11, if (signed) 7 else 6, lo3(divisor)));
     }
 
     /// SUB rsp, imm8   (REX.W 83 /5 ib)  — stack allocation

@@ -281,6 +281,37 @@ pub const TypePool = struct {
         return self.types.items[id];
     }
 
+    /// Pool-aware coercion. Recursive types such as optionals and error unions
+    /// cannot be validated correctly by comparing detached `Type` values.
+    pub fn isCoercible(self: *const TypePool, from_id: Type.Id, to_id: Type.Id) bool {
+        if (from_id == to_id) return true;
+        const from = self.get(from_id);
+        const to = self.get(to_id);
+        if (Type.isCoercible(from, to)) return true;
+
+        if (to.data == .optional) {
+            if (from.data == .primitive and from.data.primitive == .null_type) return true;
+            if (from.data == .optional) {
+                return self.isCoercible(from.data.optional.child_type, to.data.optional.child_type);
+            }
+            return self.isCoercible(from_id, to.data.optional.child_type);
+        }
+        if (to.data == .error_union) {
+            if (from.data == .error_union) {
+                return self.isCoercible(from.data.error_union.payload, to.data.error_union.payload);
+            }
+            return self.isCoercible(from_id, to.data.error_union.payload);
+        }
+        if (from.data == .pointer and to.data == .pointer) {
+            const from_pointer = from.data.pointer;
+            const to_pointer = to.data.pointer;
+            return from_pointer.size == to_pointer.size and
+                from_pointer.child_type == to_pointer.child_type and
+                (!from_pointer.is_const or to_pointer.is_const);
+        }
+        return false;
+    }
+
     /// Append param type IDs for a function type; returns the start index.
     pub fn appendParams(self: *TypePool, params: []const Type.Id) !u32 {
         const start = @as(u32, @intCast(self.extra_type_ids.items.len));

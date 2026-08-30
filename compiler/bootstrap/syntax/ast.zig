@@ -148,6 +148,17 @@ pub const Node = struct {
     ///   lhs = label token, or maxInt(u32)
     ///   rhs = break value node, or maxInt(u32)
     ///
+    /// `array_access`:
+    ///   lhs = array/slice/pointer expression
+    ///   rhs = index expression
+    ///
+    /// `slice`:
+    ///   lhs = extra_start where:
+    ///     extra_data[lhs + 0] = array/slice expression
+    ///     extra_data[lhs + 1] = start expression, or maxInt(u32)
+    ///     extra_data[lhs + 2] = end expression, or maxInt(u32)
+    ///   rhs = lhs + 3
+    ///
     /// `return_stmt`:
     ///   main_token = `return` token
     ///   lhs = 0

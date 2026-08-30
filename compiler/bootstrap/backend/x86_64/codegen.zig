@@ -1,12 +1,13 @@
 const std = @import("std");
-const lir = @import("lir.zig");
-const x86 = @import("x86_64.zig");
+const lir = @import("../../ir/lir.zig");
+const x86 = @import("target.zig");
 const abi = @import("abi.zig");
-const ast_mod = @import("ast.zig");
-const Encoder = @import("x86_64_encoder.zig").Encoder;
-const Condition = @import("x86_64_encoder.zig").Condition;
+const ast_mod = @import("../../syntax/ast.zig");
+const Encoder = @import("encoder.zig").Encoder;
+const Condition = @import("encoder.zig").Condition;
 const Reg = x86.Register;
-const TypePool = @import("type.zig").TypePool;
+const TypePool = @import("../../semantic/type.zig").TypePool;
+const integer_instructions = @import("instructions/integer.zig");
 
 /// x86_64 code generator for zin0.
 /// Operates in two modes:
@@ -84,7 +85,7 @@ pub const X86Gen = struct {
 
     // ── register allocator ───────────────────────────────────────────────────
 
-    fn allocateOp(self: *X86Gen, vreg: lir.Inst.Index) !Operand {
+    pub fn allocateOp(self: *X86Gen, vreg: lir.Inst.Index) !Operand {
         if (self.vreg_to_op.get(vreg)) |op| return op;
         if (self.next_gp_reg < gp_regs.len) {
             const reg = gp_regs[self.next_gp_reg];
@@ -101,14 +102,14 @@ pub const X86Gen = struct {
 
     // ── text helpers ─────────────────────────────────────────────────────────
 
-    fn printOp(writer: anytype, op: Operand) !void {
+    pub fn printOp(writer: anytype, op: Operand) !void {
         switch (op) {
             .reg => |r| try writer.print("{s}", .{r}),
             .mem => |m| try writer.print("qword [rbp - {d}]", .{m}),
         }
     }
 
-    fn opToReg(writer: anytype, op: Operand, scratch: []const u8) ![]const u8 {
+    pub fn opToReg(writer: anytype, op: Operand, scratch: []const u8) ![]const u8 {
         switch (op) {
             .reg => |r| return r,
             .mem => {
@@ -122,7 +123,7 @@ pub const X86Gen = struct {
 
     // ── binary helpers ───────────────────────────────────────────────────────
 
-    fn nameToReg(name: []const u8) Reg {
+    pub fn nameToReg(name: []const u8) Reg {
         if (std.mem.eql(u8, name, "rax")) return .rax;
         if (std.mem.eql(u8, name, "rcx")) return .rcx;
         if (std.mem.eql(u8, name, "rdx")) return .rdx;
@@ -142,7 +143,7 @@ pub const X86Gen = struct {
 
     /// Load an operand into `scratch` register if it is a mem operand.
     /// Returns the effective register.
-    fn opToRegBin(enc: *Encoder, op: Operand, scratch: Reg) !Reg {
+    pub fn opToRegBin(enc: *Encoder, op: Operand, scratch: Reg) !Reg {
         switch (op) {
             .reg => |r| return nameToReg(r),
             .mem => |m| {
@@ -383,22 +384,9 @@ pub const X86Gen = struct {
                 }
             },
             .div => {
-                const op = try self.allocateOp(inst_idx);
-                const lhs = try self.allocateOp(inst.data.div.lhs);
-                const rhs = try self.allocateOp(inst.data.div.rhs);
-                const lreg = try opToReg(writer, lhs, "rax");
-                try writer.print("  mov rax, {s}\n", .{lreg});
-                try writer.print("  cqo\n", .{});
-                const rreg = try opToReg(writer, rhs, "rcx");
-                try writer.print("  idiv {s}\n", .{rreg});
-                if (op == .mem) {
-                    try writer.print("  mov ", .{});
-                    try printOp(writer, op);
-                    try writer.print(", rax\n", .{});
-                } else {
-                    try writer.print("  mov {s}, rax\n", .{op.reg});
-                }
+                try integer_instructions.emitText(self, writer, inst_idx);
             },
+            .rem, .bit_and, .bit_or, .bit_xor, .shl, .shr => try integer_instructions.emitText(self, writer, inst_idx),
             .icmp => {
                 const op = try self.allocateOp(inst_idx);
                 const lhs = try self.allocateOp(inst.data.icmp.lhs);
@@ -963,12 +951,7 @@ pub const X86Gen = struct {
                 }
             },
 
-            .div => {
-                // idiv: not in encoder yet — emit as sub rsp, 0 placeholder
-                // (Stage 0 programs don't use division yet)
-                std.debug.print("[X86Gen-bin] WARNING: div not implemented in binary mode\n", .{});
-                _ = try self.allocateOp(inst_idx);
-            },
+            .div, .rem, .bit_and, .bit_or, .bit_xor, .shl, .shr => try integer_instructions.emitBinary(self, enc, inst_idx),
 
             .icmp => {
                 const op = try self.allocateOp(inst_idx);

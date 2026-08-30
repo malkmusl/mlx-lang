@@ -1,7 +1,7 @@
 //! POSIX-compatible API surface over os_linux.zig.
 
 const std = @import("std");
-const os = @import("os_linux.zig");
+const os = @import("raw.zig");
 
 pub const Fd = os.Fd;
 pub const OsError = os.OsError;

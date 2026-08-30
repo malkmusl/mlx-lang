@@ -1,6 +1,6 @@
 const std = @import("std");
-const sm = @import("source_manager.zig");
-const diag = @import("diagnostics.zig");
+const sm = @import("source/source_manager.zig");
+const diag = @import("source/diagnostics.zig");
 
 pub fn main(init: std.process.Init) !u8 {
     const allocator = init.gpa;
@@ -50,8 +50,8 @@ pub fn main(init: std.process.Init) !u8 {
     const file_id = try source_manager.addFile(path, content_unterm);
 
     // Stage 2: Lex
-    const lexer = @import("lexer.zig");
-    const Token = @import("token.zig").Token;
+    const lexer = @import("syntax/lexer.zig");
+    const Token = @import("syntax/token.zig").Token;
     var lex = lexer.Lexer.init(content[0..content_unterm.len :0]);
     var tokens = std.ArrayList(Token).empty;
     defer tokens.deinit(allocator);
@@ -62,7 +62,7 @@ pub fn main(init: std.process.Init) !u8 {
     }
 
     // Stage 3: Parse
-    const parser = @import("parser.zig");
+    const parser = @import("syntax/parser.zig");
     var p = parser.Parser.init(allocator, tokens.items, &engine, file_id);
     var ast = p.parse() catch |err| {
         std.debug.print("Fatal parse error: {}\n", .{err});
@@ -81,15 +81,15 @@ pub fn main(init: std.process.Init) !u8 {
     }
 
     // Stage 5/6/7: Type + Sema
-    const type_mod = @import("type.zig");
+    const type_mod = @import("semantic/type.zig");
     var type_pool = type_mod.TypePool.init(allocator);
     defer type_pool.deinit();
 
-    const scope_mod = @import("scope.zig");
+    const scope_mod = @import("semantic/scope.zig");
     var root_scope = scope_mod.Scope.init(allocator, null);
     defer root_scope.deinit();
 
-    const sema_mod = @import("sema.zig");
+    const sema_mod = @import("semantic/sema.zig");
     var sema = sema_mod.Sema.init(allocator, ast, &engine, &type_pool, &root_scope);
     defer sema.deinit();
     sema.analyze() catch |err| {
@@ -106,7 +106,7 @@ pub fn main(init: std.process.Init) !u8 {
     }
 
     // Stage 9: LIR
-    const lir_gen_mod = @import("lir_gen.zig");
+    const lir_gen_mod = @import("ir/lower.zig");
     var lir_builder = lir_gen_mod.LirBuilder.init(allocator, &sema);
     defer lir_builder.deinit();
     lir_builder.generate() catch |err| {
@@ -117,7 +117,7 @@ pub fn main(init: std.process.Init) !u8 {
 
     std.debug.print("AST has {d} nodes\n", .{ast.nodes.len});
 
-    var x86_gen = @import("x86_64_gen.zig").X86Gen.init(
+    var x86_gen = @import("backend/x86_64/codegen.zig").X86Gen.init(
         allocator,
         &lir_builder.lir,
         &type_pool,
@@ -134,7 +134,7 @@ pub fn main(init: std.process.Init) !u8 {
     } else {
         // ── Stage 12: Binary ELF64 output ────────────────────────────────────
         std.debug.print("[zin0] emitting ELF64 binary → '{s}'\n", .{out_path});
-        var enc = @import("x86_64_encoder.zig").Encoder.init(allocator);
+        var enc = @import("backend/x86_64/encoder.zig").Encoder.init(allocator);
         defer enc.deinit();
 
         // Phase 1: generate binary to discover code size and collect rodata strings.
@@ -147,7 +147,7 @@ pub fn main(init: std.process.Init) !u8 {
         // Compute rodata_vaddr from ELF layout:
         //   TEXT_FILE_OFFSET = 0x1000, TEXT_VADDR = 0x401000
         //   rodata starts at page-aligned offset after .text
-        const elf64_mod = @import("elf64.zig");
+        const elf64_mod = @import("object/elf64.zig");
         const text_size: u64 = @as(u64, @intCast(enc.buf.items.len));
         const rodata_file_off: u64 = elf64_mod.alignUp(0x1000 + text_size, 0x1000);
         const rodata_vaddr: u64 = 0x401000 + (rodata_file_off - 0x1000);
@@ -192,21 +192,22 @@ pub fn main(init: std.process.Init) !u8 {
 }
 
 test {
-    _ = @import("source_manager.zig");
-    _ = @import("diagnostics.zig");
-    _ = @import("lexer.zig");
-    _ = @import("ast.zig");
-    _ = @import("builtin.zig");
-    _ = @import("parser.zig");
-    _ = @import("type.zig");
-    _ = @import("scope.zig");
-    _ = @import("sema.zig");
-    _ = @import("lir.zig");
-    _ = @import("lir_gen.zig");
-    _ = @import("abi.zig");
-    _ = @import("x86_64_encoder.zig");
-    _ = @import("x86_64_gen.zig");
-    _ = @import("elf64.zig");
-    _ = @import("os_linux.zig");
-    _ = @import("posix.zig");
+    _ = @import("source/source_manager.zig");
+    _ = @import("source/diagnostics.zig");
+    _ = @import("syntax/lexer.zig");
+    _ = @import("syntax/ast.zig");
+    _ = @import("semantic/builtin.zig");
+    _ = @import("syntax/parser.zig");
+    _ = @import("semantic/type.zig");
+    _ = @import("semantic/scope.zig");
+    _ = @import("semantic/sema.zig");
+    _ = @import("ir/lir.zig");
+    _ = @import("ir/lower.zig");
+    _ = @import("backend/x86_64/abi.zig");
+    _ = @import("backend/x86_64/encoder.zig");
+    _ = @import("backend/x86_64/codegen.zig");
+    _ = @import("object/elf64.zig");
+    _ = @import("platform/linux/raw.zig");
+    _ = @import("platform/linux/posix.zig");
+    _ = @import("modules/root.zig");
 }

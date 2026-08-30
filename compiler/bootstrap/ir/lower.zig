@@ -1,12 +1,14 @@
 const std = @import("std");
-const ast = @import("ast.zig");
+const ast = @import("../syntax/ast.zig");
 const Node = ast.Node;
-const Type = @import("type.zig").Type;
-const TypePool = @import("type.zig").TypePool;
-const Sema = @import("sema.zig").Sema;
+const Type = @import("../semantic/type.zig").Type;
+const TypePool = @import("../semantic/type.zig").TypePool;
+const Sema = @import("../semantic/sema.zig").Sema;
 const Lir = @import("lir.zig").Lir;
 const Inst = @import("lir.zig").Inst;
-const builtin = @import("builtin.zig");
+const builtin = @import("../semantic/builtin.zig");
+const postfix = @import("lowering/postfix.zig");
+const operator_lowering = @import("lowering/operators.zig");
 
 const LoopTargets = struct {
     label_token: u32,
@@ -73,7 +75,7 @@ pub const LirBuilder = struct {
         }
     }
 
-    fn emitInst(self: *LirBuilder, inst: Inst) !Inst.Index {
+    pub fn emitInst(self: *LirBuilder, inst: Inst) !Inst.Index {
         const idx = @as(Inst.Index, @intCast(self.lir.insts.items.len));
         try self.lir.insts.append(self.allocator, inst);
 
@@ -84,7 +86,7 @@ pub const LirBuilder = struct {
         return idx;
     }
 
-    fn lowerNode(self: *LirBuilder, node_idx: Node.Index) std.mem.Allocator.Error!?Inst.Index {
+    pub fn lowerNode(self: *LirBuilder, node_idx: Node.Index) std.mem.Allocator.Error!?Inst.Index {
         const node = self.sema.ast_tree.nodes.get(node_idx);
         std.debug.print("-> ENTER: LirBuilder.lowerNode | Tag: {s}\n", .{@tagName(node.tag)});
 
@@ -131,67 +133,7 @@ pub const LirBuilder = struct {
                 });
                 return result;
             },
-            .binary_op => {
-                const op_tok = self.sema.ast_tree.tokens[node.main_token];
-                if (op_tok.tag == .equal) {
-                    const target = self.sema.ast_tree.nodes.get(node.data.lhs);
-                    const target_token = self.sema.ast_tree.tokens[target.main_token];
-                    const src = self.sema.diags.source_manager.getFile(0).?.content;
-                    const target_name = src[target_token.start..target_token.end];
-                    const address = self.var_addresses.get(target_name) orelse return null;
-                    const value = try self.lowerNode(node.data.rhs) orelse return null;
-                    _ = try self.emitInst(.{
-                        .opcode = .store,
-                        .type_id = self.sema.node_types.get(node.data.lhs) orelse 0,
-                        .data = .{ .store = .{ .ptr = address, .val = value } },
-                    });
-                    return null;
-                }
-                const type_id = self.sema.node_types.get(node_idx) orelse return null;
-                const lhs_inst = try self.lowerNode(node.data.lhs) orelse return null;
-                const rhs_inst = try self.lowerNode(node.data.rhs) orelse return null;
-
-                const opcode: @import("lir.zig").Opcode = switch (op_tok.tag) {
-                    .plus => .add,
-                    .minus => .sub,
-                    .asterisk => .mul,
-                    .slash => .div,
-                    .equal_equal,
-                    .bang_equal,
-                    .angle_bracket_left,
-                    .angle_bracket_left_equal,
-                    .angle_bracket_right,
-                    .angle_bracket_right_equal,
-                    => .icmp,
-                    else => return null,
-                };
-
-                result = try self.emitInst(.{
-                    .opcode = opcode,
-                    .type_id = type_id,
-                    .data = switch (opcode) {
-                        .add => .{ .add = .{ .lhs = lhs_inst, .rhs = rhs_inst } },
-                        .sub => .{ .sub = .{ .lhs = lhs_inst, .rhs = rhs_inst } },
-                        .mul => .{ .mul = .{ .lhs = lhs_inst, .rhs = rhs_inst } },
-                        .div => .{ .div = .{ .lhs = lhs_inst, .rhs = rhs_inst } },
-                        .icmp => .{ .icmp = .{
-                            .predicate = switch (op_tok.tag) {
-                                .equal_equal => .eq,
-                                .bang_equal => .ne,
-                                .angle_bracket_left => .lt,
-                                .angle_bracket_left_equal => .le,
-                                .angle_bracket_right => .gt,
-                                .angle_bracket_right_equal => .ge,
-                                else => unreachable,
-                            },
-                            .lhs = lhs_inst,
-                            .rhs = rhs_inst,
-                        } },
-                        else => unreachable,
-                    },
-                });
-                return result;
-            },
+            .binary_op => return operator_lowering.lower(self, node_idx),
             .const_decl => {
                 // New layout: lhs = ident_tok, rhs = extra_start
                 // extra_data[rhs + 0] = type_node (0 = inferred)
@@ -534,6 +476,7 @@ pub const LirBuilder = struct {
             },
             .unary_op => {
                 const operator = self.sema.ast_tree.tokens[node.main_token].tag;
+                if (operator == .dot_asterisk or operator == .dot_question) return postfix.lowerUnarySuffix(self, node_idx);
                 if (operator == .keyword_try) {
                     const operand = try self.lowerNode(node.data.lhs) orelse return null;
                     const bool_type = try self.sema.type_pool.internPrimitive(.bool_type);
@@ -569,6 +512,7 @@ pub const LirBuilder = struct {
                 result = try self.lowerNode(node.data.lhs);
                 return result;
             },
+            .array_access, .slice => return postfix.lower(self, node_idx),
             .unsafe_block => {
                 result = try self.lowerNode(node.data.lhs);
                 return result;
@@ -700,7 +644,7 @@ pub const LirBuilder = struct {
         }
     }
 
-    fn newBlock(self: *LirBuilder) !u32 {
+    pub fn newBlock(self: *LirBuilder) !u32 {
         const blk_idx = @as(u32, @intCast(self.lir.blocks.items.len));
         try self.lir.blocks.append(self.allocator, @import("lir.zig").BasicBlock.init());
         return blk_idx;
@@ -970,6 +914,12 @@ pub const LirBuilder = struct {
                     .sub => std.debug.print("%{d}, %{d}", .{ inst.data.sub.lhs, inst.data.sub.rhs }),
                     .mul => std.debug.print("%{d}, %{d}", .{ inst.data.mul.lhs, inst.data.mul.rhs }),
                     .div => std.debug.print("%{d}, %{d}", .{ inst.data.div.lhs, inst.data.div.rhs }),
+                    .rem => std.debug.print("%{d}, %{d}", .{ inst.data.rem.lhs, inst.data.rem.rhs }),
+                    .bit_and => std.debug.print("%{d}, %{d}", .{ inst.data.bit_and.lhs, inst.data.bit_and.rhs }),
+                    .bit_or => std.debug.print("%{d}, %{d}", .{ inst.data.bit_or.lhs, inst.data.bit_or.rhs }),
+                    .bit_xor => std.debug.print("%{d}, %{d}", .{ inst.data.bit_xor.lhs, inst.data.bit_xor.rhs }),
+                    .shl => std.debug.print("%{d}, %{d}", .{ inst.data.shl.lhs, inst.data.shl.rhs }),
+                    .shr => std.debug.print("%{d}, %{d}", .{ inst.data.shr.lhs, inst.data.shr.rhs }),
                     .icmp => std.debug.print("{s} %{d}, %{d}", .{ @tagName(inst.data.icmp.predicate), inst.data.icmp.lhs, inst.data.icmp.rhs }),
                     .addr => std.debug.print("local_{d}", .{inst.data.addr}),
                     .alloca => std.debug.print("local_{d}, size: {d}, align: {d}", .{ inst.data.alloca.id, inst.data.alloca.size, inst.data.alloca.alignment }),

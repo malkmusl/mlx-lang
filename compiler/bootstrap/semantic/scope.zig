@@ -1,5 +1,5 @@
 const std = @import("std");
-const ast = @import("ast.zig");
+const ast = @import("../syntax/ast.zig");
 const Type = @import("type.zig").Type;
 
 pub const Scope = struct {

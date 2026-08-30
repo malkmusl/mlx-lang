@@ -15,7 +15,7 @@
 ///   0x400000       = file offset 0  (headers)
 ///   0x401000       = .text start
 const std = @import("std");
-const Encoder = @import("x86_64_encoder.zig").Encoder;
+const Encoder = @import("../backend/x86_64/encoder.zig").Encoder;
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  ELF64 constants
@@ -357,7 +357,7 @@ test "alignUp" {
 }
 
 test "ELF magic bytes in built binary" {
-    const enc_mod = @import("x86_64_encoder.zig");
+    const enc_mod = @import("../backend/x86_64/encoder.zig");
     var enc = enc_mod.Encoder.init(std.testing.allocator);
     defer enc.deinit();
 

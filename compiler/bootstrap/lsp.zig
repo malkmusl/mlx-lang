@@ -1,7 +1,7 @@
 // Language-server entry point. Kept beside the bootstrap lexer until the
 // canonical Zin compiler owns the tooling implementation.
 const std = @import("std");
-const Lexer = @import("lexer.zig").Lexer;
+const Lexer = @import("syntax/lexer.zig").Lexer;
 
 pub fn main(init: std.process.Init) !u8 {
     const a = init.gpa;

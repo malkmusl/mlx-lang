@@ -1,13 +1,15 @@
 const std = @import("std");
-const ast = @import("ast.zig");
+const ast = @import("../syntax/ast.zig");
 const Node = ast.Node;
 const Type = @import("type.zig").Type;
 const TypePool = @import("type.zig").TypePool;
 const Scope = @import("scope.zig").Scope;
-const DiagnosticEngine = @import("diagnostics.zig").DiagnosticEngine;
-const Phase = @import("diagnostics.zig").Phase;
-const Token = @import("token.zig").Token;
+const DiagnosticEngine = @import("../source/diagnostics.zig").DiagnosticEngine;
+const Phase = @import("../source/diagnostics.zig").Phase;
+const Token = @import("../syntax/token.zig").Token;
 const builtin = @import("builtin.zig");
+const postfix = @import("expressions/postfix.zig");
+const operator_semantics = @import("expressions/operators.zig");
 
 pub const LocalState = enum {
     uninitialized,
@@ -91,7 +93,7 @@ pub const Sema = struct {
         }
     }
 
-    fn analyzeNode(self: *Sema, node_idx: Node.Index, scope: *Scope) std.mem.Allocator.Error!Type.Id {
+    pub fn analyzeNode(self: *Sema, node_idx: Node.Index, scope: *Scope) std.mem.Allocator.Error!Type.Id {
         const node = self.ast_tree.nodes.get(node_idx);
         std.debug.print("-> ENTER: Sema.analyzeNode | Tag: {s}\n", .{@tagName(node.tag)});
         defer std.debug.print("<- EXIT: Sema.analyzeNode | Tag: {s}\n", .{@tagName(node.tag)});
@@ -227,10 +229,7 @@ pub const Sema = struct {
                     declared_type = try self.resolveTypeExpr(type_node);
 
                     // Type check: is the init expression coercible to the declared type?
-                    const from_ty = self.type_pool.types.items[inferred_type];
-                    const to_ty = self.type_pool.types.items[declared_type];
-
-                    if (!Type.isCoercible(from_ty, to_ty)) {
+                    if (!self.type_pool.isCoercible(inferred_type, declared_type)) {
                         var from_buf: [64]u8 = undefined;
                         var to_buf: [64]u8 = undefined;
                         const from_name = self.type_pool.typeName(inferred_type, &from_buf) catch "<unknown>";
@@ -293,56 +292,9 @@ pub const Sema = struct {
                 return declared_type;
             },
             .builtin_call => return self.analyzeBuiltin(node_idx, scope),
-            .binary_op => {
-                const operator = self.ast_tree.tokens[node.main_token].tag;
-                if (operator == .equal) {
-                    const target_node = self.ast_tree.nodes.get(node.data.lhs);
-                    const target_type = try self.analyzeNode(node.data.lhs, scope);
-                    const value_type = try self.analyzeNode(node.data.rhs, scope);
-                    if (target_node.tag != .identifier) {
-                        try self.reportError(4001, .sema, self.ast_tree.tokens[node.main_token].start, "Assignment target must be an identifier");
-                    } else {
-                        const target_token = self.ast_tree.tokens[target_node.main_token];
-                        const src = self.diags.source_manager.getFile(0).?.content;
-                        if (scope.get(src[target_token.start..target_token.end])) |symbol| {
-                            if (symbol.is_const) {
-                                try self.reportError(4001, .sema, target_token.start, "Cannot assign to a const value");
-                            }
-                        }
-                    }
-                    if (!Type.isCoercible(self.type_pool.get(value_type), self.type_pool.get(target_type))) {
-                        try self.reportError(4001, .sema, self.ast_tree.tokens[node.main_token].start, "Assigned expression does not match target type");
-                    }
-                    const void_type = try self.type_pool.internPrimitive(.void_type);
-                    try self.node_types.put(node_idx, void_type);
-                    return void_type;
-                }
-                const lhs = try self.analyzeNode(node.data.lhs, scope);
-                const rhs = try self.analyzeNode(node.data.rhs, scope);
-                const is_comparison = switch (operator) {
-                    .equal_equal,
-                    .bang_equal,
-                    .angle_bracket_left,
-                    .angle_bracket_left_equal,
-                    .angle_bracket_right,
-                    .angle_bracket_right_equal,
-                    => true,
-                    else => false,
-                };
-                if (is_comparison) {
-                    const lhs_type = self.type_pool.get(lhs);
-                    const rhs_type = self.type_pool.get(rhs);
-                    if (!Type.isCoercible(lhs_type, rhs_type) and !Type.isCoercible(rhs_type, lhs_type)) {
-                        try self.reportError(4014, .sema, self.ast_tree.tokens[node.main_token].start, "Comparison operands have incompatible types");
-                    }
-                    const bool_type = try self.type_pool.internPrimitive(.bool_type);
-                    try self.node_types.put(node_idx, bool_type);
-                    return bool_type;
-                }
-                try self.node_types.put(node_idx, lhs);
-                return lhs;
-            },
+            .binary_op => return operator_semantics.analyze(self, node_idx, scope),
             .unary_op => {
+                if (try postfix.analyzeUnarySuffix(self, node_idx, scope)) |type_id| return type_id;
                 const operand_type = try self.analyzeNode(node.data.lhs, scope);
                 const operator = self.ast_tree.tokens[node.main_token].tag;
                 if (operator == .keyword_try) {
@@ -366,6 +318,7 @@ pub const Sema = struct {
                 try self.node_types.put(node_idx, operand_type);
                 return operand_type;
             },
+            .array_access, .slice => return postfix.analyze(self, node_idx, scope),
             .tuple_literal => {
                 const extra_start = node.data.lhs;
                 const count = self.ast_tree.extra_data[extra_start];
@@ -400,7 +353,7 @@ pub const Sema = struct {
                 while (index < count) : (index += 1) {
                     const element_node = self.ast_tree.extra_data[extra_start + 3 + index];
                     const actual_type = try self.analyzeNode(element_node, scope);
-                    if (!Type.isCoercible(self.type_pool.get(actual_type), self.type_pool.get(element_type))) {
+                    if (!self.type_pool.isCoercible(actual_type, element_type)) {
                         try self.reportError(4001, .sema, self.ast_tree.tokens[self.ast_tree.nodes.get(element_node).main_token].start, "Array element does not match the declared element type");
                     }
                 }
@@ -482,9 +435,9 @@ pub const Sema = struct {
                         result_type = else_type;
                     } else if (isPrimitive(else_value, .noreturn_type)) {
                         result_type = then_type;
-                    } else if (Type.isCoercible(then_value, else_value)) {
+                    } else if (self.type_pool.isCoercible(then_type, else_type)) {
                         result_type = else_type;
-                    } else if (Type.isCoercible(else_value, then_value)) {
+                    } else if (self.type_pool.isCoercible(else_type, then_type)) {
                         result_type = then_type;
                     } else {
                         try self.reportError(4001, .sema, self.ast_tree.tokens[node.main_token].start, "if and else branches have incompatible types");
@@ -535,7 +488,7 @@ pub const Sema = struct {
                     const start_value = self.type_pool.get(start_type);
                     const end_value = self.type_pool.get(end_type);
                     if (!start_value.isInteger() or !end_value.isInteger() or
-                        (!Type.isCoercible(start_value, end_value) and !Type.isCoercible(end_value, start_value)))
+                        (!self.type_pool.isCoercible(start_type, end_type) and !self.type_pool.isCoercible(end_type, start_type)))
                     {
                         try self.reportError(4001, .sema, self.ast_tree.tokens[iterable.main_token].start, "for range bounds must have compatible integer types");
                     }
@@ -631,11 +584,9 @@ pub const Sema = struct {
                         else
                             try self.analyzeNode(node.data.rhs, scope);
                         if (self.loop_stack.items[target_index].break_type) |previous_type| {
-                            const previous = self.type_pool.get(previous_type);
-                            const current = self.type_pool.get(break_type);
-                            if (Type.isCoercible(current, previous)) {
+                            if (self.type_pool.isCoercible(break_type, previous_type)) {
                                 // Keep the wider/established result type.
-                            } else if (Type.isCoercible(previous, current)) {
+                            } else if (self.type_pool.isCoercible(previous_type, break_type)) {
                                 self.loop_stack.items[target_index].break_type = break_type;
                             } else {
                                 try self.reportError(4001, .sema, self.ast_tree.tokens[node.main_token].start, "Break values for the same loop have incompatible types");
@@ -751,7 +702,7 @@ pub const Sema = struct {
                     if (i < params.len) {
                         const parameter_type = self.type_pool.get(params[i]);
                         const accepts_anytype = isPrimitive(parameter_type, .anytype_type);
-                        if (!accepts_anytype and !Type.isCoercible(self.type_pool.get(arg_type), parameter_type)) {
+                        if (!accepts_anytype and !self.type_pool.isCoercible(arg_type, params[i])) {
                             try self.reportError(4001, .sema, self.ast_tree.tokens[self.ast_tree.nodes.get(arg_node).main_token].start, "Function argument type does not match parameter type");
                         }
                     }
@@ -775,14 +726,10 @@ pub const Sema = struct {
                     }
                 } else {
                     const actual_type = try self.analyzeNode(node.data.rhs, scope);
-                    const actual = self.type_pool.get(actual_type);
                     const return_matches = if (expected.data == .error_union)
-                        if (actual.data == .error_union)
-                            Type.isCoercible(actual, expected)
-                        else
-                            Type.isCoercible(actual, self.type_pool.get(expected.data.error_union.payload))
+                        self.type_pool.isCoercible(actual_type, expected_type)
                     else
-                        !isPrimitive(expected, .void_type) and Type.isCoercible(actual, expected);
+                        !isPrimitive(expected, .void_type) and self.type_pool.isCoercible(actual_type, expected_type);
                     if (!return_matches) {
                         try self.reportError(4001, .sema, self.ast_tree.tokens[node.main_token].start, "Returned expression does not match function return type");
                     }
@@ -1406,7 +1353,7 @@ pub const Sema = struct {
         return raw[1 .. raw.len - 1];
     }
 
-    fn reportError(self: *Sema, code: u32, phase: Phase, start_byte: u32, msg: []const u8) !void {
+    pub fn reportError(self: *Sema, code: u32, phase: Phase, start_byte: u32, msg: []const u8) !void {
         try self.diags.report(.{
             .code = code,
             .phase = phase,

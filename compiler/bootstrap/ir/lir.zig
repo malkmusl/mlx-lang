@@ -1,5 +1,5 @@
 const std = @import("std");
-const Type = @import("type.zig").Type;
+const Type = @import("../semantic/type.zig").Type;
 
 pub const Opcode = enum {
     const_i,
@@ -12,6 +12,11 @@ pub const Opcode = enum {
     mul,
     div,
     rem,
+    bit_and,
+    bit_or,
+    bit_xor,
+    shl,
+    shr,
     icmp,
 
     // Memory
@@ -69,6 +74,11 @@ pub const Inst = struct {
         mul: struct { lhs: Index, rhs: Index },
         div: struct { lhs: Index, rhs: Index },
         rem: struct { lhs: Index, rhs: Index },
+        bit_and: struct { lhs: Index, rhs: Index },
+        bit_or: struct { lhs: Index, rhs: Index },
+        bit_xor: struct { lhs: Index, rhs: Index },
+        shl: struct { lhs: Index, rhs: Index },
+        shr: struct { lhs: Index, rhs: Index },
         icmp: struct { predicate: CmpPredicate, lhs: Index, rhs: Index },
 
         load: struct { ptr: Index },

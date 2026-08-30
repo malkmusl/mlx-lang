@@ -13,7 +13,7 @@
 ///   - Callee-saved: rbx, rbp, r12-r15
 
 const std = @import("std");
-const Type = @import("type.zig").Type;
+const Type = @import("../../semantic/type.zig").Type;
 
 // ──────────────────────────────────────────
 //  Register name tables

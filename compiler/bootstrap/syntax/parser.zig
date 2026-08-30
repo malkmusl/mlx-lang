@@ -4,8 +4,10 @@ const Tag = Token.Tag;
 const ast = @import("ast.zig");
 const Node = ast.Node;
 const Ast = ast.Ast;
-const DiagnosticEngine = @import("diagnostics.zig").DiagnosticEngine;
-const SourceManager = @import("source_manager.zig").SourceManager;
+const DiagnosticEngine = @import("../source/diagnostics.zig").DiagnosticEngine;
+const SourceManager = @import("../source/source_manager.zig").SourceManager;
+const postfix_parser = @import("parser/postfix.zig");
+const operators = @import("parser/operators.zig");
 
 pub const Parser = struct {
     allocator: std.mem.Allocator,
@@ -60,7 +62,7 @@ pub const Parser = struct {
         }
     }
 
-    fn consumeToken(self: *Parser, msg: []const u8) void {
+    pub fn consumeToken(self: *Parser, msg: []const u8) void {
         const tok = self.tokens[self.index];
         self.traceToken(msg, tok);
         self.index += 1;
@@ -637,7 +639,7 @@ pub const Parser = struct {
         }
     }
 
-    fn parseExpr(self: *Parser, binding_power: u8) std.mem.Allocator.Error!?Node.Index {
+    pub fn parseExpr(self: *Parser, binding_power: u8) std.mem.Allocator.Error!?Node.Index {
         self.traceRuleEnter("parseExpr");
         defer self.traceRuleExit("parseExpr");
         var lhs = try self.parsePrefix();
@@ -646,66 +648,12 @@ pub const Parser = struct {
         while (self.index < self.tokens.len) {
             const op_tok = self.tokens[self.index];
 
-            if (op_tok.tag == .l_paren) {
-                if (100 < binding_power) break;
-                const call_tok = self.index;
-                self.index += 1;
-
-                var args = std.ArrayList(Node.Index).empty;
-                defer args.deinit(self.allocator);
-
-                while (self.index < self.tokens.len and self.tokens[self.index].tag != .r_paren) {
-                    const arg = try self.parseExpr(0);
-                    if (arg == null) return null;
-                    try args.append(self.allocator, arg.?);
-
-                    if (self.tokens[self.index].tag == .comma) {
-                        self.index += 1;
-                    } else {
-                        break;
-                    }
-                }
-
-                if (self.tokens[self.index].tag == .r_paren) {
-                    self.index += 1;
-                } else {
-                    try self.reportError(2008, "Expected ')' after function arguments");
-                    return null;
-                }
-
-                const extra_start = @as(u32, @intCast(self.extra_data.items.len));
-                try self.extra_data.append(self.allocator, @as(u32, @intCast(args.items.len)));
-                try self.extra_data.appendSlice(self.allocator, args.items);
-
-                try self.nodes.append(self.allocator, .{
-                    .tag = .call,
-                    .main_token = call_tok,
-                    .data = .{ .lhs = lhs.?, .rhs = extra_start },
-                });
-
-                lhs = @as(u32, @intCast(self.nodes.len - 1));
+            if (try postfix_parser.parse(self, lhs.?, binding_power)) |postfix| {
+                lhs = postfix;
                 continue;
             }
 
-            if (op_tok.tag == .dot) {
-                if (100 < binding_power) break;
-                self.consumeToken("Consume field access '.'");
-                if (self.index >= self.tokens.len or self.tokens[self.index].tag != .ident) {
-                    try self.reportError(2001, "Expected field name after '.'");
-                    return null;
-                }
-                const field_tok = self.index;
-                self.consumeToken("Consume field name");
-                try self.nodes.append(self.allocator, .{
-                    .tag = .field_access,
-                    .main_token = field_tok,
-                    .data = .{ .lhs = lhs.?, .rhs = field_tok },
-                });
-                lhs = @as(u32, @intCast(self.nodes.len - 1));
-                continue;
-            }
-
-            const bp = getBindingPower(op_tok.tag);
+            const bp = operators.bindingPower(op_tok.tag);
 
             if (bp.left == 0) break;
             if (bp.left < binding_power) break;
@@ -1376,7 +1324,7 @@ pub const Parser = struct {
         };
     }
 
-    fn reportError(self: *Parser, code: u32, msg: []const u8) !void {
+    pub fn reportError(self: *Parser, code: u32, msg: []const u8) !void {
         const tok = if (self.index < self.tokens.len) self.tokens[self.index] else self.tokens[self.tokens.len - 1];
         try self.diags.report(.{
             .code = code,
@@ -1391,29 +1339,11 @@ pub const Parser = struct {
         });
     }
 
-    const BindingPower = struct { left: u8, right: u8 };
-
-    fn getBindingPower(tag: Tag) BindingPower {
-        return switch (tag) {
-            .equal => .{ .left = 10, .right = 10 },
-            .asterisk, .slash, .percent => .{ .left = 50, .right = 51 },
-            .plus, .minus => .{ .left = 40, .right = 41 },
-            .equal_equal,
-            .bang_equal,
-            .angle_bracket_left,
-            .angle_bracket_left_equal,
-            .angle_bracket_right,
-            .angle_bracket_right_equal,
-            => .{ .left = 30, .right = 31 },
-            .plus_shl, .ampersand_shl => .{ .left = 20, .right = 21 }, // shift combines
-            else => .{ .left = 0, .right = 0 },
-        };
-    }
 };
 
 test "parser: empty file" {
     const allocator = std.testing.allocator;
-    var sm = @import("source_manager.zig").SourceManager.init(allocator);
+    var sm = @import("../source/source_manager.zig").SourceManager.init(allocator);
     defer sm.deinit();
     _ = try sm.addFile("<test>", "");
     var diags = DiagnosticEngine.init(allocator, &sm);
@@ -1428,7 +1358,7 @@ test "parser: empty file" {
 
 test "parser: basic var decl" {
     const allocator = std.testing.allocator;
-    var sm = @import("source_manager.zig").SourceManager.init(allocator);
+    var sm = @import("../source/source_manager.zig").SourceManager.init(allocator);
     defer sm.deinit();
     _ = try sm.addFile("<test>", "var a = 1");
     var diags = DiagnosticEngine.init(allocator, &sm);
@@ -1456,7 +1386,7 @@ test "parser: basic var decl" {
 
 test "parser: pratt expression precedence" {
     const allocator = std.testing.allocator;
-    var sm = @import("source_manager.zig").SourceManager.init(allocator);
+    var sm = @import("../source/source_manager.zig").SourceManager.init(allocator);
     defer sm.deinit();
     _ = try sm.addFile("<test>", "const x = 1 + 2 * 3");
     var diags = DiagnosticEngine.init(allocator, &sm);
@@ -1501,7 +1431,7 @@ test "parser: pratt expression precedence" {
 
 test "parser: error recovery" {
     const allocator = std.testing.allocator;
-    var sm = @import("source_manager.zig").SourceManager.init(allocator);
+    var sm = @import("../source/source_manager.zig").SourceManager.init(allocator);
     defer sm.deinit();
     _ = try sm.addFile("<test>", "const = 1\nvar b = 2");
     var diags = DiagnosticEngine.init(allocator, &sm);
@@ -1540,7 +1470,7 @@ test "parser: declaration modifiers are preserved" {
     const allocator = std.testing.allocator;
     const source = "pub extern(\"syscall\") fn raw() void {}";
 
-    var sm = @import("source_manager.zig").SourceManager.init(allocator);
+    var sm = @import("../source/source_manager.zig").SourceManager.init(allocator);
     defer sm.deinit();
     _ = try sm.addFile("<test>", source);
 
@@ -1580,7 +1510,7 @@ test "parser: recovery always makes progress at declaration modifiers" {
     const allocator = std.testing.allocator;
     const source = "pub nope";
 
-    var sm = @import("source_manager.zig").SourceManager.init(allocator);
+    var sm = @import("../source/source_manager.zig").SourceManager.init(allocator);
     defer sm.deinit();
     _ = try sm.addFile("<test>", source);
 
@@ -1610,7 +1540,7 @@ test "parser: bootstrap hello syntax" {
         \\}
     ;
 
-    var sm = @import("source_manager.zig").SourceManager.init(allocator);
+    var sm = @import("../source/source_manager.zig").SourceManager.init(allocator);
     defer sm.deinit();
     _ = try sm.addFile("<test>", source);
 
