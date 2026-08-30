@@ -115,6 +115,25 @@ pub const Node = struct {
     ///   lhs = condition node
     ///   rhs = body block node
     ///
+    /// `for_stmt`:
+    ///   main_token = `for` token
+    ///   lhs = extra_start where:
+    ///     extra_data[lhs + 0] = item capture token
+    ///     extra_data[lhs + 1] = index capture token, or maxInt(u32)
+    ///     extra_data[lhs + 2] = iterable/range node
+    ///     extra_data[lhs + 3] = body block node
+    ///   rhs = lhs + 4
+    ///
+    /// `range`:
+    ///   main_token = `..` token
+    ///   lhs = inclusive start expression
+    ///   rhs = exclusive end expression
+    ///
+    /// `break_stmt` / `continue_stmt`:
+    ///   main_token = keyword token
+    ///   lhs = label token, or maxInt(u32)
+    ///   rhs = break value node, or maxInt(u32)
+    ///
     /// `return_stmt`:
     ///   main_token = `return` token
     ///   lhs = 0
@@ -134,6 +153,7 @@ pub const Node = struct {
         block,
         if_stmt,
         while_stmt,
+        for_stmt,
         match_stmt,
         return_stmt,
         break_stmt,
@@ -145,6 +165,7 @@ pub const Node = struct {
         // Expressions
         binary_op,
         unary_op,
+        range,
         call,
         field_access,
         array_access,

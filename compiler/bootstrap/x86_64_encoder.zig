@@ -6,10 +6,18 @@
 /// can be patched once all code has been emitted.
 ///
 /// All instructions assume 64-bit (REX.W) operand size unless noted.
-
 const std = @import("std");
 const x86 = @import("x86_64.zig");
 pub const Reg = x86.Register;
+
+pub const Condition = enum(u8) {
+    equal = 0x4,
+    not_equal = 0x5,
+    less = 0xc,
+    greater_equal = 0xd,
+    less_equal = 0xe,
+    greater = 0xf,
+};
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  Fixup kinds
@@ -300,6 +308,24 @@ pub const Encoder = struct {
         try self.emit1(modrm(0b11, lo3(reg), lo3(reg)));
     }
 
+    /// CMP lhs, rhs   (REX.W 39 /r)
+    pub fn emitCmp(self: *Encoder, lhs: Reg, rhs: Reg) !void {
+        std.debug.print("[enc] cmp {s}, {s}\n", .{ @tagName(lhs), @tagName(rhs) });
+        try self.emit1(rex(true, needsRex(rhs), false, needsRex(lhs)));
+        try self.emit1(0x39);
+        try self.emit1(modrm(0b11, lo3(rhs), lo3(lhs)));
+    }
+
+    /// SETcc dst.low8 after clearing the complete destination register.
+    pub fn emitSetcc(self: *Encoder, dst: Reg, condition: Condition) !void {
+        std.debug.print("[enc] set{s} {s}b\n", .{ @tagName(condition), @tagName(dst) });
+        try self.emitMovRegImm64(dst, 0);
+        // A REX prefix is required for spl/bpl/sil/dil and harmless for all GP regs.
+        try self.emit1(rex(false, false, false, needsRex(dst)));
+        try self.emit2(0x0F, 0x90 + @intFromEnum(condition));
+        try self.emit1(modrm(0b11, 0, lo3(dst)));
+    }
+
     // ── control flow ──────────────────────────────────────────────────────────
 
     /// JMP rel32   (E9 id)
@@ -455,7 +481,7 @@ test "symbol define and fixup" {
     defer enc.deinit();
 
     // Emit: E8 <rel32>  (call "target")
-    try enc.emitCallRel("target");  // at offset 0: E8 00 00 00 00
+    try enc.emitCallRel("target"); // at offset 0: E8 00 00 00 00
     // Define "target" at offset 5
     try enc.defineSymbol("target");
     try enc.emitSyscall(); // 0F 05 at offset 5

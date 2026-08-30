@@ -34,6 +34,7 @@ pub const Sema = struct {
     unsafe_depth: u32,
     eval_branch_quota: u64,
     current_return_type: ?Type.Id,
+    loop_depth: u32,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -55,6 +56,7 @@ pub const Sema = struct {
             .unsafe_depth = 0,
             .eval_branch_quota = 1_000_000,
             .current_return_type = null,
+            .loop_depth = 0,
         };
     }
 
@@ -286,9 +288,51 @@ pub const Sema = struct {
             },
             .builtin_call => return self.analyzeBuiltin(node_idx, scope),
             .binary_op => {
-                // Simple pass through for now
+                const operator = self.ast_tree.tokens[node.main_token].tag;
+                if (operator == .equal) {
+                    const target_node = self.ast_tree.nodes.get(node.data.lhs);
+                    const target_type = try self.analyzeNode(node.data.lhs, scope);
+                    const value_type = try self.analyzeNode(node.data.rhs, scope);
+                    if (target_node.tag != .identifier) {
+                        try self.reportError(4001, .sema, self.ast_tree.tokens[node.main_token].start, "Assignment target must be an identifier");
+                    } else {
+                        const target_token = self.ast_tree.tokens[target_node.main_token];
+                        const src = self.diags.source_manager.getFile(0).?.content;
+                        if (scope.get(src[target_token.start..target_token.end])) |symbol| {
+                            if (symbol.is_const) {
+                                try self.reportError(4001, .sema, target_token.start, "Cannot assign to a const value");
+                            }
+                        }
+                    }
+                    if (!Type.isCoercible(self.type_pool.get(value_type), self.type_pool.get(target_type))) {
+                        try self.reportError(4001, .sema, self.ast_tree.tokens[node.main_token].start, "Assigned expression does not match target type");
+                    }
+                    const void_type = try self.type_pool.internPrimitive(.void_type);
+                    try self.node_types.put(node_idx, void_type);
+                    return void_type;
+                }
                 const lhs = try self.analyzeNode(node.data.lhs, scope);
-                _ = try self.analyzeNode(node.data.rhs, scope);
+                const rhs = try self.analyzeNode(node.data.rhs, scope);
+                const is_comparison = switch (operator) {
+                    .equal_equal,
+                    .bang_equal,
+                    .angle_bracket_left,
+                    .angle_bracket_left_equal,
+                    .angle_bracket_right,
+                    .angle_bracket_right_equal,
+                    => true,
+                    else => false,
+                };
+                if (is_comparison) {
+                    const lhs_type = self.type_pool.get(lhs);
+                    const rhs_type = self.type_pool.get(rhs);
+                    if (!Type.isCoercible(lhs_type, rhs_type) and !Type.isCoercible(rhs_type, lhs_type)) {
+                        try self.reportError(4014, .sema, self.ast_tree.tokens[node.main_token].start, "Comparison operands have incompatible types");
+                    }
+                    const bool_type = try self.type_pool.internPrimitive(.bool_type);
+                    try self.node_types.put(node_idx, bool_type);
+                    return bool_type;
+                }
                 try self.node_types.put(node_idx, lhs);
                 return lhs;
             },
@@ -384,21 +428,38 @@ pub const Sema = struct {
                 const extra_end = node.data.rhs;
 
                 const cond_idx = self.ast_tree.extra_data[extra_start];
-                _ = try self.analyzeNode(cond_idx, scope);
+                const condition_type = try self.analyzeNode(cond_idx, scope);
+                if (!isPrimitive(self.type_pool.get(condition_type), .bool_type)) {
+                    try self.reportError(4001, .sema, self.ast_tree.tokens[self.ast_tree.nodes.get(cond_idx).main_token].start, "if condition must have type bool");
+                }
 
                 const then_idx = self.ast_tree.extra_data[extra_start + 1];
                 const then_type = try self.analyzeNode(then_idx, scope);
 
-                var else_type: Type.Id = 0; // void by default
+                var else_type = try self.type_pool.internPrimitive(.void_type);
                 if (extra_end > extra_start + 2) {
                     const else_idx = self.ast_tree.extra_data[extra_start + 2];
                     else_type = try self.analyzeNode(else_idx, scope);
                 }
 
-                // For now just assume they match and return then_type
-                // Wait, if it's an if without else, the result should be void.
-                // Let's just return then_type for now if it's an expression.
-                const result_type = if (extra_end > extra_start + 2) then_type else 0;
+                const has_else = extra_end > extra_start + 2;
+                var result_type = try self.type_pool.internPrimitive(.void_type);
+                if (has_else) {
+                    const then_value = self.type_pool.get(then_type);
+                    const else_value = self.type_pool.get(else_type);
+                    if (isPrimitive(then_value, .noreturn_type)) {
+                        result_type = else_type;
+                    } else if (isPrimitive(else_value, .noreturn_type)) {
+                        result_type = then_type;
+                    } else if (Type.isCoercible(then_value, else_value)) {
+                        result_type = else_type;
+                    } else if (Type.isCoercible(else_value, then_value)) {
+                        result_type = then_type;
+                    } else {
+                        try self.reportError(4001, .sema, self.ast_tree.tokens[node.main_token].start, "if and else branches have incompatible types");
+                        result_type = then_type;
+                    }
+                }
                 try self.node_types.put(node_idx, result_type);
                 return result_type;
             },
@@ -406,11 +467,88 @@ pub const Sema = struct {
                 const cond = node.data.lhs;
                 const body = node.data.rhs;
 
-                _ = try self.analyzeNode(cond, scope);
+                const condition_type = try self.analyzeNode(cond, scope);
+                if (!isPrimitive(self.type_pool.get(condition_type), .bool_type)) {
+                    try self.reportError(4001, .sema, self.ast_tree.tokens[self.ast_tree.nodes.get(cond).main_token].start, "while condition must have type bool");
+                }
+                self.loop_depth += 1;
+                defer self.loop_depth -= 1;
                 _ = try self.analyzeNode(body, scope);
 
-                try self.node_types.put(node_idx, 0); // while evaluates to void
-                return 0;
+                const void_type = try self.type_pool.internPrimitive(.void_type);
+                try self.node_types.put(node_idx, void_type);
+                return void_type;
+            },
+            .for_stmt => {
+                const extra_start = node.data.lhs;
+                const item_token = self.ast_tree.extra_data[extra_start];
+                const index_token = self.ast_tree.extra_data[extra_start + 1];
+                const iterable_node = self.ast_tree.extra_data[extra_start + 2];
+                const body_node = self.ast_tree.extra_data[extra_start + 3];
+                const iterable = self.ast_tree.nodes.get(iterable_node);
+
+                if (iterable.tag != .range) {
+                    _ = try self.analyzeNode(iterable_node, scope);
+                    try self.reportError(9001, .lowering, self.ast_tree.tokens[node.main_token].start, "Stage-0 for lowering currently supports ranges");
+                    const void_type = try self.type_pool.internPrimitive(.void_type);
+                    try self.node_types.put(node_idx, void_type);
+                    return void_type;
+                }
+
+                const start_type = try self.analyzeNode(iterable.data.lhs, scope);
+                const end_type = try self.analyzeNode(iterable.data.rhs, scope);
+                const start_value = self.type_pool.get(start_type);
+                const end_value = self.type_pool.get(end_type);
+                if (!start_value.isInteger() or !end_value.isInteger() or
+                    (!Type.isCoercible(start_value, end_value) and !Type.isCoercible(end_value, start_value)))
+                {
+                    try self.reportError(4001, .sema, self.ast_tree.tokens[iterable.main_token].start, "for range bounds must have compatible integer types");
+                }
+                try self.node_types.put(iterable_node, start_type);
+
+                var loop_scope = Scope.init(self.allocator, scope);
+                defer loop_scope.deinit();
+                const src = self.diags.source_manager.getFile(0).?.content;
+                const item_tok = self.ast_tree.tokens[item_token];
+                try loop_scope.put(src[item_tok.start..item_tok.end], .{
+                    .name = src[item_tok.start..item_tok.end],
+                    .decl_node = node_idx,
+                    .type_id = start_type,
+                    .is_const = true,
+                });
+                if (index_token != std.math.maxInt(u32)) {
+                    const index_tok = self.ast_tree.tokens[index_token];
+                    const index_type = try self.type_pool.internSizeInt(false);
+                    try loop_scope.put(src[index_tok.start..index_tok.end], .{
+                        .name = src[index_tok.start..index_tok.end],
+                        .decl_node = node_idx,
+                        .type_id = index_type,
+                        .is_const = true,
+                    });
+                }
+
+                self.loop_depth += 1;
+                defer self.loop_depth -= 1;
+                _ = try self.analyzeNode(body_node, &loop_scope);
+
+                const void_type = try self.type_pool.internPrimitive(.void_type);
+                try self.node_types.put(node_idx, void_type);
+                return void_type;
+            },
+            .break_stmt, .continue_stmt => {
+                if (self.loop_depth == 0) {
+                    try self.reportError(4001, .sema, self.ast_tree.tokens[node.main_token].start, "Loop control statement used outside a loop");
+                }
+                if (node.data.lhs != std.math.maxInt(u32)) {
+                    try self.reportError(9001, .lowering, self.ast_tree.tokens[node.main_token].start, "Labeled loop control is not available in Stage 0 yet");
+                }
+                if (node.tag == .break_stmt and node.data.rhs != std.math.maxInt(u32)) {
+                    _ = try self.analyzeNode(node.data.rhs, scope);
+                    try self.reportError(9001, .lowering, self.ast_tree.tokens[node.main_token].start, "Break values are not available in Stage 0 yet");
+                }
+                const noreturn_type = try self.type_pool.internPrimitive(.noreturn_type);
+                try self.node_types.put(node_idx, noreturn_type);
+                return noreturn_type;
             },
             .fn_proto => {
                 const extra_start = node.data.lhs;
@@ -463,8 +601,11 @@ pub const Sema = struct {
 
                 const function = self.type_pool.get(fn_type).data.function;
                 const previous_return_type = self.current_return_type;
+                const previous_loop_depth = self.loop_depth;
                 self.current_return_type = function.ret_type;
+                self.loop_depth = 0;
                 defer self.current_return_type = previous_return_type;
+                defer self.loop_depth = previous_loop_depth;
 
                 _ = try self.analyzeNode(body, &child_scope);
 

@@ -1,11 +1,17 @@
 const std = @import("std");
 const ast = @import("ast.zig");
 const Node = ast.Node;
+const Type = @import("type.zig").Type;
 const TypePool = @import("type.zig").TypePool;
 const Sema = @import("sema.zig").Sema;
 const Lir = @import("lir.zig").Lir;
 const Inst = @import("lir.zig").Inst;
 const builtin = @import("builtin.zig");
+
+const LoopTargets = struct {
+    break_dest: u32,
+    continue_dest: u32,
+};
 
 pub const LirBuilder = struct {
     allocator: std.mem.Allocator,
@@ -14,6 +20,8 @@ pub const LirBuilder = struct {
     current_block: ?u32,
     var_addresses: std.StringHashMap(u32),
     param_counter: u32 = 0,
+    current_return_type: ?Type.Id,
+    loop_stack: std.ArrayList(LoopTargets),
 
     pub fn init(allocator: std.mem.Allocator, sema: *Sema) LirBuilder {
         return .{
@@ -22,11 +30,14 @@ pub const LirBuilder = struct {
             .lir = Lir.init(allocator),
             .current_block = null,
             .var_addresses = std.StringHashMap(u32).init(allocator),
+            .current_return_type = null,
+            .loop_stack = std.ArrayList(LoopTargets).empty,
         };
     }
 
     pub fn deinit(self: *LirBuilder) void {
         self.var_addresses.deinit();
+        self.loop_stack.deinit(self.allocator);
         self.lir.deinit();
     }
 
@@ -87,17 +98,48 @@ pub const LirBuilder = struct {
                 });
                 return result;
             },
+            .bool_literal => {
+                const type_id = self.sema.node_types.get(node_idx) orelse return null;
+                const value = self.sema.const_values.get(node_idx) orelse 0;
+                result = try self.emitInst(.{
+                    .opcode = .const_i,
+                    .type_id = type_id,
+                    .data = .{ .const_i = value },
+                });
+                return result;
+            },
             .binary_op => {
+                const op_tok = self.sema.ast_tree.tokens[node.main_token];
+                if (op_tok.tag == .equal) {
+                    const target = self.sema.ast_tree.nodes.get(node.data.lhs);
+                    const target_token = self.sema.ast_tree.tokens[target.main_token];
+                    const src = self.sema.diags.source_manager.getFile(0).?.content;
+                    const target_name = src[target_token.start..target_token.end];
+                    const address = self.var_addresses.get(target_name) orelse return null;
+                    const value = try self.lowerNode(node.data.rhs) orelse return null;
+                    _ = try self.emitInst(.{
+                        .opcode = .store,
+                        .type_id = self.sema.node_types.get(node.data.lhs) orelse 0,
+                        .data = .{ .store = .{ .ptr = address, .val = value } },
+                    });
+                    return null;
+                }
                 const type_id = self.sema.node_types.get(node_idx) orelse return null;
                 const lhs_inst = try self.lowerNode(node.data.lhs) orelse return null;
                 const rhs_inst = try self.lowerNode(node.data.rhs) orelse return null;
 
-                const op_tok = self.sema.ast_tree.tokens[node.main_token];
                 const opcode: @import("lir.zig").Opcode = switch (op_tok.tag) {
                     .plus => .add,
                     .minus => .sub,
                     .asterisk => .mul,
                     .slash => .div,
+                    .equal_equal,
+                    .bang_equal,
+                    .angle_bracket_left,
+                    .angle_bracket_left_equal,
+                    .angle_bracket_right,
+                    .angle_bracket_right_equal,
+                    => .icmp,
                     else => return null,
                 };
 
@@ -109,6 +151,19 @@ pub const LirBuilder = struct {
                         .sub => .{ .sub = .{ .lhs = lhs_inst, .rhs = rhs_inst } },
                         .mul => .{ .mul = .{ .lhs = lhs_inst, .rhs = rhs_inst } },
                         .div => .{ .div = .{ .lhs = lhs_inst, .rhs = rhs_inst } },
+                        .icmp => .{ .icmp = .{
+                            .predicate = switch (op_tok.tag) {
+                                .equal_equal => .eq,
+                                .bang_equal => .ne,
+                                .angle_bracket_left => .lt,
+                                .angle_bracket_left_equal => .le,
+                                .angle_bracket_right => .gt,
+                                .angle_bracket_right_equal => .ge,
+                                else => unreachable,
+                            },
+                            .lhs = lhs_inst,
+                            .rhs = rhs_inst,
+                        } },
                         else => unreachable,
                     },
                 });
@@ -209,6 +264,7 @@ pub const LirBuilder = struct {
                 while (i < extra_end) : (i += 1) {
                     const child_idx = self.sema.ast_tree.extra_data[i];
                     last_inst = try self.lowerNode(child_idx);
+                    if (self.currentBlockTerminated()) break;
                 }
 
                 return last_inst;
@@ -225,6 +281,16 @@ pub const LirBuilder = struct {
                 const merge_block = try self.newBlock();
 
                 const has_else = extra_end > extra_start + 2;
+                const result_type = self.sema.node_types.get(node_idx) orelse 0;
+                const result_value = has_else and self.hasRuntimeValue(result_type);
+                const result_addr = if (result_value)
+                    try self.emitInst(.{
+                        .opcode = .addr,
+                        .type_id = result_type,
+                        .data = .{ .addr = 0xc000_0000 | node_idx },
+                    })
+                else
+                    null;
 
                 _ = try self.emitInst(.{
                     .opcode = .condbr,
@@ -236,19 +302,31 @@ pub const LirBuilder = struct {
                 self.current_block = then_block;
                 const then_idx = self.sema.ast_tree.extra_data[extra_start + 1];
                 const then_inst = try self.lowerNode(then_idx);
-                _ = try self.emitInst(.{ .opcode = .br, .type_id = 0, .data = .{ .br = .{ .dest = merge_block } } });
+                if (!self.currentBlockTerminated()) {
+                    if (result_addr) |addr| {
+                        if (then_inst) |value| _ = try self.emitInst(.{ .opcode = .store, .type_id = result_type, .data = .{ .store = .{ .ptr = addr, .val = value } } });
+                    }
+                    _ = try self.emitInst(.{ .opcode = .br, .type_id = 0, .data = .{ .br = .{ .dest = merge_block } } });
+                }
 
                 // Else branch
                 if (has_else) {
                     self.current_block = else_block;
                     const else_idx = self.sema.ast_tree.extra_data[extra_start + 2];
-                    _ = try self.lowerNode(else_idx);
-                    _ = try self.emitInst(.{ .opcode = .br, .type_id = 0, .data = .{ .br = .{ .dest = merge_block } } });
+                    const else_inst = try self.lowerNode(else_idx);
+                    if (!self.currentBlockTerminated()) {
+                        if (result_addr) |addr| {
+                            if (else_inst) |value| _ = try self.emitInst(.{ .opcode = .store, .type_id = result_type, .data = .{ .store = .{ .ptr = addr, .val = value } } });
+                        }
+                        _ = try self.emitInst(.{ .opcode = .br, .type_id = 0, .data = .{ .br = .{ .dest = merge_block } } });
+                    }
                 }
 
                 self.current_block = merge_block;
-
-                return then_inst;
+                if (result_addr) |addr| {
+                    return try self.emitInst(.{ .opcode = .load, .type_id = result_type, .data = .{ .load = .{ .ptr = addr } } });
+                }
+                return null;
             },
             .while_stmt => {
                 const cond_node = node.data.lhs;
@@ -269,10 +347,25 @@ pub const LirBuilder = struct {
                 });
 
                 self.current_block = body_block;
+                try self.loop_stack.append(self.allocator, .{ .break_dest = end_block, .continue_dest = cond_block });
                 _ = try self.lowerNode(body_node);
-                _ = try self.emitInst(.{ .opcode = .br, .type_id = 0, .data = .{ .br = .{ .dest = cond_block } } });
+                _ = self.loop_stack.pop();
+                if (!self.currentBlockTerminated()) {
+                    _ = try self.emitInst(.{ .opcode = .br, .type_id = 0, .data = .{ .br = .{ .dest = cond_block } } });
+                }
 
                 self.current_block = end_block;
+                return null;
+            },
+            .for_stmt => return self.lowerFor(node_idx),
+            .break_stmt => {
+                const targets = self.loop_stack.getLast();
+                _ = try self.emitInst(.{ .opcode = .br, .type_id = 0, .data = .{ .br = .{ .dest = targets.break_dest } } });
+                return null;
+            },
+            .continue_stmt => {
+                const targets = self.loop_stack.getLast();
+                _ = try self.emitInst(.{ .opcode = .br, .type_id = 0, .data = .{ .br = .{ .dest = targets.continue_dest } } });
                 return null;
             },
             .fn_decl => {
@@ -282,8 +375,12 @@ pub const LirBuilder = struct {
                 const fn_block = try self.newBlock();
                 self.current_block = fn_block;
                 self.param_counter = 0;
+                self.var_addresses.clearRetainingCapacity();
+                self.loop_stack.clearRetainingCapacity();
 
                 const proto_node = self.sema.ast_tree.nodes.get(proto_idx);
+                const function_type = self.sema.node_types.get(proto_idx).?;
+                self.current_return_type = self.sema.type_pool.get(function_type).data.function.ret_type;
                 _ = try self.emitInst(.{
                     .opcode = .label,
                     .type_id = 0,
@@ -292,7 +389,10 @@ pub const LirBuilder = struct {
 
                 _ = try self.lowerNode(proto_idx);
                 _ = try self.lowerNode(body);
-                _ = try self.emitInst(.{ .opcode = .ret, .type_id = 0, .data = .{ .ret = null } });
+                if (!self.currentBlockTerminated()) {
+                    _ = try self.emitInst(.{ .opcode = .ret, .type_id = self.current_return_type.?, .data = .{ .ret = null } });
+                }
+                self.current_return_type = null;
                 self.current_block = null; // return to root block
                 return null;
             },
@@ -373,7 +473,43 @@ pub const LirBuilder = struct {
                 }
                 return result;
             },
-            .unary_op, .unsafe_block => {
+            .unary_op => {
+                const operator = self.sema.ast_tree.tokens[node.main_token].tag;
+                if (operator == .keyword_try) {
+                    const operand = try self.lowerNode(node.data.lhs) orelse return null;
+                    const bool_type = try self.sema.type_pool.internPrimitive(.bool_type);
+                    const error_test = try self.emitInst(.{
+                        .opcode = .error_test,
+                        .type_id = bool_type,
+                        .data = .{ .error_test = operand },
+                    });
+                    const error_block = try self.newBlock();
+                    const success_block = try self.newBlock();
+                    _ = try self.emitInst(.{
+                        .opcode = .condbr,
+                        .type_id = 0,
+                        .data = .{ .condbr = .{ .cond = error_test, .true_dest = error_block, .false_dest = success_block } },
+                    });
+
+                    self.current_block = error_block;
+                    _ = try self.emitInst(.{
+                        .opcode = .ret_error,
+                        .type_id = self.current_return_type.?,
+                        .data = .{ .ret_error = error_test },
+                    });
+
+                    self.current_block = success_block;
+                    result = try self.emitInst(.{
+                        .opcode = .error_payload,
+                        .type_id = self.sema.node_types.get(node_idx) orelse 0,
+                        .data = .{ .error_payload = operand },
+                    });
+                    return result;
+                }
+                result = try self.lowerNode(node.data.lhs);
+                return result;
+            },
+            .unsafe_block => {
                 result = try self.lowerNode(node.data.lhs);
                 return result;
             },
@@ -422,7 +558,12 @@ pub const LirBuilder = struct {
                     null
                 else
                     try self.lowerNode(node.data.rhs);
-                _ = try self.emitInst(.{ .opcode = .ret, .type_id = 0, .data = .{ .ret = expr_inst } });
+                const return_type = self.current_return_type.?;
+                if (expr_inst != null and self.sema.type_pool.get(self.sema.node_types.get(node.data.rhs).?).data == .error_union) {
+                    _ = try self.emitInst(.{ .opcode = .ret_error_union, .type_id = return_type, .data = .{ .ret_error_union = expr_inst.? } });
+                } else {
+                    _ = try self.emitInst(.{ .opcode = .ret, .type_id = return_type, .data = .{ .ret = expr_inst } });
+                }
                 return null;
             },
             else => return null, // Unimplemented for now
@@ -433,6 +574,104 @@ pub const LirBuilder = struct {
         const blk_idx = @as(u32, @intCast(self.lir.blocks.items.len));
         try self.lir.blocks.append(self.allocator, @import("lir.zig").BasicBlock.init());
         return blk_idx;
+    }
+
+    fn currentBlockTerminated(self: *const LirBuilder) bool {
+        const block_index = self.current_block orelse return false;
+        const instructions = self.lir.blocks.items[block_index].insts.items;
+        if (instructions.len == 0) return false;
+        return switch (self.lir.insts.items[instructions[instructions.len - 1]].opcode) {
+            .br, .condbr, .ret, .ret_error, .ret_error_union, .unreachable_inst => true,
+            else => false,
+        };
+    }
+
+    fn hasRuntimeValue(self: *const LirBuilder, type_id: Type.Id) bool {
+        const ty = self.sema.type_pool.get(type_id);
+        return !(ty.data == .primitive and (ty.data.primitive == .void_type or ty.data.primitive == .noreturn_type));
+    }
+
+    fn lowerFor(self: *LirBuilder, node_idx: Node.Index) std.mem.Allocator.Error!?Inst.Index {
+        const node = self.sema.ast_tree.nodes.get(node_idx);
+        const extra_start = node.data.lhs;
+        const item_token = self.sema.ast_tree.extra_data[extra_start];
+        const index_token = self.sema.ast_tree.extra_data[extra_start + 1];
+        const range_node_idx = self.sema.ast_tree.extra_data[extra_start + 2];
+        const body_node = self.sema.ast_tree.extra_data[extra_start + 3];
+        const range_node = self.sema.ast_tree.nodes.get(range_node_idx);
+
+        const start_inst = try self.lowerNode(range_node.data.lhs) orelse return null;
+        const end_inst = try self.lowerNode(range_node.data.rhs) orelse return null;
+        const item_type = self.sema.node_types.get(range_node.data.lhs) orelse 0;
+        const item_addr = try self.emitInst(.{ .opcode = .addr, .type_id = item_type, .data = .{ .addr = item_token } });
+        _ = try self.emitInst(.{ .opcode = .store, .type_id = item_type, .data = .{ .store = .{ .ptr = item_addr, .val = start_inst } } });
+
+        const src = self.sema.diags.source_manager.getFile(0).?.content;
+        const item_tok = self.sema.ast_tree.tokens[item_token];
+        const item_name = src[item_tok.start..item_tok.end];
+        const previous_item = self.var_addresses.get(item_name);
+        try self.var_addresses.put(item_name, item_addr);
+        defer if (previous_item) |address| {
+            self.var_addresses.put(item_name, address) catch {};
+        } else {
+            _ = self.var_addresses.remove(item_name);
+        };
+
+        var index_addr: ?Inst.Index = null;
+        var index_name: ?[]const u8 = null;
+        var previous_index: ?u32 = null;
+        if (index_token != std.math.maxInt(u32)) {
+            const index_type = try self.sema.type_pool.internSizeInt(false);
+            const zero = try self.emitInst(.{ .opcode = .const_i, .type_id = index_type, .data = .{ .const_i = 0 } });
+            index_addr = try self.emitInst(.{ .opcode = .addr, .type_id = index_type, .data = .{ .addr = index_token } });
+            _ = try self.emitInst(.{ .opcode = .store, .type_id = index_type, .data = .{ .store = .{ .ptr = index_addr.?, .val = zero } } });
+            const index_tok = self.sema.ast_tree.tokens[index_token];
+            index_name = src[index_tok.start..index_tok.end];
+            previous_index = self.var_addresses.get(index_name.?);
+            try self.var_addresses.put(index_name.?, index_addr.?);
+        }
+        defer if (index_name) |name| {
+            if (previous_index) |address| {
+                self.var_addresses.put(name, address) catch {};
+            } else {
+                _ = self.var_addresses.remove(name);
+            }
+        };
+
+        const cond_block = try self.newBlock();
+        const body_block = try self.newBlock();
+        const increment_block = try self.newBlock();
+        const end_block = try self.newBlock();
+        _ = try self.emitInst(.{ .opcode = .br, .type_id = 0, .data = .{ .br = .{ .dest = cond_block } } });
+
+        self.current_block = cond_block;
+        const current_item = try self.emitInst(.{ .opcode = .load, .type_id = item_type, .data = .{ .load = .{ .ptr = item_addr } } });
+        const bool_type = try self.sema.type_pool.internPrimitive(.bool_type);
+        const condition = try self.emitInst(.{ .opcode = .icmp, .type_id = bool_type, .data = .{ .icmp = .{ .predicate = .lt, .lhs = current_item, .rhs = end_inst } } });
+        _ = try self.emitInst(.{ .opcode = .condbr, .type_id = 0, .data = .{ .condbr = .{ .cond = condition, .true_dest = body_block, .false_dest = end_block } } });
+
+        self.current_block = body_block;
+        try self.loop_stack.append(self.allocator, .{ .break_dest = end_block, .continue_dest = increment_block });
+        _ = try self.lowerNode(body_node);
+        _ = self.loop_stack.pop();
+        if (!self.currentBlockTerminated()) _ = try self.emitInst(.{ .opcode = .br, .type_id = 0, .data = .{ .br = .{ .dest = increment_block } } });
+
+        self.current_block = increment_block;
+        const item_value = try self.emitInst(.{ .opcode = .load, .type_id = item_type, .data = .{ .load = .{ .ptr = item_addr } } });
+        const one = try self.emitInst(.{ .opcode = .const_i, .type_id = item_type, .data = .{ .const_i = 1 } });
+        const next_item = try self.emitInst(.{ .opcode = .add, .type_id = item_type, .data = .{ .add = .{ .lhs = item_value, .rhs = one } } });
+        _ = try self.emitInst(.{ .opcode = .store, .type_id = item_type, .data = .{ .store = .{ .ptr = item_addr, .val = next_item } } });
+        if (index_addr) |address| {
+            const index_type = try self.sema.type_pool.internSizeInt(false);
+            const index_value = try self.emitInst(.{ .opcode = .load, .type_id = index_type, .data = .{ .load = .{ .ptr = address } } });
+            const index_one = try self.emitInst(.{ .opcode = .const_i, .type_id = index_type, .data = .{ .const_i = 1 } });
+            const next_index = try self.emitInst(.{ .opcode = .add, .type_id = index_type, .data = .{ .add = .{ .lhs = index_value, .rhs = index_one } } });
+            _ = try self.emitInst(.{ .opcode = .store, .type_id = index_type, .data = .{ .store = .{ .ptr = address, .val = next_index } } });
+        }
+        _ = try self.emitInst(.{ .opcode = .br, .type_id = 0, .data = .{ .br = .{ .dest = cond_block } } });
+
+        self.current_block = end_block;
+        return null;
     }
 
     pub fn printLir(self: *LirBuilder) void {
@@ -448,12 +687,17 @@ pub const LirBuilder = struct {
                     .sub => std.debug.print("%{d}, %{d}", .{ inst.data.sub.lhs, inst.data.sub.rhs }),
                     .mul => std.debug.print("%{d}, %{d}", .{ inst.data.mul.lhs, inst.data.mul.rhs }),
                     .div => std.debug.print("%{d}, %{d}", .{ inst.data.div.lhs, inst.data.div.rhs }),
+                    .icmp => std.debug.print("{s} %{d}, %{d}", .{ @tagName(inst.data.icmp.predicate), inst.data.icmp.lhs, inst.data.icmp.rhs }),
                     .addr => std.debug.print("local_{d}", .{inst.data.addr}),
                     .load => std.debug.print("ptr: %{d}", .{inst.data.load.ptr}),
                     .store => std.debug.print("ptr: %{d}, val: %{d}", .{ inst.data.store.ptr, inst.data.store.val }),
                     .br => std.debug.print("dest: block_{d}", .{inst.data.br.dest}),
                     .condbr => std.debug.print("cond: %{d}, true_dest: block_{d}, false_dest: block_{d}", .{ inst.data.condbr.cond, inst.data.condbr.true_dest, inst.data.condbr.false_dest }),
                     .ret => if (inst.data.ret) |r| std.debug.print("val: %{d}", .{r}) else std.debug.print("void", .{}),
+                    .ret_error => std.debug.print("tag: %{d}", .{inst.data.ret_error}),
+                    .ret_error_union => std.debug.print("value: %{d}", .{inst.data.ret_error_union}),
+                    .error_test => std.debug.print("value: %{d}", .{inst.data.error_test}),
+                    .error_payload => std.debug.print("value: %{d}", .{inst.data.error_payload}),
                     else => std.debug.print("...", .{}),
                 }
                 std.debug.print(" (type: {d})\n", .{inst.type_id});

@@ -4,7 +4,9 @@ const x86 = @import("x86_64.zig");
 const abi = @import("abi.zig");
 const ast_mod = @import("ast.zig");
 const Encoder = @import("x86_64_encoder.zig").Encoder;
+const Condition = @import("x86_64_encoder.zig").Condition;
 const Reg = x86.Register;
+const TypePool = @import("type.zig").TypePool;
 
 /// x86_64 code generator for zin0.
 /// Operates in two modes:
@@ -18,10 +20,12 @@ pub const X86Gen = struct {
 
     allocator: std.mem.Allocator,
     lir: *lir.Lir,
+    type_pool: *const TypePool,
     ast_tree: ast_mod.Ast,
     src: []const u8,
     vreg_to_op: std.AutoHashMap(lir.Inst.Index, Operand),
     addr_to_slot: std.AutoHashMap(u32, i32),
+    error_tag_slots: std.AutoHashMap(lir.Inst.Index, i32),
     next_gp_reg: u8,
     next_stack_slot: i32,
     /// Arena for block-label strings — freed as a batch after applyFixups
@@ -40,16 +44,19 @@ pub const X86Gen = struct {
     pub fn init(
         allocator: std.mem.Allocator,
         ir: *lir.Lir,
+        type_pool: *const TypePool,
         ast_tree: ast_mod.Ast,
         src: []const u8,
     ) X86Gen {
         return .{
             .allocator = allocator,
             .lir = ir,
+            .type_pool = type_pool,
             .ast_tree = ast_tree,
             .src = src,
             .vreg_to_op = std.AutoHashMap(lir.Inst.Index, Operand).init(allocator),
             .addr_to_slot = std.AutoHashMap(u32, i32).init(allocator),
+            .error_tag_slots = std.AutoHashMap(lir.Inst.Index, i32).init(allocator),
             .next_gp_reg = 0,
             .next_stack_slot = 8,
             .label_arena = std.heap.ArenaAllocator.init(allocator),
@@ -62,6 +69,7 @@ pub const X86Gen = struct {
     pub fn deinit(self: *X86Gen) void {
         self.vreg_to_op.deinit();
         self.addr_to_slot.deinit();
+        self.error_tag_slots.deinit();
         self.label_arena.deinit();
         self.rodata.deinit(self.allocator);
         self.string_offsets.deinit();
@@ -153,6 +161,40 @@ pub const X86Gen = struct {
         self.next_stack_slot += 8;
         try self.addr_to_slot.put(var_id, s);
         return s;
+    }
+
+    fn getOrAllocErrorTagSlot(self: *X86Gen, instruction: lir.Inst.Index) !i32 {
+        if (self.error_tag_slots.get(instruction)) |slot| return slot;
+        const slot = self.next_stack_slot;
+        self.next_stack_slot += 8;
+        try self.error_tag_slots.put(instruction, slot);
+        return slot;
+    }
+
+    fn isErrorUnion(self: *const X86Gen, type_id: u32) bool {
+        return type_id < self.type_pool.types.items.len and self.type_pool.get(type_id).data == .error_union;
+    }
+
+    fn condition(predicate: lir.CmpPredicate) Condition {
+        return switch (predicate) {
+            .eq => .equal,
+            .ne => .not_equal,
+            .lt => .less,
+            .le => .less_equal,
+            .gt => .greater,
+            .ge => .greater_equal,
+        };
+    }
+
+    fn conditionName(predicate: lir.CmpPredicate) []const u8 {
+        return switch (predicate) {
+            .eq => "e",
+            .ne => "ne",
+            .lt => "l",
+            .le => "le",
+            .gt => "g",
+            .ge => "ge",
+        };
     }
 
     // ── block label helpers ───────────────────────────────────────────────────
@@ -267,6 +309,22 @@ pub const X86Gen = struct {
                     try printOp(writer, op);
                     try writer.print(", rax\n", .{});
                 } else {
+                    try writer.print("  mov {s}, rax\n", .{op.reg});
+                }
+            },
+            .icmp => {
+                const op = try self.allocateOp(inst_idx);
+                const lhs = try self.allocateOp(inst.data.icmp.lhs);
+                const rhs = try self.allocateOp(inst.data.icmp.rhs);
+                const lhs_reg = try opToReg(writer, lhs, "rax");
+                const rhs_reg = try opToReg(writer, rhs, "rcx");
+                try writer.print("  cmp {s}, {s}\n", .{ lhs_reg, rhs_reg });
+                try writer.print("  mov rax, 0\n  set{s} al\n", .{conditionName(inst.data.icmp.predicate)});
+                if (op == .mem) {
+                    try writer.print("  mov ", .{});
+                    try printOp(writer, op);
+                    try writer.print(", rax\n", .{});
+                } else if (!std.mem.eql(u8, op.reg, "rax")) {
                     try writer.print("  mov {s}, rax\n", .{op.reg});
                 }
             },
@@ -392,12 +450,46 @@ pub const X86Gen = struct {
                     if (site.needs_stack_align) adjust += 8;
                     try writer.print("  add rsp, {d}\n", .{adjust});
                 }
+                if (self.isErrorUnion(inst.type_id)) {
+                    const tag_slot = try self.getOrAllocErrorTagSlot(inst_idx);
+                    try writer.print("  mov qword [rbp - {d}], rax\n", .{tag_slot});
+                    if (op == .mem) {
+                        try writer.print("  mov ", .{});
+                        try printOp(writer, op);
+                        try writer.print(", rdx\n", .{});
+                    } else if (!std.mem.eql(u8, op.reg, "rdx")) {
+                        try writer.print("  mov {s}, rdx\n", .{op.reg});
+                    }
+                } else if (op == .mem) {
+                    try writer.print("  mov ", .{});
+                    try printOp(writer, op);
+                    try writer.print(", rax\n", .{});
+                } else if (!std.mem.eql(u8, op.reg, "rax")) {
+                    try writer.print("  mov {s}, rax\n", .{op.reg});
+                }
+            },
+            .error_test => {
+                const op = try self.allocateOp(inst_idx);
+                const tag_slot = try self.getOrAllocErrorTagSlot(inst.data.error_test);
+                try writer.print("  mov rax, qword [rbp - {d}]\n", .{tag_slot});
                 if (op == .mem) {
                     try writer.print("  mov ", .{});
                     try printOp(writer, op);
                     try writer.print(", rax\n", .{});
                 } else if (!std.mem.eql(u8, op.reg, "rax")) {
                     try writer.print("  mov {s}, rax\n", .{op.reg});
+                }
+            },
+            .error_payload => {
+                const op = try self.allocateOp(inst_idx);
+                const payload = try self.allocateOp(inst.data.error_payload);
+                const payload_reg = try opToReg(writer, payload, "rax");
+                if (op == .mem) {
+                    try writer.print("  mov ", .{});
+                    try printOp(writer, op);
+                    try writer.print(", {s}\n", .{payload_reg});
+                } else if (!std.mem.eql(u8, op.reg, payload_reg)) {
+                    try writer.print("  mov {s}, {s}\n", .{ op.reg, payload_reg });
                 }
             },
             .br => try writer.print("  jmp .block_{d}\n", .{inst.data.br.dest}),
@@ -416,7 +508,14 @@ pub const X86Gen = struct {
                 try writer.print("  jmp .block_{d}\n", .{inst.data.condbr.false_dest});
             },
             .ret => {
-                if (inst.data.ret) |r| {
+                if (self.isErrorUnion(inst.type_id)) {
+                    try writer.print("  mov rax, 0\n", .{});
+                    if (inst.data.ret) |r| {
+                        const val_op = try self.allocateOp(r);
+                        const val_reg = try opToReg(writer, val_op, "rdx");
+                        if (!std.mem.eql(u8, val_reg, "rdx")) try writer.print("  mov rdx, {s}\n", .{val_reg});
+                    }
+                } else if (inst.data.ret) |r| {
                     const val_op = try self.allocateOp(r);
                     switch (val_op) {
                         .reg => |reg| {
@@ -429,6 +528,21 @@ pub const X86Gen = struct {
                         },
                     }
                 }
+                try writer.print("  mov rsp, rbp\n  pop rbp\n  ret\n", .{});
+            },
+            .ret_error => {
+                const tag_op = try self.allocateOp(inst.data.ret_error);
+                const tag_reg = try opToReg(writer, tag_op, "rax");
+                if (!std.mem.eql(u8, tag_reg, "rax")) try writer.print("  mov rax, {s}\n", .{tag_reg});
+                try writer.print("  mov rsp, rbp\n  pop rbp\n  ret\n", .{});
+            },
+            .ret_error_union => {
+                const source = inst.data.ret_error_union;
+                const tag_slot = try self.getOrAllocErrorTagSlot(source);
+                const payload = try self.allocateOp(source);
+                const payload_reg = try opToReg(writer, payload, "rdx");
+                try writer.print("  mov rax, qword [rbp - {d}]\n", .{tag_slot});
+                if (!std.mem.eql(u8, payload_reg, "rdx")) try writer.print("  mov rdx, {s}\n", .{payload_reg});
                 try writer.print("  mov rsp, rbp\n  pop rbp\n  ret\n", .{});
             },
             else => try writer.print("  ; [unhandled] {s}\n", .{@tagName(inst.opcode)}),
@@ -594,6 +708,21 @@ pub const X86Gen = struct {
                 _ = try self.allocateOp(inst_idx);
             },
 
+            .icmp => {
+                const op = try self.allocateOp(inst_idx);
+                const lhs = try self.allocateOp(inst.data.icmp.lhs);
+                const rhs = try self.allocateOp(inst.data.icmp.rhs);
+                const lhs_reg = try opToRegBin(enc, lhs, .rax);
+                const rhs_reg = try opToRegBin(enc, rhs, .rcx);
+                try enc.emitCmp(lhs_reg, rhs_reg);
+                const dst_reg = switch (op) {
+                    .reg => |reg| nameToReg(reg),
+                    .mem => .rax,
+                };
+                try enc.emitSetcc(dst_reg, condition(inst.data.icmp.predicate));
+                if (op == .mem) try enc.emitMovMemReg(op.mem, .rax);
+            },
+
             // ── memory ───────────────────────────────────────────────────────
             .addr => {
                 const op = try self.allocateOp(inst_idx);
@@ -713,10 +842,39 @@ pub const X86Gen = struct {
                     },
                 }
 
-                // Move return value
-                switch (op) {
+                // Error unions return the tag in rax and the first integer payload in rdx.
+                if (self.isErrorUnion(inst.type_id)) {
+                    const tag_slot = try self.getOrAllocErrorTagSlot(inst_idx);
+                    try enc.emitMovMemReg(tag_slot, .rax);
+                    switch (op) {
+                        .reg => |r| try enc.emitMovRegReg(nameToReg(r), .rdx),
+                        .mem => |m| try enc.emitMovMemReg(m, .rdx),
+                    }
+                } else switch (op) {
                     .reg => |r| try enc.emitMovRegReg(nameToReg(r), .rax),
                     .mem => |m| try enc.emitMovMemReg(m, .rax),
+                }
+            },
+
+            .error_test => {
+                const op = try self.allocateOp(inst_idx);
+                const tag_slot = try self.getOrAllocErrorTagSlot(inst.data.error_test);
+                switch (op) {
+                    .reg => |reg| try enc.emitMovRegMem(nameToReg(reg), tag_slot),
+                    .mem => |slot| {
+                        try enc.emitMovRegMem(.rax, tag_slot);
+                        try enc.emitMovMemReg(slot, .rax);
+                    },
+                }
+            },
+
+            .error_payload => {
+                const op = try self.allocateOp(inst_idx);
+                const payload = try self.allocateOp(inst.data.error_payload);
+                const payload_reg = try opToRegBin(enc, payload, .rax);
+                switch (op) {
+                    .reg => |reg| try enc.emitMovRegReg(nameToReg(reg), payload_reg),
+                    .mem => |slot| try enc.emitMovMemReg(slot, payload_reg),
                 }
             },
 
@@ -737,11 +895,39 @@ pub const X86Gen = struct {
             },
 
             .ret => {
-                if (inst.data.ret) |r| {
+                if (self.isErrorUnion(inst.type_id)) {
+                    try enc.emitMovRegImm64(.rax, 0);
+                    if (inst.data.ret) |r| {
+                        const val_op = try self.allocateOp(r);
+                        const val_r = try opToRegBin(enc, val_op, .rdx);
+                        try enc.emitMovRegReg(.rdx, val_r);
+                    }
+                } else if (inst.data.ret) |r| {
                     const val_op = try self.allocateOp(r);
                     const val_r = try opToRegBin(enc, val_op, .rax);
                     try enc.emitMovRegReg(.rax, val_r);
                 }
+                try enc.emitMovRspRbp();
+                try enc.emitPopRbp();
+                try enc.emitRet();
+            },
+
+            .ret_error => {
+                const tag_op = try self.allocateOp(inst.data.ret_error);
+                const tag_reg = try opToRegBin(enc, tag_op, .rax);
+                try enc.emitMovRegReg(.rax, tag_reg);
+                try enc.emitMovRspRbp();
+                try enc.emitPopRbp();
+                try enc.emitRet();
+            },
+
+            .ret_error_union => {
+                const source = inst.data.ret_error_union;
+                const tag_slot = try self.getOrAllocErrorTagSlot(source);
+                const payload_op = try self.allocateOp(source);
+                const payload_reg = try opToRegBin(enc, payload_op, .rdx);
+                try enc.emitMovRegMem(.rax, tag_slot);
+                try enc.emitMovRegReg(.rdx, payload_reg);
                 try enc.emitMovRspRbp();
                 try enc.emitPopRbp();
                 try enc.emitRet();

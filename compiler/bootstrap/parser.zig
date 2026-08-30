@@ -629,6 +629,8 @@ pub const Parser = struct {
             .keyword_return => {
                 return self.parseReturnStatement();
             },
+            .keyword_break => return self.parseBreakStatement(),
+            .keyword_continue => return self.parseContinueStatement(),
             else => {
                 return self.parseExpr(0);
             },
@@ -877,6 +879,7 @@ pub const Parser = struct {
             },
             .keyword_if => return self.parseIfExpr(),
             .keyword_while => return self.parseWhileLoop(),
+            .keyword_for => return self.parseForLoop(),
             .keyword_return => {
                 return self.parseReturnStatement();
             },
@@ -1151,6 +1154,113 @@ pub const Parser = struct {
         return @as(u32, @intCast(self.nodes.len - 1));
     }
 
+    fn parseForLoop(self: *Parser) !?Node.Index {
+        self.traceRuleEnter("parseForLoop");
+        defer self.traceRuleExit("parseForLoop");
+        const start_tok = self.index;
+        self.consumeToken("Consume for");
+
+        if (self.index >= self.tokens.len or self.tokens[self.index].tag != .ident) {
+            try self.reportError(2002, "Expected for-loop item capture");
+            return null;
+        }
+        const item_token = self.index;
+        self.consumeToken("Consume for-loop item capture");
+
+        var index_token: u32 = std.math.maxInt(u32);
+        if (self.index < self.tokens.len and self.tokens[self.index].tag == .comma) {
+            self.consumeToken("Consume for-loop capture comma");
+            if (self.index >= self.tokens.len or self.tokens[self.index].tag != .ident) {
+                try self.reportError(2002, "Expected for-loop index capture");
+                return null;
+            }
+            index_token = self.index;
+            self.consumeToken("Consume for-loop index capture");
+        }
+
+        if (self.index >= self.tokens.len or self.tokens[self.index].tag != .keyword_in) {
+            try self.reportError(2001, "Expected 'in' after for-loop capture");
+            return null;
+        }
+        self.consumeToken("Consume in");
+
+        const range_start = try self.parseExpr(0) orelse return null;
+        var iterable = range_start;
+        if (self.index < self.tokens.len and self.tokens[self.index].tag == .dot_dot) {
+            const range_token = self.index;
+            self.consumeToken("Consume range '..'");
+            const range_end = try self.parseExpr(0) orelse return null;
+            try self.nodes.append(self.allocator, .{
+                .tag = .range,
+                .main_token = range_token,
+                .data = .{ .lhs = range_start, .rhs = range_end },
+            });
+            iterable = @intCast(self.nodes.len - 1);
+        }
+
+        const body = try self.parseBlock() orelse return null;
+        const extra_start: u32 = @intCast(self.extra_data.items.len);
+        try self.extra_data.appendSlice(self.allocator, &.{ item_token, index_token, iterable, body });
+        try self.nodes.append(self.allocator, .{
+            .tag = .for_stmt,
+            .main_token = start_tok,
+            .data = .{ .lhs = extra_start, .rhs = extra_start + 4 },
+        });
+        return @intCast(self.nodes.len - 1);
+    }
+
+    fn parseBreakStatement(self: *Parser) !?Node.Index {
+        const break_token = self.index;
+        self.consumeToken("Consume break");
+        var label_token: u32 = std.math.maxInt(u32);
+        if (self.index < self.tokens.len and self.tokens[self.index].tag == .colon) {
+            self.consumeToken("Consume break label ':'");
+            if (self.index >= self.tokens.len or self.tokens[self.index].tag != .ident) {
+                try self.reportError(2002, "Expected break label");
+                return null;
+            }
+            label_token = self.index;
+            self.consumeToken("Consume break label");
+        }
+
+        var value_node: Node.Index = std.math.maxInt(u32);
+        if (self.index < self.tokens.len) {
+            const next = self.tokens[self.index].tag;
+            if (next != .statement_end and next != .r_brace and next != .eof) {
+                value_node = try self.parseExpr(0) orelse return null;
+            }
+        }
+        if (self.index < self.tokens.len and self.tokens[self.index].tag == .statement_end) self.index += 1;
+        try self.nodes.append(self.allocator, .{
+            .tag = .break_stmt,
+            .main_token = break_token,
+            .data = .{ .lhs = label_token, .rhs = value_node },
+        });
+        return @intCast(self.nodes.len - 1);
+    }
+
+    fn parseContinueStatement(self: *Parser) !?Node.Index {
+        const continue_token = self.index;
+        self.consumeToken("Consume continue");
+        var label_token: u32 = std.math.maxInt(u32);
+        if (self.index < self.tokens.len and self.tokens[self.index].tag == .colon) {
+            self.consumeToken("Consume continue label ':'");
+            if (self.index >= self.tokens.len or self.tokens[self.index].tag != .ident) {
+                try self.reportError(2002, "Expected continue label");
+                return null;
+            }
+            label_token = self.index;
+            self.consumeToken("Consume continue label");
+        }
+        if (self.index < self.tokens.len and self.tokens[self.index].tag == .statement_end) self.index += 1;
+        try self.nodes.append(self.allocator, .{
+            .tag = .continue_stmt,
+            .main_token = continue_token,
+            .data = .{ .lhs = label_token, .rhs = std.math.maxInt(u32) },
+        });
+        return @intCast(self.nodes.len - 1);
+    }
+
     fn recover(self: *Parser) void {
         const start_index = self.index;
         while (self.index < self.tokens.len) {
@@ -1202,9 +1312,16 @@ pub const Parser = struct {
 
     fn getBindingPower(tag: Tag) BindingPower {
         return switch (tag) {
+            .equal => .{ .left = 10, .right = 10 },
             .asterisk, .slash, .percent => .{ .left = 50, .right = 51 },
             .plus, .minus => .{ .left = 40, .right = 41 },
-            .equal_equal, .bang_equal, .angle_bracket_left => .{ .left = 30, .right = 31 },
+            .equal_equal,
+            .bang_equal,
+            .angle_bracket_left,
+            .angle_bracket_left_equal,
+            .angle_bracket_right,
+            .angle_bracket_right_equal,
+            => .{ .left = 30, .right = 31 },
             .plus_shl, .ampersand_shl => .{ .left = 20, .right = 21 }, // shift combines
             else => .{ .left = 0, .right = 0 },
         };

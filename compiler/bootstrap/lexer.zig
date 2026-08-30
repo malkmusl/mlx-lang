@@ -181,11 +181,9 @@ pub const Lexer = struct {
                         return self.emit(result);
                     },
                 },
-                .int_or_float => switch (c) {
-                    'a'...'z', 'A'...'Z', '0'...'9', '.', '_' => {
-                        self.index += 1;
-                    },
-                    else => {
+                .int_or_float => {
+                    // `..` starts a range and is never part of a floating literal.
+                    if (c == '.' and self.index + 1 < self.buffer.len and self.buffer[self.index + 1] == '.') {
                         const number = self.buffer[result.start..self.index];
                         const is_hex = std.mem.startsWith(u8, number, "0x") or std.mem.startsWith(u8, number, "0X");
                         const has_fraction = std.mem.indexOfScalar(u8, number, '.') != null;
@@ -196,7 +194,24 @@ pub const Lexer = struct {
                         result.tag = if (has_fraction or has_exponent) .float else .integer;
                         result.end = self.index;
                         return self.emit(result);
-                    },
+                    }
+                    switch (c) {
+                        'a'...'z', 'A'...'Z', '0'...'9', '.', '_' => {
+                            self.index += 1;
+                        },
+                        else => {
+                            const number = self.buffer[result.start..self.index];
+                            const is_hex = std.mem.startsWith(u8, number, "0x") or std.mem.startsWith(u8, number, "0X");
+                            const has_fraction = std.mem.indexOfScalar(u8, number, '.') != null;
+                            const has_exponent = if (is_hex)
+                                std.mem.indexOfAny(u8, number, "pP") != null
+                            else
+                                std.mem.indexOfAny(u8, number, "eE") != null;
+                            result.tag = if (has_fraction or has_exponent) .float else .integer;
+                            result.end = self.index;
+                            return self.emit(result);
+                        },
+                    }
                 },
                 .string_literal => switch (c) {
                     0 => {
@@ -675,6 +690,10 @@ test "lexer: keywords and identifiers" {
 
 test "lexer: numbers and strings (simple)" {
     try expectTokens("123 3.14 \"hello\" 'a'", &.{ .integer, .float, .string, .char });
+}
+
+test "lexer: integer range is not a float" {
+    try expectTokens("0..8", &.{ .integer, .dot_dot, .integer });
 }
 
 test "lexer: basic operators" {

@@ -12,6 +12,7 @@ pub const Opcode = enum {
     mul,
     div,
     rem,
+    icmp,
 
     // Memory
     load,
@@ -26,13 +27,28 @@ pub const Opcode = enum {
     call,
     syscall,
     ret,
+    ret_error,
+    ret_error_union,
     unreachable_inst,
     param,
+
+    // Error unions
+    error_test,
+    error_payload,
 
     // Builtins and Literals
     builtin_sym,
     string_literal,
     tuple_literal,
+};
+
+pub const CmpPredicate = enum {
+    eq,
+    ne,
+    lt,
+    le,
+    gt,
+    ge,
 };
 
 pub const Inst = struct {
@@ -48,6 +64,7 @@ pub const Inst = struct {
         mul: struct { lhs: Index, rhs: Index },
         div: struct { lhs: Index, rhs: Index },
         rem: struct { lhs: Index, rhs: Index },
+        icmp: struct { predicate: CmpPredicate, lhs: Index, rhs: Index },
 
         load: struct { ptr: Index },
         store: struct { ptr: Index, val: Index },
@@ -60,8 +77,13 @@ pub const Inst = struct {
         call: struct { func: Index, args_start: u32, args_count: u32 },
         syscall: u32, // extra_start, first elem is arg_count
         ret: ?Index,
+        ret_error: Index,
+        ret_error_union: Index,
         unreachable_inst: void,
         param: u32, // Parameter index
+
+        error_test: Index,
+        error_payload: Index,
 
         builtin_sym: u32,
         string_literal: u32, // AST node index
