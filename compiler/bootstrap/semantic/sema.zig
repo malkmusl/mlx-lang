@@ -24,6 +24,7 @@ const LoopContext = struct {
 };
 
 pub const Sema = struct {
+    const trace_enabled = false;
     allocator: std.mem.Allocator,
     ast_tree: ast.Ast,
     diags: *DiagnosticEngine,
@@ -36,9 +37,12 @@ pub const Sema = struct {
     node_types: std.AutoHashMap(Node.Index, Type.Id),
     // Comptime values materialized by builtin evaluation.
     const_values: std.AutoHashMap(Node.Index, u64),
-    // Type-valued expressions map to the type value they denote.
+    // Comptime evaluated type values
     type_values: std.AutoHashMap(Node.Index, Type.Id),
-    unsafe_depth: u32,
+
+    resolved_decls: std.AutoHashMap(Node.Index, Node.Index),
+
+    unsafe_depth: u32 = 0,
     eval_branch_quota: u64,
     current_return_type: ?Type.Id,
     loop_stack: std.ArrayList(LoopContext),
@@ -60,6 +64,7 @@ pub const Sema = struct {
             .node_types = std.AutoHashMap(Node.Index, Type.Id).init(allocator),
             .const_values = std.AutoHashMap(Node.Index, u64).init(allocator),
             .type_values = std.AutoHashMap(Node.Index, Type.Id).init(allocator),
+            .resolved_decls = std.AutoHashMap(Node.Index, Node.Index).init(allocator),
             .unsafe_depth = 0,
             .eval_branch_quota = 1_000_000,
             .current_return_type = null,
@@ -72,12 +77,13 @@ pub const Sema = struct {
         self.node_types.deinit();
         self.const_values.deinit();
         self.type_values.deinit();
+        self.resolved_decls.deinit();
         self.loop_stack.deinit(self.allocator);
     }
 
     pub fn analyze(self: *Sema) !void {
-        std.debug.print("-> ENTER: Sema.analyze\n", .{});
-        defer std.debug.print("<- EXIT: Sema.analyze\n", .{});
+        if (trace_enabled) std.debug.print("-> ENTER: Sema.analyze\n", .{});
+        defer if (trace_enabled) std.debug.print("<- EXIT: Sema.analyze\n", .{});
         // Traverse the AST starting from the root
         const root_node = self.ast_tree.nodes.get(self.ast_tree.nodes.len - 1);
         if (root_node.tag != .root) return error.InvalidAst;
@@ -88,15 +94,15 @@ pub const Sema = struct {
         var i: u32 = extra_start;
         while (i < extra_end) : (i += 1) {
             const child_idx = self.ast_tree.extra_data[i];
-            std.debug.print("   SEMA: Analyzing root child node {d}\n", .{child_idx});
+            if (trace_enabled) std.debug.print("   SEMA: Analyzing root child node {d}\n", .{child_idx});
             _ = try self.analyzeNode(child_idx, self.root_scope);
         }
     }
 
     pub fn analyzeNode(self: *Sema, node_idx: Node.Index, scope: *Scope) std.mem.Allocator.Error!Type.Id {
         const node = self.ast_tree.nodes.get(node_idx);
-        std.debug.print("-> ENTER: Sema.analyzeNode | Tag: {s}\n", .{@tagName(node.tag)});
-        defer std.debug.print("<- EXIT: Sema.analyzeNode | Tag: {s}\n", .{@tagName(node.tag)});
+        if (trace_enabled) std.debug.print("-> ENTER: Sema.analyzeNode | Tag: {s}\n", .{@tagName(node.tag)});
+        defer if (trace_enabled) std.debug.print("<- EXIT: Sema.analyzeNode | Tag: {s}\n", .{@tagName(node.tag)});
 
         switch (node.tag) {
             .integer_literal => {
@@ -147,6 +153,7 @@ pub const Sema = struct {
                             try self.reportError(6001, .sema, tok.start, "Use of moved value");
                         }
                     }
+                    try self.resolved_decls.put(node_idx, sym.decl_node);
                     try self.node_types.put(node_idx, sym.type_id);
                     return sym.type_id;
                 }
@@ -156,6 +163,7 @@ pub const Sema = struct {
                 // its body is still analyzed in the normal source traversal.
                 if (self.findRootFunction(ident_name)) |function_decl| {
                     const function_type = try self.declareFunction(function_decl, self.root_scope);
+                    try self.resolved_decls.put(node_idx, function_decl);
                     try self.node_types.put(node_idx, function_type);
                     return function_type;
                 }
@@ -234,7 +242,7 @@ pub const Sema = struct {
                         var to_buf: [64]u8 = undefined;
                         const from_name = self.type_pool.typeName(inferred_type, &from_buf) catch "<unknown>";
                         const to_name = self.type_pool.typeName(declared_type, &to_buf) catch "<unknown>";
-                        std.debug.print("TYPE ERROR: cannot coerce '{s}' to '{s}' for variable '{s}'\n", .{ from_name, to_name, name });
+                        if (trace_enabled) std.debug.print("TYPE ERROR: cannot coerce '{s}' to '{s}' for variable '{s}'\n", .{ from_name, to_name, name });
                         try self.reportError(4001, .sema, ident_tok.start, "Type mismatch");
                     }
                 }
@@ -243,7 +251,7 @@ pub const Sema = struct {
                 {
                     var name_buf: [64]u8 = undefined;
                     const type_name = self.type_pool.typeName(declared_type, &name_buf) catch "<unknown>";
-                    std.debug.print("[sema] {s} {s}: {s}\n", .{
+                    if (trace_enabled) std.debug.print("[sema] {s} {s}: {s}\n", .{
                         if (node.tag == .const_decl) "const" else "var",
                         name,
                         type_name,
@@ -268,8 +276,8 @@ pub const Sema = struct {
                     var vm = comptime_vm.ComptimeVM.init(self.allocator, self.ast_tree, self);
                     const val = vm.evaluate(init_node, src);
                     switch (val) {
-                        .integer => |i| std.debug.print("[comptime] '{s}' = {d}\n", .{ name, i }),
-                        .err => |e| std.debug.print("[comptime] '{s}' cannot be evaluated at compile time: {s}\n", .{ name, e }),
+                        .integer => |i| if (trace_enabled) std.debug.print("[comptime] '{s}' = {d}\n", .{ name, i }),
+                        .err => |e| if (trace_enabled) std.debug.print("[comptime] '{s}' cannot be evaluated at compile time: {s}\n", .{ name, e }),
                     }
                 }
 

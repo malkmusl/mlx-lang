@@ -3,6 +3,7 @@ const ast = @import("../syntax/ast.zig");
 const Node = ast.Node;
 
 pub const ComptimeVM = struct {
+    const trace_enabled = false;
     pub const Value = union(enum) {
         integer: u64,
         err: []const u8,
@@ -26,8 +27,8 @@ pub const ComptimeVM = struct {
         if (sema.type_values.get(node_idx)) |type_value| return .{ .integer = type_value };
 
         const node = self.ast_tree.nodes.get(node_idx);
-        std.debug.print("-> ENTER: ComptimeVM.evaluate | Tag: {s}\n", .{@tagName(node.tag)});
-        defer std.debug.print("<- EXIT: ComptimeVM.evaluate | Tag: {s}\n", .{@tagName(node.tag)});
+        if (trace_enabled) std.debug.print("-> ENTER: ComptimeVM.evaluate | Tag: {s}\n", .{@tagName(node.tag)});
+        defer if (trace_enabled) std.debug.print("<- EXIT: ComptimeVM.evaluate | Tag: {s}\n", .{@tagName(node.tag)});
 
         switch (node.tag) {
             .integer_literal => {

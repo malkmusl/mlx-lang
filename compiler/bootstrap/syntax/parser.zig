@@ -19,6 +19,8 @@ pub const Parser = struct {
     source_id: u32,
     trace_level: u32,
 
+    const trace_enabled = false;
+
     pub fn init(allocator: std.mem.Allocator, tokens: []const Token, diags: *DiagnosticEngine, source_id: u32) Parser {
         return .{
             .allocator = allocator,
@@ -33,6 +35,7 @@ pub const Parser = struct {
     }
 
     fn printIndent(self: *Parser) void {
+        if (!trace_enabled) return;
         var i: u32 = 0;
         while (i < self.trace_level) : (i += 1) {
             std.debug.print("  ", .{});
@@ -40,18 +43,21 @@ pub const Parser = struct {
     }
 
     fn traceRuleEnter(self: *Parser, name: []const u8) void {
+        if (!trace_enabled) return;
         self.printIndent();
         std.debug.print("-> ENTER: {s}\n", .{name});
         self.trace_level += 1;
     }
 
     fn traceRuleExit(self: *Parser, name: []const u8) void {
+        if (!trace_enabled) return;
         if (self.trace_level > 0) self.trace_level -= 1;
         self.printIndent();
         std.debug.print("<- EXIT: {s}\n", .{name});
     }
 
     fn traceToken(self: *Parser, msg: []const u8, tok: Token) void {
+        if (!trace_enabled) return;
         if (self.diags.source_manager.getFile(self.source_id)) |file| {
             const snippet = file.content[tok.start..@min(tok.end, file.content.len)];
             self.printIndent();

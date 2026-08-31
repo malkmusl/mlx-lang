@@ -45,4 +45,14 @@ pub fn build(b: *std.Build) void {
     const run_test = b.addRunArtifact(test_exe);
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_test.step);
+
+    const lsp_test_exe = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("compiler/bootstrap/lsp.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_lsp_test = b.addRunArtifact(lsp_test_exe);
+    test_step.dependOn(&run_lsp_test.step);
 }
