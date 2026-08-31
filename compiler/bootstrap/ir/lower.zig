@@ -8,7 +8,13 @@ const Lir = @import("lir.zig").Lir;
 const Inst = @import("lir.zig").Inst;
 const builtin = @import("../semantic/builtin.zig");
 const postfix = @import("lowering/postfix.zig");
+const prefix = @import("lowering/prefix.zig");
 const operator_lowering = @import("lowering/operators.zig");
+const cleanup_lowering = @import("lowering/cleanup.zig");
+const match_lowering = @import("lowering/match.zig");
+const aggregate_lowering = @import("lowering/aggregate.zig");
+const generic_definition = @import("../semantic/generics/definition.zig");
+const conditional_lowering = @import("lowering/conditional.zig");
 
 const LoopTargets = struct {
     label_token: u32,
@@ -16,6 +22,12 @@ const LoopTargets = struct {
     continue_dest: u32,
     result_addr: ?Inst.Index = null,
     result_type: Type.Id = 0,
+    cleanup_depth: usize = 0,
+};
+
+const Cleanup = struct {
+    node_index: Node.Index,
+    error_only: bool,
 };
 
 pub const LirBuilder = struct {
@@ -30,6 +42,8 @@ pub const LirBuilder = struct {
     param_counter: u32 = 0,
     current_return_type: ?Type.Id,
     loop_stack: std.ArrayList(LoopTargets),
+    cleanup_stack: std.ArrayList(Cleanup),
+    current_generic_instance: ?u32 = null,
 
     pub fn init(allocator: std.mem.Allocator, sema: *Sema) LirBuilder {
         return .{
@@ -43,6 +57,7 @@ pub const LirBuilder = struct {
             .synthetic_local_counter = std.math.maxInt(u32),
             .current_return_type = null,
             .loop_stack = std.ArrayList(LoopTargets).empty,
+            .cleanup_stack = std.ArrayList(Cleanup).empty,
         };
     }
 
@@ -51,6 +66,7 @@ pub const LirBuilder = struct {
         self.var_slice_lengths.deinit();
         self.slice_lengths.deinit();
         self.loop_stack.deinit(self.allocator);
+        self.cleanup_stack.deinit(self.allocator);
         self.lir.deinit();
     }
 
@@ -62,6 +78,17 @@ pub const LirBuilder = struct {
         try self.lir.blocks.append(self.allocator, @import("lir.zig").BasicBlock.init());
         self.current_block = 0;
 
+        try self.generateCurrentModule();
+    }
+
+    pub fn generateModule(self: *LirBuilder, module_sema: *Sema) !void {
+        const previous = self.sema;
+        self.sema = module_sema;
+        defer self.sema = previous;
+        try self.generateCurrentModule();
+    }
+
+    fn generateCurrentModule(self: *LirBuilder) !void {
         const root_node = self.sema.ast_tree.nodes.get(self.sema.ast_tree.nodes.len - 1);
         if (root_node.tag != .root) return error.InvalidAst;
 
@@ -71,8 +98,29 @@ pub const LirBuilder = struct {
         var i: u32 = extra_start;
         while (i < extra_end) : (i += 1) {
             const child_idx = self.sema.ast_tree.extra_data[i];
+            if (generic_definition.isGeneric(&self.sema.ast_tree, child_idx)) continue;
             _ = try self.lowerNode(child_idx);
         }
+        var instance_id: u32 = 0;
+        while (instance_id < self.sema.generic_instances.items.len) : (instance_id += 1) {
+            try self.lowerGenericInstance(instance_id);
+        }
+    }
+
+    fn lowerGenericInstance(self: *LirBuilder, instance_id: u32) !void {
+        const function = self.sema.type_pool.get(self.sema.generic_instances.items[instance_id].function_type).data.function;
+        const return_type = self.sema.type_pool.get(function.ret_type);
+        if (return_type.data == .primitive and return_type.data.primitive == .type_type) return;
+        const TypeMap = std.AutoHashMap(Node.Index, Type.Id);
+        const ValueMap = std.AutoHashMap(Node.Index, u64);
+        std.mem.swap(TypeMap, &self.sema.node_types, &self.sema.generic_instances.items[instance_id].node_types);
+        std.mem.swap(ValueMap, &self.sema.const_values, &self.sema.generic_instances.items[instance_id].const_values);
+        defer std.mem.swap(TypeMap, &self.sema.node_types, &self.sema.generic_instances.items[instance_id].node_types);
+        defer std.mem.swap(ValueMap, &self.sema.const_values, &self.sema.generic_instances.items[instance_id].const_values);
+        const previous = self.current_generic_instance;
+        self.current_generic_instance = instance_id;
+        defer self.current_generic_instance = previous;
+        _ = try self.lowerNode(self.sema.generic_instances.items[instance_id].declaration);
     }
 
     pub fn emitInst(self: *LirBuilder, inst: Inst) !Inst.Index {
@@ -99,10 +147,10 @@ pub const LirBuilder = struct {
         switch (node.tag) {
             .integer_literal => {
                 const type_id = self.sema.node_types.get(node_idx) orelse return null;
-                const src = self.sema.diags.source_manager.getFile(0).?.content;
+                const src = self.sema.diags.source_manager.getFile(self.sema.source_id).?.content;
                 const tok = self.sema.ast_tree.tokens[node.main_token];
                 const text = src[tok.start..tok.end];
-                const val = std.fmt.parseInt(u64, text, 10) catch 0;
+                const val = std.fmt.parseInt(u64, text, 0) catch 0;
 
                 result = try self.emitInst(.{
                     .opcode = .const_i,
@@ -113,7 +161,7 @@ pub const LirBuilder = struct {
             },
             .float_literal => {
                 const type_id = self.sema.node_types.get(node_idx) orelse return null;
-                const source = self.sema.diags.source_manager.getFile(0).?.content;
+                const source = self.sema.diags.source_manager.getFile(self.sema.source_id).?.content;
                 const token = self.sema.ast_tree.tokens[node.main_token];
                 const value = std.fmt.parseFloat(f64, source[token.start..token.end]) catch 0;
                 result = try self.emitInst(.{
@@ -133,6 +181,15 @@ pub const LirBuilder = struct {
                 });
                 return result;
             },
+            .null_literal, .undefined_literal => {
+                const type_id = self.sema.node_types.get(node_idx) orelse return null;
+                return try self.emitInst(.{ .opcode = .const_i, .type_id = type_id, .data = .{ .const_i = 0 } });
+            },
+            .enum_literal => {
+                const type_id = self.sema.node_types.get(node_idx) orelse return null;
+                const value = self.sema.const_values.get(node_idx) orelse 0;
+                return try self.emitInst(.{ .opcode = .const_i, .type_id = type_id, .data = .{ .const_i = value } });
+            },
             .binary_op => return operator_lowering.lower(self, node_idx),
             .const_decl => {
                 // New layout: lhs = ident_tok, rhs = extra_start
@@ -141,14 +198,15 @@ pub const LirBuilder = struct {
                 const ident_tok_idx = node.data.lhs;
                 const extra_start = node.data.rhs;
                 const expr_node = self.sema.ast_tree.extra_data[extra_start + 1];
+                const type_id = self.sema.node_types.get(node_idx) orelse 0;
+                const declaration_type = self.sema.type_pool.get(type_id);
+                if (declaration_type.data == .primitive and declaration_type.data.primitive == .type_type) return null;
 
                 const tok = self.sema.ast_tree.tokens[ident_tok_idx];
-                const src = self.sema.diags.source_manager.getFile(0).?.content;
+                const src = self.sema.diags.source_manager.getFile(self.sema.source_id).?.content;
                 const ident_name = src[tok.start..tok.end];
 
                 const expr_inst = (try self.lowerNode(expr_node)) orelse return null;
-                const type_id = self.sema.node_types.get(node_idx) orelse 0;
-
                 const addr_inst = try self.emitInst(.{
                     .opcode = .addr,
                     .type_id = type_id,
@@ -177,7 +235,7 @@ pub const LirBuilder = struct {
                 const rhs_inst = try self.lowerNode(init_node) orelse return null;
 
                 const tok = self.sema.ast_tree.tokens[ident_tok_idx];
-                const src = self.sema.diags.source_manager.getFile(0).?.content;
+                const src = self.sema.diags.source_manager.getFile(self.sema.source_id).?.content;
                 const ident_name = src[tok.start..tok.end];
 
                 const addr_inst = try self.emitInst(.{
@@ -199,18 +257,24 @@ pub const LirBuilder = struct {
             },
             .identifier => {
                 const type_id = self.sema.node_types.get(node_idx) orelse return null;
+                if (self.sema.const_values.get(node_idx)) |value| {
+                    return try self.emitInst(.{ .opcode = .const_i, .type_id = type_id, .data = .{ .const_i = value } });
+                }
                 const type_data = self.sema.type_pool.types.items[type_id];
 
                 if (type_data.data == .function) {
+                    const token = self.sema.ast_tree.tokens[node.main_token];
+                    const source = self.sema.diags.source_manager.getFile(self.sema.source_id).?.content;
+                    const symbol = try self.lir.internModuleSymbol(self.sema.module_id orelse 0, source[token.start..token.end]);
                     return try self.emitInst(.{
                         .opcode = .func_sym,
                         .type_id = type_id,
-                        .data = .{ .func_sym = node_idx },
+                        .data = .{ .func_sym = symbol },
                     });
                 }
 
                 const tok = self.sema.ast_tree.tokens[self.sema.ast_tree.nodes.get(node_idx).main_token];
-                const src = self.sema.diags.source_manager.getFile(0).?.content;
+                const src = self.sema.diags.source_manager.getFile(self.sema.source_id).?.content;
                 const ident_name = src[tok.start..tok.end];
 
                 const addr_inst = self.var_addresses.get(ident_name) orelse return null;
@@ -226,6 +290,8 @@ pub const LirBuilder = struct {
             .block => {
                 const extra_start = node.data.lhs;
                 const extra_end = node.data.rhs;
+                const cleanup_marker = self.cleanup_stack.items.len;
+                defer self.cleanup_stack.shrinkRetainingCapacity(cleanup_marker);
 
                 var i: u32 = extra_start;
                 var last_inst: ?Inst.Index = null;
@@ -235,67 +301,11 @@ pub const LirBuilder = struct {
                     if (self.currentBlockTerminated()) break;
                 }
 
+                if (!self.currentBlockTerminated()) try self.emitCleanups(cleanup_marker, false);
+
                 return last_inst;
             },
-            .if_stmt => {
-                const extra_start = node.data.lhs;
-                const extra_end = node.data.rhs;
-
-                const cond_idx = self.sema.ast_tree.extra_data[extra_start];
-                const cond_inst = (try self.lowerNode(cond_idx)) orelse return null;
-
-                const then_block = try self.newBlock();
-                const else_block = try self.newBlock();
-                const merge_block = try self.newBlock();
-
-                const has_else = extra_end > extra_start + 2;
-                const result_type = self.sema.node_types.get(node_idx) orelse 0;
-                const result_value = has_else and self.hasRuntimeValue(result_type);
-                const result_addr = if (result_value)
-                    try self.emitInst(.{
-                        .opcode = .addr,
-                        .type_id = result_type,
-                        .data = .{ .addr = 0xc000_0000 | node_idx },
-                    })
-                else
-                    null;
-
-                _ = try self.emitInst(.{
-                    .opcode = .condbr,
-                    .type_id = 0,
-                    .data = .{ .condbr = .{ .cond = cond_inst, .true_dest = then_block, .false_dest = if (has_else) else_block else merge_block } },
-                });
-
-                // Then branch
-                self.current_block = then_block;
-                const then_idx = self.sema.ast_tree.extra_data[extra_start + 1];
-                const then_inst = try self.lowerNode(then_idx);
-                if (!self.currentBlockTerminated()) {
-                    if (result_addr) |addr| {
-                        if (then_inst) |value| _ = try self.emitInst(.{ .opcode = .store, .type_id = result_type, .data = .{ .store = .{ .ptr = addr, .val = value } } });
-                    }
-                    _ = try self.emitInst(.{ .opcode = .br, .type_id = 0, .data = .{ .br = .{ .dest = merge_block } } });
-                }
-
-                // Else branch
-                if (has_else) {
-                    self.current_block = else_block;
-                    const else_idx = self.sema.ast_tree.extra_data[extra_start + 2];
-                    const else_inst = try self.lowerNode(else_idx);
-                    if (!self.currentBlockTerminated()) {
-                        if (result_addr) |addr| {
-                            if (else_inst) |value| _ = try self.emitInst(.{ .opcode = .store, .type_id = result_type, .data = .{ .store = .{ .ptr = addr, .val = value } } });
-                        }
-                        _ = try self.emitInst(.{ .opcode = .br, .type_id = 0, .data = .{ .br = .{ .dest = merge_block } } });
-                    }
-                }
-
-                self.current_block = merge_block;
-                if (result_addr) |addr| {
-                    return try self.emitInst(.{ .opcode = .load, .type_id = result_type, .data = .{ .load = .{ .ptr = addr } } });
-                }
-                return null;
-            },
+            .if_stmt => return conditional_lowering.lower(self, node_idx),
             .while_stmt => {
                 const extra_start = node.data.lhs;
                 const label_token = self.sema.ast_tree.extra_data[extra_start];
@@ -333,6 +343,7 @@ pub const LirBuilder = struct {
                     .continue_dest = cond_block,
                     .result_addr = result_addr,
                     .result_type = result_type,
+                    .cleanup_depth = self.cleanup_stack.items.len,
                 });
                 _ = try self.lowerNode(body_node);
                 _ = self.loop_stack.pop();
@@ -359,11 +370,13 @@ pub const LirBuilder = struct {
                         });
                     }
                 }
+                try self.emitCleanups(targets.cleanup_depth, false);
                 _ = try self.emitInst(.{ .opcode = .br, .type_id = 0, .data = .{ .br = .{ .dest = targets.break_dest } } });
                 return null;
             },
             .continue_stmt => {
                 const targets = self.findLoopTarget(node.data.lhs) orelse return null;
+                try self.emitCleanups(targets.cleanup_depth, false);
                 _ = try self.emitInst(.{ .opcode = .br, .type_id = 0, .data = .{ .br = .{ .dest = targets.continue_dest } } });
                 return null;
             },
@@ -378,14 +391,21 @@ pub const LirBuilder = struct {
                 self.var_slice_lengths.clearRetainingCapacity();
                 self.slice_lengths.clearRetainingCapacity();
                 self.loop_stack.clearRetainingCapacity();
+                self.cleanup_stack.clearRetainingCapacity();
 
                 const proto_node = self.sema.ast_tree.nodes.get(proto_idx);
                 const function_type = self.sema.node_types.get(proto_idx).?;
                 self.current_return_type = self.sema.type_pool.get(function_type).data.function.ret_type;
+                const token = self.sema.ast_tree.tokens[proto_node.main_token];
+                const source = self.sema.diags.source_manager.getFile(self.sema.source_id).?.content;
+                const symbol = if (self.current_generic_instance) |instance_id|
+                    try self.internGenericSymbol(instance_id)
+                else
+                    try self.lir.internModuleSymbol(self.sema.module_id orelse 0, source[token.start..token.end]);
                 _ = try self.emitInst(.{
                     .opcode = .label,
                     .type_id = self.current_return_type.?,
-                    .data = .{ .label = proto_node.main_token }, // We pass the token index of the identifier!
+                    .data = .{ .label = symbol },
                 });
 
                 _ = try self.lowerNode(proto_idx);
@@ -409,6 +429,7 @@ pub const LirBuilder = struct {
                 return null;
             },
             .param_decl => {
+                if (node.decl_flags.comptime_param) return null;
                 const name_tok_idx = node.data.lhs;
                 const type_id = self.sema.node_types.get(node_idx) orelse 0;
 
@@ -432,13 +453,16 @@ pub const LirBuilder = struct {
                 });
 
                 const tok = self.sema.ast_tree.tokens[name_tok_idx];
-                const src = self.sema.diags.source_manager.getFile(0).?.content;
+                const src = self.sema.diags.source_manager.getFile(self.sema.source_id).?.content;
                 const ident_name = src[tok.start..tok.end];
                 try self.var_addresses.put(ident_name, addr_inst);
 
                 return null;
             },
             .builtin_call => {
+                if (self.sema.dynamic_fields.get(node_idx)) |field| {
+                    return aggregate_lowering.lowerFieldNamed(self, field.base_node, field.name);
+                }
                 if (self.sema.const_values.get(node_idx)) |value| {
                     result = try self.emitInst(.{
                         .opcode = .const_i,
@@ -449,12 +473,12 @@ pub const LirBuilder = struct {
                 }
 
                 const name_token = self.sema.ast_tree.tokens[node.data.lhs];
-                const src = self.sema.diags.source_manager.getFile(0).?.content;
+                const src = self.sema.diags.source_manager.getFile(self.sema.source_id).?.content;
                 const kind = builtin.lookup(src[name_token.start..name_token.end]) orelse return null;
                 const extra_start = node.data.rhs;
                 const arg_count = self.sema.ast_tree.extra_data[extra_start];
                 const value_arg: ?u32 = switch (kind) {
-                    .move, .discardError, .intFromPtr, .intFromEnum, .tagOf => 0,
+                    .move, .discardError, .intFromPtr, .intFromEnum => 0,
                     .intCast,
                     .floatCast,
                     .floatFromInt,
@@ -467,6 +491,14 @@ pub const LirBuilder = struct {
                     => 1,
                     else => null,
                 };
+                if (kind == .tagOf and arg_count == 1) {
+                    const value_node = self.sema.ast_tree.extra_data[extra_start + 1];
+                    const value_type = self.sema.node_types.get(value_node) orelse return null;
+                    return if (self.sema.type_pool.get(value_type).data == .@"union")
+                        aggregate_lowering.lowerTag(self, value_node)
+                    else
+                        self.lowerNode(value_node);
+                }
                 if (value_arg) |arg_index| {
                     if (arg_index < arg_count) {
                         result = try self.lowerNode(self.sema.ast_tree.extra_data[extra_start + 1 + arg_index]);
@@ -477,42 +509,11 @@ pub const LirBuilder = struct {
             .unary_op => {
                 const operator = self.sema.ast_tree.tokens[node.main_token].tag;
                 if (operator == .dot_asterisk or operator == .dot_question) return postfix.lowerUnarySuffix(self, node_idx);
-                if (operator == .keyword_try) {
-                    const operand = try self.lowerNode(node.data.lhs) orelse return null;
-                    const bool_type = try self.sema.type_pool.internPrimitive(.bool_type);
-                    const error_test = try self.emitInst(.{
-                        .opcode = .error_test,
-                        .type_id = bool_type,
-                        .data = .{ .error_test = operand },
-                    });
-                    const error_block = try self.newBlock();
-                    const success_block = try self.newBlock();
-                    _ = try self.emitInst(.{
-                        .opcode = .condbr,
-                        .type_id = 0,
-                        .data = .{ .condbr = .{ .cond = error_test, .true_dest = error_block, .false_dest = success_block } },
-                    });
-
-                    self.current_block = error_block;
-                    _ = try self.emitInst(.{
-                        .opcode = .ret_error,
-                        .type_id = self.current_return_type.?,
-                        .data = .{ .ret_error = error_test },
-                    });
-
-                    self.current_block = success_block;
-                    result = try self.emitInst(.{
-                        .opcode = .error_payload,
-                        .type_id = self.sema.node_types.get(node_idx) orelse 0,
-                        .data = .{ .error_payload = operand },
-                    });
-                    if (self.slice_lengths.get(operand)) |length| try self.slice_lengths.put(result.?, length);
-                    return result;
-                }
-                result = try self.lowerNode(node.data.lhs);
-                return result;
+                return prefix.lower(self, node_idx);
             },
             .array_access, .slice => return postfix.lower(self, node_idx),
+            .defer_stmt, .errdefer_stmt => return cleanup_lowering.lower(self, node_idx),
+            .match_stmt => return match_lowering.lower(self, node_idx),
             .unsafe_block => {
                 result = try self.lowerNode(node.data.lhs);
                 return result;
@@ -561,6 +562,7 @@ pub const LirBuilder = struct {
                 try self.slice_lengths.put(base_address, length);
                 return base_address;
             },
+            .aggregate_literal => return aggregate_lowering.lowerLiteral(self, node_idx),
             .string_literal => {
                 result = try self.emitInst(.{
                     .opcode = .string_literal,
@@ -568,7 +570,7 @@ pub const LirBuilder = struct {
                     .data = .{ .string_literal = node_idx },
                 });
                 const token = self.sema.ast_tree.tokens[node.main_token];
-                const raw = self.sema.diags.source_manager.getFile(0).?.content[token.start..token.end];
+                const raw = self.sema.diags.source_manager.getFile(self.sema.source_id).?.content[token.start..token.end];
                 const length_type = try self.sema.type_pool.internSizeInt(false);
                 const length = try self.emitInst(.{
                     .opcode = .const_i,
@@ -578,20 +580,50 @@ pub const LirBuilder = struct {
                 try self.slice_lengths.put(result.?, length);
                 return result;
             },
+            .field_access => {
+                if (self.sema.external_decls.get(node_idx)) |external| {
+                    if (external.is_function) {
+                        const symbol = try self.lir.internModuleSymbol(external.module_id, external.name);
+                        return try self.emitInst(.{
+                            .opcode = .func_sym,
+                            .type_id = self.sema.node_types.get(node_idx) orelse 0,
+                            .data = .{ .func_sym = symbol },
+                        });
+                    }
+                }
+                if (self.sema.const_values.get(node_idx)) |value| {
+                    return try self.emitInst(.{
+                        .opcode = .const_i,
+                        .type_id = self.sema.node_types.get(node_idx) orelse 0,
+                        .data = .{ .const_i = value },
+                    });
+                }
+                return aggregate_lowering.lowerField(self, node_idx);
+            },
             .call => {
                 const target = node.data.lhs;
                 const extra_start = node.data.rhs;
                 const num_args = self.sema.ast_tree.extra_data[extra_start];
 
-                // Normal call
-                const target_inst = try self.lowerNode(target);
+                const generic_instance = self.sema.generic_calls.get(node_idx);
+                const target_inst = if (generic_instance) |instance_id|
+                    try self.emitInst(.{
+                        .opcode = .func_sym,
+                        .type_id = self.sema.node_types.get(target) orelse 0,
+                        .data = .{ .func_sym = try self.internGenericSymbol(instance_id) },
+                    })
+                else
+                    try self.lowerNode(target);
 
                 const args_start = self.lir.extra_data.items.len;
                 var i: u32 = 0;
+                var runtime_args: u32 = 0;
                 while (i < num_args) : (i += 1) {
+                    if (generic_instance != null and self.genericArgumentIsComptime(target, i)) continue;
                     const arg_node = self.sema.ast_tree.extra_data[extra_start + 1 + i];
                     const arg_inst = try self.lowerNode(arg_node);
                     try self.lir.extra_data.append(self.allocator, arg_inst.?);
+                    runtime_args += 1;
                 }
 
                 const type_id = self.sema.node_types.get(node_idx) orelse 0;
@@ -599,7 +631,7 @@ pub const LirBuilder = struct {
                 const call_inst = try self.emitInst(.{
                     .opcode = .call,
                     .type_id = type_id,
-                    .data = .{ .call = .{ .func = target_inst orelse 0, .args_start = @as(u32, @intCast(args_start)), .args_count = num_args } },
+                    .data = .{ .call = .{ .func = target_inst orelse 0, .args_start = @as(u32, @intCast(args_start)), .args_count = runtime_args } },
                 });
                 if (self.isSliceErrorUnion(type_id)) {
                     const length_type = try self.sema.type_pool.internSizeInt(false);
@@ -618,8 +650,13 @@ pub const LirBuilder = struct {
                 else
                     try self.lowerNode(node.data.rhs);
                 const return_type = self.current_return_type.?;
-                const expression_is_error_union = expr_inst != null and self.sema.type_pool.get(self.sema.node_types.get(node.data.rhs).?).data == .error_union;
-                if (expression_is_error_union and self.isSliceErrorUnion(return_type)) {
+                const expression_type = if (expr_inst != null) self.sema.type_pool.get(self.sema.node_types.get(node.data.rhs).?) else null;
+                const expression_is_error_union = expression_type != null and expression_type.?.data == .error_union;
+                const expression_is_error_value = expression_type != null and expression_type.?.data == .error_set;
+                try self.emitCleanups(0, expression_is_error_value);
+                if (expression_is_error_value) {
+                    _ = try self.emitInst(.{ .opcode = .ret_error, .type_id = return_type, .data = .{ .ret_error = expr_inst.? } });
+                } else if (expression_is_error_union and self.isSliceErrorUnion(return_type)) {
                     const length = self.slice_lengths.get(expr_inst.?) orelse return null;
                     _ = try self.emitInst(.{
                         .opcode = .ret_error_union_slice,
@@ -650,6 +687,26 @@ pub const LirBuilder = struct {
         return blk_idx;
     }
 
+    pub fn pushCleanup(self: *LirBuilder, node_index: Node.Index, error_only: bool) !void {
+        try self.cleanup_stack.append(self.allocator, .{ .node_index = node_index, .error_only = error_only });
+    }
+
+    pub fn nextSyntheticLocal(self: *LirBuilder) u32 {
+        const result = self.synthetic_local_counter;
+        self.synthetic_local_counter -= 1;
+        return result;
+    }
+
+    pub fn emitCleanups(self: *LirBuilder, first: usize, is_error: bool) !void {
+        var index = self.cleanup_stack.items.len;
+        while (index > first) {
+            index -= 1;
+            const cleanup = self.cleanup_stack.items[index];
+            if (cleanup.error_only and !is_error) continue;
+            _ = try self.lowerNode(cleanup.node_index);
+        }
+    }
+
     fn currentBlockTerminated(self: *const LirBuilder) bool {
         const block_index = self.current_block orelse return false;
         const instructions = self.lir.blocks.items[block_index].insts.items;
@@ -660,9 +717,17 @@ pub const LirBuilder = struct {
         };
     }
 
+    pub fn currentBlockTerminatedPublic(self: *const LirBuilder) bool {
+        return self.currentBlockTerminated();
+    }
+
     fn hasRuntimeValue(self: *const LirBuilder, type_id: Type.Id) bool {
         const ty = self.sema.type_pool.get(type_id);
         return !(ty.data == .primitive and (ty.data.primitive == .void_type or ty.data.primitive == .noreturn_type));
+    }
+
+    pub fn hasRuntimeValuePublic(self: *const LirBuilder, type_id: Type.Id) bool {
+        return self.hasRuntimeValue(type_id);
     }
 
     fn isSliceErrorUnion(self: *const LirBuilder, type_id: Type.Id) bool {
@@ -676,7 +741,7 @@ pub const LirBuilder = struct {
         if (self.loop_stack.items.len == 0) return null;
         if (label_token == std.math.maxInt(u32)) return self.loop_stack.items[self.loop_stack.items.len - 1];
 
-        const source = self.sema.diags.source_manager.getFile(0).?.content;
+        const source = self.sema.diags.source_manager.getFile(self.sema.source_id).?.content;
         const wanted_token = self.sema.ast_tree.tokens[label_token];
         const wanted = source[wanted_token.start..wanted_token.end];
         var index = self.loop_stack.items.len;
@@ -711,7 +776,7 @@ pub const LirBuilder = struct {
         const item_addr = try self.emitInst(.{ .opcode = .addr, .type_id = item_type, .data = .{ .addr = item_token } });
         _ = try self.emitInst(.{ .opcode = .store, .type_id = item_type, .data = .{ .store = .{ .ptr = item_addr, .val = start_inst } } });
 
-        const src = self.sema.diags.source_manager.getFile(0).?.content;
+        const src = self.sema.diags.source_manager.getFile(self.sema.source_id).?.content;
         const item_tok = self.sema.ast_tree.tokens[item_token];
         const item_name = src[item_tok.start..item_tok.end];
         const previous_item = self.var_addresses.get(item_name);
@@ -760,6 +825,7 @@ pub const LirBuilder = struct {
             .label_token = label_token,
             .break_dest = end_block,
             .continue_dest = increment_block,
+            .cleanup_depth = self.cleanup_stack.items.len,
         });
         _ = try self.lowerNode(body_node);
         _ = self.loop_stack.pop();
@@ -827,7 +893,7 @@ pub const LirBuilder = struct {
             child_type;
         const item_addr = try self.emitInst(.{ .opcode = .addr, .type_id = item_type, .data = .{ .addr = item_token } });
 
-        const source = self.sema.diags.source_manager.getFile(0).?.content;
+        const source = self.sema.diags.source_manager.getFile(self.sema.source_id).?.content;
         const item_source_token = self.sema.ast_tree.tokens[item_token];
         const item_name = source[item_source_token.start..item_source_token.end];
         const previous_item = self.var_addresses.get(item_name);
@@ -884,6 +950,7 @@ pub const LirBuilder = struct {
             .label_token = label_token,
             .break_dest = end_block,
             .continue_dest = increment_block,
+            .cleanup_depth = self.cleanup_stack.items.len,
         });
         _ = try self.lowerNode(body_node);
         _ = self.loop_stack.pop();
@@ -898,6 +965,27 @@ pub const LirBuilder = struct {
 
         self.current_block = end_block;
         return null;
+    }
+
+    fn internGenericSymbol(self: *LirBuilder, instance_id: u32) !u32 {
+        const instance = self.sema.generic_instances.items[instance_id];
+        const declaration = self.sema.ast_tree.nodes.get(instance.declaration);
+        const prototype = self.sema.ast_tree.nodes.get(declaration.data.lhs);
+        const token = self.sema.ast_tree.tokens[prototype.main_token];
+        const source = self.sema.diags.source_manager.getFile(self.sema.source_id).?.content;
+        const specialized_name = try std.fmt.allocPrint(self.allocator, "{s}__g{d}", .{ source[token.start..token.end], instance_id });
+        defer self.allocator.free(specialized_name);
+        return self.lir.internModuleSymbol(self.sema.module_id orelse 0, specialized_name);
+    }
+
+    fn genericArgumentIsComptime(self: *const LirBuilder, target_node: Node.Index, argument_offset: u32) bool {
+        const declaration_index = self.sema.resolved_decls.get(target_node) orelse return false;
+        const declaration = self.sema.ast_tree.nodes.get(declaration_index);
+        if (declaration.tag != .fn_decl) return false;
+        const prototype = self.sema.ast_tree.nodes.get(declaration.data.lhs);
+        if (argument_offset + 1 >= prototype.data.rhs) return false;
+        const parameter_index = self.sema.ast_tree.extra_data[prototype.data.lhs + 1 + argument_offset];
+        return self.sema.ast_tree.nodes.get(parameter_index).decl_flags.comptime_param;
     }
 
     pub fn printLir(self: *LirBuilder) void {

@@ -34,46 +34,23 @@ pub fn main(init: std.process.Init) !u8 {
     var engine = diag.DiagnosticEngine.init(allocator, &source_manager);
     defer engine.deinit();
 
-    const max_size = 10 * 1024 * 1024;
-    const content_unterm = std.Io.Dir.readFileAlloc(.cwd(), io, path, allocator, @enumFromInt(max_size)) catch |err| {
-        std.debug.print("Failed to read file '{s}': {}\n", .{ path, err });
-        return 1;
-    };
-    defer allocator.free(content_unterm);
-
-    var content = try allocator.alloc(u8, content_unterm.len + 1);
-    defer allocator.free(content);
-    @memcpy(content[0..content_unterm.len], content_unterm);
-    content[content_unterm.len] = 0;
-
-    // Stage 1: SourceManager
-    const file_id = try source_manager.addFile(path, content_unterm);
-
-    // Stage 2: Lex
-    const lexer = @import("syntax/lexer.zig");
-    const Token = @import("syntax/token.zig").Token;
-    var lex = lexer.Lexer.init(content[0..content_unterm.len :0]);
-    var tokens = std.ArrayList(Token).empty;
-    defer tokens.deinit(allocator);
-    while (true) {
-        const t = lex.next();
-        try tokens.append(allocator, t);
-        if (t.tag == .eof) break;
-    }
-
-    // Stage 3: Parse
-    const parser = @import("syntax/parser.zig");
-    var p = parser.Parser.init(allocator, tokens.items, &engine, file_id);
-    var ast = p.parse() catch |err| {
+    // Stages 1-4: recursively load, lex and parse the complete module graph.
+    const modules = @import("modules/root.zig");
+    var module_loader = modules.loader.Loader.init(allocator, io, &source_manager, &engine, .{ .std_root = "std/src" });
+    defer module_loader.deinit();
+    const root_module_id = module_loader.loadRoot(path) catch |err| {
         std.debug.print("Fatal parse error: {}\n", .{err});
-        try engine.render(out);
-        try stdout_file_writer.flush();
+        engine.renderDebug();
         return 1;
     };
-    defer ast.deinit(allocator);
+    const root_module = module_loader.get(root_module_id);
+    if (root_module.ast == null) {
+        engine.renderDebug();
+        return 1;
+    }
+    const ast = root_module.ast.?;
 
-    try engine.render(out);
-    try stdout_file_writer.flush();
+    engine.renderDebug();
 
     if (engine.error_count > 0) {
         std.debug.print("Compilation failed with {d} error(s).\n", .{engine.error_count});
@@ -85,20 +62,67 @@ pub fn main(init: std.process.Init) !u8 {
     var type_pool = type_mod.TypePool.init(allocator);
     defer type_pool.deinit();
 
+    var module_registry = try modules.namespace.Registry.init(allocator, module_loader.modules.items.len);
+    defer module_registry.deinit();
+
+    // Dependencies were appended while recursively walking imports. Analyze in
+    // reverse discovery order so ordinary acyclic imports expose their public
+    // namespace before their importer is checked.
+    const sema_mod = @import("semantic/sema.zig");
+    const export_collector = @import("semantic/exports.zig");
     const scope_mod = @import("semantic/scope.zig");
+    const ImportedAnalysis = struct { scope: *scope_mod.Scope, sema: *sema_mod.Sema };
+    var imported_analyses = std.ArrayList(ImportedAnalysis).empty;
+    defer {
+        for (imported_analyses.items) |analysis| {
+            analysis.sema.deinit();
+            allocator.destroy(analysis.sema);
+            analysis.scope.deinit();
+            allocator.destroy(analysis.scope);
+        }
+        imported_analyses.deinit(allocator);
+    }
+    var module_index = module_loader.modules.items.len;
+    while (module_index > 1) {
+        module_index -= 1;
+        const imported = module_loader.get(@intCast(module_index));
+        if (imported.ast == null) continue;
+        const imported_scope = try allocator.create(scope_mod.Scope);
+        errdefer allocator.destroy(imported_scope);
+        imported_scope.* = scope_mod.Scope.init(allocator, null);
+        errdefer imported_scope.deinit();
+        const imported_sema = try allocator.create(sema_mod.Sema);
+        errdefer allocator.destroy(imported_sema);
+        imported_sema.* = sema_mod.Sema.init(
+            allocator,
+            imported.ast.?,
+            imported.source_id,
+            &engine,
+            &type_pool,
+            imported_scope,
+        );
+        errdefer imported_sema.deinit();
+        imported_sema.configureModules(@intCast(module_index), &imported.imports, &module_registry);
+        imported_sema.analyze() catch |err| {
+            std.debug.print("Imported module sema failed: {}\n", .{err});
+            return 1;
+        };
+        try export_collector.collect(imported_sema, &module_registry, @intCast(module_index));
+        try imported_analyses.append(allocator, .{ .scope = imported_scope, .sema = imported_sema });
+    }
+
     var root_scope = scope_mod.Scope.init(allocator, null);
     defer root_scope.deinit();
 
-    const sema_mod = @import("semantic/sema.zig");
-    var sema = sema_mod.Sema.init(allocator, ast, &engine, &type_pool, &root_scope);
+    var sema = sema_mod.Sema.init(allocator, ast, root_module.source_id, &engine, &type_pool, &root_scope);
     defer sema.deinit();
+    sema.configureModules(root_module_id, &root_module.imports, &module_registry);
     sema.analyze() catch |err| {
         std.debug.print("Sema failed: {}\n", .{err});
         return 1;
     };
 
-    try engine.render(out);
-    try stdout_file_writer.flush();
+    engine.renderDebug();
 
     if (engine.error_count > 0) {
         std.debug.print("Compilation failed with {d} error(s).\n", .{engine.error_count});
@@ -113,6 +137,12 @@ pub fn main(init: std.process.Init) !u8 {
         std.debug.print("LIR gen failed: {}\n", .{err});
         return 1;
     };
+    for (imported_analyses.items) |analysis| {
+        lir_builder.generateModule(analysis.sema) catch |err| {
+            std.debug.print("Imported module LIR generation failed: {}\n", .{err});
+            return 1;
+        };
+    }
     lir_builder.printLir();
 
     std.debug.print("AST has {d} nodes\n", .{ast.nodes.len});
@@ -122,7 +152,7 @@ pub fn main(init: std.process.Init) !u8 {
         &lir_builder.lir,
         &type_pool,
         ast,
-        source_manager.getFile(0).?.content,
+        source_manager.getFile(root_module.source_id).?.content,
     );
     defer x86_gen.deinit();
 

@@ -217,6 +217,15 @@ pub const X86Gen = struct {
         return bits > 0 and bits <= 8;
     }
 
+    fn isSignedType(self: *const X86Gen, type_id: u32) bool {
+        if (type_id >= self.type_pool.types.items.len) return false;
+        return switch (self.type_pool.get(type_id).data) {
+            .integer => |integer| integer.is_signed,
+            .size_int => |integer| integer.is_signed,
+            else => false,
+        };
+    }
+
     fn isFloatType(self: *const X86Gen, type_id: u32) bool {
         if (type_id >= self.type_pool.types.items.len) return false;
         return self.type_pool.get(type_id).isFloat();
@@ -260,6 +269,10 @@ pub const X86Gen = struct {
             .le => .less_equal,
             .gt => .greater,
             .ge => .greater_equal,
+            .ult => .below,
+            .ule => .below_equal,
+            .ugt => .above,
+            .uge => .above_equal,
         };
     }
 
@@ -271,6 +284,10 @@ pub const X86Gen = struct {
             .le => "le",
             .gt => "g",
             .ge => "ge",
+            .ult => "b",
+            .ule => "be",
+            .ugt => "a",
+            .uge => "ae",
         };
     }
 
@@ -465,13 +482,15 @@ pub const X86Gen = struct {
                 const op = try self.allocateOp(inst_idx);
                 const ptr_op = try self.allocateOp(inst.data.load.ptr);
                 const ptr_reg = try opToReg(writer, ptr_op, "rax");
+                const byte_load = self.isByteType(inst.type_id);
+                const load_instruction = if (byte_load and self.isSignedType(inst.type_id)) "movsx" else if (byte_load) "movzx" else "mov";
                 if (op == .mem) {
-                    try writer.print("  {s} rcx, {s}[{s}]\n", .{ if (self.isByteType(inst.type_id)) "movzx" else "mov", if (self.isByteType(inst.type_id)) "byte " else "qword ", ptr_reg });
+                    try writer.print("  {s} rcx, {s}[{s}]\n", .{ load_instruction, if (byte_load) "byte " else "qword ", ptr_reg });
                     try writer.print("  mov ", .{});
                     try printOp(writer, op);
                     try writer.print(", rcx\n", .{});
                 } else {
-                    try writer.print("  {s} {s}, {s}[{s}]\n", .{ if (self.isByteType(inst.type_id)) "movzx" else "mov", op.reg, if (self.isByteType(inst.type_id)) "byte " else "qword ", ptr_reg });
+                    try writer.print("  {s} {s}, {s}[{s}]\n", .{ load_instruction, op.reg, if (byte_load) "byte " else "qword ", ptr_reg });
                 }
             },
             .param => {
@@ -500,10 +519,7 @@ pub const X86Gen = struct {
             },
             .func_sym => {
                 const op = try self.allocateOp(inst_idx);
-                const fn_node_idx = inst.data.func_sym;
-                const fn_node = self.ast_tree.nodes.get(fn_node_idx);
-                const fn_tok = self.ast_tree.tokens[fn_node.main_token];
-                const fn_name = self.src[fn_tok.start..fn_tok.end];
+                const fn_name = self.lir.symbols.items[inst.data.func_sym];
                 if (op == .mem) {
                     try writer.print("  lea rax, [rel {s}]\n", .{fn_name});
                     try writer.print("  mov ", .{});
@@ -514,9 +530,7 @@ pub const X86Gen = struct {
                 }
             },
             .label => {
-                const fn_tok_idx = inst.data.label;
-                const fn_tok = self.ast_tree.tokens[fn_tok_idx];
-                const fn_name = self.src[fn_tok.start..fn_tok.end];
+                const fn_name = self.lir.symbols.items[inst.data.label];
                 try writer.print("global {s}\n{s}:\n", .{ fn_name, fn_name });
                 try writer.print("  push rbp\n  mov rbp, rsp\n  sub rsp, 4096\n", .{});
                 self.current_function_return_type = inst.type_id;
@@ -783,6 +797,7 @@ pub const X86Gen = struct {
                 if (!std.mem.eql(u8, length_reg, "rcx")) try writer.print("  mov rcx, {s}\n", .{length_reg});
                 try writer.print("  mov rsp, rbp\n  pop rbp\n  ret\n", .{});
             },
+            .unreachable_inst => try writer.print("  ud2\n", .{}),
             else => try writer.print("  ; [unhandled] {s}\n", .{@tagName(inst.opcode)}),
         }
     }
@@ -824,12 +839,11 @@ pub const X86Gen = struct {
         }
 
         // _start stub: only emit if a 'main' symbol will be defined.
-        // We check by scanning for a .label inst whose token text == "main".
+        // We check by scanning for an unmangled root-module `main` symbol.
         var has_main = false;
         for (self.lir.insts.items) |inst| {
             if (inst.opcode == .label) {
-                const tok = self.ast_tree.tokens[inst.data.label];
-                const fn_name = self.src[tok.start..tok.end];
+                const fn_name = self.lir.symbols.items[inst.data.label];
                 if (std.mem.eql(u8, fn_name, "main")) {
                     has_main = true;
                     break;
@@ -1046,7 +1060,11 @@ pub const X86Gen = struct {
                     .mem => .rcx,
                 };
                 if (self.isByteType(inst.type_id)) {
-                    try emitLoadByteViaPtr(enc, dst_r, ptr_r);
+                    if (self.isSignedType(inst.type_id)) {
+                        try emitLoadSignedByteViaPtr(enc, dst_r, ptr_r);
+                    } else {
+                        try emitLoadByteViaPtr(enc, dst_r, ptr_r);
+                    }
                 } else {
                     try emitLoadViaPtr(enc, dst_r, ptr_r);
                 }
@@ -1080,10 +1098,7 @@ pub const X86Gen = struct {
             // ── func_sym: get function address ───────────────────────────────
             .func_sym => {
                 const op = try self.allocateOp(inst_idx);
-                const fn_node_idx = inst.data.func_sym;
-                const fn_node = self.ast_tree.nodes.get(fn_node_idx);
-                const fn_tok = self.ast_tree.tokens[fn_node.main_token];
-                const fn_name = self.src[fn_tok.start..fn_tok.end];
+                const fn_name = self.lir.symbols.items[inst.data.func_sym];
                 const dst_r = switch (op) {
                     .reg => |r| nameToReg(r),
                     .mem => .rax,
@@ -1094,9 +1109,7 @@ pub const X86Gen = struct {
 
             // ── function label + prologue ────────────────────────────────────
             .label => {
-                const fn_tok_idx = inst.data.label;
-                const fn_tok = self.ast_tree.tokens[fn_tok_idx];
-                const fn_name = self.src[fn_tok.start..fn_tok.end];
+                const fn_name = self.lir.symbols.items[inst.data.label];
                 try enc.defineSymbol(fn_name);
                 try enc.emitPushRbp();
                 try enc.emitMovRbpRsp();
@@ -1350,6 +1363,7 @@ pub const X86Gen = struct {
                 try enc.emitPopRbp();
                 try enc.emitRet();
             },
+            .unreachable_inst => try enc.emitTrap(),
 
             // ── string literal ────────────────────────────────────────────────
             // Load the virtual address of the string in .rodata into a register.
@@ -1462,6 +1476,24 @@ fn emitLoadByteViaPtr(enc: *Encoder, dst_r: Reg, ptr_r: Reg) !void {
     if (ptr_low == 5) try enc.buf.append(enc.allocator, 0x00);
 }
 
+/// MOVSX dst_reg, byte [ptr_reg] (REX.W 0F BE /r)
+fn emitLoadSignedByteViaPtr(enc: *Encoder, dst_r: Reg, ptr_r: Reg) !void {
+    const ptr_idx = @intFromEnum(ptr_r);
+    const dst_idx = @intFromEnum(dst_r);
+    const needs_rex_r = dst_idx >= 8;
+    const needs_rex_b = ptr_idx >= 8;
+    const rex_byte: u8 = 0x48 |
+        (if (needs_rex_r) @as(u8, 0x04) else 0) |
+        (if (needs_rex_b) @as(u8, 0x01) else 0);
+    const ptr_low: u8 = @as(u8, @truncate(ptr_idx)) & 7;
+    const mod_bits: u8 = if (ptr_low == 5) 0b01 else 0b00;
+    const modrm_byte: u8 = mod_bits << 6 | (@as(u8, @truncate(dst_idx)) & 7) << 3 | ptr_low;
+    try enc.buf.append(enc.allocator, rex_byte);
+    try enc.buf.appendSlice(enc.allocator, &.{ 0x0f, 0xbe, modrm_byte });
+    if (ptr_low == 4) try enc.buf.append(enc.allocator, 0x24);
+    if (ptr_low == 5) try enc.buf.append(enc.allocator, 0x00);
+}
+
 /// MOVQ xmm0, src_gp (66 REX.W 0F 6E /r)
 fn emitMovqXmm0FromGp(enc: *Encoder, src: Reg) !void {
     const source: u8 = @intFromEnum(src);
@@ -1528,6 +1560,14 @@ test "byte pointer load zero-extends" {
 
     try emitLoadByteViaPtr(&enc, .r14, .r12);
     try std.testing.expectEqualSlices(u8, &.{ 0x4d, 0x0f, 0xb6, 0x34, 0x24 }, enc.buf.items);
+}
+
+test "signed byte pointer load sign-extends" {
+    var enc = Encoder.init(std.testing.allocator);
+    defer enc.deinit();
+
+    try emitLoadSignedByteViaPtr(&enc, .r14, .r12);
+    try std.testing.expectEqualSlices(u8, &.{ 0x4d, 0x0f, 0xbe, 0x34, 0x24 }, enc.buf.items);
 }
 
 test "SSE payload transport moves f64 bits through xmm0" {

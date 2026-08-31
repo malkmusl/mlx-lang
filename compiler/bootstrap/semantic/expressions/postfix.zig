@@ -2,6 +2,7 @@ const std = @import("std");
 const Node = @import("../../syntax/ast.zig").Node;
 const Scope = @import("../scope.zig").Scope;
 const Type = @import("../type.zig").Type;
+const optional = @import("optional.zig");
 
 pub fn analyze(sema: anytype, node_index: Node.Index, scope: *Scope) !Type.Id {
     const node = sema.ast_tree.nodes.get(node_index);
@@ -17,6 +18,7 @@ pub fn analyzeUnarySuffix(sema: anytype, node_index: Node.Index, scope: *Scope) 
     const operator = sema.ast_tree.tokens[node.main_token].tag;
     if (operator != .dot_asterisk and operator != .dot_question) return null;
 
+    if (operator == .dot_question) return try optional.analyzeUnwrap(sema, node_index, scope);
     const operand_type_id = try sema.analyzeNode(node.data.lhs, scope);
     const operand_type = sema.type_pool.get(operand_type_id);
     const result_type = switch (operator) {
@@ -26,12 +28,7 @@ pub fn analyzeUnarySuffix(sema: anytype, node_index: Node.Index, scope: *Scope) 
             try sema.reportError(7001, .sema, sema.ast_tree.tokens[node.main_token].start, "Pointer dereference requires a pointer operand");
             break :blk operand_type_id;
         },
-        .dot_question => if (operand_type.data == .optional)
-            operand_type.data.optional.child_type
-        else blk: {
-            try sema.reportError(4014, .sema, sema.ast_tree.tokens[node.main_token].start, "Optional unwrap requires an optional operand");
-            break :blk operand_type_id;
-        },
+        .dot_question => unreachable,
         else => unreachable,
     };
     try sema.node_types.put(node_index, result_type);

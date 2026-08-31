@@ -13,6 +13,10 @@ pub const Reg = x86.Register;
 pub const Condition = enum(u8) {
     equal = 0x4,
     not_equal = 0x5,
+    below = 0x2,
+    above_equal = 0x3,
+    below_equal = 0x6,
+    above = 0x7,
     less = 0xc,
     greater_equal = 0xd,
     less_equal = 0xe,
@@ -442,6 +446,11 @@ pub const Encoder = struct {
     pub fn emitSyscall(self: *Encoder) !void {
         std.debug.print("[enc] syscall\n", .{});
         try self.emit2(0x0F, 0x05);
+    }
+
+    pub fn emitTrap(self: *Encoder) !void {
+        std.debug.print("[enc] ud2\n", .{});
+        try self.emit2(0x0f, 0x0b);
     }
 };
 

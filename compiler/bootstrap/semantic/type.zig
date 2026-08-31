@@ -102,6 +102,7 @@ pub const Type = struct {
         @"struct",
         @"enum",
         @"union",
+        error_set,
         tuple,
         vector,
     };
@@ -118,6 +119,7 @@ pub const Type = struct {
         @"struct": Aggregate,
         @"enum": Aggregate,
         @"union": Aggregate,
+        error_set: Aggregate,
         tuple: Aggregate,
         vector: Vector,
     };
@@ -195,17 +197,19 @@ pub const Type = struct {
 };
 
 pub const TypePool = struct {
-    pub const AggregateKind = enum { @"struct", @"enum", @"union", tuple };
+    pub const AggregateKind = enum { @"struct", @"enum", @"union", error_set, tuple };
 
     pub const AggregateField = struct {
         name: []const u8,
         type_id: Type.Id,
         offset: u64,
+        value: ?u64 = null,
     };
 
     pub const AggregateFieldInput = struct {
         name: []const u8,
         type_id: Type.Id,
+        value: ?u64 = null,
     };
 
     pub const AggregateInfo = struct {
@@ -215,6 +219,7 @@ pub const TypePool = struct {
         backing_type: ?Type.Id,
         size: u64,
         alignment: u64,
+        is_nonexhaustive: bool,
     };
 
     allocator: std.mem.Allocator,
@@ -288,6 +293,7 @@ pub const TypePool = struct {
         const from = self.get(from_id);
         const to = self.get(to_id);
         if (Type.isCoercible(from, to)) return true;
+        if (to.data == .primitive and to.data.primitive == .anytype_type) return true;
 
         if (to.data == .optional) {
             if (from.data == .primitive and from.data.primitive == .null_type) return true;
@@ -299,6 +305,11 @@ pub const TypePool = struct {
         if (to.data == .error_union) {
             if (from.data == .error_union) {
                 return self.isCoercible(from.data.error_union.payload, to.data.error_union.payload);
+            }
+            if (from.data == .error_set) {
+                const inferred = self.get(to.data.error_union.err_set);
+                return to.data.error_union.err_set == from_id or
+                    (inferred.data == .primitive and inferred.data.primitive == .void_type);
             }
             return self.isCoercible(from_id, to.data.error_union.payload);
         }
@@ -383,6 +394,7 @@ pub const TypePool = struct {
         field_inputs: []const AggregateFieldInput,
         backing_type: ?Type.Id,
         explicit_copyability: ?Copyability,
+        is_nonexhaustive: bool,
     ) !Type.Id {
         const fields_start: u32 = @intCast(self.aggregate_fields.items.len);
         var size: u64 = 0;
@@ -398,24 +410,25 @@ pub const TypePool = struct {
                     size = alignForward(size, field_alignment);
                     break :blk size;
                 },
-                .@"union", .@"enum" => 0,
+                .@"union", .@"enum", .error_set => 0,
             };
             try self.aggregate_fields.append(self.allocator, .{
                 .name = field.name,
                 .type_id = field.type_id,
                 .offset = offset,
+                .value = field.value,
             });
             switch (kind) {
                 .@"struct", .tuple => size = try std.math.add(u64, size, field_size),
                 .@"union" => size = @max(size, field_size),
-                .@"enum" => {},
+                .@"enum", .error_set => {},
             }
             if (explicit_copyability == null) {
                 copyability = Copyability.combine(copyability, self.get(field.type_id).copyability);
             }
         }
 
-        if (kind == .@"enum") {
+        if (kind == .@"enum" or kind == .error_set) {
             const backing = backing_type orelse return error.UnknownLayout;
             size = try self.sizeOf(backing);
             alignment = try self.alignOf(backing);
@@ -445,12 +458,14 @@ pub const TypePool = struct {
             .backing_type = backing_type,
             .size = size,
             .alignment = alignment,
+            .is_nonexhaustive = is_nonexhaustive,
         });
         const aggregate = Type.Aggregate{ .id = aggregate_id };
         const data: Type.Data = switch (kind) {
             .@"struct" => .{ .@"struct" = aggregate },
             .@"enum" => .{ .@"enum" = aggregate },
             .@"union" => .{ .@"union" = aggregate },
+            .error_set => .{ .error_set = aggregate },
             .tuple => .{ .tuple = aggregate },
         };
         return self.intern(data, copyability);
@@ -461,6 +476,7 @@ pub const TypePool = struct {
             .@"struct" => |aggregate| aggregate.id,
             .@"enum" => |aggregate| aggregate.id,
             .@"union" => |aggregate| aggregate.id,
+            .error_set => |aggregate| aggregate.id,
             .tuple => |aggregate| aggregate.id,
             else => return null,
         };
@@ -546,6 +562,7 @@ pub const TypePool = struct {
             .@"struct" => "struct",
             .@"enum" => "enum",
             .@"union" => "union",
+            .error_set => "error set",
             .tuple => "tuple",
             else => try std.fmt.bufPrint(buf, "<type:{d}>", .{id}),
         };
@@ -564,7 +581,7 @@ pub const TypePool = struct {
             },
             .array => |array| std.math.mul(u64, array.len, try self.bitSizeOf(array.child_type)) catch error.Overflow,
             .vector => |vector| std.math.mul(u64, vector.len, try self.bitSizeOf(vector.child_type)) catch error.Overflow,
-            .@"struct", .@"enum", .@"union", .tuple => blk: {
+            .@"struct", .@"enum", .@"union", .error_set, .tuple => blk: {
                 const info = self.aggregateInfo(id) orelse return error.UnknownLayout;
                 break :blk std.math.mul(u64, info.size, 8) catch error.Overflow;
             },
@@ -603,7 +620,7 @@ pub const TypePool = struct {
             .optional => |optional| self.alignOf(optional.child_type),
             .array => |array| self.alignOf(array.child_type),
             .vector => @min(@as(u64, 16), self.sizeOf(id) catch return error.UnknownLayout),
-            .@"struct", .@"enum", .@"union", .tuple => (self.aggregateInfo(id) orelse return error.UnknownLayout).alignment,
+            .@"struct", .@"enum", .@"union", .error_set, .tuple => (self.aggregateInfo(id) orelse return error.UnknownLayout).alignment,
             else => error.UnknownLayout,
         };
     }
@@ -760,7 +777,7 @@ test "tagged union layout includes discriminator and aligned payload" {
     const tagged = try pool.internAggregate(.@"union", &.{
         .{ .name = "none", .type_id = void_type },
         .{ .name = "data", .type_id = u32_type },
-    }, u8_type, null);
+    }, u8_type, null, false);
 
     try testing.expectEqual(@as(u64, 8), try pool.sizeOf(tagged));
     try testing.expectEqual(@as(u64, 4), try pool.alignOf(tagged));

@@ -88,6 +88,26 @@ pub const DiagnosticEngine = struct {
             });
         }
     }
+
+    /// Render diagnostics through the process debug stream. The compiler uses
+    /// this path so diagnostics and progress messages share one stream and
+    /// cannot overwrite each other when stdout/stderr are redirected together.
+    pub fn renderDebug(self: *const DiagnosticEngine) void {
+        for (self.diagnostics.items) |diag| {
+            const loc = self.source_manager.getLineCol(diag.primary_span.file_id, diag.primary_span.start_byte) orelse continue;
+            const file = self.source_manager.getFile(diag.primary_span.file_id) orelse continue;
+            const code_kind: u8 = if (diag.severity == .warning) 'W' else 'E';
+            std.debug.print("{s}:{d}:{d}: {s}: ZIN-{c}{d:0>4}: {s}\n", .{
+                file.path,
+                loc.line,
+                loc.column,
+                @tagName(diag.severity),
+                code_kind,
+                diag.code,
+                diag.message,
+            });
+        }
+    }
 };
 
 test "DiagnosticEngine" {

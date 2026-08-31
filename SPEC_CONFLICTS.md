@@ -44,3 +44,11 @@ their call shapes. The only concrete example is target-first
 provisionally applies that target-first, two-argument shape consistently to the
 other conversion builtins; this must not be treated as a finalized normative
 contract.
+
+### Non-pointer optional layout
+
+`spec/00-language/types.xml` fixes the null niche representation for `?*T`, but
+does not define the size, alignment, tag placement, or ABI representation of a
+general non-pointer `?T`. Stage 0 therefore implements null-niche optional
+pointers and preserves the existing present-value path for other optionals,
+without exposing an invented general optional layout through reflection.

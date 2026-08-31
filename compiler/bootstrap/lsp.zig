@@ -80,7 +80,7 @@ const Document = struct {
 
         const sema = try self.allocator.create(Sema);
         errdefer self.allocator.destroy(sema);
-        sema.* = Sema.init(self.allocator, self.ast.?, &self.engine, &self.types, &self.root_scope);
+        sema.* = Sema.init(self.allocator, self.ast.?, file_id, &self.engine, &self.types, &self.root_scope);
         sema.analyze() catch {};
         self.sema = sema;
     }
@@ -203,12 +203,18 @@ fn handle(server: *Server, input: []const u8) ![]u8 {
 }
 
 fn field(value: std.json.Value, name: []const u8) ?std.json.Value {
-    return switch (value) { .object => |object| object.get(name), else => null };
+    return switch (value) {
+        .object => |object| object.get(name),
+        else => null,
+    };
 }
 
 fn stringValue(value: ?std.json.Value) ?[]const u8 {
     const item = value orelse return null;
-    return switch (item) { .string => |text| text, else => null };
+    return switch (item) {
+        .string => |text| text,
+        else => null,
+    };
 }
 
 fn position(params: std.json.Value) ?Position {
@@ -216,8 +222,14 @@ fn position(params: std.json.Value) ?Position {
     const line = field(value, "line") orelse return null;
     const character = field(value, "character") orelse return null;
     return .{
-        .line = switch (line) { .integer => |n| if (n >= 0) @intCast(n) else return null, else => return null },
-        .character = switch (character) { .integer => |n| if (n >= 0) @intCast(n) else return null, else => return null },
+        .line = switch (line) {
+            .integer => |n| if (n >= 0) @intCast(n) else return null,
+            else => return null,
+        },
+        .character = switch (character) {
+            .integer => |n| if (n >= 0) @intCast(n) else return null,
+            else => return null,
+        },
     };
 }
 
@@ -278,7 +290,12 @@ fn appendDiagnostic(out: *std.ArrayList(u8), allocator: std.mem.Allocator, text:
     first.* = false;
     const start_pos = offsetToPosition(text, start);
     const end_pos = offsetToPosition(text, @max(start, end));
-    const level: u8 = switch (severity) { .@"error" => 1, .warning => 2, .note => 3, .help => 4 };
+    const level: u8 = switch (severity) {
+        .@"error" => 1,
+        .warning => 2,
+        .note => 3,
+        .help => 4,
+    };
     const prefix: u8 = if (severity == .warning) 'W' else 'E';
     try appendFormat(out, allocator, "{{\"range\":{{\"start\":{{\"line\":{d},\"character\":{d}}},\"end\":{{\"line\":{d},\"character\":{d}}}}},\"severity\":{d},\"code\":\"ZIN-{c}{d:0>4}\",\"source\":\"zin\",\"message\":", .{ start_pos.line, start_pos.character, end_pos.line, end_pos.character, level, prefix, code });
     try appendJsonString(out, allocator, message);

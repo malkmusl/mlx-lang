@@ -7,11 +7,62 @@ pub fn parse(parser: anytype, lhs: Node.Index, binding_power: u8) !?Node.Index {
     if (100 < binding_power or parser.index >= parser.tokens.len) return null;
     return switch (parser.tokens[parser.index].tag) {
         .l_paren => parseCall(parser, lhs),
-        .dot => parseField(parser, lhs),
+        .dot => if (parser.index + 1 < parser.tokens.len and parser.tokens[parser.index + 1].tag == .l_brace)
+            parseAggregateLiteral(parser, lhs)
+        else
+            parseField(parser, lhs),
         .l_bracket => parseIndexOrSlice(parser, lhs),
         .dot_asterisk, .dot_question => parseUnarySuffix(parser, lhs),
         else => null,
     };
+}
+
+/// Typed aggregate literal: `Type.{ .field = value, ... }`.
+fn parseAggregateLiteral(parser: anytype, type_node: Node.Index) !?Node.Index {
+    const dot_token = parser.index;
+    parser.consumeToken("Consume aggregate literal '.'");
+    parser.consumeToken("Consume aggregate literal '{'");
+    var fields = std.ArrayList(u32).empty;
+    defer fields.deinit(parser.allocator);
+    var count: u32 = 0;
+    while (parser.index < parser.tokens.len and parser.tokens[parser.index].tag != .r_brace) {
+        while (parser.index < parser.tokens.len and parser.tokens[parser.index].tag == .statement_end) parser.index += 1;
+        if (parser.index < parser.tokens.len and parser.tokens[parser.index].tag == .r_brace) break;
+        if (parser.index >= parser.tokens.len or parser.tokens[parser.index].tag != .dot) {
+            try parser.reportError(2001, "Expected '.field' in aggregate literal");
+            return null;
+        }
+        parser.consumeToken("Consume aggregate field '.'");
+        if (parser.index >= parser.tokens.len or parser.tokens[parser.index].tag != .ident) {
+            try parser.reportError(2001, "Expected aggregate field name");
+            return null;
+        }
+        const name_token = parser.index;
+        parser.consumeToken("Consume aggregate field name");
+        if (parser.index >= parser.tokens.len or parser.tokens[parser.index].tag != .equal) {
+            try parser.reportError(2001, "Expected '=' in aggregate field initializer");
+            return null;
+        }
+        parser.consumeToken("Consume aggregate field '='");
+        const value = try parser.parseExpr(0) orelse return null;
+        try fields.appendSlice(parser.allocator, &.{ name_token, value });
+        count += 1;
+        if (parser.index < parser.tokens.len and parser.tokens[parser.index].tag == .comma) parser.index += 1;
+    }
+    if (parser.index >= parser.tokens.len or parser.tokens[parser.index].tag != .r_brace) {
+        try parser.reportError(2003, "Expected '}' after aggregate literal");
+        return null;
+    }
+    parser.consumeToken("Consume aggregate literal '}'");
+    const extra_start: u32 = @intCast(parser.extra_data.items.len);
+    try parser.extra_data.append(parser.allocator, count);
+    try parser.extra_data.appendSlice(parser.allocator, fields.items);
+    try parser.nodes.append(parser.allocator, .{
+        .tag = .aggregate_literal,
+        .main_token = dot_token,
+        .data = .{ .lhs = type_node, .rhs = extra_start },
+    });
+    return @intCast(parser.nodes.len - 1);
 }
 
 fn parseCall(parser: anytype, lhs: Node.Index) !?Node.Index {

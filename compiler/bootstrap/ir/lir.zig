@@ -59,6 +59,10 @@ pub const CmpPredicate = enum {
     le,
     gt,
     ge,
+    ult,
+    ule,
+    ugt,
+    uge,
 };
 
 pub const Inst = struct {
@@ -136,6 +140,8 @@ pub const Lir = struct {
     insts: std.ArrayList(Inst),
     blocks: std.ArrayList(BasicBlock),
     extra_data: std.ArrayList(u32), // Stores argument lists, etc.
+    symbols: std.ArrayList([]const u8),
+    symbol_ids: std.StringHashMap(u32),
 
     pub fn init(allocator: std.mem.Allocator) Lir {
         return .{
@@ -143,7 +149,26 @@ pub const Lir = struct {
             .insts = std.ArrayList(Inst).empty,
             .blocks = std.ArrayList(BasicBlock).empty,
             .extra_data = std.ArrayList(u32).empty,
+            .symbols = .empty,
+            .symbol_ids = std.StringHashMap(u32).init(allocator),
         };
+    }
+
+    pub fn internModuleSymbol(self: *Lir, module_id: u32, name: []const u8) !u32 {
+        const qualified = if (module_id == 0)
+            try self.allocator.dupe(u8, name)
+        else
+            try std.fmt.allocPrint(self.allocator, "__zin_m{d}_{s}", .{ module_id, name });
+        errdefer self.allocator.free(qualified);
+        if (self.symbol_ids.get(qualified)) |id| {
+            self.allocator.free(qualified);
+            return id;
+        }
+        const id: u32 = @intCast(self.symbols.items.len);
+        try self.symbols.append(self.allocator, qualified);
+        errdefer _ = self.symbols.pop();
+        try self.symbol_ids.put(qualified, id);
+        return id;
     }
 
     pub fn deinit(self: *Lir) void {
@@ -153,5 +178,8 @@ pub const Lir = struct {
         self.blocks.deinit(self.allocator);
         self.insts.deinit(self.allocator);
         self.extra_data.deinit(self.allocator);
+        for (self.symbols.items) |symbol| self.allocator.free(symbol);
+        self.symbols.deinit(self.allocator);
+        self.symbol_ids.deinit();
     }
 };

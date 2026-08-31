@@ -9,7 +9,21 @@ const Phase = @import("../source/diagnostics.zig").Phase;
 const Token = @import("../syntax/token.zig").Token;
 const builtin = @import("builtin.zig");
 const postfix = @import("expressions/postfix.zig");
+const prefix = @import("expressions/prefix.zig");
 const operator_semantics = @import("expressions/operators.zig");
+const module_namespace = @import("../modules/namespace.zig");
+const ModuleId = @import("../modules/resolver.zig").ModuleId;
+const cleanup_semantics = @import("control_flow/cleanup.zig");
+const match_semantics = @import("control_flow/match.zig");
+const aggregate_semantics = @import("expressions/aggregate.zig");
+const aggregate_type_semantics = @import("types/aggregate.zig");
+const error_set_semantics = @import("types/error_set.zig");
+const optional_semantics = @import("expressions/optional.zig");
+const generic_model = @import("generics/model.zig");
+const generic_definition = @import("generics/definition.zig");
+const generic_instantiation = @import("generics/instantiate.zig");
+const conditional_semantics = @import("control_flow/conditional.zig");
+const integer_semantics = @import("numbers/integer.zig");
 
 pub const LocalState = enum {
     uninitialized,
@@ -25,8 +39,12 @@ const LoopContext = struct {
 
 pub const Sema = struct {
     const trace_enabled = false;
+    pub const ExternalDecl = struct { module_id: ModuleId, name: []const u8, is_function: bool };
+    pub const DynamicField = struct { base_node: Node.Index, name: []const u8 };
+
     allocator: std.mem.Allocator,
     ast_tree: ast.Ast,
+    source_id: u32,
     diags: *DiagnosticEngine,
     type_pool: *TypePool,
     root_scope: *Scope,
@@ -41,6 +59,14 @@ pub const Sema = struct {
     type_values: std.AutoHashMap(Node.Index, Type.Id),
 
     resolved_decls: std.AutoHashMap(Node.Index, Node.Index),
+    module_values: std.AutoHashMap(Node.Index, ModuleId),
+    external_decls: std.AutoHashMap(Node.Index, ExternalDecl),
+    dynamic_fields: std.AutoHashMap(Node.Index, DynamicField),
+    generic_instances: std.ArrayList(generic_model.Instance),
+    generic_calls: std.AutoHashMap(Node.Index, u32),
+    module_id: ?ModuleId = null,
+    import_ids: ?*const std.AutoHashMap(Node.Index, ModuleId) = null,
+    module_registry: ?*const module_namespace.Registry = null,
 
     unsafe_depth: u32 = 0,
     eval_branch_quota: u64,
@@ -50,6 +76,7 @@ pub const Sema = struct {
     pub fn init(
         allocator: std.mem.Allocator,
         ast_tree: ast.Ast,
+        source_id: u32,
         diags: *DiagnosticEngine,
         type_pool: *TypePool,
         root_scope: *Scope,
@@ -57,6 +84,7 @@ pub const Sema = struct {
         return .{
             .allocator = allocator,
             .ast_tree = ast_tree,
+            .source_id = source_id,
             .diags = diags,
             .type_pool = type_pool,
             .root_scope = root_scope,
@@ -65,6 +93,11 @@ pub const Sema = struct {
             .const_values = std.AutoHashMap(Node.Index, u64).init(allocator),
             .type_values = std.AutoHashMap(Node.Index, Type.Id).init(allocator),
             .resolved_decls = std.AutoHashMap(Node.Index, Node.Index).init(allocator),
+            .module_values = std.AutoHashMap(Node.Index, ModuleId).init(allocator),
+            .external_decls = std.AutoHashMap(Node.Index, ExternalDecl).init(allocator),
+            .dynamic_fields = std.AutoHashMap(Node.Index, DynamicField).init(allocator),
+            .generic_instances = std.ArrayList(generic_model.Instance).empty,
+            .generic_calls = std.AutoHashMap(Node.Index, u32).init(allocator),
             .unsafe_depth = 0,
             .eval_branch_quota = 1_000_000,
             .current_return_type = null,
@@ -78,7 +111,24 @@ pub const Sema = struct {
         self.const_values.deinit();
         self.type_values.deinit();
         self.resolved_decls.deinit();
+        self.module_values.deinit();
+        self.external_decls.deinit();
+        self.dynamic_fields.deinit();
+        for (self.generic_instances.items) |*instance| instance.deinit(self.allocator);
+        self.generic_instances.deinit(self.allocator);
+        self.generic_calls.deinit();
         self.loop_stack.deinit(self.allocator);
+    }
+
+    pub fn configureModules(
+        self: *Sema,
+        module_id: ModuleId,
+        import_ids: *const std.AutoHashMap(Node.Index, ModuleId),
+        registry: *const module_namespace.Registry,
+    ) void {
+        self.module_id = module_id;
+        self.import_ids = import_ids;
+        self.module_registry = registry;
     }
 
     pub fn analyze(self: *Sema) !void {
@@ -109,7 +159,7 @@ pub const Sema = struct {
                 const ty = try self.type_pool.intern(.{ .primitive = .comptime_int_type }, .copyable);
                 try self.node_types.put(node_idx, ty);
                 const tok = self.ast_tree.tokens[node.main_token];
-                const src = self.diags.source_manager.getFile(0).?.content;
+                const src = self.diags.source_manager.getFile(self.source_id).?.content;
                 if (std.fmt.parseInt(u64, src[tok.start..tok.end], 0)) |value| {
                     try self.const_values.put(node_idx, value);
                 } else |_| {}
@@ -123,11 +173,12 @@ pub const Sema = struct {
             .bool_literal => {
                 const ty = try self.type_pool.internPrimitive(.bool_type);
                 const tok = self.ast_tree.tokens[node.main_token];
-                const src = self.diags.source_manager.getFile(0).?.content;
+                const src = self.diags.source_manager.getFile(self.source_id).?.content;
                 try self.const_values.put(node_idx, if (std.mem.eql(u8, src[tok.start..tok.end], "true")) 1 else 0);
                 try self.node_types.put(node_idx, ty);
                 return ty;
             },
+            .null_literal, .undefined_literal => return optional_semantics.analyzeLiteral(self, node_idx),
             .string_literal => {
                 const u8_type = try self.type_pool.internInt(false, 8);
                 const ty = try self.type_pool.internSlice(u8_type, true);
@@ -139,10 +190,11 @@ pub const Sema = struct {
                 try self.node_types.put(node_idx, ty);
                 return ty;
             },
-            .struct_decl, .enum_decl, .union_decl => return self.analyzeAggregateType(node_idx, scope),
+            .struct_decl, .enum_decl, .union_decl => return aggregate_type_semantics.analyze(self, node_idx, scope),
+            .error_set_decl => return error_set_semantics.analyze(self, node_idx, scope),
             .identifier => {
                 const tok = self.ast_tree.tokens[node.main_token];
-                const src = self.diags.source_manager.getFile(0).?.content;
+                const src = self.diags.source_manager.getFile(self.source_id).?.content;
                 const ident_name = src[tok.start..tok.end];
 
                 // First check scope
@@ -154,6 +206,9 @@ pub const Sema = struct {
                         }
                     }
                     try self.resolved_decls.put(node_idx, sym.decl_node);
+                    if (self.module_values.get(sym.decl_node)) |module_value| try self.module_values.put(node_idx, module_value);
+                    if (self.type_values.get(sym.decl_node)) |type_value| try self.type_values.put(node_idx, type_value);
+                    if (self.const_values.get(sym.decl_node)) |const_value| try self.const_values.put(node_idx, const_value);
                     try self.node_types.put(node_idx, sym.type_id);
                     return sym.type_id;
                 }
@@ -191,9 +246,11 @@ pub const Sema = struct {
                     null;
 
                 if (builtin_prim) |prim| {
-                    const ty = try self.type_pool.intern(.{ .primitive = prim }, .copyable);
-                    try self.node_types.put(node_idx, ty);
-                    return ty;
+                    const type_value = try self.type_pool.intern(.{ .primitive = prim }, .copyable);
+                    try self.type_values.put(node_idx, type_value);
+                    const type_type = try self.type_pool.internPrimitive(.type_type);
+                    try self.node_types.put(node_idx, type_type);
+                    return type_type;
                 }
 
                 // Check builtin integer types: u8, i8, u16, i16, u32, i32, u64, i64, usize, isize
@@ -203,11 +260,20 @@ pub const Sema = struct {
                     if ((signed or unsigned) and ident_name.len <= 5) {
                         const bits = std.fmt.parseInt(u16, ident_name[1..], 10) catch 0;
                         if (bits > 0 and bits <= 4096) {
-                            const ty = try self.type_pool.intern(.{ .integer = .{ .is_signed = signed, .bits = bits } }, .copyable);
-                            try self.node_types.put(node_idx, ty);
-                            return ty;
+                            const type_value = try self.type_pool.intern(.{ .integer = .{ .is_signed = signed, .bits = bits } }, .copyable);
+                            try self.type_values.put(node_idx, type_value);
+                            const type_type = try self.type_pool.internPrimitive(.type_type);
+                            try self.node_types.put(node_idx, type_type);
+                            return type_type;
                         }
                     }
+                }
+                if (std.mem.eql(u8, ident_name, "usize") or std.mem.eql(u8, ident_name, "isize")) {
+                    const type_value = try self.type_pool.internSizeInt(std.mem.eql(u8, ident_name, "isize"));
+                    try self.type_values.put(node_idx, type_value);
+                    const type_type = try self.type_pool.internPrimitive(.type_type);
+                    try self.node_types.put(node_idx, type_type);
+                    return type_type;
                 }
 
                 try self.reportError(3001, .resolve, tok.start, "Use of undeclared identifier");
@@ -224,7 +290,7 @@ pub const Sema = struct {
                 const type_node = self.ast_tree.extra_data[extra_start];
                 const init_node = self.ast_tree.extra_data[extra_start + 1];
 
-                const src = self.diags.source_manager.getFile(0).?.content;
+                const src = self.diags.source_manager.getFile(self.source_id).?.content;
                 const ident_tok = self.ast_tree.tokens[ident_tok_idx];
                 const name = src[ident_tok.start..ident_tok.end];
 
@@ -244,6 +310,12 @@ pub const Sema = struct {
                         const to_name = self.type_pool.typeName(declared_type, &to_buf) catch "<unknown>";
                         if (trace_enabled) std.debug.print("TYPE ERROR: cannot coerce '{s}' to '{s}' for variable '{s}'\n", .{ from_name, to_name, name });
                         try self.reportError(4001, .sema, ident_tok.start, "Type mismatch");
+                    }
+                    if (self.const_values.get(init_node)) |value| {
+                        const target = self.type_pool.get(declared_type);
+                        if (target.isInteger() and !integerValueFits(target, value)) {
+                            try self.reportError(4002, .sema, ident_tok.start, "Comptime integer does not fit the declared type");
+                        }
                     }
                 }
 
@@ -290,11 +362,16 @@ pub const Sema = struct {
 
                 try self.local_states.put(node_idx, .initialized);
                 try self.node_types.put(node_idx, declared_type);
-                if (self.type_values.get(init_node)) |type_value| {
-                    try self.type_values.put(node_idx, type_value);
-                }
-                if (self.const_values.get(init_node)) |const_value| {
-                    try self.const_values.put(node_idx, const_value);
+                if (node.tag == .const_decl) {
+                    if (self.type_values.get(init_node)) |type_value| {
+                        try self.type_values.put(node_idx, type_value);
+                    }
+                    if (self.const_values.get(init_node)) |const_value| {
+                        try self.const_values.put(node_idx, const_value);
+                    }
+                    if (self.module_values.get(init_node)) |module_value| {
+                        try self.module_values.put(node_idx, module_value);
+                    }
                 }
 
                 return declared_type;
@@ -303,30 +380,13 @@ pub const Sema = struct {
             .binary_op => return operator_semantics.analyze(self, node_idx, scope),
             .unary_op => {
                 if (try postfix.analyzeUnarySuffix(self, node_idx, scope)) |type_id| return type_id;
-                const operand_type = try self.analyzeNode(node.data.lhs, scope);
-                const operator = self.ast_tree.tokens[node.main_token].tag;
-                if (operator == .keyword_try) {
-                    const operand = self.type_pool.get(operand_type);
-                    if (operand.data != .error_union) {
-                        try self.reportError(4014, .sema, self.ast_tree.tokens[node.main_token].start, "try requires an error-union operand");
-                        try self.node_types.put(node_idx, operand_type);
-                        return operand_type;
-                    }
-                    const return_type = if (self.current_return_type) |type_id|
-                        self.type_pool.get(type_id)
-                    else
-                        null;
-                    if (return_type == null or return_type.?.data != .error_union) {
-                        try self.reportError(4008, .sema, self.ast_tree.tokens[node.main_token].start, "try can only propagate from an error-capable function");
-                    }
-                    const payload = operand.data.error_union.payload;
-                    try self.node_types.put(node_idx, payload);
-                    return payload;
-                }
-                try self.node_types.put(node_idx, operand_type);
-                return operand_type;
+                if (try prefix.analyze(self, node_idx, scope)) |type_id| return type_id;
+                unreachable;
             },
             .array_access, .slice => return postfix.analyze(self, node_idx, scope),
+            .aggregate_literal => return aggregate_semantics.analyze(self, node_idx, scope),
+            .defer_stmt, .errdefer_stmt => return cleanup_semantics.analyze(self, node_idx, scope),
+            .match_stmt => return match_semantics.analyze(self, node_idx, scope),
             .tuple_literal => {
                 const extra_start = node.data.lhs;
                 const count = self.ast_tree.extra_data[extra_start];
@@ -337,7 +397,7 @@ pub const Sema = struct {
                     const element_type = try self.analyzeNode(self.ast_tree.extra_data[extra_start + 1 + i], scope);
                     try fields.append(self.allocator, .{ .name = "", .type_id = element_type });
                 }
-                const ty = self.type_pool.internAggregate(.tuple, fields.items, null, null) catch {
+                const ty = self.type_pool.internAggregate(.tuple, fields.items, null, null, false) catch {
                     try self.reportError(5005, .@"comptime", self.ast_tree.tokens[node.main_token].start, "Tuple layout could not be computed");
                     return self.type_pool.internPrimitive(.void_type);
                 };
@@ -371,13 +431,48 @@ pub const Sema = struct {
             },
             .field_access => {
                 const base_type = try self.analyzeNode(node.data.lhs, scope);
+                if (self.module_values.get(node.data.lhs)) |module_id| {
+                    const field_token = self.ast_tree.tokens[node.main_token];
+                    const src = self.diags.source_manager.getFile(self.source_id).?.content;
+                    const field_name = src[field_token.start..field_token.end];
+                    const registry = self.module_registry orelse {
+                        try self.reportError(3001, .resolve, field_token.start, "Module namespace is unavailable");
+                        return self.putBuiltinResult(node_idx, try self.type_pool.internPrimitive(.void_type));
+                    };
+                    const declaration = registry.get(module_id, field_name) orelse {
+                        try self.reportError(3001, .resolve, field_token.start, "Unknown module declaration");
+                        return self.putBuiltinResult(node_idx, try self.type_pool.internPrimitive(.void_type));
+                    };
+                    if (!declaration.public) try self.reportError(3003, .resolve, field_token.start, "Module declaration is private");
+                    try self.node_types.put(node_idx, declaration.type_id);
+                    if (declaration.const_value) |value| try self.const_values.put(node_idx, value);
+                    if (declaration.type_value) |value| try self.type_values.put(node_idx, value);
+                    if (declaration.module_value) |value| try self.module_values.put(node_idx, value);
+                    try self.external_decls.put(node_idx, .{ .module_id = module_id, .name = field_name, .is_function = declaration.is_function });
+                    return declaration.type_id;
+                }
+                if (self.type_values.get(node.data.lhs)) |type_value| {
+                    const reflected = self.type_pool.get(type_value);
+                    if (reflected.data == .@"enum" or reflected.data == .error_set) {
+                        const field_token = self.ast_tree.tokens[node.main_token];
+                        const src = self.diags.source_manager.getFile(self.source_id).?.content;
+                        const member = self.type_pool.aggregateField(type_value, src[field_token.start..field_token.end]) orelse {
+                            try self.reportError(3001, .resolve, field_token.start, if (reflected.data == .error_set) "Unknown error-set member" else "Unknown enum member");
+                            try self.node_types.put(node_idx, type_value);
+                            return type_value;
+                        };
+                        try self.node_types.put(node_idx, type_value);
+                        try self.const_values.put(node_idx, member.value orelse 0);
+                        return type_value;
+                    }
+                }
                 const base = self.type_pool.get(base_type);
                 if (base.data == .primitive and base.data.primitive == .anyopaque_type) {
                     try self.node_types.put(node_idx, base_type);
                     return base_type;
                 }
                 const field_token = self.ast_tree.tokens[node.main_token];
-                const src = self.diags.source_manager.getFile(0).?.content;
+                const src = self.diags.source_manager.getFile(self.source_id).?.content;
                 if (self.type_pool.aggregateField(base_type, src[field_token.start..field_token.end])) |field| {
                     try self.node_types.put(node_idx, field.type_id);
                     return field.type_id;
@@ -415,46 +510,7 @@ pub const Sema = struct {
                 try self.node_types.put(node_idx, last_type);
                 return last_type;
             },
-            .if_stmt => {
-                const extra_start = node.data.lhs;
-                const extra_end = node.data.rhs;
-
-                const cond_idx = self.ast_tree.extra_data[extra_start];
-                const condition_type = try self.analyzeNode(cond_idx, scope);
-                if (!isPrimitive(self.type_pool.get(condition_type), .bool_type)) {
-                    try self.reportError(4001, .sema, self.ast_tree.tokens[self.ast_tree.nodes.get(cond_idx).main_token].start, "if condition must have type bool");
-                }
-
-                const then_idx = self.ast_tree.extra_data[extra_start + 1];
-                const then_type = try self.analyzeNode(then_idx, scope);
-
-                var else_type = try self.type_pool.internPrimitive(.void_type);
-                if (extra_end > extra_start + 2) {
-                    const else_idx = self.ast_tree.extra_data[extra_start + 2];
-                    else_type = try self.analyzeNode(else_idx, scope);
-                }
-
-                const has_else = extra_end > extra_start + 2;
-                var result_type = try self.type_pool.internPrimitive(.void_type);
-                if (has_else) {
-                    const then_value = self.type_pool.get(then_type);
-                    const else_value = self.type_pool.get(else_type);
-                    if (isPrimitive(then_value, .noreturn_type)) {
-                        result_type = else_type;
-                    } else if (isPrimitive(else_value, .noreturn_type)) {
-                        result_type = then_type;
-                    } else if (self.type_pool.isCoercible(then_type, else_type)) {
-                        result_type = else_type;
-                    } else if (self.type_pool.isCoercible(else_type, then_type)) {
-                        result_type = then_type;
-                    } else {
-                        try self.reportError(4001, .sema, self.ast_tree.tokens[node.main_token].start, "if and else branches have incompatible types");
-                        result_type = then_type;
-                    }
-                }
-                try self.node_types.put(node_idx, result_type);
-                return result_type;
-            },
+            .if_stmt => return conditional_semantics.analyze(self, node_idx, scope),
             .while_stmt => {
                 const extra_start = node.data.lhs;
                 const label_token = self.ast_tree.extra_data[extra_start];
@@ -528,7 +584,7 @@ pub const Sema = struct {
                         };
                         if (iterable.tag == .identifier) {
                             const iterable_token = self.ast_tree.tokens[iterable.main_token];
-                            const source = self.diags.source_manager.getFile(0).?.content;
+                            const source = self.diags.source_manager.getFile(self.source_id).?.content;
                             if (scope.get(source[iterable_token.start..iterable_token.end])) |symbol| {
                                 is_const_storage = is_const_storage or symbol.is_const;
                             }
@@ -544,7 +600,7 @@ pub const Sema = struct {
 
                 var loop_scope = Scope.init(self.allocator, scope);
                 defer loop_scope.deinit();
-                const src = self.diags.source_manager.getFile(0).?.content;
+                const src = self.diags.source_manager.getFile(self.source_id).?.content;
                 const item_tok = self.ast_tree.tokens[item_token];
                 try loop_scope.put(src[item_tok.start..item_tok.end], .{
                     .name = src[item_tok.start..item_tok.end],
@@ -613,10 +669,13 @@ pub const Sema = struct {
                 const extra_len = node.data.rhs;
 
                 const ret_type_node = self.ast_tree.extra_data[extra_start];
-                const ret_type = try self.resolveBuiltinTypeArg(ret_type_node, scope) orelse {
-                    try self.reportError(4001, .sema, self.ast_tree.tokens[node.main_token].start, "Function return type could not be resolved");
-                    return self.type_pool.internPrimitive(.void_type);
-                };
+                const ret_type = if (self.nodeNamesGenericTypeParameter(node_idx, ret_type_node))
+                    try self.type_pool.internPrimitive(.anytype_type)
+                else
+                    try self.resolveBuiltinTypeArg(ret_type_node, scope) orelse {
+                        try self.reportError(4001, .sema, self.ast_tree.tokens[node.main_token].start, "Function return type could not be resolved");
+                        return self.type_pool.internPrimitive(.void_type);
+                    };
 
                 var param_types = std.ArrayList(Type.Id).empty;
                 defer param_types.deinit(self.allocator);
@@ -626,10 +685,13 @@ pub const Sema = struct {
                     const param_node = self.ast_tree.nodes.get(param_idx);
 
                     const param_type_node = param_node.data.rhs;
-                    const param_type = try self.resolveBuiltinTypeArg(param_type_node, scope) orelse {
-                        try self.reportError(4001, .sema, self.ast_tree.tokens[param_node.main_token].start, "Function parameter type could not be resolved");
-                        continue;
-                    };
+                    const param_type = if (self.nodeNamesGenericTypeParameter(node_idx, param_type_node))
+                        try self.type_pool.internPrimitive(.anytype_type)
+                    else
+                        try self.resolveBuiltinTypeArg(param_type_node, scope) orelse {
+                            try self.reportError(4001, .sema, self.ast_tree.tokens[param_node.main_token].start, "Function parameter type could not be resolved");
+                            continue;
+                        };
                     try param_types.append(self.allocator, param_type);
                     try self.node_types.put(param_idx, param_type);
                 }
@@ -652,6 +714,12 @@ pub const Sema = struct {
                 const body = node.data.rhs;
 
                 const fn_type = try self.declareFunction(node_idx, scope);
+                if (generic_definition.isGeneric(&self.ast_tree, node_idx)) {
+                    // The body is checked once per canonical argument tuple by
+                    // the generic-instantiation engine at its call sites.
+                    try self.node_types.put(node_idx, fn_type);
+                    return fn_type;
+                }
                 try self.bindFunctionParameters(proto, fn_type, &child_scope);
                 const proto_node = self.ast_tree.nodes.get(proto);
                 const name_tok_idx = proto_node.main_token;
@@ -689,6 +757,21 @@ pub const Sema = struct {
 
                 const num_args = self.ast_tree.extra_data[extra_start];
                 const target_type = self.type_pool.get(target_type_id);
+                if (self.resolved_decls.get(target)) |target_declaration| {
+                    if (generic_definition.isGeneric(&self.ast_tree, target_declaration)) {
+                        const outcome = try generic_instantiation.analyzeCall(
+                            self,
+                            node_idx,
+                            target_declaration,
+                            self.ast_tree.extra_data[extra_start + 1 .. extra_start + 1 + num_args],
+                            scope,
+                        );
+                        try self.generic_calls.put(node_idx, outcome.instance_id);
+                        try self.node_types.put(node_idx, outcome.return_type);
+                        if (outcome.type_value) |type_value| try self.type_values.put(node_idx, type_value);
+                        return outcome.return_type;
+                    }
+                }
                 if (target_type.data != .function) {
                     var i: u32 = 0;
                     while (i < num_args) : (i += 1) {
@@ -741,6 +824,13 @@ pub const Sema = struct {
                     if (!return_matches) {
                         try self.reportError(4001, .sema, self.ast_tree.tokens[node.main_token].start, "Returned expression does not match function return type");
                     }
+                    if (self.const_values.get(node.data.rhs)) |value| {
+                        const target_id = if (expected.data == .error_union) expected.data.error_union.payload else expected_type;
+                        const target = self.type_pool.get(target_id);
+                        if (target.isInteger() and !integerValueFits(target, value)) {
+                            try self.reportError(4002, .sema, self.ast_tree.tokens[node.main_token].start, "Returned comptime integer does not fit the return type");
+                        }
+                    }
                 }
                 const noreturn_type = try self.type_pool.internPrimitive(.noreturn_type);
                 try self.node_types.put(node_idx, noreturn_type);
@@ -755,7 +845,7 @@ pub const Sema = struct {
 
     fn analyzeBuiltin(self: *Sema, node_idx: Node.Index, scope: *Scope) std.mem.Allocator.Error!Type.Id {
         const node = self.ast_tree.nodes.get(node_idx);
-        const src = self.diags.source_manager.getFile(0).?.content;
+        const src = self.diags.source_manager.getFile(self.source_id).?.content;
         const name_token = self.ast_tree.tokens[node.data.lhs];
         const name = src[name_token.start..name_token.end];
         const kind = builtin.lookup(name) orelse {
@@ -936,6 +1026,13 @@ pub const Sema = struct {
                 if (self.stringLiteralContent(args[0]) == null) {
                     try self.reportError(5001, .@"comptime", name_token.start, "@import path must be a comptime string literal");
                 }
+                if (self.import_ids) |imports| {
+                    if (imports.get(node_idx)) |module_id| {
+                        try self.module_values.put(node_idx, module_id);
+                    } else {
+                        try self.reportError(3004, .resolve, name_token.start, "Imported module was not loaded");
+                    }
+                }
                 return self.putBuiltinResult(node_idx, try self.type_pool.internPrimitive(.anyopaque_type));
             },
             .fieldCount => {
@@ -1003,7 +1100,7 @@ pub const Sema = struct {
                     try self.reportError(5005, .@"comptime", name_token.start, "Unknown aggregate field");
                     return self.putBuiltinResult(node_idx, try self.type_pool.internPrimitive(.void_type));
                 };
-                try self.reportError(9001, .lowering, name_token.start, "Dynamic aggregate field lowering is not available in Stage 0 yet");
+                try self.dynamic_fields.put(node_idx, .{ .base_node = args[0], .name = field_name });
                 return self.putBuiltinResult(node_idx, field.type_id);
             },
             .tagOf => {
@@ -1104,7 +1201,7 @@ pub const Sema = struct {
         if (self.loop_stack.items.len == 0) return null;
         if (label_token == std.math.maxInt(u32)) return self.loop_stack.items.len - 1;
 
-        const source = self.diags.source_manager.getFile(0).?.content;
+        const source = self.diags.source_manager.getFile(self.source_id).?.content;
         const wanted_token = self.ast_tree.tokens[label_token];
         const wanted = source[wanted_token.start..wanted_token.end];
         var index = self.loop_stack.items.len;
@@ -1121,7 +1218,7 @@ pub const Sema = struct {
     fn findRootFunction(self: *const Sema, name: []const u8) ?Node.Index {
         const root = self.ast_tree.nodes.get(self.ast_tree.nodes.len - 1);
         if (root.tag != .root) return null;
-        const src = self.diags.source_manager.getFile(0).?.content;
+        const src = self.diags.source_manager.getFile(self.source_id).?.content;
         var index = root.data.lhs;
         while (index < root.data.rhs) : (index += 1) {
             const declaration_index = self.ast_tree.extra_data[index];
@@ -1134,13 +1231,31 @@ pub const Sema = struct {
         return null;
     }
 
+    fn nodeNamesGenericTypeParameter(self: *const Sema, prototype_index: Node.Index, type_node_index: Node.Index) bool {
+        const type_node = self.ast_tree.nodes.get(type_node_index);
+        if (type_node.tag != .identifier) return false;
+        const source = self.diags.source_manager.getFile(self.source_id).?.content;
+        const type_token = self.ast_tree.tokens[type_node.main_token];
+        const prototype = self.ast_tree.nodes.get(prototype_index);
+        var offset: u32 = 1;
+        while (offset < prototype.data.rhs) : (offset += 1) {
+            const parameter = self.ast_tree.nodes.get(self.ast_tree.extra_data[prototype.data.lhs + offset]);
+            if (!parameter.decl_flags.comptime_param) continue;
+            const parameter_type = self.ast_tree.nodes.get(parameter.data.rhs);
+            if (parameter_type.tag != .identifier or self.ast_tree.tokens[parameter_type.main_token].tag != .keyword_type) continue;
+            const parameter_token = self.ast_tree.tokens[parameter.main_token];
+            if (std.mem.eql(u8, source[type_token.start..type_token.end], source[parameter_token.start..parameter_token.end])) return true;
+        }
+        return false;
+    }
+
     fn declareFunction(self: *Sema, declaration_index: Node.Index, scope: *Scope) std.mem.Allocator.Error!Type.Id {
         const declaration = self.ast_tree.nodes.get(declaration_index);
         const prototype_index = declaration.data.lhs;
         const prototype = self.ast_tree.nodes.get(prototype_index);
         const function_type = self.node_types.get(prototype_index) orelse try self.analyzeNode(prototype_index, scope);
         const token = self.ast_tree.tokens[prototype.main_token];
-        const src = self.diags.source_manager.getFile(0).?.content;
+        const src = self.diags.source_manager.getFile(self.source_id).?.content;
         const name = src[token.start..token.end];
         try scope.put(name, .{
             .name = name,
@@ -1156,7 +1271,7 @@ pub const Sema = struct {
         const prototype = self.ast_tree.nodes.get(prototype_index);
         const function = self.type_pool.get(function_type).data.function;
         const parameter_types = self.type_pool.functionParams(function);
-        const src = self.diags.source_manager.getFile(0).?.content;
+        const src = self.diags.source_manager.getFile(self.source_id).?.content;
         var parameter_offset: u32 = 0;
         while (parameter_offset < parameter_types.len) : (parameter_offset += 1) {
             const parameter_index = self.ast_tree.extra_data[prototype.data.lhs + 1 + parameter_offset];
@@ -1178,74 +1293,9 @@ pub const Sema = struct {
         const node = self.ast_tree.nodes.get(node_idx);
         if (node.tag != .identifier) return false;
         const token = self.ast_tree.tokens[node.main_token];
-        const src = self.diags.source_manager.getFile(0).?.content;
+        const src = self.diags.source_manager.getFile(self.source_id).?.content;
         const symbol = scope.get(src[token.start..token.end]) orelse return false;
         return (self.local_states.get(symbol.decl_node) orelse return false) == .moved;
-    }
-
-    fn analyzeAggregateType(self: *Sema, node_idx: Node.Index, scope: *Scope) std.mem.Allocator.Error!Type.Id {
-        if (self.type_values.get(node_idx)) |_| return self.type_pool.internPrimitive(.type_type);
-
-        const node = self.ast_tree.nodes.get(node_idx);
-        const kind: TypePool.AggregateKind = switch (node.tag) {
-            .struct_decl => .@"struct",
-            .enum_decl => .@"enum",
-            .union_decl => .@"union",
-            else => unreachable,
-        };
-        const backing_node = self.ast_tree.extra_data[node.data.lhs];
-        var backing_type: ?Type.Id = null;
-        if (backing_node != std.math.maxInt(u32)) {
-            backing_type = try self.resolveBuiltinTypeArg(backing_node, scope) orelse {
-                try self.reportError(5005, .@"comptime", self.ast_tree.tokens[node.main_token].start, "Aggregate backing/tag must be a type");
-                return self.type_pool.internPrimitive(.type_type);
-            };
-            if (kind == .@"enum" and !self.type_pool.get(backing_type.?).isInteger()) {
-                try self.reportError(4001, .sema, self.ast_tree.tokens[node.main_token].start, "Enum backing type must be an integer");
-            }
-        }
-
-        var fields = std.ArrayList(TypePool.AggregateFieldInput).empty;
-        defer fields.deinit(self.allocator);
-        const src = self.diags.source_manager.getFile(0).?.content;
-        var extra_index = node.data.lhs + 1;
-        while (extra_index < node.data.rhs) : (extra_index += 1) {
-            const member_index = self.ast_tree.extra_data[extra_index];
-            const member = self.ast_tree.nodes.get(member_index);
-            const name_token = self.ast_tree.tokens[member.main_token];
-            const member_type: Type.Id = switch (member.tag) {
-                .field_decl => try self.resolveBuiltinTypeArg(member.data.lhs, scope) orelse {
-                    try self.reportError(5005, .@"comptime", name_token.start, "Struct field type could not be resolved");
-                    continue;
-                },
-                .union_member => if (member.data.lhs == std.math.maxInt(u32))
-                    try self.type_pool.internPrimitive(.void_type)
-                else
-                    try self.resolveBuiltinTypeArg(member.data.lhs, scope) orelse {
-                        try self.reportError(5005, .@"comptime", name_token.start, "Union member type could not be resolved");
-                        continue;
-                    },
-                .enum_member => backing_type orelse {
-                    try self.reportError(5005, .@"comptime", name_token.start, "Enum has no backing type");
-                    continue;
-                },
-                else => continue,
-            };
-            if (member.data.rhs != std.math.maxInt(u32)) _ = try self.analyzeNode(member.data.rhs, scope);
-            try fields.append(self.allocator, .{
-                .name = src[name_token.start..name_token.end],
-                .type_id = member_type,
-            });
-        }
-
-        const aggregate_type = self.type_pool.internAggregate(kind, fields.items, backing_type, null) catch {
-            try self.reportError(5005, .@"comptime", self.ast_tree.tokens[node.main_token].start, "Aggregate layout could not be computed");
-            return self.type_pool.internPrimitive(.type_type);
-        };
-        try self.type_values.put(node_idx, aggregate_type);
-        const result_type = try self.type_pool.internPrimitive(.type_type);
-        try self.node_types.put(node_idx, result_type);
-        return result_type;
     }
 
     fn analyzeCastBuiltin(
@@ -1304,22 +1354,15 @@ pub const Sema = struct {
     }
 
     fn integerValueFits(target: Type, value: u64) bool {
-        return switch (target.data) {
-            .integer => |int| if (int.is_signed)
-                int.bits > 64 or value <= (@as(u64, 1) << @intCast(int.bits - 1)) - 1
-            else
-                int.bits >= 64 or value <= (@as(u64, 1) << @intCast(int.bits)) - 1,
-            .size_int => true,
-            else => false,
-        };
+        return integer_semantics.valueFits(target, value);
     }
 
-    fn resolveBuiltinTypeArg(self: *Sema, node_idx: Node.Index, scope: *Scope) std.mem.Allocator.Error!?Type.Id {
+    pub fn resolveBuiltinTypeArg(self: *Sema, node_idx: Node.Index, scope: *Scope) std.mem.Allocator.Error!?Type.Id {
         const node = self.ast_tree.nodes.get(node_idx);
         switch (node.tag) {
             .identifier => {
                 const token = self.ast_tree.tokens[node.main_token];
-                const src = self.diags.source_manager.getFile(0).?.content;
+                const src = self.diags.source_manager.getFile(self.source_id).?.content;
                 if (scope.get(src[token.start..token.end])) |symbol| {
                     if (self.type_values.get(symbol.decl_node)) |type_value| return type_value;
                 }
@@ -1329,7 +1372,11 @@ pub const Sema = struct {
                 return try self.resolveTypeExpr(node_idx);
             },
             .struct_decl, .enum_decl, .union_decl => {
-                _ = try self.analyzeAggregateType(node_idx, scope);
+                _ = try aggregate_type_semantics.analyze(self, node_idx, scope);
+                return self.type_values.get(node_idx);
+            },
+            .error_set_decl => {
+                _ = try error_set_semantics.analyze(self, node_idx, scope);
                 return self.type_values.get(node_idx);
             },
             .builtin_call => {
@@ -1355,7 +1402,7 @@ pub const Sema = struct {
         const node = self.ast_tree.nodes.get(node_idx);
         if (node.tag != .string_literal) return null;
         const token = self.ast_tree.tokens[node.main_token];
-        const src = self.diags.source_manager.getFile(0).?.content;
+        const src = self.diags.source_manager.getFile(self.source_id).?.content;
         const raw = src[token.start..token.end];
         if (raw.len < 2) return null;
         return raw[1 .. raw.len - 1];
@@ -1367,7 +1414,7 @@ pub const Sema = struct {
             .phase = phase,
             .severity = .@"error",
             .primary_span = .{
-                .file_id = 0,
+                .file_id = self.source_id,
                 .start_byte = start_byte,
                 .end_byte = start_byte + 1,
             },
@@ -1381,7 +1428,7 @@ pub const Sema = struct {
             .phase = phase,
             .severity = .warning,
             .primary_span = .{
-                .file_id = 0,
+                .file_id = self.source_id,
                 .start_byte = start_byte,
                 .end_byte = start_byte + 1,
             },
@@ -1394,7 +1441,7 @@ pub const Sema = struct {
     /// and identifier nodes (mapped to builtin / user-defined types).
     pub fn resolveTypeExpr(self: *Sema, node_idx: Node.Index) !Type.Id {
         const node = self.ast_tree.nodes.get(node_idx);
-        const src = self.diags.source_manager.getFile(0).?.content;
+        const src = self.diags.source_manager.getFile(self.source_id).?.content;
 
         switch (node.tag) {
             .identifier => {
@@ -1415,7 +1462,12 @@ pub const Sema = struct {
 
             .struct_decl, .enum_decl, .union_decl => {
                 if (self.type_values.get(node_idx)) |type_value| return type_value;
-                _ = try self.analyzeAggregateType(node_idx, self.root_scope);
+                _ = try aggregate_type_semantics.analyze(self, node_idx, self.root_scope);
+                return self.type_values.get(node_idx) orelse self.type_pool.internPrimitive(.void_type);
+            },
+            .error_set_decl => {
+                if (self.type_values.get(node_idx)) |type_value| return type_value;
+                _ = try error_set_semantics.analyze(self, node_idx, self.root_scope);
                 return self.type_values.get(node_idx) orelse self.type_pool.internPrimitive(.void_type);
             },
 
@@ -1512,7 +1564,7 @@ pub const Sema = struct {
         const node = self.ast_tree.nodes.get(node_idx);
         if (node.tag != .integer_literal) return null;
         const token = self.ast_tree.tokens[node.main_token];
-        const src = self.diags.source_manager.getFile(0).?.content;
+        const src = self.diags.source_manager.getFile(self.source_id).?.content;
         return std.fmt.parseInt(u64, src[token.start..token.end], 0) catch null;
     }
 

@@ -29,7 +29,8 @@ pub const Node = struct {
         noinline_hint: bool = false,
         extern_decl: bool = false,
         comptime_param: bool = false,
-        _padding: u2 = 0,
+        aggregate_nonexhaustive: bool = false,
+        _padding: u1 = 0,
     };
 
     pub const Data = struct {
@@ -163,6 +164,10 @@ pub const Node = struct {
     ///   main_token = `return` token
     ///   lhs = 0
     ///   rhs = expression node, or maxInt(u32) for a value-less return
+    ///
+    /// `defer_stmt` / `errdefer_stmt`:
+    ///   lhs = deferred expression or block
+    ///   rhs = 0
     pub const Tag = enum {
         root,
 
@@ -207,6 +212,8 @@ pub const Node = struct {
         undefined_literal,
         tuple_literal,
         array_literal,
+        aggregate_literal,
+        enum_literal,
 
         // Type expressions (appear in type-annotation position)
         pointer_type, // *T, *const T, [*]T, [*]const T
@@ -219,9 +226,11 @@ pub const Node = struct {
         struct_decl,
         enum_decl,
         union_decl,
+        error_set_decl,
         field_decl,
         enum_member,
         union_member,
+        error_member,
         tuple_type,
 
         // Builtins & Intrinsics

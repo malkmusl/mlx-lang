@@ -6,14 +6,18 @@ const semantic_operators = @import("../../semantic/expressions/operators.zig");
 const Type = @import("../../semantic/type.zig").Type;
 const lir = @import("../lir.zig");
 const Inst = lir.Inst;
+const lvalue = @import("lvalue.zig");
 
 const Core = enum { add, sub, mul, div, rem, bit_and, bit_or, bit_xor, shl, shr };
+const Policy = enum { checked, wrapping, saturating };
 const CombineOrder = enum { original_first, shifted_first };
 const ShiftSpec = struct {
     direction: Core,
     combiner: ?Core = null,
     order: CombineOrder = .original_first,
     wrapping_count: bool = false,
+    saturating_result: bool = false,
+    combiner_policy: Policy = .checked,
 };
 
 pub fn lower(builder: anytype, node_index: Node.Index) !?Inst.Index {
@@ -34,17 +38,13 @@ pub fn lower(builder: anytype, node_index: Node.Index) !?Inst.Index {
         return result;
     }
     const core = coreForToken(tag) orelse return null;
-    const result = try emitCore(builder, core, lhs, rhs, type_id);
+    const result = try emitPolicy(builder, core, policyForToken(tag), lhs, rhs, type_id);
     return result;
 }
 
 fn lowerAssignment(builder: anytype, node_index: Node.Index, assignment: Tag) !?Inst.Index {
     const node = builder.sema.ast_tree.nodes.get(node_index);
-    const target = builder.sema.ast_tree.nodes.get(node.data.lhs);
-    if (target.tag != .identifier) return null;
-    const token = builder.sema.ast_tree.tokens[target.main_token];
-    const source = builder.sema.diags.source_manager.getFile(0).?.content;
-    const address = builder.var_addresses.get(source[token.start..token.end]) orelse return null;
+    const address = try lvalue.lowerAddress(builder, node.data.lhs) orelse return null;
     const value = try builder.lowerNode(node.data.rhs) orelse return null;
     const target_type = builder.sema.node_types.get(node.data.lhs) orelse return null;
     const stored_value = if (assignment == .equal)
@@ -53,7 +53,7 @@ fn lowerAssignment(builder: anytype, node_index: Node.Index, assignment: Tag) !?
         const current = try builder.emitInst(.{ .opcode = .load, .type_id = target_type, .data = .{ .load = .{ .ptr = address } } });
         const operator = assignmentOperator(assignment) orelse return null;
         if (shiftSpec(operator)) |spec| break :blk try emitShift(builder, spec, current, value, target_type);
-        break :blk try emitCore(builder, coreForToken(operator) orelse return null, current, value, target_type);
+        break :blk try emitPolicy(builder, coreForToken(operator) orelse return null, policyForToken(operator), current, value, target_type);
     };
     _ = try builder.emitInst(.{
         .opcode = .store,
@@ -107,13 +107,16 @@ fn lowerLogical(builder: anytype, node_index: Node.Index, tag: Tag) !?Inst.Index
 }
 
 fn emitComparison(builder: anytype, tag: Tag, lhs: Inst.Index, rhs: Inst.Index, type_id: Type.Id) !Inst.Index {
+    const lhs_type = builder.sema.type_pool.get(builder.lir.insts.items[lhs].type_id);
+    const rhs_type = builder.sema.type_pool.get(builder.lir.insts.items[rhs].type_id);
+    const signed = isSignedInteger(lhs_type) or (isComptimeInteger(lhs_type) and isSignedInteger(rhs_type));
     const predicate: lir.CmpPredicate = switch (tag) {
         .equal_equal => .eq,
         .bang_equal => .ne,
-        .angle_bracket_left => .lt,
-        .angle_bracket_left_equal => .le,
-        .angle_bracket_right => .gt,
-        .angle_bracket_right_equal => .ge,
+        .angle_bracket_left => if (signed) .lt else .ult,
+        .angle_bracket_left_equal => if (signed) .le else .ule,
+        .angle_bracket_right => if (signed) .gt else .ugt,
+        .angle_bracket_right_equal => if (signed) .ge else .uge,
         else => unreachable,
     };
     return builder.emitInst(.{ .opcode = .icmp, .type_id = type_id, .data = .{ .icmp = .{ .predicate = predicate, .lhs = lhs, .rhs = rhs } } });
@@ -123,15 +126,91 @@ fn emitShift(builder: anytype, spec: ShiftSpec, lhs: Inst.Index, rhs: Inst.Index
     var count = rhs;
     if (spec.wrapping_count) {
         const width = bitWidth(builder, type_id);
-        const mask = try builder.emitInst(.{ .opcode = .const_i, .type_id = type_id, .data = .{ .const_i = width - 1 } });
-        count = try emitCore(builder, .bit_and, rhs, mask, type_id);
+        const width_value = try builder.emitInst(.{ .opcode = .const_i, .type_id = type_id, .data = .{ .const_i = width } });
+        count = try emitCore(builder, .rem, rhs, width_value, type_id);
+    } else {
+        try emitCheckedShiftCount(builder, rhs, type_id);
     }
-    const shifted = try emitCore(builder, spec.direction, lhs, count, type_id);
+    const shifted = if (spec.saturating_result)
+        try emitPolicy(builder, spec.direction, .saturating, lhs, count, type_id)
+    else
+        try emitPolicy(builder, spec.direction, .checked, lhs, count, type_id);
     const combiner = spec.combiner orelse return shifted;
     return switch (spec.order) {
-        .original_first => emitCore(builder, combiner, lhs, shifted, type_id),
-        .shifted_first => emitCore(builder, combiner, shifted, lhs, type_id),
+        .original_first => emitPolicy(builder, combiner, spec.combiner_policy, lhs, shifted, type_id),
+        .shifted_first => emitPolicy(builder, combiner, spec.combiner_policy, shifted, lhs, type_id),
     };
+}
+
+fn emitPolicy(builder: anytype, core: Core, policy: Policy, lhs: Inst.Index, rhs: Inst.Index, type_id: Type.Id) !Inst.Index {
+    if (core == .div or core == .rem) try emitNonZeroCheck(builder, rhs, type_id);
+    const raw = try emitCore(builder, core, lhs, rhs, type_id);
+    if (policy == .wrapping) return maskToWidth(builder, raw, type_id);
+    const type_value = builder.sema.type_pool.get(type_id);
+    const integer = if (type_value.data == .integer) type_value.data.integer else return raw;
+    if (integer.is_signed or integer.bits >= 64 or integer.bits == 0) return raw;
+    const max_value = (@as(u64, 1) << @intCast(integer.bits)) - 1;
+    const max = try builder.emitInst(.{ .opcode = .const_i, .type_id = type_id, .data = .{ .const_i = max_value } });
+    const bool_type = try builder.sema.type_pool.internPrimitive(.bool_type);
+    const overflow = if (core == .sub)
+        try builder.emitInst(.{ .opcode = .icmp, .type_id = bool_type, .data = .{ .icmp = .{ .predicate = .ult, .lhs = lhs, .rhs = rhs } } })
+    else if (core == .add or core == .mul or core == .shl)
+        try builder.emitInst(.{ .opcode = .icmp, .type_id = bool_type, .data = .{ .icmp = .{ .predicate = .ugt, .lhs = raw, .rhs = max } } })
+    else
+        return raw;
+    if (policy == .checked) {
+        try emitTrapIf(builder, overflow);
+        return raw;
+    }
+    return selectSaturated(builder, overflow, raw, if (core == .sub) null else max, type_id);
+}
+
+fn maskToWidth(builder: anytype, value: Inst.Index, type_id: Type.Id) !Inst.Index {
+    const type_value = builder.sema.type_pool.get(type_id);
+    const width: u16 = if (type_value.data == .integer) type_value.data.integer.bits else return value;
+    if (width == 0 or width >= 64) return value;
+    const mask_value = (@as(u64, 1) << @intCast(width)) - 1;
+    const mask = try builder.emitInst(.{ .opcode = .const_i, .type_id = type_id, .data = .{ .const_i = mask_value } });
+    return emitCore(builder, .bit_and, value, mask, type_id);
+}
+
+fn selectSaturated(builder: anytype, overflow: Inst.Index, raw: Inst.Index, upper: ?Inst.Index, type_id: Type.Id) !Inst.Index {
+    const overflow_block = try builder.newBlock();
+    const merge_block = try builder.newBlock();
+    const address = try builder.emitInst(.{ .opcode = .addr, .type_id = type_id, .data = .{ .addr = builder.nextSyntheticLocal() } });
+    _ = try builder.emitInst(.{ .opcode = .store, .type_id = type_id, .data = .{ .store = .{ .ptr = address, .val = raw } } });
+    _ = try builder.emitInst(.{ .opcode = .condbr, .type_id = 0, .data = .{ .condbr = .{ .cond = overflow, .true_dest = overflow_block, .false_dest = merge_block } } });
+    builder.current_block = overflow_block;
+    const bound = upper orelse try builder.emitInst(.{ .opcode = .const_i, .type_id = type_id, .data = .{ .const_i = 0 } });
+    _ = try builder.emitInst(.{ .opcode = .store, .type_id = type_id, .data = .{ .store = .{ .ptr = address, .val = bound } } });
+    _ = try builder.emitInst(.{ .opcode = .br, .type_id = 0, .data = .{ .br = .{ .dest = merge_block } } });
+    builder.current_block = merge_block;
+    return builder.emitInst(.{ .opcode = .load, .type_id = type_id, .data = .{ .load = .{ .ptr = address } } });
+}
+
+fn emitNonZeroCheck(builder: anytype, rhs: Inst.Index, type_id: Type.Id) !void {
+    const zero = try builder.emitInst(.{ .opcode = .const_i, .type_id = type_id, .data = .{ .const_i = 0 } });
+    const bool_type = try builder.sema.type_pool.internPrimitive(.bool_type);
+    const invalid = try builder.emitInst(.{ .opcode = .icmp, .type_id = bool_type, .data = .{ .icmp = .{ .predicate = .eq, .lhs = rhs, .rhs = zero } } });
+    try emitTrapIf(builder, invalid);
+}
+
+fn emitCheckedShiftCount(builder: anytype, count: Inst.Index, type_id: Type.Id) !void {
+    const width = bitWidth(builder, type_id);
+    if (width == 0) return;
+    const width_value = try builder.emitInst(.{ .opcode = .const_i, .type_id = type_id, .data = .{ .const_i = width } });
+    const bool_type = try builder.sema.type_pool.internPrimitive(.bool_type);
+    const invalid = try builder.emitInst(.{ .opcode = .icmp, .type_id = bool_type, .data = .{ .icmp = .{ .predicate = .uge, .lhs = count, .rhs = width_value } } });
+    try emitTrapIf(builder, invalid);
+}
+
+fn emitTrapIf(builder: anytype, condition: Inst.Index) !void {
+    const trap_block = try builder.newBlock();
+    const continue_block = try builder.newBlock();
+    _ = try builder.emitInst(.{ .opcode = .condbr, .type_id = 0, .data = .{ .condbr = .{ .cond = condition, .true_dest = trap_block, .false_dest = continue_block } } });
+    builder.current_block = trap_block;
+    _ = try builder.emitInst(.{ .opcode = .unreachable_inst, .type_id = 0, .data = .{ .unreachable_inst = {} } });
+    builder.current_block = continue_block;
 }
 
 fn emitCore(builder: anytype, core: Core, lhs: Inst.Index, rhs: Inst.Index, type_id: Type.Id) !Inst.Index {
@@ -163,13 +242,21 @@ fn coreForToken(tag: Tag) ?Core {
     };
 }
 
+fn policyForToken(tag: Tag) Policy {
+    return switch (tag) {
+        .plus_percent, .minus_percent, .asterisk_percent => .wrapping,
+        .plus_pipe, .minus_pipe, .asterisk_pipe => .saturating,
+        else => .checked,
+    };
+}
+
 fn shiftSpec(tag: Tag) ?ShiftSpec {
     return switch (tag) {
         .shl => .{ .direction = .shl },
         .shr => .{ .direction = .shr },
         .shl_percent => .{ .direction = .shl, .wrapping_count = true },
         .shr_percent => .{ .direction = .shr, .wrapping_count = true },
-        .shl_pipe, .shl_percent_pipe => .{ .direction = .shl, .wrapping_count = tag == .shl_percent_pipe },
+        .shl_pipe, .shl_percent_pipe => .{ .direction = .shl, .wrapping_count = tag == .shl_percent_pipe, .saturating_result = true },
         .ampersand_shl => .{ .direction = .shl, .combiner = .bit_and },
         .pipe_shl => .{ .direction = .shl, .combiner = .bit_or },
         .caret_shl => .{ .direction = .shl, .combiner = .bit_xor },
@@ -181,34 +268,67 @@ fn shiftSpec(tag: Tag) ?ShiftSpec {
         .shr_ampersand => .{ .direction = .shr, .combiner = .bit_and, .order = .shifted_first },
         .shr_pipe => .{ .direction = .shr, .combiner = .bit_or, .order = .shifted_first },
         .shr_caret => .{ .direction = .shr, .combiner = .bit_xor, .order = .shifted_first },
-        .plus_shl, .plus_percent_shl, .plus_pipe_shl => .{ .direction = .shl, .combiner = .add },
-        .minus_shl, .minus_percent_shl, .minus_pipe_shl => .{ .direction = .shl, .combiner = .sub },
-        .asterisk_shl, .asterisk_percent_shl, .asterisk_pipe_shl => .{ .direction = .shl, .combiner = .mul },
-        .plus_shr, .plus_percent_shr, .plus_pipe_shr => .{ .direction = .shr, .combiner = .add },
-        .minus_shr, .minus_percent_shr, .minus_pipe_shr => .{ .direction = .shr, .combiner = .sub },
-        .asterisk_shr, .asterisk_percent_shr, .asterisk_pipe_shr => .{ .direction = .shr, .combiner = .mul },
+        .plus_shl, .plus_percent_shl, .plus_pipe_shl => .{ .direction = .shl, .combiner = .add, .combiner_policy = policyForToken(if (tag == .plus_percent_shl) .plus_percent else if (tag == .plus_pipe_shl) .plus_pipe else .plus) },
+        .minus_shl, .minus_percent_shl, .minus_pipe_shl => .{ .direction = .shl, .combiner = .sub, .combiner_policy = policyForToken(if (tag == .minus_percent_shl) .minus_percent else if (tag == .minus_pipe_shl) .minus_pipe else .minus) },
+        .asterisk_shl, .asterisk_percent_shl, .asterisk_pipe_shl => .{ .direction = .shl, .combiner = .mul, .combiner_policy = policyForToken(if (tag == .asterisk_percent_shl) .asterisk_percent else if (tag == .asterisk_pipe_shl) .asterisk_pipe else .asterisk) },
+        .plus_shr, .plus_percent_shr, .plus_pipe_shr => .{ .direction = .shr, .combiner = .add, .combiner_policy = policyForToken(if (tag == .plus_percent_shr) .plus_percent else if (tag == .plus_pipe_shr) .plus_pipe else .plus) },
+        .minus_shr, .minus_percent_shr, .minus_pipe_shr => .{ .direction = .shr, .combiner = .sub, .combiner_policy = policyForToken(if (tag == .minus_percent_shr) .minus_percent else if (tag == .minus_pipe_shr) .minus_pipe else .minus) },
+        .asterisk_shr, .asterisk_percent_shr, .asterisk_pipe_shr => .{ .direction = .shr, .combiner = .mul, .combiner_policy = policyForToken(if (tag == .asterisk_percent_shr) .asterisk_percent else if (tag == .asterisk_pipe_shr) .asterisk_pipe else .asterisk) },
         else => null,
     };
 }
 
 fn assignmentOperator(tag: Tag) ?Tag {
     return switch (tag) {
-        .plus_equal => .plus, .minus_equal => .minus, .asterisk_equal => .asterisk, .slash_equal => .slash, .percent_equal => .percent,
-        .plus_percent_equal => .plus_percent, .minus_percent_equal => .minus_percent, .asterisk_percent_equal => .asterisk_percent,
-        .plus_pipe_equal => .plus_pipe, .minus_pipe_equal => .minus_pipe, .asterisk_pipe_equal => .asterisk_pipe,
-        .ampersand_equal => .ampersand, .pipe_equal => .pipe, .caret_equal => .caret,
-        .shl_equal => .shl, .shr_equal => .shr, .shl_percent_equal => .shl_percent, .shr_percent_equal => .shr_percent,
-        .shl_pipe_equal => .shl_pipe, .shl_percent_pipe_equal => .shl_percent_pipe,
-        .ampersand_shl_equal => .ampersand_shl, .pipe_shl_equal => .pipe_shl, .caret_shl_equal => .caret_shl,
-        .ampersand_shr_equal => .ampersand_shr, .pipe_shr_equal => .pipe_shr, .caret_shr_equal => .caret_shr,
-        .shl_ampersand_equal => .shl_ampersand, .shl_caret_equal => .shl_caret,
-        .shr_ampersand_equal => .shr_ampersand, .shr_pipe_equal => .shr_pipe, .shr_caret_equal => .shr_caret,
-        .plus_shl_equal => .plus_shl, .minus_shl_equal => .minus_shl, .asterisk_shl_equal => .asterisk_shl,
-        .plus_percent_shl_equal => .plus_percent_shl, .minus_percent_shl_equal => .minus_percent_shl, .asterisk_percent_shl_equal => .asterisk_percent_shl,
-        .plus_pipe_shl_equal => .plus_pipe_shl, .minus_pipe_shl_equal => .minus_pipe_shl, .asterisk_pipe_shl_equal => .asterisk_pipe_shl,
-        .plus_shr_equal => .plus_shr, .minus_shr_equal => .minus_shr, .asterisk_shr_equal => .asterisk_shr,
-        .plus_percent_shr_equal => .plus_percent_shr, .minus_percent_shr_equal => .minus_percent_shr, .asterisk_percent_shr_equal => .asterisk_percent_shr,
-        .plus_pipe_shr_equal => .plus_pipe_shr, .minus_pipe_shr_equal => .minus_pipe_shr, .asterisk_pipe_shr_equal => .asterisk_pipe_shr,
+        .plus_equal => .plus,
+        .minus_equal => .minus,
+        .asterisk_equal => .asterisk,
+        .slash_equal => .slash,
+        .percent_equal => .percent,
+        .plus_percent_equal => .plus_percent,
+        .minus_percent_equal => .minus_percent,
+        .asterisk_percent_equal => .asterisk_percent,
+        .plus_pipe_equal => .plus_pipe,
+        .minus_pipe_equal => .minus_pipe,
+        .asterisk_pipe_equal => .asterisk_pipe,
+        .ampersand_equal => .ampersand,
+        .pipe_equal => .pipe,
+        .caret_equal => .caret,
+        .shl_equal => .shl,
+        .shr_equal => .shr,
+        .shl_percent_equal => .shl_percent,
+        .shr_percent_equal => .shr_percent,
+        .shl_pipe_equal => .shl_pipe,
+        .shl_percent_pipe_equal => .shl_percent_pipe,
+        .ampersand_shl_equal => .ampersand_shl,
+        .pipe_shl_equal => .pipe_shl,
+        .caret_shl_equal => .caret_shl,
+        .ampersand_shr_equal => .ampersand_shr,
+        .pipe_shr_equal => .pipe_shr,
+        .caret_shr_equal => .caret_shr,
+        .shl_ampersand_equal => .shl_ampersand,
+        .shl_caret_equal => .shl_caret,
+        .shr_ampersand_equal => .shr_ampersand,
+        .shr_pipe_equal => .shr_pipe,
+        .shr_caret_equal => .shr_caret,
+        .plus_shl_equal => .plus_shl,
+        .minus_shl_equal => .minus_shl,
+        .asterisk_shl_equal => .asterisk_shl,
+        .plus_percent_shl_equal => .plus_percent_shl,
+        .minus_percent_shl_equal => .minus_percent_shl,
+        .asterisk_percent_shl_equal => .asterisk_percent_shl,
+        .plus_pipe_shl_equal => .plus_pipe_shl,
+        .minus_pipe_shl_equal => .minus_pipe_shl,
+        .asterisk_pipe_shl_equal => .asterisk_pipe_shl,
+        .plus_shr_equal => .plus_shr,
+        .minus_shr_equal => .minus_shr,
+        .asterisk_shr_equal => .asterisk_shr,
+        .plus_percent_shr_equal => .plus_percent_shr,
+        .minus_percent_shr_equal => .minus_percent_shr,
+        .asterisk_percent_shr_equal => .asterisk_percent_shr,
+        .plus_pipe_shr_equal => .plus_pipe_shr,
+        .minus_pipe_shr_equal => .minus_pipe_shr,
+        .asterisk_pipe_shr_equal => .asterisk_pipe_shr,
         else => null,
     };
 }
@@ -219,4 +339,16 @@ fn bitWidth(builder: anytype, type_id: Type.Id) u64 {
         .size_int, .pointer => 64,
         else => 64,
     };
+}
+
+fn isSignedInteger(value: Type) bool {
+    return switch (value.data) {
+        .integer => |integer| integer.is_signed,
+        .size_int => |integer| integer.is_signed,
+        else => false,
+    };
+}
+
+fn isComptimeInteger(value: Type) bool {
+    return value.data == .primitive and value.data.primitive == .comptime_int_type;
 }

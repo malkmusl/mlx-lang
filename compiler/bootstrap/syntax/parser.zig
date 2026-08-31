@@ -7,7 +7,9 @@ const Ast = ast.Ast;
 const DiagnosticEngine = @import("../source/diagnostics.zig").DiagnosticEngine;
 const SourceManager = @import("../source/source_manager.zig").SourceManager;
 const postfix_parser = @import("parser/postfix.zig");
+const prefix_parser = @import("parser/prefix.zig");
 const operators = @import("parser/operators.zig");
+const control_flow_parser = @import("parser/control_flow.zig");
 
 pub const Parser = struct {
     allocator: std.mem.Allocator,
@@ -429,6 +431,7 @@ pub const Parser = struct {
             },
 
             .keyword_struct, .keyword_enum, .keyword_union => return self.parseAggregateType(),
+            .keyword_error => return self.parseErrorSetType(),
 
             else => {
                 // Not a type expression — let caller handle the error
@@ -612,6 +615,10 @@ pub const Parser = struct {
         return @as(u32, @intCast(self.nodes.len - 1));
     }
 
+    pub fn parseBlockPublic(self: *Parser) std.mem.Allocator.Error!?Node.Index {
+        return self.parseBlock();
+    }
+
     fn parseStatement(self: *Parser) std.mem.Allocator.Error!?Node.Index {
         self.traceRuleEnter("parseStatement");
         defer self.traceRuleExit("parseStatement");
@@ -639,6 +646,7 @@ pub const Parser = struct {
             },
             .keyword_break => return self.parseBreakStatement(),
             .keyword_continue => return self.parseContinueStatement(),
+            .keyword_defer, .keyword_errdefer => return control_flow_parser.parseCleanup(self),
             else => {
                 return self.parseExpr(0);
             },
@@ -683,6 +691,7 @@ pub const Parser = struct {
     fn parsePrefix(self: *Parser) std.mem.Allocator.Error!?Node.Index {
         self.traceRuleEnter("parsePrefix");
         defer self.traceRuleExit("parsePrefix");
+        if (try prefix_parser.parse(self)) |prefix| return prefix;
         const tok = self.tokens[self.index];
         switch (tok.tag) {
             .string => {
@@ -721,6 +730,15 @@ pub const Parser = struct {
                 self.consumeToken("Consume boolean literal");
                 return @as(u32, @intCast(self.nodes.len - 1));
             },
+            .keyword_null, .keyword_undefined => {
+                try self.nodes.append(self.allocator, .{
+                    .tag = if (tok.tag == .keyword_null) .null_literal else .undefined_literal,
+                    .main_token = self.index,
+                    .data = .{ .lhs = 0, .rhs = 0 },
+                });
+                self.consumeToken("Consume sentinel literal");
+                return @as(u32, @intCast(self.nodes.len - 1));
+            },
             .ident => {
                 // A loop label is part of the loop expression, not an ordinary
                 // identifier followed by a binary operator.
@@ -744,17 +762,6 @@ pub const Parser = struct {
                     .data = .{ .lhs = 0, .rhs = 0 },
                 });
                 self.consumeToken("Consume identifier");
-                return @as(u32, @intCast(self.nodes.len - 1));
-            },
-            .keyword_try => {
-                const try_tok = self.index;
-                self.consumeToken("Consume try");
-                const operand = try self.parseExpr(90) orelse return null;
-                try self.nodes.append(self.allocator, .{
-                    .tag = .unary_op,
-                    .main_token = try_tok,
-                    .data = .{ .lhs = operand, .rhs = 0 },
-                });
                 return @as(u32, @intCast(self.nodes.len - 1));
             },
             .dot => {
@@ -851,11 +858,13 @@ pub const Parser = struct {
             .keyword_if => return self.parseIfExpr(),
             .keyword_while => return self.parseWhileLoop(std.math.maxInt(u32)),
             .keyword_for => return self.parseForLoop(std.math.maxInt(u32)),
+            .keyword_match => return control_flow_parser.parseMatch(self),
             .keyword_return => {
                 return self.parseReturnStatement();
             },
             .l_brace => return self.parseBlock(),
             .keyword_struct, .keyword_enum, .keyword_union => return self.parseAggregateType(),
+            .keyword_error => return self.parseErrorSetType(),
             .l_paren => {
                 self.consumeToken("Consume '('");
                 const expr = try self.parseExpr(0);
@@ -961,12 +970,57 @@ pub const Parser = struct {
     /// remain ordinary expression nodes and are resolved by semantic analysis.
     fn parseBuiltinArgument(self: *Parser) std.mem.Allocator.Error!?Node.Index {
         return switch (self.tokens[self.index].tag) {
-            .asterisk, .l_bracket, .question, .bang, .keyword_fn, .keyword_struct, .keyword_enum, .keyword_union => self.parseTypeExpr(),
+            .asterisk, .l_bracket, .question, .bang, .keyword_fn, .keyword_struct, .keyword_enum, .keyword_union, .keyword_error => self.parseTypeExpr(),
             else => self.parseExpr(0),
         };
     }
 
+    fn parseErrorSetType(self: *Parser) std.mem.Allocator.Error!?Node.Index {
+        const error_token = self.index;
+        self.consumeToken("Consume error-set head");
+        if (self.index >= self.tokens.len or self.tokens[self.index].tag != .l_brace) {
+            try self.reportError(2001, "Expected '{' after error");
+            return null;
+        }
+        self.consumeToken("Consume error-set '{'");
+        var members = std.ArrayList(Node.Index).empty;
+        defer members.deinit(self.allocator);
+        while (self.index < self.tokens.len and self.tokens[self.index].tag != .r_brace) {
+            while (self.tokens[self.index].tag == .statement_end or self.tokens[self.index].tag == .comma) self.index += 1;
+            if (self.tokens[self.index].tag == .r_brace) break;
+            if (self.tokens[self.index].tag != .ident) {
+                try self.reportError(2001, "Expected error-set member name");
+                return null;
+            }
+            const member_token = self.index;
+            self.consumeToken("Consume error-set member");
+            try self.nodes.append(self.allocator, .{
+                .tag = .error_member,
+                .main_token = member_token,
+                .data = .{ .lhs = 0, .rhs = 0 },
+            });
+            try members.append(self.allocator, @intCast(self.nodes.len - 1));
+        }
+        if (self.index >= self.tokens.len or self.tokens[self.index].tag != .r_brace) {
+            try self.reportError(2003, "Expected '}' after error-set members");
+            return null;
+        }
+        self.consumeToken("Consume error-set '}'");
+        const extra_start: u32 = @intCast(self.extra_data.items.len);
+        try self.extra_data.appendSlice(self.allocator, members.items);
+        try self.nodes.append(self.allocator, .{
+            .tag = .error_set_decl,
+            .main_token = error_token,
+            .data = .{ .lhs = extra_start, .rhs = @intCast(self.extra_data.items.len) },
+        });
+        return @intCast(self.nodes.len - 1);
+    }
+
     const AggregateParseKind = enum { @"struct", @"enum", @"union" };
+    const AggregateHeader = struct {
+        backing: Node.Index,
+        nonexhaustive: bool = false,
+    };
 
     fn isAggregateStart(tag: Token.Tag) bool {
         return tag == .keyword_struct or tag == .keyword_enum or tag == .keyword_union;
@@ -985,26 +1039,26 @@ pub const Parser = struct {
         const head_token = self.index;
         const kind = aggregateKind(self.tokens[self.index].tag);
         self.consumeToken("Consume aggregate type head");
-        const backing = try self.parseAggregateHeader(kind) orelse return null;
-        return self.parseAggregateBody(kind, head_token, backing);
+        const header = try self.parseAggregateHeader(kind) orelse return null;
+        return self.parseAggregateBody(kind, head_token, header);
     }
 
     fn parseNoCopyAggregateArgument(self: *Parser) std.mem.Allocator.Error!?Node.Index {
         const head_token = self.index;
         const kind = aggregateKind(self.tokens[self.index].tag);
         self.consumeToken("Consume @nocopy aggregate type head");
-        const backing = try self.parseAggregateHeader(kind) orelse return null;
+        const header = try self.parseAggregateHeader(kind) orelse return null;
         if (self.index >= self.tokens.len or self.tokens[self.index].tag != .r_paren) {
             try self.reportError(2003, "Expected ')' after @nocopy aggregate head");
             return null;
         }
         self.consumeToken("Consume ')' after @nocopy aggregate head");
-        return self.parseAggregateBody(kind, head_token, backing);
+        return self.parseAggregateBody(kind, head_token, header);
     }
 
-    fn parseAggregateHeader(self: *Parser, kind: AggregateParseKind) std.mem.Allocator.Error!?Node.Index {
-        if (kind == .@"struct") return std.math.maxInt(u32);
-        if (kind == .@"union" and self.tokens[self.index].tag != .l_paren) return std.math.maxInt(u32);
+    fn parseAggregateHeader(self: *Parser, kind: AggregateParseKind) std.mem.Allocator.Error!?AggregateHeader {
+        if (kind == .@"struct") return .{ .backing = std.math.maxInt(u32) };
+        if (kind == .@"union" and self.tokens[self.index].tag != .l_paren) return .{ .backing = std.math.maxInt(u32) };
 
         if (self.tokens[self.index].tag != .l_paren) {
             try self.reportError(2001, "Enum type requires a backing integer type");
@@ -1030,6 +1084,7 @@ pub const Parser = struct {
             backing = try self.parseTypeExpr() orelse return null;
         }
 
+        var nonexhaustive = false;
         if (kind == .@"enum" and self.tokens[self.index].tag == .comma) {
             self.consumeToken("Consume enum option comma");
             if (self.tokens[self.index].tag != .keyword_nonexhaustive) {
@@ -1037,20 +1092,21 @@ pub const Parser = struct {
                 return null;
             }
             self.consumeToken("Consume nonexhaustive enum option");
+            nonexhaustive = true;
         }
         if (self.tokens[self.index].tag != .r_paren) {
             try self.reportError(2003, "Expected ')' after aggregate tag");
             return null;
         }
         self.consumeToken("Consume aggregate tag ')'");
-        return backing;
+        return .{ .backing = backing, .nonexhaustive = nonexhaustive };
     }
 
     fn parseAggregateBody(
         self: *Parser,
         kind: AggregateParseKind,
         head_token: u32,
-        backing: Node.Index,
+        header: AggregateHeader,
     ) std.mem.Allocator.Error!?Node.Index {
         if (self.index >= self.tokens.len or self.tokens[self.index].tag != .l_brace) {
             try self.reportError(2001, "Expected '{' after aggregate type head");
@@ -1112,7 +1168,7 @@ pub const Parser = struct {
         self.consumeToken("Consume aggregate '}'");
 
         const extra_start: u32 = @intCast(self.extra_data.items.len);
-        try self.extra_data.append(self.allocator, backing);
+        try self.extra_data.append(self.allocator, header.backing);
         try self.extra_data.appendSlice(self.allocator, members.items);
         const extra_end: u32 = @intCast(self.extra_data.items.len);
         try self.nodes.append(self.allocator, .{
@@ -1123,6 +1179,7 @@ pub const Parser = struct {
             },
             .main_token = head_token,
             .data = .{ .lhs = extra_start, .rhs = extra_end },
+            .decl_flags = .{ .aggregate_nonexhaustive = header.nonexhaustive },
         });
         return @intCast(self.nodes.len - 1);
     }
@@ -1344,7 +1401,6 @@ pub const Parser = struct {
             .message = msg,
         });
     }
-
 };
 
 test "parser: empty file" {
