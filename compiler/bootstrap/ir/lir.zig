@@ -114,7 +114,7 @@ pub const Inst = struct {
         error_payload_part: struct { source: Index, part: u8 },
 
         builtin_sym: u32,
-        string_literal: u32, // AST node index
+        string_literal: u32, // index into Lir.string_literals
         tuple_literal: u32, // AST node index
     };
 
@@ -146,6 +146,7 @@ pub const Lir = struct {
     extra_data: std.ArrayList(u32), // Stores argument lists, etc.
     symbols: std.ArrayList([]const u8),
     symbol_ids: std.StringHashMap(u32),
+    string_literals: std.ArrayList([]const u8),
 
     pub fn init(allocator: std.mem.Allocator) Lir {
         return .{
@@ -155,7 +156,37 @@ pub const Lir = struct {
             .extra_data = std.ArrayList(u32).empty,
             .symbols = .empty,
             .symbol_ids = std.StringHashMap(u32).init(allocator),
+            .string_literals = .empty,
         };
+    }
+
+    pub fn addStringLiteral(self: *Lir, raw: []const u8) !u32 {
+        const content = if (raw.len >= 2 and raw[0] == '"') raw[1 .. raw.len - 1] else raw;
+        var decoded = std.ArrayList(u8).empty;
+        defer decoded.deinit(self.allocator);
+        var index: usize = 0;
+        while (index < content.len) : (index += 1) {
+            if (content[index] == '\\' and index + 1 < content.len) {
+                index += 1;
+                const value: u8 = switch (content[index]) {
+                    'n' => '\n',
+                    'r' => '\r',
+                    't' => '\t',
+                    '0' => 0,
+                    '\\' => '\\',
+                    '"' => '"',
+                    else => content[index],
+                };
+                try decoded.append(self.allocator, value);
+            } else {
+                try decoded.append(self.allocator, content[index]);
+            }
+        }
+        const owned = try decoded.toOwnedSlice(self.allocator);
+        errdefer self.allocator.free(owned);
+        const literal_id: u32 = @intCast(self.string_literals.items.len);
+        try self.string_literals.append(self.allocator, owned);
+        return literal_id;
     }
 
     pub fn internModuleSymbol(self: *Lir, module_id: u32, name: []const u8) !u32 {
@@ -185,5 +216,7 @@ pub const Lir = struct {
         for (self.symbols.items) |symbol| self.allocator.free(symbol);
         self.symbols.deinit(self.allocator);
         self.symbol_ids.deinit();
+        for (self.string_literals.items) |literal| self.allocator.free(literal);
+        self.string_literals.deinit(self.allocator);
     }
 };

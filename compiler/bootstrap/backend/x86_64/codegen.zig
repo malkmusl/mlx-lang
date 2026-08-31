@@ -1,6 +1,5 @@
 const std = @import("std");
 const lir = @import("../../ir/lir.zig");
-const ast_mod = @import("../../syntax/ast.zig");
 const Encoder = @import("encoder.zig").Encoder;
 const TypePool = @import("../../semantic/type.zig").TypePool;
 const text_codegen = @import("codegen/text.zig");
@@ -22,8 +21,6 @@ pub const X86Gen = struct {
     allocator: std.mem.Allocator,
     lir: *lir.Lir,
     type_pool: *const TypePool,
-    ast_tree: ast_mod.Ast,
-    src: []const u8,
     vreg_to_op: std.AutoHashMap(lir.Inst.Index, Operand),
     addr_to_slot: std.AutoHashMap(u32, i32),
     error_tag_slots: std.AutoHashMap(lir.Inst.Index, i32),
@@ -45,15 +42,11 @@ pub const X86Gen = struct {
         allocator: std.mem.Allocator,
         ir: *lir.Lir,
         type_pool: *const TypePool,
-        ast_tree: ast_mod.Ast,
-        src: []const u8,
     ) X86Gen {
         return .{
             .allocator = allocator,
             .lir = ir,
             .type_pool = type_pool,
-            .ast_tree = ast_tree,
-            .src = src,
             .vreg_to_op = std.AutoHashMap(lir.Inst.Index, Operand).init(allocator),
             .addr_to_slot = std.AutoHashMap(u32, i32).init(allocator),
             .error_tag_slots = std.AutoHashMap(lir.Inst.Index, i32).init(allocator),
@@ -189,8 +182,18 @@ pub const X86Gen = struct {
 
     pub fn isByteType(self: *const X86Gen, type_id: u32) bool {
         if (type_id >= self.type_pool.types.items.len) return false;
-        const bits = self.type_pool.bitSizeOf(type_id) catch return false;
-        return bits > 0 and bits <= 8;
+        const value_type = self.type_pool.get(type_id);
+        return switch (value_type.data) {
+            .integer => |integer| integer.bits <= 8,
+            .primitive => |primitive| primitive == .bool_type,
+            .@"enum", .error_set => blk: {
+                const bits = self.type_pool.bitSizeOf(type_id) catch break :blk false;
+                break :blk bits > 0 and bits <= 8;
+            },
+            // Arrays and other aggregates are represented by an address in
+            // Stage 0 even when their payload happens to occupy one byte.
+            else => false,
+        };
     }
 
     pub fn isSignedType(self: *const X86Gen, type_id: u32) bool {
@@ -335,24 +338,11 @@ pub const X86Gen = struct {
         // For now collect strings so offsets are stable.
         for (self.lir.insts.items, 0..) |inst, idx| {
             if (inst.opcode == .string_literal) {
-                const ast_node_idx = inst.data.string_literal;
-                const node = self.ast_tree.nodes.get(ast_node_idx);
-                const tok = self.ast_tree.tokens[node.main_token];
-                // Token text includes surrounding quotes — strip them.
-                const raw = self.src[tok.start..tok.end];
-                const content = if (raw.len >= 2 and raw[0] == '"') raw[1 .. raw.len - 1] else raw;
+                const content = self.lir.string_literals.items[inst.data.string_literal];
                 const str_off: u64 = @as(u64, @intCast(self.rodata.items.len));
                 try self.string_offsets.put(@as(lir.Inst.Index, @intCast(idx)), str_off);
-                // Unescape \n → 0x0A
-                var i: usize = 0;
-                while (i < content.len) : (i += 1) {
-                    if (content[i] == '\\' and i + 1 < content.len and content[i + 1] == 'n') {
-                        try self.rodata.append(self.allocator, 0x0A);
-                        i += 1;
-                    } else {
-                        try self.rodata.append(self.allocator, content[i]);
-                    }
-                }
+                try self.rodata.appendSlice(self.allocator, content);
+                try self.rodata.append(self.allocator, 0);
                 std.debug.print("[X86Gen] rodata: string %{d} at offset {d} (len {d})\n", .{ idx, str_off, self.rodata.items.len - @as(usize, @intCast(str_off)) });
             }
         }

@@ -273,18 +273,19 @@ pub const LirBuilder = struct {
             },
             .aggregate_literal => return aggregate_lowering.lowerLiteral(self, node_idx),
             .string_literal => {
+                const token = self.sema.ast_tree.tokens[node.main_token];
+                const source = self.sema.diags.source_manager.getFile(self.sema.source_id).?.content;
+                const literal_id = try self.lir.addStringLiteral(source[token.start..token.end]);
                 result = try self.emitInst(.{
                     .opcode = .string_literal,
                     .type_id = self.sema.node_types.get(node_idx) orelse 0,
-                    .data = .{ .string_literal = node_idx },
+                    .data = .{ .string_literal = literal_id },
                 });
-                const token = self.sema.ast_tree.tokens[node.main_token];
-                const raw = self.sema.diags.source_manager.getFile(self.sema.source_id).?.content[token.start..token.end];
                 const length_type = try self.sema.type_pool.internSizeInt(false);
                 const length = try self.emitInst(.{
                     .opcode = .const_i,
                     .type_id = length_type,
-                    .data = .{ .const_i = if (raw.len >= 2) raw.len - 2 else 0 },
+                    .data = .{ .const_i = self.lir.string_literals.items[literal_id].len },
                 });
                 try self.slice_lengths.put(result.?, length);
                 return result;

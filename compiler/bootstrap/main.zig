@@ -181,8 +181,6 @@ pub fn main(init: std.process.Init) !u8 {
         allocator,
         &lir_builder.lir,
         &type_pool,
-        ast,
-        source_manager.getFile(root_module.source_id).?.content,
     );
     defer x86_gen.deinit();
 
