@@ -31,7 +31,16 @@ fn isConstStorage(sema: anytype, node_index: Node.Index, scope: *Scope) bool {
             const source = sema.diags.source_manager.getFile(sema.source_id).?.content;
             break :blk if (scope.get(source[token.start..token.end])) |symbol| symbol.is_const else true;
         },
-        .field_access, .array_access => isConstStorage(sema, node.data.lhs, scope),
+        .field_access => isConstStorage(sema, node.data.lhs, scope),
+        .array_access => blk: {
+            const container_id = sema.node_types.get(node.data.lhs) orelse break :blk true;
+            const container = sema.type_pool.get(container_id);
+            // A const binding containing a mutable pointer does not make the
+            // pointee const. Arrays, in contrast, inherit their binding's
+            // mutability because the storage is the binding itself.
+            if (container.data == .pointer) break :blk container.data.pointer.is_const;
+            break :blk isConstStorage(sema, node.data.lhs, scope);
+        },
         .unary_op => blk: {
             const pointer_id = sema.node_types.get(node.data.lhs) orelse break :blk true;
             const pointer = sema.type_pool.get(pointer_id);

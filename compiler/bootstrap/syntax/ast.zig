@@ -144,6 +144,13 @@ pub const Node = struct {
     ///     extra_data[lhs + 3..] = element expression nodes
     ///   rhs = lhs + 3 + element count
     ///
+    /// `tuple_literal` / `tuple_type`:
+    ///   main_token = opening delimiter (`.`, `(`)
+    ///   lhs = extra_start where:
+    ///     extra_data[lhs + 0] = element count
+    ///     extra_data[lhs + 1..] = element expression/type nodes
+    ///   rhs = element count
+    ///
     /// `break_stmt` / `continue_stmt`:
     ///   main_token = keyword token
     ///   lhs = label token, or maxInt(u32)

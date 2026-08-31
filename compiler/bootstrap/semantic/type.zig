@@ -320,6 +320,15 @@ pub const TypePool = struct {
                 from_pointer.child_type == to_pointer.child_type and
                 (!from_pointer.is_const or to_pointer.is_const);
         }
+        if (from.data == .tuple and to.data == .tuple) {
+            const from_fields = self.aggregateFields(from_id) orelse return false;
+            const to_fields = self.aggregateFields(to_id) orelse return false;
+            if (from_fields.len != to_fields.len) return false;
+            for (from_fields, to_fields) |from_field, to_field| {
+                if (!self.isCoercible(from_field.type_id, to_field.type_id)) return false;
+            }
+            return true;
+        }
         return false;
     }
 
@@ -490,6 +499,10 @@ pub const TypePool = struct {
 
     pub fn aggregateField(self: *const TypePool, type_id: Type.Id, name: []const u8) ?AggregateField {
         const fields = self.aggregateFields(type_id) orelse return null;
+        if (self.get(type_id).data == .tuple) {
+            const index = std.fmt.parseInt(usize, name, 10) catch return null;
+            return if (index < fields.len) fields[index] else null;
+        }
         for (fields) |field| {
             if (std.mem.eql(u8, field.name, name)) return field;
         }

@@ -97,7 +97,7 @@ fn parseCall(parser: anytype, lhs: Node.Index) !?Node.Index {
 
 fn parseField(parser: anytype, lhs: Node.Index) !?Node.Index {
     parser.consumeToken("Consume field access '.'");
-    if (parser.index >= parser.tokens.len or parser.tokens[parser.index].tag != .ident) {
+    if (parser.index >= parser.tokens.len or (parser.tokens[parser.index].tag != .ident and parser.tokens[parser.index].tag != .integer)) {
         try parser.reportError(2001, "Expected field name after '.'");
         return null;
     }

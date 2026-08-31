@@ -1,6 +1,48 @@
 const Node = @import("../../syntax/ast.zig").Node;
 const Inst = @import("../lir.zig").Inst;
 
+pub fn lowerTupleLiteral(builder: anytype, node_index: Node.Index) !?Inst.Index {
+    const node = builder.sema.ast_tree.nodes.get(node_index);
+    const type_id = builder.sema.node_types.get(node_index) orelse return null;
+    const size: u32 = @intCast(@max(builder.sema.type_pool.sizeOf(type_id) catch 8, 1));
+    const alignment: u32 = @intCast(builder.sema.type_pool.alignOf(type_id) catch 8);
+    const base = try builder.emitInst(.{
+        .opcode = .alloca,
+        .type_id = type_id,
+        .data = .{ .alloca = .{
+            .id = builder.nextSyntheticLocal(),
+            .size = size,
+            .alignment = alignment,
+        } },
+    });
+    const fields = builder.sema.type_pool.aggregateFields(type_id) orelse return null;
+    const count = builder.sema.ast_tree.extra_data[node.data.lhs];
+    const offset_type = try builder.sema.type_pool.internSizeInt(false);
+    var index: u32 = 0;
+    while (index < count and index < fields.len) : (index += 1) {
+        const field = fields[index];
+        const offset = try builder.emitInst(.{
+            .opcode = .const_i,
+            .type_id = offset_type,
+            .data = .{ .const_i = field.offset },
+        });
+        const pointer_type = try builder.sema.type_pool.internPtr(field.type_id, false);
+        const address = try builder.emitInst(.{
+            .opcode = .gep,
+            .type_id = pointer_type,
+            .data = .{ .gep = .{ .base = base, .index = offset, .stride = 1 } },
+        });
+        const value_node = builder.sema.ast_tree.extra_data[node.data.lhs + 1 + index];
+        const value = try builder.lowerNode(value_node) orelse return null;
+        _ = try builder.emitInst(.{
+            .opcode = .store,
+            .type_id = field.type_id,
+            .data = .{ .store = .{ .ptr = address, .val = value } },
+        });
+    }
+    return base;
+}
+
 pub fn lowerLiteral(builder: anytype, node_index: Node.Index) !?Inst.Index {
     const node = builder.sema.ast_tree.nodes.get(node_index);
     const type_id = builder.sema.node_types.get(node_index) orelse return null;

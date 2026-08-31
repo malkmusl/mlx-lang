@@ -376,7 +376,17 @@ pub const Lexer = struct {
             },
             '?' => return .question,
             '+' => return self.lexArithBase(.plus),
-            '-' => return self.lexArithBase(.minus),
+            '-' => {
+                // Preserve the existing `->>`/`->>=` combined-shift family;
+                // only a single greater-than forms the return arrow.
+                if (self.index < self.buffer.len and self.buffer[self.index] == '>' and
+                    (self.index + 1 >= self.buffer.len or self.buffer[self.index + 1] != '>'))
+                {
+                    self.index += 1;
+                    return .arrow;
+                }
+                return self.lexArithBase(.minus);
+            },
             '*' => return self.lexArithBase(.asterisk),
             '/' => {
                 if (self.match('=')) return .slash_equal;
@@ -695,6 +705,14 @@ test "lexer: integer range is not a float" {
 
 test "lexer: basic operators" {
     try expectTokens("+ - * / % == != <= >= << >>", &.{ .plus, .minus, .asterisk, .slash, .percent, .equal_equal, .bang_equal, .angle_bracket_left_equal, .angle_bracket_right_equal, .shl, .shr });
+}
+
+test "lexer: thin and match arrows share the contextual arrow token" {
+    try expectTokens("-> =>", &.{ .arrow, .arrow });
+}
+
+test "lexer: thin arrow does not consume combined right shifts" {
+    try expectTokens("->> ->>=", &.{ .minus_shr, .minus_shr_equal });
 }
 
 test "lexer: shift combine operators" {
