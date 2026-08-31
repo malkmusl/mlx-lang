@@ -185,23 +185,48 @@ fn parseNamedType(parser: anytype) std.mem.Allocator.Error!?Node.Index {
 fn parseFunctionType(parser: anytype) std.mem.Allocator.Error!?Node.Index {
     const function_token = parser.index;
     parser.consumeToken("Consume fn keyword in type");
-    if (parser.index < parser.tokens.len and parser.tokens[parser.index].tag == .l_paren) {
-        parser.consumeToken("Consume (");
-        var depth: u32 = 1;
-        while (parser.index < parser.tokens.len and depth > 0) {
-            if (parser.tokens[parser.index].tag == .l_paren) depth += 1;
-            if (parser.tokens[parser.index].tag == .r_paren) depth -= 1;
-            parser.consumeToken("Skip fn type param");
+    if (parser.index >= parser.tokens.len or parser.tokens[parser.index].tag != .l_paren) {
+        try parser.reportError(2004, "Expected '(' in function type");
+        return null;
+    }
+    parser.consumeToken("Consume function type '('");
+    var parameters = std.ArrayList(Node.Index).empty;
+    defer parameters.deinit(parser.allocator);
+    while (parser.index < parser.tokens.len and parser.tokens[parser.index].tag != .r_paren) {
+        // Named parameters are accepted for readability but names are not part
+        // of function type identity: fn(context: usize, len: usize) -> T.
+        if (parser.index + 1 < parser.tokens.len and parser.tokens[parser.index].tag == .ident and parser.tokens[parser.index + 1].tag == .colon) {
+            parser.consumeToken("Consume optional function type parameter name");
+            parser.consumeToken("Consume function type parameter ':'");
         }
+        const parameter = try parse(parser) orelse {
+            try parser.reportError(2005, "Expected parameter type in function type");
+            return null;
+        };
+        try parameters.append(parser.allocator, parameter);
+        if (parser.index < parser.tokens.len and parser.tokens[parser.index].tag == .comma) {
+            parser.consumeToken("Consume function type parameter comma");
+        } else break;
     }
-    if (parser.index < parser.tokens.len and parser.tokens[parser.index].tag == .arrow) {
-        parser.consumeToken("Consume function type return arrow");
+    if (parser.index >= parser.tokens.len or parser.tokens[parser.index].tag != .r_paren) {
+        try parser.reportError(2007, "Expected ')' after function type parameters");
+        return null;
     }
+    parser.consumeToken("Consume function type ')'");
+    if (parser.index >= parser.tokens.len or parser.tokens[parser.index].tag != .arrow) {
+        try parser.reportError(2002, "Expected '->' before function type return type");
+        return null;
+    }
+    parser.consumeToken("Consume function type return arrow");
     const return_type = try parse(parser) orelse return null;
+    const extra_start: u32 = @intCast(parser.extra_data.items.len);
+    try parser.extra_data.append(parser.allocator, return_type);
+    try parser.extra_data.append(parser.allocator, @intCast(parameters.items.len));
+    try parser.extra_data.appendSlice(parser.allocator, parameters.items);
     try parser.nodes.append(parser.allocator, .{
-        .tag = .pointer_type,
+        .tag = .fn_type,
         .main_token = function_token,
-        .data = .{ .lhs = return_type, .rhs = 0xff },
+        .data = .{ .lhs = extra_start, .rhs = @intCast(parameters.items.len) },
     });
     return @intCast(parser.nodes.len - 1);
 }

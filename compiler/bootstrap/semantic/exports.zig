@@ -21,6 +21,11 @@ pub fn collect(sema: *Sema, registry: *namespace.Registry, module_id: ModuleId) 
         const token = tree.tokens[name_token];
         const name = source[token.start..token.end];
         const type_id = sema.node_types.get(declaration_index) orelse continue;
+        const is_syscall = if (declaration.decl_flags.extern_decl and declaration.extern_name_token != std.math.maxInt(u32)) blk: {
+            const abi_token = tree.tokens[declaration.extern_name_token];
+            const raw = source[abi_token.start..abi_token.end];
+            break :blk raw.len >= 2 and std.mem.eql(u8, raw[1 .. raw.len - 1], "syscall");
+        } else false;
         try registry.put(module_id, name, .{
             .type_id = type_id,
             .public = declaration.decl_flags.public,
@@ -28,6 +33,7 @@ pub fn collect(sema: *Sema, registry: *namespace.Registry, module_id: ModuleId) 
             .type_value = sema.type_values.get(declaration_index),
             .module_value = sema.module_values.get(declaration_index),
             .is_function = declaration.tag == .fn_decl,
+            .is_syscall = is_syscall,
         });
     }
 }

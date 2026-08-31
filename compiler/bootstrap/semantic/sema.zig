@@ -44,7 +44,7 @@ const LoopContext = struct {
 
 pub const Sema = struct {
     const trace_enabled = false;
-    pub const ExternalDecl = struct { module_id: ModuleId, name: []const u8, is_function: bool };
+    pub const ExternalDecl = struct { module_id: ModuleId, name: []const u8, is_function: bool, is_syscall: bool };
     pub const DynamicField = struct { base_node: Node.Index, name: []const u8 };
 
     allocator: std.mem.Allocator,
@@ -195,6 +195,13 @@ pub const Sema = struct {
                 try self.node_types.put(node_idx, ty);
                 return ty;
             },
+            .fn_type => {
+                const value_type = try self.resolveTypeExpr(node_idx);
+                const type_type = try self.type_pool.internPrimitive(.type_type);
+                try self.type_values.put(node_idx, value_type);
+                try self.node_types.put(node_idx, type_type);
+                return type_type;
+            },
             .struct_decl, .enum_decl, .union_decl => return aggregate_type_semantics.analyze(self, node_idx, scope),
             .error_set_decl => return error_set_semantics.analyze(self, node_idx, scope),
             .identifier, .field_access => return name_semantics.analyze(self, node_idx, scope),
@@ -336,7 +343,7 @@ pub const Sema = struct {
                 }
                 return try self.resolveTypeExpr(node_idx);
             },
-            .pointer_type, .slice_type, .array_type, .optional_type, .error_union_type, .tuple_type => {
+            .pointer_type, .slice_type, .array_type, .optional_type, .error_union_type, .tuple_type, .fn_type => {
                 return try self.resolveTypeExpr(node_idx);
             },
             .struct_decl, .enum_decl, .union_decl => {

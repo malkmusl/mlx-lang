@@ -40,6 +40,7 @@ pub fn resolve(sema: anytype, node_index: Node.Index) std.mem.Allocator.Error!Ty
         },
         .array_type => resolveArray(sema, node, source),
         .tuple_type => resolveTuple(sema, node),
+        .fn_type => resolveFunction(sema, node),
         .error_union_type => blk: {
             const payload = try resolve(sema, node.data.rhs);
             const errors: Type.Id = if (node.data.lhs != 0)
@@ -50,6 +51,24 @@ pub fn resolve(sema: anytype, node_index: Node.Index) std.mem.Allocator.Error!Ty
         },
         else => sema.type_pool.internPrimitive(.void_type),
     };
+}
+
+fn resolveFunction(sema: anytype, node: Node) std.mem.Allocator.Error!Type.Id {
+    const return_type = try resolve(sema, sema.ast_tree.extra_data[node.data.lhs]);
+    const count = sema.ast_tree.extra_data[node.data.lhs + 1];
+    var parameters = std.ArrayList(Type.Id).empty;
+    defer parameters.deinit(sema.allocator);
+    var index: u32 = 0;
+    while (index < count) : (index += 1) {
+        try parameters.append(sema.allocator, try resolve(sema, sema.ast_tree.extra_data[node.data.lhs + 2 + index]));
+    }
+    const params_start = try sema.type_pool.appendParams(parameters.items);
+    return sema.type_pool.intern(.{ .function = .{
+        .ret_type = return_type,
+        .params_start = params_start,
+        .params_len = count,
+        .is_var_args = false,
+    } }, .copyable);
 }
 
 fn resolveTuple(sema: anytype, node: Node) std.mem.Allocator.Error!Type.Id {

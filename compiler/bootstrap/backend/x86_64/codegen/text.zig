@@ -179,6 +179,29 @@ pub fn emit(self: anytype, writer: anytype, inst_idx: lir.Inst.Index) !void {
                 try writer.print("  lea {s}, [rbp - {d}]\n", .{ op.reg, slot });
             }
         },
+        .aggregate_copy => {
+            const op = try self.allocateOp(inst_idx);
+            const source = try self.allocateOp(inst.data.aggregate_copy);
+            const source_reg = try opToReg(writer, source, "rsi");
+            if (!std.mem.eql(u8, source_reg, "rsi")) try writer.print("  mov rsi, {s}\n", .{source_reg});
+            const layout = self.indirectReturnLayout(inst.type_id);
+            const slot = try self.getOrAllocBlock(0x9000_0000 | inst_idx, @max(layout.size, 1), layout.alignment);
+            try writer.print("  lea rdi, [rbp - {d}]\n", .{slot});
+            var offset: u32 = 0;
+            while (offset + 8 <= layout.size) : (offset += 8) {
+                try writer.print("  mov rax, qword [rsi + {d}]\n  mov qword [rdi + {d}], rax\n", .{ offset, offset });
+            }
+            while (offset < layout.size) : (offset += 1) {
+                try writer.print("  mov al, byte [rsi + {d}]\n  mov byte [rdi + {d}], al\n", .{ offset, offset });
+            }
+            if (op == .mem) {
+                try writer.print("  lea rax, [rbp - {d}]\n  mov ", .{slot});
+                try printOp(writer, op);
+                try writer.print(", rax\n", .{});
+            } else {
+                try writer.print("  lea {s}, [rbp - {d}]\n", .{ op.reg, slot });
+            }
+        },
         .store => {
             const ptr_op = try self.allocateOp(inst.data.store.ptr);
             const val_op = try self.allocateOp(inst.data.store.val);
@@ -211,13 +234,13 @@ pub fn emit(self: anytype, writer: anytype, inst_idx: lir.Inst.Index) !void {
             const op = try self.allocateOp(inst_idx);
             const param_idx = inst.data.param + @intFromBool(if (self.current_function_return_type) |return_type| self.isIndirectReturn(return_type) else false);
             if (param_idx < abi.integer_arg_regs.len) {
-                const arg_reg = abi.integer_arg_regs[param_idx];
+                const parameter_slot = try self.getOrAllocParameterSlot(param_idx);
                 if (op == .mem) {
-                    try writer.print("  mov ", .{});
+                    try writer.print("  mov rax, qword [rbp - {d}]\n  mov ", .{parameter_slot});
                     try printOp(writer, op);
-                    try writer.print(", {s}\n", .{arg_reg});
+                    try writer.print(", rax\n", .{});
                 } else {
-                    try writer.print("  mov {s}, {s}\n", .{ op.reg, arg_reg });
+                    try writer.print("  mov {s}, qword [rbp - {d}]\n", .{ op.reg, parameter_slot });
                 }
             } else {
                 const stack_offset: i32 = 16 + @as(i32, @intCast((param_idx - 6) * 8));
@@ -246,9 +269,13 @@ pub fn emit(self: anytype, writer: anytype, inst_idx: lir.Inst.Index) !void {
         .label => {
             const fn_name = self.lir.symbols.items[inst.data.label];
             try writer.print("global {s}\n{s}:\n", .{ fn_name, fn_name });
-            try writer.print("  push rbp\n  mov rbp, rsp\n  sub rsp, 4096\n", .{});
+            const frame_size = self.beginFunction(inst_idx);
+            try writer.print("  push rbp\n  mov rbp, rsp\n  sub rsp, {d}\n", .{frame_size});
             self.current_function_return_type = inst.type_id;
-            self.current_hidden_payload_slot = null;
+            for (abi.integer_arg_regs, 0..) |argument_register, parameter_index| {
+                const parameter_slot = try self.getOrAllocParameterSlot(@intCast(parameter_index));
+                try writer.print("  mov qword [rbp - {d}], {s}\n", .{ parameter_slot, argument_register });
+            }
             if (self.isIndirectReturn(inst.type_id)) {
                 const slot = try self.getOrAllocSlot(0xb000_0000 | inst.data.label);
                 self.current_hidden_payload_slot = slot;
@@ -261,30 +288,29 @@ pub fn emit(self: anytype, writer: anytype, inst_idx: lir.Inst.Index) !void {
             const args_extra_start = inst.data.call.args_start;
             const memory_return = self.isIndirectReturn(inst.type_id);
             const register_aggregate_return = self.isRegisterAggregateErrorUnion(inst.type_id);
-            const register_tuple_return = self.isRegisterTuple(inst.type_id);
+            const register_value_return = self.isRegisterAggregate(inst.type_id);
             var memory_payload_slot: ?i32 = null;
-            if (memory_return or register_aggregate_return or register_tuple_return) {
-                const layout = if (self.isTuple(inst.type_id)) self.indirectReturnLayout(inst.type_id) else self.errorPayloadLayout(inst.type_id);
+            if (memory_return or register_aggregate_return or register_value_return) {
+                const layout = if (self.isAggregate(inst.type_id)) self.indirectReturnLayout(inst.type_id) else self.errorPayloadLayout(inst.type_id);
                 const slot = try self.getOrAllocBlock(0xa000_0000 | inst_idx, @max(layout.size, 8), layout.alignment);
                 memory_payload_slot = slot;
                 if (memory_return) try writer.print("  lea rdi, [rbp - {d}]\n", .{slot});
             }
-            var arg_classes_buf: [32]abi.ArgClass = undefined;
-            const n = @min(num_args + @intFromBool(memory_return), 32);
-            for (0..n) |i| arg_classes_buf[i] = .INTEGER;
-            const site = abi.describeCall(arg_classes_buf[0..n]);
-            if (site.stack_count > 0) {
+            const register_offset: u32 = @intFromBool(memory_return);
+            const register_capacity: u32 = @as(u32, abi.integer_arg_regs.len) - register_offset;
+            const stack_count = num_args -| register_capacity;
+            const needs_stack_align = stack_count % 2 != 0;
+            if (needs_stack_align) try writer.print("  sub rsp, 8\n", .{});
+            if (stack_count > 0) {
                 var j: i32 = @as(i32, @intCast(num_args)) - 1;
-                while (j >= @as(i32, @intCast(abi.integer_arg_regs.len))) : (j -= 1) {
+                while (j >= @as(i32, @intCast(register_capacity))) : (j -= 1) {
                     const arg_inst = self.lir.extra_data.items[args_extra_start + @as(u32, @intCast(j))];
                     const arg_op = try self.allocateOp(arg_inst);
                     const arg_reg = try opToReg(writer, arg_op, "rax");
                     try writer.print("  push {s}\n", .{arg_reg});
                 }
-                if (site.needs_stack_align) try writer.print("  sub rsp, 8\n", .{});
             }
-            const register_offset: u32 = @intFromBool(memory_return);
-            var i: u32 = @min(num_args, @as(u32, abi.integer_arg_regs.len) - register_offset);
+            var i: u32 = @min(num_args, register_capacity);
             while (i > 0) {
                 i -= 1;
                 const arg_inst = self.lir.extra_data.items[args_extra_start + i];
@@ -304,14 +330,14 @@ pub fn emit(self: anytype, writer: anytype, inst_idx: lir.Inst.Index) !void {
                     try writer.print("  call rax\n", .{});
                 },
             }
-            if (site.stack_bytes > 0) {
-                var adjust = site.stack_bytes;
-                if (site.needs_stack_align) adjust += 8;
+            if (stack_count > 0 or needs_stack_align) {
+                var adjust = stack_count * 8;
+                if (needs_stack_align) adjust += 8;
                 try writer.print("  add rsp, {d}\n", .{adjust});
             }
-            if (self.isTuple(inst.type_id)) {
+            if (self.isAggregate(inst.type_id)) {
                 const slot = memory_payload_slot.?;
-                if (register_tuple_return) {
+                if (register_value_return) {
                     const layout = self.indirectReturnLayout(inst.type_id);
                     try writer.print("  lea rdi, [rbp - {d}]\n  mov qword [rdi], rax\n", .{slot});
                     if (layout.size > 8) try writer.print("  mov qword [rdi + 8], rdx\n", .{});
@@ -366,7 +392,40 @@ pub fn emit(self: anytype, writer: anytype, inst_idx: lir.Inst.Index) !void {
                 } else if (!std.mem.eql(u8, op.reg, "rdx")) {
                     try writer.print("  mov {s}, rdx\n", .{op.reg});
                 }
+            } else if (self.isSlice(inst.type_id)) {
+                const length_slot = try self.getOrAllocErrorPayloadExtraSlot(inst_idx);
+                try writer.print("  mov qword [rbp - {d}], rdx\n", .{length_slot});
+                if (op == .mem) {
+                    try writer.print("  mov ", .{});
+                    try printOp(writer, op);
+                    try writer.print(", rax\n", .{});
+                } else if (!std.mem.eql(u8, op.reg, "rax")) {
+                    try writer.print("  mov {s}, rax\n", .{op.reg});
+                }
             } else if (op == .mem) {
+                try writer.print("  mov ", .{});
+                try printOp(writer, op);
+                try writer.print(", rax\n", .{});
+            } else if (!std.mem.eql(u8, op.reg, "rax")) {
+                try writer.print("  mov {s}, rax\n", .{op.reg});
+            }
+        },
+        .syscall => {
+            const op = try self.allocateOp(inst_idx);
+            const start = inst.data.syscall;
+            const count = self.lir.extra_data.items[start];
+            const syscall_regs = [_][]const u8{ "rax", "rdi", "rsi", "rdx", "r10", "r8", "r9" };
+            var index = @min(count, @as(u32, syscall_regs.len));
+            while (index > 0) {
+                index -= 1;
+                const argument = self.lir.extra_data.items[start + 1 + index];
+                const argument_op = try self.allocateOp(argument);
+                const source_reg = try opToReg(writer, argument_op, if (index == 0) "rax" else "rcx");
+                const destination = syscall_regs[index];
+                if (!std.mem.eql(u8, source_reg, destination)) try writer.print("  mov {s}, {s}\n", .{ destination, source_reg });
+            }
+            try writer.print("  syscall\n", .{});
+            if (op == .mem) {
                 try writer.print("  mov ", .{});
                 try printOp(writer, op);
                 try writer.print(", rax\n", .{});
@@ -425,13 +484,13 @@ pub fn emit(self: anytype, writer: anytype, inst_idx: lir.Inst.Index) !void {
             try writer.print("  jmp .block_{d}\n", .{inst.data.condbr.false_dest});
         },
         .ret => {
-            if (self.isTuple(inst.type_id)) {
+            if (self.isAggregate(inst.type_id)) {
                 if (inst.data.ret) |r| {
                     const val_op = try self.allocateOp(r);
                     const source_reg = try opToReg(writer, val_op, "rsi");
                     if (!std.mem.eql(u8, source_reg, "rsi")) try writer.print("  mov rsi, {s}\n", .{source_reg});
                     const layout = self.indirectReturnLayout(inst.type_id);
-                    if (self.isRegisterTuple(inst.type_id)) {
+                    if (self.isRegisterAggregate(inst.type_id)) {
                         try writer.print("  mov rax, qword [rsi]\n", .{});
                         if (layout.size > 8) try writer.print("  mov rdx, qword [rsi + 8]\n", .{});
                     } else {
@@ -494,6 +553,15 @@ pub fn emit(self: anytype, writer: anytype, inst_idx: lir.Inst.Index) !void {
             const tag_op = try self.allocateOp(inst.data.ret_error);
             const tag_reg = try opToReg(writer, tag_op, "rax");
             if (!std.mem.eql(u8, tag_reg, "rax")) try writer.print("  mov rax, {s}\n", .{tag_reg});
+            try writer.print("  mov rsp, rbp\n  pop rbp\n  ret\n", .{});
+        },
+        .ret_slice => {
+            const pointer = try self.allocateOp(inst.data.ret_slice.ptr);
+            const length = try self.allocateOp(inst.data.ret_slice.len);
+            const pointer_reg = try opToReg(writer, pointer, "rax");
+            const length_reg = try opToReg(writer, length, "rdx");
+            if (!std.mem.eql(u8, pointer_reg, "rax")) try writer.print("  mov rax, {s}\n", .{pointer_reg});
+            if (!std.mem.eql(u8, length_reg, "rdx")) try writer.print("  mov rdx, {s}\n", .{length_reg});
             try writer.print("  mov rsp, rbp\n  pop rbp\n  ret\n", .{});
         },
         .ret_error_union => {

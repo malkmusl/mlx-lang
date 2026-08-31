@@ -65,9 +65,9 @@ pub fn main(init: std.process.Init) !u8 {
     var module_registry = try modules.namespace.Registry.init(allocator, module_loader.modules.items.len);
     defer module_registry.deinit();
 
-    // Dependencies were appended while recursively walking imports. Analyze in
-    // reverse discovery order so ordinary acyclic imports expose their public
-    // namespace before their importer is checked.
+    // Analyze imports topologically. Discovery order alone is insufficient:
+    // a later sibling can depend on an already-discovered earlier sibling,
+    // while a direct dependency discovered during recursion can also be later.
     const sema_mod = @import("semantic/sema.zig");
     const export_collector = @import("semantic/exports.zig");
     const scope_mod = @import("semantic/scope.zig");
@@ -82,33 +82,63 @@ pub fn main(init: std.process.Init) !u8 {
         }
         imported_analyses.deinit(allocator);
     }
-    var module_index = module_loader.modules.items.len;
-    while (module_index > 1) {
-        module_index -= 1;
-        const imported = module_loader.get(@intCast(module_index));
-        if (imported.ast == null) continue;
-        const imported_scope = try allocator.create(scope_mod.Scope);
-        errdefer allocator.destroy(imported_scope);
-        imported_scope.* = scope_mod.Scope.init(allocator, null);
-        errdefer imported_scope.deinit();
-        const imported_sema = try allocator.create(sema_mod.Sema);
-        errdefer allocator.destroy(imported_sema);
-        imported_sema.* = sema_mod.Sema.init(
-            allocator,
-            imported.ast.?,
-            imported.source_id,
-            &engine,
-            &type_pool,
-            imported_scope,
-        );
-        errdefer imported_sema.deinit();
-        imported_sema.configureModules(@intCast(module_index), &imported.imports, &module_registry);
-        imported_sema.analyze() catch |err| {
-            std.debug.print("Imported module sema failed: {}\n", .{err});
+    const analyzed_modules = try allocator.alloc(bool, module_loader.modules.items.len);
+    defer allocator.free(analyzed_modules);
+    @memset(analyzed_modules, false);
+    var remaining_modules: usize = 0;
+    for (module_loader.modules.items[1..], 1..) |module, module_index| {
+        if (module.ast == null) {
+            analyzed_modules[module_index] = true;
+        } else {
+            remaining_modules += 1;
+        }
+    }
+    while (remaining_modules > 0) {
+        var made_progress = false;
+        var module_index: usize = 1;
+        while (module_index < module_loader.modules.items.len) : (module_index += 1) {
+            if (analyzed_modules[module_index]) continue;
+            const imported = module_loader.get(@intCast(module_index));
+            var dependencies_ready = true;
+            var dependencies = imported.imports.valueIterator();
+            while (dependencies.next()) |dependency| {
+                if (dependency.* >= analyzed_modules.len or !analyzed_modules[dependency.*]) {
+                    dependencies_ready = false;
+                    break;
+                }
+            }
+            if (!dependencies_ready) continue;
+
+            const imported_scope = try allocator.create(scope_mod.Scope);
+            errdefer allocator.destroy(imported_scope);
+            imported_scope.* = scope_mod.Scope.init(allocator, null);
+            errdefer imported_scope.deinit();
+            const imported_sema = try allocator.create(sema_mod.Sema);
+            errdefer allocator.destroy(imported_sema);
+            imported_sema.* = sema_mod.Sema.init(
+                allocator,
+                imported.ast.?,
+                imported.source_id,
+                &engine,
+                &type_pool,
+                imported_scope,
+            );
+            errdefer imported_sema.deinit();
+            imported_sema.configureModules(@intCast(module_index), &imported.imports, &module_registry);
+            imported_sema.analyze() catch |err| {
+                std.debug.print("Imported module sema failed: {}\n", .{err});
+                return 1;
+            };
+            try export_collector.collect(imported_sema, &module_registry, @intCast(module_index));
+            try imported_analyses.append(allocator, .{ .scope = imported_scope, .sema = imported_sema });
+            analyzed_modules[module_index] = true;
+            remaining_modules -= 1;
+            made_progress = true;
+        }
+        if (!made_progress) {
+            std.debug.print("Imported module dependency cycle cannot be analyzed by Stage 0\n", .{});
             return 1;
-        };
-        try export_collector.collect(imported_sema, &module_registry, @intCast(module_index));
-        try imported_analyses.append(allocator, .{ .scope = imported_scope, .sema = imported_sema });
+        }
     }
 
     var root_scope = scope_mod.Scope.init(allocator, null);

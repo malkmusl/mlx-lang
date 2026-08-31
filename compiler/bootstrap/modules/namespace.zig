@@ -12,6 +12,7 @@ pub const Export = struct {
     type_value: ?Type.Id = null,
     module_value: ?ModuleId = null,
     is_function: bool = false,
+    is_syscall: bool = false,
 };
 
 pub const Namespace = struct {

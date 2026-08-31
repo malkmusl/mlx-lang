@@ -340,6 +340,14 @@ pub const Encoder = struct {
         try self.emitImm32(@as(i32, @intCast(imm)));
     }
 
+    /// ADD rsp, imm32   (REX.W 81 /0 id) — discard outgoing stack arguments.
+    pub fn emitAddRspImm32(self: *Encoder, imm: u32) !void {
+        std.debug.print("[enc] add rsp, {d}\n", .{imm});
+        try self.emit1(rex(true, false, false, false));
+        try self.emit2(0x81, 0xC4);
+        try self.emitImm32(@as(i32, @intCast(imm)));
+    }
+
     // ── compare / test ────────────────────────────────────────────────────────
 
     /// TEST reg, reg   (REX.W 85 /r)
@@ -418,6 +426,13 @@ pub const Encoder = struct {
     pub fn emitPushRbp(self: *Encoder) !void {
         std.debug.print("[enc] push rbp\n", .{});
         try self.emit1(0x55);
+    }
+
+    /// PUSH r64 (50+rd, with REX.B for r8-r15).
+    pub fn emitPushReg(self: *Encoder, reg: Reg) !void {
+        std.debug.print("[enc] push {s}\n", .{@tagName(reg)});
+        if (needsRex(reg)) try self.emit1(rex(false, false, false, true));
+        try self.emit1(0x50 | @as(u8, lo3(reg)));
     }
 
     /// POP rbp   (5D)

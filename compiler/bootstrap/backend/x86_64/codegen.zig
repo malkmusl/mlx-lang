@@ -41,10 +41,6 @@ pub const X86Gen = struct {
     current_function_return_type: ?u32,
     current_hidden_payload_slot: ?i32,
 
-    const gp_regs = [_][]const u8{
-        "rdx", "rbx", "r10", "r11", "r12", "r13", "r14", "r15",
-    };
-
     pub fn init(
         allocator: std.mem.Allocator,
         ir: *lir.Lir,
@@ -87,17 +83,45 @@ pub const X86Gen = struct {
 
     pub fn allocateOp(self: *X86Gen, vreg: lir.Inst.Index) !Operand {
         if (self.vreg_to_op.get(vreg)) |op| return op;
-        if (self.next_gp_reg < gp_regs.len) {
-            const reg = gp_regs[self.next_gp_reg];
-            self.next_gp_reg += 1;
-            const op = Operand{ .reg = reg };
-            try self.vreg_to_op.put(vreg, op);
-            return op;
-        }
+        // Stage0 deliberately spills every persistent virtual register. Values
+        // therefore survive ordinary calls without a liveness-aware allocator
+        // or callee-save insertion. Scratch registers remain instruction-local.
         const op = Operand{ .mem = @as(i32, @intCast(self.next_stack_slot)) };
         self.next_stack_slot += 8;
         try self.vreg_to_op.put(vreg, op);
         return op;
+    }
+
+    /// Start a fresh function-local allocation domain and return a conservative
+    /// frame size derived from the function's LIR. The estimate intentionally
+    /// over-allocates per instruction; Stage0 values are stack-resident and
+    /// correctness matters more than compact frames during self-host bootstrap.
+    pub fn beginFunction(self: *X86Gen, label_instruction: lir.Inst.Index) u32 {
+        self.vreg_to_op.clearRetainingCapacity();
+        self.addr_to_slot.clearRetainingCapacity();
+        self.error_tag_slots.clearRetainingCapacity();
+        self.error_payload_extra_slots.clearRetainingCapacity();
+        self.next_gp_reg = 0;
+        self.next_stack_slot = 8;
+        self.current_hidden_payload_slot = null;
+
+        var bytes: u64 = 256;
+        var index: usize = @as(usize, label_instruction) + 1;
+        while (index < self.lir.insts.items.len and self.lir.insts.items[index].opcode != .label) : (index += 1) {
+            const instruction = self.lir.insts.items[index];
+            bytes += 32;
+            if (instruction.opcode == .alloca) {
+                bytes += instruction.data.alloca.size + instruction.data.alloca.alignment;
+            } else if (instruction.opcode == .aggregate_copy) {
+                bytes += (self.type_pool.sizeOf(instruction.type_id) catch 8) +
+                    (self.type_pool.alignOf(instruction.type_id) catch 8);
+            } else if (instruction.opcode == .call and self.type_pool.aggregateInfo(instruction.type_id) != null) {
+                bytes += (self.type_pool.sizeOf(instruction.type_id) catch 16) +
+                    (self.type_pool.alignOf(instruction.type_id) catch 8);
+            }
+        }
+        bytes = (bytes + 15) & ~@as(u64, 15);
+        return @intCast(@min(bytes, std.math.maxInt(u32)));
     }
 
     // ── stack frame helpers ──────────────────────────────────────────────────
@@ -139,6 +163,13 @@ pub const X86Gen = struct {
         return slot;
     }
 
+    /// Argument registers are caller-saved and the ordinary instruction
+    /// lowering uses some of them as scratch registers. Capture all register
+    /// parameters in the prologue before lowering any parameter bindings.
+    pub fn getOrAllocParameterSlot(self: *X86Gen, parameter_index: u32) !i32 {
+        return self.getOrAllocSlot(0xc000_0000 | parameter_index);
+    }
+
     pub fn isErrorUnion(self: *const X86Gen, type_id: u32) bool {
         return type_id < self.type_pool.types.items.len and self.type_pool.get(type_id).data == .error_union;
     }
@@ -148,6 +179,12 @@ pub const X86Gen = struct {
         const payload_id = self.type_pool.get(type_id).data.error_union.payload;
         const payload = self.type_pool.get(payload_id);
         return payload.data == .pointer and payload.data.pointer.size == .Slice;
+    }
+
+    pub fn isSlice(self: *const X86Gen, type_id: u32) bool {
+        if (type_id >= self.type_pool.types.items.len) return false;
+        const ty = self.type_pool.get(type_id);
+        return ty.data == .pointer and ty.data.pointer.size == .Slice;
     }
 
     pub fn isByteType(self: *const X86Gen, type_id: u32) bool {
@@ -183,25 +220,29 @@ pub const X86Gen = struct {
         return size > 16 or alignment > 16;
     }
 
-    pub fn isTuple(self: *const X86Gen, type_id: u32) bool {
-        return type_id < self.type_pool.types.items.len and self.type_pool.get(type_id).data == .tuple;
+    pub fn isAggregate(self: *const X86Gen, type_id: u32) bool {
+        if (type_id >= self.type_pool.types.items.len) return false;
+        return switch (self.type_pool.get(type_id).data) {
+            .array, .@"struct", .@"union", .tuple => true,
+            else => false,
+        };
     }
 
-    pub fn isRegisterTuple(self: *const X86Gen, type_id: u32) bool {
-        if (!self.isTuple(type_id)) return false;
+    pub fn isRegisterAggregate(self: *const X86Gen, type_id: u32) bool {
+        if (!self.isAggregate(type_id)) return false;
         const size = self.type_pool.sizeOf(type_id) catch return false;
         const alignment = self.type_pool.alignOf(type_id) catch return false;
         return size > 0 and size <= 16 and alignment <= 16 and !self.typeContainsFloat(type_id);
     }
 
-    pub fn isMemoryTuple(self: *const X86Gen, type_id: u32) bool {
-        return self.isTuple(type_id) and !self.isRegisterTuple(type_id);
+    pub fn isMemoryAggregate(self: *const X86Gen, type_id: u32) bool {
+        return self.isAggregate(type_id) and !self.isRegisterAggregate(type_id);
     }
 
     /// MEMORY-class results use caller-owned storage. Small integer-compatible
-    /// tuples remain in the normal rax/rdx aggregate return registers.
+    /// aggregates remain in the normal rax/rdx aggregate return registers.
     pub fn isIndirectReturn(self: *const X86Gen, type_id: u32) bool {
-        return self.isMemoryTuple(type_id) or self.isMemoryErrorUnion(type_id);
+        return self.isMemoryAggregate(type_id) or self.isMemoryErrorUnion(type_id);
     }
 
     fn typeContainsFloat(self: *const X86Gen, type_id: u32) bool {
@@ -237,7 +278,7 @@ pub const X86Gen = struct {
     }
 
     pub fn indirectReturnLayout(self: *const X86Gen, type_id: u32) Layout {
-        if (self.isTuple(type_id)) {
+        if (self.isAggregate(type_id)) {
             return .{
                 .size = @intCast(self.type_pool.sizeOf(type_id) catch 8),
                 .alignment = @intCast(self.type_pool.alignOf(type_id) catch 8),

@@ -151,6 +151,14 @@ pub const Node = struct {
     ///     extra_data[lhs + 1..] = element expression/type nodes
     ///   rhs = element count
     ///
+    /// `fn_type`:
+    ///   main_token = `fn` token
+    ///   lhs = extra_start where:
+    ///     extra_data[lhs + 0] = return type node
+    ///     extra_data[lhs + 1] = parameter count
+    ///     extra_data[lhs + 2..] = parameter type nodes
+    ///   rhs = parameter count
+    ///
     /// `break_stmt` / `continue_stmt`:
     ///   main_token = keyword token
     ///   lhs = label token, or maxInt(u32)
@@ -228,6 +236,7 @@ pub const Node = struct {
         array_type, // [N]T
         optional_type, // ?T
         error_union_type, // E!T or !T
+        fn_type, // fn(T, U) -> R
 
         // Aggregate type declarations
         struct_decl,

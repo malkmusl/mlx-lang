@@ -5,6 +5,7 @@ pub const Opcode = enum {
     const_i,
     const_f,
     copy,
+    aggregate_copy,
 
     // Arithmetic
     add,
@@ -34,6 +35,7 @@ pub const Opcode = enum {
     call,
     syscall,
     ret,
+    ret_slice,
     ret_error,
     ret_error_union,
     ret_error_slice,
@@ -72,6 +74,7 @@ pub const Inst = struct {
         const_i: u64,
         const_f: f64,
         copy: Index,
+        aggregate_copy: Index,
 
         add: struct { lhs: Index, rhs: Index },
         sub: struct { lhs: Index, rhs: Index },
@@ -98,6 +101,7 @@ pub const Inst = struct {
         call: struct { func: Index, args_start: u32, args_count: u32 },
         syscall: u32, // extra_start, first elem is arg_count
         ret: ?Index,
+        ret_slice: struct { ptr: Index, len: Index },
         ret_error: Index,
         ret_error_union: Index,
         ret_error_slice: struct { ptr: Index, len: Index },

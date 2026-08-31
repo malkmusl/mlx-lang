@@ -193,6 +193,24 @@ pub fn emit(self: anytype, enc: *Encoder, inst_idx: lir.Inst.Index) !void {
             }
         },
 
+        .aggregate_copy => {
+            const op = try self.allocateOp(inst_idx);
+            const source = try self.allocateOp(inst.data.aggregate_copy);
+            const source_reg = try opToRegBin(enc, source, .rsi);
+            try enc.emitMovRegReg(.rsi, source_reg);
+            const layout = self.indirectReturnLayout(inst.type_id);
+            const slot = try self.getOrAllocBlock(0x9000_0000 | inst_idx, @max(layout.size, 1), layout.alignment);
+            try enc.emitLeaRegMem(.rdi, slot);
+            try memory_codegen.emitMemoryCopy(enc, layout.size);
+            switch (op) {
+                .reg => |register| try enc.emitLeaRegMem(nameToReg(register), slot),
+                .mem => |destination| {
+                    try enc.emitLeaRegMem(.rax, slot);
+                    try enc.emitMovMemReg(destination, .rax);
+                },
+            }
+        },
+
         .store => {
             const ptr_op = try self.allocateOp(inst.data.store.ptr);
             const val_op = try self.allocateOp(inst.data.store.val);
@@ -239,10 +257,13 @@ pub fn emit(self: anytype, enc: *Encoder, inst_idx: lir.Inst.Index) !void {
             const param_idx = inst.data.param + @intFromBool(if (self.current_function_return_type) |return_type| self.isIndirectReturn(return_type) else false);
             const arg_regs_bin = [_]Reg{ .rdi, .rsi, .rdx, .rcx, .r8, .r9 };
             if (param_idx < arg_regs_bin.len) {
-                const src_r = arg_regs_bin[param_idx];
+                const parameter_slot = try self.getOrAllocParameterSlot(param_idx);
                 switch (op) {
-                    .reg => |r| try enc.emitMovRegReg(nameToReg(r), src_r),
-                    .mem => |m| try enc.emitMovMemReg(m, src_r),
+                    .reg => |r| try enc.emitMovRegMem(nameToReg(r), parameter_slot),
+                    .mem => |m| {
+                        try enc.emitMovRegMem(.rax, parameter_slot);
+                        try enc.emitMovMemReg(m, .rax);
+                    },
                 }
             } else {
                 // Stack param: [rbp + 16 + (n-6)*8]
@@ -273,9 +294,13 @@ pub fn emit(self: anytype, enc: *Encoder, inst_idx: lir.Inst.Index) !void {
             try enc.defineSymbol(fn_name);
             try enc.emitPushRbp();
             try enc.emitMovRbpRsp();
-            try enc.emitSubRspImm32(4096);
+            try enc.emitSubRspImm32(self.beginFunction(inst_idx));
             self.current_function_return_type = inst.type_id;
-            self.current_hidden_payload_slot = null;
+            const argument_registers = [_]Reg{ .rdi, .rsi, .rdx, .rcx, .r8, .r9 };
+            for (argument_registers, 0..) |argument_register, parameter_index| {
+                const parameter_slot = try self.getOrAllocParameterSlot(@intCast(parameter_index));
+                try enc.emitMovMemReg(parameter_slot, argument_register);
+            }
             if (self.isIndirectReturn(inst.type_id)) {
                 const slot = try self.getOrAllocSlot(0xb000_0000 | inst.data.label);
                 self.current_hidden_payload_slot = slot;
@@ -291,18 +316,35 @@ pub fn emit(self: anytype, enc: *Encoder, inst_idx: lir.Inst.Index) !void {
             const arg_regs_bin = [_]Reg{ .rdi, .rsi, .rdx, .rcx, .r8, .r9 };
             const memory_return = self.isIndirectReturn(inst.type_id);
             const register_aggregate_return = self.isRegisterAggregateErrorUnion(inst.type_id);
-            const register_tuple_return = self.isRegisterTuple(inst.type_id);
+            const register_value_return = self.isRegisterAggregate(inst.type_id);
             var memory_payload_slot: ?i32 = null;
-            if (memory_return or register_aggregate_return or register_tuple_return) {
-                const layout = if (self.isTuple(inst.type_id)) self.indirectReturnLayout(inst.type_id) else self.errorPayloadLayout(inst.type_id);
+            if (memory_return or register_aggregate_return or register_value_return) {
+                const layout = if (self.isAggregate(inst.type_id)) self.indirectReturnLayout(inst.type_id) else self.errorPayloadLayout(inst.type_id);
                 const slot = try self.getOrAllocBlock(0xa000_0000 | inst_idx, @max(layout.size, 8), layout.alignment);
                 memory_payload_slot = slot;
                 if (memory_return) try enc.emitLeaRegMem(.rdi, slot);
             }
 
-            // Move register args (last first to avoid clobbering)
             const register_offset: u32 = @intFromBool(memory_return);
-            var i: u32 = @min(num_args, @as(u32, arg_regs_bin.len) - register_offset);
+            const register_capacity: u32 = @as(u32, arg_regs_bin.len) - register_offset;
+            const stack_count = num_args -| register_capacity;
+            const needs_stack_align = stack_count % 2 != 0;
+            // Alignment padding precedes the pushed arguments so the first
+            // stack parameter remains at [rbp + 16] in the callee.
+            if (needs_stack_align) try enc.emitSubRspImm8(8);
+            if (stack_count > 0) {
+                var stack_index: u32 = num_args;
+                while (stack_index > register_capacity) {
+                    stack_index -= 1;
+                    const arg_inst = self.lir.extra_data.items[args_extra_start + stack_index];
+                    const arg_op = try self.allocateOp(arg_inst);
+                    const source = try opToRegBin(enc, arg_op, .rax);
+                    try enc.emitPushReg(source);
+                }
+            }
+
+            // Move register args (last first to avoid clobbering)
+            var i: u32 = @min(num_args, register_capacity);
             while (i > 0) {
                 i -= 1;
                 const arg_inst = self.lir.extra_data.items[args_extra_start + i];
@@ -323,10 +365,14 @@ pub fn emit(self: anytype, enc: *Encoder, inst_idx: lir.Inst.Index) !void {
                 },
             }
 
+            if (stack_count > 0 or needs_stack_align) {
+                try enc.emitAddRspImm32(stack_count * 8 + @as(u32, @intFromBool(needs_stack_align)) * 8);
+            }
+
             // Error unions return the tag in rax and the first integer payload in rdx.
-            if (self.isTuple(inst.type_id)) {
+            if (self.isAggregate(inst.type_id)) {
                 const slot = memory_payload_slot.?;
-                if (register_tuple_return) {
+                if (register_value_return) {
                     const layout = self.indirectReturnLayout(inst.type_id);
                     try enc.emitLeaRegMem(.rdi, slot);
                     try memory_codegen.emitStoreViaPtr(enc, .rdi, .rax);
@@ -388,9 +434,36 @@ pub fn emit(self: anytype, enc: *Encoder, inst_idx: lir.Inst.Index) !void {
                     .reg => |r| try enc.emitMovRegReg(nameToReg(r), .rdx),
                     .mem => |m| try enc.emitMovMemReg(m, .rdx),
                 }
+            } else if (self.isSlice(inst.type_id)) {
+                const length_slot = try self.getOrAllocErrorPayloadExtraSlot(inst_idx);
+                try enc.emitMovMemReg(length_slot, .rdx);
+                switch (op) {
+                    .reg => |r| try enc.emitMovRegReg(nameToReg(r), .rax),
+                    .mem => |m| try enc.emitMovMemReg(m, .rax),
+                }
             } else switch (op) {
                 .reg => |r| try enc.emitMovRegReg(nameToReg(r), .rax),
                 .mem => |m| try enc.emitMovMemReg(m, .rax),
+            }
+        },
+
+        .syscall => {
+            const op = try self.allocateOp(inst_idx);
+            const start = inst.data.syscall;
+            const count = self.lir.extra_data.items[start];
+            const syscall_regs = [_]Reg{ .rax, .rdi, .rsi, .rdx, .r10, .r8, .r9 };
+            var index = @min(count, @as(u32, syscall_regs.len));
+            while (index > 0) {
+                index -= 1;
+                const argument = self.lir.extra_data.items[start + 1 + index];
+                const argument_op = try self.allocateOp(argument);
+                const source = try opToRegBin(enc, argument_op, if (index == 0) .rax else .rcx);
+                try enc.emitMovRegReg(syscall_regs[index], source);
+            }
+            try enc.emitSyscall();
+            switch (op) {
+                .reg => |register| try enc.emitMovRegReg(nameToReg(register), .rax),
+                .mem => |destination| try enc.emitMovMemReg(destination, .rax),
             }
         },
 
@@ -445,13 +518,13 @@ pub fn emit(self: anytype, enc: *Encoder, inst_idx: lir.Inst.Index) !void {
         },
 
         .ret => {
-            if (self.isTuple(inst.type_id)) {
+            if (self.isAggregate(inst.type_id)) {
                 if (inst.data.ret) |r| {
                     const val_op = try self.allocateOp(r);
                     const val_r = try opToRegBin(enc, val_op, .rsi);
                     try enc.emitMovRegReg(.rsi, val_r);
                     const layout = self.indirectReturnLayout(inst.type_id);
-                    if (self.isRegisterTuple(inst.type_id)) {
+                    if (self.isRegisterAggregate(inst.type_id)) {
                         try memory_codegen.emitLoadViaPtr(enc, .rax, .rsi);
                         if (layout.size > 8) {
                             try enc.emitMovRegImm64(.r8, 8);
@@ -501,6 +574,18 @@ pub fn emit(self: anytype, enc: *Encoder, inst_idx: lir.Inst.Index) !void {
             const tag_op = try self.allocateOp(inst.data.ret_error);
             const tag_reg = try opToRegBin(enc, tag_op, .rax);
             try enc.emitMovRegReg(.rax, tag_reg);
+            try enc.emitMovRspRbp();
+            try enc.emitPopRbp();
+            try enc.emitRet();
+        },
+
+        .ret_slice => {
+            const pointer = try self.allocateOp(inst.data.ret_slice.ptr);
+            const length = try self.allocateOp(inst.data.ret_slice.len);
+            const pointer_reg = try opToRegBin(enc, pointer, .rax);
+            const length_reg = try opToRegBin(enc, length, .rdx);
+            try enc.emitMovRegReg(.rax, pointer_reg);
+            try enc.emitMovRegReg(.rdx, length_reg);
             try enc.emitMovRspRbp();
             try enc.emitPopRbp();
             try enc.emitRet();

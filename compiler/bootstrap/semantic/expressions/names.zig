@@ -114,7 +114,12 @@ fn analyzeFieldAccess(sema: anytype, node_idx: Node.Index, scope: *Scope) std.me
         if (declaration.const_value) |value| try sema.const_values.put(node_idx, value);
         if (declaration.type_value) |value| try sema.type_values.put(node_idx, value);
         if (declaration.module_value) |value| try sema.module_values.put(node_idx, value);
-        try sema.external_decls.put(node_idx, .{ .module_id = module_id, .name = field_name, .is_function = declaration.is_function });
+        try sema.external_decls.put(node_idx, .{
+            .module_id = module_id,
+            .name = field_name,
+            .is_function = declaration.is_function,
+            .is_syscall = declaration.is_syscall,
+        });
         return declaration.type_id;
     }
 

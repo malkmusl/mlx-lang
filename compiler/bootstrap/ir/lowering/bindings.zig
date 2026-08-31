@@ -76,7 +76,12 @@ fn lowerIdentifier(builder: anytype, node_idx: Node.Index) std.mem.Allocator.Err
     const source = builder.sema.diags.source_manager.getFile(builder.sema.source_id).?.content;
     const name = source[token.start..token.end];
 
-    if (type_data.data == .function) {
+    const resolved = builder.sema.resolved_decls.get(node_idx);
+    const namesFunctionDeclaration = if (resolved) |declaration_index|
+        builder.sema.ast_tree.nodes.get(declaration_index).tag == .fn_decl
+    else
+        false;
+    if (type_data.data == .function and namesFunctionDeclaration) {
         const symbol = try builder.lir.internModuleSymbol(builder.sema.module_id orelse 0, name);
         return try builder.emitInst(.{
             .opcode = .func_sym,

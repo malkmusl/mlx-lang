@@ -25,17 +25,22 @@ pub fn lower(builder: anytype, node_idx: Node.Index) std.mem.Allocator.Error!?In
         });
     } else if (is_error_union) {
         _ = try builder.emitInst(.{ .opcode = .ret_error_union, .type_id = return_type, .data = .{ .ret_error_union = expression.? } });
-    } else if (expression != null and isSliceErrorUnion(builder, return_type)) {
+    } else if (expression != null and isSlice(builder, return_type)) {
         const length = builder.slice_lengths.get(expression.?) orelse return null;
         _ = try builder.emitInst(.{
-            .opcode = .ret_error_slice,
+            .opcode = .ret_slice,
             .type_id = return_type,
-            .data = .{ .ret_error_slice = .{ .ptr = expression.?, .len = length } },
+            .data = .{ .ret_slice = .{ .ptr = expression.?, .len = length } },
         });
     } else {
         _ = try builder.emitInst(.{ .opcode = .ret, .type_id = return_type, .data = .{ .ret = expression } });
     }
     return null;
+}
+
+fn isSlice(builder: anytype, type_id: Type.Id) bool {
+    const ty = builder.sema.type_pool.get(type_id);
+    return ty.data == .pointer and ty.data.pointer.size == .Slice;
 }
 
 fn isSliceErrorUnion(builder: anytype, type_id: Type.Id) bool {

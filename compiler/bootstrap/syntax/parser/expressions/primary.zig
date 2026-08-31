@@ -29,6 +29,7 @@ pub fn parse(parser: anytype) std.mem.Allocator.Error!?Node.Index {
         .l_brace => statements.parseBlock(parser),
         .keyword_struct, .keyword_enum, .keyword_union => aggregate.parseType(parser),
         .keyword_error => aggregate.parseErrorSet(parser),
+        .keyword_fn => parser.parseTypeExprPublic(),
         .l_paren => parseParenthesized(parser),
         else => {
             try parser.reportError(2007, "Unexpected token in expression");

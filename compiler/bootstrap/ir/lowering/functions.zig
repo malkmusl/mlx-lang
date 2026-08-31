@@ -13,6 +13,7 @@ pub fn lower(builder: anytype, node_idx: Node.Index) std.mem.Allocator.Error!?In
 
 fn lowerDeclaration(builder: anytype, node_idx: Node.Index) std.mem.Allocator.Error!?Inst.Index {
     const node = builder.sema.ast_tree.nodes.get(node_idx);
+    if (node.decl_flags.extern_decl) return null;
     const proto_idx = node.data.lhs;
     const body = node.data.rhs;
 
@@ -84,8 +85,24 @@ fn lowerParameter(builder: anytype, node_idx: Node.Index) std.mem.Allocator.Erro
 
     const token = builder.sema.ast_tree.tokens[name_token_index];
     const source = builder.sema.diags.source_manager.getFile(builder.sema.source_id).?.content;
-    try builder.var_addresses.put(source[token.start..token.end], address);
+    const name = source[token.start..token.end];
+    try builder.var_addresses.put(name, address);
+    if (isSlice(builder, type_id)) {
+        const length_type = try builder.sema.type_pool.internSizeInt(false);
+        const length = try builder.emitInst(.{
+            .opcode = .param,
+            .type_id = length_type,
+            .data = .{ .param = builder.param_counter },
+        });
+        builder.param_counter += 1;
+        try builder.var_slice_lengths.put(name, length);
+    }
     return null;
+}
+
+fn isSlice(builder: anytype, type_id: u32) bool {
+    const ty = builder.sema.type_pool.get(type_id);
+    return ty.data == .pointer and ty.data.pointer.size == .Slice;
 }
 
 pub fn internGenericSymbol(builder: anytype, instance_id: u32) std.mem.Allocator.Error!u32 {

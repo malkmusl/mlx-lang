@@ -147,6 +147,11 @@ fn analyzeFunctionDeclaration(sema: anytype, node_idx: Node.Index, scope: *Scope
     const proto = node.data.lhs;
     const body = node.data.rhs;
     const fn_type = try function_semantics.declare(sema, node_idx, scope);
+    if (node.decl_flags.extern_decl) {
+        try validateExternFunction(sema, node_idx, fn_type);
+        try sema.node_types.put(node_idx, fn_type);
+        return fn_type;
+    }
     if (generic_definition.isGeneric(&sema.ast_tree, node_idx)) {
         try sema.node_types.put(node_idx, fn_type);
         return fn_type;
@@ -178,6 +183,41 @@ fn analyzeFunctionDeclaration(sema: anytype, node_idx: Node.Index, scope: *Scope
 
     try sema.node_types.put(node_idx, fn_type);
     return fn_type;
+}
+
+fn validateExternFunction(sema: anytype, node_idx: Node.Index, function_type: Type.Id) std.mem.Allocator.Error!void {
+    const declaration = sema.ast_tree.nodes.get(node_idx);
+    const prototype = sema.ast_tree.nodes.get(declaration.data.lhs);
+    const source = sema.diags.source_manager.getFile(sema.source_id).?.content;
+    const start = sema.ast_tree.tokens[prototype.main_token].start;
+    if (declaration.extern_name_token == std.math.maxInt(u32)) {
+        try sema.reportError(4001, .sema, start, "extern function requires an ABI name");
+        return;
+    }
+    const abi_token = sema.ast_tree.tokens[declaration.extern_name_token];
+    const raw_abi = source[abi_token.start..abi_token.end];
+    const abi_name = if (raw_abi.len >= 2) raw_abi[1 .. raw_abi.len - 1] else raw_abi;
+    if (!std.mem.eql(u8, abi_name, "syscall")) {
+        try sema.reportError(9001, .lowering, start, "Stage 0 currently supports only extern(\"syscall\")");
+        return;
+    }
+
+    const function = sema.type_pool.get(function_type).data.function;
+    const parameters = sema.type_pool.functionParams(function);
+    if (parameters.len == 0 or parameters.len > 7) {
+        try sema.reportError(4001, .sema, start, "extern(\"syscall\") requires the syscall number and at most six arguments");
+    }
+    for (parameters) |parameter| {
+        const ty = sema.type_pool.get(parameter);
+        if (!ty.isInteger() and ty.data != .pointer and ty.data != .@"enum") {
+            try sema.reportError(4001, .sema, start, "Raw syscall parameters must be integers, pointers, or enums");
+            break;
+        }
+    }
+    const body = sema.ast_tree.nodes.get(declaration.data.rhs);
+    if (body.data.lhs != body.data.rhs) {
+        try sema.reportError(4001, .sema, start, "extern functions must have an empty body");
+    }
 }
 
 fn isPrimitive(ty: Type, primitive: Type.Primitive) bool {

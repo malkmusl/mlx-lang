@@ -329,6 +329,19 @@ pub const TypePool = struct {
             }
             return true;
         }
+        if (from.data == .function and to.data == .function) {
+            const from_function = from.data.function;
+            const to_function = to.data.function;
+            if (from_function.is_var_args != to_function.is_var_args or
+                from_function.params_len != to_function.params_len or
+                !self.isCoercible(from_function.ret_type, to_function.ret_type)) return false;
+            const from_parameters = self.functionParams(from_function);
+            const to_parameters = self.functionParams(to_function);
+            for (from_parameters, to_parameters) |from_parameter, to_parameter| {
+                if (!self.isCoercible(from_parameter, to_parameter) or !self.isCoercible(to_parameter, from_parameter)) return false;
+            }
+            return true;
+        }
         return false;
     }
 
@@ -587,6 +600,7 @@ pub const TypePool = struct {
             .integer => |int| int.bits,
             .size_int => 64,
             .pointer => |ptr| if (ptr.size == .Slice) 128 else 64,
+            .function => 64,
             .optional => |optional| blk: {
                 const child = self.get(optional.child_type);
                 if (child.data == .pointer) break :blk try self.bitSizeOf(optional.child_type);
@@ -629,7 +643,7 @@ pub const TypePool = struct {
                 else => error.UnknownLayout,
             },
             .integer => |int| @min(@as(u64, 8), std.math.divCeil(u64, int.bits, 8) catch return error.UnknownLayout),
-            .size_int, .pointer => 8,
+            .size_int, .pointer, .function => 8,
             .optional => |optional| self.alignOf(optional.child_type),
             .array => |array| self.alignOf(array.child_type),
             .vector => @min(@as(u64, 16), self.sizeOf(id) catch return error.UnknownLayout),

@@ -346,7 +346,7 @@ pub const LirBuilder = struct {
         const instructions = self.lir.blocks.items[block_index].insts.items;
         if (instructions.len == 0) return false;
         return switch (self.lir.insts.items[instructions[instructions.len - 1]].opcode) {
-            .br, .condbr, .ret, .ret_error, .ret_error_union, .ret_error_slice, .ret_error_union_slice, .unreachable_inst => true,
+            .br, .condbr, .ret, .ret_slice, .ret_error, .ret_error_union, .ret_error_slice, .ret_error_union_slice, .unreachable_inst => true,
             else => false,
         };
     }
@@ -374,6 +374,7 @@ pub const LirBuilder = struct {
                 switch (inst.opcode) {
                     .const_i => std.debug.print("{d}", .{inst.data.const_i}),
                     .const_f => std.debug.print("{d}", .{inst.data.const_f}),
+                    .aggregate_copy => std.debug.print("value: %{d}", .{inst.data.aggregate_copy}),
                     .add => std.debug.print("%{d}, %{d}", .{ inst.data.add.lhs, inst.data.add.rhs }),
                     .sub => std.debug.print("%{d}, %{d}", .{ inst.data.sub.lhs, inst.data.sub.rhs }),
                     .mul => std.debug.print("%{d}, %{d}", .{ inst.data.mul.lhs, inst.data.mul.rhs }),
@@ -392,7 +393,9 @@ pub const LirBuilder = struct {
                     .gep => std.debug.print("base: %{d}, index: %{d}, stride: {d}", .{ inst.data.gep.base, inst.data.gep.index, inst.data.gep.stride }),
                     .br => std.debug.print("dest: block_{d}", .{inst.data.br.dest}),
                     .condbr => std.debug.print("cond: %{d}, true_dest: block_{d}, false_dest: block_{d}", .{ inst.data.condbr.cond, inst.data.condbr.true_dest, inst.data.condbr.false_dest }),
+                    .syscall => std.debug.print("args: extra[{d}]", .{inst.data.syscall}),
                     .ret => if (inst.data.ret) |r| std.debug.print("val: %{d}", .{r}) else std.debug.print("void", .{}),
+                    .ret_slice => std.debug.print("ptr: %{d}, len: %{d}", .{ inst.data.ret_slice.ptr, inst.data.ret_slice.len }),
                     .ret_error => std.debug.print("tag: %{d}", .{inst.data.ret_error}),
                     .ret_error_union => std.debug.print("value: %{d}", .{inst.data.ret_error_union}),
                     .ret_error_slice => std.debug.print("ptr: %{d}, len: %{d}", .{ inst.data.ret_error_slice.ptr, inst.data.ret_error_slice.len }),
