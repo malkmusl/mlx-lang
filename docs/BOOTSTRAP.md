@@ -6,7 +6,10 @@ Linux + Zig
     v
  zin0 (Zig bootstrap compiler)
     |
-    +--> minimal bootstrap std
+    +--> compiler bootstrap std (allocators, collections, files, diagnostics,
+    |    process arguments and ELF64 emission)
+    |
+    +--> zin1 compiler core written in Zin
     |
     v
  Stage-1 Zin std foundation
@@ -15,9 +18,6 @@ Linux + Zig
     +--> std.posix / std.os.*
     +--> consume canonical wayland.xml once for stdlib construction
     +--> materialize std.wayland client + server API
-    |
-    v
- zin1 (canonical compiler written in Zin)
     |
     v
  zin2 (self-compiled canonical compiler)

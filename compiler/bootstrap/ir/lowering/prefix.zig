@@ -53,7 +53,16 @@ fn lowerTry(builder: anytype, node_index: Node.Index) !?Inst.Index {
 
 fn lowerAddressOf(builder: anytype, node_index: Node.Index) !?Inst.Index {
     const node = builder.sema.ast_tree.nodes.get(node_index);
+    const operand_type = builder.sema.node_types.get(node.data.lhs) orelse return null;
+    if (isAggregate(builder, operand_type)) return builder.lowerNode(node.data.lhs);
     return lvalue.lowerAddress(builder, node.data.lhs);
+}
+
+fn isAggregate(builder: anytype, type_id: u32) bool {
+    return switch (builder.sema.type_pool.get(type_id).data) {
+        .array, .@"struct", .@"union", .tuple => true,
+        else => false,
+    };
 }
 
 fn lowerLogicalNot(builder: anytype, node_index: Node.Index) !?Inst.Index {

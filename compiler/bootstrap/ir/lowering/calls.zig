@@ -11,14 +11,17 @@ pub fn lower(builder: anytype, node_idx: Node.Index) std.mem.Allocator.Error!?In
     const num_args = builder.sema.ast_tree.extra_data[extra_start];
 
     if (isSyscallTarget(builder, target)) {
-        const syscall_start: u32 = @intCast(builder.lir.extra_data.items.len);
-        try builder.lir.extra_data.append(builder.allocator, num_args);
+        var syscall_arguments = std.ArrayList(Inst.Index).empty;
+        defer syscall_arguments.deinit(builder.allocator);
         var syscall_arg: u32 = 0;
         while (syscall_arg < num_args) : (syscall_arg += 1) {
             const argument_node = builder.sema.ast_tree.extra_data[extra_start + 1 + syscall_arg];
             const argument = try builder.lowerNode(argument_node) orelse return null;
-            try builder.lir.extra_data.append(builder.allocator, argument);
+            try syscall_arguments.append(builder.allocator, argument);
         }
+        const syscall_start: u32 = @intCast(builder.lir.extra_data.items.len);
+        try builder.lir.extra_data.append(builder.allocator, @intCast(syscall_arguments.items.len));
+        try builder.lir.extra_data.appendSlice(builder.allocator, syscall_arguments.items);
         const syscall = try builder.emitInst(.{
             .opcode = .syscall,
             .type_id = builder.sema.node_types.get(node_idx) orelse 0,
@@ -37,7 +40,8 @@ pub fn lower(builder: anytype, node_idx: Node.Index) std.mem.Allocator.Error!?In
     else
         try builder.lowerNode(target);
 
-    const args_start = builder.lir.extra_data.items.len;
+    var arguments = std.ArrayList(Inst.Index).empty;
+    defer arguments.deinit(builder.allocator);
     var i: u32 = 0;
     var runtime_args: u32 = 0;
     while (i < num_args) : (i += 1) {
@@ -53,15 +57,17 @@ pub fn lower(builder: anytype, node_idx: Node.Index) std.mem.Allocator.Error!?In
             })
         else
             argument.?;
-        try builder.lir.extra_data.append(builder.allocator, abi_argument);
+        try arguments.append(builder.allocator, abi_argument);
         runtime_args += 1;
         if (isSlice(builder, argument_type)) {
             const length = builder.slice_lengths.get(argument.?) orelse return null;
-            try builder.lir.extra_data.append(builder.allocator, length);
+            try arguments.append(builder.allocator, length);
             runtime_args += 1;
         }
     }
 
+    const args_start = builder.lir.extra_data.items.len;
+    try builder.lir.extra_data.appendSlice(builder.allocator, arguments.items);
     const type_id = builder.sema.node_types.get(node_idx) orelse 0;
     const call = try builder.emitInst(.{
         .opcode = .call,

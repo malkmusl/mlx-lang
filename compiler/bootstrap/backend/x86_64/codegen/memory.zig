@@ -38,6 +38,39 @@ pub fn emitStoreByteViaPtr(enc: *Encoder, ptr_r: Reg, val_r: Reg) !void {
     if (ptr_low == 5) try enc.buf.append(enc.allocator, 0x00);
 }
 
+/// MOV word [ptr_reg], val_reg.low16 (66 [REX] 89 /r)
+pub fn emitStoreWordViaPtr(enc: *Encoder, ptr_r: Reg, val_r: Reg) !void {
+    const ptr_idx = @intFromEnum(ptr_r);
+    const val_idx = @intFromEnum(val_r);
+    const ptr_low: u8 = @as(u8, @truncate(ptr_idx)) & 7;
+    const mod_bits: u8 = if (ptr_low == 5) 0b01 else 0b00;
+    try enc.buf.append(enc.allocator, 0x66);
+    if (ptr_idx >= 8 or val_idx >= 8) {
+        try enc.buf.append(enc.allocator, 0x40 |
+            (if (val_idx >= 8) @as(u8, 0x04) else 0) |
+            (if (ptr_idx >= 8) @as(u8, 0x01) else 0));
+    }
+    try enc.buf.appendSlice(enc.allocator, &.{ 0x89, mod_bits << 6 | (@as(u8, @truncate(val_idx)) & 7) << 3 | ptr_low });
+    if (ptr_low == 4) try enc.buf.append(enc.allocator, 0x24);
+    if (ptr_low == 5) try enc.buf.append(enc.allocator, 0x00);
+}
+
+/// MOV dword [ptr_reg], val_reg.low32 ([REX] 89 /r)
+pub fn emitStoreDwordViaPtr(enc: *Encoder, ptr_r: Reg, val_r: Reg) !void {
+    const ptr_idx = @intFromEnum(ptr_r);
+    const val_idx = @intFromEnum(val_r);
+    const ptr_low: u8 = @as(u8, @truncate(ptr_idx)) & 7;
+    const mod_bits: u8 = if (ptr_low == 5) 0b01 else 0b00;
+    if (ptr_idx >= 8 or val_idx >= 8) {
+        try enc.buf.append(enc.allocator, 0x40 |
+            (if (val_idx >= 8) @as(u8, 0x04) else 0) |
+            (if (ptr_idx >= 8) @as(u8, 0x01) else 0));
+    }
+    try enc.buf.appendSlice(enc.allocator, &.{ 0x89, mod_bits << 6 | (@as(u8, @truncate(val_idx)) & 7) << 3 | ptr_low });
+    if (ptr_low == 4) try enc.buf.append(enc.allocator, 0x24);
+    if (ptr_low == 5) try enc.buf.append(enc.allocator, 0x00);
+}
+
 /// MOV dst_reg, [ptr_reg]   (REX.W 8B ModRM(00, dst, ptr))
 pub fn emitLoadViaPtr(enc: *Encoder, dst_r: Reg, ptr_r: Reg) !void {
     const ptr_idx = @intFromEnum(ptr_r);
@@ -89,6 +122,57 @@ pub fn emitLoadSignedByteViaPtr(enc: *Encoder, dst_r: Reg, ptr_r: Reg) !void {
     const modrm_byte: u8 = mod_bits << 6 | (@as(u8, @truncate(dst_idx)) & 7) << 3 | ptr_low;
     try enc.buf.append(enc.allocator, rex_byte);
     try enc.buf.appendSlice(enc.allocator, &.{ 0x0f, 0xbe, modrm_byte });
+    if (ptr_low == 4) try enc.buf.append(enc.allocator, 0x24);
+    if (ptr_low == 5) try enc.buf.append(enc.allocator, 0x00);
+}
+
+fn emitLoadExtendedViaPtr(enc: *Encoder, dst_r: Reg, ptr_r: Reg, opcode: u8) !void {
+    const ptr_idx = @intFromEnum(ptr_r);
+    const dst_idx = @intFromEnum(dst_r);
+    const ptr_low: u8 = @as(u8, @truncate(ptr_idx)) & 7;
+    const mod_bits: u8 = if (ptr_low == 5) 0b01 else 0b00;
+    try enc.buf.append(enc.allocator, 0x48 |
+        (if (dst_idx >= 8) @as(u8, 0x04) else 0) |
+        (if (ptr_idx >= 8) @as(u8, 0x01) else 0));
+    try enc.buf.appendSlice(enc.allocator, &.{ 0x0f, opcode, mod_bits << 6 | (@as(u8, @truncate(dst_idx)) & 7) << 3 | ptr_low });
+    if (ptr_low == 4) try enc.buf.append(enc.allocator, 0x24);
+    if (ptr_low == 5) try enc.buf.append(enc.allocator, 0x00);
+}
+
+pub fn emitLoadWordViaPtr(enc: *Encoder, dst_r: Reg, ptr_r: Reg) !void {
+    return emitLoadExtendedViaPtr(enc, dst_r, ptr_r, 0xb7);
+}
+
+pub fn emitLoadSignedWordViaPtr(enc: *Encoder, dst_r: Reg, ptr_r: Reg) !void {
+    return emitLoadExtendedViaPtr(enc, dst_r, ptr_r, 0xbf);
+}
+
+/// MOV r32, dword [ptr] zero-extends into the corresponding 64-bit register.
+pub fn emitLoadDwordViaPtr(enc: *Encoder, dst_r: Reg, ptr_r: Reg) !void {
+    const ptr_idx = @intFromEnum(ptr_r);
+    const dst_idx = @intFromEnum(dst_r);
+    const ptr_low: u8 = @as(u8, @truncate(ptr_idx)) & 7;
+    const mod_bits: u8 = if (ptr_low == 5) 0b01 else 0b00;
+    if (ptr_idx >= 8 or dst_idx >= 8) {
+        try enc.buf.append(enc.allocator, 0x40 |
+            (if (dst_idx >= 8) @as(u8, 0x04) else 0) |
+            (if (ptr_idx >= 8) @as(u8, 0x01) else 0));
+    }
+    try enc.buf.appendSlice(enc.allocator, &.{ 0x8b, mod_bits << 6 | (@as(u8, @truncate(dst_idx)) & 7) << 3 | ptr_low });
+    if (ptr_low == 4) try enc.buf.append(enc.allocator, 0x24);
+    if (ptr_low == 5) try enc.buf.append(enc.allocator, 0x00);
+}
+
+/// MOVSXD r64, dword [ptr].
+pub fn emitLoadSignedDwordViaPtr(enc: *Encoder, dst_r: Reg, ptr_r: Reg) !void {
+    const ptr_idx = @intFromEnum(ptr_r);
+    const dst_idx = @intFromEnum(dst_r);
+    const ptr_low: u8 = @as(u8, @truncate(ptr_idx)) & 7;
+    const mod_bits: u8 = if (ptr_low == 5) 0b01 else 0b00;
+    try enc.buf.append(enc.allocator, 0x48 |
+        (if (dst_idx >= 8) @as(u8, 0x04) else 0) |
+        (if (ptr_idx >= 8) @as(u8, 0x01) else 0));
+    try enc.buf.appendSlice(enc.allocator, &.{ 0x63, mod_bits << 6 | (@as(u8, @truncate(dst_idx)) & 7) << 3 | ptr_low });
     if (ptr_low == 4) try enc.buf.append(enc.allocator, 0x24);
     if (ptr_low == 5) try enc.buf.append(enc.allocator, 0x00);
 }

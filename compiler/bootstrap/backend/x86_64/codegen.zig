@@ -196,6 +196,19 @@ pub const X86Gen = struct {
         };
     }
 
+    /// Width used by scalar loads and stores. Stage 0 represents aggregates
+    /// by address, so only actual scalar values may use a narrow access.
+    pub fn scalarMemorySize(self: *const X86Gen, type_id: u32) u8 {
+        if (type_id >= self.type_pool.types.items.len or self.isAggregate(type_id)) return 8;
+        const size = self.type_pool.sizeOf(type_id) catch return 8;
+        return switch (size) {
+            1 => 1,
+            2 => 2,
+            3, 4 => 4,
+            else => 8,
+        };
+    }
+
     pub fn isSignedType(self: *const X86Gen, type_id: u32) bool {
         if (type_id >= self.type_pool.types.items.len) return false;
         return switch (self.type_pool.get(type_id).data) {
@@ -203,6 +216,21 @@ pub const X86Gen = struct {
             .size_int => |integer| integer.is_signed,
             else => false,
         };
+    }
+
+    pub fn isVoidType(self: *const X86Gen, type_id: u32) bool {
+        if (type_id >= self.type_pool.types.items.len) return false;
+        const value_type = self.type_pool.get(type_id);
+        return value_type.data == .primitive and value_type.data.primitive == .void_type;
+    }
+
+    fn mainReturnsVoid(self: *const X86Gen) bool {
+        for (self.lir.insts.items) |inst| {
+            if (inst.opcode != .label) continue;
+            const name = self.lir.symbols.items[inst.data.label];
+            if (std.mem.eql(u8, name, "main")) return self.isVoidType(inst.type_id);
+        }
+        return false;
     }
 
     pub fn isFloatType(self: *const X86Gen, type_id: u32) bool {
@@ -305,8 +333,16 @@ pub const X86Gen = struct {
 
         try writer.print("global _start\nsection .text\n", .{});
         try writer.print("_start:\n", .{});
+        // Linux enters with argc at [rsp] followed by argv. A Zin slice is
+        // passed as pointer then length, so every main may optionally accept
+        // `[]const [*]const u8` without affecting no-argument mains.
+        try writer.print("  mov rsi, qword [rsp]\n", .{});
+        try writer.print("  lea rdi, [rsp + 8]\n", .{});
         try writer.print("  call main\n", .{});
-        try writer.print("  mov rdi, rax\n", .{});
+        if (self.mainReturnsVoid())
+            try writer.print("  mov rdi, 0\n", .{})
+        else
+            try writer.print("  mov rdi, rax\n", .{});
         try writer.print("  mov rax, 60\n", .{});
         try writer.print("  syscall\n", .{});
 
@@ -361,13 +397,18 @@ pub const X86Gen = struct {
         }
 
         if (has_main) {
-            // _start stub: call main → exit(rax) or exit(0) if main is void
-            // Pattern: call main; mov rdi, rax; xor rax,rax; mov rax,60; syscall
-            // For void main: ret in main doesn't set rax, so we zero rdi first
+            // _start stub: pass argv, call main, then exit(rax) or exit(0)
+            // for a void main whose return register is intentionally unspecified.
             try enc.defineSymbol("_start");
-            try enc.emitMovRegImm64(.rdi, 0); // pre-zero exit code (void main case)
+            try memory_codegen.emitLoadViaPtr(enc, .rsi, .rsp); // argc / slice length
+            try enc.emitMovRegReg(.rdi, .rsp);
+            try enc.emitMovRegImm64(.rax, 8);
+            try enc.emitAdd(.rdi, .rax); // argv / slice pointer
             try enc.emitCallRel("main");
-            try enc.emitMovRegReg(.rdi, .rax); // use main's return value if any
+            if (self.mainReturnsVoid())
+                try enc.emitMovRegImm64(.rdi, 0)
+            else
+                try enc.emitMovRegReg(.rdi, .rax);
             try enc.emitMovRegImm64(.rax, 60); // SYS_exit
             try enc.emitSyscall();
         }
@@ -427,6 +468,38 @@ test "signed byte pointer load sign-extends" {
 
     try memory_codegen.emitLoadSignedByteViaPtr(&enc, .r14, .r12);
     try std.testing.expectEqualSlices(u8, &.{ 0x4d, 0x0f, 0xbe, 0x34, 0x24 }, enc.buf.items);
+}
+
+test "word pointer loads and stores preserve scalar width" {
+    var enc = Encoder.init(std.testing.allocator);
+    defer enc.deinit();
+
+    try memory_codegen.emitStoreWordViaPtr(&enc, .r13, .r12);
+    try std.testing.expectEqualSlices(u8, &.{ 0x66, 0x45, 0x89, 0x65, 0x00 }, enc.buf.items);
+
+    enc.buf.clearRetainingCapacity();
+    try memory_codegen.emitLoadWordViaPtr(&enc, .r14, .r12);
+    try std.testing.expectEqualSlices(u8, &.{ 0x4d, 0x0f, 0xb7, 0x34, 0x24 }, enc.buf.items);
+
+    enc.buf.clearRetainingCapacity();
+    try memory_codegen.emitLoadSignedWordViaPtr(&enc, .r14, .r12);
+    try std.testing.expectEqualSlices(u8, &.{ 0x4d, 0x0f, 0xbf, 0x34, 0x24 }, enc.buf.items);
+}
+
+test "dword pointer loads and stores preserve scalar width" {
+    var enc = Encoder.init(std.testing.allocator);
+    defer enc.deinit();
+
+    try memory_codegen.emitStoreDwordViaPtr(&enc, .r13, .r12);
+    try std.testing.expectEqualSlices(u8, &.{ 0x45, 0x89, 0x65, 0x00 }, enc.buf.items);
+
+    enc.buf.clearRetainingCapacity();
+    try memory_codegen.emitLoadDwordViaPtr(&enc, .r14, .r12);
+    try std.testing.expectEqualSlices(u8, &.{ 0x45, 0x8b, 0x34, 0x24 }, enc.buf.items);
+
+    enc.buf.clearRetainingCapacity();
+    try memory_codegen.emitLoadSignedDwordViaPtr(&enc, .r14, .r12);
+    try std.testing.expectEqualSlices(u8, &.{ 0x4d, 0x63, 0x34, 0x24 }, enc.buf.items);
 }
 
 test "SSE payload transport moves f64 bits through xmm0" {

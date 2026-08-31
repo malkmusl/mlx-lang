@@ -19,12 +19,21 @@ pub fn lowerUnarySuffix(builder: anytype, node_index: Node.Index) !?Inst.Index {
     if (operator == .dot_question) return lowerOptionalUnwrap(builder, node_index);
     if (operator != .dot_asterisk) return null;
     const pointer = try builder.lowerNode(node.data.lhs) orelse return null;
+    const result_type = builder.sema.node_types.get(node_index) orelse return null;
+    if (isAggregate(builder, result_type)) return pointer;
     const result = try builder.emitInst(.{
         .opcode = .load,
-        .type_id = builder.sema.node_types.get(node_index) orelse return null,
+        .type_id = result_type,
         .data = .{ .load = .{ .ptr = pointer } },
     });
     return result;
+}
+
+fn isAggregate(builder: anytype, type_id: Type.Id) bool {
+    return switch (builder.sema.type_pool.get(type_id).data) {
+        .array, .@"struct", .@"union", .tuple => true,
+        else => false,
+    };
 }
 
 fn lowerOptionalUnwrap(builder: anytype, node_index: Node.Index) !?Inst.Index {

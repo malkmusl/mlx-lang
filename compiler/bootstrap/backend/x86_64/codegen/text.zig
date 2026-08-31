@@ -207,27 +207,34 @@ pub fn emit(self: anytype, writer: anytype, inst_idx: lir.Inst.Index) !void {
             const val_op = try self.allocateOp(inst.data.store.val);
             const ptr_reg = try opToReg(writer, ptr_op, "rax");
             const val_reg = try opToReg(writer, val_op, "rcx");
-            if (self.isByteType(inst.type_id)) {
-                if (!std.mem.eql(u8, ptr_reg, "rdi")) try writer.print("  mov rdi, {s}\n", .{ptr_reg});
-                if (!std.mem.eql(u8, val_reg, "rax")) try writer.print("  mov rax, {s}\n", .{val_reg});
-                try writer.print("  mov byte [rdi], al\n", .{});
-            } else {
-                try writer.print("  mov qword [{s}], {s}\n", .{ ptr_reg, val_reg });
+            if (!std.mem.eql(u8, ptr_reg, "rdi")) try writer.print("  mov rdi, {s}\n", .{ptr_reg});
+            if (!std.mem.eql(u8, val_reg, "rax")) try writer.print("  mov rax, {s}\n", .{val_reg});
+            switch (self.scalarMemorySize(inst.type_id)) {
+                1 => try writer.print("  mov byte [rdi], al\n", .{}),
+                2 => try writer.print("  mov word [rdi], ax\n", .{}),
+                4 => try writer.print("  mov dword [rdi], eax\n", .{}),
+                else => try writer.print("  mov qword [rdi], rax\n", .{}),
             }
         },
         .load => {
             const op = try self.allocateOp(inst_idx);
             const ptr_op = try self.allocateOp(inst.data.load.ptr);
             const ptr_reg = try opToReg(writer, ptr_op, "rax");
-            const byte_load = self.isByteType(inst.type_id);
-            const load_instruction = if (byte_load and self.isSignedType(inst.type_id)) "movsx" else if (byte_load) "movzx" else "mov";
+            switch (self.scalarMemorySize(inst.type_id)) {
+                1 => try writer.print("  {s} rcx, byte [{s}]\n", .{ if (self.isSignedType(inst.type_id)) "movsx" else "movzx", ptr_reg }),
+                2 => try writer.print("  {s} rcx, word [{s}]\n", .{ if (self.isSignedType(inst.type_id)) "movsx" else "movzx", ptr_reg }),
+                4 => if (self.isSignedType(inst.type_id))
+                    try writer.print("  movsxd rcx, dword [{s}]\n", .{ptr_reg})
+                else
+                    try writer.print("  mov ecx, dword [{s}]\n", .{ptr_reg}),
+                else => try writer.print("  mov rcx, qword [{s}]\n", .{ptr_reg}),
+            }
             if (op == .mem) {
-                try writer.print("  {s} rcx, {s}[{s}]\n", .{ load_instruction, if (byte_load) "byte " else "qword ", ptr_reg });
                 try writer.print("  mov ", .{});
                 try printOp(writer, op);
                 try writer.print(", rcx\n", .{});
-            } else {
-                try writer.print("  {s} {s}, {s}[{s}]\n", .{ load_instruction, op.reg, if (byte_load) "byte " else "qword ", ptr_reg });
+            } else if (!std.mem.eql(u8, op.reg, "rcx")) {
+                try writer.print("  mov {s}, rcx\n", .{op.reg});
             }
         },
         .param => {

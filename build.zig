@@ -34,6 +34,13 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("zin0", "Run the stage-0 bootstrap compiler scaffold");
     run_step.dependOn(&run_cmd.step);
 
+    const build_zin1 = b.addRunArtifact(exe);
+    build_zin1.addFileArg(b.path("compiler/selfhost/main.zin"));
+    const zin1_output = build_zin1.addPrefixedOutputFileArg("-o", "zin1");
+    const install_zin1 = b.addInstallBinFile(zin1_output, "zin1");
+    const zin1_step = b.step("zin1", "Build the canonical compiler scaffold with zin0");
+    zin1_step.dependOn(&install_zin1.step);
+
     const test_exe = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("compiler/bootstrap/main.zig"),

@@ -222,10 +222,11 @@ pub fn emit(self: anytype, enc: *Encoder, inst_idx: lir.Inst.Index) !void {
             // For now: if ptr_r == rax, emit "mov [rax], val_r"
             // Since our `addr` stores rbp-relative addresses in registers,
             // we use the register as a pointer.
-            if (self.isByteType(inst.type_id)) {
-                try memory_codegen.emitStoreByteViaPtr(enc, ptr_r, val_r);
-            } else {
-                try memory_codegen.emitStoreViaPtr(enc, ptr_r, val_r);
+            switch (self.scalarMemorySize(inst.type_id)) {
+                1 => try memory_codegen.emitStoreByteViaPtr(enc, ptr_r, val_r),
+                2 => try memory_codegen.emitStoreWordViaPtr(enc, ptr_r, val_r),
+                4 => try memory_codegen.emitStoreDwordViaPtr(enc, ptr_r, val_r),
+                else => try memory_codegen.emitStoreViaPtr(enc, ptr_r, val_r),
             }
         },
 
@@ -237,14 +238,20 @@ pub fn emit(self: anytype, enc: *Encoder, inst_idx: lir.Inst.Index) !void {
                 .reg => |r| nameToReg(r),
                 .mem => .rcx,
             };
-            if (self.isByteType(inst.type_id)) {
-                if (self.isSignedType(inst.type_id)) {
-                    try memory_codegen.emitLoadSignedByteViaPtr(enc, dst_r, ptr_r);
-                } else {
-                    try memory_codegen.emitLoadByteViaPtr(enc, dst_r, ptr_r);
-                }
-            } else {
-                try memory_codegen.emitLoadViaPtr(enc, dst_r, ptr_r);
+            switch (self.scalarMemorySize(inst.type_id)) {
+                1 => if (self.isSignedType(inst.type_id))
+                    try memory_codegen.emitLoadSignedByteViaPtr(enc, dst_r, ptr_r)
+                else
+                    try memory_codegen.emitLoadByteViaPtr(enc, dst_r, ptr_r),
+                2 => if (self.isSignedType(inst.type_id))
+                    try memory_codegen.emitLoadSignedWordViaPtr(enc, dst_r, ptr_r)
+                else
+                    try memory_codegen.emitLoadWordViaPtr(enc, dst_r, ptr_r),
+                4 => if (self.isSignedType(inst.type_id))
+                    try memory_codegen.emitLoadSignedDwordViaPtr(enc, dst_r, ptr_r)
+                else
+                    try memory_codegen.emitLoadDwordViaPtr(enc, dst_r, ptr_r),
+                else => try memory_codegen.emitLoadViaPtr(enc, dst_r, ptr_r),
             }
             if (op == .mem) {
                 try enc.emitMovMemReg(op.mem, .rcx);
