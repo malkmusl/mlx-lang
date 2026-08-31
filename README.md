@@ -11,11 +11,11 @@ This repository is the normative Zin 1.0 specification suite and implementation 
 ```text
 Zig on Linux
    -> zin0
-   -> bootstrap/std foundation
-   -> std.xml + std.json + std.posix + std.os
-   -> std.wayland materialized from canonical Wayland XML
+   -> Stage-1 compiler std foundation
    -> zin1 (canonical compiler written in Zin)
-   -> zin2 (self-compiled compiler)
+      +-> zin2 (self-compiled compiler)
+      +-> Stage-1 extensions: std.xml + std.json + broader std.posix/std.os
+          +-> Stage-1 protocol extensions such as std.wayland
    -> full std + tools + brixOS
 ```
 

@@ -18,9 +18,10 @@ foundation is now available without libc or Zig dependencies:
 The bootstrap std also provides growing byte and record vectors, string symbol
 maps, arena/fixed/page allocators, Linux files and process arguments, and direct
 ELF64 executable output. This is the foundation needed to implement the full
-Zin1 lexer, parser, AST, semantic pipeline, LIR, and backend. `std.xml`,
-`std.json`, POSIX compatibility, and Wayland are Stage-1 library work and are
-not dependencies of the compiler-core bootstrap.
+Zin1 lexer, parser, AST, semantic pipeline, LIR, and backend. This minimal
+compiler std is Stage-1 Core. `std.xml`, `std.json`, broader POSIX support,
+Wayland, and other protocols are non-blocking Stage-1 Extensions rather than
+dependencies of the compiler or self-hosting path.
 
 Build the current scaffold with:
 

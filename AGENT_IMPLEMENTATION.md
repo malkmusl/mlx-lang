@@ -29,9 +29,13 @@ var next = @move(file)
 
 Linux x86_64 bootstrap compiler in Zig. Implement enough Zin plus direct ELF64/syscalls to build the Stage-1 foundation. No LLVM, GCC, C compiler, libc, external assembler or external linker is required.
 
-### Stage 1 — bootstrap std and zin1
+### Stage 1 Core — bootstrap std and zin1
 
-Build the initial Zin std foundation. Implement `std.xml`, `std.json`, required OS/POSIX primitives and materialize `std.wayland` client+server declarations/runtime from canonical Wayland XML. Then compile the canonical Zin compiler (`zin1`) written in Zin.
+Build only the standard-library foundation required for Zin itself to compile and run: allocation, collections, source I/O, diagnostics, process startup and native output. Then compile the canonical Zin compiler (`zin1`) written in Zin. Protocols and data formats do not block Zin1 or self-hosting.
+
+### Stage 1 Extensions — standard-library formats and protocols
+
+After the compiler core is usable, implement the separate Stage-1 library extensions such as `std.xml`, `std.json`, broader POSIX/OS adapters and `std.wayland`. Wayland client/server declarations and runtime are materialized from canonical Wayland XML as ordinary Zin modules; none of these extensions are compiler dependencies.
 
 ### Stage 2 — self hosting
 
@@ -60,11 +64,11 @@ Use self-hosted Zin to build brixOS. brixOS may use native IPC/syscalls; `std.po
 11. zincc ABI
 12. ELF64 writer/linker
 13. Linux raw/OS layer
-14. bootstrap std
-15. std.xml/std.json
-16. std.wayland protocol materialization + client/server + Linux transport
-17. canonical compiler in Zin
-18. self-hosting
+14. Stage-1 compiler bootstrap std
+15. canonical compiler in Zin
+16. self-hosting
+17. Stage-1 extensions: std.xml/std.json
+18. Stage-1 extensions: std.wayland protocol materialization + client/server + Linux transport
 19. full std
 20. BSD + Wayland transport
 21. Windows/PE32+
