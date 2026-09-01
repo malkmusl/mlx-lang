@@ -23,6 +23,11 @@ foundation is now available without libc or Zig dependencies:
 - `sema/functions.zin` and `sema/control_flow.zin` bind parameters and locals,
   validate calls/returns, and analyze `if`, `while`, `for`, `break` and
   `continue` paths without expanding the declaration facade.
+- `sema/builtins/` registers the complete normative `@` builtin namespace and
+  centralizes arity/result typing; `builtins.zin` is its public facade.
+- `sema/comptime/` evaluates bootstrap integer/boolean constants, branches and
+  layout predicates under a bounded evaluation quota; `comptime.zin` is its
+  public facade.
 - `source.zin` owns complete source-file loading through an explicit allocator.
 - `diagnostic.zin` provides stable codes, phases, severity, source spans, causes,
   messages, and terminal rendering.
