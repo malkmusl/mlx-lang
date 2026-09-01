@@ -14,7 +14,13 @@ pub fn parseBlock(parser: anytype) std.mem.Allocator.Error!?Node.Index {
     var statements = std.ArrayList(Node.Index).empty;
     defer statements.deinit(parser.allocator);
 
-    while (parser.index < parser.tokens.len and parser.tokens[parser.index].tag != .r_brace) {
+    // EOF is a synchronization point too. Without this guard a malformed or
+    // incomplete block repeatedly asks recovery to advance past EOF, which is
+    // impossible and used to pin zin0 in an infinite loop.
+    while (parser.index < parser.tokens.len and
+        parser.tokens[parser.index].tag != .r_brace and
+        parser.tokens[parser.index].tag != .eof)
+    {
         if (parser.tokens[parser.index].tag == .statement_end) {
             parser.index += 1;
             continue;
@@ -25,7 +31,11 @@ pub fn parseBlock(parser: anytype) std.mem.Allocator.Error!?Node.Index {
             parser.recoverPublic();
         }
     }
-    if (parser.index < parser.tokens.len and parser.tokens[parser.index].tag == .r_brace) parser.consumeToken("Consume block '}'");
+    if (parser.index < parser.tokens.len and parser.tokens[parser.index].tag == .r_brace) {
+        parser.consumeToken("Consume block '}'");
+    } else {
+        try parser.reportError(2005, "Expected '}' to close block");
+    }
 
     const extra_start: u32 = @intCast(parser.extra_data.items.len);
     try parser.extra_data.appendSlice(parser.allocator, statements.items);

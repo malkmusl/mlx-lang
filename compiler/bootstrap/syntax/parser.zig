@@ -269,6 +269,33 @@ test "parser: basic var decl" {
     try std.testing.expectEqual(tags[2], .root);
 }
 
+test "parser: incomplete block reaches EOF instead of looping" {
+    const allocator = std.testing.allocator;
+    var sm = @import("../source/source_manager.zig").SourceManager.init(allocator);
+    defer sm.deinit();
+    _ = try sm.addFile("<test>", "fn main() void { return");
+    var diags = DiagnosticEngine.init(allocator, &sm);
+    defer diags.deinit();
+
+    const tokens = [_]Token{
+        .{ .tag = .keyword_fn, .start = 0, .end = 2 },
+        .{ .tag = .ident, .start = 3, .end = 7 },
+        .{ .tag = .l_paren, .start = 7, .end = 8 },
+        .{ .tag = .r_paren, .start = 8, .end = 9 },
+        .{ .tag = .ident, .start = 10, .end = 14 },
+        .{ .tag = .l_brace, .start = 15, .end = 16 },
+        .{ .tag = .keyword_return, .start = 17, .end = 23 },
+        .{ .tag = .eof, .start = 23, .end = 23 },
+    };
+
+    var parser = Parser.init(allocator, &tokens, &diags, 0);
+    var ast_tree = try parser.parse();
+    defer ast_tree.deinit(allocator);
+    try std.testing.expect(parser.index < tokens.len);
+    try std.testing.expectEqual(Token.Tag.eof, tokens[parser.index].tag);
+    try std.testing.expect(diags.error_count > 0);
+}
+
 test "parser: pratt expression precedence" {
     const allocator = std.testing.allocator;
     var sm = @import("../source/source_manager.zig").SourceManager.init(allocator);

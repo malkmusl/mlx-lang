@@ -8,12 +8,17 @@ The executable scaffold is intentionally small, but its complete runtime
 foundation is now available without libc or Zig dependencies:
 
 - `token.zin` defines the stable token representation.
-- `lexer.zin` tokenizes identifiers, integers, newlines, and core punctuation.
+- `lexer/` implements the complete normative token set, longest-match operator
+  algebra, nested comments, literals, newline filtering, and growing token
+  storage. `lexer.zin` remains its compact public facade.
+- `ast/` owns the compact indexed syntax-node store.
+- `parser/` implements declarations, types, Pratt expressions, statements,
+  control flow, and bounded error recovery. `parser.zin` is its public facade.
 - `source.zin` owns complete source-file loading through an explicit allocator.
 - `diagnostic.zin` provides stable codes, phases, severity, source spans, causes,
   messages, and terminal rendering.
-- `main.zin` accepts a source path, loads and tokenizes it, and is the current
-  `zin1` entry point and end-to-end bootstrap gate.
+- `main.zin` accepts a source path, loads, tokenizes, and parses it, and is the
+  current `zin1` entry point and end-to-end bootstrap gate.
 
 The bootstrap std also provides growing byte and record vectors, string symbol
 maps, arena/fixed/page allocators, Linux files and process arguments, and direct
