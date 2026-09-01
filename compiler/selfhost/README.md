@@ -14,11 +14,20 @@ foundation is now available without libc or Zig dependencies:
 - `ast/` owns the compact indexed syntax-node store.
 - `parser/` implements declarations, types, Pratt expressions, statements,
   control flow, and bounded error recovery. `parser.zin` is its public facade.
+- `sema/types/` owns canonical type interning, layouts, coercion checks and
+  syntax-type resolution; `types.zin` is its public facade.
+- `sema/symbols/` owns declaration symbols, nested lexical scopes, duplicate
+  detection and move states; `symbols.zin` is its public facade.
+- `sema/declarations.zin` resolves top-level binding and function signatures
+  before body analysis, including native tuple return types.
+- `sema/functions.zin` and `sema/control_flow.zin` bind parameters and locals,
+  validate calls/returns, and analyze `if`, `while`, `for`, `break` and
+  `continue` paths without expanding the declaration facade.
 - `source.zin` owns complete source-file loading through an explicit allocator.
 - `diagnostic.zin` provides stable codes, phases, severity, source spans, causes,
   messages, and terminal rendering.
 - `main.zin` accepts a source path, loads, tokenizes, and parses it, and is the
-  current `zin1` entry point and end-to-end bootstrap gate.
+  current `zin1` entry point and lexer/parser/declaration-sema bootstrap gate.
 
 The bootstrap std also provides growing byte and record vectors, string symbol
 maps, arena/fixed/page allocators, Linux files and process arguments, and direct
