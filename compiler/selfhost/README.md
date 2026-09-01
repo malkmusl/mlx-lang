@@ -29,11 +29,17 @@ foundation is now available without libc or Zig dependencies:
 - `sema/comptime/` evaluates bootstrap integer/boolean constants, branches and
   layout predicates under a bounded evaluation quota; `comptime.zin` is its
   public facade.
+- `modules/` classifies and normalizes every normative import form, recursively
+  loads a deduplicated cycle-safe source graph, owns per-file scopes, and binds
+  public module namespaces into semantic field lookup; `modules.zin` is its
+  public facade.
 - `source.zin` owns complete source-file loading through an explicit allocator.
 - `diagnostic.zin` provides stable codes, phases, severity, source spans, causes,
   messages, and terminal rendering.
-- `main.zin` accepts a source path, loads, tokenizes, and parses it, and is the
-  current `zin1` entry point and lexer/parser/declaration-sema bootstrap gate.
+- `main.zin` accepts a source path and drives the complete loaded module graph
+  through lexing, parsing, declaration analysis and visibility-aware namespace
+  construction. Graph-wide function body analysis is exposed by `modules.zin`
+  and covered independently while the remaining expression semantics land.
 
 The bootstrap std also provides growing byte and record vectors, string symbol
 maps, arena/fixed/page allocators, Linux files and process arguments, and direct
