@@ -15,7 +15,8 @@ foundation is now available without libc or Zig dependencies:
 - `parser/` implements declarations, types, Pratt expressions, statements,
   control flow, and bounded error recovery. `parser.zin` is its public facade.
 - `sema/types/` owns canonical type interning, layouts, coercion checks and
-  syntax-type resolution; `types.zin` is its public facade.
+  syntax-type resolution. Struct, enum, union and tuple layouts retain field
+  metadata for layout/reflection builtins; `types.zin` is its public facade.
 - `sema/symbols/` owns declaration symbols, nested lexical scopes, duplicate
   detection and move states; `symbols.zin` is its public facade.
 - `sema/declarations.zin` resolves top-level binding and function signatures
