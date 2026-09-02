@@ -358,7 +358,7 @@ test "alignUp" {
 
 test "ELF magic bytes in built binary" {
     const enc_mod = @import("../backend/x86_64/encoder.zig");
-    var enc = enc_mod.Encoder.init(std.testing.allocator);
+    var enc = enc_mod.Encoder.init(std.testing.allocator, false);
     defer enc.deinit();
 
     try enc.defineSymbol("_start");

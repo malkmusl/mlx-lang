@@ -13,25 +13,44 @@ const Severity = diagnostics.Severity;
 const TypePool = @import("semantic/type.zig").TypePool;
 const Scope = @import("semantic/scope.zig").Scope;
 const Sema = @import("semantic/sema.zig").Sema;
+const modules = @import("modules/root.zig");
+const namespace = @import("modules/namespace.zig");
+const export_collector = @import("semantic/exports.zig");
+const ImportedAnalysis = struct { scope: *Scope, sema: *Sema };
 
 const Position = struct { line: usize, character: usize };
 
+fn uriToPath(uri: []const u8) []const u8 {
+    if (std.mem.startsWith(u8, uri, "file://")) {
+        return uri["file://".len..];
+    }
+    return uri;
+}
+
 const Document = struct {
     allocator: std.mem.Allocator,
+    io: std.Io,
     uri: []const u8,
     text: [:0]u8,
     sources: SourceManager,
     engine: DiagnosticEngine,
+    module_loader: ?modules.loader.Loader = null,
+    module_registry: ?namespace.Registry = null,
+    imported_analyses: std.ArrayList(ImportedAnalysis) = .empty,
     ast: ?Ast = null,
     types: TypePool,
     root_scope: Scope,
     sema: ?*Sema = null,
     invalid_tokens: std.ArrayList(Token) = .empty,
 
-    fn init(allocator: std.mem.Allocator, uri: []const u8, text: []const u8) !*Document {
+    fn init(allocator: std.mem.Allocator, io: std.Io, uri: []const u8, text: []const u8) !*Document {
         const document = try allocator.create(Document);
         errdefer allocator.destroy(document);
         document.allocator = allocator;
+        document.io = io;
+        document.module_loader = null;
+        document.module_registry = null;
+        document.imported_analyses = .empty;
         document.ast = null;
         document.sema = null;
         document.invalid_tokens = .empty;
@@ -53,7 +72,19 @@ const Document = struct {
         }
         self.root_scope.deinit();
         self.types.deinit();
-        if (self.ast) |*ast| ast.deinit(self.allocator);
+        if (self.module_loader) |*loader| {
+            loader.deinit();
+        } else if (self.ast) |*ast| {
+            ast.deinit(self.allocator);
+        }
+        if (self.module_registry) |*registry| registry.deinit();
+        for (self.imported_analyses.items) |analysis| {
+            analysis.sema.deinit();
+            self.allocator.destroy(analysis.sema);
+            analysis.scope.deinit();
+            self.allocator.destroy(analysis.scope);
+        }
+        self.imported_analyses.deinit(self.allocator);
         self.invalid_tokens.deinit(self.allocator);
         self.engine.deinit();
         self.sources.deinit();
@@ -63,24 +94,85 @@ const Document = struct {
     }
 
     fn compile(self: *Document) !void {
-        const file_id = try self.sources.addFile(self.uri, self.text);
         var lexer = Lexer.init(self.text);
-        var tokens = std.ArrayList(Token).empty;
-        defer tokens.deinit(self.allocator);
         while (true) {
             const token = lexer.next();
-            try tokens.append(self.allocator, token);
             if (token.tag == .invalid) try self.invalid_tokens.append(self.allocator, token);
             if (token.tag == .eof) break;
         }
 
-        var parser = Parser.init(self.allocator, tokens.items, &self.engine, file_id);
-        self.ast = try parser.parse();
+        const path = uriToPath(self.uri);
+        self.module_loader = modules.loader.Loader.init(self.allocator, self.io, &self.sources, &self.engine, .{ .std_root = "std/src" });
+        
+        const root_module_id = self.module_loader.?.loadRootMemory(path, self.text) catch {
+            return;
+        };
+        const root_module = self.module_loader.?.get(root_module_id);
+        if (root_module.ast == null) return;
+        self.ast = root_module.ast.?;
+
         if (self.engine.error_count != 0) return;
+
+        self.module_registry = try namespace.Registry.init(self.allocator, self.module_loader.?.modules.items.len);
+
+        const analyzed_modules = try self.allocator.alloc(bool, self.module_loader.?.modules.items.len);
+        defer self.allocator.free(analyzed_modules);
+        @memset(analyzed_modules, false);
+        var remaining_modules: usize = 0;
+        for (self.module_loader.?.modules.items[1..], 1..) |module, module_index| {
+            if (module.ast == null) {
+                analyzed_modules[module_index] = true;
+            } else {
+                remaining_modules += 1;
+            }
+        }
+
+        while (remaining_modules > 0) {
+            var made_progress = false;
+            var module_index: usize = 1;
+            while (module_index < self.module_loader.?.modules.items.len) : (module_index += 1) {
+                if (analyzed_modules[module_index]) continue;
+                const imported = self.module_loader.?.get(@intCast(module_index));
+                var dependencies_ready = true;
+                var dependencies = imported.imports.valueIterator();
+                while (dependencies.next()) |dependency| {
+                    if (dependency.* >= analyzed_modules.len or !analyzed_modules[dependency.*]) {
+                        dependencies_ready = false;
+                        break;
+                    }
+                }
+                if (!dependencies_ready) continue;
+
+                const imported_scope = try self.allocator.create(Scope);
+                errdefer self.allocator.destroy(imported_scope);
+                imported_scope.* = Scope.init(self.allocator, null);
+                errdefer imported_scope.deinit();
+                const imported_sema = try self.allocator.create(Sema);
+                errdefer self.allocator.destroy(imported_sema);
+                imported_sema.* = Sema.init(
+                    self.allocator,
+                    imported.ast.?,
+                    imported.source_id,
+                    &self.engine,
+                    &self.types,
+                    imported_scope,
+                );
+                errdefer imported_sema.deinit();
+                imported_sema.configureModules(@intCast(module_index), &imported.imports, &(self.module_registry.?));
+                imported_sema.analyze() catch {};
+                try export_collector.collect(imported_sema, &(self.module_registry.?), @intCast(module_index));
+                try self.imported_analyses.append(self.allocator, .{ .scope = imported_scope, .sema = imported_sema });
+                analyzed_modules[module_index] = true;
+                remaining_modules -= 1;
+                made_progress = true;
+            }
+            if (!made_progress) break;
+        }
 
         const sema = try self.allocator.create(Sema);
         errdefer self.allocator.destroy(sema);
-        sema.* = Sema.init(self.allocator, self.ast.?, file_id, &self.engine, &self.types, &self.root_scope);
+        sema.* = Sema.init(self.allocator, self.ast.?, root_module.source_id, &self.engine, &self.types, &self.root_scope);
+        sema.configureModules(root_module_id, &root_module.imports, &(self.module_registry.?));
         sema.analyze() catch {};
         self.sema = sema;
     }
@@ -88,10 +180,11 @@ const Document = struct {
 
 const Server = struct {
     allocator: std.mem.Allocator,
+    io: std.Io,
     documents: std.StringHashMap(*Document),
 
-    fn init(allocator: std.mem.Allocator) Server {
-        return .{ .allocator = allocator, .documents = std.StringHashMap(*Document).init(allocator) };
+    fn init(allocator: std.mem.Allocator, io: std.Io) Server {
+        return .{ .allocator = allocator, .io = io, .documents = std.StringHashMap(*Document).init(allocator) };
     }
 
     fn deinit(self: *Server) void {
@@ -102,7 +195,7 @@ const Server = struct {
 
     fn replaceDocument(self: *Server, uri: []const u8, text: []const u8) !*Document {
         if (self.documents.fetchRemove(uri)) |entry| entry.value.deinit();
-        const document = try Document.init(self.allocator, uri, text);
+        const document = try Document.init(self.allocator, self.io, uri, text);
         errdefer document.deinit();
         try document.compile();
         try self.documents.put(document.uri, document);
@@ -116,7 +209,7 @@ const Server = struct {
 
 pub fn main(init: std.process.Init) !u8 {
     const allocator = init.gpa;
-    var server = Server.init(allocator);
+    var server = Server.init(allocator, init.io);
     defer server.deinit();
     var stdout_storage: [1024]u8 = undefined;
     var stdout = std.Io.File.Writer.init(.stdout(), init.io, &stdout_storage);
@@ -166,7 +259,7 @@ fn handle(server: *Server, input: []const u8) ![]u8 {
     const params = field(request, "params") orelse .null;
 
     if (std.mem.eql(u8, method, "initialize")) return response(server.allocator, id,
-        \\{"capabilities":{"textDocumentSync":{"openClose":true,"change":1},"completionProvider":{"triggerCharacters":["@","."]},"definitionProvider":true,"hoverProvider":true,"documentSymbolProvider":true}}
+        \\{"capabilities":{"textDocumentSync":{"openClose":true,"change":1},"completionProvider":{"triggerCharacters":["@","."]},"definitionProvider":true,"hoverProvider":true,"documentSymbolProvider":true,"semanticTokensProvider":{"legend":{"tokenTypes":["namespace","type","class","enum","interface","struct","typeParameter","parameter","variable","property","enumMember","event","function","method","macro","keyword","modifier","comment","string","number","regexp","operator","decorator"],"tokenModifiers":["declaration","definition","readonly","static","deprecated","abstract","async","modification","documentation","defaultLibrary"]},"full":true}}}
     );
     if (std.mem.eql(u8, method, "shutdown")) return response(server.allocator, id, "null");
     if (std.mem.eql(u8, method, "exit")) return server.allocator.dupe(u8, "");
@@ -198,6 +291,7 @@ fn handle(server: *Server, input: []const u8) ![]u8 {
     if (std.mem.eql(u8, method, "textDocument/documentSymbol")) return documentSymbols(server, id, params);
     if (std.mem.eql(u8, method, "textDocument/definition")) return definition(server, id, params);
     if (std.mem.eql(u8, method, "textDocument/hover")) return hover(server, id, params);
+    if (std.mem.eql(u8, method, "textDocument/semanticTokens/full")) return semanticTokensFull(server, id, params);
     if (std.mem.eql(u8, method, "zin/ast")) return response(server.allocator, id, "null");
     return server.allocator.dupe(u8, "");
 }
@@ -406,10 +500,41 @@ fn location(allocator: std.mem.Allocator, id: []const u8, uri: []const u8, text:
 
 fn findNodeByOffset(ast: Ast, offset: usize) ?Node.Index {
     var result: ?Node.Index = null;
+    var result_is_ident = false;
     for (ast.nodes.items(.main_token), 0..) |token_index, node_index| {
         if (token_index >= ast.tokens.len) continue;
         const token = ast.tokens[token_index];
-        if (token.start <= offset and offset <= token.end) result = @intCast(node_index);
+        
+        var is_match = if (offset == token.end)
+            token.start < token.end
+        else
+            (token.start <= offset and offset < token.end);
+            
+        const tag = ast.nodes.items(.tag)[node_index];
+        const data = ast.nodes.items(.data)[node_index];
+        
+        if (!is_match and (tag == .const_decl or tag == .var_decl or tag == .param_decl)) {
+            const decl_tok_idx = data.lhs;
+            if (decl_tok_idx < ast.tokens.len) {
+                const d_token = ast.tokens[decl_tok_idx];
+                is_match = if (offset == d_token.end)
+                    d_token.start < d_token.end
+                else
+                    (d_token.start <= offset and offset < d_token.end);
+            }
+        }
+
+        if (is_match) {
+            const is_ident = tag == .identifier or tag == .const_decl or tag == .var_decl or tag == .param_decl;
+            if (result == null or (is_ident and !result_is_ident)) {
+                result = @intCast(node_index);
+                result_is_ident = is_ident;
+            } else if (is_ident == result_is_ident) {
+                if (node_index < result.?) {
+                    result = @intCast(node_index);
+                }
+            }
+        }
     }
     return result;
 }
@@ -505,8 +630,103 @@ fn send(writer: *std.Io.Writer, body: []const u8) !void {
     try writer.flush();
 }
 
+fn semanticTokensFull(server: *Server, id: []const u8, params: std.json.Value) ![]u8 {
+    const document = documentForParams(server, params) orelse return response(server.allocator, id, "null");
+    const ast = document.ast orelse return response(server.allocator, id, "null");
+    
+    var token_types = try server.allocator.alloc(?u32, ast.tokens.len);
+    defer server.allocator.free(token_types);
+    @memset(token_types, null);
+    
+    for (ast.tokens, 0..) |token, i| {
+        token_types[i] = determineSemanticTokenType(token.tag);
+    }
+    
+    for (ast.nodes.items(.tag), ast.nodes.items(.data), 0..) |tag, data, i| {
+        switch (tag) {
+            .fn_decl => {
+                const name_tok = ast.nodes.items(.main_token)[data.lhs];
+                if (name_tok < token_types.len) { token_types[name_tok] = 12; }
+            },
+            .const_decl, .var_decl, .param_decl => {
+                const name_tok = data.lhs;
+                if (name_tok < token_types.len) { token_types[name_tok] = 8; }
+            },
+            .identifier => {
+                if (document.sema) |sema| {
+                    if (sema.resolved_decls.get(@intCast(i))) |decl_index| {
+                        const decl_tag = ast.nodes.items(.tag)[decl_index];
+                        const tok = ast.nodes.items(.main_token)[i];
+                        if (tok < token_types.len) {
+                            if (decl_tag == .fn_decl) {
+                                token_types[tok] = 12;
+                            } else if (decl_tag == .struct_decl or decl_tag == .enum_decl or decl_tag == .union_decl) {
+                                token_types[tok] = 1;
+                            } else {
+                                token_types[tok] = 8;
+                            }
+                        }
+                    }
+                }
+            },
+            .builtin_call => {
+                const tok = ast.nodes.items(.main_token)[i];
+                if (tok < token_types.len) { token_types[tok] = 12; }
+            },
+            else => {}
+        }
+    }
+    
+    var out = std.ArrayList(u8).empty;
+    defer out.deinit(server.allocator);
+    try out.appendSlice(server.allocator, "{\"data\":[");
+    
+    var first = true;
+    var prev_line: usize = 0;
+    var prev_char: usize = 0;
+    
+    for (ast.tokens, 0..) |token, i| {
+        if (token.tag == .invalid or token.tag == .eof or token.tag == .statement_end) continue;
+        const token_type = token_types[i] orelse continue;
+        
+        const start_pos = offsetToPosition(document.text, token.start);
+        const len = token.end - token.start;
+        
+        const delta_line = start_pos.line - prev_line;
+        const delta_char = if (delta_line == 0) start_pos.character - prev_char else start_pos.character;
+        
+        if (!first) try out.append(server.allocator, ',');
+        first = false;
+        
+        try appendFormat(&out, server.allocator, "{d},{d},{d},{d},0", .{
+            delta_line,
+            delta_char,
+            len,
+            token_type
+        });
+        
+        prev_line = start_pos.line;
+        prev_char = start_pos.character;
+    }
+    
+    try out.appendSlice(server.allocator, "]}");
+    return response(server.allocator, id, out.items);
+}
+
+fn determineSemanticTokenType(tag: Token.Tag) ?u32 {
+    const int_tag = @intFromEnum(tag);
+    if (int_tag >= @intFromEnum(Token.Tag.keyword_pub) and int_tag <= @intFromEnum(Token.Tag.keyword_type)) return 15;
+    if (int_tag >= @intFromEnum(Token.Tag.plus) and int_tag <= @intFromEnum(Token.Tag.asterisk_pipe_shr_equal)) return 21;
+    return switch (tag) {
+        .ident => 8,
+        .string, .byte_string, .char => 18,
+        .integer, .float => 19,
+        else => null,
+    };
+}
+
 test "LSP request JSON preserves decoded document text" {
-    var server = Server.init(std.testing.allocator);
+    var server = Server.init(std.testing.allocator, std.testing.io);
     defer server.deinit();
     const request =
         \\{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///test.zin","text":"const value: i32 = 1\n"}}}

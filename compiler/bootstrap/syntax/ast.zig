@@ -11,6 +11,10 @@ pub const Ast = struct {
         self.nodes.deinit(allocator);
         allocator.free(self.extra_data);
     }
+
+    pub fn dump(self: *const Ast, source: []const u8, writer: anytype) !void {
+        try @import("dump.zig").dump(self, source, writer);
+    }
 };
 
 pub const Node = struct {

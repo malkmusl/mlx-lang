@@ -22,6 +22,11 @@ pub fn resolve(sema: anytype, node_index: Node.Index) std.mem.Allocator.Error!Ty
             try sema.reportError(5005, .@"comptime", sema.ast_tree.tokens[node.main_token].start, "Builtin expression does not denote a type");
             break :blk sema.type_pool.internPrimitive(.void_type);
         },
+        .field_access => blk: {
+            if (sema.type_values.get(node_index)) |type_value| break :blk type_value;
+            _ = try sema.analyzeNode(node_index, sema.root_scope);
+            break :blk sema.type_values.get(node_index) orelse sema.type_pool.internPrimitive(.void_type);
+        },
         .struct_decl, .enum_decl, .union_decl => blk: {
             if (sema.type_values.get(node_index)) |type_value| break :blk type_value;
             _ = try aggregate.analyze(sema, node_index, sema.root_scope);

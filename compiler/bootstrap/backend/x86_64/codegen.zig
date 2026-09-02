@@ -37,11 +37,13 @@ pub const X86Gen = struct {
     rodata_vaddr: u64,
     current_function_return_type: ?u32,
     current_hidden_payload_slot: ?i32,
+    verbose: bool,
 
     pub fn init(
         allocator: std.mem.Allocator,
         ir: *lir.Lir,
         type_pool: *const TypePool,
+        verbose: bool,
     ) X86Gen {
         return .{
             .allocator = allocator,
@@ -59,6 +61,7 @@ pub const X86Gen = struct {
             .rodata_vaddr = 0,
             .current_function_return_type = null,
             .current_hidden_payload_slot = null,
+            .verbose = verbose,
         };
     }
 
@@ -329,7 +332,7 @@ pub const X86Gen = struct {
     // ─────────────────────────────────────────────────────────────────────────
 
     pub fn generate(self: *X86Gen, writer: anytype) !void {
-        std.debug.print("[X86Gen] Starting text code generation\n", .{});
+        if (self.verbose) std.debug.print("[X86Gen] Starting text code generation\n", .{});
 
         try writer.print("global _start\nsection .text\n", .{});
         try writer.print("_start:\n", .{});
@@ -347,13 +350,13 @@ pub const X86Gen = struct {
         try writer.print("  syscall\n", .{});
 
         for (self.lir.blocks.items, 0..) |blk, blk_idx| {
-            std.debug.print("[X86Gen] Emitting block {d} ({d} insts)\n", .{ blk_idx, blk.insts.items.len });
+            if (self.verbose) std.debug.print("[X86Gen] Emitting block {d} ({d} insts)\n", .{ blk_idx, blk.insts.items.len });
             try writer.print(".block_{d}:\n", .{blk_idx});
             for (blk.insts.items) |inst_idx| {
                 try self.emitInstText(writer, inst_idx);
             }
         }
-        std.debug.print("[X86Gen] Text code generation complete\n", .{});
+        if (self.verbose) std.debug.print("[X86Gen] Text code generation complete\n", .{});
     }
 
     fn emitInstText(self: *X86Gen, writer: anytype, inst_idx: lir.Inst.Index) !void {
@@ -365,7 +368,7 @@ pub const X86Gen = struct {
     // ─────────────────────────────────────────────────────────────────────────
 
     pub fn generateBinary(self: *X86Gen, enc: *Encoder) !void {
-        std.debug.print("[X86Gen] Starting binary code generation\n", .{});
+        if (self.verbose) std.debug.print("[X86Gen] Starting binary code generation\n", .{});
 
         // Pass 0: collect all string literals into rodata before emitting any code.
         // We need rodata_vaddr, but that is computed by elf64 after we finish.
@@ -379,7 +382,7 @@ pub const X86Gen = struct {
                 try self.string_offsets.put(@as(lir.Inst.Index, @intCast(idx)), str_off);
                 try self.rodata.appendSlice(self.allocator, content);
                 try self.rodata.append(self.allocator, 0);
-                std.debug.print("[X86Gen] rodata: string %{d} at offset {d} (len {d})\n", .{ idx, str_off, self.rodata.items.len - @as(usize, @intCast(str_off)) });
+                if (self.verbose) std.debug.print("[X86Gen] rodata: string %{d} at offset {d} (len {d})\n", .{ idx, str_off, self.rodata.items.len - @as(usize, @intCast(str_off)) });
             }
         }
 
@@ -415,7 +418,7 @@ pub const X86Gen = struct {
 
         // Two-pass block emission
         for (self.lir.blocks.items, 0..) |blk, blk_idx| {
-            std.debug.print("[X86Gen] Binary block {d} ({d} insts)\n", .{ blk_idx, blk.insts.items.len });
+            if (self.verbose) std.debug.print("[X86Gen] Binary block {d} ({d} insts)\n", .{ blk_idx, blk.insts.items.len });
             const label = try self.blockLabel(blk_idx);
             try enc.defineSymbol(label);
 
@@ -424,7 +427,7 @@ pub const X86Gen = struct {
             }
         }
 
-        std.debug.print("[X86Gen] Binary code generation complete — applying fixups\n", .{});
+        if (self.verbose) std.debug.print("[X86Gen] Binary code generation complete — applying fixups\n", .{});
         try enc.applyFixups();
         _ = self.label_arena.reset(.free_all);
     }
@@ -435,7 +438,7 @@ pub const X86Gen = struct {
 };
 
 test "pointer loads and stores encode r12/r13 base registers" {
-    var enc = Encoder.init(std.testing.allocator);
+    var enc = Encoder.init(std.testing.allocator, false);
     defer enc.deinit();
 
     try memory_codegen.emitStoreViaPtr(&enc, .r13, .r12);
@@ -447,7 +450,7 @@ test "pointer loads and stores encode r12/r13 base registers" {
 }
 
 test "byte pointer stores encode extended registers" {
-    var enc = Encoder.init(std.testing.allocator);
+    var enc = Encoder.init(std.testing.allocator, false);
     defer enc.deinit();
 
     try memory_codegen.emitStoreByteViaPtr(&enc, .r13, .r12);
@@ -455,7 +458,7 @@ test "byte pointer stores encode extended registers" {
 }
 
 test "byte pointer load zero-extends" {
-    var enc = Encoder.init(std.testing.allocator);
+    var enc = Encoder.init(std.testing.allocator, false);
     defer enc.deinit();
 
     try memory_codegen.emitLoadByteViaPtr(&enc, .r14, .r12);
@@ -463,7 +466,7 @@ test "byte pointer load zero-extends" {
 }
 
 test "signed byte pointer load sign-extends" {
-    var enc = Encoder.init(std.testing.allocator);
+    var enc = Encoder.init(std.testing.allocator, false);
     defer enc.deinit();
 
     try memory_codegen.emitLoadSignedByteViaPtr(&enc, .r14, .r12);
@@ -471,7 +474,7 @@ test "signed byte pointer load sign-extends" {
 }
 
 test "word pointer loads and stores preserve scalar width" {
-    var enc = Encoder.init(std.testing.allocator);
+    var enc = Encoder.init(std.testing.allocator, false);
     defer enc.deinit();
 
     try memory_codegen.emitStoreWordViaPtr(&enc, .r13, .r12);
@@ -487,7 +490,7 @@ test "word pointer loads and stores preserve scalar width" {
 }
 
 test "dword pointer loads and stores preserve scalar width" {
-    var enc = Encoder.init(std.testing.allocator);
+    var enc = Encoder.init(std.testing.allocator, false);
     defer enc.deinit();
 
     try memory_codegen.emitStoreDwordViaPtr(&enc, .r13, .r12);
@@ -503,7 +506,7 @@ test "dword pointer loads and stores preserve scalar width" {
 }
 
 test "SSE payload transport moves f64 bits through xmm0" {
-    var enc = Encoder.init(std.testing.allocator);
+    var enc = Encoder.init(std.testing.allocator, false);
     defer enc.deinit();
 
     try memory_codegen.emitMovqXmm0FromGp(&enc, .r9);

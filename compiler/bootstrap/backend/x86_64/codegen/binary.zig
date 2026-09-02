@@ -41,7 +41,7 @@ fn condition(predicate: lir.CmpPredicate) Condition {
 
 pub fn emit(self: anytype, enc: *Encoder, inst_idx: lir.Inst.Index) !void {
     const inst = self.lir.insts.items[inst_idx];
-    std.debug.print("[X86Gen-bin]   inst %{d} = {s}\n", .{ inst_idx, @tagName(inst.opcode) });
+    if (self.verbose) std.debug.print("[X86Gen-bin]   inst %{d} = {s}\n", .{ inst_idx, @tagName(inst.opcode) });
 
     switch (inst.opcode) {
 
@@ -668,11 +668,11 @@ pub fn emit(self: anytype, enc: *Encoder, inst_idx: lir.Inst.Index) !void {
         .string_literal => {
             const op = try self.allocateOp(inst_idx);
             const str_off = self.string_offsets.get(inst_idx) orelse {
-                std.debug.print("[X86Gen-bin]   string_literal %{d}: offset not found!\n", .{inst_idx});
+                if (self.verbose) std.debug.print("[X86Gen-bin]   string_literal %{d}: offset not found!\n", .{inst_idx});
                 return;
             };
             const str_vaddr: i64 = @as(i64, @bitCast(self.rodata_vaddr + str_off));
-            std.debug.print("[X86Gen-bin]   string_literal %{d} vaddr=0x{x}\n", .{ inst_idx, @as(u64, @bitCast(str_vaddr)) });
+            if (self.verbose) std.debug.print("[X86Gen-bin]   string_literal %{d} vaddr=0x{x}\n", .{ inst_idx, @as(u64, @bitCast(str_vaddr)) });
             switch (op) {
                 .reg => |r| try enc.emitMovRegImm64(nameToReg(r), str_vaddr),
                 .mem => |m| {
@@ -683,11 +683,11 @@ pub fn emit(self: anytype, enc: *Encoder, inst_idx: lir.Inst.Index) !void {
         },
 
         .tuple_literal => {
-            std.debug.print("[X86Gen-bin]   tuple lowering is not implemented for %{d}\n", .{inst_idx});
+            if (self.verbose) std.debug.print("[X86Gen-bin]   tuple lowering is not implemented for %{d}\n", .{inst_idx});
         },
 
         else => {
-            std.debug.print("[X86Gen-bin]   [unhandled] {s}\n", .{@tagName(inst.opcode)});
+            if (self.verbose) std.debug.print("[X86Gen-bin]   [unhandled] {s}\n", .{@tagName(inst.opcode)});
         },
     }
 }

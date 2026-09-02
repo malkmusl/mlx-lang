@@ -358,6 +358,10 @@ pub const Sema = struct {
                 _ = try self.analyzeNode(node_idx, scope);
                 return self.type_values.get(node_idx);
             },
+            .field_access => {
+                _ = try self.analyzeNode(node_idx, scope);
+                return self.type_values.get(node_idx);
+            },
 
             else => return null,
         }

@@ -22,10 +22,26 @@ pub fn main(init: std.process.Init) !u8 {
 
     // Parse flags
     var emit_asm = false;
+    var verbose = false;
+    var dump_ast = false;
     var out_path: []const u8 = "out";
-    for (args[2..]) |arg| {
-        if (std.mem.eql(u8, arg, "--emit=asm")) emit_asm = true;
-        if (std.mem.startsWith(u8, arg, "-o")) out_path = arg[2..];
+    var i: usize = 2;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
+        if (std.mem.eql(u8, arg, "--emit=asm")) {
+            emit_asm = true;
+        } else if (std.mem.eql(u8, arg, "--verbose")) {
+            verbose = true;
+        } else if (std.mem.eql(u8, arg, "--dump-ast")) {
+            dump_ast = true;
+        } else if (std.mem.startsWith(u8, arg, "-o")) {
+            if (arg.len == 2) {
+                i += 1;
+                if (i < args.len) out_path = args[i];
+            } else {
+                out_path = arg[2..];
+            }
+        }
     }
 
     var source_manager = sm.SourceManager.init(allocator);
@@ -49,6 +65,12 @@ pub fn main(init: std.process.Init) !u8 {
         return 1;
     }
     const ast = root_module.ast.?;
+
+    if (dump_ast) {
+        ast.dump(source_manager.files.items[root_module.source_id].content, out) catch {};
+        try stdout_file_writer.flush();
+        return 0;
+    }
 
     engine.renderDebug();
 
@@ -161,7 +183,7 @@ pub fn main(init: std.process.Init) !u8 {
 
     // Stage 9: LIR
     const lir_gen_mod = @import("ir/lower.zig");
-    var lir_builder = lir_gen_mod.LirBuilder.init(allocator, &sema);
+    var lir_builder = lir_gen_mod.LirBuilder.init(allocator, &sema, verbose);
     defer lir_builder.deinit();
     lir_builder.generate() catch |err| {
         std.debug.print("LIR gen failed: {}\n", .{err});
@@ -173,7 +195,9 @@ pub fn main(init: std.process.Init) !u8 {
             return 1;
         };
     }
-    lir_builder.printLir();
+    if (verbose) {
+        lir_builder.printLir();
+    }
 
     std.debug.print("AST has {d} nodes\n", .{ast.nodes.len});
 
@@ -181,6 +205,7 @@ pub fn main(init: std.process.Init) !u8 {
         allocator,
         &lir_builder.lir,
         &type_pool,
+        verbose,
     );
     defer x86_gen.deinit();
 
@@ -192,7 +217,7 @@ pub fn main(init: std.process.Init) !u8 {
     } else {
         // ── Stage 12: Binary ELF64 output ────────────────────────────────────
         std.debug.print("[zin0] emitting ELF64 binary → '{s}'\n", .{out_path});
-        var enc = @import("backend/x86_64/encoder.zig").Encoder.init(allocator);
+        var enc = @import("backend/x86_64/encoder.zig").Encoder.init(allocator, verbose);
         defer enc.deinit();
 
         // Phase 1: generate binary to discover code size and collect rodata strings.

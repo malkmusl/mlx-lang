@@ -167,7 +167,24 @@ fn parseNamedType(parser: anytype) std.mem.Allocator.Error!?Node.Index {
         .main_token = identifier_token,
         .data = .{ .lhs = 0, .rhs = 0 },
     });
-    const identifier_node: Node.Index = @intCast(parser.nodes.len - 1);
+    var identifier_node: Node.Index = @intCast(parser.nodes.len - 1);
+
+    while (parser.index < parser.tokens.len and parser.tokens[parser.index].tag == .dot) {
+        parser.consumeToken("Consume qualified type '.'");
+        if (parser.index >= parser.tokens.len or parser.tokens[parser.index].tag != .ident) {
+            try parser.reportError(2001, "Expected identifier after '.' in qualified type name");
+            return null;
+        }
+        const field_token = parser.index;
+        parser.consumeToken("Consume qualified type field");
+        try parser.nodes.append(parser.allocator, .{
+            .tag = .field_access,
+            .main_token = field_token,
+            .data = .{ .lhs = identifier_node, .rhs = field_token },
+        });
+        identifier_node = @intCast(parser.nodes.len - 1);
+    }
+
     if (parser.index < parser.tokens.len and parser.tokens[parser.index].tag == .bang) {
         const bang_token = parser.index;
         parser.consumeToken("Consume ! in E!T");

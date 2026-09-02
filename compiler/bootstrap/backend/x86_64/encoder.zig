@@ -56,13 +56,15 @@ pub const Encoder = struct {
     symbols: std.StringHashMap(u32),
     /// Pending relocations to be patched after all code is emitted.
     fixups: std.ArrayList(Fixup),
+    verbose: bool,
 
-    pub fn init(allocator: std.mem.Allocator) Encoder {
+    pub fn init(allocator: std.mem.Allocator, verbose: bool) Encoder {
         return .{
             .allocator = allocator,
             .buf = std.ArrayList(u8).empty,
             .symbols = std.StringHashMap(u32).init(allocator),
             .fixups = std.ArrayList(Fixup).empty,
+            .verbose = verbose,
         };
     }
 
@@ -165,14 +167,14 @@ pub const Encoder = struct {
 
     /// Mark the current position as the start of a named symbol.
     pub fn defineSymbol(self: *Encoder, name: []const u8) !void {
-        std.debug.print("[enc] defineSymbol '{s}' @ 0x{x}\n", .{ name, self.pos() });
+        if (self.verbose) std.debug.print("[enc] defineSymbol '{s}' @ 0x{x}\n", .{ name, self.pos() });
         try self.symbols.put(name, self.pos());
     }
 
     /// Record a fixup: emit 4 zero bytes as placeholder and register the reloc.
     pub fn addFixup(self: *Encoder, kind: FixupKind, target: []const u8) !void {
         const offset = self.pos();
-        std.debug.print("[enc] addFixup {s} → '{s}' @ 0x{x}\n", .{ @tagName(kind), target, offset });
+        if (self.verbose) std.debug.print("[enc] addFixup {s} → '{s}' @ 0x{x}\n", .{ @tagName(kind), target, offset });
         try self.fixups.append(self.allocator, .{ .kind = kind, .patch_offset = offset, .target = target });
         try self.emitImm32(0); // placeholder
     }
@@ -180,16 +182,16 @@ pub const Encoder = struct {
     /// Resolve all fixups by computing relative offsets and patching the buffer.
     /// Must be called after all code has been emitted.
     pub fn applyFixups(self: *Encoder) !void {
-        std.debug.print("[enc] applying {d} fixups\n", .{self.fixups.items.len});
+        if (self.verbose) std.debug.print("[enc] applying {d} fixups\n", .{self.fixups.items.len});
         for (self.fixups.items) |fixup| {
             const target_pos = self.symbols.get(fixup.target) orelse {
-                std.debug.print("[enc] ERROR: undefined symbol '{s}'\n", .{fixup.target});
+                if (self.verbose) std.debug.print("[enc] ERROR: undefined symbol '{s}'\n", .{fixup.target});
                 return error.UndefinedSymbol;
             };
             // rel32 = target - (patch_site + 4)
             const after_fixup: i64 = @as(i64, fixup.patch_offset) + 4;
             const rel32: i32 = @as(i32, @intCast(@as(i64, target_pos) - after_fixup));
-            std.debug.print("[enc] patching '{s}': rel32={d} @ 0x{x}\n", .{ fixup.target, rel32, fixup.patch_offset });
+            if (self.verbose) std.debug.print("[enc] patching '{s}': rel32={d} @ 0x{x}\n", .{ fixup.target, rel32, fixup.patch_offset });
             self.patch32(fixup.patch_offset, rel32);
         }
     }
@@ -202,7 +204,7 @@ pub const Encoder = struct {
 
     /// MOV reg, imm64   (REX.W B8+rd id)
     pub fn emitMovRegImm64(self: *Encoder, dst: Reg, imm: i64) !void {
-        std.debug.print("[enc] mov {s}, {d}\n", .{ @tagName(dst), imm });
+        if (self.verbose) std.debug.print("[enc] mov {s}, {d}\n", .{ @tagName(dst), imm });
         try self.emit1(rex(true, false, false, needsRex(dst)));
         try self.emit1(0xB8 | @as(u8, lo3(dst)));
         try self.emitImm64(imm);
@@ -210,7 +212,7 @@ pub const Encoder = struct {
 
     /// MOV dst, src   (REX.W 89 /r)
     pub fn emitMovRegReg(self: *Encoder, dst: Reg, src: Reg) !void {
-        std.debug.print("[enc] mov {s}, {s}\n", .{ @tagName(dst), @tagName(src) });
+        if (self.verbose) std.debug.print("[enc] mov {s}, {s}\n", .{ @tagName(dst), @tagName(src) });
         if (dst == src) return; // elide no-op
         try self.emit1(rex(true, needsRex(src), false, needsRex(dst)));
         try self.emit1(0x89);
@@ -219,7 +221,7 @@ pub const Encoder = struct {
 
     /// MOV dst, [rbp - offset]   load from local stack slot
     pub fn emitMovRegMem(self: *Encoder, dst: Reg, rbp_offset: i32) !void {
-        std.debug.print("[enc] mov {s}, [rbp-{d}]\n", .{ @tagName(dst), rbp_offset });
+        if (self.verbose) std.debug.print("[enc] mov {s}, [rbp-{d}]\n", .{ @tagName(dst), rbp_offset });
         const d = dispEncoding(-rbp_offset);
         try self.emit1(rex(true, needsRex(dst), false, false));
         try self.emit1(0x8B);
@@ -229,7 +231,7 @@ pub const Encoder = struct {
 
     /// MOV [rbp - offset], src   store to local stack slot
     pub fn emitMovMemReg(self: *Encoder, rbp_offset: i32, src: Reg) !void {
-        std.debug.print("[enc] mov [rbp-{d}], {s}\n", .{ rbp_offset, @tagName(src) });
+        if (self.verbose) std.debug.print("[enc] mov [rbp-{d}], {s}\n", .{ rbp_offset, @tagName(src) });
         const d = dispEncoding(-rbp_offset);
         try self.emit1(rex(true, needsRex(src), false, false));
         try self.emit1(0x89);
@@ -241,7 +243,7 @@ pub const Encoder = struct {
 
     /// LEA dst, [rbp - offset]
     pub fn emitLeaRegMem(self: *Encoder, dst: Reg, rbp_offset: i32) !void {
-        std.debug.print("[enc] lea {s}, [rbp-{d}]\n", .{ @tagName(dst), rbp_offset });
+        if (self.verbose) std.debug.print("[enc] lea {s}, [rbp-{d}]\n", .{ @tagName(dst), rbp_offset });
         const d = dispEncoding(-rbp_offset);
         try self.emit1(rex(true, needsRex(dst), false, false));
         try self.emit1(0x8D);
@@ -252,7 +254,7 @@ pub const Encoder = struct {
     /// LEA dst, [RIP + rel32]   (RIP-relative, used for function references)
     /// Emits a fixup for the 4-byte offset.
     pub fn emitLeaRipRel(self: *Encoder, dst: Reg, target: []const u8) !void {
-        std.debug.print("[enc] lea {s}, [RIP+rel '{s}']\n", .{ @tagName(dst), target });
+        if (self.verbose) std.debug.print("[enc] lea {s}, [RIP+rel '{s}']\n", .{ @tagName(dst), target });
         try self.emit1(rex(true, needsRex(dst), false, false));
         try self.emit1(0x8D);
         // ModRM: mod=00 (no disp), reg=dst, rm=101 (RIP-relative)
@@ -264,7 +266,7 @@ pub const Encoder = struct {
 
     /// ADD dst, src   (REX.W 01 /r)
     pub fn emitAdd(self: *Encoder, dst: Reg, src: Reg) !void {
-        std.debug.print("[enc] add {s}, {s}\n", .{ @tagName(dst), @tagName(src) });
+        if (self.verbose) std.debug.print("[enc] add {s}, {s}\n", .{ @tagName(dst), @tagName(src) });
         try self.emit1(rex(true, needsRex(src), false, needsRex(dst)));
         try self.emit1(0x01);
         try self.emit1(modrm(0b11, lo3(src), lo3(dst)));
@@ -272,7 +274,7 @@ pub const Encoder = struct {
 
     /// SUB dst, src   (REX.W 29 /r)
     pub fn emitSub(self: *Encoder, dst: Reg, src: Reg) !void {
-        std.debug.print("[enc] sub {s}, {s}\n", .{ @tagName(dst), @tagName(src) });
+        if (self.verbose) std.debug.print("[enc] sub {s}, {s}\n", .{ @tagName(dst), @tagName(src) });
         try self.emit1(rex(true, needsRex(src), false, needsRex(dst)));
         try self.emit1(0x29);
         try self.emit1(modrm(0b11, lo3(src), lo3(dst)));
@@ -280,7 +282,7 @@ pub const Encoder = struct {
 
     /// IMUL dst, src   (REX.W 0F AF /r)
     pub fn emitIMul(self: *Encoder, dst: Reg, src: Reg) !void {
-        std.debug.print("[enc] imul {s}, {s}\n", .{ @tagName(dst), @tagName(src) });
+        if (self.verbose) std.debug.print("[enc] imul {s}, {s}\n", .{ @tagName(dst), @tagName(src) });
         try self.emit1(rex(true, needsRex(dst), false, needsRex(src)));
         try self.emit2(0x0F, 0xAF);
         try self.emit1(modrm(0b11, lo3(dst), lo3(src)));
@@ -326,7 +328,7 @@ pub const Encoder = struct {
 
     /// SUB rsp, imm8   (REX.W 83 /5 ib)  — stack allocation
     pub fn emitSubRspImm8(self: *Encoder, imm: u8) !void {
-        std.debug.print("[enc] sub rsp, {d}\n", .{imm});
+        if (self.verbose) std.debug.print("[enc] sub rsp, {d}\n", .{imm});
         try self.emit1(rex(true, false, false, false));
         try self.emit2(0x83, 0xEC);
         try self.emit1(imm);
@@ -334,7 +336,7 @@ pub const Encoder = struct {
 
     /// SUB rsp, imm32   (REX.W 81 /5 id)  — larger stack allocation
     pub fn emitSubRspImm32(self: *Encoder, imm: u32) !void {
-        std.debug.print("[enc] sub rsp, {d}\n", .{imm});
+        if (self.verbose) std.debug.print("[enc] sub rsp, {d}\n", .{imm});
         try self.emit1(rex(true, false, false, false));
         try self.emit2(0x81, 0xEC);
         try self.emitImm32(@as(i32, @intCast(imm)));
@@ -342,7 +344,7 @@ pub const Encoder = struct {
 
     /// ADD rsp, imm32   (REX.W 81 /0 id) — discard outgoing stack arguments.
     pub fn emitAddRspImm32(self: *Encoder, imm: u32) !void {
-        std.debug.print("[enc] add rsp, {d}\n", .{imm});
+        if (self.verbose) std.debug.print("[enc] add rsp, {d}\n", .{imm});
         try self.emit1(rex(true, false, false, false));
         try self.emit2(0x81, 0xC4);
         try self.emitImm32(@as(i32, @intCast(imm)));
@@ -352,7 +354,7 @@ pub const Encoder = struct {
 
     /// TEST reg, reg   (REX.W 85 /r)
     pub fn emitTest(self: *Encoder, reg: Reg) !void {
-        std.debug.print("[enc] test {s}, {s}\n", .{ @tagName(reg), @tagName(reg) });
+        if (self.verbose) std.debug.print("[enc] test {s}, {s}\n", .{ @tagName(reg), @tagName(reg) });
         try self.emit1(rex(true, needsRex(reg), false, needsRex(reg)));
         try self.emit1(0x85);
         try self.emit1(modrm(0b11, lo3(reg), lo3(reg)));
@@ -360,7 +362,7 @@ pub const Encoder = struct {
 
     /// CMP lhs, rhs   (REX.W 39 /r)
     pub fn emitCmp(self: *Encoder, lhs: Reg, rhs: Reg) !void {
-        std.debug.print("[enc] cmp {s}, {s}\n", .{ @tagName(lhs), @tagName(rhs) });
+        if (self.verbose) std.debug.print("[enc] cmp {s}, {s}\n", .{ @tagName(lhs), @tagName(rhs) });
         try self.emit1(rex(true, needsRex(rhs), false, needsRex(lhs)));
         try self.emit1(0x39);
         try self.emit1(modrm(0b11, lo3(rhs), lo3(lhs)));
@@ -368,7 +370,7 @@ pub const Encoder = struct {
 
     /// SETcc dst.low8 after clearing the complete destination register.
     pub fn emitSetcc(self: *Encoder, dst: Reg, condition: Condition) !void {
-        std.debug.print("[enc] set{s} {s}b\n", .{ @tagName(condition), @tagName(dst) });
+        if (self.verbose) std.debug.print("[enc] set{s} {s}b\n", .{ @tagName(condition), @tagName(dst) });
         try self.emitMovRegImm64(dst, 0);
         // A REX prefix is required for spl/bpl/sil/dil and harmless for all GP regs.
         try self.emit1(rex(false, false, false, needsRex(dst)));
@@ -380,35 +382,35 @@ pub const Encoder = struct {
 
     /// JMP rel32   (E9 id)
     pub fn emitJmpRel(self: *Encoder, target: []const u8) !void {
-        std.debug.print("[enc] jmp '{s}'\n", .{target});
+        if (self.verbose) std.debug.print("[enc] jmp '{s}'\n", .{target});
         try self.emit1(0xE9);
         try self.addFixup(.jmp_rel32, target);
     }
 
     /// JNZ rel32   (0F 85 id)  — jump if not zero (condition true)
     pub fn emitJnzRel(self: *Encoder, target: []const u8) !void {
-        std.debug.print("[enc] jnz '{s}'\n", .{target});
+        if (self.verbose) std.debug.print("[enc] jnz '{s}'\n", .{target});
         try self.emit2(0x0F, 0x85);
         try self.addFixup(.jmp_rel32, target);
     }
 
     /// JZ rel32   (0F 84 id)  — jump if zero (condition false)
     pub fn emitJzRel(self: *Encoder, target: []const u8) !void {
-        std.debug.print("[enc] jz '{s}'\n", .{target});
+        if (self.verbose) std.debug.print("[enc] jz '{s}'\n", .{target});
         try self.emit2(0x0F, 0x84);
         try self.addFixup(.jmp_rel32, target);
     }
 
     /// CALL rel32   (E8 id)
     pub fn emitCallRel(self: *Encoder, target: []const u8) !void {
-        std.debug.print("[enc] call '{s}'\n", .{target});
+        if (self.verbose) std.debug.print("[enc] call '{s}'\n", .{target});
         try self.emit1(0xE8);
         try self.addFixup(.call_rel32, target);
     }
 
     /// CALL r/m64   (FF /2)  — indirect call through register
     pub fn emitCallReg(self: *Encoder, reg: Reg) !void {
-        std.debug.print("[enc] call {s}\n", .{@tagName(reg)});
+        if (self.verbose) std.debug.print("[enc] call {s}\n", .{@tagName(reg)});
         if (needsRex(reg)) try self.emit1(rex(false, false, false, true));
         try self.emit1(0xFF);
         try self.emit1(modrm(0b11, 2, lo3(reg)));
@@ -416,7 +418,7 @@ pub const Encoder = struct {
 
     /// RET   (C3)
     pub fn emitRet(self: *Encoder) !void {
-        std.debug.print("[enc] ret\n", .{});
+        if (self.verbose) std.debug.print("[enc] ret\n", .{});
         try self.emit1(0xC3);
     }
 
@@ -424,33 +426,33 @@ pub const Encoder = struct {
 
     /// PUSH rbp   (55)
     pub fn emitPushRbp(self: *Encoder) !void {
-        std.debug.print("[enc] push rbp\n", .{});
+        if (self.verbose) std.debug.print("[enc] push rbp\n", .{});
         try self.emit1(0x55);
     }
 
     /// PUSH r64 (50+rd, with REX.B for r8-r15).
     pub fn emitPushReg(self: *Encoder, reg: Reg) !void {
-        std.debug.print("[enc] push {s}\n", .{@tagName(reg)});
+        if (self.verbose) std.debug.print("[enc] push {s}\n", .{@tagName(reg)});
         if (needsRex(reg)) try self.emit1(rex(false, false, false, true));
         try self.emit1(0x50 | @as(u8, lo3(reg)));
     }
 
     /// POP rbp   (5D)
     pub fn emitPopRbp(self: *Encoder) !void {
-        std.debug.print("[enc] pop rbp\n", .{});
+        if (self.verbose) std.debug.print("[enc] pop rbp\n", .{});
         try self.emit1(0x5D);
     }
 
     /// MOV rbp, rsp   (REX.W 89 E5)
     pub fn emitMovRbpRsp(self: *Encoder) !void {
-        std.debug.print("[enc] mov rbp, rsp\n", .{});
+        if (self.verbose) std.debug.print("[enc] mov rbp, rsp\n", .{});
         try self.emit1(rex(true, false, false, false));
         try self.emit2(0x89, 0xE5);
     }
 
     /// MOV rsp, rbp   (REX.W 89 EC)
     pub fn emitMovRspRbp(self: *Encoder) !void {
-        std.debug.print("[enc] mov rsp, rbp\n", .{});
+        if (self.verbose) std.debug.print("[enc] mov rsp, rbp\n", .{});
         try self.emit1(rex(true, false, false, false));
         try self.emit2(0x89, 0xEC);
     }
@@ -459,12 +461,12 @@ pub const Encoder = struct {
 
     /// SYSCALL   (0F 05)
     pub fn emitSyscall(self: *Encoder) !void {
-        std.debug.print("[enc] syscall\n", .{});
+        if (self.verbose) std.debug.print("[enc] syscall\n", .{});
         try self.emit2(0x0F, 0x05);
     }
 
     pub fn emitTrap(self: *Encoder) !void {
-        std.debug.print("[enc] ud2\n", .{});
+        if (self.verbose) std.debug.print("[enc] ud2\n", .{});
         try self.emit2(0x0f, 0x0b);
     }
 };
@@ -475,7 +477,7 @@ pub const Encoder = struct {
 
 test "MOV rax, imm64" {
     const testing = std.testing;
-    var enc = Encoder.init(testing.allocator);
+    var enc = Encoder.init(testing.allocator, false);
     defer enc.deinit();
     try enc.emitMovRegImm64(.rax, 60);
     // REX.W=0x48, opcode=0xB8+0=0xB8, imm64=60
@@ -487,7 +489,7 @@ test "MOV rax, imm64" {
 
 test "MOV r15, imm64 — needs REX.B" {
     const testing = std.testing;
-    var enc = Encoder.init(testing.allocator);
+    var enc = Encoder.init(testing.allocator, false);
     defer enc.deinit();
     try enc.emitMovRegImm64(.r15, 0);
     // REX = 0x49 (REX.W + REX.B), opcode = 0xB8 + 7 = 0xBF
@@ -497,7 +499,7 @@ test "MOV r15, imm64 — needs REX.B" {
 
 test "MOV [rbp-8], rax" {
     const testing = std.testing;
-    var enc = Encoder.init(testing.allocator);
+    var enc = Encoder.init(testing.allocator, false);
     defer enc.deinit();
     try enc.emitMovMemReg(8, .rax);
     // REX.W=0x48, 0x89, ModRM(01, 0, 5)=0x45, disp8=-8=0xF8
@@ -509,7 +511,7 @@ test "MOV [rbp-8], rax" {
 
 test "ADD rax, rcx" {
     const testing = std.testing;
-    var enc = Encoder.init(testing.allocator);
+    var enc = Encoder.init(testing.allocator, false);
     defer enc.deinit();
     try enc.emitAdd(.rax, .rcx);
     // REX.W=0x48, 0x01, ModRM(11, 1, 0)=0xC8
@@ -520,7 +522,7 @@ test "ADD rax, rcx" {
 
 test "PUSH rbp / POP rbp" {
     const testing = std.testing;
-    var enc = Encoder.init(testing.allocator);
+    var enc = Encoder.init(testing.allocator, false);
     defer enc.deinit();
     try enc.emitPushRbp();
     try enc.emitPopRbp();
@@ -530,7 +532,7 @@ test "PUSH rbp / POP rbp" {
 
 test "SYSCALL" {
     const testing = std.testing;
-    var enc = Encoder.init(testing.allocator);
+    var enc = Encoder.init(testing.allocator, false);
     defer enc.deinit();
     try enc.emitSyscall();
     try testing.expectEqual(@as(u8, 0x0F), enc.buf.items[0]);
@@ -539,7 +541,7 @@ test "SYSCALL" {
 
 test "symbol define and fixup" {
     const testing = std.testing;
-    var enc = Encoder.init(testing.allocator);
+    var enc = Encoder.init(testing.allocator, false);
     defer enc.deinit();
 
     // Emit: E8 <rel32>  (call "target")
@@ -558,7 +560,7 @@ test "symbol define and fixup" {
 
 test "RET" {
     const testing = std.testing;
-    var enc = Encoder.init(testing.allocator);
+    var enc = Encoder.init(testing.allocator, false);
     defer enc.deinit();
     try enc.emitRet();
     try testing.expectEqual(@as(u8, 0xC3), enc.buf.items[0]);

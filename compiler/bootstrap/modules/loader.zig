@@ -60,8 +60,18 @@ pub const Loader = struct {
         defer self.allocator.free(cwd);
         const canonical = try std.fs.path.resolve(self.allocator, &.{ cwd, path });
         defer self.allocator.free(canonical);
-        return self.loadCanonical(canonical, null, 0);
+        return self.loadCanonical(canonical, null, 0, null);
     }
+
+    pub fn loadRootMemory(self: *Loader, path: []const u8, text: []const u8) !resolver.ModuleId {
+        const cwd = try std.process.currentPathAlloc(self.io, self.allocator);
+        defer self.allocator.free(cwd);
+        // LSP passes absolute file paths but we resolve just in case
+        const canonical = try std.fs.path.resolve(self.allocator, &.{ cwd, path });
+        defer self.allocator.free(canonical);
+        return self.loadCanonical(canonical, null, 0, text);
+    }
+
 
     pub fn get(self: *Loader, id: resolver.ModuleId) *LoadedModule {
         return &self.modules.items[id];
@@ -72,6 +82,7 @@ pub const Loader = struct {
         canonical_path: []const u8,
         importer_source: ?u32,
         import_start: u32,
+        memory_text: ?[]const u8,
     ) !resolver.ModuleId {
         const entry = try self.graph.getOrAdd(canonical_path);
         if (!entry.is_new) return entry.id;
@@ -88,11 +99,14 @@ pub const Loader = struct {
             return entry.id;
         }
 
-        const bytes = std.Io.Dir.readFileAlloc(.cwd(), self.io, canonical_path, self.allocator, @enumFromInt(10 * 1024 * 1024)) catch {
-            self.graph.setState(entry.id, .failed);
-            if (importer_source) |source_id| try self.reportImportNotFound(source_id, import_start);
-            return entry.id;
-        };
+        const bytes = if (memory_text) |text|
+            try self.allocator.dupe(u8, text)
+        else
+            std.Io.Dir.readFileAlloc(.cwd(), self.io, canonical_path, self.allocator, @enumFromInt(10 * 1024 * 1024)) catch {
+                self.graph.setState(entry.id, .failed);
+                if (importer_source) |source_id| try self.reportImportNotFound(source_id, import_start);
+                return entry.id;
+            };
         defer self.allocator.free(bytes);
 
         const source_id = try self.source_manager.addFile(canonical_path, bytes);
@@ -128,6 +142,7 @@ pub const Loader = struct {
                 resolved_path,
                 source_id,
                 tree.tokens[tree.nodes.get(import_node.builtin_node).main_token].start,
+                null,
             );
             try self.modules.items[entry.id].imports.put(import_node.builtin_node, imported_id);
         }

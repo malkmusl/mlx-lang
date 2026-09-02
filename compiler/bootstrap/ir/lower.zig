@@ -49,8 +49,9 @@ pub const LirBuilder = struct {
     loop_stack: std.ArrayList(LoopTargets),
     cleanup_stack: std.ArrayList(Cleanup),
     current_generic_instance: ?u32 = null,
+    verbose: bool,
 
-    pub fn init(allocator: std.mem.Allocator, sema: *Sema) LirBuilder {
+    pub fn init(allocator: std.mem.Allocator, sema: *Sema, verbose: bool) LirBuilder {
         return .{
             .allocator = allocator,
             .sema = sema,
@@ -63,6 +64,7 @@ pub const LirBuilder = struct {
             .current_return_type = null,
             .loop_stack = std.ArrayList(LoopTargets).empty,
             .cleanup_stack = std.ArrayList(Cleanup).empty,
+            .verbose = verbose,
         };
     }
 
@@ -76,8 +78,8 @@ pub const LirBuilder = struct {
     }
 
     pub fn generate(self: *LirBuilder) !void {
-        std.debug.print("-> ENTER: LirBuilder.generate\n", .{});
-        defer std.debug.print("<- EXIT: LirBuilder.generate\n", .{});
+        if (self.verbose) std.debug.print("-> ENTER: LirBuilder.generate\n", .{});
+        defer { if (self.verbose) std.debug.print("<- EXIT: LirBuilder.generate\n", .{}); }
 
         // Ensure at least one block exists
         try self.lir.blocks.append(self.allocator, @import("lir.zig").BasicBlock.init());
@@ -141,12 +143,14 @@ pub const LirBuilder = struct {
 
     pub fn lowerNode(self: *LirBuilder, node_idx: Node.Index) std.mem.Allocator.Error!?Inst.Index {
         const node = self.sema.ast_tree.nodes.get(node_idx);
-        std.debug.print("-> ENTER: LirBuilder.lowerNode | Tag: {s}\n", .{@tagName(node.tag)});
+        if (self.verbose) std.debug.print("-> ENTER: LirBuilder.lowerNode | Tag: {s}\n", .{@tagName(node.tag)});
 
         var result: ?Inst.Index = null;
         defer {
-            std.debug.print("<- EXIT: LirBuilder.lowerNode | Tag: {s} | Result: ", .{@tagName(node.tag)});
-            if (result) |r| std.debug.print("{d}\n", .{r}) else std.debug.print("null\n", .{});
+            if (self.verbose) {
+                std.debug.print("<- EXIT: LirBuilder.lowerNode | Tag: {s} | Result: ", .{@tagName(node.tag)});
+                if (result) |r| std.debug.print("{d}\n", .{r}) else std.debug.print("null\n", .{});
+            }
         }
 
         switch (node.tag) {
