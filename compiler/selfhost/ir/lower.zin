@@ -1,0 +1,795 @@
+const allocator_module = @import("../../../std/bootstrap/allocator.zin")
+const array_list = @import("../../../std/bootstrap/array_list.zin")
+const vector = @import("../../../std/bootstrap/vector.zin")
+const mem = @import("../../../std/bootstrap/mem.zin")
+const lir = @import("./lir.zin")
+const ast = @import("../ast/node.zin")
+const ast_store = @import("../ast/store.zin")
+const lexer = @import("../lexer.zin")
+const source_module = @import("../source.zin")
+const types_store = @import("../sema/types/store.zin")
+const symbols_store = @import("../sema/symbols/store.zin")
+const loader_module = @import("../modules/loader.zin")
+const model = @import("../modules/model.zin")
+const store_module = @import("../modules/store.zin")
+
+pub const Allocator = allocator_module.Allocator
+
+pub const Binding = struct {
+    namePointer: [*]const u8
+    nameLength: usize
+    address: usize
+    secondaryAddress: usize
+}
+
+pub const LirBuilder = struct {
+    lir: *lir.Lir
+    loader: *loader_module.Loader
+    typeStore: *types_store.Store
+    symbolStore: *symbols_store.Store
+    currentModuleId: usize
+    // Current module context (cached from module)
+    sourcePointer: [*]const u8
+    sourceLength: usize
+    tokensAddress: usize
+    nodesAddress: usize
+    // Per-function state
+    paramCounter: usize
+    currentReturnType: usize
+    bindings: *vector.Vector
+    blockCounter: usize
+    breakTarget: usize
+    continueTarget: usize
+    allocatorContext: usize
+    allocFn: allocator_module.AllocFn
+    resizeFn: allocator_module.ResizeFn
+    freeFn: allocator_module.FreeFn
+}
+
+pub fn init(
+    target_lir: *lir.Lir,
+    type_store: *types_store.Store,
+    symbol_store: *symbols_store.Store,
+    loader: *loader_module.Loader,
+    allocator: Allocator,
+) -> LirBuilder {
+    unsafe {
+        const bindings = @ptrCast(*vector.Vector, allocator.allocFn(allocator.context, @sizeOf(vector.Vector), @alignOf(vector.Vector)).?)
+        vector.initAt(bindings, allocator, @sizeOf(Binding), @alignOf(Binding), 32)
+        return LirBuilder.{
+            .lir = target_lir,
+            .loader = loader,
+            .typeStore = type_store,
+            .symbolStore = symbol_store,
+            .currentModuleId = 0,
+            .sourcePointer = @ptrCast([*]const u8, ""),
+            .sourceLength = 0,
+            .tokensAddress = 0,
+            .nodesAddress = 0,
+            .paramCounter = 0,
+            .currentReturnType = lir.NONE,
+            .bindings = bindings,
+            .blockCounter = 0,
+            .breakTarget = lir.NONE,
+            .continueTarget = lir.NONE,
+            .allocatorContext = allocator.context,
+            .allocFn = allocator.allocFn,
+            .resizeFn = allocator.resizeFn,
+            .freeFn = allocator.freeFn,
+        }
+    }
+}
+
+pub fn deinit(builder: *LirBuilder) -> void {
+    vector.deinit(builder.*.bindings.*)
+    unsafe {
+        builder.*.freeFn(builder.*.allocatorContext, @ptrCast([*]u8, builder.*.bindings), @sizeOf(vector.Vector), @alignOf(vector.Vector))
+    }
+}
+
+fn switchToModule(builder: *LirBuilder, module_id: usize) -> void {
+    builder.*.currentModuleId = module_id
+    const module = loader_module.moduleAt(builder.*.loader, module_id)
+    if module.*.sourceAddress != 0 {
+        unsafe {
+            const sf = @ptrFromInt(*source_module.SourceFile, module.*.sourceAddress)
+            builder.*.sourcePointer = @ptrCast([*]const u8, sf.*.bytes)
+            builder.*.sourceLength = sf.*.length
+        }
+    }
+    builder.*.tokensAddress = module.*.tokensAddress
+    builder.*.nodesAddress = module.*.nodesAddress
+}
+
+fn getNodes(builder: *LirBuilder) -> *ast_store.Store {
+    unsafe { return @ptrFromInt(*ast_store.Store, builder.*.nodesAddress) }
+}
+
+fn getTokens(builder: *LirBuilder) -> *lexer.Buffer {
+    unsafe { return @ptrFromInt(*lexer.Buffer, builder.*.tokensAddress) }
+}
+
+fn bindingsPointer(builder: *LirBuilder) -> *vector.Vector {
+    return builder.*.bindings
+}
+
+fn tokenStart(builder: *LirBuilder, token_index: usize) -> usize {
+    const tokens = getTokens(builder)
+    const tok = lexer.tokenAt(tokens.*, token_index)
+    return tok.start
+}
+
+fn tokenLength(builder: *LirBuilder, token_index: usize) -> usize {
+    const tokens = getTokens(builder)
+    const tok = lexer.tokenAt(tokens.*, token_index)
+    return tok.length
+}
+
+fn tokenPointer(builder: *LirBuilder, token_index: usize) -> [*]const u8 {
+    const start = tokenStart(builder, token_index)
+    unsafe {
+        return @ptrFromInt([*]const u8, @intFromPtr(builder.*.sourcePointer) + start)
+    }
+}
+
+fn tokenKind(builder: *LirBuilder, token_index: usize) -> lexer.Kind {
+    const tokens = getTokens(builder)
+    const tok = lexer.tokenAt(tokens.*, token_index)
+    return tok.kind
+}
+
+pub fn generateModule(builder: *LirBuilder, module_id: usize) -> void {
+    switchToModule(builder, module_id)
+    const module = loader_module.moduleAt(builder.*.loader, module_id)
+    if module.*.state != model.State.loaded { return }
+    if module.*.nodesAddress == 0 { return }
+    generate(builder, module.*.rootNode)
+}
+
+pub fn generate(builder: *LirBuilder, root_index: usize) -> void {
+    const nodes = getNodes(builder)
+    if root_index == ast.NONE || root_index >= nodes.*.length { return }
+    const root = ast_store.get(nodes, root_index)
+    if root.tag != ast.Tag.root { return }
+    var child = root.lhs
+    var count: usize = 0
+    while child != ast.NONE && count < root.rhs {
+        const node = ast_store.get(nodes, child)
+        lowerDeclaration(builder, child)
+        child = node.next
+        count += 1
+    }
+}
+
+fn lowerDeclaration(builder: *LirBuilder, node_index: usize) -> usize {
+    const nodes = getNodes(builder)
+    const n = ast_store.get(nodes, node_index)
+    if n.tag == ast.Tag.function_declaration {
+        return lowerFunction(builder, node_index)
+    }
+    // Skip constant/variable declarations at module level for now
+    // (they are type definitions, imports, etc.)
+    return lir.NONE
+}
+
+fn pushBinding(builder: *LirBuilder, name_ptr: [*]const u8, name_len: usize, address: usize, secondary_address: usize) -> void {
+    var b = Binding.{
+        .namePointer = name_ptr,
+        .nameLength = name_len,
+        .address = address,
+        .secondaryAddress = secondary_address,
+    }
+    unsafe {
+        const appended = vector.appendAt(bindingsPointer(builder), @ptrCast([*]const u8, &b))
+    }
+}
+
+fn findSecondaryBinding(builder: *LirBuilder, name_ptr: [*]const u8, name_len: usize) -> usize {
+    var i = builder.*.bindings.*.length
+    while i > 0 {
+        i -= 1
+        unsafe {
+            const ptr = @ptrCast(*Binding, vector.at(builder.*.bindings.*, i))
+            if ptr.*.nameLength == name_len && mem.eql(ptr.*.namePointer, name_ptr, name_len) {
+                return ptr.*.secondaryAddress
+            }
+        }
+    }
+    return lir.NONE
+}
+
+fn findBinding(builder: *LirBuilder, name_ptr: [*]const u8, name_len: usize) -> usize {
+    var i = builder.*.bindings.*.length
+    while i > 0 {
+        i = i - 1
+        unsafe {
+            const ptr = @ptrCast(*Binding, vector.at(builder.*.bindings.*, i))
+            if ptr.*.nameLength == name_len {
+                if mem.eql(ptr.*.namePointer, name_ptr, name_len) {
+                    return ptr.*.address
+                }
+            }
+        }
+    }
+    return lir.NONE
+}
+
+fn lowerFunction(builder: *LirBuilder, node_index: usize) -> usize {
+    const nodes = getNodes(builder)
+    const n = ast_store.get(nodes, node_index)
+
+    // Skip extern declarations
+    // check decl_flags for extern — using endToken's high bits
+    // If function has no body (rhs == NONE), it's extern/prototype
+    if n.rhs == ast.NONE || (n.endToken >> 32) & 16 != 0 { return lir.NONE }
+
+    const name_token = n.mainToken
+    const name_ptr = tokenPointer(builder, name_token)
+    const name_len = tokenLength(builder, name_token)
+    const sym_id = lir.addSymbol(builder.*.lir, name_ptr, name_len)
+
+    // Emit label instruction
+    lir.addInst(builder.*.lir, lir.labelInst(lir.NONE, sym_id))
+
+    // Save bindings state
+    const bindings_len = builder.*.bindings.*.length
+    builder.*.paramCounter = 0
+
+    // Walk parameter list (lhs is first parameter, linked by next)
+    var param_node = n.lhs
+    while param_node != ast.NONE {
+        const p = ast_store.get(nodes, param_node)
+        const p_name_ptr = tokenPointer(builder, p.mainToken)
+        const p_name_len = tokenLength(builder, p.mainToken)
+
+        // Emit param instruction
+        var param_inst = lir.initInst(lir.Opcode.param, lir.NONE)
+        param_inst.arg0 = builder.*.paramCounter
+        const p_val = lir.addInst(builder.*.lir, param_inst)
+
+        // Allocate stack slot for parameter
+        const addr = lir.addInst(builder.*.lir, lir.initInst(lir.Opcode.alloca, lir.NONE))
+
+        // Store parameter value to slot
+        var store_inst = lir.initInst(lir.Opcode.store, lir.NONE)
+        store_inst.arg0 = addr
+        store_inst.arg1 = p_val
+        lir.addInst(builder.*.lir, store_inst)
+
+        pushBinding(builder, p_name_ptr, p_name_len, addr, lir.NONE)
+        builder.*.paramCounter = builder.*.paramCounter + 1
+        param_node = p.next
+    }
+
+    // Lower body
+    if n.rhs != ast.NONE {
+        lowerNode(builder, n.rhs)
+    }
+
+    // Emit implicit return
+    lir.addInst(builder.*.lir, lir.retInst(lir.NONE, lir.NONE))
+
+    // Restore bindings
+    builder.*.bindings.*.length = bindings_len
+    return lir.NONE
+}
+
+fn lowerNode(builder: *LirBuilder, node_index: usize) -> usize {
+    if node_index == ast.NONE { return lir.NONE }
+    const nodes = getNodes(builder)
+    const n = ast_store.get(nodes, node_index)
+
+    if n.tag == ast.Tag.integer_literal {
+        return lowerIntLiteral(builder, n.mainToken)
+    }
+    if n.tag == ast.Tag.boolean_literal {
+        return lowerBoolLiteral(builder, n.mainToken)
+    }
+    if n.tag == ast.Tag.string_literal {
+        return lowerStringLiteral(builder, n.mainToken)
+    }
+    if n.tag == ast.Tag.tuple_literal {
+        return lowerTupleLiteral(builder, node_index)
+    }
+    if n.tag == ast.Tag.identifier {
+        return lowerIdentifier(builder, n.mainToken)
+    }
+    if n.tag == ast.Tag.binary_expression {
+        return lowerBinaryOp(builder, node_index)
+    }
+    if n.tag == ast.Tag.call_expression {
+        return lowerCall(builder, node_index)
+    }
+    if n.tag == ast.Tag.field_expression {
+        return lowerField(builder, node_index)
+    }
+    if n.tag == ast.Tag.return_statement {
+        const val = lowerNode(builder, n.rhs)
+        return lir.addInst(builder.*.lir, lir.retInst(lir.NONE, val))
+    }
+    if n.tag == ast.Tag.block {
+        return lowerBlock(builder, node_index)
+    }
+    if n.tag == ast.Tag.if_statement {
+        return lowerIf(builder, node_index)
+    }
+    if n.tag == ast.Tag.while_statement {
+        return lowerWhile(builder, node_index)
+    }
+    if n.tag == ast.Tag.for_statement {
+        return lowerFor(builder, node_index)
+    }
+    if n.tag == ast.Tag.break_statement {
+        if builder.*.breakTarget != lir.NONE { return lir.addInst(builder.*.lir, lir.branch(builder.*.breakTarget)) }
+        return lir.NONE
+    }
+    if n.tag == ast.Tag.continue_statement {
+        if builder.*.continueTarget != lir.NONE { return lir.addInst(builder.*.lir, lir.branch(builder.*.continueTarget)) }
+        return lir.NONE
+    }
+    if n.tag == ast.Tag.constant_declaration || n.tag == ast.Tag.variable_declaration {
+        return lowerLocalBinding(builder, node_index)
+    }
+    if n.tag == ast.Tag.unsafe_block {
+        return lowerNode(builder, n.lhs)
+    }
+    if n.tag == ast.Tag.comptime_block {
+        return lowerNode(builder, n.lhs)
+    }
+    if n.tag == ast.Tag.unary_expression {
+        return lowerUnary(builder, node_index)
+    }
+    if n.tag == ast.Tag.function_declaration {
+        return lowerFunction(builder, node_index)
+    }
+    return lir.NONE
+}
+
+fn lowerIntLiteral(builder: *LirBuilder, main_token: usize) -> usize {
+    const ptr = tokenPointer(builder, main_token)
+    const len = tokenLength(builder, main_token)
+    var val: usize = 0
+    var i: usize = 0
+    while i < len {
+        if ptr[i] >= 48 && ptr[i] <= 57 {
+            val = val * 10 + @intCast(usize, ptr[i] - 48)
+        }
+        i = i + 1
+    }
+    return lir.addInst(builder.*.lir, lir.constI(lir.NONE, val))
+}
+
+fn lowerBoolLiteral(builder: *LirBuilder, main_token: usize) -> usize {
+    const kind = tokenKind(builder, main_token)
+    const val: usize = if kind == lexer.Kind.keyword_true { 1 } else { 0 }
+    return lir.addInst(builder.*.lir, lir.constI(lir.NONE, val))
+}
+
+fn lowerStringLiteral(builder: *LirBuilder, main_token: usize) -> usize {
+    const ptr = tokenPointer(builder, main_token)
+    const len = tokenLength(builder, main_token)
+    // String tokens include quotes, so actual string is ptr[1..len-1]
+    if len >= 2 {
+        unsafe {
+            const str_ptr = @ptrFromInt([*]const u8, @intFromPtr(ptr) + 1)
+            const str_len = len - 2
+            const lit_id = lir.addStringLiteral(builder.*.lir, str_ptr, str_len)
+            var inst = lir.initInst(lir.Opcode.string_literal, lir.NONE)
+            inst.arg0 = lit_id
+            return lir.addInst(builder.*.lir, inst)
+        }
+    }
+    return lir.NONE
+}
+
+fn lowerTupleLiteral(builder: *LirBuilder, node_index: usize) -> usize {
+    const nodes = getNodes(builder)
+    const node = ast_store.get(nodes, node_index)
+    const start = builder.*.lir.*.extraData.*.length
+    var child = node.lhs
+    var count: usize = 0
+    while child != ast.NONE && count < node.rhs {
+        const child_node = ast_store.get(nodes, child)
+        lir.addExtra(builder.*.lir, lowerNode(builder, child))
+        child = child_node.next
+        count += 1
+    }
+    var inst = lir.initInst(lir.Opcode.tuple_literal, lir.NONE)
+    inst.arg0 = start
+    inst.arg1 = count
+    return lir.addInst(builder.*.lir, inst)
+}
+
+fn lowerIntValue(builder: *LirBuilder, main_token: usize) -> usize {
+    const ptr = tokenPointer(builder, main_token)
+    const len = tokenLength(builder, main_token)
+    var value: usize = 0
+    var index: usize = 0
+    while index < len {
+        if ptr[index] >= 48 && ptr[index] <= 57 { value = value * 10 + @intCast(usize, ptr[index] - 48) }
+        index += 1
+    }
+    return value
+}
+
+fn lowerField(builder: *LirBuilder, node_index: usize) -> usize {
+    const nodes = getNodes(builder)
+    const node = ast_store.get(nodes, node_index)
+    if tokenKind(builder, node.mainToken) != lexer.Kind.integer { return lir.NONE }
+    const field_index = lowerIntValue(builder, node.mainToken)
+    const base_node = ast_store.get(nodes, node.lhs)
+    if base_node.tag == ast.Tag.identifier {
+        const name_pointer = tokenPointer(builder, base_node.mainToken)
+        const name_length = tokenLength(builder, base_node.mainToken)
+        const address = if field_index == 0 { findBinding(builder, name_pointer, name_length) } else { findSecondaryBinding(builder, name_pointer, name_length) }
+        if address == lir.NONE { return lir.NONE }
+        var load = lir.initInst(lir.Opcode.load, lir.NONE)
+        load.arg0 = address
+        return lir.addInst(builder.*.lir, load)
+    }
+    const base = lowerNode(builder, node.lhs)
+    var extract = lir.initInst(lir.Opcode.tuple_element, lir.NONE)
+    extract.arg0 = base
+    extract.arg1 = field_index
+    return lir.addInst(builder.*.lir, extract)
+}
+
+fn lowerIdentifier(builder: *LirBuilder, main_token: usize) -> usize {
+    const name_ptr = tokenPointer(builder, main_token)
+    const name_len = tokenLength(builder, main_token)
+    const addr = findBinding(builder, name_ptr, name_len)
+    if addr != lir.NONE {
+        var inst = lir.initInst(lir.Opcode.load, lir.NONE)
+        inst.arg0 = addr
+        return lir.addInst(builder.*.lir, inst)
+    }
+    // Could be a function reference
+    const found = lir.findSymbol(builder.*.lir, name_ptr, name_len)
+    if found.0 {
+        var inst = lir.initInst(lir.Opcode.func_sym, lir.NONE)
+        inst.arg0 = found.1
+        return lir.addInst(builder.*.lir, inst)
+    }
+    // Might be a forward-reference function; add as symbol
+    const sym_id = lir.addSymbol(builder.*.lir, name_ptr, name_len)
+    var inst = lir.initInst(lir.Opcode.func_sym, lir.NONE)
+    inst.arg0 = sym_id
+    return lir.addInst(builder.*.lir, inst)
+}
+
+fn lowerAddress(builder: *LirBuilder, node_index: usize) -> usize {
+    if node_index == ast.NONE { return lir.NONE }
+    const node = ast_store.get(getNodes(builder), node_index)
+    if node.tag == ast.Tag.identifier {
+        return findBinding(builder, tokenPointer(builder, node.mainToken), tokenLength(builder, node.mainToken))
+    }
+    return lir.NONE
+}
+
+fn assignmentOpcode(kind: lexer.Kind) -> lir.Opcode {
+    if kind == lexer.Kind.minus_equal { return lir.Opcode.sub }
+    if kind == lexer.Kind.asterisk_equal { return lir.Opcode.mul }
+    if kind == lexer.Kind.slash_equal { return lir.Opcode.div }
+    if kind == lexer.Kind.percent_equal { return lir.Opcode.rem }
+    if kind == lexer.Kind.ampersand_equal { return lir.Opcode.bit_and }
+    if kind == lexer.Kind.pipe_equal { return lir.Opcode.bit_or }
+    if kind == lexer.Kind.caret_equal { return lir.Opcode.bit_xor }
+    if kind == lexer.Kind.shift_left_equal { return lir.Opcode.shl }
+    if kind == lexer.Kind.shift_right_equal { return lir.Opcode.shr }
+    return lir.Opcode.add
+}
+
+fn lowerBinaryOp(builder: *LirBuilder, node_index: usize) -> usize {
+    const nodes = getNodes(builder)
+    const n = ast_store.get(nodes, node_index)
+    const kind = tokenKind(builder, n.mainToken)
+    if kind >= lexer.Kind.equal && kind <= lexer.Kind.asterisk_pipe_shift_right_equal {
+        const address = lowerAddress(builder, n.lhs)
+        if address == lir.NONE { return lir.NONE }
+        const rhs_value = lowerNode(builder, n.rhs)
+        var result = rhs_value
+        if kind != lexer.Kind.equal {
+            var load = lir.initInst(lir.Opcode.load, lir.NONE)
+            load.arg0 = address
+            const current = lir.addInst(builder.*.lir, load)
+            result = lir.addInst(builder.*.lir, lir.binary(assignmentOpcode(kind), lir.NONE, current, rhs_value))
+        }
+        var store = lir.initInst(lir.Opcode.store, lir.NONE)
+        store.arg0 = address
+        store.arg1 = result
+        lir.addInst(builder.*.lir, store)
+        return result
+    }
+
+    const lhs_val = lowerNode(builder, n.lhs)
+    const rhs_val = lowerNode(builder, n.rhs)
+    var opcode = lir.Opcode.add
+
+    if kind == lexer.Kind.plus { opcode = lir.Opcode.add }
+    if kind == lexer.Kind.minus { opcode = lir.Opcode.sub }
+    if kind == lexer.Kind.asterisk { opcode = lir.Opcode.mul }
+    if kind == lexer.Kind.slash { opcode = lir.Opcode.div }
+    if kind == lexer.Kind.percent { opcode = lir.Opcode.rem }
+    if kind == lexer.Kind.ampersand { opcode = lir.Opcode.bit_and }
+    if kind == lexer.Kind.pipe { opcode = lir.Opcode.bit_or }
+    if kind == lexer.Kind.caret { opcode = lir.Opcode.bit_xor }
+    if kind == lexer.Kind.shift_left { opcode = lir.Opcode.shl }
+    if kind == lexer.Kind.shift_right { opcode = lir.Opcode.shr }
+
+    // Comparison operators produce icmp
+    if kind == lexer.Kind.equal_equal || kind == lexer.Kind.bang_equal ||
+       kind == lexer.Kind.less || kind == lexer.Kind.less_equal ||
+       kind == lexer.Kind.greater || kind == lexer.Kind.greater_equal {
+        var pred: usize = 0
+        if kind == lexer.Kind.equal_equal { pred = @intCast(usize, @intFromEnum(lir.CmpPredicate.eq)) }
+        if kind == lexer.Kind.bang_equal { pred = @intCast(usize, @intFromEnum(lir.CmpPredicate.ne)) }
+        if kind == lexer.Kind.less { pred = @intCast(usize, @intFromEnum(lir.CmpPredicate.lt)) }
+        if kind == lexer.Kind.less_equal { pred = @intCast(usize, @intFromEnum(lir.CmpPredicate.le)) }
+        if kind == lexer.Kind.greater { pred = @intCast(usize, @intFromEnum(lir.CmpPredicate.gt)) }
+        if kind == lexer.Kind.greater_equal { pred = @intCast(usize, @intFromEnum(lir.CmpPredicate.ge)) }
+        var inst = lir.initInst(lir.Opcode.icmp, lir.NONE)
+        inst.arg0 = pred
+        inst.arg1 = lhs_val
+        inst.arg2 = rhs_val
+        return lir.addInst(builder.*.lir, inst)
+    }
+
+    return lir.addInst(builder.*.lir, lir.binary(opcode, lir.NONE, lhs_val, rhs_val))
+}
+
+fn lowerCall(builder: *LirBuilder, node_index: usize) -> usize {
+    const nodes = getNodes(builder)
+    const n = ast_store.get(nodes, node_index)
+
+    // Lower arguments first, collect in extra data
+    var child = n.rhs
+    var arg_count: usize = 0
+    const args_start = builder.*.lir.*.extraData.*.length
+    while child != ast.NONE {
+        const cn = ast_store.get(nodes, child)
+        const arg_val = lowerNode(builder, child)
+        lir.addExtra(builder.*.lir, arg_val)
+        arg_count = arg_count + 1
+        child = cn.next
+    }
+
+    // Lower callee
+    const func_val = lowerNode(builder, n.lhs)
+    return lir.addInst(builder.*.lir, lir.callInst(lir.NONE, func_val, args_start, arg_count))
+}
+
+fn lowerBlock(builder: *LirBuilder, node_index: usize) -> usize {
+    const nodes = getNodes(builder)
+    const n = ast_store.get(nodes, node_index)
+    var child = n.lhs
+    var last_val = lir.NONE
+    while child != ast.NONE {
+        const cn = ast_store.get(nodes, child)
+        last_val = lowerNode(builder, child)
+        child = cn.next
+    }
+    return last_val
+}
+
+fn lowerIf(builder: *LirBuilder, node_index: usize) -> usize {
+    const nodes = getNodes(builder)
+    const n = ast_store.get(nodes, node_index)
+
+    const cond = lowerNode(builder, n.lhs)
+    const then_block = builder.*.blockCounter
+    builder.*.blockCounter += 1
+    const else_block = builder.*.blockCounter
+    builder.*.blockCounter += 1
+    const end_block = builder.*.blockCounter
+    builder.*.blockCounter += 1
+
+    lir.addInst(builder.*.lir, lir.condBranch(cond, then_block, else_block))
+
+    // Then block
+    lir.addInst(builder.*.lir, lir.blockLabelInst(then_block))
+    lowerNode(builder, n.rhs)
+    lir.addInst(builder.*.lir, lir.branch(end_block))
+
+    // Else block
+    lir.addInst(builder.*.lir, lir.blockLabelInst(else_block))
+    if n.extra != ast.NONE {
+        lowerNode(builder, n.extra)
+    }
+    lir.addInst(builder.*.lir, lir.branch(end_block))
+
+    // End block
+    lir.addInst(builder.*.lir, lir.blockLabelInst(end_block))
+    return lir.NONE
+}
+
+fn lowerWhile(builder: *LirBuilder, node_index: usize) -> usize {
+    const nodes = getNodes(builder)
+    const n = ast_store.get(nodes, node_index)
+
+    const header_block = builder.*.blockCounter
+    builder.*.blockCounter += 1
+    const body_block = builder.*.blockCounter
+    builder.*.blockCounter += 1
+    const update_block = builder.*.blockCounter
+    builder.*.blockCounter += 1
+    const end_block = builder.*.blockCounter
+    builder.*.blockCounter += 1
+
+    lir.addInst(builder.*.lir, lir.branch(header_block))
+
+    // Header
+    lir.addInst(builder.*.lir, lir.blockLabelInst(header_block))
+    const cond = lowerNode(builder, n.lhs)
+    lir.addInst(builder.*.lir, lir.condBranch(cond, body_block, end_block))
+
+    // Body
+    lir.addInst(builder.*.lir, lir.blockLabelInst(body_block))
+    const saved_break_target = builder.*.breakTarget
+    const saved_continue_target = builder.*.continueTarget
+    builder.*.breakTarget = end_block
+    builder.*.continueTarget = update_block
+    lowerNode(builder, n.rhs)
+    builder.*.breakTarget = saved_break_target
+    builder.*.continueTarget = saved_continue_target
+    lir.addInst(builder.*.lir, lir.branch(update_block))
+
+    // Update
+    lir.addInst(builder.*.lir, lir.blockLabelInst(update_block))
+    if n.extra != ast.NONE { lowerNode(builder, n.extra) }
+    lir.addInst(builder.*.lir, lir.branch(header_block))
+
+    // End
+    lir.addInst(builder.*.lir, lir.blockLabelInst(end_block))
+    return lir.NONE
+}
+
+fn lowerFor(builder: *LirBuilder, node_index: usize) -> usize {
+    const nodes = getNodes(builder)
+    const n = ast_store.get(nodes, node_index)
+    const iterable = ast_store.get(nodes, n.lhs)
+    if iterable.tag != ast.Tag.range_expression { return lir.NONE }
+
+    const bindings_length = builder.*.bindings.*.length
+    const initial_value = lowerNode(builder, iterable.lhs)
+    const capture_address = lir.addInst(builder.*.lir, lir.initInst(lir.Opcode.alloca, lir.NONE))
+    var capture_store = lir.initInst(lir.Opcode.store, lir.NONE)
+    capture_store.arg0 = capture_address
+    capture_store.arg1 = initial_value
+    lir.addInst(builder.*.lir, capture_store)
+
+    const capture = ast_store.get(nodes, n.extra)
+    pushBinding(builder, tokenPointer(builder, capture.mainToken), tokenLength(builder, capture.mainToken), capture_address, lir.NONE)
+
+    var index_address = lir.NONE
+    if capture.endToken != ast.NONE {
+        const zero = lir.addInst(builder.*.lir, lir.constI(lir.NONE, 0))
+        index_address = lir.addInst(builder.*.lir, lir.initInst(lir.Opcode.alloca, lir.NONE))
+        var index_store = lir.initInst(lir.Opcode.store, lir.NONE)
+        index_store.arg0 = index_address
+        index_store.arg1 = zero
+        lir.addInst(builder.*.lir, index_store)
+        pushBinding(builder, tokenPointer(builder, capture.endToken), tokenLength(builder, capture.endToken), index_address, lir.NONE)
+    }
+
+    const header_block = builder.*.blockCounter
+    builder.*.blockCounter += 1
+    const body_block = builder.*.blockCounter
+    builder.*.blockCounter += 1
+    const update_block = builder.*.blockCounter
+    builder.*.blockCounter += 1
+    const end_block = builder.*.blockCounter
+    builder.*.blockCounter += 1
+
+    lir.addInst(builder.*.lir, lir.branch(header_block))
+    lir.addInst(builder.*.lir, lir.blockLabelInst(header_block))
+    var capture_load = lir.initInst(lir.Opcode.load, lir.NONE)
+    capture_load.arg0 = capture_address
+    const capture_value = lir.addInst(builder.*.lir, capture_load)
+    const upper_value = lowerNode(builder, iterable.rhs)
+    var comparison = lir.initInst(lir.Opcode.icmp, lir.NONE)
+    comparison.arg0 = @intCast(usize, @intFromEnum(lir.CmpPredicate.lt))
+    comparison.arg1 = capture_value
+    comparison.arg2 = upper_value
+    const condition = lir.addInst(builder.*.lir, comparison)
+    lir.addInst(builder.*.lir, lir.condBranch(condition, body_block, end_block))
+
+    lir.addInst(builder.*.lir, lir.blockLabelInst(body_block))
+    const saved_break_target = builder.*.breakTarget
+    const saved_continue_target = builder.*.continueTarget
+    builder.*.breakTarget = end_block
+    builder.*.continueTarget = update_block
+    lowerNode(builder, n.rhs)
+    builder.*.breakTarget = saved_break_target
+    builder.*.continueTarget = saved_continue_target
+    lir.addInst(builder.*.lir, lir.branch(update_block))
+
+    lir.addInst(builder.*.lir, lir.blockLabelInst(update_block))
+    capture_load = lir.initInst(lir.Opcode.load, lir.NONE)
+    capture_load.arg0 = capture_address
+    const current_value = lir.addInst(builder.*.lir, capture_load)
+    const one = lir.addInst(builder.*.lir, lir.constI(lir.NONE, 1))
+    const next_value = lir.addInst(builder.*.lir, lir.binary(lir.Opcode.add, lir.NONE, current_value, one))
+    capture_store = lir.initInst(lir.Opcode.store, lir.NONE)
+    capture_store.arg0 = capture_address
+    capture_store.arg1 = next_value
+    lir.addInst(builder.*.lir, capture_store)
+    if index_address != lir.NONE {
+        var index_load = lir.initInst(lir.Opcode.load, lir.NONE)
+        index_load.arg0 = index_address
+        const current_index = lir.addInst(builder.*.lir, index_load)
+        const next_index = lir.addInst(builder.*.lir, lir.binary(lir.Opcode.add, lir.NONE, current_index, one))
+        var index_store = lir.initInst(lir.Opcode.store, lir.NONE)
+        index_store.arg0 = index_address
+        index_store.arg1 = next_index
+        lir.addInst(builder.*.lir, index_store)
+    }
+    lir.addInst(builder.*.lir, lir.branch(header_block))
+
+    lir.addInst(builder.*.lir, lir.blockLabelInst(end_block))
+    builder.*.bindings.*.length = bindings_length
+    return lir.NONE
+}
+
+fn lowerLocalBinding(builder: *LirBuilder, node_index: usize) -> usize {
+    const nodes = getNodes(builder)
+    const n = ast_store.get(nodes, node_index)
+    if n.rhs == ast.NONE { return lir.NONE }
+
+    // Evaluate initializer
+    const init_val = lowerNode(builder, n.rhs)
+
+    // Allocate local
+    const addr = lir.addInst(builder.*.lir, lir.initInst(lir.Opcode.alloca, lir.NONE))
+
+    const name_ptr = tokenPointer(builder, n.mainToken)
+    const name_len = tokenLength(builder, n.mainToken)
+
+    // Keep the second register component alongside the primary value. Scalar
+    // expressions simply contribute zero when that component is never used.
+    const secondary_addr = lir.addInst(builder.*.lir, lir.initInst(lir.Opcode.alloca, lir.NONE))
+    var secondary_extract = lir.initInst(lir.Opcode.tuple_element, lir.NONE)
+    secondary_extract.arg0 = init_val
+    secondary_extract.arg1 = 1
+    const secondary_value = lir.addInst(builder.*.lir, secondary_extract)
+    var secondary_store = lir.initInst(lir.Opcode.store, lir.NONE)
+    secondary_store.arg0 = secondary_addr
+    secondary_store.arg1 = secondary_value
+    lir.addInst(builder.*.lir, secondary_store)
+
+    pushBinding(builder, name_ptr, name_len, addr, secondary_addr)
+
+    var store_inst = lir.initInst(lir.Opcode.store, lir.NONE)
+    store_inst.arg0 = addr
+    store_inst.arg1 = init_val
+    lir.addInst(builder.*.lir, store_inst)
+
+    return lir.NONE
+}
+
+fn lowerUnary(builder: *LirBuilder, node_index: usize) -> usize {
+    const nodes = getNodes(builder)
+    const n = ast_store.get(nodes, node_index)
+    const kind = tokenKind(builder, n.mainToken)
+    const operand = lowerNode(builder, n.lhs)
+
+    if kind == lexer.Kind.minus {
+        // Negate: 0 - operand
+        const zero = lir.addInst(builder.*.lir, lir.constI(lir.NONE, 0))
+        return lir.addInst(builder.*.lir, lir.binary(lir.Opcode.sub, lir.NONE, zero, operand))
+    }
+    if kind == lexer.Kind.bang {
+        // Logical not: compare with 0
+        var inst = lir.initInst(lir.Opcode.icmp, lir.NONE)
+        inst.arg0 = @intCast(usize, @intFromEnum(lir.CmpPredicate.eq))
+        inst.arg1 = operand
+        const zero = lir.addInst(builder.*.lir, lir.constI(lir.NONE, 0))
+        inst.arg2 = zero
+        return lir.addInst(builder.*.lir, inst)
+    }
+    if kind == lexer.Kind.tilde {
+        // Bitwise not: xor with all ones
+        const all_ones = lir.addInst(builder.*.lir, lir.constI(lir.NONE, 18446744073709551615))
+        return lir.addInst(builder.*.lir, lir.binary(lir.Opcode.bit_xor, lir.NONE, operand, all_ones))
+    }
+    return operand
+}
