@@ -15,9 +15,13 @@ Implemented Stage-1 compiler-core std:
 - `array_list.mlx`: growing byte list used for source and output buffers.
 - `vector.mlx`: type-erased growing storage for Mlx1 token and AST records.
 - `hash_map.mlx`: growing `String -> usize` map for compiler symbol tables.
-- `fmt.mlx`: allocation-free unsigned decimal and hexadecimal formatting primitives.
+- `fmt/` and `fmt.mlx`: allocation-free integer conversion plus a typed,
+  fallible format writer for strings, booleans, characters, pointers and
+  signed/unsigned integers. The bootstrap argument adapter keeps the runtime
+  independent of unfinished generic reflection.
 - `fs.mlx` and `io.mlx`: raw file operations, slice reads/writes, complete writes,
-  standard streams, direct string/line output, and allocation-free integer output.
+  standard streams, direct string/line output, allocation-free integer output,
+  and formatted stdout/stderr output.
 - `process.mlx`: Linux process arguments exposed as borrowed bootstrap strings.
 - `elf.mlx`: complete in-memory and on-disk ELF64 executable emission.
 - `root.mlx`: stable facade exporting the complete bootstrap layer.
