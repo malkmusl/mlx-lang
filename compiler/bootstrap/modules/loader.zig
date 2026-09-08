@@ -72,7 +72,6 @@ pub const Loader = struct {
         return self.loadCanonical(canonical, null, 0, text);
     }
 
-
     pub fn get(self: *Loader, id: resolver.ModuleId) *LoadedModule {
         return &self.modules.items[id];
     }

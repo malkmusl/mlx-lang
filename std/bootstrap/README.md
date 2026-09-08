@@ -16,7 +16,8 @@ Implemented Stage-1 compiler-core std:
 - `vector.mlx`: type-erased growing storage for Mlx1 token and AST records.
 - `hash_map.mlx`: growing `String -> usize` map for compiler symbol tables.
 - `fmt.mlx`: allocation-free unsigned decimal and hexadecimal formatting primitives.
-- `fs.mlx` and `io.mlx`: raw file operations, complete reads/writes, and standard streams.
+- `fs.mlx` and `io.mlx`: raw file operations, slice reads/writes, complete writes,
+  standard streams, direct string/line output, and allocation-free integer output.
 - `process.mlx`: Linux process arguments exposed as borrowed bootstrap strings.
 - `elf.mlx`: complete in-memory and on-disk ELF64 executable emission.
 - `root.mlx`: stable facade exporting the complete bootstrap layer.

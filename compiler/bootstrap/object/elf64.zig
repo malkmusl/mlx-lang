@@ -109,16 +109,10 @@ pub fn buildExecutable(
     entry_symbol: []const u8,
     rodata: []const u8,
 ) ![]u8 {
-    std.debug.print("[elf64] building ELF64 binary\n", .{});
-
     const entry_code_offset = encoder.symbols.get(entry_symbol) orelse {
-        std.debug.print("[elf64] ERROR: entry symbol '{s}' not found\n", .{entry_symbol});
         return error.EntrySymbolNotFound;
     };
     const entry_vaddr: u64 = TEXT_VADDR + entry_code_offset;
-    std.debug.print("[elf64] entry '{s}' @ code+0x{x} → vaddr 0x{x}\n", .{
-        entry_symbol, entry_code_offset, entry_vaddr,
-    });
 
     const code = encoder.buf.items;
     const code_size: u64 = code.len;
@@ -292,7 +286,6 @@ pub fn buildExecutable(
         @memcpy(out[off .. off + shdr_bytes.len], shdr_bytes);
     }
 
-    std.debug.print("[elf64] built {d} bytes, entry=0x{x}\n", .{ total_size, entry_vaddr });
     return out;
 }
 
@@ -307,7 +300,6 @@ pub fn writeExecutable(
 ) !void {
     const bytes = try buildExecutable(allocator, encoder, entry_symbol, rodata);
     defer allocator.free(bytes);
-    std.debug.print("[elf64] writing {d} bytes to '{s}'\n", .{ bytes.len, out_path });
     try std.Io.Dir.writeFile(.cwd(), io, .{
         .sub_path = out_path,
         .data = bytes,
@@ -316,7 +308,6 @@ pub fn writeExecutable(
     const path_z = try std.mem.concatWithSentinel(allocator, u8, &.{out_path}, 0);
     defer allocator.free(path_z);
     _ = std.os.linux.chmod(path_z, 0o755);
-    std.debug.print("[elf64] done\n", .{});
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

@@ -10,6 +10,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("compiler/bootstrap/main.zig"),
             .target = target,
             .optimize = optimize,
+            .strip = optimize != .Debug,
         }),
     });
 
@@ -21,6 +22,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("compiler/bootstrap/lsp.zig"),
             .target = target,
             .optimize = optimize,
+            .strip = optimize != .Debug,
         }),
     });
     b.installArtifact(lsp);

@@ -38,4 +38,5 @@ send({
 setTimeout(() => {
     send({ jsonrpc: "2.0", id: 3, method: "shutdown", params: null });
     send({ jsonrpc: "2.0", method: "exit", params: null });
+    server.stdin.end();
 }, 100);

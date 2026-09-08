@@ -2,6 +2,26 @@ const std = @import("std");
 const sm = @import("source/source_manager.zig");
 const diag = @import("source/diagnostics.zig");
 
+fn progress(enabled: bool, current: usize, total: usize, message: []const u8) void {
+    if (!enabled) return;
+    std.debug.print("[mlx0 {d}/{d}] {s}\n", .{ current, total, message });
+}
+
+fn traceValue(enabled: bool, label: []const u8, value: usize) void {
+    if (!enabled) return;
+    std.debug.print("[mlx0 trace] {s}{d}\n", .{ label, value });
+}
+
+fn traceHex(enabled: bool, label: []const u8, value: usize) void {
+    if (!enabled) return;
+    std.debug.print("[mlx0 trace] {s}0x{x}\n", .{ label, value });
+}
+
+fn traceText(enabled: bool, label: []const u8, value: []const u8) void {
+    if (!enabled) return;
+    std.debug.print("[mlx0 trace] {s}{s}\n", .{ label, value });
+}
+
 pub fn main(init: std.process.Init) !u8 {
     const allocator = init.gpa;
     const io = init.io;
@@ -9,13 +29,11 @@ pub fn main(init: std.process.Init) !u8 {
     var stdout_file_writer: std.Io.File.Writer = .init(.stdout(), io, &stdout_buffer);
     const out = &stdout_file_writer.interface;
 
-    std.debug.print("mlx0 bootstrap compiler\n", .{});
-
     const args = try init.minimal.args.toSlice(allocator);
     defer allocator.free(args);
 
     if (args.len < 2) {
-        std.debug.print("Usage: mlx0 <source.mlx> [--emit=asm]\n", .{});
+        std.debug.print("Usage: mlx0 <source.mlx> [-o output] [--progress|--quiet] [--trace|--verbose] [--emit=asm]\n", .{});
         return 1;
     }
     const path = args[1];
@@ -23,6 +41,8 @@ pub fn main(init: std.process.Init) !u8 {
     // Parse flags
     var emit_asm = false;
     var verbose = false;
+    var trace_enabled = false;
+    var show_progress = true;
     var dump_ast = false;
     var out_path: []const u8 = "out";
     var i: usize = 2;
@@ -32,6 +52,13 @@ pub fn main(init: std.process.Init) !u8 {
             emit_asm = true;
         } else if (std.mem.eql(u8, arg, "--verbose")) {
             verbose = true;
+            trace_enabled = true;
+        } else if (std.mem.eql(u8, arg, "--trace")) {
+            trace_enabled = true;
+        } else if (std.mem.eql(u8, arg, "--progress")) {
+            show_progress = true;
+        } else if (std.mem.eql(u8, arg, "--quiet")) {
+            show_progress = false;
         } else if (std.mem.eql(u8, arg, "--dump-ast")) {
             dump_ast = true;
         } else if (std.mem.startsWith(u8, arg, "-o")) {
@@ -43,6 +70,9 @@ pub fn main(init: std.process.Init) !u8 {
             }
         }
     }
+    const progress_steps: usize = if (dump_ast) 1 else if (emit_asm) 5 else 7;
+    traceText(trace_enabled, "input: ", path);
+    traceText(trace_enabled, "output: ", out_path);
 
     var source_manager = sm.SourceManager.init(allocator);
     defer source_manager.deinit();
@@ -51,6 +81,7 @@ pub fn main(init: std.process.Init) !u8 {
     defer engine.deinit();
 
     // Stages 1-4: recursively load, lex and parse the complete module graph.
+    progress(show_progress, 1, progress_steps, "load and parse module graph");
     const modules = @import("modules/root.zig");
     var module_loader = modules.loader.Loader.init(allocator, io, &source_manager, &engine, .{ .std_root = "std/src" });
     defer module_loader.deinit();
@@ -59,12 +90,21 @@ pub fn main(init: std.process.Init) !u8 {
         engine.renderDebug();
         return 1;
     };
+    traceValue(trace_enabled, "source files: ", source_manager.files.items.len);
+    traceValue(trace_enabled, "modules: ", module_loader.modules.items.len);
+    if (trace_enabled) {
+        for (module_loader.graph.modules.items, 0..) |module, module_index| {
+            const display_path = if (module_index == @as(usize, @intCast(root_module_id))) path else module.path;
+            std.debug.print("[mlx0 trace] module[{d}]: {s}\n", .{ module_index, display_path });
+        }
+    }
     const root_module = module_loader.get(root_module_id);
     if (root_module.ast == null) {
         engine.renderDebug();
         return 1;
     }
     const ast = root_module.ast.?;
+    traceValue(trace_enabled, "root AST nodes: ", ast.nodes.len);
 
     if (dump_ast) {
         ast.dump(source_manager.files.items[root_module.source_id].content, out) catch {};
@@ -115,6 +155,7 @@ pub fn main(init: std.process.Init) !u8 {
             remaining_modules += 1;
         }
     }
+    progress(show_progress, 2, progress_steps, "analyze imported modules");
     while (remaining_modules > 0) {
         var made_progress = false;
         var module_index: usize = 1;
@@ -169,6 +210,7 @@ pub fn main(init: std.process.Init) !u8 {
     var sema = sema_mod.Sema.init(allocator, ast, root_module.source_id, &engine, &type_pool, &root_scope);
     defer sema.deinit();
     sema.configureModules(root_module_id, &root_module.imports, &module_registry);
+    progress(show_progress, 3, progress_steps, "analyze root module");
     sema.analyze() catch |err| {
         std.debug.print("Sema failed: {}\n", .{err});
         return 1;
@@ -182,6 +224,7 @@ pub fn main(init: std.process.Init) !u8 {
     }
 
     // Stage 9: LIR
+    progress(show_progress, 4, progress_steps, "lower typed AST to LIR");
     const lir_gen_mod = @import("ir/lower.zig");
     var lir_builder = lir_gen_mod.LirBuilder.init(allocator, &sema, verbose);
     defer lir_builder.deinit();
@@ -198,8 +241,10 @@ pub fn main(init: std.process.Init) !u8 {
     if (verbose) {
         lir_builder.printLir();
     }
-
-    std.debug.print("AST has {d} nodes\n", .{ast.nodes.len});
+    var lir_instruction_count: usize = 0;
+    for (lir_builder.lir.blocks.items) |block| lir_instruction_count += block.insts.items.len;
+    traceValue(trace_enabled, "LIR blocks: ", lir_builder.lir.blocks.items.len);
+    traceValue(trace_enabled, "LIR instructions: ", lir_instruction_count);
 
     var x86_gen = @import("backend/x86_64/codegen.zig").X86Gen.init(
         allocator,
@@ -211,12 +256,12 @@ pub fn main(init: std.process.Init) !u8 {
 
     if (emit_asm) {
         // ── Stage 10: NASM text output (legacy / debug) ──────────────────────
-        std.debug.print("[mlx0] --emit=asm: writing NASM text\n", .{});
+        progress(show_progress, 5, progress_steps, "write NASM text");
         try x86_gen.generate(out);
         try stdout_file_writer.flush();
     } else {
         // ── Stage 12: Binary ELF64 output ────────────────────────────────────
-        std.debug.print("[mlx0] emitting ELF64 binary → '{s}'\n", .{out_path});
+        progress(show_progress, 5, progress_steps, "generate x86_64 machine code");
         var enc = @import("backend/x86_64/encoder.zig").Encoder.init(allocator, verbose);
         defer enc.deinit();
 
@@ -234,8 +279,10 @@ pub fn main(init: std.process.Init) !u8 {
         const text_size: u64 = @as(u64, @intCast(enc.buf.items.len));
         const rodata_file_off: u64 = elf64_mod.alignUp(0x1000 + text_size, 0x1000);
         const rodata_vaddr: u64 = 0x401000 + (rodata_file_off - 0x1000);
-        std.debug.print("[mlx0] rodata_vaddr = 0x{x} (text_size={d})\n", .{ rodata_vaddr, text_size });
+        traceValue(trace_enabled, "first-pass text bytes: ", @intCast(text_size));
+        traceHex(trace_enabled, "rodata virtual address: ", @intCast(rodata_vaddr));
 
+        progress(show_progress, 6, progress_steps, "finalize layout and backend fixups");
         if (x86_gen.rodata.items.len > 0) {
             // Phase 2: set rodata_vaddr and regenerate with correct string addresses.
             x86_gen.rodata_vaddr = rodata_vaddr;
@@ -260,17 +307,18 @@ pub fn main(init: std.process.Init) !u8 {
                 return 1;
             };
         }
+        traceValue(trace_enabled, "final text bytes: ", enc.buf.items.len);
+        traceValue(trace_enabled, "rodata bytes: ", x86_gen.rodata.items.len);
 
         // writeExecutable with rodata slice
+        progress(show_progress, 7, progress_steps, "write ELF64 executable");
         elf64_mod.writeExecutable(allocator, io, &enc, "_start", out_path, x86_gen.rodata.items) catch |err| {
             std.debug.print("ELF64 write failed: {}\n", .{err});
             return 1;
         };
-        std.debug.print("[mlx0] wrote '{s}' — done.\n", .{out_path});
     }
 
     try stdout_file_writer.flush();
-    std.debug.print("Done.\n", .{});
     return 0;
 }
 

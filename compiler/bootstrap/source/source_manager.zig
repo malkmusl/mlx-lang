@@ -47,10 +47,10 @@ pub const SourceManager = struct {
 
     pub fn addFile(self: *SourceManager, path: []const u8, content: []const u8) !FileId {
         const id: FileId = @intCast(self.files.items.len);
-        
+
         var line_offsets = std.ArrayList(u32).empty;
         try line_offsets.append(self.allocator, 0);
-        
+
         for (content, 0..) |byte, i| {
             if (byte == '\n') {
                 try line_offsets.append(self.allocator, @intCast(i + 1));
@@ -77,7 +77,7 @@ pub const SourceManager = struct {
 
     pub fn getLineCol(self: *const SourceManager, file_id: FileId, offset: u32) ?SourceLocation {
         const file = self.getFile(file_id) orelse return null;
-        
+
         // Binary search for the line
         const offsets = file.line_offsets.items;
         var low: usize = 0;
@@ -110,7 +110,7 @@ test "SourceManager" {
     defer sm.deinit();
 
     const file_id = try sm.addFile("test.mlx", "const a = 1;\nconst b = 2;\n");
-    
+
     const loc1 = sm.getLineCol(file_id, 0).?;
     try std.testing.expectEqual(@as(u32, 1), loc1.line);
     try std.testing.expectEqual(@as(u32, 1), loc1.column);

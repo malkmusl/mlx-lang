@@ -108,8 +108,7 @@ pub inline fn syscall0(nr: usize) SyscallResult {
     return asm volatile ("syscall"
         : [ret] "={rax}" (-> SyscallResult),
         : [nr] "{rax}" (nr),
-        : .{ .rcx = true, .r11 = true, .memory = true }
-    );
+        : .{ .rcx = true, .r11 = true, .memory = true });
 }
 
 pub inline fn syscall1(nr: usize, a1: usize) SyscallResult {
@@ -117,8 +116,7 @@ pub inline fn syscall1(nr: usize, a1: usize) SyscallResult {
         : [ret] "={rax}" (-> SyscallResult),
         : [nr] "{rax}" (nr),
           [a1] "{rdi}" (a1),
-        : .{ .rcx = true, .r11 = true, .memory = true }
-    );
+        : .{ .rcx = true, .r11 = true, .memory = true });
 }
 
 pub inline fn syscall2(nr: usize, a1: usize, a2: usize) SyscallResult {
@@ -127,8 +125,7 @@ pub inline fn syscall2(nr: usize, a1: usize, a2: usize) SyscallResult {
         : [nr] "{rax}" (nr),
           [a1] "{rdi}" (a1),
           [a2] "{rsi}" (a2),
-        : .{ .rcx = true, .r11 = true, .memory = true }
-    );
+        : .{ .rcx = true, .r11 = true, .memory = true });
 }
 
 pub inline fn syscall3(nr: usize, a1: usize, a2: usize, a3: usize) SyscallResult {
@@ -138,8 +135,7 @@ pub inline fn syscall3(nr: usize, a1: usize, a2: usize, a3: usize) SyscallResult
           [a1] "{rdi}" (a1),
           [a2] "{rsi}" (a2),
           [a3] "{rdx}" (a3),
-        : .{ .rcx = true, .r11 = true, .memory = true }
-    );
+        : .{ .rcx = true, .r11 = true, .memory = true });
 }
 
 pub inline fn syscall4(nr: usize, a1: usize, a2: usize, a3: usize, a4: usize) SyscallResult {
@@ -150,8 +146,7 @@ pub inline fn syscall4(nr: usize, a1: usize, a2: usize, a3: usize, a4: usize) Sy
           [a2] "{rsi}" (a2),
           [a3] "{rdx}" (a3),
           [a4] "{r10}" (a4),
-        : .{ .rcx = true, .r11 = true, .memory = true }
-    );
+        : .{ .rcx = true, .r11 = true, .memory = true });
 }
 
 pub inline fn syscall5(nr: usize, a1: usize, a2: usize, a3: usize, a4: usize, a5: usize) SyscallResult {
@@ -163,8 +158,7 @@ pub inline fn syscall5(nr: usize, a1: usize, a2: usize, a3: usize, a4: usize, a5
           [a3] "{rdx}" (a3),
           [a4] "{r10}" (a4),
           [a5] "{r8}" (a5),
-        : .{ .rcx = true, .r11 = true, .memory = true }
-    );
+        : .{ .rcx = true, .r11 = true, .memory = true });
 }
 
 pub inline fn syscall6(nr: usize, a1: usize, a2: usize, a3: usize, a4: usize, a5: usize, a6: usize) SyscallResult {
@@ -177,8 +171,7 @@ pub inline fn syscall6(nr: usize, a1: usize, a2: usize, a3: usize, a4: usize, a5
           [a4] "{r10}" (a4),
           [a5] "{r8}" (a5),
           [a6] "{r9}" (a6),
-        : .{ .rcx = true, .r11 = true, .memory = true }
-    );
+        : .{ .rcx = true, .r11 = true, .memory = true });
 }
 
 test "syscall getpid" {

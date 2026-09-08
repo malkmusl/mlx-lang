@@ -52,7 +52,7 @@ pub fn AstDumperType(comptime WriterType: type) type {
 
             try self.printIndent(indent);
             try self.writer.print("{s}", .{@tagName(tag)});
-            
+
             // Print main token if it's meaningful for the node type
             switch (tag) {
                 .identifier, .integer_literal, .float_literal, .string_literal, .char_literal, .binary_op, .unary_op => {
@@ -147,7 +147,7 @@ pub fn AstDumperType(comptime WriterType: type) type {
                     try self.printIndent(child_indent);
                     try self.writer.print("callee:\n", .{});
                     try self.dumpNode(data.lhs, child_indent + 1);
-                    
+
                     const arg_count = self.tree.extra_data[data.rhs];
                     if (arg_count > 0) {
                         try self.printIndent(child_indent);
@@ -178,11 +178,11 @@ pub fn AstDumperType(comptime WriterType: type) type {
                     try self.printIndent(child_indent);
                     try self.writer.print("condition:\n", .{});
                     try self.dumpNode(cond, child_indent + 1);
-                    
+
                     try self.printIndent(child_indent);
                     try self.writer.print("then:\n", .{});
                     try self.dumpNode(then_blk, child_indent + 1);
-                    
+
                     if (data.rhs > data.lhs + 2) {
                         const else_blk = self.tree.extra_data[data.lhs + 2];
                         try self.printIndent(child_indent);
@@ -196,7 +196,7 @@ pub fn AstDumperType(comptime WriterType: type) type {
                     try self.printIndent(child_indent);
                     try self.writer.print("condition:\n", .{});
                     try self.dumpNode(cond, child_indent + 1);
-                    
+
                     try self.printIndent(child_indent);
                     try self.writer.print("body:\n", .{});
                     try self.dumpNode(body, child_indent + 1);
@@ -252,7 +252,7 @@ pub fn AstDumperType(comptime WriterType: type) type {
                     try self.writer.print("lhs: {d}\n", .{data.lhs});
                     try self.printIndent(child_indent);
                     try self.writer.print("rhs: {d}\n", .{data.rhs});
-                }
+                },
             }
         }
     };

@@ -103,7 +103,7 @@ const Document = struct {
 
         const path = uriToPath(self.uri);
         self.module_loader = modules.loader.Loader.init(self.allocator, self.io, &self.sources, &self.engine, .{ .std_root = "std/src" });
-        
+
         const root_module_id = self.module_loader.?.loadRootMemory(path, self.text) catch {
             return;
         };
@@ -504,15 +504,15 @@ fn findNodeByOffset(ast: Ast, offset: usize) ?Node.Index {
     for (ast.nodes.items(.main_token), 0..) |token_index, node_index| {
         if (token_index >= ast.tokens.len) continue;
         const token = ast.tokens[token_index];
-        
+
         var is_match = if (offset == token.end)
             token.start < token.end
         else
             (token.start <= offset and offset < token.end);
-            
+
         const tag = ast.nodes.items(.tag)[node_index];
         const data = ast.nodes.items(.data)[node_index];
-        
+
         if (!is_match and (tag == .const_decl or tag == .var_decl or tag == .param_decl)) {
             const decl_tok_idx = data.lhs;
             if (decl_tok_idx < ast.tokens.len) {
@@ -633,24 +633,28 @@ fn send(writer: *std.Io.Writer, body: []const u8) !void {
 fn semanticTokensFull(server: *Server, id: []const u8, params: std.json.Value) ![]u8 {
     const document = documentForParams(server, params) orelse return response(server.allocator, id, "null");
     const ast = document.ast orelse return response(server.allocator, id, "null");
-    
+
     var token_types = try server.allocator.alloc(?u32, ast.tokens.len);
     defer server.allocator.free(token_types);
     @memset(token_types, null);
-    
+
     for (ast.tokens, 0..) |token, i| {
         token_types[i] = determineSemanticTokenType(token.tag);
     }
-    
+
     for (ast.nodes.items(.tag), ast.nodes.items(.data), 0..) |tag, data, i| {
         switch (tag) {
             .fn_decl => {
                 const name_tok = ast.nodes.items(.main_token)[data.lhs];
-                if (name_tok < token_types.len) { token_types[name_tok] = 12; }
+                if (name_tok < token_types.len) {
+                    token_types[name_tok] = 12;
+                }
             },
             .const_decl, .var_decl, .param_decl => {
                 const name_tok = data.lhs;
-                if (name_tok < token_types.len) { token_types[name_tok] = 8; }
+                if (name_tok < token_types.len) {
+                    token_types[name_tok] = 8;
+                }
             },
             .identifier => {
                 if (document.sema) |sema| {
@@ -671,44 +675,41 @@ fn semanticTokensFull(server: *Server, id: []const u8, params: std.json.Value) !
             },
             .builtin_call => {
                 const tok = ast.nodes.items(.main_token)[i];
-                if (tok < token_types.len) { token_types[tok] = 12; }
+                if (tok < token_types.len) {
+                    token_types[tok] = 12;
+                }
             },
-            else => {}
+            else => {},
         }
     }
-    
+
     var out = std.ArrayList(u8).empty;
     defer out.deinit(server.allocator);
     try out.appendSlice(server.allocator, "{\"data\":[");
-    
+
     var first = true;
     var prev_line: usize = 0;
     var prev_char: usize = 0;
-    
+
     for (ast.tokens, 0..) |token, i| {
         if (token.tag == .invalid or token.tag == .eof or token.tag == .statement_end) continue;
         const token_type = token_types[i] orelse continue;
-        
+
         const start_pos = offsetToPosition(document.text, token.start);
         const len = token.end - token.start;
-        
+
         const delta_line = start_pos.line - prev_line;
         const delta_char = if (delta_line == 0) start_pos.character - prev_char else start_pos.character;
-        
+
         if (!first) try out.append(server.allocator, ',');
         first = false;
-        
-        try appendFormat(&out, server.allocator, "{d},{d},{d},{d},0", .{
-            delta_line,
-            delta_char,
-            len,
-            token_type
-        });
-        
+
+        try appendFormat(&out, server.allocator, "{d},{d},{d},{d},0", .{ delta_line, delta_char, len, token_type });
+
         prev_line = start_pos.line;
         prev_char = start_pos.character;
     }
-    
+
     try out.appendSlice(server.allocator, "]}");
     return response(server.allocator, id, out.items);
 }

@@ -79,7 +79,9 @@ pub const LirBuilder = struct {
 
     pub fn generate(self: *LirBuilder) !void {
         if (self.verbose) std.debug.print("-> ENTER: LirBuilder.generate\n", .{});
-        defer { if (self.verbose) std.debug.print("<- EXIT: LirBuilder.generate\n", .{}); }
+        defer {
+            if (self.verbose) std.debug.print("<- EXIT: LirBuilder.generate\n", .{});
+        }
 
         // Ensure at least one block exists
         try self.lir.blocks.append(self.allocator, @import("lir.zig").BasicBlock.init());
