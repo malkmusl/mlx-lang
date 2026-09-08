@@ -35,6 +35,10 @@ pub fn build(b: *std.Build) void {
     run_step.dependOn(&run_cmd.step);
 
     const build_zin1 = b.addRunArtifact(exe);
+    // zin0 resolves the self-hosted compiler's imports itself, so Zig cannot
+    // infer those transitive inputs from main.zin. Always rerun this cheap
+    // bootstrap step to avoid installing a stale zin1 from the build cache.
+    build_zin1.has_side_effects = true;
     build_zin1.addFileArg(b.path("compiler/selfhost/main.zin"));
     const zin1_output = build_zin1.addPrefixedOutputFileArg("-o", "zin1");
     const install_zin1 = b.addInstallBinFile(zin1_output, "zin1");
