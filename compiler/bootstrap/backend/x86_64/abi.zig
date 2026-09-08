@@ -1,5 +1,5 @@
-/// zincc ABI — System V AMD64 calling convention implementation
-/// Used by zin0 bootstrap for Linux x86_64.
+/// mlxcc ABI — System V AMD64 calling convention implementation
+/// Used by mlx0 bootstrap for Linux x86_64.
 ///
 /// Rules (from psABI spec):
 ///   - Integer/pointer args 1-6 → rdi, rsi, rdx, rcx, r8, r9
@@ -58,7 +58,7 @@ pub const ArgClass = enum {
     SSEUP,
 };
 
-/// Classify how a Zin type is passed according to System V AMD64 ABI.
+/// Classify how a Mlx type is passed according to System V AMD64 ABI.
 /// For Stage 0 we only need INTEGER and NO_CLASS (void).
 pub fn classifyType(ty: Type) ArgClass {
     return switch (ty.data) {

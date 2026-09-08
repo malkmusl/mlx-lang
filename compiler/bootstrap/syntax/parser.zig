@@ -448,7 +448,7 @@ test "parser: bootstrap hello syntax" {
     const source: [:0]const u8 =
         \\const std = @import("std")
         \\pub fn main() !void {
-        \\    try std.io.stdout.print("Hello from Zin\\n", .{})
+        \\    try std.io.stdout.print("Hello from Mlx\\n", .{})
         \\}
     ;
 

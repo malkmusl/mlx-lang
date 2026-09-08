@@ -1,4 +1,4 @@
-//! Linux x86_64 raw OS layer for zin0 bootstrap.
+//! Linux x86_64 raw OS layer for mlx0 bootstrap.
 //! Direct syscall wrappers with no libc dependency.
 
 const std = @import("std");

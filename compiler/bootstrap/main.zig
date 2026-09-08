@@ -9,13 +9,13 @@ pub fn main(init: std.process.Init) !u8 {
     var stdout_file_writer: std.Io.File.Writer = .init(.stdout(), io, &stdout_buffer);
     const out = &stdout_file_writer.interface;
 
-    std.debug.print("zin0 bootstrap compiler\n", .{});
+    std.debug.print("mlx0 bootstrap compiler\n", .{});
 
     const args = try init.minimal.args.toSlice(allocator);
     defer allocator.free(args);
 
     if (args.len < 2) {
-        std.debug.print("Usage: zin0 <source.zin> [--emit=asm]\n", .{});
+        std.debug.print("Usage: mlx0 <source.mlx> [--emit=asm]\n", .{});
         return 1;
     }
     const path = args[1];
@@ -211,12 +211,12 @@ pub fn main(init: std.process.Init) !u8 {
 
     if (emit_asm) {
         // ── Stage 10: NASM text output (legacy / debug) ──────────────────────
-        std.debug.print("[zin0] --emit=asm: writing NASM text\n", .{});
+        std.debug.print("[mlx0] --emit=asm: writing NASM text\n", .{});
         try x86_gen.generate(out);
         try stdout_file_writer.flush();
     } else {
         // ── Stage 12: Binary ELF64 output ────────────────────────────────────
-        std.debug.print("[zin0] emitting ELF64 binary → '{s}'\n", .{out_path});
+        std.debug.print("[mlx0] emitting ELF64 binary → '{s}'\n", .{out_path});
         var enc = @import("backend/x86_64/encoder.zig").Encoder.init(allocator, verbose);
         defer enc.deinit();
 
@@ -234,7 +234,7 @@ pub fn main(init: std.process.Init) !u8 {
         const text_size: u64 = @as(u64, @intCast(enc.buf.items.len));
         const rodata_file_off: u64 = elf64_mod.alignUp(0x1000 + text_size, 0x1000);
         const rodata_vaddr: u64 = 0x401000 + (rodata_file_off - 0x1000);
-        std.debug.print("[zin0] rodata_vaddr = 0x{x} (text_size={d})\n", .{ rodata_vaddr, text_size });
+        std.debug.print("[mlx0] rodata_vaddr = 0x{x} (text_size={d})\n", .{ rodata_vaddr, text_size });
 
         if (x86_gen.rodata.items.len > 0) {
             // Phase 2: set rodata_vaddr and regenerate with correct string addresses.
@@ -266,7 +266,7 @@ pub fn main(init: std.process.Init) !u8 {
             std.debug.print("ELF64 write failed: {}\n", .{err});
             return 1;
         };
-        std.debug.print("[zin0] wrote '{s}' — done.\n", .{out_path});
+        std.debug.print("[mlx0] wrote '{s}' — done.\n", .{out_path});
     }
 
     try stdout_file_writer.flush();

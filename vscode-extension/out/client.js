@@ -37,7 +37,7 @@ exports.getLspBinaryPath = getLspBinaryPath;
 const path = __importStar(require("path"));
 function getLspBinaryPath(context) {
     const binDir = path.join(context.extensionPath, 'bin');
-    const exe = process.platform === 'win32' ? 'zin-lsp.exe' : 'zin-lsp';
+    const exe = process.platform === 'win32' ? 'mlx-lsp.exe' : 'mlx-lsp';
     return path.join(binDir, exe);
 }
 //# sourceMappingURL=client.js.map

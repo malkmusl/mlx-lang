@@ -1,6 +1,6 @@
-# Native Wayland in Zin
+# Native Wayland in Mlx
 
-Zin treats Wayland as part of its standard library ecosystem, not as a C dependency and not as a project-local schema import.
+Mlx treats Wayland as part of its standard library ecosystem, not as a C dependency and not as a project-local schema import.
 
 ```text
 canonical wayland.xml / extension XML
@@ -25,11 +25,11 @@ canonical wayland.xml / extension XML
     Linux   BSD   brixOS
 ```
 
-The XML is consumed while the Zin standard library is bootstrapped/rebuilt. Applications do not add the XML to `build.zin` and do not call a schema builtin.
+The XML is consumed while the Mlx standard library is bootstrapped/rebuilt. Applications do not add the XML to `build.mlx` and do not call a schema builtin.
 
 Client code:
 
-```zin
+```mlx
 const wl = @import("std.wayland")
 
 pub fn main() !void {

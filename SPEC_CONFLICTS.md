@@ -1,4 +1,4 @@
-# Zin 1.0 normative conflicts
+# Mlx 1.0 normative conflicts
 
 ## Open normative gaps
 
@@ -27,14 +27,14 @@ normative.
 `spec/00-language/comptime.xml` requires `@typeInfo`, `@hasDecl`, and `@decl`,
 but does not define the value schema returned by `@typeInfo` or declaration
 metadata/lookup behavior. Stage 0 implements reflection operations whose result
-is unambiguous from the specification and emits ZIN-E5005 for these unresolved
+is unambiguous from the specification and emits MLX-E5005 for these unresolved
 metadata operations.
 
 ### Language-version value
 
 `spec/00-language/modules.xml` requires `@languageVersion`, but does not define
 its result type or value format. Stage 0 recognizes the zero-argument builtin
-and emits ZIN-E5005 rather than selecting a private representation.
+and emits MLX-E5005 rather than selecting a private representation.
 
 ### Conversion builtin signatures
 

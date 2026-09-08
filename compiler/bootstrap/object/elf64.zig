@@ -1,4 +1,4 @@
-/// ELF64 executable writer for zin0.
+/// ELF64 executable writer for mlx0.
 ///
 /// Produces a minimal statically-linked Linux x86_64 ELF64 executable
 /// directly from the machine-code buffer produced by x86_64_encoder.

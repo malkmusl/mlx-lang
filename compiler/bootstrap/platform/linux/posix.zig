@@ -166,7 +166,7 @@ pub fn readdir(fd: Fd, buf: []u8) OsError!usize {
 test "posix runtime" {
     // read/write through a pipe; do not write to stdout because Zig's build
     // runner uses it for its test protocol.
-    const msg = "hello zin posix\n";
+    const msg = "hello mlx posix\n";
     var fds: [2]Fd = undefined;
     try pipe(&fds);
     defer close(fds[0]) catch {};

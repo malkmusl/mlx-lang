@@ -1,4 +1,4 @@
-# Zin 1.0 specification rebuild notes
+# Mlx 1.0 specification rebuild notes
 
 This rebuild incorporates the latest normative decisions:
 
@@ -8,10 +8,10 @@ This rebuild incorporates the latest normative decisions:
 - Copyability propagates through by-value aggregate containment.
 - Sema tracks Uninitialized/Initialized/Moved/PartiallyMoved states.
 - No copy/move constructors or implicit destructors exist.
-- Compiler diagnostics are structured and stable-code based (`ZIN-E####`/`ZIN-W####`) with JSON output and `zin explain`.
+- Compiler diagnostics are structured and stable-code based (`MLX-E####`/`MLX-W####`) with JSON output and `mlx explain`.
 - `unsafe {}` defines explicit raw-safety permission boundaries.
 - Error-union results cannot be silently discarded; intentional error discard uses `@discardError`.
-- JSON and XML are pure Zin stdlib modules (`std.json`, `std.xml`).
+- JSON and XML are pure Mlx stdlib modules (`std.json`, `std.xml`).
 - Wayland has no compiler/build schema builtin. Canonical Wayland XML is consumed during Stage-0/1 stdlib construction, producing native `std.wayland` client and server support for Linux/BSD/brixOS.
 
 - Arbitrary-width integers are now normative for every `uN`/`iN`, 1..4096 bits.

@@ -4,9 +4,9 @@ const Scope = @import("../scope.zig").Scope;
 const Type = @import("../type.zig").Type;
 const TypePool = @import("../type.zig").TypePool;
 
-/// Error tags use non-zero internal values because zincc reserves zero for a
+/// Error tags use non-zero internal values because mlxcc reserves zero for a
 /// successful error-union return. The values are deliberately not a stable
-/// external ABI; explicitly-backed enums serve that purpose in Zin.
+/// external ABI; explicitly-backed enums serve that purpose in Mlx.
 pub fn analyze(sema: anytype, node_index: Node.Index, scope: *Scope) !Type.Id {
     _ = scope;
     if (sema.type_values.get(node_index)) |_| return sema.type_pool.internPrimitive(.type_type);

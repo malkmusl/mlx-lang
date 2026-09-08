@@ -150,7 +150,7 @@ pub fn parseFunction(parser: anytype) std.mem.Allocator.Error!?Node.Index {
         return null;
     }
     parser.consumeToken("Consume parameter ')'");
-    // `->` is the canonical Zin 1.0 return-type separator. Stage0 still
+    // `->` is the canonical Mlx 1.0 return-type separator. Stage0 still
     // accepts the old adjacent return type while the existing corpus migrates.
     if (parser.index < parser.tokens.len and parser.tokens[parser.index].tag == .arrow) {
         parser.consumeToken("Consume function return arrow");

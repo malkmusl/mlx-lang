@@ -16,7 +16,7 @@ pub fn parseBlock(parser: anytype) std.mem.Allocator.Error!?Node.Index {
 
     // EOF is a synchronization point too. Without this guard a malformed or
     // incomplete block repeatedly asks recovery to advance past EOF, which is
-    // impossible and used to pin zin0 in an infinite loop.
+    // impossible and used to pin mlx0 in an infinite loop.
     while (parser.index < parser.tokens.len and
         parser.tokens[parser.index].tag != .r_brace and
         parser.tokens[parser.index].tag != .eof)

@@ -1,4 +1,4 @@
-# Zin 1.0 Release-Candidate Spec Readiness
+# Mlx 1.0 Release-Candidate Spec Readiness
 
 This repository is intended to be implementation-ready. An implementation agent must not invent missing language semantics.
 

@@ -1,6 +1,6 @@
-# Zin 1.0 implementation contract
+# Mlx 1.0 implementation contract
 
-The files under `spec/` are normative. Implement Zin; do not design it.
+The files under `spec/` are normative. Implement Mlx; do not design it.
 
 ## Non-negotiable rules
 
@@ -10,11 +10,11 @@ The complete operator algebra in `spec/00-language/operators.xml` is normative; 
 
 Every implemented feature requires positive tests and negative compile-error tests where applicable. Runtime semantics require runtime tests. ABI features require ABI tests. Every user-facing compiler error must use the structured diagnostic model and stable diagnostic code defined under `spec/02-compiler/diagnostics*`.
 
-Do not add `@protocol`, `@importSchema`, `Build.addProtocol`, or another Wayland/XML compiler special case. JSON and XML are Zin stdlib modules. Wayland XML is consumed during Stage-0/1 standard-library construction so users later import only `std.wayland`.
+Do not add `@protocol`, `@importSchema`, `Build.addProtocol`, or another Wayland/XML compiler special case. JSON and XML are Mlx stdlib modules. Wayland XML is consumed during Stage-0/1 standard-library construction so users later import only `std.wayland`.
 
 Do not reinterpret `@nocopy` as a keyword/modifier. Required syntax includes:
 
-```zin
+```mlx
 const File = @nocopy(struct) {
     handle: usize
 }
@@ -25,29 +25,29 @@ var next = @move(file)
 
 ## Bootstrap stages
 
-### Stage 0 — zin0
+### Stage 0 — mlx0
 
-Linux x86_64 bootstrap compiler in Zig. Implement enough Zin plus direct ELF64/syscalls to build the Stage-1 foundation. No LLVM, GCC, C compiler, libc, external assembler or external linker is required.
+Linux x86_64 bootstrap compiler in Zig. Implement enough Mlx plus direct ELF64/syscalls to build the Stage-1 foundation. No LLVM, GCC, C compiler, libc, external assembler or external linker is required.
 
-### Stage 1 Core — bootstrap std and zin1
+### Stage 1 Core — bootstrap std and mlx1
 
-Build only the standard-library foundation required for Zin itself to compile and run: allocation, collections, source I/O, diagnostics, process startup and native output. Then compile the canonical Zin compiler (`zin1`) written in Zin. Protocols and data formats do not block Zin1 or self-hosting.
+Build only the standard-library foundation required for Mlx itself to compile and run: allocation, collections, source I/O, diagnostics, process startup and native output. Then compile the canonical Mlx compiler (`mlx1`) written in Mlx. Protocols and data formats do not block Mlx1 or self-hosting.
 
 ### Stage 1 Extensions — standard-library formats and protocols
 
-After the compiler core is usable, implement the separate Stage-1 library extensions such as `std.xml`, `std.json`, broader POSIX/OS adapters and `std.wayland`. Wayland client/server declarations and runtime are materialized from canonical Wayland XML as ordinary Zin modules; none of these extensions are compiler dependencies.
+After the compiler core is usable, implement the separate Stage-1 library extensions such as `std.xml`, `std.json`, broader POSIX/OS adapters and `std.wayland`. Wayland client/server declarations and runtime are materialized from canonical Wayland XML as ordinary Mlx modules; none of these extensions are compiler dependencies.
 
 ### Stage 2 — self hosting
 
-Use `zin1` to compile the canonical compiler into `zin2`; both pass the same conformance suite.
+Use `mlx1` to compile the canonical compiler into `mlx2`; both pass the same conformance suite.
 
 ### Stage 3 — full std/toolchain
 
-Rebuild full std and tooling using self-hosted Zin. Zig is no longer needed.
+Rebuild full std and tooling using self-hosted Mlx. Zig is no longer needed.
 
 ### Stage 4 — brixOS
 
-Use self-hosted Zin to build brixOS. brixOS may use native IPC/syscalls; `std.posix` provides compatibility and `std.wayland` maps its transport to brixOS-native primitives.
+Use self-hosted Mlx to build brixOS. brixOS may use native IPC/syscalls; `std.posix` provides compatibility and `std.wayland` maps its transport to brixOS-native primitives.
 
 ## Required implementation order
 
@@ -61,11 +61,11 @@ Use self-hosted Zin to build brixOS. brixOS may use native IPC/syscalls; `std.po
 8. comptime evaluator/reflection
 9. LIR
 10. x86_64 encoder/register allocation
-11. zincc ABI
+11. mlxcc ABI
 12. ELF64 writer/linker
 13. Linux raw/OS layer
 14. Stage-1 compiler bootstrap std
-15. canonical compiler in Zin
+15. canonical compiler in Mlx
 16. self-hosting
 17. Stage-1 extensions: std.xml/std.json
 18. Stage-1 extensions: std.wayland protocol materialization + client/server + Linux transport
@@ -78,11 +78,11 @@ Use self-hosted Zin to build brixOS. brixOS may use native IPC/syscalls; `std.po
 ## Required developer commands
 
 ```sh
-zin build
-zin run
-zin test
-zin fmt
-zin check
-zin explain ZIN-E6001
-zin check --diagnostic-format=json
+mlx build
+mlx run
+mlx test
+mlx fmt
+mlx check
+mlx explain MLX-E6001
+mlx check --diagnostic-format=json
 ```

@@ -1,5 +1,5 @@
-//! Language Server Protocol support for Zin.
-//! The server reuses zin0's lexer, parser and semantic analyser.
+//! Language Server Protocol support for Mlx.
+//! The server reuses mlx0's lexer, parser and semantic analyser.
 const std = @import("std");
 const Lexer = @import("syntax/lexer.zig").Lexer;
 const Token = @import("syntax/token.zig").Token;
@@ -292,7 +292,7 @@ fn handle(server: *Server, input: []const u8) ![]u8 {
     if (std.mem.eql(u8, method, "textDocument/definition")) return definition(server, id, params);
     if (std.mem.eql(u8, method, "textDocument/hover")) return hover(server, id, params);
     if (std.mem.eql(u8, method, "textDocument/semanticTokens/full")) return semanticTokensFull(server, id, params);
-    if (std.mem.eql(u8, method, "zin/ast")) return response(server.allocator, id, "null");
+    if (std.mem.eql(u8, method, "mlx/ast")) return response(server.allocator, id, "null");
     return server.allocator.dupe(u8, "");
 }
 
@@ -391,7 +391,7 @@ fn appendDiagnostic(out: *std.ArrayList(u8), allocator: std.mem.Allocator, text:
         .help => 4,
     };
     const prefix: u8 = if (severity == .warning) 'W' else 'E';
-    try appendFormat(out, allocator, "{{\"range\":{{\"start\":{{\"line\":{d},\"character\":{d}}},\"end\":{{\"line\":{d},\"character\":{d}}}}},\"severity\":{d},\"code\":\"ZIN-{c}{d:0>4}\",\"source\":\"zin\",\"message\":", .{ start_pos.line, start_pos.character, end_pos.line, end_pos.character, level, prefix, code });
+    try appendFormat(out, allocator, "{{\"range\":{{\"start\":{{\"line\":{d},\"character\":{d}}},\"end\":{{\"line\":{d},\"character\":{d}}}}},\"severity\":{d},\"code\":\"MLX-{c}{d:0>4}\",\"source\":\"mlx\",\"message\":", .{ start_pos.line, start_pos.character, end_pos.line, end_pos.character, level, prefix, code });
     try appendJsonString(out, allocator, message);
     try out.append(allocator, '}');
 }
@@ -483,7 +483,7 @@ fn hover(server: *Server, id: []const u8, params: std.json.Value) ![]u8 {
     const type_id = sema.node_types.get(node) orelse return response(server.allocator, id, "null");
     var type_buffer: [1024]u8 = undefined;
     const type_name = document.types.typeName(type_id, &type_buffer) catch "<unknown>";
-    const markdown = try std.fmt.allocPrint(server.allocator, "~~~zin\n{s}\n~~~", .{type_name});
+    const markdown = try std.fmt.allocPrint(server.allocator, "~~~mlx\n{s}\n~~~", .{type_name});
     defer server.allocator.free(markdown);
     const content = try jsonString(server.allocator, markdown);
     defer server.allocator.free(content);
@@ -729,14 +729,14 @@ test "LSP request JSON preserves decoded document text" {
     var server = Server.init(std.testing.allocator, std.testing.io);
     defer server.deinit();
     const request =
-        \\{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///test.zin","text":"const value: i32 = 1\n"}}}
+        \\{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///test.mlx","text":"const value: i32 = 1\n"}}}
     ;
 
     const result = try handle(&server, request);
     defer std.testing.allocator.free(result);
 
     try std.testing.expect(std.mem.indexOf(u8, result, "publishDiagnostics") != null);
-    const document = server.documents.get("file:///test.zin").?;
+    const document = server.documents.get("file:///test.mlx").?;
     try std.testing.expectEqualStrings("const value: i32 = 1\n", document.text);
 }
 

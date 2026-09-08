@@ -1,9 +1,9 @@
 #!/bin/bash
 set -e
 
-# Usage: ./tests/run_error.sh tests/09_type_errors.zin ZIN-E4001
+# Usage: ./tests/run_error.sh tests/09_type_errors.mlx MLX-E4001
 
-ZIN_FILE=$1
+MLX_FILE=$1
 EXPECTED_CODE=$2
 
 TMP_DIR=$(mktemp -d)
@@ -14,9 +14,9 @@ trap 'rm -rf -- "$TMP_DIR"' EXIT
 echo "Building compiler..."
 zig build
 
-echo "Checking that $ZIN_FILE is rejected with $EXPECTED_CODE..."
+echo "Checking that $MLX_FILE is rejected with $EXPECTED_CODE..."
 set +e
-./zig-out/bin/zin0 "$ZIN_FILE" "-o$OUT_PATH" >"$LOG_PATH" 2>&1
+./zig-out/bin/mlx0 "$MLX_FILE" "-o$OUT_PATH" >"$LOG_PATH" 2>&1
 EXIT_CODE=$?
 set -e
 

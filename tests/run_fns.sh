@@ -1,9 +1,9 @@
 #!/bin/bash
 set -e
 
-# Usage: ./tests/run_fns.sh tests/07_functions.zin [expected_exit_code]
+# Usage: ./tests/run_fns.sh tests/07_functions.mlx [expected_exit_code]
 
-ZIN_FILE=${1:-tests/07_functions.zin}
+MLX_FILE=${1:-tests/07_functions.mlx}
 EXPECTED=${2:-15}
 
 TMP_DIR=$(mktemp -d)
@@ -13,8 +13,8 @@ trap 'rm -rf -- "$TMP_DIR"' EXIT
 echo "Building compiler..."
 zig build
 
-echo "Compiling $ZIN_FILE to ELF..."
-./zig-out/bin/zin0 "$ZIN_FILE" "-o$OUT_PATH"
+echo "Compiling $MLX_FILE to ELF..."
+./zig-out/bin/mlx0 "$MLX_FILE" "-o$OUT_PATH"
 
 echo "Executing..."
 set +e

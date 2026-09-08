@@ -1,5 +1,5 @@
 const cp = require('child_process');
-const server = cp.spawn('./vscode-extension/bin/zin-lsp', [], { stdio: ['pipe', 'pipe', 'inherit'] });
+const server = cp.spawn('./vscode-extension/bin/mlx-lsp', [], { stdio: ['pipe', 'pipe', 'inherit'] });
 
 function send(msg) {
     const str = JSON.stringify(msg);
@@ -20,7 +20,7 @@ send({
     method: "textDocument/didOpen",
     params: {
         textDocument: {
-            uri: "file:///test.zin",
+            uri: "file:///test.mlx",
             text: "const foo = 1\n"
         }
     }
@@ -31,7 +31,7 @@ send({
     id: 2,
     method: "textDocument/semanticTokens/full",
     params: {
-        textDocument: { uri: "file:///test.zin" }
+        textDocument: { uri: "file:///test.mlx" }
     }
 });
 

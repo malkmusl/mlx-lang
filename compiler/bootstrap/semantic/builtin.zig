@@ -1,6 +1,6 @@
 const std = @import("std");
 
-/// Language builtins named by the Zin 1.0 normative specification.
+/// Language builtins named by the Mlx 1.0 normative specification.
 /// `protocol` and `importSchema` intentionally do not appear here: protocol
 /// materialization belongs to the standard-library bootstrap, not the compiler.
 pub const Kind = enum {

@@ -1,4 +1,4 @@
-/// x86_64 machine-code encoder for zin0.
+/// x86_64 machine-code encoder for mlx0.
 ///
 /// Emits raw instruction bytes into an ArrayList(u8) buffer.
 /// Tracks symbol definitions and fixup (relocation) records so that

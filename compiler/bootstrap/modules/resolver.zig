@@ -126,18 +126,18 @@ pub fn resolvePath(
 }
 
 fn standardRelativePath(allocator: std.mem.Allocator, import_path: []const u8) ![]u8 {
-    if (std.mem.eql(u8, import_path, "std")) return allocator.dupe(u8, "std.zin");
+    if (std.mem.eql(u8, import_path, "std")) return allocator.dupe(u8, "std.mlx");
     const suffix = import_path["std.".len..];
-    if (suffix.len == 0) return allocator.dupe(u8, "std.zin");
-    var result = try allocator.alloc(u8, suffix.len + ".zin".len);
+    if (suffix.len == 0) return allocator.dupe(u8, "std.mlx");
+    var result = try allocator.alloc(u8, suffix.len + ".mlx".len);
     for (suffix, 0..) |byte, index| result[index] = if (byte == '.') std.fs.path.sep else byte;
-    @memcpy(result[suffix.len..], ".zin");
+    @memcpy(result[suffix.len..], ".mlx");
     return result;
 }
 
 test "classifies normative import forms" {
-    try std.testing.expectEqual(ImportKind.relative, classify("./parser.zin").kind);
-    try std.testing.expectEqual(ImportKind.relative, classify("../shared.zin").kind);
+    try std.testing.expectEqual(ImportKind.relative, classify("./parser.mlx").kind);
+    try std.testing.expectEqual(ImportKind.relative, classify("../shared.mlx").kind);
     try std.testing.expectEqual(ImportKind.standard, classify("std.mem").kind);
     try std.testing.expectEqual(ImportKind.package, classify("example").kind);
     try std.testing.expectEqual(ImportKind.builtin, classify("builtin").kind);
@@ -146,24 +146,24 @@ test "classifies normative import forms" {
 test "resolves relative, standard, builtin and mapped package imports" {
     const allocator = std.testing.allocator;
 
-    const relative = try resolvePath(allocator, "/work/compiler/main.zin", "./parser.zin", .{ .std_root = "/work/std" });
+    const relative = try resolvePath(allocator, "/work/compiler/main.mlx", "./parser.mlx", .{ .std_root = "/work/std" });
     defer allocator.free(relative);
-    try std.testing.expectEqualStrings("/work/compiler/parser.zin", relative);
+    try std.testing.expectEqualStrings("/work/compiler/parser.mlx", relative);
 
-    const standard = try resolvePath(allocator, "/work/compiler/main.zin", "std.mem.Allocator", .{ .std_root = "/work/std" });
+    const standard = try resolvePath(allocator, "/work/compiler/main.mlx", "std.mem.Allocator", .{ .std_root = "/work/std" });
     defer allocator.free(standard);
-    try std.testing.expectEqualStrings("/work/std/mem/Allocator.zin", standard);
+    try std.testing.expectEqualStrings("/work/std/mem/Allocator.mlx", standard);
 
-    const builtin = try resolvePath(allocator, "/work/compiler/main.zin", "builtin", .{ .std_root = "/work/std" });
+    const builtin = try resolvePath(allocator, "/work/compiler/main.mlx", "builtin", .{ .std_root = "/work/std" });
     defer allocator.free(builtin);
     try std.testing.expectEqualStrings("builtin", builtin);
 
     var packages = PackageMap.init(allocator);
     defer packages.deinit();
-    try packages.put("example", "/packages/example/root.zin");
-    const package = try resolvePath(allocator, "/work/compiler/main.zin", "example", .{ .std_root = "/work/std", .packages = &packages });
+    try packages.put("example", "/packages/example/root.mlx");
+    const package = try resolvePath(allocator, "/work/compiler/main.mlx", "example", .{ .std_root = "/work/std", .packages = &packages });
     defer allocator.free(package);
-    try std.testing.expectEqualStrings("/packages/example/root.zin", package);
+    try std.testing.expectEqualStrings("/packages/example/root.mlx", package);
 }
 
 test "module graph deduplicates canonical paths and tracks cycles by state" {
@@ -171,8 +171,8 @@ test "module graph deduplicates canonical paths and tracks cycles by state" {
     var graph = ModuleGraph.init(allocator);
     defer graph.deinit();
 
-    const first = try graph.getOrAdd("/work/a.zin");
-    const again = try graph.getOrAdd("/work/a.zin");
+    const first = try graph.getOrAdd("/work/a.mlx");
+    const again = try graph.getOrAdd("/work/a.mlx");
     try std.testing.expect(first.is_new);
     try std.testing.expect(!again.is_new);
     try std.testing.expectEqual(first.id, again.id);

@@ -1,4 +1,4 @@
-# zin0 module layout
+# mlx0 module layout
 
 Each directory owns one compiler responsibility and exposes a small `root.zig`
 facade. New functionality belongs in a focused file below the owning directory;
@@ -13,7 +13,7 @@ semantic/        types, scopes, ownership, comptime, reflection and sema
 ir/              target-independent LIR and lowering
 backend/x86_64/  ABI, register allocation, encoding and code generation
 object/          ELF objects, linking and executable layout
-platform/linux/  raw syscalls and host abstractions used by zin0
+platform/linux/  raw syscalls and host abstractions used by mlx0
 driver/          command dispatch and compilation pipeline
 ```
 
@@ -91,7 +91,7 @@ backend/x86_64/codegen/
   memory.zig  shared pointer, byte, SSE and payload-copy encoders
 ```
 
-`zincc` returns integer-compatible tuples up to 16 bytes in `rax`/`rdx`.
+`mlxcc` returns integer-compatible tuples up to 16 bytes in `rax`/`rdx`.
 Larger tuples use caller-owned storage through the hidden first argument, so no
 pointer into a completed callee frame can escape.
 

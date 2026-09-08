@@ -1,4 +1,4 @@
-# Zin LIR instruction semantics
+# Mlx LIR instruction semantics
 
 This file is normative together with `lir.xml`.
 
@@ -6,7 +6,7 @@ This file is normative together with `lir.xml`.
 
 All integer instructions carry an exact bit width and signedness. No backend-native width silently changes source semantics.
 
-- `add/sub/mul`: checked arithmetic. A statically known overflow is `ZIN-E4002`; safe runtime overflow traps.
+- `add/sub/mul`: checked arithmetic. A statically known overflow is `MLX-E4002`; safe runtime overflow traps.
 - `add_wrap/sub_wrap/mul_wrap`: modulo 2^N.
 - `add_sat/sub_sat/mul_sat`: clamp to the exact iN/uN numeric bounds.
 - `div/rem`: signedness is explicit. Division by zero traps in safe modes; constant division by zero is a compile error.

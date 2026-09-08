@@ -36,7 +36,7 @@ Object.defineProperty(exports, "__esModule", { value: true });
 exports.showColorConfigurator = showColorConfigurator;
 const vscode = __importStar(require("vscode"));
 function showColorConfigurator(context) {
-    const panel = vscode.window.createWebviewPanel('zinColorConfigurator', 'Zin Theme Configurator', vscode.ViewColumn.One, {
+    const panel = vscode.window.createWebviewPanel('mlxColorConfigurator', 'Mlx Theme Configurator', vscode.ViewColumn.One, {
         enableScripts: true,
         retainContextWhenHidden: true
     });
@@ -56,33 +56,33 @@ function showColorConfigurator(context) {
     // Try to load existing customizations if any
     const config = vscode.workspace.getConfiguration('editor');
     const tokenColors = config.get('tokenColorCustomizations');
-    if (tokenColors && tokenColors['[Zin Vibrant Dark]'] && tokenColors['[Zin Vibrant Dark]'].textMateRules) {
-        const rules = tokenColors['[Zin Vibrant Dark]'].textMateRules;
+    if (tokenColors && tokenColors['[Mlx Vibrant Dark]'] && tokenColors['[Mlx Vibrant Dark]'].textMateRules) {
+        const rules = tokenColors['[Mlx Vibrant Dark]'].textMateRules;
         for (const rule of rules) {
             if (!rule.scope)
                 continue;
             const scopes = Array.isArray(rule.scope) ? rule.scope : [rule.scope];
-            if (scopes.includes('keyword.control.zin'))
+            if (scopes.includes('keyword.control.mlx'))
                 initialColors.keywords = rule.settings.foreground;
-            else if (scopes.includes('keyword.operator.zin'))
+            else if (scopes.includes('keyword.operator.mlx'))
                 initialColors.operators = rule.settings.foreground;
-            else if (scopes.includes('entity.name.type.zin'))
+            else if (scopes.includes('entity.name.type.mlx'))
                 initialColors.types = rule.settings.foreground;
-            else if (scopes.includes('storage.type.zin'))
+            else if (scopes.includes('storage.type.mlx'))
                 initialColors.storage = rule.settings.foreground;
-            else if (scopes.includes('entity.name.function.zin'))
+            else if (scopes.includes('entity.name.function.mlx'))
                 initialColors.functions = rule.settings.foreground;
-            else if (scopes.includes('support.function.builtin.zin'))
+            else if (scopes.includes('support.function.builtin.mlx'))
                 initialColors.builtins = rule.settings.foreground;
-            else if (scopes.includes('variable.parameter.zin'))
+            else if (scopes.includes('variable.parameter.mlx'))
                 initialColors.parameters = rule.settings.foreground;
-            else if (scopes.includes('constant.numeric.zin'))
+            else if (scopes.includes('constant.numeric.mlx'))
                 initialColors.numbers = rule.settings.foreground;
-            else if (scopes.includes('constant.language.zin'))
+            else if (scopes.includes('constant.language.mlx'))
                 initialColors.constants = rule.settings.foreground;
-            else if (scopes.includes('string.quoted.double.zin'))
+            else if (scopes.includes('string.quoted.double.mlx'))
                 initialColors.strings = rule.settings.foreground;
-            else if (scopes.includes('comment.line.double-slash.zin'))
+            else if (scopes.includes('comment.line.double-slash.mlx'))
                 initialColors.comments = rule.settings.foreground;
         }
     }
@@ -92,61 +92,61 @@ function showColorConfigurator(context) {
             const colors = message.colors;
             const newRules = [
                 {
-                    scope: ["keyword.control.zin"],
+                    scope: ["keyword.control.mlx"],
                     settings: { foreground: colors.keywords, fontStyle: "bold" }
                 },
                 {
-                    scope: ["keyword.operator.zin"],
+                    scope: ["keyword.operator.mlx"],
                     settings: { foreground: colors.operators }
                 },
                 {
-                    scope: ["entity.name.type.zin", "support.type.zin"],
+                    scope: ["entity.name.type.mlx", "support.type.mlx"],
                     settings: { foreground: colors.types, fontStyle: "italic" }
                 },
                 {
-                    scope: ["storage.type.zin", "storage.modifier.zin"],
+                    scope: ["storage.type.mlx", "storage.modifier.mlx"],
                     settings: { foreground: colors.storage, fontStyle: "bold" }
                 },
                 {
-                    scope: ["entity.name.function.zin"],
+                    scope: ["entity.name.function.mlx"],
                     settings: { foreground: colors.functions }
                 },
                 {
-                    scope: ["support.function.builtin.zin"],
+                    scope: ["support.function.builtin.mlx"],
                     settings: { foreground: colors.builtins, fontStyle: "bold" }
                 },
                 {
-                    scope: ["variable.parameter.zin"],
+                    scope: ["variable.parameter.mlx"],
                     settings: { foreground: colors.parameters }
                 },
                 {
-                    scope: ["constant.numeric.zin"],
+                    scope: ["constant.numeric.mlx"],
                     settings: { foreground: colors.numbers }
                 },
                 {
-                    scope: ["constant.language.zin"],
+                    scope: ["constant.language.mlx"],
                     settings: { foreground: colors.constants, fontStyle: "bold" }
                 },
                 {
-                    scope: ["string.quoted.double.zin"],
+                    scope: ["string.quoted.double.mlx"],
                     settings: { foreground: colors.strings }
                 },
                 {
-                    scope: ["comment.line.double-slash.zin"],
+                    scope: ["comment.line.double-slash.mlx"],
                     settings: { foreground: colors.comments, fontStyle: "italic" }
                 }
             ];
             // Merge with existing config
             const editorConfig = vscode.workspace.getConfiguration('editor');
             let currentTokenColors = editorConfig.get('tokenColorCustomizations') || {};
-            // We want to override just for the Zin theme
-            const zinThemeConfig = currentTokenColors['[Zin Vibrant Dark]'] || {};
-            zinThemeConfig.textMateRules = newRules;
+            // We want to override just for the Mlx theme
+            const mlxThemeConfig = currentTokenColors['[Mlx Vibrant Dark]'] || {};
+            mlxThemeConfig.textMateRules = newRules;
             const newConfig = { ...currentTokenColors };
-            newConfig['[Zin Vibrant Dark]'] = zinThemeConfig;
+            newConfig['[Mlx Vibrant Dark]'] = mlxThemeConfig;
             try {
                 await editorConfig.update('tokenColorCustomizations', newConfig, vscode.ConfigurationTarget.Global);
-                vscode.window.showInformationMessage('Zin Theme Colors updated successfully!');
+                vscode.window.showInformationMessage('Mlx Theme Colors updated successfully!');
             }
             catch (err) {
                 vscode.window.showErrorMessage('Failed to update colors: ' + err.message);
@@ -161,7 +161,7 @@ function getWebviewContent(colors) {
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Zin Theme Configurator</title>
+  <title>Mlx Theme Configurator</title>
   <style>
     body {
       font-family: var(--vscode-font-family);
@@ -205,8 +205,8 @@ function getWebviewContent(colors) {
   </style>
 </head>
 <body>
-  <h1>Zin Vibrant Dark Configurator</h1>
-  <p>Pick your favorite colors for the Zin language below. Click Apply to save globally.</p>
+  <h1>Mlx Vibrant Dark Configurator</h1>
+  <p>Pick your favorite colors for the Mlx language below. Click Apply to save globally.</p>
   
   <form id="colorForm">
     <div class="grid">

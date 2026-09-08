@@ -3,6 +3,6 @@ import * as path from 'path';
 
 export function getLspBinaryPath(context: vscode.ExtensionContext): string {
   const binDir = path.join(context.extensionPath, 'bin');
-  const exe = process.platform === 'win32' ? 'zin-lsp.exe' : 'zin-lsp';
+  const exe = process.platform === 'win32' ? 'mlx-lsp.exe' : 'mlx-lsp';
   return path.join(binDir, exe);
 }

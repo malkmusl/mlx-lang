@@ -1,6 +1,6 @@
-# zin0 bootstrap compiler
+# mlx0 bootstrap compiler
 
-Implement in Zig. Linux x86_64 first. `zin0` exists only to bootstrap the canonical Zin compiler. Keep dependencies minimal and follow `spec/` exactly.
+Implement in Zig. Linux x86_64 first. `mlx0` exists only to bootstrap the canonical Mlx compiler. Keep dependencies minimal and follow `spec/` exactly.
 
 Suggested Zig modules:
 
@@ -24,13 +24,13 @@ main.zig
 
 ## Language server
 
-zin-lsp is the bootstrap Language Server Protocol implementation. Build it
+mlx-lsp is the bootstrap Language Server Protocol implementation. Build it
 with the normal project build:
 
     zig build
-    ./zig-out/bin/zin-lsp
+    ./zig-out/bin/mlx-lsp
 
 An editor starts the binary over stdio; do not run it through a terminal
 wrapper that writes non-protocol text to stdout. The current server supports
 full-document synchronization, lexer/parser/sema diagnostics, completion,
-document symbols, hover, and go-to-definition for open Zin documents.
+document symbols, hover, and go-to-definition for open Mlx documents.

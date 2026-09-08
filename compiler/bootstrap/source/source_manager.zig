@@ -109,7 +109,7 @@ test "SourceManager" {
     var sm = SourceManager.init(allocator);
     defer sm.deinit();
 
-    const file_id = try sm.addFile("test.zin", "const a = 1;\nconst b = 2;\n");
+    const file_id = try sm.addFile("test.mlx", "const a = 1;\nconst b = 2;\n");
     
     const loc1 = sm.getLineCol(file_id, 0).?;
     try std.testing.expectEqual(@as(u32, 1), loc1.line);

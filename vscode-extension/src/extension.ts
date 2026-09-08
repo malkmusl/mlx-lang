@@ -14,7 +14,7 @@ export function activate(context: vscode.ExtensionContext) {
   };
 
   const clientOptions: LanguageClientOptions = {
-    documentSelector: [{ scheme: 'file', language: 'zin' }],
+    documentSelector: [{ scheme: 'file', language: 'mlx' }],
     synchronize: {
       fileEvents: vscode.workspace.createFileSystemWatcher('**/.clientrc')
     },
@@ -26,24 +26,24 @@ export function activate(context: vscode.ExtensionContext) {
   };
 
   client = new LanguageClient(
-    'zinLanguageServer',
-    'Zin Language Server',
+    'mlxLanguageServer',
+    'Mlx Language Server',
     serverOptions,
     clientOptions
   );
 
   client.start();
 
-  const astCommand = vscode.commands.registerCommand('zin.showAst', async () => {
+  const astCommand = vscode.commands.registerCommand('mlx.showAst', async () => {
     if (!client) { return; }
     const editor = vscode.window.activeTextEditor;
     if (!editor) { return; }
     const uri = editor.document.uri.toString();
-    const astResult = await client.sendRequest('zin/ast', { uri });
+    const astResult = await client.sendRequest('mlx/ast', { uri });
     showAstPanel(context, astResult as string);
   });
 
-  const customizeColorsCommand = vscode.commands.registerCommand('zin.customizeColors', () => {
+  const customizeColorsCommand = vscode.commands.registerCommand('mlx.customizeColors', () => {
     showColorConfigurator(context);
   });
 

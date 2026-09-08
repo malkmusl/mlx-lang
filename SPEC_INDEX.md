@@ -1,4 +1,4 @@
-# Zin 1.0 normative specification index
+# Mlx 1.0 normative specification index
 
 Specific normative rules override general rules. An unresolved contradiction must be recorded in `SPEC_CONFLICTS.md`; the implementation must never silently invent behavior.
 

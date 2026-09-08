@@ -193,7 +193,7 @@ pub const Lir = struct {
         const qualified = if (module_id == 0)
             try self.allocator.dupe(u8, name)
         else
-            try std.fmt.allocPrint(self.allocator, "__zin_m{d}_{s}", .{ module_id, name });
+            try std.fmt.allocPrint(self.allocator, "__mlx_m{d}_{s}", .{ module_id, name });
         errdefer self.allocator.free(qualified);
         if (self.symbol_ids.get(qualified)) |id| {
             self.allocator.free(qualified);

@@ -1,25 +1,25 @@
-# Zin
+# Mlx
 
-Zin is a minimalist manual-memory systems programming language with a self-hosting toolchain target. The bootstrap compiler (`zin0`) is written in Zig; the canonical compiler is written in Zin and must compile itself. Zin emits native machine code directly and does not require LLVM, GCC, a C compiler, libc, an external assembler, or an external linker for its reference path.
+Mlx is a minimalist manual-memory systems programming language with a self-hosting toolchain target. The bootstrap compiler (`mlx0`) is written in Zig; the canonical compiler is written in Mlx and must compile itself. Mlx emits native machine code directly and does not require LLVM, GCC, a C compiler, libc, an external assembler, or an external linker for its reference path.
 
 ## Repository purpose
 
-This repository is the normative Zin 1.0 specification suite and implementation workspace. An implementation agent implements the specification; it does not invent language semantics.
+This repository is the normative Mlx 1.0 specification suite and implementation workspace. An implementation agent implements the specification; it does not invent language semantics.
 
 ## Bootstrap chain
 
 ```text
 Zig on Linux
-   -> zin0
+   -> mlx0
    -> Stage-1 compiler std foundation
-   -> zin1 (canonical compiler written in Zin)
-      +-> zin2 (self-compiled compiler)
+   -> mlx1 (canonical compiler written in Mlx)
+      +-> mlx2 (self-compiled compiler)
       +-> Stage-1 extensions: std.xml + std.json + broader std.posix/std.os
           +-> Stage-1 protocol extensions such as std.wayland
    -> full std + tools + brixOS
 ```
 
-Zig is Stage-0 only. The canonical compiler, standard library, normal Zin programs and brixOS must not depend on Zig.
+Zig is Stage-0 only. The canonical compiler, standard library, normal Mlx programs and brixOS must not depend on Zig.
 
 ## Core rules
 
@@ -28,7 +28,7 @@ Zig is Stage-0 only. The canonical compiler, standard library, normal Zin progra
 - explicit allocators and explicit cleanup
 - `@nocopy(T)` makes a type non-copyable; aggregate syntax is `@nocopy(struct) { ... }`, `@nocopy(enum(u8)) { ... }`, etc.
 - `@move(value)` explicitly transfers a tracked value and invalidates its source
-- structured compile diagnostics with stable `ZIN-E####` / `ZIN-W####` codes and JSON output
+- structured compile diagnostics with stable `MLX-E####` / `MLX-W####` codes and JSON output
 - deterministic newline statement termination
 - mandatory enum backing types
 - untagged unions have no hidden tag; tagged unions use enum discriminators

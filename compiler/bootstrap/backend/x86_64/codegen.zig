@@ -6,7 +6,7 @@ const text_codegen = @import("codegen/text.zig");
 const binary_codegen = @import("codegen/binary.zig");
 const memory_codegen = @import("codegen/memory.zig");
 
-/// x86_64 code generator for zin0.
+/// x86_64 code generator for mlx0.
 /// Operates in two modes:
 ///   • text  — emits NASM syntax to a writer (used by --emit=asm)
 ///   • binary — emits raw machine code into an Encoder (default path)
@@ -336,7 +336,7 @@ pub const X86Gen = struct {
 
         try writer.print("global _start\nsection .text\n", .{});
         try writer.print("_start:\n", .{});
-        // Linux enters with argc at [rsp] followed by argv. A Zin slice is
+        // Linux enters with argc at [rsp] followed by argv. A Mlx slice is
         // passed as pointer then length, so every main may optionally accept
         // `[]const [*]const u8` without affecting no-argument mains.
         try writer.print("  mov rsi, qword [rsp]\n", .{});

@@ -1,6 +1,6 @@
 const fs = require('fs');
 const cp = require('child_process');
-const server = cp.spawn('./vscode-extension/bin/zin-lsp', [], { stdio: ['pipe', 'pipe', 'inherit'] });
+const server = cp.spawn('./vscode-extension/bin/mlx-lsp', [], { stdio: ['pipe', 'pipe', 'inherit'] });
 
 function send(msg) {
     const str = JSON.stringify(msg);
@@ -16,14 +16,14 @@ send({
     params: { capabilities: {} }
 });
 
-const sourceText = fs.readFileSync('compiler/selfhost/source.zin', 'utf8');
+const sourceText = fs.readFileSync('compiler/selfhost/source.mlx', 'utf8');
 
 send({
     jsonrpc: "2.0",
     method: "textDocument/didOpen",
     params: {
         textDocument: {
-            uri: "file://" + process.cwd() + "/compiler/selfhost/source.zin",
+            uri: "file://" + process.cwd() + "/compiler/selfhost/source.mlx",
             text: sourceText
         }
     }
