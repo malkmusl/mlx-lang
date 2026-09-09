@@ -44,8 +44,15 @@ const LoopContext = struct {
 
 pub const Sema = struct {
     const trace_enabled = false;
-    pub const ExternalDecl = struct { module_id: ModuleId, name: []const u8, is_function: bool, is_syscall: bool };
-    pub const DynamicField = struct { base_node: Node.Index, name: []const u8 };
+    pub const ExternalDecl = struct {
+        module_id: ModuleId,
+        name: []const u8,
+        is_function: bool,
+        is_syscall: bool,
+        declaration: Node.Index,
+        analysis_address: usize,
+    };
+    pub const DynamicField = generic_model.DynamicField;
 
     allocator: std.mem.Allocator,
     ast_tree: ast.Ast,
@@ -67,8 +74,9 @@ pub const Sema = struct {
     module_values: std.AutoHashMap(Node.Index, ModuleId),
     external_decls: std.AutoHashMap(Node.Index, ExternalDecl),
     dynamic_fields: std.AutoHashMap(Node.Index, DynamicField),
+    reflected_strings: std.AutoHashMap(Node.Index, []const u8),
     generic_instances: std.ArrayList(generic_model.Instance),
-    generic_calls: std.AutoHashMap(Node.Index, u32),
+    generic_calls: std.AutoHashMap(Node.Index, generic_model.Call),
     module_id: ?ModuleId = null,
     import_ids: ?*const std.AutoHashMap(Node.Index, ModuleId) = null,
     module_registry: ?*const module_namespace.Registry = null,
@@ -101,8 +109,9 @@ pub const Sema = struct {
             .module_values = std.AutoHashMap(Node.Index, ModuleId).init(allocator),
             .external_decls = std.AutoHashMap(Node.Index, ExternalDecl).init(allocator),
             .dynamic_fields = std.AutoHashMap(Node.Index, DynamicField).init(allocator),
+            .reflected_strings = std.AutoHashMap(Node.Index, []const u8).init(allocator),
             .generic_instances = std.ArrayList(generic_model.Instance).empty,
-            .generic_calls = std.AutoHashMap(Node.Index, u32).init(allocator),
+            .generic_calls = std.AutoHashMap(Node.Index, generic_model.Call).init(allocator),
             .unsafe_depth = 0,
             .eval_branch_quota = 1_000_000,
             .current_return_type = null,
@@ -119,6 +128,7 @@ pub const Sema = struct {
         self.module_values.deinit();
         self.external_decls.deinit();
         self.dynamic_fields.deinit();
+        self.reflected_strings.deinit();
         for (self.generic_instances.items) |*instance| instance.deinit(self.allocator);
         self.generic_instances.deinit(self.allocator);
         self.generic_calls.deinit();
@@ -224,7 +234,13 @@ pub const Sema = struct {
                 defer fields.deinit(self.allocator);
                 var i: u32 = 0;
                 while (i < count) : (i += 1) {
-                    const element_type = try self.analyzeNode(self.ast_tree.extra_data[extra_start + 1 + i], scope);
+                    const element_node = self.ast_tree.extra_data[extra_start + 1 + i];
+                    var element_type = try self.analyzeNode(element_node, scope);
+                    const element = self.type_pool.get(element_type);
+                    if (element.data == .primitive and element.data.primitive == .comptime_int_type) {
+                        element_type = try self.type_pool.internSizeInt(true);
+                        try self.node_types.put(element_node, element_type);
+                    }
                     try fields.append(self.allocator, .{ .name = "", .type_id = element_type });
                 }
                 const ty = self.type_pool.internAggregate(.tuple, fields.items, null, null, false) catch {

@@ -111,7 +111,21 @@ pub fn internGenericSymbol(builder: anytype, instance_id: u32) std.mem.Allocator
     const prototype = builder.sema.ast_tree.nodes.get(declaration.data.lhs);
     const token = builder.sema.ast_tree.tokens[prototype.main_token];
     const source = builder.sema.diags.source_manager.getFile(builder.sema.source_id).?.content;
-    const specialized_name = try std.fmt.allocPrint(builder.allocator, "{s}__g{d}", .{ source[token.start..token.end], instance_id });
+    return internGenericSymbolName(
+        builder,
+        builder.sema.module_id orelse 0,
+        source[token.start..token.end],
+        instance_id,
+    );
+}
+
+pub fn internGenericSymbolName(
+    builder: anytype,
+    module_id: u32,
+    name: []const u8,
+    instance_id: u32,
+) std.mem.Allocator.Error!u32 {
+    const specialized_name = try std.fmt.allocPrint(builder.allocator, "{s}__g{d}", .{ name, instance_id });
     defer builder.allocator.free(specialized_name);
-    return builder.lir.internModuleSymbol(builder.sema.module_id orelse 0, specialized_name);
+    return builder.lir.internModuleSymbol(module_id, specialized_name);
 }

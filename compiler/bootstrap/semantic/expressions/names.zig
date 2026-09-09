@@ -119,6 +119,8 @@ fn analyzeFieldAccess(sema: anytype, node_idx: Node.Index, scope: *Scope) std.me
             .name = field_name,
             .is_function = declaration.is_function,
             .is_syscall = declaration.is_syscall,
+            .declaration = declaration.declaration,
+            .analysis_address = declaration.analysis_address,
         });
         return declaration.type_id;
     }

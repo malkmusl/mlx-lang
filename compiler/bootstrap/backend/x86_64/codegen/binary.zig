@@ -211,6 +211,17 @@ pub fn emit(self: anytype, enc: *Encoder, inst_idx: lir.Inst.Index) !void {
             }
         },
 
+        .memory_copy => {
+            const copy = inst.data.memory_copy;
+            const destination = try self.allocateOp(copy.destination);
+            const source = try self.allocateOp(copy.source);
+            const destination_reg = try opToRegBin(enc, destination, .rdi);
+            if (destination_reg != .rdi) try enc.emitMovRegReg(.rdi, destination_reg);
+            const source_reg = try opToRegBin(enc, source, .rsi);
+            if (source_reg != .rsi) try enc.emitMovRegReg(.rsi, source_reg);
+            try memory_codegen.emitMemoryCopy(enc, copy.size);
+        },
+
         .store => {
             const ptr_op = try self.allocateOp(inst.data.store.ptr);
             const val_op = try self.allocateOp(inst.data.store.val);

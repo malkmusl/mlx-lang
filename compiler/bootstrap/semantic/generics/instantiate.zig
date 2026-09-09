@@ -22,11 +22,32 @@ pub fn analyzeCall(
     call_scope: *Scope,
 ) !Outcome {
     _ = call_index;
+    var arguments = std.ArrayList(model.Argument).empty;
+    defer arguments.deinit(sema.allocator);
+    for (argument_nodes) |argument_node| {
+        const actual_type = try sema.analyzeNode(argument_node, call_scope);
+        try arguments.append(sema.allocator, .{
+            .type_id = actual_type,
+            .type_value = sema.type_values.get(argument_node),
+            .const_value = sema.const_values.get(argument_node),
+        });
+    }
+    return analyzePreparedCall(sema, declaration_index, arguments.items);
+}
+
+/// Instantiates a generic owned by `sema` from arguments analyzed in another
+/// module. Type ids are shared by the compilation-wide type pool; comptime
+/// values are copied into the callee's specialization scope.
+pub fn analyzePreparedCall(
+    sema: anytype,
+    declaration_index: Node.Index,
+    prepared_arguments: []const model.Argument,
+) !Outcome {
     const declaration = sema.ast_tree.nodes.get(declaration_index);
     const prototype_index = declaration.data.lhs;
     const prototype = sema.ast_tree.nodes.get(prototype_index);
     const parameter_count: usize = prototype.data.rhs - 1;
-    if (argument_nodes.len != parameter_count) {
+    if (prepared_arguments.len != parameter_count) {
         try sema.reportError(4001, .sema, sema.ast_tree.tokens[prototype.main_token].start, "Generic argument count does not match its declaration");
     }
 
@@ -39,11 +60,11 @@ pub fn analyzeCall(
     var concrete_parameter_types = std.ArrayList(Type.Id).empty;
     defer concrete_parameter_types.deinit(sema.allocator);
 
-    const common_count = @min(argument_nodes.len, parameter_count);
+    const common_count = @min(prepared_arguments.len, parameter_count);
     var parameter_offset: usize = 0;
     while (parameter_offset < common_count) : (parameter_offset += 1) {
-        const argument_node = argument_nodes[parameter_offset];
-        const actual_type = try sema.analyzeNode(argument_node, call_scope);
+        const actual = prepared_arguments[parameter_offset];
+        const actual_type = actual.type_id;
         const parameter_index = sema.ast_tree.extra_data[prototype.data.lhs + 1 + @as(u32, @intCast(parameter_offset))];
         const parameter = sema.ast_tree.nodes.get(parameter_index);
         const declared_type = declared_parameter_types[parameter_offset];
@@ -53,17 +74,17 @@ pub fn analyzeCall(
         const concrete_type = dependent_type orelse if (is_anytype) actual_type else declared_type;
 
         if ((!is_anytype or dependent_type != null) and !sema.type_pool.isCoercible(actual_type, concrete_type)) {
-            try sema.reportError(4001, .sema, sema.ast_tree.tokens[sema.ast_tree.nodes.get(argument_node).main_token].start, "Generic argument type does not match parameter type");
+            try sema.reportError(4001, .sema, sema.ast_tree.tokens[parameter.main_token].start, "Generic argument type does not match parameter type");
         }
-        const type_value = sema.type_values.get(argument_node);
-        const const_value = sema.const_values.get(argument_node);
+        const type_value = actual.type_value;
+        const const_value = actual.const_value;
         if (parameter.decl_flags.comptime_param and type_value == null and const_value == null) {
             try sema.reportError(5001, .@"comptime", sema.ast_tree.tokens[parameter.main_token].start, "comptime argument is not compile-time known");
         }
         if (const_value) |value| {
             const concrete = sema.type_pool.get(concrete_type);
             if ((concrete.data == .integer or concrete.data == .size_int) and !integer_semantics.valueFits(concrete, value)) {
-                try sema.reportError(4002, .sema, sema.ast_tree.tokens[sema.ast_tree.nodes.get(argument_node).main_token].start, "Generic argument does not fit its instantiated parameter type");
+                try sema.reportError(4002, .sema, sema.ast_tree.tokens[parameter.main_token].start, "Generic argument does not fit its instantiated parameter type");
             }
         }
         try concrete_parameter_types.append(sema.allocator, concrete_type);
@@ -88,6 +109,45 @@ pub fn analyzeCall(
             .type_value = instance.result_type_value,
         };
     }
+
+    // Each specialization owns an isolated semantic view. Recursive generic
+    // calls revisit the same AST node ids, so sharing these maps would let an
+    // inner instance overwrite the outer instance's pruned branches and
+    // resolved reflection results.
+    var instance_node_types = try cloneMap(sema.allocator, sema.node_types);
+    errdefer instance_node_types.deinit();
+    var instance_const_values = try cloneMap(sema.allocator, sema.const_values);
+    errdefer instance_const_values.deinit();
+    var instance_type_values = try cloneMap(sema.allocator, sema.type_values);
+    errdefer instance_type_values.deinit();
+    var instance_dynamic_fields = try cloneMap(sema.allocator, sema.dynamic_fields);
+    errdefer instance_dynamic_fields.deinit();
+    var instance_reflected_strings = try cloneMap(sema.allocator, sema.reflected_strings);
+    errdefer instance_reflected_strings.deinit();
+    var instance_generic_calls = try cloneMap(sema.allocator, sema.generic_calls);
+    errdefer instance_generic_calls.deinit();
+
+    const NodeTypeMap = @TypeOf(sema.node_types);
+    const ConstValueMap = @TypeOf(sema.const_values);
+    const TypeValueMap = @TypeOf(sema.type_values);
+    const DynamicFieldMap = @TypeOf(sema.dynamic_fields);
+    const ReflectedStringMap = @TypeOf(sema.reflected_strings);
+    const GenericCallMap = @TypeOf(sema.generic_calls);
+    std.mem.swap(NodeTypeMap, &sema.node_types, &instance_node_types);
+    std.mem.swap(ConstValueMap, &sema.const_values, &instance_const_values);
+    std.mem.swap(TypeValueMap, &sema.type_values, &instance_type_values);
+    std.mem.swap(DynamicFieldMap, &sema.dynamic_fields, &instance_dynamic_fields);
+    std.mem.swap(ReflectedStringMap, &sema.reflected_strings, &instance_reflected_strings);
+    std.mem.swap(GenericCallMap, &sema.generic_calls, &instance_generic_calls);
+    var specialization_active = true;
+    defer if (specialization_active) {
+        std.mem.swap(NodeTypeMap, &sema.node_types, &instance_node_types);
+        std.mem.swap(ConstValueMap, &sema.const_values, &instance_const_values);
+        std.mem.swap(TypeValueMap, &sema.type_values, &instance_type_values);
+        std.mem.swap(DynamicFieldMap, &sema.dynamic_fields, &instance_dynamic_fields);
+        std.mem.swap(ReflectedStringMap, &sema.reflected_strings, &instance_reflected_strings);
+        std.mem.swap(GenericCallMap, &sema.generic_calls, &instance_generic_calls);
+    };
 
     var function_scope = Scope.init(sema.allocator, sema.root_scope);
     defer function_scope.deinit();
@@ -149,14 +209,13 @@ pub fn analyzeCall(
     else
         null;
 
-    var node_types = std.AutoHashMap(Node.Index, Type.Id).init(sema.allocator);
-    errdefer node_types.deinit();
-    var node_iterator = sema.node_types.iterator();
-    while (node_iterator.next()) |entry| try node_types.put(entry.key_ptr.*, entry.value_ptr.*);
-    var const_values = std.AutoHashMap(Node.Index, u64).init(sema.allocator);
-    errdefer const_values.deinit();
-    var const_iterator = sema.const_values.iterator();
-    while (const_iterator.next()) |entry| try const_values.put(entry.key_ptr.*, entry.value_ptr.*);
+    std.mem.swap(NodeTypeMap, &sema.node_types, &instance_node_types);
+    std.mem.swap(ConstValueMap, &sema.const_values, &instance_const_values);
+    std.mem.swap(TypeValueMap, &sema.type_values, &instance_type_values);
+    std.mem.swap(DynamicFieldMap, &sema.dynamic_fields, &instance_dynamic_fields);
+    std.mem.swap(ReflectedStringMap, &sema.reflected_strings, &instance_reflected_strings);
+    std.mem.swap(GenericCallMap, &sema.generic_calls, &instance_generic_calls);
+    specialization_active = false;
 
     const owned_arguments = try sema.allocator.dupe(model.Argument, arguments.items);
     errdefer sema.allocator.free(owned_arguments);
@@ -166,10 +225,22 @@ pub fn analyzeCall(
         .arguments = owned_arguments,
         .function_type = instance_function_type,
         .result_type_value = result_type_value,
-        .node_types = node_types,
-        .const_values = const_values,
+        .node_types = instance_node_types,
+        .const_values = instance_const_values,
+        .type_values = instance_type_values,
+        .dynamic_fields = instance_dynamic_fields,
+        .reflected_strings = instance_reflected_strings,
+        .generic_calls = instance_generic_calls,
     });
     return .{ .instance_id = instance_id, .return_type = return_type, .type_value = result_type_value };
+}
+
+fn cloneMap(allocator: std.mem.Allocator, source: anytype) !@TypeOf(source) {
+    var result = @TypeOf(source).init(allocator);
+    errdefer result.deinit();
+    var iterator = source.iterator();
+    while (iterator.next()) |entry| try result.put(entry.key_ptr.*, entry.value_ptr.*);
+    return result;
 }
 
 fn findExisting(sema: anytype, declaration: Node.Index, arguments: []const model.Argument) ?u32 {

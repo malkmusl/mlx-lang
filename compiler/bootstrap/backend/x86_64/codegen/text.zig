@@ -202,6 +202,22 @@ pub fn emit(self: anytype, writer: anytype, inst_idx: lir.Inst.Index) !void {
                 try writer.print("  lea {s}, [rbp - {d}]\n", .{ op.reg, slot });
             }
         },
+        .memory_copy => {
+            const copy = inst.data.memory_copy;
+            const destination = try self.allocateOp(copy.destination);
+            const source = try self.allocateOp(copy.source);
+            const destination_reg = try opToReg(writer, destination, "rdi");
+            if (!std.mem.eql(u8, destination_reg, "rdi")) try writer.print("  mov rdi, {s}\n", .{destination_reg});
+            const source_reg = try opToReg(writer, source, "rsi");
+            if (!std.mem.eql(u8, source_reg, "rsi")) try writer.print("  mov rsi, {s}\n", .{source_reg});
+            var offset: u32 = 0;
+            while (offset + 8 <= copy.size) : (offset += 8) {
+                try writer.print("  mov rax, qword [rsi + {d}]\n  mov qword [rdi + {d}], rax\n", .{ offset, offset });
+            }
+            while (offset < copy.size) : (offset += 1) {
+                try writer.print("  mov al, byte [rsi + {d}]\n  mov byte [rdi + {d}], al\n", .{ offset, offset });
+            }
+        },
         .store => {
             const ptr_op = try self.allocateOp(inst.data.store.ptr);
             const val_op = try self.allocateOp(inst.data.store.val);

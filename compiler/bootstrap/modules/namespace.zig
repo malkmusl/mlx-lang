@@ -13,6 +13,8 @@ pub const Export = struct {
     module_value: ?ModuleId = null,
     is_function: bool = false,
     is_syscall: bool = false,
+    declaration: u32 = std.math.maxInt(u32),
+    analysis_address: usize = 0,
 };
 
 pub const Namespace = struct {

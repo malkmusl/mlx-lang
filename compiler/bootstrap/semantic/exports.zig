@@ -34,6 +34,8 @@ pub fn collect(sema: *Sema, registry: *namespace.Registry, module_id: ModuleId) 
             .module_value = sema.module_values.get(declaration_index),
             .is_function = declaration.tag == .fn_decl,
             .is_syscall = is_syscall,
+            .declaration = declaration_index,
+            .analysis_address = @intFromPtr(sema),
         });
     }
 }

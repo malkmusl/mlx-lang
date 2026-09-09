@@ -31,11 +31,16 @@ pub fn lower(builder: anytype, node_idx: Node.Index) std.mem.Allocator.Error!?In
     }
 
     const generic_instance = builder.sema.generic_calls.get(node_idx);
-    const target_inst = if (generic_instance) |instance_id|
+    const target_inst = if (generic_instance) |generic_call|
         try builder.emitInst(.{
             .opcode = .func_sym,
             .type_id = builder.sema.node_types.get(target) orelse 0,
-            .data = .{ .func_sym = try function_lowering.internGenericSymbol(builder, instance_id) },
+            .data = .{ .func_sym = try function_lowering.internGenericSymbolName(
+                builder,
+                generic_call.module_id,
+                genericTargetName(builder, target),
+                generic_call.instance_id,
+            ) },
         })
     else
         try builder.lowerNode(target);
@@ -98,6 +103,16 @@ fn isSyscallTarget(builder: anytype, target_node: Node.Index) bool {
     return raw.len >= 2 and std.mem.eql(u8, raw[1 .. raw.len - 1], "syscall");
 }
 
+fn genericTargetName(builder: anytype, target_node: Node.Index) []const u8 {
+    if (builder.sema.external_decls.get(target_node)) |external| return external.name;
+    const declaration_index = builder.sema.resolved_decls.get(target_node) orelse return "generic";
+    const declaration = builder.sema.ast_tree.nodes.get(declaration_index);
+    const prototype = builder.sema.ast_tree.nodes.get(declaration.data.lhs);
+    const token = builder.sema.ast_tree.tokens[prototype.main_token];
+    const source = builder.sema.diags.source_manager.getFile(builder.sema.source_id).?.content;
+    return source[token.start..token.end];
+}
+
 fn isSlice(builder: anytype, type_id: Type.Id) bool {
     const ty = builder.sema.type_pool.get(type_id);
     return ty.data == .pointer and ty.data.pointer.size == .Slice;
@@ -111,6 +126,17 @@ fn isAggregate(builder: anytype, type_id: Type.Id) bool {
 }
 
 fn argumentIsComptime(builder: anytype, target_node: Node.Index, argument_offset: u32) bool {
+    if (builder.sema.external_decls.get(target_node)) |external| {
+        if (external.analysis_address == 0) return false;
+        const SemaType = @TypeOf(builder.sema.*);
+        const target_sema: *SemaType = @ptrFromInt(external.analysis_address);
+        const declaration = target_sema.ast_tree.nodes.get(external.declaration);
+        if (declaration.tag != .fn_decl) return false;
+        const prototype = target_sema.ast_tree.nodes.get(declaration.data.lhs);
+        if (argument_offset + 1 >= prototype.data.rhs) return false;
+        const parameter_index = target_sema.ast_tree.extra_data[prototype.data.lhs + 1 + argument_offset];
+        return target_sema.ast_tree.nodes.get(parameter_index).decl_flags.comptime_param;
+    }
     const declaration_index = builder.sema.resolved_decls.get(target_node) orelse return false;
     const declaration = builder.sema.ast_tree.nodes.get(declaration_index);
     if (declaration.tag != .fn_decl) return false;

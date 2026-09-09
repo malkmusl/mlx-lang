@@ -7,7 +7,23 @@ const aggregate_lowering = @import("aggregate.zig");
 pub fn lower(builder: anytype, node_idx: Node.Index) std.mem.Allocator.Error!?Inst.Index {
     const node = builder.sema.ast_tree.nodes.get(node_idx);
     if (builder.sema.dynamic_fields.get(node_idx)) |field| {
-        return aggregate_lowering.lowerFieldNamed(builder, field.base_node, field.name);
+        return aggregate_lowering.lowerFieldResolved(builder, field.base_node, field.offset, field.type_id);
+    }
+    if (builder.sema.reflected_strings.get(node_idx)) |value| {
+        const literal_id = try builder.lir.addStringLiteral(value);
+        const result = try builder.emitInst(.{
+            .opcode = .string_literal,
+            .type_id = builder.sema.node_types.get(node_idx) orelse 0,
+            .data = .{ .string_literal = literal_id },
+        });
+        const length_type = try builder.sema.type_pool.internSizeInt(false);
+        const length = try builder.emitInst(.{
+            .opcode = .const_i,
+            .type_id = length_type,
+            .data = .{ .const_i = value.len },
+        });
+        try builder.slice_lengths.put(result, length);
+        return result;
     }
     if (builder.sema.const_values.get(node_idx)) |value| {
         return try builder.emitInst(.{

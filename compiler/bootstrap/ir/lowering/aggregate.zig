@@ -34,11 +34,43 @@ pub fn lowerTupleLiteral(builder: anytype, node_index: Node.Index) !?Inst.Index 
         });
         const value_node = builder.sema.ast_tree.extra_data[node.data.lhs + 1 + index];
         const value = try builder.lowerNode(value_node) orelse return null;
-        _ = try builder.emitInst(.{
-            .opcode = .store,
-            .type_id = field.type_id,
-            .data = .{ .store = .{ .ptr = address, .val = value } },
-        });
+        if (isAggregate(builder, field.type_id)) {
+            _ = try builder.emitInst(.{
+                .opcode = .memory_copy,
+                .type_id = field.type_id,
+                .data = .{ .memory_copy = .{
+                    .destination = address,
+                    .source = value,
+                    .size = @intCast(builder.sema.type_pool.sizeOf(field.type_id) catch return null),
+                } },
+            });
+        } else {
+            _ = try builder.emitInst(.{
+                .opcode = .store,
+                .type_id = field.type_id,
+                .data = .{ .store = .{ .ptr = address, .val = value } },
+            });
+        }
+        if (isSlice(builder, field.type_id)) {
+            const length = builder.slice_lengths.get(value) orelse return null;
+            const length_offset = try builder.emitInst(.{
+                .opcode = .const_i,
+                .type_id = offset_type,
+                .data = .{ .const_i = field.offset + 8 },
+            });
+            const length_type = try builder.sema.type_pool.internSizeInt(false);
+            const length_pointer_type = try builder.sema.type_pool.internPtr(length_type, false);
+            const length_address = try builder.emitInst(.{
+                .opcode = .gep,
+                .type_id = length_pointer_type,
+                .data = .{ .gep = .{ .base = base, .index = length_offset, .stride = 1 } },
+            });
+            _ = try builder.emitInst(.{
+                .opcode = .store,
+                .type_id = length_type,
+                .data = .{ .store = .{ .ptr = length_address, .val = length } },
+            });
+        }
     }
     return base;
 }
@@ -97,7 +129,31 @@ pub fn lowerLiteral(builder: anytype, node_index: Node.Index) !?Inst.Index {
             .data = .{ .gep = .{ .base = base, .index = offset, .stride = 1 } },
         });
         const value = try builder.lowerNode(value_node) orelse return null;
-        _ = try builder.emitInst(.{ .opcode = .store, .type_id = field.type_id, .data = .{ .store = .{ .ptr = address, .val = value } } });
+        if (isAggregate(builder, field.type_id)) {
+            _ = try builder.emitInst(.{
+                .opcode = .memory_copy,
+                .type_id = field.type_id,
+                .data = .{ .memory_copy = .{
+                    .destination = address,
+                    .source = value,
+                    .size = @intCast(builder.sema.type_pool.sizeOf(field.type_id) catch return null),
+                } },
+            });
+        } else {
+            _ = try builder.emitInst(.{ .opcode = .store, .type_id = field.type_id, .data = .{ .store = .{ .ptr = address, .val = value } } });
+        }
+        if (isSlice(builder, field.type_id)) {
+            const length = builder.slice_lengths.get(value) orelse return null;
+            const length_offset = try builder.emitInst(.{ .opcode = .const_i, .type_id = offset_type, .data = .{ .const_i = field.offset + 8 } });
+            const length_type = try builder.sema.type_pool.internSizeInt(false);
+            const length_pointer_type = try builder.sema.type_pool.internPtr(length_type, false);
+            const length_address = try builder.emitInst(.{
+                .opcode = .gep,
+                .type_id = length_pointer_type,
+                .data = .{ .gep = .{ .base = base, .index = length_offset, .stride = 1 } },
+            });
+            _ = try builder.emitInst(.{ .opcode = .store, .type_id = length_type, .data = .{ .store = .{ .ptr = length_address, .val = length } } });
+        }
     }
     return base;
 }
@@ -126,17 +182,48 @@ pub fn lowerField(builder: anytype, node_index: Node.Index) !?Inst.Index {
 }
 
 pub fn lowerFieldNamed(builder: anytype, base_node: Node.Index, name: []const u8) !?Inst.Index {
-    const base = try builder.lowerNode(base_node) orelse return null;
     const base_type = builder.sema.node_types.get(base_node) orelse return null;
     const field = builder.sema.type_pool.aggregateField(base_type, name) orelse return null;
+    return lowerFieldResolved(builder, base_node, field.offset, field.type_id);
+}
+
+pub fn lowerFieldResolved(builder: anytype, base_node: Node.Index, field_offset: u64, field_type: u32) !?Inst.Index {
+    const base = try builder.lowerNode(base_node) orelse return null;
     const offset_type = try builder.sema.type_pool.internSizeInt(false);
-    const offset = try builder.emitInst(.{ .opcode = .const_i, .type_id = offset_type, .data = .{ .const_i = field.offset } });
-    const pointer_type = try builder.sema.type_pool.internPtr(field.type_id, false);
+    const offset = try builder.emitInst(.{ .opcode = .const_i, .type_id = offset_type, .data = .{ .const_i = field_offset } });
+    const pointer_type = try builder.sema.type_pool.internPtr(field_type, false);
     const address = try builder.emitInst(.{
         .opcode = .gep,
         .type_id = pointer_type,
         .data = .{ .gep = .{ .base = base, .index = offset, .stride = 1 } },
     });
-    const result = try builder.emitInst(.{ .opcode = .load, .type_id = field.type_id, .data = .{ .load = .{ .ptr = address } } });
+    const result = if (isAggregate(builder, field_type))
+        address
+    else
+        try builder.emitInst(.{ .opcode = .load, .type_id = field_type, .data = .{ .load = .{ .ptr = address } } });
+    if (isSlice(builder, field_type)) {
+        const length_offset = try builder.emitInst(.{ .opcode = .const_i, .type_id = offset_type, .data = .{ .const_i = field_offset + 8 } });
+        const length_type = try builder.sema.type_pool.internSizeInt(false);
+        const length_pointer_type = try builder.sema.type_pool.internPtr(length_type, false);
+        const length_address = try builder.emitInst(.{
+            .opcode = .gep,
+            .type_id = length_pointer_type,
+            .data = .{ .gep = .{ .base = base, .index = length_offset, .stride = 1 } },
+        });
+        const length = try builder.emitInst(.{ .opcode = .load, .type_id = length_type, .data = .{ .load = .{ .ptr = length_address } } });
+        try builder.slice_lengths.put(result, length);
+    }
     return result;
+}
+
+fn isSlice(builder: anytype, type_id: u32) bool {
+    const value_type = builder.sema.type_pool.get(type_id);
+    return value_type.data == .pointer and value_type.data.pointer.size == .Slice;
+}
+
+fn isAggregate(builder: anytype, type_id: u32) bool {
+    return switch (builder.sema.type_pool.get(type_id).data) {
+        .array, .@"struct", .@"union", .tuple => true,
+        else => false,
+    };
 }

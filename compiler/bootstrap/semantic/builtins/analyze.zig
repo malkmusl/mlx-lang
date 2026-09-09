@@ -1,6 +1,7 @@
 const std = @import("std");
 const Node = @import("../../syntax/ast.zig").Node;
 const Type = @import("../type.zig").Type;
+const TypePool = @import("../type.zig").TypePool;
 const Scope = @import("../scope.zig").Scope;
 const builtin = @import("../builtin.zig");
 
@@ -28,7 +29,8 @@ pub fn analyze(self: anytype, node_idx: Node.Index, scope: *Scope) std.mem.Alloc
         .nocopy => analyzeNoCopy(self, node_idx, arguments, scope, name_token.start),
         .move => analyzeMove(self, node_idx, arguments, scope, name_token.start, source),
         .sizeOf, .alignOf, .bitSizeOf => analyzeLayout(self, kind, node_idx, arguments, scope, name_token.start),
-        .isInteger, .isFloat, .isStruct, .isEnum, .isUnion, .isPointer, .isSlice, .isArray, .isOptional, .isErrorUnion, .isCopyable => analyzePredicate(self, kind, node_idx, arguments, scope, name_token.start),
+        .childType => analyzeChildType(self, node_idx, arguments, scope, name_token.start),
+        .isInteger, .isFloat, .isBool, .isSigned, .isStruct, .isTuple, .isEnum, .isUnion, .isPointer, .isSlice, .isArray, .isOptional, .isErrorUnion, .isCopyable => analyzePredicate(self, kind, node_idx, arguments, scope, name_token.start),
         .Vector => analyzeVector(self, node_idx, arguments, scope, name_token.start),
         .intCast, .floatCast, .floatFromInt, .intFromFloat, .ptrCast, .alignCast, .bitCast, .ptrFromInt, .enumFromInt => self.analyzeCastBuiltin(kind, node_idx, arguments, scope, name_token.start),
         .intFromPtr => analyzeIntFromPtr(self, node_idx, arguments, scope, name_token.start),
@@ -38,6 +40,7 @@ pub fn analyze(self: anytype, node_idx: Node.Index, scope: *Scope) std.mem.Alloc
         .setEvalBranchQuota => analyzeQuota(self, node_idx, arguments, scope, name_token.start),
         .import => analyzeImport(self, node_idx, arguments, name_token.start),
         .fieldCount => analyzeFieldCount(self, node_idx, arguments, scope, name_token.start),
+        .fieldName => analyzeFieldName(self, node_idx, arguments, scope, name_token.start),
         .fieldType => analyzeFieldType(self, node_idx, arguments, scope, name_token.start),
         .hasField => analyzeHasField(self, node_idx, arguments, scope, name_token.start),
         .offsetOf => analyzeOffsetOf(self, node_idx, arguments, scope, name_token.start),
@@ -108,7 +111,15 @@ fn analyzePredicate(self: anytype, kind: builtin.Kind, node_idx: Node.Index, arg
     const result = switch (kind) {
         .isInteger => value.isInteger(),
         .isFloat => value.isFloat(),
+        .isBool => value.data == .primitive and value.data.primitive == .bool_type,
+        .isSigned => switch (value.data) {
+            .integer => |integer| integer.is_signed,
+            .size_int => |integer| integer.is_signed,
+            .primitive => |primitive| primitive == .comptime_int_type,
+            else => false,
+        },
         .isStruct => value.data == .@"struct",
+        .isTuple => value.data == .tuple,
         .isEnum => value.data == .@"enum",
         .isUnion => value.data == .@"union",
         .isPointer => value.data == .pointer and value.data.pointer.size != .Slice,
@@ -204,18 +215,42 @@ fn analyzeFieldCount(self: anytype, node_idx: Node.Index, arguments: []const u32
     return self.putBuiltinResult(node_idx, try self.type_pool.internPrimitive(.comptime_int_type));
 }
 
+fn analyzeChildType(self: anytype, node_idx: Node.Index, arguments: []const u32, scope: *Scope, start: u32) !Type.Id {
+    const container_type = try self.resolveBuiltinTypeArg(arguments[0], scope) orelse {
+        try self.reportError(5005, .@"comptime", start, "@childType requires a type argument");
+        return self.putBuiltinResult(node_idx, try self.type_pool.internPrimitive(.type_type));
+    };
+    const child_type = switch (self.type_pool.get(container_type).data) {
+        .pointer => |pointer| pointer.child_type,
+        .array => |array| array.child_type,
+        .optional => |optional| optional.child_type,
+        .vector => |vector| vector.child_type,
+        .error_union => |error_union| error_union.payload,
+        else => {
+            try self.reportError(5005, .@"comptime", start, "@childType requires a pointer, slice, array, optional, vector, or error union");
+            return self.putBuiltinResult(node_idx, try self.type_pool.internPrimitive(.type_type));
+        },
+    };
+    try self.type_values.put(node_idx, child_type);
+    return self.putBuiltinResult(node_idx, try self.type_pool.internPrimitive(.type_type));
+}
+
 fn analyzeFieldType(self: anytype, node_idx: Node.Index, arguments: []const u32, scope: *Scope, start: u32) !Type.Id {
     const aggregate_type = try requireAggregateType(self, node_idx, arguments[0], scope, start, "@fieldType requires an aggregate type", .type_type) orelse return self.node_types.get(node_idx).?;
-    const field_name = self.stringLiteralContent(arguments[1]) orelse {
-        try self.reportError(5001, .@"comptime", start, "@fieldType field name must be a comptime string");
-        return self.putBuiltinResult(node_idx, try self.type_pool.internPrimitive(.type_type));
-    };
-    const field = self.type_pool.aggregateField(aggregate_type, field_name) orelse {
-        try self.reportError(5005, .@"comptime", start, "Unknown aggregate field");
-        return self.putBuiltinResult(node_idx, try self.type_pool.internPrimitive(.type_type));
-    };
+    const field = try selectAggregateField(self, aggregate_type, arguments[1], scope, start) orelse return self.putBuiltinResult(node_idx, try self.type_pool.internPrimitive(.type_type));
     try self.type_values.put(node_idx, field.type_id);
     return self.putBuiltinResult(node_idx, try self.type_pool.internPrimitive(.type_type));
+}
+
+fn analyzeFieldName(self: anytype, node_idx: Node.Index, arguments: []const u32, scope: *Scope, start: u32) !Type.Id {
+    const aggregate_type = try requireAggregateType(self, node_idx, arguments[0], scope, start, "@fieldName requires an aggregate type", .void_type) orelse return self.node_types.get(node_idx).?;
+    const field = try selectAggregateField(self, aggregate_type, arguments[1], scope, start) orelse {
+        const u8_type = try self.type_pool.internInt(false, 8);
+        return self.putBuiltinResult(node_idx, try self.type_pool.internSlice(u8_type, true));
+    };
+    try self.reflected_strings.put(node_idx, field.name);
+    const u8_type = try self.type_pool.internInt(false, 8);
+    return self.putBuiltinResult(node_idx, try self.type_pool.internSlice(u8_type, true));
 }
 
 fn analyzeHasField(self: anytype, node_idx: Node.Index, arguments: []const u32, scope: *Scope, start: u32) !Type.Id {
@@ -246,16 +281,35 @@ fn analyzeOffsetOf(self: anytype, node_idx: Node.Index, arguments: []const u32, 
 
 fn analyzeField(self: anytype, node_idx: Node.Index, arguments: []const u32, scope: *Scope, start: u32) !Type.Id {
     const aggregate_type = try self.analyzeNode(arguments[0], scope);
-    const field_name = self.stringLiteralContent(arguments[1]) orelse {
-        try self.reportError(5001, .@"comptime", start, "@field field name must be a comptime string");
-        return self.putBuiltinResult(node_idx, try self.type_pool.internPrimitive(.void_type));
-    };
-    const field = self.type_pool.aggregateField(aggregate_type, field_name) orelse {
-        try self.reportError(5005, .@"comptime", start, "Unknown aggregate field");
-        return self.putBuiltinResult(node_idx, try self.type_pool.internPrimitive(.void_type));
-    };
-    try self.dynamic_fields.put(node_idx, .{ .base_node = arguments[0], .name = field_name });
+    const field = try selectAggregateField(self, aggregate_type, arguments[1], scope, start) orelse return self.putBuiltinResult(node_idx, try self.type_pool.internPrimitive(.void_type));
+    try self.dynamic_fields.put(node_idx, .{
+        .base_node = arguments[0],
+        .offset = field.offset,
+        .type_id = field.type_id,
+    });
     return self.putBuiltinResult(node_idx, field.type_id);
+}
+
+fn selectAggregateField(self: anytype, aggregate_type: Type.Id, selector_node: Node.Index, scope: *Scope, start: u32) !?TypePool.AggregateField {
+    if (self.stringLiteralContent(selector_node)) |field_name| {
+        if (self.type_pool.aggregateField(aggregate_type, field_name)) |field| return field;
+        try self.reportError(5005, .@"comptime", start, "Unknown aggregate field");
+        return null;
+    }
+    _ = try self.analyzeNode(selector_node, scope);
+    const field_index = self.const_values.get(selector_node) orelse {
+        try self.reportError(5001, .@"comptime", start, "Aggregate field selector must be a comptime string or index");
+        return null;
+    };
+    const fields = self.type_pool.aggregateFields(aggregate_type) orelse {
+        try self.reportError(5005, .@"comptime", start, "Aggregate field selector requires an aggregate type");
+        return null;
+    };
+    if (field_index >= fields.len) {
+        try self.reportError(5005, .@"comptime", start, "Aggregate field index is out of bounds");
+        return null;
+    }
+    return fields[field_index];
 }
 
 fn analyzeTagOf(self: anytype, node_idx: Node.Index, arguments: []const u32, scope: *Scope, start: u32) !Type.Id {

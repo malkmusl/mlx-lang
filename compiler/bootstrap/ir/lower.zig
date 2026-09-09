@@ -122,10 +122,21 @@ pub const LirBuilder = struct {
         if (return_type.data == .primitive and return_type.data.primitive == .type_type) return;
         const TypeMap = std.AutoHashMap(Node.Index, Type.Id);
         const ValueMap = std.AutoHashMap(Node.Index, u64);
+        const StringMap = std.AutoHashMap(Node.Index, []const u8);
+        const DynamicFieldMap = std.AutoHashMap(Node.Index, Sema.DynamicField);
+        const GenericCallMap = @TypeOf(self.sema.generic_calls);
         std.mem.swap(TypeMap, &self.sema.node_types, &self.sema.generic_instances.items[instance_id].node_types);
         std.mem.swap(ValueMap, &self.sema.const_values, &self.sema.generic_instances.items[instance_id].const_values);
+        std.mem.swap(TypeMap, &self.sema.type_values, &self.sema.generic_instances.items[instance_id].type_values);
+        std.mem.swap(DynamicFieldMap, &self.sema.dynamic_fields, &self.sema.generic_instances.items[instance_id].dynamic_fields);
+        std.mem.swap(StringMap, &self.sema.reflected_strings, &self.sema.generic_instances.items[instance_id].reflected_strings);
+        std.mem.swap(GenericCallMap, &self.sema.generic_calls, &self.sema.generic_instances.items[instance_id].generic_calls);
         defer std.mem.swap(TypeMap, &self.sema.node_types, &self.sema.generic_instances.items[instance_id].node_types);
         defer std.mem.swap(ValueMap, &self.sema.const_values, &self.sema.generic_instances.items[instance_id].const_values);
+        defer std.mem.swap(TypeMap, &self.sema.type_values, &self.sema.generic_instances.items[instance_id].type_values);
+        defer std.mem.swap(DynamicFieldMap, &self.sema.dynamic_fields, &self.sema.generic_instances.items[instance_id].dynamic_fields);
+        defer std.mem.swap(StringMap, &self.sema.reflected_strings, &self.sema.generic_instances.items[instance_id].reflected_strings);
+        defer std.mem.swap(GenericCallMap, &self.sema.generic_calls, &self.sema.generic_instances.items[instance_id].generic_calls);
         const previous = self.current_generic_instance;
         self.current_generic_instance = instance_id;
         defer self.current_generic_instance = previous;
@@ -382,6 +393,11 @@ pub const LirBuilder = struct {
                     .const_i => std.debug.print("{d}", .{inst.data.const_i}),
                     .const_f => std.debug.print("{d}", .{inst.data.const_f}),
                     .aggregate_copy => std.debug.print("value: %{d}", .{inst.data.aggregate_copy}),
+                    .memory_copy => std.debug.print("destination: %{d}, source: %{d}, size: {d}", .{
+                        inst.data.memory_copy.destination,
+                        inst.data.memory_copy.source,
+                        inst.data.memory_copy.size,
+                    }),
                     .add => std.debug.print("%{d}, %{d}", .{ inst.data.add.lhs, inst.data.add.rhs }),
                     .sub => std.debug.print("%{d}, %{d}", .{ inst.data.sub.lhs, inst.data.sub.rhs }),
                     .mul => std.debug.print("%{d}, %{d}", .{ inst.data.mul.lhs, inst.data.mul.rhs }),

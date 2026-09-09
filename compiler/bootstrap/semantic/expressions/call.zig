@@ -4,6 +4,7 @@ const Type = @import("../type.zig").Type;
 const Scope = @import("../scope.zig").Scope;
 const generic_definition = @import("../generics/definition.zig");
 const generic_instantiation = @import("../generics/instantiate.zig");
+const generic_model = @import("../generics/model.zig");
 
 pub fn analyze(sema: anytype, node_idx: Node.Index, scope: *Scope) std.mem.Allocator.Error!Type.Id {
     const node = sema.ast_tree.nodes.get(node_idx);
@@ -22,10 +23,42 @@ pub fn analyze(sema: anytype, node_idx: Node.Index, scope: *Scope) std.mem.Alloc
                 sema.ast_tree.extra_data[extra_start + 1 .. extra_start + 1 + num_args],
                 scope,
             );
-            try sema.generic_calls.put(node_idx, outcome.instance_id);
+            try sema.generic_calls.put(node_idx, .{
+                .module_id = sema.module_id orelse 0,
+                .instance_id = outcome.instance_id,
+            });
             try sema.node_types.put(node_idx, outcome.return_type);
             if (outcome.type_value) |type_value| try sema.type_values.put(node_idx, type_value);
             return outcome.return_type;
+        }
+    }
+
+    if (sema.external_decls.get(target)) |external| {
+        if (external.is_function and external.analysis_address != 0) {
+            const SemaType = @TypeOf(sema.*);
+            const target_sema: *SemaType = @ptrFromInt(external.analysis_address);
+            if (generic_definition.isGeneric(&target_sema.ast_tree, external.declaration)) {
+                var arguments = std.ArrayList(generic_model.Argument).empty;
+                defer arguments.deinit(sema.allocator);
+                var argument_offset: u32 = 0;
+                while (argument_offset < num_args) : (argument_offset += 1) {
+                    const argument_node = sema.ast_tree.extra_data[extra_start + 1 + argument_offset];
+                    const actual_type = try sema.analyzeNode(argument_node, scope);
+                    try arguments.append(sema.allocator, .{
+                        .type_id = actual_type,
+                        .type_value = sema.type_values.get(argument_node),
+                        .const_value = sema.const_values.get(argument_node),
+                    });
+                }
+                const outcome = try generic_instantiation.analyzePreparedCall(target_sema, external.declaration, arguments.items);
+                try sema.generic_calls.put(node_idx, .{
+                    .module_id = external.module_id,
+                    .instance_id = outcome.instance_id,
+                });
+                try sema.node_types.put(node_idx, outcome.return_type);
+                if (outcome.type_value) |type_value| try sema.type_values.put(node_idx, type_value);
+                return outcome.return_type;
+            }
         }
     }
 

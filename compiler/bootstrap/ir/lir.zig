@@ -6,6 +6,7 @@ pub const Opcode = enum {
     const_f,
     copy,
     aggregate_copy,
+    memory_copy,
 
     // Arithmetic
     add,
@@ -75,6 +76,7 @@ pub const Inst = struct {
         const_f: f64,
         copy: Index,
         aggregate_copy: Index,
+        memory_copy: struct { destination: Index, source: Index, size: u32 },
 
         add: struct { lhs: Index, rhs: Index },
         sub: struct { lhs: Index, rhs: Index },
