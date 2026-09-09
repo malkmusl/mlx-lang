@@ -188,7 +188,9 @@ pub const Sema = struct {
 
     pub fn methodForDeclaration(self: *Sema, declaration: Node.Index) ?AggregateMethod {
         for (self.aggregate_methods.items) |method| {
-            if (method.declaration == declaration) return method;
+            // AST node indices are local to a module. Imported methods can
+            // therefore share an index with an unrelated local declaration.
+            if (method.analysis_address == @intFromPtr(self) and method.declaration == declaration) return method;
         }
         return null;
     }
