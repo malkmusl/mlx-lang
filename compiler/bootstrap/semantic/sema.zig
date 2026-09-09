@@ -53,6 +53,14 @@ pub const Sema = struct {
         analysis_address: usize,
     };
     pub const DynamicField = generic_model.DynamicField;
+    pub const AggregateMethod = struct {
+        owner_type: Type.Id,
+        name: []const u8,
+        qualified_name: []const u8,
+        declaration: Node.Index,
+        module_id: ModuleId,
+        analysis_address: usize,
+    };
 
     allocator: std.mem.Allocator,
     ast_tree: ast.Ast,
@@ -77,6 +85,7 @@ pub const Sema = struct {
     reflected_strings: std.AutoHashMap(Node.Index, []const u8),
     generic_instances: std.ArrayList(generic_model.Instance),
     generic_calls: std.AutoHashMap(Node.Index, generic_model.Call),
+    aggregate_methods: std.ArrayList(AggregateMethod),
     module_id: ?ModuleId = null,
     import_ids: ?*const std.AutoHashMap(Node.Index, ModuleId) = null,
     module_registry: ?*const module_namespace.Registry = null,
@@ -112,6 +121,7 @@ pub const Sema = struct {
             .reflected_strings = std.AutoHashMap(Node.Index, []const u8).init(allocator),
             .generic_instances = std.ArrayList(generic_model.Instance).empty,
             .generic_calls = std.AutoHashMap(Node.Index, generic_model.Call).init(allocator),
+            .aggregate_methods = std.ArrayList(AggregateMethod).empty,
             .unsafe_depth = 0,
             .eval_branch_quota = 1_000_000,
             .current_return_type = null,
@@ -132,7 +142,55 @@ pub const Sema = struct {
         for (self.generic_instances.items) |*instance| instance.deinit(self.allocator);
         self.generic_instances.deinit(self.allocator);
         self.generic_calls.deinit();
+        for (self.aggregate_methods.items) |method| self.allocator.free(method.qualified_name);
+        self.aggregate_methods.deinit(self.allocator);
         self.loop_stack.deinit(self.allocator);
+    }
+
+    pub fn registerAggregateMethod(self: *Sema, owner_type: Type.Id, name: []const u8, declaration: Node.Index) !void {
+        for (self.aggregate_methods.items) |method| {
+            if (method.owner_type == owner_type and std.mem.eql(u8, method.name, name)) return;
+        }
+        const qualified = try std.fmt.allocPrint(self.allocator, "__mlx_t{d}_{s}", .{ owner_type, name });
+        errdefer self.allocator.free(qualified);
+        try self.aggregate_methods.append(self.allocator, .{
+            .owner_type = owner_type,
+            .name = name,
+            .qualified_name = qualified,
+            .declaration = declaration,
+            .module_id = self.module_id orelse 0,
+            .analysis_address = @intFromPtr(self),
+        });
+    }
+
+    pub fn registerExternalAggregateMethod(self: *Sema, method: AggregateMethod) !void {
+        for (self.aggregate_methods.items) |existing| {
+            if (existing.owner_type == method.owner_type and std.mem.eql(u8, existing.name, method.name)) return;
+        }
+        const qualified = try self.allocator.dupe(u8, method.qualified_name);
+        errdefer self.allocator.free(qualified);
+        try self.aggregate_methods.append(self.allocator, .{
+            .owner_type = method.owner_type,
+            .name = method.name,
+            .qualified_name = qualified,
+            .declaration = method.declaration,
+            .module_id = method.module_id,
+            .analysis_address = method.analysis_address,
+        });
+    }
+
+    pub fn aggregateMethod(self: *Sema, owner_type: Type.Id, name: []const u8) ?AggregateMethod {
+        for (self.aggregate_methods.items) |method| {
+            if (method.owner_type == owner_type and std.mem.eql(u8, method.name, name)) return method;
+        }
+        return null;
+    }
+
+    pub fn methodForDeclaration(self: *Sema, declaration: Node.Index) ?AggregateMethod {
+        for (self.aggregate_methods.items) |method| {
+            if (method.declaration == declaration) return method;
+        }
+        return null;
     }
 
     pub fn configureModules(

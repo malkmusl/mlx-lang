@@ -13,6 +13,21 @@ pub fn analyze(sema: anytype, node_idx: Node.Index, scope: *Scope) std.mem.Alloc
     const target_type_id = try sema.analyzeNode(target, scope);
     const num_args = sema.ast_tree.extra_data[extra_start];
     const target_type = sema.type_pool.get(target_type_id);
+    var implicit_receiver: ?Node.Index = null;
+    var target_is_method = false;
+    if (sema.resolved_decls.get(target)) |declaration| {
+        target_is_method = sema.methodForDeclaration(declaration) != null;
+    } else if (sema.external_decls.get(target)) |external| {
+        if (external.analysis_address != 0) {
+            const SemaType = @TypeOf(sema.*);
+            const target_sema: *SemaType = @ptrFromInt(external.analysis_address);
+            target_is_method = target_sema.methodForDeclaration(external.declaration) != null;
+        }
+    }
+    if (target_is_method) {
+        const target_node = sema.ast_tree.nodes.get(target);
+        if (target_node.tag == .field_access and sema.type_values.get(target_node.data.lhs) == null) implicit_receiver = target_node.data.lhs;
+    }
 
     if (sema.resolved_decls.get(target)) |target_declaration| {
         if (generic_definition.isGeneric(&sema.ast_tree, target_declaration)) {
@@ -73,17 +88,24 @@ pub fn analyze(sema: anytype, node_idx: Node.Index, scope: *Scope) std.mem.Alloc
 
     const function = target_type.data.function;
     const params = sema.type_pool.functionParams(function);
-    if (num_args != params.len) {
+    const implicit_count: u32 = if (implicit_receiver == null) 0 else 1;
+    if (num_args + implicit_count != params.len) {
         try sema.reportError(4001, .sema, sema.ast_tree.tokens[node.main_token].start, "Function argument count does not match its declaration");
+    }
+    if (implicit_receiver) |receiver| {
+        const receiver_type = try sema.analyzeNode(receiver, scope);
+        if (params.len == 0 or !sema.type_pool.isCoercible(receiver_type, params[0])) {
+            try sema.reportError(4001, .sema, sema.ast_tree.tokens[sema.ast_tree.nodes.get(receiver).main_token].start, "Method receiver type does not match its declaration");
+        }
     }
     var i: u32 = 0;
     while (i < num_args) : (i += 1) {
         const arg_node = sema.ast_tree.extra_data[extra_start + 1 + i];
         const arg_type = try sema.analyzeNode(arg_node, scope);
-        if (i < params.len) {
-            const parameter_type = sema.type_pool.get(params[i]);
+        if (i + implicit_count < params.len) {
+            const parameter_type = sema.type_pool.get(params[i + implicit_count]);
             const accepts_anytype = isPrimitive(parameter_type, .anytype_type);
-            if (!accepts_anytype and !sema.type_pool.isCoercible(arg_type, params[i])) {
+            if (!accepts_anytype and !sema.type_pool.isCoercible(arg_type, params[i + implicit_count])) {
                 try sema.reportError(4001, .sema, sema.ast_tree.tokens[sema.ast_tree.nodes.get(arg_node).main_token].start, "Function argument type does not match parameter type");
             }
         }

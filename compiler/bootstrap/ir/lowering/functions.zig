@@ -33,6 +33,8 @@ fn lowerDeclaration(builder: anytype, node_idx: Node.Index) std.mem.Allocator.Er
     const source = builder.sema.diags.source_manager.getFile(builder.sema.source_id).?.content;
     const symbol = if (builder.current_generic_instance) |instance_id|
         try internGenericSymbol(builder, instance_id)
+    else if (builder.sema.methodForDeclaration(node_idx)) |method|
+        try builder.lir.internModuleSymbol(builder.sema.module_id orelse 0, method.qualified_name)
     else
         try builder.lir.internModuleSymbol(builder.sema.module_id orelse 0, source[token.start..token.end]);
     _ = try builder.emitInst(.{

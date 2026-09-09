@@ -109,10 +109,26 @@ pub const LirBuilder = struct {
             const child_idx = self.sema.ast_tree.extra_data[i];
             if (generic_definition.isGeneric(&self.sema.ast_tree, child_idx)) continue;
             _ = try self.lowerNode(child_idx);
+            try self.lowerAggregateMethods(child_idx);
         }
         var instance_id: u32 = 0;
         while (instance_id < self.sema.generic_instances.items.len) : (instance_id += 1) {
             try self.lowerGenericInstance(instance_id);
+        }
+    }
+
+    fn lowerAggregateMethods(self: *LirBuilder, declaration_index: Node.Index) !void {
+        const declaration = self.sema.ast_tree.nodes.get(declaration_index);
+        if (declaration.tag != .const_decl and declaration.tag != .var_decl) return;
+        const initializer = self.sema.ast_tree.extra_data[declaration.data.rhs + 1];
+        const aggregate = self.sema.ast_tree.nodes.get(initializer);
+        if (aggregate.tag != .struct_decl and aggregate.tag != .enum_decl and aggregate.tag != .union_decl) return;
+        var extra_index = aggregate.data.lhs + 1;
+        while (extra_index < aggregate.data.rhs) : (extra_index += 1) {
+            const member = self.sema.ast_tree.extra_data[extra_index];
+            if (self.sema.ast_tree.nodes.get(member).tag != .fn_decl) continue;
+            if (generic_definition.isGeneric(&self.sema.ast_tree, member)) continue;
+            _ = try self.lowerNode(member);
         }
     }
 
@@ -308,6 +324,16 @@ pub const LirBuilder = struct {
                 return result;
             },
             .field_access => {
+                if (self.sema.resolved_decls.get(node_idx)) |declaration| {
+                    if (self.sema.methodForDeclaration(declaration)) |method| {
+                        const symbol = try self.lir.internModuleSymbol(self.sema.module_id orelse 0, method.qualified_name);
+                        return try self.emitInst(.{
+                            .opcode = .func_sym,
+                            .type_id = self.sema.node_types.get(node_idx) orelse 0,
+                            .data = .{ .func_sym = symbol },
+                        });
+                    }
+                }
                 if (self.sema.external_decls.get(node_idx)) |external| {
                     if (external.is_function) {
                         const symbol = try self.lir.internModuleSymbol(external.module_id, external.name);

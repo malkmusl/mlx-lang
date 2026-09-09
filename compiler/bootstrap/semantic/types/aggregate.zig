@@ -47,6 +47,7 @@ pub fn analyze(sema: anytype, node_index: Node.Index, scope: *Scope) !Type.Id {
     while (extra_index < node.data.rhs) : (extra_index += 1) {
         const member_index = sema.ast_tree.extra_data[extra_index];
         const member = sema.ast_tree.nodes.get(member_index);
+        if (member.tag == .fn_decl) continue;
         const name_token = sema.ast_tree.tokens[member.main_token];
         const name = source[name_token.start..name_token.end];
         if (names.contains(name)) {
@@ -128,5 +129,38 @@ pub fn analyze(sema: anytype, node_index: Node.Index, scope: *Scope) !Type.Id {
     try sema.type_values.put(node_index, aggregate_type);
     const result_type = try sema.type_pool.internPrimitive(.type_type);
     try sema.node_types.put(node_index, result_type);
+
+    var member_scope = Scope.init(sema.allocator, scope);
+    defer member_scope.deinit();
+    try member_scope.put("Self", .{
+        .name = "Self",
+        .decl_node = node_index,
+        .type_id = result_type,
+        .is_const = true,
+    });
+
+    extra_index = node.data.lhs + 1;
+    while (extra_index < node.data.rhs) : (extra_index += 1) {
+        const member_index = sema.ast_tree.extra_data[extra_index];
+        const member = sema.ast_tree.nodes.get(member_index);
+        if (member.tag != .fn_decl) continue;
+        const prototype = sema.ast_tree.nodes.get(member.data.lhs);
+        const method_token = sema.ast_tree.tokens[prototype.main_token];
+        const method_name = source[method_token.start..method_token.end];
+        const function_type = try sema.analyzeNode(member.data.lhs, &member_scope);
+        try member_scope.put(method_name, .{
+            .name = method_name,
+            .decl_node = member_index,
+            .type_id = function_type,
+            .is_const = true,
+        });
+        try sema.registerAggregateMethod(aggregate_type, method_name, member_index);
+    }
+
+    extra_index = node.data.lhs + 1;
+    while (extra_index < node.data.rhs) : (extra_index += 1) {
+        const member_index = sema.ast_tree.extra_data[extra_index];
+        if (sema.ast_tree.nodes.get(member_index).tag == .fn_decl) _ = try sema.analyzeNode(member_index, &member_scope);
+    }
     return result_type;
 }

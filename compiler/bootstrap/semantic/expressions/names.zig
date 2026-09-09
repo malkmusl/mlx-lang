@@ -122,11 +122,56 @@ fn analyzeFieldAccess(sema: anytype, node_idx: Node.Index, scope: *Scope) std.me
             .declaration = declaration.declaration,
             .analysis_address = declaration.analysis_address,
         });
+        if (declaration.type_value) |owner_type| {
+            if (declaration.analysis_address != 0) {
+                const SemaType = @TypeOf(sema.*);
+                const target_sema: *SemaType = @ptrFromInt(declaration.analysis_address);
+                for (target_sema.aggregate_methods.items) |method| {
+                    if (method.owner_type != owner_type) continue;
+                    const method_node = target_sema.ast_tree.nodes.get(method.declaration);
+                    if (method_node.decl_flags.public) try sema.registerExternalAggregateMethod(method);
+                }
+            }
+        }
         return declaration.type_id;
     }
 
     if (sema.type_values.get(node.data.lhs)) |type_value| {
         const reflected = sema.type_pool.get(type_value);
+        if (sema.external_decls.get(node.data.lhs)) |external_type| {
+            if (external_type.analysis_address != 0) {
+                const SemaType = @TypeOf(sema.*);
+                const target_sema: *SemaType = @ptrFromInt(external_type.analysis_address);
+                if (target_sema.aggregateMethod(type_value, field_name)) |method| {
+                    const method_node = target_sema.ast_tree.nodes.get(method.declaration);
+                    if (!method_node.decl_flags.public) try sema.reportError(3003, .resolve, field_token.start, "Aggregate method is private");
+                    const method_type = target_sema.node_types.get(method.declaration) orelse target_sema.node_types.get(method_node.data.lhs) orelse {
+                        try sema.reportError(4001, .sema, field_token.start, "Aggregate method type is unavailable");
+                        return sema.putBuiltinResult(node_idx, try sema.type_pool.internPrimitive(.void_type));
+                    };
+                    try sema.registerExternalAggregateMethod(method);
+                    try sema.node_types.put(node_idx, method_type);
+                    try sema.external_decls.put(node_idx, .{
+                        .module_id = external_type.module_id,
+                        .name = method.qualified_name,
+                        .is_function = true,
+                        .is_syscall = false,
+                        .declaration = method.declaration,
+                        .analysis_address = external_type.analysis_address,
+                    });
+                    return method_type;
+                }
+            }
+        }
+        if (sema.aggregateMethod(type_value, field_name)) |method| {
+            const method_type = sema.node_types.get(method.declaration) orelse sema.node_types.get(sema.ast_tree.nodes.get(method.declaration).data.lhs) orelse {
+                try sema.reportError(4001, .sema, field_token.start, "Aggregate method type is unavailable");
+                return sema.putBuiltinResult(node_idx, try sema.type_pool.internPrimitive(.void_type));
+            };
+            try sema.resolved_decls.put(node_idx, method.declaration);
+            try sema.node_types.put(node_idx, method_type);
+            return method_type;
+        }
         if (reflected.data == .@"enum" or reflected.data == .error_set) {
             const member = sema.type_pool.aggregateField(type_value, field_name) orelse {
                 try sema.reportError(3001, .resolve, field_token.start, if (reflected.data == .error_set) "Unknown error-set member" else "Unknown enum member");
@@ -144,6 +189,37 @@ fn analyzeFieldAccess(sema: anytype, node_idx: Node.Index, scope: *Scope) std.me
         try sema.node_types.put(node_idx, base_type);
         return base_type;
     }
+    const method_owner: ?Type.Id = switch (base.data) {
+        .@"struct", .@"enum", .@"union" => base_type,
+        .pointer => |pointer| switch (sema.type_pool.get(pointer.child_type).data) {
+            .@"struct", .@"enum", .@"union" => pointer.child_type,
+            else => null,
+        },
+        else => null,
+    };
+    if (method_owner) |owner| if (sema.aggregateMethod(owner, field_name)) |method| {
+        const SemaType = @TypeOf(sema.*);
+        const target_sema: *SemaType = @ptrFromInt(method.analysis_address);
+        const method_node = target_sema.ast_tree.nodes.get(method.declaration);
+        const method_type = target_sema.node_types.get(method.declaration) orelse target_sema.node_types.get(method_node.data.lhs) orelse {
+            try sema.reportError(4001, .sema, field_token.start, "Aggregate method type is unavailable");
+            return sema.putBuiltinResult(node_idx, try sema.type_pool.internPrimitive(.void_type));
+        };
+        if (method.analysis_address == @intFromPtr(sema)) {
+            try sema.resolved_decls.put(node_idx, method.declaration);
+        } else {
+            try sema.external_decls.put(node_idx, .{
+                .module_id = method.module_id,
+                .name = method.qualified_name,
+                .is_function = true,
+                .is_syscall = false,
+                .declaration = method.declaration,
+                .analysis_address = method.analysis_address,
+            });
+        }
+        try sema.node_types.put(node_idx, method_type);
+        return method_type;
+    };
     if (sema.type_pool.aggregateField(base_type, field_name)) |field| {
         try sema.node_types.put(node_idx, field.type_id);
         return field.type_id;

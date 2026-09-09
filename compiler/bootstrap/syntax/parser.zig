@@ -135,6 +135,10 @@ pub const Parser = struct {
         return statement_parser.parseBlock(self);
     }
 
+    pub fn parseAggregateDeclarationPublic(self: *Parser) std.mem.Allocator.Error!?Node.Index {
+        return declaration_parser.parseTopLevel(self);
+    }
+
     pub fn parseExpr(self: *Parser, binding_power: u8) std.mem.Allocator.Error!?Node.Index {
         self.traceRuleEnter("parseExpr");
         defer self.traceRuleExit("parseExpr");

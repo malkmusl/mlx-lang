@@ -143,6 +143,16 @@ fn parseBody(parser: anytype, kind: Kind, head_token: u32, header: Header) std.m
             (parser.tokens[parser.index].tag == .statement_end or parser.tokens[parser.index].tag == .comma)) parser.index += 1;
         if (parser.index >= parser.tokens.len or parser.tokens[parser.index].tag == .r_brace) break;
 
+        if (aggregateFunctionStart(parser)) {
+            const declaration = try parser.parseAggregateDeclarationPublic() orelse return null;
+            if (parser.nodes.items(.tag)[declaration] != .fn_decl) {
+                try parser.reportError(2001, "Only function declarations may be nested in an aggregate");
+                return null;
+            }
+            try members.append(parser.allocator, declaration);
+            continue;
+        }
+
         var is_public = false;
         if (kind == .@"struct" and parser.tokens[parser.index].tag == .keyword_pub) {
             is_public = true;
@@ -202,4 +212,16 @@ fn parseBody(parser: anytype, kind: Kind, head_token: u32, header: Header) std.m
         .decl_flags = .{ .aggregate_nonexhaustive = header.nonexhaustive },
     });
     return @intCast(parser.nodes.len - 1);
+}
+
+fn aggregateFunctionStart(parser: anytype) bool {
+    var index = parser.index;
+    while (index < parser.tokens.len) : (index += 1) {
+        switch (parser.tokens[index].tag) {
+            .keyword_pub, .keyword_export, .keyword_inline, .keyword_noinline, .keyword_extern => continue,
+            .keyword_fn => return true,
+            else => return false,
+        }
+    }
+    return false;
 }

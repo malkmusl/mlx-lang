@@ -47,8 +47,12 @@ pub fn lower(builder: anytype, node_idx: Node.Index) std.mem.Allocator.Error!?In
 
     var arguments = std.ArrayList(Inst.Index).empty;
     defer arguments.deinit(builder.allocator);
+    if (implicitMethodReceiver(builder, target)) |receiver_node| {
+        const receiver = try builder.lowerNode(receiver_node) orelse return null;
+        try arguments.append(builder.allocator, receiver);
+    }
     var i: u32 = 0;
-    var runtime_args: u32 = 0;
+    var runtime_args: u32 = @intCast(arguments.items.len);
     while (i < num_args) : (i += 1) {
         if (generic_instance != null and argumentIsComptime(builder, target, i)) continue;
         const argument_node = builder.sema.ast_tree.extra_data[extra_start + 1 + i];
@@ -89,6 +93,24 @@ pub fn lower(builder: anytype, node_idx: Node.Index) std.mem.Allocator.Error!?In
         try builder.slice_lengths.put(call, length);
     }
     return call;
+}
+
+fn implicitMethodReceiver(builder: anytype, target_node_index: Node.Index) ?Node.Index {
+    var is_method = false;
+    if (builder.sema.resolved_decls.get(target_node_index)) |declaration| {
+        is_method = builder.sema.methodForDeclaration(declaration) != null;
+    } else if (builder.sema.external_decls.get(target_node_index)) |external| {
+        if (external.analysis_address != 0) {
+            const SemaType = @TypeOf(builder.sema.*);
+            const target_sema: *SemaType = @ptrFromInt(external.analysis_address);
+            is_method = target_sema.methodForDeclaration(external.declaration) != null;
+        }
+    }
+    if (!is_method) return null;
+    const target = builder.sema.ast_tree.nodes.get(target_node_index);
+    if (target.tag != .field_access) return null;
+    if (builder.sema.type_values.get(target.data.lhs) != null) return null;
+    return target.data.lhs;
 }
 
 fn isSyscallTarget(builder: anytype, target_node: Node.Index) bool {
