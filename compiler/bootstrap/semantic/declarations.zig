@@ -35,7 +35,7 @@ fn analyzeBinding(sema: anytype, node_idx: Node.Index, scope: *Scope) std.mem.Al
 
     var declared_type: Type.Id = inferred_type;
     if (type_node != 0) {
-        declared_type = try sema.resolveTypeExpr(type_node);
+        declared_type = try sema.resolveBuiltinTypeArg(type_node, scope) orelse try sema.resolveTypeExpr(type_node);
         if (!sema.type_pool.isCoercible(inferred_type, declared_type)) {
             var from_buf: [64]u8 = undefined;
             var to_buf: [64]u8 = undefined;

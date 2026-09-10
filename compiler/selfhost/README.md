@@ -4,8 +4,8 @@ This directory contains the canonical Mlx compiler written entirely in Mlx.
 `mlx0` compiles it into `mlx1`; a complete `mlx1` will then compile the same
 sources into `mlx2`. Do not add Zig dependencies here.
 
-The executable scaffold is intentionally small, but its complete runtime
-foundation is now available without libc or Zig dependencies:
+The executable entry point is intentionally small, while the compiler and its
+runtime foundation remain independent of libc and Zig dependencies:
 
 - `token.mlx` defines the stable token representation.
 - `lexer/` implements the complete normative token set, longest-match operator
@@ -36,10 +36,12 @@ foundation is now available without libc or Zig dependencies:
 - `source.mlx` owns complete source-file loading through an explicit allocator.
 - `diagnostic.mlx` provides stable codes, phases, severity, source spans, causes,
   messages, and terminal rendering.
-- `main.mlx` accepts a source path and drives the complete loaded module graph
-  through lexing, parsing, declaration analysis and visibility-aware namespace
-  construction. Graph-wide function body analysis is exposed by `modules.mlx`
-  and covered independently while the remaining expression semantics land.
+- `driver/` owns command-line options, progress/trace reporting, frontend
+  analysis, lowering, backend orchestration and cleanup; `main.mlx` is the thin
+  executable entry point.
+- `backend/x86_64/codegen/` separates mutable backend state from label,
+  memory, arithmetic, value, call and control-flow instruction emission;
+  `backend/x86_64/codegen.mlx` is the public `Codegen` facade.
 
 The bootstrap std also provides growing byte and record vectors, string symbol
 maps, arena/fixed/page allocators, Linux files and process arguments, and direct
@@ -49,9 +51,18 @@ compiler std is Stage-1 Core. `std.xml`, `std.json`, broader POSIX support,
 Wayland, and other protocols are non-blocking Stage-1 Extensions rather than
 dependencies of the compiler or self-hosting path.
 
-Build the current scaffold with:
+Build the self-hosted compiler with:
 
 ```sh
 zig build mlx1
 zig-out/bin/mlx1 tests/01_basic.mlx
+```
+
+Verify deterministic self-hosting with:
+
+```sh
+zig-out/bin/mlx1 compiler/selfhost/main.mlx -o /tmp/mlx2
+/tmp/mlx2 compiler/selfhost/main.mlx -o /tmp/mlx3
+/tmp/mlx3 compiler/selfhost/main.mlx -o /tmp/mlx4
+cmp /tmp/mlx3 /tmp/mlx4
 ```

@@ -128,7 +128,8 @@ fn analyzeFieldAccess(sema: anytype, node_idx: Node.Index, scope: *Scope) std.me
                 const target_sema: *SemaType = @ptrFromInt(declaration.analysis_address);
                 for (target_sema.aggregate_methods.items) |method| {
                     if (method.owner_type != owner_type) continue;
-                    const method_node = target_sema.ast_tree.nodes.get(method.declaration);
+                    const method_sema: *SemaType = @ptrFromInt(method.analysis_address);
+                    const method_node = method_sema.ast_tree.nodes.get(method.declaration);
                     if (method_node.decl_flags.public) try sema.registerExternalAggregateMethod(method);
                 }
             }
@@ -143,9 +144,10 @@ fn analyzeFieldAccess(sema: anytype, node_idx: Node.Index, scope: *Scope) std.me
                 const SemaType = @TypeOf(sema.*);
                 const target_sema: *SemaType = @ptrFromInt(external_type.analysis_address);
                 if (target_sema.aggregateMethod(type_value, field_name)) |method| {
-                    const method_node = target_sema.ast_tree.nodes.get(method.declaration);
+                    const method_sema: *SemaType = @ptrFromInt(method.analysis_address);
+                    const method_node = method_sema.ast_tree.nodes.get(method.declaration);
                     if (!method_node.decl_flags.public) try sema.reportError(3003, .resolve, field_token.start, "Aggregate method is private");
-                    const method_type = target_sema.node_types.get(method.declaration) orelse target_sema.node_types.get(method_node.data.lhs) orelse {
+                    const method_type = method_sema.node_types.get(method.declaration) orelse method_sema.node_types.get(method_node.data.lhs) orelse {
                         try sema.reportError(4001, .sema, field_token.start, "Aggregate method type is unavailable");
                         return sema.putBuiltinResult(node_idx, try sema.type_pool.internPrimitive(.void_type));
                     };
@@ -157,18 +159,32 @@ fn analyzeFieldAccess(sema: anytype, node_idx: Node.Index, scope: *Scope) std.me
                         .is_function = true,
                         .is_syscall = false,
                         .declaration = method.declaration,
-                        .analysis_address = external_type.analysis_address,
+                        .analysis_address = method.analysis_address,
                     });
                     return method_type;
                 }
             }
         }
         if (sema.aggregateMethod(type_value, field_name)) |method| {
-            const method_type = sema.node_types.get(method.declaration) orelse sema.node_types.get(sema.ast_tree.nodes.get(method.declaration).data.lhs) orelse {
+            const SemaType = @TypeOf(sema.*);
+            const method_sema: *SemaType = @ptrFromInt(method.analysis_address);
+            const method_node = method_sema.ast_tree.nodes.get(method.declaration);
+            const method_type = method_sema.node_types.get(method.declaration) orelse method_sema.node_types.get(method_node.data.lhs) orelse {
                 try sema.reportError(4001, .sema, field_token.start, "Aggregate method type is unavailable");
                 return sema.putBuiltinResult(node_idx, try sema.type_pool.internPrimitive(.void_type));
             };
-            try sema.resolved_decls.put(node_idx, method.declaration);
+            if (method.analysis_address == @intFromPtr(sema)) {
+                try sema.resolved_decls.put(node_idx, method.declaration);
+            } else {
+                try sema.external_decls.put(node_idx, .{
+                    .module_id = method.module_id,
+                    .name = method.qualified_name,
+                    .is_function = true,
+                    .is_syscall = false,
+                    .declaration = method.declaration,
+                    .analysis_address = method.analysis_address,
+                });
+            }
             try sema.node_types.put(node_idx, method_type);
             return method_type;
         }

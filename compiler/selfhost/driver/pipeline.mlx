@@ -1,0 +1,131 @@
+const page_allocator = @import("../../../std/bootstrap/page_allocator.mlx")
+const process = @import("../../../std/bootstrap/process.mlx")
+const modules = @import("../modules.mlx")
+const types = @import("../types.mlx")
+const symbols = @import("../symbols.mlx")
+const diagnostic = @import("../diagnostic.mlx")
+const lir = @import("../ir/lir.mlx")
+const lower = @import("../ir/lower.mlx")
+const encoder_module = @import("../backend/x86_64/encoder.mlx")
+const codegen_module = @import("../backend/x86_64/codegen.mlx")
+const elf64 = @import("../object/elf64.mlx")
+const options_module = @import("./options.mlx")
+const reporter_module = @import("./reporter.mlx")
+
+pub const Pipeline = struct {
+    pub fn compile(options: options_module.Options) -> u8 {
+        unsafe {
+            var reporter = reporter_module.Reporter.init(options.showProgress, options.traceEnabled, options_module.Options.stepCount(options))
+            Self.tracePaths(&reporter, options)
+            const allocator = page_allocator.init()
+            reporter_module.Reporter.progress(&reporter, 1, "load and parse module graph")
+            const loader = modules.initLoader(allocator, @ptrCast([*]const u8, "std/src"), 7, null)
+            const root = modules.loadRoot(loader, options.inputPointer, options.inputLength)
+            if root == modules.NONE || modules.totalErrors(loader) != 0 {
+                reporter_module.Reporter.failure(diagnostic.Code.import_not_found, diagnostic.Phase.resolve, "module graph could not be loaded")
+                modules.deinitLoader(loader)
+                return 4
+            }
+            Self.traceGraph(&reporter, loader)
+            var type_store = types.init(allocator)
+            var symbol_store = symbols.initStore(allocator, modules.moduleCount(loader) * 64 + 64)
+            var status = Self.analyze(loader, &type_store, &symbol_store, &reporter)
+            if status == 0 && options.hasOutput {
+                status = Self.emitExecutable(loader, allocator, &type_store, &symbol_store, options, &reporter)
+            }
+            symbols.deinitStore(&symbol_store)
+            types.deinit(&type_store)
+            modules.deinitLoader(loader)
+            return status
+        }
+    }
+
+    fn tracePaths(reporter: *reporter_module.Reporter, options: options_module.Options) -> void {
+        reporter_module.Reporter.traceString(reporter, "input: ", process.String.{ .pointer = options.inputPointer, .length = options.inputLength })
+        if options.hasOutput {
+            const output = process.fromCString(options.outputPointer)
+            reporter_module.Reporter.traceString(reporter, "output: ", output)
+        }
+    }
+
+    fn traceGraph(reporter: *reporter_module.Reporter, loader: *modules.Loader) -> void {
+        reporter_module.Reporter.traceValue(reporter, "modules: ", modules.moduleCount(loader))
+        reporter_module.Reporter.traceValue(reporter, "imports: ", modules.importCount(loader))
+        reporter_module.Reporter.traceModules(reporter, loader)
+    }
+
+    fn analyze(loader: *modules.Loader, type_store: *types.Store, symbol_store: *symbols.Store, reporter: *reporter_module.Reporter) -> u8 {
+        reporter_module.Reporter.progress(reporter, 2, "resolve modules and declarations")
+        if modules.prepare(loader, type_store, symbol_store) != 0 {
+            reporter_module.Reporter.failure(diagnostic.Code.duplicate_symbol, diagnostic.Phase.resolve, "duplicate declaration")
+            return 5
+        }
+        reporter_module.Reporter.progress(reporter, 3, "analyze declaration types")
+        if modules.analyzeDeclarations(loader, type_store, symbol_store) != 0 {
+            reporter_module.Reporter.failure(diagnostic.Code.type_mismatch, diagnostic.Phase.sema, "declaration type could not be resolved")
+            return 6
+        }
+        reporter_module.Reporter.traceValue(reporter, "types after declarations: ", types.count(type_store))
+        reporter_module.Reporter.progress(reporter, 4, "analyze function bodies")
+        if modules.analyzeFunctionBodies(loader, type_store, symbol_store) != 0 {
+            reporter_module.Reporter.failure(diagnostic.Code.type_mismatch, diagnostic.Phase.sema, "function body could not be resolved")
+            return 7
+        }
+        return 0
+    }
+
+    fn emitExecutable(loader: *modules.Loader, allocator: page_allocator.Allocator, type_store: *types.Store, symbol_store: *symbols.Store, options: options_module.Options, reporter: *reporter_module.Reporter) -> u8 {
+        reporter_module.Reporter.progress(reporter, 5, "lower typed AST to LIR")
+        var ir = lir.init(allocator)
+        var builder = lower.init(&ir, type_store, symbol_store, loader, allocator)
+        Self.lowerModules(loader, &builder)
+        Self.traceLir(reporter, &builder, &ir)
+        reporter_module.Reporter.progress(reporter, 6, "generate x86_64 machine code")
+        var encoder = encoder_module.init(allocator)
+        var codegen = codegen_module.Codegen.init(allocator, &encoder, &ir)
+        codegen_module.Codegen.generateBinary(&codegen)
+        reporter_module.Reporter.traceValue(reporter, "machine-code bytes: ", encoder_module.pos(&encoder))
+        reporter_module.Reporter.progress(reporter, 7, "resolve backend symbols")
+        if !encoder_module.applyFixups(&encoder) {
+            Self.reportUnresolved(reporter, &encoder)
+            Self.deinitBackend(&codegen, &encoder, &builder, &ir)
+            reporter_module.Reporter.failure(diagnostic.Code.import_not_found, diagnostic.Phase.linker, "unresolved backend symbol")
+            return 8
+        }
+        reporter_module.Reporter.progress(reporter, 8, "write ELF64 executable")
+        var empty_rodata: [*]const u8 = undefined
+        unsafe { empty_rodata = @ptrFromInt([*]const u8, 0) }
+        const wrote = elf64.writeExecutable(allocator, encoder.buf.*.items, encoder.buf.*.length, 0, empty_rodata, 0, options.outputPointer)
+        Self.deinitBackend(&codegen, &encoder, &builder, &ir)
+        if !wrote {
+            reporter_module.Reporter.failure(diagnostic.Code.import_not_found, diagnostic.Phase.resolve, "failed to write output file")
+            return 9
+        }
+        return 0
+    }
+
+    fn lowerModules(loader: *modules.Loader, builder: *lower.LirBuilder) -> void {
+        var module_index: usize = 0
+        while module_index < modules.moduleCount(loader) {
+            lower.generateModule(builder, module_index)
+            module_index += 1
+        }
+        lower.generateGenericInstances(builder)
+    }
+
+    fn traceLir(reporter: *reporter_module.Reporter, builder: *lower.LirBuilder, ir: *lir.Lir) -> void {
+        reporter_module.Reporter.traceValue(reporter, "generic instances: ", lower.genericInstanceCount(builder))
+        reporter_module.Reporter.traceValue(reporter, "LIR instructions: ", lir.instCount(ir))
+    }
+
+    fn reportUnresolved(reporter: *reporter_module.Reporter, encoder: *encoder_module.Encoder) -> void {
+        reporter_module.Reporter.unresolvedSymbol(reporter, encoder_module.unresolvedFixupPointer(encoder), encoder_module.unresolvedFixupLength(encoder))
+    }
+
+    fn deinitBackend(codegen: *codegen_module.Codegen, encoder: *encoder_module.Encoder, builder: *lower.LirBuilder, ir: *lir.Lir) -> void {
+        codegen_module.Codegen.deinit(codegen)
+        encoder_module.deinit(encoder)
+        lower.deinit(builder)
+        lir.deinit(ir)
+    }
+}

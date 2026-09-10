@@ -420,7 +420,7 @@ pub const Sema = struct {
                 return try self.resolveTypeExpr(node_idx);
             },
             .pointer_type, .slice_type, .array_type, .optional_type, .error_union_type, .tuple_type, .fn_type => {
-                return try self.resolveTypeExpr(node_idx);
+                return try type_resolution.resolveInScope(self, node_idx, scope);
             },
             .struct_decl, .enum_decl, .union_decl => {
                 _ = try aggregate_type_semantics.analyze(self, node_idx, scope);

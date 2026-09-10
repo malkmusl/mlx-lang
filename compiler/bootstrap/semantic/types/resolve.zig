@@ -6,13 +6,17 @@ const error_set = @import("error_set.zig");
 
 /// Resolves an annotation-position AST node to an interned semantic type.
 pub fn resolve(sema: anytype, node_index: Node.Index) std.mem.Allocator.Error!Type.Id {
+    return resolveInScope(sema, node_index, sema.root_scope);
+}
+
+pub fn resolveInScope(sema: anytype, node_index: Node.Index, scope: anytype) std.mem.Allocator.Error!Type.Id {
     const node = sema.ast_tree.nodes.get(node_index);
     const source = sema.diags.source_manager.getFile(sema.source_id).?.content;
     return switch (node.tag) {
         .identifier => blk: {
             const token = sema.ast_tree.tokens[node.main_token];
             const name = source[token.start..token.end];
-            if (sema.root_scope.get(name)) |symbol| {
+            if (scope.get(name)) |symbol| {
                 if (sema.type_values.get(symbol.decl_node)) |type_value| break :blk type_value;
             }
             break :blk resolveBuiltinName(sema, name, token.start);
@@ -24,32 +28,32 @@ pub fn resolve(sema: anytype, node_index: Node.Index) std.mem.Allocator.Error!Ty
         },
         .field_access => blk: {
             if (sema.type_values.get(node_index)) |type_value| break :blk type_value;
-            _ = try sema.analyzeNode(node_index, sema.root_scope);
+            _ = try sema.analyzeNode(node_index, scope);
             break :blk sema.type_values.get(node_index) orelse sema.type_pool.internPrimitive(.void_type);
         },
         .struct_decl, .enum_decl, .union_decl => blk: {
             if (sema.type_values.get(node_index)) |type_value| break :blk type_value;
-            _ = try aggregate.analyze(sema, node_index, sema.root_scope);
+            _ = try aggregate.analyze(sema, node_index, scope);
             break :blk sema.type_values.get(node_index) orelse sema.type_pool.internPrimitive(.void_type);
         },
         .error_set_decl => blk: {
             if (sema.type_values.get(node_index)) |type_value| break :blk type_value;
-            _ = try error_set.analyze(sema, node_index, sema.root_scope);
+            _ = try error_set.analyze(sema, node_index, scope);
             break :blk sema.type_values.get(node_index) orelse sema.type_pool.internPrimitive(.void_type);
         },
-        .pointer_type => resolvePointer(sema, node),
-        .slice_type => resolveSlice(sema, node),
+        .pointer_type => resolvePointer(sema, node, scope),
+        .slice_type => resolveSlice(sema, node, scope),
         .optional_type => blk: {
-            const child = try resolve(sema, node.data.lhs);
+            const child = try resolveInScope(sema, node.data.lhs, scope);
             break :blk sema.type_pool.intern(.{ .optional = .{ .child_type = child } }, .copyable);
         },
-        .array_type => resolveArray(sema, node, source),
-        .tuple_type => resolveTuple(sema, node),
-        .fn_type => resolveFunction(sema, node),
+        .array_type => resolveArray(sema, node, source, scope),
+        .tuple_type => resolveTuple(sema, node, scope),
+        .fn_type => resolveFunction(sema, node, scope),
         .error_union_type => blk: {
-            const payload = try resolve(sema, node.data.rhs);
+            const payload = try resolveInScope(sema, node.data.rhs, scope);
             const errors: Type.Id = if (node.data.lhs != 0)
-                try resolve(sema, node.data.lhs)
+                try resolveInScope(sema, node.data.lhs, scope)
             else
                 try sema.type_pool.internPrimitive(.void_type);
             break :blk sema.type_pool.intern(.{ .error_union = .{ .err_set = errors, .payload = payload } }, .copyable);
@@ -58,14 +62,14 @@ pub fn resolve(sema: anytype, node_index: Node.Index) std.mem.Allocator.Error!Ty
     };
 }
 
-fn resolveFunction(sema: anytype, node: Node) std.mem.Allocator.Error!Type.Id {
-    const return_type = try resolve(sema, sema.ast_tree.extra_data[node.data.lhs]);
+fn resolveFunction(sema: anytype, node: Node, scope: anytype) std.mem.Allocator.Error!Type.Id {
+    const return_type = try resolveInScope(sema, sema.ast_tree.extra_data[node.data.lhs], scope);
     const count = sema.ast_tree.extra_data[node.data.lhs + 1];
     var parameters = std.ArrayList(Type.Id).empty;
     defer parameters.deinit(sema.allocator);
     var index: u32 = 0;
     while (index < count) : (index += 1) {
-        try parameters.append(sema.allocator, try resolve(sema, sema.ast_tree.extra_data[node.data.lhs + 2 + index]));
+        try parameters.append(sema.allocator, try resolveInScope(sema, sema.ast_tree.extra_data[node.data.lhs + 2 + index], scope));
     }
     const params_start = try sema.type_pool.appendParams(parameters.items);
     return sema.type_pool.intern(.{ .function = .{
@@ -76,7 +80,7 @@ fn resolveFunction(sema: anytype, node: Node) std.mem.Allocator.Error!Type.Id {
     } }, .copyable);
 }
 
-fn resolveTuple(sema: anytype, node: Node) std.mem.Allocator.Error!Type.Id {
+fn resolveTuple(sema: anytype, node: Node, scope: anytype) std.mem.Allocator.Error!Type.Id {
     const count = sema.ast_tree.extra_data[node.data.lhs];
     var fields = std.ArrayList(@import("../type.zig").TypePool.AggregateFieldInput).empty;
     defer fields.deinit(sema.allocator);
@@ -84,7 +88,7 @@ fn resolveTuple(sema: anytype, node: Node) std.mem.Allocator.Error!Type.Id {
     while (index < count) : (index += 1) {
         try fields.append(sema.allocator, .{
             .name = "",
-            .type_id = try resolve(sema, sema.ast_tree.extra_data[node.data.lhs + 1 + index]),
+            .type_id = try resolveInScope(sema, sema.ast_tree.extra_data[node.data.lhs + 1 + index], scope),
         });
     }
     return sema.type_pool.internAggregate(.tuple, fields.items, null, null, false) catch |err| switch (err) {
@@ -96,8 +100,8 @@ fn resolveTuple(sema: anytype, node: Node) std.mem.Allocator.Error!Type.Id {
     };
 }
 
-fn resolvePointer(sema: anytype, node: Node) std.mem.Allocator.Error!Type.Id {
-    const child = try resolve(sema, node.data.lhs);
+fn resolvePointer(sema: anytype, node: Node, scope: anytype) std.mem.Allocator.Error!Type.Id {
+    const child = try resolveInScope(sema, node.data.lhs, scope);
     var flags = node.data.rhs;
     var explicit_alignment: ?u64 = null;
     if ((flags & 0x8000_0000) != 0) {
@@ -122,8 +126,8 @@ fn resolvePointer(sema: anytype, node: Node) std.mem.Allocator.Error!Type.Id {
     } }, .copyable);
 }
 
-fn resolveSlice(sema: anytype, node: Node) std.mem.Allocator.Error!Type.Id {
-    const child = try resolve(sema, node.data.lhs);
+fn resolveSlice(sema: anytype, node: Node, scope: anytype) std.mem.Allocator.Error!Type.Id {
+    const child = try resolveInScope(sema, node.data.lhs, scope);
     return sema.type_pool.intern(.{ .pointer = .{
         .child_type = child,
         .is_const = (node.data.rhs & 1) != 0,
@@ -136,9 +140,9 @@ fn resolveSlice(sema: anytype, node: Node) std.mem.Allocator.Error!Type.Id {
     } }, .copyable);
 }
 
-fn resolveArray(sema: anytype, node: Node, source: []const u8) std.mem.Allocator.Error!Type.Id {
+fn resolveArray(sema: anytype, node: Node, source: []const u8, scope: anytype) std.mem.Allocator.Error!Type.Id {
     const element_node = sema.ast_tree.extra_data[node.data.lhs + 1];
-    const element_type = try resolve(sema, element_node);
+    const element_type = try resolveInScope(sema, element_node, scope);
     const size_node_index = sema.ast_tree.extra_data[node.data.lhs];
     const size_node = sema.ast_tree.nodes.get(size_node_index);
     var length: u64 = 0;
