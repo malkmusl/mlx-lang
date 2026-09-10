@@ -52,3 +52,30 @@ does not define the size, alignment, tag placement, or ABI representation of a
 general non-pointer `?T`. Stage 0 therefore implements null-niche optional
 pointers and preserves the existing present-value path for other optionals,
 without exposing an invented general optional layout through reflection.
+
+### Thread-local storage ABI
+
+`spec/00-language/atomics-tls.xml` fixes the source spelling, declaration
+scope, initializer requirement, and absence of heap allocation for
+`threadlocal`, but does not define the executable TLS model, TLS relocation
+model, per-thread initialization protocol, or how a freestanding executable
+obtains its thread pointer. The compiler preserves and validates the
+declaration marker but cannot emit a private TLS ABI until that contract is
+normative.
+
+### Standard thread API details
+
+`spec/04-stdlib/thread.xml` fixes the `Thread.spawn(allocator, worker, args)`
+shape and ownership rules at a high level, but does not define the `Thread`
+handle layout, worker return/error propagation, `join` and `detach`
+signatures, stack-size policy, or allocator lifetime requirements. Raw target
+thread primitives may be exposed independently, but the high-level API cannot
+invent these observable contracts.
+
+### Networking API surface
+
+`spec/04-stdlib/posix.xml` requires socket operations by name and the Linux
+backend requires direct syscalls, but no normative `std.net` module or socket
+address, endpoint, TCP/UDP, resolver, or event-loop API is specified. Raw
+`std.os.linux`/`std.posix` wrappers can follow the platform ABI; a portable
+`std.net` interface requires an added normative contract.

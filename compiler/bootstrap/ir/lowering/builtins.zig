@@ -62,7 +62,24 @@ pub fn lower(builder: anytype, node_idx: Node.Index) std.mem.Allocator.Error!?In
     }
     if (value_argument) |argument_index| {
         if (argument_index < argument_count) {
-            return builder.lowerNode(builder.sema.ast_tree.extra_data[extra_start + 1 + argument_index]);
+            const value_node = builder.sema.ast_tree.extra_data[extra_start + 1 + argument_index];
+            const value = try builder.lowerNode(value_node) orelse return null;
+            const target_type = builder.sema.node_types.get(node_idx) orelse 0;
+            const source_type = builder.sema.node_types.get(value_node) orelse 0;
+            const converted = switch (kind) {
+                .floatCast, .floatFromInt, .intFromFloat, .intCast => try builder.emitInst(.{
+                    .opcode = .cast,
+                    .type_id = target_type,
+                    .data = .{ .cast = .{ .value = value, .source_type = source_type } },
+                }),
+                .bitCast, .ptrCast, .alignCast, .ptrFromInt, .enumFromInt => try builder.emitInst(.{
+                    .opcode = .bitcast,
+                    .type_id = target_type,
+                    .data = .{ .bitcast = value },
+                }),
+                else => value,
+            };
+            return converted;
         }
     }
     return null;

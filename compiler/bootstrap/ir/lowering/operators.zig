@@ -109,6 +109,7 @@ fn lowerLogical(builder: anytype, node_index: Node.Index, tag: Tag) !?Inst.Index
 fn emitComparison(builder: anytype, tag: Tag, lhs: Inst.Index, rhs: Inst.Index, type_id: Type.Id) !Inst.Index {
     const lhs_type = builder.sema.type_pool.get(builder.lir.insts.items[lhs].type_id);
     const rhs_type = builder.sema.type_pool.get(builder.lir.insts.items[rhs].type_id);
+    const floating = lhs_type.isFloat() or rhs_type.isFloat();
     const signed = isSignedInteger(lhs_type) or (isComptimeInteger(lhs_type) and isSignedInteger(rhs_type));
     const predicate: lir.CmpPredicate = switch (tag) {
         .equal_equal => .eq,
@@ -119,6 +120,9 @@ fn emitComparison(builder: anytype, tag: Tag, lhs: Inst.Index, rhs: Inst.Index, 
         .angle_bracket_right_equal => if (signed) .ge else .uge,
         else => unreachable,
     };
+    if (floating) {
+        return builder.emitInst(.{ .opcode = .fcmp, .type_id = type_id, .data = .{ .fcmp = .{ .predicate = predicate, .lhs = lhs, .rhs = rhs } } });
+    }
     return builder.emitInst(.{ .opcode = .icmp, .type_id = type_id, .data = .{ .icmp = .{ .predicate = predicate, .lhs = lhs, .rhs = rhs } } });
 }
 
@@ -143,7 +147,9 @@ fn emitShift(builder: anytype, spec: ShiftSpec, lhs: Inst.Index, rhs: Inst.Index
 }
 
 fn emitPolicy(builder: anytype, core: Core, policy: Policy, lhs: Inst.Index, rhs: Inst.Index, type_id: Type.Id) !Inst.Index {
-    if (core == .div or core == .rem) try emitNonZeroCheck(builder, rhs, type_id);
+    if ((core == .div or core == .rem) and !builder.sema.type_pool.get(type_id).isFloat()) {
+        try emitNonZeroCheck(builder, rhs, type_id);
+    }
     const raw = try emitCore(builder, core, lhs, rhs, type_id);
     if (policy == .wrapping) return maskToWidth(builder, raw, type_id);
     const type_value = builder.sema.type_pool.get(type_id);

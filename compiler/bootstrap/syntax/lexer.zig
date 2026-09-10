@@ -199,6 +199,20 @@ pub const Lexer = struct {
                         'a'...'z', 'A'...'Z', '0'...'9', '.', '_' => {
                             self.index += 1;
                         },
+                        '+', '-' => {
+                            const previous = if (self.index > result.start) self.buffer[self.index - 1] else 0;
+                            if (previous == 'e' or previous == 'E' or previous == 'p' or previous == 'P') {
+                                self.index += 1;
+                            } else {
+                                const number = self.buffer[result.start..self.index];
+                                const is_hex = std.mem.startsWith(u8, number, "0x") or std.mem.startsWith(u8, number, "0X");
+                                const has_fraction = std.mem.indexOfScalar(u8, number, '.') != null;
+                                const has_exponent = if (is_hex) std.mem.indexOfAny(u8, number, "pP") != null else std.mem.indexOfAny(u8, number, "eE") != null;
+                                result.tag = if (has_fraction or has_exponent) .float else .integer;
+                                result.end = self.index;
+                                return self.emit(result);
+                            }
+                        },
                         else => {
                             const number = self.buffer[result.start..self.index];
                             const is_hex = std.mem.startsWith(u8, number, "0x") or std.mem.startsWith(u8, number, "0X");
@@ -701,6 +715,10 @@ test "lexer: numbers and strings (simple)" {
 
 test "lexer: integer range is not a float" {
     try expectTokens("0..8", &.{ .integer, .dot_dot, .integer });
+}
+
+test "lexer: exponent sign remains part of float literal" {
+    try expectTokens("125e-2 2E+3", &.{ .float, .float });
 }
 
 test "lexer: basic operators" {

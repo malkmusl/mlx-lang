@@ -17,6 +17,8 @@ pub const Condition = enum(u8) {
     above_equal = 0x3,
     below_equal = 0x6,
     above = 0x7,
+    parity = 0xa,
+    not_parity = 0xb,
     less = 0xc,
     greater_equal = 0xd,
     less_equal = 0xe,
@@ -237,6 +239,82 @@ pub const Encoder = struct {
         try self.emit1(0x89);
         try self.emit1(modrm(d.mod, lo3(src), lo3(Reg.rbp)));
         try self.buf.appendSlice(self.allocator, d.bytes[0..d.len]);
+    }
+
+    /// MOVD/MOVQ xmm, gp. Floating values remain bit-identical while moving
+    /// between the stack-oriented bootstrap allocator and SSE registers.
+    pub fn emitMovXmmGp(self: *Encoder, xmm: u8, src: Reg, bits: u8) !void {
+        try self.emit1(0x66);
+        const needs_rex = bits == 64 or xmm >= 8 or needsRex(src);
+        if (needs_rex) try self.emit1(rex(bits == 64, xmm >= 8, false, needsRex(src)));
+        try self.emit2(0x0f, 0x6e);
+        try self.emit1(modrm(0b11, @truncate(xmm), lo3(src)));
+    }
+
+    /// MOVD/MOVQ gp, xmm.
+    pub fn emitMovGpXmm(self: *Encoder, dst: Reg, xmm: u8, bits: u8) !void {
+        try self.emit1(0x66);
+        const needs_rex = bits == 64 or xmm >= 8 or needsRex(dst);
+        if (needs_rex) try self.emit1(rex(bits == 64, xmm >= 8, false, needsRex(dst)));
+        try self.emit2(0x0f, 0x7e);
+        try self.emit1(modrm(0b11, @truncate(xmm), lo3(dst)));
+    }
+
+    /// MOVSS/MOVSD xmm, [rbp-offset].
+    pub fn emitMovXmmMem(self: *Encoder, xmm: u8, rbp_offset: i32, bits: u8) !void {
+        try self.emit1(if (bits == 32) 0xf3 else 0xf2);
+        if (xmm >= 8) try self.emit1(rex(false, true, false, false));
+        const d = dispEncoding(-rbp_offset);
+        try self.emit2(0x0f, 0x10);
+        try self.emit1(modrm(d.mod, @truncate(xmm), lo3(Reg.rbp)));
+        try self.buf.appendSlice(self.allocator, d.bytes[0..d.len]);
+    }
+
+    /// MOVSS/MOVSD [rbp-offset], xmm.
+    pub fn emitMovMemXmm(self: *Encoder, rbp_offset: i32, xmm: u8, bits: u8) !void {
+        try self.emit1(if (bits == 32) 0xf3 else 0xf2);
+        if (xmm >= 8) try self.emit1(rex(false, true, false, false));
+        const d = dispEncoding(-rbp_offset);
+        try self.emit2(0x0f, 0x11);
+        try self.emit1(modrm(d.mod, @truncate(xmm), lo3(Reg.rbp)));
+        try self.buf.appendSlice(self.allocator, d.bytes[0..d.len]);
+    }
+
+    /// Scalar SSE arithmetic. Opcode is 58/5c/59/5e for add/sub/mul/div.
+    pub fn emitFloatBinary(self: *Encoder, opcode: u8, dst_xmm: u8, src_xmm: u8, bits: u8) !void {
+        try self.emit1(if (bits == 32) 0xf3 else 0xf2);
+        if (dst_xmm >= 8 or src_xmm >= 8) try self.emit1(rex(false, dst_xmm >= 8, false, src_xmm >= 8));
+        try self.emit2(0x0f, opcode);
+        try self.emit1(modrm(0b11, @truncate(dst_xmm), @truncate(src_xmm)));
+    }
+
+    /// UCOMISS/UCOMISD dst, src.
+    pub fn emitFloatCompare(self: *Encoder, lhs_xmm: u8, rhs_xmm: u8, bits: u8) !void {
+        if (bits == 64) try self.emit1(0x66);
+        if (lhs_xmm >= 8 or rhs_xmm >= 8) try self.emit1(rex(false, lhs_xmm >= 8, false, rhs_xmm >= 8));
+        try self.emit2(0x0f, 0x2e);
+        try self.emit1(modrm(0b11, @truncate(lhs_xmm), @truncate(rhs_xmm)));
+    }
+
+    pub fn emitIntToFloat(self: *Encoder, dst_xmm: u8, src: Reg, float_bits: u8) !void {
+        try self.emit1(if (float_bits == 32) 0xf3 else 0xf2);
+        try self.emit1(rex(true, dst_xmm >= 8, false, needsRex(src)));
+        try self.emit2(0x0f, 0x2a);
+        try self.emit1(modrm(0b11, @truncate(dst_xmm), lo3(src)));
+    }
+
+    pub fn emitFloatToInt(self: *Encoder, dst: Reg, src_xmm: u8, float_bits: u8) !void {
+        try self.emit1(if (float_bits == 32) 0xf3 else 0xf2);
+        try self.emit1(rex(true, needsRex(dst), false, src_xmm >= 8));
+        try self.emit2(0x0f, 0x2c);
+        try self.emit1(modrm(0b11, lo3(dst), @truncate(src_xmm)));
+    }
+
+    pub fn emitFloatConvert(self: *Encoder, dst_xmm: u8, src_xmm: u8, source_bits: u8) !void {
+        try self.emit1(if (source_bits == 32) 0xf3 else 0xf2);
+        if (dst_xmm >= 8 or src_xmm >= 8) try self.emit1(rex(false, dst_xmm >= 8, false, src_xmm >= 8));
+        try self.emit2(0x0f, 0x5a);
+        try self.emit1(modrm(0b11, @truncate(dst_xmm), @truncate(src_xmm)));
     }
 
     // ── lea ──────────────────────────────────────────────────────────────────

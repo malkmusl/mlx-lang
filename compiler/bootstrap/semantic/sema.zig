@@ -381,12 +381,6 @@ pub const Sema = struct {
             else => false,
         };
         if (!valid) try self.reportError(4003, .sema, start_byte, "Invalid cast operands");
-        // A same-width bitCast is representation-only and is lowered as an
-        // identity vreg operation, including GP-held floating bit patterns.
-        const requires_float_lowering = kind == .floatCast or kind == .floatFromInt or kind == .intFromFloat;
-        if (valid and requires_float_lowering) {
-            try self.reportError(9001, .lowering, start_byte, "Floating-point builtin lowering is not available in Stage 0 yet");
-        }
         if (valid and kind == .intCast) {
             if (self.const_values.get(args[1])) |value| {
                 if (!integerValueFits(target, value)) {

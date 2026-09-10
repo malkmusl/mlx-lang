@@ -5,6 +5,8 @@ pub const Opcode = enum {
     const_i,
     const_f,
     copy,
+    cast,
+    bitcast,
     aggregate_copy,
     memory_copy,
 
@@ -20,6 +22,7 @@ pub const Opcode = enum {
     shl,
     shr,
     icmp,
+    fcmp,
 
     // Memory
     load,
@@ -75,6 +78,8 @@ pub const Inst = struct {
         const_i: u64,
         const_f: f64,
         copy: Index,
+        cast: struct { value: Index, source_type: Type.Id },
+        bitcast: Index,
         aggregate_copy: Index,
         memory_copy: struct { destination: Index, source: Index, size: u32 },
 
@@ -89,6 +94,7 @@ pub const Inst = struct {
         shl: struct { lhs: Index, rhs: Index },
         shr: struct { lhs: Index, rhs: Index },
         icmp: struct { predicate: CmpPredicate, lhs: Index, rhs: Index },
+        fcmp: struct { predicate: CmpPredicate, lhs: Index, rhs: Index },
 
         load: struct { ptr: Index },
         store: struct { ptr: Index, val: Index },

@@ -24,6 +24,136 @@ fn opToRegBin(enc: *Encoder, operand: anytype, scratch: Reg) !Reg {
     };
 }
 
+fn floatBits(self: anytype, type_id: u32) u8 {
+    if (type_id >= self.type_pool.types.items.len) return 64;
+    return switch (self.type_pool.get(type_id).data) {
+        .primitive => |primitive| if (primitive == .f32_type) 32 else 64,
+        else => 64,
+    };
+}
+
+fn loadFloatOperand(enc: *Encoder, operand: anytype, xmm: u8, bits: u8) !void {
+    switch (operand) {
+        .reg => |register| try enc.emitMovXmmGp(xmm, nameToReg(register), bits),
+        .mem => |slot| try enc.emitMovXmmMem(xmm, slot, bits),
+    }
+}
+
+fn storeFloatOperand(enc: *Encoder, operand: anytype, xmm: u8, bits: u8) !void {
+    switch (operand) {
+        .reg => |register| try enc.emitMovGpXmm(nameToReg(register), xmm, bits),
+        .mem => |slot| try enc.emitMovMemXmm(slot, xmm, bits),
+    }
+}
+
+fn emitFloatArithmetic(self: anytype, enc: *Encoder, inst_idx: lir.Inst.Index, lhs_idx: lir.Inst.Index, rhs_idx: lir.Inst.Index, opcode: u8) !void {
+    const instruction = self.lir.insts.items[inst_idx];
+    const bits = floatBits(self, instruction.type_id);
+    const destination = try self.allocateOp(inst_idx);
+    try loadFloatOperand(enc, try self.allocateOp(lhs_idx), 0, bits);
+    try loadFloatOperand(enc, try self.allocateOp(rhs_idx), 1, bits);
+    try enc.emitFloatBinary(opcode, 0, 1, bits);
+    try storeFloatOperand(enc, destination, 0, bits);
+}
+
+fn emitFloatPredicate(enc: *Encoder, predicate: lir.CmpPredicate) !void {
+    switch (predicate) {
+        .eq => {
+            try enc.emitSetcc(.rax, .equal);
+            try enc.emitSetcc(.rcx, .not_parity);
+            try enc.emitAnd(.rax, .rcx);
+        },
+        .ne => {
+            try enc.emitSetcc(.rax, .not_equal);
+            try enc.emitSetcc(.rcx, .parity);
+            try enc.emitOr(.rax, .rcx);
+        },
+        .lt, .ult => {
+            try enc.emitSetcc(.rax, .below);
+            try enc.emitSetcc(.rcx, .not_parity);
+            try enc.emitAnd(.rax, .rcx);
+        },
+        .le, .ule => {
+            try enc.emitSetcc(.rax, .below_equal);
+            try enc.emitSetcc(.rcx, .not_parity);
+            try enc.emitAnd(.rax, .rcx);
+        },
+        .gt, .ugt => try enc.emitSetcc(.rax, .above),
+        .ge, .uge => try enc.emitSetcc(.rax, .above_equal),
+    }
+}
+
+const AbiLocation = struct {
+    is_float: bool,
+    in_register: bool,
+    register_index: u8,
+    stack_index: u32,
+};
+
+fn callArgumentLocation(self: anytype, start: u32, argument_index: u32, integer_offset: u32) AbiLocation {
+    var integer_index = integer_offset;
+    var float_index: u32 = 0;
+    var stack_index: u32 = 0;
+    var index: u32 = 0;
+    while (index <= argument_index) : (index += 1) {
+        const instruction_index = self.lir.extra_data.items[start + index];
+        const is_float = self.isFloatType(self.lir.insts.items[instruction_index].type_id);
+        const register_index = if (is_float) float_index else integer_index;
+        const register_capacity: u32 = if (is_float) 8 else 6;
+        const in_register = register_index < register_capacity;
+        if (index == argument_index) return .{
+            .is_float = is_float,
+            .in_register = in_register,
+            .register_index = @intCast(register_index),
+            .stack_index = stack_index,
+        };
+        if (in_register) {
+            if (is_float) float_index += 1 else integer_index += 1;
+        } else {
+            stack_index += 1;
+        }
+    }
+    unreachable;
+}
+
+fn callStackCount(self: anytype, start: u32, count: u32, integer_offset: u32) u32 {
+    if (count == 0) return 0;
+    const last = callArgumentLocation(self, start, count - 1, integer_offset);
+    return last.stack_index + @as(u32, @intFromBool(!last.in_register));
+}
+
+fn parameterLocation(self: anytype, instruction_index: lir.Inst.Index) AbiLocation {
+    var function_start = instruction_index;
+    while (function_start > 0) {
+        function_start -= 1;
+        if (self.lir.insts.items[function_start].opcode == .label) break;
+    }
+    var integer_index: u32 = @intFromBool(if (self.current_function_return_type) |return_type| self.isIndirectReturn(return_type) else false);
+    var float_index: u32 = 0;
+    var stack_index: u32 = 0;
+    var index = function_start + 1;
+    while (index <= instruction_index) : (index += 1) {
+        const parameter = self.lir.insts.items[index];
+        if (parameter.opcode != .param) continue;
+        const is_float = self.isFloatType(parameter.type_id);
+        const register_index = if (is_float) float_index else integer_index;
+        const register_capacity: u32 = if (is_float) 8 else 6;
+        const in_register = register_index < register_capacity;
+        if (index == instruction_index) return .{
+            .is_float = is_float,
+            .in_register = in_register,
+            .register_index = @intCast(register_index),
+            .stack_index = stack_index,
+        };
+        if (in_register) {
+            if (is_float) float_index += 1 else integer_index += 1;
+        } else {
+            stack_index += 1;
+        }
+    }
+    unreachable;
+}
+
 fn condition(predicate: lir.CmpPredicate) Condition {
     return switch (predicate) {
         .eq => .equal,
@@ -72,6 +202,10 @@ pub fn emit(self: anytype, enc: *Encoder, inst_idx: lir.Inst.Index) !void {
 
         // ── arithmetic ───────────────────────────────────────────────────
         .add => {
+            if (self.isFloatType(inst.type_id)) {
+                try emitFloatArithmetic(self, enc, inst_idx, inst.data.add.lhs, inst.data.add.rhs, 0x58);
+                return;
+            }
             const op = try self.allocateOp(inst_idx);
             const lhs = try self.allocateOp(inst.data.add.lhs);
             const rhs = try self.allocateOp(inst.data.add.rhs);
@@ -92,6 +226,10 @@ pub fn emit(self: anytype, enc: *Encoder, inst_idx: lir.Inst.Index) !void {
         },
 
         .sub => {
+            if (self.isFloatType(inst.type_id)) {
+                try emitFloatArithmetic(self, enc, inst_idx, inst.data.sub.lhs, inst.data.sub.rhs, 0x5c);
+                return;
+            }
             const op = try self.allocateOp(inst_idx);
             const lhs = try self.allocateOp(inst.data.sub.lhs);
             const rhs = try self.allocateOp(inst.data.sub.rhs);
@@ -112,6 +250,10 @@ pub fn emit(self: anytype, enc: *Encoder, inst_idx: lir.Inst.Index) !void {
         },
 
         .mul => {
+            if (self.isFloatType(inst.type_id)) {
+                try emitFloatArithmetic(self, enc, inst_idx, inst.data.mul.lhs, inst.data.mul.rhs, 0x59);
+                return;
+            }
             const op = try self.allocateOp(inst_idx);
             const lhs = try self.allocateOp(inst.data.mul.lhs);
             const rhs = try self.allocateOp(inst.data.mul.rhs);
@@ -125,7 +267,15 @@ pub fn emit(self: anytype, enc: *Encoder, inst_idx: lir.Inst.Index) !void {
             }
         },
 
-        .div, .rem, .bit_and, .bit_or, .bit_xor, .shl, .shr => try integer_instructions.emitBinary(self, enc, inst_idx),
+        .div => {
+            if (self.isFloatType(inst.type_id)) {
+                try emitFloatArithmetic(self, enc, inst_idx, inst.data.div.lhs, inst.data.div.rhs, 0x5e);
+                return;
+            }
+            try integer_instructions.emitBinary(self, enc, inst_idx);
+        },
+
+        .rem, .bit_and, .bit_or, .bit_xor, .shl, .shr => try integer_instructions.emitBinary(self, enc, inst_idx),
 
         .icmp => {
             const op = try self.allocateOp(inst_idx);
@@ -140,6 +290,61 @@ pub fn emit(self: anytype, enc: *Encoder, inst_idx: lir.Inst.Index) !void {
             };
             try enc.emitSetcc(dst_reg, condition(inst.data.icmp.predicate));
             if (op == .mem) try enc.emitMovMemReg(op.mem, .rax);
+        },
+
+        .fcmp => {
+            const lhs_instruction = self.lir.insts.items[inst.data.fcmp.lhs];
+            const bits = floatBits(self, lhs_instruction.type_id);
+            try loadFloatOperand(enc, try self.allocateOp(inst.data.fcmp.lhs), 0, bits);
+            try loadFloatOperand(enc, try self.allocateOp(inst.data.fcmp.rhs), 1, bits);
+            try enc.emitFloatCompare(0, 1, bits);
+            try emitFloatPredicate(enc, inst.data.fcmp.predicate);
+            const destination = try self.allocateOp(inst_idx);
+            switch (destination) {
+                .reg => |register| try enc.emitMovRegReg(nameToReg(register), .rax),
+                .mem => |slot| try enc.emitMovMemReg(slot, .rax),
+            }
+        },
+
+        .cast => {
+            const destination = try self.allocateOp(inst_idx);
+            const source = try self.allocateOp(inst.data.cast.value);
+            const source_float = self.isFloatType(inst.data.cast.source_type);
+            const target_float = self.isFloatType(inst.type_id);
+            if (source_float and target_float) {
+                const source_bits = floatBits(self, inst.data.cast.source_type);
+                const target_bits = floatBits(self, inst.type_id);
+                try loadFloatOperand(enc, source, 0, source_bits);
+                if (source_bits != target_bits) try enc.emitFloatConvert(0, 0, source_bits);
+                try storeFloatOperand(enc, destination, 0, target_bits);
+            } else if (!source_float and target_float) {
+                const source_register = try opToRegBin(enc, source, .rax);
+                try enc.emitIntToFloat(0, source_register, floatBits(self, inst.type_id));
+                try storeFloatOperand(enc, destination, 0, floatBits(self, inst.type_id));
+            } else if (source_float and !target_float) {
+                try loadFloatOperand(enc, source, 0, floatBits(self, inst.data.cast.source_type));
+                try enc.emitFloatToInt(.rax, 0, floatBits(self, inst.data.cast.source_type));
+                switch (destination) {
+                    .reg => |register| try enc.emitMovRegReg(nameToReg(register), .rax),
+                    .mem => |slot| try enc.emitMovMemReg(slot, .rax),
+                }
+            } else {
+                const source_register = try opToRegBin(enc, source, .rax);
+                switch (destination) {
+                    .reg => |register| try enc.emitMovRegReg(nameToReg(register), source_register),
+                    .mem => |slot| try enc.emitMovMemReg(slot, source_register),
+                }
+            }
+        },
+
+        .bitcast => {
+            const destination = try self.allocateOp(inst_idx);
+            const source = try self.allocateOp(inst.data.bitcast);
+            const source_register = try opToRegBin(enc, source, .rax);
+            switch (destination) {
+                .reg => |register| try enc.emitMovRegReg(nameToReg(register), source_register),
+                .mem => |slot| try enc.emitMovMemReg(slot, source_register),
+            }
         },
 
         .gep => {
@@ -272,10 +477,15 @@ pub fn emit(self: anytype, enc: *Encoder, inst_idx: lir.Inst.Index) !void {
         // ── ABI: parameters ──────────────────────────────────────────────
         .param => {
             const op = try self.allocateOp(inst_idx);
-            const param_idx = inst.data.param + @intFromBool(if (self.current_function_return_type) |return_type| self.isIndirectReturn(return_type) else false);
-            const arg_regs_bin = [_]Reg{ .rdi, .rsi, .rdx, .rcx, .r8, .r9 };
-            if (param_idx < arg_regs_bin.len) {
-                const parameter_slot = try self.getOrAllocParameterSlot(param_idx);
+            const location = parameterLocation(self, inst_idx);
+            if (location.in_register and location.is_float) {
+                const bits = floatBits(self, inst.type_id);
+                switch (op) {
+                    .reg => |register| try enc.emitMovGpXmm(nameToReg(register), location.register_index, bits),
+                    .mem => |slot| try enc.emitMovMemXmm(slot, location.register_index, bits),
+                }
+            } else if (location.in_register) {
+                const parameter_slot = try self.getOrAllocParameterSlot(location.register_index);
                 switch (op) {
                     .reg => |r| try enc.emitMovRegMem(nameToReg(r), parameter_slot),
                     .mem => |m| {
@@ -284,8 +494,7 @@ pub fn emit(self: anytype, enc: *Encoder, inst_idx: lir.Inst.Index) !void {
                     },
                 }
             } else {
-                // Stack param: [rbp + 16 + (n-6)*8]
-                const sp_off: i32 = 16 + @as(i32, @intCast((param_idx - 6) * 8));
+                const sp_off: i32 = 16 + @as(i32, @intCast(location.stack_index * 8));
                 try enc.emitMovRegMem(.rax, -sp_off); // use negative because emitMovRegMem negates
                 switch (op) {
                     .reg => |r| try enc.emitMovRegReg(nameToReg(r), .rax),
@@ -344,16 +553,17 @@ pub fn emit(self: anytype, enc: *Encoder, inst_idx: lir.Inst.Index) !void {
             }
 
             const register_offset: u32 = @intFromBool(memory_return);
-            const register_capacity: u32 = @as(u32, arg_regs_bin.len) - register_offset;
-            const stack_count = num_args -| register_capacity;
+            const stack_count = callStackCount(self, args_extra_start, num_args, register_offset);
             const needs_stack_align = stack_count % 2 != 0;
             // Alignment padding precedes the pushed arguments so the first
             // stack parameter remains at [rbp + 16] in the callee.
             if (needs_stack_align) try enc.emitSubRspImm8(8);
             if (stack_count > 0) {
                 var stack_index: u32 = num_args;
-                while (stack_index > register_capacity) {
+                while (stack_index > 0) {
                     stack_index -= 1;
+                    const location = callArgumentLocation(self, args_extra_start, stack_index, register_offset);
+                    if (location.in_register) continue;
                     const arg_inst = self.lir.extra_data.items[args_extra_start + stack_index];
                     const arg_op = try self.allocateOp(arg_inst);
                     const source = try opToRegBin(enc, arg_op, .rax);
@@ -361,15 +571,22 @@ pub fn emit(self: anytype, enc: *Encoder, inst_idx: lir.Inst.Index) !void {
                 }
             }
 
-            // Move register args (last first to avoid clobbering)
-            var i: u32 = @min(num_args, register_capacity);
+            // Move register args last-first so GP scratch moves cannot clobber
+            // arguments that have not yet reached their ABI register.
+            var i: u32 = num_args;
             while (i > 0) {
                 i -= 1;
+                const location = callArgumentLocation(self, args_extra_start, i, register_offset);
+                if (!location.in_register) continue;
                 const arg_inst = self.lir.extra_data.items[args_extra_start + i];
                 const arg_op = try self.allocateOp(arg_inst);
-                const dst_r = arg_regs_bin[i + register_offset];
-                const src_r = try opToRegBin(enc, arg_op, .rax);
-                try enc.emitMovRegReg(dst_r, src_r);
+                if (location.is_float) {
+                    try loadFloatOperand(enc, arg_op, location.register_index, floatBits(self, self.lir.insts.items[arg_inst].type_id));
+                } else {
+                    const dst_r = arg_regs_bin[location.register_index];
+                    const src_r = try opToRegBin(enc, arg_op, .rax);
+                    try enc.emitMovRegReg(dst_r, src_r);
+                }
             }
 
             // Emit call via func_sym (must be in a register)
@@ -459,6 +676,8 @@ pub fn emit(self: anytype, enc: *Encoder, inst_idx: lir.Inst.Index) !void {
                     .reg => |r| try enc.emitMovRegReg(nameToReg(r), .rax),
                     .mem => |m| try enc.emitMovMemReg(m, .rax),
                 }
+            } else if (self.isFloatType(inst.type_id)) {
+                try storeFloatOperand(enc, op, 0, floatBits(self, inst.type_id));
             } else switch (op) {
                 .reg => |r| try enc.emitMovRegReg(nameToReg(r), .rax),
                 .mem => |m| try enc.emitMovMemReg(m, .rax),
@@ -580,8 +799,12 @@ pub fn emit(self: anytype, enc: *Encoder, inst_idx: lir.Inst.Index) !void {
                 try enc.emitMovRegImm64(.rax, 0);
             } else if (inst.data.ret) |r| {
                 const val_op = try self.allocateOp(r);
-                const val_r = try opToRegBin(enc, val_op, .rax);
-                try enc.emitMovRegReg(.rax, val_r);
+                if (self.isFloatType(inst.type_id)) {
+                    try loadFloatOperand(enc, val_op, 0, floatBits(self, inst.type_id));
+                } else {
+                    const val_r = try opToRegBin(enc, val_op, .rax);
+                    try enc.emitMovRegReg(.rax, val_r);
+                }
             }
             try enc.emitMovRspRbp();
             try enc.emitPopRbp();
