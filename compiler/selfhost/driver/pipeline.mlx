@@ -1,4 +1,5 @@
 const page_allocator = @import("../../../std/bootstrap/page_allocator.mlx")
+const arena_allocator = @import("../../../std/bootstrap/arena_allocator.mlx")
 const process = @import("../../../std/bootstrap/process.mlx")
 const modules = @import("../modules.mlx")
 const types = @import("../types.mlx")
@@ -15,18 +16,25 @@ const reporter_module = @import("./reporter.mlx")
 pub const Pipeline = struct {
     pub fn compile(options: options_module.Options) -> u8 {
         unsafe {
-            var reporter = reporter_module.Reporter.init(options.showProgress, options.traceEnabled, options_module.Options.stepCount(options))
+            var reporter = reporter_module.Reporter.init(options.compilerNamePointer, options.compilerNameLength, options.showProgress, options.traceEnabled, options_module.Options.stepCount(options))
             Self.tracePaths(&reporter, options)
-            const allocator = page_allocator.init()
+            const pages = page_allocator.init()
+            var arena = arena_allocator.init(pages, 268435456)
+            const allocator = arena_allocator.interface(&arena)
             reporter_module.Reporter.progress(&reporter, 1, "load and parse module graph")
             const loader = modules.initLoader(allocator, @ptrCast([*]const u8, "std/src"), 7, null)
             const root = modules.loadRoot(loader, options.inputPointer, options.inputLength)
             if root == modules.NONE || modules.totalErrors(loader) != 0 {
                 reporter_module.Reporter.failure(diagnostic.Code.import_not_found, diagnostic.Phase.resolve, "module graph could not be loaded")
                 modules.deinitLoader(loader)
+                Self.finishArena(&reporter, &arena)
+                reporter_module.Reporter.finish(&reporter)
                 return 4
             }
             Self.traceGraph(&reporter, loader)
+            reporter_module.Reporter.metric(&reporter, "modules loaded", modules.moduleCount(loader))
+            reporter_module.Reporter.metric(&reporter, "imports discovered", modules.importCount(loader))
+            Self.reportFrontendMetrics(&reporter, loader)
             var type_store = types.init(allocator)
             var symbol_store = symbols.initStore(allocator, modules.moduleCount(loader) * 64 + 64)
             var status = Self.analyze(loader, &type_store, &symbol_store, &reporter)
@@ -36,8 +44,15 @@ pub const Pipeline = struct {
             symbols.deinitStore(&symbol_store)
             types.deinit(&type_store)
             modules.deinitLoader(loader)
+            Self.finishArena(&reporter, &arena)
+            reporter_module.Reporter.finish(&reporter)
             return status
         }
+    }
+
+    fn finishArena(reporter: *reporter_module.Reporter, arena: *arena_allocator.Arena) -> void {
+        reporter_module.Reporter.metric(reporter, "compiler arena bytes", arena.*.offset)
+        arena_allocator.deinit(arena)
     }
 
     fn tracePaths(reporter: *reporter_module.Reporter, options: options_module.Options) -> void {
@@ -54,6 +69,17 @@ pub const Pipeline = struct {
         reporter_module.Reporter.traceModules(reporter, loader)
     }
 
+    fn reportFrontendMetrics(reporter: *reporter_module.Reporter, loader: *modules.Loader) -> void {
+        reporter_module.Reporter.metric(reporter, "source bytes", modules.sourceByteCount(loader))
+        reporter_module.Reporter.metric(reporter, "tokens scanned", modules.tokenCount(loader))
+        reporter_module.Reporter.metric(reporter, "AST nodes parsed", modules.nodeCount(loader))
+        reporter_module.Reporter.metric(reporter, "declarations discovered", modules.declarationCount(loader))
+        reporter_module.Reporter.metric(reporter, "functions discovered", modules.functionCount(loader))
+        reporter_module.Reporter.metricDuration(reporter, "source I/O", modules.sourceLoadTime(loader))
+        reporter_module.Reporter.metricDuration(reporter, "lexing", modules.lexerTime(loader))
+        reporter_module.Reporter.metricDuration(reporter, "parsing", modules.parserTime(loader))
+    }
+
     fn analyze(loader: *modules.Loader, type_store: *types.Store, symbol_store: *symbols.Store, reporter: *reporter_module.Reporter) -> u8 {
         reporter_module.Reporter.progress(reporter, 2, "resolve modules and declarations")
         if modules.prepare(loader, type_store, symbol_store) != 0 {
@@ -66,25 +92,36 @@ pub const Pipeline = struct {
             return 6
         }
         reporter_module.Reporter.traceValue(reporter, "types after declarations: ", types.count(type_store))
+        reporter_module.Reporter.metric(reporter, "types resolved", types.count(type_store))
+        reporter_module.Reporter.metric(reporter, "symbols registered", symbol_store.*.length)
         reporter_module.Reporter.progress(reporter, 4, "analyze function bodies")
         if modules.analyzeFunctionBodies(loader, type_store, symbol_store) != 0 {
             reporter_module.Reporter.failure(diagnostic.Code.type_mismatch, diagnostic.Phase.sema, "function body could not be resolved")
             return 7
         }
+        Self.traceTypeInterning(reporter, type_store)
+        Self.traceMethodLookup(reporter, symbol_store)
         return 0
     }
 
-    fn emitExecutable(loader: *modules.Loader, allocator: page_allocator.Allocator, type_store: *types.Store, symbol_store: *symbols.Store, options: options_module.Options, reporter: *reporter_module.Reporter) -> u8 {
+    fn emitExecutable(loader: *modules.Loader, allocator: arena_allocator.Allocator, type_store: *types.Store, symbol_store: *symbols.Store, options: options_module.Options, reporter: *reporter_module.Reporter) -> u8 {
         reporter_module.Reporter.progress(reporter, 5, "lower typed AST to LIR")
         var ir = lir.init(allocator)
         var builder = lower.init(&ir, type_store, symbol_store, loader, allocator)
         Self.lowerModules(loader, &builder)
         Self.traceLir(reporter, &builder, &ir)
+        Self.traceTypeInterning(reporter, type_store)
+        Self.traceMethodLookup(reporter, symbol_store)
         reporter_module.Reporter.progress(reporter, 6, "generate x86_64 machine code")
         var encoder = encoder_module.init(allocator)
         var codegen = codegen_module.Codegen.init(allocator, &encoder, &ir)
         codegen_module.Codegen.generateBinary(&codegen)
         reporter_module.Reporter.traceValue(reporter, "machine-code bytes: ", encoder_module.pos(&encoder))
+        reporter_module.Reporter.metric(reporter, "machine-code bytes", encoder_module.pos(&encoder))
+        reporter_module.Reporter.metric(reporter, "backend symbols", encoder_module.symbolCount(&encoder))
+        reporter_module.Reporter.metric(reporter, "backend fixups", encoder_module.fixupCount(&encoder))
+        reporter_module.Reporter.metric(reporter, "aggregate allocation sites", codegen_module.Codegen.aggregateAllocationCount(&codegen))
+        reporter_module.Reporter.metric(reporter, "aggregate allocation bytes (static)", codegen_module.Codegen.aggregateAllocationBytes(&codegen))
         reporter_module.Reporter.progress(reporter, 7, "resolve backend symbols")
         if !encoder_module.applyFixups(&encoder) {
             Self.reportUnresolved(reporter, &encoder)
@@ -92,6 +129,8 @@ pub const Pipeline = struct {
             reporter_module.Reporter.failure(diagnostic.Code.import_not_found, diagnostic.Phase.linker, "unresolved backend symbol")
             return 8
         }
+        reporter_module.Reporter.metric(reporter, "symbol lookup probes", encoder_module.fixupProbes(&encoder))
+        reporter_module.Reporter.metric(reporter, "maximum lookup probes", encoder_module.maxFixupProbes(&encoder))
         reporter_module.Reporter.progress(reporter, 8, "write ELF64 executable")
         var empty_rodata: [*]const u8 = undefined
         unsafe { empty_rodata = @ptrFromInt([*]const u8, 0) }
@@ -116,6 +155,28 @@ pub const Pipeline = struct {
     fn traceLir(reporter: *reporter_module.Reporter, builder: *lower.LirBuilder, ir: *lir.Lir) -> void {
         reporter_module.Reporter.traceValue(reporter, "generic instances: ", lower.genericInstanceCount(builder))
         reporter_module.Reporter.traceValue(reporter, "LIR instructions: ", lir.instCount(ir))
+        reporter_module.Reporter.metric(reporter, "generic instances", lower.genericInstanceCount(builder))
+        reporter_module.Reporter.metric(reporter, "expression type queries", lower.expressionTypeQueryCount(builder))
+        reporter_module.Reporter.metric(reporter, "expression type cache hits", lower.expressionTypeCacheHitCount(builder))
+        reporter_module.Reporter.metric(reporter, "resolved type queries", lower.resolvedTypeQueryCount(builder))
+        reporter_module.Reporter.metric(reporter, "resolved type cache hits", lower.resolvedTypeCacheHitCount(builder))
+        reporter_module.Reporter.metric(reporter, "LIR instructions", lir.instCount(ir))
+        reporter_module.Reporter.metric(reporter, "LIR extra words", lir.extraDataCount(ir))
+        reporter_module.Reporter.metric(reporter, "LIR symbols", lir.symbolCount(ir))
+        reporter_module.Reporter.metric(reporter, "string literals", lir.stringLiteralCount(ir))
+    }
+
+    fn traceTypeInterning(reporter: *reporter_module.Reporter, type_store: *types.Store) -> void {
+        reporter_module.Reporter.metric(reporter, "type intern calls", types.internCallCount(type_store))
+        reporter_module.Reporter.metric(reporter, "type intern probes", types.internProbeCount(type_store))
+        reporter_module.Reporter.metric(reporter, "maximum type intern probes", types.maxInternProbeCount(type_store))
+        reporter_module.Reporter.metric(reporter, "primitive type cache hits", types.primitiveCacheHitCount(type_store))
+    }
+
+    fn traceMethodLookup(reporter: *reporter_module.Reporter, symbol_store: *symbols.Store) -> void {
+        reporter_module.Reporter.metric(reporter, "aggregate method lookups", symbols.methodQueryCount(symbol_store))
+        reporter_module.Reporter.metric(reporter, "aggregate method probes", symbols.methodProbeCount(symbol_store))
+        reporter_module.Reporter.metric(reporter, "maximum aggregate method probes", symbols.maxMethodProbeCount(symbol_store))
     }
 
     fn reportUnresolved(reporter: *reporter_module.Reporter, encoder: *encoder_module.Encoder) -> void {

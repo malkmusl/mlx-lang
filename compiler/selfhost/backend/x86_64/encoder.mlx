@@ -24,18 +24,24 @@ pub const Fixup = struct {
     patchOffset: usize
     targetPointer: [*]const u8
     targetLength: usize
+    targetHash: usize
 }
 
 pub const SymbolEntry = struct {
     namePointer: [*]const u8
     nameLength: usize
     offset: usize
+    nameHash: usize
 }
 
 pub const Encoder = struct {
     buf: *array_list.ArrayList
     symbols: *vector.Vector
     fixups: *vector.Vector
+    symbolBuckets: [*]usize
+    symbolIndexCapacity: usize
+    fixupProbeCount: usize
+    maxFixupProbeCount: usize
     allocatorContext: usize
     allocFn: allocator_module.AllocFn
     resizeFn: allocator_module.ResizeFn
@@ -50,10 +56,15 @@ pub fn init(allocator: allocator_module.Allocator) -> Encoder {
         array_list.ArrayList.initAt(buf, allocator, 1024)
         vector.Vector.initAt(symbols, allocator, @sizeOf(SymbolEntry), @alignOf(SymbolEntry), 16)
         vector.Vector.initAt(fixups, allocator, @sizeOf(Fixup), @alignOf(Fixup), 16)
+        const empty_buckets = @ptrFromInt([*]usize, 0)
         return Encoder.{
             .buf = buf,
             .symbols = symbols,
             .fixups = fixups,
+            .symbolBuckets = empty_buckets,
+            .symbolIndexCapacity = 0,
+            .fixupProbeCount = 0,
+            .maxFixupProbeCount = 0,
             .allocatorContext = allocator.context,
             .allocFn = allocator.allocFn,
             .resizeFn = allocator.resizeFn,
@@ -63,6 +74,7 @@ pub fn init(allocator: allocator_module.Allocator) -> Encoder {
 }
 
 pub fn deinit(enc: *Encoder) -> void {
+    releaseSymbolIndex(enc)
     array_list.ArrayList.deinit(enc.*.buf.*)
     vector.Vector.deinit(enc.*.symbols.*)
     vector.Vector.deinit(enc.*.fixups.*)
@@ -125,6 +137,7 @@ pub fn defineSymbol(enc: *Encoder, name_ptr: [*]const u8, name_len: usize) -> vo
         .namePointer = name_ptr,
         .nameLength = name_len,
         .offset = pos(enc),
+        .nameHash = hashName(name_ptr, name_len),
     }
     unsafe {
         const appended = vector.Vector.appendAt(enc.*.symbols, @ptrCast([*]const u8, &entry))
@@ -132,11 +145,16 @@ pub fn defineSymbol(enc: *Encoder, name_ptr: [*]const u8, name_len: usize) -> vo
 }
 
 pub fn findSymbol(enc: *Encoder, name_ptr: [*]const u8, name_len: usize) -> (bool, usize) {
+    const name_hash = hashName(name_ptr, name_len)
+    if enc.*.symbolIndexCapacity != 0 {
+        const indexed = findIndexedSymbol(enc, name_ptr, name_len, name_hash)
+        return -> (indexed.0, indexed.1)
+    }
     var i: usize = 0
     while i < enc.*.symbols.*.length {
         unsafe {
             const entry_ptr = @ptrCast(*SymbolEntry, vector.Vector.at(enc.*.symbols.*, i))
-            if entry_ptr.*.nameLength == name_len {
+            if entry_ptr.*.nameHash == name_hash && entry_ptr.*.nameLength == name_len {
                 if mem.eql(entry_ptr.*.namePointer, name_ptr, name_len) {
                     return -> (true, entry_ptr.*.offset)
                 }
@@ -154,6 +172,7 @@ pub fn addFixup(enc: *Encoder, kind: FixupKind, target_ptr: [*]const u8, target_
         .patchOffset = offset,
         .targetPointer = target_ptr,
         .targetLength = target_len,
+        .targetHash = hashName(target_ptr, target_len),
     }
     unsafe {
         const appended = vector.Vector.appendAt(enc.*.fixups, @ptrCast([*]const u8, &fixup))
@@ -162,11 +181,16 @@ pub fn addFixup(enc: *Encoder, kind: FixupKind, target_ptr: [*]const u8, target_
 }
 
 pub fn applyFixups(enc: *Encoder) -> bool {
+    if !buildSymbolIndex(enc) { return false }
+    enc.*.fixupProbeCount = 0
+    enc.*.maxFixupProbeCount = 0
     var i: usize = 0
     while i < enc.*.fixups.*.length {
         unsafe {
             const fixup_ptr = @ptrCast(*Fixup, vector.Vector.at(enc.*.fixups.*, i))
-            const found = findSymbol(enc, fixup_ptr.*.targetPointer, fixup_ptr.*.targetLength)
+            const found = findIndexedSymbol(enc, fixup_ptr.*.targetPointer, fixup_ptr.*.targetLength, fixup_ptr.*.targetHash)
+            enc.*.fixupProbeCount += found.2
+            if found.2 > enc.*.maxFixupProbeCount { enc.*.maxFixupProbeCount = found.2 }
             if !found.0 {
                 return false
             }
@@ -179,6 +203,94 @@ pub fn applyFixups(enc: *Encoder) -> bool {
     }
     return true
 }
+
+fn hashName(pointer: [*]const u8, length: usize) -> usize {
+    var result: usize = 14695981039346656037
+    var index: usize = 0
+    while index < length {
+        result = (result ^ @intCast(usize, pointer[index])) *% 1099511628211
+        index += 1
+    }
+    return result
+}
+
+fn buildSymbolIndex(enc: *Encoder) -> bool {
+    if enc.*.symbolIndexCapacity != 0 { return true }
+    var capacity: usize = 8
+    while capacity < enc.*.symbols.*.length * 2 { capacity *= 2 }
+    const memory = enc.*.allocFn(enc.*.allocatorContext, capacity * @sizeOf(usize), @alignOf(usize))
+    if memory == null { return false }
+    unsafe { enc.*.symbolBuckets = @ptrCast([*]usize, memory.?) }
+    enc.*.symbolIndexCapacity = capacity
+    var bucket: usize = 0
+    while bucket < capacity {
+        enc.*.symbolBuckets[bucket] = 0
+        bucket += 1
+    }
+    var symbol_index: usize = 0
+    while symbol_index < enc.*.symbols.*.length {
+        if !insertSymbol(enc, symbol_index) { return false }
+        symbol_index += 1
+    }
+    return true
+}
+
+fn insertSymbol(enc: *Encoder, symbol_index: usize) -> bool {
+    unsafe {
+        const entry = @ptrCast(*SymbolEntry, vector.Vector.at(enc.*.symbols.*, symbol_index))
+        var bucket = entry.*.nameHash % enc.*.symbolIndexCapacity
+        var probes: usize = 0
+        while probes < enc.*.symbolIndexCapacity {
+            const stored = enc.*.symbolBuckets[bucket]
+            if stored == 0 {
+                enc.*.symbolBuckets[bucket] = symbol_index + 1
+                return true
+            }
+            const previous = @ptrCast(*SymbolEntry, vector.Vector.at(enc.*.symbols.*, stored - 1))
+            if namesEqual(previous, entry.*.namePointer, entry.*.nameLength, entry.*.nameHash) { return true }
+            bucket = (bucket + 1) % enc.*.symbolIndexCapacity
+            probes += 1
+        }
+    }
+    return false
+}
+
+fn findIndexedSymbol(enc: *Encoder, pointer: [*]const u8, length: usize, hash: usize) -> (bool, usize, usize) {
+    var bucket = hash % enc.*.symbolIndexCapacity
+    var probes: usize = 1
+    while probes <= enc.*.symbolIndexCapacity {
+        const stored = enc.*.symbolBuckets[bucket]
+        if stored == 0 { return -> (false, 0, probes) }
+        unsafe {
+            const entry = @ptrCast(*SymbolEntry, vector.Vector.at(enc.*.symbols.*, stored - 1))
+            if namesEqual(entry, pointer, length, hash) { return -> (true, entry.*.offset, probes) }
+        }
+        bucket = (bucket + 1) % enc.*.symbolIndexCapacity
+        probes += 1
+    }
+    return -> (false, 0, probes)
+}
+
+fn namesEqual(entry: *SymbolEntry, pointer: [*]const u8, length: usize, hash: usize) -> bool {
+    return entry.*.nameHash == hash && entry.*.nameLength == length && mem.eql(entry.*.namePointer, pointer, length)
+}
+
+fn releaseSymbolIndex(enc: *Encoder) -> void {
+    if enc.*.symbolIndexCapacity == 0 { return }
+    unsafe {
+        enc.*.freeFn(enc.*.allocatorContext, @ptrCast([*]u8, enc.*.symbolBuckets), enc.*.symbolIndexCapacity * @sizeOf(usize), @alignOf(usize))
+        enc.*.symbolBuckets = @ptrFromInt([*]usize, 0)
+    }
+    enc.*.symbolIndexCapacity = 0
+}
+
+pub fn symbolCount(enc: *Encoder) -> usize { return enc.*.symbols.*.length }
+
+pub fn fixupCount(enc: *Encoder) -> usize { return enc.*.fixups.*.length }
+
+pub fn fixupProbes(enc: *Encoder) -> usize { return enc.*.fixupProbeCount }
+
+pub fn maxFixupProbes(enc: *Encoder) -> usize { return enc.*.maxFixupProbeCount }
 
 pub fn unresolvedFixupPointer(enc: *Encoder) -> [*]const u8 {
     var index: usize = 0
@@ -397,6 +509,11 @@ pub fn emitJnzRel(enc: *Encoder, target_ptr: [*]const u8, target_len: usize) -> 
 
 pub fn emitJzRel(enc: *Encoder, target_ptr: [*]const u8, target_len: usize) -> void {
     emit2(enc, 0x0F, 0x84)
+    addFixup(enc, FixupKind.jmp_rel32, target_ptr, target_len)
+}
+
+pub fn emitJbeRel(enc: *Encoder, target_ptr: [*]const u8, target_len: usize) -> void {
+    emit2(enc, 0x0F, 0x86)
     addFixup(enc, FixupKind.jmp_rel32, target_ptr, target_len)
 }
 
