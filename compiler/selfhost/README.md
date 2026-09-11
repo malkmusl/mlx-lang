@@ -39,6 +39,13 @@ runtime foundation remain independent of libc and Zig dependencies:
 - `driver/` owns command-line options, progress/trace reporting, frontend
   analysis, lowering, backend orchestration and cleanup; `main.mlx` is the thin
   executable entry point.
+- `ir/inline.mlx` recognizes safe direct-return inline candidates. Explicit
+  `inline` requests are honored when eligible, `noinline` vetoes automatic
+  expansion, and `-O2`/`-O3` enable increasingly broad cost-limited automatic
+  inlining. Recursive expansion is bounded and falls back to an ordinary call.
+- `ir/optimize.mlx` performs mandatory LIR canonicalization, constant and
+  branch folding, local load forwarding, stack-slot promotion and dead-code
+  elimination.
 - `backend/x86_64/codegen/` separates mutable backend state from label,
   memory, arithmetic, value, call and control-flow instruction emission;
   `backend/x86_64/codegen.mlx` is the public `Codegen` facade.
@@ -57,6 +64,12 @@ Build the self-hosted compiler with:
 zig build mlx1
 zig-out/bin/mlx1 tests/01_basic.mlx
 ```
+
+The canonical driver accepts `-O0`, `-O1`, `-O2`, and `-O3`. The current
+bootstrap distinction is intentionally narrow: explicit eligible `inline`
+functions can expand at every level, O2 automatically expands only very small
+eligible functions, and O3 uses a larger cost budget. The remaining global
+optimization and register-allocation work is tracked separately.
 
 Verify deterministic self-hosting with:
 

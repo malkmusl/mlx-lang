@@ -80,3 +80,12 @@ backend requires direct syscalls, but no normative `std.net` module or socket
 address, endpoint, TCP/UDP, resolver, or event-loop API is specified. Raw
 `std.os.linux`/`std.posix` wrappers can follow the platform ABI; a portable
 `std.net` interface requires an added normative contract.
+
+### Function inline modifier strength
+
+`spec/00-language/grammar.ebnf` admits `inline` and `noinline` declaration
+modifiers, but no normative rule says whether `inline` is mandatory, a strong
+request, or an ordinary optimization hint, nor what happens when a requested
+function cannot be inlined. The canonical compiler therefore treats `inline`
+as a conservative best-effort request and `noinline` as a veto; failure to
+inline does not change program semantics or produce an invented diagnostic.
