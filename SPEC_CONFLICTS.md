@@ -11,8 +11,8 @@ implementation from choosing behavior without designing new language rules.
 `@atomicRmw`, `@cmpxchgWeak`, `@cmpxchgStrong`, and `@fence`, and defines the
 available memory orders. It does not define argument order, result types, the
 representation of an RMW operation, or the valid order combinations per
-builtin. Stage 0 recognizes every name and reports a structured lowering error;
-it does not lower an invented calling convention.
+builtin. Stage 0 and the canonical compiler recognize every name and report
+MLX-E9001; neither lowers an invented calling convention.
 
 ### Vector builtin call shapes
 
@@ -60,8 +60,9 @@ scope, initializer requirement, and absence of heap allocation for
 `threadlocal`, but does not define the executable TLS model, TLS relocation
 model, per-thread initialization protocol, or how a freestanding executable
 obtains its thread pointer. The compiler preserves and validates the
-declaration marker but cannot emit a private TLS ABI until that contract is
-normative.
+declaration marker, and the canonical compiler reports MLX-E9001 before object
+emission rather than silently treating TLS as ordinary global storage. It
+cannot emit a private TLS ABI until that contract is normative.
 
 ### Standard thread API details
 
