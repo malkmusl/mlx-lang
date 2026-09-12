@@ -9,16 +9,18 @@ pub const FreeFn = allocator_module.FreeFn
 pub const Entry = struct {
     namePointer: [*]const u8
     nameLength: usize
+    nameHash: usize
     symbol: usize
 }
 
-// A bootstrap scope deliberately uses a compact linear table. It keeps scope
-// ownership and parent traversal simple; Mlx1 can replace the lookup policy
-// without changing symbol IDs or semantic callers.
+// Small lexical scopes stay linear. Larger scopes lazily add an open-addressed
+// name index without changing scope ownership, parent traversal, or symbol IDs.
 pub const Scope = struct {
     items: [*]u8
     length: usize
     capacity: usize
+    buckets: [*]usize
+    bucketCapacity: usize
     parentAddress: usize
     depth: usize
     allocatorContext: usize
@@ -28,16 +30,20 @@ pub const Scope = struct {
 
     pub fn initRoot(allocator: Allocator, initial_capacity: usize) -> Self {
         const capacity = if initial_capacity > 0 { initial_capacity } else { 64 }
-        return Self.{
-            .items = allocator.alloc(capacity * @sizeOf(Entry), @alignOf(Entry)).?,
-            .length = 0,
-            .capacity = capacity,
-            .parentAddress = 0,
-            .depth = 0,
-            .allocatorContext = allocator.context,
-            .allocFn = allocator.allocFn,
-            .resizeFn = allocator.resizeFn,
-            .freeFn = allocator.freeFn,
+        unsafe {
+            return Self.{
+                .items = allocator.alloc(capacity * @sizeOf(Entry), @alignOf(Entry)).?,
+                .length = 0,
+                .capacity = capacity,
+                .buckets = @ptrFromInt([*]usize, 0),
+                .bucketCapacity = 0,
+                .parentAddress = 0,
+                .depth = 0,
+                .allocatorContext = allocator.context,
+                .allocFn = allocator.allocFn,
+                .resizeFn = allocator.resizeFn,
+                .freeFn = allocator.freeFn,
+            }
         }
     }
 
@@ -46,6 +52,8 @@ pub const Scope = struct {
         scope.*.items = allocator.alloc(capacity * @sizeOf(Entry), @alignOf(Entry)).?
         scope.*.length = 0
         scope.*.capacity = capacity
+        unsafe { scope.*.buckets = @ptrFromInt([*]usize, 0) }
+        scope.*.bucketCapacity = 0
         scope.*.parentAddress = 0
         scope.*.depth = 0
         scope.*.allocatorContext = allocator.context
@@ -70,14 +78,59 @@ pub const Scope = struct {
         unsafe { return @ptrFromInt(*Entry, @intFromPtr(scope.*.items) + index * @sizeOf(Entry)) }
     }
 
-    fn sameName(entry: *Entry, pointer: [*]const u8, length: usize) -> bool {
-        if entry.*.nameLength != length { return false }
+    fn hashName(pointer: [*]const u8, length: usize) -> usize {
+        var result: usize = 14695981039346656037
+        var index: usize = 0
+        while index < length {
+            result = (result ^ @intCast(usize, pointer[index])) *% 1099511628211
+            index += 1
+        }
+        return result
+    }
+
+    fn sameName(entry: *Entry, pointer: [*]const u8, length: usize, hash: usize) -> bool {
+        if entry.*.nameHash != hash || entry.*.nameLength != length { return false }
         var index: usize = 0
         while index < length {
             if entry.*.namePointer[index] != pointer[index] { return false }
             index += 1
         }
         return true
+    }
+
+    fn insertIndexed(scope: *Self, index: usize) -> void {
+        const entry = Self.entryAt(scope, index)
+        var bucket = entry.*.nameHash & (scope.*.bucketCapacity - 1)
+        while scope.*.buckets[bucket] != 0 { bucket = (bucket + 1) & (scope.*.bucketCapacity - 1) }
+        scope.*.buckets[bucket] = index + 1
+    }
+
+    fn rebuildIndex(scope: *Self, capacity: usize) -> bool {
+        const memory = scope.*.allocFn(scope.*.allocatorContext, capacity * @sizeOf(usize), @alignOf(usize))
+        if memory == null { return false }
+        const old_buckets = scope.*.buckets
+        const old_capacity = scope.*.bucketCapacity
+        unsafe { scope.*.buckets = @ptrCast([*]usize, memory.?) }
+        scope.*.bucketCapacity = capacity
+        unsafe { mem.zero(@ptrCast([*]u8, scope.*.buckets), capacity * @sizeOf(usize)) }
+        var index: usize = 0
+        while index < scope.*.length {
+            Self.insertIndexed(scope, index)
+            index += 1
+        }
+        if old_capacity != 0 { unsafe { scope.*.freeFn(scope.*.allocatorContext, @ptrCast([*]u8, old_buckets), old_capacity * @sizeOf(usize), @alignOf(usize)) } }
+        return true
+    }
+
+    fn indexNewEntry(scope: *Self) -> void {
+        if scope.*.bucketCapacity == 0 {
+            if scope.*.length >= 8 { const indexed = Self.rebuildIndex(scope, 16) }
+            return
+        }
+        if scope.*.length * 10 >= scope.*.bucketCapacity * 7 {
+            if Self.rebuildIndex(scope, scope.*.bucketCapacity * 2) { return }
+        }
+        Self.insertIndexed(scope, scope.*.length - 1)
     }
 
     fn ensureCapacity(scope: *Self, minimum: usize) -> void {
@@ -89,10 +142,20 @@ pub const Scope = struct {
     }
 
     pub fn lookupCurrent(scope: *Self, pointer: [*]const u8, length: usize) -> (bool, usize) {
+        const hash = Self.hashName(pointer, length)
+        if scope.*.bucketCapacity != 0 {
+            var bucket = hash & (scope.*.bucketCapacity - 1)
+            while scope.*.buckets[bucket] != 0 {
+                const entry = Self.entryAt(scope, scope.*.buckets[bucket] - 1)
+                if Self.sameName(entry, pointer, length, hash) { return -> (true, entry.*.symbol) }
+                bucket = (bucket + 1) & (scope.*.bucketCapacity - 1)
+            }
+            return -> (false, 0)
+        }
         var index: usize = 0
         while index < scope.*.length {
             const entry = Self.entryAt(scope, index)
-            if Self.sameName(entry, pointer, length) { return -> (true, entry.*.symbol) }
+            if Self.sameName(entry, pointer, length, hash) { return -> (true, entry.*.symbol) }
             index += 1
         }
         return -> (false, 0)
@@ -101,9 +164,10 @@ pub const Scope = struct {
     pub fn define(scope: *Self, pointer: [*]const u8, length: usize, symbol: usize) -> bool {
         if Self.lookupCurrent(scope, pointer, length).0 { return false }
         Self.ensureCapacity(scope, scope.*.length + 1)
-        var value = Entry.{ .namePointer = pointer, .nameLength = length, .symbol = symbol }
+        var value = Entry.{ .namePointer = pointer, .nameLength = length, .nameHash = Self.hashName(pointer, length), .symbol = symbol }
         unsafe { mem.copy(@ptrCast([*]u8, Self.entryAt(scope, scope.*.length)), @ptrCast([*]const u8, &value), @sizeOf(Entry)) }
         scope.*.length += 1
+        Self.indexNewEntry(scope)
         return true
     }
 
@@ -119,7 +183,9 @@ pub const Scope = struct {
     }
 
     pub fn deinit(scope: *Self) -> void {
+        if scope.*.bucketCapacity != 0 { unsafe { scope.*.freeFn(scope.*.allocatorContext, @ptrCast([*]u8, scope.*.buckets), scope.*.bucketCapacity * @sizeOf(usize), @alignOf(usize)) } }
         scope.*.freeFn(scope.*.allocatorContext, scope.*.items, scope.*.capacity * @sizeOf(Entry), @alignOf(Entry))
         scope.*.length = 0
+        scope.*.bucketCapacity = 0
     }
 }
