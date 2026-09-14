@@ -71,6 +71,7 @@ fn lowerOptionalUnwrap(builder: anytype, node_index: Node.Index) !?Inst.Index {
 fn lowerIndex(builder: anytype, node_index: Node.Index) !?Inst.Index {
     const child_type = builder.sema.node_types.get(node_index) orelse return null;
     const address = try lvalue.lowerAddress(builder, node_index) orelse return null;
+    if (isAggregate(builder, child_type)) return address;
     const result = try builder.emitInst(.{
         .opcode = .load,
         .type_id = child_type,
