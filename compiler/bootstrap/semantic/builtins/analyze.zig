@@ -59,12 +59,39 @@ fn analyzeTypeOf(self: anytype, node_idx: Node.Index, arguments: []const u32, sc
 
 fn analyzeNoCopy(self: anytype, node_idx: Node.Index, arguments: []const u32, scope: *Scope, start: u32) !Type.Id {
     const wrapped = try self.resolveBuiltinTypeArg(arguments[0], scope) orelse {
-        try self.reportError(5005, .@"comptime", start, "@nocopy requires a type argument");
+        try self.reportError(5005, .@"comptime", start, "@noncopy requires a type argument");
         return self.putBuiltinResult(node_idx, try self.type_pool.internPrimitive(.type_type));
     };
     const nocopy_type = try self.type_pool.intern(self.type_pool.get(wrapped).data, .explicit_nocopy);
+    if (self.aggregateMethod(nocopy_type, "deinit")) |method| try validateDeinitializer(self, nocopy_type, method, start);
     try self.type_values.put(node_idx, nocopy_type);
     return self.putBuiltinResult(node_idx, try self.type_pool.internPrimitive(.type_type));
+}
+
+fn validateDeinitializer(self: anytype, owner_type: Type.Id, method: anytype, start: u32) !void {
+    const SemaType = @TypeOf(self.*);
+    const method_sema: *SemaType = @ptrFromInt(method.analysis_address);
+    const declaration = method_sema.ast_tree.nodes.get(method.declaration);
+    const function_type_id = method_sema.node_types.get(method.declaration) orelse
+        method_sema.node_types.get(declaration.data.lhs) orelse return;
+    const function_type = method_sema.type_pool.get(function_type_id);
+    if (function_type.data != .function) return invalidDeinitializer(self, start);
+    const function = function_type.data.function;
+    const parameters = method_sema.type_pool.functionParams(function);
+    const return_type = method_sema.type_pool.get(function.ret_type);
+    if (parameters.len != 1 or return_type.data != .primitive or return_type.data.primitive != .void_type) {
+        return invalidDeinitializer(self, start);
+    }
+    const receiver = method_sema.type_pool.get(parameters[0]);
+    if (receiver.data != .pointer or receiver.data.pointer.size != .One or receiver.data.pointer.is_const) {
+        return invalidDeinitializer(self, start);
+    }
+    const receiver_child = method_sema.type_pool.get(receiver.data.pointer.child_type);
+    if (!std.meta.eql(receiver_child.data, self.type_pool.get(owner_type).data)) return invalidDeinitializer(self, start);
+}
+
+fn invalidDeinitializer(self: anytype, start: u32) !void {
+    try self.reportError(6006, .sema, start, "Automatic deinitializer must be fn deinit(self: *Self) -> void");
 }
 
 fn analyzeMove(self: anytype, node_idx: Node.Index, arguments: []const u32, scope: *Scope, start: u32, source: []const u8) !Type.Id {

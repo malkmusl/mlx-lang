@@ -30,9 +30,17 @@ const LoopTargets = struct {
     cleanup_depth: usize = 0,
 };
 
-const Cleanup = struct {
-    node_index: Node.Index,
-    error_only: bool,
+const Cleanup = union(enum) {
+    explicit: struct {
+        node_index: Node.Index,
+        error_only: bool,
+    },
+    auto_drop: struct {
+        address: Inst.Index,
+        initialized: Inst.Index,
+        type_id: Type.Id,
+        declaration: Node.Index,
+    },
 };
 
 pub const LirBuilder = struct {
@@ -41,6 +49,7 @@ pub const LirBuilder = struct {
     lir: Lir,
     current_block: ?u32,
     var_addresses: std.StringHashMap(u32),
+    drop_flags: std.StringHashMap(Inst.Index),
     var_slice_lengths: std.StringHashMap(Inst.Index),
     slice_lengths: std.AutoHashMap(Inst.Index, Inst.Index),
     synthetic_local_counter: u32,
@@ -58,6 +67,7 @@ pub const LirBuilder = struct {
             .lir = Lir.init(allocator),
             .current_block = null,
             .var_addresses = std.StringHashMap(u32).init(allocator),
+            .drop_flags = std.StringHashMap(Inst.Index).init(allocator),
             .var_slice_lengths = std.StringHashMap(Inst.Index).init(allocator),
             .slice_lengths = std.AutoHashMap(Inst.Index, Inst.Index).init(allocator),
             .synthetic_local_counter = std.math.maxInt(u32),
@@ -70,6 +80,7 @@ pub const LirBuilder = struct {
 
     pub fn deinit(self: *LirBuilder) void {
         self.var_addresses.deinit();
+        self.drop_flags.deinit();
         self.var_slice_lengths.deinit();
         self.slice_lengths.deinit();
         self.loop_stack.deinit(self.allocator);
@@ -120,8 +131,18 @@ pub const LirBuilder = struct {
     fn lowerAggregateMethods(self: *LirBuilder, declaration_index: Node.Index) !void {
         const declaration = self.sema.ast_tree.nodes.get(declaration_index);
         if (declaration.tag != .const_decl and declaration.tag != .var_decl) return;
-        const initializer = self.sema.ast_tree.extra_data[declaration.data.rhs + 1];
-        const aggregate = self.sema.ast_tree.nodes.get(initializer);
+        var aggregate_index = self.sema.ast_tree.extra_data[declaration.data.rhs + 1];
+        var aggregate = self.sema.ast_tree.nodes.get(aggregate_index);
+        if (aggregate.tag == .builtin_call) {
+            const token = self.sema.ast_tree.tokens[aggregate.data.lhs];
+            const source = self.sema.diags.source_manager.getFile(self.sema.source_id).?.content;
+            const name = source[token.start..token.end];
+            const is_noncopy = std.mem.eql(u8, name, "noncopy") or std.mem.eql(u8, name, "nocopy");
+            const argument_count = self.sema.ast_tree.extra_data[aggregate.data.rhs];
+            if (!is_noncopy or argument_count != 1) return;
+            aggregate_index = self.sema.ast_tree.extra_data[aggregate.data.rhs + 1];
+            aggregate = self.sema.ast_tree.nodes.get(aggregate_index);
+        }
         if (aggregate.tag != .struct_decl and aggregate.tag != .enum_decl and aggregate.tag != .union_decl) return;
         var extra_index = aggregate.data.lhs + 1;
         while (extra_index < aggregate.data.rhs) : (extra_index += 1) {
@@ -366,7 +387,57 @@ pub const LirBuilder = struct {
     }
 
     pub fn pushCleanup(self: *LirBuilder, node_index: Node.Index, error_only: bool) !void {
-        try self.cleanup_stack.append(self.allocator, .{ .node_index = node_index, .error_only = error_only });
+        try self.cleanup_stack.append(self.allocator, .{ .explicit = .{ .node_index = node_index, .error_only = error_only } });
+    }
+
+    pub fn pushAutoDrop(self: *LirBuilder, address: Inst.Index, type_id: Type.Id, declaration: Node.Index) !void {
+        if (self.sema.type_pool.get(type_id).copyability == .copyable) return;
+        if (self.sema.aggregateMethod(type_id, "deinit") == null) return;
+        const bool_type = try self.sema.type_pool.internPrimitive(.bool_type);
+        const initialized = try self.emitInst(.{
+            .opcode = .addr,
+            .type_id = bool_type,
+            .data = .{ .addr = self.nextSyntheticLocal() },
+        });
+        const one = try self.emitInst(.{ .opcode = .const_i, .type_id = bool_type, .data = .{ .const_i = 1 } });
+        _ = try self.emitInst(.{
+            .opcode = .store,
+            .type_id = bool_type,
+            .data = .{ .store = .{ .ptr = initialized, .val = one } },
+        });
+        const node = self.sema.ast_tree.nodes.get(declaration);
+        const token = self.sema.ast_tree.tokens[node.data.lhs];
+        const source = self.sema.diags.source_manager.getFile(self.sema.source_id).?.content;
+        try self.drop_flags.put(source[token.start..token.end], initialized);
+        try self.cleanup_stack.append(self.allocator, .{ .auto_drop = .{
+            .address = address,
+            .initialized = initialized,
+            .type_id = type_id,
+            .declaration = declaration,
+        } });
+    }
+
+    pub fn markMoved(self: *LirBuilder, node_index: Node.Index) !void {
+        try self.setDropFlag(node_index, 0);
+    }
+
+    pub fn markInitialized(self: *LirBuilder, node_index: Node.Index) !void {
+        try self.setDropFlag(node_index, 1);
+    }
+
+    fn setDropFlag(self: *LirBuilder, node_index: Node.Index, value: u64) !void {
+        const node = self.sema.ast_tree.nodes.get(node_index);
+        if (node.tag != .identifier) return;
+        const token = self.sema.ast_tree.tokens[node.main_token];
+        const source = self.sema.diags.source_manager.getFile(self.sema.source_id).?.content;
+        const address = self.drop_flags.get(source[token.start..token.end]) orelse return;
+        const bool_type = try self.sema.type_pool.internPrimitive(.bool_type);
+        const flag = try self.emitInst(.{ .opcode = .const_i, .type_id = bool_type, .data = .{ .const_i = value } });
+        _ = try self.emitInst(.{
+            .opcode = .store,
+            .type_id = bool_type,
+            .data = .{ .store = .{ .ptr = address, .val = flag } },
+        });
     }
 
     pub fn nextSyntheticLocal(self: *LirBuilder) u32 {
@@ -380,9 +451,60 @@ pub const LirBuilder = struct {
         while (index > first) {
             index -= 1;
             const cleanup = self.cleanup_stack.items[index];
-            if (cleanup.error_only and !is_error) continue;
-            _ = try self.lowerNode(cleanup.node_index);
+            switch (cleanup) {
+                .explicit => |entry| {
+                    if (entry.error_only and !is_error) continue;
+                    _ = try self.lowerNode(entry.node_index);
+                },
+                .auto_drop => |entry| {
+                    try self.emitAutoDrop(entry.address, entry.initialized, entry.type_id);
+                },
+            }
         }
+    }
+
+    fn emitAutoDrop(self: *LirBuilder, address: Inst.Index, initialized: Inst.Index, type_id: Type.Id) !void {
+        const method = self.sema.aggregateMethod(type_id, "deinit") orelse return;
+        const bool_type = try self.sema.type_pool.internPrimitive(.bool_type);
+        const condition = try self.emitInst(.{
+            .opcode = .load,
+            .type_id = bool_type,
+            .data = .{ .load = .{ .ptr = initialized } },
+        });
+        const drop_block = try self.newBlock();
+        const end_block = try self.newBlock();
+        _ = try self.emitInst(.{
+            .opcode = .condbr,
+            .type_id = 0,
+            .data = .{ .condbr = .{ .cond = condition, .true_dest = drop_block, .false_dest = end_block } },
+        });
+        self.current_block = drop_block;
+        const value = try self.emitInst(.{
+            .opcode = .load,
+            .type_id = type_id,
+            .data = .{ .load = .{ .ptr = address } },
+        });
+        const function_type = blk: {
+            const SemaType = @TypeOf(self.sema.*);
+            const method_sema: *SemaType = @ptrFromInt(method.analysis_address);
+            const declaration = method_sema.ast_tree.nodes.get(method.declaration);
+            break :blk method_sema.node_types.get(method.declaration) orelse method_sema.node_types.get(declaration.data.lhs) orelse return;
+        };
+        const function_symbol = try self.emitInst(.{
+            .opcode = .func_sym,
+            .type_id = function_type,
+            .data = .{ .func_sym = try self.lir.internModuleSymbol(method.module_id, method.qualified_name) },
+        });
+        const arguments_start: u32 = @intCast(self.lir.extra_data.items.len);
+        try self.lir.extra_data.append(self.allocator, value);
+        const void_type = try self.sema.type_pool.internPrimitive(.void_type);
+        _ = try self.emitInst(.{
+            .opcode = .call,
+            .type_id = void_type,
+            .data = .{ .call = .{ .func = function_symbol, .args_start = arguments_start, .args_count = 1 } },
+        });
+        _ = try self.emitInst(.{ .opcode = .br, .type_id = 0, .data = .{ .br = .{ .dest = end_block } } });
+        self.current_block = end_block;
     }
 
     fn currentBlockTerminated(self: *const LirBuilder) bool {

@@ -3,7 +3,22 @@ const Scope = @import("../scope.zig").Scope;
 const Type = @import("../type.zig").Type;
 
 pub fn validateMutable(sema: anytype, node_index: Node.Index, scope: *Scope, operator_start: u32) !Type.Id {
-    const type_id = try sema.analyzeNode(node_index, scope);
+    return validateMutableWithState(sema, node_index, scope, operator_start, false);
+}
+
+pub fn validateReinitialization(sema: anytype, node_index: Node.Index, scope: *Scope, operator_start: u32) !Type.Id {
+    return validateMutableWithState(sema, node_index, scope, operator_start, true);
+}
+
+fn validateMutableWithState(sema: anytype, node_index: Node.Index, scope: *Scope, operator_start: u32, allow_moved: bool) !Type.Id {
+    const node = sema.ast_tree.nodes.get(node_index);
+    const type_id = if (allow_moved and node.tag == .identifier) blk: {
+        const token = sema.ast_tree.tokens[node.main_token];
+        const source = sema.diags.source_manager.getFile(sema.source_id).?.content;
+        const symbol = scope.get(source[token.start..token.end]) orelse break :blk try sema.analyzeNode(node_index, scope);
+        try sema.node_types.put(node_index, symbol.type_id);
+        break :blk symbol.type_id;
+    } else try sema.analyzeNode(node_index, scope);
     if (!isAddressable(sema, node_index)) {
         try sema.reportError(4015, .sema, operator_start, "Assignment target is not addressable storage");
         return type_id;

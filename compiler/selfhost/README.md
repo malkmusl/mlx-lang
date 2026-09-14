@@ -71,6 +71,12 @@ functions can expand at every level, O2 automatically expands only very small
 eligible functions, and O3 uses a larger cost budget. The remaining global
 optimization and register-allocation work is tracked separately.
 
+Progress reporting is enabled by default and records the duration of every
+pipeline step. A rejected compilation marks the active step as `failed`, reports
+its duration and semantic error count, and prints stable `MLX-E...` diagnostics
+on stderr. `--quiet` disables progress output; `--trace` additionally prints
+input paths, module graph details, LIR counts, and unresolved backend symbols.
+
 Verify deterministic self-hosting with:
 
 ```sh

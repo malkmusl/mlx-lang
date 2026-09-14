@@ -123,6 +123,7 @@ const names = std.StaticStringMap(Kind).initComptime(.{
     .{ "isUnion", .isUnion },
     .{ "languageVersion", .languageVersion },
     .{ "move", .move },
+    .{ "noncopy", .nocopy },
     .{ "nocopy", .nocopy },
     .{ "offsetOf", .offsetOf },
     .{ "ptrCast", .ptrCast },

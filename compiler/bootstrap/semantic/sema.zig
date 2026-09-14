@@ -183,6 +183,15 @@ pub const Sema = struct {
         for (self.aggregate_methods.items) |method| {
             if (method.owner_type == owner_type and std.mem.eql(u8, method.name, name)) return method;
         }
+        // @noncopy/@nocopy changes only ownership metadata. Methods belong to
+        // the wrapped aggregate representation and remain visible through the
+        // ownership-qualified type identity.
+        const owner = self.type_pool.get(owner_type);
+        for (self.aggregate_methods.items) |method| {
+            if (!std.mem.eql(u8, method.name, name)) continue;
+            const candidate = self.type_pool.get(method.owner_type);
+            if (std.meta.eql(owner.data, candidate.data)) return method;
+        }
         return null;
     }
 

@@ -84,7 +84,9 @@ fn parseBuiltin(parser: anytype) std.mem.Allocator.Error!?Node.Index {
     var arguments = std.ArrayList(Node.Index).empty;
     defer arguments.deinit(parser.allocator);
     var closing_consumed = false;
-    if (std.mem.eql(u8, tokenText(parser, builtin_token), "nocopy") and parser.index < parser.tokens.len and aggregate.isStart(parser.tokens[parser.index].tag)) {
+    const builtin_name = tokenText(parser, builtin_token);
+    const is_noncopy = std.mem.eql(u8, builtin_name, "noncopy") or std.mem.eql(u8, builtin_name, "nocopy");
+    if (is_noncopy and parser.index < parser.tokens.len and aggregate.isStart(parser.tokens[parser.index].tag)) {
         try arguments.append(parser.allocator, try aggregate.parseNoCopyArgument(parser) orelse return null);
         closing_consumed = true;
     } else {

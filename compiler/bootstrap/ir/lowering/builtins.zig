@@ -64,6 +64,7 @@ pub fn lower(builder: anytype, node_idx: Node.Index) std.mem.Allocator.Error!?In
         if (argument_index < argument_count) {
             const value_node = builder.sema.ast_tree.extra_data[extra_start + 1 + argument_index];
             const value = try builder.lowerNode(value_node) orelse return null;
+            if (kind == .move) try builder.markMoved(value_node);
             const target_type = builder.sema.node_types.get(node_idx) orelse 0;
             const source_type = builder.sema.node_types.get(value_node) orelse 0;
             const converted = switch (kind) {

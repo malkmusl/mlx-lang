@@ -36,6 +36,7 @@ fn lowerConst(builder: anytype, node_idx: Node.Index) std.mem.Allocator.Error!?I
         .type_id = type_id,
         .data = .{ .store = .{ .ptr = address, .val = expression } },
     });
+    try builder.pushAutoDrop(address, type_id, node_idx);
     return expression;
 }
 
@@ -62,6 +63,7 @@ fn lowerVar(builder: anytype, node_idx: Node.Index) std.mem.Allocator.Error!?Ins
         .type_id = type_id,
         .data = .{ .store = .{ .ptr = address, .val = rhs } },
     });
+    try builder.pushAutoDrop(address, type_id, node_idx);
     return @as(?Inst.Index, store);
 }
 

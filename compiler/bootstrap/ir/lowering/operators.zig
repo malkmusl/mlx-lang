@@ -60,6 +60,7 @@ fn lowerAssignment(builder: anytype, node_index: Node.Index, assignment: Tag) !?
         .type_id = target_type,
         .data = .{ .store = .{ .ptr = address, .val = stored_value } },
     });
+    if (assignment == .equal) try builder.markInitialized(node.data.lhs);
     return null;
 }
 

@@ -406,7 +406,7 @@ fn completion(server: *Server, id: []const u8, params: std.json.Value) ![]u8 {
     var first = true;
     const keywords = [_][]const u8{ "const", "var", "fn", "pub", "extern", "comptime", "if", "else", "while", "for", "in", "return", "break", "continue", "defer", "errdefer", "unsafe", "struct", "enum", "union", "error", "true", "false", "null", "undefined" };
     for (keywords) |item| if (matchesPrefix(item, prefix)) try appendCompletion(&out, server.allocator, item, 14, &first);
-    const builtins = [_][]const u8{ "@import", "@compileError", "@move", "@nocopy", "@sizeOf", "@alignOf", "@typeInfo" };
+    const builtins = [_][]const u8{ "@import", "@compileError", "@move", "@noncopy", "@nocopy", "@sizeOf", "@alignOf", "@typeInfo" };
     for (builtins) |item| if (matchesPrefix(item, prefix)) try appendCompletion(&out, server.allocator, item, 3, &first);
     if (document.ast) |ast| try appendDeclarations(&out, server.allocator, ast, document.text, prefix, &first);
     try out.appendSlice(server.allocator, "]}");

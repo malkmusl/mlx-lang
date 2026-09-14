@@ -9,6 +9,7 @@ Required diagnostic fixtures include:
 - MLX-E4005 non-exhaustive match
 - MLX-E4008 unhandled error union
 - MLX-E6001 use after @move
-- MLX-E6002 copy of @nocopy type
+- MLX-E6002 copy of @noncopy/@nocopy type
 - MLX-E6005 partially moved aggregate misuse
+- MLX-E6006 invalid automatic deinitializer signature
 - MLX-E7004 unsafe operation outside unsafe block

@@ -139,7 +139,10 @@ fn foldInteger(sema: anytype, node_index: Node.Index, node: Node, operator: Tag,
 fn analyzeAssignment(sema: anytype, node_index: Node.Index, scope: *Scope, operator: Tag) !Type.Id {
     const node = sema.ast_tree.nodes.get(node_index);
     const target = sema.ast_tree.nodes.get(node.data.lhs);
-    const target_type = try lvalue.validateMutable(sema, node.data.lhs, scope, sema.ast_tree.tokens[node.main_token].start);
+    const target_type = if (operator == .equal)
+        try lvalue.validateReinitialization(sema, node.data.lhs, scope, sema.ast_tree.tokens[node.main_token].start)
+    else
+        try lvalue.validateMutable(sema, node.data.lhs, scope, sema.ast_tree.tokens[node.main_token].start);
     const value_type = try sema.analyzeNode(node.data.rhs, scope);
     if (!sema.type_pool.isCoercible(value_type, target_type)) {
         try sema.reportError(4001, .sema, sema.ast_tree.tokens[node.main_token].start, "Assigned expression does not match target type");

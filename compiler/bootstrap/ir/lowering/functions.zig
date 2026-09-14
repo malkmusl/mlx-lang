@@ -21,6 +21,7 @@ fn lowerDeclaration(builder: anytype, node_idx: Node.Index) std.mem.Allocator.Er
     builder.current_block = function_block;
     builder.param_counter = 0;
     builder.var_addresses.clearRetainingCapacity();
+    builder.drop_flags.clearRetainingCapacity();
     builder.var_slice_lengths.clearRetainingCapacity();
     builder.slice_lengths.clearRetainingCapacity();
     builder.loop_stack.clearRetainingCapacity();
@@ -46,6 +47,7 @@ fn lowerDeclaration(builder: anytype, node_idx: Node.Index) std.mem.Allocator.Er
     _ = try builder.lowerNode(proto_idx);
     _ = try builder.lowerNode(body);
     if (!builder.currentBlockTerminatedPublic()) {
+        try builder.emitCleanups(0, false);
         _ = try builder.emitInst(.{ .opcode = .ret, .type_id = builder.current_return_type.?, .data = .{ .ret = null } });
     }
     builder.current_return_type = null;
@@ -89,6 +91,7 @@ fn lowerParameter(builder: anytype, node_idx: Node.Index) std.mem.Allocator.Erro
     const source = builder.sema.diags.source_manager.getFile(builder.sema.source_id).?.content;
     const name = source[token.start..token.end];
     try builder.var_addresses.put(name, address);
+    try builder.pushAutoDrop(address, type_id, node_idx);
     if (isSlice(builder, type_id)) {
         const length_type = try builder.sema.type_pool.internSizeInt(false);
         const length = try builder.emitInst(.{
