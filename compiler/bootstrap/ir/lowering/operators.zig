@@ -134,7 +134,7 @@ fn emitShift(builder: anytype, spec: ShiftSpec, lhs: Inst.Index, rhs: Inst.Index
         const width_value = try builder.emitInst(.{ .opcode = .const_i, .type_id = type_id, .data = .{ .const_i = width } });
         count = try emitCore(builder, .rem, rhs, width_value, type_id);
     } else {
-        try emitCheckedShiftCount(builder, rhs, type_id);
+        if (builder.runtime_safety) try emitCheckedShiftCount(builder, rhs, type_id);
     }
     const shifted = if (spec.saturating_result)
         try emitPolicy(builder, spec.direction, .saturating, lhs, count, type_id)
@@ -148,7 +148,7 @@ fn emitShift(builder: anytype, spec: ShiftSpec, lhs: Inst.Index, rhs: Inst.Index
 }
 
 fn emitPolicy(builder: anytype, core: Core, policy: Policy, lhs: Inst.Index, rhs: Inst.Index, type_id: Type.Id) !Inst.Index {
-    if ((core == .div or core == .rem) and !builder.sema.type_pool.get(type_id).isFloat()) {
+    if (builder.runtime_safety and (core == .div or core == .rem) and !builder.sema.type_pool.get(type_id).isFloat()) {
         try emitNonZeroCheck(builder, rhs, type_id);
     }
     const raw = try emitCore(builder, core, lhs, rhs, type_id);
@@ -166,7 +166,7 @@ fn emitPolicy(builder: anytype, core: Core, policy: Policy, lhs: Inst.Index, rhs
     else
         return raw;
     if (policy == .checked) {
-        try emitTrapIf(builder, overflow);
+        if (builder.runtime_safety) try emitTrapIf(builder, overflow);
         return raw;
     }
     return selectSaturated(builder, overflow, raw, if (core == .sub) null else max, type_id);

@@ -59,8 +59,9 @@ pub const LirBuilder = struct {
     cleanup_stack: std.ArrayList(Cleanup),
     current_generic_instance: ?u32 = null,
     verbose: bool,
+    runtime_safety: bool,
 
-    pub fn init(allocator: std.mem.Allocator, sema: *Sema, verbose: bool) LirBuilder {
+    pub fn init(allocator: std.mem.Allocator, sema: *Sema, verbose: bool, runtime_safety: bool) LirBuilder {
         return .{
             .allocator = allocator,
             .sema = sema,
@@ -75,6 +76,7 @@ pub const LirBuilder = struct {
             .loop_stack = std.ArrayList(LoopTargets).empty,
             .cleanup_stack = std.ArrayList(Cleanup).empty,
             .verbose = verbose,
+            .runtime_safety = runtime_safety,
         };
     }
 

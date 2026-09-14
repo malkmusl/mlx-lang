@@ -33,7 +33,7 @@ pub fn main(init: std.process.Init) !u8 {
     defer allocator.free(args);
 
     if (args.len < 2) {
-        std.debug.print("Usage: mlx0 <source.mlx> [-o output] [--progress|--quiet] [--trace|--verbose] [--emit=asm]\n", .{});
+        std.debug.print("Usage: mlx0 <source.mlx> [-o output] [--progress|--quiet] [--trace|--verbose] [--safety=on|off] [--emit=asm]\n", .{});
         return 1;
     }
     const path = args[1];
@@ -43,6 +43,7 @@ pub fn main(init: std.process.Init) !u8 {
     var verbose = false;
     var trace_enabled = false;
     var show_progress = true;
+    var runtime_safety = true;
     var dump_ast = false;
     var out_path: []const u8 = "out";
     var i: usize = 2;
@@ -59,6 +60,10 @@ pub fn main(init: std.process.Init) !u8 {
             show_progress = true;
         } else if (std.mem.eql(u8, arg, "--quiet")) {
             show_progress = false;
+        } else if (std.mem.eql(u8, arg, "--safety=on")) {
+            runtime_safety = true;
+        } else if (std.mem.eql(u8, arg, "--safety=off")) {
+            runtime_safety = false;
         } else if (std.mem.eql(u8, arg, "--dump-ast")) {
             dump_ast = true;
         } else if (std.mem.startsWith(u8, arg, "-o")) {
@@ -73,6 +78,7 @@ pub fn main(init: std.process.Init) !u8 {
     const progress_steps: usize = if (dump_ast) 1 else if (emit_asm) 5 else 7;
     traceText(trace_enabled, "input: ", path);
     traceText(trace_enabled, "output: ", out_path);
+    traceText(trace_enabled, "runtime safety: ", if (runtime_safety) "on" else "off");
 
     var source_manager = sm.SourceManager.init(allocator);
     defer source_manager.deinit();
@@ -226,7 +232,7 @@ pub fn main(init: std.process.Init) !u8 {
     // Stage 9: LIR
     progress(show_progress, 4, progress_steps, "lower typed AST to LIR");
     const lir_gen_mod = @import("ir/lower.zig");
-    var lir_builder = lir_gen_mod.LirBuilder.init(allocator, &sema, verbose);
+    var lir_builder = lir_gen_mod.LirBuilder.init(allocator, &sema, verbose, runtime_safety);
     defer lir_builder.deinit();
     lir_builder.generate() catch |err| {
         std.debug.print("LIR gen failed: {}\n", .{err});

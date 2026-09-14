@@ -46,7 +46,7 @@ fn lowerOptionalUnwrap(builder: anytype, node_index: Node.Index) !?Inst.Index {
     // The spec fixes a null niche for optional pointers. Other optional
     // representations are intentionally not guessed here because their layout
     // remains unspecified in the RC documents.
-    if (child.data == .pointer) {
+    if (builder.runtime_safety and child.data == .pointer) {
         const zero = try builder.emitInst(.{ .opcode = .const_i, .type_id = optional_type_id, .data = .{ .const_i = 0 } });
         const bool_type = try builder.sema.type_pool.internPrimitive(.bool_type);
         const present = try builder.emitInst(.{
@@ -92,11 +92,22 @@ fn lowerSlice(builder: anytype, node_index: Node.Index) !?Inst.Index {
         try builder.emitInst(.{ .opcode = .const_i, .type_id = index_type, .data = .{ .const_i = 0 } })
     else
         try builder.lowerNode(lower_node) orelse return null;
-    const original_length = builder.slice_lengths.get(base);
+    const container_type_id = builder.sema.node_types.get(container_node) orelse return null;
+    const container_type = builder.sema.type_pool.get(container_type_id);
+    const original_length = switch (container_type.data) {
+        .array => |array| try builder.emitInst(.{ .opcode = .const_i, .type_id = index_type, .data = .{ .const_i = array.len } }),
+        .pointer => |pointer| if (pointer.size == .Slice) builder.slice_lengths.get(base) else null,
+        else => null,
+    };
     const upper = if (upper_node == std.math.maxInt(u32))
         original_length orelse return null
     else
         try builder.lowerNode(upper_node) orelse return null;
+
+    if (builder.runtime_safety) {
+        try emitBoundTrap(builder, lower_bound, upper, .ugt);
+        if (original_length) |length| try emitBoundTrap(builder, upper, length, .ugt);
+    }
 
     const result_type_id = builder.sema.node_types.get(node_index) orelse return null;
     const result_type = builder.sema.type_pool.get(result_type_id);
@@ -115,4 +126,19 @@ fn lowerSlice(builder: anytype, node_index: Node.Index) !?Inst.Index {
     });
     try builder.slice_lengths.put(result, length);
     return result;
+}
+
+fn emitBoundTrap(builder: anytype, lhs: Inst.Index, rhs: Inst.Index, predicate: @import("../lir.zig").CmpPredicate) !void {
+    const bool_type = try builder.sema.type_pool.internPrimitive(.bool_type);
+    const invalid = try builder.emitInst(.{
+        .opcode = .icmp,
+        .type_id = bool_type,
+        .data = .{ .icmp = .{ .predicate = predicate, .lhs = lhs, .rhs = rhs } },
+    });
+    const trap_block = try builder.newBlock();
+    const continue_block = try builder.newBlock();
+    _ = try builder.emitInst(.{ .opcode = .condbr, .type_id = 0, .data = .{ .condbr = .{ .cond = invalid, .true_dest = trap_block, .false_dest = continue_block } } });
+    builder.current_block = trap_block;
+    _ = try builder.emitInst(.{ .opcode = .unreachable_inst, .type_id = 0, .data = .{ .unreachable_inst = {} } });
+    builder.current_block = continue_block;
 }
