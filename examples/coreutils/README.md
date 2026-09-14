@@ -11,6 +11,8 @@ Initial utilities:
 - `cat`: stdin, files, `-`, `--`, multiple operands, and streaming I/O
 - `wc`: line, word, and byte counts with `-l`, `-w`, and `-c`
 - `pwd`: logical and physical paths with `-L` and `-P`
+- `mkdir`: octal modes, parent creation, and verbose output
+- `rmdir`: parent removal, non-empty handling, and verbose output
 
 Build all utilities with the self-hosted compiler:
 
