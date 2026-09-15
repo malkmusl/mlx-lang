@@ -666,6 +666,26 @@ if "$bin_dir/mkfifo" -m invalid "$work_dir/fifo-invalid" >/dev/null 2>&1; then
     fail 'mkfifo accepted an invalid mode'
 fi
 
+printf 'copy payload\n' > "$work_dir/cp-source"
+chmod 640 "$work_dir/cp-source"
+/usr/bin/touch -d @90 "$work_dir/cp-source"
+"$bin_dir/cp" "$work_dir/cp-source" "$work_dir/cp-target"
+cmp "$work_dir/cp-source" "$work_dir/cp-target" || fail 'cp file content differs'
+"$bin_dir/cp" -p "$work_dir/cp-source" "$work_dir/cp-preserved"
+[[ "$(stat -c %a "$work_dir/cp-preserved")" == 640 && "$(stat -c %Y "$work_dir/cp-preserved")" == 90 ]] || fail 'cp preserve metadata differs'
+mkdir "$work_dir/cp-directory"
+"$bin_dir/cp" "$work_dir/cp-source" "$work_dir/tail-a" "$work_dir/cp-directory"
+cmp "$work_dir/cp-source" "$work_dir/cp-directory/cp-source" || fail 'cp multiple-source directory copy differs'
+cmp "$work_dir/tail-a" "$work_dir/cp-directory/tail-a" || fail 'cp second directory target differs'
+printf 'keep\n' > "$work_dir/cp-no-clobber"
+"$bin_dir/cp" -n "$work_dir/cp-source" "$work_dir/cp-no-clobber"
+[[ "$(cat "$work_dir/cp-no-clobber")" == keep ]] || fail 'cp -n overwrote a destination'
+"$bin_dir/cp" -l "$work_dir/cp-source" "$work_dir/cp-link"
+[[ "$(stat -c %i "$work_dir/cp-source")" == "$(stat -c %i "$work_dir/cp-link")" ]] || fail 'cp -l did not create a hard link'
+if "$bin_dir/cp" "$work_dir/cp-source" "$work_dir/cp-source" >/dev/null 2>&1; then
+    fail 'cp accepted identical source and destination'
+fi
+
 printf 'sync payload\n' > "$work_dir/sync-file"
 "$bin_dir/sync"
 "$bin_dir/sync" "$work_dir/sync-file"

@@ -31,6 +31,7 @@ their `/usr/bin` counterparts.
 | `truncate` | complete | validate filesystem-specific IO-block behavior |
 | `mkfifo` | complete | native context assignment still needs validation on an SELinux/SMACK host |
 | `sync` | complete | none known |
+| `cp` | partial | recursive trees, symlink policies, backups, sparse/reflink copies, ownership, xattrs, ACLs, and interactive mode |
 
 “Complete” means the documented option surface is implemented and covered by
 the current parity suite. It does not claim locale, filesystem, or kernel
@@ -38,7 +39,7 @@ behaviors that cannot be exercised on the development host.
 
 ## Utilities not implemented yet
 
-The installed GNU 9.11 suite contains 103 command names. After existing flag
-parity is closed, implementation proceeds through filesystem tools (`cp`,
-`mv`, `rm`, `ln`, `chmod`, `chown`, `stat`, `readlink`, `realpath`, `ls`), then
+The installed GNU 9.11 suite contains 103 command names. Implementation now
+proceeds through the remaining filesystem tools (`mv`, `rm`, `ln`, `chmod`,
+`chown`, `stat`, `readlink`, `realpath`, `ls`), then
 text/data tools, checksums, and the remaining system/account utilities.
