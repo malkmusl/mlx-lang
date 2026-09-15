@@ -33,6 +33,12 @@ compare_dirname() {
     cmp "$work_dir/actual" "$work_dir/expected"
 }
 
+compare_head() {
+    "$bin_dir/head" "$@" > "$work_dir/actual" || return 1
+    /usr/bin/head "$@" > "$work_dir/expected" || return 1
+    cmp "$work_dir/actual" "$work_dir/expected"
+}
+
 "$bin_dir/true" || fail 'true returned a failure status'
 if "$bin_dir/false"; then
     fail 'false returned success'
@@ -133,5 +139,32 @@ compare_dirname -- -strange || fail 'dirname -- output differs'
 "$bin_dir/dirname" -z /usr/bin/sort foo > "$work_dir/actual"
 /usr/bin/dirname -z /usr/bin/sort foo > "$work_dir/expected"
 cmp "$work_dir/actual" "$work_dir/expected" || fail 'dirname -z output differs'
+
+printf '01\n02\n03\n04\n05\n06\n07\n08\n09\n10\n11\n12\n' > "$work_dir/head-a"
+printf 'alpha\nbeta\ngamma\n' > "$work_dir/head-b"
+compare_head "$work_dir/head-a" || fail 'head default output differs'
+compare_head -n 2 "$work_dir/head-a" || fail 'head -n output differs'
+compare_head -n2 "$work_dir/head-a" || fail 'head attached line count differs'
+compare_head --lines=3 "$work_dir/head-a" || fail 'head --lines output differs'
+compare_head -n 0 "$work_dir/head-a" || fail 'head zero line count differs'
+compare_head -c 7 "$work_dir/head-a" || fail 'head -c output differs'
+compare_head --bytes=5 "$work_dir/head-a" || fail 'head --bytes output differs'
+compare_head -c 0 "$work_dir/head-a" || fail 'head zero byte count differs'
+compare_head -n 1 "$work_dir/head-a" "$work_dir/head-b" || fail 'head multiple-file headers differ'
+compare_head -q -n 1 "$work_dir/head-a" "$work_dir/head-b" || fail 'head quiet output differs'
+compare_head -v -n 1 "$work_dir/head-a" || fail 'head verbose output differs'
+printf 'left\nright\nlast\n' | "$bin_dir/head" -n 2 > "$work_dir/actual"
+printf 'left\nright\nlast\n' | /usr/bin/head -n 2 > "$work_dir/expected"
+cmp "$work_dir/actual" "$work_dir/expected" || fail 'head stdin output differs'
+printf 'one\0two\0three\0' > "$work_dir/head-zero"
+"$bin_dir/head" -z -n 2 "$work_dir/head-zero" > "$work_dir/actual"
+/usr/bin/head -z -n 2 "$work_dir/head-zero" > "$work_dir/expected"
+cmp "$work_dir/actual" "$work_dir/expected" || fail 'head zero-terminated output differs'
+if "$bin_dir/head" -n 18446744073709551616 "$work_dir/head-a" >/dev/null 2>&1; then
+    fail 'head accepted an overflowing count'
+fi
+if "$bin_dir/head" "$work_dir/missing-head-input" >/dev/null 2>&1; then
+    fail 'head accepted a missing input file'
+fi
 
 printf 'all coreutils smoke tests passed\n'
