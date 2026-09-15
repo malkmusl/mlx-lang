@@ -63,6 +63,12 @@ compare_printenv() {
     cmp "$work_dir/actual" "$work_dir/expected"
 }
 
+compare_echo() {
+    "$bin_dir/echo" "$@" > "$work_dir/actual"
+    /usr/bin/echo "$@" > "$work_dir/expected"
+    cmp "$work_dir/actual" "$work_dir/expected"
+}
+
 compare_yes() {
     set +o pipefail
     "$bin_dir/yes" "$@" | /usr/bin/head -c 4096 > "$work_dir/actual"
@@ -106,6 +112,13 @@ cmp "$work_dir/actual" "$work_dir/expected" || fail 'echo -n output differs'
 "$bin_dir/echo" -- alpha > "$work_dir/actual"
 /usr/bin/echo -- alpha > "$work_dir/expected"
 cmp "$work_dir/actual" "$work_dir/expected" || fail 'echo -- output differs'
+compare_echo -e 'one\ntwo' || fail 'echo newline escape differs'
+compare_echo -ne 'tab\tvalue' || fail 'echo combined options differ'
+compare_echo -n -e 'hex=\x41 octal=\0102' || fail 'echo numeric escapes differ'
+compare_echo -e 'alert=\a back=\b escape=\e form=\f return=\r vertical=\v slash=\\' || fail 'echo control escapes differ'
+compare_echo -e 'stop\cignored' trailing || fail 'echo stop escape differs'
+compare_echo -e -E 'literal\nvalue' || fail 'echo escape disabling differs'
+compare_echo -unknown value || fail 'echo unknown option operand differs'
 
 printf 'alpha beta\ngamma\n' > "$work_dir/a"
 printf 'delta\n' > "$work_dir/b"
