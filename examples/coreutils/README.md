@@ -21,6 +21,7 @@ Initial utilities:
 - `yes`: block-buffered repeated output for one or more strings
 - `sleep`: decimal durations, unit suffixes, and summed operands
 - `uname`: kernel, node, release, architecture, and operating-system fields
+- `printenv`: complete environment iteration, selected variables, and NUL output
 
 Build all utilities with the self-hosted compiler:
 

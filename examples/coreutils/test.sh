@@ -51,6 +51,18 @@ compare_uname() {
     cmp "$work_dir/actual" "$work_dir/expected"
 }
 
+compare_printenv() {
+    local mlx_status gnu_status
+    set +e
+    /usr/bin/env -i ALPHA=one EMPTY= ZED=last "$bin_dir/printenv" "$@" > "$work_dir/actual"
+    mlx_status=$?
+    /usr/bin/env -i ALPHA=one EMPTY= ZED=last /usr/bin/printenv "$@" > "$work_dir/expected"
+    gnu_status=$?
+    set -e
+    [[ "$mlx_status" -eq "$gnu_status" ]] || return 1
+    cmp "$work_dir/actual" "$work_dir/expected"
+}
+
 compare_yes() {
     set +o pipefail
     "$bin_dir/yes" "$@" | /usr/bin/head -c 4096 > "$work_dir/actual"
@@ -277,6 +289,15 @@ compare_uname --kernel-name --nodename --kernel-release --kernel-version --machi
     fail 'uname long-option output differs'
 if "$bin_dir/uname" --unknown >/dev/null 2>&1; then
     fail 'uname accepted an unknown option'
+fi
+
+compare_printenv || fail 'printenv complete environment differs'
+compare_printenv ALPHA EMPTY ZED || fail 'printenv selected values differ'
+compare_printenv ALPHA MISSING ZED || fail 'printenv missing-value status differs'
+compare_printenv -0 ALPHA EMPTY ZED || fail 'printenv NUL output differs'
+compare_printenv --null ALPHA || fail 'printenv long NUL output differs'
+if "$bin_dir/printenv" --unknown >/dev/null 2>&1; then
+    fail 'printenv accepted an unknown option'
 fi
 
 printf 'all coreutils smoke tests passed\n'

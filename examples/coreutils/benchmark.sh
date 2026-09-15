@@ -58,6 +58,8 @@ benchmark "$startup_iterations" "system sleep 0" /usr/bin/sleep 0
 benchmark "$startup_iterations" "mlx sleep 0" "$bin_dir/sleep" 0
 benchmark "$startup_iterations" "system uname" sh -c "/usr/bin/uname >/dev/null"
 benchmark "$startup_iterations" "mlx uname" sh -c "'$bin_dir/uname' >/dev/null"
+benchmark "$startup_iterations" "system printenv" sh -c "ALPHA=one /usr/bin/printenv ALPHA >/dev/null"
+benchmark "$startup_iterations" "mlx printenv" sh -c "ALPHA=one '$bin_dir/printenv' ALPHA >/dev/null"
 throughput "$io_iterations" "system cat 128M" "$fixture_bytes" sh -c "/usr/bin/cat '$fixture' >/dev/null"
 throughput "$io_iterations" "mlx cat 128M" "$fixture_bytes" sh -c "'$bin_dir/cat' '$fixture' >/dev/null"
 throughput "$io_iterations" "system head 1M" "$head_bytes" sh -c "/usr/bin/head -c '$head_bytes' '$fixture' >/dev/null"
