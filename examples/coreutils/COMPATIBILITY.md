@@ -27,7 +27,7 @@ their `/usr/bin` counterparts.
 | `env` | partial | `--argv0`, `--chdir`, `--split-string`, signal-list operations, and debug tracing |
 | `nproc` | complete | OpenMP thread-limit environment extensions |
 | `link`, `unlink` | complete | none known |
-| `touch` | partial | selected timestamps, references, parsed dates, explicit timestamps, and symlink mode |
+| `touch` | complete | full GNU natural-language dates and non-UTC local timezone rules |
 | `truncate` | complete | validate filesystem-specific IO-block behavior |
 | `mkfifo` | complete | native context assignment still needs validation on an SELinux/SMACK host |
 | `sync` | complete | none known |

@@ -513,6 +513,36 @@ printf 'touch payload\n' > "$work_dir/touch-existing"
 grep -q 'touch payload' "$work_dir/touch-existing" || fail 'touch changed file contents'
 "$bin_dir/touch" -c "$work_dir/touch-no-create"
 [[ ! -e "$work_dir/touch-no-create" ]] || fail 'touch -c created a missing file'
+printf 'touch selected times\n' > "$work_dir/touch-selected"
+/usr/bin/touch -a -d @10 "$work_dir/touch-selected"
+/usr/bin/touch -m -d @20 "$work_dir/touch-selected"
+"$bin_dir/touch" -a -d @30 "$work_dir/touch-selected"
+[[ "$(stat -c %X "$work_dir/touch-selected")" == 30 && "$(stat -c %Y "$work_dir/touch-selected")" == 20 ]] || fail 'touch -a changed the wrong timestamps'
+"$bin_dir/touch" --time=mtime -d @40 "$work_dir/touch-selected"
+[[ "$(stat -c %X "$work_dir/touch-selected")" == 30 && "$(stat -c %Y "$work_dir/touch-selected")" == 40 ]] || fail 'touch --time=mtime changed the wrong timestamps'
+printf reference > "$work_dir/touch-reference"
+/usr/bin/touch -a -d @51 "$work_dir/touch-reference"
+/usr/bin/touch -m -d @52 "$work_dir/touch-reference"
+"$bin_dir/touch" -r "$work_dir/touch-reference" "$work_dir/touch-selected"
+[[ "$(stat -c %X "$work_dir/touch-selected")" == 51 && "$(stat -c %Y "$work_dir/touch-selected")" == 52 ]] || fail 'touch reference times differ'
+printf target > "$work_dir/touch-link-target"
+ln -s "$work_dir/touch-link-target" "$work_dir/touch-link"
+"$bin_dir/touch" -h -d @61 "$work_dir/touch-link"
+[[ "$(stat -c %Y "$work_dir/touch-link-target")" != 61 && "$(stat -c %Y "$work_dir/touch-link")" == 61 ]] || fail 'touch -h did not update the symlink'
+TZ=UTC0 "$bin_dir/touch" -t 202401020304.05 "$work_dir/touch-selected"
+[[ "$(stat -c %Y "$work_dir/touch-selected")" == "$(date -u -d '2024-01-02 03:04:05' +%s)" ]] || fail 'touch -t timestamp differs'
+"$bin_dir/touch" -f -d @70 "$work_dir/touch-selected"
+[[ "$(stat -c %Y "$work_dir/touch-selected")" == 70 ]] || fail 'touch -f compatibility flag differs'
+"$bin_dir/touch" -d @80.123456789 "$work_dir/touch-selected"
+[[ "$(stat -c %y "$work_dir/touch-selected")" == *".123456789 "* ]] || fail 'touch fractional timestamp differs'
+if "$bin_dir/touch" -d not-a-date "$work_dir/touch-selected" >/dev/null 2>&1; then
+    fail 'touch accepted an invalid date'
+fi
+if "$bin_dir/touch" -h "$work_dir/touch-missing-link" >/dev/null 2>&1; then
+    fail 'touch -h accepted a missing symlink without -c'
+fi
+"$bin_dir/touch" -ch "$work_dir/touch-missing-link"
+[[ ! -e "$work_dir/touch-missing-link" ]] || fail 'touch -ch created a missing symlink'
 (
     cd "$work_dir"
     "$bin_dir/touch" -- -touch-dash
