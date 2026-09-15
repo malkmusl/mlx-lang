@@ -44,6 +44,9 @@ The build script defaults to the converged self-hosted compiler at
 The benchmark creates a 128 MiB text workload when no fixture is supplied and
 compares every hot path directly with the installed GNU utility.
 
+The exact GNU 9.11 option and behavior gaps are tracked in
+[`COMPATIBILITY.md`](./COMPATIBILITY.md).
+
 `MLX_COMPILER` and `MLX_COREUTILS_BIN_DIR` override the build inputs and output
 directory. Benchmark iteration counts can be changed through
 `MLX_BENCH_STARTUP_ITERATIONS`, `MLX_BENCH_IO_ITERATIONS`, and
