@@ -371,4 +371,24 @@ if "$bin_dir/nproc" --ignore=invalid >/dev/null 2>&1; then
     fail 'nproc accepted an invalid ignore count'
 fi
 
+printf 'hard link payload\n' > "$work_dir/link-source"
+"$bin_dir/link" "$work_dir/link-source" "$work_dir/link-target"
+cmp "$work_dir/link-source" "$work_dir/link-target" || fail 'link content differs'
+[[ "$(stat -c %i "$work_dir/link-source")" == "$(stat -c %i "$work_dir/link-target")" ]] || fail 'link inode differs'
+if "$bin_dir/link" "$work_dir/missing-link-source" "$work_dir/link-missing-target" >/dev/null 2>&1; then
+    fail 'link accepted a missing source'
+fi
+if "$bin_dir/link" "$work_dir/link-source" >/dev/null 2>&1; then
+    fail 'link accepted a missing destination'
+fi
+
+"$bin_dir/unlink" -- "$work_dir/link-target"
+[[ ! -e "$work_dir/link-target" ]] || fail 'unlink did not remove its operand'
+if "$bin_dir/unlink" "$work_dir/link-target" >/dev/null 2>&1; then
+    fail 'unlink accepted a missing file'
+fi
+if "$bin_dir/unlink" "$work_dir/link-source" "$work_dir/link-target" >/dev/null 2>&1; then
+    fail 'unlink accepted multiple operands'
+fi
+
 printf 'all coreutils smoke tests passed\n'
