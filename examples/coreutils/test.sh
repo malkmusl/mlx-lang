@@ -391,4 +391,21 @@ if "$bin_dir/unlink" "$work_dir/link-source" "$work_dir/link-target" >/dev/null 
     fail 'unlink accepted multiple operands'
 fi
 
+printf 'touch payload\n' > "$work_dir/touch-existing"
+/usr/bin/touch -d @1 "$work_dir/touch-existing"
+"$bin_dir/touch" "$work_dir/touch-existing" "$work_dir/touch-created"
+[[ "$(stat -c %Y "$work_dir/touch-existing")" -gt 1 ]] || fail 'touch did not update timestamp'
+[[ -f "$work_dir/touch-created" ]] || fail 'touch did not create a missing file'
+grep -q 'touch payload' "$work_dir/touch-existing" || fail 'touch changed file contents'
+"$bin_dir/touch" -c "$work_dir/touch-no-create"
+[[ ! -e "$work_dir/touch-no-create" ]] || fail 'touch -c created a missing file'
+(
+    cd "$work_dir"
+    "$bin_dir/touch" -- -touch-dash
+)
+[[ -f "$work_dir/-touch-dash" ]] || fail 'touch -- did not handle a dash path'
+if "$bin_dir/touch" "$work_dir/missing-touch-parent/file" >/dev/null 2>&1; then
+    fail 'touch accepted an invalid parent path'
+fi
+
 printf 'all coreutils smoke tests passed\n'
