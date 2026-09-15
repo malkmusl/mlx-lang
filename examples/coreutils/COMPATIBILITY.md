@@ -24,7 +24,7 @@ their `/usr/bin` counterparts.
 | `sleep` | complete | GNU infinity and scientific-number extensions |
 | `uname` | complete | platform/processor discovery where the kernel reports extra values |
 | `printenv` | complete | none known |
-| `env` | partial | `--argv0`, `--chdir`, `--split-string`, signal-list operations, and debug tracing |
+| `env` | complete | full FreeBSD `-S` expansion grammar and inherited signal-state detail |
 | `nproc` | complete | OpenMP thread-limit environment extensions |
 | `link`, `unlink` | complete | none known |
 | `touch` | complete | full GNU natural-language dates and non-UTC local timezone rules |

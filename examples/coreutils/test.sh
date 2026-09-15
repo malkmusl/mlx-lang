@@ -485,6 +485,26 @@ set -e
 if "$bin_dir/env" --unknown >/dev/null 2>&1; then
     fail 'env accepted an unknown option'
 fi
+"$bin_dir/env" -a mlx-argv0 /bin/sh -c 'printf "%s\n" "$0"' > "$work_dir/actual"
+printf 'mlx-argv0\n' > "$work_dir/expected"
+cmp "$work_dir/actual" "$work_dir/expected" || fail 'env --argv0 output differs'
+"$bin_dir/env" --chdir="$work_dir" /bin/pwd > "$work_dir/actual"
+printf '%s\n' "$work_dir" > "$work_dir/expected"
+cmp "$work_dir/actual" "$work_dir/expected" || fail 'env --chdir output differs'
+"$bin_dir/env" --debug MLX_ENV_DEBUG=value /usr/bin/printenv MLX_ENV_DEBUG > "$work_dir/actual" 2> "$work_dir/env-debug"
+printf 'value\n' > "$work_dir/expected"
+cmp "$work_dir/actual" "$work_dir/expected" || fail 'env --debug changed command output'
+grep -q 'mlx-env:' "$work_dir/env-debug" || fail 'env --debug emitted no trace'
+"$bin_dir/env" --ignore-signal=PIPE /bin/sh -c 'kill -s PIPE $$; printf survived' > "$work_dir/actual"
+[[ "$(cat "$work_dir/actual")" == survived ]] || fail 'env --ignore-signal did not preserve the command'
+"$bin_dir/env" --block-signal=TERM /bin/sh -c 'kill -s TERM $$; printf blocked' > "$work_dir/actual"
+[[ "$(cat "$work_dir/actual")" == blocked ]] || fail 'env --block-signal did not block delivery'
+"$bin_dir/env" --list-signal-handling --ignore-signal=PIPE /bin/true 2> "$work_dir/env-signals"
+grep -q 'signals ignored' "$work_dir/env-signals" || fail 'env did not list signal handling'
+"$bin_dir/env" -vS '/usr/bin/printf "split:%s:%s\n" one' two > "$work_dir/actual" 2> "$work_dir/env-split-debug"
+/usr/bin/env -S '/usr/bin/printf "split:%s:%s\n" one' two > "$work_dir/expected"
+cmp "$work_dir/actual" "$work_dir/expected" || fail 'env --split-string output differs'
+grep -q 'mlx-env:' "$work_dir/env-split-debug" || fail 'env -vS emitted no trace'
 
 "$bin_dir/nproc" > "$work_dir/actual"
 /usr/bin/nproc > "$work_dir/expected"

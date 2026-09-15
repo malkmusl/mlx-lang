@@ -22,7 +22,7 @@ Initial utilities:
 - `sleep`: decimal durations, unit suffixes, and summed operands
 - `uname`: kernel, node, release, architecture, and operating-system fields
 - `printenv`: complete environment iteration, selected variables, and NUL output
-- `env`: environment clearing, unsetting, assignments, and `execve` with `PATH` lookup
+- `env`: environment filtering, PATH/argv control, shebang splitting, signal policy, and `execve`
 - `nproc`: affinity-aware available CPUs, configured CPUs, and ignored processors
 - `link`, `unlink`: dependency-free hard-link creation and single-path removal
 - `touch`: selected/reference/symlink timestamps, explicit dates, file creation, and no-create mode
