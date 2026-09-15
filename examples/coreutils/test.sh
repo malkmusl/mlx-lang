@@ -39,6 +39,17 @@ compare_head() {
     cmp "$work_dir/actual" "$work_dir/expected"
 }
 
+compare_yes() {
+    set +o pipefail
+    "$bin_dir/yes" "$@" | /usr/bin/head -c 4096 > "$work_dir/actual"
+    local mlx_reader_status=${PIPESTATUS[1]}
+    /usr/bin/yes "$@" | /usr/bin/head -c 4096 > "$work_dir/expected"
+    local gnu_reader_status=${PIPESTATUS[1]}
+    set -o pipefail
+    [[ "$mlx_reader_status" -eq 0 && "$gnu_reader_status" -eq 0 ]] || return 1
+    cmp "$work_dir/actual" "$work_dir/expected"
+}
+
 "$bin_dir/true" || fail 'true returned a failure status'
 if "$bin_dir/false"; then
     fail 'false returned success'
@@ -196,5 +207,15 @@ if printf 'error path\n' | "$bin_dir/tee" "$work_dir/missing/target" >"$work_dir
 fi
 printf 'error path\n' > "$work_dir/expected"
 cmp "$work_dir/actual" "$work_dir/expected" || fail 'tee lost stdout after an output-open error'
+
+compare_yes || fail 'yes default output differs'
+compare_yes hello || fail 'yes single-string output differs'
+compare_yes hello mlx world || fail 'yes joined-string output differs'
+compare_yes -- -value || fail 'yes -- output differs'
+set +e
+/usr/bin/timeout 1 "$bin_dir/yes" -n >/dev/null 2>&1
+yes_invalid_status=$?
+set -e
+[[ "$yes_invalid_status" -eq 1 ]] || fail 'yes accepted an unknown option'
 
 printf 'all coreutils smoke tests passed\n'
