@@ -422,4 +422,17 @@ if "$bin_dir/truncate" -s invalid "$work_dir/truncate-invalid" >/dev/null 2>&1; 
     fail 'truncate accepted an invalid size'
 fi
 
+(
+    umask 000
+    "$bin_dir/mkfifo" -m 640 "$work_dir/fifo-a" "$work_dir/fifo-b"
+)
+[[ -p "$work_dir/fifo-a" && -p "$work_dir/fifo-b" ]] || fail 'mkfifo did not create FIFOs'
+[[ "$(stat -c %a "$work_dir/fifo-a")" == 640 ]] || fail 'mkfifo mode differs'
+if "$bin_dir/mkfifo" "$work_dir/fifo-a" >/dev/null 2>&1; then
+    fail 'mkfifo accepted an existing path'
+fi
+if "$bin_dir/mkfifo" -m invalid "$work_dir/fifo-invalid" >/dev/null 2>&1; then
+    fail 'mkfifo accepted an invalid mode'
+fi
+
 printf 'all coreutils smoke tests passed\n'

@@ -27,6 +27,7 @@ Initial utilities:
 - `link`, `unlink`: dependency-free hard-link creation and single-path removal
 - `touch`: current-time timestamp updates, file creation, and no-create mode
 - `truncate`: exact file resizing with binary size suffixes and no-create mode
+- `mkfifo`: named-pipe creation with octal permission modes
 
 Build all utilities with the self-hosted compiler:
 
