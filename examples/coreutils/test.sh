@@ -39,6 +39,12 @@ compare_head() {
     cmp "$work_dir/actual" "$work_dir/expected"
 }
 
+compare_tail() {
+    "$bin_dir/tail" "$@" > "$work_dir/actual" || return 1
+    /usr/bin/tail "$@" > "$work_dir/expected" || return 1
+    cmp "$work_dir/actual" "$work_dir/expected"
+}
+
 compare_yes() {
     set +o pipefail
     "$bin_dir/yes" "$@" | /usr/bin/head -c 4096 > "$work_dir/actual"
@@ -229,6 +235,32 @@ if "$bin_dir/sleep" invalid >/dev/null 2>&1; then
 fi
 if "$bin_dir/sleep" 18446744073709551615d >/dev/null 2>&1; then
     fail 'sleep accepted an overflowing duration'
+fi
+
+printf '01\n02\n03\n04\n05\n06\n07\n08\n09\n10\n11\n12\n' > "$work_dir/tail-a"
+printf 'alpha\nbeta\ngamma' > "$work_dir/tail-b"
+compare_tail "$work_dir/tail-a" || fail 'tail default output differs'
+compare_tail -n 2 "$work_dir/tail-a" || fail 'tail -n output differs'
+compare_tail -n2 "$work_dir/tail-b" || fail 'tail attached line count differs'
+compare_tail -2 "$work_dir/tail-a" || fail 'tail historical line count differs'
+compare_tail --lines=3 "$work_dir/tail-b" || fail 'tail --lines output differs'
+compare_tail -n 0 "$work_dir/tail-a" || fail 'tail zero line count differs'
+compare_tail -c 7 "$work_dir/tail-a" || fail 'tail -c output differs'
+compare_tail --bytes=5 "$work_dir/tail-b" || fail 'tail --bytes output differs'
+compare_tail -q -n 1 "$work_dir/tail-a" "$work_dir/tail-b" || fail 'tail quiet output differs'
+compare_tail -v -n 1 "$work_dir/tail-a" || fail 'tail verbose output differs'
+printf 'left\nright\nlast' | "$bin_dir/tail" -n 2 > "$work_dir/actual"
+printf 'left\nright\nlast' | /usr/bin/tail -n 2 > "$work_dir/expected"
+cmp "$work_dir/actual" "$work_dir/expected" || fail 'tail stdin output differs'
+printf 'one\0two\0three' > "$work_dir/tail-zero"
+"$bin_dir/tail" -z -n 2 "$work_dir/tail-zero" > "$work_dir/actual"
+/usr/bin/tail -z -n 2 "$work_dir/tail-zero" > "$work_dir/expected"
+cmp "$work_dir/actual" "$work_dir/expected" || fail 'tail zero-terminated output differs'
+if "$bin_dir/tail" -n 18446744073709551616 "$work_dir/tail-a" >/dev/null 2>&1; then
+    fail 'tail accepted an overflowing count'
+fi
+if "$bin_dir/tail" "$work_dir/missing-tail-input" >/dev/null 2>&1; then
+    fail 'tail accepted a missing input file'
 fi
 
 printf 'all coreutils smoke tests passed\n'

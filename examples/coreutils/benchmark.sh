@@ -60,6 +60,8 @@ throughput "$io_iterations" "system cat 128M" "$fixture_bytes" sh -c "/usr/bin/c
 throughput "$io_iterations" "mlx cat 128M" "$fixture_bytes" sh -c "'$bin_dir/cat' '$fixture' >/dev/null"
 throughput "$io_iterations" "system head 1M" "$head_bytes" sh -c "/usr/bin/head -c '$head_bytes' '$fixture' >/dev/null"
 throughput "$io_iterations" "mlx head 1M" "$head_bytes" sh -c "'$bin_dir/head' -c '$head_bytes' '$fixture' >/dev/null"
+throughput "$io_iterations" "system tail 1M" "$head_bytes" sh -c "/usr/bin/tail -c '$head_bytes' '$fixture' >/dev/null"
+throughput "$io_iterations" "mlx tail 1M" "$head_bytes" sh -c "'$bin_dir/tail' -c '$head_bytes' '$fixture' >/dev/null"
 throughput "$io_iterations" "system tee 128M" "$fixture_bytes" sh -c "/usr/bin/tee /dev/null < '$fixture' >/dev/null"
 throughput "$io_iterations" "mlx tee 128M" "$fixture_bytes" sh -c "'$bin_dir/tee' /dev/null < '$fixture' >/dev/null"
 throughput "$io_iterations" "system yes 128M" "$fixture_bytes" sh -c "/usr/bin/yes | /usr/bin/head -c '$fixture_bytes' >/dev/null"
