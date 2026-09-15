@@ -45,6 +45,12 @@ compare_tail() {
     cmp "$work_dir/actual" "$work_dir/expected"
 }
 
+compare_uname() {
+    "$bin_dir/uname" "$@" > "$work_dir/actual" || return 1
+    /usr/bin/uname "$@" > "$work_dir/expected" || return 1
+    cmp "$work_dir/actual" "$work_dir/expected"
+}
+
 compare_yes() {
     set +o pipefail
     "$bin_dir/yes" "$@" | /usr/bin/head -c 4096 > "$work_dir/actual"
@@ -261,6 +267,16 @@ if "$bin_dir/tail" -n 18446744073709551616 "$work_dir/tail-a" >/dev/null 2>&1; t
 fi
 if "$bin_dir/tail" "$work_dir/missing-tail-input" >/dev/null 2>&1; then
     fail 'tail accepted a missing input file'
+fi
+
+compare_uname || fail 'uname default output differs'
+compare_uname -a || fail 'uname -a output differs'
+compare_uname -snrvm || fail 'uname combined output differs'
+compare_uname -p -i -o || fail 'uname extended fields differ'
+compare_uname --kernel-name --nodename --kernel-release --kernel-version --machine --operating-system || \
+    fail 'uname long-option output differs'
+if "$bin_dir/uname" --unknown >/dev/null 2>&1; then
+    fail 'uname accepted an unknown option'
 fi
 
 printf 'all coreutils smoke tests passed\n'

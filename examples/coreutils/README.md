@@ -20,6 +20,7 @@ Initial utilities:
 - `tee`: streaming fan-out to stdout and multiple truncate/append targets
 - `yes`: block-buffered repeated output for one or more strings
 - `sleep`: decimal durations, unit suffixes, and summed operands
+- `uname`: kernel, node, release, architecture, and operating-system fields
 
 Build all utilities with the self-hosted compiler:
 
