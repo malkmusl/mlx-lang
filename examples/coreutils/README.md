@@ -18,6 +18,7 @@ Initial utilities:
 - `head`: byte or line limits, multiple-file headers, and NUL records
 - `tee`: streaming fan-out to stdout and multiple truncate/append targets
 - `yes`: block-buffered repeated output for one or more strings
+- `sleep`: decimal durations, unit suffixes, and summed operands
 
 Build all utilities with the self-hosted compiler:
 

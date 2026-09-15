@@ -218,4 +218,17 @@ yes_invalid_status=$?
 set -e
 [[ "$yes_invalid_status" -eq 1 ]] || fail 'yes accepted an unknown option'
 
+"$bin_dir/sleep" 0
+"$bin_dir/sleep" 0s 0m 0h 0d
+sleep_started=$(date +%s%N)
+"$bin_dir/sleep" 0.02s 0.01s
+sleep_elapsed=$(( $(date +%s%N) - sleep_started ))
+[[ "$sleep_elapsed" -ge 20000000 && "$sleep_elapsed" -lt 2000000000 ]] || fail 'sleep decimal duration differs'
+if "$bin_dir/sleep" invalid >/dev/null 2>&1; then
+    fail 'sleep accepted an invalid duration'
+fi
+if "$bin_dir/sleep" 18446744073709551615d >/dev/null 2>&1; then
+    fail 'sleep accepted an overflowing duration'
+fi
+
 printf 'all coreutils smoke tests passed\n'

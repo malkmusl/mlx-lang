@@ -54,6 +54,8 @@ benchmark "$startup_iterations" "system basename" sh -c "/usr/bin/basename /usr/
 benchmark "$startup_iterations" "mlx basename" sh -c "'$bin_dir/basename' /usr/bin/basename >/dev/null"
 benchmark "$startup_iterations" "system dirname" sh -c "/usr/bin/dirname /usr/bin/dirname >/dev/null"
 benchmark "$startup_iterations" "mlx dirname" sh -c "'$bin_dir/dirname' /usr/bin/dirname >/dev/null"
+benchmark "$startup_iterations" "system sleep 0" /usr/bin/sleep 0
+benchmark "$startup_iterations" "mlx sleep 0" "$bin_dir/sleep" 0
 throughput "$io_iterations" "system cat 128M" "$fixture_bytes" sh -c "/usr/bin/cat '$fixture' >/dev/null"
 throughput "$io_iterations" "mlx cat 128M" "$fixture_bytes" sh -c "'$bin_dir/cat' '$fixture' >/dev/null"
 throughput "$io_iterations" "system head 1M" "$head_bytes" sh -c "/usr/bin/head -c '$head_bytes' '$fixture' >/dev/null"
