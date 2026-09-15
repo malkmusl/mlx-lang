@@ -28,6 +28,7 @@ Initial utilities:
 - `touch`: current-time timestamp updates, file creation, and no-create mode
 - `truncate`: exact file resizing with binary size suffixes and no-create mode
 - `mkfifo`: named-pipe creation with octal permission modes
+- `sync`: global, per-file data, and per-filesystem cache synchronization
 
 Build all utilities with the self-hosted compiler:
 

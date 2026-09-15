@@ -435,4 +435,16 @@ if "$bin_dir/mkfifo" -m invalid "$work_dir/fifo-invalid" >/dev/null 2>&1; then
     fail 'mkfifo accepted an invalid mode'
 fi
 
+printf 'sync payload\n' > "$work_dir/sync-file"
+"$bin_dir/sync"
+"$bin_dir/sync" "$work_dir/sync-file"
+"$bin_dir/sync" -d "$work_dir/sync-file"
+"$bin_dir/sync" -f "$work_dir/sync-file"
+if "$bin_dir/sync" "$work_dir/missing-sync-file" >/dev/null 2>&1; then
+    fail 'sync accepted a missing file'
+fi
+if "$bin_dir/sync" -d -f "$work_dir/sync-file" >/dev/null 2>&1; then
+    fail 'sync accepted mutually exclusive modes'
+fi
+
 printf 'all coreutils smoke tests passed\n'
