@@ -21,6 +21,12 @@ compare_wc() {
        "$mlx_bytes" == "$gnu_bytes" && "$mlx_name" == "$gnu_name" ]]
 }
 
+compare_wc_flags() {
+    LC_ALL=C "$bin_dir/wc" "$@" > "$work_dir/actual" || return 1
+    LC_ALL=C /usr/bin/wc "$@" > "$work_dir/expected" || return 1
+    cmp "$work_dir/actual" "$work_dir/expected"
+}
+
 compare_basename() {
     "$bin_dir/basename" "$@" > "$work_dir/actual"
     /usr/bin/basename "$@" > "$work_dir/expected"
@@ -170,6 +176,15 @@ read -r bytes name < <(tail -n 1 "$work_dir/actual")
 
 printf 'a b\tc\nd\ve\ff\rg\240h\n' > "$work_dir/whitespace"
 compare_wc "$work_dir/whitespace" || fail 'wc whitespace classification differs'
+printf 'ab\tcd\n12345\nlast' > "$work_dir/wc-flags"
+compare_wc_flags -m "$work_dir/wc-flags" || fail 'wc character count differs'
+compare_wc_flags -L "$work_dir/wc-flags" || fail 'wc maximum line length differs'
+compare_wc_flags -lwmcL "$work_dir/wc-flags" || fail 'wc combined counts differ'
+compare_wc_flags --lines --words --chars --bytes --max-line-length "$work_dir/wc-flags" || fail 'wc long count flags differ'
+printf 'x\342\202\254y\n' > "$work_dir/wc-utf8"
+LC_ALL=C.UTF-8 "$bin_dir/wc" -m "$work_dir/wc-utf8" > "$work_dir/actual"
+LC_ALL=C.UTF-8 /usr/bin/wc -m "$work_dir/wc-utf8" > "$work_dir/expected"
+cmp "$work_dir/actual" "$work_dir/expected" || fail 'wc UTF-8 character count differs'
 
 dd if=/dev/urandom of="$work_dir/random" bs=64K count=1 status=none
 compare_wc "$work_dir/random" || fail 'wc binary input counts differ'
