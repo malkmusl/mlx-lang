@@ -26,7 +26,7 @@ Initial utilities:
 - `nproc`: affinity-aware available CPUs, configured CPUs, and ignored processors
 - `link`, `unlink`: dependency-free hard-link creation and single-path removal
 - `touch`: current-time timestamp updates, file creation, and no-create mode
-- `truncate`: exact file resizing with binary size suffixes and no-create mode
+- `truncate`: exact, relative, reference-based, rounded, and IO-block file resizing
 - `mkfifo`: named-pipe creation with octal permission modes
 - `sync`: global, per-file data, and per-filesystem cache synchronization
 

@@ -28,7 +28,7 @@ their `/usr/bin` counterparts.
 | `nproc` | complete | OpenMP thread-limit environment extensions |
 | `link`, `unlink` | complete | none known |
 | `touch` | partial | selected timestamps, references, parsed dates, explicit timestamps, and symlink mode |
-| `truncate` | partial | reference sizes, IO-block mode, decimal units, and relative/rounded sizes |
+| `truncate` | complete | validate filesystem-specific IO-block behavior |
 | `mkfifo` | partial | symbolic modes and SELinux/SMACK `-Z`/`--context` |
 | `sync` | complete | none known |
 

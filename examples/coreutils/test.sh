@@ -513,6 +513,33 @@ printf 'abcdefghijklmnop' > "$work_dir/truncate-a"
 if "$bin_dir/truncate" -s invalid "$work_dir/truncate-invalid" >/dev/null 2>&1; then
     fail 'truncate accepted an invalid size'
 fi
+printf '12345678901234567' > "$work_dir/truncate-reference"
+"$bin_dir/truncate" -r "$work_dir/truncate-reference" "$work_dir/truncate-created"
+[[ "$(stat -c %s "$work_dir/truncate-created")" == 17 ]] || fail 'truncate reference size differs'
+: > "$work_dir/truncate-empty-reference"
+"$bin_dir/truncate" -r "$work_dir/truncate-empty-reference" "$work_dir/truncate-created"
+[[ "$(stat -c %s "$work_dir/truncate-created")" == 0 ]] || fail 'truncate empty reference size differs'
+"$bin_dir/truncate" -s 0 "$work_dir/truncate-created"
+[[ "$(stat -c %s "$work_dir/truncate-created")" == 0 ]] || fail 'truncate zero size differs'
+"$bin_dir/truncate" -r "$work_dir/truncate-reference" "$work_dir/truncate-created"
+"$bin_dir/truncate" -s +3 "$work_dir/truncate-created"
+[[ "$(stat -c %s "$work_dir/truncate-created")" == 20 ]] || fail 'truncate extend operation differs'
+"$bin_dir/truncate" -s -5 "$work_dir/truncate-created"
+[[ "$(stat -c %s "$work_dir/truncate-created")" == 15 ]] || fail 'truncate reduce operation differs'
+"$bin_dir/truncate" -s '<10' "$work_dir/truncate-created"
+[[ "$(stat -c %s "$work_dir/truncate-created")" == 10 ]] || fail 'truncate at-most operation differs'
+"$bin_dir/truncate" -s '>12' "$work_dir/truncate-created"
+[[ "$(stat -c %s "$work_dir/truncate-created")" == 12 ]] || fail 'truncate at-least operation differs'
+"$bin_dir/truncate" -s 2KB "$work_dir/truncate-created"
+[[ "$(stat -c %s "$work_dir/truncate-created")" == 2000 ]] || fail 'truncate decimal suffix differs'
+"$bin_dir/truncate" -s 2KiB "$work_dir/truncate-created"
+[[ "$(stat -c %s "$work_dir/truncate-created")" == 2048 ]] || fail 'truncate binary prefix differs'
+"$bin_dir/truncate" -s /1000 "$work_dir/truncate-created"
+[[ "$(stat -c %s "$work_dir/truncate-created")" == 2000 ]] || fail 'truncate round-down differs'
+"$bin_dir/truncate" -s %1024 "$work_dir/truncate-created"
+[[ "$(stat -c %s "$work_dir/truncate-created")" == 2048 ]] || fail 'truncate round-up differs'
+"$bin_dir/truncate" -o -s 1 "$work_dir/truncate-created"
+[[ "$(stat -c %s "$work_dir/truncate-created")" == "$(stat -c %o "$work_dir/truncate-created")" ]] || fail 'truncate IO block size differs'
 
 (
     umask 000
