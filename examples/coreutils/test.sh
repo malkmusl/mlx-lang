@@ -300,4 +300,54 @@ if "$bin_dir/printenv" --unknown >/dev/null 2>&1; then
     fail 'printenv accepted an unknown option'
 fi
 
+/usr/bin/env -i OLD=drop KEEP=yes "$bin_dir/env" -i ALPHA=one EMPTY= > "$work_dir/actual"
+/usr/bin/env -i OLD=drop KEEP=yes /usr/bin/env -i ALPHA=one EMPTY= > "$work_dir/expected"
+cmp "$work_dir/actual" "$work_dir/expected" || fail 'env clean environment differs'
+
+/usr/bin/env -i OLD=drop KEEP=yes SECOND=drop "$bin_dir/env" -u OLD --unset=SECOND > "$work_dir/actual"
+/usr/bin/env -i OLD=drop KEEP=yes SECOND=drop /usr/bin/env -u OLD --unset=SECOND > "$work_dir/expected"
+cmp "$work_dir/actual" "$work_dir/expected" || fail 'env unset environment differs'
+
+/usr/bin/env -i OLD=before KEEP=yes "$bin_dir/env" OLD=after NEXT=two > "$work_dir/actual"
+/usr/bin/env -i OLD=before KEEP=yes /usr/bin/env OLD=after NEXT=two > "$work_dir/expected"
+cmp "$work_dir/actual" "$work_dir/expected" || fail 'env assignments differ'
+
+/usr/bin/env -i "$bin_dir/env" A=one B=two A=three > "$work_dir/actual"
+/usr/bin/env -i /usr/bin/env A=one B=two A=three > "$work_dir/expected"
+cmp "$work_dir/actual" "$work_dir/expected" || fail 'env repeated assignments differ'
+
+/usr/bin/env -i OLD=before KEEP=yes "$bin_dir/env" -u OLD OLD=after NEXT=two > "$work_dir/actual"
+/usr/bin/env -i OLD=before KEEP=yes /usr/bin/env -u OLD OLD=after NEXT=two > "$work_dir/expected"
+cmp "$work_dir/actual" "$work_dir/expected" || fail 'env unset and assignment order differs'
+
+/usr/bin/env -i ALPHA=one EMPTY= "$bin_dir/env" -0 > "$work_dir/actual"
+/usr/bin/env -i ALPHA=one EMPTY= /usr/bin/env -0 > "$work_dir/expected"
+cmp "$work_dir/actual" "$work_dir/expected" || fail 'env NUL output differs'
+
+/usr/bin/env -i "$bin_dir/env" ANSWER=42 /usr/bin/printenv ANSWER > "$work_dir/actual"
+printf '42\n' > "$work_dir/expected"
+cmp "$work_dir/actual" "$work_dir/expected" || fail 'env direct execution differs'
+
+/usr/bin/env -i "$bin_dir/env" PATH=/usr/bin ANSWER=43 printenv ANSWER > "$work_dir/actual"
+printf '43\n' > "$work_dir/expected"
+cmp "$work_dir/actual" "$work_dir/expected" || fail 'env PATH execution differs'
+
+set +e
+/usr/bin/env -i "$bin_dir/env" /bin/sh -c 'exit 7'
+env_command_status=$?
+/usr/bin/env -i "$bin_dir/env" missing-mlx-command >/dev/null 2>&1
+env_missing_status=$?
+/usr/bin/env -i "$bin_dir/env" -0 /bin/true >/dev/null 2>&1
+env_zero_command_status=$?
+/usr/bin/env -i "$bin_dir/env" --unset= >/dev/null 2>&1
+env_empty_unset_status=$?
+set -e
+[[ "$env_command_status" -eq 7 ]] || fail 'env lost child exit status'
+[[ "$env_missing_status" -eq 127 ]] || fail 'env missing-command status differs'
+[[ "$env_zero_command_status" -eq 125 ]] || fail 'env accepted NUL output with a command'
+[[ "$env_empty_unset_status" -eq 125 ]] || fail 'env accepted an empty unset name'
+if "$bin_dir/env" --unknown >/dev/null 2>&1; then
+    fail 'env accepted an unknown option'
+fi
+
 printf 'all coreutils smoke tests passed\n'
