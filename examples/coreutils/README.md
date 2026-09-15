@@ -16,7 +16,7 @@ Initial utilities:
 - `basename`: suffix removal, multiple operands, and NUL-delimited output
 - `dirname`: multiple paths and newline- or NUL-delimited output
 - `head`: byte or line limits, multiple-file headers, and NUL records
-- `tail`: backward regular-file scans plus buffered stdin for bytes or records
+- `tail`: backward scans, buffered stdin, start offsets, and polling-based file following
 - `tee`: streaming fan-out to stdout and multiple truncate/append targets
 - `yes`: block-buffered repeated output for one or more strings
 - `sleep`: decimal durations, unit suffixes, and summed operands

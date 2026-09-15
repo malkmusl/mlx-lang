@@ -399,6 +399,23 @@ fi
 if "$bin_dir/tail" "$work_dir/missing-tail-input" >/dev/null 2>&1; then
     fail 'tail accepted a missing input file'
 fi
+timeout 3 "$bin_dir/tail" --pid=999999 -f -s 0.01 "$work_dir/tail-a" > "$work_dir/actual"
+/usr/bin/tail --pid=999999 -f -s 0.01 "$work_dir/tail-a" > "$work_dir/expected"
+cmp "$work_dir/actual" "$work_dir/expected" || fail 'tail descriptor follow output differs'
+timeout 3 "$bin_dir/tail" --debug --pid=999999 -F -s 0.01 "$work_dir/tail-b" > "$work_dir/actual" 2> "$work_dir/tail-debug"
+/usr/bin/tail --pid=999999 -F -s 0.01 "$work_dir/tail-b" > "$work_dir/expected"
+cmp "$work_dir/actual" "$work_dir/expected" || fail 'tail name follow output differs'
+grep -q 'mlx-tail:' "$work_dir/tail-debug" || fail 'tail --debug emitted no strategy diagnostic'
+printf 'follow-start\n' > "$work_dir/tail-follow"
+(
+    sleep 0.05
+    printf 'follow-next\n' >> "$work_dir/tail-follow"
+    sleep 0.05
+) &
+tail_writer=$!
+timeout 3 "$bin_dir/tail" --pid="$tail_writer" -f -s.01 "$work_dir/tail-follow" > "$work_dir/actual"
+printf 'follow-start\nfollow-next\n' > "$work_dir/expected"
+cmp "$work_dir/actual" "$work_dir/expected" || fail 'tail did not stream appended data'
 
 compare_uname || fail 'uname default output differs'
 compare_uname -a || fail 'uname -a output differs'

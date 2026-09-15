@@ -18,7 +18,7 @@ their `/usr/bin` counterparts.
 | `rmdir` | complete | none known |
 | `basename`, `dirname` | complete | none known |
 | `head` | complete | bounded-memory streaming for negative counts |
-| `tail` | partial | `--follow`, `--retry`, `--pid`, `--sleep-interval`, and `--max-unchanged-stats` |
+| `tail` | complete | inotify, multiple followed files, and repeated `--pid` values currently use reduced polling behavior |
 | `tee` | complete | validate rare non-EPIPE device failures for every output-error mode |
 | `yes` | complete | none known |
 | `sleep` | complete | GNU infinity and scientific-number extensions |
