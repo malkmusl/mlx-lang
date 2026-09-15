@@ -185,6 +185,16 @@ printf 'x\342\202\254y\n' > "$work_dir/wc-utf8"
 LC_ALL=C.UTF-8 "$bin_dir/wc" -m "$work_dir/wc-utf8" > "$work_dir/actual"
 LC_ALL=C.UTF-8 /usr/bin/wc -m "$work_dir/wc-utf8" > "$work_dir/expected"
 cmp "$work_dir/actual" "$work_dir/expected" || fail 'wc UTF-8 character count differs'
+printf '%s\0%s\0' "$work_dir/a" "$work_dir/b" > "$work_dir/wc-files0"
+compare_wc_flags -c --files0-from="$work_dir/wc-files0" || fail 'wc files0 input differs'
+compare_wc_flags -c --total=always "$work_dir/a" || fail 'wc always total differs'
+compare_wc_flags -c --total=only "$work_dir/a" "$work_dir/b" || fail 'wc only total differs'
+compare_wc_flags -c --total=never "$work_dir/a" "$work_dir/b" || fail 'wc never total differs'
+LC_ALL=C "$bin_dir/wc" --debug -l "$work_dir/a" > "$work_dir/actual" 2> "$work_dir/wc-debug"
+grep -q 'mlx-wc:' "$work_dir/wc-debug" || fail 'wc --debug emitted no strategy diagnostic'
+if "$bin_dir/wc" --files0-from="$work_dir/wc-files0" "$work_dir/a" >/dev/null 2>&1; then
+    fail 'wc combined files0 and operands'
+fi
 
 dd if=/dev/urandom of="$work_dir/random" bs=64K count=1 status=none
 compare_wc "$work_dir/random" || fail 'wc binary input counts differ'
