@@ -11,7 +11,7 @@ Initial utilities:
 - `cat`: stdin, files, `-`, `--`, multiple operands, and streaming I/O
 - `wc`: line, word, and byte counts with `-l`, `-w`, and `-c`
 - `pwd`: logical and physical paths with `-L` and `-P`
-- `mkdir`: octal modes, parent creation, and verbose output
+- `mkdir`: chmod-style modes, parent creation, security-context flags, and verbose output
 - `rmdir`: parent removal, non-empty handling, and verbose output
 - `basename`: suffix removal, multiple operands, and NUL-delimited output
 - `dirname`: multiple paths and newline- or NUL-delimited output
@@ -27,7 +27,7 @@ Initial utilities:
 - `link`, `unlink`: dependency-free hard-link creation and single-path removal
 - `touch`: current-time timestamp updates, file creation, and no-create mode
 - `truncate`: exact, relative, reference-based, rounded, and IO-block file resizing
-- `mkfifo`: named-pipe creation with octal permission modes
+- `mkfifo`: named-pipe creation with chmod-style modes and security-context flags
 - `sync`: global, per-file data, and per-filesystem cache synchronization
 
 Build all utilities with the self-hosted compiler:

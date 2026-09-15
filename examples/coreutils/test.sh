@@ -217,6 +217,28 @@ cmp "$work_dir/actual" "$work_dir/expected" || fail 'pwd -L output differs'
 )
 [[ "$(stat -c %a "$work_dir/mode-dir")" == 750 ]] || fail 'mkdir -m mode differs'
 
+(
+    umask 077
+    "$bin_dir/mkdir" -m 'u=rwx,g=rx,o=' "$work_dir/mode-symbolic"
+    "$bin_dir/mkdir" -m 000 "$work_dir/mode-zero"
+    "$bin_dir/mkdir" -p -m 750 "$work_dir/mode-parents/child"
+)
+[[ "$(stat -c %a "$work_dir/mode-symbolic")" == 750 ]] || fail 'mkdir symbolic mode differs'
+[[ "$(stat -c %a "$work_dir/mode-zero")" == 0 ]] || fail 'mkdir zero mode differs'
+[[ "$(stat -c %a "$work_dir/mode-parents")" == 700 ]] || fail 'mkdir parent mode should follow umask'
+[[ "$(stat -c %a "$work_dir/mode-parents/child")" == 750 ]] || fail 'mkdir final parent mode differs'
+(
+    umask 027
+    "$bin_dir/mkdir" -m '=rw' "$work_dir/mode-implicit-who"
+)
+[[ "$(stat -c %a "$work_dir/mode-implicit-who")" == 640 ]] || fail 'mkdir implicit symbolic who ignored umask'
+"$bin_dir/mkdir" -Z "$work_dir/mode-context-default"
+"$bin_dir/mkdir" --context=mlx-test "$work_dir/mode-context-explicit" 2> "$work_dir/mkdir-context-warning"
+[[ -d "$work_dir/mode-context-default" && -d "$work_dir/mode-context-explicit" ]] || fail 'mkdir context flags failed'
+if [[ ! -e /sys/fs/selinux/enforce && ! -e /sys/fs/smackfs ]]; then
+    grep -q 'warning: ignoring --context' "$work_dir/mkdir-context-warning" || fail 'mkdir omitted unsupported context warning'
+fi
+
 "$bin_dir/mkdir" -p "$work_dir/parents/child/leaf"
 [[ -d "$work_dir/parents/child/leaf" ]] || fail 'mkdir -p did not create parents'
 
@@ -547,6 +569,24 @@ printf '12345678901234567' > "$work_dir/truncate-reference"
 )
 [[ -p "$work_dir/fifo-a" && -p "$work_dir/fifo-b" ]] || fail 'mkfifo did not create FIFOs'
 [[ "$(stat -c %a "$work_dir/fifo-a")" == 640 ]] || fail 'mkfifo mode differs'
+(
+    umask 077
+    "$bin_dir/mkfifo" -m 'u=rw,g=r,o=' "$work_dir/fifo-symbolic"
+    "$bin_dir/mkfifo" -m 666 "$work_dir/fifo-exact"
+)
+[[ "$(stat -c %a "$work_dir/fifo-symbolic")" == 640 ]] || fail 'mkfifo symbolic mode differs'
+[[ "$(stat -c %a "$work_dir/fifo-exact")" == 666 ]] || fail 'mkfifo explicit mode followed umask'
+(
+    umask 027
+    "$bin_dir/mkfifo" -m '=rw' "$work_dir/fifo-implicit-who"
+)
+[[ "$(stat -c %a "$work_dir/fifo-implicit-who")" == 640 ]] || fail 'mkfifo implicit symbolic who ignored umask'
+"$bin_dir/mkfifo" -Z "$work_dir/fifo-context-default"
+"$bin_dir/mkfifo" --context=mlx-test "$work_dir/fifo-context-explicit" 2> "$work_dir/mkfifo-context-warning"
+[[ -p "$work_dir/fifo-context-default" && -p "$work_dir/fifo-context-explicit" ]] || fail 'mkfifo context flags failed'
+if [[ ! -e /sys/fs/selinux/enforce && ! -e /sys/fs/smackfs ]]; then
+    grep -q 'warning: ignoring --context' "$work_dir/mkfifo-context-warning" || fail 'mkfifo omitted unsupported context warning'
+fi
 if "$bin_dir/mkfifo" "$work_dir/fifo-a" >/dev/null 2>&1; then
     fail 'mkfifo accepted an existing path'
 fi

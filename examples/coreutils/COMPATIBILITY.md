@@ -14,7 +14,7 @@ their `/usr/bin` counterparts.
 | `cat` | complete | validate multibyte display behavior outside `LC_ALL=C` |
 | `wc` | complete | full Unicode `wcwidth` and hardware-specific `--debug` wording |
 | `pwd` | complete | none known |
-| `mkdir` | partial | symbolic modes and SELinux/SMACK `-Z`/`--context` |
+| `mkdir` | complete | native context assignment still needs validation on an SELinux/SMACK host |
 | `rmdir` | complete | none known |
 | `basename`, `dirname` | complete | none known |
 | `head` | complete | bounded-memory streaming for negative counts |
@@ -29,7 +29,7 @@ their `/usr/bin` counterparts.
 | `link`, `unlink` | complete | none known |
 | `touch` | partial | selected timestamps, references, parsed dates, explicit timestamps, and symlink mode |
 | `truncate` | complete | validate filesystem-specific IO-block behavior |
-| `mkfifo` | partial | symbolic modes and SELinux/SMACK `-Z`/`--context` |
+| `mkfifo` | complete | native context assignment still needs validation on an SELinux/SMACK host |
 | `sync` | complete | none known |
 
 “Complete” means the documented option surface is implemented and covered by
