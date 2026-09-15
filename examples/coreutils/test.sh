@@ -408,4 +408,18 @@ if "$bin_dir/touch" "$work_dir/missing-touch-parent/file" >/dev/null 2>&1; then
     fail 'touch accepted an invalid parent path'
 fi
 
+"$bin_dir/truncate" -s 10 "$work_dir/truncate-created"
+[[ "$(stat -c %s "$work_dir/truncate-created")" == 10 ]] || fail 'truncate did not create requested size'
+printf 'abcdefghijklmnop' > "$work_dir/truncate-a"
+"$bin_dir/truncate" --size=3 "$work_dir/truncate-a"
+[[ "$(stat -c %s "$work_dir/truncate-a")" == 3 ]] || fail 'truncate did not shrink a file'
+"$bin_dir/truncate" -s 2K "$work_dir/truncate-a" "$work_dir/truncate-b"
+[[ "$(stat -c %s "$work_dir/truncate-a")" == 2048 ]] || fail 'truncate suffix size differs'
+[[ "$(stat -c %s "$work_dir/truncate-b")" == 2048 ]] || fail 'truncate multiple files differ'
+"$bin_dir/truncate" -c -s 7 "$work_dir/truncate-no-create"
+[[ ! -e "$work_dir/truncate-no-create" ]] || fail 'truncate -c created a missing file'
+if "$bin_dir/truncate" -s invalid "$work_dir/truncate-invalid" >/dev/null 2>&1; then
+    fail 'truncate accepted an invalid size'
+fi
+
 printf 'all coreutils smoke tests passed\n'

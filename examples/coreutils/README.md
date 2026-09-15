@@ -26,6 +26,7 @@ Initial utilities:
 - `nproc`: affinity-aware available CPUs, configured CPUs, and ignored processors
 - `link`, `unlink`: dependency-free hard-link creation and single-path removal
 - `touch`: current-time timestamp updates, file creation, and no-create mode
+- `truncate`: exact file resizing with binary size suffixes and no-create mode
 
 Build all utilities with the self-hosted compiler:
 
