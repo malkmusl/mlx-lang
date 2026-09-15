@@ -69,6 +69,12 @@ compare_echo() {
     cmp "$work_dir/actual" "$work_dir/expected"
 }
 
+compare_cat() {
+    LC_ALL=C "$bin_dir/cat" "$@" > "$work_dir/actual" || return 1
+    LC_ALL=C /usr/bin/cat "$@" > "$work_dir/expected" || return 1
+    cmp "$work_dir/actual" "$work_dir/expected"
+}
+
 compare_yes() {
     set +o pipefail
     "$bin_dir/yes" "$@" | /usr/bin/head -c 4096 > "$work_dir/actual"
@@ -133,6 +139,21 @@ cmp "$work_dir/actual" "$work_dir/expected" || fail 'cat stdin output differs'
 printf 'stdin through --\n' | "$bin_dir/cat" -- > "$work_dir/actual"
 printf 'stdin through --\n' > "$work_dir/expected"
 cmp "$work_dir/actual" "$work_dir/expected" || fail 'cat -- stdin output differs'
+
+printf '\nfirst\n\n\nsecond\tcolumn\n' > "$work_dir/cat-flags-a"
+printf 'third\n\001\177\200\377\n' > "$work_dir/cat-flags-b"
+compare_cat -n "$work_dir/cat-flags-a" "$work_dir/cat-flags-b" || fail 'cat line numbering differs'
+compare_cat -b "$work_dir/cat-flags-a" || fail 'cat nonblank numbering differs'
+compare_cat -s "$work_dir/cat-flags-a" || fail 'cat blank squeezing differs'
+compare_cat -E "$work_dir/cat-flags-a" || fail 'cat end markers differ'
+compare_cat -T "$work_dir/cat-flags-a" || fail 'cat tab markers differ'
+compare_cat -v "$work_dir/cat-flags-b" || fail 'cat nonprinting output differs'
+compare_cat -A "$work_dir/cat-flags-a" "$work_dir/cat-flags-b" || fail 'cat show-all differs'
+compare_cat -benstuvET "$work_dir/cat-flags-a" || fail 'cat combined flags differ'
+compare_cat --number --squeeze-blank --show-ends "$work_dir/cat-flags-a" || fail 'cat long flags differ'
+if "$bin_dir/cat" --unknown "$work_dir/cat-flags-a" >/dev/null 2>&1; then
+    fail 'cat accepted an unknown option'
+fi
 
 "$bin_dir/wc" "$work_dir/a" > "$work_dir/actual"
 read -r lines words bytes name < "$work_dir/actual"
