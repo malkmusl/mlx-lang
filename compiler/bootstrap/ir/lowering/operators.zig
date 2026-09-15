@@ -47,6 +47,17 @@ fn lowerAssignment(builder: anytype, node_index: Node.Index, assignment: Tag) !?
     const address = try lvalue.lowerAddress(builder, node.data.lhs) orelse return null;
     const value = try builder.lowerNode(node.data.rhs) orelse return null;
     const target_type = builder.sema.node_types.get(node.data.lhs) orelse return null;
+    if (assignment == .equal and isMemoryAggregateTarget(builder, node.data.lhs, target_type)) {
+        const size = builder.sema.type_pool.sizeOf(target_type) catch return null;
+        const copy_size = std.math.cast(u32, size) orelse return null;
+        _ = try builder.emitInst(.{
+            .opcode = .memory_copy,
+            .type_id = target_type,
+            .data = .{ .memory_copy = .{ .destination = address, .source = value, .size = copy_size } },
+        });
+        try builder.markInitialized(node.data.lhs);
+        return null;
+    }
     const stored_value = if (assignment == .equal)
         value
     else blk: {
@@ -62,6 +73,17 @@ fn lowerAssignment(builder: anytype, node_index: Node.Index, assignment: Tag) !?
     });
     if (assignment == .equal) try builder.markInitialized(node.data.lhs);
     return null;
+}
+
+fn isMemoryAggregateTarget(builder: anytype, node_index: Node.Index, type_id: Type.Id) bool {
+    const node = builder.sema.ast_tree.nodes.get(node_index);
+    const addressesInlineStorage = node.tag == .field_access or node.tag == .array_access or
+        (node.tag == .unary_op and builder.sema.ast_tree.tokens[node.main_token].tag == .dot_asterisk);
+    if (!addressesInlineStorage) return false;
+    return switch (builder.sema.type_pool.get(type_id).data) {
+        .array, .@"struct", .@"union" => true,
+        else => false,
+    };
 }
 
 fn lowerLogical(builder: anytype, node_index: Node.Index, tag: Tag) !?Inst.Index {

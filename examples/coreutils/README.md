@@ -13,16 +13,19 @@ Initial utilities:
 - `pwd`: logical and physical paths with `-L` and `-P`
 - `mkdir`: octal modes, parent creation, and verbose output
 - `rmdir`: parent removal, non-empty handling, and verbose output
+- `basename`: suffix removal, multiple operands, and NUL-delimited output
 
 Build all utilities with the self-hosted compiler:
 
 ```sh
-./examples/coreutils/build.sh ./zig-out/bin/mlx2
+./examples/coreutils/build.sh
 ./examples/coreutils/test.sh
 ./examples/coreutils/benchmark.sh
 ```
 
-The build script defaults to `mlx2` and never invokes the bootstrap compiler.
+The build script defaults to the converged self-hosted compiler at
+`mlx-out/bin/compiler/mlx4` and writes the utilities to
+`mlx-out/bin/coreutils`. It never invokes the bootstrap compiler.
 The benchmark creates a 128 MiB text workload when no fixture is supplied and
 compares every hot path directly with the installed GNU utility.
 

@@ -65,7 +65,9 @@ zig build mlx1
 zig-out/bin/mlx1 tests/01_basic.mlx
 ```
 
-The canonical driver accepts `-O0`, `-O1`, `-O2`, and `-O3`. The current
+The canonical driver accepts `-O0`, `-O1`, `-O2`, and `-O3`. Runtime safety is
+enabled by default at every optimization level and can be selected explicitly
+with `--safety=on` or `--safety=off`; it is independent of optimization. The current
 bootstrap distinction is intentionally narrow: explicit eligible `inline`
 functions can expand at every level, O2 automatically expands only very small
 eligible functions, and O3 uses a larger cost budget. The remaining global
@@ -76,6 +78,8 @@ pipeline step. A rejected compilation marks the active step as `failed`, reports
 its duration and semantic error count, and prints stable `MLX-E...` diagnostics
 on stderr. `--quiet` disables progress output; `--trace` additionally prints
 input paths, module graph details, LIR counts, and unresolved backend symbols.
+Lexer/parser failures additionally identify the failing module and first bad
+byte instead of collapsing to a generic module-graph error.
 
 Verify deterministic self-hosting with:
 

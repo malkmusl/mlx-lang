@@ -2,7 +2,7 @@
 set -euo pipefail
 
 repo_root=$(cd "$(dirname "$0")/../.." && pwd)
-bin_dir=${MLX_COREUTILS_BIN_DIR:-"$repo_root/zig-out/bin"}
+bin_dir=${MLX_COREUTILS_BIN_DIR:-"$repo_root/mlx-out/bin/coreutils"}
 fixture=${1:-/tmp/mlx-coreutils-benchmark.bin}
 
 if [[ ! -f "$fixture" ]]; then
@@ -46,12 +46,14 @@ fixture_bytes=$(stat -c %s "$fixture")
 
 /usr/bin/cat "$fixture" >/dev/null
 benchmark "$startup_iterations" "system true" /usr/bin/true
-benchmark "$startup_iterations" "mlx true" "$bin_dir/mlx-true"
+benchmark "$startup_iterations" "mlx true" "$bin_dir/true"
 benchmark "$startup_iterations" "system pwd" sh -c "/usr/bin/pwd >/dev/null"
-benchmark "$startup_iterations" "mlx pwd" sh -c "'$bin_dir/mlx-pwd' >/dev/null"
+benchmark "$startup_iterations" "mlx pwd" sh -c "'$bin_dir/pwd' >/dev/null"
+benchmark "$startup_iterations" "system basename" sh -c "/usr/bin/basename /usr/bin/basename >/dev/null"
+benchmark "$startup_iterations" "mlx basename" sh -c "'$bin_dir/basename' /usr/bin/basename >/dev/null"
 throughput "$io_iterations" "system cat 128M" "$fixture_bytes" sh -c "/usr/bin/cat '$fixture' >/dev/null"
-throughput "$io_iterations" "mlx cat 128M" "$fixture_bytes" sh -c "'$bin_dir/mlx-cat' '$fixture' >/dev/null"
+throughput "$io_iterations" "mlx cat 128M" "$fixture_bytes" sh -c "'$bin_dir/cat' '$fixture' >/dev/null"
 throughput "$io_iterations" "system wc 128M" "$fixture_bytes" sh -c "/usr/bin/wc -c '$fixture' >/dev/null"
-throughput "$io_iterations" "mlx wc 128M" "$fixture_bytes" sh -c "'$bin_dir/mlx-wc' -c '$fixture' >/dev/null"
+throughput "$io_iterations" "mlx wc 128M" "$fixture_bytes" sh -c "'$bin_dir/wc' -c '$fixture' >/dev/null"
 throughput "$scan_iterations" "system wc default" "$fixture_bytes" sh -c "/usr/bin/wc '$fixture' >/dev/null"
-throughput "$scan_iterations" "mlx wc default" "$fixture_bytes" sh -c "'$bin_dir/mlx-wc' '$fixture' >/dev/null"
+throughput "$scan_iterations" "mlx wc default" "$fixture_bytes" sh -c "'$bin_dir/wc' '$fixture' >/dev/null"
