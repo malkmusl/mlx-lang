@@ -14,6 +14,7 @@ Initial utilities:
 - `mkdir`: octal modes, parent creation, and verbose output
 - `rmdir`: parent removal, non-empty handling, and verbose output
 - `basename`: suffix removal, multiple operands, and NUL-delimited output
+- `dirname`: multiple paths and newline- or NUL-delimited output
 
 Build all utilities with the self-hosted compiler:
 

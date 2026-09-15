@@ -27,6 +27,12 @@ compare_basename() {
     cmp "$work_dir/actual" "$work_dir/expected"
 }
 
+compare_dirname() {
+    "$bin_dir/dirname" "$@" > "$work_dir/actual"
+    /usr/bin/dirname "$@" > "$work_dir/expected"
+    cmp "$work_dir/actual" "$work_dir/expected"
+}
+
 "$bin_dir/true" || fail 'true returned a failure status'
 if "$bin_dir/false"; then
     fail 'false returned success'
@@ -120,5 +126,12 @@ compare_basename -- -strange || fail 'basename -- output differs'
 "$bin_dir/basename" -az foo/bar baz > "$work_dir/actual"
 /usr/bin/basename -az foo/bar baz > "$work_dir/expected"
 cmp "$work_dir/actual" "$work_dir/expected" || fail 'basename -z output differs'
+
+compare_dirname /usr/bin/sort || fail 'dirname path output differs'
+compare_dirname /usr/bin/ / /a foo ./foo ../foo a//b// || fail 'dirname multiple path output differs'
+compare_dirname -- -strange || fail 'dirname -- output differs'
+"$bin_dir/dirname" -z /usr/bin/sort foo > "$work_dir/actual"
+/usr/bin/dirname -z /usr/bin/sort foo > "$work_dir/expected"
+cmp "$work_dir/actual" "$work_dir/expected" || fail 'dirname -z output differs'
 
 printf 'all coreutils smoke tests passed\n'
