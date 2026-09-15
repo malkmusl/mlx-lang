@@ -294,6 +294,21 @@ if printf 'error path\n' | "$bin_dir/tee" "$work_dir/missing/target" >"$work_dir
 fi
 printf 'error path\n' > "$work_dir/expected"
 cmp "$work_dir/actual" "$work_dir/expected" || fail 'tee lost stdout after an output-open error'
+for tee_mode in -i -p --output-error=warn --output-error=warn-nopipe --output-error=exit --output-error=exit-nopipe; do
+    printf 'mode output\n' | "$bin_dir/tee" "$tee_mode" > "$work_dir/actual"
+    printf 'mode output\n' | /usr/bin/tee "$tee_mode" > "$work_dir/expected"
+    cmp "$work_dir/actual" "$work_dir/expected" || fail "tee $tee_mode output differs"
+done
+if "$bin_dir/tee" --output-error=invalid </dev/null >/dev/null 2>&1; then
+    fail 'tee accepted an invalid output-error mode'
+fi
+set +e
+set +o pipefail
+/usr/bin/yes x | "$bin_dir/tee" -p | /usr/bin/head -c 1 >/dev/null
+tee_pipe_status=${PIPESTATUS[1]}
+set -o pipefail
+set -e
+[[ "$tee_pipe_status" -eq 0 ]] || fail 'tee -p did not handle a closed pipe'
 
 compare_yes || fail 'yes default output differs'
 compare_yes hello || fail 'yes single-string output differs'
