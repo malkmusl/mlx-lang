@@ -350,4 +350,25 @@ if "$bin_dir/env" --unknown >/dev/null 2>&1; then
     fail 'env accepted an unknown option'
 fi
 
+"$bin_dir/nproc" > "$work_dir/actual"
+/usr/bin/nproc > "$work_dir/expected"
+cmp "$work_dir/actual" "$work_dir/expected" || fail 'nproc available count differs'
+"$bin_dir/nproc" --all > "$work_dir/actual"
+/usr/bin/nproc --all > "$work_dir/expected"
+cmp "$work_dir/actual" "$work_dir/expected" || fail 'nproc configured count differs'
+"$bin_dir/nproc" --ignore=1 > "$work_dir/actual"
+/usr/bin/nproc --ignore=1 > "$work_dir/expected"
+cmp "$work_dir/actual" "$work_dir/expected" || fail 'nproc attached ignore differs'
+"$bin_dir/nproc" --ignore 999999 > "$work_dir/actual"
+/usr/bin/nproc --ignore 999999 > "$work_dir/expected"
+cmp "$work_dir/actual" "$work_dir/expected" || fail 'nproc saturated ignore differs'
+affinity_list=$(taskset -pc $$ | sed 's/.*: //')
+first_cpu=${affinity_list%%[-,]*}
+taskset -c "$first_cpu" "$bin_dir/nproc" > "$work_dir/actual"
+taskset -c "$first_cpu" /usr/bin/nproc > "$work_dir/expected"
+cmp "$work_dir/actual" "$work_dir/expected" || fail 'nproc affinity count differs'
+if "$bin_dir/nproc" --ignore=invalid >/dev/null 2>&1; then
+    fail 'nproc accepted an invalid ignore count'
+fi
+
 printf 'all coreutils smoke tests passed\n'

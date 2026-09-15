@@ -23,6 +23,7 @@ Initial utilities:
 - `uname`: kernel, node, release, architecture, and operating-system fields
 - `printenv`: complete environment iteration, selected variables, and NUL output
 - `env`: environment clearing, unsetting, assignments, and `execve` with `PATH` lookup
+- `nproc`: affinity-aware available CPUs, configured CPUs, and ignored processors
 
 Build all utilities with the self-hosted compiler:
 
