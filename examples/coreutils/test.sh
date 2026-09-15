@@ -75,11 +75,25 @@ compare_yes() {
 }
 
 "$bin_dir/true" || fail 'true returned a failure status'
+"$bin_dir/true" ignored operands || fail 'true rejected ignored operands'
+"$bin_dir/true" --help > "$work_dir/actual" || fail 'true --help failed'
+grep -q '^Usage: true' "$work_dir/actual" || fail 'true --help output differs'
+"$bin_dir/true" --version > "$work_dir/actual" || fail 'true --version failed'
+grep -q '^mlx true ' "$work_dir/actual" || fail 'true --version output differs'
 if "$bin_dir/false"; then
     fail 'false returned success'
 elif [[ $? -ne 1 ]]; then
     fail 'false did not return status 1'
 fi
+if "$bin_dir/false" ignored operands; then
+    fail 'false accepted ignored operands with success'
+elif [[ $? -ne 1 ]]; then
+    fail 'false ignored operands changed status'
+fi
+"$bin_dir/false" --help > "$work_dir/actual" || fail 'false --help failed'
+grep -q '^Usage: false' "$work_dir/actual" || fail 'false --help output differs'
+"$bin_dir/false" --version > "$work_dir/actual" || fail 'false --version failed'
+grep -q '^mlx false ' "$work_dir/actual" || fail 'false --version output differs'
 
 "$bin_dir/echo" alpha beta > "$work_dir/actual"
 /usr/bin/echo alpha beta > "$work_dir/expected"
