@@ -16,6 +16,7 @@ Initial utilities:
 - `basename`: suffix removal, multiple operands, and NUL-delimited output
 - `dirname`: multiple paths and newline- or NUL-delimited output
 - `head`: byte or line limits, multiple-file headers, and NUL records
+- `tee`: streaming fan-out to stdout and multiple truncate/append targets
 
 Build all utilities with the self-hosted compiler:
 

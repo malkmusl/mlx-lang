@@ -167,4 +167,34 @@ if "$bin_dir/head" "$work_dir/missing-head-input" >/dev/null 2>&1; then
     fail 'head accepted a missing input file'
 fi
 
+printf 'tee stdin\nsecond line\n' | "$bin_dir/tee" > "$work_dir/actual"
+printf 'tee stdin\nsecond line\n' > "$work_dir/expected"
+cmp "$work_dir/actual" "$work_dir/expected" || fail 'tee stdout output differs'
+
+printf 'one target\n' | "$bin_dir/tee" "$work_dir/tee-a" > "$work_dir/actual"
+printf 'one target\n' > "$work_dir/expected"
+cmp "$work_dir/actual" "$work_dir/expected" || fail 'tee stdout with target differs'
+cmp "$work_dir/tee-a" "$work_dir/expected" || fail 'tee target output differs'
+
+printf 'multiple targets\n' | "$bin_dir/tee" "$work_dir/tee-a" "$work_dir/tee-b" > "$work_dir/actual"
+cmp "$work_dir/tee-a" "$work_dir/actual" || fail 'tee first multiple target differs'
+cmp "$work_dir/tee-b" "$work_dir/actual" || fail 'tee second multiple target differs'
+
+printf 'before\n' > "$work_dir/tee-append"
+printf 'after\n' | "$bin_dir/tee" -a "$work_dir/tee-append" > "$work_dir/actual"
+printf 'before\nafter\n' > "$work_dir/expected"
+cmp "$work_dir/tee-append" "$work_dir/expected" || fail 'tee append output differs'
+
+(
+    cd "$work_dir"
+    printf 'dash target\n' | "$bin_dir/tee" -- -output >/dev/null
+)
+printf 'dash target\n' > "$work_dir/expected"
+cmp "$work_dir/-output" "$work_dir/expected" || fail 'tee -- target differs'
+if printf 'error path\n' | "$bin_dir/tee" "$work_dir/missing/target" >"$work_dir/actual" 2>/dev/null; then
+    fail 'tee accepted an unopenable output'
+fi
+printf 'error path\n' > "$work_dir/expected"
+cmp "$work_dir/actual" "$work_dir/expected" || fail 'tee lost stdout after an output-open error'
+
 printf 'all coreutils smoke tests passed\n'
