@@ -953,6 +953,11 @@ cmp "$work_dir/actual" "$work_dir/expected" || fail 'ls multiple-directory opera
 LC_ALL=C "$bin_dir/ls" -d1 "$work_dir/ls-second-directory" "$work_dir/ls-tree/subdirectory" > "$work_dir/actual"
 LC_ALL=C /usr/bin/ls -d1 "$work_dir/ls-second-directory" "$work_dir/ls-tree/subdirectory" > "$work_dir/expected"
 cmp "$work_dir/actual" "$work_dir/expected" || fail 'ls -d multiple operands differ'
+for ls_flags in '-ln --full-time' '-lin --full-time' '-lsn --full-time'; do
+    TZ=UTC0 LC_ALL=C "$bin_dir/ls" $ls_flags "$work_dir/ls-tree" > "$work_dir/actual"
+    TZ=UTC0 LC_ALL=C /usr/bin/ls $ls_flags "$work_dir/ls-tree" > "$work_dir/expected"
+    cmp "$work_dir/actual" "$work_dir/expected" || fail "ls $ls_flags long output differs"
+done
 if "$bin_dir/ls" "$work_dir/ls-missing" >/dev/null 2>&1; then
     fail 'ls accepted a missing operand'
 fi
