@@ -30,6 +30,7 @@ Initial utilities:
 - `mkfifo`: named-pipe creation with chmod-style modes and security-context flags
 - `sync`: global, per-file data, and per-filesystem cache synchronization
 - `cp`: regular-file copies, multiple sources, target directories, hard links, updates, and metadata preservation
+- `mv`: atomic renames and exchanges, multiple sources, target directories, no-clobber, and updates
 
 Build all utilities with the self-hosted compiler:
 

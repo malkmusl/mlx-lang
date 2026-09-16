@@ -685,6 +685,39 @@ printf 'keep\n' > "$work_dir/cp-no-clobber"
 if "$bin_dir/cp" "$work_dir/cp-source" "$work_dir/cp-source" >/dev/null 2>&1; then
     fail 'cp accepted identical source and destination'
 fi
+if "$bin_dir/cp" --target-directory= "$work_dir/cp-source" >/dev/null 2>&1; then
+    fail 'cp accepted an empty target directory'
+fi
+
+printf 'move payload\n' > "$work_dir/mv-source"
+"$bin_dir/mv" "$work_dir/mv-source" "$work_dir/mv-target"
+[[ ! -e "$work_dir/mv-source" && "$(cat "$work_dir/mv-target")" == 'move payload' ]] || fail 'mv basic rename differs'
+mkdir "$work_dir/mv-directory"
+printf 'first\n' > "$work_dir/mv-first"
+printf 'second\n' > "$work_dir/mv-second"
+"$bin_dir/mv" "$work_dir/mv-first" "$work_dir/mv-second" "$work_dir/mv-directory"
+[[ "$(cat "$work_dir/mv-directory/mv-first")" == first ]] || fail 'mv first directory target differs'
+[[ "$(cat "$work_dir/mv-directory/mv-second")" == second ]] || fail 'mv second directory target differs'
+printf 'source\n' > "$work_dir/mv-no-clobber-source"
+printf 'destination\n' > "$work_dir/mv-no-clobber-target"
+"$bin_dir/mv" -n "$work_dir/mv-no-clobber-source" "$work_dir/mv-no-clobber-target"
+[[ -e "$work_dir/mv-no-clobber-source" && "$(cat "$work_dir/mv-no-clobber-target")" == destination ]] || fail 'mv -n overwrote a destination'
+printf 'older source\n' > "$work_dir/mv-update-source"
+printf 'newer destination\n' > "$work_dir/mv-update-target"
+/usr/bin/touch -d @90 "$work_dir/mv-update-source"
+/usr/bin/touch -d @100 "$work_dir/mv-update-target"
+"$bin_dir/mv" -u "$work_dir/mv-update-source" "$work_dir/mv-update-target"
+[[ -e "$work_dir/mv-update-source" && "$(cat "$work_dir/mv-update-target")" == 'newer destination' ]] || fail 'mv -u replaced a newer destination'
+printf 'left\n' > "$work_dir/mv-exchange-left"
+printf 'right\n' > "$work_dir/mv-exchange-right"
+"$bin_dir/mv" --exchange "$work_dir/mv-exchange-left" "$work_dir/mv-exchange-right"
+[[ "$(cat "$work_dir/mv-exchange-left")" == right && "$(cat "$work_dir/mv-exchange-right")" == left ]] || fail 'mv --exchange did not swap paths'
+if "$bin_dir/mv" "$work_dir/mv-target" "$work_dir/mv-target" >/dev/null 2>&1; then
+    fail 'mv accepted identical source and destination'
+fi
+if "$bin_dir/mv" --target-directory= "$work_dir/mv-target" >/dev/null 2>&1; then
+    fail 'mv accepted an empty target directory'
+fi
 
 printf 'sync payload\n' > "$work_dir/sync-file"
 "$bin_dir/sync"
