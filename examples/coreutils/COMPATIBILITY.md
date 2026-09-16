@@ -34,8 +34,10 @@ their `/usr/bin` counterparts.
 | `cp` | partial | recursive trees, symlink policies, backups, sparse/reflink copies, ownership, xattrs, ACLs, and interactive mode |
 | `mv` | partial | cross-filesystem copy fallback, backups, interactive mode, full update modes, and native context assignment |
 | `rm` | partial | unwritable-file terminal prompts, `--preserve-root=all` parent-device checks, and exact GNU interactive directory wording |
-| `ln` | partial | canonicalized `--relative` links, numbered/existing backup policies, and atomic replacement without backups |
+| `ln` | partial | numbered/existing backup policies and atomic replacement without backups |
 | `chmod` | partial | recursive `-L` cycle-safe traversal, recursive `--dereference` of encountered symlinks, and exact verbose diagnostics |
+| `readlink` | complete | exact POSIXLY_CORRECT diagnostic defaults and the multiple-file `-n` warning |
+| `realpath` | complete | paths are currently bounded to 64 KiB and exact platform-specific diagnostics differ |
 
 “Complete” means the documented option surface is implemented and covered by
 the current parity suite. It does not claim locale, filesystem, or kernel
@@ -44,6 +46,5 @@ behaviors that cannot be exercised on the development host.
 ## Utilities not implemented yet
 
 The installed GNU 9.11 suite contains 103 command names. Implementation now
-proceeds through the remaining filesystem tools (`chown`, `stat`, `readlink`,
-`realpath`, `ls`), then
+proceeds through the remaining filesystem tools (`chown`, `stat`, `ls`), then
 text/data tools, checksums, and the remaining system/account utilities.

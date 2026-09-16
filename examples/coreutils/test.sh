@@ -810,6 +810,47 @@ ln -s "$work_dir/chmod-linked-directory" "$work_dir/chmod-directory-link"
 "$bin_dir/chmod" -RH 700 "$work_dir/chmod-directory-link"
 [[ "$(stat -c %a "$work_dir/chmod-linked-directory")" == 700 && "$(stat -c %a "$work_dir/chmod-linked-directory/file")" == 700 ]] || fail 'chmod -H did not traverse a command-line symlink'
 
+mkdir -p "$work_dir/path-base/real/subdirectory" "$work_dir/path-base/other"
+printf 'resolved\n' > "$work_dir/path-base/real/file"
+ln -s real "$work_dir/path-base/link"
+ln -s ../real/file "$work_dir/path-base/other/relative-link"
+[[ "$("$bin_dir/readlink" "$work_dir/path-base/link")" == real ]] || fail 'readlink raw target differs'
+"$bin_dir/readlink" -n "$work_dir/path-base/link" > "$work_dir/readlink-no-newline"
+[[ "$(wc -c < "$work_dir/readlink-no-newline")" == 4 ]] || fail 'readlink -n wrote a delimiter'
+"$bin_dir/readlink" -z "$work_dir/path-base/link" > "$work_dir/readlink-zero"
+printf 'real\0' > "$work_dir/readlink-zero-expected"
+cmp "$work_dir/readlink-zero" "$work_dir/readlink-zero-expected" || fail 'readlink -z delimiter differs'
+"$bin_dir/readlink" -f "$work_dir/path-base/link/subdirectory/../file" > "$work_dir/actual"
+/usr/bin/readlink -f "$work_dir/path-base/link/subdirectory/../file" > "$work_dir/expected"
+cmp "$work_dir/actual" "$work_dir/expected" || fail 'readlink -f canonical path differs'
+if "$bin_dir/readlink" -e "$work_dir/path-base/link/missing" >/dev/null; then
+    fail 'readlink -e accepted a missing component'
+fi
+"$bin_dir/readlink" -m "$work_dir/path-base/missing/../future" > "$work_dir/actual"
+/usr/bin/readlink -m "$work_dir/path-base/missing/../future" > "$work_dir/expected"
+cmp "$work_dir/actual" "$work_dir/expected" || fail 'readlink -m missing path differs'
+"$bin_dir/realpath" "$work_dir/path-base/other/relative-link" > "$work_dir/actual"
+/usr/bin/realpath "$work_dir/path-base/other/relative-link" > "$work_dir/expected"
+cmp "$work_dir/actual" "$work_dir/expected" || fail 'realpath symlink resolution differs'
+"$bin_dir/realpath" --relative-to="$work_dir/path-base/real/subdirectory" "$work_dir/path-base/other/relative-link" > "$work_dir/actual"
+/usr/bin/realpath --relative-to="$work_dir/path-base/real/subdirectory" "$work_dir/path-base/other/relative-link" > "$work_dir/expected"
+cmp "$work_dir/actual" "$work_dir/expected" || fail 'realpath --relative-to differs'
+"$bin_dir/realpath" --relative-base="$work_dir/path-base" "$work_dir/path-base/other/relative-link" > "$work_dir/actual"
+/usr/bin/realpath --relative-base="$work_dir/path-base" "$work_dir/path-base/other/relative-link" > "$work_dir/expected"
+cmp "$work_dir/actual" "$work_dir/expected" || fail 'realpath --relative-base differs'
+ln -s real/subdirectory "$work_dir/path-base/deep-link"
+"$bin_dir/realpath" -L "$work_dir/path-base/deep-link/../other" > "$work_dir/actual"
+/usr/bin/realpath -L "$work_dir/path-base/deep-link/../other" > "$work_dir/expected"
+cmp "$work_dir/actual" "$work_dir/expected" || fail 'realpath -L ordering differs'
+"$bin_dir/realpath" -s "$work_dir/path-base/link/missing" > "$work_dir/actual"
+/usr/bin/realpath -s "$work_dir/path-base/link/missing" > "$work_dir/expected"
+cmp "$work_dir/actual" "$work_dir/expected" || fail 'realpath -s lexical path differs'
+mkdir -p "$work_dir/ln-relative/source" "$work_dir/ln-relative/destination/deep"
+printf 'relative\n' > "$work_dir/ln-relative/source/file"
+"$bin_dir/ln" -sr "$work_dir/ln-relative/source/file" "$work_dir/ln-relative/destination/deep/link"
+[[ "$(readlink "$work_dir/ln-relative/destination/deep/link")" == ../../source/file ]] || fail 'ln -r target differs'
+[[ "$(cat "$work_dir/ln-relative/destination/deep/link")" == relative ]] || fail 'ln -r did not resolve to the source'
+
 printf 'sync payload\n' > "$work_dir/sync-file"
 "$bin_dir/sync"
 "$bin_dir/sync" "$work_dir/sync-file"

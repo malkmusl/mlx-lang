@@ -34,6 +34,8 @@ Initial utilities:
 - `rm`: fd-relative recursive removal, interactive policies, filesystem boundaries, and root preservation
 - `ln`: hard and symbolic links, logical/physical sources, target directories, replacement, and backups
 - `chmod`: numeric/symbolic/reference modes, recursive traversal, reporting, and symlink policies
+- `readlink`: raw targets, canonicalization policies, quiet/verbose output, and NUL delimiters
+- `realpath`: physical/logical/lexical resolution and relative-to/base output
 
 Build all utilities with the self-hosted compiler:
 
