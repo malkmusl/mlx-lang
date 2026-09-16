@@ -920,6 +920,9 @@ printf 'run\n' > "$work_dir/ls-tree/executable"
 chmod 755 "$work_dir/ls-tree/executable"
 ln -s alpha.txt "$work_dir/ls-tree/link"
 printf 'nested\n' > "$work_dir/ls-tree/subdirectory/nested"
+printf 'two\n' > "$work_dir/ls-tree/version2"
+printf 'ten ten\n' > "$work_dir/ls-tree/version10"
+printf 'backup\n' > "$work_dir/ls-tree/ignored~"
 for ls_flags in -1 -a1 -A1 -r1 -F1 -p1 -S1 -X1 -v1 -R1; do
     LC_ALL=C "$bin_dir/ls" "$ls_flags" "$work_dir/ls-tree" > "$work_dir/actual"
     LC_ALL=C /usr/bin/ls "$ls_flags" "$work_dir/ls-tree" > "$work_dir/expected"
@@ -931,6 +934,25 @@ cmp "$work_dir/actual" "$work_dir/expected" || fail 'ls -d output differs'
 LC_ALL=C "$bin_dir/ls" --zero "$work_dir/ls-tree" > "$work_dir/actual"
 LC_ALL=C /usr/bin/ls --zero "$work_dir/ls-tree" > "$work_dir/expected"
 cmp "$work_dir/actual" "$work_dir/expected" || fail 'ls --zero output differs'
+for ls_flags in '-B1' '--group-directories-first'; do
+    LC_ALL=C "$bin_dir/ls" $ls_flags "$work_dir/ls-tree" > "$work_dir/actual"
+    LC_ALL=C /usr/bin/ls $ls_flags "$work_dir/ls-tree" > "$work_dir/expected"
+    cmp "$work_dir/actual" "$work_dir/expected" || fail "ls $ls_flags output differs"
+done
+mkdir "$work_dir/ls-second-directory"
+printf 'second\n' > "$work_dir/ls-second-directory/item"
+LC_ALL=C "$bin_dir/ls" -1 "$work_dir/ls-tree/version10" "$work_dir/ls-tree/alpha.txt" > "$work_dir/actual"
+LC_ALL=C /usr/bin/ls -1 "$work_dir/ls-tree/version10" "$work_dir/ls-tree/alpha.txt" > "$work_dir/expected"
+cmp "$work_dir/actual" "$work_dir/expected" || fail 'ls multiple-file operand sorting differs'
+LC_ALL=C "$bin_dir/ls" -1 "$work_dir/ls-tree/version10" "$work_dir/ls-tree/subdirectory" > "$work_dir/actual"
+LC_ALL=C /usr/bin/ls -1 "$work_dir/ls-tree/version10" "$work_dir/ls-tree/subdirectory" > "$work_dir/expected"
+cmp "$work_dir/actual" "$work_dir/expected" || fail 'ls mixed file/directory operands differ'
+LC_ALL=C "$bin_dir/ls" -1 "$work_dir/ls-second-directory" "$work_dir/ls-tree/subdirectory" > "$work_dir/actual"
+LC_ALL=C /usr/bin/ls -1 "$work_dir/ls-second-directory" "$work_dir/ls-tree/subdirectory" > "$work_dir/expected"
+cmp "$work_dir/actual" "$work_dir/expected" || fail 'ls multiple-directory operands differ'
+LC_ALL=C "$bin_dir/ls" -d1 "$work_dir/ls-second-directory" "$work_dir/ls-tree/subdirectory" > "$work_dir/actual"
+LC_ALL=C /usr/bin/ls -d1 "$work_dir/ls-second-directory" "$work_dir/ls-tree/subdirectory" > "$work_dir/expected"
+cmp "$work_dir/actual" "$work_dir/expected" || fail 'ls -d multiple operands differ'
 if "$bin_dir/ls" "$work_dir/ls-missing" >/dev/null 2>&1; then
     fail 'ls accepted a missing operand'
 fi
