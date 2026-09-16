@@ -38,6 +38,7 @@ Initial utilities:
 - `realpath`: physical/logical/lexical resolution and relative-to/base output
 - `chown`, `chgrp`: numeric and named identities, filters, references, symlinks, and recursive traversal
 - `stat`: file, symlink, birth-time, identity, device, and filesystem metadata with custom formats
+- `ls`: owned directory scans, hidden-entry policies, type indicators, recursive traversal, and name/size/time/extension/version sorting
 
 Build all utilities with the self-hosted compiler:
 

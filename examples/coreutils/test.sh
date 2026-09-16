@@ -912,4 +912,27 @@ if "$bin_dir/stat" "$work_dir/stat-missing" >/dev/null 2>&1; then
     fail 'stat accepted a missing file'
 fi
 
+mkdir -p "$work_dir/ls-tree/subdirectory"
+printf 'a\n' > "$work_dir/ls-tree/alpha.txt"
+printf 'bbbb\n' > "$work_dir/ls-tree/beta.log"
+printf 'hidden\n' > "$work_dir/ls-tree/.hidden"
+printf 'run\n' > "$work_dir/ls-tree/executable"
+chmod 755 "$work_dir/ls-tree/executable"
+ln -s alpha.txt "$work_dir/ls-tree/link"
+printf 'nested\n' > "$work_dir/ls-tree/subdirectory/nested"
+for ls_flags in -1 -a1 -A1 -r1 -F1 -p1 -S1 -X1 -v1 -R1; do
+    LC_ALL=C "$bin_dir/ls" "$ls_flags" "$work_dir/ls-tree" > "$work_dir/actual"
+    LC_ALL=C /usr/bin/ls "$ls_flags" "$work_dir/ls-tree" > "$work_dir/expected"
+    cmp "$work_dir/actual" "$work_dir/expected" || fail "ls $ls_flags output differs"
+done
+LC_ALL=C "$bin_dir/ls" -d1 "$work_dir/ls-tree" > "$work_dir/actual"
+LC_ALL=C /usr/bin/ls -d1 "$work_dir/ls-tree" > "$work_dir/expected"
+cmp "$work_dir/actual" "$work_dir/expected" || fail 'ls -d output differs'
+LC_ALL=C "$bin_dir/ls" --zero "$work_dir/ls-tree" > "$work_dir/actual"
+LC_ALL=C /usr/bin/ls --zero "$work_dir/ls-tree" > "$work_dir/expected"
+cmp "$work_dir/actual" "$work_dir/expected" || fail 'ls --zero output differs'
+if "$bin_dir/ls" "$work_dir/ls-missing" >/dev/null 2>&1; then
+    fail 'ls accepted a missing operand'
+fi
+
 printf 'all coreutils smoke tests passed\n'

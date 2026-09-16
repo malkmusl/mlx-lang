@@ -40,6 +40,7 @@ their `/usr/bin` counterparts.
 | `realpath` | complete | paths are currently bounded to 64 KiB and exact platform-specific diagnostics differ |
 | `chown`, `chgrp` | partial | recursive `-L` cycle-safe traversal, recursive dereference of encountered symlinks, and NSS sources beyond local passwd/group files |
 | `stat` | partial | locale-aware human timestamps, mount-point discovery, SELinux contexts, printf width/precision flags, and exact `--cached` synchronization policy |
+| `ls` | partial | aligned long listings, terminal-aware columns/color/hyperlinks, full quoting/glob ignores, time styles, block scaling, multi-operand grouping, and recursive symlink cycle detection |
 
 “Complete” means the documented option surface is implemented and covered by
 the current parity suite. It does not claim locale, filesystem, or kernel
@@ -47,6 +48,6 @@ behaviors that cannot be exercised on the development host.
 
 ## Utilities not implemented yet
 
-The installed GNU 9.11 suite contains 103 command names. Implementation now
-proceeds through the remaining filesystem tool (`ls`), then
+The installed GNU 9.11 suite contains 103 command names. The initial
+filesystem-tool pass is complete; implementation now proceeds through
 text/data tools, checksums, and the remaining system/account utilities.
