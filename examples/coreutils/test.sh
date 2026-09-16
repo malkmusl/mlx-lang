@@ -781,6 +781,35 @@ if "$bin_dir/ln" -f "$work_dir/ln-source" "$work_dir/ln-source" >/dev/null 2>&1;
     fail 'ln -f accepted identical source and destination'
 fi
 
+printf 'mode\n' > "$work_dir/chmod-file"
+chmod 640 "$work_dir/chmod-file"
+"$bin_dir/chmod" 600 "$work_dir/chmod-file"
+[[ "$(stat -c %a "$work_dir/chmod-file")" == 600 ]] || fail 'chmod numeric mode differs'
+"$bin_dir/chmod" 'u+x,g=u,o=' "$work_dir/chmod-file"
+[[ "$(stat -c %a "$work_dir/chmod-file")" == 770 ]] || fail 'chmod symbolic copy mode differs'
+chmod 600 "$work_dir/chmod-file"
+"$bin_dir/chmod" +110 "$work_dir/chmod-file"
+[[ "$(stat -c %a "$work_dir/chmod-file")" == 710 ]] || fail 'chmod symbolic numeric operation differs'
+printf 'reference\n' > "$work_dir/chmod-reference"
+chmod 754 "$work_dir/chmod-reference"
+"$bin_dir/chmod" --reference="$work_dir/chmod-reference" "$work_dir/chmod-file"
+[[ "$(stat -c %a "$work_dir/chmod-file")" == 754 ]] || fail 'chmod reference mode differs'
+mkdir -p "$work_dir/chmod-tree/first/second"
+printf 'leaf\n' > "$work_dir/chmod-tree/first/second/file"
+chmod -R 777 "$work_dir/chmod-tree"
+"$bin_dir/chmod" -R 'a=,u=rwX' "$work_dir/chmod-tree"
+[[ "$(stat -c %a "$work_dir/chmod-tree")" == 700 && "$(stat -c %a "$work_dir/chmod-tree/first/second")" == 700 ]] || fail 'chmod recursive directory mode differs'
+[[ "$(stat -c %a "$work_dir/chmod-tree/first/second/file")" == 600 ]] || fail 'chmod recursive X handling differs'
+mkdir "$work_dir/chmod-linked-directory"
+printf 'linked\n' > "$work_dir/chmod-linked-directory/file"
+chmod 755 "$work_dir/chmod-linked-directory"
+chmod 644 "$work_dir/chmod-linked-directory/file"
+ln -s "$work_dir/chmod-linked-directory" "$work_dir/chmod-directory-link"
+"$bin_dir/chmod" -RP 700 "$work_dir/chmod-directory-link"
+[[ "$(stat -c %a "$work_dir/chmod-linked-directory")" == 755 && "$(stat -c %a "$work_dir/chmod-linked-directory/file")" == 644 ]] || fail 'chmod -P traversed a command-line symlink'
+"$bin_dir/chmod" -RH 700 "$work_dir/chmod-directory-link"
+[[ "$(stat -c %a "$work_dir/chmod-linked-directory")" == 700 && "$(stat -c %a "$work_dir/chmod-linked-directory/file")" == 700 ]] || fail 'chmod -H did not traverse a command-line symlink'
+
 printf 'sync payload\n' > "$work_dir/sync-file"
 "$bin_dir/sync"
 "$bin_dir/sync" "$work_dir/sync-file"

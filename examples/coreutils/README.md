@@ -33,6 +33,7 @@ Initial utilities:
 - `mv`: atomic renames and exchanges, multiple sources, target directories, no-clobber, and updates
 - `rm`: fd-relative recursive removal, interactive policies, filesystem boundaries, and root preservation
 - `ln`: hard and symbolic links, logical/physical sources, target directories, replacement, and backups
+- `chmod`: numeric/symbolic/reference modes, recursive traversal, reporting, and symlink policies
 
 Build all utilities with the self-hosted compiler:
 
