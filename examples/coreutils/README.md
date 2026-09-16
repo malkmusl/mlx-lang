@@ -36,6 +36,7 @@ Initial utilities:
 - `chmod`: numeric/symbolic/reference modes, recursive traversal, reporting, and symlink policies
 - `readlink`: raw targets, canonicalization policies, quiet/verbose output, and NUL delimiters
 - `realpath`: physical/logical/lexical resolution and relative-to/base output
+- `chown`, `chgrp`: numeric and named identities, filters, references, symlinks, and recursive traversal
 
 Build all utilities with the self-hosted compiler:
 

@@ -851,6 +851,32 @@ printf 'relative\n' > "$work_dir/ln-relative/source/file"
 [[ "$(readlink "$work_dir/ln-relative/destination/deep/link")" == ../../source/file ]] || fail 'ln -r target differs'
 [[ "$(cat "$work_dir/ln-relative/destination/deep/link")" == relative ]] || fail 'ln -r did not resolve to the source'
 
+owner_uid=$(id -u)
+owner_gid=$(id -g)
+owner_name=$(id -un)
+group_name=$(id -gn)
+printf 'ownership\n' > "$work_dir/chown-file"
+"$bin_dir/chown" "$owner_uid:$owner_gid" "$work_dir/chown-file"
+[[ "$(stat -c %u:%g "$work_dir/chown-file")" == "$owner_uid:$owner_gid" ]] || fail 'chown numeric ownership differs'
+"$bin_dir/chown" "$owner_name:$group_name" "$work_dir/chown-file"
+[[ "$(stat -c %u:%g "$work_dir/chown-file")" == "$owner_uid:$owner_gid" ]] || fail 'chown named ownership differs'
+"$bin_dir/chown" "$owner_name:" "$work_dir/chown-file"
+[[ "$(stat -c %u:%g "$work_dir/chown-file")" == "$owner_uid:$owner_gid" ]] || fail 'chown implied login group differs'
+"$bin_dir/chgrp" "$group_name" "$work_dir/chown-file"
+[[ "$(stat -c %g "$work_dir/chown-file")" == "$owner_gid" ]] || fail 'chgrp named group differs'
+printf 'reference\n' > "$work_dir/chown-reference"
+"$bin_dir/chown" --reference="$work_dir/chown-reference" "$work_dir/chown-file"
+[[ "$(stat -c %u:%g "$work_dir/chown-file")" == "$(stat -c %u:%g "$work_dir/chown-reference")" ]] || fail 'chown reference ownership differs'
+"$bin_dir/chown" --from=4294967294:4294967294 "$owner_uid:$owner_gid" "$work_dir/chown-file"
+[[ "$(cat "$work_dir/chown-file")" == ownership ]] || fail 'chown --from modified file contents'
+mkdir -p "$work_dir/chown-tree/first/second"
+printf 'leaf\n' > "$work_dir/chown-tree/first/second/file"
+"$bin_dir/chown" -R "$owner_uid:$owner_gid" "$work_dir/chown-tree"
+[[ "$(stat -c %u:%g "$work_dir/chown-tree/first/second/file")" == "$owner_uid:$owner_gid" ]] || fail 'chown recursive ownership differs'
+ln -s "$work_dir/chown-file" "$work_dir/chown-link"
+"$bin_dir/chown" -h "$owner_uid:$owner_gid" "$work_dir/chown-link"
+[[ "$(stat -c %u:%g "$work_dir/chown-link")" == "$owner_uid:$owner_gid" ]] || fail 'chown -h symlink ownership differs'
+
 printf 'sync payload\n' > "$work_dir/sync-file"
 "$bin_dir/sync"
 "$bin_dir/sync" "$work_dir/sync-file"
