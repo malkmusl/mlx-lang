@@ -750,6 +750,37 @@ if "$bin_dir/rm" "$work_dir/rm-once/." >/dev/null 2>&1; then
     fail 'rm accepted a final dot component'
 fi
 
+printf 'link payload\n' > "$work_dir/ln-source"
+"$bin_dir/ln" "$work_dir/ln-source" "$work_dir/ln-hard"
+[[ "$(stat -c %i "$work_dir/ln-source")" == "$(stat -c %i "$work_dir/ln-hard")" ]] || fail 'ln did not create a hard link'
+"$bin_dir/ln" -s "$work_dir/ln-source" "$work_dir/ln-symbolic"
+[[ "$(readlink "$work_dir/ln-symbolic")" == "$work_dir/ln-source" ]] || fail 'ln -s target differs'
+mkdir "$work_dir/ln-directory"
+printf 'first\n' > "$work_dir/ln-first"
+printf 'second\n' > "$work_dir/ln-second"
+"$bin_dir/ln" "$work_dir/ln-first" "$work_dir/ln-second" "$work_dir/ln-directory"
+[[ "$(stat -c %i "$work_dir/ln-first")" == "$(stat -c %i "$work_dir/ln-directory/ln-first")" ]] || fail 'ln first directory target differs'
+[[ "$(stat -c %i "$work_dir/ln-second")" == "$(stat -c %i "$work_dir/ln-directory/ln-second")" ]] || fail 'ln second directory target differs'
+printf 'replace me\n' > "$work_dir/ln-force"
+"$bin_dir/ln" -sf "$work_dir/ln-source" "$work_dir/ln-force"
+[[ "$(readlink "$work_dir/ln-force")" == "$work_dir/ln-source" ]] || fail 'ln -f did not replace the destination'
+printf 'back me up\n' > "$work_dir/ln-backup"
+"$bin_dir/ln" -sfbS .old "$work_dir/ln-source" "$work_dir/ln-backup"
+[[ "$(cat "$work_dir/ln-backup.old")" == 'back me up' ]] || fail 'ln backup contents differ'
+ln -s "$work_dir/ln-source" "$work_dir/ln-source-link"
+"$bin_dir/ln" -P "$work_dir/ln-source-link" "$work_dir/ln-physical"
+"$bin_dir/ln" -L "$work_dir/ln-source-link" "$work_dir/ln-logical"
+[[ "$(stat -c %i "$work_dir/ln-source-link")" == "$(stat -c %i "$work_dir/ln-physical")" ]] || fail 'ln -P followed a symbolic source'
+[[ "$(stat -Lc %i "$work_dir/ln-source-link")" == "$(stat -c %i "$work_dir/ln-logical")" ]] || fail 'ln -L did not follow a symbolic source'
+printf 'keep\n' > "$work_dir/ln-interactive"
+if printf 'n\n' | "$bin_dir/ln" -si "$work_dir/ln-source" "$work_dir/ln-interactive" >/dev/null 2>/dev/null; then
+    fail 'ln -i reported success after a rejected replacement'
+fi
+[[ "$(cat "$work_dir/ln-interactive")" == keep ]] || fail 'ln -i replaced a rejected destination'
+if "$bin_dir/ln" -f "$work_dir/ln-source" "$work_dir/ln-source" >/dev/null 2>&1; then
+    fail 'ln -f accepted identical source and destination'
+fi
+
 printf 'sync payload\n' > "$work_dir/sync-file"
 "$bin_dir/sync"
 "$bin_dir/sync" "$work_dir/sync-file"
