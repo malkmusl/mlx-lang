@@ -958,6 +958,31 @@ for ls_flags in '-ln --full-time' '-lin --full-time' '-lsn --full-time'; do
     TZ=UTC0 LC_ALL=C /usr/bin/ls $ls_flags "$work_dir/ls-tree" > "$work_dir/expected"
     cmp "$work_dir/actual" "$work_dir/expected" || fail "ls $ls_flags long output differs"
 done
+for ls_flags in '-l --full-time' '-lg --full-time' '-lo --full-time' '-lG --full-time' '-l --author --full-time'; do
+    TZ=UTC0 LC_ALL=C "$bin_dir/ls" $ls_flags "$work_dir/ls-tree" > "$work_dir/actual"
+    TZ=UTC0 LC_ALL=C /usr/bin/ls $ls_flags "$work_dir/ls-tree" > "$work_dir/expected"
+    cmp "$work_dir/actual" "$work_dir/expected" || fail "ls $ls_flags identity output differs"
+done
+mkdir "$work_dir/ls-sizes"
+truncate -s 1 "$work_dir/ls-sizes/a"
+truncate -s 1024 "$work_dir/ls-sizes/b"
+truncate -s 1025 "$work_dir/ls-sizes/c"
+truncate -s 9999 "$work_dir/ls-sizes/d"
+truncate -s 1048576 "$work_dir/ls-sizes/e"
+for ls_flags in '-ln --time-style=long-iso' '-ln --time-style=iso' '-ln --time-style=+%Y/%m/%d-%H:%M:%S' '-lhn --time-style=long-iso' '-ln --si --time-style=long-iso' '-ln --block-size=K --time-style=long-iso' '-ln --block-size=1000 --time-style=long-iso' '-ln --time=birth --time-style=full-iso'; do
+    TZ=UTC0 LC_ALL=C "$bin_dir/ls" $ls_flags "$work_dir/ls-sizes" > "$work_dir/actual"
+    TZ=UTC0 LC_ALL=C /usr/bin/ls $ls_flags "$work_dir/ls-sizes" > "$work_dir/expected"
+    cmp "$work_dir/actual" "$work_dir/expected" || fail "ls $ls_flags size/time output differs"
+done
+touch -a -d '2020-01-02 03:04:05 UTC' "$work_dir/ls-sizes/a"
+for ls_flags in '-ln --time=atime --time-style=full-iso' '-ln --time=ctime --time-style=full-iso' '-tu1' '-tc1'; do
+    TZ=UTC0 LC_ALL=C "$bin_dir/ls" $ls_flags "$work_dir/ls-sizes" > "$work_dir/actual"
+    TZ=UTC0 LC_ALL=C /usr/bin/ls $ls_flags "$work_dir/ls-sizes" > "$work_dir/expected"
+    cmp "$work_dir/actual" "$work_dir/expected" || fail "ls $ls_flags selected time differs"
+done
+TZ=America/New_York LC_ALL=C "$bin_dir/ls" -ln --time-style=full-iso "$work_dir/ls-sizes" > "$work_dir/actual"
+TZ=America/New_York LC_ALL=C /usr/bin/ls -ln --time-style=full-iso "$work_dir/ls-sizes" > "$work_dir/expected"
+cmp "$work_dir/actual" "$work_dir/expected" || fail 'ls named timezone output differs'
 mkdir "$work_dir/ls-format"
 touch "$work_dir/ls-format/a" "$work_dir/ls-format/bb" "$work_dir/ls-format/cccc" "$work_dir/ls-format/ddddd" "$work_dir/ls-format/eeeeee"
 for ls_flags in '-Cw 14' '-xw 14' '-mw 14' '--format=vertical --width=14' '--format=horizontal --width=14' '--format=commas --width=14'; do
