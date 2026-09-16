@@ -889,4 +889,27 @@ if "$bin_dir/sync" -d -f "$work_dir/sync-file" >/dev/null 2>&1; then
     fail 'sync accepted mutually exclusive modes'
 fi
 
+printf 'stat payload\n' > "$work_dir/stat-file"
+chmod 6754 "$work_dir/stat-file"
+ln -s stat-file "$work_dir/stat-link"
+stat_format='%a|%A|%b|%B|%d|%D|%Hd|%Ld|%f|%F|%g|%G|%h|%i|%n|%o|%s|%r|%R|%Hr|%Lr|%t|%T|%u|%U|%W|%X|%Y|%Z'
+LC_ALL=C "$bin_dir/stat" -c "$stat_format" "$work_dir/stat-file" > "$work_dir/actual"
+LC_ALL=C /usr/bin/stat -c "$stat_format" "$work_dir/stat-file" > "$work_dir/expected"
+cmp "$work_dir/actual" "$work_dir/expected" || fail 'stat numeric format output differs'
+LC_ALL=C "$bin_dir/stat" -c '%a|%A|%F|%N' "$work_dir/stat-link" > "$work_dir/actual"
+LC_ALL=C /usr/bin/stat -c '%a|%A|%F|%N' "$work_dir/stat-link" > "$work_dir/expected"
+cmp "$work_dir/actual" "$work_dir/expected" || fail 'stat symbolic-link output differs'
+LC_ALL=C "$bin_dir/stat" -Lc '%a|%A|%F|%N' "$work_dir/stat-link" > "$work_dir/actual"
+LC_ALL=C /usr/bin/stat -Lc '%a|%A|%F|%N' "$work_dir/stat-link" > "$work_dir/expected"
+cmp "$work_dir/actual" "$work_dir/expected" || fail 'stat -L output differs'
+LC_ALL=C "$bin_dir/stat" -f -c '%l|%s|%S|%t|%T' "$work_dir/stat-file" > "$work_dir/actual"
+LC_ALL=C /usr/bin/stat -f -c '%l|%s|%S|%t|%T' "$work_dir/stat-file" > "$work_dir/expected"
+cmp "$work_dir/actual" "$work_dir/expected" || fail 'stat file-system format output differs'
+"$bin_dir/stat" --printf='name=%n\\nsize=%s\\t%%\n' "$work_dir/stat-file" > "$work_dir/actual"
+/usr/bin/stat --printf='name=%n\\nsize=%s\\t%%\n' "$work_dir/stat-file" > "$work_dir/expected"
+cmp "$work_dir/actual" "$work_dir/expected" || fail 'stat --printf escapes differ'
+if "$bin_dir/stat" "$work_dir/stat-missing" >/dev/null 2>&1; then
+    fail 'stat accepted a missing file'
+fi
+
 printf 'all coreutils smoke tests passed\n'
