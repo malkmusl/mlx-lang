@@ -958,6 +958,27 @@ for ls_flags in '-ln --full-time' '-lin --full-time' '-lsn --full-time'; do
     TZ=UTC0 LC_ALL=C /usr/bin/ls $ls_flags "$work_dir/ls-tree" > "$work_dir/expected"
     cmp "$work_dir/actual" "$work_dir/expected" || fail "ls $ls_flags long output differs"
 done
+mkdir "$work_dir/ls-format"
+touch "$work_dir/ls-format/a" "$work_dir/ls-format/bb" "$work_dir/ls-format/cccc" "$work_dir/ls-format/ddddd" "$work_dir/ls-format/eeeeee"
+for ls_flags in '-Cw 14' '-xw 14' '-mw 14' '--format=vertical --width=14' '--format=horizontal --width=14' '--format=commas --width=14'; do
+    LC_ALL=C "$bin_dir/ls" $ls_flags "$work_dir/ls-format" > "$work_dir/actual"
+    LC_ALL=C /usr/bin/ls $ls_flags "$work_dir/ls-format" > "$work_dir/expected"
+    cmp "$work_dir/actual" "$work_dir/expected" || fail "ls $ls_flags layout differs"
+done
+mkdir "$work_dir/ls-filter"
+touch "$work_dir/ls-filter/keep.c" "$work_dir/ls-filter/skip.o" "$work_dir/ls-filter/skip.tmp" "$work_dir/ls-filter/skip~"
+for ls_flags in '--ignore=*.o -1' '-I*.o -1' '--hide=*.tmp -1' '--ignore=skip? -1'; do
+    LC_ALL=C "$bin_dir/ls" $ls_flags "$work_dir/ls-filter" > "$work_dir/actual"
+    LC_ALL=C /usr/bin/ls $ls_flags "$work_dir/ls-filter" > "$work_dir/expected"
+    cmp "$work_dir/actual" "$work_dir/expected" || fail "ls $ls_flags filtering differs"
+done
+mkdir "$work_dir/ls-quote"
+touch "$work_dir/ls-quote/ordinary" "$work_dir/ls-quote/with space" "$work_dir/ls-quote/back\\slash" "$work_dir/ls-quote/"$'tab\tname'
+for ls_flags in '-b1' '-Q1' '-q1' '-N1' '--quoting-style=shell-escape-always -1'; do
+    LC_ALL=C "$bin_dir/ls" $ls_flags "$work_dir/ls-quote" > "$work_dir/actual"
+    LC_ALL=C /usr/bin/ls $ls_flags "$work_dir/ls-quote" > "$work_dir/expected"
+    cmp "$work_dir/actual" "$work_dir/expected" || fail "ls $ls_flags quoting differs"
+done
 if "$bin_dir/ls" "$work_dir/ls-missing" >/dev/null 2>&1; then
     fail 'ls accepted a missing operand'
 fi
