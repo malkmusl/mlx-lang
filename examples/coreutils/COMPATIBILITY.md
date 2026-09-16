@@ -40,7 +40,7 @@ their `/usr/bin` counterparts.
 | `realpath` | complete | paths are currently bounded to 64 KiB and exact platform-specific diagnostics differ |
 | `chown`, `chgrp` | partial | recursive `-L` cycle-safe traversal, recursive dereference of encountered symlinks, and NSS sources beyond local passwd/group files |
 | `stat` | partial | locale-aware human timestamps, mount-point discovery, SELinux contexts, printf width/precision flags, and exact `--cached` synchronization policy |
-| `ls` | partial | aligned long listings, terminal-aware columns/color/hyperlinks, full quoting/glob ignores, time styles, block scaling, multi-operand grouping, and recursive symlink cycle detection |
+| `ls` | partial | local-zone/default time styles, aligned named identities, terminal-aware columns/color/hyperlinks, full quoting/glob ignores, block scaling, and recursive symlink cycle detection |
 
 “Complete” means the documented option surface is implemented and covered by
 the current parity suite. It does not claim locale, filesystem, or kernel
