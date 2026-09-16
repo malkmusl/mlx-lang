@@ -31,6 +31,7 @@ Initial utilities:
 - `sync`: global, per-file data, and per-filesystem cache synchronization
 - `cp`: regular-file copies, multiple sources, target directories, hard links, updates, and metadata preservation
 - `mv`: atomic renames and exchanges, multiple sources, target directories, no-clobber, and updates
+- `rm`: fd-relative recursive removal, interactive policies, filesystem boundaries, and root preservation
 
 Build all utilities with the self-hosted compiler:
 

@@ -719,6 +719,37 @@ if "$bin_dir/mv" --target-directory= "$work_dir/mv-target" >/dev/null 2>&1; then
     fail 'mv accepted an empty target directory'
 fi
 
+printf 'remove me\n' > "$work_dir/rm-file"
+"$bin_dir/rm" "$work_dir/rm-file"
+[[ ! -e "$work_dir/rm-file" ]] || fail 'rm did not remove a regular file'
+"$bin_dir/rm" -f "$work_dir/rm-missing"
+mkdir "$work_dir/rm-empty"
+if "$bin_dir/rm" "$work_dir/rm-empty" >/dev/null 2>&1; then
+    fail 'rm removed a directory without -d or recursion'
+fi
+"$bin_dir/rm" -d "$work_dir/rm-empty"
+[[ ! -e "$work_dir/rm-empty" ]] || fail 'rm -d did not remove an empty directory'
+mkdir -p "$work_dir/rm-tree/first/second"
+printf 'nested\n' > "$work_dir/rm-tree/first/second/file"
+printf 'outside\n' > "$work_dir/rm-outside"
+ln -s "$work_dir/rm-outside" "$work_dir/rm-tree/outside-link"
+"$bin_dir/rm" -rv "$work_dir/rm-tree" > "$work_dir/rm-verbose"
+[[ ! -e "$work_dir/rm-tree" && "$(cat "$work_dir/rm-outside")" == outside ]] || fail 'rm recursive traversal followed a symlink or left the tree'
+grep -q "removed.*rm-tree/first/second/file" "$work_dir/rm-verbose" || fail 'rm -v omitted a removed path'
+printf 'keep\n' > "$work_dir/rm-interactive-no"
+printf 'n\n' | "$bin_dir/rm" -i "$work_dir/rm-interactive-no" 2>/dev/null
+[[ -e "$work_dir/rm-interactive-no" ]] || fail 'rm -i ignored a negative answer'
+printf 'delete\n' > "$work_dir/rm-interactive-yes"
+printf 'y\n' | "$bin_dir/rm" -i "$work_dir/rm-interactive-yes" 2>/dev/null
+[[ ! -e "$work_dir/rm-interactive-yes" ]] || fail 'rm -i ignored an affirmative answer'
+mkdir -p "$work_dir/rm-once/subdirectory"
+printf 'keep\n' > "$work_dir/rm-once/subdirectory/file"
+printf 'n\n' | "$bin_dir/rm" -rI "$work_dir/rm-once" 2>/dev/null
+[[ -e "$work_dir/rm-once/subdirectory/file" ]] || fail 'rm -I ignored a negative batch answer'
+if "$bin_dir/rm" "$work_dir/rm-once/." >/dev/null 2>&1; then
+    fail 'rm accepted a final dot component'
+fi
+
 printf 'sync payload\n' > "$work_dir/sync-file"
 "$bin_dir/sync"
 "$bin_dir/sync" "$work_dir/sync-file"
