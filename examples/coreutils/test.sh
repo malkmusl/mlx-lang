@@ -1004,6 +1004,53 @@ for ls_flags in '-b1' '-Q1' '-q1' '-N1' '--quoting-style=shell-escape-always -1'
     LC_ALL=C /usr/bin/ls $ls_flags "$work_dir/ls-quote" > "$work_dir/expected"
     cmp "$work_dir/actual" "$work_dir/expected" || fail "ls $ls_flags quoting differs"
 done
+touch "$work_dir/ls-format/z z"
+for ls_flags in '--sort=width -1' '--sort=width -r1' '--sort=width -Cw20'; do
+    LC_ALL=C "$bin_dir/ls" $ls_flags "$work_dir/ls-format" > "$work_dir/actual"
+    LC_ALL=C /usr/bin/ls $ls_flags "$work_dir/ls-format" > "$work_dir/expected"
+    cmp "$work_dir/actual" "$work_dir/expected" || fail "ls $ls_flags width sorting differs"
+done
+for block_size in K KB KiB M MB MiB E EB; do
+    LC_ALL=C "$bin_dir/ls" -ln --block-size="$block_size" --time-style=long-iso /etc/passwd > "$work_dir/actual"
+    LC_ALL=C /usr/bin/ls -ln --block-size="$block_size" --time-style=long-iso /etc/passwd > "$work_dir/expected"
+    cmp "$work_dir/actual" "$work_dir/expected" || fail "ls --block-size=$block_size output differs"
+done
+for ls_flags in '--dired --time-style=long-iso' '--dired -l --quoting-style=shell-escape --time-style=long-iso'; do
+    LC_ALL=C "$bin_dir/ls" $ls_flags "$work_dir/ls-quote" > "$work_dir/actual"
+    LC_ALL=C /usr/bin/ls $ls_flags "$work_dir/ls-quote" > "$work_dir/expected"
+    cmp "$work_dir/actual" "$work_dir/expected" || fail "ls $ls_flags dired output differs"
+done
+LS_COLORS='di=31:ex=32:ln=33:*.txt=35' LC_ALL=C "$bin_dir/ls" --color=always -F1 "$work_dir/ls-tree" > "$work_dir/actual"
+LS_COLORS='di=31:ex=32:ln=33:*.txt=35' LC_ALL=C /usr/bin/ls --color=always -F1 "$work_dir/ls-tree" > "$work_dir/expected"
+cmp "$work_dir/actual" "$work_dir/expected" || fail 'ls color output differs'
+LC_ALL=C "$bin_dir/ls" --hyperlink=always -1 "$work_dir/ls-tree" > "$work_dir/actual"
+LC_ALL=C /usr/bin/ls --hyperlink=always -1 "$work_dir/ls-tree" > "$work_dir/expected"
+cmp "$work_dir/actual" "$work_dir/expected" || fail 'ls hyperlink output differs'
+for ls_flags in '-Z1' '-iZ1' '-lZ --time-style=long-iso'; do
+    LC_ALL=C "$bin_dir/ls" $ls_flags "$work_dir/ls-tree" > "$work_dir/actual"
+    LC_ALL=C /usr/bin/ls $ls_flags "$work_dir/ls-tree" > "$work_dir/expected"
+    cmp "$work_dir/actual" "$work_dir/expected" || fail "ls $ls_flags context output differs"
+done
+mkdir -p "$work_dir/ls-cycle/a"
+ln -s ../ "$work_dir/ls-cycle/a/up"
+set +e
+LC_ALL=C "$bin_dir/ls" -RL1 "$work_dir/ls-cycle" > "$work_dir/actual" 2> "$work_dir/actual-error"
+mlx_ls_status=$?
+LC_ALL=C /usr/bin/ls -RL1 "$work_dir/ls-cycle" > "$work_dir/expected" 2> "$work_dir/expected-error"
+gnu_ls_status=$?
+set -e
+[[ "$mlx_ls_status" -eq "$gnu_ls_status" ]] || fail 'ls recursive cycle status differs'
+cmp "$work_dir/actual" "$work_dir/expected" || fail 'ls recursive cycle output differs'
+cmp "$work_dir/actual-error" "$work_dir/expected-error" || fail 'ls recursive cycle diagnostic differs'
+ln -s ls-tree/subdirectory "$work_dir/ls-directory-link"
+for ls_flags in '-l --time-style=long-iso' '-H -l --time-style=long-iso' '-F1'; do
+    LC_ALL=C "$bin_dir/ls" $ls_flags "$work_dir/ls-directory-link" > "$work_dir/actual"
+    LC_ALL=C /usr/bin/ls $ls_flags "$work_dir/ls-directory-link" > "$work_dir/expected"
+    cmp "$work_dir/actual" "$work_dir/expected" || fail "ls $ls_flags command-line symlink behavior differs"
+done
+LC_ALL=C "$bin_dir/ls" -ln --time-style=long-iso /dev/null /etc/passwd > "$work_dir/actual"
+LC_ALL=C /usr/bin/ls -ln --time-style=long-iso /dev/null /etc/passwd > "$work_dir/expected"
+cmp "$work_dir/actual" "$work_dir/expected" || fail 'ls device major/minor output differs'
 if "$bin_dir/ls" "$work_dir/ls-missing" >/dev/null 2>&1; then
     fail 'ls accepted a missing operand'
 fi
