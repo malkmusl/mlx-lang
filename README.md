@@ -40,3 +40,11 @@ Zig is Stage-0 only. The canonical compiler, standard library, normal Mlx progra
 - Wayland client+server are provided by `std.wayland`; canonical XML is consumed during stdlib bootstrap, never required in ordinary project builds
 
 Read `AGENT_IMPLEMENTATION.md` and `SPEC_INDEX.md` before implementation.
+
+## Documentation
+
+- [`docs/guide/`](docs/guide/README.md) — a test-driven language guide: every
+  example is taken from a fixture in `tests/` and is guaranteed to compile
+  (or fail) exactly as described
+- [`spec/`](spec/) — the normative Mlx 1.0 specification (see `SPEC_INDEX.md`)
+- [`docs/BOOTSTRAP.md`](docs/BOOTSTRAP.md) / [`docs/WAYLAND.md`](docs/WAYLAND.md) — bootstrap chain and Wayland architecture notes
