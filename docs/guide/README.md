@@ -47,8 +47,15 @@ For a compile-error fixture, use `tests/run_error.sh`:
 ## Scope
 
 This guide covers the core surface language as exercised by the low-numbered,
-single-feature fixtures in `tests/` (roughly `01_*` through `232_*`). It does
-not (yet) cover the compiler-internals and self-hosting runtime fixtures
-(`*_selfhost_*`, `*_bootstrap_*`), the x86_64/ELF ABI in detail, or the
-standard library; those are documented normatively in `spec/01-abi/`,
-`spec/02-compiler/`, and `spec/04-stdlib/`.
+single-feature fixtures in `tests/` (roughly `01_*` through `232_*`). It
+deliberately stays at the language-usage level and doesn't dive into ABI
+register allocation, object-file layout, or compiler-internal data
+structures — those live one level deeper, in
+[`../reference/`](../reference/) and [`../internals/`](../internals/), which
+cover the ABI, object formats, the build system, the standard library,
+Wayland, the memory/concurrency model, and the compiler's own pipeline and
+self-hosted implementation (`compiler/selfhost/`), each grounded the same
+way this guide is: in the normative `spec/`, in real test fixtures
+(including the `*_selfhost_*`/`*_bootstrap_*` runtime tests this guide
+scopes out), and in the actual source. See [`../README.md`](../README.md)
+for the full documentation index.

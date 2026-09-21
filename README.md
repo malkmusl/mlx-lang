@@ -43,8 +43,8 @@ Read `AGENT_IMPLEMENTATION.md` and `SPEC_INDEX.md` before implementation.
 
 ## Documentation
 
-- [`docs/guide/`](docs/guide/README.md) — a test-driven language guide: every
-  example is taken from a fixture in `tests/` and is guaranteed to compile
-  (or fail) exactly as described
+- [`docs/README.md`](docs/README.md) — documentation index: a test-driven
+  language guide, implementation-grounded subsystem references (ABI,
+  formats, build system, stdlib, Wayland, memory/concurrency), and an
+  architecture tour of the self-hosted compiler (`compiler/selfhost/`)
 - [`spec/`](spec/) — the normative Mlx 1.0 specification (see `SPEC_INDEX.md`)
-- [`docs/BOOTSTRAP.md`](docs/BOOTSTRAP.md) / [`docs/WAYLAND.md`](docs/WAYLAND.md) — bootstrap chain and Wayland architecture notes
