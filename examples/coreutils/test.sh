@@ -1055,4 +1055,36 @@ if "$bin_dir/ls" "$work_dir/ls-missing" >/dev/null 2>&1; then
     fail 'ls accepted a missing operand'
 fi
 
+# Regression: parsing a numeric field of exactly 0 (root uid/gid, --width=0,
+# --color=never, ...) must not be mistaken for "no value" by any ?integer
+# result used across these utilities.
+LC_ALL=C "$bin_dir/ls" -l /etc/passwd > "$work_dir/actual"
+LC_ALL=C /usr/bin/ls -l /etc/passwd > "$work_dir/expected"
+cmp "$work_dir/actual" "$work_dir/expected" || fail 'ls -l root-owned identity output differs'
+for ls_flags in '--width=0' '--color=never' '--hyperlink=never' '--classify=none'; do
+    LC_ALL=C "$bin_dir/ls" $ls_flags /etc/passwd > "$work_dir/actual"
+    LC_ALL=C /usr/bin/ls $ls_flags /etc/passwd > "$work_dir/expected"
+    cmp "$work_dir/actual" "$work_dir/expected" || fail "ls $ls_flags output differs"
+done
+
+"$bin_dir/arch" > "$work_dir/actual"
+/usr/bin/arch > "$work_dir/expected"
+cmp "$work_dir/actual" "$work_dir/expected" || fail 'arch output differs'
+
+"$bin_dir/whoami" > "$work_dir/actual"
+/usr/bin/whoami > "$work_dir/expected"
+cmp "$work_dir/actual" "$work_dir/expected" || fail 'whoami output differs'
+
+set +e
+"$bin_dir/logname" > "$work_dir/actual" 2> "$work_dir/actual-error"
+mlx_logname_status=$?
+/usr/bin/logname > "$work_dir/expected" 2> "$work_dir/expected-error"
+gnu_logname_status=$?
+set -e
+[[ "$mlx_logname_status" -eq "$gnu_logname_status" ]] || fail 'logname exit status differs'
+cmp "$work_dir/actual" "$work_dir/expected" || fail 'logname output differs'
+grep -q 'no login name' "$work_dir/expected-error" && {
+    grep -q 'no login name' "$work_dir/actual-error" || fail 'logname diagnostic differs'
+}
+
 printf 'all coreutils smoke tests passed\n'
