@@ -11,13 +11,21 @@ Implemented Stage-1 compiler-core std:
 - `ranges.mlx`: ordered range bounds and the first real consumer of native multiple returns.
 - `os/linux.mlx`: direct Linux x86_64 syscall gateway without libc.
 - `allocator.mlx`, `page_allocator.mlx`, `fixed_buffer_allocator.mlx`, and `arena_allocator.mlx`: explicit allocation, scratch allocation, reset, and ownership.
-  `Allocator` follows Zig's `std.mem.Allocator` shape: a `ptr: *anyopaque` context plus a
-  `vtable: *const VTable` (`alloc`/`resize`/`remap`/`free`) that each implementation builds once as
-  a static table, rather than storing per-instance function pointers. It keeps the pointer/length
-  convenience methods (`alloc`, `resize`, `free`) every other bootstrap module already called, and
-  adds Zig-style typed helpers (`create`, `destroy`, `allocSlice`, `freeSlice`, `resizeSlice`,
-  `dupe`) built on `comptime T: type` generics, returning `[*]T`/`*T` rather than `[]T` since Mlx
-  slices carry no readable `.length`/`.pointer` accessor the way Zig's do.
+  `Allocator` is a single Zig-style polymorphic type (page/arena/fixed-buffer/custom all share the
+  same method surface: `alloc`, `resize`, `free`, `destroy`, `freeSlice`, ...), but its *internal*
+  representation is flattened per-instance function pointers
+  (`context`/`allocFn`/`resizeFn`/`remapFn`/`freeFn`) rather than Zig's own
+  `ptr: *anyopaque, vtable: *const VTable` indirection. That shape was tried first and reliably
+  miscompiles under mlx0: a `VTable`-shaped struct (one with a function-typed field) declared
+  *anywhere* in the compilation corrupts field values for an unrelated two-pointer-field struct
+  crossing a function-parameter boundary, which is exactly how every `SomeCollection.init(allocator,
+  ...)` call uses `Allocator`. Confirmed with a minimal repro; the self-hosted compiler itself
+  (`compiler/selfhost`, which stores `allocator: Allocator` on `Loader`/`Store`/etc. and passes it
+  through constructors) segfaulted immediately until this was reverted. The flattened shape has no
+  struct-with-function-field type anywhere and does not trigger it. `create`/`allocSlice`/
+  `resizeSlice`/`dupe` (which would need to manufacture a new `*T`/`[*]T` purely from a
+  `comptime T: type`) also don't compile yet under mlx0's generics; only `destroy`/`freeSlice`
+  (which infer their element type from an existing `anytype` pointer) are implemented.
 - `string.mlx`: borrowed byte strings, equality, slicing, ordering, prefixes, suffixes, and hashing.
 - `array_list.mlx`: growing byte list used for source and output buffers.
 - `vector.mlx`: type-erased growing storage for Mlx1 token and AST records.
