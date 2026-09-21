@@ -67,3 +67,31 @@ How the compiler itself works, normatively and concretely:
 - [`BOOTSTRAP.md`](BOOTSTRAP.md) — the Zig-to-self-hosting bootstrap chain
 - [`WAYLAND.md`](WAYLAND.md) — why Wayland is a stdlib-bootstrap protocol
   extension, not a compiler feature
+
+## Keeping this documentation accurate
+
+A GitHub Actions workflow
+([`.github/workflows/docs-conformance.yml`](../.github/workflows/docs-conformance.yml))
+runs [`tools/check_docs_coverage.py`](../tools/check_docs_coverage.py) on
+every push/PR that touches `tests/`, `docs/`, or the diagnostic code
+catalog, and fails the build if:
+
+- any `*.mlx` file under `tests/` (including `tests/modules/` and
+  `tests/support/`) isn't cited anywhere under `docs/` — a new fixture that
+  lands without a documentation update breaks CI, not just this pass's
+  one-time audit
+- any relative link in a `docs/**/*.md` file (or the root `README.md`)
+  doesn't resolve to a real file
+- any ``` code fence is left unclosed
+- any `MLX-E`/`MLX-W` code in
+  [`spec/02-compiler/diagnostics/codes.xml`](../spec/02-compiler/diagnostics/codes.xml)
+  is missing from [`guide/11-diagnostics.md`](guide/11-diagnostics.md)'s code
+  table
+
+Run it locally before pushing a docs or test change:
+
+```sh
+python3 tools/check_docs_coverage.py
+```
+
+It has no dependencies beyond a Python 3 standard library.
