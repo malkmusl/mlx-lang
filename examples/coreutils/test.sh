@@ -1087,4 +1087,25 @@ grep -q 'no login name' "$work_dir/expected-error" && {
     grep -q 'no login name' "$work_dir/actual-error" || fail 'logname diagnostic differs'
 }
 
+for seq_args in '5' '3 7' '1 2 10' '5 1' '5 -1 1' '-5 5' '-w -5 5' '-w 0 10' '-w 8 10' '-s, 1 5' '-s, -w 1 10' '-s: 1 3' '--separator=: 1 3' '1 -1 -3' '-5' '-- -5 -1'; do
+    "$bin_dir/seq" $seq_args > "$work_dir/actual"
+    /usr/bin/seq $seq_args > "$work_dir/expected"
+    cmp "$work_dir/actual" "$work_dir/expected" || fail "seq $seq_args output differs"
+done
+set +e
+"$bin_dir/seq" > "$work_dir/actual" 2>&1
+mlx_seq_status=$?
+/usr/bin/seq > "$work_dir/expected" 2>&1
+gnu_seq_status=$?
+set -e
+[[ "$mlx_seq_status" -eq "$gnu_seq_status" ]] || fail 'seq missing-operand exit status differs'
+set +e
+"$bin_dir/seq" 1 0 5 >/dev/null 2>&1
+mlx_seq_zero_status=$?
+/usr/bin/seq 1 0 5 >/dev/null 2>&1
+gnu_seq_zero_status=$?
+set -e
+[[ "$mlx_seq_zero_status" -eq "$gnu_seq_zero_status" ]] || fail 'seq zero-increment exit status differs'
+diff <("$bin_dir/seq" 1 100000) <(/usr/bin/seq 1 100000) >/dev/null || fail 'seq large sequence differs'
+
 printf 'all coreutils smoke tests passed\n'

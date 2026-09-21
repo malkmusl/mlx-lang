@@ -44,6 +44,7 @@ their `/usr/bin` counterparts.
 | `arch` | complete | none known |
 | `logname` | complete | reads `/proc/self/loginuid`; NSS sources beyond local passwd files |
 | `whoami` | complete | NSS sources beyond local passwd files |
+| `seq` | partial | integer arguments only; `-f/--format` floating-point printf formatting is not implemented |
 
 “Complete” means the documented option surface is implemented and covered by
 the current parity suite. It does not claim locale, filesystem, or kernel
