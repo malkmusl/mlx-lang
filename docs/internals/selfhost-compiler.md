@@ -517,7 +517,7 @@ pub const Code = enum(u16) {
     unexpected_byte = 1001,
     unexpected_end_of_file = 1002,
     unexpected_token = 2001,
-    unknown_type = 3001,
+    unknown_identifier = 3001,
     duplicate_symbol = 3002,
     private_declaration = 3003,
     import_not_found = 3004,
@@ -548,12 +548,9 @@ enum does define (e.g. `type_mismatch = 4001` used broadly, per
 `driver/pipeline.mlx`'s failure calls). It does mean that a caller relying
 on the self-hosted compiler's diagnostic *codes* for fine-grained tooling
 (as opposed to the human message) should not yet expect the same code
-granularity `mlx0`/the spec catalog promises; the id also uses the
-non-normative name `unknown_type` at `3001` where the spec's catalog calls
-that slot `UnknownIdentifier`. Also worth noting: `id 3001` in this enum is
-called `unknown_type`, not `UnknownIdentifier` as `codes.xml` names it —
-a naming drift worth being aware of if cross-referencing by name rather
-than numeric code.
+granularity `mlx0`/the spec catalog promises. The `3001` member now uses
+the `unknown_identifier` spelling, so its source-level name and numeric
+identity align with the spec catalog's `UnknownIdentifier` entry.
 
 ## Contrast with the bootstrap compiler (`compiler/bootstrap/`)
 
@@ -628,6 +625,15 @@ representative few, read in full above or below:
   { one = 1 / 0 ... }`) proving an enum whose explicit discriminant can't be
   evaluated at compile time is now rejected by `sema.analyzeDeclarations`
   rather than silently dropped.
+
+`tests/234_slice_var_reassign_bootstrap_bug.mlx` is deliberately different:
+it records a known bootstrap code-generation bug rather than a currently
+passing conformance case. A slice-typed `var` initialized from `""` and then
+reassigned to a non-empty pointer-derived slice retains a stale zero length;
+the fixture therefore exits `1` under the current `mlx0`/`mlx1`, while exit
+`13` is the expected result once the lowering bug is fixed. The self-hosted
+driver avoids that pattern when carrying diagnostic paths, so the known bug
+does not block compiler self-hosting.
 
 The rest of the family, by name and what they exercise (inferred from their
 imports and test number, following the same low-numbered/single-feature
