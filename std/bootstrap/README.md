@@ -11,6 +11,13 @@ Implemented Stage-1 compiler-core std:
 - `ranges.mlx`: ordered range bounds and the first real consumer of native multiple returns.
 - `os/linux.mlx`: direct Linux x86_64 syscall gateway without libc.
 - `allocator.mlx`, `page_allocator.mlx`, `fixed_buffer_allocator.mlx`, and `arena_allocator.mlx`: explicit allocation, scratch allocation, reset, and ownership.
+  `Allocator` follows Zig's `std.mem.Allocator` shape: a `ptr: *anyopaque` context plus a
+  `vtable: *const VTable` (`alloc`/`resize`/`remap`/`free`) that each implementation builds once as
+  a static table, rather than storing per-instance function pointers. It keeps the pointer/length
+  convenience methods (`alloc`, `resize`, `free`) every other bootstrap module already called, and
+  adds Zig-style typed helpers (`create`, `destroy`, `allocSlice`, `freeSlice`, `resizeSlice`,
+  `dupe`) built on `comptime T: type` generics, returning `[*]T`/`*T` rather than `[]T` since Mlx
+  slices carry no readable `.length`/`.pointer` accessor the way Zig's do.
 - `string.mlx`: borrowed byte strings, equality, slicing, ordering, prefixes, suffixes, and hashing.
 - `array_list.mlx`: growing byte list used for source and output buffers.
 - `vector.mlx`: type-erased growing storage for Mlx1 token and AST records.

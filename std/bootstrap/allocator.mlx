@@ -1,26 +1,113 @@
-// Minimal allocator contract shared by the bootstrap collections. Function
-// values are ordinary indirect-callable values in Mlx; context is kept as a
-// usize until Stage 1 introduces richer opaque-pointer ergonomics.
+// Zig-style allocator interface: every concrete implementation exposes a
+// single static VTable (MlxComptime materializes it in static storage since
+// every field is a comptime-known function value) and each instance carries
+// only an opaque context pointer plus a pointer to that table, mirroring
+// std.mem.Allocator's `ptr: *anyopaque, vtable: *const VTable` shape rather
+// than storing per-instance function pointers directly.
+//
+// `resize`/`remap`/`free` take an explicit `length` alongside the pointer
+// instead of a `[]u8` slice: Mlx slices do not expose a `.length`/`.pointer`
+// accessor the way Zig's do, so every buffer-passing API in this codebase
+// (this one included) carries pointer and length as separate values.
 
-pub const AllocFn = fn(context: usize, length: usize, alignment: usize) -> ?[*]u8
-pub const ResizeFn = fn(context: usize, memory: [*]u8, old_length: usize, new_length: usize, alignment: usize) -> ?[*]u8
-pub const FreeFn = fn(context: usize, memory: [*]u8, length: usize, alignment: usize) -> void
+pub const AllocFn = fn(context: *anyopaque, length: usize, alignment: usize) -> ?[*]u8
+pub const ResizeFn = fn(context: *anyopaque, memory: [*]u8, length: usize, alignment: usize, new_length: usize) -> bool
+pub const RemapFn = fn(context: *anyopaque, memory: [*]u8, length: usize, alignment: usize, new_length: usize) -> ?[*]u8
+pub const FreeFn = fn(context: *anyopaque, memory: [*]u8, length: usize, alignment: usize) -> void
+
+pub const VTable = struct {
+    alloc: AllocFn
+    resize: ResizeFn
+    remap: RemapFn
+    free: FreeFn
+}
 
 pub const Allocator = struct {
-    context: usize
-    allocFn: AllocFn
-    resizeFn: ResizeFn
-    freeFn: FreeFn
+    ptr: *anyopaque
+    vtable: *const VTable
 
-    pub fn alloc(self: Self, length: usize, alignment: usize) -> ?[*]u8 {
-        return self.allocFn(self.context, length, alignment)
+    // Raw vtable dispatch, named after Zig's Allocator.rawAlloc/rawResize/
+    // rawRemap/rawFree internals.
+    pub fn rawAlloc(self: Self, length: usize, alignment: usize) -> ?[*]u8 {
+        return self.vtable.alloc(self.ptr, length, alignment)
     }
 
+    pub fn rawResize(self: Self, memory: [*]u8, length: usize, alignment: usize, new_length: usize) -> bool {
+        return self.vtable.resize(self.ptr, memory, length, alignment, new_length)
+    }
+
+    pub fn rawRemap(self: Self, memory: [*]u8, length: usize, alignment: usize, new_length: usize) -> ?[*]u8 {
+        return self.vtable.remap(self.ptr, memory, length, alignment, new_length)
+    }
+
+    pub fn rawFree(self: Self, memory: [*]u8, length: usize, alignment: usize) -> void {
+        self.vtable.free(self.ptr, memory, length, alignment)
+    }
+
+    // Pointer/length convenience wrappers kept source-compatible with the
+    // bootstrap collections and userland programs that were already calling
+    // Allocator.alloc/resize/free with this exact shape.
+    pub fn alloc(self: Self, length: usize, alignment: usize) -> ?[*]u8 {
+        return self.rawAlloc(length, alignment)
+    }
+
+    // Tries an in-place resize first and falls back to allocate+copy+free
+    // (a "remap" in Zig's terms) when the implementation cannot grow or
+    // shrink the block in place.
     pub fn resize(self: Self, memory: [*]u8, old_length: usize, new_length: usize, alignment: usize) -> ?[*]u8 {
-        return self.resizeFn(self.context, memory, old_length, new_length, alignment)
+        if new_length == 0 {
+            self.free(memory, old_length, alignment)
+            return null
+        }
+        if old_length > 0 && self.rawResize(memory, old_length, alignment, new_length) { return memory }
+        return self.rawRemap(memory, old_length, alignment, new_length)
     }
 
     pub fn free(self: Self, memory: [*]u8, length: usize, alignment: usize) -> void {
-        self.freeFn(self.context, memory, length, alignment)
+        self.rawFree(memory, length, alignment)
+    }
+
+    // Zig-style typed convenience API. These return `[*]T` (not `[]T`)
+    // because Mlx slices carry no readable length field; callers already
+    // track lengths explicitly everywhere else in this codebase.
+    pub fn create(self: Self, comptime T: type) -> ?*T {
+        const memory = self.rawAlloc(@sizeOf(T), @alignOf(T))
+        if memory == null { return null }
+        unsafe { return @ptrCast(*T, memory.?) }
+    }
+
+    pub fn destroy(self: Self, pointer: anytype) -> void {
+        const Element = @childType(@typeOf(pointer))
+        unsafe { self.rawFree(@ptrCast([*]u8, pointer), @sizeOf(Element), @alignOf(Element)) }
+    }
+
+    pub fn allocSlice(self: Self, comptime T: type, count: usize) -> ?[*]T {
+        if count == 0 { return null }
+        const memory = self.rawAlloc(count * @sizeOf(T), @alignOf(T))
+        if memory == null { return null }
+        unsafe { return @ptrCast([*]T, memory.?) }
+    }
+
+    pub fn freeSlice(self: Self, comptime T: type, memory: [*]T, count: usize) -> void {
+        unsafe { self.rawFree(@ptrCast([*]u8, memory), count * @sizeOf(T), @alignOf(T)) }
+    }
+
+    pub fn resizeSlice(self: Self, comptime T: type, memory: [*]T, old_count: usize, new_count: usize) -> ?[*]T {
+        unsafe {
+            const resized = self.resize(@ptrCast([*]u8, memory), old_count * @sizeOf(T), new_count * @sizeOf(T), @alignOf(T))
+            if resized == null { return null }
+            return @ptrCast([*]T, resized.?)
+        }
+    }
+
+    pub fn dupe(self: Self, comptime T: type, source: [*]const T, count: usize) -> ?[*]T {
+        const copy = self.allocSlice(T, count)
+        if copy == null { return null }
+        var index: usize = 0
+        while index < count {
+            copy.?[index] = source[index]
+            index += 1
+        }
+        return copy.?
     }
 }
