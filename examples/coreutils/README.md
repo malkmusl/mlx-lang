@@ -1,8 +1,12 @@
 # MLX coreutils
 
 Dependency-free Linux userland programs written in MLX. Each utility lives in
-its own directory and imports only the MLX standard library plus the shared
-helpers in `common.mlx`.
+its own directory and imports only the MLX standard library plus the small
+set of CLI diagnostic helpers in `common.mlx`. Path manipulation and
+canonicalization, chmod-style mode parsing, sized-number/duration parsing,
+POSIX-ish word splitting, and calendar/timestamp parsing were generalized out
+of these examples into `std.path`, `std.mode`, `std.parse`, `std.shell`, and
+`std.calendar` respectively, so other MLX programs can reuse them too.
 
 Initial utilities:
 
