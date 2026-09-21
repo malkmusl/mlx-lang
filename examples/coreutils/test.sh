@@ -1130,4 +1130,14 @@ printf 'a\nb\nc' | "$bin_dir/tac" > "$work_dir/actual"
 printf 'a\nb\nc' | /usr/bin/tac > "$work_dir/expected"
 cmp "$work_dir/actual" "$work_dir/expected" || fail 'tac no-trailing-newline differs'
 
+printf 'a\n\nb\nc\n\n\nd\n' > "$work_dir/nl1"
+for nl_flags in '' '-ba' '-w4 -s: ' '-nln -w3' '-v10 -i5' '-nrz' '-bn'; do
+    "$bin_dir/nl" $nl_flags "$work_dir/nl1" > "$work_dir/actual"
+    /usr/bin/nl $nl_flags "$work_dir/nl1" > "$work_dir/expected"
+    cmp "$work_dir/actual" "$work_dir/expected" || fail "nl $nl_flags output differs"
+done
+printf 'a\nb' | "$bin_dir/nl" > "$work_dir/actual"
+printf 'a\nb' | /usr/bin/nl > "$work_dir/expected"
+cmp "$work_dir/actual" "$work_dir/expected" || fail 'nl no-trailing-newline differs'
+
 printf 'all coreutils smoke tests passed\n'

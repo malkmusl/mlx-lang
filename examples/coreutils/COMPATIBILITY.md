@@ -46,6 +46,7 @@ their `/usr/bin` counterparts.
 | `whoami` | complete | NSS sources beyond local passwd files |
 | `seq` | partial | integer arguments only; `-f/--format` floating-point printf formatting is not implemented |
 | `tac` | partial | `-r/--regex` regular-expression separators are not implemented |
+| `nl` | partial | header/body/footer section delimiters (`\:\:\:`), `-p` no-reset, `-bpREGEX` numbering, and `-l` blank-line joining are not implemented; the whole input is treated as one body section |
 
 “Complete” means the documented option surface is implemented and covered by
 the current parity suite. It does not claim locale, filesystem, or kernel
