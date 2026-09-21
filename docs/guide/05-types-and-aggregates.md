@@ -4,10 +4,12 @@
 `20_vector_type_builtin.mlx`, `23_tagged_union_layout.mlx`,
 `60_array_layout_runtime.mlx`, `65_index_slice_runtime.mlx`,
 `67_optional_unwrap_runtime.mlx`, `85_struct_literal_runtime.mlx`,
-`86_struct_literal_missing_field.mlx`, `95_enum_value_runtime.mlx`,
+`86_struct_literal_missing_field.mlx`, `87_field_builtin_runtime.mlx`,
+`88_lvalue_assignment_runtime.mlx`, `95_enum_value_runtime.mlx`,
 `97_tagged_union_runtime.mlx`, `98_nonexhaustive_enum_requires_else.mlx`,
 `99_enum_duplicate_value.mlx`, `100_union_explicit_tag_mismatch.mlx`,
-`104_optional_pointer_null_runtime.mlx`
+`104_optional_pointer_null_runtime.mlx`, `174_aggregate_functions_runtime.mlx`,
+`176_pointer_struct_fields_runtime.mlx`, `212_aggregate_index_runtime.mlx`
 
 ## Structs
 
@@ -34,6 +36,48 @@ fn main() u8 {
 Omitting a field in the literal is a compile-time error
 (`tests/86_struct_literal_missing_field.mlx`).
 
+A field can also be read through the `@field(value, "name")` builtin instead
+of `value.name` — useful when the field name itself is comptime-computed
+(see [Comptime and generics](08-comptime-and-generics.md) for a generic
+example that does exactly that):
+
+```mlx
+const Point = struct {
+    x: u8
+    y: u8
+}
+
+fn main() u8 {
+    const point: Point = Point.{ .x = 19, .y = 23 }
+    return @field(point, "y")
+}
+```
+
+(`tests/87_field_builtin_runtime.mlx`)
+
+Any lvalue — a struct field, an array element, or a pointer dereference —
+supports compound assignment directly, not just plain variables:
+
+```mlx
+const Pair = struct {
+    left: u8
+    right: u8
+}
+
+fn main() u8 {
+    var pair: Pair = Pair.{ .left = 3, .right = 4 }
+    pair.left += 2
+    var values: [2]u8 = [2]u8{ 5, 6 }
+    values[1] *= 2
+    var extra: u8 = 7
+    const pointer = &extra
+    pointer.* += 1
+    return pair.left + values[1] + pointer.*
+}
+```
+
+(`tests/88_lvalue_assignment_runtime.mlx`)
+
 Struct layout/reflection builtins:
 
 ```mlx
@@ -51,6 +95,79 @@ pub fn main() u8 {
 ```
 
 (`tests/15_aggregate_builtins.mlx`)
+
+## Methods
+
+A struct can declare functions in its body. `Self` refers to the enclosing
+type. A method that takes `self` (by value or by pointer, `self: Self` /
+`self: *Self`) is called on an instance with `.`; a function that doesn't
+take `self` is called on the type itself, like an associated/"static"
+function:
+
+```mlx
+pub const Parser = struct {
+    value: u8
+
+    fn rejectAggregateDeclaration(parser: *anyopaque) -> usize {
+        return 17
+    }
+
+    pub fn current(self: Self) -> u8 {
+        return self.value
+    }
+}
+
+fn main() -> u8 {
+    unsafe {
+        if Parser.rejectAggregateDeclaration(@ptrFromInt(*anyopaque, 1)) != 17 { return 1 }
+    }
+    const parser = Parser.{ .value = 13 }
+    return parser.current()
+}
+```
+
+(`tests/174_aggregate_functions_runtime.mlx`; see
+[Modules](10-modules.md) for the same pattern used with a struct imported
+from another file)
+
+A pointer-receiver method (`self: *Self`) can mutate the instance it's
+called on, and an associated function can return `*Self` — for example, to
+hand back a heap-allocated instance (see
+[Standard library](../reference/stdlib.md) for the allocator interface used
+here):
+
+```mlx
+const page_allocator = @import("../std/bootstrap/page_allocator.mlx")
+
+const Box = struct {
+    value: usize
+
+    fn set(box: *Self, value: usize) -> void {
+        box.*.value = value
+    }
+
+    fn create() -> *Self {
+        const allocator = page_allocator.init()
+        const memory = allocator.allocFn(allocator.context, @sizeOf(Self), @alignOf(Self)).?
+        unsafe {
+            const box = @ptrCast(*Self, memory)
+            box.*.value = 13
+            return box
+        }
+    }
+}
+
+pub fn main() -> u8 {
+    var local = Box.{ .value = 1 }
+    Box.set(&local, 7)
+    if local.value != 7 { return 1 }
+    const allocated = Box.create()
+    if allocated.*.value != 13 { return 2 }
+    return 13
+}
+```
+
+(`tests/176_pointer_struct_fields_runtime.mlx`)
 
 ## Enums
 
@@ -185,7 +302,39 @@ noinline fn readAt(index: usize) -> u8 {
 out-of-range index)
 
 Array element layout follows normal row-major/sequential order
-(`tests/60_array_layout_runtime.mlx`).
+(`tests/60_array_layout_runtime.mlx`), which holds just as well for a
+heap-allocated run of structs addressed through a raw pointer: indexing a
+`[*]Entry` and then a field on the result addresses exactly the expected
+byte offset (`entries[0]` and `entries[1]` sit `@sizeOf(Entry)` bytes apart):
+
+```mlx
+const page_allocator = @import("../std/bootstrap/page_allocator.mlx")
+
+const Entry = struct {
+    value: usize
+    marker: u8
+}
+
+pub fn main() -> u8 {
+    const allocator = page_allocator.init()
+    unsafe {
+        const memory = allocator.allocFn(allocator.context, 2 * @sizeOf(Entry), @alignOf(Entry)).?
+        const entries = @ptrCast([*]Entry, memory)
+        entries[0].value = 11
+        entries[0].marker = 3
+        entries[1].value = 29
+        entries[1].marker = 13
+
+        if entries[0].value != 11 || entries[0].marker != 3 { return 1 }
+        if entries[1].value != 29 { return 2 }
+        return entries[1].marker
+    }
+}
+```
+
+(`tests/212_aggregate_index_runtime.mlx`; see
+[Unsafe and safety](09-unsafe-and-safety.md) for the `unsafe {}` boundary
+this raw-pointer indexing requires)
 
 ## Optionals
 

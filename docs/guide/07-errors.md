@@ -7,7 +7,8 @@
 `79_defer_lifo_runtime.mlx`, `80_defer_break_runtime.mlx`,
 `81_errdefer_success_runtime.mlx`, `82_errdefer_requires_error_function.mlx`,
 `101_error_set_runtime.mlx`, `102_error_set_mismatch.mlx`,
-`103_error_set_duplicate.mlx`
+`103_error_set_duplicate.mlx`, `167_error_return_propagation_runtime.mlx`,
+`168_error_direct_return_runtime.mlx`
 
 Mlx has no exceptions. Fallibility is part of a function's type via error
 unions, and propagation is always explicit (`try`).
@@ -157,6 +158,48 @@ const Broken = error {
 ```
 
 (`tests/103_error_set_duplicate.mlx`)
+
+A minimal function can return a named error set's value directly, without
+even a `try` anywhere — there's no call to unwrap, just an error union being
+produced and handed straight back:
+
+```mlx
+const Failure = error { Broken }
+
+pub fn main() -> Failure!void {
+    return Failure.Broken
+}
+```
+
+(`tests/168_error_direct_return_runtime.mlx`)
+
+### Propagating without `try`
+
+`try` is for *unwrapping* a `!T` so you can use its payload. If you're not
+using the payload at all — just forwarding another call's error union
+straight out of the current function — `return theCall()` works directly,
+as long as the current function's return type is itself an error union (the
+same requirement `try` has, from the "Error unions" section above). The
+named error set of the inner call converts into the caller's own (possibly
+broader) error union automatically:
+
+```mlx
+const Failure = error { Broken }
+
+fn fail() -> Failure!void {
+    return Failure.Broken
+}
+
+fn forward() -> !void {
+    return fail()   // no `try` needed: forward() just re-returns fail()'s error union
+}
+
+pub fn main() -> !void {
+    return forward()
+}
+```
+
+(`tests/167_error_return_propagation_runtime.mlx`)
 
 ## `defer` and `errdefer`
 

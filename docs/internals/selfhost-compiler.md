@@ -661,3 +661,13 @@ Each of these imports directly from `compiler/selfhost/...` (rather than
 compiling a `.mlx` file as a black box), so they test the self-hosted
 compiler's internal module API surface — the same API this page describes
 — not just its command-line behavior.
+
+`157_selfhost_modules_runtime.mlx` in particular drives `modules.mlx`'s
+`loadRoot`/`putPackage` functions directly against small fixture files under
+`tests/modules/`: `157_root.mlx` exercises every normative import form in one
+file (`@import("./157_values.mlx")`, a `././`-prefixed relative path,
+`@import("builtin")`, a registered package name `@import("example")`
+resolved through `putPackage` to `157_package.mlx`, a `@import("std.testing")`
+dotted stdlib-style path, and a cyclic import), and `157_missing_root.mlx` /
+`157_private_root.mlx` drive the missing-import and private-declaration
+error paths that `158_selfhost_module_errors_runtime.mlx` asserts against.

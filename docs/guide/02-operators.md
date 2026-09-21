@@ -4,7 +4,11 @@
 `70_compound_assignment_runtime.mlx`, `71_shift_combine_runtime.mlx`,
 `72_logical_short_circuit_runtime.mlx`, `73_prefix_operators_runtime.mlx`,
 `89_checked_overflow_comptime.mlx`, `91_wrapping_saturating_runtime.mlx`,
-`92_saturating_shift_runtime.mlx`, `93_checked_overflow_runtime.mlx`
+`92_saturating_shift_runtime.mlx`, `93_checked_overflow_runtime.mlx`,
+`94_wrapping_shift_count_runtime.mlx`, `113_signed_integer_runtime.mlx`,
+`114_unsigned_comparison_runtime.mlx`, `183_float_exponent_runtime.mlx`,
+`184_signed_right_shift_runtime.mlx`, `203_immediate_alu_gep_runtime.mlx`,
+`207_popcount_runtime.mlx`
 
 ## Arithmetic, division and remainder
 
@@ -75,6 +79,141 @@ pub fn main() u8 {
 ```
 
 (`tests/71_shift_combine_runtime.mlx` → 15, i.e. `(3 << 2) | 3`)
+
+## Shift counts and signed shifts
+
+`<<%` is a *wrapping-shift-count* left shift: unlike plain `<<`, a shift
+amount that would exceed the type's bit width doesn't trap — the amount
+itself wraps modulo the bit width first:
+
+```mlx
+fn main() u8 {
+    const value: u7 = 1
+    return @intCast(u8, value <<% 8)   // shift amount 8 wraps to 8 % 7 = 1
+}
+```
+
+(`tests/94_wrapping_shift_count_runtime.mlx`)
+
+`>>` on a signed integer is an arithmetic (sign-extending) shift — the
+vacated high bits are filled with copies of the sign bit rather than
+zeros, so shifting a negative number right keeps it negative:
+
+```mlx
+fn shifted(value: i64, amount: u8) -> i64 {
+    return value >> amount
+}
+
+pub fn main() -> u8 {
+    if shifted(-8, 2) != -2 { return 1 }   // -8 >> 2 == -2, not a huge positive number
+    return 13
+}
+```
+
+(`tests/184_signed_right_shift_runtime.mlx`)
+
+## Signed vs. unsigned semantics
+
+Division, remainder, and comparison all respect signedness. Signed division
+truncates toward zero, and the sign of a negative dividend's remainder
+follows the dividend:
+
+```mlx
+fn main() u8 {
+    var lhs: i8 = -7
+    var rhs: i8 = 2
+    const quotient = lhs / rhs     // -3 (truncated toward zero, not -4)
+    const remainder = lhs % rhs    // -1
+    if quotient == -3 && remainder == -1 && lhs < rhs {
+        return 13
+    }
+    return 1
+}
+```
+
+(`tests/113_signed_integer_runtime.mlx`)
+
+An unsigned comparison never reinterprets its operands as signed — a `u64`
+value whose top bit is set still compares correctly as a large positive
+number, not as a negative one:
+
+```mlx
+fn main() u8 {
+    var large: u64 = 9223372036854775808   // 2^63: negative if compared as i64
+    var small: u64 = 1
+    if large > small {
+        return 13
+    }
+    return 1
+}
+```
+
+(`tests/114_unsigned_comparison_runtime.mlx`)
+
+## Float literals
+
+Float literals accept a decimal exponent suffix (`e`/`E`, with an optional
+sign), and convert correctly between `f32`/`f64`:
+
+```mlx
+pub fn main() -> u8 {
+    if 1.25e2 != 125.0 { return 1 }
+    if 125e-2 != 1.25 { return 2 }
+    if 2E+3 != 2000.0 { return 3 }
+    if 5e-1 != 0.5 { return 4 }
+    if @bitCast(u64, @floatCast(f64, 1e0)) != 4607182418800017408 { return 5 }
+    if @floatCast(f32, 1.25e0) != @floatCast(f32, 1.25) { return 6 }
+    return 13
+}
+```
+
+(`tests/183_float_exponent_runtime.mlx`; `@bitCast` reinterprets a value's
+bits as another same-size type, `@floatCast` converts between float widths)
+
+## Bit-counting
+
+`@popCount(value)` counts the set bits in an integer, signed or unsigned:
+
+```mlx
+pub fn main() -> usize {
+    const empty: u64 = 0
+    const sparse: u64 = 9223372036854775809
+    const alternating: u64 = 12297829382473034410
+    const signed: i8 = -1
+    if @popCount(empty) != 0 { return 1 }
+    if @popCount(sparse) != 2 { return 2 }
+    if @popCount(alternating) != 32 { return 3 }
+    if @popCount(signed) != 8 { return 4 }   // -1 is all-ones in two's complement
+    return 13
+}
+```
+
+(`tests/207_popcount_runtime.mlx`)
+
+A chain of arithmetic and bitwise operators combined with array indexing —
+the kind of expression that exercises the backend's immediate-operand and
+address-calculation paths — evaluates with ordinary operator precedence:
+
+```mlx
+fn calculate(value: i64) -> i64 {
+    const added = value + 7
+    const multiplied = added * -3
+    const subtracted = multiplied - 5
+    const masked = subtracted & 255
+    return (masked | 256) ^ 17
+}
+
+pub fn main() -> u8 {
+    if calculate(11) != 468 { return 1 }
+    const bytes = [_]u8{ 3, 5, 8, 13 }
+    if bytes[3] != 13 { return 2 }
+    return 13
+}
+```
+
+(`tests/203_immediate_alu_gep_runtime.mlx`; see
+[docs/internals/selfhost-compiler.md](../internals/selfhost-compiler.md) for
+how the self-hosted x86_64 backend generates code for expressions like this)
 
 ## Logical operators and short-circuit evaluation
 

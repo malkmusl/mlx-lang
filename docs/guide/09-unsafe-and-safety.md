@@ -1,10 +1,10 @@
 # Unsafe and safety
 
 **Source tests:** `14_unsafe_ptr_builtin.mlx`, `17_unsafe_ptr_roundtrip.mlx`,
-`18_invalid_pointer_alignment.mlx`, `225_runtime_bounds_safety.mlx`,
-`226_runtime_bounds_in_range.mlx`, `227_runtime_slice_index_safety.mlx`,
-`228_runtime_slice_range_safety.mlx`, `231_optional_pointer_unwrap_safety.mlx`,
-`232_optional_pointer_unwrap_valid.mlx`
+`18_invalid_pointer_alignment.mlx`, `211_byte_mask_64_runtime.mlx`,
+`225_runtime_bounds_safety.mlx`, `226_runtime_bounds_in_range.mlx`,
+`227_runtime_slice_index_safety.mlx`, `228_runtime_slice_range_safety.mlx`,
+`231_optional_pointer_unwrap_safety.mlx`, `232_optional_pointer_unwrap_valid.mlx`
 
 ## The `unsafe {}` boundary
 
@@ -49,6 +49,32 @@ pub fn main() usize {
 ```
 
 (`tests/18_invalid_pointer_alignment.mlx`)
+
+`@byteMask64(pointer, needle)` is a raw-memory builtin: given a valid `*u8`
+pointer, it reads 64 bytes starting there and returns a `usize` bitmask with
+bit `i` set exactly when byte `i` equals `needle`'s low 8 bits (per
+`spec/00-language/types.xml`) — a SWAR-style building block for fast byte
+scanning, and, like any operation that reads through a raw pointer, only
+usable inside `unsafe {}`:
+
+```mlx
+pub fn main() -> usize {
+    var bytes: [64]u8 = undefined
+    var index: usize = 0
+    while index < 64 {
+        bytes[index] = if index == 0 || index == 31 || index == 63 { 32 } else { @intCast(u8, index) }
+        index += 1
+    }
+    unsafe {
+        const pointer = @ptrCast([*]const u8, &bytes)
+        if @byteMask64(pointer, 32) != 9223372043297226753 { return 1 }   // bits 0, 31, 63 set
+        if @byteMask64(pointer, 6) != 64 { return 2 }   // only byte 6 equals 6: bit 6 set
+    }
+    return 13
+}
+```
+
+(`tests/211_byte_mask_64_runtime.mlx`)
 
 ## Runtime safety checks
 
@@ -107,8 +133,22 @@ fn main() -> u8 {
 
 (`tests/228_runtime_slice_range_safety.mlx`)
 
-Unwrapping (`.?`) a `null` optional pointer traps before the would-be
-dereference happens, rather than reading through address 0:
+Unwrapping (`.?`) a `null` optional pointer traps immediately, even without
+a following dereference — the trap is on the unwrap itself, not on reading
+through the resulting pointer:
+
+```mlx
+fn main() u8 {
+    const value: ?*u8 = null
+    value.?
+    return 0
+}
+```
+
+(`tests/105_optional_pointer_unwrap_trap.mlx`)
+
+The same holds when the unwrapped pointer is immediately dereferenced — the
+trap fires before the read through address 0 would happen:
 
 ```mlx
 fn main() -> u8 {

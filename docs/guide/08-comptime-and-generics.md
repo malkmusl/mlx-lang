@@ -6,7 +6,8 @@
 `74_comptime_runtime_dependency.mlx`, `106_anytype_generic_runtime.mlx`,
 `107_comptime_type_generic_runtime.mlx`, `108_comptime_value_generic_runtime.mlx`,
 `109_comptime_argument_runtime_dependency.mlx`, `110_generic_dependent_type_range.mlx`,
-`111_generic_type_return_runtime.mlx`, `112_comptime_if_pruning_runtime.mlx`
+`111_generic_type_return_runtime.mlx`, `112_comptime_if_pruning_runtime.mlx`,
+`171_imported_generic_runtime.mlx`, `support/generic_identity.mlx`
 
 Mlx has no separate template/macro system. Generics are ordinary functions
 whose parameters (or whose parameter *types*) are known at compile time,
@@ -114,6 +115,55 @@ fn main() u8 {
 
 (`tests/106_anytype_generic_runtime.mlx`)
 
+Generic/`anytype` functions work the same way when imported from another
+module — the comptime instantiation happens at the call site regardless of
+which module the generic function was declared in:
+
+```mlx
+// tests/support/generic_identity.mlx
+pub fn identity(value: anytype) -> anytype {
+    return value
+}
+
+pub fn choose(comptime T: type, value: T) -> T {
+    return value
+}
+
+pub fn fieldAt(value: anytype, comptime index: usize) -> anytype {
+    return @field(value, index)
+}
+
+pub fn fieldName(value: anytype, comptime index: usize) -> []const u8 {
+    return @fieldName(@typeOf(value), index)
+}
+
+pub fn isAggregate(value: anytype) -> bool {
+    return @isStruct(@typeOf(value)) || @isTuple(@typeOf(value))
+}
+```
+
+```mlx
+const generic = @import("./support/generic_identity.mlx")
+
+const Pair = struct {
+    first: u8
+    second: u8
+}
+
+pub fn main() -> u8 {
+    const pair = Pair.{ .first = 2, .second = 8 }
+    const name = generic.fieldName(pair, 1)
+    if name[0] != 115 { return 1 }   // "second"[0] == 's' == 115
+    if !generic.isAggregate(pair) { return 2 }
+    return generic.identity(5) + generic.choose(u8, generic.fieldAt(pair, 1))
+}
+```
+
+(`tests/171_imported_generic_runtime.mlx`, importing
+`tests/support/generic_identity.mlx`; note `@field` also accepts a
+comptime field *index*, not just a name string, and `@fieldName(T, index)`
+goes the other way — index to name)
+
 ## Comptime/runtime dependency checking
 
 A `comptime` parameter must actually receive a comptime-known argument —
@@ -170,7 +220,9 @@ The core reflection surface used throughout the suite:
 | `@offsetOf(T, "name")` | byte offset of a field |
 | `@fieldType(T, "name")` | type of a named field |
 | `@hasField(T, "name")` | whether a field exists |
-| `@isInteger`/`@isFloat`/`@isPointer`/`@isSlice`/`@isArray`/`@isOptional`/`@isErrorUnion`/`@isStruct`/`@isEnum`/`@isUnion`/`@isCopyable(T)` | type-category predicates |
+| `@field(value, "name" \| index)` | read a field by comptime name or index |
+| `@fieldName(T, index)` | the name of the field at a comptime index |
+| `@isInteger`/`@isFloat`/`@isPointer`/`@isSlice`/`@isArray`/`@isOptional`/`@isErrorUnion`/`@isStruct`/`@isEnum`/`@isUnion`/`@isTuple`/`@isCopyable(T)` | type-category predicates |
 | `@intCast(T, value)` | range-checked integer conversion |
 | `@intFromEnum(value)` / `@tagOf(value)` | integer/tag value of an enum or tagged-union instance |
 

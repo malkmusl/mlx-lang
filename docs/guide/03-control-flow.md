@@ -5,7 +5,7 @@
 `45_for_index_runtime.mlx`, `49_while_state_break_runtime.mlx`,
 `50_for_continue_runtime.mlx`, `51_if_expression_runtime.mlx`,
 `52_labeled_loops_runtime.mlx`, `53_break_value_runtime.mlx`,
-`54_unknown_loop_label.mlx`, `55_array_for_runtime.mlx`,
+`47_break_outside_loop.mlx`, `54_unknown_loop_label.mlx`, `55_array_for_runtime.mlx`,
 `56_slice_for_runtime.mlx`, `57_array_pointer_capture_runtime.mlx`,
 `63_labeled_continue_runtime.mlx`, `64_break_value_requires_infinite_loop.mlx`,
 `83_match_range_runtime.mlx`, `84_match_non_exhaustive.mlx`,
@@ -74,6 +74,18 @@ the loop:
 ```
 
 (`tests/49_while_state_break_runtime.mlx`)
+
+`break` (and `continue`) are only meaningful inside a loop — using either
+outside any enclosing loop is a compile-time error, the same kind of
+loop-context validation that rejects an unknown label:
+
+```mlx
+pub fn main() void {
+    break   // rejected: no enclosing loop
+}
+```
+
+(`tests/47_break_outside_loop.mlx`)
 
 ## `for`
 
