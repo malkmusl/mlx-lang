@@ -1108,4 +1108,26 @@ set -e
 [[ "$mlx_seq_zero_status" -eq "$gnu_seq_zero_status" ]] || fail 'seq zero-increment exit status differs'
 diff <("$bin_dir/seq" 1 100000) <(/usr/bin/seq 1 100000) >/dev/null || fail 'seq large sequence differs'
 
+printf 'a\nb\nc\n' > "$work_dir/tac1"
+printf 'd\ne\n' > "$work_dir/tac2"
+printf 'a,b,c' > "$work_dir/tac3"
+"$bin_dir/tac" "$work_dir/tac1" > "$work_dir/actual"
+/usr/bin/tac "$work_dir/tac1" > "$work_dir/expected"
+cmp "$work_dir/actual" "$work_dir/expected" || fail 'tac single file differs'
+"$bin_dir/tac" "$work_dir/tac1" "$work_dir/tac2" > "$work_dir/actual"
+/usr/bin/tac "$work_dir/tac1" "$work_dir/tac2" > "$work_dir/expected"
+cmp "$work_dir/actual" "$work_dir/expected" || fail 'tac multi-file differs'
+"$bin_dir/tac" -b "$work_dir/tac1" > "$work_dir/actual"
+/usr/bin/tac -b "$work_dir/tac1" > "$work_dir/expected"
+cmp "$work_dir/actual" "$work_dir/expected" || fail 'tac -b differs'
+"$bin_dir/tac" -s, "$work_dir/tac3" > "$work_dir/actual"
+/usr/bin/tac -s, "$work_dir/tac3" > "$work_dir/expected"
+cmp "$work_dir/actual" "$work_dir/expected" || fail 'tac -s differs'
+"$bin_dir/tac" -b -s, "$work_dir/tac3" > "$work_dir/actual"
+/usr/bin/tac -b -s, "$work_dir/tac3" > "$work_dir/expected"
+cmp "$work_dir/actual" "$work_dir/expected" || fail 'tac -b -s differs'
+printf 'a\nb\nc' | "$bin_dir/tac" > "$work_dir/actual"
+printf 'a\nb\nc' | /usr/bin/tac > "$work_dir/expected"
+cmp "$work_dir/actual" "$work_dir/expected" || fail 'tac no-trailing-newline differs'
+
 printf 'all coreutils smoke tests passed\n'
