@@ -1231,4 +1231,28 @@ gnu_comm_stdin_status=$?
 set -e
 [[ "$mlx_comm_stdin_status" -eq "$gnu_comm_stdin_status" ]] || fail 'comm both-stdin exit status differs'
 
+tr_case() {
+    local input=$1
+    shift
+    printf '%s' "$input" | "$bin_dir/tr" "$@" > "$work_dir/actual"
+    printf '%s' "$input" | /usr/bin/tr "$@" > "$work_dir/expected"
+    cmp "$work_dir/actual" "$work_dir/expected" || fail "tr $* output differs"
+}
+tr_case $'hello world\n' 'a-z' 'A-Z'
+tr_case $'hello   world\n' -s ' '
+tr_case $'hello world\n' -d 'lo'
+tr_case $'hello world\n' -c 'a-z' '_'
+tr_case $'aabbccdd\n' -s 'a-z'
+tr_case $'foo bar\n' 'ab' 'X'
+tr_case $'Hello123\n' '[:upper:]' '[:lower:]'
+tr_case $'Hello123!\n' -d '[:punct:]'
+tr_case $'a\tb\n' '\t' ' '
+tr_case $'A\101B\n' '\101' 'X'
+tr_case $'abcdef\n' -t 'a-f' 'XY'
+tr_case $'aabbccdd\n' -ds 'a-b' 'c'
+tr_case $'aabbccdd\n' -s 'a-z' 'A-Z'
+printf 'abc' | "$bin_dir/tr" 'a-z' 'A-Z' > "$work_dir/actual"
+printf 'abc' | /usr/bin/tr 'a-z' 'A-Z' > "$work_dir/expected"
+cmp "$work_dir/actual" "$work_dir/expected" || fail 'tr no-trailing-newline differs'
+
 printf 'all coreutils smoke tests passed\n'
