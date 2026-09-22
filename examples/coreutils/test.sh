@@ -1389,4 +1389,16 @@ for util in md5sum sha1sum sha224sum sha256sum sha384sum sha512sum; do
     cmp "$work_dir/actual" "$work_dir/expected" || fail "$util -c (tag format) output differs"
 done
 
+for sum_mode in -r -s; do
+    "$bin_dir/sum" $sum_mode "$work_dir/ck1" > "$work_dir/actual"
+    "/usr/bin/sum" $sum_mode "$work_dir/ck1" > "$work_dir/expected"
+    cmp "$work_dir/actual" "$work_dir/expected" || fail "sum $sum_mode output differs"
+    "$bin_dir/sum" $sum_mode "$work_dir/ck1" "$work_dir/ck3" > "$work_dir/actual"
+    "/usr/bin/sum" $sum_mode "$work_dir/ck1" "$work_dir/ck3" > "$work_dir/expected"
+    cmp "$work_dir/actual" "$work_dir/expected" || fail "sum $sum_mode multi-file output differs"
+    "$bin_dir/sum" $sum_mode < "$work_dir/ck1" > "$work_dir/actual"
+    "/usr/bin/sum" $sum_mode < "$work_dir/ck1" > "$work_dir/expected"
+    cmp "$work_dir/actual" "$work_dir/expected" || fail "sum $sum_mode stdin output differs"
+done
+
 printf 'all coreutils smoke tests passed\n'
