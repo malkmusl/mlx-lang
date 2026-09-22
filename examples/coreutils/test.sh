@@ -1536,4 +1536,25 @@ diff <("$bin_dir/fmt" -u -w 40 "$work_dir/fmt2") <(/usr/bin/fmt -u -w 40 "$work_
 printf 'a    b   c\n' > "$work_dir/fmt3"
 diff <("$bin_dir/fmt" -s -w 40 "$work_dir/fmt3") <(/usr/bin/fmt -s -w 40 "$work_dir/fmt3") > /dev/null || fail 'fmt -s (line already fits, spacing preserved) output differs'
 
+seq 1 20 > "$work_dir/csdata"
+mkdir -p "$work_dir/cs-mine" "$work_dir/cs-gnu"
+(cd "$work_dir/cs-mine" && "$bin_dir/csplit" "$work_dir/csdata" 5 10 15 > out.txt)
+(cd "$work_dir/cs-gnu" && /usr/bin/csplit "$work_dir/csdata" 5 10 15 > out.txt)
+diff -rq "$work_dir/cs-mine" "$work_dir/cs-gnu" > /dev/null || fail 'csplit integer-pattern output differs'
+rm -rf "$work_dir/cs-mine" "$work_dir/cs-gnu"
+printf 'a\nb\nSTART\nc\nd\nSTART\ne\nf\n' > "$work_dir/cspat"
+mkdir -p "$work_dir/cs-mine" "$work_dir/cs-gnu"
+(cd "$work_dir/cs-mine" && "$bin_dir/csplit" "$work_dir/cspat" '/START/' '{*}' > out.txt)
+(cd "$work_dir/cs-gnu" && /usr/bin/csplit "$work_dir/cspat" '/START/' '{*}' > out.txt)
+diff -rq "$work_dir/cs-mine" "$work_dir/cs-gnu" > /dev/null || fail 'csplit regex {*} output differs'
+rm -rf "$work_dir/cs-mine" "$work_dir/cs-gnu"
+mkdir -p "$work_dir/cs-mine" "$work_dir/cs-gnu"
+(cd "$work_dir/cs-mine" && rc=0 && { "$bin_dir/csplit" "$work_dir/csdata" 5 100 > out.txt 2> err.txt || rc=$?; }; echo "exit=$rc" > exit.txt)
+(cd "$work_dir/cs-gnu" && rc=0 && { /usr/bin/csplit "$work_dir/csdata" 5 100 > out.txt 2> /dev/null || rc=$?; }; echo "exit=$rc" > exit.txt)
+diff "$work_dir/cs-mine/out.txt" "$work_dir/cs-gnu/out.txt" > /dev/null || fail 'csplit out-of-range stdout differs'
+diff "$work_dir/cs-mine/exit.txt" "$work_dir/cs-gnu/exit.txt" > /dev/null || fail 'csplit out-of-range exit status differs'
+if [[ -e "$work_dir/cs-mine/xx00" || -e "$work_dir/cs-mine/xx01" ]]; then
+    fail 'csplit removed output files on error by default, should be absent'
+fi
+
 printf 'all coreutils smoke tests passed\n'
