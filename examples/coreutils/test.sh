@@ -1416,4 +1416,15 @@ done
 "/usr/bin/cksum" -a md5 --untagged "$work_dir/ck1" > "$work_dir/expected"
 cmp "$work_dir/actual" "$work_dir/expected" || fail 'cksum -a md5 --untagged output differs'
 
+"$bin_dir/b2sum" "$work_dir/ck1" > "$work_dir/actual"
+"/usr/bin/b2sum" "$work_dir/ck1" > "$work_dir/expected"
+cmp "$work_dir/actual" "$work_dir/expected" || fail 'b2sum basic output differs'
+"$bin_dir/b2sum" --tag "$work_dir/ck1" > "$work_dir/actual"
+"/usr/bin/b2sum" --tag "$work_dir/ck1" > "$work_dir/expected"
+cmp "$work_dir/actual" "$work_dir/expected" || fail 'b2sum --tag output differs'
+"/usr/bin/b2sum" "$work_dir/ck1" "$work_dir/ck3" > "$work_dir/ck-b2-list"
+"$bin_dir/b2sum" -c "$work_dir/ck-b2-list" > "$work_dir/actual"
+"/usr/bin/b2sum" -c "$work_dir/ck-b2-list" > "$work_dir/expected"
+cmp "$work_dir/actual" "$work_dir/expected" || fail 'b2sum -c output differs'
+
 printf 'all coreutils smoke tests passed\n'

@@ -58,6 +58,7 @@ their `/usr/bin` counterparts.
 | `md5sum`, `sha1sum`, `sha224sum`, `sha256sum`, `sha384sum`, `sha512sum` | partial | a checksum file where every listed file is missing (or ignored via `--ignore-missing`) exits 0 instead of GNU's 1 ("no file was verified"); digest computation, `-b`/`-c`/`--tag`/`-t`/`-z`/`--status`/`--quiet`/`--strict`/`--ignore-missing`, and both the standard and BSD-tag checksum-file formats work |
 | `sum` | complete | none known |
 | `cksum` | partial | `-c`/`--check`, `--base64`, `--raw`, `-l`/`--length`, `-z`/`--zero`, and the `blake2b`/`sm3` digest types are not implemented; the default 32-bit CRC algorithm and `-a`/`--algorithm=`{`crc`,`sysv`,`bsd`,`md5`,`sha1`,`sha224`,`sha256`,`sha384`,`sha512`} with `--tag`/`--untagged` all work |
+| `b2sum` | partial | `-l`/`--length` (variable digest length) is not implemented, only the full 512-bit digest; a checksum file where every listed file is missing (or ignored via `--ignore-missing`) exits 0 instead of GNU's 1 ("no file was verified"); digest computation, `-b`/`-c`/`--tag`/`-t`/`-z`/`--status`/`--quiet`/`--strict`/`--ignore-missing`, and both the standard and BSD-tag checksum-file formats work |
 
 “Complete” means the documented option surface is implemented and covered by
 the current parity suite. It does not claim locale, filesystem, or kernel
