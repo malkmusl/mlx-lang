@@ -1482,4 +1482,19 @@ diff <("$bin_dir/date" -d @1700000000 '+%Y-%m-%d %H:%M:%S %a %Z') <(/usr/bin/dat
 diff <("$bin_dir/date" -d @1700000000) <(/usr/bin/date -d @1700000000) > /dev/null || fail 'date -d @epoch output differs'
 diff <("$bin_dir/date" -d '2024-01-15 10:30:00' '+%Y-%m-%d %H:%M:%S') <(/usr/bin/date -d '2024-01-15 10:30:00' '+%Y-%m-%d %H:%M:%S') > /dev/null || fail 'date -d STRING output differs'
 
+printf 'banana\napple\ncherry\napple\n' > "$work_dir/sort1"
+printf '10\n2\n33\n4\n' > "$work_dir/sort2"
+printf 'b:2\na:10\nc:1\n' > "$work_dir/sort3"
+diff <("$bin_dir/sort" "$work_dir/sort1") <(/usr/bin/sort "$work_dir/sort1") > /dev/null || fail 'sort default output differs'
+diff <("$bin_dir/sort" -r "$work_dir/sort1") <(/usr/bin/sort -r "$work_dir/sort1") > /dev/null || fail 'sort -r output differs'
+diff <("$bin_dir/sort" -u "$work_dir/sort1") <(/usr/bin/sort -u "$work_dir/sort1") > /dev/null || fail 'sort -u output differs'
+diff <("$bin_dir/sort" -n "$work_dir/sort2") <(/usr/bin/sort -n "$work_dir/sort2") > /dev/null || fail 'sort -n output differs'
+diff <("$bin_dir/sort" -nr "$work_dir/sort2") <(/usr/bin/sort -nr "$work_dir/sort2") > /dev/null || fail 'sort -nr (bundled flags) output differs'
+diff <("$bin_dir/sort" -t: -k2n "$work_dir/sort3") <(/usr/bin/sort -t: -k2n "$work_dir/sort3") > /dev/null || fail 'sort -t: -k2n output differs'
+diff <("$bin_dir/sort" "$work_dir/sort1" "$work_dir/sort2") <(/usr/bin/sort "$work_dir/sort1" "$work_dir/sort2") > /dev/null || fail 'sort multi-file output differs'
+"$bin_dir/sort" -c "$work_dir/sort2" || fail 'sort -c on sorted input should exit 0'
+if "$bin_dir/sort" -c "$work_dir/sort1" > /dev/null 2>&1; then
+    fail 'sort -c on unsorted input should exit nonzero'
+fi
+
 printf 'all coreutils smoke tests passed\n'
