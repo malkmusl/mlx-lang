@@ -1370,4 +1370,23 @@ printf '414243' | "$bin_dir/basenc" --base16 -d > "$work_dir/actual"
 printf '414243' | /usr/bin/basenc --base16 -d > "$work_dir/expected"
 cmp "$work_dir/actual" "$work_dir/expected" || fail 'basenc --base16 -d differs'
 
+printf 'hello\n' > "$work_dir/ck1"
+printf 'world\n' > "$work_dir/ck3"
+for util in md5sum sha1sum sha224sum sha256sum sha384sum sha512sum; do
+    "$bin_dir/$util" "$work_dir/ck1" > "$work_dir/actual"
+    "/usr/bin/$util" "$work_dir/ck1" > "$work_dir/expected"
+    cmp "$work_dir/actual" "$work_dir/expected" || fail "$util basic output differs"
+    "$bin_dir/$util" --tag "$work_dir/ck1" > "$work_dir/actual"
+    "/usr/bin/$util" --tag "$work_dir/ck1" > "$work_dir/expected"
+    cmp "$work_dir/actual" "$work_dir/expected" || fail "$util --tag output differs"
+    "/usr/bin/$util" "$work_dir/ck1" "$work_dir/ck3" > "$work_dir/ck-list"
+    "$bin_dir/$util" -c "$work_dir/ck-list" > "$work_dir/actual"
+    "/usr/bin/$util" -c "$work_dir/ck-list" > "$work_dir/expected"
+    cmp "$work_dir/actual" "$work_dir/expected" || fail "$util -c output differs"
+    "/usr/bin/$util" --tag "$work_dir/ck1" "$work_dir/ck3" > "$work_dir/ck-tag-list"
+    "$bin_dir/$util" -c "$work_dir/ck-tag-list" > "$work_dir/actual"
+    "/usr/bin/$util" -c "$work_dir/ck-tag-list" > "$work_dir/expected"
+    cmp "$work_dir/actual" "$work_dir/expected" || fail "$util -c (tag format) output differs"
+done
+
 printf 'all coreutils smoke tests passed\n'

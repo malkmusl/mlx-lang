@@ -55,6 +55,7 @@ their `/usr/bin` counterparts.
 | `expr` | partial | arithmetic uses fixed 64-bit integers rather than GNU's arbitrary precision; `\{n,m\}` interval repetition and `[=CHAR=]`/`[.CHAR.]` in regex bracket expressions are not implemented; arithmetic, comparisons, `\|`/`\&`, `length`/`substr`/`index`/`match`, `:`, and parentheses all work |
 | `test`, `[` | partial | `-b`, `-c`, `-p`, `-S`, `-g`, `-u`, `-k`, `-O`, `-G`, `-N` file tests are not implemented; string/numeric comparisons, `-e`/`-f`/`-d`/`-L`/`-h`/`-r`/`-w`/`-x`/`-s`, `-nt`/`-ot`/`-ef`, `!`/`-a`/`-o`, and parentheses all work |
 | `base64`, `base32`, `basenc` | partial | decoding does not strictly reject malformed/non-canonically-padded input the way GNU does; `basenc --z85` is not implemented; encoding, decoding, `-w`/`--wrap`, `-i`/`--ignore-garbage`, and all of basenc's `--base64`/`--base64url`/`--base32`/`--base32hex`/`--base16`/`--base2msbf`/`--base2lsbf` modes work |
+| `md5sum`, `sha1sum`, `sha224sum`, `sha256sum`, `sha384sum`, `sha512sum` | partial | a checksum file where every listed file is missing (or ignored via `--ignore-missing`) exits 0 instead of GNU's 1 ("no file was verified"); digest computation, `-b`/`-c`/`--tag`/`-t`/`-z`/`--status`/`--quiet`/`--strict`/`--ignore-missing`, and both the standard and BSD-tag checksum-file formats work |
 
 “Complete” means the documented option surface is implemented and covered by
 the current parity suite. It does not claim locale, filesystem, or kernel
