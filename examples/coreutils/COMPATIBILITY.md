@@ -61,6 +61,7 @@ their `/usr/bin` counterparts.
 | `b2sum` | partial | `-l`/`--length` (variable digest length) is not implemented, only the full 512-bit digest; a checksum file where every listed file is missing (or ignored via `--ignore-missing`) exits 0 instead of GNU's 1 ("no file was verified"); digest computation, `-b`/`-c`/`--tag`/`-t`/`-z`/`--status`/`--quiet`/`--strict`/`--ignore-missing`, and both the standard and BSD-tag checksum-file formats work |
 | `expand` | partial | the comma-separated `-t`/`--tabs=LIST` custom tab-stop form is not implemented, only a single numeric width; `-i`/`--initial` and `-t`/`--tabs=N` work |
 | `unexpand` | partial | the comma-separated `-t`/`--tabs=LIST` custom tab-stop form is not implemented, only a single numeric width; column tracking treats an input blank run as a uniform span (a literal input tab immediately adjacent to a tab stop can be re-emitted as a space instead of preserved verbatim), and other terminal control characters (e.g. backspace) are not given special column-width handling; `-a`/`--all`, `--first-only`, and `-t`/`--tabs=N` work |
+| `paste` | complete | none known |
 
 “Complete” means the documented option surface is implemented and covered by
 the current parity suite. It does not claim locale, filesystem, or kernel

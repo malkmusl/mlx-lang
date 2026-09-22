@@ -1449,4 +1449,16 @@ cmp "$work_dir/actual" "$work_dir/expected" || fail 'unexpand -a output differs'
 /usr/bin/unexpand -a -t 4 "$work_dir/unexpand1" > "$work_dir/expected"
 cmp "$work_dir/actual" "$work_dir/expected" || fail 'unexpand -a -t 4 output differs'
 
+printf 'a\nb\nc\n' > "$work_dir/paste1"
+printf '1\n2\n3\n' > "$work_dir/paste2"
+"$bin_dir/paste" "$work_dir/paste1" "$work_dir/paste2" > "$work_dir/actual"
+/usr/bin/paste "$work_dir/paste1" "$work_dir/paste2" > "$work_dir/expected"
+cmp "$work_dir/actual" "$work_dir/expected" || fail 'paste default output differs'
+"$bin_dir/paste" -s "$work_dir/paste1" "$work_dir/paste2" > "$work_dir/actual"
+/usr/bin/paste -s "$work_dir/paste1" "$work_dir/paste2" > "$work_dir/expected"
+cmp "$work_dir/actual" "$work_dir/expected" || fail 'paste -s output differs'
+"$bin_dir/paste" -d, "$work_dir/paste1" "$work_dir/paste2" > "$work_dir/actual"
+/usr/bin/paste -d, "$work_dir/paste1" "$work_dir/paste2" > "$work_dir/expected"
+cmp "$work_dir/actual" "$work_dir/expected" || fail 'paste -d, output differs'
+
 printf 'all coreutils smoke tests passed\n'
