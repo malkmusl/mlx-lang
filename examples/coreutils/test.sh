@@ -1206,4 +1206,29 @@ gnu_cut_nomode_status=$?
 set -e
 [[ "$mlx_cut_nomode_status" -eq "$gnu_cut_nomode_status" ]] || fail 'cut no-mode exit status differs'
 
+printf 'a\nb\nc\nd\n' > "$work_dir/comm1"
+printf 'b\nc\ne\n' > "$work_dir/comm2"
+printf '' > "$work_dir/comm-empty"
+for comm_case in '' '-1' '-2' '-3' '-12' '-13' '-23' '-123' '--output-delimiter=:'; do
+    "$bin_dir/comm" $comm_case "$work_dir/comm1" "$work_dir/comm2" > "$work_dir/actual"
+    /usr/bin/comm $comm_case "$work_dir/comm1" "$work_dir/comm2" > "$work_dir/expected"
+    cmp "$work_dir/actual" "$work_dir/expected" || fail "comm $comm_case output differs"
+done
+"$bin_dir/comm" "$work_dir/comm1" "$work_dir/comm1" > "$work_dir/actual"
+/usr/bin/comm "$work_dir/comm1" "$work_dir/comm1" > "$work_dir/expected"
+cmp "$work_dir/actual" "$work_dir/expected" || fail 'comm identical files output differs'
+"$bin_dir/comm" "$work_dir/comm1" "$work_dir/comm-empty" > "$work_dir/actual"
+/usr/bin/comm "$work_dir/comm1" "$work_dir/comm-empty" > "$work_dir/expected"
+cmp "$work_dir/actual" "$work_dir/expected" || fail 'comm empty file2 output differs'
+printf 'a\nb\n' | "$bin_dir/comm" - "$work_dir/comm2" > "$work_dir/actual"
+printf 'a\nb\n' | /usr/bin/comm - "$work_dir/comm2" > "$work_dir/expected"
+cmp "$work_dir/actual" "$work_dir/expected" || fail 'comm stdin as file1 differs'
+set +e
+"$bin_dir/comm" - - </dev/null >/dev/null 2>&1
+mlx_comm_stdin_status=$?
+/usr/bin/comm - - </dev/null >/dev/null 2>&1
+gnu_comm_stdin_status=$?
+set -e
+[[ "$mlx_comm_stdin_status" -eq "$gnu_comm_stdin_status" ]] || fail 'comm both-stdin exit status differs'
+
 printf 'all coreutils smoke tests passed\n'

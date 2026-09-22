@@ -50,6 +50,7 @@ their `/usr/bin` counterparts.
 | `fold` | complete | none known |
 | `uniq` | partial | `--all-repeated` and `--group` (blank-line-separated group output) are not implemented |
 | `cut` | complete | none known |
+| `comm` | partial | `--check-order`/`--nocheck-order` sorted-input validation and `--total` are accepted but not implemented (input order is trusted, not verified) |
 
 “Complete” means the documented option surface is implemented and covered by
 the current parity suite. It does not claim locale, filesystem, or kernel
