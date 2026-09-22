@@ -1557,4 +1557,15 @@ if [[ -e "$work_dir/cs-mine/xx00" || -e "$work_dir/cs-mine/xx01" ]]; then
     fail 'csplit removed output files on error by default, should be absent'
 fi
 
+normalize_pr_date() {
+    sed 's/^[0-9]\{4\}-[0-9]\{2\}-[0-9]\{2\} [0-9:]* /DATE /'
+}
+seq 1 10 > "$work_dir/prtest"
+diff <("$bin_dir/pr" -l 20 "$work_dir/prtest" | normalize_pr_date) <(/usr/bin/pr -l 20 "$work_dir/prtest" | normalize_pr_date) > /dev/null || fail 'pr basic pagination output differs'
+diff <("$bin_dir/pr" -l 20 -t -n "$work_dir/prtest") <(/usr/bin/pr -l 20 -t -n "$work_dir/prtest") > /dev/null || fail 'pr -t -n output differs'
+diff <("$bin_dir/pr" -l 20 -t -o 4 "$work_dir/prtest") <(/usr/bin/pr -l 20 -t -o 4 "$work_dir/prtest") > /dev/null || fail 'pr -t -o 4 output differs'
+diff <("$bin_dir/pr" -l 20 -F "$work_dir/prtest" | normalize_pr_date) <(/usr/bin/pr -l 20 -F "$work_dir/prtest" | normalize_pr_date) > /dev/null || fail 'pr -F output differs'
+printf '1\n2\n3\n' > "$work_dir/pr3"
+diff <("$bin_dir/pr" -l 15 "$work_dir/pr3" | normalize_pr_date) <(/usr/bin/pr -l 15 "$work_dir/pr3" | normalize_pr_date) > /dev/null || fail 'pr short-input padding output differs'
+
 printf 'all coreutils smoke tests passed\n'
