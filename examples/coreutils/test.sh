@@ -1473,4 +1473,13 @@ r1=$("$bin_dir/shuf" --random-source=/dev/zero "$work_dir/shuf1")
 r2=$("$bin_dir/shuf" --random-source=/dev/zero "$work_dir/shuf1")
 [[ "$r1" == "$r2" ]] || fail 'shuf --random-source=/dev/zero was not deterministic'
 
+diff <("$bin_dir/date" '+%Y-%m-%d %H:%M') <(/usr/bin/date '+%Y-%m-%d %H:%M') > /dev/null || fail 'date default (minute precision) output differs'
+diff <("$bin_dir/date" -u '+%Y-%m-%d %H:%M') <(/usr/bin/date -u '+%Y-%m-%d %H:%M') > /dev/null || fail 'date -u (minute precision) output differs'
+diff <("$bin_dir/date" -d @1700000000 -R) <(/usr/bin/date -d @1700000000 -R) > /dev/null || fail 'date -R output differs'
+diff <("$bin_dir/date" -d @1700000000 -Iseconds) <(/usr/bin/date -d @1700000000 -Iseconds) > /dev/null || fail 'date -Iseconds output differs'
+diff <("$bin_dir/date" -d @1700000000 --rfc-3339=seconds) <(/usr/bin/date -d @1700000000 --rfc-3339=seconds) > /dev/null || fail 'date --rfc-3339=seconds output differs'
+diff <("$bin_dir/date" -d @1700000000 '+%Y-%m-%d %H:%M:%S %a %Z') <(/usr/bin/date -d @1700000000 '+%Y-%m-%d %H:%M:%S %a %Z') > /dev/null || fail 'date custom format output differs'
+diff <("$bin_dir/date" -d @1700000000) <(/usr/bin/date -d @1700000000) > /dev/null || fail 'date -d @epoch output differs'
+diff <("$bin_dir/date" -d '2024-01-15 10:30:00' '+%Y-%m-%d %H:%M:%S') <(/usr/bin/date -d '2024-01-15 10:30:00' '+%Y-%m-%d %H:%M:%S') > /dev/null || fail 'date -d STRING output differs'
+
 printf 'all coreutils smoke tests passed\n'
