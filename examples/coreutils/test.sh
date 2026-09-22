@@ -1156,4 +1156,31 @@ printf 'abcdefghij' | "$bin_dir/fold" -w4 > "$work_dir/actual"
 printf 'abcdefghij' | /usr/bin/fold -w4 > "$work_dir/expected"
 cmp "$work_dir/actual" "$work_dir/expected" || fail 'fold no-trailing-newline differs'
 
+printf 'a\na\nb\nb\nb\nc\n' > "$work_dir/uniq1"
+printf 'A a\nA b\nB c\n' > "$work_dir/uniq2"
+printf 'AAAa\nAAAb\n' > "$work_dir/uniq3"
+printf 'apple\nApple\nbanana\n' > "$work_dir/uniq4"
+printf 'abcX\nabcY\nabd\n' > "$work_dir/uniq5"
+for uniq_case in 'uniq1' 'uniq1 -c' 'uniq1 -d' 'uniq1 -u' 'uniq1 -D' 'uniq1 -cd' 'uniq2 -f1' 'uniq3 -s3' 'uniq4 -i' 'uniq5 -w3'; do
+    set -- $uniq_case
+    file="$work_dir/$1"
+    shift
+    "$bin_dir/uniq" "$@" "$file" > "$work_dir/actual"
+    /usr/bin/uniq "$@" "$file" > "$work_dir/expected"
+    cmp "$work_dir/actual" "$work_dir/expected" || fail "uniq $uniq_case output differs"
+done
+printf 'a\na\nb' | "$bin_dir/uniq" > "$work_dir/actual"
+printf 'a\na\nb' | /usr/bin/uniq > "$work_dir/expected"
+cmp "$work_dir/actual" "$work_dir/expected" || fail 'uniq no-trailing-newline differs'
+"$bin_dir/uniq" "$work_dir/uniq1" "$work_dir/uniq-out"
+/usr/bin/uniq "$work_dir/uniq1" "$work_dir/uniq-out-gnu"
+cmp "$work_dir/uniq-out" "$work_dir/uniq-out-gnu" || fail 'uniq explicit output file differs'
+set +e
+"$bin_dir/uniq" -cD "$work_dir/uniq1" >/dev/null 2>&1
+mlx_uniq_cd_status=$?
+/usr/bin/uniq -cD "$work_dir/uniq1" >/dev/null 2>&1
+gnu_uniq_cd_status=$?
+set -e
+[[ "$mlx_uniq_cd_status" -eq "$gnu_uniq_cd_status" ]] || fail 'uniq -cD exit status differs'
+
 printf 'all coreutils smoke tests passed\n'
