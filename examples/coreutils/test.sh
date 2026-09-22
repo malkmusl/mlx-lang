@@ -1140,4 +1140,20 @@ printf 'a\nb' | "$bin_dir/nl" > "$work_dir/actual"
 printf 'a\nb' | /usr/bin/nl > "$work_dir/expected"
 cmp "$work_dir/actual" "$work_dir/expected" || fail 'nl no-trailing-newline differs'
 
+printf 'abcdefghij\n' > "$work_dir/fold1"
+printf 'a\tbcdefg\n' > "$work_dir/fold2"
+printf 'one two three four five\n' > "$work_dir/fold3"
+printf 'abc\ndef\n' > "$work_dir/fold4"
+for fold_case in 'fold1 -w4' 'fold2 -w4' 'fold2 -bw4' 'fold3 -sw10' 'fold4 -w2' 'fold1' 'fold1 -w 4' 'fold1 --width=4'; do
+    set -- $fold_case
+    file="$work_dir/$1"
+    shift
+    "$bin_dir/fold" "$@" "$file" > "$work_dir/actual"
+    /usr/bin/fold "$@" "$file" > "$work_dir/expected"
+    cmp "$work_dir/actual" "$work_dir/expected" || fail "fold $fold_case output differs"
+done
+printf 'abcdefghij' | "$bin_dir/fold" -w4 > "$work_dir/actual"
+printf 'abcdefghij' | /usr/bin/fold -w4 > "$work_dir/expected"
+cmp "$work_dir/actual" "$work_dir/expected" || fail 'fold no-trailing-newline differs'
+
 printf 'all coreutils smoke tests passed\n'
