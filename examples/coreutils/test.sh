@@ -1183,4 +1183,27 @@ gnu_uniq_cd_status=$?
 set -e
 [[ "$mlx_uniq_cd_status" -eq "$gnu_uniq_cd_status" ]] || fail 'uniq -cD exit status differs'
 
+printf 'hello\n' > "$work_dir/cut1"
+printf 'a:b:c:d\n' > "$work_dir/cut2"
+printf 'a:b:c\nnodel\n' > "$work_dir/cut3"
+printf 'abcdefgh\n' > "$work_dir/cut4"
+for cut_case in 'cut1 -c1-3' 'cut1 -c2-' 'cut1 -c-3' 'cut1 -c1,3,5' 'cut2 -d: -f2,4' 'cut2 -d: -f2-3' 'cut3 -d: -f2' 'cut3 -d: -f2 -s' 'cut2 -d: -f2 --complement' 'cut2 -d: -f1,3 --output-delimiter=,' 'cut4 -c2-4,3-6'; do
+    set -- $cut_case
+    file="$work_dir/$1"
+    shift
+    "$bin_dir/cut" "$@" "$file" > "$work_dir/actual"
+    /usr/bin/cut "$@" "$file" > "$work_dir/expected"
+    cmp "$work_dir/actual" "$work_dir/expected" || fail "cut $cut_case output differs"
+done
+printf 'abc' | "$bin_dir/cut" -c1-2 > "$work_dir/actual"
+printf 'abc' | /usr/bin/cut -c1-2 > "$work_dir/expected"
+cmp "$work_dir/actual" "$work_dir/expected" || fail 'cut no-trailing-newline differs'
+set +e
+"$bin_dir/cut" "$work_dir/cut1" >/dev/null 2>&1
+mlx_cut_nomode_status=$?
+/usr/bin/cut "$work_dir/cut1" >/dev/null 2>&1
+gnu_cut_nomode_status=$?
+set -e
+[[ "$mlx_cut_nomode_status" -eq "$gnu_cut_nomode_status" ]] || fail 'cut no-mode exit status differs'
+
 printf 'all coreutils smoke tests passed\n'
