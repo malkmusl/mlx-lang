@@ -1255,4 +1255,46 @@ printf 'abc' | "$bin_dir/tr" 'a-z' 'A-Z' > "$work_dir/actual"
 printf 'abc' | /usr/bin/tr 'a-z' 'A-Z' > "$work_dir/expected"
 cmp "$work_dir/actual" "$work_dir/expected" || fail 'tr no-trailing-newline differs'
 
+expr_case() {
+    local mlx_out gnu_out mlx_status gnu_status
+    set +e
+    mlx_out=$("$bin_dir/expr" "$@" 2>/dev/null)
+    mlx_status=$?
+    gnu_out=$(/usr/bin/expr "$@" 2>/dev/null)
+    gnu_status=$?
+    set -e
+    [[ "$mlx_status" -eq "$gnu_status" ]] || fail "expr $* exit status differs"
+    if [[ "$mlx_status" -ne 2 ]]; then
+        [[ "$mlx_out" == "$gnu_out" ]] || fail "expr $* output differs"
+    fi
+}
+expr_case 1 + 2
+expr_case 10 / 3
+expr_case 10 % 3
+expr_case 3 '*' 4
+expr_case 5 - 2
+expr_case 5 '>' 3
+expr_case 5 '<' 3
+expr_case 5 = 5
+expr_case abc = abc
+expr_case abc = def
+expr_case 3 '|' 5
+expr_case 0 '|' 5
+expr_case 0 '&' 5
+expr_case 3 '&' 5
+expr_case length hello
+expr_case substr hello 2 3
+expr_case index hello lo
+expr_case hello : 'h.l'
+expr_case hello : '\(h.l\)'
+expr_case '(' 1 + 2 ')' '*' 3
+expr_case 0
+expr_case ''
+expr_case 1 = 2
+expr_case 'abc123' : '[a-z]*\([0-9]*\)'
+expr_case 'aaab' : 'a*b'
+expr_case 'hello' : 'hello$'
+expr_case 'hello!' : 'hello$'
+expr_case 'abc' : '[^0-9]*'
+
 printf 'all coreutils smoke tests passed\n'
