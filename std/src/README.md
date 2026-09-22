@@ -9,3 +9,8 @@ surface once Mlx1 can instantiate reflection-heavy generics itself.
 
 Native code uses `std.os.*`; portable POSIX software uses `std.posix`; Wayland
 uses `std.wayland` plus generated protocol modules.
+
+`std.path`, `std.mode`, `std.parse`, `std.shell` and `std.calendar` provide
+coreutils-grade building blocks (path manipulation/canonicalization, chmod-style
+permission parsing, sized-number/duration parsing, POSIX-ish word splitting and
+calendar/timestamp parsing) that were generalized out of `examples/coreutils`.

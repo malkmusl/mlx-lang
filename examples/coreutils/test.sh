@@ -1055,4 +1055,89 @@ if "$bin_dir/ls" "$work_dir/ls-missing" >/dev/null 2>&1; then
     fail 'ls accepted a missing operand'
 fi
 
+# Regression: parsing a numeric field of exactly 0 (root uid/gid, --width=0,
+# --color=never, ...) must not be mistaken for "no value" by any ?integer
+# result used across these utilities.
+LC_ALL=C "$bin_dir/ls" -l /etc/passwd > "$work_dir/actual"
+LC_ALL=C /usr/bin/ls -l /etc/passwd > "$work_dir/expected"
+cmp "$work_dir/actual" "$work_dir/expected" || fail 'ls -l root-owned identity output differs'
+for ls_flags in '--width=0' '--color=never' '--hyperlink=never' '--classify=none'; do
+    LC_ALL=C "$bin_dir/ls" $ls_flags /etc/passwd > "$work_dir/actual"
+    LC_ALL=C /usr/bin/ls $ls_flags /etc/passwd > "$work_dir/expected"
+    cmp "$work_dir/actual" "$work_dir/expected" || fail "ls $ls_flags output differs"
+done
+
+"$bin_dir/arch" > "$work_dir/actual"
+/usr/bin/arch > "$work_dir/expected"
+cmp "$work_dir/actual" "$work_dir/expected" || fail 'arch output differs'
+
+"$bin_dir/whoami" > "$work_dir/actual"
+/usr/bin/whoami > "$work_dir/expected"
+cmp "$work_dir/actual" "$work_dir/expected" || fail 'whoami output differs'
+
+set +e
+"$bin_dir/logname" > "$work_dir/actual" 2> "$work_dir/actual-error"
+mlx_logname_status=$?
+/usr/bin/logname > "$work_dir/expected" 2> "$work_dir/expected-error"
+gnu_logname_status=$?
+set -e
+[[ "$mlx_logname_status" -eq "$gnu_logname_status" ]] || fail 'logname exit status differs'
+cmp "$work_dir/actual" "$work_dir/expected" || fail 'logname output differs'
+grep -q 'no login name' "$work_dir/expected-error" && {
+    grep -q 'no login name' "$work_dir/actual-error" || fail 'logname diagnostic differs'
+}
+
+for seq_args in '5' '3 7' '1 2 10' '5 1' '5 -1 1' '-5 5' '-w -5 5' '-w 0 10' '-w 8 10' '-s, 1 5' '-s, -w 1 10' '-s: 1 3' '--separator=: 1 3' '1 -1 -3' '-5' '-- -5 -1'; do
+    "$bin_dir/seq" $seq_args > "$work_dir/actual"
+    /usr/bin/seq $seq_args > "$work_dir/expected"
+    cmp "$work_dir/actual" "$work_dir/expected" || fail "seq $seq_args output differs"
+done
+set +e
+"$bin_dir/seq" > "$work_dir/actual" 2>&1
+mlx_seq_status=$?
+/usr/bin/seq > "$work_dir/expected" 2>&1
+gnu_seq_status=$?
+set -e
+[[ "$mlx_seq_status" -eq "$gnu_seq_status" ]] || fail 'seq missing-operand exit status differs'
+set +e
+"$bin_dir/seq" 1 0 5 >/dev/null 2>&1
+mlx_seq_zero_status=$?
+/usr/bin/seq 1 0 5 >/dev/null 2>&1
+gnu_seq_zero_status=$?
+set -e
+[[ "$mlx_seq_zero_status" -eq "$gnu_seq_zero_status" ]] || fail 'seq zero-increment exit status differs'
+diff <("$bin_dir/seq" 1 100000) <(/usr/bin/seq 1 100000) >/dev/null || fail 'seq large sequence differs'
+
+printf 'a\nb\nc\n' > "$work_dir/tac1"
+printf 'd\ne\n' > "$work_dir/tac2"
+printf 'a,b,c' > "$work_dir/tac3"
+"$bin_dir/tac" "$work_dir/tac1" > "$work_dir/actual"
+/usr/bin/tac "$work_dir/tac1" > "$work_dir/expected"
+cmp "$work_dir/actual" "$work_dir/expected" || fail 'tac single file differs'
+"$bin_dir/tac" "$work_dir/tac1" "$work_dir/tac2" > "$work_dir/actual"
+/usr/bin/tac "$work_dir/tac1" "$work_dir/tac2" > "$work_dir/expected"
+cmp "$work_dir/actual" "$work_dir/expected" || fail 'tac multi-file differs'
+"$bin_dir/tac" -b "$work_dir/tac1" > "$work_dir/actual"
+/usr/bin/tac -b "$work_dir/tac1" > "$work_dir/expected"
+cmp "$work_dir/actual" "$work_dir/expected" || fail 'tac -b differs'
+"$bin_dir/tac" -s, "$work_dir/tac3" > "$work_dir/actual"
+/usr/bin/tac -s, "$work_dir/tac3" > "$work_dir/expected"
+cmp "$work_dir/actual" "$work_dir/expected" || fail 'tac -s differs'
+"$bin_dir/tac" -b -s, "$work_dir/tac3" > "$work_dir/actual"
+/usr/bin/tac -b -s, "$work_dir/tac3" > "$work_dir/expected"
+cmp "$work_dir/actual" "$work_dir/expected" || fail 'tac -b -s differs'
+printf 'a\nb\nc' | "$bin_dir/tac" > "$work_dir/actual"
+printf 'a\nb\nc' | /usr/bin/tac > "$work_dir/expected"
+cmp "$work_dir/actual" "$work_dir/expected" || fail 'tac no-trailing-newline differs'
+
+printf 'a\n\nb\nc\n\n\nd\n' > "$work_dir/nl1"
+for nl_flags in '' '-ba' '-w4 -s: ' '-nln -w3' '-v10 -i5' '-nrz' '-bn'; do
+    "$bin_dir/nl" $nl_flags "$work_dir/nl1" > "$work_dir/actual"
+    /usr/bin/nl $nl_flags "$work_dir/nl1" > "$work_dir/expected"
+    cmp "$work_dir/actual" "$work_dir/expected" || fail "nl $nl_flags output differs"
+done
+printf 'a\nb' | "$bin_dir/nl" > "$work_dir/actual"
+printf 'a\nb' | /usr/bin/nl > "$work_dir/expected"
+cmp "$work_dir/actual" "$work_dir/expected" || fail 'nl no-trailing-newline differs'
+
 printf 'all coreutils smoke tests passed\n'
