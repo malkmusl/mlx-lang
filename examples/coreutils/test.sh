@@ -1343,4 +1343,31 @@ gnu_bracket_status=$?
 set -e
 [[ "$mlx_bracket_status" -eq "$gnu_bracket_status" ]] || fail '[ missing close exit status differs'
 
+printf 'hello world' | "$bin_dir/base64" > "$work_dir/actual"
+printf 'hello world' | /usr/bin/base64 > "$work_dir/expected"
+cmp "$work_dir/actual" "$work_dir/expected" || fail 'base64 encode differs'
+printf 'hello world' | "$bin_dir/base64" | "$bin_dir/base64" -d > "$work_dir/actual"
+printf 'hello world' > "$work_dir/expected"
+cmp "$work_dir/actual" "$work_dir/expected" || fail 'base64 roundtrip differs'
+printf 'a longer test string to check line wrapping behavior of base64 encoding output format here' | "$bin_dir/base64" > "$work_dir/actual"
+printf 'a longer test string to check line wrapping behavior of base64 encoding output format here' | /usr/bin/base64 > "$work_dir/expected"
+cmp "$work_dir/actual" "$work_dir/expected" || fail 'base64 wrap differs'
+printf 'hello world' | "$bin_dir/base64" -w0 > "$work_dir/actual"
+printf 'hello world' | /usr/bin/base64 -w0 > "$work_dir/expected"
+cmp "$work_dir/actual" "$work_dir/expected" || fail 'base64 -w0 differs'
+printf 'hello' | "$bin_dir/base32" > "$work_dir/actual"
+printf 'hello' | /usr/bin/base32 > "$work_dir/expected"
+cmp "$work_dir/actual" "$work_dir/expected" || fail 'base32 encode differs'
+printf 'hello world' | "$bin_dir/base32" | "$bin_dir/base32" -d > "$work_dir/actual"
+printf 'hello world' > "$work_dir/expected"
+cmp "$work_dir/actual" "$work_dir/expected" || fail 'base32 roundtrip differs'
+for basenc_mode in --base16 --base2msbf --base2lsbf --base32hex --base64url; do
+    printf 'hello world, this is a longer test string 1234567890' | "$bin_dir/basenc" $basenc_mode > "$work_dir/actual"
+    printf 'hello world, this is a longer test string 1234567890' | /usr/bin/basenc $basenc_mode > "$work_dir/expected"
+    cmp "$work_dir/actual" "$work_dir/expected" || fail "basenc $basenc_mode output differs"
+done
+printf '414243' | "$bin_dir/basenc" --base16 -d > "$work_dir/actual"
+printf '414243' | /usr/bin/basenc --base16 -d > "$work_dir/expected"
+cmp "$work_dir/actual" "$work_dir/expected" || fail 'basenc --base16 -d differs'
+
 printf 'all coreutils smoke tests passed\n'
