@@ -1527,4 +1527,13 @@ mkdir -p "$work_dir/split-mine" "$work_dir/split-gnu"
 (cd "$work_dir/split-gnu" && /usr/bin/split -C 15 "$work_dir/split-input")
 diff -rq "$work_dir/split-mine" "$work_dir/split-gnu" > /dev/null || fail 'split -C 15 output differs'
 
+printf 'This is a simple test of the fmt utility that should reflow this paragraph nicely into lines of the given width.\n\nAnd a second paragraph here that is also long enough to need wrapping across several lines of output text.\n' > "$work_dir/fmt1"
+"$bin_dir/fmt" -w 40 "$work_dir/fmt1" > "$work_dir/fmt1-actual"
+awk '{ if (length($0) > 40) exit 1 }' "$work_dir/fmt1-actual" || fail 'fmt -w 40 produced a line exceeding the width'
+diff <(tr -s ' \n' ' ' < "$work_dir/fmt1-actual") <(tr -s ' \n' ' ' < "$work_dir/fmt1") > /dev/null || fail 'fmt -w 40 changed word content or order'
+printf 'word1    word2.  Word3     word4.\n' > "$work_dir/fmt2"
+diff <("$bin_dir/fmt" -u -w 40 "$work_dir/fmt2") <(/usr/bin/fmt -u -w 40 "$work_dir/fmt2") > /dev/null || fail 'fmt -u output differs'
+printf 'a    b   c\n' > "$work_dir/fmt3"
+diff <("$bin_dir/fmt" -s -w 40 "$work_dir/fmt3") <(/usr/bin/fmt -s -w 40 "$work_dir/fmt3") > /dev/null || fail 'fmt -s (line already fits, spacing preserved) output differs'
+
 printf 'all coreutils smoke tests passed\n'
