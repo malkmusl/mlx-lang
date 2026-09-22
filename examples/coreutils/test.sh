@@ -1427,4 +1427,26 @@ cmp "$work_dir/actual" "$work_dir/expected" || fail 'b2sum --tag output differs'
 "/usr/bin/b2sum" -c "$work_dir/ck-b2-list" > "$work_dir/expected"
 cmp "$work_dir/actual" "$work_dir/expected" || fail 'b2sum -c output differs'
 
+printf '\t\thello\tworld\n' > "$work_dir/expand1"
+"$bin_dir/expand" "$work_dir/expand1" > "$work_dir/actual"
+/usr/bin/expand "$work_dir/expand1" > "$work_dir/expected"
+cmp "$work_dir/actual" "$work_dir/expected" || fail 'expand default output differs'
+"$bin_dir/expand" -i "$work_dir/expand1" > "$work_dir/actual"
+/usr/bin/expand -i "$work_dir/expand1" > "$work_dir/expected"
+cmp "$work_dir/actual" "$work_dir/expected" || fail 'expand -i output differs'
+"$bin_dir/expand" -t 4 "$work_dir/expand1" > "$work_dir/actual"
+/usr/bin/expand -t 4 "$work_dir/expand1" > "$work_dir/expected"
+cmp "$work_dir/actual" "$work_dir/expected" || fail 'expand -t 4 output differs'
+
+printf '        hello   world\nb       c\n' > "$work_dir/unexpand1"
+"$bin_dir/unexpand" "$work_dir/unexpand1" > "$work_dir/actual"
+/usr/bin/unexpand "$work_dir/unexpand1" > "$work_dir/expected"
+cmp "$work_dir/actual" "$work_dir/expected" || fail 'unexpand default output differs'
+"$bin_dir/unexpand" -a "$work_dir/unexpand1" > "$work_dir/actual"
+/usr/bin/unexpand -a "$work_dir/unexpand1" > "$work_dir/expected"
+cmp "$work_dir/actual" "$work_dir/expected" || fail 'unexpand -a output differs'
+"$bin_dir/unexpand" -a -t 4 "$work_dir/unexpand1" > "$work_dir/actual"
+/usr/bin/unexpand -a -t 4 "$work_dir/unexpand1" > "$work_dir/expected"
+cmp "$work_dir/actual" "$work_dir/expected" || fail 'unexpand -a -t 4 output differs'
+
 printf 'all coreutils smoke tests passed\n'
