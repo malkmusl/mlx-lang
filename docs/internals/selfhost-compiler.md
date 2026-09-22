@@ -466,6 +466,33 @@ directly matching the README's "separates mutable backend state from
 label, memory, arithmetic, value, call and control-flow instruction
 emission."
 
+Every LIR value (`vreg`) lives at a fixed stack offset assigned once by
+`State.allocateOp`, keyed by a per-function `slotEpoch` so vreg-index slots
+can be reused across functions without clearing the whole table between
+them (bumped once per function in `State.beginFunction`, not per basic
+block). A single-word value that is used by exactly the LIR instruction
+right after it skips that stack write as a peephole
+(`State.storeRaxResult`'s `canRetainNext`/`state.pendingRaxVreg` path):
+the value stays in `rax` only, on the assumption that its one consumer is
+about to read it immediately. `State.getComponent` is a plain "has this
+vreg already been written to memory?" peek that knows nothing about that
+pending state; most component-0 readers instead go through `State.loadOp`,
+which does. Two call sites didn't: `emitTupleElement` (`@field(value, N)`
+codegen, `codegen/values.mlx`) and the call-argument loaders
+(`codegen/calls.mlx`). Whenever the retained value's real consumer wasn't
+literally the next instruction — one arm of a branch reading the field
+while the other called anything, or the value being passed to a call and
+then read again — those two silently treated the "not yet written" peek as
+"the value is zero" (`emitTupleElement` had a literal `movRegImm64 rax, 0`
+fallback) instead of resolving the still-pending value. Fixed by routing
+component-0 reads through `State.loadOp` in both places;
+`tests/235_component_zero_call_and_branch_runtime.mlx` reproduces all three
+shapes directly (and asserts the fix), and `tests/170_standard_fmt_any_struct_runtime.mlx` /
+`tests/173_standard_fmt_nested_any_runtime.mlx` (see `## fmt` in
+`docs/reference/stdlib.md`) are real pre-existing tests that this same bug
+crashed (`SIGSEGV`) before the fix, via `std.io.printFmt`'s single-argument
+recursive `anytype`-tuple lookup.
+
 `emitStartStub` hand-encodes the process entry point (`_start`) directly as
 raw opcode bytes (`encoder.emit1(state.*.enc, 0x48) ...`) — reading argc off
 the stack, computing argv, calling `main`, and exiting via the `syscall`
