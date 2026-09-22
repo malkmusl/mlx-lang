@@ -1497,4 +1497,18 @@ if "$bin_dir/sort" -c "$work_dir/sort1" > /dev/null 2>&1; then
     fail 'sort -c on unsorted input should exit nonzero'
 fi
 
+printf '1 a\n2 b\n3 c\n' > "$work_dir/join1"
+printf '1 x\n2 y\n4 z\n' > "$work_dir/join2"
+diff <("$bin_dir/join" "$work_dir/join1" "$work_dir/join2") <(/usr/bin/join "$work_dir/join1" "$work_dir/join2") > /dev/null || fail 'join default output differs'
+diff <("$bin_dir/join" -a 1 "$work_dir/join1" "$work_dir/join2") <(/usr/bin/join -a 1 "$work_dir/join1" "$work_dir/join2") > /dev/null || fail 'join -a 1 output differs'
+diff <("$bin_dir/join" -a1 -a2 "$work_dir/join1" "$work_dir/join2") <(/usr/bin/join -a1 -a2 "$work_dir/join1" "$work_dir/join2") > /dev/null || fail 'join -a1 -a2 (attached) output differs'
+diff <("$bin_dir/join" -v 1 "$work_dir/join1" "$work_dir/join2") <(/usr/bin/join -v 1 "$work_dir/join1" "$work_dir/join2") > /dev/null || fail 'join -v 1 output differs'
+diff <("$bin_dir/join" -o 1.1,2.2,1.2 "$work_dir/join1" "$work_dir/join2") <(/usr/bin/join -o 1.1,2.2,1.2 "$work_dir/join1" "$work_dir/join2") > /dev/null || fail 'join -o output differs'
+printf '1:a\n2:b\n' > "$work_dir/join3"
+printf '1:x\n2:y\n' > "$work_dir/join4"
+diff <("$bin_dir/join" -t: "$work_dir/join3" "$work_dir/join4") <(/usr/bin/join -t: "$work_dir/join3" "$work_dir/join4") > /dev/null || fail 'join -t: (attached) output differs'
+printf 'id val1\n1 a\n2 b\n' > "$work_dir/join5"
+printf 'id val2\n1 x\n2 y\n' > "$work_dir/join6"
+diff <("$bin_dir/join" --header "$work_dir/join5" "$work_dir/join6") <(/usr/bin/join --header "$work_dir/join5" "$work_dir/join6") > /dev/null || fail 'join --header output differs'
+
 printf 'all coreutils smoke tests passed\n'
