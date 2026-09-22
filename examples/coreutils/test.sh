@@ -1461,4 +1461,16 @@ cmp "$work_dir/actual" "$work_dir/expected" || fail 'paste -s output differs'
 /usr/bin/paste -d, "$work_dir/paste1" "$work_dir/paste2" > "$work_dir/expected"
 cmp "$work_dir/actual" "$work_dir/expected" || fail 'paste -d, output differs'
 
+printf 'a\nb\nc\nd\ne\n' > "$work_dir/shuf1"
+sort "$work_dir/shuf1" > "$work_dir/shuf1-sorted"
+"$bin_dir/shuf" "$work_dir/shuf1" | sort > "$work_dir/actual"
+cmp "$work_dir/actual" "$work_dir/shuf1-sorted" || fail 'shuf output is not a permutation of input'
+[[ "$("$bin_dir/shuf" -n 3 "$work_dir/shuf1" | wc -l)" -eq 3 ]] || fail 'shuf -n 3 did not produce 3 lines'
+[[ "$("$bin_dir/shuf" -n 3 "$work_dir/shuf1" | sort -u | wc -l)" -eq 3 ]] || fail 'shuf -n 3 produced duplicate lines'
+[[ "$("$bin_dir/shuf" -e x y z | sort | tr '\n' ' ')" == "x y z " ]] || fail 'shuf -e did not permute its arguments'
+[[ "$("$bin_dir/shuf" -i 1-10 | sort -n | tr '\n' ' ')" == "1 2 3 4 5 6 7 8 9 10 " ]] || fail 'shuf -i 1-10 did not permute the range'
+r1=$("$bin_dir/shuf" --random-source=/dev/zero "$work_dir/shuf1")
+r2=$("$bin_dir/shuf" --random-source=/dev/zero "$work_dir/shuf1")
+[[ "$r1" == "$r2" ]] || fail 'shuf --random-source=/dev/zero was not deterministic'
+
 printf 'all coreutils smoke tests passed\n'

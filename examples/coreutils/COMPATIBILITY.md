@@ -62,6 +62,7 @@ their `/usr/bin` counterparts.
 | `expand` | partial | the comma-separated `-t`/`--tabs=LIST` custom tab-stop form is not implemented, only a single numeric width; `-i`/`--initial` and `-t`/`--tabs=N` work |
 | `unexpand` | partial | the comma-separated `-t`/`--tabs=LIST` custom tab-stop form is not implemented, only a single numeric width; column tracking treats an input blank run as a uniform span (a literal input tab immediately adjacent to a tab stop can be re-emitted as a space instead of preserved verbatim), and other terminal control characters (e.g. backspace) are not given special column-width handling; `-a`/`--all`, `--first-only`, and `-t`/`--tabs=N` work |
 | `paste` | complete | none known |
+| `shuf` | partial | randomness is drawn from `/dev/urandom` (or `--random-source=FILE`) using a Fisher-Yates shuffle, but the exact bit-consumption pattern does not match GNU's arbitrary-precision generator, so `--random-source` output is not byte-identical to real `shuf` even for the same source file; `-r`/`--repeat` requires `-n`/`--head-count` in this implementation (GNU allows unbounded `-r` output without `-n`); negative `-i`/`--input-range` bounds are not supported; `-e`/`--echo`, `-i` (non-negative), `-n`, `-o`/`--output`, `-z`/`--zero-terminated`, and `--random-source` all work |
 
 “Complete” means the documented option surface is implemented and covered by
 the current parity suite. It does not claim locale, filesystem, or kernel
