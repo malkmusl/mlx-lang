@@ -1297,4 +1297,50 @@ expr_case 'hello' : 'hello$'
 expr_case 'hello!' : 'hello$'
 expr_case 'abc' : '[^0-9]*'
 
+test_case() {
+    local mlx_status gnu_status
+    set +e
+    "$bin_dir/test" "$@" >/dev/null 2>&1
+    mlx_status=$?
+    /usr/bin/test "$@" >/dev/null 2>&1
+    gnu_status=$?
+    set -e
+    [[ "$mlx_status" -eq "$gnu_status" ]] || fail "test $* exit status differs"
+}
+test_case
+test_case ''
+test_case foo
+test_case ! foo
+test_case ! ''
+test_case 1 -eq 1
+test_case 1 -a 1
+test_case '' -o foo
+test_case -z ''
+test_case -n foo
+test_case -e /etc/passwd
+test_case -f /etc/passwd
+test_case -d /etc
+test_case -r /etc/passwd
+test_case /etc/passwd -nt /etc/group
+test_case '(' foo = foo ')'
+test_case ! foo -a bar
+test_case 1 -eq abc
+test_case foo != bar
+test_case 1 -lt 2
+test_case -f /nonexistent/xyz123
+test_case -L /etc/passwd
+test_case -w /tmp
+test_case -x /etc
+test_case -s /etc/passwd
+test_case /etc/passwd -ef /etc/passwd
+"$bin_dir/[" foo = foo ']'
+[[ $? -eq 0 ]] || fail '[ foo = foo ] should succeed'
+set +e
+"$bin_dir/[" foo = foo >/dev/null 2>&1
+mlx_bracket_status=$?
+/usr/bin/[ foo = foo >/dev/null 2>&1
+gnu_bracket_status=$?
+set -e
+[[ "$mlx_bracket_status" -eq "$gnu_bracket_status" ]] || fail '[ missing close exit status differs'
+
 printf 'all coreutils smoke tests passed\n'

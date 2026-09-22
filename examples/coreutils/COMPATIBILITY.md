@@ -53,6 +53,7 @@ their `/usr/bin` counterparts.
 | `comm` | partial | `--check-order`/`--nocheck-order` sorted-input validation and `--total` are accepted but not implemented (input order is trusted, not verified) |
 | `tr` | partial | `[CHAR*N]` repeat notation and `[=CHAR=]` equivalence classes are not implemented; ranges, POSIX classes, octal/backslash escapes, translate/delete/squeeze/complement all work |
 | `expr` | partial | arithmetic uses fixed 64-bit integers rather than GNU's arbitrary precision; `\{n,m\}` interval repetition and `[=CHAR=]`/`[.CHAR.]` in regex bracket expressions are not implemented; arithmetic, comparisons, `\|`/`\&`, `length`/`substr`/`index`/`match`, `:`, and parentheses all work |
+| `test`, `[` | partial | `-b`, `-c`, `-p`, `-S`, `-g`, `-u`, `-k`, `-O`, `-G`, `-N` file tests are not implemented; string/numeric comparisons, `-e`/`-f`/`-d`/`-L`/`-h`/`-r`/`-w`/`-x`/`-s`, `-nt`/`-ot`/`-ef`, `!`/`-a`/`-o`, and parentheses all work |
 
 “Complete” means the documented option surface is implemented and covered by
 the current parity suite. It does not claim locale, filesystem, or kernel
