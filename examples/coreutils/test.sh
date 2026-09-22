@@ -1401,4 +1401,19 @@ for sum_mode in -r -s; do
     cmp "$work_dir/actual" "$work_dir/expected" || fail "sum $sum_mode stdin output differs"
 done
 
+"$bin_dir/cksum" "$work_dir/ck1" > "$work_dir/actual"
+"/usr/bin/cksum" "$work_dir/ck1" > "$work_dir/expected"
+cmp "$work_dir/actual" "$work_dir/expected" || fail 'cksum default output differs'
+"$bin_dir/cksum" "$work_dir/ck1" "$work_dir/ck3" > "$work_dir/actual"
+"/usr/bin/cksum" "$work_dir/ck1" "$work_dir/ck3" > "$work_dir/expected"
+cmp "$work_dir/actual" "$work_dir/expected" || fail 'cksum default multi-file output differs'
+for cksum_alg in crc sysv bsd md5 sha1 sha224 sha256 sha384 sha512; do
+    "$bin_dir/cksum" -a "$cksum_alg" "$work_dir/ck1" > "$work_dir/actual"
+    "/usr/bin/cksum" -a "$cksum_alg" "$work_dir/ck1" > "$work_dir/expected"
+    cmp "$work_dir/actual" "$work_dir/expected" || fail "cksum -a $cksum_alg output differs"
+done
+"$bin_dir/cksum" -a md5 --untagged "$work_dir/ck1" > "$work_dir/actual"
+"/usr/bin/cksum" -a md5 --untagged "$work_dir/ck1" > "$work_dir/expected"
+cmp "$work_dir/actual" "$work_dir/expected" || fail 'cksum -a md5 --untagged output differs'
+
 printf 'all coreutils smoke tests passed\n'
