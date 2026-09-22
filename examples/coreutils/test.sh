@@ -1511,4 +1511,20 @@ printf 'id val1\n1 a\n2 b\n' > "$work_dir/join5"
 printf 'id val2\n1 x\n2 y\n' > "$work_dir/join6"
 diff <("$bin_dir/join" --header "$work_dir/join5" "$work_dir/join6") <(/usr/bin/join --header "$work_dir/join5" "$work_dir/join6") > /dev/null || fail 'join --header output differs'
 
+seq 1 25 > "$work_dir/split-input"
+mkdir -p "$work_dir/split-mine" "$work_dir/split-gnu"
+(cd "$work_dir/split-mine" && "$bin_dir/split" -l 5 "$work_dir/split-input")
+(cd "$work_dir/split-gnu" && /usr/bin/split -l 5 "$work_dir/split-input")
+diff -rq "$work_dir/split-mine" "$work_dir/split-gnu" > /dev/null || fail 'split -l 5 output differs'
+rm -rf "$work_dir/split-mine" "$work_dir/split-gnu"
+mkdir -p "$work_dir/split-mine" "$work_dir/split-gnu"
+(cd "$work_dir/split-mine" && "$bin_dir/split" -b 10 -d "$work_dir/split-input" byt)
+(cd "$work_dir/split-gnu" && /usr/bin/split -b 10 -d "$work_dir/split-input" byt)
+diff -rq "$work_dir/split-mine" "$work_dir/split-gnu" > /dev/null || fail 'split -b 10 -d output differs'
+rm -rf "$work_dir/split-mine" "$work_dir/split-gnu"
+mkdir -p "$work_dir/split-mine" "$work_dir/split-gnu"
+(cd "$work_dir/split-mine" && "$bin_dir/split" -C 15 "$work_dir/split-input")
+(cd "$work_dir/split-gnu" && /usr/bin/split -C 15 "$work_dir/split-input")
+diff -rq "$work_dir/split-mine" "$work_dir/split-gnu" > /dev/null || fail 'split -C 15 output differs'
+
 printf 'all coreutils smoke tests passed\n'
