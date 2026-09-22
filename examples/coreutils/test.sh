@@ -191,7 +191,7 @@ compare_wc_flags -c --total=always "$work_dir/a" || fail 'wc always total differ
 compare_wc_flags -c --total=only "$work_dir/a" "$work_dir/b" || fail 'wc only total differs'
 compare_wc_flags -c --total=never "$work_dir/a" "$work_dir/b" || fail 'wc never total differs'
 LC_ALL=C "$bin_dir/wc" --debug -l "$work_dir/a" > "$work_dir/actual" 2> "$work_dir/wc-debug"
-grep -q 'mlx-wc:' "$work_dir/wc-debug" || fail 'wc --debug emitted no strategy diagnostic'
+grep -q 'wc:' "$work_dir/wc-debug" || fail 'wc --debug emitted no strategy diagnostic'
 if "$bin_dir/wc" --files0-from="$work_dir/wc-files0" "$work_dir/a" >/dev/null 2>&1; then
     fail 'wc combined files0 and operands'
 fi
@@ -405,7 +405,7 @@ cmp "$work_dir/actual" "$work_dir/expected" || fail 'tail descriptor follow outp
 timeout 3 "$bin_dir/tail" --debug --pid=999999 -F -s 0.01 "$work_dir/tail-b" > "$work_dir/actual" 2> "$work_dir/tail-debug"
 /usr/bin/tail --pid=999999 -F -s 0.01 "$work_dir/tail-b" > "$work_dir/expected"
 cmp "$work_dir/actual" "$work_dir/expected" || fail 'tail name follow output differs'
-grep -q 'mlx-tail:' "$work_dir/tail-debug" || fail 'tail --debug emitted no strategy diagnostic'
+grep -q 'tail:' "$work_dir/tail-debug" || fail 'tail --debug emitted no strategy diagnostic'
 printf 'follow-start\n' > "$work_dir/tail-follow"
 (
     sleep 0.05
@@ -494,7 +494,7 @@ cmp "$work_dir/actual" "$work_dir/expected" || fail 'env --chdir output differs'
 "$bin_dir/env" --debug MLX_ENV_DEBUG=value /usr/bin/printenv MLX_ENV_DEBUG > "$work_dir/actual" 2> "$work_dir/env-debug"
 printf 'value\n' > "$work_dir/expected"
 cmp "$work_dir/actual" "$work_dir/expected" || fail 'env --debug changed command output'
-grep -q 'mlx-env:' "$work_dir/env-debug" || fail 'env --debug emitted no trace'
+grep -q 'env:' "$work_dir/env-debug" || fail 'env --debug emitted no trace'
 "$bin_dir/env" --ignore-signal=PIPE /bin/sh -c 'kill -s PIPE $$; printf survived' > "$work_dir/actual"
 [[ "$(cat "$work_dir/actual")" == survived ]] || fail 'env --ignore-signal did not preserve the command'
 "$bin_dir/env" --block-signal=TERM /bin/sh -c 'kill -s TERM $$; printf blocked' > "$work_dir/actual"
@@ -504,7 +504,7 @@ grep -q 'signals ignored' "$work_dir/env-signals" || fail 'env did not list sign
 "$bin_dir/env" -vS '/usr/bin/printf "split:%s:%s\n" one' two > "$work_dir/actual" 2> "$work_dir/env-split-debug"
 /usr/bin/env -S '/usr/bin/printf "split:%s:%s\n" one' two > "$work_dir/expected"
 cmp "$work_dir/actual" "$work_dir/expected" || fail 'env --split-string output differs'
-grep -q 'mlx-env:' "$work_dir/env-split-debug" || fail 'env -vS emitted no trace'
+grep -q 'env:' "$work_dir/env-split-debug" || fail 'env -vS emitted no trace'
 
 "$bin_dir/nproc" > "$work_dir/actual"
 /usr/bin/nproc > "$work_dir/expected"
