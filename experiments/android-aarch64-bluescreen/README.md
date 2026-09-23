@@ -520,9 +520,72 @@ Tested by installing the mlx-built `bluescreen.apk` on a real device
     interactions (back gesture, idle timeout, home) to confirm the ANR
     stays fixed now that it's back. Full external-tool suite (`aapt`,
     `jarsigner -verify`, `unzip -t`) re-run clean either way.
+- **Fifteenth report: the fourteenth round's two fixes weren't quite
+  right** -- the status bar still didn't show the system color with the
+  blue background underneath, and rotation still left a black bar on one
+  edge.
+  - *Status bar color, take two.* `Theme.DeviceDefault.NoActionBar`
+    (0x01030129, the previous round's fix) is still a real, correctly-
+    resolved theme, but it turns out to be the wrong mechanism: it's an
+    *opaque* status bar, just painted with whatever unthemed color
+    DeviceDefault happens to default to -- not visibly different from the
+    old hardcoded-black theme, and it never lets the app's own blue fill
+    show through. Fetched the real AOSP source
+    (`themes_material.xml`, which `Theme.DeviceDefault.NoActionBar.
+    TranslucentDecor` inherits from) rather than guessing what
+    "TranslucentDecor" actually does: it sets `windowTranslucentStatus`
+    =true, `windowTranslucentNavigation`=true, `windowContentOverlay`
+    =@null -- exactly the mechanism for a see-through status bar with the
+    app's own content extending underneath and the system's icons/clock
+    drawn on top, which is what "adapt to the system color" + "blue
+    background" actually meant. Ground-truthed the real resource ID the
+    same way as every other theme in this file: `aapt` against
+    `/usr/share/android-framework-res/framework-res.apk` resolved
+    `Theme.DeviceDefault.NoActionBar.TranslucentDecor` to `0x010301e3`.
+    `themeSystemWithStatusBar()`/`THEME_SYSTEM_WITH_STATUS_BAR` now point
+    at this instead -- no change needed to the toggle plumbing itself,
+    since it was already just a resource-ID constant. Verified via
+    `aapt dump xmltree` showing `android:theme(0x01010000)=@0x010301e3`.
+  - *Rotation, take two.* The fourteenth round's fix (re-registering
+    `onNativeWindowResized`) treated the symptom, not the root cause. The
+    actual root cause is this experiment's own `configChanges` value: it
+    declares `orientation|screenSize` (0x4a0), which opts the app INTO
+    handling rotation itself by resizing the existing window in place
+    (dispatched via `onNativeWindowResized`) instead of letting Android use
+    its normal, vastly more exercised path of destroying and recreating the
+    whole activity on rotation. That in-place path turns out to be
+    genuinely fragile in practice, not just under this hand-rolled
+    implementation: a fetched real NDK issue
+    ([android/ndk#1139](https://github.com/android/ndk/issues/1139))
+    confirms that even Google's own reference
+    `android_native_app_glue.c` -- the library literally every C/C++ NDK
+    game and app is built on -- never wires up
+    `onNativeWindowResized`/`onNativeWindowRedrawNeeded` at all, despite
+    defining the command constants for them. This experiment has no state
+    worth preserving across an activity restart (it's a single static
+    frame), so there's no reason to keep opting into the fragile path:
+    dropped `orientation|screenSize` from `configChanges`, leaving only
+    `keyboardHidden` (ground-truthed via `aapt` to resolve to `0x20`, down
+    from `0x4a0`). A rotation now goes through a fresh
+    `ANativeActivity_onCreate` -> `onNativeWindowCreated` with the new
+    orientation's correct dimensions from the start -- the same path
+    already proven correct, real-device-confirmed, across every other
+    lifecycle transition this experiment has been tested against.
+    `onNativeWindowResized`/`onNativeWindowRedrawNeeded` stay registered
+    regardless (now both, not just the former -- registering both costs two
+    cheap instructions and the shared handler is already proven idempotent
+    and safe to call repeatedly), as a harmless fallback for any resize
+    Android dispatches to a still-live window without a restart. Verified
+    with `llvm-objdump -d --triple=aarch64` on the rebuilt `.so`:
+    `ANativeActivity_onCreate` now stores the identical handler address
+    into `activity->callbacks` at offsets `0x38`/`0x40`/`0x48` (56/64/72 --
+    `onNativeWindowCreated`/`onNativeWindowResized`/
+    `onNativeWindowRedrawNeeded`), and `aapt dump xmltree` confirms
+    `android:configChanges` now reads `0x20`. Full external-tool suite
+    re-run clean.
 
-This closes out the black-screen-and-ANR investigation and covers two
-follow-up feature/fix requests: fourteen real-device rounds, seven genuine
+This closes out the black-screen-and-ANR investigation and covers three
+follow-up feature/fix rounds: fifteen real-device rounds, eight genuine
 bugs found and fixed (missing `onNativeWindowResized`/
 `onNativeWindowRedrawNeeded` registration; missing `LR` preservation
 across the handler's nested calls; the actual root cause, replacing
@@ -531,15 +594,22 @@ across the handler's nested calls; the actual root cause, replacing
 which caused an ANR once the real rendering path was finally reachable;
 never draining the input queue `NativeActivity.java` always hands this
 app, which caused the ANR to persist even with no window callback left
-registered; and never repainting on `onNativeWindowResized`, which left
-newly-exposed buffer area black after a config-changes-driven rotation),
-one correctness fix found along the way (the window's real default format
-is `RGB_565`, not `RGBA_8888`), two toggle features added after the app was
-confirmed working (fullscreen vs. status-bar-visible; hardcoded-black vs.
-system-adaptive status bar color), and a lot of what turned out to be
-correctly-transcribed ABI assumptions (struct offsets, calling conventions,
-ELF/dynamic-linking details) that real-device evidence independently
-confirmed rather than contradicted.
+registered; never repainting on resize, which left newly-exposed buffer
+area black after rotation; and, once that repaint was added back, the
+deeper issue it was only papering over -- opting into a resize-in-place
+rotation path that's fragile enough that even Google's own reference NDK
+glue library doesn't support it, fixed by routing rotation through
+Android's standard destroy-and-recreate path instead), one correctness fix
+found along the way (the window's real default format is `RGB_565`, not
+`RGBA_8888`), two toggle features added after the app was confirmed
+working (fullscreen vs. status-bar-visible; hardcoded-black vs.
+system-adaptive status bar color) -- the second of which took a follow-up
+round to get right, since the first real, correctly-resolved theme tried
+for it turned out to be the wrong mechanism for what was actually being
+asked for -- and a lot of what turned out to be correctly-transcribed ABI
+assumptions (struct offsets, calling conventions, ELF/dynamic-linking
+details) that real-device evidence independently confirmed rather than
+contradicted.
 
 ## What's genuinely unverified
 

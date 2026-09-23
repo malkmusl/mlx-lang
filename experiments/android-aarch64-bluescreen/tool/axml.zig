@@ -217,17 +217,28 @@ fn writeEndElement(out: *std.ArrayList(u8), pool: *StringPool, name: []const u8,
 //   @android:style/Theme.Black.NoTitleBar                       -- keeps
 //     the status bar, forced-black otherwise.
 //   @android:style/Theme.DeviceDefault.NoActionBar.Fullscreen   -- hides
-//     the status bar entirely, system-adaptive otherwise.
-//   @android:style/Theme.DeviceDefault.NoActionBar              -- keeps
-//     the status bar, and (unlike the Black themes) styles it to match the
-//     device's actual default look rather than a hardcoded black bar --
-//     requested after real-device feedback that the status bar should
-//     "adapt to the system color" the way it does in ordinary apps.
+//     the status bar entirely, system-adaptive otherwise (moot: fullscreen
+//     draws no status bar at all, so there's nothing to tint).
+//   @android:style/Theme.DeviceDefault.NoActionBar.TranslucentDecor --
+//     keeps the status bar (and nav bar) visible but translucent, per the
+//     real style's own AOSP source (themes_material.xml, the base this
+//     inherits from): `windowTranslucentStatus=true`,
+//     `windowTranslucentNavigation=true`, `windowContentOverlay=@null`.
+//     That's the actual mechanism behind the "adapt to the system color"
+//     ask: a plain opaque `Theme.DeviceDefault.NoActionBar` (tried first,
+//     0x01030129, still ground-truthed and correct, just not what was
+//     wanted) still paints a solid status-bar background -- just whatever
+//     unthemed color DeviceDefault happens to default to, not visibly
+//     different from the old hardcoded-black theme. TranslucentDecor is
+//     what actually lets this app's own blue fill show through the status
+//     bar with the system's icons/clock drawn on top of it, since
+//     ANativeWindow_lock's window then spans the full display including
+//     the area behind the (now see-through) bar.
 // None of the four is a memorized guess.
 pub const THEME_FULLSCREEN: u32 = 0x0103000a;
 pub const THEME_WITH_STATUS_BAR: u32 = 0x01030009;
 pub const THEME_SYSTEM_FULLSCREEN: u32 = 0x0103012a;
-pub const THEME_SYSTEM_WITH_STATUS_BAR: u32 = 0x01030129;
+pub const THEME_SYSTEM_WITH_STATUS_BAR: u32 = 0x010301e3;
 
 /// Build the complete `dev.mlxlang.experiments.bluescreen` blue-screen
 /// manifest: a single `android.app.NativeActivity` activity backed by
@@ -279,10 +290,29 @@ pub fn buildManifest(allocator: std.mem.Allocator, package: []const u8, fullscre
     } }, line);
     line += 1;
 
-    // configChanges = orientation|keyboardHidden|screenSize, resolved to
-    // 0x4a0 by the real aapt against the real framework attribute flag
-    // table (see the derivation note above) — kept as a plain constant
-    // here since re-deriving individual bit flags adds risk for no benefit.
+    // configChanges = keyboardHidden, resolved to 0x20 by the real aapt.
+    // Used to also declare orientation|screenSize (0x4a0) — standard
+    // NDK-sample boilerplate, copied without a specific reason to include
+    // it — which opts the app INTO handling rotation itself by resizing
+    // the existing window in place (via onNativeWindowResized) instead of
+    // letting Android use its normal, far-better-tested path of destroying
+    // and recreating the whole activity. Real-device testing showed that
+    // in-place path is fragile: rotating left a black bar on one edge even
+    // with onNativeWindowResized correctly registered and repainting. A
+    // real NDK issue (android/ndk#1139) confirms why: even Google's own
+    // reference `android_native_app_glue.c` never wires up
+    // onNativeWindowResized/onNativeWindowRedrawNeeded at all — this
+    // resize-in-place path is essentially unexercised in the wild. Since
+    // this experiment has no state worth preserving across a restart,
+    // dropping `orientation|screenSize` here routes rotation through the
+    // ordinary, robust restart path instead: a fresh
+    // ANativeActivity_onCreate -> onNativeWindowCreated with the new
+    // orientation's correct dimensions from the start, the same path
+    // already proven correct across every other lifecycle transition.
+    // onNativeWindowResized/onNativeWindowRedrawNeeded (native_activity.zig)
+    // stay registered regardless, as a harmless fallback for any resize
+    // Android does dispatch to a still-live window (e.g. multi-window
+    // drag-resize) rather than a restart.
     //
     // theme: `fullscreen` toggles hiding the status bar entirely vs.
     // keeping it visible; `system_status_bar_color` independently toggles
@@ -297,7 +327,7 @@ pub fn buildManifest(allocator: std.mem.Allocator, package: []const u8, fullscre
         .{ .ns = true, .name = "theme", .value = .{ .reference = theme_id } },
         .{ .ns = true, .name = "label", .value = .{ .str = "Mlx Blue Screen" } },
         .{ .ns = true, .name = "name", .value = .{ .str = "android.app.NativeActivity" } },
-        .{ .ns = true, .name = "configChanges", .value = .{ .int_hex = 0x4a0 } },
+        .{ .ns = true, .name = "configChanges", .value = .{ .int_hex = 0x20 } },
     } }, line);
     line += 1;
 
