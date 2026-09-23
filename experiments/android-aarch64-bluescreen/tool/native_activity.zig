@@ -60,15 +60,26 @@ const a64 = @import("aarch64.zig");
 pub const CB_OFFSET_ON_NATIVE_WINDOW_CREATED: u16 = 56;
 pub const CB_OFFSET_ON_NATIVE_WINDOW_RESIZED: u16 = 64;
 pub const CB_OFFSET_ON_NATIVE_WINDOW_REDRAW_NEEDED: u16 = 72;
+pub const CB_OFFSET_ON_INPUT_QUEUE_CREATED: u16 = 88;
 pub const ACTIVITY_OFFSET_CALLBACKS: u16 = 0;
 
 pub const BLUE_RGBA8888_LE: u32 = 0xFFFF0000;
 pub const WINDOW_FORMAT_RGBA_8888: u32 = 1;
 
+/// The ALooper "ident" this experiment's input queue is attached under.
+/// Irrelevant here beyond being >= 0 -- since a non-null callback is
+/// supplied to AInputQueue_attachLooper, the looper invokes that callback
+/// directly instead of ever returning this ident from ALooper_pollOnce.
+pub const LOOPER_IDENT_INPUT: u32 = 1;
+
 pub const GotLayout = struct {
     set_buffers_geometry: u64,
     lock: u64,
     unlock_and_post: u64,
+    looper_for_thread: u64,
+    input_queue_attach_looper: u64,
+    input_queue_get_event: u64,
+    input_queue_finish_event: u64,
 };
 
 /// Build the full .text machine code: `ANativeActivity_onCreate` immediately
@@ -139,6 +150,29 @@ pub fn buildText(
     //   posted buffer indefinitely (scaled as needed) with no further
     //   involvement from us, so there is nothing left to redraw on demand.
     try out.append(a64.strX(10, 9, CB_OFFSET_ON_NATIVE_WINDOW_CREATED)); // activity->callbacks->onNativeWindowCreated = x10
+    // Also register onInputQueueCreated. `android.app.NativeActivity`
+    // unconditionally calls `getWindow().takeInputQueue(this)` in its own
+    // onCreate, which hands this app an input event queue -- Android then
+    // expects native code to actively drain it (this is exactly what
+    // android_native_app_glue.c's own internal plumbing does for every app
+    // built on it). Found necessary after the callback-registration and
+    // ANR-avoidance fixes above still left an ANR ("Mlx Blue Screen
+    // reagiert nicht") on the back gesture, home, and idle screen-timeout
+    // -- all of which involve input events (the back gesture is
+    // fundamentally a touch/drag gesture) -- even with *no* window
+    // callback left registered at all, proving the ANR wasn't about the
+    // paint path anymore. An unconsumed input event sitting in the queue
+    // forever is exactly what trips Android's "Input dispatching timed
+    // out" watchdog. onInputQueueCreated below sets up a lightweight
+    // drain via the existing main-thread ALooper (no new thread needed).
+    //
+    // x10 is free to reuse here: its previous value (the paint handler's
+    // address) was already stored above, so this placeholder pair
+    // overwrites it with onInputQueueCreated's own address instead.
+    const adrp_input_queue_created_idx = out.items.len;
+    try out.append(0); // placeholder ADRP x10, onInputQueueCreated
+    try out.append(0); // placeholder ADD  x10, x10, #lo12
+    try out.append(a64.strX(10, 9, CB_OFFSET_ON_INPUT_QUEUE_CREATED)); // activity->callbacks->onInputQueueCreated = x10
     try out.append(a64.ret(a64.lr));
 
     const on_window_created_start = out.items.len;
@@ -237,15 +271,95 @@ pub fn buildText(
     try out.append(a64.addImm64(a64.sp, a64.sp, 64));
     try out.append(a64.ret(a64.lr));
 
-    return out;
-}
+    const on_input_queue_created_start = out.items.len;
+    const on_input_queue_created_vaddr = text_vaddr + on_input_queue_created_start * 4;
+    {
+        const pc = text_vaddr + adrp_input_queue_created_idx * 4;
+        out.items[adrp_input_queue_created_idx] = a64.adrp(10, pc, on_input_queue_created_vaddr);
+        out.items[adrp_input_queue_created_idx + 1] = a64.addImm64(10, 10, @truncate(on_input_queue_created_vaddr & 0xfff));
+    }
 
-/// ADRP + ADD idiom: put the absolute address of `target` (anywhere in our
-/// own image) into `reg`, PC-relative, no relocation needed.
-fn emitAdrpAdd(out: *std.ArrayList(u32), text_vaddr: u64, reg: a64.Reg, target: u64) !void {
-    const pc = text_vaddr + out.items.len * 4;
-    try out.append(a64.adrp(reg, pc, target));
-    try out.append(a64.addImm64(reg, reg, @truncate(target & 0xfff)));
+    // ── onInputQueueCreated(x0=activity, x1=queue) ──
+    // Stack frame: [16..23] = saved queue, [24..31] = saved LR.
+    // Attaches `queue` to this thread's already-running ALooper (the main
+    // thread's -- onInputQueueCreated runs on it, same as every other
+    // ANativeActivityCallbacks callback, so ALooper_forThread() here finds
+    // the looper Android's own runtime already prepared for it) with
+    // drainInputEvents (below) as the per-event callback. This mirrors
+    // exactly what android_native_app_glue.c does, minus its extra thread
+    // — ALooper_pollOnce's own caller is the main thread's existing
+    // message loop, so no new thread is needed here, just this one-time
+    // registration.
+    try out.append(a64.subImm64(a64.sp, a64.sp, 32));
+    try out.append(a64.strX(a64.lr, a64.sp, 24)); // save LR (this is a non-leaf function; see the LR-preservation note above)
+    try out.append(a64.strX(1, a64.sp, 16)); // save queue
+
+    try emitGotCall(&out, text_vaddr, 9, got.looper_for_thread); // x0 = ALooper_forThread()
+    try out.append(a64.movReg64(1, 0)); // x1 = looper
+    try out.append(a64.ldrX(0, a64.sp, 16)); // x0 = queue
+    try out.append(a64.movReg64(4, 0)); // x4 = data = queue (threaded through to drainInputEvents's 3rd arg)
+    try out.append(a64.movz32(2, LOOPER_IDENT_INPUT, 0)); // w2 = ident
+
+    const adrp_drain_callback_idx = out.items.len;
+    try out.append(0); // placeholder ADRP x3, drainInputEvents
+    try out.append(0); // placeholder ADD  x3, x3, #lo12
+
+    // AInputQueue_attachLooper(queue=x0, looper=x1, ident=w2, callback=x3, data=x4)
+    try emitGotCall(&out, text_vaddr, 9, got.input_queue_attach_looper);
+
+    try out.append(a64.ldrX(a64.lr, a64.sp, 24)); // restore LR
+    try out.append(a64.addImm64(a64.sp, a64.sp, 32));
+    try out.append(a64.ret(a64.lr));
+
+    const drain_callback_start = out.items.len;
+    const drain_callback_vaddr = text_vaddr + drain_callback_start * 4;
+    {
+        const pc = text_vaddr + adrp_drain_callback_idx * 4;
+        out.items[adrp_drain_callback_idx] = a64.adrp(3, pc, drain_callback_vaddr);
+        out.items[adrp_drain_callback_idx + 1] = a64.addImm64(3, 3, @truncate(drain_callback_vaddr & 0xfff));
+    }
+
+    // ── drainInputEvents(w0=fd, w1=events, x2=data=queue) ──
+    // The ALooper_callbackFunc registered above. Called by the main
+    // thread's own message loop whenever the input queue's fd has data.
+    // Does nothing with the events themselves (this experiment has no use
+    // for input) beyond immediately finishing each one -- the point is
+    // purely to keep Android's "Input dispatching timed out" watchdog from
+    // ever finding an unconsumed event sitting in the queue. Returns 1
+    // (w0) to keep receiving future callbacks, per ALooper_callbackFunc's
+    // documented contract.
+    // Stack frame: [0..7] = AInputEvent* out-param for getEvent,
+    // [16..23] = saved queue, [24..31] = saved LR.
+    try out.append(a64.subImm64(a64.sp, a64.sp, 32));
+    try out.append(a64.strX(a64.lr, a64.sp, 24)); // save LR (non-leaf: calls getEvent/finishEvent via BLR)
+    try out.append(a64.strX(2, a64.sp, 16)); // save queue (arrives in x2, the callback's "data" param)
+
+    const drain_loop_top = out.items.len;
+    try out.append(a64.ldrX(0, a64.sp, 16)); // x0 = queue
+    try out.append(a64.addImm64(1, a64.sp, 0)); // x1 = &outEvent
+    try emitGotCall(&out, text_vaddr, 9, got.input_queue_get_event); // w0 = result (negative once the queue is drained)
+
+    // if (result < 0) goto drain_done;  (forward branch, patched below)
+    const tbnz_drain_done_idx = out.items.len;
+    try out.append(0);
+
+    try out.append(a64.ldrX(0, a64.sp, 16)); // x0 = queue
+    try out.append(a64.ldrX(1, a64.sp, 0)); // x1 = event (written by getEvent above)
+    try out.append(a64.movz32(2, 0, 0)); // w2 = handled = 0
+    try emitGotCall(&out, text_vaddr, 9, got.input_queue_finish_event);
+
+    const branch_back_idx = out.items.len;
+    try out.append(a64.b(@as(i32, @intCast(drain_loop_top)) * 4 - @as(i32, @intCast(branch_back_idx)) * 4));
+
+    const drain_done = out.items.len;
+    out.items[tbnz_drain_done_idx] = a64.tbnz(0, 31, @as(i32, @intCast(drain_done)) * 4 - @as(i32, @intCast(tbnz_drain_done_idx)) * 4);
+
+    try out.append(a64.ldrX(a64.lr, a64.sp, 24)); // restore LR
+    try out.append(a64.addImm64(a64.sp, a64.sp, 32));
+    try out.append(a64.movz32(0, 1, 0)); // w0 = 1 (keep receiving future callbacks)
+    try out.append(a64.ret(a64.lr));
+
+    return out;
 }
 
 /// ADRP + LDR + BLR idiom: call an imported function through its GOT slot
@@ -260,10 +374,26 @@ fn emitGotCall(out: *std.ArrayList(u32), text_vaddr: u64, scratch: a64.Reg, got_
 
 test "buildText is deterministic in length across the two-pass call" {
     const alloc = std.testing.allocator;
-    var pass1 = try buildText(alloc, 0, .{ .set_buffers_geometry = 0, .lock = 0, .unlock_and_post = 0 });
+    var pass1 = try buildText(alloc, 0, .{
+        .set_buffers_geometry = 0,
+        .lock = 0,
+        .unlock_and_post = 0,
+        .looper_for_thread = 0,
+        .input_queue_attach_looper = 0,
+        .input_queue_get_event = 0,
+        .input_queue_finish_event = 0,
+    });
     defer pass1.deinit();
-    var pass2 = try buildText(alloc, 0x2000, .{ .set_buffers_geometry = 0x3000, .lock = 0x3008, .unlock_and_post = 0x3010 });
+    var pass2 = try buildText(alloc, 0x2000, .{
+        .set_buffers_geometry = 0x30b0,
+        .lock = 0x30b8,
+        .unlock_and_post = 0x30c0,
+        .looper_for_thread = 0x30c8,
+        .input_queue_attach_looper = 0x30d0,
+        .input_queue_get_event = 0x30d8,
+        .input_queue_finish_event = 0x30e0,
+    });
     defer pass2.deinit();
     try std.testing.expectEqual(pass1.items.len, pass2.items.len);
-    try std.testing.expect(pass1.items.len > 20);
+    try std.testing.expect(pass1.items.len > 60);
 }

@@ -221,6 +221,50 @@ pub fn udf(imm16: u16) u32 {
 }
 
 /// ─────────────────────────────────────────────────────────────────────────
+///  B — unconditional branch (PC-relative immediate)
+///
+///   31-26     25-0
+///   000101    imm26
+///
+/// imm26 is a signed word (4-byte) offset from this instruction to target.
+/// Verified against `llvm-mc -triple=aarch64 -filetype=obj` +
+/// `llvm-objdump -d`: `b .+8` -> 0x14000002, `b .-8` -> 0x17fffffe,
+/// `b .+1048572` -> 0x1403ffff — all match.
+/// ─────────────────────────────────────────────────────────────────────────
+pub fn b(byte_delta: i32) u32 {
+    const word_delta: i32 = @divTrunc(byte_delta, 4);
+    const imm26: u32 = if (word_delta >= 0) @intCast(word_delta) else @intCast(word_delta + 67108864);
+    return (@as(u32, 0b000101) << 26) | (imm26 & 0x3ffffff);
+}
+
+/// ─────────────────────────────────────────────────────────────────────────
+///  TBZ / TBNZ — test bit and branch (if zero / if not zero)
+///
+///   31   30-25    24  23-19   18-5      4-0
+///   b5   011011   op  b40     imm14     Rt
+///
+/// op: 0 = TBZ, 1 = TBNZ. The bit position (0-63) is split as b5 (its top
+/// bit, distinguishing the W/X register width) and b40 (its low 5 bits).
+/// imm14 is a signed word (4-byte) offset from this instruction to target.
+/// Verified the same way as `b` above: `tbnz w0, #31, .+8` -> 0x37f80040,
+/// `tbz w0, #31, .+8` -> 0x36f80040, `tbnz w9, #0, .+16` -> 0x37000089,
+/// `tbnz x9, #33, .+8` -> 0xb7080049 — all match.
+/// ─────────────────────────────────────────────────────────────────────────
+fn testBranch(op: u32, rt: Reg, bitPos: u32, byte_delta: i32) u32 {
+    const word_delta: i32 = @divTrunc(byte_delta, 4);
+    const imm14: u32 = if (word_delta >= 0) @intCast(word_delta) else @intCast(word_delta + 16384);
+    const b5: u32 = (bitPos >> 5) & 1;
+    const b40: u32 = bitPos & 0x1f;
+    return (b5 << 31) | (@as(u32, 0b011011) << 25) | (op << 24) | (b40 << 19) | ((imm14 & 0x3fff) << 5) | @as(u32, rt);
+}
+pub fn tbz(rt: Reg, bitPos: u32, byte_delta: i32) u32 {
+    return testBranch(0, rt, bitPos, byte_delta);
+}
+pub fn tbnz(rt: Reg, bitPos: u32, byte_delta: i32) u32 {
+    return testBranch(1, rt, bitPos, byte_delta);
+}
+
+/// ─────────────────────────────────────────────────────────────────────────
 ///  MOV (register) — alias of ORR Xd, XZR, Xm  (Logical, shifted register)
 ///
 ///  31  30-29  28-24    23-22  21  20-16  15-10  9-5   4-0
@@ -293,4 +337,17 @@ test "mov register known encoding" {
 test "strw post-index known encoding" {
     // str w9, [x8], #4
     try std.testing.expectEqual(@as(u32, 0xB8004509), strwPostIndex(9, 8, 4));
+}
+
+test "b (unconditional branch) known encodings, cross-checked against llvm-mc" {
+    try std.testing.expectEqual(@as(u32, 0x14000002), b(8));
+    try std.testing.expectEqual(@as(u32, 0x17FFFFFE), b(-8));
+    try std.testing.expectEqual(@as(u32, 0x1403FFFF), b(1048572));
+}
+
+test "tbz/tbnz known encodings, cross-checked against llvm-mc" {
+    try std.testing.expectEqual(@as(u32, 0x37F80040), tbnz(0, 31, 8));
+    try std.testing.expectEqual(@as(u32, 0x36F80040), tbz(0, 31, 8));
+    try std.testing.expectEqual(@as(u32, 0x37000089), tbnz(9, 0, 16));
+    try std.testing.expectEqual(@as(u32, 0xB7080049), tbnz(9, 33, 8));
 }

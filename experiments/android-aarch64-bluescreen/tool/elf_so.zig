@@ -181,12 +181,20 @@ pub fn build(allocator: std.mem.Allocator, soname: []const u8, needed: []const u
     const name_set_buffers = try Str.add(&dynstr, "ANativeWindow_setBuffersGeometry");
     const name_lock = try Str.add(&dynstr, "ANativeWindow_lock");
     const name_unlock = try Str.add(&dynstr, "ANativeWindow_unlockAndPost");
+    // These three (also part of the stable NDK libandroid.so, same as the
+    // ANativeWindow_* imports above) back onInputQueueCreated's input-queue
+    // drain, added to fix a real-device ANR -- see native_activity.zig's
+    // buildText for the full story.
+    const name_looper_for_thread = try Str.add(&dynstr, "ALooper_forThread");
+    const name_input_queue_attach_looper = try Str.add(&dynstr, "AInputQueue_attachLooper");
+    const name_input_queue_get_event = try Str.add(&dynstr, "AInputQueue_getEvent");
+    const name_input_queue_finish_event = try Str.add(&dynstr, "AInputQueue_finishEvent");
     const name_on_create = try Str.add(&dynstr, "ANativeActivity_onCreate");
     const name_needed = try Str.add(&dynstr, needed);
     const name_soname = try Str.add(&dynstr, soname);
 
     // ── layout inside the RO segment ───────────────────────────────────
-    const dynsym_count = 5; // null + 3 imports + 1 export
+    const dynsym_count = 9; // null + 7 imports + 1 export
     const dynsym_off = RO_VADDR;
     const dynsym_size: u64 = dynsym_count * @sizeOf(Elf64Sym);
 
@@ -199,7 +207,7 @@ pub fn build(allocator: std.mem.Allocator, soname: []const u8, needed: []const u
     const hash_size: u64 = (2 + nbucket + nchain) * 4;
 
     const rela_off = alignUp(hash_off + hash_size, 8);
-    const rela_count = 3; // one GLOB_DAT per imported function
+    const rela_count = 7; // one GLOB_DAT per imported function
     const rela_size: u64 = rela_count * @sizeOf(Elf64Rela);
 
     const ro_end = rela_off + rela_size;
@@ -211,6 +219,10 @@ pub fn build(allocator: std.mem.Allocator, soname: []const u8, needed: []const u
         .set_buffers_geometry = got_vaddr,
         .lock = got_vaddr + 8,
         .unlock_and_post = got_vaddr + 16,
+        .looper_for_thread = got_vaddr + 24,
+        .input_queue_attach_looper = got_vaddr + 32,
+        .input_queue_get_event = got_vaddr + 40,
+        .input_queue_finish_event = got_vaddr + 48,
     };
     var text = try na.buildText(allocator, TEXT_VADDR, got);
     defer text.deinit();
@@ -230,7 +242,7 @@ pub fn build(allocator: std.mem.Allocator, soname: []const u8, needed: []const u
     const dynamic_size: u64 = dynamic_count * @sizeOf(Elf64Dyn);
     std.debug.assert(RW_VADDR + dynamic_size == got_vaddr);
     const got_off = got_vaddr;
-    const got_size: u64 = 24;
+    const got_size: u64 = 56; // 7 GOT slots * 8 bytes
     const rw_end = got_off + got_size;
     std.debug.assert(rw_end <= RW_VADDR + PAGE);
 
@@ -240,9 +252,13 @@ pub fn build(allocator: std.mem.Allocator, soname: []const u8, needed: []const u
     dynsym[1] = .{ .st_name = name_set_buffers, .st_info = elfSymInfo(STB_GLOBAL, STT_FUNC), .st_other = 0, .st_shndx = SHN_UNDEF, .st_value = 0, .st_size = 0 };
     dynsym[2] = .{ .st_name = name_lock, .st_info = elfSymInfo(STB_GLOBAL, STT_FUNC), .st_other = 0, .st_shndx = SHN_UNDEF, .st_value = 0, .st_size = 0 };
     dynsym[3] = .{ .st_name = name_unlock, .st_info = elfSymInfo(STB_GLOBAL, STT_FUNC), .st_other = 0, .st_shndx = SHN_UNDEF, .st_value = 0, .st_size = 0 };
-    dynsym[4] = .{ .st_name = name_on_create, .st_info = elfSymInfo(STB_GLOBAL, STT_FUNC), .st_other = 0, .st_shndx = 6, .st_value = TEXT_VADDR, .st_size = text_size };
+    dynsym[4] = .{ .st_name = name_looper_for_thread, .st_info = elfSymInfo(STB_GLOBAL, STT_FUNC), .st_other = 0, .st_shndx = SHN_UNDEF, .st_value = 0, .st_size = 0 };
+    dynsym[5] = .{ .st_name = name_input_queue_attach_looper, .st_info = elfSymInfo(STB_GLOBAL, STT_FUNC), .st_other = 0, .st_shndx = SHN_UNDEF, .st_value = 0, .st_size = 0 };
+    dynsym[6] = .{ .st_name = name_input_queue_get_event, .st_info = elfSymInfo(STB_GLOBAL, STT_FUNC), .st_other = 0, .st_shndx = SHN_UNDEF, .st_value = 0, .st_size = 0 };
+    dynsym[7] = .{ .st_name = name_input_queue_finish_event, .st_info = elfSymInfo(STB_GLOBAL, STT_FUNC), .st_other = 0, .st_shndx = SHN_UNDEF, .st_value = 0, .st_size = 0 };
+    dynsym[8] = .{ .st_name = name_on_create, .st_info = elfSymInfo(STB_GLOBAL, STT_FUNC), .st_other = 0, .st_shndx = 6, .st_value = TEXT_VADDR, .st_size = text_size };
 
-    // ── .hash (single bucket — O(n) lookup, fine for 4 symbols) ─────────
+    // ── .hash (single bucket — O(n) lookup, fine for a handful of symbols) ──
     var hash_words = try std.ArrayList(u32).initCapacity(allocator, 2 + nbucket + nchain);
     defer hash_words.deinit();
     try hash_words.append(nbucket);
@@ -252,7 +268,11 @@ pub fn build(allocator: std.mem.Allocator, soname: []const u8, needed: []const u
     try hash_words.append(2); // chain[1] -> 2
     try hash_words.append(3); // chain[2] -> 3
     try hash_words.append(4); // chain[3] -> 4
-    try hash_words.append(0); // chain[4] -> end
+    try hash_words.append(5); // chain[4] -> 5
+    try hash_words.append(6); // chain[5] -> 6
+    try hash_words.append(7); // chain[6] -> 7
+    try hash_words.append(8); // chain[7] -> 8
+    try hash_words.append(0); // chain[8] -> end
     std.debug.assert(hash_words.items.len == 2 + nbucket + nchain);
     // (elfHash is kept/exercised via the unit test below; a single-bucket
     // table doesn't need real hash values, only *a* consistent function.)
@@ -263,6 +283,10 @@ pub fn build(allocator: std.mem.Allocator, soname: []const u8, needed: []const u
     relas[0] = .{ .r_offset = got.set_buffers_geometry, .r_info = (@as(u64, 1) << 32) | R_AARCH64_GLOB_DAT, .r_addend = 0 };
     relas[1] = .{ .r_offset = got.lock, .r_info = (@as(u64, 2) << 32) | R_AARCH64_GLOB_DAT, .r_addend = 0 };
     relas[2] = .{ .r_offset = got.unlock_and_post, .r_info = (@as(u64, 3) << 32) | R_AARCH64_GLOB_DAT, .r_addend = 0 };
+    relas[3] = .{ .r_offset = got.looper_for_thread, .r_info = (@as(u64, 4) << 32) | R_AARCH64_GLOB_DAT, .r_addend = 0 };
+    relas[4] = .{ .r_offset = got.input_queue_attach_looper, .r_info = (@as(u64, 5) << 32) | R_AARCH64_GLOB_DAT, .r_addend = 0 };
+    relas[5] = .{ .r_offset = got.input_queue_get_event, .r_info = (@as(u64, 6) << 32) | R_AARCH64_GLOB_DAT, .r_addend = 0 };
+    relas[6] = .{ .r_offset = got.input_queue_finish_event, .r_info = (@as(u64, 7) << 32) | R_AARCH64_GLOB_DAT, .r_addend = 0 };
 
     // ── .dynamic ───────────────────────────────────────────────────────
     var dyn: [dynamic_count]Elf64Dyn = undefined;

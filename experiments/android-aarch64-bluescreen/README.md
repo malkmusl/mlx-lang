@@ -412,21 +412,64 @@ Tested by installing the mlx-built `bluescreen.apk` on a real device
   configuration, and arguably what this experiment should have used from
   the start once the real bug was understood. Verified by decoding the
   rebuilt `.text` bytes: `ANativeActivity_onCreate` is now 5 words with a
-  single store, to offset 56 only. Awaiting real-device confirmation.
+  single store, to offset 56 only.
+- **Twelfth report: the exact same ANR persisted, even with *no* window
+  callback registered at all.** This was decisive: since the paint
+  handler could then only ever fire once (at window creation) and had
+  already succeeded (a real blue screen had rendered), the ANR could no
+  longer have anything to do with painting. That pointed at something
+  structural instead: `android.app.NativeActivity`'s own `onCreate`
+  unconditionally calls `getWindow().takeInputQueue(this)`, handing this
+  app an input event queue that Android expects native code to actively
+  *drain* -- exactly what `android_native_app_glue.c`'s own internal
+  plumbing does for every app built on it, which this bare-NativeActivity
+  experiment had never done. An input event sitting in the queue forever
+  with nothing ever consuming it is exactly what trips Android's "Input
+  dispatching timed out" watchdog -- and the back gesture is fundamentally
+  a touch/drag gesture, home a swipe or button press, and even the idle
+  case plausibly involves *some* system-generated input-adjacent event
+  during the screen-timeout transition.
 
-This closes out the black-screen investigation (for now): eleven
-real-device rounds, five genuine bugs found and fixed (missing
+  Fixed by registering `onInputQueueCreated` (offset 88) and implementing
+  a lightweight drain: `ALooper_forThread()` (finds the main thread's
+  already-running looper -- the same thread `onInputQueueCreated` itself
+  runs on, so no new thread needed) plus `AInputQueue_attachLooper()` to
+  register a small callback that loops `AInputQueue_getEvent`/
+  `AInputQueue_finishEvent` until the queue is drained, mirroring what
+  `android_native_app_glue.c` does minus its extra thread. This needed
+  four new NDK imports (`ALooper_forThread`, `AInputQueue_attachLooper`,
+  `AInputQueue_getEvent`, `AInputQueue_finishEvent` -- all, like the
+  `ANativeWindow_*` imports, part of the same stable `libandroid.so`, so
+  no new `DT_NEEDED` entry) and two new AArch64 instruction encoders this
+  port had never needed before: `B` (unconditional branch) and `TBZ`/
+  `TBNZ` (test bit and branch), both added to `aarch64.zig`/`aarch64.mlx`
+  and independently verified against `llvm-mc -triple=aarch64
+  -filetype=obj` + `llvm-objdump -d` (both available in this sandbox)
+  before use, the same rigor as every other encoder in this file --
+  every hand-derived encoding matched exactly. `elf_so.zig`/`elf_so.mlx`
+  were extended accordingly (9 dynsym entries, 7 relocations, a 7-slot
+  GOT). The full generated `.text` (320 bytes, 80 words) was then decoded
+  and checked instruction-by-instruction against the intended sequence --
+  every branch target, GOT offset, and patched address landed exactly
+  where designed, with no discrepancies. Full external-tool suite
+  (`aapt`, `readelf`, `unzip -t`, `jarsigner -verify`) re-run clean.
+  Awaiting real-device confirmation.
+
+This closes out the black-screen-and-ANR investigation (for now): twelve
+real-device rounds, six genuine bugs found and fixed (missing
 `onNativeWindowResized`/`onNativeWindowRedrawNeeded` registration;
 missing `LR` preservation across the handler's nested calls; the actual
 root cause, replacing `activity->callbacks` instead of writing through
-it; and registering `onNativeWindowResized` and then
+it; registering `onNativeWindowResized` and then
 `onNativeWindowRedrawNeeded`, each of which caused an ANR once the real
-rendering path was finally reachable), one correctness fix found along
-the way (the window's real default format is `RGB_565`, not
-`RGBA_8888`), and a lot of what turned out to be correctly-transcribed
-ABI assumptions (struct offsets, calling conventions, ELF/dynamic-linking
-details) that real-device evidence independently confirmed rather than
-contradicted.
+rendering path was finally reachable; and never draining the input queue
+`NativeActivity.java` always hands this app, which caused the ANR to
+persist even with no window callback left registered), one correctness
+fix found along the way (the window's real default format is `RGB_565`,
+not `RGBA_8888`), and a lot of what turned out to be correctly-
+transcribed ABI assumptions (struct offsets, calling conventions,
+ELF/dynamic-linking details) that real-device evidence independently
+confirmed rather than contradicted.
 
 ## What's genuinely unverified
 
