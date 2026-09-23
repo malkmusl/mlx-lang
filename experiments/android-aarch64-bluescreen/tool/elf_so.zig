@@ -20,7 +20,7 @@
 //!   0x0040  Program headers (4: LOAD ro, LOAD rx, LOAD rw, DYNAMIC)
 //!   0x1000  [LOAD #1, R]   .dynsym  .dynstr  .hash  .rela.dyn
 //!   0x2000  [LOAD #2, R+X] .text
-//!   0x3000  [LOAD #3, R+W] .dynamic  .got
+//!   0x3000  [LOAD #3, R+W] .dynamic  .got  .data
 //!   ...     .shstrtab + section header table (not in any PT_LOAD — for
 //!           `readelf`/`objdump` friendliness only; Bionic's linker never
 //!           looks at section headers, only program headers + PT_DYNAMIC)
@@ -189,12 +189,17 @@ pub fn build(allocator: std.mem.Allocator, soname: []const u8, needed: []const u
     const name_input_queue_attach_looper = try Str.add(&dynstr, "AInputQueue_attachLooper");
     const name_input_queue_get_event = try Str.add(&dynstr, "AInputQueue_getEvent");
     const name_input_queue_finish_event = try Str.add(&dynstr, "AInputQueue_finishEvent");
+    // Also part of the stable NDK libandroid.so (android/input.h), added for
+    // the touch-to-cycle-colors feature: drainInputEvents inspects each
+    // event's type/action instead of just finishing it unread.
+    const name_input_event_get_type = try Str.add(&dynstr, "AInputEvent_getType");
+    const name_motion_event_get_action = try Str.add(&dynstr, "AMotionEvent_getAction");
     const name_on_create = try Str.add(&dynstr, "ANativeActivity_onCreate");
     const name_needed = try Str.add(&dynstr, needed);
     const name_soname = try Str.add(&dynstr, soname);
 
     // ── layout inside the RO segment ───────────────────────────────────
-    const dynsym_count = 9; // null + 7 imports + 1 export
+    const dynsym_count = 11; // null + 9 imports + 1 export
     const dynsym_off = RO_VADDR;
     const dynsym_size: u64 = dynsym_count * @sizeOf(Elf64Sym);
 
@@ -207,7 +212,7 @@ pub fn build(allocator: std.mem.Allocator, soname: []const u8, needed: []const u
     const hash_size: u64 = (2 + nbucket + nchain) * 4;
 
     const rela_off = alignUp(hash_off + hash_size, 8);
-    const rela_count = 7; // one GLOB_DAT per imported function
+    const rela_count = 9; // one GLOB_DAT per imported function
     const rela_size: u64 = rela_count * @sizeOf(Elf64Rela);
 
     const ro_end = rela_off + rela_size;
@@ -223,27 +228,34 @@ pub fn build(allocator: std.mem.Allocator, soname: []const u8, needed: []const u
         .input_queue_attach_looper = got_vaddr + 32,
         .input_queue_get_event = got_vaddr + 40,
         .input_queue_finish_event = got_vaddr + 48,
+        .input_event_get_type = got_vaddr + 56,
+        .motion_event_get_action = got_vaddr + 64,
     };
-    var text = try na.buildText(allocator, TEXT_VADDR, got);
+    const got_size: u64 = 72; // 9 GOT slots * 8 bytes
+    // `.data`: this experiment's own small, writable app-state block --
+    // g_currentColor/g_colorIndex/g_window/g_activity, all written and read
+    // only by our own code (never by the dynamic linker, unlike `.got`
+    // above) -- see native_activity.zig's DATA_OFFSET_* constants for the
+    // layout. Re-introduces a `.data` allocation after an earlier round
+    // removed one (`g_callbacks`, a *different*, since-fixed mistake: that
+    // one was replacing a framework-owned pointer instead of writing
+    // through it -- see buildText's onCreate comment). This one is
+    // legitimate mutable state with no such framework contract to violate.
+    const data_vaddr = got_vaddr + got_size;
+    const data_size: u64 = 24;
+    var text = try na.buildText(allocator, TEXT_VADDR, got, data_vaddr);
     defer text.deinit();
     const text_size: u64 = text.items.len * 4;
     std.debug.assert(text_size <= PAGE);
 
     // ── layout inside the RW segment ───────────────────────────────────
-    // No separate `g_callbacks` data allocation here (there used to be
-    // one): ANativeActivity_onCreate now writes into the
-    // ANativeActivityCallbacks struct the framework itself already
-    // allocates and points `activity->callbacks` at, rather than pointing
-    // `activity->callbacks` at a struct of our own -- see
-    // native_activity.zig's buildText for the full story. So the RW
-    // segment only needs `.dynamic` and `.got`.
     const dynamic_off = RW_VADDR;
     const dynamic_count = 11;
     const dynamic_size: u64 = dynamic_count * @sizeOf(Elf64Dyn);
     std.debug.assert(RW_VADDR + dynamic_size == got_vaddr);
     const got_off = got_vaddr;
-    const got_size: u64 = 56; // 7 GOT slots * 8 bytes
-    const rw_end = got_off + got_size;
+    const data_off = data_vaddr;
+    const rw_end = data_off + data_size;
     std.debug.assert(rw_end <= RW_VADDR + PAGE);
 
     // ── .dynsym ─────────────────────────────────────────────────────────
@@ -256,7 +268,9 @@ pub fn build(allocator: std.mem.Allocator, soname: []const u8, needed: []const u
     dynsym[5] = .{ .st_name = name_input_queue_attach_looper, .st_info = elfSymInfo(STB_GLOBAL, STT_FUNC), .st_other = 0, .st_shndx = SHN_UNDEF, .st_value = 0, .st_size = 0 };
     dynsym[6] = .{ .st_name = name_input_queue_get_event, .st_info = elfSymInfo(STB_GLOBAL, STT_FUNC), .st_other = 0, .st_shndx = SHN_UNDEF, .st_value = 0, .st_size = 0 };
     dynsym[7] = .{ .st_name = name_input_queue_finish_event, .st_info = elfSymInfo(STB_GLOBAL, STT_FUNC), .st_other = 0, .st_shndx = SHN_UNDEF, .st_value = 0, .st_size = 0 };
-    dynsym[8] = .{ .st_name = name_on_create, .st_info = elfSymInfo(STB_GLOBAL, STT_FUNC), .st_other = 0, .st_shndx = 6, .st_value = TEXT_VADDR, .st_size = text_size };
+    dynsym[8] = .{ .st_name = name_input_event_get_type, .st_info = elfSymInfo(STB_GLOBAL, STT_FUNC), .st_other = 0, .st_shndx = SHN_UNDEF, .st_value = 0, .st_size = 0 };
+    dynsym[9] = .{ .st_name = name_motion_event_get_action, .st_info = elfSymInfo(STB_GLOBAL, STT_FUNC), .st_other = 0, .st_shndx = SHN_UNDEF, .st_value = 0, .st_size = 0 };
+    dynsym[10] = .{ .st_name = name_on_create, .st_info = elfSymInfo(STB_GLOBAL, STT_FUNC), .st_other = 0, .st_shndx = 6, .st_value = TEXT_VADDR, .st_size = text_size };
 
     // ── .hash (single bucket — O(n) lookup, fine for a handful of symbols) ──
     var hash_words = try std.ArrayList(u32).initCapacity(allocator, 2 + nbucket + nchain);
@@ -272,7 +286,9 @@ pub fn build(allocator: std.mem.Allocator, soname: []const u8, needed: []const u
     try hash_words.append(6); // chain[5] -> 6
     try hash_words.append(7); // chain[6] -> 7
     try hash_words.append(8); // chain[7] -> 8
-    try hash_words.append(0); // chain[8] -> end
+    try hash_words.append(9); // chain[8] -> 9
+    try hash_words.append(10); // chain[9] -> 10
+    try hash_words.append(0); // chain[10] -> end
     std.debug.assert(hash_words.items.len == 2 + nbucket + nchain);
     // (elfHash is kept/exercised via the unit test below; a single-bucket
     // table doesn't need real hash values, only *a* consistent function.)
@@ -287,6 +303,8 @@ pub fn build(allocator: std.mem.Allocator, soname: []const u8, needed: []const u
     relas[4] = .{ .r_offset = got.input_queue_attach_looper, .r_info = (@as(u64, 5) << 32) | R_AARCH64_GLOB_DAT, .r_addend = 0 };
     relas[5] = .{ .r_offset = got.input_queue_get_event, .r_info = (@as(u64, 6) << 32) | R_AARCH64_GLOB_DAT, .r_addend = 0 };
     relas[6] = .{ .r_offset = got.input_queue_finish_event, .r_info = (@as(u64, 7) << 32) | R_AARCH64_GLOB_DAT, .r_addend = 0 };
+    relas[7] = .{ .r_offset = got.input_event_get_type, .r_info = (@as(u64, 8) << 32) | R_AARCH64_GLOB_DAT, .r_addend = 0 };
+    relas[8] = .{ .r_offset = got.motion_event_get_action, .r_info = (@as(u64, 9) << 32) | R_AARCH64_GLOB_DAT, .r_addend = 0 };
 
     // ── .dynamic ───────────────────────────────────────────────────────
     var dyn: [dynamic_count]Elf64Dyn = undefined;
@@ -313,12 +331,13 @@ pub fn build(allocator: std.mem.Allocator, soname: []const u8, needed: []const u
     const sh_dynamic = try Str.add(&shstrtab, ".dynamic");
     const sh_got = try Str.add(&shstrtab, ".got");
     const sh_text = try Str.add(&shstrtab, ".text");
+    const sh_data = try Str.add(&shstrtab, ".data");
     const sh_shstrtab = try Str.add(&shstrtab, ".shstrtab");
 
     const shstrtab_off = alignUp(rw_end, 1);
     const shstrtab_size = shstrtab.items.len;
     const shdr_off = alignUp(shstrtab_off + shstrtab_size, 8);
-    const shnum = 9; // null, dynsym, dynstr, hash, rela.dyn, dynamic, text, got, shstrtab
+    const shnum = 10; // null, dynsym, dynstr, hash, rela.dyn, dynamic, text, got, data, shstrtab
     const shdr_size = shnum * @sizeOf(Elf64Shdr);
     const file_size = shdr_off + shdr_size;
 
@@ -343,7 +362,7 @@ pub fn build(allocator: std.mem.Allocator, soname: []const u8, needed: []const u
     ehdr.e_phnum = 4;
     ehdr.e_shentsize = @sizeOf(Elf64Shdr);
     ehdr.e_shnum = shnum;
-    ehdr.e_shstrndx = 8; // index of .shstrtab among the 9 sections: null,dynsym,dynstr,hash,rela.dyn,dynamic,text,got,shstrtab
+    ehdr.e_shstrndx = 9; // index of .shstrtab among the 10 sections: null,dynsym,dynstr,hash,rela.dyn,dynamic,text,got,data,shstrtab
     writeStruct(buf, 0, Elf64Ehdr, ehdr);
 
     const phdrs = [4]Elf64Phdr{
@@ -372,6 +391,7 @@ pub fn build(allocator: std.mem.Allocator, soname: []const u8, needed: []const u
         .{ .sh_name = sh_dynamic, .sh_type = SHT_DYNAMIC, .sh_flags = SHF_ALLOC | SHF_WRITE, .sh_addr = dynamic_off, .sh_offset = dynamic_off, .sh_size = dynamic_size, .sh_link = 2, .sh_info = 0, .sh_addralign = 8, .sh_entsize = @sizeOf(Elf64Dyn) },
         .{ .sh_name = sh_text, .sh_type = SHT_PROGBITS, .sh_flags = SHF_ALLOC | SHF_EXECINSTR, .sh_addr = TEXT_VADDR, .sh_offset = TEXT_VADDR, .sh_size = text_size, .sh_link = 0, .sh_info = 0, .sh_addralign = 4, .sh_entsize = 0 },
         .{ .sh_name = sh_got, .sh_type = SHT_PROGBITS, .sh_flags = SHF_ALLOC | SHF_WRITE, .sh_addr = got_off, .sh_offset = got_off, .sh_size = got_size, .sh_link = 0, .sh_info = 0, .sh_addralign = 8, .sh_entsize = 8 },
+        .{ .sh_name = sh_data, .sh_type = SHT_PROGBITS, .sh_flags = SHF_ALLOC | SHF_WRITE, .sh_addr = data_off, .sh_offset = data_off, .sh_size = data_size, .sh_link = 0, .sh_info = 0, .sh_addralign = 8, .sh_entsize = 0 },
         .{ .sh_name = sh_shstrtab, .sh_type = SHT_STRTAB, .sh_flags = 0, .sh_addr = 0, .sh_offset = shstrtab_off, .sh_size = shstrtab_size, .sh_link = 0, .sh_info = 0, .sh_addralign = 1, .sh_entsize = 0 },
     };
     for (shdrs, 0..) |s, i| writeStruct(buf, shdr_off + i * @sizeOf(Elf64Shdr), Elf64Shdr, s);

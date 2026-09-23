@@ -583,9 +583,71 @@ Tested by installing the mlx-built `bluescreen.apk` on a real device
     `onNativeWindowRedrawNeeded`), and `aapt dump xmltree` confirms
     `android:configChanges` now reads `0x20`. Full external-tool suite
     re-run clean.
+- **Sixteenth report: the status bar still wasn't right, and a request to
+  test touch input** -- the fifteenth round's `TranslucentDecor` theme
+  still didn't look like a normal status bar with the blue underneath, the
+  landscape black bar persisted (now visibly next to the front camera,
+  confirming it as the display cutout, not the earlier resize bug), and a
+  request to verify touch works by cycling through colors on tap.
+  - *Display cutout, the real fix.* `windowTranslucentStatus`/
+    `windowTranslucentNavigation` (what `TranslucentDecor` actually sets)
+    only make the *system bars* see-through -- they say nothing about
+    Android's separate, independent default for the *display cutout*
+    (the front camera). Fetched Android's own developer documentation
+    rather than guessing further: "the platform default allows a window
+    under the cutout in portrait, but avoids it in landscape, leaving a
+    black bar over the cutout area" -- exactly the symptom. The fix is
+    `WindowManager.LayoutParams.layoutInDisplayCutoutMode =
+    LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES` (`1`, ground-truthed against
+    the real Android docs), settable only via a custom theme (a
+    resources.arsc/style writer this experiment doesn't have) or directly
+    through JNI -- so `fixDisplayCutoutMode` makes this project's
+    first-ever JNI calls: `activity.getWindow().getAttributes()`, set the
+    field, `.setAttributes(...)`. Every JNI function-table byte offset used
+    (`FindClass`=48, `GetMethodID`=264, `CallObjectMethod`=272,
+    `CallVoidMethod`=488, `GetFieldID`=752, `SetIntField`=872) was cross-
+    checked against both Oracle's published JNI Functions reference and a
+    fetched real AOSP `jni.h`, not trusted from memory, given a wrong
+    vtable offset here is a straight crash with no adb/logcat to diagnose
+    it from. Given that real risk -- a materially bigger, riskier class of
+    change than anything shipped in this experiment before -- this round's
+    implementation was only started after explicitly confirming with the
+    user that the risk was worth taking rather than deferring it.
+  - *Touch, to actually test something new rather than just re-verify
+    rotation.* `drainInputEvents` now calls the two more NDK imports this
+    needed (`AInputEvent_getType`, `AMotionEvent_getAction`, both stable
+    `libandroid.so` exports like every other import here) on each event
+    instead of immediately finishing it unread; on a finger touching down
+    it advances through a four-color palette (blue/red/green/yellow) and
+    repaints immediately by calling the shared paint handler directly.
+    Backing this needed this experiment's first mutable global state since
+    the `g_callbacks` allocation an earlier round removed (that removal
+    was for an unrelated reason -- writing into the framework's own struct
+    instead of replacing its pointer, see the tenth report -- not a
+    reason to avoid app-owned mutable state in general): a small 24-byte
+    `.data` block (`g_currentColor`, `g_colorIndex`, `g_window`,
+    `g_activity`) the paint handler and `fixDisplayCutoutMode` both also
+    read from.
+  - *Verification, given the elevated risk.* No adb/logcat access exists
+    to fall back on, so this round leaned harder than usual on static
+    verification before shipping: disassembled the entire rebuilt `.text`
+    with `llvm-objdump -d --triple=aarch64` and checked every one of the
+    ~330 words -- every JNI vtable offset, every stack save/reload, every
+    branch target, and every embedded C-string constant (packed as raw
+    data words in the same R+X `.text` section the disassembler
+    obligingly -- if confusingly -- tries and fails to decode as
+    instructions) -- against the intended design by hand. All of it
+    matched exactly, including string bytes that decode character-for-
+    character to `"android/app/NativeActivity\0"`,
+    `"()Landroid/view/WindowManager$LayoutParams;\0"`, and so on. `readelf
+    -d`/`--dyn-syms`/`-r` confirmed the two new dynsym entries and
+    relocations resolve correctly, and the full external-tool suite
+    (`aapt`, `jarsigner -verify`, `unzip -t`) re-run clean. Real-device
+    behavior is still the only way to know whether the cutout fix and
+    touch actually work as intended.
 
-This closes out the black-screen-and-ANR investigation and covers three
-follow-up feature/fix rounds: fifteen real-device rounds, eight genuine
+This closes out the black-screen-and-ANR investigation and covers four
+follow-up feature/fix rounds: sixteen real-device rounds, eight genuine
 bugs found and fixed (missing `onNativeWindowResized`/
 `onNativeWindowRedrawNeeded` registration; missing `LR` preservation
 across the handler's nested calls; the actual root cause, replacing
@@ -601,15 +663,16 @@ rotation path that's fragile enough that even Google's own reference NDK
 glue library doesn't support it, fixed by routing rotation through
 Android's standard destroy-and-recreate path instead), one correctness fix
 found along the way (the window's real default format is `RGB_565`, not
-`RGBA_8888`), two toggle features added after the app was confirmed
-working (fullscreen vs. status-bar-visible; hardcoded-black vs.
-system-adaptive status bar color) -- the second of which took a follow-up
-round to get right, since the first real, correctly-resolved theme tried
-for it turned out to be the wrong mechanism for what was actually being
-asked for -- and a lot of what turned out to be correctly-transcribed ABI
-assumptions (struct offsets, calling conventions, ELF/dynamic-linking
-details) that real-device evidence independently confirmed rather than
-contradicted.
+`RGBA_8888`), three feature additions after the app was confirmed working
+(fullscreen vs. status-bar-visible; hardcoded-black vs. system-adaptive
+status bar color -- which itself took two follow-up rounds, first to the
+wrong translucency-only mechanism and then to the actually-independent
+display-cutout fix, this project's first JNI calls; and touch-to-cycle-
+colors, backed by this experiment's first legitimate mutable app state),
+and a lot of what turned out to be correctly-transcribed ABI assumptions
+(struct offsets, calling conventions, ELF/dynamic-linking, and now JNI
+function-table details) that real-device evidence independently confirmed
+rather than contradicted.
 
 ## What's genuinely unverified
 

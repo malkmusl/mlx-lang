@@ -62,8 +62,16 @@ pub const CB_OFFSET_ON_NATIVE_WINDOW_RESIZED: u16 = 64;
 pub const CB_OFFSET_ON_NATIVE_WINDOW_REDRAW_NEEDED: u16 = 72;
 pub const CB_OFFSET_ON_INPUT_QUEUE_CREATED: u16 = 88;
 pub const ACTIVITY_OFFSET_CALLBACKS: u16 = 0;
+/// `struct ANativeActivity { void* callbacks; JavaVM* vm; JNIEnv* env;
+/// jobject clazz; ... }` (android/native_activity.h) -- needed now that
+/// fixDisplayCutoutMode below makes this experiment's first-ever JNI calls.
+pub const ACTIVITY_OFFSET_ENV: u16 = 16;
+pub const ACTIVITY_OFFSET_CLAZZ: u16 = 24;
 
 pub const BLUE_RGBA8888_LE: u32 = 0xFFFF0000;
+pub const RED_RGBA8888_LE: u32 = 0xFF0000FF;
+pub const GREEN_RGBA8888_LE: u32 = 0xFF00FF00;
+pub const YELLOW_RGBA8888_LE: u32 = 0xFF00FFFF;
 pub const WINDOW_FORMAT_RGBA_8888: u32 = 1;
 
 /// The ALooper "ident" this experiment's input queue is attached under.
@@ -71,6 +79,49 @@ pub const WINDOW_FORMAT_RGBA_8888: u32 = 1;
 /// supplied to AInputQueue_attachLooper, the looper invokes that callback
 /// directly instead of ever returning this ident from ALooper_pollOnce.
 pub const LOOPER_IDENT_INPUT: u32 = 1;
+
+/// AInputEvent_getType's result for a touch/motion event (android/input.h).
+pub const AINPUT_EVENT_TYPE_MOTION: u32 = 2;
+/// AMotionEvent_getAction's low byte for a finger just touching down
+/// (android/input.h's AMOTION_EVENT_ACTION_DOWN). Compared against the
+/// *unmasked* action int below rather than `action & AMOTION_EVENT_ACTION_MASK`
+/// first, since this encoder has no bitwise AND -- correct for this
+/// experiment's single-finger taps (pointer index 0 contributes nothing to
+/// the masked-off upper bits), but a multi-touch gesture with a nonzero
+/// pointer index could in principle slip past this check unrecognized.
+pub const AMOTION_EVENT_ACTION_DOWN: u32 = 0;
+
+/// JNI function-table (`JNINativeInterface`) byte offsets -- ground-truthed
+/// against the real JNI spec (stable since JNI 1.2, unchanged since; cross-
+/// checked against both Oracle's own JNI Functions reference and a fetched
+/// real AOSP jni.h, not trusted from memory alone). Every `JNIEnv*` is a
+/// `JNINativeInterface**`, so calling any JNI function is
+/// `functable = *env; fn = functable[INDEX]; fn(env, ...)` -- see
+/// emitJniCall. Each index below is its position in the table (0-based)
+/// times 8 (pointer size): FindClass=6, GetMethodID=33,
+/// CallObjectMethod=34, CallVoidMethod=61, GetFieldID=94, SetIntField=109.
+pub const JNI_FIND_CLASS: u32 = 48;
+pub const JNI_GET_METHOD_ID: u32 = 264;
+pub const JNI_CALL_OBJECT_METHOD: u32 = 272;
+pub const JNI_CALL_VOID_METHOD: u32 = 488;
+pub const JNI_GET_FIELD_ID: u32 = 752;
+pub const JNI_SET_INT_FIELD: u32 = 872;
+
+/// WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES,
+/// ground-truthed against the real Android developer docs (not memorized):
+/// "the window is always allowed to extend into the DisplayCutout areas on
+/// the short edges of the screen" -- in every orientation, which is exactly
+/// what fixDisplayCutoutMode below needs.
+pub const LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES: u32 = 1;
+
+/// Byte offsets within this experiment's own small writable `.data` block
+/// (see elf_so.zig's `data_vaddr`) for its mutable app state -- never
+/// touched by the dynamic linker (unlike `.got`), only read/written by our
+/// own code below.
+pub const DATA_OFFSET_CURRENT_COLOR: u64 = 0; // u32: the paint handler's fill color
+pub const DATA_OFFSET_COLOR_INDEX: u64 = 4; // u32: which palette entry is current
+pub const DATA_OFFSET_WINDOW: u64 = 8; // u64: most recently painted ANativeWindow*
+pub const DATA_OFFSET_ACTIVITY: u64 = 16; // u64: the ANativeActivity* from onCreate
 
 pub const GotLayout = struct {
     set_buffers_geometry: u64,
@@ -80,6 +131,8 @@ pub const GotLayout = struct {
     input_queue_attach_looper: u64,
     input_queue_get_event: u64,
     input_queue_finish_event: u64,
+    input_event_get_type: u64,
+    motion_event_get_action: u64,
 };
 
 /// Build the full .text machine code: `ANativeActivity_onCreate` immediately
@@ -92,6 +145,7 @@ pub fn buildText(
     allocator: std.mem.Allocator,
     text_vaddr: u64,
     got: GotLayout,
+    data_vaddr: u64,
 ) !std.ArrayList(u32) {
     var out = try std.ArrayList(u32).initCapacity(allocator, 40);
     errdefer out.deinit();
@@ -115,8 +169,34 @@ pub fn buildText(
     // untouched and all-NULL, so its guard silently never fires the
     // callback. No crash, no error, no visible effect at all -- which
     // matches everything observed on-device across every earlier round.
+    // Now non-leaf (it calls fixDisplayCutoutMode via BLR near the end), so
+    // -- per the same LR-preservation rule the paint handler below
+    // documents, and got wrong once before there -- it must save its own
+    // incoming LR before that call and restore it before its own `ret`,
+    // even though nothing before this round ever touched LR here.
     const on_create_start = out.items.len;
     std.debug.assert(on_create_start == 0);
+    try out.append(a64.subImm64(a64.sp, a64.sp, 16));
+    try out.append(a64.strX(a64.lr, a64.sp, 0)); // save LR
+
+    // Cache `activity` itself and set the initial fill color into this
+    // experiment's small `.data` block (see elf_so.zig's `data_vaddr`):
+    // g_activity lets fixDisplayCutoutMode (called at the end of this
+    // function) and a later touch event (drainInputEvents) reach the JNI
+    // env/clazz and repaint without either being threaded through as an
+    // extra parameter; g_currentColor/g_colorIndex back the
+    // touch-to-cycle-colors feature -- the paint handler below now reads
+    // its fill color from g_currentColor instead of a hardcoded immediate.
+    try emitAdrpAdd(&out, text_vaddr, 10, data_vaddr + DATA_OFFSET_ACTIVITY);
+    try out.append(a64.strX(0, 10, 0)); // g_activity = activity (x0, untouched so far)
+    try emitAdrpAdd(&out, text_vaddr, 10, data_vaddr + DATA_OFFSET_CURRENT_COLOR);
+    try out.append(a64.movz32(11, @truncate(BLUE_RGBA8888_LE), 0));
+    try out.append(a64.movk32(11, @truncate(BLUE_RGBA8888_LE >> 16), 1));
+    try out.append(a64.strW(11, 10, 0)); // g_currentColor = blue (initial)
+    try emitAdrpAdd(&out, text_vaddr, 10, data_vaddr + DATA_OFFSET_COLOR_INDEX);
+    try out.append(a64.movz32(11, 0, 0));
+    try out.append(a64.strW(11, 10, 0)); // g_colorIndex = 0
+
     try out.append(a64.ldrX(9, 0, ACTIVITY_OFFSET_CALLBACKS)); // x9 = activity->callbacks (framework-owned, already valid -- do not overwrite this pointer)
     // (function 2's address is only known once we've counted this function's
     // own length below — patched in after the fact, see `windowCreatedAddr`)
@@ -183,6 +263,20 @@ pub fn buildText(
     try out.append(0); // placeholder ADRP x10, onInputQueueCreated
     try out.append(0); // placeholder ADD  x10, x10, #lo12
     try out.append(a64.strX(10, 9, CB_OFFSET_ON_INPUT_QUEUE_CREATED)); // activity->callbacks->onInputQueueCreated = x10
+
+    // Fix the landscape display-cutout black bar (real-device feedback):
+    // see fixDisplayCutoutMode's own comment, at the end of this file, for
+    // the full mechanism. Its address is only known once this whole
+    // function's length is counted -- patched in after the fact, the same
+    // way onNativeWindowCreated's and onInputQueueCreated's addresses are
+    // above.
+    const adrp_fix_cutout_idx = out.items.len;
+    try out.append(0); // placeholder ADRP x3, fixDisplayCutoutMode
+    try out.append(0); // placeholder ADD  x3, x3, #lo12
+    try out.append(a64.blr(3));
+
+    try out.append(a64.ldrX(a64.lr, a64.sp, 0)); // restore LR
+    try out.append(a64.addImm64(a64.sp, a64.sp, 16));
     try out.append(a64.ret(a64.lr));
 
     const on_window_created_start = out.items.len;
@@ -226,6 +320,12 @@ pub fn buildText(
     try out.append(a64.strX(a64.lr, a64.sp, 48)); // save LR
     try out.append(a64.strX(1, a64.sp, 56)); // save window
 
+    // Keep g_window fresh across every paint (create/resize/redraw, and
+    // now a touch-triggered repaint too), so drainInputEvents always has
+    // an up-to-date window to hand back to this same function.
+    try emitAdrpAdd(&out, text_vaddr, 9, data_vaddr + DATA_OFFSET_WINDOW);
+    try out.append(a64.strX(1, 9, 0)); // g_window = window
+
     // ANativeWindow_setBuffersGeometry(window, 0, 0, RGBA_8888) -- the
     // window's actual default surface format is PixelFormat.RGB_565 (16-bit,
     // per NativeActivity.java's onCreate, which calls
@@ -254,8 +354,8 @@ pub fn buildText(
     try out.append(a64.ldrW(10, a64.sp, 8)); // w10 = stride (zero-extends x10)
     try out.append(a64.mul64(11, 9, 10)); // x11 = total pixel count
     try out.append(a64.ldrX(12, a64.sp, 16)); // x12 = buffer.bits
-    try out.append(a64.movz32(13, @truncate(BLUE_RGBA8888_LE), 0));
-    try out.append(a64.movk32(13, @truncate(BLUE_RGBA8888_LE >> 16), 1));
+    try emitAdrpAdd(&out, text_vaddr, 13, data_vaddr + DATA_OFFSET_CURRENT_COLOR);
+    try out.append(a64.ldrW(13, 13, 0)); // w13 = g_currentColor (touch-cycled fill color)
 
     // if (total_pixels == 0) goto skip_fill;  (forward branch, patched below)
     const cbz_zero_pixels_idx = out.items.len;
@@ -353,6 +453,98 @@ pub fn buildText(
     const tbnz_drain_done_idx = out.items.len;
     try out.append(0);
 
+    // Touch-to-cycle-colors: on a finger touching down, advance through a
+    // small color palette and repaint immediately -- added after
+    // real-device feedback asking to test touch this way. See
+    // AMOTION_EVENT_ACTION_DOWN's comment above for the one known
+    // limitation (no bitwise AND here, so the action int isn't masked).
+    try out.append(a64.ldrX(0, a64.sp, 0)); // x0 = event
+    try emitGotCall(&out, text_vaddr, 9, got.input_event_get_type); // w0 = AInputEvent_getType(event)
+    try out.append(a64.subImm64(9, 0, AINPUT_EVENT_TYPE_MOTION));
+    const cbnz_not_motion_idx = out.items.len;
+    try out.append(0); // if type != MOTION, skip touch handling (forward branch, patched below)
+
+    try out.append(a64.ldrX(0, a64.sp, 0)); // x0 = event (reload: getType above clobbered it)
+    try emitGotCall(&out, text_vaddr, 9, got.motion_event_get_action); // w0 = AMotionEvent_getAction(event)
+    try out.append(a64.subImm64(9, 0, AMOTION_EVENT_ACTION_DOWN));
+    const cbnz_not_down_idx = out.items.len;
+    try out.append(0); // if action != DOWN, skip touch handling (forward branch, patched below)
+
+    // Advance g_colorIndex (0->1->2->3->0) and g_currentColor to match --
+    // written as a 4-case if/elif/elif/else chain rather than an
+    // index-scaled table jump: this encoder has no register-offset
+    // addressing mode or bitwise AND for a mod-4, and four cases is cheap
+    // to just write out directly.
+    try emitAdrpAdd(&out, text_vaddr, 9, data_vaddr + DATA_OFFSET_COLOR_INDEX);
+    try out.append(a64.ldrW(10, 9, 0)); // w10 = g_colorIndex; x9 = &g_colorIndex, kept live so every case below can store its new index through it directly
+
+    try out.append(a64.subImm64(11, 10, 0)); // index - 0
+    const skip_case0_idx = out.items.len;
+    try out.append(0); // if index != 0, try the next case (patched below)
+    try out.append(a64.movz32(12, 1, 0));
+    try out.append(a64.strW(12, 9, 0)); // g_colorIndex = 1
+    try out.append(a64.movz32(13, @truncate(RED_RGBA8888_LE), 0));
+    try out.append(a64.movk32(13, @truncate(RED_RGBA8888_LE >> 16), 1));
+    const done_case0_idx = out.items.len;
+    try out.append(0); // branch to color_chosen (patched below)
+
+    const case1_start = out.items.len;
+    out.items[skip_case0_idx] = a64.cbnzX(11, @as(i32, @intCast(case1_start)) * 4 - @as(i32, @intCast(skip_case0_idx)) * 4);
+    try out.append(a64.subImm64(11, 10, 1)); // index - 1
+    const skip_case1_idx = out.items.len;
+    try out.append(0);
+    try out.append(a64.movz32(12, 2, 0));
+    try out.append(a64.strW(12, 9, 0)); // g_colorIndex = 2
+    try out.append(a64.movz32(13, @truncate(GREEN_RGBA8888_LE), 0));
+    try out.append(a64.movk32(13, @truncate(GREEN_RGBA8888_LE >> 16), 1));
+    const done_case1_idx = out.items.len;
+    try out.append(0);
+
+    const case2_start = out.items.len;
+    out.items[skip_case1_idx] = a64.cbnzX(11, @as(i32, @intCast(case2_start)) * 4 - @as(i32, @intCast(skip_case1_idx)) * 4);
+    try out.append(a64.subImm64(11, 10, 2)); // index - 2
+    const skip_case2_idx = out.items.len;
+    try out.append(0);
+    try out.append(a64.movz32(12, 3, 0));
+    try out.append(a64.strW(12, 9, 0)); // g_colorIndex = 3
+    try out.append(a64.movz32(13, @truncate(YELLOW_RGBA8888_LE), 0));
+    try out.append(a64.movk32(13, @truncate(YELLOW_RGBA8888_LE >> 16), 1));
+    const done_case2_idx = out.items.len;
+    try out.append(0);
+
+    const case3_start = out.items.len;
+    out.items[skip_case2_idx] = a64.cbnzX(11, @as(i32, @intCast(case3_start)) * 4 - @as(i32, @intCast(skip_case2_idx)) * 4);
+    // else (index == 3, or any unexpected value): wrap back to blue.
+    try out.append(a64.movz32(12, 0, 0));
+    try out.append(a64.strW(12, 9, 0)); // g_colorIndex = 0
+    try out.append(a64.movz32(13, @truncate(BLUE_RGBA8888_LE), 0));
+    try out.append(a64.movk32(13, @truncate(BLUE_RGBA8888_LE >> 16), 1));
+    // falls straight through to color_chosen, no branch needed
+
+    const color_chosen = out.items.len;
+    out.items[done_case0_idx] = a64.b(@as(i32, @intCast(color_chosen)) * 4 - @as(i32, @intCast(done_case0_idx)) * 4);
+    out.items[done_case1_idx] = a64.b(@as(i32, @intCast(color_chosen)) * 4 - @as(i32, @intCast(done_case1_idx)) * 4);
+    out.items[done_case2_idx] = a64.b(@as(i32, @intCast(color_chosen)) * 4 - @as(i32, @intCast(done_case2_idx)) * 4);
+
+    try emitAdrpAdd(&out, text_vaddr, 9, data_vaddr + DATA_OFFSET_CURRENT_COLOR);
+    try out.append(a64.strW(13, 9, 0)); // g_currentColor = the chosen color
+
+    // Repaint now with the new color: call the shared paint handler
+    // directly (x0=activity is unused by it, x1=window from g_window --
+    // see its own comment). Its address (on_window_created_vaddr) is
+    // already known at this point in the emission order, unlike the other
+    // ADRP+ADD sites in this file that reference addresses not yet known
+    // when emitted, so no forward-patch is needed here.
+    try emitAdrpAdd(&out, text_vaddr, 1, data_vaddr + DATA_OFFSET_WINDOW);
+    try out.append(a64.ldrX(1, 1, 0)); // x1 = g_window
+    try out.append(a64.movz32(0, 0, 0)); // x0 = 0 (unused by the paint handler)
+    try emitAdrpAdd(&out, text_vaddr, 3, on_window_created_vaddr);
+    try out.append(a64.blr(3));
+
+    const touch_handled = out.items.len;
+    out.items[cbnz_not_motion_idx] = a64.cbnzX(9, @as(i32, @intCast(touch_handled)) * 4 - @as(i32, @intCast(cbnz_not_motion_idx)) * 4);
+    out.items[cbnz_not_down_idx] = a64.cbnzX(9, @as(i32, @intCast(touch_handled)) * 4 - @as(i32, @intCast(cbnz_not_down_idx)) * 4);
+
     try out.append(a64.ldrX(0, a64.sp, 16)); // x0 = queue
     try out.append(a64.ldrX(1, a64.sp, 0)); // x1 = event (written by getEvent above)
     try out.append(a64.movz32(2, 0, 0)); // w2 = handled = 0
@@ -369,6 +561,157 @@ pub fn buildText(
     try out.append(a64.movz32(0, 1, 0)); // w0 = 1 (keep receiving future callbacks)
     try out.append(a64.ret(a64.lr));
 
+    const fix_cutout_start = out.items.len;
+    const fix_cutout_vaddr = text_vaddr + fix_cutout_start * 4;
+    {
+        const pc = text_vaddr + adrp_fix_cutout_idx * 4;
+        out.items[adrp_fix_cutout_idx] = a64.adrp(3, pc, fix_cutout_vaddr);
+        out.items[adrp_fix_cutout_idx + 1] = a64.addImm64(3, 3, @truncate(fix_cutout_vaddr & 0xfff));
+    }
+
+    // ── fixDisplayCutoutMode() -- reads g_activity, takes no other args ──
+    //
+    // Real-device feedback: rotating to landscape left a black bar over
+    // the area next to the display cutout (the front camera). Confirmed
+    // via Android's own documentation rather than guessed at: "The
+    // platform default allows a window under the cutout in portrait, but
+    // avoids it in landscape, leaving a black bar over the cutout area"
+    // -- exactly this symptom. The fix is to set
+    // `WindowManager.LayoutParams.layoutInDisplayCutoutMode` to
+    // LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES (1, see its own comment
+    // above), which lets the window extend into the cutout area on the
+    // screen's short edges in every orientation. That field can only be
+    // set via a custom theme (a resources.arsc/style writer this
+    // experiment doesn't have) or, as here, directly through JNI -- this
+    // project's first use of it. Equivalent to the Java:
+    //   Window w = activity.getWindow();
+    //   WindowManager.LayoutParams lp = w.getAttributes();
+    //   lp.layoutInDisplayCutoutMode = LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES;
+    //   w.setAttributes(lp);
+    // Every class/method/field name below is a real, public Android API
+    // (android.app.Activity.getWindow, android.view.Window.
+    // getAttributes/setAttributes, android.view.WindowManager.
+    // LayoutParams.layoutInDisplayCutoutMode). getAttributes/setAttributes
+    // are declared directly on the public abstract Window class, so
+    // FindClass on that (rather than the actual hidden PhoneWindow runtime
+    // subclass getWindow() returns) is enough -- JNI resolves
+    // inherited/overridden methods correctly starting from either the
+    // declaring class or a subclass.
+    //
+    // Stack frame (96 bytes, 16-aligned): [0]=env [8]=activityObj
+    // [16]=windowClass [24]=layoutParamsClass [32]=windowObj [40]=attrsObj
+    // [48]=getWindowMid [56]=getAttrsMid [64]=setAttrsMid
+    // [72]=cutoutModeFid [80]=saved LR. Every JNI call below reloads its
+    // arguments from this frame rather than trusting a register to still
+    // hold an earlier result, since emitJniCall's own ADRP+LDR sequence
+    // (and every JNI call itself) is free to clobber any caller-saved
+    // register -- the same discipline drainInputEvents already uses
+    // around its own GOT calls.
+    try out.append(a64.subImm64(a64.sp, a64.sp, 96));
+    try out.append(a64.strX(a64.lr, a64.sp, 80)); // save LR (non-leaf: many JNI calls via BLR)
+
+    try emitAdrpAdd(&out, text_vaddr, 9, data_vaddr + DATA_OFFSET_ACTIVITY);
+    try out.append(a64.ldrX(9, 9, 0)); // x9 = g_activity
+    try out.append(a64.ldrX(0, 9, ACTIVITY_OFFSET_ENV)); // x0 = activity->env (JNIEnv*)
+    try out.append(a64.strX(0, a64.sp, 0)); // save env
+    try out.append(a64.ldrX(1, 9, ACTIVITY_OFFSET_CLAZZ)); // x1 = activity->clazz
+    try out.append(a64.strX(1, a64.sp, 8)); // save activityObj
+
+    // activityClass = FindClass(env, "android/app/NativeActivity")
+    const str_native_activity = try emitCString(&out, text_vaddr, "android/app/NativeActivity");
+    try out.append(a64.ldrX(0, a64.sp, 0)); // x0 = env
+    try emitAdrpAdd(&out, text_vaddr, 1, str_native_activity);
+    try emitJniCall(&out, JNI_FIND_CLASS); // x0 = activityClass
+    try out.append(a64.movReg64(9, 0)); // x9 = activityClass (kept live for the very next call only)
+
+    // getWindowMid = GetMethodID(env, activityClass, "getWindow", "()Landroid/view/Window;")
+    const str_get_window = try emitCString(&out, text_vaddr, "getWindow");
+    const str_get_window_sig = try emitCString(&out, text_vaddr, "()Landroid/view/Window;");
+    try out.append(a64.ldrX(0, a64.sp, 0)); // x0 = env
+    try out.append(a64.movReg64(1, 9)); // x1 = activityClass
+    try emitAdrpAdd(&out, text_vaddr, 2, str_get_window);
+    try emitAdrpAdd(&out, text_vaddr, 3, str_get_window_sig);
+    try emitJniCall(&out, JNI_GET_METHOD_ID); // x0 = getWindowMid
+    try out.append(a64.strX(0, a64.sp, 48)); // save getWindowMid
+
+    // windowClass = FindClass(env, "android/view/Window")
+    const str_window = try emitCString(&out, text_vaddr, "android/view/Window");
+    try out.append(a64.ldrX(0, a64.sp, 0)); // x0 = env
+    try emitAdrpAdd(&out, text_vaddr, 1, str_window);
+    try emitJniCall(&out, JNI_FIND_CLASS); // x0 = windowClass
+    try out.append(a64.strX(0, a64.sp, 16)); // save windowClass
+    try out.append(a64.movReg64(9, 0)); // x9 = windowClass (kept live for the next call only)
+
+    // getAttrsMid = GetMethodID(env, windowClass, "getAttributes", "()Landroid/view/WindowManager$LayoutParams;")
+    const str_get_attrs = try emitCString(&out, text_vaddr, "getAttributes");
+    const str_get_attrs_sig = try emitCString(&out, text_vaddr, "()Landroid/view/WindowManager$LayoutParams;");
+    try out.append(a64.ldrX(0, a64.sp, 0)); // x0 = env
+    try out.append(a64.movReg64(1, 9)); // x1 = windowClass
+    try emitAdrpAdd(&out, text_vaddr, 2, str_get_attrs);
+    try emitAdrpAdd(&out, text_vaddr, 3, str_get_attrs_sig);
+    try emitJniCall(&out, JNI_GET_METHOD_ID); // x0 = getAttrsMid
+    try out.append(a64.strX(0, a64.sp, 56)); // save getAttrsMid
+
+    // setAttrsMid = GetMethodID(env, windowClass, "setAttributes", "(Landroid/view/WindowManager$LayoutParams;)V")
+    const str_set_attrs = try emitCString(&out, text_vaddr, "setAttributes");
+    const str_set_attrs_sig = try emitCString(&out, text_vaddr, "(Landroid/view/WindowManager$LayoutParams;)V");
+    try out.append(a64.ldrX(0, a64.sp, 0)); // x0 = env
+    try out.append(a64.ldrX(1, a64.sp, 16)); // x1 = windowClass (reload: the previous call clobbered x9)
+    try emitAdrpAdd(&out, text_vaddr, 2, str_set_attrs);
+    try emitAdrpAdd(&out, text_vaddr, 3, str_set_attrs_sig);
+    try emitJniCall(&out, JNI_GET_METHOD_ID); // x0 = setAttrsMid
+    try out.append(a64.strX(0, a64.sp, 64)); // save setAttrsMid
+
+    // layoutParamsClass = FindClass(env, "android/view/WindowManager$LayoutParams")
+    const str_layout_params = try emitCString(&out, text_vaddr, "android/view/WindowManager$LayoutParams");
+    try out.append(a64.ldrX(0, a64.sp, 0)); // x0 = env
+    try emitAdrpAdd(&out, text_vaddr, 1, str_layout_params);
+    try emitJniCall(&out, JNI_FIND_CLASS); // x0 = layoutParamsClass
+    try out.append(a64.strX(0, a64.sp, 24)); // save layoutParamsClass
+    try out.append(a64.movReg64(9, 0)); // x9 = layoutParamsClass (kept live for the next call only)
+
+    // cutoutModeFid = GetFieldID(env, layoutParamsClass, "layoutInDisplayCutoutMode", "I")
+    const str_cutout_field = try emitCString(&out, text_vaddr, "layoutInDisplayCutoutMode");
+    const str_int_sig = try emitCString(&out, text_vaddr, "I");
+    try out.append(a64.ldrX(0, a64.sp, 0)); // x0 = env
+    try out.append(a64.movReg64(1, 9)); // x1 = layoutParamsClass
+    try emitAdrpAdd(&out, text_vaddr, 2, str_cutout_field);
+    try emitAdrpAdd(&out, text_vaddr, 3, str_int_sig);
+    try emitJniCall(&out, JNI_GET_FIELD_ID); // x0 = cutoutModeFid
+    try out.append(a64.strX(0, a64.sp, 72)); // save cutoutModeFid
+
+    // windowObj = CallObjectMethod(env, activityObj, getWindowMid)
+    try out.append(a64.ldrX(0, a64.sp, 0)); // x0 = env
+    try out.append(a64.ldrX(1, a64.sp, 8)); // x1 = activityObj
+    try out.append(a64.ldrX(2, a64.sp, 48)); // x2 = getWindowMid
+    try emitJniCall(&out, JNI_CALL_OBJECT_METHOD); // x0 = windowObj
+    try out.append(a64.strX(0, a64.sp, 32)); // save windowObj
+
+    // attrsObj = CallObjectMethod(env, windowObj, getAttrsMid)
+    try out.append(a64.ldrX(0, a64.sp, 0)); // x0 = env
+    try out.append(a64.ldrX(1, a64.sp, 32)); // x1 = windowObj
+    try out.append(a64.ldrX(2, a64.sp, 56)); // x2 = getAttrsMid
+    try emitJniCall(&out, JNI_CALL_OBJECT_METHOD); // x0 = attrsObj
+    try out.append(a64.strX(0, a64.sp, 40)); // save attrsObj
+
+    // attrsObj.layoutInDisplayCutoutMode = LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+    try out.append(a64.ldrX(0, a64.sp, 0)); // x0 = env
+    try out.append(a64.ldrX(1, a64.sp, 40)); // x1 = attrsObj
+    try out.append(a64.ldrX(2, a64.sp, 72)); // x2 = cutoutModeFid
+    try out.append(a64.movz32(3, @truncate(LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES), 0)); // w3 = 1
+    try emitJniCall(&out, JNI_SET_INT_FIELD);
+
+    // window.setAttributes(attrsObj)
+    try out.append(a64.ldrX(0, a64.sp, 0)); // x0 = env
+    try out.append(a64.ldrX(1, a64.sp, 32)); // x1 = windowObj
+    try out.append(a64.ldrX(2, a64.sp, 64)); // x2 = setAttrsMid
+    try out.append(a64.ldrX(3, a64.sp, 40)); // x3 = attrsObj
+    try emitJniCall(&out, JNI_CALL_VOID_METHOD);
+
+    try out.append(a64.ldrX(a64.lr, a64.sp, 80)); // restore LR
+    try out.append(a64.addImm64(a64.sp, a64.sp, 96));
+    try out.append(a64.ret(a64.lr));
+
     return out;
 }
 
@@ -382,6 +725,58 @@ fn emitGotCall(out: *std.ArrayList(u32), text_vaddr: u64, scratch: a64.Reg, got_
     try out.append(a64.blr(scratch));
 }
 
+/// ADRP + ADD idiom: put the absolute address of `target` (anywhere in our
+/// own image) into `reg`, PC-relative, no relocation needed.
+fn emitAdrpAdd(out: *std.ArrayList(u32), text_vaddr: u64, reg: a64.Reg, target: u64) !void {
+    const pc = text_vaddr + out.items.len * 4;
+    try out.append(a64.adrp(reg, pc, target));
+    try out.append(a64.addImm64(reg, reg, @truncate(target & 0xfff)));
+}
+
+/// JNI calling idiom, used only by fixDisplayCutoutMode: given `env`
+/// (JNIEnv*) already loaded into x0 and any other real arguments already
+/// loaded into x1.. per the target JNI function's signature, calls through
+/// the JNI function table. `env` is a `JNINativeInterface**`, so reaching
+/// any JNI function needs two dereferences: one to get the table, one --
+/// at `offset`, one of the JNI_* byte offsets above -- to get the actual
+/// function pointer. Uses x9 as scratch (never x0/x1/x2/x3, which may hold
+/// live call arguments) so it never clobbers the arguments the caller just
+/// set up; every JNI function's first parameter is `env` itself, so x0
+/// must already hold it going in and this helper leaves it untouched.
+fn emitJniCall(out: *std.ArrayList(u32), offset: u32) !void {
+    try out.append(a64.ldrX(9, 0, 0)); // x9 = *env (the JNINativeInterface* function table)
+    try out.append(a64.ldrX(9, 9, @truncate(offset))); // x9 = functable[offset] (the actual function pointer)
+    try out.append(a64.blr(9));
+}
+
+/// Packs `s` plus a NUL terminator into `out` as raw data words -- never
+/// executed, just readable bytes living in the same R+X `.text` segment as
+/// every instruction here (harmless: nothing ever branches into it, and
+/// AArch64 doesn't care that non-instruction bytes sit in an executable
+/// page unless something actually tries to run them as code). Returns the
+/// vaddr the string starts at, for the caller to hand to emitAdrpAdd the
+/// same way any function address in this file already is.
+fn emitCString(out: *std.ArrayList(u32), text_vaddr: u64, s: []const u8) !u64 {
+    const start_vaddr = text_vaddr + out.items.len * 4;
+    var i: usize = 0;
+    while (i < s.len) : (i += 4) {
+        var word: u32 = 0;
+        var j: u5 = 0;
+        while (j < 4) : (j += 1) {
+            const byte_val: u32 = if (i + j < s.len) @intCast(s[i + j]) else 0;
+            word |= byte_val << (j * 8);
+        }
+        try out.append(word);
+    }
+    // The loop above already zero-pads (hence NUL-terminates) any partial
+    // final word, but a length that's an exact multiple of 4 needs one
+    // more all-zero word for the terminator.
+    if (s.len % 4 == 0) {
+        try out.append(0);
+    }
+    return start_vaddr;
+}
+
 test "buildText is deterministic in length across the two-pass call" {
     const alloc = std.testing.allocator;
     var pass1 = try buildText(alloc, 0, .{
@@ -392,7 +787,9 @@ test "buildText is deterministic in length across the two-pass call" {
         .input_queue_attach_looper = 0,
         .input_queue_get_event = 0,
         .input_queue_finish_event = 0,
-    });
+        .input_event_get_type = 0,
+        .motion_event_get_action = 0,
+    }, 0);
     defer pass1.deinit();
     var pass2 = try buildText(alloc, 0x2000, .{
         .set_buffers_geometry = 0x30b0,
@@ -402,8 +799,10 @@ test "buildText is deterministic in length across the two-pass call" {
         .input_queue_attach_looper = 0x30d0,
         .input_queue_get_event = 0x30d8,
         .input_queue_finish_event = 0x30e0,
-    });
+        .input_event_get_type = 0x30e8,
+        .motion_event_get_action = 0x30f0,
+    }, 0x30f8);
     defer pass2.deinit();
     try std.testing.expectEqual(pass1.items.len, pass2.items.len);
-    try std.testing.expect(pass1.items.len > 60);
+    try std.testing.expect(pass1.items.len > 300);
 }
