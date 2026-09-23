@@ -112,19 +112,33 @@ pub fn buildText(
     const adrp_window_created_idx = out.items.len;
     try out.append(0); // placeholder ADRP x10, onNativeWindowCreated
     try out.append(0); // placeholder ADD  x10, x10, #lo12
-    // Register the same handler for onNativeWindowCreated, onNativeWindowResized,
-    // and onNativeWindowRedrawNeeded — all three share the identical
+    // Register the same handler for onNativeWindowCreated and
+    // onNativeWindowRedrawNeeded — both share the identical
     // (ANativeActivity*, ANativeWindow*) signature, and our handler already
     // ignores the activity argument. A raw NativeActivity (no
     // android_native_app_glue) can have its very first onNativeWindowCreated
     // paint happen before the window is actually attached/composited and get
     // silently discarded with no further redraw ever requested from us;
     // registering onNativeWindowRedrawNeeded too (the system's explicit
-    // "please draw now, it's safe" signal) is the standard fix, matching what
-    // android_native_app_glue's own sample apps do by redrawing on more than
-    // just window-created.
+    // "please draw now, it's safe" signal, fired sparingly) is the standard
+    // fix, matching what android_native_app_glue's own sample apps do by
+    // redrawing on more than just window-created.
+    //
+    // Deliberately NOT registering onNativeWindowResized (there used to be
+    // a third store here, to that offset): confirmed via real-device
+    // testing to cause an ANR ("Mlx Blue Screen reagiert nicht" / not
+    // responding) on the back gesture, backgrounding, and even after
+    // sitting idle — all of which drive Android's live window-resize/
+    // transition animations, and onNativeWindowResized can fire on every
+    // frame of one of those. Every firing re-ran this handler's full
+    // synchronous ANativeWindow_lock/_setBuffersGeometry/_unlockAndPost
+    // cycle (real Binder IPC round-trips each time) with no rate limiting,
+    // which was enough repeated blocking work on the main thread to trip
+    // the ANR watchdog. Since the fill is a single solid color, it doesn't
+    // need repainting on every resize anyway — the already-posted buffer is
+    // simply scaled by the compositor during the animation and still looks
+    // correct; only an actual redraw request needs a new frame.
     try out.append(a64.strX(10, 9, CB_OFFSET_ON_NATIVE_WINDOW_CREATED)); // activity->callbacks->onNativeWindowCreated = x10
-    try out.append(a64.strX(10, 9, CB_OFFSET_ON_NATIVE_WINDOW_RESIZED)); // activity->callbacks->onNativeWindowResized = x10
     try out.append(a64.strX(10, 9, CB_OFFSET_ON_NATIVE_WINDOW_REDRAW_NEEDED)); // activity->callbacks->onNativeWindowRedrawNeeded = x10
     try out.append(a64.ret(a64.lr));
 

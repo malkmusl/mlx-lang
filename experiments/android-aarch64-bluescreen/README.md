@@ -364,16 +364,47 @@ Tested by installing the mlx-built `bluescreen.apk` on a real device
   Fullscreen` in both `axml.zig`/`axml.mlx`, now that the blue fill is
   confirmed to work independent of the theme's own background color.
 
-This closes out the black-screen investigation: nine real-device rounds,
-three genuine bugs found and fixed (missing `onNativeWindowResized`/
-`onNativeWindowRedrawNeeded` registration, missing `LR` preservation
-across the handler's nested calls, and — the actual root cause —
-replacing `activity->callbacks` instead of writing through it), one
-correctness fix found along the way (the window's real default format is
-`RGB_565`, not `RGBA_8888`), and a lot of what turned out to be
-correctly-transcribed ABI assumptions (struct offsets, calling
-conventions, ELF/dynamic-linking details) that real-device evidence
-independently confirmed rather than contradicted.
+- **Tenth report: a real blue screen, but "Mlx Blue Screen reagiert
+  nicht" (an ANR, "app not responding") on the back gesture, after
+  backgrounding, and even just after sitting idle for about a minute.**
+  Not a crash — no new tombstone appeared for it at all (confirmed by
+  cross-checking timestamps across two separate bug-report pulls), which
+  is itself the key clue: an unresponsive main thread, not a fault. All
+  three triggers share the same underlying event: Android running a live
+  window-resize/transition animation (the back gesture's dismiss preview,
+  the recents/home transition, and — for the idle case — most likely the
+  screen-timeout transition), each of which can fire
+  `onNativeWindowResized` on every animation frame. This handler was
+  still registered for that callback (registered back when the actual
+  bug was the callback-registration one, to make sure *some* redraw path
+  would eventually fire) and re-ran its full synchronous
+  `ANativeWindow_lock`/`_setBuffersGeometry`/`_unlockAndPost` cycle --
+  real Binder IPC round-trips -- on *every* firing, with no rate
+  limiting. Enough of those firing back-to-back during one animation was
+  enough blocking work on the main thread to trip the ANR watchdog.
+  Fixed by no longer registering `onNativeWindowResized` at all, in both
+  `native_activity.zig` and `native_activity.mlx` -- since the fill is a
+  single solid color, it doesn't need repainting on every resize anyway;
+  the already-posted buffer is simply scaled by the compositor during the
+  animation and still looks correct, and `onNativeWindowRedrawNeeded`
+  (fired sparingly, not per-frame, specifically when a fresh frame is
+  actually needed) remains registered alongside `onNativeWindowCreated`.
+  Verified by decoding the rebuilt `.text` bytes: `ANativeActivity_onCreate`
+  is now 6 words and stores the handler's address at only two offsets (56
+  and 72), with no store to 64.
+
+This closes out the black-screen investigation: ten real-device rounds,
+four genuine bugs found and fixed (missing `onNativeWindowResized`/
+`onNativeWindowRedrawNeeded` registration; missing `LR` preservation
+across the handler's nested calls; the actual root cause, replacing
+`activity->callbacks` instead of writing through it; and registering
+`onNativeWindowResized` itself, which caused an ANR once the real
+rendering path was finally reachable), one correctness fix found along
+the way (the window's real default format is `RGB_565`, not
+`RGBA_8888`), and a lot of what turned out to be correctly-transcribed
+ABI assumptions (struct offsets, calling conventions, ELF/dynamic-linking
+details) that real-device evidence independently confirmed rather than
+contradicted.
 
 ## What's genuinely unverified
 
