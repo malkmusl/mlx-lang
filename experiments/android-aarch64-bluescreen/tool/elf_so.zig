@@ -20,7 +20,7 @@
 //!   0x0040  Program headers (4: LOAD ro, LOAD rx, LOAD rw, DYNAMIC)
 //!   0x1000  [LOAD #1, R]   .dynsym  .dynstr  .hash  .rela.dyn
 //!   0x2000  [LOAD #2, R+X] .text
-//!   0x3000  [LOAD #3, R+W] .dynamic  .got  .data (g_callbacks)
+//!   0x3000  [LOAD #3, R+W] .dynamic  .got
 //!   ...     .shstrtab + section header table (not in any PT_LOAD — for
 //!           `readelf`/`objdump` friendliness only; Bionic's linker never
 //!           looks at section headers, only program headers + PT_DYNAMIC)
@@ -212,22 +212,26 @@ pub fn build(allocator: std.mem.Allocator, soname: []const u8, needed: []const u
         .lock = got_vaddr + 8,
         .unlock_and_post = got_vaddr + 16,
     };
-    const data_vaddr = got_vaddr + 24; // 3 GOT slots * 8 bytes
-    var text = try na.buildText(allocator, TEXT_VADDR, got, data_vaddr);
+    var text = try na.buildText(allocator, TEXT_VADDR, got);
     defer text.deinit();
     const text_size: u64 = text.items.len * 4;
     std.debug.assert(text_size <= PAGE);
 
     // ── layout inside the RW segment ───────────────────────────────────
+    // No separate `g_callbacks` data allocation here (there used to be
+    // one): ANativeActivity_onCreate now writes into the
+    // ANativeActivityCallbacks struct the framework itself already
+    // allocates and points `activity->callbacks` at, rather than pointing
+    // `activity->callbacks` at a struct of our own -- see
+    // native_activity.zig's buildText for the full story. So the RW
+    // segment only needs `.dynamic` and `.got`.
     const dynamic_off = RW_VADDR;
     const dynamic_count = 11;
     const dynamic_size: u64 = dynamic_count * @sizeOf(Elf64Dyn);
     std.debug.assert(RW_VADDR + dynamic_size == got_vaddr);
     const got_off = got_vaddr;
     const got_size: u64 = 24;
-    const data_off = data_vaddr;
-    const data_size: u64 = na.CALLBACKS_STRUCT_SIZE;
-    const rw_end = data_off + data_size;
+    const rw_end = got_off + got_size;
     std.debug.assert(rw_end <= RW_VADDR + PAGE);
 
     // ── .dynsym ─────────────────────────────────────────────────────────
@@ -284,17 +288,14 @@ pub fn build(allocator: std.mem.Allocator, soname: []const u8, needed: []const u
     const sh_rela = try Str.add(&shstrtab, ".rela.dyn");
     const sh_dynamic = try Str.add(&shstrtab, ".dynamic");
     const sh_got = try Str.add(&shstrtab, ".got");
-    const sh_data = try Str.add(&shstrtab, ".data");
     const sh_text = try Str.add(&shstrtab, ".text");
     const sh_shstrtab = try Str.add(&shstrtab, ".shstrtab");
 
     const shstrtab_off = alignUp(rw_end, 1);
     const shstrtab_size = shstrtab.items.len;
     const shdr_off = alignUp(shstrtab_off + shstrtab_size, 8);
-    const shnum = 9; // null, dynsym, dynstr, hash, rela.dyn, dynamic, text, got, data, shstrtab = 10 actually, fixed below
-    _ = shnum;
-    const real_shnum = 10;
-    const shdr_size = real_shnum * @sizeOf(Elf64Shdr);
+    const shnum = 9; // null, dynsym, dynstr, hash, rela.dyn, dynamic, text, got, shstrtab
+    const shdr_size = shnum * @sizeOf(Elf64Shdr);
     const file_size = shdr_off + shdr_size;
 
     // ── assemble the file ─────────────────────────────────────────────
@@ -317,8 +318,8 @@ pub fn build(allocator: std.mem.Allocator, soname: []const u8, needed: []const u
     ehdr.e_phentsize = @sizeOf(Elf64Phdr);
     ehdr.e_phnum = 4;
     ehdr.e_shentsize = @sizeOf(Elf64Shdr);
-    ehdr.e_shnum = real_shnum;
-    ehdr.e_shstrndx = 9;
+    ehdr.e_shnum = shnum;
+    ehdr.e_shstrndx = 8; // index of .shstrtab among the 9 sections: null,dynsym,dynstr,hash,rela.dyn,dynamic,text,got,shstrtab
     writeStruct(buf, 0, Elf64Ehdr, ehdr);
 
     const phdrs = [4]Elf64Phdr{
@@ -336,10 +337,9 @@ pub fn build(allocator: std.mem.Allocator, soname: []const u8, needed: []const u
     for (dyn, 0..) |d, i| writeStruct(buf, dynamic_off + i * @sizeOf(Elf64Dyn), Elf64Dyn, d);
     for (text.items, 0..) |w, i| writeInt(buf, TEXT_VADDR + i * 4, u32, w);
     // .got left zero — filled by the dynamic linker's GLOB_DAT relocations at load time.
-    // .data (g_callbacks) left zero — populated by ANativeActivity_onCreate at load time.
     @memcpy(buf[shstrtab_off..][0..shstrtab.items.len], shstrtab.items);
 
-    const shdrs = [10]Elf64Shdr{
+    const shdrs = [shnum]Elf64Shdr{
         std.mem.zeroes(Elf64Shdr), // SHN_UNDEF
         .{ .sh_name = sh_dynsym, .sh_type = SHT_DYNSYM, .sh_flags = SHF_ALLOC, .sh_addr = dynsym_off, .sh_offset = dynsym_off, .sh_size = dynsym_size, .sh_link = 2, .sh_info = 1, .sh_addralign = 8, .sh_entsize = @sizeOf(Elf64Sym) },
         .{ .sh_name = sh_dynstr, .sh_type = SHT_STRTAB, .sh_flags = SHF_ALLOC, .sh_addr = dynstr_off, .sh_offset = dynstr_off, .sh_size = dynstr_size, .sh_link = 0, .sh_info = 0, .sh_addralign = 1, .sh_entsize = 0 },
@@ -348,7 +348,6 @@ pub fn build(allocator: std.mem.Allocator, soname: []const u8, needed: []const u
         .{ .sh_name = sh_dynamic, .sh_type = SHT_DYNAMIC, .sh_flags = SHF_ALLOC | SHF_WRITE, .sh_addr = dynamic_off, .sh_offset = dynamic_off, .sh_size = dynamic_size, .sh_link = 2, .sh_info = 0, .sh_addralign = 8, .sh_entsize = @sizeOf(Elf64Dyn) },
         .{ .sh_name = sh_text, .sh_type = SHT_PROGBITS, .sh_flags = SHF_ALLOC | SHF_EXECINSTR, .sh_addr = TEXT_VADDR, .sh_offset = TEXT_VADDR, .sh_size = text_size, .sh_link = 0, .sh_info = 0, .sh_addralign = 4, .sh_entsize = 0 },
         .{ .sh_name = sh_got, .sh_type = SHT_PROGBITS, .sh_flags = SHF_ALLOC | SHF_WRITE, .sh_addr = got_off, .sh_offset = got_off, .sh_size = got_size, .sh_link = 0, .sh_info = 0, .sh_addralign = 8, .sh_entsize = 8 },
-        .{ .sh_name = sh_data, .sh_type = SHT_PROGBITS, .sh_flags = SHF_ALLOC | SHF_WRITE, .sh_addr = data_off, .sh_offset = data_off, .sh_size = data_size, .sh_link = 0, .sh_info = 0, .sh_addralign = 8, .sh_entsize = 0 },
         .{ .sh_name = sh_shstrtab, .sh_type = SHT_STRTAB, .sh_flags = 0, .sh_addr = 0, .sh_offset = shstrtab_off, .sh_size = shstrtab_size, .sh_link = 0, .sh_info = 0, .sh_addralign = 1, .sh_entsize = 0 },
     };
     for (shdrs, 0..) |s, i| writeStruct(buf, shdr_off + i * @sizeOf(Elf64Shdr), Elf64Shdr, s);

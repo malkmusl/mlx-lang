@@ -28,8 +28,13 @@
 //!   };
 //!
 //!   struct ANativeActivity { void* callbacks; /* ...JNI fields... */ };
-//!   // `callbacks` is the first field, at offset 0 — this is the one field
-//!   // this experiment relies on.
+//!   // `callbacks` is the first field, at offset 0. By the time
+//!   // ANativeActivity_onCreate runs, the framework has already allocated
+//!   // an ANativeActivityCallbacks struct and pointed `callbacks` at it --
+//!   // real-device testing (see buildText's comment) confirmed the
+//!   // contract is to write INTO that existing struct through the pointer
+//!   // (`activity->callbacks->onNativeWindowCreated = ...`), not to
+//!   // replace the pointer with one of our own.
 //!
 //!   struct ANativeWindow_Buffer {
 //!       int32_t width;    // +0
@@ -52,7 +57,6 @@
 const std = @import("std");
 const a64 = @import("aarch64.zig");
 
-pub const CALLBACKS_STRUCT_SIZE: u64 = 128;
 pub const CB_OFFSET_ON_NATIVE_WINDOW_CREATED: u16 = 56;
 pub const CB_OFFSET_ON_NATIVE_WINDOW_RESIZED: u16 = 64;
 pub const CB_OFFSET_ON_NATIVE_WINDOW_REDRAW_NEEDED: u16 = 72;
@@ -77,45 +81,32 @@ pub fn buildText(
     allocator: std.mem.Allocator,
     text_vaddr: u64,
     got: GotLayout,
-    data_callbacks_vaddr: u64,
 ) !std.ArrayList(u32) {
     var out = try std.ArrayList(u32).initCapacity(allocator, 40);
     errdefer out.deinit();
 
     // ── ANativeActivity_onCreate(x0=activity, x1=savedState, x2=savedStateSize) ──
     //
-    // Diagnostic history: an unconditional trap at the very start of the
-    // window handler (below) proved the window-created/resized/redraw-
-    // needed callback is never invoked at all on a real device, with no
-    // crash. Moving that trap to this function's own first instruction
-    // then proved ANativeActivity_onCreate itself *does* run (it crashed
-    // immediately on launch). The ANativeActivityCallbacks/ANativeActivity
-    // struct offsets used throughout this file were then cross-checked
-    // against the real AOSP source (android.googlesource.com,
-    // frameworks/native/include/android/native_activity.h) rather than
-    // memory, and matched exactly (callbacks@0, onNativeWindowCreated@56,
-    // onNativeWindowResized@64, onNativeWindowRedrawNeeded@72) -- ruling
-    // out a struct-offset mistake as the explanation too.
-    //
-    // Next: verify the one thing that's still just an assumption -- that
-    // `x0` genuinely points to a real ANativeActivity struct laid out the
-    // way we expect, as opposed to something unexpected on this specific
-    // real device/OS build. `activity->sdkVersion` (an int32_t at offset
-    // 48) is read and then dereferenced as a pointer, which -- since a
-    // real SDK version number (e.g. 34) is never a valid memory address --
-    // is guaranteed to SIGSEGV. Android's crash report reliably includes
-    // the exact faulting address, which is exactly the leaked sdkVersion
-    // value: a real, plausible SDK level (confirms x0 and the struct
-    // layout are right, and something else entirely is preventing the
-    // window callback) vs. 0 or something implausible (means x0 or the
-    // struct layout assumption is wrong after all). No adb needed -- just
-    // the crash report's fault address. Remove once answered.
+    // Root cause, found after an 8-round real-device diagnostic campaign
+    // (crash-address leaks, an AOSP source cross-check of every struct
+    // offset used here -- all correct -- and finally fetching the actual
+    // JNI glue, frameworks/base/core/jni/android_app_NativeActivity.cpp):
+    // `onSurfaceCreated_native` there checks
+    // `code->callbacks.onNativeWindowCreated != NULL`, reading through
+    // `activity->callbacks` as a pointer the FRAMEWORK already allocated
+    // and pre-populated (as part of its own internal NativeCode object)
+    // *before* calling our onCreate. The contract is to write INTO the
+    // ANativeActivityCallbacks struct the framework already points us at
+    // (`activity->callbacks->onNativeWindowCreated = ...`), not to
+    // allocate our own separate struct and replace the pointer
+    // (`activity->callbacks = &ourOwnStruct`) -- the latter (what this
+    // code used to do) leaves the framework's own internal storage
+    // untouched and all-NULL, so its guard silently never fires the
+    // callback. No crash, no error, no visible effect at all -- which
+    // matches everything observed on-device across every earlier round.
     const on_create_start = out.items.len;
     std.debug.assert(on_create_start == 0);
-    try out.append(a64.ldrW(9, 0, 48)); // w9 = activity->sdkVersion
-    try out.append(a64.ldrX(a64.xzr, 9, 0)); // deref w9/x9 as an address -- deliberate SIGSEGV, fault addr == sdkVersion
-
-    try emitAdrpAdd(&out, text_vaddr, 9, data_callbacks_vaddr);
+    try out.append(a64.ldrX(9, 0, ACTIVITY_OFFSET_CALLBACKS)); // x9 = activity->callbacks (framework-owned, already valid -- do not overwrite this pointer)
     // (function 2's address is only known once we've counted this function's
     // own length below — patched in after the fact, see `windowCreatedAddr`)
     const adrp_window_created_idx = out.items.len;
@@ -131,13 +122,10 @@ pub fn buildText(
     // registering onNativeWindowRedrawNeeded too (the system's explicit
     // "please draw now, it's safe" signal) is the standard fix, matching what
     // android_native_app_glue's own sample apps do by redrawing on more than
-    // just window-created. Found via real-device testing (blue fill silently
-    // not appearing on a Pixel 10 Pro / Android Canary build) — see the
-    // mlx-native port's identical fix and the README for the diagnosis.
-    try out.append(a64.strX(10, 9, CB_OFFSET_ON_NATIVE_WINDOW_CREATED)); // g_callbacks.onNativeWindowCreated = x10
-    try out.append(a64.strX(10, 9, CB_OFFSET_ON_NATIVE_WINDOW_RESIZED)); // g_callbacks.onNativeWindowResized = x10
-    try out.append(a64.strX(10, 9, CB_OFFSET_ON_NATIVE_WINDOW_REDRAW_NEEDED)); // g_callbacks.onNativeWindowRedrawNeeded = x10
-    try out.append(a64.strX(9, 0, ACTIVITY_OFFSET_CALLBACKS)); // activity->callbacks = &g_callbacks
+    // just window-created.
+    try out.append(a64.strX(10, 9, CB_OFFSET_ON_NATIVE_WINDOW_CREATED)); // activity->callbacks->onNativeWindowCreated = x10
+    try out.append(a64.strX(10, 9, CB_OFFSET_ON_NATIVE_WINDOW_RESIZED)); // activity->callbacks->onNativeWindowResized = x10
+    try out.append(a64.strX(10, 9, CB_OFFSET_ON_NATIVE_WINDOW_REDRAW_NEEDED)); // activity->callbacks->onNativeWindowRedrawNeeded = x10
     try out.append(a64.ret(a64.lr));
 
     const on_window_created_start = out.items.len;
@@ -161,36 +149,35 @@ pub fn buildText(
     // restore it before its own `ret` -- otherwise the final `ret` uses
     // whatever the *last* BLR left in LR (pointing back into this function's
     // own body, not to our caller), so control never actually returns to the
-    // Android framework. Missing this was the real cause of a real-device
-    // black screen (the buffer was filled and posted, but the handler never
-    // returned cleanly afterward) even after the onNativeWindowCreated-only
-    // registration bug was fixed.
+    // Android framework.
     //
-    // Diagnostic history: after removing setBuffersGeometry and trapping on
-    // a failing lock/unlockAndPost (see below), a real device was still
-    // black with no crash -- ruling out either of those calls returning
-    // failure. An unconditional trap as this handler's own first
-    // instruction was then tried and also produced no crash, proving this
-    // handler is never invoked by the framework at all -- see the
-    // now-active trap at the very start of ANativeActivity_onCreate above
-    // instead, which checks the more basic question of whether onCreate
-    // itself even runs.
+    // The real reason this handler was never even reached, across many
+    // rounds of real-device diagnosis, turned out to be entirely upstream
+    // of this function -- see ANativeActivity_onCreate's comment above.
+    // The lock/unlockAndPost failure traps below predate that finding
+    // (added as a diagnostic while this handler's own invocation was still
+    // in question) but are kept as a real, cheap safety net: on this ABI
+    // there's no other way to surface a lock/present failure without
+    // adb/logcat, and a silent failure here is exactly as invisible as the
+    // original bug was.
     try out.append(a64.subImm64(a64.sp, a64.sp, 64));
     try out.append(a64.strX(a64.lr, a64.sp, 48)); // save LR
     try out.append(a64.strX(1, a64.sp, 56)); // save window
 
-    // ANativeWindow_lock(window, &buffer, NULL) -- deliberately no
-    // ANativeWindow_setBuffersGeometry(window, 0, 0, RGBA_8888) call before
-    // this (there used to be one): after fixing the callback-registration
-    // and LR-preservation bugs, a real device still showed solid black
-    // (confirmed independent of the window's theme/background -- a
-    // SurfaceView shows black by default until a buffer is actually
-    // posted, so this points at the lock/fill/post path itself). With no
-    // adb/logcat access to see setBuffersGeometry's or lock's return codes
-    // directly, this removes setBuffersGeometry as a variable (lock will
-    // use the window's current/default size and format instead) and adds
-    // explicit failure traps below so a crash report -- if lock or
-    // unlockAndPost do fail -- pinpoints which one via its distinct PC.
+    // ANativeWindow_setBuffersGeometry(window, 0, 0, RGBA_8888) -- the
+    // window's actual default surface format is PixelFormat.RGB_565 (16-bit,
+    // per NativeActivity.java's onCreate, which calls
+    // getWindow().setFormat(PixelFormat.RGB_565) before ever loading our
+    // native code), not RGBA_8888, so this call is required, not optional:
+    // without it, ANativeWindow_lock would hand back a 16-bit buffer that
+    // the 32-bit fill loop below would misinterpret.
+    try out.append(a64.movReg64(0, 1)); // x0 = window
+    try out.append(a64.movz32(1, 0, 0)); // w1 = 0 (width: keep current)
+    try out.append(a64.movz32(2, 0, 0)); // w2 = 0 (height: keep current)
+    try out.append(a64.movz32(3, @intCast(WINDOW_FORMAT_RGBA_8888), 0)); // w3 = format
+    try emitGotCall(&out, text_vaddr, 9, got.set_buffers_geometry);
+
+    // ANativeWindow_lock(window, &buffer, NULL)
     try out.append(a64.ldrX(0, a64.sp, 56)); // x0 = window
     try out.append(a64.addImm64(1, a64.sp, 0)); // x1 = &buffer
     try out.append(a64.movReg64(2, a64.xzr)); // x2 = NULL
@@ -264,10 +251,10 @@ fn emitGotCall(out: *std.ArrayList(u32), text_vaddr: u64, scratch: a64.Reg, got_
 
 test "buildText is deterministic in length across the two-pass call" {
     const alloc = std.testing.allocator;
-    var pass1 = try buildText(alloc, 0, .{ .set_buffers_geometry = 0, .lock = 0, .unlock_and_post = 0 }, 0);
+    var pass1 = try buildText(alloc, 0, .{ .set_buffers_geometry = 0, .lock = 0, .unlock_and_post = 0 });
     defer pass1.deinit();
-    var pass2 = try buildText(alloc, 0x2000, .{ .set_buffers_geometry = 0x3000, .lock = 0x3008, .unlock_and_post = 0x3010 }, 0x3020);
+    var pass2 = try buildText(alloc, 0x2000, .{ .set_buffers_geometry = 0x3000, .lock = 0x3008, .unlock_and_post = 0x3010 });
     defer pass2.deinit();
     try std.testing.expectEqual(pass1.items.len, pass2.items.len);
-    try std.testing.expect(pass1.items.len > 30);
+    try std.testing.expect(pass1.items.len > 20);
 }

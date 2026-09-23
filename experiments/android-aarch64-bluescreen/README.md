@@ -283,7 +283,71 @@ Tested by installing the mlx-built `bluescreen.apk` on a real device
   `setBuffersGeometry(0, 0, ...)` itself was the actual problem all along.
   Verified by decoding the rebuilt `.text` bytes directly to confirm both
   `cbnz` checks branch to their correct, distinct trap addresses.
-  Awaiting this round's real-device result.
+- **Fifth report: still black, no crash.** This ruled out `ANativeWindow_lock`/
+  `_unlockAndPost` returning failure (either trap would have fired) and
+  left exactly two explanations: the callback is never invoked, or it runs
+  and every call reports success but nothing reaches the screen.
+  Disambiguated with an unconditional `udf #0` as the *handler's* own
+  first instruction (sixth round): **no crash** — conclusive proof the
+  window-created/resized/redraw-needed callback is never invoked by the
+  framework at all, pointing upstream at how it gets *registered*, not at
+  anything inside the handler.
+- **Sixth/seventh rounds, narrowing further:** moved the trap to
+  `ANativeActivity_onCreate`'s own first instruction — **crashed
+  immediately on launch**, proving `onCreate` itself does run. Every
+  `ANativeActivityCallbacks`/`ANativeActivity` struct offset this code
+  uses was then cross-checked against the real AOSP source
+  (`android.googlesource.com`, `frameworks/native/include/android/
+  native_activity.h`) instead of memory, and matched exactly
+  (`callbacks@0`, `onNativeWindowCreated@56`, `onNativeWindowResized@64`,
+  `onNativeWindowRedrawNeeded@72`) — ruling out a struct-offset mistake.
+  One assumption remained: does `x0` (the `ANativeActivity*` argument)
+  genuinely point where expected? Read `activity->sdkVersion` (an
+  `int32_t` at offset 48) and deliberately dereferenced it as a pointer —
+  a real SDK version is never a valid address, so this reliably `SIGSEGV`s,
+  and Android's crash report's fault address directly reveals the exact
+  value with no adb needed. The resulting tombstone (extracted from a
+  Developer-options bug report's `FS/data/tombstones/` folder, the same
+  phone-only technique used for the earlier view-hierarchy dump) showed
+  **`fault addr 0x0000000000000025` (37 decimal)** — a plausible SDK level
+  for a bleeding-edge Canary build — confirming `x0` and the struct layout
+  were right all along. The same tombstone's backtrace independently
+  confirmed the crash landed at `ANativeActivity_onCreate+4`, called from
+  `android::loadNativeCode_native` → `android.app.NativeActivity.onCreate`,
+  and its kernel string (`6.6.127-android15-8-...-4k`) confirmed a 4 KiB
+  page size, ruling out a 16 KiB-page-alignment theory too.
+- **Root cause, found by reading the actual framework source
+  (`frameworks/base/core/jni/android_app_NativeActivity.cpp`) rather than
+  guessing further:** `onSurfaceCreated_native` there checks
+  `code->callbacks.onNativeWindowCreated != NULL`, reading through
+  `activity->callbacks` as a pointer the *framework itself* already
+  allocates and pre-populates (as part of its own internal `NativeCode`
+  object) *before* ever calling our `onCreate`. The correct contract is to
+  write **into** that already-allocated `ANativeActivityCallbacks` struct
+  through the pointer the framework hands you
+  (`activity->callbacks->onNativeWindowCreated = ...`) — not to allocate a
+  separate struct of your own and replace the pointer
+  (`activity->callbacks = &ourOwnStruct`), which is what this code had
+  been doing since the very first version. Replacing the pointer leaves
+  the framework's own internal storage (the one its guard actually checks)
+  untouched and permanently all-`NULL`, so the callback silently never
+  fires — no crash, no error, no visible effect — exactly matching every
+  round of on-device testing above. Fixed in both `native_activity.zig`
+  and `native_activity.mlx`: `ANativeActivity_onCreate` now reads
+  `activity->callbacks` with a plain `LDR` instead of computing the
+  address of an owned buffer and overwriting the pointer with `STR`; the
+  now-unnecessary 128-byte `g_callbacks` allocation and its ELF `.data`
+  section were removed from `elf_so.zig`/`elf_so.mlx` accordingly. Also
+  restored the `ANativeWindow_setBuffersGeometry` call the diagnostic
+  rounds had removed, now that fetching the real `NativeActivity.java`
+  source (also read during this investigation) confirmed the window's
+  *actual* default surface format is `PixelFormat.RGB_565` (16-bit), not
+  `RGBA_8888` — needed regardless of the callback-registration bug, since
+  the 32-bit fill loop would otherwise misinterpret a 16-bit buffer.
+  Verified by decoding the rebuilt `.text` bytes instruction-by-instruction
+  against the intended sequence, and the full external-tool suite (`aapt`,
+  `readelf`, `unzip -t`, `jarsigner -verify`) once more. Awaiting
+  real-device confirmation.
 
 ## What's genuinely unverified
 
