@@ -453,9 +453,27 @@ Tested by installing the mlx-built `bluescreen.apk` on a real device
   every branch target, GOT offset, and patched address landed exactly
   where designed, with no discrepancies. Full external-tool suite
   (`aapt`, `readelf`, `unzip -t`, `jarsigner -verify`) re-run clean.
-  Awaiting real-device confirmation.
+- **Thirteenth report: confirmed working, including the back gesture** --
+  the blue screen renders and the app survives every lifecycle transition
+  that used to ANR. The one remaining request: the fullscreen theme was
+  hiding the system status bar entirely; real-device feedback was that the
+  normal status bar should stay visible instead. Added a toggle rather
+  than just flipping the default: `axml.zig`/`axml.mlx`'s `buildManifest`
+  now takes a `fullscreen` parameter selecting between
+  `Theme.Black.NoTitleBar.Fullscreen` (0x0103000a, hides the status bar)
+  and `Theme.Black.NoTitleBar` (0x01030009, keeps it) -- the latter's
+  resource ID ground-truthed against the real `aapt` the same way as every
+  other theme ID in this file, not memorized. `main.zig`/`main.mlx` expose
+  it as a single switch (`FULLSCREEN_ENABLED` / `fullscreenEnabled()`),
+  currently set to `false` (status bar visible) per that feedback. No
+  native-code changes needed: `ANativeWindow_lock`'s reported buffer
+  dimensions already reflect whatever area the system actually gives the
+  window, status bar included or not, so the existing fill logic adapts
+  automatically. Verified via `aapt dump xmltree` showing
+  `android:theme(0x01010000)=@0x01030009` and the rest of the external-tool
+  suite once more.
 
-This closes out the black-screen-and-ANR investigation (for now): twelve
+This closes out the black-screen-and-ANR investigation: thirteen
 real-device rounds, six genuine bugs found and fixed (missing
 `onNativeWindowResized`/`onNativeWindowRedrawNeeded` registration;
 missing `LR` preservation across the handler's nested calls; the actual
