@@ -106,6 +106,71 @@ specifically to *validate* the hand-written encoders during this session —
 they are not referenced anywhere in `tool/`'s source and nothing here
 requires them to be present to build or run.
 
+## The self-hosted mlx port (`mlx/`)
+
+`tool/` above is a *Zig* implementation, which only exists because mlx's
+own build (`mlx0`, the bootstrap compiler) is itself written in Zig. But
+Zig is meant to be the bootstrap for `mlx0` only — everything else is
+supposed to run on mlx's own self-hosted compiler (`mlx1`, built from
+`compiler/selfhost/`). `mlx/` is this same experiment ported to genuine mlx
+source, compiled by `./zig-out/bin/mlx1` and run as a native x86_64
+executable with **no Zig involved at runtime at all** (`mlx0`/Zig only
+built the `mlx1` compiler itself, same as always).
+
+```sh
+zig build mlx1                                   # build the self-hosted compiler once
+./zig-out/bin/mlx1 experiments/android-aarch64-bluescreen/mlx/main.mlx -o /tmp/build-apk
+cd /tmp && /tmp/build-apk                        # writes bluescreen.apk in the cwd
+```
+
+Every layer was re-verified against the same tools as the Zig version
+(`aapt`/`aapt2`, `readelf`, `dexdump`, `unzip -t`, `openssl x509`/`asn1parse`/
+`verify -check_ss_sig`, and `jarsigner -verify` reporting `jar verified.` on
+the final signed APK) — porting line-by-line isn't enough of a guarantee on
+its own given how young the self-hosted compiler is, so each module got the
+same external-oracle treatment the Zig version did, not just a recompile.
+
+Two differences from `tool/`, both load-bearing:
+
+- **RSA-1024 (512-bit primes), not RSA-2048.** `mlx/bignum.mlx` is a
+  from-scratch arbitrary-precision integer library (mlx's stdlib has no
+  bignum, and `uN`/`iN` wider than 64 bits doesn't actually work yet — see
+  below), using binary long division rather than Knuth's algorithm for
+  simplicity. Combined with a genuinely severe compiler bug found while
+  building it (below), 2048-bit keys aren't practical here yet; 1024-bit
+  completes reliably in well under a minute. Every operation was verified
+  against Python's arbitrary-precision `int` before being ported.
+- **Every module works around real self-hosted-compiler bugs**, most of
+  them newly found by this port, all written up in
+  [`docs/internals/selfhost-compiler.md`](../../docs/internals/selfhost-compiler.md):
+  a fixed array of slices silently corrupts on write (`axml.mlx`'s
+  `StringPool`, `zip.mlx`'s `EntryList` both use parallel `usize` arrays
+  instead); a module-level `const` of non-integer/boolean type miscompiles
+  into a bogus link error instead of a diagnostic (every such constant here
+  is a zero-argument function instead); taking the address of a struct
+  *field* (`&x.field`) doesn't resolve at all, at any nesting depth
+  (`bignum.mlx`'s signed-value helper and `jar_sign.mlx`'s RSA keypair both
+  thread plain values instead of bundling into a struct); and, most
+  severely, a local struct/array variable declared with `undefined` is
+  `alloca`'d from a single fixed 256 MiB arena that is **never reclaimed**,
+  so any loop that declares one eventually exhausts it and crashes — this
+  is the real reason RSA-2048 isn't practical yet, independent of how fast
+  the arithmetic itself is. One bug (a struct/array field written with
+  `undefined` inside an aggregate literal dereferencing a bogus address)
+  was small and clear enough to actually fix, with a regression test; the
+  rest are documented as known gaps and worked around here, matching this
+  repository's existing practice for the handful of gaps found before this
+  port (see the same doc's `uN`/`iN`-above-64-bits entry, itself the reason
+  `bignum.mlx` uses u64 limbs instead of a wider native integer type).
+
+This satisfies item 3 of "Where this goes next" below in spirit — the
+pipeline is now expressible in ordinary mlx source, not just a bespoke Zig
+tool — but it's still hand-written mlx, not a compiler-generated `aarch64`
+backend; that larger step (an actual `backend/aarch64/` alongside
+`backend/x86_64/`, wired into `mlx build --target aarch64-android`) remains
+future work, arguably better-informed now that this port has exercised the
+self-hosted compiler this hard and found what it doesn't handle yet.
+
 ## What's genuinely unverified
 
 This environment has no Android emulator or device, so the one thing that
