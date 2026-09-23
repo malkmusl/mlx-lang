@@ -392,13 +392,35 @@ Tested by installing the mlx-built `bluescreen.apk` on a real device
   Verified by decoding the rebuilt `.text` bytes: `ANativeActivity_onCreate`
   is now 6 words and stores the handler's address at only two offsets (56
   and 72), with no store to 64.
+- **Eleventh report: the exact same ANR persisted** even with
+  `onNativeWindowResized` gone. `onNativeWindowRedrawNeeded` was the
+  remaining live suspect: the framework also uses it specifically to
+  *synchronize app-transition animations* -- it can call in and wait on
+  exactly the same triggers (back gesture, home, screen timeout) already
+  implicated above, so the same "handler is slow/blocking, animation
+  waits on it" mechanism applies just as well. It had only ever been
+  registered on a guess, made *before* the real callback-registration bug
+  was found, that the very first paint might get silently discarded
+  without it; now that the actual bug is fixed and confirmed working on
+  a real device, that guess no longer has anything to justify it -- this
+  experiment's content is one static, unchanging solid-color frame, and
+  once it's successfully posted the compositor keeps showing that same
+  buffer indefinitely (scaled as needed) with zero further involvement
+  from the app, so there is nothing to ever redraw on demand. Fixed by
+  registering *only* `onNativeWindowCreated` in both `native_activity.zig`
+  and `native_activity.mlx` -- the minimal, most conservative
+  configuration, and arguably what this experiment should have used from
+  the start once the real bug was understood. Verified by decoding the
+  rebuilt `.text` bytes: `ANativeActivity_onCreate` is now 5 words with a
+  single store, to offset 56 only. Awaiting real-device confirmation.
 
-This closes out the black-screen investigation: ten real-device rounds,
-four genuine bugs found and fixed (missing `onNativeWindowResized`/
-`onNativeWindowRedrawNeeded` registration; missing `LR` preservation
-across the handler's nested calls; the actual root cause, replacing
-`activity->callbacks` instead of writing through it; and registering
-`onNativeWindowResized` itself, which caused an ANR once the real
+This closes out the black-screen investigation (for now): eleven
+real-device rounds, five genuine bugs found and fixed (missing
+`onNativeWindowResized`/`onNativeWindowRedrawNeeded` registration;
+missing `LR` preservation across the handler's nested calls; the actual
+root cause, replacing `activity->callbacks` instead of writing through
+it; and registering `onNativeWindowResized` and then
+`onNativeWindowRedrawNeeded`, each of which caused an ANR once the real
 rendering path was finally reachable), one correctness fix found along
 the way (the window's real default format is `RGB_565`, not
 `RGBA_8888`), and a lot of what turned out to be correctly-transcribed
