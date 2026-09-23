@@ -493,6 +493,30 @@ shapes directly (and asserts the fix), and `tests/170_standard_fmt_any_struct_ru
 crashed (`SIGSEGV`) before the fix, via `std.io.printFmt`'s single-argument
 recursive `anytype`-tuple lookup.
 
+**Known gap: `uN`/`iN` wider than 64 bits are not actually multi-word.**
+`operators.xml` normatively allows `uN`/`iN` up to 4096 bits (see
+`spec/00-language/operators.xml`'s `ArbitraryWidth`), but nothing in the
+current pipeline represents or computes on a width above the native 64-bit
+register: `ir/lower.mlx`'s `typeWordCount` — the function that decides how
+many stack-slot components a value needs — returns `1` for every integer
+type, `u128`/`u256`/`u4096` included, only special-casing `slice`,
+`error_union`, and `tuple`. `backend/x86_64/codegen/arithmetic.mlx`
+matches: every arithmetic opcode (`emitSimple`/`emitNumeric` for
+add/sub/mul/bitwise, `emitDivision`, `emitShift`) emits exactly one native
+64-bit instruction, with no width-based branching or carry/borrow chain
+across additional words at all. In effect a `uN`/`iN` value with N > 64 is
+silently truncated to its low 64 bits everywhere at runtime — comptime
+constant folding (`sema/comptime/`) is unaffected and does compute the
+full-width value, which is why a *literal* wide-integer expression can
+look correct while the identical computation over runtime values (e.g.
+behind a function call the optimizer can't fold through) silently loses
+everything above bit 63. This is a real, reproducible gap (confirmed with
+runtime — non-comptime-folded — `u128` left-shift-by-64 and division, both
+wrong), not a small bug: closing it needs multi-word type layout, N/64-word
+LIR lowering with real carry propagation for add/sub, a genuine
+multiplication algorithm, long division, and cross-word shifts, for every
+arithmetic operator. No fix or regression test exists for this yet.
+
 `emitStartStub` hand-encodes the process entry point (`_start`) directly as
 raw opcode bytes (`encoder.emit1(state.*.enc, 0x48) ...`) — reading argc off
 the stack, computing argv, calling `main`, and exiting via the `syscall`
