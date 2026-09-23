@@ -346,25 +346,52 @@ Tested by installing the mlx-built `bluescreen.apk` on a real device
   the 32-bit fill loop would otherwise misinterpret a 16-bit buffer.
   Verified by decoding the rebuilt `.text` bytes instruction-by-instruction
   against the intended sequence, and the full external-tool suite (`aapt`,
-  `readelf`, `unzip -t`, `jarsigner -verify`) once more. Awaiting
-  real-device confirmation.
+  `readelf`, `unzip -t`, `jarsigner -verify`) once more.
+- **Confirmed on-device: a real blue screen.** The fix above worked.
+  Immediately surfaced a second, unrelated issue: performing the Android
+  back gesture crashed the app. The only crash points left anywhere in the
+  code at that point were the `ANativeWindow_lock`/`_unlockAndPost`
+  failure traps kept from the diagnostic rounds above (as a "safety net")
+  — and a lock failure is exactly what a window mid-teardown, which is
+  what the back gesture's dismiss animation causes, legitimately produces.
+  A well-behaved app is supposed to silently skip that frame, not crash.
+  Downgraded both traps back to a plain skip-to-epilogue (their original,
+  pre-diagnostic behavior) in both `native_activity.zig` and
+  `native_activity.mlx`, now that they'd served their purpose of
+  confirming the real callback-registration bug was fixed. Also reverted
+  the manifest's theme from the diagnostic `Theme.Light.NoTitleBar.
+  Fullscreen` back to the originally-intended `Theme.Black.NoTitleBar.
+  Fullscreen` in both `axml.zig`/`axml.mlx`, now that the blue fill is
+  confirmed to work independent of the theme's own background color.
+
+This closes out the black-screen investigation: nine real-device rounds,
+three genuine bugs found and fixed (missing `onNativeWindowResized`/
+`onNativeWindowRedrawNeeded` registration, missing `LR` preservation
+across the handler's nested calls, and — the actual root cause —
+replacing `activity->callbacks` instead of writing through it), one
+correctness fix found along the way (the window's real default format is
+`RGB_565`, not `RGBA_8888`), and a lot of what turned out to be
+correctly-transcribed ABI assumptions (struct offsets, calling
+conventions, ELF/dynamic-linking details) that real-device evidence
+independently confirmed rather than contradicted.
 
 ## What's genuinely unverified
 
-Beyond the real-device result above (which confirms the pipeline up through
-native library load, and now — pending re-test — the paint path), the
-following remain unconfirmed or noteworthy:
+The real-device rounds above confirm the pipeline end to end: JAR
+signature acceptance, binary-manifest parsing, empty-DEX validity, ELF64
+`.so` loading and dynamic-linking, the `ANativeActivity`/
+`ANativeActivityCallbacks` struct layout (cross-checked against real AOSP
+source, not just memory), and the actual `ANativeWindow_lock`/
+`_setBuffersGeometry`/`_unlockAndPost` fill-and-present path all the way
+to visible pixels on a real screen. What's left:
 
-- **The `ANativeActivity`/`ANativeWindow` ABI** (`native_activity.zig`'s
-  doc comment) was transcribed from memory, not compiled against real NDK
-  headers (none are available in this sandbox). Struct field offsets and
-  function signatures are believed correct — the NDK guarantees ABI
-  stability here, and the real-device test above already confirms
-  `ANativeActivity_onCreate`'s signature and the `callbacks` field offset
-  are right, since onCreate runs without crashing — but the window-buffer
-  fill path (`ANativeWindow_Buffer`, `ANativeWindow_lock`/
-  `_setBuffersGeometry`/`_unlockAndPost`) is still only indirectly
-  exercised pending confirmation that the blue fill now shows up.
+- **APK Signature Scheme v1 (JAR signing) only.** No v2/v3 signing block.
+  This is why `minSdkVersion`/`targetSdkVersion` are kept at 21/29 in
+  `axml.zig` — v1-only APKs are accepted at those levels. Devices/policies
+  that require v2+ (Android enforces this starting around API 30 for
+  `targetSdkVersion`) will reject this APK as-is; adding a v2 signing
+  block is a reasonably contained follow-up once v1 is confirmed to
+  actually install and run.
 - **APK Signature Scheme v1 (JAR signing) only.** No v2/v3 signing block.
   This is why `minSdkVersion`/`targetSdkVersion` are kept at 21/29 in
   `axml.zig` — v1-only APKs are accepted at those levels. Devices/policies

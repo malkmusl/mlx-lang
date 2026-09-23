@@ -259,23 +259,17 @@ pub fn buildManifest(allocator: std.mem.Allocator, package: []const u8) ![]u8 {
     // table (see the derivation note above) — kept as a plain constant
     // here since re-deriving individual bit flags adds risk for no benefit.
     //
-    // theme = @android:style/Theme.Light.NoTitleBar.Fullscreen (0x0103000e,
+    // theme = @android:style/Theme.Black.NoTitleBar.Fullscreen (0x0103000a,
     // ground-truthed the same way -- see ANDROID_ATTRS's comment above).
-    // Deliberately the *Light* (not Black) fullscreen/no-title variant right
-    // now: after fixing an earlier missing-theme bug (confirmed via a
-    // real-device view-hierarchy dump showing an ActionBar/Toolbar in the
-    // decor view -- now gone, the window is properly fullscreen), the
-    // screen is still black on-device with no way to get logcat. Black is
-    // also Theme.Black's own default window background, so a still-black
-    // result is ambiguous between "the native blue fill is failing" and
-    // "it was never a fill problem, the theme's own bg was showing all
-    // along". Using the Light variant's non-black default background turns
-    // the next on-device screenshot into a real diagnostic: still non-blue
-    // (now some light color) narrows it back to the native fill/present
-    // path; blue confirms the opposite. Swap back to Black once the fill
-    // path is confirmed working.
+    // Briefly swapped to the *Light* variant (0x0103000e) during
+    // diagnosis, to tell apart "the native blue fill is failing" from "the
+    // theme's own black background is what's showing" (both looked
+    // identical under Black); a real-device confirmation that the blue
+    // fill now works on its own (see the README's real-device test
+    // results) settled that, so this reverts to the originally-intended
+    // Black background for the final experiment.
     try writeStartElement(&body, &pool, .{ .name = "activity", .attrs = &[_]Attr{
-        .{ .ns = true, .name = "theme", .value = .{ .reference = 0x0103000e } },
+        .{ .ns = true, .name = "theme", .value = .{ .reference = 0x0103000a } },
         .{ .ns = true, .name = "label", .value = .{ .str = "Mlx Blue Screen" } },
         .{ .ns = true, .name = "name", .value = .{ .str = "android.app.NativeActivity" } },
         .{ .ns = true, .name = "configChanges", .value = .{ .int_hex = 0x4a0 } },

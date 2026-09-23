@@ -154,12 +154,17 @@ pub fn buildText(
     // The real reason this handler was never even reached, across many
     // rounds of real-device diagnosis, turned out to be entirely upstream
     // of this function -- see ANativeActivity_onCreate's comment above.
-    // The lock/unlockAndPost failure traps below predate that finding
-    // (added as a diagnostic while this handler's own invocation was still
-    // in question) but are kept as a real, cheap safety net: on this ABI
-    // there's no other way to surface a lock/present failure without
-    // adb/logcat, and a silent failure here is exactly as invisible as the
-    // original bug was.
+    // The lock/unlockAndPost failure traps that used to be here predate
+    // that finding (added as a diagnostic while this handler's own
+    // invocation was still in question) -- and confirmed real: with the
+    // actual bug fixed and a real blue screen finally rendering, the very
+    // next real-device test (the Android back gesture) crashed.
+    // `ANativeWindow_lock` can and does legitimately fail while a window
+    // is mid-teardown (exactly what the back gesture's dismiss animation
+    // triggers), and that's supposed to be a normal, silent "skip this
+    // frame" case for any well-behaved app, not a crash -- so the traps
+    // were downgraded back to a plain skip once they'd done their job of
+    // confirming the real bug was fixed.
     try out.append(a64.subImm64(a64.sp, a64.sp, 64));
     try out.append(a64.strX(a64.lr, a64.sp, 48)); // save LR
     try out.append(a64.strX(1, a64.sp, 56)); // save window
@@ -183,7 +188,7 @@ pub fn buildText(
     try out.append(a64.movReg64(2, a64.xzr)); // x2 = NULL
     try emitGotCall(&out, text_vaddr, 9, got.lock);
 
-    // if (result != 0) goto trap_lock_failed;  (forward branch, patched below)
+    // if (result != 0) goto epilogue;  (forward branch, patched below)
     const cbnz_lock_failed_idx = out.items.len;
     try out.append(0);
 
@@ -207,26 +212,17 @@ pub fn buildText(
     const skip_fill = out.items.len;
     out.items[cbz_zero_pixels_idx] = a64.cbzX(11, @as(i32, @intCast(skip_fill)) * 4 - @as(i32, @intCast(cbz_zero_pixels_idx)) * 4);
 
-    // ANativeWindow_unlockAndPost(window)
+    // ANativeWindow_unlockAndPost(window) -- its result isn't checked:
+    // it's the last thing this handler does before the shared epilogue
+    // either way, so there's nothing left to skip on failure.
     try out.append(a64.ldrX(0, a64.sp, 56)); // x0 = window
     try emitGotCall(&out, text_vaddr, 9, got.unlock_and_post);
 
-    // if (result != 0) goto trap_post_failed;  (forward branch, patched below)
-    const cbnz_post_failed_idx = out.items.len;
-    try out.append(0);
-
     const epilogue = out.items.len;
-    try out.append(a64.ldrX(a64.lr, a64.sp, 48)); // restore LR (only the success path reaches here)
+    out.items[cbnz_lock_failed_idx] = a64.cbnzW(0, @as(i32, @intCast(epilogue)) * 4 - @as(i32, @intCast(cbnz_lock_failed_idx)) * 4);
+    try out.append(a64.ldrX(a64.lr, a64.sp, 48)); // restore LR (both the lock-failed and normal paths land here)
     try out.append(a64.addImm64(a64.sp, a64.sp, 64));
     try out.append(a64.ret(a64.lr));
-
-    const trap_lock_failed = out.items.len;
-    try out.append(a64.udf(0));
-    out.items[cbnz_lock_failed_idx] = a64.cbnzW(0, @as(i32, @intCast(trap_lock_failed)) * 4 - @as(i32, @intCast(cbnz_lock_failed_idx)) * 4);
-
-    const trap_post_failed = out.items.len;
-    try out.append(a64.udf(0));
-    out.items[cbnz_post_failed_idx] = a64.cbnzW(0, @as(i32, @intCast(trap_post_failed)) * 4 - @as(i32, @intCast(cbnz_post_failed_idx)) * 4);
 
     return out;
 }
