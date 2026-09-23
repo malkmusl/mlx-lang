@@ -426,6 +426,93 @@ canonicalization pipeline on a hand-built six-instruction LIR sequence: an
 instructions are marked `dead` and excluded from the `instructionsAfter`
 count.
 
+**Known gap: a module-level `const` of non-integer/non-boolean type
+miscompiles into a bogus "unresolved backend symbol" instead of a proper
+diagnostic.** `sema/comptime/value.mlx`'s `Kind` enum only has
+`integer`/`boolean`/`type_value`/`null_value` variants — there is no
+representation for a comptime string, slice, or array. `ir/lower.mlx`'s
+`lowerSymbolValue` (the function that decides how to lower a reference to a
+resolved symbol) handles the `integer`/`boolean` comptime tags and function
+symbols (`FLAG_FUNCTION`) explicitly, then falls through to `return
+lir.NONE` for anything else — which is exactly what happens for, say, a
+top-level `const ANDROID_NS_URI: []const u8 = "..."` or a top-level `const
+IDS: [9]u32 = [9]u32{...}`. The caller (the general identifier-lowering
+path around line 2489) only uses that `lowerSymbolValue` result if it isn't
+`NONE`; when it is, the code falls all the way through to a "might be a
+forward-reference function; add as symbol" fallback that unconditionally
+treats the identifier as an as-yet-undefined function, emitting a
+`lir.addModuleSymbol` reference (named `.m<module>.<NAME>`) and a
+`func_sym` LIR instruction for it. No function body with that name is ever
+lowered to satisfy the reference, so it reaches the backend as a fixup with
+no matching label, and `encoder.applyFixups` fails at the "resolve backend
+symbols" pipeline step with `MLX-E3004: unresolved backend symbol` — a
+diagnostic that (per `driver/pipeline.mlx:206`) carries no source location,
+so the actual cause (a harmless-looking top-level string or array constant
+declared possibly hundreds of lines from where it's used) is easy to miss.
+`driver/reporter.mlx:171`'s `Reporter.unresolvedSymbol` does print the
+bogus symbol name (e.g. `.m0.SHORT_STR`) to stderr, but only when `mlx1` is
+invoked with `--trace`/`--verbose` — without that flag the error is
+reported with zero identifying information at all. Reproduced with a
+minimal two-line repro (`const S: []const u8 = "hi"` at module scope,
+referenced as `S.length` inside `main`) that fails the same way regardless
+of string length or of whether the const is referenced once or multiple
+times; a *local* (function-scope) `const` of the same type, or the string
+literal used directly, both lower correctly, which is what makes this a
+gap in top-level/module-scope constant handling specifically rather than in
+slice/string lowering in general. Found and worked around (not fixed) while
+porting `experiments/android-aarch64-bluescreen/tool/axml.zig` to
+`experiments/android-aarch64-bluescreen/mlx/axml.mlx`: every top-level
+`const` of a type other than a plain integer/boolean was rewritten as a
+zero-argument function returning the value (`androidNsUri()`) or an
+indexing function (`androidAttrId(i)`) instead — see the comments at
+`experiments/android-aarch64-bluescreen/mlx/axml.mlx`'s `androidNsUri` and
+`androidAttrId`. No regression test or fix exists for this in the compiler
+itself yet; a real fix would need `sema/comptime/value.mlx`'s `Kind` to gain
+a representation for these types (or, short of that, at minimum
+`lowerSymbolValue` should report a proper location-carrying diagnostic
+instead of silently falling through to the forward-function-reference path
+when a resolved, non-function symbol can't be lowered).
+
+**Fixed: `undefined` initializing a memory-typed field inside an aggregate
+literal dereferenced address 0 and crashed.** `lowerNode`'s
+`undefined_literal` case (line ~1192) lowers `undefined` to a single scalar
+`lir.constI(lir.NONE, 0)` for every type uniformly — a reasonable
+placeholder for a scalar field, but wrong for a `struct`/`union`/`array`
+-typed one. `lowerAggregateLiteral`'s per-field loop always lowered the
+initializer and called `storeAggregateValue`, which for a memory type
+(`aggregate_copy.isMemoryType`) calls `aggregate_copy.emit(ir, typeStore,
+address, value, type_id)` — and `aggregate_copy.emit` treats its `value`
+argument as a *source address* to `load` from at each word offset
+(`copyWidth`/`addressAt` in `ir/lowering/aggregate_copy.mlx`), not as an
+already-materialized value. So `Type.{ .arrayField = undefined, ... }`
+computed a GEP off address `0` and unconditionally dereferenced it — a
+near-null-pointer read — crashing with `SIGSEGV` on every such literal,
+independent of the struct's total size (this is a different, more precise
+root cause than an earlier size-threshold guess made while porting the
+Android experiment — see `experiments/android-aarch64-bluescreen/mlx/`'s
+`StringPool`, whose out-parameter-constructor workaround predates this fix
+and is left in place as a harmless, still-valid pattern rather than
+unwound). Confirmed independent of return-by-value: a bare local `const b:
+T = T.{ .words = undefined, .count = 7 }` crashed identically to returning
+the same literal from a function, and a *scalar* field given `undefined` in
+the same literal was unaffected either way. Notably, a whole-variable `var
+x: T = undefined` was already correct — `lowerBindingInitializer` (line
+~3542) special-cases exactly this situation by `alloca`-ing fresh,
+intentionally-uninitialized storage instead of attempting a copy — so the
+bug was specifically in the per-field path inside an aggregate literal,
+which had no equivalent special case. Fixed by adding one: in
+`lowerAggregateLiteral`, a field is now skipped entirely (no address
+computed, no store emitted, matching `lowerBindingInitializer`'s "leave the
+allocated memory as-is" semantics) exactly when its initializer AST node is
+`ast.Tag.undefined_literal` *and* its type is a memory type; every other
+field — including a scalar field set to `undefined`, and any field given a
+real value — is unaffected and still lowers exactly as before.
+`tests/236_undefined_memory_field_aggregate_literal_runtime.mlx` is the
+regression test: it crashes the pre-fix compiler and exits `0` afterward,
+covering both an array field and a nested-struct field, both as a local and
+as a function return value, with a sibling field that gets a real value in
+the same literal to prove the fix doesn't over-skip.
+
 ## x86_64 backend (`backend/x86_64/codegen.mlx`, `codegen/emitter.mlx`)
 
 `backend/x86_64/codegen.mlx`'s `Codegen` is a thin public facade (matching

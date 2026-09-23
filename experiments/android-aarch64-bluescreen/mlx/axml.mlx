@@ -1,0 +1,401 @@
+// Hand-written binary AndroidManifest.xml (AXML) encoder. Straight port of
+// experiments/android-aarch64-bluescreen/tool/axml.zig -- see that file for
+// the full chunk-format derivation and the note on how the android:*
+// attribute resource IDs were ground-truthed against a real aapt-compiled
+// reference manifest (not reproduced here; unchanged by this port). This
+// port also round-tripped through `aapt dump xmltree`/`dump badging` and
+// `aapt2 dump xmltree` the same way the Zig version did -- see the
+// experiment README.
+//
+// Where the Zig version used a StringPool backed by a hash map and an
+// Attr tagged union, this port uses a fixed-size linear-scan string table
+// (at most ~30 distinct strings here -- a hash map buys nothing) and
+// separate per-value-kind attribute writers instead of a tagged union, to
+// avoid depending on mlx language/stdlib features this experiment doesn't
+// otherwise need.
+
+const std = @import("std")
+
+pub const ArrayList = std.array_list.ArrayList
+pub const Allocator = std.allocator.Allocator
+
+const RES_STRING_POOL_TYPE: u32 = 0x0001
+const RES_XML_TYPE: u32 = 0x0003
+const RES_XML_START_NAMESPACE_TYPE: u32 = 0x0100
+const RES_XML_END_NAMESPACE_TYPE: u32 = 0x0101
+const RES_XML_START_ELEMENT_TYPE: u32 = 0x0102
+const RES_XML_END_ELEMENT_TYPE: u32 = 0x0103
+const RES_XML_RESOURCE_MAP_TYPE: u32 = 0x0180
+
+const TYPE_STRING: u32 = 0x03
+const TYPE_INT_DEC: u32 = 0x10
+const TYPE_INT_HEX: u32 = 0x11
+const TYPE_INT_BOOLEAN: u32 = 0x12
+
+const NO_VALUE_U32: u32 = 4294967295 // -1 as a u32 bit pattern
+
+// A module-level `const` of a non-integer/non-boolean type (here
+// `[]const u8`) has no comptime representation in this compiler (see
+// sema/comptime/value.mlx's `Kind` enum -- only integer/boolean/type/null
+// are handled). Referencing such a const from a function silently miscompiles:
+// the lowering fallback in ir/lower.mlx (the "might be a forward-reference
+// function" path, hit because `lowerSymbolValue` returns NONE for a symbol
+// that is neither comptime-integer/boolean nor a function) treats the name
+// as an as-yet-undefined function and emits a `.m<N>.<NAME>` symbol
+// reference that no function definition ever satisfies, so the backend
+// fails at link time with "unresolved backend symbol" -- not documented yet
+// as a known gap, unlike the array-of-slices and large-struct-return issues
+// found earlier in this port, since this one has an easy, local workaround:
+// wrap the literal in a function instead of a top-level const. A plain
+// string literal used directly at a call site, or returned from a function,
+// compiles fine either way.
+fn androidNsUri() -> []const u8 { return "http://schemas.android.com/apk/res/android" }
+
+pub const MAX_STRINGS: usize = 64
+
+// A fixed-size array of *slices* (`[N][]const u8`) turned out to be
+// miscompiled by the current self-hosted backend: writing a slice into
+// such an array and reading it back silently corrupts it (confirmed with
+// a minimal repro -- not documented as a known gap yet, unlike the
+// component-0 and >64-bit-arithmetic issues, since this port routes
+// around it rather than fixing it). Working around it here with parallel
+// arrays of raw `usize` (pointer, length) pairs instead -- plain
+// single-word array elements, which do work correctly.
+pub const StringPool = struct {
+    ptrs: [64]usize
+    lens: [64]usize
+    count: usize
+}
+
+pub fn sliceAt(p: *StringPool, i: usize) -> []const u8 {
+    unsafe {
+        return @ptrFromInt([*]const u8, p.*.ptrs[i])[0..p.*.lens[i]]
+    }
+}
+
+// Returning a struct this large *by value* was independently found to
+// segfault at runtime (confirmed with a minimal repro: a bare `[128]usize`
+// struct, no slices involved, crashes the same way) -- a second, distinct
+// backend gap from the array-of-slices one above. Initializing through an
+// out-parameter instead, like every other "big result" constructor in this
+// port, avoids it entirely.
+pub fn initPool(p: *StringPool) -> void {
+    p.*.count = 0
+}
+
+pub fn strEq(a: []const u8, b: []const u8) -> bool {
+    if a.length != b.length { return false }
+    var i: usize = 0
+    while i < a.length {
+        if a[i] != b[i] { return false }
+        i += 1
+    }
+    return true
+}
+
+pub fn intern(p: *StringPool, s: []const u8) -> u32 {
+    var i: usize = 0
+    while i < p.*.count {
+        if strEq(sliceAt(p, i), s) { return @intCast(u32, i) }
+        i += 1
+    }
+    const idx: usize = p.*.count
+    unsafe {
+        p.*.ptrs[idx] = @intFromPtr(@ptrCast([*]const u8, s))
+    }
+    p.*.lens[idx] = s.length
+    p.*.count += 1
+    return @intCast(u32, idx)
+}
+
+// ── ordered android:* attribute -> resource ID table ──────────────────────
+// Order matters: it must match first-use order below, because the resource
+// map only covers pool strings 0..N-1 and pool index order is insertion
+// order (see intern's reservation loop in buildManifest).
+const ANDROID_ATTR_COUNT: usize = 9
+
+// A top-level `const` array has the same "no comptime representation"
+// problem as the string constant documented above `androidNsUri` --
+// confirmed with the same symptom (`.m<N>.ANDROID_ATTR_IDS` reported as an
+// unresolved backend symbol). Worked around the same way: a function
+// (indexed rather than returning the whole array, since arrays aren't
+// returned by value elsewhere in this port either -- see the StringPool
+// out-parameter note above) instead of a top-level const.
+fn androidAttrId(i: usize) -> u32 {
+    const ids: [9]u32 = [9]u32{
+        0x0101021b, 0x0101021c, 0x0101020c, 0x01010270,
+        0x01010001, 0x0101000c, 0x01010003, 0x0101001f, 0x01010024,
+    }
+    return ids[i]
+}
+
+// ── little-endian byte appenders ───────────────────────────────────────────
+pub fn appendU8(list: *ArrayList, v: u32) -> void {
+    var ok: bool = std.array_list.ArrayList.appendAt(list, @intCast(u8, v & 255))
+}
+pub fn appendU16(list: *ArrayList, v: u32) -> void {
+    appendU8(list, v)
+    appendU8(list, v >> 8)
+}
+pub fn appendU32(list: *ArrayList, v: u32) -> void {
+    appendU8(list, v)
+    appendU8(list, v >> 8)
+    appendU8(list, v >> 16)
+    appendU8(list, v >> 24)
+}
+// Appends a signed 32-bit AXML reference: every negative value used in this
+// encoder is exactly NO_VALUE (-1), so that's the only case handled as
+// two's complement; everything else is a plain non-negative index.
+pub fn appendRef(list: *ArrayList, isNone: bool, v: u32) -> void {
+    if isNone {
+        appendU32(list, NO_VALUE_U32)
+    } else {
+        appendU32(list, v)
+    }
+}
+
+pub fn appendSlice(list: *ArrayList, src: []const u8) -> void {
+    var i: usize = 0
+    while i < src.length {
+        var ok: bool = std.array_list.ArrayList.appendAt(list, src[i])
+        i += 1
+    }
+}
+
+pub fn nodeHeader(body: *ArrayList, chunkType: u32, size: u32, line: u32) -> void {
+    appendU16(body, chunkType)
+    appendU16(body, 16) // headerSize
+    appendU32(body, size)
+    appendU32(body, line)
+    appendU32(body, NO_VALUE_U32) // comment: none
+}
+
+pub fn writeStartElementHeader(body: *ArrayList, pool: *StringPool, name: []const u8, attrCount: u32, line: u32) -> void {
+    const nameIdx: u32 = intern(pool, name)
+    const size: u32 = 16 + 20 + attrCount * 20
+    nodeHeader(body, RES_XML_START_ELEMENT_TYPE, size, line)
+    appendRef(body, true, 0) // ns
+    appendRef(body, false, nameIdx)
+    appendU16(body, 20) // attributeStart
+    appendU16(body, 20) // attributeSize
+    appendU16(body, attrCount)
+    appendU16(body, 0) // idIndex
+    appendU16(body, 0) // classIndex
+    appendU16(body, 0) // styleIndex
+}
+
+pub fn writeEndElement(body: *ArrayList, pool: *StringPool, name: []const u8, line: u32) -> void {
+    const nameIdx: u32 = intern(pool, name)
+    nodeHeader(body, RES_XML_END_ELEMENT_TYPE, 24, line)
+    appendRef(body, true, 0) // ns
+    appendRef(body, false, nameIdx)
+}
+
+pub fn writeNamespace(body: *ArrayList, pool: *StringPool, isStart: bool, line: u32) -> void {
+    const uriIdx: u32 = intern(pool, androidNsUri())
+    const prefixIdx: u32 = intern(pool, "android")
+    var kind: u32 = RES_XML_END_NAMESPACE_TYPE
+    if isStart { kind = RES_XML_START_NAMESPACE_TYPE }
+    nodeHeader(body, kind, 24, line)
+    appendRef(body, false, prefixIdx)
+    appendRef(body, false, uriIdx)
+}
+
+pub fn writeStrAttr(body: *ArrayList, pool: *StringPool, isNs: bool, name: []const u8, value: []const u8) -> void {
+    appendRef(body, !isNs, intern(pool, androidNsUri()))
+    appendRef(body, false, intern(pool, name))
+    const valIdx: u32 = intern(pool, value)
+    appendRef(body, false, valIdx) // rawValue
+    appendU16(body, 8) // Res_value.size
+    appendU8(body, 0) // res0
+    appendU8(body, TYPE_STRING)
+    appendU32(body, valIdx) // data
+}
+
+pub fn writeIntDecAttr(body: *ArrayList, pool: *StringPool, isNs: bool, name: []const u8, value: u32) -> void {
+    appendRef(body, !isNs, intern(pool, androidNsUri()))
+    appendRef(body, false, intern(pool, name))
+    appendRef(body, true, 0) // rawValue: none
+    appendU16(body, 8)
+    appendU8(body, 0)
+    appendU8(body, TYPE_INT_DEC)
+    appendU32(body, value)
+}
+
+pub fn writeIntHexAttr(body: *ArrayList, pool: *StringPool, isNs: bool, name: []const u8, value: u32) -> void {
+    appendRef(body, !isNs, intern(pool, androidNsUri()))
+    appendRef(body, false, intern(pool, name))
+    appendRef(body, true, 0)
+    appendU16(body, 8)
+    appendU8(body, 0)
+    appendU8(body, TYPE_INT_HEX)
+    appendU32(body, value)
+}
+
+pub fn writeBoolAttr(body: *ArrayList, pool: *StringPool, isNs: bool, name: []const u8, value: bool) -> void {
+    appendRef(body, !isNs, intern(pool, androidNsUri()))
+    appendRef(body, false, intern(pool, name))
+    appendRef(body, true, 0)
+    appendU16(body, 8)
+    appendU8(body, 0)
+    appendU8(body, TYPE_INT_BOOLEAN)
+    var data: u32 = 0
+    if value { data = NO_VALUE_U32 }
+    appendU32(body, data)
+}
+
+// Build the complete `dev.mlxlang.experiments.bluescreen` blue-screen
+// manifest: a single `android.app.NativeActivity` activity backed by
+// `main.so` (`android.app.lib_name` = "main"), MAIN/LAUNCHER intent filter.
+pub fn buildManifest(allocator: Allocator, package: []const u8) -> ArrayList {
+    var pool: StringPool = undefined
+    initPool(&pool)
+
+    // Reserve pool indices 0..8 for the resource-mapped android: attrs, in
+    // first-use order, before anything else is interned -- matching
+    // ANDROID_ATTR_IDS below 1:1. Written out individually rather than
+    // looping over an ANDROID_ATTR_NAMES array: a fixed-size array of
+    // *slices* (each string here) was independently found to be
+    // miscompiled by the current self-hosted backend the same way
+    // StringPool's own array-of-slices was (see its comment above); a
+    // plain array of u32 IDs (below) doesn't hit it.
+    var t0: u32 = intern(&pool, "versionCode")
+    var t1: u32 = intern(&pool, "versionName")
+    var t2: u32 = intern(&pool, "minSdkVersion")
+    var t3: u32 = intern(&pool, "targetSdkVersion")
+    var t4: u32 = intern(&pool, "label")
+    var t5: u32 = intern(&pool, "hasCode")
+    var t6: u32 = intern(&pool, "name")
+    var t7: u32 = intern(&pool, "configChanges")
+    var t8: u32 = intern(&pool, "value")
+
+    var body: ArrayList = std.array_list.ArrayList.init(allocator, 512)
+    var line: u32 = 2
+
+    writeNamespace(&body, &pool, true, line)
+    line += 1
+
+    writeStartElementHeader(&body, &pool, "manifest", 3, line)
+    writeIntDecAttr(&body, &pool, true, "versionCode", 1)
+    writeStrAttr(&body, &pool, true, "versionName", "0.1-experiment")
+    writeStrAttr(&body, &pool, false, "package", package)
+    line += 1
+
+    writeStartElementHeader(&body, &pool, "uses-sdk", 2, line)
+    writeIntDecAttr(&body, &pool, true, "minSdkVersion", 21)
+    writeIntDecAttr(&body, &pool, true, "targetSdkVersion", 29)
+    line += 1
+    writeEndElement(&body, &pool, "uses-sdk", line)
+    line += 1
+
+    writeStartElementHeader(&body, &pool, "application", 2, line)
+    writeStrAttr(&body, &pool, true, "label", "Mlx Blue Screen")
+    writeBoolAttr(&body, &pool, true, "hasCode", false)
+    line += 1
+
+    // configChanges = orientation|keyboardHidden|screenSize, resolved to
+    // 0x4a0 by the real aapt (see axml.zig's derivation note).
+    writeStartElementHeader(&body, &pool, "activity", 3, line)
+    writeStrAttr(&body, &pool, true, "label", "Mlx Blue Screen")
+    writeStrAttr(&body, &pool, true, "name", "android.app.NativeActivity")
+    writeIntHexAttr(&body, &pool, true, "configChanges", 0x4a0)
+    line += 1
+
+    writeStartElementHeader(&body, &pool, "meta-data", 2, line)
+    writeStrAttr(&body, &pool, true, "name", "android.app.lib_name")
+    writeStrAttr(&body, &pool, true, "value", "main")
+    line += 1
+    writeEndElement(&body, &pool, "meta-data", line)
+    line += 1
+
+    writeStartElementHeader(&body, &pool, "intent-filter", 0, line)
+    line += 1
+    writeStartElementHeader(&body, &pool, "action", 1, line)
+    writeStrAttr(&body, &pool, true, "name", "android.intent.action.MAIN")
+    line += 1
+    writeEndElement(&body, &pool, "action", line)
+    line += 1
+    writeStartElementHeader(&body, &pool, "category", 1, line)
+    writeStrAttr(&body, &pool, true, "name", "android.intent.category.LAUNCHER")
+    line += 1
+    writeEndElement(&body, &pool, "category", line)
+    line += 1
+    writeEndElement(&body, &pool, "intent-filter", line)
+    line += 1
+
+    writeEndElement(&body, &pool, "activity", line)
+    line += 1
+    writeEndElement(&body, &pool, "application", line)
+    line += 1
+    writeEndElement(&body, &pool, "manifest", line)
+    writeNamespace(&body, &pool, false, line)
+
+    // ── serialize the string pool (UTF-16, matching the reference file) ──
+    var strData: ArrayList = std.array_list.ArrayList.init(allocator, 512)
+    var strOffsets: [64]u32 = undefined
+    var si: usize = 0
+    while si < pool.count {
+        strOffsets[si] = @intCast(u32, strData.length)
+        const s: []const u8 = sliceAt(&pool, si)
+        appendU16(&strData, @intCast(u32, s.length))
+        var ci: usize = 0
+        while ci < s.length {
+            appendU16(&strData, @intCast(u32, s[ci])) // ASCII-only strings in this manifest
+            ci += 1
+        }
+        appendU16(&strData, 0)
+        si += 1
+    }
+    const offsetsBytes: u32 = @intCast(u32, pool.count) * 4
+    const stringsStart: u32 = 28 + offsetsBytes
+    var poolSize: u32 = stringsStart + @intCast(u32, strData.length)
+    const poolPad: u32 = (4 - (poolSize % 4)) % 4
+    poolSize += poolPad
+
+    var out: ArrayList = std.array_list.ArrayList.init(allocator, 2048)
+
+    // XML root chunk header -- size patched in once everything is known.
+    appendU16(&out, RES_XML_TYPE)
+    appendU16(&out, 8)
+    appendU32(&out, 0) // placeholder
+
+    appendU16(&out, RES_STRING_POOL_TYPE)
+    appendU16(&out, 28)
+    appendU32(&out, poolSize)
+    appendU32(&out, @intCast(u32, pool.count)) // stringCount
+    appendU32(&out, 0) // styleCount
+    appendU32(&out, 0) // flags: UTF-16
+    appendU32(&out, stringsStart)
+    appendU32(&out, 0) // stylesStart
+    var oi: usize = 0
+    while oi < pool.count {
+        appendU32(&out, strOffsets[oi])
+        oi += 1
+    }
+    appendSlice(&out, strData.items[0..strData.length])
+    var pad: u32 = 0
+    while pad < poolPad {
+        appendU8(&out, 0)
+        pad += 1
+    }
+
+    const resmapSize: u32 = 8 + @intCast(u32, ANDROID_ATTR_COUNT) * 4
+    appendU16(&out, RES_XML_RESOURCE_MAP_TYPE)
+    appendU16(&out, 8)
+    appendU32(&out, resmapSize)
+    var ri: usize = 0
+    while ri < ANDROID_ATTR_COUNT {
+        appendU32(&out, androidAttrId(ri))
+        ri += 1
+    }
+
+    appendSlice(&out, body.items[0..body.length])
+
+    const total: u32 = @intCast(u32, out.length)
+    std.array_list.ArrayList.set(out, 4, @intCast(u8, total & 255))
+    std.array_list.ArrayList.set(out, 5, @intCast(u8, (total >> 8) & 255))
+    std.array_list.ArrayList.set(out, 6, @intCast(u8, (total >> 16) & 255))
+    std.array_list.ArrayList.set(out, 7, @intCast(u8, (total >> 24) & 255))
+
+    return out
+}

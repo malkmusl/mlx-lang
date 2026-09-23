@@ -1,0 +1,153 @@
+// Generates the machine code for a minimal Android `ANativeActivity` shared
+// library that fills its window with solid blue. Straight port of
+// experiments/android-aarch64-bluescreen/tool/native_activity.zig; the ABI
+// notes (struct layouts, why they're hand-transcribed instead of taken from
+// real NDK headers, and the biggest-risk callout) live there and in the
+// experiment README -- unchanged by this port, so not repeated here.
+//
+// Pixel format: WINDOW_FORMAT_RGBA_8888 stores bytes R,G,B,A per pixel;
+// read as a little-endian u32 that is 0xAABBGGRR. Opaque blue is 0xFFFF0000.
+
+const a64 = @import("./aarch64.mlx")
+
+pub const CALLBACKS_STRUCT_SIZE: u64 = 128
+pub const CB_OFFSET_ON_NATIVE_WINDOW_CREATED: u32 = 56
+pub const ACTIVITY_OFFSET_CALLBACKS: u32 = 0
+
+pub const BLUE_RGBA8888_LE: u32 = 0xFFFF0000
+pub const WINDOW_FORMAT_RGBA_8888: u32 = 1
+
+// Fixed-size instruction buffer: the function body below is a fixed,
+// hand-written sequence (never more than a few dozen words), so a plain
+// array avoids needing a growable-vector abstraction for this module.
+pub const MAX_WORDS: usize = 48
+
+pub const Builder = struct {
+    words: [48]u32
+    count: usize
+}
+
+pub const GotLayout = struct {
+    setBuffersGeometry: u64
+    lock: u64
+    unlockAndPost: u64
+}
+
+fn newBuilder() -> Builder {
+    return Builder.{
+        .words = [48]u32{
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        },
+        .count = 0,
+    }
+}
+
+fn emit(b: *Builder, word: u32) -> void {
+    b.*.words[b.*.count] = word
+    b.*.count += 1
+}
+
+// ADRP + ADD idiom: put the absolute address of `target` (anywhere in our
+// own image) into `reg`, PC-relative, no relocation needed.
+fn emitAdrpAdd(b: *Builder, text_vaddr: u64, reg: u32, target: u64) -> void {
+    const pc: u64 = text_vaddr + @intCast(u64, b.*.count) * 4
+    emit(b, a64.adrp(reg, pc, target))
+    emit(b, a64.addImm64(reg, reg, @intCast(u32, target & 4095)))
+}
+
+// ADRP + LDR + BLR idiom: call an imported function through its GOT slot
+// (filled in by the dynamic linker's R_AARCH64_GLOB_DAT relocations before
+// our code ever runs -- see elf_so.mlx).
+fn emitGotCall(b: *Builder, text_vaddr: u64, scratch: u32, gotSlotVaddr: u64) -> void {
+    const pc: u64 = text_vaddr + @intCast(u64, b.*.count) * 4
+    emit(b, a64.adrp(scratch, pc, gotSlotVaddr))
+    emit(b, a64.ldrX(scratch, scratch, @intCast(u32, gotSlotVaddr & 4095)))
+    emit(b, a64.blr(scratch))
+}
+
+// Build the full .text machine code: `ANativeActivity_onCreate` immediately
+// followed by `onNativeWindowCreated`. Call once with all-zero addresses to
+// discover the size (`result.count * 4`), then call again with the real,
+// final virtual addresses once the surrounding ELF layout is known -- the
+// instruction sequence is identical both times, only the embedded address
+// immediates differ, so the word count is stable across both calls.
+pub fn buildText(textVaddr: u64, got: GotLayout, dataCallbacksVaddr: u64) -> Builder {
+    var b: Builder = newBuilder()
+
+    // -- ANativeActivity_onCreate(x0=activity, x1=savedState, x2=savedStateSize) --
+    emitAdrpAdd(&b, textVaddr, 9, dataCallbacksVaddr)
+    // (function 2's address is only known once we've counted this
+    // function's own length below -- patched in after the fact)
+    const adrpWindowCreatedIdx: usize = b.count
+    emit(&b, 0) // placeholder ADRP x10, onNativeWindowCreated
+    emit(&b, 0) // placeholder ADD  x10, x10, #lo12
+    emit(&b, a64.strX(10, 9, CB_OFFSET_ON_NATIVE_WINDOW_CREATED)) // g_callbacks.onNativeWindowCreated = x10
+    emit(&b, a64.strX(9, 0, ACTIVITY_OFFSET_CALLBACKS)) // activity->callbacks = &g_callbacks
+    emit(&b, a64.ret(a64.LR))
+
+    const onWindowCreatedStart: usize = b.count
+    const onWindowCreatedVaddr: u64 = textVaddr + @intCast(u64, onWindowCreatedStart) * 4
+
+    // Patch the two placeholders now that this function's address is known.
+    const patchPc: u64 = textVaddr + @intCast(u64, adrpWindowCreatedIdx) * 4
+    b.words[adrpWindowCreatedIdx] = a64.adrp(10, patchPc, onWindowCreatedVaddr)
+    b.words[adrpWindowCreatedIdx + 1] = a64.addImm64(10, 10, @intCast(u32, onWindowCreatedVaddr & 4095))
+
+    // -- onNativeWindowCreated(x0=activity, x1=window) --
+    // Stack frame: [0..47] = ANativeWindow_Buffer, [56..63] = saved window ptr.
+    emit(&b, a64.subImm64(a64.SP, a64.SP, 64))
+    emit(&b, a64.strX(1, a64.SP, 56)) // save window
+
+    // ANativeWindow_setBuffersGeometry(window, 0, 0, RGBA_8888)
+    emit(&b, a64.movReg64(0, 1)) // x0 = window
+    emit(&b, a64.movz32(1, 0, 0)) // w1 = 0 (width: keep current)
+    emit(&b, a64.movz32(2, 0, 0)) // w2 = 0 (height: keep current)
+    emit(&b, a64.movz32(3, WINDOW_FORMAT_RGBA_8888, 0)) // w3 = format
+    emitGotCall(&b, textVaddr, 9, got.setBuffersGeometry)
+
+    // ANativeWindow_lock(window, &buffer, NULL)
+    emit(&b, a64.ldrX(0, a64.SP, 56)) // x0 = window
+    emit(&b, a64.addImm64(1, a64.SP, 0)) // x1 = &buffer
+    emit(&b, a64.movReg64(2, a64.XZR)) // x2 = NULL
+    emitGotCall(&b, textVaddr, 9, got.lock)
+
+    // if (result != 0) goto epilogue;  (forward branch, patched below)
+    const cbnzLockFailedIdx: usize = b.count
+    emit(&b, 0)
+
+    // Fill: total_pixels = buffer.height * buffer.stride
+    emit(&b, a64.ldrW(9, a64.SP, 4)) // w9 = height (zero-extends x9)
+    emit(&b, a64.ldrW(10, a64.SP, 8)) // w10 = stride (zero-extends x10)
+    emit(&b, a64.mul64(11, 9, 10)) // x11 = total pixel count
+    emit(&b, a64.ldrX(12, a64.SP, 16)) // x12 = buffer.bits
+    emit(&b, a64.movz32(13, BLUE_RGBA8888_LE & 0xffff, 0))
+    emit(&b, a64.movk32(13, (BLUE_RGBA8888_LE >> 16) & 0xffff, 1))
+
+    // if (total_pixels == 0) goto skip_fill;  (forward branch, patched below)
+    const cbzZeroPixelsIdx: usize = b.count
+    emit(&b, 0)
+
+    const loopStart: usize = b.count
+    emit(&b, a64.strwPostIndex(13, 12, 4)) // *bits++ = blue
+    emit(&b, a64.subImm64(11, 11, 1))
+    const cbnzLoopIdx: usize = b.count
+    emit(&b, a64.cbnzX(11, (@intCast(i32, loopStart) - @intCast(i32, cbnzLoopIdx)) * 4))
+
+    const skipFill: usize = b.count
+    b.words[cbzZeroPixelsIdx] = a64.cbzX(11, (@intCast(i32, skipFill) - @intCast(i32, cbzZeroPixelsIdx)) * 4)
+
+    // ANativeWindow_unlockAndPost(window)
+    emit(&b, a64.ldrX(0, a64.SP, 56)) // x0 = window
+    emitGotCall(&b, textVaddr, 9, got.unlockAndPost)
+
+    const epilogue: usize = b.count
+    b.words[cbnzLockFailedIdx] = a64.cbnzW(0, (@intCast(i32, epilogue) - @intCast(i32, cbnzLockFailedIdx)) * 4)
+
+    emit(&b, a64.addImm64(a64.SP, a64.SP, 64))
+    emit(&b, a64.ret(a64.LR))
+
+    return b
+}
