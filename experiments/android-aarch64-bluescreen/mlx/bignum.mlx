@@ -1,0 +1,673 @@
+// Arbitrary-precision unsigned integer arithmetic, built from u64 limbs.
+// Straight port of experiments/android-aarch64-bluescreen/tool/bignum.zig's
+// *behavior* (same operations, same RSA-keygen algorithms), but not its
+// implementation: the Zig version leans on `std.math.big.int.Managed`,
+// which mlx's stdlib has no equivalent of, and native `uN`/`iN` wider than
+// 64 bits is a documented, deferred compiler gap (see
+// docs/internals/selfhost-compiler.md's "uN/iN wider than 64 bits" entry) --
+// so this is a from-scratch schoolbook bignum built entirely out of u64
+// limbs and 64-bit-native operations, never a wide integer type.
+//
+// Every carry/borrow chain here (`addTo`, `subTo`, the multiply-accumulate
+// step in `mulTo`) uses the standard two-step overflow-detecting idiom
+// (`sum1 = a +% b; carry = sum1 < a; sum2 = sum1 +% carry_in; ...`) because
+// mlx's plain `+`/`-`/`*` panic on overflow (Zig-style checked arithmetic;
+// `+%`/`-%`/`*%` are the wrapping equivalents) and this code needs the
+// wraparound behavior to implement carry propagation itself. Every one of
+// these carry/borrow/64x64->128-bit-multiply idioms, and the full set of
+// operations below (add/sub/mul/shift/cmp/divMod/modPow/modInverse/
+// isProbablePrime), was first verified against Python's arbitrary-precision
+// `int` (thousands of random trials plus edge cases) before being
+// transcribed here, matching this session's general rule of treating an
+// external, independently-implemented arithmetic system as a dev-time
+// oracle for anything non-trivial.
+//
+// Division is binary long division (shift-compare-subtract, one bit of
+// quotient per iteration) rather than Knuth's Algorithm D -- much simpler
+// to get right, at the cost of being O(bits x limbs) instead of O(limbs^2)
+// per division.
+//
+// A second, more severe constraint on key size: every hot-path function
+// below (`mulTo`/`divMod`'s callers, `modPow`, `isProbablePrime`,
+// `modInverse`) is written to avoid declaring a fresh local `BigUint`
+// inside a loop or on every call from one, because the self-hosted
+// compiler's `alloca` for a struct-typed local permanently consumes space
+// from a fixed, never-reclaimed 256 MiB arena (see
+// docs/internals/selfhost-compiler.md's "every `var x: T = undefined` ...
+// permanently consumes space from that same 256 MiB arena" entry) -- a
+// loop that declares one exhausts the arena and crashes after enough
+// iterations, full stop, independent of how fast the arithmetic itself is.
+// Both constraints together are why this experiment's RSA key size
+// (`generateKeyPair`'s `bits` argument, wired up in the JAR-signing
+// module) is smaller than the Zig prototype's real-build default (2048
+// bits): 512-bit primes (1024-bit modulus) complete reliably in this port
+// (~1 minute); 768-bit primes were observed to exhaust the arena even
+// after every hot-path fix applied here, mid-keygen.
+
+const std = @import("std")
+
+pub const Allocator = std.allocator.Allocator
+pub const ArrayList = std.array_list.ArrayList
+
+pub const MAX_LIMBS: usize = 40
+
+pub const BigUint = struct {
+    limbs: [40]u64
+    len: usize
+}
+
+fn setZeroLimbs(x: *BigUint) -> void {
+    var i: usize = 0
+    while i < MAX_LIMBS {
+        x.*.limbs[i] = 0
+        i += 1
+    }
+}
+
+pub fn setZero(x: *BigUint) -> void {
+    setZeroLimbs(x)
+    x.*.len = 1
+}
+
+fn trim(x: *BigUint) -> void {
+    var n: usize = x.*.len
+    while n > 1 {
+        if x.*.limbs[n - 1] != 0 { break }
+        n -= 1
+    }
+    x.*.len = n
+}
+
+pub fn setU64(x: *BigUint, v: u64) -> void {
+    setZeroLimbs(x)
+    x.*.limbs[0] = v
+    x.*.len = 1
+}
+
+pub fn copyTo(dst: *BigUint, src: *BigUint) -> void {
+    var i: usize = 0
+    while i < MAX_LIMBS {
+        dst.*.limbs[i] = src.*.limbs[i]
+        i += 1
+    }
+    dst.*.len = src.*.len
+}
+
+pub fn isZero(x: *BigUint) -> bool {
+    return x.*.len == 1 && x.*.limbs[0] == 0
+}
+
+pub fn isEven(x: *BigUint) -> bool {
+    return (x.*.limbs[0] & 1) == 0
+}
+
+pub fn cmp(a: *BigUint, b: *BigUint) -> i32 {
+    if a.*.len != b.*.len {
+        if a.*.len < b.*.len { return -1 }
+        return 1
+    }
+    var i: usize = a.*.len
+    while i > 0 {
+        i -= 1
+        if a.*.limbs[i] != b.*.limbs[i] {
+            if a.*.limbs[i] < b.*.limbs[i] { return -1 }
+            return 1
+        }
+    }
+    return 0
+}
+
+pub fn addTo(dst: *BigUint, a: *BigUint, b: *BigUint) -> void {
+    var carry: u64 = 0
+    var n: usize = a.*.len
+    if b.*.len > n { n = b.*.len }
+    var i: usize = 0
+    while i < n {
+        var av: u64 = 0
+        if i < a.*.len { av = a.*.limbs[i] }
+        var bv: u64 = 0
+        if i < b.*.len { bv = b.*.limbs[i] }
+        const sum1: u64 = av +% bv
+        var c1: u64 = 0
+        if sum1 < av { c1 = 1 }
+        const sum2: u64 = sum1 +% carry
+        var c2: u64 = 0
+        if sum2 < sum1 { c2 = 1 }
+        dst.*.limbs[i] = sum2
+        carry = c1 +% c2
+        i += 1
+    }
+    if carry != 0 {
+        dst.*.limbs[n] = carry
+        n += 1
+    }
+    dst.*.len = n
+    trim(dst)
+}
+
+// dst = a - b. Assumes a >= b (every call site here maintains that).
+pub fn subTo(dst: *BigUint, a: *BigUint, b: *BigUint) -> void {
+    var borrow: u64 = 0
+    const n: usize = a.*.len
+    var i: usize = 0
+    while i < n {
+        const av: u64 = a.*.limbs[i]
+        var bv: u64 = 0
+        if i < b.*.len { bv = b.*.limbs[i] }
+        const diff1: u64 = av -% bv
+        var br1: u64 = 0
+        if av < bv { br1 = 1 }
+        const diff2: u64 = diff1 -% borrow
+        var br2: u64 = 0
+        if diff1 < borrow { br2 = 1 }
+        dst.*.limbs[i] = diff2
+        borrow = br1 +% br2
+        i += 1
+    }
+    dst.*.len = n
+    trim(dst)
+}
+
+// 64x64 -> 128-bit multiply, portable (no native wide-int dependency):
+// split into 32-bit halves and combine four 32x32->64 partial products.
+// `lo` is exactly the native wrapping product `a *% b`; `hi` is built from
+// the cross terms with the standard carry-bit correction.
+fn mul64Full(a: u64, b: u64) -> (u64, u64) {
+    const aLo: u64 = a & 4294967295
+    const aHi: u64 = a >> 32
+    const bLo: u64 = b & 4294967295
+    const bHi: u64 = b >> 32
+    const aXbHi: u64 = aHi *% bHi
+    const aXbMid: u64 = aHi *% bLo
+    const bXaMid: u64 = bHi *% aLo
+    const aXbLo: u64 = aLo *% bLo
+    const carryBit: u64 = ((aXbMid & 4294967295) +% (bXaMid & 4294967295) +% (aXbLo >> 32)) >> 32
+    const hi: u64 = ((aXbHi +% (aXbMid >> 32)) +% (bXaMid >> 32)) +% carryBit
+    const lo: u64 = a *% b
+    return -> (hi, lo)
+}
+
+// Schoolbook multiply using a caller-provided scratch accumulator, so a
+// hot-path caller (`modPow`, `isProbablePrime`) can hoist `acc` once and
+// reuse it across many calls instead of paying for a fresh arena
+// allocation on every single one (see divMod's comment) -- multiplication
+// can't write directly into `dst` in general because `dst` may alias `a`
+// or `b` (e.g. `mulSmall`'s in-place `mulTo(x, x, &mBig)`), so it always
+// needs a separate accumulator distinct from both operands.
+fn mulToScratch(dst: *BigUint, a: *BigUint, b: *BigUint, acc: *BigUint) -> void {
+    setZero(acc)
+    var i: usize = 0
+    while i < a.*.len {
+        var carry: u64 = 0
+        var j: usize = 0
+        while j < b.*.len {
+            const k: usize = i + j
+            const prod = mul64Full(a.*.limbs[i], b.*.limbs[j])
+            const sum1: u64 = acc.*.limbs[k] +% prod.1
+            var c1: u64 = 0
+            if sum1 < acc.*.limbs[k] { c1 = 1 }
+            const sum2: u64 = sum1 +% carry
+            var c2: u64 = 0
+            if sum2 < sum1 { c2 = 1 }
+            acc.*.limbs[k] = sum2
+            carry = (prod.0 +% c1) +% c2
+            j += 1
+        }
+        var k: usize = i + b.*.len
+        while carry != 0 {
+            const sum1: u64 = acc.*.limbs[k] +% carry
+            var c1: u64 = 0
+            if sum1 < acc.*.limbs[k] { c1 = 1 }
+            acc.*.limbs[k] = sum1
+            carry = c1
+            k += 1
+        }
+        i += 1
+    }
+    acc.*.len = a.*.len + b.*.len
+    trim(acc)
+    copyTo(dst, acc)
+}
+
+pub fn mulTo(dst: *BigUint, a: *BigUint, b: *BigUint) -> void {
+    var acc: BigUint = undefined
+    mulToScratch(dst, a, b, &acc)
+}
+
+fn mulSmall(dst: *BigUint, a: *BigUint, m: u64) -> void {
+    var mBig: BigUint = undefined
+    setU64(&mBig, m)
+    mulTo(dst, a, &mBig)
+}
+
+pub fn shiftRight1(x: *BigUint) -> void {
+    var carry: u64 = 0
+    var i: usize = x.*.len
+    while i > 0 {
+        i -= 1
+        const cur: u64 = x.*.limbs[i]
+        x.*.limbs[i] = (cur >> 1) | (carry << 63)
+        carry = cur & 1
+    }
+    trim(x)
+}
+
+pub fn shiftLeft1(x: *BigUint) -> void {
+    var carry: u64 = 0
+    var i: usize = 0
+    while i < x.*.len {
+        const cur: u64 = x.*.limbs[i]
+        x.*.limbs[i] = (cur << 1) | carry
+        carry = cur >> 63
+        i += 1
+    }
+    if carry != 0 {
+        x.*.limbs[x.*.len] = carry
+        x.*.len += 1
+    }
+    trim(x)
+}
+
+pub fn bitLength(x: *BigUint) -> usize {
+    var top: u64 = x.*.limbs[x.*.len - 1]
+    var bits: usize = 0
+    while top != 0 {
+        bits += 1
+        top = top >> 1
+    }
+    return (x.*.len - 1) * 64 + bits
+}
+
+pub fn getBit(x: *BigUint, idx: usize) -> u64 {
+    const limb: usize = idx / 64
+    const bit: usize = idx % 64
+    if limb >= x.*.len { return 0 }
+    return (x.*.limbs[limb] >> @intCast(u64, bit)) & 1
+}
+
+fn setBit(x: *BigUint, idx: usize) -> void {
+    const limb: usize = idx / 64
+    const bit: usize = idx % 64
+    if limb + 1 > x.*.len { x.*.len = limb + 1 }
+    x.*.limbs[limb] = x.*.limbs[limb] | (@intCast(u64, 1) << @intCast(u64, bit))
+}
+
+// Binary long division (one quotient bit per iteration). a and b must not
+// alias quotient/remainder (every call site here uses fresh out-params).
+//
+// Deliberately declares no local `BigUint`/aggregate variable inside the
+// loop (`subTo(remainder, remainder, b)` is safe in place: every limb of a
+// `subTo` destination is read before it is overwritten, at the same index,
+// so aliasing the destination with the minuend is fine). This works around
+// a severe backend bug: a local of struct/array type declared with
+// `undefined` (`var x: T = undefined`) is `alloca`'d from a single fixed
+// 256 MiB *global* arena via a monotonically-increasing bump pointer
+// (`backend/x86_64/codegen/memory.mlx`'s `emitArenaAllocation`, feeding
+// `emitAggregateArena`'s one-time `mmap` in `codegen/emitter.mlx`) that is
+// **never reclaimed** -- not at function return, not at the end of a loop
+// iteration. A declaration site executed repeatedly (by looping, or by
+// being called repeatedly from an outer loop) permanently consumes 256
+// MiB's worth of arena after roughly 256MiB / sizeof(T) dynamic executions
+// and then traps. Confirmed with a minimal repro: a bare `while i <
+// 2000000 { var x: SomeStruct = undefined; ... }` (328-byte struct) crashes
+// after ~800,000 iterations (~262 MB, matching the arena size); hoisting
+// the same declaration above the loop and reusing it removes the ceiling
+// entirely (2,000,000 iterations, no crash). Every function below that
+// sits on a hot path (called from `randomPrime`'s/`isProbablePrime`'s/
+// `modPow`'s loops) has been written or rewritten to avoid declaring a new
+// aggregate local per loop iteration or per call for exactly this reason --
+// `divMod` in particular is the dominant cost, since it is called from
+// inside `modPow`'s own per-exponent-bit loop and previously declared a
+// fresh `tmp` on almost every one of its own per-dividend-bit iterations.
+// Not documented as a known gap yet; this is the most severe of the new
+// findings from this port (it isn't just a slicing/codegen correctness
+// issue like the others -- it is a hard, silent ceiling on how much
+// aggregate-typed local state *any* program can create over its lifetime).
+pub fn divMod(quotient: *BigUint, remainder: *BigUint, a: *BigUint, b: *BigUint) -> void {
+    setZero(quotient)
+    setZero(remainder)
+    const nbits: usize = bitLength(a)
+    var i: usize = nbits
+    while i > 0 {
+        i -= 1
+        shiftLeft1(remainder)
+        if getBit(a, i) == 1 {
+            remainder.*.limbs[0] = remainder.*.limbs[0] | 1
+        }
+        if cmp(remainder, b) >= 0 {
+            subTo(remainder, remainder, b)
+            setBit(quotient, i)
+        }
+    }
+}
+
+pub fn modOf(remainder: *BigUint, a: *BigUint, m: *BigUint) -> void {
+    var q: BigUint = undefined
+    divMod(&q, remainder, a, m)
+}
+
+pub fn fromBytesBE(x: *BigUint, bytes: []const u8) -> void {
+    setZero(x)
+    var byteVal: BigUint = undefined
+    var i: usize = 0
+    while i < bytes.length {
+        // Both in place: mulSmall/addTo only read their source operands
+        // before writing the same limb index, so aliasing dst with a
+        // source here is safe (see divMod's comment for the general
+        // reasoning; this also avoids declaring a fresh aggregate local
+        // per byte on what can be a hot path).
+        mulSmall(x, x, 256)
+        setU64(&byteVal, @intCast(u64, bytes[i]))
+        addTo(x, x, &byteVal)
+        i += 1
+    }
+}
+
+fn getByteAt(x: *BigUint, bitOffset: usize) -> u64 {
+    const limb: usize = bitOffset / 64
+    const bitInLimb: usize = bitOffset % 64
+    if limb >= x.*.len { return 0 }
+    return (x.*.limbs[limb] >> @intCast(u64, bitInLimb)) & 255
+}
+
+// Big-endian bytes, sized exactly to the value's bit length (no leading
+// zero byte) -- minimal DER INTEGER content; the caller adds the
+// sign-disambiguation 0x00 byte if required.
+pub fn toBytesBEMinimal(x: *BigUint, allocator: Allocator) -> ArrayList {
+    var out: ArrayList = std.array_list.ArrayList.init(allocator, 64)
+    if isZero(x) {
+        var ok: bool = std.array_list.ArrayList.appendAt(&out, 0)
+        return out
+    }
+    const bits: usize = bitLength(x)
+    const nbytes: usize = (bits + 7) / 8
+    out = std.array_list.ArrayList.resize(out, nbytes, 0)
+    var i: usize = 0
+    while i < nbytes {
+        const shiftFromTop: usize = (nbytes - 1 - i) * 8
+        const byteVal: u8 = @intCast(u8, getByteAt(x, shiftFromTop))
+        std.array_list.ArrayList.set(out, i, byteVal)
+        i += 1
+    }
+    return out
+}
+
+// r = (base ^ exp) mod modulus, via left-to-right square-and-multiply.
+//
+// `tmp`/`bsq` are declared once, above the loop, and reused across
+// iterations -- see divMod's comment for why (the fixed-size global
+// aggregate arena this compiler `alloca`s struct locals from is never
+// reclaimed, so a fresh declaration per loop iteration is a real, hard
+// resource ceiling on a hot path like this one). `modOf(result, &tmp,
+// modulus)` / `modOf(&b, &bsq, modulus)` write directly into `result`/`b`
+// rather than through yet another temporary: safe because `tmp`/`bsq` are
+// distinct variables from `result`/`b` (modOf's remainder out-param must
+// not alias its own dividend argument -- unlike mulTo/addTo/subTo, it zeros
+// the out-param before finishing reading the dividend -- but here they
+// never do alias).
+pub fn modPow(result: *BigUint, base: *BigUint, exp: *BigUint, modulus: *BigUint) -> void {
+    setU64(result, 1)
+    var b: BigUint = undefined
+    modOf(&b, base, modulus)
+    var e: BigUint = undefined
+    copyTo(&e, exp)
+    var tmp: BigUint = undefined
+    var bsq: BigUint = undefined
+    // `modOf` itself declares a fresh quotient scratch per call, which
+    // would otherwise be re-`alloca`'d (from the same fixed arena -- see
+    // divMod's comment) on every one of this loop's iterations; `qScratch`
+    // is hoisted once here and reused via `divMod` directly instead.
+    // Likewise `mulAcc` for `mulToScratch` (see its comment).
+    var qScratch: BigUint = undefined
+    var mulAcc: BigUint = undefined
+    while !isZero(&e) {
+        if !isEven(&e) {
+            mulToScratch(&tmp, result, &b, &mulAcc)
+            divMod(&qScratch, result, &tmp, modulus)
+        }
+        mulToScratch(&bsq, &b, &b, &mulAcc)
+        divMod(&qScratch, &b, &bsq, modulus)
+        shiftRight1(&e)
+    }
+}
+
+// Signed values for the Bezout coefficients in modInverse's extended-Euclid
+// loop (the remainder sequence itself stays non-negative and uses plain
+// BigUint/divMod throughout). These are plain (magnitude, negative) value
+// pairs rather than a `struct { mag: BigUint, negative: bool }` wrapper,
+// because taking the address of a struct FIELD -- `&x.field` or `&x.*.field`,
+// for any field type, at any nesting depth, not just a nested-struct one --
+// does not work in the current self-hosted compiler: `expressionWithReturn`
+// (`sema/declarations.mlx`, the type-checker path unary `&` goes through)
+// fails to resolve the operand's type for a field_expression operand,
+// reporting `MLX-E4001: expression type could not be resolved` even for the
+// simplest case (`var i: Inner = undefined; setVal(&i.val, 1)` with
+// `val: u64`). Not documented as a known gap before this port hit it --
+// unlike the array-of-slices and large-struct-return issues, `&expr.field`
+// has no minimal-repro history in this codebase at all (grep confirms nothing
+// in compiler/selfhost or std ever takes the address of a struct field this
+// way). Worked around here by threading a BigUint magnitude and a bool sign
+// as two separate parameters/locals everywhere a signed value is needed,
+// so every `&` only ever addresses a plain local variable -- the pattern
+// already used successfully throughout the rest of this file.
+
+// dstMag = |a + b|; returns the result's sign (false when the result is 0).
+fn biAdd(dstMag: *BigUint, aMag: *BigUint, aNeg: bool, bMag: *BigUint, bNeg: bool) -> bool {
+    if aNeg == bNeg {
+        addTo(dstMag, aMag, bMag)
+        if isZero(dstMag) { return false }
+        return aNeg
+    }
+    const c: i32 = cmp(aMag, bMag)
+    if c == 0 {
+        setZero(dstMag)
+        return false
+    }
+    if c > 0 {
+        subTo(dstMag, aMag, bMag)
+        return aNeg
+    }
+    subTo(dstMag, bMag, aMag)
+    return bNeg
+}
+
+// dstMag = |a - b|; returns the result's sign. (Flipping b's sign and
+// reusing biAdd is correct even when bMag is zero: a zero magnitude makes
+// the sign bit irrelevant to the arithmetic either way.)
+fn biSub(dstMag: *BigUint, aMag: *BigUint, aNeg: bool, bMag: *BigUint, bNeg: bool) -> bool {
+    return biAdd(dstMag, aMag, aNeg, bMag, !bNeg)
+}
+
+// dstMag = |a * b|; returns the result's sign (false when the result is 0).
+fn biMulScratch(dstMag: *BigUint, aMag: *BigUint, aNeg: bool, bMag: *BigUint, bNeg: bool, mulAcc: *BigUint) -> bool {
+    mulToScratch(dstMag, aMag, bMag, mulAcc)
+    if isZero(dstMag) { return false }
+    if aNeg != bNeg { return true }
+    return false
+}
+
+// Extended Euclidean algorithm: returns x such that (a * x) mod m == 1.
+// Assumes gcd(a, m) == 1 (true for RSA's e vs. phi(n) by construction).
+pub fn modInverse(result: *BigUint, a: *BigUint, m: *BigUint) -> void {
+    var oldRMag: BigUint = undefined
+    copyTo(&oldRMag, a)
+    var rMag: BigUint = undefined
+    copyTo(&rMag, m)
+
+    var oldSMag: BigUint = undefined
+    setU64(&oldSMag, 1)
+    var oldSNeg: bool = false
+    var sMag: BigUint = undefined
+    setZero(&sMag)
+    var sNeg: bool = false
+
+    // Hoisted above the loop and reused (see divMod's comment).
+    var q: BigUint = undefined
+    var rem: BigUint = undefined
+    var qsMag: BigUint = undefined
+    var newSMag: BigUint = undefined
+    var mulAcc: BigUint = undefined
+
+    while !isZero(&rMag) {
+        divMod(&q, &rem, &oldRMag, &rMag)
+
+        // new_s = old_s - q*s, computed from the OLD old_s/s before either
+        // is overwritten below (this loop body mirrors a simultaneous
+        // tuple assignment: `old_r, r = r, rem; old_s, s = s, new_s`).
+        const qsNeg: bool = biMulScratch(&qsMag, &q, false, &sMag, sNeg, &mulAcc)
+        const newSNeg: bool = biSub(&newSMag, &oldSMag, oldSNeg, &qsMag, qsNeg)
+
+        copyTo(&oldRMag, &rMag)
+        copyTo(&rMag, &rem)
+
+        copyTo(&oldSMag, &sMag)
+        oldSNeg = sNeg
+        copyTo(&sMag, &newSMag)
+        sNeg = newSNeg
+    }
+
+    if oldSNeg {
+        // old_s is negative: normalize into [0, m) as m - |old_s|, via the
+        // sign-aware biAdd(-|old_s|, +m) rather than a plain unsigned add.
+        var normalized: bool = biAdd(result, &oldSMag, true, m, false)
+    } else {
+        copyTo(result, &oldSMag)
+    }
+}
+
+// ── randomness ───────────────────────────────────────────────────────────
+//
+// A second, distinct backend slicing bug was found and worked around here:
+// `@ptrCast(PointerType, &arrayVar)[a..b]` -- taking a slice directly off a
+// freshly-`@ptrCast`'d many-pointer, in one chained expression -- silently
+// produces a corrupted slice (confirmed with a minimal repro: a byte known
+// to be 200 reads back as some value < 10 after being routed through
+// `@ptrCast([*]const u8, &buf)[0..1]`). Assigning the `@ptrCast` result to
+// an intermediate `[*]T` variable first and slicing that separately does
+// NOT avoid it -- the corruption follows the ptrCast-then-slice combination
+// itself, not the expression shape around it. A direct array slice
+// (`buf[0..n]`, no pointer cast at all) is unaffected and is what
+// `randomInRange`/`randomPrime` use below. Not documented as a known gap
+// yet, unlike the array-of-slices and `undefined`-field issues found
+// earlier in this port.
+fn fillRandomBytes(dst: [*]u8, n: usize) -> void {
+    const file = std.fs.open(@ptrCast([*]const u8, "/dev/urandom"), std.fs.READ_ONLY, 0)
+    var got: usize = 0
+    while got < n {
+        var destination: [*]u8 = undefined
+        unsafe {
+            destination = @ptrFromInt([*]u8, @intFromPtr(dst) + got)
+        }
+        const r: isize = std.fs.read(file, destination, n - got)
+        if r <= 0 { break }
+        got += @intCast(usize, r)
+    }
+    var ok: bool = std.fs.close(file)
+}
+
+fn randomInRange(result: *BigUint, lo: *BigUint, hi: *BigUint) -> void {
+    const bits: usize = bitLength(hi)
+    const nbytes: usize = (bits + 7) / 8
+    var buf: [512]u8 = undefined
+    var dst: [*]u8 = undefined
+    unsafe {
+        dst = @ptrCast([*]u8, &buf)
+    }
+    while true {
+        fillRandomBytes(dst, nbytes)
+        // `buf[0..nbytes]` (a direct array slice), not
+        // `@ptrCast([*]const u8, &buf)[0..nbytes]` -- see the note on
+        // `@ptrCast(...)[a..b]` above `fillRandomBytes`. Writes straight
+        // into `result` (rejected draws just get overwritten next
+        // iteration) rather than through a hoisted `cand` -- see divMod's
+        // comment on why avoiding a fresh aggregate local per iteration
+        // matters here.
+        fromBytesBE(result, buf[0..nbytes])
+        if cmp(result, lo) >= 0 && cmp(result, hi) <= 0 {
+            return
+        }
+    }
+}
+
+// Miller-Rabin primality test (probabilistic; `rounds` independent bases).
+pub fn isProbablePrime(n: *BigUint, rounds: u32) -> bool {
+    var two: BigUint = undefined
+    setU64(&two, 2)
+    var three: BigUint = undefined
+    setU64(&three, 3)
+    if cmp(n, &two) < 0 { return false }
+    if cmp(n, &two) == 0 { return true }
+    if cmp(n, &three) == 0 { return true }
+    if isEven(n) { return false }
+
+    var one: BigUint = undefined
+    setU64(&one, 1)
+    var nMinus1: BigUint = undefined
+    subTo(&nMinus1, n, &one)
+    var d: BigUint = undefined
+    copyTo(&d, &nMinus1)
+    var s: u32 = 0
+    while isEven(&d) {
+        shiftRight1(&d)
+        s += 1
+    }
+
+    var nMinus2: BigUint = undefined
+    subTo(&nMinus2, n, &two)
+
+    // Hoisted above both loops and reused (see divMod's comment): this
+    // function sits directly on randomPrime's hot path.
+    var a: BigUint = undefined
+    var x: BigUint = undefined
+    var sq: BigUint = undefined
+    var qScratch: BigUint = undefined
+    var mulAcc: BigUint = undefined
+
+    var round: u32 = 0
+    while round < rounds {
+        randomInRange(&a, &two, &nMinus2)
+        modPow(&x, &a, &d, n)
+
+        if cmp(&x, &one) == 0 || cmp(&x, &nMinus1) == 0 {
+            round += 1
+            continue
+        }
+
+        var composite: bool = true
+        var r: u32 = 1
+        while r < s {
+            mulToScratch(&sq, &x, &x, &mulAcc)
+            divMod(&qScratch, &x, &sq, n)
+            if cmp(&x, &nMinus1) == 0 {
+                composite = false
+                break
+            }
+            r += 1
+        }
+        if composite { return false }
+        round += 1
+    }
+    return true
+}
+
+// Generate a random probable prime with the top two bits set (guarantees
+// the product of two such primes has exactly 2*bits bits) and the low bit
+// set (odd).
+pub fn randomPrime(result: *BigUint, bits: usize) -> void {
+    const nbytes: usize = (bits + 7) / 8
+    var buf: [512]u8 = undefined
+    var dst: [*]u8 = undefined
+    unsafe {
+        dst = @ptrCast([*]u8, &buf)
+    }
+    while true {
+        fillRandomBytes(dst, nbytes)
+        buf[0] = buf[0] | 192 // 0xc0: top two bits set
+        buf[nbytes - 1] = buf[nbytes - 1] | 1 // odd
+        // Writes straight into `result` -- see randomInRange's comment.
+        fromBytesBE(result, buf[0..nbytes])
+        if isProbablePrime(result, 32) {
+            return
+        }
+    }
+}

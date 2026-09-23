@@ -618,6 +618,58 @@ depending on any libc allocator. This is a direct, concrete instance of the
 x86_64 spec's "Direct machine-code byte emission. No external assembler is
 required" (`spec/02-compiler/x86_64.xml`).
 
+**Known gap, severe: every `var x: T = undefined` for a struct/union/array
+`T` permanently consumes space from that same 256&nbsp;MiB arena, for the
+life of the whole process, no matter how short-lived or tightly-scoped the
+variable is — a loop that declares one is a hard, silent crash waiting to
+happen.** `codegen/memory.mlx`'s `emitAlloca` has two paths: a sized
+allocation (`instruction.arg0 != NONE`, which is what every aggregate-typed
+local literal is lowered to, in both `lowerBindingInitializer`'s `undefined`
+case and `lowerAggregateLiteral`) always calls `emitArenaAllocation`, an
+atomic-XADD bump of the arena cursor (`r14`) checked against the arena limit
+(`r15`) with `emitTrap` on overflow; an unsized allocation instead reserves a
+plain function-frame-relative slot via `state.*.nextStackSlot`, exactly like
+an ordinary scalar local, correctly reused across every dynamic execution of
+that instruction (loop iterations, repeated calls) because it's a
+compile-time-fixed offset, not a runtime-growing cursor. Nothing routes
+aggregate locals through the second, correctly-scoped path — every one goes
+through the arena, and the arena is bumped **every time the `alloca`
+instruction executes at runtime**, not once per place it appears in the
+source. A loop (directly, or one call away — the same declaration site
+inside a function called repeatedly from a loop counts too) that declares
+such a local exhausts the arena and hits the trap after
+roughly `268435464 / sizeof(T)` dynamic executions — confirmed with a
+minimal repro, `while i < 2000000 { var x: SomeStruct = undefined; ... }`
+for a 328-byte struct crashes (`SIGILL`, the `emitTrap`) at ~800,000
+iterations (~262&nbsp;MB, matching the arena size); hoisting the identical
+declaration above the loop and reusing the variable removes the ceiling
+entirely (2,000,000 iterations, no crash, since the `alloca` then executes
+once). This was found and worked around (not fixed) porting
+`experiments/android-aarch64-bluescreen/tool/bignum.zig` to
+`experiments/android-aarch64-bluescreen/mlx/bignum.mlx`: an RSA keygen's
+inner loops (long division, modular exponentiation, the extended Euclidean
+algorithm) each declare a handful of `BigUint` (328-byte struct) locals per
+iteration by the most natural way to write them, and real key sizes run
+those loops enough times to exhaust the arena within seconds. The general
+shape of the workaround, applied throughout `bignum.mlx`: hoist every
+loop-body `var x: T = undefined` to above its loop and reuse it by
+overwriting through the existing pointer-based mutator functions (safe
+because a limb-by-limb/field-by-field write never depends on a stale
+previous value once every field is rewritten); where a function on a hot
+path (called repeatedly from a loop, not just looping itself) needs its own
+scratch aggregate, thread it in from the caller as an extra out-parameter
+instead of declaring it locally (see `mulToScratch`/`biMulScratch` next to
+the plain `mulTo`, which just supplies a fresh scratch buffer for
+occasional/cold-path use). A real fix would extend the existing
+correctly-scoped `nextStackSlot` path to sized allocations too — the
+mechanism already exists and already reuses slots correctly across dynamic
+executions for scalars — but doing that safely needs `functionFrameSize`
+(`codegen/state.mlx`, currently `(instruction_count * 24 + 271)` rounded up,
+with no awareness of aggregate sizes at all) to also account for the total
+concurrent aggregate-local footprint of a function, which this port did not
+attempt. No fix or regression test exists for this in the compiler itself
+yet.
+
 ## ELF64 object writer (`object/elf64.mlx`)
 
 `object/elf64.mlx`'s `buildExecutable` writes a complete `ET_EXEC` ELF64
