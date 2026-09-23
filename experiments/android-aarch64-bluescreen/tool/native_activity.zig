@@ -83,8 +83,23 @@ pub fn buildText(
     errdefer out.deinit();
 
     // ── ANativeActivity_onCreate(x0=activity, x1=savedState, x2=savedStateSize) ──
+    //
+    // Diagnostic: an unconditional trap at the very start of the window
+    // handler (below) proved the window-created/resized/redraw-needed
+    // callback is never invoked at all on a real device, with no crash --
+    // so the mystery is upstream of that handler, in how it gets
+    // registered. Before chasing the ANativeActivity struct's `callbacks`
+    // field offset (the single highest-risk hand-transcribed assumption in
+    // this whole pipeline, per the README from day one), confirm the more
+    // basic fact first: does ANativeActivity_onCreate itself even run?
+    // `udf #0` as its literal first instruction settles that with no adb
+    // needed -- a crash immediately on launch proves it does (pointing the
+    // investigation at the struct-offset assumptions instead); no crash at
+    // all would mean the library's exported onCreate is never being found/
+    // called by the framework in the first place. Remove once answered.
     const on_create_start = out.items.len;
     std.debug.assert(on_create_start == 0);
+    try out.append(a64.udf(0));
 
     try emitAdrpAdd(&out, text_vaddr, 9, data_callbacks_vaddr);
     // (function 2's address is only known once we've counted this function's
@@ -137,19 +152,15 @@ pub fn buildText(
     // returned cleanly afterward) even after the onNativeWindowCreated-only
     // registration bug was fixed.
     //
-    // Diagnostic: after removing setBuffersGeometry and trapping on a
-    // failing lock/unlockAndPost (see below), a real device was still
-    // black with *no* crash -- ruling out either of those calls returning
-    // failure. That leaves two live explanations: this handler is never
-    // being invoked by the framework at all, or it runs and every call
-    // reports success but the pixels still never reach the screen. An
-    // unconditional trap as the very first instruction disambiguates them
-    // with no adb needed: a crash now proves the handler *is* being
-    // called (pointing at the buffer/format/present side instead); no
-    // crash proves it never runs (pointing at the callback registration/
-    // ANativeActivity struct-offset assumptions instead). Remove once
-    // that's answered.
-    try out.append(a64.udf(0));
+    // Diagnostic history: after removing setBuffersGeometry and trapping on
+    // a failing lock/unlockAndPost (see below), a real device was still
+    // black with no crash -- ruling out either of those calls returning
+    // failure. An unconditional trap as this handler's own first
+    // instruction was then tried and also produced no crash, proving this
+    // handler is never invoked by the framework at all -- see the
+    // now-active trap at the very start of ANativeActivity_onCreate above
+    // instead, which checks the more basic question of whether onCreate
+    // itself even runs.
     try out.append(a64.subImm64(a64.sp, a64.sp, 64));
     try out.append(a64.strX(a64.lr, a64.sp, 48)); // save LR
     try out.append(a64.strX(1, a64.sp, 56)); // save window
