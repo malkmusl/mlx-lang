@@ -123,33 +123,40 @@ pub fn buildText(
     const adrp_window_created_idx = out.items.len;
     try out.append(0); // placeholder ADRP x10, onNativeWindowCreated
     try out.append(0); // placeholder ADD  x10, x10, #lo12
-    // Register the handler for onNativeWindowCreated only.
+    // Register the handler for both onNativeWindowCreated and
+    // onNativeWindowResized — both share the exact same
+    // `(activity, window) -> void` signature, and this handler already
+    // re-reads the buffer's current width/height/stride from
+    // ANativeWindow_lock's own out-param on every call rather than caching
+    // them, so the same address serves both without any change.
     //
-    // Two more callbacks used to be registered here too, both removed
-    // after real-device evidence, not just theory:
+    // onNativeWindowResized used to be left unregistered here: it was
+    // removed as a broad diagnostic step while chasing an ANR ("Mlx Blue
+    // Screen reagiert nicht") on the back gesture/home/idle-timeout, on the
+    // theory that it might be firing on every frame of those transition
+    // animations and each firing's synchronous Binder IPC
+    // (ANativeWindow_lock/_unlockAndPost) was enough main-thread blocking
+    // to trip the ANR watchdog. That theory was never actually confirmed —
+    // the ANR *persisted* even after removing this registration too, and
+    // was eventually root-caused to something entirely unrelated: an
+    // unconsumed AInputQueue (see onInputQueueCreated below), now fixed
+    // independently. So there's no remaining evidence this callback caused
+    // anything.
     //
-    // - onNativeWindowResized: removed after confirming it can fire on
-    //   every frame of a live window-resize/transition animation (back
-    //   gesture, home, screen-timeout transitions all trigger one), each
-    //   firing re-running this handler's full synchronous
-    //   ANativeWindow_lock/_setBuffersGeometry/_unlockAndPost cycle — real
-    //   Binder IPC round-trips — with no rate limiting. Enough of those
-    //   back-to-back was enough main-thread blocking to trip an ANR
-    //   ("Mlx Blue Screen reagiert nicht").
-    // - onNativeWindowRedrawNeeded: removed after the ANR *persisted* even
-    //   with onNativeWindowResized gone. This one is specifically used by
-    //   the framework to synchronize app-transition animations — it can
-    //   call in and wait on exactly the same triggers (back gesture, home,
-    //   screen timeout) that were already implicated, so the same
-    //   mechanism applies. It was only ever registered on a guess (from
-    //   before the real callback-registration bug above was found) that
-    //   the very first paint might get silently discarded without it; now
-    //   that the actual bug is fixed and confirmed working, that guess is
-    //   moot — once fill+post succeeds here, on this experiment's single
-    //   static, unchanging frame, the compositor keeps showing that same
-    //   posted buffer indefinitely (scaled as needed) with no further
-    //   involvement from us, so there is nothing left to redraw on demand.
+    // Re-registered after real-device feedback that rotating the device
+    // left half the screen black: this experiment's manifest declares
+    // `configChanges = orientation|keyboardHidden|screenSize` (see
+    // axml.zig), which tells Android to resize the existing window in
+    // place on rotation instead of destroying and recreating the whole
+    // activity — and a resize without a matching repaint is exactly the
+    // classic "black bar in the newly-exposed area" bug every
+    // NativeActivity app has to handle (this is precisely what
+    // android_native_app_glue.c's APP_CMD_WINDOW_RESIZED handling exists
+    // for). onNativeWindowRedrawNeeded remains unregistered — no evidence
+    // it's needed for anything this experiment does, so left out to keep
+    // this change minimal.
     try out.append(a64.strX(10, 9, CB_OFFSET_ON_NATIVE_WINDOW_CREATED)); // activity->callbacks->onNativeWindowCreated = x10
+    try out.append(a64.strX(10, 9, CB_OFFSET_ON_NATIVE_WINDOW_RESIZED)); // activity->callbacks->onNativeWindowResized = x10 (same handler, x10 unchanged since the store above)
     // Also register onInputQueueCreated. `android.app.NativeActivity`
     // unconditionally calls `getWindow().takeInputQueue(this)` in its own
     // onCreate, which hands this app an input event queue -- Android then

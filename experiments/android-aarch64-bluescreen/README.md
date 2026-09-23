@@ -472,20 +472,72 @@ Tested by installing the mlx-built `bluescreen.apk` on a real device
   automatically. Verified via `aapt dump xmltree` showing
   `android:theme(0x01010000)=@0x01030009` and the rest of the external-tool
   suite once more.
+- **Fourteenth report: two more requests after confirming the app fully
+  works** -- the status bar should adapt to the device's actual system
+  color instead of a hardcoded black bar, as its own toggle independent of
+  fullscreen; and rotation is broken, leaving half the screen black
+  because the buffer isn't updated.
+  - *Status bar color.* Ground-truthed two more theme IDs the same way as
+    the two already in use: compiled a reference manifest for each through
+    the real `aapt` against `/usr/share/android-framework-res/framework-res.apk`.
+    `Theme.DeviceDefault.NoActionBar` = `0x01030129` (status bar visible,
+    system-adaptive) and `Theme.DeviceDefault.NoActionBar.Fullscreen` =
+    `0x0103012a` (hidden, system-adaptive) -- neither memorized.
+    `buildManifest` now takes a second, independent bool
+    (`system_status_bar_color` / `systemStatusBarColor`) selecting between
+    the hardcoded-black and system-adaptive theme within whichever of the
+    fullscreen/status-bar-visible pair `fullscreen` already picked, so all
+    four themes are reachable via the two toggles' four combinations.
+    Exposed the same way as the existing toggle
+    (`SYSTEM_STATUS_BAR_COLOR_ENABLED` / `systemStatusBarColorEnabled()`),
+    defaulted to `true` per the feedback. Verified via `aapt dump xmltree`
+    showing `android:theme(0x01010000)=@0x01030129`.
+  - *Rotation.* Root-caused to this experiment's own manifest: it declares
+    `configChanges = orientation|keyboardHidden|screenSize`, which tells
+    Android to resize the existing window in place on rotation rather than
+    destroying and recreating the whole activity -- and nothing was
+    listening for that resize to repaint. `onNativeWindowResized` had been
+    deliberately left unregistered since an earlier round (see the tenth
+    report above), but that removal was only ever a broad diagnostic guess
+    made while chasing the ANR, never actually confirmed as the cause --
+    the ANR persisted after removing it and was eventually traced to the
+    unrelated unconsumed `AInputQueue`, fixed independently two rounds
+    later. With no remaining evidence against it, re-registered
+    `onNativeWindowResized` to point at the exact same handler already
+    used for `onNativeWindowCreated`: both share the identical
+    `(activity, window) -> void` signature, and the handler already
+    re-reads the buffer's current width/height/stride from
+    `ANativeWindow_lock`'s own out-param on every call rather than caching
+    them, so no other change was needed. Verified with `llvm-objdump
+    -d --triple=aarch64` on the rebuilt `.so`: `ANativeActivity_onCreate`
+    now stores the same handler address into `activity->callbacks` at both
+    offset `0x38` (56, `onNativeWindowCreated`) and offset `0x40` (64,
+    `onNativeWindowResized`). `onNativeWindowRedrawNeeded` stays
+    unregistered -- no evidence it's needed for anything this experiment
+    does. Because this reintroduces a callback whose earlier removal was
+    never conclusively tied to the ANR, this round's real-device request
+    should re-test not just rotation but also the previously-fragile
+    interactions (back gesture, idle timeout, home) to confirm the ANR
+    stays fixed now that it's back. Full external-tool suite (`aapt`,
+    `jarsigner -verify`, `unzip -t`) re-run clean either way.
 
-This closes out the black-screen-and-ANR investigation: thirteen
-real-device rounds, six genuine bugs found and fixed (missing
-`onNativeWindowResized`/`onNativeWindowRedrawNeeded` registration;
-missing `LR` preservation across the handler's nested calls; the actual
-root cause, replacing `activity->callbacks` instead of writing through
-it; registering `onNativeWindowResized` and then
-`onNativeWindowRedrawNeeded`, each of which caused an ANR once the real
-rendering path was finally reachable; and never draining the input queue
-`NativeActivity.java` always hands this app, which caused the ANR to
-persist even with no window callback left registered), one correctness
-fix found along the way (the window's real default format is `RGB_565`,
-not `RGBA_8888`), and a lot of what turned out to be correctly-
-transcribed ABI assumptions (struct offsets, calling conventions,
+This closes out the black-screen-and-ANR investigation and covers two
+follow-up feature/fix requests: fourteen real-device rounds, seven genuine
+bugs found and fixed (missing `onNativeWindowResized`/
+`onNativeWindowRedrawNeeded` registration; missing `LR` preservation
+across the handler's nested calls; the actual root cause, replacing
+`activity->callbacks` instead of writing through it; registering
+`onNativeWindowResized` and then `onNativeWindowRedrawNeeded`, each of
+which caused an ANR once the real rendering path was finally reachable;
+never draining the input queue `NativeActivity.java` always hands this
+app, which caused the ANR to persist even with no window callback left
+registered; and never repainting on `onNativeWindowResized`, which left
+newly-exposed buffer area black after a config-changes-driven rotation),
+one correctness fix found along the way (the window's real default format
+is `RGB_565`, not `RGBA_8888`), two toggle features added after the app was
+confirmed working (fullscreen vs. status-bar-visible; hardcoded-black vs.
+system-adaptive status bar color), and a lot of what turned out to be
+correctly-transcribed ABI assumptions (struct offsets, calling conventions,
 ELF/dynamic-linking details) that real-device evidence independently
 confirmed rather than contradicted.
 

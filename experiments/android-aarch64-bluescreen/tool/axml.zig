@@ -207,23 +207,35 @@ fn writeEndElement(out: *std.ArrayList(u8), pool: *StringPool, name: []const u8,
     try appendI32(out, name_idx);
 }
 
-// android:theme resource IDs, both ground-truthed against the real `aapt`
-// the same way as everything else in this file (compiled a minimal
+// android:theme resource IDs, all four ground-truthed against the real
+// `aapt` the same way as everything else in this file (compiled a minimal
 // reference manifest with each theme through
 // /usr/share/android-framework-res/framework-res.apk and read the resolved
-// value back from `aapt dump xmltree`): @android:style/Theme.Black.
-// NoTitleBar.Fullscreen (hides the status bar entirely) and @android:style/
-// Theme.Black.NoTitleBar (keeps the normal system status bar, still no
-// action bar/title). Neither is a memorized guess.
+// value back from `aapt dump xmltree`):
+//   @android:style/Theme.Black.NoTitleBar.Fullscreen            -- hides
+//     the status bar entirely, forced-black otherwise.
+//   @android:style/Theme.Black.NoTitleBar                       -- keeps
+//     the status bar, forced-black otherwise.
+//   @android:style/Theme.DeviceDefault.NoActionBar.Fullscreen   -- hides
+//     the status bar entirely, system-adaptive otherwise.
+//   @android:style/Theme.DeviceDefault.NoActionBar              -- keeps
+//     the status bar, and (unlike the Black themes) styles it to match the
+//     device's actual default look rather than a hardcoded black bar --
+//     requested after real-device feedback that the status bar should
+//     "adapt to the system color" the way it does in ordinary apps.
+// None of the four is a memorized guess.
 pub const THEME_FULLSCREEN: u32 = 0x0103000a;
 pub const THEME_WITH_STATUS_BAR: u32 = 0x01030009;
+pub const THEME_SYSTEM_FULLSCREEN: u32 = 0x0103012a;
+pub const THEME_SYSTEM_WITH_STATUS_BAR: u32 = 0x01030129;
 
 /// Build the complete `dev.mlxlang.experiments.bluescreen` blue-screen
 /// manifest: a single `android.app.NativeActivity` activity backed by
 /// `main.so` (`android.app.lib_name` = "main"), MAIN/LAUNCHER intent filter.
-/// `fullscreen` toggles between the two themes above -- see main.zig's
-/// `fullscreen_enabled` for the actual switch.
-pub fn buildManifest(allocator: std.mem.Allocator, package: []const u8, fullscreen: bool) ![]u8 {
+/// `fullscreen` and `system_status_bar_color` each independently toggle
+/// between the four themes above -- see main.zig's `FULLSCREEN_ENABLED` and
+/// `SYSTEM_STATUS_BAR_COLOR_ENABLED` for the actual switches.
+pub fn buildManifest(allocator: std.mem.Allocator, package: []const u8, fullscreen: bool, system_status_bar_color: bool) ![]u8 {
     var pool = StringPool.init(allocator);
     defer pool.deinit();
 
@@ -272,12 +284,15 @@ pub fn buildManifest(allocator: std.mem.Allocator, package: []const u8, fullscre
     // table (see the derivation note above) — kept as a plain constant
     // here since re-deriving individual bit flags adds risk for no benefit.
     //
-    // theme: toggled via the `fullscreen` parameter between hiding the
-    // status bar entirely and keeping the normal system status bar visible
-    // -- added after real-device feedback that the fullscreen look wasn't
-    // actually wanted; see THEME_FULLSCREEN/THEME_WITH_STATUS_BAR above for
-    // both resource IDs' derivation.
-    const theme_id: u32 = if (fullscreen) THEME_FULLSCREEN else THEME_WITH_STATUS_BAR;
+    // theme: `fullscreen` toggles hiding the status bar entirely vs.
+    // keeping it visible; `system_status_bar_color` independently toggles
+    // between a hardcoded black bar and one styled to match the device's
+    // actual default look. Both added after real-device feedback -- see
+    // the four THEME_* constants above for each resource ID's derivation.
+    const theme_id: u32 = if (fullscreen)
+        (if (system_status_bar_color) THEME_SYSTEM_FULLSCREEN else THEME_FULLSCREEN)
+    else
+        (if (system_status_bar_color) THEME_SYSTEM_WITH_STATUS_BAR else THEME_WITH_STATUS_BAR);
     try writeStartElement(&body, &pool, .{ .name = "activity", .attrs = &[_]Attr{
         .{ .ns = true, .name = "theme", .value = .{ .reference = theme_id } },
         .{ .ns = true, .name = "label", .value = .{ .str = "Mlx Blue Screen" } },
@@ -379,7 +394,7 @@ pub fn buildManifest(allocator: std.mem.Allocator, package: []const u8, fullscre
 
 test "buildManifest produces a well-formed AXML root chunk" {
     const alloc = std.testing.allocator;
-    const bytes = try buildManifest(alloc, "dev.mlxlang.experiments.bluescreen", false);
+    const bytes = try buildManifest(alloc, "dev.mlxlang.experiments.bluescreen", false, true);
     defer alloc.free(bytes);
     try std.testing.expect(bytes.len > 64);
     const root_type = std.mem.readInt(u16, bytes[0..2], .little);

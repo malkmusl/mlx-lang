@@ -17,12 +17,20 @@ const SO_PATH = "lib/arm64-v8a/libmain.so";
 const MANIFEST_PATH = "AndroidManifest.xml";
 const DEX_PATH = "classes.dex";
 
-// Toggle: true hides the system status bar entirely (Theme.Black.
-// NoTitleBar.Fullscreen); false keeps the normal system status bar visible
-// (Theme.Black.NoTitleBar) with the blue fill underneath it, which is what
-// real-device testing showed was actually wanted -- see axml.zig's
-// THEME_FULLSCREEN/THEME_WITH_STATUS_BAR for both themes' resource IDs.
+// Toggle: true hides the system status bar entirely (a `*_FULLSCREEN`
+// theme); false keeps the normal system status bar visible (the blue fill
+// renders underneath it), which is what real-device testing showed was
+// actually wanted -- see axml.zig's THEME_* constants for all four themes'
+// resource IDs.
 const FULLSCREEN_ENABLED = false;
+
+// Toggle: true styles the status bar to match the device's actual default
+// look (`Theme.DeviceDefault.NoActionBar[.Fullscreen]`); false forces a
+// hardcoded black bar (`Theme.Black.NoTitleBar[.Fullscreen]`), which was
+// this experiment's original look before real-device feedback asked for
+// the status bar to "adapt to the system color" instead. Independent of
+// FULLSCREEN_ENABLED above -- the two combine into all four themes.
+const SYSTEM_STATUS_BAR_COLOR_ENABLED = true;
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -45,7 +53,7 @@ pub fn main() !void {
     try out.print("      {s}: {d} bytes\n", .{ SO_PATH, so_bytes.len });
 
     try out.print("[2/6] generating binary AndroidManifest.xml...\n", .{});
-    const manifest_bytes = try axml.buildManifest(allocator, package, FULLSCREEN_ENABLED);
+    const manifest_bytes = try axml.buildManifest(allocator, package, FULLSCREEN_ENABLED, SYSTEM_STATUS_BAR_COLOR_ENABLED);
     defer allocator.free(manifest_bytes);
     try out.print("      {s}: {d} bytes\n", .{ MANIFEST_PATH, manifest_bytes.len });
 
