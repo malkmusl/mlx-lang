@@ -224,10 +224,37 @@ Tested by installing the mlx-built `bluescreen.apk` on a real device
   `STR`/`LDR` pair, verified the same way as the previous fix by decoding
   the actual compiled `.text` bytes (`STR x30, [sp, #48]` / ...
   / `LDR x30, [sp, #48]` / `ADD sp, sp, #64` / `RET`).
+- **Third report, after both fixes above: still black.** No adb/computer
+  access was available, so diagnosis moved to phone-only evidence instead:
+  a raw view-hierarchy dump of the running activity's decor view (obtained
+  on-device, no adb). It showed the tree rooted at the standard
+  `DecorView`, but containing a full `ActionBarOverlayLayout` →
+  `ActionBarContainer` → `Toolbar` (with a title `TextView` and
+  `ActionMenuView`), themed `android:style/Theme.DeviceDefault.Light.
+  DarkActionBar` — i.e. the activity was running under the **device's
+  default themed window** (action bar and all), not a plain fullscreen
+  native window, because the manifest never set an explicit
+  `android:theme`. This is atypical for a native-activity/game-style app
+  (virtually every real one sets an explicit fullscreen/no-title theme)
+  and is a real, independent bug regardless of whether it's the sole
+  explanation for the black screen. Fixed by adding
+  `android:theme="@android:style/Theme.Black.NoTitleBar.Fullscreen"` to
+  the `<activity>` element in both `axml.zig` and `axml.mlx`. The
+  resource ID for `android:theme` (`0x01010000`) and the resolved
+  reference value for that theme (`0x0103000a`) were ground-truthed the
+  same way `configChanges`'s `0x4a0` was originally: compiled a minimal
+  reference manifest with that exact theme attribute through the real
+  `aapt` against `/usr/share/android-framework-res/framework-res.apk`
+  (present in this sandbox) and read the resolved IDs back from
+  `aapt dump xmltree`, rather than trusting memory for either number.
+  Verified the rebuilt manifest against both `aapt dump xmltree` and
+  `aapt2 dump xmltree` showing `android:theme(0x01010000)=@0x0103000a`
+  correctly, with the rest of the tree unchanged.
   Awaiting re-test on-device to confirm the fix; if the screen is still not
   blue after this, the next diagnostic step is `adb logcat` during launch
-  to see whether `onNativeWindowCreated`/`onNativeWindowRedrawNeeded` fire
-  at all and what `ANativeWindow_lock`/`_setBuffersGeometry` return.
+  (or another on-device view-hierarchy/window dump) to see whether
+  `onNativeWindowCreated`/`onNativeWindowRedrawNeeded` fire at all and
+  what `ANativeWindow_lock`/`_setBuffersGeometry` return.
 
 ## What's genuinely unverified
 

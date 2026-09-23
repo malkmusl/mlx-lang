@@ -53,6 +53,7 @@ const RES_XML_START_ELEMENT_TYPE: u16 = 0x0102;
 const RES_XML_END_ELEMENT_TYPE: u16 = 0x0103;
 const RES_XML_RESOURCE_MAP_TYPE: u16 = 0x0180;
 
+const TYPE_REFERENCE: u8 = 0x01;
 const TYPE_STRING: u8 = 0x03;
 const TYPE_INT_DEC: u8 = 0x10;
 const TYPE_INT_HEX: u8 = 0x11;
@@ -75,6 +76,13 @@ const ANDROID_ATTRS = [_]AndroidAttr{
     .{ .name = "name", .resid = 0x01010003 },
     .{ .name = "configChanges", .resid = 0x0101001f },
     .{ .name = "value", .resid = 0x01010024 },
+    // android:theme -- ground-truthed the same way configChanges's 0x4a0
+    // was: compiled a minimal reference manifest with android:theme="@android:
+    // style/Theme.Black.NoTitleBar.Fullscreen" through the real `aapt`
+    // against /usr/share/android-framework-res/framework-res.apk and read
+    // back `android:theme(0x01010000)=@0x0103000a` from `aapt dump xmltree`
+    // -- see the .reference attribute's use below.
+    .{ .name = "theme", .resid = 0x01010000 },
 };
 const ANDROID_NS_URI = "http://schemas.android.com/apk/res/android";
 
@@ -103,6 +111,7 @@ const AttrValue = union(enum) {
     int_dec: i32,
     int_hex: u32,
     boolean: bool,
+    reference: u32,
 };
 const Attr = struct { ns: bool, name: []const u8, value: AttrValue };
 
@@ -130,6 +139,10 @@ fn attrRecordBytes(pool: *StringPool, attr: Attr, out: *std.ArrayList(u8)) !void
         .boolean => |b| {
             dtype = TYPE_INT_BOOLEAN;
             data = if (b) 0xffffffff else 0;
+        },
+        .reference => |r| {
+            dtype = TYPE_REFERENCE;
+            data = r;
         },
     }
     try appendI32(out, ns_idx);
@@ -201,7 +214,7 @@ pub fn buildManifest(allocator: std.mem.Allocator, package: []const u8) ![]u8 {
     var pool = StringPool.init(allocator);
     defer pool.deinit();
 
-    // Reserve pool indices 0..8 for the resource-mapped android: attrs, in
+    // Reserve pool indices 0..9 for the resource-mapped android: attrs, in
     // first-use order, *before* anything else is interned — this is what
     // makes the resource map (which only covers a string-pool prefix) line
     // up with the right attribute names.
@@ -245,7 +258,17 @@ pub fn buildManifest(allocator: std.mem.Allocator, package: []const u8) ![]u8 {
     // 0x4a0 by the real aapt against the real framework attribute flag
     // table (see the derivation note above) — kept as a plain constant
     // here since re-deriving individual bit flags adds risk for no benefit.
+    //
+    // theme = @android:style/Theme.Black.NoTitleBar.Fullscreen (0x0103000a,
+    // ground-truthed the same way -- see ANDROID_ATTRS's comment above).
+    // Without an explicit theme the activity was inheriting the device's
+    // default themed window (an ActionBar/Toolbar-bearing theme, confirmed
+    // via a real-device view-hierarchy dump showing
+    // ActionBarOverlayLayout/Toolbar in the decor view), instead of a plain
+    // fullscreen native window -- found while diagnosing a real-device
+    // black-screen report.
     try writeStartElement(&body, &pool, .{ .name = "activity", .attrs = &[_]Attr{
+        .{ .ns = true, .name = "theme", .value = .{ .reference = 0x0103000a } },
         .{ .ns = true, .name = "label", .value = .{ .str = "Mlx Blue Screen" } },
         .{ .ns = true, .name = "name", .value = .{ .str = "android.app.NativeActivity" } },
         .{ .ns = true, .name = "configChanges", .value = .{ .int_hex = 0x4a0 } },
