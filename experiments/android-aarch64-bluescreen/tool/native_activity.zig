@@ -54,6 +54,8 @@ const a64 = @import("aarch64.zig");
 
 pub const CALLBACKS_STRUCT_SIZE: u64 = 128;
 pub const CB_OFFSET_ON_NATIVE_WINDOW_CREATED: u16 = 56;
+pub const CB_OFFSET_ON_NATIVE_WINDOW_RESIZED: u16 = 64;
+pub const CB_OFFSET_ON_NATIVE_WINDOW_REDRAW_NEEDED: u16 = 72;
 pub const ACTIVITY_OFFSET_CALLBACKS: u16 = 0;
 
 pub const BLUE_RGBA8888_LE: u32 = 0xFFFF0000;
@@ -90,7 +92,22 @@ pub fn buildText(
     const adrp_window_created_idx = out.items.len;
     try out.append(0); // placeholder ADRP x10, onNativeWindowCreated
     try out.append(0); // placeholder ADD  x10, x10, #lo12
+    // Register the same handler for onNativeWindowCreated, onNativeWindowResized,
+    // and onNativeWindowRedrawNeeded — all three share the identical
+    // (ANativeActivity*, ANativeWindow*) signature, and our handler already
+    // ignores the activity argument. A raw NativeActivity (no
+    // android_native_app_glue) can have its very first onNativeWindowCreated
+    // paint happen before the window is actually attached/composited and get
+    // silently discarded with no further redraw ever requested from us;
+    // registering onNativeWindowRedrawNeeded too (the system's explicit
+    // "please draw now, it's safe" signal) is the standard fix, matching what
+    // android_native_app_glue's own sample apps do by redrawing on more than
+    // just window-created. Found via real-device testing (blue fill silently
+    // not appearing on a Pixel 10 Pro / Android Canary build) — see the
+    // mlx-native port's identical fix and the README for the diagnosis.
     try out.append(a64.strX(10, 9, CB_OFFSET_ON_NATIVE_WINDOW_CREATED)); // g_callbacks.onNativeWindowCreated = x10
+    try out.append(a64.strX(10, 9, CB_OFFSET_ON_NATIVE_WINDOW_RESIZED)); // g_callbacks.onNativeWindowResized = x10
+    try out.append(a64.strX(10, 9, CB_OFFSET_ON_NATIVE_WINDOW_REDRAW_NEEDED)); // g_callbacks.onNativeWindowRedrawNeeded = x10
     try out.append(a64.strX(9, 0, ACTIVITY_OFFSET_CALLBACKS)); // activity->callbacks = &g_callbacks
     try out.append(a64.ret(a64.lr));
 

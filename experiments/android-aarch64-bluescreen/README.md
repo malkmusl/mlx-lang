@@ -171,20 +171,60 @@ backend; that larger step (an actual `backend/aarch64/` alongside
 future work, arguably better-informed now that this port has exercised the
 self-hosted compiler this hard and found what it doesn't handle yet.
 
+## Real-device test results
+
+Tested by installing the mlx-built `bluescreen.apk` on a real device
+(Google Pixel 10 Pro, Android Canary build 2608):
+
+- **The APK installs and `android.app.NativeActivity` launches without
+  crashing.** This is a strong positive signal for everything upstream of
+  rendering: the v1 (JAR) signature is accepted, the binary
+  `AndroidManifest.xml` parses correctly (`android.app.lib_name`, the
+  `hasCode="false"` / native-only activity setup, the MAIN/LAUNCHER intent
+  filter), the empty `classes.dex` is valid enough for a code-free app, and
+  the hand-written ELF64 `.so` loads and dynamic-links cleanly under
+  Bionic (`ANativeActivity_onCreate` is found via the hand-rolled
+  `.dynsym`/`.hash` and called; the three `ANativeWindow_*` imports resolve
+  through the `R_AARCH64_GLOB_DAT` relocations in `.rela.dyn`).
+- **First report: the window stayed black instead of turning blue.** No
+  crash, no ANR — just no paint. Root cause: the handler was registered
+  only for `onNativeWindowCreated`. A raw `ANativeActivity` (bypassing
+  `android_native_app_glue`) can have that very first paint happen before
+  the window is actually attached/composited by SurfaceFlinger, get
+  silently discarded, and never receive another draw request — which is
+  exactly why `android_native_app_glue`'s own sample apps redraw on more
+  than a single lifecycle event instead of painting once. Fixed in both
+  `tool/native_activity.zig` and `mlx/native_activity.mlx` by registering
+  the *same* handler for `onNativeWindowResized` (+64) and
+  `onNativeWindowRedrawNeeded` (+72) as well as `onNativeWindowCreated`
+  (+56) — all three callbacks share the identical
+  `(ANativeActivity*, ANativeWindow*)` signature, and the handler already
+  ignores the activity argument, so no new logic was needed, only two more
+  `STR` stores into `g_callbacks` in `ANativeActivity_onCreate`'s prologue.
+  Verified by decoding the rebuilt `libmain.so`'s `.text` bytes directly
+  (not just re-running the external-tool suite) to confirm the three
+  stores land at the correct offsets with the correct handler address.
+  Awaiting re-test on-device to confirm the fix; if the screen is still not
+  blue after this, the next diagnostic step is `adb logcat` during launch
+  to see whether `onNativeWindowCreated`/`onNativeWindowRedrawNeeded` fire
+  at all and what `ANativeWindow_lock`/`_setBuffersGeometry` return.
+
 ## What's genuinely unverified
 
-This environment has no Android emulator or device, so the one thing that
-has **not** been confirmed is the thing the experiment is ultimately for:
-whether the app actually shows a blue screen when it runs. Specifically:
+Beyond the real-device result above (which confirms the pipeline up through
+native library load, and now — pending re-test — the paint path), the
+following remain unconfirmed or noteworthy:
 
 - **The `ANativeActivity`/`ANativeWindow` ABI** (`native_activity.zig`'s
   doc comment) was transcribed from memory, not compiled against real NDK
   headers (none are available in this sandbox). Struct field offsets and
   function signatures are believed correct — the NDK guarantees ABI
-  stability here — but this is the single highest-risk assumption in the
-  whole pipeline and should be the first thing checked against real
-  `android/native_activity.h`/`android/native_window.h` before trusting
-  this further.
+  stability here, and the real-device test above already confirms
+  `ANativeActivity_onCreate`'s signature and the `callbacks` field offset
+  are right, since onCreate runs without crashing — but the window-buffer
+  fill path (`ANativeWindow_Buffer`, `ANativeWindow_lock`/
+  `_setBuffersGeometry`/`_unlockAndPost`) is still only indirectly
+  exercised pending confirmation that the blue fill now shows up.
 - **APK Signature Scheme v1 (JAR signing) only.** No v2/v3 signing block.
   This is why `minSdkVersion`/`targetSdkVersion` are kept at 21/29 in
   `axml.zig` — v1-only APKs are accepted at those levels. Devices/policies
