@@ -122,8 +122,22 @@ pub fn buildText(
     }
 
     // ── onNativeWindowCreated(x0=activity, x1=window) ──
-    // Stack frame: [0..47] = ANativeWindow_Buffer, [56..63] = saved window ptr.
+    // Stack frame: [0..47] = ANativeWindow_Buffer, [48..55] = saved LR,
+    // [56..63] = saved window ptr.
+    //
+    // This function is NOT a leaf: it calls ANativeWindow_setBuffersGeometry/
+    // _lock/_unlockAndPost via BLR, and BLR overwrites LR (x30) with the
+    // return address *within this function* on every call. Per AAPCS64, a
+    // non-leaf function must save its incoming LR before making any call and
+    // restore it before its own `ret` -- otherwise the final `ret` uses
+    // whatever the *last* BLR left in LR (pointing back into this function's
+    // own body, not to our caller), so control never actually returns to the
+    // Android framework. Missing this was the real cause of a real-device
+    // black screen (the buffer was filled and posted, but the handler never
+    // returned cleanly afterward) even after the onNativeWindowCreated-only
+    // registration bug was fixed.
     try out.append(a64.subImm64(a64.sp, a64.sp, 64));
+    try out.append(a64.strX(a64.lr, a64.sp, 48)); // save LR
     try out.append(a64.strX(1, a64.sp, 56)); // save window
 
     // ANativeWindow_setBuffersGeometry(window, 0, 0, RGBA_8888)
@@ -170,6 +184,7 @@ pub fn buildText(
     const epilogue = out.items.len;
     out.items[cbnz_lock_failed_idx] = a64.cbnzW(0, @as(i32, @intCast(epilogue)) * 4 - @as(i32, @intCast(cbnz_lock_failed_idx)) * 4);
 
+    try out.append(a64.ldrX(a64.lr, a64.sp, 48)); // restore LR (both the lock-failed and normal paths land here)
     try out.append(a64.addImm64(a64.sp, a64.sp, 64));
     try out.append(a64.ret(a64.lr));
 

@@ -204,6 +204,26 @@ Tested by installing the mlx-built `bluescreen.apk` on a real device
   Verified by decoding the rebuilt `libmain.so`'s `.text` bytes directly
   (not just re-running the external-tool suite) to confirm the three
   stores land at the correct offsets with the correct handler address.
+- **Second report, after the fix above: still black.** This pointed at a
+  second, more fundamental bug: the window-paint handler calls
+  `ANativeWindow_setBuffersGeometry`/`_lock`/`_unlockAndPost` via `BLR`, and
+  `BLR` overwrites `LR` (`x30`) with the return address *within the calling
+  function* on every call — but the handler never saved its own incoming
+  `LR` first. By the time it reached its own `ret`, `LR` held the address
+  after the *last* `BLR` (pointing back into the handler's own body, not to
+  whoever called it), so the handler never returned control to the Android
+  framework at all — most likely hanging or corrupting its own stack right
+  after posting the frame, rather than actually failing to draw. This is a
+  plain AAPCS64 calling-convention violation (any non-leaf function must
+  preserve its incoming `LR` across calls it makes) that both
+  `native_activity.zig` and `native_activity.mlx` had from the start; the
+  `onNativeWindowCreated`-only registration bug fixed above was real but
+  evidently not the whole story. Fixed by saving `LR` to the stack frame
+  (`[sp, #48]`, reusing padding that was already there) right after the
+  frame is allocated, and restoring it right before the final `ret` — one
+  `STR`/`LDR` pair, verified the same way as the previous fix by decoding
+  the actual compiled `.text` bytes (`STR x30, [sp, #48]` / ...
+  / `LDR x30, [sp, #48]` / `ADD sp, sp, #64` / `RET`).
   Awaiting re-test on-device to confirm the fix; if the screen is still not
   blue after this, the next diagnostic step is `adb logcat` during launch
   to see whether `onNativeWindowCreated`/`onNativeWindowRedrawNeeded` fire
