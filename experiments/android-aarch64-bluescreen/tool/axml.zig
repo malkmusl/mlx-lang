@@ -77,11 +77,11 @@ const ANDROID_ATTRS = [_]AndroidAttr{
     .{ .name = "configChanges", .resid = 0x0101001f },
     .{ .name = "value", .resid = 0x01010024 },
     // android:theme -- ground-truthed the same way configChanges's 0x4a0
-    // was: compiled a minimal reference manifest with android:theme="@android:
-    // style/Theme.Black.NoTitleBar.Fullscreen" through the real `aapt`
-    // against /usr/share/android-framework-res/framework-res.apk and read
-    // back `android:theme(0x01010000)=@0x0103000a` from `aapt dump xmltree`
-    // -- see the .reference attribute's use below.
+    // was: compiled a minimal reference manifest with an explicit
+    // android:theme through the real `aapt` against
+    // /usr/share/android-framework-res/framework-res.apk and read back
+    // the resolved attribute ID from `aapt dump xmltree` -- see the
+    // .reference attribute's use below for the resolved theme value.
     .{ .name = "theme", .resid = 0x01010000 },
 };
 const ANDROID_NS_URI = "http://schemas.android.com/apk/res/android";
@@ -259,16 +259,23 @@ pub fn buildManifest(allocator: std.mem.Allocator, package: []const u8) ![]u8 {
     // table (see the derivation note above) — kept as a plain constant
     // here since re-deriving individual bit flags adds risk for no benefit.
     //
-    // theme = @android:style/Theme.Black.NoTitleBar.Fullscreen (0x0103000a,
+    // theme = @android:style/Theme.Light.NoTitleBar.Fullscreen (0x0103000e,
     // ground-truthed the same way -- see ANDROID_ATTRS's comment above).
-    // Without an explicit theme the activity was inheriting the device's
-    // default themed window (an ActionBar/Toolbar-bearing theme, confirmed
-    // via a real-device view-hierarchy dump showing
-    // ActionBarOverlayLayout/Toolbar in the decor view), instead of a plain
-    // fullscreen native window -- found while diagnosing a real-device
-    // black-screen report.
+    // Deliberately the *Light* (not Black) fullscreen/no-title variant right
+    // now: after fixing an earlier missing-theme bug (confirmed via a
+    // real-device view-hierarchy dump showing an ActionBar/Toolbar in the
+    // decor view -- now gone, the window is properly fullscreen), the
+    // screen is still black on-device with no way to get logcat. Black is
+    // also Theme.Black's own default window background, so a still-black
+    // result is ambiguous between "the native blue fill is failing" and
+    // "it was never a fill problem, the theme's own bg was showing all
+    // along". Using the Light variant's non-black default background turns
+    // the next on-device screenshot into a real diagnostic: still non-blue
+    // (now some light color) narrows it back to the native fill/present
+    // path; blue confirms the opposite. Swap back to Black once the fill
+    // path is confirmed working.
     try writeStartElement(&body, &pool, .{ .name = "activity", .attrs = &[_]Attr{
-        .{ .ns = true, .name = "theme", .value = .{ .reference = 0x0103000a } },
+        .{ .ns = true, .name = "theme", .value = .{ .reference = 0x0103000e } },
         .{ .ns = true, .name = "label", .value = .{ .str = "Mlx Blue Screen" } },
         .{ .ns = true, .name = "name", .value = .{ .str = "android.app.NativeActivity" } },
         .{ .ns = true, .name = "configChanges", .value = .{ .int_hex = 0x4a0 } },
