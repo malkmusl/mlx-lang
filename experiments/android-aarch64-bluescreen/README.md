@@ -250,11 +250,40 @@ Tested by installing the mlx-built `bluescreen.apk` on a real device
   Verified the rebuilt manifest against both `aapt dump xmltree` and
   `aapt2 dump xmltree` showing `android:theme(0x01010000)=@0x0103000a`
   correctly, with the rest of the tree unchanged.
-  Awaiting re-test on-device to confirm the fix; if the screen is still not
-  blue after this, the next diagnostic step is `adb logcat` during launch
-  (or another on-device view-hierarchy/window dump) to see whether
-  `onNativeWindowCreated`/`onNativeWindowRedrawNeeded` fire at all and
-  what `ANativeWindow_lock`/`_setBuffersGeometry` return.
+- **Fourth report: fullscreen now, but still black on both a black-
+  background theme and a light-background theme.** This is the single most
+  informative result so far. `Theme.Black.NoTitleBar.Fullscreen`'s own
+  default window background is black, so a black result under it was
+  ambiguous -- it could mean the native fill was failing, or it could mean
+  the fill was irrelevant because the theme's own black background was
+  always what was showing. Swapping to `Theme.Light.NoTitleBar.Fullscreen`
+  (0x0103000e, ground-truthed the same way) and seeing the *same* solid
+  black ruled that out: a `SurfaceView`/`NativeContentView` shows solid
+  black by default *before any buffer has ever been posted to it*,
+  independent of the window's own theme/background, which is compositied
+  underneath it. So this result specifically means: no buffer is reaching
+  the screen -- either the window-created callback is never firing, or
+  `ANativeWindow_lock`/`_setBuffersGeometry`/`_unlockAndPost` are failing
+  every time.
+
+  With no adb/logcat access at all, the fix turned into a diagnostic:
+  removed the `ANativeWindow_setBuffersGeometry(window, 0, 0, RGBA_8888)`
+  call entirely (ruling it out as a variable -- `ANativeWindow_lock` now
+  uses the window's current/default size and format), and added explicit
+  checks on `ANativeWindow_lock`'s and `ANativeWindow_unlockAndPost`'s
+  return values that deliberately execute `udf #0` (a permanently
+  undefined instruction, guaranteed `SIGILL`) at two distinct, known
+  addresses on failure -- added as a new `udf` encoder in both
+  `aarch64.zig`/`aarch64.mlx`. If this build is still black with no crash,
+  that means the handler is never being invoked at all (a different bug
+  than previously suspected). If it crashes, the crash's faulting PC
+  (from a tombstone, or the same kind of on-device dump used for the
+  theme diagnosis) pinpoints exactly which call failed, since the two
+  `udf`s sit at distinct, known offsets in `.text`. If it turns blue,
+  `setBuffersGeometry(0, 0, ...)` itself was the actual problem all along.
+  Verified by decoding the rebuilt `.text` bytes directly to confirm both
+  `cbnz` checks branch to their correct, distinct trap addresses.
+  Awaiting this round's real-device result.
 
 ## What's genuinely unverified
 

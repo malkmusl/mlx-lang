@@ -205,6 +205,22 @@ pub fn ret(rn: Reg) u32 {
 pub const lr: Reg = 30;
 
 /// ─────────────────────────────────────────────────────────────────────────
+///  UDF — permanently undefined instruction, always raises SIGILL
+///
+///   31-16              15-0
+///   0000000000000000   imm16
+///
+/// Used purely as a deliberate, distinctly-located debugging trap (not part
+/// of the intended program logic): a `udf #0` at a known, unique address
+/// lets a real-device crash tombstone's faulting PC be matched back to
+/// exactly which call site failed, when there is no adb/logcat access to
+/// find that out any other way.
+/// ─────────────────────────────────────────────────────────────────────────
+pub fn udf(imm16: u16) u32 {
+    return imm16;
+}
+
+/// ─────────────────────────────────────────────────────────────────────────
 ///  MOV (register) — alias of ORR Xd, XZR, Xm  (Logical, shifted register)
 ///
 ///  31  30-29  28-24    23-22  21  20-16  15-10  9-5   4-0

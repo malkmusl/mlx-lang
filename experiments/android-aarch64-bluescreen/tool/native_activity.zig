@@ -140,20 +140,24 @@ pub fn buildText(
     try out.append(a64.strX(a64.lr, a64.sp, 48)); // save LR
     try out.append(a64.strX(1, a64.sp, 56)); // save window
 
-    // ANativeWindow_setBuffersGeometry(window, 0, 0, RGBA_8888)
-    try out.append(a64.movReg64(0, 1)); // x0 = window
-    try out.append(a64.movz32(1, 0, 0)); // w1 = 0 (width: keep current)
-    try out.append(a64.movz32(2, 0, 0)); // w2 = 0 (height: keep current)
-    try out.append(a64.movz32(3, @intCast(WINDOW_FORMAT_RGBA_8888), 0)); // w3 = format
-    try emitGotCall(&out, text_vaddr, 9, got.set_buffers_geometry);
-
-    // ANativeWindow_lock(window, &buffer, NULL)
+    // ANativeWindow_lock(window, &buffer, NULL) -- deliberately no
+    // ANativeWindow_setBuffersGeometry(window, 0, 0, RGBA_8888) call before
+    // this (there used to be one): after fixing the callback-registration
+    // and LR-preservation bugs, a real device still showed solid black
+    // (confirmed independent of the window's theme/background -- a
+    // SurfaceView shows black by default until a buffer is actually
+    // posted, so this points at the lock/fill/post path itself). With no
+    // adb/logcat access to see setBuffersGeometry's or lock's return codes
+    // directly, this removes setBuffersGeometry as a variable (lock will
+    // use the window's current/default size and format instead) and adds
+    // explicit failure traps below so a crash report -- if lock or
+    // unlockAndPost do fail -- pinpoints which one via its distinct PC.
     try out.append(a64.ldrX(0, a64.sp, 56)); // x0 = window
     try out.append(a64.addImm64(1, a64.sp, 0)); // x1 = &buffer
     try out.append(a64.movReg64(2, a64.xzr)); // x2 = NULL
     try emitGotCall(&out, text_vaddr, 9, got.lock);
 
-    // if (result != 0) goto epilogue;  (forward branch, patched below)
+    // if (result != 0) goto trap_lock_failed;  (forward branch, patched below)
     const cbnz_lock_failed_idx = out.items.len;
     try out.append(0);
 
@@ -181,12 +185,22 @@ pub fn buildText(
     try out.append(a64.ldrX(0, a64.sp, 56)); // x0 = window
     try emitGotCall(&out, text_vaddr, 9, got.unlock_and_post);
 
-    const epilogue = out.items.len;
-    out.items[cbnz_lock_failed_idx] = a64.cbnzW(0, @as(i32, @intCast(epilogue)) * 4 - @as(i32, @intCast(cbnz_lock_failed_idx)) * 4);
+    // if (result != 0) goto trap_post_failed;  (forward branch, patched below)
+    const cbnz_post_failed_idx = out.items.len;
+    try out.append(0);
 
-    try out.append(a64.ldrX(a64.lr, a64.sp, 48)); // restore LR (both the lock-failed and normal paths land here)
+    const epilogue = out.items.len;
+    try out.append(a64.ldrX(a64.lr, a64.sp, 48)); // restore LR (only the success path reaches here)
     try out.append(a64.addImm64(a64.sp, a64.sp, 64));
     try out.append(a64.ret(a64.lr));
+
+    const trap_lock_failed = out.items.len;
+    try out.append(a64.udf(0));
+    out.items[cbnz_lock_failed_idx] = a64.cbnzW(0, @as(i32, @intCast(trap_lock_failed)) * 4 - @as(i32, @intCast(cbnz_lock_failed_idx)) * 4);
+
+    const trap_post_failed = out.items.len;
+    try out.append(a64.udf(0));
+    out.items[cbnz_post_failed_idx] = a64.cbnzW(0, @as(i32, @intCast(trap_post_failed)) * 4 - @as(i32, @intCast(cbnz_post_failed_idx)) * 4);
 
     return out;
 }
