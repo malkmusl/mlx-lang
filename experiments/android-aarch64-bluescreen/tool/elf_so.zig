@@ -163,8 +163,16 @@ fn alignUp(x: u64, a: u64) u64 {
     return (x + a - 1) & ~(a - 1);
 }
 
-/// Build the complete `libmain.so` file bytes.
-pub fn build(allocator: std.mem.Allocator, soname: []const u8, needed: []const u8) ![]u8 {
+/// Build the complete `libmain.so` file bytes. `needed`/`needed2` become two
+/// separate `DT_NEEDED` entries -- `libandroid.so` (every NDK/`libandroid`
+/// import already used) and, as of this round, `libc.so` (for `malloc`,
+/// needed by onSaveInstanceState's real, documented contract -- see
+/// native_activity.zig's comment on it). A symbol's `.rela.dyn`/`.dynsym`
+/// entry never has to say *which* of the two it resolves against: Bionic's
+/// dynamic linker searches every `DT_NEEDED` dependency (in order) for each
+/// undefined symbol, exactly how the existing single-library case already
+/// works.
+pub fn build(allocator: std.mem.Allocator, soname: []const u8, needed: []const u8, needed2: []const u8) ![]u8 {
     // ── .dynstr ─────────────────────────────────────────────────────────
     var dynstr = std.ArrayList(u8).init(allocator);
     defer dynstr.deinit();
@@ -194,12 +202,23 @@ pub fn build(allocator: std.mem.Allocator, soname: []const u8, needed: []const u
     // event's type/action instead of just finishing it unread.
     const name_input_event_get_type = try Str.add(&dynstr, "AInputEvent_getType");
     const name_motion_event_get_action = try Str.add(&dynstr, "AMotionEvent_getAction");
+    // Also part of libandroid.so, added to fix real-device feedback that
+    // combining rotation with touch input broke: onInputQueueDestroyed
+    // (native_activity.zig) must detach the old, about-to-be-destroyed
+    // input queue from its looper.
+    const name_input_queue_detach_looper = try Str.add(&dynstr, "AInputQueue_detachLooper");
+    // libc.so, not libandroid.so -- this project's first import from it
+    // (hence the second DT_NEEDED, see build()'s own comment). Backs
+    // onSaveInstanceState's real, documented contract: the buffer it
+    // returns must be malloc'd, since the framework frees it with free().
+    const name_malloc = try Str.add(&dynstr, "malloc");
     const name_on_create = try Str.add(&dynstr, "ANativeActivity_onCreate");
     const name_needed = try Str.add(&dynstr, needed);
+    const name_needed2 = try Str.add(&dynstr, needed2);
     const name_soname = try Str.add(&dynstr, soname);
 
     // ── layout inside the RO segment ───────────────────────────────────
-    const dynsym_count = 11; // null + 9 imports + 1 export
+    const dynsym_count = 13; // null + 11 imports + 1 export
     const dynsym_off = RO_VADDR;
     const dynsym_size: u64 = dynsym_count * @sizeOf(Elf64Sym);
 
@@ -212,14 +231,14 @@ pub fn build(allocator: std.mem.Allocator, soname: []const u8, needed: []const u
     const hash_size: u64 = (2 + nbucket + nchain) * 4;
 
     const rela_off = alignUp(hash_off + hash_size, 8);
-    const rela_count = 9; // one GLOB_DAT per imported function
+    const rela_count = 11; // one GLOB_DAT per imported function
     const rela_size: u64 = rela_count * @sizeOf(Elf64Rela);
 
     const ro_end = rela_off + rela_size;
     std.debug.assert(ro_end <= TEXT_VADDR); // must fit in one page
 
     // ── .text (two-pass: discover size, then re-emit with final vaddrs) ──
-    const got_vaddr = RW_VADDR + 176; // 176 = 11 Elf64Dyn entries * 16 bytes, see below
+    const got_vaddr = RW_VADDR + 192; // 192 = 12 Elf64Dyn entries * 16 bytes, see below
     const got = na.GotLayout{
         .set_buffers_geometry = got_vaddr,
         .lock = got_vaddr + 8,
@@ -230,8 +249,10 @@ pub fn build(allocator: std.mem.Allocator, soname: []const u8, needed: []const u
         .input_queue_finish_event = got_vaddr + 48,
         .input_event_get_type = got_vaddr + 56,
         .motion_event_get_action = got_vaddr + 64,
+        .input_queue_detach_looper = got_vaddr + 72,
+        .malloc = got_vaddr + 80,
     };
-    const got_size: u64 = 72; // 9 GOT slots * 8 bytes
+    const got_size: u64 = 88; // 11 GOT slots * 8 bytes
     // `.data`: this experiment's own small, writable app-state block --
     // g_currentColor/g_colorIndex/g_window/g_activity, all written and read
     // only by our own code (never by the dynamic linker, unlike `.got`
@@ -250,7 +271,7 @@ pub fn build(allocator: std.mem.Allocator, soname: []const u8, needed: []const u
 
     // ── layout inside the RW segment ───────────────────────────────────
     const dynamic_off = RW_VADDR;
-    const dynamic_count = 11;
+    const dynamic_count = 12; // 2 DT_NEEDED (libandroid.so, libc.so) + 9 others + DT_NULL
     const dynamic_size: u64 = dynamic_count * @sizeOf(Elf64Dyn);
     std.debug.assert(RW_VADDR + dynamic_size == got_vaddr);
     const got_off = got_vaddr;
@@ -270,7 +291,9 @@ pub fn build(allocator: std.mem.Allocator, soname: []const u8, needed: []const u
     dynsym[7] = .{ .st_name = name_input_queue_finish_event, .st_info = elfSymInfo(STB_GLOBAL, STT_FUNC), .st_other = 0, .st_shndx = SHN_UNDEF, .st_value = 0, .st_size = 0 };
     dynsym[8] = .{ .st_name = name_input_event_get_type, .st_info = elfSymInfo(STB_GLOBAL, STT_FUNC), .st_other = 0, .st_shndx = SHN_UNDEF, .st_value = 0, .st_size = 0 };
     dynsym[9] = .{ .st_name = name_motion_event_get_action, .st_info = elfSymInfo(STB_GLOBAL, STT_FUNC), .st_other = 0, .st_shndx = SHN_UNDEF, .st_value = 0, .st_size = 0 };
-    dynsym[10] = .{ .st_name = name_on_create, .st_info = elfSymInfo(STB_GLOBAL, STT_FUNC), .st_other = 0, .st_shndx = 6, .st_value = TEXT_VADDR, .st_size = text_size };
+    dynsym[10] = .{ .st_name = name_input_queue_detach_looper, .st_info = elfSymInfo(STB_GLOBAL, STT_FUNC), .st_other = 0, .st_shndx = SHN_UNDEF, .st_value = 0, .st_size = 0 };
+    dynsym[11] = .{ .st_name = name_malloc, .st_info = elfSymInfo(STB_GLOBAL, STT_FUNC), .st_other = 0, .st_shndx = SHN_UNDEF, .st_value = 0, .st_size = 0 };
+    dynsym[12] = .{ .st_name = name_on_create, .st_info = elfSymInfo(STB_GLOBAL, STT_FUNC), .st_other = 0, .st_shndx = 6, .st_value = TEXT_VADDR, .st_size = text_size };
 
     // ── .hash (single bucket — O(n) lookup, fine for a handful of symbols) ──
     var hash_words = try std.ArrayList(u32).initCapacity(allocator, 2 + nbucket + nchain);
@@ -288,7 +311,9 @@ pub fn build(allocator: std.mem.Allocator, soname: []const u8, needed: []const u
     try hash_words.append(8); // chain[7] -> 8
     try hash_words.append(9); // chain[8] -> 9
     try hash_words.append(10); // chain[9] -> 10
-    try hash_words.append(0); // chain[10] -> end
+    try hash_words.append(11); // chain[10] -> 11
+    try hash_words.append(12); // chain[11] -> 12
+    try hash_words.append(0); // chain[12] -> end
     std.debug.assert(hash_words.items.len == 2 + nbucket + nchain);
     // (elfHash is kept/exercised via the unit test below; a single-bucket
     // table doesn't need real hash values, only *a* consistent function.)
@@ -305,20 +330,23 @@ pub fn build(allocator: std.mem.Allocator, soname: []const u8, needed: []const u
     relas[6] = .{ .r_offset = got.input_queue_finish_event, .r_info = (@as(u64, 7) << 32) | R_AARCH64_GLOB_DAT, .r_addend = 0 };
     relas[7] = .{ .r_offset = got.input_event_get_type, .r_info = (@as(u64, 8) << 32) | R_AARCH64_GLOB_DAT, .r_addend = 0 };
     relas[8] = .{ .r_offset = got.motion_event_get_action, .r_info = (@as(u64, 9) << 32) | R_AARCH64_GLOB_DAT, .r_addend = 0 };
+    relas[9] = .{ .r_offset = got.input_queue_detach_looper, .r_info = (@as(u64, 10) << 32) | R_AARCH64_GLOB_DAT, .r_addend = 0 };
+    relas[10] = .{ .r_offset = got.malloc, .r_info = (@as(u64, 11) << 32) | R_AARCH64_GLOB_DAT, .r_addend = 0 };
 
     // ── .dynamic ───────────────────────────────────────────────────────
     var dyn: [dynamic_count]Elf64Dyn = undefined;
     dyn[0] = .{ .d_tag = DT_NEEDED, .d_val = name_needed };
-    dyn[1] = .{ .d_tag = DT_SONAME, .d_val = name_soname };
-    dyn[2] = .{ .d_tag = DT_HASH, .d_val = hash_off };
-    dyn[3] = .{ .d_tag = DT_STRTAB, .d_val = dynstr_off };
-    dyn[4] = .{ .d_tag = DT_SYMTAB, .d_val = dynsym_off };
-    dyn[5] = .{ .d_tag = DT_STRSZ, .d_val = dynstr_size };
-    dyn[6] = .{ .d_tag = DT_SYMENT, .d_val = @sizeOf(Elf64Sym) };
-    dyn[7] = .{ .d_tag = DT_RELA, .d_val = rela_off };
-    dyn[8] = .{ .d_tag = DT_RELASZ, .d_val = rela_size };
-    dyn[9] = .{ .d_tag = DT_RELAENT, .d_val = @sizeOf(Elf64Rela) };
-    dyn[10] = .{ .d_tag = DT_NULL, .d_val = 0 };
+    dyn[1] = .{ .d_tag = DT_NEEDED, .d_val = name_needed2 };
+    dyn[2] = .{ .d_tag = DT_SONAME, .d_val = name_soname };
+    dyn[3] = .{ .d_tag = DT_HASH, .d_val = hash_off };
+    dyn[4] = .{ .d_tag = DT_STRTAB, .d_val = dynstr_off };
+    dyn[5] = .{ .d_tag = DT_SYMTAB, .d_val = dynsym_off };
+    dyn[6] = .{ .d_tag = DT_STRSZ, .d_val = dynstr_size };
+    dyn[7] = .{ .d_tag = DT_SYMENT, .d_val = @sizeOf(Elf64Sym) };
+    dyn[8] = .{ .d_tag = DT_RELA, .d_val = rela_off };
+    dyn[9] = .{ .d_tag = DT_RELASZ, .d_val = rela_size };
+    dyn[10] = .{ .d_tag = DT_RELAENT, .d_val = @sizeOf(Elf64Rela) };
+    dyn[11] = .{ .d_tag = DT_NULL, .d_val = 0 };
 
     // ── section header string table (tooling only) ───────────────────────
     var shstrtab = std.ArrayList(u8).init(allocator);
@@ -418,7 +446,7 @@ test "elf_hash matches an independent reference implementation" {
 
 test "build produces a well-formed ELF64 DYN aarch64 image" {
     const alloc = std.testing.allocator;
-    const bytes = try build(alloc, "libmain.so", "libandroid.so");
+    const bytes = try build(alloc, "libmain.so", "libandroid.so", "libc.so");
     defer alloc.free(bytes);
     try std.testing.expect(bytes.len > @sizeOf(Elf64Ehdr));
     try std.testing.expectEqualSlices(u8, "\x7fELF", bytes[0..4]);

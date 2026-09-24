@@ -48,7 +48,7 @@ pub fn main() !void {
     try out.print("mlx android-aarch64-bluescreen experiment — building {s} (package {s})\n", .{ out_path, package });
 
     try out.print("[1/6] generating AArch64 machine code + ELF64 shared object...\n", .{});
-    const so_bytes = try elf_so.build(allocator, "libmain.so", "libandroid.so");
+    const so_bytes = try elf_so.build(allocator, "libmain.so", "libandroid.so", "libc.so");
     defer allocator.free(so_bytes);
     try out.print("      {s}: {d} bytes\n", .{ SO_PATH, so_bytes.len });
 

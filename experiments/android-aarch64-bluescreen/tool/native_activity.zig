@@ -57,10 +57,12 @@
 const std = @import("std");
 const a64 = @import("aarch64.zig");
 
+pub const CB_OFFSET_ON_SAVE_INSTANCE_STATE: u16 = 16;
 pub const CB_OFFSET_ON_NATIVE_WINDOW_CREATED: u16 = 56;
 pub const CB_OFFSET_ON_NATIVE_WINDOW_RESIZED: u16 = 64;
 pub const CB_OFFSET_ON_NATIVE_WINDOW_REDRAW_NEEDED: u16 = 72;
 pub const CB_OFFSET_ON_INPUT_QUEUE_CREATED: u16 = 88;
+pub const CB_OFFSET_ON_INPUT_QUEUE_DESTROYED: u16 = 96;
 pub const ACTIVITY_OFFSET_CALLBACKS: u16 = 0;
 /// `struct ANativeActivity { void* callbacks; JavaVM* vm; JNIEnv* env;
 /// jobject clazz; ... }` (android/native_activity.h) -- needed now that
@@ -148,6 +150,8 @@ pub const GotLayout = struct {
     input_queue_finish_event: u64,
     input_event_get_type: u64,
     motion_event_get_action: u64,
+    input_queue_detach_looper: u64,
+    malloc: u64,
 };
 
 /// Build the full .text machine code: `ANativeActivity_onCreate` immediately
@@ -194,25 +198,73 @@ pub fn buildText(
     try out.append(a64.subImm64(a64.sp, a64.sp, 16));
     try out.append(a64.strX(a64.lr, a64.sp, 0)); // save LR
 
-    // Cache `activity` itself and set the initial fill color into this
-    // experiment's small `.data` block (see elf_so.zig's `data_vaddr`):
-    // g_activity lets fixDisplayCutoutMode (called at the end of this
-    // function) and a later touch event (drainInputEvents) reach the JNI
-    // env/clazz and repaint without either being threaded through as an
-    // extra parameter; g_currentColor/g_colorIndex back the
-    // touch-to-cycle-colors feature -- the paint handler below now reads
-    // its fill color from g_currentColor instead of a hardcoded immediate.
+    // Cache `activity` itself into this experiment's small `.data` block
+    // (see elf_so.zig's `data_vaddr`): g_activity lets fixDisplayCutoutMode
+    // (called at the end of this function) and a later touch event
+    // (drainInputEvents) reach the JNI env/clazz and repaint without
+    // either being threaded through as an extra parameter.
     try emitAdrpAdd(&out, text_vaddr, 10, data_vaddr + DATA_OFFSET_ACTIVITY);
     try out.append(a64.strX(0, 10, 0)); // g_activity = activity (x0, untouched so far)
-    try emitAdrpAdd(&out, text_vaddr, 10, data_vaddr + DATA_OFFSET_CURRENT_COLOR);
-    try out.append(a64.movz32(11, @truncate(BLUE_RGBA8888_LE), 0));
-    try out.append(a64.movk32(11, @truncate(BLUE_RGBA8888_LE >> 16), 1));
-    try out.append(a64.strW(11, 10, 0)); // g_currentColor = blue (initial)
-    try emitAdrpAdd(&out, text_vaddr, 10, data_vaddr + DATA_OFFSET_COLOR_INDEX);
-    try out.append(a64.movz32(11, 0, 0));
-    try out.append(a64.strW(11, 10, 0)); // g_colorIndex = 0
 
-    try out.append(a64.ldrX(9, 0, ACTIVITY_OFFSET_CALLBACKS)); // x9 = activity->callbacks (framework-owned, already valid -- do not overwrite this pointer)
+    // Restore g_colorIndex/g_currentColor across a rotation instead of
+    // always resetting to blue -- real-device feedback that a rotation
+    // (which, per axml.zig's configChanges comment, now goes through a
+    // full destroy-and-recreate of this activity, not an in-place resize)
+    // was silently discarding whatever color a touch had already picked.
+    // `saved_state`/`saved_state_size` (x1/x2, both still exactly as
+    // handed to us -- unused until now) are Android's own standard
+    // mechanism for this: `onSaveInstanceState` below hands the framework
+    // a small malloc'd buffer before the old instance is destroyed, and
+    // the framework passes that same buffer straight back here as
+    // (savedState, savedStateSize) on the new instance's onCreate. A
+    // fresh process launch (no prior instance to have saved anything) has
+    // savedStateSize == 0, in which case this still defaults to blue/index
+    // 0 exactly as before.
+    const cbz_no_saved_state_idx = out.items.len;
+    try out.append(0); // if savedStateSize(x2) == 0, goto use_default_index (patched below)
+    try out.append(a64.ldrW(4, 1, 0)); // w4 = *savedState (the index onSaveInstanceState wrote)
+    const b_index_ready_idx = out.items.len;
+    try out.append(0); // branch to index_ready (patched below)
+
+    const use_default_index_pos = out.items.len;
+    out.items[cbz_no_saved_state_idx] = a64.cbzX(2, @as(i32, @intCast(use_default_index_pos)) * 4 - @as(i32, @intCast(cbz_no_saved_state_idx)) * 4);
+    try out.append(a64.movz32(4, 0, 0)); // w4 = 0 (default index: blue)
+
+    const index_ready = out.items.len;
+    out.items[b_index_ready_idx] = a64.b(@as(i32, @intCast(index_ready)) * 4 - @as(i32, @intCast(b_index_ready_idx)) * 4);
+
+    try emitAdrpAdd(&out, text_vaddr, 10, data_vaddr + DATA_OFFSET_COLOR_INDEX);
+    try out.append(a64.strW(4, 10, 0)); // g_colorIndex = w4
+
+    // color = colorForIndex(w4) -- its address is only known once this
+    // whole function's length is counted, patched in after the fact like
+    // every other forward reference in this function.
+    try out.append(a64.movReg64(0, 4)); // x0 = index (colorForIndex's one arg)
+    const adrp_color_for_index_idx = out.items.len;
+    try out.append(0); // placeholder ADRP x3, colorForIndex
+    try out.append(0); // placeholder ADD  x3, x3, #lo12
+    try out.append(a64.blr(3)); // w0 = color
+    try emitAdrpAdd(&out, text_vaddr, 10, data_vaddr + DATA_OFFSET_CURRENT_COLOR);
+    try out.append(a64.strW(0, 10, 0)); // g_currentColor = color
+
+    // Reload `activity` from g_activity rather than trusting x0: the
+    // colorForIndex call above was free to clobber it (colorForIndex
+    // itself never touches x0 beyond its own arg/return, but nothing
+    // upstream of this point should keep relying on x0 staying live
+    // across an intervening call regardless -- the same discipline this
+    // file already uses everywhere else).
+    try emitAdrpAdd(&out, text_vaddr, 9, data_vaddr + DATA_OFFSET_ACTIVITY);
+    try out.append(a64.ldrX(9, 9, 0)); // x9 = g_activity (== activity)
+    try out.append(a64.ldrX(9, 9, ACTIVITY_OFFSET_CALLBACKS)); // x9 = activity->callbacks (framework-owned, already valid -- do not overwrite this pointer)
+
+    // Register onSaveInstanceState -- see its own comment below for what
+    // it hands the framework and why (the other half of the
+    // savedState/savedStateSize restore above).
+    const adrp_save_instance_state_idx = out.items.len;
+    try out.append(0); // placeholder ADRP x10, onSaveInstanceState
+    try out.append(0); // placeholder ADD  x10, x10, #lo12
+    try out.append(a64.strX(10, 9, CB_OFFSET_ON_SAVE_INSTANCE_STATE)); // activity->callbacks->onSaveInstanceState = x10
+
     // (function 2's address is only known once we've counted this function's
     // own length below — patched in after the fact, see `windowCreatedAddr`)
     const adrp_window_created_idx = out.items.len;
@@ -278,6 +330,16 @@ pub fn buildText(
     try out.append(0); // placeholder ADRP x10, onInputQueueCreated
     try out.append(0); // placeholder ADD  x10, x10, #lo12
     try out.append(a64.strX(10, 9, CB_OFFSET_ON_INPUT_QUEUE_CREATED)); // activity->callbacks->onInputQueueCreated = x10
+
+    // Also register onInputQueueDestroyed, its counterpart -- see its own
+    // comment below for why: real-device feedback that combining rotation
+    // with touch input broke, root-caused to never detaching the old
+    // instance's input queue from its looper before that queue (and the
+    // instance it belonged to) is torn down.
+    const adrp_input_queue_destroyed_idx = out.items.len;
+    try out.append(0); // placeholder ADRP x10, onInputQueueDestroyed
+    try out.append(0); // placeholder ADD  x10, x10, #lo12
+    try out.append(a64.strX(10, 9, CB_OFFSET_ON_INPUT_QUEUE_DESTROYED)); // activity->callbacks->onInputQueueDestroyed = x10
 
     // Fix the landscape display-cutout black bar (real-device feedback):
     // see fixDisplayCutoutMode's own comment, at the end of this file, for
@@ -798,6 +860,132 @@ pub fn buildText(
     try out.append(a64.addImm64(a64.sp, a64.sp, 96));
     try out.append(a64.ret(a64.lr));
 
+    const color_for_index_start = out.items.len;
+    const color_for_index_vaddr = text_vaddr + color_for_index_start * 4;
+    {
+        const pc = text_vaddr + adrp_color_for_index_idx * 4;
+        out.items[adrp_color_for_index_idx] = a64.adrp(3, pc, color_for_index_vaddr);
+        out.items[adrp_color_for_index_idx + 1] = a64.addImm64(3, 3, @truncate(color_for_index_vaddr & 0xfff));
+    }
+
+    // ── colorForIndex(w0=index) -> w0=color ── a pure leaf function, no
+    // calls, no data of any kind embedded in it (deliberately, after the
+    // real-device crash the rest of this file's comments document: never
+    // again mix data into a straight-line instruction stream without an
+    // unconditional jump over it). Mirrors drainInputEvents' own
+    // touch-cycle palette (index 0/1/2/3 -> blue/red/green/yellow) by
+    // deliberate duplication rather than a shared helper: this function
+    // exists solely so onCreate's savedState-restore path (above) can
+    // recompute g_currentColor for a restored g_colorIndex without
+    // touching drainInputEvents' already real-device-verified logic at
+    // all -- any unexpected index (should never happen; only ever written
+    // by our own onSaveInstanceState) safely falls back to blue, same as
+    // index 0.
+    try out.append(a64.subImm64(9, 0, 0)); // index - 0
+    const cfi_skip0_idx = out.items.len;
+    try out.append(0); // if index != 0, try next (patched below)
+    try out.append(a64.movz32(0, @truncate(BLUE_RGBA8888_LE), 0));
+    try out.append(a64.movk32(0, @truncate(BLUE_RGBA8888_LE >> 16), 1));
+    try out.append(a64.ret(a64.lr));
+
+    const cfi_try1 = out.items.len;
+    out.items[cfi_skip0_idx] = a64.cbnzX(9, @as(i32, @intCast(cfi_try1)) * 4 - @as(i32, @intCast(cfi_skip0_idx)) * 4);
+    try out.append(a64.subImm64(9, 0, 1)); // index - 1
+    const cfi_skip1_idx = out.items.len;
+    try out.append(0);
+    try out.append(a64.movz32(0, @truncate(RED_RGBA8888_LE), 0));
+    try out.append(a64.movk32(0, @truncate(RED_RGBA8888_LE >> 16), 1));
+    try out.append(a64.ret(a64.lr));
+
+    const cfi_try2 = out.items.len;
+    out.items[cfi_skip1_idx] = a64.cbnzX(9, @as(i32, @intCast(cfi_try2)) * 4 - @as(i32, @intCast(cfi_skip1_idx)) * 4);
+    try out.append(a64.subImm64(9, 0, 2)); // index - 2
+    const cfi_skip2_idx = out.items.len;
+    try out.append(0);
+    try out.append(a64.movz32(0, @truncate(GREEN_RGBA8888_LE), 0));
+    try out.append(a64.movk32(0, @truncate(GREEN_RGBA8888_LE >> 16), 1));
+    try out.append(a64.ret(a64.lr));
+
+    const cfi_else = out.items.len;
+    out.items[cfi_skip2_idx] = a64.cbnzX(9, @as(i32, @intCast(cfi_else)) * 4 - @as(i32, @intCast(cfi_skip2_idx)) * 4);
+    // index == 3 (the only remaining case this function is ever actually
+    // called with).
+    try out.append(a64.movz32(0, @truncate(YELLOW_RGBA8888_LE), 0));
+    try out.append(a64.movk32(0, @truncate(YELLOW_RGBA8888_LE >> 16), 1));
+    try out.append(a64.ret(a64.lr));
+
+    const save_instance_state_start = out.items.len;
+    const save_instance_state_vaddr = text_vaddr + save_instance_state_start * 4;
+    {
+        const pc = text_vaddr + adrp_save_instance_state_idx * 4;
+        out.items[adrp_save_instance_state_idx] = a64.adrp(10, pc, save_instance_state_vaddr);
+        out.items[adrp_save_instance_state_idx + 1] = a64.addImm64(10, 10, @truncate(save_instance_state_vaddr & 0xfff));
+    }
+
+    // ── onSaveInstanceState(x0=activity[unused], x1=outLen) -> x0=void* ──
+    // Called on the OLD activity instance before it's destroyed (e.g. by
+    // the destroy-and-recreate a rotation now triggers) -- the other half
+    // of onCreate's savedState-restore path above. Per the real NDK
+    // contract: "the returned data will be freed by the caller using
+    // free(), so this data should be allocated using malloc()" -- this
+    // project's first use of libc's allocator (elf_so.zig's second
+    // DT_NEEDED, `libc.so`, added just for this). `*outLen` (a `size_t*`,
+    // 8 bytes on this LP64 ABI, not 4) must be filled in with however many
+    // bytes were allocated.
+    // Stack frame (32 bytes): [0]=allocated ptr, [8]=saved outLen(x1),
+    // [16]=saved LR.
+    try out.append(a64.subImm64(a64.sp, a64.sp, 32));
+    try out.append(a64.strX(a64.lr, a64.sp, 16)); // save LR (non-leaf: calls malloc via BLR)
+    try out.append(a64.strX(1, a64.sp, 8)); // save outLen ptr
+
+    try out.append(a64.movz32(0, 4, 0)); // x0 = 4 (bytes to allocate: one u32 color index)
+    try emitGotCall(&out, text_vaddr, 9, got.malloc); // x0 = malloc(4)
+    try out.append(a64.strX(0, a64.sp, 0)); // save allocated ptr
+
+    try emitAdrpAdd(&out, text_vaddr, 9, data_vaddr + DATA_OFFSET_COLOR_INDEX);
+    try out.append(a64.ldrW(10, 9, 0)); // w10 = g_colorIndex
+    try out.append(a64.ldrX(0, a64.sp, 0)); // reload allocated ptr
+    try out.append(a64.strW(10, 0, 0)); // *ptr = g_colorIndex
+
+    try out.append(a64.ldrX(1, a64.sp, 8)); // reload outLen ptr
+    try out.append(a64.movz32(9, 4, 0)); // x9 = 4 (movz32 zero-extends into the full 64-bit x9, so this is a correct 8-byte size_t value, not just the low 32 bits)
+    try out.append(a64.strX(9, 1, 0)); // *outLen = 4
+
+    try out.append(a64.ldrX(0, a64.sp, 0)); // return value = allocated ptr
+    try out.append(a64.ldrX(a64.lr, a64.sp, 16)); // restore LR
+    try out.append(a64.addImm64(a64.sp, a64.sp, 32));
+    try out.append(a64.ret(a64.lr));
+
+    const input_queue_destroyed_start = out.items.len;
+    const input_queue_destroyed_vaddr = text_vaddr + input_queue_destroyed_start * 4;
+    {
+        const pc = text_vaddr + adrp_input_queue_destroyed_idx * 4;
+        out.items[adrp_input_queue_destroyed_idx] = a64.adrp(10, pc, input_queue_destroyed_vaddr);
+        out.items[adrp_input_queue_destroyed_idx + 1] = a64.addImm64(10, 10, @truncate(input_queue_destroyed_vaddr & 0xfff));
+    }
+
+    // ── onInputQueueDestroyed(x0=activity[unused], x1=queue) ──
+    // Real-device feedback: combining rotation with touch input broke.
+    // Root cause: this activity's input queue was never detached from its
+    // ALooper before being torn down. A rotation now destroys and
+    // recreates the whole activity (see axml.zig's configChanges
+    // comment), which destroys the OLD instance's input queue too -- and
+    // per the real NDK docs, `AInputQueue_detachLooper` must be called
+    // before that happens, exactly what `onInputQueueDestroyed` exists
+    // for (android_native_app_glue.c's own internal plumbing does this
+    // same call in its own onInputQueueDestroyed handler). Without it, the
+    // stale attachment from the old, now-destroyed queue/looper pairing
+    // was left dangling right as the new instance's onInputQueueCreated
+    // (above) set up a fresh one -- consistent with input only misbehaving
+    // specifically around a rotation, not otherwise.
+    try out.append(a64.subImm64(a64.sp, a64.sp, 16));
+    try out.append(a64.strX(a64.lr, a64.sp, 0)); // save LR (non-leaf: calls AInputQueue_detachLooper via BLR)
+    try out.append(a64.movReg64(0, 1)); // x0 = queue
+    try emitGotCall(&out, text_vaddr, 9, got.input_queue_detach_looper);
+    try out.append(a64.ldrX(a64.lr, a64.sp, 0)); // restore LR
+    try out.append(a64.addImm64(a64.sp, a64.sp, 16));
+    try out.append(a64.ret(a64.lr));
+
     return out;
 }
 
@@ -875,19 +1063,23 @@ test "buildText is deterministic in length across the two-pass call" {
         .input_queue_finish_event = 0,
         .input_event_get_type = 0,
         .motion_event_get_action = 0,
+        .input_queue_detach_looper = 0,
+        .malloc = 0,
     }, 0);
     defer pass1.deinit();
     var pass2 = try buildText(alloc, 0x2000, .{
-        .set_buffers_geometry = 0x30b0,
-        .lock = 0x30b8,
-        .unlock_and_post = 0x30c0,
-        .looper_for_thread = 0x30c8,
-        .input_queue_attach_looper = 0x30d0,
-        .input_queue_get_event = 0x30d8,
-        .input_queue_finish_event = 0x30e0,
-        .input_event_get_type = 0x30e8,
-        .motion_event_get_action = 0x30f0,
-    }, 0x30f8);
+        .set_buffers_geometry = 0x30c0,
+        .lock = 0x30c8,
+        .unlock_and_post = 0x30d0,
+        .looper_for_thread = 0x30d8,
+        .input_queue_attach_looper = 0x30e0,
+        .input_queue_get_event = 0x30e8,
+        .input_queue_finish_event = 0x30f0,
+        .input_event_get_type = 0x30f8,
+        .motion_event_get_action = 0x3100,
+        .input_queue_detach_looper = 0x3108,
+        .malloc = 0x3110,
+    }, 0x3118);
     defer pass2.deinit();
     try std.testing.expectEqual(pass1.items.len, pass2.items.len);
     try std.testing.expect(pass1.items.len > 300);

@@ -717,6 +717,90 @@ and a lot of what turned out to be correctly-transcribed ABI assumptions
 (struct offsets, calling conventions, ELF/dynamic-linking, and now JNI
 function-table details) that real-device evidence independently confirmed
 rather than contradicted.
+- **Eighteenth report: two more requests after the crash was fixed and the
+  app confirmed fully working again** -- the touch-cycled color resets to
+  blue on every rotation instead of surviving it, and combining rotation
+  with touch input doesn't work right.
+  - *Color resets on rotation.* Root cause: `onCreate` unconditionally
+    wrote blue/index-0 into `g_currentColor`/`g_colorIndex` on every call
+    -- including the destroy-and-recreate a rotation now triggers (see the
+    fifteenth report), which discards whatever color a touch had already
+    picked. Android's own standard mechanism for exactly this --
+    preserving state across a configuration-change-driven recreate -- is
+    `onSaveInstanceState`/the `savedState`/`savedStateSize` params
+    `onCreate` already receives and, until now, ignored. Implemented both
+    halves: `onSaveInstanceState` (newly registered at callback offset 16)
+    hands the framework a small heap-allocated buffer holding
+    `g_colorIndex` before the old instance is destroyed; `onCreate` now
+    checks `savedStateSize` and, when the framework hands the same buffer
+    back on the new instance, restores `g_colorIndex` from it (defaulting
+    to blue/index 0 only when there's nothing to restore, e.g. a fresh
+    process launch). Per the real, documented NDK contract ("the returned
+    data will be freed by the caller using `free()`, so this data should
+    be allocated using `malloc()`"), the saved buffer must be heap-
+    allocated -- this project's first `libc.so` import (`malloc`), needing
+    its own second `DT_NEEDED` entry alongside the existing
+    `libandroid.so` one; `.dynsym`/`.rela.dyn`/`.hash`/`.got` all grew
+    accordingly, verified via `readelf -d`/`--dyn-syms`/`-r` the same way
+    as every other import in this file. A new, deliberately duplicated
+    (not shared with `drainInputEvents`' own copy, to avoid touching
+    already real-device-verified code) `colorForIndex` leaf function maps
+    a restored index back to its color.
+  - *Rotation + touch.* Root cause: `onInputQueueDestroyed` was never
+    implemented. Per the real NDK contract, it must call
+    `AInputQueue_detachLooper` on the queue before it's destroyed --
+    `android_native_app_glue.c`'s own internal plumbing does exactly this.
+    Without it, rotating (which destroys the old activity instance and its
+    input queue, per the fifteenth report's destroy-and-recreate path) left
+    the old queue's looper attachment dangling right as the new instance's
+    `onInputQueueCreated` set up a fresh one -- consistent with input only
+    misbehaving specifically around a rotation. Fixed by implementing and
+    registering `onInputQueueDestroyed` (callback offset 96) to detach the
+    old queue.
+  - Verified with the same rigor the last round's crash made non-
+    negotiable: disassembled the entire rebuilt `.text`, confirmed the
+    `savedStateSize`-check branch and its fallback path both land
+    correctly, confirmed every `.data` global offset and JNI/GOT slot the
+    two new callbacks touch, and confirmed `colorForIndex` has no
+    fall-through-into-data risk (no data of any kind embedded in it, only
+    instructions, learned the hard way last round). `readelf`/`aapt`/
+    `jarsigner -verify`/`unzip -t` all clean.
+
+This closes out the black-screen-and-ANR investigation and covers five
+follow-up feature/fix rounds: eighteen real-device rounds, eleven genuine
+bugs found and fixed (missing `onNativeWindowResized`/
+`onNativeWindowRedrawNeeded` registration; missing `LR` preservation
+across the handler's nested calls; the actual root cause, replacing
+`activity->callbacks` instead of writing through it; registering
+`onNativeWindowResized` and then `onNativeWindowRedrawNeeded`, each of
+which caused an ANR once the real rendering path was finally reachable;
+never draining the input queue `NativeActivity.java` always hands this
+app, which caused the ANR to persist even with no window callback left
+registered; never repainting on resize, which left newly-exposed buffer
+area black after rotation; once that repaint was added back, the deeper
+issue it was only papering over -- opting into a resize-in-place rotation
+path that's fragile enough that even Google's own reference NDK glue
+library doesn't support it, fixed by routing rotation through Android's
+standard destroy-and-recreate path instead; a string constant embedded
+straight in the middle of executable code with nothing to jump over it,
+which real-device evidence caught as an immediate `SIGILL` crash on
+launch; never implementing `onSaveInstanceState`, which silently
+discarded touch-picked state across every rotation; and never implementing
+`onInputQueueDestroyed`, which left a stale looper attachment dangling
+right as rotation's destroy-and-recreate set up a fresh input queue),
+one correctness fix found along the way (the window's real default format
+is `RGB_565`, not `RGBA_8888`), three feature additions after the app was
+confirmed working (fullscreen vs. status-bar-visible; hardcoded-black vs.
+system-adaptive status bar color -- which itself took two follow-up
+rounds, first to the wrong translucency-only mechanism and then to the
+actually-independent display-cutout fix, this project's first JNI calls;
+and touch-to-cycle-colors, backed by this experiment's first legitimate
+mutable app state, later extended with its own state-preservation and
+`libc.so`/`malloc` needs), and a lot of what turned out to be
+correctly-transcribed ABI assumptions (struct offsets, calling
+conventions, ELF/dynamic-linking, and now JNI function-table details)
+that real-device evidence independently confirmed rather than
+contradicted.
 
 ## What's genuinely unverified
 
