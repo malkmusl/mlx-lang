@@ -12,6 +12,7 @@ const axml = @import("axml.zig");
 const dex = @import("dex.zig");
 const zip = @import("zip.zig");
 const jar_sign = @import("jar_sign.zig");
+const apk_sign_v2v3 = @import("apk_sign_v2v3.zig");
 
 const SO_PATH = "lib/arm64-v8a/libmain.so";
 const MANIFEST_PATH = "AndroidManifest.xml";
@@ -47,22 +48,22 @@ pub fn main() !void {
 
     try out.print("mlx android-aarch64-bluescreen experiment — building {s} (package {s})\n", .{ out_path, package });
 
-    try out.print("[1/6] generating AArch64 machine code + ELF64 shared object...\n", .{});
+    try out.print("[1/7] generating AArch64 machine code + ELF64 shared object...\n", .{});
     const so_bytes = try elf_so.build(allocator, "libmain.so", "libandroid.so", "libc.so");
     defer allocator.free(so_bytes);
     try out.print("      {s}: {d} bytes\n", .{ SO_PATH, so_bytes.len });
 
-    try out.print("[2/6] generating binary AndroidManifest.xml...\n", .{});
+    try out.print("[2/7] generating binary AndroidManifest.xml...\n", .{});
     const manifest_bytes = try axml.buildManifest(allocator, package, FULLSCREEN_ENABLED, SYSTEM_STATUS_BAR_COLOR_ENABLED);
     defer allocator.free(manifest_bytes);
     try out.print("      {s}: {d} bytes\n", .{ MANIFEST_PATH, manifest_bytes.len });
 
-    try out.print("[3/6] generating classes.dex (empty — pure native activity)...\n", .{});
+    try out.print("[3/7] generating classes.dex (empty — pure native activity)...\n", .{});
     const dex_bytes = try dex.buildEmptyDex(allocator);
     defer allocator.free(dex_bytes);
     try out.print("      {s}: {d} bytes\n", .{ DEX_PATH, dex_bytes.len });
 
-    try out.print("[4/6] generating RSA-2048 signing key + self-signed certificate (this takes a few seconds)...\n", .{});
+    try out.print("[4/7] generating RSA-2048 signing key + self-signed certificate (this takes a few seconds)...\n", .{});
     var timer = try std.time.Timer.start();
     var key = try jar_sign.generateKeyPair(allocator, 2048);
     defer key.deinit();
@@ -71,7 +72,7 @@ pub fn main() !void {
     defer allocator.free(cert_der);
     try out.print("      certificate: {d} bytes\n", .{cert_der.len});
 
-    try out.print("[5/6] signing (MANIFEST.MF / CERT.SF / CERT.RSA)...\n", .{});
+    try out.print("[5/7] signing (MANIFEST.MF / CERT.SF / CERT.RSA)...\n", .{});
     const entries = [_]jar_sign.NamedEntry{
         .{ .name = MANIFEST_PATH, .data = manifest_bytes },
         .{ .name = DEX_PATH, .data = dex_bytes },
@@ -83,7 +84,7 @@ pub fn main() !void {
     defer allocator.free(signed.cert_rsa);
     try out.print("      META-INF/CERT.RSA: {d} bytes\n", .{signed.cert_rsa.len});
 
-    try out.print("[6/6] packaging APK (ZIP)...\n", .{});
+    try out.print("[6/7] packaging APK (ZIP)...\n", .{});
     const zip_entries = [_]zip.Entry{
         .{ .name = MANIFEST_PATH, .data = manifest_bytes },
         .{ .name = DEX_PATH, .data = dex_bytes },
@@ -92,8 +93,13 @@ pub fn main() !void {
         .{ .name = "META-INF/CERT.SF", .data = signed.cert_sf },
         .{ .name = "META-INF/CERT.RSA", .data = signed.cert_rsa },
     };
-    const apk_bytes = try zip.build(allocator, &zip_entries);
+    const v1_apk_bytes = try zip.build(allocator, &zip_entries);
+    defer allocator.free(v1_apk_bytes);
+
+    try out.print("[7/7] signing (APK Signature Scheme v2 + v3)...\n", .{});
+    const apk_bytes = try apk_sign_v2v3.signV2V3(allocator, &key, cert_der, v1_apk_bytes, 28);
     defer allocator.free(apk_bytes);
+    try out.print("      APK Signing Block: {d} bytes\n", .{apk_bytes.len - v1_apk_bytes.len});
 
     const f = try std.fs.cwd().createFile(out_path, .{});
     defer f.close();

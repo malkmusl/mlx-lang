@@ -801,6 +801,81 @@ correctly-transcribed ABI assumptions (struct offsets, calling
 conventions, ELF/dynamic-linking, and now JNI function-table details)
 that real-device evidence independently confirmed rather than
 contradicted.
+- **Nineteenth report: APK Signature Scheme v2 and v3 signing**, added
+  alongside the existing v1 (JAR) signature rather than replacing it (`apk_sign_v2v3.mlx`/
+  `apk_sign_v2v3.zig`, wired into both `main.mlx` and `main.zig` right
+  after `zip.build()`). This is a build-time/packaging change with no
+  runtime behavior for the app itself to test on-device -- verification
+  here is against the real `apksigner verify --print-certs -v` tool
+  (`apksigner` version 0.9, from `build-tools;30.0.3`), the same
+  "external, independently-implemented oracle" standard every other layer
+  in this project has been held to, not a fresh physical-device install.
+  Reused `hash.sha256`, `jar_sign.signSha256Pkcs1v15` (same RSA keypair,
+  same PKCS1v1.5-SHA256 primitive, algorithm ID `0x0103`), and `asn1.mlx`'s
+  DER encoders as-is; duplicated `jar_sign.buildSelfSignedCert`'s inline
+  SubjectPublicKeyInfo construction locally (its helpers aren't `pub`,
+  same tradeoff `jar_sign.mlx` itself documents). Three real bugs were
+  found in this round, each one only by a genuine `apksigner verify`
+  failure -- in every case the wrong version's bytes still "lined up"
+  under an incomplete mental model of the format, so nothing short of
+  the real verifier caught it:
+  - **Missing per-entry length prefix on digest/signature pairs.** Each
+    entry in a `digests`/`signatures` sequence isn't `algId(4) ++
+    lp(payload)` as a first read of the spec's own comments suggests --
+    real apksig's `encodeAsSequenceOfLengthPrefixedPairsOfIntAndLengthPrefixedBytes`
+    wraps each pair in its own *additional* outer length prefix, making
+    every entry `lp(algId(4) ++ lp(payload))`, three levels deep. Missing
+    this produced a v3 block that crashed `apksigner` outright
+    (`IllegalArgumentException: Negative length` while parsing signer #1)
+    before even getting to a content check.
+  - **Chunking the three signed sections as one flat stream instead of
+    independently.** The v2/v3 content digest algorithm chunks *each* of
+    the three sections (pre-Central-Directory bytes, Central Directory,
+    EOCD) into <=1MB pieces on its own, always starting a fresh chunk
+    boundary at a section's first byte -- confirmed against apksig's real
+    `computeOneMbChunkContentDigests`, which loops a `DataSource[]` array
+    and restarts hashing at each element rather than treating the whole
+    thing as one concatenated byte stream. Every previous structural
+    check (nested length prefixes, per-signer framing, the two now-fixed
+    bugs above) had already passed by the time this one showed up as a
+    `CHUNKED_SHA256 digest mismatch` -- offsets and framing can be
+    perfectly self-consistent while the digest algorithm itself is still
+    wrong.
+  - **Digesting the file's real (post-insertion) EOCD instead of the
+    pre-insertion one.** The natural assumption -- that the content digest
+    should cover the *actual bytes on disk*, including the EOCD's real,
+    already-adjusted "start of Central Directory" field -- is wrong.
+    apksig's own verifier comment says the EOCD "must be treated as
+    though its Central Directory offset points to the start of [the] APK
+    Signing Block" when computing the digest, and its source confirms
+    this literally: it rewrites the digested EOCD's offset field to
+    `beforeApkSigningBlock.size()` (the block's *start* position, i.e.
+    the *original*, pre-insertion `cdStart`), discarding the file's real
+    value for this one purpose. The file written to disk still needs the
+    real, adjusted `cdStart` -- normal ZIP/Android readers must be able
+    to physically find the Central Directory -- so the fix keeps two
+    separate EOCD buffers: one (unmodified) for the digest, one
+    (`cdStart`-patched) for the actual output bytes. A pleasant
+    side-effect of finding this: since the digest input never depends on
+    the Signing Block's own size, the two-pass "measure with a
+    placeholder digest, then rebuild for real" approach this module
+    started with (mirroring `elf_so.mlx`'s `.text`-sizing pattern) turned
+    out to be unnecessary -- the real digest, signatures, and block size
+    can all be computed in one straight pass once the EOCD-for-digesting
+    is right.
+  - Final state verified end to end with `apksigner verify
+    --print-certs -v`: `Verifies` / `v1 scheme: true` / `v2 scheme: true`
+    / `v3 scheme: true`, plus `unzip -t` (no errors) and `jarsigner
+    -verify` (`jar verified.`, same pre-existing self-signed/1024-bit-key
+    warnings as every prior round -- nothing new). v3's `minSdkVersion`
+    field is set to 28 (the first API level that verifies v3 at all;
+    `RSA_PKCS1_V1_5_WITH_SHA256`'s own supported-from version is 24, and
+    setting the signer's declared range below either floor makes
+    `apksigner` report "No supported signatures" for that scheme even
+    though nothing about the bytes is malformed) -- independent of, and
+    not required to match, the manifest's own `minSdkVersion="21"`. No
+    proof-of-rotation attribute: a single, fresh (non-rotated) signing
+    key needs none.
 
 ## What's genuinely unverified
 
@@ -812,20 +887,15 @@ source, not just memory), and the actual `ANativeWindow_lock`/
 `_setBuffersGeometry`/`_unlockAndPost` fill-and-present path all the way
 to visible pixels on a real screen. What's left:
 
-- **APK Signature Scheme v1 (JAR signing) only.** No v2/v3 signing block.
-  This is why `minSdkVersion`/`targetSdkVersion` are kept at 21/29 in
-  `axml.zig` — v1-only APKs are accepted at those levels. Devices/policies
-  that require v2+ (Android enforces this starting around API 30 for
-  `targetSdkVersion`) will reject this APK as-is; adding a v2 signing
-  block is a reasonably contained follow-up once v1 is confirmed to
-  actually install and run.
-- **APK Signature Scheme v1 (JAR signing) only.** No v2/v3 signing block.
-  This is why `minSdkVersion`/`targetSdkVersion` are kept at 21/29 in
-  `axml.zig` — v1-only APKs are accepted at those levels. Devices/policies
-  that require v2+ (Android enforces this starting around API 30 for
-  `targetSdkVersion`) will reject this APK as-is; adding a v2 signing
-  block is a reasonably contained follow-up once v1 is confirmed to
-  actually install and run.
+- **APK Signature Scheme v2/v3 signing is implemented and passes
+  `apksigner verify` (v1/v2/v3 all `true`, see the nineteenth report
+  above), but has not yet been confirmed by installing the resulting APK
+  on a real device.** Every earlier layer in this project treats real
+  hardware as the actual bar, not just an external verifier tool, and
+  that hasn't happened yet for this one -- the next real-device round
+  should reinstall over the previous v1-only build and confirm the app
+  still launches and behaves identically (v2/v3 adds an integrity check,
+  it doesn't change anything the app itself does).
 - **No native-library page alignment.** `libmain.so` is stored (not
   compressed) but not 4/16 KiB-aligned within the ZIP, so it relies on
   `extractNativeLibs`-style extraction rather than direct `mmap`. Fine
@@ -856,7 +926,8 @@ Roughly in order of what unblocks what:
    eventually a `std.android` module so this is expressible in ordinary
    mlx source rather than hand-built by a bespoke Zig tool. The Zig tool
    here is scaffolding to de-risk that work, not a replacement for it.
-4. APK Signature Scheme v2 (or v2+v1 for broader compatibility).
+4. ~~APK Signature Scheme v2 (or v2+v1 for broader compatibility).~~ Done
+   — see the nineteenth report above (v2 *and* v3, alongside v1).
 5. A real target triple story in the build system (`mlx build --target
    aarch64-android`), matching how `zig build`'s `standardTargetOptions`
    already works for the *bootstrap* compiler's own binary today (that's
