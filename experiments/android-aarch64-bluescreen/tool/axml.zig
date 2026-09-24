@@ -102,6 +102,19 @@ const ANDROID_ATTRS = [_]AndroidAttr{
     // /usr/share/android-framework-res/framework-res.apk and read back
     // the resolved attribute ID from `aapt dump xmltree`.
     .{ .name = "exported", .resid = 0x01010010 },
+    // android:extractNativeLibs -- true tells the platform to extract
+    // libmain.so to a normal file at install time rather than mmap it
+    // directly out of the (uncompressed) APK, which is the alternative
+    // the platform can choose when this is false or absent-and-inferred
+    // false, and which depends on the native library's own zip entry
+    // being page-aligned (handled separately in zip.zig). Set explicitly
+    // here to remove any ambiguity about the implicit default, added
+    // after real-device install still failed with the same generic
+    // block even after the `exported` fix, prompted by independently
+    // converging research pointing at native-library extraction/
+    // alignment as the remaining suspect. Resource ID ground-truthed the
+    // same way as every other attribute here.
+    .{ .name = "extractNativeLibs", .resid = 0x010104ea },
 };
 const ANDROID_NS_URI = "http://schemas.android.com/apk/res/android";
 
@@ -311,6 +324,11 @@ pub fn buildManifest(allocator: std.mem.Allocator, package: []const u8, fullscre
     try writeStartElement(&body, &pool, .{ .name = "application", .attrs = &[_]Attr{
         .{ .ns = true, .name = "label", .value = .{ .str = "Mlx Blue Screen" } },
         .{ .ns = true, .name = "hasCode", .value = .{ .boolean = false } },
+        // Set explicitly to true (the real platform default when this
+        // attribute is entirely absent, which this manifest always was
+        // before) rather than left implicit -- see ANDROID_ATTRS's
+        // "extractNativeLibs" entry above for why.
+        .{ .ns = true, .name = "extractNativeLibs", .value = .{ .boolean = true } },
     } }, line);
     line += 1;
 

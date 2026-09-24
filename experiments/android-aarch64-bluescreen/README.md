@@ -1062,6 +1062,31 @@ contradicted.
     This is the fourth independent real bug found across four rounds
     from the same one install attempt -- still pending the actual
     real-device confirmation all of them were aimed at.
+- **Twenty-fourth report: still the same "You can't install this app on
+  your device" toast with `android:exported` added.** The user separately
+  researched this exact symptom and brought back a converging suspicion:
+  `android:extractNativeLibs`, the attribute controlling whether the
+  platform extracts `libmain.so` to a normal file at install time or
+  mmaps it directly out of the (uncompressed) APK. This manifest has
+  never declared it at all. The real platform default when it's absent
+  has always been documented as `true` (extract) -- so this was reasoned
+  through rather than confirmed as a behavior change, but declaring it
+  *explicitly* removes that ambiguity for zero downside, and is cheap
+  enough to be worth doing regardless of whether it turns out to be the
+  actual remaining blocker.
+  - Added `android:extractNativeLibs="true"` to the `<application>`
+    element in `axml.mlx`/`axml.zig`. Resource ID (`0x010104ea`)
+    ground-truthed the same way as every other attribute in this file:
+    a minimal reference manifest compiled through the real `aapt`,
+    resolved ID read back from `aapt dump xmltree`.
+  - Verified with `aapt dump xmltree` (byte-identical to the reference),
+    `apksigner verify` (still v1/v2/v3 all `true`, same persisted
+    certificate -- no reinstall needed), and `unzip -t` (still clean).
+    No adb/logcat access is available on the test device, so unlike
+    every other layer in this project, this round -- and the previous
+    few -- can't be verified against the platform's actual specific
+    rejection reason, only against the same generic symptom and a
+    plausible, but not certain, mechanism.
 
 ## What's genuinely unverified
 
