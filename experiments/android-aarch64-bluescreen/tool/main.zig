@@ -55,16 +55,16 @@ const DEFAULT_MIN_SDK_VERSION: u32 = 21;
 // signing -- Android surfaces that warning purely off the gap between
 // targetSdkVersion and the device's own platform version.
 //
-// 36 (Android 16): the highest value real-device confirmed so far (31, 35
-// and 36 all installed and ran once the attribute-order bug behind the old
-// >= 31 block was fixed -- see the README's twenty-eighth and twenty-ninth
-// reports). Override with `--target-sdk=N`.
+// 37 (Android 17): the highest value real-device confirmed so far (31, 35,
+// 36 and 37 all installed and ran once the attribute-order bug behind the
+// old >= 31 block was fixed -- see the README's twenty-eighth and
+// twenty-ninth reports). Override with `--target-sdk=N`.
 //
 // There's deliberately no "maxSdkVersion" to pair with the min:
 // `<uses-sdk android:maxSdkVersion>` has been ignored at install time since
 // API 4. Android installs on any device >= min_sdk_version regardless of
 // target, so this single value is the real "how current" lever.
-const DEFAULT_TARGET_SDK_VERSION: u32 = 36;
+const DEFAULT_TARGET_SDK_VERSION: u32 = 37;
 
 // Absolute path (not repo-relative) to a small persisted RSA keypair,
 // reused across builds instead of generating a fresh random one every

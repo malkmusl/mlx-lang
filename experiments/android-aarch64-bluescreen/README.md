@@ -1317,8 +1317,9 @@ contradicted.
   - A target-37 build passes every local check (attribute-order checker,
     `apksigner verify` with the same certificate, `aapt dump badging`,
     `unzip -t`) and differs from the confirmed target-36 manifest by
-    exactly one byte. The default moves to 37 once it's confirmed on the
-    device.
+    exactly one byte. **Real-device confirmed** (installs and runs); the
+    default is now 37, and the repo's default build is byte-identical to
+    that confirmed APK.
   - The v3 signer's `maxSdk` is `0x7fffffff` and `schemesForTargetSdk`
     returns v1+v2+v3 for any target >= 28, so neither needs to change as
     targets go up.
@@ -1337,9 +1338,8 @@ to visible pixels on a real screen. What's left:
   and the "built for an older Android version" fix.~~ **Real-device
   confirmed** -- see the twenty-sixth report's closing note.
 - ~~`targetSdkVersion >= 31` install block.~~ **Fixed and real-device
-  confirmed** at 31, 35 and 36 (twenty-eighth and twenty-ninth reports);
-  default is now 36. Target 37 (Android 17) is built and locally
-  verified, pending a device install.
+  confirmed** at 31, 35, 36 and 37 (twenty-eighth and twenty-ninth
+  reports); default is now 37 (Android 17).
 - **16 KB native-library page alignment and `extractNativeLibs` were
   never the cause of the 31+ block**, but are real, correct settings for
   modern devices and stay in the build regardless of target.
@@ -1363,7 +1363,7 @@ Roughly in order of what unblocks what:
    confirmed baseline at `targetSdkVersion=30`.
 2. ~~Root-cause and fix the `targetSdkVersion >= 31` install block.~~
    Done — it was attribute ordering in the AXML encoder (twenty-eighth
-   report); 31/35/36 are device-confirmed and 37 is pending. When this
+   report); 31/35/36/37 are device-confirmed. When this
    moves into the compiler, the AXML writer should enforce ascending
    resource-ID attribute order itself (sort, or reject) rather than
    relying on each call site, since that's the invariant that cost the
