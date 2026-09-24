@@ -43,17 +43,22 @@ const SYSTEM_STATUS_BAR_COLOR_ENABLED = true;
 const MIN_SDK_VERSION: u32 = 21;
 
 // Declares how current this build has actually been tested/updated for.
-// Real-device feedback: a low targetSdkVersion (this was 29 until now)
+// Real-device feedback: a low targetSdkVersion (this was 29 originally)
 // makes current Android show "This app was built for an older version of
 // Android and may not work properly" on install/launch, independent of
 // signing -- Android surfaces that warning purely off the gap between
-// targetSdkVersion and the device's own platform version. 35 (Android 15)
-// is the latest well-established stable level as of this writing; nothing
-// this app does is gated on newer platform behavior, so there's no
-// downside to targeting it. This is also what drives
-// `apk_sign_v2v3.schemesForTargetSdk` below -- raising it further will
-// keep including v1+v2+v3 (already the ceiling at 28+), never fewer.
-const TARGET_SDK_VERSION: u32 = 35;
+// targetSdkVersion and the device's own platform version.
+//
+// Temporarily set to 34 (Android 14), not 35, as a diagnostic step: every
+// build at 35 has failed to install on the real test device with a
+// generic "You can't install this app on your device" block, even after
+// fixing every specific 35-triggered requirement found so far
+// (android:exported, android:extractNativeLibs, 16 KB native-library
+// alignment). 34 still requires android:exported (mandatory since API
+// 31) and still clears the old-Android warning, but sits one level below
+// whatever 35 specifically enforces that hasn't been identified yet --
+// isolates whether the remaining block is really tied to 35 itself.
+const TARGET_SDK_VERSION: u32 = 34;
 
 // Absolute path (not repo-relative) to a small persisted RSA keypair,
 // reused across builds instead of generating a fresh random one every
