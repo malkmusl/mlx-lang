@@ -5,7 +5,10 @@
 //! X.509/PKCS#7 JAR signature). See the experiment README for what's
 //! verified and what still needs a real device.
 //!
-//! Usage: `zig run main.zig -- [output.apk] [package.name]`
+//! Usage: `zig run main.zig -- [output.apk] [package.name] [--min-sdk=N] [--target-sdk=N]`
+//! The two flags override MIN_SDK_VERSION/TARGET_SDK_VERSION below without
+//! editing source -- see those constants' comments for what each bound
+//! means and why TARGET_SDK_VERSION defaults to 30, not higher.
 const std = @import("std");
 const Managed = std.math.big.int.Managed;
 const elf_so = @import("elf_so.zig");
@@ -39,8 +42,11 @@ const SYSTEM_STATUS_BAR_COLOR_ENABLED = true;
 // install and run the app fine (NativeActivity itself needs nothing
 // newer). Threaded into both the manifest's `<uses-sdk>` and (as the
 // floor apk_sign_v2v3.signV2V3 assumes) the v3 Signing Block's own
-// per-signer minSdk field.
-const MIN_SDK_VERSION: u32 = 21;
+// per-signer minSdk field. Override at build time with `--min-sdk=N` --
+// this is a `DEFAULT_*` rather than a hardcoded value for exactly that
+// reason (unlike mlx/main.mlx, which has no CLI arg access yet and so
+// stays a plain hardcoded function -- see its own minSdkVersion() doc).
+const DEFAULT_MIN_SDK_VERSION: u32 = 21;
 
 // Declares how current this build has actually been tested/updated for.
 // Real-device feedback: a low targetSdkVersion (this was 29 originally)
@@ -49,7 +55,7 @@ const MIN_SDK_VERSION: u32 = 21;
 // signing -- Android surfaces that warning purely off the gap between
 // targetSdkVersion and the device's own platform version.
 //
-// Pinned at 30 (Android 11), not something higher, as the result of a
+// Defaults to 30 (Android 11), not something higher, as the result of a
 // real-device bisection: every build at targetSdkVersion 31 or above has
 // failed to install outright ("You can't install this app on your
 // device"), even after correctly implementing every specific 31+/35+
@@ -58,14 +64,35 @@ const MIN_SDK_VERSION: u32 = 21;
 // byte-correct, and each one individually ruled OUT as the cause by
 // testing its absence). A single-variable A/B test (identical manifest
 // and binary, only this value changed) confirmed the exact boundary: 30
-// installs, 31 does not. No adb/logcat access exists on the test device
-// to see the platform's actual rejection reason at 31+, so whatever that
-// requirement is remains unidentified -- 30 is what actually installs,
-// still clears the original old-Android warning (Android 11 is not
+// installs, 31 does not, real-device confirmed. No adb/logcat access
+// exists on the test device to see the platform's actual rejection
+// reason at 31+, so whatever that requirement is remains unidentified.
+//
+// 30 still clears the original old-Android warning (Android 11 is not
 // "old" by that warning's own standard), and every other fix from this
 // investigation is kept since none of them were the culprit and all are
 // harmless or beneficial regardless of target.
-const TARGET_SDK_VERSION: u32 = 30;
+//
+// This is a DEFAULT, not a hard ceiling: override with `--target-sdk=N`
+// to keep bisecting the 31+ block (the next step is getting a real
+// PackageManager rejection reason via `pm install -r` run locally in a
+// terminal app on the test device itself, e.g. Termux, since that needs
+// no adb/PC at all -- see the README's "Where this goes next" section).
+// Do not raise this default until that block is actually root-caused and
+// fixed; every build above 30 is currently known to fail on the real
+// test device regardless of anything else in this file.
+//
+// There's no real "maxSdkVersion" concept to pair with MIN_SDK_VERSION
+// here: `<uses-sdk android:maxSdkVersion>` is a real manifest attribute,
+// but Android's own docs have deprecated it since API 4 and the
+// framework ignores it at install time on every version since -- adding
+// it would look like a fix without doing anything. The actual
+// "supports every SDK" lever is this single TARGET_SDK_VERSION ceiling:
+// Android installs on any device with API >= min_sdk_version regardless
+// of target, normally, so raising this default (once whatever blocks
+// 31+ on this device is fixed) is what widens real-world support, not a
+// separate max-sdk field.
+const DEFAULT_TARGET_SDK_VERSION: u32 = 30;
 
 // Absolute path (not repo-relative) to a small persisted RSA keypair,
 // reused across builds instead of generating a fresh random one every
@@ -153,7 +180,31 @@ pub fn main() !void {
 
     const out = std.io.getStdOut().writer();
 
+    var min_sdk_version: u32 = DEFAULT_MIN_SDK_VERSION;
+    var target_sdk_version: u32 = DEFAULT_TARGET_SDK_VERSION;
+    while (args.next()) |arg| {
+        if (std.mem.startsWith(u8, arg, "--min-sdk=")) {
+            min_sdk_version = std.fmt.parseInt(u32, arg["--min-sdk=".len..], 10) catch {
+                try out.print("error: invalid --min-sdk value: {s}\n", .{arg});
+                return error.InvalidArgument;
+            };
+        } else if (std.mem.startsWith(u8, arg, "--target-sdk=")) {
+            target_sdk_version = std.fmt.parseInt(u32, arg["--target-sdk=".len..], 10) catch {
+                try out.print("error: invalid --target-sdk value: {s}\n", .{arg});
+                return error.InvalidArgument;
+            };
+        } else {
+            try out.print("error: unrecognized argument: {s}\n", .{arg});
+            return error.InvalidArgument;
+        }
+    }
+    if (target_sdk_version < min_sdk_version) {
+        try out.print("error: --target-sdk ({d}) cannot be below --min-sdk ({d})\n", .{ target_sdk_version, min_sdk_version });
+        return error.InvalidSdkRange;
+    }
+
     try out.print("mlx android-aarch64-bluescreen experiment — building {s} (package {s})\n", .{ out_path, package });
+    try out.print("      min-sdk={d} target-sdk={d}{s}\n", .{ min_sdk_version, target_sdk_version, if (target_sdk_version > 30) " (WARNING: >30 is known to fail install on the real test device -- see TARGET_SDK_VERSION's comment)" else "" });
 
     try out.print("[1/7] generating AArch64 machine code + ELF64 shared object...\n", .{});
     const so_bytes = try elf_so.build(allocator, "libmain.so", "libandroid.so", "libc.so");
@@ -161,7 +212,7 @@ pub fn main() !void {
     try out.print("      {s}: {d} bytes\n", .{ SO_PATH, so_bytes.len });
 
     try out.print("[2/7] generating binary AndroidManifest.xml...\n", .{});
-    const manifest_bytes = try axml.buildManifest(allocator, package, FULLSCREEN_ENABLED, SYSTEM_STATUS_BAR_COLOR_ENABLED, MIN_SDK_VERSION, TARGET_SDK_VERSION);
+    const manifest_bytes = try axml.buildManifest(allocator, package, FULLSCREEN_ENABLED, SYSTEM_STATUS_BAR_COLOR_ENABLED, min_sdk_version, target_sdk_version);
     defer allocator.free(manifest_bytes);
     try out.print("      {s}: {d} bytes\n", .{ MANIFEST_PATH, manifest_bytes.len });
 
@@ -215,7 +266,7 @@ pub fn main() !void {
     try out.print("[7/7] signing (APK Signature Scheme v2/v3, auto-picked from targetSdkVersion)...\n", .{});
     // v1 is never dropped by schemesForTargetSdk (see its comment) -- the
     // META-INF/* entries above are unconditional for exactly that reason.
-    const schemes = apk_sign_v2v3.schemesForTargetSdk(TARGET_SDK_VERSION);
+    const schemes = apk_sign_v2v3.schemesForTargetSdk(target_sdk_version);
     try out.print("      v2: {}, v3: {}\n", .{ schemes.v2, schemes.v3 });
     const apk_bytes = try apk_sign_v2v3.signV2V3(allocator, &key, cert_der, v1_apk_bytes, 28, schemes.v2, schemes.v3);
     defer allocator.free(apk_bytes);

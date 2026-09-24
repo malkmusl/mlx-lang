@@ -1173,6 +1173,68 @@ contradicted.
     build (`bluescreen_stable_target30.apk`) on the Pixel 10 Pro test
     device and confirmed it installs. This is now the project's stable,
     shippable baseline.
+- **Twenty-seventh report: made the min/target SDK bounds configurable
+  instead of hardcoded, ahead of bringing this into the main compiler as
+  an `aarch64`/Android backend.** Before generalizing this experiment,
+  two gaps needed closing: testing a different SDK combination shouldn't
+  require editing source, and there was no single place documenting what
+  "min" and "target" actually mean here or why there's no "max."
+  - `tool/main.zig`: `MIN_SDK_VERSION`/`TARGET_SDK_VERSION` renamed to
+    `DEFAULT_MIN_SDK_VERSION`/`DEFAULT_TARGET_SDK_VERSION` and made
+    overridable with new `--min-sdk=N`/`--target-sdk=N` CLI flags,
+    validated (`target >= min`, reject anything else with a clear error)
+    before any work starts. The build banner now prints the resolved
+    `min-sdk=N target-sdk=N`, with an inline warning if target is pushed
+    above 30 (the known-installing ceiling).
+  - `mlx/main.mlx`: unchanged in mechanism -- mlx still has no argv
+    equivalent (this file's header comment), so `minSdkVersion()`/
+    `targetSdkVersion()` stay hardcoded functions requiring a source
+    edit + rebuild to change, now cross-documented against the Zig
+    port's flags. Added `validateSdkRange()`, called first thing in
+    `main()`, as the same defensive `target >= min` check the Zig CLI
+    now does at parse time -- there's no shared validation point here
+    since these are two independent functions, so it's a runtime guard
+    instead of a parse-time one.
+  - **On "max SDK":** deliberately did *not* add a
+    `android:maxSdkVersion` attribute to `<uses-sdk>`. It's a real
+    manifest attribute, but Android's own documentation deprecated it at
+    API level 4 and the framework has ignored it at install time on
+    every version since -- adding it would look like a "supports a
+    range" fix while doing nothing. The actual lever for "install on
+    everything" is the single `targetSdkVersion` ceiling: Android
+    normally installs on any device with API >= `minSdkVersion`
+    regardless of target (that's the whole reason this project's
+    `minSdkVersion` has stayed at 21 throughout), so raising
+    `targetSdkVersion` past 30 -- once the block below is actually
+    root-caused -- is what widens real-world support, not a separate
+    max field.
+  - Verified by rebuilding both ports: `zig ast-check tool/main.zig` (OK,
+    `zig run`/`zig test` remain blocked by the project's pre-existing,
+    unrelated Zig-version stdlib API mismatch -- the established
+    fallback bar for this port throughout the project) and running the
+    rebuilt mlx1-compiled `main.mlx` end to end, which produced a
+    byte-identical-sized 53,961-byte APK to the twenty-sixth report's
+    shipped build (same `min-sdk=21 target-sdk=30` banner, same signing
+    key reused, same v2/v3 signing) -- confirming the new validation and
+    banner output didn't disturb anything downstream.
+  - **Still open, and the actual blocker on bringing this into the main
+    compiler:** the `targetSdkVersion >= 31` install failure itself is
+    still unfixed, just easier to keep probing now. Continuing to guess
+    at more manifest attributes without a real error message has a poor
+    hit rate -- three plausible, well-researched candidates
+    (`exported`, `extractNativeLibs`, 16 KB alignment) were each
+    individually ruled out over five rounds. The most promising
+    un-tried path needs no adb or PC at all: modern Android ships a
+    `pm` command-line tool as part of the OS itself, reachable from any
+    on-device terminal app (e.g. Termux, installed like any other APK --
+    from F-Droid, since the Play Store build is deprecated). Running
+    `pm install -r /sdcard/Download/bluescreen.apk` locally, in a shell
+    on the test device itself, prints the actual
+    `PackageManager`/`PackageInstaller` rejection string directly to the
+    terminal (e.g. `INSTALL_FAILED_INVALID_APK: ...`) -- the same
+    information `adb install` would show, without needing adb or a
+    computer. This is the fastest real path to root-causing (not just
+    routing around) the 31+ block, and hasn't been tried yet.
 
 ## What's genuinely unverified
 
@@ -1216,22 +1278,35 @@ to visible pixels on a real screen. What's left:
 
 Roughly in order of what unblocks what:
 
-1. **Validate on a real target** — an Android emulator (`qemu-system-aarch64`
-   or the Android emulator itself) or device, via `adb install`. This is
-   the actual "does it work" gate everything above is standing in for.
-2. If the ABI assumptions need fixing, fix `native_activity.zig` and
+1. ~~Validate on a real target.~~ Done — a real Pixel 10 Pro confirmed
+   install and correct visible rendering; see the twenty-sixth and
+   twenty-seventh reports for the full path to a stable, real-device-
+   confirmed baseline at `targetSdkVersion=30`.
+2. **Root-cause and fix the `targetSdkVersion >= 31` install block**
+   before bringing this into the main compiler (item 3) — shipping a
+   generalized Android backend with a silent, unexplained SDK ceiling
+   baked in would just move today's guesswork into the compiler itself.
+   The next concrete step, detailed in the twenty-seventh report, is
+   getting a real `PackageManager` rejection reason via `pm install -r`
+   run locally in an on-device terminal app (Termux or similar) — no
+   adb or PC needed. Once the real cause is known, `--target-sdk=N`
+   (`tool/main.zig`) makes testing the fix fast without editing source.
+3. If the ABI assumptions need fixing, fix `native_activity.zig` and
    re-verify with the same `llvm-mc` disassembly technique.
-3. **Bring this into the language**, not just a side tool: an `aarch64`
+4. **Bring this into the language**, not just a side tool: an `aarch64`
    backend under `compiler/selfhost/backend/` (mirroring
    `compiler/selfhost/backend/x86_64/`), an `android`/ELF-shared-object
    object-format mode alongside `compiler/selfhost/object/elf64.mlx`, and
    eventually a `std.android` module so this is expressible in ordinary
    mlx source rather than hand-built by a bespoke Zig tool. The Zig tool
    here is scaffolding to de-risk that work, not a replacement for it.
-4. ~~APK Signature Scheme v2 (or v2+v1 for broader compatibility).~~ Done
+   Blocked on item 2 by design, not just sequencing.
+5. ~~APK Signature Scheme v2 (or v2+v1 for broader compatibility).~~ Done
    — see the nineteenth report above (v2 *and* v3, alongside v1).
-5. A real target triple story in the build system (`mlx build --target
+6. A real target triple story in the build system (`mlx build --target
    aarch64-android`), matching how `zig build`'s `standardTargetOptions`
    already works for the *bootstrap* compiler's own binary today (that's
    the host `mlx0`'s target, not the target mlx *emits code for* — this
-   experiment is about the latter).
+   experiment is about the latter). Should expose `--min-sdk`/
+   `--target-sdk` (or a `std.android` config struct, once item 4 lands)
+   the same way `tool/main.zig`'s CLI flags do now.
