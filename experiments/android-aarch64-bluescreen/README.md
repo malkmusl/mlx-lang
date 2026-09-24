@@ -916,6 +916,54 @@ contradicted.
     on-device install to confirm the warning is actually gone -- this
     round's verification is tool-based, same caveat as the nineteenth
     report's.
+- **Twenty-first report: real-device install of the twentieth report's
+  build was flatly refused** ("You can't install this app on your
+  device"), not just warned about. Root cause: a genuine, previously
+  latent bug that every prior round's real-device testing happened not to
+  trigger. `main.mlx`/`main.zig` called `jar_sign.generateKeyPair` fresh
+  on *every single build* -- meaning every one of the twenty-one APKs
+  shipped across this experiment's real-device rounds was signed with a
+  **different, randomly-generated** self-signed certificate. Android
+  requires an app "update" (same package name) to be signed with the
+  *same* certificate as whatever's currently installed; once the device
+  already had one of these randomly-keyed builds installed, the next
+  differently-keyed build could no longer install over it at all -- not a
+  warning, an outright block, and unrelated to the targetSdkVersion fix
+  from the twentieth report (which had already shipped and was still
+  correct; this is a second, independent bug the block symptom happened
+  to surface at the same time).
+  - Fixed by persisting the RSA keypair (`n`, `d` -- `e` is always the
+    fixed 65537 public exponent, not stored) to a small file
+    (`debug_signing_key.bin`, checked into the repo, at a path both ports
+    agree on) instead of generating a new one every build: `n_bytes` as a
+    4-byte little-endian header, then `n` and `d` each as exactly
+    `n_bytes` big-endian bytes -- not a real keystore format (no JKS/PKCS12
+    parser exists here), just enough to make the signing identity stable.
+    `main.mlx`/`main.zig` now try loading this file first and only fall
+    back to `generateKeyPair` (saving the result for next time) if it's
+    missing or short/corrupt. Mirrors the *purpose* of Android Studio's
+    own `debug.keystore` -- a fixed, throwaway, non-secret signing
+    identity checked in so builds stay installable as updates over each
+    other -- not its file format. Since the self-signed certificate's
+    other inputs (CN, serial, validity dates) were already static, the
+    certificate bytes are now fully deterministic across rebuilds, not
+    just "some equivalent key": confirmed by building twice in a row and
+    diffing `apksigner verify --print-certs`'s reported certificate
+    SHA-256 digest -- byte-identical, and a second build now takes
+    seconds instead of the ~1-2 minute keygen.
+  - Real consequence for whoever is testing this on-device: **this fix
+    does not retroactively repair an already-installed, differently-keyed
+    build.** The device needs one manual uninstall of whatever's
+    currently installed; every build from this point forward (using the
+    now-checked-in key) will then install cleanly as an update over the
+    previous one, indefinitely, with no further uninstalls needed unless
+    `debug_signing_key.bin` itself is deleted or regenerated.
+  - Verified the same way as the previous two rounds (`apksigner verify`
+    still v1/v2/v3 all `true`, `unzip -t` clean) plus the
+    build-twice-diff-the-certificate check described above. Still
+    pending: a real device confirming both the install block is gone
+    *and* the targetSdkVersion warning from the twentieth report doesn't
+    reappear now that install can actually proceed.
 
 ## What's genuinely unverified
 

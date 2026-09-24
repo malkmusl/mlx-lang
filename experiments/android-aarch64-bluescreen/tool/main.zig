@@ -7,12 +7,14 @@
 //!
 //! Usage: `zig run main.zig -- [output.apk] [package.name]`
 const std = @import("std");
+const Managed = std.math.big.int.Managed;
 const elf_so = @import("elf_so.zig");
 const axml = @import("axml.zig");
 const dex = @import("dex.zig");
 const zip = @import("zip.zig");
 const jar_sign = @import("jar_sign.zig");
 const apk_sign_v2v3 = @import("apk_sign_v2v3.zig");
+const bn = @import("bignum.zig");
 
 const SO_PATH = "lib/arm64-v8a/libmain.so";
 const MANIFEST_PATH = "AndroidManifest.xml";
@@ -53,6 +55,79 @@ const MIN_SDK_VERSION: u32 = 21;
 // keep including v1+v2+v3 (already the ceiling at 28+), never fewer.
 const TARGET_SDK_VERSION: u32 = 35;
 
+// Absolute path (not repo-relative) to a small persisted RSA keypair,
+// reused across builds instead of generating a fresh random one every
+// time -- shared with mlx/main.mlx's identical `keyPath()`/on-disk format
+// so mlx- and zig-built APKs carry the SAME signing identity and stay
+// installable as updates over each other. This is a real fix for a real
+// bug: every build up through the twenty-first round called
+// jar_sign.generateKeyPair fresh, so every shipped APK had a DIFFERENT
+// self-signed certificate -- and Android refuses to install an "update"
+// whose signing certificate doesn't match whatever's already installed
+// under the same package name, confirmed on a real device as a "You
+// can't install this app on your device" toast after several
+// differently-keyed builds had been installed in a row. Mirrors the
+// purpose (not the file format) of Android Studio's own debug.keystore.
+const KEY_PATH = "/home/user/mlx-lang/experiments/android-aarch64-bluescreen/debug_signing_key.bin";
+
+// On-disk format: [4 bytes LE n_bytes][n_bytes bytes n, big-endian]
+// [n_bytes bytes d, big-endian] -- not a real keystore format, just
+// enough to keep this experiment's signing identity stable across
+// rebuilds (and across which port built it). `e` isn't persisted since
+// it's always the fixed public exponent 65537 by construction. Returns
+// null if the file doesn't exist yet or is short/corrupt (caller then
+// falls back to generating a fresh key).
+fn tryLoadKeyPair(allocator: std.mem.Allocator) !?jar_sign.RsaKeyPair {
+    const file = std.fs.openFileAbsolute(KEY_PATH, .{}) catch return null;
+    defer file.close();
+
+    var header: [4]u8 = undefined;
+    const header_read = try file.readAll(&header);
+    if (header_read != 4) return null;
+    const n_bytes: usize = std.mem.readInt(u32, &header, .little);
+
+    const body = try allocator.alloc(u8, n_bytes * 2);
+    defer allocator.free(body);
+    const body_read = try file.readAll(body);
+    if (body_read != n_bytes * 2) return null;
+
+    var n = try bn.initFromBytesBE(allocator, body[0..n_bytes]);
+    errdefer n.deinit();
+    var d = try bn.initFromBytesBE(allocator, body[n_bytes .. n_bytes * 2]);
+    errdefer d.deinit();
+    var e = try Managed.initSet(allocator, @as(u32, 65537));
+    errdefer e.deinit();
+
+    return jar_sign.RsaKeyPair{ .allocator = allocator, .n = n, .e = e, .d = d, .n_bytes = n_bytes };
+}
+
+fn saveKeyPair(key: *const jar_sign.RsaKeyPair) !void {
+    const file = try std.fs.createFileAbsolute(KEY_PATH, .{});
+    defer file.close();
+
+    var header: [4]u8 = undefined;
+    std.mem.writeInt(u32, &header, @as(u32, @intCast(key.n_bytes)), .little);
+    try file.writeAll(&header);
+
+    const allocator = key.allocator;
+
+    const n_padded = try allocator.alloc(u8, key.n_bytes);
+    defer allocator.free(n_padded);
+    @memset(n_padded, 0);
+    const n_min = try bn.toBytesBEMinimal(allocator, &key.n);
+    defer allocator.free(n_min);
+    @memcpy(n_padded[key.n_bytes - n_min.len ..], n_min);
+    try file.writeAll(n_padded);
+
+    const d_padded = try allocator.alloc(u8, key.n_bytes);
+    defer allocator.free(d_padded);
+    @memset(d_padded, 0);
+    const d_min = try bn.toBytesBEMinimal(allocator, &key.d);
+    defer allocator.free(d_min);
+    @memcpy(d_padded[key.n_bytes - d_min.len ..], d_min);
+    try file.writeAll(d_padded);
+}
+
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
@@ -83,11 +158,20 @@ pub fn main() !void {
     defer allocator.free(dex_bytes);
     try out.print("      {s}: {d} bytes\n", .{ DEX_PATH, dex_bytes.len });
 
-    try out.print("[4/7] generating RSA-2048 signing key + self-signed certificate (this takes a few seconds)...\n", .{});
-    var timer = try std.time.Timer.start();
-    var key = try jar_sign.generateKeyPair(allocator, 2048);
+    try out.print("[4/7] loading or generating RSA signing key + self-signed certificate...\n", .{});
+    var key: jar_sign.RsaKeyPair = undefined;
+    if (try tryLoadKeyPair(allocator)) |loaded| {
+        key = loaded;
+        try out.print("      reusing saved signing key: {s}\n", .{KEY_PATH});
+    } else {
+        try out.print("      no saved key found -- generating a new one (this takes a few seconds)...\n", .{});
+        var timer = try std.time.Timer.start();
+        key = try jar_sign.generateKeyPair(allocator, 2048);
+        try out.print("      keygen: {d}ms\n", .{timer.lap() / 1_000_000});
+        try saveKeyPair(&key);
+        try out.print("      saved signing key: {s}\n", .{KEY_PATH});
+    }
     defer key.deinit();
-    try out.print("      keygen: {d}ms\n", .{timer.lap() / 1_000_000});
     const cert_der = try jar_sign.buildSelfSignedCert(allocator, &key, "mlx-android-aarch64-bluescreen", 1);
     defer allocator.free(cert_der);
     try out.print("      certificate: {d} bytes\n", .{cert_der.len});

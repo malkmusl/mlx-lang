@@ -78,6 +78,85 @@ fn printBytes(label: []const u8, n: usize) -> void {
     w = std.io.println(" bytes")
 }
 
+// Absolute (not repo-relative -- mlx has no argv, and the built binary's
+// own CWD is wherever it's *invoked* from, e.g. an arbitrary /tmp build
+// directory per the README's own `cd /tmp && /tmp/build-apk` usage, not
+// the repo) path to a small persisted RSA keypair, reused across builds
+// instead of generating a fresh random one every time. This is a real
+// fix for a real bug: every build through the twenty-first round called
+// jar_sign.generateKeyPair fresh, so every shipped APK had a DIFFERENT
+// self-signed certificate -- and Android refuses to install an "update"
+// whose signing certificate doesn't match whatever's already installed
+// under the same package name, confirmed on a real device as a "You
+// can't install this app on your device" toast after several
+// differently-keyed builds had been installed in a row. Mirrors the
+// purpose (not the file format) of Android Studio's own debug.keystore:
+// a fixed, throwaway, non-secret signing identity checked in so builds
+// stay installable as updates over each other. See tryLoadKeyPair/
+// saveKeyPair below for the (deliberately minimal, not-a-real-keystore)
+// on-disk format.
+fn keyPath() -> []const u8 { return "/home/user/mlx-lang/experiments/android-aarch64-bluescreen/debug_signing_key.bin" }
+
+fn appendU32LE(list: *std.array_list.ArrayList, v: u32) -> void {
+    var ok0: bool = std.array_list.ArrayList.appendAt(list, @intCast(u8, v & 255))
+    var ok1: bool = std.array_list.ArrayList.appendAt(list, @intCast(u8, (v >> 8) & 255))
+    var ok2: bool = std.array_list.ArrayList.appendAt(list, @intCast(u8, (v >> 16) & 255))
+    var ok3: bool = std.array_list.ArrayList.appendAt(list, @intCast(u8, (v >> 24) & 255))
+}
+
+fn appendSlice(list: *std.array_list.ArrayList, src: []const u8) -> void {
+    var i: usize = 0
+    while i < src.length {
+        var ok: bool = std.array_list.ArrayList.appendAt(list, src[i])
+        i += 1
+    }
+}
+
+// On-disk format: [4 bytes LE nBytes][nBytes bytes n, big-endian][nBytes
+// bytes d, big-endian]. Returns nBytes on success, 0 if the file doesn't
+// exist yet or is short/corrupt (caller then falls back to generating a
+// fresh key). A single std.fs.read per field is safe here (not looped):
+// unlike /dev/urandom (see bignum.mlx's fillRandomBytes), a regular local
+// file this small always returns its full requested length in one
+// syscall on Linux, short only at real EOF -- which this function treats
+// as "no valid saved key" either way.
+fn tryLoadKeyPair(allocator: std.allocator.Allocator, n: *bn.BigUint, d: *bn.BigUint) -> usize {
+    const file = std.fs.open(@ptrCast([*]const u8, keyPath()), std.fs.READ_ONLY, 0)
+    if !std.fs.isValid(file) { return 0 }
+
+    var header: std.array_list.ArrayList = std.array_list.ArrayList.init(allocator, 4)
+    header = std.array_list.ArrayList.resize(header, 4, 0)
+    const headerRead: isize = std.fs.read(file, header.items, 4)
+    if headerRead != 4 {
+        var okClose: bool = std.fs.close(file)
+        return 0
+    }
+    const nBytes: usize = @intCast(usize, header.items[0]) | (@intCast(usize, header.items[1]) << 8) | (@intCast(usize, header.items[2]) << 16) | (@intCast(usize, header.items[3]) << 24)
+
+    var body: std.array_list.ArrayList = std.array_list.ArrayList.init(allocator, nBytes * 2)
+    body = std.array_list.ArrayList.resize(body, nBytes * 2, 0)
+    const bodyRead: isize = std.fs.read(file, body.items, nBytes * 2)
+    var okClose2: bool = std.fs.close(file)
+    if bodyRead != @intCast(isize, nBytes * 2) { return 0 }
+
+    bn.fromBytesBE(n, body.items[0..nBytes])
+    bn.fromBytesBE(d, body.items[nBytes..nBytes * 2])
+    return nBytes
+}
+
+fn saveKeyPair(allocator: std.allocator.Allocator, n: *bn.BigUint, d: *bn.BigUint, nBytes: usize) -> void {
+    var buf: std.array_list.ArrayList = std.array_list.ArrayList.init(allocator, 4 + nBytes * 2)
+    appendU32LE(&buf, @intCast(u32, nBytes))
+    const nEnc = bn.toBytesBEPadded(n, allocator, nBytes)
+    appendSlice(&buf, nEnc.items[0..nEnc.length])
+    const dEnc = bn.toBytesBEPadded(d, allocator, nBytes)
+    appendSlice(&buf, dEnc.items[0..dEnc.length])
+
+    const file = std.fs.open(@ptrCast([*]const u8, keyPath()), std.fs.WRITE_ONLY | std.fs.CREATE | std.fs.TRUNCATE, 420)
+    var wroteOk: bool = std.fs.writeAllBytes(file, @ptrCast([*]const u8, buf.items[0..buf.length]), buf.length)
+    var closedOk: bool = std.fs.close(file)
+}
+
 pub fn main() -> void {
     const allocator: std.allocator.Allocator = std.page_allocator.init()
 
@@ -99,15 +178,25 @@ pub fn main() -> void {
     const dexBytes = dex.buildEmptyDex(allocator)
     printBytes(dexPath(), dexBytes.length)
 
-    if !std.io.println("[4/7] generating RSA-1024 signing key + self-signed certificate (this takes about a minute)...") { return }
-    const keygenStart: usize = std.time.monotonicNanoseconds()
+    if !std.io.println("[4/7] loading or generating RSA-1024 signing key + self-signed certificate...") { return }
     var n: bn.BigUint = undefined
     var d: bn.BigUint = undefined
-    const nBytes: usize = jar_sign.generateKeyPair(&n, &d, 1024)
-    const keygenElapsedMs: usize = std.time.elapsedNanoseconds(keygenStart, std.time.monotonicNanoseconds()) / 1000000
-    var w1: bool = std.io.print("      keygen: ")
-    w1 = std.io.writeUnsigned(std.io.stdout(), keygenElapsedMs)
-    w1 = std.io.println("ms")
+    var nBytes: usize = tryLoadKeyPair(allocator, &n, &d)
+    if nBytes > 0 {
+        var wLoaded: bool = std.io.print("      reusing saved signing key: ")
+        wLoaded = std.io.println(keyPath())
+    } else {
+        var wGen: bool = std.io.println("      no saved key found -- generating a new one (this takes about a minute)...")
+        const keygenStart: usize = std.time.monotonicNanoseconds()
+        nBytes = jar_sign.generateKeyPair(&n, &d, 1024)
+        const keygenElapsedMs: usize = std.time.elapsedNanoseconds(keygenStart, std.time.monotonicNanoseconds()) / 1000000
+        var w1: bool = std.io.print("      keygen: ")
+        w1 = std.io.writeUnsigned(std.io.stdout(), keygenElapsedMs)
+        w1 = std.io.println("ms")
+        saveKeyPair(allocator, &n, &d, nBytes)
+        var wSaved: bool = std.io.print("      saved signing key: ")
+        wSaved = std.io.println(keyPath())
+    }
     const certDer = jar_sign.buildSelfSignedCert(allocator, &n, &d, nBytes, certCn(), 1)
     printBytes("certificate", certDer.length)
 
