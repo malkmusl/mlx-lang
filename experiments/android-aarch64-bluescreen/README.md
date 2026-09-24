@@ -1401,6 +1401,10 @@ contradicted.
   would generate RSA-2048 where mlx generates RSA-1024 (both use the
   committed 1024-bit key when it's present). `main.zig` itself still
   doesn't build on Zig 0.16 for the API reasons above.
+  - **Project rule:** shipped APKs are always built by the mlx port. The
+    Zig port exists only as an independent cross-check -- kept in step
+    with the mlx code and compared byte for byte as above -- so its
+    `main.zig`/CLI isn't maintained as a product.
 
 ## What's genuinely unverified
 
