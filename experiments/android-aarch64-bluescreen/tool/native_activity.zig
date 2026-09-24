@@ -106,6 +106,21 @@ pub const JNI_CALL_OBJECT_METHOD: u32 = 272;
 pub const JNI_CALL_VOID_METHOD: u32 = 488;
 pub const JNI_GET_FIELD_ID: u32 = 752;
 pub const JNI_SET_INT_FIELD: u32 = 872;
+/// ExceptionClear=17 (index*8=136). A NULL result from FindClass/
+/// GetMethodID/GetFieldID always means an exception is now pending on this
+/// JNIEnv -- and per the JNI spec, calling almost any other JNI function
+/// while an exception is pending is undefined behavior; ART's real,
+/// observed behavior for that is a fatal abort of the whole process, not a
+/// contained failure. fixDisplayCutoutMode's first version below didn't
+/// check any of this and likely explains a real-device instant crash: no
+/// class/method/field name typo needs to exist for a legitimate reason to
+/// fail (a stricter classloader, a hidden-API policy change on some OS
+/// build) and the very next JNI call would then abort the app. Every
+/// handle this function depends on later is now null-checked immediately,
+/// bailing out to a shared epilogue that clears any pending exception
+/// before returning, so a failure here degrades to "cutout fix skipped"
+/// instead of "app doesn't start".
+pub const JNI_EXCEPTION_CLEAR: u32 = 136;
 
 /// WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES,
 /// ground-truthed against the real Android developer docs (not memorized):
@@ -598,6 +613,38 @@ pub fn buildText(
     // inherited/overridden methods correctly starting from either the
     // declaring class or a subclass.
     //
+    // A real-device crash (SIGILL, ILL_ILLOPC, fault PC landing squarely on
+    // the raw bytes of "android/app/NativeActivity" read as an
+    // instruction) confirmed the very first version of this function had a
+    // real bug: each emitCString call site emitted its string's bytes
+    // directly in the middle of straight-line code, immediately after a
+    // normal instruction and before another one, with nothing to jump
+    // over it. Ordinary sequential execution doesn't know those bytes
+    // aren't code -- it just fell straight from the last real instruction
+    // into the string data and tried to execute it. Fixed by packing every
+    // C string this function needs into one block, jumped over with a
+    // single unconditional branch before any of it is reached, immediately
+    // after this function's own entry point -- every string's address is
+    // still just an ordinary ADRP+ADD against an address already known by
+    // the time it's used below, same as before.
+    const skip_strings_idx = out.items.len;
+    try out.append(0); // placeholder B real_start (patched below)
+
+    const str_native_activity = try emitCString(&out, text_vaddr, "android/app/NativeActivity");
+    const str_get_window = try emitCString(&out, text_vaddr, "getWindow");
+    const str_get_window_sig = try emitCString(&out, text_vaddr, "()Landroid/view/Window;");
+    const str_window = try emitCString(&out, text_vaddr, "android/view/Window");
+    const str_get_attrs = try emitCString(&out, text_vaddr, "getAttributes");
+    const str_get_attrs_sig = try emitCString(&out, text_vaddr, "()Landroid/view/WindowManager$LayoutParams;");
+    const str_set_attrs = try emitCString(&out, text_vaddr, "setAttributes");
+    const str_set_attrs_sig = try emitCString(&out, text_vaddr, "(Landroid/view/WindowManager$LayoutParams;)V");
+    const str_layout_params = try emitCString(&out, text_vaddr, "android/view/WindowManager$LayoutParams");
+    const str_cutout_field = try emitCString(&out, text_vaddr, "layoutInDisplayCutoutMode");
+    const str_int_sig = try emitCString(&out, text_vaddr, "I");
+
+    const real_start = out.items.len;
+    out.items[skip_strings_idx] = a64.b(@as(i32, @intCast(real_start)) * 4 - @as(i32, @intCast(skip_strings_idx)) * 4);
+
     // Stack frame (96 bytes, 16-aligned): [0]=env [8]=activityObj
     // [16]=windowClass [24]=layoutParamsClass [32]=windowObj [40]=attrsObj
     // [48]=getWindowMid [56]=getAttrsMid [64]=setAttrsMid
@@ -607,6 +654,20 @@ pub fn buildText(
     // (and every JNI call itself) is free to clobber any caller-saved
     // register -- the same discipline drainInputEvents already uses
     // around its own GOT calls.
+    //
+    // Every handle a later call depends on is null-checked immediately
+    // after it's produced, bailing out to a shared epilogue (cutout_bail)
+    // that clears any pending JNI exception before returning, rather than
+    // pressing on: a NULL from FindClass/GetMethodID/GetFieldID always
+    // means an exception is now pending on this JNIEnv, and calling
+    // almost any other JNI function while one is pending is undefined
+    // behavior -- ART's real, observed response to that is a fatal abort
+    // of the whole process, not a contained failure. This wasn't what
+    // caused the crash above (that was the string-data bug), but it's
+    // still a real gap this function's first version had, worth closing
+    // now rather than leaving as a second latent way to take the app down
+    // if any class/method/field lookup ever legitimately fails on some
+    // other OS build.
     try out.append(a64.subImm64(a64.sp, a64.sp, 96));
     try out.append(a64.strX(a64.lr, a64.sp, 80)); // save LR (non-leaf: many JNI calls via BLR)
 
@@ -618,66 +679,69 @@ pub fn buildText(
     try out.append(a64.strX(1, a64.sp, 8)); // save activityObj
 
     // activityClass = FindClass(env, "android/app/NativeActivity")
-    const str_native_activity = try emitCString(&out, text_vaddr, "android/app/NativeActivity");
     try out.append(a64.ldrX(0, a64.sp, 0)); // x0 = env
     try emitAdrpAdd(&out, text_vaddr, 1, str_native_activity);
     try emitJniCall(&out, JNI_FIND_CLASS); // x0 = activityClass
+    const bail_activity_class_idx = out.items.len;
+    try out.append(0); // if activityClass == NULL, bail (patched below)
     try out.append(a64.movReg64(9, 0)); // x9 = activityClass (kept live for the very next call only)
 
     // getWindowMid = GetMethodID(env, activityClass, "getWindow", "()Landroid/view/Window;")
-    const str_get_window = try emitCString(&out, text_vaddr, "getWindow");
-    const str_get_window_sig = try emitCString(&out, text_vaddr, "()Landroid/view/Window;");
     try out.append(a64.ldrX(0, a64.sp, 0)); // x0 = env
     try out.append(a64.movReg64(1, 9)); // x1 = activityClass
     try emitAdrpAdd(&out, text_vaddr, 2, str_get_window);
     try emitAdrpAdd(&out, text_vaddr, 3, str_get_window_sig);
     try emitJniCall(&out, JNI_GET_METHOD_ID); // x0 = getWindowMid
+    const bail_get_window_mid_idx = out.items.len;
+    try out.append(0); // if getWindowMid == NULL, bail (patched below)
     try out.append(a64.strX(0, a64.sp, 48)); // save getWindowMid
 
     // windowClass = FindClass(env, "android/view/Window")
-    const str_window = try emitCString(&out, text_vaddr, "android/view/Window");
     try out.append(a64.ldrX(0, a64.sp, 0)); // x0 = env
     try emitAdrpAdd(&out, text_vaddr, 1, str_window);
     try emitJniCall(&out, JNI_FIND_CLASS); // x0 = windowClass
+    const bail_window_class_idx = out.items.len;
+    try out.append(0); // if windowClass == NULL, bail (patched below)
     try out.append(a64.strX(0, a64.sp, 16)); // save windowClass
     try out.append(a64.movReg64(9, 0)); // x9 = windowClass (kept live for the next call only)
 
     // getAttrsMid = GetMethodID(env, windowClass, "getAttributes", "()Landroid/view/WindowManager$LayoutParams;")
-    const str_get_attrs = try emitCString(&out, text_vaddr, "getAttributes");
-    const str_get_attrs_sig = try emitCString(&out, text_vaddr, "()Landroid/view/WindowManager$LayoutParams;");
     try out.append(a64.ldrX(0, a64.sp, 0)); // x0 = env
     try out.append(a64.movReg64(1, 9)); // x1 = windowClass
     try emitAdrpAdd(&out, text_vaddr, 2, str_get_attrs);
     try emitAdrpAdd(&out, text_vaddr, 3, str_get_attrs_sig);
     try emitJniCall(&out, JNI_GET_METHOD_ID); // x0 = getAttrsMid
+    const bail_get_attrs_mid_idx = out.items.len;
+    try out.append(0); // if getAttrsMid == NULL, bail (patched below)
     try out.append(a64.strX(0, a64.sp, 56)); // save getAttrsMid
 
     // setAttrsMid = GetMethodID(env, windowClass, "setAttributes", "(Landroid/view/WindowManager$LayoutParams;)V")
-    const str_set_attrs = try emitCString(&out, text_vaddr, "setAttributes");
-    const str_set_attrs_sig = try emitCString(&out, text_vaddr, "(Landroid/view/WindowManager$LayoutParams;)V");
     try out.append(a64.ldrX(0, a64.sp, 0)); // x0 = env
     try out.append(a64.ldrX(1, a64.sp, 16)); // x1 = windowClass (reload: the previous call clobbered x9)
     try emitAdrpAdd(&out, text_vaddr, 2, str_set_attrs);
     try emitAdrpAdd(&out, text_vaddr, 3, str_set_attrs_sig);
     try emitJniCall(&out, JNI_GET_METHOD_ID); // x0 = setAttrsMid
+    const bail_set_attrs_mid_idx = out.items.len;
+    try out.append(0); // if setAttrsMid == NULL, bail (patched below)
     try out.append(a64.strX(0, a64.sp, 64)); // save setAttrsMid
 
     // layoutParamsClass = FindClass(env, "android/view/WindowManager$LayoutParams")
-    const str_layout_params = try emitCString(&out, text_vaddr, "android/view/WindowManager$LayoutParams");
     try out.append(a64.ldrX(0, a64.sp, 0)); // x0 = env
     try emitAdrpAdd(&out, text_vaddr, 1, str_layout_params);
     try emitJniCall(&out, JNI_FIND_CLASS); // x0 = layoutParamsClass
+    const bail_layout_params_class_idx = out.items.len;
+    try out.append(0); // if layoutParamsClass == NULL, bail (patched below)
     try out.append(a64.strX(0, a64.sp, 24)); // save layoutParamsClass
     try out.append(a64.movReg64(9, 0)); // x9 = layoutParamsClass (kept live for the next call only)
 
     // cutoutModeFid = GetFieldID(env, layoutParamsClass, "layoutInDisplayCutoutMode", "I")
-    const str_cutout_field = try emitCString(&out, text_vaddr, "layoutInDisplayCutoutMode");
-    const str_int_sig = try emitCString(&out, text_vaddr, "I");
     try out.append(a64.ldrX(0, a64.sp, 0)); // x0 = env
     try out.append(a64.movReg64(1, 9)); // x1 = layoutParamsClass
     try emitAdrpAdd(&out, text_vaddr, 2, str_cutout_field);
     try emitAdrpAdd(&out, text_vaddr, 3, str_int_sig);
     try emitJniCall(&out, JNI_GET_FIELD_ID); // x0 = cutoutModeFid
+    const bail_cutout_mode_fid_idx = out.items.len;
+    try out.append(0); // if cutoutModeFid == NULL, bail (patched below)
     try out.append(a64.strX(0, a64.sp, 72)); // save cutoutModeFid
 
     // windowObj = CallObjectMethod(env, activityObj, getWindowMid)
@@ -685,6 +749,8 @@ pub fn buildText(
     try out.append(a64.ldrX(1, a64.sp, 8)); // x1 = activityObj
     try out.append(a64.ldrX(2, a64.sp, 48)); // x2 = getWindowMid
     try emitJniCall(&out, JNI_CALL_OBJECT_METHOD); // x0 = windowObj
+    const bail_window_obj_idx = out.items.len;
+    try out.append(0); // if windowObj == NULL, bail (patched below)
     try out.append(a64.strX(0, a64.sp, 32)); // save windowObj
 
     // attrsObj = CallObjectMethod(env, windowObj, getAttrsMid)
@@ -692,6 +758,8 @@ pub fn buildText(
     try out.append(a64.ldrX(1, a64.sp, 32)); // x1 = windowObj
     try out.append(a64.ldrX(2, a64.sp, 56)); // x2 = getAttrsMid
     try emitJniCall(&out, JNI_CALL_OBJECT_METHOD); // x0 = attrsObj
+    const bail_attrs_obj_idx = out.items.len;
+    try out.append(0); // if attrsObj == NULL, bail (patched below)
     try out.append(a64.strX(0, a64.sp, 40)); // save attrsObj
 
     // attrsObj.layoutInDisplayCutoutMode = LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
@@ -707,6 +775,24 @@ pub fn buildText(
     try out.append(a64.ldrX(2, a64.sp, 64)); // x2 = setAttrsMid
     try out.append(a64.ldrX(3, a64.sp, 40)); // x3 = attrsObj
     try emitJniCall(&out, JNI_CALL_VOID_METHOD);
+
+    // cutout_bail: every early-out above lands here too. Clearing any
+    // pending exception is harmless when none is pending (ExceptionClear
+    // is documented as a no-op in that case) and required when one is, so
+    // it's unconditional rather than guarded.
+    const cutout_bail = out.items.len;
+    out.items[bail_activity_class_idx] = a64.cbzX(0, @as(i32, @intCast(cutout_bail)) * 4 - @as(i32, @intCast(bail_activity_class_idx)) * 4);
+    out.items[bail_get_window_mid_idx] = a64.cbzX(0, @as(i32, @intCast(cutout_bail)) * 4 - @as(i32, @intCast(bail_get_window_mid_idx)) * 4);
+    out.items[bail_window_class_idx] = a64.cbzX(0, @as(i32, @intCast(cutout_bail)) * 4 - @as(i32, @intCast(bail_window_class_idx)) * 4);
+    out.items[bail_get_attrs_mid_idx] = a64.cbzX(0, @as(i32, @intCast(cutout_bail)) * 4 - @as(i32, @intCast(bail_get_attrs_mid_idx)) * 4);
+    out.items[bail_set_attrs_mid_idx] = a64.cbzX(0, @as(i32, @intCast(cutout_bail)) * 4 - @as(i32, @intCast(bail_set_attrs_mid_idx)) * 4);
+    out.items[bail_layout_params_class_idx] = a64.cbzX(0, @as(i32, @intCast(cutout_bail)) * 4 - @as(i32, @intCast(bail_layout_params_class_idx)) * 4);
+    out.items[bail_cutout_mode_fid_idx] = a64.cbzX(0, @as(i32, @intCast(cutout_bail)) * 4 - @as(i32, @intCast(bail_cutout_mode_fid_idx)) * 4);
+    out.items[bail_window_obj_idx] = a64.cbzX(0, @as(i32, @intCast(cutout_bail)) * 4 - @as(i32, @intCast(bail_window_obj_idx)) * 4);
+    out.items[bail_attrs_obj_idx] = a64.cbzX(0, @as(i32, @intCast(cutout_bail)) * 4 - @as(i32, @intCast(bail_attrs_obj_idx)) * 4);
+
+    try out.append(a64.ldrX(0, a64.sp, 0)); // x0 = env
+    try emitJniCall(&out, JNI_EXCEPTION_CLEAR);
 
     try out.append(a64.ldrX(a64.lr, a64.sp, 80)); // restore LR
     try out.append(a64.addImm64(a64.sp, a64.sp, 96));

@@ -645,9 +645,50 @@ Tested by installing the mlx-built `bluescreen.apk` on a real device
     (`aapt`, `jarsigner -verify`, `unzip -t`) re-run clean. Real-device
     behavior is still the only way to know whether the cutout fix and
     touch actually work as intended.
+- **Seventeenth report: the sixteenth round's real-device warning came
+  true** -- instant crash on launch. This time a bug report (tombstone)
+  was available, and it named the exact fault precisely: `SIGILL,
+  ILL_ILLOPC` (illegal instruction) at a PC landing inside
+  `ANativeActivity_onCreate`, with the memory dump around the fault
+  address reading `"android/app/Nati"` -- literally the bytes of the
+  first JNI call's class-name string, being fetched and executed as an
+  AArch64 instruction. `emitCString` was placing each string's raw bytes
+  directly in the middle of straight-line code -- right after one real
+  instruction and right before the next -- with nothing to jump over it.
+  Ordinary sequential execution has no way to know those bytes aren't
+  code; it just fell out of the last real instruction straight into the
+  string data. This was a real, confirmed bug, not the JNI vtable
+  offsets or method signatures independently re-verified while
+  investigating (both checked out; the AOSP struct-field offsets used
+  for `activity->env`/`activity->clazz` were also freshly re-verified
+  against real NDK source rather than re-trusted from memory, and also
+  checked out). Fixed by hoisting every one of `fixDisplayCutoutMode`'s
+  11 C-string constants into one block immediately after the function's
+  entry point, guarded by a single unconditional branch that jumps over
+  all of them before any instruction can fall through into the data --
+  every string's address is still an ordinary ADRP+ADD against an
+  address already known by the time it's used, only the *order* of
+  emission changed. While already in there, also closed a second, latent
+  gap the crash investigation surfaced: the original JNI call chain never
+  checked any handle for `NULL`, and per the JNI spec a `NULL` from
+  `FindClass`/`GetMethodID`/`GetFieldID` always means an exception is now
+  pending on that `JNIEnv` -- calling almost any other JNI function while
+  one is pending is undefined behavior, and ART's real response to that
+  is a fatal abort of the whole process. Every handle the function
+  depends on is now null-checked immediately after it's produced, bailing
+  out to a shared epilogue that unconditionally clears any pending
+  exception before returning, so a failure there now degrades to "cutout
+  fix skipped" rather than a second way to take the whole app down.
+  Rebuilt and re-verified with the same rigor as the round that shipped
+  the bug: disassembled the corrected `.text`, confirmed the new
+  unconditional branch (`B`, `0x226c` -> `0x2388`) correctly jumps clear
+  over the entire string-data block, confirmed all 9 null-check branches
+  land on the same shared exception-clearing epilogue, and re-checked
+  every stack offset and JNI table offset the restructuring touched --
+  all unchanged and correct. Full external-tool suite re-run clean.
 
 This closes out the black-screen-and-ANR investigation and covers four
-follow-up feature/fix rounds: sixteen real-device rounds, eight genuine
+follow-up feature/fix rounds: seventeen real-device rounds, nine genuine
 bugs found and fixed (missing `onNativeWindowResized`/
 `onNativeWindowRedrawNeeded` registration; missing `LR` preservation
 across the handler's nested calls; the actual root cause, replacing
@@ -657,13 +698,16 @@ which caused an ANR once the real rendering path was finally reachable;
 never draining the input queue `NativeActivity.java` always hands this
 app, which caused the ANR to persist even with no window callback left
 registered; never repainting on resize, which left newly-exposed buffer
-area black after rotation; and, once that repaint was added back, the
-deeper issue it was only papering over -- opting into a resize-in-place
-rotation path that's fragile enough that even Google's own reference NDK
-glue library doesn't support it, fixed by routing rotation through
-Android's standard destroy-and-recreate path instead), one correctness fix
-found along the way (the window's real default format is `RGB_565`, not
-`RGBA_8888`), three feature additions after the app was confirmed working
+area black after rotation; once that repaint was added back, the deeper
+issue it was only papering over -- opting into a resize-in-place rotation
+path that's fragile enough that even Google's own reference NDK glue
+library doesn't support it, fixed by routing rotation through Android's
+standard destroy-and-recreate path instead; and, most recently, a string
+constant embedded straight in the middle of executable code with nothing
+to jump over it, which real-device evidence caught as an immediate
+`SIGILL` crash on launch), one correctness fix found along the way (the
+window's real default format is `RGB_565`, not `RGBA_8888`), three feature
+additions after the app was confirmed working
 (fullscreen vs. status-bar-visible; hardcoded-black vs. system-adaptive
 status bar color -- which itself took two follow-up rounds, first to the
 wrong translucency-only mechanism and then to the actually-independent
