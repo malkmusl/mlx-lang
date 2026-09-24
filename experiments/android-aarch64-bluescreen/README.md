@@ -1087,6 +1087,16 @@ contradicted.
     few -- can't be verified against the platform's actual specific
     rejection reason, only against the same generic symptom and a
     plausible, but not certain, mechanism.
+- **Twenty-fifth report (diagnostic, not a permanent decision):**
+  `targetSdkVersion` temporarily dropped from 35 to 34 in
+  `main.mlx`/`main.zig`, to isolate whether the still-unresolved install
+  block is actually tied to 35 specifically. 34 still requires
+  `android:exported` (mandatory since API 31) and still clears the
+  original "built for an older Android version" warning, but sits one
+  level below whatever 35 enforces that the last two rounds' fixes
+  haven't identified. Whichever way the real-device result goes decides
+  the next step -- back to 35 with more investigation, or staying at 34
+  -- so this isn't logged as a fix, just a control experiment.
 
 ## What's genuinely unverified
 
