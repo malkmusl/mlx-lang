@@ -1296,6 +1296,32 @@ contradicted.
     (target 30+) is for `resources.arsc`, which this APK doesn't have.
   - Real-device confirmation of the fixed builds at 31/35/36 is pending;
     the default `targetSdkVersion` stays at 30 until that comes back.
+- **Twenty-ninth report: 31, 35 and 36 real-device confirmed; default
+  raised to 36; Android 17 (API 37) build ready.** All three fixed builds
+  installed via `adb install -r` and ran on the Pixel 10 Pro. The default
+  in `main.mlx`/`main.zig` is now 36 (Android 16), the highest confirmed
+  value; the repo's default build is byte-identical to the device-
+  confirmed target-36 test APK.
+  - **Android 17 is API level 37, not 38.** Checked against
+    developer.android.com: the Android 17 behavior-changes page gates on
+    "Android 17 (API level 37)", its API diffs run "API 36 → API 37", and
+    its QPR betas are 37.1/37.2. Nothing on Google's pages mentions an
+    API 38 yet.
+  - Two of the target-37 behavior changes are relevant to a native app,
+    and neither should apply here: `System.load()`'d native files must
+    now be read-only (this app loads nothing dynamically, and
+    `NativeActivity` loads `libmain.so` from the installer-extracted,
+    system-owned lib directory), and apps can no longer opt out of
+    ignoring orientation/resizability restrictions on large screens
+    (this manifest declares none).
+  - A target-37 build passes every local check (attribute-order checker,
+    `apksigner verify` with the same certificate, `aapt dump badging`,
+    `unzip -t`) and differs from the confirmed target-36 manifest by
+    exactly one byte. The default moves to 37 once it's confirmed on the
+    device.
+  - The v3 signer's `maxSdk` is `0x7fffffff` and `schemesForTargetSdk`
+    returns v1+v2+v3 for any target >= 28, so neither needs to change as
+    targets go up.
 
 ## What's genuinely unverified
 
@@ -1309,15 +1335,11 @@ to visible pixels on a real screen. What's left:
 
 - ~~APK Signature Scheme v2/v3 signing, the `targetSdkVersion=30` build,
   and the "built for an older Android version" fix.~~ **Real-device
-  confirmed** -- see the twenty-sixth report's closing note. `30` is
-  still the default baseline.
-- **`targetSdkVersion >= 31`: root cause found and fixed, not yet
-  device-confirmed.** The block was `android:exported` being written out
-  of resource-ID order and so silently skipped by the platform's
-  attribute lookup (twenty-eighth report). Fixed builds at 31/35/36 pass
-  every local check, including an attribute-order checker that
-  reproduces the original failure; an `adb install` of each on the test
-  device is the remaining gate before raising the default above 30.
+  confirmed** -- see the twenty-sixth report's closing note.
+- ~~`targetSdkVersion >= 31` install block.~~ **Fixed and real-device
+  confirmed** at 31, 35 and 36 (twenty-eighth and twenty-ninth reports);
+  default is now 36. Target 37 (Android 17) is built and locally
+  verified, pending a device install.
 - **16 KB native-library page alignment and `extractNativeLibs` were
   never the cause of the 31+ block**, but are real, correct settings for
   modern devices and stay in the build regardless of target.
@@ -1339,15 +1361,13 @@ Roughly in order of what unblocks what:
    install and correct visible rendering; see the twenty-sixth and
    twenty-seventh reports for the full path to a stable, real-device-
    confirmed baseline at `targetSdkVersion=30`.
-2. **Root-cause and fix the `targetSdkVersion >= 31` install block**
-   before bringing this into the main compiler (item 3) — shipping a
-   generalized Android backend with a silent, unexplained SDK ceiling
-   baked in would just move today's guesswork into the compiler itself.
-   The next concrete step, detailed in the twenty-seventh report, is
-   getting a real `PackageManager` rejection reason via `pm install -r`
-   run locally in an on-device terminal app (Termux or similar) — no
-   adb or PC needed. Once the real cause is known, `--target-sdk=N`
-   (`tool/main.zig`) makes testing the fix fast without editing source.
+2. ~~Root-cause and fix the `targetSdkVersion >= 31` install block.~~
+   Done — it was attribute ordering in the AXML encoder (twenty-eighth
+   report); 31/35/36 are device-confirmed and 37 is pending. When this
+   moves into the compiler, the AXML writer should enforce ascending
+   resource-ID attribute order itself (sort, or reject) rather than
+   relying on each call site, since that's the invariant that cost the
+   most time here.
 3. If the ABI assumptions need fixing, fix `native_activity.zig` and
    re-verify with the same `llvm-mc` disassembly technique.
 4. **Bring this into the language**, not just a side tool: an `aarch64`
