@@ -224,13 +224,24 @@ pub fn build(allocator: std.mem.Allocator, soname: []const u8, needed: []const u
     // onSaveInstanceState's real, documented contract: the buffer it
     // returns must be malloc'd, since the framework frees it with free().
     const name_malloc = try Str.add(&dynstr, "malloc");
+    // Gesture classification (native_activity.zig's drainInputEvents): touch
+    // position/time from libandroid.so, and a timerfd on the main ALooper
+    // for recognizing a long press while the finger is still down. All are
+    // available from API 21, this APK's minSdkVersion.
+    const name_motion_event_get_x = try Str.add(&dynstr, "AMotionEvent_getX");
+    const name_motion_event_get_y = try Str.add(&dynstr, "AMotionEvent_getY");
+    const name_motion_event_get_event_time = try Str.add(&dynstr, "AMotionEvent_getEventTime");
+    const name_looper_add_fd = try Str.add(&dynstr, "ALooper_addFd");
+    const name_timerfd_create = try Str.add(&dynstr, "timerfd_create");
+    const name_timerfd_settime = try Str.add(&dynstr, "timerfd_settime");
+    const name_read = try Str.add(&dynstr, "read");
     const name_on_create = try Str.add(&dynstr, "ANativeActivity_onCreate");
     const name_needed = try Str.add(&dynstr, needed);
     const name_needed2 = try Str.add(&dynstr, needed2);
     const name_soname = try Str.add(&dynstr, soname);
 
     // ── layout inside the RO segment ───────────────────────────────────
-    const dynsym_count = 13; // null + 11 imports + 1 export
+    const dynsym_count = 20; // null + 18 imports + 1 export
     const dynsym_off = RO_VADDR;
     const dynsym_size: u64 = dynsym_count * @sizeOf(Elf64Sym);
 
@@ -243,7 +254,7 @@ pub fn build(allocator: std.mem.Allocator, soname: []const u8, needed: []const u
     const hash_size: u64 = (2 + nbucket + nchain) * 4;
 
     const rela_off = alignUp(hash_off + hash_size, 8);
-    const rela_count = 11; // one GLOB_DAT per imported function
+    const rela_count = 18; // one GLOB_DAT per imported function
     const rela_size: u64 = rela_count * @sizeOf(Elf64Rela);
 
     const ro_end = rela_off + rela_size;
@@ -263,8 +274,15 @@ pub fn build(allocator: std.mem.Allocator, soname: []const u8, needed: []const u
         .motion_event_get_action = got_vaddr + 64,
         .input_queue_detach_looper = got_vaddr + 72,
         .malloc = got_vaddr + 80,
+        .motion_event_get_x = got_vaddr + 88,
+        .motion_event_get_y = got_vaddr + 96,
+        .motion_event_get_event_time = got_vaddr + 104,
+        .looper_add_fd = got_vaddr + 112,
+        .timerfd_create = got_vaddr + 120,
+        .timerfd_settime = got_vaddr + 128,
+        .read = got_vaddr + 136,
     };
-    const got_size: u64 = 88; // 11 GOT slots * 8 bytes
+    const got_size: u64 = 144; // 18 GOT slots * 8 bytes
     // `.data`: this experiment's own small, writable app-state block --
     // g_currentColor/g_colorIndex/g_window/g_activity, all written and read
     // only by our own code (never by the dynamic linker, unlike `.got`
@@ -275,7 +293,7 @@ pub fn build(allocator: std.mem.Allocator, soname: []const u8, needed: []const u
     // through it -- see buildText's onCreate comment). This one is
     // legitimate mutable state with no such framework contract to violate.
     const data_vaddr = got_vaddr + got_size;
-    const data_size: u64 = 24;
+    const data_size: u64 = na.DATA_SIZE;
     var text = try na.buildText(allocator, TEXT_VADDR, got, data_vaddr);
     defer text.deinit();
     const text_size: u64 = text.items.len * 4;
@@ -305,7 +323,15 @@ pub fn build(allocator: std.mem.Allocator, soname: []const u8, needed: []const u
     dynsym[9] = .{ .st_name = name_motion_event_get_action, .st_info = elfSymInfo(STB_GLOBAL, STT_FUNC), .st_other = 0, .st_shndx = SHN_UNDEF, .st_value = 0, .st_size = 0 };
     dynsym[10] = .{ .st_name = name_input_queue_detach_looper, .st_info = elfSymInfo(STB_GLOBAL, STT_FUNC), .st_other = 0, .st_shndx = SHN_UNDEF, .st_value = 0, .st_size = 0 };
     dynsym[11] = .{ .st_name = name_malloc, .st_info = elfSymInfo(STB_GLOBAL, STT_FUNC), .st_other = 0, .st_shndx = SHN_UNDEF, .st_value = 0, .st_size = 0 };
-    dynsym[12] = .{ .st_name = name_on_create, .st_info = elfSymInfo(STB_GLOBAL, STT_FUNC), .st_other = 0, .st_shndx = 6, .st_value = TEXT_VADDR, .st_size = text_size };
+    const imports2 = [_]u32{
+        name_motion_event_get_x,     name_motion_event_get_y, name_motion_event_get_event_time,
+        name_looper_add_fd,          name_timerfd_create,     name_timerfd_settime,
+        name_read,
+    };
+    for (imports2, 12..) |name, i| {
+        dynsym[i] = .{ .st_name = name, .st_info = elfSymInfo(STB_GLOBAL, STT_FUNC), .st_other = 0, .st_shndx = SHN_UNDEF, .st_value = 0, .st_size = 0 };
+    }
+    dynsym[19] = .{ .st_name = name_on_create, .st_info = elfSymInfo(STB_GLOBAL, STT_FUNC), .st_other = 0, .st_shndx = 6, .st_value = TEXT_VADDR, .st_size = text_size };
 
     // ── .hash (single bucket — O(n) lookup, fine for a handful of symbols) ──
     var hash_words = try std.ArrayList(u32).initCapacity(allocator, 2 + nbucket + nchain);
@@ -314,18 +340,11 @@ pub fn build(allocator: std.mem.Allocator, soname: []const u8, needed: []const u
     try hash_words.append(nchain);
     try hash_words.append(1); // bucket[0] = symbol index 1
     try hash_words.append(0); // chain[0] (STN_UNDEF slot, unused)
-    try hash_words.append(2); // chain[1] -> 2
-    try hash_words.append(3); // chain[2] -> 3
-    try hash_words.append(4); // chain[3] -> 4
-    try hash_words.append(5); // chain[4] -> 5
-    try hash_words.append(6); // chain[5] -> 6
-    try hash_words.append(7); // chain[6] -> 7
-    try hash_words.append(8); // chain[7] -> 8
-    try hash_words.append(9); // chain[8] -> 9
-    try hash_words.append(10); // chain[9] -> 10
-    try hash_words.append(11); // chain[10] -> 11
-    try hash_words.append(12); // chain[11] -> 12
-    try hash_words.append(0); // chain[12] -> end
+    // chain[i] = i + 1 for every real symbol, the last one terminating at 0.
+    var ci: u32 = 1;
+    while (ci < nchain) : (ci += 1) {
+        try hash_words.append(if (ci + 1 == nchain) 0 else ci + 1);
+    }
     std.debug.assert(hash_words.items.len == 2 + nbucket + nchain);
     // (elfHash is kept/exercised via the unit test below; a single-bucket
     // table doesn't need real hash values, only *a* consistent function.)
@@ -344,6 +363,14 @@ pub fn build(allocator: std.mem.Allocator, soname: []const u8, needed: []const u
     relas[8] = .{ .r_offset = got.motion_event_get_action, .r_info = (@as(u64, 9) << 32) | R_AARCH64_GLOB_DAT, .r_addend = 0 };
     relas[9] = .{ .r_offset = got.input_queue_detach_looper, .r_info = (@as(u64, 10) << 32) | R_AARCH64_GLOB_DAT, .r_addend = 0 };
     relas[10] = .{ .r_offset = got.malloc, .r_info = (@as(u64, 11) << 32) | R_AARCH64_GLOB_DAT, .r_addend = 0 };
+    const got_slots2 = [_]u64{
+        got.motion_event_get_x, got.motion_event_get_y, got.motion_event_get_event_time,
+        got.looper_add_fd,      got.timerfd_create,     got.timerfd_settime,
+        got.read,
+    };
+    for (got_slots2, 11..) |slot, i| {
+        relas[i] = .{ .r_offset = slot, .r_info = (@as(u64, i + 1) << 32) | R_AARCH64_GLOB_DAT, .r_addend = 0 };
+    }
 
     // ── .dynamic ───────────────────────────────────────────────────────
     var dyn: [dynamic_count]Elf64Dyn = undefined;

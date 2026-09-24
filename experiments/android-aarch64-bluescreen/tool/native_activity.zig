@@ -61,6 +61,7 @@ pub const CB_OFFSET_ON_SAVE_INSTANCE_STATE: u16 = 16;
 pub const CB_OFFSET_ON_NATIVE_WINDOW_CREATED: u16 = 56;
 pub const CB_OFFSET_ON_NATIVE_WINDOW_RESIZED: u16 = 64;
 pub const CB_OFFSET_ON_NATIVE_WINDOW_REDRAW_NEEDED: u16 = 72;
+pub const CB_OFFSET_ON_NATIVE_WINDOW_DESTROYED: u16 = 80;
 pub const CB_OFFSET_ON_INPUT_QUEUE_CREATED: u16 = 88;
 pub const CB_OFFSET_ON_INPUT_QUEUE_DESTROYED: u16 = 96;
 pub const ACTIVITY_OFFSET_CALLBACKS: u16 = 0;
@@ -74,24 +75,54 @@ pub const BLUE_RGBA8888_LE: u32 = 0xFFFF0000;
 pub const RED_RGBA8888_LE: u32 = 0xFF0000FF;
 pub const GREEN_RGBA8888_LE: u32 = 0xFF00FF00;
 pub const YELLOW_RGBA8888_LE: u32 = 0xFF00FFFF;
+pub const MAGENTA_RGBA8888_LE: u32 = 0xFFFF00FF;
+pub const CYAN_RGBA8888_LE: u32 = 0xFFFFFF00;
+pub const ORANGE_RGBA8888_LE: u32 = 0xFF0080FF;
 pub const WINDOW_FORMAT_RGBA_8888: u32 = 1;
 
-/// The ALooper "ident" this experiment's input queue is attached under.
-/// Irrelevant here beyond being >= 0 -- since a non-null callback is
-/// supplied to AInputQueue_attachLooper, the looper invokes that callback
-/// directly instead of ever returning this ident from ALooper_pollOnce.
-pub const LOOPER_IDENT_INPUT: u32 = 1;
+/// What the last completed touch was recognized as. Stored in g_colorIndex
+/// (kept across rotation via onSaveInstanceState) and mapped to the fill
+/// color by colorForIndex.
+pub const KIND_NONE: u32 = 0; // blue
+pub const KIND_TAP: u32 = 1; // green
+pub const KIND_LONG_PRESS: u32 = 2; // yellow
+pub const KIND_SWIPE_RIGHT: u32 = 3; // red
+pub const KIND_SWIPE_LEFT: u32 = 4; // magenta
+pub const KIND_SWIPE_DOWN: u32 = 5; // cyan
+pub const KIND_SWIPE_UP: u32 = 6; // orange
+pub const KIND_MAX: u32 = 6;
 
-/// AInputEvent_getType's result for a touch/motion event (android/input.h).
+/// A touch that stays within this many pixels of where it went down (on
+/// both axes) is a tap or long press; beyond it, a swipe. ~8dp at the test
+/// device's density, matching Android's own default touch slop there; fixed
+/// in pixels because reading the real density needs AConfiguration.
+pub const TOUCH_SLOP_PX: u32 = 24;
+/// Held still this long (500 ms, in ns) = long press.
+pub const LONG_PRESS_NS_LO: u32 = 0x6500;
+pub const LONG_PRESS_NS_HI: u32 = 0x1DCD;
+
+/// ALooper idents. Irrelevant beyond being >= 0: both registrations supply
+/// a callback, so the looper calls it instead of returning the ident from
+/// ALooper_pollOnce.
+pub const LOOPER_IDENT_INPUT: u32 = 1;
+pub const LOOPER_IDENT_TIMER: u32 = 2;
+pub const ALOOPER_EVENT_INPUT: u32 = 1;
+
+/// timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC). The flag
+/// values are O_NONBLOCK (0x800) and O_CLOEXEC (0x80000) on arm64 Linux.
+pub const CLOCK_MONOTONIC: u32 = 1;
+pub const TFD_FLAGS_LO: u32 = 0x0800;
+pub const TFD_FLAGS_HI: u32 = 0x0008;
+
+/// android/input.h. The action is masked to its low byte
+/// (AMOTION_EVENT_ACTION_MASK) before comparing, which strips the pointer
+/// index bits multi-touch actions carry.
 pub const AINPUT_EVENT_TYPE_MOTION: u32 = 2;
-/// AMotionEvent_getAction's low byte for a finger just touching down
-/// (android/input.h's AMOTION_EVENT_ACTION_DOWN). Compared against the
-/// *unmasked* action int below rather than `action & AMOTION_EVENT_ACTION_MASK`
-/// first, since this encoder has no bitwise AND -- correct for this
-/// experiment's single-finger taps (pointer index 0 contributes nothing to
-/// the masked-off upper bits), but a multi-touch gesture with a nonzero
-/// pointer index could in principle slip past this check unrecognized.
 pub const AMOTION_EVENT_ACTION_DOWN: u32 = 0;
+pub const AMOTION_EVENT_ACTION_UP: u32 = 1;
+pub const AMOTION_EVENT_ACTION_MOVE: u32 = 2;
+pub const AMOTION_EVENT_ACTION_CANCEL: u32 = 3;
+pub const AMOTION_EVENT_ACTION_POINTER_DOWN: u32 = 5;
 
 /// JNI function-table (`JNINativeInterface`) byte offsets -- ground-truthed
 /// against the real JNI spec (stable since JNI 1.2, unchanged since; cross-
@@ -136,9 +167,17 @@ pub const LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES: u32 = 1;
 /// touched by the dynamic linker (unlike `.got`), only read/written by our
 /// own code below.
 pub const DATA_OFFSET_CURRENT_COLOR: u64 = 0; // u32: the paint handler's fill color
-pub const DATA_OFFSET_COLOR_INDEX: u64 = 4; // u32: which palette entry is current
-pub const DATA_OFFSET_WINDOW: u64 = 8; // u64: most recently painted ANativeWindow*
+pub const DATA_OFFSET_COLOR_INDEX: u64 = 4; // u32: last recognized KIND_*
+pub const DATA_OFFSET_WINDOW: u64 = 8; // u64: current ANativeWindow*, NULL once destroyed
 pub const DATA_OFFSET_ACTIVITY: u64 = 16; // u64: the ANativeActivity* from onCreate
+pub const DATA_OFFSET_DOWN_TIME: u64 = 24; // i64: ACTION_DOWN event time (ns)
+pub const DATA_OFFSET_DOWN_X: u64 = 32; // i32: ACTION_DOWN x (px)
+pub const DATA_OFFSET_DOWN_Y: u64 = 36; // i32: ACTION_DOWN y (px)
+pub const DATA_OFFSET_TRACKING: u64 = 40; // u32 bool: a single-finger touch is in progress
+pub const DATA_OFFSET_MOVED: u64 = 44; // u32 bool: it has left the touch slop
+pub const DATA_OFFSET_LONG_FIRED: u64 = 48; // u32 bool: the long-press timer already recognized it
+pub const DATA_OFFSET_TIMER_FD_PLUS_1: u64 = 52; // u32: long-press timerfd + 1, 0 = none
+pub const DATA_SIZE: u64 = 56;
 
 pub const GotLayout = struct {
     set_buffers_geometry: u64,
@@ -152,6 +191,13 @@ pub const GotLayout = struct {
     motion_event_get_action: u64,
     input_queue_detach_looper: u64,
     malloc: u64,
+    motion_event_get_x: u64,
+    motion_event_get_y: u64,
+    motion_event_get_event_time: u64,
+    looper_add_fd: u64,
+    timerfd_create: u64,
+    timerfd_settime: u64,
+    read: u64,
 };
 
 /// Build the full .text machine code: `ANativeActivity_onCreate` immediately
@@ -341,6 +387,13 @@ pub fn buildText(
     try out.append(0); // placeholder ADD  x10, x10, #lo12
     try out.append(a64.strX(10, 9, CB_OFFSET_ON_INPUT_QUEUE_DESTROYED)); // activity->callbacks->onInputQueueDestroyed = x10
 
+    // onNativeWindowDestroyed clears g_window, so a long-press timer that
+    // fires after the window is gone doesn't paint into a released window.
+    const adrp_window_destroyed_idx = out.items.len;
+    try out.append(0); // placeholder ADRP x10, onNativeWindowDestroyed
+    try out.append(0); // placeholder ADD  x10, x10, #lo12
+    try out.append(a64.strX(10, 9, CB_OFFSET_ON_NATIVE_WINDOW_DESTROYED)); // activity->callbacks->onNativeWindowDestroyed = x10
+
     // Fix the landscape display-cutout black bar (real-device feedback):
     // see fixDisplayCutoutMode's own comment, at the end of this file, for
     // the full mechanism. Its address is only known once this whole
@@ -432,14 +485,14 @@ pub fn buildText(
     try out.append(a64.mul64(11, 9, 10)); // x11 = total pixel count
     try out.append(a64.ldrX(12, a64.sp, 16)); // x12 = buffer.bits
     try emitAdrpAdd(&out, text_vaddr, 13, data_vaddr + DATA_OFFSET_CURRENT_COLOR);
-    try out.append(a64.ldrW(13, 13, 0)); // w13 = g_currentColor (touch-cycled fill color)
+    try out.append(a64.ldrW(13, 13, 0)); // w13 = g_currentColor (set by showKind)
 
     // if (total_pixels == 0) goto skip_fill;  (forward branch, patched below)
     const cbz_zero_pixels_idx = out.items.len;
     try out.append(0);
 
     const loop_start = out.items.len;
-    try out.append(a64.strwPostIndex(13, 12, 4)); // *bits++ = blue
+    try out.append(a64.strwPostIndex(13, 12, 4)); // *bits++ = color
     try out.append(a64.subImm64(11, 11, 1));
     try out.append(a64.cbnzX(11, @as(i32, @intCast(loop_start)) * 4 - @as(i32, @intCast(out.items.len)) * 4));
 
@@ -458,30 +511,120 @@ pub fn buildText(
     try out.append(a64.addImm64(a64.sp, a64.sp, 64));
     try out.append(a64.ret(a64.lr));
 
+    // -- showKind(w0 = KIND_*) --
+    // Records the recognized kind in g_colorIndex, looks up its color, and
+    // repaints the current window, if there still is one.
+    // Stack frame: [0] saved LR.
+    const show_kind_start = out.items.len;
+    const show_kind_vaddr = text_vaddr + show_kind_start * 4;
+    try out.append(a64.subImm64(a64.sp, a64.sp, 16));
+    try out.append(a64.strX(a64.lr, a64.sp, 0));
+    try emitAdrpAdd(&out, text_vaddr, 9, data_vaddr);
+    try out.append(a64.strW(0, 9, off(DATA_OFFSET_COLOR_INDEX))); // g_colorIndex = kind
+    const call_color_for_index_idx = try emitDirectCallPlaceholder(&out); // w0 = colorForIndex(kind)
+    try emitAdrpAdd(&out, text_vaddr, 9, data_vaddr);
+    try out.append(a64.strW(0, 9, off(DATA_OFFSET_CURRENT_COLOR))); // g_currentColor = color
+    try out.append(a64.ldrX(1, 9, off(DATA_OFFSET_WINDOW))); // x1 = g_window
+    const cbz_no_window_idx = out.items.len;
+    try out.append(0); // if (!g_window) skip the repaint (patched below)
+    try out.append(a64.movz32(0, 0, 0)); // x0 = activity (unused by the paint handler)
+    try emitDirectCall(&out, text_vaddr, on_window_created_vaddr);
+    const show_kind_done = out.items.len;
+    out.items[cbz_no_window_idx] = a64.cbzX(1, delta(cbz_no_window_idx, show_kind_done));
+    try out.append(a64.ldrX(a64.lr, a64.sp, 0));
+    try out.append(a64.addImm64(a64.sp, a64.sp, 16));
+    try out.append(a64.ret(a64.lr));
+
+    // -- setLongPressTimer(x0 = delay in ns; 0 disarms) --
+    // One-shot, relative timerfd_settime on the long-press timer, if
+    // onInputQueueCreated managed to create one.
+    // Stack frame: [0..31] struct itimerspec {it_interval, it_value},
+    // [32] saved LR.
+    const set_timer_start = out.items.len;
+    const set_timer_vaddr = text_vaddr + set_timer_start * 4;
+    try out.append(a64.subImm64(a64.sp, a64.sp, 48));
+    try out.append(a64.strX(a64.lr, a64.sp, 32));
+    try out.append(a64.strX(a64.xzr, a64.sp, 0)); // it_interval.tv_sec = 0 (one-shot)
+    try out.append(a64.strX(a64.xzr, a64.sp, 8)); // it_interval.tv_nsec = 0
+    try out.append(a64.strX(a64.xzr, a64.sp, 16)); // it_value.tv_sec = 0
+    try out.append(a64.strX(0, a64.sp, 24)); // it_value.tv_nsec = delay
+    try emitAdrpAdd(&out, text_vaddr, 9, data_vaddr);
+    try out.append(a64.ldrW(10, 9, off(DATA_OFFSET_TIMER_FD_PLUS_1)));
+    const cbz_no_timer_idx = out.items.len;
+    try out.append(0); // if no timer, nothing to do (patched below)
+    try out.append(a64.subImm64(0, 10, 1)); // x0 = fd
+    try out.append(a64.movz32(1, 0, 0)); // w1 = flags: relative
+    try out.append(a64.addImm64(2, a64.sp, 0)); // x2 = &new_value
+    try out.append(a64.movReg64(3, a64.xzr)); // x3 = old_value: NULL
+    try emitGotCall(&out, text_vaddr, 9, got.timerfd_settime);
+    const set_timer_done = out.items.len;
+    out.items[cbz_no_timer_idx] = a64.cbzW(10, delta(cbz_no_timer_idx, set_timer_done));
+    try out.append(a64.ldrX(a64.lr, a64.sp, 32));
+    try out.append(a64.addImm64(a64.sp, a64.sp, 48));
+    try out.append(a64.ret(a64.lr));
+
+    // -- onLongPressTimer(w0 = fd, w1 = events, x2 = data) --
+    // ALooper callback for the long-press timerfd, which fires 500 ms after
+    // ACTION_DOWN unless the touch moved or ended first. Reads the expiration
+    // count so the fd stops polling readable, then, if that touch is still
+    // down and still inside the slop, recognizes the long press right away,
+    // while the finger is down. Returns 1 to stay registered.
+    // Stack frame: [0] u64 read buffer, [24] saved LR.
+    const long_press_timer_start = out.items.len;
+    const long_press_timer_vaddr = text_vaddr + long_press_timer_start * 4;
+    try out.append(a64.subImm64(a64.sp, a64.sp, 32));
+    try out.append(a64.strX(a64.lr, a64.sp, 24));
+    try out.append(a64.addImm64(1, a64.sp, 0)); // x1 = &buffer (x0 = fd, as passed in)
+    try out.append(a64.movz32(2, 8, 0)); // x2 = 8
+    try emitGotCall(&out, text_vaddr, 9, got.read);
+    try emitAdrpAdd(&out, text_vaddr, 9, data_vaddr);
+    try out.append(a64.ldrW(10, 9, off(DATA_OFFSET_TRACKING)));
+    const lp_not_tracking_idx = out.items.len;
+    try out.append(0); // if (!tracking) done
+    try out.append(a64.ldrW(10, 9, off(DATA_OFFSET_MOVED)));
+    const lp_moved_idx = out.items.len;
+    try out.append(0); // if (moved) done
+    try out.append(a64.ldrW(10, 9, off(DATA_OFFSET_LONG_FIRED)));
+    const lp_fired_idx = out.items.len;
+    try out.append(0); // if (longFired) done
+    try out.append(a64.movz32(10, 1, 0));
+    try out.append(a64.strW(10, 9, off(DATA_OFFSET_LONG_FIRED))); // longFired = 1
+    try out.append(a64.movz32(0, KIND_LONG_PRESS, 0));
+    try emitDirectCall(&out, text_vaddr, show_kind_vaddr);
+    const lp_done = out.items.len;
+    out.items[lp_not_tracking_idx] = a64.cbzW(10, delta(lp_not_tracking_idx, lp_done));
+    out.items[lp_moved_idx] = a64.cbnzW(10, delta(lp_moved_idx, lp_done));
+    out.items[lp_fired_idx] = a64.cbnzW(10, delta(lp_fired_idx, lp_done));
+    try out.append(a64.ldrX(a64.lr, a64.sp, 24));
+    try out.append(a64.addImm64(a64.sp, a64.sp, 32));
+    try out.append(a64.movz32(0, 1, 0)); // w0 = 1 (keep receiving callbacks)
+    try out.append(a64.ret(a64.lr));
+
     const on_input_queue_created_start = out.items.len;
     const on_input_queue_created_vaddr = text_vaddr + on_input_queue_created_start * 4;
-    {
-        const pc = text_vaddr + adrp_input_queue_created_idx * 4;
-        out.items[adrp_input_queue_created_idx] = a64.adrp(10, pc, on_input_queue_created_vaddr);
-        out.items[adrp_input_queue_created_idx + 1] = a64.addImm64(10, 10, @truncate(on_input_queue_created_vaddr & 0xfff));
-    }
+    const patch_pc2 = text_vaddr + adrp_input_queue_created_idx * 4;
+    out.items[adrp_input_queue_created_idx] = a64.adrp(10, patch_pc2, on_input_queue_created_vaddr);
+    out.items[adrp_input_queue_created_idx + 1] = a64.addImm64(10, 10, @truncate(on_input_queue_created_vaddr & 0xfff));
 
-    // ── onInputQueueCreated(x0=activity, x1=queue) ──
-    // Stack frame: [16..23] = saved queue, [24..31] = saved LR.
+    // -- onInputQueueCreated(x0=activity, x1=queue) --
     // Attaches `queue` to this thread's already-running ALooper (the main
     // thread's -- onInputQueueCreated runs on it, same as every other
     // ANativeActivityCallbacks callback, so ALooper_forThread() here finds
     // the looper Android's own runtime already prepared for it) with
     // drainInputEvents (below) as the per-event callback. This mirrors
-    // exactly what android_native_app_glue.c does, minus its extra thread
-    // — ALooper_pollOnce's own caller is the main thread's existing
-    // message loop, so no new thread is needed here, just this one-time
-    // registration.
+    // exactly what android_native_app_glue.c does, minus its extra thread.
+    //
+    // The first time (per process) it also creates the long-press timerfd
+    // and adds it to the same looper with onLongPressTimer as its callback.
+    // If either step fails, long presses are still recognized, just on
+    // release instead of while held (see drainInputEvents).
+    // Stack frame: [8] saved looper, [16] saved queue, [24] saved LR.
     try out.append(a64.subImm64(a64.sp, a64.sp, 32));
     try out.append(a64.strX(a64.lr, a64.sp, 24)); // save LR (this is a non-leaf function; see the LR-preservation note above)
     try out.append(a64.strX(1, a64.sp, 16)); // save queue
 
     try emitGotCall(&out, text_vaddr, 9, got.looper_for_thread); // x0 = ALooper_forThread()
+    try out.append(a64.strX(0, a64.sp, 8)); // save looper
     try out.append(a64.movReg64(1, 0)); // x1 = looper
     try out.append(a64.ldrX(0, a64.sp, 16)); // x0 = queue
     try out.append(a64.movReg64(4, 0)); // x4 = data = queue (threaded through to drainInputEvents's 3rd arg)
@@ -494,149 +637,297 @@ pub fn buildText(
     // AInputQueue_attachLooper(queue=x0, looper=x1, ident=w2, callback=x3, data=x4)
     try emitGotCall(&out, text_vaddr, 9, got.input_queue_attach_looper);
 
+    try emitAdrpAdd(&out, text_vaddr, 9, data_vaddr);
+    try out.append(a64.ldrW(10, 9, off(DATA_OFFSET_TIMER_FD_PLUS_1)));
+    const cbnz_have_timer_idx = out.items.len;
+    try out.append(0); // if the timer already exists, done (patched below)
+    try out.append(a64.movz32(0, CLOCK_MONOTONIC, 0));
+    try out.append(a64.movz32(1, TFD_FLAGS_LO, 0));
+    try out.append(a64.movk32(1, TFD_FLAGS_HI, 1)); // w1 = TFD_NONBLOCK | TFD_CLOEXEC
+    try emitGotCall(&out, text_vaddr, 9, got.timerfd_create); // w0 = fd
+    const tbnz_no_timer_idx = out.items.len;
+    try out.append(0); // if (fd < 0) done, no timer (patched below)
+    try out.append(a64.addImm64(10, 0, 1));
+    try emitAdrpAdd(&out, text_vaddr, 9, data_vaddr);
+    try out.append(a64.strW(10, 9, off(DATA_OFFSET_TIMER_FD_PLUS_1))); // g_timerFdPlus1 = fd + 1
+    // ALooper_addFd(looper, fd, LOOPER_IDENT_TIMER, ALOOPER_EVENT_INPUT, onLongPressTimer, NULL)
+    try out.append(a64.movReg64(1, 0)); // x1 = fd
+    try out.append(a64.ldrX(0, a64.sp, 8)); // x0 = looper
+    try out.append(a64.movz32(2, LOOPER_IDENT_TIMER, 0));
+    try out.append(a64.movz32(3, ALOOPER_EVENT_INPUT, 0));
+    try emitAdrpAdd(&out, text_vaddr, 4, long_press_timer_vaddr);
+    try out.append(a64.movReg64(5, a64.xzr));
+    try emitGotCall(&out, text_vaddr, 9, got.looper_add_fd);
+    const timer_ready = out.items.len;
+    out.items[cbnz_have_timer_idx] = a64.cbnzW(10, delta(cbnz_have_timer_idx, timer_ready));
+    out.items[tbnz_no_timer_idx] = a64.tbnz(0, 31, delta(tbnz_no_timer_idx, timer_ready));
+
     try out.append(a64.ldrX(a64.lr, a64.sp, 24)); // restore LR
     try out.append(a64.addImm64(a64.sp, a64.sp, 32));
     try out.append(a64.ret(a64.lr));
 
     const drain_callback_start = out.items.len;
     const drain_callback_vaddr = text_vaddr + drain_callback_start * 4;
-    {
-        const pc = text_vaddr + adrp_drain_callback_idx * 4;
-        out.items[adrp_drain_callback_idx] = a64.adrp(3, pc, drain_callback_vaddr);
-        out.items[adrp_drain_callback_idx + 1] = a64.addImm64(3, 3, @truncate(drain_callback_vaddr & 0xfff));
-    }
+    const patch_pc3 = text_vaddr + adrp_drain_callback_idx * 4;
+    out.items[adrp_drain_callback_idx] = a64.adrp(3, patch_pc3, drain_callback_vaddr);
+    out.items[adrp_drain_callback_idx + 1] = a64.addImm64(3, 3, @truncate(drain_callback_vaddr & 0xfff));
 
-    // ── drainInputEvents(w0=fd, w1=events, x2=data=queue) ──
-    // The ALooper_callbackFunc registered above. Called by the main
-    // thread's own message loop whenever the input queue's fd has data.
-    // Does nothing with the events themselves (this experiment has no use
-    // for input) beyond immediately finishing each one -- the point is
-    // purely to keep Android's "Input dispatching timed out" watchdog from
-    // ever finding an unconsumed event sitting in the queue. Returns 1
-    // (w0) to keep receiving future callbacks, per ALooper_callbackFunc's
-    // documented contract.
-    // Stack frame: [0..7] = AInputEvent* out-param for getEvent,
-    // [16..23] = saved queue, [24..31] = saved LR.
-    try out.append(a64.subImm64(a64.sp, a64.sp, 32));
-    try out.append(a64.strX(a64.lr, a64.sp, 24)); // save LR (non-leaf: calls getEvent/finishEvent via BLR)
+    // -- drainInputEvents(w0=fd, w1=events, x2=data=queue) --
+    // The ALooper callback for the input queue. Drains every pending event,
+    // classifies single-finger touches, and finishes each event as
+    // unhandled (so the system still gets its own gestures). Draining at
+    // all is what keeps Android's "Input dispatching timed out" watchdog
+    // from firing. Returns 1 to stay registered.
+    //
+    // DOWN records where and when the finger went down and arms the
+    // long-press timer. MOVE marks the touch as moved once it leaves the
+    // touch slop, disarming the timer. UP classifies: moved, or released
+    // outside the slop, is a swipe in its dominant direction; otherwise a
+    // long press if held >= 500 ms (normally the timer recognized it
+    // already; this is the fallback), else a tap. CANCEL, or a second
+    // finger (POINTER_DOWN), abandons the touch.
+    // Stack frame: [0] AInputEvent* out-param, [8] x (i32), [12] y (i32),
+    // [16] saved queue, [24] saved LR, [32] masked action.
+    try out.append(a64.subImm64(a64.sp, a64.sp, 48));
+    try out.append(a64.strX(a64.lr, a64.sp, 24)); // save LR (non-leaf)
     try out.append(a64.strX(2, a64.sp, 16)); // save queue (arrives in x2, the callback's "data" param)
 
     const drain_loop_top = out.items.len;
     try out.append(a64.ldrX(0, a64.sp, 16)); // x0 = queue
     try out.append(a64.addImm64(1, a64.sp, 0)); // x1 = &outEvent
     try emitGotCall(&out, text_vaddr, 9, got.input_queue_get_event); // w0 = result (negative once the queue is drained)
-
-    // if (result < 0) goto drain_done;  (forward branch, patched below)
     const tbnz_drain_done_idx = out.items.len;
-    try out.append(0);
+    try out.append(0); // if (result < 0) done (patched below)
 
-    // Touch-to-cycle-colors: on a finger touching down, advance through a
-    // small color palette and repaint immediately -- added after
-    // real-device feedback asking to test touch this way. See
-    // AMOTION_EVENT_ACTION_DOWN's comment above for the one known
-    // limitation (no bitwise AND here, so the action int isn't masked).
     try out.append(a64.ldrX(0, a64.sp, 0)); // x0 = event
-    try emitGotCall(&out, text_vaddr, 9, got.input_event_get_type); // w0 = AInputEvent_getType(event)
-    try out.append(a64.subImm64(9, 0, AINPUT_EVENT_TYPE_MOTION));
-    const cbnz_not_motion_idx = out.items.len;
-    try out.append(0); // if type != MOTION, skip touch handling (forward branch, patched below)
+    try emitGotCall(&out, text_vaddr, 9, got.input_event_get_type);
+    try out.append(a64.cmpImm32(0, AINPUT_EVENT_TYPE_MOTION));
+    const bne_not_motion_idx = out.items.len;
+    try out.append(0); // if not a motion event, just finish it (patched below)
 
-    try out.append(a64.ldrX(0, a64.sp, 0)); // x0 = event (reload: getType above clobbered it)
-    try emitGotCall(&out, text_vaddr, 9, got.motion_event_get_action); // w0 = AMotionEvent_getAction(event)
-    try out.append(a64.subImm64(9, 0, AMOTION_EVENT_ACTION_DOWN));
-    const cbnz_not_down_idx = out.items.len;
-    try out.append(0); // if action != DOWN, skip touch handling (forward branch, patched below)
+    try out.append(a64.ldrX(0, a64.sp, 0));
+    try emitGotCall(&out, text_vaddr, 9, got.motion_event_get_action);
+    try out.append(a64.uxtbW(0, 0)); // action & AMOTION_EVENT_ACTION_MASK
+    try out.append(a64.strW(0, a64.sp, 32));
+    try out.append(a64.ldrX(0, a64.sp, 0));
+    try out.append(a64.movz32(1, 0, 0)); // pointer index 0
+    try emitGotCall(&out, text_vaddr, 9, got.motion_event_get_x); // s0 = x
+    try out.append(a64.fcvtzsWS(0, 0));
+    try out.append(a64.strW(0, a64.sp, 8));
+    try out.append(a64.ldrX(0, a64.sp, 0));
+    try out.append(a64.movz32(1, 0, 0));
+    try emitGotCall(&out, text_vaddr, 9, got.motion_event_get_y); // s0 = y
+    try out.append(a64.fcvtzsWS(0, 0));
+    try out.append(a64.strW(0, a64.sp, 12));
 
-    // Advance g_colorIndex (0->1->2->3->0) and g_currentColor to match --
-    // written as a 4-case if/elif/elif/else chain rather than an
-    // index-scaled table jump: this encoder has no register-offset
-    // addressing mode or bitwise AND for a mod-4, and four cases is cheap
-    // to just write out directly.
-    try emitAdrpAdd(&out, text_vaddr, 9, data_vaddr + DATA_OFFSET_COLOR_INDEX);
-    try out.append(a64.ldrW(10, 9, 0)); // w10 = g_colorIndex; x9 = &g_colorIndex, kept live so every case below can store its new index through it directly
-
-    try out.append(a64.subImm64(11, 10, 0)); // index - 0
-    const skip_case0_idx = out.items.len;
-    try out.append(0); // if index != 0, try the next case (patched below)
-    try out.append(a64.movz32(12, 1, 0));
-    try out.append(a64.strW(12, 9, 0)); // g_colorIndex = 1
-    try out.append(a64.movz32(13, @truncate(RED_RGBA8888_LE), 0));
-    try out.append(a64.movk32(13, @truncate(RED_RGBA8888_LE >> 16), 1));
-    const done_case0_idx = out.items.len;
-    try out.append(0); // branch to color_chosen (patched below)
-
-    const case1_start = out.items.len;
-    out.items[skip_case0_idx] = a64.cbnzX(11, @as(i32, @intCast(case1_start)) * 4 - @as(i32, @intCast(skip_case0_idx)) * 4);
-    try out.append(a64.subImm64(11, 10, 1)); // index - 1
-    const skip_case1_idx = out.items.len;
+    try out.append(a64.ldrW(9, a64.sp, 32)); // w9 = action
+    try out.append(a64.cmpImm32(9, AMOTION_EVENT_ACTION_DOWN));
+    const beq_down_idx = out.items.len;
     try out.append(0);
-    try out.append(a64.movz32(12, 2, 0));
-    try out.append(a64.strW(12, 9, 0)); // g_colorIndex = 2
-    try out.append(a64.movz32(13, @truncate(GREEN_RGBA8888_LE), 0));
-    try out.append(a64.movk32(13, @truncate(GREEN_RGBA8888_LE >> 16), 1));
-    const done_case1_idx = out.items.len;
+    try out.append(a64.cmpImm32(9, AMOTION_EVENT_ACTION_MOVE));
+    const beq_move_idx = out.items.len;
     try out.append(0);
-
-    const case2_start = out.items.len;
-    out.items[skip_case1_idx] = a64.cbnzX(11, @as(i32, @intCast(case2_start)) * 4 - @as(i32, @intCast(skip_case1_idx)) * 4);
-    try out.append(a64.subImm64(11, 10, 2)); // index - 2
-    const skip_case2_idx = out.items.len;
+    try out.append(a64.cmpImm32(9, AMOTION_EVENT_ACTION_UP));
+    const beq_up_idx = out.items.len;
     try out.append(0);
-    try out.append(a64.movz32(12, 3, 0));
-    try out.append(a64.strW(12, 9, 0)); // g_colorIndex = 3
-    try out.append(a64.movz32(13, @truncate(YELLOW_RGBA8888_LE), 0));
-    try out.append(a64.movk32(13, @truncate(YELLOW_RGBA8888_LE >> 16), 1));
-    const done_case2_idx = out.items.len;
+    try out.append(a64.cmpImm32(9, AMOTION_EVENT_ACTION_CANCEL));
+    const beq_cancel_idx = out.items.len;
     try out.append(0);
+    try out.append(a64.cmpImm32(9, AMOTION_EVENT_ACTION_POINTER_DOWN));
+    const beq_pointer_down_idx = out.items.len;
+    try out.append(0);
+    const b_other_action_idx = out.items.len;
+    try out.append(0); // any other action: just finish it (patched below)
 
-    const case3_start = out.items.len;
-    out.items[skip_case2_idx] = a64.cbnzX(11, @as(i32, @intCast(case3_start)) * 4 - @as(i32, @intCast(skip_case2_idx)) * 4);
-    // else (index == 3, or any unexpected value): wrap back to blue.
-    try out.append(a64.movz32(12, 0, 0));
-    try out.append(a64.strW(12, 9, 0)); // g_colorIndex = 0
-    try out.append(a64.movz32(13, @truncate(BLUE_RGBA8888_LE), 0));
-    try out.append(a64.movk32(13, @truncate(BLUE_RGBA8888_LE >> 16), 1));
-    // falls straight through to color_chosen, no branch needed
+    // ACTION_DOWN: remember time and position, start tracking, arm the timer.
+    const on_down = out.items.len;
+    try out.append(a64.ldrX(0, a64.sp, 0));
+    try emitGotCall(&out, text_vaddr, 9, got.motion_event_get_event_time); // x0 = event time (ns)
+    try emitAdrpAdd(&out, text_vaddr, 9, data_vaddr);
+    try out.append(a64.strX(0, 9, off(DATA_OFFSET_DOWN_TIME)));
+    try out.append(a64.ldrW(10, a64.sp, 8));
+    try out.append(a64.strW(10, 9, off(DATA_OFFSET_DOWN_X)));
+    try out.append(a64.ldrW(10, a64.sp, 12));
+    try out.append(a64.strW(10, 9, off(DATA_OFFSET_DOWN_Y)));
+    try out.append(a64.movz32(10, 1, 0));
+    try out.append(a64.strW(10, 9, off(DATA_OFFSET_TRACKING)));
+    try out.append(a64.strW(a64.xzr, 9, off(DATA_OFFSET_MOVED)));
+    try out.append(a64.strW(a64.xzr, 9, off(DATA_OFFSET_LONG_FIRED)));
+    try out.append(a64.movz32(0, LONG_PRESS_NS_LO, 0));
+    try out.append(a64.movk32(0, LONG_PRESS_NS_HI, 1)); // x0 = 500 ms
+    try emitDirectCall(&out, text_vaddr, set_timer_vaddr);
+    const b_down_done_idx = out.items.len;
+    try out.append(0); // -> finish
 
-    const color_chosen = out.items.len;
-    out.items[done_case0_idx] = a64.b(@as(i32, @intCast(color_chosen)) * 4 - @as(i32, @intCast(done_case0_idx)) * 4);
-    out.items[done_case1_idx] = a64.b(@as(i32, @intCast(color_chosen)) * 4 - @as(i32, @intCast(done_case1_idx)) * 4);
-    out.items[done_case2_idx] = a64.b(@as(i32, @intCast(color_chosen)) * 4 - @as(i32, @intCast(done_case2_idx)) * 4);
+    // ACTION_MOVE: once the tracked touch leaves the slop, it's a swipe.
+    const on_move = out.items.len;
+    try emitAdrpAdd(&out, text_vaddr, 9, data_vaddr);
+    try out.append(a64.ldrW(10, 9, off(DATA_OFFSET_TRACKING)));
+    const mv_not_tracking_idx = out.items.len;
+    try out.append(0); // if (!tracking) finish
+    try out.append(a64.ldrW(10, 9, off(DATA_OFFSET_MOVED)));
+    const mv_moved_idx = out.items.len;
+    try out.append(0); // if (moved) finish
+    try out.append(a64.ldrW(10, 9, off(DATA_OFFSET_LONG_FIRED)));
+    const mv_fired_idx = out.items.len;
+    try out.append(0); // if (longFired) finish
+    try out.append(a64.ldrW(10, a64.sp, 8));
+    try out.append(a64.ldrW(11, 9, off(DATA_OFFSET_DOWN_X)));
+    try out.append(a64.subReg32(10, 10, 11)); // w10 = dx
+    try out.append(a64.ldrW(12, a64.sp, 12));
+    try out.append(a64.ldrW(13, 9, off(DATA_OFFSET_DOWN_Y)));
+    try out.append(a64.subReg32(12, 12, 13)); // w12 = dy
+    try out.append(a64.cmpImm32(10, 0));
+    try out.append(a64.cnegW(10, 10, .mi)); // w10 = |dx|
+    try out.append(a64.cmpImm32(12, 0));
+    try out.append(a64.cnegW(12, 12, .mi)); // w12 = |dy|
+    try out.append(a64.cmpImm32(10, TOUCH_SLOP_PX));
+    const mv_out_xidx = out.items.len;
+    try out.append(0); // if (|dx| > slop) markMoved
+    try out.append(a64.cmpImm32(12, TOUCH_SLOP_PX));
+    const mv_out_yidx = out.items.len;
+    try out.append(0); // if (|dy| > slop) markMoved
+    const b_move_inside_idx = out.items.len;
+    try out.append(0); // -> finish
+    const mark_moved = out.items.len;
+    try out.append(a64.movz32(10, 1, 0));
+    try out.append(a64.strW(10, 9, off(DATA_OFFSET_MOVED)));
+    try out.append(a64.movz32(0, 0, 0));
+    try emitDirectCall(&out, text_vaddr, set_timer_vaddr); // disarm
+    const b_moved_done_idx = out.items.len;
+    try out.append(0); // -> finish
 
-    try emitAdrpAdd(&out, text_vaddr, 9, data_vaddr + DATA_OFFSET_CURRENT_COLOR);
-    try out.append(a64.strW(13, 9, 0)); // g_currentColor = the chosen color
+    // ACTION_UP: classify the finished touch.
+    const on_up = out.items.len;
+    try emitAdrpAdd(&out, text_vaddr, 9, data_vaddr);
+    try out.append(a64.ldrW(10, 9, off(DATA_OFFSET_TRACKING)));
+    const up_not_tracking_idx = out.items.len;
+    try out.append(0); // if (!tracking) finish
+    try out.append(a64.strW(a64.xzr, 9, off(DATA_OFFSET_TRACKING)));
+    try out.append(a64.movz32(0, 0, 0));
+    try emitDirectCall(&out, text_vaddr, set_timer_vaddr); // disarm
+    try emitAdrpAdd(&out, text_vaddr, 9, data_vaddr);
+    try out.append(a64.ldrW(10, 9, off(DATA_OFFSET_LONG_FIRED)));
+    const up_fired_idx = out.items.len;
+    try out.append(0); // if (longFired) finish: already shown
+    try out.append(a64.ldrW(10, a64.sp, 8));
+    try out.append(a64.ldrW(11, 9, off(DATA_OFFSET_DOWN_X)));
+    try out.append(a64.subReg32(10, 10, 11)); // w10 = dx
+    try out.append(a64.ldrW(12, a64.sp, 12));
+    try out.append(a64.ldrW(13, 9, off(DATA_OFFSET_DOWN_Y)));
+    try out.append(a64.subReg32(12, 12, 13)); // w12 = dy
+    try out.append(a64.cmpImm32(10, 0));
+    try out.append(a64.cnegW(11, 10, .mi)); // w11 = |dx|
+    try out.append(a64.cmpImm32(12, 0));
+    try out.append(a64.cnegW(13, 12, .mi)); // w13 = |dy|
+    try out.append(a64.ldrW(14, 9, off(DATA_OFFSET_MOVED)));
+    const up_moved_idx = out.items.len;
+    try out.append(0); // if (moved) swipe
+    try out.append(a64.cmpImm32(11, TOUCH_SLOP_PX));
+    const up_out_xidx = out.items.len;
+    try out.append(0); // if (|dx| > slop) swipe
+    try out.append(a64.cmpImm32(13, TOUCH_SLOP_PX));
+    const up_out_yidx = out.items.len;
+    try out.append(0); // if (|dy| > slop) swipe
+    try out.append(a64.ldrX(0, a64.sp, 0));
+    try emitGotCall(&out, text_vaddr, 9, got.motion_event_get_event_time); // x0 = up time (ns)
+    try emitAdrpAdd(&out, text_vaddr, 9, data_vaddr);
+    try out.append(a64.ldrX(10, 9, off(DATA_OFFSET_DOWN_TIME)));
+    try out.append(a64.subReg64(0, 0, 10)); // x0 = held for (ns)
+    try out.append(a64.movz32(10, LONG_PRESS_NS_LO, 0));
+    try out.append(a64.movk32(10, LONG_PRESS_NS_HI, 1)); // x10 = 500 ms
+    try out.append(a64.cmpReg64(0, 10));
+    const up_long_idx = out.items.len;
+    try out.append(0); // if (held >= 500 ms) long press
+    try out.append(a64.movz32(0, KIND_TAP, 0));
+    const b_tap_show_idx = out.items.len;
+    try out.append(0); // -> show
+    const up_long = out.items.len;
+    try out.append(a64.movz32(0, KIND_LONG_PRESS, 0));
+    const b_long_show_idx = out.items.len;
+    try out.append(0); // -> show
+    const swipe = out.items.len;
+    try out.append(a64.cmpReg32(11, 13));
+    const sw_vertical_idx = out.items.len;
+    try out.append(0); // if (|dx| < |dy|) vertical
+    try out.append(a64.cmpImm32(10, 0));
+    const sw_left_idx = out.items.len;
+    try out.append(0); // if (dx < 0) left
+    try out.append(a64.movz32(0, KIND_SWIPE_RIGHT, 0));
+    const b_right_show_idx = out.items.len;
+    try out.append(0); // -> show
+    const sw_left = out.items.len;
+    try out.append(a64.movz32(0, KIND_SWIPE_LEFT, 0));
+    const b_left_show_idx = out.items.len;
+    try out.append(0); // -> show
+    const sw_vertical = out.items.len;
+    try out.append(a64.cmpImm32(12, 0));
+    const sw_up_idx = out.items.len;
+    try out.append(0); // if (dy < 0) up (screen y grows downward)
+    try out.append(a64.movz32(0, KIND_SWIPE_DOWN, 0));
+    const b_down_show_idx = out.items.len;
+    try out.append(0); // -> show
+    const sw_up = out.items.len;
+    try out.append(a64.movz32(0, KIND_SWIPE_UP, 0));
+    const show = out.items.len;
+    try emitDirectCall(&out, text_vaddr, show_kind_vaddr);
+    const b_shown_idx = out.items.len;
+    try out.append(0); // -> finish
 
-    // Repaint now with the new color: call the shared paint handler
-    // directly (x0=activity is unused by it, x1=window from g_window --
-    // see its own comment). Its address (on_window_created_vaddr) is
-    // already known at this point in the emission order, unlike the other
-    // ADRP+ADD sites in this file that reference addresses not yet known
-    // when emitted, so no forward-patch is needed here.
-    try emitAdrpAdd(&out, text_vaddr, 1, data_vaddr + DATA_OFFSET_WINDOW);
-    try out.append(a64.ldrX(1, 1, 0)); // x1 = g_window
-    try out.append(a64.movz32(0, 0, 0)); // x0 = 0 (unused by the paint handler)
-    try emitAdrpAdd(&out, text_vaddr, 3, on_window_created_vaddr);
-    try out.append(a64.blr(3));
+    // ACTION_CANCEL / ACTION_POINTER_DOWN: abandon the touch.
+    const on_cancel = out.items.len;
+    try emitAdrpAdd(&out, text_vaddr, 9, data_vaddr);
+    try out.append(a64.strW(a64.xzr, 9, off(DATA_OFFSET_TRACKING)));
+    try out.append(a64.movz32(0, 0, 0));
+    try emitDirectCall(&out, text_vaddr, set_timer_vaddr); // disarm
+    // falls through to finish
 
-    const touch_handled = out.items.len;
-    out.items[cbnz_not_motion_idx] = a64.cbnzX(9, @as(i32, @intCast(touch_handled)) * 4 - @as(i32, @intCast(cbnz_not_motion_idx)) * 4);
-    out.items[cbnz_not_down_idx] = a64.cbnzX(9, @as(i32, @intCast(touch_handled)) * 4 - @as(i32, @intCast(cbnz_not_down_idx)) * 4);
-
+    const finish = out.items.len;
     try out.append(a64.ldrX(0, a64.sp, 16)); // x0 = queue
-    try out.append(a64.ldrX(1, a64.sp, 0)); // x1 = event (written by getEvent above)
+    try out.append(a64.ldrX(1, a64.sp, 0)); // x1 = event
     try out.append(a64.movz32(2, 0, 0)); // w2 = handled = 0
     try emitGotCall(&out, text_vaddr, 9, got.input_queue_finish_event);
-
     const branch_back_idx = out.items.len;
-    try out.append(a64.b(@as(i32, @intCast(drain_loop_top)) * 4 - @as(i32, @intCast(branch_back_idx)) * 4));
+    try out.append(a64.b(delta(branch_back_idx, drain_loop_top)));
 
     const drain_done = out.items.len;
-    out.items[tbnz_drain_done_idx] = a64.tbnz(0, 31, @as(i32, @intCast(drain_done)) * 4 - @as(i32, @intCast(tbnz_drain_done_idx)) * 4);
-
     try out.append(a64.ldrX(a64.lr, a64.sp, 24)); // restore LR
-    try out.append(a64.addImm64(a64.sp, a64.sp, 32));
+    try out.append(a64.addImm64(a64.sp, a64.sp, 48));
     try out.append(a64.movz32(0, 1, 0)); // w0 = 1 (keep receiving future callbacks)
     try out.append(a64.ret(a64.lr));
+
+    out.items[tbnz_drain_done_idx] = a64.tbnz(0, 31, delta(tbnz_drain_done_idx, drain_done));
+    out.items[bne_not_motion_idx] = a64.bCond(.ne, delta(bne_not_motion_idx, finish));
+    out.items[beq_down_idx] = a64.bCond(.eq, delta(beq_down_idx, on_down));
+    out.items[beq_move_idx] = a64.bCond(.eq, delta(beq_move_idx, on_move));
+    out.items[beq_up_idx] = a64.bCond(.eq, delta(beq_up_idx, on_up));
+    out.items[beq_cancel_idx] = a64.bCond(.eq, delta(beq_cancel_idx, on_cancel));
+    out.items[beq_pointer_down_idx] = a64.bCond(.eq, delta(beq_pointer_down_idx, on_cancel));
+    out.items[b_other_action_idx] = a64.b(delta(b_other_action_idx, finish));
+    out.items[b_down_done_idx] = a64.b(delta(b_down_done_idx, finish));
+    out.items[mv_not_tracking_idx] = a64.cbzW(10, delta(mv_not_tracking_idx, finish));
+    out.items[mv_moved_idx] = a64.cbnzW(10, delta(mv_moved_idx, finish));
+    out.items[mv_fired_idx] = a64.cbnzW(10, delta(mv_fired_idx, finish));
+    out.items[mv_out_xidx] = a64.bCond(.gt, delta(mv_out_xidx, mark_moved));
+    out.items[mv_out_yidx] = a64.bCond(.gt, delta(mv_out_yidx, mark_moved));
+    out.items[b_move_inside_idx] = a64.b(delta(b_move_inside_idx, finish));
+    out.items[b_moved_done_idx] = a64.b(delta(b_moved_done_idx, finish));
+    out.items[up_not_tracking_idx] = a64.cbzW(10, delta(up_not_tracking_idx, finish));
+    out.items[up_fired_idx] = a64.cbnzW(10, delta(up_fired_idx, finish));
+    out.items[up_moved_idx] = a64.cbnzW(14, delta(up_moved_idx, swipe));
+    out.items[up_out_xidx] = a64.bCond(.gt, delta(up_out_xidx, swipe));
+    out.items[up_out_yidx] = a64.bCond(.gt, delta(up_out_yidx, swipe));
+    out.items[up_long_idx] = a64.bCond(.ge, delta(up_long_idx, up_long));
+    out.items[b_tap_show_idx] = a64.b(delta(b_tap_show_idx, show));
+    out.items[b_long_show_idx] = a64.b(delta(b_long_show_idx, show));
+    out.items[sw_vertical_idx] = a64.bCond(.lt, delta(sw_vertical_idx, sw_vertical));
+    out.items[sw_left_idx] = a64.bCond(.lt, delta(sw_left_idx, sw_left));
+    out.items[b_right_show_idx] = a64.b(delta(b_right_show_idx, show));
+    out.items[b_left_show_idx] = a64.b(delta(b_left_show_idx, show));
+    out.items[sw_up_idx] = a64.bCond(.lt, delta(sw_up_idx, sw_up));
+    out.items[b_down_show_idx] = a64.b(delta(b_down_show_idx, show));
+    out.items[b_shown_idx] = a64.b(delta(b_shown_idx, finish));
+
 
     const fix_cutout_start = out.items.len;
     const fix_cutout_vaddr = text_vaddr + fix_cutout_start * 4;
@@ -868,51 +1159,41 @@ pub fn buildText(
         out.items[adrp_color_for_index_idx + 1] = a64.addImm64(3, 3, @truncate(color_for_index_vaddr & 0xfff));
     }
 
-    // ── colorForIndex(w0=index) -> w0=color ── a pure leaf function, no
-    // calls, no data of any kind embedded in it (deliberately, after the
-    // real-device crash the rest of this file's comments document: never
-    // again mix data into a straight-line instruction stream without an
-    // unconditional jump over it). Mirrors drainInputEvents' own
-    // touch-cycle palette (index 0/1/2/3 -> blue/red/green/yellow) by
-    // deliberate duplication rather than a shared helper: this function
-    // exists solely so onCreate's savedState-restore path (above) can
-    // recompute g_currentColor for a restored g_colorIndex without
-    // touching drainInputEvents' already real-device-verified logic at
-    // all -- any unexpected index (should never happen; only ever written
-    // by our own onSaveInstanceState) safely falls back to blue, same as
-    // index 0.
-    try out.append(a64.subImm64(9, 0, 0)); // index - 0
-    const cfi_skip0_idx = out.items.len;
-    try out.append(0); // if index != 0, try next (patched below)
+    patchDirectCall(&out, text_vaddr, call_color_for_index_idx, color_for_index_vaddr);
+
+    // ── colorForIndex(w0 = KIND_*) -> w0 = RGBA color ── leaf.
+    // Used by showKind and by onCreate's savedState restore. Any
+    // out-of-range value (never written by this code) falls back to blue.
+    try out.append(a64.cmpImm32(0, KIND_MAX));
+    const cfi_out_of_range_idx = out.items.len;
+    try out.append(0); // if (kind > KIND_MAX, unsigned) default (patched below)
+    try out.append(a64.uxtbW(10, 0)); // x10 = kind, zero-extended
+    const cfi_table_adrp_idx = out.items.len;
+    try out.append(0); // placeholder ADRP x9, table
+    try out.append(0); // placeholder ADD  x9, x9, #lo12
+    try out.append(a64.addRegLsl64(9, 9, 10, 2)); // x9 = &table[kind]
+    try out.append(a64.ldrW(0, 9, 0));
+    try out.append(a64.ret(a64.lr));
+    const cfi_default = out.items.len;
+    out.items[cfi_out_of_range_idx] = a64.bCond(.hi, delta(cfi_out_of_range_idx, cfi_default));
     try out.append(a64.movz32(0, @truncate(BLUE_RGBA8888_LE), 0));
     try out.append(a64.movk32(0, @truncate(BLUE_RGBA8888_LE >> 16), 1));
     try out.append(a64.ret(a64.lr));
-
-    const cfi_try1 = out.items.len;
-    out.items[cfi_skip0_idx] = a64.cbnzX(9, @as(i32, @intCast(cfi_try1)) * 4 - @as(i32, @intCast(cfi_skip0_idx)) * 4);
-    try out.append(a64.subImm64(9, 0, 1)); // index - 1
-    const cfi_skip1_idx = out.items.len;
-    try out.append(0);
-    try out.append(a64.movz32(0, @truncate(RED_RGBA8888_LE), 0));
-    try out.append(a64.movk32(0, @truncate(RED_RGBA8888_LE >> 16), 1));
-    try out.append(a64.ret(a64.lr));
-
-    const cfi_try2 = out.items.len;
-    out.items[cfi_skip1_idx] = a64.cbnzX(9, @as(i32, @intCast(cfi_try2)) * 4 - @as(i32, @intCast(cfi_skip1_idx)) * 4);
-    try out.append(a64.subImm64(9, 0, 2)); // index - 2
-    const cfi_skip2_idx = out.items.len;
-    try out.append(0);
-    try out.append(a64.movz32(0, @truncate(GREEN_RGBA8888_LE), 0));
-    try out.append(a64.movk32(0, @truncate(GREEN_RGBA8888_LE >> 16), 1));
-    try out.append(a64.ret(a64.lr));
-
-    const cfi_else = out.items.len;
-    out.items[cfi_skip2_idx] = a64.cbnzX(9, @as(i32, @intCast(cfi_else)) * 4 - @as(i32, @intCast(cfi_skip2_idx)) * 4);
-    // index == 3 (the only remaining case this function is ever actually
-    // called with).
-    try out.append(a64.movz32(0, @truncate(YELLOW_RGBA8888_LE), 0));
-    try out.append(a64.movk32(0, @truncate(YELLOW_RGBA8888_LE >> 16), 1));
-    try out.append(a64.ret(a64.lr));
+    // The color table, indexed by KIND_*: data words, never executed (both
+    // paths above return before reaching it).
+    const cfi_table_vaddr = text_vaddr + out.items.len * 4;
+    try out.append(BLUE_RGBA8888_LE); // KIND_NONE
+    try out.append(GREEN_RGBA8888_LE); // KIND_TAP
+    try out.append(YELLOW_RGBA8888_LE); // KIND_LONG_PRESS
+    try out.append(RED_RGBA8888_LE); // KIND_SWIPE_RIGHT
+    try out.append(MAGENTA_RGBA8888_LE); // KIND_SWIPE_LEFT
+    try out.append(CYAN_RGBA8888_LE); // KIND_SWIPE_DOWN
+    try out.append(ORANGE_RGBA8888_LE); // KIND_SWIPE_UP
+    {
+        const pc = text_vaddr + cfi_table_adrp_idx * 4;
+        out.items[cfi_table_adrp_idx] = a64.adrp(9, pc, cfi_table_vaddr);
+        out.items[cfi_table_adrp_idx + 1] = a64.addImm64(9, 9, @truncate(cfi_table_vaddr & 0xfff));
+    }
 
     const save_instance_state_start = out.items.len;
     const save_instance_state_vaddr = text_vaddr + save_instance_state_start * 4;
@@ -980,10 +1261,29 @@ pub fn buildText(
     // specifically around a rotation, not otherwise.
     try out.append(a64.subImm64(a64.sp, a64.sp, 16));
     try out.append(a64.strX(a64.lr, a64.sp, 0)); // save LR (non-leaf: calls AInputQueue_detachLooper via BLR)
+    // A touch still in progress belonged to this queue; its UP/CANCEL will
+    // never arrive, so stop tracking it (the long-press timer checks this).
+    try emitAdrpAdd(&out, text_vaddr, 9, data_vaddr);
+    try out.append(a64.strW(a64.xzr, 9, off(DATA_OFFSET_TRACKING)));
     try out.append(a64.movReg64(0, 1)); // x0 = queue
     try emitGotCall(&out, text_vaddr, 9, got.input_queue_detach_looper);
     try out.append(a64.ldrX(a64.lr, a64.sp, 0)); // restore LR
     try out.append(a64.addImm64(a64.sp, a64.sp, 16));
+    try out.append(a64.ret(a64.lr));
+
+    const window_destroyed_start = out.items.len;
+    const window_destroyed_vaddr = text_vaddr + window_destroyed_start * 4;
+    {
+        const pc = text_vaddr + adrp_window_destroyed_idx * 4;
+        out.items[adrp_window_destroyed_idx] = a64.adrp(10, pc, window_destroyed_vaddr);
+        out.items[adrp_window_destroyed_idx + 1] = a64.addImm64(10, 10, @truncate(window_destroyed_vaddr & 0xfff));
+    }
+
+    // ── onNativeWindowDestroyed(x0=activity, x1=window) ── leaf.
+    // The window is released once this returns: forget it so showKind
+    // skips repainting until onNativeWindowCreated hands over a new one.
+    try emitAdrpAdd(&out, text_vaddr, 9, data_vaddr);
+    try out.append(a64.strX(a64.xzr, 9, off(DATA_OFFSET_WINDOW)));
     try out.append(a64.ret(a64.lr));
 
     return out;
@@ -1005,6 +1305,41 @@ fn emitAdrpAdd(out: *std.ArrayList(u32), text_vaddr: u64, reg: a64.Reg, target: 
     const pc = text_vaddr + out.items.len * 4;
     try out.append(a64.adrp(reg, pc, target));
     try out.append(a64.addImm64(reg, reg, @truncate(target & 0xfff)));
+}
+
+/// Direct call to one of our own functions whose address is already known.
+/// x16 (IP0, the AAPCS64 intra-procedure scratch register) holds the
+/// address, so no argument register is disturbed.
+fn emitDirectCall(out: *std.ArrayList(u32), text_vaddr: u64, target: u64) !void {
+    try emitAdrpAdd(out, text_vaddr, 16, target);
+    try out.append(a64.blr(16));
+}
+
+/// A direct call whose target isn't emitted yet: two placeholder words for
+/// the ADRP+ADD, then the BLR. Returns the placeholder index for
+/// patchDirectCall once the target's address is known.
+fn emitDirectCallPlaceholder(out: *std.ArrayList(u32)) !usize {
+    const idx = out.items.len;
+    try out.append(0);
+    try out.append(0);
+    try out.append(a64.blr(16));
+    return idx;
+}
+
+fn patchDirectCall(out: *std.ArrayList(u32), text_vaddr: u64, idx: usize, target: u64) void {
+    const pc = text_vaddr + idx * 4;
+    out.items[idx] = a64.adrp(16, pc, target);
+    out.items[idx + 1] = a64.addImm64(16, 16, @truncate(target & 0xfff));
+}
+
+/// Branch-offset helper: byte delta from instruction index `from` to `to`.
+fn delta(from: usize, to: usize) i32 {
+    return (@as(i32, @intCast(to)) - @as(i32, @intCast(from))) * 4;
+}
+
+/// A .data field offset as the byte offset LDR/STR take.
+fn off(x: u64) u16 {
+    return @intCast(x);
 }
 
 /// JNI calling idiom, used only by fixDisplayCutoutMode: given `env`
@@ -1065,6 +1400,13 @@ test "buildText is deterministic in length across the two-pass call" {
         .motion_event_get_action = 0,
         .input_queue_detach_looper = 0,
         .malloc = 0,
+        .motion_event_get_x = 0,
+        .motion_event_get_y = 0,
+        .motion_event_get_event_time = 0,
+        .looper_add_fd = 0,
+        .timerfd_create = 0,
+        .timerfd_settime = 0,
+        .read = 0,
     }, 0);
     defer pass1.deinit();
     var pass2 = try buildText(alloc, 0x2000, .{
@@ -1079,7 +1421,14 @@ test "buildText is deterministic in length across the two-pass call" {
         .motion_event_get_action = 0x3100,
         .input_queue_detach_looper = 0x3108,
         .malloc = 0x3110,
-    }, 0x3118);
+        .motion_event_get_x = 0x3118,
+        .motion_event_get_y = 0x3120,
+        .motion_event_get_event_time = 0x3128,
+        .looper_add_fd = 0x3130,
+        .timerfd_create = 0x3138,
+        .timerfd_settime = 0x3140,
+        .read = 0x3148,
+    }, 0x3150);
     defer pass2.deinit();
     try std.testing.expectEqual(pass1.items.len, pass2.items.len);
     try std.testing.expect(pass1.items.len > 300);

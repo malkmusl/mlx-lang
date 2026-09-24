@@ -277,6 +277,60 @@ pub fn movReg64(rd: Reg, rm: Reg) u32 {
         (@as(u32, rm) << 16) | (@as(u32, xzr) << 5) | @as(u32, rd);
 }
 
+// Every encoding below was ground-truthed against `llvm-mc -show-encoding`
+// (and, for B.cond, `llvm-mc -filetype=obj` + `llvm-objdump -d` to resolve
+// the branch offset); the tests at the end of this file check each one.
+
+/// FCVTZS Wd, Sn -- float32 to int32, rounding toward zero.
+pub fn fcvtzsWS(rd: Reg, rn: Reg) u32 {
+    return 0x1E380000 | (@as(u32, rn) << 5) | @as(u32, rd);
+}
+
+/// SUB (shifted register, no shift).
+pub fn subReg32(rd: Reg, rn: Reg, rm: Reg) u32 {
+    return 0x4B000000 | (@as(u32, rm) << 16) | (@as(u32, rn) << 5) | @as(u32, rd);
+}
+pub fn subReg64(rd: Reg, rn: Reg, rm: Reg) u32 {
+    return 0xCB000000 | (@as(u32, rm) << 16) | (@as(u32, rn) << 5) | @as(u32, rd);
+}
+
+/// ADD (shifted register, LSL #shift).
+pub fn addRegLsl64(rd: Reg, rn: Reg, rm: Reg, shift: u6) u32 {
+    return 0x8B000000 | (@as(u32, rm) << 16) | (@as(u32, shift) << 10) | (@as(u32, rn) << 5) | @as(u32, rd);
+}
+
+/// CMP -- alias of SUBS with Rd = WZR/XZR.
+pub fn cmpImm32(rn: Reg, imm12: u12) u32 {
+    return 0x7100001F | (@as(u32, imm12) << 10) | (@as(u32, rn) << 5);
+}
+pub fn cmpReg32(rn: Reg, rm: Reg) u32 {
+    return 0x6B00001F | (@as(u32, rm) << 16) | (@as(u32, rn) << 5);
+}
+pub fn cmpReg64(rn: Reg, rm: Reg) u32 {
+    return 0xEB00001F | (@as(u32, rm) << 16) | (@as(u32, rn) << 5);
+}
+
+/// B.cond -- `01010100 imm19 0 cond`, imm19 a signed word offset.
+pub const Cond = enum(u4) { eq = 0, ne = 1, mi = 4, hi = 8, ge = 10, lt = 11, gt = 12 };
+pub fn bCond(cond: Cond, byte_delta: i32) u32 {
+    const word_delta: i32 = @divTrunc(byte_delta, 4);
+    const imm19: u32 = if (word_delta >= 0) @intCast(word_delta) else @intCast(word_delta + 524288);
+    return 0x54000000 | ((imm19 & 0x7ffff) << 5) | @as(u32, @intFromEnum(cond));
+}
+
+/// CNEG Wd, Wn, cond -- alias of CSNEG Wd, Wn, Wn, invert(cond). Inverting
+/// a condition code flips its low bit.
+pub fn cnegW(rd: Reg, rn: Reg, cond: Cond) u32 {
+    const inv: u32 = @as(u32, @intFromEnum(cond)) ^ 1;
+    return 0x5A800400 | (@as(u32, rn) << 16) | (inv << 12) | (@as(u32, rn) << 5) | @as(u32, rd);
+}
+
+/// UXTB Wd, Wn -- alias of UBFM Wd, Wn, #0, #7. Also clears Xd's upper 32
+/// bits, as every W-register write does.
+pub fn uxtbW(rd: Reg, rn: Reg) u32 {
+    return 0x53001C00 | (@as(u32, rn) << 5) | @as(u32, rd);
+}
+
 // ───────────────────────────────────────────────────────────────────────────
 //  Self-tests: every encoder above checked against known-good, widely
 //  documented A64 hex encodings (the same constants any AArch64 disassembler
@@ -350,4 +404,29 @@ test "tbz/tbnz known encodings, cross-checked against llvm-mc" {
     try std.testing.expectEqual(@as(u32, 0x36F80040), tbz(0, 31, 8));
     try std.testing.expectEqual(@as(u32, 0x37000089), tbnz(9, 0, 16));
     try std.testing.expectEqual(@as(u32, 0xB7080049), tbnz(9, 33, 8));
+}
+
+test "gesture-code encodings, cross-checked against llvm-mc" {
+    try std.testing.expectEqual(@as(u32, 0x1E380000), fcvtzsWS(0, 0));
+    try std.testing.expectEqual(@as(u32, 0x1E380029), fcvtzsWS(9, 1));
+    try std.testing.expectEqual(@as(u32, 0x4B0B014A), subReg32(10, 10, 11));
+    try std.testing.expectEqual(@as(u32, 0x4B050083), subReg32(3, 4, 5));
+    try std.testing.expectEqual(@as(u32, 0xCB090000), subReg64(0, 0, 9));
+    try std.testing.expectEqual(@as(u32, 0x7100013F), cmpImm32(9, 0));
+    try std.testing.expectEqual(@as(u32, 0x7100153F), cmpImm32(9, 5));
+    try std.testing.expectEqual(@as(u32, 0x7100615F), cmpImm32(10, 24));
+    try std.testing.expectEqual(@as(u32, 0x6B0D019F), cmpReg32(12, 13));
+    try std.testing.expectEqual(@as(u32, 0xEB0A001F), cmpReg64(0, 10));
+    try std.testing.expectEqual(@as(u32, 0x54000040), bCond(.eq, 8));
+    try std.testing.expectEqual(@as(u32, 0x54FFFFC1), bCond(.ne, -8));
+    try std.testing.expectEqual(@as(u32, 0x54000088), bCond(.hi, 16));
+    try std.testing.expectEqual(@as(u32, 0x5400006B), bCond(.lt, 12));
+    try std.testing.expectEqual(@as(u32, 0x540000AC), bCond(.gt, 20));
+    try std.testing.expectEqual(@as(u32, 0x54FFFFEA), bCond(.ge, -4));
+    try std.testing.expectEqual(@as(u32, 0x547FFFEB), bCond(.lt, 1048572));
+    try std.testing.expectEqual(@as(u32, 0x5A8A554A), cnegW(10, 10, .mi));
+    try std.testing.expectEqual(@as(u32, 0x5A8D55AC), cnegW(12, 13, .mi));
+    try std.testing.expectEqual(@as(u32, 0x53001C00), uxtbW(0, 0));
+    try std.testing.expectEqual(@as(u32, 0x53001C0A), uxtbW(10, 0));
+    try std.testing.expectEqual(@as(u32, 0x8B0A0929), addRegLsl64(9, 9, 10, 2));
 }

@@ -1323,6 +1323,65 @@ contradicted.
   - The v3 signer's `maxSdk` is `0x7fffffff` and `schemesForTargetSdk`
     returns v1+v2+v3 for any target >= 28, so neither needs to change as
     targets go up.
+- **Thirtieth report: touch input now tells a tap, a long press and a
+  swipe apart.** Until now any finger-down just cycled through four
+  colors. The native code now classifies each single-finger touch and
+  fills the screen with a color for what it recognized:
+
+  | Touch | Rule | Color |
+  |---|---|---|
+  | Tap | released within 24 px of where it went down, before 500 ms | green |
+  | Long press | held within 24 px for 500 ms — recognized *while still held* | yellow |
+  | Swipe right / left | left the 24 px slop, mostly horizontal | red / magenta |
+  | Swipe down / up | left the 24 px slop, mostly vertical | cyan / orange |
+
+  A second finger or an `ACTION_CANCEL` abandons the touch (nothing is
+  recognized). The last recognized kind still survives rotation through
+  `onSaveInstanceState`, the same way the color index did.
+  - **How it works:** `drainInputEvents` masks each motion event's action
+    to its low byte (so multi-touch actions are recognized), reads pointer
+    0's position (`AMotionEvent_getX/getY`, converted with `fcvtzs`) and
+    `AMotionEvent_getEventTime`. `ACTION_DOWN` records position and time
+    and arms a one-shot 500 ms `timerfd`; `ACTION_MOVE` past the slop marks
+    the touch as moved and disarms it; `ACTION_UP` classifies. The timer
+    lives on the same main-thread `ALooper` as the input queue
+    (`ALooper_addFd`), so its callback runs on the main thread with no
+    locking, and recognizes a long press the moment it fires. If creating
+    the timer ever fails, long presses are still recognized, on release.
+    `onNativeWindowDestroyed` is now registered to clear `g_window`, so a
+    timer firing after the window is gone doesn't paint into it, and
+    `onInputQueueDestroyed` drops any touch in progress.
+  - **New pieces:** 7 imports (`AMotionEvent_getX/getY/getEventTime`,
+    `ALooper_addFd` from libandroid; `timerfd_create`, `timerfd_settime`,
+    `read` from libc -- all available at this APK's minSdkVersion 21), a
+    56-byte `.data` block for touch state, a color table indexed by kind,
+    and 9 new A64 encodings (`fcvtzs`, `sub`/`cmp` register and immediate
+    forms, `b.cond`, `cneg`, `uxtb`, `add` with shift). Every encoding was
+    ground-truthed against `llvm-mc` and is checked by
+    `verify_aarch64.mlx` (47/47) and `aarch64.zig`'s tests (12/12). The
+    code buffer grew from 512 to 1024 words (the text is now 612).
+  - **Verified off-device, by running the real machine code:**
+    `emulate_gestures.py` loads the built `libmain.so` into the Unicorn
+    AArch64 emulator, points every GOT slot at a stub emulating the
+    Android/libc function behind it, and drives the library the way the
+    framework does -- `ANativeActivity_onCreate`, then whatever callbacks it
+    registered. 17 scenarios pass: tap, long press via the timer and on
+    release, the 499 ms and 24/25 px boundaries, all four swipe
+    directions, a slow swipe, cancel, a second finger, non-touch events,
+    a timer firing after the window is destroyed, a failed
+    `timerfd_create`, and rotation (save/restore). It also checks that
+    every event is finished exactly once, that stack and callee-saved
+    registers are preserved across every callback, and it fills the
+    upper half of every `int` return with junk to catch code treating it
+    as 64-bit. Three deliberately planted bugs (no action mask, swapped
+    left/right, timer ignoring movement) were each caught by exactly the
+    expected scenarios. Run it with `pip install unicorn; python3
+    emulate_gestures.py bluescreen.apk`.
+  - Both ports updated in lockstep (the Zig port was translated from the
+    emulator-verified mlx code and passes `zig ast-check`). The APK passes
+    `apksigner verify` (v1/v2/v3, same certificate), the attribute-order
+    check, `zipalign -p 4` for `libmain.so`, 16 KB `PT_LOAD` alignment and
+    `unzip -t`. Real-device confirmation is pending.
 
 ## What's genuinely unverified
 
@@ -1340,6 +1399,12 @@ to visible pixels on a real screen. What's left:
 - ~~`targetSdkVersion >= 31` install block.~~ **Fixed and real-device
   confirmed** at 31, 35, 36 and 37 (twenty-eighth and twenty-ninth
   reports); default is now 37 (Android 17).
+- **Tap / long press / swipe recognition (thirtieth report) is verified in
+  emulation, not yet on a device.** The emulator runs the real machine
+  code, but the Android and libc functions it calls are stubs written
+  from their documented behavior, and the 24 px slop is a fixed pixel
+  value tuned for the test device's density rather than read from the
+  display.
 - **16 KB native-library page alignment and `extractNativeLibs` were
   never the cause of the 31+ block**, but are real, correct settings for
   modern devices and stay in the build regardless of target.
