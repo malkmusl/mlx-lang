@@ -179,7 +179,7 @@ pub fn main() !void {
     try out.print("      min-sdk={d} target-sdk={d}\n", .{ min_sdk_version, target_sdk_version });
 
     try out.print("[1/7] generating AArch64 machine code + ELF64 shared object...\n", .{});
-    const so_bytes = try elf_so.build(allocator, "libmain.so", "libandroid.so", "libc.so");
+    const so_bytes = try elf_so.build(allocator, "libmain.so", "libandroid.so", "libc.so", "liblog.so");
     defer allocator.free(so_bytes);
     try out.print("      {s}: {d} bytes\n", .{ SO_PATH, so_bytes.len });
 

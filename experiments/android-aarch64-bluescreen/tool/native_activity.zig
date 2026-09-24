@@ -108,6 +108,9 @@ pub const LOOPER_IDENT_INPUT: u32 = 1;
 pub const LOOPER_IDENT_TIMER: u32 = 2;
 pub const ALOOPER_EVENT_INPUT: u32 = 1;
 
+/// android/log.h priority for __android_log_print; logcat tag is "mlx".
+pub const ANDROID_LOG_INFO: u32 = 4;
+
 /// timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC). The flag
 /// values are O_NONBLOCK (0x800) and O_CLOEXEC (0x80000) on arm64 Linux.
 pub const CLOCK_MONOTONIC: u32 = 1;
@@ -198,6 +201,7 @@ pub const GotLayout = struct {
     timerfd_create: u64,
     timerfd_settime: u64,
     read: u64,
+    log_print: u64,
 };
 
 /// Build the full .text machine code: `ANativeActivity_onCreate` immediately
@@ -409,6 +413,16 @@ pub fn buildText(
     try out.append(a64.addImm64(a64.sp, a64.sp, 16));
     try out.append(a64.ret(a64.lr));
 
+    // Logcat tag and format strings: data words, never executed (onCreate's
+    // `ret` above is the last instruction before them).
+    const str_log_tag = try emitCString(&out, text_vaddr, "mlx");
+    const str_log_touch = try emitCString(&out, text_vaddr, "touch action=0x%x x=%d y=%d");
+    const str_log_kind = try emitCString(&out, text_vaddr, "recognized kind=%d (1 tap, 2 long press, 3 right, 4 left, 5 down, 6 up)");
+    const str_log_timer_set = try emitCString(&out, text_vaddr, "long-press timer set to %lld ns (timer fd+1=%d)");
+    const str_log_timer_fired = try emitCString(&out, text_vaddr, "long-press timer fired: tracking=%d moved=%d longFired=%d");
+    const str_log_timer_create = try emitCString(&out, text_vaddr, "timerfd_create -> %d");
+    const str_log_add_fd = try emitCString(&out, text_vaddr, "ALooper_addFd -> %d");
+
     const on_window_created_start = out.items.len;
     const on_window_created_vaddr = text_vaddr + on_window_created_start * 4;
 
@@ -514,11 +528,15 @@ pub fn buildText(
     // -- showKind(w0 = KIND_*) --
     // Records the recognized kind in g_colorIndex, looks up its color, and
     // repaints the current window, if there still is one.
-    // Stack frame: [0] saved LR.
+    // Stack frame: [0] saved LR, [8] kind.
     const show_kind_start = out.items.len;
     const show_kind_vaddr = text_vaddr + show_kind_start * 4;
     try out.append(a64.subImm64(a64.sp, a64.sp, 16));
     try out.append(a64.strX(a64.lr, a64.sp, 0));
+    try out.append(a64.strW(0, a64.sp, 8)); // save kind across the log call
+    try out.append(a64.ldrW(3, a64.sp, 8));
+    try emitLog(&out, text_vaddr, got.log_print, str_log_tag, str_log_kind);
+    try out.append(a64.ldrW(0, a64.sp, 8)); // w0 = kind
     try emitAdrpAdd(&out, text_vaddr, 9, data_vaddr);
     try out.append(a64.strW(0, 9, off(DATA_OFFSET_COLOR_INDEX))); // g_colorIndex = kind
     const call_color_for_index_idx = try emitDirectCallPlaceholder(&out); // w0 = colorForIndex(kind)
@@ -548,6 +566,10 @@ pub fn buildText(
     try out.append(a64.strX(a64.xzr, a64.sp, 8)); // it_interval.tv_nsec = 0
     try out.append(a64.strX(a64.xzr, a64.sp, 16)); // it_value.tv_sec = 0
     try out.append(a64.strX(0, a64.sp, 24)); // it_value.tv_nsec = delay
+    try out.append(a64.ldrX(3, a64.sp, 24)); // log: delay
+    try emitAdrpAdd(&out, text_vaddr, 9, data_vaddr);
+    try out.append(a64.ldrW(4, 9, off(DATA_OFFSET_TIMER_FD_PLUS_1))); // log: fd + 1
+    try emitLog(&out, text_vaddr, got.log_print, str_log_tag, str_log_timer_set);
     try emitAdrpAdd(&out, text_vaddr, 9, data_vaddr);
     try out.append(a64.ldrW(10, 9, off(DATA_OFFSET_TIMER_FD_PLUS_1)));
     const cbz_no_timer_idx = out.items.len;
@@ -577,6 +599,11 @@ pub fn buildText(
     try out.append(a64.addImm64(1, a64.sp, 0)); // x1 = &buffer (x0 = fd, as passed in)
     try out.append(a64.movz32(2, 8, 0)); // x2 = 8
     try emitGotCall(&out, text_vaddr, 9, got.read);
+    try emitAdrpAdd(&out, text_vaddr, 9, data_vaddr);
+    try out.append(a64.ldrW(3, 9, off(DATA_OFFSET_TRACKING)));
+    try out.append(a64.ldrW(4, 9, off(DATA_OFFSET_MOVED)));
+    try out.append(a64.ldrW(5, 9, off(DATA_OFFSET_LONG_FIRED)));
+    try emitLog(&out, text_vaddr, got.log_print, str_log_tag, str_log_timer_fired);
     try emitAdrpAdd(&out, text_vaddr, 9, data_vaddr);
     try out.append(a64.ldrW(10, 9, off(DATA_OFFSET_TRACKING)));
     const lp_not_tracking_idx = out.items.len;
@@ -618,7 +645,7 @@ pub fn buildText(
     // and adds it to the same looper with onLongPressTimer as its callback.
     // If either step fails, long presses are still recognized, just on
     // release instead of while held (see drainInputEvents).
-    // Stack frame: [8] saved looper, [16] saved queue, [24] saved LR.
+    // Stack frame: [0] timerfd, [8] saved looper, [16] saved queue, [24] saved LR.
     try out.append(a64.subImm64(a64.sp, a64.sp, 32));
     try out.append(a64.strX(a64.lr, a64.sp, 24)); // save LR (this is a non-leaf function; see the LR-preservation note above)
     try out.append(a64.strX(1, a64.sp, 16)); // save queue
@@ -645,6 +672,10 @@ pub fn buildText(
     try out.append(a64.movz32(1, TFD_FLAGS_LO, 0));
     try out.append(a64.movk32(1, TFD_FLAGS_HI, 1)); // w1 = TFD_NONBLOCK | TFD_CLOEXEC
     try emitGotCall(&out, text_vaddr, 9, got.timerfd_create); // w0 = fd
+    try out.append(a64.strW(0, a64.sp, 0)); // save fd across the log call
+    try out.append(a64.ldrW(3, a64.sp, 0));
+    try emitLog(&out, text_vaddr, got.log_print, str_log_tag, str_log_timer_create);
+    try out.append(a64.ldrW(0, a64.sp, 0)); // w0 = fd
     const tbnz_no_timer_idx = out.items.len;
     try out.append(0); // if (fd < 0) done, no timer (patched below)
     try out.append(a64.addImm64(10, 0, 1));
@@ -658,6 +689,8 @@ pub fn buildText(
     try emitAdrpAdd(&out, text_vaddr, 4, long_press_timer_vaddr);
     try out.append(a64.movReg64(5, a64.xzr));
     try emitGotCall(&out, text_vaddr, 9, got.looper_add_fd);
+    try out.append(a64.movReg64(3, 0));
+    try emitLog(&out, text_vaddr, got.log_print, str_log_tag, str_log_add_fd);
     const timer_ready = out.items.len;
     out.items[cbnz_have_timer_idx] = a64.cbnzW(10, delta(cbnz_have_timer_idx, timer_ready));
     out.items[tbnz_no_timer_idx] = a64.tbnz(0, 31, delta(tbnz_no_timer_idx, timer_ready));
@@ -687,7 +720,7 @@ pub fn buildText(
     // already; this is the fallback), else a tap. CANCEL, or a second
     // finger (POINTER_DOWN), abandons the touch.
     // Stack frame: [0] AInputEvent* out-param, [8] x (i32), [12] y (i32),
-    // [16] saved queue, [24] saved LR, [32] masked action.
+    // [16] saved queue, [24] saved LR, [32] masked action, [36] raw action.
     try out.append(a64.subImm64(a64.sp, a64.sp, 48));
     try out.append(a64.strX(a64.lr, a64.sp, 24)); // save LR (non-leaf)
     try out.append(a64.strX(2, a64.sp, 16)); // save queue (arrives in x2, the callback's "data" param)
@@ -707,6 +740,7 @@ pub fn buildText(
 
     try out.append(a64.ldrX(0, a64.sp, 0));
     try emitGotCall(&out, text_vaddr, 9, got.motion_event_get_action);
+    try out.append(a64.strW(0, a64.sp, 36)); // raw action, for the log
     try out.append(a64.uxtbW(0, 0)); // action & AMOTION_EVENT_ACTION_MASK
     try out.append(a64.strW(0, a64.sp, 32));
     try out.append(a64.ldrX(0, a64.sp, 0));
@@ -719,6 +753,10 @@ pub fn buildText(
     try emitGotCall(&out, text_vaddr, 9, got.motion_event_get_y); // s0 = y
     try out.append(a64.fcvtzsWS(0, 0));
     try out.append(a64.strW(0, a64.sp, 12));
+    try out.append(a64.ldrW(3, a64.sp, 36));
+    try out.append(a64.ldrW(4, a64.sp, 8));
+    try out.append(a64.ldrW(5, a64.sp, 12));
+    try emitLog(&out, text_vaddr, got.log_print, str_log_tag, str_log_touch);
 
     try out.append(a64.ldrW(9, a64.sp, 32)); // w9 = action
     try out.append(a64.cmpImm32(9, AMOTION_EVENT_ACTION_DOWN));
@@ -1332,6 +1370,17 @@ fn patchDirectCall(out: *std.ArrayList(u32), text_vaddr: u64, idx: usize, target
     out.items[idx + 1] = a64.addImm64(16, 16, @truncate(target & 0xfff));
 }
 
+/// __android_log_print(ANDROID_LOG_INFO, tag, fmt, ...): the caller loads the
+/// format's arguments into x3.. first; this sets x0-x2 and calls through the
+/// GOT (x9 scratch). Variadic arguments go in registers like any others on
+/// Android's AArch64 ABI.
+fn emitLog(out: *std.ArrayList(u32), text_vaddr: u64, log_print_slot: u64, tag_vaddr: u64, fmt_vaddr: u64) !void {
+    try out.append(a64.movz32(0, ANDROID_LOG_INFO, 0));
+    try emitAdrpAdd(out, text_vaddr, 1, tag_vaddr);
+    try emitAdrpAdd(out, text_vaddr, 2, fmt_vaddr);
+    try emitGotCall(out, text_vaddr, 9, log_print_slot);
+}
+
 /// Branch-offset helper: byte delta from instruction index `from` to `to`.
 fn delta(from: usize, to: usize) i32 {
     return (@as(i32, @intCast(to)) - @as(i32, @intCast(from))) * 4;
@@ -1407,6 +1456,7 @@ test "buildText is deterministic in length across the two-pass call" {
         .timerfd_create = 0,
         .timerfd_settime = 0,
         .read = 0,
+        .log_print = 0,
     }, 0);
     defer pass1.deinit();
     var pass2 = try buildText(alloc, 0x2000, .{
@@ -1428,7 +1478,8 @@ test "buildText is deterministic in length across the two-pass call" {
         .timerfd_create = 0x3138,
         .timerfd_settime = 0x3140,
         .read = 0x3148,
-    }, 0x3150);
+        .log_print = 0x3150,
+    }, 0x3158);
     defer pass2.deinit();
     try std.testing.expectEqual(pass1.items.len, pass2.items.len);
     try std.testing.expect(pass1.items.len > 300);

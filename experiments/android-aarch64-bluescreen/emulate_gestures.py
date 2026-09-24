@@ -8,7 +8,8 @@ then whichever callbacks it registered. Touch sequences are fed through the
 input queue and the long-press timer, and the test asserts what each one was
 recognized as and what color was painted.
 
-Usage: pip install unicorn; python3 emulate_gestures.py bluescreen.apk
+Usage: pip install unicorn; python3 emulate_gestures.py bluescreen.apk [-v]
+(-v prints the library's logcat output for each scenario.)
 """
 import random
 import struct
@@ -16,14 +17,17 @@ import sys
 import zipfile
 
 from unicorn import Uc, UcError, UC_ARCH_ARM64, UC_MODE_ARM, UC_HOOK_CODE
+import re
+
 from unicorn.arm64_const import (
     UC_ARM64_REG_X0, UC_ARM64_REG_X1, UC_ARM64_REG_X2, UC_ARM64_REG_X3,
-    UC_ARM64_REG_X4, UC_ARM64_REG_X5, UC_ARM64_REG_X19, UC_ARM64_REG_X30,
-    UC_ARM64_REG_SP, UC_ARM64_REG_S0, UC_ARM64_REG_CPACR_EL1,
+    UC_ARM64_REG_X4, UC_ARM64_REG_X5, UC_ARM64_REG_X6, UC_ARM64_REG_X7,
+    UC_ARM64_REG_X19, UC_ARM64_REG_X30, UC_ARM64_REG_SP, UC_ARM64_REG_S0,
+    UC_ARM64_REG_CPACR_EL1,
 )
 
 X = [UC_ARM64_REG_X0, UC_ARM64_REG_X1, UC_ARM64_REG_X2, UC_ARM64_REG_X3,
-     UC_ARM64_REG_X4, UC_ARM64_REG_X5]
+     UC_ARM64_REG_X4, UC_ARM64_REG_X5, UC_ARM64_REG_X6, UC_ARM64_REG_X7]
 CALLEE_SAVED = [UC_ARM64_REG_X19 + i for i in range(10)]  # x19..x28
 
 BASE = 0x40000000  # where libmain.so is loaded (any 4 KB-aligned base works)
@@ -138,6 +142,7 @@ class Android:
         self.timer_cb = self.timer_fd = None
         self.timer_armed_ns = 0
         self.jni_set_int = []
+        self.logs = []
 
     # ── stubs ────────────────────────────────────────────────────────────
     def reg(self, i):
@@ -152,6 +157,29 @@ class Android:
     def ret_ptr(self, v):
         self.uc.reg_write(UC_ARM64_REG_X0, v & 0xFFFFFFFFFFFFFFFF)
 
+    def cstr(self, addr):
+        out = b""
+        while True:
+            c = bytes(self.uc.mem_read(addr + len(out), 1))
+            if c == b"\0":
+                return out.decode()
+            out += c
+
+    def format_log(self, fmt, vals):
+        # The subset of printf the library's format strings use.
+        it = iter(vals)
+
+        def conv(m):
+            v = next(it)
+            spec = m.group(1)
+            if spec == "lld":
+                return str(v - (1 << 64) if v >> 63 else v)
+            v &= 0xFFFFFFFF
+            if spec == "x":
+                return "%x" % v
+            return str(v - (1 << 32) if v >> 31 else v)
+        return re.sub(r"%(lld|d|x)", conv, fmt)
+
     def event(self, handle):
         idx = (handle - EVENTS) // 16
         return self.current_events[idx]
@@ -161,7 +189,7 @@ class Android:
             self._on_jni((addr - JNI_STUBS) // 4)
             return
         name = self.stub_names[addr]
-        args = [self.reg(i) for i in range(6)]
+        args = [self.reg(i) for i in range(8)]
         self.calls.append((name, args))
         if name == "ANativeWindow_setBuffersGeometry":
             assert args[0] == WINDOW and args[3] & 0xFFFFFFFF == 1
@@ -227,6 +255,10 @@ class Android:
             assert args[0] & 0xFFFFFFFF == 7 and args[2] == 8
             uc.mem_write(args[1], struct.pack("<Q", 1))
             self.ret_ptr(8)
+        elif name == "__android_log_print":
+            assert args[0] & 0xFFFFFFFF == 4 and self.cstr(args[1]) == "mlx"
+            self.logs.append(self.format_log(self.cstr(args[2]), args[3:8]))
+            self.ret_int(0)
         elif name == "malloc":
             p = self.heap_next
             self.heap_next += (args[0] + 15) & ~15
@@ -301,18 +333,25 @@ def start(so, **kw):
     return a
 
 
+VERBOSE = "-v" in sys.argv
+
+
 def check(a, name, expected_kind, expected_paints):
     got = KIND_NAMES[a.kind]
     painted = [next(k for k, c in COLORS.items() if c == p) for p in a.paints]
     ok = a.kind == expected_kind and painted == expected_paints
     print("%s %-44s -> %-11s painted %s" % ("PASS" if ok else "FAIL", name, got,
                                            [KIND_NAMES[k] for k in painted]))
+    if VERBOSE:
+        for line in a.logs:
+            print("       mlx: " + line)
     return ok
 
 
 def scenario(so, name, steps, expected_kind, expected_paint_kinds, **kw):
     a = start(so, **kw)
     a.paints.clear()
+    a.logs.clear()
     for step in steps:
         step(a)
     return check(a, name, expected_kind, expected_paint_kinds)
@@ -386,6 +425,7 @@ def run(so):
     a.call(a.callback(96), ACTIVITY, QUEUE)  # onInputQueueDestroyed
     assert a.input_cb is None
     a.paints.clear()
+    a.logs.clear()
     a.call(BASE + 0x4000, ACTIVITY, saved, size)  # new instance
     a.call(a.callback(56), ACTIVITY, WINDOW)
     results.append(check(a, "rotation keeps the last gesture (saved %d/%d B)" % (blob, size),
