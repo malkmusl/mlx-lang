@@ -1382,6 +1382,25 @@ contradicted.
     `apksigner verify` (v1/v2/v3, same certificate), the attribute-order
     check, `zipalign -p 4` for `libmain.so`, 16 KB `PT_LOAD` alignment and
     `unzip -t`. Real-device confirmation is pending.
+- **Thirty-first report: the two ports produce byte-identical APKs.**
+  Until now the Zig port was only checked with `zig ast-check`, because
+  the installed Zig (0.16) no longer has the `std.ArrayList`/`std.fs`/
+  `std.io` APIs it was written against. `ast-check` doesn't type-check,
+  and it had let a real type error through: `zip.zig` passed the 16 KB
+  alignment's `u32` padding length where a `u16` is required (fixed with
+  a checked cast; the value is always below 16384). To compare the ports
+  for real, a scratch copy of `tool/` with `std.ArrayList` renamed to
+  0.16's `std.array_list.Managed` (and `jar_sign.zig`'s three
+  `writer().print` calls swapped for `std.fmt.allocPrint`) was driven
+  through `main.zig`'s exact pipeline with the persisted signing key. Its
+  `libmain.so`, `AndroidManifest.xml`, `classes.dex` and the complete
+  signed APK (54,073 bytes, v1/v2/v3) are byte-identical to the mlx
+  port's. What still differs is only in `main`: the Zig CLI takes the
+  output path, package name and `--min-sdk`/`--target-sdk`, while mlx has
+  no argv yet and uses fixed values; and without a saved key the Zig port
+  would generate RSA-2048 where mlx generates RSA-1024 (both use the
+  committed 1024-bit key when it's present). `main.zig` itself still
+  doesn't build on Zig 0.16 for the API reasons above.
 
 ## What's genuinely unverified
 

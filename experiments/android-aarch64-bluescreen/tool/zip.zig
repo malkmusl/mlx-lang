@@ -66,7 +66,7 @@ pub fn build(allocator: std.mem.Allocator, entries: []const Entry) ![]u8 {
             const rem = data_start_unpadded % ZIP_ALIGN;
             if (rem != 0) extra_len = ZIP_ALIGN - rem;
         }
-        try appendU16(&out, extra_len);
+        try appendU16(&out, @intCast(extra_len)); // < ZIP_ALIGN, fits in 16 bits
         try out.appendSlice(e.name);
         try out.appendNTimes(0, @as(usize, extra_len));
         try out.appendSlice(e.data);
