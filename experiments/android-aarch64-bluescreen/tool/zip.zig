@@ -20,6 +20,21 @@ const EOCD_SIG: u32 = 0x06054b50;
 const DOS_TIME: u16 = 0x0000;
 const DOS_DATE: u16 = 0x0021; // 1980-01-01 — the common fixed default
 
+// 16384 (16 KB), matching elf_so.zig's PT_LOAD alignment -- real
+// `zipalign`/apksigner page-align *uncompressed* native-library entries
+// within the APK the same way (so the OS can mmap the library straight
+// out of the APK at a real page boundary instead of extracting it
+// first), and this project stores every entry uncompressed already, so
+// nothing here needs a "is this entry stored or deflated" check.
+const ZIP_ALIGN: u32 = 16384;
+
+// Real zipalign's own heuristic: page-align entries under lib/*/*.so, not
+// everything -- padding every entry would bloat the APK for no benefit,
+// since only native libraries are ever mmap'd directly.
+fn needsPageAlign(name: []const u8) bool {
+    return std.mem.endsWith(u8, name, ".so");
+}
+
 pub fn build(allocator: std.mem.Allocator, entries: []const Entry) ![]u8 {
     var out = std.ArrayList(u8).init(allocator);
     defer out.deinit();
@@ -30,7 +45,8 @@ pub fn build(allocator: std.mem.Allocator, entries: []const Entry) ![]u8 {
 
     for (entries, 0..) |e, i| {
         const crc = std.hash.Crc32.hash(e.data);
-        offsets[i] = .{ .offset = @intCast(out.items.len), .crc = crc };
+        const header_start: u32 = @intCast(out.items.len);
+        offsets[i] = .{ .offset = header_start, .crc = crc };
         try appendU32(&out, LOCAL_SIG);
         try appendU16(&out, 20); // version needed
         try appendU16(&out, 0); // flags
@@ -41,8 +57,18 @@ pub fn build(allocator: std.mem.Allocator, entries: []const Entry) ![]u8 {
         try appendU32(&out, @intCast(e.data.len)); // compressed size
         try appendU32(&out, @intCast(e.data.len)); // uncompressed size
         try appendU16(&out, @intCast(e.name.len));
-        try appendU16(&out, 0); // extra length
+
+        // 30 = the fixed-size local header fields written above (4+2+2+2
+        // +2+2+4+4+4+2+2), the one number here not already a named field.
+        var extra_len: u32 = 0;
+        if (needsPageAlign(e.name)) {
+            const data_start_unpadded: u32 = header_start + 30 + @as(u32, @intCast(e.name.len));
+            const rem = data_start_unpadded % ZIP_ALIGN;
+            if (rem != 0) extra_len = ZIP_ALIGN - rem;
+        }
+        try appendU16(&out, extra_len);
         try out.appendSlice(e.name);
+        try out.appendNTimes(0, @as(usize, extra_len));
         try out.appendSlice(e.data);
     }
 

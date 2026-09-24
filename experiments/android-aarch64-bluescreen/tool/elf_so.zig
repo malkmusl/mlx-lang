@@ -155,9 +155,21 @@ fn elfHash(name: []const u8) u32 {
 }
 
 const RO_VADDR: u64 = 0x1000;
-const TEXT_VADDR: u64 = 0x2000;
-const RW_VADDR: u64 = 0x3000;
-const PAGE: u64 = 0x1000;
+// 16384 (16 KB), not 4096 -- see mlx/elf_so.mlx's identical constants for
+// the full story: real, modern Android devices (confirmed on a real
+// Pixel 10 Pro running a current/Canary build, which flatly refused to
+// install this APK with "You can't install this app on your device")
+// require every PT_LOAD segment's alignment to be >= the device's page
+// size, which is 16 KB on newer hardware. Verified against Google's own
+// documented check (`llvm-objdump -p libmain.so | grep LOAD`, looking
+// for `align 2**14` or higher). Since every segment here already has
+// vaddr == offset, the ELF-spec congruency requirement holds either way
+// -- the honest fix is to actually move TEXT_VADDR/RW_VADDR to true 16
+// KB-multiple file offsets, not just relabel the existing 4 KB-spaced
+// layout's p_align field.
+const TEXT_VADDR: u64 = 0x4000;
+const RW_VADDR: u64 = 0x8000;
+const PAGE: u64 = 0x4000;
 
 fn alignUp(x: u64, a: u64) u64 {
     return (x + a - 1) & ~(a - 1);

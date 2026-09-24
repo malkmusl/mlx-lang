@@ -964,6 +964,62 @@ contradicted.
     pending: a real device confirming both the install block is gone
     *and* the targetSdkVersion warning from the twentieth report doesn't
     reappear now that install can actually proceed.
+- **Twenty-second report: the fix above didn't help -- same "You can't
+  install this app on your device" toast, confirmed after a clean
+  uninstall first** (ruling out a leftover signature mismatch). A
+  genuinely different, third bug: 16&nbsp;KB memory page size. Real,
+  modern Android hardware (confirmed on the same real Pixel 10 Pro,
+  running a current/Canary build) is moving to a 16&nbsp;KB page size
+  instead of the historical 4&nbsp;KB, and devices on the new page size
+  can refuse to install an APK outright if its native libraries' ELF
+  `PT_LOAD` segments aren't aligned to at least 16&nbsp;KB --
+  independent of, and unrelated to, both the targetSdkVersion warning
+  and the signing-key block from the previous two reports. Verified via
+  Google's own documented check
+  (developer.android.com/guide/practices/page-sizes): `llvm-objdump -p
+  libmain.so | grep LOAD` showed `align 2**12` (4096) on all three
+  `PT_LOAD` segments -- confirmed `UNALIGNED` by exactly the criterion
+  that page-sizes doc describes (`>= 2**14` required). This had been
+  true since this experiment's very first ELF writer and simply never
+  mattered until testing happened to land on 16&nbsp;KB-page hardware.
+  - Fixed in `elf_so.mlx`/`elf_so.zig` by moving `TEXT_VADDR` from
+    `0x2000` to `0x4000` and `RW_VADDR` from `0x3000` to `0x8000` (true
+    16&nbsp;KB-multiple file offsets, not just relabeling the existing
+    4&nbsp;KB-spaced layout's `p_align` field to `0x4000` while leaving
+    the actual segment starts unmoved -- that would satisfy a check that
+    only inspects the `align` column without the segments actually being
+    safely `mmap`-able at a real 16&nbsp;KB boundary, which is not
+    something this project settles for). Since every segment already has
+    `vaddr == offset`, the ELF-spec congruency requirement
+    (`p_vaddr &equiv; p_offset (mod p_align)`) holds either way, so this
+    was a pure constant change with the file's actual bytes growing
+    (`libmain.so`: 13,304 -&gt; 33,784 bytes) to hold the real padding
+    now needed between segments -- verified this doesn't touch the
+    machine-code generator at all: `aarch64.mlx`'s `adrp` encoder already
+    does proper page-unit arithmetic (`/ 4096`, the AArch64 ISA's own
+    fixed page-unit for the instruction itself, entirely independent of
+    the OS/ELF page-size concept being changed here) for arbitrary
+    target/PC deltas, not a hardcoded small-offset assumption, so it
+    needed no changes to correctly address the new, larger vaddrs.
+  - Also added the matching ZIP-level fix in `zip.mlx`/`zip.zig`: real
+    `zipalign`/apksigner additionally page-align *where the uncompressed
+    library's bytes sit inside the APK* (so the OS can `mmap` it directly
+    out of the APK without extracting it first), via padding written as
+    the local file header's "extra field" -- this project's ZIP writer
+    previously always wrote extra length `0` for every entry. Now any
+    entry whose name ends in `.so` gets exactly enough padding for its
+    data to start at a 16,384-byte-aligned offset, matching real
+    zipalign's own heuristic of only padding native libraries, not every
+    entry. Verified with `zipalign -c -v -p 4`: `lib/arm64-v8a/libmain.so
+    (OK)`, and directly confirmed the entry's data offset is `%16384 ==
+    0` via a Python zip-parsing script cross-check.
+  - Re-verified `apksigner verify` (still v1/v2/v3 all `true`) and
+    `unzip -t` (still clean) after both changes. Still pending: the
+    actual real-device install this was all aimed at unblocking -- three
+    independent, real bugs have now been found and fixed across three
+    rounds triggered by the same one install attempt, which is a
+    reasonable prompt to expect *this* one might not be the last if the
+    device still refuses it.
 
 ## What's genuinely unverified
 
@@ -989,10 +1045,13 @@ to visible pixels on a real screen. What's left:
   over the previous build and confirm both the warning is gone and the
   app still launches and behaves identically (none of this round's
   changes touch what the app itself does at runtime).
-- **No native-library page alignment.** `libmain.so` is stored (not
-  compressed) but not 4/16 KiB-aligned within the ZIP, so it relies on
-  `extractNativeLibs`-style extraction rather than direct `mmap`. Fine
-  functionally, worth tightening later.
+- **16 KB native-library page alignment (both the ELF `PT_LOAD` segments
+  and the ZIP entry's own byte offset) is now implemented and passes both
+  Google's official `llvm-objdump -p` check and `zipalign -c -p 4`, but
+  is unconfirmed on the actual real device this was meant to unblock** --
+  see the twenty-second report above. Three independent real bugs found
+  across three rounds from a single install attempt is reason enough not
+  to assume this is the last one until a device actually confirms it.
 - **RSA-2048 implementation is from-scratch and unaudited.** It produces
   signatures `jarsigner`/`openssl` accept, which is a strong structural and
   interoperability signal, but this code has not had any cryptographic
