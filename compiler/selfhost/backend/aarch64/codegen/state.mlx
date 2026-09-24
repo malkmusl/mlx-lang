@@ -1,0 +1,346 @@
+// Per-function code generation state for the AArch64 backend. Frame-slot
+// allocation, component bookkeeping for multi-word values, type queries and
+// block-label naming are the same as backend/x86_64/codegen/state.mlx, so a
+// function gets the same frame layout on both targets (slot N lives at
+// x29 - N here and rbp - N there). The x86_64 "retain in rax" peephole is
+// not mirrored: every value is stored to its slot as soon as it is made.
+const allocator_module = @import("../../../../../std/bootstrap/allocator.mlx")
+const vector = @import("../../../../../std/bootstrap/vector.mlx")
+const encoder = @import("../encoder.mlx")
+const lir_module = @import("../../../ir/lir.mlx")
+const type_store = @import("../../../sema/types/store.mlx")
+
+const BLOCK_LABEL_STRIDE: usize = 32
+
+pub const VregMap = struct {
+    key: usize
+    value: i32
+}
+
+pub const ComponentMap = struct {
+    key: usize
+    component: usize
+    value: i32
+}
+
+pub const State = struct {
+    enc: *encoder.Encoder
+    lir: *lir_module.Lir
+    typeStore: *type_store.Store
+    nextStackSlot: i32
+    vregSlots: [*]i32
+    slotEpochs: [*]usize
+    componentSlots: [*]i32
+    componentCounts: [*]usize
+    slotCapacity: usize
+    componentStride: usize
+    slotEpoch: usize
+    addrSlots: *vector.Vector
+    blockLabelLengths: [*]usize
+    blockLabelStorage: [*]u8
+    blockLabelCapacity: usize
+    aggregateAllocationCount: usize
+    aggregateAllocationBytes: usize
+    directCallCount: usize
+    fallthroughBranchCount: usize
+    invalidOperandCount: usize
+    frameSize: usize
+    currentReturnType: usize
+    allocator: allocator_module.Allocator
+
+    pub fn create(alloc: allocator_module.Allocator, enc: *encoder.Encoder, lir: *lir_module.Lir, types: *type_store.Store) -> *Self {
+        unsafe {
+            const state = @ptrCast(*Self, alloc.alloc(@sizeOf(Self), @alignOf(Self)).?)
+            state.*.enc = enc
+            state.*.lir = lir
+            state.*.typeStore = types
+            state.*.nextStackSlot = 8
+            state.*.slotCapacity = if lir_module.instCount(lir) > 0 { lir_module.instCount(lir) } else { 1 }
+            state.*.componentStride = Self.maximumComponentCount(lir)
+            state.*.vregSlots = @ptrCast([*]i32, alloc.alloc(state.*.slotCapacity * @sizeOf(i32), @alignOf(i32)).?)
+            state.*.slotEpochs = @ptrCast([*]usize, alloc.alloc(state.*.slotCapacity * @sizeOf(usize), @alignOf(usize)).?)
+            state.*.componentSlots = @ptrCast([*]i32, alloc.alloc(state.*.slotCapacity * state.*.componentStride * @sizeOf(i32), @alignOf(i32)).?)
+            state.*.componentCounts = @ptrCast([*]usize, alloc.alloc(state.*.slotCapacity * @sizeOf(usize), @alignOf(usize)).?)
+            state.*.slotEpoch = 0
+            state.*.addrSlots = Self.createVector(alloc, @sizeOf(VregMap), @alignOf(VregMap), 64)
+            state.*.blockLabelCapacity = Self.maximumBlockLabel(lir) + 1
+            state.*.blockLabelLengths = @ptrCast([*]usize, alloc.alloc(state.*.blockLabelCapacity * @sizeOf(usize), @alignOf(usize)).?)
+            state.*.blockLabelStorage = alloc.alloc(state.*.blockLabelCapacity * BLOCK_LABEL_STRIDE, 1).?
+            state.*.aggregateAllocationCount = 0
+            state.*.aggregateAllocationBytes = 0
+            state.*.directCallCount = 0
+            state.*.fallthroughBranchCount = 0
+            state.*.invalidOperandCount = 0
+            state.*.frameSize = 0
+            state.*.currentReturnType = lir_module.NONE
+            state.*.allocator = alloc
+            Self.initializeEpochs(state)
+            Self.initializeBlockLabels(state)
+            return state
+        }
+    }
+
+    fn maximumComponentCount(lir: *lir_module.Lir) -> usize {
+        var result: usize = 3
+        var index: usize = 0
+        while index < lir_module.instCount(lir) {
+            const instruction = lir_module.getInst(lir, index)
+            if instruction.opcode == lir_module.Opcode.tuple_literal && instruction.arg1 > result { result = instruction.arg1 }
+            index += 1
+        }
+        return result
+    }
+
+    fn maximumBlockLabel(lir: *lir_module.Lir) -> usize {
+        var result: usize = 0
+        var index: usize = 0
+        while index < lir_module.instCount(lir) {
+            const instruction = lir_module.getInst(lir, index)
+            if instruction.opcode == lir_module.Opcode.label && instruction.arg0 == lir_module.NONE && instruction.arg1 != lir_module.NONE && instruction.arg1 > result {
+                result = instruction.arg1
+            }
+            if instruction.opcode == lir_module.Opcode.br && instruction.arg0 != lir_module.NONE && instruction.arg0 > result {
+                result = instruction.arg0
+            }
+            if instruction.opcode == lir_module.Opcode.condbr {
+                if instruction.arg1 != lir_module.NONE && instruction.arg1 > result { result = instruction.arg1 }
+                if instruction.arg2 != lir_module.NONE && instruction.arg2 > result { result = instruction.arg2 }
+            }
+            index += 1
+        }
+        return result
+    }
+
+    fn initializeEpochs(state: *Self) -> void {
+        var index: usize = 0
+        while index < state.*.slotCapacity {
+            state.*.slotEpochs[index] = 0
+            state.*.componentCounts[index] = 0
+            index += 1
+        }
+    }
+
+    fn initializeBlockLabels(state: *Self) -> void {
+        var index: usize = 0
+        while index < state.*.blockLabelCapacity {
+            state.*.blockLabelLengths[index] = 0
+            index += 1
+        }
+    }
+
+    fn createVector(alloc: allocator_module.Allocator, element_size: usize, element_alignment: usize, capacity: usize) -> *vector.Vector {
+        unsafe {
+            const result = @ptrCast(*vector.Vector, alloc.alloc(@sizeOf(vector.Vector), @alignOf(vector.Vector)).?)
+            vector.Vector.initAt(result, alloc, element_size, element_alignment, capacity)
+            return result
+        }
+    }
+
+    pub fn destroy(state: *Self) -> void {
+        unsafe {
+            state.*.allocator.free(@ptrCast([*]u8, state.*.vregSlots), state.*.slotCapacity * @sizeOf(i32), @alignOf(i32))
+            state.*.allocator.free(@ptrCast([*]u8, state.*.slotEpochs), state.*.slotCapacity * @sizeOf(usize), @alignOf(usize))
+            state.*.allocator.free(@ptrCast([*]u8, state.*.componentSlots), state.*.slotCapacity * state.*.componentStride * @sizeOf(i32), @alignOf(i32))
+            state.*.allocator.free(@ptrCast([*]u8, state.*.componentCounts), state.*.slotCapacity * @sizeOf(usize), @alignOf(usize))
+            state.*.allocator.free(@ptrCast([*]u8, state.*.blockLabelLengths), state.*.blockLabelCapacity * @sizeOf(usize), @alignOf(usize))
+            state.*.allocator.free(state.*.blockLabelStorage, state.*.blockLabelCapacity * BLOCK_LABEL_STRIDE, 1)
+        }
+        Self.destroyVector(state, state.*.addrSlots)
+        unsafe { state.*.allocator.free(@ptrCast([*]u8, state), @sizeOf(Self), @alignOf(Self)) }
+    }
+
+    fn destroyVector(state: *Self, value: *vector.Vector) -> void {
+        vector.Vector.deinit(value.*)
+        unsafe { state.*.allocator.free(@ptrCast([*]u8, value), @sizeOf(vector.Vector), @alignOf(vector.Vector)) }
+    }
+
+    fn getMap(values: *vector.Vector, key: usize) -> (bool, i32) {
+        var index: usize = 0
+        while index < values.*.length {
+            unsafe {
+                const entry = @ptrCast(*VregMap, vector.Vector.at(values.*, index))
+                if entry.*.key == key { return -> (true, entry.*.value) }
+            }
+            index += 1
+        }
+        return -> (false, 0)
+    }
+
+    fn putMap(values: *vector.Vector, key: usize, value: i32) -> void {
+        var entry = VregMap.{ .key = key, .value = value }
+        unsafe { const appended = vector.Vector.appendAt(values, @ptrCast([*]const u8, &entry)) }
+    }
+
+    pub fn allocateOp(state: *Self, vreg: usize) -> i32 {
+        if vreg >= state.*.slotCapacity {
+            // An operand that names no LIR value (a lowering gap). Count it
+            // so the driver can fail the build, and hand out a slot that
+            // keeps the bookkeeping arrays in bounds.
+            state.*.invalidOperandCount += 1
+            return 8
+        }
+        if state.*.slotEpochs[vreg] == state.*.slotEpoch { return state.*.vregSlots[vreg] }
+        const slot = state.*.nextStackSlot
+        state.*.nextStackSlot = slot + 8
+        state.*.slotEpochs[vreg] = state.*.slotEpoch
+        state.*.vregSlots[vreg] = slot
+        state.*.componentCounts[vreg] = 1
+        return slot
+    }
+
+    // Every LIR value lives in its frame slot(s); instructions load their
+    // operands into scratch registers and store the result straight back.
+    pub fn loadOp(state: *Self, destination: u32, vreg: usize) -> void {
+        encoder.emitLoadSlot(state.*.enc, destination, Self.allocateOp(state, vreg))
+    }
+
+    pub fn storeResult(state: *Self, index: usize, source: u32) -> void {
+        encoder.emitStoreSlot(state.*.enc, Self.allocateOp(state, index), source)
+    }
+
+    pub fn storeImmediateResult(state: *Self, index: usize, value: u64) -> void {
+        encoder.emitLoadImm(state.*.enc, encoder.X0, value)
+        Self.storeResult(state, index, encoder.X0)
+    }
+
+    pub fn getOrAllocSlot(state: *Self, variable: usize) -> i32 {
+        const found = Self.getMap(state.*.addrSlots, variable)
+        if found.0 { return found.1 }
+        const slot = state.*.nextStackSlot
+        state.*.nextStackSlot = slot + 8
+        Self.putMap(state.*.addrSlots, variable, slot)
+        return slot
+    }
+
+    pub fn getComponent(state: *Self, vreg: usize, component: usize) -> (bool, i32) {
+        if vreg >= state.*.slotCapacity { return -> (false, 0) }
+        if state.*.slotEpochs[vreg] != state.*.slotEpoch { return -> (false, 0) }
+        if component == 0 { return -> (true, state.*.vregSlots[vreg]) }
+        if component >= state.*.componentCounts[vreg] { return -> (false, 0) }
+        return -> (true, state.*.componentSlots[vreg * state.*.componentStride + component])
+    }
+
+    pub fn allocateComponentOp(state: *Self, vreg: usize, component: usize) -> i32 {
+        if component == 0 || vreg >= state.*.slotCapacity { return Self.allocateOp(state, vreg) }
+        const found = Self.getComponent(state, vreg, component)
+        if found.0 { return found.1 }
+        if state.*.slotEpochs[vreg] != state.*.slotEpoch { const primary = Self.allocateOp(state, vreg) }
+        const slot = state.*.nextStackSlot
+        state.*.nextStackSlot = slot + 8
+        state.*.componentSlots[vreg * state.*.componentStride + component] = slot
+        if component + 1 > state.*.componentCounts[vreg] { state.*.componentCounts[vreg] = component + 1 }
+        return slot
+    }
+
+    pub fn allocateSecondaryOp(state: *Self, vreg: usize) -> i32 { return Self.allocateComponentOp(state, vreg, 1) }
+
+    pub fn allocateTertiaryOp(state: *Self, vreg: usize) -> i32 { return Self.allocateComponentOp(state, vreg, 2) }
+
+    pub fn componentCount(state: *Self, vreg: usize) -> usize {
+        if vreg >= state.*.slotCapacity { return 1 }
+        if state.*.slotEpochs[vreg] != state.*.slotEpoch { return 1 }
+        return state.*.componentCounts[vreg]
+    }
+
+    pub fn isFloatType(state: *Self, type_id: usize) -> bool {
+        if type_id == lir_module.NONE || type_id >= type_store.Store.count(state.*.typeStore) { return false }
+        const value = type_store.Store.get(state.*.typeStore, type_id)
+        return value.*.kind == type_store.Kind.float || value.*.kind == type_store.Kind.comptime_float_type
+    }
+
+    pub fn floatBits(state: *Self, type_id: usize) -> usize {
+        if !Self.isFloatType(state, type_id) { return 64 }
+        const value = type_store.Store.get(state.*.typeStore, type_id)
+        if value.*.kind == type_store.Kind.float && value.*.bits == 32 { return 32 }
+        return 64
+    }
+
+    pub fn isSignedType(state: *Self, type_id: usize) -> bool {
+        if type_id == lir_module.NONE || type_id >= type_store.Store.count(state.*.typeStore) { return false }
+        const value = type_store.Store.get(state.*.typeStore, type_id)
+        return value.*.kind == type_store.Kind.integer && value.*.flags & type_store.FLAG_SIGNED != 0
+    }
+
+    pub fn isErrorUnion(state: *Self, type_id: usize) -> bool {
+        return type_id != lir_module.NONE && type_id < type_store.Store.count(state.*.typeStore) && type_store.Store.get(state.*.typeStore, type_id).*.kind == type_store.Kind.error_union
+    }
+
+    pub fn isFloatErrorUnion(state: *Self, type_id: usize) -> bool {
+        if !Self.isErrorUnion(state, type_id) { return false }
+        return Self.isFloatType(state, type_store.Store.get(state.*.typeStore, type_id).*.rhs)
+    }
+
+    pub fn errorUnionPayloadType(state: *Self, type_id: usize) -> usize {
+        if !Self.isErrorUnion(state, type_id) { return lir_module.NONE }
+        return type_store.Store.get(state.*.typeStore, type_id).*.rhs
+    }
+
+    pub fn typeWordCount(state: *Self, type_id: usize) -> usize {
+        if type_id == lir_module.NONE || type_id >= type_store.Store.count(state.*.typeStore) { return 1 }
+        const value = type_store.Store.get(state.*.typeStore, type_id)
+        if value.*.kind == type_store.Kind.slice || value.*.kind == type_store.Kind.error_union { return 2 }
+        if value.*.kind == type_store.Kind.tuple {
+            var result: usize = 0
+            var index: usize = 0
+            while index < value.*.extraLength {
+                result += Self.typeWordCount(state, type_store.Store.extraAt(state.*.typeStore, value.*.extraStart + index))
+                index += 1
+            }
+            if result > 3 { return 3 }
+            return result
+        }
+        return 1
+    }
+
+    pub fn incomingArgumentSlot(index: usize) -> i32 { return @intCast(i32, (index + 1) * 8) }
+
+    pub fn beginFunction(state: *Self, frame_size: usize) -> void {
+        state.*.addrSlots.*.length = 0
+        state.*.slotEpoch += 1
+        state.*.nextStackSlot = 8
+        state.*.frameSize = frame_size
+    }
+
+    pub fn functionFrameSize(state: *Self, label_index: usize) -> usize {
+        var index = label_index + 1
+        var count: usize = 0
+        const total = lir_module.instCount(state.*.lir)
+        while index < total {
+            const instruction = lir_module.getInst(state.*.lir, index)
+            if instruction.opcode == lir_module.Opcode.label && instruction.arg0 != lir_module.NONE { break }
+            if instruction.opcode != lir_module.Opcode.dead { count += 1 }
+            index += 1
+        }
+        return (count * 24 + 271) & ~@intCast(usize, 15)
+    }
+
+    pub fn blockLabelName(state: *Self, index: usize) -> ([*]const u8, usize) {
+        var result: [*]u8 = undefined
+        unsafe { result = @ptrFromInt([*]u8, @intFromPtr(state.*.blockLabelStorage) + index * BLOCK_LABEL_STRIDE) }
+        if state.*.blockLabelLengths[index] != 0 {
+            return -> (result, state.*.blockLabelLengths[index])
+        }
+        result[0] = 46
+        result[1] = 98
+        result[2] = 108
+        result[3] = 111
+        result[4] = 99
+        result[5] = 107
+        result[6] = 95
+        var length: usize = 7
+        if index == 0 {
+            result[length] = 48
+            length += 1
+        } else {
+            var divisor: usize = 1
+            while index / divisor >= 10 { divisor *= 10 }
+            while divisor > 0 {
+                result[length] = @intCast(u8, 48 + (index / divisor) % 10)
+                length += 1
+                divisor /= 10
+            }
+        }
+        state.*.blockLabelLengths[index] = length
+        return -> (result, length)
+    }
+}
