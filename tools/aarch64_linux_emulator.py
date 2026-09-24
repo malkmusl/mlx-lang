@@ -21,9 +21,9 @@ import struct
 import sys
 import time
 
-from unicorn import (Uc, UcError, UC_ARCH_ARM64, UC_MODE_ARM, UC_HOOK_INTR,
-                     UC_PROT_ALL)
-from unicorn.arm64_const import (UC_ARM64_REG_CPACR_EL1, UC_ARM64_REG_PC,
+from unicorn import (Uc, UcError, UC_ARCH_ARM64, UC_MODE_ARM, UC_HOOK_CODE,
+                     UC_HOOK_INTR, UC_PROT_ALL)
+from unicorn.arm64_const import (UC_ARM64_REG_CPACR_EL1, UC_ARM64_REG_LR, UC_ARM64_REG_PC,
                                  UC_ARM64_REG_SP, UC_ARM64_REG_X0,
                                  UC_ARM64_REG_X8)
 
@@ -583,6 +583,117 @@ class Process:
 
     def sys_94(self, status, *_):  # exit_group
         raise Exit(status & 0xFF)
+
+
+class SharedLibrary(Process):
+    """Loads an AArch64 ET_DYN shared object (e.g. an Android libmain.so)
+    the way a dynamic linker would: maps its PT_LOAD segments at LIBRARY_BASE,
+    binds every R_AARCH64_GLOB_DAT import to a Python stub from `imports`
+    (name -> function(process, x0..x7) -> result), and lets tests call its
+    exported functions with call(name, *args). Unbound imports return 0 and
+    are listed in `missing`."""
+
+    LIBRARY_BASE = 0x7F00_0000_0000
+    STUB_BASE = 0x7E00_0000_0000
+    RETURN_ADDRESS = 0x7D00_0000_0000
+
+    def __init__(self, path, imports=None, trace=False, timeout_seconds=60):
+        self.imports = imports or {}
+        self.stubs = {}
+        self.missing = set()
+        self.exports = {}
+        super().__init__(path, [path], trace=trace, timeout_seconds=timeout_seconds)
+        self.uc.mem_map(self.RETURN_ADDRESS, PAGE, UC_PROT_ALL)
+        self.uc.hook_add(UC_HOOK_CODE, self._on_stub, begin=self.STUB_BASE, end=self.STUB_BASE + 0x100000)
+
+    def _load(self, path):
+        with open(path, "rb") as handle:
+            image = handle.read()
+        if image[:4] != b"\x7fELF" or struct.unpack_from("<HH", image, 16) != (3, 183):
+            raise ValueError(f"{path}: not an AArch64 ET_DYN file")
+        base = self.LIBRARY_BASE
+        phoff = struct.unpack_from("<Q", image, 32)[0]
+        phentsize, phnum = struct.unpack_from("<HH", image, 54)
+        dynamic = None
+        for index in range(phnum):
+            p_type, _flags, offset, vaddr, _paddr, filesz, memsz, align = struct.unpack_from(
+                "<IIQQQQQQ", image, phoff + index * phentsize)
+            if p_type == 1:
+                if align < 0x4000 or vaddr % align != offset % align:
+                    raise ValueError(f"PT_LOAD {index}: alignment {align:#x} unsuitable for 16 KiB pages")
+                self._map(base + vaddr, memsz)
+                self.uc.mem_write(base + vaddr, image[offset:offset + filesz])
+            elif p_type == 2:
+                dynamic = (offset, filesz)
+        tags = {}
+        for entry in range(dynamic[1] // 16):
+            tag, value = struct.unpack_from("<qQ", image, dynamic[0] + entry * 16)
+            if tag == 0:
+                break
+            tags.setdefault(tag, []).append(value)
+        symtab, strtab = tags[6][0], tags[5][0]
+        hash_nchain = struct.unpack_from("<I", image, tags[4][0] + 4)[0]
+
+        def name_at(offset):
+            return image[strtab + offset:image.index(b"\0", strtab + offset)].decode()
+
+        self.needed = [name_at(offset) for offset in tags.get(1, [])]
+        self._map(self.STUB_BASE, 0x100000)
+        for index in range(1, hash_nchain):
+            name_offset, info, _other, shndx, value, _size = struct.unpack_from("<IBBHQQ", image, symtab + index * 24)
+            if shndx:
+                self.exports[name_at(name_offset)] = base + value
+        rela, relasz = tags.get(7, [0])[0], tags.get(8, [0])[0]
+        for entry in range(relasz // 24):
+            offset, info, addend = struct.unpack_from("<QQq", image, rela + entry * 24)
+            if info & 0xFFFFFFFF != 1025:  # R_AARCH64_GLOB_DAT
+                raise ValueError(f"unexpected relocation type {info & 0xFFFFFFFF}")
+            name = name_at(struct.unpack_from("<I", image, symtab + (info >> 32) * 24)[0])
+            stub = self.STUB_BASE + len(self.stubs) * 16
+            self.stubs[stub] = name
+            self.uc.mem_write(stub, struct.pack("<I", 0xD65F03C0))  # ret
+            self.uc.mem_write(base + offset, struct.pack("<Q", stub + addend))
+        return 0
+
+    def _setup_stack(self):
+        self._map(STACK_TOP - STACK_SIZE, STACK_SIZE)
+
+    def _on_stub(self, uc, address, _size, _user_data):
+        name = self.stubs.get(address)
+        if name is None:
+            return
+        args = [uc.reg_read(UC_ARM64_REG_X0 + i) for i in range(8)]
+        handler = self.imports.get(name)
+        if handler is None:
+            self.missing.add(name)
+            result = 0
+        else:
+            result = handler(self, *args)
+        if self.trace:
+            sys.stderr.write(f"[import] {name}({', '.join(hex(a) for a in args[:4])}) = {result}\n")
+        uc.reg_write(UC_ARM64_REG_X0, (result or 0) & 0xFFFFFFFFFFFFFFFF)
+
+    def call(self, name, *args):
+        """Calls exported function `name` with integer arguments; returns x0."""
+        self.status = None
+        for index, value in enumerate(args[:8]):
+            self.uc.reg_write(UC_ARM64_REG_X0 + index, value & 0xFFFFFFFFFFFFFFFF)
+        # AAPCS64: further integer arguments go in 8-byte stack slots at sp.
+        stack = STACK_TOP - 4096
+        for index, value in enumerate(args[8:]):
+            self.uc.mem_write(stack + index * 8, struct.pack("<Q", value & 0xFFFFFFFFFFFFFFFF))
+        self.uc.reg_write(UC_ARM64_REG_SP, stack)
+        self.uc.reg_write(UC_ARM64_REG_LR, self.RETURN_ADDRESS)
+        try:
+            self.uc.emu_start(self.exports[name], self.RETURN_ADDRESS, timeout=self.timeout * 1_000_000)
+        except UcError as error:
+            pc = self.uc.reg_read(UC_ARM64_REG_PC)
+            raise RuntimeError(f"{name}: {error} at pc={pc:#x}") from None
+        if self.status is not None:
+            raise RuntimeError(f"{name}: stopped with status {self.status}")
+        if self.uc.reg_read(UC_ARM64_REG_PC) != self.RETURN_ADDRESS:
+            raise RuntimeError(f"{name}: did not return (timeout)")
+        return self.uc.reg_read(UC_ARM64_REG_X0)
 
 
 def main():
