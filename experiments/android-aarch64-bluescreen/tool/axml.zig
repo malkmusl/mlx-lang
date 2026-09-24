@@ -213,6 +213,10 @@ const Element = struct {
     attrs: []const Attr,
 };
 
+// `el.attrs` must be in ascending resource-ID order, with non-resource
+// attributes (e.g. `package`) last. The platform's attribute lookup is a
+// single forward merge-walk over them, so an attribute following a
+// higher-ID one is silently never found.
 fn writeStartElement(out: *std.ArrayList(u8), pool: *StringPool, el: Element, line: u32) !void {
     var body = std.ArrayList(u8).init(out.allocator);
     defer body.deinit();
@@ -365,15 +369,16 @@ pub fn buildManifest(allocator: std.mem.Allocator, package: []const u8, fullscre
         (if (system_status_bar_color) THEME_SYSTEM_FULLSCREEN else THEME_FULLSCREEN)
     else
         (if (system_status_bar_color) THEME_SYSTEM_WITH_STATUS_BAR else THEME_WITH_STATUS_BAR);
+    // Attributes must be listed in ascending resource-ID order (see
+    // writeStartElement). `exported` (0x01010010) was once listed last,
+    // after configChanges (0x0101001f), and the platform silently skipped
+    // it -- INSTALL_PARSE_FAILED_MANIFEST_MALFORMED at target >= 31.
     try writeStartElement(&body, &pool, .{ .name = "activity", .attrs = &[_]Attr{
         .{ .ns = true, .name = "theme", .value = .{ .reference = theme_id } },
         .{ .ns = true, .name = "label", .value = .{ .str = "Mlx Blue Screen" } },
         .{ .ns = true, .name = "name", .value = .{ .str = "android.app.NativeActivity" } },
-        .{ .ns = true, .name = "configChanges", .value = .{ .int_hex = 0x20 } },
-        // Mandatory (not optional) once targetSdkVersion >= 31, since
-        // this activity has an intent-filter below -- see ANDROID_ATTRS's
-        // "exported" entry above for the full story.
         .{ .ns = true, .name = "exported", .value = .{ .boolean = true } },
+        .{ .ns = true, .name = "configChanges", .value = .{ .int_hex = 0x20 } },
     } }, line);
     line += 1;
 

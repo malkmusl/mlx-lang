@@ -55,43 +55,16 @@ const DEFAULT_MIN_SDK_VERSION: u32 = 21;
 // signing -- Android surfaces that warning purely off the gap between
 // targetSdkVersion and the device's own platform version.
 //
-// Defaults to 30 (Android 11), not something higher, as the result of a
-// real-device bisection: every build at targetSdkVersion 31 or above has
-// failed to install outright ("You can't install this app on your
-// device"), even after correctly implementing every specific 31+/35+
-// requirement found (android:exported, android:extractNativeLibs, 16 KB
-// native-library alignment -- all individually confirmed present and
-// byte-correct, and each one individually ruled OUT as the cause by
-// testing its absence). A single-variable A/B test (identical manifest
-// and binary, only this value changed) confirmed the exact boundary: 30
-// installs, 31 does not, real-device confirmed. No adb/logcat access
-// exists on the test device to see the platform's actual rejection
-// reason at 31+, so whatever that requirement is remains unidentified.
+// Still 30 (the last real-device-confirmed value) pending device
+// confirmation of the fix for the >= 31 install block: axml.zig wrote
+// android:exported out of resource-ID order, so the platform's attribute
+// lookup skipped it (INSTALL_PARSE_FAILED_MANIFEST_MALFORMED). See the
+// README's twenty-eighth report. Override with `--target-sdk=N`.
 //
-// 30 still clears the original old-Android warning (Android 11 is not
-// "old" by that warning's own standard), and every other fix from this
-// investigation is kept since none of them were the culprit and all are
-// harmless or beneficial regardless of target.
-//
-// This is a DEFAULT, not a hard ceiling: override with `--target-sdk=N`
-// to keep bisecting the 31+ block (the next step is getting a real
-// PackageManager rejection reason via `pm install -r` run locally in a
-// terminal app on the test device itself, e.g. Termux, since that needs
-// no adb/PC at all -- see the README's "Where this goes next" section).
-// Do not raise this default until that block is actually root-caused and
-// fixed; every build above 30 is currently known to fail on the real
-// test device regardless of anything else in this file.
-//
-// There's no real "maxSdkVersion" concept to pair with MIN_SDK_VERSION
-// here: `<uses-sdk android:maxSdkVersion>` is a real manifest attribute,
-// but Android's own docs have deprecated it since API 4 and the
-// framework ignores it at install time on every version since -- adding
-// it would look like a fix without doing anything. The actual
-// "supports every SDK" lever is this single TARGET_SDK_VERSION ceiling:
-// Android installs on any device with API >= min_sdk_version regardless
-// of target, normally, so raising this default (once whatever blocks
-// 31+ on this device is fixed) is what widens real-world support, not a
-// separate max-sdk field.
+// There's deliberately no "maxSdkVersion" to pair with the min:
+// `<uses-sdk android:maxSdkVersion>` has been ignored at install time since
+// API 4. Android installs on any device >= min_sdk_version regardless of
+// target, so this single value is the real "how current" lever.
 const DEFAULT_TARGET_SDK_VERSION: u32 = 30;
 
 // Absolute path (not repo-relative) to a small persisted RSA keypair,
@@ -204,7 +177,7 @@ pub fn main() !void {
     }
 
     try out.print("mlx android-aarch64-bluescreen experiment — building {s} (package {s})\n", .{ out_path, package });
-    try out.print("      min-sdk={d} target-sdk={d}{s}\n", .{ min_sdk_version, target_sdk_version, if (target_sdk_version > 30) " (WARNING: >30 is known to fail install on the real test device -- see TARGET_SDK_VERSION's comment)" else "" });
+    try out.print("      min-sdk={d} target-sdk={d}\n", .{ min_sdk_version, target_sdk_version });
 
     try out.print("[1/7] generating AArch64 machine code + ELF64 shared object...\n", .{});
     const so_bytes = try elf_so.build(allocator, "libmain.so", "libandroid.so", "libc.so");

@@ -1125,7 +1125,10 @@ contradicted.
   4. **bisect3** (v21 baseline + `android:exported` only, targetSdk left
      at 29): **installs.** Proves the `exported` encoder change itself
      has no bug -- adding it to a build that already installs doesn't
-     break it.
+     break it. *(Wrong -- see the twenty-eighth report. Below target 31
+     the platform never checks for `exported`, so this build installing
+     proved nothing about whether the platform could actually read it.
+     It couldn't.)*
   5. **bisect4** (full current combination -- 16 KB alignment,
      `exported`, `extractNativeLibs`, stable key -- targetSdk 31):
      **fails.**
@@ -1157,7 +1160,9 @@ contradicted.
     `extractNativeLibs`, 16 KB alignment) was individually implemented
     correctly and individually ruled out by this bisection -- the actual
     mechanism remains unidentified for lack of adb/logcat access to see
-    the platform's real rejection reason.
+    the platform's real rejection reason. *(Since identified -- see the
+    twenty-eighth report. `exported` was never correctly implemented; it
+    was present but unreadable due to attribute ordering.)*
   - Verified with the full tool suite before shipping: `apksigner
     verify --print-certs -v` (`Verifies`, v1/v2/v3 all `true`, same
     persisted certificate SHA-256 as every prior build -- no reinstall
@@ -1235,6 +1240,62 @@ contradicted.
     information `adb install` would show, without needing adb or a
     computer. This is the fastest real path to root-causing (not just
     routing around) the 31+ block, and hasn't been tried yet.
+    *(Tried; didn't work. Non-rooted Termux runs as an ordinary app UID,
+    which can't call the package service --
+    `cmd: Failure calling service package: Failed transaction`. `pm`
+    needs the `shell` UID that `adb` provides. The real answer came from
+    `adb install` -- see the twenty-eighth report.)*
+- **Twenty-eighth report: root cause of the `targetSdkVersion >= 31`
+  install block, found with `adb install`, and fixed.** With adb
+  available, `adb install -r` on a target-31 build printed the actual
+  rejection instead of the generic toast:
+  ```
+  Failure [INSTALL_PARSE_FAILED_MANIFEST_MALFORMED: Failed parse during
+  installPackageLI: /data/app/vmdl1882762383.tmp/base.apk (at Binary XML
+  file line #16): android.app.NativeActivity: Targeting S+ (version 31
+  and above) requires that an explicit value for android:exported be
+  defined when intent filters are present]
+  ```
+  So the platform wasn't seeing `android:exported` at all, even though
+  it was in the file and `aapt dump xmltree` showed it. The cause:
+  **attribute order.** The framework reads an element's attributes with
+  `AttributeResolution`'s `RetrieveAttributes`, which walks the requested
+  attribute IDs (sorted) and the element's XML attributes (in file order)
+  in a single forward merge -- it assumes the XML attributes are already
+  sorted by resource ID, which is what `aapt2` always emits. This
+  project's `<activity>` wrote them as `theme` (0x01010000), `label`
+  (0x01010001), `name` (0x01010003), `configChanges` (0x0101001f),
+  `exported` (0x01010010) -- `exported` appended last when it was added
+  in the twenty-third report. Looking for 0x10, the walk passes 0x00,
+  0x01, 0x03, reaches 0x1f > 0x10, concludes `exported` is absent, and
+  moves on. `aapt dump xmltree` iterates every attribute regardless of
+  order, so it never showed a problem. "Line #16" is the `</activity>`
+  end tag, where the parser checks exported-vs-intent-filters.
+  - This also explains every earlier result: below target 31 a missing
+    `exported` is legal, so every target-29/30 build installed whether
+    or not the platform could read it -- which is why bisect3 (twenty-
+    sixth report) "proved" nothing, and why the 30-vs-31 boundary was
+    exact. `extractNativeLibs` and 16 KB alignment really weren't
+    involved; `exported` was the right fix all along, just never
+    actually delivered to the platform.
+  - **Fix:** `exported` moved between `name` and `configChanges` in both
+    `mlx/axml.mlx` and `tool/axml.zig`, with the ordering invariant
+    documented on `writeStartElementHeader`/`writeStartElement` so a
+    future attribute doesn't repeat this.
+  - **Verified:** a small AXML checker (parses the string pool, resource
+    map, and each start element, and flags any element whose resource-
+    ID'd attributes aren't ascending, with non-ID'd ones last) reported
+    exactly one violation -- the `<activity>`'s `exported` -- on the
+    failing target-31 build, and zero on fixed builds at targets 30, 31,
+    35 and 36. All four fixed builds also pass `apksigner verify`
+    (v1/v2/v3, same persisted certificate), `aapt dump badging` (correct
+    `targetSdkVersion`), and `unzip -t`. `zipalign -c -p 4` flags the
+    non-`.so` entries as unaligned, but identically on the previously
+    device-installed target-30 build -- only `libmain.so` needs page
+    alignment (it has it), and the platform's only other alignment rule
+    (target 30+) is for `resources.arsc`, which this APK doesn't have.
+  - Real-device confirmation of the fixed builds at 31/35/36 is pending;
+    the default `targetSdkVersion` stays at 30 until that comes back.
 
 ## What's genuinely unverified
 
@@ -1249,21 +1310,17 @@ to visible pixels on a real screen. What's left:
 - ~~APK Signature Scheme v2/v3 signing, the `targetSdkVersion=30` build,
   and the "built for an older Android version" fix.~~ **Real-device
   confirmed** -- see the twenty-sixth report's closing note. `30` is
-  pinned as the stable baseline; `31` and above reproducibly fail to
-  install on the test device for a reason that remains unidentified
-  (every specific API-31+ requirement implemented in this project was
-  individually ruled out as the cause -- see that report).
-- **16 KB native-library page alignment and `android:exported` are real,
-  worthwhile fixes, kept in the shipped build, but the twenty-sixth
-  report's bisection confirmed neither one was ever the actual cause of
-  the persistent 31+ install block** -- each was individually removed
-  and the failure persisted identically, and each was individually
-  restored (with `targetSdkVersion` held below 31) and installed fine.
-  They pass every available tool check (`llvm-objdump -p`, `zipalign -c
-  -p 4`, `aapt dump xmltree`, `apksigner verify`) and remain in the
-  shipped build because they're correct and beneficial regardless of
-  target, not because they fixed the blocker they were originally added
-  to chase.
+  still the default baseline.
+- **`targetSdkVersion >= 31`: root cause found and fixed, not yet
+  device-confirmed.** The block was `android:exported` being written out
+  of resource-ID order and so silently skipped by the platform's
+  attribute lookup (twenty-eighth report). Fixed builds at 31/35/36 pass
+  every local check, including an attribute-order checker that
+  reproduces the original failure; an `adb install` of each on the test
+  device is the remaining gate before raising the default above 30.
+- **16 KB native-library page alignment and `extractNativeLibs` were
+  never the cause of the 31+ block**, but are real, correct settings for
+  modern devices and stay in the build regardless of target.
 - **RSA-2048 implementation is from-scratch and unaudited.** It produces
   signatures `jarsigner`/`openssl` accept, which is a strong structural and
   interoperability signal, but this code has not had any cryptographic
