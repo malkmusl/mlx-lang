@@ -68,10 +68,12 @@ class Exit(Exception):
 
 class Process:
     def __init__(self, path, argv, stdin=b"", trace=False, timeout_seconds=60, environment=None):
+        """`stdin` is the program's input as bytes, or None to read the host's
+        standard input on demand."""
         self.path = path
         self.argv = argv
         self.environment = os.environ if environment is None else environment
-        self.stdin = bytearray(stdin)
+        self.stdin = None if stdin is None else bytearray(stdin)
         self.stdout = bytearray()
         self.stderr = bytearray()
         self.trace = trace
@@ -231,7 +233,7 @@ class Process:
                            int(st.st_ctime), st.st_ctime_ns % 1_000_000_000, 0, 0)
 
     def sys_63(self, fd, buf, count, *_):  # read
-        if fd == 0:
+        if fd == 0 and self.stdin is not None:
             data = bytes(self.stdin[:count])
             del self.stdin[:count]
         else:
@@ -705,8 +707,7 @@ def main():
     if not arguments:
         sys.stderr.write(__doc__)
         return 2
-    process = Process(arguments[0], arguments, stdin=b"" if sys.stdin.isatty() else sys.stdin.buffer.read(),
-                      trace=trace)
+    process = Process(arguments[0], arguments, stdin=None, trace=trace)
     status = process.run()
     sys.stdout.buffer.write(process.stdout)
     sys.stderr.buffer.write(process.stderr)

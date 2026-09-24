@@ -1,0 +1,143 @@
+// APK Signature Scheme v2 and v3: the APK Signing Block inserted before the
+// ZIP central directory, next to the v1 (JAR) signature. Ported from
+// experiments/android-aarch64-bluescreen/mlx/apk_sign_v2v3.mlx, which was
+// checked against the apksig sources and `apksigner verify`; see that file
+// for the layout details (nested length prefixes, the per-section 1 MiB
+// chunk digests, and the EOCD digested with its original directory offset).
+const bytes = @import("./bytes.mlx")
+const hash = @import("./hash.mlx")
+const signing = @import("./signing.mlx")
+
+pub const Allocator = bytes.Allocator
+pub const ArrayList = bytes.ArrayList
+pub const Bytes = bytes.Bytes
+
+const BLOCK_ID_V2: u32 = 1896449818 // 0x7109871a
+const BLOCK_ID_V3: u32 = 4031998144 // 0xf05368c0
+const RSA_PKCS1_SHA256: u32 = 259 // 0x0103
+const MAX_SDK: u32 = 2147483647
+const CHUNK_SIZE: usize = 1048576
+
+// v2 is verified from API 24, v3 from API 28; older platforms ignore both.
+pub fn useV2(target_sdk: u32) -> bool { return target_sdk >= 24 }
+pub fn useV3(target_sdk: u32) -> bool { return target_sdk >= 28 }
+
+fn appendPrefixed(out: *ArrayList, content: Bytes) -> void {
+    bytes.appendU32(out, @intCast(u32, content.length))
+    bytes.appendBytes(out, content)
+}
+
+// SHA-256 over 0xa5 ++ LE32(length) ++ chunk for each <= 1 MiB chunk of
+// `section`; appends the digests and returns how many chunks there were.
+fn chunkDigests(allocator: Allocator, section: Bytes, digests: *ArrayList) -> usize {
+    var chunks: usize = 0
+    var offset: usize = 0
+    while offset < section.length {
+        const end = if section.length - offset < CHUNK_SIZE { section.length } else { offset + CHUNK_SIZE }
+        var context = hash.sha256Init(allocator)
+        hash.sha256UpdateByte(&context, 165)
+        hash.sha256UpdateU32(&context, @intCast(u32, end - offset))
+        hash.sha256Update(&context, bytes.sub(section, offset, end))
+        const digest = bytes.zeroed(allocator, 32)
+        hash.sha256Final(&context, digest.items)
+        bytes.appendList(digests, digest)
+        bytes.free(digest)
+        offset = end
+        chunks += 1
+    }
+    return chunks
+}
+
+fn contentDigest(allocator: Allocator, before_directory: Bytes, directory: Bytes, end_record: Bytes) -> ArrayList {
+    var digests = bytes.newList(allocator, 256)
+    var chunks: usize = 0
+    chunks += chunkDigests(allocator, before_directory, &digests)
+    chunks += chunkDigests(allocator, directory, &digests)
+    chunks += chunkDigests(allocator, end_record, &digests)
+    var top = bytes.newList(allocator, digests.length + 5)
+    bytes.appendU8(&top, 90) // 0x5a
+    bytes.appendU32(&top, @intCast(u32, chunks))
+    bytes.appendList(&top, digests)
+    return hash.sha256List(allocator, bytes.ofList(top))
+}
+
+// lp(algorithm id ++ lp(payload)), itself wrapped in one more lp: the
+// "sequence of length-prefixed pairs" encoding of digests and signatures.
+fn algorithmField(allocator: Allocator, payload: Bytes) -> ArrayList {
+    var pair = bytes.newList(allocator, payload.length + 8)
+    bytes.appendU32(&pair, RSA_PKCS1_SHA256)
+    appendPrefixed(&pair, payload)
+    var entry = bytes.newList(allocator, pair.length + 4)
+    appendPrefixed(&entry, bytes.ofList(pair))
+    var field = bytes.newList(allocator, entry.length + 4)
+    appendPrefixed(&field, bytes.ofList(entry))
+    return field
+}
+
+fn signer(allocator: Allocator, key: *signing.RsaKey, certificate_der: Bytes, public_key: Bytes, digest: Bytes, min_sdk: u32, v3: bool) -> ArrayList {
+    var signed = bytes.newList(allocator, 1024)
+    bytes.appendList(&signed, algorithmField(allocator, digest))
+    var certificates = bytes.newList(allocator, certificate_der.length + 4)
+    appendPrefixed(&certificates, certificate_der)
+    appendPrefixed(&signed, bytes.ofList(certificates))
+    if v3 {
+        bytes.appendU32(&signed, min_sdk)
+        bytes.appendU32(&signed, MAX_SDK)
+    }
+    bytes.appendU32(&signed, 0) // no additional attributes
+    const signature = signing.signSha256(allocator, key, bytes.ofList(signed))
+    var out = bytes.newList(allocator, signed.length + signature.length + public_key.length + 64)
+    appendPrefixed(&out, bytes.ofList(signed))
+    if v3 {
+        bytes.appendU32(&out, min_sdk)
+        bytes.appendU32(&out, MAX_SDK)
+    }
+    bytes.appendList(&out, algorithmField(allocator, bytes.ofList(signature)))
+    appendPrefixed(&out, public_key)
+    return out
+}
+
+fn appendPair(allocator: Allocator, out: *ArrayList, id: u32, signer_bytes: ArrayList) -> void {
+    var signers = bytes.newList(allocator, signer_bytes.length + 4)
+    appendPrefixed(&signers, bytes.ofList(signer_bytes))
+    var value = bytes.newList(allocator, signers.length + 4)
+    appendPrefixed(&value, bytes.ofList(signers))
+    bytes.appendU64(out, @intCast(u64, 4 + value.length))
+    bytes.appendU32(out, id)
+    bytes.appendList(out, value)
+}
+
+// Inserts the APK Signing Block (v2 and/or v3 per target_sdk) into the
+// v1-signed ZIP `archive` and returns the final APK bytes.
+pub fn sign(allocator: Allocator, key: *signing.RsaKey, certificate_der: Bytes, archive: Bytes, min_sdk: u32, target_sdk: u32) -> ArrayList {
+    var out = bytes.newList(allocator, archive.length + 4096)
+    if !useV2(target_sdk) && !useV3(target_sdk) {
+        bytes.appendBytes(&out, archive)
+        return out
+    }
+    const end_offset = archive.length - 22
+    const directory_start = @intCast(usize, bytes.readU32(archive, end_offset + 16))
+    const before_directory = bytes.sub(archive, 0, directory_start)
+    const directory = bytes.sub(archive, directory_start, end_offset)
+    const end_record = bytes.sub(archive, end_offset, archive.length)
+    const digest = contentDigest(allocator, before_directory, directory, end_record)
+    const public_key = signing.subjectPublicKeyInfo(allocator, key)
+    // The v3 signer applies from API 28 (when v3 verification starts).
+    const v3_min_sdk: u32 = if min_sdk > 28 { min_sdk } else { 28 }
+    var pairs = bytes.newList(allocator, 4096)
+    if useV2(target_sdk) { appendPair(allocator, &pairs, BLOCK_ID_V2, signer(allocator, key, certificate_der, bytes.ofList(public_key), bytes.ofList(digest), min_sdk, false)) }
+    if useV3(target_sdk) { appendPair(allocator, &pairs, BLOCK_ID_V3, signer(allocator, key, certificate_der, bytes.ofList(public_key), bytes.ofList(digest), v3_min_sdk, true)) }
+    const block_size = @intCast(u64, pairs.length + 24)
+    bytes.appendBytes(&out, before_directory)
+    bytes.appendU64(&out, block_size)
+    bytes.appendList(&out, pairs)
+    bytes.appendU64(&out, block_size)
+    bytes.appendText(&out, "APK Sig Block 42")
+    bytes.appendBytes(&out, directory)
+    const end_start = out.length
+    bytes.appendBytes(&out, end_record)
+    // The written EOCD points at the moved central directory; the digest
+    // above used the original offset (the start of the signing block).
+    bytes.setU32(out, end_start + 16, @intCast(u32, directory_start + 8 + pairs.length + 24))
+    return out
+}
