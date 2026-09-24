@@ -1097,6 +1097,78 @@ contradicted.
   haven't identified. Whichever way the real-device result goes decides
   the next step -- back to 35 with more investigation, or staying at 34
   -- so this isn't logged as a fix, just a control experiment.
+- **Twenty-sixth report: bisected the install block to an exact
+  `targetSdkVersion` threshold (30 installs, 31 does not), and shipped
+  30 as the new baseline.** The user confirmed 34 (twenty-fifth report)
+  still failed the same way as 35, ruling out 35-specific behavior --
+  whatever blocks this device's install is gated at some level at or
+  below 34, not something unique to 35. That reopened every earlier fix
+  in this saga (signing-key stability, 16 KB alignment, `exported`,
+  `extractNativeLibs`) as a suspect again, since all of them had only
+  ever been tested in combination, never in isolation against a known
+  install/fail baseline. Isolating the real variable required a proper
+  bisection, done with `git worktree` (to build exact historical
+  commits without disturbing the working tree) and scratch copies of
+  `mlx/*.mlx` with individual files swapped back to older versions via
+  `git show <commit>:<path>`, since this device has no adb/logcat
+  access to read the platform's actual rejection reason directly:
+  1. **v21 reproduction** (commit `c1e5a1f`, the last known-good build
+     before this entire investigation started, targetSdk 29, no
+     `exported`/`extractNativeLibs`, 4 KB alignment): **installs.**
+     Confirms the regression really is something introduced since then,
+     not an environment change on the device side.
+  2. **bisect1** (current code, but 4 KB alignment instead of 16 KB,
+     targetSdk still current at the time): **fails.** Rules out 16 KB
+     alignment as the cause -- reverting it to 4 KB didn't fix anything.
+  3. **bisect2** (current code minus `extractNativeLibs`, targetSdk 34):
+     **fails**, identically to bisect1. Rules out `extractNativeLibs`.
+  4. **bisect3** (v21 baseline + `android:exported` only, targetSdk left
+     at 29): **installs.** Proves the `exported` encoder change itself
+     has no bug -- adding it to a build that already installs doesn't
+     break it.
+  5. **bisect4** (full current combination -- 16 KB alignment,
+     `exported`, `extractNativeLibs`, stable key -- targetSdk 31):
+     **fails.**
+  6. **bisect5** (identical to bisect4, only `targetSdkVersion` changed
+     from 31 to 30): **installs.**
+  Steps 5 and 6 are a true single-variable A/B test: `cmp -l` on the two
+  builds' `AndroidManifest.xml` confirmed exactly one byte differs
+  between them (the `targetSdkVersion` integer itself), so this isn't an
+  AXML-encoder artifact -- the threshold is real and exact. The user
+  also checked the device's own Android version (Settings → About phone):
+  a Pixel 10 Pro on the "CANARY" pre-release channel, build
+  `ZP11.260717.006`, with no numeric SDK level shown -- a genuinely
+  bleeding-edge platform build, which doesn't explain *why* 31 specifically
+  fails but is at least consistent with this device enforcing something
+  newer or stricter than documented API-31 behavior.
+  - **Decision:** ship `targetSdkVersion = 30` (Android 11) as the new
+    baseline in `main.mlx`/`main.zig`, rather than continue bisecting
+    blind into the 31-35 range with no way to read the platform's actual
+    rejection reason. 30 still clears the original "built for an older
+    version of Android" warning (the twentieth report's fix), keeps
+    every other fix from this investigation (stable signing key, 16 KB
+    alignment, `exported`, `extractNativeLibs` -- none of which were the
+    actual culprit, and all of which are harmless or beneficial
+    regardless of target), and is the highest value confirmed to
+    actually install.
+  - **What's still unknown:** the exact platform requirement gated at
+    `targetSdkVersion >= 31` on this specific device. Every documented
+    API-31+ manifest requirement found and checked (`exported`,
+    `extractNativeLibs`, 16 KB alignment) was individually implemented
+    correctly and individually ruled out by this bisection -- the actual
+    mechanism remains unidentified for lack of adb/logcat access to see
+    the platform's real rejection reason.
+  - Verified with the full tool suite before shipping: `apksigner
+    verify --print-certs -v` (`Verifies`, v1/v2/v3 all `true`, same
+    persisted certificate SHA-256 as every prior build -- no reinstall
+    needed), `aapt dump badging` (`targetSdkVersion:'30'`), `zipalign -c
+    -v -p 4` (`lib/arm64-v8a/libmain.so (OK)`), `llvm-objdump -p` on the
+    extracted `.so` (all `LOAD` segments `align 2**14`), and `unzip -t`
+    (clean). This exact combined build (30 + 16 KB alignment +
+    `exported` + `extractNativeLibs` + stable key, all present
+    simultaneously) is tool-verified but still pending real-device
+    confirmation -- bisect5 confirmed targetSdk 30 alone installs, but
+    not yet this specific full combination together.
 
 ## What's genuinely unverified
 
@@ -1108,29 +1180,31 @@ source, not just memory), and the actual `ANativeWindow_lock`/
 `_setBuffersGeometry`/`_unlockAndPost` fill-and-present path all the way
 to visible pixels on a real screen. What's left:
 
-- **APK Signature Scheme v2/v3 signing, the `schemesForTargetSdk`
-  auto-pick, and the `targetSdkVersion` bump to 35 are all implemented
-  and pass their respective tool checks (`apksigner verify`, `aapt dump
-  badging`), but none of them have yet been confirmed by installing the
-  resulting APK on a real device** -- in particular, whether bumping
-  `targetSdkVersion` actually clears the "built for an older version of
-  Android" warning the twentieth report describes is still unconfirmed
-  by anything other than reasoning about how that warning works. Every
-  earlier layer in this project treats real hardware as the actual bar,
-  not just an external verifier tool, and that hasn't happened yet for
-  this batch of changes -- the next real-device round should reinstall
-  over the previous build and confirm both the warning is gone and the
-  app still launches and behaves identically (none of this round's
-  changes touch what the app itself does at runtime).
-- **16 KB native-library page alignment (both the ELF `PT_LOAD` segments
-  and the ZIP entry's own byte offset) and the missing `android:exported`
-  attribute are now implemented and pass every available tool check
-  (`llvm-objdump -p`, `zipalign -c -p 4`, `aapt dump xmltree`,
-  `apksigner verify`), but are unconfirmed on the actual real device
-  this was all meant to unblock** -- see the twenty-second and
-  twenty-third reports above. Four independent real bugs found across
-  four rounds from a single install attempt is reason enough not to
-  assume this is the last one until a device actually confirms it.
+- **APK Signature Scheme v2/v3 signing is real-device confirmed** (the
+  bisection in the twenty-sixth report installed and reinstalled dozens
+  of v2/v3-signed builds over each other without a signature complaint).
+  **`targetSdkVersion` is no longer 35, or even 34 -- it's pinned at 30**,
+  the exact value the twenty-sixth report's bisection confirmed actually
+  installs on the real test device; 31 and above reproducibly fail to
+  install at all, for a reason that remains unidentified (see that report
+  for the full bisection). The "built for an older version of Android"
+  warning this was originally meant to clear (twentieth report) is
+  confirmed gone at 30. What's still open is real-device confirmation of
+  the *exact combined* build this experiment now ships -- 30 together
+  with 16 KB alignment, `exported`, and `extractNativeLibs` all present
+  at once (bisect5 confirmed 30 alone installs; the full combination is
+  currently only tool-verified, not yet device-installed).
+- **16 KB native-library page alignment and `android:exported` are real,
+  worthwhile fixes, kept in the shipped build, but the twenty-sixth
+  report's bisection confirmed neither one was ever the actual cause of
+  the persistent 31+ install block** -- each was individually removed
+  and the failure persisted identically, and each was individually
+  restored (with `targetSdkVersion` held below 31) and installed fine.
+  They pass every available tool check (`llvm-objdump -p`, `zipalign -c
+  -p 4`, `aapt dump xmltree`, `apksigner verify`) and remain in the
+  shipped build because they're correct and beneficial regardless of
+  target, not because they fixed the blocker they were originally added
+  to chase.
 - **RSA-2048 implementation is from-scratch and unaudited.** It produces
   signatures `jarsigner`/`openssl` accept, which is a strong structural and
   interoperability signal, but this code has not had any cryptographic
