@@ -83,6 +83,25 @@ const ANDROID_ATTRS = [_]AndroidAttr{
     // the resolved attribute ID from `aapt dump xmltree` -- see the
     // .reference attribute's use below for the resolved theme value.
     .{ .name = "theme", .resid = 0x01010000 },
+    // android:exported, mandatory (not just recommended) on any
+    // intent-filtered component once targetSdkVersion >= 31 -- omitting
+    // it is a hard manifest-validation failure at install time on such
+    // devices, not just a lint warning. This was invisible for this
+    // project's entire life at targetSdkVersion=29 and only surfaced as
+    // a real-device "You can't install this app on your device" block
+    // once targetSdkVersion was bumped to 35 (see the twentieth report:
+    // that bump fixed a real compatibility warning but silently exposed
+    // this pre-existing gap). The install confirmation dialog still
+    // renders fine beforehand (it reads only the package name/label/icon
+    // via a lighter parse); this failure is in the deeper manifest
+    // validation the actual install step performs, which is why it fails
+    // near-instantly right after confirming, with no parse-level warning
+    // visible anywhere else. Resource ID ground-truthed the same way as
+    // every other attribute here: compiled a minimal reference manifest
+    // with an explicit android:exported through the real `aapt` against
+    // /usr/share/android-framework-res/framework-res.apk and read back
+    // the resolved attribute ID from `aapt dump xmltree`.
+    .{ .name = "exported", .resid = 0x01010010 },
 };
 const ANDROID_NS_URI = "http://schemas.android.com/apk/res/android";
 
@@ -333,6 +352,10 @@ pub fn buildManifest(allocator: std.mem.Allocator, package: []const u8, fullscre
         .{ .ns = true, .name = "label", .value = .{ .str = "Mlx Blue Screen" } },
         .{ .ns = true, .name = "name", .value = .{ .str = "android.app.NativeActivity" } },
         .{ .ns = true, .name = "configChanges", .value = .{ .int_hex = 0x20 } },
+        // Mandatory (not optional) once targetSdkVersion >= 31, since
+        // this activity has an intent-filter below -- see ANDROID_ATTRS's
+        // "exported" entry above for the full story.
+        .{ .ns = true, .name = "exported", .value = .{ .boolean = true } },
     } }, line);
     line += 1;
 

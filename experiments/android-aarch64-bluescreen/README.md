@@ -1020,6 +1020,48 @@ contradicted.
     rounds triggered by the same one install attempt, which is a
     reasonable prompt to expect *this* one might not be the last if the
     device still refuses it.
+- **Twenty-third report: still the same toast, confirmed via two
+  screenshots this time** -- the install *confirmation* dialog (package
+  name, icon, "Mlx Blue Screen" label) rendered correctly, then tapping
+  "Installieren" failed near-instantly with the same generic "You can't
+  install this app on your device." That the confirm dialog renders fine
+  but the real install step fails fast pointed at a deeper, early
+  manifest-validation check the confirm dialog's lighter parse doesn't
+  perform -- and re-examining exactly what changed between the last
+  build that's known to have installed successfully (the nineteenth/
+  twenty-first report's builds, both at the original
+  `targetSdkVersion=29`) and every failing build since (all at the
+  twentieth report's `targetSdkVersion=35`) pointed straight at the
+  bump itself, not at either of the last two rounds' fixes (both still
+  correct and still needed, just not sufficient alone). Root cause: since
+  Android 12 (API 31), any activity/service/receiver that has an
+  `<intent-filter>` **must** explicitly declare `android:exported` --
+  omitting it is only a lint warning below `targetSdkVersion=31`, but a
+  hard manifest-validation failure at install time at 31 and above. This
+  project's `<activity>` has always had a MAIN/LAUNCHER `<intent-filter>`
+  and never declared `android:exported`, because it never needed to
+  until `targetSdkVersion` crossed 31 -- invisible for this experiment's
+  entire life at `targetSdkVersion=29`, silently exposed by the
+  twentieth report's otherwise-correct bump to 35.
+  - Fixed by adding `android:exported="true"` to the `<activity>`
+    element in `axml.mlx`/`axml.zig` (true, since it's the app's
+    LAUNCHER activity and must be externally invokable by the home
+    screen). Resource ID (`0x01010010`) ground-truthed the same way
+    every other attribute in this file was: compiled a minimal reference
+    manifest with an explicit `android:exported` through the real `aapt`
+    against `/usr/share/android-framework-res/framework-res.apk` and
+    read back the resolved ID from `aapt dump xmltree`, which also
+    confirmed the boolean-`true` encoding (`0xffffffff`, TYPE_INT_BOOLEAN
+    `0x12`) matches what this project's `writeBoolAttr`/`.boolean` helper
+    already produces for `hasCode` -- no new encoding logic needed, just
+    the missing attribute itself.
+  - Verified with `aapt dump xmltree`, confirming byte-for-byte the same
+    `android:exported(0x01010010)=(type 0x12)0xffffffff` the reference
+    manifest produced, plus the usual `apksigner verify` (still v1/v2/v3
+    all `true`, same persisted certificate) and `unzip -t` (still clean).
+    This is the fourth independent real bug found across four rounds
+    from the same one install attempt -- still pending the actual
+    real-device confirmation all of them were aimed at.
 
 ## What's genuinely unverified
 
@@ -1046,12 +1088,14 @@ to visible pixels on a real screen. What's left:
   app still launches and behaves identically (none of this round's
   changes touch what the app itself does at runtime).
 - **16 KB native-library page alignment (both the ELF `PT_LOAD` segments
-  and the ZIP entry's own byte offset) is now implemented and passes both
-  Google's official `llvm-objdump -p` check and `zipalign -c -p 4`, but
-  is unconfirmed on the actual real device this was meant to unblock** --
-  see the twenty-second report above. Three independent real bugs found
-  across three rounds from a single install attempt is reason enough not
-  to assume this is the last one until a device actually confirms it.
+  and the ZIP entry's own byte offset) and the missing `android:exported`
+  attribute are now implemented and pass every available tool check
+  (`llvm-objdump -p`, `zipalign -c -p 4`, `aapt dump xmltree`,
+  `apksigner verify`), but are unconfirmed on the actual real device
+  this was all meant to unblock** -- see the twenty-second and
+  twenty-third reports above. Four independent real bugs found across
+  four rounds from a single install attempt is reason enough not to
+  assume this is the last one until a device actually confirms it.
 - **RSA-2048 implementation is from-scratch and unaudited.** It produces
   signatures `jarsigner`/`openssl` accept, which is a strong structural and
   interoperability signal, but this code has not had any cryptographic
