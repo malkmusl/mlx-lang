@@ -1169,6 +1169,10 @@ contradicted.
     simultaneously) is tool-verified but still pending real-device
     confirmation -- bisect5 confirmed targetSdk 30 alone installs, but
     not yet this specific full combination together.
+  - **Real-device confirmed:** the user installed this exact combined
+    build (`bluescreen_stable_target30.apk`) on the Pixel 10 Pro test
+    device and confirmed it installs. This is now the project's stable,
+    shippable baseline.
 
 ## What's genuinely unverified
 
@@ -1180,20 +1184,13 @@ source, not just memory), and the actual `ANativeWindow_lock`/
 `_setBuffersGeometry`/`_unlockAndPost` fill-and-present path all the way
 to visible pixels on a real screen. What's left:
 
-- **APK Signature Scheme v2/v3 signing is real-device confirmed** (the
-  bisection in the twenty-sixth report installed and reinstalled dozens
-  of v2/v3-signed builds over each other without a signature complaint).
-  **`targetSdkVersion` is no longer 35, or even 34 -- it's pinned at 30**,
-  the exact value the twenty-sixth report's bisection confirmed actually
-  installs on the real test device; 31 and above reproducibly fail to
-  install at all, for a reason that remains unidentified (see that report
-  for the full bisection). The "built for an older version of Android"
-  warning this was originally meant to clear (twentieth report) is
-  confirmed gone at 30. What's still open is real-device confirmation of
-  the *exact combined* build this experiment now ships -- 30 together
-  with 16 KB alignment, `exported`, and `extractNativeLibs` all present
-  at once (bisect5 confirmed 30 alone installs; the full combination is
-  currently only tool-verified, not yet device-installed).
+- ~~APK Signature Scheme v2/v3 signing, the `targetSdkVersion=30` build,
+  and the "built for an older Android version" fix.~~ **Real-device
+  confirmed** -- see the twenty-sixth report's closing note. `30` is
+  pinned as the stable baseline; `31` and above reproducibly fail to
+  install on the test device for a reason that remains unidentified
+  (every specific API-31+ requirement implemented in this project was
+  individually ruled out as the cause -- see that report).
 - **16 KB native-library page alignment and `android:exported` are real,
   worthwhile fixes, kept in the shipped build, but the twenty-sixth
   report's bisection confirmed neither one was ever the actual cause of
