@@ -229,40 +229,65 @@ fn buildPairEntry(allocator: std.mem.Allocator, id: u32, value: []const u8) ![]u
     return out.toOwnedSlice();
 }
 
-// Both ID-value pairs (v2 + v3), back to back — everything the Signing
-// Block needs except its own 8-byte size fields and magic.
-fn buildPairsBytes(allocator: std.mem.Allocator, key: *const jar_sign.RsaKeyPair, cert_der: []const u8, spki_bytes: []const u8, digest: []const u8, min_sdk: u32) ![]u8 {
-    // Two nested length prefixes here, not one: the pair's value is
-    // LP(signersSeq), and signersSeq is itself the concatenation of
-    // LP(signer) for each signer (just one, here) — a verifier reads the
-    // outer LP to find the whole sequence, then reads a per-signer LP from
-    // inside it to find where each signer ends.
-    const signer_v2 = try buildSignerBytes(allocator, key, cert_der, spki_bytes, digest, min_sdk, false);
-    defer allocator.free(signer_v2);
-    var signers_seq_v2 = std.ArrayList(u8).init(allocator);
-    defer signers_seq_v2.deinit();
-    try appendLp(&signers_seq_v2, signer_v2);
-    var signers_value_v2 = std.ArrayList(u8).init(allocator);
-    defer signers_value_v2.deinit();
-    try appendLp(&signers_value_v2, signers_seq_v2.items);
-    const pair_v2 = try buildPairEntry(allocator, SIGNING_BLOCK_ID_V2, signers_value_v2.items);
-    defer allocator.free(pair_v2);
+/// Which signing schemes are worth including for a given target_sdk,
+/// mirroring when each one actually became meaningful on the real Android
+/// platform: v1 (JAR signing) is understood by every API level, so it's
+/// never dropped — there is no compatibility upside to omitting it, only
+/// a (rarely wanted) hardening tradeoff, which this project doesn't opt
+/// into automatically. v2 verification began at API 24 (N); v3 at API 28
+/// (P) — a device below either level simply ignores a Signing Block ID it
+/// doesn't recognize, so including v2/v3 for a low target_sdk is
+/// harmless, but there's equally no reason to pay their bytes/signing
+/// cost when targeting only platforms that predate them. Monotonic in
+/// target_sdk (a higher target only ever adds schemes, never removes
+/// one).
+pub fn schemesForTargetSdk(target_sdk: u32) struct { v1: bool, v2: bool, v3: bool } {
+    if (target_sdk < 24) return .{ .v1 = true, .v2 = false, .v3 = false };
+    if (target_sdk < 28) return .{ .v1 = true, .v2 = true, .v3 = false };
+    return .{ .v1 = true, .v2 = true, .v3 = true };
+}
 
-    const signer_v3 = try buildSignerBytes(allocator, key, cert_der, spki_bytes, digest, min_sdk, true);
-    defer allocator.free(signer_v3);
-    var signers_seq_v3 = std.ArrayList(u8).init(allocator);
-    defer signers_seq_v3.deinit();
-    try appendLp(&signers_seq_v3, signer_v3);
-    var signers_value_v3 = std.ArrayList(u8).init(allocator);
-    defer signers_value_v3.deinit();
-    try appendLp(&signers_value_v3, signers_seq_v3.items);
-    const pair_v3 = try buildPairEntry(allocator, SIGNING_BLOCK_ID_V3, signers_value_v3.items);
-    defer allocator.free(pair_v3);
-
+// Both ID-value pairs (v2 + v3, whichever are enabled), back to back —
+// everything the Signing Block needs except its own 8-byte size fields
+// and magic. Returns an empty slice when neither scheme is enabled —
+// callers must check that before wrapping/inserting a block.
+fn buildPairsBytes(allocator: std.mem.Allocator, key: *const jar_sign.RsaKeyPair, cert_der: []const u8, spki_bytes: []const u8, digest: []const u8, min_sdk: u32, include_v2: bool, include_v3: bool) ![]u8 {
     var out = std.ArrayList(u8).init(allocator);
     errdefer out.deinit();
-    try out.appendSlice(pair_v2);
-    try out.appendSlice(pair_v3);
+
+    if (include_v2) {
+        // Two nested length prefixes here, not one: the pair's value is
+        // LP(signersSeq), and signersSeq is itself the concatenation of
+        // LP(signer) for each signer (just one, here) — a verifier reads
+        // the outer LP to find the whole sequence, then reads a
+        // per-signer LP from inside it to find where each signer ends.
+        const signer_v2 = try buildSignerBytes(allocator, key, cert_der, spki_bytes, digest, min_sdk, false);
+        defer allocator.free(signer_v2);
+        var signers_seq_v2 = std.ArrayList(u8).init(allocator);
+        defer signers_seq_v2.deinit();
+        try appendLp(&signers_seq_v2, signer_v2);
+        var signers_value_v2 = std.ArrayList(u8).init(allocator);
+        defer signers_value_v2.deinit();
+        try appendLp(&signers_value_v2, signers_seq_v2.items);
+        const pair_v2 = try buildPairEntry(allocator, SIGNING_BLOCK_ID_V2, signers_value_v2.items);
+        defer allocator.free(pair_v2);
+        try out.appendSlice(pair_v2);
+    }
+
+    if (include_v3) {
+        const signer_v3 = try buildSignerBytes(allocator, key, cert_der, spki_bytes, digest, min_sdk, true);
+        defer allocator.free(signer_v3);
+        var signers_seq_v3 = std.ArrayList(u8).init(allocator);
+        defer signers_seq_v3.deinit();
+        try appendLp(&signers_seq_v3, signer_v3);
+        var signers_value_v3 = std.ArrayList(u8).init(allocator);
+        defer signers_value_v3.deinit();
+        try appendLp(&signers_value_v3, signers_seq_v3.items);
+        const pair_v3 = try buildPairEntry(allocator, SIGNING_BLOCK_ID_V3, signers_value_v3.items);
+        defer allocator.free(pair_v3);
+        try out.appendSlice(pair_v3);
+    }
+
     return out.toOwnedSlice();
 }
 
@@ -277,11 +302,17 @@ fn wrapSigningBlock(allocator: std.mem.Allocator, pairs_bytes: []const u8) ![]u8
     return out.toOwnedSlice();
 }
 
-/// Splice APK Signature Scheme v2 + v3 signing into `zip_bytes` (the
-/// already v1(JAR)-signed, fully-built ZIP from zip.build() — v1 and
-/// v2/v3 coexist, same as real apksigner's default behavior). Returns the
-/// final APK bytes.
-pub fn signV2V3(allocator: std.mem.Allocator, key: *const jar_sign.RsaKeyPair, cert_der: []const u8, zip_bytes: []const u8, min_sdk: u32) ![]u8 {
+/// Splice APK Signature Scheme v2/v3 signing into `zip_bytes` (the already
+/// v1(JAR)-signed, fully-built ZIP from zip.build() — v1 and v2/v3
+/// coexist, same as real apksigner's default behavior), whichever of
+/// v2/v3 are enabled (see `schemesForTargetSdk`). Returns `zip_bytes`
+/// unchanged (no Signing Block inserted at all, just a copy) when both
+/// are disabled. Returns the final APK bytes.
+pub fn signV2V3(allocator: std.mem.Allocator, key: *const jar_sign.RsaKeyPair, cert_der: []const u8, zip_bytes: []const u8, min_sdk: u32, include_v2: bool, include_v3: bool) ![]u8 {
+    if (!include_v2 and !include_v3) {
+        return allocator.dupe(u8, zip_bytes);
+    }
+
     const eocd_offset = zip_bytes.len - 22;
     const orig_cd_start = readU32LE(zip_bytes, eocd_offset + 16);
 
@@ -309,7 +340,7 @@ pub fn signV2V3(allocator: std.mem.Allocator, key: *const jar_sign.RsaKeyPair, c
     // computed in one straight pass.
     const content_digest = try chunkedSha256DigestOverSections(allocator, section1, section2, orig_eocd);
 
-    const real_pairs = try buildPairsBytes(allocator, key, cert_der, spki, &content_digest, min_sdk);
+    const real_pairs = try buildPairsBytes(allocator, key, cert_der, spki, &content_digest, min_sdk, include_v2, include_v3);
     defer allocator.free(real_pairs);
     const signing_block = try wrapSigningBlock(allocator, real_pairs);
     defer allocator.free(signing_block);

@@ -33,6 +33,26 @@ const FULLSCREEN_ENABLED = false;
 // FULLSCREEN_ENABLED above -- the two combine into all four themes.
 const SYSTEM_STATUS_BAR_COLOR_ENABLED = true;
 
+// Kept low for broad device compatibility -- devices below this still
+// install and run the app fine (NativeActivity itself needs nothing
+// newer). Threaded into both the manifest's `<uses-sdk>` and (as the
+// floor apk_sign_v2v3.signV2V3 assumes) the v3 Signing Block's own
+// per-signer minSdk field.
+const MIN_SDK_VERSION: u32 = 21;
+
+// Declares how current this build has actually been tested/updated for.
+// Real-device feedback: a low targetSdkVersion (this was 29 until now)
+// makes current Android show "This app was built for an older version of
+// Android and may not work properly" on install/launch, independent of
+// signing -- Android surfaces that warning purely off the gap between
+// targetSdkVersion and the device's own platform version. 35 (Android 15)
+// is the latest well-established stable level as of this writing; nothing
+// this app does is gated on newer platform behavior, so there's no
+// downside to targeting it. This is also what drives
+// `apk_sign_v2v3.schemesForTargetSdk` below -- raising it further will
+// keep including v1+v2+v3 (already the ceiling at 28+), never fewer.
+const TARGET_SDK_VERSION: u32 = 35;
+
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
@@ -54,7 +74,7 @@ pub fn main() !void {
     try out.print("      {s}: {d} bytes\n", .{ SO_PATH, so_bytes.len });
 
     try out.print("[2/7] generating binary AndroidManifest.xml...\n", .{});
-    const manifest_bytes = try axml.buildManifest(allocator, package, FULLSCREEN_ENABLED, SYSTEM_STATUS_BAR_COLOR_ENABLED);
+    const manifest_bytes = try axml.buildManifest(allocator, package, FULLSCREEN_ENABLED, SYSTEM_STATUS_BAR_COLOR_ENABLED, MIN_SDK_VERSION, TARGET_SDK_VERSION);
     defer allocator.free(manifest_bytes);
     try out.print("      {s}: {d} bytes\n", .{ MANIFEST_PATH, manifest_bytes.len });
 
@@ -96,8 +116,12 @@ pub fn main() !void {
     const v1_apk_bytes = try zip.build(allocator, &zip_entries);
     defer allocator.free(v1_apk_bytes);
 
-    try out.print("[7/7] signing (APK Signature Scheme v2 + v3)...\n", .{});
-    const apk_bytes = try apk_sign_v2v3.signV2V3(allocator, &key, cert_der, v1_apk_bytes, 28);
+    try out.print("[7/7] signing (APK Signature Scheme v2/v3, auto-picked from targetSdkVersion)...\n", .{});
+    // v1 is never dropped by schemesForTargetSdk (see its comment) -- the
+    // META-INF/* entries above are unconditional for exactly that reason.
+    const schemes = apk_sign_v2v3.schemesForTargetSdk(TARGET_SDK_VERSION);
+    try out.print("      v2: {}, v3: {}\n", .{ schemes.v2, schemes.v3 });
+    const apk_bytes = try apk_sign_v2v3.signV2V3(allocator, &key, cert_der, v1_apk_bytes, 28, schemes.v2, schemes.v3);
     defer allocator.free(apk_bytes);
     try out.print("      APK Signing Block: {d} bytes\n", .{apk_bytes.len - v1_apk_bytes.len});
 

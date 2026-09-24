@@ -876,6 +876,46 @@ contradicted.
     not required to match, the manifest's own `minSdkVersion="21"`. No
     proof-of-rotation attribute: a single, fresh (non-rotated) signing
     key needs none.
+- **Twentieth report: real-device install showed "This app was built for
+  an older version of Android and may not work properly"** even with v2/v3
+  signing now in place. Root cause: unrelated to signing entirely -- this
+  is Android's own compatibility warning, surfaced purely off the gap
+  between the manifest's `targetSdkVersion` (29, set back when this
+  experiment started and never revisited) and the real device's actual
+  platform version. No signing scheme changes that; the previous round's
+  work was necessary for install-time integrity checking but was never
+  going to touch this warning. Fixed by bumping `targetSdkVersion` to 35
+  (Android 15, the latest well-established stable level as of this
+  writing) in both `axml.mlx`/`axml.zig` -- nothing this app does is
+  gated on newer platform behavior, so there's no downside to targeting
+  it, and `minSdkVersion` stays at 21 for broad compatibility.
+  - Also requested: automatically picking the right signing variant from
+    the SDK target instead of always hardcoding v1+v2+v3. Added
+    `apk_sign_v2v3.schemesForTargetSdk(targetSdk)`, a small policy
+    function mirroring when each scheme actually became meaningful on
+    the real platform (v1 works on every API level, so it's never
+    dropped; v2 verification began at API 24; v3 at API 28) -- monotonic
+    in `targetSdk`, so raising the target only ever adds schemes, never
+    removes one. `buildPairsBytes`/`signV2V3` now take explicit
+    `includeV2`/`includeV3` flags and, at 21/24-27/28+, produce v1-only /
+    v1+v2 / v1+v2+v3 respectively; `signV2V3` returns `zipBytes`
+    unchanged (no Signing Block at all) when both are disabled. Both
+    `minSdkVersion` and `targetSdkVersion` are now threaded in from
+    `main.mlx`/`main.zig` as the single source of truth (previously
+    hardcoded separately inside `axml.mlx`'s `buildManifest`), so the
+    manifest's declared SDK range and the auto-picked signing schemes can
+    never drift out of sync with each other. At this experiment's own
+    `targetSdkVersion=35`, the auto-pick still yields v1+v2+v3 -- no
+    behavior change from the nineteenth report's already-verified build,
+    just the hardcoded "always all three" replaced with a real,
+    general-purpose policy.
+  - Re-verified with the same `apksigner verify --print-certs -v` /
+    `unzip -t` pair as the nineteenth report (still all green), plus
+    `aapt dump badging` confirming `targetSdkVersion:'35'` in the actual
+    built APK. The `targetSdkVersion` fix itself still needs a fresh
+    on-device install to confirm the warning is actually gone -- this
+    round's verification is tool-based, same caveat as the nineteenth
+    report's.
 
 ## What's genuinely unverified
 
@@ -887,15 +927,20 @@ source, not just memory), and the actual `ANativeWindow_lock`/
 `_setBuffersGeometry`/`_unlockAndPost` fill-and-present path all the way
 to visible pixels on a real screen. What's left:
 
-- **APK Signature Scheme v2/v3 signing is implemented and passes
-  `apksigner verify` (v1/v2/v3 all `true`, see the nineteenth report
-  above), but has not yet been confirmed by installing the resulting APK
-  on a real device.** Every earlier layer in this project treats real
-  hardware as the actual bar, not just an external verifier tool, and
-  that hasn't happened yet for this one -- the next real-device round
-  should reinstall over the previous v1-only build and confirm the app
-  still launches and behaves identically (v2/v3 adds an integrity check,
-  it doesn't change anything the app itself does).
+- **APK Signature Scheme v2/v3 signing, the `schemesForTargetSdk`
+  auto-pick, and the `targetSdkVersion` bump to 35 are all implemented
+  and pass their respective tool checks (`apksigner verify`, `aapt dump
+  badging`), but none of them have yet been confirmed by installing the
+  resulting APK on a real device** -- in particular, whether bumping
+  `targetSdkVersion` actually clears the "built for an older version of
+  Android" warning the twentieth report describes is still unconfirmed
+  by anything other than reasoning about how that warning works. Every
+  earlier layer in this project treats real hardware as the actual bar,
+  not just an external verifier tool, and that hasn't happened yet for
+  this batch of changes -- the next real-device round should reinstall
+  over the previous build and confirm both the warning is gone and the
+  app still launches and behaves identically (none of this round's
+  changes touch what the app itself does at runtime).
 - **No native-library page alignment.** `libmain.so` is stored (not
   compressed) but not 4/16 KiB-aligned within the ZIP, so it relies on
   `extractNativeLibs`-style extraction rather than direct `mmap`. Fine

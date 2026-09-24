@@ -246,7 +246,12 @@ pub const THEME_SYSTEM_WITH_STATUS_BAR: u32 = 0x010301e3;
 /// `fullscreen` and `system_status_bar_color` each independently toggle
 /// between the four themes above -- see main.zig's `FULLSCREEN_ENABLED` and
 /// `SYSTEM_STATUS_BAR_COLOR_ENABLED` for the actual switches.
-pub fn buildManifest(allocator: std.mem.Allocator, package: []const u8, fullscreen: bool, system_status_bar_color: bool) ![]u8 {
+/// `min_sdk_version`/`target_sdk_version` are threaded in from main.zig
+/// (rather than hardcoded here) so they're the same single source of
+/// truth `apk_sign_v2v3.schemesForTargetSdk` uses to auto-pick which
+/// signing schemes to add -- see main.zig's `MIN_SDK_VERSION`/
+/// `TARGET_SDK_VERSION`.
+pub fn buildManifest(allocator: std.mem.Allocator, package: []const u8, fullscreen: bool, system_status_bar_color: bool, min_sdk_version: u32, target_sdk_version: u32) ![]u8 {
     var pool = StringPool.init(allocator);
     defer pool.deinit();
 
@@ -277,8 +282,8 @@ pub fn buildManifest(allocator: std.mem.Allocator, package: []const u8, fullscre
     line += 1;
 
     try writeStartElement(&body, &pool, .{ .name = "uses-sdk", .attrs = &[_]Attr{
-        .{ .ns = true, .name = "minSdkVersion", .value = .{ .int_dec = 21 } },
-        .{ .ns = true, .name = "targetSdkVersion", .value = .{ .int_dec = 29 } },
+        .{ .ns = true, .name = "minSdkVersion", .value = .{ .int_dec = @intCast(min_sdk_version) } },
+        .{ .ns = true, .name = "targetSdkVersion", .value = .{ .int_dec = @intCast(target_sdk_version) } },
     } }, line);
     line += 1;
     try writeEndElement(&body, &pool, "uses-sdk", line);
@@ -424,7 +429,7 @@ pub fn buildManifest(allocator: std.mem.Allocator, package: []const u8, fullscre
 
 test "buildManifest produces a well-formed AXML root chunk" {
     const alloc = std.testing.allocator;
-    const bytes = try buildManifest(alloc, "dev.mlxlang.experiments.bluescreen", false, true);
+    const bytes = try buildManifest(alloc, "dev.mlxlang.experiments.bluescreen", false, true, 21, 35);
     defer alloc.free(bytes);
     try std.testing.expect(bytes.len > 64);
     const root_type = std.mem.readInt(u16, bytes[0..2], .little);
