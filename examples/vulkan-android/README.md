@@ -3,12 +3,13 @@
 Vulkan on Android: a NativeActivity that renders the animated pattern of
 `examples/vulkan-shared` with a compute shader and presents it through a
 `VK_KHR_android_surface` swapchain. Touch moves the ring; it turns white
-while a finger is down. A top bar is reserved across the frame with
-[`std.ui`](../../docs/reference/ui.md) and a label (the GPU and the frame
-count) is centered in it, laid out by
+while a finger is down. Like other Android apps, it keeps the status and
+navigation bars: its window reaches under them, and only its background
+color is drawn there. A label (the GPU and the frame count) sits at the
+top center of the rest, laid out by
 [`std.truetype`](../../docs/reference/truetype.md) from the system font
-(`/system/fonts/Roboto-Regular.ttf`, or Noto Sans, Droid Sans). The `text`
-compute shader draws both: the bar as a solid fill, then the glyphs.
+(`/system/fonts/Roboto-Regular.ttf`, or Noto Sans, Droid Sans) and drawn by
+the `text` compute shader.
 
 The Vulkan side is the same code the Linux examples run: the system
 `libvulkan.so` is opened with `std.vulkan.loader.openSystemLoader`, the
@@ -26,14 +27,17 @@ the window's size really changed. Turning the phone restarts the activity
 (the manifest does not handle orientation changes), which builds a new
 swapchain for the new orientation.
 
-The layout: the frame is a `ui.Screen`; `ui.reserveTop` takes a bar one
-text line plus padding high, filled dark and mostly opaque, and the label
-is centered in a `ui.Container` inside it. The text is sized from the
-screen's shorter side, so it is the same size in portrait and landscape,
-and the label drops its "Mlx + Vulkan · " prefix when the whole line does
-not fit. The app is built with `--android-fullscreen`, so no status bar
-covers the top; without it, pass the status bar's height as the screen's
-top safe inset and the bar's background extends behind it.
+The layout ([`std.ui`](../../docs/reference/ui.md)): the frame is a
+`ui.Screen` whose safe insets are where the system bars and display
+cutouts cover the window. `std.android.windowInsets` asks the Java side for
+them through JNI when the window is created or resized and after each
+layout pass (`onContentRectChanged`), and logs them (`ui: system bar insets
+top … right … bottom … left …`). Those bands are filled with the background
+color (`text.fill`); the label is placed at the top center of the free area
+with `ui.Container` and clipped to it (`text.drawIn`). The text is sized
+from the screen's shorter side, so it is the same size in portrait and
+landscape, and the label drops its "Mlx + Vulkan · " prefix when the whole
+line does not fit.
 
 ## Build
 
@@ -43,7 +47,7 @@ From the repository root, with the aarch64-android target
 ```sh
 zig-out/bin/mlx1 examples/vulkan-android/main.mlx -o vulkan.apk \
     --target=aarch64-android --android-package=dev.mlxlang.vulkan \
-    --android-label="Mlx Vulkan" --android-fullscreen
+    --android-label="Mlx Vulkan"
 adb install -r vulkan.apk
 adb logcat -s mlx
 ```

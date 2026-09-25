@@ -56,9 +56,12 @@ COMPOSITE_ALPHA_INHERIT = 8
 ACTION_DOWN, ACTION_UP, ACTION_MOVE = 0, 1, 2
 MS = 1_000_000
 FONT = os.path.join(ROOT, "tests/support/fonts/DejaVuSans-subset.ttf")
-# The top bar behind the label (examples/vulkan-android BAR_COLOR),
-# 0xAARRGGBB before the app swaps red and blue for R8G8B8A8.
-BAR_COLOR = 0xD0101820
+# The app's background (examples/vulkan-android BACKGROUND_COLOR,
+# 0xAARRGGBB before the app swaps red and blue for R8G8B8A8): all that may
+# be drawn under the system bars.
+BACKGROUND_COLOR = 0xFF101418
+# Rows below the top inset the label (with its padding and shadow) may use.
+LABEL_ROWS = 40
 
 
 def pattern(x, y, width, time, pointer_x, pointer_y, flags):
@@ -493,13 +496,155 @@ class MockVulkan:
         return 0
 
 
+ACTIVITY_OBJECT = 0x7A00_0001
+# WindowInsets.Type.systemBars() and displayCutout().
+SYSTEM_BARS, DISPLAY_CUTOUT = 7, 128
+
+
+class FakeJni:
+    """The activity's JNIEnv, as far as std.android.windowInsets uses it:
+    the NativeActivity object, its Window, the decor View and its
+    WindowInsets, answering `insets` (top, right, bottom, left), or no
+    WindowInsets at all while `insets` is None (not laid out yet). API 30+
+    goes through WindowInsets.Type and android.graphics.Insets, older levels
+    through getSystemWindowInset*. Unknown classes, methods and fields throw
+    (a pending exception, as in Java); any call made while an exception is
+    pending, and unbalanced local frames, fail the run."""
+
+    FUNCTIONS = {6: "FindClass", 17: "ExceptionClear", 19: "PushLocalFrame", 20: "PopLocalFrame",
+                 31: "GetObjectClass", 33: "GetMethodID", 36: "CallObjectMethodA", 51: "CallIntMethodA",
+                 94: "GetFieldID", 100: "GetIntField", 113: "GetStaticMethodID", 131: "CallStaticIntMethodA",
+                 228: "ExceptionCheck"}
+    CLASSES = {"activity": "android/app/NativeActivity", "window": "android/view/Window",
+               "decor": "android/view/View", "insets": "android/view/WindowInsets", "values": "android/graphics/Insets"}
+    METHODS = {("android/app/NativeActivity", "getWindow", "()Landroid/view/Window;"),
+               ("android/view/Window", "getDecorView", "()Landroid/view/View;"),
+               ("android/view/View", "getRootWindowInsets", "()Landroid/view/WindowInsets;"),
+               ("android/view/WindowInsets", "getInsets", "(I)Landroid/graphics/Insets;"),
+               ("android/view/WindowInsets", "getSystemWindowInsetTop", "()I"),
+               ("android/view/WindowInsets", "getSystemWindowInsetRight", "()I"),
+               ("android/view/WindowInsets", "getSystemWindowInsetBottom", "()I"),
+               ("android/view/WindowInsets", "getSystemWindowInsetLeft", "()I")}
+
+    def __init__(self, framework, stub, sdk=34, insets=(0, 0, 0, 0)):
+        self.framework = framework
+        self.sdk = sdk
+        self.insets = insets
+        self.pending = False
+        self.frames = 0
+        self.queries = 0
+        self.objects = {ACTIVITY_OBJECT: "activity"}
+        table = framework.malloc(8 * 240)
+        for index in range(240):
+            name = self.FUNCTIONS.get(index)
+            handler = getattr(self, name) if name else self.unexpected(index)
+            framework.put_u64(table + 8 * index, stub(f"jni:{name or index}", handler))
+        self.env = framework.malloc(8)
+        framework.put_u64(self.env, table)
+
+    def unexpected(self, index):
+        def fail(process, *_):
+            raise AssertionError(f"unexpected JNI function {index}")
+        return fail
+
+    def new(self, kind):
+        handle = 0x7A00_0000 + 0x10 * (len(self.objects) + 1)
+        self.objects[handle] = kind
+        return handle
+
+    def calm(self, name):
+        assert not self.pending, f"JNI {name} called with an exception pending"
+
+    def throw(self):
+        self.pending = True
+        return 0
+
+    def FindClass(self, process, env, name, *_):
+        self.calm("FindClass")
+        if process.cstring(name) == "android/view/WindowInsets$Type" and self.sdk >= 30:
+            return self.new("class:android/view/WindowInsets$Type")
+        return self.throw()
+
+    def ExceptionCheck(self, process, env, *_):
+        return 1 if self.pending else 0
+
+    def ExceptionClear(self, process, env, *_):
+        self.pending = False
+
+    def PushLocalFrame(self, process, env, capacity, *_):
+        self.calm("PushLocalFrame")
+        self.frames += 1
+        return 0
+
+    def PopLocalFrame(self, process, env, result, *_):
+        assert self.frames > 0, "PopLocalFrame without PushLocalFrame"
+        self.frames -= 1
+        return 0
+
+    def GetObjectClass(self, process, env, obj, *_):
+        self.calm("GetObjectClass")
+        return self.new("class:" + self.CLASSES[self.objects[obj]])
+
+    def member(self, process, cls, name, signature, known):
+        class_name = self.objects[cls].split(":", 1)[1]
+        key = (class_name, process.cstring(name), process.cstring(signature))
+        if key not in known:
+            return self.throw()
+        return self.new("member:" + key[1])
+
+    def GetMethodID(self, process, env, cls, name, signature, *_):
+        self.calm("GetMethodID")
+        return self.member(process, cls, name, signature, self.METHODS)
+
+    def GetStaticMethodID(self, process, env, cls, name, signature, *_):
+        self.calm("GetStaticMethodID")
+        return self.member(process, cls, name, signature, {("android/view/WindowInsets$Type", "systemBars", "()I"),
+                                                           ("android/view/WindowInsets$Type", "displayCutout", "()I")})
+
+    def GetFieldID(self, process, env, cls, name, signature, *_):
+        self.calm("GetFieldID")
+        return self.member(process, cls, name, signature, {("android/graphics/Insets", side, "I")
+                                                           for side in ("top", "right", "bottom", "left")})
+
+    def CallObjectMethodA(self, process, env, obj, method, arguments, *_):
+        self.calm("CallObjectMethodA")
+        name = self.objects[method].split(":", 1)[1]
+        if name == "getWindow":
+            return self.new("window")
+        if name == "getDecorView":
+            return self.new("decor")
+        if name == "getRootWindowInsets":
+            self.queries += 1
+            return 0 if self.insets is None else self.new("insets")
+        assert name == "getInsets" and self.sdk >= 30, name
+        mask = struct.unpack("<I", process.read(arguments, 4))[0]
+        assert mask == SYSTEM_BARS | DISPLAY_CUTOUT, f"getInsets({mask}): not the system bars and cutouts"
+        return self.new("values")
+
+    def CallIntMethodA(self, process, env, obj, method, arguments, *_):
+        self.calm("CallIntMethodA")
+        side = self.objects[method].split(":", 1)[1][len("getSystemWindowInset"):].lower()
+        return self.insets[("top", "right", "bottom", "left").index(side)]
+
+    def CallStaticIntMethodA(self, process, env, cls, method, arguments, *_):
+        self.calm("CallStaticIntMethodA")
+        return {"member:systemBars": SYSTEM_BARS, "member:displayCutout": DISPLAY_CUTOUT}[self.objects[method]]
+
+    def GetIntField(self, process, env, obj, field, *_):
+        self.calm("GetIntField")
+        assert self.objects[obj] == "values"
+        return self.insets[("top", "right", "bottom", "left").index(self.objects[field].split(":", 1)[1])]
+
+
 class App(Framework):
     """The framework model with a periodic timerfd and the mock driver."""
 
-    def __init__(self, library_path, available=True, verbose=False, font=FONT):
+    def __init__(self, library_path, available=True, verbose=False, font=FONT, jni=None):
         super().__init__(library_path, verbose=verbose)
         self.timer_interval = 0
         self.vulkan = MockVulkan(self, available)
+        # jni: {"sdk": ..., "insets": ...} gives the activity a JNIEnv.
+        self.jni = FakeJni(self, self.vulkan.stub, **jni) if jni is not None else None
         # /system/fonts/* is the test font (or missing, with font=None).
         lib = self.lib
         original = lib.sys_56
@@ -512,6 +657,12 @@ class App(Framework):
                 return os.open(font, os.O_RDONLY)
             return original(dirfd, path, flags, mode, *rest)
         lib.sys_56 = openat
+
+    def prepare_activity(self):
+        if self.jni is not None:
+            self.put_u64(self.activity + 16, self.jni.env)
+            self.put_u64(self.activity + 24, ACTIVITY_OBJECT)
+            self.lib.write(self.activity + 48, struct.pack("<i", self.jni.sdk))
 
     def _set_timer(self, process, fd, flags, new, old, *_):
         interval = struct.unpack("<qq", process.read(new, 16))
@@ -554,48 +705,44 @@ def blend(under, color):
 centered = []
 
 
-def check_frame(frame, time, pointer=None, pressed=False, label=True):
+def check_frame(frame, time, pointer=None, pressed=False, label=True, insets=(0, 0, 0, 0)):
+    """Under the insets (top, right, bottom, left) only the background; in
+    the rest the pattern, except the label's ink in its rows, at the top
+    center."""
     (width, height), pixels = frame
     flags = 4 | (1 if pointer else 0) | (2 if pressed else 0)
     px, py = pointer or (0, 0)
-    bar_height = 0
+    top, right, bottom, left = insets
+    background = swap_red_blue(BACKGROUND_COLOR)
+    ink = []
+    for y in range(height):
+        for x in range(width):
+            value = pixels[y * width + x]
+            if not (left <= x < width - right and top <= y < height - bottom):
+                assert value == background, f"frame at time {time}: pixel ({x}, {y}) under the system bars is {value:#010x}, not the background"
+                continue
+            expected = pattern(x, y, width, time, px, py, flags)
+            if value != expected:
+                assert label and y < top + LABEL_ROWS, f"frame at time {time}: pixel ({x}, {y}) is {value:#010x}, expected {expected:#010x}"
+                ink.append((x, y))
     if label:
-        # The top bar: rows of the pattern under BAR_COLOR (and the label)
-        # down to the first row that is the plain pattern again.
-        bar = swap_red_blue(BAR_COLOR)
-
-        def plain(y):
-            return all(pixels[y * width + x] == pattern(x, y, width, time, px, py, flags) for x in range(width))
-        while bar_height < height and not plain(bar_height):
-            bar_height += 1
-        assert bar_height >= 10, f"frame at time {time}: no top bar ({bar_height} rows)"
-        # Its padding rows (first and last) are bar color only.
-        for y in (0, bar_height - 1):
-            for x in range(width):
-                expected = blend(pattern(x, y, width, time, px, py, flags), bar)
-                assert pixels[y * width + x] == expected, f"frame at time {time}: bar pixel ({x}, {y}) is {pixels[y * width + x]:#010x}, expected {expected:#010x}"
-        # The label's ink: centered across the frame, inside the bar.
-        ink = [(x, y) for y in range(bar_height) for x in range(width)
-               if pixels[y * width + x] != blend(pattern(x, y, width, time, px, py, flags), bar)]
         assert len(ink) >= 20, f"frame at time {time}: no label ({len(ink)} pixels)"
         xs = [x for x, _ in ink]
         ys = [y for _, y in ink]
-        # (A label wider than the frame is centered too, but clipped at
-        # both edges, so its ink no longer shows where the middle is.)
-        fits = min(xs) > 0 and max(xs) < width - 1
+        assert min(ys) > top, f"frame at time {time}: the label touches the top inset (row {min(ys)})"
+        # Centered in the free area (the shadow adds 2 on the right). A
+        # label wider than that is centered too, but clipped at both edges,
+        # so its ink no longer shows where the middle is.
+        fits = min(xs) > left and max(xs) < width - right - 1
         if fits:
-            assert abs((min(xs) + max(xs) + 1) - width) <= 3, f"frame at time {time}: label spans x {min(xs)}..{max(xs)}, not centered in {width}"
+            assert abs((min(xs) + max(xs) - 1) - (left + width - right)) <= 3, f"frame at time {time}: label spans x {min(xs)}..{max(xs)}, not centered in {left}..{width - right}"
         centered.append(fits)
-        assert min(ys) > 0 and max(ys) < bar_height - 1, f"frame at time {time}: label rows {min(ys)}..{max(ys)} outside the bar"
-    for y in range(bar_height, height):
-        for x in range(width):
-            expected = pattern(x, y, width, time, px, py, flags)
-            if pixels[y * width + x] != expected:
-                raise AssertionError(f"frame at time {time}: pixel ({x}, {y}) is {pixels[y * width + x]:#010x}, expected {expected:#010x}")
 
 
 def scenario_render(library, spirv_val):
-    app = App(library)
+    # A phone in portrait: status bar at the top, gesture bar at the bottom.
+    insets = (8, 0, 6, 0)
+    app = App(library, jni={"sdk": 34, "insets": insets})
     vulkan = app.vulkan
     app.create()
     assert "vulkan: device ready" in app.messages(), app.messages()
@@ -616,25 +763,27 @@ def scenario_render(library, spirv_val):
     app.show_window()
     app.attach_input()
     assert "vulkan: swapchain created" in app.messages()
-    assert "text: font loaded" in app.messages() and vulkan.text_draws == 2, (app.messages(), vulkan.text_draws)
+    # The background under the two bars, the label's shadow and the label.
+    assert "text: font loaded" in app.messages() and vulkan.text_draws == 4, (app.messages(), vulkan.text_draws)
+    assert "ui: system bar insets top 8 right 0 bottom 6 left 0" in app.messages(), app.messages()
     logged = len(app.messages())
     assert len(vulkan.frames) == 1, "no frame on window creation"
-    check_frame(vulkan.frames[0], 0)
+    check_frame(vulkan.frames[0], 0, insets=insets)
     # The timer presents a frame every 16.7 ms; time advances by 2 a frame.
     app.advance(51 * MS)
     assert len(vulkan.frames) == 4, len(vulkan.frames)
     assert len(app.messages()) == logged, "steps are still logged after the first frame"
     for index, frame in enumerate(vulkan.frames):
-        check_frame(frame, index * 2)
+        check_frame(frame, index * 2, insets=insets)
     # Touch: the ring follows the finger, white while down, amber after.
     # (Timer ticks land at multiples of 16.67 ms.)
     app.touch(ACTION_DOWN, 50, 30, 52 * MS)
     app.advance(70 * MS)
-    check_frame(vulkan.frames[-1], (len(vulkan.frames) - 1) * 2, (50, 30), pressed=True)
+    check_frame(vulkan.frames[-1], (len(vulkan.frames) - 1) * 2, (50, 30), pressed=True, insets=insets)
     app.touch(ACTION_MOVE, 20.7, 40.2, 71 * MS)
     app.touch(ACTION_UP, 20.7, 40.2, 72 * MS)
     app.advance(90 * MS)
-    check_frame(vulkan.frames[-1], (len(vulkan.frames) - 1) * 2, (20, 40), pressed=False)
+    check_frame(vulkan.frames[-1], (len(vulkan.frames) - 1) * 2, (20, 40), pressed=False, insets=insets)
     # An out-of-date swapchain is recreated on the same surface; that frame
     # does not count, so the next one repeats its time.
     swapchains_before = set(vulkan.swapchains)
@@ -644,12 +793,24 @@ def scenario_render(library, spirv_val):
     presented = len(vulkan.frames)
     app.advance(130 * MS)
     assert len(vulkan.frames) == presented + 1, "no frame after recreating the swapchain"
-    check_frame(vulkan.frames[-1], (len(vulkan.frames) - 2) * 2, (20, 40))
+    check_frame(vulkan.frames[-1], (len(vulkan.frames) - 2) * 2, (20, 40), insets=insets)
     # Rotation: the window is resized and the swapchain follows.
     vulkan.extent = (64, 96)
     app.callback("onNativeWindowResized", WINDOW)
     assert vulkan.frames[-1][0] == (64, 96), vulkan.frames[-1][0]
-    check_frame(vulkan.frames[-1], (len(vulkan.frames) - 2) * 2, (20, 40))
+    check_frame(vulkan.frames[-1], (len(vulkan.frames) - 2) * 2, (20, 40), insets=insets)
+    # The bars change after a layout pass (say, the status bar grows):
+    # the next frame follows; a layout pass that changes nothing draws no
+    # extra frame.
+    app.jni.insets = insets = (12, 0, 4, 0)
+    presented = len(vulkan.frames)
+    rect = app.malloc(16)
+    app.callback("onContentRectChanged", rect)
+    assert len(vulkan.frames) == presented + 1, "no frame for the new insets"
+    check_frame(vulkan.frames[-1], (len(vulkan.frames) - 2) * 2, (20, 40), insets=insets)
+    app.callback("onContentRectChanged", rect)
+    assert len(vulkan.frames) == presented + 1, "a frame for unchanged insets"
+    assert app.jni.frames == 0, "JNI local frames left pushed"
     # Going to the background: swapchain, surface and timer go away.
     app.callback("onNativeWindowDestroyed", WINDOW)
     assert not vulkan.swapchains and not vulkan.surfaces, "swapchain or surface left after the window was destroyed"
@@ -671,7 +832,9 @@ def scenario_landscape(library):
     currentExtent landscape. Every present is suboptimal; that alone must not
     rebuild the swapchain, a size change still must. (Rotating restarts the
     activity: its manifest does not handle orientation changes.)"""
-    app = App(library)
+    # API 29 (getSystemWindowInset*), and no WindowInsets until the first
+    # layout pass.
+    app = App(library, jni={"sdk": 29, "insets": None})
     vulkan = app.vulkan
     vulkan.transform = TRANSFORM_ROTATE_90
     # Wide enough for the whole label.
@@ -686,6 +849,15 @@ def scenario_landscape(library):
         del centered[:]
         check_frame(frame, index * 2)
         assert centered == [True], "the label does not fit a 480-pixel frame"
+    # Laid out: the status bar on top, the camera cutout on the left, the
+    # gesture bar at the bottom.
+    insets = (10, 0, 6, 24)
+    app.jni.insets = insets
+    app.callback("onContentRectChanged", app.malloc(16))
+    assert "ui: system bar insets top 10 right 0 bottom 6 left 24" in app.messages(), app.messages()
+    del centered[:]
+    check_frame(vulkan.frames[-1], (len(vulkan.frames) - 1) * 2, insets=insets)
+    assert centered == [True], "the label does not fit the free part of a 480-pixel frame"
     # The window changes size without a resize callback: the suboptimal
     # present notices and the next frame has the new size.
     vulkan.extent = (64, 96)
@@ -693,7 +865,7 @@ def scenario_landscape(library):
     assert vulkan.swapchains_created == 2, vulkan.swapchains_created
     app.advance(90 * MS)
     assert vulkan.frames[-1][0] == (64, 96), vulkan.frames[-1][0]
-    check_frame(vulkan.frames[-1], (len(vulkan.frames) - 2) * 2)
+    check_frame(vulkan.frames[-1], (len(vulkan.frames) - 2) * 2, insets=insets)
     assert vulkan.swapchains_created == 2, vulkan.swapchains_created
     app.callback("onNativeWindowDestroyed", WINDOW)
     app.callback("onDestroy")
@@ -701,20 +873,23 @@ def scenario_landscape(library):
 
 
 def scenario_no_font(library):
-    app = App(library, font=None)
+    # Still the background under the bars, drawn by the text shader
+    # without an atlas.
+    insets = (8, 0, 6, 0)
+    app = App(library, font=None, jni={"sdk": 34, "insets": insets})
     app.create()
     app.show_window()
     app.advance(40 * MS)
     assert "text: no system font (no label)" in app.messages(), app.messages()
-    assert len(app.vulkan.frames) == 3 and app.vulkan.text_draws == 0
+    assert len(app.vulkan.frames) == 3 and app.vulkan.text_draws == 6, (len(app.vulkan.frames), app.vulkan.text_draws)
     for index, frame in enumerate(app.vulkan.frames):
-        check_frame(frame, index * 2, label=False)
+        check_frame(frame, index * 2, label=False, insets=insets)
     app.callback("onNativeWindowDestroyed", WINDOW)
     app.callback("onDestroy")
 
 
 def scenario_no_vulkan(library):
-    app = App(library, available=False)
+    app = App(library, available=False, jni={"sdk": 34, "insets": (8, 0, 6, 0)})
     app.create()
     app.show_window()
     app.attach_input()
@@ -745,10 +920,10 @@ def main():
             path = library
         spirv_val = shutil.which("spirv-val")
         frames = scenario_render(path, spirv_val)
-        print(f"ok   render: {frames} frames checked pixel by pixel (touch, out-of-date, resize, background)"
+        print(f"ok   render: {frames} frames checked pixel by pixel (system bar insets, touch, out-of-date, resize, new insets, background)"
               + ("" if spirv_val else " [spirv-val not installed]"))
         frames = scenario_landscape(path)
-        print(f"ok   landscape (ROTATE_90): {frames} frames, upright with an IDENTITY swapchain, no rebuild per suboptimal present")
+        print(f"ok   landscape (ROTATE_90, API 29 insets): {frames} frames, upright with an IDENTITY swapchain, no rebuild per suboptimal present")
         scenario_no_font(path)
         print("ok   no system font: frames without a label")
         scenario_no_vulkan(path)

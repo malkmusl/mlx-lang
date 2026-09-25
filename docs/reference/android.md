@@ -112,6 +112,20 @@ the locked RGBA_8888 window buffer.
 blue at start, green for a tap, yellow for a long press, red/magenta for a
 swipe right/left, cyan/orange for a swipe down/up.
 
+`windowInsets(activity, &insets)` fills a `std.ui` `Insets` with where the
+system draws over the window: status and navigation bars and display
+cutouts, in window pixels. A window that is not fullscreen reaches under
+the bars (edge to edge, enforced from Android 15), so an app draws only
+its background there and lays out its content in the rest (see
+[ui.md](ui.md)). The NDK has no C call for this, so it goes through the
+activity's `JNIEnv`: `getWindow().getDecorView().getRootWindowInsets()`,
+then `getInsets(WindowInsets.Type.systemBars() | displayCutout())` from
+API 30 and `getSystemWindowInset*()` on API 23 to 29, inside a local
+reference frame, with any Java exception cleared. It returns false, with
+zero insets, below API 23, before the window's first layout pass (no
+insets yet) or when a call fails, so ask again from `onContentRectChanged`,
+as `examples/vulkan-android` does. Call it on the main thread.
+
 ## Runtime and Linux compatibility
 
 Generated code needs no C runtime. Helpers emitted once per program provide
@@ -132,7 +146,7 @@ calls), the `O_*` bits that differ, and the `struct stat` and
 | `tools/check_android_packaging.py` | CRC-32, Adler-32, SHA-1, SHA-256 and bignum results of the packaging code, built by mlx0 and by mlx1, against Python |
 | `tools/check_android_apk.py` | `apksigner`, `jarsigner`, `zipalign`, `aapt2` on a built APK; reproducible output |
 | `tools/emulate_android_app.py` | the gesture example against a model of the Android framework: taps, long presses, swipes, cancel, rotation |
-| `tools/emulate_vulkan_android.py` | `examples/vulkan-android` against the same framework model plus a mock Vulkan driver behind `libvulkan.so`: instance and device extensions, the submitted shader (`spirv-val`), swapchain creation on an R8G8B8A8, "inherit"-alpha surface, every presented frame pixel by pixel, the std.ui top bar and the std.truetype label centered in it (the system font served from the test font, the `text` shader run on the fill, atlas and runs the app built), touch, out-of-date and resized swapchains, background and return, and devices without a system font or without Vulkan |
+| `tools/emulate_vulkan_android.py` | `examples/vulkan-android` against the same framework model plus a mock Vulkan driver behind `libvulkan.so`: instance and device extensions, the submitted shader (`spirv-val`), swapchain creation on an R8G8B8A8, "inherit"-alpha surface, every presented frame pixel by pixel, the system bar insets (a fake `JNIEnv` answers `getRootWindowInsets` on API 34 through `WindowInsets.Type` and `Insets`, and on API 29 through `getSystemWindowInset*`; before the first layout pass it has none) with only the background under them, the std.truetype label at the top center of the rest (the system font served from the test font, the `text` shader run on the fills, atlas and runs the app built), touch, out-of-date and resized swapchains, background and return, and devices without a system font or without Vulkan |
 
 The emulator cannot run Android itself, so the last step is a device:
 `adb install -r gestures.apk`, then `adb logcat -s mlx` shows each

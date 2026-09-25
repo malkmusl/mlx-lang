@@ -38,7 +38,8 @@ MS = 1_000_000
 ACTION_DOWN, ACTION_UP, ACTION_MOVE, ACTION_CANCEL, ACTION_POINTER_DOWN = 0, 1, 2, 3, 5
 CALLBACKS = {"onSaveInstanceState": 16, "onDestroy": 40, "onNativeWindowCreated": 56,
              "onNativeWindowResized": 64, "onNativeWindowRedrawNeeded": 72,
-             "onNativeWindowDestroyed": 80, "onInputQueueCreated": 88, "onInputQueueDestroyed": 96}
+             "onNativeWindowDestroyed": 80, "onInputQueueCreated": 88, "onInputQueueDestroyed": 96,
+             "onContentRectChanged": 104}
 
 
 def rgb(red, green, blue):
@@ -165,7 +166,11 @@ class Framework:
         self.activity = self.malloc(80)
         self.callbacks = self.malloc(128)
         self.put_u64(self.activity, self.callbacks)
+        self.prepare_activity()
         self.lib.call("ANativeActivity_onCreate", self.activity, saved, saved_size)
+
+    def prepare_activity(self):
+        """Fills more of the ANativeActivity before onCreate (subclasses)."""
 
     def callback(self, name, *args):
         address = self.u64(self.callbacks + CALLBACKS[name])
