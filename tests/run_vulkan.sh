@@ -67,10 +67,12 @@ if [[ -n "$lavapipe" ]]; then
     run tests/256_vulkan_icd_runtime.mlx -- "$work/manifest.json"
     run tests/257_vulkan_sharing_runtime.mlx VK_DRIVER_FILES="$lavapipe"
     run tests/258_vulkan_swapchain_runtime.mlx VK_DRIVER_FILES="$lavapipe"
+    run tests/263_vulkan_text_runtime.mlx VK_DRIVER_FILES="$lavapipe"
 else
-    echo "skip tests/253, 254, 256, 257 and 258 (no lavapipe manifest)"
+    echo "skip tests/253, 254, 256, 257, 258 and 263 (no lavapipe manifest)"
 fi
 run tests/255_spirv_module_runtime.mlx -- "$work/doubler.spv"
+run tests/262_truetype_runtime.mlx
 
 # The builder's module passes the Khronos validator, and modules from
 # glslang pass std.spirv.module.
@@ -116,7 +118,7 @@ done
 if "$compiler" --quiet examples/vulkan-shared/check_shaders.mlx -o "$work/check-shaders" 2> "$work/errors" && "$work/check-shaders" "$work" > "$work/output" 2>&1; then
     echo "ok   examples/vulkan-shared shaders build and pass std.spirv.module"
     if command -v spirv-val > /dev/null; then
-        for shader in pattern blit; do
+        for shader in pattern blit text; do
             if spirv-val --target-env vulkan1.1 "$work/$shader.spv"; then
                 echo "ok   spirv-val accepts the $shader shader"
             else
@@ -128,6 +130,17 @@ if "$compiler" --quiet examples/vulkan-shared/check_shaders.mlx -o "$work/check-
 else
     echo "FAIL examples/vulkan-shared/check_shaders.mlx"
     cat "$work/errors" "$work/output" 2> /dev/null
+    failures=$((failures + 1))
+fi
+
+# std.truetype's rasterizer against FreeType and a supersampled ground
+# truth (skipped without freetype-py and fontTools).
+if python3 tools/check_truetype.py "$compiler" > "$work/output" 2>&1; then
+    sed 's/^/     /' "$work/output"
+    echo "ok   tools/check_truetype.py"
+else
+    echo "FAIL tools/check_truetype.py"
+    cat "$work/output"
     failures=$((failures + 1))
 fi
 

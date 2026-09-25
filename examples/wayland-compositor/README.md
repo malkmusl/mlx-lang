@@ -44,8 +44,17 @@ compositor needs a Wayland session (GNOME, KDE Plasma, sway, ...). On X11,
 start `weston` first and run it inside weston.
 
 Options: `--socket NAME`, `--size WxH`, `--renderer cpu|vulkan`,
-`--terminal PROGRAM`, `--run PROGRAM` (repeatable), `--screenshot FILE`,
-`--timeout SECONDS`, `--verbose`.
+`--font PATH|none`, `--terminal PROGRAM`, `--run PROGRAM` (repeatable),
+`--screenshot FILE`, `--timeout SECONDS`, `--verbose`.
+
+## Title bars
+
+Every window gets a title bar above its frame (the focus color when it has
+the keyboard) showing its `xdg_toplevel` title, drawn with
+[`std.truetype`](../../docs/reference/truetype.md) from `--font` (default
+DejaVu Sans; titles are left out when it cannot be read). Dragging a title
+bar moves the window. Both renderers draw titles identically: the CPU with
+`std.truetype.drawRun`, Vulkan with the `text` compute shader.
 
 ## Vulkan
 
@@ -83,7 +92,7 @@ toplevels, popups and positioners. There are no subsurfaces or data devices
   xdg-shell, focus and input delivery, and launching programs.
 - `dmabuf.mlx`: linux-dmabuf; each dma-buf becomes a one-buffer pool.
 - `vulkan.mlx`: the Vulkan renderer.
-- `scene.mlx`: stacking, hit-testing and software composition.
+- `scene.mlx`: stacking, hit-testing, title bars and software composition.
 - `state.mlx`: shared records and list helpers.
 
 `tools/check_wayland_compositor.sh [compiler] [cpu|vulkan]` exercises all

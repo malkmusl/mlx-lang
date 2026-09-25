@@ -10,7 +10,9 @@
 #   1. click the Mlx terminal and type a command (keyboard -> shell);
 #   2. Alt+Enter opens a second terminal (compositor shortcut);
 #   3. Alt+drag moves it (compositor-driven move), then type into it;
-#   4. with weston-terminal (if installed): type with Shift through the
+#   4. drag a window by the compositor's title bar (the title is drawn with
+#      std.truetype when DejaVu Sans is installed);
+#   5. with weston-terminal (if installed): type with Shift through the
 #      forwarded xkb keymap, drag it by its title bar (xdg_toplevel.move)
 #      and open its right-click popup menu.
 #
@@ -104,7 +106,44 @@ assert rgb(62, 300) != focus, "the window did not leave its original position"
 PY
 echo "ok   Alt+drag moved the focused window by the pointer's travel"
 
-# Scenario 2: weston-terminal (libwayland, cairo, xkbcommon) if available.
+# Scenario 2: the compositor's own title bars (std.truetype titles, when
+# the default font is installed): dragging one moves its window.
+cat > "$work/title.script" <<SCRIPT
+wait 1500
+pointer 120 12
+press 272
+pointer 170 62
+pointer 220 112
+release 272
+wait 800
+shot $work/title.ppm
+close
+SCRIPT
+run_scenario title "$work/title.script" --terminal "$work/mlx-terminal" --run "$work/mlx-terminal"
+grep -q "^move: Mlx Terminal" "$work/title-compositor.log" || { echo "dragging the title bar did not move the window" >&2; cat "$work/title-compositor.log" >&2; exit 1; }
+# The window starts at (24, 24) and moves by (+100, +100): its frame's left
+# edge is at x = 122, its title bar spans y = 102..121.
+font=0
+[[ -f /usr/share/fonts/truetype/dejavu/DejaVuSans.ttf ]] && font=1
+python3 - "$work/title.ppm" "$font" <<'PY'
+import sys
+data = open(sys.argv[1], 'rb').read()
+_, size, _, pixels = data.split(b'\n', 3)
+width, height = map(int, size.split())
+def rgb(x, y):
+    offset = (y * width + x) * 3
+    return tuple(pixels[offset:offset + 3])
+focus = (0x5a, 0xa0, 0xff)
+assert rgb(122, 300) == focus and rgb(122, 110) == focus, (rgb(122, 300), rgb(122, 110))
+assert rgb(22, 300) != focus, "the window did not leave its original position"
+if sys.argv[2] == "1":
+    # The title in white over the bar (the bar's red is 0x5a).
+    light = sum(1 for y in range(102, 122) for x in range(124, 320) if rgb(x, y)[0] > 180)
+    assert light > 50, "no title text in the title bar (%d light pixels)" % light
+PY
+echo "ok   dragging the compositor's title bar moved the window"
+
+# Scenario 3: weston-terminal (libwayland, cairo, xkbcommon) if available.
 if command -v weston-terminal > /dev/null; then
     cat > "$work/weston.script" <<SCRIPT
 wait 2500

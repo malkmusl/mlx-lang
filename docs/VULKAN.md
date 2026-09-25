@@ -66,7 +66,9 @@ and `examples/vulkan-android` builds into an APK with
 
 All of them share `examples/vulkan-shared`: the shaders (built with
 `std.spirv.builder`), device and buffer setup with dma-buf and host-memory
-sharing, and swapchain presentation.
+sharing, swapchain presentation, and text: the client's label, the
+compositor's window titles and the Android label are laid out by
+[`std.truetype`](reference/truetype.md) and drawn by a compute shader.
 
 ![The Vulkan client inside the compositor's Vulkan renderer](../examples/wayland-compositor/screenshots/vulkan-client.png)
 

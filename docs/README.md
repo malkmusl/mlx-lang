@@ -48,6 +48,8 @@ exercise it:
 - [`reference/vulkan.md`](reference/vulkan.md) — `std.vulkan` materialized
   from `vk.xml`, the driver loader and driver interface, SPIR-V and
   `std.json` (expands [`VULKAN.md`](VULKAN.md))
+- [`reference/truetype.md`](reference/truetype.md) — `std.truetype`: TrueType
+  parsing, anti-aliased rasterization, atlas, layout, and text on Vulkan
 - [`reference/memory-and-concurrency.md`](reference/memory-and-concurrency.md)
   — the memory model (lifetime, UB, overflow) and the atomics/TLS Stage-0 gap
 - [`reference/diagnostics-selfhost.md`](reference/diagnostics-selfhost.md) —

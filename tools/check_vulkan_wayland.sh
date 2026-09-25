@@ -12,8 +12,11 @@
 #
 # tools/wayland-test-host plays the session compositor and saves the frame
 # it receives. Each frame is checked pixel by pixel: the client's window must
-# hold the pattern shader's output for a single time value, and everything
-# outside it (background, focus frame) must match the CPU renderer exactly.
+# hold the pattern shader's output for a single time value, with the
+# client's label (std.truetype text drawn by the `text` shader) at the
+# bottom, and everything outside it (background, focus frame, title bar
+# with the window title) must match the CPU renderer exactly - so the
+# compositor's GPU-drawn title equals its CPU-drawn one.
 #
 # Needs a Vulkan driver with VK_EXT_external_memory_host and
 # VK_EXT_external_memory_dma_buf (lavapipe) and xkbcli. Usage:
@@ -88,12 +91,21 @@ left, top, w, h = 24, 24, 480, 320
 t = rgb(left, top)[0]
 for tt in range(t, 1024, 256):
     if all(rgb(left + x, top + y) == ((x + tt) & 255, (y + tt // 2) & 255, ((x ^ y) + 2 * tt) & 255)
-           for x in range(0, w, 7) for y in range(0, h, 5)):
+           for x in range(0, w, 7) for y in range(0, h - 32, 5)):
         break
 else:
     sys.exit("window does not hold the pattern: %r at its origin" % (rgb(left, top),))
 focus = (0x5a, 0xa0, 0xff)
 assert rgb(left - 1, top + 100) == focus and rgb(left + w + 1, top + 100) == focus, "no focus frame"
+# The client's label (white text) in its bottom-left corner.
+label = sum(1 for y in range(top + h - 30, top + h) for x in range(left + 8, left + 260) if rgb(x, y) == (255, 255, 255))
+assert label > 40, "no label in the client window (%d white pixels)" % label
+# The title bar above the frame: focus color with the title in white.
+bar_top = top - 2 - 20
+assert rgb(left + w - 4, bar_top + 3) == focus, "no title bar"
+# (anti-aliased white over the bar: red well above the bar's 0x5a)
+title = sum(1 for y in range(bar_top, top - 2) for x in range(left, left + 200) if rgb(x, y)[0] > 180)
+assert title > 40, "no title text in the title bar (%d light pixels)" % title
 reference = sys.argv[2]
 if os.path.exists(reference) and reference != sys.argv[1]:
     _, _, expected = load(reference)

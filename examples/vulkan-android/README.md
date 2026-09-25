@@ -3,7 +3,10 @@
 Vulkan on Android: a NativeActivity that renders the animated pattern of
 `examples/vulkan-shared` with a compute shader and presents it through a
 `VK_KHR_android_surface` swapchain. Touch moves the ring; it turns white
-while a finger is down.
+while a finger is down. A label at the top left (the GPU and the frame
+count) is laid out by [`std.truetype`](../../docs/reference/truetype.md)
+from the system font (`/system/fonts/Roboto-Regular.ttf`, or Noto Sans,
+Droid Sans) and drawn by the `text` compute shader.
 
 The Vulkan side is the same code the Linux examples run: the system
 `libvulkan.so` is opened with `std.vulkan.loader.openSystemLoader`, the

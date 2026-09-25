@@ -170,6 +170,10 @@ pub fn main() -> u8 {
 (`tests/183_float_exponent_runtime.mlx`; `@bitCast` reinterprets a value's
 bits as another same-size type, `@floatCast` converts between float widths)
 
+Unary minus negates floats as floats, including literals whose type comes
+from their context (`@intFromFloat(i64, -2.25)` is `-2`)
+(`tests/261_float_negation_context_runtime.mlx`).
+
 ## Bit-counting
 
 `@popCount(value)` counts the set bits in an integer, signed or unsigned:

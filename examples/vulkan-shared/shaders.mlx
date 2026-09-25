@@ -13,7 +13,16 @@
 //     the output; the output starts `targetOffset` pixels into binding 1.
 //     A source stride of 0 repeats the first row (solid rectangles).
 //
-// Both use 8x8 work groups: dispatch ceil(width / 8) x ceil(height / 8).
+// text (binding 0: glyph atlas, binding 1: glyph run, binding 2:
+//      destination pixels, push constants: Text)
+//     Draws a std.truetype Run: each invocation is one pixel of the run's
+//     bounding box, takes the largest atlas coverage among the run's quads
+//     covering it and blends `color` at that coverage, exactly like
+//     std.truetype.drawRun. The atlas holds 8-bit coverage, four per word;
+//     each quad is four words: atlasX | atlasY << 16, width | height << 16,
+//     x, y (signed, relative to the run origin).
+//
+// All use 8x8 work groups: dispatch ceil(width / 8) x ceil(height / 8).
 
 const std = @import("std")
 const spv = @import("std.spirv.core")
@@ -52,8 +61,33 @@ pub const Blit = struct {
     targetOffset: u32
 }
 
+// Text: the target (as in Blit), the run's origin in the target, its
+// bounding box relative to the origin, the quad count, the atlas width (a
+// multiple of 4) and the color (0xAARRGGBB, straight alpha; swap red and
+// blue on the host for R8G8B8A8 targets).
+pub const Text = struct {
+    targetWidth: u32
+    targetHeight: u32
+    targetOffset: u32
+    originX: u32
+    originY: u32
+    boxLeft: u32
+    boxTop: u32
+    boxWidth: u32
+    boxHeight: u32
+    count: u32
+    atlasWidth: u32
+    color: u32
+    // Where this run's quads start in binding 1 (words).
+    runOffset: u32
+}
+
 pub const PATTERN_WORDS: u32 = 6
 pub const BLIT_WORDS: u32 = 10
+pub const TEXT_WORDS: u32 = 13
+pub const PATTERN: u8 = 0
+pub const BLIT: u8 = 1
+pub const TEXT: u8 = 2
 
 // Types and variables shared by both shaders.
 const Common = struct {
@@ -66,7 +100,7 @@ const Common = struct {
     storagePointer: u32
     globalId: u32
     zero: u32
-    buffers: [2]u32
+    buffers: [3]u32
     voidType: u32
     functionType: u32
 }
@@ -89,8 +123,13 @@ fn declare(b: *builder.Builder, common: *Common, push_words: u32, buffer_count: 
     builder.decorateBuiltIn(b, common.*.globalId, spv.BuiltIn.globalInvocationId)
     common.*.zero = builder.constant(b, common.*.uint, 0)
 
-    // Push constants: a Block of `push_words` (at most 10) u32 members.
-    var members: [10]u32 = [10]u32{ common.*.uint, common.*.uint, common.*.uint, common.*.uint, common.*.uint, common.*.uint, common.*.uint, common.*.uint, common.*.uint, common.*.uint }
+    // Push constants: a Block of `push_words` (at most 16) u32 members.
+    var members: [16]u32 = undefined
+    var member_index: usize = 0
+    while member_index < 16 {
+        members[member_index] = common.*.uint
+        member_index += 1
+    }
     var push_block: u32 = 0
     unsafe { push_block = builder.typeStruct(b, @ptrCast([*]const u32, &members), words(push_words)) }
     builder.decorate(b, push_block, spv.Decoration.block)
@@ -293,12 +332,160 @@ pub fn buildBlit(b: *builder.Builder) -> void {
     finish(b, &common, main)
 }
 
+fn signed(b: *builder.Builder, common: *const Common, value: u32) -> u32 {
+    return builder.unary(b, spv.Op.bitcast, common.*.int, value)
+}
+
+pub fn buildText(b: *builder.Builder) -> void {
+    var common: Common = undefined
+    declare(b, &common, TEXT_WORDS, 3)
+    const function_pointer = builder.typePointer(b, spv.StorageClass.function, common.uint)
+    const main = builder.function(b, common.voidType, spv.FUNCTION_CONTROL_NONE, common.functionType)
+    const entry = builder.label(b)
+    // Function variables come first in the entry block.
+    const counter = builder.localVariable(b, function_pointer)
+    const coverage = builder.localVariable(b, function_pointer)
+    const id = builder.load(b, common.uvec3, common.globalId)
+    const x = builder.compositeExtract(b, common.uint, id, 0)
+    const y = builder.compositeExtract(b, common.uint, id, 1)
+    const target_width = pushWord(b, &common, 0)
+    const target_height = pushWord(b, &common, 1)
+    const target_offset = pushWord(b, &common, 2)
+    const origin_x = signed(b, &common, pushWord(b, &common, 3))
+    const origin_y = signed(b, &common, pushWord(b, &common, 4))
+    const box_left = signed(b, &common, pushWord(b, &common, 5))
+    const box_top = signed(b, &common, pushWord(b, &common, 6))
+    const box_width = pushWord(b, &common, 7)
+    const box_height = pushWord(b, &common, 8)
+    const count = pushWord(b, &common, 9)
+    const atlas_width = pushWord(b, &common, 10)
+    const color = pushWord(b, &common, 11)
+    const run_offset = pushWord(b, &common, 12)
+    const zero_int = builder.constant(b, common.int, 0)
+    // The run pixel (relative to the origin) and the target pixel.
+    const run_x = op(b, spv.Op.iAdd, common.int, box_left, signed(b, &common, x))
+    const run_y = op(b, spv.Op.iAdd, common.int, box_top, signed(b, &common, y))
+    const target_x = op(b, spv.Op.iAdd, common.int, origin_x, run_x)
+    const target_y = op(b, spv.Op.iAdd, common.int, origin_y, run_y)
+    const in_box = op(b, spv.Op.logicalAnd, common.boolean, op(b, spv.Op.uLessThan, common.boolean, x, box_width), op(b, spv.Op.uLessThan, common.boolean, y, box_height))
+    const in_x = op(b, spv.Op.logicalAnd, common.boolean, op(b, spv.Op.sGreaterThanEqual, common.boolean, target_x, zero_int), op(b, spv.Op.sLessThan, common.boolean, target_x, signed(b, &common, target_width)))
+    const in_y = op(b, spv.Op.logicalAnd, common.boolean, op(b, spv.Op.sGreaterThanEqual, common.boolean, target_y, zero_int), op(b, spv.Op.sLessThan, common.boolean, target_y, signed(b, &common, target_height)))
+    const visible = op(b, spv.Op.logicalAnd, common.boolean, in_box, op(b, spv.Op.logicalAnd, common.boolean, in_x, in_y))
+    const body = builder.newId(b)
+    const done = builder.newId(b)
+    builder.selectionMerge(b, done)
+    builder.branchConditional(b, visible, body, done)
+
+    const body_label = builder.labelWith(b, body)
+    builder.store(b, counter, common.zero)
+    builder.store(b, coverage, common.zero)
+    const header = builder.newId(b)
+    const condition_block = builder.newId(b)
+    const loop_body = builder.newId(b)
+    const continue_block = builder.newId(b)
+    const loop_end = builder.newId(b)
+    builder.branch(b, header)
+
+    // for (i = 0; i < count; i += 1)
+    const header_label = builder.labelWith(b, header)
+    builder.loopMerge(b, loop_end, continue_block)
+    builder.branch(b, condition_block)
+
+    const condition_label = builder.labelWith(b, condition_block)
+    const index = builder.load(b, common.uint, counter)
+    const more = op(b, spv.Op.uLessThan, common.boolean, index, count)
+    builder.branchConditional(b, more, loop_body, loop_end)
+
+    const loop_body_label = builder.labelWith(b, loop_body)
+    const base = op(b, spv.Op.iAdd, common.uint, run_offset, op(b, spv.Op.shiftLeftLogical, common.uint, index, constant(b, &common, 2)))
+    const word0 = builder.load(b, common.uint, element(b, &common, common.buffers[1], base))
+    const word1 = builder.load(b, common.uint, element(b, &common, common.buffers[1], op(b, spv.Op.iAdd, common.uint, base, constant(b, &common, 1))))
+    const quad_x = signed(b, &common, builder.load(b, common.uint, element(b, &common, common.buffers[1], op(b, spv.Op.iAdd, common.uint, base, constant(b, &common, 2)))))
+    const quad_y = signed(b, &common, builder.load(b, common.uint, element(b, &common, common.buffers[1], op(b, spv.Op.iAdd, common.uint, base, constant(b, &common, 3)))))
+    const mask = constant(b, &common, 65535)
+    const sixteen = constant(b, &common, 16)
+    const atlas_x = op(b, spv.Op.bitwiseAnd, common.uint, word0, mask)
+    const atlas_y = op(b, spv.Op.shiftRightLogical, common.uint, word0, sixteen)
+    const quad_width = signed(b, &common, op(b, spv.Op.bitwiseAnd, common.uint, word1, mask))
+    const quad_height = signed(b, &common, op(b, spv.Op.shiftRightLogical, common.uint, word1, sixteen))
+    const local_x = op(b, spv.Op.iSub, common.int, run_x, quad_x)
+    const local_y = op(b, spv.Op.iSub, common.int, run_y, quad_y)
+    const inside_x = op(b, spv.Op.logicalAnd, common.boolean, op(b, spv.Op.sGreaterThanEqual, common.boolean, local_x, zero_int), op(b, spv.Op.sLessThan, common.boolean, local_x, quad_width))
+    const inside_y = op(b, spv.Op.logicalAnd, common.boolean, op(b, spv.Op.sGreaterThanEqual, common.boolean, local_y, zero_int), op(b, spv.Op.sLessThan, common.boolean, local_y, quad_height))
+    const inside = op(b, spv.Op.logicalAnd, common.boolean, inside_x, inside_y)
+    const sample = builder.newId(b)
+    const sampled = builder.newId(b)
+    builder.selectionMerge(b, sampled)
+    builder.branchConditional(b, inside, sample, sampled)
+
+    const sample_label = builder.labelWith(b, sample)
+    const row = op(b, spv.Op.iAdd, common.uint, atlas_y, builder.unary(b, spv.Op.bitcast, common.uint, local_y))
+    const column = op(b, spv.Op.iAdd, common.uint, atlas_x, builder.unary(b, spv.Op.bitcast, common.uint, local_x))
+    const byte_index = op(b, spv.Op.iAdd, common.uint, op(b, spv.Op.iMul, common.uint, row, atlas_width), column)
+    const word = builder.load(b, common.uint, element(b, &common, common.buffers[0], op(b, spv.Op.shiftRightLogical, common.uint, byte_index, constant(b, &common, 2))))
+    const shift = op(b, spv.Op.shiftLeftLogical, common.uint, op(b, spv.Op.bitwiseAnd, common.uint, byte_index, constant(b, &common, 3)), constant(b, &common, 3))
+    const value = op(b, spv.Op.bitwiseAnd, common.uint, op(b, spv.Op.shiftRightLogical, common.uint, word, shift), constant(b, &common, 255))
+    const current = builder.load(b, common.uint, coverage)
+    builder.store(b, coverage, select(b, common.uint, op(b, spv.Op.uGreaterThan, common.boolean, value, current), value, current))
+    builder.branch(b, sampled)
+
+    const sampled_label = builder.labelWith(b, sampled)
+    builder.branch(b, continue_block)
+
+    const continue_label = builder.labelWith(b, continue_block)
+    builder.store(b, counter, op(b, spv.Op.iAdd, common.uint, index, constant(b, &common, 1)))
+    builder.branch(b, header)
+
+    // Blend: alpha = (coverage * color alpha + 127) / 255; each channel
+    // (color * alpha + target * (255 - alpha) + 127) / 255.
+    const loop_end_label = builder.labelWith(b, loop_end)
+    const final_coverage = builder.load(b, common.uint, coverage)
+    const covered = op(b, spv.Op.iNotEqual, common.boolean, final_coverage, common.zero)
+    const blend = builder.newId(b)
+    const blended = builder.newId(b)
+    builder.selectionMerge(b, blended)
+    builder.branchConditional(b, covered, blend, blended)
+
+    const blend_label = builder.labelWith(b, blend)
+    const target_index = op(b, spv.Op.iAdd, common.uint, target_offset, op(b, spv.Op.iAdd, common.uint, op(b, spv.Op.iMul, common.uint, builder.unary(b, spv.Op.bitcast, common.uint, target_y), target_width), builder.unary(b, spv.Op.bitcast, common.uint, target_x)))
+    const target_pointer = element(b, &common, common.buffers[2], target_index)
+    const under = builder.load(b, common.uint, target_pointer)
+    const c255 = constant(b, &common, 255)
+    const c127 = constant(b, &common, 127)
+    const alpha = op(b, spv.Op.uDiv, common.uint, op(b, spv.Op.iAdd, common.uint, op(b, spv.Op.iMul, common.uint, final_coverage, channel(b, &common, color, 24)), c127), c255)
+    const inverse = op(b, spv.Op.iSub, common.uint, c255, alpha)
+    var mixed: [3]u32 = [3]u32{ 0, 0, 0 }
+    var channel_index: u32 = 0
+    while channel_index < 3 {
+        const shift_bits = 16 - channel_index * 8
+        const sum = op(b, spv.Op.iAdd, common.uint, op(b, spv.Op.iAdd, common.uint, op(b, spv.Op.iMul, common.uint, channel(b, &common, color, shift_bits), alpha), op(b, spv.Op.iMul, common.uint, channel(b, &common, under, shift_bits), inverse)), c127)
+        mixed[channel_index] = op(b, spv.Op.uDiv, common.uint, sum, c255)
+        channel_index += 1
+    }
+    builder.store(b, target_pointer, pack(b, &common, mixed[0], mixed[1], mixed[2]))
+    builder.branch(b, blended)
+
+    const blended_label = builder.labelWith(b, blended)
+    builder.branch(b, done)
+
+    const done_label = builder.labelWith(b, done)
+    builder.returnVoid(b)
+    builder.functionEnd(b)
+    finish(b, &common, main)
+}
+
 // Builds a shader into words allocated from `allocator`; returns the word
-// count (0 when out of memory). `which` is 0 for pattern, 1 for blit.
+// count (0 when out of memory). `which` is PATTERN, BLIT or TEXT.
 pub fn build(allocator: std.allocator.Allocator, which: u8, result: *[*]u32) -> usize {
     var b: builder.Builder = undefined
     builder.init(&b, allocator, spv.version(1, 3))
-    if which == 0 { buildPattern(&b) } else { buildBlit(&b) }
+    if which == PATTERN {
+        buildPattern(&b)
+    } else if which == BLIT {
+        buildBlit(&b)
+    } else {
+        buildText(&b)
+    }
     const count = builder.wordCount(&b)
     const memory = allocator.alloc(count * 4, 4)
     if memory == null { return 0 }

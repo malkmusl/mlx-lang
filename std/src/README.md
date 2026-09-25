@@ -28,6 +28,10 @@ name and are not re-exported from `std.mlx`.
 `spirv/module.mlx` write, read and validate SPIR-V. See
 `docs/reference/vulkan.md`.
 
+`truetype.mlx` (`std.truetype`) reads TrueType fonts, rasterizes glyphs
+with anti-aliasing, packs them into an atlas and lays out text; see
+`docs/reference/truetype.md`.
+
 `std.path`, `std.mode`, `std.parse`, `std.shell` and `std.calendar` provide
 coreutils-grade building blocks (path manipulation/canonicalization, chmod-style
 permission parsing, sized-number/duration parsing, POSIX-ish word splitting and

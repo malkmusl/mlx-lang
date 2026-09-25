@@ -241,19 +241,26 @@ a JSON string. (`tests/248_json_runtime.mlx`)
 
 The examples share one small renderer in `examples/vulkan-shared`:
 
-- `shaders.mlx` builds two compute shaders with `std.spirv.builder`:
+- `shaders.mlx` builds three compute shaders with `std.spirv.builder`:
   `pattern` (an animated pattern with a ring around the pointer, written as
-  `0xAARRGGBB` or, for R8G8B8A8 targets, with red and blue swapped) and
+  `0xAARRGGBB` or, for R8G8B8A8 targets, with red and blue swapped),
   `blit` (composites a premultiplied ARGB or opaque XRGB source into a
-  target at an offset, clipped; a source stride of 0 fills a rectangle).
-  `check_shaders.mlx` validates both and writes them out for `spirv-val`.
+  target at an offset, clipped; a source stride of 0 fills a rectangle) and
+  `text` (draws a `std.truetype` run from a glyph atlas, with a loop over
+  the run's glyphs per pixel). `check_shaders.mlx` validates them and
+  writes them out for `spirv-val`.
+- `text.mlx` keeps a `std.truetype` atlas and the frame's glyph runs in
+  GPU memory and records `text` dispatches; GPU text equals
+  `std.truetype.drawRun`'s pixel for pixel
+  (`tests/263_vulkan_text_runtime.mlx`, see [truetype.md](truetype.md)).
 - `gpu.mlx` opens a device with one compute queue and, on request, the
   sharing extensions the driver supports: dma-buf import and export
   (`VK_EXT_external_memory_dma_buf`) and imported host memory
   (`VK_EXT_external_memory_host`). It creates, imports and destroys storage
   buffers, compiles kernels and records dispatches.
 - `swapchain.mlx` presents to a window surface: each frame the pattern is
-  rendered into a buffer, copied into the acquired image
+  rendered into a buffer, a callback may draw over it (the Android app's
+  label), and the buffer is copied into the acquired image
   (`vkCmdCopyBufferToImage`) and presented (FIFO).
 
 `tests/257_vulkan_sharing_runtime.mlx` runs the sharing paths on lavapipe:
@@ -279,11 +286,12 @@ receives pixel by pixel.
 ## Tests
 
 `tests/run_vulkan.sh [compiler]` runs `tests/248_json_runtime.mlx`,
-`tests/251_vulkan_api_runtime.mlx` and `tests/255_spirv_module_runtime.mlx`
-everywhere; `tests/253_vulkan_loader_runtime.mlx`,
+`tests/251_vulkan_api_runtime.mlx`, `tests/255_spirv_module_runtime.mlx`
+and `tests/262_truetype_runtime.mlx` everywhere; `tests/253_vulkan_loader_runtime.mlx`,
 `tests/254_spirv_compute_runtime.mlx` and
-`tests/256_vulkan_icd_runtime.mlx`, `tests/257_vulkan_sharing_runtime.mlx`
-and `tests/258_vulkan_swapchain_runtime.mlx` when lavapipe (package
+`tests/256_vulkan_icd_runtime.mlx`, `tests/257_vulkan_sharing_runtime.mlx`,
+`tests/258_vulkan_swapchain_runtime.mlx` and
+`tests/263_vulkan_text_runtime.mlx` when lavapipe (package
 `mesa-vulkan-drivers`) is installed; `tools/check_vulkan_wayland.sh` when
 lavapipe and `xkbcli` are; the `spirv-val` and glslang cross-checks
 (including the examples' shaders) when those tools are present; the layout

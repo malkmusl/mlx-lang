@@ -16,6 +16,10 @@ libvulkan.so, and checks the app end to end:
   - the 60 Hz timer keeps presenting; touch moves the ring (white while
     down, amber after); an out-of-date swapchain and a window resize
     recreate it; destroying the window destroys the swapchain and surface;
+  - the label: the app loads a system font (/system/fonts/..., served
+    from tests/support/fonts/DejaVuSans-subset.ttf), lays it out with
+    std.truetype and draws it with the `text` shader, whose arithmetic the
+    mock runs on the atlas and glyph runs the aarch64 code produced;
   - without libvulkan.so the app logs it and keeps running.
 
 The mock "GPU" runs the pattern shader's formula (the shader itself is
@@ -46,6 +50,10 @@ ERROR_OUT_OF_DATE = (-1000001004) & 0xFFFFFFFF
 COMPOSITE_ALPHA_INHERIT = 8
 ACTION_DOWN, ACTION_UP, ACTION_MOVE = 0, 1, 2
 MS = 1_000_000
+FONT = os.path.join(ROOT, "tests/support/fonts/DejaVuSans-subset.ttf")
+# Rows the label may cover (it sits at the top left); the pattern is
+# checked below them.
+LABEL_ROWS = 40
 
 
 def pattern(x, y, width, time, pointer_x, pointer_y, flags):
@@ -82,6 +90,8 @@ class MockVulkan:
         self.surfaces = set()
         self.acquire_semaphore = None
         self.frames = []         # (extent, pixels)
+        self.pipelines = {}      # handle -> "pattern" or "text"
+        self.text_draws = 0
         self.out_of_date_once = False
         self.commands = {name[3:]: getattr(self, name) for name in dir(self) if name.startswith("vk_")}
         self.addresses = {}
@@ -204,8 +214,11 @@ class MockVulkan:
         return 0
 
     def vk_CreateComputePipelines(self, process, device, cache, count, infos, allocator, pipelines, *_):
+        # The app creates the pattern pipeline first, the text one second.
         for index in range(count):
-            self.put_u64(pipelines + 8 * index, self.handle())
+            handle = self.handle()
+            self.pipelines[handle] = "pattern" if not self.pipelines else "text"
+            self.put_u64(pipelines + 8 * index, handle)
         return 0
 
     def nothing(self, process, *_):
@@ -309,6 +322,10 @@ class MockVulkan:
                 state["set"] = self.sets[command[1]]
             elif kind == "push":
                 state["push"] = command[1]
+            elif kind == "pipeline":
+                state["pipeline"] = self.pipelines[command[1]]
+            elif kind == "dispatch" and state.get("pipeline") == "text":
+                self.run_text(state["push"], state["set"], command[1], command[2])
             elif kind == "dispatch":
                 width, height, time, pointer_x, pointer_y, flags = state["push"]
                 assert command[1] * 8 >= width and command[2] * 8 >= height, "dispatch does not cover the frame"
@@ -327,6 +344,46 @@ class MockVulkan:
                 assert (width, height) == image["size"], "copy does not cover the image"
                 assert self.acquire_semaphore in waits, "the copy does not wait for the acquired image"
                 image["pixels"] = struct.unpack(f"<{width * height}I", self.lib.read(self.buffers[source][1] + offset, width * height * 4))
+
+    def run_text(self, push, bindings, groups_x, groups_y):
+        """The `text` shader: per pixel of the run's box, the largest atlas
+        coverage among the quads covering it, blended over the target."""
+        def signed(value):
+            return value - (1 << 32) if value >= 1 << 31 else value
+        (width, height, offset, origin_x, origin_y, box_left, box_top, box_width, box_height,
+         count, atlas_width, color, run_offset) = push
+        origin_x, origin_y, box_left, box_top = map(signed, (origin_x, origin_y, box_left, box_top))
+        assert groups_x * 8 >= box_width and groups_y * 8 >= box_height, "text dispatch does not cover the run"
+        atlas_handle, runs_handle, target_handle = bindings[0], bindings[1], bindings[2]
+        atlas_size, atlas_address = self.buffers[atlas_handle]
+        atlas = self.lib.read(atlas_address, atlas_size)
+        words = struct.unpack(f"<{count * 4}I", self.lib.read(self.buffers[runs_handle][1] + run_offset * 4, count * 16))
+        coverage = {}
+        for index in range(count):
+            w0, w1, qx, qy = words[4 * index:4 * index + 4]
+            ax, ay, qw, qh = w0 & 65535, w0 >> 16, w1 & 65535, w1 >> 16
+            qx, qy = signed(qx), signed(qy)
+            for ly in range(qh):
+                for lx in range(qw):
+                    x, y = qx + lx, qy + ly
+                    if box_left <= x < box_left + box_width and box_top <= y < box_top + box_height:
+                        value = atlas[(ay + ly) * atlas_width + ax + lx]
+                        if value > coverage.get((x, y), 0):
+                            coverage[(x, y)] = value
+        target = self.buffers[target_handle][1]
+        for (x, y), value in coverage.items():
+            tx, ty = origin_x + x, origin_y + y
+            if value == 0 or not (0 <= tx < width and 0 <= ty < height):
+                continue
+            at = target + (offset + ty * width + tx) * 4
+            under = struct.unpack("<I", self.lib.read(at, 4))[0]
+            alpha = (value * (color >> 24) + 127) // 255
+            result = 0xFF000000
+            for shift in (0, 8, 16):
+                mixed = (((color >> shift) & 255) * alpha + ((under >> shift) & 255) * (255 - alpha) + 127) // 255
+                result |= mixed << shift
+            self.lib.write(at, struct.pack("<I", result))
+        self.text_draws += 1
 
     # ── WSI ──
     def vk_CreateAndroidSurfaceKHR(self, process, instance, info, allocator, surface, *_):
@@ -413,10 +470,22 @@ class MockVulkan:
 class App(Framework):
     """The framework model with a periodic timerfd and the mock driver."""
 
-    def __init__(self, library_path, available=True, verbose=False):
+    def __init__(self, library_path, available=True, verbose=False, font=FONT):
         super().__init__(library_path, verbose=verbose)
         self.timer_interval = 0
         self.vulkan = MockVulkan(self, available)
+        # /system/fonts/* is the test font (or missing, with font=None).
+        lib = self.lib
+        original = lib.sys_56
+
+        def openat(dirfd, path, flags, mode, *rest):
+            name = lib.cstring(path)
+            if name.startswith("/system/fonts/"):
+                if font is None:
+                    return -2  # ENOENT
+                return os.open(font, os.O_RDONLY)
+            return original(dirfd, path, flags, mode, *rest)
+        lib.sys_56 = openat
 
     def _set_timer(self, process, fd, flags, new, old, *_):
         interval = struct.unpack("<qq", process.read(new, 16))
@@ -441,11 +510,15 @@ class App(Framework):
         return [text for tag, text in self.logs if tag == "mlx"]
 
 
-def check_frame(frame, time, pointer=None, pressed=False):
+def check_frame(frame, time, pointer=None, pressed=False, label=True):
     (width, height), pixels = frame
     flags = 4 | (1 if pointer else 0) | (2 if pressed else 0)
     px, py = pointer or (0, 0)
-    for y in range(height):
+    if label:
+        # The label: white text over its shadow in the top-left corner.
+        white = sum(1 for y in range(LABEL_ROWS) for x in range(width) if pixels[y * width + x] == 0xFFFFFFFF)
+        assert white >= 3, f"frame at time {time}: no label ({white} white pixels)"
+    for y in range(LABEL_ROWS if label else 0, height):
         for x in range(width):
             expected = pattern(x, y, width, time, px, py, flags)
             if pixels[y * width + x] != expected:
@@ -474,6 +547,7 @@ def scenario_render(library, spirv_val):
     app.show_window()
     app.attach_input()
     assert "vulkan: swapchain created" in app.messages()
+    assert "text: font loaded" in app.messages() and vulkan.text_draws == 2, (app.messages(), vulkan.text_draws)
     logged = len(app.messages())
     assert len(vulkan.frames) == 1, "no frame on window creation"
     check_frame(vulkan.frames[0], 0)
@@ -523,6 +597,19 @@ def scenario_render(library, spirv_val):
     return len(vulkan.frames)
 
 
+def scenario_no_font(library):
+    app = App(library, font=None)
+    app.create()
+    app.show_window()
+    app.advance(40 * MS)
+    assert "text: no system font (no label)" in app.messages(), app.messages()
+    assert len(app.vulkan.frames) == 3 and app.vulkan.text_draws == 0
+    for index, frame in enumerate(app.vulkan.frames):
+        check_frame(frame, index * 2, label=False)
+    app.callback("onNativeWindowDestroyed", WINDOW)
+    app.callback("onDestroy")
+
+
 def scenario_no_vulkan(library):
     app = App(library, available=False)
     app.create()
@@ -557,6 +644,8 @@ def main():
         frames = scenario_render(path, spirv_val)
         print(f"ok   render: {frames} frames checked pixel by pixel (touch, out-of-date, resize, background)"
               + ("" if spirv_val else " [spirv-val not installed]"))
+        scenario_no_font(path)
+        print("ok   no system font: frames without a label")
         scenario_no_vulkan(path)
         print("ok   no libvulkan.so: logged, input and window callbacks still work")
     return 0

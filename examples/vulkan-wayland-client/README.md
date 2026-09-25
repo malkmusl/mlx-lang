@@ -19,8 +19,13 @@ Frames go to the compositor the cheapest way both sides support
 | `shm-direct` | The GPU renders straight into the `wl_shm` pool, imported with `VK_EXT_external_memory_host`. Zero-copy with CPU drivers such as lavapipe. |
 | `shm-copy` | The GPU renders into its own memory and the frame is copied into the pool. |
 
+A label in the bottom-left corner (mode and frame count) is laid out with
+[`std.truetype`](../../docs/reference/truetype.md) and drawn into the frame
+by the `text` compute shader.
+
 Options: `--mode auto|dmabuf|shm-direct|shm-copy`, `--size WxH` (default
-480x320), `--frames N` (exit after N frames), `--verbose`, and, for tests,
+480x320), `--frames N` (exit after N frames), `--font PATH|none` (the
+label's font, default DejaVu Sans), `--verbose`, and, for tests,
 `--test-memfd-dmabuf`: where no dma-buf exporter exists (lavapipe), offer
 the shared memory through linux-dmabuf to exercise a compositor's import
 path.

@@ -1,0 +1,1194 @@
+// std.truetype: TrueType fonts in Mlx, without a C library.
+//
+//     const tt = @import("std.truetype")
+//
+//     var font: tt.Font = undefined
+//     if tt.loadFile(&font, path, allocator) != tt.Status.ok { ... }
+//     var atlas: tt.Atlas = undefined
+//     if !tt.initAtlas(&atlas, &font, 20, 512, 512, allocator) { ... }
+//     var run: tt.Run = undefined
+//     if !tt.initRun(&run, 128, allocator) { ... }
+//     tt.layout(&atlas, "Hello, Mlx", &run)
+//     tt.drawRun(&atlas, &run, pixels, width, height, width, x, baseline, 0xFFFFFFFF, 0)
+//
+// The parser reads the tables it needs with bounds checks, so a truncated
+// or hostile file yields missing glyphs, never out-of-range reads: the
+// offset table (and the first font of a .ttc collection), head, maxp, hhea,
+// hmtx, cmap (formats 0, 4, 6 and 12; Unicode subtables preferred), loca
+// (short and long), glyf (simple glyphs, and compound glyphs with offsets,
+// scales and 2x2 transforms) and the legacy kern table (format 0). Hinting
+// instructions are not run. CFF-flavoured OpenType ('OTTO') is reported as
+// Status.notTrueType.
+//
+// Glyphs are rasterized with exact-area anti-aliasing: the outline is
+// flattened (quadratic curves adaptively) and every line adds its signed
+// area and cover to an accumulation buffer whose running sum is the
+// coverage of each pixel (the non-zero winding rule, as TrueType outlines
+// need). Rasterized glyphs are packed into an atlas of 8-bit coverage.
+//
+// layout() turns UTF-8 text into a Run: one Quad per visible glyph (its
+// atlas rectangle and its position relative to the pen origin on the
+// baseline) plus the run's bounding box. drawRun() blends a run into a
+// 0xAARRGGBB pixel buffer; the Vulkan examples' `text` compute shader
+// (examples/vulkan-shared/shaders.mlx) blends the same run on the GPU with
+// the same integer arithmetic, so both produce identical pixels.
+
+const allocator_module = @import("../bootstrap/allocator.mlx")
+const fs = @import("../bootstrap/fs.mlx")
+
+pub const Allocator = allocator_module.Allocator
+
+pub const Status = enum(u8) {
+    ok,
+    unreadable,
+    truncated,
+    notTrueType,
+    missingTable,
+    noUnicodeMap,
+    outOfMemory,
+}
+
+pub fn statusMessage(status: Status) -> []const u8 {
+    return match status {
+        Status.ok => "ok",
+        Status.unreadable => "the font file cannot be read",
+        Status.truncated => "the font file is truncated",
+        Status.notTrueType => "not a TrueType font (glyf outlines)",
+        Status.missingTable => "a required table (head, maxp, hhea, hmtx, cmap, loca, glyf) is missing",
+        Status.noUnicodeMap => "the font has no Unicode character map",
+        else => "out of memory",
+    }
+}
+
+pub const Font = struct {
+    data: [*]const u8
+    size: usize
+    // Owned by the font when it was loaded from a file (loadFile).
+    owned: bool
+    ownedCapacity: usize
+    allocator: Allocator
+    unitsPerEm: u32
+    numGlyphs: u32
+    longLoca: bool
+    // Absolute offsets of the tables the renderer uses.
+    loca: usize
+    glyf: usize
+    glyfSize: usize
+    hmtx: usize
+    numberOfHMetrics: u32
+    // Vertical metrics in font units (hhea): descender is negative.
+    ascender: i32
+    descender: i32
+    lineGap: i32
+    // The chosen character map subtable (absolute offset) and its format.
+    cmap: usize
+    cmapFormat: u32
+    // The legacy kern table's format 0 pairs (absolute offset; 0: none).
+    kernPairs: usize
+    kernCount: u32
+}
+
+// ---------------------------------------------------------------------------
+// Big-endian reads (out of range: 0)
+
+fn byteAt(font: *const Font, at: usize) -> u32 {
+    if at >= font.*.size { return 0 }
+    return @intCast(u32, font.*.data[at])
+}
+
+fn u16At(font: *const Font, at: usize) -> u32 {
+    if at + 2 > font.*.size { return 0 }
+    return (@intCast(u32, font.*.data[at]) << 8) | @intCast(u32, font.*.data[at + 1])
+}
+
+fn i16At(font: *const Font, at: usize) -> i32 {
+    const value = u16At(font, at)
+    if value >= 32768 { return @intCast(i32, value) - 65536 }
+    return @intCast(i32, value)
+}
+
+fn u32At(font: *const Font, at: usize) -> u32 {
+    if at + 4 > font.*.size { return 0 }
+    return (@intCast(u32, font.*.data[at]) << 24) | (@intCast(u32, font.*.data[at + 1]) << 16) | (@intCast(u32, font.*.data[at + 2]) << 8) | @intCast(u32, font.*.data[at + 3])
+}
+
+fn tag(text: []const u8) -> u32 {
+    var value: u32 = 0
+    for byte in text { value = (value << 8) | @intCast(u32, byte) }
+    return value
+}
+
+// ---------------------------------------------------------------------------
+// Opening a font
+
+// A table's absolute offset, or 0 when absent or out of range.
+fn findTable(font: *const Font, directory: usize, wanted: u32, length: *usize) -> usize {
+    const count = @intCast(usize, u16At(font, directory + 4))
+    var index: usize = 0
+    while index < count {
+        const record = directory + 12 + index * 16
+        if u32At(font, record) == wanted {
+            const offset = @intCast(usize, u32At(font, record + 8))
+            const size = @intCast(usize, u32At(font, record + 12))
+            if offset == 0 || offset + size > font.*.size { return 0 }
+            length.* = size
+            return offset
+        }
+        index += 1
+    }
+    return 0
+}
+
+// Ranks a cmap subtable: full Unicode (format 12) first, then the BMP.
+fn cmapRank(platform: u32, encoding: u32, format: u32) -> u32 {
+    const unicode = platform == 0 || (platform == 3 && (encoding == 1 || encoding == 10))
+    if !unicode { return 0 }
+    if format == 12 { return 4 }
+    if format == 4 { return 3 }
+    if format == 6 || format == 0 { return 1 }
+    return 0
+}
+
+// Reads `data[0 .. size]` (which must outlive the font).
+pub fn init(font: *Font, data: [*]const u8, size: usize) -> Status {
+    font.*.data = data
+    font.*.size = size
+    font.*.owned = false
+    font.*.ownedCapacity = 0
+    font.*.kernPairs = 0
+    font.*.kernCount = 0
+    if size < 12 { return Status.truncated }
+    var directory: usize = 0
+    var scaler = u32At(font, 0)
+    if scaler == tag("ttcf") {
+        // A collection: its first font.
+        directory = @intCast(usize, u32At(font, 12))
+        scaler = u32At(font, directory)
+    }
+    if scaler == tag("OTTO") { return Status.notTrueType }
+    if scaler != 65536 && scaler != tag("true") { return Status.notTrueType }
+
+    var length: usize = 0
+    const head = findTable(font, directory, tag("head"), &length)
+    if head == 0 || length < 54 { return Status.missingTable }
+    const maxp = findTable(font, directory, tag("maxp"), &length)
+    if maxp == 0 || length < 6 { return Status.missingTable }
+    const hhea = findTable(font, directory, tag("hhea"), &length)
+    if hhea == 0 || length < 36 { return Status.missingTable }
+    font.*.hmtx = findTable(font, directory, tag("hmtx"), &length)
+    if font.*.hmtx == 0 { return Status.missingTable }
+    font.*.loca = findTable(font, directory, tag("loca"), &length)
+    if font.*.loca == 0 { return Status.missingTable }
+    font.*.glyf = findTable(font, directory, tag("glyf"), &length)
+    if font.*.glyf == 0 { return Status.notTrueType }
+    font.*.glyfSize = length
+    const cmap = findTable(font, directory, tag("cmap"), &length)
+    if cmap == 0 { return Status.missingTable }
+
+    font.*.unitsPerEm = u16At(font, head + 18)
+    if font.*.unitsPerEm == 0 { return Status.truncated }
+    font.*.longLoca = i16At(font, head + 50) == 1
+    font.*.numGlyphs = u16At(font, maxp + 4)
+    font.*.ascender = i16At(font, hhea + 4)
+    font.*.descender = i16At(font, hhea + 6)
+    font.*.lineGap = i16At(font, hhea + 8)
+    font.*.numberOfHMetrics = u16At(font, hhea + 34)
+    if font.*.numberOfHMetrics == 0 { return Status.truncated }
+
+    // The best Unicode subtable.
+    var best: u32 = 0
+    var index: usize = 0
+    const count = @intCast(usize, u16At(font, cmap + 2))
+    while index < count {
+        const record = cmap + 4 + index * 8
+        const offset = @intCast(usize, u32At(font, record + 4))
+        const subtable = cmap + offset
+        const rank = cmapRank(u16At(font, record), u16At(font, record + 2), u16At(font, subtable))
+        if rank > best && subtable < font.*.size {
+            best = rank
+            font.*.cmap = subtable
+            font.*.cmapFormat = u16At(font, subtable)
+        }
+        index += 1
+    }
+    if best == 0 { return Status.noUnicodeMap }
+
+    // Kerning: the first horizontal format 0 subtable of the legacy table.
+    const kern = findTable(font, directory, tag("kern"), &length)
+    if kern != 0 && u16At(font, kern) == 0 && u16At(font, kern + 2) > 0 {
+        const coverage = u16At(font, kern + 8)
+        // Format 0 (high byte), horizontal, not minimum or cross-stream.
+        if coverage >> 8 == 0 && coverage & 7 == 1 {
+            font.*.kernCount = u16At(font, kern + 10)
+            font.*.kernPairs = kern + 18
+        }
+    }
+    return Status.ok
+}
+
+// Reads the font at `path`; the font owns the file's contents (close()).
+pub fn loadFile(font: *Font, path: [*]const u8, allocator: Allocator) -> Status {
+    font.*.owned = false
+    const file = fs.open(path, fs.READ_ONLY, 0)
+    if !fs.isValid(file) { return Status.unreadable }
+    const contents = fs.readToEndAlloc(file, allocator)
+    const closed = fs.close(file)
+    if contents.length == 0 {
+        fs.ArrayList.deinit(contents)
+        return Status.unreadable
+    }
+    var data: [*]const u8 = undefined
+    unsafe { data = @ptrCast([*]const u8, contents.items) }
+    const status = init(font, data, contents.length)
+    font.*.owned = true
+    font.*.ownedCapacity = contents.capacity
+    font.*.allocator = allocator
+    if status != Status.ok { close(font) }
+    return status
+}
+
+pub fn close(font: *Font) -> void {
+    if font.*.owned {
+        unsafe { font.*.allocator.free(@ptrCast([*]u8, font.*.data), font.*.ownedCapacity, 1) }
+        font.*.owned = false
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Characters, metrics and kerning
+
+// The glyph for a Unicode code point; 0 (.notdef) when the font has none.
+pub fn glyphIndex(font: *const Font, codepoint: u32) -> u32 {
+    const table = font.*.cmap
+    var glyph: u32 = 0
+    if font.*.cmapFormat == 4 {
+        if codepoint > 65535 { return 0 }
+        const segments = @intCast(usize, u16At(font, table + 6) / 2)
+        const ends = table + 14
+        const starts = ends + segments * 2 + 2
+        const deltas = starts + segments * 2
+        const ranges = deltas + segments * 2
+        // Binary search for the first segment whose end is >= codepoint.
+        var low: usize = 0
+        var high: usize = segments
+        while low < high {
+            const middle = (low + high) / 2
+            if u16At(font, ends + middle * 2) < codepoint { low = middle + 1 } else { high = middle }
+        }
+        if low >= segments { return 0 }
+        const start = u16At(font, starts + low * 2)
+        if codepoint < start { return 0 }
+        const delta = u16At(font, deltas + low * 2)
+        const range_at = ranges + low * 2
+        const range_offset = u16At(font, range_at)
+        if range_offset == 0 {
+            glyph = (codepoint + delta) & 65535
+        } else {
+            const raw = u16At(font, range_at + @intCast(usize, range_offset) + @intCast(usize, codepoint - start) * 2)
+            if raw == 0 { return 0 }
+            glyph = (raw + delta) & 65535
+        }
+    } else if font.*.cmapFormat == 12 {
+        const groups = @intCast(usize, u32At(font, table + 12))
+        var low: usize = 0
+        var high: usize = groups
+        while low < high {
+            const middle = (low + high) / 2
+            const group = table + 16 + middle * 12
+            if u32At(font, group + 4) < codepoint {
+                low = middle + 1
+            } else {
+                high = middle
+            }
+        }
+        if low >= groups { return 0 }
+        const group = table + 16 + low * 12
+        const first = u32At(font, group)
+        if codepoint < first { return 0 }
+        glyph = u32At(font, group + 8) +% (codepoint - first)
+    } else if font.*.cmapFormat == 6 {
+        const first = u16At(font, table + 6)
+        const count = u16At(font, table + 8)
+        if codepoint < first || codepoint >= first + count { return 0 }
+        glyph = u16At(font, table + 10 + @intCast(usize, codepoint - first) * 2)
+    } else if font.*.cmapFormat == 0 {
+        if codepoint > 255 { return 0 }
+        glyph = byteAt(font, table + 6 + @intCast(usize, codepoint))
+    }
+    if glyph >= font.*.numGlyphs { return 0 }
+    return glyph
+}
+
+// Horizontal advance in font units.
+pub fn advanceWidth(font: *const Font, glyph: u32) -> i32 {
+    const metrics = font.*.numberOfHMetrics
+    const index = if glyph < metrics { glyph } else { metrics - 1 }
+    return @intCast(i32, u16At(font, font.*.hmtx + @intCast(usize, index) * 4))
+}
+
+// Kerning between two glyphs in font units (legacy kern table).
+pub fn kerning(font: *const Font, left: u32, right: u32) -> i32 {
+    if font.*.kernCount == 0 { return 0 }
+    const wanted = (left << 16) | right
+    var low: usize = 0
+    var high: usize = @intCast(usize, font.*.kernCount)
+    while low < high {
+        const middle = (low + high) / 2
+        const pair = font.*.kernPairs + middle * 6
+        const key = u32At(font, pair)
+        if key == wanted { return i16At(font, pair + 4) }
+        if key < wanted { low = middle + 1 } else { high = middle }
+    }
+    return 0
+}
+
+// The byte range of a glyph's outline; false for empty glyphs (space).
+fn glyphRange(font: *const Font, glyph: u32, start: *usize, end: *usize) -> bool {
+    if glyph >= font.*.numGlyphs { return false }
+    const index = @intCast(usize, glyph)
+    var first: usize = 0
+    var last: usize = 0
+    if font.*.longLoca {
+        first = @intCast(usize, u32At(font, font.*.loca + index * 4))
+        last = @intCast(usize, u32At(font, font.*.loca + index * 4 + 4))
+    } else {
+        first = @intCast(usize, u16At(font, font.*.loca + index * 2)) * 2
+        last = @intCast(usize, u16At(font, font.*.loca + index * 2 + 2)) * 2
+    }
+    if last <= first || last > font.*.glyfSize || last - first < 10 { return false }
+    start.* = font.*.glyf + first
+    end.* = font.*.glyf + last
+    return true
+}
+
+// ---------------------------------------------------------------------------
+// Float helpers (the bootstrap compiler has no floor/sqrt builtins)
+
+fn floor(value: f64) -> f64 {
+    const whole: i64 = @intFromFloat(i64, value)
+    const truncated: f64 = @floatFromInt(f64, whole)
+    if truncated > value { return truncated - 1.0 }
+    return truncated
+}
+
+fn ceil(value: f64) -> f64 {
+    const down = floor(value)
+    if down < value { return down + 1.0 }
+    return down
+}
+
+fn toInt(value: f64) -> i64 {
+    const result: i64 = @intFromFloat(i64, value)
+    return result
+}
+
+fn toFloat(value: i64) -> f64 {
+    const result: f64 = @floatFromInt(f64, value)
+    return result
+}
+
+fn sqrt(value: f64) -> f64 {
+    if value <= 0.0 { return 0.0 }
+    var guess = if value > 1.0 { value } else { 1.0 }
+    var step: usize = 0
+    while step < 40 {
+        guess = 0.5 * (guess + value / guess)
+        step += 1
+    }
+    return guess
+}
+
+fn minimum(a: f64, b: f64) -> f64 { return if a < b { a } else { b } }
+fn maximum(a: f64, b: f64) -> f64 { return if a > b { a } else { b } }
+fn absolute(a: f64) -> f64 { return if a < 0.0 { -a } else { a } }
+
+// ---------------------------------------------------------------------------
+// Rasterization
+
+// x' = xx * x + xy * y + dx, y' = yx * x + yy * y + dy
+pub const Transform = struct {
+    xx: f64
+    xy: f64
+    yx: f64
+    yy: f64
+    dx: f64
+    dy: f64
+}
+
+// `outer` applied after `inner`.
+fn compose(outer: Transform, inner: Transform) -> Transform {
+    return Transform.{
+        .xx = outer.xx * inner.xx + outer.xy * inner.yx,
+        .xy = outer.xx * inner.xy + outer.xy * inner.yy,
+        .yx = outer.yx * inner.xx + outer.yy * inner.yx,
+        .yy = outer.yx * inner.xy + outer.yy * inner.yy,
+        .dx = outer.xx * inner.dx + outer.xy * inner.dy + outer.dx,
+        .dy = outer.yx * inner.dx + outer.yy * inner.dy + outer.dy,
+    }
+}
+
+const Raster = struct {
+    accumulation: [*]f64
+    width: usize
+    height: usize
+    // The current point and the start of the contour (pixels).
+    x: f64
+    y: f64
+    allocator: Allocator
+}
+
+// Adds one line's signed area and cover (after font-rs, Raph Levien).
+fn rasterLine(raster: *Raster, ax: f64, ay: f64, bx: f64, by: f64) -> void {
+    if ay == by { return }
+    var direction: f64 = 1.0
+    var x0 = ax
+    var y0 = ay
+    var x1 = bx
+    var y1 = by
+    if ay > by {
+        direction = -1.0
+        x0 = bx
+        y0 = by
+        x1 = ax
+        y1 = ay
+    }
+    const width = raster.*.width
+    const height_f = toFloat(@intCast(i64, raster.*.height))
+    const width_f = toFloat(@intCast(i64, width))
+    const dxdy = (x1 - x0) / (y1 - y0)
+    var x = x0
+    var row_start = floor(y0)
+    if y0 < 0.0 {
+        x -= y0 * dxdy
+        row_start = 0.0
+    }
+    const row_end = minimum(height_f, ceil(y1))
+    var row = row_start
+    const buffer = raster.*.accumulation
+    while row < row_end {
+        const line_start = @intCast(usize, toInt(row)) * width
+        const dy = minimum(row + 1.0, y1) - maximum(row, y0)
+        const x_next = x + dxdy * dy
+        const d = dy * direction
+        var left = x
+        var right = x_next
+        if x_next < x {
+            left = x_next
+            right = x
+        }
+        // Keep inside the row (the bitmap has a spare column).
+        left = maximum(0.0, minimum(left, width_f - 1.0))
+        right = maximum(0.0, minimum(right, width_f - 1.0))
+        const left_floor = floor(left)
+        const left_index = @intCast(usize, toInt(left_floor))
+        const right_ceil = ceil(right)
+        const right_index = @intCast(usize, toInt(right_ceil))
+        if right_index <= left_index + 1 {
+            const middle = 0.5 * (x + x_next) - left_floor
+            const clamped = maximum(0.0, minimum(middle, 1.0))
+            buffer[line_start + left_index] += d - d * clamped
+            buffer[line_start + left_index + 1] += d * clamped
+        } else {
+            const s = 1.0 / (right - left)
+            const left_fraction = left - left_floor
+            const a0 = 0.5 * s * (1.0 - left_fraction) * (1.0 - left_fraction)
+            const right_fraction = right - right_ceil + 1.0
+            const am = 0.5 * s * right_fraction * right_fraction
+            buffer[line_start + left_index] += d * a0
+            if right_index == left_index + 2 {
+                buffer[line_start + left_index + 1] += d * (1.0 - a0 - am)
+            } else {
+                const a1 = s * (1.5 - left_fraction)
+                buffer[line_start + left_index + 1] += d * (a1 - a0)
+                var column = left_index + 2
+                while column < right_index - 1 {
+                    buffer[line_start + column] += d * s
+                    column += 1
+                }
+                const middle_count = toFloat(@intCast(i64, right_index - left_index - 3))
+                const a2 = a1 + middle_count * s
+                buffer[line_start + right_index - 1] += d * (1.0 - a2 - am)
+            }
+            buffer[line_start + right_index] += d * am
+        }
+        x = x_next
+        row += 1.0
+    }
+}
+
+fn lineTo(raster: *Raster, x: f64, y: f64) -> void {
+    rasterLine(raster, raster.*.x, raster.*.y, x, y)
+    raster.*.x = x
+    raster.*.y = y
+}
+
+// A quadratic curve, flattened into segments (fewer when it is flat).
+fn quadTo(raster: *Raster, cx: f64, cy: f64, x: f64, y: f64) -> void {
+    const x0 = raster.*.x
+    const y0 = raster.*.y
+    const deviation_x = x0 - 2.0 * cx + x
+    const deviation_y = y0 - 2.0 * cy + y
+    const deviation = deviation_x * deviation_x + deviation_y * deviation_y
+    if deviation < 0.0001 {
+        lineTo(raster, x, y)
+        return
+    }
+    const count = 1 + toInt(floor(sqrt(sqrt(768.0 * deviation))))
+    const count_f = toFloat(count)
+    var step: i64 = 1
+    while step < count {
+        const t = toFloat(step) / count_f
+        const u = 1.0 - t
+        const px = u * u * x0 + 2.0 * u * t * cx + t * t * x
+        const py = u * u * y0 + 2.0 * u * t * cy + t * t * y
+        lineTo(raster, px, py)
+        step += 1
+    }
+    lineTo(raster, x, y)
+}
+
+fn applyX(transform: Transform, x: f64, y: f64) -> f64 { return transform.xx * x + transform.xy * y + transform.dx }
+fn applyY(transform: Transform, x: f64, y: f64) -> f64 { return transform.yx * x + transform.yy * y + transform.dy }
+
+// Decodes a simple glyph's points and draws its contours.
+fn drawSimple(font: *const Font, raster: *Raster, start: usize, end: usize, contours: usize, transform: Transform) -> bool {
+    const end_points = start + 10
+    const point_count = @intCast(usize, u16At(font, end_points + (contours - 1) * 2)) + 1
+    const instructions = @intCast(usize, u16At(font, end_points + contours * 2))
+    var at = end_points + contours * 2 + 2 + instructions
+    if at > end { return false }
+    const allocator = raster.*.allocator
+    const flags_memory = allocator.alloc(point_count, 8)
+    const x_memory = allocator.alloc(point_count * 8, 8)
+    const y_memory = allocator.alloc(point_count * 8, 8)
+    if flags_memory == null || x_memory == null || y_memory == null { return false }
+    const flags = flags_memory.?
+    var xs: [*]f64 = undefined
+    var ys: [*]f64 = undefined
+    unsafe {
+        xs = @ptrCast([*]f64, x_memory.?)
+        ys = @ptrCast([*]f64, y_memory.?)
+    }
+    // Flags, with repeats.
+    var index: usize = 0
+    while index < point_count && at < end {
+        const flag = byteAt(font, at)
+        at += 1
+        flags[index] = @intCast(u8, flag)
+        index += 1
+        if flag & 8 != 0 {
+            var repeat = byteAt(font, at)
+            at += 1
+            while repeat > 0 && index < point_count {
+                flags[index] = @intCast(u8, flag)
+                index += 1
+                repeat -= 1
+            }
+        }
+    }
+    while index < point_count {
+        flags[index] = 0
+        index += 1
+    }
+    // X then Y coordinates, as deltas.
+    var value: i64 = 0
+    index = 0
+    while index < point_count {
+        const flag = @intCast(u32, flags[index])
+        if flag & 2 != 0 {
+            const delta = @intCast(i64, byteAt(font, at))
+            at += 1
+            value = if flag & 16 != 0 { value + delta } else { value - delta }
+        } else if flag & 16 == 0 {
+            value = value + @intCast(i64, i16At(font, at))
+            at += 2
+        }
+        xs[index] = toFloat(value)
+        index += 1
+    }
+    value = 0
+    index = 0
+    while index < point_count {
+        const flag = @intCast(u32, flags[index])
+        if flag & 4 != 0 {
+            const delta = @intCast(i64, byteAt(font, at))
+            at += 1
+            value = if flag & 32 != 0 { value + delta } else { value - delta }
+        } else if flag & 32 == 0 {
+            value = value + @intCast(i64, i16At(font, at))
+            at += 2
+        }
+        ys[index] = toFloat(value)
+        index += 1
+    }
+    // Into pixel space.
+    index = 0
+    while index < point_count {
+        const x = xs[index]
+        const y = ys[index]
+        xs[index] = applyX(transform, x, y)
+        ys[index] = applyY(transform, x, y)
+        index += 1
+    }
+    // Contours: on-curve points end lines and curves; two off-curve points
+    // in a row imply the on-curve point between them.
+    var first: usize = 0
+    var contour: usize = 0
+    while contour < contours {
+        var last = @intCast(usize, u16At(font, end_points + contour * 2))
+        if last >= point_count { last = point_count - 1 }
+        if last > first {
+            drawContour(raster, flags, xs, ys, first, last)
+        }
+        first = last + 1
+        contour += 1
+    }
+    allocator.free(flags_memory.?, point_count, 8)
+    allocator.free(x_memory.?, point_count * 8, 8)
+    allocator.free(y_memory.?, point_count * 8, 8)
+    return true
+}
+
+fn drawContour(raster: *Raster, flags: [*]u8, xs: [*]f64, ys: [*]f64, first: usize, last: usize) -> void {
+    const first_on = flags[first] & 1 != 0
+    const last_on = flags[last] & 1 != 0
+    var start_x = xs[first]
+    var start_y = ys[first]
+    var index = first + 1
+    var count = last - first
+    if !first_on {
+        if last_on {
+            start_x = xs[last]
+            start_y = ys[last]
+            index = first
+            count = last - first
+        } else {
+            start_x = 0.5 * (xs[first] + xs[last])
+            start_y = 0.5 * (ys[first] + ys[last])
+            index = first
+            count = last - first + 1
+        }
+    }
+    raster.*.x = start_x
+    raster.*.y = start_y
+    var control = false
+    var cx: f64 = 0.0
+    var cy: f64 = 0.0
+    var step: usize = 0
+    while step < count {
+        const x = xs[index]
+        const y = ys[index]
+        if flags[index] & 1 != 0 {
+            if control { quadTo(raster, cx, cy, x, y) } else { lineTo(raster, x, y) }
+            control = false
+        } else {
+            if control {
+                const mx = 0.5 * (cx + x)
+                const my = 0.5 * (cy + y)
+                quadTo(raster, cx, cy, mx, my)
+            }
+            cx = x
+            cy = y
+            control = true
+        }
+        index += 1
+        step += 1
+    }
+    if control { quadTo(raster, cx, cy, start_x, start_y) } else { lineTo(raster, start_x, start_y) }
+}
+
+fn f2dot14(font: *const Font, at: usize) -> f64 {
+    const raw: i64 = @intCast(i64, i16At(font, at))
+    return toFloat(raw) / 16384.0
+}
+
+// Draws a glyph (simple or compound) through `transform`.
+fn drawGlyph(font: *const Font, raster: *Raster, glyph: u32, transform: Transform, depth: usize) -> bool {
+    var start: usize = 0
+    var end: usize = 0
+    if !glyphRange(font, glyph, &start, &end) { return true }
+    const contours = i16At(font, start)
+    if contours > 0 { return drawSimple(font, raster, start, end, @intCast(usize, contours), transform) }
+    if contours == 0 || depth > 8 { return true }
+    // Compound: components with their own offsets and transforms.
+    var at = start + 10
+    var more = true
+    while more && at + 4 <= end {
+        const flags = u16At(font, at)
+        const component = u16At(font, at + 2)
+        at += 4
+        var dx: i32 = 0
+        var dy: i32 = 0
+        if flags & 1 != 0 {
+            dx = i16At(font, at)
+            dy = i16At(font, at + 2)
+            at += 4
+        } else {
+            const raw_x = byteAt(font, at)
+            const raw_y = byteAt(font, at + 1)
+            dx = if raw_x >= 128 { @intCast(i32, raw_x) - 256 } else { @intCast(i32, raw_x) }
+            dy = if raw_y >= 128 { @intCast(i32, raw_y) - 256 } else { @intCast(i32, raw_y) }
+            at += 2
+        }
+        var inner = Transform.{ .xx = 1.0, .xy = 0.0, .yx = 0.0, .yy = 1.0, .dx = 0.0, .dy = 0.0 }
+        if flags & 8 != 0 {
+            const scale = f2dot14(font, at)
+            inner.xx = scale
+            inner.yy = scale
+            at += 2
+        } else if flags & 64 != 0 {
+            inner.xx = f2dot14(font, at)
+            inner.yy = f2dot14(font, at + 2)
+            at += 4
+        } else if flags & 128 != 0 {
+            inner.xx = f2dot14(font, at)
+            inner.yx = f2dot14(font, at + 2)
+            inner.xy = f2dot14(font, at + 4)
+            inner.yy = f2dot14(font, at + 6)
+            at += 8
+        }
+        // Offsets are x/y values (bit 2); point matching (rare) is skipped.
+        if flags & 2 != 0 {
+            const offset_x: i64 = @intCast(i64, dx)
+            const offset_y: i64 = @intCast(i64, dy)
+            inner.dx = toFloat(offset_x)
+            inner.dy = toFloat(offset_y)
+            if !drawGlyph(font, raster, component, compose(transform, inner), depth + 1) { return false }
+        }
+        more = flags & 32 != 0
+    }
+    return true
+}
+
+// A glyph's coverage bitmap: `width` x `height` bytes (0 to 255), placed
+// `left` pixels right of the pen and `top` pixels below the baseline (top
+// is negative for glyphs that rise above it).
+pub const Bitmap = struct {
+    pixels: [*]u8
+    width: usize
+    height: usize
+    left: i32
+    top: i32
+}
+
+// The pixels per font unit for a line `pixel_height` pixels tall
+// (ascender to descender).
+pub fn scaleForPixelHeight(font: *const Font, pixel_height: u32) -> f64 {
+    const pixels: i64 = @intCast(i64, pixel_height)
+    const units: i64 = @intCast(i64, font.*.ascender - font.*.descender)
+    if units <= 0 { return 0.0 }
+    return toFloat(pixels) / toFloat(units)
+}
+
+// Rasterizes `glyph` at `scale`; the caller frees bitmap.pixels
+// (width * height bytes) with `allocator`. An empty glyph has width 0.
+pub fn rasterize(font: *const Font, glyph: u32, scale: f64, allocator: Allocator, bitmap: *Bitmap) -> bool {
+    bitmap.*.width = 0
+    bitmap.*.height = 0
+    bitmap.*.left = 0
+    bitmap.*.top = 0
+    var start: usize = 0
+    var end: usize = 0
+    if !glyphRange(font, glyph, &start, &end) { return true }
+    const x_min: i64 = @intCast(i64, i16At(font, start + 2))
+    const y_min: i64 = @intCast(i64, i16At(font, start + 4))
+    const x_max: i64 = @intCast(i64, i16At(font, start + 6))
+    const y_max: i64 = @intCast(i64, i16At(font, start + 8))
+    if x_max <= x_min || y_max <= y_min { return true }
+    const left = floor(toFloat(x_min) * scale)
+    const top = floor(-toFloat(y_max) * scale)
+    const right = ceil(toFloat(x_max) * scale)
+    const bottom = ceil(-toFloat(y_min) * scale)
+    // One spare column so every edge stays inside its row.
+    const width = @intCast(usize, toInt(right - left)) + 2
+    const height = @intCast(usize, toInt(bottom - top))
+    if height == 0 || width > 4096 || height > 4096 { return true }
+    const cells = width * height + 4
+    const accumulation_memory = allocator.alloc(cells * 8, 8)
+    if accumulation_memory == null { return false }
+    var accumulation: [*]f64 = undefined
+    unsafe { accumulation = @ptrCast([*]f64, accumulation_memory.?) }
+    var index: usize = 0
+    while index < cells {
+        accumulation[index] = 0.0
+        index += 1
+    }
+    var raster = Raster.{ .accumulation = accumulation, .width = width, .height = height, .x = 0.0, .y = 0.0, .allocator = allocator }
+    // Font units (y up) to bitmap pixels (y down).
+    const transform = Transform.{ .xx = scale, .xy = 0.0, .yx = 0.0, .yy = -scale, .dx = -left, .dy = -top }
+    const drawn = drawGlyph(font, &raster, glyph, transform, 0)
+    const pixels_memory = allocator.alloc(width * height, 8)
+    if !drawn || pixels_memory == null {
+        allocator.free(accumulation_memory.?, cells * 8, 8)
+        return false
+    }
+    const pixels = pixels_memory.?
+    var sum: f64 = 0.0
+    index = 0
+    while index < width * height {
+        sum += accumulation[index]
+        const coverage = minimum(absolute(sum), 1.0)
+        const value = toInt(coverage * 255.0 + 0.5)
+        pixels[index] = @intCast(u8, value)
+        index += 1
+    }
+    allocator.free(accumulation_memory.?, cells * 8, 8)
+    bitmap.*.pixels = pixels
+    bitmap.*.width = width
+    bitmap.*.height = height
+    const left_whole = toInt(left)
+    const top_whole = toInt(top)
+    bitmap.*.left = @intCast(i32, left_whole)
+    bitmap.*.top = @intCast(i32, top_whole)
+    return true
+}
+
+// ---------------------------------------------------------------------------
+// Atlas
+
+pub const AtlasGlyph = struct {
+    glyph: u32
+    used: bool
+    x: u32
+    y: u32
+    width: u32
+    height: u32
+    left: i32
+    top: i32
+}
+
+pub const ATLAS_SLOTS: usize = 1024
+
+// Rasterized glyphs of one font at one size, packed in rows into a
+// `width` x `height` coverage image. `revision` changes whenever a glyph is
+// added, so a GPU copy knows when to upload again.
+pub const Atlas = struct {
+    font: *const Font
+    scale: f64
+    pixelHeight: u32
+    // Line metrics in pixels: baseline to top, to bottom, and line to line.
+    ascent: i32
+    descent: i32
+    lineHeight: i32
+    width: u32
+    height: u32
+    pixels: [*]u8
+    cursorX: u32
+    cursorY: u32
+    rowHeight: u32
+    revision: u32
+    full: bool
+    slots: [*]AtlasGlyph
+    allocator: Allocator
+}
+
+fn roundToInt(value: f64) -> i32 {
+    const whole = toInt(floor(value + 0.5))
+    return @intCast(i32, whole)
+}
+
+// `width` must be a multiple of 4 (the GPU reads it as 32-bit words).
+pub fn initAtlas(atlas: *Atlas, font: *const Font, pixel_height: u32, width: u32, height: u32, allocator: Allocator) -> bool {
+    atlas.*.font = font
+    atlas.*.scale = scaleForPixelHeight(font, pixel_height)
+    atlas.*.pixelHeight = pixel_height
+    const ascender: i64 = @intCast(i64, font.*.ascender)
+    const descender: i64 = @intCast(i64, font.*.descender)
+    const gap: i64 = @intCast(i64, font.*.lineGap)
+    atlas.*.ascent = roundToInt(toFloat(ascender) * atlas.*.scale)
+    atlas.*.descent = roundToInt(-toFloat(descender) * atlas.*.scale)
+    atlas.*.lineHeight = roundToInt(toFloat(ascender - descender + gap) * atlas.*.scale)
+    atlas.*.width = (width + 3) / 4 * 4
+    atlas.*.height = height
+    atlas.*.cursorX = 1
+    atlas.*.cursorY = 1
+    atlas.*.rowHeight = 0
+    atlas.*.revision = 1
+    atlas.*.full = false
+    atlas.*.allocator = allocator
+    const size = @intCast(usize, atlas.*.width) * @intCast(usize, height)
+    const pixels = allocator.alloc(size, 16)
+    const slots = allocator.alloc(ATLAS_SLOTS * @sizeOf(AtlasGlyph), 16)
+    if pixels == null || slots == null { return false }
+    atlas.*.pixels = pixels.?
+    var index: usize = 0
+    while index < size {
+        atlas.*.pixels[index] = 0
+        index += 1
+    }
+    unsafe { atlas.*.slots = @ptrCast([*]AtlasGlyph, slots.?) }
+    index = 0
+    while index < ATLAS_SLOTS {
+        slotAt(atlas, index).*.used = false
+        index += 1
+    }
+    return true
+}
+
+pub fn deinitAtlas(atlas: *Atlas) -> void {
+    const size = @intCast(usize, atlas.*.width) * @intCast(usize, atlas.*.height)
+    atlas.*.allocator.free(atlas.*.pixels, size, 16)
+    unsafe { atlas.*.allocator.free(@ptrCast([*]u8, atlas.*.slots), ATLAS_SLOTS * @sizeOf(AtlasGlyph), 16) }
+}
+
+fn slotAt(atlas: *Atlas, index: usize) -> *AtlasGlyph {
+    unsafe { return @ptrFromInt(*AtlasGlyph, @intFromPtr(atlas.*.slots) + index * @sizeOf(AtlasGlyph)) }
+}
+
+// A glyph's place in the atlas, rasterizing and packing it on first use;
+// null when the atlas is full (or out of memory).
+pub fn atlasGlyph(atlas: *Atlas, glyph: u32) -> ?*AtlasGlyph {
+    var index = @intCast(usize, (glyph *% 2654435761) >> 22) % ATLAS_SLOTS
+    var probes: usize = 0
+    while probes < ATLAS_SLOTS {
+        const slot = slotAt(atlas, index)
+        if !slot.*.used { break }
+        if slot.*.glyph == glyph { return slot }
+        index = (index + 1) % ATLAS_SLOTS
+        probes += 1
+    }
+    if probes >= ATLAS_SLOTS || atlas.*.full { return null }
+    var bitmap: Bitmap = undefined
+    if !rasterize(atlas.*.font, glyph, atlas.*.scale, atlas.*.allocator, &bitmap) { return null }
+    const width = @intCast(u32, bitmap.width)
+    const height = @intCast(u32, bitmap.height)
+    // Shelf packing with a 1-pixel gap.
+    if atlas.*.cursorX + width + 1 > atlas.*.width {
+        atlas.*.cursorX = 1
+        atlas.*.cursorY += atlas.*.rowHeight + 1
+        atlas.*.rowHeight = 0
+    }
+    if atlas.*.cursorY + height + 1 > atlas.*.height || width + 2 > atlas.*.width {
+        atlas.*.full = true
+        if bitmap.width > 0 { atlas.*.allocator.free(bitmap.pixels, bitmap.width * bitmap.height, 8) }
+        return null
+    }
+    const slot = slotAt(atlas, index)
+    slot.*.glyph = glyph
+    slot.*.used = true
+    slot.*.x = atlas.*.cursorX
+    slot.*.y = atlas.*.cursorY
+    slot.*.width = width
+    slot.*.height = height
+    slot.*.left = bitmap.left
+    slot.*.top = bitmap.top
+    var row: usize = 0
+    while row < bitmap.height {
+        var column: usize = 0
+        const target = (@intCast(usize, slot.*.y) + row) * @intCast(usize, atlas.*.width) + @intCast(usize, slot.*.x)
+        while column < bitmap.width {
+            atlas.*.pixels[target + column] = bitmap.pixels[row * bitmap.width + column]
+            column += 1
+        }
+        row += 1
+    }
+    if bitmap.width > 0 { atlas.*.allocator.free(bitmap.pixels, bitmap.width * bitmap.height, 8) }
+    atlas.*.cursorX += width + 1
+    if height > atlas.*.rowHeight { atlas.*.rowHeight = height }
+    atlas.*.revision += 1
+    return slot
+}
+
+// ---------------------------------------------------------------------------
+// Layout
+
+// One glyph of a run: its atlas rectangle, and its top-left corner relative
+// to the run's origin (the pen start on the baseline).
+pub const Quad = struct {
+    atlasX: u32
+    atlasY: u32
+    width: u32
+    height: u32
+    x: i32
+    y: i32
+}
+
+// Laid-out text: quads, the bounding box of their pixels relative to the
+// origin (left/top inclusive, right/bottom exclusive) and the advance.
+pub const Run = struct {
+    quads: [*]Quad
+    count: usize
+    capacity: usize
+    left: i32
+    top: i32
+    right: i32
+    bottom: i32
+    advance: i32
+    allocator: Allocator
+}
+
+pub fn initRun(run: *Run, capacity: usize, allocator: Allocator) -> bool {
+    const memory = allocator.alloc(capacity * @sizeOf(Quad), 16)
+    if memory == null { return false }
+    unsafe { run.*.quads = @ptrCast([*]Quad, memory.?) }
+    run.*.capacity = capacity
+    run.*.count = 0
+    run.*.allocator = allocator
+    return true
+}
+
+pub fn deinitRun(run: *Run) -> void {
+    unsafe { run.*.allocator.free(@ptrCast([*]u8, run.*.quads), run.*.capacity * @sizeOf(Quad), 16) }
+}
+
+// Decodes the UTF-8 sequence at text[index]; returns the code point
+// (U+FFFD for malformed input) and stores the sequence length.
+pub fn decodeUtf8(text: [*]const u8, length: usize, index: usize, consumed: *usize) -> u32 {
+    const first = @intCast(u32, text[index])
+    consumed.* = 1
+    if first < 128 { return first }
+    var extra: usize = 0
+    var value: u32 = 0
+    if first & 224 == 192 {
+        extra = 1
+        value = first & 31
+    } else if first & 240 == 224 {
+        extra = 2
+        value = first & 15
+    } else if first & 248 == 240 {
+        extra = 3
+        value = first & 7
+    } else {
+        return 65533
+    }
+    if index + extra >= length { return 65533 }
+    var step: usize = 1
+    while step <= extra {
+        const next = @intCast(u32, text[index + step])
+        if next & 192 != 128 { return 65533 }
+        value = (value << 6) | (next & 63)
+        step += 1
+    }
+    consumed.* = extra + 1
+    return value
+}
+
+fn textLength(text: []const u8) -> usize {
+    var length: usize = 0
+    for byte in text { length += 1 }
+    return length
+}
+
+// Lays out `text` (UTF-8, one line) into `run`, replacing its contents.
+// Glyphs beyond the run's capacity, or that no longer fit in the atlas,
+// are skipped (their advance still counts).
+pub fn layout(atlas: *Atlas, text: []const u8, run: *Run) -> void {
+    var pointer: [*]const u8 = undefined
+    unsafe { pointer = @ptrCast([*]const u8, text) }
+    layoutBytes(atlas, pointer, textLength(text), run)
+}
+
+pub fn layoutBytes(atlas: *Atlas, text: [*]const u8, length: usize, run: *Run) -> void {
+    const font = atlas.*.font
+    run.*.count = 0
+    run.*.left = 0
+    run.*.top = 0
+    run.*.right = 0
+    run.*.bottom = 0
+    var first = true
+    var pen: f64 = 0.0
+    var previous: u32 = 0
+    var index: usize = 0
+    while index < length {
+        var consumed: usize = 1
+        const codepoint = decodeUtf8(text, length, index, &consumed)
+        index += consumed
+        const glyph = glyphIndex(font, codepoint)
+        if previous != 0 {
+            const kern: i64 = @intCast(i64, kerning(font, previous, glyph))
+            pen += toFloat(kern) * atlas.*.scale
+        }
+        const placed = atlasGlyph(atlas, glyph)
+        if placed != null && run.*.count < run.*.capacity {
+            const slot = placed.?
+            if slot.*.width > 0 {
+                const x = roundToInt(pen) + slot.*.left
+                const y = slot.*.top
+                run.*.quads[run.*.count] = Quad.{ .atlasX = slot.*.x, .atlasY = slot.*.y, .width = slot.*.width, .height = slot.*.height, .x = x, .y = y }
+                run.*.count += 1
+                const right = x + @intCast(i32, slot.*.width)
+                const bottom = y + @intCast(i32, slot.*.height)
+                if first || x < run.*.left { run.*.left = x }
+                if first || y < run.*.top { run.*.top = y }
+                if first || right > run.*.right { run.*.right = right }
+                if first || bottom > run.*.bottom { run.*.bottom = bottom }
+                first = false
+            }
+        }
+        const advance: i64 = @intCast(i64, advanceWidth(font, glyph))
+        pen += toFloat(advance) * atlas.*.scale
+        previous = glyph
+    }
+    run.*.advance = roundToInt(pen)
+}
+
+// The coverage (0-255) of the run's pixel (x, y) relative to its origin:
+// the largest over the glyphs covering it.
+pub fn runCoverage(atlas: *const Atlas, run: *const Run, x: i32, y: i32) -> u32 {
+    var coverage: u32 = 0
+    var index: usize = 0
+    while index < run.*.count {
+        const quad = run.*.quads[index]
+        const local_x = x - quad.x
+        const local_y = y - quad.y
+        if local_x >= 0 && local_y >= 0 && local_x < @intCast(i32, quad.width) && local_y < @intCast(i32, quad.height) {
+            const at = (@intCast(usize, quad.atlasY) + @intCast(usize, local_y)) * @intCast(usize, atlas.*.width) + @intCast(usize, quad.atlasX) + @intCast(usize, local_x)
+            const value = @intCast(u32, atlas.*.pixels[at])
+            if value > coverage { coverage = value }
+        }
+        index += 1
+    }
+    return coverage
+}
+
+// Blends `color` (0xAARRGGBB, straight alpha) at `coverage` over `under`
+// (an opaque 0xAARRGGBB pixel). The Vulkan `text` shader does exactly this.
+pub fn blendCoverage(under: u32, color: u32, coverage: u32) -> u32 {
+    const alpha = (coverage * (color >> 24) + 127) / 255
+    const inverse = 255 - alpha
+    var result: u32 = 4278190080
+    var shift: u32 = 0
+    while shift < 24 {
+        const source = (color >> shift) & 255
+        const target = (under >> shift) & 255
+        const mixed = (source * alpha + target * inverse + 127) / 255
+        result = result | (mixed << shift)
+        shift += 8
+    }
+    return result
+}
+
+// FLAG_SWAP_RED_BLUE: the target stores 0xAABBGGRR (R8G8B8A8).
+pub const FLAG_SWAP_RED_BLUE: u32 = 4
+
+fn swapRedBlue(value: u32) -> u32 {
+    return (value & 4278255360) | ((value & 255) << 16) | ((value >> 16) & 255)
+}
+
+// Draws `run` with its origin at (origin_x, origin_y) into `pixels`
+// (`width` x `height`, `stride` pixels per row), clipped.
+pub fn drawRun(atlas: *const Atlas, run: *const Run, pixels: [*]u32, width: usize, height: usize, stride: usize, origin_x: i32, origin_y: i32, color: u32, flags: u32) -> void {
+    var y = run.*.top
+    while y < run.*.bottom {
+        const target_y = origin_y + y
+        if target_y >= 0 && target_y < @intCast(i32, height) {
+            var x = run.*.left
+            while x < run.*.right {
+                const target_x = origin_x + x
+                if target_x >= 0 && target_x < @intCast(i32, width) {
+                    const coverage = runCoverage(atlas, run, x, y)
+                    if coverage != 0 {
+                        const at = @intCast(usize, target_y) * stride + @intCast(usize, target_x)
+                        if flags & FLAG_SWAP_RED_BLUE != 0 {
+                            pixels[at] = swapRedBlue(blendCoverage(swapRedBlue(pixels[at]), color, coverage))
+                        } else {
+                            pixels[at] = blendCoverage(pixels[at], color, coverage)
+                        }
+                    }
+                }
+                x += 1
+            }
+        }
+        y += 1
+    }
+}

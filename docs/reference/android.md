@@ -132,14 +132,14 @@ calls), the `O_*` bits that differ, and the `struct stat` and
 | `tools/check_android_packaging.py` | CRC-32, Adler-32, SHA-1, SHA-256 and bignum results of the packaging code, built by mlx0 and by mlx1, against Python |
 | `tools/check_android_apk.py` | `apksigner`, `jarsigner`, `zipalign`, `aapt2` on a built APK; reproducible output |
 | `tools/emulate_android_app.py` | the gesture example against a model of the Android framework: taps, long presses, swipes, cancel, rotation |
-| `tools/emulate_vulkan_android.py` | `examples/vulkan-android` against the same framework model plus a mock Vulkan driver behind `libvulkan.so`: instance and device extensions, the submitted shader (`spirv-val`), swapchain creation on an R8G8B8A8, "inherit"-alpha surface, every presented frame pixel by pixel, touch, out-of-date and resized swapchains, background and return, and a device without Vulkan |
+| `tools/emulate_vulkan_android.py` | `examples/vulkan-android` against the same framework model plus a mock Vulkan driver behind `libvulkan.so`: instance and device extensions, the submitted shader (`spirv-val`), swapchain creation on an R8G8B8A8, "inherit"-alpha surface, every presented frame pixel by pixel, the std.truetype label (the system font served from the test font, the `text` shader run on the atlas and runs the app built), touch, out-of-date and resized swapchains, background and return, and devices without a system font or without Vulkan |
 
 The emulator cannot run Android itself, so the last step is a device:
 `adb install -r gestures.apk`, then `adb logcat -s mlx` shows each
 recognized gesture.
 
 In `tools/diff_aarch64_backend.py`, tests that load C libraries or a Vulkan
-driver (`tests/247`, `253`, `254`, `257`, `258`) cannot run on the static
+driver (`tests/247`, `253`, `254`, `257`, `258`, `263`) cannot run on the static
 aarch64-linux target, and the Wayland transport tests (`tests/243` to `245`)
 need `memfd_create`, `sendmsg` and `wait4`, which the emulator does not
 implement.
