@@ -379,7 +379,8 @@ instruction set. It maps onto the normative instruction list in
 backend-shaped instructions the spec doesn't name directly (`func_sym`,
 `label`, `icmp_br` as a fused compare-and-branch, `direct_call` vs `call`,
 `syscall`, `byte_mask_64`, `dead` as an explicit tombstone opcode for
-eliminated instructions, `aggregate_copy`, and separate `udiv`/`urem` next
+eliminated instructions, `aggregate_copy`, `mem_copy` for struct and array
+value copies (one instruction per copy, whatever the size), and separate `udiv`/`urem` next
 to signed `div`/`rem`) and folds some of the spec's saturating/wrapping
 arithmetic variants down to flag bits on a smaller opcode set rather than
 one opcode per variant. Every `Inst` is a fixed-size record — `opcode`,
@@ -552,6 +553,16 @@ soon as one claims the instruction), rather than a single giant switch —
 directly matching the README's "separates mutable backend state from
 label, memory, arithmetic, value, call and control-flow instruction
 emission."
+
+The aarch64 backend (`backend/aarch64/`) also keeps every value in a stack
+slot below the frame pointer. Slots within 256 bytes use `ldur`/`stur`; the
+rest are addressed from `sp` (`sp = fp - frameSize` after the prologue, lower
+by the outgoing stack arguments while a call reserves them, which
+`encoder.adjustSpBelow` tracks) with one `ldr`/`str`, and only frames beyond
+that reach fall back to `sub x17, x29, #slot` first. A load of the slot just
+stored, into the register it was stored from, is left out unless a symbol
+(a branch target) was defined between them. Together with `mem_copy` this
+made Android libraries about 40% smaller.
 
 Every LIR value (`vreg`) lives at a fixed stack offset assigned once by
 `State.allocateOp`, keyed by a per-function `slotEpoch` so vreg-index slots

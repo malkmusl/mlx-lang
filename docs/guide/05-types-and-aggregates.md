@@ -92,7 +92,8 @@ h = a
 h.x = 1              // a.x is unchanged
 ```
 
-(`tests/265_aggregate_value_copy_runtime.mlx`). A literal is not copied
+(`tests/265_aggregate_value_copy_runtime.mlx`; sizes that are not a
+multiple of 8 in `tests/266_mem_copy_sizes_runtime.mlx`). A literal is not copied
 again: it is built in the variable's own storage. A `const` binding of an
 existing aggregate is not copied either; it cannot be changed through its
 name, but in the bootstrap compiler it still reads the original's storage,

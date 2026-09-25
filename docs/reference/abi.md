@@ -228,6 +228,12 @@ holder.pair = replacement
 
 (`tests/229_aggregate_field_assignment_runtime.mlx`)
 
+Every such copy is one `mem_copy` LIR instruction: on aarch64 a call to the
+runtime's `__mlx_mem_copy` (x0 = destination, x1 = source, x2 = byte count;
+8 bytes at a time, then the rest), on x86_64 an inline `rep movsb`. Sizes
+that are not a multiple of 8 copy exactly
+(`tests/266_mem_copy_sizes_runtime.mlx`).
+
 A 20-byte array exceeds the 16-byte register-return threshold, so it returns
 through caller-owned hidden memory instead:
 
