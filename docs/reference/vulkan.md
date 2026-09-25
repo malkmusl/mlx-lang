@@ -267,7 +267,12 @@ The examples share one small renderer in `examples/vulkan-shared`:
 - `swapchain.mlx` presents to a window surface: each frame the pattern is
   rendered into a buffer, a callback may draw over it (the Android app's
   label), and the buffer is copied into the acquired image
-  (`vkCmdCopyBufferToImage`) and presented (FIFO).
+  (`vkCmdCopyBufferToImage`) and presented (FIFO) with as few images as
+  the surface allows. `present` submits with `gpu.submitFrame`, which does
+  not wait: the next frame waits for it (`gpu.finishPending`) before
+  acquiring an image and reusing the command buffer, and each image has
+  its own present semaphore. `gpu.submit` still waits, for code that reads
+  results back.
 
 `tests/257_vulkan_sharing_runtime.mlx` runs the sharing paths on lavapipe:
 the pattern rendered into a memfd imported as host memory, the blit
