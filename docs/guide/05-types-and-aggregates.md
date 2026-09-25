@@ -78,6 +78,26 @@ fn main() u8 {
 
 (`tests/88_lvalue_assignment_runtime.mlx`)
 
+Structs and arrays are values. A `var` initialized from another value and a
+value assigned to a variable are copies, so changing them leaves the
+original alone, whether it came from a local, a call, a field reached
+through a pointer or an array element:
+
+```mlx
+var s = S.{ .p = P.{ .x = 1, .y = 2 }, .n = 0 }
+var field = s.p
+field.x = 3          // s.p.x is still 1
+var h = make(7)
+h = a
+h.x = 1              // a.x is unchanged
+```
+
+(`tests/265_aggregate_value_copy_runtime.mlx`). A literal is not copied
+again: it is built in the variable's own storage. A `const` binding of an
+existing aggregate is not copied either; it cannot be changed through its
+name, but in the bootstrap compiler it still reads the original's storage,
+so it sees later changes made to the original.
+
 Struct layout/reflection builtins:
 
 ```mlx
