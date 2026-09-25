@@ -118,37 +118,52 @@ cyan/orange for a swipe down/up.
 
 The layout rule for every Android window: an app that is not fullscreen
 keeps the status and navigation bars, and its window reaches under them
-(edge to edge, enforced from Android 15). That space is reserved: only the app's background is drawn there, and every UI
-component starts below it (and inside the other edges), in the `free`
-area. A fullscreen app (`--android-fullscreen`, whose theme sets
-`FLAG_FULLSCREEN`) has nothing reserved and lays out over the whole window,
-as if the rule did not exist.
+(edge to edge, enforced from Android 15). That space is reserved: only the
+app's background is drawn there, and every UI component starts below it
+(and inside the other edges), in the `free` area. The top band keeps its
+portrait height in landscape: while the status bar is shown it is as tall
+as the status bar in portrait, the larger of the system's
+`status_bar_height_portrait` (else `status_bar_height`) and the display
+cutout's depth. The cutout itself is not reserved: in landscape the camera
+sits at a side edge and the content goes there. A fullscreen app
+(`--android-fullscreen`, whose theme sets `FLAG_FULLSCREEN`) has nothing
+reserved and lays out over the whole window, as if the rule did not exist.
 
 `reservedInsets(activity, &insets)` applies it: it returns
-`Reserved.system_bars` with the bars' insets, `Reserved.fullscreen` with
+`Reserved.system_bars` with the reserved insets, `Reserved.fullscreen` with
 zero insets (the bars are not even asked for), or `Reserved.unknown` with
 zero insets until the window has been laid out. With `std.ui`,
 `ui.screen(width, height, insets)` then gives `free` for the components
 (see [ui.md](ui.md)). The `Canvas` runtime does this on every paint
 (`canvas.*.reserved`, `canvas.*.free`), and `examples/vulkan-android` on
-window creation, resize and each layout pass (`onContentRectChanged`),
-logging `ui: reserved for the system bars: top … right … bottom … left …`
-or `ui: fullscreen, nothing reserved`.
+window creation, resize, each layout pass (`onContentRectChanged`) and
+every 8 frames, logging `ui: reserved for the system bars: top … right …
+bottom … left …` or `ui: fullscreen, nothing reserved`.
+
+`setSystemBarsHidden(activity, status, navigation)` switches the bars at
+runtime: both hidden for fullscreen, the navigation bar alone for more
+room at the bottom; a swipe from the edge shows hidden bars for a moment.
+API 30+ uses the window's `WindowInsetsController` (`hide`/`show` with
+`BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE`), older levels the decor view's
+`setSystemUiVisibility` (immersive sticky, with the layout-stable,
+hide-navigation and fullscreen layout flags). Hidden bars reserve nothing,
+and with the status bar hidden the top band goes too. With edge-to-edge
+windows no layout callback reports the change, so ask `reservedInsets`
+again a few frames later (the Vulkan example looks every 8 frames).
 
 `isFullscreen(activity)` reads `getWindow().getAttributes().flags`.
 `windowInsets(activity, &insets)` fills a `std.ui` `Insets` with where the
-system draws over the window whether or not the app is fullscreen: status
-and navigation bars, in window pixels. Display cutouts are not included: in
-landscape the camera cutout sits at a side edge, and reserving it would
-leave a band down that side. The NDK has no
-C call for either, so they go through the
-activity's `JNIEnv`: `getWindow().getDecorView().getRootWindowInsets()`,
-then `getInsets(WindowInsets.Type.systemBars())` from
-API 30 and `getSystemWindowInset*()` on API 23 to 29, inside a local
-reference frame, with any Java exception cleared. It returns false, with
-zero insets, below API 23, before the window's first layout pass (no
-insets yet) or when a call fails, so ask again from `onContentRectChanged`,
-as `examples/vulkan-android` does. Call it on the main thread.
+shown system bars cover the window, whether or not the app is fullscreen,
+in window pixels, without the portrait-height rule and without cutouts.
+The NDK has no C call for any of this, so it goes through the activity's
+`JNIEnv`: `getWindow().getDecorView().getRootWindowInsets()`, then
+`getInsets(WindowInsets.Type.systemBars())` (and `displayCutout()`) from
+API 30 and `getSystemWindowInset*()` (and `getDisplayCutout()` from API 28)
+on API 23 to 29, and `getResources().getIdentifier(...)` for the status
+bar dimens, inside a local reference frame, with any Java exception
+cleared. It returns false, with zero insets, below API 23, before the
+window's first layout pass (no insets yet) or when a call fails. Call these
+functions on the main thread.
 
 ## Runtime and Linux compatibility
 
@@ -170,7 +185,7 @@ calls), the `O_*` bits that differ, and the `struct stat` and
 | `tools/check_android_packaging.py` | CRC-32, Adler-32, SHA-1, SHA-256 and bignum results of the packaging code, built by mlx0 and by mlx1, against Python |
 | `tools/check_android_apk.py` | `apksigner`, `jarsigner`, `zipalign`, `aapt2` on a built APK; reproducible output |
 | `tools/emulate_android_app.py` | the gesture example against a model of the Android framework: taps, long presses, swipes, cancel, rotation, and the reserved space (a fake `JNIEnv`, see below): only the background under the status and navigation bars, nothing reserved when fullscreen |
-| `tools/emulate_vulkan_android.py` | `examples/vulkan-android` against the same framework model plus a mock Vulkan driver behind `libvulkan.so`: instance and device extensions, the submitted shader (`spirv-val`), swapchain creation on an R8G8B8A8, "inherit"-alpha surface, every presented frame pixel by pixel, the system bar insets (a fake `JNIEnv` answers `getRootWindowInsets` on API 34 through `WindowInsets.Type` and `Insets`, and on API 29 through `getSystemWindowInset*`; before the first layout pass it has none) with only the background under them, the std.truetype label at the top center of the rest (the system font served from the test font, the `text` shader run on the fills, atlas and runs the app built), touch, out-of-date and resized swapchains, background and return, and devices without a system font or without Vulkan |
+| `tools/emulate_vulkan_android.py` | `examples/vulkan-android` against the same framework model plus a mock Vulkan driver behind `libvulkan.so`: instance and device extensions, the submitted shader (`spirv-val`), swapchain creation on an R8G8B8A8, "inherit"-alpha surface, every presented frame pixel by pixel, the reserved space (a fake `JNIEnv` answers `getRootWindowInsets` on API 34 through `WindowInsets.Type` and `Insets`, and on API 29 through `getSystemWindowInset*` and `getDisplayCutout`, plus the status bar dimens; before the first layout pass it has none) with only the background under it and the landscape top band at its portrait height, the fullscreen and navigation bar switches tapped at runtime (`WindowInsetsController` on API 34, system UI flags on API 29) with the reserved space following, the std.truetype label at the top center of the rest and the buttons at its bottom center (the system font served from the test font, the `text` shader run on the fills, atlas and runs the app built), touch, out-of-date and resized swapchains, background and return, and devices without a system font or without Vulkan |
 
 The emulator cannot run Android itself, so the last step is a device:
 `adb install -r gestures.apk`, then `adb logcat -s mlx` shows each

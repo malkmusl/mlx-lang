@@ -53,51 +53,93 @@ NAMES = {BLUE: "blue", GREEN: "green", YELLOW: "yellow", RED: "red", MAGENTA: "m
 
 
 ACTIVITY_OBJECT = 0x7A00_0001
-# WindowInsets.Type.systemBars() and displayCutout().
-SYSTEM_BARS, DISPLAY_CUTOUT = 7, 128
+# WindowInsets.Type: statusBars(), navigationBars(), systemBars() (with the
+# caption bar) and displayCutout().
+STATUS_BARS, NAVIGATION_BARS, SYSTEM_BARS, DISPLAY_CUTOUT = 1, 2, 7, 128
 FLAG_FULLSCREEN = 0x400
+# View.SYSTEM_UI_FLAG_*: the layout flags std.android always sets, and the
+# two that hide bars.
+SYSTEM_UI_LAYOUT = 0x100 | 0x200 | 0x400 | 0x1000
+SYSTEM_UI_FULLSCREEN, SYSTEM_UI_HIDE_NAVIGATION = 4, 2
+SIDES = ("top", "right", "bottom", "left")
+# Resource ids of the status bar dimens.
+PORTRAIT_DIMEN, STATUS_BAR_DIMEN = 0x1050_0001, 0x1050_0002
 
 
 class FakeJni:
-    """The activity's JNIEnv, as far as std.android's reserved space uses
-    it: the NativeActivity object, its Window with its LayoutParams flags
-    (FLAG_FULLSCREEN when `fullscreen`), the decor View and its
-    WindowInsets, answering `insets` (top, right, bottom, left), or no
-    WindowInsets at all while `insets` is None (not laid out yet). API 30+
-    goes through WindowInsets.Type and android.graphics.Insets, older levels
-    through getSystemWindowInset*. Unknown classes, methods and fields throw
-    (a pending exception, as in Java); any call made while an exception is
-    pending, and unbalanced local frames, fail the run."""
+    """The activity's JNIEnv, as far as std.android's reserved space and
+    system bar switches use it: the NativeActivity object and its
+    Resources (the status bar dimens: `portrait_status_bar` for
+    status_bar_height_portrait, `status_bar` for status_bar_height, None
+    when missing), its Window with its LayoutParams flags (FLAG_FULLSCREEN
+    when `fullscreen`) and WindowInsetsController, the decor View
+    (setSystemUiVisibility) and its WindowInsets: `insets` (top, right,
+    bottom, left) are the system bars, the top one the status bar and the
+    others the navigation bar, as long as they are shown; None means no
+    WindowInsets yet (not laid out). `cutout` is the display cutout's safe
+    insets. API 30+ goes through WindowInsets.Type, android.graphics.Insets
+    and the controller, older levels through getSystemWindowInset*,
+    getDisplayCutout (API 28+) and system UI flags. Unknown classes, methods
+    and fields throw (a pending exception, as in Java); any call made while
+    an exception is pending, and unbalanced local frames, fail the run."""
 
     FUNCTIONS = {6: "FindClass", 17: "ExceptionClear", 19: "PushLocalFrame", 20: "PopLocalFrame",
                  31: "GetObjectClass", 33: "GetMethodID", 36: "CallObjectMethodA", 51: "CallIntMethodA",
-                 94: "GetFieldID", 100: "GetIntField", 113: "GetStaticMethodID", 131: "CallStaticIntMethodA",
-                 228: "ExceptionCheck"}
+                 63: "CallVoidMethodA", 94: "GetFieldID", 100: "GetIntField", 113: "GetStaticMethodID",
+                 131: "CallStaticIntMethodA", 167: "NewStringUTF", 228: "ExceptionCheck"}
     CLASSES = {"activity": "android/app/NativeActivity", "window": "android/view/Window",
                "attributes": "android/view/WindowManager$LayoutParams",
+               "controller": "android/view/WindowInsetsController", "resources": "android/content/res/Resources",
+               "string": "java/lang/String", "cutout": "android/view/DisplayCutout",
                "decor": "android/view/View", "insets": "android/view/WindowInsets", "values": "android/graphics/Insets"}
     METHODS = {("android/app/NativeActivity", "getWindow", "()Landroid/view/Window;"),
+               ("android/app/NativeActivity", "getResources", "()Landroid/content/res/Resources;"),
+               ("android/content/res/Resources", "getIdentifier",
+                "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)I"),
+               ("android/content/res/Resources", "getDimensionPixelSize", "(I)I"),
                ("android/view/Window", "getDecorView", "()Landroid/view/View;"),
                ("android/view/Window", "getAttributes", "()Landroid/view/WindowManager$LayoutParams;"),
                ("android/view/View", "getRootWindowInsets", "()Landroid/view/WindowInsets;"),
-               ("android/view/WindowInsets", "getInsets", "(I)Landroid/graphics/Insets;"),
                ("android/view/WindowInsets", "getSystemWindowInsetTop", "()I"),
                ("android/view/WindowInsets", "getSystemWindowInsetRight", "()I"),
                ("android/view/WindowInsets", "getSystemWindowInsetBottom", "()I"),
                ("android/view/WindowInsets", "getSystemWindowInsetLeft", "()I")}
+    # Only from these API levels on.
+    METHODS_SINCE = {28: {("android/view/WindowInsets", "getDisplayCutout", "()Landroid/view/DisplayCutout;"),
+                          ("android/view/DisplayCutout", "getSafeInsetTop", "()I"),
+                          ("android/view/DisplayCutout", "getSafeInsetRight", "()I"),
+                          ("android/view/DisplayCutout", "getSafeInsetBottom", "()I"),
+                          ("android/view/DisplayCutout", "getSafeInsetLeft", "()I")},
+                     30: {("android/view/WindowInsets", "getInsets", "(I)Landroid/graphics/Insets;"),
+                          ("android/view/Window", "getInsetsController", "()Landroid/view/WindowInsetsController;"),
+                          ("android/view/WindowInsetsController", "setSystemBarsBehavior", "(I)V"),
+                          ("android/view/WindowInsetsController", "hide", "(I)V"),
+                          ("android/view/WindowInsetsController", "show", "(I)V")}}
+    VOID_METHODS = {("android/view/View", "setSystemUiVisibility", "(I)V")}
 
-    def __init__(self, framework, stub, sdk=34, insets=(0, 0, 0, 0), fullscreen=False, cutout=(0, 0, 0, 0)):
+    def __init__(self, framework, stub, sdk=34, insets=(0, 0, 0, 0), fullscreen=False, cutout=(0, 0, 0, 0),
+                 portrait_status_bar=None, status_bar=None):
         self.framework = framework
         self.sdk = sdk
         self.insets = insets
-        # A display cutout's inset, only answered for displayCutout(): the
-        # app must not reserve it.
         self.cutout = cutout
         self.fullscreen = fullscreen
+        self.portrait_status_bar = portrait_status_bar
+        self.status_bar = status_bar
+        self.status_hidden = False
+        self.navigation_hidden = False
+        self.behavior = None
+        # (method, argument) of every system bar change, in order.
+        self.bar_calls = []
         self.pending = False
         self.frames = 0
         self.queries = 0
         self.objects = {ACTIVITY_OBJECT: "activity"}
+        self.data = {}
+        self.methods = set(self.METHODS) | self.VOID_METHODS
+        for level, methods in self.METHODS_SINCE.items():
+            if sdk >= level:
+                self.methods |= methods
         table = framework.malloc(8 * 240)
         for index in range(240):
             name = self.FUNCTIONS.get(index)
@@ -106,14 +148,37 @@ class FakeJni:
         self.env = framework.malloc(8)
         framework.put_u64(self.env, table)
 
+    def visible(self):
+        """The system bars' insets as far as they are shown."""
+        top, right, bottom, left = self.insets
+        if self.status_hidden:
+            top = 0
+        if self.navigation_hidden:
+            right = bottom = left = 0
+        return (top, right, bottom, left)
+
+    def reserved(self):
+        """What std.android.reservedInsets should answer: the shown bars,
+        with the status bar's band as tall as in portrait."""
+        if self.fullscreen or self.insets is None:
+            return (0, 0, 0, 0)
+        top, right, bottom, left = self.visible()
+        if top > 0:
+            resource = self.portrait_status_bar if self.portrait_status_bar is not None else (self.status_bar or 0)
+            cutout = max(self.cutout) if self.sdk >= 28 else 0
+            top = max(top, resource, cutout)
+        return (top, right, bottom, left)
+
     def unexpected(self, index):
         def fail(process, *_):
             raise AssertionError(f"unexpected JNI function {index}")
         return fail
 
-    def new(self, kind):
+    def new(self, kind, data=None):
         handle = 0x7A00_0000 + 0x10 * (len(self.objects) + 1)
         self.objects[handle] = kind
+        if data is not None:
+            self.data[handle] = data
         return handle
 
     def calm(self, name):
@@ -123,11 +188,18 @@ class FakeJni:
         self.pending = True
         return 0
 
+    def name_of(self, method):
+        return self.objects[method].split(":", 1)[1]
+
     def FindClass(self, process, env, name, *_):
         self.calm("FindClass")
         if process.cstring(name) == "android/view/WindowInsets$Type" and self.sdk >= 30:
             return self.new("class:android/view/WindowInsets$Type")
         return self.throw()
+
+    def NewStringUTF(self, process, env, text, *_):
+        self.calm("NewStringUTF")
+        return self.new("string", process.cstring(text))
 
     def ExceptionCheck(self, process, env, *_):
         return 1 if self.pending else 0
@@ -158,44 +230,80 @@ class FakeJni:
 
     def GetMethodID(self, process, env, cls, name, signature, *_):
         self.calm("GetMethodID")
-        return self.member(process, cls, name, signature, self.METHODS)
+        return self.member(process, cls, name, signature, self.methods)
 
     def GetStaticMethodID(self, process, env, cls, name, signature, *_):
         self.calm("GetStaticMethodID")
-        return self.member(process, cls, name, signature, {("android/view/WindowInsets$Type", "systemBars", "()I"),
-                                                           ("android/view/WindowInsets$Type", "displayCutout", "()I")})
+        return self.member(process, cls, name, signature,
+                           {("android/view/WindowInsets$Type", method, "()I")
+                            for method in ("statusBars", "navigationBars", "systemBars", "displayCutout")})
 
     def GetFieldID(self, process, env, cls, name, signature, *_):
         self.calm("GetFieldID")
-        return self.member(process, cls, name, signature, {("android/graphics/Insets", side, "I")
-                                                           for side in ("top", "right", "bottom", "left")}
+        return self.member(process, cls, name, signature, {("android/graphics/Insets", side, "I") for side in SIDES}
                            | {("android/view/WindowManager$LayoutParams", "flags", "I")})
+
+    def int_argument(self, process, arguments, index=0):
+        return struct.unpack("<i", process.read(arguments + 8 * index, 4))[0]
 
     def CallObjectMethodA(self, process, env, obj, method, arguments, *_):
         self.calm("CallObjectMethodA")
-        name = self.objects[method].split(":", 1)[1]
-        if name == "getWindow":
-            return self.new("window")
-        if name == "getDecorView":
-            return self.new("decor")
-        if name == "getAttributes":
-            return self.new("attributes")
+        name = self.name_of(method)
+        simple = {"getWindow": "window", "getDecorView": "decor", "getAttributes": "attributes",
+                  "getInsetsController": "controller", "getResources": "resources"}
+        if name in simple:
+            return self.new(simple[name])
         if name == "getRootWindowInsets":
             self.queries += 1
             return 0 if self.insets is None else self.new("insets")
-        assert name == "getInsets" and self.sdk >= 30, name
-        mask = struct.unpack("<I", process.read(arguments, 4))[0]
-        assert mask == SYSTEM_BARS, f"getInsets({mask}): not just the system bars"
-        return self.new("values")
+        if name == "getDisplayCutout":
+            return self.new("cutout") if any(self.cutout) else 0
+        assert name == "getInsets", name
+        mask = self.int_argument(process, arguments)
+        assert mask in (SYSTEM_BARS, DISPLAY_CUTOUT), f"getInsets({mask}): neither the system bars nor the cutout"
+        return self.new("values", self.visible() if mask == SYSTEM_BARS else self.cutout)
 
     def CallIntMethodA(self, process, env, obj, method, arguments, *_):
         self.calm("CallIntMethodA")
-        side = self.objects[method].split(":", 1)[1][len("getSystemWindowInset"):].lower()
-        return self.insets[("top", "right", "bottom", "left").index(side)]
+        name = self.name_of(method)
+        if name.startswith("getSystemWindowInset"):
+            return self.visible()[SIDES.index(name[len("getSystemWindowInset"):].lower())]
+        if name.startswith("getSafeInset"):
+            return self.cutout[SIDES.index(name[len("getSafeInset"):].lower())]
+        if name == "getIdentifier":
+            text = [self.data[struct.unpack("<Q", process.read(arguments + 8 * index, 8))[0]] for index in range(3)]
+            assert text[1:] == ["dimen", "android"], text
+            if text[0] == "status_bar_height_portrait" and self.portrait_status_bar is not None:
+                return PORTRAIT_DIMEN
+            if text[0] == "status_bar_height" and self.status_bar is not None:
+                return STATUS_BAR_DIMEN
+            return 0
+        assert name == "getDimensionPixelSize", name
+        return {PORTRAIT_DIMEN: self.portrait_status_bar, STATUS_BAR_DIMEN: self.status_bar}[self.int_argument(process, arguments)]
+
+    def CallVoidMethodA(self, process, env, obj, method, arguments, *_):
+        self.calm("CallVoidMethodA")
+        name = self.name_of(method)
+        value = self.int_argument(process, arguments)
+        self.bar_calls.append((name, value))
+        if name == "setSystemBarsBehavior":
+            self.behavior = value
+        elif name == "hide":
+            self.status_hidden |= bool(value & STATUS_BARS)
+            self.navigation_hidden |= bool(value & NAVIGATION_BARS)
+        elif name == "show":
+            self.status_hidden &= not value & STATUS_BARS
+            self.navigation_hidden &= not value & NAVIGATION_BARS
+        else:
+            assert name == "setSystemUiVisibility" and self.sdk < 30, name
+            assert value & SYSTEM_UI_LAYOUT == SYSTEM_UI_LAYOUT, f"system UI flags {value:#x} without the layout flags"
+            self.status_hidden = bool(value & SYSTEM_UI_FULLSCREEN)
+            self.navigation_hidden = bool(value & SYSTEM_UI_HIDE_NAVIGATION)
 
     def CallStaticIntMethodA(self, process, env, cls, method, arguments, *_):
         self.calm("CallStaticIntMethodA")
-        return {"member:systemBars": SYSTEM_BARS, "member:displayCutout": DISPLAY_CUTOUT}[self.objects[method]]
+        return {"statusBars": STATUS_BARS, "navigationBars": NAVIGATION_BARS, "systemBars": SYSTEM_BARS,
+                "displayCutout": DISPLAY_CUTOUT}[self.name_of(method)]
 
     def GetIntField(self, process, env, obj, field, *_):
         self.calm("GetIntField")
@@ -203,7 +311,7 @@ class FakeJni:
             # FLAG_LAYOUT_IN_SCREEN and FLAG_LAYOUT_INSET_DECOR are always set.
             return (FLAG_FULLSCREEN if self.fullscreen else 0) | 0x100 | 0x10000
         assert self.objects[obj] == "values"
-        return self.insets[("top", "right", "bottom", "left").index(self.objects[field].split(":", 1)[1])]
+        return self.data[obj][SIDES.index(self.name_of(field))]
 
 
 class Framework:

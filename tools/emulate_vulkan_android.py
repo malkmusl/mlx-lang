@@ -33,6 +33,7 @@ Usage: python3 tools/emulate_vulkan_android.py [-v] [app.apk | libmain.so]
 With no file, builds examples/vulkan-android/main.mlx with zig-out/bin/mlx1.
 """
 import os
+import re
 import shutil
 import struct
 import subprocess
@@ -60,8 +61,10 @@ FONT = os.path.join(ROOT, "tests/support/fonts/DejaVuSans-subset.ttf")
 # 0xAARRGGBB before the app swaps red and blue for R8G8B8A8): all that may
 # be drawn under the system bars.
 BACKGROUND_COLOR = 0xFF101418
-# Rows below the top inset the label (with its padding and shadow) may use.
+# Rows below the top inset the label (with its padding and shadow) may
+# use, and above the bottom inset the switch buttons may.
 LABEL_ROWS = 40
+BUTTON_ROWS = 40
 
 
 def pattern(x, y, width, time, pointer_x, pointer_y, flags):
@@ -559,14 +562,16 @@ centered = []
 
 def check_frame(frame, time, pointer=None, pressed=False, label=True, insets=(0, 0, 0, 0)):
     """Under the insets (top, right, bottom, left) only the background; in
-    the rest the pattern, except the label's ink in its rows, at the top
-    center."""
+    the rest the pattern, except the label's ink in its rows at the top
+    center and the buttons' at the bottom center."""
     (width, height), pixels = frame
     flags = 4 | (1 if pointer else 0) | (2 if pressed else 0)
     px, py = pointer or (0, 0)
     top, right, bottom, left = insets
     background = swap_red_blue(BACKGROUND_COLOR)
-    ink = []
+    label_end = top + LABEL_ROWS
+    buttons_start = height - bottom - BUTTON_ROWS
+    ink, button_ink = [], []
     for y in range(height):
         for x in range(width):
             value = pixels[y * width + x]
@@ -575,27 +580,51 @@ def check_frame(frame, time, pointer=None, pressed=False, label=True, insets=(0,
                 continue
             expected = pattern(x, y, width, time, px, py, flags)
             if value != expected:
-                assert label and y < top + LABEL_ROWS, f"frame at time {time}: pixel ({x}, {y}) is {value:#010x}, expected {expected:#010x}"
-                ink.append((x, y))
+                assert label and (y < label_end or y >= buttons_start), f"frame at time {time}: pixel ({x}, {y}) is {value:#010x}, expected {expected:#010x}"
+                (ink if y < label_end else button_ink).append((x, y))
     if label:
         assert len(ink) >= 20, f"frame at time {time}: no label ({len(ink)} pixels)"
+        assert len(button_ink) >= 20, f"frame at time {time}: no buttons ({len(button_ink)} pixels)"
         xs = [x for x, _ in ink]
         ys = [y for _, y in ink]
         assert min(ys) > top, f"frame at time {time}: the label touches the top inset (row {min(ys)})"
-        # Centered in the free area (the shadow adds 2 on the right). A
-        # label wider than that is centered too, but clipped at both edges,
-        # so its ink no longer shows where the middle is.
-        fits = min(xs) > left and max(xs) < width - right - 1
+        assert max(y for _, y in button_ink) < height - bottom - 1, f"frame at time {time}: the buttons touch the bottom inset"
+        # Centered in the free area (the label's shadow adds 2 on the right),
+        # when the label's rows and the buttons' do not overlap and they fit.
+        # A label wider than the free area is centered too, but clipped at
+        # both edges, so its ink no longer shows where the middle is.
+        apart = label_end <= buttons_start
+        fits = apart and min(xs) > left and max(xs) < width - right - 1
         if fits:
             assert abs((min(xs) + max(xs) - 1) - (left + width - right)) <= 3, f"frame at time {time}: label spans x {min(xs)}..{max(xs)}, not centered in {left}..{width - right}"
+            button_xs = [x for x, _ in button_ink]
+            assert abs((min(button_xs) + max(button_xs) + 1) - (left + width - right)) <= 2, f"frame at time {time}: buttons span x {min(button_xs)}..{max(button_xs)}, not centered in {left}..{width - right}"
         centered.append(fits)
 
 
+BUTTONS = re.compile(r"ui: buttons: fullscreen (\d+) (\d+) (\d+) (\d+), navigation bar (\d+) (\d+) (\d+) (\d+)")
+
+
+def buttons(app):
+    """The switch buttons' rectangles (x, y, width, height), as last logged."""
+    found = [BUTTONS.fullmatch(text) for text in app.messages()]
+    numbers = [int(n) for n in [match for match in found if match][-1].groups()]
+    return tuple(numbers[:4]), tuple(numbers[4:])
+
+
+def tap(app, button, at):
+    """Taps the middle of `button`; returns where."""
+    x, y = button[0] + button[2] // 2, button[1] + button[3] // 2
+    app.touch(ACTION_DOWN, x, y, at)
+    app.touch(ACTION_UP, x, y, at + MS)
+    return (x, y)
+
+
 def scenario_render(library, spirv_val):
-    # A phone in portrait: status bar at the top, gesture bar at the bottom,
-    # and a cutout on the left, which is not reserved.
+    # A phone in portrait: status bar at the top (as tall as the cutout
+    # under it), gesture bar at the bottom.
     insets = (8, 0, 6, 0)
-    app = App(library, jni={"sdk": 34, "insets": insets, "cutout": (0, 0, 0, 12)})
+    app = App(library, jni={"sdk": 34, "insets": insets, "cutout": (8, 0, 0, 0), "portrait_status_bar": 7})
     vulkan = app.vulkan
     app.create()
     assert "vulkan: device ready" in app.messages(), app.messages()
@@ -616,8 +645,9 @@ def scenario_render(library, spirv_val):
     app.show_window()
     app.attach_input()
     assert "vulkan: swapchain created" in app.messages()
-    # The background under the two bars, the label's shadow and the label.
-    assert "text: font loaded" in app.messages() and vulkan.text_draws == 4, (app.messages(), vulkan.text_draws)
+    # The background under the two bars, the label's shadow and the label,
+    # and the two buttons (background and text).
+    assert "text: font loaded" in app.messages() and vulkan.text_draws == 8, (app.messages(), vulkan.text_draws)
     assert "ui: reserved for the system bars: top 8 right 0 bottom 6 left 0" in app.messages(), app.messages()
     logged = len(app.messages())
     assert len(vulkan.frames) == 1, "no frame on window creation"
@@ -687,38 +717,59 @@ def scenario_landscape(library):
     activity: its manifest does not handle orientation changes.)"""
     # API 29 (getSystemWindowInset*), and no WindowInsets until the first
     # layout pass.
-    app = App(library, jni={"sdk": 29, "insets": None})
+    app = App(library, jni={"sdk": 29, "insets": None, "cutout": (0, 20, 0, 0), "status_bar": 16})
     vulkan = app.vulkan
     vulkan.transform = TRANSFORM_ROTATE_90
-    # Wide enough for the whole label.
-    vulkan.extent = (480, 80)
+    # Wide enough for the whole label, tall enough for label and buttons.
+    vulkan.extent = (480, 120)
     app.create()
     app.show_window()
     app.advance(51 * MS)
     assert len(vulkan.frames) == 4 and vulkan.suboptimal == 4, (len(vulkan.frames), vulkan.suboptimal)
     assert vulkan.swapchains_created == 1, f"{vulkan.swapchains_created} swapchains for one window"
     for index, frame in enumerate(vulkan.frames):
-        assert frame[0] == (480, 80), frame[0]
+        assert frame[0] == (480, 120), frame[0]
         del centered[:]
         check_frame(frame, index * 2)
         assert centered == [True], "the label does not fit a 480-pixel frame"
     # Laid out: the status bar on top, a three-button navigation bar on the
-    # left, the gesture area at the bottom.
-    insets = (10, 0, 6, 24)
-    app.jni.insets = insets
+    # left, the gesture area at the bottom, the camera cutout on the right.
+    # The top band keeps its portrait height: the cutout's depth (20), more
+    # than the landscape status bar (10) and status_bar_height (16); the
+    # cutout's side is not reserved.
+    app.jni.insets = (10, 0, 6, 24)
     app.callback("onContentRectChanged", app.malloc(16))
-    assert "ui: reserved for the system bars: top 10 right 0 bottom 6 left 24" in app.messages(), app.messages()
+    insets = app.jni.reserved()
+    assert insets == (20, 0, 6, 24), insets
+    assert "ui: reserved for the system bars: top 20 right 0 bottom 6 left 24" in app.messages(), app.messages()
     del centered[:]
     check_frame(vulkan.frames[-1], (len(vulkan.frames) - 1) * 2, insets=insets)
     assert centered == [True], "the label does not fit the free part of a 480-pixel frame"
+    # Fullscreen on API 29: the decor view's system UI flags hide both bars
+    # (immersive sticky), and nothing is reserved any more.
+    app.attach_input()
+    fullscreen_button, _ = buttons(app)
+    pointer = tap(app, fullscreen_button, 60 * MS)
+    assert app.jni.bar_calls == [("setSystemUiVisibility", 0x100 | 0x200 | 0x400 | 0x1000 | 4 | 2)], app.jni.bar_calls
+    app.advance(100 * MS)
+    assert app.jni.reserved() == (0, 0, 0, 0) and "ui: reserved for the system bars: top 0 right 0 bottom 0 left 0" in app.messages()
+    check_frame(vulkan.frames[-1], (len(vulkan.frames) - 1) * 2, pointer, insets=(0, 0, 0, 0))
+    # And back: the bars and the reserved space return.
+    fullscreen_button, _ = buttons(app)
+    app.jni.bar_calls.clear()
+    pointer = tap(app, fullscreen_button, 110 * MS)
+    assert app.jni.bar_calls == [("setSystemUiVisibility", 0x100 | 0x200 | 0x400 | 0x1000)], app.jni.bar_calls
+    app.advance(150 * MS)
+    assert app.jni.reserved() == insets
+    check_frame(vulkan.frames[-1], (len(vulkan.frames) - 1) * 2, pointer, insets=insets)
     # The window changes size without a resize callback: the suboptimal
     # present notices and the next frame has the new size.
     vulkan.extent = (64, 96)
-    app.advance(70 * MS)
+    app.advance(170 * MS)
     assert vulkan.swapchains_created == 2, vulkan.swapchains_created
-    app.advance(90 * MS)
+    app.advance(190 * MS)
     assert vulkan.frames[-1][0] == (64, 96), vulkan.frames[-1][0]
-    check_frame(vulkan.frames[-1], (len(vulkan.frames) - 2) * 2, insets=insets)
+    check_frame(vulkan.frames[-1], (len(vulkan.frames) - 2) * 2, pointer, insets=insets)
     assert vulkan.swapchains_created == 2, vulkan.swapchains_created
     app.callback("onNativeWindowDestroyed", WINDOW)
     app.callback("onDestroy")
@@ -731,14 +782,14 @@ def scenario_fullscreen(library):
     were no system bars; their insets are not even asked for."""
     app = App(library, jni={"sdk": 34, "insets": (8, 0, 6, 0), "fullscreen": True})
     vulkan = app.vulkan
-    vulkan.extent = (480, 80)
+    vulkan.extent = (480, 120)
     app.create()
     app.show_window()
     app.advance(40 * MS)
     assert "ui: fullscreen, nothing reserved" in app.messages(), app.messages()
     assert app.jni.queries == 0 and app.jni.frames == 0, (app.jni.queries, app.jni.frames)
-    # Shadow and label only: no background bands.
-    assert vulkan.text_draws == 2 * len(vulkan.frames), (vulkan.text_draws, len(vulkan.frames))
+    # Shadow, label and the two buttons only: no background bands.
+    assert vulkan.text_draws == 6 * len(vulkan.frames), (vulkan.text_draws, len(vulkan.frames))
     for index, frame in enumerate(vulkan.frames):
         del centered[:]
         check_frame(frame, index * 2)
@@ -747,6 +798,52 @@ def scenario_fullscreen(library):
     presented = len(vulkan.frames)
     app.callback("onContentRectChanged", app.malloc(16))
     assert len(vulkan.frames) == presented
+    app.callback("onNativeWindowDestroyed", WINDOW)
+    app.callback("onDestroy")
+    return len(vulkan.frames)
+
+
+def scenario_switches(library):
+    """The switch buttons on API 34: hiding the navigation bar frees the
+    bottom, fullscreen hides both bars (and the top band with the status
+    bar), and turning fullscreen off again keeps the navigation bar hidden
+    until its own switch shows it. The window's WindowInsetsController does
+    it (bars shown again by a swipe), and the reserved space follows within
+    a few frames without a layout callback."""
+    app = App(library, jni={"sdk": 34, "insets": (10, 0, 6, 0), "cutout": (0, 0, 0, 22),
+                            "portrait_status_bar": 18})
+    vulkan = app.vulkan
+    vulkan.extent = (480, 160)
+    app.create()
+    app.show_window()
+    app.attach_input()
+    app.advance(40 * MS)
+    insets = app.jni.reserved()
+    assert insets == (22, 0, 6, 0), insets
+    del centered[:]
+    check_frame(vulkan.frames[-1], (len(vulkan.frames) - 1) * 2, insets=insets)
+    assert centered == [True]
+    now = 50
+    steps = (("navigation", [("setSystemBarsBehavior", 2), ("hide", 2), ("show", 1)], (22, 0, 0, 0),
+              "ui: navigation bar hidden"),
+             ("fullscreen", [("setSystemBarsBehavior", 2), ("hide", 3)], (0, 0, 0, 0), "ui: fullscreen on"),
+             ("fullscreen", [("setSystemBarsBehavior", 2), ("hide", 2), ("show", 1)], (22, 0, 0, 0),
+              "ui: fullscreen off"),
+             ("navigation", [("setSystemBarsBehavior", 2), ("show", 3)], (22, 0, 6, 0), "ui: navigation bar shown"))
+    for which, calls, expected, message in steps:
+        fullscreen_button, navigation_button = buttons(app)
+        app.jni.bar_calls.clear()
+        pointer = tap(app, fullscreen_button if which == "fullscreen" else navigation_button, now * MS)
+        assert app.jni.bar_calls == calls, (which, app.jni.bar_calls)
+        assert message in app.messages(), (message, app.messages())
+        # Two frames: one to notice, one drawn with the new space.
+        app.advance((now + 40) * MS)
+        now += 50
+        assert app.jni.reserved() == expected, app.jni.reserved()
+        del centered[:]
+        check_frame(vulkan.frames[-1], (len(vulkan.frames) - 1) * 2, pointer, insets=expected)
+        assert centered == [True], which
+    assert app.jni.frames == 0, "JNI local frames left pushed"
     app.callback("onNativeWindowDestroyed", WINDOW)
     app.callback("onDestroy")
     return len(vulkan.frames)
@@ -804,6 +901,8 @@ def main():
               + ("" if spirv_val else " [spirv-val not installed]"))
         frames = scenario_landscape(path)
         print(f"ok   landscape (ROTATE_90, API 29 insets): {frames} frames, upright with an IDENTITY swapchain, no rebuild per suboptimal present")
+        frames = scenario_switches(path)
+        print(f"ok   switches: {frames} frames, navigation bar and fullscreen toggled at runtime, the reserved space following")
         frames = scenario_fullscreen(path)
         print(f"ok   fullscreen: {frames} frames, nothing reserved, the label at the top center of the whole window")
         scenario_no_font(path)

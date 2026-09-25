@@ -31,20 +31,32 @@ The layout follows `std.android`'s reserved-space rule
 ([android.md](../../docs/reference/android.md#reserved-space)): unless the
 app is fullscreen, the space of the status and navigation bars is
 reserved; only the background goes there and everything else starts below
-it. Display cutouts are not reserved (in landscape the camera sits at a
-side edge, and the content goes there). `std.android.reservedInsets` asks the Java side through
-JNI when the window is created or resized and after each layout pass
-(`onContentRectChanged`), and the result is logged (`ui: reserved for the
-system bars: top … right … bottom … left …`, or `ui: fullscreen, nothing
-reserved`). The frame is a `ui.Screen` with those insets
-([`std.ui`](../../docs/reference/ui.md)); the reserved bands are filled with
-the background color (`text.fill`), and the label is placed at the top
-center of the free area with `ui.Container` and clipped to it
-(`text.drawIn`). Built with `--android-fullscreen`, nothing is reserved and
-the label sits at the top center of the whole window. The text is sized
-from the screen's shorter side, so it is the same size in portrait and
-landscape, and the label drops its "Mlx + Vulkan · " prefix when the whole
-line does not fit.
+it. In landscape the top band keeps its portrait height (as tall as the
+portrait status bar with the camera cutout); the cutout's side is not
+reserved. `std.android.reservedInsets` asks the Java side through JNI when
+the window is created or resized, after each layout pass
+(`onContentRectChanged`) and every 8 frames, and each change is logged
+(`ui: reserved for the system bars: top … right … bottom … left …`, or
+`ui: fullscreen, nothing reserved`). The frame is a `ui.Screen` with those
+insets ([`std.ui`](../../docs/reference/ui.md)); the reserved bands are
+filled with the background color (`text.fill`), the label is placed at the
+top center of the free area with `ui.Container` and clipped to it
+(`text.drawIn`), and two buttons sit side by side at its bottom center (a
+`ui.Stack`):
+
+- **Fullscreen: off / on** hides or shows both system bars at runtime;
+- **Navigation bar: shown / hidden** hides or shows only the navigation
+  bar (it stays hidden when fullscreen is turned off again).
+
+A tap (down and up inside a button) flips it through
+`std.android.setSystemBarsHidden`; a swipe from the edge shows hidden bars
+for a moment. The buttons' places are logged when they move
+(`ui: buttons: fullscreen X Y W H, navigation bar X Y W H`). Built with
+`--android-fullscreen`, nothing is reserved and the label sits at the top
+center of the whole window. The text is sized from the screen's shorter
+side, so it is the same size in portrait and landscape, and the label drops
+its "Mlx + Vulkan · " prefix when the whole line does not fit. The switches
+start off again after a rotation (the activity restarts).
 
 ## Build
 
