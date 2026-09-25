@@ -16,6 +16,9 @@ libvulkan.so, and checks the app end to end:
   - the 60 Hz timer keeps presenting; touch moves the ring (white while
     down, amber after); an out-of-date swapchain and a window resize
     recreate it; destroying the window destroys the swapchain and surface;
+  - landscape on a portrait display (currentTransform ROTATE_90): the
+    swapchain is IDENTITY at the landscape size, and the suboptimal
+    presents Android then returns rebuild it only when the size changes;
   - the label: the app loads a system font (/system/fonts/..., served
     from tests/support/fonts/DejaVuSans-subset.ttf), lays it out with
     std.truetype and draws it with the `text` shader, whose arithmetic the
@@ -47,6 +50,8 @@ LIBVULKAN = 0x5800_0000_0001
 FORMAT_R8G8B8A8_UNORM = 37
 LAYOUT_UNDEFINED, LAYOUT_TRANSFER_DST, LAYOUT_PRESENT_SRC = 0, 7, 1000001002
 ERROR_OUT_OF_DATE = (-1000001004) & 0xFFFFFFFF
+SUBOPTIMAL = 1000001003
+TRANSFORM_IDENTITY, TRANSFORM_ROTATE_90 = 1, 2
 COMPOSITE_ALPHA_INHERIT = 8
 ACTION_DOWN, ACTION_UP, ACTION_MOVE = 0, 1, 2
 MS = 1_000_000
@@ -79,6 +84,12 @@ class MockVulkan:
         self.available = available
         self.next_handle = 0x1000
         self.extent = (96, 64)
+        # The display rotation Android reports (ROTATE_90 in landscape on a
+        # portrait phone); currentExtent is always in the window's current
+        # orientation.
+        self.transform = TRANSFORM_IDENTITY
+        self.swapchains_created = 0
+        self.suboptimal = 0
         self.calls = []
         self.shaders = []
         self.buffers = {}        # handle -> [size, memory]
@@ -403,7 +414,7 @@ class MockVulkan:
     def vk_GetPhysicalDeviceSurfaceCapabilitiesKHR(self, process, device, surface, capabilities, *_):
         width, height = self.extent
         self.lib.write(capabilities, struct.pack("<IIIIIIIIIIIII", 2, 3, width, height, 1, 1, 4096, 4096, 1,
-                                                 1, 1, COMPOSITE_ALPHA_INHERIT, 2 | 16))
+                                                 1 | 2 | 4 | 8, self.transform, COMPOSITE_ALPHA_INHERIT, 2 | 16))
         return 0
 
     def vk_GetPhysicalDeviceSurfaceFormatsKHR(self, process, device, surface, count, formats, *_):
@@ -416,19 +427,24 @@ class MockVulkan:
         surface = self.u64(info + 24)
         image_format, _space, width, height = struct.unpack("<IIII", self.lib.read(info + 36, 16))
         usage = self.u32(info + 56)
+        transform = self.u32(info + 80)
         alpha = self.u32(info + 84)
         assert surface in self.surfaces, "swapchain on a destroyed surface"
         assert image_format == FORMAT_R8G8B8A8_UNORM, image_format
         assert (width, height) == self.extent, ((width, height), self.extent)
         assert usage & 2, "swapchain images are not transfer destinations"
         assert alpha == COMPOSITE_ALPHA_INHERIT, alpha
+        # Frames are drawn upright at the current orientation's size, so the
+        # compositor has to rotate them: IDENTITY, whatever the display says.
+        assert transform == TRANSFORM_IDENTITY, f"preTransform {transform} for upright frames"
+        self.swapchains_created += 1
         handle = self.handle()
         images = []
         for _ in range(3):
             image = self.handle()
             self.images[image] = {"layout": LAYOUT_UNDEFINED, "pixels": None, "size": (width, height)}
             images.append(image)
-        self.swapchains[handle] = {"images": images, "next": 0, "extent": (width, height)}
+        self.swapchains[handle] = {"images": images, "next": 0, "extent": (width, height), "transform": transform}
         self.put_u64(swapchain, handle)
         return 0
 
@@ -464,6 +480,11 @@ class MockVulkan:
         if self.out_of_date_once:
             self.out_of_date_once = False
             return ERROR_OUT_OF_DATE
+        # Like Android: a preTransform other than the display's works, but
+        # every present says it is suboptimal.
+        if chain["transform"] != self.transform:
+            self.suboptimal += 1
+            return SUBOPTIMAL
         return 0
 
 
@@ -597,6 +618,36 @@ def scenario_render(library, spirv_val):
     return len(vulkan.frames)
 
 
+def scenario_landscape(library):
+    """A portrait phone held in landscape: currentTransform is ROTATE_90,
+    currentExtent landscape. Every present is suboptimal; that alone must not
+    rebuild the swapchain, a size change still must. (Rotating restarts the
+    activity: its manifest does not handle orientation changes.)"""
+    app = App(library)
+    vulkan = app.vulkan
+    vulkan.transform = TRANSFORM_ROTATE_90
+    app.create()
+    app.show_window()
+    app.advance(51 * MS)
+    assert len(vulkan.frames) == 4 and vulkan.suboptimal == 4, (len(vulkan.frames), vulkan.suboptimal)
+    assert vulkan.swapchains_created == 1, f"{vulkan.swapchains_created} swapchains for one window"
+    for index, frame in enumerate(vulkan.frames):
+        assert frame[0] == (96, 64), frame[0]
+        check_frame(frame, index * 2)
+    # The window changes size without a resize callback: the suboptimal
+    # present notices and the next frame has the new size.
+    vulkan.extent = (64, 96)
+    app.advance(70 * MS)
+    assert vulkan.swapchains_created == 2, vulkan.swapchains_created
+    app.advance(90 * MS)
+    assert vulkan.frames[-1][0] == (64, 96), vulkan.frames[-1][0]
+    check_frame(vulkan.frames[-1], (len(vulkan.frames) - 2) * 2)
+    assert vulkan.swapchains_created == 2, vulkan.swapchains_created
+    app.callback("onNativeWindowDestroyed", WINDOW)
+    app.callback("onDestroy")
+    return len(vulkan.frames)
+
+
 def scenario_no_font(library):
     app = App(library, font=None)
     app.create()
@@ -644,6 +695,8 @@ def main():
         frames = scenario_render(path, spirv_val)
         print(f"ok   render: {frames} frames checked pixel by pixel (touch, out-of-date, resize, background)"
               + ("" if spirv_val else " [spirv-val not installed]"))
+        frames = scenario_landscape(path)
+        print(f"ok   landscape (ROTATE_90): {frames} frames, upright with an IDENTITY swapchain, no rebuild per suboptimal present")
         scenario_no_font(path)
         print("ok   no system font: frames without a label")
         scenario_no_vulkan(path)

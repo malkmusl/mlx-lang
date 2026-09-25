@@ -16,6 +16,14 @@ acquired image and presents it (FIFO, paced by a 60 Hz timer on the main
 looper). R8G8B8A8 swapchains, common on Android, get red and blue swapped
 in the shader.
 
+Rotation: the swapchain has the window's current size and
+`preTransform = IDENTITY`, so frames are drawn upright and the compositor
+rotates them for the display. Android answers each present of such a
+swapchain with `VK_SUBOPTIMAL_KHR`; that only rebuilds the swapchain when
+the window's size really changed. Turning the phone restarts the activity
+(the manifest does not handle orientation changes), which builds a new
+swapchain for the new orientation.
+
 ## Build
 
 From the repository root, with the aarch64-android target

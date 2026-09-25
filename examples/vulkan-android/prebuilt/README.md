@@ -16,6 +16,6 @@ adb install mlx-vulkan.apk
 ```
 
 495781 bytes, SHA-256
-`3ca4c5bda2c80db8bd98098649ef0f4944f6872dfc1d05836ab1b6793c7ea2bc`.
+`a83c7a8763991a3e01999c152ed327b8eaf17445d6cde7a647c77a7aef5b0083`.
 It logs each startup step to `adb logcat -s mlx` and shows a label drawn
 with std.truetype from the system font (see ../README.md).
