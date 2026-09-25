@@ -1,0 +1,605 @@
+// A scripted Wayland host for testing compositors and clients that need
+// real input, written with std.wayland.server.
+//
+// It offers wl_compositor, wl_shm, xdg_wm_base and a wl_seat with pointer
+// and keyboard, hands clients an xkb keymap read from a file, and plays an
+// input script against the first mapped toplevel. It can save the frames it
+// receives as PPM images.
+//
+//     wayland-test-host SOCKET KEYMAP SCRIPT
+//
+// Script lines (times in milliseconds, coordinates window-local):
+//
+//     wait MS            pause
+//     pointer X Y        move the pointer (enters the window first)
+//     press BUTTON       button press (272 = left)
+//     release BUTTON     button release
+//     down KEY           key press (Linux evdev code)
+//     up KEY             key release
+//     type TEXT          type TEXT with a US layout (Shift as needed)
+//     enter              press and release Enter
+//     shot FILE          save the latest frame as a PPM image
+//     close              send xdg_toplevel.close and exit when the client leaves
+//
+// The host exits 0 after the client disconnects following `close`, and 1 if
+// no toplevel was mapped within ten seconds.
+
+const std = @import("std")
+const wl = @import("std.wayland")
+
+const String = std.string.String
+
+const Host = struct {
+    display: wl.server.Display
+    client: wl.server.Client
+    hasClient: bool
+    keymap: wl.SharedMemory
+    keymapSize: u32
+    // The client's main window.
+    surface: wl.server.Object
+    hasSurface: bool
+    xdgSurface: wl.server.Object
+    toplevel: wl.server.Object
+    hasToplevel: bool
+    mapped: bool
+    pointer: wl.server.Object
+    hasPointer: bool
+    keyboard: wl.server.Object
+    hasKeyboard: bool
+    pointerInside: bool
+    // Shared memory: pools and buffers by resource id.
+    poolIds: [16]u32
+    poolMemory: [16]wl.SharedMemory
+    poolCount: usize
+    bufferIds: [64]u32
+    bufferPools: [64]usize
+    bufferOffsets: [64]i32
+    bufferWidths: [64]i32
+    bufferHeights: [64]i32
+    bufferStrides: [64]i32
+    bufferCount: usize
+    pendingBuffer: u32
+    callbacks: [32]u32
+    callbackCount: usize
+    // The latest frame of the main window (BGRA as received).
+    frame: [*]u8
+    frameCapacity: usize
+    frameWidth: usize
+    frameHeight: usize
+    frames: usize
+    // Script state.
+    script: [*]const u8
+    scriptLength: usize
+    scriptPosition: usize
+    nextAction: usize
+    closing: bool
+    done: bool
+    failed: bool
+    serial: u32
+}
+
+fn hostOf(context: *anyopaque) -> *Host {
+    unsafe { return @ptrCast(*Host, context) }
+}
+
+fn milliseconds() -> usize {
+    var time: [16]u8 = undefined
+    const result = std.linux.syscall2(228, 1, @intFromPtr(&time))
+    var seconds: usize = 0
+    var nanoseconds: usize = 0
+    var index: usize = 0
+    while index < 8 {
+        seconds = seconds | (@intCast(usize, time[index]) << (index * 8))
+        nanoseconds = nanoseconds | (@intCast(usize, time[8 + index]) << (index * 8))
+        index += 1
+    }
+    return seconds * 1000 + nanoseconds / 1000000
+}
+
+fn say(text: []const u8) -> void {
+    const ignored = std.io.writeAll(std.io.stdout(), text)
+}
+
+fn sayBytes(pointer: [*]const u8, length: usize) -> void {
+    const ignored = std.io.writeAllBytes(std.io.stdout(), pointer, length)
+}
+
+fn nextSerial(host: *Host) -> u32 {
+    host.*.serial += 1
+    return host.*.serial
+}
+
+fn emptyArray() -> wl.ArrayView {
+    unsafe { return wl.ArrayView.{ .pointer = @ptrFromInt([*]const u8, 8), .length = 0 } }
+}
+
+// ---------------------------------------------------------------------------
+// Protocol
+
+fn ignoreRequest(context: *anyopaque, request: wl.server.Request) -> void {}
+
+fn copyFrame(host: *Host, buffer_id: u32) -> void {
+    var index: usize = 0
+    while index < host.*.bufferCount && host.*.bufferIds[index] != buffer_id { index += 1 }
+    if index >= host.*.bufferCount { return }
+    const memory = host.*.poolMemory[host.*.bufferPools[index]]
+    const source = memory.bytes()
+    const width = @intCast(usize, host.*.bufferWidths[index])
+    const height = @intCast(usize, host.*.bufferHeights[index])
+    const stride = @intCast(usize, host.*.bufferStrides[index])
+    const offset = @intCast(usize, host.*.bufferOffsets[index])
+    const needed = width * height * 4
+    if needed > host.*.frameCapacity {
+        const allocator = std.page_allocator.init()
+        if host.*.frameCapacity > 0 { allocator.free(host.*.frame, host.*.frameCapacity, 16) }
+        host.*.frame = allocator.alloc(needed, 16).?
+        host.*.frameCapacity = needed
+    }
+    var row: usize = 0
+    while row < height {
+        var column: usize = 0
+        while column < width * 4 {
+            host.*.frame[row * width * 4 + column] = source[offset + row * stride + column]
+            column += 1
+        }
+        row += 1
+    }
+    host.*.frameWidth = width
+    host.*.frameHeight = height
+    host.*.frames += 1
+}
+
+fn onSurface(context: *anyopaque, request: wl.server.Request) -> void {
+    const host = hostOf(context)
+    const decoded = wl.wl_surface.decodeRequest(request)
+    const is_main = host.*.hasSurface && request.object.id == host.*.surface.id
+    if request.opcode == wl.wl_surface.REQUEST_ATTACH {
+        if is_main { host.*.pendingBuffer = decoded.attach.buffer.id() }
+    } else if request.opcode == wl.wl_surface.REQUEST_FRAME {
+        if host.*.callbackCount < 32 {
+            host.*.callbacks[host.*.callbackCount] = decoded.frame.callback.id()
+            host.*.callbackCount += 1
+        }
+    } else if request.opcode == wl.wl_surface.REQUEST_COMMIT {
+        if is_main && host.*.pendingBuffer != 0 {
+            copyFrame(host, host.*.pendingBuffer)
+            wl.wl_buffer.Resource.fromObject(wl.server.Object.{ .client = request.client, .id = host.*.pendingBuffer }).sendRelease()
+            host.*.pendingBuffer = 0
+            if host.*.hasToplevel && !host.*.mapped {
+                host.*.mapped = true
+                say("host: window mapped\n")
+            }
+        }
+        // Frames are "displayed" immediately.
+        var index: usize = 0
+        while index < host.*.callbackCount {
+            wl.wl_callback.Resource.fromObject(wl.server.Object.{ .client = request.client, .id = host.*.callbacks[index] }).sendDone(@intCast(u32, milliseconds() & 4294967295))
+            index += 1
+        }
+        host.*.callbackCount = 0
+    }
+}
+
+fn onCompositor(context: *anyopaque, request: wl.server.Request) -> void {
+    const decoded = wl.wl_compositor.decodeRequest(request)
+    if request.opcode == wl.wl_compositor.REQUEST_CREATE_SURFACE {
+        decoded.create_surface.id.setHandler(onSurface, context)
+    } else if request.opcode == wl.wl_compositor.REQUEST_CREATE_REGION {
+        decoded.create_region.id.setHandler(ignoreRequest, context)
+    }
+}
+
+fn onPool(context: *anyopaque, request: wl.server.Request) -> void {
+    const host = hostOf(context)
+    if request.opcode != wl.wl_shm_pool.REQUEST_CREATE_BUFFER { return }
+    const decoded = wl.wl_shm_pool.decodeRequest(request)
+    const created = decoded.create_buffer
+    created.id.setHandler(ignoreRequest, context)
+    var slot: usize = 0
+    while slot < host.*.poolCount && host.*.poolIds[slot] != request.object.id { slot += 1 }
+    if slot >= host.*.poolCount || host.*.bufferCount >= 64 { return }
+    const index = host.*.bufferCount
+    host.*.bufferIds[index] = created.id.id()
+    host.*.bufferPools[index] = slot
+    host.*.bufferOffsets[index] = created.offset
+    host.*.bufferWidths[index] = created.width
+    host.*.bufferHeights[index] = created.height
+    host.*.bufferStrides[index] = created.stride
+    host.*.bufferCount += 1
+}
+
+fn onShm(context: *anyopaque, request: wl.server.Request) -> void {
+    const host = hostOf(context)
+    const decoded = wl.wl_shm.decodeRequest(request)
+    const created = decoded.create_pool
+    created.id.setHandler(onPool, context)
+    var memory: wl.SharedMemory = undefined
+    if host.*.poolCount < 16 && wl.transport.mapSharedMemory(&memory, created.fd, @intCast(usize, created.size), false) {
+        host.*.poolIds[host.*.poolCount] = created.id.id()
+        host.*.poolMemory[host.*.poolCount] = memory
+        host.*.poolCount += 1
+    }
+}
+
+fn onToplevel(context: *anyopaque, request: wl.server.Request) -> void {
+    if request.opcode == wl.xdg_toplevel.REQUEST_SET_TITLE {
+        const decoded = wl.xdg_toplevel.decodeRequest(request)
+        say("host: title ")
+        sayBytes(decoded.set_title.title.pointer, decoded.set_title.title.length)
+        say("\n")
+    }
+}
+
+fn onXdgSurface(context: *anyopaque, request: wl.server.Request) -> void {
+    const host = hostOf(context)
+    const decoded = wl.xdg_surface.decodeRequest(request)
+    if request.opcode == wl.xdg_surface.REQUEST_GET_TOPLEVEL && !host.*.hasToplevel {
+        host.*.toplevel = decoded.get_toplevel.id.object
+        host.*.hasToplevel = true
+        host.*.xdgSurface = request.object
+        decoded.get_toplevel.id.setHandler(onToplevel, context)
+        decoded.get_toplevel.id.sendConfigure(0, 0, emptyArray())
+        wl.xdg_surface.Resource.fromObject(request.object).sendConfigure(nextSerial(host))
+    }
+}
+
+fn onWmBase(context: *anyopaque, request: wl.server.Request) -> void {
+    const host = hostOf(context)
+    const decoded = wl.xdg_wm_base.decodeRequest(request)
+    if request.opcode == wl.xdg_wm_base.REQUEST_GET_XDG_SURFACE {
+        decoded.get_xdg_surface.id.setHandler(onXdgSurface, context)
+        if !host.*.hasSurface {
+            host.*.surface = decoded.get_xdg_surface.surface.object
+            host.*.hasSurface = true
+        }
+    }
+}
+
+fn onSeat(context: *anyopaque, request: wl.server.Request) -> void {
+    const host = hostOf(context)
+    const decoded = wl.wl_seat.decodeRequest(request)
+    if request.opcode == wl.wl_seat.REQUEST_GET_POINTER {
+        host.*.pointer = decoded.get_pointer.id.object
+        host.*.hasPointer = true
+        decoded.get_pointer.id.setHandler(ignoreRequest, context)
+    } else if request.opcode == wl.wl_seat.REQUEST_GET_KEYBOARD {
+        const keyboard = decoded.get_keyboard.id
+        host.*.keyboard = keyboard.object
+        host.*.hasKeyboard = true
+        keyboard.setHandler(ignoreRequest, context)
+        keyboard.sendKeymap(@intFromEnum(wl.wl_keyboard.KeymapFormat.xkb_v1), host.*.keymap.handle, host.*.keymapSize)
+        keyboard.sendRepeatInfo(25, 600)
+    }
+}
+
+fn bindCompositor(context: *anyopaque, client: wl.server.Client, object: wl.server.Object, version: u32) -> void {
+    wl.wl_compositor.Resource.fromObject(object).setHandler(onCompositor, context)
+}
+
+fn bindShm(context: *anyopaque, client: wl.server.Client, object: wl.server.Object, version: u32) -> void {
+    const shm = wl.wl_shm.Resource.fromObject(object)
+    shm.setHandler(onShm, context)
+    shm.sendFormat(@intFromEnum(wl.wl_shm.Format.argb8888))
+    shm.sendFormat(@intFromEnum(wl.wl_shm.Format.xrgb8888))
+}
+
+fn bindWmBase(context: *anyopaque, client: wl.server.Client, object: wl.server.Object, version: u32) -> void {
+    wl.xdg_wm_base.Resource.fromObject(object).setHandler(onWmBase, context)
+}
+
+fn bindSeat(context: *anyopaque, client: wl.server.Client, object: wl.server.Object, version: u32) -> void {
+    const seat = wl.wl_seat.Resource.fromObject(object)
+    seat.setHandler(onSeat, context)
+    seat.sendCapabilities(@intFromEnum(wl.wl_seat.Capability.pointer) | @intFromEnum(wl.wl_seat.Capability.keyboard))
+}
+
+fn onClientCreated(context: *anyopaque, client: wl.server.Client) -> void {
+    const host = hostOf(context)
+    host.*.client = client
+    host.*.hasClient = true
+}
+
+fn onClientDestroyed(context: *anyopaque, client: wl.server.Client) -> void {
+    const host = hostOf(context)
+    host.*.done = true
+    say("host: client disconnected\n")
+}
+
+// ---------------------------------------------------------------------------
+// Input
+
+fn keyboardFocus(host: *Host) -> void {
+    if !host.*.hasKeyboard || !host.*.hasSurface { return }
+    const keyboard = wl.wl_keyboard.Resource.fromObject(host.*.keyboard)
+    keyboard.sendEnter(nextSerial(host), wl.wl_surface.Resource.fromObject(host.*.surface), emptyArray())
+    keyboard.sendModifiers(nextSerial(host), 0, 0, 0, 0)
+}
+
+fn pointerTo(host: *Host, x: i32, y: i32) -> void {
+    if !host.*.hasPointer || !host.*.hasSurface { return }
+    const pointer = wl.wl_pointer.Resource.fromObject(host.*.pointer)
+    if !host.*.pointerInside {
+        pointer.sendEnter(nextSerial(host), wl.wl_surface.Resource.fromObject(host.*.surface), wl.Fixed.fromInt(x), wl.Fixed.fromInt(y))
+        host.*.pointerInside = true
+    } else {
+        pointer.sendMotion(@intCast(u32, milliseconds() & 4294967295), wl.Fixed.fromInt(x), wl.Fixed.fromInt(y))
+    }
+    pointer.sendFrame()
+}
+
+fn button(host: *Host, code: u32, pressed: bool) -> void {
+    if !host.*.hasPointer { return }
+    const pointer = wl.wl_pointer.Resource.fromObject(host.*.pointer)
+    pointer.sendButton(nextSerial(host), @intCast(u32, milliseconds() & 4294967295), code, if pressed { 1 } else { 0 })
+    pointer.sendFrame()
+}
+
+fn key(host: *Host, code: u32, pressed: bool) -> void {
+    if !host.*.hasKeyboard { return }
+    wl.wl_keyboard.Resource.fromObject(host.*.keyboard).sendKey(nextSerial(host), @intCast(u32, milliseconds() & 4294967295), code, if pressed { 1 } else { 0 })
+}
+
+fn modifiers(host: *Host, shift: bool) -> void {
+    if !host.*.hasKeyboard { return }
+    wl.wl_keyboard.Resource.fromObject(host.*.keyboard).sendModifiers(nextSerial(host), if shift { 1 } else { 0 }, 0, 0, 0)
+}
+
+// US layout: character -> key code; `shift` is set when Shift is needed.
+fn keyFor(character: u8, shift: *bool) -> u32 {
+    shift.* = false
+    const letters = "qwertyuiopasdfghjklzxcvbnm"
+    const codes: [26]u32 = [26]u32{ 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 30, 31, 32, 33, 34, 35, 36, 37, 38, 44, 45, 46, 47, 48, 49, 50 }
+    var index: usize = 0
+    for letter in letters {
+        if character == letter { return codes[index] }
+        if character == letter - 32 {
+            shift.* = true
+            return codes[index]
+        }
+        index += 1
+    }
+    if character >= 49 && character <= 57 { return @intCast(u32, character - 47) }
+    if character == 48 { return 11 }
+    if character == 32 { return 57 }
+    if character == 45 { return 12 }
+    if character == 61 { return 13 }
+    if character == 46 { return 52 }
+    if character == 47 { return 53 }
+    if character == 44 { return 51 }
+    if character == 59 { return 39 }
+    if character == 39 { return 40 }
+    shift.* = true
+    if character == 95 { return 12 }
+    if character == 33 { return 2 }
+    if character == 34 { return 40 }
+    if character == 58 { return 39 }
+    if character == 124 { return 43 }
+    if character == 62 { return 52 }
+    shift.* = false
+    return 0
+}
+
+fn typeText(host: *Host, text: [*]const u8, length: usize) -> void {
+    var index: usize = 0
+    while index < length {
+        var shift = false
+        const code = keyFor(text[index], &shift)
+        if code != 0 {
+            if shift {
+                key(host, 42, true)
+                modifiers(host, true)
+            }
+            key(host, code, true)
+            key(host, code, false)
+            if shift {
+                key(host, 42, false)
+                modifiers(host, false)
+            }
+        }
+        index += 1
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Screenshots
+
+fn writeNumber(file: std.fs.File, value: usize) -> bool {
+    return std.io.writeUnsigned(file, value)
+}
+
+fn shot(host: *Host, path: [*]const u8) -> void {
+    if host.*.frames == 0 { return }
+    const file = std.fs.open(path, 577, 420)
+    if !std.fs.isValid(file) { return }
+    var ok = std.fs.writeAll(file, "P6\n") && writeNumber(file, host.*.frameWidth) && std.fs.writeAll(file, " ") && writeNumber(file, host.*.frameHeight) && std.fs.writeAll(file, "\n255\n")
+    const allocator = std.page_allocator.init()
+    const row = allocator.alloc(host.*.frameWidth * 3, 1).?
+    var y: usize = 0
+    while ok && y < host.*.frameHeight {
+        var x: usize = 0
+        while x < host.*.frameWidth {
+            const source = (y * host.*.frameWidth + x) * 4
+            row[x * 3] = host.*.frame[source + 2]
+            row[x * 3 + 1] = host.*.frame[source + 1]
+            row[x * 3 + 2] = host.*.frame[source]
+            x += 1
+        }
+        ok = std.fs.writeAllBytes(file, row, host.*.frameWidth * 3)
+        y += 1
+    }
+    allocator.free(row, host.*.frameWidth * 3, 1)
+    const closed = std.fs.close(file)
+    say("host: screenshot saved\n")
+}
+
+// ---------------------------------------------------------------------------
+// Script
+
+fn isSpace(byte: u8) -> bool { return byte == 32 || byte == 9 }
+
+fn startsWith(pointer: [*]const u8, length: usize, word: []const u8) -> bool {
+    var index: usize = 0
+    for byte in word {
+        if index >= length || pointer[index] != byte { return false }
+        index += 1
+    }
+    return index == length || isSpace(pointer[index])
+}
+
+fn number(pointer: [*]const u8, length: usize, position: *usize) -> i32 {
+    while position.* < length && isSpace(pointer[position.*]) { position.* += 1 }
+    var value: i32 = 0
+    while position.* < length && pointer[position.*] >= 48 && pointer[position.*] <= 57 {
+        value = value * 10 + @intCast(i32, pointer[position.*] - 48)
+        position.* += 1
+    }
+    return value
+}
+
+// Runs script lines until one asks to wait.
+fn step(host: *Host) -> void {
+    while host.*.scriptPosition < host.*.scriptLength && !host.*.closing {
+        const start = host.*.scriptPosition
+        var end = start
+        while end < host.*.scriptLength && host.*.script[end] != 10 { end += 1 }
+        host.*.scriptPosition = end + 1
+        var line: [*]const u8 = undefined
+        unsafe { line = @ptrFromInt([*]const u8, @intFromPtr(host.*.script) + start) }
+        const length = end - start
+        var position: usize = 0
+        while position < length && !isSpace(line[position]) { position += 1 }
+        const word_end = position
+        if startsWith(line, length, "wait") {
+            host.*.nextAction = milliseconds() + @intCast(usize, number(line, length, &position))
+            return
+        } else if startsWith(line, length, "pointer") {
+            const x = number(line, length, &position)
+            const y = number(line, length, &position)
+            pointerTo(host, x, y)
+        } else if startsWith(line, length, "press") {
+            button(host, @intCast(u32, number(line, length, &position)), true)
+        } else if startsWith(line, length, "release") {
+            button(host, @intCast(u32, number(line, length, &position)), false)
+        } else if startsWith(line, length, "down") {
+            key(host, @intCast(u32, number(line, length, &position)), true)
+        } else if startsWith(line, length, "up") {
+            key(host, @intCast(u32, number(line, length, &position)), false)
+        } else if startsWith(line, length, "type") && length > 5 {
+            unsafe { typeText(host, @ptrFromInt([*]const u8, @intFromPtr(line) + 5), length - 5) }
+        } else if startsWith(line, length, "enter") {
+            key(host, 28, true)
+            key(host, 28, false)
+        } else if startsWith(line, length, "shot") && length > 5 {
+            var path: [256]u8 = undefined
+            var index: usize = 0
+            while index < length - 5 && index < 255 {
+                path[index] = line[5 + index]
+                index += 1
+            }
+            path[index] = 0
+            unsafe { shot(host, @ptrCast([*]const u8, &path)) }
+        } else if startsWith(line, length, "close") {
+            if host.*.hasToplevel { wl.xdg_toplevel.Resource.fromObject(host.*.toplevel).sendClose() }
+            host.*.closing = true
+        }
+        if word_end > 0 {
+            say("host: ")
+            sayBytes(line, length)
+            say("\n")
+        }
+    }
+}
+
+fn loadFile(path: [*]const u8, result: *std.array_list.ArrayList) -> bool {
+    const file = std.fs.open(path, 0, 0)
+    if !std.fs.isValid(file) { return false }
+    result.* = std.fs.readToEndAlloc(file, std.page_allocator.init())
+    const closed = std.fs.close(file)
+    return true
+}
+
+const Failure = error { Usage, MissingFile, NoWindow }
+
+fn usage() -> Failure!void { return Failure.Usage }
+fn missingFile() -> Failure!void { return Failure.MissingFile }
+fn noWindow() -> Failure!void { return Failure.NoWindow }
+
+fn run(host: *Host, arguments: [][*]const u8) -> !void {
+    if std.process.count(arguments) != 4 {
+        const shown = std.io.eprintln("usage: wayland-test-host SOCKET KEYMAP SCRIPT")
+        return usage()
+    }
+    var keymap_file: std.array_list.ArrayList = undefined
+    var script_file: std.array_list.ArrayList = undefined
+    if !loadFile(arguments[2], &keymap_file) || !loadFile(arguments[3], &script_file) { return missingFile() }
+    // The keymap travels as a NUL-terminated string in shared memory.
+    var keymap: wl.SharedMemory = undefined
+    if !wl.transport.createSharedMemory(&keymap, keymap_file.length + 1) { return missingFile() }
+    const bytes = keymap.bytes()
+    var index: usize = 0
+    while index < keymap_file.length {
+        bytes[index] = keymap_file.items[index]
+        index += 1
+    }
+    bytes[index] = 0
+    host.*.keymap = keymap
+    host.*.keymapSize = @intCast(u32, keymap_file.length + 1)
+    host.*.script = script_file.items
+    host.*.scriptLength = script_file.length
+
+    var display: wl.server.Display = undefined
+    try wl.server.Display.init(&display, std.page_allocator.init())
+    host.*.display = display
+    const socket = std.process.argument(arguments, 1)
+    try display.addSocket(std.string.asSlice(socket))
+    var context: *anyopaque = undefined
+    unsafe { context = @ptrCast(*anyopaque, host) }
+    display.setClientCreatedHandler(onClientCreated, context)
+    display.setClientDestroyedHandler(onClientDestroyed, context)
+    const globals = display.createGlobal(wl.Interface.wl_compositor, 4, bindCompositor, context) + display.createGlobal(wl.Interface.wl_shm, 1, bindShm, context) + display.createGlobal(wl.Interface.xdg_wm_base, 2, bindWmBase, context) + display.createGlobal(wl.Interface.wl_seat, 5, bindSeat, context)
+    say("host: listening\n")
+    const started = milliseconds()
+    var focused = false
+    while !host.*.done {
+        try display.dispatch(20)
+        if !host.*.mapped {
+            if milliseconds() > started + 10000 {
+                host.*.failed = true
+                break
+            }
+        } else {
+            if !focused {
+                keyboardFocus(host)
+                focused = true
+            }
+            if milliseconds() >= host.*.nextAction { step(host) }
+        }
+    }
+    display.deinit()
+    keymap.release()
+    if host.*.failed { return noWindow() }
+}
+
+pub fn main(arguments: [][*]const u8) -> !void {
+    var host: Host = undefined
+    host.hasClient = false
+    host.hasSurface = false
+    host.hasToplevel = false
+    host.mapped = false
+    host.hasPointer = false
+    host.hasKeyboard = false
+    host.pointerInside = false
+    host.poolCount = 0
+    host.bufferCount = 0
+    host.pendingBuffer = 0
+    host.callbackCount = 0
+    host.frameCapacity = 0
+    host.frames = 0
+    host.scriptPosition = 0
+    host.nextAction = 0
+    host.closing = false
+    host.done = false
+    host.failed = false
+    host.serial = 0
+    try run(&host, arguments)
+}

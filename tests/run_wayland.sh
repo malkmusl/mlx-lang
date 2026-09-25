@@ -43,7 +43,7 @@ for test in tests/240_*.mlx tests/241_*.mlx tests/242_*.mlx tests/243_*.mlx test
     fi
 done
 
-for example in examples/wayland-client/main.mlx examples/wayland-server/main.mlx; do
+for example in examples/wayland-client/main.mlx examples/wayland-server/main.mlx examples/wayland-terminal/main.mlx examples/wayland-compositor/main.mlx tools/wayland-test-host/main.mlx; do
     if "$compiler" --quiet "$example" -o "$work/example"; then
         echo "ok   $example (builds)"
     else

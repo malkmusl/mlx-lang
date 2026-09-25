@@ -433,7 +433,32 @@ pub fn main() -> !void {
 
 `examples/wayland-client/main.mlx` and `examples/wayland-server/main.mlx`
 are the complete programs, with shared memory, xdg-shell configuration and
-frame callbacks. Neither program imports `std.xml`, registers protocol XML
+frame callbacks.
+
+## Larger examples: a nested compositor and a terminal
+
+Two programs use both halves of `std.wayland` with real input:
+
+- [`examples/wayland-compositor`](../../examples/wayland-compositor/README.md)
+  is a nested compositor. It is a client of the session compositor (its
+  output is one window there) and a server for its own clients. It routes
+  the session's pointer and keyboard to the window under the pointer or
+  with focus, and hands clients the session's xkb keymap. It moves windows
+  through `xdg_toplevel.move` or Alt+drag, places `xdg_popup` windows with
+  `xdg_positioner`, and launches programs such as a terminal on Alt+Enter.
+  It waits on both connections with `wl.transport.waitAny`.
+- [`examples/wayland-terminal`](../../examples/wayland-terminal/README.md)
+  is a terminal emulator: a shell on a pseudo-terminal, keyboard input with
+  key repeat, and a built-in bitmap font.
+
+`tools/check_wayland_compositor.sh` runs both under
+`tools/wayland-test-host`, a scripted host compositor with a seat. Typed
+commands must reach the shells (they create marker files), Alt+Enter must
+open a second terminal, and Alt+drag must move it to the expected pixel
+position in the host's screenshot. weston-terminal, when installed, must
+accept Shift through the forwarded keymap and move by its title bar.
+`tools/check_wayland_interop.sh` also runs the nested compositor inside
+weston. Neither program imports `std.xml`, registers protocol XML
 in a build file, or calls anything schema-shaped. From an application's
 point of view `std.wayland` is an ordinary stdlib import, and the whole
 XML-to-Mlx pipeline above ran when the standard library was bootstrapped.

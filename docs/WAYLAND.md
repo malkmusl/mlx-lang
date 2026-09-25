@@ -57,3 +57,9 @@ with libwayland in both directions. See
 [`reference/wayland.md`](reference/wayland.md) for the pipeline, the runtime
 and the tests. The BSD and brixOS transports come later in the
 implementation order.
+
+For larger programs, see
+[`examples/wayland-compositor`](../examples/wayland-compositor/README.md), a
+nested compositor with keyboard and pointer input that launches clients,
+and [`examples/wayland-terminal`](../examples/wayland-terminal/README.md), a
+terminal emulator client.

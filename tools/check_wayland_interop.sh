@@ -7,7 +7,9 @@
 #   2. examples/wayland-server (Mlx) serves wayland-info and
 #      weston-simple-shm (libwayland clients);
 #   3. the Mlx client talks to the Mlx compositor, which verifies the pixels
-#      it receives through shared memory.
+#      it receives through shared memory;
+#   4. examples/wayland-compositor runs nested inside weston and shows
+#      weston-terminal and examples/wayland-terminal.
 #
 # Needs weston, wayland-info and weston-simple-shm on PATH (Debian/Ubuntu:
 # apt-get install weston wayland-utils). Usage:
@@ -37,6 +39,8 @@ trap cleanup EXIT
 
 "$compiler" --quiet examples/wayland-client/main.mlx -o "$work/mlx-client"
 "$compiler" --quiet examples/wayland-server/main.mlx -o "$work/mlx-compositor"
+"$compiler" --quiet examples/wayland-compositor/main.mlx -o "$work/mlx-nested"
+"$compiler" --quiet examples/wayland-terminal/main.mlx -o "$work/mlx-terminal"
 
 wait_for_socket() {
     for _ in $(seq 1 50); do
@@ -84,3 +88,11 @@ for checksum in 3516967216 315644208 1409288496; do
     grep -q "commit buffer 320x240 checksum $checksum" "$work/compositor.log" || { echo "missing frame checksum $checksum" >&2; exit 1; }
 done
 echo "ok   Mlx client and Mlx compositor exchanged verified frames"
+
+# 4. The nested compositor as a weston client, serving two terminals.
+WAYLAND_DISPLAY=weston-test timeout 30 "$work/mlx-nested" --verbose --socket nested-test --timeout 6 \
+    --terminal "$work/mlx-terminal" --run "$work/mlx-terminal" --run weston-terminal > "$work/nested.log" 2>&1
+for title in "Mlx Terminal" "Wayland Terminal"; do
+    grep -q "^map: $title" "$work/nested.log" || { echo "the nested compositor did not map $title" >&2; cat "$work/nested.log" >&2; exit 1; }
+done
+echo "ok   nested Mlx compositor on weston showed weston-terminal and the Mlx terminal"

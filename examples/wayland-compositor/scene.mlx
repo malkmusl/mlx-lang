@@ -1,0 +1,242 @@
+// Scene management and software composition for the nested compositor.
+//
+// Windows are drawn bottom to top into the host buffer with premultiplied
+// ARGB8888 blending (the wl_shm pixel convention), each with a thin frame
+// that highlights the keyboard focus, followed by the cursor: the client's
+// cursor surface when one is set, otherwise a built-in arrow.
+
+const state = @import("./state.mlx")
+
+const Compositor = state.Compositor
+const Surface = state.Surface
+
+const FOCUS_COLOR: u32 = 4284129535
+const FRAME_COLOR: u32 = 4283453536
+
+// The window rectangle used for hit-testing, frames and placement: the
+// xdg window geometry when the client set one, otherwise the buffer.
+pub fn windowX(surface: *const Surface) -> i32 {
+    return if surface.*.hasGeometry { surface.*.x + surface.*.geometryX } else { surface.*.x }
+}
+
+pub fn windowY(surface: *const Surface) -> i32 {
+    return if surface.*.hasGeometry { surface.*.y + surface.*.geometryY } else { surface.*.y }
+}
+
+pub fn windowWidth(surface: *const Surface) -> i32 {
+    return if surface.*.hasGeometry { surface.*.geometryWidth } else { @intCast(i32, surface.*.pixelWidth) }
+}
+
+pub fn windowHeight(surface: *const Surface) -> i32 {
+    return if surface.*.hasGeometry { surface.*.geometryHeight } else { @intCast(i32, surface.*.pixelHeight) }
+}
+
+// The mapped window under (x, y), topmost first; 0 when none.
+pub fn surfaceAtPoint(compositor: *Compositor, x: i32, y: i32) -> usize {
+    var index = compositor.*.stack.length
+    while index > 0 {
+        index -= 1
+        const address = state.listAt(compositor.*.stack, index)
+        const surface = state.surfaceAt(address)
+        const left = windowX(surface)
+        const top = windowY(surface)
+        if x >= left && y >= top && x < left + windowWidth(surface) && y < top + windowHeight(surface) { return address }
+    }
+    return 0
+}
+
+// The toplevel a surface belongs to (itself, or a popup's root parent).
+pub fn toplevelOf(address: usize) -> usize {
+    var current = address
+    var depth: usize = 0
+    while current != 0 && depth < 16 {
+        const surface = state.surfaceAt(current)
+        if surface.*.role == state.ROLE_TOPLEVEL { return current }
+        current = surface.*.parent
+        depth += 1
+    }
+    return 0
+}
+
+pub fn raise(compositor: *Compositor, address: usize) -> void {
+    if !state.listContains(compositor.*.stack, address) { return }
+    compositor.*.stack = state.listRemove(compositor.*.stack, address)
+    compositor.*.stack = state.listAppend(compositor.*.stack, address)
+    // Keep the window's popups above it.
+    var index: usize = 0
+    var count = compositor.*.stack.length
+    while index < count {
+        const other = state.listAt(compositor.*.stack, index)
+        if other != address && toplevelOf(other) == address {
+            compositor.*.stack = state.listRemove(compositor.*.stack, other)
+            compositor.*.stack = state.listAppend(compositor.*.stack, other)
+            count -= 1
+        } else {
+            index += 1
+        }
+    }
+    compositor.*.needsRedraw = true
+}
+
+// Places a new toplevel: cascaded from the top-left, wrapping around.
+pub fn place(compositor: *Compositor, surface: *Surface) -> void {
+    const offset_x = if surface.*.hasGeometry { surface.*.geometryX } else { 0 }
+    const offset_y = if surface.*.hasGeometry { surface.*.geometryY } else { 0 }
+    surface.*.x = compositor.*.nextWindowX - offset_x
+    surface.*.y = compositor.*.nextWindowY - offset_y
+    compositor.*.nextWindowX += 40
+    compositor.*.nextWindowY += 32
+    if compositor.*.nextWindowX > @intCast(i32, compositor.*.width / 2) || compositor.*.nextWindowY > @intCast(i32, compositor.*.height / 2) {
+        compositor.*.nextWindowX = 24
+        compositor.*.nextWindowY = 24
+    }
+}
+
+fn store(pixels: [*]u8, offset: usize, color: u32) -> void {
+    pixels[offset] = @intCast(u8, color & 255)
+    pixels[offset + 1] = @intCast(u8, (color >> 8) & 255)
+    pixels[offset + 2] = @intCast(u8, (color >> 16) & 255)
+    pixels[offset + 3] = 255
+}
+
+fn fillRect(compositor: *Compositor, pixels: [*]u8, x: i32, y: i32, width: i32, height: i32, color: u32) -> void {
+    var top = y
+    if top < 0 { top = 0 }
+    var bottom = y + height
+    if bottom > @intCast(i32, compositor.*.height) { bottom = @intCast(i32, compositor.*.height) }
+    var left = x
+    if left < 0 { left = 0 }
+    var right = x + width
+    if right > @intCast(i32, compositor.*.width) { right = @intCast(i32, compositor.*.width) }
+    var row = top
+    while row < bottom {
+        var column = left
+        const line = @intCast(usize, row) * compositor.*.width * 4
+        while column < right {
+            store(pixels, line + @intCast(usize, column) * 4, color)
+            column += 1
+        }
+        row += 1
+    }
+}
+
+fn blend(destination: u8, source: u8, alpha: u8) -> u8 {
+    const kept = @intCast(usize, destination) * (255 - @intCast(usize, alpha))
+    const value = @intCast(usize, source) + (kept + 127) / 255
+    return if value > 255 { 255 } else { @intCast(u8, value) }
+}
+
+// Draws `surface` with its top-left at (x, y).
+fn blit(compositor: *Compositor, pixels: [*]u8, surface: *const Surface, x: i32, y: i32) -> void {
+    if !surface.*.hasContent { return }
+    const width = @intCast(i32, surface.*.pixelWidth)
+    const height = @intCast(i32, surface.*.pixelHeight)
+    const screen_width = @intCast(i32, compositor.*.width)
+    const screen_height = @intCast(i32, compositor.*.height)
+    var row: i32 = 0
+    if y < 0 { row = 0 - y }
+    while row < height && y + row < screen_height {
+        var column: i32 = 0
+        if x < 0 { column = 0 - x }
+        const source_line = @intCast(usize, row) * surface.*.pixelWidth * 4
+        const destination_line = @intCast(usize, y + row) * compositor.*.width * 4
+        while column < width && x + column < screen_width {
+            const source = source_line + @intCast(usize, column) * 4
+            const alpha = surface.*.pixels[source + 3]
+            if alpha != 0 {
+                const destination = destination_line + @intCast(usize, x + column) * 4
+                if alpha == 255 {
+                    pixels[destination] = surface.*.pixels[source]
+                    pixels[destination + 1] = surface.*.pixels[source + 1]
+                    pixels[destination + 2] = surface.*.pixels[source + 2]
+                } else {
+                    pixels[destination] = blend(pixels[destination], surface.*.pixels[source], alpha)
+                    pixels[destination + 1] = blend(pixels[destination + 1], surface.*.pixels[source + 1], alpha)
+                    pixels[destination + 2] = blend(pixels[destination + 2], surface.*.pixels[source + 2], alpha)
+                }
+                pixels[destination + 3] = 255
+            }
+            column += 1
+        }
+        row += 1
+    }
+}
+
+fn drawFrame(compositor: *Compositor, pixels: [*]u8, surface: *const Surface, focused: bool) -> void {
+    const color = if focused { FOCUS_COLOR } else { FRAME_COLOR }
+    const x = windowX(surface)
+    const y = windowY(surface)
+    const width = windowWidth(surface)
+    const height = windowHeight(surface)
+    fillRect(compositor, pixels, x - 2, y - 2, width + 4, 2, color)
+    fillRect(compositor, pixels, x - 2, y + height, width + 4, 2, color)
+    fillRect(compositor, pixels, x - 2, y, 2, height, color)
+    fillRect(compositor, pixels, x + width, y, 2, height, color)
+}
+
+// The built-in arrow: 0 transparent, 1 outline, 2 fill.
+fn arrowPixel(x: i32, y: i32) -> u8 {
+    if y < 0 || x < 0 || y > 16 { return 0 }
+    if y <= 11 {
+        if x > y { return 0 }
+        if x == 0 || x == y || y == 11 { return 1 }
+        return 2
+    }
+    // The tail below the triangle.
+    const tail = y - 11
+    if x < 4 + tail / 2 || x > 6 + tail / 2 { return 0 }
+    if x == 4 + tail / 2 || x == 6 + tail / 2 || y == 16 { return 1 }
+    return 2
+}
+
+fn drawArrow(compositor: *Compositor, pixels: [*]u8) -> void {
+    var y: i32 = 0
+    while y <= 16 {
+        var x: i32 = 0
+        while x <= 12 {
+            const kind = arrowPixel(x, y)
+            if kind != 0 {
+                fillRect(compositor, pixels, compositor.*.pointerX + x, compositor.*.pointerY + y, 1, 1, if kind == 1 { 4278190080 } else { 4294967295 })
+            }
+            x += 1
+        }
+        y += 1
+    }
+}
+
+// Composes the whole output into `pixels` (width x height ARGB8888).
+pub fn compose(compositor: *Compositor, pixels: [*]u8) -> void {
+    const width = compositor.*.width
+    const height = compositor.*.height
+    var row: usize = 0
+    while row < height {
+        // A dark blue vertical gradient as the desktop background.
+        const shade = @intCast(u32, (row * 48) / height)
+        const color = 4278190080 | ((24 + shade / 2) << 16) | ((34 + shade / 2) << 8) | (52 + shade)
+        var column: usize = 0
+        const line = row * width * 4
+        while column < width {
+            store(pixels, line + column * 4, color)
+            column += 1
+        }
+        row += 1
+    }
+    var index: usize = 0
+    while index < compositor.*.stack.length {
+        const address = state.listAt(compositor.*.stack, index)
+        const surface = state.surfaceAt(address)
+        if surface.*.role == state.ROLE_TOPLEVEL {
+            drawFrame(compositor, pixels, surface, address == compositor.*.keyboardFocus)
+        }
+        blit(compositor, pixels, surface, surface.*.x, surface.*.y)
+        index += 1
+    }
+    if compositor.*.pointerInside {
+        if compositor.*.cursorSurface != 0 {
+            const cursor = state.surfaceAt(compositor.*.cursorSurface)
+            blit(compositor, pixels, cursor, compositor.*.pointerX - compositor.*.cursorHotspotX, compositor.*.pointerY - compositor.*.cursorHotspotY)
+        } else if !compositor.*.cursorHidden {
+            drawArrow(compositor, pixels)
+        }
+    }
+}
