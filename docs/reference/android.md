@@ -29,7 +29,16 @@ Run `mlx1` from the repository root so the standard library resolves.
 | `--android-min-sdk=N` | `21` | `minSdkVersion` (21 or higher: the first release with arm64-v8a) |
 | `--android-target-sdk=N` | `37` | `targetSdkVersion`; also selects the signature schemes |
 | `--android-fullscreen` | off | hide the status bar |
+| `--android-extract-native-libs` | off | let the package manager extract `libmain.so` at install (`extractNativeLibs=true`) |
 | `--android-key=PATH` | `$HOME/.mlx/android-debug.key` | signing key |
+
+By default the manifest says `extractNativeLibs=false`: `libmain.so` is
+stored uncompressed and 16 KB-aligned in the APK (as are its load segments),
+and Android runs it from there, so an installed app takes about the APK's
+size instead of the APK plus an extracted copy of the library.
+`--android-extract-native-libs` restores extraction.
+`tools/check_android_apk.py` checks both, and the library's alignment,
+without the SDK.
 
 Without `--android-key`, the compiler signs with a per-user debug key and
 creates it (RSA-2048, a few seconds) on first use, like Android Studio's

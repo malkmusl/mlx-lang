@@ -15,7 +15,9 @@ adb uninstall dev.mlxlang.vulkan
 adb install mlx-vulkan.apk
 ```
 
-643237 bytes, SHA-256
-`ce7cd33272960b1ce744460fadad628be5b52f6a0bc7d0e8a227ee856b90ff59`.
+348325 bytes, SHA-256
+`9c2c287f08a4035686b3ce9e1b5bcc0c3026ab6bf708a36ba5bd9c0495680ae9`.
+Android runs its library straight from the APK (`extractNativeLibs=false`),
+so the installed app takes about the APK's size.
 It logs each startup step to `adb logcat -s mlx` and shows a label drawn
 with std.truetype from the system font (see ../README.md).
