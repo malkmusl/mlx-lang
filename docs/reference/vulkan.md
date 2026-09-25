@@ -92,6 +92,10 @@ buffer commands). Each table is a struct of addresses (0 when the driver
 does not provide a command), filled by `vk.loadGlobalCommands`,
 `vk.loadInstanceCommands` and `vk.loadDeviceCommands`, which fall back to
 an extension's name for promoted commands (`vkGetPhysicalDeviceProperties2KHR`).
+The instance and device tables are filled by one loop over a generated list
+of names per table (`INSTANCE_COMMAND_NAMES`, `DEVICE_COMMAND_NAMES`: each
+command's name and its other names), which keeps programs small: a call per
+command made the device loader alone about 80 KB of aarch64 code.
 Each wrapper takes its table first:
 
 ```mlx
