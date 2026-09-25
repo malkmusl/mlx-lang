@@ -38,6 +38,8 @@ Zig is Stage-0 only. The canonical compiler, standard library, normal Mlx progra
 - direct x86_64 machine-code generation
 - XML/JSON are normal stdlib modules, not compiler schema features
 - Wayland client+server are provided by `std.wayland`; canonical XML is consumed during stdlib bootstrap, never required in ordinary project builds
+- Vulkan is provided by `std.vulkan` (materialized from `vk.xml` the same way), with a driver loader that needs no C loader, and `std.spirv` writes and validates shaders (see [`docs/VULKAN.md`](docs/VULKAN.md))
+- C libraries are called with `extern("c")` functions, and `export fn` makes Mlx functions callable from C
 
 Read `AGENT_IMPLEMENTATION.md` and `SPEC_INDEX.md` before implementation.
 

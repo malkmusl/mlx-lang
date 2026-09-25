@@ -42,6 +42,9 @@ exercise it:
   module by module
 - [`reference/wayland.md`](reference/wayland.md) — the Wayland protocol-AST
   pipeline and transport layer (expands [`WAYLAND.md`](WAYLAND.md))
+- [`reference/vulkan.md`](reference/vulkan.md) — `std.vulkan` materialized
+  from `vk.xml`, the driver loader and driver interface, SPIR-V and
+  `std.json` (expands [`VULKAN.md`](VULKAN.md))
 - [`reference/memory-and-concurrency.md`](reference/memory-and-concurrency.md)
   — the memory model (lifetime, UB, overflow) and the atomics/TLS Stage-0 gap
 - [`reference/diagnostics-selfhost.md`](reference/diagnostics-selfhost.md) —
@@ -67,6 +70,8 @@ How the compiler itself works, normatively and concretely:
 - [`BOOTSTRAP.md`](BOOTSTRAP.md) — the Zig-to-self-hosting bootstrap chain
 - [`WAYLAND.md`](WAYLAND.md) — why Wayland is a stdlib-bootstrap protocol
   extension, not a compiler feature
+- [`VULKAN.md`](VULKAN.md) — native Vulkan without a C loader, and the
+  building blocks toward an Mlx Vulkan driver
 
 ## Keeping this documentation accurate
 

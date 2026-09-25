@@ -79,6 +79,30 @@ file) producing a static, non-relocatable, non-PIE executable whose entry
 point is `entry_offset` bytes into the `.text` segment loaded at a fixed
 virtual address.
 
+## Dynamically linked executables
+
+A program that imports C functions or exports functions (see
+[ABI](abi.md#c-functions-externc-and-export-fn)) is written by
+`compiler/selfhost/object/elf64_dynamic.mlx` instead: still `ET_EXEC` at the
+same fixed address, but loaded by the system dynamic linker
+(`PT_INTERP /lib64/ld-linux-x86-64.so.2`). It has
+
+- an `R` segment with the headers, `.interp`, `.hash` (one bucket),
+  `.dynsym`, `.dynstr` and `.rela.dyn`;
+- the `R+X` `.text` segment, at the static layout's address;
+- an `R+W` segment with `.dynamic`, `.got` (one slot per import, filled by an
+  `R_X86_64_GLOB_DAT` relocation) and `.data` (the aggregate-arena words
+  `_start` records for exported functions);
+- `PT_DYNAMIC`, `PT_PHDR` and a non-executable `PT_GNU_STACK`.
+
+Imports are unversioned undefined symbols, bound immediately (`DF_BIND_NOW`,
+`DF_1_NOW`) to the default version in any `DT_NEEDED` library: always
+`libc.so.6`, plus each library named with `--library NAME` on the command
+line. Exports are global `STT_FUNC` symbols in `.text`. A program without
+imports or exports is still the static executable described above
+(`tests/run_foreign.sh` checks that, and runs
+`tests/247_foreign_c_runtime.mlx`).
+
 ## Debug information
 
 `spec/03-formats/debug.xml` specifies target-appropriate debug formats and a

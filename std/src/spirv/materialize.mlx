@@ -1,0 +1,723 @@
+// std.spirv.materialize: reads the SPIR-V core grammar
+// (spirv.core.grammar.json) with std.json and writes std/src/spirv/core.mlx:
+// the opcode and operand-kind enumerations, the bit masks, and compact
+// operand signatures from which std.spirv.module decodes any instruction.
+//
+// Signatures are strings with one character per operand. The character
+// names the operand kind: kind index k (grammar order) is written as byte
+// 48 + k, skipping 92 (a backslash). A preceding '!' marks an optional
+// operand ("?" in the grammar), '#' a repeated one ("*").
+
+const allocator_module = @import("../../bootstrap/allocator.mlx")
+const string = @import("../../bootstrap/string.mlx")
+const vector = @import("../../bootstrap/vector.mlx")
+const array_list = @import("../../bootstrap/array_list.mlx")
+const json = @import("../json.mlx")
+
+pub const Allocator = allocator_module.Allocator
+pub const String = string.String
+pub const Vector = vector.Vector
+pub const ArrayList = array_list.ArrayList
+
+pub const CATEGORY_BIT_ENUM: u8 = 0
+pub const CATEGORY_VALUE_ENUM: u8 = 1
+pub const CATEGORY_ID: u8 = 2
+pub const CATEGORY_LITERAL: u8 = 3
+pub const CATEGORY_COMPOSITE: u8 = 4
+
+pub const Operand = struct {
+    kind: String
+    quantifier: u8
+}
+
+pub const Instruction = struct {
+    name: String
+    opcode: u32
+    operandStart: usize
+    operandCount: usize
+}
+
+pub const Enumerant = struct {
+    name: String
+    value: u64
+    // Parameters, as operands.
+    parameterStart: usize
+    parameterCount: usize
+    alias: bool
+}
+
+pub const Kind = struct {
+    name: String
+    category: u8
+    enumerantStart: usize
+    enumerantCount: usize
+    // Composite: its bases, as operands.
+    baseStart: usize
+    baseCount: usize
+}
+
+pub const Grammar = struct {
+    allocator: Allocator
+    source: [*]const u8
+    length: usize
+    magic: u64
+    major: u64
+    minor: u64
+    revision: u64
+    instructions: Vector
+    operands: Vector
+    kinds: Vector
+    enumerants: Vector
+    failure: String
+    errorLine: usize
+}
+
+pub fn instructionAt(grammar: *const Grammar, index: usize) -> *Instruction {
+    unsafe { return @ptrCast(*Instruction, grammar.*.instructions.at(index)) }
+}
+
+pub fn operandAt(grammar: *const Grammar, index: usize) -> *Operand {
+    unsafe { return @ptrCast(*Operand, grammar.*.operands.at(index)) }
+}
+
+pub fn kindAt(grammar: *const Grammar, index: usize) -> *Kind {
+    unsafe { return @ptrCast(*Kind, grammar.*.kinds.at(index)) }
+}
+
+pub fn enumerantAt(grammar: *const Grammar, index: usize) -> *Enumerant {
+    unsafe { return @ptrCast(*Enumerant, grammar.*.enumerants.at(index)) }
+}
+
+fn copyString(value: String) -> String { return string.fromParts(value.pointer, value.length) }
+
+fn equals(value: String, text: []const u8) -> bool { return json.equals(value, text) }
+
+// ---------------------------------------------------------------------------
+// Reading
+
+const Reader = struct {
+    tokenizer: *json.Tokenizer
+    grammar: *Grammar
+}
+
+fn fail(reader: *Reader, message: []const u8) -> bool {
+    reader.*.grammar.*.failure = string.fromSlice(message)
+    reader.*.grammar.*.errorLine = json.lineOf(reader.*.tokenizer, json.errorOffset(reader.*.tokenizer))
+    return false
+}
+
+fn next(reader: *Reader, token: *json.Token) -> bool {
+    return json.next(reader.*.tokenizer, token)
+}
+
+// A JSON number or a "0x..." string.
+fn numberValue(token: json.Token, result: *u64) -> bool {
+    const text = copyString(token.value)
+    if token.kind == json.TokenKind.number { return json.parseUnsigned(text, result) }
+    if token.kind != json.TokenKind.string || text.length < 3 || text.pointer[0] != 48 || text.pointer[1] != 120 { return false }
+    var value: u64 = 0
+    var index: usize = 2
+    while index < text.length {
+        const byte = text.pointer[index]
+        var digit: u64 = 16
+        if byte >= 48 && byte <= 57 { digit = @intCast(u64, byte - 48) }
+        if byte >= 97 && byte <= 102 { digit = @intCast(u64, byte - 87) }
+        if byte >= 65 && byte <= 70 { digit = @intCast(u64, byte - 55) }
+        if digit == 16 { return false }
+        value = value * 16 + digit
+        index += 1
+    }
+    result.* = value
+    return true
+}
+
+fn skip(reader: *Reader, first: json.Token) -> bool { return json.skipValue(reader.*.tokenizer, first) }
+
+// [{"kind": ..., "quantifier": ...}, ...] -> operands; returns the count.
+fn readOperands(reader: *Reader, count: *usize) -> bool {
+    var token: json.Token = undefined
+    count.* = 0
+    if !next(reader, &token) || token.kind != json.TokenKind.arrayStart { return fail(reader, "expected an operand array") }
+    while next(reader, &token) {
+        if token.kind == json.TokenKind.arrayEnd { return true }
+        if token.kind != json.TokenKind.objectStart { return fail(reader, "expected an operand object") }
+        var operand = Operand.{ .kind = string.fromParts(reader.*.grammar.*.source, 0), .quantifier = 0 }
+        while next(reader, &token) {
+            if token.kind == json.TokenKind.objectEnd { break }
+            const key = copyString(token.value)
+            var value: json.Token = undefined
+            if !next(reader, &value) { return fail(reader, "truncated operand") }
+            if equals(key, "kind") { operand.kind = copyString(value.value) }
+            if equals(key, "quantifier") && value.value.length > 0 { operand.quantifier = value.value.pointer[0] }
+            if !skip(reader, value) { return false }
+        }
+        unsafe { reader.*.grammar.*.operands = Vector.append(reader.*.grammar.*.operands, @ptrCast([*]const u8, &operand)) }
+        count.* += 1
+    }
+    return fail(reader, "truncated operand array")
+}
+
+fn readInstructions(reader: *Reader) -> bool {
+    var token: json.Token = undefined
+    if !next(reader, &token) || token.kind != json.TokenKind.arrayStart { return fail(reader, "expected the instruction array") }
+    while next(reader, &token) {
+        if token.kind == json.TokenKind.arrayEnd { return true }
+        if token.kind != json.TokenKind.objectStart { return fail(reader, "expected an instruction object") }
+        var instruction = Instruction.{ .name = string.fromParts(reader.*.grammar.*.source, 0), .opcode = 0, .operandStart = reader.*.grammar.*.operands.length, .operandCount = 0 }
+        while next(reader, &token) {
+            if token.kind == json.TokenKind.objectEnd { break }
+            const key = copyString(token.value)
+            if equals(key, "operands") {
+                var count: usize = 0
+                if !readOperands(reader, &count) { return false }
+                instruction.operandCount = count
+            } else {
+                var value: json.Token = undefined
+                if !next(reader, &value) { return fail(reader, "truncated instruction") }
+                if equals(key, "opname") { instruction.name = copyString(value.value) }
+                if equals(key, "opcode") {
+                    var opcode: u64 = 0
+                    if !numberValue(value, &opcode) { return fail(reader, "invalid opcode") }
+                    instruction.opcode = @intCast(u32, opcode)
+                }
+                if !skip(reader, value) { return false }
+            }
+        }
+        unsafe { reader.*.grammar.*.instructions = Vector.append(reader.*.grammar.*.instructions, @ptrCast([*]const u8, &instruction)) }
+    }
+    return fail(reader, "truncated instruction array")
+}
+
+fn readEnumerants(reader: *Reader, count: *usize) -> bool {
+    var token: json.Token = undefined
+    count.* = 0
+    if !next(reader, &token) || token.kind != json.TokenKind.arrayStart { return fail(reader, "expected an enumerant array") }
+    while next(reader, &token) {
+        if token.kind == json.TokenKind.arrayEnd { return true }
+        if token.kind != json.TokenKind.objectStart { return fail(reader, "expected an enumerant object") }
+        var enumerant = Enumerant.{ .name = string.fromParts(reader.*.grammar.*.source, 0), .value = 0, .parameterStart = reader.*.grammar.*.operands.length, .parameterCount = 0, .alias = false }
+        while next(reader, &token) {
+            if token.kind == json.TokenKind.objectEnd { break }
+            const key = copyString(token.value)
+            if equals(key, "parameters") {
+                var parameters: usize = 0
+                if !readOperands(reader, &parameters) { return false }
+                enumerant.parameterCount = parameters
+            } else {
+                var value: json.Token = undefined
+                if !next(reader, &value) { return fail(reader, "truncated enumerant") }
+                if equals(key, "enumerant") { enumerant.name = copyString(value.value) }
+                if equals(key, "value") {
+                    var number: u64 = 0
+                    if !numberValue(value, &number) { return fail(reader, "invalid enumerant value") }
+                    enumerant.value = number
+                }
+                if !skip(reader, value) { return false }
+            }
+        }
+        unsafe { reader.*.grammar.*.enumerants = Vector.append(reader.*.grammar.*.enumerants, @ptrCast([*]const u8, &enumerant)) }
+        count.* += 1
+    }
+    return fail(reader, "truncated enumerant array")
+}
+
+// The "bases" of a composite kind: ["LiteralInteger", "IdRef"].
+fn readBases(reader: *Reader, count: *usize) -> bool {
+    var token: json.Token = undefined
+    count.* = 0
+    if !next(reader, &token) || token.kind != json.TokenKind.arrayStart { return fail(reader, "expected a bases array") }
+    while next(reader, &token) {
+        if token.kind == json.TokenKind.arrayEnd { return true }
+        var operand = Operand.{ .kind = copyString(token.value), .quantifier = 0 }
+        unsafe { reader.*.grammar.*.operands = Vector.append(reader.*.grammar.*.operands, @ptrCast([*]const u8, &operand)) }
+        count.* += 1
+    }
+    return fail(reader, "truncated bases array")
+}
+
+fn readKinds(reader: *Reader) -> bool {
+    var token: json.Token = undefined
+    if !next(reader, &token) || token.kind != json.TokenKind.arrayStart { return fail(reader, "expected the operand kind array") }
+    while next(reader, &token) {
+        if token.kind == json.TokenKind.arrayEnd { return true }
+        if token.kind != json.TokenKind.objectStart { return fail(reader, "expected an operand kind object") }
+        var kind = Kind.{ .name = string.fromParts(reader.*.grammar.*.source, 0), .category = CATEGORY_LITERAL, .enumerantStart = reader.*.grammar.*.enumerants.length, .enumerantCount = 0, .baseStart = 0, .baseCount = 0 }
+        while next(reader, &token) {
+            if token.kind == json.TokenKind.objectEnd { break }
+            const key = copyString(token.value)
+            if equals(key, "enumerants") {
+                kind.enumerantStart = reader.*.grammar.*.enumerants.length
+                var count: usize = 0
+                if !readEnumerants(reader, &count) { return false }
+                kind.enumerantCount = count
+            } else if equals(key, "bases") {
+                kind.baseStart = reader.*.grammar.*.operands.length
+                var bases: usize = 0
+                if !readBases(reader, &bases) { return false }
+                kind.baseCount = bases
+            } else {
+                var value: json.Token = undefined
+                if !next(reader, &value) { return fail(reader, "truncated operand kind") }
+                const text = copyString(value.value)
+                if equals(key, "kind") { kind.name = text }
+                if equals(key, "category") {
+                    if equals(text, "BitEnum") { kind.category = CATEGORY_BIT_ENUM }
+                    if equals(text, "ValueEnum") { kind.category = CATEGORY_VALUE_ENUM }
+                    if equals(text, "Id") { kind.category = CATEGORY_ID }
+                    if equals(text, "Literal") { kind.category = CATEGORY_LITERAL }
+                    if equals(text, "Composite") { kind.category = CATEGORY_COMPOSITE }
+                }
+                if !skip(reader, value) { return false }
+            }
+        }
+        unsafe { reader.*.grammar.*.kinds = Vector.append(reader.*.grammar.*.kinds, @ptrCast([*]const u8, &kind)) }
+    }
+    return fail(reader, "truncated operand kind array")
+}
+
+pub fn parse(grammar: *Grammar, allocator: Allocator, source: [*]const u8, length: usize) -> bool {
+    grammar.*.allocator = allocator
+    grammar.*.source = source
+    grammar.*.length = length
+    grammar.*.magic = 0
+    grammar.*.major = 0
+    grammar.*.minor = 0
+    grammar.*.revision = 0
+    grammar.*.instructions = Vector.init(allocator, @sizeOf(Instruction), @alignOf(Instruction), 1024)
+    grammar.*.operands = Vector.init(allocator, @sizeOf(Operand), @alignOf(Operand), 4096)
+    grammar.*.kinds = Vector.init(allocator, @sizeOf(Kind), @alignOf(Kind), 128)
+    grammar.*.enumerants = Vector.init(allocator, @sizeOf(Enumerant), @alignOf(Enumerant), 2048)
+    grammar.*.failure = string.fromSlice("")
+    grammar.*.errorLine = 0
+    var tokenizer: json.Tokenizer = undefined
+    json.initAt(&tokenizer, source, length)
+    var reader = Reader.{ .tokenizer = &tokenizer, .grammar = grammar }
+    var token: json.Token = undefined
+    if !json.next(&tokenizer, &token) || token.kind != json.TokenKind.objectStart { return fail(&reader, "expected a JSON object") }
+    while json.next(&tokenizer, &token) {
+        if token.kind == json.TokenKind.objectEnd { break }
+        const key = copyString(token.value)
+        if equals(key, "instructions") {
+            if !readInstructions(&reader) { return false }
+        } else if equals(key, "operand_kinds") {
+            if !readKinds(&reader) { return false }
+        } else {
+            var value: json.Token = undefined
+            if !json.next(&tokenizer, &value) { return fail(&reader, "truncated grammar") }
+            var number: u64 = 0
+            if equals(key, "magic_number") && numberValue(value, &number) { grammar.*.magic = number }
+            if equals(key, "major_version") && numberValue(value, &number) { grammar.*.major = number }
+            if equals(key, "minor_version") && numberValue(value, &number) { grammar.*.minor = number }
+            if equals(key, "revision") && numberValue(value, &number) { grammar.*.revision = number }
+            if !json.skipValue(&tokenizer, value) { return fail(&reader, "invalid value") }
+        }
+    }
+    if json.failed(&tokenizer) { return fail(&reader, json.errorMessage(json.errorCode(&tokenizer))) }
+    if grammar.*.magic == 0 || grammar.*.instructions.length == 0 || grammar.*.kinds.length == 0 { return fail(&reader, "not a SPIR-V grammar") }
+    return true
+}
+
+// ---------------------------------------------------------------------------
+// Names
+
+const Name = struct {
+    bytes: [128]u8
+    length: usize
+}
+
+fn nameAppend(name: *Name, byte: u8) -> void {
+    if name.*.length < 127 {
+        name.*.bytes[name.*.length] = byte
+        name.*.length += 1
+    }
+}
+
+fn nameEquals(name: *const Name, text: []const u8) -> bool {
+    var index: usize = 0
+    for byte in text {
+        if index >= name.*.length || name.*.bytes[index] != byte { return false }
+        index += 1
+    }
+    return index == name.*.length
+}
+
+fn isUpper(byte: u8) -> bool { return byte >= 65 && byte <= 90 }
+fn isLower(byte: u8) -> bool { return byte >= 97 && byte <= 122 }
+fn isDigit(byte: u8) -> bool { return byte >= 48 && byte <= 57 }
+fn lower(byte: u8) -> u8 { return if isUpper(byte) { byte + 32 } else { byte } }
+fn upper(byte: u8) -> u8 { return if isLower(byte) { byte - 32 } else { byte } }
+
+fn isKeyword(name: *const Name) -> bool {
+    if nameEquals(name, "export") || nameEquals(name, "extern") || nameEquals(name, "const") || nameEquals(name, "volatile") { return true }
+    if nameEquals(name, "inline") || nameEquals(name, "noinline") || nameEquals(name, "packed") || nameEquals(name, "align") { return true }
+    if nameEquals(name, "return") || nameEquals(name, "match") || nameEquals(name, "struct") || nameEquals(name, "union") { return true }
+    if nameEquals(name, "enum") || nameEquals(name, "error") || nameEquals(name, "fn") || nameEquals(name, "if") || nameEquals(name, "else") { return true }
+    if nameEquals(name, "for") || nameEquals(name, "while") || nameEquals(name, "break") || nameEquals(name, "continue") || nameEquals(name, "defer") { return true }
+    if nameEquals(name, "true") || nameEquals(name, "false") || nameEquals(name, "null") || nameEquals(name, "undefined") || nameEquals(name, "type") { return true }
+    if nameEquals(name, "var") || nameEquals(name, "pub") || nameEquals(name, "test") || nameEquals(name, "try") || nameEquals(name, "unsafe") || nameEquals(name, "void") { return true }
+    if nameEquals(name, "bool") || nameEquals(name, "in") || nameEquals(name, "comptime") || nameEquals(name, "anyopaque") || nameEquals(name, "Self") { return true }
+    return false
+}
+
+// "OpTypeVoid" -> "typeVoid", "GLCompute" -> "glCompute", "1D" -> "dim1D"
+// (with prefix "dim"), "RayGenerationKHR" -> "rayGenerationKHR".
+fn buildMember(result: *Name, value: String, strip_op: bool, digit_prefix: String) -> void {
+    result.*.length = 0
+    var start: usize = 0
+    if strip_op && value.length > 2 && value.pointer[0] == 79 && value.pointer[1] == 112 { start = 2 }
+    if start < value.length && isDigit(value.pointer[start]) {
+        var index: usize = 0
+        while index < digit_prefix.length {
+            nameAppend(result, if index == 0 { lower(digit_prefix.pointer[index]) } else { digit_prefix.pointer[index] })
+            index += 1
+        }
+        index = start
+        while index < value.length {
+            nameAppend(result, value.pointer[index])
+            index += 1
+        }
+    } else {
+        // Lower the leading run of capitals, except the capital that starts
+        // the next word ("GLCompute": G, L lowered; C kept).
+        var index = start
+        var run_end = start
+        while run_end < value.length && isUpper(value.pointer[run_end]) { run_end += 1 }
+        if run_end < value.length && run_end - start > 1 && isLower(value.pointer[run_end]) { run_end -= 1 }
+        if run_end == start { run_end = start + 1 }
+        while index < value.length {
+            nameAppend(result, if index < run_end { lower(value.pointer[index]) } else { value.pointer[index] })
+            index += 1
+        }
+    }
+    if isKeyword(result) { nameAppend(result, 95) }
+}
+
+// "ImageOperands" + "MakeTexelAvailableKHR" -> "IMAGE_OPERANDS_MAKE_TEXEL_AVAILABLE_KHR".
+fn appendUpperSnake(result: *Name, value: String) -> void {
+    var index: usize = 0
+    while index < value.length {
+        const byte = value.pointer[index]
+        if index > 0 && isUpper(byte) {
+            const previous = value.pointer[index - 1]
+            const following_lower = index + 1 < value.length && isLower(value.pointer[index + 1])
+            if isLower(previous) || isDigit(previous) || (isUpper(previous) && following_lower) { nameAppend(result, 95) }
+        }
+        nameAppend(result, upper(byte))
+        index += 1
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Output
+
+fn put(out: *ArrayList, text: []const u8) -> void {
+    for byte in text {
+        const ignored = ArrayList.appendAt(out, byte)
+    }
+}
+
+fn putByte(out: *ArrayList, byte: u8) -> void {
+    const ignored = ArrayList.appendAt(out, byte)
+}
+
+fn putString(out: *ArrayList, value: String) -> void {
+    var index: usize = 0
+    while index < value.length {
+        putByte(out, value.pointer[index])
+        index += 1
+    }
+}
+
+fn putName(out: *ArrayList, name: *const Name) -> void {
+    var index: usize = 0
+    while index < name.*.length {
+        putByte(out, name.*.bytes[index])
+        index += 1
+    }
+}
+
+fn putNumber(out: *ArrayList, value: u64) -> void {
+    var digits: [24]u8 = undefined
+    var count: usize = 0
+    var rest = value
+    if rest == 0 {
+        putByte(out, 48)
+        return
+    }
+    while rest > 0 {
+        digits[count] = @intCast(u8, 48 + rest % 10)
+        rest = rest / 10
+        count += 1
+    }
+    while count > 0 {
+        count -= 1
+        putByte(out, digits[count])
+    }
+}
+
+fn findKind(grammar: *const Grammar, name: String) -> usize {
+    var index: usize = 0
+    while index < grammar.*.kinds.length {
+        if string.eql(kindAt(grammar, index).*.name, name) { return index }
+        index += 1
+    }
+    return grammar.*.kinds.length
+}
+
+pub fn kindCode(index: usize) -> u8 {
+    const code = 48 + index
+    return @intCast(u8, if code >= 92 { code + 1 } else { code })
+}
+
+fn putSignature(out: *ArrayList, grammar: *const Grammar, start: usize, count: usize) -> void {
+    var index: usize = 0
+    while index < count {
+        const operand = operandAt(grammar, start + index)
+        if operand.*.quantifier == 63 { putByte(out, 33) }
+        if operand.*.quantifier == 42 { putByte(out, 35) }
+        putByte(out, kindCode(findKind(grammar, operand.*.kind)))
+        index += 1
+    }
+}
+
+fn putHeader(out: *ArrayList, grammar: *const Grammar) -> void {
+    put(out, "// std.spirv.core: SPIR-V ")
+    putNumber(out, grammar.*.major)
+    put(out, ".")
+    putNumber(out, grammar.*.minor)
+    put(out, " (revision ")
+    putNumber(out, grammar.*.revision)
+    put(out, ") opcodes, operand kinds and enumerants, materialized\n")
+    put(out, "// from the SPIR-V core grammar (std/registry/spirv/spirv.core.grammar.json).\n//\n")
+    put(out, "// GENERATED by std/registry/spirv/materialize.sh -- do not edit.\n//\n")
+    put(out, "// Opcodes are Op members without the \"Op\" prefix (Op.typeVoid); value\n")
+    put(out, "// enumerations are enums (StorageClass.storageBuffer); bit enumerations are\n")
+    put(out, "// masks with constants (FUNCTION_CONTROL_INLINE). operandSignature describes\n")
+    put(out, "// the operands of an instruction for generic decoding (see std.spirv.module).\n\n")
+    put(out, "pub const MAGIC_NUMBER: u32 = ")
+    putNumber(out, grammar.*.magic)
+    put(out, "\npub const MAJOR_VERSION: u32 = ")
+    putNumber(out, grammar.*.major)
+    put(out, "\npub const MINOR_VERSION: u32 = ")
+    putNumber(out, grammar.*.minor)
+    put(out, "\npub const REVISION: u32 = ")
+    putNumber(out, grammar.*.revision)
+    put(out, "\n\n// The version word of a module header: 0x00MMmm00.\n")
+    put(out, "pub fn version(major: u32, minor: u32) -> u32 { return (major << 16) | (minor << 8) }\n\n")
+    put(out, "pub const CATEGORY_BIT_ENUM: u8 = 0\npub const CATEGORY_VALUE_ENUM: u8 = 1\npub const CATEGORY_ID: u8 = 2\n")
+    put(out, "pub const CATEGORY_LITERAL: u8 = 3\npub const CATEGORY_COMPOSITE: u8 = 4\n")
+}
+
+fn putOpcodes(out: *ArrayList, grammar: *const Grammar) -> void {
+    put(out, "\npub const Op = enum(u16, nonexhaustive) {\n")
+    var index: usize = 0
+    while index < grammar.*.instructions.length {
+        const instruction = instructionAt(grammar, index)
+        var name: Name = undefined
+        buildMember(&name, instruction.*.name, true, string.fromSlice("op"))
+        put(out, "    ")
+        putName(out, &name)
+        put(out, " = ")
+        putNumber(out, @intCast(u64, instruction.*.opcode))
+        put(out, ",\n")
+        index += 1
+    }
+    put(out, "}\n")
+    put(out, "\n// The grammar's name of an opcode (\"OpTypeVoid\"), or \"\" when unknown.\n")
+    put(out, "pub fn opcodeName(opcode: u32) -> []const u8 {\n    return match opcode {\n")
+    index = 0
+    while index < grammar.*.instructions.length {
+        const instruction = instructionAt(grammar, index)
+        put(out, "        ")
+        putNumber(out, @intCast(u64, instruction.*.opcode))
+        put(out, " => \"")
+        putString(out, instruction.*.name)
+        put(out, "\",\n")
+        index += 1
+    }
+    put(out, "        else => \"\",\n    }\n}\n")
+    put(out, "\n// Operand signature of an opcode (see OperandKind and kindOfCode), or \"?\"\n// when the opcode is unknown.\n")
+    put(out, "pub fn operandSignature(opcode: u32) -> []const u8 {\n    return match opcode {\n")
+    index = 0
+    while index < grammar.*.instructions.length {
+        const instruction = instructionAt(grammar, index)
+        put(out, "        ")
+        putNumber(out, @intCast(u64, instruction.*.opcode))
+        put(out, " => \"")
+        putSignature(out, grammar, instruction.*.operandStart, instruction.*.operandCount)
+        put(out, "\",\n")
+        index += 1
+    }
+    put(out, "        else => \"?\",\n    }\n}\n")
+}
+
+fn putKinds(out: *ArrayList, grammar: *const Grammar) -> void {
+    put(out, "\n// Operand kinds, in grammar order; kind k is written as byte kindCode(k) in\n// signatures.\n")
+    put(out, "pub const OperandKind = enum(u8) {\n")
+    var index: usize = 0
+    while index < grammar.*.kinds.length {
+        var name: Name = undefined
+        buildMember(&name, kindAt(grammar, index).*.name, false, string.fromSlice("kind"))
+        put(out, "    ")
+        putName(out, &name)
+        put(out, " = ")
+        putNumber(out, @intCast(u64, index))
+        put(out, ",\n")
+        index += 1
+    }
+    put(out, "}\n\npub const OPERAND_KIND_COUNT: usize = ")
+    putNumber(out, @intCast(u64, grammar.*.kinds.length))
+    put(out, "\n\n// The signature byte of operand kind `kind`, and back.\n")
+    put(out, "pub fn kindCode(kind: u8) -> u8 { return if kind >= 44 { kind + 49 } else { kind + 48 } }\n")
+    put(out, "pub fn kindOfCode(code: u8) -> u8 { return if code >= 93 { code - 49 } else { code - 48 } }\n")
+    put(out, "\npub fn kindCategory(kind: u8) -> u8 {\n    return match kind {\n")
+    index = 0
+    while index < grammar.*.kinds.length {
+        put(out, "        ")
+        putNumber(out, @intCast(u64, index))
+        put(out, " => ")
+        putNumber(out, @intCast(u64, kindAt(grammar, index).*.category))
+        put(out, ",\n")
+        index += 1
+    }
+    put(out, "        else => 255,\n    }\n}\n")
+    put(out, "\n// The grammar's name of an operand kind (\"IdRef\").\npub fn kindName(kind: u8) -> []const u8 {\n    return match kind {\n")
+    index = 0
+    while index < grammar.*.kinds.length {
+        put(out, "        ")
+        putNumber(out, @intCast(u64, index))
+        put(out, " => \"")
+        putString(out, kindAt(grammar, index).*.name)
+        put(out, "\",\n")
+        index += 1
+    }
+    put(out, "        else => \"\",\n    }\n}\n")
+    // Composite bases.
+    put(out, "\n// The signature of a composite kind's parts (PairLiteralIntegerIdRef ...).\npub fn compositeSignature(kind: u8) -> []const u8 {\n    return match kind {\n")
+    index = 0
+    while index < grammar.*.kinds.length {
+        const kind = kindAt(grammar, index)
+        if kind.*.category == CATEGORY_COMPOSITE {
+            put(out, "        ")
+            putNumber(out, @intCast(u64, index))
+            put(out, " => \"")
+            putSignature(out, grammar, kind.*.baseStart, kind.*.baseCount)
+            put(out, "\",\n")
+        }
+        index += 1
+    }
+    put(out, "        else => \"\",\n    }\n}\n")
+    // Well-known kinds.
+    put(out, "\n")
+    putKnownKind(out, grammar, "IdResultType", "KIND_ID_RESULT_TYPE")
+    putKnownKind(out, grammar, "IdResult", "KIND_ID_RESULT")
+    putKnownKind(out, grammar, "IdRef", "KIND_ID_REF")
+    putKnownKind(out, grammar, "IdScope", "KIND_ID_SCOPE")
+    putKnownKind(out, grammar, "IdMemorySemantics", "KIND_ID_MEMORY_SEMANTICS")
+    putKnownKind(out, grammar, "LiteralInteger", "KIND_LITERAL_INTEGER")
+    putKnownKind(out, grammar, "LiteralString", "KIND_LITERAL_STRING")
+    putKnownKind(out, grammar, "LiteralContextDependentNumber", "KIND_LITERAL_CONTEXT_DEPENDENT_NUMBER")
+    putKnownKind(out, grammar, "LiteralSpecConstantOpInteger", "KIND_LITERAL_SPEC_CONSTANT_OP_INTEGER")
+}
+
+fn putKnownKind(out: *ArrayList, grammar: *const Grammar, name: []const u8, constant: []const u8) -> void {
+    put(out, "pub const ")
+    put(out, constant)
+    put(out, ": u8 = ")
+    putNumber(out, @intCast(u64, findKind(grammar, string.fromSlice(name))))
+    put(out, "\n")
+}
+
+fn putEnumerations(out: *ArrayList, grammar: *const Grammar) -> void {
+    var index: usize = 0
+    while index < grammar.*.kinds.length {
+        const kind = kindAt(grammar, index)
+        if kind.*.category == CATEGORY_VALUE_ENUM {
+            put(out, "\npub const ")
+            putString(out, kind.*.name)
+            put(out, " = enum(u32, nonexhaustive) {\n")
+            var member: usize = 0
+            while member < kind.*.enumerantCount {
+                const enumerant = enumerantAt(grammar, kind.*.enumerantStart + member)
+                var name: Name = undefined
+                buildMember(&name, enumerant.*.name, false, kind.*.name)
+                put(out, "    ")
+                putName(out, &name)
+                put(out, " = ")
+                putNumber(out, enumerant.*.value)
+                put(out, ",\n")
+                member += 1
+            }
+            put(out, "}\n")
+        }
+        if kind.*.category == CATEGORY_BIT_ENUM {
+            put(out, "\npub const ")
+            putString(out, kind.*.name)
+            put(out, "Mask = u32\n")
+            var member: usize = 0
+            while member < kind.*.enumerantCount {
+                const enumerant = enumerantAt(grammar, kind.*.enumerantStart + member)
+                var name: Name = undefined
+                name.length = 0
+                appendUpperSnake(&name, kind.*.name)
+                nameAppend(&name, 95)
+                appendUpperSnake(&name, enumerant.*.name)
+                put(out, "pub const ")
+                putName(out, &name)
+                put(out, ": ")
+                putString(out, kind.*.name)
+                put(out, "Mask = ")
+                putNumber(out, enumerant.*.value)
+                put(out, "\n")
+                member += 1
+            }
+        }
+        index += 1
+    }
+}
+
+// Parameters that follow an enumerant operand (Decoration.builtIn takes a
+// BuiltIn; ExecutionMode.localSize three literals). For a bit enumeration,
+// `value` is a single bit.
+fn putParameters(out: *ArrayList, grammar: *const Grammar) -> void {
+    put(out, "\n// The signature of the parameters following enumerant `value` of operand\n// kind `kind` (for a bit enumeration, one bit at a time).\n")
+    put(out, "pub fn enumerantParameters(kind: u8, value: u32) -> []const u8 {\n")
+    var index: usize = 0
+    while index < grammar.*.kinds.length {
+        const kind = kindAt(grammar, index)
+        var any = false
+        var member: usize = 0
+        while member < kind.*.enumerantCount {
+            if enumerantAt(grammar, kind.*.enumerantStart + member).*.parameterCount > 0 { any = true }
+            member += 1
+        }
+        if any {
+            put(out, "    if kind == ")
+            putNumber(out, @intCast(u64, index))
+            put(out, " {\n        return match value {\n")
+            member = 0
+            while member < kind.*.enumerantCount {
+                const enumerant = enumerantAt(grammar, kind.*.enumerantStart + member)
+                if enumerant.*.parameterCount > 0 {
+                    put(out, "            ")
+                    putNumber(out, enumerant.*.value)
+                    put(out, " => \"")
+                    putSignature(out, grammar, enumerant.*.parameterStart, enumerant.*.parameterCount)
+                    put(out, "\",\n")
+                }
+                member += 1
+            }
+            put(out, "            else => \"\",\n        }\n    }\n")
+        }
+        index += 1
+    }
+    put(out, "    return \"\"\n}\n")
+}
+
+pub fn emit(grammar: *const Grammar, out: *ArrayList) -> void {
+    putHeader(out, grammar)
+    putKinds(out, grammar)
+    putOpcodes(out, grammar)
+    putEnumerations(out, grammar)
+    putParameters(out, grammar)
+}

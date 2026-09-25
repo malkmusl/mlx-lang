@@ -112,3 +112,24 @@ request, or an ordinary optimization hint, nor what happens when a requested
 function cannot be inlined. The canonical compiler therefore treats `inline`
 as a conservative best-effort request and `noinline` as a veto; failure to
 inline does not change program semantics or produce an invented diagnostic.
+
+### Foreign C functions on x86_64 Linux
+
+`spec/03-formats/elf64.xml` allows dynamic linking "after the static/bootstrap
+path" without fixing its shape, and `spec/01-abi/foreign-abi.xml` listed only
+`sysv`, `win64` and `syscall`. The compiler now accepts `extern("c")` (and
+`extern` without a string) as the target's C ABI, as on the aarch64-android
+branch, and writes a program that imports or exports functions as an
+`ET_EXEC` loaded by the system dynamic linker with `DT_NEEDED libc.so.6` plus
+each `--library NAME`. The `--library` option and always linking libc are
+provisional choices; `spec/01-abi/foreign-abi.xml` records the rules.
+
+### Vulkan in the standard library
+
+`spec/04-stdlib/std.xml` does not mention Vulkan. `std.vulkan` follows the
+Wayland precedent: the canonical registry (`vk.xml`) is materialized while
+the standard library is bootstrapped, by Mlx code, into a normal module. The
+naming (enum members in camelCase without their prefix, `VK_`-less constants,
+wrappers taking their dispatch table first), the selected extensions and the
+loader's behavior (one driver per `Driver`, no device merging or layers)
+are provisional std conventions, not normative mappings.

@@ -204,6 +204,21 @@ const Mode = enum(u8, nonexhaustive) {
 
 (`tests/98_nonexhaustive_enum_requires_else.mlx`)
 
+An enum is stored and loaded like its backing integer, so the members of an
+enum with a signed backing type may be negative and keep their value through
+struct fields, copies, parameters and `@enumFromInt` — including values a
+non-exhaustive enum does not name (Vulkan's `VkResult` error codes are
+negative `i32` values):
+
+```mlx
+const Result = enum(i32, nonexhaustive) { success = 0, timeout = 2, errorDeviceLost = -4, errorUnknown = -13, }
+
+holder.result = Result.errorDeviceLost
+if holder.result != Result.errorDeviceLost { return 1 }
+```
+
+(`tests/252_negative_enum_runtime.mlx`)
+
 ## Unions
 
 An untagged `union` has no hidden discriminator — the caller is responsible

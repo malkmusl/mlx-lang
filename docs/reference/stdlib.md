@@ -77,8 +77,8 @@ isolation.
 `std.mem std.heap std.fmt std.io std.fs std.math std.meta std.atomic
 std.Thread std.time std.process std.testing std.posix std.os std.json
 std.xml std.wayland` — several of which (`std.heap`, `std.math`,
-`std.atomic`, `std.json`) have no implementation under `std/` yet; those
-names are spec-only until a bootstrap or extensions module exists.
+`std.atomic`) have no implementation under `std/` yet; those names are
+spec-only until a bootstrap or extensions module exists.
 
 `std.xml` (`std/src/xml.mlx`) and `std.wayland` (`std/src/wayland.mlx` and
 `std/src/wayland/`) are implemented as Stage-1 extensions. They are imported
@@ -87,6 +87,13 @@ deliberately not re-exported from `std.mlx`, so programs that only use the
 compiler-core std do not load the generated protocol modules. See
 [Wayland](wayland.md) for the pipeline, runtime and tests
 (`tests/240_std_xml_tokenizer_runtime.mlx` covers `std.xml`).
+
+`std.json` (`std/src/json.mlx`), `std.vulkan` (`std/src/vulkan.mlx`,
+materialized from the Vulkan registry, with `std.vulkan.loader` and
+`std.vulkan.icd` in `std/src/vulkan/`) and `std.spirv.core`,
+`std.spirv.builder` and `std.spirv.module` (`std/src/spirv/`) are Stage-1
+extensions of the same kind; see [Vulkan, SPIR-V and JSON](vulkan.md)
+(`tests/248_json_runtime.mlx` covers `std.json`).
 
 ## Core: allocators
 

@@ -17,6 +17,17 @@ server runtimes. `wayland/generated/` holds the modules materialized from
 `std/protocols/wayland` and must not be edited by hand. Both are imported by
 name and are not re-exported from `std.mlx`.
 
+`json.mlx` (`std.json`) is the allocation-free JSON pull tokenizer.
+`vulkan.mlx` (`std.vulkan`) is the Vulkan API, materialized from
+`std/registry/vulkan/vk.xml` by `vulkan/registry.mlx` and
+`vulkan/materialize.mlx` — do not edit it by hand. `vulkan/loader.mlx`
+(`std.vulkan.loader`) finds and opens drivers without a C loader, and
+`vulkan/icd.mlx` (`std.vulkan.icd`) is the driver side of that interface.
+`spirv/core.mlx` (`std.spirv.core`, generated from
+`std/registry/spirv/spirv.core.grammar.json`), `spirv/builder.mlx` and
+`spirv/module.mlx` write, read and validate SPIR-V. See
+`docs/reference/vulkan.md`.
+
 `std.path`, `std.mode`, `std.parse`, `std.shell` and `std.calendar` provide
 coreutils-grade building blocks (path manipulation/canonicalization, chmod-style
 permission parsing, sized-number/duration parsing, POSIX-ish word splitting and
