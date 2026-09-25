@@ -1,0 +1,1048 @@
+// std.vulkan.materialize: writes the Mlx source of std.vulkan from a
+// resolved registry (see std.vulkan.registry and the bootstrap tool in
+// std/registry/vulkan).
+//
+// Mapping (documented for users in docs/reference/vulkan.md):
+//
+//   VkInstanceCreateInfo          InstanceCreateInfo (struct, C layout)
+//   VkInstance / VkBuffer         Instance = usize / Buffer = u64 (handles)
+//   VkResult, VkFormat, ...       enum(i32, nonexhaustive): Result.errorOutOfDateKhr
+//   VkBufferUsageFlags            BufferUsageFlags = Flags (u32 or u64)
+//   VK_BUFFER_USAGE_..._BIT       BUFFER_USAGE_..._BIT constants
+//   VK_MAX_EXTENSION_NAME_SIZE    MAX_EXTENSION_NAME_SIZE
+//   PFN_vkDebugUtils...           PFN_vkDebugUtils... = usize (function address)
+//   vkCreateInstance              PFN_vkCreateInstance (fn type), a slot in
+//                                 GlobalCommands, and the wrapper
+//                                 createInstance(&global, ...)
+//
+// Struct and union types are emitted in dependency order (the bootstrap
+// compiler needs a type declared before it is referenced); a pointer that
+// would close a cycle becomes `*anyopaque`. Pointer members are optional
+// (`?*const T`, or `?[*]const T` when the registry gives a length) so
+// `init()` can zero a struct. Every struct and union has `init()`, which
+// zeroes it and sets sType when the registry fixes it.
+
+const allocator_module = @import("../../bootstrap/allocator.mlx")
+const string = @import("../../bootstrap/string.mlx")
+const array_list = @import("../../bootstrap/array_list.mlx")
+const registry = @import("./registry.mlx")
+
+pub const Allocator = allocator_module.Allocator
+pub const String = string.String
+pub const ArrayList = array_list.ArrayList
+pub const Registry = registry.Registry
+
+const NONE: usize = 18446744073709551615
+
+const MARK_NONE: u8 = 0
+const MARK_ACTIVE: u8 = 1
+const MARK_DONE: u8 = 2
+
+const LEVEL_GLOBAL: u8 = 0
+const LEVEL_INSTANCE: u8 = 1
+const LEVEL_DEVICE: u8 = 2
+
+const Name = struct {
+    bytes: [160]u8
+    length: usize
+}
+
+const Emitter = struct {
+    registry: *Registry
+    out: *ArrayList
+    marks: [*]u8
+}
+
+// ---------------------------------------------------------------------------
+// Output helpers
+
+fn put(out: *ArrayList, text: []const u8) -> void {
+    for byte in text {
+        const ignored = ArrayList.appendAt(out, byte)
+    }
+}
+
+fn putByte(out: *ArrayList, byte: u8) -> void {
+    const ignored = ArrayList.appendAt(out, byte)
+}
+
+fn putString(out: *ArrayList, value: String) -> void {
+    var index: usize = 0
+    while index < value.length {
+        putByte(out, value.pointer[index])
+        index += 1
+    }
+}
+
+fn putUnsigned(out: *ArrayList, value: u64) -> void {
+    var digits: [24]u8 = undefined
+    var count: usize = 0
+    var rest = value
+    if rest == 0 {
+        putByte(out, 48)
+        return
+    }
+    while rest > 0 {
+        digits[count] = @intCast(u8, 48 + rest % 10)
+        rest = rest / 10
+        count += 1
+    }
+    while count > 0 {
+        count -= 1
+        putByte(out, digits[count])
+    }
+}
+
+fn putSigned(out: *ArrayList, value: i64) -> void {
+    if value < 0 {
+        putByte(out, 45)
+        putUnsigned(out, @intCast(u64, 0 - value))
+        return
+    }
+    putUnsigned(out, @intCast(u64, value))
+}
+
+fn putName(out: *ArrayList, name: *const Name) -> void {
+    var index: usize = 0
+    while index < name.*.length {
+        putByte(out, name.*.bytes[index])
+        index += 1
+    }
+}
+
+fn nameAppend(name: *Name, byte: u8) -> void {
+    if name.*.length < 159 {
+        name.*.bytes[name.*.length] = byte
+        name.*.length += 1
+    }
+}
+
+fn nameEquals(name: *const Name, text: []const u8) -> bool {
+    var index: usize = 0
+    for byte in text {
+        if index >= name.*.length || name.*.bytes[index] != byte { return false }
+        index += 1
+    }
+    return index == name.*.length
+}
+
+fn equals(value: String, text: []const u8) -> bool { return registry.equals(value, text) }
+
+fn startsWith(value: String, prefix: []const u8) -> bool {
+    var index: usize = 0
+    for byte in prefix {
+        if index >= value.length || value.pointer[index] != byte { return false }
+        index += 1
+    }
+    return true
+}
+
+fn tail(value: String, start: usize) -> String {
+    if start >= value.length { return string.fromParts(value.pointer, 0) }
+    unsafe { return string.fromParts(@ptrFromInt([*]const u8, @intFromPtr(value.pointer) + start), value.length - start) }
+}
+
+fn isDigit(byte: u8) -> bool { return byte >= 48 && byte <= 57 }
+fn isUpper(byte: u8) -> bool { return byte >= 65 && byte <= 90 }
+fn isLower(byte: u8) -> bool { return byte >= 97 && byte <= 122 }
+fn lower(byte: u8) -> u8 { return if isUpper(byte) { byte + 32 } else { byte } }
+fn upper(byte: u8) -> u8 { return if isLower(byte) { byte - 32 } else { byte } }
+
+fn isKeyword(name: *const Name) -> bool {
+    if nameEquals(name, "align") || nameEquals(name, "anytype") || nameEquals(name, "bool") || nameEquals(name, "break") { return true }
+    if nameEquals(name, "comptime") || nameEquals(name, "const") || nameEquals(name, "continue") || nameEquals(name, "defer") { return true }
+    if nameEquals(name, "else") || nameEquals(name, "enum") || nameEquals(name, "errdefer") || nameEquals(name, "error") { return true }
+    if nameEquals(name, "export") || nameEquals(name, "extern") || nameEquals(name, "false") || nameEquals(name, "fn") { return true }
+    if nameEquals(name, "for") || nameEquals(name, "if") || nameEquals(name, "in") || nameEquals(name, "inline") { return true }
+    if nameEquals(name, "isize") || nameEquals(name, "match") || nameEquals(name, "noinline") || nameEquals(name, "nonexhaustive") { return true }
+    if nameEquals(name, "noreturn") || nameEquals(name, "null") || nameEquals(name, "packed") || nameEquals(name, "pub") { return true }
+    if nameEquals(name, "return") || nameEquals(name, "struct") || nameEquals(name, "test") || nameEquals(name, "threadlocal") { return true }
+    if nameEquals(name, "true") || nameEquals(name, "try") || nameEquals(name, "type") || nameEquals(name, "undefined") { return true }
+    if nameEquals(name, "union") || nameEquals(name, "unsafe") || nameEquals(name, "usize") || nameEquals(name, "var") { return true }
+    if nameEquals(name, "void") || nameEquals(name, "volatile") || nameEquals(name, "while") || nameEquals(name, "Self") { return true }
+    if nameEquals(name, "unreachable") || nameEquals(name, "anyopaque") || nameEquals(name, "orelse") || nameEquals(name, "and") || nameEquals(name, "or") { return true }
+    if name.*.length >= 2 && (name.*.bytes[0] == 105 || name.*.bytes[0] == 117 || name.*.bytes[0] == 102) {
+        var index: usize = 1
+        while index < name.*.length {
+            if !isDigit(name.*.bytes[index]) { return false }
+            index += 1
+        }
+        return true
+    }
+    return false
+}
+
+// A member, parameter or field name, escaped when it is a keyword.
+fn putIdentifier(out: *ArrayList, value: String) -> void {
+    var name: Name = undefined
+    name.length = 0
+    var index: usize = 0
+    while index < value.length {
+        nameAppend(&name, value.pointer[index])
+        index += 1
+    }
+    if isKeyword(&name) { nameAppend(&name, 95) }
+    putName(out, &name)
+}
+
+// "VkInstanceCreateInfo" -> "InstanceCreateInfo".
+fn putTypeName(out: *ArrayList, value: String) -> void {
+    if startsWith(value, "Vk") {
+        putString(out, tail(value, 2))
+        return
+    }
+    putString(out, value)
+}
+
+// "VK_MAX_EXTENSION_NAME_SIZE" -> "MAX_EXTENSION_NAME_SIZE".
+fn putConstantName(out: *ArrayList, value: String) -> void {
+    if startsWith(value, "VK_") {
+        putString(out, tail(value, 3))
+        return
+    }
+    putString(out, value)
+}
+
+// "vkCreateInstance" -> "createInstance".
+fn putFunctionName(out: *ArrayList, value: String) -> void {
+    const rest = if startsWith(value, "vk") { tail(value, 2) } else { value }
+    var index: usize = 0
+    while index < rest.length {
+        putByte(out, if index == 0 { lower(rest.pointer[index]) } else { rest.pointer[index] })
+        index += 1
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Enumerant names: VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO in VkStructureType
+// becomes instanceCreateInfo, VK_PRESENT_MODE_FIFO_KHR in VkPresentModeKHR
+// becomes fifo, VK_ERROR_OUT_OF_DATE_KHR in VkResult errorOutOfDateKhr and
+// VK_IMAGE_TYPE_2D type2d.
+
+// The enumerant prefix of an enum type ("VK_PRESENT_MODE_") and its vendor
+// tag ("KHR", possibly empty).
+fn enumPrefix(type_name: String, prefix: *Name, tag: *Name) -> void {
+    prefix.*.length = 0
+    tag.*.length = 0
+    const body = if startsWith(type_name, "Vk") { tail(type_name, 2) } else { type_name }
+    // Trailing run of capitals (two or more) is a vendor tag.
+    var end = body.length
+    while end > 0 && isUpper(body.pointer[end - 1]) { end -= 1 }
+    if body.length - end < 2 { end = body.length }
+    nameAppend(prefix, 86)
+    nameAppend(prefix, 75)
+    nameAppend(prefix, 95)
+    var index: usize = 0
+    while index < end {
+        const byte = body.pointer[index]
+        if index > 0 && isUpper(byte) && (isLower(body.pointer[index - 1]) || isDigit(body.pointer[index - 1])) { nameAppend(prefix, 95) }
+        nameAppend(prefix, upper(byte))
+        index += 1
+    }
+    nameAppend(prefix, 95)
+    index = end
+    while index < body.length {
+        nameAppend(tag, body.pointer[index])
+        index += 1
+    }
+}
+
+fn buildEnumerantName(result: *Name, prefix: *const Name, tag: *const Name, value: String) -> void {
+    result.*.length = 0
+    // Strip the type's prefix, else "VK_".
+    var start: usize = 0
+    var matches = prefix.*.length <= value.length
+    var index: usize = 0
+    while matches && index < prefix.*.length {
+        if value.pointer[index] != prefix.*.bytes[index] { matches = false }
+        index += 1
+    }
+    if matches { start = prefix.*.length } else if startsWith(value, "VK_") { start = 3 }
+    var end = value.length
+    // Strip "_<TAG>" when it repeats the type's vendor tag.
+    if tag.*.length > 0 && end > start + tag.*.length + 1 {
+        var tagged = value.pointer[end - tag.*.length - 1] == 95
+        var position: usize = 0
+        while tagged && position < tag.*.length {
+            if value.pointer[end - tag.*.length + position] != tag.*.bytes[position] { tagged = false }
+            position += 1
+        }
+        if tagged { end = end - tag.*.length - 1 }
+    }
+    if start < end && isDigit(value.pointer[start]) {
+        // Borrow the prefix's last word: IMAGE_TYPE_ + 2D -> type2d.
+        var word_start = prefix.*.length - 1
+        while word_start > 0 && prefix.*.bytes[word_start - 1] != 95 { word_start -= 1 }
+        var position = word_start
+        while position + 1 < prefix.*.length {
+            nameAppend(result, lower(prefix.*.bytes[position]))
+            position += 1
+        }
+    }
+    var capital = false
+    index = start
+    while index < end {
+        const byte = value.pointer[index]
+        if byte == 95 {
+            capital = result.*.length > 0
+        } else {
+            nameAppend(result, if capital { upper(byte) } else { lower(byte) })
+            capital = false
+        }
+        index += 1
+    }
+    if isKeyword(result) { nameAppend(result, 95) }
+}
+
+// ---------------------------------------------------------------------------
+// Type references
+
+fn scalarName(name: String) -> []const u8 {
+    if equals(name, "uint8_t") { return "u8" }
+    if equals(name, "int8_t") { return "i8" }
+    if equals(name, "uint16_t") { return "u16" }
+    if equals(name, "int16_t") { return "i16" }
+    if equals(name, "uint32_t") { return "u32" }
+    if equals(name, "int32_t") { return "i32" }
+    if equals(name, "uint64_t") { return "u64" }
+    if equals(name, "int64_t") { return "i64" }
+    if equals(name, "size_t") { return "usize" }
+    if equals(name, "float") { return "f32" }
+    if equals(name, "double") { return "f64" }
+    if equals(name, "char") { return "u8" }
+    if equals(name, "int") { return "i32" }
+    if equals(name, "void") { return "void" }
+    return ""
+}
+
+fn isScalar(name: String) -> bool {
+    var length: usize = 0
+    for byte in scalarName(name) { length += 1 }
+    return length > 0
+}
+
+// True when a type is only usable behind a pointer (platform types such as
+// wl_display, opaque base types such as ANativeWindow, and void).
+fn isOpaque(emitter: *Emitter, name: String) -> bool {
+    if equals(name, "void") { return true }
+    if isScalar(name) { return false }
+    const index = registry.findType(emitter.*.registry, name)
+    if index == NONE { return true }
+    const value = registry.typeAt(emitter.*.registry, index)
+    if value.*.alias.length > 0 { return isOpaque(emitter, value.*.alias) }
+    if value.*.category == registry.CATEGORY_OPAQUE { return true }
+    if value.*.category == registry.CATEGORY_BASETYPE && value.*.base.length == 0 { return true }
+    return false
+}
+
+fn isAggregate(emitter: *Emitter, name: String) -> usize {
+    const index = registry.findType(emitter.*.registry, name)
+    if index == NONE { return NONE }
+    const value = registry.typeAt(emitter.*.registry, index)
+    if value.*.alias.length > 0 { return isAggregate(emitter, value.*.alias) }
+    if value.*.category == registry.CATEGORY_STRUCT || value.*.category == registry.CATEGORY_UNION { return index }
+    return NONE
+}
+
+fn putBaseType(emitter: *Emitter, name: String) -> void {
+    const out = emitter.*.out
+    const scalar = scalarName(name)
+    var length: usize = 0
+    for byte in scalar { length += 1 }
+    if length > 0 {
+        put(out, scalar)
+        return
+    }
+    if isOpaque(emitter, name) {
+        put(out, "anyopaque")
+        return
+    }
+    putTypeName(out, name)
+}
+
+// Array dimension: a number or an API constant name.
+fn putDimension(emitter: *Emitter, text: String) -> void {
+    const out = emitter.*.out
+    if text.length > 0 && isDigit(text.pointer[0]) {
+        putString(out, text)
+        return
+    }
+    const index = registry.findEnumerant(emitter.*.registry, text)
+    if index != NONE {
+        putString(out, registry.enumerantAt(emitter.*.registry, index).*.text)
+        return
+    }
+    putString(out, text)
+}
+
+fn putArrayPrefix(emitter: *Emitter, member: *const registry.Member) -> void {
+    if member.*.arrayLength.length > 0 {
+        putByte(emitter.*.out, 91)
+        putDimension(emitter, member.*.arrayLength)
+        putByte(emitter.*.out, 93)
+    }
+    if member.*.arrayLength2.length > 0 {
+        putByte(emitter.*.out, 91)
+        putDimension(emitter, member.*.arrayLength2)
+        putByte(emitter.*.out, 93)
+    }
+}
+
+// A pointer to a struct that is not declared yet (a cycle) is opaque.
+fn pointeeUnavailable(emitter: *Emitter, name: String) -> bool {
+    const aggregate = isAggregate(emitter, name)
+    return aggregate != NONE && emitter.*.marks[aggregate] != MARK_DONE
+}
+
+// The Mlx type of a struct member (`in_struct`) or command parameter.
+fn putMemberType(emitter: *Emitter, member: *const registry.Member, in_struct: bool) -> void {
+    const out = emitter.*.out
+    const is_const = member.*.constMask & 1 != 0
+    const optional = in_struct || member.*.optional
+    if member.*.pointers == 0 {
+        if !in_struct && member.*.arrayLength.length > 0 {
+            // An array parameter decays to a pointer to the array.
+            put(out, if is_const { "*const " } else { "*" })
+        }
+        putArrayPrefix(emitter, member)
+        putBaseType(emitter, member.*.typeName)
+        return
+    }
+    const is_char = equals(member.*.typeName, "char")
+    if member.*.pointers >= 2 {
+        // `const char* const* ppEnabledExtensionNames`, `void** ppData`.
+        if optional { putByte(out, 63) }
+        put(out, if member.*.length.length > 0 { "[*]" } else { "*" })
+        if member.*.constMask & 2 != 0 { put(out, "const ") }
+        if is_char {
+            put(out, if is_const { "[*]const u8" } else { "[*]u8" })
+        } else if isOpaque(emitter, member.*.typeName) || pointeeUnavailable(emitter, member.*.typeName) {
+            put(out, if is_const { "?*const anyopaque" } else { "?*anyopaque" })
+        } else {
+            put(out, if is_const { "*const " } else { "*" })
+            putBaseType(emitter, member.*.typeName)
+        }
+        return
+    }
+    if optional { putByte(out, 63) }
+    if isOpaque(emitter, member.*.typeName) || pointeeUnavailable(emitter, member.*.typeName) {
+        put(out, if is_const { "*const anyopaque" } else { "*anyopaque" })
+        return
+    }
+    const many = is_char || member.*.length.length > 0
+    put(out, if many { "[*]" } else { "*" })
+    if is_const { put(out, "const ") }
+    putBaseType(emitter, member.*.typeName)
+}
+
+// ---------------------------------------------------------------------------
+// Sections
+
+fn putHeader(emitter: *Emitter) -> void {
+    const out = emitter.*.out
+    const reg = emitter.*.registry
+    put(out, "// std.vulkan: the Vulkan API for Mlx, materialized from the Vulkan API\n")
+    put(out, "// registry (std/registry/vulkan/vk.xml, header version ")
+    putUnsigned(out, @intCast(u64, reg.*.headerVersion))
+    put(out, ").\n//\n// GENERATED by std/registry/vulkan/materialize.sh -- do not edit.\n//\n")
+    put(out, "// Features: VK_VERSION_1_0")
+    var minor: u8 = 1
+    while minor <= reg.*.selection.maxMinor {
+        put(out, ", VK_VERSION_1_")
+        putUnsigned(out, @intCast(u64, minor))
+        minor += 1
+    }
+    put(out, "\n// Extensions:")
+    var index: usize = 0
+    while index < reg.*.selection.extensionCount {
+        put(out, if index % 3 == 0 { "\n//   " } else { " " })
+        putString(out, reg.*.selection.extensions[index])
+        index += 1
+    }
+    put(out, "\n//\n// Naming, layout and loading are described in docs/reference/vulkan.md.\n\n")
+    put(out, "const vulkan_mem = @import(\"../bootstrap/mem.mlx\")\n\n")
+    put(out, "pub const HEADER_VERSION: u32 = ")
+    putUnsigned(out, @intCast(u64, reg.*.headerVersion))
+    put(out, "\n\n")
+    put(out, "pub fn makeApiVersion(variant: u32, major: u32, minor: u32, patch: u32) -> u32 {\n")
+    put(out, "    return (variant << 29) | (major << 22) | (minor << 12) | patch\n}\n\n")
+    put(out, "pub fn apiVersionVariant(version: u32) -> u32 { return version >> 29 }\n")
+    put(out, "pub fn apiVersionMajor(version: u32) -> u32 { return (version >> 22) & 127 }\n")
+    put(out, "pub fn apiVersionMinor(version: u32) -> u32 { return (version >> 12) & 1023 }\n")
+    put(out, "pub fn apiVersionPatch(version: u32) -> u32 { return version & 4095 }\n\n")
+    minor = 0
+    while minor <= reg.*.selection.maxMinor {
+        put(out, "pub const API_VERSION_1_")
+        putUnsigned(out, @intCast(u64, minor))
+        put(out, ": u32 = ")
+        putUnsigned(out, @intCast(u64, (1 << 22) | (@intCast(usize, minor) << 12)))
+        put(out, "\n")
+        minor += 1
+    }
+    put(out, "\n// The null value of every handle type.\npub const NULL_HANDLE: u64 = 0\n")
+}
+
+fn putBaseTypes(emitter: *Emitter) -> void {
+    const out = emitter.*.out
+    const reg = emitter.*.registry
+    put(out, "\n// ---------------------------------------------------------------------------\n// Base types\n\n")
+    var index: usize = 0
+    while index < registry.typeCount(reg) {
+        const value = registry.typeAt(reg, index)
+        if value.*.required && value.*.category == registry.CATEGORY_BASETYPE && value.*.base.length > 0 && value.*.alias.length == 0 {
+            put(out, "pub const ")
+            putTypeName(out, value.*.name)
+            put(out, " = ")
+            putBaseType(emitter, value.*.base)
+            put(out, "\n")
+        }
+        index += 1
+    }
+}
+
+fn putHandles(emitter: *Emitter) -> void {
+    const out = emitter.*.out
+    const reg = emitter.*.registry
+    put(out, "\n// ---------------------------------------------------------------------------\n")
+    put(out, "// Handles: dispatchable handles are pointers (usize), the others 64-bit\n// values.\n\n")
+    var index: usize = 0
+    while index < registry.typeCount(reg) {
+        const value = registry.typeAt(reg, index)
+        if value.*.required && value.*.category == registry.CATEGORY_HANDLE && value.*.alias.length == 0 {
+            put(out, "pub const ")
+            putTypeName(out, value.*.name)
+            put(out, if equals(value.*.base, "VK_DEFINE_HANDLE") { " = usize\n" } else { " = u64\n" })
+        }
+        index += 1
+    }
+}
+
+// "(~0U)" -> 4294967295, "(~0ULL)" -> 18446744073709551615, "256U" -> 256.
+fn putConstantValue(out: *ArrayList, text: String, wide: bool) -> bool {
+    if startsWith(text, "(~") {
+        var complement: u64 = 0
+        var index: usize = 2
+        while index < text.length && isDigit(text.pointer[index]) {
+            complement = complement * 10 + @intCast(u64, text.pointer[index] - 48)
+            index += 1
+        }
+        const maximum: u64 = if wide { 18446744073709551615 } else { 4294967295 }
+        putUnsigned(out, maximum - complement)
+        return true
+    }
+    var index: usize = 0
+    var any = false
+    while index < text.length && isDigit(text.pointer[index]) {
+        putByte(out, text.pointer[index])
+        any = true
+        index += 1
+    }
+    return any
+}
+
+fn putConstants(emitter: *Emitter) -> void {
+    const out = emitter.*.out
+    const reg = emitter.*.registry
+    put(out, "\n// ---------------------------------------------------------------------------\n// API and extension constants\n\n")
+    const constants_block = registry.findBlock(reg, string.fromSlice("API Constants"))
+    var index: usize = 0
+    while index < registry.enumerantCount(reg) {
+        const value = registry.enumerantAt(reg, index)
+        if value.*.alias.length == 0 && value.*.block == constants_block && constants_block != NONE {
+            const wide = equals(value.*.constantType, "uint64_t")
+            if equals(value.*.constantType, "uint32_t") || wide {
+                put(out, "pub const ")
+                putConstantName(out, value.*.name)
+                put(out, if wide { ": u64 = " } else { ": u32 = " })
+                const written = putConstantValue(out, value.*.text, wide)
+                put(out, "\n")
+            }
+        }
+        if value.*.alias.length == 0 && value.*.block == NONE && value.*.required {
+            // An extension's SPEC_VERSION (a number) or EXTENSION_NAME ("&quot;name&quot;").
+            if startsWith(value.*.text, "&quot;") && value.*.text.length > 12 {
+                put(out, "pub const ")
+                putConstantName(out, value.*.name)
+                put(out, " = \"")
+                putString(out, string.fromParts(tail(value.*.text, 6).pointer, value.*.text.length - 12))
+                put(out, "\"\n")
+            } else if value.*.text.length > 0 && isDigit(value.*.text.pointer[0]) {
+                put(out, "pub const ")
+                putConstantName(out, value.*.name)
+                put(out, ": u32 = ")
+                putString(out, value.*.text)
+                put(out, "\n")
+            }
+        }
+        index += 1
+    }
+}
+
+fn blockBitwidth(emitter: *Emitter, block: usize) -> u8 {
+    if block == NONE { return 32 }
+    return registry.blockAt(emitter.*.registry, block).*.bitwidth
+}
+
+fn putEnumerations(emitter: *Emitter) -> void {
+    const out = emitter.*.out
+    const reg = emitter.*.registry
+    put(out, "\n// ---------------------------------------------------------------------------\n// Enumerations\n")
+    var index: usize = 0
+    while index < registry.typeCount(reg) {
+        const value = registry.typeAt(reg, index)
+        if value.*.required && value.*.category == registry.CATEGORY_ENUM && value.*.alias.length == 0 && value.*.block != NONE {
+            const block = registry.blockAt(reg, value.*.block)
+            if block.*.kind == registry.BLOCK_ENUM { putEnumeration(emitter, value.*.name, value.*.block) }
+        }
+        index += 1
+    }
+}
+
+fn putEnumeration(emitter: *Emitter, type_name: String, block: usize) -> void {
+    const out = emitter.*.out
+    const reg = emitter.*.registry
+    var prefix: Name = undefined
+    var tag: Name = undefined
+    enumPrefix(type_name, &prefix, &tag)
+    put(out, "\npub const ")
+    putTypeName(out, type_name)
+    put(out, " = enum(i32, nonexhaustive) {\n")
+    // Names already used in this enumeration (NUL separated).
+    var used: ArrayList = ArrayList.init(reg.*.allocator, 1024)
+    var index: usize = 0
+    while index < registry.enumerantCount(reg) {
+        const value = registry.enumerantAt(reg, index)
+        if value.*.block == block && value.*.alias.length == 0 {
+            var name: Name = undefined
+            buildEnumerantName(&name, &prefix, &tag, value.*.name)
+            if !nameUsed(&used, &name) {
+                var position: usize = 0
+                while position < name.length {
+                    const appended = ArrayList.appendAt(&used, name.bytes[position])
+                    position += 1
+                }
+                const separator = ArrayList.appendAt(&used, 0)
+                put(out, "    ")
+                putName(out, &name)
+                put(out, " = ")
+                putSigned(out, value.*.value)
+                put(out, ",\n")
+            }
+        }
+        index += 1
+    }
+    ArrayList.deinit(used)
+    put(out, "}\n")
+}
+
+fn nameUsed(used: *const ArrayList, name: *const Name) -> bool {
+    var start: usize = 0
+    var index: usize = 0
+    while index < used.*.length {
+        if used.*.items[index] == 0 {
+            if index - start == name.*.length {
+                var same = true
+                var position: usize = 0
+                while same && position < name.*.length {
+                    if used.*.items[start + position] != name.*.bytes[position] { same = false }
+                    position += 1
+                }
+                if same { return true }
+            }
+            start = index + 1
+        }
+        index += 1
+    }
+    return false
+}
+
+fn putBitmasks(emitter: *Emitter) -> void {
+    const out = emitter.*.out
+    const reg = emitter.*.registry
+    put(out, "\n// ---------------------------------------------------------------------------\n// Bitmasks and their bits\n")
+    var index: usize = 0
+    while index < registry.typeCount(reg) {
+        const value = registry.typeAt(reg, index)
+        if value.*.required && value.*.alias.length == 0 && value.*.category == registry.CATEGORY_BITMASK {
+            put(out, "\npub const ")
+            putTypeName(out, value.*.name)
+            put(out, if equals(value.*.base, "VkFlags64") { " = Flags64\n" } else { " = Flags\n" })
+        }
+        if value.*.required && value.*.alias.length == 0 && value.*.category == registry.CATEGORY_ENUM && value.*.block == NONE {
+            // Declared without any enumerants.
+            put(out, "\npub const ")
+            putTypeName(out, value.*.name)
+            put(out, if registry.contains(value.*.name, "FlagBits") { " = Flags\n" } else { " = i32\n" })
+        }
+        if value.*.required && value.*.alias.length == 0 && value.*.category == registry.CATEGORY_ENUM && value.*.block != NONE {
+            const block = registry.blockAt(reg, value.*.block)
+            if block.*.kind == registry.BLOCK_BITMASK {
+                const wide = block.*.bitwidth == 64
+                put(out, "\npub const ")
+                putTypeName(out, value.*.name)
+                put(out, if wide { " = Flags64\n" } else { " = Flags\n" })
+                var bit: usize = 0
+                while bit < registry.enumerantCount(reg) {
+                    const enumerant = registry.enumerantAt(reg, bit)
+                    if enumerant.*.block == value.*.block && enumerant.*.alias.length == 0 {
+                        put(out, "pub const ")
+                        putConstantName(out, enumerant.*.name)
+                        put(out, ": ")
+                        putTypeName(out, value.*.name)
+                        put(out, " = ")
+                        if wide {
+                            putUnsigned(out, @bitCast(u64, enumerant.*.value))
+                        } else {
+                            putUnsigned(out, @bitCast(u64, enumerant.*.value) & 4294967295)
+                        }
+                        put(out, "\n")
+                    }
+                    bit += 1
+                }
+            }
+        }
+        index += 1
+    }
+}
+
+fn putFunctionPointers(emitter: *Emitter) -> void {
+    const out = emitter.*.out
+    const reg = emitter.*.registry
+    put(out, "\n// ---------------------------------------------------------------------------\n")
+    put(out, "// Callback types: the address of a function with the C calling convention\n// (for an Mlx function: @intFromPtr(function)).\n\n")
+    var index: usize = 0
+    while index < registry.typeCount(reg) {
+        const value = registry.typeAt(reg, index)
+        if value.*.required && value.*.category == registry.CATEGORY_FUNCPOINTER {
+            put(out, "pub const ")
+            putString(out, value.*.name)
+            put(out, " = usize\n")
+        }
+        index += 1
+    }
+}
+
+fn putAliases(emitter: *Emitter) -> void {
+    const out = emitter.*.out
+    const reg = emitter.*.registry
+    var any = false
+    var index: usize = 0
+    while index < registry.typeCount(reg) {
+        const value = registry.typeAt(reg, index)
+        if value.*.required && value.*.alias.length > 0 {
+            if !any {
+                put(out, "\n// ---------------------------------------------------------------------------\n// Type aliases\n\n")
+                any = true
+            }
+            put(out, "pub const ")
+            putTypeName(out, value.*.name)
+            put(out, " = ")
+            putTypeName(out, value.*.alias)
+            put(out, "\n")
+        }
+        index += 1
+    }
+}
+
+// Emits a struct or union after the aggregates it depends on.
+fn putAggregate(emitter: *Emitter, index: usize) -> void {
+    if emitter.*.marks[index] != MARK_NONE { return }
+    emitter.*.marks[index] = MARK_ACTIVE
+    const reg = emitter.*.registry
+    const value = registry.typeAt(reg, index)
+    var member: usize = 0
+    while member < value.*.memberCount {
+        const field = registry.memberAt(reg, value.*.memberStart + member)
+        const dependency = isAggregate(emitter, field.*.typeName)
+        if dependency != NONE && dependency != index { putAggregate(emitter, dependency) }
+        member += 1
+    }
+    const out = emitter.*.out
+    put(out, "\npub const ")
+    putTypeName(out, value.*.name)
+    put(out, if value.*.category == registry.CATEGORY_UNION { " = union {\n" } else { " = struct {\n" })
+    var s_type = string.fromParts(reg.*.source, 0)
+    member = 0
+    while member < value.*.memberCount {
+        const field = registry.memberAt(reg, value.*.memberStart + member)
+        put(out, "    ")
+        putIdentifier(out, field.*.name)
+        put(out, ": ")
+        if field.*.bitfield {
+            put(out, "u32 // bitfield in C\n")
+        } else if equals(field.*.name, "pNext") {
+            put(out, if field.*.constMask & 1 != 0 { "?*const anyopaque\n" } else { "?*anyopaque\n" })
+        } else {
+            putMemberType(emitter, field, true)
+            put(out, "\n")
+        }
+        if equals(field.*.name, "sType") && field.*.values.length > 0 { s_type = field.*.values }
+        member += 1
+    }
+    put(out, "\n    pub fn init() -> Self {\n        var value: Self = undefined\n")
+    put(out, "        unsafe { vulkan_mem.zero(@ptrCast([*]u8, &value), @sizeOf(Self)) }\n")
+    if s_type.length > 0 {
+        var prefix: Name = undefined
+        var tag: Name = undefined
+        enumPrefix(string.fromSlice("VkStructureType"), &prefix, &tag)
+        var name: Name = undefined
+        buildEnumerantName(&name, &prefix, &tag, s_type)
+        put(out, "        value.sType = StructureType.")
+        putName(out, &name)
+        put(out, "\n")
+    }
+    put(out, "        return value\n    }\n}\n")
+    emitter.*.marks[index] = MARK_DONE
+}
+
+fn putAggregates(emitter: *Emitter) -> void {
+    const out = emitter.*.out
+    const reg = emitter.*.registry
+    put(out, "\n// ---------------------------------------------------------------------------\n// Structures and unions\n")
+    var index: usize = 0
+    while index < registry.typeCount(reg) {
+        const value = registry.typeAt(reg, index)
+        if value.*.required && value.*.alias.length == 0 && (value.*.category == registry.CATEGORY_STRUCT || value.*.category == registry.CATEGORY_UNION) {
+            putAggregate(emitter, index)
+        }
+        index += 1
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Commands
+
+fn firstParameterType(reg: *Registry, command: *const registry.Command) -> String {
+    if command.*.paramCount == 0 { return string.fromParts(reg.*.source, 0) }
+    return registry.memberAt(reg, command.*.paramStart).*.typeName
+}
+
+fn commandLevel(reg: *Registry, command: *const registry.Command) -> u8 {
+    if equals(command.*.name, "vkGetInstanceProcAddr") { return LEVEL_GLOBAL }
+    if equals(command.*.name, "vkGetDeviceProcAddr") { return LEVEL_INSTANCE }
+    const first = firstParameterType(reg, command)
+    if equals(first, "VkInstance") || equals(first, "VkPhysicalDevice") { return LEVEL_INSTANCE }
+    if equals(first, "VkDevice") || equals(first, "VkQueue") || equals(first, "VkCommandBuffer") { return LEVEL_DEVICE }
+    return LEVEL_GLOBAL
+}
+
+fn isEmitted(command: *const registry.Command) -> bool {
+    return command.*.required && command.*.alias.length == 0
+}
+
+fn putReturnType(emitter: *Emitter, command: *const registry.Command) -> void {
+    const out = emitter.*.out
+    if equals(command.*.returnType, "void*") {
+        put(out, "?*anyopaque")
+        return
+    }
+    const index = registry.findType(emitter.*.registry, command.*.returnType)
+    if index != NONE && registry.typeAt(emitter.*.registry, index).*.category == registry.CATEGORY_FUNCPOINTER {
+        put(out, "usize")
+        return
+    }
+    putBaseType(emitter, command.*.returnType)
+}
+
+fn putParameters(emitter: *Emitter, command: *const registry.Command, with_names: bool) -> void {
+    const out = emitter.*.out
+    var parameter: usize = 0
+    while parameter < command.*.paramCount {
+        const member = registry.memberAt(emitter.*.registry, command.*.paramStart + parameter)
+        if parameter > 0 || with_names { put(out, ", ") }
+        if with_names {
+            putIdentifier(out, member.*.name)
+            put(out, ": ")
+        }
+        putMemberType(emitter, member, false)
+        parameter += 1
+    }
+}
+
+fn putCommandTypes(emitter: *Emitter) -> void {
+    const out = emitter.*.out
+    const reg = emitter.*.registry
+    put(out, "\n// ---------------------------------------------------------------------------\n// Command function types\n\n")
+    var index: usize = 0
+    while index < registry.commandCount(reg) {
+        const command = registry.commandAt(reg, index)
+        if isEmitted(command) {
+            put(out, "pub const PFN_")
+            putString(out, command.*.name)
+            put(out, " = fn(")
+            putParameters(emitter, command, false)
+            put(out, ") -> ")
+            putReturnType(emitter, command)
+            put(out, "\n")
+        }
+        index += 1
+    }
+}
+
+fn levelTable(level: u8) -> []const u8 {
+    if level == LEVEL_GLOBAL { return "GlobalCommands" }
+    if level == LEVEL_INSTANCE { return "InstanceCommands" }
+    return "DeviceCommands"
+}
+
+fn putTables(emitter: *Emitter) -> void {
+    const out = emitter.*.out
+    const reg = emitter.*.registry
+    put(out, "\n// ---------------------------------------------------------------------------\n")
+    put(out, "// Dispatch tables: the address of each command (0 when the implementation\n")
+    put(out, "// does not provide it), filled by loadGlobalCommands, loadInstanceCommands\n")
+    put(out, "// and loadDeviceCommands.\n")
+    var level: u8 = 0
+    while level <= LEVEL_DEVICE {
+        put(out, "\npub const ")
+        put(out, levelTable(level))
+        put(out, " = struct {\n")
+        var index: usize = 0
+        while index < registry.commandCount(reg) {
+            const command = registry.commandAt(reg, index)
+            if isEmitted(command) && commandLevel(reg, command) == level {
+                put(out, "    ")
+                putString(out, command.*.name)
+                put(out, ": usize\n")
+            }
+            index += 1
+        }
+        put(out, "}\n")
+        level += 1
+    }
+}
+
+fn putLoad(emitter: *Emitter, command: *const registry.Command, handle: []const u8) -> void {
+    const out = emitter.*.out
+    const reg = emitter.*.registry
+    put(out, "        table.*.")
+    putString(out, command.*.name)
+    put(out, " = get(")
+    put(out, handle)
+    put(out, ", @ptrCast([*]const u8, \"")
+    putString(out, command.*.name)
+    put(out, "\"))\n")
+    // Implementations older than the core version may only provide an
+    // extension's name for the command.
+    var index: usize = 0
+    while index < registry.commandCount(reg) {
+        const other = registry.commandAt(reg, index)
+        if other.*.alias.length > 0 && string.eql(other.*.alias, command.*.name) {
+            put(out, "        if table.*.")
+            putString(out, command.*.name)
+            put(out, " == 0 { table.*.")
+            putString(out, command.*.name)
+            put(out, " = get(")
+            put(out, handle)
+            put(out, ", @ptrCast([*]const u8, \"")
+            putString(out, other.*.name)
+            put(out, "\")) }\n")
+        }
+        index += 1
+    }
+}
+
+fn putLoaders(emitter: *Emitter) -> void {
+    const out = emitter.*.out
+    const reg = emitter.*.registry
+    put(out, "\n// Fills `table` through vkGetInstanceProcAddr (with a null instance).\n")
+    put(out, "pub fn loadGlobalCommands(table: *GlobalCommands, getInstanceProcAddr: usize) -> void {\n")
+    put(out, "    var get: PFN_vkGetInstanceProcAddr = undefined\n    unsafe {\n")
+    put(out, "        get = @ptrFromInt(PFN_vkGetInstanceProcAddr, getInstanceProcAddr)\n")
+    put(out, "        table.*.vkGetInstanceProcAddr = getInstanceProcAddr\n")
+    var index: usize = 0
+    while index < registry.commandCount(reg) {
+        const command = registry.commandAt(reg, index)
+        if isEmitted(command) && commandLevel(reg, command) == LEVEL_GLOBAL && !equals(command.*.name, "vkGetInstanceProcAddr") { putLoad(emitter, command, "0") }
+        index += 1
+    }
+    put(out, "    }\n}\n")
+    put(out, "\n// Fills `table` with the instance-level and physical-device-level commands\n// of `instance`.\n")
+    put(out, "pub fn loadInstanceCommands(table: *InstanceCommands, instance: Instance, getInstanceProcAddr: usize) -> void {\n")
+    put(out, "    var get: PFN_vkGetInstanceProcAddr = undefined\n    unsafe {\n")
+    put(out, "        get = @ptrFromInt(PFN_vkGetInstanceProcAddr, getInstanceProcAddr)\n")
+    index = 0
+    while index < registry.commandCount(reg) {
+        const command = registry.commandAt(reg, index)
+        if isEmitted(command) && commandLevel(reg, command) == LEVEL_INSTANCE { putLoad(emitter, command, "instance") }
+        index += 1
+    }
+    put(out, "    }\n}\n")
+    put(out, "\n// Fills `table` with the device-level commands of `device`, straight from\n// its driver (vkGetDeviceProcAddr).\n")
+    put(out, "pub fn loadDeviceCommands(table: *DeviceCommands, device: Device, getDeviceProcAddr: usize) -> void {\n")
+    put(out, "    var get: PFN_vkGetDeviceProcAddr = undefined\n    unsafe {\n")
+    put(out, "        get = @ptrFromInt(PFN_vkGetDeviceProcAddr, getDeviceProcAddr)\n")
+    index = 0
+    while index < registry.commandCount(reg) {
+        const command = registry.commandAt(reg, index)
+        if isEmitted(command) && commandLevel(reg, command) == LEVEL_DEVICE { putLoad(emitter, command, "device") }
+        index += 1
+    }
+    put(out, "    }\n}\n")
+}
+
+fn putWrappers(emitter: *Emitter) -> void {
+    const out = emitter.*.out
+    const reg = emitter.*.registry
+    put(out, "\n// ---------------------------------------------------------------------------\n")
+    put(out, "// Commands: each takes the dispatch table holding it, then the C parameters.\n")
+    var index: usize = 0
+    while index < registry.commandCount(reg) {
+        const command = registry.commandAt(reg, index)
+        if isEmitted(command) {
+            const returns = !equals(command.*.returnType, "void")
+            put(out, "\npub fn ")
+            putFunctionName(out, command.*.name)
+            put(out, "(dispatch: *const ")
+            put(out, levelTable(commandLevel(reg, command)))
+            putParameters(emitter, command, true)
+            put(out, ") -> ")
+            putReturnType(emitter, command)
+            put(out, " {\n    var entry: PFN_")
+            putString(out, command.*.name)
+            put(out, " = undefined\n    unsafe { entry = @ptrFromInt(PFN_")
+            putString(out, command.*.name)
+            put(out, ", dispatch.*.")
+            putString(out, command.*.name)
+            put(out, ") }\n    ")
+            if returns { put(out, "return ") }
+            put(out, "entry(")
+            var parameter: usize = 0
+            while parameter < command.*.paramCount {
+                if parameter > 0 { put(out, ", ") }
+                putIdentifier(out, registry.memberAt(reg, command.*.paramStart + parameter).*.name)
+                parameter += 1
+            }
+            put(out, ")\n}\n")
+        }
+        index += 1
+    }
+}
+
+// Writes the whole std.vulkan module for a parsed and resolved registry.
+pub fn emit(reg: *Registry, out: *ArrayList) -> bool {
+    const count = registry.typeCount(reg)
+    const memory = reg.*.allocator.alloc(if count > 0 { count } else { 1 }, 1)
+    if memory == null { return false }
+    var emitter = Emitter.{ .registry = reg, .out = out, .marks = memory.? }
+    var index: usize = 0
+    while index < count {
+        emitter.marks[index] = MARK_NONE
+        index += 1
+    }
+    putHeader(&emitter)
+    putBaseTypes(&emitter)
+    putHandles(&emitter)
+    putConstants(&emitter)
+    putEnumerations(&emitter)
+    putBitmasks(&emitter)
+    putFunctionPointers(&emitter)
+    putAggregates(&emitter)
+    putAliases(&emitter)
+    putCommandTypes(&emitter)
+    putTables(&emitter)
+    putLoaders(&emitter)
+    putWrappers(&emitter)
+    reg.*.allocator.free(memory.?, if count > 0 { count } else { 1 }, 1)
+    return true
+}
