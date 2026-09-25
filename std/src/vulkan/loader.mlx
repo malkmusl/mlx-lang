@@ -1,0 +1,578 @@
+// std.vulkan.loader: finds and opens Vulkan implementations.
+//
+// Two ways in, one result (a `Driver` whose GlobalCommands are loaded):
+//
+//   - `openDriver` loads an installable client driver (ICD) directly, the
+//     way the Khronos loader does on Linux: `findDrivers` reads the ICD
+//     manifests (JSON files naming the driver library) from the standard
+//     search path, and `openDriver` dlopens the library, negotiates the
+//     loader/driver interface version and takes its vk_icdGetInstanceProcAddr.
+//     No C loader is involved.
+//
+//   - `openSystemLoader` opens a system Vulkan library that already is a
+//     loader: libvulkan.so on Android (where applications must use it), or
+//     libvulkan.so.1 on Linux when layers or the Khronos loader's device
+//     merging are wanted.
+//
+// Unlike the Khronos loader, a Driver is one implementation: its instances
+// see only its own physical devices, and no layers are inserted. Open
+// several drivers to use several implementations.
+//
+// Everything after opening is plain std.vulkan:
+//
+//     var driver: loader.Driver = undefined
+//     if loader.openFirstDriver(&driver, arguments, allocator) != loader.Status.ok { ... }
+//     var instance: vk.Instance = 0
+//     const created = vk.createInstance(driver.global, &info, null, &instance)
+//     var commands: vk.InstanceCommands = undefined
+//     vk.loadInstanceCommands(&commands, instance, driver.getInstanceProcAddr)
+//     ... vk.loadDeviceCommands(&deviceCommands, device, commands.vkGetDeviceProcAddr)
+//
+// Search order for manifests (Linux, as in the Khronos loader's
+// LoaderDriverInterface): VK_DRIVER_FILES (or the older VK_ICD_FILENAMES),
+// when set, is used alone -- a colon-separated list of manifest files or
+// directories. Otherwise VK_ADD_DRIVER_FILES comes first, then the icd.d
+// directory under $XDG_CONFIG_HOME (~/.config), each $XDG_CONFIG_DIRS entry
+// (/etc/xdg), /etc/vulkan, $XDG_DATA_HOME (~/.local/share) and each
+// $XDG_DATA_DIRS entry (/usr/local/share:/usr/share). Manifests in one
+// directory are taken in name order.
+
+const allocator_module = @import("../../bootstrap/allocator.mlx")
+const string = @import("../../bootstrap/string.mlx")
+const fs = @import("../../bootstrap/fs.mlx")
+const process = @import("../../bootstrap/process.mlx")
+const json = @import("../json.mlx")
+const vk = @import("../vulkan.mlx")
+
+pub const Allocator = allocator_module.Allocator
+pub const String = string.String
+
+extern("c") fn dlopen(name: [*]const u8, flags: i32) -> usize
+extern("c") fn dlsym(handle: usize, name: [*]const u8) -> usize
+extern("c") fn dlclose(handle: usize) -> i32
+
+const RTLD_NOW: i32 = 2
+
+// The system loader library names.
+pub const SYSTEM_LOADER_LINUX = "libvulkan.so.1"
+pub const SYSTEM_LOADER_ANDROID = "libvulkan.so"
+
+// Loader/driver interface versions (LoaderDriverInterface.md): 3 lets the
+// driver create VkSurfaceKHR objects itself, 4 adds
+// vk_icdGetPhysicalDeviceProcAddr, 5 lets instances ask for any apiVersion.
+pub const INTERFACE_VERSION: u32 = 5
+pub const MINIMUM_INTERFACE_VERSION: u32 = 3
+
+pub const MAX_DRIVERS: usize = 16
+pub const PATH_CAPACITY: usize = 512
+
+pub const Status = enum(u8) {
+    ok,
+    noDrivers,
+    libraryNotFound,
+    missingEntryPoint,
+    interfaceUnsupported,
+    unreadableManifest,
+    invalidManifest,
+}
+
+pub fn statusMessage(status: Status) -> []const u8 {
+    return match status {
+        .ok => "ok",
+        .noDrivers => "no Vulkan driver manifest found",
+        .libraryNotFound => "the driver library could not be loaded",
+        .missingEntryPoint => "the library exports no vkGetInstanceProcAddr entry point",
+        .interfaceUnsupported => "the driver's loader interface version is too old (before 3)",
+        .unreadableManifest => "the driver manifest could not be read",
+        .invalidManifest => "the driver manifest is not a valid ICD manifest",
+    }
+}
+
+// A NUL-terminated path in fixed storage.
+pub const Path = struct {
+    bytes: [512]u8
+    length: usize
+}
+
+pub const Manifest = struct {
+    // The manifest file.
+    path: Path
+    // What to dlopen: a path (relative paths in the manifest are resolved
+    // against its directory) or a bare library name for the dynamic linker's
+    // search.
+    library: Path
+    // The Vulkan version the driver reports in its manifest.
+    apiVersion: u32
+    portability: bool
+}
+
+pub const Manifests = struct {
+    count: usize
+    entries: [16]Manifest
+}
+
+pub const Driver = struct {
+    library: usize
+    getInstanceProcAddr: usize
+    // vk_icdGetPhysicalDeviceProcAddr (interface 4+), or 0.
+    getPhysicalDeviceProcAddr: usize
+    // The negotiated interface version; 0 for a system loader.
+    interfaceVersion: u32
+    // From the manifest, or vkEnumerateInstanceVersion (1.0 without it).
+    apiVersion: u32
+    isSystemLoader: bool
+    // The global commands (vkCreateInstance, vkEnumerateInstance*...),
+    // allocated when the driver is opened.
+    global: *vk.GlobalCommands
+}
+
+// ---------------------------------------------------------------------------
+// Paths
+
+fn pathReset(path: *Path) -> void {
+    path.*.length = 0
+    path.*.bytes[0] = 0
+}
+
+fn pathAppendByte(path: *Path, byte: u8) -> bool {
+    if path.*.length + 1 >= PATH_CAPACITY { return false }
+    path.*.bytes[path.*.length] = byte
+    path.*.length += 1
+    path.*.bytes[path.*.length] = 0
+    return true
+}
+
+fn pathAppend(path: *Path, text: String) -> bool {
+    var index: usize = 0
+    while index < text.length {
+        if !pathAppendByte(path, text.pointer[index]) { return false }
+        index += 1
+    }
+    return true
+}
+
+fn pathAppendText(path: *Path, text: []const u8) -> bool {
+    return pathAppend(path, string.fromSlice(text))
+}
+
+pub fn pathPointer(path: *const Path) -> [*]const u8 {
+    unsafe { return @ptrCast([*]const u8, path) }
+}
+
+pub fn pathString(path: *const Path) -> String {
+    return string.fromParts(pathPointer(path), path.*.length)
+}
+
+fn endsWith(value: String, suffix: []const u8) -> bool {
+    const tail = string.fromSlice(suffix)
+    if tail.length > value.length { return false }
+    var index: usize = 0
+    while index < tail.length {
+        if value.pointer[value.length - tail.length + index] != tail.pointer[index] { return false }
+        index += 1
+    }
+    return true
+}
+
+// Field addresses are computed from offsets: the bootstrap compiler does
+// not take `&record.*.field`.
+fn libraryOf(manifest: *const Manifest) -> *Path {
+    unsafe { return @ptrFromInt(*Path, @intFromPtr(manifest) + @offsetOf(Manifest, "library")) }
+}
+
+fn manifestPathOf(manifest: *const Manifest) -> *Path {
+    unsafe { return @ptrFromInt(*Path, @intFromPtr(manifest) + @offsetOf(Manifest, "path")) }
+}
+
+pub fn manifestAt(manifests: *const Manifests, index: usize) -> *Manifest {
+    unsafe { return @ptrFromInt(*Manifest, @intFromPtr(manifests) + @offsetOf(Manifests, "entries") + index * @sizeOf(Manifest)) }
+}
+
+// The library a manifest names, as a C string.
+pub fn libraryPath(manifest: *const Manifest) -> [*]const u8 { return pathPointer(libraryOf(manifest)) }
+
+// The manifest file, as a C string.
+pub fn manifestPath(manifest: *const Manifest) -> [*]const u8 { return pathPointer(manifestPathOf(manifest)) }
+
+fn contains(value: String, byte: u8) -> bool {
+    var index: usize = 0
+    while index < value.length {
+        if value.pointer[index] == byte { return true }
+        index += 1
+    }
+    return false
+}
+
+fn sub(value: String, start: usize, end: usize) -> String {
+    unsafe { return string.fromParts(@ptrFromInt([*]const u8, @intFromPtr(value.pointer) + start), end - start) }
+}
+
+// ---------------------------------------------------------------------------
+// Manifests
+
+// "1.4.318" -> VK_MAKE_API_VERSION(0, 1, 4, 318).
+fn parseVersion(text: String) -> u32 {
+    var parts: [3]u32 = [3]u32{ 0, 0, 0 }
+    var part: usize = 0
+    var index: usize = 0
+    while index < text.length && part < 3 {
+        const byte = text.pointer[index]
+        if byte == 46 {
+            part += 1
+        } else if byte >= 48 && byte <= 57 {
+            parts[part] = parts[part] * 10 + @intCast(u32, byte - 48)
+        }
+        index += 1
+    }
+    return vk.makeApiVersion(0, parts[0], parts[1], parts[2])
+}
+
+// Reads one manifest; returns false when it is unusable (not an ICD
+// manifest, or built for another architecture).
+fn readManifest(allocator: Allocator, file_path: *const Path, manifest: *Manifest) -> Status {
+    const file = fs.open(pathPointer(file_path), fs.READ_ONLY, 0)
+    if !fs.isValid(file) { return Status.unreadableManifest }
+    const contents = fs.readToEndAlloc(file, allocator)
+    const closed = fs.close(file)
+    var tokenizer: json.Tokenizer = undefined
+    json.initAt(&tokenizer, contents.items, contents.length)
+    var token: json.Token = undefined
+    var in_icd = false
+    var icd_depth: usize = 0
+    var library = string.fromParts(contents.items, 0)
+    var version = string.fromParts(contents.items, 0)
+    var architecture = string.fromParts(contents.items, 0)
+    var portability = false
+    var found = false
+    while json.next(&tokenizer, &token) {
+        if token.kind == json.TokenKind.key {
+            const depth = json.depth(&tokenizer)
+            const key = string.fromParts(token.value.pointer, token.value.length)
+            if depth == 1 && json.equals(key, "ICD") {
+                in_icd = true
+                found = true
+                icd_depth = 2
+            } else if depth == 1 {
+                in_icd = false
+            } else if in_icd && depth == icd_depth {
+                var value: json.Token = undefined
+                if !json.next(&tokenizer, &value) { break }
+                const text = string.fromParts(value.value.pointer, value.value.length)
+                if json.equals(key, "library_path") && value.kind == json.TokenKind.string { library = text }
+                if json.equals(key, "api_version") && value.kind == json.TokenKind.string { version = text }
+                if json.equals(key, "library_arch") && value.kind == json.TokenKind.string { architecture = text }
+                if json.equals(key, "is_portability_driver") { portability = value.kind == json.TokenKind.trueValue }
+                if value.kind == json.TokenKind.objectStart || value.kind == json.TokenKind.arrayStart {
+                    const skipped = json.skipValue(&tokenizer, value)
+                }
+            }
+        }
+    }
+    var status = Status.ok
+    if json.failed(&tokenizer) || !found || library.length == 0 || !json.isPlain(library) { status = Status.invalidManifest }
+    if architecture.length > 0 && !json.equals(architecture, "64") { status = Status.invalidManifest }
+    if status == Status.ok {
+        manifest.*.path = file_path.*
+        manifest.*.apiVersion = parseVersion(version)
+        manifest.*.portability = portability
+        const library_path = libraryOf(manifest)
+        pathReset(library_path)
+        var ok = true
+        if contains(library, 47) && library.pointer[0] != 47 {
+            // Relative to the manifest's directory.
+            const manifest_path = pathString(file_path)
+            var slash = manifest_path.length
+            while slash > 0 && manifest_path.pointer[slash - 1] != 47 { slash -= 1 }
+            ok = pathAppend(library_path, sub(manifest_path, 0, slash))
+        }
+        if !ok || !pathAppend(library_path, library) { status = Status.invalidManifest }
+    }
+    fs.ArrayList.deinit(contents)
+    return status
+}
+
+fn alreadyListed(manifests: *const Manifests, path: *const Path) -> bool {
+    var index: usize = 0
+    while index < manifests.*.count {
+        if string.eql(pathString(manifestPathOf(manifestAt(manifests, index))), pathString(path)) { return true }
+        index += 1
+    }
+    return false
+}
+
+fn addManifest(manifests: *Manifests, allocator: Allocator, path: *const Path) -> void {
+    if manifests.*.count >= MAX_DRIVERS || alreadyListed(manifests, path) { return }
+    var manifest: Manifest = undefined
+    if readManifest(allocator, path, &manifest) == Status.ok {
+        manifests.*.entries[manifests.*.count] = manifest
+        manifests.*.count += 1
+    }
+}
+
+// Adds the *.json manifests of a directory, in name order.
+fn addDirectory(manifests: *Manifests, allocator: Allocator, directory: String) -> void {
+    var base: Path = undefined
+    pathReset(&base)
+    if !pathAppend(&base, directory) { return }
+    const handle = fs.open(pathPointer(&base), fs.READ_ONLY | fs.DIRECTORY, 0)
+    if !fs.isValid(handle) { return }
+    // Collect the names (NUL separated) first, then add them sorted.
+    var names: [4096]u8 = undefined
+    var names_length: usize = 0
+    var buffer: [4096]u8 = undefined
+    while true {
+        var read: isize = 0
+        unsafe { read = fs.readDirectory(handle, @ptrCast([*]u8, &buffer), 4096) }
+        if read <= 0 { break }
+        var offset: usize = 0
+        while offset < @bitCast(usize, read) {
+            const record_length = @intCast(usize, buffer[offset + 16]) | (@intCast(usize, buffer[offset + 17]) << 8)
+            var name_length: usize = 0
+            while buffer[offset + 19 + name_length] != 0 { name_length += 1 }
+            var name: String = undefined
+            unsafe { name = string.fromParts(@ptrFromInt([*]const u8, @intFromPtr(&buffer) + offset + 19), name_length) }
+            if endsWith(name, ".json") && names_length + name_length + 1 < 4096 {
+                var index: usize = 0
+                while index < name_length {
+                    names[names_length] = name.pointer[index]
+                    names_length += 1
+                    index += 1
+                }
+                names[names_length] = 0
+                names_length += 1
+            }
+            offset += record_length
+        }
+    }
+    const closed = fs.close(handle)
+    // Repeatedly take the smallest name not yet added.
+    var previous_start: usize = names_length
+    var remaining = true
+    while remaining {
+        remaining = false
+        var best_start: usize = names_length
+        var start: usize = 0
+        while start < names_length {
+            var end = start
+            while names[end] != 0 { end += 1 }
+            unsafe {
+                const candidate = string.fromParts(@ptrFromInt([*]const u8, @intFromPtr(&names) + start), end - start)
+                const after_previous = previous_start == names_length || compareNames(candidate, string.fromParts(@ptrFromInt([*]const u8, @intFromPtr(&names) + previous_start), cLength(@ptrFromInt([*]const u8, @intFromPtr(&names) + previous_start)))) > 0
+                if after_previous && (best_start == names_length || compareNames(candidate, string.fromParts(@ptrFromInt([*]const u8, @intFromPtr(&names) + best_start), cLength(@ptrFromInt([*]const u8, @intFromPtr(&names) + best_start)))) < 0) {
+                    best_start = start
+                }
+            }
+            start = end + 1
+        }
+        if best_start != names_length {
+            var file_path: Path = undefined
+            pathReset(&file_path)
+            var ok = pathAppend(&file_path, directory)
+            if ok && directory.length > 0 && directory.pointer[directory.length - 1] != 47 { ok = pathAppendByte(&file_path, 47) }
+            unsafe {
+                const name_pointer = @ptrFromInt([*]const u8, @intFromPtr(&names) + best_start)
+                if ok { ok = pathAppend(&file_path, string.fromParts(name_pointer, cLength(name_pointer))) }
+            }
+            if ok { addManifest(manifests, allocator, &file_path) }
+            previous_start = best_start
+            remaining = true
+        }
+    }
+}
+
+fn cLength(text: [*]const u8) -> usize {
+    var length: usize = 0
+    while text[length] != 0 { length += 1 }
+    return length
+}
+
+fn compareNames(left: String, right: String) -> isize {
+    var index: usize = 0
+    while index < left.length && index < right.length {
+        if left.pointer[index] != right.pointer[index] { return @intCast(isize, left.pointer[index]) - @intCast(isize, right.pointer[index]) }
+        index += 1
+    }
+    return @intCast(isize, left.length) - @intCast(isize, right.length)
+}
+
+// A manifest file or a directory of manifests.
+fn addEntry(manifests: *Manifests, allocator: Allocator, entry: String) -> void {
+    if entry.length == 0 { return }
+    if endsWith(entry, ".json") {
+        var path: Path = undefined
+        pathReset(&path)
+        if pathAppend(&path, entry) { addManifest(manifests, allocator, &path) }
+        return
+    }
+    addDirectory(manifests, allocator, entry)
+}
+
+// Adds every entry of a colon-separated list, each followed by `suffix`
+// (e.g. "/vulkan/icd.d"), or used as-is when the suffix is empty.
+fn addList(manifests: *Manifests, allocator: Allocator, list: String, suffix: []const u8) -> void {
+    var start: usize = 0
+    var index: usize = 0
+    while index <= list.length {
+        if index == list.length || list.pointer[index] == 58 {
+            if index > start {
+                var path: Path = undefined
+                pathReset(&path)
+                if pathAppend(&path, sub(list, start, index)) && pathAppendText(&path, suffix) {
+                    addEntry(manifests, allocator, pathString(&path))
+                }
+            }
+            start = index + 1
+        }
+        index += 1
+    }
+}
+
+fn variable(arguments: [][*]const u8, name: []const u8) -> String {
+    const value = process.environment(arguments, name)
+    if value == null { return string.fromSlice("") }
+    return value.?
+}
+
+// Adds "<$name or $HOME/<fallback>>/vulkan/icd.d".
+fn addHomeDirectory(manifests: *Manifests, allocator: Allocator, arguments: [][*]const u8, name: []const u8, fallback: []const u8) -> void {
+    const value = variable(arguments, name)
+    var path: Path = undefined
+    pathReset(&path)
+    var ok = true
+    if value.length > 0 {
+        ok = pathAppend(&path, value)
+    } else {
+        const home = variable(arguments, "HOME")
+        if home.length == 0 { return }
+        ok = pathAppend(&path, home) && pathAppendText(&path, fallback)
+    }
+    if ok && pathAppendText(&path, "/vulkan/icd.d") { addDirectory(manifests, allocator, pathString(&path)) }
+}
+
+// Finds the ICD manifests of the Vulkan drivers installed on this system
+// (Linux). `arguments` is main's argument slice (for the environment).
+// Returns the number of usable manifests.
+pub fn findDrivers(manifests: *Manifests, arguments: [][*]const u8, allocator: Allocator) -> usize {
+    manifests.*.count = 0
+    var exclusive = variable(arguments, "VK_DRIVER_FILES")
+    if exclusive.length == 0 { exclusive = variable(arguments, "VK_ICD_FILENAMES") }
+    if exclusive.length > 0 {
+        addList(manifests, allocator, exclusive, "")
+        return manifests.*.count
+    }
+    addList(manifests, allocator, variable(arguments, "VK_ADD_DRIVER_FILES"), "")
+    addHomeDirectory(manifests, allocator, arguments, "XDG_CONFIG_HOME", "/.config")
+    const config_dirs = variable(arguments, "XDG_CONFIG_DIRS")
+    addList(manifests, allocator, if config_dirs.length > 0 { config_dirs } else { string.fromSlice("/etc/xdg") }, "/vulkan/icd.d")
+    addDirectory(manifests, allocator, string.fromSlice("/etc/vulkan/icd.d"))
+    addHomeDirectory(manifests, allocator, arguments, "XDG_DATA_HOME", "/.local/share")
+    const data_dirs = variable(arguments, "XDG_DATA_DIRS")
+    addList(manifests, allocator, if data_dirs.length > 0 { data_dirs } else { string.fromSlice("/usr/local/share:/usr/share") }, "/vulkan/icd.d")
+    return manifests.*.count
+}
+
+// ---------------------------------------------------------------------------
+// Opening
+
+const PfnNegotiate = fn(*u32) -> vk.Result
+
+fn symbol(library: usize, name: []const u8) -> usize {
+    unsafe { return dlsym(library, @ptrCast([*]const u8, name)) }
+}
+
+fn finish(driver: *Driver, allocator: Allocator) -> Status {
+    const memory = allocator.alloc(@sizeOf(vk.GlobalCommands), 8)
+    if memory == null {
+        closeDriver(driver)
+        return Status.libraryNotFound
+    }
+    unsafe { driver.*.global = @ptrCast(*vk.GlobalCommands, memory.?) }
+    vk.loadGlobalCommands(driver.*.global, driver.*.getInstanceProcAddr)
+    if driver.*.apiVersion == 0 {
+        driver.*.apiVersion = vk.API_VERSION_1_0
+        if driver.*.global.*.vkEnumerateInstanceVersion != 0 {
+            var version: u32 = 0
+            if vk.enumerateInstanceVersion(driver.*.global, &version) == vk.Result.success { driver.*.apiVersion = version }
+        }
+    }
+    return Status.ok
+}
+
+fn clear(driver: *Driver) -> void {
+    driver.*.library = 0
+    driver.*.getInstanceProcAddr = 0
+    driver.*.getPhysicalDeviceProcAddr = 0
+    driver.*.interfaceVersion = 0
+    driver.*.apiVersion = 0
+    driver.*.isSystemLoader = false
+}
+
+// Loads the driver a manifest names and negotiates the loader/driver
+// interface with it.
+// `allocator` holds the driver's GlobalCommands (a few hundred bytes, for the
+// life of the program).
+pub fn openDriver(driver: *Driver, manifest: *const Manifest, allocator: Allocator) -> Status {
+    clear(driver)
+    const library = dlopen(libraryPath(manifest), RTLD_NOW)
+    if library == 0 { return Status.libraryNotFound }
+    driver.*.library = library
+    const negotiate = symbol(library, "vk_icdNegotiateLoaderICDInterfaceVersion")
+    if negotiate == 0 {
+        closeDriver(driver)
+        return Status.interfaceUnsupported
+    }
+    var function: PfnNegotiate = undefined
+    unsafe { function = @ptrFromInt(PfnNegotiate, negotiate) }
+    var version = INTERFACE_VERSION
+    if function(&version) != vk.Result.success || version < MINIMUM_INTERFACE_VERSION {
+        closeDriver(driver)
+        return Status.interfaceUnsupported
+    }
+    if version > INTERFACE_VERSION { version = INTERFACE_VERSION }
+    driver.*.interfaceVersion = version
+    driver.*.getInstanceProcAddr = symbol(library, "vk_icdGetInstanceProcAddr")
+    if driver.*.getInstanceProcAddr == 0 { driver.*.getInstanceProcAddr = symbol(library, "vkGetInstanceProcAddr") }
+    if driver.*.getInstanceProcAddr == 0 {
+        closeDriver(driver)
+        return Status.missingEntryPoint
+    }
+    if version >= 4 { driver.*.getPhysicalDeviceProcAddr = symbol(library, "vk_icdGetPhysicalDeviceProcAddr") }
+    driver.*.apiVersion = manifest.*.apiVersion
+    return finish(driver, allocator)
+}
+
+// Opens a system Vulkan loader library (SYSTEM_LOADER_ANDROID on Android,
+// SYSTEM_LOADER_LINUX to go through the Khronos loader on Linux).
+pub fn openSystemLoader(driver: *Driver, name: [*]const u8, allocator: Allocator) -> Status {
+    clear(driver)
+    const library = dlopen(name, RTLD_NOW)
+    if library == 0 { return Status.libraryNotFound }
+    driver.*.library = library
+    driver.*.isSystemLoader = true
+    driver.*.getInstanceProcAddr = symbol(library, "vkGetInstanceProcAddr")
+    if driver.*.getInstanceProcAddr == 0 {
+        closeDriver(driver)
+        return Status.missingEntryPoint
+    }
+    return finish(driver, allocator)
+}
+
+// Opens the first driver that loads, in search order.
+pub fn openFirstDriver(driver: *Driver, arguments: [][*]const u8, allocator: Allocator) -> Status {
+    var manifests: Manifests = undefined
+    if findDrivers(&manifests, arguments, allocator) == 0 { return Status.noDrivers }
+    var status = Status.noDrivers
+    var index: usize = 0
+    while index < manifests.count {
+        status = openDriver(driver, manifestAt(&manifests, index), allocator)
+        if status == Status.ok { return status }
+        index += 1
+    }
+    return status
+}
+
+pub fn closeDriver(driver: *Driver) -> void {
+    if driver.*.library != 0 { const closed = dlclose(driver.*.library) }
+    driver.*.library = 0
+    driver.*.getInstanceProcAddr = 0
+}
