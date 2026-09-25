@@ -24,6 +24,11 @@ the window's size really changed. Turning the phone restarts the activity
 (the manifest does not handle orientation changes), which builds a new
 swapchain for the new orientation.
 
+The label is sized from the screen's shorter side, so it is the same size
+in portrait and landscape, and drops its "Mlx + Vulkan · " prefix when the
+whole line does not fit the width. The app is built with
+`--android-fullscreen`, so the status bar does not cover it.
+
 ## Build
 
 From the repository root, with the aarch64-android target
@@ -32,7 +37,7 @@ From the repository root, with the aarch64-android target
 ```sh
 zig-out/bin/mlx1 examples/vulkan-android/main.mlx -o vulkan.apk \
     --target=aarch64-android --android-package=dev.mlxlang.vulkan \
-    --android-label="Mlx Vulkan"
+    --android-label="Mlx Vulkan" --android-fullscreen
 adb install -r vulkan.apk
 adb logcat -s mlx
 ```

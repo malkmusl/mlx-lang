@@ -5,7 +5,8 @@ self-hosted compiler (from the commit that last changed this file) with
 
 ```sh
 mlx4 examples/vulkan-android/main.mlx -o mlx-vulkan.apk --target=aarch64-android \
-    --android-package=dev.mlxlang.vulkan --android-label="Mlx Vulkan"
+    --android-package=dev.mlxlang.vulkan --android-label="Mlx Vulkan" \
+    --android-fullscreen
 ```
 
 and signed with a throwaway debug key, so remove any other build first:
@@ -16,6 +17,6 @@ adb install mlx-vulkan.apk
 ```
 
 495781 bytes, SHA-256
-`a83c7a8763991a3e01999c152ed327b8eaf17445d6cde7a647c77a7aef5b0083`.
+`49bb659b79c62799c33bd01b7a62a0cd05dfabb81c920e1634a979daf9ad6be7`.
 It logs each startup step to `adb logcat -s mlx` and shows a label drawn
 with std.truetype from the system font (see ../README.md).
