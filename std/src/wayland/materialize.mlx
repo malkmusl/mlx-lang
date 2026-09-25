@@ -1,0 +1,1337 @@
+// std.wayland.materialize: Protocol AST -> typed Mlx declarations.
+//
+// This is the generation stage of the spec/06-wayland pipeline. Given a set
+// of parsed protocols it produces ordinary Mlx modules:
+//
+//   interfaces.mlx          every interface of the set: the `Interface` enum
+//                           and wire metadata (names, versions, libwayland-
+//                           style message signatures, destructor flags and
+//                           the interface of each object/new_id argument)
+//   <protocol>/types.mlx    client proxy and server resource types with a
+//                           typed method per request (client) and per event
+//                           (server)
+//   <protocol>/<iface>.mlx  one namespace per interface: version, opcodes,
+//                           since-versions, enums with exact XML values,
+//                           the Proxy/Resource types, and typed decoding of
+//                           events (client) and requests (server)
+//   <protocol>.mlx          the protocol facade
+//
+// Naming: interface, message, argument and entry names keep their XML
+// spelling; a name that starts with a digit gets a leading '_' and a name
+// that is an Mlx keyword gets a trailing '_'. Enum types and payload structs
+// are PascalCase, request methods are camelCase, and event-sending methods
+// are "send" + PascalCase.
+//
+// Method signatures may only name types that are declared earlier, so each
+// types module declares proxies (and resources) in dependency order. A
+// reference that would close a cycle is typed as the untyped runtime object.
+
+const protocol = @import("./protocol.mlx")
+const lists = @import("../../bootstrap/array_list.mlx")
+const string = @import("../../bootstrap/string.mlx")
+
+pub const ArrayList = lists.ArrayList
+pub const String = string.String
+pub const Protocol = protocol.Protocol
+
+pub const Failure = struct {
+    failed: bool
+    message: []const u8
+    protocolName: String
+    subject: String
+}
+
+pub const Set = struct {
+    protocols: [*]Protocol
+    count: usize
+    failure: *Failure
+}
+
+const Name = struct {
+    bytes: [256]u8
+    length: usize
+}
+
+const REF_NONE: u8 = 0
+const REF_SELF: u8 = 1
+const REF_LOCAL: u8 = 2
+const REF_FOREIGN: u8 = 3
+const REF_UNTYPED: u8 = 4
+
+// Resolution of an interface reference from the protocol being emitted.
+const Reference = struct {
+    kind: u8
+    protocolIndex: usize
+    interfaceIndex: usize
+    name: String
+}
+
+// ---------------------------------------------------------------------------
+// Output helpers
+
+fn put(out: *ArrayList, text: []const u8) -> void {
+    for byte in text {
+        const ignored = ArrayList.appendAt(out, byte)
+    }
+}
+
+fn putChoice(out: *ArrayList, condition: bool, yes: []const u8, no: []const u8) -> void {
+    if condition {
+        put(out, yes)
+    } else {
+        put(out, no)
+    }
+}
+
+fn choose(condition: bool, yes: []const u8, no: []const u8) -> []const u8 {
+    if condition { return yes }
+    return no
+}
+
+fn putByte(out: *ArrayList, byte: u8) -> void {
+    const ignored = ArrayList.appendAt(out, byte)
+}
+
+fn putString(out: *ArrayList, value: String) -> void {
+    var index: usize = 0
+    while index < value.length {
+        putByte(out, value.pointer[index])
+        index += 1
+    }
+}
+
+fn putNumber(out: *ArrayList, value: usize) -> void {
+    var digits: [24]u8 = undefined
+    var count: usize = 0
+    var rest = value
+    if rest == 0 {
+        putByte(out, 48)
+        return
+    }
+    while rest > 0 {
+        digits[count] = @intCast(u8, 48 + rest % 10)
+        rest = rest / 10
+        count += 1
+    }
+    while count > 0 {
+        count -= 1
+        putByte(out, digits[count])
+    }
+}
+
+fn putName(out: *ArrayList, name: *const Name) -> void {
+    var index: usize = 0
+    while index < name.*.length {
+        putByte(out, name.*.bytes[index])
+        index += 1
+    }
+}
+
+fn nameEquals(name: *const Name, text: []const u8) -> bool {
+    var index: usize = 0
+    for byte in text {
+        if index >= name.*.length || name.*.bytes[index] != byte { return false }
+        index += 1
+    }
+    return index == name.*.length
+}
+
+fn nameAppend(name: *Name, byte: u8) -> void {
+    if name.*.length < 256 {
+        name.*.bytes[name.*.length] = byte
+        name.*.length += 1
+    }
+}
+
+fn nameAppendText(name: *Name, text: []const u8) -> void {
+    for byte in text { nameAppend(name, byte) }
+}
+
+fn isDigit(byte: u8) -> bool { return byte >= 48 && byte <= 57 }
+fn isLower(byte: u8) -> bool { return byte >= 97 && byte <= 122 }
+fn upper(byte: u8) -> u8 { return if isLower(byte) { byte - 32 } else { byte } }
+
+fn isKeyword(name: *const Name) -> bool {
+    if nameEquals(name, "align") || nameEquals(name, "anytype") || nameEquals(name, "bool") || nameEquals(name, "break") { return true }
+    if nameEquals(name, "comptime") || nameEquals(name, "const") || nameEquals(name, "continue") || nameEquals(name, "defer") { return true }
+    if nameEquals(name, "else") || nameEquals(name, "enum") || nameEquals(name, "errdefer") || nameEquals(name, "error") { return true }
+    if nameEquals(name, "export") || nameEquals(name, "extern") || nameEquals(name, "false") || nameEquals(name, "fn") { return true }
+    if nameEquals(name, "for") || nameEquals(name, "if") || nameEquals(name, "in") || nameEquals(name, "inline") { return true }
+    if nameEquals(name, "isize") || nameEquals(name, "match") || nameEquals(name, "noinline") || nameEquals(name, "nonexhaustive") { return true }
+    if nameEquals(name, "noreturn") || nameEquals(name, "null") || nameEquals(name, "packed") || nameEquals(name, "pub") { return true }
+    if nameEquals(name, "return") || nameEquals(name, "struct") || nameEquals(name, "test") || nameEquals(name, "threadlocal") { return true }
+    if nameEquals(name, "true") || nameEquals(name, "try") || nameEquals(name, "type") || nameEquals(name, "undefined") { return true }
+    if nameEquals(name, "union") || nameEquals(name, "unsafe") || nameEquals(name, "usize") || nameEquals(name, "var") { return true }
+    if nameEquals(name, "void") || nameEquals(name, "volatile") || nameEquals(name, "while") || nameEquals(name, "Self") { return true }
+    // Primitive type names: iN, uN, fN.
+    if name.*.length >= 2 && (name.*.bytes[0] == 105 || name.*.bytes[0] == 117 || name.*.bytes[0] == 102) {
+        var index: usize = 1
+        while index < name.*.length {
+            if !isDigit(name.*.bytes[index]) { return false }
+            index += 1
+        }
+        return true
+    }
+    return false
+}
+
+// Identifiers the generated function bodies use; parameters with these
+// names are escaped so they cannot shadow them.
+fn isGeneratedLocal(name: *const Name) -> bool {
+    if nameEquals(name, "self") || nameEquals(name, "message") || nameEquals(name, "created") || nameEquals(name, "client") { return true }
+    if nameEquals(name, "server") || nameEquals(name, "wire") || nameEquals(name, "interfaces") || nameEquals(name, "types") { return true }
+    if nameEquals(name, "reader") || nameEquals(name, "event") || nameEquals(name, "request") || nameEquals(name, "Interface") { return true }
+    // "<protocol>_types" aliases and "nullable_<n>" locals.
+    if name.*.length > 9 && name.*.bytes[0] == 110 && name.*.bytes[1] == 117 && name.*.bytes[2] == 108 && name.*.bytes[3] == 108 && name.*.bytes[4] == 97 && name.*.bytes[5] == 98 && name.*.bytes[6] == 108 && name.*.bytes[7] == 101 && name.*.bytes[8] == 95 { return true }
+    if name.*.length > 6 {
+        const start = name.*.length - 6
+        if name.*.bytes[start] == 95 && name.*.bytes[start + 1] == 116 && name.*.bytes[start + 2] == 121 && name.*.bytes[start + 3] == 112 && name.*.bytes[start + 4] == 101 && name.*.bytes[start + 5] == 115 { return true }
+    }
+    return false
+}
+
+fn buildVerbatim(name: *Name, value: String) -> void {
+    name.*.length = 0
+    if value.length > 0 && isDigit(value.pointer[0]) { nameAppend(name, 95) }
+    var index: usize = 0
+    while index < value.length {
+        nameAppend(name, value.pointer[index])
+        index += 1
+    }
+    if isKeyword(name) { nameAppend(name, 95) }
+}
+
+fn buildPascal(name: *Name, value: String) -> void {
+    name.*.length = 0
+    if value.length > 0 && isDigit(value.pointer[0]) { nameAppend(name, 95) }
+    var capital = true
+    var index: usize = 0
+    while index < value.length {
+        const byte = value.pointer[index]
+        if byte == 95 {
+            capital = true
+        } else {
+            nameAppend(name, if capital { upper(byte) } else { byte })
+            capital = false
+        }
+        index += 1
+    }
+    if isKeyword(name) { nameAppend(name, 95) }
+}
+
+fn buildCamel(name: *Name, value: String) -> void {
+    name.*.length = 0
+    if value.length > 0 && isDigit(value.pointer[0]) { nameAppend(name, 95) }
+    var capital = false
+    var index: usize = 0
+    while index < value.length {
+        const byte = value.pointer[index]
+        if byte == 95 && name.*.length > 0 {
+            capital = true
+        } else {
+            nameAppend(name, if capital { upper(byte) } else { byte })
+            capital = false
+        }
+        index += 1
+    }
+    if isKeyword(name) { nameAppend(name, 95) }
+}
+
+fn buildUpper(name: *Name, value: String) -> void {
+    name.*.length = 0
+    var index: usize = 0
+    while index < value.length {
+        nameAppend(name, upper(value.pointer[index]))
+        index += 1
+    }
+}
+
+fn buildParameter(name: *Name, value: String) -> void {
+    buildVerbatim(name, value)
+    if isGeneratedLocal(name) { nameAppend(name, 95) }
+}
+
+fn putVerbatim(out: *ArrayList, value: String) -> void {
+    var name: Name = undefined
+    buildVerbatim(&name, value)
+    putName(out, &name)
+}
+
+fn putPascal(out: *ArrayList, value: String) -> void {
+    var name: Name = undefined
+    buildPascal(&name, value)
+    putName(out, &name)
+}
+
+fn putUpper(out: *ArrayList, value: String) -> void {
+    var name: Name = undefined
+    buildUpper(&name, value)
+    putName(out, &name)
+}
+
+fn putParameter(out: *ArrayList, value: String) -> void {
+    var name: Name = undefined
+    buildParameter(&name, value)
+    putName(out, &name)
+}
+
+// ---------------------------------------------------------------------------
+// Set queries
+
+fn protocolAt(set: *const Set, index: usize) -> *Protocol {
+    unsafe { return @ptrFromInt(*Protocol, @intFromPtr(set.*.protocols) + index * @sizeOf(Protocol)) }
+}
+
+fn fail(set: *const Set, message: []const u8, protocol_name: String, subject: String) -> bool {
+    if !set.*.failure.*.failed {
+        set.*.failure.*.failed = true
+        set.*.failure.*.message = message
+        set.*.failure.*.protocolName = protocol_name
+        set.*.failure.*.subject = subject
+    }
+    return false
+}
+
+fn findInterface(set: *const Set, name: String, protocol_index: *usize, interface_index: *usize) -> bool {
+    var p: usize = 0
+    while p < set.*.count {
+        const current = protocolAt(set, p)
+        var i: usize = 0
+        while i < protocol.interfaceCount(current) {
+            if string.eql(protocol.interfaceAt(current, i).*.name, name) {
+                protocol_index.* = p
+                interface_index.* = i
+                return true
+            }
+            i += 1
+        }
+        p += 1
+    }
+    return false
+}
+
+// Checks names across the set: interfaces are unique, every interface
+// reference resolves, and messages have at most one new_id argument, and
+// generic new_id only appears in requests.
+pub fn validate(set: *const Set) -> bool {
+    var p: usize = 0
+    while p < set.*.count {
+        const current = protocolAt(set, p)
+        var i: usize = 0
+        while i < protocol.interfaceCount(current) {
+            const interface = protocol.interfaceAt(current, i)
+            var found_protocol: usize = 0
+            var found_interface: usize = 0
+            if findInterface(set, interface.*.name, &found_protocol, &found_interface) {
+                if found_protocol != p || found_interface != i { return fail(set, "interface is declared by more than one protocol", current.*.name, interface.*.name) }
+            }
+            var kind: usize = 0
+            while kind < 2 {
+                const count = if kind == 0 { interface.*.requestCount } else { interface.*.eventCount }
+                var m: usize = 0
+                while m < count {
+                    const message = if kind == 0 { protocol.requestAt(current, interface, m) } else { protocol.eventAt(current, interface, m) }
+                    var new_ids: usize = 0
+                    var a: usize = 0
+                    while a < message.*.argCount {
+                        const arg = protocol.argAt(current, message, a)
+                        if arg.*.kind == protocol.ArgType.newId {
+                            new_ids += 1
+                            if arg.*.interfaceName.length == 0 && kind == 1 { return fail(set, "events cannot carry a generic new_id", current.*.name, message.*.name) }
+                        }
+                        if arg.*.interfaceName.length > 0 {
+                            if !findInterface(set, arg.*.interfaceName, &found_protocol, &found_interface) { return fail(set, "argument names an interface outside the protocol set", current.*.name, arg.*.interfaceName) }
+                        }
+                        a += 1
+                    }
+                    if new_ids > 1 { return fail(set, "messages with more than one new_id cannot be materialized", current.*.name, message.*.name) }
+                    m += 1
+                }
+                kind += 1
+            }
+            var e: usize = 0
+            while e < interface.*.enumCount {
+                const enumeration = protocol.enumAt(current, interface, e)
+                var x: usize = 0
+                while x < enumeration.*.entryCount {
+                    var y = x + 1
+                    while y < enumeration.*.entryCount {
+                        if protocol.entryAt(current, enumeration, x).*.value == protocol.entryAt(current, enumeration, y).*.value {
+                            return fail(set, "enum entries with equal values cannot be materialized", current.*.name, enumeration.*.name)
+                        }
+                        y += 1
+                    }
+                    x += 1
+                }
+                e += 1
+            }
+            i += 1
+        }
+        p += 1
+    }
+    return true
+}
+
+fn putHeader(out: *ArrayList, set: *const Set) -> void {
+    put(out, "// Generated by std.wayland.materialize from the canonical protocol XML\n")
+    put(out, "// under std/protocols/wayland (protocols:")
+    var p: usize = 0
+    while p < set.*.count {
+        put(out, " ")
+        putString(out, protocolAt(set, p).*.name)
+        p += 1
+    }
+    put(out, "). Do not edit; regenerate with\n// std/protocols/wayland/materialize.sh.\n\n")
+}
+
+// ---------------------------------------------------------------------------
+// interfaces.mlx
+
+fn putSignature(out: *ArrayList, current: *const Protocol, message: *const protocol.Message) -> void {
+    if message.*.since > 1 { putNumber(out, @intCast(usize, message.*.since)) }
+    var a: usize = 0
+    while a < message.*.argCount {
+        const arg = protocol.argAt(current, message, a)
+        if arg.*.allowNull { put(out, "?") }
+        const kind = arg.*.kind
+        if kind == protocol.ArgType.int { put(out, "i") }
+        if kind == protocol.ArgType.uint { put(out, "u") }
+        if kind == protocol.ArgType.fixed { put(out, "f") }
+        if kind == protocol.ArgType.string { put(out, "s") }
+        if kind == protocol.ArgType.object { put(out, "o") }
+        if kind == protocol.ArgType.newId {
+            if arg.*.interfaceName.length == 0 { put(out, "sun") } else { put(out, "n") }
+        }
+        if kind == protocol.ArgType.array { put(out, "a") }
+        if kind == protocol.ArgType.fd { put(out, "h") }
+        a += 1
+    }
+}
+
+fn putMessageTable(out: *ArrayList, current: *const Protocol, interface: *const protocol.Interface, is_event: bool, what: u8) -> void {
+    // what: 0 signature, 1 name, 2 destructor
+    put(out, "fn ")
+    putString(out, interface.*.name)
+    if is_event { put(out, "_event") } else { put(out, "_request") }
+    if what == 0 { put(out, "Signature(opcode: u16) -> []const u8 {\n") }
+    if what == 1 { put(out, "Name(opcode: u16) -> []const u8 {\n") }
+    if what == 2 { put(out, "Destructor(opcode: u16) -> bool {\n") }
+    const count = if is_event { interface.*.eventCount } else { interface.*.requestCount }
+    var m: usize = 0
+    while m < count {
+        const message = if is_event { protocol.eventAt(current, interface, m) } else { protocol.requestAt(current, interface, m) }
+        put(out, "    if opcode == ")
+        putNumber(out, m)
+        put(out, " { return ")
+        if what == 0 {
+            put(out, "\"")
+            putSignature(out, current, message)
+            put(out, "\"")
+        }
+        if what == 1 {
+            put(out, "\"")
+            putString(out, message.*.name)
+            put(out, "\"")
+        }
+        if what == 2 { putChoice(out, message.*.destructor, "true", "false") }
+        put(out, " }\n")
+        m += 1
+    }
+    if what == 2 { put(out, "    return false\n}\n\n") } else { put(out, "    return \"\"\n}\n\n") }
+}
+
+fn putArgInterfaceTable(out: *ArrayList, set: *const Set, current: *const Protocol, interface: *const protocol.Interface, is_event: bool) -> void {
+    put(out, "fn ")
+    putString(out, interface.*.name)
+    if is_event { put(out, "_eventArgInterface") } else { put(out, "_requestArgInterface") }
+    put(out, "(opcode: u16, argument: usize, result: *Interface) -> bool {\n")
+    const count = if is_event { interface.*.eventCount } else { interface.*.requestCount }
+    var m: usize = 0
+    while m < count {
+        const message = if is_event { protocol.eventAt(current, interface, m) } else { protocol.requestAt(current, interface, m) }
+        var position: usize = 0
+        var a: usize = 0
+        while a < message.*.argCount {
+            const arg = protocol.argAt(current, message, a)
+            if arg.*.kind == protocol.ArgType.newId && arg.*.interfaceName.length == 0 {
+                position += 3
+            } else {
+                if arg.*.interfaceName.length > 0 {
+                    put(out, "    if opcode == ")
+                    putNumber(out, m)
+                    put(out, " && argument == ")
+                    putNumber(out, position)
+                    put(out, " {\n        result.* = Interface.")
+                    putString(out, arg.*.interfaceName)
+                    put(out, "\n        return true\n    }\n")
+                }
+                position += 1
+            }
+            a += 1
+        }
+        m += 1
+    }
+    put(out, "    return false\n}\n\n")
+}
+
+fn putDispatchFunction(out: *ArrayList, set: *const Set, signature: []const u8, call_suffix: []const u8, call_arguments: []const u8, fallback: []const u8) -> void {
+    put(out, "pub fn ")
+    put(out, signature)
+    put(out, " {\n    return match interface {\n")
+    var p: usize = 0
+    while p < set.*.count {
+        const current = protocolAt(set, p)
+        var i: usize = 0
+        while i < protocol.interfaceCount(current) {
+            const interface = protocol.interfaceAt(current, i)
+            put(out, "        .")
+            putString(out, interface.*.name)
+            put(out, " => ")
+            putString(out, interface.*.name)
+            put(out, call_suffix)
+            put(out, call_arguments)
+            put(out, ",\n")
+            i += 1
+        }
+        p += 1
+    }
+    put(out, "    }\n}\n\n")
+}
+
+pub fn emitInterfaces(set: *const Set, out: *ArrayList) -> bool {
+    putHeader(out, set)
+    put(out, "// Metadata for every materialized interface. Signatures use the\n")
+    put(out, "// libwayland encoding described in std/src/wayland/wire.mlx.\n\n")
+    put(out, "pub const Interface = enum(u16) {\n")
+    var total: usize = 0
+    var p: usize = 0
+    while p < set.*.count {
+        const current = protocolAt(set, p)
+        var i: usize = 0
+        while i < protocol.interfaceCount(current) {
+            if total > 0 { put(out, ",\n") }
+            put(out, "    ")
+            putString(out, protocol.interfaceAt(current, i).*.name)
+            put(out, " = ")
+            putNumber(out, total)
+            total += 1
+            i += 1
+        }
+        p += 1
+    }
+    put(out, "\n}\n\npub const COUNT: usize = ")
+    putNumber(out, total)
+    put(out, "\n\n")
+
+    put(out, "fn matches(name: [*]const u8, length: usize, expected: []const u8) -> bool {\n")
+    put(out, "    var index: usize = 0\n    for byte in expected {\n        if index >= length || name[index] != byte { return false }\n        index += 1\n    }\n    return index == length\n}\n\n")
+    put(out, "// Resolves an interface name (as sent by wl_registry) to its enum value.\n")
+    put(out, "pub fn lookup(name: [*]const u8, length: usize, result: *Interface) -> bool {\n")
+    p = 0
+    while p < set.*.count {
+        const current = protocolAt(set, p)
+        var i: usize = 0
+        while i < protocol.interfaceCount(current) {
+            const interface = protocol.interfaceAt(current, i)
+            put(out, "    if matches(name, length, \"")
+            putString(out, interface.*.name)
+            put(out, "\") {\n        result.* = Interface.")
+            putString(out, interface.*.name)
+            put(out, "\n        return true\n    }\n")
+            i += 1
+        }
+        p += 1
+    }
+    put(out, "    return false\n}\n\n")
+
+    put(out, "pub fn interfaceName(interface: Interface) -> []const u8 {\n    return match interface {\n")
+    p = 0
+    while p < set.*.count {
+        const current = protocolAt(set, p)
+        var i: usize = 0
+        while i < protocol.interfaceCount(current) {
+            const interface = protocol.interfaceAt(current, i)
+            put(out, "        .")
+            putString(out, interface.*.name)
+            put(out, " => \"")
+            putString(out, interface.*.name)
+            put(out, "\",\n")
+            i += 1
+        }
+        p += 1
+    }
+    put(out, "    }\n}\n\n")
+
+    var what: usize = 0
+    while what < 3 {
+        if what == 0 { put(out, "pub fn interfaceVersion(interface: Interface) -> u32 {\n    return match interface {\n") }
+        if what == 1 { put(out, "pub fn requestCount(interface: Interface) -> u16 {\n    return match interface {\n") }
+        if what == 2 { put(out, "pub fn eventCount(interface: Interface) -> u16 {\n    return match interface {\n") }
+        p = 0
+        while p < set.*.count {
+            const current = protocolAt(set, p)
+            var i: usize = 0
+            while i < protocol.interfaceCount(current) {
+                const interface = protocol.interfaceAt(current, i)
+                put(out, "        .")
+                putString(out, interface.*.name)
+                put(out, " => ")
+                if what == 0 { putNumber(out, @intCast(usize, interface.*.version)) }
+                if what == 1 { putNumber(out, interface.*.requestCount) }
+                if what == 2 { putNumber(out, interface.*.eventCount) }
+                put(out, ",\n")
+                i += 1
+            }
+            p += 1
+        }
+        put(out, "    }\n}\n\n")
+        what += 1
+    }
+
+    putDispatchFunction(out, set, "requestSignature(interface: Interface, opcode: u16) -> []const u8", "_requestSignature", "(opcode)", "")
+    putDispatchFunction(out, set, "eventSignature(interface: Interface, opcode: u16) -> []const u8", "_eventSignature", "(opcode)", "")
+    putDispatchFunction(out, set, "requestName(interface: Interface, opcode: u16) -> []const u8", "_requestName", "(opcode)", "")
+    putDispatchFunction(out, set, "eventName(interface: Interface, opcode: u16) -> []const u8", "_eventName", "(opcode)", "")
+    putDispatchFunction(out, set, "requestDestructor(interface: Interface, opcode: u16) -> bool", "_requestDestructor", "(opcode)", "")
+    putDispatchFunction(out, set, "eventDestructor(interface: Interface, opcode: u16) -> bool", "_eventDestructor", "(opcode)", "")
+    put(out, "// The interface of object/new_id argument `argument` (counted in\n// signature order), when the protocol names one.\n")
+    putDispatchFunction(out, set, "requestArgInterface(interface: Interface, opcode: u16, argument: usize, result: *Interface) -> bool", "_requestArgInterface", "(opcode, argument, result)", "")
+    putDispatchFunction(out, set, "eventArgInterface(interface: Interface, opcode: u16, argument: usize, result: *Interface) -> bool", "_eventArgInterface", "(opcode, argument, result)", "")
+
+    p = 0
+    while p < set.*.count {
+        const current = protocolAt(set, p)
+        var i: usize = 0
+        while i < protocol.interfaceCount(current) {
+            const interface = protocol.interfaceAt(current, i)
+            var table: u8 = 0
+            while table < 3 {
+                putMessageTable(out, current, interface, false, table)
+                putMessageTable(out, current, interface, true, table)
+                table += 1
+            }
+            putArgInterfaceTable(out, set, current, interface, false)
+            putArgInterfaceTable(out, set, current, interface, true)
+            i += 1
+        }
+        p += 1
+    }
+    return true
+}
+
+// ---------------------------------------------------------------------------
+// Type references and declaration order
+
+fn resolve(set: *const Set, current_index: usize, owner_index: usize, target: String, emitted: *const ArrayList) -> Reference {
+    var result: Reference = undefined
+    result.name = target
+    result.kind = REF_NONE
+    result.protocolIndex = 0
+    result.interfaceIndex = 0
+    if target.length == 0 {
+        result.kind = REF_UNTYPED
+        return result
+    }
+    var found_protocol: usize = 0
+    var found_interface: usize = 0
+    if !findInterface(set, target, &found_protocol, &found_interface) {
+        result.kind = REF_UNTYPED
+        return result
+    }
+    result.protocolIndex = found_protocol
+    result.interfaceIndex = found_interface
+    if found_protocol != current_index {
+        result.kind = REF_FOREIGN
+        return result
+    }
+    if found_interface == owner_index {
+        result.kind = REF_SELF
+        return result
+    }
+    if emitted.*.items[found_interface] != 0 {
+        result.kind = REF_LOCAL
+    } else {
+        result.kind = REF_UNTYPED
+    }
+    return result
+}
+
+// Every reference as seen from a separate module (all types declared).
+fn resolveAll(set: *const Set, current_index: usize, target: String) -> Reference {
+    var result: Reference = undefined
+    result.name = target
+    result.kind = REF_UNTYPED
+    result.protocolIndex = 0
+    result.interfaceIndex = 0
+    var found_protocol: usize = 0
+    var found_interface: usize = 0
+    if target.length == 0 { return result }
+    if !findInterface(set, target, &found_protocol, &found_interface) { return result }
+    result.protocolIndex = found_protocol
+    result.interfaceIndex = found_interface
+    result.kind = if found_protocol == current_index { REF_LOCAL } else { REF_FOREIGN }
+    return result
+}
+
+// kind: "_Proxy" or "_Resource"; runtime: "client" or "server".
+fn putTypeReference(out: *ArrayList, set: *const Set, reference: *const Reference, suffix: []const u8, runtime: []const u8, in_types: bool) -> void {
+    if reference.*.kind == REF_SELF {
+        put(out, "Self")
+        return
+    }
+    if reference.*.kind == REF_UNTYPED {
+        put(out, runtime)
+        put(out, ".Object")
+        return
+    }
+    if reference.*.kind == REF_FOREIGN {
+        putString(out, protocolAt(set, reference.*.protocolIndex).*.name)
+        put(out, "_types.")
+    } else if !in_types {
+        put(out, "types.")
+    }
+    putString(out, reference.*.name)
+    put(out, suffix)
+}
+
+// Depth-first post-order over "method signature of A names B" edges, so
+// every type is declared after the types its methods name.
+fn visit(set: *const Set, current_index: usize, index: usize, events: bool, state: *ArrayList, order: *ArrayList) -> void {
+    if state.*.items[index] != 0 { return }
+    state.*.items[index] = 1
+    const current = protocolAt(set, current_index)
+    const interface = protocol.interfaceAt(current, index)
+    const count = if events { interface.*.eventCount } else { interface.*.requestCount }
+    var m: usize = 0
+    while m < count {
+        const message = if events { protocol.eventAt(current, interface, m) } else { protocol.requestAt(current, interface, m) }
+        var a: usize = 0
+        while a < message.*.argCount {
+            const arg = protocol.argAt(current, message, a)
+            if arg.*.interfaceName.length > 0 {
+                var found_protocol: usize = 0
+                var found_interface: usize = 0
+                if findInterface(set, arg.*.interfaceName, &found_protocol, &found_interface) {
+                    if found_protocol == current_index && found_interface != index {
+                        visit(set, current_index, found_interface, events, state, order)
+                    }
+                }
+            }
+            a += 1
+        }
+        m += 1
+    }
+    state.*.items[index] = 2
+    const ignored = ArrayList.appendAt(order, @intCast(u8, index & 255))
+    const ignored_high = ArrayList.appendAt(order, @intCast(u8, index >> 8))
+}
+
+fn declarationOrder(set: *const Set, current_index: usize, events: bool, order: *ArrayList) -> void {
+    const current = protocolAt(set, current_index)
+    const count = protocol.interfaceCount(current)
+    var state = ArrayList.init(current.*.allocator, count + 1)
+    state = ArrayList.resize(state, count, 0)
+    var index: usize = 0
+    while index < count {
+        visit(set, current_index, index, events, &state, order)
+        index += 1
+    }
+    ArrayList.deinit(state)
+}
+
+fn orderAt(order: *const ArrayList, index: usize) -> usize {
+    return @intCast(usize, order.*.items[index * 2]) | (@intCast(usize, order.*.items[index * 2 + 1]) << 8)
+}
+
+// ---------------------------------------------------------------------------
+// types.mlx
+
+fn putImports(out: *ArrayList, set: *const Set, current_index: usize, depth: []const u8) -> void {
+    put(out, "const client = @import(\"")
+    put(out, depth)
+    put(out, "client.mlx\")\nconst server = @import(\"")
+    put(out, depth)
+    put(out, "server.mlx\")\nconst wire = @import(\"")
+    put(out, depth)
+    put(out, "wire.mlx\")\nconst interfaces = @import(\"../interfaces.mlx\")\nconst Interface = interfaces.Interface\n")
+    // Other protocols this protocol names (interfaces are resolved across
+    // the whole set).
+    var p: usize = 0
+    while p < set.*.count {
+        if p != current_index && protocolReferences(set, current_index, p) {
+            put(out, "const ")
+            putString(out, protocolAt(set, p).*.name)
+            put(out, "_types = @import(\"../")
+            putString(out, protocolAt(set, p).*.name)
+            put(out, "/types.mlx\")\n")
+        }
+        p += 1
+    }
+}
+
+fn protocolReferences(set: *const Set, current_index: usize, other: usize) -> bool {
+    const current = protocolAt(set, current_index)
+    var index: usize = 0
+    while index < current.*.args.length {
+        var arg: *protocol.Arg = undefined
+        unsafe { arg = @ptrCast(*protocol.Arg, current.*.args.at(index)) }
+        if arg.*.interfaceName.length > 0 {
+            var found_protocol: usize = 0
+            var found_interface: usize = 0
+            if findInterface(set, arg.*.interfaceName, &found_protocol, &found_interface) && found_protocol == other { return true }
+        }
+        index += 1
+    }
+    return false
+}
+
+fn putParameterType(out: *ArrayList, set: *const Set, arg: *const protocol.Arg, reference: *const Reference, suffix: []const u8, runtime: []const u8) -> void {
+    const kind = arg.*.kind
+    if kind == protocol.ArgType.int { put(out, "i32") }
+    if kind == protocol.ArgType.uint { put(out, "u32") }
+    if kind == protocol.ArgType.fixed { put(out, "wire.Fixed") }
+    if kind == protocol.ArgType.string { putChoice(out, arg.*.allowNull, "?[]const u8", "[]const u8") }
+    if kind == protocol.ArgType.array { put(out, "wire.ArrayView") }
+    if kind == protocol.ArgType.fd {
+        put(out, runtime)
+        put(out, ".Handle")
+    }
+    if kind == protocol.ArgType.object {
+        if arg.*.allowNull { put(out, "?*const ") }
+        putTypeReference(out, set, reference, suffix, runtime, true)
+    }
+}
+
+// Emits one typed message-sending method. `sending_events` selects the
+// server Resource flavor (events) over the client Proxy flavor (requests).
+fn putSendMethod(out: *ArrayList, set: *const Set, current_index: usize, owner_index: usize, message: *const protocol.Message, emitted: *const ArrayList, sending_events: bool) -> void {
+    const current = protocolAt(set, current_index)
+    const suffix = choose(sending_events, "_Resource", "_Proxy")
+    const runtime = choose(sending_events, "server", "client")
+    var method: Name = undefined
+    if sending_events {
+        var pascal: Name = undefined
+        buildPascal(&pascal, message.*.name)
+        method.length = 0
+        nameAppendText(&method, "send")
+        var index: usize = 0
+        while index < pascal.length {
+            nameAppend(&method, pascal.bytes[index])
+            index += 1
+        }
+    } else {
+        buildCamel(&method, message.*.name)
+        if nameEquals(&method, "fromObject") || nameEquals(&method, "id") || nameEquals(&method, "version") || nameEquals(&method, "isNull") || nameEquals(&method, "setHandler") || nameEquals(&method, "forget") || nameEquals(&method, "object") {
+            nameAppendText(&method, "Request")
+        }
+    }
+    // Return type: the new object for a new_id argument.
+    var new_id: *protocol.Arg = undefined
+    var has_new_id = false
+    var a: usize = 0
+    while a < message.*.argCount {
+        const arg = protocol.argAt(current, message, a)
+        if arg.*.kind == protocol.ArgType.newId {
+            new_id = arg
+            has_new_id = true
+        }
+        a += 1
+    }
+    var result_reference: Reference = undefined
+    if has_new_id { result_reference = resolve(set, current_index, owner_index, new_id.*.interfaceName, emitted) }
+
+    put(out, "    pub fn ")
+    putName(out, &method)
+    put(out, "(self: Self")
+    a = 0
+    while a < message.*.argCount {
+        const arg = protocol.argAt(current, message, a)
+        if arg.*.kind == protocol.ArgType.newId {
+            if arg.*.interfaceName.length == 0 {
+                put(out, ", ")
+                putString(out, arg.*.name)
+                put(out, "_interface: Interface, ")
+                putString(out, arg.*.name)
+                put(out, "_version: u32")
+            }
+        } else {
+            put(out, ", ")
+            putParameter(out, arg.*.name)
+            put(out, ": ")
+            const reference = resolve(set, current_index, owner_index, arg.*.interfaceName, emitted)
+            putParameterType(out, set, arg, &reference, suffix, runtime)
+        }
+        a += 1
+    }
+    put(out, ") -> ")
+    if has_new_id {
+        putTypeReference(out, set, &result_reference, suffix, runtime, true)
+    } else {
+        put(out, "void")
+    }
+    put(out, " {\n        var message: wire.Writer = undefined\n        if !")
+    put(out, runtime)
+    putChoice(out, sending_events, ".beginEvent(self.object, ", ".beginRequest(self.object, ")
+    putNumber(out, @intCast(usize, message.*.opcode))
+    put(out, ", ")
+    putNumber(out, @intCast(usize, message.*.since))
+    put(out, ", &message) { return")
+    if has_new_id {
+        if result_reference.kind == REF_UNTYPED {
+            put(out, " ")
+            put(out, runtime)
+            put(out, ".nullObject(self.object)")
+        } else {
+            put(out, " ")
+            putTypeReference(out, set, &result_reference, suffix, runtime, true)
+            put(out, ".fromObject(")
+            put(out, runtime)
+            put(out, ".nullObject(self.object))")
+        }
+    }
+    put(out, " }\n")
+    if has_new_id {
+        put(out, "        const created = ")
+        put(out, runtime)
+        if new_id.*.interfaceName.length == 0 {
+            put(out, ".createGenericObject(self.object, ")
+            putString(out, new_id.*.name)
+            put(out, "_interface, ")
+            putString(out, new_id.*.name)
+            put(out, "_version)\n")
+        } else {
+            put(out, ".createObject(self.object, ")
+            put(out, "Interface.")
+            putString(out, new_id.*.interfaceName)
+            put(out, ", ")
+            put(out, runtime)
+            put(out, ".objectVersion(self.object))\n")
+        }
+    }
+    a = 0
+    while a < message.*.argCount {
+        const arg = protocol.argAt(current, message, a)
+        const kind = arg.*.kind
+        if kind == protocol.ArgType.newId {
+            if arg.*.interfaceName.length == 0 {
+                put(out, "        wire.putStringSlice(&message, interfaces.interfaceName(")
+                putString(out, arg.*.name)
+                put(out, "_interface))\n        wire.putUint(&message, ")
+                putString(out, arg.*.name)
+                put(out, "_version)\n")
+            }
+            put(out, "        wire.putNewId(&message, created.id)\n")
+        } else if kind == protocol.ArgType.object {
+            if arg.*.allowNull {
+                put(out, "        var nullable_")
+                putNumber(out, a)
+                put(out, ": u32 = 0\n        if ")
+                putParameter(out, arg.*.name)
+                put(out, " != null { nullable_")
+                putNumber(out, a)
+                put(out, " = ")
+                putParameter(out, arg.*.name)
+                const reference = resolve(set, current_index, owner_index, arg.*.interfaceName, emitted)
+                if reference.kind == REF_UNTYPED { put(out, ".?.*.id }\n") } else { put(out, ".?.*.object.id }\n") }
+                put(out, "        wire.putObject(&message, nullable_")
+                putNumber(out, a)
+                put(out, ")\n")
+            } else {
+                put(out, "        ")
+                put(out, runtime)
+                put(out, ".putObject(self.object, &message, ")
+                putParameter(out, arg.*.name)
+                const reference = resolve(set, current_index, owner_index, arg.*.interfaceName, emitted)
+                if reference.kind == REF_UNTYPED { put(out, ")\n") } else { put(out, ".object)\n") }
+            }
+        } else {
+            put(out, "        ")
+            if kind == protocol.ArgType.int { put(out, "wire.putInt(&message, ") }
+            if kind == protocol.ArgType.uint { put(out, "wire.putUint(&message, ") }
+            if kind == protocol.ArgType.fixed { put(out, "wire.putFixed(&message, ") }
+            if kind == protocol.ArgType.string { putChoice(out, arg.*.allowNull, "wire.putString(&message, ", "wire.putStringSlice(&message, ") }
+            if kind == protocol.ArgType.array { put(out, "wire.putArray(&message, ") }
+            if kind == protocol.ArgType.fd {
+                put(out, runtime)
+                put(out, ".putHandle(self.object, &message, ")
+            }
+            putParameter(out, arg.*.name)
+            put(out, ")\n")
+        }
+        a += 1
+    }
+    put(out, "        ")
+    put(out, runtime)
+    putChoice(out, sending_events, ".endEvent(self.object, &message, ", ".endRequest(self.object, &message, ")
+    putChoice(out, message.*.destructor, "true)\n", "false)\n")
+    if has_new_id {
+        if result_reference.kind == REF_UNTYPED {
+            put(out, "        return created\n")
+        } else {
+            put(out, "        return ")
+            putTypeReference(out, set, &result_reference, suffix, runtime, true)
+            put(out, ".fromObject(created)\n")
+        }
+    }
+    put(out, "    }\n\n")
+}
+
+fn putObjectType(out: *ArrayList, set: *const Set, current_index: usize, index: usize, emitted: *const ArrayList, server_side: bool) -> void {
+    const current = protocolAt(set, current_index)
+    const interface = protocol.interfaceAt(current, index)
+    const runtime = choose(server_side, "server", "client")
+    put(out, "// ")
+    putString(out, interface.*.name)
+    putChoice(out, server_side, " resource (server side): one method per event.\n", " proxy (client side): one method per request.\n")
+    put(out, "pub const ")
+    putString(out, interface.*.name)
+    putChoice(out, server_side, "_Resource", "_Proxy")
+    put(out, " = struct {\n    object: ")
+    put(out, runtime)
+    put(out, ".Object\n\n")
+    put(out, "    pub fn fromObject(object: ")
+    put(out, runtime)
+    put(out, ".Object) -> Self { return Self.{ .object = object } }\n")
+    put(out, "    pub fn id(self: Self) -> u32 { return self.object.id }\n")
+    put(out, "    pub fn version(self: Self) -> u32 { return ")
+    put(out, runtime)
+    put(out, ".objectVersion(self.object) }\n")
+    put(out, "    pub fn isNull(self: Self) -> bool { return self.object.id == 0 }\n")
+    if server_side {
+        put(out, "    pub fn client(self: Self) -> server.Client { return self.object.client }\n")
+        put(out, "    pub fn setHandler(self: Self, handler: server.RequestHandler, context: *anyopaque) -> void { server.setHandler(self.object, handler, context) }\n")
+        put(out, "    pub fn setDestroyHandler(self: Self, handler: server.DestroyHandler, context: *anyopaque) -> void { server.setDestroyHandler(self.object, handler, context) }\n")
+        put(out, "    pub fn postError(self: Self, code: u32, message: []const u8) -> void { server.postError(self.object, code, message) }\n")
+        put(out, "    pub fn destroy(self: Self) -> void { server.destroyObject(self.object) }\n\n")
+    } else {
+        put(out, "    pub fn setHandler(self: Self, handler: client.EventHandler, context: *anyopaque) -> void { client.setHandler(self.object, handler, context) }\n")
+        put(out, "    // Destroys the proxy locally without sending a request.\n")
+        put(out, "    pub fn forget(self: Self) -> void { client.forget(self.object) }\n\n")
+    }
+    const count = if server_side { interface.*.eventCount } else { interface.*.requestCount }
+    var m: usize = 0
+    while m < count {
+        const message = if server_side { protocol.eventAt(current, interface, m) } else { protocol.requestAt(current, interface, m) }
+        putSendMethod(out, set, current_index, index, message, emitted, server_side)
+        m += 1
+    }
+    put(out, "}\n\n")
+}
+
+pub fn emitTypes(set: *const Set, current_index: usize, out: *ArrayList) -> bool {
+    const current = protocolAt(set, current_index)
+    putHeader(out, set)
+    put(out, "// Typed client proxies and server resources of the \"")
+    putString(out, current.*.name)
+    put(out, "\" protocol, declared in\n// dependency order.\n\n")
+    putImports(out, set, current_index, "../../")
+    put(out, "\n")
+    const count = protocol.interfaceCount(current)
+    var side: usize = 0
+    while side < 2 {
+        var order = ArrayList.init(current.*.allocator, count * 2 + 2)
+        declarationOrder(set, current_index, side == 1, &order)
+        var emitted = ArrayList.init(current.*.allocator, count + 1)
+        emitted = ArrayList.resize(emitted, count, 0)
+        var index: usize = 0
+        while index < count {
+            const interface_index = orderAt(&order, index)
+            putObjectType(out, set, current_index, interface_index, &emitted, side == 1)
+            emitted.items[interface_index] = 1
+            index += 1
+        }
+        ArrayList.deinit(emitted)
+        ArrayList.deinit(order)
+        side += 1
+    }
+    return true
+}
+
+// ---------------------------------------------------------------------------
+// <interface>.mlx
+
+fn putPayloadStruct(out: *ArrayList, set: *const Set, current_index: usize, message: *const protocol.Message, is_event: bool) -> void {
+    const current = protocolAt(set, current_index)
+    const suffix = choose(is_event, "_Proxy", "_Resource")
+    const runtime = choose(is_event, "client", "server")
+    put(out, "pub const ")
+    putPascal(out, message.*.name)
+    putChoice(out, is_event, "Event", "Request")
+    put(out, " = struct {\n")
+    var a: usize = 0
+    while a < message.*.argCount {
+        const arg = protocol.argAt(current, message, a)
+        const kind = arg.*.kind
+        if kind == protocol.ArgType.newId && arg.*.interfaceName.length == 0 {
+            put(out, "    ")
+            putString(out, arg.*.name)
+            put(out, "_interface: wire.String\n    ")
+            putString(out, arg.*.name)
+            put(out, "_version: u32\n")
+        }
+        put(out, "    ")
+        putVerbatim(out, arg.*.name)
+        put(out, ": ")
+        if kind == protocol.ArgType.int { put(out, "i32") }
+        if kind == protocol.ArgType.uint { put(out, "u32") }
+        if kind == protocol.ArgType.fixed { put(out, "wire.Fixed") }
+        if kind == protocol.ArgType.string { put(out, "wire.String") }
+        if kind == protocol.ArgType.array { put(out, "wire.ArrayView") }
+        if kind == protocol.ArgType.fd {
+            put(out, runtime)
+            put(out, ".Handle")
+        }
+        if kind == protocol.ArgType.newId && arg.*.interfaceName.length == 0 {
+            put(out, "u32")
+        } else if kind == protocol.ArgType.object || kind == protocol.ArgType.newId {
+            const reference = resolveAll(set, current_index, arg.*.interfaceName)
+            putTypeReference(out, set, &reference, suffix, runtime, false)
+        }
+        put(out, "\n")
+        a += 1
+    }
+    put(out, "}\n\n")
+}
+
+fn putDecode(out: *ArrayList, set: *const Set, current_index: usize, interface: *const protocol.Interface, is_event: bool) -> void {
+    const current = protocolAt(set, current_index)
+    const suffix = choose(is_event, "_Proxy", "_Resource")
+    const runtime = choose(is_event, "client", "server")
+    const count = if is_event { interface.*.eventCount } else { interface.*.requestCount }
+    const kind_name = choose(is_event, "Event", "Request")
+    put(out, "pub const ")
+    put(out, kind_name)
+    put(out, " = union(enum(u16)) {\n")
+    var m: usize = 0
+    while m < count {
+        const message = if is_event { protocol.eventAt(current, interface, m) } else { protocol.requestAt(current, interface, m) }
+        put(out, "    ")
+        putVerbatim(out, message.*.name)
+        if message.*.argCount > 0 {
+            put(out, ": ")
+            putPascal(out, message.*.name)
+            put(out, kind_name)
+        }
+        if m + 1 < count { put(out, ",") }
+        put(out, "\n")
+        m += 1
+    }
+    put(out, "}\n\n")
+    putChoice(out, is_event, "// Decodes an event received by a proxy of this interface.\npub fn decodeEvent(event: client.Event) -> Event {\n    var reader = client.eventReader(event)\n", "// Decodes a request received by a resource of this interface.\npub fn decodeRequest(request: server.Request) -> Request {\n    var reader = server.requestReader(request)\n")
+    const source = choose(is_event, "event", "request")
+    m = 0
+    while m < count {
+        const message = if is_event { protocol.eventAt(current, interface, m) } else { protocol.requestAt(current, interface, m) }
+        const last = m + 1 == count
+        const indent = choose(last, "    ", "        ")
+        if !last {
+            put(out, "    if ")
+            put(out, source)
+            put(out, ".opcode == ")
+            putNumber(out, m)
+            put(out, " {\n")
+        }
+        var a: usize = 0
+        while a < message.*.argCount {
+            const arg = protocol.argAt(current, message, a)
+            const kind = arg.*.kind
+            if kind == protocol.ArgType.newId && arg.*.interfaceName.length == 0 {
+                put(out, indent)
+                put(out, "const value_")
+                putNumber(out, m)
+                put(out, "_")
+                putNumber(out, a)
+                put(out, "_interface = wire.getString(&reader)\n")
+                put(out, indent)
+                put(out, "const value_")
+                putNumber(out, m)
+                put(out, "_")
+                putNumber(out, a)
+                put(out, "_version = wire.getUint(&reader)\n")
+            }
+            put(out, indent)
+            put(out, "const value_")
+            putNumber(out, m)
+            put(out, "_")
+            putNumber(out, a)
+            put(out, " = ")
+            if kind == protocol.ArgType.int { put(out, "wire.getInt(&reader)") }
+            if kind == protocol.ArgType.uint { put(out, "wire.getUint(&reader)") }
+            if kind == protocol.ArgType.fixed { put(out, "wire.getFixed(&reader)") }
+            if kind == protocol.ArgType.string { put(out, "wire.getString(&reader)") }
+            if kind == protocol.ArgType.array { put(out, "wire.getArray(&reader)") }
+            if kind == protocol.ArgType.fd {
+                put(out, runtime)
+                put(out, ".Handle.fromDescriptor(wire.getHandle(&reader))")
+            }
+            if kind == protocol.ArgType.newId && arg.*.interfaceName.length == 0 {
+                put(out, "wire.getNewId(&reader)")
+            } else if kind == protocol.ArgType.object || kind == protocol.ArgType.newId {
+                const reference = resolveAll(set, current_index, arg.*.interfaceName)
+                if reference.kind != REF_UNTYPED {
+                    putTypeReference(out, set, &reference, suffix, runtime, false)
+                    put(out, ".fromObject(")
+                }
+                put(out, runtime)
+                putChoice(out, is_event, ".eventObject(event, ", ".requestObject(request, ")
+                putChoice(out, kind == protocol.ArgType.object, "wire.getObject(&reader))", "wire.getNewId(&reader))")
+                if reference.kind != REF_UNTYPED { put(out, ")") }
+            }
+            put(out, "\n")
+            a += 1
+        }
+        put(out, indent)
+        put(out, "return ")
+        put(out, kind_name)
+        put(out, ".{ .")
+        putVerbatim(out, message.*.name)
+        if message.*.argCount == 0 {
+            put(out, " = undefined }\n")
+        } else {
+            put(out, " = ")
+            putPascal(out, message.*.name)
+            put(out, kind_name)
+            put(out, ".{ ")
+            a = 0
+            while a < message.*.argCount {
+                const arg = protocol.argAt(current, message, a)
+                if a > 0 { put(out, ", ") }
+                if arg.*.kind == protocol.ArgType.newId && arg.*.interfaceName.length == 0 {
+                    put(out, ".")
+                    putString(out, arg.*.name)
+                    put(out, "_interface = value_")
+                    putNumber(out, m)
+                    put(out, "_")
+                    putNumber(out, a)
+                    put(out, "_interface, .")
+                    putString(out, arg.*.name)
+                    put(out, "_version = value_")
+                    putNumber(out, m)
+                    put(out, "_")
+                    putNumber(out, a)
+                    put(out, "_version, ")
+                }
+                put(out, ".")
+                putVerbatim(out, arg.*.name)
+                put(out, " = value_")
+                putNumber(out, m)
+                put(out, "_")
+                putNumber(out, a)
+                a += 1
+            }
+            put(out, " } }\n")
+        }
+        if !last { put(out, "    }\n") }
+        m += 1
+    }
+    put(out, "}\n\n")
+}
+
+pub fn emitInterface(set: *const Set, current_index: usize, index: usize, out: *ArrayList) -> bool {
+    const current = protocolAt(set, current_index)
+    const interface = protocol.interfaceAt(current, index)
+    putHeader(out, set)
+    put(out, "// Interface ")
+    putString(out, interface.*.name)
+    put(out, " of the \"")
+    putString(out, current.*.name)
+    put(out, "\" protocol.\n\n")
+    putImports(out, set, current_index, "../../")
+    put(out, "const types = @import(\"./types.mlx\")\n\n")
+    put(out, "pub const VERSION: u32 = ")
+    putNumber(out, @intCast(usize, interface.*.version))
+    put(out, "\n\npub fn interface() -> Interface { return Interface.")
+    putString(out, interface.*.name)
+    put(out, " }\npub fn name() -> []const u8 { return \"")
+    putString(out, interface.*.name)
+    put(out, "\" }\n\npub const Proxy = types.")
+    putString(out, interface.*.name)
+    put(out, "_Proxy\npub const Resource = types.")
+    putString(out, interface.*.name)
+    put(out, "_Resource\n\n")
+    var kind: usize = 0
+    while kind < 2 {
+        const count = if kind == 0 { interface.*.requestCount } else { interface.*.eventCount }
+        var m: usize = 0
+        while m < count {
+            const message = if kind == 0 { protocol.requestAt(current, interface, m) } else { protocol.eventAt(current, interface, m) }
+            putChoice(out, kind == 0, "pub const REQUEST_", "pub const EVENT_")
+            putUpper(out, message.*.name)
+            put(out, ": u16 = ")
+            putNumber(out, m)
+            putChoice(out, kind == 0, "\npub const REQUEST_", "\npub const EVENT_")
+            putUpper(out, message.*.name)
+            put(out, "_SINCE: u32 = ")
+            putNumber(out, @intCast(usize, message.*.since))
+            put(out, "\n")
+            m += 1
+        }
+        if count > 0 { put(out, "\n") }
+        kind += 1
+    }
+    var e: usize = 0
+    while e < interface.*.enumCount {
+        const enumeration = protocol.enumAt(current, interface, e)
+        put(out, "// enum ")
+        putString(out, enumeration.*.name)
+        if enumeration.*.bitfield { put(out, " (bitfield: combine with std.wayland.flags)") }
+        put(out, "\npub const ")
+        putPascal(out, enumeration.*.name)
+        put(out, " = enum(u32) {\n")
+        var x: usize = 0
+        while x < enumeration.*.entryCount {
+            const entry = protocol.entryAt(current, enumeration, x)
+            put(out, "    ")
+            putVerbatim(out, entry.*.name)
+            put(out, " = ")
+            putNumber(out, @intCast(usize, entry.*.value))
+            if x + 1 < enumeration.*.entryCount { put(out, ",") }
+            put(out, "\n")
+            x += 1
+        }
+        put(out, "}\n\n")
+        e += 1
+    }
+    var m: usize = 0
+    while m < interface.*.eventCount {
+        const message = protocol.eventAt(current, interface, m)
+        if message.*.argCount > 0 { putPayloadStruct(out, set, current_index, message, true) }
+        m += 1
+    }
+    if interface.*.eventCount > 0 { putDecode(out, set, current_index, interface, true) }
+    m = 0
+    while m < interface.*.requestCount {
+        const message = protocol.requestAt(current, interface, m)
+        if message.*.argCount > 0 { putPayloadStruct(out, set, current_index, message, false) }
+        m += 1
+    }
+    if interface.*.requestCount > 0 { putDecode(out, set, current_index, interface, false) }
+    return true
+}
+
+// ---------------------------------------------------------------------------
+// <protocol>.mlx
+
+pub fn emitFacade(set: *const Set, current_index: usize, out: *ArrayList) -> bool {
+    const current = protocolAt(set, current_index)
+    putHeader(out, set)
+    put(out, "// The \"")
+    putString(out, current.*.name)
+    put(out, "\" protocol: one namespace per interface.\n\n")
+    put(out, "pub const types = @import(\"./")
+    putString(out, current.*.name)
+    put(out, "/types.mlx\")\n")
+    var i: usize = 0
+    while i < protocol.interfaceCount(current) {
+        const interface = protocol.interfaceAt(current, i)
+        put(out, "pub const ")
+        putString(out, interface.*.name)
+        put(out, " = @import(\"./")
+        putString(out, current.*.name)
+        put(out, "/")
+        putString(out, interface.*.name)
+        put(out, ".mlx\")\n")
+        i += 1
+    }
+    return true
+}

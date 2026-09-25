@@ -1,0 +1,792 @@
+// std.wayland.client: the Wayland client runtime.
+//
+// Provides the connection (Display), object id allocation, request
+// marshaling for the generated proxies, handle transfer, event decoding and
+// dispatch, wl_display.delete_id handling, object version gating and
+// protocol-error handling (spec/06-wayland/wayland.xml <Client>).
+//
+// Failures inside request methods are sticky, as in libwayland: a request
+// that cannot be sent (dead connection, destroyed object, version too low,
+// oversized message) marks the display failed and returns an inert proxy;
+// the next flush/dispatch/roundtrip returns the error. The server's
+// wl_display.error is reported as Error.ProtocolError with its object id,
+// code and message available from the Display.
+//
+// Usage:
+//
+//     var display: wl.client.Display = undefined
+//     try wl.client.Display.connect(&display, allocator)
+//     defer display.disconnect()
+//     const registry = wl.displayProxy(display).getRegistry()
+//     registry.setHandler(onRegistryEvent, context)
+//     try display.roundtrip()
+
+const allocator_module = @import("../../bootstrap/allocator.mlx")
+const string = @import("../../bootstrap/string.mlx")
+const vector = @import("../../bootstrap/vector.mlx")
+const wire = @import("./wire.mlx")
+const transport = @import("./transport/linux.mlx")
+const interfaces = @import("./generated/interfaces.mlx")
+
+pub const Allocator = allocator_module.Allocator
+pub const String = string.String
+pub const Vector = vector.Vector
+pub const Interface = interfaces.Interface
+pub const Handle = transport.Handle
+
+pub const Error = error {
+    OutOfMemory,
+    NoDisplay,
+    ConnectFailed,
+    Disconnected,
+    ProtocolError,
+    InvalidMessage,
+    InvalidObject,
+    VersionTooLow,
+    MessageTooLarge
+}
+
+const FAIL_NONE: u8 = 0
+const FAIL_MEMORY: u8 = 1
+const FAIL_DISCONNECTED: u8 = 2
+const FAIL_PROTOCOL: u8 = 3
+const FAIL_MESSAGE: u8 = 4
+const FAIL_OBJECT: u8 = 5
+const FAIL_VERSION: u8 = 6
+const FAIL_SIZE: u8 = 7
+
+const STATUS_FREE: u8 = 0
+const STATUS_LIVE: u8 = 1
+const STATUS_ZOMBIE: u8 = 2
+
+const DISPLAY_ID: u32 = 1
+const ERROR_MESSAGE_CAPACITY: usize = 512
+
+// Connection state. Owned by the allocator given to `connect`.
+pub const State = struct {
+    allocator: Allocator
+    connection: *transport.Connection
+    objects: Vector
+    serverObjects: Vector
+    freeIds: Vector
+    failure: u8
+    errorObject: u32
+    errorCode: u32
+    errorMessage: [*]u8
+    errorMessageLength: usize
+}
+
+// The connection handle. It is a small value; copies refer to the same
+// connection.
+pub const Display = struct {
+    state: *State
+
+    // Connects using WAYLAND_SOCKET, or WAYLAND_DISPLAY (default
+    // "wayland-0", relative to XDG_RUNTIME_DIR unless absolute).
+    pub fn connect(display: *Self, allocator: Allocator) -> Error!void {
+        return connectFromEnvironment(display, allocator)
+    }
+
+    // Connects to the socket at `path` (absolute, or relative to the
+    // working directory).
+    pub fn connectTo(display: *Self, allocator: Allocator, path: []const u8) -> Error!void {
+        var length: usize = 0
+        for byte in path { length += 1 }
+        var descriptor: isize = 0
+        unsafe { descriptor = transport.connectPath(@ptrCast([*]const u8, path), length) }
+        if descriptor < 0 { return Error.ConnectFailed }
+        return initialize(display, allocator, descriptor)
+    }
+
+    // Takes ownership of an already connected stream socket.
+    pub fn connectToHandle(display: *Self, allocator: Allocator, handle: Handle) -> Error!void {
+        if !handle.isValid() { return Error.ConnectFailed }
+        if !transport.setNonBlocking(handle.descriptor) { return Error.ConnectFailed }
+        return initialize(display, allocator, handle.descriptor)
+    }
+
+    pub fn disconnect(self: Self) -> void { release(self.state) }
+
+    // False once the connection failed or received a protocol error.
+    pub fn running(self: Self) -> bool { return self.state.*.failure == FAIL_NONE }
+
+    // The socket, for integration with an external event loop.
+    pub fn descriptor(self: Self) -> isize { return self.state.*.connection.*.descriptor }
+
+    pub fn flush(self: Self) -> Error!void { return flushState(self.state) }
+
+    // Sends pending requests, waits for at least one event unless events
+    // are already buffered, and dispatches every complete buffered event.
+    pub fn dispatch(self: Self) -> Error!void { return dispatchState(self.state, true) }
+
+    // Dispatches buffered events without reading from the socket.
+    pub fn dispatchPending(self: Self) -> Error!void { return dispatchState(self.state, false) }
+
+    // Sends wl_display.sync and dispatches until the server answered, so
+    // every event caused by earlier requests has been handled.
+    pub fn roundtrip(self: Self) -> Error!void { return roundtripState(self) }
+
+    // Details of the last wl_display.error.
+    pub fn errorObjectId(self: Self) -> u32 { return self.state.*.errorObject }
+    pub fn errorCode(self: Self) -> u32 { return self.state.*.errorCode }
+    pub fn errorMessage(self: Self) -> String {
+        unsafe { return string.fromParts(@ptrCast([*]const u8, self.state.*.errorMessage), self.state.*.errorMessageLength) }
+    }
+}
+
+// A client-side object: connection plus object id. Id 0 is the null object.
+pub const Object = struct {
+    display: Display
+    id: u32
+}
+
+// One received event. The payload and handles are valid for the duration
+// of the handler call; handles become owned by the handler.
+pub const Event = struct {
+    display: Display
+    object: Object
+    interface: Interface
+    opcode: u16
+    payload: [*]const u8
+    payloadLength: usize
+    handles: [*]const isize
+    handleCount: usize
+}
+
+pub const EventHandler = fn(context: *anyopaque, event: Event) -> void
+
+// The wl_display object (id 1) of a connection.
+pub fn displayObject(display: Display) -> Object {
+    return Object.{ .display = display, .id = DISPLAY_ID }
+}
+
+const ObjectEntry = struct {
+    interface: Interface
+    version: u32
+    status: u8
+    hasHandler: bool
+    handler: EventHandler
+    context: *anyopaque
+}
+
+fn ignoreEvent(context: *anyopaque, event: Event) -> void {}
+
+// ---------------------------------------------------------------------------
+// Object table
+
+fn entryAt(list: Vector, index: usize) -> *ObjectEntry {
+    unsafe { return @ptrCast(*ObjectEntry, list.at(index)) }
+}
+
+fn lookup(state: *State, id: u32) -> ?*ObjectEntry {
+    if id == 0 { return null }
+    if id >= wire.SERVER_ID_START {
+        const index = @intCast(usize, id - wire.SERVER_ID_START)
+        if index >= state.*.serverObjects.length { return null }
+        return entryAt(state.*.serverObjects, index)
+    }
+    const index = @intCast(usize, id)
+    if index >= state.*.objects.length { return null }
+    return entryAt(state.*.objects, index)
+}
+
+fn emptyEntry(entry: *ObjectEntry) -> void {
+    entry.*.interface = Interface.wl_display
+    entry.*.version = 0
+    entry.*.status = STATUS_FREE
+    entry.*.hasHandler = false
+    entry.*.handler = ignoreEvent
+    unsafe { entry.*.context = @ptrFromInt(*anyopaque, 1) }
+}
+
+fn grow(state: *State, server_range: bool, length: usize) -> bool {
+    var list = state.*.objects
+    if server_range { list = state.*.serverObjects }
+    var ok = true
+    while ok && list.length < length {
+        var entry: ObjectEntry = undefined
+        emptyEntry(&entry)
+        unsafe { ok = Vector.appendAt(&list, @ptrCast([*]const u8, &entry)) }
+    }
+    if server_range { state.*.serverObjects = list } else { state.*.objects = list }
+    return ok
+}
+
+fn register(state: *State, id: u32, interface: Interface, version: u32) -> bool {
+    const server_range = id >= wire.SERVER_ID_START
+    const index = if server_range { @intCast(usize, id - wire.SERVER_ID_START) } else { @intCast(usize, id) }
+    if !grow(state, server_range, index + 1) {
+        state.*.failure = FAIL_MEMORY
+        return false
+    }
+    const entry = lookup(state, id).?
+    emptyEntry(entry)
+    entry.*.interface = interface
+    entry.*.version = version
+    entry.*.status = STATUS_LIVE
+    return true
+}
+
+fn allocateId(state: *State) -> u32 {
+    if state.*.freeIds.length > 0 {
+        var id: u32 = 0
+        unsafe { id = @ptrCast(*u32, state.*.freeIds.at(state.*.freeIds.length - 1)).* }
+        state.*.freeIds = state.*.freeIds.pop()
+        return id
+    }
+    if state.*.objects.length > @intCast(usize, wire.MAX_CLIENT_ID) { return 0 }
+    return @intCast(u32, state.*.objects.length)
+}
+
+fn releaseId(state: *State, id: u32) -> void {
+    const entry = lookup(state, id)
+    if entry == null { return }
+    emptyEntry(entry.?)
+    if id < wire.SERVER_ID_START {
+        var free = state.*.freeIds
+        var value = id
+        unsafe { const ignored = Vector.appendAt(&free, @ptrCast([*]const u8, &value)) }
+        state.*.freeIds = free
+    }
+}
+
+// An early bare `return` inside an error-union function is not lowered
+// correctly by the bootstrap backends yet; early exits return this instead.
+fn success() -> Error!void {}
+
+fn setFailure(state: *State, failure: u8) -> void {
+    if state.*.failure == FAIL_NONE { state.*.failure = failure }
+}
+
+fn check(state: *State) -> Error!void {
+    const failure = state.*.failure
+    if failure == FAIL_NONE { return success() }
+    if failure == FAIL_MEMORY { return Error.OutOfMemory }
+    if failure == FAIL_DISCONNECTED { return Error.Disconnected }
+    if failure == FAIL_PROTOCOL { return Error.ProtocolError }
+    if failure == FAIL_MESSAGE { return Error.InvalidMessage }
+    if failure == FAIL_OBJECT { return Error.InvalidObject }
+    if failure == FAIL_VERSION { return Error.VersionTooLow }
+    return Error.MessageTooLarge
+}
+
+// ---------------------------------------------------------------------------
+// Connection setup
+
+fn initialize(display: *Display, allocator: Allocator, descriptor: isize) -> Error!void {
+    const state_memory = allocator.alloc(@sizeOf(State), @alignOf(State))
+    if state_memory == null {
+        transport.close(descriptor)
+        return Error.OutOfMemory
+    }
+    const connection_memory = allocator.alloc(@sizeOf(transport.Connection), @alignOf(transport.Connection))
+    const message_memory = allocator.alloc(ERROR_MESSAGE_CAPACITY, 1)
+    if connection_memory == null || message_memory == null {
+        transport.close(descriptor)
+        return Error.OutOfMemory
+    }
+    var state: *State = undefined
+    unsafe {
+        state = @ptrCast(*State, state_memory.?)
+        state.*.connection = @ptrCast(*transport.Connection, connection_memory.?)
+    }
+    if !transport.init(state.*.connection, allocator, descriptor) {
+        transport.close(descriptor)
+        return Error.OutOfMemory
+    }
+    state.*.allocator = allocator
+    var objects: Vector = undefined
+    Vector.initAt(&objects, allocator, @sizeOf(ObjectEntry), @alignOf(ObjectEntry), 64)
+    var server_objects: Vector = undefined
+    Vector.initAt(&server_objects, allocator, @sizeOf(ObjectEntry), @alignOf(ObjectEntry), 16)
+    var free_ids: Vector = undefined
+    Vector.initAt(&free_ids, allocator, 4, 4, 16)
+    state.*.objects = objects
+    state.*.serverObjects = server_objects
+    state.*.freeIds = free_ids
+    state.*.failure = FAIL_NONE
+    state.*.errorObject = 0
+    state.*.errorCode = 0
+    state.*.errorMessage = message_memory.?
+    state.*.errorMessageLength = 0
+    // Id 0 is the null object; id 1 is wl_display.
+    if !grow(state, false, 1) { return Error.OutOfMemory }
+    if !register(state, DISPLAY_ID, Interface.wl_display, 1) { return Error.OutOfMemory }
+    display.*.state = state
+}
+
+fn parseDescriptor(value: String) -> isize {
+    if value.length == 0 { return -1 }
+    var result: isize = 0
+    var index: usize = 0
+    while index < value.length {
+        const byte = value.pointer[index]
+        if byte < 48 || byte > 57 { return -1 }
+        result = result * 10 + @intCast(isize, byte - 48)
+        if result > 2147483647 { return -1 }
+        index += 1
+    }
+    return result
+}
+
+fn connectFromEnvironment(display: *Display, allocator: Allocator) -> Error!void {
+    var environment: transport.Environment = undefined
+    if !transport.loadEnvironment(&environment, allocator) { return Error.NoDisplay }
+    const socket = transport.lookupEnvironment(&environment, "WAYLAND_SOCKET")
+    if !wire.isNull(socket) {
+        const descriptor = parseDescriptor(socket)
+        transport.freeEnvironment(&environment)
+        if descriptor < 0 { return Error.NoDisplay }
+        return Display.connectToHandle(display, allocator, Handle.fromDescriptor(descriptor))
+    }
+    var name = transport.lookupEnvironment(&environment, "WAYLAND_DISPLAY")
+    if wire.isNull(name) || name.length == 0 { name = string.fromSlice("wayland-0") }
+    var path: [112]u8 = undefined
+    var length: usize = 0
+    if name.pointer[0] != 47 {
+        const runtime = transport.lookupEnvironment(&environment, "XDG_RUNTIME_DIR")
+        if wire.isNull(runtime) || runtime.length == 0 {
+            transport.freeEnvironment(&environment)
+            return Error.NoDisplay
+        }
+        if runtime.length + 1 + name.length > 107 {
+            transport.freeEnvironment(&environment)
+            return Error.NoDisplay
+        }
+        var index: usize = 0
+        while index < runtime.length {
+            path[length] = runtime.pointer[index]
+            length += 1
+            index += 1
+        }
+        path[length] = 47
+        length += 1
+    }
+    if length + name.length > 107 {
+        transport.freeEnvironment(&environment)
+        return Error.NoDisplay
+    }
+    var index: usize = 0
+    while index < name.length {
+        path[length] = name.pointer[index]
+        length += 1
+        index += 1
+    }
+    transport.freeEnvironment(&environment)
+    var descriptor: isize = 0
+    unsafe { descriptor = transport.connectPath(@ptrCast([*]const u8, &path), length) }
+    if descriptor < 0 { return Error.ConnectFailed }
+    return initialize(display, allocator, descriptor)
+}
+
+fn release(state: *State) -> void {
+    const allocator = state.*.allocator
+    transport.deinit(state.*.connection)
+    state.*.objects.deinit()
+    state.*.serverObjects.deinit()
+    state.*.freeIds.deinit()
+    allocator.free(state.*.errorMessage, ERROR_MESSAGE_CAPACITY, 1)
+    unsafe {
+        allocator.free(@ptrCast([*]u8, state.*.connection), @sizeOf(transport.Connection), @alignOf(transport.Connection))
+        allocator.free(@ptrCast([*]u8, state), @sizeOf(State), @alignOf(State))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Requests (called by generated proxies)
+
+pub fn objectVersion(object: Object) -> u32 {
+    const entry = lookup(object.display.state, object.id)
+    if entry == null { return 0 }
+    return entry.?.*.version
+}
+
+pub fn nullObject(object: Object) -> Object {
+    return Object.{ .display = object.display, .id = 0 }
+}
+
+pub fn setHandler(object: Object, handler: EventHandler, context: *anyopaque) -> void {
+    const entry = lookup(object.display.state, object.id)
+    if entry == null { return }
+    entry.?.*.handler = handler
+    entry.?.*.context = context
+    entry.?.*.hasHandler = true
+}
+
+// Destroys a proxy locally without a request. A client-created id stays
+// reserved until the server's delete_id; a server-created id is released.
+pub fn forget(object: Object) -> void {
+    const state = object.display.state
+    const entry = lookup(state, object.id)
+    if entry == null || object.id == DISPLAY_ID { return }
+    if object.id >= wire.SERVER_ID_START {
+        releaseId(state, object.id)
+    } else {
+        entry.?.*.status = STATUS_ZOMBIE
+        entry.?.*.hasHandler = false
+    }
+}
+
+pub fn beginRequest(object: Object, opcode: u16, since: u32, message: *wire.Writer) -> bool {
+    const state = object.display.state
+    if state.*.failure != FAIL_NONE { return false }
+    const entry = lookup(state, object.id)
+    if entry == null || entry.?.*.status != STATUS_LIVE {
+        setFailure(state, FAIL_OBJECT)
+        return false
+    }
+    if entry.?.*.version < since {
+        setFailure(state, FAIL_VERSION)
+        return false
+    }
+    wire.begin(message, object.id, opcode)
+    return true
+}
+
+// Allocates an id for a generic new_id argument (wl_registry.bind): the
+// requested version must be one this build of std.wayland can decode.
+pub fn createGenericObject(parent: Object, interface: Interface, version: u32) -> Object {
+    if version > interfaces.interfaceVersion(interface) {
+        setFailure(parent.display.state, FAIL_VERSION)
+        return nullObject(parent)
+    }
+    return createObject(parent, interface, version)
+}
+
+// Allocates an id for a typed new_id argument and registers the new
+// object. As in libwayland, it takes the version of the object it was
+// created from.
+pub fn createObject(parent: Object, interface: Interface, version: u32) -> Object {
+    const state = parent.display.state
+    if state.*.failure != FAIL_NONE { return nullObject(parent) }
+    if version == 0 {
+        setFailure(state, FAIL_VERSION)
+        return nullObject(parent)
+    }
+    const id = allocateId(state)
+    if id == 0 {
+        setFailure(state, FAIL_MEMORY)
+        return nullObject(parent)
+    }
+    if !register(state, id, interface, version) { return nullObject(parent) }
+    return Object.{ .display = parent.display, .id = id }
+}
+
+// Puts a non-nullable object argument.
+pub fn putObject(owner: Object, message: *wire.Writer, object: Object) -> void {
+    if object.id == 0 || @intFromPtr(object.display.state) != @intFromPtr(owner.display.state) {
+        setFailure(owner.display.state, FAIL_OBJECT)
+    }
+    wire.putObject(message, object.id)
+}
+
+// Puts an fd argument. The caller keeps ownership of `handle`; the
+// connection sends a duplicate.
+pub fn putHandle(owner: Object, message: *wire.Writer, handle: Handle) -> void {
+    const copy = handle.duplicate()
+    if !copy.isValid() {
+        setFailure(owner.display.state, FAIL_OBJECT)
+        return
+    }
+    wire.putHandle(message, copy.descriptor)
+}
+
+fn closeWriterHandles(message: *const wire.Writer) -> void {
+    var index: usize = 0
+    while index < message.*.handleCount {
+        transport.close(wire.handleAt(message, index))
+        index += 1
+    }
+}
+
+fn queueMessage(state: *State, message: *const wire.Writer) -> bool {
+    while true {
+        const queued = transport.queue(state.*.connection, message)
+        if queued == 0 { return true }
+        if queued != transport.EAGAIN {
+            setFailure(state, FAIL_DISCONNECTED)
+            return false
+        }
+        // The output buffer is full: wait until the server reads.
+        if transport.wait(state.*.connection.*.descriptor, true, -1) < 0 {
+            setFailure(state, FAIL_DISCONNECTED)
+            return false
+        }
+        const flushed = transport.flush(state.*.connection)
+        if flushed < 0 && flushed != transport.EAGAIN {
+            setFailure(state, FAIL_DISCONNECTED)
+            return false
+        }
+    }
+    return false
+}
+
+pub fn endRequest(object: Object, message: *wire.Writer, destructor: bool) -> void {
+    const state = object.display.state
+    if state.*.failure != FAIL_NONE {
+        closeWriterHandles(message)
+        return
+    }
+    if !wire.finish(message) {
+        closeWriterHandles(message)
+        setFailure(state, FAIL_SIZE)
+        return
+    }
+    if !queueMessage(state, message) {
+        closeWriterHandles(message)
+        return
+    }
+    if destructor { forget(object) }
+}
+
+// ---------------------------------------------------------------------------
+// Events (used by generated decoders)
+
+pub fn eventReader(event: Event) -> wire.Reader {
+    var reader: wire.Reader = undefined
+    wire.initReader(&reader, event.payload, event.payloadLength, event.handles, event.handleCount)
+    return reader
+}
+
+pub fn eventObject(event: Event, id: u32) -> Object {
+    return Object.{ .display = event.display, .id = id }
+}
+
+// ---------------------------------------------------------------------------
+// Flushing and dispatch
+
+fn flushState(state: *State) -> Error!void {
+    try check(state)
+    while true {
+        const flushed = transport.flush(state.*.connection)
+        if flushed == 0 { return success() }
+        if flushed != transport.EAGAIN {
+            setFailure(state, FAIL_DISCONNECTED)
+            return check(state)
+        }
+        if transport.wait(state.*.connection.*.descriptor, true, -1) < 0 {
+            setFailure(state, FAIL_DISCONNECTED)
+            return check(state)
+        }
+    }
+}
+
+// Byte offset of every new_id argument is found by walking the signature
+// over the (already validated) payload; server-created objects are
+// registered before their event is dispatched.
+fn registerNewObjects(state: *State, entry_interface: Interface, entry_version: u32, opcode: u16, signature: []const u8, payload: [*]const u8) -> bool {
+    var position: usize = 0
+    var argument: usize = 0
+    for byte in signature {
+        if byte == 105 || byte == 117 || byte == 102 || byte == 111 {
+            position += 4
+            argument += 1
+        } else if byte == 110 {
+            const id = wire.load32(payload, position)
+            var interface = Interface.wl_display
+            if !interfaces.eventArgInterface(entry_interface, opcode, argument, &interface) { return false }
+            if id < wire.SERVER_ID_START { return false }
+            const existing = lookup(state, id)
+            if existing != null && existing.?.*.status != STATUS_FREE { return false }
+            if !register(state, id, interface, entry_version) { return false }
+            position += 4
+            argument += 1
+        } else if byte == 115 || byte == 97 {
+            const size = @intCast(usize, wire.load32(payload, position))
+            position += 4 + wire.padded(size)
+            argument += 1
+        } else if byte == 104 {
+            argument += 1
+        }
+    }
+    return true
+}
+
+fn closeHandles(handles: [*]const isize, count: usize) -> void {
+    var index: usize = 0
+    while index < count {
+        transport.close(handles[index])
+        index += 1
+    }
+}
+
+fn handleDisplayEvent(state: *State, opcode: u16, payload: [*]const u8, length: usize) -> void {
+    var reader: wire.Reader = undefined
+    unsafe { wire.initReader(&reader, payload, length, @ptrFromInt([*]const isize, 8), 0) }
+    if opcode == 0 {
+        state.*.errorObject = wire.getObject(&reader)
+        state.*.errorCode = wire.getUint(&reader)
+        const text = wire.getString(&reader)
+        var index: usize = 0
+        while index < text.length && index < ERROR_MESSAGE_CAPACITY {
+            state.*.errorMessage[index] = text.pointer[index]
+            index += 1
+        }
+        state.*.errorMessageLength = index
+        setFailure(state, FAIL_PROTOCOL)
+        return
+    }
+    const id = wire.getUint(&reader)
+    const entry = lookup(state, id)
+    if entry != null && id != DISPLAY_ID { releaseId(state, id) }
+}
+
+// Dispatches one complete buffered message. Returns 1 when a message was
+// handled, 0 when more input is needed, -1 on failure.
+fn dispatchOne(state: *State) -> isize {
+    const connection = state.*.connection
+    const available = transport.bufferedInput(connection)
+    if available < wire.HEADER_SIZE { return 0 }
+    const bytes = transport.inputPointer(connection)
+    const size = wire.headerSize(bytes)
+    if size < wire.HEADER_SIZE || size > wire.MAX_MESSAGE_SIZE || (size & 3) != 0 {
+        setFailure(state, FAIL_MESSAGE)
+        return -1
+    }
+    if available < size { return 0 }
+    const id = wire.headerObject(bytes)
+    const opcode = wire.headerOpcode(bytes)
+    const found = lookup(state, id)
+    if found == null || found.?.*.status == STATUS_FREE {
+        setFailure(state, FAIL_MESSAGE)
+        return -1
+    }
+    const entry = found.?
+    const interface = entry.*.interface
+    if opcode >= interfaces.eventCount(interface) {
+        setFailure(state, FAIL_MESSAGE)
+        return -1
+    }
+    const signature = interfaces.eventSignature(interface, opcode)
+    const handle_count = wire.signatureHandleCount(signature)
+    if transport.bufferedHandles(connection) < handle_count { return 0 }
+    var payload: [*]const u8 = undefined
+    unsafe { payload = @ptrFromInt([*]const u8, @intFromPtr(bytes) + wire.HEADER_SIZE) }
+    const payload_length = size - wire.HEADER_SIZE
+    if !wire.validate(signature, payload, payload_length, handle_count) || wire.signatureSince(signature) > entry.*.version {
+        setFailure(state, FAIL_MESSAGE)
+        return -1
+    }
+
+    // Copy the message out of the receive buffer: a handler may dispatch
+    // again (for example through roundtrip), which reuses that buffer.
+    var copy: [4096]u8 = undefined
+    var handles: [28]isize = undefined
+    var index: usize = 0
+    while index < payload_length {
+        copy[index] = payload[index]
+        index += 1
+    }
+    const queued_handles = transport.handlePointer(connection)
+    index = 0
+    while index < handle_count {
+        handles[index] = queued_handles[index]
+        index += 1
+    }
+    transport.consume(connection, size, handle_count)
+    var copied_payload: [*]const u8 = undefined
+    var copied_handles: [*]const isize = undefined
+    unsafe {
+        copied_payload = @ptrCast([*]const u8, &copy)
+        copied_handles = @ptrCast([*]const isize, &handles)
+    }
+
+    if entry.*.status == STATUS_ZOMBIE {
+        closeHandles(copied_handles, handle_count)
+        return 1
+    }
+    if id == DISPLAY_ID {
+        handleDisplayEvent(state, opcode, copied_payload, payload_length)
+        return 1
+    }
+    const version = entry.*.version
+    if !registerNewObjects(state, interface, version, opcode, signature, copied_payload) {
+        closeHandles(copied_handles, handle_count)
+        setFailure(state, FAIL_MESSAGE)
+        return -1
+    }
+    // Re-read the entry: registering new objects may have moved the table.
+    const current = lookup(state, id).?
+    const has_handler = current.*.hasHandler
+    const handler = current.*.handler
+    const context = current.*.context
+    const display = Display.{ .state = state }
+    if has_handler {
+        const event = Event.{
+            .display = display,
+            .object = Object.{ .display = display, .id = id },
+            .interface = interface,
+            .opcode = opcode,
+            .payload = copied_payload,
+            .payloadLength = payload_length,
+            .handles = copied_handles,
+            .handleCount = handle_count,
+        }
+        handler(context, event)
+    } else {
+        closeHandles(copied_handles, handle_count)
+    }
+    if interfaces.eventDestructor(interface, opcode) {
+        forget(Object.{ .display = display, .id = id })
+    }
+    return 1
+}
+
+fn dispatchBuffered(state: *State) -> Error!usize {
+    var count: usize = 0
+    while state.*.failure == FAIL_NONE {
+        const result = dispatchOne(state)
+        if result <= 0 { break }
+        count += 1
+    }
+    try check(state)
+    return count
+}
+
+fn dispatchState(state: *State, block: bool) -> Error!void {
+    try flushState(state)
+    const handled = try dispatchBuffered(state)
+    if handled > 0 || !block { return success() }
+    while true {
+        const received = transport.receive(state.*.connection)
+        if received == 0 {
+            setFailure(state, FAIL_DISCONNECTED)
+            return check(state)
+        }
+        if received == transport.EAGAIN {
+            if transport.wait(state.*.connection.*.descriptor, false, -1) < 0 {
+                setFailure(state, FAIL_DISCONNECTED)
+                return check(state)
+            }
+        } else if received < 0 {
+            setFailure(state, FAIL_DISCONNECTED)
+            return check(state)
+        } else {
+            const count = try dispatchBuffered(state)
+            if count > 0 { return success() }
+        }
+    }
+}
+
+fn markDone(context: *anyopaque, event: Event) -> void {
+    unsafe {
+        const flag = @ptrCast(*bool, context)
+        flag.* = true
+    }
+}
+
+fn roundtripState(display: Display) -> Error!void {
+    const state = display.state
+    try check(state)
+    var done = false
+    const callback = createObject(displayObject(display), Interface.wl_callback, 1)
+    unsafe { setHandler(callback, markDone, @ptrCast(*anyopaque, &done)) }
+    var message: wire.Writer = undefined
+    if beginRequest(displayObject(display), 0, 1, &message) {
+        wire.putNewId(&message, callback.id)
+        endRequest(displayObject(display), &message, false)
+    }
+    while !done {
+        try dispatchState(state, true)
+    }
+}
