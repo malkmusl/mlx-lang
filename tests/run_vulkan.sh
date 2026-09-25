@@ -6,7 +6,8 @@
 #
 # The driver tests need a Vulkan driver; they use lavapipe (the Mesa CPU
 # driver, Debian/Ubuntu package mesa-vulkan-drivers) when its manifest is
-# installed, else they are skipped. The layout check needs gcc and the
+# installed, else they are skipped. The Wayland interop check also needs
+# xkbcli (libxkbcommon-tools). The layout check needs gcc and the
 # Vulkan headers (libvulkan-dev). Every test exits 13 on success.
 set -euo pipefail
 
@@ -64,8 +65,10 @@ if [[ -n "$lavapipe" ]]; then
     run tests/253_vulkan_loader_runtime.mlx VK_DRIVER_FILES="$lavapipe"
     run tests/254_spirv_compute_runtime.mlx VK_DRIVER_FILES="$lavapipe"
     run tests/256_vulkan_icd_runtime.mlx -- "$work/manifest.json"
+    run tests/257_vulkan_sharing_runtime.mlx VK_DRIVER_FILES="$lavapipe"
+    run tests/258_vulkan_swapchain_runtime.mlx VK_DRIVER_FILES="$lavapipe"
 else
-    echo "skip tests/253, 254 and 256 (no lavapipe manifest)"
+    echo "skip tests/253, 254, 256, 257 and 258 (no lavapipe manifest)"
 fi
 run tests/255_spirv_module_runtime.mlx -- "$work/doubler.spv"
 
@@ -99,12 +102,48 @@ if command -v glslangValidator > /dev/null; then
     done
 fi
 
-if "$compiler" --quiet examples/vulkan-info/main.mlx -o "$work/vulkan-info" 2> "$work/errors"; then
-    echo "ok   examples/vulkan-info/main.mlx (builds)"
+for example in examples/vulkan-info/main.mlx examples/vulkan-wayland-client/main.mlx examples/wayland-compositor/main.mlx; do
+    if "$compiler" --quiet "$example" -o "$work/example" 2> "$work/errors"; then
+        echo "ok   $example (builds)"
+    else
+        echo "FAIL (compile) $example"
+        cat "$work/errors"
+        failures=$((failures + 1))
+    fi
+done
+
+# The examples' shaders (examples/vulkan-shared) pass the Khronos validator.
+if "$compiler" --quiet examples/vulkan-shared/check_shaders.mlx -o "$work/check-shaders" 2> "$work/errors" && "$work/check-shaders" "$work" > "$work/output" 2>&1; then
+    echo "ok   examples/vulkan-shared shaders build and pass std.spirv.module"
+    if command -v spirv-val > /dev/null; then
+        for shader in pattern blit; do
+            if spirv-val --target-env vulkan1.1 "$work/$shader.spv"; then
+                echo "ok   spirv-val accepts the $shader shader"
+            else
+                echo "FAIL spirv-val rejects the $shader shader"
+                failures=$((failures + 1))
+            fi
+        done
+    fi
 else
-    echo "FAIL (compile) examples/vulkan-info/main.mlx"
-    cat "$work/errors"
+    echo "FAIL examples/vulkan-shared/check_shaders.mlx"
+    cat "$work/errors" "$work/output" 2> /dev/null
     failures=$((failures + 1))
+fi
+
+# The Vulkan Wayland client inside the compositor (both renderers, shm and
+# dma-buf paths), checked pixel by pixel.
+if [[ -n "$lavapipe" ]] && command -v xkbcli > /dev/null; then
+    if tools/check_vulkan_wayland.sh "$compiler" "$lavapipe" > "$work/output" 2>&1; then
+        sed 's/^/     /' "$work/output"
+        echo "ok   tools/check_vulkan_wayland.sh"
+    else
+        echo "FAIL tools/check_vulkan_wayland.sh"
+        cat "$work/output"
+        failures=$((failures + 1))
+    fi
+else
+    echo "skip tools/check_vulkan_wayland.sh (needs lavapipe and xkbcli)"
 fi
 
 if std/registry/vulkan/materialize.sh --check "$compiler" > "$work/check" 2>&1; then

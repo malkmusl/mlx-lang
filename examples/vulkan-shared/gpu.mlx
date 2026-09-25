@@ -1,0 +1,604 @@
+// The Vulkan plumbing shared by the Vulkan examples (Wayland client,
+// compositor, Android): one device and queue, pixel buffers that can be
+// shared with other processes as dma-bufs, compute kernels made from SPIR-V
+// words, and a frame of recorded dispatches submitted at once.
+//
+//     var context: gpu.Context = undefined
+//     gpu.open(&context, driver, &options, allocator)
+//     gpu.createBuffer(&context, &target, width * height * 4, true)   // dma-buf
+//     gpu.createKernel(&context, &pattern, code, words, 1, shaders.PATTERN_WORDS)
+//     gpu.begin(&context)
+//     gpu.dispatch(&context, &pattern, &buffers, &push, groups_x, groups_y)
+//     gpu.submit(&context)
+//
+// Everything is plain std.vulkan; the Vulkan objects stay reachable through
+// the records for code that needs more (a swapchain, image copies).
+
+const std = @import("std")
+const vk = @import("std.vulkan")
+const loader = @import("std.vulkan.loader")
+
+pub const Allocator = std.allocator.Allocator
+
+pub const Status = enum(u8) {
+    ok,
+    instanceFailed,
+    noDevice,
+    deviceFailed,
+    outOfMemory,
+}
+
+pub fn statusMessage(status: Status) -> []const u8 {
+    return match status {
+        .ok => "ok",
+        .instanceFailed => "vkCreateInstance failed",
+        .noDevice => "no physical device with a compute queue",
+        .deviceFailed => "vkCreateDevice failed",
+        .outOfMemory => "out of memory",
+    }
+}
+
+pub const Options = struct {
+    applicationName: [*]const u8
+    // Extra instance and device extensions (a surface, the swapchain).
+    instanceExtensions: ?[*]const [*]const u8
+    instanceExtensionCount: u32
+    deviceExtensions: ?[*]const [*]const u8
+    deviceExtensionCount: u32
+    // Enable buffer sharing (dma-buf import/export, imported host memory)
+    // as far as the device supports it.
+    wantSharing: bool
+}
+
+pub fn defaultOptions(name: [*]const u8) -> Options {
+    return Options.{
+        .applicationName = name,
+        .instanceExtensions = null,
+        .instanceExtensionCount = 0,
+        .deviceExtensions = null,
+        .deviceExtensionCount = 0,
+        .wantSharing = false,
+    }
+}
+
+pub const Context = struct {
+    allocator: Allocator
+    driver: loader.Driver
+    instance: vk.Instance
+    physical: vk.PhysicalDevice
+    device: vk.Device
+    queue: vk.Queue
+    family: u32
+    instanceCommands: *vk.InstanceCommands
+    commands: *vk.DeviceCommands
+    memory: *vk.PhysicalDeviceMemoryProperties
+    deviceName: [256]u8
+    commandPool: vk.CommandPool
+    commandBuffer: vk.CommandBuffer
+    fence: vk.Fence
+    descriptorPool: vk.DescriptorPool
+    // What buffer sharing the device supports (with wantSharing): importing
+    // dma-bufs, exporting them, and importing host memory (alignment
+    // `hostAlignment`).
+    dmaBufImport: bool
+    dmaBufExport: bool
+    hostMemory: bool
+    hostAlignment: u64
+}
+
+pub const Buffer = struct {
+    buffer: vk.Buffer
+    memory: vk.DeviceMemory
+    size: u64
+    // The mapping (host-visible memory), else 0.
+    address: usize
+    // The exported dma-buf, or -1.
+    fd: i32
+}
+
+pub const Kernel = struct {
+    module: vk.ShaderModule
+    setLayout: vk.DescriptorSetLayout
+    pipelineLayout: vk.PipelineLayout
+    pipeline: vk.Pipeline
+    bindings: u32
+    pushBytes: u32
+}
+
+fn allocate(allocator: Allocator, size: usize) -> usize {
+    const memory = allocator.alloc(size, 16)
+    if memory == null { return 0 }
+    return @intFromPtr(memory.?)
+}
+
+fn cString(text: [*]const u8, other: [*]const u8) -> bool {
+    var index: usize = 0
+    while text[index] != 0 || other[index] != 0 {
+        if text[index] != other[index] { return false }
+        index += 1
+    }
+    return true
+}
+
+fn hasDeviceExtension(context: *Context, name: [*]const u8) -> bool {
+    var count: u32 = 0
+    const counted = vk.enumerateDeviceExtensionProperties(context.*.instanceCommands, context.*.physical, null, &count, null)
+    if count == 0 { return false }
+    const memory = allocate(context.*.allocator, @intCast(usize, count) * @sizeOf(vk.ExtensionProperties))
+    if memory == 0 { return false }
+    var properties: [*]vk.ExtensionProperties = undefined
+    unsafe { properties = @ptrFromInt([*]vk.ExtensionProperties, memory) }
+    const listed = vk.enumerateDeviceExtensionProperties(context.*.instanceCommands, context.*.physical, null, &count, properties)
+    var index: u32 = 0
+    var found = false
+    while index < count {
+        // extensionName is the first member.
+        unsafe {
+            if cString(@ptrFromInt([*]const u8, memory + @intCast(usize, index) * @sizeOf(vk.ExtensionProperties)), name) { found = true }
+        }
+        index += 1
+    }
+    unsafe { context.*.allocator.free(@ptrFromInt([*]u8, memory), @intCast(usize, count) * @sizeOf(vk.ExtensionProperties), 16) }
+    return found
+}
+
+// Creates the instance and a device with one compute-capable queue on
+// `driver` (opened with std.vulkan.loader).
+pub fn open(context: *Context, driver: loader.Driver, options: *const Options, allocator: Allocator) -> Status {
+    context.*.allocator = allocator
+    context.*.driver = driver
+    context.*.dmaBufImport = false
+    context.*.dmaBufExport = false
+    context.*.hostMemory = false
+    context.*.hostAlignment = 4096
+    const instance_commands = allocate(allocator, @sizeOf(vk.InstanceCommands))
+    const device_commands = allocate(allocator, @sizeOf(vk.DeviceCommands))
+    const memory_properties = allocate(allocator, @sizeOf(vk.PhysicalDeviceMemoryProperties))
+    if instance_commands == 0 || device_commands == 0 || memory_properties == 0 { return Status.outOfMemory }
+    unsafe {
+        context.*.instanceCommands = @ptrFromInt(*vk.InstanceCommands, instance_commands)
+        context.*.commands = @ptrFromInt(*vk.DeviceCommands, device_commands)
+        context.*.memory = @ptrFromInt(*vk.PhysicalDeviceMemoryProperties, memory_properties)
+    }
+
+    var application = vk.ApplicationInfo.init()
+    application.pApplicationName = options.*.applicationName
+    application.apiVersion = vk.API_VERSION_1_1
+    var instance_info = vk.InstanceCreateInfo.init()
+    instance_info.pApplicationInfo = &application
+    instance_info.enabledExtensionCount = options.*.instanceExtensionCount
+    instance_info.ppEnabledExtensionNames = options.*.instanceExtensions
+    var instance: vk.Instance = 0
+    if vk.createInstance(driver.global, &instance_info, null, &instance) != vk.Result.success { return Status.instanceFailed }
+    context.*.instance = instance
+    vk.loadInstanceCommands(context.*.instanceCommands, instance, driver.getInstanceProcAddr)
+
+    var physical_devices: [8]vk.PhysicalDevice = undefined
+    var physical_count: u32 = 8
+    unsafe { const listed = vk.enumeratePhysicalDevices(context.*.instanceCommands, instance, &physical_count, @ptrCast([*]vk.PhysicalDevice, &physical_devices)) }
+    var chosen = false
+    var device_index: u32 = 0
+    while device_index < physical_count && !chosen {
+        var families: [16]vk.QueueFamilyProperties = undefined
+        var family_count: u32 = 16
+        unsafe { vk.getPhysicalDeviceQueueFamilyProperties(context.*.instanceCommands, physical_devices[device_index], &family_count, @ptrCast([*]vk.QueueFamilyProperties, &families)) }
+        var family: u32 = 0
+        while family < family_count && !chosen {
+            if families[family].queueFlags & vk.QUEUE_COMPUTE_BIT != 0 {
+                context.*.physical = physical_devices[device_index]
+                context.*.family = family
+                chosen = true
+            }
+            family += 1
+        }
+        device_index += 1
+    }
+    if !chosen { return Status.noDevice }
+    vk.getPhysicalDeviceMemoryProperties(context.*.instanceCommands, context.*.physical, context.*.memory)
+    var properties: vk.PhysicalDeviceProperties = undefined
+    vk.getPhysicalDeviceProperties(context.*.instanceCommands, context.*.physical, &properties)
+    var name_index: usize = 0
+    while name_index < 256 {
+        context.*.deviceName[name_index] = properties.deviceName[name_index]
+        name_index += 1
+    }
+
+    // Device extensions: the caller's, plus dma-buf sharing when wanted and
+    // supported.
+    var names: [12][*]const u8 = undefined
+    var name_count: u32 = 0
+    var extension: u32 = 0
+    while extension < options.*.deviceExtensionCount && name_count < 8 {
+        names[name_count] = options.*.deviceExtensions.?[extension]
+        name_count += 1
+        extension += 1
+    }
+    if options.*.wantSharing {
+        var memory_fd: [*]const u8 = undefined
+        var dma_buf: [*]const u8 = undefined
+        var host: [*]const u8 = undefined
+        unsafe {
+            memory_fd = @ptrCast([*]const u8, vk.KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME)
+            dma_buf = @ptrCast([*]const u8, vk.EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME)
+            host = @ptrCast([*]const u8, vk.EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME)
+        }
+        if hasDeviceExtension(context, memory_fd) && hasDeviceExtension(context, dma_buf) {
+            names[name_count] = memory_fd
+            names[name_count + 1] = dma_buf
+            name_count += 2
+            context.*.dmaBufImport = true
+            context.*.dmaBufExport = canExport(context)
+        }
+        if hasDeviceExtension(context, host) {
+            names[name_count] = host
+            name_count += 1
+            context.*.hostMemory = true
+            var host_properties = vk.PhysicalDeviceExternalMemoryHostPropertiesEXT.init()
+            var properties2 = vk.PhysicalDeviceProperties2.init()
+            properties2.pNext = &host_properties
+            vk.getPhysicalDeviceProperties2(context.*.instanceCommands, context.*.physical, &properties2)
+            if host_properties.minImportedHostPointerAlignment > 0 { context.*.hostAlignment = host_properties.minImportedHostPointerAlignment }
+        }
+    }
+    var queue_info = vk.DeviceQueueCreateInfo.init()
+    queue_info.queueFamilyIndex = context.*.family
+    queue_info.queueCount = 1
+    var priority: u32 = 1065353216 // 1.0f
+    unsafe { queue_info.pQueuePriorities = @ptrCast([*]const f32, &priority) }
+    var device_info = vk.DeviceCreateInfo.init()
+    device_info.queueCreateInfoCount = 1
+    device_info.pQueueCreateInfos = &queue_info
+    device_info.enabledExtensionCount = name_count
+    unsafe { device_info.ppEnabledExtensionNames = @ptrCast([*]const [*]const u8, &names) }
+    var device: vk.Device = 0
+    if vk.createDevice(context.*.instanceCommands, context.*.physical, &device_info, null, &device) != vk.Result.success { return Status.deviceFailed }
+    context.*.device = device
+    vk.loadDeviceCommands(context.*.commands, device, context.*.instanceCommands.*.vkGetDeviceProcAddr)
+    var queue: vk.Queue = 0
+    vk.getDeviceQueue(context.*.commands, device, context.*.family, 0, &queue)
+    context.*.queue = queue
+
+    // One command buffer, fence and descriptor pool, reused every frame.
+    var pool_info = vk.CommandPoolCreateInfo.init()
+    pool_info.flags = vk.COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT
+    pool_info.queueFamilyIndex = context.*.family
+    var command_pool: vk.CommandPool = 0
+    if vk.createCommandPool(context.*.commands, device, &pool_info, null, &command_pool) != vk.Result.success { return Status.deviceFailed }
+    context.*.commandPool = command_pool
+    var allocation = vk.CommandBufferAllocateInfo.init()
+    allocation.commandPool = command_pool
+    allocation.level = vk.CommandBufferLevel.primary
+    allocation.commandBufferCount = 1
+    var command_buffer: vk.CommandBuffer = 0
+    if vk.allocateCommandBuffers(context.*.commands, device, &allocation, &command_buffer) != vk.Result.success { return Status.deviceFailed }
+    context.*.commandBuffer = command_buffer
+    var fence_info = vk.FenceCreateInfo.init()
+    var fence: vk.Fence = 0
+    if vk.createFence(context.*.commands, device, &fence_info, null, &fence) != vk.Result.success { return Status.deviceFailed }
+    context.*.fence = fence
+    var sizes = vk.DescriptorPoolSize.init()
+    sizes.type_ = vk.DescriptorType.storageBuffer
+    sizes.descriptorCount = 1024
+    var descriptor_info = vk.DescriptorPoolCreateInfo.init()
+    descriptor_info.maxSets = 512
+    descriptor_info.poolSizeCount = 1
+    descriptor_info.pPoolSizes = &sizes
+    var descriptor_pool: vk.DescriptorPool = 0
+    if vk.createDescriptorPool(context.*.commands, device, &descriptor_info, null, &descriptor_pool) != vk.Result.success { return Status.deviceFailed }
+    context.*.descriptorPool = descriptor_pool
+    return Status.ok
+}
+
+// Whether storage buffers can be exported as dma-bufs (drivers without a
+// dma-buf exporter, such as lavapipe without /dev/udmabuf, only import).
+fn canExport(context: *Context) -> bool {
+    var info = vk.PhysicalDeviceExternalBufferInfo.init()
+    info.usage = vk.BUFFER_USAGE_STORAGE_BUFFER_BIT | vk.BUFFER_USAGE_TRANSFER_SRC_BIT | vk.BUFFER_USAGE_TRANSFER_DST_BIT
+    info.handleType = vk.EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT
+    var properties = vk.ExternalBufferProperties.init()
+    vk.getPhysicalDeviceExternalBufferProperties(context.*.instanceCommands, context.*.physical, &info, &properties)
+    return properties.externalMemoryProperties.externalMemoryFeatures & vk.EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT != 0
+}
+
+pub fn deviceName(context: *const Context) -> [*]const u8 {
+    unsafe { return @ptrFromInt([*]const u8, @intFromPtr(context) + @offsetOf(Context, "deviceName")) }
+}
+
+fn memoryType(context: *const Context, bits: u32, wanted: vk.MemoryPropertyFlags) -> u32 {
+    var index: u32 = 0
+    while index < context.*.memory.*.memoryTypeCount {
+        if bits & (@intCast(u32, 1) << @intCast(u5, index)) != 0 && context.*.memory.*.memoryTypes[index].propertyFlags & wanted == wanted { return index }
+        index += 1
+    }
+    return 4294967295
+}
+
+// A host-visible, coherent storage buffer of `size` bytes, mapped at
+// `result.address`; exported as a dma-buf (`result.fd`) when `shareable` is
+// set and the context supports it.
+pub fn createBuffer(context: *Context, result: *Buffer, size: u64, shareable: bool) -> bool {
+    const shared = shareable && context.*.dmaBufExport
+    result.*.buffer = 0
+    result.*.memory = 0
+    result.*.size = size
+    result.*.address = 0
+    result.*.fd = -1
+    var external = vk.ExternalMemoryBufferCreateInfo.init()
+    external.handleTypes = vk.EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT
+    var info = vk.BufferCreateInfo.init()
+    info.size = size
+    info.usage = vk.BUFFER_USAGE_STORAGE_BUFFER_BIT | vk.BUFFER_USAGE_TRANSFER_SRC_BIT | vk.BUFFER_USAGE_TRANSFER_DST_BIT
+    info.sharingMode = vk.SharingMode.exclusive
+    if shared { info.pNext = &external }
+    var buffer: vk.Buffer = 0
+    if vk.createBuffer(context.*.commands, context.*.device, &info, null, &buffer) != vk.Result.success { return false }
+    result.*.buffer = buffer
+    var requirements: vk.MemoryRequirements = undefined
+    vk.getBufferMemoryRequirements(context.*.commands, context.*.device, buffer, &requirements)
+    // Exported memory is a dedicated allocation (drivers such as lavapipe
+    // require it for dma-bufs).
+    var dedicated = vk.MemoryDedicatedAllocateInfo.init()
+    dedicated.buffer = buffer
+    var export_info = vk.ExportMemoryAllocateInfo.init()
+    export_info.handleTypes = vk.EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT
+    export_info.pNext = &dedicated
+    var allocation = vk.MemoryAllocateInfo.init()
+    allocation.allocationSize = requirements.size
+    allocation.memoryTypeIndex = memoryType(context, requirements.memoryTypeBits, vk.MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk.MEMORY_PROPERTY_HOST_COHERENT_BIT)
+    if allocation.memoryTypeIndex == 4294967295 { return false }
+    if shared { allocation.pNext = &export_info }
+    var memory: vk.DeviceMemory = 0
+    if vk.allocateMemory(context.*.commands, context.*.device, &allocation, null, &memory) != vk.Result.success { return false }
+    result.*.memory = memory
+    if vk.bindBufferMemory(context.*.commands, context.*.device, buffer, memory, 0) != vk.Result.success { return false }
+    var mapped: ?*anyopaque = null
+    if vk.mapMemory(context.*.commands, context.*.device, memory, 0, vk.WHOLE_SIZE, 0, &mapped) != vk.Result.success { return false }
+    result.*.address = @intFromPtr(mapped.?)
+    if shared {
+        var get = vk.MemoryGetFdInfoKHR.init()
+        get.memory = memory
+        get.handleType = vk.EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT
+        var fd: i32 = -1
+        if vk.getMemoryFdKHR(context.*.commands, context.*.device, &get, &fd) != vk.Result.success { return false }
+        result.*.fd = fd
+    }
+    return true
+}
+
+// A storage buffer over `size` bytes of another process's dma-buf. Vulkan
+// takes ownership of `fd` on success (pass a duplicate to keep yours).
+pub fn importBuffer(context: *Context, result: *Buffer, fd: i32, size: u64) -> bool {
+    result.*.buffer = 0
+    result.*.memory = 0
+    result.*.size = size
+    result.*.address = 0
+    result.*.fd = -1
+    if !context.*.dmaBufImport { return false }
+    var external = vk.ExternalMemoryBufferCreateInfo.init()
+    external.handleTypes = vk.EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT
+    var info = vk.BufferCreateInfo.init()
+    info.pNext = &external
+    info.size = size
+    info.usage = vk.BUFFER_USAGE_STORAGE_BUFFER_BIT | vk.BUFFER_USAGE_TRANSFER_SRC_BIT
+    info.sharingMode = vk.SharingMode.exclusive
+    var buffer: vk.Buffer = 0
+    if vk.createBuffer(context.*.commands, context.*.device, &info, null, &buffer) != vk.Result.success { return false }
+    result.*.buffer = buffer
+    var requirements: vk.MemoryRequirements = undefined
+    vk.getBufferMemoryRequirements(context.*.commands, context.*.device, buffer, &requirements)
+    var fd_properties = vk.MemoryFdPropertiesKHR.init()
+    if vk.getMemoryFdPropertiesKHR(context.*.commands, context.*.device, vk.EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT, fd, &fd_properties) != vk.Result.success { return false }
+    var import_info = vk.ImportMemoryFdInfoKHR.init()
+    import_info.handleType = vk.EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT
+    import_info.fd = fd
+    var allocation = vk.MemoryAllocateInfo.init()
+    allocation.pNext = &import_info
+    allocation.allocationSize = requirements.size
+    // Some drivers report no types for a dma-buf they can import anyway.
+    const importable = if fd_properties.memoryTypeBits != 0 { fd_properties.memoryTypeBits } else { 4294967295 }
+    allocation.memoryTypeIndex = memoryType(context, requirements.memoryTypeBits & importable, 0)
+    if allocation.memoryTypeIndex == 4294967295 { return false }
+    var memory: vk.DeviceMemory = 0
+    if vk.allocateMemory(context.*.commands, context.*.device, &allocation, null, &memory) != vk.Result.success { return false }
+    result.*.memory = memory
+    return vk.bindBufferMemory(context.*.commands, context.*.device, buffer, memory, 0) == vk.Result.success
+}
+
+// A storage buffer over `size` bytes of this process's memory at `address`
+// (VK_EXT_external_memory_host): the GPU reads and writes it in place, so a
+// wl_shm pool can be rendered into or composited from without copies.
+// `address` and `size` must be multiples of `context.hostAlignment`.
+pub fn importHostMemory(context: *Context, result: *Buffer, address: usize, size: u64) -> bool {
+    result.*.buffer = 0
+    result.*.memory = 0
+    result.*.size = size
+    result.*.address = 0
+    result.*.fd = -1
+    if !context.*.hostMemory || @intCast(u64, address) % context.*.hostAlignment != 0 || size % context.*.hostAlignment != 0 { return false }
+    var external = vk.ExternalMemoryBufferCreateInfo.init()
+    external.handleTypes = vk.EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT
+    var info = vk.BufferCreateInfo.init()
+    info.pNext = &external
+    info.size = size
+    info.usage = vk.BUFFER_USAGE_STORAGE_BUFFER_BIT | vk.BUFFER_USAGE_TRANSFER_SRC_BIT | vk.BUFFER_USAGE_TRANSFER_DST_BIT
+    info.sharingMode = vk.SharingMode.exclusive
+    var buffer: vk.Buffer = 0
+    if vk.createBuffer(context.*.commands, context.*.device, &info, null, &buffer) != vk.Result.success { return false }
+    result.*.buffer = buffer
+    var requirements: vk.MemoryRequirements = undefined
+    vk.getBufferMemoryRequirements(context.*.commands, context.*.device, buffer, &requirements)
+    var pointer_properties = vk.MemoryHostPointerPropertiesEXT.init()
+    var host: *const anyopaque = undefined
+    unsafe { host = @ptrFromInt(*const anyopaque, address) }
+    if vk.getMemoryHostPointerPropertiesEXT(context.*.commands, context.*.device, vk.EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, host, &pointer_properties) != vk.Result.success { return false }
+    const importable = if pointer_properties.memoryTypeBits != 0 { pointer_properties.memoryTypeBits } else { 4294967295 }
+    var import_info = vk.ImportMemoryHostPointerInfoEXT.init()
+    import_info.handleType = vk.EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT
+    unsafe { import_info.pHostPointer = @ptrFromInt(*anyopaque, address) }
+    var allocation = vk.MemoryAllocateInfo.init()
+    allocation.pNext = &import_info
+    allocation.allocationSize = size
+    allocation.memoryTypeIndex = memoryType(context, requirements.memoryTypeBits & importable, vk.MEMORY_PROPERTY_HOST_VISIBLE_BIT)
+    if allocation.memoryTypeIndex == 4294967295 { return false }
+    var memory: vk.DeviceMemory = 0
+    if vk.allocateMemory(context.*.commands, context.*.device, &allocation, null, &memory) != vk.Result.success { return false }
+    result.*.memory = memory
+    if vk.bindBufferMemory(context.*.commands, context.*.device, buffer, memory, 0) != vk.Result.success { return false }
+    // Not mapped through Vulkan: the caller owns the memory.
+    return true
+}
+
+pub fn destroyBuffer(context: *Context, buffer: *Buffer) -> void {
+    if buffer.*.address != 0 { vk.unmapMemory(context.*.commands, context.*.device, buffer.*.memory) }
+    if buffer.*.buffer != 0 { vk.destroyBuffer(context.*.commands, context.*.device, buffer.*.buffer, null) }
+    if buffer.*.memory != 0 { vk.freeMemory(context.*.commands, context.*.device, buffer.*.memory, null) }
+    buffer.*.buffer = 0
+    buffer.*.memory = 0
+    buffer.*.address = 0
+}
+
+// A compute pipeline from SPIR-V `code` with `bindings` storage buffers
+// (set 0, bindings 0..) and `push_words` u32 push constants.
+pub fn createKernel(context: *Context, kernel: *Kernel, code: [*]const u32, words: usize, bindings: u32, push_words: u32) -> bool {
+    kernel.*.bindings = bindings
+    kernel.*.pushBytes = push_words * 4
+    var module_info = vk.ShaderModuleCreateInfo.init()
+    module_info.codeSize = words * 4
+    module_info.pCode = code
+    var module: vk.ShaderModule = 0
+    if vk.createShaderModule(context.*.commands, context.*.device, &module_info, null, &module) != vk.Result.success { return false }
+    kernel.*.module = module
+    var layout_bindings: [4]vk.DescriptorSetLayoutBinding = undefined
+    var index: u32 = 0
+    while index < bindings {
+        var binding = vk.DescriptorSetLayoutBinding.init()
+        binding.binding = index
+        binding.descriptorType = vk.DescriptorType.storageBuffer
+        binding.descriptorCount = 1
+        binding.stageFlags = vk.SHADER_STAGE_COMPUTE_BIT
+        layout_bindings[index] = binding
+        index += 1
+    }
+    var layout_info = vk.DescriptorSetLayoutCreateInfo.init()
+    layout_info.bindingCount = bindings
+    unsafe { layout_info.pBindings = @ptrCast([*]const vk.DescriptorSetLayoutBinding, &layout_bindings) }
+    var set_layout: vk.DescriptorSetLayout = 0
+    if vk.createDescriptorSetLayout(context.*.commands, context.*.device, &layout_info, null, &set_layout) != vk.Result.success { return false }
+    kernel.*.setLayout = set_layout
+    var range = vk.PushConstantRange.init()
+    range.stageFlags = vk.SHADER_STAGE_COMPUTE_BIT
+    range.offset = 0
+    range.size = push_words * 4
+    var pipeline_layout_info = vk.PipelineLayoutCreateInfo.init()
+    pipeline_layout_info.setLayoutCount = 1
+    pipeline_layout_info.pSetLayouts = &set_layout
+    pipeline_layout_info.pushConstantRangeCount = 1
+    pipeline_layout_info.pPushConstantRanges = &range
+    var pipeline_layout: vk.PipelineLayout = 0
+    if vk.createPipelineLayout(context.*.commands, context.*.device, &pipeline_layout_info, null, &pipeline_layout) != vk.Result.success { return false }
+    kernel.*.pipelineLayout = pipeline_layout
+    var pipeline_info = vk.ComputePipelineCreateInfo.init()
+    pipeline_info.stage = vk.PipelineShaderStageCreateInfo.init()
+    pipeline_info.stage.stage = vk.SHADER_STAGE_COMPUTE_BIT
+    pipeline_info.stage.module = module
+    unsafe { pipeline_info.stage.pName = @ptrCast([*]const u8, "main") }
+    pipeline_info.layout = pipeline_layout
+    var pipeline: vk.Pipeline = 0
+    if vk.createComputePipelines(context.*.commands, context.*.device, 0, 1, &pipeline_info, null, &pipeline) != vk.Result.success { return false }
+    kernel.*.pipeline = pipeline
+    return true
+}
+
+// Starts recording a frame.
+pub fn begin(context: *Context) -> bool {
+    if vk.resetDescriptorPool(context.*.commands, context.*.device, context.*.descriptorPool, 0) != vk.Result.success { return false }
+    if vk.resetCommandBuffer(context.*.commands, context.*.commandBuffer, 0) != vk.Result.success { return false }
+    var info = vk.CommandBufferBeginInfo.init()
+    info.flags = vk.COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT
+    return vk.beginCommandBuffer(context.*.commands, context.*.commandBuffer, &info) == vk.Result.success
+}
+
+// Records `kernel` over `groups_x` x `groups_y` work groups with
+// `buffers[0 .. kernel.bindings]` bound and `push` as push constants,
+// followed by a barrier so the next dispatch (or the host) sees its writes.
+pub fn dispatch(context: *Context, kernel: *const Kernel, buffers: [*]const vk.Buffer, push: *const anyopaque, groups_x: u32, groups_y: u32) -> bool {
+    var set_layout = kernel.*.setLayout
+    var allocation = vk.DescriptorSetAllocateInfo.init()
+    allocation.descriptorPool = context.*.descriptorPool
+    allocation.descriptorSetCount = 1
+    allocation.pSetLayouts = &set_layout
+    var set: vk.DescriptorSet = 0
+    if vk.allocateDescriptorSets(context.*.commands, context.*.device, &allocation, &set) != vk.Result.success { return false }
+    var infos: [4]vk.DescriptorBufferInfo = undefined
+    var writes: [4]vk.WriteDescriptorSet = undefined
+    var index: u32 = 0
+    while index < kernel.*.bindings {
+        var info = vk.DescriptorBufferInfo.init()
+        info.buffer = buffers[index]
+        info.offset = 0
+        info.range = vk.WHOLE_SIZE
+        infos[index] = info
+        index += 1
+    }
+    index = 0
+    while index < kernel.*.bindings {
+        var write = vk.WriteDescriptorSet.init()
+        write.dstSet = set
+        write.dstBinding = index
+        write.descriptorCount = 1
+        write.descriptorType = vk.DescriptorType.storageBuffer
+        unsafe { write.pBufferInfo = @ptrFromInt(*const vk.DescriptorBufferInfo, @intFromPtr(&infos) + @intCast(usize, index) * @sizeOf(vk.DescriptorBufferInfo)) }
+        writes[index] = write
+        index += 1
+    }
+    unsafe { vk.updateDescriptorSets(context.*.commands, context.*.device, kernel.*.bindings, @ptrCast([*]const vk.WriteDescriptorSet, &writes), 0, null) }
+    const commands = context.*.commandBuffer
+    vk.cmdBindPipeline(context.*.commands, commands, vk.PipelineBindPoint.compute, kernel.*.pipeline)
+    vk.cmdBindDescriptorSets(context.*.commands, commands, vk.PipelineBindPoint.compute, kernel.*.pipelineLayout, 0, 1, &set, 0, null)
+    vk.cmdPushConstants(context.*.commands, commands, kernel.*.pipelineLayout, vk.SHADER_STAGE_COMPUTE_BIT, 0, kernel.*.pushBytes, push)
+    vk.cmdDispatch(context.*.commands, commands, groups_x, groups_y, 1)
+    var barrier = vk.MemoryBarrier.init()
+    barrier.srcAccessMask = vk.ACCESS_SHADER_WRITE_BIT
+    barrier.dstAccessMask = vk.ACCESS_SHADER_READ_BIT | vk.ACCESS_SHADER_WRITE_BIT | vk.ACCESS_HOST_READ_BIT | vk.ACCESS_TRANSFER_READ_BIT
+    vk.cmdPipelineBarrier(context.*.commands, commands, vk.PIPELINE_STAGE_COMPUTE_SHADER_BIT, vk.PIPELINE_STAGE_COMPUTE_SHADER_BIT | vk.PIPELINE_STAGE_HOST_BIT | vk.PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &barrier, 0, null, 0, null)
+    return true
+}
+
+// Ends the frame, submits it and waits for it (waiting on `wait` and
+// signalling `signal` when they are not 0: swapchain semaphores).
+pub fn submitWith(context: *Context, wait: vk.Semaphore, wait_stage: vk.PipelineStageFlags, signal: vk.Semaphore) -> bool {
+    if vk.endCommandBuffer(context.*.commands, context.*.commandBuffer) != vk.Result.success { return false }
+    var command_buffer = context.*.commandBuffer
+    var wait_semaphore = wait
+    var stage = wait_stage
+    var signal_semaphore = signal
+    var submit = vk.SubmitInfo.init()
+    submit.commandBufferCount = 1
+    submit.pCommandBuffers = &command_buffer
+    if wait != 0 {
+        submit.waitSemaphoreCount = 1
+        submit.pWaitSemaphores = &wait_semaphore
+        submit.pWaitDstStageMask = &stage
+    }
+    if signal != 0 {
+        submit.signalSemaphoreCount = 1
+        submit.pSignalSemaphores = &signal_semaphore
+    }
+    var fence = context.*.fence
+    if vk.queueSubmit(context.*.commands, context.*.queue, 1, &submit, fence) != vk.Result.success { return false }
+    if vk.waitForFences(context.*.commands, context.*.device, 1, &fence, vk.TRUE, 5000000000) != vk.Result.success { return false }
+    return vk.resetFences(context.*.commands, context.*.device, 1, &fence) == vk.Result.success
+}
+
+pub fn submit(context: *Context) -> bool { return submitWith(context, 0, 0, 0) }
+
+pub fn groups(size: u32, group: u32) -> u32 { return (size + group - 1) / group }
+
+pub fn close(context: *Context) -> void {
+    const idle = vk.deviceWaitIdle(context.*.commands, context.*.device)
+    vk.destroyDescriptorPool(context.*.commands, context.*.device, context.*.descriptorPool, null)
+    vk.destroyFence(context.*.commands, context.*.device, context.*.fence, null)
+    vk.destroyCommandPool(context.*.commands, context.*.device, context.*.commandPool, null)
+    vk.destroyDevice(context.*.commands, context.*.device, null)
+    vk.destroyInstance(context.*.instanceCommands, context.*.instance, null)
+}

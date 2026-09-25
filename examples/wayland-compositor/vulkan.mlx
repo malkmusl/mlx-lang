@@ -1,0 +1,291 @@
+// The compositor's Vulkan renderer (--renderer vulkan): the output is
+// composed by the blit compute shader from examples/vulkan-shared, reading
+// client buffers where they are, without copying them.
+//
+//   - wl_shm pools are imported with VK_EXT_external_memory_host;
+//   - linux-dmabuf buffers are imported with VK_EXT_external_memory_dma_buf
+//     (or, on drivers that cannot, as host memory through their mapping);
+//   - the output (the two buffers this compositor shows in its host window)
+//     is itself imported host memory, so the frame is rendered straight into
+//     the host compositor's wl_shm pool.
+//
+// Every frame is one command buffer: the background, then for each window
+// bottom to top its frame (solid rectangles: stride-0 blits from a palette)
+// and its buffer, then the cursor. Blending matches the CPU renderer
+// (scene.mlx) exactly, so both produce the same pixels.
+
+const std = @import("std")
+const vk = @import("std.vulkan")
+const loader = @import("std.vulkan.loader")
+const gpu = @import("../vulkan-shared/gpu.mlx")
+const shaders = @import("../vulkan-shared/shaders.mlx")
+const state = @import("./state.mlx")
+const scene = @import("./scene.mlx")
+const wl = @import("std.wayland")
+
+const Compositor = state.Compositor
+const Surface = state.Surface
+const Pool = state.Pool
+const Buffer = state.Buffer
+
+pub const Renderer = struct {
+    context: *gpu.Context
+    blit: *gpu.Kernel
+    // The host window's pool (both frames).
+    target: *gpu.Buffer
+    // Device memory: the background, the palette rows (focus, frame) and
+    // the arrow cursor.
+    background: *gpu.Buffer
+    palette: *gpu.Buffer
+    arrow: *gpu.Buffer
+    paletteWidth: u32
+    // Buffers bound by the frame being recorded.
+    source: vk.Buffer
+    offset: u32
+    failed: bool
+}
+
+fn rendererOf(compositor: *Compositor) -> *Renderer {
+    unsafe { return @ptrFromInt(*Renderer, compositor.*.renderer) }
+}
+
+fn record(compositor: *Compositor, size: usize) -> usize {
+    return @intFromPtr(state.allocate(compositor, size))
+}
+
+fn roundUp(value: usize, alignment: u64) -> u64 {
+    const size = @intCast(u64, value)
+    return (size + alignment - 1) / alignment * alignment
+}
+
+fn say(text: []const u8) -> void { state.say(text) }
+
+// Opens a Vulkan driver and prepares the renderer; false (with a message)
+// when the driver lacks what the renderer needs. Call after host.connect.
+pub fn open(compositor: *Compositor, arguments: [][*]const u8) -> bool {
+    const allocator = compositor.*.allocator
+    var driver: loader.Driver = undefined
+    const opened = loader.openFirstDriver(&driver, arguments, allocator)
+    if opened != loader.Status.ok {
+        say("mlx-compositor: ")
+        say(loader.statusMessage(opened))
+        say("\n")
+        return false
+    }
+    var renderer: *Renderer = undefined
+    var context: *gpu.Context = undefined
+    var kernel: *gpu.Kernel = undefined
+    unsafe {
+        renderer = @ptrFromInt(*Renderer, record(compositor, @sizeOf(Renderer)))
+        context = @ptrFromInt(*gpu.Context, record(compositor, @sizeOf(gpu.Context)))
+        kernel = @ptrFromInt(*gpu.Kernel, record(compositor, @sizeOf(gpu.Kernel)))
+        renderer.*.target = @ptrFromInt(*gpu.Buffer, record(compositor, @sizeOf(gpu.Buffer)))
+        renderer.*.background = @ptrFromInt(*gpu.Buffer, record(compositor, @sizeOf(gpu.Buffer)))
+        renderer.*.palette = @ptrFromInt(*gpu.Buffer, record(compositor, @sizeOf(gpu.Buffer)))
+        renderer.*.arrow = @ptrFromInt(*gpu.Buffer, record(compositor, @sizeOf(gpu.Buffer)))
+    }
+    renderer.*.context = context
+    renderer.*.blit = kernel
+    renderer.*.failed = false
+    var options = gpu.defaultOptions(@ptrCast([*]const u8, "mlx-compositor"))
+    options.wantSharing = true
+    const status = gpu.open(context, driver, &options, allocator)
+    if status != gpu.Status.ok {
+        say("mlx-compositor: ")
+        say(gpu.statusMessage(status))
+        say("\n")
+        return false
+    }
+    if !context.*.hostMemory {
+        say("mlx-compositor: the Vulkan renderer needs VK_EXT_external_memory_host\n")
+        gpu.close(context)
+        return false
+    }
+    var code: [*]u32 = undefined
+    const words = shaders.build(allocator, 1, &code)
+    if words == 0 || !gpu.createKernel(context, kernel, code, words, 2, shaders.BLIT_WORDS) {
+        say("mlx-compositor: cannot create the blit pipeline\n")
+        gpu.close(context)
+        return false
+    }
+
+    // The output: both host frames, imported in place.
+    const host = compositor.*.hostMemory
+    if !gpu.importHostMemory(context, renderer.*.target, host.address, roundUp(host.size, context.*.hostAlignment)) {
+        say("mlx-compositor: cannot import the output into Vulkan\n")
+        gpu.close(context)
+        return false
+    }
+
+    // The background, drawn once.
+    const width = compositor.*.width
+    const height = compositor.*.height
+    if !gpu.createBuffer(context, renderer.*.background, @intCast(u64, width * height * 4), false) { return false }
+    var pixels: [*]u32 = undefined
+    unsafe { pixels = @ptrFromInt([*]u32, renderer.*.background.*.address) }
+    var row: usize = 0
+    while row < height {
+        const color = scene.backgroundColor(compositor, row)
+        var column: usize = 0
+        while column < width {
+            pixels[row * width + column] = color
+            column += 1
+        }
+        row += 1
+    }
+
+    // Palette rows long enough for any frame edge.
+    const longest = if width > height { width } else { height }
+    renderer.*.paletteWidth = @intCast(u32, longest + 8)
+    const palette_width = longest + 8
+    if !gpu.createBuffer(context, renderer.*.palette, @intCast(u64, palette_width * 2 * 4), false) { return false }
+    unsafe { pixels = @ptrFromInt([*]u32, renderer.*.palette.*.address) }
+    var index: usize = 0
+    while index < palette_width {
+        pixels[index] = scene.FOCUS_COLOR
+        pixels[palette_width + index] = scene.FRAME_COLOR
+        index += 1
+    }
+
+    // The arrow cursor (premultiplied: transparent pixels are 0).
+    const arrow_width = @intCast(usize, scene.ARROW_WIDTH)
+    const arrow_height = @intCast(usize, scene.ARROW_HEIGHT)
+    if !gpu.createBuffer(context, renderer.*.arrow, @intCast(u64, arrow_width * arrow_height * 4), false) { return false }
+    unsafe { pixels = @ptrFromInt([*]u32, renderer.*.arrow.*.address) }
+    var y: i32 = 0
+    while y < scene.ARROW_HEIGHT {
+        var x: i32 = 0
+        while x < scene.ARROW_WIDTH {
+            pixels[@intCast(usize, y) * arrow_width + @intCast(usize, x)] = scene.arrowColor(scene.arrowPixel(x, y))
+            x += 1
+        }
+        y += 1
+    }
+
+    compositor.*.renderer = @intFromPtr(renderer)
+    if compositor.*.verbose {
+        say("renderer: vulkan (")
+        const shown = std.io.writeString(std.io.stdout(), std.process.fromCString(gpu.deviceName(context)))
+        say(")\n")
+    }
+    return true
+}
+
+// ---------------------------------------------------------------------------
+// Client memory
+
+// Imports a pool into Vulkan on first use; false when the driver cannot.
+fn importPool(renderer: *Renderer, pool: *Pool) -> bool {
+    if pool.*.imported { return true }
+    const context = renderer.*.context
+    var imported: gpu.Buffer = undefined
+    var done = false
+    if pool.*.dmabuf && context.*.dmaBufImport {
+        // Vulkan takes ownership of the descriptor it imports.
+        const duplicate = pool.*.memory.handle.duplicate()
+        if duplicate.isValid() {
+            done = gpu.importBuffer(context, &imported, @intCast(i32, duplicate.descriptor), @intCast(u64, pool.*.memory.size))
+            if !done {
+                gpu.destroyBuffer(context, &imported)
+                duplicate.close()
+            }
+        }
+    }
+    if !done {
+        done = gpu.importHostMemory(context, &imported, pool.*.memory.address, roundUp(pool.*.memory.size, context.*.hostAlignment))
+        if !done { gpu.destroyBuffer(context, &imported) }
+    }
+    if !done { return false }
+    pool.*.gpuBuffer = imported
+    pool.*.imported = true
+    return true
+}
+
+// Drops a pool's Vulkan import (before its memory is unmapped or remapped).
+pub fn releasePool(compositor: *Compositor, pool: *Pool) -> void {
+    if !pool.*.imported || compositor.*.renderer == 0 { return }
+    const renderer = rendererOf(compositor)
+    // Nothing is in flight: frames are waited for before presenting.
+    var imported = pool.*.gpuBuffer
+    gpu.destroyBuffer(renderer.*.context, &imported)
+    pool.*.imported = false
+}
+
+// ---------------------------------------------------------------------------
+// Frames
+
+// Records one blit of a `width` x `height` block of `source` (starting
+// `sourceOffset` pixels in, rows `stride` pixels apart; 0 repeats the first
+// row) to (x, y) in the frame.
+fn blit(compositor: *Compositor, renderer: *Renderer, source: vk.Buffer, source_offset: u32, stride: u32, width: i32, height: i32, x: i32, y: i32, opaque: bool) -> void {
+    if renderer.*.failed || width <= 0 || height <= 0 { return }
+    var buffers: [2]vk.Buffer = [2]vk.Buffer{ source, renderer.*.target.*.buffer }
+    const push = shaders.Blit.{ .sourceWidth = @intCast(u32, width), .sourceHeight = @intCast(u32, height), .sourceStride = stride, .sourceOffset = source_offset, .targetWidth = @intCast(u32, compositor.*.width), .targetHeight = @intCast(u32, compositor.*.height), .targetX = @bitCast(u32, x), .targetY = @bitCast(u32, y), .flags = if opaque { shaders.FLAG_OPAQUE } else { 0 }, .targetOffset = renderer.*.offset }
+    const groups_x = gpu.groups(@intCast(u32, width), shaders.GROUP_SIZE)
+    const groups_y = gpu.groups(@intCast(u32, height), shaders.GROUP_SIZE)
+    unsafe {
+        if !gpu.dispatch(renderer.*.context, renderer.*.blit, @ptrCast([*]const vk.Buffer, &buffers), &push, groups_x, groups_y) { renderer.*.failed = true }
+    }
+}
+
+fn fill(compositor: *Compositor, renderer: *Renderer, x: i32, y: i32, width: i32, height: i32, row: u32) -> void {
+    blit(compositor, renderer, renderer.*.palette.*.buffer, row * renderer.*.paletteWidth, 0, width, height, x, y, true)
+}
+
+fn drawFrame(compositor: *Compositor, renderer: *Renderer, surface: *const Surface, focused: bool) -> void {
+    const row: u32 = if focused { 0 } else { 1 }
+    const x = scene.windowX(surface)
+    const y = scene.windowY(surface)
+    const width = scene.windowWidth(surface)
+    const height = scene.windowHeight(surface)
+    fill(compositor, renderer, x - 2, y - 2, width + 4, 2, row)
+    fill(compositor, renderer, x - 2, y + height, width + 4, 2, row)
+    fill(compositor, renderer, x - 2, y, 2, height, row)
+    fill(compositor, renderer, x + width, y, 2, height, row)
+}
+
+// Draws the buffer a surface shows with its top-left at (x, y).
+fn drawSurface(compositor: *Compositor, renderer: *Renderer, surface: *const Surface, x: i32, y: i32) -> void {
+    if !surface.*.hasContent || surface.*.current == 0 { return }
+    var buffer: *Buffer = undefined
+    unsafe { buffer = @ptrFromInt(*Buffer, surface.*.current) }
+    const pool = buffer.*.pool
+    // The shader addresses whole pixels.
+    if buffer.*.offset % 4 != 0 || buffer.*.stride % 4 != 0 { return }
+    if !importPool(renderer, pool) { return }
+    const opaque = buffer.*.format == @intFromEnum(wl.wl_shm.Format.xrgb8888)
+    blit(compositor, renderer, pool.*.gpuBuffer.buffer, @intCast(u32, buffer.*.offset / 4), @intCast(u32, buffer.*.stride / 4), buffer.*.width, buffer.*.height, x, y, opaque)
+}
+
+// Composes the whole output into the host frame starting `offset` bytes
+// into the host pool and waits for it; false when Vulkan failed.
+pub fn compose(compositor: *Compositor, offset: usize) -> bool {
+    const renderer = rendererOf(compositor)
+    const context = renderer.*.context
+    renderer.*.offset = @intCast(u32, offset / 4)
+    renderer.*.failed = false
+    if !gpu.begin(context) { return false }
+    const width = @intCast(i32, compositor.*.width)
+    const height = @intCast(i32, compositor.*.height)
+    blit(compositor, renderer, renderer.*.background.*.buffer, 0, @intCast(u32, compositor.*.width), width, height, 0, 0, true)
+    var index: usize = 0
+    while index < compositor.*.stack.length {
+        const address = state.listAt(compositor.*.stack, index)
+        const surface = state.surfaceAt(address)
+        if surface.*.role == state.ROLE_TOPLEVEL {
+            drawFrame(compositor, renderer, surface, address == compositor.*.keyboardFocus)
+        }
+        drawSurface(compositor, renderer, surface, surface.*.x, surface.*.y)
+        index += 1
+    }
+    if compositor.*.pointerInside {
+        if compositor.*.cursorSurface != 0 {
+            const cursor = state.surfaceAt(compositor.*.cursorSurface)
+            drawSurface(compositor, renderer, cursor, compositor.*.pointerX - compositor.*.cursorHotspotX, compositor.*.pointerY - compositor.*.cursorHotspotY)
+        } else if !compositor.*.cursorHidden {
+            blit(compositor, renderer, renderer.*.arrow.*.buffer, 0, @intCast(u32, scene.ARROW_WIDTH), scene.ARROW_WIDTH, scene.ARROW_HEIGHT, compositor.*.pointerX, compositor.*.pointerY, false)
+        }
+    }
+    if renderer.*.failed { return false }
+    return gpu.submit(context)
+}

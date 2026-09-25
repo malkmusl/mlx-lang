@@ -159,6 +159,7 @@ upstream, the provenance record, and the bootstrap tool:
 | --- | --- |
 | `wayland.xml` | core protocol, wayland 1.26.0 |
 | `xdg-shell.xml` | stable xdg-shell, wayland-protocols 1.49 |
+| `linux-dmabuf-v1.xml` | stable linux-dmabuf (`zwp_linux_dmabuf_v1`, version 6), wayland-protocols 1.49 |
 | `SOURCES` | upstream URL, release and SHA-256 of each XML file |
 | `materialize.mlx` | Stage-1 tool: XML to `std/src/wayland/generated/` |
 | `materialize.sh` | verifies the hashes, builds the tool, runs it |
@@ -458,7 +459,31 @@ open a second terminal, and Alt+drag must move it to the expected pixel
 position in the host's screenshot. weston-terminal, when installed, must
 accept Shift through the forwarded keymap and move by its title bar.
 `tools/check_wayland_interop.sh` also runs the nested compositor inside
-weston. Neither program imports `std.xml`, registers protocol XML
+weston.
+
+### GPU buffers: linux-dmabuf and Vulkan
+
+`wl.zwp_linux_dmabuf_v1`, `wl.zwp_linux_buffer_params_v1` and
+`wl.zwp_linux_dmabuf_feedback_v1` are generated like the core interfaces.
+A client collects a buffer's planes (`params.add(fd, plane, offset, stride,
+modifier_hi, modifier_lo)`) and creates the `wl_buffer` with
+`createImmed(width, height, format, flags)`; a server decodes the same
+requests (`AddRequest.fd` is a received `wl.Handle`) and answers `create`
+with `sendCreated()` (which creates the `wl_buffer` resource) or
+`sendFailed()`.
+
+- [`examples/vulkan-wayland-client`](../../examples/vulkan-wayland-client/README.md)
+  renders with Vulkan (`std.vulkan`, no C loader) and hands frames over as
+  dma-bufs, or renders straight into its `wl_shm` pool.
+- The nested compositor offers linux-dmabuf (ARGB8888/XRGB8888, linear) and,
+  with `--renderer vulkan`, composes on the GPU, reading client pools and
+  dma-bufs in place.
+
+`tools/check_vulkan_wayland.sh` runs the client inside the compositor with
+both renderers, over `wl_shm` and linux-dmabuf, and compares the frames
+pixel by pixel (see [the Vulkan reference](vulkan.md#examples)).
+
+Neither program imports `std.xml`, registers protocol XML
 in a build file, or calls anything schema-shaped. From an application's
 point of view `std.wayland` is an ordinary stdlib import, and the whole
 XML-to-Mlx pipeline above ran when the standard library was bootstrapped.

@@ -37,8 +37,9 @@ The Vulkan selection (in `std/registry/vulkan/materialize.mlx`) is
 `VK_KHR_android_surface`, `VK_EXT_debug_utils`,
 `VK_KHR_portability_enumeration`, `VK_KHR_external_memory_fd`,
 `VK_KHR_external_semaphore_fd`, `VK_KHR_external_fence_fd`,
-`VK_EXT_external_memory_dma_buf`, `VK_EXT_image_drm_format_modifier` and
-`VK_EXT_queue_family_foreign`. `std.vulkan.registry` records every
+`VK_EXT_external_memory_dma_buf`, `VK_EXT_image_drm_format_modifier`,
+`VK_EXT_queue_family_foreign`, `VK_EXT_external_memory_host` and
+`VK_EXT_headless_surface`. `std.vulkan.registry` records every
 definition for the `vulkan` API (skipping `vulkansc` variants), the
 requirements of the selected features and extensions (evaluating `depends`
 expressions and computing extension enumerant values from
@@ -79,7 +80,9 @@ application.apiVersion = vk.API_VERSION_1_3
 info.pApplicationInfo = &application
 ```
 
-(`tests/251_vulkan_api_runtime.mlx`)
+(`tests/251_vulkan_api_runtime.mlx`) Extension structures chain through
+`pNext`, which takes any pointer (it converts to `*anyopaque`):
+`info.pNext = &external`.
 
 Commands are grouped by the object they dispatch on: `vk.GlobalCommands`
 (`vkCreateInstance`, `vkEnumerateInstance*`, `vkGetInstanceProcAddr`),
@@ -107,7 +110,7 @@ there is no loader trampoline between an application and its driver.
 
 `tools/check_vulkan_layout.py` compiles a C program and an Mlx program that
 print the size, alignment and member offsets of every generated structure
-and union: all 318 aggregates and 2015 members match `<vulkan/vulkan.h>`
+and union: all 322 aggregates and 2028 members match `<vulkan/vulkan.h>`
 (the Android surface structure is skipped for lack of NDK headers).
 
 ## The loader
@@ -234,17 +237,60 @@ expands escapes including UTF-16 surrogate pairs; `parseInteger` and
 `parseUnsigned` convert numbers with overflow checks; `escapeString` writes
 a JSON string. (`tests/248_json_runtime.mlx`)
 
+## Examples
+
+The examples share one small renderer in `examples/vulkan-shared`:
+
+- `shaders.mlx` builds two compute shaders with `std.spirv.builder`:
+  `pattern` (an animated pattern with a ring around the pointer, written as
+  `0xAARRGGBB` or, for R8G8B8A8 targets, with red and blue swapped) and
+  `blit` (composites a premultiplied ARGB or opaque XRGB source into a
+  target at an offset, clipped; a source stride of 0 fills a rectangle).
+  `check_shaders.mlx` validates both and writes them out for `spirv-val`.
+- `gpu.mlx` opens a device with one compute queue and, on request, the
+  sharing extensions the driver supports: dma-buf import and export
+  (`VK_EXT_external_memory_dma_buf`) and imported host memory
+  (`VK_EXT_external_memory_host`). It creates, imports and destroys storage
+  buffers, compiles kernels and records dispatches.
+- `swapchain.mlx` presents to a window surface: each frame the pattern is
+  rendered into a buffer, copied into the acquired image
+  (`vkCmdCopyBufferToImage`) and presented (FIFO).
+
+`tests/257_vulkan_sharing_runtime.mlx` runs the sharing paths on lavapipe:
+the pattern rendered into a memfd imported as host memory, the blit
+reading a memfd imported as a dma-buf (opaque copy, premultiplied blending,
+stride-0 fill, target offset), and a dma-buf export when the driver can.
+`tests/258_vulkan_swapchain_runtime.mlx` presents through a
+`VK_EXT_headless_surface` swapchain, checks the rendered frame and
+recreates the swapchain at a new size.
+
+On top of it:
+
+| Example | What it shows |
+| --- | --- |
+| `examples/vulkan-wayland-client` | A Wayland client (std.wayland) that renders with Vulkan and hands frames over zero-copy: dma-bufs through `zwp_linux_dmabuf_v1`, or rendering straight into its `wl_shm` pool (imported host memory); a copying fallback. |
+| `examples/wayland-compositor --renderer vulkan` | The nested compositor composes on the GPU: client `wl_shm` pools and linux-dmabuf buffers are imported where they are, and the output is rendered into the host window's buffer. |
+| `examples/vulkan-android` | A NativeActivity presenting through a `VK_KHR_android_surface` swapchain from the system `libvulkan.so`, with touch input moving the ring. Needs the aarch64-android target (see the README there). |
+
+`tools/check_vulkan_wayland.sh` runs the client inside the compositor with
+both renderers and both client paths and compares the frames the host
+receives pixel by pixel.
+
 ## Tests
 
 `tests/run_vulkan.sh [compiler]` runs `tests/248_json_runtime.mlx`,
 `tests/251_vulkan_api_runtime.mlx` and `tests/255_spirv_module_runtime.mlx`
 everywhere; `tests/253_vulkan_loader_runtime.mlx`,
 `tests/254_spirv_compute_runtime.mlx` and
-`tests/256_vulkan_icd_runtime.mlx` when lavapipe (package
-`mesa-vulkan-drivers`) is installed; the `spirv-val` and glslang
-cross-checks when those tools are present; the layout check when gcc and
-`vulkan/vulkan.h` are; and verifies that `examples/vulkan-info` builds and
-that both generated modules are current.
+`tests/256_vulkan_icd_runtime.mlx`, `tests/257_vulkan_sharing_runtime.mlx`
+and `tests/258_vulkan_swapchain_runtime.mlx` when lavapipe (package
+`mesa-vulkan-drivers`) is installed; `tools/check_vulkan_wayland.sh` when
+lavapipe and `xkbcli` are; the `spirv-val` and glslang cross-checks
+(including the examples' shaders) when those tools are present; the layout
+check when gcc and `vulkan/vulkan.h` are; and verifies that
+`examples/vulkan-info`, `examples/vulkan-wayland-client` and
+`examples/wayland-compositor` build and that both generated modules are
+current.
 
 ## Limits
 
@@ -260,8 +306,13 @@ that both generated modules are current.
   emitted in dependency order and a pointer that would close a cycle is
   `*anyopaque`.
 - `VK_KHR_wayland_surface` needs a libwayland `wl_display`; with the native
-  std.wayland, presentation to Wayland goes through dma-buf images instead
-  (see [`VULKAN.md`](../VULKAN.md)).
+  std.wayland, Vulkan frames reach Wayland as dma-bufs (linux-dmabuf) or
+  through `wl_shm` pools imported as host memory, as
+  `examples/vulkan-wayland-client` does.
+- lavapipe imports dma-bufs but cannot export them (that needs a kernel
+  exporter such as `/dev/udmabuf`), so on it the client's dma-buf path is
+  exercised with `--test-memfd-dmabuf`: shared memory offered as a dma-buf,
+  which Mesa's import accepts.
 - Android: `std.vulkan.loader` uses `dlopen`/`dlsym` from `libdl.so`, which
   the aarch64-android target already links; the aarch64 backend needs the
   same enum extension at C boundaries that x86_64 has

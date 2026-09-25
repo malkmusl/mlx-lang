@@ -55,8 +55,24 @@ merged). Calling C at all needed foreign functions in the compiler
 (`extern("c")`, `export fn`, dynamically linked executables); see
 [the ABI reference](reference/abi.md#c-functions-externc-and-export-fn).
 
+## Examples
+
+| Example | |
+| --- | --- |
+| [`examples/vulkan-info`](../examples/vulkan-info/README.md) | every installed driver, its devices and extensions |
+| [`examples/vulkan-wayland-client`](../examples/vulkan-wayland-client/README.md) | a Wayland window rendered by a compute shader, handed to the compositor as dma-bufs or rendered straight into shared memory |
+| [`examples/wayland-compositor`](../examples/wayland-compositor/README.md) `--renderer vulkan` | a compositor that composes its clients' buffers on the GPU, reading `wl_shm` pools and dma-bufs in place |
+| [`examples/vulkan-android`](../examples/vulkan-android/README.md) | an Android NativeActivity presenting through a `VK_KHR_android_surface` swapchain, with touch input |
+
+All of them share `examples/vulkan-shared`: the shaders (built with
+`std.spirv.builder`), device and buffer setup with dma-buf and host-memory
+sharing, and swapchain presentation.
+
+![The Vulkan client inside the compositor's Vulkan renderer](../examples/wayland-compositor/screenshots/vulkan-client.png)
+
 The reference — naming rules, the loader, SPIR-V, the driver interface,
-tests and known limits — is [`reference/vulkan.md`](reference/vulkan.md).
+the examples, tests and known limits — is
+[`reference/vulkan.md`](reference/vulkan.md).
 
 ## Toward a driver
 
@@ -85,8 +101,7 @@ What comes next, in order:
    submission, fences) with virtio-gpu first — its Venus protocol forwards
    Vulkan to the host, so the guest driver stays small — then native GPU
    backends.
-4. Presentation: `VK_KHR_display` for direct scan-out, and, for Wayland,
-   dma-buf images (`VK_EXT_external_memory_dma_buf` and DRM format
-   modifiers are already in the generated API) shared through the
-   linux-dmabuf protocol, since std.wayland is native and has no libwayland
-   `wl_display` for `VK_KHR_wayland_surface`.
+4. Presentation: `VK_KHR_display` for direct scan-out. For Wayland the
+   path already works without `VK_KHR_wayland_surface` (which would need a
+   libwayland `wl_display`): frames travel as dma-bufs over linux-dmabuf,
+   as the examples show; a driver only has to export them.

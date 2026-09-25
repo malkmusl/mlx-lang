@@ -392,6 +392,13 @@ it. Pointer type modifiers include alignment (`*align(N) T`) and `volatile`.
 See [Unsafe and safety](09-unsafe-and-safety.md) for the rules around
 constructing raw pointers.
 
+A single-item pointer converts implicitly to `*anyopaque`, C's `void *`
+(and to `*const anyopaque` or `?*const anyopaque`), keeping its address; a
+`*const T` only converts to a const opaque pointer. This is what C
+extension chains such as Vulkan's `pNext` need
+(`info.pNext = &external`). Going back takes an explicit `@ptrCast`.
+(`tests/259_anyopaque_coercion_runtime.mlx`)
+
 ## Vectors
 
 `@Vector(len, ElemType)` (or the equivalent vector type syntax) constructs a

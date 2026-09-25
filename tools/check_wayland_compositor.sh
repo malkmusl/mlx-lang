@@ -18,12 +18,16 @@
 # shell; the moved window's focus frame is checked in the host's screenshot.
 # Needs xkbcli (libxkbcommon-tools). Usage:
 #
-#   tools/check_wayland_compositor.sh [compiler]
+#   tools/check_wayland_compositor.sh [compiler] [cpu|vulkan]
+#
+# The second argument picks the compositor's renderer (default cpu; vulkan
+# needs a Vulkan driver, e.g. VK_DRIVER_FILES naming lavapipe's manifest).
 set -euo pipefail
 
 repo_root=$(cd "$(dirname "$0")/.." && pwd)
 cd "$repo_root"
 compiler=${1:-${MLX_COMPILER:-mlx-out/bin/compiler/mlx4}}
+renderer=${2:-cpu}
 command -v xkbcli > /dev/null || { echo "check_wayland_compositor.sh: xkbcli is not installed" >&2; exit 2; }
 
 work=$(mktemp -d)
@@ -42,7 +46,7 @@ run_scenario() {
     "$work/test-host" "host-$name" "$work/us.xkb" "$script" > "$work/$name-host.log" 2>&1 &
     local host_pid=$!
     for _ in $(seq 1 50); do [[ -S "$XDG_RUNTIME_DIR/host-$name" ]] && break; sleep 0.1; done
-    WAYLAND_DISPLAY="host-$name" timeout 60 "$work/mlx-compositor" --verbose --socket "nested-$name" "$@" > "$work/$name-compositor.log" 2>&1
+    WAYLAND_DISPLAY="host-$name" timeout 60 "$work/mlx-compositor" --verbose --renderer "$renderer" --socket "nested-$name" "$@" > "$work/$name-compositor.log" 2>&1
     wait "$host_pid" || { echo "test host failed ($name):" >&2; cat "$work/$name-host.log" >&2; exit 1; }
 }
 

@@ -58,6 +58,13 @@ with libwayland in both directions. See
 and the tests. The BSD and brixOS transports come later in the
 implementation order.
 
+GPU rendering works the same way: the stable linux-dmabuf protocol is
+materialized alongside the core and xdg-shell XML, so a Vulkan client
+(`examples/vulkan-wayland-client`) hands its frames over as dma-bufs, and
+the nested compositor (`examples/wayland-compositor --renderer vulkan`)
+composes client buffers on the GPU. Vulkan itself is native too; see
+[`VULKAN.md`](VULKAN.md).
+
 For larger programs, see
 [`examples/wayland-compositor`](../examples/wayland-compositor/README.md), a
 nested compositor with keyboard and pointer input that launches clients,

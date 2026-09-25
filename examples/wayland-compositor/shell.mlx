@@ -1,11 +1,12 @@
-// The compositor's server side: globals, surfaces, shared memory,
-// xdg-shell windows and popups, the seat, focus and input delivery, and
-// launching client programs.
+// The compositor's server side: globals, surfaces, buffers (wl_shm here,
+// linux-dmabuf in dmabuf.mlx), xdg-shell windows and popups, the seat,
+// focus and input delivery, and launching client programs.
 
 const std = @import("std")
 const wl = @import("std.wayland")
 const state = @import("./state.mlx")
 const scene = @import("./scene.mlx")
+const vulkan = @import("./vulkan.mlx")
 
 const Compositor = state.Compositor
 const Surface = state.Surface
@@ -500,12 +501,34 @@ fn copyBuffer(surface: *Surface, buffer: *Buffer) -> void {
     wl.wl_buffer.Resource.fromObject(buffer.*.resource).sendRelease()
 }
 
+// Vulkan: shows an attached buffer in place, releasing the one it replaces.
+fn holdBuffer(surface: *Surface, address: usize) -> void {
+    if surface.*.current != 0 && surface.*.current != address {
+        wl.wl_buffer.Resource.fromObject(bufferAt(surface.*.current).*.resource).sendRelease()
+    }
+    surface.*.current = address
+    const buffer = bufferAt(address)
+    surface.*.pixelWidth = @intCast(usize, buffer.*.width)
+    surface.*.pixelHeight = @intCast(usize, buffer.*.height)
+    surface.*.hasContent = true
+}
+
+fn releaseCurrent(surface: *Surface) -> void {
+    if surface.*.current != 0 {
+        wl.wl_buffer.Resource.fromObject(bufferAt(surface.*.current).*.resource).sendRelease()
+        surface.*.current = 0
+    }
+}
+
 fn commit(surface: *Surface) -> void {
     const compositor = surface.*.compositor
     if surface.*.hasPendingAttach {
         if surface.*.pendingBuffer == 0 {
             surface.*.hasContent = false
+            releaseCurrent(surface)
             unmap(surface)
+        } else if compositor.*.renderer != 0 {
+            holdBuffer(surface, surface.*.pendingBuffer)
         } else {
             copyBuffer(surface, bufferAt(surface.*.pendingBuffer))
         }
@@ -563,6 +586,7 @@ fn onSurfaceDestroyed(context: *anyopaque, object: wl.server.Object) -> void {
         index += 1
     }
     compositor.*.surfaces = state.listRemove(compositor.*.surfaces, address)
+    releaseCurrent(surface)
     if surface.*.pixelCapacity > 0 { state.release(compositor, surface.*.pixels, surface.*.pixelCapacity) }
     unsafe { state.release(compositor, @ptrCast([*]u8, surface), @sizeOf(Surface)) }
 }
@@ -585,6 +609,7 @@ fn createSurface(compositor: *Compositor, resource: wl.wl_surface.Resource) -> v
     surface.*.hasGeometry = false
     surface.*.pendingBuffer = 0
     surface.*.hasPendingAttach = false
+    surface.*.current = 0
     surface.*.pixelCapacity = 0
     surface.*.pixelWidth = 0
     surface.*.pixelHeight = 0
@@ -622,6 +647,7 @@ fn dropPool(pool: *Pool) -> void {
     pool.*.references -= 1
     if pool.*.references == 0 {
         const compositor = pool.*.compositor
+        vulkan.releasePool(compositor, pool)
         pool.*.memory.release()
         unsafe { state.release(compositor, @ptrCast([*]u8, pool), @sizeOf(Pool)) }
     }
@@ -636,12 +662,52 @@ fn onBufferDestroyed(context: *anyopaque, object: wl.server.Object) -> void {
     while index < compositor.*.surfaces.length {
         const surface = state.surfaceAt(state.listAt(compositor.*.surfaces, index))
         if surface.*.pendingBuffer == address { surface.*.pendingBuffer = 0 }
+        if surface.*.current == address {
+            // Destroyed while shown: its contents are gone.
+            surface.*.current = 0
+            compositor.*.needsRedraw = true
+        }
         index += 1
     }
     compositor.*.buffers = state.listRemove(compositor.*.buffers, address)
     dropPool(buffer.*.pool)
     unsafe { state.release(compositor, @ptrCast([*]u8, buffer), @sizeOf(Buffer)) }
 }
+
+// Records a wl_buffer backed by `pool` (which it keeps alive).
+pub fn addBuffer(pool: *Pool, resource: wl.wl_buffer.Resource, offset: i32, width: i32, height: i32, stride: i32, format: u32) -> void {
+    const compositor = pool.*.compositor
+    const memory = state.allocate(compositor, @sizeOf(Buffer))
+    var buffer: *Buffer = undefined
+    unsafe { buffer = @ptrCast(*Buffer, memory) }
+    buffer.*.compositor = compositor
+    buffer.*.resource = resource.object
+    buffer.*.pool = pool
+    buffer.*.offset = offset
+    buffer.*.width = width
+    buffer.*.height = height
+    buffer.*.stride = stride
+    buffer.*.format = format
+    pool.*.references += 1
+    compositor.*.buffers = state.listAppend(compositor.*.buffers, @intFromPtr(buffer))
+    resource.setHandler(ignoreRequest, state.contextOf(memory))
+    resource.setDestroyHandler(onBufferDestroyed, state.contextOf(memory))
+}
+
+// A pool record for mapped client memory, with one reference.
+pub fn newPool(compositor: *Compositor, memory: wl.SharedMemory, dmabuf: bool) -> *Pool {
+    const record = state.allocate(compositor, @sizeOf(Pool))
+    var pool: *Pool = undefined
+    unsafe { pool = @ptrCast(*Pool, record) }
+    pool.*.compositor = compositor
+    pool.*.memory = memory
+    pool.*.references = 1
+    pool.*.dmabuf = dmabuf
+    pool.*.imported = false
+    return pool
+}
+
+pub fn releasePool(pool: *Pool) -> void { dropPool(pool) }
 
 fn onPool(context: *anyopaque, request: wl.server.Request) -> void {
     const pool = poolAt(context)
@@ -661,26 +727,13 @@ fn onPool(context: *anyopaque, request: wl.server.Request) -> void {
             shm_pool.postError(@intFromEnum(wl.wl_shm.Error.invalid_stride), "buffer does not fit the pool")
             return
         }
-        const memory = state.allocate(compositor, @sizeOf(Buffer))
-        var buffer: *Buffer = undefined
-        unsafe { buffer = @ptrCast(*Buffer, memory) }
-        buffer.*.compositor = compositor
-        buffer.*.resource = created.id.object
-        buffer.*.pool = pool
-        buffer.*.offset = created.offset
-        buffer.*.width = created.width
-        buffer.*.height = created.height
-        buffer.*.stride = created.stride
-        buffer.*.format = created.format
-        pool.*.references += 1
-        compositor.*.buffers = state.listAppend(compositor.*.buffers, @intFromPtr(buffer))
-        created.id.setHandler(ignoreRequest, state.contextOf(memory))
-        created.id.setDestroyHandler(onBufferDestroyed, state.contextOf(memory))
+        addBuffer(pool, created.id, created.offset, created.width, created.height, created.stride, created.format)
     } else if request.opcode == wl.wl_shm_pool.REQUEST_RESIZE {
         const size = decoded.resize.size
         if size > 0 && @intCast(usize, size) > pool.*.memory.size {
             var grown: wl.SharedMemory = undefined
             if wl.transport.mapSharedMemory(&grown, pool.*.memory.handle.duplicate(), @intCast(usize, size), false) {
+                vulkan.releasePool(compositor, pool)
                 pool.*.memory.release()
                 pool.*.memory = grown
             }
@@ -703,12 +756,9 @@ fn onShm(context: *anyopaque, request: wl.server.Request) -> void {
         wl.wl_shm.Resource.fromObject(request.object).postError(@intFromEnum(wl.wl_shm.Error.invalid_fd), "cannot map the pool")
         return
     }
-    const record = state.allocate(compositor, @sizeOf(Pool))
-    var pool: *Pool = undefined
-    unsafe { pool = @ptrCast(*Pool, record) }
-    pool.*.compositor = compositor
-    pool.*.memory = memory
-    pool.*.references = 1
+    const pool = newPool(compositor, memory, false)
+    var record: [*]u8 = undefined
+    unsafe { record = @ptrCast([*]u8, pool) }
     created.id.setHandler(onPool, state.contextOf(record))
     created.id.setDestroyHandler(onPoolDestroyed, state.contextOf(record))
 }

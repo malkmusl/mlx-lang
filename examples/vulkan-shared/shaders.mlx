@@ -1,0 +1,309 @@
+// The compute shaders the Vulkan examples run, written with
+// std.spirv.builder (no GLSL compiler involved).
+//
+// pattern (binding 0: pixels, push constants: Pattern)
+//     An animated XOR/gradient pattern with a ring following the pointer;
+//     each invocation writes one pixel 0xAARRGGBB (DRM XRGB8888 / Vulkan
+//     B8G8R8A8 in memory), or 0xAABBGGRR with FLAG_SWAP_RED_BLUE.
+//
+// blit (binding 0: source pixels, binding 1: destination pixels,
+//       push constants: Blit)
+//     Blends one window (premultiplied ARGB, the wl_shm convention, or XRGB
+//     with FLAG_OPAQUE) into the output at (targetX, targetY), clipped to
+//     the output; the output starts `targetOffset` pixels into binding 1.
+//     A source stride of 0 repeats the first row (solid rectangles).
+//
+// Both use 8x8 work groups: dispatch ceil(width / 8) x ceil(height / 8).
+
+const std = @import("std")
+const spv = @import("std.spirv.core")
+const builder = @import("std.spirv.builder")
+
+pub const GROUP_SIZE: u32 = 8
+
+// Pattern flags.
+pub const FLAG_POINTER: u32 = 1
+pub const FLAG_PRESSED: u32 = 2
+pub const FLAG_SWAP_RED_BLUE: u32 = 4
+
+// Blit flags.
+pub const FLAG_OPAQUE: u32 = 1
+
+// Push constants (u32 words).
+pub const Pattern = struct {
+    width: u32
+    height: u32
+    time: u32
+    pointerX: u32
+    pointerY: u32
+    flags: u32
+}
+
+pub const Blit = struct {
+    sourceWidth: u32
+    sourceHeight: u32
+    sourceStride: u32
+    sourceOffset: u32
+    targetWidth: u32
+    targetHeight: u32
+    targetX: u32
+    targetY: u32
+    flags: u32
+    targetOffset: u32
+}
+
+pub const PATTERN_WORDS: u32 = 6
+pub const BLIT_WORDS: u32 = 10
+
+// Types and variables shared by both shaders.
+const Common = struct {
+    uint: u32
+    int: u32
+    boolean: u32
+    uvec3: u32
+    pushPointer: u32
+    push: u32
+    storagePointer: u32
+    globalId: u32
+    zero: u32
+    buffers: [2]u32
+    voidType: u32
+    functionType: u32
+}
+
+fn words(count: u32) -> usize { return @intCast(usize, count) }
+
+// Declares the module header, the common types, `push_words` u32 push
+// constants and `buffer_count` storage buffers of u32 (bindings 0..).
+fn declare(b: *builder.Builder, common: *Common, push_words: u32, buffer_count: u32) -> void {
+    builder.capability(b, spv.Capability.shader)
+    builder.memoryModel(b, spv.AddressingModel.logical, spv.MemoryModel.glsl450)
+    common.*.voidType = builder.typeVoid(b)
+    common.*.functionType = builder.typeFunction(b, common.*.voidType, null, 0)
+    common.*.boolean = builder.typeBool(b)
+    common.*.uint = builder.typeInt(b, 32, false)
+    common.*.int = builder.typeInt(b, 32, true)
+    common.*.uvec3 = builder.typeVector(b, common.*.uint, 3)
+    const input_pointer = builder.typePointer(b, spv.StorageClass.input, common.*.uvec3)
+    common.*.globalId = builder.variable(b, input_pointer, spv.StorageClass.input)
+    builder.decorateBuiltIn(b, common.*.globalId, spv.BuiltIn.globalInvocationId)
+    common.*.zero = builder.constant(b, common.*.uint, 0)
+
+    // Push constants: a Block of `push_words` (at most 10) u32 members.
+    var members: [10]u32 = [10]u32{ common.*.uint, common.*.uint, common.*.uint, common.*.uint, common.*.uint, common.*.uint, common.*.uint, common.*.uint, common.*.uint, common.*.uint }
+    var push_block: u32 = 0
+    unsafe { push_block = builder.typeStruct(b, @ptrCast([*]const u32, &members), words(push_words)) }
+    builder.decorate(b, push_block, spv.Decoration.block)
+    var member: u32 = 0
+    while member < push_words {
+        builder.memberDecorateValue(b, push_block, member, spv.Decoration.offset, member * 4)
+        member += 1
+    }
+    const push_block_pointer = builder.typePointer(b, spv.StorageClass.pushConstant, push_block)
+    common.*.push = builder.variable(b, push_block_pointer, spv.StorageClass.pushConstant)
+    common.*.pushPointer = builder.typePointer(b, spv.StorageClass.pushConstant, common.*.uint)
+
+    // Storage buffers: struct { uint pixels[]; }.
+    const pixels = builder.typeRuntimeArray(b, common.*.uint)
+    builder.decorateValue(b, pixels, spv.Decoration.arrayStride, 4)
+    var fields: [1]u32 = [1]u32{ pixels }
+    var buffer_block: u32 = 0
+    unsafe { buffer_block = builder.typeStruct(b, @ptrCast([*]const u32, &fields), 1) }
+    builder.decorate(b, buffer_block, spv.Decoration.block)
+    builder.memberDecorateValue(b, buffer_block, 0, spv.Decoration.offset, 0)
+    const buffer_pointer = builder.typePointer(b, spv.StorageClass.storageBuffer, buffer_block)
+    common.*.storagePointer = builder.typePointer(b, spv.StorageClass.storageBuffer, common.*.uint)
+    var binding: u32 = 0
+    while binding < buffer_count {
+        const variable = builder.variable(b, buffer_pointer, spv.StorageClass.storageBuffer)
+        builder.decorateValue(b, variable, spv.Decoration.descriptorSet, 0)
+        builder.decorateValue(b, variable, spv.Decoration.binding, binding)
+        common.*.buffers[binding] = variable
+        binding += 1
+    }
+}
+
+fn constant(b: *builder.Builder, common: *const Common, value: u32) -> u32 {
+    return builder.constant(b, common.*.uint, value)
+}
+
+fn pushWord(b: *builder.Builder, common: *const Common, index: u32) -> u32 {
+    var chain: [1]u32 = [1]u32{ constant(b, common, index) }
+    var pointer: u32 = 0
+    unsafe { pointer = builder.accessChain(b, common.*.pushPointer, common.*.push, @ptrCast([*]const u32, &chain), 1) }
+    return builder.load(b, common.*.uint, pointer)
+}
+
+// Pointer to element `index` of storage buffer `buffer`.
+fn element(b: *builder.Builder, common: *const Common, buffer: u32, index: u32) -> u32 {
+    var chain: [2]u32 = [2]u32{ common.*.zero, index }
+    var pointer: u32 = 0
+    unsafe { pointer = builder.accessChain(b, common.*.storagePointer, buffer, @ptrCast([*]const u32, &chain), 2) }
+    return pointer
+}
+
+fn op(b: *builder.Builder, opcode: spv.Op, type_id: u32, left: u32, right: u32) -> u32 {
+    return builder.binary(b, opcode, type_id, left, right)
+}
+
+fn select(b: *builder.Builder, type_id: u32, condition: u32, yes: u32, no: u32) -> u32 {
+    const id = builder.newId(b)
+    builder.op5(b, builder.SECTION_FUNCTION, spv.Op.select, type_id, id, condition, yes, no)
+    return id
+}
+
+fn flagSet(b: *builder.Builder, common: *const Common, flags: u32, flag: u32) -> u32 {
+    const masked = op(b, spv.Op.bitwiseAnd, common.*.uint, flags, constant(b, common, flag))
+    return op(b, spv.Op.iNotEqual, common.*.boolean, masked, common.*.zero)
+}
+
+// (value >> shift) & 255
+fn channel(b: *builder.Builder, common: *const Common, value: u32, shift: u32) -> u32 {
+    const shifted = if shift == 0 { value } else { op(b, spv.Op.shiftRightLogical, common.*.uint, value, constant(b, common, shift)) }
+    return op(b, spv.Op.bitwiseAnd, common.*.uint, shifted, constant(b, common, 255))
+}
+
+// 0xFF000000 | red << 16 | green << 8 | blue
+fn pack(b: *builder.Builder, common: *const Common, red: u32, green: u32, blue: u32) -> u32 {
+    const r = op(b, spv.Op.shiftLeftLogical, common.*.uint, red, constant(b, common, 16))
+    const g = op(b, spv.Op.shiftLeftLogical, common.*.uint, green, constant(b, common, 8))
+    const rg = op(b, spv.Op.bitwiseOr, common.*.uint, r, g)
+    const rgb = op(b, spv.Op.bitwiseOr, common.*.uint, rg, blue)
+    return op(b, spv.Op.bitwiseOr, common.*.uint, rgb, constant(b, common, 4278190080))
+}
+
+fn finish(b: *builder.Builder, common: *const Common, main: u32) -> void {
+    var interfaces: [1]u32 = [1]u32{ common.*.globalId }
+    unsafe { builder.entryPoint(b, spv.ExecutionModel.glCompute, main, "main", @ptrCast([*]const u32, &interfaces), 1) }
+    builder.localSize(b, main, GROUP_SIZE, GROUP_SIZE, 1)
+    builder.name(b, main, "main")
+}
+
+pub fn buildPattern(b: *builder.Builder) -> void {
+    var common: Common = undefined
+    declare(b, &common, PATTERN_WORDS, 1)
+    const main = builder.function(b, common.voidType, spv.FUNCTION_CONTROL_NONE, common.functionType)
+    const entry = builder.label(b)
+    const id = builder.load(b, common.uvec3, common.globalId)
+    const x = builder.compositeExtract(b, common.uint, id, 0)
+    const y = builder.compositeExtract(b, common.uint, id, 1)
+    const width = pushWord(b, &common, 0)
+    const height = pushWord(b, &common, 1)
+    const time = pushWord(b, &common, 2)
+    const pointer_x = pushWord(b, &common, 3)
+    const pointer_y = pushWord(b, &common, 4)
+    const flags = pushWord(b, &common, 5)
+    const inside_x = op(b, spv.Op.uLessThan, common.boolean, x, width)
+    const inside_y = op(b, spv.Op.uLessThan, common.boolean, y, height)
+    const inside = op(b, spv.Op.logicalAnd, common.boolean, inside_x, inside_y)
+    const body = builder.newId(b)
+    const merge = builder.newId(b)
+    builder.selectionMerge(b, merge)
+    builder.branchConditional(b, inside, body, merge)
+
+    const body_label = builder.labelWith(b, body)
+    // The pattern.
+    const red = op(b, spv.Op.bitwiseAnd, common.uint, op(b, spv.Op.iAdd, common.uint, x, time), constant(b, &common, 255))
+    const half_time = op(b, spv.Op.shiftRightLogical, common.uint, time, constant(b, &common, 1))
+    const green = op(b, spv.Op.bitwiseAnd, common.uint, op(b, spv.Op.iAdd, common.uint, y, half_time), constant(b, &common, 255))
+    const double_time = op(b, spv.Op.shiftLeftLogical, common.uint, time, constant(b, &common, 1))
+    const xor = op(b, spv.Op.bitwiseXor, common.uint, x, y)
+    const blue = op(b, spv.Op.bitwiseAnd, common.uint, op(b, spv.Op.iAdd, common.uint, xor, double_time), constant(b, &common, 255))
+    const color = pack(b, &common, red, green, blue)
+    // The ring around the pointer: 30 <= distance < 40.
+    const dx = op(b, spv.Op.iSub, common.int, builder.unary(b, spv.Op.bitcast, common.int, x), builder.unary(b, spv.Op.bitcast, common.int, pointer_x))
+    const dy = op(b, spv.Op.iSub, common.int, builder.unary(b, spv.Op.bitcast, common.int, y), builder.unary(b, spv.Op.bitcast, common.int, pointer_y))
+    const distance = op(b, spv.Op.iAdd, common.int, op(b, spv.Op.iMul, common.int, dx, dx), op(b, spv.Op.iMul, common.int, dy, dy))
+    const outer = op(b, spv.Op.sLessThan, common.boolean, distance, builder.constant(b, common.int, 1600))
+    const inner = op(b, spv.Op.sGreaterThanEqual, common.boolean, distance, builder.constant(b, common.int, 900))
+    const on_ring = op(b, spv.Op.logicalAnd, common.boolean, outer, inner)
+    const near = op(b, spv.Op.logicalAnd, common.boolean, on_ring, flagSet(b, &common, flags, FLAG_POINTER))
+    const ring_color = select(b, common.uint, flagSet(b, &common, flags, FLAG_PRESSED), constant(b, &common, 4294967295), constant(b, &common, 4294955072))
+    const shaded = select(b, common.uint, near, ring_color, color)
+    // Red and blue swapped for R8G8B8A8 targets.
+    const kept = op(b, spv.Op.bitwiseAnd, common.uint, shaded, constant(b, &common, 4278255360))
+    const swapped_red = op(b, spv.Op.shiftLeftLogical, common.uint, channel(b, &common, shaded, 0), constant(b, &common, 16))
+    const swapped = op(b, spv.Op.bitwiseOr, common.uint, op(b, spv.Op.bitwiseOr, common.uint, kept, swapped_red), channel(b, &common, shaded, 16))
+    const final = select(b, common.uint, flagSet(b, &common, flags, FLAG_SWAP_RED_BLUE), swapped, shaded)
+    const index = op(b, spv.Op.iAdd, common.uint, op(b, spv.Op.iMul, common.uint, y, width), x)
+    builder.store(b, element(b, &common, common.buffers[0], index), final)
+    builder.branch(b, merge)
+
+    const merge_label = builder.labelWith(b, merge)
+    builder.returnVoid(b)
+    builder.functionEnd(b)
+    finish(b, &common, main)
+}
+
+pub fn buildBlit(b: *builder.Builder) -> void {
+    var common: Common = undefined
+    declare(b, &common, BLIT_WORDS, 2)
+    const main = builder.function(b, common.voidType, spv.FUNCTION_CONTROL_NONE, common.functionType)
+    const entry = builder.label(b)
+    const id = builder.load(b, common.uvec3, common.globalId)
+    const x = builder.compositeExtract(b, common.uint, id, 0)
+    const y = builder.compositeExtract(b, common.uint, id, 1)
+    const source_width = pushWord(b, &common, 0)
+    const source_height = pushWord(b, &common, 1)
+    const source_stride = pushWord(b, &common, 2)
+    const source_offset = pushWord(b, &common, 3)
+    const target_width = pushWord(b, &common, 4)
+    const target_height = pushWord(b, &common, 5)
+    const target_x = builder.unary(b, spv.Op.bitcast, common.int, pushWord(b, &common, 6))
+    const target_y = builder.unary(b, spv.Op.bitcast, common.int, pushWord(b, &common, 7))
+    const flags = pushWord(b, &common, 8)
+    const target_offset = pushWord(b, &common, 9)
+    const in_source = op(b, spv.Op.logicalAnd, common.boolean, op(b, spv.Op.uLessThan, common.boolean, x, source_width), op(b, spv.Op.uLessThan, common.boolean, y, source_height))
+    const dx = op(b, spv.Op.iAdd, common.int, target_x, builder.unary(b, spv.Op.bitcast, common.int, x))
+    const dy = op(b, spv.Op.iAdd, common.int, target_y, builder.unary(b, spv.Op.bitcast, common.int, y))
+    const zero = builder.constant(b, common.int, 0)
+    const in_x = op(b, spv.Op.logicalAnd, common.boolean, op(b, spv.Op.sGreaterThanEqual, common.boolean, dx, zero), op(b, spv.Op.sLessThan, common.boolean, dx, builder.unary(b, spv.Op.bitcast, common.int, target_width)))
+    const in_y = op(b, spv.Op.logicalAnd, common.boolean, op(b, spv.Op.sGreaterThanEqual, common.boolean, dy, zero), op(b, spv.Op.sLessThan, common.boolean, dy, builder.unary(b, spv.Op.bitcast, common.int, target_height)))
+    const visible = op(b, spv.Op.logicalAnd, common.boolean, in_source, op(b, spv.Op.logicalAnd, common.boolean, in_x, in_y))
+    const body = builder.newId(b)
+    const merge = builder.newId(b)
+    builder.selectionMerge(b, merge)
+    builder.branchConditional(b, visible, body, merge)
+
+    const body_label = builder.labelWith(b, body)
+    const source_index = op(b, spv.Op.iAdd, common.uint, source_offset, op(b, spv.Op.iAdd, common.uint, op(b, spv.Op.iMul, common.uint, y, source_stride), x))
+    const source = builder.load(b, common.uint, element(b, &common, common.buffers[0], source_index))
+    const target_index = op(b, spv.Op.iAdd, common.uint, target_offset, op(b, spv.Op.iAdd, common.uint, op(b, spv.Op.iMul, common.uint, builder.unary(b, spv.Op.bitcast, common.uint, dy), target_width), builder.unary(b, spv.Op.bitcast, common.uint, dx)))
+    const target_pointer = element(b, &common, common.buffers[1], target_index)
+    const target = builder.load(b, common.uint, target_pointer)
+    const alpha = select(b, common.uint, flagSet(b, &common, flags, FLAG_OPAQUE), constant(b, &common, 255), channel(b, &common, source, 24))
+    const inverse = op(b, spv.Op.iSub, common.uint, constant(b, &common, 255), alpha)
+    // Each channel, premultiplied: min(255, source + (target * (255 - alpha) + 127) / 255).
+    var blended: [3]u32 = [3]u32{ 0, 0, 0 }
+    var index: u32 = 0
+    while index < 3 {
+        const shift = 16 - index * 8
+        const kept = op(b, spv.Op.iAdd, common.uint, op(b, spv.Op.iMul, common.uint, channel(b, &common, target, shift), inverse), constant(b, &common, 127))
+        const sum = op(b, spv.Op.iAdd, common.uint, channel(b, &common, source, shift), op(b, spv.Op.uDiv, common.uint, kept, constant(b, &common, 255)))
+        const saturated = op(b, spv.Op.uGreaterThan, common.boolean, sum, constant(b, &common, 255))
+        blended[index] = select(b, common.uint, saturated, constant(b, &common, 255), sum)
+        index += 1
+    }
+    builder.store(b, target_pointer, pack(b, &common, blended[0], blended[1], blended[2]))
+    builder.branch(b, merge)
+
+    const merge_label = builder.labelWith(b, merge)
+    builder.returnVoid(b)
+    builder.functionEnd(b)
+    finish(b, &common, main)
+}
+
+// Builds a shader into words allocated from `allocator`; returns the word
+// count (0 when out of memory). `which` is 0 for pattern, 1 for blit.
+pub fn build(allocator: std.allocator.Allocator, which: u8, result: *[*]u32) -> usize {
+    var b: builder.Builder = undefined
+    builder.init(&b, allocator, spv.version(1, 3))
+    if which == 0 { buildPattern(&b) } else { buildBlit(&b) }
+    const count = builder.wordCount(&b)
+    const memory = allocator.alloc(count * 4, 4)
+    if memory == null { return 0 }
+    unsafe { result.* = @ptrCast([*]u32, memory.?) }
+    builder.writeWords(&b, result.*)
+    builder.deinit(&b)
+    return count
+}

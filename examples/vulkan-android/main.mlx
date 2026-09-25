@@ -1,0 +1,333 @@
+// Vulkan on Android: a NativeActivity that renders the animated pattern of
+// examples/vulkan-shared with a compute shader and presents it through a
+// VK_KHR_android_surface swapchain. Touch moves the ring; it turns white
+// while the finger is down.
+//
+// No C Vulkan headers and no NDK toolchain: the system loader (libvulkan.so)
+// is opened with std.vulkan.loader, the shader is built with
+// std.spirv.builder, and the activity is driven through std.android's NDK
+// bindings.
+//
+// Build (from the repository root, with the aarch64-android compiler):
+//   zig-out/bin/mlx1 examples/vulkan-android/main.mlx -o vulkan.apk \
+//       --target=aarch64-android --android-package=dev.mlxlang.vulkan \
+//       --android-label="Mlx Vulkan"
+//   adb install -r vulkan.apk && adb logcat -s mlx
+//
+// Frames are paced by a 60 Hz timerfd on the main looper; each frame waits
+// for the GPU (FIFO presentation), so the pace never outruns the display.
+
+const std = @import("std")
+const android = @import("std.android")
+const vk = @import("std.vulkan")
+const loader = @import("std.vulkan.loader")
+const gpu = @import("../vulkan-shared/gpu.mlx")
+const shaders = @import("../vulkan-shared/shaders.mlx")
+const swapchain = @import("../vulkan-shared/swapchain.mlx")
+
+// struct ANativeActivity: callbacks at 0, instance at 56.
+const ACTIVITY_CALLBACKS: usize = 0
+const ACTIVITY_INSTANCE: usize = 56
+// struct ANativeActivityCallbacks, one function pointer each.
+const ON_DESTROY: usize = 40
+const ON_NATIVE_WINDOW_CREATED: usize = 56
+const ON_NATIVE_WINDOW_RESIZED: usize = 64
+const ON_NATIVE_WINDOW_REDRAW_NEEDED: usize = 72
+const ON_NATIVE_WINDOW_DESTROYED: usize = 80
+const ON_INPUT_QUEUE_CREATED: usize = 88
+const ON_INPUT_QUEUE_DESTROYED: usize = 96
+
+const CLOCK_MONOTONIC: i32 = 1
+const TIMER_FLAGS: i32 = 526336 // TFD_NONBLOCK | TFD_CLOEXEC
+const FRAME_NANOSECONDS: u64 = 16666667
+
+const App = struct {
+    activity: usize
+    window: usize
+    queue: usize
+    looper: usize
+    timer: i32
+    // Vulkan: the device, the pattern pipeline, the window's swapchain.
+    vulkan: bool
+    context: *gpu.Context
+    kernel: *gpu.Kernel
+    chain: *swapchain.Swapchain
+    hasSwapchain: bool
+    time: u32
+    frames: usize
+    // Touch: the ring follows the last position.
+    pointerSeen: bool
+    touching: bool
+    pointerX: u32
+    pointerY: u32
+    // Scratch: the AInputEvent* out-parameter and an itimerspec.
+    event: usize
+    timerSpec: usize
+}
+
+fn appOf(activity: usize) -> *App {
+    unsafe { return @ptrFromInt(*App, @ptrFromInt(*usize, activity + ACTIVITY_INSTANCE).*) }
+}
+
+fn setCallback(activity: usize, offset: usize, function: usize) -> void {
+    unsafe {
+        const callbacks = @ptrFromInt(*usize, activity + ACTIVITY_CALLBACKS).*
+        @ptrFromInt(*usize, callbacks + offset).* = function
+    }
+}
+
+fn writeU64(address: usize, value: u64) -> void {
+    unsafe { @ptrFromInt(*u64, address).* = value }
+}
+
+fn allocate(size: usize) -> usize {
+    const memory = std.page_allocator.init().alloc(size, 16)
+    if memory == null { return 0 }
+    return @intFromPtr(memory.?)
+}
+
+// ── Vulkan ────────────────────────────────────────────────────────────────
+
+fn openVulkan(app: *App) -> bool {
+    const allocator = std.page_allocator.init()
+    var driver: loader.Driver = undefined
+    unsafe {
+        if loader.openSystemLoader(&driver, @ptrCast([*]const u8, loader.SYSTEM_LOADER_ANDROID), allocator) != loader.Status.ok {
+            android.log("vulkan: libvulkan.so is not available")
+            return false
+        }
+    }
+    const names = allocate(24)
+    if names == 0 { return false }
+    unsafe {
+        @ptrFromInt(*usize, names).* = @intFromPtr(@ptrCast([*]const u8, vk.KHR_SURFACE_EXTENSION_NAME))
+        @ptrFromInt(*usize, names + 8).* = @intFromPtr(@ptrCast([*]const u8, vk.KHR_ANDROID_SURFACE_EXTENSION_NAME))
+        @ptrFromInt(*usize, names + 16).* = @intFromPtr(@ptrCast([*]const u8, vk.KHR_SWAPCHAIN_EXTENSION_NAME))
+    }
+    var options = gpu.defaultOptions(@ptrCast([*]const u8, "mlx-vulkan-android"))
+    unsafe {
+        options.instanceExtensions = @ptrFromInt([*]const [*]const u8, names)
+        options.deviceExtensions = @ptrFromInt([*]const [*]const u8, names + 16)
+    }
+    options.instanceExtensionCount = 2
+    options.deviceExtensionCount = 1
+    if gpu.open(app.*.context, driver, &options, allocator) != gpu.Status.ok {
+        android.log("vulkan: no device with the surface and swapchain extensions")
+        return false
+    }
+    var code: [*]u32 = undefined
+    const words = shaders.build(allocator, 0, &code)
+    if words == 0 || !gpu.createKernel(app.*.context, app.*.kernel, code, words, 1, shaders.PATTERN_WORDS) {
+        android.log("vulkan: cannot create the compute pipeline")
+        gpu.close(app.*.context)
+        return false
+    }
+    android.log("vulkan: device ready")
+    return true
+}
+
+// A swapchain for the current window; its surface is created here.
+fn createSwapchain(app: *App) -> void {
+    if !app.*.vulkan || app.*.window == 0 || app.*.hasSwapchain { return }
+    const context = app.*.context
+    var info = vk.AndroidSurfaceCreateInfoKHR.init()
+    unsafe { info.window = @ptrFromInt(*anyopaque, app.*.window) }
+    var surface: vk.SurfaceKHR = 0
+    if vk.createAndroidSurfaceKHR(context.*.instanceCommands, context.*.instance, &info, null, &surface) != vk.Result.success {
+        android.log("vulkan: cannot create the window surface")
+        return
+    }
+    // The window decides the size: the hint is unused on Android.
+    if !swapchain.create(context, app.*.chain, surface, 0, 0) {
+        android.log("vulkan: cannot create the swapchain")
+        swapchain.destroy(context, app.*.chain, false)
+        return
+    }
+    app.*.hasSwapchain = true
+    android.log("vulkan: swapchain created")
+}
+
+fn destroySwapchain(app: *App, keep_surface: bool) -> void {
+    if !app.*.hasSwapchain { return }
+    swapchain.destroy(app.*.context, app.*.chain, keep_surface)
+    app.*.hasSwapchain = false
+}
+
+// Same surface, new swapchain (the window was resized or rotated).
+fn recreateSwapchain(app: *App) -> void {
+    if !app.*.hasSwapchain { return }
+    const surface = app.*.chain.*.surface
+    swapchain.destroy(app.*.context, app.*.chain, true)
+    if !swapchain.create(app.*.context, app.*.chain, surface, 0, 0) {
+        swapchain.destroy(app.*.context, app.*.chain, false)
+        app.*.hasSwapchain = false
+        android.log("vulkan: cannot recreate the swapchain")
+    }
+}
+
+fn render(app: *App) -> void {
+    if !app.*.hasSwapchain { return }
+    var flags: u32 = 0
+    if app.*.pointerSeen { flags = flags | shaders.FLAG_POINTER }
+    if app.*.touching { flags = flags | shaders.FLAG_PRESSED }
+    const pattern = shaders.Pattern.{ .width = 0, .height = 0, .time = app.*.time, .pointerX = app.*.pointerX, .pointerY = app.*.pointerY, .flags = flags }
+    const status = swapchain.present(app.*.context, app.*.chain, app.*.kernel, pattern)
+    if status == swapchain.FrameStatus.out_of_date {
+        recreateSwapchain(app)
+        return
+    }
+    if status == swapchain.FrameStatus.failed {
+        android.log("vulkan: frame failed")
+        destroySwapchain(app, false)
+        return
+    }
+    app.*.time += 2
+    app.*.frames += 1
+    if app.*.frames == 1 { android.log("vulkan: first frame presented") }
+}
+
+// ── Frame timer ───────────────────────────────────────────────────────────
+
+fn setTimer(app: *App, running: bool) -> void {
+    if app.*.timer < 0 { return }
+    const spec = app.*.timerSpec
+    const period: u64 = if running { FRAME_NANOSECONDS } else { 0 }
+    writeU64(spec, 0) // it_interval: seconds, nanoseconds
+    writeU64(spec + 8, period)
+    writeU64(spec + 16, 0) // it_value (all 0 disarms)
+    writeU64(spec + 24, period)
+    const set = android.timerfd_settime(app.*.timer, 0, spec, 0)
+}
+
+fn onTimer(fd: i32, events: i32, data: usize) -> i32 {
+    var app: *App = undefined
+    unsafe { app = @ptrFromInt(*App, data) }
+    const expirations = android.read(fd, app.*.event, 8)
+    render(app)
+    return 1
+}
+
+// ── Input ─────────────────────────────────────────────────────────────────
+
+fn handleMotion(app: *App, event: usize) -> void {
+    const action = android.AMotionEvent_getAction(event) & android.MOTION_ACTION_MASK
+    const x_position: f32 = android.AMotionEvent_getX(event, 0)
+    const y_position: f32 = android.AMotionEvent_getY(event, 0)
+    const x: i64 = @intFromFloat(i64, x_position)
+    const y: i64 = @intFromFloat(i64, y_position)
+    if action == android.MOTION_ACTION_DOWN || action == android.MOTION_ACTION_MOVE {
+        app.*.pointerX = if x < 0 { 0 } else { @intCast(u32, x) }
+        app.*.pointerY = if y < 0 { 0 } else { @intCast(u32, y) }
+        app.*.pointerSeen = true
+        app.*.touching = true
+    } else if action == android.MOTION_ACTION_UP || action == android.MOTION_ACTION_CANCEL {
+        app.*.touching = false
+    }
+}
+
+fn onInput(fd: i32, events: i32, data: usize) -> i32 {
+    var app: *App = undefined
+    unsafe { app = @ptrFromInt(*App, data) }
+    while app.*.queue != 0 && android.AInputQueue_getEvent(app.*.queue, app.*.event) >= 0 {
+        var event: usize = 0
+        unsafe { event = @ptrFromInt(*usize, app.*.event).* }
+        if android.AInputQueue_preDispatchEvent(app.*.queue, event) == 0 {
+            if android.AInputEvent_getType(event) == android.INPUT_EVENT_TYPE_MOTION { handleMotion(app, event) }
+            android.AInputQueue_finishEvent(app.*.queue, event, 0)
+        }
+    }
+    return 1
+}
+
+// ── Activity callbacks ────────────────────────────────────────────────────
+
+fn onWindowCreated(activity: usize, window: usize) -> void {
+    const app = appOf(activity)
+    app.*.window = window
+    createSwapchain(app)
+    render(app)
+    setTimer(app, true)
+}
+
+fn onWindowResized(activity: usize, window: usize) -> void {
+    const app = appOf(activity)
+    recreateSwapchain(app)
+    render(app)
+}
+
+fn onRedrawNeeded(activity: usize, window: usize) -> void {
+    render(appOf(activity))
+}
+
+// The surface must be gone before this returns.
+fn onWindowDestroyed(activity: usize, window: usize) -> void {
+    const app = appOf(activity)
+    setTimer(app, false)
+    destroySwapchain(app, false)
+    app.*.window = 0
+}
+
+fn onInputQueueCreated(activity: usize, queue: usize) -> void {
+    const app = appOf(activity)
+    app.*.queue = queue
+    android.AInputQueue_attachLooper(queue, app.*.looper, 1, @intFromPtr(onInput), @intFromPtr(app))
+}
+
+fn onInputQueueDestroyed(activity: usize, queue: usize) -> void {
+    const app = appOf(activity)
+    android.AInputQueue_detachLooper(queue)
+    app.*.queue = 0
+    app.*.touching = false
+}
+
+fn onDestroy(activity: usize) -> void {
+    const app = appOf(activity)
+    if app.*.timer >= 0 {
+        if app.*.looper != 0 { const removed = android.ALooper_removeFd(app.*.looper, app.*.timer) }
+        const closed = android.close(app.*.timer)
+    }
+    destroySwapchain(app, false)
+    if app.*.vulkan { gpu.close(app.*.context) }
+    unsafe { @ptrFromInt(*usize, activity + ACTIVITY_INSTANCE).* = 0 }
+}
+
+export fn ANativeActivity_onCreate(activity: usize, saved_state: usize, saved_state_size: usize) -> void {
+    const block = allocate(@sizeOf(App) + 8 + 32)
+    const context = allocate(@sizeOf(gpu.Context))
+    const kernel = allocate(@sizeOf(gpu.Kernel))
+    const chain = allocate(@sizeOf(swapchain.Swapchain))
+    if block == 0 || context == 0 || kernel == 0 || chain == 0 { return }
+    var app: *App = undefined
+    unsafe {
+        app = @ptrFromInt(*App, block)
+        app.*.context = @ptrFromInt(*gpu.Context, context)
+        app.*.kernel = @ptrFromInt(*gpu.Kernel, kernel)
+        app.*.chain = @ptrFromInt(*swapchain.Swapchain, chain)
+    }
+    app.*.activity = activity
+    app.*.window = 0
+    app.*.queue = 0
+    app.*.looper = android.ALooper_forThread()
+    app.*.hasSwapchain = false
+    app.*.time = 0
+    app.*.frames = 0
+    app.*.pointerSeen = false
+    app.*.touching = false
+    app.*.pointerX = 0
+    app.*.pointerY = 0
+    app.*.event = block + @sizeOf(App)
+    app.*.timerSpec = app.*.event + 8
+    app.*.vulkan = openVulkan(app)
+    app.*.timer = android.timerfd_create(CLOCK_MONOTONIC, TIMER_FLAGS)
+    if app.*.timer >= 0 && app.*.looper != 0 {
+        const added = android.ALooper_addFd(app.*.looper, app.*.timer, 2, android.LOOPER_EVENT_INPUT, @intFromPtr(onTimer), block)
+    }
+    unsafe { @ptrFromInt(*usize, activity + ACTIVITY_INSTANCE).* = block }
+    setCallback(activity, ON_DESTROY, @intFromPtr(onDestroy))
+    setCallback(activity, ON_NATIVE_WINDOW_CREATED, @intFromPtr(onWindowCreated))
+    setCallback(activity, ON_NATIVE_WINDOW_RESIZED, @intFromPtr(onWindowResized))
+    setCallback(activity, ON_NATIVE_WINDOW_REDRAW_NEEDED, @intFromPtr(onRedrawNeeded))
+    setCallback(activity, ON_NATIVE_WINDOW_DESTROYED, @intFromPtr(onWindowDestroyed))
+    setCallback(activity, ON_INPUT_QUEUE_CREATED, @intFromPtr(onInputQueueCreated))
+    setCallback(activity, ON_INPUT_QUEUE_DESTROYED, @intFromPtr(onInputQueueDestroyed))
+}
