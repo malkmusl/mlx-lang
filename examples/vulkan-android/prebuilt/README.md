@@ -16,7 +16,7 @@ adb install mlx-vulkan.apk
 ```
 
 348325 bytes, SHA-256
-`9c2c287f08a4035686b3ce9e1b5bcc0c3026ab6bf708a36ba5bd9c0495680ae9`.
+`2f799fdd78f84bdb23ac71362d12ce94760865a47961819d86d5a3099df04ba3`.
 Android runs its library straight from the APK (`extractNativeLibs=false`),
 so the installed app takes about the APK's size.
 It logs each startup step to `adb logcat -s mlx` and shows a label drawn

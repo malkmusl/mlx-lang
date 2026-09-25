@@ -19,8 +19,10 @@
 //       --android-label="Mlx Vulkan"
 //   adb install -r vulkan.apk && adb logcat -s mlx
 //
-// Frames are paced by a 60 Hz timerfd on the main looper; each frame waits
-// for the GPU (FIFO presentation), so the pace never outruns the display.
+// Frames follow the display: one per vsync (AChoreographer, API 24+; a
+// 60 Hz timerfd below that), each submitted without waiting for the GPU,
+// which finishes it while the main looper handles input. The line under
+// the label shows the frame rate and the app's time per frame.
 
 const std = @import("std")
 const android = @import("std.android")
@@ -65,6 +67,20 @@ const App = struct {
     queue: usize
     looper: usize
     timer: i32
+    // Frame pacing: the display's frame clock when there is one, whether a
+    // frame callback is posted, and whether frames should be drawn.
+    clock: *android.Choreographer
+    hasClock: bool
+    framePosted: bool
+    running: bool
+    // The frame counter: frames and time spent since statsStart, and the
+    // last second's frames per second and time per frame (tenths of ms).
+    statsStart: i64
+    statsFrames: u32
+    statsWork: i64
+    fps: u32
+    workTenths: u32
+    statsRun: *tt.Run
     // Vulkan: the device, the pattern pipeline, the window's swapchain.
     vulkan: bool
     context: *gpu.Context
@@ -230,7 +246,7 @@ fn setUpText(app: *App, context: *gpu.Context, chain: *swapchain.Swapchain) -> b
         var size = shorter / 28
         if size < 16 { size = 16 }
         const allocator = std.page_allocator.init()
-        if !tt.initAtlas(app.*.atlas, app.*.font, size, 1024, 512, allocator) || !tt.initRun(app.*.run, 128, allocator) || !tt.initRun(app.*.fullscreenRun, 32, allocator) || !tt.initRun(app.*.navigationRun, 32, allocator) || !tt.initRun(app.*.gestureRun, 32, allocator) {
+        if !tt.initAtlas(app.*.atlas, app.*.font, size, 1024, 512, allocator) || !tt.initRun(app.*.run, 128, allocator) || !tt.initRun(app.*.fullscreenRun, 32, allocator) || !tt.initRun(app.*.navigationRun, 32, allocator) || !tt.initRun(app.*.gestureRun, 32, allocator) || !tt.initRun(app.*.statsRun, 32, allocator) {
             android.log("text: cannot set up the atlas (no label)")
             app.*.hasFont = false
         }
@@ -341,8 +357,20 @@ fn decorateFrame(data: usize, context: *gpu.Context, chain: *swapchain.Swapchain
     const x = placed.x - run.*.left
     const y = placed.y + app.*.atlas.*.ascent
     // Clipped to the free area: nothing but the background under the bars.
-    if !text_module.drawIn(context, app.*.text, app.*.atlas, run, frame, width, height, 0, x + 2, y + 2, swapRedBlue(SHADOW_COLOR, flags), screen.free) { return false }
-    if !text_module.drawIn(context, app.*.text, app.*.atlas, run, frame, width, height, 0, x, y, swapRedBlue(LABEL_COLOR, flags), screen.free) { return false }
+    if !drawShadowed(app, context, chain, run, x, y, screen.free) { return false }
+    // Under it, once measured: "N FPS · X.Y ms".
+    if app.*.fps != 0 {
+        var stats_length = appendNumber(app.*.label, 0, app.*.fps)
+        unsafe { stats_length = appendText(app.*.label, stats_length, @ptrCast([*]const u8, " FPS · ")) }
+        stats_length = appendNumber(app.*.label, stats_length, app.*.workTenths / 10)
+        unsafe { stats_length = appendText(app.*.label, stats_length, @ptrCast([*]const u8, ".")) }
+        stats_length = appendNumber(app.*.label, stats_length, app.*.workTenths % 10)
+        unsafe { stats_length = appendText(app.*.label, stats_length, @ptrCast([*]const u8, " ms")) }
+        const stats = app.*.statsRun
+        tt.layoutBytes(app.*.atlas, label, stats_length, stats)
+        const line = ui.place(ui.rect(screen.free.x, placed.y + text_height, screen.free.width, text_height), ui.size(stats.*.right - stats.*.left, text_height), ui.topCenter())
+        if !drawShadowed(app, context, chain, stats, line.x - stats.*.left, line.y + app.*.atlas.*.ascent, screen.free) { return false }
+    }
 
     // The switches at the bottom center: side by side when they fit the
     // width, else one above the other, all as wide as the widest.
@@ -374,6 +402,14 @@ fn decorateFrame(data: usize, context: *gpu.Context, chain: *swapchain.Swapchain
     if !drawButton(app, context, chain, fullscreen_button, app.*.fullscreenRun) { return false }
     if !drawButton(app, context, chain, navigation_button, app.*.navigationRun) { return false }
     return drawButton(app, context, chain, gesture_button, app.*.gestureRun)
+}
+
+// White text over its shadow, clipped to `clip`.
+fn drawShadowed(app: *App, context: *gpu.Context, chain: *swapchain.Swapchain, run: *tt.Run, x: i32, y: i32, clip: ui.Rect) -> bool {
+    const flags = chain.*.formatFlags
+    const frame = chain.*.frame.buffer
+    if !text_module.drawIn(context, app.*.text, app.*.atlas, run, frame, chain.*.width, chain.*.height, 0, x + 2, y + 2, swapRedBlue(SHADOW_COLOR, flags), clip) { return false }
+    return text_module.drawIn(context, app.*.text, app.*.atlas, run, frame, chain.*.width, chain.*.height, 0, x, y, swapRedBlue(LABEL_COLOR, flags), clip)
 }
 
 fn sameRect(a: ui.Rect, b: ui.Rect) -> bool {
@@ -531,6 +567,7 @@ fn recreateSwapchain(app: *App) -> void {
 
 fn render(app: *App) -> void {
     if !app.*.hasSwapchain { return }
+    const started = @intCast(i64, std.time.monotonicNanoseconds())
     var flags: u32 = 0
     if app.*.pointerSeen { flags = flags | shaders.FLAG_POINTER }
     if app.*.touching { flags = flags | shaders.FLAG_PRESSED }
@@ -547,6 +584,7 @@ fn render(app: *App) -> void {
     }
     app.*.time += 2
     app.*.frames += 1
+    countFrame(app, started)
     app.*.framesSinceInsets += 1
     if app.*.framesSinceInsets >= INSETS_POLL {
         app.*.framesSinceInsets = 0
@@ -559,7 +597,68 @@ fn render(app: *App) -> void {
     }
 }
 
-// ── Frame timer ───────────────────────────────────────────────────────────
+// ── Frame pacing ──────────────────────────────────────────────────────────
+
+// Counts a presented frame that took from `started` until now; once a
+// second, the frame rate and the average time go to the counter and the log.
+fn countFrame(app: *App, started: i64) -> void {
+    const now = @intCast(i64, std.time.monotonicNanoseconds())
+    app.*.statsFrames += 1
+    app.*.statsWork += now - started
+    const elapsed = now - app.*.statsStart
+    if elapsed < 1000000000 { return }
+    app.*.fps = @intCast(u32, (@intCast(i64, app.*.statsFrames) * 1000000000 + elapsed / 2) / elapsed)
+    app.*.workTenths = @intCast(u32, (app.*.statsWork / @intCast(i64, app.*.statsFrames) + 50000) / 100000)
+    app.*.statsFrames = 0
+    app.*.statsWork = 0
+    app.*.statsStart = now
+    // "perf: N FPS, X.Y ms per frame"
+    const buffer = app.*.label
+    var length: usize = 0
+    unsafe { length = appendText(buffer, length, @ptrCast([*]const u8, "perf: ")) }
+    length = appendNumber(buffer, length, app.*.fps)
+    unsafe { length = appendText(buffer, length, @ptrCast([*]const u8, " FPS, ")) }
+    length = appendNumber(buffer, length, app.*.workTenths / 10)
+    unsafe { length = appendText(buffer, length, @ptrCast([*]const u8, ".")) }
+    length = appendNumber(buffer, length, app.*.workTenths % 10)
+    unsafe {
+        length = appendText(buffer, length, @ptrCast([*]const u8, " ms per frame"))
+        @ptrFromInt(*u8, buffer + length).* = 0
+        const written = android.__android_log_write(android.LOG_INFO, @ptrCast([*]const u8, "mlx"), @ptrFromInt([*]const u8, buffer))
+    }
+}
+
+// The display's frame callback: one frame per vsync while the window is
+// there.
+fn onFrame(frame_time: i64, data: usize) -> void {
+    var app: *App = undefined
+    unsafe { app = @ptrFromInt(*App, data) }
+    app.*.framePosted = false
+    if !app.*.running { return }
+    render(app)
+    postFrame(app)
+}
+
+fn postFrame(app: *App) -> void {
+    if app.*.framePosted { return }
+    app.*.framePosted = true
+    android.postFrameCallback(app.*.clock, @intFromPtr(onFrame), @intFromPtr(app))
+}
+
+fn startFrames(app: *App) -> void {
+    app.*.running = true
+    app.*.statsStart = @intCast(i64, std.time.monotonicNanoseconds())
+    app.*.statsFrames = 0
+    app.*.statsWork = 0
+    if app.*.hasClock { postFrame(app) } else { setTimer(app, true) }
+}
+
+fn stopFrames(app: *App) -> void {
+    app.*.running = false
+    setTimer(app, false)
+}
+
+// Without a frame clock (below API 24): a 60 Hz timerfd.
 
 fn setTimer(app: *App, running: bool) -> void {
     if app.*.timer < 0 { return }
@@ -632,7 +731,7 @@ fn onWindowCreated(activity: usize, window: usize) -> void {
     const changed = updateInsets(app)
     createSwapchain(app)
     render(app)
-    setTimer(app, true)
+    startFrames(app)
 }
 
 fn onWindowResized(activity: usize, window: usize) -> void {
@@ -656,7 +755,7 @@ fn onRedrawNeeded(activity: usize, window: usize) -> void {
 // The surface must be gone before this returns.
 fn onWindowDestroyed(activity: usize, window: usize) -> void {
     const app = appOf(activity)
-    setTimer(app, false)
+    stopFrames(app)
     destroySwapchain(app, false)
     app.*.window = 0
 }
@@ -697,9 +796,11 @@ export fn ANativeActivity_onCreate(activity: usize, saved_state: usize, saved_st
     const fullscreen_run = allocate(@sizeOf(tt.Run))
     const navigation_run = allocate(@sizeOf(tt.Run))
     const gesture_run = allocate(@sizeOf(tt.Run))
+    const stats_run = allocate(@sizeOf(tt.Run))
+    const clock = allocate(@sizeOf(android.Choreographer))
     const text = allocate(@sizeOf(text_module.Text))
     const label = allocate(320)
-    if block == 0 || context == 0 || kernel == 0 || chain == 0 || font == 0 || atlas == 0 || run == 0 || fullscreen_run == 0 || navigation_run == 0 || gesture_run == 0 || text == 0 || label == 0 { return }
+    if block == 0 || context == 0 || kernel == 0 || chain == 0 || font == 0 || atlas == 0 || run == 0 || fullscreen_run == 0 || navigation_run == 0 || gesture_run == 0 || stats_run == 0 || clock == 0 || text == 0 || label == 0 { return }
     var app: *App = undefined
     unsafe {
         app = @ptrFromInt(*App, block)
@@ -712,6 +813,8 @@ export fn ANativeActivity_onCreate(activity: usize, saved_state: usize, saved_st
         app.*.fullscreenRun = @ptrFromInt(*tt.Run, fullscreen_run)
         app.*.navigationRun = @ptrFromInt(*tt.Run, navigation_run)
         app.*.gestureRun = @ptrFromInt(*tt.Run, gesture_run)
+        app.*.statsRun = @ptrFromInt(*tt.Run, stats_run)
+        app.*.clock = @ptrFromInt(*android.Choreographer, clock)
         app.*.text = @ptrFromInt(*text_module.Text, text)
     }
     app.*.label = label
@@ -741,6 +844,12 @@ export fn ANativeActivity_onCreate(activity: usize, saved_state: usize, saved_st
     app.*.pointerY = 0
     app.*.event = block + @sizeOf(App)
     app.*.timerSpec = app.*.event + 8
+    app.*.running = false
+    app.*.framePosted = false
+    app.*.fps = 0
+    app.*.workTenths = 0
+    app.*.hasClock = android.choreographer(app.*.clock)
+    if app.*.hasClock { android.log("vulkan: frames follow the display (Choreographer)") } else { android.log("vulkan: frames follow a 60 Hz timer") }
     app.*.vulkan = openVulkan(app)
     if app.*.vulkan { loadFont(app) } else { app.*.hasFont = false }
     app.*.timer = android.timerfd_create(CLOCK_MONOTONIC, TIMER_FLAGS)

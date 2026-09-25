@@ -48,6 +48,10 @@ from emulate_android_app import Framework, TIMER_FD, WINDOW  # noqa: E402
 from unicorn.arm64_const import UC_ARM64_REG_SP  # noqa: E402
 
 LIBVULKAN = 0x5800_0000_0001
+LIBANDROID = 0x5800_0000_0002
+CHOREOGRAPHER = 0x5C00_0000_0001
+# The display refreshes every 16.67 ms (60 Hz).
+VSYNC = 16_666_667
 FORMAT_R8G8B8A8_UNORM = 37
 LAYOUT_UNDEFINED, LAYOUT_TRANSFER_DST, LAYOUT_PRESENT_SRC = 0, 7, 1000001002
 ERROR_OUT_OF_DATE = (-1000001004) & 0xFFFFFFFF
@@ -61,8 +65,9 @@ FONT = os.path.join(ROOT, "tests/support/fonts/DejaVuSans-subset.ttf")
 # 0xAARRGGBB before the app swaps red and blue for R8G8B8A8): all that may
 # be drawn under the system bars.
 BACKGROUND_COLOR = 0xFF101418
-# Rows below the top inset the label (with its padding and shadow) may use.
-LABEL_ROWS = 40
+# Rows below the top inset the label and the frame counter under it (with
+# their padding and shadows) may use.
+LABEL_ROWS = 50
 
 
 def pattern(x, y, width, time, pointer_x, pointer_y, flags):
@@ -108,6 +113,15 @@ class MockVulkan:
         self.pipelines = {}      # handle -> "pattern" or "text"
         self.text_draws = 0
         self.out_of_date_once = False
+        # The fence: signaled (the mock GPU finishes a submission at once)
+        # and whether the app has waited for it since. Frames must be waited
+        # for before the command buffer is used again or the next image is
+        # acquired, and should be presented before that wait.
+        self.fence_signaled = False
+        self.fence_unwaited = False
+        self.presented_unwaited = 0
+        # The semaphore each swapchain image was presented with.
+        self.present_semaphores = {}
         self.commands = {name[3:]: getattr(self, name) for name in dir(self) if name.startswith("vk_")}
         self.addresses = {}
         framework.lib.imports.update({"dlopen": self.dlopen, "dlsym": self.dlsym, "dlclose": lambda p, *_: 0})
@@ -240,8 +254,29 @@ class MockVulkan:
         return 0
 
     vk_DestroyShaderModule = vk_DestroyFence = vk_DestroyCommandPool = vk_DestroyDescriptorPool = nothing
-    vk_DestroySemaphore = vk_DeviceWaitIdle = vk_WaitForFences = vk_ResetFences = nothing
-    vk_ResetDescriptorPool = vk_BeginCommandBuffer = vk_EndCommandBuffer = vk_UnmapMemory = nothing
+    vk_DestroySemaphore = vk_DeviceWaitIdle = nothing
+    vk_EndCommandBuffer = vk_UnmapMemory = nothing
+
+    def vk_WaitForFences(self, process, device, count, fences, *_):
+        assert self.fence_signaled, "waiting for a fence nothing will signal"
+        self.fence_unwaited = False
+        return 0
+
+    def vk_ResetFences(self, process, device, count, fences, *_):
+        assert not self.fence_unwaited, "fence reset before it was waited for"
+        self.fence_signaled = False
+        return 0
+
+    def reuse(self, what):
+        assert not self.fence_unwaited, f"{what} while the last frame may still run on the GPU"
+
+    def vk_ResetDescriptorPool(self, process, *_):
+        self.reuse("descriptor pool reset")
+        return 0
+
+    def vk_BeginCommandBuffer(self, process, *_):
+        self.reuse("command buffer recorded")
+        return 0
     vk_FreeMemory = vk_DestroyBuffer = vk_DestroyPipeline = vk_DestroyPipelineLayout = nothing
     vk_DestroyDescriptorSetLayout = nothing
 
@@ -291,6 +326,7 @@ class MockVulkan:
             self.sets[self.u64(write + 16)][self.u32(write + 24)] = self.u64(info)
 
     def vk_ResetCommandBuffer(self, process, buffer, *_):
+        self.reuse("command buffer reset")
         self.recorded[buffer] = []
         return 0
 
@@ -322,6 +358,10 @@ class MockVulkan:
         self.record(buffer, "copy", source, image, layout & 0xFFFFFFFF, width, height, self.u64(regions))
 
     def vk_QueueSubmit(self, process, queue, count, submits, fence, *_):
+        assert not self.fence_signaled, "submitted with a fence still signaled"
+        if fence:
+            self.fence_signaled = True
+            self.fence_unwaited = True
         for index in range(count):
             submit = submits + 72 * index
             waits = [self.u64(self.u64(submit + 24) + 8 * n) for n in range(self.u32(submit + 16))]
@@ -422,7 +462,7 @@ class MockVulkan:
 
     def vk_GetPhysicalDeviceSurfaceCapabilitiesKHR(self, process, device, surface, capabilities, *_):
         width, height = self.extent
-        self.lib.write(capabilities, struct.pack("<IIIIIIIIIIIII", 2, 3, width, height, 1, 1, 4096, 4096, 1,
+        self.lib.write(capabilities, struct.pack("<IIIIIIIIIIIII", 3, 64, width, height, 1, 1, 4096, 4096, 1,
                                                  1 | 2 | 4 | 8, self.transform, COMPOSITE_ALPHA_INHERIT, 2 | 16))
         return 0
 
@@ -443,13 +483,16 @@ class MockVulkan:
         assert (width, height) == self.extent, ((width, height), self.extent)
         assert usage & 2, "swapchain images are not transfer destinations"
         assert alpha == COMPOSITE_ALPHA_INHERIT, alpha
+        # As few images as allowed: less queued, less input lag.
+        requested = self.u32(info + 32)
+        assert requested == 3, f"{requested} images, not minImageCount (3)"
         # Frames are drawn upright at the current orientation's size, so the
         # compositor has to rotate them: IDENTITY, whatever the display says.
         assert transform == TRANSFORM_IDENTITY, f"preTransform {transform} for upright frames"
         self.swapchains_created += 1
         handle = self.handle()
         images = []
-        for _ in range(3):
+        for _ in range(requested):
             image = self.handle()
             self.images[image] = {"layout": LAYOUT_UNDEFINED, "pixels": None, "size": (width, height)}
             images.append(image)
@@ -469,6 +512,9 @@ class MockVulkan:
         return 0
 
     def vk_AcquireNextImageKHR(self, process, device, swapchain, timeout, semaphore, fence, index, *_):
+        # The acquire semaphore is free again only once the frame that
+        # waited on it is done.
+        self.reuse("next image acquired")
         chain = self.swapchains[swapchain]
         assert semaphore, "acquire without a semaphore"
         self.acquire_semaphore = semaphore
@@ -480,6 +526,12 @@ class MockVulkan:
         assert self.u32(info + 16) == 1, "present waits for no semaphore"
         swapchain = self.u64(self.u64(info + 40))
         index = self.u32(self.u64(info + 48))
+        # One semaphore per image, always the same for an image.
+        semaphore = self.u64(self.u64(info + 24))
+        previous = self.present_semaphores.setdefault((swapchain, index), semaphore)
+        assert previous == semaphore and list(self.present_semaphores.values()).count(semaphore) == 1, "images share a present semaphore"
+        if self.fence_unwaited:
+            self.presented_unwaited += 1
         chain = self.swapchains[swapchain]
         image = self.images[chain["images"][index]]
         assert image["layout"] == LAYOUT_PRESENT_SRC, "presented image is not in PRESENT_SRC"
@@ -500,10 +552,37 @@ class MockVulkan:
 class App(Framework):
     """The framework model with a periodic timerfd and the mock driver."""
 
-    def __init__(self, library_path, available=True, verbose=False, font=FONT, jni=None):
+    def __init__(self, library_path, available=True, verbose=False, font=FONT, jni=None, choreographer=True):
         super().__init__(library_path, verbose=verbose, jni=jni)
         self.timer_interval = 0
         self.vulkan = MockVulkan(self, available)
+        # libandroid.so's AChoreographer (API 24+): frame callbacks run at
+        # the next vsync after they were posted.
+        self.choreographer = choreographer
+        self.frame_callbacks = []
+        vulkan_dlopen, vulkan_dlsym = self.vulkan.dlopen, self.vulkan.dlsym
+
+        def dlopen(process, name, flags, *_):
+            if process.cstring(name) == "libandroid.so":
+                return LIBANDROID if choreographer else 0
+            return vulkan_dlopen(process, name, flags)
+
+        def dlsym(process, library, name, *_):
+            if library != LIBANDROID:
+                return vulkan_dlsym(process, library, name)
+            symbol = process.cstring(name)
+            if symbol == "AChoreographer_getInstance":
+                return self.vulkan.stub(symbol, lambda p, *_: CHOREOGRAPHER)
+            if symbol == "AChoreographer_postFrameCallback":
+                return self.vulkan.stub(symbol, self._post_frame_callback)
+            return 0
+        self.lib.imports.update({"dlopen": dlopen, "dlsym": dlsym})
+
+        # clock_gettime (a syscall): the model's time.
+        def clock_gettime(clock, spec, *_):
+            self.lib.write(spec, struct.pack("<qq", self.now // 1_000_000_000, self.now % 1_000_000_000))
+            return 0
+        self.lib.sys_113 = clock_gettime
         # /system/fonts/* is the test font (or missing, with font=None).
         lib = self.lib
         original = lib.sys_56
@@ -526,9 +605,24 @@ class App(Framework):
         self.timer_expired = False
         return 0
 
+    def _post_frame_callback(self, process, instance, callback, data, *_):
+        assert instance == CHOREOGRAPHER, "frame callback on an unknown choreographer"
+        self.frame_callbacks.append((callback, data))
+
     def advance(self, until):
-        while self.timer_deadline is not None and self.timer_deadline <= until:
-            self.now = self.timer_deadline
+        """Runs the timer and the vsync frame callbacks due up to `until`,
+        in time order."""
+        while True:
+            vsync = (self.now // VSYNC + 1) * VSYNC if self.frame_callbacks else None
+            due = [t for t in (self.timer_deadline, vsync) if t is not None and t <= until]
+            if not due:
+                break
+            self.now = min(due)
+            if self.now == vsync:
+                callbacks, self.frame_callbacks = self.frame_callbacks, []
+                for callback, data in callbacks:
+                    self.lib.call_address(callback, self.now, data, name="frame")
+                continue
             self.timer_deadline = self.now + self.timer_interval if self.timer_interval else None
             self.timer_expired = True
             callback, data = self.fd_callbacks[TIMER_FD]
@@ -668,11 +762,15 @@ def scenario_render(library, spirv_val):
     assert "ui: reserved for the system bars: top 8 right 0 bottom 6 left 0" in app.messages(), app.messages()
     logged = len(app.messages())
     assert len(vulkan.frames) == 1, "no frame on window creation"
+    # Frames follow the display's vsync; no timer runs.
+    assert "vulkan: frames follow the display (Choreographer)" in app.messages() and app.timer_deadline is None
     check_frame(vulkan.frames[0], 0, insets=insets, app=app)
     # The timer presents a frame every 16.7 ms; time advances by 2 a frame.
     app.advance(51 * MS)
     assert len(vulkan.frames) == 4, len(vulkan.frames)
     assert len(app.messages()) == logged, "steps are still logged after the first frame"
+    # Every frame is presented before the app waits for the GPU to finish it.
+    assert vulkan.presented_unwaited == len(vulkan.frames), (vulkan.presented_unwaited, len(vulkan.frames))
     for index, frame in enumerate(vulkan.frames):
         check_frame(frame, index * 2, insets=insets, app=app)
     # Touch: the ring follows the finger, white while down, amber after
@@ -735,7 +833,8 @@ def scenario_landscape(library):
     activity: its manifest does not handle orientation changes.)"""
     # API 29 (getSystemWindowInset*), and no WindowInsets until the first
     # layout pass.
-    app = App(library, jni={"sdk": 29, "insets": None, "cutout": (0, 20, 0, 0), "status_bar": 16})
+    # Without a Choreographer (as below API 24) a 60 Hz timer paces frames.
+    app = App(library, jni={"sdk": 29, "insets": None, "cutout": (0, 20, 0, 0), "status_bar": 16}, choreographer=False)
     vulkan = app.vulkan
     vulkan.transform = TRANSFORM_ROTATE_90
     # Wide enough for the whole label and a row of buttons, tall enough for
@@ -744,6 +843,7 @@ def scenario_landscape(library):
     app.create()
     app.show_window()
     app.advance(51 * MS)
+    assert "vulkan: frames follow a 60 Hz timer" in app.messages() and app.timer_deadline is not None
     assert len(vulkan.frames) == 4 and vulkan.suboptimal == 4, (len(vulkan.frames), vulkan.suboptimal)
     assert vulkan.swapchains_created == 1, f"{vulkan.swapchains_created} swapchains for one window"
     for index, frame in enumerate(vulkan.frames):
@@ -876,6 +976,18 @@ def scenario_switches(library):
         check_frame(vulkan.frames[-1], (len(vulkan.frames) - 1) * 2, pointer, insets=expected, app=app)
         assert centered == [True], which
     assert app.jni.frames == 0, "JNI local frames left pushed"
+    # After a second the frame counter appears under the label and in the
+    # log: 60 frames a second, no time spent (the model's clock stands still
+    # during a call).
+    app.advance(1100 * MS)
+    assert "perf: 60 FPS, 0.0 ms per frame" in app.messages(), [m for m in app.messages() if m.startswith("perf")]
+    app.advance(1120 * MS)
+    del centered[:]
+    check_frame(vulkan.frames[-1], (len(vulkan.frames) - 1) * 2, pointer, insets=(22, 0, 6, 0), app=app)
+    assert centered == [True]
+    (width, _), pixels = vulkan.frames[-1]
+    rows = [y for y in range(22, 22 + LABEL_ROWS) if any(pixels[y * width + x] == 0xFFFFFFFF for x in range(width))]
+    assert rows and rows[-1] - rows[0] > 20, f"one line of text, not two (rows {rows[:1]}..{rows[-1:]})"
     app.callback("onNativeWindowDestroyed", WINDOW)
     app.callback("onDestroy")
     return len(vulkan.frames)
@@ -929,12 +1041,12 @@ def main():
             path = library
         spirv_val = shutil.which("spirv-val")
         frames = scenario_render(path, spirv_val)
-        print(f"ok   render: {frames} frames checked pixel by pixel (system bar insets, touch, out-of-date, resize, new insets, background)"
+        print(f"ok   render: {frames} frames checked pixel by pixel, one per vsync, presented before the GPU wait (system bar insets, touch, out-of-date, resize, new insets, background)"
               + ("" if spirv_val else " [spirv-val not installed]"))
         frames = scenario_landscape(path)
-        print(f"ok   landscape (ROTATE_90, API 29 insets): {frames} frames, upright with an IDENTITY swapchain, no rebuild per suboptimal present")
+        print(f"ok   landscape (ROTATE_90, API 29 insets, 60 Hz timer): {frames} frames, upright with an IDENTITY swapchain, no rebuild per suboptimal present")
         frames = scenario_switches(path)
-        print(f"ok   switches: {frames} frames, navigation bar and fullscreen toggled at runtime, the reserved space following")
+        print(f"ok   switches: {frames} frames, navigation bar and fullscreen toggled at runtime, the reserved space following; 60 FPS counter")
         frames = scenario_fullscreen(path)
         print(f"ok   fullscreen: {frames} frames, nothing reserved, the label at the top center of the whole window")
         scenario_no_font(path)

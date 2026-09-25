@@ -123,6 +123,16 @@ and above the navigation bar by the last gesture: blue at start, green for
 a tap, yellow for a long press, red/magenta for a swipe right/left,
 cyan/orange for a swipe down/up.
 
+### Frame clock
+
+`choreographer(&clock)` finds Android's frame clock (`AChoreographer`,
+API 24+) at run time with `dlopen`/`dlsym`, so an app using it still loads
+on older releases (it returns false there; pace frames with a timerfd
+instead). `postFrameCallback(&clock, callback, data)` asks for
+`callback(frame_time_nanos, data)` once, on the looper thread, when the
+display starts its next frame; `examples/vulkan-android` draws a frame and
+posts again from each callback, so it draws exactly once per vsync.
+
 ### Reserved space
 
 The layout rule for every Android window: an app that is not fullscreen
@@ -200,7 +210,7 @@ calls), the `O_*` bits that differ, and the `struct stat` and
 | `tools/check_android_packaging.py` | CRC-32, Adler-32, SHA-1, SHA-256 and bignum results of the packaging code, built by mlx0 and by mlx1, against Python |
 | `tools/check_android_apk.py` | `apksigner`, `jarsigner`, `zipalign`, `aapt2` on a built APK; reproducible output |
 | `tools/emulate_android_app.py` | the gesture example against a model of the Android framework: taps, long presses, swipes, cancel, rotation, and the reserved space (a fake `JNIEnv`, see below): only the background under the status and navigation bars, nothing reserved when fullscreen |
-| `tools/emulate_vulkan_android.py` | `examples/vulkan-android` against the same framework model plus a mock Vulkan driver behind `libvulkan.so`: instance and device extensions, the submitted shader (`spirv-val`), swapchain creation on an R8G8B8A8, "inherit"-alpha surface, every presented frame pixel by pixel, the reserved space (a fake `JNIEnv` answers `getRootWindowInsets` on API 34 through `WindowInsets.Type` and `Insets`, and on API 29 through `getSystemWindowInset*` and `getDisplayCutout`, plus the status bar dimens; before the first layout pass it has none) with only the background under it and the landscape top band at its portrait height, the fullscreen, navigation bar and gesture bar switches tapped at runtime (the content behind a transparent gesture bar) (`WindowInsetsController` on API 34, system UI flags on API 29) with the reserved space following, the std.truetype label at the top center of the rest and the buttons at its bottom center (the system font served from the test font, the `text` shader run on the fills, atlas and runs the app built), touch, out-of-date and resized swapchains, background and return, and devices without a system font or without Vulkan |
+| `tools/emulate_vulkan_android.py` | `examples/vulkan-android` against the same framework model plus a mock Vulkan driver behind `libvulkan.so`: instance and device extensions, the submitted shader (`spirv-val`), swapchain creation on an R8G8B8A8, "inherit"-alpha surface, every presented frame pixel by pixel, the reserved space (a fake `JNIEnv` answers `getRootWindowInsets` on API 34 through `WindowInsets.Type` and `Insets`, and on API 29 through `getSystemWindowInset*` and `getDisplayCutout`, plus the status bar dimens; before the first layout pass it has none) with only the background under it and the landscape top band at its portrait height, frames paced by a modeled `AChoreographer` (one per vsync; the 60 Hz timer without it), each presented before the app waits for the GPU and never re-recorded before that wait (a modeled fence), one present semaphore per image and `minImageCount` images, the frame counter under the label (`60 FPS`, and the `perf:` log line), the fullscreen, navigation bar and gesture bar switches tapped at runtime (the content behind a transparent gesture bar) (`WindowInsetsController` on API 34, system UI flags on API 29) with the reserved space following, the std.truetype label at the top center of the rest and the buttons at its bottom center (the system font served from the test font, the `text` shader run on the fills, atlas and runs the app built), touch, out-of-date and resized swapchains, background and return, and devices without a system font or without Vulkan |
 
 The emulator cannot run Android itself, so the last step is a device:
 `adb install -r gestures.apk`, then `adb logcat -s mlx` shows each

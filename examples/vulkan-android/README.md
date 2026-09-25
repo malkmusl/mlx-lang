@@ -15,9 +15,20 @@ The Vulkan side is the same code the Linux examples run: the system
 `libvulkan.so` is opened with `std.vulkan.loader.openSystemLoader`, the
 shader comes from `std.spirv.builder`, and `examples/vulkan-shared/
 swapchain.mlx` renders each frame into a buffer, copies it into the
-acquired image and presents it (FIFO, paced by a 60 Hz timer on the main
-looper). R8G8B8A8 swapchains, common on Android, get red and blue swapped
-in the shader.
+acquired image and presents it (FIFO). R8G8B8A8 swapchains, common on
+Android, get red and blue swapped in the shader.
+
+Frames follow the display: the app draws one frame per vsync from
+Android's frame clock (`AChoreographer`, found at run time; below API 24 a
+60 Hz timerfd). A frame is submitted without waiting for the GPU, which
+finishes it while the main looper goes back to input; the next frame waits
+for it before reusing the command buffer. The swapchain has as few images
+as the surface allows (3 on Android) and one present semaphore per image,
+so few frames queue up between a touch and the screen. Under the label a
+second line shows the last second's frame rate and the app's time per
+frame (`60 FPS · 1.8 ms`, the time from the start of a frame until it is
+submitted, including any wait for the previous frame's GPU work); the same
+numbers go to the log every second (`perf: 60 FPS, 1.8 ms per frame`).
 
 Rotation: the swapchain has the window's current size and
 `preTransform = IDENTITY`, so frames are drawn upright and the compositor
