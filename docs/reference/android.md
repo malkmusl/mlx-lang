@@ -118,8 +118,7 @@ cyan/orange for a swipe down/up.
 
 The layout rule for every Android window: an app that is not fullscreen
 keeps the status and navigation bars, and its window reaches under them
-(and display cutouts; edge to edge, enforced from Android 15). That space
-is reserved: only the app's background is drawn there, and every UI
+(edge to edge, enforced from Android 15). That space is reserved: only the app's background is drawn there, and every UI
 component starts below it (and inside the other edges), in the `free`
 area. A fullscreen app (`--android-fullscreen`, whose theme sets
 `FLAG_FULLSCREEN`) has nothing reserved and lays out over the whole window,
@@ -139,10 +138,12 @@ or `ui: fullscreen, nothing reserved`.
 `isFullscreen(activity)` reads `getWindow().getAttributes().flags`.
 `windowInsets(activity, &insets)` fills a `std.ui` `Insets` with where the
 system draws over the window whether or not the app is fullscreen: status
-and navigation bars and display cutouts, in window pixels. The NDK has no
+and navigation bars, in window pixels. Display cutouts are not included: in
+landscape the camera cutout sits at a side edge, and reserving it would
+leave a band down that side. The NDK has no
 C call for either, so they go through the
 activity's `JNIEnv`: `getWindow().getDecorView().getRootWindowInsets()`,
-then `getInsets(WindowInsets.Type.systemBars() | displayCutout())` from
+then `getInsets(WindowInsets.Type.systemBars())` from
 API 30 and `getSystemWindowInset*()` on API 23 to 29, inside a local
 reference frame, with any Java exception cleared. It returns false, with
 zero insets, below API 23, before the window's first layout pass (no

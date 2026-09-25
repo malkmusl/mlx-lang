@@ -86,10 +86,13 @@ class FakeJni:
                ("android/view/WindowInsets", "getSystemWindowInsetBottom", "()I"),
                ("android/view/WindowInsets", "getSystemWindowInsetLeft", "()I")}
 
-    def __init__(self, framework, stub, sdk=34, insets=(0, 0, 0, 0), fullscreen=False):
+    def __init__(self, framework, stub, sdk=34, insets=(0, 0, 0, 0), fullscreen=False, cutout=(0, 0, 0, 0)):
         self.framework = framework
         self.sdk = sdk
         self.insets = insets
+        # A display cutout's inset, only answered for displayCutout(): the
+        # app must not reserve it.
+        self.cutout = cutout
         self.fullscreen = fullscreen
         self.pending = False
         self.frames = 0
@@ -182,7 +185,7 @@ class FakeJni:
             return 0 if self.insets is None else self.new("insets")
         assert name == "getInsets" and self.sdk >= 30, name
         mask = struct.unpack("<I", process.read(arguments, 4))[0]
-        assert mask == SYSTEM_BARS | DISPLAY_CUTOUT, f"getInsets({mask}): not the system bars and cutouts"
+        assert mask == SYSTEM_BARS, f"getInsets({mask}): not just the system bars"
         return self.new("values")
 
     def CallIntMethodA(self, process, env, obj, method, arguments, *_):

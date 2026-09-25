@@ -29,9 +29,10 @@ swapchain for the new orientation.
 
 The layout follows `std.android`'s reserved-space rule
 ([android.md](../../docs/reference/android.md#reserved-space)): unless the
-app is fullscreen, the space of the status and navigation bars and display
-cutouts is reserved; only the background goes there and everything else
-starts below it. `std.android.reservedInsets` asks the Java side through
+app is fullscreen, the space of the status and navigation bars is
+reserved; only the background goes there and everything else starts below
+it. Display cutouts are not reserved (in landscape the camera sits at a
+side edge, and the content goes there). `std.android.reservedInsets` asks the Java side through
 JNI when the window is created or resized and after each layout pass
 (`onContentRectChanged`), and the result is logged (`ui: reserved for the
 system bars: top … right … bottom … left …`, or `ui: fullscreen, nothing

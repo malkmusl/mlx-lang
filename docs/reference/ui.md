@@ -11,7 +11,7 @@ one drawing helper.
 ```mlx
 const ui = @import("std.ui")
 
-// The whole surface, minus what the system covers (status bar, cutouts).
+// The whole surface, minus what the system covers (status bar, navigation bar).
 var screen = ui.screen(width, height, ui.insets(status_bar, 0, 0, 0))
 // A top bar: 48 content pixels below the status bar.
 const bar = ui.reserveTop(&screen, 48)
@@ -91,7 +91,7 @@ the `text` shader's arithmetic at full coverage, and on the GPU
 `tests/263_vulkan_text_runtime.mlx` checks the two pixel for pixel.
 
 On Android, the safe insets are the space `std.android.reservedInsets`
-reserves: the system bars and cutouts for an app that is not fullscreen,
+reserves: the status and navigation bars for an app that is not fullscreen,
 nothing for a fullscreen one (see [android.md](android.md#reserved-space)).
 Every component is laid out in `screen.free`.
 `examples/vulkan-android` lays out its frame this way: only the

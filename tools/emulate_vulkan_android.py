@@ -592,9 +592,10 @@ def check_frame(frame, time, pointer=None, pressed=False, label=True, insets=(0,
 
 
 def scenario_render(library, spirv_val):
-    # A phone in portrait: status bar at the top, gesture bar at the bottom.
+    # A phone in portrait: status bar at the top, gesture bar at the bottom,
+    # and a cutout on the left, which is not reserved.
     insets = (8, 0, 6, 0)
-    app = App(library, jni={"sdk": 34, "insets": insets})
+    app = App(library, jni={"sdk": 34, "insets": insets, "cutout": (0, 0, 0, 12)})
     vulkan = app.vulkan
     app.create()
     assert "vulkan: device ready" in app.messages(), app.messages()
@@ -701,8 +702,8 @@ def scenario_landscape(library):
         del centered[:]
         check_frame(frame, index * 2)
         assert centered == [True], "the label does not fit a 480-pixel frame"
-    # Laid out: the status bar on top, the camera cutout on the left, the
-    # gesture bar at the bottom.
+    # Laid out: the status bar on top, a three-button navigation bar on the
+    # left, the gesture area at the bottom.
     insets = (10, 0, 6, 24)
     app.jni.insets = insets
     app.callback("onContentRectChanged", app.malloc(16))
