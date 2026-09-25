@@ -10,6 +10,13 @@ surface once Mlx1 can instantiate reflection-heavy generics itself.
 Native code uses `std.os.*`; portable POSIX software uses `std.posix`; Wayland
 uses `std.wayland` plus generated protocol modules.
 
+`xml.mlx` (`std.xml`) is the allocation-free XML pull tokenizer.
+`wayland.mlx` (`std.wayland`) and `wayland/` contain the protocol parser,
+the materializer, the wire format, the Linux transport, and the client and
+server runtimes. `wayland/generated/` holds the modules materialized from
+`std/protocols/wayland` and must not be edited by hand. Both are imported by
+name and are not re-exported from `std.mlx`.
+
 `std.path`, `std.mode`, `std.parse`, `std.shell` and `std.calendar` provide
 coreutils-grade building blocks (path manipulation/canonicalization, chmod-style
 permission parsing, sized-number/duration parsing, POSIX-ish word splitting and

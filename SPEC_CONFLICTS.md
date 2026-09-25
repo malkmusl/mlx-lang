@@ -81,6 +81,29 @@ address, endpoint, TCP/UDP, resolver, or event-loop API is specified. Raw
 `std.os.linux`/`std.posix` wrappers can follow the platform ABI; a portable
 `std.net` interface requires an added normative contract.
 
+### Materialized Wayland declaration names
+
+`spec/06-wayland/wayland.xml` requires typed client/server declarations
+generated from protocol XML but does not define how XML names become Mlx
+identifiers. XML names may start with a digit (`wl_output.transform` entry
+`90`) or collide with Mlx keywords (the `wl_display.error` event). The
+materializer keeps XML spelling, prefixes a leading digit with `_`, appends
+`_` to keywords, uses PascalCase for enum and payload types, camelCase for
+request methods and `send` + PascalCase for event methods. This is a
+provisional std convention, not a normative mapping.
+
+### Wayland public runtime API shape
+
+`spec/06-wayland/wayland.xml` lists what `std.wayland.client` and
+`std.wayland.server` provide but not their signatures, the event delivery
+model, or how nullability of object and string arguments is expressed in Mlx
+types. `std.wayland` provides per-object handler functions with typed
+`decodeEvent`/`decodeRequest` unions, libwayland-style sticky request
+failures, `?*const Proxy` parameters for nullable objects, `?[]const u8` for
+nullable request strings, and `std.string.String` (null as a zero pointer)
+for decoded strings. fd arguments are duplicated when sent, so callers keep
+ownership, and received handles are owned by the handler.
+
 ### Function inline modifier strength
 
 `spec/00-language/grammar.ebnf` admits `inline` and `noinline` declaration
