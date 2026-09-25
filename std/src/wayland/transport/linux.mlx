@@ -1,0 +1,744 @@
+// std.wayland transport: native Linux backend (direct syscalls, no libc).
+//
+// Implements spec/06-wayland/transport.xml on Linux x86_64:
+//
+// - Handle: an owned file descriptor.
+// - Byte stream: AF_UNIX SOCK_STREAM sockets. Ancillary descriptors travel
+//   with SCM_RIGHTS; received descriptors are queued in arrival order and
+//   consumed by messages in order, which keeps them associated with their
+//   arguments across partial reads and writes.
+// - Buffering: every connection buffer is allocated from the caller's
+//   explicit allocator and released by `deinit`.
+// - Waiting: poll(2) for single connections and epoll(7) event loops that
+//   watch any number of connections and listeners.
+// - Shared memory: memfd_create(2) objects mapped with mmap(2) MAP_SHARED.
+//
+// Kernel ABI records (msghdr, iovec, cmsghdr, sockaddr_un, epoll_event,
+// pollfd) are assembled byte by byte in local storage so their layout never
+// depends on aggregate layout rules.
+
+const allocator_module = @import("../../../bootstrap/allocator.mlx")
+const string = @import("../../../bootstrap/string.mlx")
+const wire = @import("../wire.mlx")
+
+pub const Allocator = allocator_module.Allocator
+pub const String = string.String
+
+pub extern("syscall") fn syscall1(number: usize, a1: usize) -> isize {}
+pub extern("syscall") fn syscall2(number: usize, a1: usize, a2: usize) -> isize {}
+pub extern("syscall") fn syscall3(number: usize, a1: usize, a2: usize, a3: usize) -> isize {}
+pub extern("syscall") fn syscall4(number: usize, a1: usize, a2: usize, a3: usize, a4: usize) -> isize {}
+pub extern("syscall") fn syscall6(number: usize, a1: usize, a2: usize, a3: usize, a4: usize, a5: usize, a6: usize) -> isize {}
+
+const SYS_read: usize = 0
+const SYS_close: usize = 3
+const SYS_poll: usize = 7
+const SYS_mmap: usize = 9
+const SYS_munmap: usize = 11
+const SYS_socket: usize = 41
+const SYS_connect: usize = 42
+const SYS_sendmsg: usize = 46
+const SYS_recvmsg: usize = 47
+const SYS_bind: usize = 49
+const SYS_listen: usize = 50
+const SYS_socketpair: usize = 53
+const SYS_fcntl: usize = 72
+const SYS_flock: usize = 73
+const SYS_ftruncate: usize = 77
+const SYS_unlink: usize = 87
+const SYS_epoll_wait: usize = 232
+const SYS_epoll_ctl: usize = 233
+const SYS_openat: usize = 257
+const SYS_accept4: usize = 288
+const SYS_epoll_create1: usize = 291
+const SYS_memfd_create: usize = 319
+
+const AF_UNIX: usize = 1
+const SOCK_STREAM: usize = 1
+const SOCK_NONBLOCK: usize = 2048
+const SOCK_CLOEXEC: usize = 524288
+const SOL_SOCKET: u32 = 1
+const SCM_RIGHTS: u32 = 1
+const MSG_DONTWAIT: usize = 64
+const MSG_NOSIGNAL: usize = 16384
+const MSG_CMSG_CLOEXEC: usize = 1073741824
+const MSG_CTRUNC: u32 = 8
+const F_GETFL: usize = 3
+const F_SETFL: usize = 4
+const F_DUPFD_CLOEXEC: usize = 1030
+const O_RDWR: usize = 2
+const O_CREAT: usize = 64
+const O_NONBLOCK: usize = 2048
+const O_CLOEXEC: usize = 524288
+const AT_FDCWD: usize = 18446744073709551516
+const LOCK_EX: usize = 2
+const LOCK_NB: usize = 4
+const PROT_READ: usize = 1
+const PROT_WRITE: usize = 2
+const MAP_SHARED: usize = 1
+const MFD_CLOEXEC: usize = 1
+const MFD_ALLOW_SEALING: usize = 2
+const EPOLL_CLOEXEC: usize = 524288
+const EPOLL_CTL_ADD: usize = 1
+const EPOLL_CTL_DEL: usize = 2
+const EPOLL_CTL_MOD: usize = 3
+
+pub const EPOLLIN: u32 = 1
+pub const EPOLLOUT: u32 = 4
+pub const EPOLLERR: u32 = 8
+pub const EPOLLHUP: u32 = 16
+
+pub const EAGAIN: isize = -11
+pub const EINTR: isize = -4
+pub const ENOMEM: isize = -12
+pub const EPIPE: isize = -32
+pub const EMSGSIZE: isize = -90
+pub const ECONNRESET: isize = -104
+pub const ENAMETOOLONG: isize = -36
+pub const EPROTO: isize = -71
+
+pub const INPUT_CAPACITY: usize = 65536
+pub const OUTPUT_CAPACITY: usize = 65536
+pub const HANDLE_CAPACITY: usize = 1024
+pub const MAX_EVENTS: usize = 32
+const MAX_PATH: usize = 107
+
+// Opaque transferable handle. On Linux it wraps an owned file descriptor.
+pub const Handle = struct {
+    descriptor: isize
+
+    pub fn fromDescriptor(descriptor: isize) -> Self { return Self.{ .descriptor = descriptor } }
+    pub fn invalid() -> Self { return Self.{ .descriptor = -1 } }
+    pub fn isValid(self: Self) -> bool { return self.descriptor >= 0 }
+    pub fn raw(self: Self) -> isize { return self.descriptor }
+
+    pub fn close(self: Self) -> void {
+        if self.descriptor >= 0 { const ignored = syscall1(SYS_close, @bitCast(usize, self.descriptor)) }
+    }
+
+    // Duplicates the handle (close-on-exec). The copy is owned separately.
+    pub fn duplicate(self: Self) -> Self {
+        const result = syscall3(SYS_fcntl, @bitCast(usize, self.descriptor), F_DUPFD_CLOEXEC, 0)
+        return Self.{ .descriptor = if result < 0 { -1 } else { result } }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Byte helpers for kernel records
+
+fn store64(bytes: [*]u8, offset: usize, value: usize) -> void {
+    var index: usize = 0
+    while index < 8 {
+        bytes[offset + index] = @intCast(u8, (value >> (index * 8)) & 255)
+        index += 1
+    }
+}
+
+fn load64(bytes: [*]const u8, offset: usize) -> usize {
+    var value: usize = 0
+    var index: usize = 0
+    while index < 8 {
+        value = value | (@intCast(usize, bytes[offset + index]) << (index * 8))
+        index += 1
+    }
+    return value
+}
+
+fn store16(bytes: [*]u8, offset: usize, value: u16) -> void {
+    bytes[offset] = @intCast(u8, value & 255)
+    bytes[offset + 1] = @intCast(u8, (value >> 8) & 255)
+}
+
+fn copyBytes(destination: [*]u8, source: [*]const u8, length: usize) -> void {
+    var index: usize = 0
+    while index < length {
+        destination[index] = source[index]
+        index += 1
+    }
+}
+
+fn closeDescriptor(descriptor: isize) -> void {
+    if descriptor >= 0 { const ignored = syscall1(SYS_close, @bitCast(usize, descriptor)) }
+}
+
+pub fn close(descriptor: isize) -> void { closeDescriptor(descriptor) }
+
+pub fn setNonBlocking(descriptor: isize) -> bool {
+    const flags = syscall3(SYS_fcntl, @bitCast(usize, descriptor), F_GETFL, 0)
+    if flags < 0 { return false }
+    return syscall3(SYS_fcntl, @bitCast(usize, descriptor), F_SETFL, @bitCast(usize, flags) | O_NONBLOCK) >= 0
+}
+
+// ---------------------------------------------------------------------------
+// Sockets
+
+// Builds a sockaddr_un for `path`; returns the address length or 0 when the
+// path does not fit.
+fn socketAddress(address: [*]u8, path: [*]const u8, path_length: usize) -> usize {
+    if path_length == 0 || path_length > MAX_PATH { return 0 }
+    var index: usize = 0
+    while index < 110 {
+        address[index] = 0
+        index += 1
+    }
+    store16(address, 0, 1)
+    unsafe { copyBytes(@ptrFromInt([*]u8, @intFromPtr(address) + 2), path, path_length) }
+    return 2 + path_length + 1
+}
+
+// Connects a non-blocking, close-on-exec stream socket to `path`. Returns
+// the descriptor or a negative errno.
+pub fn connectPath(path: [*]const u8, path_length: usize) -> isize {
+    var address: [112]u8 = undefined
+    var length: usize = 0
+    unsafe { length = socketAddress(@ptrCast([*]u8, &address), path, path_length) }
+    if length == 0 { return ENAMETOOLONG }
+    const descriptor = syscall3(SYS_socket, AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0)
+    if descriptor < 0 { return descriptor }
+    const result = syscall3(SYS_connect, @bitCast(usize, descriptor), @intFromPtr(&address), length)
+    if result < 0 {
+        closeDescriptor(descriptor)
+        return result
+    }
+    if !setNonBlocking(descriptor) {
+        closeDescriptor(descriptor)
+        return EPROTO
+    }
+    return descriptor
+}
+
+// Binds and listens on `path`. Returns the listening descriptor or a
+// negative errno.
+pub fn listenPath(path: [*]const u8, path_length: usize) -> isize {
+    var address: [112]u8 = undefined
+    var length: usize = 0
+    unsafe { length = socketAddress(@ptrCast([*]u8, &address), path, path_length) }
+    if length == 0 { return ENAMETOOLONG }
+    const descriptor = syscall3(SYS_socket, AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0)
+    if descriptor < 0 { return descriptor }
+    const bound = syscall3(SYS_bind, @bitCast(usize, descriptor), @intFromPtr(&address), length)
+    if bound < 0 {
+        closeDescriptor(descriptor)
+        return bound
+    }
+    const listening = syscall2(SYS_listen, @bitCast(usize, descriptor), 128)
+    if listening < 0 {
+        closeDescriptor(descriptor)
+        return listening
+    }
+    return descriptor
+}
+
+// Accepts one pending connection as a non-blocking, close-on-exec socket.
+pub fn accept(listener: isize) -> isize {
+    return syscall4(SYS_accept4, @bitCast(usize, listener), 0, 0, SOCK_CLOEXEC | SOCK_NONBLOCK)
+}
+
+// Creates a connected pair of non-blocking stream sockets.
+pub fn socketPair(first: *isize, second: *isize) -> bool {
+    var descriptors: [2]i32 = [2]i32{ -1, -1 }
+    const result = syscall4(SYS_socketpair, AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0, @intFromPtr(&descriptors))
+    if result < 0 { return false }
+    first.* = @intCast(isize, descriptors[0])
+    second.* = @intCast(isize, descriptors[1])
+    return true
+}
+
+// Opens and exclusively locks `path` (the "<socket>.lock" convention shared
+// with libwayland). Returns the lock descriptor or a negative errno.
+pub fn lockPath(path: [*]const u8) -> isize {
+    const descriptor = syscall4(SYS_openat, AT_FDCWD, @intFromPtr(path), O_RDWR | O_CREAT | O_CLOEXEC, 432)
+    if descriptor < 0 { return descriptor }
+    const locked = syscall2(SYS_flock, @bitCast(usize, descriptor), LOCK_EX | LOCK_NB)
+    if locked < 0 {
+        closeDescriptor(descriptor)
+        return locked
+    }
+    return descriptor
+}
+
+pub fn unlinkPath(path: [*]const u8) -> void {
+    const ignored = syscall1(SYS_unlink, @intFromPtr(path))
+}
+
+// Waits until `descriptor` is readable (or writable). Returns 1 when ready,
+// 0 on timeout, or a negative errno. A negative timeout waits forever.
+pub fn wait(descriptor: isize, writable: bool, timeout_milliseconds: isize) -> isize {
+    var record: [8]u8 = [8]u8{ 0, 0, 0, 0, 0, 0, 0, 0 }
+    unsafe {
+        const bytes = @ptrCast([*]u8, &record)
+        wire.store32(bytes, 0, @intCast(u32, descriptor))
+        store16(bytes, 4, if writable { 4 } else { 1 })
+    }
+    return syscall3(SYS_poll, @intFromPtr(&record), 1, @bitCast(usize, timeout_milliseconds))
+}
+
+// ---------------------------------------------------------------------------
+// Connections
+
+pub const Connection = struct {
+    descriptor: isize
+    allocator: Allocator
+    input: [*]u8
+    inputStart: usize
+    inputEnd: usize
+    inputHandles: [*]isize
+    inputHandleStart: usize
+    inputHandleEnd: usize
+    output: [*]u8
+    outputLength: usize
+    outputHandles: [*]isize
+    outputHandleCount: usize
+    outputHandlesSent: bool
+    closed: bool
+}
+
+// Takes ownership of `descriptor`. Returns false (leaving the descriptor
+// open) when the buffers cannot be allocated.
+pub fn init(connection: *Connection, allocator: Allocator, descriptor: isize) -> bool {
+    const input = allocator.alloc(INPUT_CAPACITY, 16)
+    if input == null { return false }
+    const output = allocator.alloc(OUTPUT_CAPACITY, 16)
+    if output == null {
+        allocator.free(input.?, INPUT_CAPACITY, 16)
+        return false
+    }
+    const input_handles = allocator.alloc(HANDLE_CAPACITY * 8, 8)
+    if input_handles == null {
+        allocator.free(input.?, INPUT_CAPACITY, 16)
+        allocator.free(output.?, OUTPUT_CAPACITY, 16)
+        return false
+    }
+    const output_handles = allocator.alloc(wire.MAX_HANDLES * 8, 8)
+    if output_handles == null {
+        allocator.free(input.?, INPUT_CAPACITY, 16)
+        allocator.free(output.?, OUTPUT_CAPACITY, 16)
+        allocator.free(input_handles.?, HANDLE_CAPACITY * 8, 8)
+        return false
+    }
+    connection.*.descriptor = descriptor
+    connection.*.allocator = allocator
+    connection.*.input = input.?
+    connection.*.inputStart = 0
+    connection.*.inputEnd = 0
+    unsafe { connection.*.inputHandles = @ptrCast([*]isize, input_handles.?) }
+    connection.*.inputHandleStart = 0
+    connection.*.inputHandleEnd = 0
+    connection.*.output = output.?
+    connection.*.outputLength = 0
+    unsafe { connection.*.outputHandles = @ptrCast([*]isize, output_handles.?) }
+    connection.*.outputHandleCount = 0
+    connection.*.outputHandlesSent = false
+    connection.*.closed = false
+    return true
+}
+
+// Closes the socket and every handle still owned by the connection, then
+// releases the buffers.
+pub fn deinit(connection: *Connection) -> void {
+    closeDescriptor(connection.*.descriptor)
+    connection.*.descriptor = -1
+    var index = connection.*.inputHandleStart
+    while index < connection.*.inputHandleEnd {
+        closeDescriptor(connection.*.inputHandles[index])
+        index += 1
+    }
+    if !connection.*.outputHandlesSent {
+        index = 0
+        while index < connection.*.outputHandleCount {
+            closeDescriptor(connection.*.outputHandles[index])
+            index += 1
+        }
+    }
+    const allocator = connection.*.allocator
+    allocator.free(connection.*.input, INPUT_CAPACITY, 16)
+    allocator.free(connection.*.output, OUTPUT_CAPACITY, 16)
+    unsafe {
+        allocator.free(@ptrCast([*]u8, connection.*.inputHandles), HANDLE_CAPACITY * 8, 8)
+        allocator.free(@ptrCast([*]u8, connection.*.outputHandles), wire.MAX_HANDLES * 8, 8)
+    }
+    connection.*.closed = true
+}
+
+pub fn pendingOutput(connection: *const Connection) -> usize { return connection.*.outputLength }
+
+// Sends buffered bytes. Handles are attached to the first sendmsg that
+// carries any of the buffered bytes, so they never arrive after the message
+// that consumes them. Returns 0 once everything was sent, EAGAIN when the
+// socket is full, or another negative errno.
+pub fn flush(connection: *Connection) -> isize {
+    while connection.*.outputLength > 0 {
+        var header: [56]u8 = undefined
+        var vector: [16]u8 = undefined
+        var control: [128]u8 = undefined
+        var header_bytes: [*]u8 = undefined
+        var vector_bytes: [*]u8 = undefined
+        var control_bytes: [*]u8 = undefined
+        unsafe {
+            header_bytes = @ptrCast([*]u8, &header)
+            vector_bytes = @ptrCast([*]u8, &vector)
+            control_bytes = @ptrCast([*]u8, &control)
+        }
+        var index: usize = 0
+        while index < 56 {
+            header_bytes[index] = 0
+            index += 1
+        }
+        store64(vector_bytes, 0, @intFromPtr(connection.*.output))
+        store64(vector_bytes, 8, connection.*.outputLength)
+        store64(header_bytes, 16, @intFromPtr(vector_bytes))
+        store64(header_bytes, 24, 1)
+        const handles = if connection.*.outputHandlesSent { 0 } else { connection.*.outputHandleCount }
+        if handles > 0 {
+            index = 0
+            while index < 128 {
+                control_bytes[index] = 0
+                index += 1
+            }
+            store64(control_bytes, 0, 16 + handles * 4)
+            wire.store32(control_bytes, 8, SOL_SOCKET)
+            wire.store32(control_bytes, 12, SCM_RIGHTS)
+            index = 0
+            while index < handles {
+                wire.store32(control_bytes, 16 + index * 4, @intCast(u32, connection.*.outputHandles[index]))
+                index += 1
+            }
+            store64(header_bytes, 32, @intFromPtr(control_bytes))
+            store64(header_bytes, 40, 16 + ((handles * 4 + 7) / 8) * 8)
+        }
+        const sent = syscall3(SYS_sendmsg, @bitCast(usize, connection.*.descriptor), @intFromPtr(header_bytes), MSG_DONTWAIT | MSG_NOSIGNAL)
+        if sent == EINTR { continue }
+        if sent < 0 { return sent }
+        if handles > 0 {
+            // The kernel duplicated the descriptors into the message; the
+            // connection's copies are released now.
+            index = 0
+            while index < handles {
+                closeDescriptor(connection.*.outputHandles[index])
+                index += 1
+            }
+            connection.*.outputHandlesSent = true
+        }
+        const amount = @bitCast(usize, sent)
+        const remaining = connection.*.outputLength - amount
+        index = 0
+        while index < remaining {
+            connection.*.output[index] = connection.*.output[amount + index]
+            index += 1
+        }
+        connection.*.outputLength = remaining
+        if remaining == 0 {
+            connection.*.outputHandleCount = 0
+            connection.*.outputHandlesSent = false
+        }
+    }
+    return 0
+}
+
+// Appends one finished message to the output buffer, flushing first when
+// the bytes or handles would not fit. Ownership of the message's handles
+// moves to the connection. Returns 0, EAGAIN (buffer full and the peer is
+// not reading), or another negative errno.
+pub fn queue(connection: *Connection, writer: *const wire.Writer) -> isize {
+    const needs_room = connection.*.outputLength + writer.*.length > OUTPUT_CAPACITY
+    const needs_handles = writer.*.handleCount > 0 && (connection.*.outputHandlesSent || connection.*.outputHandleCount + writer.*.handleCount > wire.MAX_HANDLES)
+    if needs_room || needs_handles {
+        const flushed = flush(connection)
+        if flushed < 0 && flushed != EAGAIN { return flushed }
+        if connection.*.outputLength + writer.*.length > OUTPUT_CAPACITY { return EAGAIN }
+        if writer.*.handleCount > 0 && connection.*.outputLength > 0 { return EAGAIN }
+    }
+    unsafe { wire.copyBytes(writer, @ptrFromInt([*]u8, @intFromPtr(connection.*.output) + connection.*.outputLength)) }
+    connection.*.outputLength += writer.*.length
+    var index: usize = 0
+    while index < writer.*.handleCount {
+        connection.*.outputHandles[connection.*.outputHandleCount] = wire.handleAt(writer, index)
+        connection.*.outputHandleCount += 1
+        index += 1
+    }
+    return 0
+}
+
+fn compactInput(connection: *Connection) -> void {
+    if connection.*.inputStart > 0 {
+        const length = connection.*.inputEnd - connection.*.inputStart
+        var index: usize = 0
+        while index < length {
+            connection.*.input[index] = connection.*.input[connection.*.inputStart + index]
+            index += 1
+        }
+        connection.*.inputStart = 0
+        connection.*.inputEnd = length
+    }
+    if connection.*.inputHandleStart > 0 {
+        const count = connection.*.inputHandleEnd - connection.*.inputHandleStart
+        var index: usize = 0
+        while index < count {
+            connection.*.inputHandles[index] = connection.*.inputHandles[connection.*.inputHandleStart + index]
+            index += 1
+        }
+        connection.*.inputHandleStart = 0
+        connection.*.inputHandleEnd = count
+    }
+}
+
+// Reads whatever the socket has, queueing received handles in order.
+// Returns the number of bytes read, 0 at end of stream, EAGAIN when nothing
+// is available, or another negative errno.
+pub fn receive(connection: *Connection) -> isize {
+    compactInput(connection)
+    const room = INPUT_CAPACITY - connection.*.inputEnd
+    if room == 0 { return EMSGSIZE }
+    if connection.*.inputHandleEnd + wire.MAX_HANDLES > HANDLE_CAPACITY { return EMSGSIZE }
+    var header: [56]u8 = undefined
+    var vector: [16]u8 = undefined
+    var control: [128]u8 = undefined
+    var header_bytes: [*]u8 = undefined
+    var vector_bytes: [*]u8 = undefined
+    var control_bytes: [*]u8 = undefined
+    unsafe {
+        header_bytes = @ptrCast([*]u8, &header)
+        vector_bytes = @ptrCast([*]u8, &vector)
+        control_bytes = @ptrCast([*]u8, &control)
+    }
+    var index: usize = 0
+    while index < 56 {
+        header_bytes[index] = 0
+        index += 1
+    }
+    store64(vector_bytes, 0, @intFromPtr(connection.*.input) + connection.*.inputEnd)
+    store64(vector_bytes, 8, room)
+    store64(header_bytes, 16, @intFromPtr(vector_bytes))
+    store64(header_bytes, 24, 1)
+    store64(header_bytes, 32, @intFromPtr(control_bytes))
+    store64(header_bytes, 40, 128)
+    var received: isize = EINTR
+    while received == EINTR {
+        received = syscall3(SYS_recvmsg, @bitCast(usize, connection.*.descriptor), @intFromPtr(header_bytes), MSG_DONTWAIT | MSG_CMSG_CLOEXEC)
+    }
+    if received < 0 { return received }
+    const control_length = load64(header_bytes, 40)
+    var offset: usize = 0
+    while offset + 16 <= control_length {
+        const record_length = load64(control_bytes, offset)
+        if record_length < 16 || offset + record_length > control_length { break }
+        if wire.load32(control_bytes, offset + 8) == SOL_SOCKET && wire.load32(control_bytes, offset + 12) == SCM_RIGHTS {
+            const count = (record_length - 16) / 4
+            index = 0
+            while index < count {
+                const descriptor = @intCast(isize, wire.load32(control_bytes, offset + 16 + index * 4))
+                if connection.*.inputHandleEnd < HANDLE_CAPACITY {
+                    connection.*.inputHandles[connection.*.inputHandleEnd] = descriptor
+                    connection.*.inputHandleEnd += 1
+                } else {
+                    closeDescriptor(descriptor)
+                }
+                index += 1
+            }
+        }
+        offset += ((record_length + 7) / 8) * 8
+    }
+    if (wire.load32(header_bytes, 48) & MSG_CTRUNC) != 0 { return EPROTO }
+    connection.*.inputEnd += @bitCast(usize, received)
+    return received
+}
+
+pub fn bufferedInput(connection: *const Connection) -> usize {
+    return connection.*.inputEnd - connection.*.inputStart
+}
+
+pub fn bufferedHandles(connection: *const Connection) -> usize {
+    return connection.*.inputHandleEnd - connection.*.inputHandleStart
+}
+
+// Start of the next buffered message (valid when at least HEADER_SIZE bytes
+// are buffered).
+pub fn inputPointer(connection: *const Connection) -> [*]const u8 {
+    unsafe { return @ptrFromInt([*]const u8, @intFromPtr(connection.*.input) + connection.*.inputStart) }
+}
+
+pub fn handlePointer(connection: *const Connection) -> [*]const isize {
+    unsafe { return @ptrFromInt([*]const isize, @intFromPtr(connection.*.inputHandles) + connection.*.inputHandleStart * 8) }
+}
+
+// Drops a processed message and hands its `handles` leading queued handles
+// to the consumer (who now owns them).
+pub fn consume(connection: *Connection, size: usize, handles: usize) -> void {
+    connection.*.inputStart += size
+    connection.*.inputHandleStart += handles
+    if connection.*.inputStart == connection.*.inputEnd {
+        connection.*.inputStart = 0
+        connection.*.inputEnd = 0
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Event loop (epoll)
+
+// Received readiness records; `token` is the caller's registration value.
+pub const Events = struct {
+    records: [384]u8
+    count: usize
+}
+
+pub fn createEventLoop() -> isize {
+    return syscall1(SYS_epoll_create1, EPOLL_CLOEXEC)
+}
+
+fn control(event_loop: isize, operation: usize, descriptor: isize, flags: u32, token: usize) -> bool {
+    var record: [12]u8 = undefined
+    unsafe {
+        const bytes = @ptrCast([*]u8, &record)
+        wire.store32(bytes, 0, flags)
+        wire.store32(bytes, 4, @intCast(u32, token & 4294967295))
+        wire.store32(bytes, 8, @intCast(u32, token >> 32))
+    }
+    return syscall4(SYS_epoll_ctl, @bitCast(usize, event_loop), operation, @bitCast(usize, descriptor), @intFromPtr(&record)) == 0
+}
+
+pub fn watch(event_loop: isize, descriptor: isize, token: usize, writable: bool) -> bool {
+    return control(event_loop, EPOLL_CTL_ADD, descriptor, if writable { EPOLLIN | EPOLLOUT } else { EPOLLIN }, token)
+}
+
+pub fn rewatch(event_loop: isize, descriptor: isize, token: usize, writable: bool) -> bool {
+    return control(event_loop, EPOLL_CTL_MOD, descriptor, if writable { EPOLLIN | EPOLLOUT } else { EPOLLIN }, token)
+}
+
+pub fn unwatch(event_loop: isize, descriptor: isize) -> bool {
+    return control(event_loop, EPOLL_CTL_DEL, descriptor, 0, 0)
+}
+
+// Waits for readiness. Returns the number of records, 0 on timeout, or a
+// negative errno. A negative timeout waits forever.
+pub fn waitEvents(event_loop: isize, events: *Events, timeout_milliseconds: isize) -> isize {
+    var result: isize = EINTR
+    while result == EINTR {
+        unsafe { result = syscall4(SYS_epoll_wait, @bitCast(usize, event_loop), @intFromPtr(events), MAX_EVENTS, @bitCast(usize, timeout_milliseconds)) }
+    }
+    events.*.count = if result > 0 { @bitCast(usize, result) } else { 0 }
+    return result
+}
+
+pub fn eventFlags(events: *const Events, index: usize) -> u32 {
+    const offset = index * 12
+    return @intCast(u32, events.*.records[offset]) | (@intCast(u32, events.*.records[offset + 1]) << 8) | (@intCast(u32, events.*.records[offset + 2]) << 16) | (@intCast(u32, events.*.records[offset + 3]) << 24)
+}
+
+pub fn eventToken(events: *const Events, index: usize) -> usize {
+    const offset = index * 12 + 4
+    var value: usize = 0
+    var byte: usize = 0
+    while byte < 8 {
+        value = value | (@intCast(usize, events.*.records[offset + byte]) << (byte * 8))
+        byte += 1
+    }
+    return value
+}
+
+// ---------------------------------------------------------------------------
+// Shared memory
+
+// Creates an anonymous shared-memory object of `size` bytes. Returns the
+// descriptor or a negative errno.
+pub fn createSharedMemory(size: usize) -> isize {
+    var name: usize = 0
+    unsafe { name = @intFromPtr(@ptrCast([*]const u8, "mlx-wayland-shm")) }
+    const descriptor = syscall2(SYS_memfd_create, name, MFD_CLOEXEC | MFD_ALLOW_SEALING)
+    if descriptor < 0 { return descriptor }
+    const truncated = syscall2(SYS_ftruncate, @bitCast(usize, descriptor), size)
+    if truncated < 0 {
+        closeDescriptor(descriptor)
+        return truncated
+    }
+    return descriptor
+}
+
+// Maps `size` bytes of a shared-memory descriptor. Returns the address, or
+// 0 on failure.
+pub fn mapSharedMemory(descriptor: isize, size: usize, writable: bool) -> usize {
+    const protection = if writable { PROT_READ | PROT_WRITE } else { PROT_READ }
+    const result = syscall6(SYS_mmap, 0, size, protection, MAP_SHARED, @bitCast(usize, descriptor), 0)
+    if result < 0 && result > -4096 { return 0 }
+    return @bitCast(usize, result)
+}
+
+pub fn unmapSharedMemory(address: usize, size: usize) -> void {
+    const ignored = syscall2(SYS_munmap, address, size)
+}
+
+// ---------------------------------------------------------------------------
+// Environment
+
+// A snapshot of the process environment read from /proc/self/environ.
+pub const Environment = struct {
+    bytes: [*]u8
+    length: usize
+    capacity: usize
+    allocator: Allocator
+}
+
+pub fn loadEnvironment(environment: *Environment, allocator: Allocator) -> bool {
+    var path: usize = 0
+    unsafe { path = @intFromPtr(@ptrCast([*]const u8, "/proc/self/environ")) }
+    const descriptor = syscall4(SYS_openat, AT_FDCWD, path, O_CLOEXEC, 0)
+    if descriptor < 0 { return false }
+    var capacity: usize = 16384
+    var memory = allocator.alloc(capacity, 1)
+    if memory == null {
+        closeDescriptor(descriptor)
+        return false
+    }
+    var bytes = memory.?
+    var length: usize = 0
+    while true {
+        if length == capacity {
+            const grown = allocator.resize(bytes, capacity, capacity * 2, 1)
+            if grown == null {
+                allocator.free(bytes, capacity, 1)
+                closeDescriptor(descriptor)
+                return false
+            }
+            bytes = grown.?
+            capacity *= 2
+        }
+        const amount = syscall3(SYS_read, @bitCast(usize, descriptor), @intFromPtr(bytes) + length, capacity - length)
+        if amount == EINTR { continue }
+        if amount <= 0 { break }
+        length += @bitCast(usize, amount)
+    }
+    closeDescriptor(descriptor)
+    environment.*.bytes = bytes
+    environment.*.length = length
+    environment.*.capacity = capacity
+    environment.*.allocator = allocator
+    return true
+}
+
+// Looks up `name`; the result borrows the snapshot. A missing variable is
+// returned with a zero pointer (see wire.isNull).
+pub fn lookupEnvironment(environment: *const Environment, name: []const u8) -> String {
+    var name_length: usize = 0
+    for byte in name { name_length += 1 }
+    var start: usize = 0
+    while start < environment.*.length {
+        var end = start
+        while end < environment.*.length && environment.*.bytes[end] != 0 { end += 1 }
+        if end - start > name_length && environment.*.bytes[start + name_length] == 61 {
+            var matches = true
+            var index: usize = 0
+            for byte in name {
+                if environment.*.bytes[start + index] != byte { matches = false }
+                index += 1
+            }
+            if matches {
+                unsafe { return string.fromParts(@ptrFromInt([*]const u8, @intFromPtr(environment.*.bytes) + start + name_length + 1), end - start - name_length - 1) }
+            }
+        }
+        start = end + 1
+    }
+    return wire.nullString()
+}
+
+pub fn freeEnvironment(environment: *Environment) -> void {
+    environment.*.allocator.free(environment.*.bytes, environment.*.capacity, 1)
+}
