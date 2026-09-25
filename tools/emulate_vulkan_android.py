@@ -457,6 +457,10 @@ def scenario_render(library, spirv_val):
     vulkan = app.vulkan
     app.create()
     assert "vulkan: device ready" in app.messages(), app.messages()
+    # Each setup step is logged, so a device that crashes shows where.
+    for step in ("vulkan: onCreate", "vkCreateInstance", "vkCreateDevice", "vkCreateComputePipelines",
+                 "vulkan: device Mock Android GPU, Vulkan 1.1.0"):
+        assert step in app.messages(), (step, app.messages())
     assert vulkan.instance_extensions == ["VK_KHR_surface", "VK_KHR_android_surface"], vulkan.instance_extensions
     assert vulkan.device_extensions == ["VK_KHR_swapchain"], vulkan.device_extensions
     assert vulkan.push_size == 24, vulkan.push_size
@@ -470,11 +474,13 @@ def scenario_render(library, spirv_val):
     app.show_window()
     app.attach_input()
     assert "vulkan: swapchain created" in app.messages()
+    logged = len(app.messages())
     assert len(vulkan.frames) == 1, "no frame on window creation"
     check_frame(vulkan.frames[0], 0)
     # The timer presents a frame every 16.7 ms; time advances by 2 a frame.
     app.advance(51 * MS)
     assert len(vulkan.frames) == 4, len(vulkan.frames)
+    assert len(app.messages()) == logged, "steps are still logged after the first frame"
     for index, frame in enumerate(vulkan.frames):
         check_frame(frame, index * 2)
     # Touch: the ring follows the finger, white while down, amber after.

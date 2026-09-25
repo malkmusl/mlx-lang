@@ -22,7 +22,7 @@ import sys
 import time
 
 from unicorn import (Uc, UcError, UC_ARCH_ARM64, UC_MODE_ARM, UC_HOOK_CODE,
-                     UC_HOOK_INTR, UC_PROT_ALL)
+                     UC_HOOK_INTR, UC_PROT_ALL, UC_PROT_READ, UC_PROT_WRITE, UC_PROT_EXEC)
 from unicorn.arm64_const import (UC_ARM64_REG_CPACR_EL1, UC_ARM64_REG_LR, UC_ARM64_REG_PC, UC_ARM64_REG_S0,
                                  UC_ARM64_REG_SP, UC_ARM64_REG_X0,
                                  UC_ARM64_REG_X8)
@@ -621,14 +621,16 @@ class SharedLibrary(Process):
         phoff = struct.unpack_from("<Q", image, 32)[0]
         phentsize, phnum = struct.unpack_from("<HH", image, 54)
         dynamic = None
+        segments = []
         for index in range(phnum):
-            p_type, _flags, offset, vaddr, _paddr, filesz, memsz, align = struct.unpack_from(
+            p_type, flags, offset, vaddr, _paddr, filesz, memsz, align = struct.unpack_from(
                 "<IIQQQQQQ", image, phoff + index * phentsize)
             if p_type == 1:
                 if align < 0x4000 or vaddr % align != offset % align:
                     raise ValueError(f"PT_LOAD {index}: alignment {align:#x} unsuitable for 16 KiB pages")
                 self._map(base + vaddr, memsz)
                 self.uc.mem_write(base + vaddr, image[offset:offset + filesz])
+                segments.append((base + vaddr, memsz, flags))
             elif p_type == 2:
                 dynamic = (offset, filesz)
         tags = {}
@@ -659,6 +661,13 @@ class SharedLibrary(Process):
             self.stubs[stub] = name
             self.uc.mem_write(stub, struct.pack("<I", 0xD65F03C0))  # ret
             self.uc.mem_write(base + offset, struct.pack("<Q", stub + addend))
+        # Like Android's linker: each segment gets exactly its p_flags, so a
+        # write into the text segment (code, literals, constants) faults.
+        for address, size, flags in segments:
+            permissions = ((UC_PROT_READ if flags & 4 else 0) | (UC_PROT_WRITE if flags & 2 else 0)
+                           | (UC_PROT_EXEC if flags & 1 else 0))
+            start = address & ~(PAGE - 1)
+            self.uc.mem_protect(start, align_up(address + size, PAGE) - start, permissions)
         return 0
 
     def _setup_stack(self):

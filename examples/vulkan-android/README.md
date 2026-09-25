@@ -26,8 +26,32 @@ adb install -r vulkan.apk
 adb logcat -s mlx
 ```
 
-The log shows `vulkan: device ready`, `vulkan: swapchain created` and
-`vulkan: first frame presented`.
+Until the first frame is on screen, every step is logged (tag `mlx`), so a
+driver that fails or crashes shows where:
+
+```text
+vulkan: onCreate
+vulkan: opening libvulkan.so
+vkCreateInstance
+...
+vulkan: device Adreno (TM) 740, Vulkan 1.3.128
+vulkan: building the shader
+vkCreateShaderModule
+...
+vulkan: device ready
+vulkan: window created
+vkCreateAndroidSurfaceKHR
+...
+vulkan: swapchain created
+...
+vulkan: first frame presented
+```
+
+If the app stops, the last line names the step, and
+`adb logcat -b crash -d` holds the native crash report (signal, fault
+address and the `libmain.so` offsets of the backtrace). If not even
+`vulkan: onCreate` appears, the library did not load: `adb logcat -d` then
+shows the linker or `NativeActivity` error.
 
 ## What is verified where
 
