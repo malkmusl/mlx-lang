@@ -270,7 +270,7 @@ On top of it:
 | --- | --- |
 | `examples/vulkan-wayland-client` | A Wayland client (std.wayland) that renders with Vulkan and hands frames over zero-copy: dma-bufs through `zwp_linux_dmabuf_v1`, or rendering straight into its `wl_shm` pool (imported host memory); a copying fallback. |
 | `examples/wayland-compositor --renderer vulkan` | The nested compositor composes on the GPU: client `wl_shm` pools and linux-dmabuf buffers are imported where they are, and the output is rendered into the host window's buffer. |
-| `examples/vulkan-android` | A NativeActivity presenting through a `VK_KHR_android_surface` swapchain from the system `libvulkan.so`, with touch input moving the ring. Needs the aarch64-android target (see the README there). |
+| `examples/vulkan-android` | A NativeActivity presenting through a `VK_KHR_android_surface` swapchain from the system `libvulkan.so`, with touch input moving the ring; built with `--target=aarch64-android` and checked by `tools/emulate_vulkan_android.py`. |
 
 `tools/check_vulkan_wayland.sh` runs the client inside the compositor with
 both renderers and both client paths and compares the frames the host
@@ -314,6 +314,8 @@ current.
   exercised with `--test-memfd-dmabuf`: shared memory offered as a dma-buf,
   which Mesa's import accepts.
 - Android: `std.vulkan.loader` uses `dlopen`/`dlsym` from `libdl.so`, which
-  the aarch64-android target already links; the aarch64 backend needs the
-  same enum extension at C boundaries that x86_64 has
-  (`tests/252_negative_enum_runtime.mlx` covers the in-memory part).
+  the aarch64-android target links. Enum results such as `VkResult` are
+  sign-extended after calls through function pointers on both backends
+  (`tests/252_negative_enum_runtime.mlx` covers the in-memory part;
+  `tools/emulate_vulkan_android.py` checks `VK_ERROR_OUT_OF_DATE_KHR` on
+  aarch64).

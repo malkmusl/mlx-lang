@@ -49,9 +49,9 @@ On Linux the loader reads the installed drivers' ICD manifests, `dlopen`s a
 driver and negotiates the loader/driver interface with it directly: every
 Mesa driver in the test environment loads, and lavapipe runs transfer work
 and an Mlx-built SPIR-V compute shader. On Android the system `libvulkan.so`
-is the loader applications must use; `openSystemLoader` takes that path (the
-same code builds for Android once the aarch64-android compiler branch is
-merged). Calling C at all needed foreign functions in the compiler
+is the loader applications must use; `openSystemLoader` takes that path,
+and `examples/vulkan-android` builds into an APK with
+`--target=aarch64-android`. Calling C at all needed foreign functions in the compiler
 (`extern("c")`, `export fn`, dynamically linked executables); see
 [the ABI reference](reference/abi.md#c-functions-externc-and-export-fn).
 

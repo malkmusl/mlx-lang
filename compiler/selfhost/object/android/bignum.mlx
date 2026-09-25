@@ -1,0 +1,648 @@
+// Unsigned big integers on u64 limbs, for RSA signing and key generation.
+// Ported from experiments/android-aarch64-bluescreen/mlx/bignum.mlx (same
+// algorithms: schoolbook multiply, binary long division, square-and-
+// multiply, extended Euclid, Miller-Rabin), with the limbs in allocator
+// memory instead of a fixed array inside the struct, so values are cheap
+// to pass around and never live in large struct locals. Every left shift
+// masks off the bits it would drop first (the bootstrap compiler traps on
+// a left shift that loses set bits).
+const bytes = @import("./bytes.mlx")
+const fs = @import("../../../../std/bootstrap/fs.mlx")
+
+pub const Allocator = bytes.Allocator
+pub const ArrayList = bytes.ArrayList
+pub const Bytes = bytes.Bytes
+
+// Enough for products of two 2304-bit values: RSA-2048 needs 64 limbs for
+// products and 65 for the Montgomery R^2 setup.
+pub const LIMBS: usize = 72
+const LOW_63_BITS: u64 = 9223372036854775807
+
+pub const BigUint = struct {
+    limbs: [*]u64
+    len: usize
+}
+
+// A zero value with its own limb storage.
+pub fn create(allocator: Allocator) -> BigUint {
+    var limbs: [*]u64 = undefined
+    unsafe { limbs = @ptrCast([*]u64, allocator.alloc(LIMBS * 8, 8).?) }
+    var index: usize = 0
+    while index < LIMBS {
+        limbs[index] = 0
+        index += 1
+    }
+    return BigUint.{ .limbs = limbs, .len = 1 }
+}
+
+pub fn destroy(allocator: Allocator, x: BigUint) -> void {
+    unsafe { allocator.free(@ptrCast([*]u8, x.limbs), LIMBS * 8, 8) }
+}
+
+pub fn setZero(x: *BigUint) -> void {
+    var index: usize = 0
+    while index < LIMBS {
+        x.*.limbs[index] = 0
+        index += 1
+    }
+    x.*.len = 1
+}
+
+pub fn setU64(x: *BigUint, value: u64) -> void {
+    setZero(x)
+    x.*.limbs[0] = value
+}
+
+fn trim(x: *BigUint) -> void {
+    var n = x.*.len
+    while n > 1 && x.*.limbs[n - 1] == 0 { n -= 1 }
+    x.*.len = n
+}
+
+pub fn copyTo(destination: *BigUint, source: *BigUint) -> void {
+    var index: usize = 0
+    while index < LIMBS {
+        destination.*.limbs[index] = source.*.limbs[index]
+        index += 1
+    }
+    destination.*.len = source.*.len
+}
+
+pub fn isZero(x: *BigUint) -> bool { return x.*.len == 1 && x.*.limbs[0] == 0 }
+
+pub fn isEven(x: *BigUint) -> bool { return x.*.limbs[0] & 1 == 0 }
+
+pub fn cmp(a: *BigUint, b: *BigUint) -> i32 {
+    if a.*.len != b.*.len { return if a.*.len < b.*.len { -1 } else { 1 } }
+    var index = a.*.len
+    while index > 0 {
+        index -= 1
+        if a.*.limbs[index] != b.*.limbs[index] { return if a.*.limbs[index] < b.*.limbs[index] { -1 } else { 1 } }
+    }
+    return 0
+}
+
+// destination = a + b (destination may alias either operand).
+pub fn addTo(destination: *BigUint, a: *BigUint, b: *BigUint) -> void {
+    var carry: u64 = 0
+    var n = if a.*.len > b.*.len { a.*.len } else { b.*.len }
+    var index: usize = 0
+    while index < n {
+        const av: u64 = if index < a.*.len { a.*.limbs[index] } else { 0 }
+        const bv: u64 = if index < b.*.len { b.*.limbs[index] } else { 0 }
+        const sum1: u64 = av +% bv
+        const c1: u64 = if sum1 < av { 1 } else { 0 }
+        const sum2: u64 = sum1 +% carry
+        const c2: u64 = if sum2 < sum1 { 1 } else { 0 }
+        destination.*.limbs[index] = sum2
+        carry = c1 + c2
+        index += 1
+    }
+    if carry != 0 {
+        destination.*.limbs[n] = carry
+        n += 1
+    }
+    destination.*.len = n
+    trim(destination)
+}
+
+// destination = a - b, for a >= b (destination may alias a).
+pub fn subTo(destination: *BigUint, a: *BigUint, b: *BigUint) -> void {
+    var borrow: u64 = 0
+    const n = a.*.len
+    var index: usize = 0
+    while index < n {
+        const av: u64 = a.*.limbs[index]
+        const bv: u64 = if index < b.*.len { b.*.limbs[index] } else { 0 }
+        const diff1: u64 = av -% bv
+        const b1: u64 = if av < bv { 1 } else { 0 }
+        const diff2: u64 = diff1 -% borrow
+        const b2: u64 = if diff1 < borrow { 1 } else { 0 }
+        destination.*.limbs[index] = diff2
+        borrow = b1 + b2
+        index += 1
+    }
+    destination.*.len = n
+    trim(destination)
+}
+
+// High and low halves of the 128-bit product a * b.
+fn mul64Full(a: u64, b: u64) -> (u64, u64) {
+    const a_lo: u64 = a & 4294967295
+    const a_hi: u64 = a >> 32
+    const b_lo: u64 = b & 4294967295
+    const b_hi: u64 = b >> 32
+    const hi_hi: u64 = a_hi * b_hi
+    const hi_lo: u64 = a_hi * b_lo
+    const lo_hi: u64 = b_hi * a_lo
+    const lo_lo: u64 = a_lo * b_lo
+    const carry: u64 = ((hi_lo & 4294967295) + (lo_hi & 4294967295) + (lo_lo >> 32)) >> 32
+    const hi: u64 = hi_hi +% (hi_lo >> 32) +% (lo_hi >> 32) +% carry
+    return -> (hi, a *% b)
+}
+
+// destination = a * b through `accumulator` (so destination may alias an
+// operand). The product must fit in LIMBS limbs.
+pub fn mulTo(destination: *BigUint, a: *BigUint, b: *BigUint, accumulator: *BigUint) -> void {
+    setZero(accumulator)
+    var i: usize = 0
+    while i < a.*.len {
+        var carry: u64 = 0
+        var j: usize = 0
+        while j < b.*.len {
+            const k = i + j
+            const product = mul64Full(a.*.limbs[i], b.*.limbs[j])
+            const sum1: u64 = accumulator.*.limbs[k] +% product.1
+            const c1: u64 = if sum1 < accumulator.*.limbs[k] { 1 } else { 0 }
+            const sum2: u64 = sum1 +% carry
+            const c2: u64 = if sum2 < sum1 { 1 } else { 0 }
+            accumulator.*.limbs[k] = sum2
+            carry = product.0 +% c1 +% c2
+            j += 1
+        }
+        var k = i + b.*.len
+        while carry != 0 {
+            const sum: u64 = accumulator.*.limbs[k] +% carry
+            carry = if sum < accumulator.*.limbs[k] { 1 } else { 0 }
+            accumulator.*.limbs[k] = sum
+            k += 1
+        }
+        i += 1
+    }
+    accumulator.*.len = a.*.len + b.*.len
+    trim(accumulator)
+    copyTo(destination, accumulator)
+}
+
+pub fn shiftRight1(x: *BigUint) -> void {
+    var carry: u64 = 0
+    var index = x.*.len
+    while index > 0 {
+        index -= 1
+        const current = x.*.limbs[index]
+        x.*.limbs[index] = (current >> 1) | (carry << 63)
+        carry = current & 1
+    }
+    trim(x)
+}
+
+pub fn shiftLeft1(x: *BigUint) -> void {
+    var carry: u64 = 0
+    var index: usize = 0
+    while index < x.*.len {
+        const current = x.*.limbs[index]
+        x.*.limbs[index] = ((current & LOW_63_BITS) << 1) | carry
+        carry = current >> 63
+        index += 1
+    }
+    if carry != 0 {
+        x.*.limbs[x.*.len] = carry
+        x.*.len += 1
+    }
+    trim(x)
+}
+
+pub fn bitLength(x: *BigUint) -> usize {
+    var top = x.*.limbs[x.*.len - 1]
+    var bits: usize = 0
+    while top != 0 {
+        bits += 1
+        top = top >> 1
+    }
+    return (x.*.len - 1) * 64 + bits
+}
+
+pub fn getBit(x: *BigUint, index: usize) -> u64 {
+    const limb = index / 64
+    if limb >= x.*.len { return 0 }
+    return (x.*.limbs[limb] >> @intCast(u64, index % 64)) & 1
+}
+
+fn setBit(x: *BigUint, index: usize) -> void {
+    const limb = index / 64
+    if limb + 1 > x.*.len { x.*.len = limb + 1 }
+    x.*.limbs[limb] = x.*.limbs[limb] | (@intCast(u64, 1) << @intCast(u64, index % 64))
+}
+
+// Binary long division; quotient/remainder must not alias a or b.
+pub fn divMod(quotient: *BigUint, remainder: *BigUint, a: *BigUint, b: *BigUint) -> void {
+    setZero(quotient)
+    setZero(remainder)
+    var index = bitLength(a)
+    while index > 0 {
+        index -= 1
+        shiftLeft1(remainder)
+        if getBit(a, index) == 1 { remainder.*.limbs[0] = remainder.*.limbs[0] | 1 }
+        if cmp(remainder, b) >= 0 {
+            subTo(remainder, remainder, b)
+            setBit(quotient, index)
+        }
+    }
+}
+
+pub fn fromBytes(x: *BigUint, data: Bytes) -> void {
+    setZero(x)
+    var index: usize = 0
+    while index < data.length {
+        // x = x * 256 + byte, limb by limb.
+        var carry: u64 = @intCast(u64, data.pointer[index])
+        var limb: usize = 0
+        while limb < x.*.len {
+            const current = x.*.limbs[limb]
+            x.*.limbs[limb] = ((current & 72057594037927935) << 8) | carry
+            carry = current >> 56
+            limb += 1
+        }
+        if carry != 0 {
+            x.*.limbs[x.*.len] = carry
+            x.*.len += 1
+        }
+        trim(x)
+        index += 1
+    }
+}
+
+fn byteAt(x: *BigUint, bit_offset: usize) -> u64 {
+    const limb = bit_offset / 64
+    if limb >= x.*.len { return 0 }
+    return (x.*.limbs[limb] >> @intCast(u64, bit_offset % 64)) & 255
+}
+
+// Big-endian bytes without leading zeros (one zero byte for zero).
+pub fn toBytesMinimal(allocator: Allocator, x: *BigUint) -> ArrayList {
+    if isZero(x) { return bytes.zeroed(allocator, 1) }
+    return toBytesPadded(allocator, x, (bitLength(x) + 7) / 8)
+}
+
+// Big-endian bytes left-padded with zeros to `total` bytes.
+pub fn toBytesPadded(allocator: Allocator, x: *BigUint, total: usize) -> ArrayList {
+    const out = bytes.zeroed(allocator, total)
+    var index: usize = 0
+    while index < total {
+        bytes.setU8(out, index, @intCast(u32, byteAt(x, (total - 1 - index) * 8)))
+        index += 1
+    }
+    return out
+}
+
+// result = base ^ exponent mod modulus (left-to-right square and multiply).
+// Odd moduli (every RSA modulus and prime candidate) use Montgomery
+// multiplication, which reduces with word operations instead of the
+// bit-serial divMod; even moduli fall back to multiply-then-divide.
+pub fn modPow(allocator: Allocator, result: *BigUint, base: *BigUint, exponent: *BigUint, modulus: *BigUint) -> void {
+    if !isEven(modulus) && modulus.*.len * 2 + 2 <= LIMBS {
+        montgomeryPow(allocator, result, base, exponent, modulus)
+        return
+    }
+    var b = create(allocator)
+    var e = create(allocator)
+    var product = create(allocator)
+    var quotient = create(allocator)
+    var accumulator = create(allocator)
+    divMod(&quotient, &b, base, modulus)
+    copyTo(&e, exponent)
+    setU64(result, 1)
+    while !isZero(&e) {
+        if !isEven(&e) {
+            mulTo(&product, result, &b, &accumulator)
+            divMod(&quotient, result, &product, modulus)
+        }
+        mulTo(&product, &b, &b, &accumulator)
+        divMod(&quotient, &b, &product, modulus)
+        shiftRight1(&e)
+    }
+    destroy(allocator, b)
+    destroy(allocator, e)
+    destroy(allocator, product)
+    destroy(allocator, quotient)
+    destroy(allocator, accumulator)
+}
+
+// -n^-1 mod 2^64 for odd n (Newton iteration, doubling correct bits).
+fn negativeInverse64(n: u64) -> u64 {
+    var x: u64 = n // correct to 3 bits: n * n == 1 mod 8
+    var round: usize = 0
+    while round < 5 {
+        x = x *% (2 -% n *% x)
+        round += 1
+    }
+    return 0 -% x
+}
+
+// destination = a * b * R^-1 mod n, R = 2^(64 * size) (CIOS Montgomery
+// multiplication). `t` needs size + 2 limbs of scratch; destination may
+// alias a or b. a and b must be < n.
+fn montgomeryMultiply(destination: *BigUint, a: *BigUint, b: *BigUint, n: *BigUint, n_inverse: u64, t: [*]u64) -> void {
+    const size = n.*.len
+    var index: usize = 0
+    while index < size + 2 {
+        t[index] = 0
+        index += 1
+    }
+    var i: usize = 0
+    while i < size {
+        const b_limb: u64 = if i < b.*.len { b.*.limbs[i] } else { 0 }
+        var carry: u64 = 0
+        var j: usize = 0
+        while j < size {
+            const a_limb: u64 = if j < a.*.len { a.*.limbs[j] } else { 0 }
+            const product = mul64Full(a_limb, b_limb)
+            const sum1: u64 = t[j] +% product.1
+            const c1: u64 = if sum1 < t[j] { 1 } else { 0 }
+            const sum2: u64 = sum1 +% carry
+            const c2: u64 = if sum2 < sum1 { 1 } else { 0 }
+            t[j] = sum2
+            carry = product.0 +% c1 +% c2
+            j += 1
+        }
+        const top: u64 = t[size] +% carry
+        t[size + 1] = if top < carry { 1 } else { 0 }
+        t[size] = top
+        const m: u64 = t[0] *% n_inverse
+        const first = mul64Full(m, n.*.limbs[0])
+        const low: u64 = t[0] +% first.1
+        carry = first.0 +% (if low < t[0] { 1 } else { 0 })
+        j = 1
+        while j < size {
+            const product = mul64Full(m, n.*.limbs[j])
+            const sum1: u64 = t[j] +% product.1
+            const c1: u64 = if sum1 < t[j] { 1 } else { 0 }
+            const sum2: u64 = sum1 +% carry
+            const c2: u64 = if sum2 < sum1 { 1 } else { 0 }
+            t[j - 1] = sum2
+            carry = product.0 +% c1 +% c2
+            j += 1
+        }
+        const last: u64 = t[size] +% carry
+        const last_carry: u64 = if last < carry { 1 } else { 0 }
+        t[size - 1] = last
+        t[size] = t[size + 1] +% last_carry
+        i += 1
+    }
+    // The result t[0..size] (+ t[size] * R) is below 2n: subtract n once if
+    // it is not below n.
+    setZero(destination)
+    index = 0
+    while index < size {
+        destination.*.limbs[index] = t[index]
+        index += 1
+    }
+    destination.*.len = size
+    var reduce = t[size] != 0
+    if !reduce {
+        trim(destination)
+        reduce = cmp(destination, n) >= 0
+    }
+    if reduce {
+        var borrow: u64 = 0
+        index = 0
+        while index < size {
+            const av: u64 = t[index]
+            const bv: u64 = n.*.limbs[index]
+            const diff1: u64 = av -% bv
+            const b1: u64 = if av < bv { 1 } else { 0 }
+            const diff2: u64 = diff1 -% borrow
+            const b2: u64 = if diff1 < borrow { 1 } else { 0 }
+            destination.*.limbs[index] = diff2
+            borrow = b1 + b2
+            index += 1
+        }
+        destination.*.len = size
+    }
+    trim(destination)
+}
+
+fn montgomeryPow(allocator: Allocator, result: *BigUint, base: *BigUint, exponent: *BigUint, n: *BigUint) -> void {
+    const size = n.*.len
+    const n_inverse = negativeInverse64(n.*.limbs[0])
+    var t: [*]u64 = undefined
+    unsafe { t = @ptrCast([*]u64, allocator.alloc((size + 2) * 8, 8).?) }
+    var quotient = create(allocator)
+    var r_squared = create(allocator)
+    var power = create(allocator)
+    var a = create(allocator)
+    var x = create(allocator)
+    var one = create(allocator)
+    // R^2 mod n, with R = 2^(64 * size).
+    setZero(&power)
+    power.limbs[2 * size] = 1
+    power.len = 2 * size + 1
+    divMod(&quotient, &r_squared, &power, n)
+    // a = base * R mod n; x = R mod n (Montgomery form of 1).
+    divMod(&quotient, &power, base, n)
+    montgomeryMultiply(&a, &power, &r_squared, n, n_inverse, t)
+    setU64(&one, 1)
+    montgomeryMultiply(&x, &one, &r_squared, n, n_inverse, t)
+    var bit = bitLength(exponent)
+    while bit > 0 {
+        bit -= 1
+        montgomeryMultiply(&x, &x, &x, n, n_inverse, t)
+        if getBit(exponent, bit) == 1 { montgomeryMultiply(&x, &x, &a, n, n_inverse, t) }
+    }
+    montgomeryMultiply(result, &x, &one, n, n_inverse, t)
+    unsafe { allocator.free(@ptrCast([*]u8, t), (size + 2) * 8, 8) }
+    destroy(allocator, quotient)
+    destroy(allocator, r_squared)
+    destroy(allocator, power)
+    destroy(allocator, a)
+    destroy(allocator, x)
+    destroy(allocator, one)
+}
+
+// x mod small (small < 2^32), processing 32 bits at a time.
+fn modSmall(x: *BigUint, small: u64) -> u64 {
+    var remainder: u64 = 0
+    var index = x.*.len
+    while index > 0 {
+        index -= 1
+        const limb = x.*.limbs[index]
+        remainder = ((remainder << 32) | (limb >> 32)) % small
+        remainder = ((remainder << 32) | (limb & 4294967295)) % small
+    }
+    return remainder
+}
+
+// True when x has a prime factor below 1000 (and is not that prime).
+fn hasSmallFactor(x: *BigUint) -> bool {
+    var candidate: u64 = 3
+    while candidate < 1000 {
+        var prime = true
+        var divisor: u64 = 3
+        while divisor * divisor <= candidate {
+            if candidate % divisor == 0 { prime = false }
+            divisor += 2
+        }
+        if prime && modSmall(x, candidate) == 0 {
+            return !(x.*.len == 1 && x.*.limbs[0] == candidate)
+        }
+        candidate += 2
+    }
+    return false
+}
+
+// Signed helpers for modInverse: values are (magnitude, negative) pairs.
+fn signedAdd(destination: *BigUint, a: *BigUint, a_negative: bool, b: *BigUint, b_negative: bool) -> bool {
+    if a_negative == b_negative {
+        addTo(destination, a, b)
+        return if isZero(destination) { false } else { a_negative }
+    }
+    const order = cmp(a, b)
+    if order == 0 {
+        setZero(destination)
+        return false
+    }
+    if order > 0 {
+        subTo(destination, a, b)
+        return a_negative
+    }
+    subTo(destination, b, a)
+    return b_negative
+}
+
+// result = a^-1 mod m (extended Euclid), for gcd(a, m) = 1.
+pub fn modInverse(allocator: Allocator, result: *BigUint, a: *BigUint, m: *BigUint) -> void {
+    var old_r = create(allocator)
+    var r = create(allocator)
+    var old_s = create(allocator)
+    var s = create(allocator)
+    var q = create(allocator)
+    var remainder = create(allocator)
+    var qs = create(allocator)
+    var new_s = create(allocator)
+    var accumulator = create(allocator)
+    copyTo(&old_r, a)
+    copyTo(&r, m)
+    setU64(&old_s, 1)
+    var old_s_negative = false
+    var s_negative = false
+    while !isZero(&r) {
+        divMod(&q, &remainder, &old_r, &r)
+        mulTo(&qs, &q, &s, &accumulator)
+        const qs_negative = if isZero(&qs) { false } else { s_negative }
+        const new_s_negative = signedAdd(&new_s, &old_s, old_s_negative, &qs, !qs_negative)
+        copyTo(&old_r, &r)
+        copyTo(&r, &remainder)
+        copyTo(&old_s, &s)
+        old_s_negative = s_negative
+        copyTo(&s, &new_s)
+        s_negative = new_s_negative
+    }
+    // A negative coefficient normalizes to m - |old_s|.
+    if old_s_negative { const sign = signedAdd(result, &old_s, true, m, false) }
+    if !old_s_negative { copyTo(result, &old_s) }
+    destroy(allocator, old_r)
+    destroy(allocator, r)
+    destroy(allocator, old_s)
+    destroy(allocator, s)
+    destroy(allocator, q)
+    destroy(allocator, remainder)
+    destroy(allocator, qs)
+    destroy(allocator, new_s)
+    destroy(allocator, accumulator)
+}
+
+// ── Randomness and primes (key generation) ────────────────────────────────
+
+// Fills `length` bytes from /dev/urandom; false if it cannot be read.
+pub fn fillRandom(destination: [*]u8, length: usize) -> bool {
+    var path: [*]const u8 = undefined
+    unsafe { path = @ptrCast([*]const u8, "/dev/urandom") }
+    const file = fs.open(path, fs.READ_ONLY, 0)
+    if !fs.isValid(file) { return false }
+    var got: usize = 0
+    while got < length {
+        var target: [*]u8 = undefined
+        unsafe { target = @ptrFromInt([*]u8, @intFromPtr(destination) + got) }
+        const amount = fs.read(file, target, length - got)
+        if amount <= 0 { break }
+        got += @bitCast(usize, amount)
+    }
+    const closed = fs.close(file)
+    return got == length
+}
+
+// A uniformly drawn value in [low, high].
+fn randomInRange(allocator: Allocator, result: *BigUint, low: *BigUint, high: *BigUint) -> void {
+    const length = (bitLength(high) + 7) / 8
+    const buffer = bytes.zeroed(allocator, length)
+    while true {
+        const filled = fillRandom(buffer.items, length)
+        fromBytes(result, bytes.ofList(buffer))
+        if cmp(result, low) >= 0 && cmp(result, high) <= 0 { break }
+    }
+    bytes.free(buffer)
+}
+
+// Miller-Rabin with `rounds` random bases.
+pub fn isProbablePrime(allocator: Allocator, n: *BigUint, rounds: u32) -> bool {
+    var two = create(allocator)
+    setU64(&two, 2)
+    if cmp(n, &two) < 0 { return false }
+    if n.*.len == 1 && (n.*.limbs[0] == 2 || n.*.limbs[0] == 3) { return true }
+    if isEven(n) { return false }
+    var one = create(allocator)
+    setU64(&one, 1)
+    var n_minus_1 = create(allocator)
+    subTo(&n_minus_1, n, &one)
+    var n_minus_2 = create(allocator)
+    subTo(&n_minus_2, n, &two)
+    var d = create(allocator)
+    copyTo(&d, &n_minus_1)
+    var s: u32 = 0
+    while isEven(&d) {
+        shiftRight1(&d)
+        s += 1
+    }
+    var a = create(allocator)
+    var x = create(allocator)
+    var square = create(allocator)
+    var quotient = create(allocator)
+    var accumulator = create(allocator)
+    var prime = true
+    var round: u32 = 0
+    while round < rounds && prime {
+        randomInRange(allocator, &a, &two, &n_minus_2)
+        modPow(allocator, &x, &a, &d, n)
+        if cmp(&x, &one) != 0 && cmp(&x, &n_minus_1) != 0 {
+            var composite = true
+            var r: u32 = 1
+            while r < s {
+                mulTo(&square, &x, &x, &accumulator)
+                divMod(&quotient, &x, &square, n)
+                if cmp(&x, &n_minus_1) == 0 {
+                    composite = false
+                    break
+                }
+                r += 1
+            }
+            if composite { prime = false }
+        }
+        round += 1
+    }
+    destroy(allocator, two)
+    destroy(allocator, one)
+    destroy(allocator, n_minus_1)
+    destroy(allocator, n_minus_2)
+    destroy(allocator, d)
+    destroy(allocator, a)
+    destroy(allocator, x)
+    destroy(allocator, square)
+    destroy(allocator, quotient)
+    destroy(allocator, accumulator)
+    return prime
+}
+
+// A random probable prime of exactly `bits` bits with the top two bits set
+// (so a product of two has exactly 2 * bits bits).
+pub fn randomPrime(allocator: Allocator, result: *BigUint, bits: usize) -> void {
+    const length = (bits + 7) / 8
+    const buffer = bytes.zeroed(allocator, length)
+    while true {
+        const filled = fillRandom(buffer.items, length)
+        bytes.setU8(buffer, 0, @intCast(u32, buffer.items[0]) | 192)
+        bytes.setU8(buffer, length - 1, @intCast(u32, buffer.items[length - 1]) | 1)
+        fromBytes(result, bytes.ofList(buffer))
+        if !hasSmallFactor(result) && isProbablePrime(allocator, result, 32) { break }
+    }
+    bytes.free(buffer)
+}

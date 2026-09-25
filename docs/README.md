@@ -33,6 +33,9 @@ exercise it:
 - [`reference/abi.md`](reference/abi.md) — the internal `mlxcc` x86_64
   calling convention and the foreign/`extern` ABI, including the raw Linux
   syscall path
+- [`reference/android.md`](reference/android.md) — the AArch64 backend,
+  `--target=aarch64-linux`/`aarch64-android`, APK packaging and signing,
+  foreign/exported functions, and `std.android`
 - [`reference/formats.md`](reference/formats.md) — ELF64 executable output,
   debug formats, and the (unimplemented) PE32+ target
 - [`reference/build-system.md`](reference/build-system.md) — the normative

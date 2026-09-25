@@ -1,0 +1,227 @@
+const encoder = @import("../encoder.mlx")
+const lir_module = @import("../../../ir/lir.mlx")
+const state_module = @import("./state.mlx")
+const labels = @import("./labels.mlx")
+const runtime = @import("./runtime.mlx")
+
+const X0: u32 = 0
+const X1: u32 = 1
+const X2: u32 = 2
+const X8: u32 = 8
+const X16: u32 = 16
+
+const AbiLocation = struct {
+    isFloat: bool
+    inRegister: bool
+    registerIndex: usize
+    stackIndex: usize
+}
+
+// Calls follow AAPCS64 for the values mlx passes: up to eight integer words
+// in x0-x7 and eight floats in v0-v7, each further word in its own 8-byte
+// stack slot in argument order; results come back in x0/x1/x2 or v0.
+pub const Calls = struct {
+    pub fn emit(state: *state_module.State, index: usize, instruction: lir_module.Inst) -> bool {
+        if instruction.opcode == lir_module.Opcode.call {
+            Self.emitCall(state, index, instruction)
+            return true
+        }
+        if instruction.opcode == lir_module.Opcode.direct_call {
+            Self.emitDirectCall(state, index, instruction)
+            return true
+        }
+        if instruction.opcode == lir_module.Opcode.syscall {
+            Self.emitSyscall(state, index, instruction)
+            return true
+        }
+        return false
+    }
+
+    fn emitCall(state: *state_module.State, index: usize, instruction: lir_module.Inst) -> void {
+        const function = state_module.State.allocateOp(state, instruction.arg0)
+        const stack_bytes = Self.prepareCall(state, instruction.arg1, instruction.arg2)
+        encoder.emitLoadSlot(state.*.enc, X16, function)
+        encoder.emit32(state.*.enc, encoder.blr(X16))
+        Self.finishCall(state, index, instruction.typeId, stack_bytes, true)
+    }
+
+    fn emitDirectCall(state: *state_module.State, index: usize, instruction: lir_module.Inst) -> void {
+        const stack_bytes = Self.prepareCall(state, instruction.arg1, instruction.arg2)
+        const symbol = lir_module.getSymbol(state.*.lir, instruction.arg0)
+        const foreign = symbol.flags & lir_module.SYMBOL_IMPORT != 0
+        if foreign {
+            encoder.emitImportCall(state.*.enc, symbol.pointer, symbol.length)
+        } else {
+            encoder.emitCallTo(state.*.enc, symbol.pointer, symbol.length)
+        }
+        state.*.directCallCount += 1
+        Self.finishCall(state, index, instruction.typeId, stack_bytes, foreign)
+    }
+
+    // Reserves the outgoing stack-argument area (kept 16-byte aligned),
+    // fills it, then loads the register arguments. Returns the area size.
+    fn prepareCall(state: *state_module.State, start: usize, count: usize) -> usize {
+        const stack_count = Self.stackArgumentCount(state, start, count)
+        const stack_bytes = (stack_count * 8 + 15) & ~@intCast(usize, 15)
+        if stack_bytes > 0 {
+            Self.adjustStack(state, stack_bytes, true)
+            Self.storeStackArguments(state, start, count)
+        }
+        Self.loadRegisterArguments(state, start, count)
+        return stack_bytes
+    }
+
+    fn adjustStack(state: *state_module.State, bytes: usize, reserve: bool) -> void {
+        if bytes < 4096 {
+            encoder.emit32(state.*.enc, if reserve { encoder.subImm(encoder.SP, encoder.SP, @intCast(u32, bytes)) } else { encoder.addImm(encoder.SP, encoder.SP, @intCast(u32, bytes)) })
+            return
+        }
+        encoder.emitLoadImm(state.*.enc, X16, @intCast(u64, bytes))
+        encoder.emit32(state.*.enc, if reserve { encoder.SUB_SP_SP_X16 } else { encoder.ADD_SP_SP_X16 })
+    }
+
+    // `may_be_foreign`: the callee may be C code (an import, or any function
+    // pointer), whose narrow integer results have unspecified upper bits.
+    fn finishCall(state: *state_module.State, index: usize, type_id: usize, stack_bytes: usize, may_be_foreign: bool) -> void {
+        if stack_bytes > 0 { Self.adjustStack(state, stack_bytes, false) }
+        if may_be_foreign {
+            const narrow = state_module.State.narrowInteger(state, type_id)
+            encoder.emitExtend(state.*.enc, X0, narrow.0, narrow.1)
+        }
+        Self.storeReturnValue(state, index, type_id)
+    }
+
+    fn argumentLocation(state: *state_module.State, start: usize, target_argument: usize, target_component: usize) -> AbiLocation {
+        var integer_index: usize = 0
+        var float_index: usize = 0
+        var stack_index: usize = 0
+        var argument_index: usize = 0
+        while argument_index <= target_argument {
+            const argument = lir_module.getExtra(state.*.lir, start + argument_index)
+            const count = state_module.State.componentCount(state, argument)
+            var component: usize = 0
+            while component < count {
+                const value = lir_module.getInst(state.*.lir, argument)
+                const is_float = count == 1 && state_module.State.isFloatType(state, value.typeId)
+                const register_index = if is_float { float_index } else { integer_index }
+                const capacity: usize = if is_float { labels.FLOAT_ARG_REGS_COUNT } else { labels.ARG_REGS_COUNT }
+                const in_register = register_index < capacity
+                if argument_index == target_argument && component == target_component {
+                    return AbiLocation.{ .isFloat = is_float, .inRegister = in_register, .registerIndex = register_index, .stackIndex = stack_index }
+                }
+                if in_register {
+                    if is_float { float_index += 1 } else { integer_index += 1 }
+                } else { stack_index += 1 }
+                component += 1
+            }
+            argument_index += 1
+        }
+        return AbiLocation.{ .isFloat = false, .inRegister = false, .registerIndex = 0, .stackIndex = stack_index }
+    }
+
+    fn stackArgumentCount(state: *state_module.State, start: usize, count: usize) -> usize {
+        var result: usize = 0
+        var argument_index: usize = 0
+        while argument_index < count {
+            const argument = lir_module.getExtra(state.*.lir, start + argument_index)
+            var component: usize = 0
+            while component < state_module.State.componentCount(state, argument) {
+                if !Self.argumentLocation(state, start, argument_index, component).inRegister { result += 1 }
+                component += 1
+            }
+            argument_index += 1
+        }
+        return result
+    }
+
+    fn storeStackArguments(state: *state_module.State, start: usize, count: usize) -> void {
+        var argument_index: usize = 0
+        while argument_index < count {
+            const argument = lir_module.getExtra(state.*.lir, start + argument_index)
+            var component: usize = 0
+            while component < state_module.State.componentCount(state, argument) {
+                const location = Self.argumentLocation(state, start, argument_index, component)
+                if !location.inRegister {
+                    Self.loadComponent(state, X16, argument, component)
+                    encoder.emit32(state.*.enc, encoder.strX(X16, encoder.SP, @intCast(u32, location.stackIndex * 8)))
+                }
+                component += 1
+            }
+            argument_index += 1
+        }
+    }
+
+    fn loadComponent(state: *state_module.State, destination: u32, argument: usize, component: usize) -> void {
+        if component == 0 {
+            state_module.State.loadOp(state, destination, argument)
+            return
+        }
+        const slot = state_module.State.getComponent(state, argument, component)
+        if slot.0 {
+            encoder.emitLoadSlot(state.*.enc, destination, slot.1)
+        } else {
+            encoder.emitLoadImm(state.*.enc, destination, 0)
+        }
+    }
+
+    fn loadRegisterArguments(state: *state_module.State, start: usize, count: usize) -> void {
+        var argument_index: usize = 0
+        while argument_index < count {
+            const argument = lir_module.getExtra(state.*.lir, start + argument_index)
+            var component: usize = 0
+            const component_count = state_module.State.componentCount(state, argument)
+            while component < component_count {
+                const location = Self.argumentLocation(state, start, argument_index, component)
+                const register_index = @intCast(u32, location.registerIndex)
+                if component == 0 && location.inRegister && !location.isFloat {
+                    state_module.State.loadOp(state, register_index, argument)
+                    component += 1
+                    continue
+                }
+                const slot = state_module.State.getComponent(state, argument, component)
+                if slot.0 && location.inRegister && location.isFloat {
+                    const value = lir_module.getInst(state.*.lir, argument)
+                    encoder.emitLoadSlotFp(state.*.enc, register_index, slot.1, state_module.State.floatBits(state, value.typeId))
+                }
+                if slot.0 && location.inRegister && !location.isFloat { encoder.emitLoadSlot(state.*.enc, register_index, slot.1) }
+                component += 1
+            }
+            argument_index += 1
+        }
+    }
+
+    fn storeReturnValue(state: *state_module.State, index: usize, type_id: usize) -> void {
+        const word_count = state_module.State.typeWordCount(state, type_id)
+        if state_module.State.isFloatType(state, type_id) {
+            encoder.emitStoreSlotFp(state.*.enc, state_module.State.allocateOp(state, index), 0, state_module.State.floatBits(state, type_id))
+            return
+        }
+        encoder.emitStoreSlot(state.*.enc, state_module.State.allocateOp(state, index), X0)
+        if word_count >= 2 {
+            if state_module.State.isFloatErrorUnion(state, type_id) {
+                const payload_type = state_module.State.errorUnionPayloadType(state, type_id)
+                encoder.emitStoreSlotFp(state.*.enc, state_module.State.allocateSecondaryOp(state, index), 0, state_module.State.floatBits(state, payload_type))
+            } else { encoder.emitStoreSlot(state.*.enc, state_module.State.allocateSecondaryOp(state, index), X1) }
+        }
+        if word_count >= 3 {
+            encoder.emitStoreSlot(state.*.enc, state_module.State.allocateTertiaryOp(state, index), X2)
+        }
+    }
+
+    // Programs issue Linux x86_64 syscall numbers (std/bootstrap/os/linux.mlx);
+    // the runtime helper translates number, arguments and results to the
+    // aarch64 kernel ABI. x8 carries the x86_64 number into the helper.
+    fn emitSyscall(state: *state_module.State, index: usize, instruction: lir_module.Inst) -> void {
+        var argument: usize = 0
+        while argument < instruction.arg2 {
+            if argument < 6 {
+                const value = lir_module.getExtra(state.*.lir, instruction.arg1 + argument)
+                encoder.emitLoadSlot(state.*.enc, @intCast(u32, argument), state_module.State.allocateOp(state, value))
+            }
+            argument += 1
+        }
+        encoder.emitLoadSlot(state.*.enc, X8, state_module.State.allocateOp(state, instruction.arg0))
+        runtime.emitCall(state.*.enc, runtime.Helper.syscall)
+        encoder.emitStoreSlot(state.*.enc, state_module.State.allocateOp(state, index), X0)
+    }
+}

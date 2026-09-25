@@ -1,0 +1,272 @@
+// APK signing primitives: an RSA key, RSASSA-PKCS1-v1_5 over SHA-256, a
+// self-signed X.509 certificate, PKCS#7 SignedData, and the v1 (JAR)
+// signature files META-INF/MANIFEST.MF, CERT.SF and CERT.RSA. Ported from
+// experiments/android-aarch64-bluescreen/mlx/jar_sign.mlx.
+//
+// Key files use the experiment's format: little-endian u32 modulus length
+// L, then L bytes of the modulus n and L bytes of the private exponent d,
+// both big-endian. The public exponent is always 65537.
+const bytes = @import("./bytes.mlx")
+const hash = @import("./hash.mlx")
+const bn = @import("./bignum.mlx")
+const der = @import("./der.mlx")
+const zip = @import("./zip.mlx")
+const fs = @import("../../../../std/bootstrap/fs.mlx")
+
+pub const Allocator = bytes.Allocator
+pub const ArrayList = bytes.ArrayList
+pub const Bytes = bytes.Bytes
+
+pub const RsaKey = struct {
+    n: bn.BigUint
+    d: bn.BigUint
+    byteLength: usize
+    valid: bool
+}
+
+fn invalidKey(allocator: Allocator) -> RsaKey {
+    return RsaKey.{ .n = bn.create(allocator), .d = bn.create(allocator), .byteLength = 0, .valid = false }
+}
+
+// A new key with a `bits`-bit modulus (two bits/2-bit primes, e = 65537).
+pub fn generateKey(allocator: Allocator, bits: usize) -> RsaKey {
+    var p = bn.create(allocator)
+    var q = bn.create(allocator)
+    var n = bn.create(allocator)
+    var d = bn.create(allocator)
+    var one = bn.create(allocator)
+    var p1 = bn.create(allocator)
+    var q1 = bn.create(allocator)
+    var phi = bn.create(allocator)
+    var e = bn.create(allocator)
+    var accumulator = bn.create(allocator)
+    bn.randomPrime(allocator, &p, bits / 2)
+    bn.randomPrime(allocator, &q, bits / 2)
+    bn.mulTo(&n, &p, &q, &accumulator)
+    bn.setU64(&one, 1)
+    bn.subTo(&p1, &p, &one)
+    bn.subTo(&q1, &q, &one)
+    bn.mulTo(&phi, &p1, &q1, &accumulator)
+    bn.setU64(&e, 65537)
+    bn.modInverse(allocator, &d, &e, &phi)
+    return RsaKey.{ .n = n, .d = d, .byteLength = (bits + 7) / 8, .valid = true }
+}
+
+pub fn loadKey(allocator: Allocator, path: [*]const u8) -> RsaKey {
+    const file = fs.open(path, fs.READ_ONLY, 0)
+    if !fs.isValid(file) { return invalidKey(allocator) }
+    const header = bytes.zeroed(allocator, 4)
+    const header_read = fs.read(file, header.items, 4)
+    if header_read != 4 {
+        const closed = fs.close(file)
+        return invalidKey(allocator)
+    }
+    const length = @intCast(usize, bytes.readU32(bytes.ofList(header), 0))
+    if length == 0 || length > 288 {
+        const closed = fs.close(file)
+        return invalidKey(allocator)
+    }
+    const body = bytes.zeroed(allocator, length * 2)
+    const body_read = fs.read(file, body.items, length * 2)
+    const closed = fs.close(file)
+    if body_read != @intCast(isize, length * 2) { return invalidKey(allocator) }
+    var n = bn.create(allocator)
+    var d = bn.create(allocator)
+    bn.fromBytes(&n, bytes.sub(bytes.ofList(body), 0, length))
+    bn.fromBytes(&d, bytes.sub(bytes.ofList(body), length, length * 2))
+    return RsaKey.{ .n = n, .d = d, .byteLength = length, .valid = true }
+}
+
+pub fn saveKey(allocator: Allocator, key: *RsaKey, path: [*]const u8) -> bool {
+    var out = bytes.newList(allocator, 4 + key.*.byteLength * 2)
+    bytes.appendU32(&out, @intCast(u32, key.*.byteLength))
+    var n = key.*.n
+    var d = key.*.d
+    bytes.appendList(&out, bn.toBytesPadded(allocator, &n, key.*.byteLength))
+    bytes.appendList(&out, bn.toBytesPadded(allocator, &d, key.*.byteLength))
+    const file = fs.open(path, fs.WRITE_ONLY | fs.CREATE | fs.TRUNCATE, 384) // 0600
+    if !fs.isValid(file) { return false }
+    const wrote = fs.writeAllBytes(file, out.items, out.length)
+    const closed = fs.close(file)
+    return wrote && closed
+}
+
+// RSASSA-PKCS1-v1_5 signature of a SHA-256 digest: EM = 00 01 FF..FF 00
+// DigestInfo(sha256, digest), signature = EM^d mod n.
+pub fn signDigest(allocator: Allocator, key: *RsaKey, digest: Bytes) -> ArrayList {
+    const algorithm = der.algorithm(allocator, "2.16.840.1.101.3.4.2.1")
+    const digest_octets = der.octetString(allocator, digest)
+    const digest_info = der.sequence2(allocator, bytes.ofList(algorithm), bytes.ofList(digest_octets))
+    const length = key.*.byteLength
+    const encoded = bytes.zeroed(allocator, length)
+    bytes.setU8(encoded, 1, 1)
+    const padding = length - digest_info.length - 3
+    var index: usize = 0
+    while index < padding {
+        bytes.setU8(encoded, 2 + index, 255)
+        index += 1
+    }
+    index = 0
+    while index < digest_info.length {
+        bytes.setU8(encoded, length - digest_info.length + index, @intCast(u32, digest_info.items[index]))
+        index += 1
+    }
+    var message = bn.create(allocator)
+    var signature = bn.create(allocator)
+    bn.fromBytes(&message, bytes.ofList(encoded))
+    var n = key.*.n
+    var d = key.*.d
+    bn.modPow(allocator, &signature, &message, &d, &n)
+    return bn.toBytesPadded(allocator, &signature, length)
+}
+
+pub fn signSha256(allocator: Allocator, key: *RsaKey, content: Bytes) -> ArrayList {
+    return signDigest(allocator, key, bytes.ofList(hash.sha256List(allocator, content)))
+}
+
+fn commonName(allocator: Allocator, name: Bytes) -> ArrayList {
+    const identifier = der.oid(allocator, bytes.ofText("2.5.4.3"))
+    const value = der.utf8String(allocator, name)
+    const pair = der.sequence2(allocator, bytes.ofList(identifier), bytes.ofList(value))
+    const relative = der.set1(allocator, bytes.ofList(pair))
+    return der.sequence1(allocator, bytes.ofList(relative))
+}
+
+pub fn subjectPublicKeyInfo(allocator: Allocator, key: *RsaKey) -> ArrayList {
+    var n = key.*.n
+    const modulus = der.integerFromUnsigned(allocator, bytes.ofList(bn.toBytesMinimal(allocator, &n)))
+    const exponent = der.integerFromU64(allocator, 65537)
+    const public_key = der.sequence2(allocator, bytes.ofList(modulus), bytes.ofList(exponent))
+    const algorithm = der.algorithm(allocator, "1.2.840.113549.1.1.1")
+    const key_bits = der.bitString(allocator, bytes.ofList(public_key))
+    return der.sequence2(allocator, bytes.ofList(algorithm), bytes.ofList(key_bits))
+}
+
+// A self-signed X.509 v1 certificate, subject = issuer = CN=<name>, valid
+// 1970-01-01 to 2049-12-31, signed with SHA256withRSA.
+pub fn certificate(allocator: Allocator, key: *RsaKey, name: Bytes, serial: u64) -> ArrayList {
+    const subject = commonName(allocator, name)
+    const spki = subjectPublicKeyInfo(allocator, key)
+    const not_before = der.utcTime(allocator, bytes.ofText("700101000000Z"))
+    const not_after = der.utcTime(allocator, bytes.ofText("491231235959Z"))
+    const validity = der.sequence2(allocator, bytes.ofList(not_before), bytes.ofList(not_after))
+    const serial_number = der.integerFromU64(allocator, serial)
+    const algorithm = der.algorithm(allocator, "1.2.840.113549.1.1.11")
+    const tbs = der.sequence6(allocator, bytes.ofList(serial_number), bytes.ofList(algorithm), bytes.ofList(subject), bytes.ofList(validity), bytes.ofList(subject), bytes.ofList(spki))
+    const signature = signSha256(allocator, key, bytes.ofList(tbs))
+    const signature_bits = der.bitString(allocator, bytes.ofList(signature))
+    return der.sequence3(allocator, bytes.ofList(tbs), bytes.ofList(algorithm), bytes.ofList(signature_bits))
+}
+
+// PKCS#7 SignedData (detached, no signed attributes) over `content`,
+// embedding `certificate_der`: the classic JAR CERT.RSA.
+pub fn signedData(allocator: Allocator, key: *RsaKey, certificate_der: Bytes, name: Bytes, serial: u64, content: Bytes) -> ArrayList {
+    const digest_algorithm = der.algorithm(allocator, "2.16.840.1.101.3.4.2.1")
+    const digest_algorithms = der.set1(allocator, bytes.ofList(digest_algorithm))
+    const data_type = der.oid(allocator, bytes.ofText("1.2.840.113549.1.7.1"))
+    const content_info = der.sequence1(allocator, bytes.ofList(data_type))
+    const certificates = der.contextTag(allocator, 0, certificate_der)
+    const signature = signSha256(allocator, key, content)
+    const encrypted_digest = der.octetString(allocator, bytes.ofList(signature))
+    const issuer = commonName(allocator, name)
+    const serial_number = der.integerFromU64(allocator, serial)
+    const issuer_and_serial = der.sequence2(allocator, bytes.ofList(issuer), bytes.ofList(serial_number))
+    const signature_algorithm = der.algorithm(allocator, "1.2.840.113549.1.1.1")
+    const version = der.integerFromU64(allocator, 1)
+    const signer = der.sequence5(allocator, bytes.ofList(version), bytes.ofList(issuer_and_serial), bytes.ofList(digest_algorithm), bytes.ofList(signature_algorithm), bytes.ofList(encrypted_digest))
+    const signers = der.set1(allocator, bytes.ofList(signer))
+    const signed = der.sequence5(allocator, bytes.ofList(version), bytes.ofList(digest_algorithms), bytes.ofList(content_info), bytes.ofList(certificates), bytes.ofList(signers))
+    const signed_type = der.oid(allocator, bytes.ofText("1.2.840.113549.1.7.2"))
+    const explicit = der.contextTag(allocator, 0, bytes.ofList(signed))
+    return der.sequence2(allocator, bytes.ofList(signed_type), bytes.ofList(explicit))
+}
+
+// ── v1 (JAR) signature files ──────────────────────────────────────────────
+
+fn base64Character(value: u32) -> u32 {
+    if value < 26 { return 65 + value }
+    if value < 52 { return 97 + value - 26 }
+    if value < 62 { return 48 + value - 52 }
+    return if value == 62 { 43 } else { 47 }
+}
+
+pub fn appendBase64(out: *ArrayList, data: Bytes) -> void {
+    var index: usize = 0
+    while index + 3 <= data.length {
+        const b0 = @intCast(u32, data.pointer[index])
+        const b1 = @intCast(u32, data.pointer[index + 1])
+        const b2 = @intCast(u32, data.pointer[index + 2])
+        bytes.appendU8(out, base64Character(b0 >> 2))
+        bytes.appendU8(out, base64Character(((b0 & 3) << 4) | (b1 >> 4)))
+        bytes.appendU8(out, base64Character(((b1 & 15) << 2) | (b2 >> 6)))
+        bytes.appendU8(out, base64Character(b2 & 63))
+        index += 3
+    }
+    const remaining = data.length - index
+    if remaining == 1 {
+        const b0 = @intCast(u32, data.pointer[index])
+        bytes.appendU8(out, base64Character(b0 >> 2))
+        bytes.appendU8(out, base64Character((b0 & 3) << 4))
+        bytes.appendU8(out, 61)
+        bytes.appendU8(out, 61)
+    }
+    if remaining == 2 {
+        const b0 = @intCast(u32, data.pointer[index])
+        const b1 = @intCast(u32, data.pointer[index + 1])
+        bytes.appendU8(out, base64Character(b0 >> 2))
+        bytes.appendU8(out, base64Character(((b0 & 3) << 4) | (b1 >> 4)))
+        bytes.appendU8(out, base64Character((b1 & 15) << 2))
+        bytes.appendU8(out, 61)
+    }
+}
+
+fn appendDigestSection(allocator: Allocator, out: *ArrayList, name: Bytes, content: Bytes) -> void {
+    bytes.appendText(out, "Name: ")
+    bytes.appendBytes(out, name)
+    bytes.appendText(out, "\r\nSHA-256-Digest: ")
+    appendBase64(out, bytes.ofList(hash.sha256List(allocator, content)))
+    bytes.appendText(out, "\r\n\r\n")
+}
+
+pub const JarSignature = struct {
+    manifest: ArrayList
+    signatureFile: ArrayList
+    signatureBlock: ArrayList
+}
+
+// MANIFEST.MF, CERT.SF and CERT.RSA for the given (non-META-INF) entries.
+// `apk_signed` lists the APK signature schemes also present (e.g. "2, 3")
+// for CERT.SF's X-Android-APK-Signed header, which lets Android reject an
+// APK whose v2/v3 block was stripped; empty for none.
+pub fn signJar(allocator: Allocator, key: *RsaKey, certificate_der: Bytes, name: Bytes, serial: u64, entries: *zip.Entries, apk_signed: Bytes) -> JarSignature {
+    var manifest = bytes.newList(allocator, 1024)
+    bytes.appendText(&manifest, "Manifest-Version: 1.0\r\nCreated-By: mlx\r\n\r\n")
+    var index: usize = 0
+    while index < zip.count(entries) {
+        const entry = zip.at(entries, index)
+        appendDigestSection(allocator, &manifest, entry.name, entry.data)
+        index += 1
+    }
+    var signature_file = bytes.newList(allocator, 1024)
+    bytes.appendText(&signature_file, "Signature-Version: 1.0\r\nCreated-By: mlx\r\n")
+    if apk_signed.length > 0 {
+        bytes.appendText(&signature_file, "X-Android-APK-Signed: ")
+        bytes.appendBytes(&signature_file, apk_signed)
+        bytes.appendText(&signature_file, "\r\n")
+    }
+    bytes.appendText(&signature_file, "SHA-256-Digest-Manifest: ")
+    appendBase64(&signature_file, bytes.ofList(hash.sha256List(allocator, bytes.ofList(manifest))))
+    bytes.appendText(&signature_file, "\r\n\r\n")
+    index = 0
+    while index < zip.count(entries) {
+        const entry = zip.at(entries, index)
+        // Each .SF section digests the corresponding MANIFEST.MF section.
+        var section = bytes.newList(allocator, 128)
+        appendDigestSection(allocator, &section, entry.name, entry.data)
+        appendDigestSection(allocator, &signature_file, entry.name, bytes.ofList(section))
+        bytes.free(section)
+        index += 1
+    }
+    const block = signedData(allocator, key, certificate_der, name, serial, bytes.ofList(signature_file))
+    return JarSignature.{ .manifest = manifest, .signatureFile = signature_file, .signatureBlock = block }
+}

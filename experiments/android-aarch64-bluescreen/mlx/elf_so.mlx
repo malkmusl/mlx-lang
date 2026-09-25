@@ -1,0 +1,721 @@
+// Hand-written ELF64 shared object (ET_DYN) writer for aarch64, targeting
+// the Android/Bionic dynamic linker. Straight port of
+// experiments/android-aarch64-bluescreen/tool/elf_so.zig -- see that file
+// and the experiment README for the full design rationale (why an eager
+// R_AARCH64_GLOB_DAT relocation per import instead of a PLT, the exact
+// file layout, and the readelf-based verification this was checked
+// against). This port keeps every constant, offset and field write in the
+// same order as the already-verified Zig version to minimize the chance
+// of a transcription slip.
+//
+// Every field is written with explicit little-endian byte helpers rather
+// than a struct-to-bytes reinterpret cast, so there is no dependency on
+// mlx guaranteeing any particular struct memory layout -- just explicit,
+// auditable byte placement, the same way compiler/bootstrap/object/elf64.zig
+// and this experiment's own AXML/DEX/ZIP encoders already do it.
+
+const std = @import("std")
+const a64 = @import("./aarch64.mlx")
+const na = @import("./native_activity.mlx")
+
+pub const Allocator = std.allocator.Allocator
+pub const ArrayList = std.array_list.ArrayList
+
+const ELFCLASS64: u32 = 2
+const ELFDATA2LSB: u32 = 1
+const EV_CURRENT: u32 = 1
+const ELFOSABI_NONE: u32 = 0
+
+const ET_DYN: u32 = 3
+const EM_AARCH64: u32 = 183
+
+const PT_LOAD: u32 = 1
+const PT_DYNAMIC: u32 = 2
+const PF_X: u32 = 1
+const PF_W: u32 = 2
+const PF_R: u32 = 4
+
+const SHT_PROGBITS: u32 = 1
+const SHT_STRTAB: u32 = 3
+const SHT_RELA: u32 = 4
+const SHT_HASH: u32 = 5
+const SHT_DYNAMIC: u32 = 6
+const SHT_DYNSYM: u32 = 11
+const SHF_WRITE: u64 = 0x1
+const SHF_ALLOC: u64 = 0x2
+const SHF_EXECINSTR: u64 = 0x4
+
+const STB_GLOBAL: u32 = 1
+const STT_FUNC: u32 = 2
+const SHN_UNDEF: u32 = 0
+
+const DT_NULL: i64 = 0
+const DT_NEEDED: i64 = 1
+const DT_HASH: i64 = 4
+const DT_STRTAB: i64 = 5
+const DT_SYMTAB: i64 = 6
+const DT_RELA: i64 = 7
+const DT_RELASZ: i64 = 8
+const DT_RELAENT: i64 = 9
+const DT_STRSZ: i64 = 10
+const DT_SYMENT: i64 = 11
+const DT_SONAME: i64 = 14
+
+const R_AARCH64_GLOB_DAT: u64 = 1025
+
+const RO_VADDR: u64 = 0x1000
+// 16384 (16 KB), not 4096 -- real, modern Android devices (confirmed on a
+// real Pixel 10 Pro running a current/Canary build, which flatly refused
+// to install this APK at all with "You can't install this app on your
+// device") require every PT_LOAD segment's alignment to be >= the
+// device's page size, which is 16 KB on newer hardware. Verified against
+// Google's own documented check (`llvm-objdump -p libmain.so | grep
+// LOAD`, looking for `align 2**14` or higher) -- this file previously
+// wrote `align 2**12` (4096) for all three PT_LOAD segments, which
+// `llvm-objdump` confirmed and which is exactly what
+// developer.android.com/guide/practices/page-sizes documents as
+// UNALIGNED. Since every segment here already has vaddr == offset (the
+// ELF-spec congruency requirement `p_vaddr ≡ p_offset (mod p_align)`
+// holds trivially either way), the honest fix is to actually move
+// TEXT_VADDR/RW_VADDR to true 16 KB-multiple file offsets -- not just
+// relabel the existing 4 KB-spaced layout's p_align field, which would
+// pass a check that only inspects the align column without the segment
+// actually being safely mmap-able at a real 16 KB page boundary.
+const TEXT_VADDR: u64 = 0x4000
+const RW_VADDR: u64 = 0x8000
+const PAGE: u64 = 0x4000
+
+const ELF64_EHDR_SIZE: u64 = 64
+const ELF64_PHDR_SIZE: u64 = 56
+const ELF64_SHDR_SIZE: u64 = 64
+const ELF64_SYM_SIZE: u64 = 24
+const ELF64_RELA_SIZE: u64 = 24
+const ELF64_DYN_SIZE: u64 = 16
+
+fn alignUp(x: u64, a: u64) -> u64 {
+    return ((x + a - 1) / a) * a
+}
+
+// ── little-endian byte writers into a pre-sized ArrayList ────────────────
+fn w8(buf: ArrayList, offset: u64, value: u32) -> void {
+    std.array_list.ArrayList.set(buf, @intCast(usize, offset), @intCast(u8, value & 255))
+}
+fn w16(buf: ArrayList, offset: u64, value: u32) -> void {
+    w8(buf, offset, value)
+    w8(buf, offset + 1, value >> 8)
+}
+fn w32(buf: ArrayList, offset: u64, value: u32) -> void {
+    w8(buf, offset, value)
+    w8(buf, offset + 1, value >> 8)
+    w8(buf, offset + 2, value >> 16)
+    w8(buf, offset + 3, value >> 24)
+}
+fn w64(buf: ArrayList, offset: u64, value: u64) -> void {
+    w32(buf, offset, @intCast(u32, value & 4294967295))
+    w32(buf, offset + 4, @intCast(u32, (value >> 32) & 4294967295))
+}
+fn wi64(buf: ArrayList, offset: u64, value: i64) -> void {
+    // Every call site here passes a non-negative value (DT_* tags are all
+    // >= 0, and every r_addend used is 0), so plain widening is exact.
+    w64(buf, offset, @intCast(u64, value))
+}
+fn wBytes(buf: ArrayList, offset: u64, src: []const u8) -> void {
+    var i: usize = 0
+    while i < src.length {
+        w8(buf, offset + @intCast(u64, i), @intCast(u32, src[i]))
+        i += 1
+    }
+}
+
+// An undefined, global FUNC .dynsym entry for an imported function.
+fn writeImportSym(buf: ArrayList, s: u64, nameOff: u32) -> void {
+    w32(buf, s, nameOff)
+    w8(buf, s + 4, (STB_GLOBAL << 4) | (STT_FUNC & 15))
+    w8(buf, s + 5, 0)
+    w16(buf, s + 6, SHN_UNDEF)
+    w64(buf, s + 8, 0)
+    w64(buf, s + 16, 0)
+}
+
+// An R_AARCH64_GLOB_DAT .rela.dyn entry filling `gotSlot` with symbol `symIndex`.
+fn writeGlobDat(buf: ArrayList, r: u64, gotSlot: u64, symIndex: u64) -> void {
+    w64(buf, r, gotSlot)
+    w64(buf, r + 8, (symIndex << 32) | R_AARCH64_GLOB_DAT)
+    wi64(buf, r + 16, 0)
+}
+
+// SysV ELF hash (the classic algorithm from the System V ABI). Kept for
+// documentation/parity with the Zig prototype's elfHash even though the
+// single-bucket .hash table below doesn't need real hash distribution.
+pub fn elfHash(name: []const u8) -> u32 {
+    var h: u32 = 0
+    var i: usize = 0
+    while i < name.length {
+        h = (h << 4) + @intCast(u32, name[i])
+        const g: u32 = h & 0xf0000000
+        if g != 0 {
+            h = h ^ (g >> 24)
+        }
+        h = h & (4294967295 - g)
+        i += 1
+    }
+    return h
+}
+
+// Appends `s` followed by a NUL byte to `list`, returning the offset `s`
+// starts at (the interned string's "name" index into that string table).
+fn internString(list: *ArrayList, s: []const u8) -> u32 {
+    const off: u32 = @intCast(u32, list.*.length)
+    var i: usize = 0
+    while i < s.length {
+        var ok: bool = std.array_list.ArrayList.appendAt(list, s[i])
+        i += 1
+    }
+    var ok2: bool = std.array_list.ArrayList.appendAt(list, 0)
+    return off
+}
+
+// Build the complete `libmain.so` file bytes. `needed`/`needed2`/`needed3`
+// become three `DT_NEEDED` entries -- `libandroid.so` (the NDK imports),
+// `libc.so` (`malloc`, the timerfd calls and `read`) and `liblog.so`
+// (`__android_log_print`). A symbol's `.rela.dyn`/`.dynsym` entry never has
+// to say *which* library it resolves against: Bionic's dynamic linker
+// searches every `DT_NEEDED` dependency (in order) for each undefined
+// symbol.
+pub fn build(allocator: Allocator, soname: []const u8, needed: []const u8, needed2: []const u8, needed3: []const u8) -> ArrayList {
+    // ── .dynstr ────────────────────────────────────────────────────────
+    var dynstr: ArrayList = std.array_list.ArrayList.init(allocator, 128)
+    var ok0: bool = std.array_list.ArrayList.appendAt(&dynstr, 0) // index 0 = ""
+
+    const nameSetBuffers: u32 = internString(&dynstr, "ANativeWindow_setBuffersGeometry")
+    const nameLock: u32 = internString(&dynstr, "ANativeWindow_lock")
+    const nameUnlock: u32 = internString(&dynstr, "ANativeWindow_unlockAndPost")
+    // These three (also part of the stable NDK libandroid.so, same as the
+    // ANativeWindow_* imports above) back onInputQueueCreated's input-queue
+    // drain, added to fix a real-device ANR -- see native_activity.mlx's
+    // buildText for the full story.
+    const nameLooperForThread: u32 = internString(&dynstr, "ALooper_forThread")
+    const nameInputQueueAttachLooper: u32 = internString(&dynstr, "AInputQueue_attachLooper")
+    const nameInputQueueGetEvent: u32 = internString(&dynstr, "AInputQueue_getEvent")
+    const nameInputQueueFinishEvent: u32 = internString(&dynstr, "AInputQueue_finishEvent")
+    // Also part of the stable NDK libandroid.so (android/input.h), added for
+    // the touch-to-cycle-colors feature: drainInputEvents inspects each
+    // event's type/action instead of just finishing it unread.
+    const nameInputEventGetType: u32 = internString(&dynstr, "AInputEvent_getType")
+    const nameMotionEventGetAction: u32 = internString(&dynstr, "AMotionEvent_getAction")
+    // Also part of libandroid.so, added to fix real-device feedback that
+    // combining rotation with touch input broke: onInputQueueDestroyed
+    // (native_activity.mlx) must detach the old, about-to-be-destroyed
+    // input queue from its looper.
+    const nameInputQueueDetachLooper: u32 = internString(&dynstr, "AInputQueue_detachLooper")
+    // libc.so, not libandroid.so -- this project's first import from it
+    // (hence the second DT_NEEDED, see build()'s own comment). Backs
+    // onSaveInstanceState's real, documented contract: the buffer it
+    // returns must be malloc'd, since the framework frees it with free().
+    const nameMalloc: u32 = internString(&dynstr, "malloc")
+    // Gesture classification (native_activity.mlx's drainInputEvents): touch
+    // position/time from libandroid.so, and a timerfd on the main ALooper
+    // for recognizing a long press while the finger is still down. All are
+    // available from API 21, this APK's minSdkVersion.
+    const nameMotionEventGetX: u32 = internString(&dynstr, "AMotionEvent_getX")
+    const nameMotionEventGetY: u32 = internString(&dynstr, "AMotionEvent_getY")
+    const nameMotionEventGetEventTime: u32 = internString(&dynstr, "AMotionEvent_getEventTime")
+    const nameLooperAddFd: u32 = internString(&dynstr, "ALooper_addFd")
+    const nameTimerfdCreate: u32 = internString(&dynstr, "timerfd_create")
+    const nameTimerfdSettime: u32 = internString(&dynstr, "timerfd_settime")
+    const nameRead: u32 = internString(&dynstr, "read")
+    // liblog.so (the third DT_NEEDED): logcat output for the input handling.
+    const nameLogPrint: u32 = internString(&dynstr, "__android_log_print")
+    const nameOnCreate: u32 = internString(&dynstr, "ANativeActivity_onCreate")
+    const nameNeeded: u32 = internString(&dynstr, needed)
+    const nameNeeded2: u32 = internString(&dynstr, needed2)
+    const nameNeeded3: u32 = internString(&dynstr, needed3)
+    const nameSoname: u32 = internString(&dynstr, soname)
+
+    // ── layout inside the RO segment ──────────────────────────────────
+    const dynsymCount: u64 = 21 // null + 19 imports + 1 export
+    const dynsymOff: u64 = RO_VADDR
+    const dynsymSize: u64 = dynsymCount * ELF64_SYM_SIZE
+
+    const dynstrOff: u64 = dynsymOff + dynsymSize
+    const dynstrSize: u64 = @intCast(u64, dynstr.length)
+
+    const hashOff: u64 = alignUp(dynstrOff + dynstrSize, 4)
+    const nbucket: u64 = 1
+    const nchain: u64 = dynsymCount
+    const hashSize: u64 = (2 + nbucket + nchain) * 4
+
+    const relaOff: u64 = alignUp(hashOff + hashSize, 8)
+    const relaCount: u64 = 19 // one GLOB_DAT per imported function
+    const relaSize: u64 = relaCount * ELF64_RELA_SIZE
+
+    const roEnd: u64 = relaOff + relaSize // must fit within one page (< TEXT_VADDR)
+
+    // ── .text ───────────────────────────────────────────────────────
+    const gotVaddr: u64 = RW_VADDR + 208 // 208 = 13 Elf64Dyn entries * 16 bytes
+    const got: na.GotLayout = na.GotLayout.{
+        .setBuffersGeometry = gotVaddr,
+        .lock = gotVaddr + 8,
+        .unlockAndPost = gotVaddr + 16,
+        .looperForThread = gotVaddr + 24,
+        .inputQueueAttachLooper = gotVaddr + 32,
+        .inputQueueGetEvent = gotVaddr + 40,
+        .inputQueueFinishEvent = gotVaddr + 48,
+        .inputEventGetType = gotVaddr + 56,
+        .motionEventGetAction = gotVaddr + 64,
+        .inputQueueDetachLooper = gotVaddr + 72,
+        .malloc = gotVaddr + 80,
+        .motionEventGetX = gotVaddr + 88,
+        .motionEventGetY = gotVaddr + 96,
+        .motionEventGetEventTime = gotVaddr + 104,
+        .looperAddFd = gotVaddr + 112,
+        .timerfdCreate = gotVaddr + 120,
+        .timerfdSettime = gotVaddr + 128,
+        .read = gotVaddr + 136,
+        .logPrint = gotVaddr + 144,
+    }
+    const gotSize: u64 = 152 // 19 GOT slots * 8 bytes
+    // `.data`: this experiment's own small, writable app-state block --
+    // g_currentColor/g_colorIndex/g_window/g_activity, all written and read
+    // only by our own code (never by the dynamic linker, unlike `.got`
+    // above) -- see native_activity.mlx's DATA_OFFSET_* constants for the
+    // layout. Re-introduces a `.data` allocation after an earlier round
+    // removed one (`g_callbacks`, a *different*, since-fixed mistake: that
+    // one was replacing a framework-owned pointer instead of writing
+    // through it -- see buildText's onCreate comment). This one is
+    // legitimate mutable state with no such framework contract to violate.
+    const dataVaddr: u64 = gotVaddr + gotSize
+    const dataSize: u64 = na.DATA_SIZE
+    const text: na.Builder = na.buildText(TEXT_VADDR, got, dataVaddr)
+    const textSize: u64 = @intCast(u64, text.count) * 4 // must fit within one page
+
+    // ── layout inside the RW segment ──────────────────────────────────
+    const dynamicOff: u64 = RW_VADDR
+    const dynamicCount: u64 = 13 // 3 DT_NEEDED (libandroid.so, libc.so, liblog.so) + 9 others + DT_NULL
+    const dynamicSize: u64 = dynamicCount * ELF64_DYN_SIZE
+    const gotOff: u64 = gotVaddr
+    const dataOff: u64 = dataVaddr
+    const rwEnd: u64 = dataOff + dataSize // must fit within RW_VADDR + PAGE
+
+    // ── section header string table (tooling only) ────────────────────
+    var shstrtab: ArrayList = std.array_list.ArrayList.init(allocator, 128)
+    var ok1: bool = std.array_list.ArrayList.appendAt(&shstrtab, 0)
+    const shDynsym: u32 = internString(&shstrtab, ".dynsym")
+    const shDynstr: u32 = internString(&shstrtab, ".dynstr")
+    const shHash: u32 = internString(&shstrtab, ".hash")
+    const shRela: u32 = internString(&shstrtab, ".rela.dyn")
+    const shDynamic: u32 = internString(&shstrtab, ".dynamic")
+    const shGot: u32 = internString(&shstrtab, ".got")
+    const shText: u32 = internString(&shstrtab, ".text")
+    const shData: u32 = internString(&shstrtab, ".data")
+    const shShstrtab: u32 = internString(&shstrtab, ".shstrtab")
+
+    const shstrtabOff: u64 = rwEnd
+    const shstrtabSize: u64 = @intCast(u64, shstrtab.length)
+    const shdrOff: u64 = alignUp(shstrtabOff + shstrtabSize, 8)
+    const shnum: u64 = 10 // null, dynsym, dynstr, hash, rela.dyn, dynamic, text, got, data, shstrtab
+    const shdrSize: u64 = shnum * ELF64_SHDR_SIZE
+    const fileSize: u64 = shdrOff + shdrSize
+
+    // ── assemble the file ──────────────────────────────────────────────
+    var buf: ArrayList = std.array_list.ArrayList.init(allocator, @intCast(usize, fileSize))
+    buf = std.array_list.ArrayList.resize(buf, @intCast(usize, fileSize), 0)
+
+    // ELF header
+    w8(buf, 0, 127) // 0x7f
+    w8(buf, 1, 69) // 'E'
+    w8(buf, 2, 76) // 'L'
+    w8(buf, 3, 70) // 'F'
+    w8(buf, 4, ELFCLASS64)
+    w8(buf, 5, ELFDATA2LSB)
+    w8(buf, 6, EV_CURRENT)
+    w8(buf, 7, ELFOSABI_NONE)
+    // bytes 8..15 (e_ident padding) stay zero
+    w16(buf, 16, ET_DYN)
+    w16(buf, 18, EM_AARCH64)
+    w32(buf, 20, EV_CURRENT)
+    w64(buf, 24, 0) // e_entry: a library, no entry point
+    w64(buf, 32, 64) // e_phoff
+    w64(buf, 40, shdrOff) // e_shoff
+    w32(buf, 48, 0) // e_flags
+    w16(buf, 52, @intCast(u32, ELF64_EHDR_SIZE)) // e_ehsize
+    w16(buf, 54, @intCast(u32, ELF64_PHDR_SIZE)) // e_phentsize
+    w16(buf, 56, 4) // e_phnum
+    w16(buf, 58, @intCast(u32, ELF64_SHDR_SIZE)) // e_shentsize
+    w16(buf, 60, @intCast(u32, shnum)) // e_shnum
+    w16(buf, 62, 9) // e_shstrndx (index of .shstrtab among the 10 sections: null,dynsym,dynstr,hash,rela.dyn,dynamic,text,got,data,shstrtab)
+
+    // Program headers, at file offset 0x40, 4 entries of 56 bytes.
+    // PT_LOAD #1: R, covers headers + .dynsym/.dynstr/.hash/.rela.dyn
+    var p: u64 = 64
+    w32(buf, p, PT_LOAD)
+    w32(buf, p + 4, PF_R)
+    w64(buf, p + 8, 0)
+    w64(buf, p + 16, 0)
+    w64(buf, p + 24, 0)
+    w64(buf, p + 32, roEnd)
+    w64(buf, p + 40, roEnd)
+    w64(buf, p + 48, PAGE)
+    p += ELF64_PHDR_SIZE
+    // PT_LOAD #2: R+X, .text
+    w32(buf, p, PT_LOAD)
+    w32(buf, p + 4, PF_R | PF_X)
+    w64(buf, p + 8, TEXT_VADDR)
+    w64(buf, p + 16, TEXT_VADDR)
+    w64(buf, p + 24, TEXT_VADDR)
+    w64(buf, p + 32, textSize)
+    w64(buf, p + 40, textSize)
+    w64(buf, p + 48, PAGE)
+    p += ELF64_PHDR_SIZE
+    // PT_LOAD #3: R+W, .dynamic/.got/.data
+    w32(buf, p, PT_LOAD)
+    w32(buf, p + 4, PF_R | PF_W)
+    w64(buf, p + 8, RW_VADDR)
+    w64(buf, p + 16, RW_VADDR)
+    w64(buf, p + 24, RW_VADDR)
+    w64(buf, p + 32, rwEnd - RW_VADDR)
+    w64(buf, p + 40, rwEnd - RW_VADDR)
+    w64(buf, p + 48, PAGE)
+    p += ELF64_PHDR_SIZE
+    // PT_DYNAMIC
+    w32(buf, p, PT_DYNAMIC)
+    w32(buf, p + 4, PF_R | PF_W)
+    w64(buf, p + 8, dynamicOff)
+    w64(buf, p + 16, dynamicOff)
+    w64(buf, p + 24, dynamicOff)
+    w64(buf, p + 32, dynamicSize)
+    w64(buf, p + 40, dynamicSize)
+    w64(buf, p + 48, 8)
+
+    // .dynsym: index 0 = STN_UNDEF, 1..19 = imports (undefined), 20 = export.
+    // The .rela.dyn entries below refer to imports by these indices.
+    var s: u64 = dynsymOff
+    w32(buf, s, 0)
+    w8(buf, s + 4, 0)
+    w8(buf, s + 5, 0)
+    w16(buf, s + 6, 0)
+    w64(buf, s + 8, 0)
+    w64(buf, s + 16, 0)
+    s += ELF64_SYM_SIZE
+    w32(buf, s, nameSetBuffers)
+    w8(buf, s + 4, (STB_GLOBAL << 4) | (STT_FUNC & 15))
+    w8(buf, s + 5, 0)
+    w16(buf, s + 6, SHN_UNDEF)
+    w64(buf, s + 8, 0)
+    w64(buf, s + 16, 0)
+    s += ELF64_SYM_SIZE
+    w32(buf, s, nameLock)
+    w8(buf, s + 4, (STB_GLOBAL << 4) | (STT_FUNC & 15))
+    w8(buf, s + 5, 0)
+    w16(buf, s + 6, SHN_UNDEF)
+    w64(buf, s + 8, 0)
+    w64(buf, s + 16, 0)
+    s += ELF64_SYM_SIZE
+    w32(buf, s, nameUnlock)
+    w8(buf, s + 4, (STB_GLOBAL << 4) | (STT_FUNC & 15))
+    w8(buf, s + 5, 0)
+    w16(buf, s + 6, SHN_UNDEF)
+    w64(buf, s + 8, 0)
+    w64(buf, s + 16, 0)
+    s += ELF64_SYM_SIZE
+    w32(buf, s, nameLooperForThread)
+    w8(buf, s + 4, (STB_GLOBAL << 4) | (STT_FUNC & 15))
+    w8(buf, s + 5, 0)
+    w16(buf, s + 6, SHN_UNDEF)
+    w64(buf, s + 8, 0)
+    w64(buf, s + 16, 0)
+    s += ELF64_SYM_SIZE
+    w32(buf, s, nameInputQueueAttachLooper)
+    w8(buf, s + 4, (STB_GLOBAL << 4) | (STT_FUNC & 15))
+    w8(buf, s + 5, 0)
+    w16(buf, s + 6, SHN_UNDEF)
+    w64(buf, s + 8, 0)
+    w64(buf, s + 16, 0)
+    s += ELF64_SYM_SIZE
+    w32(buf, s, nameInputQueueGetEvent)
+    w8(buf, s + 4, (STB_GLOBAL << 4) | (STT_FUNC & 15))
+    w8(buf, s + 5, 0)
+    w16(buf, s + 6, SHN_UNDEF)
+    w64(buf, s + 8, 0)
+    w64(buf, s + 16, 0)
+    s += ELF64_SYM_SIZE
+    w32(buf, s, nameInputQueueFinishEvent)
+    w8(buf, s + 4, (STB_GLOBAL << 4) | (STT_FUNC & 15))
+    w8(buf, s + 5, 0)
+    w16(buf, s + 6, SHN_UNDEF)
+    w64(buf, s + 8, 0)
+    w64(buf, s + 16, 0)
+    s += ELF64_SYM_SIZE
+    w32(buf, s, nameInputEventGetType)
+    w8(buf, s + 4, (STB_GLOBAL << 4) | (STT_FUNC & 15))
+    w8(buf, s + 5, 0)
+    w16(buf, s + 6, SHN_UNDEF)
+    w64(buf, s + 8, 0)
+    w64(buf, s + 16, 0)
+    s += ELF64_SYM_SIZE
+    w32(buf, s, nameMotionEventGetAction)
+    w8(buf, s + 4, (STB_GLOBAL << 4) | (STT_FUNC & 15))
+    w8(buf, s + 5, 0)
+    w16(buf, s + 6, SHN_UNDEF)
+    w64(buf, s + 8, 0)
+    w64(buf, s + 16, 0)
+    s += ELF64_SYM_SIZE
+    w32(buf, s, nameInputQueueDetachLooper)
+    w8(buf, s + 4, (STB_GLOBAL << 4) | (STT_FUNC & 15))
+    w8(buf, s + 5, 0)
+    w16(buf, s + 6, SHN_UNDEF)
+    w64(buf, s + 8, 0)
+    w64(buf, s + 16, 0)
+    s += ELF64_SYM_SIZE
+    w32(buf, s, nameMalloc)
+    w8(buf, s + 4, (STB_GLOBAL << 4) | (STT_FUNC & 15))
+    w8(buf, s + 5, 0)
+    w16(buf, s + 6, SHN_UNDEF)
+    w64(buf, s + 8, 0)
+    w64(buf, s + 16, 0)
+    s += ELF64_SYM_SIZE
+    writeImportSym(buf, s, nameMotionEventGetX)
+    s += ELF64_SYM_SIZE
+    writeImportSym(buf, s, nameMotionEventGetY)
+    s += ELF64_SYM_SIZE
+    writeImportSym(buf, s, nameMotionEventGetEventTime)
+    s += ELF64_SYM_SIZE
+    writeImportSym(buf, s, nameLooperAddFd)
+    s += ELF64_SYM_SIZE
+    writeImportSym(buf, s, nameTimerfdCreate)
+    s += ELF64_SYM_SIZE
+    writeImportSym(buf, s, nameTimerfdSettime)
+    s += ELF64_SYM_SIZE
+    writeImportSym(buf, s, nameRead)
+    s += ELF64_SYM_SIZE
+    writeImportSym(buf, s, nameLogPrint)
+    s += ELF64_SYM_SIZE
+    w32(buf, s, nameOnCreate)
+    w8(buf, s + 4, (STB_GLOBAL << 4) | (STT_FUNC & 15))
+    w8(buf, s + 5, 0)
+    w16(buf, s + 6, 6) // section index of .text
+    w64(buf, s + 8, TEXT_VADDR)
+    w64(buf, s + 16, textSize)
+
+    wBytes(buf, dynstrOff, dynstr.items[0..dynstr.length])
+
+    // .hash: single bucket -- O(n) lookup, fine for a handful of symbols.
+    // With nbucket=1 every name's hash lands in bucket[0] regardless of its
+    // actual value, so bucket[0]=1 (the first real symbol) plus a chain
+    // linking every symbol index in order (chain[i]=i+1, terminated by 0)
+    // is a valid, if degenerate, SysV hash table that still visits every
+    // symbol on lookup.
+    w32(buf, hashOff, @intCast(u32, nbucket))
+    w32(buf, hashOff + 4, @intCast(u32, nchain))
+    w32(buf, hashOff + 8, 1) // bucket[0] = symbol index 1
+    w32(buf, hashOff + 12, 0) // chain[0] (STN_UNDEF slot, unused)
+    // chain[i] = i + 1 for every real symbol, the last one terminating at 0.
+    var ci: u64 = 1
+    while ci < dynsymCount {
+        var next: u32 = @intCast(u32, ci + 1)
+        if ci + 1 == dynsymCount { next = 0 }
+        w32(buf, hashOff + 12 + ci * 4, next)
+        ci += 1
+    }
+
+    // .rela.dyn -- GLOB_DAT each GOT slot from its dynsym entry.
+    var r: u64 = relaOff
+    w64(buf, r, got.setBuffersGeometry)
+    w64(buf, r + 8, (1 << 32) | R_AARCH64_GLOB_DAT)
+    wi64(buf, r + 16, 0)
+    r += ELF64_RELA_SIZE
+    w64(buf, r, got.lock)
+    w64(buf, r + 8, (2 << 32) | R_AARCH64_GLOB_DAT)
+    wi64(buf, r + 16, 0)
+    r += ELF64_RELA_SIZE
+    w64(buf, r, got.unlockAndPost)
+    w64(buf, r + 8, (3 << 32) | R_AARCH64_GLOB_DAT)
+    wi64(buf, r + 16, 0)
+    r += ELF64_RELA_SIZE
+    w64(buf, r, got.looperForThread)
+    w64(buf, r + 8, (4 << 32) | R_AARCH64_GLOB_DAT)
+    wi64(buf, r + 16, 0)
+    r += ELF64_RELA_SIZE
+    w64(buf, r, got.inputQueueAttachLooper)
+    w64(buf, r + 8, (5 << 32) | R_AARCH64_GLOB_DAT)
+    wi64(buf, r + 16, 0)
+    r += ELF64_RELA_SIZE
+    w64(buf, r, got.inputQueueGetEvent)
+    w64(buf, r + 8, (6 << 32) | R_AARCH64_GLOB_DAT)
+    wi64(buf, r + 16, 0)
+    r += ELF64_RELA_SIZE
+    w64(buf, r, got.inputQueueFinishEvent)
+    w64(buf, r + 8, (7 << 32) | R_AARCH64_GLOB_DAT)
+    wi64(buf, r + 16, 0)
+    r += ELF64_RELA_SIZE
+    w64(buf, r, got.inputEventGetType)
+    w64(buf, r + 8, (8 << 32) | R_AARCH64_GLOB_DAT)
+    wi64(buf, r + 16, 0)
+    r += ELF64_RELA_SIZE
+    w64(buf, r, got.motionEventGetAction)
+    w64(buf, r + 8, (9 << 32) | R_AARCH64_GLOB_DAT)
+    wi64(buf, r + 16, 0)
+    r += ELF64_RELA_SIZE
+    w64(buf, r, got.inputQueueDetachLooper)
+    w64(buf, r + 8, (10 << 32) | R_AARCH64_GLOB_DAT)
+    wi64(buf, r + 16, 0)
+    r += ELF64_RELA_SIZE
+    w64(buf, r, got.malloc)
+    w64(buf, r + 8, (11 << 32) | R_AARCH64_GLOB_DAT)
+    wi64(buf, r + 16, 0)
+    r += ELF64_RELA_SIZE
+    writeGlobDat(buf, r, got.motionEventGetX, 12)
+    r += ELF64_RELA_SIZE
+    writeGlobDat(buf, r, got.motionEventGetY, 13)
+    r += ELF64_RELA_SIZE
+    writeGlobDat(buf, r, got.motionEventGetEventTime, 14)
+    r += ELF64_RELA_SIZE
+    writeGlobDat(buf, r, got.looperAddFd, 15)
+    r += ELF64_RELA_SIZE
+    writeGlobDat(buf, r, got.timerfdCreate, 16)
+    r += ELF64_RELA_SIZE
+    writeGlobDat(buf, r, got.timerfdSettime, 17)
+    r += ELF64_RELA_SIZE
+    writeGlobDat(buf, r, got.read, 18)
+    r += ELF64_RELA_SIZE
+    writeGlobDat(buf, r, got.logPrint, 19)
+
+    // .dynamic
+    var d: u64 = dynamicOff
+    wi64(buf, d, DT_NEEDED)
+    w64(buf, d + 8, @intCast(u64, nameNeeded))
+    d += ELF64_DYN_SIZE
+    wi64(buf, d, DT_NEEDED)
+    w64(buf, d + 8, @intCast(u64, nameNeeded2))
+    d += ELF64_DYN_SIZE
+    wi64(buf, d, DT_NEEDED)
+    w64(buf, d + 8, @intCast(u64, nameNeeded3))
+    d += ELF64_DYN_SIZE
+    wi64(buf, d, DT_SONAME)
+    w64(buf, d + 8, @intCast(u64, nameSoname))
+    d += ELF64_DYN_SIZE
+    wi64(buf, d, DT_HASH)
+    w64(buf, d + 8, hashOff)
+    d += ELF64_DYN_SIZE
+    wi64(buf, d, DT_STRTAB)
+    w64(buf, d + 8, dynstrOff)
+    d += ELF64_DYN_SIZE
+    wi64(buf, d, DT_SYMTAB)
+    w64(buf, d + 8, dynsymOff)
+    d += ELF64_DYN_SIZE
+    wi64(buf, d, DT_STRSZ)
+    w64(buf, d + 8, dynstrSize)
+    d += ELF64_DYN_SIZE
+    wi64(buf, d, DT_SYMENT)
+    w64(buf, d + 8, ELF64_SYM_SIZE)
+    d += ELF64_DYN_SIZE
+    wi64(buf, d, DT_RELA)
+    w64(buf, d + 8, relaOff)
+    d += ELF64_DYN_SIZE
+    wi64(buf, d, DT_RELASZ)
+    w64(buf, d + 8, relaSize)
+    d += ELF64_DYN_SIZE
+    wi64(buf, d, DT_RELAENT)
+    w64(buf, d + 8, ELF64_RELA_SIZE)
+    d += ELF64_DYN_SIZE
+    wi64(buf, d, DT_NULL)
+    w64(buf, d + 8, 0)
+
+    // .text
+    var i: usize = 0
+    while i < text.count {
+        w32(buf, TEXT_VADDR + @intCast(u64, i) * 4, text.words[i])
+        i += 1
+    }
+    // .got left zero -- filled by the dynamic linker's GLOB_DAT relocations
+    // at load time.
+
+    wBytes(buf, shstrtabOff, shstrtab.items[0..shstrtab.length])
+
+    // Section headers.
+    var h: u64 = shdrOff
+    w32(buf, h, 0) // SHN_UNDEF
+    h += ELF64_SHDR_SIZE
+    w32(buf, h, shDynsym)
+    w32(buf, h + 4, SHT_DYNSYM)
+    w64(buf, h + 8, SHF_ALLOC)
+    w64(buf, h + 16, dynsymOff)
+    w64(buf, h + 24, dynsymOff)
+    w64(buf, h + 32, dynsymSize)
+    w32(buf, h + 40, 2)
+    w32(buf, h + 44, 1)
+    w64(buf, h + 48, 8)
+    w64(buf, h + 56, ELF64_SYM_SIZE)
+    h += ELF64_SHDR_SIZE
+    w32(buf, h, shDynstr)
+    w32(buf, h + 4, SHT_STRTAB)
+    w64(buf, h + 8, SHF_ALLOC)
+    w64(buf, h + 16, dynstrOff)
+    w64(buf, h + 24, dynstrOff)
+    w64(buf, h + 32, dynstrSize)
+    w64(buf, h + 48, 1)
+    h += ELF64_SHDR_SIZE
+    w32(buf, h, shHash)
+    w32(buf, h + 4, SHT_HASH)
+    w64(buf, h + 8, SHF_ALLOC)
+    w64(buf, h + 16, hashOff)
+    w64(buf, h + 24, hashOff)
+    w64(buf, h + 32, hashSize)
+    w32(buf, h + 40, 1)
+    w64(buf, h + 48, 4)
+    w64(buf, h + 56, 4)
+    h += ELF64_SHDR_SIZE
+    w32(buf, h, shRela)
+    w32(buf, h + 4, SHT_RELA)
+    w64(buf, h + 8, SHF_ALLOC)
+    w64(buf, h + 16, relaOff)
+    w64(buf, h + 24, relaOff)
+    w64(buf, h + 32, relaSize)
+    w32(buf, h + 40, 1)
+    w64(buf, h + 48, 8)
+    w64(buf, h + 56, ELF64_RELA_SIZE)
+    h += ELF64_SHDR_SIZE
+    w32(buf, h, shDynamic)
+    w32(buf, h + 4, SHT_DYNAMIC)
+    w64(buf, h + 8, SHF_ALLOC | SHF_WRITE)
+    w64(buf, h + 16, dynamicOff)
+    w64(buf, h + 24, dynamicOff)
+    w64(buf, h + 32, dynamicSize)
+    w32(buf, h + 40, 2)
+    w64(buf, h + 48, 8)
+    w64(buf, h + 56, ELF64_DYN_SIZE)
+    h += ELF64_SHDR_SIZE
+    w32(buf, h, shText)
+    w32(buf, h + 4, SHT_PROGBITS)
+    w64(buf, h + 8, SHF_ALLOC | SHF_EXECINSTR)
+    w64(buf, h + 16, TEXT_VADDR)
+    w64(buf, h + 24, TEXT_VADDR)
+    w64(buf, h + 32, textSize)
+    w64(buf, h + 48, 4)
+    h += ELF64_SHDR_SIZE
+    w32(buf, h, shGot)
+    w32(buf, h + 4, SHT_PROGBITS)
+    w64(buf, h + 8, SHF_ALLOC | SHF_WRITE)
+    w64(buf, h + 16, gotOff)
+    w64(buf, h + 24, gotOff)
+    w64(buf, h + 32, gotSize)
+    w64(buf, h + 48, 8)
+    w64(buf, h + 56, 8)
+    h += ELF64_SHDR_SIZE
+    w32(buf, h, shData)
+    w32(buf, h + 4, SHT_PROGBITS)
+    w64(buf, h + 8, SHF_ALLOC | SHF_WRITE)
+    w64(buf, h + 16, dataOff)
+    w64(buf, h + 24, dataOff)
+    w64(buf, h + 32, dataSize)
+    w64(buf, h + 48, 8)
+    h += ELF64_SHDR_SIZE
+    w32(buf, h, shShstrtab)
+    w32(buf, h + 4, SHT_STRTAB)
+    w64(buf, h + 16, 0)
+    w64(buf, h + 24, shstrtabOff)
+    w64(buf, h + 32, shstrtabSize)
+    w64(buf, h + 48, 1)
+
+    return buf
+}

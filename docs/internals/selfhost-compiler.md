@@ -426,6 +426,93 @@ canonicalization pipeline on a hand-built six-instruction LIR sequence: an
 instructions are marked `dead` and excluded from the `instructionsAfter`
 count.
 
+**Known gap: a module-level `const` of non-integer/non-boolean type
+miscompiles into a bogus "unresolved backend symbol" instead of a proper
+diagnostic.** `sema/comptime/value.mlx`'s `Kind` enum only has
+`integer`/`boolean`/`type_value`/`null_value` variants — there is no
+representation for a comptime string, slice, or array. `ir/lower.mlx`'s
+`lowerSymbolValue` (the function that decides how to lower a reference to a
+resolved symbol) handles the `integer`/`boolean` comptime tags and function
+symbols (`FLAG_FUNCTION`) explicitly, then falls through to `return
+lir.NONE` for anything else — which is exactly what happens for, say, a
+top-level `const ANDROID_NS_URI: []const u8 = "..."` or a top-level `const
+IDS: [9]u32 = [9]u32{...}`. The caller (the general identifier-lowering
+path around line 2489) only uses that `lowerSymbolValue` result if it isn't
+`NONE`; when it is, the code falls all the way through to a "might be a
+forward-reference function; add as symbol" fallback that unconditionally
+treats the identifier as an as-yet-undefined function, emitting a
+`lir.addModuleSymbol` reference (named `.m<module>.<NAME>`) and a
+`func_sym` LIR instruction for it. No function body with that name is ever
+lowered to satisfy the reference, so it reaches the backend as a fixup with
+no matching label, and `encoder.applyFixups` fails at the "resolve backend
+symbols" pipeline step with `MLX-E3004: unresolved backend symbol` — a
+diagnostic that (per `driver/pipeline.mlx:206`) carries no source location,
+so the actual cause (a harmless-looking top-level string or array constant
+declared possibly hundreds of lines from where it's used) is easy to miss.
+`driver/reporter.mlx:171`'s `Reporter.unresolvedSymbol` does print the
+bogus symbol name (e.g. `.m0.SHORT_STR`) to stderr, but only when `mlx1` is
+invoked with `--trace`/`--verbose` — without that flag the error is
+reported with zero identifying information at all. Reproduced with a
+minimal two-line repro (`const S: []const u8 = "hi"` at module scope,
+referenced as `S.length` inside `main`) that fails the same way regardless
+of string length or of whether the const is referenced once or multiple
+times; a *local* (function-scope) `const` of the same type, or the string
+literal used directly, both lower correctly, which is what makes this a
+gap in top-level/module-scope constant handling specifically rather than in
+slice/string lowering in general. Found and worked around (not fixed) while
+porting `experiments/android-aarch64-bluescreen/tool/axml.zig` to
+`experiments/android-aarch64-bluescreen/mlx/axml.mlx`: every top-level
+`const` of a type other than a plain integer/boolean was rewritten as a
+zero-argument function returning the value (`androidNsUri()`) or an
+indexing function (`androidAttrId(i)`) instead — see the comments at
+`experiments/android-aarch64-bluescreen/mlx/axml.mlx`'s `androidNsUri` and
+`androidAttrId`. No regression test or fix exists for this in the compiler
+itself yet; a real fix would need `sema/comptime/value.mlx`'s `Kind` to gain
+a representation for these types (or, short of that, at minimum
+`lowerSymbolValue` should report a proper location-carrying diagnostic
+instead of silently falling through to the forward-function-reference path
+when a resolved, non-function symbol can't be lowered).
+
+**Fixed: `undefined` initializing a memory-typed field inside an aggregate
+literal dereferenced address 0 and crashed.** `lowerNode`'s
+`undefined_literal` case (line ~1192) lowers `undefined` to a single scalar
+`lir.constI(lir.NONE, 0)` for every type uniformly — a reasonable
+placeholder for a scalar field, but wrong for a `struct`/`union`/`array`
+-typed one. `lowerAggregateLiteral`'s per-field loop always lowered the
+initializer and called `storeAggregateValue`, which for a memory type
+(`aggregate_copy.isMemoryType`) calls `aggregate_copy.emit(ir, typeStore,
+address, value, type_id)` — and `aggregate_copy.emit` treats its `value`
+argument as a *source address* to `load` from at each word offset
+(`copyWidth`/`addressAt` in `ir/lowering/aggregate_copy.mlx`), not as an
+already-materialized value. So `Type.{ .arrayField = undefined, ... }`
+computed a GEP off address `0` and unconditionally dereferenced it — a
+near-null-pointer read — crashing with `SIGSEGV` on every such literal,
+independent of the struct's total size (this is a different, more precise
+root cause than an earlier size-threshold guess made while porting the
+Android experiment — see `experiments/android-aarch64-bluescreen/mlx/`'s
+`StringPool`, whose out-parameter-constructor workaround predates this fix
+and is left in place as a harmless, still-valid pattern rather than
+unwound). Confirmed independent of return-by-value: a bare local `const b:
+T = T.{ .words = undefined, .count = 7 }` crashed identically to returning
+the same literal from a function, and a *scalar* field given `undefined` in
+the same literal was unaffected either way. Notably, a whole-variable `var
+x: T = undefined` was already correct — `lowerBindingInitializer` (line
+~3542) special-cases exactly this situation by `alloca`-ing fresh,
+intentionally-uninitialized storage instead of attempting a copy — so the
+bug was specifically in the per-field path inside an aggregate literal,
+which had no equivalent special case. Fixed by adding one: in
+`lowerAggregateLiteral`, a field is now skipped entirely (no address
+computed, no store emitted, matching `lowerBindingInitializer`'s "leave the
+allocated memory as-is" semantics) exactly when its initializer AST node is
+`ast.Tag.undefined_literal` *and* its type is a memory type; every other
+field — including a scalar field set to `undefined`, and any field given a
+real value — is unaffected and still lowers exactly as before.
+`tests/236_undefined_memory_field_aggregate_literal_runtime.mlx` is the
+regression test: it crashes the pre-fix compiler and exits `0` afterward,
+covering both an array field and a nested-struct field, both as a local and
+as a function return value, with a sibling field that gets a real value in
+the same literal to prove the fix doesn't over-skip.
+
 ## x86_64 backend (`backend/x86_64/codegen.mlx`, `codegen/emitter.mlx`)
 
 `backend/x86_64/codegen.mlx`'s `Codegen` is a thin public facade (matching
@@ -466,6 +553,57 @@ directly matching the README's "separates mutable backend state from
 label, memory, arithmetic, value, call and control-flow instruction
 emission."
 
+Every LIR value (`vreg`) lives at a fixed stack offset assigned once by
+`State.allocateOp`, keyed by a per-function `slotEpoch` so vreg-index slots
+can be reused across functions without clearing the whole table between
+them (bumped once per function in `State.beginFunction`, not per basic
+block). A single-word value that is used by exactly the LIR instruction
+right after it skips that stack write as a peephole
+(`State.storeRaxResult`'s `canRetainNext`/`state.pendingRaxVreg` path):
+the value stays in `rax` only, on the assumption that its one consumer is
+about to read it immediately. `State.getComponent` is a plain "has this
+vreg already been written to memory?" peek that knows nothing about that
+pending state; most component-0 readers instead go through `State.loadOp`,
+which does. Two call sites didn't: `emitTupleElement` (`@field(value, N)`
+codegen, `codegen/values.mlx`) and the call-argument loaders
+(`codegen/calls.mlx`). Whenever the retained value's real consumer wasn't
+literally the next instruction — one arm of a branch reading the field
+while the other called anything, or the value being passed to a call and
+then read again — those two silently treated the "not yet written" peek as
+"the value is zero" (`emitTupleElement` had a literal `movRegImm64 rax, 0`
+fallback) instead of resolving the still-pending value. Fixed by routing
+component-0 reads through `State.loadOp` in both places;
+`tests/235_component_zero_call_and_branch_runtime.mlx` reproduces all three
+shapes directly (and asserts the fix), and `tests/170_standard_fmt_any_struct_runtime.mlx` /
+`tests/173_standard_fmt_nested_any_runtime.mlx` (see `## fmt` in
+`docs/reference/stdlib.md`) are real pre-existing tests that this same bug
+crashed (`SIGSEGV`) before the fix, via `std.io.printFmt`'s single-argument
+recursive `anytype`-tuple lookup.
+
+**Known gap: `uN`/`iN` wider than 64 bits are not actually multi-word.**
+`operators.xml` normatively allows `uN`/`iN` up to 4096 bits (see
+`spec/00-language/operators.xml`'s `ArbitraryWidth`), but nothing in the
+current pipeline represents or computes on a width above the native 64-bit
+register: `ir/lower.mlx`'s `typeWordCount` — the function that decides how
+many stack-slot components a value needs — returns `1` for every integer
+type, `u128`/`u256`/`u4096` included, only special-casing `slice`,
+`error_union`, and `tuple`. `backend/x86_64/codegen/arithmetic.mlx`
+matches: every arithmetic opcode (`emitSimple`/`emitNumeric` for
+add/sub/mul/bitwise, `emitDivision`, `emitShift`) emits exactly one native
+64-bit instruction, with no width-based branching or carry/borrow chain
+across additional words at all. In effect a `uN`/`iN` value with N > 64 is
+silently truncated to its low 64 bits everywhere at runtime — comptime
+constant folding (`sema/comptime/`) is unaffected and does compute the
+full-width value, which is why a *literal* wide-integer expression can
+look correct while the identical computation over runtime values (e.g.
+behind a function call the optimizer can't fold through) silently loses
+everything above bit 63. This is a real, reproducible gap (confirmed with
+runtime — non-comptime-folded — `u128` left-shift-by-64 and division, both
+wrong), not a small bug: closing it needs multi-word type layout, N/64-word
+LIR lowering with real carry propagation for add/sub, a genuine
+multiplication algorithm, long division, and cross-word shifts, for every
+arithmetic operator. No fix or regression test exists for this yet.
+
 `emitStartStub` hand-encodes the process entry point (`_start`) directly as
 raw opcode bytes (`encoder.emit1(state.*.enc, 0x48) ...`) — reading argc off
 the stack, computing argv, calling `main`, and exiting via the `syscall`
@@ -479,6 +617,58 @@ generated executable does its own bump-pointer heap management rather than
 depending on any libc allocator. This is a direct, concrete instance of the
 x86_64 spec's "Direct machine-code byte emission. No external assembler is
 required" (`spec/02-compiler/x86_64.xml`).
+
+**Known gap, severe: every `var x: T = undefined` for a struct/union/array
+`T` permanently consumes space from that same 256&nbsp;MiB arena, for the
+life of the whole process, no matter how short-lived or tightly-scoped the
+variable is — a loop that declares one is a hard, silent crash waiting to
+happen.** `codegen/memory.mlx`'s `emitAlloca` has two paths: a sized
+allocation (`instruction.arg0 != NONE`, which is what every aggregate-typed
+local literal is lowered to, in both `lowerBindingInitializer`'s `undefined`
+case and `lowerAggregateLiteral`) always calls `emitArenaAllocation`, an
+atomic-XADD bump of the arena cursor (`r14`) checked against the arena limit
+(`r15`) with `emitTrap` on overflow; an unsized allocation instead reserves a
+plain function-frame-relative slot via `state.*.nextStackSlot`, exactly like
+an ordinary scalar local, correctly reused across every dynamic execution of
+that instruction (loop iterations, repeated calls) because it's a
+compile-time-fixed offset, not a runtime-growing cursor. Nothing routes
+aggregate locals through the second, correctly-scoped path — every one goes
+through the arena, and the arena is bumped **every time the `alloca`
+instruction executes at runtime**, not once per place it appears in the
+source. A loop (directly, or one call away — the same declaration site
+inside a function called repeatedly from a loop counts too) that declares
+such a local exhausts the arena and hits the trap after
+roughly `268435464 / sizeof(T)` dynamic executions — confirmed with a
+minimal repro, `while i < 2000000 { var x: SomeStruct = undefined; ... }`
+for a 328-byte struct crashes (`SIGILL`, the `emitTrap`) at ~800,000
+iterations (~262&nbsp;MB, matching the arena size); hoisting the identical
+declaration above the loop and reusing the variable removes the ceiling
+entirely (2,000,000 iterations, no crash, since the `alloca` then executes
+once). This was found and worked around (not fixed) porting
+`experiments/android-aarch64-bluescreen/tool/bignum.zig` to
+`experiments/android-aarch64-bluescreen/mlx/bignum.mlx`: an RSA keygen's
+inner loops (long division, modular exponentiation, the extended Euclidean
+algorithm) each declare a handful of `BigUint` (328-byte struct) locals per
+iteration by the most natural way to write them, and real key sizes run
+those loops enough times to exhaust the arena within seconds. The general
+shape of the workaround, applied throughout `bignum.mlx`: hoist every
+loop-body `var x: T = undefined` to above its loop and reuse it by
+overwriting through the existing pointer-based mutator functions (safe
+because a limb-by-limb/field-by-field write never depends on a stale
+previous value once every field is rewritten); where a function on a hot
+path (called repeatedly from a loop, not just looping itself) needs its own
+scratch aggregate, thread it in from the caller as an extra out-parameter
+instead of declaring it locally (see `mulToScratch`/`biMulScratch` next to
+the plain `mulTo`, which just supplies a fresh scratch buffer for
+occasional/cold-path use). A real fix would extend the existing
+correctly-scoped `nextStackSlot` path to sized allocations too — the
+mechanism already exists and already reuses slots correctly across dynamic
+executions for scalars — but doing that safely needs `functionFrameSize`
+(`codegen/state.mlx`, currently `(instruction_count * 24 + 271)` rounded up,
+with no awareness of aggregate sizes at all) to also account for the total
+concurrent aggregate-local footprint of a function, which this port did not
+attempt. No fix or regression test exists for this in the compiler itself
+yet.
 
 ## ELF64 object writer (`object/elf64.mlx`)
 

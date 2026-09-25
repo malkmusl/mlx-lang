@@ -1,0 +1,289 @@
+// RSA key generation, a minimal self-signed X.509 certificate, and classic
+// (no signed-attributes) PKCS#7 `SignedData` -- enough to produce the
+// `META-INF/MANIFEST.MF`, `META-INF/CERT.SF` and `META-INF/CERT.RSA` trio
+// that make an APK's ZIP a *signed* JAR (APK Signature Scheme v1 / JAR
+// signing). Straight port of
+// experiments/android-aarch64-bluescreen/tool/jar_sign.zig.
+//
+// Where the Zig version bundles the keypair into an `RsaKeyPair` struct
+// (`n`/`e`/`d`: `Managed`), this port threads `n`/`d` as separate `*
+// bignum.BigUint` parameters throughout instead: taking the address of a
+// struct FIELD (`&keyPair.*.n`) does not work in the current self-hosted
+// compiler (see bignum.mlx's note on the same issue for the `BigInt`
+// signed-value wrapper -- this hits the identical `&expr.field` gap, just
+// with an RSA-keypair-shaped struct instead of a bignum-internal one). `e`
+// is always the fixed public exponent 65537 by construction, so it is
+// never threaded as a BigUint at all after keygen -- just written as the
+// literal `65537` wherever DER needs its value.
+//
+// Also, like asn1.mlx, every OID here is a zero-argument function instead
+// of a top-level string constant, because referencing a module-level
+// `const` of non-integer/boolean type from a function miscompiles (see
+// docs/internals/selfhost-compiler.md and axml.mlx's `androidNsUri` note).
+
+const std = @import("std")
+const bn = @import("./bignum.mlx")
+const asn1 = @import("./asn1.mlx")
+const hash = @import("./hash.mlx")
+const zip = @import("./zip.mlx")
+
+pub const Allocator = std.allocator.Allocator
+pub const ArrayList = std.array_list.ArrayList
+
+fn oidRsaEncryption() -> []const u8 { return "1.2.840.113549.1.1.1" }
+fn oidSha256WithRsa() -> []const u8 { return "1.2.840.113549.1.1.11" }
+fn oidSha256() -> []const u8 { return "2.16.840.1.101.3.4.2.1" }
+fn oidCommonName() -> []const u8 { return "2.5.4.3" }
+fn oidPkcs7Data() -> []const u8 { return "1.2.840.113549.1.7.1" }
+fn oidPkcs7SignedData() -> []const u8 { return "1.2.840.113549.1.7.2" }
+
+// Generate an RSA key pair with a `bits`-bit modulus and public exponent
+// 65537; returns n_bytes = (bits+7)/8. ~1 minute at 512-bit primes (see
+// bignum.mlx's header comment for why this port's default is smaller than
+// the Zig prototype's 2048-bit real-build default) -- this runs once per
+// APK build, not per signature.
+pub fn generateKeyPair(n: *bn.BigUint, d: *bn.BigUint, bits: usize) -> usize {
+    var p: bn.BigUint = undefined
+    bn.randomPrime(&p, bits / 2)
+    var q: bn.BigUint = undefined
+    bn.randomPrime(&q, bits / 2)
+
+    bn.mulTo(n, &p, &q)
+
+    var one: bn.BigUint = undefined
+    bn.setU64(&one, 1)
+    var p1: bn.BigUint = undefined
+    bn.subTo(&p1, &p, &one)
+    var q1: bn.BigUint = undefined
+    bn.subTo(&q1, &q, &one)
+    var phi: bn.BigUint = undefined
+    bn.mulTo(&phi, &p1, &q1)
+
+    var e: bn.BigUint = undefined
+    bn.setU64(&e, 65537)
+    bn.modInverse(d, &e, &phi)
+
+    return (bits + 7) / 8
+}
+
+fn algIdWithNull(allocator: Allocator, oidDotted: []const u8) -> ArrayList {
+    const o = asn1.oid(allocator, oidDotted)
+    const nul = asn1.asnNull(allocator)
+    return asn1.sequence2(allocator, o.items[0..o.length], nul.items[0..nul.length])
+}
+
+// RSASSA-PKCS1-v1_5 signature of a SHA-256 digest (RFC 8017 Sec 8.2, 9.2):
+// EM = 0x00 0x01 [0xFF...] 0x00 DigestInfo(sha256, digest); signature =
+// EM^d mod n, left-padded to exactly `nBytes`.
+pub fn signSha256Pkcs1v15(allocator: Allocator, n: *bn.BigUint, d: *bn.BigUint, nBytes: usize, digest: []const u8) -> ArrayList {
+    const algId = algIdWithNull(allocator, oidSha256())
+    const digestOctets = asn1.octetString(allocator, digest)
+    const digestInfo = asn1.sequence2(allocator, algId.items[0..algId.length], digestOctets.items[0..digestOctets.length])
+
+    var em: ArrayList = std.array_list.ArrayList.init(allocator, nBytes)
+    em = std.array_list.ArrayList.resize(em, nBytes, 0)
+    std.array_list.ArrayList.set(em, 0, 0)
+    std.array_list.ArrayList.set(em, 1, 1)
+    const psLen: usize = nBytes - digestInfo.length - 3
+    var i: usize = 0
+    while i < psLen {
+        std.array_list.ArrayList.set(em, 2 + i, 255)
+        i += 1
+    }
+    std.array_list.ArrayList.set(em, 2 + psLen, 0)
+    const digestInfoStart: usize = nBytes - digestInfo.length
+    i = 0
+    while i < digestInfo.length {
+        std.array_list.ArrayList.set(em, digestInfoStart + i, digestInfo.items[i])
+        i += 1
+    }
+
+    var emInt: bn.BigUint = undefined
+    bn.fromBytesBE(&emInt, em.items[0..nBytes])
+    var sigInt: bn.BigUint = undefined
+    bn.modPow(&sigInt, &emInt, d, n)
+
+    return bn.toBytesBEPadded(&sigInt, allocator, nBytes)
+}
+
+fn rdnCommonName(allocator: Allocator, cn: []const u8) -> ArrayList {
+    const cnOid = asn1.oid(allocator, oidCommonName())
+    const cnVal = asn1.utf8String(allocator, cn)
+    const ava = asn1.sequence2(allocator, cnOid.items[0..cnOid.length], cnVal.items[0..cnVal.length])
+    const rdn = asn1.set1(allocator, ava.items[0..ava.length])
+    return asn1.sequence1(allocator, rdn.items[0..rdn.length])
+}
+
+// A minimal self-signed v1 X.509 certificate over the keypair, subject/
+// issuer `CN=<cn>`, valid 1970-01-01..2049-12-31 (kept inside the UTCTime
+// range so no GeneralizedTime handling is needed).
+pub fn buildSelfSignedCert(allocator: Allocator, n: *bn.BigUint, d: *bn.BigUint, nBytes: usize, cn: []const u8, serial: u64) -> ArrayList {
+    const name = rdnCommonName(allocator, cn)
+
+    const nMag = bn.toBytesBEMinimal(n, allocator)
+    const nInt = asn1.integerFromUnsignedBE(allocator, nMag.items[0..nMag.length])
+    const eInt = asn1.integerFromU64(allocator, 65537)
+    const rsaPub = asn1.sequence2(allocator, nInt.items[0..nInt.length], eInt.items[0..eInt.length])
+    const rsaAlg = algIdWithNull(allocator, oidRsaEncryption())
+    const pubKeyBits = asn1.bitStringFromBytes(allocator, rsaPub.items[0..rsaPub.length])
+    const spki = asn1.sequence2(allocator, rsaAlg.items[0..rsaAlg.length], pubKeyBits.items[0..pubKeyBits.length])
+
+    const notBefore = asn1.utcTime(allocator, "700101000000Z")
+    const notAfter = asn1.utcTime(allocator, "491231235959Z")
+    const validity = asn1.sequence2(allocator, notBefore.items[0..notBefore.length], notAfter.items[0..notAfter.length])
+
+    const serialInt = asn1.integerFromU64(allocator, serial)
+    const sigAlg = algIdWithNull(allocator, oidSha256WithRsa())
+
+    const tbs = asn1.sequence6(allocator, serialInt.items[0..serialInt.length], sigAlg.items[0..sigAlg.length], name.items[0..name.length], validity.items[0..validity.length], name.items[0..name.length], spki.items[0..spki.length])
+
+    const digest = hash.sha256(tbs.items[0..tbs.length])
+    const sig = signSha256Pkcs1v15(allocator, n, d, nBytes, digest.bytes[0..32])
+    const sigBits = asn1.bitStringFromBytes(allocator, sig.items[0..sig.length])
+
+    return asn1.sequence3(allocator, tbs.items[0..tbs.length], sigAlg.items[0..sigAlg.length], sigBits.items[0..sigBits.length])
+}
+
+// PKCS#7 `SignedData` (detached, no signed attributes -- the classic JAR
+// `CERT.RSA` shape) over `content` (the CERT.SF bytes), embedding `certDer`.
+pub fn buildPkcs7SignedData(allocator: Allocator, n: *bn.BigUint, d: *bn.BigUint, nBytes: usize, certDer: []const u8, cn: []const u8, serial: u64, content: []const u8) -> ArrayList {
+    const digestAlg = algIdWithNull(allocator, oidSha256())
+    const digestAlgsSet = asn1.set1(allocator, digestAlg.items[0..digestAlg.length])
+
+    const dataOid = asn1.oid(allocator, oidPkcs7Data())
+    const innerContentInfo = asn1.sequence1(allocator, dataOid.items[0..dataOid.length])
+
+    const certsWrapper = asn1.implicitConstructedTag1(allocator, 0, certDer)
+
+    const digest = hash.sha256(content)
+    const sig = signSha256Pkcs1v15(allocator, n, d, nBytes, digest.bytes[0..32])
+    const encDigest = asn1.octetString(allocator, sig.items[0..sig.length])
+
+    const name = rdnCommonName(allocator, cn)
+    const serialInt = asn1.integerFromU64(allocator, serial)
+    const issuerAndSerial = asn1.sequence2(allocator, name.items[0..name.length], serialInt.items[0..serialInt.length])
+
+    const rsaAlg = algIdWithNull(allocator, oidRsaEncryption())
+    const version1 = asn1.integerFromU64(allocator, 1)
+
+    const signerInfo = asn1.sequence5(allocator, version1.items[0..version1.length], issuerAndSerial.items[0..issuerAndSerial.length], digestAlg.items[0..digestAlg.length], rsaAlg.items[0..rsaAlg.length], encDigest.items[0..encDigest.length])
+    const signerInfosSet = asn1.set1(allocator, signerInfo.items[0..signerInfo.length])
+
+    const version1b = asn1.integerFromU64(allocator, 1)
+    const signedData = asn1.sequence5(allocator, version1b.items[0..version1b.length], digestAlgsSet.items[0..digestAlgsSet.length], innerContentInfo.items[0..innerContentInfo.length], certsWrapper.items[0..certsWrapper.length], signerInfosSet.items[0..signerInfosSet.length])
+
+    const sdOid = asn1.oid(allocator, oidPkcs7SignedData())
+    const explicitSd = asn1.explicitTag1(allocator, 0, signedData.items[0..signedData.length])
+
+    return asn1.sequence2(allocator, sdOid.items[0..sdOid.length], explicitSd.items[0..explicitSd.length])
+}
+
+// ── JAR manifest / signature-file text generation ─────────────────────────
+
+fn base64Char(v: u32) -> u8 {
+    if v < 26 { return @intCast(u8, 65 + v) } // A-Z
+    if v < 52 { return @intCast(u8, 97 + (v - 26)) } // a-z
+    if v < 62 { return @intCast(u8, 48 + (v - 52)) } // 0-9
+    if v == 62 { return 43 } // +
+    return 47 // /
+}
+
+fn base64Encode(allocator: Allocator, data: []const u8) -> ArrayList {
+    var out: ArrayList = std.array_list.ArrayList.init(allocator, ((data.length + 2) / 3) * 4)
+    var i: usize = 0
+    while i + 3 <= data.length {
+        const b0: u32 = @intCast(u32, data[i])
+        const b1: u32 = @intCast(u32, data[i + 1])
+        const b2: u32 = @intCast(u32, data[i + 2])
+        out = std.array_list.ArrayList.append(out, base64Char(b0 >> 2))
+        out = std.array_list.ArrayList.append(out, base64Char(((b0 & 3) << 4) | (b1 >> 4)))
+        out = std.array_list.ArrayList.append(out, base64Char(((b1 & 15) << 2) | (b2 >> 6)))
+        out = std.array_list.ArrayList.append(out, base64Char(b2 & 63))
+        i += 3
+    }
+    const remaining: usize = data.length - i
+    if remaining == 1 {
+        const b0: u32 = @intCast(u32, data[i])
+        out = std.array_list.ArrayList.append(out, base64Char(b0 >> 2))
+        out = std.array_list.ArrayList.append(out, base64Char((b0 & 3) << 4))
+        out = std.array_list.ArrayList.append(out, 61) // '='
+        out = std.array_list.ArrayList.append(out, 61)
+    } else {
+        if remaining == 2 {
+            const b0: u32 = @intCast(u32, data[i])
+            const b1: u32 = @intCast(u32, data[i + 1])
+            out = std.array_list.ArrayList.append(out, base64Char(b0 >> 2))
+            out = std.array_list.ArrayList.append(out, base64Char(((b0 & 3) << 4) | (b1 >> 4)))
+            out = std.array_list.ArrayList.append(out, base64Char((b1 & 15) << 2))
+            out = std.array_list.ArrayList.append(out, 61)
+        }
+    }
+    return out
+}
+
+fn sha256Base64(allocator: Allocator, data: []const u8) -> ArrayList {
+    const digest = hash.sha256(data)
+    return base64Encode(allocator, digest.bytes[0..32])
+}
+
+fn buildManifestSection(allocator: Allocator, name: []const u8, digestB64: []const u8) -> ArrayList {
+    var out: ArrayList = std.array_list.ArrayList.init(allocator, name.length + digestB64.length + 40)
+    out = std.array_list.ArrayList.appendSlice(out, "Name: ")
+    out = std.array_list.ArrayList.appendSlice(out, name)
+    out = std.array_list.ArrayList.appendSlice(out, "\r\nSHA-256-Digest: ")
+    out = std.array_list.ArrayList.appendSlice(out, digestB64)
+    out = std.array_list.ArrayList.appendSlice(out, "\r\n\r\n")
+    return out
+}
+
+pub const SignedJarFiles = struct {
+    manifestMf: ArrayList
+    certSf: ArrayList
+    certRsa: ArrayList
+}
+
+// Produce MANIFEST.MF, CERT.SF and CERT.RSA for `entries` (the APK's
+// content files other than the META-INF/ signing trio itself). Out
+// -parameters rather than a returned `SignedJarFiles` -- assigning a whole
+// struct through `ptr.* = value` is fine (confirmed separately), but
+// `SignedJarFiles` bundles three ArrayLists and every other "many results"
+// function in this port already uses out-parameters, so this matches.
+pub fn signJar(allocator: Allocator, n: *bn.BigUint, d: *bn.BigUint, nBytes: usize, certDer: []const u8, cn: []const u8, serial: u64, entries: *zip.EntryList, mfOut: *ArrayList, sfOut: *ArrayList, rsaOut: *ArrayList) -> void {
+    var mf: ArrayList = std.array_list.ArrayList.init(allocator, 512)
+    mf = std.array_list.ArrayList.appendSlice(mf, "Manifest-Version: 1.0\r\nCreated-By: mlx android-aarch64-bluescreen experiment\r\n\r\n")
+
+    var i: usize = 0
+    while i < entries.*.count {
+        const entryName = zip.nameAt(entries, i)
+        const entryData = zip.dataAt(entries, i)
+        const digestB64 = sha256Base64(allocator, entryData)
+        const section = buildManifestSection(allocator, entryName, digestB64.items[0..digestB64.length])
+        mf = std.array_list.ArrayList.appendSlice(mf, section.items[0..section.length])
+        i += 1
+    }
+
+    const mfDigestB64 = sha256Base64(allocator, mf.items[0..mf.length])
+
+    var sf: ArrayList = std.array_list.ArrayList.init(allocator, 512)
+    sf = std.array_list.ArrayList.appendSlice(sf, "Signature-Version: 1.0\r\nCreated-By: mlx android-aarch64-bluescreen experiment\r\nSHA-256-Digest-Manifest: ")
+    sf = std.array_list.ArrayList.appendSlice(sf, mfDigestB64.items[0..mfDigestB64.length])
+    sf = std.array_list.ArrayList.appendSlice(sf, "\r\n\r\n")
+
+    i = 0
+    while i < entries.*.count {
+        const entryName = zip.nameAt(entries, i)
+        const entryData = zip.dataAt(entries, i)
+        const digestB64 = sha256Base64(allocator, entryData)
+        const section = buildManifestSection(allocator, entryName, digestB64.items[0..digestB64.length])
+        const sectionDigestB64 = sha256Base64(allocator, section.items[0..section.length])
+        const sfSection = buildManifestSection(allocator, entryName, sectionDigestB64.items[0..sectionDigestB64.length])
+        sf = std.array_list.ArrayList.appendSlice(sf, sfSection.items[0..sfSection.length])
+        i += 1
+    }
+
+    const certRsa = buildPkcs7SignedData(allocator, n, d, nBytes, certDer, cn, serial, sf.items[0..sf.length])
+
+    mfOut.* = mf
+    sfOut.* = sf
+    rsaOut.* = certRsa
+}

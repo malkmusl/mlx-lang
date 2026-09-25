@@ -15,9 +15,8 @@ in the shader.
 
 ## Build
 
-This example needs the aarch64-android target and `std.android` from the
-Android compiler branch (`claude/mlx-android-compiler-integration`); once
-that branch is merged:
+From the repository root, with the aarch64-android target
+([`docs/reference/android.md`](../../docs/reference/android.md)):
 
 ```sh
 zig-out/bin/mlx1 examples/vulkan-android/main.mlx -o vulkan.apk \
@@ -35,5 +34,10 @@ The log shows `vulkan: device ready`, `vulkan: swapchain created` and
 - The swapchain path runs on lavapipe through a `VK_EXT_headless_surface`
   (`tests/258_vulkan_swapchain_runtime.mlx`): creation, rendering,
   presentation, recreation at a new size.
-- The activity code type-checks against the Android branch's `std.android`.
-- Running it needs an Android device or emulator with Vulkan.
+- `tools/emulate_vulkan_android.py` runs the app's `libmain.so` (aarch64)
+  under Unicorn against a model of the Android framework and a mock Vulkan
+  driver: every Vulkan call, the submitted shader (`spirv-val`), each
+  presented frame pixel by pixel, touch input, out-of-date and resized
+  swapchains, the window going away and coming back, and a device without
+  Vulkan.
+- On hardware: `adb install -r vulkan.apk`, then `adb logcat -s mlx`.

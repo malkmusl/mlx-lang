@@ -1,0 +1,404 @@
+// Android support for --target=aarch64-android: NDK bindings and a small
+// NativeActivity runtime.
+//
+// An app is two functions over one `usize` of state:
+//
+//     const android = @import("std.android")
+//
+//     fn draw(canvas: *android.Canvas, state: usize) -> void {
+//         android.fill(canvas, if state == 0 { android.rgb(0, 0, 255) } else { android.rgb(0, 200, 0) })
+//     }
+//
+//     fn update(state: usize, gesture: android.Gesture) -> usize { return state + 1 }
+//
+//     export fn ANativeActivity_onCreate(activity: usize, saved_state: usize, saved_state_size: usize) -> void {
+//         android.start(activity, saved_state, saved_state_size, draw, update)
+//     }
+//
+// The runtime registers the activity callbacks, repaints the window with
+// `draw` whenever Android asks for it, drains the input queue on the main
+// looper, recognizes taps, long presses and swipes, passes each one to
+// `update` and repaints, and keeps the state across the activity restart a
+// rotation causes (onSaveInstanceState). Recognized gestures are logged to
+// logcat under the tag "mlx".
+//
+// Everything the runtime needs per event (window buffer, event out-param,
+// timer spec) lives in one malloc'd App block reached through the
+// activity's `instance` field, so handling input allocates nothing.
+
+// ── NDK functions (libandroid.so, liblog.so, libc.so) ─────────────────────
+
+pub extern("c") fn ANativeActivity_finish(activity: usize) -> void
+pub extern("c") fn ANativeWindow_setBuffersGeometry(window: usize, width: i32, height: i32, format: i32) -> i32
+pub extern("c") fn ANativeWindow_lock(window: usize, buffer: usize, dirty_bounds: usize) -> i32
+pub extern("c") fn ANativeWindow_unlockAndPost(window: usize) -> i32
+pub extern("c") fn ALooper_forThread() -> usize
+pub extern("c") fn ALooper_addFd(looper: usize, fd: i32, ident: i32, events: i32, callback: usize, data: usize) -> i32
+pub extern("c") fn ALooper_removeFd(looper: usize, fd: i32) -> i32
+pub extern("c") fn AInputQueue_attachLooper(queue: usize, looper: usize, ident: i32, callback: usize, data: usize) -> void
+pub extern("c") fn AInputQueue_detachLooper(queue: usize) -> void
+pub extern("c") fn AInputQueue_getEvent(queue: usize, event_out: usize) -> i32
+pub extern("c") fn AInputQueue_preDispatchEvent(queue: usize, event: usize) -> i32
+pub extern("c") fn AInputQueue_finishEvent(queue: usize, event: usize, handled: i32) -> void
+pub extern("c") fn AInputEvent_getType(event: usize) -> i32
+pub extern("c") fn AMotionEvent_getAction(event: usize) -> i32
+pub extern("c") fn AMotionEvent_getX(event: usize, pointer_index: usize) -> f32
+pub extern("c") fn AMotionEvent_getY(event: usize, pointer_index: usize) -> f32
+pub extern("c") fn AMotionEvent_getEventTime(event: usize) -> i64
+pub extern("c") fn __android_log_write(priority: i32, tag: [*]const u8, text: [*]const u8) -> i32
+pub extern("c") fn timerfd_create(clock: i32, flags: i32) -> i32
+pub extern("c") fn timerfd_settime(fd: i32, flags: i32, new_value: usize, old_value: usize) -> i32
+pub extern("c") fn read(fd: i32, buffer: usize, length: usize) -> isize
+pub extern("c") fn close(fd: i32) -> i32
+pub extern("c") fn malloc(size: usize) -> usize
+pub extern("c") fn free(pointer: usize) -> void
+
+// ── NDK constants and struct offsets ──────────────────────────────────────
+
+pub const WINDOW_FORMAT_RGBA_8888: i32 = 1
+pub const INPUT_EVENT_TYPE_MOTION: i32 = 2
+pub const MOTION_ACTION_MASK: i32 = 255
+pub const MOTION_ACTION_DOWN: i32 = 0
+pub const MOTION_ACTION_UP: i32 = 1
+pub const MOTION_ACTION_MOVE: i32 = 2
+pub const MOTION_ACTION_CANCEL: i32 = 3
+pub const MOTION_ACTION_POINTER_DOWN: i32 = 5
+pub const LOOPER_EVENT_INPUT: i32 = 1
+pub const LOG_INFO: i32 = 4
+const CLOCK_MONOTONIC: i32 = 1
+const TIMER_FLAGS: i32 = 526336 // TFD_NONBLOCK (0x800) | TFD_CLOEXEC (0x80000)
+
+// struct ANativeActivity: callbacks at 0, instance at 56.
+const ACTIVITY_CALLBACKS: usize = 0
+const ACTIVITY_INSTANCE: usize = 56
+// struct ANativeActivityCallbacks, one function pointer each.
+const ON_SAVE_INSTANCE_STATE: usize = 16
+const ON_DESTROY: usize = 40
+const ON_NATIVE_WINDOW_CREATED: usize = 56
+const ON_NATIVE_WINDOW_RESIZED: usize = 64
+const ON_NATIVE_WINDOW_REDRAW_NEEDED: usize = 72
+const ON_NATIVE_WINDOW_DESTROYED: usize = 80
+const ON_INPUT_QUEUE_CREATED: usize = 88
+const ON_INPUT_QUEUE_DESTROYED: usize = 96
+// ANativeWindow_Buffer: width, height, stride, format (i32), bits pointer.
+const BUFFER_WIDTH: usize = 0
+const BUFFER_HEIGHT: usize = 4
+const BUFFER_STRIDE: usize = 8
+const BUFFER_BITS: usize = 16
+const BUFFER_SIZE: usize = 48
+
+// ── Drawing ───────────────────────────────────────────────────────────────
+
+// The locked window: `stride` pixels per row, RGBA_8888.
+pub const Canvas = struct {
+    pixels: usize
+    width: usize
+    height: usize
+    stride: usize
+}
+
+// An opaque RGBA_8888 pixel (bytes R, G, B, A in memory).
+pub fn rgb(red: u32, green: u32, blue: u32) -> u32 {
+    return 4278190080 | ((blue & 255) << 16) | ((green & 255) << 8) | (red & 255)
+}
+
+pub fn fillRect(canvas: *Canvas, x: usize, y: usize, width: usize, height: usize, color: u32) -> void {
+    const right = if x + width < canvas.*.width { x + width } else { canvas.*.width }
+    const bottom = if y + height < canvas.*.height { y + height } else { canvas.*.height }
+    var row = y
+    while row < bottom {
+        var address = canvas.*.pixels + (row * canvas.*.stride + x) * 4
+        const end = canvas.*.pixels + (row * canvas.*.stride + right) * 4
+        while address < end {
+            unsafe { @ptrFromInt(*u32, address).* = color }
+            address += 4
+        }
+        row += 1
+    }
+}
+
+pub fn fill(canvas: *Canvas, color: u32) -> void {
+    fillRect(canvas, 0, 0, canvas.*.width, canvas.*.height, color)
+}
+
+// ── Logging ───────────────────────────────────────────────────────────────
+
+// Logs a string literal (mlx string literals are zero-terminated) to
+// logcat with tag "mlx".
+pub fn log(text: []const u8) -> void {
+    unsafe { const written = __android_log_write(LOG_INFO, @ptrCast([*]const u8, "mlx"), @ptrCast([*]const u8, text)) }
+}
+
+// ── Gestures ──────────────────────────────────────────────────────────────
+
+pub const Gesture = enum(u8) { tap, long_press, swipe_left, swipe_right, swipe_up, swipe_down }
+
+pub const DrawFn = fn(*Canvas, usize) -> void
+pub const UpdateFn = fn(usize, Gesture) -> usize
+
+// A touch that stays within this many pixels of where it went down is a
+// tap or long press; beyond it, a swipe (about 8dp on a typical phone).
+pub const TOUCH_SLOP: i64 = 24
+// Held without moving this long (nanoseconds): a long press.
+pub const LONG_PRESS_NANOSECONDS: i64 = 500000000
+
+// ── Runtime ───────────────────────────────────────────────────────────────
+
+const App = struct {
+    activity: usize
+    window: usize
+    queue: usize
+    looper: usize
+    timer: i32
+    state: usize
+    draw: usize
+    update: usize
+    // Touch being tracked (one finger).
+    tracking: bool
+    moved: bool
+    longPressed: bool
+    downX: i64
+    downY: i64
+    downTime: i64
+    // Scratch in the same block: ANativeWindow_Buffer, the AInputEvent*
+    // out-parameter, an itimerspec, and the Canvas handed to `draw`.
+    buffer: usize
+    event: usize
+    timerSpec: usize
+    canvas: usize
+}
+
+fn appOf(activity: usize) -> *App {
+    unsafe { return @ptrFromInt(*App, @ptrFromInt(*usize, activity + ACTIVITY_INSTANCE).*) }
+}
+
+fn setCallback(activity: usize, offset: usize, function: usize) -> void {
+    unsafe {
+        const callbacks = @ptrFromInt(*usize, activity + ACTIVITY_CALLBACKS).*
+        @ptrFromInt(*usize, callbacks + offset).* = function
+    }
+}
+
+fn readU32(address: usize) -> u32 {
+    unsafe { return @ptrFromInt(*u32, address).* }
+}
+
+fn writeU64(address: usize, value: u64) -> void {
+    unsafe { @ptrFromInt(*u64, address).* = value }
+}
+
+// Starts the runtime for `activity` (call it from ANativeActivity_onCreate,
+// passing its arguments through).
+pub fn start(activity: usize, saved_state: usize, saved_state_size: usize, draw: DrawFn, update: UpdateFn) -> void {
+    const block = malloc(@sizeOf(App) + BUFFER_SIZE + 8 + 32 + @sizeOf(Canvas))
+    if block == 0 { return }
+    var app: *App = undefined
+    unsafe { app = @ptrFromInt(*App, block) }
+    app.*.activity = activity
+    app.*.window = 0
+    app.*.queue = 0
+    app.*.looper = ALooper_forThread()
+    app.*.state = 0
+    if saved_state != 0 && saved_state_size >= 8 {
+        unsafe { app.*.state = @ptrFromInt(*usize, saved_state).* }
+    }
+    app.*.draw = @intFromPtr(draw)
+    app.*.update = @intFromPtr(update)
+    app.*.tracking = false
+    app.*.moved = false
+    app.*.longPressed = false
+    app.*.downX = 0
+    app.*.downY = 0
+    app.*.downTime = 0
+    app.*.buffer = block + @sizeOf(App)
+    app.*.event = app.*.buffer + BUFFER_SIZE
+    app.*.timerSpec = app.*.event + 8
+    app.*.canvas = app.*.timerSpec + 32
+    app.*.timer = timerfd_create(CLOCK_MONOTONIC, TIMER_FLAGS)
+    if app.*.timer >= 0 && app.*.looper != 0 {
+        const added = ALooper_addFd(app.*.looper, app.*.timer, 2, LOOPER_EVENT_INPUT, @intFromPtr(onTimer), block)
+    }
+    unsafe { @ptrFromInt(*usize, activity + ACTIVITY_INSTANCE).* = block }
+    // Write into the callback table the framework already points us at.
+    setCallback(activity, ON_SAVE_INSTANCE_STATE, @intFromPtr(onSaveInstanceState))
+    setCallback(activity, ON_DESTROY, @intFromPtr(onDestroy))
+    setCallback(activity, ON_NATIVE_WINDOW_CREATED, @intFromPtr(onWindowChanged))
+    setCallback(activity, ON_NATIVE_WINDOW_RESIZED, @intFromPtr(onWindowChanged))
+    setCallback(activity, ON_NATIVE_WINDOW_REDRAW_NEEDED, @intFromPtr(onWindowChanged))
+    setCallback(activity, ON_NATIVE_WINDOW_DESTROYED, @intFromPtr(onWindowDestroyed))
+    setCallback(activity, ON_INPUT_QUEUE_CREATED, @intFromPtr(onInputQueueCreated))
+    setCallback(activity, ON_INPUT_QUEUE_DESTROYED, @intFromPtr(onInputQueueDestroyed))
+}
+
+// Repaints the whole window with the app's `draw`.
+fn paint(app: *App) -> void {
+    const window = app.*.window
+    if window == 0 { return }
+    const geometry = ANativeWindow_setBuffersGeometry(window, 0, 0, WINDOW_FORMAT_RGBA_8888)
+    if ANativeWindow_lock(window, app.*.buffer, 0) < 0 { return }
+    const buffer = app.*.buffer
+    var canvas: *Canvas = undefined
+    unsafe { canvas = @ptrFromInt(*Canvas, app.*.canvas) }
+    canvas.*.width = @intCast(usize, readU32(buffer + BUFFER_WIDTH))
+    canvas.*.height = @intCast(usize, readU32(buffer + BUFFER_HEIGHT))
+    canvas.*.stride = @intCast(usize, readU32(buffer + BUFFER_STRIDE))
+    unsafe { canvas.*.pixels = @ptrFromInt(*usize, buffer + BUFFER_BITS).* }
+    var draw: DrawFn = undefined
+    unsafe { draw = @ptrFromInt(DrawFn, app.*.draw) }
+    draw(canvas, app.*.state)
+    const posted = ANativeWindow_unlockAndPost(window)
+}
+
+fn recognize(app: *App, gesture: Gesture) -> void {
+    match gesture {
+        Gesture.tap => { log("gesture: tap") },
+        Gesture.long_press => { log("gesture: long press") },
+        Gesture.swipe_left => { log("gesture: swipe left") },
+        Gesture.swipe_right => { log("gesture: swipe right") },
+        Gesture.swipe_up => { log("gesture: swipe up") },
+        else => { log("gesture: swipe down") },
+    }
+    var update: UpdateFn = undefined
+    unsafe { update = @ptrFromInt(UpdateFn, app.*.update) }
+    app.*.state = update(app.*.state, gesture)
+    paint(app)
+}
+
+// Arms the long-press timer for `nanoseconds` from now, or disarms it (0).
+fn setTimer(app: *App, nanoseconds: i64) -> void {
+    if app.*.timer < 0 { return }
+    const spec = app.*.timerSpec
+    writeU64(spec, 0) // it_interval: none
+    writeU64(spec + 8, 0)
+    writeU64(spec + 16, @intCast(u64, nanoseconds / 1000000000)) // it_value
+    writeU64(spec + 24, @intCast(u64, nanoseconds % 1000000000))
+    const set = timerfd_settime(app.*.timer, 0, spec, 0)
+}
+
+fn absolute(value: i64) -> i64 { return if value < 0 { 0 - value } else { value } }
+
+fn handleMotion(app: *App, event: usize) -> void {
+    const action = AMotionEvent_getAction(event) & MOTION_ACTION_MASK
+    const x_position: f32 = AMotionEvent_getX(event, 0)
+    const y_position: f32 = AMotionEvent_getY(event, 0)
+    const x: i64 = @intFromFloat(i64, x_position)
+    const y: i64 = @intFromFloat(i64, y_position)
+    if action == MOTION_ACTION_DOWN {
+        app.*.tracking = true
+        app.*.moved = false
+        app.*.longPressed = false
+        app.*.downX = x
+        app.*.downY = y
+        app.*.downTime = AMotionEvent_getEventTime(event)
+        setTimer(app, LONG_PRESS_NANOSECONDS)
+        return
+    }
+    if !app.*.tracking { return }
+    const dx = x - app.*.downX
+    const dy = y - app.*.downY
+    const outside = absolute(dx) > TOUCH_SLOP || absolute(dy) > TOUCH_SLOP
+    if action == MOTION_ACTION_MOVE {
+        if outside && !app.*.moved {
+            app.*.moved = true
+            setTimer(app, 0)
+        }
+        return
+    }
+    if action == MOTION_ACTION_UP {
+        app.*.tracking = false
+        setTimer(app, 0)
+        if app.*.longPressed { return }
+        if app.*.moved || outside {
+            if absolute(dx) >= absolute(dy) {
+                recognize(app, if dx < 0 { Gesture.swipe_left } else { Gesture.swipe_right })
+            } else {
+                recognize(app, if dy < 0 { Gesture.swipe_up } else { Gesture.swipe_down })
+            }
+            return
+        }
+        // Normally the timer already recognized a long press; this covers
+        // an UP that arrives before the timer callback runs.
+        const held = AMotionEvent_getEventTime(event) - app.*.downTime
+        recognize(app, if held >= LONG_PRESS_NANOSECONDS { Gesture.long_press } else { Gesture.tap })
+        return
+    }
+    if action == MOTION_ACTION_CANCEL || action == MOTION_ACTION_POINTER_DOWN {
+        app.*.tracking = false
+        setTimer(app, 0)
+    }
+}
+
+// ── Activity callbacks (C ABI, called by the framework) ───────────────────
+
+fn onWindowChanged(activity: usize, window: usize) -> void {
+    const app = appOf(activity)
+    app.*.window = window
+    paint(app)
+}
+
+fn onWindowDestroyed(activity: usize, window: usize) -> void {
+    appOf(activity).*.window = 0
+}
+
+fn onInputQueueCreated(activity: usize, queue: usize) -> void {
+    const app = appOf(activity)
+    app.*.queue = queue
+    AInputQueue_attachLooper(queue, app.*.looper, 1, @intFromPtr(onInput), @intFromPtr(app))
+}
+
+fn onInputQueueDestroyed(activity: usize, queue: usize) -> void {
+    const app = appOf(activity)
+    AInputQueue_detachLooper(queue)
+    app.*.queue = 0
+    app.*.tracking = false
+    setTimer(app, 0)
+}
+
+// Hands the framework the state to pass back to the next onCreate.
+fn onSaveInstanceState(activity: usize, size_out: usize) -> usize {
+    const saved = malloc(8)
+    if saved == 0 { return 0 }
+    writeU64(saved, @intCast(u64, appOf(activity).*.state))
+    writeU64(size_out, 8)
+    return saved
+}
+
+fn onDestroy(activity: usize) -> void {
+    const app = appOf(activity)
+    if app.*.timer >= 0 {
+        if app.*.looper != 0 { const removed = ALooper_removeFd(app.*.looper, app.*.timer) }
+        const closed = close(app.*.timer)
+    }
+    unsafe { @ptrFromInt(*usize, activity + ACTIVITY_INSTANCE).* = 0 }
+    free(@intFromPtr(app))
+}
+
+// ── Looper callbacks: return 1 to stay registered ─────────────────────────
+
+// Drains every pending input event; motion events feed the recognizer and
+// every event is finished as unhandled, so system gestures keep working.
+fn onInput(fd: i32, events: i32, data: usize) -> i32 {
+    var app: *App = undefined
+    unsafe { app = @ptrFromInt(*App, data) }
+    while app.*.queue != 0 && AInputQueue_getEvent(app.*.queue, app.*.event) >= 0 {
+        var event: usize = 0
+        unsafe { event = @ptrFromInt(*usize, app.*.event).* }
+        if AInputQueue_preDispatchEvent(app.*.queue, event) == 0 {
+            if AInputEvent_getType(event) == INPUT_EVENT_TYPE_MOTION { handleMotion(app, event) }
+            AInputQueue_finishEvent(app.*.queue, event, 0)
+        }
+    }
+    return 1
+}
+
+// The long-press timer expired while the finger is still down and still.
+fn onTimer(fd: i32, events: i32, data: usize) -> i32 {
+    var app: *App = undefined
+    unsafe { app = @ptrFromInt(*App, data) }
+    const expirations = read(fd, app.*.event, 8)
+    if app.*.tracking && !app.*.moved && !app.*.longPressed {
+        app.*.longPressed = true
+        recognize(app, Gesture.long_press)
+    }
+    return 1
+}

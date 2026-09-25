@@ -298,3 +298,7 @@ fn main() u8 {
 ```
 
 (`tests/98_nonexhaustive_enum_requires_else.mlx`)
+
+A `match` used as a value can produce any type, including a slice: both
+its pointer and its length leave the arm
+(`tests/260_match_slice_result_runtime.mlx`).

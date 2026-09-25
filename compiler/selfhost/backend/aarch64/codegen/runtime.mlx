@@ -1,0 +1,626 @@
+// Runtime helpers the AArch64 backend emits once per program, after the
+// compiled functions. Generated code reaches them with BL, and each helper
+// clobbers only caller-saved registers (x0-x17), so they are safe from mlx
+// code and from C callers alike (shared libraries, Stage 3).
+//
+//   __mlx_arena_alloc   x0 = size (multiple of 8) -> x0 = zeroed memory.
+//                       The x86_64 backend maps its 256 MiB aggregate arena
+//                       in _start; here the arena is mapped on first use so
+//                       a shared library needs no entry hook. Its base lives
+//                       in the writable data block (__mlx_arena_base).
+//   __mlx_byte_mask_64  x0 = pointer, x1 = byte -> x0 = bit i set when
+//                       pointer[i] == byte, for i in 0..63.
+//   __mlx_syscall       x8 = Linux x86_64 syscall number, x0-x5 = arguments
+//                       -> x0 = result. Translates the call to the aarch64
+//                       kernel ABI: numbers, the legacy path calls x86_64
+//                       still has (open, stat, mkdir, ... become *at calls),
+//                       O_* flag bits that differ, and the struct stat and
+//                       epoll_event layouts that differ. Unknown numbers
+//                       return -ENOSYS.
+const encoder = @import("../encoder.mlx")
+
+const X0: u32 = 0
+const X1: u32 = 1
+const X2: u32 = 2
+const X3: u32 = 3
+const X4: u32 = 4
+const X5: u32 = 5
+const X8: u32 = 8
+const X9: u32 = 9
+const X10: u32 = 10
+const X11: u32 = 11
+const X12: u32 = 12
+const X13: u32 = 13
+const X14: u32 = 14
+const X15: u32 = 15
+const X16: u32 = 16
+const ZR: u32 = 31
+const SP: u32 = 31
+
+// Same capacity as the x86_64 arena: 256 MiB plus the bump-pointer word.
+const ARENA_CAPACITY: u64 = 268435464
+const AT_FDCWD: u64 = 18446744073709551516 // -100
+const AT_SYMLINK_NOFOLLOW: u64 = 256
+const AT_REMOVEDIR: u64 = 512
+const SYSCALL_TABLE_ENTRIES: usize = 436
+
+pub const Helper = enum(u8) { arena_alloc, byte_mask_64, syscall }
+
+pub fn emitCall(enc: *encoder.Encoder, helper: Helper) -> void {
+    unsafe {
+        match helper {
+            Helper.arena_alloc => { encoder.emitCallTo(enc, @ptrCast([*]const u8, "__mlx_arena_alloc"), 17) },
+            Helper.byte_mask_64 => { encoder.emitCallTo(enc, @ptrCast([*]const u8, "__mlx_byte_mask_64"), 18) },
+            else => { encoder.emitCallTo(enc, @ptrCast([*]const u8, "__mlx_syscall"), 13) },
+        }
+    }
+}
+
+pub fn emitHelpers(enc: *encoder.Encoder) -> void {
+    emitArenaAlloc(enc)
+    emitByteMask64(enc)
+    emitSyscall(enc)
+}
+
+fn emit(enc: *encoder.Encoder, word: u32) -> void { encoder.emit32(enc, word) }
+
+fn imm(enc: *encoder.Encoder, rd: u32, value: u64) -> void { encoder.emitLoadImm(enc, rd, value) }
+
+// Reserves one word for a forward branch; `land` patches it once the
+// target (the current position at that point) is known.
+fn reserve(enc: *encoder.Encoder) -> usize {
+    const at = encoder.pos(enc)
+    emit(enc, 0)
+    return at
+}
+
+fn back(enc: *encoder.Encoder, target: usize) -> i32 { return encoder.delta(encoder.pos(enc), target) }
+
+fn emitArenaAlloc(enc: *encoder.Encoder) -> void {
+    var base_name: [*]const u8 = undefined
+    unsafe {
+        base_name = @ptrCast([*]const u8, "__mlx_arena_base")
+        encoder.defineDataSymbol(enc, base_name, 16, 8)
+        encoder.defineSymbol(enc, @ptrCast([*]const u8, "__mlx_arena_alloc"), 17)
+    }
+    encoder.emitAddressOf(enc, X16, base_name, 16)
+    emit(enc, encoder.ldar(X1, X16))
+    const to_have = reserve(enc)
+    // First use: map the arena and publish it with a compare-and-swap, so
+    // two threads racing here agree on one arena.
+    emit(enc, encoder.movReg(X9, X0))
+    imm(enc, X0, 0)
+    imm(enc, X1, ARENA_CAPACITY)
+    imm(enc, X2, 3) // PROT_READ | PROT_WRITE
+    imm(enc, X3, 34) // MAP_PRIVATE | MAP_ANONYMOUS
+    imm(enc, X4, 18446744073709551615)
+    imm(enc, X5, 0)
+    imm(enc, X8, 222) // mmap
+    emit(enc, encoder.SVC0)
+    imm(enc, X2, 18446744073709547520) // -4096: results above it are -errno
+    emit(enc, encoder.cmpReg(X0, X2))
+    const map_failed = reserve(enc)
+    emit(enc, encoder.addImm(X1, X0, 8))
+    emit(enc, encoder.strX(X1, X0, 0))
+    const cas = encoder.pos(enc)
+    emit(enc, encoder.ldxr(X2, X16))
+    const to_lost = reserve(enc)
+    emit(enc, encoder.stlxr(X3, X0, X16))
+    emit(enc, encoder.cbnzW(X3, back(enc, cas)))
+    emit(enc, encoder.movReg(X1, X0))
+    emit(enc, encoder.movReg(X0, X9))
+    const won_to_have = reserve(enc)
+    encoder.patch32(enc, to_lost, encoder.cbnzX(X2, encoder.delta(to_lost, encoder.pos(enc))))
+    // Another thread published first: drop this mapping, use theirs.
+    emit(enc, encoder.movReg(X10, X2))
+    imm(enc, X1, ARENA_CAPACITY)
+    imm(enc, X8, 215) // munmap
+    emit(enc, encoder.SVC0)
+    emit(enc, encoder.movReg(X1, X10))
+    emit(enc, encoder.movReg(X0, X9))
+    const have = encoder.pos(enc)
+    encoder.patch32(enc, to_have, encoder.cbnzX(X1, encoder.delta(to_have, have)))
+    encoder.patch32(enc, won_to_have, encoder.b(encoder.delta(won_to_have, have)))
+    // x1 = arena base, whose first word is the bump pointer; x0 = size.
+    emit(enc, encoder.ldxr(X2, X1))
+    emit(enc, encoder.addReg(X3, X2, X0))
+    emit(enc, encoder.stxr(X4, X3, X1))
+    emit(enc, encoder.cbnzW(X4, back(enc, have)))
+    imm(enc, X5, ARENA_CAPACITY)
+    emit(enc, encoder.addReg(X5, X1, X5))
+    emit(enc, encoder.cmpReg(X3, X5))
+    const exhausted = reserve(enc)
+    emit(enc, encoder.movReg(X0, X2))
+    emit(enc, encoder.RET)
+    const trap = encoder.pos(enc)
+    encoder.patch32(enc, map_failed, encoder.bCond(encoder.COND_HI, encoder.delta(map_failed, trap)))
+    encoder.patch32(enc, exhausted, encoder.bCond(encoder.COND_HI, encoder.delta(exhausted, trap)))
+    emit(enc, encoder.UDF0)
+}
+
+fn emitByteMask64(enc: *encoder.Encoder) -> void {
+    unsafe { encoder.defineSymbol(enc, @ptrCast([*]const u8, "__mlx_byte_mask_64"), 18) }
+    emit(enc, encoder.uxtb(X1, X1))
+    imm(enc, X2, 0)
+    imm(enc, X3, 0)
+    const loop = encoder.pos(enc)
+    emit(enc, encoder.ldrbReg(X4, X0, X3))
+    emit(enc, encoder.cmpRegW(X4, X1))
+    emit(enc, encoder.bCond(encoder.COND_NE, 16))
+    emit(enc, encoder.movz(X5, 1, 0))
+    emit(enc, encoder.lslv(X5, X5, X3))
+    emit(enc, encoder.orrReg(X2, X2, X5))
+    emit(enc, encoder.addImm(X3, X3, 1))
+    emit(enc, encoder.cmpImm(X3, 64))
+    emit(enc, encoder.bCond(encoder.COND_LO, back(enc, loop)))
+    emit(enc, encoder.movReg(X0, X2))
+    emit(enc, encoder.RET)
+}
+
+// ── Syscall translation ───────────────────────────────────────────────────
+
+fn emitSyscall(enc: *encoder.Encoder) -> void {
+    // Shared tails first so the cases below can branch back to them.
+    const stat_fix = encoder.pos(enc)
+    emitStatFix(enc)
+    const enosys = encoder.pos(enc)
+    imm(enc, X0, 18446744073709551578) // -ENOSYS
+    emit(enc, encoder.RET)
+
+    var table_name: [*]const u8 = undefined
+    unsafe {
+        table_name = @ptrCast([*]const u8, "__mlx_syscall_table")
+        encoder.defineSymbol(enc, @ptrCast([*]const u8, "__mlx_syscall"), 13)
+    }
+    emitOpen(enc)
+    emitOpenAt(enc)
+    emitStatCases(enc, stat_fix)
+    emitPoll(enc)
+    emitClone(enc)
+    emitPathCases(enc)
+    emitEpollWait(enc)
+    emitEpollCtl(enc)
+
+    // Everything else maps 1:1 through the number table.
+    emit(enc, encoder.cmpImm(X8, @intCast(u32, SYSCALL_TABLE_ENTRIES)))
+    emit(enc, encoder.bCond(encoder.COND_HS, back(enc, enosys)))
+    encoder.emitAddressOf(enc, X16, table_name, 19)
+    emit(enc, encoder.ldrhReg(X8, X16, X8))
+    emit(enc, encoder.cbzX(X8, back(enc, enosys)))
+    emit(enc, encoder.SVC0)
+    emit(enc, encoder.RET)
+    emitSyscallTable(enc, table_name)
+}
+
+// Opens a case for x86_64 syscall `number`: compares x8 and reserves the
+// branch that skips the case body. `endCase` points it past the body.
+fn beginCase(enc: *encoder.Encoder, number: u32) -> usize {
+    emit(enc, encoder.cmpImm(X8, number))
+    return reserve(enc)
+}
+
+fn endCase(enc: *encoder.Encoder, skip: usize) -> void {
+    encoder.patch32(enc, skip, encoder.bCond(encoder.COND_NE, encoder.delta(skip, encoder.pos(enc))))
+}
+
+fn invoke(enc: *encoder.Encoder, number: u64) -> void {
+    imm(enc, X8, number)
+    emit(enc, encoder.SVC0)
+    emit(enc, encoder.RET)
+}
+
+// x86_64 and aarch64 disagree on four O_* bits:
+//   O_DIRECT 0x4000 / 0x10000, O_LARGEFILE 0x8000 / 0x20000,
+//   O_DIRECTORY 0x10000 / 0x4000, O_NOFOLLOW 0x20000 / 0x8000.
+fn translateOpenFlags(enc: *encoder.Encoder, flags: u32) -> void {
+    imm(enc, X16, 0xC000)
+    emit(enc, encoder.andReg(X9, flags, X16))
+    emit(enc, encoder.lslImm(X9, X9, 2))
+    imm(enc, X16, 0x30000)
+    emit(enc, encoder.andReg(X10, flags, X16))
+    emit(enc, encoder.lsrImm(X10, X10, 2))
+    imm(enc, X16, 18446744073709289471) // ~0x3C000
+    emit(enc, encoder.andReg(flags, flags, X16))
+    emit(enc, encoder.orrReg(flags, flags, X9))
+    emit(enc, encoder.orrReg(flags, flags, X10))
+}
+
+// open(path, flags, mode) -> openat(AT_FDCWD, path, flags, mode)
+fn emitOpen(enc: *encoder.Encoder) -> void {
+    const skip = beginCase(enc, 2)
+    emit(enc, encoder.movReg(X3, X2))
+    emit(enc, encoder.movReg(X2, X1))
+    emit(enc, encoder.movReg(X1, X0))
+    imm(enc, X0, AT_FDCWD)
+    translateOpenFlags(enc, X2)
+    invoke(enc, 56)
+    endCase(enc, skip)
+}
+
+fn emitOpenAt(enc: *encoder.Encoder) -> void {
+    const skip = beginCase(enc, 257)
+    translateOpenFlags(enc, X2)
+    invoke(enc, 56)
+    endCase(enc, skip)
+}
+
+// stat (4), lstat (6), fstat (5) and newfstatat (262) all end in the
+// struct stat conversion below; the buffer pointer is in x2 when they do.
+fn emitStatCases(enc: *encoder.Encoder, stat_fix: usize) -> void {
+    var skip = beginCase(enc, 4)
+    emit(enc, encoder.movReg(X2, X1))
+    emit(enc, encoder.movReg(X1, X0))
+    imm(enc, X0, AT_FDCWD)
+    imm(enc, X3, 0)
+    imm(enc, X8, 79)
+    emit(enc, encoder.SVC0)
+    emit(enc, encoder.b(back(enc, stat_fix)))
+    endCase(enc, skip)
+    skip = beginCase(enc, 6)
+    emit(enc, encoder.movReg(X2, X1))
+    emit(enc, encoder.movReg(X1, X0))
+    imm(enc, X0, AT_FDCWD)
+    imm(enc, X3, AT_SYMLINK_NOFOLLOW)
+    imm(enc, X8, 79)
+    emit(enc, encoder.SVC0)
+    emit(enc, encoder.b(back(enc, stat_fix)))
+    endCase(enc, skip)
+    skip = beginCase(enc, 5)
+    emit(enc, encoder.movReg(X2, X1))
+    imm(enc, X8, 80)
+    emit(enc, encoder.SVC0)
+    emit(enc, encoder.b(back(enc, stat_fix)))
+    endCase(enc, skip)
+    skip = beginCase(enc, 262)
+    imm(enc, X8, 79)
+    emit(enc, encoder.SVC0)
+    emit(enc, encoder.b(back(enc, stat_fix)))
+    endCase(enc, skip)
+}
+
+// Rewrites the aarch64 struct stat at [x2] into the x86_64 layout after a
+// successful call. Offsets 0-15, 48-55 and 64-127 already agree; nlink,
+// mode, uid, gid, rdev and blksize move.
+fn emitStatFix(enc: *encoder.Encoder) -> void {
+    emit(enc, encoder.cbzX(X0, 8))
+    emit(enc, encoder.RET)
+    emit(enc, encoder.ldrW(X9, X2, 16)) // st_mode
+    emit(enc, encoder.ldrW(X10, X2, 20)) // st_nlink
+    emit(enc, encoder.ldrW(X11, X2, 24)) // st_uid
+    emit(enc, encoder.ldrW(X12, X2, 28)) // st_gid
+    emit(enc, encoder.ldrX(X13, X2, 32)) // st_rdev
+    emit(enc, encoder.ldrW(X14, X2, 56)) // st_blksize
+    emit(enc, encoder.strX(X10, X2, 16))
+    emit(enc, encoder.strW(X9, X2, 24))
+    emit(enc, encoder.strW(X11, X2, 28))
+    emit(enc, encoder.strW(X12, X2, 32))
+    emit(enc, encoder.strW(ZR, X2, 36))
+    emit(enc, encoder.strX(X13, X2, 40))
+    emit(enc, encoder.strX(X14, X2, 56))
+    emit(enc, encoder.RET)
+}
+
+// poll(fds, n, timeout_ms) -> ppoll(fds, n, timeout ? &timespec : NULL, NULL, 8)
+fn emitPoll(enc: *encoder.Encoder) -> void {
+    const skip = beginCase(enc, 7)
+    emit(enc, encoder.subImm(SP, SP, 16))
+    const infinite = reserve(enc)
+    imm(enc, X9, 1000)
+    emit(enc, encoder.udiv(X10, X2, X9))
+    emit(enc, encoder.msub(X11, X10, X9, X2))
+    imm(enc, X12, 1000000)
+    emit(enc, encoder.mul(X11, X11, X12))
+    emit(enc, encoder.strX(X10, SP, 0))
+    emit(enc, encoder.strX(X11, SP, 8))
+    emit(enc, encoder.addImm(X2, SP, 0))
+    const to_call = reserve(enc)
+    encoder.patch32(enc, infinite, encoder.tbnz(X2, 31, encoder.delta(infinite, encoder.pos(enc))))
+    imm(enc, X2, 0)
+    encoder.patch32(enc, to_call, encoder.b(encoder.delta(to_call, encoder.pos(enc))))
+    imm(enc, X3, 0)
+    imm(enc, X4, 8)
+    imm(enc, X8, 73)
+    emit(enc, encoder.SVC0)
+    emit(enc, encoder.addImm(SP, SP, 16))
+    emit(enc, encoder.RET)
+    endCase(enc, skip)
+}
+
+// clone: x86_64 passes (flags, stack, parent_tid, child_tid, tls); aarch64
+// takes tls before child_tid.
+fn emitClone(enc: *encoder.Encoder) -> void {
+    const skip = beginCase(enc, 56)
+    emit(enc, encoder.movReg(X9, X3))
+    emit(enc, encoder.movReg(X3, X4))
+    emit(enc, encoder.movReg(X4, X9))
+    invoke(enc, 220)
+    endCase(enc, skip)
+}
+
+// Legacy path syscalls that aarch64 only has in *at form.
+fn emitPathCases(enc: *encoder.Encoder) -> void {
+    // rename(old, new) -> renameat2(AT_FDCWD, old, AT_FDCWD, new, 0)
+    var skip = beginCase(enc, 82)
+    emit(enc, encoder.movReg(X3, X1))
+    emit(enc, encoder.movReg(X1, X0))
+    imm(enc, X0, AT_FDCWD)
+    imm(enc, X2, AT_FDCWD)
+    imm(enc, X4, 0)
+    invoke(enc, 276)
+    endCase(enc, skip)
+    // mkdir(path, mode) -> mkdirat(AT_FDCWD, path, mode)
+    skip = beginCase(enc, 83)
+    emit(enc, encoder.movReg(X2, X1))
+    emit(enc, encoder.movReg(X1, X0))
+    imm(enc, X0, AT_FDCWD)
+    invoke(enc, 34)
+    endCase(enc, skip)
+    // rmdir(path) -> unlinkat(AT_FDCWD, path, AT_REMOVEDIR)
+    skip = beginCase(enc, 84)
+    emit(enc, encoder.movReg(X1, X0))
+    imm(enc, X0, AT_FDCWD)
+    imm(enc, X2, AT_REMOVEDIR)
+    invoke(enc, 35)
+    endCase(enc, skip)
+    // link(old, new) -> linkat(AT_FDCWD, old, AT_FDCWD, new, 0)
+    skip = beginCase(enc, 86)
+    emit(enc, encoder.movReg(X3, X1))
+    emit(enc, encoder.movReg(X1, X0))
+    imm(enc, X0, AT_FDCWD)
+    imm(enc, X2, AT_FDCWD)
+    imm(enc, X4, 0)
+    invoke(enc, 37)
+    endCase(enc, skip)
+    // unlink(path) -> unlinkat(AT_FDCWD, path, 0)
+    skip = beginCase(enc, 87)
+    emit(enc, encoder.movReg(X1, X0))
+    imm(enc, X0, AT_FDCWD)
+    imm(enc, X2, 0)
+    invoke(enc, 35)
+    endCase(enc, skip)
+    // symlink(target, path) -> symlinkat(target, AT_FDCWD, path)
+    skip = beginCase(enc, 88)
+    emit(enc, encoder.movReg(X2, X1))
+    imm(enc, X1, AT_FDCWD)
+    invoke(enc, 36)
+    endCase(enc, skip)
+    // readlink(path, buffer, size) -> readlinkat(AT_FDCWD, path, buffer, size)
+    skip = beginCase(enc, 89)
+    emit(enc, encoder.movReg(X3, X2))
+    emit(enc, encoder.movReg(X2, X1))
+    emit(enc, encoder.movReg(X1, X0))
+    imm(enc, X0, AT_FDCWD)
+    invoke(enc, 78)
+    endCase(enc, skip)
+    // chmod(path, mode) -> fchmodat(AT_FDCWD, path, mode)
+    skip = beginCase(enc, 90)
+    emit(enc, encoder.movReg(X2, X1))
+    emit(enc, encoder.movReg(X1, X0))
+    imm(enc, X0, AT_FDCWD)
+    invoke(enc, 53)
+    endCase(enc, skip)
+    // chown / lchown(path, uid, gid) -> fchownat(AT_FDCWD, path, uid, gid, flags)
+    skip = beginCase(enc, 92)
+    emitChown(enc, 0)
+    endCase(enc, skip)
+    skip = beginCase(enc, 94)
+    emitChown(enc, AT_SYMLINK_NOFOLLOW)
+    endCase(enc, skip)
+    // getpgrp() -> getpgid(0)
+    skip = beginCase(enc, 111)
+    imm(enc, X0, 0)
+    invoke(enc, 155)
+    endCase(enc, skip)
+    // mknod(path, mode, dev) -> mknodat(AT_FDCWD, path, mode, dev)
+    skip = beginCase(enc, 133)
+    emit(enc, encoder.movReg(X3, X2))
+    emit(enc, encoder.movReg(X2, X1))
+    emit(enc, encoder.movReg(X1, X0))
+    imm(enc, X0, AT_FDCWD)
+    invoke(enc, 33)
+    endCase(enc, skip)
+}
+
+fn emitChown(enc: *encoder.Encoder, flags: u64) -> void {
+    emit(enc, encoder.movReg(X3, X2))
+    emit(enc, encoder.movReg(X2, X1))
+    emit(enc, encoder.movReg(X1, X0))
+    imm(enc, X0, AT_FDCWD)
+    imm(enc, X4, flags)
+    invoke(enc, 54)
+}
+
+// x86_64's struct epoll_event is packed (12 bytes), aarch64's is 16. The
+// kernel fills up to 16 events in a stack buffer; they are then repacked
+// into the caller's 12-byte entries.
+fn emitEpollWait(enc: *encoder.Encoder) -> void {
+    const skip = beginCase(enc, 232)
+    emit(enc, encoder.subImm(SP, SP, 256))
+    emit(enc, encoder.movReg(X9, X1))
+    emit(enc, encoder.cmpImm(X2, 16))
+    emit(enc, encoder.bCond(encoder.COND_LS, 8))
+    imm(enc, X2, 16)
+    emit(enc, encoder.addImm(X1, SP, 0))
+    imm(enc, X4, 0)
+    imm(enc, X5, 8)
+    imm(enc, X8, 22) // epoll_pwait
+    emit(enc, encoder.SVC0)
+    imm(enc, X10, 0)
+    emit(enc, encoder.addImm(X11, SP, 0))
+    emit(enc, encoder.movReg(X12, X9))
+    const loop = encoder.pos(enc)
+    emit(enc, encoder.cmpReg(X10, X0))
+    const done = reserve(enc)
+    emit(enc, encoder.ldrW(X13, X11, 0))
+    emit(enc, encoder.ldrX(X14, X11, 8))
+    emit(enc, encoder.strW(X13, X12, 0))
+    emit(enc, encoder.addImm(X15, X12, 4))
+    emit(enc, encoder.strX(X14, X15, 0))
+    emit(enc, encoder.addImm(X11, X11, 16))
+    emit(enc, encoder.addImm(X12, X12, 12))
+    emit(enc, encoder.addImm(X10, X10, 1))
+    emit(enc, encoder.b(back(enc, loop)))
+    encoder.patch32(enc, done, encoder.bCond(encoder.COND_GE, encoder.delta(done, encoder.pos(enc))))
+    emit(enc, encoder.addImm(SP, SP, 256))
+    emit(enc, encoder.RET)
+    endCase(enc, skip)
+}
+
+// epoll_ctl(epfd, op, fd, event): widen the 12-byte event to 16 bytes.
+fn emitEpollCtl(enc: *encoder.Encoder) -> void {
+    const skip = beginCase(enc, 233)
+    emit(enc, encoder.subImm(SP, SP, 16))
+    const no_event = reserve(enc)
+    emit(enc, encoder.ldrW(X9, X3, 0))
+    emit(enc, encoder.addImm(X10, X3, 4))
+    emit(enc, encoder.ldrX(X10, X10, 0))
+    emit(enc, encoder.strW(X9, SP, 0))
+    emit(enc, encoder.strX(X10, SP, 8))
+    emit(enc, encoder.addImm(X3, SP, 0))
+    encoder.patch32(enc, no_event, encoder.cbzX(X3, encoder.delta(no_event, encoder.pos(enc))))
+    imm(enc, X8, 21)
+    emit(enc, encoder.SVC0)
+    emit(enc, encoder.addImm(SP, SP, 16))
+    emit(enc, encoder.RET)
+    endCase(enc, skip)
+}
+
+// x86_64 number -> aarch64 number for calls whose arguments and results
+// need no translation. Zero means unsupported (-ENOSYS).
+fn emitSyscallTable(enc: *encoder.Encoder, table_name: [*]const u8) -> void {
+    encoder.defineSymbol(enc, table_name, 19)
+    const table = encoder.pos(enc)
+    var index: usize = 0
+    while index < SYSCALL_TABLE_ENTRIES * 2 {
+        encoder.emit1(enc, 0)
+        index += 1
+    }
+    const t = table
+    map(enc, t, 0, 63) // read
+    map(enc, t, 1, 64) // write
+    map(enc, t, 3, 57) // close
+    map(enc, t, 8, 62) // lseek
+    map(enc, t, 9, 222) // mmap
+    map(enc, t, 10, 226) // mprotect
+    map(enc, t, 11, 215) // munmap
+    map(enc, t, 12, 214) // brk
+    map(enc, t, 13, 134) // rt_sigaction
+    map(enc, t, 14, 135) // rt_sigprocmask
+    map(enc, t, 15, 139) // rt_sigreturn
+    map(enc, t, 16, 29) // ioctl
+    map(enc, t, 17, 67) // pread64
+    map(enc, t, 18, 68) // pwrite64
+    map(enc, t, 19, 65) // readv
+    map(enc, t, 20, 66) // writev
+    map(enc, t, 24, 124) // sched_yield
+    map(enc, t, 25, 216) // mremap
+    map(enc, t, 28, 233) // madvise
+    map(enc, t, 32, 23) // dup
+    map(enc, t, 35, 101) // nanosleep
+    map(enc, t, 39, 172) // getpid
+    map(enc, t, 41, 198) // socket
+    map(enc, t, 42, 203) // connect
+    map(enc, t, 43, 202) // accept
+    map(enc, t, 44, 206) // sendto
+    map(enc, t, 45, 207) // recvfrom
+    map(enc, t, 46, 211) // sendmsg
+    map(enc, t, 47, 212) // recvmsg
+    map(enc, t, 48, 210) // shutdown
+    map(enc, t, 49, 200) // bind
+    map(enc, t, 50, 201) // listen
+    map(enc, t, 51, 204) // getsockname
+    map(enc, t, 52, 205) // getpeername
+    map(enc, t, 53, 199) // socketpair
+    map(enc, t, 54, 208) // setsockopt
+    map(enc, t, 55, 209) // getsockopt
+    map(enc, t, 59, 221) // execve
+    map(enc, t, 60, 93) // exit
+    map(enc, t, 61, 260) // wait4
+    map(enc, t, 62, 129) // kill
+    map(enc, t, 63, 160) // uname
+    map(enc, t, 72, 25) // fcntl
+    map(enc, t, 73, 32) // flock
+    map(enc, t, 74, 82) // fsync
+    map(enc, t, 75, 83) // fdatasync
+    map(enc, t, 76, 45) // truncate
+    map(enc, t, 77, 46) // ftruncate
+    map(enc, t, 79, 17) // getcwd
+    map(enc, t, 80, 49) // chdir
+    map(enc, t, 81, 50) // fchdir
+    map(enc, t, 91, 52) // fchmod
+    map(enc, t, 93, 55) // fchown
+    map(enc, t, 95, 166) // umask
+    map(enc, t, 96, 169) // gettimeofday
+    map(enc, t, 97, 163) // getrlimit
+    map(enc, t, 98, 165) // getrusage
+    map(enc, t, 99, 179) // sysinfo
+    map(enc, t, 102, 174) // getuid
+    map(enc, t, 104, 176) // getgid
+    map(enc, t, 105, 146) // setuid
+    map(enc, t, 106, 144) // setgid
+    map(enc, t, 107, 175) // geteuid
+    map(enc, t, 108, 177) // getegid
+    map(enc, t, 109, 154) // setpgid
+    map(enc, t, 110, 173) // getppid
+    map(enc, t, 112, 157) // setsid
+    map(enc, t, 115, 158) // getgroups
+    map(enc, t, 121, 155) // getpgid
+    map(enc, t, 124, 156) // getsid
+    map(enc, t, 137, 43) // statfs
+    map(enc, t, 138, 44) // fstatfs
+    map(enc, t, 157, 167) // prctl
+    map(enc, t, 162, 81) // sync
+    map(enc, t, 186, 178) // gettid
+    map(enc, t, 191, 8) // getxattr
+    map(enc, t, 192, 9) // lgetxattr
+    map(enc, t, 200, 130) // tkill
+    map(enc, t, 202, 98) // futex
+    map(enc, t, 204, 123) // sched_getaffinity
+    map(enc, t, 217, 61) // getdents64
+    map(enc, t, 218, 96) // set_tid_address
+    map(enc, t, 228, 113) // clock_gettime
+    map(enc, t, 229, 114) // clock_getres
+    map(enc, t, 230, 115) // clock_nanosleep
+    map(enc, t, 231, 94) // exit_group
+    map(enc, t, 234, 131) // tgkill
+    map(enc, t, 247, 95) // waitid
+    map(enc, t, 258, 34) // mkdirat
+    map(enc, t, 259, 33) // mknodat
+    map(enc, t, 260, 54) // fchownat
+    map(enc, t, 263, 35) // unlinkat
+    map(enc, t, 264, 38) // renameat
+    map(enc, t, 265, 37) // linkat
+    map(enc, t, 266, 36) // symlinkat
+    map(enc, t, 267, 78) // readlinkat
+    map(enc, t, 268, 53) // fchmodat
+    map(enc, t, 269, 48) // faccessat
+    map(enc, t, 270, 72) // pselect6
+    map(enc, t, 271, 73) // ppoll
+    map(enc, t, 273, 99) // set_robust_list
+    map(enc, t, 275, 76) // splice
+    map(enc, t, 280, 88) // utimensat
+    map(enc, t, 283, 85) // timerfd_create
+    map(enc, t, 286, 86) // timerfd_settime
+    map(enc, t, 287, 87) // timerfd_gettime
+    map(enc, t, 288, 242) // accept4
+    map(enc, t, 290, 19) // eventfd2
+    map(enc, t, 291, 20) // epoll_create1
+    map(enc, t, 292, 24) // dup3
+    map(enc, t, 293, 59) // pipe2
+    map(enc, t, 302, 261) // prlimit64
+    map(enc, t, 306, 267) // syncfs
+    map(enc, t, 309, 168) // getcpu
+    map(enc, t, 316, 276) // renameat2
+    map(enc, t, 318, 278) // getrandom
+    map(enc, t, 319, 279) // memfd_create
+    map(enc, t, 332, 291) // statx
+    map(enc, t, 334, 293) // rseq
+    map(enc, t, 425, 425) // io_uring_setup
+    map(enc, t, 426, 426) // io_uring_enter
+    map(enc, t, 427, 427) // io_uring_register
+    map(enc, t, 435, 435) // clone3
+}
+
+fn map(enc: *encoder.Encoder, table: usize, x86_number: usize, aarch64_number: u32) -> void {
+    encoder.patch16(enc, table + x86_number * 2, aarch64_number)
+}

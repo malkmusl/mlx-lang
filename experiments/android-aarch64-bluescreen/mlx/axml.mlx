@@ -1,0 +1,537 @@
+// Hand-written binary AndroidManifest.xml (AXML) encoder. Straight port of
+// experiments/android-aarch64-bluescreen/tool/axml.zig -- see that file for
+// the full chunk-format derivation and the note on how the android:*
+// attribute resource IDs were ground-truthed against a real aapt-compiled
+// reference manifest (not reproduced here; unchanged by this port). This
+// port also round-tripped through `aapt dump xmltree`/`dump badging` and
+// `aapt2 dump xmltree` the same way the Zig version did -- see the
+// experiment README.
+//
+// Where the Zig version used a StringPool backed by a hash map and an
+// Attr tagged union, this port uses a fixed-size linear-scan string table
+// (at most ~30 distinct strings here -- a hash map buys nothing) and
+// separate per-value-kind attribute writers instead of a tagged union, to
+// avoid depending on mlx language/stdlib features this experiment doesn't
+// otherwise need.
+
+const std = @import("std")
+
+pub const ArrayList = std.array_list.ArrayList
+pub const Allocator = std.allocator.Allocator
+
+const RES_STRING_POOL_TYPE: u32 = 0x0001
+const RES_XML_TYPE: u32 = 0x0003
+const RES_XML_START_NAMESPACE_TYPE: u32 = 0x0100
+const RES_XML_END_NAMESPACE_TYPE: u32 = 0x0101
+const RES_XML_START_ELEMENT_TYPE: u32 = 0x0102
+const RES_XML_END_ELEMENT_TYPE: u32 = 0x0103
+const RES_XML_RESOURCE_MAP_TYPE: u32 = 0x0180
+
+const TYPE_REFERENCE: u32 = 0x01
+const TYPE_STRING: u32 = 0x03
+const TYPE_INT_DEC: u32 = 0x10
+const TYPE_INT_HEX: u32 = 0x11
+const TYPE_INT_BOOLEAN: u32 = 0x12
+
+const NO_VALUE_U32: u32 = 4294967295 // -1 as a u32 bit pattern
+
+// A module-level `const` of a non-integer/non-boolean type (here
+// `[]const u8`) has no comptime representation in this compiler (see
+// sema/comptime/value.mlx's `Kind` enum -- only integer/boolean/type/null
+// are handled). Referencing such a const from a function silently miscompiles:
+// the lowering fallback in ir/lower.mlx (the "might be a forward-reference
+// function" path, hit because `lowerSymbolValue` returns NONE for a symbol
+// that is neither comptime-integer/boolean nor a function) treats the name
+// as an as-yet-undefined function and emits a `.m<N>.<NAME>` symbol
+// reference that no function definition ever satisfies, so the backend
+// fails at link time with "unresolved backend symbol" -- not documented yet
+// as a known gap, unlike the array-of-slices and large-struct-return issues
+// found earlier in this port, since this one has an easy, local workaround:
+// wrap the literal in a function instead of a top-level const. A plain
+// string literal used directly at a call site, or returned from a function,
+// compiles fine either way.
+fn androidNsUri() -> []const u8 { return "http://schemas.android.com/apk/res/android" }
+
+pub const MAX_STRINGS: usize = 64
+
+// A fixed-size array of *slices* (`[N][]const u8`) turned out to be
+// miscompiled by the current self-hosted backend: writing a slice into
+// such an array and reading it back silently corrupts it (confirmed with
+// a minimal repro -- not documented as a known gap yet, unlike the
+// component-0 and >64-bit-arithmetic issues, since this port routes
+// around it rather than fixing it). Working around it here with parallel
+// arrays of raw `usize` (pointer, length) pairs instead -- plain
+// single-word array elements, which do work correctly.
+pub const StringPool = struct {
+    ptrs: [64]usize
+    lens: [64]usize
+    count: usize
+}
+
+pub fn sliceAt(p: *StringPool, i: usize) -> []const u8 {
+    unsafe {
+        return @ptrFromInt([*]const u8, p.*.ptrs[i])[0..p.*.lens[i]]
+    }
+}
+
+// Returning a struct this large *by value* was independently found to
+// segfault at runtime (confirmed with a minimal repro: a bare `[128]usize`
+// struct, no slices involved, crashes the same way) -- a second, distinct
+// backend gap from the array-of-slices one above. Initializing through an
+// out-parameter instead, like every other "big result" constructor in this
+// port, avoids it entirely.
+pub fn initPool(p: *StringPool) -> void {
+    p.*.count = 0
+}
+
+pub fn strEq(a: []const u8, b: []const u8) -> bool {
+    if a.length != b.length { return false }
+    var i: usize = 0
+    while i < a.length {
+        if a[i] != b[i] { return false }
+        i += 1
+    }
+    return true
+}
+
+pub fn intern(p: *StringPool, s: []const u8) -> u32 {
+    var i: usize = 0
+    while i < p.*.count {
+        if strEq(sliceAt(p, i), s) { return @intCast(u32, i) }
+        i += 1
+    }
+    const idx: usize = p.*.count
+    unsafe {
+        p.*.ptrs[idx] = @intFromPtr(@ptrCast([*]const u8, s))
+    }
+    p.*.lens[idx] = s.length
+    p.*.count += 1
+    return @intCast(u32, idx)
+}
+
+// ── ordered android:* attribute -> resource ID table ──────────────────────
+// Order matters: it must match first-use order below, because the resource
+// map only covers pool strings 0..N-1 and pool index order is insertion
+// order (see intern's reservation loop in buildManifest).
+const ANDROID_ATTR_COUNT: usize = 12
+
+// A top-level `const` array has the same "no comptime representation"
+// problem as the string constant documented above `androidNsUri` --
+// confirmed with the same symptom (`.m<N>.ANDROID_ATTR_IDS` reported as an
+// unresolved backend symbol). Worked around the same way: a function
+// (indexed rather than returning the whole array, since arrays aren't
+// returned by value elsewhere in this port either -- see the StringPool
+// out-parameter note above) instead of a top-level const.
+//
+// The last entry, 0x01010000 (`android:theme`), was ground-truthed the
+// same way `configChanges`'s 0x4a0 resolution was: compiled a minimal
+// reference manifest with an explicit `android:theme` through the real
+// `aapt` against /usr/share/android-framework-res/framework-res.apk and
+// read back the resolved attribute/value IDs from `aapt dump xmltree`
+// rather than trusting memory for either number.
+fn androidAttrId(i: usize) -> u32 {
+    const ids: [12]u32 = [12]u32{
+        0x0101021b, 0x0101021c, 0x0101020c, 0x01010270,
+        0x01010001, 0x0101000c, 0x01010003, 0x0101001f, 0x01010024,
+        0x01010000, 0x01010010, 0x010104ea,
+    }
+    return ids[i]
+}
+
+// ── little-endian byte appenders ───────────────────────────────────────────
+pub fn appendU8(list: *ArrayList, v: u32) -> void {
+    var ok: bool = std.array_list.ArrayList.appendAt(list, @intCast(u8, v & 255))
+}
+pub fn appendU16(list: *ArrayList, v: u32) -> void {
+    appendU8(list, v)
+    appendU8(list, v >> 8)
+}
+pub fn appendU32(list: *ArrayList, v: u32) -> void {
+    appendU8(list, v)
+    appendU8(list, v >> 8)
+    appendU8(list, v >> 16)
+    appendU8(list, v >> 24)
+}
+// Appends a signed 32-bit AXML reference: every negative value used in this
+// encoder is exactly NO_VALUE (-1), so that's the only case handled as
+// two's complement; everything else is a plain non-negative index.
+pub fn appendRef(list: *ArrayList, isNone: bool, v: u32) -> void {
+    if isNone {
+        appendU32(list, NO_VALUE_U32)
+    } else {
+        appendU32(list, v)
+    }
+}
+
+pub fn appendSlice(list: *ArrayList, src: []const u8) -> void {
+    var i: usize = 0
+    while i < src.length {
+        var ok: bool = std.array_list.ArrayList.appendAt(list, src[i])
+        i += 1
+    }
+}
+
+pub fn nodeHeader(body: *ArrayList, chunkType: u32, size: u32, line: u32) -> void {
+    appendU16(body, chunkType)
+    appendU16(body, 16) // headerSize
+    appendU32(body, size)
+    appendU32(body, line)
+    appendU32(body, NO_VALUE_U32) // comment: none
+}
+
+// Callers must write the element's attributes in ascending resource-ID
+// order, with non-resource attributes (e.g. `package`) last. The
+// platform's attribute lookup is a single forward merge-walk over them, so
+// an attribute following a higher-ID one is silently never found.
+pub fn writeStartElementHeader(body: *ArrayList, pool: *StringPool, name: []const u8, attrCount: u32, line: u32) -> void {
+    const nameIdx: u32 = intern(pool, name)
+    const size: u32 = 16 + 20 + attrCount * 20
+    nodeHeader(body, RES_XML_START_ELEMENT_TYPE, size, line)
+    appendRef(body, true, 0) // ns
+    appendRef(body, false, nameIdx)
+    appendU16(body, 20) // attributeStart
+    appendU16(body, 20) // attributeSize
+    appendU16(body, attrCount)
+    appendU16(body, 0) // idIndex
+    appendU16(body, 0) // classIndex
+    appendU16(body, 0) // styleIndex
+}
+
+pub fn writeEndElement(body: *ArrayList, pool: *StringPool, name: []const u8, line: u32) -> void {
+    const nameIdx: u32 = intern(pool, name)
+    nodeHeader(body, RES_XML_END_ELEMENT_TYPE, 24, line)
+    appendRef(body, true, 0) // ns
+    appendRef(body, false, nameIdx)
+}
+
+pub fn writeNamespace(body: *ArrayList, pool: *StringPool, isStart: bool, line: u32) -> void {
+    const uriIdx: u32 = intern(pool, androidNsUri())
+    const prefixIdx: u32 = intern(pool, "android")
+    var kind: u32 = RES_XML_END_NAMESPACE_TYPE
+    if isStart { kind = RES_XML_START_NAMESPACE_TYPE }
+    nodeHeader(body, kind, 24, line)
+    appendRef(body, false, prefixIdx)
+    appendRef(body, false, uriIdx)
+}
+
+pub fn writeStrAttr(body: *ArrayList, pool: *StringPool, isNs: bool, name: []const u8, value: []const u8) -> void {
+    appendRef(body, !isNs, intern(pool, androidNsUri()))
+    appendRef(body, false, intern(pool, name))
+    const valIdx: u32 = intern(pool, value)
+    appendRef(body, false, valIdx) // rawValue
+    appendU16(body, 8) // Res_value.size
+    appendU8(body, 0) // res0
+    appendU8(body, TYPE_STRING)
+    appendU32(body, valIdx) // data
+}
+
+pub fn writeIntDecAttr(body: *ArrayList, pool: *StringPool, isNs: bool, name: []const u8, value: u32) -> void {
+    appendRef(body, !isNs, intern(pool, androidNsUri()))
+    appendRef(body, false, intern(pool, name))
+    appendRef(body, true, 0) // rawValue: none
+    appendU16(body, 8)
+    appendU8(body, 0)
+    appendU8(body, TYPE_INT_DEC)
+    appendU32(body, value)
+}
+
+pub fn writeIntHexAttr(body: *ArrayList, pool: *StringPool, isNs: bool, name: []const u8, value: u32) -> void {
+    appendRef(body, !isNs, intern(pool, androidNsUri()))
+    appendRef(body, false, intern(pool, name))
+    appendRef(body, true, 0)
+    appendU16(body, 8)
+    appendU8(body, 0)
+    appendU8(body, TYPE_INT_HEX)
+    appendU32(body, value)
+}
+
+// Writes a TYPE_REFERENCE attribute (e.g. `android:theme="@android:style/..."`)
+// -- `resId` is the resolved numeric resource ID of the referenced resource,
+// not a string; see androidAttrId's comment above for how
+// @android:style/Theme.Black.NoTitleBar.Fullscreen's ID (0x0103000a) was
+// ground-truthed against a real aapt.
+pub fn writeRefAttr(body: *ArrayList, pool: *StringPool, isNs: bool, name: []const u8, resId: u32) -> void {
+    appendRef(body, !isNs, intern(pool, androidNsUri()))
+    appendRef(body, false, intern(pool, name))
+    appendRef(body, true, 0) // rawValue: none (no string representation)
+    appendU16(body, 8)
+    appendU8(body, 0)
+    appendU8(body, TYPE_REFERENCE)
+    appendU32(body, resId) // data: the referenced resource's ID
+}
+
+pub fn writeBoolAttr(body: *ArrayList, pool: *StringPool, isNs: bool, name: []const u8, value: bool) -> void {
+    appendRef(body, !isNs, intern(pool, androidNsUri()))
+    appendRef(body, false, intern(pool, name))
+    appendRef(body, true, 0)
+    appendU16(body, 8)
+    appendU8(body, 0)
+    appendU8(body, TYPE_INT_BOOLEAN)
+    var data: u32 = 0
+    if value { data = NO_VALUE_U32 }
+    appendU32(body, data)
+}
+
+// android:theme resource IDs, all four ground-truthed against the real
+// `aapt` the same way as everything else in this file (compiled a minimal
+// reference manifest with each theme through
+// /usr/share/android-framework-res/framework-res.apk and read the resolved
+// value back from `aapt dump xmltree`):
+//   @android:style/Theme.Black.NoTitleBar.Fullscreen            -- hides
+//     the status bar entirely, forced-black otherwise.
+//   @android:style/Theme.Black.NoTitleBar                       -- keeps
+//     the status bar, forced-black otherwise.
+//   @android:style/Theme.DeviceDefault.NoActionBar.Fullscreen   -- hides
+//     the status bar entirely, system-adaptive otherwise (moot: fullscreen
+//     draws no status bar at all, so there's nothing to tint).
+//   @android:style/Theme.DeviceDefault.NoActionBar.TranslucentDecor --
+//     keeps the status bar (and nav bar) visible but translucent, per the
+//     real style's own AOSP source (themes_material.xml, the base this
+//     inherits from): `windowTranslucentStatus=true`,
+//     `windowTranslucentNavigation=true`, `windowContentOverlay=@null`.
+//     That's the actual mechanism behind the "adapt to the system color"
+//     ask: a plain opaque `Theme.DeviceDefault.NoActionBar` (tried first,
+//     0x01030129, still ground-truthed and correct, just not what was
+//     wanted) still paints a solid status-bar background -- just whatever
+//     unthemed color DeviceDefault happens to default to, not visibly
+//     different from the old hardcoded-black theme. TranslucentDecor is
+//     what actually lets this app's own blue fill show through the status
+//     bar with the system's icons/clock drawn on top of it, since
+//     ANativeWindow_lock's window then spans the full display including
+//     the area behind the (now see-through) bar.
+// None of the four is a memorized guess.
+pub fn themeFullscreen() -> u32 { return 0x0103000a }
+pub fn themeWithStatusBar() -> u32 { return 0x01030009 }
+pub fn themeSystemFullscreen() -> u32 { return 0x0103012a }
+pub fn themeSystemWithStatusBar() -> u32 { return 0x010301e3 }
+
+// Build the complete `dev.mlxlang.experiments.bluescreen` blue-screen
+// manifest: a single `android.app.NativeActivity` activity backed by
+// `main.so` (`android.app.lib_name` = "main"), MAIN/LAUNCHER intent filter.
+// `fullscreen` and `systemStatusBarColor` each independently toggle between
+// the four themes above -- see main.mlx's `fullscreenEnabled()` and
+// `systemStatusBarColorEnabled()` for the actual switches. `minSdkVersion`/
+// `targetSdkVersion` are threaded in from main.mlx (rather than hardcoded
+// here) so they're the same single source of truth that
+// `apk_sign_v2v3.schemesForTargetSdk` uses to auto-pick which signing
+// schemes to add -- see main.mlx's `minSdkVersion()`/`targetSdkVersion()`.
+pub fn buildManifest(allocator: Allocator, package: []const u8, fullscreen: bool, systemStatusBarColor: bool, minSdkVersion: u32, targetSdkVersion: u32) -> ArrayList {
+    var pool: StringPool = undefined
+    initPool(&pool)
+
+    // Reserve pool indices 0..8 for the resource-mapped android: attrs, in
+    // first-use order, before anything else is interned -- matching
+    // ANDROID_ATTR_IDS below 1:1. Written out individually rather than
+    // looping over an ANDROID_ATTR_NAMES array: a fixed-size array of
+    // *slices* (each string here) was independently found to be
+    // miscompiled by the current self-hosted backend the same way
+    // StringPool's own array-of-slices was (see its comment above); a
+    // plain array of u32 IDs (below) doesn't hit it.
+    var t0: u32 = intern(&pool, "versionCode")
+    var t1: u32 = intern(&pool, "versionName")
+    var t2: u32 = intern(&pool, "minSdkVersion")
+    var t3: u32 = intern(&pool, "targetSdkVersion")
+    var t4: u32 = intern(&pool, "label")
+    var t5: u32 = intern(&pool, "hasCode")
+    var t6: u32 = intern(&pool, "name")
+    var t7: u32 = intern(&pool, "configChanges")
+    var t8: u32 = intern(&pool, "value")
+    var t9: u32 = intern(&pool, "theme")
+    // android:exported, mandatory (not just recommended) on any
+    // intent-filtered component once targetSdkVersion >= 31 -- omitting
+    // it is a hard manifest-validation failure at install time on such
+    // devices, not just a lint warning. This was invisible for this
+    // project's entire life at targetSdkVersion=29 and only surfaced as
+    // a real-device "You can't install this app on your device" block
+    // once targetSdkVersion was bumped to 35 (see the twentieth report:
+    // that bump fixed a real compatibility warning but silently exposed
+    // this pre-existing gap). The install confirmation dialog still
+    // renders fine beforehand (it reads only the package name/label/icon
+    // via a lighter parse); this failure is in the deeper manifest
+    // validation the actual install step performs, which is why it fails
+    // near-instantly right after confirming, with no parse-level warning
+    // visible anywhere else.
+    var t10: u32 = intern(&pool, "exported")
+    // android:extractNativeLibs, set explicitly to true (Store/mmap-from-
+    // zip is the platform's alternative when it's false, which needs the
+    // native library's zip entry itself page-aligned -- already handled
+    // separately in zip.mlx, but extraction to a normal file sidesteps
+    // that whole mechanism rather than depending on it). The real
+    // platform default when this attribute is entirely absent (as this
+    // manifest always was before) is documented as `true`, so this is
+    // meant to remove any ambiguity rather than change behavior -- added
+    // after real-device install still failed with the same generic
+    // block even after the `exported` fix, prompted by independently
+    // converging research pointing at native-library extraction/
+    // alignment as the remaining suspect.
+    var t11: u32 = intern(&pool, "extractNativeLibs")
+
+    var body: ArrayList = std.array_list.ArrayList.init(allocator, 512)
+    var line: u32 = 2
+
+    writeNamespace(&body, &pool, true, line)
+    line += 1
+
+    writeStartElementHeader(&body, &pool, "manifest", 3, line)
+    writeIntDecAttr(&body, &pool, true, "versionCode", 1)
+    writeStrAttr(&body, &pool, true, "versionName", "0.1-experiment")
+    writeStrAttr(&body, &pool, false, "package", package)
+    line += 1
+
+    writeStartElementHeader(&body, &pool, "uses-sdk", 2, line)
+    writeIntDecAttr(&body, &pool, true, "minSdkVersion", minSdkVersion)
+    writeIntDecAttr(&body, &pool, true, "targetSdkVersion", targetSdkVersion)
+    line += 1
+    writeEndElement(&body, &pool, "uses-sdk", line)
+    line += 1
+
+    writeStartElementHeader(&body, &pool, "application", 3, line)
+    writeStrAttr(&body, &pool, true, "label", "Mlx Blue Screen")
+    writeBoolAttr(&body, &pool, true, "hasCode", false)
+    writeBoolAttr(&body, &pool, true, "extractNativeLibs", true)
+    line += 1
+
+    // configChanges = keyboardHidden, resolved to 0x20 by the real aapt
+    // (see axml.zig's derivation note). Used to also declare
+    // orientation|screenSize (0x4a0) -- standard NDK-sample boilerplate,
+    // copied without a specific reason to include it -- which opts the app
+    // INTO handling rotation itself by resizing the existing window in
+    // place (via onNativeWindowResized) instead of letting Android use its
+    // normal, far-better-tested path of destroying and recreating the
+    // whole activity. Real-device testing showed that in-place path is
+    // fragile: rotating left a black bar on one edge even with
+    // onNativeWindowResized correctly registered and repainting. A fetched
+    // real NDK issue (android/ndk#1139) confirms why: even Google's own
+    // reference `android_native_app_glue.c` never wires up
+    // onNativeWindowResized/onNativeWindowRedrawNeeded at all -- this
+    // resize-in-place path is essentially unexercised in the wild. Since
+    // this experiment has no state worth preserving across a restart,
+    // dropping `orientation|screenSize` here routes rotation through the
+    // ordinary, robust restart path instead: a fresh
+    // ANativeActivity_onCreate -> onNativeWindowCreated with the new
+    // orientation's correct dimensions from the start, the same path
+    // already proven correct across every other lifecycle transition.
+    // onNativeWindowResized/onNativeWindowRedrawNeeded (native_activity.mlx)
+    // stay registered regardless, as a harmless fallback for any resize
+    // Android does dispatch to a still-live window (e.g. multi-window
+    // drag-resize) rather than a restart.
+    //
+    // theme: `fullscreen` toggles hiding the status bar entirely vs.
+    // keeping it visible; `systemStatusBarColor` independently toggles
+    // between a hardcoded black bar and one styled to match the device's
+    // actual default look. Both added after real-device feedback -- see
+    // the four theme*() functions above for each resource ID's derivation.
+    var themeId: u32 = themeWithStatusBar()
+    if systemStatusBarColor { themeId = themeSystemWithStatusBar() }
+    if fullscreen { themeId = themeFullscreen() }
+    if fullscreen && systemStatusBarColor { themeId = themeSystemFullscreen() }
+    // Attributes must be written in ascending resource-ID order (see
+    // writeStartElementHeader). `exported` (0x01010010) was once appended
+    // last, after configChanges (0x0101001f), and the platform silently
+    // skipped it -- INSTALL_PARSE_FAILED_MANIFEST_MALFORMED at target >= 31.
+    writeStartElementHeader(&body, &pool, "activity", 5, line)
+    writeRefAttr(&body, &pool, true, "theme", themeId)
+    writeStrAttr(&body, &pool, true, "label", "Mlx Blue Screen")
+    writeStrAttr(&body, &pool, true, "name", "android.app.NativeActivity")
+    writeBoolAttr(&body, &pool, true, "exported", true)
+    writeIntHexAttr(&body, &pool, true, "configChanges", 0x20)
+    line += 1
+
+    writeStartElementHeader(&body, &pool, "meta-data", 2, line)
+    writeStrAttr(&body, &pool, true, "name", "android.app.lib_name")
+    writeStrAttr(&body, &pool, true, "value", "main")
+    line += 1
+    writeEndElement(&body, &pool, "meta-data", line)
+    line += 1
+
+    writeStartElementHeader(&body, &pool, "intent-filter", 0, line)
+    line += 1
+    writeStartElementHeader(&body, &pool, "action", 1, line)
+    writeStrAttr(&body, &pool, true, "name", "android.intent.action.MAIN")
+    line += 1
+    writeEndElement(&body, &pool, "action", line)
+    line += 1
+    writeStartElementHeader(&body, &pool, "category", 1, line)
+    writeStrAttr(&body, &pool, true, "name", "android.intent.category.LAUNCHER")
+    line += 1
+    writeEndElement(&body, &pool, "category", line)
+    line += 1
+    writeEndElement(&body, &pool, "intent-filter", line)
+    line += 1
+
+    writeEndElement(&body, &pool, "activity", line)
+    line += 1
+    writeEndElement(&body, &pool, "application", line)
+    line += 1
+    writeEndElement(&body, &pool, "manifest", line)
+    writeNamespace(&body, &pool, false, line)
+
+    // ── serialize the string pool (UTF-16, matching the reference file) ──
+    var strData: ArrayList = std.array_list.ArrayList.init(allocator, 512)
+    var strOffsets: [64]u32 = undefined
+    var si: usize = 0
+    while si < pool.count {
+        strOffsets[si] = @intCast(u32, strData.length)
+        const s: []const u8 = sliceAt(&pool, si)
+        appendU16(&strData, @intCast(u32, s.length))
+        var ci: usize = 0
+        while ci < s.length {
+            appendU16(&strData, @intCast(u32, s[ci])) // ASCII-only strings in this manifest
+            ci += 1
+        }
+        appendU16(&strData, 0)
+        si += 1
+    }
+    const offsetsBytes: u32 = @intCast(u32, pool.count) * 4
+    const stringsStart: u32 = 28 + offsetsBytes
+    var poolSize: u32 = stringsStart + @intCast(u32, strData.length)
+    const poolPad: u32 = (4 - (poolSize % 4)) % 4
+    poolSize += poolPad
+
+    var out: ArrayList = std.array_list.ArrayList.init(allocator, 2048)
+
+    // XML root chunk header -- size patched in once everything is known.
+    appendU16(&out, RES_XML_TYPE)
+    appendU16(&out, 8)
+    appendU32(&out, 0) // placeholder
+
+    appendU16(&out, RES_STRING_POOL_TYPE)
+    appendU16(&out, 28)
+    appendU32(&out, poolSize)
+    appendU32(&out, @intCast(u32, pool.count)) // stringCount
+    appendU32(&out, 0) // styleCount
+    appendU32(&out, 0) // flags: UTF-16
+    appendU32(&out, stringsStart)
+    appendU32(&out, 0) // stylesStart
+    var oi: usize = 0
+    while oi < pool.count {
+        appendU32(&out, strOffsets[oi])
+        oi += 1
+    }
+    appendSlice(&out, strData.items[0..strData.length])
+    var pad: u32 = 0
+    while pad < poolPad {
+        appendU8(&out, 0)
+        pad += 1
+    }
+
+    const resmapSize: u32 = 8 + @intCast(u32, ANDROID_ATTR_COUNT) * 4
+    appendU16(&out, RES_XML_RESOURCE_MAP_TYPE)
+    appendU16(&out, 8)
+    appendU32(&out, resmapSize)
+    var ri: usize = 0
+    while ri < ANDROID_ATTR_COUNT {
+        appendU32(&out, androidAttrId(ri))
+        ri += 1
+    }
+
+    appendSlice(&out, body.items[0..body.length])
+
+    const total: u32 = @intCast(u32, out.length)
+    std.array_list.ArrayList.set(out, 4, @intCast(u8, total & 255))
+    std.array_list.ArrayList.set(out, 5, @intCast(u8, (total >> 8) & 255))
+    std.array_list.ArrayList.set(out, 6, @intCast(u8, (total >> 16) & 255))
+    std.array_list.ArrayList.set(out, 7, @intCast(u8, (total >> 24) & 255))
+
+    return out
+}
