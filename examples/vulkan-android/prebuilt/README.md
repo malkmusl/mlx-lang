@@ -15,7 +15,7 @@ adb uninstall dev.mlxlang.vulkan
 adb install mlx-vulkan.apk
 ```
 
-626853 bytes, SHA-256
-`2b165f8ee7f88c8e60f459428b6d1d49b9137558c333f6a51fb574daf2a94695`.
+643237 bytes, SHA-256
+`ce7cd33272960b1ce744460fadad628be5b52f6a0bc7d0e8a227ee856b90ff59`.
 It logs each startup step to `adb logcat -s mlx` and shows a label drawn
 with std.truetype from the system font (see ../README.md).

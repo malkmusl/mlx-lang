@@ -41,17 +41,22 @@ the window is created or resized, after each layout pass
 insets ([`std.ui`](../../docs/reference/ui.md)); the reserved bands are
 filled with the background color (`text.fill`), the label is placed at the
 top center of the free area with `ui.Container` and clipped to it
-(`text.drawIn`), and two buttons sit side by side at its bottom center (a
-`ui.Stack`):
+(`text.drawIn`), and three buttons sit at its bottom center, side by side
+when they fit the width and else one above the other (a `ui.Stack`):
 
 - **Fullscreen: off / on** hides or shows both system bars at runtime;
 - **Navigation bar: shown / hidden** hides or shows only the navigation
-  bar (it stays hidden when fullscreen is turned off again).
+  bar (it stays hidden when fullscreen is turned off again);
+- **Gesture bar: solid / transparent** decides what shows behind the
+  navigation (gesture) bar while it is shown: the background color, or
+  the content (the pattern) through it. Its space stays reserved either
+  way, so the label and buttons stay clear of the bar.
 
 A tap (down and up inside a button) flips it through
 `std.android.setSystemBarsHidden`; a swipe from the edge shows hidden bars
 for a moment. The buttons' places are logged when they move
-(`ui: buttons: fullscreen X Y W H, navigation bar X Y W H`). Built with
+(`ui: buttons: fullscreen X Y W H, navigation bar X Y W H, gesture bar X Y
+W H`). Built with
 `--android-fullscreen`, nothing is reserved and the label sits at the top
 center of the whole window. The text is sized from the screen's shorter
 side, so it is the same size in portrait and landscape, and the label drops
