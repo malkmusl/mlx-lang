@@ -52,10 +52,163 @@ NAMES = {BLUE: "blue", GREEN: "green", YELLOW: "yellow", RED: "red", MAGENTA: "m
          CYAN: "cyan", ORANGE: "orange"}
 
 
-class Framework:
-    """The Android side of one app process."""
+ACTIVITY_OBJECT = 0x7A00_0001
+# WindowInsets.Type.systemBars() and displayCutout().
+SYSTEM_BARS, DISPLAY_CUTOUT = 7, 128
+FLAG_FULLSCREEN = 0x400
 
-    def __init__(self, library_path, verbose=False):
+
+class FakeJni:
+    """The activity's JNIEnv, as far as std.android's reserved space uses
+    it: the NativeActivity object, its Window with its LayoutParams flags
+    (FLAG_FULLSCREEN when `fullscreen`), the decor View and its
+    WindowInsets, answering `insets` (top, right, bottom, left), or no
+    WindowInsets at all while `insets` is None (not laid out yet). API 30+
+    goes through WindowInsets.Type and android.graphics.Insets, older levels
+    through getSystemWindowInset*. Unknown classes, methods and fields throw
+    (a pending exception, as in Java); any call made while an exception is
+    pending, and unbalanced local frames, fail the run."""
+
+    FUNCTIONS = {6: "FindClass", 17: "ExceptionClear", 19: "PushLocalFrame", 20: "PopLocalFrame",
+                 31: "GetObjectClass", 33: "GetMethodID", 36: "CallObjectMethodA", 51: "CallIntMethodA",
+                 94: "GetFieldID", 100: "GetIntField", 113: "GetStaticMethodID", 131: "CallStaticIntMethodA",
+                 228: "ExceptionCheck"}
+    CLASSES = {"activity": "android/app/NativeActivity", "window": "android/view/Window",
+               "attributes": "android/view/WindowManager$LayoutParams",
+               "decor": "android/view/View", "insets": "android/view/WindowInsets", "values": "android/graphics/Insets"}
+    METHODS = {("android/app/NativeActivity", "getWindow", "()Landroid/view/Window;"),
+               ("android/view/Window", "getDecorView", "()Landroid/view/View;"),
+               ("android/view/Window", "getAttributes", "()Landroid/view/WindowManager$LayoutParams;"),
+               ("android/view/View", "getRootWindowInsets", "()Landroid/view/WindowInsets;"),
+               ("android/view/WindowInsets", "getInsets", "(I)Landroid/graphics/Insets;"),
+               ("android/view/WindowInsets", "getSystemWindowInsetTop", "()I"),
+               ("android/view/WindowInsets", "getSystemWindowInsetRight", "()I"),
+               ("android/view/WindowInsets", "getSystemWindowInsetBottom", "()I"),
+               ("android/view/WindowInsets", "getSystemWindowInsetLeft", "()I")}
+
+    def __init__(self, framework, stub, sdk=34, insets=(0, 0, 0, 0), fullscreen=False):
+        self.framework = framework
+        self.sdk = sdk
+        self.insets = insets
+        self.fullscreen = fullscreen
+        self.pending = False
+        self.frames = 0
+        self.queries = 0
+        self.objects = {ACTIVITY_OBJECT: "activity"}
+        table = framework.malloc(8 * 240)
+        for index in range(240):
+            name = self.FUNCTIONS.get(index)
+            handler = getattr(self, name) if name else self.unexpected(index)
+            framework.put_u64(table + 8 * index, stub(f"jni:{name or index}", handler))
+        self.env = framework.malloc(8)
+        framework.put_u64(self.env, table)
+
+    def unexpected(self, index):
+        def fail(process, *_):
+            raise AssertionError(f"unexpected JNI function {index}")
+        return fail
+
+    def new(self, kind):
+        handle = 0x7A00_0000 + 0x10 * (len(self.objects) + 1)
+        self.objects[handle] = kind
+        return handle
+
+    def calm(self, name):
+        assert not self.pending, f"JNI {name} called with an exception pending"
+
+    def throw(self):
+        self.pending = True
+        return 0
+
+    def FindClass(self, process, env, name, *_):
+        self.calm("FindClass")
+        if process.cstring(name) == "android/view/WindowInsets$Type" and self.sdk >= 30:
+            return self.new("class:android/view/WindowInsets$Type")
+        return self.throw()
+
+    def ExceptionCheck(self, process, env, *_):
+        return 1 if self.pending else 0
+
+    def ExceptionClear(self, process, env, *_):
+        self.pending = False
+
+    def PushLocalFrame(self, process, env, capacity, *_):
+        self.calm("PushLocalFrame")
+        self.frames += 1
+        return 0
+
+    def PopLocalFrame(self, process, env, result, *_):
+        assert self.frames > 0, "PopLocalFrame without PushLocalFrame"
+        self.frames -= 1
+        return 0
+
+    def GetObjectClass(self, process, env, obj, *_):
+        self.calm("GetObjectClass")
+        return self.new("class:" + self.CLASSES[self.objects[obj]])
+
+    def member(self, process, cls, name, signature, known):
+        class_name = self.objects[cls].split(":", 1)[1]
+        key = (class_name, process.cstring(name), process.cstring(signature))
+        if key not in known:
+            return self.throw()
+        return self.new("member:" + key[1])
+
+    def GetMethodID(self, process, env, cls, name, signature, *_):
+        self.calm("GetMethodID")
+        return self.member(process, cls, name, signature, self.METHODS)
+
+    def GetStaticMethodID(self, process, env, cls, name, signature, *_):
+        self.calm("GetStaticMethodID")
+        return self.member(process, cls, name, signature, {("android/view/WindowInsets$Type", "systemBars", "()I"),
+                                                           ("android/view/WindowInsets$Type", "displayCutout", "()I")})
+
+    def GetFieldID(self, process, env, cls, name, signature, *_):
+        self.calm("GetFieldID")
+        return self.member(process, cls, name, signature, {("android/graphics/Insets", side, "I")
+                                                           for side in ("top", "right", "bottom", "left")}
+                           | {("android/view/WindowManager$LayoutParams", "flags", "I")})
+
+    def CallObjectMethodA(self, process, env, obj, method, arguments, *_):
+        self.calm("CallObjectMethodA")
+        name = self.objects[method].split(":", 1)[1]
+        if name == "getWindow":
+            return self.new("window")
+        if name == "getDecorView":
+            return self.new("decor")
+        if name == "getAttributes":
+            return self.new("attributes")
+        if name == "getRootWindowInsets":
+            self.queries += 1
+            return 0 if self.insets is None else self.new("insets")
+        assert name == "getInsets" and self.sdk >= 30, name
+        mask = struct.unpack("<I", process.read(arguments, 4))[0]
+        assert mask == SYSTEM_BARS | DISPLAY_CUTOUT, f"getInsets({mask}): not the system bars and cutouts"
+        return self.new("values")
+
+    def CallIntMethodA(self, process, env, obj, method, arguments, *_):
+        self.calm("CallIntMethodA")
+        side = self.objects[method].split(":", 1)[1][len("getSystemWindowInset"):].lower()
+        return self.insets[("top", "right", "bottom", "left").index(side)]
+
+    def CallStaticIntMethodA(self, process, env, cls, method, arguments, *_):
+        self.calm("CallStaticIntMethodA")
+        return {"member:systemBars": SYSTEM_BARS, "member:displayCutout": DISPLAY_CUTOUT}[self.objects[method]]
+
+    def GetIntField(self, process, env, obj, field, *_):
+        self.calm("GetIntField")
+        if self.objects[obj] == "attributes":
+            # FLAG_LAYOUT_IN_SCREEN and FLAG_LAYOUT_INSET_DECOR are always set.
+            return (FLAG_FULLSCREEN if self.fullscreen else 0) | 0x100 | 0x10000
+        assert self.objects[obj] == "values"
+        return self.insets[("top", "right", "bottom", "left").index(self.objects[field].split(":", 1)[1])]
+
+
+class Framework:
+    """The Android side of one app process. jni: {"sdk", "insets",
+    "fullscreen"} gives the activity a JNIEnv (FakeJni); without it the
+    activity has none, as far as the app can tell."""
+
+    def __init__(self, library_path, verbose=False, jni=None):
         self.verbose = verbose
         self.heap_next = HEAP
         self.now = 0
@@ -71,6 +224,15 @@ class Framework:
         self.lib = SharedLibrary(library_path, imports=self._imports())
         self.lib.uc.mem_map(HEAP, HEAP_SIZE)
         self.framebuffer = self.malloc(WIDTH * HEIGHT * 4)
+        self.jni = FakeJni(self, self.stub, **jni) if jni is not None else None
+
+    def stub(self, name, function):
+        """An address that calls `function(process, *arguments)`."""
+        address = SharedLibrary.STUB_BASE + len(self.lib.stubs) * 16
+        self.lib.uc.mem_write(address, struct.pack("<I", 0xD65F03C0))  # ret
+        self.lib.stubs[address] = name
+        self.lib.imports[name] = function
+        return address
 
     # ── memory ──
     def malloc(self, size):
@@ -170,7 +332,11 @@ class Framework:
         self.lib.call("ANativeActivity_onCreate", self.activity, saved, saved_size)
 
     def prepare_activity(self):
-        """Fills more of the ANativeActivity before onCreate (subclasses)."""
+        """The ANativeActivity's env, clazz and sdkVersion, with a JNIEnv."""
+        if self.jni is not None:
+            self.put_u64(self.activity + 16, self.jni.env)
+            self.put_u64(self.activity + 24, ACTIVITY_OBJECT)
+            self.lib.write(self.activity + 48, struct.pack("<i", self.jni.sdk))
 
     def callback(self, name, *args):
         address = self.u64(self.callbacks + CALLBACKS[name])
@@ -246,6 +412,37 @@ def scenario_events(name):
     return table[name]
 
 
+BACKGROUND = rgb(16, 20, 24)
+
+
+def check_reserved(library, verbose, fullscreen):
+    top, bottom = 4, 3
+    framework = Framework(library, verbose, jni={"sdk": 34, "insets": (top, 0, bottom, 0), "fullscreen": fullscreen})
+    framework.create()
+    framework.show_window()
+    framework.attach_input()
+    problems = []
+    for color, label in ((BLUE, "at start"), (GREEN, "after a tap")):
+        if label == "after a tap":
+            for action, x, y, at in scenario_events("tap")[0]:
+                framework.touch(action, x, y, at)
+        pixels = struct.unpack(f"<{WIDTH * HEIGHT}I", framework.lib.read(framework.framebuffer, WIDTH * HEIGHT * 4))
+        for y in range(HEIGHT):
+            reserved = not fullscreen and (y < top or y >= HEIGHT - bottom)
+            expected = BACKGROUND if reserved else color
+            row = set(pixels[y * WIDTH:(y + 1) * WIDTH])
+            if row != {expected}:
+                problems.append(f"{label}: row {y} is {sorted(row)}, expected {expected:#010x}")
+    if fullscreen and framework.jni.queries:
+        problems.append("the insets were asked for although the app is fullscreen")
+    if framework.jni.frames:
+        problems.append("JNI local frames left pushed")
+    name = "fullscreen: nothing reserved" if fullscreen else "status and navigation bars: only the background"
+    if verbose or problems:
+        print(f"{'ok  ' if not problems else 'FAIL'} {name}" + "".join(f"\n     {p}" for p in problems[:4]))
+    return not problems
+
+
 def run_scenarios(library, verbose):
     failures = 0
     names = ["tap", "tap, then wait 2 s", "tap within slop", "long press", "slow tap (400 ms)", "swipe right",
@@ -300,7 +497,14 @@ def run_scenarios(library, verbose):
     if framework.lib.missing:
         print(f"FAIL unmodeled imports called: {sorted(framework.lib.missing)}")
         failures += 1
-    total = len(names) + 2
+    # Not fullscreen: the status bar (top) and navigation bar (bottom) get
+    # only the background; the gesture color fills the rest, before and
+    # after a tap.
+    failures += not check_reserved(library, verbose, fullscreen=False)
+    # Fullscreen: nothing reserved, the whole window is the color, and the
+    # insets are not even asked for.
+    failures += not check_reserved(library, verbose, fullscreen=True)
+    total = len(names) + 4
     print(f"{total - failures}/{total} android app scenarios passed")
     return failures
 

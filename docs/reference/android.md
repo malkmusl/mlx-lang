@@ -105,19 +105,42 @@ Each gesture goes to `update` and triggers a repaint. The state survives the
 activity restart a rotation causes (`onSaveInstanceState`), and recognized
 gestures are logged under the logcat tag `mlx`. Per-event memory lives in
 one malloc'd block reached through `ANativeActivity.instance`, so handling
-input allocates nothing. `Canvas`, `fill`, `fillRect` and `rgb` draw into
-the locked RGBA_8888 window buffer.
+input allocates nothing. `Canvas`, `fill`, `fillRect`, `fillArea` and `rgb`
+draw into the locked RGBA_8888 window buffer; each paint also sets the
+canvas's `reserved` insets and `free` rectangle (below).
 
-`examples/android/gestures.mlx` colors the screen by the last gesture:
-blue at start, green for a tap, yellow for a long press, red/magenta for a
-swipe right/left, cyan/orange for a swipe down/up.
+`examples/android/gestures.mlx` colors the screen below the status bar
+and above the navigation bar by the last gesture: blue at start, green for
+a tap, yellow for a long press, red/magenta for a swipe right/left,
+cyan/orange for a swipe down/up.
 
+### Reserved space
+
+The layout rule for every Android window: an app that is not fullscreen
+keeps the status and navigation bars, and its window reaches under them
+(and display cutouts; edge to edge, enforced from Android 15). That space
+is reserved: only the app's background is drawn there, and every UI
+component starts below it (and inside the other edges), in the `free`
+area. A fullscreen app (`--android-fullscreen`, whose theme sets
+`FLAG_FULLSCREEN`) has nothing reserved and lays out over the whole window,
+as if the rule did not exist.
+
+`reservedInsets(activity, &insets)` applies it: it returns
+`Reserved.system_bars` with the bars' insets, `Reserved.fullscreen` with
+zero insets (the bars are not even asked for), or `Reserved.unknown` with
+zero insets until the window has been laid out. With `std.ui`,
+`ui.screen(width, height, insets)` then gives `free` for the components
+(see [ui.md](ui.md)). The `Canvas` runtime does this on every paint
+(`canvas.*.reserved`, `canvas.*.free`), and `examples/vulkan-android` on
+window creation, resize and each layout pass (`onContentRectChanged`),
+logging `ui: reserved for the system bars: top … right … bottom … left …`
+or `ui: fullscreen, nothing reserved`.
+
+`isFullscreen(activity)` reads `getWindow().getAttributes().flags`.
 `windowInsets(activity, &insets)` fills a `std.ui` `Insets` with where the
-system draws over the window: status and navigation bars and display
-cutouts, in window pixels. A window that is not fullscreen reaches under
-the bars (edge to edge, enforced from Android 15), so an app draws only
-its background there and lays out its content in the rest (see
-[ui.md](ui.md)). The NDK has no C call for this, so it goes through the
+system draws over the window whether or not the app is fullscreen: status
+and navigation bars and display cutouts, in window pixels. The NDK has no
+C call for either, so they go through the
 activity's `JNIEnv`: `getWindow().getDecorView().getRootWindowInsets()`,
 then `getInsets(WindowInsets.Type.systemBars() | displayCutout())` from
 API 30 and `getSystemWindowInset*()` on API 23 to 29, inside a local
@@ -145,7 +168,7 @@ calls), the `O_*` bits that differ, and the `struct stat` and
 | `tools/check_aarch64_shared_library.py` | exports, imports, stack arguments and narrow-integer extension of a `.so` |
 | `tools/check_android_packaging.py` | CRC-32, Adler-32, SHA-1, SHA-256 and bignum results of the packaging code, built by mlx0 and by mlx1, against Python |
 | `tools/check_android_apk.py` | `apksigner`, `jarsigner`, `zipalign`, `aapt2` on a built APK; reproducible output |
-| `tools/emulate_android_app.py` | the gesture example against a model of the Android framework: taps, long presses, swipes, cancel, rotation |
+| `tools/emulate_android_app.py` | the gesture example against a model of the Android framework: taps, long presses, swipes, cancel, rotation, and the reserved space (a fake `JNIEnv`, see below): only the background under the status and navigation bars, nothing reserved when fullscreen |
 | `tools/emulate_vulkan_android.py` | `examples/vulkan-android` against the same framework model plus a mock Vulkan driver behind `libvulkan.so`: instance and device extensions, the submitted shader (`spirv-val`), swapchain creation on an R8G8B8A8, "inherit"-alpha surface, every presented frame pixel by pixel, the system bar insets (a fake `JNIEnv` answers `getRootWindowInsets` on API 34 through `WindowInsets.Type` and `Insets`, and on API 29 through `getSystemWindowInset*`; before the first layout pass it has none) with only the background under them, the std.truetype label at the top center of the rest (the system font served from the test font, the `text` shader run on the fills, atlas and runs the app built), touch, out-of-date and resized swapchains, background and return, and devices without a system font or without Vulkan |
 
 The emulator cannot run Android itself, so the last step is a device:

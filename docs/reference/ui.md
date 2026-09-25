@@ -90,10 +90,12 @@ the `text` shader's arithmetic at full coverage, and on the GPU
 (the shader with no glyphs and every pixel starting fully covered);
 `tests/263_vulkan_text_runtime.mlx` checks the two pixel for pixel.
 
-`examples/vulkan-android` lays out its frame this way: the frame is a
-screen whose safe insets are the system bars and cutouts
-(`std.android.windowInsets`, see [android.md](android.md)); only the
-background is filled into those bands (`takeTop`/`takeBottom`/`takeLeft`/
+On Android, the safe insets are the space `std.android.reservedInsets`
+reserves: the system bars and cutouts for an app that is not fullscreen,
+nothing for a fullscreen one (see [android.md](android.md#reserved-space)).
+Every component is laid out in `screen.free`.
+`examples/vulkan-android` lays out its frame this way: only the
+background is filled into the reserved bands (`takeTop`/`takeBottom`/`takeLeft`/
 `takeRight` of the bounds), and the label goes at the top center of
 `screen.free`, clipped to it with `text.drawIn`.
 

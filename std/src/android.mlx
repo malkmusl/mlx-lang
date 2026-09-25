@@ -91,12 +91,17 @@ const BUFFER_SIZE: usize = 48
 
 // ── Drawing ───────────────────────────────────────────────────────────────
 
-// The locked window: `stride` pixels per row, RGBA_8888.
+// The locked window: `stride` pixels per row, RGBA_8888. `reserved` is the
+// space kept for the system (see reservedInsets: the system bars unless the
+// app is fullscreen) and `free` the rest, where UI components go; only the
+// background belongs under `reserved`.
 pub const Canvas = struct {
     pixels: usize
     width: usize
     height: usize
     stride: usize
+    reserved: ui.Insets
+    free: ui.Rect
 }
 
 // An opaque RGBA_8888 pixel (bytes R, G, B, A in memory).
@@ -119,8 +124,17 @@ pub fn fillRect(canvas: *Canvas, x: usize, y: usize, width: usize, height: usize
     }
 }
 
+// The whole window: for the background.
 pub fn fill(canvas: *Canvas, color: u32) -> void {
     fillRect(canvas, 0, 0, canvas.*.width, canvas.*.height, color)
+}
+
+// The part of `area` inside the window (canvas.*.free for a component that
+// fills the space it is given).
+pub fn fillArea(canvas: *Canvas, area: ui.Rect, color: u32) -> void {
+    const clipped = ui.intersect(area, ui.rect(0, 0, @intCast(i32, canvas.*.width), @intCast(i32, canvas.*.height)))
+    if ui.isEmpty(clipped) { return }
+    fillRect(canvas, @intCast(usize, clipped.x), @intCast(usize, clipped.y), @intCast(usize, clipped.width), @intCast(usize, clipped.height), color)
 }
 
 // ── Logging ───────────────────────────────────────────────────────────────
@@ -131,13 +145,64 @@ pub fn log(text: []const u8) -> void {
     unsafe { const written = __android_log_write(LOG_INFO, @ptrCast([*]const u8, "mlx"), @ptrCast([*]const u8, text)) }
 }
 
-// ── Window insets (JNI) ───────────────────────────────────────────────────
+// ── Reserved space and window insets (JNI) ────────────────────────────────
+
+// The rule for laying out an Android window: an app that is not
+// fullscreen keeps the system's status and navigation bars (and display
+// cutouts), and its window reaches under them (edge to edge, enforced from
+// Android 15). That space is reserved: only the app's background is drawn
+// there, and every UI component is laid out in the rest. A fullscreen app
+// (FLAG_FULLSCREEN, as --android-fullscreen's theme sets) has nothing
+// reserved and lays out over the whole window.
+//
+// With std.ui:
+//
+//     var reserved = ui.uniform(0)
+//     const kind = android.reservedInsets(activity, &reserved)
+//     var screen = ui.screen(width, height, reserved)
+//     // background everywhere; components inside screen.free
+pub const Reserved = enum(u8) {
+    // Not fullscreen: the insets of the system bars and cutouts.
+    system_bars,
+    // Fullscreen: nothing reserved.
+    fullscreen,
+    // Not known yet (before the window's first layout pass, below API 23,
+    // or without a JNIEnv): nothing reserved for now; ask again after the
+    // next layout pass (onContentRectChanged).
+    unknown,
+}
+
+pub const FLAG_FULLSCREEN: i32 = 1024
+
+// The space reserved for the system in `activity`'s window (see Reserved),
+// in window pixels; all 0 unless `system_bars`. Call it on the main thread.
+pub fn reservedInsets(activity: usize, result: *ui.Insets) -> Reserved {
+    result.* = ui.uniform(0)
+    if isFullscreen(activity) { return Reserved.fullscreen }
+    if windowInsets(activity, result) { return Reserved.system_bars }
+    return Reserved.unknown
+}
+
+// Whether the window hides the status bar (its WindowManager.LayoutParams
+// has FLAG_FULLSCREEN). False when that cannot be asked.
+pub fn isFullscreen(activity: usize) -> bool {
+    var env: usize = 0
+    var object: usize = 0
+    var sdk: i32 = 0
+    if !jniEnter(activity, &env, &object, &sdk) { return false }
+    var ok = true
+    const window = jniCallObject(env, object, "getWindow", "()Landroid/view/Window;", 0)
+    const attributes = jniCallObject(env, window, "getAttributes", "()Landroid/view/WindowManager$LayoutParams;", 0)
+    var flags: i32 = 0
+    if attributes != 0 { flags = jniIntField(env, attributes, "flags", &ok) }
+    jniLeave(env)
+    return attributes != 0 && ok && flags & FLAG_FULLSCREEN != 0
+}
 
 // Where the system draws over the window: status and navigation bars and
-// display cutouts, in window pixels. An app that is not fullscreen gets a
-// window that reaches under the bars (edge to edge, enforced from Android
-// 15); it should draw only its background there and lay out its content in
-// the rest. The NDK has no C call for this, so it asks the Java side:
+// display cutouts, in window pixels, whether or not the app is fullscreen
+// (reservedInsets applies the rule). The NDK has no C call for this, so it
+// asks the Java side:
 //
 //     activity.getWindow().getDecorView().getRootWindowInsets()
 //         .getInsets(WindowInsets.Type.systemBars() | displayCutout())   (API 30+)
@@ -152,26 +217,37 @@ pub fn windowInsets(activity: usize, result: *ui.Insets) -> bool {
     var env: usize = 0
     var object: usize = 0
     var sdk: i32 = 0
-    unsafe {
-        env = @ptrFromInt(*usize, activity + ACTIVITY_ENV).*
-        object = @ptrFromInt(*usize, activity + ACTIVITY_OBJECT).*
-        sdk = @ptrFromInt(*i32, activity + ACTIVITY_SDK_VERSION).*
-    }
-    if env == 0 || object == 0 || sdk < 23 { return false }
-    // The references made here are freed with the frame.
-    var push: JniPushLocalFrame = undefined
-    unsafe { push = @ptrFromInt(JniPushLocalFrame, jniFunction(env, JNI_PUSH_LOCAL_FRAME)) }
-    if push(env, 16) != 0 {
-        jniFailed(env)
-        return false
-    }
+    if !jniEnter(activity, &env, &object, &sdk) { return false }
     var insets = ui.uniform(0)
     const found = queryInsets(env, object, sdk, &insets)
+    jniLeave(env)
+    if found { result.* = insets }
+    return found
+}
+
+// The activity's JNIEnv, NativeActivity object and API level, with a local
+// reference frame pushed (the references made until jniLeave are freed
+// with it). False below API 23 or without a JNIEnv.
+fn jniEnter(activity: usize, env: *usize, object: *usize, sdk: *i32) -> bool {
+    unsafe {
+        env.* = @ptrFromInt(*usize, activity + ACTIVITY_ENV).*
+        object.* = @ptrFromInt(*usize, activity + ACTIVITY_OBJECT).*
+        sdk.* = @ptrFromInt(*i32, activity + ACTIVITY_SDK_VERSION).*
+    }
+    if env.* == 0 || object.* == 0 || sdk.* < 23 { return false }
+    var push: JniPushLocalFrame = undefined
+    unsafe { push = @ptrFromInt(JniPushLocalFrame, jniFunction(env.*, JNI_PUSH_LOCAL_FRAME)) }
+    if push(env.*, 16) != 0 {
+        const failed = jniFailed(env.*)
+        return false
+    }
+    return true
+}
+
+fn jniLeave(env: usize) -> void {
     var pop: JniPopLocalFrame = undefined
     unsafe { pop = @ptrFromInt(JniPopLocalFrame, jniFunction(env, JNI_POP_LOCAL_FRAME)) }
     const popped = pop(env, 0)
-    if found { result.* = insets }
-    return found
 }
 
 // JNIEnv is a pointer to the table of JNI functions (jni.h, JNINativeInterface).
@@ -431,7 +507,8 @@ pub fn start(activity: usize, saved_state: usize, saved_state_size: usize, draw:
     setCallback(activity, ON_INPUT_QUEUE_DESTROYED, @intFromPtr(onInputQueueDestroyed))
 }
 
-// Repaints the whole window with the app's `draw`.
+// Repaints the whole window with the app's `draw`, with the reserved space
+// as it is now (a paint follows every window change).
 fn paint(app: *App) -> void {
     const window = app.*.window
     if window == 0 { return }
@@ -444,6 +521,10 @@ fn paint(app: *App) -> void {
     canvas.*.height = @intCast(usize, readU32(buffer + BUFFER_HEIGHT))
     canvas.*.stride = @intCast(usize, readU32(buffer + BUFFER_STRIDE))
     unsafe { canvas.*.pixels = @ptrFromInt(*usize, buffer + BUFFER_BITS).* }
+    var reserved = ui.uniform(0)
+    const kind = reservedInsets(app.*.activity, &reserved)
+    canvas.*.reserved = reserved
+    canvas.*.free = ui.inset(ui.rect(0, 0, @intCast(i32, canvas.*.width), @intCast(i32, canvas.*.height)), reserved)
     var draw: DrawFn = undefined
     unsafe { draw = @ptrFromInt(DrawFn, app.*.draw) }
     draw(canvas, app.*.state)

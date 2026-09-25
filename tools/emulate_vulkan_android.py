@@ -496,155 +496,13 @@ class MockVulkan:
         return 0
 
 
-ACTIVITY_OBJECT = 0x7A00_0001
-# WindowInsets.Type.systemBars() and displayCutout().
-SYSTEM_BARS, DISPLAY_CUTOUT = 7, 128
-
-
-class FakeJni:
-    """The activity's JNIEnv, as far as std.android.windowInsets uses it:
-    the NativeActivity object, its Window, the decor View and its
-    WindowInsets, answering `insets` (top, right, bottom, left), or no
-    WindowInsets at all while `insets` is None (not laid out yet). API 30+
-    goes through WindowInsets.Type and android.graphics.Insets, older levels
-    through getSystemWindowInset*. Unknown classes, methods and fields throw
-    (a pending exception, as in Java); any call made while an exception is
-    pending, and unbalanced local frames, fail the run."""
-
-    FUNCTIONS = {6: "FindClass", 17: "ExceptionClear", 19: "PushLocalFrame", 20: "PopLocalFrame",
-                 31: "GetObjectClass", 33: "GetMethodID", 36: "CallObjectMethodA", 51: "CallIntMethodA",
-                 94: "GetFieldID", 100: "GetIntField", 113: "GetStaticMethodID", 131: "CallStaticIntMethodA",
-                 228: "ExceptionCheck"}
-    CLASSES = {"activity": "android/app/NativeActivity", "window": "android/view/Window",
-               "decor": "android/view/View", "insets": "android/view/WindowInsets", "values": "android/graphics/Insets"}
-    METHODS = {("android/app/NativeActivity", "getWindow", "()Landroid/view/Window;"),
-               ("android/view/Window", "getDecorView", "()Landroid/view/View;"),
-               ("android/view/View", "getRootWindowInsets", "()Landroid/view/WindowInsets;"),
-               ("android/view/WindowInsets", "getInsets", "(I)Landroid/graphics/Insets;"),
-               ("android/view/WindowInsets", "getSystemWindowInsetTop", "()I"),
-               ("android/view/WindowInsets", "getSystemWindowInsetRight", "()I"),
-               ("android/view/WindowInsets", "getSystemWindowInsetBottom", "()I"),
-               ("android/view/WindowInsets", "getSystemWindowInsetLeft", "()I")}
-
-    def __init__(self, framework, stub, sdk=34, insets=(0, 0, 0, 0)):
-        self.framework = framework
-        self.sdk = sdk
-        self.insets = insets
-        self.pending = False
-        self.frames = 0
-        self.queries = 0
-        self.objects = {ACTIVITY_OBJECT: "activity"}
-        table = framework.malloc(8 * 240)
-        for index in range(240):
-            name = self.FUNCTIONS.get(index)
-            handler = getattr(self, name) if name else self.unexpected(index)
-            framework.put_u64(table + 8 * index, stub(f"jni:{name or index}", handler))
-        self.env = framework.malloc(8)
-        framework.put_u64(self.env, table)
-
-    def unexpected(self, index):
-        def fail(process, *_):
-            raise AssertionError(f"unexpected JNI function {index}")
-        return fail
-
-    def new(self, kind):
-        handle = 0x7A00_0000 + 0x10 * (len(self.objects) + 1)
-        self.objects[handle] = kind
-        return handle
-
-    def calm(self, name):
-        assert not self.pending, f"JNI {name} called with an exception pending"
-
-    def throw(self):
-        self.pending = True
-        return 0
-
-    def FindClass(self, process, env, name, *_):
-        self.calm("FindClass")
-        if process.cstring(name) == "android/view/WindowInsets$Type" and self.sdk >= 30:
-            return self.new("class:android/view/WindowInsets$Type")
-        return self.throw()
-
-    def ExceptionCheck(self, process, env, *_):
-        return 1 if self.pending else 0
-
-    def ExceptionClear(self, process, env, *_):
-        self.pending = False
-
-    def PushLocalFrame(self, process, env, capacity, *_):
-        self.calm("PushLocalFrame")
-        self.frames += 1
-        return 0
-
-    def PopLocalFrame(self, process, env, result, *_):
-        assert self.frames > 0, "PopLocalFrame without PushLocalFrame"
-        self.frames -= 1
-        return 0
-
-    def GetObjectClass(self, process, env, obj, *_):
-        self.calm("GetObjectClass")
-        return self.new("class:" + self.CLASSES[self.objects[obj]])
-
-    def member(self, process, cls, name, signature, known):
-        class_name = self.objects[cls].split(":", 1)[1]
-        key = (class_name, process.cstring(name), process.cstring(signature))
-        if key not in known:
-            return self.throw()
-        return self.new("member:" + key[1])
-
-    def GetMethodID(self, process, env, cls, name, signature, *_):
-        self.calm("GetMethodID")
-        return self.member(process, cls, name, signature, self.METHODS)
-
-    def GetStaticMethodID(self, process, env, cls, name, signature, *_):
-        self.calm("GetStaticMethodID")
-        return self.member(process, cls, name, signature, {("android/view/WindowInsets$Type", "systemBars", "()I"),
-                                                           ("android/view/WindowInsets$Type", "displayCutout", "()I")})
-
-    def GetFieldID(self, process, env, cls, name, signature, *_):
-        self.calm("GetFieldID")
-        return self.member(process, cls, name, signature, {("android/graphics/Insets", side, "I")
-                                                           for side in ("top", "right", "bottom", "left")})
-
-    def CallObjectMethodA(self, process, env, obj, method, arguments, *_):
-        self.calm("CallObjectMethodA")
-        name = self.objects[method].split(":", 1)[1]
-        if name == "getWindow":
-            return self.new("window")
-        if name == "getDecorView":
-            return self.new("decor")
-        if name == "getRootWindowInsets":
-            self.queries += 1
-            return 0 if self.insets is None else self.new("insets")
-        assert name == "getInsets" and self.sdk >= 30, name
-        mask = struct.unpack("<I", process.read(arguments, 4))[0]
-        assert mask == SYSTEM_BARS | DISPLAY_CUTOUT, f"getInsets({mask}): not the system bars and cutouts"
-        return self.new("values")
-
-    def CallIntMethodA(self, process, env, obj, method, arguments, *_):
-        self.calm("CallIntMethodA")
-        side = self.objects[method].split(":", 1)[1][len("getSystemWindowInset"):].lower()
-        return self.insets[("top", "right", "bottom", "left").index(side)]
-
-    def CallStaticIntMethodA(self, process, env, cls, method, arguments, *_):
-        self.calm("CallStaticIntMethodA")
-        return {"member:systemBars": SYSTEM_BARS, "member:displayCutout": DISPLAY_CUTOUT}[self.objects[method]]
-
-    def GetIntField(self, process, env, obj, field, *_):
-        self.calm("GetIntField")
-        assert self.objects[obj] == "values"
-        return self.insets[("top", "right", "bottom", "left").index(self.objects[field].split(":", 1)[1])]
-
-
 class App(Framework):
     """The framework model with a periodic timerfd and the mock driver."""
 
     def __init__(self, library_path, available=True, verbose=False, font=FONT, jni=None):
-        super().__init__(library_path, verbose=verbose)
+        super().__init__(library_path, verbose=verbose, jni=jni)
         self.timer_interval = 0
         self.vulkan = MockVulkan(self, available)
-        # jni: {"sdk": ..., "insets": ...} gives the activity a JNIEnv.
-        self.jni = FakeJni(self, self.vulkan.stub, **jni) if jni is not None else None
         # /system/fonts/* is the test font (or missing, with font=None).
         lib = self.lib
         original = lib.sys_56
@@ -657,12 +515,6 @@ class App(Framework):
                 return os.open(font, os.O_RDONLY)
             return original(dirfd, path, flags, mode, *rest)
         lib.sys_56 = openat
-
-    def prepare_activity(self):
-        if self.jni is not None:
-            self.put_u64(self.activity + 16, self.jni.env)
-            self.put_u64(self.activity + 24, ACTIVITY_OBJECT)
-            self.lib.write(self.activity + 48, struct.pack("<i", self.jni.sdk))
 
     def _set_timer(self, process, fd, flags, new, old, *_):
         interval = struct.unpack("<qq", process.read(new, 16))
@@ -765,7 +617,7 @@ def scenario_render(library, spirv_val):
     assert "vulkan: swapchain created" in app.messages()
     # The background under the two bars, the label's shadow and the label.
     assert "text: font loaded" in app.messages() and vulkan.text_draws == 4, (app.messages(), vulkan.text_draws)
-    assert "ui: system bar insets top 8 right 0 bottom 6 left 0" in app.messages(), app.messages()
+    assert "ui: reserved for the system bars: top 8 right 0 bottom 6 left 0" in app.messages(), app.messages()
     logged = len(app.messages())
     assert len(vulkan.frames) == 1, "no frame on window creation"
     check_frame(vulkan.frames[0], 0, insets=insets)
@@ -854,7 +706,7 @@ def scenario_landscape(library):
     insets = (10, 0, 6, 24)
     app.jni.insets = insets
     app.callback("onContentRectChanged", app.malloc(16))
-    assert "ui: system bar insets top 10 right 0 bottom 6 left 24" in app.messages(), app.messages()
+    assert "ui: reserved for the system bars: top 10 right 0 bottom 6 left 24" in app.messages(), app.messages()
     del centered[:]
     check_frame(vulkan.frames[-1], (len(vulkan.frames) - 1) * 2, insets=insets)
     assert centered == [True], "the label does not fit the free part of a 480-pixel frame"
@@ -867,6 +719,33 @@ def scenario_landscape(library):
     assert vulkan.frames[-1][0] == (64, 96), vulkan.frames[-1][0]
     check_frame(vulkan.frames[-1], (len(vulkan.frames) - 2) * 2, insets=insets)
     assert vulkan.swapchains_created == 2, vulkan.swapchains_created
+    app.callback("onNativeWindowDestroyed", WINDOW)
+    app.callback("onDestroy")
+    return len(vulkan.frames)
+
+
+def scenario_fullscreen(library):
+    """Fullscreen: nothing is reserved, so the whole frame is the pattern
+    and the label sits at the top center of the whole window, as if there
+    were no system bars; their insets are not even asked for."""
+    app = App(library, jni={"sdk": 34, "insets": (8, 0, 6, 0), "fullscreen": True})
+    vulkan = app.vulkan
+    vulkan.extent = (480, 80)
+    app.create()
+    app.show_window()
+    app.advance(40 * MS)
+    assert "ui: fullscreen, nothing reserved" in app.messages(), app.messages()
+    assert app.jni.queries == 0 and app.jni.frames == 0, (app.jni.queries, app.jni.frames)
+    # Shadow and label only: no background bands.
+    assert vulkan.text_draws == 2 * len(vulkan.frames), (vulkan.text_draws, len(vulkan.frames))
+    for index, frame in enumerate(vulkan.frames):
+        del centered[:]
+        check_frame(frame, index * 2)
+        assert centered == [True], "the label is not centered in the whole window"
+    # A layout pass changes nothing.
+    presented = len(vulkan.frames)
+    app.callback("onContentRectChanged", app.malloc(16))
+    assert len(vulkan.frames) == presented
     app.callback("onNativeWindowDestroyed", WINDOW)
     app.callback("onDestroy")
     return len(vulkan.frames)
@@ -924,6 +803,8 @@ def main():
               + ("" if spirv_val else " [spirv-val not installed]"))
         frames = scenario_landscape(path)
         print(f"ok   landscape (ROTATE_90, API 29 insets): {frames} frames, upright with an IDENTITY swapchain, no rebuild per suboptimal present")
+        frames = scenario_fullscreen(path)
+        print(f"ok   fullscreen: {frames} frames, nothing reserved, the label at the top center of the whole window")
         scenario_no_font(path)
         print("ok   no system font: frames without a label")
         scenario_no_vulkan(path)
