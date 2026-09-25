@@ -1,0 +1,629 @@
+// std.json: allocation-free JSON (RFC 8259) pull tokenizer plus string and
+// number decoding.
+//
+// The tokenizer borrows the source bytes and reports one token at a time,
+// checking the grammar as it goes: objects and arrays must nest and close
+// properly, members are `key: value` separated by commas, and exactly one
+// top-level value is allowed. Container nesting is tracked in fixed storage
+// inside the tokenizer.
+//
+// Object member names are reported as `key` tokens, every other string as a
+// `string` token. String and number tokens carry their raw source text (a
+// string's without the quotes, escapes still in place); `decodeString`,
+// `parseInteger` and `parseUnsigned` convert them. (There is no float
+// conversion yet: the bootstrap compiler's integer-to-float conversion of
+// negative values is not reliable.)
+//
+// Reading a document is a loop over `next`; `skipValue` passes over a value
+// the caller is not interested in, whole subtree included:
+//
+//     var tokenizer: json.Tokenizer = undefined
+//     json.initString(&tokenizer, text)
+//     var token: json.Token = undefined
+//     while json.next(&tokenizer, &token) {
+//         if token.kind == json.TokenKind.key && json.depth(&tokenizer) == 1 && json.equals(token.value, "name") {
+//             ...
+//         }
+//     }
+//     if json.failed(&tokenizer) { ... }
+
+const allocator_module = @import("../bootstrap/allocator.mlx")
+const string = @import("../bootstrap/string.mlx")
+
+pub const Allocator = allocator_module.Allocator
+pub const String = string.String
+
+pub const MAX_DEPTH: usize = 64
+
+pub const TokenKind = enum(u8) {
+    endOfDocument,
+    objectStart,
+    objectEnd,
+    arrayStart,
+    arrayEnd,
+    key,
+    string,
+    number,
+    trueValue,
+    falseValue,
+    nullValue,
+    invalid
+}
+
+pub const ErrorCode = enum(u8) {
+    none,
+    unexpectedEnd,
+    unexpectedCharacter,
+    invalidLiteral,
+    invalidNumber,
+    invalidString,
+    invalidEscape,
+    expectedKey,
+    expectedColon,
+    expectedCommaOrEnd,
+    mismatchedClose,
+    tooDeep,
+    trailingContent
+}
+
+pub const Token = struct {
+    kind: TokenKind
+    // Raw text: a string's or key's content without quotes, a number's
+    // digits, or the literal; empty for structural tokens.
+    value: String
+    offset: usize
+}
+
+// What the tokenizer expects next.
+const EXPECT_VALUE: u8 = 0 // a value (document start, after ':' or ',' in an array)
+const EXPECT_FIRST_VALUE: u8 = 1 // a value or ']' (just after '[')
+const EXPECT_FIRST_KEY: u8 = 2 // a key or '}' (just after '{')
+const EXPECT_KEY: u8 = 3 // a key (after ',' in an object)
+const EXPECT_COLON: u8 = 4 // ':' after a key
+const EXPECT_SEPARATOR: u8 = 5 // ',' or the container's close after a value
+const EXPECT_END: u8 = 6 // nothing but whitespace (top-level value done)
+const EXPECT_DONE: u8 = 7
+
+const CONTAINER_OBJECT: u8 = 1
+const CONTAINER_ARRAY: u8 = 2
+
+pub const Tokenizer = struct {
+    source: [*]const u8
+    length: usize
+    position: usize
+    expect: u8
+    depth: usize
+    containers: [64]u8
+    errorCode: ErrorCode
+    errorOffset: usize
+}
+
+// Initializes a tokenizer in place. The source must outlive every token.
+pub fn initAt(tokenizer: *Tokenizer, source: [*]const u8, length: usize) -> void {
+    tokenizer.*.source = source
+    tokenizer.*.length = length
+    tokenizer.*.position = 0
+    tokenizer.*.expect = EXPECT_VALUE
+    tokenizer.*.depth = 0
+    tokenizer.*.errorCode = ErrorCode.none
+    tokenizer.*.errorOffset = 0
+    // A UTF-8 byte order mark is tolerated before the document.
+    if length >= 3 && source[0] == 239 && source[1] == 187 && source[2] == 191 {
+        tokenizer.*.position = 3
+    }
+}
+
+pub fn initString(tokenizer: *Tokenizer, source: String) -> void {
+    initAt(tokenizer, source.pointer, source.length)
+}
+
+pub fn failed(tokenizer: *const Tokenizer) -> bool {
+    return tokenizer.*.errorCode != ErrorCode.none
+}
+
+pub fn errorCode(tokenizer: *const Tokenizer) -> ErrorCode {
+    return tokenizer.*.errorCode
+}
+
+pub fn errorOffset(tokenizer: *const Tokenizer) -> usize {
+    return tokenizer.*.errorOffset
+}
+
+// Number of open containers. Inside the top-level object a member's key and
+// value are at depth 1.
+pub fn depth(tokenizer: *const Tokenizer) -> usize {
+    return tokenizer.*.depth
+}
+
+// 1-based line number of a byte offset in the tokenizer's source.
+pub fn lineOf(tokenizer: *const Tokenizer, offset: usize) -> usize {
+    var line: usize = 1
+    var index: usize = 0
+    while index < offset && index < tokenizer.*.length {
+        if tokenizer.*.source[index] == 10 { line += 1 }
+        index += 1
+    }
+    return line
+}
+
+pub fn errorMessage(code: ErrorCode) -> []const u8 {
+    return match code {
+        .none => "no error",
+        .unexpectedEnd => "unexpected end of document",
+        .unexpectedCharacter => "unexpected character",
+        .invalidLiteral => "invalid literal (expected true, false or null)",
+        .invalidNumber => "invalid number",
+        .invalidString => "invalid string (unterminated or control character)",
+        .invalidEscape => "invalid escape sequence in string",
+        .expectedKey => "expected a quoted member name",
+        .expectedColon => "expected ':' after member name",
+        .expectedCommaOrEnd => "expected ',' or the end of the container",
+        .mismatchedClose => "closing bracket does not match the open container",
+        .tooDeep => "containers nested too deeply",
+        .trailingContent => "content after the top-level value",
+    }
+}
+
+fn isWhitespace(byte: u8) -> bool {
+    return byte == 32 || byte == 9 || byte == 10 || byte == 13
+}
+
+fn isDigit(byte: u8) -> bool {
+    return byte >= 48 && byte <= 57
+}
+
+fn fail(tokenizer: *Tokenizer, token: *Token, code: ErrorCode, offset: usize) -> bool {
+    tokenizer.*.errorCode = code
+    tokenizer.*.errorOffset = offset
+    tokenizer.*.expect = EXPECT_DONE
+    token.*.kind = TokenKind.invalid
+    token.*.offset = offset
+    unsafe { token.*.value = string.fromParts(@ptrFromInt([*]const u8, @intFromPtr(tokenizer.*.source) + offset), 0) }
+    return false
+}
+
+fn emit(tokenizer: *Tokenizer, token: *Token, kind: TokenKind, start: usize, end: usize) -> bool {
+    token.*.kind = kind
+    token.*.offset = start
+    unsafe { token.*.value = string.fromParts(@ptrFromInt([*]const u8, @intFromPtr(tokenizer.*.source) + start), end - start) }
+    return true
+}
+
+fn skipWhitespace(tokenizer: *Tokenizer) -> void {
+    while tokenizer.*.position < tokenizer.*.length && isWhitespace(tokenizer.*.source[tokenizer.*.position]) {
+        tokenizer.*.position += 1
+    }
+}
+
+fn currentContainer(tokenizer: *const Tokenizer) -> u8 {
+    if tokenizer.*.depth == 0 { return 0 }
+    return tokenizer.*.containers[tokenizer.*.depth - 1]
+}
+
+// State after a complete value at the current depth.
+fn afterValue(tokenizer: *Tokenizer) -> void {
+    tokenizer.*.expect = if tokenizer.*.depth == 0 { EXPECT_END } else { EXPECT_SEPARATOR }
+}
+
+// Scans a string starting at the opening quote; returns the offset of the
+// closing quote, or `length` when the string is invalid (the error is set).
+fn scanString(tokenizer: *Tokenizer, open: usize) -> usize {
+    var index = open + 1
+    while index < tokenizer.*.length {
+        const byte = tokenizer.*.source[index]
+        if byte == 34 { return index }
+        if byte < 32 {
+            tokenizer.*.errorCode = ErrorCode.invalidString
+            tokenizer.*.errorOffset = index
+            return tokenizer.*.length
+        }
+        if byte == 92 {
+            if index + 1 >= tokenizer.*.length { break }
+            const escaped = tokenizer.*.source[index + 1]
+            if escaped == 117 {
+                var digit: usize = 0
+                while digit < 4 {
+                    if index + 2 + digit >= tokenizer.*.length || hexValue(tokenizer.*.source[index + 2 + digit]) < 0 {
+                        tokenizer.*.errorCode = ErrorCode.invalidEscape
+                        tokenizer.*.errorOffset = index
+                        return tokenizer.*.length
+                    }
+                    digit += 1
+                }
+                index += 6
+            } else if escaped == 34 || escaped == 92 || escaped == 47 || escaped == 98 || escaped == 102 || escaped == 110 || escaped == 114 || escaped == 116 {
+                index += 2
+            } else {
+                tokenizer.*.errorCode = ErrorCode.invalidEscape
+                tokenizer.*.errorOffset = index
+                return tokenizer.*.length
+            }
+        } else {
+            index += 1
+        }
+    }
+    tokenizer.*.errorCode = ErrorCode.invalidString
+    tokenizer.*.errorOffset = open
+    return tokenizer.*.length
+}
+
+// Scans a number per the JSON grammar; returns its end offset, or `start`
+// when it is not a valid number.
+fn scanNumber(source: [*]const u8, length: usize, start: usize) -> usize {
+    var index = start
+    if index < length && source[index] == 45 { index += 1 }
+    if index >= length || !isDigit(source[index]) { return start }
+    if source[index] == 48 {
+        index += 1
+    } else {
+        while index < length && isDigit(source[index]) { index += 1 }
+    }
+    if index < length && source[index] == 46 {
+        index += 1
+        if index >= length || !isDigit(source[index]) { return start }
+        while index < length && isDigit(source[index]) { index += 1 }
+    }
+    if index < length && (source[index] == 101 || source[index] == 69) {
+        index += 1
+        if index < length && (source[index] == 43 || source[index] == 45) { index += 1 }
+        if index >= length || !isDigit(source[index]) { return start }
+        while index < length && isDigit(source[index]) { index += 1 }
+    }
+    return index
+}
+
+fn matchesLiteral(tokenizer: *const Tokenizer, start: usize, literal: []const u8) -> bool {
+    var index: usize = 0
+    for byte in literal {
+        if start + index >= tokenizer.*.length || tokenizer.*.source[start + index] != byte { return false }
+        index += 1
+    }
+    // A literal must not run into further letters ("trueish").
+    const end = start + index
+    if end < tokenizer.*.length {
+        const after = tokenizer.*.source[end]
+        if (after >= 97 && after <= 122) || (after >= 65 && after <= 90) || isDigit(after) { return false }
+    }
+    return true
+}
+
+fn literalLength(literal: []const u8) -> usize {
+    var length: usize = 0
+    for byte in literal { length += 1 }
+    return length
+}
+
+fn openContainer(tokenizer: *Tokenizer, token: *Token, container: u8, start: usize) -> bool {
+    if tokenizer.*.depth >= MAX_DEPTH { return fail(tokenizer, token, ErrorCode.tooDeep, start) }
+    tokenizer.*.containers[tokenizer.*.depth] = container
+    tokenizer.*.depth += 1
+    tokenizer.*.position = start + 1
+    tokenizer.*.expect = if container == CONTAINER_OBJECT { EXPECT_FIRST_KEY } else { EXPECT_FIRST_VALUE }
+    const kind = if container == CONTAINER_OBJECT { TokenKind.objectStart } else { TokenKind.arrayStart }
+    return emit(tokenizer, token, kind, start, start)
+}
+
+fn closeContainer(tokenizer: *Tokenizer, token: *Token, container: u8, start: usize) -> bool {
+    if currentContainer(tokenizer) != container { return fail(tokenizer, token, ErrorCode.mismatchedClose, start) }
+    tokenizer.*.depth -= 1
+    tokenizer.*.position = start + 1
+    afterValue(tokenizer)
+    const kind = if container == CONTAINER_OBJECT { TokenKind.objectEnd } else { TokenKind.arrayEnd }
+    return emit(tokenizer, token, kind, start, start)
+}
+
+// Reads a value starting at `start` (whitespace already skipped).
+fn readValue(tokenizer: *Tokenizer, token: *Token, start: usize) -> bool {
+    const byte = tokenizer.*.source[start]
+    if byte == 123 { return openContainer(tokenizer, token, CONTAINER_OBJECT, start) }
+    if byte == 91 { return openContainer(tokenizer, token, CONTAINER_ARRAY, start) }
+    if byte == 34 {
+        const close = scanString(tokenizer, start)
+        if close >= tokenizer.*.length { return fail(tokenizer, token, tokenizer.*.errorCode, tokenizer.*.errorOffset) }
+        tokenizer.*.position = close + 1
+        afterValue(tokenizer)
+        return emit(tokenizer, token, TokenKind.string, start + 1, close)
+    }
+    if byte == 45 || isDigit(byte) {
+        const end = scanNumber(tokenizer.*.source, tokenizer.*.length, start)
+        if end == start { return fail(tokenizer, token, ErrorCode.invalidNumber, start) }
+        tokenizer.*.position = end
+        afterValue(tokenizer)
+        return emit(tokenizer, token, TokenKind.number, start, end)
+    }
+    if matchesLiteral(tokenizer, start, "true") {
+        tokenizer.*.position = start + 4
+        afterValue(tokenizer)
+        return emit(tokenizer, token, TokenKind.trueValue, start, start + 4)
+    }
+    if matchesLiteral(tokenizer, start, "false") {
+        tokenizer.*.position = start + 5
+        afterValue(tokenizer)
+        return emit(tokenizer, token, TokenKind.falseValue, start, start + 5)
+    }
+    if matchesLiteral(tokenizer, start, "null") {
+        tokenizer.*.position = start + 4
+        afterValue(tokenizer)
+        return emit(tokenizer, token, TokenKind.nullValue, start, start + 4)
+    }
+    if (byte >= 97 && byte <= 122) || (byte >= 65 && byte <= 90) { return fail(tokenizer, token, ErrorCode.invalidLiteral, start) }
+    return fail(tokenizer, token, ErrorCode.unexpectedCharacter, start)
+}
+
+fn readKey(tokenizer: *Tokenizer, token: *Token, start: usize) -> bool {
+    if tokenizer.*.source[start] != 34 { return fail(tokenizer, token, ErrorCode.expectedKey, start) }
+    const close = scanString(tokenizer, start)
+    if close >= tokenizer.*.length { return fail(tokenizer, token, tokenizer.*.errorCode, tokenizer.*.errorOffset) }
+    tokenizer.*.position = close + 1
+    tokenizer.*.expect = EXPECT_COLON
+    return emit(tokenizer, token, TokenKind.key, start + 1, close)
+}
+
+// Produces the next token. Returns false at the end of the document (token
+// kind endOfDocument) or on an error (token kind invalid; see `failed`).
+pub fn next(tokenizer: *Tokenizer, token: *Token) -> bool {
+    while true {
+        if tokenizer.*.expect == EXPECT_DONE {
+            if failed(tokenizer) { return fail(tokenizer, token, tokenizer.*.errorCode, tokenizer.*.errorOffset) }
+            const ended = emit(tokenizer, token, TokenKind.endOfDocument, tokenizer.*.length, tokenizer.*.length)
+            return false
+        }
+        skipWhitespace(tokenizer)
+        const start = tokenizer.*.position
+        if start >= tokenizer.*.length {
+            if tokenizer.*.expect == EXPECT_END {
+                tokenizer.*.expect = EXPECT_DONE
+                const ended = emit(tokenizer, token, TokenKind.endOfDocument, start, start)
+                return false
+            }
+            return fail(tokenizer, token, ErrorCode.unexpectedEnd, start)
+        }
+        const byte = tokenizer.*.source[start]
+        const expect = tokenizer.*.expect
+        if expect == EXPECT_END { return fail(tokenizer, token, ErrorCode.trailingContent, start) }
+        if expect == EXPECT_VALUE { return readValue(tokenizer, token, start) }
+        if expect == EXPECT_FIRST_VALUE {
+            if byte == 93 { return closeContainer(tokenizer, token, CONTAINER_ARRAY, start) }
+            return readValue(tokenizer, token, start)
+        }
+        if expect == EXPECT_FIRST_KEY {
+            if byte == 125 { return closeContainer(tokenizer, token, CONTAINER_OBJECT, start) }
+            return readKey(tokenizer, token, start)
+        }
+        if expect == EXPECT_KEY { return readKey(tokenizer, token, start) }
+        if expect == EXPECT_COLON {
+            if byte != 58 { return fail(tokenizer, token, ErrorCode.expectedColon, start) }
+            tokenizer.*.position = start + 1
+            tokenizer.*.expect = EXPECT_VALUE
+        } else {
+            // EXPECT_SEPARATOR
+            const container = currentContainer(tokenizer)
+            if byte == 44 {
+                tokenizer.*.position = start + 1
+                tokenizer.*.expect = if container == CONTAINER_OBJECT { EXPECT_KEY } else { EXPECT_VALUE }
+            } else if byte == 125 {
+                return closeContainer(tokenizer, token, CONTAINER_OBJECT, start)
+            } else if byte == 93 {
+                return closeContainer(tokenizer, token, CONTAINER_ARRAY, start)
+            } else {
+                return fail(tokenizer, token, ErrorCode.expectedCommaOrEnd, start)
+            }
+        }
+    }
+    return false
+}
+
+// Skips the value whose first token is `first` (already read): for an
+// object or array start, every token through the matching end. Returns false
+// on an error.
+pub fn skipValue(tokenizer: *Tokenizer, first: Token) -> bool {
+    if first.kind != TokenKind.objectStart && first.kind != TokenKind.arrayStart { return first.kind != TokenKind.invalid }
+    const target = tokenizer.*.depth - 1
+    var token: Token = undefined
+    while next(tokenizer, &token) {
+        if (token.kind == TokenKind.objectEnd || token.kind == TokenKind.arrayEnd) && tokenizer.*.depth == target { return true }
+    }
+    return false
+}
+
+// ---------------------------------------------------------------------------
+// Strings
+
+fn hexValue(byte: u8) -> isize {
+    if byte >= 48 && byte <= 57 { return @intCast(isize, byte - 48) }
+    if byte >= 97 && byte <= 102 { return @intCast(isize, byte - 87) }
+    if byte >= 65 && byte <= 70 { return @intCast(isize, byte - 55) }
+    return -1
+}
+
+fn hex4(raw: String, at: usize) -> isize {
+    if at + 4 > raw.length { return -1 }
+    var value: isize = 0
+    var index: usize = 0
+    while index < 4 {
+        const digit = hexValue(raw.pointer[at + index])
+        if digit < 0 { return -1 }
+        value = value * 16 + digit
+        index += 1
+    }
+    return value
+}
+
+fn encodeScalar(value: usize, destination: [*]u8, offset: usize, capacity: usize) -> usize {
+    if value < 128 {
+        if offset + 1 > capacity { return 0 }
+        destination[offset] = @intCast(u8, value)
+        return 1
+    }
+    if value < 2048 {
+        if offset + 2 > capacity { return 0 }
+        destination[offset] = @intCast(u8, 192 | (value >> 6))
+        destination[offset + 1] = @intCast(u8, 128 | (value & 63))
+        return 2
+    }
+    if value < 65536 {
+        if offset + 3 > capacity { return 0 }
+        destination[offset] = @intCast(u8, 224 | (value >> 12))
+        destination[offset + 1] = @intCast(u8, 128 | ((value >> 6) & 63))
+        destination[offset + 2] = @intCast(u8, 128 | (value & 63))
+        return 3
+    }
+    if offset + 4 > capacity { return 0 }
+    destination[offset] = @intCast(u8, 240 | (value >> 18))
+    destination[offset + 1] = @intCast(u8, 128 | ((value >> 12) & 63))
+    destination[offset + 2] = @intCast(u8, 128 | ((value >> 6) & 63))
+    destination[offset + 3] = @intCast(u8, 128 | (value & 63))
+    return 4
+}
+
+// Expands the escapes in a raw string or key token into `destination`.
+// Returns the decoded length, or -1 when an escape is invalid (including an
+// unpaired UTF-16 surrogate) or the destination is too small. The decoded
+// form is never longer than the raw form.
+pub fn decodeString(raw: String, destination: [*]u8, capacity: usize) -> isize {
+    var input: usize = 0
+    var output: usize = 0
+    while input < raw.length {
+        const byte = raw.pointer[input]
+        if byte != 92 {
+            if output >= capacity { return -1 }
+            destination[output] = byte
+            output += 1
+            input += 1
+        } else {
+            if input + 1 >= raw.length { return -1 }
+            const escaped = raw.pointer[input + 1]
+            var simple: isize = -1
+            if escaped == 34 { simple = 34 }
+            if escaped == 92 { simple = 92 }
+            if escaped == 47 { simple = 47 }
+            if escaped == 98 { simple = 8 }
+            if escaped == 102 { simple = 12 }
+            if escaped == 110 { simple = 10 }
+            if escaped == 114 { simple = 13 }
+            if escaped == 116 { simple = 9 }
+            if simple >= 0 {
+                if output >= capacity { return -1 }
+                destination[output] = @intCast(u8, simple)
+                output += 1
+                input += 2
+            } else {
+                if escaped != 117 { return -1 }
+                var scalar = hex4(raw, input + 2)
+                if scalar < 0 { return -1 }
+                input += 6
+                if scalar >= 55296 && scalar <= 56319 {
+                    // A high surrogate must be followed by \u and a low one.
+                    if input + 1 >= raw.length || raw.pointer[input] != 92 || raw.pointer[input + 1] != 117 { return -1 }
+                    const low = hex4(raw, input + 2)
+                    if low < 56320 || low > 57343 { return -1 }
+                    scalar = 65536 + (scalar - 55296) * 1024 + (low - 56320)
+                    input += 6
+                } else if scalar >= 56320 && scalar <= 57343 {
+                    return -1
+                }
+                const written = encodeScalar(@bitCast(usize, scalar), destination, output, capacity)
+                if written == 0 { return -1 }
+                output += written
+            }
+        }
+    }
+    return @bitCast(isize, output)
+}
+
+// True when a raw string contains no escapes, so it can be used as-is.
+pub fn isPlain(raw: String) -> bool {
+    var index: usize = 0
+    while index < raw.length {
+        if raw.pointer[index] == 92 { return false }
+        index += 1
+    }
+    return true
+}
+
+// Decodes `raw` into memory owned by the caller through `allocator`; release
+// it with `freeDecoded(allocator, result, raw.length)`. Returns false on an
+// invalid escape or allocation failure.
+pub fn decodeAlloc(allocator: Allocator, raw: String, result: *String) -> bool {
+    const capacity = if raw.length > 0 { raw.length } else { 1 }
+    const memory = allocator.alloc(capacity, 1)
+    if memory == null { return false }
+    const length = decodeString(raw, memory.?, capacity)
+    if length < 0 {
+        allocator.free(memory.?, capacity, 1)
+        return false
+    }
+    unsafe { result.* = string.fromParts(@ptrCast([*]const u8, memory.?), @bitCast(usize, length)) }
+    return true
+}
+
+pub fn freeDecoded(allocator: Allocator, value: String, raw_length: usize) -> void {
+    const capacity = if raw_length > 0 { raw_length } else { 1 }
+    unsafe { allocator.free(@ptrCast([*]u8, value.pointer), capacity, 1) }
+}
+
+// True when a raw token equals the literal `expected` (escapes are not
+// expanded, so compare plain names only).
+pub fn equals(value: String, expected: []const u8) -> bool {
+    return string.eql(value, string.fromSlice(expected))
+}
+
+// ---------------------------------------------------------------------------
+// Numbers
+
+// Parses a raw number token that is an integer (no fraction or exponent)
+// fitting in i64. Returns false otherwise.
+pub fn parseInteger(raw: String, result: *i64) -> bool {
+    if raw.length == 0 { return false }
+    var index: usize = 0
+    var negative = false
+    if raw.pointer[0] == 45 {
+        negative = true
+        index = 1
+    }
+    if index >= raw.length { return false }
+    var magnitude: u64 = 0
+    while index < raw.length {
+        const byte = raw.pointer[index]
+        if !isDigit(byte) { return false }
+        const digit = @intCast(u64, byte - 48)
+        if magnitude > (18446744073709551615 - digit) / 10 { return false }
+        magnitude = magnitude * 10 + digit
+        index += 1
+    }
+    if negative {
+        if magnitude > 9223372036854775808 { return false }
+        if magnitude == 9223372036854775808 {
+            result.* = -9223372036854775807 - 1
+            return true
+        }
+        result.* = 0 - @intCast(i64, magnitude)
+        return true
+    }
+    if magnitude > 9223372036854775807 { return false }
+    result.* = @intCast(i64, magnitude)
+    return true
+}
+
+// Parses a raw number token that is a non-negative integer fitting in u64.
+pub fn parseUnsigned(raw: String, result: *u64) -> bool {
+    if raw.length == 0 { return false }
+    var magnitude: u64 = 0
+    var index: usize = 0
+    while index < raw.length {
+        const byte = raw.pointer[index]
+        if !isDigit(byte) { return false }
+        const digit = @intCast(u64, byte - 48)
+        if magnitude > (18446744073709551615 - digit) / 10 { return false }
+        magnitude = magnitude * 10 + digit
+        index += 1
+    }
+    result.* = magnitude
+    return true
+}
+
+// Scans a whole raw number token; used to validate text from other sources.
+pub fn isNumber(raw: String) -> bool {
+    if raw.length == 0 { return false }
+    return scanNumber(raw.pointer, raw.length, 0) == raw.length
+}
