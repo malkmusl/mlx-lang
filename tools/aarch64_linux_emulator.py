@@ -23,7 +23,7 @@ import time
 
 from unicorn import (Uc, UcError, UC_ARCH_ARM64, UC_MODE_ARM, UC_HOOK_CODE,
                      UC_HOOK_INTR, UC_PROT_ALL)
-from unicorn.arm64_const import (UC_ARM64_REG_CPACR_EL1, UC_ARM64_REG_LR, UC_ARM64_REG_PC,
+from unicorn.arm64_const import (UC_ARM64_REG_CPACR_EL1, UC_ARM64_REG_LR, UC_ARM64_REG_PC, UC_ARM64_REG_S0,
                                  UC_ARM64_REG_SP, UC_ARM64_REG_X0,
                                  UC_ARM64_REG_X8)
 
@@ -587,6 +587,10 @@ class Process:
         raise Exit(status & 0xFF)
 
 
+class Float32(float):
+    """An import stub result returned in s0 (a C `float`) instead of x0."""
+
+
 class SharedLibrary(Process):
     """Loads an AArch64 ET_DYN shared object (e.g. an Android libmain.so)
     the way a dynamic linker would: maps its PT_LOAD segments at LIBRARY_BASE,
@@ -673,10 +677,19 @@ class SharedLibrary(Process):
             result = handler(self, *args)
         if self.trace:
             sys.stderr.write(f"[import] {name}({', '.join(hex(a) for a in args[:4])}) = {result}\n")
+        if isinstance(result, Float32):
+            uc.reg_write(UC_ARM64_REG_S0, struct.unpack("<I", struct.pack("<f", result))[0])
+            return
         uc.reg_write(UC_ARM64_REG_X0, (result or 0) & 0xFFFFFFFFFFFFFFFF)
 
     def call(self, name, *args):
         """Calls exported function `name` with integer arguments; returns x0."""
+        return self.call_address(self.exports[name], *args, name=name)
+
+    def call_address(self, address, *args, name=None):
+        """Calls the function at `address` (e.g. a callback the library
+        registered) with integer arguments; returns x0."""
+        name = name or hex(address)
         self.status = None
         for index, value in enumerate(args[:8]):
             self.uc.reg_write(UC_ARM64_REG_X0 + index, value & 0xFFFFFFFFFFFFFFFF)
@@ -687,7 +700,7 @@ class SharedLibrary(Process):
         self.uc.reg_write(UC_ARM64_REG_SP, stack)
         self.uc.reg_write(UC_ARM64_REG_LR, self.RETURN_ADDRESS)
         try:
-            self.uc.emu_start(self.exports[name], self.RETURN_ADDRESS, timeout=self.timeout * 1_000_000)
+            self.uc.emu_start(address, self.RETURN_ADDRESS, timeout=self.timeout * 1_000_000)
         except UcError as error:
             pc = self.uc.reg_read(UC_ARM64_REG_PC)
             raise RuntimeError(f"{name}: {error} at pc={pc:#x}") from None
