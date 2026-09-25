@@ -3,10 +3,12 @@
 Vulkan on Android: a NativeActivity that renders the animated pattern of
 `examples/vulkan-shared` with a compute shader and presents it through a
 `VK_KHR_android_surface` swapchain. Touch moves the ring; it turns white
-while a finger is down. A label at the top left (the GPU and the frame
-count) is laid out by [`std.truetype`](../../docs/reference/truetype.md)
-from the system font (`/system/fonts/Roboto-Regular.ttf`, or Noto Sans,
-Droid Sans) and drawn by the `text` compute shader.
+while a finger is down. A top bar is reserved across the frame with
+[`std.ui`](../../docs/reference/ui.md) and a label (the GPU and the frame
+count) is centered in it, laid out by
+[`std.truetype`](../../docs/reference/truetype.md) from the system font
+(`/system/fonts/Roboto-Regular.ttf`, or Noto Sans, Droid Sans). The `text`
+compute shader draws both: the bar as a solid fill, then the glyphs.
 
 The Vulkan side is the same code the Linux examples run: the system
 `libvulkan.so` is opened with `std.vulkan.loader.openSystemLoader`, the
@@ -24,10 +26,14 @@ the window's size really changed. Turning the phone restarts the activity
 (the manifest does not handle orientation changes), which builds a new
 swapchain for the new orientation.
 
-The label is sized from the screen's shorter side, so it is the same size
-in portrait and landscape, and drops its "Mlx + Vulkan · " prefix when the
-whole line does not fit the width. The app is built with
-`--android-fullscreen`, so the status bar does not cover it.
+The layout: the frame is a `ui.Screen`; `ui.reserveTop` takes a bar one
+text line plus padding high, filled dark and mostly opaque, and the label
+is centered in a `ui.Container` inside it. The text is sized from the
+screen's shorter side, so it is the same size in portrait and landscape,
+and the label drops its "Mlx + Vulkan · " prefix when the whole line does
+not fit. The app is built with `--android-fullscreen`, so no status bar
+covers the top; without it, pass the status bar's height as the screen's
+top safe inset and the bar's background extends behind it.
 
 ## Build
 

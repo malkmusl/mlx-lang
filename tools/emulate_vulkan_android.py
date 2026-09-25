@@ -56,9 +56,9 @@ COMPOSITE_ALPHA_INHERIT = 8
 ACTION_DOWN, ACTION_UP, ACTION_MOVE = 0, 1, 2
 MS = 1_000_000
 FONT = os.path.join(ROOT, "tests/support/fonts/DejaVuSans-subset.ttf")
-# Rows the label may cover (it sits at the top left); the pattern is
-# checked below them.
-LABEL_ROWS = 40
+# The top bar behind the label (examples/vulkan-android BAR_COLOR),
+# 0xAARRGGBB before the app swaps red and blue for R8G8B8A8.
+BAR_COLOR = 0xD0101820
 
 
 def pattern(x, y, width, time, pointer_x, pointer_y, flags):
@@ -357,12 +357,13 @@ class MockVulkan:
                 image["pixels"] = struct.unpack(f"<{width * height}I", self.lib.read(self.buffers[source][1] + offset, width * height * 4))
 
     def run_text(self, push, bindings, groups_x, groups_y):
-        """The `text` shader: per pixel of the run's box, the largest atlas
-        coverage among the quads covering it, blended over the target."""
+        """The `text` shader: per pixel of the run's box, the largest of the
+        base coverage and the atlas coverage of the quads covering it,
+        blended over the target (base 255 and no quads: a solid fill)."""
         def signed(value):
             return value - (1 << 32) if value >= 1 << 31 else value
         (width, height, offset, origin_x, origin_y, box_left, box_top, box_width, box_height,
-         count, atlas_width, color, run_offset) = push
+         count, atlas_width, color, run_offset, base_coverage) = push
         origin_x, origin_y, box_left, box_top = map(signed, (origin_x, origin_y, box_left, box_top))
         assert groups_x * 8 >= box_width and groups_y * 8 >= box_height, "text dispatch does not cover the run"
         atlas_handle, runs_handle, target_handle = bindings[0], bindings[1], bindings[2]
@@ -370,6 +371,10 @@ class MockVulkan:
         atlas = self.lib.read(atlas_address, atlas_size)
         words = struct.unpack(f"<{count * 4}I", self.lib.read(self.buffers[runs_handle][1] + run_offset * 4, count * 16))
         coverage = {}
+        if base_coverage:
+            for y in range(box_top, box_top + box_height):
+                for x in range(box_left, box_left + box_width):
+                    coverage[(x, y)] = base_coverage
         for index in range(count):
             w0, w1, qx, qy = words[4 * index:4 * index + 4]
             ax, ay, qw, qh = w0 & 65535, w0 >> 16, w1 & 65535, w1 >> 16
@@ -531,15 +536,58 @@ class App(Framework):
         return [text for tag, text in self.logs if tag == "mlx"]
 
 
+def swap_red_blue(color):
+    return (color & 0xFF00FF00) | ((color & 255) << 16) | ((color >> 16) & 255)
+
+
+def blend(under, color):
+    """The text shader at full coverage (std.ui.fillRect)."""
+    alpha = ((color >> 24) * 255 + 127) // 255
+    result = 0xFF000000
+    for shift in (0, 8, 16):
+        result |= ((((color >> shift) & 255) * alpha + ((under >> shift) & 255) * (255 - alpha) + 127) // 255) << shift
+    return result
+
+
+# Whether each checked label fitted its frame (and so had its centering
+# checked).
+centered = []
+
+
 def check_frame(frame, time, pointer=None, pressed=False, label=True):
     (width, height), pixels = frame
     flags = 4 | (1 if pointer else 0) | (2 if pressed else 0)
     px, py = pointer or (0, 0)
+    bar_height = 0
     if label:
-        # The label: white text over its shadow in the top-left corner.
-        white = sum(1 for y in range(LABEL_ROWS) for x in range(width) if pixels[y * width + x] == 0xFFFFFFFF)
-        assert white >= 3, f"frame at time {time}: no label ({white} white pixels)"
-    for y in range(LABEL_ROWS if label else 0, height):
+        # The top bar: rows of the pattern under BAR_COLOR (and the label)
+        # down to the first row that is the plain pattern again.
+        bar = swap_red_blue(BAR_COLOR)
+
+        def plain(y):
+            return all(pixels[y * width + x] == pattern(x, y, width, time, px, py, flags) for x in range(width))
+        while bar_height < height and not plain(bar_height):
+            bar_height += 1
+        assert bar_height >= 10, f"frame at time {time}: no top bar ({bar_height} rows)"
+        # Its padding rows (first and last) are bar color only.
+        for y in (0, bar_height - 1):
+            for x in range(width):
+                expected = blend(pattern(x, y, width, time, px, py, flags), bar)
+                assert pixels[y * width + x] == expected, f"frame at time {time}: bar pixel ({x}, {y}) is {pixels[y * width + x]:#010x}, expected {expected:#010x}"
+        # The label's ink: centered across the frame, inside the bar.
+        ink = [(x, y) for y in range(bar_height) for x in range(width)
+               if pixels[y * width + x] != blend(pattern(x, y, width, time, px, py, flags), bar)]
+        assert len(ink) >= 20, f"frame at time {time}: no label ({len(ink)} pixels)"
+        xs = [x for x, _ in ink]
+        ys = [y for _, y in ink]
+        # (A label wider than the frame is centered too, but clipped at
+        # both edges, so its ink no longer shows where the middle is.)
+        fits = min(xs) > 0 and max(xs) < width - 1
+        if fits:
+            assert abs((min(xs) + max(xs) + 1) - width) <= 3, f"frame at time {time}: label spans x {min(xs)}..{max(xs)}, not centered in {width}"
+        centered.append(fits)
+        assert min(ys) > 0 and max(ys) < bar_height - 1, f"frame at time {time}: label rows {min(ys)}..{max(ys)} outside the bar"
+    for y in range(bar_height, height):
         for x in range(width):
             expected = pattern(x, y, width, time, px, py, flags)
             if pixels[y * width + x] != expected:
@@ -626,14 +674,18 @@ def scenario_landscape(library):
     app = App(library)
     vulkan = app.vulkan
     vulkan.transform = TRANSFORM_ROTATE_90
+    # Wide enough for the whole label.
+    vulkan.extent = (480, 80)
     app.create()
     app.show_window()
     app.advance(51 * MS)
     assert len(vulkan.frames) == 4 and vulkan.suboptimal == 4, (len(vulkan.frames), vulkan.suboptimal)
     assert vulkan.swapchains_created == 1, f"{vulkan.swapchains_created} swapchains for one window"
     for index, frame in enumerate(vulkan.frames):
-        assert frame[0] == (96, 64), frame[0]
+        assert frame[0] == (480, 80), frame[0]
+        del centered[:]
         check_frame(frame, index * 2)
+        assert centered == [True], "the label does not fit a 480-pixel frame"
     # The window changes size without a resize callback: the suboptimal
     # present notices and the next frame has the new size.
     vulkan.extent = (64, 96)

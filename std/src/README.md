@@ -32,6 +32,10 @@ name and are not re-exported from `std.mlx`.
 with anti-aliasing, packs them into an atlas and lays out text; see
 `docs/reference/truetype.md`.
 
+`ui.mlx` (`std.ui`) has layout building blocks for pixel user interfaces:
+rectangles, insets, alignment, containers, stacks and reserved bars; see
+`docs/reference/ui.md`.
+
 `std.path`, `std.mode`, `std.parse`, `std.shell` and `std.calendar` provide
 coreutils-grade building blocks (path manipulation/canonicalization, chmod-style
 permission parsing, sized-number/duration parsing, POSIX-ish word splitting and

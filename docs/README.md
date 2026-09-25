@@ -50,6 +50,8 @@ exercise it:
   `std.json` (expands [`VULKAN.md`](VULKAN.md))
 - [`reference/truetype.md`](reference/truetype.md) — `std.truetype`: TrueType
   parsing, anti-aliased rasterization, atlas, layout, and text on Vulkan
+- [`reference/ui.md`](reference/ui.md) — `std.ui`: layout building blocks
+  (rectangles, insets, alignment, containers, stacks, reserved bars)
 - [`reference/memory-and-concurrency.md`](reference/memory-and-concurrency.md)
   — the memory model (lifetime, UB, overflow) and the atomics/TLS Stage-0 gap
 - [`reference/diagnostics-selfhost.md`](reference/diagnostics-selfhost.md) —

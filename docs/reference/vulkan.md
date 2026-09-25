@@ -247,12 +247,14 @@ The examples share one small renderer in `examples/vulkan-shared`:
   `blit` (composites a premultiplied ARGB or opaque XRGB source into a
   target at an offset, clipped; a source stride of 0 fills a rectangle) and
   `text` (draws a `std.truetype` run from a glyph atlas, with a loop over
-  the run's glyphs per pixel). `check_shaders.mlx` validates them and
+  the run's glyphs per pixel; every pixel starts at a base coverage, 0 for
+  text and 255 with no glyphs for a solid fill). `check_shaders.mlx` validates them and
   writes them out for `spirv-val`.
 - `text.mlx` keeps a `std.truetype` atlas and the frame's glyph runs in
   GPU memory and records `text` dispatches; GPU text equals
-  `std.truetype.drawRun`'s pixel for pixel
-  (`tests/263_vulkan_text_runtime.mlx`, see [truetype.md](truetype.md)).
+  `std.truetype.drawRun`'s pixel for pixel and `text.fill` equals
+  `std.ui.fillRect`'s (`tests/263_vulkan_text_runtime.mlx`, see
+  [truetype.md](truetype.md) and [ui.md](ui.md)).
 - `gpu.mlx` opens a device with one compute queue and, on request, the
   sharing extensions the driver supports: dma-buf import and export
   (`VK_EXT_external_memory_dma_buf`) and imported host memory

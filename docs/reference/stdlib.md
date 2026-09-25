@@ -95,6 +95,11 @@ materialized from the Vulkan registry, with `std.vulkan.loader` and
 extensions of the same kind; see [Vulkan, SPIR-V and JSON](vulkan.md)
 (`tests/248_json_runtime.mlx` covers `std.json`).
 
+`std.truetype` (`std/src/truetype.mlx`, see [TrueType fonts](truetype.md))
+and `std.ui` (`std/src/ui.mlx`, layout building blocks, see
+[Layout](ui.md)) are extensions for drawing text and laying out pixel user
+interfaces.
+
 ## Core: allocators
 
 **Normative source:** `spec/04-stdlib/mem.xml`
