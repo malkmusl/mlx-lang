@@ -1,0 +1,742 @@
+// A small D-Bus client for the DRM backend: enough of the protocol to talk
+// to systemd-logind on the system bus (logind.mlx).
+//
+// It connects to $DBUS_SYSTEM_BUS_ADDRESS (a unix:path= address) or
+// /run/dbus/system_bus_socket, authenticates with EXTERNAL (our uid) and
+// negotiates Unix descriptor passing, then sends method calls and reads
+// method returns, errors and signals in the little-endian wire format:
+// basic types (y b u i s o g h), with the header fields a call and its
+// reply need. Descriptors arrive with SCM_RIGHTS and belong to the message
+// that announces them (UNIX_FDS). Signals that arrive while a call waits
+// for its reply are kept, in order, for the next dispatch.
+
+const std = @import("std")
+const linux = std.linux
+const device = @import("./device.mlx")
+
+const Allocator = std.allocator.Allocator
+
+const AF_UNIX: usize = 1
+const SOCK_STREAM: usize = 1
+const SOCK_CLOEXEC: usize = 524288
+const MSG_DONTWAIT: usize = 64
+const MSG_NOSIGNAL: usize = 16384
+const MSG_CMSG_CLOEXEC: usize = 1073741824
+const SOL_SOCKET: u32 = 1
+const SCM_RIGHTS: u32 = 1
+
+pub const METHOD_CALL: u8 = 1
+pub const METHOD_RETURN: u8 = 2
+pub const ERROR: u8 = 3
+pub const SIGNAL: u8 = 4
+
+const FIELD_PATH: u8 = 1
+const FIELD_INTERFACE: u8 = 2
+const FIELD_MEMBER: u8 = 3
+const FIELD_ERROR_NAME: u8 = 4
+const FIELD_REPLY_SERIAL: u8 = 5
+const FIELD_DESTINATION: u8 = 6
+const FIELD_SENDER: u8 = 7
+const FIELD_SIGNATURE: u8 = 8
+const FIELD_UNIX_FDS: u8 = 9
+
+const INPUT_SIZE: usize = 65536
+const MAX_DESCRIPTORS: usize = 64
+pub const MAX_MESSAGE: usize = 4096
+
+pub const Bus = struct {
+    allocator: Allocator
+    descriptor: isize
+    serial: u32
+    // Bytes read but not yet taken as messages, and the descriptors that
+    // came with them (in order).
+    input: [*]u8
+    inputLength: usize
+    descriptors: [64]isize
+    descriptorCount: usize
+    // Messages set aside while a call waited: each is a u32 length, a u32
+    // descriptor count, the descriptors (i32 each), then the bytes.
+    held: [*]u8
+    heldLength: usize
+    // The connection failed (the bus went away).
+    broken: bool
+}
+
+// A received message. `bytes` stays valid until the next receive or
+// dispatch on the bus.
+pub const Message = struct {
+    bytes: [*]u8
+    length: usize
+    kind: u8
+    serial: u32
+    replySerial: u32
+    member: [*]const u8
+    memberLength: usize
+    interface: [*]const u8
+    interfaceLength: usize
+    errorName: [*]const u8
+    errorNameLength: usize
+    signature: [*]const u8
+    signatureLength: usize
+    bodyStart: usize
+    descriptors: [8]isize
+    descriptorCount: usize
+}
+
+// Reads a message body in order.
+pub const Cursor = struct {
+    message: *Message
+    position: usize
+}
+
+// Builds one message (a method call).
+pub const Builder = struct {
+    bytes: [4096]u8
+    length: usize
+    fieldsEnd: usize
+}
+
+// ---------------------------------------------------------------------------
+// Names
+
+pub fn equals(pointer: [*]const u8, length: usize, text: []const u8) -> bool {
+    var index: usize = 0
+    for byte in text {
+        if index >= length || pointer[index] != byte { return false }
+        index += 1
+    }
+    return index == length
+}
+
+fn cStringLength(text: [*]const u8) -> usize {
+    var length: usize = 0
+    while text[length] != 0 { length += 1 }
+    return length
+}
+
+// ---------------------------------------------------------------------------
+// Writing
+
+// The message bytes (`bytes` is the builder's first field).
+fn builderBytes(builder: *Builder) -> [*]u8 {
+    unsafe { return @ptrCast([*]u8, builder) }
+}
+
+fn pad(builder: *Builder, alignment: usize) -> void {
+    while builder.*.length % alignment != 0 {
+        builder.*.bytes[builder.*.length] = 0
+        builder.*.length += 1
+    }
+}
+
+fn putByte(builder: *Builder, value: u8) -> void {
+    builder.*.bytes[builder.*.length] = value
+    builder.*.length += 1
+}
+
+pub fn putU32(builder: *Builder, value: u32) -> void {
+    pad(builder, 4)
+    var index: usize = 0
+    while index < 4 {
+        putByte(builder, @intCast(u8, (value >> @intCast(u32, index * 8)) & 255))
+        index += 1
+    }
+}
+
+pub fn putBool(builder: *Builder, value: bool) -> void { putU32(builder, if value { 1 } else { 0 }) }
+
+fn putStringBytes(builder: *Builder, text: [*]const u8, length: usize) -> void {
+    putU32(builder, @intCast(u32, length))
+    var index: usize = 0
+    while index < length {
+        putByte(builder, text[index])
+        index += 1
+    }
+    putByte(builder, 0)
+}
+
+pub fn putString(builder: *Builder, text: []const u8) -> void {
+    var length: usize = 0
+    for byte in text { length += 1 }
+    unsafe { putStringBytes(builder, @ptrCast([*]const u8, text), length) }
+}
+
+// A string given as pointer and length (object paths too).
+pub fn putStringOf(builder: *Builder, text: [*]const u8, length: usize) -> void { putStringBytes(builder, text, length) }
+
+fn putSignatureValue(builder: *Builder, text: []const u8) -> void {
+    var length: usize = 0
+    for byte in text { length += 1 }
+    putByte(builder, @intCast(u8, length))
+    for byte in text { putByte(builder, byte) }
+    putByte(builder, 0)
+}
+
+// One header field: code, the variant's signature, its value.
+fn putField(builder: *Builder, code: u8, kind: u8, text: [*]const u8, length: usize) -> void {
+    pad(builder, 8)
+    putByte(builder, code)
+    putByte(builder, 1)
+    putByte(builder, kind)
+    putByte(builder, 0)
+    if kind == 103 {
+        putByte(builder, @intCast(u8, length))
+        var index: usize = 0
+        while index < length {
+            putByte(builder, text[index])
+            index += 1
+        }
+        putByte(builder, 0)
+    } else {
+        putStringBytes(builder, text, length)
+    }
+}
+
+fn putFieldText(builder: *Builder, code: u8, kind: u8, text: []const u8) -> void {
+    var length: usize = 0
+    for byte in text { length += 1 }
+    unsafe { putField(builder, code, kind, @ptrCast([*]const u8, text), length) }
+}
+
+// Starts a method call to `destination` on `path` (pointer and length, as
+// paths come from replies) with a body of `signature` ("" for none).
+pub fn beginCall(builder: *Builder, destination: []const u8, path: [*]const u8, path_length: usize, interface: []const u8, member: []const u8, signature: []const u8) -> void {
+    builder.*.length = 0
+    putByte(builder, 108)
+    putByte(builder, METHOD_CALL)
+    putByte(builder, 0)
+    putByte(builder, 1)
+    putU32(builder, 0)
+    putU32(builder, 0)
+    putU32(builder, 0)
+    putField(builder, FIELD_PATH, 111, path, path_length)
+    putFieldText(builder, FIELD_DESTINATION, 115, destination)
+    putFieldText(builder, FIELD_INTERFACE, 115, interface)
+    putFieldText(builder, FIELD_MEMBER, 115, member)
+    var signature_length: usize = 0
+    for byte in signature { signature_length += 1 }
+    if signature_length > 0 { putFieldText(builder, FIELD_SIGNATURE, 103, signature) }
+    const fields_length = builder.*.length - 16
+    device.store32(builderBytes(builder), 12, @intCast(u32, fields_length))
+    pad(builder, 8)
+    builder.*.fieldsEnd = builder.*.length
+}
+
+pub fn beginCallText(builder: *Builder, destination: []const u8, path: []const u8, interface: []const u8, member: []const u8, signature: []const u8) -> void {
+    var length: usize = 0
+    for byte in path { length += 1 }
+    unsafe { beginCall(builder, destination, @ptrCast([*]const u8, path), length, interface, member, signature) }
+}
+
+// ---------------------------------------------------------------------------
+// Connecting
+
+fn writeAll(bus: *Bus, bytes: [*]const u8, length: usize) -> bool {
+    var sent: usize = 0
+    while sent < length {
+        const count = linux.syscall6(44, @bitCast(usize, bus.*.descriptor), @intFromPtr(bytes) + sent, length - sent, MSG_NOSIGNAL, 0, 0)
+        if count == device.EINTR { continue }
+        if count == device.EAGAIN {
+            const slept = device.waitReadable(-1, 1)
+            continue
+        }
+        if count <= 0 { return false }
+        sent += @bitCast(usize, count)
+    }
+    return true
+}
+
+fn writeText(bus: *Bus, text: []const u8) -> bool {
+    var length: usize = 0
+    for byte in text { length += 1 }
+    unsafe { return writeAll(bus, @ptrCast([*]const u8, text), length) }
+}
+
+// Reads one "\r\n"-terminated line of the authentication exchange.
+fn readLine(bus: *Bus, line: [*]u8, capacity: usize) -> usize {
+    var length: usize = 0
+    while length < capacity {
+        if !device.waitReadable(bus.*.descriptor, 5000) { return 0 }
+        var byte: [1]u8 = [1]u8{ 0 }
+        var byte_bytes: [*]u8 = undefined
+        unsafe { byte_bytes = @ptrCast([*]u8, &byte) }
+        const count = linux.syscall3(device.SYS_read, @bitCast(usize, bus.*.descriptor), @intFromPtr(byte_bytes), 1)
+        if count == device.EAGAIN || count == device.EINTR { continue }
+        if count <= 0 { return 0 }
+        line[length] = byte_bytes[0]
+        length += 1
+        if length >= 2 && line[length - 2] == 13 && line[length - 1] == 10 { return length }
+    }
+    return 0
+}
+
+fn startsWith(pointer: [*]const u8, length: usize, prefix: []const u8) -> bool {
+    var index: usize = 0
+    for byte in prefix {
+        if index >= length || pointer[index] != byte { return false }
+        index += 1
+    }
+    return true
+}
+
+// The socket path of a unix:path= bus address (the first one), copied
+// NUL-terminated into `path`; false when there is none.
+fn addressPath(address: [*]const u8, path: [*]u8, capacity: usize) -> bool {
+    var start: usize = 0
+    while address[start] != 0 {
+        var here: [*]const u8 = undefined
+        unsafe { here = @ptrFromInt([*]const u8, @intFromPtr(address) + start) }
+        if startsWith(here, 1000, "unix:path=") {
+            var length: usize = 0
+            const value = start + 10
+            while address[value + length] != 0 && address[value + length] != 44 && address[value + length] != 59 && length + 1 < capacity {
+                path[length] = address[value + length]
+                length += 1
+            }
+            path[length] = 0
+            return length > 0
+        }
+        // The next address.
+        while address[start] != 0 && address[start] != 59 { start += 1 }
+        if address[start] == 59 { start += 1 }
+    }
+    return false
+}
+
+// Connects to the system bus and says Hello. `address` is the value of
+// $DBUS_SYSTEM_BUS_ADDRESS (0 when unset).
+pub fn connectSystem(bus: *Bus, allocator: Allocator, address: [*]const u8) -> bool {
+    var path: [108]u8 = undefined
+    var path_bytes: [*]u8 = undefined
+    unsafe { path_bytes = @ptrCast([*]u8, &path) }
+    var found = false
+    if @intFromPtr(address) != 0 { found = addressPath(address, path_bytes, 108) }
+    if !found {
+        var length: usize = 0
+        for byte in "/run/dbus/system_bus_socket" {
+            path_bytes[length] = byte
+            length += 1
+        }
+        path_bytes[length] = 0
+    }
+    // struct sockaddr_un
+    var socket_address: [110]u8 = undefined
+    var socket_bytes: [*]u8 = undefined
+    unsafe { socket_bytes = @ptrCast([*]u8, &socket_address) }
+    device.zero(socket_bytes, 110)
+    device.store16(socket_bytes, 0, 1)
+    const path_length = cStringLength(path_bytes)
+    var index: usize = 0
+    while index < path_length {
+        socket_bytes[2 + index] = path_bytes[index]
+        index += 1
+    }
+    const descriptor = linux.syscall3(device.SYS_socket, AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0)
+    if descriptor < 0 { return false }
+    if linux.syscall3(device.SYS_connect, @bitCast(usize, descriptor), @intFromPtr(socket_bytes), 2 + path_length + 1) < 0 {
+        device.close(descriptor)
+        return false
+    }
+    bus.*.allocator = allocator
+    bus.*.descriptor = descriptor
+    bus.*.serial = 0
+    bus.*.input = allocator.alloc(INPUT_SIZE, 16).?
+    bus.*.inputLength = 0
+    bus.*.descriptorCount = 0
+    bus.*.held = allocator.alloc(INPUT_SIZE, 16).?
+    bus.*.heldLength = 0
+    bus.*.broken = false
+    if !authenticate(bus) || !hello(bus) {
+        close(bus)
+        return false
+    }
+    return true
+}
+
+// AUTH EXTERNAL with our uid in hex, descriptor passing, BEGIN.
+fn authenticate(bus: *Bus) -> bool {
+    var line: [256]u8 = undefined
+    var line_bytes: [*]u8 = undefined
+    unsafe { line_bytes = @ptrCast([*]u8, &line) }
+    // The uid as decimal digits, each sent as two hex digits.
+    var digits: [24]u8 = undefined
+    var count: usize = 0
+    var uid = @bitCast(usize, linux.syscall0(device.SYS_getuid))
+    while uid > 0 || count == 0 {
+        digits[count] = @intCast(u8, 48 + uid % 10)
+        uid = uid / 10
+        count += 1
+    }
+    var length: usize = 0
+    line_bytes[0] = 0
+    length = 1
+    for byte in "AUTH EXTERNAL " {
+        line_bytes[length] = byte
+        length += 1
+    }
+    const hex = "0123456789abcdef"
+    while count > 0 {
+        count -= 1
+        line_bytes[length] = hex[@intCast(usize, digits[count] >> 4)]
+        line_bytes[length + 1] = hex[@intCast(usize, digits[count] & 15)]
+        length += 2
+    }
+    line_bytes[length] = 13
+    line_bytes[length + 1] = 10
+    length += 2
+    if !writeAll(bus, line_bytes, length) { return false }
+    var answer = readLine(bus, line_bytes, 256)
+    if !startsWith(line_bytes, answer, "OK ") { return false }
+    if !writeText(bus, "NEGOTIATE_UNIX_FD\r\n") { return false }
+    answer = readLine(bus, line_bytes, 256)
+    if !startsWith(line_bytes, answer, "AGREE_UNIX_FD") { return false }
+    return writeText(bus, "BEGIN\r\n")
+}
+
+fn hello(bus: *Bus) -> bool {
+    var builder: Builder = undefined
+    beginCallText(&builder, "org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus", "Hello", "")
+    var reply: Message = undefined
+    return call(bus, &builder, &reply) && reply.kind == METHOD_RETURN
+}
+
+pub fn close(bus: *Bus) -> void {
+    device.close(bus.*.descriptor)
+    bus.*.descriptor = -1
+    var index: usize = 0
+    while index < bus.*.descriptorCount {
+        device.close(bus.*.descriptors[index])
+        index += 1
+    }
+    bus.*.descriptorCount = 0
+    bus.*.allocator.free(bus.*.input, INPUT_SIZE, 16)
+    bus.*.allocator.free(bus.*.held, INPUT_SIZE, 16)
+}
+
+// ---------------------------------------------------------------------------
+// Receiving
+
+// Reads what the socket has (never waits). False when the bus is gone.
+fn receive(bus: *Bus) -> bool {
+    if bus.*.inputLength >= INPUT_SIZE { return true }
+    var header: [56]u8 = undefined
+    var vector: [16]u8 = undefined
+    var control: [256]u8 = undefined
+    var header_bytes: [*]u8 = undefined
+    var vector_bytes: [*]u8 = undefined
+    var control_bytes: [*]u8 = undefined
+    unsafe {
+        header_bytes = @ptrCast([*]u8, &header)
+        vector_bytes = @ptrCast([*]u8, &vector)
+        control_bytes = @ptrCast([*]u8, &control)
+    }
+    device.zero(header_bytes, 56)
+    device.store64(vector_bytes, 0, @intFromPtr(bus.*.input) + bus.*.inputLength)
+    device.store64(vector_bytes, 8, INPUT_SIZE - bus.*.inputLength)
+    device.store64(header_bytes, 16, @intFromPtr(vector_bytes))
+    device.store64(header_bytes, 24, 1)
+    device.store64(header_bytes, 32, @intFromPtr(control_bytes))
+    device.store64(header_bytes, 40, 256)
+    const received = linux.syscall3(device.SYS_recvmsg, @bitCast(usize, bus.*.descriptor), @intFromPtr(header_bytes), MSG_DONTWAIT | MSG_CMSG_CLOEXEC)
+    if received == device.EAGAIN || received == device.EINTR { return true }
+    if received <= 0 {
+        bus.*.broken = true
+        return false
+    }
+    bus.*.inputLength += @bitCast(usize, received)
+    const control_length = device.load64(header_bytes, 40)
+    var offset: usize = 0
+    while offset + 16 <= control_length {
+        const record = device.load64(control_bytes, offset)
+        if record < 16 || offset + record > control_length { break }
+        if device.load32(control_bytes, offset + 8) == SOL_SOCKET && device.load32(control_bytes, offset + 12) == SCM_RIGHTS {
+            var index: usize = 0
+            while index < (record - 16) / 4 {
+                const descriptor = @intCast(isize, device.loadInt(control_bytes, offset + 16 + index * 4))
+                if bus.*.descriptorCount < MAX_DESCRIPTORS {
+                    bus.*.descriptors[bus.*.descriptorCount] = descriptor
+                    bus.*.descriptorCount += 1
+                } else {
+                    device.close(descriptor)
+                }
+                index += 1
+            }
+        }
+        offset += ((record + 7) / 8) * 8
+    }
+    return true
+}
+
+fn alignUp(value: usize, alignment: usize) -> usize { return (value + alignment - 1) / alignment * alignment }
+
+// The size of the complete message at `bytes` (0 when `available` is not
+// enough yet, or it is not a message we read).
+fn messageSize(bytes: [*]const u8, available: usize) -> usize {
+    if available < 16 { return 0 }
+    const fields = @intCast(usize, device.load32(bytes, 12))
+    const body = @intCast(usize, device.load32(bytes, 4))
+    const size = alignUp(16 + fields, 8) + body
+    if available < size { return 0 }
+    return size
+}
+
+// Fills `message` from the bytes of one complete message; takes its
+// descriptors from `descriptors` (it announces how many).
+fn parse(message: *Message, bytes: [*]u8, length: usize) -> usize {
+    message.*.bytes = bytes
+    message.*.length = length
+    message.*.kind = bytes[1]
+    message.*.serial = device.load32(bytes, 8)
+    message.*.replySerial = 0
+    message.*.memberLength = 0
+    message.*.interfaceLength = 0
+    message.*.errorNameLength = 0
+    message.*.signatureLength = 0
+    message.*.descriptorCount = 0
+    var descriptors: usize = 0
+    const end = 16 + @intCast(usize, device.load32(bytes, 12))
+    var position: usize = 16
+    while position < end {
+        position = alignUp(position, 8)
+        if position + 4 > end { break }
+        const code = bytes[position]
+        const kind = bytes[position + 2]
+        position += 4
+        if kind == 115 || kind == 111 {
+            position = alignUp(position, 4)
+            const text_length = @intCast(usize, device.load32(bytes, position))
+            var text: [*]const u8 = undefined
+            unsafe { text = @ptrFromInt([*]const u8, @intFromPtr(bytes) + position + 4) }
+            if code == FIELD_MEMBER {
+                message.*.member = text
+                message.*.memberLength = text_length
+            } else if code == FIELD_INTERFACE {
+                message.*.interface = text
+                message.*.interfaceLength = text_length
+            } else if code == FIELD_ERROR_NAME {
+                message.*.errorName = text
+                message.*.errorNameLength = text_length
+            }
+            position += 4 + text_length + 1
+        } else if kind == 117 {
+            position = alignUp(position, 4)
+            const value = device.load32(bytes, position)
+            if code == FIELD_REPLY_SERIAL { message.*.replySerial = value }
+            if code == FIELD_UNIX_FDS { descriptors = @intCast(usize, value) }
+            position += 4
+        } else if kind == 103 {
+            const text_length = @intCast(usize, bytes[position])
+            if code == FIELD_SIGNATURE {
+                unsafe { message.*.signature = @ptrFromInt([*]const u8, @intFromPtr(bytes) + position + 1) }
+                message.*.signatureLength = text_length
+            }
+            position += 1 + text_length + 1
+        } else {
+            break
+        }
+    }
+    message.*.bodyStart = alignUp(end, 8)
+    return descriptors
+}
+
+// Takes the next complete message from the input into `storage` (at most
+// MAX_MESSAGE bytes; longer ones are skipped). False when none is complete.
+fn takeInput(bus: *Bus, message: *Message, storage: [*]u8) -> bool {
+    while true {
+        const size = messageSize(bus.*.input, bus.*.inputLength)
+        if size == 0 { return false }
+        const fits = size <= MAX_MESSAGE && bus.*.input[0] == 108
+        var index: usize = 0
+        if fits {
+            while index < size {
+                storage[index] = bus.*.input[index]
+                index += 1
+            }
+        }
+        const rest = bus.*.inputLength - size
+        index = 0
+        while index < rest {
+            bus.*.input[index] = bus.*.input[size + index]
+            index += 1
+        }
+        bus.*.inputLength = rest
+        if fits {
+            const count = parse(message, storage, size)
+            takeDescriptors(bus, message, count)
+            return true
+        }
+    }
+    return false
+}
+
+fn takeDescriptors(bus: *Bus, message: *Message, count: usize) -> void {
+    var index: usize = 0
+    while index < count && index < bus.*.descriptorCount {
+        if index < 8 {
+            message.*.descriptors[index] = bus.*.descriptors[index]
+            message.*.descriptorCount += 1
+        } else {
+            device.close(bus.*.descriptors[index])
+        }
+        index += 1
+    }
+    const taken = index
+    index = 0
+    while taken + index < bus.*.descriptorCount {
+        bus.*.descriptors[index] = bus.*.descriptors[taken + index]
+        index += 1
+    }
+    bus.*.descriptorCount -= taken
+}
+
+// Sets `message` aside for the next dispatch.
+fn hold(bus: *Bus, message: *const Message) -> void {
+    const needed = 8 + message.*.descriptorCount * 4 + message.*.length
+    if bus.*.heldLength + needed > INPUT_SIZE {
+        closeDescriptors(message)
+        return
+    }
+    const at = bus.*.heldLength
+    device.store32(bus.*.held, at, @intCast(u32, message.*.length))
+    device.store32(bus.*.held, at + 4, @intCast(u32, message.*.descriptorCount))
+    var index: usize = 0
+    while index < message.*.descriptorCount {
+        device.store32(bus.*.held, at + 8 + index * 4, @intCast(u32, message.*.descriptors[index]))
+        index += 1
+    }
+    const bytes_at = at + 8 + message.*.descriptorCount * 4
+    index = 0
+    while index < message.*.length {
+        bus.*.held[bytes_at + index] = message.*.bytes[index]
+        index += 1
+    }
+    bus.*.heldLength += needed
+}
+
+fn takeHeld(bus: *Bus, message: *Message, storage: [*]u8) -> bool {
+    if bus.*.heldLength == 0 { return false }
+    const length = @intCast(usize, device.load32(bus.*.held, 0))
+    const count = @intCast(usize, device.load32(bus.*.held, 4))
+    const bytes_at = 8 + count * 4
+    var index: usize = 0
+    while index < length {
+        storage[index] = bus.*.held[bytes_at + index]
+        index += 1
+    }
+    const ignored = parse(message, storage, length)
+    index = 0
+    while index < count {
+        message.*.descriptors[index] = @intCast(isize, device.loadInt(bus.*.held, 8 + index * 4))
+        index += 1
+    }
+    message.*.descriptorCount = count
+    const used = bytes_at + length
+    const rest = bus.*.heldLength - used
+    index = 0
+    while index < rest {
+        bus.*.held[index] = bus.*.held[used + index]
+        index += 1
+    }
+    bus.*.heldLength = rest
+    return true
+}
+
+// Closes the descriptors a message brought that nobody took.
+pub fn closeDescriptors(message: *const Message) -> void {
+    var index: usize = 0
+    while index < message.*.descriptorCount {
+        device.close(message.*.descriptors[index])
+        index += 1
+    }
+}
+
+// The next message to handle (held ones first), into `storage` (at least
+// MAX_MESSAGE bytes). Never waits. False when there is none.
+pub fn next(bus: *Bus, message: *Message, storage: [*]u8) -> bool {
+    if takeHeld(bus, message, storage) { return true }
+    if takeInput(bus, message, storage) { return true }
+    if !receive(bus) { return false }
+    return takeInput(bus, message, storage)
+}
+
+// Whether the bus connection still works.
+pub fn alive(bus: *const Bus) -> bool { return bus.*.descriptor >= 0 && !bus.*.broken }
+
+// ---------------------------------------------------------------------------
+// Calls
+
+// Sends the call in `builder` and waits (up to five seconds) for its reply,
+// setting other messages aside. `reply` keeps its bytes in the builder's
+// storage (which the reply overwrites), so read it before the next call.
+pub fn call(bus: *Bus, builder: *Builder, reply: *Message) -> bool {
+    bus.*.serial += 1
+    const serial = bus.*.serial
+    const bytes = builderBytes(builder)
+    device.store32(bytes, 4, @intCast(u32, builder.*.length - builder.*.fieldsEnd))
+    device.store32(bytes, 8, serial)
+    if !writeAll(bus, bytes, builder.*.length) { return false }
+    var waited: usize = 0
+    while waited < 5000 {
+        if !receive(bus) { return false }
+        while takeInput(bus, reply, bytes) {
+            if (reply.*.kind == METHOD_RETURN || reply.*.kind == ERROR) && reply.*.replySerial == serial { return true }
+            if reply.*.kind == SIGNAL {
+                hold(bus, reply)
+            } else {
+                closeDescriptors(reply)
+            }
+        }
+        if !device.waitReadable(bus.*.descriptor, 100) { waited += 100 }
+    }
+    return false
+}
+
+// Sends a call without waiting for the reply (it is dropped when it comes).
+pub fn send(bus: *Bus, builder: *Builder) -> bool {
+    bus.*.serial += 1
+    const bytes = builderBytes(builder)
+    device.store32(bytes, 4, @intCast(u32, builder.*.length - builder.*.fieldsEnd))
+    device.store32(bytes, 8, bus.*.serial)
+    return writeAll(bus, bytes, builder.*.length)
+}
+
+// ---------------------------------------------------------------------------
+// Reading bodies
+
+pub fn cursor(message: *Message) -> Cursor {
+    return Cursor.{ .message = message, .position = message.*.bodyStart }
+}
+
+pub fn readU32(at: *Cursor) -> u32 {
+    at.*.position = alignUp(at.*.position, 4)
+    if at.*.position + 4 > at.*.message.*.length { return 0 }
+    const value = device.load32(at.*.message.*.bytes, at.*.position)
+    at.*.position += 4
+    return value
+}
+
+pub fn readBool(at: *Cursor) -> bool { return readU32(at) != 0 }
+
+// A string or object path: its bytes stay in the message.
+pub fn readString(at: *Cursor, length: *usize) -> [*]const u8 {
+    const size = @intCast(usize, readU32(at))
+    var text: [*]const u8 = undefined
+    unsafe { text = @ptrFromInt([*]const u8, @intFromPtr(at.*.message.*.bytes) + at.*.position) }
+    if at.*.position + size + 1 > at.*.message.*.length {
+        length.* = 0
+        return text
+    }
+    length.* = size
+    at.*.position += size + 1
+    return text
+}
+
+// A Unix descriptor argument ('h'): the message's descriptor it names,
+// now owned by the caller (-1 when missing).
+pub fn readHandle(at: *Cursor) -> isize {
+    const index = @intCast(usize, readU32(at))
+    if index >= at.*.message.*.descriptorCount { return -1 }
+    const descriptor = at.*.message.*.descriptors[index]
+    at.*.message.*.descriptors[index] = -1
+    return descriptor
+}

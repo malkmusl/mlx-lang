@@ -1,0 +1,472 @@
+// Scene management and software composition for the nested compositor.
+//
+// Windows are drawn bottom to top into the host buffer with premultiplied
+// ARGB8888 blending (the wl_shm pixel convention), each with a thin frame
+// that highlights the keyboard focus, followed by the cursor: the client's
+// cursor surface when one is set, otherwise a built-in arrow.
+
+const state = @import("./state.mlx")
+const tt = @import("std.truetype")
+
+const Compositor = state.Compositor
+const Surface = state.Surface
+
+pub const FOCUS_COLOR: u32 = 4284129535
+pub const FRAME_COLOR: u32 = 4283453536
+pub const TITLE_HEIGHT: i32 = 20
+pub const TITLE_TEXT_SIZE: u32 = 14
+pub const TITLE_COLOR: u32 = 4294967295
+pub const ARROW_WIDTH: i32 = 13
+pub const ARROW_HEIGHT: i32 = 17
+
+// xdg_toplevel.ResizeEdge bits.
+pub const EDGE_TOP: u32 = 1
+pub const EDGE_BOTTOM: u32 = 2
+pub const EDGE_LEFT: u32 = 4
+pub const EDGE_RIGHT: u32 = 8
+// How far outside its frame a window's border can be grabbed, and how far
+// along an edge from a corner a grab still takes the corner.
+pub const GRAB: i32 = 6
+pub const CORNER: i32 = 16
+
+// Cursors the compositor draws (in a CURSOR_SIZE box): the arrow and the
+// resize arrows for each direction.
+pub const CURSOR_SIZE: i32 = 17
+pub const CURSOR_ARROW: u32 = 0
+pub const CURSOR_HORIZONTAL: u32 = 1
+pub const CURSOR_VERTICAL: u32 = 2
+pub const CURSOR_DIAGONAL: u32 = 3
+pub const CURSOR_ANTIDIAGONAL: u32 = 4
+pub const CURSOR_KINDS: u32 = 5
+
+// The window rectangle used for hit-testing, frames and placement: the
+// xdg window geometry when the client set one, otherwise the buffer.
+pub fn windowX(surface: *const Surface) -> i32 {
+    return if surface.*.hasGeometry { surface.*.x + surface.*.geometryX } else { surface.*.x }
+}
+
+pub fn windowY(surface: *const Surface) -> i32 {
+    return if surface.*.hasGeometry { surface.*.y + surface.*.geometryY } else { surface.*.y }
+}
+
+pub fn windowWidth(surface: *const Surface) -> i32 {
+    return if surface.*.hasGeometry { surface.*.geometryWidth } else { @intCast(i32, surface.*.pixelWidth) }
+}
+
+pub fn windowHeight(surface: *const Surface) -> i32 {
+    return if surface.*.hasGeometry { surface.*.geometryHeight } else { @intCast(i32, surface.*.pixelHeight) }
+}
+
+// A toplevel's title bar, above its frame: x, y, width (height TITLE_HEIGHT).
+pub fn titleX(surface: *const Surface) -> i32 { return windowX(surface) - 2 }
+pub fn titleY(surface: *const Surface) -> i32 { return windowY(surface) - 2 - TITLE_HEIGHT }
+pub fn titleWidth(surface: *const Surface) -> i32 { return windowWidth(surface) + 4 }
+
+// The title's text origin (pen start on the baseline).
+pub fn titleTextX(surface: *const Surface) -> i32 { return windowX(surface) + 4 }
+pub fn titleTextY(surface: *const Surface) -> i32 { return titleY(surface) + TITLE_HEIGHT - 6 }
+
+// The toplevel whose title bar is at (x, y), unless a window above covers
+// the point; 0 when none.
+pub fn titleAt(compositor: *Compositor, x: i32, y: i32) -> usize {
+    var index = compositor.*.stack.length
+    while index > 0 {
+        index -= 1
+        const address = state.listAt(compositor.*.stack, index)
+        const surface = state.surfaceAt(address)
+        const left = windowX(surface)
+        const top = windowY(surface)
+        if x >= left && y >= top && x < left + windowWidth(surface) && y < top + windowHeight(surface) { return 0 }
+        if surface.*.role == state.ROLE_TOPLEVEL {
+            const bar_x = titleX(surface)
+            const bar_y = titleY(surface)
+            if x >= bar_x && y >= bar_y && x < bar_x + titleWidth(surface) && y < bar_y + TITLE_HEIGHT { return address }
+            if borderEdges(surface, x, y) != 0 { return 0 }
+        }
+    }
+    return 0
+}
+
+// The resize edges of `surface`'s border at (x, y): its frame, the title
+// bar's top, and GRAB pixels around them; 0 outside, or on the title bar.
+pub fn borderEdges(surface: *const Surface, x: i32, y: i32) -> u32 {
+    const left = windowX(surface)
+    const right = left + windowWidth(surface)
+    const top = titleY(surface)
+    const bottom = windowY(surface) + windowHeight(surface)
+    if x < left - 2 - GRAB || x >= right + 2 + GRAB || y < top - GRAB || y >= bottom + 2 + GRAB { return 0 }
+    var edges: u32 = 0
+    if x < left { edges = EDGE_LEFT } else if x >= right { edges = EDGE_RIGHT }
+    if y < top { edges = edges | EDGE_TOP } else if y >= bottom { edges = edges | EDGE_BOTTOM }
+    // Near a corner, the corner.
+    if edges == EDGE_LEFT || edges == EDGE_RIGHT {
+        if y < top + CORNER { edges = edges | EDGE_TOP } else if y >= bottom - CORNER { edges = edges | EDGE_BOTTOM }
+    } else if edges == EDGE_TOP || edges == EDGE_BOTTOM {
+        if x < left + CORNER { edges = edges | EDGE_LEFT } else if x >= right - CORNER { edges = edges | EDGE_RIGHT }
+    }
+    // Inside the frame is the title bar (moving) or the window itself.
+    if y >= top && y < bottom && x >= left - 2 && x < right + 2 && (y < windowY(surface) || x >= left && x < right) { return 0 }
+    return edges
+}
+
+// Whether (x, y) is on a toplevel's decorations: its title bar or border.
+fn onDecoration(surface: *const Surface, x: i32, y: i32) -> bool {
+    if surface.*.role != state.ROLE_TOPLEVEL { return false }
+    const bar_x = titleX(surface)
+    const bar_y = titleY(surface)
+    if x >= bar_x && y >= bar_y && x < bar_x + titleWidth(surface) && y < bar_y + TITLE_HEIGHT { return true }
+    return borderEdges(surface, x, y) != 0
+}
+
+// The toplevel whose border is at (x, y), unless a window above covers
+// the point; 0 when none.
+pub fn borderAt(compositor: *Compositor, x: i32, y: i32) -> usize {
+    var index = compositor.*.stack.length
+    while index > 0 {
+        index -= 1
+        const address = state.listAt(compositor.*.stack, index)
+        const surface = state.surfaceAt(address)
+        const left = windowX(surface)
+        const top = windowY(surface)
+        if x >= left && y >= top && x < left + windowWidth(surface) && y < top + windowHeight(surface) { return 0 }
+        if surface.*.role == state.ROLE_TOPLEVEL {
+            const bar_x = titleX(surface)
+            const bar_y = titleY(surface)
+            if x >= bar_x && y >= bar_y && x < bar_x + titleWidth(surface) && y < bar_y + TITLE_HEIGHT { return 0 }
+            if borderEdges(surface, x, y) != 0 { return address }
+        }
+    }
+    return 0
+}
+
+// Lays the title out into compositor.run, dropping glyphs past the bar.
+pub fn layoutTitle(compositor: *Compositor, surface: *const Surface) -> bool {
+    if !compositor.*.hasText || surface.*.titleLength == 0 { return false }
+    var title: [*]const u8 = undefined
+    unsafe { title = @ptrFromInt([*]const u8, @intFromPtr(surface) + @offsetOf(Surface, "title")) }
+    const run = compositor.*.run
+    tt.layoutBytes(compositor.*.atlas, title, surface.*.titleLength, run)
+    const limit = titleX(surface) + titleWidth(surface) - 4 - titleTextX(surface)
+    var kept: usize = 0
+    while kept < run.*.count {
+        const quad = run.*.quads[kept]
+        if quad.x + @intCast(i32, quad.width) > limit { break }
+        kept += 1
+    }
+    run.*.count = kept
+    if kept == 0 { return false }
+    // The bounding box of what is left.
+    var index: usize = 0
+    while index < kept {
+        const quad = run.*.quads[index]
+        const right = quad.x + @intCast(i32, quad.width)
+        const bottom = quad.y + @intCast(i32, quad.height)
+        if index == 0 || quad.x < run.*.left { run.*.left = quad.x }
+        if index == 0 || quad.y < run.*.top { run.*.top = quad.y }
+        if index == 0 || right > run.*.right { run.*.right = right }
+        if index == 0 || bottom > run.*.bottom { run.*.bottom = bottom }
+        index += 1
+    }
+    return true
+}
+
+// The mapped window under (x, y), topmost first; 0 when none.
+pub fn surfaceAtPoint(compositor: *Compositor, x: i32, y: i32) -> usize {
+    var index = compositor.*.stack.length
+    while index > 0 {
+        index -= 1
+        const address = state.listAt(compositor.*.stack, index)
+        const surface = state.surfaceAt(address)
+        const left = windowX(surface)
+        const top = windowY(surface)
+        if x >= left && y >= top && x < left + windowWidth(surface) && y < top + windowHeight(surface) { return address }
+        // A title bar or border above covers what is below it.
+        if onDecoration(surface, x, y) { return 0 }
+    }
+    return 0
+}
+
+// The toplevel a surface belongs to (itself, or a popup's root parent).
+pub fn toplevelOf(address: usize) -> usize {
+    var current = address
+    var depth: usize = 0
+    while current != 0 && depth < 16 {
+        const surface = state.surfaceAt(current)
+        if surface.*.role == state.ROLE_TOPLEVEL { return current }
+        current = surface.*.parent
+        depth += 1
+    }
+    return 0
+}
+
+pub fn raise(compositor: *Compositor, address: usize) -> void {
+    if !state.listContains(compositor.*.stack, address) { return }
+    compositor.*.stack = state.listRemove(compositor.*.stack, address)
+    compositor.*.stack = state.listAppend(compositor.*.stack, address)
+    // Keep the window's popups above it.
+    var index: usize = 0
+    var count = compositor.*.stack.length
+    while index < count {
+        const other = state.listAt(compositor.*.stack, index)
+        if other != address && toplevelOf(other) == address {
+            compositor.*.stack = state.listRemove(compositor.*.stack, other)
+            compositor.*.stack = state.listAppend(compositor.*.stack, other)
+            count -= 1
+        } else {
+            index += 1
+        }
+    }
+    compositor.*.needsRedraw = true
+}
+
+// Places a new toplevel: cascaded from the top-left, wrapping around.
+pub fn place(compositor: *Compositor, surface: *Surface) -> void {
+    const offset_x = if surface.*.hasGeometry { surface.*.geometryX } else { 0 }
+    const offset_y = if surface.*.hasGeometry { surface.*.geometryY } else { 0 }
+    surface.*.x = compositor.*.nextWindowX - offset_x
+    surface.*.y = compositor.*.nextWindowY - offset_y
+    compositor.*.nextWindowX += 40
+    compositor.*.nextWindowY += 32
+    if compositor.*.nextWindowX > @intCast(i32, compositor.*.width / 2) || compositor.*.nextWindowY > @intCast(i32, compositor.*.height / 2) {
+        compositor.*.nextWindowX = 24
+        compositor.*.nextWindowY = 24
+    }
+}
+
+fn store(pixels: [*]u8, offset: usize, color: u32) -> void {
+    pixels[offset] = @intCast(u8, color & 255)
+    pixels[offset + 1] = @intCast(u8, (color >> 8) & 255)
+    pixels[offset + 2] = @intCast(u8, (color >> 16) & 255)
+    pixels[offset + 3] = 255
+}
+
+fn fillRect(compositor: *Compositor, pixels: [*]u8, x: i32, y: i32, width: i32, height: i32, color: u32) -> void {
+    var top = y
+    if top < 0 { top = 0 }
+    var bottom = y + height
+    if bottom > @intCast(i32, compositor.*.height) { bottom = @intCast(i32, compositor.*.height) }
+    var left = x
+    if left < 0 { left = 0 }
+    var right = x + width
+    if right > @intCast(i32, compositor.*.width) { right = @intCast(i32, compositor.*.width) }
+    var row = top
+    while row < bottom {
+        var column = left
+        const line = @intCast(usize, row) * compositor.*.width * 4
+        while column < right {
+            store(pixels, line + @intCast(usize, column) * 4, color)
+            column += 1
+        }
+        row += 1
+    }
+}
+
+fn blend(destination: u8, source: u8, alpha: u8) -> u8 {
+    const kept = @intCast(usize, destination) * (255 - @intCast(usize, alpha))
+    const value = @intCast(usize, source) + (kept + 127) / 255
+    return if value > 255 { 255 } else { @intCast(u8, value) }
+}
+
+// Draws `surface` with its top-left at (x, y).
+fn blit(compositor: *Compositor, pixels: [*]u8, surface: *const Surface, x: i32, y: i32) -> void {
+    if !surface.*.hasContent { return }
+    const width = @intCast(i32, surface.*.pixelWidth)
+    const height = @intCast(i32, surface.*.pixelHeight)
+    const screen_width = @intCast(i32, compositor.*.width)
+    const screen_height = @intCast(i32, compositor.*.height)
+    var row: i32 = 0
+    if y < 0 { row = 0 - y }
+    while row < height && y + row < screen_height {
+        var column: i32 = 0
+        if x < 0 { column = 0 - x }
+        const source_line = @intCast(usize, row) * surface.*.pixelWidth * 4
+        const destination_line = @intCast(usize, y + row) * compositor.*.width * 4
+        while column < width && x + column < screen_width {
+            const source = source_line + @intCast(usize, column) * 4
+            const alpha = surface.*.pixels[source + 3]
+            if alpha != 0 {
+                const destination = destination_line + @intCast(usize, x + column) * 4
+                if alpha == 255 {
+                    pixels[destination] = surface.*.pixels[source]
+                    pixels[destination + 1] = surface.*.pixels[source + 1]
+                    pixels[destination + 2] = surface.*.pixels[source + 2]
+                } else {
+                    pixels[destination] = blend(pixels[destination], surface.*.pixels[source], alpha)
+                    pixels[destination + 1] = blend(pixels[destination + 1], surface.*.pixels[source + 1], alpha)
+                    pixels[destination + 2] = blend(pixels[destination + 2], surface.*.pixels[source + 2], alpha)
+                }
+                pixels[destination + 3] = 255
+            }
+            column += 1
+        }
+        row += 1
+    }
+}
+
+fn drawTitle(compositor: *Compositor, pixels: [*]u8, surface: *const Surface, focused: bool) -> void {
+    const color = if focused { FOCUS_COLOR } else { FRAME_COLOR }
+    fillRect(compositor, pixels, titleX(surface), titleY(surface), titleWidth(surface), TITLE_HEIGHT, color)
+    if !layoutTitle(compositor, surface) { return }
+    var words: [*]u32 = undefined
+    unsafe { words = @ptrCast([*]u32, pixels) }
+    tt.drawRun(compositor.*.atlas, compositor.*.run, words, compositor.*.width, compositor.*.height, compositor.*.width, titleTextX(surface), titleTextY(surface), TITLE_COLOR, 0)
+}
+
+fn drawFrame(compositor: *Compositor, pixels: [*]u8, surface: *const Surface, focused: bool) -> void {
+    const color = if focused { FOCUS_COLOR } else { FRAME_COLOR }
+    const x = windowX(surface)
+    const y = windowY(surface)
+    const width = windowWidth(surface)
+    const height = windowHeight(surface)
+    fillRect(compositor, pixels, x - 2, y - 2, width + 4, 2, color)
+    fillRect(compositor, pixels, x - 2, y + height, width + 4, 2, color)
+    fillRect(compositor, pixels, x - 2, y, 2, height, color)
+    fillRect(compositor, pixels, x + width, y, 2, height, color)
+}
+
+// The built-in arrow: 0 transparent, 1 outline, 2 fill.
+pub fn arrowPixel(x: i32, y: i32) -> u8 {
+    if y < 0 || x < 0 || y > 16 { return 0 }
+    if y <= 11 {
+        if x > y { return 0 }
+        if x == 0 || x == y || y == 11 { return 1 }
+        return 2
+    }
+    // The tail below the triangle.
+    const tail = y - 11
+    if x < 4 + tail / 2 || x > 6 + tail / 2 { return 0 }
+    if x == 4 + tail / 2 || x == 6 + tail / 2 || y == 16 { return 1 }
+    return 2
+}
+
+// A resize cursor: a double arrow through the middle of the CURSOR_SIZE
+// box (along x, along y, or diagonal); 0 transparent, 1 outline, 2 fill.
+fn insideResize(kind: u32, x: i32, y: i32) -> bool {
+    const u0 = x - CURSOR_SIZE / 2
+    const v0 = y - CURSOR_SIZE / 2
+    var along = u0
+    var across = v0
+    var reach: i32 = 8
+    if kind == CURSOR_VERTICAL {
+        along = v0
+        across = u0
+    } else if kind == CURSOR_DIAGONAL {
+        along = u0 + v0
+        across = u0 - v0
+        reach = 12
+    } else if kind == CURSOR_ANTIDIAGONAL {
+        along = u0 - v0
+        across = u0 + v0
+        reach = 12
+    }
+    const a = if along < 0 { 0 - along } else { along }
+    const b = if across < 0 { 0 - across } else { across }
+    if a > reach { return false }
+    // The shaft, and a head at each end whose tip is `reach` out.
+    if b <= 1 { return true }
+    return a >= reach / 2 && b <= reach - a
+}
+
+pub fn cursorPixel(kind: u32, x: i32, y: i32) -> u8 {
+    if kind == CURSOR_ARROW { return arrowPixel(x, y) }
+    if x < 0 || y < 0 || x >= CURSOR_SIZE || y >= CURSOR_SIZE { return 0 }
+    if insideResize(kind, x, y) { return 2 }
+    var dy: i32 = -1
+    while dy <= 1 {
+        var dx: i32 = -1
+        while dx <= 1 {
+            const nx = x + dx
+            const ny = y + dy
+            if nx >= 0 && ny >= 0 && nx < CURSOR_SIZE && ny < CURSOR_SIZE && insideResize(kind, nx, ny) { return 1 }
+            dx += 1
+        }
+        dy += 1
+    }
+    return 0
+}
+
+// The cursor's hot spot within its box: the arrow's tip, or the middle.
+pub fn cursorHotspot(kind: u32) -> i32 {
+    return if kind == CURSOR_ARROW { 0 } else { CURSOR_SIZE / 2 }
+}
+
+// The resize cursor for resize edges (the arrow for none).
+pub fn cursorForEdges(edges: u32) -> u32 {
+    if edges == 0 { return CURSOR_ARROW }
+    const horizontal = edges & (EDGE_LEFT | EDGE_RIGHT) != 0
+    const vertical = edges & (EDGE_TOP | EDGE_BOTTOM) != 0
+    if horizontal && vertical {
+        return if edges == (EDGE_TOP | EDGE_LEFT) || edges == (EDGE_BOTTOM | EDGE_RIGHT) { CURSOR_DIAGONAL } else { CURSOR_ANTIDIAGONAL }
+    }
+    return if horizontal { CURSOR_HORIZONTAL } else { CURSOR_VERTICAL }
+}
+
+// The cursor the compositor draws now: a resize cursor while resizing or
+// over a border, else the arrow.
+pub fn cursorKind(compositor: *const Compositor) -> u32 {
+    return cursorForEdges(if compositor.*.resizing != 0 { compositor.*.resizeEdges } else { compositor.*.hoverEdges })
+}
+
+pub fn arrowColor(kind: u8) -> u32 {
+    if kind == 1 { return 4278190080 }
+    if kind == 2 { return 4294967295 }
+    return 0
+}
+
+// The desktop background: a dark blue vertical gradient.
+pub fn backgroundColor(compositor: *const Compositor, row: usize) -> u32 {
+    const shade = @intCast(u32, (row * 48) / compositor.*.height)
+    return 4278190080 | ((24 + shade / 2) << 16) | ((34 + shade / 2) << 8) | (52 + shade)
+}
+
+fn drawCursor(compositor: *Compositor, pixels: [*]u8, cursor: u32) -> void {
+    const hotspot = cursorHotspot(cursor)
+    var y: i32 = 0
+    while y < CURSOR_SIZE {
+        var x: i32 = 0
+        while x < CURSOR_SIZE {
+            const kind = cursorPixel(cursor, x, y)
+            if kind != 0 {
+                fillRect(compositor, pixels, compositor.*.pointerX - hotspot + x, compositor.*.pointerY - hotspot + y, 1, 1, arrowColor(kind))
+            }
+            x += 1
+        }
+        y += 1
+    }
+}
+
+// Composes the whole output into `pixels` (width x height ARGB8888).
+pub fn compose(compositor: *Compositor, pixels: [*]u8) -> void {
+    const width = compositor.*.width
+    const height = compositor.*.height
+    var row: usize = 0
+    while row < height {
+        const color = backgroundColor(compositor, row)
+        var column: usize = 0
+        const line = row * width * 4
+        while column < width {
+            store(pixels, line + column * 4, color)
+            column += 1
+        }
+        row += 1
+    }
+    var index: usize = 0
+    while index < compositor.*.stack.length {
+        const address = state.listAt(compositor.*.stack, index)
+        const surface = state.surfaceAt(address)
+        if surface.*.role == state.ROLE_TOPLEVEL {
+            drawFrame(compositor, pixels, surface, address == compositor.*.keyboardFocus)
+            drawTitle(compositor, pixels, surface, address == compositor.*.keyboardFocus)
+        }
+        blit(compositor, pixels, surface, surface.*.x, surface.*.y)
+        index += 1
+    }
+    if compositor.*.pointerInside {
+        if compositor.*.cursorSurface != 0 {
+            const cursor = state.surfaceAt(compositor.*.cursorSurface)
+            blit(compositor, pixels, cursor, compositor.*.pointerX - compositor.*.cursorHotspotX, compositor.*.pointerY - compositor.*.cursorHotspotY)
+        } else if !compositor.*.cursorHidden {
+            drawCursor(compositor, pixels, cursorKind(compositor))
+        }
+    }
+}

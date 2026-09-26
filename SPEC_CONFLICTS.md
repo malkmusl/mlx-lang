@@ -81,6 +81,29 @@ address, endpoint, TCP/UDP, resolver, or event-loop API is specified. Raw
 `std.os.linux`/`std.posix` wrappers can follow the platform ABI; a portable
 `std.net` interface requires an added normative contract.
 
+### Materialized Wayland declaration names
+
+`spec/06-wayland/wayland.xml` requires typed client/server declarations
+generated from protocol XML but does not define how XML names become Mlx
+identifiers. XML names may start with a digit (`wl_output.transform` entry
+`90`) or collide with Mlx keywords (the `wl_display.error` event). The
+materializer keeps XML spelling, prefixes a leading digit with `_`, appends
+`_` to keywords, uses PascalCase for enum and payload types, camelCase for
+request methods and `send` + PascalCase for event methods. This is a
+provisional std convention, not a normative mapping.
+
+### Wayland public runtime API shape
+
+`spec/06-wayland/wayland.xml` lists what `std.wayland.client` and
+`std.wayland.server` provide but not their signatures, the event delivery
+model, or how nullability of object and string arguments is expressed in Mlx
+types. `std.wayland` provides per-object handler functions with typed
+`decodeEvent`/`decodeRequest` unions, libwayland-style sticky request
+failures, `?*const Proxy` parameters for nullable objects, `?[]const u8` for
+nullable request strings, and `std.string.String` (null as a zero pointer)
+for decoded strings. fd arguments are duplicated when sent, so callers keep
+ownership, and received handles are owned by the handler.
+
 ### Function inline modifier strength
 
 `spec/00-language/grammar.ebnf` admits `inline` and `noinline` declaration
@@ -89,3 +112,24 @@ request, or an ordinary optimization hint, nor what happens when a requested
 function cannot be inlined. The canonical compiler therefore treats `inline`
 as a conservative best-effort request and `noinline` as a veto; failure to
 inline does not change program semantics or produce an invented diagnostic.
+
+### Foreign C functions on x86_64 Linux
+
+`spec/03-formats/elf64.xml` allows dynamic linking "after the static/bootstrap
+path" without fixing its shape, and `spec/01-abi/foreign-abi.xml` listed only
+`sysv`, `win64` and `syscall`. The compiler now accepts `extern("c")` (and
+`extern` without a string) as the target's C ABI, as on the aarch64-android
+branch, and writes a program that imports or exports functions as an
+`ET_EXEC` loaded by the system dynamic linker with `DT_NEEDED libc.so.6` plus
+each `--library NAME`. The `--library` option and always linking libc are
+provisional choices; `spec/01-abi/foreign-abi.xml` records the rules.
+
+### Vulkan in the standard library
+
+`spec/04-stdlib/std.xml` does not mention Vulkan. `std.vulkan` follows the
+Wayland precedent: the canonical registry (`vk.xml`) is materialized while
+the standard library is bootstrapped, by Mlx code, into a normal module. The
+naming (enum members in camelCase without their prefix, `VK_`-less constants,
+wrappers taking their dispatch table first), the selected extensions and the
+loader's behavior (one driver per `Driver`, no device merging or layers)
+are provisional std conventions, not normative mappings.

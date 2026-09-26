@@ -1,0 +1,288 @@
+// Builds `bluescreen.apk`: a minimal, real, *signed* Android package whose
+// `android.app.NativeActivity` fills its window solid blue -- entirely from
+// hand-written bytes (AArch64 machine code, an ELF64 shared object, a
+// binary AndroidManifest.xml, a DEX header, a ZIP container, and an RSA/
+// X.509/PKCS#7 JAR signature), running end to end on mlx's own self-hosted
+// compiler (mlx1) rather than the Zig bootstrap -- see
+// experiments/android-aarch64-bluescreen/tool/main.zig for the reference
+// this orchestrator ports, and the experiment README for what's verified
+// and what still needs a real device.
+//
+// No CLI argument access exists in mlx's stdlib yet (no argv equivalent),
+// so unlike the Zig CLI tool this always writes to a fixed output path and
+// package name below, rather than reading them from argv.
+//
+// RSA-1024 (512-bit primes), not the Zig version's RSA-2048 default: see
+// bignum.mlx's header comment for why -- both this port's O(bits x limbs)
+// division algorithm and, more fundamentally, the self-hosted compiler's
+// 256 MiB aggregate-local arena limit (documented in
+// docs/internals/selfhost-compiler.md) make 2048-bit impractical here for
+// now.
+
+const std = @import("std")
+const elf_so = @import("./elf_so.mlx")
+const axml = @import("./axml.mlx")
+const dex = @import("./dex.mlx")
+const zip = @import("./zip.mlx")
+const jar_sign = @import("./jar_sign.mlx")
+const apk_sign_v2v3 = @import("./apk_sign_v2v3.mlx")
+const bn = @import("./bignum.mlx")
+
+fn outPath() -> []const u8 { return "bluescreen.apk" }
+fn packageName() -> []const u8 { return "dev.mlxlang.experiments.bluescreen" }
+fn soPath() -> []const u8 { return "lib/arm64-v8a/libmain.so" }
+fn manifestPath() -> []const u8 { return "AndroidManifest.xml" }
+fn dexPath() -> []const u8 { return "classes.dex" }
+fn certCn() -> []const u8 { return "mlx-android-aarch64-bluescreen" }
+
+// Toggle: true hides the system status bar entirely (a `*.Fullscreen`
+// theme); false keeps the normal system status bar visible (the blue fill
+// renders underneath it), which is what real-device testing showed was
+// actually wanted -- see axml.mlx's theme*() functions for all four
+// themes' resource IDs.
+fn fullscreenEnabled() -> bool { return false }
+
+// Toggle: true styles the status bar to match the device's actual default
+// look (`Theme.DeviceDefault.NoActionBar[.Fullscreen]`); false forces a
+// hardcoded black bar (`Theme.Black.NoTitleBar[.Fullscreen]`), which was
+// this experiment's original look before real-device feedback asked for
+// the status bar to "adapt to the system color" instead. Independent of
+// fullscreenEnabled() above -- the two combine into all four themes.
+fn systemStatusBarColorEnabled() -> bool { return true }
+
+// Kept low for broad device compatibility -- devices below this still
+// install and run the app fine (NativeActivity itself needs nothing
+// newer). Threaded into both the manifest's `<uses-sdk>` and (as the
+// floor apk_sign_v2v3.signV2V3 assumes) the v3 Signing Block's own
+// per-signer minSdk field.
+//
+// mlx has no argv equivalent yet (see this file's header comment), so
+// unlike tool/main.zig's `--min-sdk=N`/`--target-sdk=N` CLI overrides,
+// changing this requires editing this source and rebuilding. Keep this
+// and targetSdkVersion() in sync with main.zig's DEFAULT_MIN_SDK_VERSION/
+// DEFAULT_TARGET_SDK_VERSION when either changes.
+fn minSdkVersion() -> u32 { return 21 }
+
+// Declares how current this build has actually been tested/updated for.
+// Real-device feedback: a low targetSdkVersion (this was 29 originally)
+// makes current Android show "This app was built for an older version of
+// Android and may not work properly" on install/launch, independent of
+// signing -- Android surfaces that warning purely off the gap between
+// targetSdkVersion and the device's own platform version.
+//
+// 37 (Android 17): the highest value real-device confirmed so far (31, 35,
+// 36 and 37 all installed and ran once the attribute-order bug behind the
+// old >= 31 block was fixed -- see the README's twenty-eighth and
+// twenty-ninth reports).
+//
+// There's deliberately no "maxSdkVersion" to pair with minSdkVersion():
+// `<uses-sdk android:maxSdkVersion>` has been ignored at install time since
+// API 4. Android installs on any device >= minSdkVersion regardless of
+// target, so this single value is the real "how current" lever.
+fn targetSdkVersion() -> u32 { return 37 }
+
+// Defensive parity with main.zig's runtime `target_sdk_version <
+// min_sdk_version` check: since these are still just two independent
+// hardcoded functions here (no shared validation point like the Zig
+// port's flag-parsing), main() below calls this once at startup so a
+// future edit that breaks the invariant fails loudly instead of quietly
+// producing a manifest whose `<uses-sdk>` claims a target below its own
+// floor.
+fn validateSdkRange() -> bool {
+    if targetSdkVersion() < minSdkVersion() {
+        var w: bool = std.io.print("error: targetSdkVersion (")
+        w = std.io.writeUnsigned(std.io.stdout(), @intCast(usize, targetSdkVersion()))
+        w = std.io.print(") cannot be below minSdkVersion (")
+        w = std.io.writeUnsigned(std.io.stdout(), @intCast(usize, minSdkVersion()))
+        w = std.io.println(")")
+        return false
+    }
+    return true
+}
+
+fn printBytes(label: []const u8, n: usize) -> void {
+    var w: bool = std.io.print("      ")
+    w = std.io.print(label)
+    w = std.io.print(": ")
+    w = std.io.writeUnsigned(std.io.stdout(), n)
+    w = std.io.println(" bytes")
+}
+
+// Absolute (not repo-relative -- mlx has no argv, and the built binary's
+// own CWD is wherever it's *invoked* from, e.g. an arbitrary /tmp build
+// directory per the README's own `cd /tmp && /tmp/build-apk` usage, not
+// the repo) path to a small persisted RSA keypair, reused across builds
+// instead of generating a fresh random one every time. This is a real
+// fix for a real bug: every build through the twenty-first round called
+// jar_sign.generateKeyPair fresh, so every shipped APK had a DIFFERENT
+// self-signed certificate -- and Android refuses to install an "update"
+// whose signing certificate doesn't match whatever's already installed
+// under the same package name, confirmed on a real device as a "You
+// can't install this app on your device" toast after several
+// differently-keyed builds had been installed in a row. Mirrors the
+// purpose (not the file format) of Android Studio's own debug.keystore:
+// a fixed, throwaway, non-secret signing identity checked in so builds
+// stay installable as updates over each other. See tryLoadKeyPair/
+// saveKeyPair below for the (deliberately minimal, not-a-real-keystore)
+// on-disk format.
+fn keyPath() -> []const u8 { return "/home/user/mlx-lang/experiments/android-aarch64-bluescreen/debug_signing_key.bin" }
+
+fn appendU32LE(list: *std.array_list.ArrayList, v: u32) -> void {
+    var ok0: bool = std.array_list.ArrayList.appendAt(list, @intCast(u8, v & 255))
+    var ok1: bool = std.array_list.ArrayList.appendAt(list, @intCast(u8, (v >> 8) & 255))
+    var ok2: bool = std.array_list.ArrayList.appendAt(list, @intCast(u8, (v >> 16) & 255))
+    var ok3: bool = std.array_list.ArrayList.appendAt(list, @intCast(u8, (v >> 24) & 255))
+}
+
+fn appendSlice(list: *std.array_list.ArrayList, src: []const u8) -> void {
+    var i: usize = 0
+    while i < src.length {
+        var ok: bool = std.array_list.ArrayList.appendAt(list, src[i])
+        i += 1
+    }
+}
+
+// On-disk format: [4 bytes LE nBytes][nBytes bytes n, big-endian][nBytes
+// bytes d, big-endian]. Returns nBytes on success, 0 if the file doesn't
+// exist yet or is short/corrupt (caller then falls back to generating a
+// fresh key). A single std.fs.read per field is safe here (not looped):
+// unlike /dev/urandom (see bignum.mlx's fillRandomBytes), a regular local
+// file this small always returns its full requested length in one
+// syscall on Linux, short only at real EOF -- which this function treats
+// as "no valid saved key" either way.
+fn tryLoadKeyPair(allocator: std.allocator.Allocator, n: *bn.BigUint, d: *bn.BigUint) -> usize {
+    const file = std.fs.open(@ptrCast([*]const u8, keyPath()), std.fs.READ_ONLY, 0)
+    if !std.fs.isValid(file) { return 0 }
+
+    var header: std.array_list.ArrayList = std.array_list.ArrayList.init(allocator, 4)
+    header = std.array_list.ArrayList.resize(header, 4, 0)
+    const headerRead: isize = std.fs.read(file, header.items, 4)
+    if headerRead != 4 {
+        var okClose: bool = std.fs.close(file)
+        return 0
+    }
+    const nBytes: usize = @intCast(usize, header.items[0]) | (@intCast(usize, header.items[1]) << 8) | (@intCast(usize, header.items[2]) << 16) | (@intCast(usize, header.items[3]) << 24)
+
+    var body: std.array_list.ArrayList = std.array_list.ArrayList.init(allocator, nBytes * 2)
+    body = std.array_list.ArrayList.resize(body, nBytes * 2, 0)
+    const bodyRead: isize = std.fs.read(file, body.items, nBytes * 2)
+    var okClose2: bool = std.fs.close(file)
+    if bodyRead != @intCast(isize, nBytes * 2) { return 0 }
+
+    bn.fromBytesBE(n, body.items[0..nBytes])
+    bn.fromBytesBE(d, body.items[nBytes..nBytes * 2])
+    return nBytes
+}
+
+fn saveKeyPair(allocator: std.allocator.Allocator, n: *bn.BigUint, d: *bn.BigUint, nBytes: usize) -> void {
+    var buf: std.array_list.ArrayList = std.array_list.ArrayList.init(allocator, 4 + nBytes * 2)
+    appendU32LE(&buf, @intCast(u32, nBytes))
+    const nEnc = bn.toBytesBEPadded(n, allocator, nBytes)
+    appendSlice(&buf, nEnc.items[0..nEnc.length])
+    const dEnc = bn.toBytesBEPadded(d, allocator, nBytes)
+    appendSlice(&buf, dEnc.items[0..dEnc.length])
+
+    const file = std.fs.open(@ptrCast([*]const u8, keyPath()), std.fs.WRITE_ONLY | std.fs.CREATE | std.fs.TRUNCATE, 420)
+    var wroteOk: bool = std.fs.writeAllBytes(file, @ptrCast([*]const u8, buf.items[0..buf.length]), buf.length)
+    var closedOk: bool = std.fs.close(file)
+}
+
+pub fn main() -> void {
+    if !validateSdkRange() { return }
+
+    const allocator: std.allocator.Allocator = std.page_allocator.init()
+
+    var w0: bool = std.io.print("mlx android-aarch64-bluescreen experiment -- building ")
+    w0 = std.io.print(outPath())
+    w0 = std.io.print(" (package ")
+    w0 = std.io.print(packageName())
+    w0 = std.io.println(")")
+
+    var wSdk: bool = std.io.print("      min-sdk=")
+    wSdk = std.io.writeUnsigned(std.io.stdout(), @intCast(usize, minSdkVersion()))
+    wSdk = std.io.print(" target-sdk=")
+    wSdk = std.io.writeUnsigned(std.io.stdout(), @intCast(usize, targetSdkVersion()))
+    wSdk = std.io.println("")
+
+    if !std.io.println("[1/7] generating AArch64 machine code + ELF64 shared object...") { return }
+    const soBytes = elf_so.build(allocator, "libmain.so", "libandroid.so", "libc.so", "liblog.so")
+    printBytes(soPath(), soBytes.length)
+
+    if !std.io.println("[2/7] generating binary AndroidManifest.xml...") { return }
+    const manifestBytes = axml.buildManifest(allocator, packageName(), fullscreenEnabled(), systemStatusBarColorEnabled(), minSdkVersion(), targetSdkVersion())
+    printBytes(manifestPath(), manifestBytes.length)
+
+    if !std.io.println("[3/7] generating classes.dex (empty -- pure native activity)...") { return }
+    const dexBytes = dex.buildEmptyDex(allocator)
+    printBytes(dexPath(), dexBytes.length)
+
+    if !std.io.println("[4/7] loading or generating RSA-1024 signing key + self-signed certificate...") { return }
+    var n: bn.BigUint = undefined
+    var d: bn.BigUint = undefined
+    var nBytes: usize = tryLoadKeyPair(allocator, &n, &d)
+    if nBytes > 0 {
+        var wLoaded: bool = std.io.print("      reusing saved signing key: ")
+        wLoaded = std.io.println(keyPath())
+    } else {
+        var wGen: bool = std.io.println("      no saved key found -- generating a new one (this takes about a minute)...")
+        const keygenStart: usize = std.time.monotonicNanoseconds()
+        nBytes = jar_sign.generateKeyPair(&n, &d, 1024)
+        const keygenElapsedMs: usize = std.time.elapsedNanoseconds(keygenStart, std.time.monotonicNanoseconds()) / 1000000
+        var w1: bool = std.io.print("      keygen: ")
+        w1 = std.io.writeUnsigned(std.io.stdout(), keygenElapsedMs)
+        w1 = std.io.println("ms")
+        saveKeyPair(allocator, &n, &d, nBytes)
+        var wSaved: bool = std.io.print("      saved signing key: ")
+        wSaved = std.io.println(keyPath())
+    }
+    const certDer = jar_sign.buildSelfSignedCert(allocator, &n, &d, nBytes, certCn(), 1)
+    printBytes("certificate", certDer.length)
+
+    if !std.io.println("[5/7] signing (MANIFEST.MF / CERT.SF / CERT.RSA)...") { return }
+    var signEntries: zip.EntryList = undefined
+    zip.initEntries(&signEntries)
+    zip.addEntry(&signEntries, manifestPath(), manifestBytes.items[0..manifestBytes.length])
+    zip.addEntry(&signEntries, dexPath(), dexBytes.items[0..dexBytes.length])
+    zip.addEntry(&signEntries, soPath(), soBytes.items[0..soBytes.length])
+
+    var mf: jar_sign.ArrayList = undefined
+    var sf: jar_sign.ArrayList = undefined
+    var rsaSig: jar_sign.ArrayList = undefined
+    jar_sign.signJar(allocator, &n, &d, nBytes, certDer.items[0..certDer.length], certCn(), 1, &signEntries, &mf, &sf, &rsaSig)
+    printBytes("META-INF/CERT.RSA", rsaSig.length)
+
+    if !std.io.println("[6/7] packaging APK (ZIP)...") { return }
+    var apkEntries: zip.EntryList = undefined
+    zip.initEntries(&apkEntries)
+    zip.addEntry(&apkEntries, manifestPath(), manifestBytes.items[0..manifestBytes.length])
+    zip.addEntry(&apkEntries, dexPath(), dexBytes.items[0..dexBytes.length])
+    zip.addEntry(&apkEntries, soPath(), soBytes.items[0..soBytes.length])
+    zip.addEntry(&apkEntries, "META-INF/MANIFEST.MF", mf.items[0..mf.length])
+    zip.addEntry(&apkEntries, "META-INF/CERT.SF", sf.items[0..sf.length])
+    zip.addEntry(&apkEntries, "META-INF/CERT.RSA", rsaSig.items[0..rsaSig.length])
+
+    const v1ApkBytes = zip.build(allocator, &apkEntries)
+
+    if !std.io.println("[7/7] signing (APK Signature Scheme v2/v3, auto-picked from targetSdkVersion)...") { return }
+    // v1 is never dropped by schemesForTargetSdk (see its comment) -- the
+    // META-INF/* entries above are unconditional for exactly that reason.
+    const schemes = apk_sign_v2v3.schemesForTargetSdk(targetSdkVersion())
+    const includeV2: bool = schemes.1
+    const includeV3: bool = schemes.2
+    var w3: bool = std.io.print("      v2: ")
+    if includeV2 { w3 = std.io.print("yes") } else { w3 = std.io.print("no") }
+    w3 = std.io.print(", v3: ")
+    if includeV3 { w3 = std.io.println("yes") } else { w3 = std.io.println("no") }
+    const apkBytes = apk_sign_v2v3.signV2V3(allocator, &n, &d, nBytes, certDer.items[0..certDer.length], v1ApkBytes.items[0..v1ApkBytes.length], 28, includeV2, includeV3)
+    printBytes("APK Signing Block", apkBytes.length - v1ApkBytes.length)
+
+    const file = std.fs.open(@ptrCast([*]const u8, outPath()), std.fs.WRITE_ONLY | std.fs.CREATE | std.fs.TRUNCATE, 420)
+    var wroteOk: bool = std.fs.writeAllBytes(file, @ptrCast([*]const u8, apkBytes.items[0..apkBytes.length]), apkBytes.length)
+    var closedOk: bool = std.fs.close(file)
+
+    var w2: bool = std.io.print("done: ")
+    w2 = std.io.print(outPath())
+    w2 = std.io.print(" (")
+    w2 = std.io.writeUnsigned(std.io.stdout(), apkBytes.length)
+    w2 = std.io.println(" bytes)")
+}

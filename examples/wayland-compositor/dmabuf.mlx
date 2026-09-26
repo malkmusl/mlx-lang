@@ -1,0 +1,179 @@
+// linux-dmabuf (zwp_linux_dmabuf_v1, version 3): clients hand over buffers
+// as dma-buf file descriptors, typically rendered by a GPU, instead of
+// shared memory.
+//
+// Offered: ARGB8888 and XRGB8888 with the LINEAR modifier, one plane. Each
+// dma-buf is mapped read-only and becomes a one-buffer pool, so the CPU
+// renderer reads it like a wl_shm pool; the Vulkan renderer imports the
+// dma-buf itself (VK_EXT_external_memory_dma_buf).
+
+const std = @import("std")
+const wl = @import("std.wayland")
+const state = @import("./state.mlx")
+const shell = @import("./shell.mlx")
+
+const Compositor = state.Compositor
+
+const DRM_FORMAT_ARGB8888: u32 = 875713089
+const DRM_FORMAT_XRGB8888: u32 = 875713112
+// DRM_FORMAT_MOD_INVALID: "the buffer's layout is implicit" (0x00ffffffffffffff).
+const MODIFIER_INVALID_HI: u32 = 16777215
+const MODIFIER_INVALID_LO: u32 = 4294967295
+
+const Params = struct {
+    compositor: *Compositor
+    fd: wl.Handle
+    hasPlane: bool
+    offset: u32
+    stride: u32
+    modifierHi: u32
+    modifierLo: u32
+    used: bool
+}
+
+fn paramsOf(context: *anyopaque) -> *Params {
+    unsafe { return @ptrCast(*Params, context) }
+}
+
+fn fail(params: wl.zwp_linux_buffer_params_v1.Resource, code: wl.zwp_linux_buffer_params_v1.Error, message: []const u8) -> void {
+    params.postError(@intFromEnum(code), message)
+}
+
+const CREATE_OK: u8 = 0
+const CREATE_ERROR: u8 = 1
+const CREATE_FAILED: u8 = 2
+
+// Validates the collected plane and maps it into a one-buffer pool:
+// CREATE_OK (the pool is in `result`), CREATE_ERROR (a protocol error was
+// posted) or CREATE_FAILED (a valid request this compositor cannot import).
+fn prepare(params: *Params, resource: wl.zwp_linux_buffer_params_v1.Resource, width: i32, height: i32, format: u32, flags: u32, result: *usize) -> u8 {
+    const compositor = params.*.compositor
+    if params.*.used {
+        fail(resource, wl.zwp_linux_buffer_params_v1.Error.already_used, "params already used")
+        return CREATE_ERROR
+    }
+    params.*.used = true
+    if !params.*.hasPlane {
+        fail(resource, wl.zwp_linux_buffer_params_v1.Error.incomplete, "no plane added")
+        return CREATE_ERROR
+    }
+    if format != DRM_FORMAT_ARGB8888 && format != DRM_FORMAT_XRGB8888 {
+        fail(resource, wl.zwp_linux_buffer_params_v1.Error.invalid_format, "unsupported format")
+        return CREATE_ERROR
+    }
+    if width <= 0 || height <= 0 || width > 16384 || height > 16384 {
+        fail(resource, wl.zwp_linux_buffer_params_v1.Error.invalid_dimensions, "invalid dimensions")
+        return CREATE_ERROR
+    }
+    const stride = @intCast(usize, params.*.stride)
+    const offset = @intCast(usize, params.*.offset)
+    if stride < @intCast(usize, width) * 4 || stride > 65536 || offset > 1073741824 {
+        fail(resource, wl.zwp_linux_buffer_params_v1.Error.out_of_bounds, "plane does not fit the buffer")
+        return CREATE_ERROR
+    }
+    // Flags (y-inverted, interlaced) and tiled layouts are not supported:
+    // such buffers fail, as the protocol allows.
+    const linear = params.*.modifierHi == 0 && params.*.modifierLo == 0
+    const implicit = params.*.modifierHi == MODIFIER_INVALID_HI && params.*.modifierLo == MODIFIER_INVALID_LO
+    if flags != 0 || (!linear && !implicit) { return CREATE_FAILED }
+    var memory: wl.SharedMemory = undefined
+    const handle = params.*.fd
+    params.*.hasPlane = false
+    if !wl.transport.mapSharedMemory(&memory, handle, offset + stride * @intCast(usize, height), false) {
+        handle.close()
+        return CREATE_FAILED
+    }
+    result.* = @intFromPtr(shell.newPool(compositor, memory, true))
+    return CREATE_OK
+}
+
+// The pool's own reference passes to its only buffer.
+fn finish(params: *Params, pool_address: usize, buffer: wl.wl_buffer.Resource, width: i32, height: i32, format: u32) -> void {
+    var pool: *state.Pool = undefined
+    unsafe { pool = @ptrFromInt(*state.Pool, pool_address) }
+    const shm_format = if format == DRM_FORMAT_ARGB8888 { @intFromEnum(wl.wl_shm.Format.argb8888) } else { @intFromEnum(wl.wl_shm.Format.xrgb8888) }
+    shell.addBuffer(pool, buffer, @intCast(i32, params.*.offset), width, height, @intCast(i32, params.*.stride), shm_format)
+    shell.releasePool(pool)
+    if params.*.compositor.*.verbose { state.say("dmabuf buffer created\n") }
+}
+
+fn onParams(context: *anyopaque, request: wl.server.Request) -> void {
+    const params = paramsOf(context)
+    const resource = wl.zwp_linux_buffer_params_v1.Resource.fromObject(request.object)
+    const decoded = wl.zwp_linux_buffer_params_v1.decodeRequest(request)
+    if request.opcode == wl.zwp_linux_buffer_params_v1.REQUEST_ADD {
+        const added = decoded.add
+        if added.plane_idx != 0 {
+            added.fd.close()
+            fail(resource, wl.zwp_linux_buffer_params_v1.Error.plane_idx, "only single-plane formats are offered")
+            return
+        }
+        if params.*.hasPlane {
+            added.fd.close()
+            fail(resource, wl.zwp_linux_buffer_params_v1.Error.plane_set, "plane 0 already set")
+            return
+        }
+        params.*.fd = added.fd
+        params.*.hasPlane = true
+        params.*.offset = added.offset
+        params.*.stride = added.stride
+        params.*.modifierHi = added.modifier_hi
+        params.*.modifierLo = added.modifier_lo
+    } else if request.opcode == wl.zwp_linux_buffer_params_v1.REQUEST_CREATE {
+        const created = decoded.create
+        var pool: usize = 0
+        const status = prepare(params, resource, created.width, created.height, created.format, created.flags, &pool)
+        if status == CREATE_OK {
+            finish(params, pool, resource.sendCreated(), created.width, created.height, created.format)
+        } else if status == CREATE_FAILED {
+            resource.sendFailed()
+        }
+    } else if request.opcode == wl.zwp_linux_buffer_params_v1.REQUEST_CREATE_IMMED {
+        const created = decoded.create_immed
+        var pool: usize = 0
+        const status = prepare(params, resource, created.width, created.height, created.format, created.flags, &pool)
+        if status == CREATE_OK {
+            finish(params, pool, created.buffer_id, created.width, created.height, created.format)
+        } else if status == CREATE_FAILED {
+            fail(resource, wl.zwp_linux_buffer_params_v1.Error.invalid_wl_buffer, "cannot import the dma-buf")
+        }
+    }
+}
+
+fn onParamsDestroyed(context: *anyopaque, object: wl.server.Object) -> void {
+    const params = paramsOf(context)
+    if params.*.hasPlane { params.*.fd.close() }
+    unsafe { state.release(params.*.compositor, @ptrCast([*]u8, params), @sizeOf(Params)) }
+}
+
+fn onDmabuf(context: *anyopaque, request: wl.server.Request) -> void {
+    const compositor = state.compositorOf(context)
+    const decoded = wl.zwp_linux_dmabuf_v1.decodeRequest(request)
+    if request.opcode != wl.zwp_linux_dmabuf_v1.REQUEST_CREATE_PARAMS { return }
+    const memory = state.allocate(compositor, @sizeOf(Params))
+    var params: *Params = undefined
+    unsafe { params = @ptrCast(*Params, memory) }
+    params.*.compositor = compositor
+    params.*.hasPlane = false
+    params.*.used = false
+    const resource = decoded.create_params.params_id
+    resource.setHandler(onParams, state.contextOf(memory))
+    resource.setDestroyHandler(onParamsDestroyed, state.contextOf(memory))
+}
+
+fn bindDmabuf(context: *anyopaque, client: wl.server.Client, object: wl.server.Object, version: u32) -> void {
+    const dmabuf = wl.zwp_linux_dmabuf_v1.Resource.fromObject(object)
+    dmabuf.setHandler(onDmabuf, context)
+    dmabuf.sendFormat(DRM_FORMAT_ARGB8888)
+    dmabuf.sendFormat(DRM_FORMAT_XRGB8888)
+    if dmabuf.version() >= 3 {
+        dmabuf.sendModifier(DRM_FORMAT_ARGB8888, 0, 0)
+        dmabuf.sendModifier(DRM_FORMAT_XRGB8888, 0, 0)
+    }
+}
+
+pub fn createGlobal(compositor: *Compositor) -> bool {
+    var memory: [*]u8 = undefined
+    unsafe { memory = @ptrCast([*]u8, compositor) }
+    return compositor.*.server.createGlobal(wl.Interface.zwp_linux_dmabuf_v1, 3, bindDmabuf, state.contextOf(memory)) != 0
+}

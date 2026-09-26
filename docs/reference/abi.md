@@ -228,6 +228,12 @@ holder.pair = replacement
 
 (`tests/229_aggregate_field_assignment_runtime.mlx`)
 
+Every such copy is one `mem_copy` LIR instruction: on aarch64 a call to the
+runtime's `__mlx_mem_copy` (x0 = destination, x1 = source, x2 = byte count;
+8 bytes at a time, then the rest), on x86_64 an inline `rep movsb`. Sizes
+that are not a multiple of 8 copy exactly
+(`tests/266_mem_copy_sizes_runtime.mlx`).
+
 A 20-byte array exceeds the 16-byte register-return threshold, so it returns
 through caller-owned hidden memory instead:
 
@@ -446,6 +452,54 @@ The foreign-ABI spec also fixes the C-compatible scalar type aliases
 (`*anyopaque`) used at an `extern("sysv")`/`extern("win64")` boundary, and is
 explicit that conformance never requires a C preprocessor, C parser, Clang,
 libclang, or header translator (`NoRequiredCParser`).
+
+## C functions: `extern("c")` and `export fn`
+
+`extern("c")` (or `extern` without an ABI string) declares a bodiless
+function with the target's C ABI, imported from a shared library at load
+time under its source name; `export fn` defines an Mlx function the dynamic
+linker (and so C code) can see under its plain name:
+
+```mlx
+extern("c") fn dlopen(name: [*]const u8, flags: i32) -> usize
+extern("c") fn dlsym(handle: usize, name: [*]const u8) -> usize
+extern("c") fn qsort(base: usize, count: usize, size: usize, compare: usize) -> void
+
+// Runs on a thread the C library created.
+export fn mlx_foreign_worker(argument: usize) -> usize { ... }
+```
+
+(`tests/247_foreign_c_runtime.mlx`)
+
+Integer and pointer arguments already follow System V (mlxcc passes them in
+`rdi rsi rdx rcx r8 r9` and float scalars in `xmm0..7`). What the C boundary
+adds on x86_64:
+
+- a call to an import is `call qword [rip + GOT slot]`, with `AL` holding
+  the number of vector registers used (variadic callees such as `snprintf`
+  read it);
+- System V leaves the bits above a narrow result or argument unspecified, so
+  integers, `bool`s and enums narrower than 64 bits are sign- or
+  zero-extended (by their backing type, for enums) after every call to an
+  import or through a function pointer, and on entry to every function;
+- mlxcc keeps the aggregate arena in `r14`/`r15`; an exported function may
+  be entered from a C thread where they hold C's values, so it saves them,
+  reloads the arena registers `_start` recorded, and restores them on
+  return. Ordinary Mlx functions handed to C as callbacks (`qsort`'s
+  comparator) work when C calls them on the calling thread;
+- a program with imports or exports is a dynamically linked executable (see
+  [Formats](formats.md#dynamically-linked-executables)) that exits through
+  libc's `exit`, so stdio is flushed and library destructors run.
+
+`tests/247_foreign_c_runtime.mlx` covers direct imports, a variadic import,
+`dlopen`/`dlsym` and calls through the result, a `qsort` callback, an export
+on a `pthread_create` thread (with aggregate allocation), `dlsym` of the
+export, and narrow results and arguments with garbage upper bits produced by
+machine-code stubs — including an `enum(i32)` result.
+
+Struct arguments and returns by value are not classified for C yet; C APIs
+that take structures by pointer (Vulkan, Wayland's C libraries) are fully
+usable.
 
 ## Open ABI gap: thread-local storage
 

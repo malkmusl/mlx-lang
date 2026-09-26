@@ -1,0 +1,290 @@
+// Presenting to a window through a Vulkan swapchain (VK_KHR_swapchain):
+// the pattern shader renders into a storage buffer, which is copied into the
+// acquired swapchain image and presented.
+//
+// Compute shaders cannot write every swapchain format directly, and a
+// storage-buffer frame keeps one rendering path for every example, so each
+// frame is: dispatch -> vkCmdCopyBufferToImage -> present. The surface comes
+// from the platform: VK_KHR_android_surface on Android
+// (examples/vulkan-android), VK_EXT_headless_surface in tests.
+
+const std = @import("std")
+const vk = @import("std.vulkan")
+const gpu = @import("./gpu.mlx")
+const shaders = @import("./shaders.mlx")
+
+pub const MAX_IMAGES: u32 = 8
+
+pub const Swapchain = struct {
+    surface: vk.SurfaceKHR
+    swapchain: vk.SwapchainKHR
+    format: vk.Format
+    width: u32
+    height: u32
+    // Pattern flags for the format: FLAG_SWAP_RED_BLUE for R8G8B8A8.
+    formatFlags: u32
+    images: [8]vk.Image
+    imageCount: u32
+    acquired: vk.Semaphore
+    // One per image: a present may still wait on its semaphore when the
+    // next frame is submitted, never once its image is acquired again.
+    rendered: [8]vk.Semaphore
+    frame: gpu.Buffer
+    hasFrame: bool
+}
+
+pub const FrameStatus = enum(u8) { presented, out_of_date, failed }
+
+// Called after the pattern is recorded and before the frame is copied to
+// the screen, to draw more into swapchain.frame (text, for example);
+// returns false when recording failed.
+pub const DecorateFn = fn(usize, *gpu.Context, *Swapchain) -> bool
+
+fn clamp(value: u32, low: u32, high: u32) -> u32 {
+    if value < low { return low }
+    if value > high { return high }
+    return value
+}
+
+// Picks the format: B8G8R8A8 as the shader writes it, else R8G8B8A8 with red
+// and blue swapped in the shader; 0 formats or neither: false.
+fn chooseFormat(context: *gpu.Context, swapchain: *Swapchain, surface: vk.SurfaceKHR) -> bool {
+    var count: u32 = 0
+    if vk.getPhysicalDeviceSurfaceFormatsKHR(context.*.instanceCommands, context.*.physical, surface, &count, null) != vk.Result.success || count == 0 { return false }
+    const memory = context.*.allocator.alloc(@intCast(usize, count) * @sizeOf(vk.SurfaceFormatKHR), 8)
+    if memory == null { return false }
+    var formats: [*]vk.SurfaceFormatKHR = undefined
+    unsafe { formats = @ptrCast([*]vk.SurfaceFormatKHR, memory.?) }
+    if vk.getPhysicalDeviceSurfaceFormatsKHR(context.*.instanceCommands, context.*.physical, surface, &count, formats) != vk.Result.success { return false }
+    var found = false
+    var index: u32 = 0
+    while index < count {
+        const format = formats[index].format
+        const bgra = format == vk.Format.b8g8r8a8Unorm || format == vk.Format.b8g8r8a8Srgb
+        const rgba = format == vk.Format.r8g8b8a8Unorm || format == vk.Format.r8g8b8a8Srgb
+        // Prefer BGRA; take RGBA only until a BGRA shows up.
+        if bgra || (rgba && !found) {
+            swapchain.*.format = format
+            swapchain.*.formatFlags = if bgra { 0 } else { shaders.FLAG_SWAP_RED_BLUE }
+            found = true
+            if bgra { index = count }
+        }
+        index += 1
+    }
+    context.*.allocator.free(memory.?, @intCast(usize, count) * @sizeOf(vk.SurfaceFormatKHR), 8)
+    return found
+}
+
+// Creates a swapchain for `surface` (which it then owns). The size follows
+// the surface; `width` and `height` are used where the surface leaves it to
+// the application (headless surfaces).
+pub fn create(context: *gpu.Context, swapchain: *Swapchain, surface: vk.SurfaceKHR, width: u32, height: u32) -> bool {
+    swapchain.*.surface = surface
+    swapchain.*.swapchain = 0
+    swapchain.*.acquired = 0
+    swapchain.*.rendered = [8]vk.Semaphore{ 0, 0, 0, 0, 0, 0, 0, 0 }
+    swapchain.*.imageCount = 0
+    swapchain.*.hasFrame = false
+    var supported: vk.Bool32 = 0
+    gpu.step(context, "vkGetPhysicalDeviceSurfaceSupportKHR")
+    if vk.getPhysicalDeviceSurfaceSupportKHR(context.*.instanceCommands, context.*.physical, context.*.family, surface, &supported) != vk.Result.success || supported == 0 { return false }
+    var capabilities = vk.SurfaceCapabilitiesKHR.init()
+    gpu.step(context, "vkGetPhysicalDeviceSurfaceCapabilitiesKHR")
+    if vk.getPhysicalDeviceSurfaceCapabilitiesKHR(context.*.instanceCommands, context.*.physical, surface, &capabilities) != vk.Result.success { return false }
+    if capabilities.supportedUsageFlags & vk.IMAGE_USAGE_TRANSFER_DST_BIT == 0 { return false }
+    gpu.step(context, "vkGetPhysicalDeviceSurfaceFormatsKHR")
+    if !chooseFormat(context, swapchain, surface) { return false }
+    var extent = capabilities.currentExtent
+    if extent.width == 4294967295 {
+        extent.width = clamp(width, capabilities.minImageExtent.width, capabilities.maxImageExtent.width)
+        extent.height = clamp(height, capabilities.minImageExtent.height, capabilities.maxImageExtent.height)
+    }
+    if extent.width == 0 || extent.height == 0 { return false }
+    swapchain.*.width = extent.width
+    swapchain.*.height = extent.height
+    // As few images as the surface allows (at least 2): frames are paced by
+    // the display, and fewer queued images mean less input lag.
+    var images = capabilities.minImageCount
+    if images < 2 { images = 2 }
+    if capabilities.maxImageCount != 0 && images > capabilities.maxImageCount { images = capabilities.maxImageCount }
+    if images > MAX_IMAGES { images = MAX_IMAGES }
+    // Android surfaces often only offer "inherit" composition.
+    var alpha = vk.COMPOSITE_ALPHA_OPAQUE_BIT_KHR
+    if capabilities.supportedCompositeAlpha & alpha == 0 { alpha = vk.COMPOSITE_ALPHA_INHERIT_BIT_KHR }
+    if capabilities.supportedCompositeAlpha & alpha == 0 { alpha = vk.COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR }
+    if capabilities.supportedCompositeAlpha & alpha == 0 { alpha = vk.COMPOSITE_ALPHA_POST_MULTIPLIED_BIT_KHR }
+
+    var info = vk.SwapchainCreateInfoKHR.init()
+    info.surface = surface
+    info.minImageCount = images
+    info.imageFormat = swapchain.*.format
+    info.imageColorSpace = vk.ColorSpaceKHR.srgbNonlinear
+    info.imageExtent = extent
+    info.imageArrayLayers = 1
+    info.imageUsage = vk.IMAGE_USAGE_TRANSFER_DST_BIT
+    info.imageSharingMode = vk.SharingMode.exclusive
+    // Android reports the display rotation as currentTransform (ROTATE_90
+    // in landscape) and currentExtent in the window's current orientation.
+    // Passing currentTransform would promise frames already rotated into
+    // the panel's natural orientation, at the swapped size; these frames
+    // are drawn upright, so ask for IDENTITY and let the compositor rotate
+    // them. Android then answers every present with VK_SUBOPTIMAL_KHR,
+    // which present() tells apart from a real size change.
+    info.preTransform = capabilities.currentTransform
+    if capabilities.supportedTransforms & vk.SURFACE_TRANSFORM_IDENTITY_BIT_KHR != 0 { info.preTransform = vk.SURFACE_TRANSFORM_IDENTITY_BIT_KHR }
+    info.compositeAlpha = alpha
+    info.presentMode = vk.PresentModeKHR.fifo
+    info.clipped = vk.TRUE
+    var handle: vk.SwapchainKHR = 0
+    gpu.step(context, "vkCreateSwapchainKHR")
+    if vk.createSwapchainKHR(context.*.commands, context.*.device, &info, null, &handle) != vk.Result.success { return false }
+    swapchain.*.swapchain = handle
+    var count: u32 = MAX_IMAGES
+    var list: [8]vk.Image = [8]vk.Image{ 0, 0, 0, 0, 0, 0, 0, 0 }
+    gpu.step(context, "vkGetSwapchainImagesKHR")
+    unsafe {
+        const listed = vk.getSwapchainImagesKHR(context.*.commands, context.*.device, handle, &count, @ptrCast([*]vk.Image, &list))
+        if listed != vk.Result.success && listed != vk.Result.incomplete { return false }
+    }
+    swapchain.*.images = list
+    swapchain.*.imageCount = count
+
+    var semaphore_info = vk.SemaphoreCreateInfo.init()
+    var semaphore: vk.Semaphore = 0
+    gpu.step(context, "vkCreateSemaphore")
+    if vk.createSemaphore(context.*.commands, context.*.device, &semaphore_info, null, &semaphore) != vk.Result.success { return false }
+    swapchain.*.acquired = semaphore
+    var rendered: [8]vk.Semaphore = [8]vk.Semaphore{ 0, 0, 0, 0, 0, 0, 0, 0 }
+    var image_index: u32 = 0
+    while image_index < count {
+        if vk.createSemaphore(context.*.commands, context.*.device, &semaphore_info, null, &semaphore) != vk.Result.success { return false }
+        rendered[image_index] = semaphore
+        image_index += 1
+    }
+    swapchain.*.rendered = rendered
+    var frame: gpu.Buffer = undefined
+    if !gpu.createBuffer(context, &frame, @intCast(u64, extent.width) * @intCast(u64, extent.height) * 4, false) { return false }
+    swapchain.*.frame = frame
+    swapchain.*.hasFrame = true
+    return true
+}
+
+fn colorRange() -> vk.ImageSubresourceRange {
+    var range = vk.ImageSubresourceRange.init()
+    range.aspectMask = vk.IMAGE_ASPECT_COLOR_BIT
+    range.levelCount = 1
+    range.layerCount = 1
+    return range
+}
+
+fn transition(context: *gpu.Context, image: vk.Image, old: vk.ImageLayout, new: vk.ImageLayout, source_access: vk.AccessFlags, target_access: vk.AccessFlags, source_stage: vk.PipelineStageFlags, target_stage: vk.PipelineStageFlags) -> void {
+    var barrier = vk.ImageMemoryBarrier.init()
+    barrier.srcAccessMask = source_access
+    barrier.dstAccessMask = target_access
+    barrier.oldLayout = old
+    barrier.newLayout = new
+    barrier.srcQueueFamilyIndex = vk.QUEUE_FAMILY_IGNORED
+    barrier.dstQueueFamilyIndex = vk.QUEUE_FAMILY_IGNORED
+    barrier.image = image
+    barrier.subresourceRange = colorRange()
+    vk.cmdPipelineBarrier(context.*.commands, context.*.commandBuffer, source_stage, target_stage, 0, 0, null, 0, null, 1, &barrier)
+}
+
+// Whether the surface no longer has the swapchain's size (a present that
+// returned VK_SUBOPTIMAL_KHR only because of the transform needs no new
+// swapchain). Surfaces that leave the size to the application never change.
+fn sizeChanged(context: *gpu.Context, swapchain: *Swapchain) -> bool {
+    var capabilities = vk.SurfaceCapabilitiesKHR.init()
+    if vk.getPhysicalDeviceSurfaceCapabilitiesKHR(context.*.instanceCommands, context.*.physical, swapchain.*.surface, &capabilities) != vk.Result.success { return true }
+    const extent = capabilities.currentExtent
+    if extent.width == 4294967295 { return false }
+    return extent.width != swapchain.*.width || extent.height != swapchain.*.height
+}
+
+// Renders one pattern frame (the previous one is waited for first; this one
+// runs on the GPU after present returns) (`pattern.width`/`height` are set here),
+// lets `decorate` (a DecorateFn address, or 0) draw over it with `data`,
+// and presents it. out_of_date: recreate the swapchain (the window changed).
+pub fn present(context: *gpu.Context, swapchain: *Swapchain, kernel: *const gpu.Kernel, pattern: shaders.Pattern, decorate: usize, data: usize) -> FrameStatus {
+    var index: u32 = 0
+    // The previous frame is done with the acquire semaphore, the frame
+    // buffer and the command buffer.
+    if !gpu.finishPending(context) { return FrameStatus.failed }
+    gpu.step(context, "vkAcquireNextImageKHR")
+    const acquired = vk.acquireNextImageKHR(context.*.commands, context.*.device, swapchain.*.swapchain, 5000000000, swapchain.*.acquired, 0, &index)
+    if acquired == vk.Result.errorOutOfDateKhr { return FrameStatus.out_of_date }
+    if acquired != vk.Result.success && acquired != vk.Result.suboptimalKhr { return FrameStatus.failed }
+    const image = swapchain.*.images[index]
+    var push = pattern
+    push.width = swapchain.*.width
+    push.height = swapchain.*.height
+    push.flags = push.flags | swapchain.*.formatFlags
+    gpu.step(context, "record the frame")
+    if !gpu.begin(context) { return FrameStatus.failed }
+    var buffers: [1]vk.Buffer = [1]vk.Buffer{ swapchain.*.frame.buffer }
+    unsafe {
+        if !gpu.dispatch(context, kernel, @ptrCast([*]const vk.Buffer, &buffers), &push, gpu.groups(push.width, shaders.GROUP_SIZE), gpu.groups(push.height, shaders.GROUP_SIZE)) { return FrameStatus.failed }
+    }
+    if decorate != 0 {
+        var function: DecorateFn = undefined
+        unsafe { function = @ptrFromInt(DecorateFn, decorate) }
+        if !function(data, context, swapchain) { return FrameStatus.failed }
+    }
+    transition(context, image, vk.ImageLayout.undefined_, vk.ImageLayout.transferDstOptimal, 0, vk.ACCESS_TRANSFER_WRITE_BIT, vk.PIPELINE_STAGE_TRANSFER_BIT, vk.PIPELINE_STAGE_TRANSFER_BIT)
+    var layers = vk.ImageSubresourceLayers.init()
+    layers.aspectMask = vk.IMAGE_ASPECT_COLOR_BIT
+    layers.layerCount = 1
+    var size = vk.Extent3D.init()
+    size.width = swapchain.*.width
+    size.height = swapchain.*.height
+    size.depth = 1
+    var region = vk.BufferImageCopy.init()
+    region.imageSubresource = layers
+    region.imageExtent = size
+    vk.cmdCopyBufferToImage(context.*.commands, context.*.commandBuffer, swapchain.*.frame.buffer, image, vk.ImageLayout.transferDstOptimal, 1, &region)
+    transition(context, image, vk.ImageLayout.transferDstOptimal, vk.ImageLayout.presentSrcKhr, vk.ACCESS_TRANSFER_WRITE_BIT, 0, vk.PIPELINE_STAGE_TRANSFER_BIT, vk.PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT)
+    gpu.step(context, "vkQueueSubmit")
+    // Not waited for: the GPU runs the frame while the caller goes on.
+    const rendered = swapchain.*.rendered[index]
+    if !gpu.submitFrame(context, swapchain.*.acquired, vk.PIPELINE_STAGE_TRANSFER_BIT, rendered) { return FrameStatus.failed }
+
+    var wait = rendered
+    var handle = swapchain.*.swapchain
+    var presented_index = index
+    var info = vk.PresentInfoKHR.init()
+    info.waitSemaphoreCount = 1
+    info.pWaitSemaphores = &wait
+    info.swapchainCount = 1
+    info.pSwapchains = &handle
+    info.pImageIndices = &presented_index
+    gpu.step(context, "vkQueuePresentKHR")
+    const result = vk.queuePresentKHR(context.*.commands, context.*.queue, &info)
+    if result == vk.Result.errorOutOfDateKhr { return FrameStatus.out_of_date }
+    if result == vk.Result.suboptimalKhr {
+        return if sizeChanged(context, swapchain) { FrameStatus.out_of_date } else { FrameStatus.presented }
+    }
+    return if result == vk.Result.success { FrameStatus.presented } else { FrameStatus.failed }
+}
+
+// Destroys the swapchain and its resources; with `keep_surface` the surface
+// stays (to create the next swapchain on it).
+pub fn destroy(context: *gpu.Context, swapchain: *Swapchain, keep_surface: bool) -> void {
+    const idle = vk.deviceWaitIdle(context.*.commands, context.*.device)
+    if swapchain.*.hasFrame {
+        var frame = swapchain.*.frame
+        gpu.destroyBuffer(context, &frame)
+    }
+    if swapchain.*.acquired != 0 { vk.destroySemaphore(context.*.commands, context.*.device, swapchain.*.acquired, null) }
+    var index: u32 = 0
+    while index < MAX_IMAGES {
+        const rendered = swapchain.*.rendered[index]
+        if rendered != 0 { vk.destroySemaphore(context.*.commands, context.*.device, rendered, null) }
+        index += 1
+    }
+    if swapchain.*.swapchain != 0 { vk.destroySwapchainKHR(context.*.commands, context.*.device, swapchain.*.swapchain, null) }
+    if !keep_surface && swapchain.*.surface != 0 { vk.destroySurfaceKHR(context.*.instanceCommands, context.*.instance, swapchain.*.surface, null) }
+    swapchain.*.swapchain = 0
+    swapchain.*.acquired = 0
+    swapchain.*.rendered = [8]vk.Semaphore{ 0, 0, 0, 0, 0, 0, 0, 0 }
+    swapchain.*.hasFrame = false
+}

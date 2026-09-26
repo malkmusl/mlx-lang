@@ -49,6 +49,12 @@ runtime foundation remain independent of libc and Zig dependencies:
 - `backend/x86_64/codegen/` separates mutable backend state from label,
   memory, arithmetic, value, call and control-flow instruction emission;
   `backend/x86_64/codegen.mlx` is the public `Codegen` facade.
+- `backend/aarch64/` is the AArch64 backend with the same module split, plus
+  `codegen/runtime.mlx` (arena, byte mask and the x86_64-to-aarch64 syscall
+  translator). `--target=aarch64-linux` writes an executable through
+  `object/elf64_aarch64.mlx`; `--target=aarch64-android` writes a shared
+  object, or an APK through `object/android/` (manifest, dex, zip, RSA/X.509
+  signing, APK Signature Scheme v2/v3). See `docs/reference/android.md`.
 
 The bootstrap std also provides growing byte and record vectors, string symbol
 maps, arena/fixed/page allocators, Linux files and process arguments, and direct

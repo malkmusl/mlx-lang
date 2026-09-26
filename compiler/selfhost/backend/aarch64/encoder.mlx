@@ -1,0 +1,737 @@
+// AArch64 (A64) machine-code buffer, symbol table and fixups for mlx1.
+//
+// Mirrors backend/x86_64/encoder.mlx: code is appended to a byte buffer,
+// labels and functions are named symbols, and references to them are
+// recorded as fixups resolved once all code is emitted. Every instruction
+// is one little-endian 32-bit word. Instruction encodings are checked
+// against llvm-mc by compiler/selfhost/backend/aarch64/verify_encoder.mlx.
+//
+// Fixups resolve against three kinds of targets: code symbols (functions,
+// block labels, string literals, all in .text), data symbols (a small
+// writable block placed in its own segment), and imports (functions from a
+// shared library, called through a GOT slot the object writer allocates).
+const allocator_module = @import("../../../../std/bootstrap/allocator.mlx")
+const array_list = @import("../../../../std/bootstrap/array_list.mlx")
+const vector = @import("../../../../std/bootstrap/vector.mlx")
+const mem = @import("../../../../std/bootstrap/mem.mlx")
+
+// Registers. x29 is the frame pointer, x30 the link register; register 31
+// is SP or XZR depending on the instruction.
+pub const X0: u32 = 0
+pub const X1: u32 = 1
+pub const X2: u32 = 2
+pub const X3: u32 = 3
+pub const X8: u32 = 8
+pub const X9: u32 = 9
+pub const X10: u32 = 10
+pub const X11: u32 = 11
+pub const X12: u32 = 12
+pub const X16: u32 = 16
+pub const X17: u32 = 17
+pub const FP: u32 = 29
+pub const LR: u32 = 30
+pub const SP: u32 = 31
+pub const ZR: u32 = 31
+
+// Condition codes.
+pub const COND_EQ: u32 = 0
+pub const COND_NE: u32 = 1
+pub const COND_HS: u32 = 2
+pub const COND_LO: u32 = 3
+pub const COND_MI: u32 = 4
+pub const COND_HI: u32 = 8
+pub const COND_LS: u32 = 9
+pub const COND_GE: u32 = 10
+pub const COND_LT: u32 = 11
+pub const COND_GT: u32 = 12
+pub const COND_LE: u32 = 13
+
+pub const FixupKind = enum(u8) { branch26, call26, adrp_add, adrp_ldr_got }
+
+pub const Fixup = struct {
+    kind: FixupKind
+    patchOffset: usize
+    targetPointer: [*]const u8
+    targetLength: usize
+    targetHash: usize
+}
+
+pub const SymbolEntry = struct {
+    namePointer: [*]const u8
+    nameLength: usize
+    offset: usize
+    nameHash: usize
+}
+
+// An imported function: the object writer gives each one a GOT slot and a
+// dynamic relocation; code reaches it with ADRP+LDR+BLR through the slot.
+pub const ImportEntry = struct {
+    namePointer: [*]const u8
+    nameLength: usize
+    nameHash: usize
+}
+
+pub const Encoder = struct {
+    buf: *array_list.ArrayList
+    symbols: *vector.Vector
+    dataSymbols: *vector.Vector
+    imports: *vector.Vector
+    exports: *vector.Vector
+    fixups: *vector.Vector
+    dataSize: usize
+    allocator: allocator_module.Allocator
+    // The function being emitted: after its prologue sp = fp - frameSize,
+    // and spBelow more while a call's stack arguments are reserved. Slots
+    // (fp - slot) within reach are then addressed from sp in one
+    // instruction.
+    frameSize: usize
+    spBelow: usize
+    // The last slot store (it ended at storedEnd) and the last symbol's
+    // position: a load right after that store, of the same slot into the
+    // same register, is left out unless a symbol (a branch target) sits
+    // between them.
+    storedEnd: usize
+    storedSlot: i32
+    storedReg: u32
+    symbolAt: usize
+}
+
+pub fn init(allocator: allocator_module.Allocator) -> Encoder {
+    unsafe {
+        const buf = @ptrCast(*array_list.ArrayList, allocator.alloc(@sizeOf(array_list.ArrayList), @alignOf(array_list.ArrayList)).?)
+        const symbols = @ptrCast(*vector.Vector, allocator.alloc(@sizeOf(vector.Vector), @alignOf(vector.Vector)).?)
+        const data_symbols = @ptrCast(*vector.Vector, allocator.alloc(@sizeOf(vector.Vector), @alignOf(vector.Vector)).?)
+        const imports = @ptrCast(*vector.Vector, allocator.alloc(@sizeOf(vector.Vector), @alignOf(vector.Vector)).?)
+        const exports = @ptrCast(*vector.Vector, allocator.alloc(@sizeOf(vector.Vector), @alignOf(vector.Vector)).?)
+        const fixups = @ptrCast(*vector.Vector, allocator.alloc(@sizeOf(vector.Vector), @alignOf(vector.Vector)).?)
+        array_list.ArrayList.initAt(buf, allocator, 4096)
+        vector.Vector.initAt(symbols, allocator, @sizeOf(SymbolEntry), @alignOf(SymbolEntry), 64)
+        vector.Vector.initAt(data_symbols, allocator, @sizeOf(SymbolEntry), @alignOf(SymbolEntry), 8)
+        vector.Vector.initAt(imports, allocator, @sizeOf(ImportEntry), @alignOf(ImportEntry), 16)
+        vector.Vector.initAt(exports, allocator, @sizeOf(SymbolEntry), @alignOf(SymbolEntry), 8)
+        vector.Vector.initAt(fixups, allocator, @sizeOf(Fixup), @alignOf(Fixup), 64)
+        return Encoder.{
+            .buf = buf,
+            .symbols = symbols,
+            .dataSymbols = data_symbols,
+            .imports = imports,
+            .exports = exports,
+            .fixups = fixups,
+            .dataSize = 0,
+            .allocator = allocator,
+            .frameSize = 0,
+            .spBelow = 0,
+            .storedEnd = 18446744073709551615,
+            .storedSlot = 0,
+            .storedReg = 0,
+            .symbolAt = 18446744073709551615,
+        }
+    }
+}
+
+pub fn deinit(enc: *Encoder) -> void {
+    array_list.ArrayList.deinit(enc.*.buf.*)
+    vector.Vector.deinit(enc.*.symbols.*)
+    vector.Vector.deinit(enc.*.dataSymbols.*)
+    vector.Vector.deinit(enc.*.imports.*)
+    vector.Vector.deinit(enc.*.exports.*)
+    vector.Vector.deinit(enc.*.fixups.*)
+    unsafe {
+        enc.*.allocator.free(@ptrCast([*]u8, enc.*.buf), @sizeOf(array_list.ArrayList), @alignOf(array_list.ArrayList))
+        enc.*.allocator.free(@ptrCast([*]u8, enc.*.symbols), @sizeOf(vector.Vector), @alignOf(vector.Vector))
+        enc.*.allocator.free(@ptrCast([*]u8, enc.*.dataSymbols), @sizeOf(vector.Vector), @alignOf(vector.Vector))
+        enc.*.allocator.free(@ptrCast([*]u8, enc.*.imports), @sizeOf(vector.Vector), @alignOf(vector.Vector))
+        enc.*.allocator.free(@ptrCast([*]u8, enc.*.exports), @sizeOf(vector.Vector), @alignOf(vector.Vector))
+        enc.*.allocator.free(@ptrCast([*]u8, enc.*.fixups), @sizeOf(vector.Vector), @alignOf(vector.Vector))
+    }
+}
+
+pub fn pos(enc: *Encoder) -> usize {
+    return enc.*.buf.*.length
+}
+
+pub fn emit1(enc: *Encoder, b: u8) -> void {
+    const appended = array_list.ArrayList.appendAt(enc.*.buf, b)
+}
+
+pub fn emit32(enc: *Encoder, word: u32) -> void {
+    emit1(enc, @intCast(u8, word & 255))
+    emit1(enc, @intCast(u8, (word >> 8) & 255))
+    emit1(enc, @intCast(u8, (word >> 16) & 255))
+    emit1(enc, @intCast(u8, (word >> 24) & 255))
+}
+
+pub fn wordAt(enc: *Encoder, offset: usize) -> u32 {
+    const items = enc.*.buf.*.items
+    return @intCast(u32, items[offset]) | (@intCast(u32, items[offset + 1]) << 8) | (@intCast(u32, items[offset + 2]) << 16) | (@intCast(u32, items[offset + 3]) << 24)
+}
+
+pub fn patch32(enc: *Encoder, offset: usize, word: u32) -> void {
+    array_list.ArrayList.set(enc.*.buf.*, offset, @intCast(u8, word & 255))
+    array_list.ArrayList.set(enc.*.buf.*, offset + 1, @intCast(u8, (word >> 8) & 255))
+    array_list.ArrayList.set(enc.*.buf.*, offset + 2, @intCast(u8, (word >> 16) & 255))
+    array_list.ArrayList.set(enc.*.buf.*, offset + 3, @intCast(u8, (word >> 24) & 255))
+}
+
+pub fn patch16(enc: *Encoder, offset: usize, value: u32) -> void {
+    array_list.ArrayList.set(enc.*.buf.*, offset, @intCast(u8, value & 255))
+    array_list.ArrayList.set(enc.*.buf.*, offset + 1, @intCast(u8, (value >> 8) & 255))
+}
+
+// Signed byte distance from `from` to `to` for PC-relative branch fields.
+pub fn delta(from: usize, to: usize) -> i32 {
+    return @intCast(i32, to) - @intCast(i32, from)
+}
+
+// Pads the buffer with zero bytes to a multiple of `alignment`.
+pub fn alignTo(enc: *Encoder, alignment: usize) -> void {
+    while pos(enc) % alignment != 0 { emit1(enc, 0) }
+}
+
+fn hashName(pointer: [*]const u8, length: usize) -> usize {
+    var result: usize = 14695981039346656037
+    var index: usize = 0
+    while index < length {
+        result = (result ^ @intCast(usize, pointer[index])) *% 1099511628211
+        index += 1
+    }
+    return result
+}
+
+fn appendSymbol(list: *vector.Vector, name_ptr: [*]const u8, name_len: usize, offset: usize) -> void {
+    const entry = SymbolEntry.{
+        .namePointer = name_ptr,
+        .nameLength = name_len,
+        .offset = offset,
+        .nameHash = hashName(name_ptr, name_len),
+    }
+    unsafe { const appended = vector.Vector.appendAt(list, @ptrCast([*]const u8, &entry)) }
+}
+
+fn findIn(list: *vector.Vector, name_ptr: [*]const u8, name_len: usize, name_hash: usize) -> (bool, usize) {
+    var index: usize = 0
+    while index < list.*.length {
+        unsafe {
+            const entry = @ptrCast(*SymbolEntry, vector.Vector.at(list.*, index))
+            if entry.*.nameHash == name_hash && entry.*.nameLength == name_len && mem.eql(entry.*.namePointer, name_ptr, name_len) {
+                return -> (true, entry.*.offset)
+            }
+        }
+        index += 1
+    }
+    return -> (false, 0)
+}
+
+// A code symbol at the current position.
+pub fn defineSymbol(enc: *Encoder, name_ptr: [*]const u8, name_len: usize) -> void {
+    enc.*.symbolAt = pos(enc)
+    appendSymbol(enc.*.symbols, name_ptr, name_len, pos(enc))
+}
+
+// Reserves `size` bytes (8-byte aligned) in the writable data block.
+pub fn defineDataSymbol(enc: *Encoder, name_ptr: [*]const u8, name_len: usize, size: usize) -> void {
+    appendSymbol(enc.*.dataSymbols, name_ptr, name_len, enc.*.dataSize)
+    enc.*.dataSize += (size + 7) & ~@intCast(usize, 7)
+}
+
+// Marks an already-defined code symbol as exported under `export_name`.
+pub fn exportSymbol(enc: *Encoder, export_ptr: [*]const u8, export_len: usize, offset: usize) -> void {
+    appendSymbol(enc.*.exports, export_ptr, export_len, offset)
+}
+
+pub fn findSymbol(enc: *Encoder, name_ptr: [*]const u8, name_len: usize) -> (bool, usize) {
+    return findIn(enc.*.symbols, name_ptr, name_len, hashName(name_ptr, name_len))
+}
+
+// Records `name` as an import (once) and returns its index.
+pub fn importIndex(enc: *Encoder, name_ptr: [*]const u8, name_len: usize) -> usize {
+    const name_hash = hashName(name_ptr, name_len)
+    var index: usize = 0
+    while index < enc.*.imports.*.length {
+        unsafe {
+            const entry = @ptrCast(*ImportEntry, vector.Vector.at(enc.*.imports.*, index))
+            if entry.*.nameHash == name_hash && entry.*.nameLength == name_len && mem.eql(entry.*.namePointer, name_ptr, name_len) { return index }
+        }
+        index += 1
+    }
+    const entry = ImportEntry.{ .namePointer = name_ptr, .nameLength = name_len, .nameHash = name_hash }
+    unsafe { const appended = vector.Vector.appendAt(enc.*.imports, @ptrCast([*]const u8, &entry)) }
+    return enc.*.imports.*.length - 1
+}
+
+pub fn importCount(enc: *Encoder) -> usize { return enc.*.imports.*.length }
+
+pub fn importAt(enc: *Encoder, index: usize) -> ImportEntry {
+    unsafe { return @ptrCast(*ImportEntry, vector.Vector.at(enc.*.imports.*, index)).* }
+}
+
+pub fn exportCount(enc: *Encoder) -> usize { return enc.*.exports.*.length }
+
+pub fn exportAt(enc: *Encoder, index: usize) -> SymbolEntry {
+    unsafe { return @ptrCast(*SymbolEntry, vector.Vector.at(enc.*.exports.*, index)).* }
+}
+
+pub fn symbolCount(enc: *Encoder) -> usize { return enc.*.symbols.*.length }
+
+pub fn fixupCount(enc: *Encoder) -> usize { return enc.*.fixups.*.length }
+
+// Records a fixup for the instruction(s) about to be emitted at the current
+// position; the caller emits placeholder word(s) right after.
+pub fn addFixup(enc: *Encoder, kind: FixupKind, target_ptr: [*]const u8, target_len: usize) -> void {
+    const fixup = Fixup.{
+        .kind = kind,
+        .patchOffset = pos(enc),
+        .targetPointer = target_ptr,
+        .targetLength = target_len,
+        .targetHash = hashName(target_ptr, target_len),
+    }
+    unsafe { const appended = vector.Vector.appendAt(enc.*.fixups, @ptrCast([*]const u8, &fixup)) }
+}
+
+// Resolves every fixup. `text_vaddr` is where byte 0 of the buffer is
+// loaded, `data_vaddr` where the data block starts, and `got_vaddr` where
+// the GOT (one 8-byte slot per import, in import order) starts. Returns
+// false if a target is neither a code nor a data symbol and, for calls, not
+// an import either.
+pub fn applyFixups(enc: *Encoder, text_vaddr: u64, data_vaddr: u64, got_vaddr: u64) -> bool {
+    var index: usize = 0
+    while index < enc.*.fixups.*.length {
+        var fixup: Fixup = undefined
+        unsafe { fixup = @ptrCast(*Fixup, vector.Vector.at(enc.*.fixups.*, index)).* }
+        const pc: u64 = text_vaddr + @intCast(u64, fixup.patchOffset)
+        const code = findIn(enc.*.symbols, fixup.targetPointer, fixup.targetLength, fixup.targetHash)
+        if fixup.kind == FixupKind.branch26 || fixup.kind == FixupKind.call26 {
+            if !code.0 { return false }
+            const word = wordAt(enc, fixup.patchOffset)
+            patch32(enc, fixup.patchOffset, (word & 0xFC000000) | imm26(pc, text_vaddr + @intCast(u64, code.1)))
+        } else if fixup.kind == FixupKind.adrp_add {
+            var target_address: u64 = 0
+            if code.0 {
+                target_address = text_vaddr + @intCast(u64, code.1)
+            } else {
+                const data = findIn(enc.*.dataSymbols, fixup.targetPointer, fixup.targetLength, fixup.targetHash)
+                if !data.0 { return false }
+                target_address = data_vaddr + @intCast(u64, data.1)
+            }
+            patchAdrp(enc, fixup.patchOffset, pc, target_address)
+            const add_word = wordAt(enc, fixup.patchOffset + 4)
+            patch32(enc, fixup.patchOffset + 4, (add_word & 0xFFC003FF) | (@intCast(u32, target_address & 4095) << 10))
+        } else {
+            const slot_address = got_vaddr + @intCast(u64, importIndex(enc, fixup.targetPointer, fixup.targetLength)) * 8
+            patchAdrp(enc, fixup.patchOffset, pc, slot_address)
+            const ldr_word = wordAt(enc, fixup.patchOffset + 4)
+            patch32(enc, fixup.patchOffset + 4, (ldr_word & 0xFFC003FF) | (@intCast(u32, (slot_address & 4095) / 8) << 10))
+        }
+        index += 1
+    }
+    return true
+}
+
+fn patchAdrp(enc: *Encoder, offset: usize, pc: u64, target_address: u64) -> void {
+    const word = wordAt(enc, offset)
+    patch32(enc, offset, (word & 0x9F00001F) | adrpImmediate(pc, target_address))
+}
+
+fn adrpImmediate(pc: u64, target_address: u64) -> u32 {
+    const pc_page: u64 = pc & 0xFFFFFFFFFFFFF000
+    const target_page: u64 = target_address & 0xFFFFFFFFFFFFF000
+    var pages: u64 = 0
+    if target_page >= pc_page {
+        pages = (target_page - pc_page) >> 12
+    } else {
+        pages = 2097152 - ((pc_page - target_page) >> 12)
+    }
+    const imm21: u32 = @intCast(u32, pages & 0x1FFFFF)
+    return ((imm21 & 3) << 29) | (((imm21 >> 2) & 0x7FFFF) << 5)
+}
+
+fn imm26(pc: u64, target_address: u64) -> u32 {
+    var words: u64 = 0
+    if target_address >= pc {
+        words = (target_address - pc) >> 2
+    } else {
+        words = 67108864 - ((pc - target_address) >> 2)
+    }
+    return @intCast(u32, words & 0x3FFFFFF)
+}
+
+// Name of the first fixup whose target cannot be resolved (for diagnostics).
+pub fn unresolvedFixupPointer(enc: *Encoder) -> [*]const u8 {
+    var index: usize = 0
+    while index < enc.*.fixups.*.length {
+        unsafe {
+            const fixup = @ptrCast(*Fixup, vector.Vector.at(enc.*.fixups.*, index))
+            if fixup.*.kind != FixupKind.adrp_ldr_got && !findIn(enc.*.symbols, fixup.*.targetPointer, fixup.*.targetLength, fixup.*.targetHash).0 && !findIn(enc.*.dataSymbols, fixup.*.targetPointer, fixup.*.targetLength, fixup.*.targetHash).0 { return fixup.*.targetPointer }
+        }
+        index += 1
+    }
+    unsafe { return @ptrFromInt([*]const u8, 0) }
+}
+
+pub fn unresolvedFixupLength(enc: *Encoder) -> usize {
+    var index: usize = 0
+    while index < enc.*.fixups.*.length {
+        unsafe {
+            const fixup = @ptrCast(*Fixup, vector.Vector.at(enc.*.fixups.*, index))
+            if fixup.*.kind != FixupKind.adrp_ldr_got && !findIn(enc.*.symbols, fixup.*.targetPointer, fixup.*.targetLength, fixup.*.targetHash).0 && !findIn(enc.*.dataSymbols, fixup.*.targetPointer, fixup.*.targetLength, fixup.*.targetHash).0 { return fixup.*.targetLength }
+        }
+        index += 1
+    }
+    return 0
+}
+
+// ── Instruction words ─────────────────────────────────────────────────────
+// Register fields are 5 bits; `& 31` keeps a stray value from corrupting
+// neighbouring fields.
+
+pub fn movz(rd: u32, imm16: u32, shift: u32) -> u32 { return 0xD2800000 | ((shift / 16) << 21) | ((imm16 & 0xFFFF) << 5) | (rd & 31) }
+pub fn movk(rd: u32, imm16: u32, shift: u32) -> u32 { return 0xF2800000 | ((shift / 16) << 21) | ((imm16 & 0xFFFF) << 5) | (rd & 31) }
+pub fn movn(rd: u32, imm16: u32, shift: u32) -> u32 { return 0x92800000 | ((shift / 16) << 21) | ((imm16 & 0xFFFF) << 5) | (rd & 31) }
+pub fn movReg(rd: u32, rm: u32) -> u32 { return 0xAA0003E0 | ((rm & 31) << 16) | (rd & 31) }
+pub fn addImm(rd: u32, rn: u32, imm12: u32) -> u32 { return 0x91000000 | ((imm12 & 0xFFF) << 10) | ((rn & 31) << 5) | (rd & 31) }
+pub fn subImm(rd: u32, rn: u32, imm12: u32) -> u32 { return 0xD1000000 | ((imm12 & 0xFFF) << 10) | ((rn & 31) << 5) | (rd & 31) }
+pub fn subImmShifted(rd: u32, rn: u32, imm12: u32) -> u32 { return 0xD1400000 | ((imm12 & 0xFFF) << 10) | ((rn & 31) << 5) | (rd & 31) }
+pub fn addReg(rd: u32, rn: u32, rm: u32) -> u32 { return 0x8B000000 | ((rm & 31) << 16) | ((rn & 31) << 5) | (rd & 31) }
+pub fn subReg(rd: u32, rn: u32, rm: u32) -> u32 { return 0xCB000000 | ((rm & 31) << 16) | ((rn & 31) << 5) | (rd & 31) }
+pub fn mul(rd: u32, rn: u32, rm: u32) -> u32 { return 0x9B007C00 | ((rm & 31) << 16) | ((rn & 31) << 5) | (rd & 31) }
+pub fn msub(rd: u32, rn: u32, rm: u32, ra: u32) -> u32 { return 0x9B008000 | ((rm & 31) << 16) | ((ra & 31) << 10) | ((rn & 31) << 5) | (rd & 31) }
+pub fn sdiv(rd: u32, rn: u32, rm: u32) -> u32 { return 0x9AC00C00 | ((rm & 31) << 16) | ((rn & 31) << 5) | (rd & 31) }
+pub fn udiv(rd: u32, rn: u32, rm: u32) -> u32 { return 0x9AC00800 | ((rm & 31) << 16) | ((rn & 31) << 5) | (rd & 31) }
+pub fn andReg(rd: u32, rn: u32, rm: u32) -> u32 { return 0x8A000000 | ((rm & 31) << 16) | ((rn & 31) << 5) | (rd & 31) }
+pub fn orrReg(rd: u32, rn: u32, rm: u32) -> u32 { return 0xAA000000 | ((rm & 31) << 16) | ((rn & 31) << 5) | (rd & 31) }
+pub fn eorReg(rd: u32, rn: u32, rm: u32) -> u32 { return 0xCA000000 | ((rm & 31) << 16) | ((rn & 31) << 5) | (rd & 31) }
+pub fn lslv(rd: u32, rn: u32, rm: u32) -> u32 { return 0x9AC02000 | ((rm & 31) << 16) | ((rn & 31) << 5) | (rd & 31) }
+pub fn lsrv(rd: u32, rn: u32, rm: u32) -> u32 { return 0x9AC02400 | ((rm & 31) << 16) | ((rn & 31) << 5) | (rd & 31) }
+pub fn asrv(rd: u32, rn: u32, rm: u32) -> u32 { return 0x9AC02800 | ((rm & 31) << 16) | ((rn & 31) << 5) | (rd & 31) }
+pub fn cmpReg(rn: u32, rm: u32) -> u32 { return 0xEB00001F | ((rm & 31) << 16) | ((rn & 31) << 5) }
+pub fn cmpImm(rn: u32, imm12: u32) -> u32 { return 0xF100001F | ((imm12 & 0xFFF) << 10) | ((rn & 31) << 5) }
+pub fn cmpRegW(rn: u32, rm: u32) -> u32 { return 0x6B00001F | ((rm & 31) << 16) | ((rn & 31) << 5) }
+// CSET Xd, cond == CSINC Xd, XZR, XZR, invert(cond).
+pub fn cset(rd: u32, cond: u32) -> u32 { return 0x9A9F07E0 | (((cond ^ 1) & 15) << 12) | (rd & 31) }
+pub fn uxtb(rd: u32, rn: u32) -> u32 { return 0x53001C00 | ((rn & 31) << 5) | (rd & 31) }
+
+// Loads/stores with an unsigned, size-scaled 12-bit offset.
+pub fn ldrX(rt: u32, rn: u32, offset: u32) -> u32 { return 0xF9400000 | (((offset / 8) & 0xFFF) << 10) | ((rn & 31) << 5) | (rt & 31) }
+pub fn strX(rt: u32, rn: u32, offset: u32) -> u32 { return 0xF9000000 | (((offset / 8) & 0xFFF) << 10) | ((rn & 31) << 5) | (rt & 31) }
+pub fn ldrW(rt: u32, rn: u32, offset: u32) -> u32 { return 0xB9400000 | (((offset / 4) & 0xFFF) << 10) | ((rn & 31) << 5) | (rt & 31) }
+pub fn strW(rt: u32, rn: u32, offset: u32) -> u32 { return 0xB9000000 | (((offset / 4) & 0xFFF) << 10) | ((rn & 31) << 5) | (rt & 31) }
+pub fn ldrH(rt: u32, rn: u32) -> u32 { return 0x79400000 | ((rn & 31) << 5) | (rt & 31) }
+pub fn strH(rt: u32, rn: u32) -> u32 { return 0x79000000 | ((rn & 31) << 5) | (rt & 31) }
+pub fn ldrB(rt: u32, rn: u32) -> u32 { return 0x39400000 | ((rn & 31) << 5) | (rt & 31) }
+pub fn strB(rt: u32, rn: u32) -> u32 { return 0x39000000 | ((rn & 31) << 5) | (rt & 31) }
+pub fn ldrsw(rt: u32, rn: u32) -> u32 { return 0xB9800000 | ((rn & 31) << 5) | (rt & 31) }
+pub fn ldrsh(rt: u32, rn: u32) -> u32 { return 0x79800000 | ((rn & 31) << 5) | (rt & 31) }
+pub fn ldrsb(rt: u32, rn: u32) -> u32 { return 0x39800000 | ((rn & 31) << 5) | (rt & 31) }
+// LDRB Wt, [Xn, Xm]
+pub fn ldrbReg(rt: u32, rn: u32, rm: u32) -> u32 { return 0x38606800 | ((rm & 31) << 16) | ((rn & 31) << 5) | (rt & 31) }
+// Unscaled signed 9-bit offset forms (LDUR/STUR), X and FP S/D registers.
+pub fn ldurX(rt: u32, rn: u32, offset: i32) -> u32 { return 0xF8400000 | (imm9(offset) << 12) | ((rn & 31) << 5) | (rt & 31) }
+pub fn sturX(rt: u32, rn: u32, offset: i32) -> u32 { return 0xF8000000 | (imm9(offset) << 12) | ((rn & 31) << 5) | (rt & 31) }
+pub fn ldurD(rt: u32, rn: u32, offset: i32) -> u32 { return 0xFC400000 | (imm9(offset) << 12) | ((rn & 31) << 5) | (rt & 31) }
+pub fn sturD(rt: u32, rn: u32, offset: i32) -> u32 { return 0xFC000000 | (imm9(offset) << 12) | ((rn & 31) << 5) | (rt & 31) }
+pub fn ldurS(rt: u32, rn: u32, offset: i32) -> u32 { return 0xBC400000 | (imm9(offset) << 12) | ((rn & 31) << 5) | (rt & 31) }
+pub fn sturS(rt: u32, rn: u32, offset: i32) -> u32 { return 0xBC000000 | (imm9(offset) << 12) | ((rn & 31) << 5) | (rt & 31) }
+pub fn ldrD(rt: u32, rn: u32) -> u32 { return 0xFD400000 | ((rn & 31) << 5) | (rt & 31) }
+pub fn strD(rt: u32, rn: u32) -> u32 { return 0xFD000000 | ((rn & 31) << 5) | (rt & 31) }
+pub fn ldrS(rt: u32, rn: u32) -> u32 { return 0xBD400000 | ((rn & 31) << 5) | (rt & 31) }
+pub fn strS(rt: u32, rn: u32) -> u32 { return 0xBD000000 | ((rn & 31) << 5) | (rt & 31) }
+// The same with a byte offset: a multiple of the access size, at most
+// 4095 times it (32760 for d, 16380 for s).
+pub fn ldrDOffset(rt: u32, rn: u32, offset: u32) -> u32 { return 0xFD400000 | (((offset / 8) & 0xFFF) << 10) | ((rn & 31) << 5) | (rt & 31) }
+pub fn strDOffset(rt: u32, rn: u32, offset: u32) -> u32 { return 0xFD000000 | (((offset / 8) & 0xFFF) << 10) | ((rn & 31) << 5) | (rt & 31) }
+pub fn ldrSOffset(rt: u32, rn: u32, offset: u32) -> u32 { return 0xBD400000 | (((offset / 4) & 0xFFF) << 10) | ((rn & 31) << 5) | (rt & 31) }
+pub fn strSOffset(rt: u32, rn: u32, offset: u32) -> u32 { return 0xBD000000 | (((offset / 4) & 0xFFF) << 10) | ((rn & 31) << 5) | (rt & 31) }
+
+fn imm9(offset: i32) -> u32 {
+    if offset >= 0 { return @intCast(u32, offset) & 0x1FF }
+    return @intCast(u32, offset + 512) & 0x1FF
+}
+
+pub const STP_FP_LR_PRE: u32 = 0xA9BF7BFD // stp x29, x30, [sp, #-16]!
+pub const LDP_FP_LR_POST: u32 = 0xA8C17BFD // ldp x29, x30, [sp], #16
+pub const MOV_FP_SP: u32 = 0x910003FD // mov x29, sp
+pub const MOV_SP_FP: u32 = 0x910003BF // mov sp, x29
+pub const SUB_SP_SP_X16: u32 = 0xCB3063FF // sub sp, sp, x16
+pub const ADD_SP_SP_X16: u32 = 0x8B3063FF // add sp, sp, x16
+pub const RET: u32 = 0xD65F03C0
+pub const SVC0: u32 = 0xD4000001
+pub const BRK0: u32 = 0xD4200000
+pub const UDF0: u32 = 0x00000000 // permanently undefined: SIGILL, like x86 ud2
+
+pub fn blr(rn: u32) -> u32 { return 0xD63F0000 | ((rn & 31) << 5) }
+pub fn cbzX(rt: u32, byte_delta: i32) -> u32 { return 0xB4000000 | (imm19(byte_delta) << 5) | (rt & 31) }
+pub fn cbnzX(rt: u32, byte_delta: i32) -> u32 { return 0xB5000000 | (imm19(byte_delta) << 5) | (rt & 31) }
+pub fn cbnzW(rt: u32, byte_delta: i32) -> u32 { return 0x35000000 | (imm19(byte_delta) << 5) | (rt & 31) }
+pub fn bCond(cond: u32, byte_delta: i32) -> u32 { return 0x54000000 | (imm19(byte_delta) << 5) | (cond & 15) }
+pub fn b(byte_delta: i32) -> u32 {
+    const words: i32 = byte_delta / 4
+    if words >= 0 { return 0x14000000 | (@intCast(u32, words) & 0x3FFFFFF) }
+    return 0x14000000 | (@intCast(u32, words + 67108864) & 0x3FFFFFF)
+}
+
+fn imm19(byte_delta: i32) -> u32 {
+    const words: i32 = byte_delta / 4
+    if words >= 0 { return @intCast(u32, words) & 0x7FFFF }
+    return @intCast(u32, words + 524288) & 0x7FFFF
+}
+
+// Floating point; `bits` is 32 (S registers) or 64 (D registers).
+fn fpType(bits: usize) -> u32 { return if bits == 32 { 0 } else { 0x400000 } }
+pub fn fadd(rd: u32, rn: u32, rm: u32, bits: usize) -> u32 { return 0x1E202800 | fpType(bits) | ((rm & 31) << 16) | ((rn & 31) << 5) | (rd & 31) }
+pub fn fsub(rd: u32, rn: u32, rm: u32, bits: usize) -> u32 { return 0x1E203800 | fpType(bits) | ((rm & 31) << 16) | ((rn & 31) << 5) | (rd & 31) }
+pub fn fmul(rd: u32, rn: u32, rm: u32, bits: usize) -> u32 { return 0x1E200800 | fpType(bits) | ((rm & 31) << 16) | ((rn & 31) << 5) | (rd & 31) }
+pub fn fdiv(rd: u32, rn: u32, rm: u32, bits: usize) -> u32 { return 0x1E201800 | fpType(bits) | ((rm & 31) << 16) | ((rn & 31) << 5) | (rd & 31) }
+pub fn fcmp(rn: u32, rm: u32, bits: usize) -> u32 { return 0x1E202000 | fpType(bits) | ((rm & 31) << 16) | ((rn & 31) << 5) }
+// FCVT between single and double: source width `source_bits`.
+pub fn fcvt(rd: u32, rn: u32, source_bits: usize) -> u32 {
+    if source_bits == 32 { return 0x1E22C000 | ((rn & 31) << 5) | (rd & 31) }
+    return 0x1E624000 | ((rn & 31) << 5) | (rd & 31)
+}
+// SCVTF from a 64-bit signed integer; FCVTZS to a 64-bit signed integer.
+pub fn scvtf(rd: u32, rn: u32, bits: usize) -> u32 { return 0x9E220000 | fpType(bits) | ((rn & 31) << 5) | (rd & 31) }
+pub fn fcvtzs(rd: u32, rn: u32, bits: usize) -> u32 { return 0x9E380000 | fpType(bits) | ((rn & 31) << 5) | (rd & 31) }
+// FMOV Dd, Xn and FMOV Xd, Dn (raw bit moves).
+pub fn fmovToFp(rd: u32, rn: u32) -> u32 { return 0x9E670000 | ((rn & 31) << 5) | (rd & 31) }
+pub fn fmovFromFp(rd: u32, rn: u32) -> u32 { return 0x9E660000 | ((rn & 31) << 5) | (rd & 31) }
+// CNT Vd.8B, Vn.8B; ADDV Bd, Vn.8B; UMOV Wd, Vn.B[0].
+pub fn cnt8b(rd: u32, rn: u32) -> u32 { return 0x0E205800 | ((rn & 31) << 5) | (rd & 31) }
+pub fn addv8b(rd: u32, rn: u32) -> u32 { return 0x0E31B800 | ((rn & 31) << 5) | (rd & 31) }
+pub fn umovB0(rd: u32, rn: u32) -> u32 { return 0x0E013C00 | ((rn & 31) << 5) | (rd & 31) }
+// LDXR Xt, [Xn]; STXR Ws, Xt, [Xn].
+pub fn ldxr(rt: u32, rn: u32) -> u32 { return 0xC85F7C00 | ((rn & 31) << 5) | (rt & 31) }
+pub fn stxr(rs: u32, rt: u32, rn: u32) -> u32 { return 0xC8007C00 | ((rs & 31) << 16) | ((rn & 31) << 5) | (rt & 31) }
+// LDAR Xt, [Xn]; STLXR Ws, Xt, [Xn] (acquire/release forms).
+pub fn ldar(rt: u32, rn: u32) -> u32 { return 0xC8DFFC00 | ((rn & 31) << 5) | (rt & 31) }
+pub fn stlxr(rs: u32, rt: u32, rn: u32) -> u32 { return 0xC800FC00 | ((rs & 31) << 16) | ((rn & 31) << 5) | (rt & 31) }
+pub fn adrp(rd: u32) -> u32 { return 0x90000000 | (rd & 31) }
+pub fn br(rn: u32) -> u32 { return 0xD61F0000 | ((rn & 31) << 5) }
+// LSL/LSR Xd, Xn, #shift (UBFM aliases), shift in 1..63.
+pub fn lslImm(rd: u32, rn: u32, shift: u32) -> u32 { return 0xD3400000 | (((64 - shift) & 63) << 16) | ((63 - shift) << 10) | ((rn & 31) << 5) | (rd & 31) }
+pub fn lsrImm(rd: u32, rn: u32, shift: u32) -> u32 { return 0xD340FC00 | ((shift & 63) << 16) | ((rn & 31) << 5) | (rd & 31) }
+// SBFM/UBFM Xd, Xn, #0, #(bits - 1): sign- or zero-extend the low `bits`
+// bits (1..63) of Xn into Xd (SXTB/SXTH/SXTW and UXTB/UXTH/UXTW for 8/16/32).
+pub fn sbfmLow(rd: u32, rn: u32, bits: u32) -> u32 { return 0x93400000 | (((bits - 1) & 63) << 10) | ((rn & 31) << 5) | (rd & 31) }
+pub fn ubfmLow(rd: u32, rn: u32, bits: u32) -> u32 { return 0xD3400000 | (((bits - 1) & 63) << 10) | ((rn & 31) << 5) | (rd & 31) }
+// LDRH Wt, [Xn, Xm, LSL #1]
+pub fn ldrhReg(rt: u32, rn: u32, rm: u32) -> u32 { return 0x78607800 | ((rm & 31) << 16) | ((rn & 31) << 5) | (rt & 31) }
+// TBZ/TBNZ Rt, #bit, label (bit 0..63).
+pub fn tbz(rt: u32, bit: u32, byte_delta: i32) -> u32 { return 0x36000000 | ((bit >> 5) << 31) | ((bit & 31) << 19) | (imm14(byte_delta) << 5) | (rt & 31) }
+pub fn tbnz(rt: u32, bit: u32, byte_delta: i32) -> u32 { return 0x37000000 | ((bit >> 5) << 31) | ((bit & 31) << 19) | (imm14(byte_delta) << 5) | (rt & 31) }
+
+fn imm14(byte_delta: i32) -> u32 {
+    const words: i32 = byte_delta / 4
+    if words >= 0 { return @intCast(u32, words) & 0x3FFF }
+    return @intCast(u32, words + 16384) & 0x3FFF
+}
+
+// ── Emission helpers ──────────────────────────────────────────────────────
+
+// Materializes any 64-bit constant: MOVZ + MOVK over the non-zero 16-bit
+// chunks, or MOVN + MOVK over the chunks that are not 0xFFFF when that is
+// shorter (small negative numbers, inverted masks).
+pub fn emitLoadImm(enc: *Encoder, rd: u32, value: u64) -> void {
+    var zero_chunks: u32 = 0
+    var ones_chunks: u32 = 0
+    var shift: u32 = 0
+    while shift < 64 {
+        const chunk: u64 = (value >> @intCast(u64, shift)) & 0xFFFF
+        if chunk == 0 { zero_chunks += 1 }
+        if chunk == 0xFFFF { ones_chunks += 1 }
+        shift += 16
+    }
+    const inverted = ones_chunks > zero_chunks
+    var first = true
+    shift = 0
+    while shift < 64 {
+        const chunk: u32 = @intCast(u32, (value >> @intCast(u64, shift)) & 0xFFFF)
+        const skip = if inverted { chunk == 0xFFFF } else { chunk == 0 }
+        if !skip {
+            if first {
+                emit32(enc, if inverted { movn(rd, (~chunk) & 0xFFFF, shift) } else { movz(rd, chunk, shift) })
+                first = false
+            } else {
+                emit32(enc, movk(rd, chunk, shift))
+            }
+        }
+        shift += 16
+    }
+    if first { emit32(enc, if inverted { movn(rd, 0, 0) } else { movz(rd, 0, 0) }) }
+}
+
+// Address of the frame slot `slot` bytes below x29 into `rd`.
+pub fn emitSlotAddress(enc: *Encoder, rd: u32, slot: i32) -> void {
+    if slot < 0 {
+        // Negative "slots" address the caller's frame (incoming stack arguments).
+        emitLoadImm(enc, X17, @intCast(u64, 0 - slot))
+        emit32(enc, addReg(rd, FP, X17))
+        return
+    }
+    if slot < 4096 {
+        emit32(enc, subImm(rd, FP, @intCast(u32, slot)))
+        return
+    }
+    emitLoadImm(enc, X17, @intCast(u64, slot))
+    emit32(enc, subReg(rd, FP, X17))
+}
+
+fn slotFitsUnscaled(slot: i32) -> bool { return slot > 0 && slot <= 256 }
+
+// The slot's offset above sp when a scaled unsigned 12-bit immediate
+// reaches it (8-byte multiples up to 32760) and it lies inside the frame.
+fn slotFromSp(enc: *Encoder, slot: i32) -> (bool, u32) {
+    if slot <= 0 || @intCast(usize, slot) > enc.*.frameSize { return -> (false, 0) }
+    const offset = enc.*.frameSize - @intCast(usize, slot) + enc.*.spBelow
+    if offset % 8 != 0 || offset > 32760 { return -> (false, 0) }
+    return -> (true, @intCast(u32, offset))
+}
+
+// Sets up slot addressing for a function whose prologue reserved `size`.
+pub fn beginFrame(enc: *Encoder, size: usize) -> void {
+    enc.*.frameSize = size
+    enc.*.spBelow = 0
+}
+
+// sp moved `bytes` down (reserve) or back up around a call's stack
+// arguments.
+pub fn adjustSpBelow(enc: *Encoder, bytes: usize, reserve: bool) -> void {
+    if reserve { enc.*.spBelow = enc.*.spBelow + bytes } else { enc.*.spBelow = enc.*.spBelow - bytes }
+}
+
+pub fn emitLoadSlot(enc: *Encoder, rt: u32, slot: i32) -> void {
+    // The value is still in rt: the slot was stored from it just before.
+    if enc.*.storedEnd == pos(enc) && enc.*.symbolAt != pos(enc) && enc.*.storedSlot == slot && enc.*.storedReg == rt { return }
+    if slotFitsUnscaled(slot) {
+        emit32(enc, ldurX(rt, FP, 0 - slot))
+        return
+    }
+    const from_sp = slotFromSp(enc, slot)
+    if from_sp.0 {
+        emit32(enc, ldrX(rt, SP, from_sp.1))
+        return
+    }
+    emitSlotAddress(enc, X17, slot)
+    emit32(enc, ldrX(rt, X17, 0))
+}
+
+pub fn emitStoreSlot(enc: *Encoder, slot: i32, rt: u32) -> void {
+    if slotFitsUnscaled(slot) {
+        emit32(enc, sturX(rt, FP, 0 - slot))
+    } else {
+        const from_sp = slotFromSp(enc, slot)
+        if from_sp.0 {
+            emit32(enc, strX(rt, SP, from_sp.1))
+        } else {
+            emitSlotAddress(enc, X17, slot)
+            emit32(enc, strX(rt, X17, 0))
+        }
+    }
+    enc.*.storedEnd = pos(enc)
+    enc.*.storedSlot = slot
+    enc.*.storedReg = rt
+}
+
+pub fn emitLoadSlotFp(enc: *Encoder, vt: u32, slot: i32, bits: usize) -> void {
+    if slotFitsUnscaled(slot) {
+        emit32(enc, if bits == 32 { ldurS(vt, FP, 0 - slot) } else { ldurD(vt, FP, 0 - slot) })
+        return
+    }
+    const from_sp = slotFromSp(enc, slot)
+    // A 32-bit float's offset is scaled by 4: it reaches 16380 bytes.
+    if from_sp.0 && (bits != 32 || from_sp.1 <= 16380) {
+        emit32(enc, if bits == 32 { ldrSOffset(vt, SP, from_sp.1) } else { ldrDOffset(vt, SP, from_sp.1) })
+        return
+    }
+    emitSlotAddress(enc, X17, slot)
+    emit32(enc, if bits == 32 { ldrS(vt, X17) } else { ldrD(vt, X17) })
+}
+
+pub fn emitStoreSlotFp(enc: *Encoder, slot: i32, vt: u32, bits: usize) -> void {
+    if slotFitsUnscaled(slot) {
+        emit32(enc, if bits == 32 { sturS(vt, FP, 0 - slot) } else { sturD(vt, FP, 0 - slot) })
+        return
+    }
+    const from_sp = slotFromSp(enc, slot)
+    if from_sp.0 && (bits != 32 || from_sp.1 <= 16380) {
+        emit32(enc, if bits == 32 { strSOffset(vt, SP, from_sp.1) } else { strDOffset(vt, SP, from_sp.1) })
+        return
+    }
+    emitSlotAddress(enc, X17, slot)
+    emit32(enc, if bits == 32 { strS(vt, X17) } else { strD(vt, X17) })
+}
+
+// Canonicalizes an integer narrower than 64 bits in `reg`: C code leaves
+// the bits above a narrow argument or result unspecified (AAPCS64).
+pub fn emitExtend(enc: *Encoder, reg: u32, bits: usize, signed: bool) -> void {
+    if bits == 0 || bits >= 64 { return }
+    emit32(enc, if signed { sbfmLow(reg, reg, @intCast(u32, bits)) } else { ubfmLow(reg, reg, @intCast(u32, bits)) })
+}
+
+// Loads `width` bytes from [pointer] into rt (zero- or sign-extended).
+pub fn emitLoadPointer(enc: *Encoder, rt: u32, pointer: u32, width: usize, signed: bool) -> void {
+    if width == 1 { emit32(enc, if signed { ldrsb(rt, pointer) } else { ldrB(rt, pointer) }) } else if width == 2 { emit32(enc, if signed { ldrsh(rt, pointer) } else { ldrH(rt, pointer) }) } else if width == 4 { emit32(enc, if signed { ldrsw(rt, pointer) } else { ldrW(rt, pointer, 0) }) } else { emit32(enc, ldrX(rt, pointer, 0)) }
+}
+
+pub fn emitStorePointer(enc: *Encoder, pointer: u32, rt: u32, width: usize) -> void {
+    if width == 1 { emit32(enc, strB(rt, pointer)) } else if width == 2 { emit32(enc, strH(rt, pointer)) } else if width == 4 { emit32(enc, strW(rt, pointer, 0)) } else { emit32(enc, strX(rt, pointer, 0)) }
+}
+
+// Branch to a named code symbol (resolved by applyFixups).
+pub fn emitBranchTo(enc: *Encoder, name_ptr: [*]const u8, name_len: usize) -> void {
+    addFixup(enc, FixupKind.branch26, name_ptr, name_len)
+    emit32(enc, 0x14000000)
+}
+
+// Conditional branch to a named symbol: B.<inverse> over an unconditional
+// B, so the target may be anywhere within B's +-128 MiB range.
+pub fn emitBranchCondTo(enc: *Encoder, cond: u32, name_ptr: [*]const u8, name_len: usize) -> void {
+    emit32(enc, bCond(cond ^ 1, 8))
+    emitBranchTo(enc, name_ptr, name_len)
+}
+
+pub fn emitCallTo(enc: *Encoder, name_ptr: [*]const u8, name_len: usize) -> void {
+    addFixup(enc, FixupKind.call26, name_ptr, name_len)
+    emit32(enc, 0x94000000)
+}
+
+// Call to an imported function through its GOT slot.
+pub fn emitImportCall(enc: *Encoder, name_ptr: [*]const u8, name_len: usize) -> void {
+    const recorded = importIndex(enc, name_ptr, name_len)
+    addFixup(enc, FixupKind.adrp_ldr_got, name_ptr, name_len)
+    emit32(enc, adrp(X16))
+    emit32(enc, ldrX(X16, X16, 0))
+    emit32(enc, blr(X16))
+}
+
+// Address of an imported function (its GOT slot's contents) into rd.
+pub fn emitImportAddress(enc: *Encoder, rd: u32, name_ptr: [*]const u8, name_len: usize) -> void {
+    const recorded = importIndex(enc, name_ptr, name_len)
+    addFixup(enc, FixupKind.adrp_ldr_got, name_ptr, name_len)
+    emit32(enc, adrp(rd))
+    emit32(enc, ldrX(rd, rd, 0))
+}
+
+// Address of a named code or data symbol into rd.
+pub fn emitAddressOf(enc: *Encoder, rd: u32, name_ptr: [*]const u8, name_len: usize) -> void {
+    addFixup(enc, FixupKind.adrp_add, name_ptr, name_len)
+    emit32(enc, adrp(rd))
+    emit32(enc, addImm(rd, rd, 0))
+}
+
+// Reserves a frame of `size` bytes below the saved x29/x30 pair.
+pub fn emitPrologue(enc: *Encoder, size: usize) -> void {
+    beginFrame(enc, size)
+    emit32(enc, STP_FP_LR_PRE)
+    emit32(enc, MOV_FP_SP)
+    if size < 4096 {
+        emit32(enc, subImm(SP, SP, @intCast(u32, size)))
+    } else {
+        emitLoadImm(enc, X16, @intCast(u64, size))
+        emit32(enc, SUB_SP_SP_X16)
+    }
+}
+
+pub fn emitEpilogue(enc: *Encoder) -> void {
+    emit32(enc, MOV_SP_FP)
+    emit32(enc, LDP_FP_LR_POST)
+    emit32(enc, RET)
+}

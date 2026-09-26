@@ -1,0 +1,395 @@
+// Input devices for the DRM backend: keyboards, mice and touchpads read
+// straight from their evdev nodes (/dev/input/eventN), turned into the
+// same calls the nested compositor makes for its host's input
+// (shell.pointerMotion, pointerButton, pointerAxis, keyboardKey,
+// keyboardModifiers).
+//
+// - Keyboards: key presses and releases (the clients repeat keys
+//   themselves); xkb.mlx follows the modifiers.
+// - Mice: relative motion with a little acceleration, buttons, wheels
+//   (one notch scrolls 15 pixels).
+// - Touchpads (absolute, not a touchscreen): one finger moves the pointer
+//   (scaled by the pad's resolution, about 4 pixels per millimetre), two
+//   fingers scroll (natural direction: the content follows the fingers),
+//   a physical click is a left click (a right click with two fingers on
+//   the pad), and a short tap without moving clicks (two fingers: right).
+//
+// Layouts are <linux/input.h>'s on 64-bit Linux: struct input_event is 24
+// bytes (time, u16 type, u16 code, s32 value).
+
+const std = @import("std")
+const wl = @import("std.wayland")
+const state = @import("./state.mlx")
+const shell = @import("./shell.mlx")
+const device = @import("./device.mlx")
+const xkb = @import("./xkb.mlx")
+
+const Compositor = state.Compositor
+const Allocator = std.allocator.Allocator
+
+const EV_SYN: u32 = 0
+const EV_KEY: u32 = 1
+const EV_REL: u32 = 2
+const EV_ABS: u32 = 3
+const SYN_REPORT: u32 = 0
+const REL_X: u32 = 0
+const REL_Y: u32 = 1
+const REL_HWHEEL: u32 = 6
+const REL_WHEEL: u32 = 8
+const ABS_X: u32 = 0
+const ABS_Y: u32 = 1
+const KEY_A: usize = 30
+const KEY_SPACE: usize = 57
+const BTN_LEFT: u32 = 272
+const BTN_RIGHT: u32 = 273
+const BTN_TASK: u32 = 279
+const BTN_TOOL_FINGER: u32 = 325
+const BTN_TOUCH: u32 = 330
+const BTN_TOOL_DOUBLETAP: u32 = 333
+const BTN_TOOL_TRIPLETAP: u32 = 334
+const BTN_TOOL_QUADTAP: u32 = 335
+const INPUT_PROP_DIRECT: usize = 1
+const INPUT_PROP_BUTTONPAD: usize = 2
+
+// Touchpad tuning: pixels per millimetre (in 1/256), the longest tap and
+// the farthest a tap may move.
+const PAD_SPEED: i32 = 1024
+const TAP_MILLISECONDS: usize = 180
+const TAP_TRAVEL_MM: i32 = 3
+const WHEEL_STEP: i32 = 15
+
+// EVIOCG* requests: _IOC(_IOC_READ, 'E', number, size).
+fn readRequest(number: usize, size: usize) -> usize { return 2147483648 + size * 65536 + 17664 + number }
+fn bitsRequest(kind: usize, size: usize) -> usize { return readRequest(32 + kind, size) }
+
+pub const Input = struct {
+    device: device.Device
+    major: u32
+    minor: u32
+    keyboard: bool
+    pointer: bool
+    touchpad: bool
+    buttonpad: bool
+    // Motion and wheels of the report being read.
+    dx: i32
+    dy: i32
+    wheel: i32
+    hwheel: i32
+    // Touchpad: units per millimetre, the finger's position (now and at
+    // the last report), fingers on the pad, the touch so far.
+    resolution: i32
+    x: i32
+    y: i32
+    lastX: i32
+    lastY: i32
+    hasLast: bool
+    touching: bool
+    fingers: u32
+    maxFingers: u32
+    touchStart: usize
+    travel: i32
+    scrolled: bool
+    clicked: bool
+    pressedButton: u32
+    carryX: i32
+    carryY: i32
+    name: [64]u8
+}
+
+fn deviceOf(input: *Input) -> *device.Device {
+    unsafe { return @ptrFromInt(*device.Device, @intFromPtr(input) + @offsetOf(Input, "device")) }
+}
+
+fn nameOf(input: *Input) -> [*]u8 {
+    unsafe { return @ptrFromInt([*]u8, @intFromPtr(input) + @offsetOf(Input, "name")) }
+}
+
+fn hasBit(bits: [*]const u8, bit: usize) -> bool {
+    return (bits[bit / 8] >> @intCast(u8, bit % 8)) & 1 != 0
+}
+
+fn now() -> usize {
+    var time: [16]u8 = undefined
+    var bytes: [*]u8 = undefined
+    unsafe { bytes = @ptrCast([*]u8, &time) }
+    const result = std.linux.syscall2(228, 1, @intFromPtr(bytes))
+    return device.load64(bytes, 0) * 1000 + device.load64(bytes, 8) / 1000000
+}
+
+// Sets up an input device on `descriptor` (owned from now on) and finds
+// out what it is. False when it is none of keyboard, mouse or touchpad
+// (the caller then closes it with close()).
+pub fn open(input: *Input, descriptor: isize, major: u32, minor: u32, allocator: Allocator) -> bool {
+    device.init(deviceOf(input), descriptor, allocator)
+    if !deviceOf(input).*.emulated {
+        // Reads must never wait.
+        const flags = std.linux.syscall2(72, @bitCast(usize, descriptor), 3)
+        if flags >= 0 { const set = std.linux.syscall3(72, @bitCast(usize, descriptor), 4, @bitCast(usize, flags) | device.O_NONBLOCK) }
+    }
+    input.*.major = major
+    input.*.minor = minor
+    input.*.keyboard = false
+    input.*.pointer = false
+    input.*.touchpad = false
+    input.*.buttonpad = false
+    input.*.dx = 0
+    input.*.dy = 0
+    input.*.wheel = 0
+    input.*.hwheel = 0
+    input.*.hasLast = false
+    input.*.touching = false
+    input.*.fingers = 0
+    input.*.maxFingers = 0
+    input.*.pressedButton = 0
+    input.*.carryX = 0
+    input.*.carryY = 0
+    input.*.resolution = 1
+    const name = nameOf(input)
+    device.zero(name, 64)
+    const named = device.ioctl(deviceOf(input), readRequest(6, 63), name, 63)
+
+    var bits: [96]u8 = undefined
+    var bytes: [*]u8 = undefined
+    unsafe { bytes = @ptrCast([*]u8, &bits) }
+    device.zero(bytes, 96)
+    if device.ioctl(deviceOf(input), bitsRequest(0, 8), bytes, 8) < 0 { return false }
+    const kinds = bytes[0]
+    const has_key = (kinds >> 1) & 1 != 0
+    const has_rel = (kinds >> 2) & 1 != 0
+    const has_abs = (kinds >> 3) & 1 != 0
+    var keys: [96]u8 = undefined
+    var key_bytes: [*]u8 = undefined
+    unsafe { key_bytes = @ptrCast([*]u8, &keys) }
+    device.zero(key_bytes, 96)
+    if has_key { const got = device.ioctl(deviceOf(input), bitsRequest(1, 96), key_bytes, 96) }
+    input.*.keyboard = has_key && hasBit(key_bytes, KEY_A) && hasBit(key_bytes, KEY_SPACE)
+    if has_rel {
+        device.zero(bytes, 8)
+        const got = device.ioctl(deviceOf(input), bitsRequest(2, 8), bytes, 8)
+        input.*.pointer = hasBit(bytes, 0) && hasBit(bytes, 1) && hasBit(key_bytes, @intCast(usize, BTN_LEFT))
+    }
+    if has_abs && hasBit(key_bytes, @intCast(usize, BTN_TOOL_FINGER)) {
+        device.zero(bytes, 8)
+        const got = device.ioctl(deviceOf(input), readRequest(9, 8), bytes, 8)
+        const direct = hasBit(bytes, INPUT_PROP_DIRECT)
+        input.*.buttonpad = hasBit(bytes, INPUT_PROP_BUTTONPAD)
+        var range: [24]u8 = undefined
+        var range_bytes: [*]u8 = undefined
+        unsafe { range_bytes = @ptrCast([*]u8, &range) }
+        device.zero(range_bytes, 24)
+        if !direct && device.ioctl(deviceOf(input), readRequest(64 + @intCast(usize, ABS_X), 24), range_bytes, 24) >= 0 {
+            input.*.touchpad = true
+            // struct input_absinfo: value, minimum, maximum, fuzz, flat, resolution.
+            var resolution = device.loadInt(range_bytes, 20)
+            if resolution <= 0 {
+                // Unknown: take the pad as 100 mm wide.
+                resolution = (device.loadInt(range_bytes, 8) - device.loadInt(range_bytes, 4)) / 100
+            }
+            input.*.resolution = if resolution > 0 { resolution } else { 1 }
+        }
+    }
+    return input.*.keyboard || input.*.pointer || input.*.touchpad
+}
+
+pub fn close(input: *Input, allocator: Allocator) -> void { device.deinit(deviceOf(input), allocator) }
+
+pub fn descriptor(input: *const Input) -> isize { return input.*.device.descriptor }
+
+// After logind resumed the device with a new descriptor (the old one was
+// revoked): read from that one.
+pub fn replaceDescriptor(input: *Input, descriptor: isize, allocator: Allocator) -> void {
+    device.deinit(deviceOf(input), allocator)
+    device.init(deviceOf(input), descriptor, allocator)
+    input.*.hasLast = false
+    input.*.touching = false
+}
+
+pub fn hasBufferedData(input: *Input) -> bool { return device.hasBufferedData(deviceOf(input)) }
+
+// For the log: "keyboard", "mouse" or "touchpad", and the device's name.
+pub fn describe(input: *Input) -> void {
+    if input.*.keyboard { state.say("keyboard") }
+    if input.*.pointer {
+        if input.*.keyboard { state.say(" + ") }
+        state.say("mouse")
+    }
+    if input.*.touchpad {
+        if input.*.keyboard || input.*.pointer { state.say(" + ") }
+        state.say("touchpad")
+    }
+    const name = nameOf(input)
+    var length: usize = 0
+    while length < 63 && name[length] != 0 { length += 1 }
+    if length > 0 {
+        state.say(": ")
+        unsafe { const shown = std.io.writeAllBytes(std.io.stdout(), name, length) }
+    }
+}
+
+fn clamp(value: i32, limit: usize) -> i32 {
+    if value < 0 { return 0 }
+    if value >= @intCast(i32, limit) { return @intCast(i32, limit) - 1 }
+    return value
+}
+
+fn movePointer(compositor: *Compositor, dx: i32, dy: i32) -> void {
+    if dx == 0 && dy == 0 { return }
+    shell.pointerMotion(compositor, clamp(compositor.*.pointerX + dx, compositor.*.width), clamp(compositor.*.pointerY + dy, compositor.*.height))
+}
+
+// Touchpad units to pixels, keeping the fraction for the next report.
+fn padPixels(input: *Input, units: i32, vertical: bool) -> i32 {
+    const carry = if vertical { input.*.carryY } else { input.*.carryX }
+    const scaled = units * PAD_SPEED / input.*.resolution + carry
+    const pixels = scaled / 256
+    if vertical { input.*.carryY = scaled - pixels * 256 } else { input.*.carryX = scaled - pixels * 256 }
+    return pixels
+}
+
+fn absolute(value: i32) -> i32 { return if value < 0 { 0 - value } else { value } }
+
+// Applies what one report (up to SYN_REPORT) said.
+fn report(input: *Input, compositor: *Compositor) -> void {
+    if input.*.dx != 0 || input.*.dy != 0 {
+        // Faster hand movements go farther.
+        const speed = absolute(input.*.dx) + absolute(input.*.dy)
+        var factor: i32 = 2
+        if speed > 4 { factor = 3 }
+        if speed > 10 { factor = 4 }
+        movePointer(compositor, input.*.dx * factor / 2, input.*.dy * factor / 2)
+    }
+    if input.*.wheel != 0 { shell.pointerAxis(compositor, 0, wl.Fixed.fromInt(0 - WHEEL_STEP * input.*.wheel)) }
+    if input.*.hwheel != 0 { shell.pointerAxis(compositor, 1, wl.Fixed.fromInt(WHEEL_STEP * input.*.hwheel)) }
+    input.*.dx = 0
+    input.*.dy = 0
+    input.*.wheel = 0
+    input.*.hwheel = 0
+    if !input.*.touchpad || !input.*.touching { return }
+    if input.*.hasLast {
+        const units_x = input.*.x - input.*.lastX
+        const units_y = input.*.y - input.*.lastY
+        input.*.travel += absolute(units_x) + absolute(units_y)
+        if input.*.fingers >= 2 {
+            const pixels = padPixels(input, units_y, true)
+            if pixels != 0 {
+                input.*.scrolled = true
+                shell.pointerAxis(compositor, 0, wl.Fixed.fromInt(0 - pixels))
+            }
+        } else {
+            const moved_x = padPixels(input, units_x, false)
+            movePointer(compositor, moved_x, padPixels(input, units_y, true))
+        }
+    }
+    input.*.lastX = input.*.x
+    input.*.lastY = input.*.y
+    input.*.hasLast = true
+}
+
+fn touch(input: *Input, compositor: *Compositor, down: bool) -> void {
+    if down {
+        input.*.touching = true
+        input.*.touchStart = now()
+        input.*.travel = 0
+        input.*.scrolled = false
+        input.*.clicked = false
+        input.*.maxFingers = if input.*.fingers > 0 { input.*.fingers } else { 1 }
+        input.*.hasLast = false
+        input.*.carryX = 0
+        input.*.carryY = 0
+        return
+    }
+    input.*.touching = false
+    const short = now() - input.*.touchStart < TAP_MILLISECONDS
+    if short && input.*.travel < TAP_TRAVEL_MM * input.*.resolution && !input.*.scrolled && !input.*.clicked {
+        const button = if input.*.maxFingers >= 2 { BTN_RIGHT } else { BTN_LEFT }
+        shell.pointerButton(compositor, button, true)
+        shell.pointerButton(compositor, button, false)
+    }
+}
+
+fn keyEvent(compositor: *Compositor, keyboard: *xkb.Keyboard, code: u32, pressed: bool) -> void {
+    const changed = xkb.key(keyboard, code, pressed)
+    shell.keyboardKey(compositor, code, pressed)
+    if changed { shell.keyboardModifiers(compositor, keyboard.*.depressed, keyboard.*.latched, keyboard.*.locked, keyboard.*.group) }
+}
+
+fn event(input: *Input, compositor: *Compositor, keyboard: *xkb.Keyboard, kind: u32, code: u32, value: i32) -> void {
+    if kind == EV_SYN {
+        if code == SYN_REPORT { report(input, compositor) }
+    } else if kind == EV_KEY {
+        if code < 256 {
+            // 2 is the kernel's repeat: clients repeat keys themselves.
+            if value != 2 && input.*.keyboard { keyEvent(compositor, keyboard, code, value != 0) }
+        } else if code >= BTN_LEFT && code <= BTN_TASK {
+            if value != 0 {
+                var button = code
+                if input.*.touchpad {
+                    input.*.clicked = true
+                    if code == BTN_LEFT && input.*.fingers >= 2 { button = BTN_RIGHT }
+                }
+                input.*.pressedButton = button
+                keyboard.*.pressedButtons = keyboard.*.pressedButtons | (@intCast(u32, 1) << (button - BTN_LEFT))
+                shell.pointerButton(compositor, button, true)
+            } else {
+                const button = if input.*.touchpad && input.*.pressedButton != 0 { input.*.pressedButton } else { code }
+                keyboard.*.pressedButtons = keyboard.*.pressedButtons & (4294967295 ^ (@intCast(u32, 1) << (button - BTN_LEFT)))
+                shell.pointerButton(compositor, button, false)
+            }
+        } else if code == BTN_TOUCH && input.*.touchpad {
+            touch(input, compositor, value != 0)
+        } else if code == BTN_TOOL_FINGER || code == BTN_TOOL_DOUBLETAP || code == BTN_TOOL_TRIPLETAP || code == BTN_TOOL_QUADTAP {
+            if value != 0 {
+                const count = if code == BTN_TOOL_FINGER { 1 } else { code - BTN_TOOL_DOUBLETAP + 2 }
+                input.*.fingers = count
+                if count > input.*.maxFingers { input.*.maxFingers = count }
+                // A different number of fingers: no jump from the old ones.
+                input.*.hasLast = false
+            }
+        }
+    } else if kind == EV_REL {
+        if code == REL_X { input.*.dx += value }
+        if code == REL_Y { input.*.dy += value }
+        if code == REL_WHEEL { input.*.wheel += value }
+        if code == REL_HWHEEL { input.*.hwheel += value }
+    } else if kind == EV_ABS {
+        if code == ABS_X { input.*.x = value }
+        if code == ABS_Y { input.*.y = value }
+    }
+}
+
+// Lets go of every key and button held down: when the session leaves the
+// foreground their releases go to the other session, so clients (and our
+// shortcuts) would think them held.
+pub fn releaseAll(compositor: *Compositor, keyboard: *xkb.Keyboard) -> void {
+    var code: u32 = 0
+    while code < 256 {
+        if xkb.isPressed(keyboard, code) { keyEvent(compositor, keyboard, code, false) }
+        code += 1
+    }
+    var button: u32 = 0
+    while button < 8 {
+        if keyboard.*.pressedButtons & (@intCast(u32, 1) << button) != 0 { shell.pointerButton(compositor, BTN_LEFT + button, false) }
+        button += 1
+    }
+    keyboard.*.pressedButtons = 0
+}
+
+// Reads and handles what the device has. False when it is gone (or was
+// revoked by logind).
+pub fn read(input: *Input, compositor: *Compositor, keyboard: *xkb.Keyboard) -> bool {
+    var buffer: [1536]u8 = undefined
+    var bytes: [*]u8 = undefined
+    unsafe { bytes = @ptrCast([*]u8, &buffer) }
+    while true {
+        const count = device.read(deviceOf(input), bytes, 1536)
+        if count == device.EAGAIN || count == device.EINTR { return true }
+        if count <= 0 { return false }
+        compositor.*.time = @intCast(u32, now() & 4294967295)
+        var at: usize = 0
+        while at + 24 <= @bitCast(usize, count) {
+            event(input, compositor, keyboard, device.load16(bytes, at + 16), device.load16(bytes, at + 18), device.loadInt(bytes, at + 20))
+            at += 24
+        }
+    }
+    return true
+}

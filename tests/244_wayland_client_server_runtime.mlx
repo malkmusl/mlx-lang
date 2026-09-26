@@ -1,0 +1,327 @@
+// std.wayland end to end: a forked std.wayland.server serves two
+// std.wayland.client connections over socket pairs. Covers registry globals,
+// bind, typed requests/events, fd passing with shared memory mapped by the
+// server, buffer release and frame callbacks, delete_id and id reuse,
+// wl_display.error delivery, and client-side version gating. Exits 13.
+const std = @import("std")
+const wl = @import("std.wayland")
+const linux = @import("std").linux
+
+const SYS_fork: usize = 57
+const SYS_wait4: usize = 61
+const SYS_kill: usize = 62
+const SYS_exit_group: usize = 231
+
+fn exitProcess(code: usize) -> void {
+    const ignored = linux.syscall1(SYS_exit_group, code)
+}
+
+// ---------------------------------------------------------------------------
+// Server
+
+const Server = struct {
+    display: wl.server.Display
+    clientsSeen: usize
+    clientsGone: usize
+    pool: wl.SharedMemory
+    poolMapped: bool
+    poolByte: u8
+    attached: u32
+    commits: usize
+    failures: usize
+}
+
+fn serverOf(context: *anyopaque) -> *Server {
+    unsafe { return @ptrCast(*Server, context) }
+}
+
+fn onRegion(context: *anyopaque, request: wl.server.Request) -> void {
+    const decoded = wl.wl_region.decodeRequest(request)
+    if request.opcode == wl.wl_region.REQUEST_ADD && decoded.add.x < 0 {
+        wl.wl_region.Resource.fromObject(request.object).postError(7, "negative region")
+    }
+}
+
+fn onSurface(context: *anyopaque, request: wl.server.Request) -> void {
+    const server = serverOf(context)
+    const decoded = wl.wl_surface.decodeRequest(request)
+    if request.opcode == wl.wl_surface.REQUEST_ATTACH {
+        server.*.attached = decoded.attach.buffer.id()
+        if decoded.attach.x != -3 || decoded.attach.y != 5 { server.*.failures += 1 }
+    } else if request.opcode == wl.wl_surface.REQUEST_FRAME {
+        decoded.frame.callback.sendDone(4242)
+    } else if request.opcode == wl.wl_surface.REQUEST_COMMIT {
+        server.*.commits += 1
+        if server.*.attached != 0 {
+            wl.wl_buffer.Resource.fromObject(wl.server.Object.{ .client = request.client, .id = server.*.attached }).sendRelease()
+        }
+    }
+}
+
+fn onPool(context: *anyopaque, request: wl.server.Request) -> void {
+    const decoded = wl.wl_shm_pool.decodeRequest(request)
+    if request.opcode == wl.wl_shm_pool.REQUEST_CREATE_BUFFER {
+        const created = decoded.create_buffer
+        if created.width != 4 || created.height != 2 || created.stride != 16 { serverOf(context).*.failures += 1 }
+    }
+}
+
+fn onShm(context: *anyopaque, request: wl.server.Request) -> void {
+    const server = serverOf(context)
+    const decoded = wl.wl_shm.decodeRequest(request)
+    const created = decoded.create_pool
+    created.id.setHandler(onPool, context)
+    var memory: wl.SharedMemory = undefined
+    if wl.transport.mapSharedMemory(&memory, created.fd, @intCast(usize, created.size), false) {
+        server.*.pool = memory
+        server.*.poolMapped = true
+        const bytes = memory.bytes()
+        server.*.poolByte = bytes[0]
+    } else {
+        server.*.failures += 1
+    }
+}
+
+fn onCompositor(context: *anyopaque, request: wl.server.Request) -> void {
+    const decoded = wl.wl_compositor.decodeRequest(request)
+    if request.opcode == wl.wl_compositor.REQUEST_CREATE_SURFACE {
+        decoded.create_surface.id.setHandler(onSurface, context)
+    } else if request.opcode == wl.wl_compositor.REQUEST_CREATE_REGION {
+        decoded.create_region.id.setHandler(onRegion, context)
+    }
+}
+
+fn bindCompositor(context: *anyopaque, client: wl.server.Client, object: wl.server.Object, version: u32) -> void {
+    const resource = wl.wl_compositor.Resource.fromObject(object)
+    if resource.version() != version { serverOf(context).*.failures += 1 }
+    resource.setHandler(onCompositor, context)
+}
+
+fn bindShm(context: *anyopaque, client: wl.server.Client, object: wl.server.Object, version: u32) -> void {
+    const shm = wl.wl_shm.Resource.fromObject(object)
+    shm.setHandler(onShm, context)
+    shm.sendFormat(@intFromEnum(wl.wl_shm.Format.argb8888))
+    shm.sendFormat(@intFromEnum(wl.wl_shm.Format.xrgb8888))
+}
+
+fn bindOutput(context: *anyopaque, client: wl.server.Client, object: wl.server.Object, version: u32) -> void {}
+
+fn onClientCreated(context: *anyopaque, client: wl.server.Client) -> void {
+    serverOf(context).*.clientsSeen += 1
+}
+
+fn onClientDestroyed(context: *anyopaque, client: wl.server.Client) -> void {
+    const server = serverOf(context)
+    server.*.clientsGone += 1
+    if server.*.clientsGone == 2 { server.*.display.terminate() }
+}
+
+fn runServer(first: wl.Handle, second: wl.Handle) -> !usize {
+    const allocator = std.page_allocator.init()
+    var server: Server = undefined
+    server.clientsSeen = 0
+    server.clientsGone = 0
+    server.poolMapped = false
+    server.poolByte = 0
+    server.attached = 0
+    server.commits = 0
+    server.failures = 0
+    var display: wl.server.Display = undefined
+    try wl.server.Display.init(&display, allocator)
+    server.display = display
+    var context: *anyopaque = undefined
+    unsafe { context = @ptrCast(*anyopaque, &server) }
+    display.setClientCreatedHandler(onClientCreated, context)
+    display.setClientDestroyedHandler(onClientDestroyed, context)
+    if display.createGlobal(wl.Interface.wl_compositor, 6, bindCompositor, context) != 1 { return 101 }
+    if display.createGlobal(wl.Interface.wl_shm, 1, bindShm, context) != 2 { return 102 }
+    const output = display.createGlobal(wl.Interface.wl_output, 4, bindOutput, context)
+    if display.createGlobal(wl.Interface.wl_seat, 99, bindOutput, context) != 0 { return 103 }
+    var client: wl.server.Client = undefined
+    try display.addClient(first, &client)
+    try display.addClient(second, &client)
+    // wl_output is withdrawn once the first commit arrived.
+    var removed = false
+    while display.running() {
+        try display.dispatch(5000)
+        if server.commits > 0 && !removed {
+            display.removeGlobal(output)
+            removed = true
+        }
+    }
+    display.deinit()
+    if server.clientsSeen != 2 { return 104 }
+    if !server.poolMapped || server.poolByte != 90 { return 105 }
+    if server.commits != 1 { return 106 }
+    if server.failures != 0 { return 107 }
+    server.pool.release()
+    return 13
+}
+
+// ---------------------------------------------------------------------------
+// Client
+
+const Client = struct {
+    registry: wl.wl_registry.Proxy
+    compositorName: u32
+    shmName: u32
+    outputName: u32
+    globals: usize
+    removedName: u32
+    formats: usize
+    released: bool
+    frameDone: u32
+}
+
+fn clientOf(context: *anyopaque) -> *Client {
+    unsafe { return @ptrCast(*Client, context) }
+}
+
+fn onRegistry(context: *anyopaque, event: wl.client.Event) -> void {
+    const client = clientOf(context)
+    const decoded = wl.wl_registry.decodeEvent(event)
+    if event.opcode == wl.wl_registry.EVENT_GLOBAL {
+        client.*.globals += 1
+        const global = decoded.global
+        if std.string.eql(global.interface, std.string.fromSlice("wl_compositor")) && global.version == 6 { client.*.compositorName = global.name }
+        if std.string.eql(global.interface, std.string.fromSlice("wl_shm")) { client.*.shmName = global.name }
+        if std.string.eql(global.interface, std.string.fromSlice("wl_output")) { client.*.outputName = global.name }
+    } else {
+        client.*.removedName = decoded.global_remove.name
+    }
+}
+
+fn onShmEvent(context: *anyopaque, event: wl.client.Event) -> void {
+    const decoded = wl.wl_shm.decodeEvent(event)
+    const format = decoded.format.format
+    if format == 0 || format == 1 { clientOf(context).*.formats += 1 }
+}
+
+fn onBuffer(context: *anyopaque, event: wl.client.Event) -> void {
+    clientOf(context).*.released = true
+}
+
+fn onFrame(context: *anyopaque, event: wl.client.Event) -> void {
+    const decoded = wl.wl_callback.decodeEvent(event)
+    clientOf(context).*.frameDone = decoded.done.callback_data
+}
+
+fn runClient(handle: wl.Handle) -> !usize {
+    const allocator = std.page_allocator.init()
+    var display: wl.client.Display = undefined
+    try wl.client.Display.connectToHandle(&display, allocator, handle)
+    var client: Client = undefined
+    client.compositorName = 0
+    client.shmName = 0
+    client.outputName = 0
+    client.globals = 0
+    client.removedName = 0
+    client.formats = 0
+    client.released = false
+    client.frameDone = 0
+    var context: *anyopaque = undefined
+    unsafe { context = @ptrCast(*anyopaque, &client) }
+    client.registry = wl.displayProxy(display).getRegistry()
+    if client.registry.id() != 2 { return 1 }
+    client.registry.setHandler(onRegistry, context)
+    try display.roundtrip()
+    if client.globals != 3 || client.compositorName != 1 || client.shmName != 2 || client.outputName != 3 { return 2 }
+
+    const compositor = wl.wl_compositor.Proxy.fromObject(client.registry.bind(client.compositorName, wl.Interface.wl_compositor, 4))
+    const shm = wl.wl_shm.Proxy.fromObject(client.registry.bind(client.shmName, wl.Interface.wl_shm, 1))
+    shm.setHandler(onShmEvent, context)
+    if compositor.version() != 4 { return 3 }
+    const surface = compositor.createSurface()
+    if surface.version() != 4 { return 4 }
+
+    // delete_id: after the roundtrip the region's id and the roundtrip
+    // callback's id are free again, so no new id is allocated.
+    const region = compositor.createRegion()
+    const region_id = region.id()
+    region.add(1, 2, 3, 4)
+    region.destroy()
+    try display.roundtrip()
+    if client.formats != 2 { return 5 }
+    const reused = compositor.createRegion()
+    if reused.id() != region_id && reused.id() != region_id + 1 { return 6 }
+    reused.destroy()
+
+    // Shared memory crosses the socket as an fd; the server reads it.
+    var memory: wl.SharedMemory = undefined
+    if !wl.transport.createSharedMemory(&memory, 32) { return 7 }
+    const bytes = memory.bytes()
+    bytes[0] = 90
+    const pool = shm.createPool(memory.handle, 32)
+    const buffer = pool.createBuffer(0, 4, 2, 16, @intFromEnum(wl.wl_shm.Format.argb8888))
+    buffer.setHandler(onBuffer, context)
+    pool.destroy()
+    surface.attach(&buffer, -3, 5)
+    const frame = surface.frame()
+    frame.setHandler(onFrame, context)
+    surface.commit()
+    try display.roundtrip()
+    if !client.released || client.frameDone != 4242 { return 8 }
+    // The server withdrew wl_output after the commit.
+    try display.roundtrip()
+    if client.removedName != client.outputName { return 9 }
+
+    // Version gating: wl_surface.offset needs version 5.
+    surface.offset(1, 1)
+    if display.running() { return 10 }
+    memory.release()
+    display.disconnect()
+    return 13
+}
+
+// The second client triggers a protocol error the server posts on a region.
+fn runFailingClient(handle: wl.Handle) -> !usize {
+    const allocator = std.page_allocator.init()
+    var display: wl.client.Display = undefined
+    try wl.client.Display.connectToHandle(&display, allocator, handle)
+    const registry = wl.displayProxy(display).getRegistry()
+    try display.roundtrip()
+    const compositor = wl.wl_compositor.Proxy.fromObject(registry.bind(1, wl.Interface.wl_compositor, 6))
+    const region = compositor.createRegion()
+    region.add(-1, 0, 1, 1)
+    var rounds: usize = 0
+    while display.running() && rounds < 10 {
+        @discardError(display.dispatch())
+        rounds += 1
+    }
+    if display.running() { return 21 }
+    if display.errorObjectId() != region.id() || display.errorCode() != 7 { return 22 }
+    if !std.string.eql(display.errorMessage(), std.string.fromSlice("negative region")) { return 23 }
+    display.disconnect()
+    return 13
+}
+
+pub fn main() -> !void {
+    var server_first: wl.Handle = undefined
+    var client_first: wl.Handle = undefined
+    var server_second: wl.Handle = undefined
+    var client_second: wl.Handle = undefined
+    if !wl.transport.socketPair(&server_first, &client_first) { exitProcess(30) }
+    if !wl.transport.socketPair(&server_second, &client_second) { exitProcess(31) }
+    const child = linux.syscall0(SYS_fork)
+    if child == 0 {
+        client_first.close()
+        client_second.close()
+        const status = try runServer(server_first, server_second)
+        exitProcess(status)
+    }
+    server_first.close()
+    server_second.close()
+    const first = try runClient(client_first)
+    const second = try runFailingClient(client_second)
+    if first != 13 || second != 13 {
+        // A client stopped early; the server would wait for it forever.
+        const killed = linux.syscall2(SYS_kill, @bitCast(usize, child), 9)
+        if first != 13 { exitProcess(40 + first) }
+        exitProcess(60 + second)
+    }
+    var status: [4]u8 = [4]u8{ 0, 0, 0, 0 }
+    const waited = linux.syscall4(SYS_wait4, @bitCast(usize, child), @intFromPtr(&status), 0, 0)
+    // WEXITSTATUS: the child's exit code is the second byte.
+    if status[0] != 0 || status[1] != 13 { exitProcess(@intCast(usize, status[1])) }
+    exitProcess(13)
+}

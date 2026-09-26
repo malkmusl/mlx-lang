@@ -1,0 +1,437 @@
+// std.spirv.module: reads and validates SPIR-V modules.
+//
+// `readHeader` and `nextInstruction` walk a module; `validate` checks its
+// structure against the grammar in std.spirv.core, which is what a driver
+// needs before it translates a shader:
+//
+//   - the header: magic number (little-endian words), a version up to the
+//     grammar's, a non-zero id bound, schema 0;
+//   - every instruction: a non-zero word count that fits, a known opcode,
+//     and operands that decode exactly by the opcode's signature (including
+//     enumerant parameters such as Decoration BuiltIn and composite operands);
+//   - ids: results inside the bound and defined once, every referenced id
+//     defined somewhere in the module (forward references are allowed);
+//   - layout (SPIR-V 2.4): capabilities, extensions, imports, one memory
+//     model, entry points, execution modes, debug, annotations, types and
+//     globals, then functions, in that order; functions properly delimited,
+//     with labels only inside them; at least one entry point unless the
+//     Linkage capability is declared.
+//
+// It does not check typing rules or execution-model requirements (use
+// spirv-val for that); it guarantees a module can be decoded safely.
+
+const allocator_module = @import("../../bootstrap/allocator.mlx")
+const spv = @import("./core.mlx")
+
+pub const Allocator = allocator_module.Allocator
+
+pub const MAX_BOUND: u32 = 4194304
+
+pub const Error = enum(u8) {
+    none,
+    tooShort,
+    badMagic,
+    unsupportedVersion,
+    badBound,
+    badSchema,
+    zeroWordCount,
+    truncatedInstruction,
+    unknownOpcode,
+    missingOperand,
+    extraOperands,
+    unterminatedString,
+    idOutOfBound,
+    duplicateResult,
+    undefinedId,
+    layoutOrder,
+    missingMemoryModel,
+    duplicateMemoryModel,
+    missingEntryPoint,
+    nestedFunction,
+    unterminatedFunction,
+    instructionOutsideFunction,
+    outOfMemory,
+}
+
+pub fn errorMessage(code: Error) -> []const u8 {
+    return match code {
+        .none => "valid",
+        .tooShort => "module shorter than its five-word header",
+        .badMagic => "not a SPIR-V module (magic number, or big-endian words)",
+        .unsupportedVersion => "SPIR-V version newer than the grammar",
+        .badBound => "id bound is zero or too large",
+        .badSchema => "schema word is not zero",
+        .zeroWordCount => "instruction with a word count of zero",
+        .truncatedInstruction => "instruction runs past the end of the module",
+        .unknownOpcode => "unknown opcode",
+        .missingOperand => "instruction is missing operands",
+        .extraOperands => "instruction has more operands than its opcode takes",
+        .unterminatedString => "literal string without a terminating NUL",
+        .idOutOfBound => "id is zero or not below the bound",
+        .duplicateResult => "result id defined more than once",
+        .undefinedId => "id used but never defined",
+        .layoutOrder => "instruction out of the logical layout order",
+        .missingMemoryModel => "no OpMemoryModel",
+        .duplicateMemoryModel => "more than one OpMemoryModel",
+        .missingEntryPoint => "no OpEntryPoint (and no Linkage capability)",
+        .nestedFunction => "OpFunction inside a function",
+        .unterminatedFunction => "function without OpFunctionEnd",
+        .instructionOutsideFunction => "instruction allowed only inside a function",
+        .outOfMemory => "out of memory",
+    }
+}
+
+pub const Header = struct {
+    version: u32
+    generator: u32
+    bound: u32
+    schema: u32
+}
+
+pub const Instruction = struct {
+    opcode: u32
+    // Words, including the first (count and opcode).
+    wordCount: usize
+    // Word index of the instruction in the module.
+    offset: usize
+    words: [*]const u32
+}
+
+pub const Diagnostic = struct {
+    code: Error
+    // Word offset of the offending instruction (0 for the header).
+    offset: usize
+    opcode: u32
+    id: u32
+}
+
+pub fn readHeader(words: [*]const u32, count: usize, header: *Header) -> Error {
+    if count < 5 { return Error.tooShort }
+    if words[0] != spv.MAGIC_NUMBER { return Error.badMagic }
+    header.*.version = words[1]
+    header.*.generator = words[2]
+    header.*.bound = words[3]
+    header.*.schema = words[4]
+    if words[1] > spv.version(spv.MAJOR_VERSION, spv.MINOR_VERSION) || words[1] & 4278190335 != 0 { return Error.unsupportedVersion }
+    if words[3] == 0 || words[3] > MAX_BOUND { return Error.badBound }
+    if words[4] != 0 { return Error.badSchema }
+    return Error.none
+}
+
+// Reads the instruction at word `position.*` and advances past it. Returns
+// false at the end of the module; `error` reports a malformed instruction.
+pub fn nextInstruction(words: [*]const u32, count: usize, position: *usize, instruction: *Instruction, error_code: *Error) -> bool {
+    error_code.* = Error.none
+    if position.* >= count { return false }
+    const first = words[position.*]
+    const word_count = @intCast(usize, first >> 16)
+    if word_count == 0 {
+        error_code.* = Error.zeroWordCount
+        return false
+    }
+    if position.* + word_count > count {
+        error_code.* = Error.truncatedInstruction
+        return false
+    }
+    instruction.*.opcode = first & 65535
+    instruction.*.wordCount = word_count
+    instruction.*.offset = position.*
+    unsafe { instruction.*.words = @ptrFromInt([*]const u32, @intFromPtr(words) + position.* * 4) }
+    position.* += word_count
+    return true
+}
+
+// ---------------------------------------------------------------------------
+// Operand decoding
+
+const Decoder = struct {
+    words: [*]const u32
+    count: usize
+    position: usize
+    bound: u32
+    defined: [*]u8
+    referenced: [*]u8
+    // Set when an operand's width is not known from the grammar alone
+    // (OpSpecConstantOp's operation, context-dependent numbers).
+    open: bool
+    failure: Error
+    failureId: u32
+}
+
+fn fail(decoder: *Decoder, code: Error, id: u32) -> bool {
+    if decoder.*.failure == Error.none {
+        decoder.*.failure = code
+        decoder.*.failureId = id
+    }
+    return false
+}
+
+fn remaining(decoder: *const Decoder) -> usize { return decoder.*.count - decoder.*.position }
+
+fn takeId(decoder: *Decoder, is_result: bool) -> bool {
+    const id = decoder.*.words[decoder.*.position]
+    decoder.*.position += 1
+    if id == 0 || id >= decoder.*.bound { return fail(decoder, Error.idOutOfBound, id) }
+    if is_result {
+        if decoder.*.defined[id] != 0 { return fail(decoder, Error.duplicateResult, id) }
+        decoder.*.defined[id] = 1
+    } else {
+        decoder.*.referenced[id] = 1
+    }
+    return true
+}
+
+// Decodes one operand of kind `kind`.
+fn operand(decoder: *Decoder, kind: u8) -> bool {
+    if remaining(decoder) == 0 { return fail(decoder, Error.missingOperand, 0) }
+    const category = spv.kindCategory(kind)
+    if kind == spv.KIND_ID_RESULT { return takeId(decoder, true) }
+    if category == spv.CATEGORY_ID { return takeId(decoder, false) }
+    if kind == spv.KIND_LITERAL_STRING {
+        while remaining(decoder) > 0 {
+            const value = decoder.*.words[decoder.*.position]
+            decoder.*.position += 1
+            if value & 255 == 0 || (value >> 8) & 255 == 0 || (value >> 16) & 255 == 0 || value >> 24 == 0 { return true }
+        }
+        return fail(decoder, Error.unterminatedString, 0)
+    }
+    if kind == spv.KIND_LITERAL_CONTEXT_DEPENDENT_NUMBER || kind == spv.KIND_LITERAL_SPEC_CONSTANT_OP_INTEGER {
+        // The width depends on a type or on another opcode: the rest of the
+        // instruction is not decoded.
+        decoder.*.position = decoder.*.count
+        decoder.*.open = true
+        return true
+    }
+    if category == spv.CATEGORY_LITERAL {
+        decoder.*.position += 1
+        return true
+    }
+    if category == spv.CATEGORY_COMPOSITE { return signature(decoder, spv.compositeSignature(kind)) }
+    const value = decoder.*.words[decoder.*.position]
+    decoder.*.position += 1
+    if category == spv.CATEGORY_VALUE_ENUM { return signature(decoder, spv.enumerantParameters(kind, value)) }
+    // A bit enumeration: the parameters of each set bit, lowest first.
+    var bit: u32 = 0
+    while bit < 32 {
+        const mask = @intCast(u32, 1) << @intCast(u5, bit)
+        if value & mask != 0 {
+            if !signature(decoder, spv.enumerantParameters(kind, mask)) { return false }
+        }
+        bit += 1
+    }
+    return true
+}
+
+fn signature(decoder: *Decoder, text: []const u8) -> bool {
+    var quantifier: u8 = 0
+    for code in text {
+        if decoder.*.open { return true }
+        if code == 33 || code == 35 {
+            quantifier = code
+        } else {
+            const kind = spv.kindOfCode(code)
+            if quantifier == 35 {
+                while remaining(decoder) > 0 && !decoder.*.open {
+                    if !operand(decoder, kind) { return false }
+                }
+            } else if quantifier == 33 {
+                if remaining(decoder) > 0 {
+                    if !operand(decoder, kind) { return false }
+                }
+            } else {
+                if !operand(decoder, kind) { return false }
+            }
+            quantifier = 0
+        }
+    }
+    return true
+}
+
+// ---------------------------------------------------------------------------
+// Layout
+
+const LAYOUT_CAPABILITY: u8 = 0
+const LAYOUT_EXTENSION: u8 = 1
+const LAYOUT_EXT_INST_IMPORT: u8 = 2
+const LAYOUT_MEMORY_MODEL: u8 = 3
+const LAYOUT_ENTRY_POINT: u8 = 4
+const LAYOUT_EXECUTION_MODE: u8 = 5
+const LAYOUT_DEBUG: u8 = 6
+const LAYOUT_ANNOTATION: u8 = 7
+const LAYOUT_GLOBAL: u8 = 8
+const LAYOUT_FUNCTION: u8 = 9
+// Allowed anywhere from the globals on (OpLine, OpNoLine, OpExtInst, OpUndef).
+const LAYOUT_ANYWHERE: u8 = 10
+// Allowed only inside a function.
+const LAYOUT_BODY: u8 = 11
+
+fn startsWith(text: []const u8, prefix: []const u8) -> bool {
+    var index: usize = 0
+    var length: usize = 0
+    for byte in text { length += 1 }
+    for byte in prefix {
+        if index >= length || text[index] != byte { return false }
+        index += 1
+    }
+    return true
+}
+
+// operandSignature's answer for an unknown opcode is "?".
+fn isUnknown(text: []const u8) -> bool {
+    var length: usize = 0
+    var first: u8 = 0
+    for byte in text {
+        if length == 0 { first = byte }
+        length += 1
+    }
+    return length == 1 && first == 63
+}
+
+fn layoutOf(opcode: u32) -> u8 {
+    const op = @enumFromInt(spv.Op, @intCast(u16, opcode))
+    if op == spv.Op.capability { return LAYOUT_CAPABILITY }
+    if op == spv.Op.extension { return LAYOUT_EXTENSION }
+    if op == spv.Op.extInstImport { return LAYOUT_EXT_INST_IMPORT }
+    if op == spv.Op.memoryModel { return LAYOUT_MEMORY_MODEL }
+    if op == spv.Op.entryPoint { return LAYOUT_ENTRY_POINT }
+    if op == spv.Op.executionMode || op == spv.Op.executionModeId { return LAYOUT_EXECUTION_MODE }
+    if op == spv.Op.string || op == spv.Op.sourceExtension || op == spv.Op.source || op == spv.Op.sourceContinued || op == spv.Op.name || op == spv.Op.memberName || op == spv.Op.moduleProcessed { return LAYOUT_DEBUG }
+    if op == spv.Op.decorate || op == spv.Op.memberDecorate || op == spv.Op.decorationGroup || op == spv.Op.groupDecorate || op == spv.Op.groupMemberDecorate || op == spv.Op.decorateId || op == spv.Op.decorateString || op == spv.Op.memberDecorateString { return LAYOUT_ANNOTATION }
+    if op == spv.Op.line || op == spv.Op.noLine || op == spv.Op.extInst || op == spv.Op.undef || op == spv.Op.variable { return LAYOUT_ANYWHERE }
+    if op == spv.Op.function || op == spv.Op.functionEnd { return LAYOUT_FUNCTION }
+    const name = spv.opcodeName(opcode)
+    if startsWith(name, "OpType") || startsWith(name, "OpConstant") || startsWith(name, "OpSpecConstant") { return LAYOUT_GLOBAL }
+    return LAYOUT_BODY
+}
+
+// ---------------------------------------------------------------------------
+// Validation
+
+fn report(diagnostic: *Diagnostic, code: Error, instruction: *const Instruction, id: u32) -> Error {
+    diagnostic.*.code = code
+    diagnostic.*.offset = instruction.*.offset
+    diagnostic.*.opcode = instruction.*.opcode
+    diagnostic.*.id = id
+    return code
+}
+
+// Validates a module of `count` words. `allocator` provides scratch
+// memory proportional to the id bound.
+pub fn validate(words: [*]const u32, count: usize, allocator: Allocator, diagnostic: *Diagnostic) -> Error {
+    diagnostic.*.code = Error.none
+    diagnostic.*.offset = 0
+    diagnostic.*.opcode = 0
+    diagnostic.*.id = 0
+    var header: Header = undefined
+    const header_error = readHeader(words, count, &header)
+    if header_error != Error.none {
+        diagnostic.*.code = header_error
+        return header_error
+    }
+    const bound = @intCast(usize, header.bound)
+    const memory = allocator.alloc(bound * 2, 1)
+    if memory == null {
+        diagnostic.*.code = Error.outOfMemory
+        return Error.outOfMemory
+    }
+    const defined = memory.?
+    var referenced: [*]u8 = undefined
+    unsafe { referenced = @ptrFromInt([*]u8, @intFromPtr(defined) + bound) }
+    var index: usize = 0
+    while index < bound * 2 {
+        defined[index] = 0
+        index += 1
+    }
+    var result = Error.none
+    var position: usize = 5
+    var layout: u8 = 0
+    var in_function = false
+    var memory_models: usize = 0
+    var entry_points: usize = 0
+    var linkage = false
+    var instruction: Instruction = undefined
+    var step_error = Error.none
+    while result == Error.none && nextInstruction(words, count, &position, &instruction, &step_error) {
+        const signature_text = spv.operandSignature(instruction.opcode)
+        if isUnknown(signature_text) {
+            result = report(diagnostic, Error.unknownOpcode, &instruction, 0)
+        } else {
+            var decoder = Decoder.{
+                .words = instruction.words,
+                .count = instruction.wordCount,
+                .position = 1,
+                .bound = header.bound,
+                .defined = defined,
+                .referenced = referenced,
+                .open = false,
+                .failure = Error.none,
+                .failureId = 0,
+            }
+            const decoded = signature(&decoder, signature_text)
+            if !decoded {
+                result = report(diagnostic, decoder.failure, &instruction, decoder.failureId)
+            } else if decoder.position < decoder.count {
+                result = report(diagnostic, Error.extraOperands, &instruction, 0)
+            }
+        }
+        if result == Error.none {
+            const section = layoutOf(instruction.opcode)
+            const op = @enumFromInt(spv.Op, @intCast(u16, instruction.opcode))
+            if op == spv.Op.memoryModel { memory_models += 1 }
+            if op == spv.Op.entryPoint { entry_points += 1 }
+            if op == spv.Op.capability && instruction.wordCount == 2 && instruction.words[1] == @intFromEnum(spv.Capability.linkage) { linkage = true }
+            if op == spv.Op.function {
+                if in_function { result = report(diagnostic, Error.nestedFunction, &instruction, 0) }
+                in_function = true
+                layout = LAYOUT_FUNCTION
+            } else if op == spv.Op.functionEnd {
+                if !in_function { result = report(diagnostic, Error.instructionOutsideFunction, &instruction, 0) }
+                in_function = false
+            } else if in_function {
+                if section < LAYOUT_ANYWHERE { result = report(diagnostic, Error.layoutOrder, &instruction, 0) }
+            } else if section == LAYOUT_BODY {
+                result = report(diagnostic, Error.instructionOutsideFunction, &instruction, 0)
+            } else if section == LAYOUT_ANYWHERE {
+                if layout < LAYOUT_GLOBAL { layout = LAYOUT_GLOBAL }
+            } else {
+                if section < layout { result = report(diagnostic, Error.layoutOrder, &instruction, 0) }
+                layout = section
+            }
+        }
+    }
+    if result == Error.none && step_error != Error.none {
+        diagnostic.*.code = step_error
+        diagnostic.*.offset = position
+        result = step_error
+    }
+    if result == Error.none && in_function {
+        diagnostic.*.code = Error.unterminatedFunction
+        result = Error.unterminatedFunction
+    }
+    if result == Error.none && memory_models == 0 {
+        diagnostic.*.code = Error.missingMemoryModel
+        result = Error.missingMemoryModel
+    }
+    if result == Error.none && memory_models > 1 {
+        diagnostic.*.code = Error.duplicateMemoryModel
+        result = Error.duplicateMemoryModel
+    }
+    if result == Error.none && entry_points == 0 && !linkage {
+        diagnostic.*.code = Error.missingEntryPoint
+        result = Error.missingEntryPoint
+    }
+    if result == Error.none {
+        var id: usize = 1
+        while id < bound {
+            if referenced[id] != 0 && defined[id] == 0 {
+                diagnostic.*.code = Error.undefinedId
+                diagnostic.*.id = @intCast(u32, id)
+                result = Error.undefinedId
+                break
+            }
+            id += 1
+        }
+    }
+    allocator.free(defined, bound * 2, 1)
+    return result
+}

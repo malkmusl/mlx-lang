@@ -1,0 +1,543 @@
+// A Wayland compositor written with std.wayland.
+//
+// It runs freestanding (drm.mlx: it drives the monitor with DRM/KMS and
+// reads the input devices itself, as the desktop session a display
+// manager starts) or nested (host.mlx: as a window inside your session
+// compositor, any Wayland desktop or weston on X11), and is a compositor in
+// its own right either way: Wayland clients connect to its socket and
+// appear as windows inside it. It routes keyboard and pointer input to its
+// clients:
+//
+//   - pointer motion, buttons and scrolling go to the window under the
+//     pointer, and a click focuses and raises it;
+//   - keys and modifiers go to the focused window (the host's xkb keymap is
+//     handed to clients);
+//   - windows move by dragging their title bar (xdg_toplevel.move) or with
+//     Alt+drag anywhere, and resize by dragging their border, with
+//     Alt+right-drag, or from their own edges (xdg_toplevel.resize);
+//   - Alt+Enter opens a terminal, Alt+Tab switches windows, Alt+F4 closes
+//     the focused window and Alt+Shift+Q quits.
+//
+// Supported protocol: wl_compositor, wl_shm (ARGB8888/XRGB8888),
+// zwp_linux_dmabuf_v1 (ARGB8888/XRGB8888, linear), wl_output, wl_seat
+// (pointer and keyboard), wl_data_device_manager (copy and paste between
+// clients; no drag and drop) and xdg_wm_base (toplevels and popups).
+//
+// Windows are composed on the CPU, or with --renderer vulkan by a Vulkan
+// compute shader that reads client buffers (wl_shm pools and dma-bufs) in
+// place and writes the output straight into the host window's buffer.
+//
+//     mlx4 examples/wayland-compositor/main.mlx -o mlx-compositor
+//     mlx4 examples/wayland-terminal/main.mlx -o mlx-terminal
+//     ./mlx-compositor --run ./mlx-terminal
+//
+// Options:
+//     --backend NAME      auto (default: nested inside a Wayland session,
+//                         else drm), nested or drm (freestanding)
+//     --socket NAME       listen on $XDG_RUNTIME_DIR/NAME (default wayland-mlx)
+//     --size WxH          output size (default 1024x768)
+//     --fullscreen        ask the host for a fullscreen window and take the
+//                         monitor's resolution as the output size (what the
+//                         desktop session, tools/install_compositor_session.sh,
+//                         uses)
+//     --renderer NAME     cpu (default) or vulkan
+//     --font PATH         TrueType font for window titles (default DejaVu
+//                         Sans; `none` for bars without titles)
+//     --terminal PROGRAM  what Alt+Enter runs (default: mlx-terminal next to
+//                         this program, else mlx-terminal from PATH)
+//     --run PROGRAM       start PROGRAM once the compositor is up (repeatable)
+//     --screenshot FILE   write the last frame to FILE (PPM) on exit
+//     --timeout SECONDS   exit after SECONDS (for demos and tests)
+//     --verbose           log clients, windows, focus and forwarded keys
+
+const std = @import("std")
+const wl = @import("std.wayland")
+const state = @import("./state.mlx")
+const shell = @import("./shell.mlx")
+const host = @import("./host.mlx")
+const dmabuf = @import("./dmabuf.mlx")
+const data = @import("./data.mlx")
+const drm = @import("./drm.mlx")
+const vulkan = @import("./vulkan.mlx")
+const tt = @import("std.truetype")
+const scene = @import("./scene.mlx")
+
+const DEFAULT_FONT = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
+
+const Compositor = state.Compositor
+const String = std.string.String
+
+fn equals(value: String, text: []const u8) -> bool {
+    return std.string.eql(value, std.string.fromSlice(text))
+}
+
+fn parseNumber(text: String, start: usize, end: usize) -> usize {
+    var value: usize = 0
+    var index = start
+    while index < end {
+        const byte = text.pointer[index]
+        if byte < 48 || byte > 57 { return 0 }
+        value = value * 10 + @intCast(usize, byte - 48)
+        index += 1
+    }
+    return value
+}
+
+// "mlx-terminal" next to this program when it was started by path.
+fn defaultTerminal(compositor: *Compositor, program: String) -> [*]const u8 {
+    var slash: usize = 0
+    var found = false
+    var index: usize = 0
+    while index < program.length {
+        if program.pointer[index] == 47 {
+            slash = index
+            found = true
+        }
+        index += 1
+    }
+    const name = "mlx-terminal"
+    if !found {
+        unsafe { return @ptrCast([*]const u8, name) }
+    }
+    const memory = state.allocate(compositor, slash + 16)
+    index = 0
+    while index <= slash {
+        memory[index] = program.pointer[index]
+        index += 1
+    }
+    var length = slash + 1
+    for byte in name {
+        memory[length] = byte
+        length += 1
+    }
+    memory[length] = 0
+    unsafe { return @ptrCast([*]const u8, memory) }
+}
+
+// Our environment for children, with WAYLAND_DISPLAY naming our socket.
+fn childEnvironment(compositor: *Compositor, arguments: [][*]const u8) -> [*][*]const u8 {
+    const count = std.process.environmentCount(arguments)
+    const entries = std.process.environmentEntries(arguments)
+    var result: [*][*]const u8 = undefined
+    unsafe { result = @ptrCast([*][*]const u8, state.allocate(compositor, (count + 2) * 8)) }
+    var used: usize = 0
+    var index: usize = 0
+    while index < count {
+        const entry = std.process.fromCString(entries[index])
+        if !std.string.startsWith(entry, std.string.fromSlice("WAYLAND_DISPLAY=")) && !std.string.startsWith(entry, std.string.fromSlice("WAYLAND_SOCKET=")) {
+            result[used] = entries[index]
+            used += 1
+        }
+        index += 1
+    }
+    const variable = state.allocate(compositor, 17 + compositor.*.socketNameLength)
+    var length: usize = 0
+    for byte in "WAYLAND_DISPLAY=" {
+        variable[length] = byte
+        length += 1
+    }
+    index = 0
+    while index < compositor.*.socketNameLength {
+        variable[length] = compositor.*.socketName[index]
+        length += 1
+        index += 1
+    }
+    variable[length] = 0
+    unsafe {
+        result[used] = @ptrCast([*]const u8, variable)
+        result[used + 1] = @ptrFromInt([*]const u8, 0)
+    }
+    return result
+}
+
+// Monotonic time in milliseconds.
+fn milliseconds() -> usize {
+    var time: [16]u8 = undefined
+    const result = std.linux.syscall2(228, 1, @intFromPtr(&time))
+    var seconds: usize = 0
+    var nanoseconds: usize = 0
+    var index: usize = 0
+    while index < 8 {
+        seconds = seconds | (@intCast(usize, time[index]) << (index * 8))
+        nanoseconds = nanoseconds | (@intCast(usize, time[8 + index]) << (index * 8))
+        index += 1
+    }
+    return seconds * 1000 + nanoseconds / 1000000
+}
+
+fn initialize(compositor: *Compositor) -> void {
+    compositor.*.allocator = std.page_allocator.init()
+    compositor.*.width = 1024
+    compositor.*.height = 768
+    compositor.*.running = true
+    compositor.*.verbose = false
+    compositor.*.socketNameLength = 0
+    compositor.*.hasHostCompositor = false
+    compositor.*.hasHostShm = false
+    compositor.*.hasHostWmBase = false
+    compositor.*.hasHostSeat = false
+    compositor.*.hasHostPointer = false
+    compositor.*.hasHostKeyboard = false
+    compositor.*.hasHostOutput = false
+    compositor.*.hostModeWidth = 0
+    compositor.*.hostModeHeight = 0
+    compositor.*.hostScale = 1
+    compositor.*.hostConfigureWidth = 0
+    compositor.*.hostConfigureHeight = 0
+    compositor.*.fullscreen = false
+    compositor.*.hostFirstBusy = false
+    compositor.*.hostSecondBusy = false
+    compositor.*.hostConfigured = false
+    compositor.*.hostFramePending = false
+    compositor.*.needsRedraw = true
+    compositor.*.frames = 0
+    compositor.*.hasKeymap = false
+    compositor.*.repeatRate = 25
+    compositor.*.repeatDelay = 600
+    compositor.*.modsDepressed = 0
+    compositor.*.modsLatched = 0
+    compositor.*.modsLocked = 0
+    compositor.*.modsGroup = 0
+    const allocator = compositor.*.allocator
+    compositor.*.surfaces = state.newList(allocator)
+    compositor.*.stack = state.newList(allocator)
+    compositor.*.buffers = state.newList(allocator)
+    compositor.*.positioners = state.newList(allocator)
+    compositor.*.pointers = state.newList(allocator)
+    compositor.*.keyboards = state.newList(allocator)
+    compositor.*.nextWindowX = 24
+    compositor.*.nextWindowY = 24
+    compositor.*.pointerX = 0
+    compositor.*.pointerY = 0
+    compositor.*.pointerInside = false
+    compositor.*.pointerFocus = 0
+    compositor.*.keyboardFocus = 0
+    compositor.*.resizing = 0
+    compositor.*.resizeEdges = 0
+    compositor.*.hoverEdges = 0
+    compositor.*.buttonsDown = 0
+    compositor.*.moving = 0
+    compositor.*.moveOffsetX = 0
+    compositor.*.moveOffsetY = 0
+    compositor.*.cursorSurface = 0
+    compositor.*.cursorHidden = false
+    compositor.*.alt = false
+    compositor.*.shift = false
+    compositor.*.control = false
+    compositor.*.swallowedKey = 0
+    compositor.*.swallowedButton = false
+    compositor.*.time = 0
+    compositor.*.renderer = 0
+    compositor.*.commits = 0
+    compositor.*.stage = state.STAGE_ARGUMENTS
+    compositor.*.hasText = false
+    compositor.*.freestanding = false
+    compositor.*.drm = 0
+    compositor.*.vtRequest = 0
+}
+
+// Window titles: the font, its atlas and a run for laying titles out.
+fn loadFont(compositor: *Compositor, path: [*]const u8) -> void {
+    if path[0] == 0 { return }
+    const allocator = compositor.*.allocator
+    unsafe {
+        compositor.*.font = @ptrCast(*tt.Font, state.allocate(compositor, @sizeOf(tt.Font)))
+        compositor.*.atlas = @ptrCast(*tt.Atlas, state.allocate(compositor, @sizeOf(tt.Atlas)))
+        compositor.*.run = @ptrCast(*tt.Run, state.allocate(compositor, @sizeOf(tt.Run)))
+    }
+    const status = tt.loadFile(compositor.*.font, path, allocator)
+    if status != tt.Status.ok {
+        if compositor.*.verbose {
+            state.say("titles: ")
+            state.say(tt.statusMessage(status))
+            state.say("\n")
+        }
+        return
+    }
+    if !tt.initAtlas(compositor.*.atlas, compositor.*.font, scene.TITLE_TEXT_SIZE, 512, 256, allocator) { return }
+    if !tt.initRun(compositor.*.run, 64, allocator) { return }
+    compositor.*.hasText = true
+}
+
+const Failure = error { InvalidArguments, GlobalsFailed, NoVulkan, NoMonitor }
+
+fn invalidArguments() -> Failure!void { return Failure.InvalidArguments }
+fn globalsFailed() -> Failure!void { return Failure.GlobalsFailed }
+fn noVulkan() -> Failure!void { return Failure.NoVulkan }
+fn noMonitor() -> Failure!void { return Failure.NoMonitor }
+
+const BACKEND_AUTO: u8 = 0
+const BACKEND_NESTED: u8 = 1
+const BACKEND_DRM: u8 = 2
+
+// Says why start-up or the event loop stopped the compositor (errors
+// leave `main` without a message of their own).
+fn reportStop(compositor: *Compositor) -> void {
+    const stage = compositor.*.stage
+    if stage == state.STAGE_DONE { return }
+    if stage == state.STAGE_ARGUMENTS {
+        state.say("mlx-compositor: invalid arguments (see --help)\n")
+    } else if stage == state.STAGE_SOCKET {
+        state.say("mlx-compositor: cannot listen on the Wayland socket ")
+        const shown = std.io.writeString(std.io.stdout(), socketName(compositor))
+        state.say(" in XDG_RUNTIME_DIR (is another compositor using it? try --socket NAME)\n")
+    } else if stage == state.STAGE_GLOBALS {
+        state.say("mlx-compositor: cannot create the Wayland globals\n")
+    } else if stage == state.STAGE_OUTPUT {
+        if compositor.*.freestanding {
+            state.say("mlx-compositor: no monitor to drive\n")
+        } else {
+            state.say("mlx-compositor: cannot connect to the session compositor (WAYLAND_DISPLAY) or it lacks wl_compositor, wl_shm or xdg_wm_base\n")
+        }
+    } else if stage == state.STAGE_HOST && compositor.*.host.running() {
+        state.say("mlx-compositor: cannot open the output window\n")
+    } else if stage == state.STAGE_RUNNING && compositor.*.freestanding {
+        state.say("mlx-compositor: the event loop failed\n")
+    } else if stage == state.STAGE_RUNNING && compositor.*.host.running() {
+        state.say("mlx-compositor: the event loop failed\n")
+    }
+    if stage >= state.STAGE_HOST && !compositor.*.freestanding { host.reportFailure(compositor) }
+}
+
+fn socketName(compositor: *Compositor) -> std.string.String {
+    unsafe { return std.string.fromParts(@ptrCast([*]const u8, &compositor.*.socketName), compositor.*.socketNameLength) }
+}
+
+// (The defer sits in this small wrapper: placed in `serve` itself, the
+// compiler got the freestanding path's exit status wrong.)
+fn run(compositor: *Compositor, arguments: [][*]const u8) -> !void {
+    defer reportStop(compositor)
+    try serve(compositor, arguments)
+}
+
+fn serve(compositor: *Compositor, arguments: [][*]const u8) -> !void {
+    var socket = std.string.fromSlice("wayland-mlx")
+    var screenshot = std.string.fromSlice("")
+    var launches: [8]usize = [8]usize{ 0, 0, 0, 0, 0, 0, 0, 0 }
+    var launch_count: usize = 0
+    var terminal_set = false
+    var timeout: usize = 0
+    var use_vulkan = false
+    var backend = BACKEND_AUTO
+    var font_path: [*]const u8 = undefined
+    unsafe { font_path = @ptrCast([*]const u8, DEFAULT_FONT) }
+    var index: usize = 1
+    const count = std.process.count(arguments)
+    while index < count {
+        const argument = std.process.argument(arguments, index)
+        const has_value = index + 1 < count
+        if equals(argument, "--verbose") {
+            compositor.*.verbose = true
+        } else if equals(argument, "--fullscreen") {
+            compositor.*.fullscreen = true
+        } else if equals(argument, "--backend") && has_value {
+            index += 1
+            const name = std.process.argument(arguments, index)
+            if equals(name, "drm") {
+                backend = BACKEND_DRM
+            } else if equals(name, "nested") {
+                backend = BACKEND_NESTED
+            } else if !equals(name, "auto") {
+                return invalidArguments()
+            }
+        } else if equals(argument, "--socket") && has_value {
+            index += 1
+            socket = std.process.argument(arguments, index)
+        } else if equals(argument, "--renderer") && has_value {
+            index += 1
+            const name = std.process.argument(arguments, index)
+            if equals(name, "vulkan") {
+                use_vulkan = true
+            } else if !equals(name, "cpu") {
+                return invalidArguments()
+            }
+        } else if equals(argument, "--font") && has_value {
+            index += 1
+            const path = std.process.argument(arguments, index)
+            if equals(path, "none") {
+                unsafe { font_path = @ptrCast([*]const u8, "") }
+            } else {
+                font_path = path.pointer
+            }
+        } else if equals(argument, "--screenshot") && has_value {
+            index += 1
+            screenshot = std.process.argument(arguments, index)
+        } else if equals(argument, "--terminal") && has_value {
+            index += 1
+            compositor.*.terminal = std.process.argument(arguments, index).pointer
+            terminal_set = true
+        } else if equals(argument, "--run") && has_value && launch_count < 8 {
+            index += 1
+            launches[launch_count] = @intFromPtr(std.process.argument(arguments, index).pointer)
+            launch_count += 1
+        } else if equals(argument, "--timeout") && has_value {
+            index += 1
+            const seconds = std.process.argument(arguments, index)
+            timeout = parseNumber(seconds, 0, seconds.length) * 1000
+        } else if equals(argument, "--size") && has_value {
+            index += 1
+            const size = std.process.argument(arguments, index)
+            var split: usize = 0
+            while split < size.length && size.pointer[split] != 120 { split += 1 }
+            const width = parseNumber(size, 0, split)
+            const height = if split < size.length { parseNumber(size, split + 1, size.length) } else { 0 }
+            if width < 64 || height < 64 || width > 8192 || height > 8192 { return invalidArguments() }
+            compositor.*.width = width
+            compositor.*.height = height
+        } else {
+            const usage = std.io.eprintln("usage: mlx-compositor [--backend auto|nested|drm] [--socket NAME] [--size WxH] [--fullscreen] [--renderer cpu|vulkan] [--font PATH|none] [--terminal PROGRAM] [--run PROGRAM]... [--screenshot FILE] [--timeout SECONDS] [--verbose]")
+            return invalidArguments()
+        }
+        index += 1
+    }
+    if socket.length == 0 || socket.length > 60 { return invalidArguments() }
+    index = 0
+    while index < socket.length {
+        compositor.*.socketName[index] = socket.pointer[index]
+        index += 1
+    }
+    compositor.*.socketNameLength = socket.length
+    if !terminal_set { compositor.*.terminal = defaultTerminal(compositor, std.process.argument(arguments, 0)) }
+    compositor.*.environment = childEnvironment(compositor, arguments)
+
+    compositor.*.stage = state.STAGE_SOCKET
+    var server: wl.server.Display = undefined
+    try wl.server.Display.init(&server, compositor.*.allocator)
+    compositor.*.server = server
+    try server.addSocket(std.string.asSlice(socket))
+    compositor.*.stage = state.STAGE_GLOBALS
+    if !shell.createGlobals(compositor) || !dmabuf.createGlobal(compositor) || !data.createGlobal(compositor) { return globalsFailed() }
+    compositor.*.stage = state.STAGE_OUTPUT
+    if backend == BACKEND_AUTO {
+        // Inside a Wayland session: a window there. Otherwise (a display
+        // manager's session, a text console): the monitor itself.
+        const entries = std.process.environmentEntries(arguments)
+        const inside = @intFromPtr(state.environmentValue(entries, "WAYLAND_DISPLAY")) != 0 || @intFromPtr(state.environmentValue(entries, "WAYLAND_SOCKET")) != 0
+        backend = if inside { BACKEND_NESTED } else { BACKEND_DRM }
+    }
+    if backend == BACKEND_DRM {
+        compositor.*.freestanding = true
+        compositor.*.drm = drm.start(compositor)
+        if compositor.*.drm == 0 { return noMonitor() }
+        loadFont(compositor, font_path)
+        if use_vulkan { state.say("drm: the freestanding compositor composes on the CPU\n") }
+        if compositor.*.verbose {
+            state.say("listening on ")
+            const shown = std.io.writeString(std.io.stdout(), socket)
+            state.say("\n")
+        }
+        index = 0
+        while index < launch_count {
+            unsafe { shell.launch(compositor, @ptrFromInt([*]const u8, launches[index])) }
+            index += 1
+        }
+        compositor.*.stage = state.STAGE_RUNNING
+        try runFreestanding(compositor, server, timeout)
+        compositor.*.stage = state.STAGE_DONE
+        if screenshot.length > 0 {
+            if host.screenshot(compositor, screenshot.pointer) {
+                if compositor.*.verbose { state.say("screenshot written\n") }
+            }
+        }
+        drm.stop(drm.backendAt(compositor.*.drm))
+        server.deinit()
+        return
+    }
+    try host.connect(compositor)
+    compositor.*.stage = state.STAGE_RENDERER
+    loadFont(compositor, font_path)
+    if use_vulkan && !vulkan.open(compositor, arguments) { return noVulkan() }
+    if compositor.*.verbose {
+        state.say("output: ")
+        state.sayNumber(compositor.*.width)
+        state.say("x")
+        state.sayNumber(compositor.*.height)
+        if compositor.*.hostModeWidth > 0 {
+            state.say(" (monitor ")
+            state.sayInteger(compositor.*.hostModeWidth)
+            state.say("x")
+            state.sayInteger(compositor.*.hostModeHeight)
+            if compositor.*.hostScale > 1 {
+                state.say(", scale ")
+                state.sayInteger(compositor.*.hostScale)
+            }
+            state.say(")")
+        }
+        state.say("\n")
+        state.say("listening on ")
+        const shown = std.io.writeString(std.io.stdout(), socket)
+        state.say("\n")
+    }
+    index = 0
+    while index < launch_count {
+        unsafe { shell.launch(compositor, @ptrFromInt([*]const u8, launches[index])) }
+        index += 1
+    }
+
+    compositor.*.stage = state.STAGE_RUNNING
+    const display = compositor.*.host
+    var handles: [2]wl.Handle = undefined
+    handles[0] = wl.Handle.fromDescriptor(display.descriptor())
+    handles[1] = wl.Handle.fromDescriptor(server.descriptor())
+    var ready: [2]bool = [2]bool{ false, false }
+    const deadline = milliseconds() + timeout
+    while compositor.*.running && display.running() {
+        if timeout > 0 && milliseconds() >= deadline { compositor.*.running = false }
+        shell.reapChildren()
+        host.present(compositor)
+        try display.flush()
+        server.flushClients()
+        var waited: isize = 0
+        unsafe { waited = wl.transport.waitAny(@ptrCast([*]const wl.Handle, &handles), 2, @ptrCast([*]bool, &ready), 1000) }
+        if ready[0] { try display.dispatch() }
+        if ready[1] { try server.dispatch(0) }
+    }
+    // The session compositor went away or rejected something.
+    host.reportFailure(compositor)
+    compositor.*.stage = state.STAGE_DONE
+    if screenshot.length > 0 {
+        if host.screenshot(compositor, screenshot.pointer) {
+            if compositor.*.verbose { state.say("screenshot written\n") }
+        }
+    }
+    server.deinit()
+    display.disconnect()
+}
+
+// The freestanding event loop: clients, the card, the session, the input
+// devices.
+fn runFreestanding(compositor: *Compositor, server: wl.server.Display, timeout: usize) -> !void {
+    const backend = drm.backendAt(compositor.*.drm)
+    var handles: [40]wl.Handle = undefined
+    var ready: [40]bool = undefined
+    const deadline = milliseconds() + timeout
+    while compositor.*.running {
+        if timeout > 0 && milliseconds() >= deadline { compositor.*.running = false }
+        shell.reapChildren()
+        drm.present(backend)
+        server.flushClients()
+        var count: usize = 0
+        unsafe { count = drm.handles(backend, @ptrCast([*]wl.Handle, &handles), 39) }
+        handles[count] = wl.Handle.fromDescriptor(server.descriptor())
+        var index: usize = 0
+        while index <= count {
+            ready[index] = false
+            index += 1
+        }
+        const wait: isize = if drm.hasBufferedData(backend) { 0 } else { 1000 }
+        var waited: isize = 0
+        unsafe { waited = wl.transport.waitAny(@ptrCast([*]const wl.Handle, &handles), count + 1, @ptrCast([*]bool, &ready), wait) }
+        if ready[count] { try server.dispatch(0) }
+        drm.dispatch(backend)
+        if compositor.*.vtRequest != 0 {
+            drm.switchTo(backend, compositor.*.vtRequest)
+            compositor.*.vtRequest = 0
+        }
+    }
+}
+
+pub fn main(arguments: [][*]const u8) -> !void {
+    var compositor: Compositor = undefined
+    initialize(&compositor)
+    try run(&compositor, arguments)
+}

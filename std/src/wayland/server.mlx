@@ -1,0 +1,1076 @@
+// std.wayland.server: the Wayland server (compositor) runtime.
+//
+// Provides the display with its listening sockets and event loop, client
+// connections, globals and the wl_registry, resources, request decoding and
+// dispatch, event sending, handle transfer, object version gating and
+// protocol-error handling (spec/06-wayland/wayland.xml <Server>).
+//
+// The runtime implements the core wl_display requests itself (sync and
+// get_registry) and wl_registry.bind, which validates the global and
+// requested version, creates the resource and calls the global's bind
+// handler. Every other request goes to the handler set on its resource.
+// Typed new_id arguments are created as resources (with the parent's
+// version) before the request handler runs, so handlers receive ready
+// resources. A destructor request destroys its resource after the handler.
+//
+// Usage:
+//
+//     var display: wl.server.Display = undefined
+//     try wl.server.Display.init(&display, allocator)
+//     defer display.deinit()
+//     try display.addSocket("wayland-0")
+//     const name = display.createGlobal(wl.Interface.wl_compositor, 6, bindCompositor, context)
+//     while display.running() { try display.dispatch(-1) }
+
+const allocator_module = @import("../../bootstrap/allocator.mlx")
+const string = @import("../../bootstrap/string.mlx")
+const vector = @import("../../bootstrap/vector.mlx")
+const wire = @import("./wire.mlx")
+const transport = @import("./transport/linux.mlx")
+const interfaces = @import("./generated/interfaces.mlx")
+
+pub const Allocator = allocator_module.Allocator
+pub const String = string.String
+pub const Vector = vector.Vector
+pub const Interface = interfaces.Interface
+pub const Handle = transport.Handle
+
+pub const Error = error {
+    OutOfMemory,
+    NoRuntimeDirectory,
+    AddressInUse,
+    SocketFailed,
+    EventLoopFailed
+}
+
+// wl_display.error codes (wayland.xml wl_display.error).
+pub const ERROR_INVALID_OBJECT: u32 = 0
+pub const ERROR_INVALID_METHOD: u32 = 1
+pub const ERROR_NO_MEMORY: u32 = 2
+pub const ERROR_IMPLEMENTATION: u32 = 3
+
+const STATUS_FREE: u8 = 0
+const STATUS_LIVE: u8 = 1
+const DISPLAY_ID: u32 = 1
+const LISTENER_TOKENS: usize = 65536
+
+pub const State = struct {
+    allocator: Allocator
+    eventLoop: isize
+    events: *transport.Events
+    listeners: Vector
+    clients: Vector
+    globals: Vector
+    callbacks: Vector
+    nextGlobalName: u32
+    serial: u32
+    running: bool
+}
+
+pub const ClientState = struct {
+    display: *State
+    connection: *transport.Connection
+    objects: Vector
+    serverObjects: Vector
+    freeServerIds: Vector
+    callbacks: Vector
+    dead: bool
+}
+
+// A connected client. Copies refer to the same client.
+pub const Client = struct {
+    state: *ClientState
+
+    pub fn isAlive(self: Self) -> bool { return !self.state.*.dead }
+    // Flushes and disconnects the client at the end of the current dispatch.
+    pub fn disconnect(self: Self) -> void { self.state.*.dead = true }
+    pub fn flush(self: Self) -> void { const ignored = transport.flush(self.state.*.connection) }
+    pub fn descriptor(self: Self) -> isize { return self.state.*.connection.*.descriptor }
+}
+
+// A server-side object: client plus object id. Id 0 is the null object.
+pub const Object = struct {
+    client: Client
+    id: u32
+}
+
+// One received request. The payload and handles are valid for the duration
+// of the handler call; handles become owned by the handler.
+pub const Request = struct {
+    client: Client
+    object: Object
+    interface: Interface
+    opcode: u16
+    payload: [*]const u8
+    payloadLength: usize
+    handles: [*]const isize
+    handleCount: usize
+}
+
+pub const RequestHandler = fn(context: *anyopaque, request: Request) -> void
+pub const DestroyHandler = fn(context: *anyopaque, object: Object) -> void
+// Called after wl_registry.bind created `resource` with the requested version.
+pub const BindHandler = fn(context: *anyopaque, client: Client, resource: Object, version: u32) -> void
+pub const ClientHandler = fn(context: *anyopaque, client: Client) -> void
+
+const ResourceEntry = struct {
+    interface: Interface
+    version: u32
+    status: u8
+    isRegistry: bool
+    hasHandler: bool
+    handler: RequestHandler
+    context: *anyopaque
+    hasDestroyHandler: bool
+    destroyHandler: DestroyHandler
+    destroyContext: *anyopaque
+}
+
+const GlobalEntry = struct {
+    name: u32
+    interface: Interface
+    version: u32
+    removed: bool
+    handler: BindHandler
+    context: *anyopaque
+}
+
+// `path` is the first field: the listener's address is its NUL-terminated
+// socket path.
+const Listener = struct {
+    path: [112]u8
+    pathLength: usize
+    descriptor: isize
+    lock: isize
+}
+
+const ClientCallbacks = struct {
+    hasCreated: bool
+    created: ClientHandler
+    createdContext: *anyopaque
+    hasDestroyed: bool
+    destroyed: ClientHandler
+    destroyedContext: *anyopaque
+}
+
+fn ignoreRequest(context: *anyopaque, request: Request) -> void {}
+fn ignoreDestroy(context: *anyopaque, object: Object) -> void {}
+fn ignoreBind(context: *anyopaque, client: Client, resource: Object, version: u32) -> void {}
+fn ignoreClient(context: *anyopaque, client: Client) -> void {}
+
+fn dummyContext() -> *anyopaque {
+    unsafe { return @ptrFromInt(*anyopaque, 1) }
+}
+
+// The display: listening sockets, clients, globals and the event loop.
+pub const Display = struct {
+    state: *State
+
+    pub fn init(display: *Self, allocator: Allocator) -> Error!void {
+        const memory = allocator.alloc(@sizeOf(State), @alignOf(State))
+        const events = allocator.alloc(@sizeOf(transport.Events), 16)
+        if memory == null || events == null { return Error.OutOfMemory }
+        const event_loop = transport.createEventLoop()
+        if event_loop < 0 { return Error.EventLoopFailed }
+        var state: *State = undefined
+        unsafe {
+            state = @ptrCast(*State, memory.?)
+            state.*.events = @ptrCast(*transport.Events, events.?)
+        }
+        state.*.allocator = allocator
+        state.*.eventLoop = event_loop
+        var listeners: Vector = undefined
+        Vector.initAt(&listeners, allocator, @sizeOf(Listener), @alignOf(Listener), 4)
+        var clients: Vector = undefined
+        Vector.initAt(&clients, allocator, 8, 8, 16)
+        var globals: Vector = undefined
+        Vector.initAt(&globals, allocator, @sizeOf(GlobalEntry), @alignOf(GlobalEntry), 16)
+        var callbacks: Vector = undefined
+        Vector.initAt(&callbacks, allocator, @sizeOf(ClientCallbacks), @alignOf(ClientCallbacks), 1)
+        var record: ClientCallbacks = undefined
+        record.hasCreated = false
+        record.created = ignoreClient
+        record.createdContext = dummyContext()
+        record.hasDestroyed = false
+        record.destroyed = ignoreClient
+        record.destroyedContext = dummyContext()
+        unsafe { const appended = Vector.appendAt(&callbacks, @ptrCast([*]const u8, &record)) }
+        state.*.listeners = listeners
+        state.*.clients = clients
+        state.*.globals = globals
+        state.*.callbacks = callbacks
+        state.*.nextGlobalName = 1
+        state.*.serial = 0
+        state.*.running = true
+        display.*.state = state
+    }
+
+    // Disconnects every client, removes the sockets and releases the display.
+    pub fn deinit(self: Self) -> void { releaseDisplay(self.state) }
+
+    // Listens on $XDG_RUNTIME_DIR/<name> (or on <name> when absolute),
+    // guarded by the "<socket>.lock" file as libwayland does.
+    pub fn addSocket(self: Self, name: []const u8) -> Error!void { return addSocketState(self.state, name) }
+
+    // Adds an already connected stream socket as a client.
+    pub fn addClient(self: Self, handle: Handle, client: *Client) -> Error!void {
+        if !handle.isValid() || !transport.setNonBlocking(handle.descriptor) { return Error.SocketFailed }
+        const created = createClient(self.state, handle.descriptor)
+        if created == null { return Error.OutOfMemory }
+        client.*.state = created.?
+    }
+
+    // Advertises a global. Returns its registry name (0 when out of memory).
+    pub fn createGlobal(self: Self, interface: Interface, version: u32, handler: BindHandler, context: *anyopaque) -> u32 {
+        return createGlobalState(self.state, interface, version, handler, context)
+    }
+
+    // Withdraws a global: registries receive global_remove.
+    pub fn removeGlobal(self: Self, name: u32) -> void { removeGlobalState(self.state, name) }
+
+    pub fn setClientCreatedHandler(self: Self, handler: ClientHandler, context: *anyopaque) -> void {
+        const record = callbacksOf(self.state.*.callbacks)
+        record.*.hasCreated = true
+        record.*.created = handler
+        record.*.createdContext = context
+    }
+
+    pub fn setClientDestroyedHandler(self: Self, handler: ClientHandler, context: *anyopaque) -> void {
+        const record = callbacksOf(self.state.*.callbacks)
+        record.*.hasDestroyed = true
+        record.*.destroyed = handler
+        record.*.destroyedContext = context
+    }
+
+    // Waits up to `timeout_milliseconds` (negative: forever) for activity,
+    // accepts connections, dispatches requests and flushes clients.
+    pub fn dispatch(self: Self, timeout_milliseconds: isize) -> Error!void {
+        return dispatchDisplay(self.state, timeout_milliseconds)
+    }
+
+    pub fn flushClients(self: Self) -> void { flushAll(self.state) }
+    pub fn running(self: Self) -> bool { return self.state.*.running }
+    pub fn terminate(self: Self) -> void { self.state.*.running = false }
+    // The epoll descriptor, for integration with an outer event loop.
+    pub fn descriptor(self: Self) -> isize { return self.state.*.eventLoop }
+    pub fn clientCount(self: Self) -> usize { return self.state.*.clients.length }
+
+    pub fn nextSerial(self: Self) -> u32 {
+        self.state.*.serial +%= 1
+        return self.state.*.serial
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tables
+
+fn callbacksOf(list: Vector) -> *ClientCallbacks {
+    unsafe { return @ptrCast(*ClientCallbacks, list.at(0)) }
+}
+
+fn entryAt(list: Vector, index: usize) -> *ResourceEntry {
+    unsafe { return @ptrCast(*ResourceEntry, list.at(index)) }
+}
+
+fn globalAt(state: *State, index: usize) -> *GlobalEntry {
+    unsafe { return @ptrCast(*GlobalEntry, state.*.globals.at(index)) }
+}
+
+fn listenerAt(state: *State, index: usize) -> *Listener {
+    unsafe { return @ptrCast(*Listener, state.*.listeners.at(index)) }
+}
+
+fn clientAt(state: *State, index: usize) -> *ClientState {
+    unsafe { return @ptrCast(**ClientState, state.*.clients.at(index)).* }
+}
+
+fn lookup(client: *ClientState, id: u32) -> ?*ResourceEntry {
+    if id == 0 { return null }
+    if id >= wire.SERVER_ID_START {
+        const index = @intCast(usize, id - wire.SERVER_ID_START)
+        if index >= client.*.serverObjects.length { return null }
+        return entryAt(client.*.serverObjects, index)
+    }
+    const index = @intCast(usize, id)
+    if index >= client.*.objects.length { return null }
+    return entryAt(client.*.objects, index)
+}
+
+fn emptyEntry(entry: *ResourceEntry) -> void {
+    entry.*.interface = Interface.wl_display
+    entry.*.version = 0
+    entry.*.status = STATUS_FREE
+    entry.*.isRegistry = false
+    entry.*.hasHandler = false
+    entry.*.handler = ignoreRequest
+    entry.*.context = dummyContext()
+    entry.*.hasDestroyHandler = false
+    entry.*.destroyHandler = ignoreDestroy
+    entry.*.destroyContext = dummyContext()
+}
+
+fn grow(client: *ClientState, server_range: bool, length: usize) -> bool {
+    var list = client.*.objects
+    if server_range { list = client.*.serverObjects }
+    var ok = true
+    while ok && list.length < length {
+        var entry: ResourceEntry = undefined
+        emptyEntry(&entry)
+        unsafe { ok = Vector.appendAt(&list, @ptrCast([*]const u8, &entry)) }
+    }
+    if server_range { client.*.serverObjects = list } else { client.*.objects = list }
+    return ok
+}
+
+fn register(client: *ClientState, id: u32, interface: Interface, version: u32) -> bool {
+    const server_range = id >= wire.SERVER_ID_START
+    const index = if server_range { @intCast(usize, id - wire.SERVER_ID_START) } else { @intCast(usize, id) }
+    if !grow(client, server_range, index + 1) {
+        client.*.dead = true
+        return false
+    }
+    const entry = lookup(client, id).?
+    emptyEntry(entry)
+    entry.*.interface = interface
+    entry.*.version = version
+    entry.*.status = STATUS_LIVE
+    return true
+}
+
+// ---------------------------------------------------------------------------
+// Resources (used by generated resource types)
+
+pub fn objectVersion(object: Object) -> u32 {
+    const entry = lookup(object.client.state, object.id)
+    if entry == null { return 0 }
+    return entry.?.*.version
+}
+
+pub fn objectInterface(object: Object) -> Interface {
+    const entry = lookup(object.client.state, object.id)
+    if entry == null { return Interface.wl_display }
+    return entry.?.*.interface
+}
+
+pub fn nullObject(object: Object) -> Object {
+    return Object.{ .client = object.client, .id = 0 }
+}
+
+pub fn isLive(object: Object) -> bool {
+    const entry = lookup(object.client.state, object.id)
+    return entry != null && entry.?.*.status == STATUS_LIVE
+}
+
+pub fn setHandler(object: Object, handler: RequestHandler, context: *anyopaque) -> void {
+    const entry = lookup(object.client.state, object.id)
+    if entry == null { return }
+    entry.?.*.handler = handler
+    entry.?.*.context = context
+    entry.?.*.hasHandler = true
+}
+
+pub fn setDestroyHandler(object: Object, handler: DestroyHandler, context: *anyopaque) -> void {
+    const entry = lookup(object.client.state, object.id)
+    if entry == null { return }
+    entry.?.*.destroyHandler = handler
+    entry.?.*.destroyContext = context
+    entry.?.*.hasDestroyHandler = true
+}
+
+fn sendDisplayEvent(client: *ClientState, opcode: u16, object_id: u32, code: u32, text: [*]const u8, text_length: usize) -> void {
+    if client.*.dead { return }
+    var message: wire.Writer = undefined
+    wire.begin(&message, DISPLAY_ID, opcode)
+    if opcode == 0 {
+        wire.putObject(&message, object_id)
+        wire.putUint(&message, code)
+        wire.putStringParts(&message, text, text_length)
+    } else {
+        wire.putUint(&message, object_id)
+    }
+    if !wire.finish(&message) { return }
+    if transport.queue(client.*.connection, &message) != 0 { client.*.dead = true }
+}
+
+// Destroys a resource: runs its destroy handler, releases the id and, for a
+// client-created id, sends wl_display.delete_id.
+pub fn destroyObject(object: Object) -> void {
+    const client = object.client.state
+    const entry = lookup(client, object.id)
+    if entry == null || entry.?.*.status != STATUS_LIVE || object.id == DISPLAY_ID { return }
+    const has_destroy = entry.?.*.hasDestroyHandler
+    const handler = entry.?.*.destroyHandler
+    const context = entry.?.*.destroyContext
+    emptyEntry(entry.?)
+    if has_destroy { handler(context, object) }
+    if object.id < wire.SERVER_ID_START {
+        unsafe { sendDisplayEvent(client, 1, object.id, 0, @ptrFromInt([*]const u8, 1), 0) }
+    } else {
+        var free = client.*.freeServerIds
+        var value = object.id
+        unsafe { const ignored = Vector.appendAt(&free, @ptrCast([*]const u8, &value)) }
+        client.*.freeServerIds = free
+    }
+}
+
+// Sends wl_display.error for `object` and disconnects the client after the
+// error has been flushed.
+pub fn postError(object: Object, code: u32, message: []const u8) -> void {
+    var length: usize = 0
+    for byte in message { length += 1 }
+    unsafe { postErrorRaw(object.client.state, object.id, code, @ptrCast([*]const u8, message), length) }
+}
+
+fn postErrorRaw(client: *ClientState, object_id: u32, code: u32, text: [*]const u8, text_length: usize) -> void {
+    sendDisplayEvent(client, 0, object_id, code, text, text_length)
+    client.*.dead = true
+}
+
+pub fn beginEvent(object: Object, opcode: u16, since: u32, message: *wire.Writer) -> bool {
+    const client = object.client.state
+    if client.*.dead { return false }
+    const entry = lookup(client, object.id)
+    if entry == null || entry.?.*.status != STATUS_LIVE { return false }
+    // Events newer than the resource's version are never sent.
+    if entry.?.*.version < since { return false }
+    wire.begin(message, object.id, opcode)
+    return true
+}
+
+// Allocates a server-side id for a new_id event argument.
+pub fn createObject(parent: Object, interface: Interface, version: u32) -> Object {
+    const client = parent.client.state
+    var id: u32 = 0
+    if client.*.freeServerIds.length > 0 {
+        unsafe { id = @ptrCast(*u32, client.*.freeServerIds.at(client.*.freeServerIds.length - 1)).* }
+        client.*.freeServerIds = client.*.freeServerIds.pop()
+    } else {
+        id = wire.SERVER_ID_START + @intCast(u32, client.*.serverObjects.length)
+    }
+    if !register(client, id, interface, version) { return nullObject(parent) }
+    return Object.{ .client = parent.client, .id = id }
+}
+
+pub fn putObject(owner: Object, message: *wire.Writer, object: Object) -> void {
+    wire.putObject(message, object.id)
+}
+
+// Puts an fd argument. The caller keeps ownership of `handle`.
+pub fn putHandle(owner: Object, message: *wire.Writer, handle: Handle) -> void {
+    const copy = handle.duplicate()
+    if !copy.isValid() {
+        owner.client.state.*.dead = true
+        return
+    }
+    wire.putHandle(message, copy.descriptor)
+}
+
+fn closeWriterHandles(message: *const wire.Writer) -> void {
+    var index: usize = 0
+    while index < message.*.handleCount {
+        transport.close(wire.handleAt(message, index))
+        index += 1
+    }
+}
+
+pub fn endEvent(object: Object, message: *wire.Writer, destructor: bool) -> void {
+    const client = object.client.state
+    if client.*.dead || !wire.finish(message) {
+        closeWriterHandles(message)
+        return
+    }
+    if transport.queue(client.*.connection, message) != 0 {
+        // The client stopped reading and its buffer is full.
+        closeWriterHandles(message)
+        client.*.dead = true
+        return
+    }
+    if destructor { destroyObject(object) }
+}
+
+pub fn requestReader(request: Request) -> wire.Reader {
+    var reader: wire.Reader = undefined
+    wire.initReader(&reader, request.payload, request.payloadLength, request.handles, request.handleCount)
+    return reader
+}
+
+pub fn requestObject(request: Request, id: u32) -> Object {
+    return Object.{ .client = request.client, .id = id }
+}
+
+// ---------------------------------------------------------------------------
+// Clients
+
+fn createClient(state: *State, descriptor: isize) -> ?*ClientState {
+    const allocator = state.*.allocator
+    const memory = allocator.alloc(@sizeOf(ClientState), @alignOf(ClientState))
+    const connection_memory = allocator.alloc(@sizeOf(transport.Connection), @alignOf(transport.Connection))
+    if memory == null || connection_memory == null {
+        transport.close(descriptor)
+        return null
+    }
+    var client: *ClientState = undefined
+    unsafe {
+        client = @ptrCast(*ClientState, memory.?)
+        client.*.connection = @ptrCast(*transport.Connection, connection_memory.?)
+    }
+    if !transport.init(client.*.connection, allocator, descriptor) {
+        transport.close(descriptor)
+        return null
+    }
+    client.*.display = state
+    client.*.dead = false
+    var objects: Vector = undefined
+    Vector.initAt(&objects, allocator, @sizeOf(ResourceEntry), @alignOf(ResourceEntry), 64)
+    var server_objects: Vector = undefined
+    Vector.initAt(&server_objects, allocator, @sizeOf(ResourceEntry), @alignOf(ResourceEntry), 8)
+    var free_ids: Vector = undefined
+    Vector.initAt(&free_ids, allocator, 4, 4, 8)
+    client.*.objects = objects
+    client.*.serverObjects = server_objects
+    client.*.freeServerIds = free_ids
+    if !grow(client, false, 1) || !register(client, DISPLAY_ID, Interface.wl_display, 1) { return null }
+    var clients = state.*.clients
+    var address = @intFromPtr(client)
+    unsafe {
+        if !Vector.appendAt(&clients, @ptrCast([*]const u8, &address)) { return null }
+    }
+    state.*.clients = clients
+    if !transport.watch(state.*.eventLoop, descriptor, address, false) { client.*.dead = true }
+    const record = callbacksOf(state.*.callbacks)
+    if record.*.hasCreated { record.*.created(record.*.createdContext, Client.{ .state = client }) }
+    return client
+}
+
+fn destroyClient(state: *State, client: *ClientState) -> void {
+    const ignored = transport.flush(client.*.connection)
+    // Resources are destroyed without delete_id: the client is gone.
+    var index: usize = 0
+    while index < client.*.objects.length + client.*.serverObjects.length {
+        var id: u32 = 0
+        if index < client.*.objects.length {
+            id = @intCast(u32, index)
+        } else {
+            id = wire.SERVER_ID_START + @intCast(u32, index - client.*.objects.length)
+        }
+        const entry = lookup(client, id)
+        if entry != null && entry.?.*.status == STATUS_LIVE {
+            const has_destroy = entry.?.*.hasDestroyHandler
+            const handler = entry.?.*.destroyHandler
+            const context = entry.?.*.destroyContext
+            emptyEntry(entry.?)
+            if has_destroy { handler(context, Object.{ .client = Client.{ .state = client }, .id = id }) }
+        }
+        index += 1
+    }
+    const record = callbacksOf(state.*.callbacks)
+    if record.*.hasDestroyed { record.*.destroyed(record.*.destroyedContext, Client.{ .state = client }) }
+    const unwatched = transport.unwatch(state.*.eventLoop, client.*.connection.*.descriptor)
+    transport.deinit(client.*.connection)
+    client.*.objects.deinit()
+    client.*.serverObjects.deinit()
+    client.*.freeServerIds.deinit()
+    const allocator = state.*.allocator
+    unsafe {
+        allocator.free(@ptrCast([*]u8, client.*.connection), @sizeOf(transport.Connection), @alignOf(transport.Connection))
+        allocator.free(@ptrCast([*]u8, client), @sizeOf(ClientState), @alignOf(ClientState))
+    }
+}
+
+// Removes and releases every client marked dead.
+fn reapClients(state: *State) -> void {
+    var index: usize = 0
+    while index < state.*.clients.length {
+        const client = clientAt(state, index)
+        if client.*.dead {
+            const last = state.*.clients.length - 1
+            if index != last {
+                var moved = @intFromPtr(clientAt(state, last))
+                unsafe {
+                    const slot = @ptrCast(*usize, state.*.clients.at(index))
+                    slot.* = moved
+                }
+            }
+            state.*.clients = state.*.clients.pop()
+            destroyClient(state, client)
+        } else {
+            index += 1
+        }
+    }
+}
+
+fn flushAll(state: *State) -> void {
+    var index: usize = 0
+    while index < state.*.clients.length {
+        const client = clientAt(state, index)
+        const flushed = transport.flush(client.*.connection)
+        if flushed < 0 && flushed != transport.EAGAIN { client.*.dead = true }
+        index += 1
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Globals and registries
+
+fn sendGlobal(client: *ClientState, registry: u32, global: *const GlobalEntry) -> void {
+    if client.*.dead { return }
+    var message: wire.Writer = undefined
+    wire.begin(&message, registry, 0)
+    wire.putUint(&message, global.*.name)
+    wire.putStringSlice(&message, interfaces.interfaceName(global.*.interface))
+    wire.putUint(&message, global.*.version)
+    if !wire.finish(&message) { return }
+    if transport.queue(client.*.connection, &message) != 0 { client.*.dead = true }
+}
+
+fn sendGlobalRemove(client: *ClientState, registry: u32, name: u32) -> void {
+    if client.*.dead { return }
+    var message: wire.Writer = undefined
+    wire.begin(&message, registry, 1)
+    wire.putUint(&message, name)
+    if !wire.finish(&message) { return }
+    if transport.queue(client.*.connection, &message) != 0 { client.*.dead = true }
+}
+
+fn forEachRegistry(state: *State, global_index: usize, removal: bool) -> void {
+    var c: usize = 0
+    while c < state.*.clients.length {
+        const client = clientAt(state, c)
+        var id: usize = 1
+        while id < client.*.objects.length {
+            const entry = entryAt(client.*.objects, id)
+            if entry.*.status == STATUS_LIVE && entry.*.isRegistry {
+                const global = globalAt(state, global_index)
+                if removal {
+                    sendGlobalRemove(client, @intCast(u32, id), global.*.name)
+                } else {
+                    sendGlobal(client, @intCast(u32, id), global)
+                }
+            }
+            id += 1
+        }
+        c += 1
+    }
+}
+
+fn createGlobalState(state: *State, interface: Interface, version: u32, handler: BindHandler, context: *anyopaque) -> u32 {
+    if version == 0 || version > interfaces.interfaceVersion(interface) { return 0 }
+    var global: GlobalEntry = undefined
+    global.name = state.*.nextGlobalName
+    global.interface = interface
+    global.version = version
+    global.removed = false
+    global.handler = handler
+    global.context = context
+    var globals = state.*.globals
+    var appended = false
+    unsafe { appended = Vector.appendAt(&globals, @ptrCast([*]const u8, &global)) }
+    state.*.globals = globals
+    if !appended { return 0 }
+    state.*.nextGlobalName += 1
+    forEachRegistry(state, state.*.globals.length - 1, false)
+    return global.name
+}
+
+fn findGlobal(state: *State, name: u32) -> ?*GlobalEntry {
+    var index: usize = 0
+    while index < state.*.globals.length {
+        const global = globalAt(state, index)
+        if global.*.name == name { return global }
+        index += 1
+    }
+    return null
+}
+
+fn removeGlobalState(state: *State, name: u32) -> void {
+    var index: usize = 0
+    while index < state.*.globals.length {
+        const global = globalAt(state, index)
+        if global.*.name == name && !global.*.removed {
+            global.*.removed = true
+            forEachRegistry(state, index, true)
+        }
+        index += 1
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Request dispatch
+
+// Creates resources for new_id arguments. Returns false (after posting a
+// protocol error) when an id is invalid.
+fn registerNewObjects(client: *ClientState, interface: Interface, version: u32, opcode: u16, signature: []const u8, payload: [*]const u8) -> bool {
+    var position: usize = 0
+    var argument: usize = 0
+    var last_string_position: usize = 0
+    var last_uint: u32 = 0
+    for byte in signature {
+        if byte == 105 || byte == 102 || byte == 111 {
+            position += 4
+            argument += 1
+        } else if byte == 117 {
+            last_uint = wire.load32(payload, position)
+            position += 4
+            argument += 1
+        } else if byte == 110 {
+            const id = wire.load32(payload, position)
+            var target = Interface.wl_display
+            var target_version = version
+            if !interfaces.requestArgInterface(interface, opcode, argument, &target) {
+                // Generic new_id: the preceding string and uint name the
+                // interface and version.
+                const size = @intCast(usize, wire.load32(payload, last_string_position))
+                unsafe {
+                    const name = @ptrFromInt([*]const u8, @intFromPtr(payload) + last_string_position + 4)
+                    if size == 0 || !interfaces.lookup(name, size - 1, &target) {
+                        postErrorRaw(client, id, ERROR_INVALID_OBJECT, @ptrCast([*]const u8, "unknown interface for new id"), 28)
+                        return false
+                    }
+                }
+                target_version = last_uint
+                if target_version == 0 || target_version > interfaces.interfaceVersion(target) {
+                    postErrorRaw(client, id, ERROR_INVALID_OBJECT, @ptrCast([*]const u8, "invalid version for new id"), 26)
+                    return false
+                }
+            }
+            const existing = lookup(client, id)
+            const in_use = existing != null && existing.?.*.status != STATUS_FREE
+            if id == 0 || id >= wire.SERVER_ID_START || in_use || @intCast(usize, id) > client.*.objects.length {
+                postErrorRaw(client, id, ERROR_INVALID_OBJECT, @ptrCast([*]const u8, "invalid new id"), 14)
+                return false
+            }
+            if !register(client, id, target, target_version) { return false }
+            position += 4
+            argument += 1
+        } else if byte == 115 || byte == 97 {
+            last_string_position = position
+            const size = @intCast(usize, wire.load32(payload, position))
+            position += 4 + wire.padded(size)
+            argument += 1
+        } else if byte == 104 {
+            argument += 1
+        }
+    }
+    return true
+}
+
+fn closeHandles(handles: [*]const isize, count: usize) -> void {
+    var index: usize = 0
+    while index < count {
+        transport.close(handles[index])
+        index += 1
+    }
+}
+
+fn handleDisplayRequest(state: *State, client: *ClientState, opcode: u16, payload: [*]const u8) -> void {
+    const id = wire.load32(payload, 0)
+    const client_value = Client.{ .state = client }
+    if opcode == 0 {
+        // sync: the callback's done event carries the event serial, and the
+        // destructor event destroys the callback (delete_id follows).
+        var message: wire.Writer = undefined
+        const callback = Object.{ .client = client_value, .id = id }
+        if beginEvent(callback, 0, 1, &message) {
+            state.*.serial +%= 1
+            wire.putUint(&message, state.*.serial)
+            endEvent(callback, &message, true)
+        }
+        return
+    }
+    // get_registry: advertise every live global.
+    const entry = lookup(client, id).?
+    entry.*.isRegistry = true
+    var index: usize = 0
+    while index < state.*.globals.length {
+        const global = globalAt(state, index)
+        if !global.*.removed { sendGlobal(client, id, global) }
+        index += 1
+    }
+}
+
+fn handleBind(state: *State, client: *ClientState, payload: [*]const u8) -> void {
+    var reader: wire.Reader = undefined
+    unsafe { wire.initReader(&reader, payload, wire.MAX_MESSAGE_SIZE, @ptrFromInt([*]const isize, 8), 0) }
+    const name = wire.getUint(&reader)
+    const interface_name = wire.getString(&reader)
+    const version = wire.getUint(&reader)
+    const id = wire.getNewId(&reader)
+    const global = findGlobal(state, name)
+    var ok = global != null
+    if ok { ok = string.eql(interface_name, string.fromSlice(interfaces.interfaceName(global.?.*.interface))) }
+    if !ok {
+        postErrorRaw(client, id, ERROR_INVALID_OBJECT, @ptrCast([*]const u8, "invalid global"), 14)
+        return
+    }
+    if version == 0 || version > global.?.*.version {
+        postErrorRaw(client, id, ERROR_INVALID_OBJECT, @ptrCast([*]const u8, "invalid version for global"), 26)
+        return
+    }
+    if global.?.*.removed { return }
+    const handler = global.?.*.handler
+    const context = global.?.*.context
+    const client_value = Client.{ .state = client }
+    handler(context, client_value, Object.{ .client = client_value, .id = id }, version)
+}
+
+// Dispatches one complete buffered request. Returns 1 when a request was
+// handled, 0 when more input is needed, -1 when the client failed.
+fn dispatchOne(state: *State, client: *ClientState) -> isize {
+    const connection = client.*.connection
+    const available = transport.bufferedInput(connection)
+    if available < wire.HEADER_SIZE { return 0 }
+    const bytes = transport.inputPointer(connection)
+    const size = wire.headerSize(bytes)
+    if size < wire.HEADER_SIZE || size > wire.MAX_MESSAGE_SIZE || (size & 3) != 0 {
+        client.*.dead = true
+        return -1
+    }
+    if available < size { return 0 }
+    const id = wire.headerObject(bytes)
+    const opcode = wire.headerOpcode(bytes)
+    const found = lookup(client, id)
+    if found == null || found.?.*.status != STATUS_LIVE {
+        unsafe { postErrorRaw(client, DISPLAY_ID, ERROR_INVALID_OBJECT, @ptrCast([*]const u8, "invalid object"), 14) }
+        return -1
+    }
+    const interface = found.?.*.interface
+    const version = found.?.*.version
+    if opcode >= interfaces.requestCount(interface) {
+        unsafe { postErrorRaw(client, id, ERROR_INVALID_METHOD, @ptrCast([*]const u8, "invalid method"), 14) }
+        return -1
+    }
+    const signature = interfaces.requestSignature(interface, opcode)
+    const handle_count = wire.signatureHandleCount(signature)
+    if transport.bufferedHandles(connection) < handle_count { return 0 }
+    var payload: [*]const u8 = undefined
+    unsafe { payload = @ptrFromInt([*]const u8, @intFromPtr(bytes) + wire.HEADER_SIZE) }
+    const payload_length = size - wire.HEADER_SIZE
+    if !wire.validate(signature, payload, payload_length, handle_count) {
+        unsafe { postErrorRaw(client, id, ERROR_INVALID_METHOD, @ptrCast([*]const u8, "invalid arguments"), 17) }
+        return -1
+    }
+    if wire.signatureSince(signature) > version {
+        unsafe { postErrorRaw(client, id, ERROR_INVALID_METHOD, @ptrCast([*]const u8, "request not supported by object version"), 39) }
+        return -1
+    }
+
+    var copy: [4096]u8 = undefined
+    var handles: [28]isize = undefined
+    var index: usize = 0
+    while index < payload_length {
+        copy[index] = payload[index]
+        index += 1
+    }
+    const queued_handles = transport.handlePointer(connection)
+    index = 0
+    while index < handle_count {
+        handles[index] = queued_handles[index]
+        index += 1
+    }
+    transport.consume(connection, size, handle_count)
+    var copied_payload: [*]const u8 = undefined
+    var copied_handles: [*]const isize = undefined
+    unsafe {
+        copied_payload = @ptrCast([*]const u8, &copy)
+        copied_handles = @ptrCast([*]const isize, &handles)
+    }
+
+    if !registerNewObjects(client, interface, version, opcode, signature, copied_payload) {
+        closeHandles(copied_handles, handle_count)
+        return -1
+    }
+    if interface == Interface.wl_display {
+        handleDisplayRequest(state, client, opcode, copied_payload)
+        return 1
+    }
+    if interface == Interface.wl_registry {
+        handleBind(state, client, copied_payload)
+        return 1
+    }
+    const entry = lookup(client, id).?
+    const has_handler = entry.*.hasHandler
+    const handler = entry.*.handler
+    const context = entry.*.context
+    const client_value = Client.{ .state = client }
+    const object = Object.{ .client = client_value, .id = id }
+    if has_handler {
+        const request = Request.{
+            .client = client_value,
+            .object = object,
+            .interface = interface,
+            .opcode = opcode,
+            .payload = copied_payload,
+            .payloadLength = payload_length,
+            .handles = copied_handles,
+            .handleCount = handle_count,
+        }
+        handler(context, request)
+    } else {
+        closeHandles(copied_handles, handle_count)
+    }
+    if interfaces.requestDestructor(interface, opcode) { destroyObject(object) }
+    return 1
+}
+
+fn serviceClient(state: *State, client: *ClientState) -> void {
+    while !client.*.dead {
+        const received = transport.receive(client.*.connection)
+        if received == transport.EAGAIN { return }
+        if received <= 0 {
+            client.*.dead = true
+            return
+        }
+        while !client.*.dead {
+            if dispatchOne(state, client) <= 0 { break }
+        }
+    }
+}
+
+fn acceptClients(state: *State, listener: *Listener) -> void {
+    while true {
+        const descriptor = transport.accept(listener.*.descriptor)
+        if descriptor < 0 { return }
+        const created = createClient(state, descriptor)
+    }
+}
+
+fn dispatchDisplay(state: *State, timeout_milliseconds: isize) -> Error!void {
+    flushAll(state)
+    reapClients(state)
+    const count = transport.waitEvents(state.*.eventLoop, state.*.events, timeout_milliseconds)
+    if count < 0 { return Error.EventLoopFailed }
+    var index: usize = 0
+    while index < state.*.events.*.count {
+        const token = transport.eventToken(state.*.events, index)
+        if token < LISTENER_TOKENS {
+            if token < state.*.listeners.length { acceptClients(state, listenerAt(state, token)) }
+        } else {
+            // The token is the client's address; skip clients reaped while
+            // handling earlier records of this batch.
+            var c: usize = 0
+            while c < state.*.clients.length {
+                const client = clientAt(state, c)
+                if @intFromPtr(client) == token { serviceClient(state, client) }
+                c += 1
+            }
+        }
+        index += 1
+    }
+    flushAll(state)
+    reapClients(state)
+}
+
+// ---------------------------------------------------------------------------
+// Sockets
+
+fn addSocketState(state: *State, name: []const u8) -> Error!void {
+    var listener: Listener = undefined
+    listener.pathLength = 0
+    var name_length: usize = 0
+    for byte in name { name_length += 1 }
+    if name_length == 0 { return Error.SocketFailed }
+    if name[0] != 47 {
+        var environment: transport.Environment = undefined
+        if !transport.loadEnvironment(&environment, state.*.allocator) { return Error.NoRuntimeDirectory }
+        const runtime = transport.lookupEnvironment(&environment, "XDG_RUNTIME_DIR")
+        if wire.isNull(runtime) || runtime.length == 0 || runtime.length + 1 + name_length > 100 {
+            transport.freeEnvironment(&environment)
+            return Error.NoRuntimeDirectory
+        }
+        var index: usize = 0
+        while index < runtime.length {
+            listener.path[listener.pathLength] = runtime.pointer[index]
+            listener.pathLength += 1
+            index += 1
+        }
+        listener.path[listener.pathLength] = 47
+        listener.pathLength += 1
+        transport.freeEnvironment(&environment)
+    }
+    if listener.pathLength + name_length > 100 { return Error.SocketFailed }
+    for byte in name {
+        listener.path[listener.pathLength] = byte
+        listener.pathLength += 1
+    }
+    // "<path>.lock" guards the socket; a stale socket is removed once the
+    // lock is held.
+    var lock_path: [112]u8 = undefined
+    var index: usize = 0
+    while index < listener.pathLength {
+        lock_path[index] = listener.path[index]
+        index += 1
+    }
+    lock_path[index] = 46
+    lock_path[index + 1] = 108
+    lock_path[index + 2] = 111
+    lock_path[index + 3] = 99
+    lock_path[index + 4] = 107
+    lock_path[index + 5] = 0
+    listener.path[listener.pathLength] = 0
+    var lock: isize = -1
+    var descriptor: isize = -1
+    unsafe {
+        lock = transport.lockPath(@ptrCast([*]const u8, &lock_path))
+        if lock < 0 { return Error.AddressInUse }
+        transport.unlinkPath(@ptrCast([*]const u8, &listener))
+        descriptor = transport.listenPath(@ptrCast([*]const u8, &listener), listener.pathLength)
+    }
+    if descriptor < 0 {
+        transport.close(lock)
+        return Error.SocketFailed
+    }
+    listener.descriptor = descriptor
+    listener.lock = lock
+    const token = state.*.listeners.length
+    if !transport.watch(state.*.eventLoop, descriptor, token, false) {
+        transport.close(descriptor)
+        transport.close(lock)
+        return Error.EventLoopFailed
+    }
+    var listeners = state.*.listeners
+    var appended = false
+    unsafe { appended = Vector.appendAt(&listeners, @ptrCast([*]const u8, &listener)) }
+    state.*.listeners = listeners
+    if !appended { return Error.OutOfMemory }
+}
+
+fn releaseDisplay(state: *State) -> void {
+    var index: usize = 0
+    while index < state.*.clients.length {
+        clientAt(state, index).*.dead = true
+        index += 1
+    }
+    reapClients(state)
+    index = 0
+    while index < state.*.listeners.length {
+        const listener = listenerAt(state, index)
+        transport.close(listener.*.descriptor)
+        unsafe { transport.unlinkPath(@ptrCast([*]const u8, listener)) }
+        // Remove "<path>.lock" as well.
+        var lock_path: [112]u8 = undefined
+        var byte: usize = 0
+        while byte < listener.*.pathLength {
+            lock_path[byte] = listener.*.path[byte]
+            byte += 1
+        }
+        lock_path[byte] = 46
+        lock_path[byte + 1] = 108
+        lock_path[byte + 2] = 111
+        lock_path[byte + 3] = 99
+        lock_path[byte + 4] = 107
+        lock_path[byte + 5] = 0
+        unsafe { transport.unlinkPath(@ptrCast([*]const u8, &lock_path)) }
+        transport.close(listener.*.lock)
+        index += 1
+    }
+    transport.close(state.*.eventLoop)
+    state.*.listeners.deinit()
+    state.*.clients.deinit()
+    state.*.globals.deinit()
+    state.*.callbacks.deinit()
+    const allocator = state.*.allocator
+    unsafe {
+        allocator.free(@ptrCast([*]u8, state.*.events), @sizeOf(transport.Events), 16)
+        allocator.free(@ptrCast([*]u8, state), @sizeOf(State), @alignOf(State))
+    }
+}

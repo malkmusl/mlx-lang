@@ -234,6 +234,20 @@ const c = @sizeOf(b)
 
 (`tests/04_comptime.mlx`)
 
+`@offsetOf` (like `@sizeOf`) is a compile-time constant for a type from
+another module as well as a local one, wherever it is used — a call
+argument, a local, a condition:
+
+```mlx
+const layout = @import("./support/layout_types.mlx")
+
+if second("a slice before it", @offsetOf(layout.Tagged, "extent"), 0) != 16 { return 4 }
+const imported = @offsetOf(layout.Tagged, "flags")
+```
+
+(`tests/250_offsetof_runtime.mlx`, with the aggregates in
+`tests/support/layout_types.mlx`)
+
 Calling an unknown/undefined builtin name is rejected at compile time
 (`tests/12_unknown_builtin.mlx`).
 

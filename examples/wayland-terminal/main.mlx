@@ -1,0 +1,452 @@
+// A small Wayland terminal emulator written with std.wayland.
+//
+// It runs a shell on a pseudo-terminal, shows its output in an xdg_toplevel
+// window rendered with a built-in 8x8 bitmap font (80x24 cells to start
+// with; the window follows the size its compositor configures, and the
+// shell learns the new size), and sends keyboard input (US layout, with
+// Shift, Ctrl, Caps Lock and key repeat) to the shell. Output is interpreted as a dumb terminal (TERM=dumb) with a
+// small escape-sequence subset; see screen.mlx.
+//
+//     mlx4 examples/wayland-terminal/main.mlx -o mlx-terminal
+//     ./mlx-terminal                  # runs /bin/sh
+//     ./mlx-terminal /bin/bash -l     # runs the given program (absolute path)
+//
+// examples/wayland-compositor launches it with Alt+Enter.
+
+const std = @import("std")
+const wl = @import("std.wayland")
+const screens = @import("./screen.mlx")
+const keys = @import("./keys.mlx")
+const pty = @import("./pty.mlx")
+
+// Two frames of the largest size; only the pages of the current size are
+// ever touched.
+const FRAME_SIZE: usize = 2 * screens.MAX_PIXEL_WIDTH * screens.MAX_PIXEL_HEIGHT * 4
+
+const App = struct {
+    display: wl.client.Display
+    registry: wl.wl_registry.Proxy
+    compositor: wl.wl_compositor.Proxy
+    shm: wl.wl_shm.Proxy
+    wmBase: wl.xdg_wm_base.Proxy
+    seat: wl.wl_seat.Proxy
+    keyboard: wl.wl_keyboard.Proxy
+    hasCompositor: bool
+    hasShm: bool
+    hasWmBase: bool
+    hasSeat: bool
+    hasKeyboard: bool
+    surface: wl.wl_surface.Proxy
+    xdgSurface: wl.xdg_surface.Proxy
+    toplevel: wl.xdg_toplevel.Proxy
+    memory: wl.SharedMemory
+    pool: wl.wl_shm_pool.Proxy
+    // The buffers' size (they are made again when it changes), and the
+    // window size the compositor asked for last (0: none).
+    bufferWidth: usize
+    bufferHeight: usize
+    wantedWidth: i32
+    wantedHeight: i32
+    firstBuffer: wl.wl_buffer.Proxy
+    secondBuffer: wl.wl_buffer.Proxy
+    firstBusy: bool
+    secondBusy: bool
+    configured: bool
+    framePending: bool
+    dirty: bool
+    running: bool
+    screen: *screens.Screen
+    child: pty.Child
+    hasChild: bool
+    shift: bool
+    control: bool
+    caps: bool
+    repeatKey: u32
+    repeating: bool
+    repeatAt: usize
+    repeatInterval: usize
+    repeatDelay: usize
+}
+
+fn appOf(context: *anyopaque) -> *App {
+    unsafe { return @ptrCast(*App, context) }
+}
+
+fn contextOf(app: *App) -> *anyopaque {
+    unsafe { return @ptrCast(*anyopaque, app) }
+}
+
+fn minimum(left: u32, right: u32) -> u32 {
+    return if left < right { left } else { right }
+}
+
+fn isNamed(value: wl.String, name: []const u8) -> bool {
+    return std.string.eql(value, std.string.fromSlice(name))
+}
+
+// ---------------------------------------------------------------------------
+// Keyboard
+
+fn sendKey(app: *App, key: u32) -> void {
+    var bytes: [4]u8 = undefined
+    var length: usize = 0
+    unsafe { length = keys.encode(key, app.*.shift, app.*.control, app.*.caps, @ptrCast([*]u8, &bytes)) }
+    if length == 0 { return }
+    const child = app.*.child
+    unsafe { pty.write(&child, @ptrCast([*]const u8, &bytes), length) }
+}
+
+fn keyPressed(app: *App, key: u32) -> void {
+    if key == keys.KEY_LEFTSHIFT || key == keys.KEY_RIGHTSHIFT { app.*.shift = true }
+    if key == keys.KEY_LEFTCTRL || key == keys.KEY_RIGHTCTRL { app.*.control = true }
+    if key == keys.KEY_CAPSLOCK { app.*.caps = !app.*.caps }
+    if keys.isModifier(key) { return }
+    sendKey(app, key)
+    if app.*.repeatInterval > 0 {
+        app.*.repeating = true
+        app.*.repeatKey = key
+        app.*.repeatAt = pty.milliseconds() + app.*.repeatDelay
+    }
+}
+
+fn keyReleased(app: *App, key: u32) -> void {
+    if key == keys.KEY_LEFTSHIFT || key == keys.KEY_RIGHTSHIFT { app.*.shift = false }
+    if key == keys.KEY_LEFTCTRL || key == keys.KEY_RIGHTCTRL { app.*.control = false }
+    if app.*.repeating && app.*.repeatKey == key { app.*.repeating = false }
+}
+
+fn onKeyboard(context: *anyopaque, event: wl.client.Event) -> void {
+    const app = appOf(context)
+    const decoded = wl.wl_keyboard.decodeEvent(event)
+    if event.opcode == wl.wl_keyboard.EVENT_KEYMAP {
+        // Keys are decoded from evdev codes; the xkb keymap is not needed.
+        decoded.keymap.fd.close()
+    } else if event.opcode == wl.wl_keyboard.EVENT_ENTER {
+        app.*.screen.*.focused = true
+        app.*.dirty = true
+    } else if event.opcode == wl.wl_keyboard.EVENT_LEAVE {
+        app.*.screen.*.focused = false
+        app.*.repeating = false
+        app.*.shift = false
+        app.*.control = false
+        app.*.dirty = true
+    } else if event.opcode == wl.wl_keyboard.EVENT_KEY {
+        if decoded.key.state == @intFromEnum(wl.wl_keyboard.KeyState.pressed) {
+            keyPressed(app, decoded.key.key)
+        } else {
+            keyReleased(app, decoded.key.key)
+        }
+    } else if event.opcode == wl.wl_keyboard.EVENT_REPEAT_INFO {
+        const rate = decoded.repeat_info.rate
+        if rate > 0 {
+            app.*.repeatInterval = 1000 / @intCast(usize, rate)
+            app.*.repeatDelay = @intCast(usize, decoded.repeat_info.delay)
+        } else {
+            app.*.repeatInterval = 0
+        }
+    }
+}
+
+fn onSeat(context: *anyopaque, event: wl.client.Event) -> void {
+    const app = appOf(context)
+    const decoded = wl.wl_seat.decodeEvent(event)
+    if event.opcode != wl.wl_seat.EVENT_CAPABILITIES { return }
+    const capabilities = decoded.capabilities.capabilities
+    if wl.flags.has(capabilities, @intFromEnum(wl.wl_seat.Capability.keyboard)) && !app.*.hasKeyboard {
+        app.*.keyboard = app.*.seat.getKeyboard()
+        app.*.keyboard.setHandler(onKeyboard, context)
+        app.*.hasKeyboard = true
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Window
+
+fn onRegistry(context: *anyopaque, event: wl.client.Event) -> void {
+    const app = appOf(context)
+    const decoded = wl.wl_registry.decodeEvent(event)
+    if event.opcode != wl.wl_registry.EVENT_GLOBAL { return }
+    const global = decoded.global
+    if isNamed(global.interface, "wl_compositor") {
+        app.*.compositor = wl.wl_compositor.Proxy.fromObject(app.*.registry.bind(global.name, wl.Interface.wl_compositor, minimum(global.version, 4)))
+        app.*.hasCompositor = true
+    } else if isNamed(global.interface, "wl_shm") {
+        app.*.shm = wl.wl_shm.Proxy.fromObject(app.*.registry.bind(global.name, wl.Interface.wl_shm, 1))
+        app.*.hasShm = true
+    } else if isNamed(global.interface, "xdg_wm_base") {
+        app.*.wmBase = wl.xdg_wm_base.Proxy.fromObject(app.*.registry.bind(global.name, wl.Interface.xdg_wm_base, minimum(global.version, 2)))
+        app.*.hasWmBase = true
+    } else if isNamed(global.interface, "wl_seat") && !app.*.hasSeat {
+        app.*.seat = wl.wl_seat.Proxy.fromObject(app.*.registry.bind(global.name, wl.Interface.wl_seat, minimum(global.version, 5)))
+        app.*.seat.setHandler(onSeat, context)
+        app.*.hasSeat = true
+    }
+}
+
+fn onWmBase(context: *anyopaque, event: wl.client.Event) -> void {
+    const decoded = wl.xdg_wm_base.decodeEvent(event)
+    appOf(context).*.wmBase.pong(decoded.ping.serial)
+}
+
+fn onXdgSurface(context: *anyopaque, event: wl.client.Event) -> void {
+    const app = appOf(context)
+    const decoded = wl.xdg_surface.decodeEvent(event)
+    // The size the toplevel configure asked for: as many whole cells as fit.
+    if app.*.wantedWidth > 0 && app.*.wantedHeight > 0 {
+        const padding = @intCast(i32, 2 * screens.PADDING)
+        const columns = if app.*.wantedWidth > padding { @intCast(usize, app.*.wantedWidth - padding) / screens.CELL_WIDTH } else { 0 }
+        const rows = if app.*.wantedHeight > padding { @intCast(usize, app.*.wantedHeight - padding) / screens.CELL_HEIGHT } else { 0 }
+        if screens.resize(app.*.screen, columns, rows) && app.*.hasChild {
+            const child = app.*.child
+            pty.resize(&child, @intCast(u16, app.*.screen.*.columns), @intCast(u16, app.*.screen.*.rows))
+        }
+    }
+    app.*.xdgSurface.ackConfigure(decoded.configure.serial)
+    app.*.configured = true
+    app.*.dirty = true
+}
+
+fn onToplevel(context: *anyopaque, event: wl.client.Event) -> void {
+    const app = appOf(context)
+    const decoded = wl.xdg_toplevel.decodeEvent(event)
+    if event.opcode == wl.xdg_toplevel.EVENT_CONFIGURE {
+        // 0 x 0: our choice (the size we have).
+        app.*.wantedWidth = decoded.configure.width
+        app.*.wantedHeight = decoded.configure.height
+    } else if event.opcode == wl.xdg_toplevel.EVENT_CLOSE {
+        app.*.running = false
+    }
+}
+
+// Buffers of the screen's current size, made again when it changed.
+fn fitBuffers(app: *App) -> void {
+    const width = screens.pixelWidth(app.*.screen)
+    const height = screens.pixelHeight(app.*.screen)
+    if width == app.*.bufferWidth && height == app.*.bufferHeight { return }
+    if app.*.bufferWidth != 0 {
+        app.*.firstBuffer.destroy()
+        app.*.secondBuffer.destroy()
+    }
+    const format = @intFromEnum(wl.wl_shm.Format.argb8888)
+    const stride = @intCast(i32, width * 4)
+    app.*.firstBuffer = app.*.pool.createBuffer(0, @intCast(i32, width), @intCast(i32, height), stride, format)
+    app.*.secondBuffer = app.*.pool.createBuffer(@intCast(i32, FRAME_SIZE / 2), @intCast(i32, width), @intCast(i32, height), stride, format)
+    app.*.firstBuffer.setHandler(onBuffer, contextOf(app))
+    app.*.secondBuffer.setHandler(onBuffer, contextOf(app))
+    app.*.firstBusy = false
+    app.*.secondBusy = false
+    app.*.bufferWidth = width
+    app.*.bufferHeight = height
+}
+
+fn onBuffer(context: *anyopaque, event: wl.client.Event) -> void {
+    const app = appOf(context)
+    if event.object.id == app.*.firstBuffer.id() { app.*.firstBusy = false }
+    if event.object.id == app.*.secondBuffer.id() { app.*.secondBusy = false }
+}
+
+fn onFrame(context: *anyopaque, event: wl.client.Event) -> void {
+    appOf(context).*.framePending = false
+}
+
+fn redraw(app: *App) -> void {
+    if !app.*.configured || app.*.framePending || !app.*.dirty { return }
+    fitBuffers(app)
+    var use_first = true
+    if app.*.firstBusy {
+        if app.*.secondBusy { return }
+        use_first = false
+    }
+    var pixels = app.*.memory.bytes()
+    if !use_first {
+        unsafe { pixels = @ptrFromInt([*]u8, app.*.memory.address + FRAME_SIZE / 2) }
+    }
+    const screen = app.*.screen
+    screens.render(screen, pixels)
+    var buffer = app.*.firstBuffer
+    if use_first {
+        app.*.firstBusy = true
+    } else {
+        buffer = app.*.secondBuffer
+        app.*.secondBusy = true
+    }
+    app.*.surface.attach(&buffer, 0, 0)
+    app.*.surface.damage(0, 0, @intCast(i32, app.*.bufferWidth), @intCast(i32, app.*.bufferHeight))
+    const callback = app.*.surface.frame()
+    callback.setHandler(onFrame, contextOf(app))
+    app.*.surface.commit()
+    app.*.framePending = true
+    app.*.dirty = false
+}
+
+const Failure = error { MissingGlobals, NoSharedMemory, NoTerminal }
+
+fn missingGlobals() -> Failure!void { return Failure.MissingGlobals }
+fn noSharedMemory() -> Failure!void { return Failure.NoSharedMemory }
+fn noTerminal() -> Failure!void { return Failure.NoTerminal }
+
+fn createWindow(app: *App) -> !void {
+    app.*.registry = wl.displayProxy(app.*.display).getRegistry()
+    app.*.registry.setHandler(onRegistry, contextOf(app))
+    try app.*.display.roundtrip()
+    if !app.*.hasCompositor || !app.*.hasShm || !app.*.hasWmBase { return missingGlobals() }
+    app.*.wmBase.setHandler(onWmBase, contextOf(app))
+    var memory: wl.SharedMemory = undefined
+    if !wl.transport.createSharedMemory(&memory, FRAME_SIZE) { return noSharedMemory() }
+    app.*.memory = memory
+    app.*.pool = app.*.shm.createPool(memory.handle, @intCast(i32, FRAME_SIZE))
+    fitBuffers(app)
+    app.*.surface = app.*.compositor.createSurface()
+    app.*.xdgSurface = app.*.wmBase.getXdgSurface(app.*.surface)
+    app.*.xdgSurface.setHandler(onXdgSurface, contextOf(app))
+    app.*.toplevel = app.*.xdgSurface.getToplevel()
+    app.*.toplevel.setHandler(onToplevel, contextOf(app))
+    app.*.toplevel.setTitle("Mlx Terminal")
+    app.*.toplevel.setAppId("org.mlx.terminal")
+    app.*.toplevel.setMinSize(@intCast(i32, screens.MIN_COLUMNS * screens.CELL_WIDTH + 2 * screens.PADDING), @intCast(i32, screens.MIN_ROWS * screens.CELL_HEIGHT + 2 * screens.PADDING))
+    app.*.surface.commit()
+    try app.*.display.roundtrip()
+}
+
+// ---------------------------------------------------------------------------
+// Shell
+
+// The environment passed to the shell: ours, with TERM=dumb.
+fn shellEnvironment(arguments: [][*]const u8, allocator: std.allocator.Allocator) -> [*][*]const u8 {
+    const count = std.process.environmentCount(arguments)
+    const memory = allocator.alloc((count + 2) * 8, 8).?
+    var result: [*][*]const u8 = undefined
+    unsafe { result = @ptrCast([*][*]const u8, memory) }
+    const entries = std.process.environmentEntries(arguments)
+    var used: usize = 0
+    var index: usize = 0
+    while index < count {
+        const entry = std.process.fromCString(entries[index])
+        if !std.string.startsWith(entry, std.string.fromSlice("TERM=")) {
+            result[used] = entries[index]
+            used += 1
+        }
+        index += 1
+    }
+    unsafe {
+        result[used] = @ptrCast([*]const u8, "TERM=dumb")
+        result[used + 1] = @ptrFromInt([*]const u8, 0)
+    }
+    return result
+}
+
+fn startShell(app: *App, arguments: [][*]const u8, allocator: std.allocator.Allocator) -> bool {
+    const environment = shellEnvironment(arguments, allocator)
+    var child: pty.Child = undefined
+    var started = false
+    if std.process.count(arguments) > 1 {
+        // Run the given program: argv[1..] is already NULL-terminated.
+        unsafe {
+            const argv = @ptrFromInt([*][*]const u8, @intFromPtr(@ptrCast([*][*]const u8, arguments)) + 8)
+            started = pty.spawn(&child, argv[0], argv, environment, @intCast(u16, app.*.screen.*.columns), @intCast(u16, app.*.screen.*.rows))
+        }
+    } else {
+        var argv: [2][*]const u8 = undefined
+        unsafe {
+            argv[0] = @ptrCast([*]const u8, "/bin/sh")
+            argv[1] = @ptrFromInt([*]const u8, 0)
+            started = pty.spawn(&child, argv[0], @ptrCast([*][*]const u8, &argv), environment, @intCast(u16, app.*.screen.*.columns), @intCast(u16, app.*.screen.*.rows))
+        }
+    }
+    app.*.child = child
+    app.*.hasChild = started
+    return started
+}
+
+fn readShell(app: *App) -> void {
+    var buffer: [4096]u8 = undefined
+    const child = app.*.child
+    while true {
+        var amount: isize = 0
+        unsafe { amount = pty.read(&child, @ptrCast([*]u8, &buffer), 4096) }
+        if amount == pty.EAGAIN { return }
+        if amount <= 0 {
+            // The shell exited (EOF or EIO on the master side).
+            app.*.running = false
+            return
+        }
+        var index: usize = 0
+        while index < @bitCast(usize, amount) {
+            screens.feed(app.*.screen, buffer[index])
+            index += 1
+        }
+        app.*.dirty = true
+    }
+}
+
+fn run(app: *App, arguments: [][*]const u8) -> !void {
+    const allocator = std.page_allocator.init()
+    var display: wl.client.Display = undefined
+    try wl.client.Display.connect(&display, allocator)
+    app.*.display = display
+    try createWindow(app)
+    if !startShell(app, arguments, allocator) { return noTerminal() }
+
+    var handles: [2]wl.Handle = undefined
+    handles[0] = wl.Handle.fromDescriptor(display.descriptor())
+    handles[1] = wl.Handle.fromDescriptor(app.*.child.master)
+    var ready: [2]bool = [2]bool{ false, false }
+    while app.*.running && display.running() {
+        redraw(app)
+        try display.flush()
+        var timeout: isize = -1
+        if app.*.repeating {
+            const now = pty.milliseconds()
+            timeout = if app.*.repeatAt > now { @intCast(isize, app.*.repeatAt - now) } else { 0 }
+        }
+        var count: isize = 0
+        unsafe { count = wl.transport.waitAny(@ptrCast([*]const wl.Handle, &handles), 2, @ptrCast([*]bool, &ready), timeout) }
+        if ready[0] { try display.dispatch() }
+        if ready[1] { readShell(app) }
+        if app.*.repeating && pty.milliseconds() >= app.*.repeatAt {
+            sendKey(app, app.*.repeatKey)
+            app.*.repeatAt = pty.milliseconds() + app.*.repeatInterval
+        }
+    }
+    const child = app.*.child
+    pty.hangUp(&child)
+    app.*.toplevel.destroy()
+    app.*.xdgSurface.destroy()
+    app.*.surface.destroy()
+    try display.roundtrip()
+    app.*.pool.destroy()
+    app.*.memory.release()
+    display.disconnect()
+}
+
+pub fn main(arguments: [][*]const u8) -> !void {
+    var screen: screens.Screen = undefined
+    screens.initAt(&screen)
+    var app: App = undefined
+    app.hasCompositor = false
+    app.hasShm = false
+    app.hasWmBase = false
+    app.hasSeat = false
+    app.hasKeyboard = false
+    app.firstBusy = false
+    app.secondBusy = false
+    app.hasChild = false
+    app.bufferWidth = 0
+    app.bufferHeight = 0
+    app.wantedWidth = 0
+    app.wantedHeight = 0
+    app.configured = false
+    app.framePending = false
+    app.dirty = true
+    app.running = true
+    app.screen = &screen
+    app.shift = false
+    app.control = false
+    app.caps = false
+    app.repeating = false
+    app.repeatKey = 0
+    app.repeatAt = 0
+    app.repeatInterval = 40
+    app.repeatDelay = 400
+    try run(&app, arguments)
+}

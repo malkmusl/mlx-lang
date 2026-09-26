@@ -1,0 +1,394 @@
+// Kernel devices for the DRM backend (drm.mlx): the syscalls it needs, and
+// one type for a DRM card or an input device.
+//
+// A device is normally a character device (from logind's TakeDevice or
+// opened directly), used with ioctl(2), read(2) and mmap(2). When the
+// descriptor is a Unix socket instead, the device is emulated by a test
+// harness (tools/fake_drm_session.py) and the same calls travel as frames:
+//
+//   request:  u32 kind (1: ioctl), u32 length, u64 request, argument bytes
+//   reply:    u32 kind (1), u32 length, i64 result, argument bytes back
+//             (MAP_DUMB's reply carries the buffer's memfd as SCM_RIGHTS)
+//   data:     u32 kind (2), u32 length, bytes read(2) would return (DRM
+//             events, input_event records)
+//
+// Everything above this file is the same for both: the ioctl numbers and
+// the kernel's structure layouts.
+
+const std = @import("std")
+const linux = std.linux
+
+pub const SYS_read: usize = 0
+pub const SYS_write: usize = 1
+pub const SYS_close: usize = 3
+pub const SYS_fstat: usize = 5
+pub const SYS_poll: usize = 7
+pub const SYS_mmap: usize = 9
+pub const SYS_munmap: usize = 11
+pub const SYS_ioctl: usize = 16
+pub const SYS_getpid: usize = 39
+pub const SYS_socket: usize = 41
+pub const SYS_connect: usize = 42
+pub const SYS_sendmsg: usize = 46
+pub const SYS_recvmsg: usize = 47
+pub const SYS_getuid: usize = 102
+pub const SYS_inotify_add_watch: usize = 254
+pub const SYS_getdents64: usize = 217
+pub const SYS_openat: usize = 257
+pub const SYS_newfstatat: usize = 262
+pub const SYS_inotify_init1: usize = 294
+
+pub const O_RDONLY: usize = 0
+pub const O_RDWR: usize = 2
+pub const O_NOCTTY: usize = 256
+pub const O_NONBLOCK: usize = 2048
+pub const O_DIRECTORY: usize = 65536
+pub const O_CLOEXEC: usize = 524288
+pub const AT_FDCWD: usize = 18446744073709551516
+
+pub const EAGAIN: isize = -11
+pub const EINTR: isize = -4
+pub const ENODEV: isize = -19
+
+const PROT_READ: usize = 1
+const PROT_WRITE: usize = 2
+const MAP_SHARED: usize = 1
+const S_IFMT: u32 = 61440
+const S_IFSOCK: u32 = 49152
+const S_IFCHR: u32 = 8192
+const MSG_DONTWAIT: usize = 64
+const MSG_NOSIGNAL: usize = 16384
+const MSG_CMSG_CLOEXEC: usize = 1073741824
+const SOL_SOCKET: u32 = 1
+const SCM_RIGHTS: u32 = 1
+const POLLIN: u16 = 1
+
+const FRAME_IOCTL: u32 = 1
+const FRAME_DATA: u32 = 2
+// Room for data frames that arrive while an emulated ioctl waits.
+const BUFFER_SIZE: usize = 65536
+
+// ---------------------------------------------------------------------------
+// Little-endian fields of kernel structures
+
+pub fn store16(bytes: [*]u8, offset: usize, value: u32) -> void {
+    bytes[offset] = @intCast(u8, value & 255)
+    bytes[offset + 1] = @intCast(u8, (value >> 8) & 255)
+}
+
+pub fn store32(bytes: [*]u8, offset: usize, value: u32) -> void {
+    var index: usize = 0
+    while index < 4 {
+        bytes[offset + index] = @intCast(u8, (value >> @intCast(u32, index * 8)) & 255)
+        index += 1
+    }
+}
+
+pub fn store64(bytes: [*]u8, offset: usize, value: usize) -> void {
+    var index: usize = 0
+    while index < 8 {
+        bytes[offset + index] = @intCast(u8, (value >> index * 8) & 255)
+        index += 1
+    }
+}
+
+pub fn load16(bytes: [*]const u8, offset: usize) -> u32 {
+    return @intCast(u32, bytes[offset]) | (@intCast(u32, bytes[offset + 1]) << 8)
+}
+
+pub fn load32(bytes: [*]const u8, offset: usize) -> u32 {
+    var value: u32 = 0
+    var index: usize = 4
+    while index > 0 {
+        index -= 1
+        value = (value << 8) | @intCast(u32, bytes[offset + index])
+    }
+    return value
+}
+
+pub fn load64(bytes: [*]const u8, offset: usize) -> usize {
+    var value: usize = 0
+    var index: usize = 8
+    while index > 0 {
+        index -= 1
+        value = (value << 8) | @intCast(usize, bytes[offset + index])
+    }
+    return value
+}
+
+// A signed 32-bit field.
+pub fn loadInt(bytes: [*]const u8, offset: usize) -> i32 {
+    const value = load32(bytes, offset)
+    if value < 2147483648 { return @intCast(i32, value) }
+    return 0 - @intCast(i32, 4294967295 - value) - 1
+}
+
+pub fn zero(bytes: [*]u8, length: usize) -> void {
+    var index: usize = 0
+    while index < length {
+        bytes[index] = 0
+        index += 1
+    }
+}
+
+pub fn close(descriptor: isize) -> void {
+    if descriptor >= 0 { const closed = linux.syscall1(SYS_close, @bitCast(usize, descriptor)) }
+}
+
+pub fn openPath(path: [*]const u8, flags: usize) -> isize {
+    return linux.syscall4(SYS_openat, AT_FDCWD, @intFromPtr(path), flags | O_CLOEXEC, 0)
+}
+
+// Waits until `descriptor` is readable (or `timeout` milliseconds pass).
+pub fn waitReadable(descriptor: isize, timeout: isize) -> bool {
+    var record: [8]u8 = [8]u8{ 0, 0, 0, 0, 0, 0, 0, 0 }
+    var bytes: [*]u8 = undefined
+    unsafe { bytes = @ptrCast([*]u8, &record) }
+    store32(bytes, 0, @bitCast(u32, @intCast(i32, descriptor)))
+    store16(bytes, 4, @intCast(u32, POLLIN))
+    const result = linux.syscall3(SYS_poll, @intFromPtr(bytes), 1, @bitCast(usize, timeout))
+    return result > 0 && load16(bytes, 6) != 0
+}
+
+// ---------------------------------------------------------------------------
+// Files
+
+pub const Stat = struct {
+    mode: u32
+    major: u32
+    minor: u32
+}
+
+fn decodeStat(bytes: [*]const u8, result: *Stat) -> void {
+    result.*.mode = load32(bytes, 24)
+    const number = load64(bytes, 40)
+    result.*.major = @intCast(u32, ((number >> 8) & 4095) | ((number >> 32) & 4294963200))
+    result.*.minor = @intCast(u32, (number & 255) | ((number >> 12) & 4294967040))
+}
+
+// stat(2) of a path: its type and, for device nodes, the device number.
+pub fn statPath(path: [*]const u8, result: *Stat) -> bool {
+    var buffer: [144]u8 = undefined
+    var bytes: [*]u8 = undefined
+    unsafe { bytes = @ptrCast([*]u8, &buffer) }
+    if linux.syscall4(SYS_newfstatat, AT_FDCWD, @intFromPtr(path), @intFromPtr(bytes), 0) < 0 { return false }
+    decodeStat(bytes, result)
+    return true
+}
+
+pub fn isCharacterDevice(value: *const Stat) -> bool { return value.*.mode & S_IFMT == S_IFCHR }
+
+fn isSocket(descriptor: isize) -> bool {
+    var buffer: [144]u8 = undefined
+    var bytes: [*]u8 = undefined
+    unsafe { bytes = @ptrCast([*]u8, &buffer) }
+    if linux.syscall2(SYS_fstat, @bitCast(usize, descriptor), @intFromPtr(bytes)) < 0 { return false }
+    return load32(bytes, 24) & S_IFMT == S_IFSOCK
+}
+
+// ---------------------------------------------------------------------------
+// Devices
+
+pub const Device = struct {
+    descriptor: isize
+    emulated: bool
+    // Emulated devices: bytes received but not yet framed, and data frames'
+    // bytes waiting for read.
+    pending: [*]u8
+    pendingLength: usize
+    data: [*]u8
+    dataLength: usize
+    // A descriptor that came with the last ioctl reply (-1: none).
+    receivedDescriptor: isize
+    // The emulating side closed its end (a revoked or removed device).
+    hungUp: bool
+}
+
+// Takes ownership of `descriptor`.
+pub fn init(device: *Device, descriptor: isize, allocator: std.allocator.Allocator) -> void {
+    device.*.descriptor = descriptor
+    device.*.emulated = isSocket(descriptor)
+    device.*.pendingLength = 0
+    device.*.dataLength = 0
+    device.*.receivedDescriptor = -1
+    device.*.hungUp = false
+    if device.*.emulated {
+        device.*.pending = allocator.alloc(BUFFER_SIZE, 16).?
+        device.*.data = allocator.alloc(BUFFER_SIZE, 16).?
+    }
+}
+
+pub fn deinit(device: *Device, allocator: std.allocator.Allocator) -> void {
+    close(device.*.descriptor)
+    device.*.descriptor = -1
+    if device.*.emulated {
+        allocator.free(device.*.pending, BUFFER_SIZE, 16)
+        allocator.free(device.*.data, BUFFER_SIZE, 16)
+        device.*.emulated = false
+    }
+}
+
+// Reads what the emulating socket has, filing complete frames: data frames
+// into `data`, an ioctl reply's argument bytes into `reply` (returning
+// true, with its result in `result`). Returns false when no reply came.
+fn receiveFrames(device: *Device, reply: [*]u8, reply_size: usize, result: *isize) -> bool {
+    var header: [56]u8 = undefined
+    var vector: [16]u8 = undefined
+    var control: [64]u8 = undefined
+    var header_bytes: [*]u8 = undefined
+    var vector_bytes: [*]u8 = undefined
+    var control_bytes: [*]u8 = undefined
+    unsafe {
+        header_bytes = @ptrCast([*]u8, &header)
+        vector_bytes = @ptrCast([*]u8, &vector)
+        control_bytes = @ptrCast([*]u8, &control)
+    }
+    zero(header_bytes, 56)
+    store64(vector_bytes, 0, @intFromPtr(device.*.pending) + device.*.pendingLength)
+    store64(vector_bytes, 8, BUFFER_SIZE - device.*.pendingLength)
+    store64(header_bytes, 16, @intFromPtr(vector_bytes))
+    store64(header_bytes, 24, 1)
+    store64(header_bytes, 32, @intFromPtr(control_bytes))
+    store64(header_bytes, 40, 64)
+    const received = linux.syscall3(SYS_recvmsg, @bitCast(usize, device.*.descriptor), @intFromPtr(header_bytes), MSG_DONTWAIT | MSG_CMSG_CLOEXEC)
+    if received == 0 || (received < 0 && received != EAGAIN && received != EINTR) { device.*.hungUp = true }
+    if received > 0 {
+        device.*.pendingLength += @bitCast(usize, received)
+        const control_length = load64(header_bytes, 40)
+        if control_length >= 20 && load32(control_bytes, 8) == SOL_SOCKET && load32(control_bytes, 12) == SCM_RIGHTS {
+            close(device.*.receivedDescriptor)
+            device.*.receivedDescriptor = @intCast(isize, loadInt(control_bytes, 16))
+        }
+    }
+    var replied = false
+    while device.*.pendingLength >= 8 {
+        const kind = load32(device.*.pending, 0)
+        const length = @intCast(usize, load32(device.*.pending, 4))
+        if device.*.pendingLength < 8 + length { break }
+        if kind == FRAME_DATA && device.*.dataLength + length <= BUFFER_SIZE {
+            var index: usize = 0
+            while index < length {
+                device.*.data[device.*.dataLength + index] = device.*.pending[8 + index]
+                index += 1
+            }
+            device.*.dataLength += length
+        } else if kind == FRAME_IOCTL && length >= 8 {
+            result.* = @bitCast(isize, load64(device.*.pending, 8))
+            var index: usize = 0
+            while index < length - 8 && index < reply_size {
+                reply[index] = device.*.pending[16 + index]
+                index += 1
+            }
+            replied = true
+        }
+        const rest = device.*.pendingLength - 8 - length
+        var index: usize = 0
+        while index < rest {
+            device.*.pending[index] = device.*.pending[8 + length + index]
+            index += 1
+        }
+        device.*.pendingLength = rest
+        if replied { return true }
+    }
+    return false
+}
+
+// ioctl(2) with `size` bytes of argument at `argument` (updated in place).
+// Returns the result, or a negative errno.
+pub fn ioctl(device: *Device, request: usize, argument: [*]u8, size: usize) -> isize {
+    if !device.*.emulated {
+        var result: isize = EINTR
+        while result == EINTR {
+            result = linux.syscall3(SYS_ioctl, @bitCast(usize, device.*.descriptor), request, @intFromPtr(argument))
+        }
+        return result
+    }
+    // One frame: header, request, argument.
+    var frame: [4096]u8 = undefined
+    var bytes: [*]u8 = undefined
+    unsafe { bytes = @ptrCast([*]u8, &frame) }
+    if size + 16 > 4096 { return -22 }
+    store32(bytes, 0, FRAME_IOCTL)
+    store32(bytes, 4, @intCast(u32, 8 + size))
+    store64(bytes, 8, request)
+    var index: usize = 0
+    while index < size {
+        bytes[16 + index] = argument[index]
+        index += 1
+    }
+    var sent: usize = 0
+    while sent < 16 + size {
+        const count = linux.syscall3(SYS_write, @bitCast(usize, device.*.descriptor), @intFromPtr(bytes) + sent, 16 + size - sent)
+        if count < 0 && count != EAGAIN && count != EINTR { return ENODEV }
+        if count > 0 { sent += @bitCast(usize, count) }
+        // A full socket: give the other side a millisecond.
+        if count == EAGAIN { const slept = waitReadable(-1, 1) }
+    }
+    var result: isize = 0
+    var waited: usize = 0
+    while !receiveFrames(device, argument, size, &result) {
+        if waited > 5000 || device.*.hungUp { return ENODEV }
+        if !waitReadable(device.*.descriptor, 100) { waited += 100 }
+    }
+    return result
+}
+
+// read(2): the device's next bytes, EAGAIN when there are none.
+pub fn read(device: *Device, buffer: [*]u8, capacity: usize) -> isize {
+    if !device.*.emulated {
+        return linux.syscall3(SYS_read, @bitCast(usize, device.*.descriptor), @intFromPtr(buffer), capacity)
+    }
+    if device.*.dataLength == 0 {
+        var ignored: isize = 0
+        var none: [8]u8 = undefined
+        var none_bytes: [*]u8 = undefined
+        unsafe { none_bytes = @ptrCast([*]u8, &none) }
+        const replied = receiveFrames(device, none_bytes, 0, &ignored)
+        if device.*.dataLength == 0 { return if device.*.hungUp { ENODEV } else { EAGAIN } }
+    }
+    var count = device.*.dataLength
+    if count > capacity { count = capacity }
+    var index: usize = 0
+    while index < count {
+        buffer[index] = device.*.data[index]
+        index += 1
+    }
+    const rest = device.*.dataLength - count
+    index = 0
+    while index < rest {
+        device.*.data[index] = device.*.data[count + index]
+        index += 1
+    }
+    device.*.dataLength = rest
+    return @bitCast(isize, count)
+}
+
+// Whether read would return bytes without waiting (emulated devices keep
+// what arrived during an ioctl).
+pub fn hasBufferedData(device: *const Device) -> bool {
+    return device.*.emulated && device.*.dataLength > 0
+}
+
+// Maps `size` bytes of a DRM dumb buffer: at `offset` of the card, or, on
+// an emulated card, the memfd that came with the MAP_DUMB reply. Returns
+// the address, or 0.
+pub fn mapBuffer(device: *Device, offset: usize, size: usize) -> usize {
+    var descriptor = device.*.descriptor
+    var position = offset
+    if device.*.emulated {
+        descriptor = device.*.receivedDescriptor
+        position = 0
+        if descriptor < 0 { return 0 }
+    }
+    const address = linux.syscall6(SYS_mmap, 0, size, PROT_READ | PROT_WRITE, MAP_SHARED, @bitCast(usize, descriptor), position)
+    if device.*.emulated {
+        close(descriptor)
+        device.*.receivedDescriptor = -1
+    }
+    if address < 0 { return 0 }
+    return @bitCast(usize, address)
+}
+
+pub fn unmap(address: usize, size: usize) -> void {
+    if address != 0 { const unmapped = linux.syscall2(SYS_munmap, address, size) }
+}

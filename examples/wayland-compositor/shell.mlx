@@ -1,0 +1,1436 @@
+// The compositor's server side: globals, surfaces, buffers (wl_shm here,
+// linux-dmabuf in dmabuf.mlx), xdg-shell windows and popups, the seat,
+// focus and input delivery, and launching client programs.
+
+const std = @import("std")
+const wl = @import("std.wayland")
+const state = @import("./state.mlx")
+const scene = @import("./scene.mlx")
+const vulkan = @import("./vulkan.mlx")
+const data = @import("./data.mlx")
+
+const Compositor = state.Compositor
+const Surface = state.Surface
+const Pool = state.Pool
+const Buffer = state.Buffer
+const Positioner = state.Positioner
+const SeatResource = state.SeatResource
+
+const BTN_LEFT: u32 = 272
+const BTN_RIGHT: u32 = 273
+// The smallest window a resize makes (unless the client asks for more).
+const MIN_WIDTH: i32 = 64
+const MIN_HEIGHT: i32 = 32
+const KEY_TAB: u32 = 15
+const KEY_Q: u32 = 16
+const KEY_ENTER: u32 = 28
+const KEY_LEFTCTRL: u32 = 29
+const KEY_LEFTSHIFT: u32 = 42
+const KEY_RIGHTSHIFT: u32 = 54
+const KEY_LEFTALT: u32 = 56
+const KEY_F4: u32 = 62
+const KEY_RIGHTCTRL: u32 = 97
+const KEY_RIGHTALT: u32 = 100
+const KEY_BACKSPACE: u32 = 14
+const KEY_F1: u32 = 59
+const KEY_F10: u32 = 68
+const KEY_F11: u32 = 87
+const KEY_F12: u32 = 88
+
+const SYS_execve: usize = 59
+const SYS_fork: usize = 57
+const SYS_wait4: usize = 61
+const SYS_exit_group: usize = 231
+
+fn ignoreRequest(context: *anyopaque, request: wl.server.Request) -> void {}
+fn ignoreDestroy(context: *anyopaque, object: wl.server.Object) -> void {}
+
+fn sameObject(first: wl.server.Object, second: wl.server.Object) -> bool {
+    return first.id == second.id && state.sameClient(first, second)
+}
+
+fn findSurface(compositor: *Compositor, object: wl.server.Object) -> usize {
+    var index: usize = 0
+    while index < compositor.*.surfaces.length {
+        const address = state.listAt(compositor.*.surfaces, index)
+        if sameObject(state.surfaceAt(address).*.resource, object) { return address }
+        index += 1
+    }
+    return 0
+}
+
+fn findXdgSurface(compositor: *Compositor, object: wl.server.Object) -> usize {
+    var index: usize = 0
+    while index < compositor.*.surfaces.length {
+        const address = state.listAt(compositor.*.surfaces, index)
+        const surface = state.surfaceAt(address)
+        if surface.*.hasXdgSurface && sameObject(surface.*.xdgSurface, object) { return address }
+        index += 1
+    }
+    return 0
+}
+
+fn bufferAt(address: usize) -> *Buffer {
+    unsafe { return @ptrFromInt(*Buffer, address) }
+}
+
+fn findBuffer(compositor: *Compositor, object: wl.server.Object) -> usize {
+    var index: usize = 0
+    while index < compositor.*.buffers.length {
+        const address = state.listAt(compositor.*.buffers, index)
+        if sameObject(bufferAt(address).*.resource, object) { return address }
+        index += 1
+    }
+    return 0
+}
+
+fn positionerAt(address: usize) -> *Positioner {
+    unsafe { return @ptrFromInt(*Positioner, address) }
+}
+
+fn findPositioner(compositor: *Compositor, object: wl.server.Object) -> usize {
+    var index: usize = 0
+    while index < compositor.*.positioners.length {
+        const address = state.listAt(compositor.*.positioners, index)
+        if sameObject(positionerAt(address).*.resource, object) { return address }
+        index += 1
+    }
+    return 0
+}
+
+fn seatResourceAt(address: usize) -> *SeatResource {
+    unsafe { return @ptrFromInt(*SeatResource, address) }
+}
+
+fn emptyArray() -> wl.ArrayView {
+    unsafe { return wl.ArrayView.{ .pointer = @ptrFromInt([*]const u8, 8), .length = 0 } }
+}
+
+// ---------------------------------------------------------------------------
+// Focus and xdg configuration
+
+// Sends the toplevel its size (configuredWidth x configuredHeight; 0 x 0
+// lets the client choose) and states: resizing (3) during a resize,
+// activated (4) with keyboard focus. Until the client acks it and commits,
+// resizing asks for no further size.
+fn configureToplevel(surface: *Surface) -> void {
+    if !surface.*.hasToplevel || !surface.*.hasXdgSurface { return }
+    const compositor = surface.*.compositor
+    var states: [8]u8 = [8]u8{ 0, 0, 0, 0, 0, 0, 0, 0 }
+    var count: usize = 0
+    if surface.*.resizing {
+        states[0] = 3
+        count = 1
+    }
+    if compositor.*.keyboardFocus == state.addressOfSurface(surface) {
+        states[count * 4] = 4
+        count += 1
+    }
+    var array = emptyArray()
+    if count > 0 {
+        unsafe { array = wl.ArrayView.{ .pointer = @ptrCast([*]const u8, &states), .length = count * 4 } }
+    }
+    const toplevel = wl.xdg_toplevel.Resource.fromObject(surface.*.toplevel)
+    // The most a window can use: the output without the title bar and the
+    // frame (xdg_toplevel v4+; GTK sizes new windows to fit).
+    toplevel.sendConfigureBounds(@intCast(i32, compositor.*.width) - 4, @intCast(i32, compositor.*.height) - scene.TITLE_HEIGHT - 4)
+    toplevel.sendConfigure(surface.*.configuredWidth, surface.*.configuredHeight, array)
+    const serial = compositor.*.server.nextSerial()
+    surface.*.configureSerial = serial
+    surface.*.configurePending = true
+    wl.xdg_surface.Resource.fromObject(surface.*.xdgSurface).sendConfigure(serial)
+}
+
+// ---------------------------------------------------------------------------
+// Resizing
+
+fn clampSize(value: i32, minimum: i32, maximum: i32) -> i32 {
+    var result = value
+    if maximum > 0 && result > maximum { result = maximum }
+    if result < minimum { result = minimum }
+    return result
+}
+
+// Asks the toplevel for a new window size, within its limits; with a
+// configure still pending, the size waits for the client's next commit.
+fn requestSize(surface: *Surface, width: i32, height: i32) -> void {
+    const min_width = if surface.*.minWidth > MIN_WIDTH { surface.*.minWidth } else { MIN_WIDTH }
+    const min_height = if surface.*.minHeight > MIN_HEIGHT { surface.*.minHeight } else { MIN_HEIGHT }
+    surface.*.wantedWidth = clampSize(width, min_width, surface.*.maxWidth)
+    surface.*.wantedHeight = clampSize(height, min_height, surface.*.maxHeight)
+    if surface.*.configurePending { return }
+    if surface.*.wantedWidth == surface.*.configuredWidth && surface.*.wantedHeight == surface.*.configuredHeight { return }
+    surface.*.configuredWidth = surface.*.wantedWidth
+    surface.*.configuredHeight = surface.*.wantedHeight
+    configureToplevel(surface)
+}
+
+// Starts resizing the toplevel of `address` by its `edges` (scene.EDGE_*)
+// as the pointer moves, until the buttons are released.
+fn startResize(compositor: *Compositor, address: usize, edges: u32) -> void {
+    const toplevel = scene.toplevelOf(address)
+    if toplevel == 0 || edges == 0 { return }
+    const surface = state.surfaceAt(toplevel)
+    dismissPopups(compositor, 0)
+    const width = scene.windowWidth(surface)
+    const height = scene.windowHeight(surface)
+    compositor.*.resizing = toplevel
+    compositor.*.resizeEdges = edges
+    compositor.*.resizeStartX = compositor.*.pointerX
+    compositor.*.resizeStartY = compositor.*.pointerY
+    compositor.*.resizeStartWidth = width
+    compositor.*.resizeStartHeight = height
+    // Resizing from the left or top keeps the right or bottom edge put.
+    surface.*.anchorEdges = edges & (scene.EDGE_LEFT | scene.EDGE_TOP)
+    surface.*.anchorRight = scene.windowX(surface) + width
+    surface.*.anchorBottom = scene.windowY(surface) + height
+    surface.*.resizing = true
+    surface.*.wantedWidth = width
+    surface.*.wantedHeight = height
+    surface.*.configuredWidth = width
+    surface.*.configuredHeight = height
+    configureToplevel(surface)
+    compositor.*.needsRedraw = true
+    if compositor.*.verbose {
+        state.say("resize: ")
+        state.sayTitle(surface)
+        state.say("\n")
+    }
+}
+
+fn resizeMotion(compositor: *Compositor) -> void {
+    const surface = state.surfaceAt(compositor.*.resizing)
+    const edges = compositor.*.resizeEdges
+    const dx = compositor.*.pointerX - compositor.*.resizeStartX
+    const dy = compositor.*.pointerY - compositor.*.resizeStartY
+    var width = compositor.*.resizeStartWidth
+    var height = compositor.*.resizeStartHeight
+    if edges & scene.EDGE_RIGHT != 0 { width += dx }
+    if edges & scene.EDGE_LEFT != 0 { width -= dx }
+    if edges & scene.EDGE_BOTTOM != 0 { height += dy }
+    if edges & scene.EDGE_TOP != 0 { height -= dy }
+    requestSize(surface, width, height)
+}
+
+// The last size, without the resizing state.
+fn endResize(compositor: *Compositor) -> void {
+    const address = compositor.*.resizing
+    if address == 0 { return }
+    compositor.*.resizing = 0
+    const surface = state.surfaceAt(address)
+    surface.*.resizing = false
+    surface.*.configuredWidth = surface.*.wantedWidth
+    surface.*.configuredHeight = surface.*.wantedHeight
+    configureToplevel(surface)
+    compositor.*.needsRedraw = true
+    if compositor.*.verbose {
+        state.say("resize done: asked for ")
+        state.sayInteger(surface.*.wantedWidth)
+        state.say("x")
+        state.sayInteger(surface.*.wantedHeight)
+        state.say("\n")
+    }
+}
+
+// After a toplevel commit: the configure it answered is done; while it is
+// resized, the kept edges stay put and the next size goes out.
+fn resizeCommitted(surface: *Surface) -> void {
+    const compositor = surface.*.compositor
+    if surface.*.configurePending && surface.*.ackedSerial == surface.*.configureSerial { surface.*.configurePending = false }
+    if surface.*.anchorEdges != 0 {
+        const offset_x = if surface.*.hasGeometry { surface.*.geometryX } else { 0 }
+        const offset_y = if surface.*.hasGeometry { surface.*.geometryY } else { 0 }
+        if surface.*.anchorEdges & scene.EDGE_LEFT != 0 { surface.*.x = surface.*.anchorRight - scene.windowWidth(surface) - offset_x }
+        if surface.*.anchorEdges & scene.EDGE_TOP != 0 { surface.*.y = surface.*.anchorBottom - scene.windowHeight(surface) - offset_y }
+        // Kept until the final size is in.
+        if !surface.*.resizing && !surface.*.configurePending { surface.*.anchorEdges = 0 }
+    }
+    // The log shows every new size of a mapped window.
+    if compositor.*.verbose && surface.*.mapped && (scene.windowWidth(surface) != surface.*.loggedWidth || scene.windowHeight(surface) != surface.*.loggedHeight) {
+        surface.*.loggedWidth = scene.windowWidth(surface)
+        surface.*.loggedHeight = scene.windowHeight(surface)
+        state.say("window:")
+        sayGeometry(surface)
+    }
+    if surface.*.resizing && !surface.*.configurePending { requestSize(surface, surface.*.wantedWidth, surface.*.wantedHeight) }
+}
+
+fn sendKeyboardEnter(compositor: *Compositor, keyboard: *SeatResource, surface: *Surface) -> void {
+    const resource = wl.wl_keyboard.Resource.fromObject(keyboard.*.object)
+    resource.sendEnter(compositor.*.server.nextSerial(), wl.wl_surface.Resource.fromObject(surface.*.resource), emptyArray())
+    resource.sendModifiers(compositor.*.server.nextSerial(), compositor.*.modsDepressed, compositor.*.modsLatched, compositor.*.modsLocked, compositor.*.modsGroup)
+}
+
+// Moves keyboard focus to the toplevel at `address` (0 clears it).
+pub fn focus(compositor: *Compositor, address: usize) -> void {
+    if address != 0 { scene.raise(compositor, address) }
+    const old = compositor.*.keyboardFocus
+    if old == address { return }
+    compositor.*.keyboardFocus = address
+    // The newly focused client's clipboard first, then its keyboard enter.
+    data.offerToFocus(compositor)
+    var index: usize = 0
+    while index < compositor.*.keyboards.length {
+        const keyboard = seatResourceAt(state.listAt(compositor.*.keyboards, index))
+        if old != 0 && state.sameClient(keyboard.*.object, state.surfaceAt(old).*.resource) {
+            wl.wl_keyboard.Resource.fromObject(keyboard.*.object).sendLeave(compositor.*.server.nextSerial(), wl.wl_surface.Resource.fromObject(state.surfaceAt(old).*.resource))
+        }
+        if address != 0 && state.sameClient(keyboard.*.object, state.surfaceAt(address).*.resource) {
+            sendKeyboardEnter(compositor, keyboard, state.surfaceAt(address))
+        }
+        index += 1
+    }
+    if old != 0 { configureToplevel(state.surfaceAt(old)) }
+    if address != 0 {
+        const surface = state.surfaceAt(address)
+        configureToplevel(surface)
+        if compositor.*.verbose {
+            state.say("focus: ")
+            state.sayTitle(surface)
+            state.say("\n")
+        }
+    }
+    compositor.*.needsRedraw = true
+}
+
+fn topmostToplevel(compositor: *Compositor) -> usize {
+    var index = compositor.*.stack.length
+    while index > 0 {
+        index -= 1
+        const address = state.listAt(compositor.*.stack, index)
+        if state.surfaceAt(address).*.role == state.ROLE_TOPLEVEL { return address }
+    }
+    return 0
+}
+
+fn sendPointerFrame(pointer: *SeatResource) -> void {
+    wl.wl_pointer.Resource.fromObject(pointer.*.object).sendFrame()
+}
+
+fn updatePointerFocus(compositor: *Compositor, target: usize) -> void {
+    const old = compositor.*.pointerFocus
+    if old == target { return }
+    compositor.*.pointerFocus = target
+    compositor.*.cursorSurface = 0
+    compositor.*.cursorHidden = false
+    var index: usize = 0
+    while index < compositor.*.pointers.length {
+        const pointer = seatResourceAt(state.listAt(compositor.*.pointers, index))
+        const resource = wl.wl_pointer.Resource.fromObject(pointer.*.object)
+        if old != 0 && state.sameClient(pointer.*.object, state.surfaceAt(old).*.resource) {
+            resource.sendLeave(compositor.*.server.nextSerial(), wl.wl_surface.Resource.fromObject(state.surfaceAt(old).*.resource))
+            sendPointerFrame(pointer)
+        }
+        if target != 0 && state.sameClient(pointer.*.object, state.surfaceAt(target).*.resource) {
+            const surface = state.surfaceAt(target)
+            resource.sendEnter(compositor.*.server.nextSerial(), wl.wl_surface.Resource.fromObject(surface.*.resource), wl.Fixed.fromInt(compositor.*.pointerX - surface.*.x), wl.Fixed.fromInt(compositor.*.pointerY - surface.*.y))
+            sendPointerFrame(pointer)
+        }
+        index += 1
+    }
+}
+
+// Sends popup_done to every mapped popup that does not belong to the
+// toplevel `keep` (0: dismiss all).
+fn dismissPopups(compositor: *Compositor, keep: usize) -> void {
+    var index: usize = 0
+    while index < compositor.*.stack.length {
+        const address = state.listAt(compositor.*.stack, index)
+        const surface = state.surfaceAt(address)
+        if surface.*.role == state.ROLE_POPUP && surface.*.hasPopup && scene.toplevelOf(address) != keep {
+            wl.xdg_popup.Resource.fromObject(surface.*.popup).sendPopupDone()
+        }
+        index += 1
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Input from the host (called by host.mlx)
+
+pub fn pointerMotion(compositor: *Compositor, x: i32, y: i32) -> void {
+    const dx = x - compositor.*.pointerX
+    const dy = y - compositor.*.pointerY
+    compositor.*.pointerX = x
+    compositor.*.pointerY = y
+    compositor.*.pointerInside = true
+    compositor.*.needsRedraw = true
+    if compositor.*.resizing != 0 {
+        resizeMotion(compositor)
+        return
+    }
+    if compositor.*.moving != 0 {
+        // Interactive move: the window and its popups follow the pointer.
+        var index: usize = 0
+        while index < compositor.*.stack.length {
+            const address = state.listAt(compositor.*.stack, index)
+            if scene.toplevelOf(address) == compositor.*.moving {
+                const surface = state.surfaceAt(address)
+                surface.*.x += dx
+                surface.*.y += dy
+            }
+            index += 1
+        }
+        return
+    }
+    updatePointerFocus(compositor, scene.surfaceAtPoint(compositor, x, y))
+    // Over a window's border the cursor shows how it would resize.
+    compositor.*.hoverEdges = 0
+    if compositor.*.pointerFocus == 0 {
+        const bordered = scene.borderAt(compositor, x, y)
+        if bordered != 0 { compositor.*.hoverEdges = scene.borderEdges(state.surfaceAt(bordered), x, y) }
+    }
+    if compositor.*.pointerFocus == 0 { return }
+    const surface = state.surfaceAt(compositor.*.pointerFocus)
+    var index: usize = 0
+    while index < compositor.*.pointers.length {
+        const pointer = seatResourceAt(state.listAt(compositor.*.pointers, index))
+        if state.sameClient(pointer.*.object, surface.*.resource) {
+            wl.wl_pointer.Resource.fromObject(pointer.*.object).sendMotion(compositor.*.time, wl.Fixed.fromInt(x - surface.*.x), wl.Fixed.fromInt(y - surface.*.y))
+            sendPointerFrame(pointer)
+        }
+        index += 1
+    }
+}
+
+pub fn pointerLeave(compositor: *Compositor) -> void {
+    updatePointerFocus(compositor, 0)
+    compositor.*.pointerInside = false
+    compositor.*.needsRedraw = true
+}
+
+fn startMove(compositor: *Compositor, address: usize) -> void {
+    const toplevel = scene.toplevelOf(address)
+    if toplevel == 0 { return }
+    compositor.*.moving = toplevel
+    if compositor.*.verbose {
+        state.say("move: ")
+        state.sayTitle(state.surfaceAt(toplevel))
+        state.say("\n")
+    }
+}
+
+pub fn pointerButton(compositor: *Compositor, button: u32, pressed: bool) -> void {
+    if pressed {
+        compositor.*.buttonsDown += 1
+    } else if compositor.*.buttonsDown > 0 {
+        compositor.*.buttonsDown -= 1
+    }
+    const target = compositor.*.pointerFocus
+    if pressed {
+        dismissPopups(compositor, if target == 0 { 0 } else { scene.toplevelOf(target) })
+        if target != 0 { focus(compositor, scene.toplevelOf(target)) }
+        if target == 0 && button == BTN_LEFT {
+            // Dragging a title bar moves its window.
+            const titled = scene.titleAt(compositor, compositor.*.pointerX, compositor.*.pointerY)
+            if titled != 0 {
+                focus(compositor, titled)
+                startMove(compositor, titled)
+                compositor.*.swallowedButton = true
+                return
+            }
+            // Dragging a border resizes its window.
+            const bordered = scene.borderAt(compositor, compositor.*.pointerX, compositor.*.pointerY)
+            if bordered != 0 {
+                focus(compositor, bordered)
+                startResize(compositor, bordered, scene.borderEdges(state.surfaceAt(bordered), compositor.*.pointerX, compositor.*.pointerY))
+                compositor.*.swallowedButton = true
+                return
+            }
+        }
+        if compositor.*.alt && button == BTN_RIGHT && target != 0 {
+            // Alt+right-drag resizes from the nearest corner.
+            const window = state.surfaceAt(scene.toplevelOf(target))
+            var edges = if compositor.*.pointerX < scene.windowX(window) + scene.windowWidth(window) / 2 { scene.EDGE_LEFT } else { scene.EDGE_RIGHT }
+            edges = edges | (if compositor.*.pointerY < scene.windowY(window) + scene.windowHeight(window) / 2 { scene.EDGE_TOP } else { scene.EDGE_BOTTOM })
+            startResize(compositor, target, edges)
+            compositor.*.swallowedButton = true
+            return
+        }
+        if compositor.*.alt && button == BTN_LEFT && target != 0 {
+            // Alt+drag moves windows without involving the client.
+            startMove(compositor, target)
+            compositor.*.swallowedButton = true
+            return
+        }
+    } else {
+        if compositor.*.buttonsDown == 0 {
+            if compositor.*.moving != 0 && compositor.*.verbose { state.say("move done\n") }
+            compositor.*.moving = 0
+            endResize(compositor)
+        }
+        if compositor.*.swallowedButton {
+            compositor.*.swallowedButton = false
+            return
+        }
+    }
+    if target == 0 { return }
+    const surface = state.surfaceAt(target)
+    const button_state = if pressed { @intFromEnum(wl.wl_pointer.ButtonState.pressed) } else { @intFromEnum(wl.wl_pointer.ButtonState.released) }
+    var index: usize = 0
+    while index < compositor.*.pointers.length {
+        const pointer = seatResourceAt(state.listAt(compositor.*.pointers, index))
+        if state.sameClient(pointer.*.object, surface.*.resource) {
+            wl.wl_pointer.Resource.fromObject(pointer.*.object).sendButton(compositor.*.server.nextSerial(), compositor.*.time, button, button_state)
+            sendPointerFrame(pointer)
+        }
+        index += 1
+    }
+}
+
+pub fn pointerAxis(compositor: *Compositor, axis: u32, value: wl.Fixed) -> void {
+    if compositor.*.pointerFocus == 0 { return }
+    const surface = state.surfaceAt(compositor.*.pointerFocus)
+    var index: usize = 0
+    while index < compositor.*.pointers.length {
+        const pointer = seatResourceAt(state.listAt(compositor.*.pointers, index))
+        if state.sameClient(pointer.*.object, surface.*.resource) {
+            wl.wl_pointer.Resource.fromObject(pointer.*.object).sendAxis(compositor.*.time, axis, value)
+            sendPointerFrame(pointer)
+        }
+        index += 1
+    }
+}
+
+fn cycleFocus(compositor: *Compositor) -> void {
+    // Alt+Tab: bring the bottom-most window to the front.
+    var index: usize = 0
+    while index < compositor.*.stack.length {
+        const address = state.listAt(compositor.*.stack, index)
+        if state.surfaceAt(address).*.role == state.ROLE_TOPLEVEL {
+            focus(compositor, address)
+            return
+        }
+        index += 1
+    }
+}
+
+fn closeFocused(compositor: *Compositor) -> void {
+    if compositor.*.keyboardFocus == 0 { return }
+    const surface = state.surfaceAt(compositor.*.keyboardFocus)
+    if surface.*.hasToplevel { wl.xdg_toplevel.Resource.fromObject(surface.*.toplevel).sendClose() }
+}
+
+// The VT a function key switches to with Ctrl+Alt (0: not one).
+fn virtualTerminal(key: u32) -> u32 {
+    if key >= KEY_F1 && key <= KEY_F10 { return key - KEY_F1 + 1 }
+    if key == KEY_F11 { return 11 }
+    if key == KEY_F12 { return 12 }
+    return 0
+}
+
+pub fn keyboardKey(compositor: *Compositor, key: u32, pressed: bool) -> void {
+    if key == KEY_LEFTALT || key == KEY_RIGHTALT { compositor.*.alt = pressed }
+    if key == KEY_LEFTSHIFT || key == KEY_RIGHTSHIFT { compositor.*.shift = pressed }
+    if key == KEY_LEFTCTRL || key == KEY_RIGHTCTRL { compositor.*.control = pressed }
+    if pressed && compositor.*.freestanding && compositor.*.control && compositor.*.alt {
+        // Freestanding, the compositor is the one to switch VTs.
+        const terminal = virtualTerminal(key)
+        if terminal != 0 || key == KEY_BACKSPACE {
+            if terminal != 0 { compositor.*.vtRequest = terminal } else { compositor.*.running = false }
+            compositor.*.swallowedKey = key
+            return
+        }
+    }
+    if pressed && compositor.*.alt {
+        var handled = true
+        if key == KEY_ENTER {
+            launch(compositor, compositor.*.terminal)
+        } else if key == KEY_F4 {
+            closeFocused(compositor)
+        } else if key == KEY_TAB {
+            cycleFocus(compositor)
+        } else if key == KEY_Q && compositor.*.shift {
+            compositor.*.running = false
+        } else {
+            handled = false
+        }
+        if handled {
+            compositor.*.swallowedKey = key
+            return
+        }
+    }
+    if !pressed && key == compositor.*.swallowedKey && key != 0 {
+        compositor.*.swallowedKey = 0
+        return
+    }
+    if compositor.*.keyboardFocus == 0 { return }
+    const surface = state.surfaceAt(compositor.*.keyboardFocus)
+    const key_state = if pressed { @intFromEnum(wl.wl_keyboard.KeyState.pressed) } else { @intFromEnum(wl.wl_keyboard.KeyState.released) }
+    var index: usize = 0
+    while index < compositor.*.keyboards.length {
+        const keyboard = seatResourceAt(state.listAt(compositor.*.keyboards, index))
+        if state.sameClient(keyboard.*.object, surface.*.resource) {
+            wl.wl_keyboard.Resource.fromObject(keyboard.*.object).sendKey(compositor.*.server.nextSerial(), compositor.*.time, key, key_state)
+        }
+        index += 1
+    }
+    if compositor.*.verbose && pressed {
+        state.say("key ")
+        state.sayNumber(@intCast(usize, key))
+        state.say(" -> ")
+        state.sayTitle(surface)
+        state.say("\n")
+    }
+}
+
+pub fn keyboardModifiers(compositor: *Compositor, depressed: u32, latched: u32, locked: u32, group: u32) -> void {
+    compositor.*.modsDepressed = depressed
+    compositor.*.modsLatched = latched
+    compositor.*.modsLocked = locked
+    compositor.*.modsGroup = group
+    if compositor.*.keyboardFocus == 0 { return }
+    const surface = state.surfaceAt(compositor.*.keyboardFocus)
+    var index: usize = 0
+    while index < compositor.*.keyboards.length {
+        const keyboard = seatResourceAt(state.listAt(compositor.*.keyboards, index))
+        if state.sameClient(keyboard.*.object, surface.*.resource) {
+            wl.wl_keyboard.Resource.fromObject(keyboard.*.object).sendModifiers(compositor.*.server.nextSerial(), depressed, latched, locked, group)
+        }
+        index += 1
+    }
+}
+
+// Sends the host's keymap to every client keyboard (it may arrive after
+// clients bound their keyboards).
+pub fn broadcastKeymap(compositor: *Compositor) -> void {
+    var index: usize = 0
+    while index < compositor.*.keyboards.length {
+        const keyboard = seatResourceAt(state.listAt(compositor.*.keyboards, index))
+        wl.wl_keyboard.Resource.fromObject(keyboard.*.object).sendKeymap(compositor.*.keymapFormat, compositor.*.keymap, compositor.*.keymapSize)
+        index += 1
+    }
+}
+
+// Completes the frame callbacks committed before the last presented frame.
+pub fn frameDone(compositor: *Compositor, time: u32) -> void {
+    var index: usize = 0
+    while index < compositor.*.surfaces.length {
+        const surface = state.surfaceAt(state.listAt(compositor.*.surfaces, index))
+        var callback: usize = 0
+        while callback < surface.*.frameCallbackCount {
+            const object = wl.server.Object.{ .client = surface.*.resource.client, .id = surface.*.frameCallbacks[callback] }
+            wl.wl_callback.Resource.fromObject(object).sendDone(time)
+            callback += 1
+        }
+        surface.*.frameCallbackCount = 0
+        index += 1
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Mapping
+
+// For the log: the window's geometry as " WxH at X,Y".
+fn sayGeometry(surface: *const Surface) -> void {
+    state.say(" ")
+    state.sayInteger(scene.windowWidth(surface))
+    state.say("x")
+    state.sayInteger(scene.windowHeight(surface))
+    state.say(" at ")
+    state.sayInteger(scene.windowX(surface))
+    state.say(",")
+    state.sayInteger(scene.windowY(surface))
+    state.say("\n")
+}
+
+fn map(surface: *Surface) -> void {
+    const compositor = surface.*.compositor
+    const address = state.addressOfSurface(surface)
+    surface.*.mapped = true
+    compositor.*.stack = state.listAppend(compositor.*.stack, address)
+    if surface.*.role == state.ROLE_TOPLEVEL {
+        scene.place(compositor, surface)
+        if compositor.*.verbose {
+            state.say("map: ")
+            state.sayTitle(surface)
+            state.say("\n")
+            state.say("window:")
+            sayGeometry(surface)
+            surface.*.loggedWidth = scene.windowWidth(surface)
+            surface.*.loggedHeight = scene.windowHeight(surface)
+        }
+        focus(compositor, address)
+    }
+    compositor.*.needsRedraw = true
+}
+
+fn unmap(surface: *Surface) -> void {
+    const compositor = surface.*.compositor
+    const address = state.addressOfSurface(surface)
+    if !surface.*.mapped { return }
+    surface.*.mapped = false
+    compositor.*.stack = state.listRemove(compositor.*.stack, address)
+    if compositor.*.moving == address { compositor.*.moving = 0 }
+    if compositor.*.resizing == address { compositor.*.resizing = 0 }
+    if compositor.*.pointerFocus == address { updatePointerFocus(compositor, 0) }
+    if compositor.*.keyboardFocus == address {
+        compositor.*.keyboardFocus = 0
+        focus(compositor, topmostToplevel(compositor))
+    }
+    // Popups of an unmapped window go with it.
+    var index: usize = 0
+    while index < compositor.*.surfaces.length {
+        const other = state.surfaceAt(state.listAt(compositor.*.surfaces, index))
+        if other.*.parent == address {
+            other.*.parent = 0
+            if other.*.hasPopup { wl.xdg_popup.Resource.fromObject(other.*.popup).sendPopupDone() }
+            unmap(other)
+        }
+        index += 1
+    }
+    compositor.*.needsRedraw = true
+}
+
+// Copies an attached shm buffer into the surface and releases it.
+fn copyBuffer(surface: *Surface, buffer: *Buffer) -> void {
+    const compositor = surface.*.compositor
+    const width = @intCast(usize, buffer.*.width)
+    const height = @intCast(usize, buffer.*.height)
+    const needed = width * height * 4
+    if needed > surface.*.pixelCapacity {
+        if surface.*.pixelCapacity > 0 { state.release(compositor, surface.*.pixels, surface.*.pixelCapacity) }
+        surface.*.pixels = state.allocate(compositor, needed)
+        surface.*.pixelCapacity = needed
+    }
+    const source = buffer.*.pool.*.memory.bytes()
+    const offset = @intCast(usize, buffer.*.offset)
+    const stride = @intCast(usize, buffer.*.stride)
+    const opaque = buffer.*.format == @intFromEnum(wl.wl_shm.Format.xrgb8888)
+    var row: usize = 0
+    while row < height {
+        var column: usize = 0
+        const from = offset + row * stride
+        const to = row * width * 4
+        while column < width * 4 {
+            surface.*.pixels[to + column] = source[from + column]
+            column += 1
+        }
+        if opaque {
+            column = 3
+            while column < width * 4 {
+                surface.*.pixels[to + column] = 255
+                column += 4
+            }
+        }
+        row += 1
+    }
+    surface.*.pixelWidth = width
+    surface.*.pixelHeight = height
+    surface.*.hasContent = true
+    wl.wl_buffer.Resource.fromObject(buffer.*.resource).sendRelease()
+}
+
+// Vulkan: shows an attached buffer in place, releasing the one it replaces.
+fn holdBuffer(surface: *Surface, address: usize) -> void {
+    if surface.*.current != 0 && surface.*.current != address {
+        wl.wl_buffer.Resource.fromObject(bufferAt(surface.*.current).*.resource).sendRelease()
+    }
+    surface.*.current = address
+    const compositor = surface.*.compositor
+    compositor.*.commits += 1
+    surface.*.contentSerial = compositor.*.commits
+    const buffer = bufferAt(address)
+    surface.*.pixelWidth = @intCast(usize, buffer.*.width)
+    surface.*.pixelHeight = @intCast(usize, buffer.*.height)
+    surface.*.hasContent = true
+}
+
+fn releaseCurrent(surface: *Surface) -> void {
+    if surface.*.current != 0 {
+        wl.wl_buffer.Resource.fromObject(bufferAt(surface.*.current).*.resource).sendRelease()
+        surface.*.current = 0
+    }
+}
+
+fn commit(surface: *Surface) -> void {
+    const compositor = surface.*.compositor
+    if surface.*.hasPendingAttach {
+        if surface.*.pendingBuffer == 0 {
+            surface.*.hasContent = false
+            releaseCurrent(surface)
+            unmap(surface)
+        } else if compositor.*.renderer != 0 {
+            holdBuffer(surface, surface.*.pendingBuffer)
+        } else {
+            copyBuffer(surface, bufferAt(surface.*.pendingBuffer))
+        }
+        surface.*.hasPendingAttach = false
+        surface.*.pendingBuffer = 0
+    }
+    var index: usize = 0
+    while index < surface.*.pendingCallbackCount {
+        if surface.*.frameCallbackCount < state.MAX_CALLBACKS {
+            surface.*.frameCallbacks[surface.*.frameCallbackCount] = surface.*.pendingCallbacks[index]
+            surface.*.frameCallbackCount += 1
+        }
+        index += 1
+    }
+    surface.*.pendingCallbackCount = 0
+    if surface.*.role == state.ROLE_TOPLEVEL { resizeCommitted(surface) }
+    const has_role = surface.*.role == state.ROLE_TOPLEVEL || surface.*.role == state.ROLE_POPUP
+    if has_role && surface.*.configured && surface.*.hasContent && !surface.*.mapped { map(surface) }
+    compositor.*.needsRedraw = true
+}
+
+// ---------------------------------------------------------------------------
+// wl_surface, wl_region, wl_compositor
+
+fn onSurface(context: *anyopaque, request: wl.server.Request) -> void {
+    const surface = state.surfaceOf(context)
+    const compositor = surface.*.compositor
+    const decoded = wl.wl_surface.decodeRequest(request)
+    if request.opcode == wl.wl_surface.REQUEST_ATTACH {
+        surface.*.hasPendingAttach = true
+        surface.*.pendingBuffer = if decoded.attach.buffer.isNull() { 0 } else { findBuffer(compositor, decoded.attach.buffer.object) }
+    } else if request.opcode == wl.wl_surface.REQUEST_FRAME {
+        if surface.*.pendingCallbackCount < state.MAX_CALLBACKS {
+            surface.*.pendingCallbacks[surface.*.pendingCallbackCount] = decoded.frame.callback.id()
+            surface.*.pendingCallbackCount += 1
+        }
+    } else if request.opcode == wl.wl_surface.REQUEST_COMMIT {
+        commit(surface)
+    }
+}
+
+fn onSurfaceDestroyed(context: *anyopaque, object: wl.server.Object) -> void {
+    const surface = state.surfaceOf(context)
+    const compositor = surface.*.compositor
+    const address = state.addressOfSurface(surface)
+    unmap(surface)
+    // Role objects may outlive the surface during a disconnect; detach them.
+    if surface.*.hasXdgSurface { wl.server.setDestroyHandler(surface.*.xdgSurface, ignoreDestroy, context) }
+    if surface.*.hasToplevel { wl.server.setDestroyHandler(surface.*.toplevel, ignoreDestroy, context) }
+    if surface.*.hasPopup { wl.server.setDestroyHandler(surface.*.popup, ignoreDestroy, context) }
+    if compositor.*.cursorSurface == address { compositor.*.cursorSurface = 0 }
+    var index: usize = 0
+    while index < compositor.*.surfaces.length {
+        const other = state.surfaceAt(state.listAt(compositor.*.surfaces, index))
+        if other.*.parent == address { other.*.parent = 0 }
+        index += 1
+    }
+    compositor.*.surfaces = state.listRemove(compositor.*.surfaces, address)
+    releaseCurrent(surface)
+    vulkan.releaseSurface(compositor, surface)
+    if surface.*.pixelCapacity > 0 { state.release(compositor, surface.*.pixels, surface.*.pixelCapacity) }
+    unsafe { state.release(compositor, @ptrCast([*]u8, surface), @sizeOf(Surface)) }
+}
+
+fn createSurface(compositor: *Compositor, resource: wl.wl_surface.Resource) -> void {
+    const memory = state.allocate(compositor, @sizeOf(Surface))
+    var surface: *Surface = undefined
+    unsafe { surface = @ptrCast(*Surface, memory) }
+    surface.*.compositor = compositor
+    surface.*.resource = resource.object
+    surface.*.role = state.ROLE_NONE
+    surface.*.hasXdgSurface = false
+    surface.*.hasToplevel = false
+    surface.*.hasPopup = false
+    surface.*.parent = 0
+    surface.*.configured = false
+    surface.*.mapped = false
+    surface.*.x = 0
+    surface.*.y = 0
+    surface.*.hasGeometry = false
+    surface.*.pendingBuffer = 0
+    surface.*.hasPendingAttach = false
+    surface.*.current = 0
+    surface.*.pixelCapacity = 0
+    surface.*.pixelWidth = 0
+    surface.*.pixelHeight = 0
+    surface.*.hasContent = false
+    surface.*.pendingCallbackCount = 0
+    surface.*.frameCallbackCount = 0
+    surface.*.titleLength = 0
+    surface.*.configuredWidth = 0
+    surface.*.configuredHeight = 0
+    surface.*.wantedWidth = 0
+    surface.*.wantedHeight = 0
+    surface.*.configureSerial = 0
+    surface.*.ackedSerial = 0
+    surface.*.configurePending = false
+    surface.*.resizing = false
+    surface.*.minWidth = 0
+    surface.*.minHeight = 0
+    surface.*.maxWidth = 0
+    surface.*.maxHeight = 0
+    surface.*.anchorEdges = 0
+    surface.*.anchorRight = 0
+    surface.*.anchorBottom = 0
+    surface.*.loggedWidth = 0
+    surface.*.loggedHeight = 0
+    surface.*.staging = 0
+    surface.*.stagingSize = 0
+    surface.*.stagingSerial = 0
+    surface.*.contentSerial = 0
+    compositor.*.surfaces = state.listAppend(compositor.*.surfaces, @intFromPtr(surface))
+    resource.setHandler(onSurface, state.contextOf(memory))
+    resource.setDestroyHandler(onSurfaceDestroyed, state.contextOf(memory))
+}
+
+fn onCompositor(context: *anyopaque, request: wl.server.Request) -> void {
+    const compositor = state.compositorOf(context)
+    const decoded = wl.wl_compositor.decodeRequest(request)
+    if request.opcode == wl.wl_compositor.REQUEST_CREATE_SURFACE {
+        createSurface(compositor, decoded.create_surface.id)
+    } else if request.opcode == wl.wl_compositor.REQUEST_CREATE_REGION {
+        decoded.create_region.id.setHandler(ignoreRequest, context)
+    }
+}
+
+fn bindCompositor(context: *anyopaque, client: wl.server.Client, object: wl.server.Object, version: u32) -> void {
+    wl.wl_compositor.Resource.fromObject(object).setHandler(onCompositor, context)
+}
+
+// ---------------------------------------------------------------------------
+// wl_shm, wl_shm_pool, wl_buffer
+
+fn poolAt(context: *anyopaque) -> *Pool {
+    unsafe { return @ptrCast(*Pool, context) }
+}
+
+fn dropPool(pool: *Pool) -> void {
+    pool.*.references -= 1
+    if pool.*.references == 0 {
+        const compositor = pool.*.compositor
+        vulkan.releasePool(compositor, pool)
+        pool.*.memory.release()
+        unsafe { state.release(compositor, @ptrCast([*]u8, pool), @sizeOf(Pool)) }
+    }
+}
+
+fn onBufferDestroyed(context: *anyopaque, object: wl.server.Object) -> void {
+    var buffer: *Buffer = undefined
+    unsafe { buffer = @ptrCast(*Buffer, context) }
+    const compositor = buffer.*.compositor
+    const address = @intFromPtr(buffer)
+    var index: usize = 0
+    while index < compositor.*.surfaces.length {
+        const surface = state.surfaceAt(state.listAt(compositor.*.surfaces, index))
+        if surface.*.pendingBuffer == address { surface.*.pendingBuffer = 0 }
+        if surface.*.current == address {
+            // Destroyed while shown: its contents are gone.
+            surface.*.current = 0
+            compositor.*.needsRedraw = true
+        }
+        index += 1
+    }
+    compositor.*.buffers = state.listRemove(compositor.*.buffers, address)
+    dropPool(buffer.*.pool)
+    unsafe { state.release(compositor, @ptrCast([*]u8, buffer), @sizeOf(Buffer)) }
+}
+
+// Records a wl_buffer backed by `pool` (which it keeps alive).
+pub fn addBuffer(pool: *Pool, resource: wl.wl_buffer.Resource, offset: i32, width: i32, height: i32, stride: i32, format: u32) -> void {
+    const compositor = pool.*.compositor
+    const memory = state.allocate(compositor, @sizeOf(Buffer))
+    var buffer: *Buffer = undefined
+    unsafe { buffer = @ptrCast(*Buffer, memory) }
+    buffer.*.compositor = compositor
+    buffer.*.resource = resource.object
+    buffer.*.pool = pool
+    buffer.*.offset = offset
+    buffer.*.width = width
+    buffer.*.height = height
+    buffer.*.stride = stride
+    buffer.*.format = format
+    pool.*.references += 1
+    compositor.*.buffers = state.listAppend(compositor.*.buffers, @intFromPtr(buffer))
+    resource.setHandler(ignoreRequest, state.contextOf(memory))
+    resource.setDestroyHandler(onBufferDestroyed, state.contextOf(memory))
+}
+
+// A pool record for mapped client memory, with one reference.
+pub fn newPool(compositor: *Compositor, memory: wl.SharedMemory, dmabuf: bool) -> *Pool {
+    const record = state.allocate(compositor, @sizeOf(Pool))
+    var pool: *Pool = undefined
+    unsafe { pool = @ptrCast(*Pool, record) }
+    pool.*.compositor = compositor
+    pool.*.memory = memory
+    pool.*.references = 1
+    pool.*.dmabuf = dmabuf
+    pool.*.imported = false
+    pool.*.importFailed = false
+    return pool
+}
+
+pub fn releasePool(pool: *Pool) -> void { dropPool(pool) }
+
+fn onPool(context: *anyopaque, request: wl.server.Request) -> void {
+    const pool = poolAt(context)
+    const compositor = pool.*.compositor
+    const decoded = wl.wl_shm_pool.decodeRequest(request)
+    if request.opcode == wl.wl_shm_pool.REQUEST_CREATE_BUFFER {
+        const created = decoded.create_buffer
+        const size = @intCast(i32, pool.*.memory.size)
+        const format_ok = created.format == @intFromEnum(wl.wl_shm.Format.argb8888) || created.format == @intFromEnum(wl.wl_shm.Format.xrgb8888)
+        const geometry_ok = created.width > 0 && created.height > 0 && created.offset >= 0 && created.stride >= created.width * 4 && created.offset + created.stride * created.height <= size
+        const shm_pool = wl.wl_shm_pool.Resource.fromObject(request.object)
+        if !format_ok {
+            shm_pool.postError(@intFromEnum(wl.wl_shm.Error.invalid_format), "unsupported buffer format")
+            return
+        }
+        if !geometry_ok {
+            shm_pool.postError(@intFromEnum(wl.wl_shm.Error.invalid_stride), "buffer does not fit the pool")
+            return
+        }
+        addBuffer(pool, created.id, created.offset, created.width, created.height, created.stride, created.format)
+    } else if request.opcode == wl.wl_shm_pool.REQUEST_RESIZE {
+        const size = decoded.resize.size
+        if size > 0 && @intCast(usize, size) > pool.*.memory.size {
+            var grown: wl.SharedMemory = undefined
+            if wl.transport.mapSharedMemory(&grown, pool.*.memory.handle.duplicate(), @intCast(usize, size), false) {
+                vulkan.releasePool(compositor, pool)
+                pool.*.memory.release()
+                pool.*.memory = grown
+            }
+        }
+    }
+}
+
+fn onPoolDestroyed(context: *anyopaque, object: wl.server.Object) -> void {
+    dropPool(poolAt(context))
+}
+
+fn onShm(context: *anyopaque, request: wl.server.Request) -> void {
+    const compositor = state.compositorOf(context)
+    const decoded = wl.wl_shm.decodeRequest(request)
+    if request.opcode != wl.wl_shm.REQUEST_CREATE_POOL { return }
+    const created = decoded.create_pool
+    var memory: wl.SharedMemory = undefined
+    if created.size <= 0 || !wl.transport.mapSharedMemory(&memory, created.fd, @intCast(usize, created.size), false) {
+        created.fd.close()
+        wl.wl_shm.Resource.fromObject(request.object).postError(@intFromEnum(wl.wl_shm.Error.invalid_fd), "cannot map the pool")
+        return
+    }
+    const pool = newPool(compositor, memory, false)
+    var record: [*]u8 = undefined
+    unsafe { record = @ptrCast([*]u8, pool) }
+    created.id.setHandler(onPool, state.contextOf(record))
+    created.id.setDestroyHandler(onPoolDestroyed, state.contextOf(record))
+}
+
+fn bindShm(context: *anyopaque, client: wl.server.Client, object: wl.server.Object, version: u32) -> void {
+    const shm = wl.wl_shm.Resource.fromObject(object)
+    shm.setHandler(onShm, context)
+    shm.sendFormat(@intFromEnum(wl.wl_shm.Format.argb8888))
+    shm.sendFormat(@intFromEnum(wl.wl_shm.Format.xrgb8888))
+}
+
+// ---------------------------------------------------------------------------
+// wl_output
+
+fn bindOutput(context: *anyopaque, client: wl.server.Client, object: wl.server.Object, version: u32) -> void {
+    const compositor = state.compositorOf(context)
+    const output = wl.wl_output.Resource.fromObject(object)
+    const width = @intCast(i32, compositor.*.width)
+    const height = @intCast(i32, compositor.*.height)
+    output.sendGeometry(0, 0, (width * 254) / 960, (height * 254) / 960, @intCast(i32, @intFromEnum(wl.wl_output.Subpixel.unknown)), "Mlx", "nested output", @intCast(i32, @intFromEnum(wl.wl_output.Transform.normal)))
+    output.sendMode(@intFromEnum(wl.wl_output.Mode.current) | @intFromEnum(wl.wl_output.Mode.preferred), width, height, 60000)
+    output.sendScale(1)
+    output.sendName("MLX-1")
+    output.sendDescription("Mlx nested compositor output")
+    output.sendDone()
+}
+
+// ---------------------------------------------------------------------------
+// wl_seat, wl_pointer, wl_keyboard
+
+fn onSeatResourceDestroyed(context: *anyopaque, object: wl.server.Object) -> void {
+    var resource: *SeatResource = undefined
+    unsafe { resource = @ptrCast(*SeatResource, context) }
+    const compositor = resource.*.compositor
+    const address = @intFromPtr(resource)
+    if resource.*.kind == state.SEAT_POINTER {
+        compositor.*.pointers = state.listRemove(compositor.*.pointers, address)
+    } else {
+        compositor.*.keyboards = state.listRemove(compositor.*.keyboards, address)
+    }
+    unsafe { state.release(compositor, @ptrCast([*]u8, resource), @sizeOf(SeatResource)) }
+}
+
+fn onPointer(context: *anyopaque, request: wl.server.Request) -> void {
+    var resource: *SeatResource = undefined
+    unsafe { resource = @ptrCast(*SeatResource, context) }
+    const compositor = resource.*.compositor
+    if request.opcode != wl.wl_pointer.REQUEST_SET_CURSOR { return }
+    const decoded = wl.wl_pointer.decodeRequest(request)
+    // Only the client with pointer focus may set the cursor.
+    if compositor.*.pointerFocus == 0 { return }
+    if !state.sameClient(request.object, state.surfaceAt(compositor.*.pointerFocus).*.resource) { return }
+    const cursor = decoded.set_cursor
+    if cursor.surface.isNull() {
+        compositor.*.cursorSurface = 0
+        compositor.*.cursorHidden = true
+    } else {
+        const address = findSurface(compositor, cursor.surface.object)
+        if address != 0 {
+            state.surfaceAt(address).*.role = state.ROLE_CURSOR
+            compositor.*.cursorSurface = address
+            compositor.*.cursorHotspotX = cursor.hotspot_x
+            compositor.*.cursorHotspotY = cursor.hotspot_y
+            compositor.*.cursorHidden = false
+        }
+    }
+    compositor.*.needsRedraw = true
+}
+
+fn addSeatResource(compositor: *Compositor, object: wl.server.Object, kind: u8) -> *SeatResource {
+    const memory = state.allocate(compositor, @sizeOf(SeatResource))
+    var resource: *SeatResource = undefined
+    unsafe { resource = @ptrCast(*SeatResource, memory) }
+    resource.*.compositor = compositor
+    resource.*.object = object
+    resource.*.kind = kind
+    if kind == state.SEAT_POINTER {
+        compositor.*.pointers = state.listAppend(compositor.*.pointers, @intFromPtr(resource))
+    } else {
+        compositor.*.keyboards = state.listAppend(compositor.*.keyboards, @intFromPtr(resource))
+    }
+    wl.server.setDestroyHandler(object, onSeatResourceDestroyed, state.contextOf(memory))
+    return resource
+}
+
+fn onSeat(context: *anyopaque, request: wl.server.Request) -> void {
+    const compositor = state.compositorOf(context)
+    const decoded = wl.wl_seat.decodeRequest(request)
+    if request.opcode == wl.wl_seat.REQUEST_GET_POINTER {
+        const pointer = addSeatResource(compositor, decoded.get_pointer.id.object, state.SEAT_POINTER)
+        var memory: [*]u8 = undefined
+        unsafe { memory = @ptrCast([*]u8, pointer) }
+        decoded.get_pointer.id.setHandler(onPointer, state.contextOf(memory))
+    } else if request.opcode == wl.wl_seat.REQUEST_GET_KEYBOARD {
+        const keyboard = addSeatResource(compositor, decoded.get_keyboard.id.object, state.SEAT_KEYBOARD)
+        const resource = decoded.get_keyboard.id
+        resource.setHandler(ignoreRequest, context)
+        if compositor.*.hasKeymap {
+            resource.sendKeymap(compositor.*.keymapFormat, compositor.*.keymap, compositor.*.keymapSize)
+        }
+        resource.sendRepeatInfo(compositor.*.repeatRate, compositor.*.repeatDelay)
+        const focused = compositor.*.keyboardFocus
+        if focused != 0 && state.sameClient(resource.object, state.surfaceAt(focused).*.resource) {
+            sendKeyboardEnter(compositor, keyboard, state.surfaceAt(focused))
+        }
+    } else if request.opcode == wl.wl_seat.REQUEST_GET_TOUCH {
+        decoded.get_touch.id.setHandler(ignoreRequest, context)
+    }
+}
+
+fn bindSeat(context: *anyopaque, client: wl.server.Client, object: wl.server.Object, version: u32) -> void {
+    const seat = wl.wl_seat.Resource.fromObject(object)
+    seat.setHandler(onSeat, context)
+    seat.sendCapabilities(@intFromEnum(wl.wl_seat.Capability.pointer) | @intFromEnum(wl.wl_seat.Capability.keyboard))
+    seat.sendName("seat0")
+}
+
+// ---------------------------------------------------------------------------
+// xdg_wm_base, xdg_positioner, xdg_surface, xdg_toplevel, xdg_popup
+
+fn onPositioner(context: *anyopaque, request: wl.server.Request) -> void {
+    var positioner: *Positioner = undefined
+    unsafe { positioner = @ptrCast(*Positioner, context) }
+    const decoded = wl.xdg_positioner.decodeRequest(request)
+    const opcode = request.opcode
+    if opcode == wl.xdg_positioner.REQUEST_SET_SIZE {
+        positioner.*.width = decoded.set_size.width
+        positioner.*.height = decoded.set_size.height
+    } else if opcode == wl.xdg_positioner.REQUEST_SET_ANCHOR_RECT {
+        positioner.*.anchorX = decoded.set_anchor_rect.x
+        positioner.*.anchorY = decoded.set_anchor_rect.y
+        positioner.*.anchorWidth = decoded.set_anchor_rect.width
+        positioner.*.anchorHeight = decoded.set_anchor_rect.height
+    } else if opcode == wl.xdg_positioner.REQUEST_SET_ANCHOR {
+        positioner.*.anchor = decoded.set_anchor.anchor
+    } else if opcode == wl.xdg_positioner.REQUEST_SET_GRAVITY {
+        positioner.*.gravity = decoded.set_gravity.gravity
+    } else if opcode == wl.xdg_positioner.REQUEST_SET_OFFSET {
+        positioner.*.offsetX = decoded.set_offset.x
+        positioner.*.offsetY = decoded.set_offset.y
+    }
+}
+
+fn onPositionerDestroyed(context: *anyopaque, object: wl.server.Object) -> void {
+    var positioner: *Positioner = undefined
+    unsafe { positioner = @ptrCast(*Positioner, context) }
+    const compositor = positioner.*.compositor
+    compositor.*.positioners = state.listRemove(compositor.*.positioners, @intFromPtr(positioner))
+    unsafe { state.release(compositor, @ptrCast([*]u8, positioner), @sizeOf(Positioner)) }
+}
+
+// xdg_positioner anchor/gravity values: 1 top, 2 bottom, 3 left, 4 right,
+// 5 top_left, 6 bottom_left, 7 top_right, 8 bottom_right, 0 none.
+fn hasTop(value: u32) -> bool { return value == 1 || value == 5 || value == 7 }
+fn hasBottom(value: u32) -> bool { return value == 2 || value == 6 || value == 8 }
+fn hasLeft(value: u32) -> bool { return value == 3 || value == 5 || value == 6 }
+fn hasRight(value: u32) -> bool { return value == 4 || value == 7 || value == 8 }
+
+// Popup position relative to the parent's window geometry.
+fn popupX(positioner: *const Positioner) -> i32 {
+    var x = positioner.*.anchorX + positioner.*.anchorWidth / 2
+    if hasLeft(positioner.*.anchor) { x = positioner.*.anchorX }
+    if hasRight(positioner.*.anchor) { x = positioner.*.anchorX + positioner.*.anchorWidth }
+    if hasLeft(positioner.*.gravity) {
+        x -= positioner.*.width
+    } else if !hasRight(positioner.*.gravity) {
+        x -= positioner.*.width / 2
+    }
+    return x + positioner.*.offsetX
+}
+
+fn popupY(positioner: *const Positioner) -> i32 {
+    var y = positioner.*.anchorY + positioner.*.anchorHeight / 2
+    if hasTop(positioner.*.anchor) { y = positioner.*.anchorY }
+    if hasBottom(positioner.*.anchor) { y = positioner.*.anchorY + positioner.*.anchorHeight }
+    if hasTop(positioner.*.gravity) {
+        y -= positioner.*.height
+    } else if !hasBottom(positioner.*.gravity) {
+        y -= positioner.*.height / 2
+    }
+    return y + positioner.*.offsetY
+}
+
+fn configurePopup(surface: *Surface, positioner: *const Positioner) -> void {
+    const x = popupX(positioner)
+    const y = popupY(positioner)
+    if surface.*.parent != 0 {
+        const parent = state.surfaceAt(surface.*.parent)
+        surface.*.x = scene.windowX(parent) + x
+        surface.*.y = scene.windowY(parent) + y
+    }
+    wl.xdg_popup.Resource.fromObject(surface.*.popup).sendConfigure(x, y, positioner.*.width, positioner.*.height)
+    wl.xdg_surface.Resource.fromObject(surface.*.xdgSurface).sendConfigure(surface.*.compositor.*.server.nextSerial())
+}
+
+fn onToplevel(context: *anyopaque, request: wl.server.Request) -> void {
+    const surface = state.surfaceOf(context)
+    const compositor = surface.*.compositor
+    const decoded = wl.xdg_toplevel.decodeRequest(request)
+    if request.opcode == wl.xdg_toplevel.REQUEST_SET_TITLE {
+        const title = decoded.set_title.title
+        var index: usize = 0
+        while index < title.length && index < 64 {
+            surface.*.title[index] = title.pointer[index]
+            index += 1
+        }
+        surface.*.titleLength = index
+    } else if request.opcode == wl.xdg_toplevel.REQUEST_MOVE {
+        if compositor.*.buttonsDown > 0 { startMove(compositor, state.addressOfSurface(surface)) }
+    } else if request.opcode == wl.xdg_toplevel.REQUEST_RESIZE {
+        // Client-side decorations (GTK) start resizes from their own edges.
+        if compositor.*.buttonsDown > 0 { startResize(compositor, state.addressOfSurface(surface), decoded.resize.edges) }
+    } else if request.opcode == wl.xdg_toplevel.REQUEST_SET_MIN_SIZE {
+        surface.*.minWidth = decoded.set_min_size.width
+        surface.*.minHeight = decoded.set_min_size.height
+    } else if request.opcode == wl.xdg_toplevel.REQUEST_SET_MAX_SIZE {
+        surface.*.maxWidth = decoded.set_max_size.width
+        surface.*.maxHeight = decoded.set_max_size.height
+    }
+}
+
+fn onToplevelDestroyed(context: *anyopaque, object: wl.server.Object) -> void {
+    const surface = state.surfaceOf(context)
+    unmap(surface)
+    surface.*.hasToplevel = false
+    surface.*.role = state.ROLE_NONE
+}
+
+fn onPopup(context: *anyopaque, request: wl.server.Request) -> void {
+    const surface = state.surfaceOf(context)
+    const decoded = wl.xdg_popup.decodeRequest(request)
+    if request.opcode == wl.xdg_popup.REQUEST_REPOSITION {
+        const address = findPositioner(surface.*.compositor, decoded.reposition.positioner.object)
+        if address != 0 {
+            wl.xdg_popup.Resource.fromObject(surface.*.popup).sendRepositioned(decoded.reposition.token)
+            configurePopup(surface, positionerAt(address))
+        }
+    }
+}
+
+fn onPopupDestroyed(context: *anyopaque, object: wl.server.Object) -> void {
+    const surface = state.surfaceOf(context)
+    unmap(surface)
+    surface.*.hasPopup = false
+    surface.*.role = state.ROLE_NONE
+    surface.*.parent = 0
+}
+
+fn onXdgSurface(context: *anyopaque, request: wl.server.Request) -> void {
+    const surface = state.surfaceOf(context)
+    const compositor = surface.*.compositor
+    const decoded = wl.xdg_surface.decodeRequest(request)
+    const opcode = request.opcode
+    if opcode == wl.xdg_surface.REQUEST_GET_TOPLEVEL {
+        const toplevel = decoded.get_toplevel.id
+        surface.*.role = state.ROLE_TOPLEVEL
+        surface.*.hasToplevel = true
+        surface.*.toplevel = toplevel.object
+        toplevel.setHandler(onToplevel, context)
+        toplevel.setDestroyHandler(onToplevelDestroyed, context)
+        configureToplevel(surface)
+    } else if opcode == wl.xdg_surface.REQUEST_GET_POPUP {
+        const popup = decoded.get_popup.id
+        surface.*.role = state.ROLE_POPUP
+        surface.*.hasPopup = true
+        surface.*.popup = popup.object
+        surface.*.parent = if decoded.get_popup.parent.isNull() { 0 } else { findXdgSurface(compositor, decoded.get_popup.parent.object) }
+        popup.setHandler(onPopup, context)
+        popup.setDestroyHandler(onPopupDestroyed, context)
+        const address = findPositioner(compositor, decoded.get_popup.positioner.object)
+        if address != 0 { configurePopup(surface, positionerAt(address)) }
+    } else if opcode == wl.xdg_surface.REQUEST_SET_WINDOW_GEOMETRY {
+        const geometry = decoded.set_window_geometry
+        if geometry.width > 0 && geometry.height > 0 {
+            surface.*.hasGeometry = true
+            surface.*.geometryX = geometry.x
+            surface.*.geometryY = geometry.y
+            surface.*.geometryWidth = geometry.width
+            surface.*.geometryHeight = geometry.height
+        }
+    } else if opcode == wl.xdg_surface.REQUEST_ACK_CONFIGURE {
+        surface.*.configured = true
+        surface.*.ackedSerial = decoded.ack_configure.serial
+    }
+}
+
+fn onXdgSurfaceDestroyed(context: *anyopaque, object: wl.server.Object) -> void {
+    const surface = state.surfaceOf(context)
+    unmap(surface)
+    surface.*.hasXdgSurface = false
+}
+
+fn onWmBase(context: *anyopaque, request: wl.server.Request) -> void {
+    const compositor = state.compositorOf(context)
+    const decoded = wl.xdg_wm_base.decodeRequest(request)
+    if request.opcode == wl.xdg_wm_base.REQUEST_CREATE_POSITIONER {
+        const memory = state.allocate(compositor, @sizeOf(Positioner))
+        var positioner: *Positioner = undefined
+        unsafe { positioner = @ptrCast(*Positioner, memory) }
+        positioner.*.compositor = compositor
+        positioner.*.resource = decoded.create_positioner.id.object
+        positioner.*.width = 1
+        positioner.*.height = 1
+        positioner.*.anchorX = 0
+        positioner.*.anchorY = 0
+        positioner.*.anchorWidth = 1
+        positioner.*.anchorHeight = 1
+        positioner.*.anchor = 0
+        positioner.*.gravity = 0
+        positioner.*.offsetX = 0
+        positioner.*.offsetY = 0
+        compositor.*.positioners = state.listAppend(compositor.*.positioners, @intFromPtr(positioner))
+        decoded.create_positioner.id.setHandler(onPositioner, state.contextOf(memory))
+        decoded.create_positioner.id.setDestroyHandler(onPositionerDestroyed, state.contextOf(memory))
+    } else if request.opcode == wl.xdg_wm_base.REQUEST_GET_XDG_SURFACE {
+        const created = decoded.get_xdg_surface
+        const address = findSurface(compositor, created.surface.object)
+        if address == 0 {
+            wl.xdg_wm_base.Resource.fromObject(request.object).postError(@intFromEnum(wl.xdg_wm_base.Error.role), "unknown surface")
+            return
+        }
+        const surface = state.surfaceAt(address)
+        surface.*.hasXdgSurface = true
+        surface.*.xdgSurface = created.id.object
+        var memory: [*]u8 = undefined
+        unsafe { memory = @ptrCast([*]u8, surface) }
+        created.id.setHandler(onXdgSurface, state.contextOf(memory))
+        created.id.setDestroyHandler(onXdgSurfaceDestroyed, state.contextOf(memory))
+    }
+}
+
+fn bindWmBase(context: *anyopaque, client: wl.server.Client, object: wl.server.Object, version: u32) -> void {
+    wl.xdg_wm_base.Resource.fromObject(object).setHandler(onWmBase, context)
+}
+
+// ---------------------------------------------------------------------------
+// Setup
+
+fn onClientCreated(context: *anyopaque, client: wl.server.Client) -> void {
+    if state.compositorOf(context).*.verbose { state.say("client connected\n") }
+}
+
+fn onClientDestroyed(context: *anyopaque, client: wl.server.Client) -> void {
+    const compositor = state.compositorOf(context)
+    compositor.*.needsRedraw = true
+    if compositor.*.verbose { state.say("client disconnected\n") }
+}
+
+pub fn createGlobals(compositor: *Compositor) -> bool {
+    const server = compositor.*.server
+    var memory: [*]u8 = undefined
+    unsafe { memory = @ptrCast([*]u8, compositor) }
+    const context = state.contextOf(memory)
+    server.setClientCreatedHandler(onClientCreated, context)
+    server.setClientDestroyedHandler(onClientDestroyed, context)
+    if server.createGlobal(wl.Interface.wl_compositor, 6, bindCompositor, context) == 0 { return false }
+    if server.createGlobal(wl.Interface.wl_shm, 1, bindShm, context) == 0 { return false }
+    if server.createGlobal(wl.Interface.wl_output, 4, bindOutput, context) == 0 { return false }
+    if server.createGlobal(wl.Interface.wl_seat, 7, bindSeat, context) == 0 { return false }
+    if server.createGlobal(wl.Interface.xdg_wm_base, 5, bindWmBase, context) == 0 { return false }
+    return true
+}
+
+// ---------------------------------------------------------------------------
+// Launching clients
+
+// Runs `program` (a path, or a name looked up in PATH) with our
+// WAYLAND_DISPLAY. Only called in the forked child.
+fn execute(program: [*]const u8, environment: [*][*]const u8) -> void {
+    var arguments: [2][*]const u8 = undefined
+    unsafe {
+        arguments[0] = program
+        arguments[1] = @ptrFromInt([*]const u8, 0)
+    }
+    var has_slash = false
+    var length: usize = 0
+    while program[length] != 0 {
+        if program[length] == 47 { has_slash = true }
+        length += 1
+    }
+    if has_slash {
+        const ignored = std.linux.syscall3(SYS_execve, @intFromPtr(program), @intFromPtr(&arguments), @intFromPtr(environment))
+        return
+    }
+    const path = state.environmentValue(environment, "PATH")
+    if @intFromPtr(path) == 0 { return }
+    var candidate: [512]u8 = undefined
+    var position: usize = 0
+    while true {
+        var used: usize = 0
+        while path[position] != 0 && path[position] != 58 && used < 400 {
+            candidate[used] = path[position]
+            used += 1
+            position += 1
+        }
+        if used > 0 && used + length + 2 < 512 {
+            candidate[used] = 47
+            var index: usize = 0
+            while index <= length {
+                candidate[used + 1 + index] = program[index]
+                index += 1
+            }
+            const ignored = std.linux.syscall3(SYS_execve, @intFromPtr(&candidate), @intFromPtr(&arguments), @intFromPtr(environment))
+        }
+        if path[position] == 0 { return }
+        position += 1
+    }
+}
+
+pub fn launch(compositor: *Compositor, program: [*]const u8) -> void {
+    if compositor.*.verbose {
+        state.say("launch: ")
+        var length: usize = 0
+        while program[length] != 0 { length += 1 }
+        const shown = std.io.writeAllBytes(std.io.stdout(), program, length)
+        state.say("\n")
+    }
+    const child = std.linux.syscall0(SYS_fork)
+    if child == 0 {
+        execute(program, compositor.*.environment)
+        const exited = std.linux.syscall1(SYS_exit_group, 127)
+    }
+}
+
+// Collects exited children.
+pub fn reapChildren() -> void {
+    var status: [4]u8 = [4]u8{ 0, 0, 0, 0 }
+    while std.linux.syscall4(SYS_wait4, 18446744073709551615, @intFromPtr(&status), 1, 0) > 0 {}
+}

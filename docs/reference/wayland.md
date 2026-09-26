@@ -152,38 +152,82 @@ named helper call, not `|`/`&` on the enum type.
 
 ### Bootstrap input location
 
-`std/protocols/wayland/README.md` is short but normative about intent, not
-just location:
+`std/protocols/wayland/` holds the canonical XML exactly as published
+upstream, the provenance record, and the bootstrap tool:
 
-```
-Canonical `wayland.xml` and selected extension XML files are placed or
-acquired here by the Stage-0/Stage-1 stdlib bootstrap process. They are
-source inputs for materializing `std.wayland`; they are not user-project
-build inputs.
+| File | Content |
+| --- | --- |
+| `wayland.xml` | core protocol, wayland 1.26.0 |
+| `xdg-shell.xml` | stable xdg-shell, wayland-protocols 1.49 |
+| `linux-dmabuf-v1.xml` | stable linux-dmabuf (`zwp_linux_dmabuf_v1`, version 6), wayland-protocols 1.49 |
+| `SOURCES` | upstream URL, release and SHA-256 of each XML file |
+| `materialize.mlx` | Stage-1 tool: XML to `std/src/wayland/generated/` |
+| `materialize.sh` | verifies the hashes, builds the tool, runs it |
 
-The repository intentionally does not vendor an invented substitute XML
-file. Bootstrap tooling must preserve upstream protocol contents exactly and
-record source/version/hash metadata.
-```
-
-(`std/protocols/wayland/README.md`)
-
-As of this writing that directory contains only the `README.md` — the
-canonical `wayland.xml`/extension XML itself has not been vendored in yet,
-which is consistent with `spec/06-wayland/wayland.xml`'s framing of this as
-Stage-0/Stage-1 bootstrap work still ahead, and with the project's rule
-against inventing a stand-in schema file. `protocols/README.md` at the repo
-root makes the same "this isn't ordinary project configuration" point from
-the caller's side:
-
-```
-Protocol source data used to construct standard-library modules belongs to
-the toolchain/stdlib source process, not ordinary Mlx project configuration.
-Wayland's canonical XML is handled under `std/protocols/wayland` during
-Stage-0/1 stdlib bootstrap.
+```sh
+std/protocols/wayland/materialize.sh           # regenerate std.wayland
+std/protocols/wayland/materialize.sh --check   # fail if generated code is stale
 ```
 
-(`protocols/README.md`)
+The script refuses to run when an XML file no longer matches the hash in
+`SOURCES`, which enforces the README's rule that bootstrap tooling "must
+preserve upstream protocol contents exactly and record source/version/hash
+metadata" (`std/protocols/wayland/README.md`). The generated modules are
+committed, so ordinary builds never read XML: they compile
+`std/src/wayland/generated/*.mlx` like any other std source.
+
+### The implemented pipeline
+
+Each stage of `<ImplementationPipeline>` is an ordinary Mlx module:
+
+| Stage | Module | Fixture |
+| --- | --- | --- |
+| XML tokenizer / pull parser | `std.xml` (`std/src/xml.mlx`) | `tests/240_std_xml_tokenizer_runtime.mlx` |
+| protocol parser, AST, validation | `std.wayland.protocol` | `tests/241_wayland_protocol_parser_runtime.mlx` |
+| typed declaration generation | `std.wayland.materialize` | `tests/246_wayland_generated_api_runtime.mlx` |
+| ordinary `std.wayland` module | `std/src/wayland.mlx` + `generated/` | `tests/244_wayland_client_server_runtime.mlx` |
+
+`std.xml` is an allocation-free pull tokenizer. It reports declarations,
+comments, element starts, one token per attribute, element ends
+(self-closing ones flagged), text and CDATA, checks well-formedness (matching
+end tags, unique attributes, a single root, valid references) and decodes
+the predefined entities and numeric character references on request.
+
+`std.wayland.protocol` builds the AST of `protocol-ast.xml` and applies
+wayland-scanner's hard errors: identifier rules, `since`/`deprecated-since`
+bounds, `frozen` interfaces at version 1, `destroy` requests that must be
+destructors, argument types, `interface` only on object/new_id, `allow-null`
+only on object/string, enum-typed arguments only on int/uint, bitfield enums
+only on uint, and non-empty enums. It also rejects every element or attribute
+the schema does not define; the only ignored constructs are comments,
+whitespace and `<description>` inside `<arg>`/`<entry>`. The parser test
+checks these errors one by one against small documents, and parses both
+vendored files.
+
+`std.wayland.materialize` produces, for the whole protocol set:
+
+- `generated/interfaces.mlx`: the `Interface` enum and the metadata the
+  runtimes dispatch on — names, versions, request/event counts,
+  libwayland-format signatures (`"?oii"`, `"usun"` for a generic new_id),
+  destructor flags and the interface of every object/new_id argument. Every
+  signature and argument interface was checked against `wayland-scanner`'s
+  output for the same XML.
+- `generated/<protocol>/types.mlx`: a client `Proxy` type with one method
+  per request and a server `Resource` type with one `send…` method per
+  event.
+- `generated/<protocol>/<interface>.mlx`: the per-interface namespace
+  (`wl.wl_surface`, `wl.xdg_toplevel`, ...) with `VERSION`,
+  `REQUEST_*`/`EVENT_*` opcodes and `*_SINCE` versions, enums with the exact
+  XML values and `u32` backing, `Proxy`/`Resource`, payload structs, and
+  `decodeEvent`/`decodeRequest` returning tagged unions.
+
+Argument types follow `<XMLMapping>`: `int` is `i32`, `uint` is `u32`,
+`fixed` is `wl.Fixed`, strings are `[]const u8` (`?[]const u8` when
+nullable) in sent messages and `wl.String` in decoded ones, objects are the
+typed proxy or resource (`?*const T` when nullable), `array` is
+`wl.ArrayView`, and `fd` is `wl.Handle`. A typed new_id becomes the method's
+return value. Bitfield enums combine through `std.wayland.flags`. The naming
+convention is recorded as a provisional choice in `SPEC_CONFLICTS.md`.
 
 ## The transport layer
 
@@ -260,81 +304,208 @@ the standard `wl_compositor`/`wl_surface`/etc. protocol can talk to a
 non-Mlx compositor, and vice versa — the pipeline's job is only to turn XML
 into typed Mlx declarations, not to invent a new wire format.
 
-## Client code: what actually gets imported
+## Implementation notes: runtime and transport
 
-Both `docs/WAYLAND.md` and `wayland.xml`'s `<UserAPI>` block agree on the
-one import an application needs:
+`std.wayland.client` (`std/src/wayland/client.mlx`) owns the connection:
+`Display.connect` reads `WAYLAND_SOCKET` or `WAYLAND_DISPLAY` (relative to
+`XDG_RUNTIME_DIR`) from the process environment, and `connectTo` or
+`connectToHandle` take an explicit path or socket. Object ids are allocated
+from the client range and recycled after `wl_display.delete_id`. New objects
+take their parent's version, as in libwayland, and a request newer than its
+object's version is refused. Failures inside request methods are sticky: the
+request returns an inert proxy and the next `flush`, `dispatch` or
+`roundtrip` returns the error. The server's `wl_display.error` surfaces as
+`error.ProtocolError`, and the object id, code and message are available
+from the display. `failureReason()` says in words why a display stopped
+running; for an event the client cannot decode (unknown object or opcode,
+malformed arguments) `rejectedObjectId`, `rejectedOpcode` and
+`rejectedInterface` name it. Events go to per-object handler functions and are decoded
+with the generated `decodeEvent`. Objects that the server creates through a
+new_id event argument are registered before their event is dispatched.
+
+`std.wayland.server` (`std/src/wayland/server.mlx`) listens on
+`$XDG_RUNTIME_DIR/<name>` behind the `<name>.lock` convention, accepts or
+adopts clients, and dispatches from an epoll loop. It answers
+`wl_display.sync` and `get_registry` itself, validates `wl_registry.bind`
+against the global's name, interface and version, and advertises and
+withdraws globals on every registry. Typed new_id arguments become resources
+before the request handler runs, and destructor requests destroy their
+resource afterwards (sending `delete_id`). Unknown objects, unknown opcodes,
+malformed arguments, requests newer than the resource version and invalid
+new ids are answered with `wl_display.error` using libwayland's codes, and
+the client is then disconnected (`tests/245_wayland_server_errors_runtime.mlx`).
+
+The Linux transport (`std/src/wayland/transport/linux.mlx`) implements the
+five `transport.xml` rules with direct syscalls. Unix stream sockets carry
+`SCM_RIGHTS` descriptors. Received descriptors are queued in arrival order,
+and a message is only dispatched once its bytes and all of its handles are
+buffered. Queued handles are attached to the first `sendmsg` that carries
+their bytes. Connection buffers come from the caller's allocator. Waiting
+uses `poll` for one connection and `epoll` for any number of connections and
+listeners. `memfd_create` objects are mapped with `MAP_SHARED`
+(`tests/243_wayland_linux_transport_runtime.mlx`,
+`tests/242_wayland_wire_runtime.mlx`). `wl.transport.SharedMemory` and
+`wl.transport.socketPair` expose these to applications.
+
+### Wire compatibility
+
+`<Conformance>` requires wire compatibility with established
+implementations. `tools/check_wayland_interop.sh` checks it against
+libwayland in both directions:
+
+- `examples/wayland-client` opens an `xdg_toplevel` window on a headless
+  weston and presents frames through `wl_shm`;
+- `examples/wayland-server` is enumerated by `wayland-info` and drives
+  `weston-simple-shm`;
+- the Mlx client and compositor exchange frames whose pixel checksums the
+  compositor verifies.
+
+`tests/run_wayland.sh` runs every fixture above with the self-hosted
+compiler (`mlx1` or the fixed-point `mlx4`) and checks that the generated
+modules are current.
+
+### Bootstrap compiler constraints
+
+The runtime is written in the subset of Mlx that the self-hosted compiler
+lowers correctly today, and each workaround is commented at its use site:
+
+- field addresses (`&value.field`) are avoided, so the code uses pointers
+  to separately allocated state and copy-modify-write on tables;
+- error unions carry only scalar or void payloads, so constructors
+  initialize in place, as in `Display.connect(&display, allocator)`;
+- a struct's methods may only name types declared earlier, so generated
+  types are emitted in dependency order;
+- decoded strings use `std.string.String` rather than optional slices;
+- signed words are converted arithmetically rather than with
+  `@bitCast(i32, u32)`, and early exits from `!void` functions return
+  `success()` instead of a bare `return`.
+
+## Client and server code
+
+Both directions import only `std.wayland`. A client:
 
 ```mlx
-const wl = @import("std.wayland")
-```
-
-The two example apps under `examples/` show this in the two directions the
-spec calls out — `<Client>` and `<Server>` in `wayland.xml`. The client:
-
-```mlx
-const wl = @import("std.wayland")
 const std = @import("std")
+const wl = @import("std.wayland")
 
-pub fn main() !void {
-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator)
-    defer arena.deinit()
+fn onRegistry(context: *anyopaque, event: wl.client.Event) -> void {
+    const decoded = wl.wl_registry.decodeEvent(event)
+    if event.opcode == wl.wl_registry.EVENT_GLOBAL {
+        const global = decoded.global
+        // global.name, global.interface (wl.String), global.version
+    }
+}
 
-    var display = try wl.client.Display.connect(arena.allocator())
-    defer display.disconnect()
-
-    const registry = try display.getRegistry()
-    _ = registry
-
+pub fn main() -> !void {
+    var display: wl.client.Display = undefined
+    try wl.client.Display.connect(&display, std.page_allocator.init())
+    const registry = wl.displayProxy(display).getRegistry()
+    var state: u32 = 0
+    unsafe { registry.setHandler(onRegistry, @ptrCast(*anyopaque, &state)) }
+    try display.roundtrip()
     while display.running() {
         try display.dispatch()
     }
+    display.disconnect()
 }
 ```
 
-(`examples/wayland-client/main.mlx`)
-
-And the server/compositor side, using `wl.server` instead of `wl.client`:
+A server:
 
 ```mlx
-const wl = @import("std.wayland")
 const std = @import("std")
+const wl = @import("std.wayland")
 
-pub fn main() !void {
-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator)
-    defer arena.deinit()
+fn bindCompositor(context: *anyopaque, client: wl.server.Client, object: wl.server.Object, version: u32) -> void {
+    // set a request handler on wl.wl_compositor.Resource.fromObject(object)
+}
 
-    var display = try wl.server.Display.init(arena.allocator())
-    defer display.deinit()
-
+pub fn main() -> !void {
+    var display: wl.server.Display = undefined
+    try wl.server.Display.init(&display, std.page_allocator.init())
     try display.addSocket("wayland-0")
-
+    var state: u32 = 0
+    var context: *anyopaque = undefined
+    unsafe { context = @ptrCast(*anyopaque, &state) }
+    const name = display.createGlobal(wl.Interface.wl_compositor, 6, bindCompositor, context)
     while display.running() {
-        try display.dispatch()
+        try display.dispatch(-1)
     }
+    display.deinit()
 }
 ```
 
-(`examples/wayland-server/main.mlx`)
+`examples/wayland-client/main.mlx` and `examples/wayland-server/main.mlx`
+are the complete programs, with shared memory, xdg-shell configuration and
+frame callbacks.
 
-Both examples pass an explicit `arena.allocator()` into `Display`
-connect/init, consistent with `memory-model.xml`'s allocator rule and with
-`transport.xml`'s `Buffering` constraint — connection/display state that
-needs to outlive a single stack frame is allocator-owned, not hidden. Note
-what these examples do *not* do: neither one imports `std.xml`, registers
-protocol XML in a build file, or calls anything schema-shaped. That absence
-is itself the point the rest of this document is about — from an
-application's point of view, `std.wayland` is exactly as ordinary an import
-as any other stdlib module, and the entire protocol-AST/XML pipeline above
-has already run by the time this code is compiled.
+## Larger examples: a nested compositor and a terminal
 
-`wayland.xml`'s `<Client>`/`<Server>` rules describe what's behind
-`wl.client.Display`/`wl.server.Display` at a level neither example currently
-exercises: `std.wayland.client` additionally provides object ID allocation,
-request marshaling, event decode/dispatch, delete-id handling, object
-version gating, and protocol-error handling; `std.wayland.server`
-additionally provides client/global/registry bookkeeping, resource
-management, request decode/dispatch, event send, and the same version-gating
-and protocol-error handling on the server side. Both example apps above are
-minimal — connect-and-dispatch-loop — because they're demonstrating the
-import surface, not exercising the full generated protocol API.
+Two programs use both halves of `std.wayland` with real input:
+
+- [`examples/wayland-compositor`](../../examples/wayland-compositor/README.md)
+  is a compositor that runs freestanding (DRM/KMS output, evdev input, the
+  devices and VT switching from systemd-logind over its own D-Bus client,
+  the keymap from libxkbcommon) or nested. Nested, it is a client of the
+  session compositor (its output is one window there) and a server for its
+  own clients. It routes
+  the session's pointer and keyboard to the window under the pointer or
+  with focus, and hands clients the session's xkb keymap. It moves windows
+  through `xdg_toplevel.move` or Alt+drag, resizes them by their border,
+  Alt+right-drag or `xdg_toplevel.resize` (one configure at a time, the
+  opposite edges kept), places `xdg_popup` windows with
+  `xdg_positioner`, and launches programs such as a terminal on Alt+Enter.
+  Its `wl_data_device_manager` carries the clipboard between clients (GTK 4
+  applications such as Nautilus need it to use the display). With
+  `--fullscreen` it takes the host monitor's resolution, which is how
+  `tools/install_compositor_session.sh` installs it as a GDM/SDDM session
+  (inside cage or weston's kiosk shell). It waits on
+  both connections with `wl.transport.waitAny`.
+- [`examples/wayland-terminal`](../../examples/wayland-terminal/README.md)
+  is a terminal emulator: a shell on a pseudo-terminal, keyboard input with
+  key repeat, and a built-in bitmap font.
+
+`tools/check_wayland_compositor.sh` runs both under
+`tools/wayland-test-host`, a scripted host compositor with a seat. Typed
+commands must reach the shells (they create marker files), Alt+Enter must
+open a second terminal, and Alt+drag must move it to the expected pixel
+position in the host's screenshot. Resizing a terminal by its border and
+with Alt+right-drag must give exact window sizes and positions, and its
+shell must learn each size. weston-terminal, when installed, must
+accept Shift through the forwarded keymap and move by its title bar;
+wl-clipboard, when installed, must paste in one client what another copied;
+gtk4-widget-factory, when installed, must open its window.
+`tools/check_compositor_drm.sh` runs the freestanding compositor against
+an emulated kernel (DRM card, evdev devices) and an emulated logind on a
+private dbus-daemon, with real clients: modeset at the preferred mode,
+typing, mouse, touchpad, hotplug, a VT switch and the console restored on
+exit.
+`tools/check_wayland_interop.sh` also runs the nested compositor inside
+weston.
+
+### GPU buffers: linux-dmabuf and Vulkan
+
+`wl.zwp_linux_dmabuf_v1`, `wl.zwp_linux_buffer_params_v1` and
+`wl.zwp_linux_dmabuf_feedback_v1` are generated like the core interfaces.
+A client collects a buffer's planes (`params.add(fd, plane, offset, stride,
+modifier_hi, modifier_lo)`) and creates the `wl_buffer` with
+`createImmed(width, height, format, flags)`; a server decodes the same
+requests (`AddRequest.fd` is a received `wl.Handle`) and answers `create`
+with `sendCreated()` (which creates the `wl_buffer` resource) or
+`sendFailed()`.
+
+- [`examples/vulkan-wayland-client`](../../examples/vulkan-wayland-client/README.md)
+  renders with Vulkan (`std.vulkan`, no C loader) and hands frames over as
+  dma-bufs, or renders straight into its `wl_shm` pool.
+- The nested compositor offers linux-dmabuf (ARGB8888/XRGB8888, linear) and,
+  with `--renderer vulkan`, composes on the GPU, reading client pools and
+  dma-bufs in place.
+
+`tools/check_vulkan_wayland.sh` runs the client inside the compositor with
+both renderers, over `wl_shm` and linux-dmabuf, and compares the frames
+pixel by pixel (see [the Vulkan reference](vulkan.md#examples)).
+
+Neither program imports `std.xml`, registers protocol XML
+in a build file, or calls anything schema-shaped. From an application's
+point of view `std.wayland` is an ordinary stdlib import, and the whole
+XML-to-Mlx pipeline above ran when the standard library was bootstrapped.

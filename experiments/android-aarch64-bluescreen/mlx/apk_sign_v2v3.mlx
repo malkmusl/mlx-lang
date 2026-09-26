@@ -1,0 +1,413 @@
+// APK Signature Scheme v2 and v3 -- the "APK Signing Block" that real
+// Android (API 24+ for v2, API 28+ for v3) verifies in addition to (not
+// instead of) the classic v1 JAR signature already produced by
+// jar_sign.mlx. Both schemes cover the whole file (not just three text
+// manifests), so an attacker can no longer add/replace unsigned entries
+// the way a pure v1-signed ZIP allows.
+//
+// Byte formats below were cross-checked against source.android.com's v2/v3
+// spec pages AND Google's real `apksig` library source
+// (ApkSigningBlockUtils.java / SignatureAlgorithm.java) before writing any
+// code here. Verified against the real `apksigner verify` tool, not just
+// disassembly, since a wrong byte anywhere is unrecoverable except through
+// external re-verification (unlike the v1 path, which `jarsigner -verify`
+// already exercises).
+//
+// Container: right before the ZIP Central Directory, an "APK Signing
+// Block" is spliced in --
+//   uint64 sizeOfBlock (excl. this field)
+//   repeated {uint64 pairLen; uint32 id; pairLen-4 bytes value}
+//   uint64 sizeOfBlock (repeated, so a verifier can find the start by
+//                        scanning backward from the EOCD)
+//   16 bytes magic "APK Sig Block 42"
+// This experiment writes exactly two pairs: v2 (id 0x7109871a) and v3 (id
+// 0xf05368c0), no page-alignment padding block (that's an optional
+// zipalign convenience, not required for a valid signature).
+//
+// Every field inside a pair's value is 4-byte-length-prefixed (`lp`),
+// nested: value = lp(signersSeq), signersSeq = lp(signer) (repeated --
+// TWO nested length prefixes even for our one signer, confirmed against
+// apksig's real `V3SchemeSigner.generateV3Signature`, which wraps
+// `encodeAsSequenceOfLengthPrefixedElements(signerBlocks)` a second time);
+// signer = lp(signedData) + lp(signatures) + lp(publicKey); signedData =
+// lp(digests) + lp(certificates) [+ v3: minSdk(4) + maxSdk(4)] +
+// lp(additionalAttributes); v3's signer also repeats minSdk/maxSdk OUTSIDE
+// signedData, between signedData and signatures (that duplication is
+// deliberate, per spec -- it lets a verifier reject a signer for its own
+// too-old/too-new platform without having to touch the signed portion at
+// all). `digests` and `signatures` are sequences of algId+payload pairs,
+// but each pair gets its OWN extra outer length prefix too (real apksig's
+// `encodeAsSequenceOfLengthPrefixedPairsOfIntAndLengthPrefixedBytes`:
+// lp(algId(4) ++ lp(payload)), not just algId ++ lp(payload)) -- easy to
+// miss since a byte-offset walk of the wrong layout can still look
+// internally consistent; only `apksigner verify` catches it for real.
+//
+// The content digest covers three sections: (1) everything in the ZIP
+// before where the Central Directory used to start, (2) the Central
+// Directory bytes (unchanged -- entry offsets inside it are still correct,
+// since section (1) doesn't move), (3) the End Of Central Directory
+// record, with its "offset of start of central directory" field treated
+// as pointing to the START of the (about to be inserted) Signing Block --
+// i.e. left as-is, matching apksig's own verifier, which rewrites the
+// EOCD it digests to that same value rather than the file's real, final
+// offset. Chunked SHA-256: each SECTION independently split into <=1MB
+// pieces (a fresh chunk boundary always starts at a section's first byte,
+// never spanning two sections), each chunk digested as 0xa5+LE32(len)+chunk,
+// then a final digest over
+// 0x5a+LE32(totalChunkCountAcrossAllSections)+concat(all chunk digests,
+// section order). Getting the "per-section, not one flat concatenation"
+// chunking detail wrong, and separately digesting the file's real
+// (adjusted) EOCD instead of the pre-insertion one, were this module's
+// second and third real bugs -- see chunkDigestsForSection's and
+// signV2V3's comments.
+
+const std = @import("std")
+const bn = @import("./bignum.mlx")
+const asn1 = @import("./asn1.mlx")
+const hash = @import("./hash.mlx")
+const jar_sign = @import("./jar_sign.mlx")
+
+pub const Allocator = std.allocator.Allocator
+pub const ArrayList = std.array_list.ArrayList
+
+pub const SIGNING_BLOCK_ID_V2: u32 = 0x7109871a
+pub const SIGNING_BLOCK_ID_V3: u32 = 0xf05368c0
+
+const SIG_ALGORITHM_ID: u32 = 0x0103 // RSASSA-PKCS1-v1_5 with SHA2-256
+const MAX_SDK: u32 = 0x7fffffff
+const CHUNK_SIZE: usize = 1048576 // 1 MiB
+
+fn oidRsaEncryption() -> []const u8 { return "1.2.840.113549.1.1.1" }
+
+// ── little-endian byte-buffer helpers (mirrors zip.mlx's own local ones --
+// not reused from there since they're not `pub`) ───────────────────────────
+
+fn appendU8(list: *ArrayList, v: u32) -> void {
+    var ok: bool = std.array_list.ArrayList.appendAt(list, @intCast(u8, v & 255))
+}
+fn appendU32LE(list: *ArrayList, v: u32) -> void {
+    appendU8(list, v)
+    appendU8(list, v >> 8)
+    appendU8(list, v >> 16)
+    appendU8(list, v >> 24)
+}
+fn appendU64LE(list: *ArrayList, v: u64) -> void {
+    var i: usize = 0
+    while i < 8 {
+        var ok: bool = std.array_list.ArrayList.appendAt(list, @intCast(u8, (v >> @intCast(u64, i * 8)) & 255))
+        i += 1
+    }
+}
+fn appendSlice(list: *ArrayList, src: []const u8) -> void {
+    var i: usize = 0
+    while i < src.length {
+        var ok: bool = std.array_list.ArrayList.appendAt(list, src[i])
+        i += 1
+    }
+}
+// 4-byte length prefix + payload -- the format every v2/v3 sub-field uses.
+fn appendLp(list: *ArrayList, content: []const u8) -> void {
+    appendU32LE(list, @intCast(u32, content.length))
+    appendSlice(list, content)
+}
+
+fn readU32LE(data: []const u8, offset: usize) -> u32 {
+    const b0: u32 = @intCast(u32, data[offset])
+    const b1: u32 = @intCast(u32, data[offset + 1])
+    const b2: u32 = @intCast(u32, data[offset + 2])
+    const b3: u32 = @intCast(u32, data[offset + 3])
+    return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
+}
+
+// ── chunked content digest (APK Signing Block's own digest algorithm,
+// distinct from a plain sha256(data)) ──────────────────────────────────────
+
+// Appends one SHA256(0xa5 ++ LE32(chunkLen) ++ chunk) digest per <=1MB chunk
+// of `data` to `outDigests`, returns how many chunks it produced (0 for an
+// empty section). Each of the three sections chunks *independently* -- a
+// fresh chunk boundary always starts at a section's first byte, never
+// spanning two sections -- confirmed against apksig's real
+// `computeOneMbChunkContentDigests` (it loops `DataSource[] contents`,
+// restarting `chunkContentPrefix`-based hashing at the start of every
+// element), not by chunking one flat concatenation of all three sections
+// (which was this function's first, wrong version -- it produced
+// self-consistent-looking but real-device-rejected digests).
+fn chunkDigestsForSection(allocator: Allocator, data: []const u8, outDigests: *ArrayList) -> usize {
+    var count: usize = 0
+    var offset: usize = 0
+    while offset < data.length {
+        var chunkLen: usize = CHUNK_SIZE
+        if data.length - offset < CHUNK_SIZE { chunkLen = data.length - offset }
+
+        var buf: ArrayList = std.array_list.ArrayList.init(allocator, chunkLen + 5)
+        appendU8(&buf, 165) // 0xa5 -- per-chunk prefix
+        appendU32LE(&buf, @intCast(u32, chunkLen))
+        appendSlice(&buf, data[offset..offset + chunkLen])
+        const d: hash.Sha256Digest = hash.sha256(buf.items[0..buf.length])
+        appendSlice(outDigests, d.bytes[0..32])
+
+        offset += chunkLen
+        count += 1
+    }
+    return count
+}
+
+// The three sections are fixed-arity parameters (not a slice-of-slices --
+// see this file's other helpers and axml.mlx's StringPool comment for why
+// arrays of slices are avoided throughout this port).
+pub fn chunkedSha256DigestOverSections(allocator: Allocator, section1: []const u8, section2: []const u8, section3: []const u8) -> hash.Sha256Digest {
+    var chunkDigests: ArrayList = std.array_list.ArrayList.init(allocator, 128)
+    var totalChunks: usize = 0
+    totalChunks += chunkDigestsForSection(allocator, section1, &chunkDigests)
+    totalChunks += chunkDigestsForSection(allocator, section2, &chunkDigests)
+    totalChunks += chunkDigestsForSection(allocator, section3, &chunkDigests)
+
+    var top: ArrayList = std.array_list.ArrayList.init(allocator, chunkDigests.length + 5)
+    appendU8(&top, 90) // 0x5a -- top-level combine prefix
+    appendU32LE(&top, @intCast(u32, totalChunks))
+    appendSlice(&top, chunkDigests.items[0..chunkDigests.length])
+
+    return hash.sha256(top.items[0..top.length])
+}
+
+// ── SubjectPublicKeyInfo (DER) -- duplicated from jar_sign.buildSelfSignedCert's
+// inline construction rather than imported, since its helpers aren't `pub`
+// (see that file's header comment for the same tradeoff elsewhere) ────────
+
+pub fn buildSubjectPublicKeyInfo(allocator: Allocator, n: *bn.BigUint) -> ArrayList {
+    const nMag = bn.toBytesBEMinimal(n, allocator)
+    const nInt = asn1.integerFromUnsignedBE(allocator, nMag.items[0..nMag.length])
+    const eInt = asn1.integerFromU64(allocator, 65537)
+    const rsaPub = asn1.sequence2(allocator, nInt.items[0..nInt.length], eInt.items[0..eInt.length])
+    const oidBytes = asn1.oid(allocator, oidRsaEncryption())
+    const nul = asn1.asnNull(allocator)
+    const rsaAlg = asn1.sequence2(allocator, oidBytes.items[0..oidBytes.length], nul.items[0..nul.length])
+    const pubKeyBits = asn1.bitStringFromBytes(allocator, rsaPub.items[0..rsaPub.length])
+    return asn1.sequence2(allocator, rsaAlg.items[0..rsaAlg.length], pubKeyBits.items[0..pubKeyBits.length])
+}
+
+// ── signedData sub-fields (shared shape between v2 and v3) ────────────────
+
+// A "digests"/"signatures" entry is NOT simply algId+lp(payload) -- real
+// apksig's `encodeAsSequenceOfLengthPrefixedPairsOfIntAndLengthPrefixedBytes`
+// wraps each pair in its OWN outer length prefix too (length = 8 +
+// payload.length, covering the algId word and the inner length word), so
+// an entry is a *triply* nested structure: lp( algId(4) ++ lp(payload) ).
+// Missing this outer wrap was this module's first real bug -- it produced
+// byte-for-byte self-consistent (but wrong) output that only real
+// `apksigner verify` caught (as "Malformed ... signature record #1"),
+// since every offset still lined up under an *incomplete* mental model.
+fn buildAlgIdPayloadEntry(allocator: Allocator, algId: u32, payload: []const u8) -> ArrayList {
+    var inner: ArrayList = std.array_list.ArrayList.init(allocator, 8 + payload.length)
+    appendU32LE(&inner, algId)
+    appendLp(&inner, payload)
+    var entry: ArrayList = std.array_list.ArrayList.init(allocator, inner.length + 4)
+    appendLp(&entry, inner.items[0..inner.length])
+    return entry
+}
+
+fn buildDigestsField(allocator: Allocator, digest: []const u8) -> ArrayList {
+    const entry = buildAlgIdPayloadEntry(allocator, SIG_ALGORITHM_ID, digest)
+    var field: ArrayList = std.array_list.ArrayList.init(allocator, entry.length + 4)
+    appendLp(&field, entry.items[0..entry.length])
+    return field
+}
+
+fn buildCertsField(allocator: Allocator, certDer: []const u8) -> ArrayList {
+    var seq: ArrayList = std.array_list.ArrayList.init(allocator, certDer.length + 4)
+    appendLp(&seq, certDer)
+    var field: ArrayList = std.array_list.ArrayList.init(allocator, seq.length + 4)
+    appendLp(&field, seq.items[0..seq.length])
+    return field
+}
+
+fn buildEmptyAttrsField(allocator: Allocator) -> ArrayList {
+    var field: ArrayList = std.array_list.ArrayList.init(allocator, 4)
+    appendU32LE(&field, 0) // zero-length sequence of additional attributes
+    return field
+}
+
+fn buildSignaturesField(allocator: Allocator, sig: []const u8) -> ArrayList {
+    const entry = buildAlgIdPayloadEntry(allocator, SIG_ALGORITHM_ID, sig)
+    var field: ArrayList = std.array_list.ArrayList.init(allocator, entry.length + 4)
+    appendLp(&field, entry.items[0..entry.length])
+    return field
+}
+
+// One full `signer` record (signedData + signatures + publicKey), v2 shape
+// when includeSdk is false, v3 shape (minSdk/maxSdk inside AND outside
+// signedData) when true. `digest` is the already-computed chunked content
+// digest.
+fn buildSignerBytes(allocator: Allocator, n: *bn.BigUint, d: *bn.BigUint, nBytes: usize, certDer: []const u8, spkiBytes: []const u8, digest: []const u8, minSdk: u32, includeSdk: bool) -> ArrayList {
+    const digestsField = buildDigestsField(allocator, digest)
+    const certsField = buildCertsField(allocator, certDer)
+    const attrsField = buildEmptyAttrsField(allocator)
+
+    var signedData: ArrayList = std.array_list.ArrayList.init(allocator, digestsField.length + certsField.length + attrsField.length + 8)
+    appendSlice(&signedData, digestsField.items[0..digestsField.length])
+    appendSlice(&signedData, certsField.items[0..certsField.length])
+    if includeSdk {
+        appendU32LE(&signedData, minSdk)
+        appendU32LE(&signedData, MAX_SDK)
+    }
+    appendSlice(&signedData, attrsField.items[0..attrsField.length])
+
+    const signedDataDigest: hash.Sha256Digest = hash.sha256(signedData.items[0..signedData.length])
+    const sig = jar_sign.signSha256Pkcs1v15(allocator, n, d, nBytes, signedDataDigest.bytes[0..32])
+    const sigsField = buildSignaturesField(allocator, sig.items[0..sig.length])
+
+    var pubKeyField: ArrayList = std.array_list.ArrayList.init(allocator, spkiBytes.length + 4)
+    appendLp(&pubKeyField, spkiBytes)
+
+    var signer: ArrayList = std.array_list.ArrayList.init(allocator, signedData.length + sigsField.length + pubKeyField.length + 16)
+    appendLp(&signer, signedData.items[0..signedData.length])
+    if includeSdk {
+        appendU32LE(&signer, minSdk)
+        appendU32LE(&signer, MAX_SDK)
+    }
+    appendSlice(&signer, sigsField.items[0..sigsField.length])
+    appendSlice(&signer, pubKeyField.items[0..pubKeyField.length])
+    return signer
+}
+
+fn buildPairEntry(allocator: Allocator, id: u32, value: []const u8) -> ArrayList {
+    var out: ArrayList = std.array_list.ArrayList.init(allocator, value.length + 12)
+    appendU64LE(&out, @intCast(u64, 4 + value.length))
+    appendU32LE(&out, id)
+    appendSlice(&out, value)
+    return out
+}
+
+// Which signing schemes are worth including for a given targetSdkVersion,
+// mirroring when each one actually became meaningful on the real Android
+// platform: v1 (JAR signing) is understood by every API level, so it's
+// never dropped -- there is no compatibility upside to omitting it, only
+// a (rarely wanted) hardening tradeoff, which this project doesn't opt
+// into automatically. v2 verification began at API 24 (N); v3 at API 28
+// (P) -- a device below either level simply ignores a Signing Block ID it
+// doesn't recognize, so including v2/v3 for a low targetSdkVersion is
+// harmless, but there's equally no reason to pay their bytes/signing cost
+// when targeting only platforms that predate them. Monotonic in
+// targetSdk (a higher target only ever adds schemes, never removes one),
+// so raising this app's own target (see main.mlx) can only gain v2/v3
+// coverage, never lose v1.
+pub fn schemesForTargetSdk(targetSdk: u32) -> (bool, bool, bool) {
+    if targetSdk < 24 {
+        return -> (true, false, false)
+    }
+    if targetSdk < 28 {
+        return -> (true, true, false)
+    }
+    return -> (true, true, true)
+}
+
+// Both ID-value pairs (v2 + v3, whichever are enabled), back to back --
+// everything the Signing Block needs except its own 8-byte size fields
+// and magic. Returns an empty list when neither scheme is enabled --
+// callers must check that before wrapping/inserting a block.
+fn buildPairsBytes(allocator: Allocator, n: *bn.BigUint, d: *bn.BigUint, nBytes: usize, certDer: []const u8, spkiBytes: []const u8, digest: []const u8, minSdk: u32, includeV2: bool, includeV3: bool) -> ArrayList {
+    var out: ArrayList = std.array_list.ArrayList.init(allocator, 512)
+
+    if includeV2 {
+        // Two nested length prefixes here, not one: the pair's value is
+        // LP(signersSeq), and signersSeq is itself the concatenation of
+        // LP(signer) for each signer (just one, here) -- a verifier reads
+        // the outer LP to find the whole sequence, then reads a
+        // per-signer LP from inside it to find where each signer ends.
+        const signerV2 = buildSignerBytes(allocator, n, d, nBytes, certDer, spkiBytes, digest, minSdk, false)
+        var signersSeqV2: ArrayList = std.array_list.ArrayList.init(allocator, signerV2.length + 4)
+        appendLp(&signersSeqV2, signerV2.items[0..signerV2.length])
+        var signersValueV2: ArrayList = std.array_list.ArrayList.init(allocator, signersSeqV2.length + 4)
+        appendLp(&signersValueV2, signersSeqV2.items[0..signersSeqV2.length])
+        const pairV2 = buildPairEntry(allocator, SIGNING_BLOCK_ID_V2, signersValueV2.items[0..signersValueV2.length])
+        appendSlice(&out, pairV2.items[0..pairV2.length])
+    }
+
+    if includeV3 {
+        const signerV3 = buildSignerBytes(allocator, n, d, nBytes, certDer, spkiBytes, digest, minSdk, true)
+        var signersSeqV3: ArrayList = std.array_list.ArrayList.init(allocator, signerV3.length + 4)
+        appendLp(&signersSeqV3, signerV3.items[0..signerV3.length])
+        var signersValueV3: ArrayList = std.array_list.ArrayList.init(allocator, signersSeqV3.length + 4)
+        appendLp(&signersValueV3, signersSeqV3.items[0..signersSeqV3.length])
+        const pairV3 = buildPairEntry(allocator, SIGNING_BLOCK_ID_V3, signersValueV3.items[0..signersValueV3.length])
+        appendSlice(&out, pairV3.items[0..pairV3.length])
+    }
+
+    return out
+}
+
+fn wrapSigningBlock(allocator: Allocator, pairsBytes: []const u8) -> ArrayList {
+    const sizeVal: u64 = @intCast(u64, pairsBytes.length + 24) // + second size field (8) + magic (16)
+    var out: ArrayList = std.array_list.ArrayList.init(allocator, pairsBytes.length + 32)
+    appendU64LE(&out, sizeVal)
+    appendSlice(&out, pairsBytes)
+    appendU64LE(&out, sizeVal)
+    appendSlice(&out, "APK Sig Block 42")
+    return out
+}
+
+// Splice APK Signature Scheme v2/v3 signing into `zipBytes` (the already
+// v1(JAR)-signed, fully-built ZIP from zip.build() -- v1 and v2/v3 coexist,
+// same as real apksigner's default behavior), whichever of v2/v3 are
+// enabled (see `schemesForTargetSdk`). Returns `zipBytes` unchanged (no
+// Signing Block inserted at all) when both are disabled. Returns the
+// final APK bytes.
+pub fn signV2V3(allocator: Allocator, n: *bn.BigUint, d: *bn.BigUint, nBytes: usize, certDer: []const u8, zipBytes: []const u8, minSdk: u32, includeV2: bool, includeV3: bool) -> ArrayList {
+    if !includeV2 && !includeV3 {
+        var out: ArrayList = std.array_list.ArrayList.init(allocator, zipBytes.length)
+        appendSlice(&out, zipBytes)
+        return out
+    }
+
+    const eocdOffset: usize = zipBytes.length - 22
+    const origCdStart: u32 = readU32LE(zipBytes, eocdOffset + 16)
+
+    const section1: []const u8 = zipBytes[0..origCdStart]
+    const section2: []const u8 = zipBytes[origCdStart..eocdOffset]
+    const origEocd: []const u8 = zipBytes[eocdOffset..zipBytes.length]
+
+    const spki = buildSubjectPublicKeyInfo(allocator, n)
+
+    // The content digest is computed treating EOCD's "start of central
+    // directory" field as pointing to the START of the (about to be
+    // inserted) APK Signing Block -- i.e. unchanged from `origEocd`, since
+    // that's exactly where the block goes. This is a real, deliberate
+    // apksig quirk (its own comment: "For the purposes of verifying
+    // integrity, ... EoCD must be treated as though its Central Directory
+    // offset points to the start of APK Signing Block"), confirmed against
+    // its actual verifier source (`ApkSigningBlockUtils.verifyIntegrity`
+    // rewrites the EOCD it digests to `beforeApkSigningBlock.size()`,
+    // which is exactly `origCdStart` here) -- NOT the adjusted offset that
+    // makes the final on-disk file a valid, readable ZIP. Conflating the
+    // two (digesting the file's real, adjusted EOCD) was this module's
+    // third real bug, caught only by a genuine digest mismatch from
+    // `apksigner verify` since every prior structural check had already
+    // passed. A pleasant consequence: since the digest input never
+    // mentions the Signing Block's own size, there's no real circularity
+    // left to resolve with a placeholder-then-rebuild pass (unlike this
+    // function's very first draft) -- the real digest, real signatures,
+    // and real block size can all be computed in one straight pass.
+    const contentDigest: hash.Sha256Digest = chunkedSha256DigestOverSections(allocator, section1, section2, origEocd)
+
+    const realPairs = buildPairsBytes(allocator, n, d, nBytes, certDer, spki.items[0..spki.length], contentDigest.bytes[0..32], minSdk, includeV2, includeV3)
+    const signingBlock = wrapSigningBlock(allocator, realPairs.items[0..realPairs.length])
+    const blockSize: usize = signingBlock.length
+
+    // The EOCD actually written to disk DOES need its cdStart adjusted --
+    // unlike the digest input above, a real ZIP/Android reader must be
+    // able to physically locate the Central Directory in the final file.
+    var finalEocd: ArrayList = std.array_list.ArrayList.init(allocator, 22)
+    appendSlice(&finalEocd, origEocd)
+    const newCdStart: u32 = origCdStart + @intCast(u32, blockSize)
+    std.array_list.ArrayList.set(finalEocd, 16, @intCast(u8, newCdStart & 255))
+    std.array_list.ArrayList.set(finalEocd, 17, @intCast(u8, (newCdStart >> 8) & 255))
+    std.array_list.ArrayList.set(finalEocd, 18, @intCast(u8, (newCdStart >> 16) & 255))
+    std.array_list.ArrayList.set(finalEocd, 19, @intCast(u8, (newCdStart >> 24) & 255))
+
+    var finalApk: ArrayList = std.array_list.ArrayList.init(allocator, zipBytes.length + signingBlock.length)
+    appendSlice(&finalApk, section1)
+    appendSlice(&finalApk, signingBlock.items[0..signingBlock.length])
+    appendSlice(&finalApk, section2)
+    appendSlice(&finalApk, finalEocd.items[0..finalEocd.length])
+    return finalApk
+}

@@ -1,0 +1,572 @@
+// The freestanding backend: the compositor drives the monitor and reads
+// the input devices itself, as the desktop session a display manager (GDM,
+// SDDM) starts, or from a text console. (host.mlx is the other backend: a
+// window in a host compositor.)
+//
+// - Session: systemd-logind (logind.mlx) gives the DRM card and the input
+//   devices to the session's user and switches VTs. Without logind (no
+//   system bus, or no session) the devices are opened directly, which
+//   needs the rights to them (root, or the seat's ACLs) and has no VT
+//   switching.
+// - Output: the first card (/dev/dri/cardN) with a connected monitor, at
+//   the monitor's preferred mode (kms.mlx). Frames are composed on the CPU
+//   into memory of our own (blending reads what is under a window, which is
+//   slow in a dumb buffer), copied into the back buffer and page-flipped.
+//   Frame callbacks follow the flips, so clients draw at the monitor's rate.
+// - Input: every keyboard, mouse and touchpad under /dev/input (evdev.mlx),
+//   including those plugged in later (inotify); the keymap comes from
+//   libxkbcommon (xkb.mlx).
+// - Ctrl+Alt+F1..F12 switch VTs; the devices pause while another VT is in
+//   front and the CRTC is set up again on return. Alt+Shift+Q (or
+//   Ctrl+Alt+Backspace) quits, and the monitor gets back what it showed.
+//
+// MLX_DRM_DIR and MLX_INPUT_DIR (default /dev/dri and /dev/input) point
+// the backend elsewhere; the test harness uses them.
+
+const std = @import("std")
+const wl = @import("std.wayland")
+const state = @import("./state.mlx")
+const shell = @import("./shell.mlx")
+const scene = @import("./scene.mlx")
+const device = @import("./device.mlx")
+const kms = @import("./kms.mlx")
+const evdev = @import("./evdev.mlx")
+const logind = @import("./logind.mlx")
+const xkb = @import("./xkb.mlx")
+
+const Compositor = state.Compositor
+
+pub const MAX_INPUTS: usize = 32
+const IN_NONBLOCK: usize = 2048
+const IN_CLOEXEC: usize = 524288
+const IN_ATTRIB: usize = 4
+const IN_CREATE: usize = 256
+
+pub const Backend = struct {
+    compositor: *Compositor
+    session: logind.Session
+    hasSession: bool
+    output: kms.Output
+    cardMajor: u32
+    cardMinor: u32
+    // Input devices (evdev.Input record addresses; 0: free slot) and
+    // whether each is paused (its descriptor revoked while another VT is in
+    // front).
+    inputs: [32]usize
+    paused: [32]bool
+    inotify: isize
+    keyboard: xkb.Keyboard
+    // The session is in front (the card is ours).
+    active: bool
+    // Directories as NUL-terminated paths.
+    cardDirectory: [128]u8
+    inputDirectory: [128]u8
+    // The CPU frame, width * height * 4 bytes.
+    frame: [*]u8
+}
+
+fn at(backend: *Backend, field: usize) -> usize { return @intFromPtr(backend) + field }
+
+fn sessionOf(backend: *Backend) -> *logind.Session {
+    unsafe { return @ptrFromInt(*logind.Session, at(backend, @offsetOf(Backend, "session"))) }
+}
+
+fn outputOf(backend: *Backend) -> *kms.Output {
+    unsafe { return @ptrFromInt(*kms.Output, at(backend, @offsetOf(Backend, "output"))) }
+}
+
+fn keyboardOf(backend: *Backend) -> *xkb.Keyboard {
+    unsafe { return @ptrFromInt(*xkb.Keyboard, at(backend, @offsetOf(Backend, "keyboard"))) }
+}
+
+fn cardDirectoryOf(backend: *Backend) -> [*]u8 {
+    unsafe { return @ptrFromInt([*]u8, at(backend, @offsetOf(Backend, "cardDirectory"))) }
+}
+
+fn inputDirectoryOf(backend: *Backend) -> [*]u8 {
+    unsafe { return @ptrFromInt([*]u8, at(backend, @offsetOf(Backend, "inputDirectory"))) }
+}
+
+fn inputAt(backend: *Backend, slot: usize) -> *evdev.Input {
+    unsafe { return @ptrFromInt(*evdev.Input, backend.*.inputs[slot]) }
+}
+
+fn allocator(backend: *Backend) -> std.allocator.Allocator { return backend.*.compositor.*.allocator }
+
+// ---------------------------------------------------------------------------
+// Paths
+
+fn setDirectory(target: [*]u8, value: [*]const u8, fallback: []const u8) -> void {
+    var length: usize = 0
+    if @intFromPtr(value) != 0 {
+        while value[length] != 0 && length < 100 {
+            target[length] = value[length]
+            length += 1
+        }
+    } else {
+        for byte in fallback {
+            target[length] = byte
+            length += 1
+        }
+    }
+    target[length] = 0
+}
+
+// directory + "/" + prefix + number, NUL-terminated.
+fn nodePath(path: [*]u8, directory: [*]const u8, prefix: []const u8, number: u32) -> void {
+    var length: usize = 0
+    while directory[length] != 0 {
+        path[length] = directory[length]
+        length += 1
+    }
+    path[length] = 47
+    length += 1
+    for byte in prefix {
+        path[length] = byte
+        length += 1
+    }
+    var digits: [12]u8 = undefined
+    var count: usize = 0
+    var rest = number
+    while rest > 0 || count == 0 {
+        digits[count] = @intCast(u8, 48 + rest % 10)
+        rest = rest / 10
+        count += 1
+    }
+    while count > 0 {
+        count -= 1
+        path[length] = digits[count]
+        length += 1
+    }
+    path[length] = 0
+}
+
+fn sayPath(path: [*]const u8) -> void {
+    var length: usize = 0
+    while path[length] != 0 { length += 1 }
+    unsafe { const shown = std.io.writeAllBytes(std.io.stdout(), path, length) }
+}
+
+// Opens a device node: through logind when we have a session, else
+// directly. -1 when refused.
+fn openNode(backend: *Backend, path: [*]const u8, node: *const device.Stat) -> isize {
+    if backend.*.hasSession {
+        var inactive = false
+        return logind.takeDevice(sessionOf(backend), node.*.major, node.*.minor, &inactive)
+    }
+    return device.openPath(path, device.O_RDWR | device.O_NOCTTY | device.O_NONBLOCK)
+}
+
+fn releaseNode(backend: *Backend, major: u32, minor: u32) -> void {
+    if backend.*.hasSession { logind.releaseDevice(sessionOf(backend), major, minor) }
+}
+
+// ---------------------------------------------------------------------------
+// Input devices
+
+fn slotOf(backend: *Backend, major: u32, minor: u32) -> usize {
+    var slot: usize = 0
+    while slot < MAX_INPUTS {
+        if backend.*.inputs[slot] != 0 {
+            const input = inputAt(backend, slot)
+            if input.*.major == major && input.*.minor == minor { return slot }
+        }
+        slot += 1
+    }
+    return MAX_INPUTS
+}
+
+// Opens /dev/input/eventN unless it is open already or of no use to us.
+fn addInput(backend: *Backend, number: u32) -> void {
+    var path: [160]u8 = undefined
+    var path_bytes: [*]u8 = undefined
+    unsafe { path_bytes = @ptrCast([*]u8, &path) }
+    nodePath(path_bytes, inputDirectoryOf(backend), "event", number)
+    var node: device.Stat = undefined
+    if !device.statPath(path_bytes, &node) || !device.isCharacterDevice(&node) { return }
+    if slotOf(backend, node.major, node.minor) < MAX_INPUTS { return }
+    var slot: usize = 0
+    while slot < MAX_INPUTS && backend.*.inputs[slot] != 0 { slot += 1 }
+    if slot == MAX_INPUTS { return }
+    const descriptor = openNode(backend, path_bytes, &node)
+    if descriptor < 0 { return }
+    const memory = state.allocate(backend.*.compositor, @sizeOf(evdev.Input))
+    var input: *evdev.Input = undefined
+    unsafe { input = @ptrCast(*evdev.Input, memory) }
+    if !evdev.open(input, descriptor, node.major, node.minor, allocator(backend)) {
+        evdev.close(input, allocator(backend))
+        releaseNode(backend, node.major, node.minor)
+        state.release(backend.*.compositor, memory, @sizeOf(evdev.Input))
+        return
+    }
+    backend.*.inputs[slot] = @intFromPtr(memory)
+    backend.*.paused[slot] = false
+    if backend.*.compositor.*.verbose {
+        state.say("input: ")
+        sayPath(path_bytes)
+        state.say(" ")
+        evdev.describe(input)
+        state.say("\n")
+    }
+}
+
+fn removeInput(backend: *Backend, slot: usize) -> void {
+    const input = inputAt(backend, slot)
+    const major = input.*.major
+    const minor = input.*.minor
+    evdev.close(input, allocator(backend))
+    releaseNode(backend, major, minor)
+    unsafe { state.release(backend.*.compositor, @ptrFromInt([*]u8, backend.*.inputs[slot]), @sizeOf(evdev.Input)) }
+    backend.*.inputs[slot] = 0
+    if backend.*.compositor.*.verbose { state.say("input: device removed\n") }
+}
+
+// The number N of a directory entry named "eventN" (none: false).
+fn eventNumber(name: [*]const u8, number: *u32) -> bool {
+    var index: usize = 0
+    for byte in "event" {
+        if name[index] != byte { return false }
+        index += 1
+    }
+    if name[index] < 48 || name[index] > 57 { return false }
+    var value: u32 = 0
+    while name[index] >= 48 && name[index] <= 57 {
+        value = value * 10 + @intCast(u32, name[index] - 48)
+        index += 1
+    }
+    if name[index] != 0 { return false }
+    number.* = value
+    return true
+}
+
+fn scanInputs(backend: *Backend) -> void {
+    const directory = device.openPath(inputDirectoryOf(backend), device.O_RDONLY | device.O_DIRECTORY)
+    if directory < 0 {
+        state.say("input: cannot read ")
+        sayPath(inputDirectoryOf(backend))
+        state.say("\n")
+        return
+    }
+    var buffer: [4096]u8 = undefined
+    var bytes: [*]u8 = undefined
+    unsafe { bytes = @ptrCast([*]u8, &buffer) }
+    while true {
+        const count = std.linux.syscall3(device.SYS_getdents64, @bitCast(usize, directory), @intFromPtr(bytes), 4096)
+        if count <= 0 { break }
+        var offset: usize = 0
+        while offset < @bitCast(usize, count) {
+            // struct linux_dirent64: ino, off, u16 reclen, u8 type, name.
+            const length = @intCast(usize, device.load16(bytes, offset + 16))
+            var number: u32 = 0
+            var name: [*]const u8 = undefined
+            unsafe { name = @ptrFromInt([*]const u8, @intFromPtr(bytes) + offset + 19) }
+            if eventNumber(name, &number) { addInput(backend, number) }
+            if length == 0 { break }
+            offset += length
+        }
+    }
+    device.close(directory)
+}
+
+// Devices that appeared (or became readable) since.
+fn readInotify(backend: *Backend) -> void {
+    if backend.*.inotify < 0 { return }
+    var buffer: [4096]u8 = undefined
+    var bytes: [*]u8 = undefined
+    unsafe { bytes = @ptrCast([*]u8, &buffer) }
+    while true {
+        const count = std.linux.syscall3(device.SYS_read, @bitCast(usize, backend.*.inotify), @intFromPtr(bytes), 4096)
+        if count <= 0 { return }
+        var offset: usize = 0
+        while offset + 16 <= @bitCast(usize, count) {
+            // struct inotify_event: wd, mask, cookie, len, name.
+            const length = @intCast(usize, device.load32(bytes, offset + 12))
+            var number: u32 = 0
+            var name: [*]const u8 = undefined
+            unsafe { name = @ptrFromInt([*]const u8, @intFromPtr(bytes) + offset + 16) }
+            if length > 0 && eventNumber(name, &number) { addInput(backend, number) }
+            offset += 16 + length
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Starting and stopping
+
+fn openCard(backend: *Backend) -> bool {
+    var number: u32 = 0
+    while number < 8 {
+        var path: [160]u8 = undefined
+        var path_bytes: [*]u8 = undefined
+        unsafe { path_bytes = @ptrCast([*]u8, &path) }
+        nodePath(path_bytes, cardDirectoryOf(backend), "card", number)
+        var node: device.Stat = undefined
+        if device.statPath(path_bytes, &node) && device.isCharacterDevice(&node) {
+            const descriptor = openNode(backend, path_bytes, &node)
+            if descriptor >= 0 {
+                if kms.open(outputOf(backend), descriptor, allocator(backend)) {
+                    backend.*.cardMajor = node.major
+                    backend.*.cardMinor = node.minor
+                    if backend.*.compositor.*.verbose {
+                        state.say("drm: ")
+                        sayPath(path_bytes)
+                        state.say(" ")
+                        state.sayNumber(outputOf(backend).*.width)
+                        state.say("x")
+                        state.sayNumber(outputOf(backend).*.height)
+                        state.say(" at ")
+                        state.sayNumber(@intCast(usize, outputOf(backend).*.refresh))
+                        state.say(" Hz\n")
+                    }
+                    return true
+                }
+                device.close(descriptor)
+                releaseNode(backend, node.major, node.minor)
+            }
+        }
+        number += 1
+    }
+    return false
+}
+
+// Takes the session, the monitor and the input devices. Returns the
+// backend's record, or 0 (after saying why) when there is no monitor to
+// show on.
+pub fn start(compositor: *Compositor) -> usize {
+    const memory = state.allocate(compositor, @sizeOf(Backend))
+    var backend: *Backend = undefined
+    unsafe { backend = @ptrCast(*Backend, memory) }
+    backend.*.compositor = compositor
+    backend.*.inotify = -1
+    backend.*.active = true
+    var slot: usize = 0
+    while slot < MAX_INPUTS {
+        backend.*.inputs[slot] = 0
+        backend.*.paused[slot] = false
+        slot += 1
+    }
+    setDirectory(cardDirectoryOf(backend), state.environmentValue(compositor.*.environment, "MLX_DRM_DIR"), "/dev/dri")
+    setDirectory(inputDirectoryOf(backend), state.environmentValue(compositor.*.environment, "MLX_INPUT_DIR"), "/dev/input")
+
+    backend.*.hasSession = logind.open(sessionOf(backend), compositor.*.allocator, compositor.*.environment)
+    if !backend.*.hasSession { state.say("drm: no logind session; opening the devices directly (no VT switching)\n") }
+    if !openCard(backend) {
+        state.say("drm: no card with a connected monitor under ")
+        sayPath(cardDirectoryOf(backend))
+        state.say("\n")
+        if backend.*.hasSession { logind.close(sessionOf(backend)) }
+        return 0
+    }
+    compositor.*.width = outputOf(backend).*.width
+    compositor.*.height = outputOf(backend).*.height
+    backend.*.frame = state.allocate(compositor, compositor.*.width * compositor.*.height * 4)
+    compositor.*.lastFrame = backend.*.frame
+    compositor.*.pointerX = @intCast(i32, compositor.*.width / 2)
+    compositor.*.pointerY = @intCast(i32, compositor.*.height / 2)
+    compositor.*.pointerInside = true
+    compositor.*.needsRedraw = true
+
+    const loaded = xkb.load(keyboardOf(backend), compositor)
+    scanInputs(backend)
+    backend.*.inotify = std.linux.syscall1(device.SYS_inotify_init1, IN_NONBLOCK | IN_CLOEXEC)
+    if backend.*.inotify >= 0 {
+        const watched = std.linux.syscall3(device.SYS_inotify_add_watch, @bitCast(usize, backend.*.inotify), @intFromPtr(inputDirectoryOf(backend)), IN_CREATE | IN_ATTRIB)
+    }
+    return @intFromPtr(memory)
+}
+
+pub fn backendAt(address: usize) -> *Backend {
+    unsafe { return @ptrFromInt(*Backend, address) }
+}
+
+// Gives everything back: the monitor what it showed, the devices to logind.
+pub fn stop(backend: *Backend) -> void {
+    kms.close(outputOf(backend), allocator(backend))
+    releaseNode(backend, backend.*.cardMajor, backend.*.cardMinor)
+    var slot: usize = 0
+    while slot < MAX_INPUTS {
+        if backend.*.inputs[slot] != 0 { removeInput(backend, slot) }
+        slot += 1
+    }
+    device.close(backend.*.inotify)
+    if backend.*.hasSession { logind.close(sessionOf(backend)) }
+}
+
+// ---------------------------------------------------------------------------
+// The event loop
+
+// The descriptors to wait on: the card, the bus, inotify and the input
+// devices. Returns how many were stored (at most `capacity`).
+pub fn handles(backend: *Backend, list: [*]wl.Handle, capacity: usize) -> usize {
+    var count: usize = 0
+    list[count] = wl.Handle.fromDescriptor(kms.descriptor(outputOf(backend)))
+    count += 1
+    if backend.*.hasSession && count < capacity {
+        list[count] = wl.Handle.fromDescriptor(logind.descriptor(sessionOf(backend)))
+        count += 1
+    }
+    if backend.*.inotify >= 0 && count < capacity {
+        list[count] = wl.Handle.fromDescriptor(backend.*.inotify)
+        count += 1
+    }
+    var slot: usize = 0
+    while slot < MAX_INPUTS && count < capacity {
+        if backend.*.inputs[slot] != 0 && !backend.*.paused[slot] {
+            list[count] = wl.Handle.fromDescriptor(evdev.descriptor(inputAt(backend, slot)))
+            count += 1
+        }
+        slot += 1
+    }
+    return count
+}
+
+// Whether some device has data read already (then do not wait).
+pub fn hasBufferedData(backend: *Backend) -> bool {
+    var slot: usize = 0
+    while slot < MAX_INPUTS {
+        if backend.*.inputs[slot] != 0 && evdev.hasBufferedData(inputAt(backend, slot)) { return true }
+        slot += 1
+    }
+    return false
+}
+
+fn now() -> u32 {
+    var time: [16]u8 = undefined
+    var bytes: [*]u8 = undefined
+    unsafe { bytes = @ptrCast([*]u8, &time) }
+    const result = std.linux.syscall2(228, 1, @intFromPtr(bytes))
+    return @intCast(u32, (device.load64(bytes, 0) * 1000 + device.load64(bytes, 8) / 1000000) & 4294967295)
+}
+
+fn sessionEvents(backend: *Backend) -> void {
+    if !backend.*.hasSession { return }
+    const compositor = backend.*.compositor
+    var event: logind.Event = undefined
+    var alive = true
+    while logind.nextEvent(sessionOf(backend), &event, &alive) {
+        const card = event.major == backend.*.cardMajor && event.minor == backend.*.cardMinor
+        if event.kind == logind.PAUSE {
+            if card {
+                // Another VT is in front: no frames until we are back, and
+                // nothing held down any more.
+                backend.*.active = false
+                evdev.releaseAll(compositor, keyboardOf(backend))
+                if compositor.*.verbose { state.say("session: paused\n") }
+                if event.pauseKind == logind.PAUSE_ASKED { logind.pauseComplete(sessionOf(backend), event.major, event.minor) }
+            } else {
+                const slot = slotOf(backend, event.major, event.minor)
+                if slot < MAX_INPUTS {
+                    if event.pauseKind == logind.PAUSE_GONE {
+                        removeInput(backend, slot)
+                    } else {
+                        backend.*.paused[slot] = true
+                        if event.pauseKind == logind.PAUSE_ASKED { logind.pauseComplete(sessionOf(backend), event.major, event.minor) }
+                    }
+                }
+            }
+        } else if event.kind == logind.RESUME {
+            if card {
+                // Our descriptor is master again; the one logind sent is a
+                // copy of it.
+                device.close(event.descriptor)
+                kms.resume(outputOf(backend))
+                backend.*.active = true
+                compositor.*.needsRedraw = true
+                if compositor.*.verbose { state.say("session: resumed\n") }
+            } else {
+                const slot = slotOf(backend, event.major, event.minor)
+                if slot < MAX_INPUTS && event.descriptor >= 0 {
+                    evdev.replaceDescriptor(inputAt(backend, slot), event.descriptor, allocator(backend))
+                    backend.*.paused[slot] = false
+                } else {
+                    device.close(event.descriptor)
+                }
+            }
+        }
+    }
+    if !alive {
+        state.say("session: the system bus went away\n")
+        backend.*.hasSession = false
+    }
+}
+
+// Handles whatever the card, the session, inotify and the input devices
+// have (none of it waits).
+pub fn dispatch(backend: *Backend) -> void {
+    const compositor = backend.*.compositor
+    sessionEvents(backend)
+    var milliseconds: u32 = 0
+    if kms.readEvents(outputOf(backend), &milliseconds) { shell.frameDone(compositor, milliseconds) }
+    readInotify(backend)
+    var slot: usize = 0
+    while slot < MAX_INPUTS {
+        if backend.*.inputs[slot] != 0 && !backend.*.paused[slot] {
+            if !evdev.read(inputAt(backend, slot), compositor, keyboardOf(backend)) {
+                // Revoked (logind pauses it, and resumes it with a new
+                // descriptor) or unplugged (logind says "gone"). Without
+                // logind nobody will say: let it go.
+                if backend.*.hasSession { backend.*.paused[slot] = true } else { removeInput(backend, slot) }
+            }
+        }
+        slot += 1
+    }
+}
+
+// Composes and shows a frame when something changed, the session is in
+// front and the last flip is done.
+pub fn present(backend: *Backend) -> void {
+    const compositor = backend.*.compositor
+    const output = outputOf(backend)
+    if !backend.*.active || output.*.flipPending || !compositor.*.needsRedraw { return }
+    scene.compose(compositor, backend.*.frame)
+    // Row by row into the dumb buffer, eight bytes at a time.
+    const row_words = compositor.*.width * 4 / 8
+    const pitch = kms.backPitch(output)
+    var source: [*]const u64 = undefined
+    var target: [*]u64 = undefined
+    var row: usize = 0
+    while row < compositor.*.height {
+        unsafe {
+            source = @ptrFromInt([*]const u64, @intFromPtr(backend.*.frame) + row * compositor.*.width * 4)
+            target = @ptrFromInt([*]u64, kms.backAddress(output) + row * pitch)
+        }
+        var word: usize = 0
+        while word < row_words {
+            target[word] = source[word]
+            word += 1
+        }
+        if compositor.*.width % 2 != 0 {
+            // The last pixel of an odd-width row.
+            var last_source: [*]const u32 = undefined
+            var last_target: [*]u32 = undefined
+            unsafe {
+                last_source = @ptrCast([*]const u32, source)
+                last_target = @ptrCast([*]u32, target)
+            }
+            last_target[compositor.*.width - 1] = last_source[compositor.*.width - 1]
+        }
+        row += 1
+    }
+    var shown = false
+    if !kms.present(output, &shown) {
+        // The card is not ours right now (a VT switch under way).
+        return
+    }
+    compositor.*.frames += 1
+    compositor.*.needsRedraw = false
+    if shown { shell.frameDone(compositor, now()) }
+}
+
+// Ctrl+Alt+F<number>.
+pub fn switchTo(backend: *Backend, number: u32) -> void {
+    if !backend.*.hasSession {
+        state.say("drm: no logind session, no VT switching\n")
+        return
+    }
+    if backend.*.compositor.*.verbose {
+        state.say("session: switch to VT ")
+        state.sayNumber(@intCast(usize, number))
+        state.say("\n")
+    }
+    const switched = logind.switchTo(sessionOf(backend), number)
+}

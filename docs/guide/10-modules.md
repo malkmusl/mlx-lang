@@ -100,6 +100,20 @@ pub fn main() -> u8 {
 
 (`tests/135_imported_string_literal_runtime.mlx`)
 
+A module-level string constant is a value like any other: used in its own
+module or through an import it is the string's literal, NUL-terminated, so it
+can also be handed to C as a `[*]const u8`:
+
+```mlx
+const constants = @import("./support/strings/constants.mlx")
+
+unsafe { pointer = @ptrCast([*]const u8, constants.NAME) }
+if cLength(pointer) != 14 || pointer[3] != 75 { return 3 }
+```
+
+(`tests/249_string_constant_runtime.mlx`, constants in
+`tests/support/strings/constants.mlx`)
+
 ## Visibility
 
 Only `pub` declarations are visible outside their module. Accessing a

@@ -1,0 +1,677 @@
+// A Wayland client that renders with Vulkan: an animated pattern from a
+// compute shader (examples/vulkan-shared), with a ring following the pointer
+// (white while a button is held). No libwayland, no C Vulkan loader: only
+// std.wayland, std.vulkan.loader and std.spirv.
+//
+//     mlx4 examples/vulkan-wayland-client/main.mlx -o vulkan-wayland-client
+//     ./vulkan-wayland-client
+//
+// Each frame goes to the compositor the cheapest way both sides support:
+//
+//   dmabuf       the GPU renders into buffers exported as dma-bufs, handed
+//                over with zwp_linux_dmabuf_v1 (XRGB8888, linear): zero-copy
+//                on GPUs;
+//   shm-direct   the GPU renders straight into the wl_shm pool, imported
+//                with VK_EXT_external_memory_host: zero-copy with CPU
+//                drivers such as lavapipe;
+//   shm-copy     the GPU renders into its own memory and the frame is copied
+//                into the wl_shm pool.
+//
+// Options:
+//     --mode auto|dmabuf|shm-direct|shm-copy   (default auto)
+//     --size WxH          window size (default 480x320)
+//     --frames N          exit after N presented frames (default: run until
+//                         the window is closed)
+//     --font PATH         TrueType font for the label (default DejaVu Sans;
+//                         `none` for no label)
+//     --test-memfd-dmabuf testing only: where no dma-buf exporter exists,
+//                         offer the shm-direct memory (a memfd) through
+//                         linux-dmabuf, to exercise a compositor's import path
+//     --verbose
+
+const std = @import("std")
+const wl = @import("std.wayland")
+const vk = @import("std.vulkan")
+const loader = @import("std.vulkan.loader")
+const gpu = @import("../vulkan-shared/gpu.mlx")
+const shaders = @import("../vulkan-shared/shaders.mlx")
+const tt = @import("std.truetype")
+const text_module = @import("../vulkan-shared/text.mlx")
+
+const DEFAULT_FONT = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
+const LABEL_SIZE: u32 = 18
+
+// DRM_FORMAT_XRGB8888 ('XR24').
+const DRM_FORMAT_XRGB8888: u32 = 875713112
+
+const MODE_AUTO: u8 = 0
+const MODE_DMABUF: u8 = 1
+const MODE_SHM_DIRECT: u8 = 2
+const MODE_SHM_COPY: u8 = 3
+
+const SLOTS: usize = 2
+
+// One presentable buffer.
+const Slot = struct {
+    app: usize
+    target: gpu.Buffer
+    buffer: wl.wl_buffer.Proxy
+    // Byte offset of the pixels in the shm pool (shm modes).
+    offset: usize
+    busy: bool
+}
+
+const App = struct {
+    allocator: std.allocator.Allocator
+    display: wl.client.Display
+    registry: wl.wl_registry.Proxy
+    compositor: wl.wl_compositor.Proxy
+    shm: wl.wl_shm.Proxy
+    wmBase: wl.xdg_wm_base.Proxy
+    seat: wl.wl_seat.Proxy
+    pointer: wl.wl_pointer.Proxy
+    dmabuf: wl.zwp_linux_dmabuf_v1.Proxy
+    hasCompositor: bool
+    hasShm: bool
+    hasWmBase: bool
+    hasSeat: bool
+    hasPointer: bool
+    hasDmabuf: bool
+    dmabufLinear: bool
+    surface: wl.wl_surface.Proxy
+    xdgSurface: wl.xdg_surface.Proxy
+    toplevel: wl.xdg_toplevel.Proxy
+    configured: bool
+    closed: bool
+    framePending: bool
+    width: u32
+    height: u32
+    stride: u32
+    frames: u32
+    frameLimit: u32
+    time: u32
+    pointerX: i32
+    pointerY: i32
+    pointerInside: bool
+    pressed: bool
+    mode: u8
+    testMemfd: bool
+    verbose: bool
+    pool: wl.SharedMemory
+    context: *gpu.Context
+    kernel: *gpu.Kernel
+    slots: [2]usize
+    // The label: std.truetype layout, drawn by the text shader.
+    fontPath: [*]const u8
+    hasText: bool
+    font: *tt.Font
+    atlas: *tt.Atlas
+    run: *tt.Run
+    text: *text_module.Text
+    label: [*]u8
+}
+
+fn appOf(context: *anyopaque) -> *App {
+    unsafe { return @ptrCast(*App, context) }
+}
+
+fn contextOf(app: *App) -> *anyopaque {
+    unsafe { return @ptrCast(*anyopaque, app) }
+}
+
+fn slotAt(app: *App, index: usize) -> *Slot {
+    unsafe { return @ptrFromInt(*Slot, app.*.slots[index]) }
+}
+
+fn say(text: []const u8) -> void { const ignored = std.io.writeAll(std.io.stdout(), text) }
+fn sayNumber(value: usize) -> void { const ignored = std.io.writeUnsigned(std.io.stdout(), value) }
+
+fn minimum(left: u32, right: u32) -> u32 {
+    if left < right { return left }
+    return right
+}
+
+fn isNamed(value: std.string.String, name: []const u8) -> bool {
+    return std.string.eql(value, std.string.fromSlice(name))
+}
+
+fn modeName(mode: u8) -> []const u8 {
+    if mode == MODE_DMABUF { return "dmabuf" }
+    if mode == MODE_SHM_DIRECT { return "shm-direct" }
+    return "shm-copy"
+}
+
+// ---------------------------------------------------------------------------
+// Wayland events
+
+fn onRegistry(context: *anyopaque, event: wl.client.Event) -> void {
+    const app = appOf(context)
+    const decoded = wl.wl_registry.decodeEvent(event)
+    if @tagOf(decoded) != 0 { return }
+    const global = decoded.global
+    const registry = app.*.registry
+    if isNamed(global.interface, "wl_compositor") {
+        app.*.compositor = wl.wl_compositor.Proxy.fromObject(registry.bind(global.name, wl.Interface.wl_compositor, minimum(global.version, 4)))
+        app.*.hasCompositor = true
+    } else if isNamed(global.interface, "wl_shm") {
+        app.*.shm = wl.wl_shm.Proxy.fromObject(registry.bind(global.name, wl.Interface.wl_shm, 1))
+        app.*.hasShm = true
+    } else if isNamed(global.interface, "xdg_wm_base") {
+        app.*.wmBase = wl.xdg_wm_base.Proxy.fromObject(registry.bind(global.name, wl.Interface.xdg_wm_base, minimum(global.version, 5)))
+        app.*.hasWmBase = true
+    } else if isNamed(global.interface, "wl_seat") && !app.*.hasSeat {
+        app.*.seat = wl.wl_seat.Proxy.fromObject(registry.bind(global.name, wl.Interface.wl_seat, minimum(global.version, 5)))
+        app.*.hasSeat = true
+    } else if isNamed(global.interface, "zwp_linux_dmabuf_v1") && global.version >= 3 {
+        // Version 3 announces formats and modifiers with events.
+        app.*.dmabuf = wl.zwp_linux_dmabuf_v1.Proxy.fromObject(registry.bind(global.name, wl.Interface.zwp_linux_dmabuf_v1, 3))
+        app.*.hasDmabuf = true
+    }
+}
+
+fn onDmabuf(context: *anyopaque, event: wl.client.Event) -> void {
+    const app = appOf(context)
+    if event.opcode != wl.zwp_linux_dmabuf_v1.EVENT_MODIFIER { return }
+    const decoded = wl.zwp_linux_dmabuf_v1.decodeEvent(event)
+    const modifier = decoded.modifier
+    if modifier.format == DRM_FORMAT_XRGB8888 && modifier.modifier_hi == 0 && modifier.modifier_lo == 0 { app.*.dmabufLinear = true }
+}
+
+fn onWmBase(context: *anyopaque, event: wl.client.Event) -> void {
+    const app = appOf(context)
+    const decoded = wl.xdg_wm_base.decodeEvent(event)
+    app.*.wmBase.pong(decoded.ping.serial)
+}
+
+fn onXdgSurface(context: *anyopaque, event: wl.client.Event) -> void {
+    const app = appOf(context)
+    const decoded = wl.xdg_surface.decodeEvent(event)
+    app.*.xdgSurface.ackConfigure(decoded.configure.serial)
+    if !app.*.configured {
+        app.*.configured = true
+        present(app)
+    }
+}
+
+fn onToplevel(context: *anyopaque, event: wl.client.Event) -> void {
+    const app = appOf(context)
+    if event.opcode == wl.xdg_toplevel.EVENT_CLOSE { app.*.closed = true }
+}
+
+fn onSeat(context: *anyopaque, event: wl.client.Event) -> void {
+    const app = appOf(context)
+    if event.opcode != wl.wl_seat.EVENT_CAPABILITIES { return }
+    const decoded = wl.wl_seat.decodeEvent(event)
+    if wl.flags.has(decoded.capabilities.capabilities, @intFromEnum(wl.wl_seat.Capability.pointer)) && !app.*.hasPointer {
+        app.*.pointer = app.*.seat.getPointer()
+        app.*.pointer.setHandler(onPointer, context)
+        app.*.hasPointer = true
+    }
+}
+
+fn onPointer(context: *anyopaque, event: wl.client.Event) -> void {
+    const app = appOf(context)
+    const decoded = wl.wl_pointer.decodeEvent(event)
+    if event.opcode == wl.wl_pointer.EVENT_ENTER {
+        app.*.pointerInside = true
+        app.*.pointerX = decoded.enter.surface_x.toInt()
+        app.*.pointerY = decoded.enter.surface_y.toInt()
+    } else if event.opcode == wl.wl_pointer.EVENT_LEAVE {
+        app.*.pointerInside = false
+        app.*.pressed = false
+    } else if event.opcode == wl.wl_pointer.EVENT_MOTION {
+        app.*.pointerX = decoded.motion.surface_x.toInt()
+        app.*.pointerY = decoded.motion.surface_y.toInt()
+    } else if event.opcode == wl.wl_pointer.EVENT_BUTTON {
+        app.*.pressed = decoded.button.state == @intFromEnum(wl.wl_pointer.ButtonState.pressed)
+    }
+}
+
+fn onFrame(context: *anyopaque, event: wl.client.Event) -> void {
+    const app = appOf(context)
+    app.*.framePending = false
+    app.*.frames += 1
+    if app.*.frameLimit == 0 || app.*.frames < app.*.frameLimit { present(app) }
+}
+
+fn onRelease(context: *anyopaque, event: wl.client.Event) -> void {
+    var slot: *Slot = undefined
+    unsafe { slot = @ptrCast(*Slot, context) }
+    slot.*.busy = false
+}
+
+// ---------------------------------------------------------------------------
+// Rendering
+
+fn freeSlot(app: *App) -> usize {
+    var index: usize = 0
+    while index < SLOTS {
+        if !slotAt(app, index).*.busy { return index }
+        index += 1
+    }
+    return SLOTS
+}
+
+fn appendText(buffer: [*]u8, length: usize, text: []const u8) -> usize {
+    var at = length
+    for byte in text {
+        buffer[at] = byte
+        at += 1
+    }
+    return at
+}
+
+fn appendNumber(buffer: [*]u8, length: usize, value: u32) -> usize {
+    var digits: [10]u8 = undefined
+    var count: usize = 0
+    var rest = value
+    while count == 0 || rest > 0 {
+        digits[count] = @intCast(u8, 48 + rest % 10)
+        rest = rest / 10
+        count += 1
+    }
+    var at = length
+    while count > 0 {
+        count -= 1
+        buffer[at] = digits[count]
+        at += 1
+    }
+    return at
+}
+
+// Loads the label font and prepares the text shader; without a font the
+// window simply has no label.
+fn setUpText(app: *App) -> void {
+    app.*.hasText = false
+    if app.*.fontPath[0] == 0 { return }
+    const allocator = app.*.allocator
+    const status = tt.loadFile(app.*.font, app.*.fontPath, allocator)
+    if status != tt.Status.ok {
+        if app.*.verbose {
+            say("label: ")
+            say(tt.statusMessage(status))
+            say("\n")
+        }
+        return
+    }
+    if !tt.initAtlas(app.*.atlas, app.*.font, LABEL_SIZE, 512, 128, allocator) { return }
+    if !tt.initRun(app.*.run, 96, allocator) { return }
+    if !text_module.init(app.*.context, app.*.text, app.*.atlas, 256) { return }
+    app.*.hasText = true
+}
+
+// "Mlx + Vulkan · MODE · frame N" in the bottom-left corner, over a shadow.
+fn drawLabel(app: *App, slot: *Slot) -> bool {
+    if !app.*.hasText { return true }
+    var length = appendText(app.*.label, 0, "Mlx + Vulkan · ")
+    length = appendText(app.*.label, length, modeName(app.*.mode))
+    length = appendText(app.*.label, length, " · frame ")
+    length = appendNumber(app.*.label, length, app.*.frames)
+    tt.layoutBytes(app.*.atlas, app.*.label, length, app.*.run)
+    text_module.beginFrame(app.*.text)
+    const x: i32 = 10
+    const y = @intCast(i32, app.*.height) - 10
+    if !text_module.draw(app.*.context, app.*.text, app.*.atlas, app.*.run, slot.*.target.buffer, app.*.width, app.*.height, 0, x + 1, y + 1, 3019898880) { return false }
+    return text_module.draw(app.*.context, app.*.text, app.*.atlas, app.*.run, slot.*.target.buffer, app.*.width, app.*.height, 0, x, y, 4294967295)
+}
+
+fn render(app: *App, slot: *Slot) -> bool {
+    var flags: u32 = 0
+    if app.*.pointerInside { flags = flags | shaders.FLAG_POINTER }
+    if app.*.pressed { flags = flags | shaders.FLAG_PRESSED }
+    var push = shaders.Pattern.{
+        .width = app.*.width,
+        .height = app.*.height,
+        .time = app.*.time,
+        .pointerX = @bitCast(u32, app.*.pointerX),
+        .pointerY = @bitCast(u32, app.*.pointerY),
+        .flags = flags,
+    }
+    var buffers: [1]vk.Buffer = [1]vk.Buffer{ slot.*.target.buffer }
+    if !gpu.begin(app.*.context) { return false }
+    unsafe {
+        if !gpu.dispatch(app.*.context, app.*.kernel, @ptrCast([*]const vk.Buffer, &buffers), &push, gpu.groups(app.*.width, shaders.GROUP_SIZE), gpu.groups(app.*.height, shaders.GROUP_SIZE)) { return false }
+    }
+    if !drawLabel(app, slot) { return false }
+    if !gpu.submit(app.*.context) { return false }
+    if app.*.mode == MODE_SHM_COPY {
+        const bytes = @intCast(usize, app.*.stride) * @intCast(usize, app.*.height)
+        unsafe { std.mem.copy(@ptrFromInt([*]u8, app.*.pool.address + slot.*.offset), @ptrFromInt([*]const u8, slot.*.target.address), bytes) }
+    }
+    app.*.time += 2
+    return true
+}
+
+// Renders into a free buffer and commits it with a frame callback.
+fn present(app: *App) -> void {
+    if app.*.framePending || app.*.closed { return }
+    const index = freeSlot(app)
+    if index == SLOTS { return }
+    const slot = slotAt(app, index)
+    if !render(app, slot) {
+        say("vulkan-wayland-client: rendering failed\n")
+        app.*.closed = true
+        return
+    }
+    slot.*.busy = true
+    const buffer = slot.*.buffer
+    app.*.surface.attach(&buffer, 0, 0)
+    app.*.surface.damage(0, 0, @bitCast(i32, app.*.width), @bitCast(i32, app.*.height))
+    const callback = app.*.surface.frame()
+    callback.setHandler(onFrame, contextOf(app))
+    app.*.framePending = true
+    app.*.surface.commit()
+}
+
+// ---------------------------------------------------------------------------
+// Setup
+
+fn alignUp(value: usize, alignment: usize) -> usize {
+    return (value + alignment - 1) / alignment * alignment
+}
+
+// Creates the presentable buffers for the chosen mode.
+fn createSlots(app: *App) -> bool {
+    const context = app.*.context
+    const frame_bytes = @intCast(usize, app.*.stride) * @intCast(usize, app.*.height)
+    const slot_bytes = alignUp(frame_bytes, @intCast(usize, context.*.hostAlignment))
+    if app.*.mode != MODE_DMABUF || app.*.testMemfd {
+        var pool: wl.SharedMemory = undefined
+        if !wl.transport.createSharedMemory(&pool, slot_bytes * SLOTS) { return false }
+        app.*.pool = pool
+    }
+    var shm_pool: wl.wl_shm_pool.Proxy = undefined
+    if app.*.mode != MODE_DMABUF { shm_pool = app.*.shm.createPool(app.*.pool.handle, @intCast(i32, slot_bytes * SLOTS)) }
+    var index: usize = 0
+    while index < SLOTS {
+        const memory = app.*.allocator.alloc(@sizeOf(Slot), 16)
+        if memory == null { return false }
+        app.*.slots[index] = @intFromPtr(memory.?)
+        const slot = slotAt(app, index)
+        slot.*.app = @intFromPtr(app)
+        slot.*.busy = false
+        slot.*.offset = slot_bytes * index
+        var ok = false
+        var target: gpu.Buffer = undefined
+        if app.*.mode == MODE_DMABUF && !app.*.testMemfd {
+            ok = gpu.createBuffer(context, &target, @intCast(u64, frame_bytes), true) && target.fd >= 0
+        } else if app.*.mode == MODE_SHM_COPY {
+            ok = gpu.createBuffer(context, &target, @intCast(u64, frame_bytes), false)
+        } else {
+            ok = gpu.importHostMemory(context, &target, app.*.pool.address + slot.*.offset, @intCast(u64, slot_bytes))
+        }
+        slot.*.target = target
+        if !ok { return false }
+        if app.*.mode == MODE_DMABUF {
+            const params = app.*.dmabuf.createParams()
+            if app.*.testMemfd {
+                params.add(app.*.pool.handle, 0, @intCast(u32, slot.*.offset), app.*.stride, 0, 0)
+            } else {
+                params.add(wl.Handle.fromDescriptor(@intCast(isize, slot.*.target.fd)), 0, 0, app.*.stride, 0, 0)
+            }
+            slot.*.buffer = params.createImmed(@bitCast(i32, app.*.width), @bitCast(i32, app.*.height), DRM_FORMAT_XRGB8888, 0)
+            params.destroy()
+        } else {
+            slot.*.buffer = shm_pool.createBuffer(@intCast(i32, slot.*.offset), @bitCast(i32, app.*.width), @bitCast(i32, app.*.height), @bitCast(i32, app.*.stride), @intFromEnum(wl.wl_shm.Format.xrgb8888))
+        }
+        unsafe { slot.*.buffer.setHandler(onRelease, @ptrCast(*anyopaque, slot)) }
+        index += 1
+    }
+    if app.*.mode != MODE_DMABUF { shm_pool.destroy() }
+    return true
+}
+
+// Whether the driver imports memory like a wl_shm pool's (a memfd) with
+// VK_EXT_external_memory_host: RADV and the other amdgpu drivers take only
+// anonymous memory.
+fn canImportShm(app: *App) -> bool {
+    const context = app.*.context
+    if !context.*.hostMemory { return false }
+    const size = @intCast(usize, context.*.hostAlignment)
+    var memory: wl.SharedMemory = undefined
+    if !wl.transport.createSharedMemory(&memory, size) { return false }
+    var probe: gpu.Buffer = undefined
+    const imported = gpu.importHostMemory(context, &probe, memory.address, @intCast(u64, size))
+    gpu.destroyBuffer(context, &probe)
+    memory.release()
+    return imported
+}
+
+fn chooseMode(app: *App, requested: u8) -> u8 {
+    const context = app.*.context
+    const shm_import = canImportShm(app)
+    const dmabuf_ok = app.*.hasDmabuf && app.*.dmabufLinear && (context.*.dmaBufExport || (app.*.testMemfd && shm_import))
+    if requested == MODE_DMABUF { return if dmabuf_ok { MODE_DMABUF } else { MODE_AUTO } }
+    if requested == MODE_SHM_DIRECT { return if shm_import { MODE_SHM_DIRECT } else { MODE_AUTO } }
+    if requested == MODE_SHM_COPY { return MODE_SHM_COPY }
+    if dmabuf_ok { return MODE_DMABUF }
+    if shm_import { return MODE_SHM_DIRECT }
+    return MODE_SHM_COPY
+}
+
+const Failure = error { InvalidArguments, MissingGlobals, NoVulkan, NoBuffers, ModeUnavailable }
+
+fn invalidArguments() -> Failure!void { return Failure.InvalidArguments }
+fn missingGlobals() -> Failure!void { return Failure.MissingGlobals }
+fn noVulkan() -> Failure!void { return Failure.NoVulkan }
+fn noBuffers() -> Failure!void { return Failure.NoBuffers }
+fn modeUnavailable() -> Failure!void { return Failure.ModeUnavailable }
+
+fn parseNumber(text: std.string.String, start: usize, end: usize) -> u32 {
+    var value: u32 = 0
+    var index = start
+    while index < end {
+        const byte = text.pointer[index]
+        if byte < 48 || byte > 57 { return 0 }
+        value = value * 10 + @intCast(u32, byte - 48)
+        index += 1
+    }
+    return value
+}
+
+fn run(app: *App, arguments: [][*]const u8) -> !void {
+    var requested = MODE_AUTO
+    var index: usize = 1
+    const count = std.process.count(arguments)
+    while index < count {
+        const argument = std.process.argument(arguments, index)
+        const has_value = index + 1 < count
+        if isNamed(argument, "--verbose") {
+            app.*.verbose = true
+        } else if isNamed(argument, "--test-memfd-dmabuf") {
+            app.*.testMemfd = true
+        } else if isNamed(argument, "--font") && has_value {
+            index += 1
+            const path = std.process.argument(arguments, index)
+            if isNamed(path, "none") {
+                unsafe { app.*.fontPath = @ptrCast([*]const u8, "") }
+            } else {
+                app.*.fontPath = path.pointer
+            }
+        } else if isNamed(argument, "--frames") && has_value {
+            index += 1
+            const value = std.process.argument(arguments, index)
+            app.*.frameLimit = parseNumber(value, 0, value.length)
+        } else if isNamed(argument, "--size") && has_value {
+            index += 1
+            const size = std.process.argument(arguments, index)
+            var split: usize = 0
+            while split < size.length && size.pointer[split] != 120 { split += 1 }
+            app.*.width = parseNumber(size, 0, split)
+            app.*.height = if split < size.length { parseNumber(size, split + 1, size.length) } else { 0 }
+            if app.*.width < 16 || app.*.height < 16 || app.*.width > 4096 || app.*.height > 4096 { return invalidArguments() }
+        } else if isNamed(argument, "--mode") && has_value {
+            index += 1
+            const mode = std.process.argument(arguments, index)
+            if isNamed(mode, "dmabuf") {
+                requested = MODE_DMABUF
+            } else if isNamed(mode, "shm-direct") {
+                requested = MODE_SHM_DIRECT
+            } else if isNamed(mode, "shm-copy") {
+                requested = MODE_SHM_COPY
+            } else if !isNamed(mode, "auto") {
+                return invalidArguments()
+            }
+        } else {
+            const usage = std.io.eprintln("usage: vulkan-wayland-client [--mode auto|dmabuf|shm-direct|shm-copy] [--size WxH] [--frames N] [--font PATH|none] [--test-memfd-dmabuf] [--verbose]")
+            return invalidArguments()
+        }
+        index += 1
+    }
+    app.*.stride = app.*.width * 4
+
+    // Wayland.
+    var display: wl.client.Display = undefined
+    try wl.client.Display.connect(&display, app.*.allocator)
+    var connected = true
+    defer reportLost(&display, &connected)
+    app.*.display = display
+    app.*.registry = wl.displayProxy(display).getRegistry()
+    app.*.registry.setHandler(onRegistry, contextOf(app))
+    try display.roundtrip()
+    if !app.*.hasCompositor || !app.*.hasShm || !app.*.hasWmBase { return missingGlobals() }
+    app.*.wmBase.setHandler(onWmBase, contextOf(app))
+    if app.*.hasSeat { app.*.seat.setHandler(onSeat, contextOf(app)) }
+    if app.*.hasDmabuf { app.*.dmabuf.setHandler(onDmabuf, contextOf(app)) }
+    // The dmabuf formats and the seat capabilities.
+    try display.roundtrip()
+
+    // Vulkan.
+    var driver: loader.Driver = undefined
+    const opened = loader.openFirstDriver(&driver, arguments, app.*.allocator)
+    if opened != loader.Status.ok {
+        say("vulkan-wayland-client: ")
+        say(loader.statusMessage(opened))
+        say("\n")
+        return noVulkan()
+    }
+    var options = gpu.defaultOptions(@ptrCast([*]const u8, "vulkan-wayland-client"))
+    options.wantSharing = true
+    const status = gpu.open(app.*.context, driver, &options, app.*.allocator)
+    if status != gpu.Status.ok {
+        say("vulkan-wayland-client: ")
+        say(gpu.statusMessage(status))
+        say("\n")
+        return noVulkan()
+    }
+    var code: [*]u32 = undefined
+    const words = shaders.buildPatternWords(app.*.allocator, &code)
+    if words == 0 || !gpu.createKernel(app.*.context, app.*.kernel, code, words, 1, shaders.PATTERN_WORDS) { return noVulkan() }
+    app.*.mode = chooseMode(app, requested)
+    if app.*.mode == MODE_AUTO {
+        say("vulkan-wayland-client: the requested mode is not available (dmabuf needs a Vulkan driver that exports dma-bufs and a compositor offering XRGB8888 linear buffers; shm-direct needs VK_EXT_external_memory_host importing the shared memory)\n")
+        return modeUnavailable()
+    }
+    if !createSlots(app) {
+        say("vulkan-wayland-client: cannot create the ")
+        say(modeName(app.*.mode))
+        say(" buffers (try --mode shm-copy)\n")
+        return noBuffers()
+    }
+    setUpText(app)
+    if app.*.verbose {
+        say("device: ")
+        const name = std.io.writeString(std.io.stdout(), std.process.fromCString(gpu.deviceName(app.*.context)))
+        say("\nmode: ")
+        say(modeName(app.*.mode))
+        say("\n")
+    }
+
+    app.*.surface = app.*.compositor.createSurface()
+    app.*.xdgSurface = app.*.wmBase.getXdgSurface(app.*.surface)
+    app.*.xdgSurface.setHandler(onXdgSurface, contextOf(app))
+    app.*.toplevel = app.*.xdgSurface.getToplevel()
+    app.*.toplevel.setHandler(onToplevel, contextOf(app))
+    app.*.toplevel.setTitle("Mlx + Vulkan")
+    app.*.toplevel.setAppId("org.mlx.vulkan")
+    app.*.surface.commit()
+
+    while display.running() && !app.*.closed && (app.*.frameLimit == 0 || app.*.frames < app.*.frameLimit) {
+        try display.flush()
+        try display.dispatch()
+    }
+    say("vulkan-wayland-client: ")
+    sayNumber(@intCast(usize, app.*.frames))
+    say(" frames presented (")
+    say(modeName(app.*.mode))
+    say(")\n")
+    app.*.toplevel.destroy()
+    app.*.xdgSurface.destroy()
+    app.*.surface.destroy()
+    index = 0
+    while index < SLOTS {
+        slotAt(app, index).*.buffer.destroy()
+        index += 1
+    }
+    try display.roundtrip()
+    index = 0
+    while index < SLOTS {
+        var target = slotAt(app, index).*.target
+        gpu.destroyBuffer(app.*.context, &target)
+        index += 1
+    }
+    gpu.close(app.*.context)
+    connected = false
+    display.disconnect()
+}
+
+// Says why the connection to the compositor stopped, when it did.
+fn reportLost(display: *const wl.client.Display, connected: *const bool) -> void {
+    if !connected.* || display.*.running() { return }
+    say("vulkan-wayland-client: lost the compositor: ")
+    say(display.*.failureReason())
+    if display.*.errorObjectId() != 0 {
+        say(" (object ")
+        sayNumber(@intCast(usize, display.*.errorObjectId()))
+        say(", code ")
+        sayNumber(@intCast(usize, display.*.errorCode()))
+        say("): ")
+        const shown = std.io.writeString(std.io.stdout(), display.*.errorMessage())
+    }
+    say("\n")
+}
+
+pub fn main(arguments: [][*]const u8) -> !void {
+    var app: App = undefined
+    app.allocator = std.page_allocator.init()
+    app.hasCompositor = false
+    app.hasShm = false
+    app.hasWmBase = false
+    app.hasSeat = false
+    app.hasPointer = false
+    app.hasDmabuf = false
+    app.dmabufLinear = false
+    app.configured = false
+    app.closed = false
+    app.framePending = false
+    app.width = 480
+    app.height = 320
+    app.frames = 0
+    app.frameLimit = 0
+    app.time = 0
+    app.pointerX = 0
+    app.pointerY = 0
+    app.pointerInside = false
+    app.pressed = false
+    app.mode = MODE_AUTO
+    app.testMemfd = false
+    app.verbose = false
+    const context_memory = app.allocator.alloc(@sizeOf(gpu.Context), 16)
+    const kernel_memory = app.allocator.alloc(@sizeOf(gpu.Kernel), 16)
+    const font_memory = app.allocator.alloc(@sizeOf(tt.Font), 16)
+    const atlas_memory = app.allocator.alloc(@sizeOf(tt.Atlas), 16)
+    const run_memory = app.allocator.alloc(@sizeOf(tt.Run), 16)
+    const text_memory = app.allocator.alloc(@sizeOf(text_module.Text), 16)
+    unsafe {
+        app.context = @ptrCast(*gpu.Context, context_memory.?)
+        app.kernel = @ptrCast(*gpu.Kernel, kernel_memory.?)
+        app.font = @ptrCast(*tt.Font, font_memory.?)
+        app.atlas = @ptrCast(*tt.Atlas, atlas_memory.?)
+        app.run = @ptrCast(*tt.Run, run_memory.?)
+        app.text = @ptrCast(*text_module.Text, text_memory.?)
+        app.fontPath = @ptrCast([*]const u8, DEFAULT_FONT)
+    }
+    app.hasText = false
+    app.label = app.allocator.alloc(128, 16).?
+    try run(&app, arguments)
+}

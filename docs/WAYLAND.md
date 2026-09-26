@@ -30,14 +30,16 @@ The XML is consumed while the Mlx standard library is bootstrapped/rebuilt. Appl
 Client code:
 
 ```mlx
+const std = @import("std")
 const wl = @import("std.wayland")
 
-pub fn main() !void {
-    var display = try wl.client.Display.connect(allocator)
+pub fn main() -> !void {
+    var display: wl.client.Display = undefined
+    try wl.client.Display.connect(&display, std.page_allocator.init())
     defer display.disconnect()
 
-    const registry = try display.getRegistry()
-    _ = registry
+    const registry = wl.displayProxy(display).getRegistry()
+    try display.roundtrip()
 
     while display.running() {
         try display.dispatch()
@@ -46,3 +48,25 @@ pub fn main() !void {
 ```
 
 Server/compositor code imports the same module and uses `wl.server`.
+
+The Linux implementation is complete: the vendored canonical XML lives in
+`std/protocols/wayland`, the materialized modules live in
+`std/src/wayland/generated`, and the client and server run over native Unix
+sockets with `SCM_RIGHTS` and memfd shared memory. They are wire-compatible
+with libwayland in both directions. See
+[`reference/wayland.md`](reference/wayland.md) for the pipeline, the runtime
+and the tests. The BSD and brixOS transports come later in the
+implementation order.
+
+GPU rendering works the same way: the stable linux-dmabuf protocol is
+materialized alongside the core and xdg-shell XML, so a Vulkan client
+(`examples/vulkan-wayland-client`) hands its frames over as dma-bufs, and
+the nested compositor (`examples/wayland-compositor --renderer vulkan`)
+composes client buffers on the GPU. Vulkan itself is native too; see
+[`VULKAN.md`](VULKAN.md).
+
+For larger programs, see
+[`examples/wayland-compositor`](../examples/wayland-compositor/README.md), a
+nested compositor with keyboard and pointer input that launches clients,
+and [`examples/wayland-terminal`](../examples/wayland-terminal/README.md), a
+terminal emulator client.

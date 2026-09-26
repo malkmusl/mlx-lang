@@ -1,16 +1,302 @@
-const wl = @import("std.wayland")
+// A minimal native Wayland compositor built on std.wayland.server.
+//
+// It advertises wl_compositor, wl_shm and xdg_wm_base, maps the clients'
+// shared-memory pools, configures xdg_toplevel windows, and on every commit
+// reads the attached buffer, releases it and completes frame callbacks.
+// Nothing is displayed: the compositor reports what it received on stdout.
+//
+//     mlx4 examples/wayland-server/main.mlx -o mini-compositor
+//     ./mini-compositor wayland-mlx          # $XDG_RUNTIME_DIR/wayland-mlx
+//     ./mini-compositor wayland-mlx --once   # exit after the first client
+//
+// It works with any Wayland client, including libwayland-based ones such as
+// wayland-info and weston-simple-shm, and with examples/wayland-client.
+
 const std = @import("std")
+const wl = @import("std.wayland")
 
-pub fn main() !void {
-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator)
-    defer arena.deinit()
+const MAX_POOLS: usize = 32
+const MAX_BUFFERS: usize = 64
+const MAX_CALLBACKS: usize = 64
 
-    var display = try wl.server.Display.init(arena.allocator())
-    defer display.deinit()
+const Compositor = struct {
+    display: wl.server.Display
+    serial: u32
+    clientsSeen: usize
+    commits: usize
+    once: bool
+    // Shared-memory pools: resource id -> mapping (one client at a time).
+    poolIds: [32]u32
+    poolMemory: [32]wl.SharedMemory
+    poolCount: usize
+    // Buffers: resource id -> (pool slot, offset, width, height, stride).
+    bufferIds: [64]u32
+    bufferPools: [64]usize
+    bufferOffsets: [64]i32
+    bufferWidths: [64]i32
+    bufferHeights: [64]i32
+    bufferStrides: [64]i32
+    bufferCount: usize
+    // Pending attach and frame callbacks of the (single) surface.
+    attachedBuffer: u32
+    callbackIds: [64]u32
+    callbackCount: usize
+}
 
-    try display.addSocket("wayland-0")
+fn compositorOf(context: *anyopaque) -> *Compositor {
+    unsafe { return @ptrCast(*Compositor, context) }
+}
 
-    while display.running() {
-        try display.dispatch()
+fn contextOf(compositor: *Compositor) -> *anyopaque {
+    unsafe { return @ptrCast(*anyopaque, compositor) }
+}
+
+fn say(text: []const u8) -> void {
+    const ignored = std.io.writeAll(std.io.stdout(), text)
+}
+
+fn sayNumber(value: usize) -> void {
+    const ignored = std.io.writeUnsigned(std.io.stdout(), value)
+}
+
+fn sayString(text: wl.String) -> void {
+    const ignored = std.io.writeString(std.io.stdout(), text)
+}
+
+// ---------------------------------------------------------------------------
+// wl_shm, wl_shm_pool, wl_buffer
+
+fn onBuffer(context: *anyopaque, request: wl.server.Request) -> void {}
+
+fn onPool(context: *anyopaque, request: wl.server.Request) -> void {
+    const compositor = compositorOf(context)
+    const decoded = wl.wl_shm_pool.decodeRequest(request)
+    if request.opcode == wl.wl_shm_pool.REQUEST_CREATE_BUFFER {
+        const created = decoded.create_buffer
+        created.id.setHandler(onBuffer, context)
+        var slot: usize = 0
+        while slot < compositor.*.poolCount && compositor.*.poolIds[slot] != request.object.id { slot += 1 }
+        if compositor.*.bufferCount < MAX_BUFFERS && slot < compositor.*.poolCount {
+            const index = compositor.*.bufferCount
+            compositor.*.bufferIds[index] = created.id.id()
+            compositor.*.bufferPools[index] = slot
+            compositor.*.bufferOffsets[index] = created.offset
+            compositor.*.bufferWidths[index] = created.width
+            compositor.*.bufferHeights[index] = created.height
+            compositor.*.bufferStrides[index] = created.stride
+            compositor.*.bufferCount += 1
+        }
     }
+}
+
+fn onShm(context: *anyopaque, request: wl.server.Request) -> void {
+    const compositor = compositorOf(context)
+    const decoded = wl.wl_shm.decodeRequest(request)
+    if request.opcode == wl.wl_shm.REQUEST_CREATE_POOL {
+        const created = decoded.create_pool
+        created.id.setHandler(onPool, context)
+        var memory: wl.SharedMemory = undefined
+        const size = @intCast(usize, created.size)
+        if compositor.*.poolCount >= MAX_POOLS || created.size <= 0 || !wl.transport.mapSharedMemory(&memory, created.fd, size, false) {
+            created.fd.close()
+            wl.wl_shm.Resource.fromObject(request.object).postError(@intFromEnum(wl.wl_shm.Error.invalid_fd), "cannot map the pool")
+            return
+        }
+        compositor.*.poolIds[compositor.*.poolCount] = created.id.id()
+        compositor.*.poolMemory[compositor.*.poolCount] = memory
+        compositor.*.poolCount += 1
+    }
+}
+
+fn bindShm(context: *anyopaque, client: wl.server.Client, object: wl.server.Object, version: u32) -> void {
+    const shm = wl.wl_shm.Resource.fromObject(object)
+    shm.setHandler(onShm, context)
+    shm.sendFormat(@intFromEnum(wl.wl_shm.Format.argb8888))
+    shm.sendFormat(@intFromEnum(wl.wl_shm.Format.xrgb8888))
+}
+
+// ---------------------------------------------------------------------------
+// wl_compositor, wl_surface, wl_region
+
+fn onRegion(context: *anyopaque, request: wl.server.Request) -> void {}
+
+// Reports the attached buffer's first and last pixel and a checksum.
+fn inspect(compositor: *Compositor, buffer_id: u32) -> void {
+    var index: usize = 0
+    while index < compositor.*.bufferCount && compositor.*.bufferIds[index] != buffer_id { index += 1 }
+    if index >= compositor.*.bufferCount { return }
+    const memory = compositor.*.poolMemory[compositor.*.bufferPools[index]]
+    const pixels = memory.bytes()
+    const offset = @intCast(usize, compositor.*.bufferOffsets[index])
+    const width = @intCast(usize, compositor.*.bufferWidths[index])
+    const height = @intCast(usize, compositor.*.bufferHeights[index])
+    const stride = @intCast(usize, compositor.*.bufferStrides[index])
+    var checksum: usize = 0
+    var y: usize = 0
+    while y < height {
+        var x: usize = 0
+        while x < width * 4 {
+            checksum = (checksum * 31 + @intCast(usize, pixels[offset + y * stride + x])) & 4294967295
+            x += 1
+        }
+        y += 1
+    }
+    say("commit buffer ")
+    sayNumber(width)
+    say("x")
+    sayNumber(height)
+    say(" checksum ")
+    sayNumber(checksum)
+    say("\n")
+}
+
+fn onSurface(context: *anyopaque, request: wl.server.Request) -> void {
+    const compositor = compositorOf(context)
+    const decoded = wl.wl_surface.decodeRequest(request)
+    if request.opcode == wl.wl_surface.REQUEST_ATTACH {
+        compositor.*.attachedBuffer = decoded.attach.buffer.id()
+    } else if request.opcode == wl.wl_surface.REQUEST_FRAME {
+        if compositor.*.callbackCount < MAX_CALLBACKS {
+            compositor.*.callbackIds[compositor.*.callbackCount] = decoded.frame.callback.id()
+            compositor.*.callbackCount += 1
+        }
+    } else if request.opcode == wl.wl_surface.REQUEST_COMMIT {
+        compositor.*.commits += 1
+        if compositor.*.attachedBuffer != 0 {
+            inspect(compositor, compositor.*.attachedBuffer)
+            const buffer = wl.wl_buffer.Resource.fromObject(wl.server.Object.{ .client = request.client, .id = compositor.*.attachedBuffer })
+            buffer.sendRelease()
+            compositor.*.attachedBuffer = 0
+        }
+        compositor.*.serial += 16
+        var index: usize = 0
+        while index < compositor.*.callbackCount {
+            const callback = wl.wl_callback.Resource.fromObject(wl.server.Object.{ .client = request.client, .id = compositor.*.callbackIds[index] })
+            callback.sendDone(compositor.*.serial)
+            index += 1
+        }
+        compositor.*.callbackCount = 0
+    }
+}
+
+fn onCompositor(context: *anyopaque, request: wl.server.Request) -> void {
+    const decoded = wl.wl_compositor.decodeRequest(request)
+    if request.opcode == wl.wl_compositor.REQUEST_CREATE_SURFACE {
+        decoded.create_surface.id.setHandler(onSurface, context)
+    } else if request.opcode == wl.wl_compositor.REQUEST_CREATE_REGION {
+        decoded.create_region.id.setHandler(onRegion, context)
+    }
+}
+
+fn bindCompositor(context: *anyopaque, client: wl.server.Client, object: wl.server.Object, version: u32) -> void {
+    wl.wl_compositor.Resource.fromObject(object).setHandler(onCompositor, context)
+}
+
+// ---------------------------------------------------------------------------
+// xdg_wm_base, xdg_surface, xdg_toplevel
+
+fn onToplevel(context: *anyopaque, request: wl.server.Request) -> void {
+    const decoded = wl.xdg_toplevel.decodeRequest(request)
+    if request.opcode == wl.xdg_toplevel.REQUEST_SET_TITLE {
+        say("title: ")
+        sayString(decoded.set_title.title)
+        say("\n")
+    } else if request.opcode == wl.xdg_toplevel.REQUEST_SET_APP_ID {
+        say("app id: ")
+        sayString(decoded.set_app_id.app_id)
+        say("\n")
+    }
+}
+
+fn onXdgSurface(context: *anyopaque, request: wl.server.Request) -> void {
+    const compositor = compositorOf(context)
+    const decoded = wl.xdg_surface.decodeRequest(request)
+    if request.opcode == wl.xdg_surface.REQUEST_GET_TOPLEVEL {
+        const toplevel = decoded.get_toplevel.id
+        toplevel.setHandler(onToplevel, context)
+        // Initial configure: size 0x0 lets the client choose.
+        const states: [4]u8 = [4]u8{ 0, 0, 0, 0 }
+        unsafe { toplevel.sendConfigure(0, 0, wl.ArrayView.{ .pointer = @ptrCast([*]const u8, &states), .length = 0 }) }
+        compositor.*.serial += 1
+        wl.xdg_surface.Resource.fromObject(request.object).sendConfigure(compositor.*.serial)
+    } else if request.opcode == wl.xdg_surface.REQUEST_ACK_CONFIGURE {
+        say("configure acknowledged\n")
+    }
+}
+
+fn onWmBase(context: *anyopaque, request: wl.server.Request) -> void {
+    const decoded = wl.xdg_wm_base.decodeRequest(request)
+    if request.opcode == wl.xdg_wm_base.REQUEST_GET_XDG_SURFACE {
+        decoded.get_xdg_surface.id.setHandler(onXdgSurface, context)
+    }
+}
+
+fn bindWmBase(context: *anyopaque, client: wl.server.Client, object: wl.server.Object, version: u32) -> void {
+    wl.xdg_wm_base.Resource.fromObject(object).setHandler(onWmBase, context)
+}
+
+// ---------------------------------------------------------------------------
+
+fn onClientCreated(context: *anyopaque, client: wl.server.Client) -> void {
+    const compositor = compositorOf(context)
+    compositor.*.clientsSeen += 1
+    say("client connected\n")
+}
+
+fn onClientDestroyed(context: *anyopaque, client: wl.server.Client) -> void {
+    const compositor = compositorOf(context)
+    var index: usize = 0
+    while index < compositor.*.poolCount {
+        const memory = compositor.*.poolMemory[index]
+        memory.release()
+        index += 1
+    }
+    compositor.*.poolCount = 0
+    compositor.*.bufferCount = 0
+    compositor.*.callbackCount = 0
+    compositor.*.attachedBuffer = 0
+    say("client disconnected\n")
+    if compositor.*.once { compositor.*.display.terminate() }
+}
+
+fn run(compositor: *Compositor, socket: std.string.String) -> !void {
+    const allocator = std.page_allocator.init()
+    var display: wl.server.Display = undefined
+    try wl.server.Display.init(&display, allocator)
+    compositor.*.display = display
+    try display.addSocket(std.string.asSlice(socket))
+    display.setClientCreatedHandler(onClientCreated, contextOf(compositor))
+    display.setClientDestroyedHandler(onClientDestroyed, contextOf(compositor))
+    const compositor_global = display.createGlobal(wl.Interface.wl_compositor, 6, bindCompositor, contextOf(compositor))
+    const shm_global = display.createGlobal(wl.Interface.wl_shm, 1, bindShm, contextOf(compositor))
+    const wm_global = display.createGlobal(wl.Interface.xdg_wm_base, 5, bindWmBase, contextOf(compositor))
+    say("listening\n")
+    while display.running() {
+        try display.dispatch(-1)
+    }
+    display.deinit()
+}
+
+pub fn main(arguments: [][*]const u8) -> !void {
+    var compositor: Compositor = undefined
+    compositor.serial = 0
+    compositor.clientsSeen = 0
+    compositor.commits = 0
+    compositor.once = false
+    compositor.poolCount = 0
+    compositor.bufferCount = 0
+    compositor.attachedBuffer = 0
+    compositor.callbackCount = 0
+    var socket = std.string.fromSlice("wayland-mlx")
+    var index: usize = 1
+    while index < std.process.count(arguments) {
+        const argument = std.process.argument(arguments, index)
+        if std.string.eql(argument, std.string.fromSlice("--once")) {
+            compositor.once = true
+        } else {
+            socket = argument
+        }
+        index += 1
+    }
+    try run(&compositor, socket)
 }

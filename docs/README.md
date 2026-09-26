@@ -33,6 +33,9 @@ exercise it:
 - [`reference/abi.md`](reference/abi.md) — the internal `mlxcc` x86_64
   calling convention and the foreign/`extern` ABI, including the raw Linux
   syscall path
+- [`reference/android.md`](reference/android.md) — the AArch64 backend,
+  `--target=aarch64-linux`/`aarch64-android`, APK packaging and signing,
+  foreign/exported functions, and `std.android`
 - [`reference/formats.md`](reference/formats.md) — ELF64 executable output,
   debug formats, and the (unimplemented) PE32+ target
 - [`reference/build-system.md`](reference/build-system.md) — the normative
@@ -42,6 +45,13 @@ exercise it:
   module by module
 - [`reference/wayland.md`](reference/wayland.md) — the Wayland protocol-AST
   pipeline and transport layer (expands [`WAYLAND.md`](WAYLAND.md))
+- [`reference/vulkan.md`](reference/vulkan.md) — `std.vulkan` materialized
+  from `vk.xml`, the driver loader and driver interface, SPIR-V and
+  `std.json` (expands [`VULKAN.md`](VULKAN.md))
+- [`reference/truetype.md`](reference/truetype.md) — `std.truetype`: TrueType
+  parsing, anti-aliased rasterization, atlas, layout, and text on Vulkan
+- [`reference/ui.md`](reference/ui.md) — `std.ui`: layout building blocks
+  (rectangles, insets, alignment, containers, stacks, reserved bars)
 - [`reference/memory-and-concurrency.md`](reference/memory-and-concurrency.md)
   — the memory model (lifetime, UB, overflow) and the atomics/TLS Stage-0 gap
 - [`reference/diagnostics-selfhost.md`](reference/diagnostics-selfhost.md) —
@@ -67,6 +77,8 @@ How the compiler itself works, normatively and concretely:
 - [`BOOTSTRAP.md`](BOOTSTRAP.md) — the Zig-to-self-hosting bootstrap chain
 - [`WAYLAND.md`](WAYLAND.md) — why Wayland is a stdlib-bootstrap protocol
   extension, not a compiler feature
+- [`VULKAN.md`](VULKAN.md) — native Vulkan without a C loader, and the
+  building blocks toward an Mlx Vulkan driver
 
 ## Keeping this documentation accurate
 

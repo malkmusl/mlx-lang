@@ -1,0 +1,395 @@
+// The monitor, through the kernel's DRM/KMS interface (legacy modesetting
+// with dumb buffers), for the DRM backend.
+//
+// open() finds the first connected connector, takes its preferred mode and
+// a CRTC that can drive it, remembers what that CRTC showed (to restore
+// it on exit), and makes two XRGB8888 dumb buffers, mapped for drawing.
+// The compositor draws a frame into the back buffer and flips to it with
+// DRM_IOCTL_MODE_PAGE_FLIP; the flip-complete event (read from the card)
+// says the frame is on screen, which paces frame callbacks to the
+// monitor's refresh. After a VT switch the CRTC is set up again (modeset).
+//
+// Structure layouts and ioctl numbers are those of <drm/drm_mode.h> on
+// 64-bit Linux.
+
+const std = @import("std")
+const device = @import("./device.mlx")
+
+const Allocator = std.allocator.Allocator
+
+const SET_MASTER: usize = 25630
+const DROP_MASTER: usize = 25631
+const GET_CAP: usize = 3222299660
+const GETRESOURCES: usize = 3225445536
+const GETCONNECTOR: usize = 3226494119
+const GETENCODER: usize = 3222561958
+const GETCRTC: usize = 3228066977
+const SETCRTC: usize = 3228066978
+const CREATE_DUMB: usize = 3223348402
+const MAP_DUMB: usize = 3222299827
+const DESTROY_DUMB: usize = 3221513396
+const ADDFB: usize = 3223086254
+const RMFB: usize = 3221513391
+const PAGE_FLIP: usize = 3222824112
+
+const CAP_DUMB_BUFFER: usize = 1
+const PAGE_FLIP_EVENT: u32 = 1
+const EVENT_FLIP_COMPLETE: u32 = 2
+const MODE_TYPE_PREFERRED: u32 = 8
+const CONNECTED: u32 = 1
+const MODE_SIZE: usize = 68
+const CRTC_SIZE: usize = 104
+
+pub const Output = struct {
+    card: device.Device
+    connector: u32
+    crtc: u32
+    mode: [68]u8
+    width: usize
+    height: usize
+    refresh: u32
+    // The two dumb buffers: kernel handle, framebuffer, row pitch, size
+    // and our mapping.
+    handles: [2]u32
+    framebuffers: [2]u32
+    pitches: [2]usize
+    sizes: [2]usize
+    addresses: [2]usize
+    // The buffer to draw the next frame into.
+    back: usize
+    flipPending: bool
+    // The CRTC as it was before us (struct drm_mode_crtc).
+    saved: [104]u8
+    // The CRTC has to be set up (first frame, after a VT switch).
+    needsModeset: bool
+}
+
+fn bytesOf(output: *Output, field: usize) -> [*]u8 {
+    unsafe { return @ptrFromInt([*]u8, @intFromPtr(output) + field) }
+}
+
+fn modeOf(output: *Output) -> [*]u8 { return bytesOf(output, @offsetOf(Output, "mode")) }
+fn savedOf(output: *Output) -> [*]u8 { return bytesOf(output, @offsetOf(Output, "saved")) }
+
+fn cardOf(output: *Output) -> *device.Device {
+    unsafe { return @ptrFromInt(*device.Device, @intFromPtr(output) + @offsetOf(Output, "card")) }
+}
+
+fn call(output: *Output, request: usize, argument: [*]u8, size: usize) -> bool {
+    return device.ioctl(cardOf(output), request, argument, size) >= 0
+}
+
+fn allocateWords(allocator: Allocator, count: usize) -> [*]u8 {
+    const size = if count == 0 { 8 } else { count * 4 }
+    return allocator.alloc(size, 8).?
+}
+
+// Picks the CRTC for `connector`: its current encoder's, else the first
+// one an encoder of it can drive. 0 when none.
+fn pickCrtc(output: *Output, connector: [*]u8, encoders: [*]u8, encoder_count: usize, crtcs: [*]u8, crtc_count: usize) -> u32 {
+    var encoder: [20]u8 = undefined
+    var encoder_bytes: [*]u8 = undefined
+    unsafe { encoder_bytes = @ptrCast([*]u8, &encoder) }
+    const current = device.load32(connector, 44)
+    if current != 0 {
+        device.zero(encoder_bytes, 20)
+        device.store32(encoder_bytes, 0, current)
+        if call(output, GETENCODER, encoder_bytes, 20) && device.load32(encoder_bytes, 8) != 0 { return device.load32(encoder_bytes, 8) }
+    }
+    var index: usize = 0
+    while index < encoder_count {
+        device.zero(encoder_bytes, 20)
+        device.store32(encoder_bytes, 0, device.load32(encoders, index * 4))
+        if call(output, GETENCODER, encoder_bytes, 20) {
+            const possible = device.load32(encoder_bytes, 12)
+            var crtc: usize = 0
+            while crtc < crtc_count && crtc < 32 {
+                if possible & (@intCast(u32, 1) << @intCast(u32, crtc)) != 0 { return device.load32(crtcs, crtc * 4) }
+                crtc += 1
+            }
+        }
+        index += 1
+    }
+    return 0
+}
+
+// Looks at one connector: when it is connected and a CRTC can drive it,
+// takes it with its preferred mode. True when taken.
+fn tryConnector(output: *Output, allocator: Allocator, id: u32, crtcs: [*]u8, crtc_count: usize) -> bool {
+    var connector: [80]u8 = undefined
+    var bytes: [*]u8 = undefined
+    unsafe { bytes = @ptrCast([*]u8, &connector) }
+    device.zero(bytes, 80)
+    device.store32(bytes, 48, id)
+    if !call(output, GETCONNECTOR, bytes, 80) { return false }
+    const mode_count = @intCast(usize, device.load32(bytes, 32))
+    const encoder_count = @intCast(usize, device.load32(bytes, 40))
+    if device.load32(bytes, 60) != CONNECTED || mode_count == 0 { return false }
+    const modes = allocator.alloc(mode_count * MODE_SIZE, 8).?
+    const encoders = allocateWords(allocator, encoder_count)
+    device.store64(bytes, 0, @intFromPtr(encoders))
+    device.store64(bytes, 8, @intFromPtr(modes))
+    device.store64(bytes, 16, 0)
+    device.store64(bytes, 24, 0)
+    device.store32(bytes, 36, 0)
+    var taken = false
+    if call(output, GETCONNECTOR, bytes, 80) {
+        // The kernel reports how many it wrote (no more than we had room for).
+        var count = @intCast(usize, device.load32(bytes, 32))
+        if count > mode_count { count = mode_count }
+        var chosen: usize = 0
+        var index: usize = 0
+        while index < count {
+            if device.load32(modes, index * MODE_SIZE + 32) & MODE_TYPE_PREFERRED != 0 {
+                chosen = index
+                break
+            }
+            index += 1
+        }
+        var usable_encoders = @intCast(usize, device.load32(bytes, 40))
+        if usable_encoders > encoder_count { usable_encoders = encoder_count }
+        const crtc = pickCrtc(output, bytes, encoders, usable_encoders, crtcs, crtc_count)
+        if count > 0 && crtc != 0 {
+            const mode = modeOf(output)
+            index = 0
+            while index < MODE_SIZE {
+                mode[index] = modes[chosen * MODE_SIZE + index]
+                index += 1
+            }
+            output.*.connector = id
+            output.*.crtc = crtc
+            output.*.width = @intCast(usize, device.load16(modes, chosen * MODE_SIZE + 4))
+            output.*.height = @intCast(usize, device.load16(modes, chosen * MODE_SIZE + 14))
+            output.*.refresh = device.load32(modes, chosen * MODE_SIZE + 24)
+            taken = true
+        }
+    }
+    allocator.free(modes, mode_count * MODE_SIZE, 8)
+    allocator.free(encoders, if encoder_count == 0 { 8 } else { encoder_count * 4 }, 8)
+    return taken
+}
+
+fn createBuffer(output: *Output, index: usize) -> bool {
+    var create: [32]u8 = undefined
+    var bytes: [*]u8 = undefined
+    unsafe { bytes = @ptrCast([*]u8, &create) }
+    device.zero(bytes, 32)
+    device.store32(bytes, 0, @intCast(u32, output.*.height))
+    device.store32(bytes, 4, @intCast(u32, output.*.width))
+    device.store32(bytes, 8, 32)
+    if !call(output, CREATE_DUMB, bytes, 32) { return false }
+    output.*.handles[index] = device.load32(bytes, 16)
+    output.*.pitches[index] = @intCast(usize, device.load32(bytes, 20))
+    output.*.sizes[index] = device.load64(bytes, 24)
+
+    var framebuffer: [28]u8 = undefined
+    var fb_bytes: [*]u8 = undefined
+    unsafe { fb_bytes = @ptrCast([*]u8, &framebuffer) }
+    device.zero(fb_bytes, 28)
+    device.store32(fb_bytes, 4, @intCast(u32, output.*.width))
+    device.store32(fb_bytes, 8, @intCast(u32, output.*.height))
+    device.store32(fb_bytes, 12, @intCast(u32, output.*.pitches[index]))
+    device.store32(fb_bytes, 16, 32)
+    device.store32(fb_bytes, 20, 24)
+    device.store32(fb_bytes, 24, output.*.handles[index])
+    if !call(output, ADDFB, fb_bytes, 28) { return false }
+    output.*.framebuffers[index] = device.load32(fb_bytes, 0)
+
+    var map: [16]u8 = undefined
+    var map_bytes: [*]u8 = undefined
+    unsafe { map_bytes = @ptrCast([*]u8, &map) }
+    device.zero(map_bytes, 16)
+    device.store32(map_bytes, 0, output.*.handles[index])
+    if !call(output, MAP_DUMB, map_bytes, 16) { return false }
+    output.*.addresses[index] = device.mapBuffer(cardOf(output), device.load64(map_bytes, 8), output.*.sizes[index])
+    return output.*.addresses[index] != 0
+}
+
+// Sets `output` up on the card `descriptor` (owned from now on). False
+// when it has no connected monitor or cannot show buffers.
+pub fn open(output: *Output, descriptor: isize, allocator: Allocator) -> bool {
+    device.init(cardOf(output), descriptor, allocator)
+    output.*.handles[0] = 0
+    output.*.handles[1] = 0
+    output.*.framebuffers[0] = 0
+    output.*.framebuffers[1] = 0
+    output.*.addresses[0] = 0
+    output.*.addresses[1] = 0
+    output.*.back = 0
+    output.*.flipPending = false
+    output.*.needsModeset = true
+    output.*.connector = 0
+    // Without logind the first opener is DRM master already, or becomes it.
+    var none: [8]u8 = undefined
+    var none_bytes: [*]u8 = undefined
+    unsafe { none_bytes = @ptrCast([*]u8, &none) }
+    const master = device.ioctl(cardOf(output), SET_MASTER, none_bytes, 0)
+
+    var capability: [16]u8 = undefined
+    var capability_bytes: [*]u8 = undefined
+    unsafe { capability_bytes = @ptrCast([*]u8, &capability) }
+    device.zero(capability_bytes, 16)
+    device.store64(capability_bytes, 0, CAP_DUMB_BUFFER)
+    if !call(output, GET_CAP, capability_bytes, 16) || device.load64(capability_bytes, 8) == 0 { return false }
+
+    var resources: [64]u8 = undefined
+    var bytes: [*]u8 = undefined
+    unsafe { bytes = @ptrCast([*]u8, &resources) }
+    device.zero(bytes, 64)
+    if !call(output, GETRESOURCES, bytes, 64) { return false }
+    const crtc_count = @intCast(usize, device.load32(bytes, 36))
+    const connector_count = @intCast(usize, device.load32(bytes, 40))
+    const encoder_count = @intCast(usize, device.load32(bytes, 44))
+    const crtcs = allocateWords(allocator, crtc_count)
+    const connectors = allocateWords(allocator, connector_count)
+    const encoders = allocateWords(allocator, encoder_count)
+    device.zero(bytes, 64)
+    device.store64(bytes, 8, @intFromPtr(crtcs))
+    device.store64(bytes, 16, @intFromPtr(connectors))
+    device.store64(bytes, 24, @intFromPtr(encoders))
+    device.store32(bytes, 36, @intCast(u32, crtc_count))
+    device.store32(bytes, 40, @intCast(u32, connector_count))
+    device.store32(bytes, 44, @intCast(u32, encoder_count))
+    var found = false
+    if call(output, GETRESOURCES, bytes, 64) {
+        var index: usize = 0
+        while index < connector_count && !found {
+            found = tryConnector(output, allocator, device.load32(connectors, index * 4), crtcs, crtc_count)
+            index += 1
+        }
+    }
+    allocator.free(crtcs, if crtc_count == 0 { 8 } else { crtc_count * 4 }, 8)
+    allocator.free(connectors, if connector_count == 0 { 8 } else { connector_count * 4 }, 8)
+    allocator.free(encoders, if encoder_count == 0 { 8 } else { encoder_count * 4 }, 8)
+    if !found { return false }
+
+    // What the CRTC shows now, for restore().
+    device.zero(savedOf(output), CRTC_SIZE)
+    device.store32(savedOf(output), 12, output.*.crtc)
+    if !call(output, GETCRTC, savedOf(output), CRTC_SIZE) { device.zero(savedOf(output), CRTC_SIZE) }
+
+    return createBuffer(output, 0) && createBuffer(output, 1)
+}
+
+// The card's descriptor (to wait for flip events).
+pub fn descriptor(output: *const Output) -> isize { return output.*.card.descriptor }
+
+// Where the next frame goes: its address and row pitch in bytes.
+pub fn backAddress(output: *const Output) -> usize { return output.*.addresses[output.*.back] }
+pub fn backPitch(output: *const Output) -> usize { return output.*.pitches[output.*.back] }
+
+fn setCrtc(output: *Output, framebuffer: u32, mode: [*]const u8, mode_valid: bool) -> bool {
+    var crtc: [104]u8 = undefined
+    var bytes: [*]u8 = undefined
+    unsafe { bytes = @ptrCast([*]u8, &crtc) }
+    device.zero(bytes, CRTC_SIZE)
+    var connectors: [2]u32 = [2]u32{ output.*.connector, 0 }
+    unsafe { device.store64(bytes, 0, @intFromPtr(@ptrCast([*]u32, &connectors))) }
+    device.store32(bytes, 8, if framebuffer == 0 { 0 } else { 1 })
+    device.store32(bytes, 12, output.*.crtc)
+    device.store32(bytes, 16, framebuffer)
+    device.store32(bytes, 32, if mode_valid { 1 } else { 0 })
+    var index: usize = 0
+    while index < MODE_SIZE {
+        bytes[36 + index] = mode[index]
+        index += 1
+    }
+    return call(output, SETCRTC, bytes, CRTC_SIZE)
+}
+
+// Shows the back buffer. The first time (and after a VT switch) that sets
+// the CRTC up and is on screen at once; otherwise it is a page flip, done
+// when its event arrives (true either way when it worked). `shown` is
+// true when the frame is already on screen.
+pub fn present(output: *Output, shown: *bool) -> bool {
+    shown.* = false
+    const framebuffer = output.*.framebuffers[output.*.back]
+    if output.*.needsModeset {
+        if !setCrtc(output, framebuffer, modeOf(output), true) { return false }
+        output.*.needsModeset = false
+        output.*.flipPending = false
+        output.*.back = 1 - output.*.back
+        shown.* = true
+        return true
+    }
+    var flip: [24]u8 = undefined
+    var bytes: [*]u8 = undefined
+    unsafe { bytes = @ptrCast([*]u8, &flip) }
+    device.zero(bytes, 24)
+    device.store32(bytes, 0, output.*.crtc)
+    device.store32(bytes, 4, framebuffer)
+    device.store32(bytes, 8, PAGE_FLIP_EVENT)
+    device.store64(bytes, 16, @intCast(usize, framebuffer))
+    if !call(output, PAGE_FLIP, bytes, 24) { return false }
+    output.*.flipPending = true
+    output.*.back = 1 - output.*.back
+    return true
+}
+
+// Reads the card's events. True when a flip completed (the last presented
+// frame is on screen); `milliseconds` is its time.
+pub fn readEvents(output: *Output, milliseconds: *u32) -> bool {
+    var buffer: [1024]u8 = undefined
+    var bytes: [*]u8 = undefined
+    unsafe { bytes = @ptrCast([*]u8, &buffer) }
+    var flipped = false
+    while true {
+        const count = device.read(cardOf(output), bytes, 1024)
+        if count <= 0 { break }
+        var at: usize = 0
+        const total = @bitCast(usize, count)
+        while at + 8 <= total {
+            const kind = device.load32(bytes, at)
+            const length = @intCast(usize, device.load32(bytes, at + 4))
+            if length < 8 || at + length > total { break }
+            if kind == EVENT_FLIP_COMPLETE && length >= 32 {
+                output.*.flipPending = false
+                flipped = true
+                const seconds = device.load32(bytes, at + 16)
+                const microseconds = device.load32(bytes, at + 20)
+                milliseconds.* = seconds *% 1000 +% microseconds / 1000
+            }
+            at += length
+        }
+    }
+    return flipped
+}
+
+// After the session comes back to the foreground: the CRTC is set up again
+// with the next frame, and no flip is outstanding any more.
+pub fn resume(output: *Output) -> void {
+    output.*.needsModeset = true
+    output.*.flipPending = false
+}
+
+// Puts back what the CRTC showed before us, and frees our buffers.
+pub fn close(output: *Output, allocator: Allocator) -> void {
+    const saved = savedOf(output)
+    const saved_framebuffer = device.load32(saved, 16)
+    var mode_bytes: [*]const u8 = undefined
+    unsafe { mode_bytes = @ptrFromInt([*]const u8, @intFromPtr(saved) + 36) }
+    const restored = setCrtc(output, saved_framebuffer, mode_bytes, device.load32(saved, 32) != 0)
+    var index: usize = 0
+    while index < 2 {
+        var word: [8]u8 = undefined
+        var bytes: [*]u8 = undefined
+        unsafe { bytes = @ptrCast([*]u8, &word) }
+        device.unmap(output.*.addresses[index], output.*.sizes[index])
+        if output.*.framebuffers[index] != 0 {
+            device.zero(bytes, 8)
+            device.store32(bytes, 0, output.*.framebuffers[index])
+            const removed = call(output, RMFB, bytes, 4)
+        }
+        if output.*.handles[index] != 0 {
+            device.zero(bytes, 8)
+            device.store32(bytes, 0, output.*.handles[index])
+            const destroyed = call(output, DESTROY_DUMB, bytes, 4)
+        }
+        index += 1
+    }
+    var none: [8]u8 = undefined
+    var none_bytes: [*]u8 = undefined
+    unsafe { none_bytes = @ptrCast([*]u8, &none) }
+    const dropped = device.ioctl(cardOf(output), DROP_MASTER, none_bytes, 0)
+    device.deinit(cardOf(output), allocator)
+}

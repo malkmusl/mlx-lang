@@ -1,0 +1,609 @@
+// std.xml: allocation-free XML 1.0 pull tokenizer plus entity decoding.
+//
+// The tokenizer borrows the source bytes and reports one token at a time.
+// Element nesting is tracked in fixed storage inside the tokenizer so that
+// end tags are checked against their start tags without heap allocation.
+// Text, attribute values and comments are reported raw; `decode`/`decodeAlloc`
+// expand the five predefined entities and numeric character references into
+// caller-provided or explicitly allocated storage.
+//
+// A start tag produces `elementStart`, one `attribute` token per attribute,
+// and — for `<name/>` — an immediate `elementEnd` whose `selfClosing` flag is
+// set. Every other token kind maps directly onto an XML construct.
+
+const allocator_module = @import("../bootstrap/allocator.mlx")
+const string = @import("../bootstrap/string.mlx")
+
+pub const Allocator = allocator_module.Allocator
+pub const String = string.String
+
+pub const MAX_DEPTH: usize = 64
+
+pub const TokenKind = enum(u8) {
+    endOfDocument,
+    declaration,
+    processingInstruction,
+    doctype,
+    comment,
+    elementStart,
+    attribute,
+    elementEnd,
+    text,
+    cdata,
+    invalid
+}
+
+pub const ErrorCode = enum(u8) {
+    none,
+    unexpectedEnd,
+    invalidName,
+    expectedEquals,
+    expectedQuote,
+    invalidAttributeValue,
+    duplicateAttribute,
+    unexpectedCharacter,
+    mismatchedEndTag,
+    unexpectedEndTag,
+    tooDeep,
+    contentOutsideRoot,
+    multipleRoots,
+    invalidComment,
+    misplacedDeclaration,
+    missingRoot,
+    unclosedElement,
+    invalidReference
+}
+
+pub const Token = struct {
+    kind: TokenKind
+    name: String
+    value: String
+    offset: usize
+    selfClosing: bool
+}
+
+const STATE_CONTENT: u8 = 0
+const STATE_START_TAG: u8 = 1
+const STATE_SELF_CLOSE: u8 = 2
+const STATE_DONE: u8 = 3
+
+pub const Tokenizer = struct {
+    source: [*]const u8
+    length: usize
+    position: usize
+    state: u8
+    depth: usize
+    nameStarts: [64]usize
+    nameLengths: [64]usize
+    attributeStarts: [64]usize
+    attributeLengths: [64]usize
+    attributeCount: usize
+    sawRoot: bool
+    sawAnything: bool
+    errorCode: ErrorCode
+    errorOffset: usize
+}
+
+// Initializes a tokenizer in place. The source must outlive every token.
+pub fn initAt(tokenizer: *Tokenizer, source: [*]const u8, length: usize) -> void {
+    tokenizer.*.source = source
+    tokenizer.*.length = length
+    tokenizer.*.position = 0
+    tokenizer.*.state = STATE_CONTENT
+    tokenizer.*.depth = 0
+    tokenizer.*.attributeCount = 0
+    tokenizer.*.sawRoot = false
+    tokenizer.*.sawAnything = false
+    tokenizer.*.errorCode = ErrorCode.none
+    tokenizer.*.errorOffset = 0
+    // A UTF-8 byte order mark is permitted before the document.
+    if length >= 3 && source[0] == 239 && source[1] == 187 && source[2] == 191 {
+        tokenizer.*.position = 3
+    }
+}
+
+pub fn initString(tokenizer: *Tokenizer, source: String) -> void {
+    initAt(tokenizer, source.pointer, source.length)
+}
+
+pub fn failed(tokenizer: *const Tokenizer) -> bool {
+    return tokenizer.*.errorCode != ErrorCode.none
+}
+
+pub fn errorCode(tokenizer: *const Tokenizer) -> ErrorCode {
+    return tokenizer.*.errorCode
+}
+
+pub fn errorOffset(tokenizer: *const Tokenizer) -> usize {
+    return tokenizer.*.errorOffset
+}
+
+pub fn depth(tokenizer: *const Tokenizer) -> usize {
+    return tokenizer.*.depth
+}
+
+// 1-based line number of a byte offset in the tokenizer's source.
+pub fn lineOf(tokenizer: *const Tokenizer, offset: usize) -> usize {
+    var line: usize = 1
+    var index: usize = 0
+    while index < offset && index < tokenizer.*.length {
+        if tokenizer.*.source[index] == 10 { line += 1 }
+        index += 1
+    }
+    return line
+}
+
+// 1-based column (in bytes) of a byte offset in the tokenizer's source.
+pub fn columnOf(tokenizer: *const Tokenizer, offset: usize) -> usize {
+    var column: usize = 1
+    var index: usize = 0
+    while index < offset && index < tokenizer.*.length {
+        if tokenizer.*.source[index] == 10 {
+            column = 1
+        } else {
+            column += 1
+        }
+        index += 1
+    }
+    return column
+}
+
+pub fn errorMessage(code: ErrorCode) -> []const u8 {
+    return match code {
+        .none => "no error",
+        .unexpectedEnd => "unexpected end of document",
+        .invalidName => "invalid XML name",
+        .expectedEquals => "expected '=' after attribute name",
+        .expectedQuote => "expected quoted attribute value",
+        .invalidAttributeValue => "'<' is not allowed in an attribute value",
+        .duplicateAttribute => "duplicate attribute on one element",
+        .unexpectedCharacter => "unexpected character",
+        .mismatchedEndTag => "end tag does not match the open element",
+        .unexpectedEndTag => "end tag without an open element",
+        .tooDeep => "element nesting exceeds the tokenizer depth limit",
+        .contentOutsideRoot => "character data outside the root element",
+        .multipleRoots => "document has more than one root element",
+        .invalidComment => "'--' is not allowed inside a comment",
+        .misplacedDeclaration => "XML declaration must start the document",
+        .missingRoot => "document has no root element",
+        .unclosedElement => "document ended inside an open element",
+        .invalidReference => "invalid entity or character reference"
+    }
+}
+
+fn isWhitespace(byte: u8) -> bool {
+    return byte == 32 || byte == 9 || byte == 10 || byte == 13
+}
+
+fn isNameStart(byte: u8) -> bool {
+    if byte >= 97 && byte <= 122 { return true }
+    if byte >= 65 && byte <= 90 { return true }
+    if byte == 95 || byte == 58 { return true }
+    return byte >= 128
+}
+
+fn isNameByte(byte: u8) -> bool {
+    if isNameStart(byte) { return true }
+    if byte >= 48 && byte <= 57 { return true }
+    return byte == 45 || byte == 46
+}
+
+fn slice(tokenizer: *const Tokenizer, start: usize, end: usize) -> String {
+    unsafe {
+        return string.fromParts(@ptrFromInt([*]const u8, @intFromPtr(tokenizer.*.source) + start), end - start)
+    }
+}
+
+fn emptyString(tokenizer: *const Tokenizer) -> String {
+    return string.fromParts(tokenizer.*.source, 0)
+}
+
+fn fail(tokenizer: *Tokenizer, token: *Token, code: ErrorCode, offset: usize) -> bool {
+    tokenizer.*.errorCode = code
+    tokenizer.*.errorOffset = offset
+    tokenizer.*.state = STATE_DONE
+    token.*.kind = TokenKind.invalid
+    token.*.name = emptyString(tokenizer)
+    token.*.value = emptyString(tokenizer)
+    token.*.offset = offset
+    token.*.selfClosing = false
+    return false
+}
+
+fn emit(tokenizer: *Tokenizer, token: *Token, kind: TokenKind, name: String, value: String, offset: usize) -> bool {
+    token.*.kind = kind
+    token.*.name = name
+    token.*.value = value
+    token.*.offset = offset
+    token.*.selfClosing = false
+    tokenizer.*.sawAnything = true
+    return true
+}
+
+fn startsWithAt(tokenizer: *const Tokenizer, position: usize, literal: []const u8) -> bool {
+    var index: usize = 0
+    for byte in literal {
+        if position + index >= tokenizer.*.length { return false }
+        if tokenizer.*.source[position + index] != byte { return false }
+        index += 1
+    }
+    return true
+}
+
+// Returns the end of the name starting at `start`, or `start` when no valid
+// name begins there.
+fn scanName(tokenizer: *const Tokenizer, start: usize) -> usize {
+    if start >= tokenizer.*.length { return start }
+    if !isNameStart(tokenizer.*.source[start]) { return start }
+    var position = start + 1
+    while position < tokenizer.*.length && isNameByte(tokenizer.*.source[position]) {
+        position += 1
+    }
+    return position
+}
+
+fn skipWhitespace(tokenizer: *Tokenizer) -> void {
+    while tokenizer.*.position < tokenizer.*.length && isWhitespace(tokenizer.*.source[tokenizer.*.position]) {
+        tokenizer.*.position += 1
+    }
+}
+
+// Finds `terminator` at or after `start`; returns the length on failure.
+fn find(tokenizer: *const Tokenizer, start: usize, terminator: []const u8) -> usize {
+    var position = start
+    while position < tokenizer.*.length {
+        if startsWithAt(tokenizer, position, terminator) { return position }
+        position += 1
+    }
+    return tokenizer.*.length
+}
+
+fn sameName(tokenizer: *const Tokenizer, left_start: usize, left_length: usize, right_start: usize, right_length: usize) -> bool {
+    if left_length != right_length { return false }
+    var index: usize = 0
+    while index < left_length {
+        if tokenizer.*.source[left_start + index] != tokenizer.*.source[right_start + index] { return false }
+        index += 1
+    }
+    return true
+}
+
+// Reads the next token. Returns false once the document has ended (the token
+// kind is then `endOfDocument`) or a well-formedness error was found (the
+// token kind is then `invalid`; see `errorCode`/`errorOffset`).
+pub fn next(tokenizer: *Tokenizer, token: *Token) -> bool {
+    if tokenizer.*.state == STATE_DONE {
+        if tokenizer.*.errorCode != ErrorCode.none { return fail(tokenizer, token, tokenizer.*.errorCode, tokenizer.*.errorOffset) }
+        const ignored = emit(tokenizer, token, TokenKind.endOfDocument, emptyString(tokenizer), emptyString(tokenizer), tokenizer.*.length)
+        return false
+    }
+    if tokenizer.*.state == STATE_SELF_CLOSE {
+        const top = tokenizer.*.depth - 1
+        const name = slice(tokenizer, tokenizer.*.nameStarts[top], tokenizer.*.nameStarts[top] + tokenizer.*.nameLengths[top])
+        tokenizer.*.depth -= 1
+        tokenizer.*.state = STATE_CONTENT
+        const ignored = emit(tokenizer, token, TokenKind.elementEnd, name, emptyString(tokenizer), tokenizer.*.position)
+        token.*.selfClosing = true
+        return true
+    }
+    if tokenizer.*.state == STATE_START_TAG {
+        return nextInStartTag(tokenizer, token)
+    }
+    return nextInContent(tokenizer, token)
+}
+
+fn nextInStartTag(tokenizer: *Tokenizer, token: *Token) -> bool {
+    const before = tokenizer.*.position
+    skipWhitespace(tokenizer)
+    const position = tokenizer.*.position
+    if position >= tokenizer.*.length { return fail(tokenizer, token, ErrorCode.unexpectedEnd, position) }
+    const byte = tokenizer.*.source[position]
+    if byte == 62 {
+        tokenizer.*.position = position + 1
+        tokenizer.*.state = STATE_CONTENT
+        return nextInContent(tokenizer, token)
+    }
+    if byte == 47 {
+        if position + 1 >= tokenizer.*.length { return fail(tokenizer, token, ErrorCode.unexpectedEnd, position) }
+        if tokenizer.*.source[position + 1] != 62 { return fail(tokenizer, token, ErrorCode.unexpectedCharacter, position + 1) }
+        tokenizer.*.position = position + 2
+        tokenizer.*.state = STATE_SELF_CLOSE
+        return next(tokenizer, token)
+    }
+    // Attributes must be separated from the element name and from each other.
+    if before == position { return fail(tokenizer, token, ErrorCode.unexpectedCharacter, position) }
+    const name_end = scanName(tokenizer, position)
+    if name_end == position { return fail(tokenizer, token, ErrorCode.invalidName, position) }
+    var index: usize = 0
+    while index < tokenizer.*.attributeCount {
+        if sameName(tokenizer, tokenizer.*.attributeStarts[index], tokenizer.*.attributeLengths[index], position, name_end - position) {
+            return fail(tokenizer, token, ErrorCode.duplicateAttribute, position)
+        }
+        index += 1
+    }
+    if tokenizer.*.attributeCount < MAX_DEPTH {
+        tokenizer.*.attributeStarts[tokenizer.*.attributeCount] = position
+        tokenizer.*.attributeLengths[tokenizer.*.attributeCount] = name_end - position
+        tokenizer.*.attributeCount += 1
+    }
+    tokenizer.*.position = name_end
+    skipWhitespace(tokenizer)
+    if tokenizer.*.position >= tokenizer.*.length { return fail(tokenizer, token, ErrorCode.unexpectedEnd, tokenizer.*.position) }
+    if tokenizer.*.source[tokenizer.*.position] != 61 { return fail(tokenizer, token, ErrorCode.expectedEquals, tokenizer.*.position) }
+    tokenizer.*.position += 1
+    skipWhitespace(tokenizer)
+    if tokenizer.*.position >= tokenizer.*.length { return fail(tokenizer, token, ErrorCode.unexpectedEnd, tokenizer.*.position) }
+    const quote = tokenizer.*.source[tokenizer.*.position]
+    if quote != 34 && quote != 39 { return fail(tokenizer, token, ErrorCode.expectedQuote, tokenizer.*.position) }
+    const value_start = tokenizer.*.position + 1
+    var value_end = value_start
+    while value_end < tokenizer.*.length && tokenizer.*.source[value_end] != quote {
+        if tokenizer.*.source[value_end] == 60 { return fail(tokenizer, token, ErrorCode.invalidAttributeValue, value_end) }
+        value_end += 1
+    }
+    if value_end >= tokenizer.*.length { return fail(tokenizer, token, ErrorCode.unexpectedEnd, value_end) }
+    if !validReferences(tokenizer, value_start, value_end) { return fail(tokenizer, token, ErrorCode.invalidReference, value_start) }
+    tokenizer.*.position = value_end + 1
+    return emit(tokenizer, token, TokenKind.attribute, slice(tokenizer, position, name_end), slice(tokenizer, value_start, value_end), position)
+}
+
+fn nextInContent(tokenizer: *Tokenizer, token: *Token) -> bool {
+    const start = tokenizer.*.position
+    if start >= tokenizer.*.length {
+        if tokenizer.*.depth > 0 { return fail(tokenizer, token, ErrorCode.unclosedElement, start) }
+        if !tokenizer.*.sawRoot { return fail(tokenizer, token, ErrorCode.missingRoot, start) }
+        tokenizer.*.state = STATE_DONE
+        const ignored = emit(tokenizer, token, TokenKind.endOfDocument, emptyString(tokenizer), emptyString(tokenizer), start)
+        return false
+    }
+    if tokenizer.*.source[start] != 60 {
+        var end = start
+        var only_whitespace = true
+        while end < tokenizer.*.length && tokenizer.*.source[end] != 60 {
+            if !isWhitespace(tokenizer.*.source[end]) { only_whitespace = false }
+            end += 1
+        }
+        if tokenizer.*.depth == 0 && !only_whitespace { return fail(tokenizer, token, ErrorCode.contentOutsideRoot, start) }
+        if !validReferences(tokenizer, start, end) { return fail(tokenizer, token, ErrorCode.invalidReference, start) }
+        tokenizer.*.position = end
+        return emit(tokenizer, token, TokenKind.text, emptyString(tokenizer), slice(tokenizer, start, end), start)
+    }
+    if startsWithAt(tokenizer, start, "<!--") {
+        const end = find(tokenizer, start + 4, "--")
+        if end >= tokenizer.*.length { return fail(tokenizer, token, ErrorCode.unexpectedEnd, start) }
+        if !startsWithAt(tokenizer, end, "-->") { return fail(tokenizer, token, ErrorCode.invalidComment, end) }
+        tokenizer.*.position = end + 3
+        return emit(tokenizer, token, TokenKind.comment, emptyString(tokenizer), slice(tokenizer, start + 4, end), start)
+    }
+    if startsWithAt(tokenizer, start, "<![CDATA[") {
+        if tokenizer.*.depth == 0 { return fail(tokenizer, token, ErrorCode.contentOutsideRoot, start) }
+        const end = find(tokenizer, start + 9, "]]>")
+        if end >= tokenizer.*.length { return fail(tokenizer, token, ErrorCode.unexpectedEnd, start) }
+        tokenizer.*.position = end + 3
+        return emit(tokenizer, token, TokenKind.cdata, emptyString(tokenizer), slice(tokenizer, start + 9, end), start)
+    }
+    if startsWithAt(tokenizer, start, "<!DOCTYPE") {
+        if tokenizer.*.sawRoot || tokenizer.*.depth > 0 { return fail(tokenizer, token, ErrorCode.unexpectedCharacter, start) }
+        // Internal subsets are bracketed; skip to the matching '>'.
+        var position = start + 9
+        var bracket = false
+        while position < tokenizer.*.length {
+            const byte = tokenizer.*.source[position]
+            if byte == 91 { bracket = true }
+            if byte == 93 { bracket = false }
+            if byte == 62 && !bracket { break }
+            position += 1
+        }
+        if position >= tokenizer.*.length { return fail(tokenizer, token, ErrorCode.unexpectedEnd, start) }
+        tokenizer.*.position = position + 1
+        return emit(tokenizer, token, TokenKind.doctype, emptyString(tokenizer), slice(tokenizer, start + 9, position), start)
+    }
+    if startsWithAt(tokenizer, start, "<?") {
+        const name_end = scanName(tokenizer, start + 2)
+        if name_end == start + 2 { return fail(tokenizer, token, ErrorCode.invalidName, start + 2) }
+        const end = find(tokenizer, name_end, "?>")
+        if end >= tokenizer.*.length { return fail(tokenizer, token, ErrorCode.unexpectedEnd, start) }
+        const name = slice(tokenizer, start + 2, name_end)
+        var content_start = name_end
+        while content_start < end && isWhitespace(tokenizer.*.source[content_start]) { content_start += 1 }
+        tokenizer.*.position = end + 2
+        if string.eql(name, string.fromSlice("xml")) {
+            if start != 0 && !(start == 3 && tokenizer.*.source[0] == 239) { return fail(tokenizer, token, ErrorCode.misplacedDeclaration, start) }
+            return emit(tokenizer, token, TokenKind.declaration, name, slice(tokenizer, content_start, end), start)
+        }
+        return emit(tokenizer, token, TokenKind.processingInstruction, name, slice(tokenizer, content_start, end), start)
+    }
+    if startsWithAt(tokenizer, start, "</") {
+        const name_end = scanName(tokenizer, start + 2)
+        if name_end == start + 2 { return fail(tokenizer, token, ErrorCode.invalidName, start + 2) }
+        if tokenizer.*.depth == 0 { return fail(tokenizer, token, ErrorCode.unexpectedEndTag, start) }
+        const top = tokenizer.*.depth - 1
+        if !sameName(tokenizer, tokenizer.*.nameStarts[top], tokenizer.*.nameLengths[top], start + 2, name_end - start - 2) {
+            return fail(tokenizer, token, ErrorCode.mismatchedEndTag, start)
+        }
+        tokenizer.*.position = name_end
+        skipWhitespace(tokenizer)
+        if tokenizer.*.position >= tokenizer.*.length { return fail(tokenizer, token, ErrorCode.unexpectedEnd, tokenizer.*.position) }
+        if tokenizer.*.source[tokenizer.*.position] != 62 { return fail(tokenizer, token, ErrorCode.unexpectedCharacter, tokenizer.*.position) }
+        tokenizer.*.position += 1
+        tokenizer.*.depth -= 1
+        return emit(tokenizer, token, TokenKind.elementEnd, slice(tokenizer, start + 2, name_end), emptyString(tokenizer), start)
+    }
+    const name_end = scanName(tokenizer, start + 1)
+    if name_end == start + 1 { return fail(tokenizer, token, ErrorCode.invalidName, start + 1) }
+    if tokenizer.*.depth == 0 {
+        if tokenizer.*.sawRoot { return fail(tokenizer, token, ErrorCode.multipleRoots, start) }
+        tokenizer.*.sawRoot = true
+    }
+    if tokenizer.*.depth >= MAX_DEPTH { return fail(tokenizer, token, ErrorCode.tooDeep, start) }
+    tokenizer.*.nameStarts[tokenizer.*.depth] = start + 1
+    tokenizer.*.nameLengths[tokenizer.*.depth] = name_end - start - 1
+    tokenizer.*.depth += 1
+    tokenizer.*.attributeCount = 0
+    tokenizer.*.position = name_end
+    tokenizer.*.state = STATE_START_TAG
+    return emit(tokenizer, token, TokenKind.elementStart, slice(tokenizer, start + 1, name_end), emptyString(tokenizer), start)
+}
+
+// Checks that every '&' in [start, end) begins a well-formed reference.
+fn validReferences(tokenizer: *const Tokenizer, start: usize, end: usize) -> bool {
+    var position = start
+    while position < end {
+        if tokenizer.*.source[position] == 38 {
+            var terminator = position + 1
+            while terminator < end && tokenizer.*.source[terminator] != 59 { terminator += 1 }
+            if terminator >= end { return false }
+            const scalar = referenceValue(tokenizer.*.source, position + 1, terminator)
+            if scalar < 0 { return false }
+            position = terminator
+        }
+        position += 1
+    }
+    return true
+}
+
+fn isReference(source: [*]const u8, start: usize, end: usize, name: []const u8) -> bool {
+    var index: usize = 0
+    for byte in name {
+        if start + index >= end { return false }
+        if source[start + index] != byte { return false }
+        index += 1
+    }
+    return start + index == end
+}
+
+// Decodes the reference body between '&' and ';'. Returns the Unicode scalar
+// value, or -1 for an unknown entity or invalid character reference.
+fn referenceValue(source: [*]const u8, start: usize, end: usize) -> isize {
+    if isReference(source, start, end, "lt") { return 60 }
+    if isReference(source, start, end, "gt") { return 62 }
+    if isReference(source, start, end, "amp") { return 38 }
+    if isReference(source, start, end, "quot") { return 34 }
+    if isReference(source, start, end, "apos") { return 39 }
+    if start >= end || source[start] != 35 { return -1 }
+    var position = start + 1
+    var base: usize = 10
+    if position < end && source[position] == 120 {
+        base = 16
+        position += 1
+    }
+    if position >= end { return -1 }
+    var value: usize = 0
+    while position < end {
+        const byte = source[position]
+        var digit: usize = 16
+        if byte >= 48 && byte <= 57 { digit = @intCast(usize, byte - 48) }
+        if base == 16 && byte >= 97 && byte <= 102 { digit = @intCast(usize, byte - 87) }
+        if base == 16 && byte >= 65 && byte <= 70 { digit = @intCast(usize, byte - 55) }
+        if digit >= base { return -1 }
+        value = value * base + digit
+        if value > 1114111 { return -1 }
+        position += 1
+    }
+    if value == 0 { return -1 }
+    if value >= 55296 && value <= 57343 { return -1 }
+    return @bitCast(isize, value)
+}
+
+fn encodeScalar(value: usize, destination: [*]u8, offset: usize, capacity: usize) -> usize {
+    if value < 128 {
+        if offset + 1 > capacity { return 0 }
+        destination[offset] = @intCast(u8, value)
+        return 1
+    }
+    if value < 2048 {
+        if offset + 2 > capacity { return 0 }
+        destination[offset] = @intCast(u8, 192 | (value >> 6))
+        destination[offset + 1] = @intCast(u8, 128 | (value & 63))
+        return 2
+    }
+    if value < 65536 {
+        if offset + 3 > capacity { return 0 }
+        destination[offset] = @intCast(u8, 224 | (value >> 12))
+        destination[offset + 1] = @intCast(u8, 128 | ((value >> 6) & 63))
+        destination[offset + 2] = @intCast(u8, 128 | (value & 63))
+        return 3
+    }
+    if offset + 4 > capacity { return 0 }
+    destination[offset] = @intCast(u8, 240 | (value >> 18))
+    destination[offset + 1] = @intCast(u8, 128 | ((value >> 12) & 63))
+    destination[offset + 2] = @intCast(u8, 128 | ((value >> 6) & 63))
+    destination[offset + 3] = @intCast(u8, 128 | (value & 63))
+    return 4
+}
+
+// Expands references in `raw` into `destination`. Returns the decoded length,
+// or -1 when a reference is invalid or the destination is too small. The
+// decoded form is never longer than the raw form, so `raw.length` bytes of
+// capacity always suffice.
+pub fn decode(raw: String, destination: [*]u8, capacity: usize) -> isize {
+    var input: usize = 0
+    var output: usize = 0
+    while input < raw.length {
+        const byte = raw.pointer[input]
+        if byte != 38 {
+            if output >= capacity { return -1 }
+            destination[output] = byte
+            output += 1
+            input += 1
+        } else {
+            var terminator = input + 1
+            while terminator < raw.length && raw.pointer[terminator] != 59 { terminator += 1 }
+            if terminator >= raw.length { return -1 }
+            const scalar = referenceValue(raw.pointer, input + 1, terminator)
+            if scalar < 0 { return -1 }
+            const written = encodeScalar(@bitCast(usize, scalar), destination, output, capacity)
+            if written == 0 { return -1 }
+            output += written
+            input = terminator + 1
+        }
+    }
+    return @bitCast(isize, output)
+}
+
+// Returns true when `raw` contains no references, so it can be used as-is.
+pub fn isPlain(raw: String) -> bool {
+    var index: usize = 0
+    while index < raw.length {
+        if raw.pointer[index] == 38 { return false }
+        index += 1
+    }
+    return true
+}
+
+// Decodes `raw` into memory owned by the caller through `allocator`. The
+// result's capacity is `raw.length` (at least 1); release it with
+// `freeDecoded(allocator, result, raw.length)`. Returns false on an invalid
+// reference or allocation failure.
+pub fn decodeAlloc(allocator: Allocator, raw: String, result: *String) -> bool {
+    const capacity = if raw.length > 0 { raw.length } else { 1 }
+    const memory = allocator.alloc(capacity, 1)
+    if memory == null { return false }
+    const length = decode(raw, memory.?, capacity)
+    if length < 0 {
+        allocator.free(memory.?, capacity, 1)
+        return false
+    }
+    unsafe { result.* = string.fromParts(@ptrCast([*]const u8, memory.?), @bitCast(usize, length)) }
+    return true
+}
+
+pub fn freeDecoded(allocator: Allocator, value: String, raw_length: usize) -> void {
+    const capacity = if raw_length > 0 { raw_length } else { 1 }
+    unsafe { allocator.free(@ptrCast([*]u8, value.pointer), capacity, 1) }
+}
+
+// True when `value` equals the literal `expected`.
+pub fn equals(value: String, expected: []const u8) -> bool {
+    return string.eql(value, string.fromSlice(expected))
+}
+
+// True when `raw` consists only of XML whitespace.
+pub fn isBlank(raw: String) -> bool {
+    var index: usize = 0
+    while index < raw.length {
+        if !isWhitespace(raw.pointer[index]) { return false }
+        index += 1
+    }
+    return true
+}

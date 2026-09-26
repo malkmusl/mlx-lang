@@ -1,0 +1,331 @@
+// Dynamically linked x86_64 executables.
+//
+// Programs that call C functions (extern "c") or export functions are
+// written as ET_EXEC images loaded by the system dynamic linker. The image
+// keeps the static layout's base address and puts:
+//
+//   R    headers, .interp, .hash, .dynsym, .dynstr, .rela.dyn
+//   R+X  .text (the code, entry point _start)
+//   R+W  .dynamic, .got (one slot per import, R_X86_64_GLOB_DAT) and .data
+//        (the words the encoder's DATA_* offsets name)
+//
+// Imports are unversioned references and bind to the default version of the
+// symbol in any library named by DT_NEEDED. Binding is immediate
+// (DF_BIND_NOW), so a missing function fails at load time.
+
+const mem = @import("../../../std/bootstrap/mem.mlx")
+const fs = @import("../../../std/bootstrap/fs.mlx")
+const elf = @import("../../../std/bootstrap/elf.mlx")
+const allocator_mod = @import("../../../std/bootstrap/allocator.mlx")
+const encoder_module = @import("../backend/x86_64/encoder.mlx")
+const elf64 = @import("./elf64.mlx")
+
+pub const Allocator = allocator_mod.Allocator
+
+const INTERPRETER_LENGTH: usize = 27
+
+// Section names, in section order after the null section; each name's offset
+// is its position in the string written below, and every "|" is written as a NUL.
+const SHSTRTAB_LENGTH: usize = 77
+
+const PROGRAM_HEADERS: usize = 7
+const SECTION_COUNT: usize = 11
+const TEXT_SECTION: u16 = 6
+
+const DT_NULL: u64 = 0
+const DT_NEEDED: u64 = 1
+const DT_HASH: u64 = 4
+const DT_STRTAB: u64 = 5
+const DT_SYMTAB: u64 = 6
+const DT_RELA: u64 = 7
+const DT_RELASZ: u64 = 8
+const DT_RELAENT: u64 = 9
+const DT_STRSZ: u64 = 10
+const DT_SYMENT: u64 = 11
+const DT_DEBUG: u64 = 21
+const DT_FLAGS: u64 = 30
+const DT_FLAGS_1: u64 = 1879048187
+const DF_BIND_NOW: u64 = 8
+const DF_1_NOW: u64 = 1
+const R_X86_64_GLOB_DAT: u64 = 6
+
+pub const Layout = struct {
+    symbolCount: usize
+    interpOffset: usize
+    hashOffset: usize
+    hashSize: usize
+    dynsymOffset: usize
+    dynstrOffset: usize
+    dynstrSize: usize
+    relaOffset: usize
+    headersEnd: usize
+    textOffset: usize
+    codeLength: usize
+    dataOffset: usize
+    dynamicOffset: usize
+    dynamicSize: usize
+    gotOffset: usize
+    mlxDataOffset: usize
+    dataEnd: usize
+    shstrtabOffset: usize
+    sectionOffset: usize
+    totalSize: usize
+}
+
+fn cLength(text: [*]const u8) -> usize {
+    var length: usize = 0
+    while text[length] != 0 { length += 1 }
+    return length
+}
+
+fn vaddr(offset: usize) -> u64 { return @intCast(u64, elf64.LOAD_VADDR + offset) }
+
+pub fn layout(enc: *encoder_module.Encoder, needed: [*]const [*]const u8, needed_count: usize) -> Layout {
+    const imports = encoder_module.importCount(enc)
+    const exports = encoder_module.exportCount(enc)
+    const symbol_count = 1 + imports + exports
+    var dynstr_size: usize = 1
+    var index: usize = 0
+    while index < needed_count {
+        dynstr_size += cLength(needed[index]) + 1
+        index += 1
+    }
+    index = 0
+    while index < imports {
+        dynstr_size += encoder_module.importAt(enc, index).nameLength + 1
+        index += 1
+    }
+    index = 0
+    while index < exports {
+        dynstr_size += encoder_module.exportAt(enc, index).nameLength + 1
+        index += 1
+    }
+    const interp_offset = elf.ELF_HEADER_SIZE + PROGRAM_HEADERS * elf.PROGRAM_HEADER_SIZE
+    const hash_offset = elf64.alignUp(interp_offset + INTERPRETER_LENGTH + 1, 8)
+    const hash_size = 4 * (3 + symbol_count)
+    const dynsym_offset = elf64.alignUp(hash_offset + hash_size, 8)
+    const dynstr_offset = dynsym_offset + 24 * symbol_count
+    const rela_offset = elf64.alignUp(dynstr_offset + dynstr_size, 8)
+    const headers_end = rela_offset + 24 * imports
+    var text_offset = elf64.alignUp(headers_end, elf64.PAGE_SIZE)
+    if text_offset < elf64.TEXT_FILE_OFFSET { text_offset = elf64.TEXT_FILE_OFFSET }
+    const code_length = encoder_module.pos(enc)
+    const data_offset = elf64.alignUp(text_offset + code_length, elf64.PAGE_SIZE)
+    const dynamic_size = 16 * (needed_count + 13)
+    const got_offset = data_offset + dynamic_size
+    const mlx_data_offset = got_offset + 8 * imports
+    const data_end = mlx_data_offset + encoder_module.DATA_SIZE
+    const shstrtab_offset = data_end
+    const section_offset = elf64.alignUp(shstrtab_offset + SHSTRTAB_LENGTH, 8)
+    return Layout.{
+        .symbolCount = symbol_count,
+        .interpOffset = interp_offset,
+        .hashOffset = hash_offset,
+        .hashSize = hash_size,
+        .dynsymOffset = dynsym_offset,
+        .dynstrOffset = dynstr_offset,
+        .dynstrSize = dynstr_size,
+        .relaOffset = rela_offset,
+        .headersEnd = headers_end,
+        .textOffset = text_offset,
+        .codeLength = code_length,
+        .dataOffset = data_offset,
+        .dynamicOffset = data_offset,
+        .dynamicSize = dynamic_size,
+        .gotOffset = got_offset,
+        .mlxDataOffset = mlx_data_offset,
+        .dataEnd = data_end,
+        .shstrtabOffset = shstrtab_offset,
+        .sectionOffset = section_offset,
+        .totalSize = section_offset + SECTION_COUNT * 64,
+    }
+}
+
+
+fn copyText(buffer: [*]u8, offset: usize, text: [*]const u8, length: usize) -> usize {
+    var index: usize = 0
+    while index < length {
+        buffer[offset + index] = text[index]
+        index += 1
+    }
+    buffer[offset + length] = 0
+    return offset + length + 1
+}
+
+fn programHeader(buffer: [*]u8, index: usize, kind: u32, flags: u32, offset: usize, size: usize, alignment: usize) -> void {
+    const at = elf.ELF_HEADER_SIZE + index * elf.PROGRAM_HEADER_SIZE
+    elf.writeU32(buffer, at, kind)
+    elf.writeU32(buffer, at + 4, flags)
+    elf.writeU64(buffer, at + 8, @intCast(u64, offset))
+    elf.writeU64(buffer, at + 16, vaddr(offset))
+    elf.writeU64(buffer, at + 24, vaddr(offset))
+    elf.writeU64(buffer, at + 32, @intCast(u64, size))
+    elf.writeU64(buffer, at + 40, @intCast(u64, size))
+    elf.writeU64(buffer, at + 48, @intCast(u64, alignment))
+}
+
+fn sectionHeader(buffer: [*]u8, at: usize, name: u32, kind: u32, flags: u64, offset: usize, size: usize, link: u32, info: u32, alignment: u64, entry_size: u64) -> void {
+    elf.writeU32(buffer, at, name)
+    elf.writeU32(buffer, at + 4, kind)
+    elf.writeU64(buffer, at + 8, flags)
+    elf.writeU64(buffer, at + 16, if flags & 2 != 0 { vaddr(offset) } else { 0 })
+    elf.writeU64(buffer, at + 24, @intCast(u64, offset))
+    elf.writeU64(buffer, at + 32, @intCast(u64, size))
+    elf.writeU32(buffer, at + 40, link)
+    elf.writeU32(buffer, at + 44, info)
+    elf.writeU64(buffer, at + 48, alignment)
+    elf.writeU64(buffer, at + 56, entry_size)
+}
+
+fn symbol(buffer: [*]u8, at: usize, name: usize, section: u16, value: u64) -> void {
+    elf.writeU32(buffer, at, @intCast(u32, name))
+    buffer[at + 4] = 18 // STB_GLOBAL, STT_FUNC
+    buffer[at + 5] = 0
+    elf.writeU16(buffer, at + 6, section)
+    elf.writeU64(buffer, at + 8, value)
+    elf.writeU64(buffer, at + 16, 0)
+}
+
+fn dynamicEntry(buffer: [*]u8, at: usize, tag: u64, value: u64) -> usize {
+    elf.writeU64(buffer, at, tag)
+    elf.writeU64(buffer, at + 8, value)
+    return at + 16
+}
+
+pub fn build(allocator: Allocator, enc: *encoder_module.Encoder, needed: [*]const [*]const u8, needed_count: usize) -> elf64.BuildResult {
+    const shape = layout(enc, needed, needed_count)
+    const buffer_opt = allocator.alloc(shape.totalSize, 8)
+    if buffer_opt == null {
+        unsafe { return elf64.BuildResult.{ .valid = false, .buffer = @ptrFromInt([*]u8, 0), .size = 0 } }
+    }
+    const buffer = buffer_opt.?
+    mem.zero(buffer, shape.totalSize)
+    const imports = encoder_module.importCount(enc)
+    const exports = encoder_module.exportCount(enc)
+
+    // ELF header
+    buffer[0] = 127
+    buffer[1] = 69
+    buffer[2] = 76
+    buffer[3] = 70
+    buffer[4] = 2
+    buffer[5] = 1
+    buffer[6] = 1
+    elf.writeU16(buffer, 16, 2) // ET_EXEC
+    elf.writeU16(buffer, 18, 62) // EM_X86_64
+    elf.writeU32(buffer, 20, 1)
+    elf.writeU64(buffer, 24, vaddr(shape.textOffset))
+    elf.writeU64(buffer, 32, 64)
+    elf.writeU64(buffer, 40, @intCast(u64, shape.sectionOffset))
+    elf.writeU16(buffer, 52, 64)
+    elf.writeU16(buffer, 54, 56)
+    elf.writeU16(buffer, 56, @intCast(u16, PROGRAM_HEADERS))
+    elf.writeU16(buffer, 58, 64)
+    elf.writeU16(buffer, 60, @intCast(u16, SECTION_COUNT))
+    elf.writeU16(buffer, 62, @intCast(u16, SECTION_COUNT - 1))
+
+    // Program headers
+    programHeader(buffer, 0, 6, 4, elf.ELF_HEADER_SIZE, PROGRAM_HEADERS * elf.PROGRAM_HEADER_SIZE, 8) // PT_PHDR
+    programHeader(buffer, 1, 3, 4, shape.interpOffset, INTERPRETER_LENGTH + 1, 1) // PT_INTERP
+    programHeader(buffer, 2, 1, 4, 0, shape.headersEnd, elf64.PAGE_SIZE) // PT_LOAD R
+    programHeader(buffer, 3, 1, 5, shape.textOffset, shape.codeLength, elf64.PAGE_SIZE) // PT_LOAD R+X
+    programHeader(buffer, 4, 1, 6, shape.dataOffset, shape.dataEnd - shape.dataOffset, elf64.PAGE_SIZE) // PT_LOAD R+W
+    programHeader(buffer, 5, 2, 6, shape.dynamicOffset, shape.dynamicSize, 8) // PT_DYNAMIC
+    programHeader(buffer, 6, 1685382481, 6, 0, 0, 16) // PT_GNU_STACK (not executable)
+
+    // .interp
+    unsafe { const interp_end = copyText(buffer, shape.interpOffset, @ptrCast([*]const u8, "/lib64/ld-linux-x86-64.so.2"), INTERPRETER_LENGTH) }
+
+    // .dynstr: library names, then imported and exported function names.
+    var string_at: usize = 1
+    const needed_names = string_at
+    var index: usize = 0
+    while index < needed_count {
+        const length = cLength(needed[index])
+        string_at = copyText(buffer, shape.dynstrOffset + string_at, needed[index], length) - shape.dynstrOffset
+        index += 1
+    }
+
+    // .dynsym and .rela.dyn: imports are symbols 1..imports (undefined), each
+    // with a GLOB_DAT relocation filling its GOT slot; exports follow.
+    index = 0
+    while index < imports {
+        const entry = encoder_module.importAt(enc, index)
+        symbol(buffer, shape.dynsymOffset + (1 + index) * 24, string_at, 0, 0)
+        string_at = copyText(buffer, shape.dynstrOffset + string_at, entry.namePointer, entry.nameLength) - shape.dynstrOffset
+        const rela = shape.relaOffset + index * 24
+        elf.writeU64(buffer, rela, vaddr(shape.gotOffset + index * 8))
+        elf.writeU64(buffer, rela + 8, (@intCast(u64, 1 + index) << 32) | R_X86_64_GLOB_DAT)
+        elf.writeU64(buffer, rela + 16, 0)
+        index += 1
+    }
+    index = 0
+    while index < exports {
+        const entry = encoder_module.exportAt(enc, index)
+        symbol(buffer, shape.dynsymOffset + (1 + imports + index) * 24, string_at, TEXT_SECTION, vaddr(shape.textOffset + entry.offset))
+        string_at = copyText(buffer, shape.dynstrOffset + string_at, entry.namePointer, entry.nameLength) - shape.dynstrOffset
+        index += 1
+    }
+
+    // .hash: one bucket chaining every symbol (lookups are linear).
+    elf.writeU32(buffer, shape.hashOffset, 1)
+    elf.writeU32(buffer, shape.hashOffset + 4, @intCast(u32, shape.symbolCount))
+    elf.writeU32(buffer, shape.hashOffset + 8, @intCast(u32, shape.symbolCount - 1))
+    index = 1
+    while index < shape.symbolCount {
+        elf.writeU32(buffer, shape.hashOffset + 12 + index * 4, @intCast(u32, index - 1))
+        index += 1
+    }
+
+    // .text, with GOT and data references resolved.
+    encoder_module.applyLinkFixups(enc, shape.gotOffset - shape.textOffset, shape.mlxDataOffset - shape.textOffset)
+    unsafe { mem.copy(@ptrFromInt([*]u8, @intFromPtr(buffer) + shape.textOffset), @ptrCast([*]const u8, enc.*.buf.*.items), shape.codeLength) }
+
+    // .dynamic
+    var dynamic_at = shape.dynamicOffset
+    var name_at = needed_names
+    index = 0
+    while index < needed_count {
+        dynamic_at = dynamicEntry(buffer, dynamic_at, DT_NEEDED, @intCast(u64, name_at))
+        name_at += cLength(needed[index]) + 1
+        index += 1
+    }
+    dynamic_at = dynamicEntry(buffer, dynamic_at, DT_HASH, vaddr(shape.hashOffset))
+    dynamic_at = dynamicEntry(buffer, dynamic_at, DT_STRTAB, vaddr(shape.dynstrOffset))
+    dynamic_at = dynamicEntry(buffer, dynamic_at, DT_SYMTAB, vaddr(shape.dynsymOffset))
+    dynamic_at = dynamicEntry(buffer, dynamic_at, DT_STRSZ, @intCast(u64, shape.dynstrSize))
+    dynamic_at = dynamicEntry(buffer, dynamic_at, DT_SYMENT, 24)
+    dynamic_at = dynamicEntry(buffer, dynamic_at, DT_RELA, vaddr(shape.relaOffset))
+    dynamic_at = dynamicEntry(buffer, dynamic_at, DT_RELASZ, @intCast(u64, 24 * imports))
+    dynamic_at = dynamicEntry(buffer, dynamic_at, DT_RELAENT, 24)
+    dynamic_at = dynamicEntry(buffer, dynamic_at, DT_FLAGS, DF_BIND_NOW)
+    dynamic_at = dynamicEntry(buffer, dynamic_at, DT_FLAGS_1, DF_1_NOW)
+    dynamic_at = dynamicEntry(buffer, dynamic_at, DT_DEBUG, 0)
+    dynamic_at = dynamicEntry(buffer, dynamic_at, DT_NULL, 0)
+
+    // .shstrtab and section headers
+    var name_index: usize = 0
+    for byte in "|.interp|.hash|.dynsym|.dynstr|.rela.dyn|.text|.dynamic|.got|.data|.shstrtab|" {
+        buffer[shape.shstrtabOffset + name_index] = if byte == 124 { 0 } else { byte }
+        name_index += 1
+    }
+    const sh = shape.sectionOffset
+    sectionHeader(buffer, sh + 64, 1, 1, 2, shape.interpOffset, INTERPRETER_LENGTH + 1, 0, 0, 1, 0)
+    sectionHeader(buffer, sh + 128, 9, 5, 2, shape.hashOffset, shape.hashSize, 3, 0, 8, 4)
+    sectionHeader(buffer, sh + 192, 15, 11, 2, shape.dynsymOffset, 24 * shape.symbolCount, 4, 1, 8, 24)
+    sectionHeader(buffer, sh + 256, 23, 3, 2, shape.dynstrOffset, shape.dynstrSize, 0, 0, 1, 0)
+    sectionHeader(buffer, sh + 320, 31, 4, 2, shape.relaOffset, 24 * imports, 3, 0, 8, 24)
+    sectionHeader(buffer, sh + 384, 41, 1, 6, shape.textOffset, shape.codeLength, 0, 0, 16, 0)
+    sectionHeader(buffer, sh + 448, 47, 6, 3, shape.dynamicOffset, shape.dynamicSize, 4, 0, 8, 16)
+    sectionHeader(buffer, sh + 512, 56, 1, 3, shape.gotOffset, 8 * imports, 0, 0, 8, 8)
+    sectionHeader(buffer, sh + 576, 61, 1, 3, shape.mlxDataOffset, encoder_module.DATA_SIZE, 0, 0, 8, 0)
+    sectionHeader(buffer, sh + 640, 67, 3, 0, shape.shstrtabOffset, SHSTRTAB_LENGTH, 0, 0, 1, 0)
+
+    return elf64.BuildResult.{ .valid = true, .buffer = buffer, .size = shape.totalSize }
+}
+
+pub fn writeExecutable(allocator: Allocator, enc: *encoder_module.Encoder, needed: [*]const [*]const u8, needed_count: usize, output_path: [*]const u8) -> bool {
+    const result = build(allocator, enc, needed, needed_count)
+    if !result.valid { return false }
+    return elf64.writeImage(allocator, result.buffer, result.size, output_path)
+}

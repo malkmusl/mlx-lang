@@ -11,6 +11,14 @@ const optimize = @import("../ir/optimize.mlx")
 const encoder_module = @import("../backend/x86_64/encoder.mlx")
 const codegen_module = @import("../backend/x86_64/codegen.mlx")
 const elf64 = @import("../object/elf64.mlx")
+const elf64_dynamic = @import("../object/elf64_dynamic.mlx")
+const a64_encoder = @import("../backend/aarch64/encoder.mlx")
+const a64_codegen = @import("../backend/aarch64/codegen.mlx")
+const elf64_aarch64 = @import("../object/elf64_aarch64.mlx")
+const array_list = @import("../../../std/bootstrap/array_list.mlx")
+const fs = @import("../../../std/bootstrap/fs.mlx")
+const android_bytes = @import("../object/android/bytes.mlx")
+const apk = @import("../object/android/apk.mlx")
 const options_module = @import("./options.mlx")
 const reporter_module = @import("./reporter.mlx")
 
@@ -18,6 +26,15 @@ pub const Pipeline = struct {
     pub fn compile(options: options_module.Options) -> u8 {
         unsafe {
             var reporter = reporter_module.Reporter.init(options.compilerNamePointer, options.compilerNameLength, options.showProgress, options.traceEnabled, options_module.Options.stepCount(options))
+            if !options.targetValid {
+                reporter_module.Reporter.failure(diagnostic.Code.import_not_found, diagnostic.Phase.resolve, "unknown --target; expected x86_64-linux, aarch64-linux or aarch64-android")
+                reporter_module.Reporter.finish(&reporter)
+                return 2
+            }
+            if !Self.androidOptionsValid(&reporter, options) {
+                reporter_module.Reporter.finish(&reporter)
+                return 2
+            }
             Self.tracePaths(&reporter, options)
             const pages = page_allocator.init()
             var arena = arena_allocator.init(pages, 268435456)
@@ -182,6 +199,12 @@ pub const Pipeline = struct {
         reporter_module.Reporter.metric(reporter, "unreachable function instructions eliminated", optimization.functionInstructionsEliminated)
         reporter_module.Reporter.metric(reporter, "post-terminator instructions eliminated", optimization.postTerminatorInstructionsEliminated)
         reporter_module.Reporter.metric(reporter, "dead instructions eliminated", optimization.eliminated)
+        if options.target != options_module.Target.x86_64_linux {
+            const status = Self.emitAarch64(allocator, &ir, type_store, options, reporter)
+            lower.deinit(&builder)
+            lir.deinit(&ir)
+            return status
+        }
         reporter_module.Reporter.progress(reporter, 7, "generate x86_64 machine code")
         var encoder = encoder_module.init(allocator)
         var codegen = codegen_module.Codegen.init(allocator, &encoder, &ir, type_store)
@@ -210,9 +233,16 @@ pub const Pipeline = struct {
         reporter_module.Reporter.metric(reporter, "symbol lookup probes", encoder_module.fixupProbes(&encoder))
         reporter_module.Reporter.metric(reporter, "maximum lookup probes", encoder_module.maxFixupProbes(&encoder))
         reporter_module.Reporter.progress(reporter, 9, "write ELF64 executable")
-        var empty_rodata: [*]const u8 = undefined
-        unsafe { empty_rodata = @ptrFromInt([*]const u8, 0) }
-        const wrote = elf64.writeExecutable(allocator, encoder.buf.*.items, encoder.buf.*.length, 0, empty_rodata, 0, options.outputPointer)
+        var wrote = false
+        if encoder_module.hasLinkFixups(&encoder) || encoder_module.exportCount(&encoder) > 0 {
+            reporter_module.Reporter.metric(reporter, "imported functions", encoder_module.importCount(&encoder))
+            reporter_module.Reporter.metric(reporter, "exported functions", encoder_module.exportCount(&encoder))
+            wrote = Self.writeDynamicExecutable(allocator, &encoder, options)
+        } else {
+            var empty_rodata: [*]const u8 = undefined
+            unsafe { empty_rodata = @ptrFromInt([*]const u8, 0) }
+            wrote = elf64.writeExecutable(allocator, encoder.buf.*.items, encoder.buf.*.length, 0, empty_rodata, 0, options.outputPointer)
+        }
         Self.deinitBackend(&codegen, &encoder, &builder, &ir)
         if !wrote {
             reporter_module.Reporter.failure(diagnostic.Code.import_not_found, diagnostic.Phase.resolve, "failed to write output file")
@@ -220,6 +250,184 @@ pub const Pipeline = struct {
             return 9
         }
         return 0
+    }
+
+    // A program that calls C functions is loaded by the system dynamic
+    // linker; it always links libc.so.6 (dlopen, dlsym and the rest of the
+    // C library), plus every library named with --library.
+    fn writeDynamicExecutable(allocator: arena_allocator.Allocator, encoder: *encoder_module.Encoder, options: options_module.Options) -> bool {
+        const extra = options_module.Options.libraryCount(options)
+        var needed: [*][*]const u8 = undefined
+        unsafe {
+            needed = @ptrCast([*][*]const u8, allocator.alloc((extra + 1) * 8, 8).?)
+            needed[0] = @ptrCast([*]const u8, "libc.so.6")
+        }
+        var index: usize = 0
+        while index < extra {
+            needed[index + 1] = options_module.Options.library(options, index)
+            index += 1
+        }
+        unsafe { return elf64_dynamic.writeExecutable(allocator, encoder, @ptrCast([*]const [*]const u8, needed), extra + 1, options.outputPointer) }
+    }
+
+    fn emitAarch64(allocator: arena_allocator.Allocator, ir: *lir.Lir, type_store: *types.Store, options: options_module.Options, reporter: *reporter_module.Reporter) -> u8 {
+        const shared = options.target == options_module.Target.aarch64_android
+        reporter_module.Reporter.progress(reporter, 7, "generate aarch64 machine code")
+        var encoder = a64_encoder.init(allocator)
+        var codegen = a64_codegen.Codegen.init(allocator, &encoder, ir, type_store)
+        a64_codegen.Codegen.generateBinary(&codegen, !shared)
+        const code_length = a64_encoder.pos(&encoder)
+        reporter_module.Reporter.traceValue(reporter, "machine-code bytes: ", code_length)
+        reporter_module.Reporter.metric(reporter, "machine-code bytes", code_length)
+        reporter_module.Reporter.metric(reporter, "backend symbols", a64_encoder.symbolCount(&encoder))
+        reporter_module.Reporter.metric(reporter, "backend fixups", a64_encoder.fixupCount(&encoder))
+        reporter_module.Reporter.metric(reporter, "backend fallthrough branches removed", a64_codegen.Codegen.fallthroughBranchCount(&codegen))
+        reporter_module.Reporter.metric(reporter, "backend direct calls", a64_codegen.Codegen.directCallCount(&codegen))
+        reporter_module.Reporter.metric(reporter, "aggregate allocation sites", a64_codegen.Codegen.aggregateAllocationCount(&codegen))
+        reporter_module.Reporter.metric(reporter, "aggregate allocation bytes (static)", a64_codegen.Codegen.aggregateAllocationBytes(&codegen))
+        if a64_codegen.Codegen.invalidOperandCount(&codegen) != 0 {
+            reporter_module.Reporter.metric(reporter, "invalid backend operands", a64_codegen.Codegen.invalidOperandCount(&codegen))
+            a64_codegen.Codegen.deinit(&codegen)
+            a64_encoder.deinit(&encoder)
+            reporter_module.Reporter.failure(diagnostic.Code.unsupported_instruction_lowering, diagnostic.Phase.codegen, "an instruction uses a value that was never lowered")
+            reporter_module.Reporter.failActiveStep(reporter, 1)
+            return 10
+        }
+        if shared { return Self.emitAndroidLibrary(allocator, &codegen, &encoder, options, reporter) }
+        reporter_module.Reporter.progress(reporter, 8, "resolve backend symbols")
+        const text_vaddr = @intCast(u64, elf64_aarch64.TEXT_VADDR)
+        const data_vaddr = @intCast(u64, elf64_aarch64.dataVaddr(code_length))
+        if !a64_encoder.applyFixups(&encoder, text_vaddr, data_vaddr, 0) {
+            reporter_module.Reporter.unresolvedSymbol(reporter, a64_encoder.unresolvedFixupPointer(&encoder), a64_encoder.unresolvedFixupLength(&encoder))
+            a64_codegen.Codegen.deinit(&codegen)
+            a64_encoder.deinit(&encoder)
+            reporter_module.Reporter.failure(diagnostic.Code.import_not_found, diagnostic.Phase.linker, "unresolved backend symbol")
+            reporter_module.Reporter.failActiveStep(reporter, 1)
+            return 8
+        }
+        reporter_module.Reporter.progress(reporter, 9, "write ELF64 executable (aarch64)")
+        const wrote = elf64_aarch64.writeExecutable(allocator, encoder.buf.*.items, code_length, 0, encoder.dataSize, options.outputPointer)
+        a64_codegen.Codegen.deinit(&codegen)
+        a64_encoder.deinit(&encoder)
+        if !wrote {
+            reporter_module.Reporter.failure(diagnostic.Code.import_not_found, diagnostic.Phase.resolve, "failed to write output file")
+            reporter_module.Reporter.failActiveStep(reporter, 1)
+            return 9
+        }
+        return 0
+    }
+
+    // Android: a shared object (libmain.so) whose exported functions the
+    // framework calls. It links against the stable NDK system libraries;
+    // imported functions resolve from any of them.
+    fn emitAndroidLibrary(allocator: arena_allocator.Allocator, codegen: *a64_codegen.Codegen, encoder: *a64_encoder.Encoder, options: options_module.Options, reporter: *reporter_module.Reporter) -> u8 {
+        reporter_module.Reporter.metric(reporter, "imported functions", a64_encoder.importCount(encoder))
+        reporter_module.Reporter.metric(reporter, "exported functions", a64_encoder.exportCount(encoder))
+        reporter_module.Reporter.progress(reporter, 8, "resolve backend symbols")
+        var needed = array_list.ArrayList.init(allocator, 64)
+        Self.appendNeeded(&needed, "libandroid.so")
+        Self.appendNeeded(&needed, "liblog.so")
+        Self.appendNeeded(&needed, "libm.so")
+        Self.appendNeeded(&needed, "libc.so")
+        Self.appendNeeded(&needed, "libdl.so")
+        var soname: [*]const u8 = undefined
+        unsafe { soname = @ptrCast([*]const u8, "libmain.so") }
+        var status = elf64_aarch64.SHARED_OK
+        if options_module.Options.outputIsApk(options) {
+            reporter_module.Reporter.progress(reporter, 9, "link libmain.so (aarch64)")
+            const image = elf64_aarch64.buildSharedObject(allocator, encoder, soname, 10, needed.items, needed.length)
+            status = image.status
+            if status == elf64_aarch64.SHARED_OK {
+                reporter_module.Reporter.metric(reporter, "libmain.so bytes", image.size)
+                reporter_module.Reporter.progress(reporter, 10, "package and sign APK")
+                if !Self.writeApk(allocator, image, options, reporter) { status = elf64_aarch64.SHARED_WRITE_FAILED }
+            }
+        } else {
+            reporter_module.Reporter.progress(reporter, 9, "write ELF64 shared object (aarch64)")
+            status = elf64_aarch64.writeSharedObject(allocator, encoder, soname, 10, needed.items, needed.length, options.outputPointer)
+        }
+        array_list.ArrayList.deinit(needed)
+        if status == elf64_aarch64.SHARED_UNRESOLVED {
+            reporter_module.Reporter.unresolvedSymbol(reporter, a64_encoder.unresolvedFixupPointer(encoder), a64_encoder.unresolvedFixupLength(encoder))
+        }
+        a64_codegen.Codegen.deinit(codegen)
+        a64_encoder.deinit(encoder)
+        if status == elf64_aarch64.SHARED_UNRESOLVED {
+            reporter_module.Reporter.failure(diagnostic.Code.import_not_found, diagnostic.Phase.linker, "unresolved backend symbol")
+            reporter_module.Reporter.failActiveStep(reporter, 1)
+            return 8
+        }
+        if status != elf64_aarch64.SHARED_OK {
+            reporter_module.Reporter.failure(diagnostic.Code.import_not_found, diagnostic.Phase.resolve, "failed to write output file")
+            reporter_module.Reporter.failActiveStep(reporter, 1)
+            return 9
+        }
+        return 0
+    }
+
+    fn androidOptionsValid(reporter: *reporter_module.Reporter, options: options_module.Options) -> bool {
+        if options.invalidOptionLength != 0 {
+            reporter_module.Reporter.unresolvedSymbol(reporter, options.invalidOptionPointer, options.invalidOptionLength)
+            reporter_module.Reporter.failure(diagnostic.Code.import_not_found, diagnostic.Phase.resolve, "option value is not a decimal number")
+            return false
+        }
+        if options.androidMinSdk < 21 {
+            reporter_module.Reporter.failure(diagnostic.Code.import_not_found, diagnostic.Phase.resolve, "--android-min-sdk must be at least 21 (the first release with arm64-v8a)")
+            return false
+        }
+        if options.androidTargetSdk < options.androidMinSdk {
+            reporter_module.Reporter.failure(diagnostic.Code.import_not_found, diagnostic.Phase.resolve, "--android-target-sdk must not be below --android-min-sdk")
+            return false
+        }
+        return true
+    }
+
+    // Packages the linked libmain.so into a signed APK at the output path.
+    fn writeApk(allocator: arena_allocator.Allocator, image: elf64_aarch64.SharedObject, options: options_module.Options, reporter: *reporter_module.Reporter) -> bool {
+        var key_path = options.androidKeyPointer
+        if !options.hasAndroidKey {
+            if options.homeLength == 0 {
+                reporter_module.Reporter.failure(diagnostic.Code.import_not_found, diagnostic.Phase.resolve, "no signing key: pass --android-key=PATH or set HOME for the default debug key")
+                return false
+            }
+            // Default debug key: $HOME/.mlx/android-debug.key
+            var path = array_list.ArrayList.init(allocator, options.homeLength + 32)
+            android_bytes.appendBytes(&path, android_bytes.of(options.homePointer, options.homeLength))
+            android_bytes.appendText(&path, "/.mlx")
+            android_bytes.appendU8(&path, 0)
+            const made = fs.makeDir(path.items, 448) // 0700; may already exist
+            path.length -= 1
+            android_bytes.appendText(&path, "/android-debug.key")
+            android_bytes.appendU8(&path, 0)
+            key_path = path.items
+        }
+        var generated = false
+        var key = apk.loadOrCreateKey(allocator, key_path, &generated)
+        if generated { reporter_module.Reporter.metric(reporter, "new signing key generated (RSA-2048)", 1) }
+        if !key.valid {
+            reporter_module.Reporter.failure(diagnostic.Code.import_not_found, diagnostic.Phase.resolve, "cannot read or create the signing key")
+            return false
+        }
+        const manifest = apk.ManifestOptions.{
+            .package = android_bytes.of(options.androidPackagePointer, options.androidPackageLength),
+            .label = android_bytes.of(options.androidLabelPointer, options.androidLabelLength),
+            .versionCode = options.androidVersionCode,
+            .versionName = android_bytes.of(options.androidVersionNamePointer, options.androidVersionNameLength),
+            .minSdk = options.androidMinSdk,
+            .targetSdk = options.androidTargetSdk,
+            .fullscreen = options.androidFullscreen,
+            .extractNativeLibs = options.androidExtractNativeLibs,
+        }
+        var library: [*]const u8 = undefined
+        unsafe { library = @ptrCast([*]const u8, image.buffer) }
+        const package = apk.build(allocator, android_bytes.of(library, image.size), manifest, &key, android_bytes.of(options.androidPackagePointer, options.androidPackageLength))
+        reporter_module.Reporter.metric(reporter, "APK bytes", package.length)
+        return elf64_aarch64.writeFileMode(package.items, package.length, options.outputPointer, 420) // 0644
+    }
+
+    fn appendNeeded(list: *array_list.ArrayList, name: []const u8) -> void {
+        for byte in name { const appended = array_list.ArrayList.appendAt(list, byte) }
+        const terminated = array_list.ArrayList.appendAt(list, 0)
     }
 
     fn lowerModules(loader: *modules.Loader, builder: *lower.LirBuilder) -> void {

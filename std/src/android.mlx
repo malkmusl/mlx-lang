@@ -1,0 +1,936 @@
+// Android support for --target=aarch64-android: NDK bindings and a small
+// NativeActivity runtime.
+//
+// An app is two functions over one `usize` of state:
+//
+//     const android = @import("std.android")
+//
+//     fn draw(canvas: *android.Canvas, state: usize) -> void {
+//         android.fill(canvas, if state == 0 { android.rgb(0, 0, 255) } else { android.rgb(0, 200, 0) })
+//     }
+//
+//     fn update(state: usize, gesture: android.Gesture) -> usize { return state + 1 }
+//
+//     export fn ANativeActivity_onCreate(activity: usize, saved_state: usize, saved_state_size: usize) -> void {
+//         android.start(activity, saved_state, saved_state_size, draw, update)
+//     }
+//
+// The runtime registers the activity callbacks, repaints the window with
+// `draw` whenever Android asks for it, drains the input queue on the main
+// looper, recognizes taps, long presses and swipes, passes each one to
+// `update` and repaints, and keeps the state across the activity restart a
+// rotation causes (onSaveInstanceState). Recognized gestures are logged to
+// logcat under the tag "mlx".
+//
+// Everything the runtime needs per event (window buffer, event out-param,
+// timer spec) lives in one malloc'd App block reached through the
+// activity's `instance` field, so handling input allocates nothing.
+
+const ui = @import("std.ui")
+
+// ── NDK functions (libandroid.so, liblog.so, libc.so) ─────────────────────
+
+pub extern("c") fn ANativeActivity_finish(activity: usize) -> void
+pub extern("c") fn ANativeWindow_setBuffersGeometry(window: usize, width: i32, height: i32, format: i32) -> i32
+pub extern("c") fn ANativeWindow_lock(window: usize, buffer: usize, dirty_bounds: usize) -> i32
+pub extern("c") fn ANativeWindow_unlockAndPost(window: usize) -> i32
+pub extern("c") fn ALooper_forThread() -> usize
+pub extern("c") fn ALooper_addFd(looper: usize, fd: i32, ident: i32, events: i32, callback: usize, data: usize) -> i32
+pub extern("c") fn ALooper_removeFd(looper: usize, fd: i32) -> i32
+pub extern("c") fn AInputQueue_attachLooper(queue: usize, looper: usize, ident: i32, callback: usize, data: usize) -> void
+pub extern("c") fn AInputQueue_detachLooper(queue: usize) -> void
+pub extern("c") fn AInputQueue_getEvent(queue: usize, event_out: usize) -> i32
+pub extern("c") fn AInputQueue_preDispatchEvent(queue: usize, event: usize) -> i32
+pub extern("c") fn AInputQueue_finishEvent(queue: usize, event: usize, handled: i32) -> void
+pub extern("c") fn AInputEvent_getType(event: usize) -> i32
+pub extern("c") fn AMotionEvent_getAction(event: usize) -> i32
+pub extern("c") fn AMotionEvent_getX(event: usize, pointer_index: usize) -> f32
+pub extern("c") fn AMotionEvent_getY(event: usize, pointer_index: usize) -> f32
+pub extern("c") fn AMotionEvent_getEventTime(event: usize) -> i64
+pub extern("c") fn __android_log_write(priority: i32, tag: [*]const u8, text: [*]const u8) -> i32
+pub extern("c") fn timerfd_create(clock: i32, flags: i32) -> i32
+pub extern("c") fn timerfd_settime(fd: i32, flags: i32, new_value: usize, old_value: usize) -> i32
+pub extern("c") fn read(fd: i32, buffer: usize, length: usize) -> isize
+pub extern("c") fn close(fd: i32) -> i32
+pub extern("c") fn malloc(size: usize) -> usize
+extern("c") fn dlopen(name: [*]const u8, flags: i32) -> usize
+extern("c") fn dlsym(handle: usize, name: [*]const u8) -> usize
+pub extern("c") fn free(pointer: usize) -> void
+
+// ── NDK constants and struct offsets ──────────────────────────────────────
+
+pub const WINDOW_FORMAT_RGBA_8888: i32 = 1
+pub const INPUT_EVENT_TYPE_MOTION: i32 = 2
+pub const MOTION_ACTION_MASK: i32 = 255
+pub const MOTION_ACTION_DOWN: i32 = 0
+pub const MOTION_ACTION_UP: i32 = 1
+pub const MOTION_ACTION_MOVE: i32 = 2
+pub const MOTION_ACTION_CANCEL: i32 = 3
+pub const MOTION_ACTION_POINTER_DOWN: i32 = 5
+pub const LOOPER_EVENT_INPUT: i32 = 1
+pub const LOG_INFO: i32 = 4
+const CLOCK_MONOTONIC: i32 = 1
+const TIMER_FLAGS: i32 = 526336 // TFD_NONBLOCK (0x800) | TFD_CLOEXEC (0x80000)
+
+// struct ANativeActivity: callbacks at 0, instance at 56.
+const ACTIVITY_CALLBACKS: usize = 0
+const ACTIVITY_INSTANCE: usize = 56
+// struct ANativeActivityCallbacks, one function pointer each.
+const ON_SAVE_INSTANCE_STATE: usize = 16
+const ON_DESTROY: usize = 40
+const ON_NATIVE_WINDOW_CREATED: usize = 56
+const ON_NATIVE_WINDOW_RESIZED: usize = 64
+const ON_NATIVE_WINDOW_REDRAW_NEEDED: usize = 72
+const ON_NATIVE_WINDOW_DESTROYED: usize = 80
+const ON_INPUT_QUEUE_CREATED: usize = 88
+const ON_INPUT_QUEUE_DESTROYED: usize = 96
+// ANativeWindow_Buffer: width, height, stride, format (i32), bits pointer.
+const BUFFER_WIDTH: usize = 0
+const BUFFER_HEIGHT: usize = 4
+const BUFFER_STRIDE: usize = 8
+const BUFFER_BITS: usize = 16
+const BUFFER_SIZE: usize = 48
+
+// ── Drawing ───────────────────────────────────────────────────────────────
+
+// The locked window: `stride` pixels per row, RGBA_8888. `reserved` is the
+// space kept for the system (see reservedInsets: the system bars unless the
+// app is fullscreen) and `free` the rest, where UI components go; only the
+// background belongs under `reserved`.
+pub const Canvas = struct {
+    pixels: usize
+    width: usize
+    height: usize
+    stride: usize
+    reserved: ui.Insets
+    free: ui.Rect
+}
+
+// An opaque RGBA_8888 pixel (bytes R, G, B, A in memory).
+pub fn rgb(red: u32, green: u32, blue: u32) -> u32 {
+    return 4278190080 | ((blue & 255) << 16) | ((green & 255) << 8) | (red & 255)
+}
+
+pub fn fillRect(canvas: *Canvas, x: usize, y: usize, width: usize, height: usize, color: u32) -> void {
+    const right = if x + width < canvas.*.width { x + width } else { canvas.*.width }
+    const bottom = if y + height < canvas.*.height { y + height } else { canvas.*.height }
+    var row = y
+    while row < bottom {
+        var address = canvas.*.pixels + (row * canvas.*.stride + x) * 4
+        const end = canvas.*.pixels + (row * canvas.*.stride + right) * 4
+        while address < end {
+            unsafe { @ptrFromInt(*u32, address).* = color }
+            address += 4
+        }
+        row += 1
+    }
+}
+
+// The whole window: for the background.
+pub fn fill(canvas: *Canvas, color: u32) -> void {
+    fillRect(canvas, 0, 0, canvas.*.width, canvas.*.height, color)
+}
+
+// The part of `area` inside the window (canvas.*.free for a component that
+// fills the space it is given).
+pub fn fillArea(canvas: *Canvas, area: ui.Rect, color: u32) -> void {
+    const clipped = ui.intersect(area, ui.rect(0, 0, @intCast(i32, canvas.*.width), @intCast(i32, canvas.*.height)))
+    if ui.isEmpty(clipped) { return }
+    fillRect(canvas, @intCast(usize, clipped.x), @intCast(usize, clipped.y), @intCast(usize, clipped.width), @intCast(usize, clipped.height), color)
+}
+
+// ── Logging ───────────────────────────────────────────────────────────────
+
+// Logs a string literal (mlx string literals are zero-terminated) to
+// logcat with tag "mlx".
+pub fn log(text: []const u8) -> void {
+    unsafe { const written = __android_log_write(LOG_INFO, @ptrCast([*]const u8, "mlx"), @ptrCast([*]const u8, text)) }
+}
+
+// ── Frame clock and time ──────────────────────────────────────────────────
+
+// The display's frame clock (AChoreographer, API 24+). It is looked up at
+// run time, so an app using it still loads on older releases.
+pub const Choreographer = struct {
+    instance: usize
+    post: usize
+}
+
+// Called once per post, on the looper thread, when the display starts its
+// next frame (vsync): the frame's time in nanoseconds and the posted data.
+pub const FrameCallback = fn(i64, usize) -> void
+
+const ChoreographerGet = fn() -> usize
+const ChoreographerPost = fn(usize, usize, usize) -> void
+
+// The calling thread's frame clock (the thread needs a looper: the main
+// thread has one). False below API 24; pace frames some other way then
+// (a timerfd, say).
+pub fn choreographer(result: *Choreographer) -> bool {
+    var library: usize = 0
+    var get: usize = 0
+    var post: usize = 0
+    unsafe {
+        library = dlopen(@ptrCast([*]const u8, "libandroid.so"), 2)
+        if library != 0 {
+            get = dlsym(library, @ptrCast([*]const u8, "AChoreographer_getInstance"))
+            post = dlsym(library, @ptrCast([*]const u8, "AChoreographer_postFrameCallback"))
+        }
+    }
+    if get == 0 || post == 0 { return false }
+    var instance_of: ChoreographerGet = undefined
+    unsafe { instance_of = @ptrFromInt(ChoreographerGet, get) }
+    result.*.instance = instance_of()
+    result.*.post = post
+    return result.*.instance != 0
+}
+
+// Asks the display to refresh `window` at `rate` frames a second
+// (ANativeWindow_setFrameRate, API 30+, found at run time). The system may
+// pick another rate: the closest the display has, and no more than the
+// user's setting allows (on Pixels, "Smooth Display" off caps it at 60).
+// False below API 30.
+pub fn setFrameRate(window: usize, rate: f32) -> bool {
+    var set: usize = 0
+    unsafe {
+        const library = dlopen(@ptrCast([*]const u8, "libandroid.so"), 2)
+        if library != 0 { set = dlsym(library, @ptrCast([*]const u8, "ANativeWindow_setFrameRate")) }
+    }
+    if set == 0 { return false }
+    var call: SetFrameRate = undefined
+    unsafe { call = @ptrFromInt(SetFrameRate, set) }
+    // ANATIVEWINDOW_FRAME_RATE_COMPATIBILITY_DEFAULT: an app drawing at
+    // that rate.
+    return call(window, rate, 0) == 0
+}
+
+const SetFrameRate = fn(usize, f32, i32) -> i32
+
+// Asks for `callback` (a FrameCallback) at the display's next frame.
+pub fn postFrameCallback(clock: *const Choreographer, callback: usize, data: usize) -> void {
+    var post: ChoreographerPost = undefined
+    unsafe { post = @ptrFromInt(ChoreographerPost, clock.*.post) }
+    post(clock.*.instance, callback, data)
+}
+
+// ── Reserved space and window insets (JNI) ────────────────────────────────
+
+// The rule for laying out an Android window: an app that is not
+// fullscreen keeps the system's status and navigation bars, and its window
+// reaches under them (edge to edge, enforced from Android 15). That space
+// is reserved: only the app's background is drawn there, and every UI
+// component is laid out in the rest. The top band keeps its portrait
+// height in landscape: as tall as the status bar in portrait (the larger of
+// the system's portrait status bar height and the camera cutout's depth),
+// while the status bar is shown. The cutout itself is not reserved: in
+// landscape it sits at a side edge, and the content goes there as in other
+// edge-to-edge apps. Hidden bars (setSystemBarsHidden) reserve nothing. A fullscreen app
+// (FLAG_FULLSCREEN, as --android-fullscreen's theme sets) has nothing
+// reserved and lays out over the whole window.
+//
+// With std.ui:
+//
+//     var reserved = ui.uniform(0)
+//     const kind = android.reservedInsets(activity, &reserved)
+//     var screen = ui.screen(width, height, reserved)
+//     // background everywhere; components inside screen.free
+pub const Reserved = enum(u8) {
+    // Not fullscreen: the insets of the status and navigation bars.
+    system_bars,
+    // Fullscreen: nothing reserved.
+    fullscreen,
+    // Not known yet (before the window's first layout pass, below API 23,
+    // or without a JNIEnv): nothing reserved for now; ask again after the
+    // next layout pass (onContentRectChanged).
+    unknown,
+}
+
+pub const FLAG_FULLSCREEN: i32 = 1024
+
+// The space reserved for the system in `activity`'s window (see Reserved),
+// in window pixels; all 0 unless `system_bars`. Call it on the main thread.
+pub fn reservedInsets(activity: usize, result: *ui.Insets) -> Reserved {
+    result.* = ui.uniform(0)
+    if isFullscreen(activity) { return Reserved.fullscreen }
+    var bars = ui.uniform(0)
+    var portrait_top: i32 = 0
+    if !systemInsets(activity, &bars, &portrait_top) { return Reserved.unknown }
+    // The status bar is shown: its band as tall as in portrait.
+    if bars.top > 0 && portrait_top > bars.top { bars.top = portrait_top }
+    result.* = bars
+    return Reserved.system_bars
+}
+
+// Hides or shows the status bar and the navigation bar at runtime (hide
+// both for fullscreen; the navigation bar alone for more room at the
+// bottom). A swipe from the edge shows hidden bars for a moment. API 30+
+// uses the window's WindowInsetsController, older levels the decor view's
+// system UI flags (immersive sticky). Call it on the main thread; the
+// reserved space follows once the window has applied it (ask
+// reservedInsets again a few frames later). False when it cannot be asked.
+pub fn setSystemBarsHidden(activity: usize, status: bool, navigation: bool) -> bool {
+    var env: usize = 0
+    var object: usize = 0
+    var sdk: i32 = 0
+    if !jniEnter(activity, &env, &object, &sdk) { return false }
+    var ok = true
+    const window = jniCallObject(env, object, "getWindow", "()Landroid/view/Window;", 0)
+    if sdk >= 30 {
+        const controller = jniCallObject(env, window, "getInsetsController", "()Landroid/view/WindowInsetsController;", 0)
+        const types = insetTypes(env)
+        const status_mask = jniStaticInt(env, types, "statusBars", &ok)
+        const navigation_mask = jniStaticInt(env, types, "navigationBars", &ok)
+        if controller == 0 || types == 0 { ok = false }
+        if ok {
+            var behavior: u64 = BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+            jniCallVoid(env, controller, "setSystemBarsBehavior", "(I)V", @intFromPtr(&behavior), &ok)
+            var hide: i32 = 0
+            var show: i32 = 0
+            if status { hide = hide | status_mask } else { show = show | status_mask }
+            if navigation { hide = hide | navigation_mask } else { show = show | navigation_mask }
+            var hide_argument: u64 = @intCast(u64, @bitCast(u32, hide))
+            var show_argument: u64 = @intCast(u64, @bitCast(u32, show))
+            if hide != 0 { jniCallVoid(env, controller, "hide", "(I)V", @intFromPtr(&hide_argument), &ok) }
+            if show != 0 { jniCallVoid(env, controller, "show", "(I)V", @intFromPtr(&show_argument), &ok) }
+        }
+    } else {
+        const decor = jniCallObject(env, window, "getDecorView", "()Landroid/view/View;", 0)
+        var flags: i32 = SYSTEM_UI_LAYOUT_STABLE | SYSTEM_UI_LAYOUT_HIDE_NAVIGATION | SYSTEM_UI_LAYOUT_FULLSCREEN | SYSTEM_UI_IMMERSIVE_STICKY
+        if status { flags = flags | SYSTEM_UI_FULLSCREEN }
+        if navigation { flags = flags | SYSTEM_UI_HIDE_NAVIGATION }
+        var argument: u64 = @intCast(u64, @bitCast(u32, flags))
+        if decor == 0 { ok = false } else { jniCallVoid(env, decor, "setSystemUiVisibility", "(I)V", @intFromPtr(&argument), &ok) }
+    }
+    jniLeave(env)
+    return ok
+}
+
+// WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE.
+const BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE: u64 = 2
+// View.SYSTEM_UI_FLAG_* (API 19-29).
+const SYSTEM_UI_HIDE_NAVIGATION: i32 = 2
+const SYSTEM_UI_FULLSCREEN: i32 = 4
+const SYSTEM_UI_LAYOUT_STABLE: i32 = 256
+const SYSTEM_UI_LAYOUT_HIDE_NAVIGATION: i32 = 512
+const SYSTEM_UI_LAYOUT_FULLSCREEN: i32 = 1024
+const SYSTEM_UI_IMMERSIVE_STICKY: i32 = 4096
+
+// Whether the window hides the status bar (its WindowManager.LayoutParams
+// has FLAG_FULLSCREEN). False when that cannot be asked.
+pub fn isFullscreen(activity: usize) -> bool {
+    var env: usize = 0
+    var object: usize = 0
+    var sdk: i32 = 0
+    if !jniEnter(activity, &env, &object, &sdk) { return false }
+    var ok = true
+    const window = jniCallObject(env, object, "getWindow", "()Landroid/view/Window;", 0)
+    const attributes = jniCallObject(env, window, "getAttributes", "()Landroid/view/WindowManager$LayoutParams;", 0)
+    var flags: i32 = 0
+    if attributes != 0 { flags = jniIntField(env, attributes, "flags", &ok) }
+    jniLeave(env)
+    return attributes != 0 && ok && flags & FLAG_FULLSCREEN != 0
+}
+
+// Where the system bars cover the window: the status and navigation bars
+// (not display cutouts), in window pixels, whether or not the app is
+// fullscreen (reservedInsets applies the rule). The NDK has no C call for
+// this, so it asks the Java side:
+//
+//     activity.getWindow().getDecorView().getRootWindowInsets()
+//         .getInsets(WindowInsets.Type.systemBars())                     (API 30+)
+//         .getSystemWindowInsetTop() ...                                 (API 23-29)
+//
+// through the activity's JNIEnv, so call it on the main thread (the
+// activity callbacks and looper callbacks run there). False, with all
+// insets 0, below API 23, before the window is attached (no insets yet) or
+// when a call fails; any Java exception is cleared.
+pub fn windowInsets(activity: usize, result: *ui.Insets) -> bool {
+    var portrait_top: i32 = 0
+    return systemInsets(activity, result, &portrait_top)
+}
+
+// The system bars' insets and the status bar's height in portrait.
+fn systemInsets(activity: usize, result: *ui.Insets, portrait_top: *i32) -> bool {
+    result.* = ui.uniform(0)
+    portrait_top.* = 0
+    var env: usize = 0
+    var object: usize = 0
+    var sdk: i32 = 0
+    if !jniEnter(activity, &env, &object, &sdk) { return false }
+    var insets = ui.uniform(0)
+    var top: i32 = 0
+    const found = queryInsets(env, object, sdk, &insets, &top)
+    jniLeave(env)
+    if found {
+        result.* = insets
+        portrait_top.* = top
+    }
+    return found
+}
+
+// The activity's JNIEnv, NativeActivity object and API level, with a local
+// reference frame pushed (the references made until jniLeave are freed
+// with it). False below API 23 or without a JNIEnv.
+fn jniEnter(activity: usize, env: *usize, object: *usize, sdk: *i32) -> bool {
+    unsafe {
+        env.* = @ptrFromInt(*usize, activity + ACTIVITY_ENV).*
+        object.* = @ptrFromInt(*usize, activity + ACTIVITY_OBJECT).*
+        sdk.* = @ptrFromInt(*i32, activity + ACTIVITY_SDK_VERSION).*
+    }
+    if env.* == 0 || object.* == 0 || sdk.* < 23 { return false }
+    var push: JniPushLocalFrame = undefined
+    unsafe { push = @ptrFromInt(JniPushLocalFrame, jniFunction(env.*, JNI_PUSH_LOCAL_FRAME)) }
+    if push(env.*, 16) != 0 {
+        const failed = jniFailed(env.*)
+        return false
+    }
+    return true
+}
+
+fn jniLeave(env: usize) -> void {
+    var pop: JniPopLocalFrame = undefined
+    unsafe { pop = @ptrFromInt(JniPopLocalFrame, jniFunction(env, JNI_POP_LOCAL_FRAME)) }
+    const popped = pop(env, 0)
+}
+
+// JNIEnv is a pointer to the table of JNI functions (jni.h, JNINativeInterface).
+const JNI_EXCEPTION_CLEAR: usize = 17
+const JNI_PUSH_LOCAL_FRAME: usize = 19
+const JNI_POP_LOCAL_FRAME: usize = 20
+const JNI_FIND_CLASS: usize = 6
+const JNI_GET_OBJECT_CLASS: usize = 31
+const JNI_GET_METHOD_ID: usize = 33
+const JNI_CALL_OBJECT_METHOD_A: usize = 36
+const JNI_CALL_INT_METHOD_A: usize = 51
+const JNI_CALL_VOID_METHOD_A: usize = 63
+const JNI_GET_FIELD_ID: usize = 94
+const JNI_GET_INT_FIELD: usize = 100
+const JNI_GET_STATIC_METHOD_ID: usize = 113
+const JNI_CALL_STATIC_INT_METHOD_A: usize = 131
+const JNI_NEW_STRING_UTF: usize = 167
+const JNI_EXCEPTION_CHECK: usize = 228
+
+// struct ANativeActivity: env (JNIEnv*), clazz (the NativeActivity
+// object), sdkVersion.
+const ACTIVITY_ENV: usize = 16
+const ACTIVITY_OBJECT: usize = 24
+const ACTIVITY_SDK_VERSION: usize = 48
+
+const JniFindClass = fn(usize, [*]const u8) -> usize
+const JniGetObjectClass = fn(usize, usize) -> usize
+// GetMethodID, GetStaticMethodID and GetFieldID: (env, class, name, signature).
+const JniGetMember = fn(usize, usize, [*]const u8, [*]const u8) -> usize
+// Call<Type>MethodA: (env, object or class, method, jvalue arguments).
+const JniCallObjectA = fn(usize, usize, usize, usize) -> usize
+const JniCallIntA = fn(usize, usize, usize, usize) -> i32
+const JniCallVoidA = fn(usize, usize, usize, usize) -> void
+const JniGetIntField = fn(usize, usize, usize) -> i32
+const JniExceptionCheck = fn(usize) -> u32
+const JniExceptionClear = fn(usize) -> void
+const JniPushLocalFrame = fn(usize, i32) -> i32
+const JniPopLocalFrame = fn(usize, usize) -> usize
+
+fn jniFunction(env: usize, index: usize) -> usize {
+    unsafe {
+        const table = @ptrFromInt(*usize, env).*
+        return @ptrFromInt(*usize, table + index * 8).*
+    }
+}
+
+// Whether the last call threw; clears the exception.
+fn jniFailed(env: usize) -> bool {
+    var check: JniExceptionCheck = undefined
+    unsafe { check = @ptrFromInt(JniExceptionCheck, jniFunction(env, JNI_EXCEPTION_CHECK)) }
+    if check(env) & 255 == 0 { return false }
+    var clear: JniExceptionClear = undefined
+    unsafe { clear = @ptrFromInt(JniExceptionClear, jniFunction(env, JNI_EXCEPTION_CLEAR)) }
+    clear(env)
+    return true
+}
+
+// A method or field of `class` (0 when missing).
+fn jniMember(env: usize, index: usize, class: usize, name: []const u8, signature: []const u8) -> usize {
+    if class == 0 { return 0 }
+    var get: JniGetMember = undefined
+    unsafe { get = @ptrFromInt(JniGetMember, jniFunction(env, index)) }
+    var member: usize = 0
+    unsafe { member = get(env, class, @ptrCast([*]const u8, name), @ptrCast([*]const u8, signature)) }
+    if jniFailed(env) { return 0 }
+    return member
+}
+
+fn jniClassOf(env: usize, object: usize) -> usize {
+    var get: JniGetObjectClass = undefined
+    unsafe { get = @ptrFromInt(JniGetObjectClass, jniFunction(env, JNI_GET_OBJECT_CLASS)) }
+    const class = get(env, object)
+    if jniFailed(env) { return 0 }
+    return class
+}
+
+// object.name() for a method returning an object (0 for null or failure);
+// `arguments` points at jvalues, or is 0.
+fn jniCallObject(env: usize, object: usize, name: []const u8, signature: []const u8, arguments: usize) -> usize {
+    if object == 0 { return 0 }
+    const method = jniMember(env, JNI_GET_METHOD_ID, jniClassOf(env, object), name, signature)
+    if method == 0 { return 0 }
+    var call: JniCallObjectA = undefined
+    unsafe { call = @ptrFromInt(JniCallObjectA, jniFunction(env, JNI_CALL_OBJECT_METHOD_A)) }
+    const value = call(env, object, method, arguments)
+    if jniFailed(env) { return 0 }
+    return value
+}
+
+// object.name() for a method returning an int; `ok` turns false on failure.
+fn jniCallInt(env: usize, object: usize, name: []const u8, ok: *bool) -> i32 {
+    return jniCallIntWith(env, object, name, "()I", 0, ok)
+}
+
+// The same with a signature and jvalue arguments.
+fn jniCallIntWith(env: usize, object: usize, name: []const u8, signature: []const u8, arguments: usize, ok: *bool) -> i32 {
+    if object == 0 {
+        ok.* = false
+        return 0
+    }
+    const method = jniMember(env, JNI_GET_METHOD_ID, jniClassOf(env, object), name, signature)
+    if method == 0 {
+        ok.* = false
+        return 0
+    }
+    var call: JniCallIntA = undefined
+    unsafe { call = @ptrFromInt(JniCallIntA, jniFunction(env, JNI_CALL_INT_METHOD_A)) }
+    const value = call(env, object, method, arguments)
+    if jniFailed(env) { ok.* = false }
+    return value
+}
+
+// object.name(arguments) for a void method.
+fn jniCallVoid(env: usize, object: usize, name: []const u8, signature: []const u8, arguments: usize, ok: *bool) -> void {
+    if object == 0 {
+        ok.* = false
+        return
+    }
+    const method = jniMember(env, JNI_GET_METHOD_ID, jniClassOf(env, object), name, signature)
+    if method == 0 {
+        ok.* = false
+        return
+    }
+    var call: JniCallVoidA = undefined
+    unsafe { call = @ptrFromInt(JniCallVoidA, jniFunction(env, JNI_CALL_VOID_METHOD_A)) }
+    call(env, object, method, arguments)
+    if jniFailed(env) { ok.* = false }
+}
+
+// A java.lang.String (a local reference; 0 on failure).
+fn jniString(env: usize, text: []const u8) -> usize {
+    var make: JniFindClass = undefined
+    unsafe { make = @ptrFromInt(JniFindClass, jniFunction(env, JNI_NEW_STRING_UTF)) }
+    var value: usize = 0
+    unsafe { value = make(env, @ptrCast([*]const u8, text)) }
+    if jniFailed(env) { return 0 }
+    return value
+}
+
+// android.view.WindowInsets$Type (API 30+; 0 on failure).
+fn insetTypes(env: usize) -> usize {
+    var find: JniFindClass = undefined
+    unsafe { find = @ptrFromInt(JniFindClass, jniFunction(env, JNI_FIND_CLASS)) }
+    var types: usize = 0
+    unsafe { types = find(env, @ptrCast([*]const u8, "android/view/WindowInsets$Type")) }
+    if jniFailed(env) { return 0 }
+    return types
+}
+
+fn jniStaticInt(env: usize, class: usize, name: []const u8, ok: *bool) -> i32 {
+    const method = jniMember(env, JNI_GET_STATIC_METHOD_ID, class, name, "()I")
+    if method == 0 {
+        ok.* = false
+        return 0
+    }
+    var call: JniCallIntA = undefined
+    unsafe { call = @ptrFromInt(JniCallIntA, jniFunction(env, JNI_CALL_STATIC_INT_METHOD_A)) }
+    const value = call(env, class, method, 0)
+    if jniFailed(env) { ok.* = false }
+    return value
+}
+
+fn jniIntField(env: usize, object: usize, name: []const u8, ok: *bool) -> i32 {
+    const field = jniMember(env, JNI_GET_FIELD_ID, jniClassOf(env, object), name, "I")
+    if field == 0 {
+        ok.* = false
+        return 0
+    }
+    var get: JniGetIntField = undefined
+    unsafe { get = @ptrFromInt(JniGetIntField, jniFunction(env, JNI_GET_INT_FIELD)) }
+    const value = get(env, object, field)
+    if jniFailed(env) { ok.* = false }
+    return value
+}
+
+// The four int fields of an android.graphics.Insets.
+fn insetFields(env: usize, values: usize, result: *ui.Insets, ok: *bool) -> void {
+    result.*.top = jniIntField(env, values, "top", ok)
+    result.*.right = jniIntField(env, values, "right", ok)
+    result.*.bottom = jniIntField(env, values, "bottom", ok)
+    result.*.left = jniIntField(env, values, "left", ok)
+}
+
+fn deepest(insets: ui.Insets) -> i32 {
+    var depth = insets.top
+    if insets.right > depth { depth = insets.right }
+    if insets.bottom > depth { depth = insets.bottom }
+    if insets.left > depth { depth = insets.left }
+    return depth
+}
+
+// The system's status bar height for portrait (the dimen
+// status_bar_height_portrait, else status_bar_height; 0 if neither).
+fn statusBarResource(env: usize, activity_object: usize) -> i32 {
+    const resources = jniCallObject(env, activity_object, "getResources", "()Landroid/content/res/Resources;", 0)
+    if resources == 0 { return 0 }
+    var ok = true
+    var id = resourceId(env, resources, "status_bar_height_portrait", &ok)
+    if id == 0 { id = resourceId(env, resources, "status_bar_height", &ok) }
+    if id == 0 { return 0 }
+    ok = true
+    var argument: u64 = @intCast(u64, @bitCast(u32, id))
+    const pixels = jniCallIntWith(env, resources, "getDimensionPixelSize", "(I)I", @intFromPtr(&argument), &ok)
+    if !ok { return 0 }
+    return pixels
+}
+
+// resources.getIdentifier(name, "dimen", "android").
+fn resourceId(env: usize, resources: usize, name: []const u8, ok: *bool) -> i32 {
+    var arguments: [3]u64 = [3]u64{ 0, 0, 0 }
+    arguments[0] = @intCast(u64, jniString(env, name))
+    arguments[1] = @intCast(u64, jniString(env, "dimen"))
+    arguments[2] = @intCast(u64, jniString(env, "android"))
+    if arguments[0] == 0 || arguments[1] == 0 || arguments[2] == 0 { return 0 }
+    return jniCallIntWith(env, resources, "getIdentifier", "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)I", @intFromPtr(&arguments), ok)
+}
+
+// The system bars' insets, and the status bar's height in portrait: the
+// larger of the system's portrait status bar height and the display
+// cutout's depth (its deepest safe inset; the cutout is at the top in
+// portrait and at a side in landscape).
+fn queryInsets(env: usize, activity_object: usize, sdk: i32, result: *ui.Insets, portrait_top: *i32) -> bool {
+    const window = jniCallObject(env, activity_object, "getWindow", "()Landroid/view/Window;", 0)
+    const decor = jniCallObject(env, window, "getDecorView", "()Landroid/view/View;", 0)
+    const insets = jniCallObject(env, decor, "getRootWindowInsets", "()Landroid/view/WindowInsets;", 0)
+    if insets == 0 { return false }
+    var ok = true
+    // The cutout is optional: failures there only leave its depth 0.
+    var cutout_ok = true
+    var cutout = ui.uniform(0)
+    if sdk >= 30 {
+        const types = insetTypes(env)
+        if types == 0 { return false }
+        const bars = jniStaticInt(env, types, "systemBars", &ok)
+        if !ok { return false }
+        // One jvalue: the int type mask.
+        var argument: u64 = @intCast(u64, @bitCast(u32, bars))
+        const values = jniCallObject(env, insets, "getInsets", "(I)Landroid/graphics/Insets;", @intFromPtr(&argument))
+        if values == 0 { return false }
+        insetFields(env, values, result, &ok)
+        const cutout_mask = jniStaticInt(env, types, "displayCutout", &cutout_ok)
+        var cutout_argument: u64 = @intCast(u64, @bitCast(u32, cutout_mask))
+        const cutout_values = if cutout_ok { jniCallObject(env, insets, "getInsets", "(I)Landroid/graphics/Insets;", @intFromPtr(&cutout_argument)) } else { 0 }
+        if cutout_values != 0 { insetFields(env, cutout_values, &cutout, &cutout_ok) }
+    } else {
+        result.*.top = jniCallInt(env, insets, "getSystemWindowInsetTop", &ok)
+        result.*.right = jniCallInt(env, insets, "getSystemWindowInsetRight", &ok)
+        result.*.bottom = jniCallInt(env, insets, "getSystemWindowInsetBottom", &ok)
+        result.*.left = jniCallInt(env, insets, "getSystemWindowInsetLeft", &ok)
+        if sdk >= 28 {
+            const display_cutout = jniCallObject(env, insets, "getDisplayCutout", "()Landroid/view/DisplayCutout;", 0)
+            if display_cutout != 0 {
+                cutout.top = jniCallInt(env, display_cutout, "getSafeInsetTop", &cutout_ok)
+                cutout.right = jniCallInt(env, display_cutout, "getSafeInsetRight", &cutout_ok)
+                cutout.bottom = jniCallInt(env, display_cutout, "getSafeInsetBottom", &cutout_ok)
+                cutout.left = jniCallInt(env, display_cutout, "getSafeInsetLeft", &cutout_ok)
+            }
+        }
+    }
+    var top = statusBarResource(env, activity_object)
+    if cutout_ok && deepest(cutout) > top { top = deepest(cutout) }
+    portrait_top.* = top
+    return ok
+}
+
+// ── Gestures ──────────────────────────────────────────────────────────────
+
+pub const Gesture = enum(u8) { tap, long_press, swipe_left, swipe_right, swipe_up, swipe_down }
+
+pub const DrawFn = fn(*Canvas, usize) -> void
+pub const UpdateFn = fn(usize, Gesture) -> usize
+
+// A touch that stays within this many pixels of where it went down is a
+// tap or long press; beyond it, a swipe (about 8dp on a typical phone).
+pub const TOUCH_SLOP: i64 = 24
+// Held without moving this long (nanoseconds): a long press.
+pub const LONG_PRESS_NANOSECONDS: i64 = 500000000
+
+// ── Runtime ───────────────────────────────────────────────────────────────
+
+const App = struct {
+    activity: usize
+    window: usize
+    queue: usize
+    looper: usize
+    timer: i32
+    state: usize
+    draw: usize
+    update: usize
+    // Touch being tracked (one finger).
+    tracking: bool
+    moved: bool
+    longPressed: bool
+    downX: i64
+    downY: i64
+    downTime: i64
+    // Scratch in the same block: ANativeWindow_Buffer, the AInputEvent*
+    // out-parameter, an itimerspec, and the Canvas handed to `draw`.
+    buffer: usize
+    event: usize
+    timerSpec: usize
+    canvas: usize
+}
+
+fn appOf(activity: usize) -> *App {
+    unsafe { return @ptrFromInt(*App, @ptrFromInt(*usize, activity + ACTIVITY_INSTANCE).*) }
+}
+
+fn setCallback(activity: usize, offset: usize, function: usize) -> void {
+    unsafe {
+        const callbacks = @ptrFromInt(*usize, activity + ACTIVITY_CALLBACKS).*
+        @ptrFromInt(*usize, callbacks + offset).* = function
+    }
+}
+
+fn readU32(address: usize) -> u32 {
+    unsafe { return @ptrFromInt(*u32, address).* }
+}
+
+fn writeU64(address: usize, value: u64) -> void {
+    unsafe { @ptrFromInt(*u64, address).* = value }
+}
+
+// Starts the runtime for `activity` (call it from ANativeActivity_onCreate,
+// passing its arguments through).
+pub fn start(activity: usize, saved_state: usize, saved_state_size: usize, draw: DrawFn, update: UpdateFn) -> void {
+    const block = malloc(@sizeOf(App) + BUFFER_SIZE + 8 + 32 + @sizeOf(Canvas))
+    if block == 0 { return }
+    var app: *App = undefined
+    unsafe { app = @ptrFromInt(*App, block) }
+    app.*.activity = activity
+    app.*.window = 0
+    app.*.queue = 0
+    app.*.looper = ALooper_forThread()
+    app.*.state = 0
+    if saved_state != 0 && saved_state_size >= 8 {
+        unsafe { app.*.state = @ptrFromInt(*usize, saved_state).* }
+    }
+    app.*.draw = @intFromPtr(draw)
+    app.*.update = @intFromPtr(update)
+    app.*.tracking = false
+    app.*.moved = false
+    app.*.longPressed = false
+    app.*.downX = 0
+    app.*.downY = 0
+    app.*.downTime = 0
+    app.*.buffer = block + @sizeOf(App)
+    app.*.event = app.*.buffer + BUFFER_SIZE
+    app.*.timerSpec = app.*.event + 8
+    app.*.canvas = app.*.timerSpec + 32
+    app.*.timer = timerfd_create(CLOCK_MONOTONIC, TIMER_FLAGS)
+    if app.*.timer >= 0 && app.*.looper != 0 {
+        const added = ALooper_addFd(app.*.looper, app.*.timer, 2, LOOPER_EVENT_INPUT, @intFromPtr(onTimer), block)
+    }
+    unsafe { @ptrFromInt(*usize, activity + ACTIVITY_INSTANCE).* = block }
+    // Write into the callback table the framework already points us at.
+    setCallback(activity, ON_SAVE_INSTANCE_STATE, @intFromPtr(onSaveInstanceState))
+    setCallback(activity, ON_DESTROY, @intFromPtr(onDestroy))
+    setCallback(activity, ON_NATIVE_WINDOW_CREATED, @intFromPtr(onWindowChanged))
+    setCallback(activity, ON_NATIVE_WINDOW_RESIZED, @intFromPtr(onWindowChanged))
+    setCallback(activity, ON_NATIVE_WINDOW_REDRAW_NEEDED, @intFromPtr(onWindowChanged))
+    setCallback(activity, ON_NATIVE_WINDOW_DESTROYED, @intFromPtr(onWindowDestroyed))
+    setCallback(activity, ON_INPUT_QUEUE_CREATED, @intFromPtr(onInputQueueCreated))
+    setCallback(activity, ON_INPUT_QUEUE_DESTROYED, @intFromPtr(onInputQueueDestroyed))
+}
+
+// Repaints the whole window with the app's `draw`, with the reserved space
+// as it is now (a paint follows every window change).
+fn paint(app: *App) -> void {
+    const window = app.*.window
+    if window == 0 { return }
+    const geometry = ANativeWindow_setBuffersGeometry(window, 0, 0, WINDOW_FORMAT_RGBA_8888)
+    if ANativeWindow_lock(window, app.*.buffer, 0) < 0 { return }
+    const buffer = app.*.buffer
+    var canvas: *Canvas = undefined
+    unsafe { canvas = @ptrFromInt(*Canvas, app.*.canvas) }
+    canvas.*.width = @intCast(usize, readU32(buffer + BUFFER_WIDTH))
+    canvas.*.height = @intCast(usize, readU32(buffer + BUFFER_HEIGHT))
+    canvas.*.stride = @intCast(usize, readU32(buffer + BUFFER_STRIDE))
+    unsafe { canvas.*.pixels = @ptrFromInt(*usize, buffer + BUFFER_BITS).* }
+    var reserved = ui.uniform(0)
+    const kind = reservedInsets(app.*.activity, &reserved)
+    canvas.*.reserved = reserved
+    canvas.*.free = ui.inset(ui.rect(0, 0, @intCast(i32, canvas.*.width), @intCast(i32, canvas.*.height)), reserved)
+    var draw: DrawFn = undefined
+    unsafe { draw = @ptrFromInt(DrawFn, app.*.draw) }
+    draw(canvas, app.*.state)
+    const posted = ANativeWindow_unlockAndPost(window)
+}
+
+fn recognize(app: *App, gesture: Gesture) -> void {
+    match gesture {
+        Gesture.tap => { log("gesture: tap") },
+        Gesture.long_press => { log("gesture: long press") },
+        Gesture.swipe_left => { log("gesture: swipe left") },
+        Gesture.swipe_right => { log("gesture: swipe right") },
+        Gesture.swipe_up => { log("gesture: swipe up") },
+        else => { log("gesture: swipe down") },
+    }
+    var update: UpdateFn = undefined
+    unsafe { update = @ptrFromInt(UpdateFn, app.*.update) }
+    app.*.state = update(app.*.state, gesture)
+    paint(app)
+}
+
+// Arms the long-press timer for `nanoseconds` from now, or disarms it (0).
+fn setTimer(app: *App, nanoseconds: i64) -> void {
+    if app.*.timer < 0 { return }
+    const spec = app.*.timerSpec
+    writeU64(spec, 0) // it_interval: none
+    writeU64(spec + 8, 0)
+    writeU64(spec + 16, @intCast(u64, nanoseconds / 1000000000)) // it_value
+    writeU64(spec + 24, @intCast(u64, nanoseconds % 1000000000))
+    const set = timerfd_settime(app.*.timer, 0, spec, 0)
+}
+
+fn absolute(value: i64) -> i64 { return if value < 0 { 0 - value } else { value } }
+
+fn handleMotion(app: *App, event: usize) -> void {
+    const action = AMotionEvent_getAction(event) & MOTION_ACTION_MASK
+    const x_position: f32 = AMotionEvent_getX(event, 0)
+    const y_position: f32 = AMotionEvent_getY(event, 0)
+    const x: i64 = @intFromFloat(i64, x_position)
+    const y: i64 = @intFromFloat(i64, y_position)
+    if action == MOTION_ACTION_DOWN {
+        app.*.tracking = true
+        app.*.moved = false
+        app.*.longPressed = false
+        app.*.downX = x
+        app.*.downY = y
+        app.*.downTime = AMotionEvent_getEventTime(event)
+        setTimer(app, LONG_PRESS_NANOSECONDS)
+        return
+    }
+    if !app.*.tracking { return }
+    const dx = x - app.*.downX
+    const dy = y - app.*.downY
+    const outside = absolute(dx) > TOUCH_SLOP || absolute(dy) > TOUCH_SLOP
+    if action == MOTION_ACTION_MOVE {
+        if outside && !app.*.moved {
+            app.*.moved = true
+            setTimer(app, 0)
+        }
+        return
+    }
+    if action == MOTION_ACTION_UP {
+        app.*.tracking = false
+        setTimer(app, 0)
+        if app.*.longPressed { return }
+        if app.*.moved || outside {
+            if absolute(dx) >= absolute(dy) {
+                recognize(app, if dx < 0 { Gesture.swipe_left } else { Gesture.swipe_right })
+            } else {
+                recognize(app, if dy < 0 { Gesture.swipe_up } else { Gesture.swipe_down })
+            }
+            return
+        }
+        // Normally the timer already recognized a long press; this covers
+        // an UP that arrives before the timer callback runs.
+        const held = AMotionEvent_getEventTime(event) - app.*.downTime
+        recognize(app, if held >= LONG_PRESS_NANOSECONDS { Gesture.long_press } else { Gesture.tap })
+        return
+    }
+    if action == MOTION_ACTION_CANCEL || action == MOTION_ACTION_POINTER_DOWN {
+        app.*.tracking = false
+        setTimer(app, 0)
+    }
+}
+
+// ── Activity callbacks (C ABI, called by the framework) ───────────────────
+
+fn onWindowChanged(activity: usize, window: usize) -> void {
+    const app = appOf(activity)
+    app.*.window = window
+    paint(app)
+}
+
+fn onWindowDestroyed(activity: usize, window: usize) -> void {
+    appOf(activity).*.window = 0
+}
+
+fn onInputQueueCreated(activity: usize, queue: usize) -> void {
+    const app = appOf(activity)
+    app.*.queue = queue
+    AInputQueue_attachLooper(queue, app.*.looper, 1, @intFromPtr(onInput), @intFromPtr(app))
+}
+
+fn onInputQueueDestroyed(activity: usize, queue: usize) -> void {
+    const app = appOf(activity)
+    AInputQueue_detachLooper(queue)
+    app.*.queue = 0
+    app.*.tracking = false
+    setTimer(app, 0)
+}
+
+// Hands the framework the state to pass back to the next onCreate.
+fn onSaveInstanceState(activity: usize, size_out: usize) -> usize {
+    const saved = malloc(8)
+    if saved == 0 { return 0 }
+    writeU64(saved, @intCast(u64, appOf(activity).*.state))
+    writeU64(size_out, 8)
+    return saved
+}
+
+fn onDestroy(activity: usize) -> void {
+    const app = appOf(activity)
+    if app.*.timer >= 0 {
+        if app.*.looper != 0 { const removed = ALooper_removeFd(app.*.looper, app.*.timer) }
+        const closed = close(app.*.timer)
+    }
+    unsafe { @ptrFromInt(*usize, activity + ACTIVITY_INSTANCE).* = 0 }
+    free(@intFromPtr(app))
+}
+
+// ── Looper callbacks: return 1 to stay registered ─────────────────────────
+
+// Drains every pending input event; motion events feed the recognizer and
+// every event is finished as unhandled, so system gestures keep working.
+fn onInput(fd: i32, events: i32, data: usize) -> i32 {
+    var app: *App = undefined
+    unsafe { app = @ptrFromInt(*App, data) }
+    while app.*.queue != 0 && AInputQueue_getEvent(app.*.queue, app.*.event) >= 0 {
+        var event: usize = 0
+        unsafe { event = @ptrFromInt(*usize, app.*.event).* }
+        if AInputQueue_preDispatchEvent(app.*.queue, event) == 0 {
+            if AInputEvent_getType(event) == INPUT_EVENT_TYPE_MOTION { handleMotion(app, event) }
+            AInputQueue_finishEvent(app.*.queue, event, 0)
+        }
+    }
+    return 1
+}
+
+// The long-press timer expired while the finger is still down and still.
+fn onTimer(fd: i32, events: i32, data: usize) -> i32 {
+    var app: *App = undefined
+    unsafe { app = @ptrFromInt(*App, data) }
+    const expirations = read(fd, app.*.event, 8)
+    if app.*.tracking && !app.*.moved && !app.*.longPressed {
+        app.*.longPressed = true
+        recognize(app, Gesture.long_press)
+    }
+    return 1
+}

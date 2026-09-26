@@ -170,6 +170,17 @@ pub fn main() -> u8 {
 (`tests/183_float_exponent_runtime.mlx`; `@bitCast` reinterprets a value's
 bits as another same-size type, `@floatCast` converts between float widths)
 
+Unary minus negates floats as floats, including literals whose type comes
+from their context (`@intFromFloat(i64, -2.25)` is `-2`)
+(`tests/261_float_negation_context_runtime.mlx`).
+
+A float literal that meets an `f32` becomes an `f32` value, with no
+`@floatCast` needed: a typed binding (`const rate: f32 = 120.0`), an
+assignment, an argument for an `f32` parameter (also through a function
+pointer), a returned value, a structure field, and the other operand of
+arithmetic or a comparison with an `f32`
+(`tests/267_f32_literal_runtime.mlx`).
+
 ## Bit-counting
 
 `@popCount(value)` counts the set bits in an integer, signed or unsigned:
