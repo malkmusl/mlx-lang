@@ -179,11 +179,27 @@ with the system's keyboard layout (`localectl`, `/etc/default/keyboard` or
 `/etc/vconsole.conf`; `XKB_DEFAULT_LAYOUT` wins), composed by the GPU when
 a Vulkan driver works, else on the CPU (the log says which). Alt+Enter
 opens a terminal, Ctrl+Alt+F1..F12 switch VTs, Alt+Shift+Q ends the
-session, and everything the compositor logs (`--verbose`) goes to
-`~/.local/state/mlx-compositor/session.log`, which is the place to look
-when the session does not come up: it names the renderer, every window,
-and, should the compositor die, the crash (below). `MLX_COMPOSITOR_ARGS`
-adds options (`--renderer cpu` to stay on the CPU).
+session. `MLX_COMPOSITOR_ARGS` adds options (`--renderer cpu` to stay on
+the CPU).
+
+The session log is `~/.config/mlx/compositor.log` (`MLX_SESSION_LOG`
+names another file; the previous run's log is kept as
+`compositor.log.old`). It is the place to look when the session does not
+come up. It starts with the environment the display manager gave the
+session (user, `XDG_SESSION_ID`, seat and VT, the logind session's type
+and activity, the system bus, the DRM devices, the Vulkan drivers
+installed, a checksum of the compositor binary), then holds everything
+the compositor prints with `--verbose`: the card and mode it took
+(`drm: /dev/dri/card1 3840x1080 at 60 Hz`), the renderer, `drm: first
+frame on screen` once the monitor shows a frame, or `drm: modeset failed
+(errno N); nothing shown yet, trying again` when the kernel refuses the
+mode (13 is EACCES: the card is not ours, 22 EINVAL: the mode or buffer),
+every window, and how it all ended (`mlx-compositor exited with status N`
+or `was killed by signal N`, with the crash line below when there was
+one). A compositor that crashes within its first 20 seconds, or gives up
+that early while composing with Vulkan, is started once more with
+`--renderer cpu`, so a Vulkan-only failure still leaves a working
+session, and the log shows both attempts.
 
 `MLX_SESSION_HOST=cage` or `weston` in the session's environment runs the
 compositor nested instead, fullscreen in a minimal host that drives the

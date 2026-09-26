@@ -40,7 +40,7 @@ run_session() {
         XKB_DEFAULT_LAYOUT=de MLX_SESSION_HOST="$host" MLX_SESSION_BACKEND=headless \
         MLX_COMPOSITOR_ARGS="--timeout 2" \
         timeout 30 "$bindir/mlx-session" || true
-    cat "$home/.local/state/mlx-compositor/session.log"
+    cat "$home/.config/mlx/compositor.log"
 }
 
 checked=0

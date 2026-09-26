@@ -115,5 +115,5 @@ if [[ -z "$destdir" ]]; then
     echo "choosing your user, in SDDM in the session menu. Alt+Enter opens a"
     echo "terminal, Ctrl+Alt+F1..F12 switch VTs, Alt+Shift+Q ends the session."
     echo "Its log is"
-    echo "${XDG_STATE_HOME:-$HOME/.local/state}/mlx-compositor/session.log."
+    echo "${XDG_CONFIG_HOME:-$HOME/.config}/mlx/compositor.log."
 fi
