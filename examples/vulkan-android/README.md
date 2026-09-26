@@ -20,7 +20,10 @@ Android, get red and blue swapped in the shader.
 
 Frames follow the display: the app draws one frame per vsync from
 Android's frame clock (`AChoreographer`, found at run time; below API 24 a
-60 Hz timerfd). A frame is submitted without waiting for the GPU, which
+60 Hz timerfd). It asks for 120 Hz for its window
+(`ANativeWindow_setFrameRate`, API 30+), so on a phone with a faster
+display, and on a Pixel with "Smooth Display" on, it draws 120 frames a
+second; otherwise the display, and the app, stay at 60. A frame is submitted without waiting for the GPU, which
 finishes it while the main looper goes back to input; the next frame waits
 for it before reusing the command buffer. The swapchain has as few images
 as the surface allows (3 on Android) and one present semaphore per image,

@@ -45,13 +45,15 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "tools"))
 from aarch64_linux_emulator import SharedLibrary  # noqa: E402
 from emulate_android_app import Framework, TIMER_FD, WINDOW  # noqa: E402
-from unicorn.arm64_const import UC_ARM64_REG_SP  # noqa: E402
+from unicorn.arm64_const import UC_ARM64_REG_S0, UC_ARM64_REG_SP  # noqa: E402
 
 LIBVULKAN = 0x5800_0000_0001
 LIBANDROID = 0x5800_0000_0002
 CHOREOGRAPHER = 0x5C00_0000_0001
-# The display refreshes every 16.67 ms (60 Hz).
+# The display refreshes every 16.67 ms (60 Hz), or every 8.33 ms at 120 Hz
+# when the app asks for it and the user's setting allows it.
 VSYNC = 16_666_667
+VSYNC_120 = 8_333_333
 FORMAT_R8G8B8A8_UNORM = 37
 LAYOUT_UNDEFINED, LAYOUT_TRANSFER_DST, LAYOUT_PRESENT_SRC = 0, 7, 1000001002
 ERROR_OUT_OF_DATE = (-1000001004) & 0xFFFFFFFF
@@ -552,7 +554,8 @@ class MockVulkan:
 class App(Framework):
     """The framework model with a periodic timerfd and the mock driver."""
 
-    def __init__(self, library_path, available=True, verbose=False, font=FONT, jni=None, choreographer=True):
+    def __init__(self, library_path, available=True, verbose=False, font=FONT, jni=None, choreographer=True,
+                 peak_rate=60):
         super().__init__(library_path, verbose=verbose, jni=jni)
         self.timer_interval = 0
         self.vulkan = MockVulkan(self, available)
@@ -560,6 +563,11 @@ class App(Framework):
         # the next vsync after they were posted.
         self.choreographer = choreographer
         self.frame_callbacks = []
+        # ANativeWindow_setFrameRate: what the app asked for, and the most
+        # the user allows (a Pixel's "Smooth Display": 120 on, 60 off).
+        self.peak_rate = peak_rate
+        self.frame_rate_requests = []
+        self.vsync = VSYNC
         vulkan_dlopen, vulkan_dlsym = self.vulkan.dlopen, self.vulkan.dlsym
 
         def dlopen(process, name, flags, *_):
@@ -575,6 +583,8 @@ class App(Framework):
                 return self.vulkan.stub(symbol, lambda p, *_: CHOREOGRAPHER)
             if symbol == "AChoreographer_postFrameCallback":
                 return self.vulkan.stub(symbol, self._post_frame_callback)
+            if symbol == "ANativeWindow_setFrameRate":
+                return self.vulkan.stub(symbol, self._set_frame_rate)
             return 0
         self.lib.imports.update({"dlopen": dlopen, "dlsym": dlsym})
 
@@ -605,6 +615,13 @@ class App(Framework):
         self.timer_expired = False
         return 0
 
+    def _set_frame_rate(self, process, window, compatibility, *_):
+        rate = struct.unpack("<f", struct.pack("<I", process.uc.reg_read(UC_ARM64_REG_S0) & 0xFFFFFFFF))[0]
+        assert window == WINDOW, "frame rate for another window"
+        self.frame_rate_requests.append((rate, compatibility & 0xFF))
+        self.vsync = VSYNC_120 if rate >= 120 and self.peak_rate >= 120 else VSYNC
+        return 0
+
     def _post_frame_callback(self, process, instance, callback, data, *_):
         assert instance == CHOREOGRAPHER, "frame callback on an unknown choreographer"
         self.frame_callbacks.append((callback, data))
@@ -613,7 +630,7 @@ class App(Framework):
         """Runs the timer and the vsync frame callbacks due up to `until`,
         in time order."""
         while True:
-            vsync = (self.now // VSYNC + 1) * VSYNC if self.frame_callbacks else None
+            vsync = (self.now // self.vsync + 1) * self.vsync if self.frame_callbacks else None
             due = [t for t in (self.timer_deadline, vsync) if t is not None and t <= until]
             if not due:
                 break
@@ -895,6 +912,28 @@ def scenario_landscape(library):
     return len(vulkan.frames)
 
 
+def scenario_smooth_display(library):
+    """With "Smooth Display" on (the user allows 120 Hz) the app's request
+    for 120 frames a second makes the display, and so the frame clock, run
+    at 120 Hz: 120 frames a second."""
+    app = App(library, jni={"sdk": 34, "insets": (22, 0, 6, 0)}, peak_rate=120)
+    vulkan = app.vulkan
+    vulkan.extent = (640, 160)
+    app.create()
+    app.show_window()
+    assert app.frame_rate_requests == [(120.0, 0)], app.frame_rate_requests
+    assert "vulkan: asked for 120 Hz" in app.messages(), app.messages()
+    app.advance(1100 * MS)
+    assert "perf: 120 FPS, 0.0 ms per frame" in app.messages(), [m for m in app.messages() if m.startswith("perf")]
+    assert len(vulkan.frames) >= 130, len(vulkan.frames)
+    del centered[:]
+    check_frame(vulkan.frames[-1], (len(vulkan.frames) - 1) * 2, insets=(22, 0, 6, 0), app=app)
+    assert centered == [True]
+    app.callback("onNativeWindowDestroyed", WINDOW)
+    app.callback("onDestroy")
+    return len(vulkan.frames)
+
+
 def scenario_fullscreen(library):
     """Fullscreen: nothing is reserved, so the whole frame is the pattern
     and the label sits at the top center of the whole window, as if there
@@ -981,6 +1020,8 @@ def scenario_switches(library):
     # during a call).
     app.advance(1100 * MS)
     assert "perf: 60 FPS, 0.0 ms per frame" in app.messages(), [m for m in app.messages() if m.startswith("perf")]
+    # "Smooth Display" off: the request for 120 Hz is made, the display stays at 60.
+    assert app.frame_rate_requests == [(120.0, 0)] and app.vsync == VSYNC, app.frame_rate_requests
     app.advance(1120 * MS)
     del centered[:]
     check_frame(vulkan.frames[-1], (len(vulkan.frames) - 1) * 2, pointer, insets=(22, 0, 6, 0), app=app)
@@ -1047,6 +1088,8 @@ def main():
         print(f"ok   landscape (ROTATE_90, API 29 insets, 60 Hz timer): {frames} frames, upright with an IDENTITY swapchain, no rebuild per suboptimal present")
         frames = scenario_switches(path)
         print(f"ok   switches: {frames} frames, navigation bar and fullscreen toggled at runtime, the reserved space following; 60 FPS counter")
+        frames = scenario_smooth_display(path)
+        print(f"ok   smooth display: {frames} frames in 1.1 s, 120 FPS after asking for 120 Hz (60 with the setting off)")
         frames = scenario_fullscreen(path)
         print(f"ok   fullscreen: {frames} frames, nothing reserved, the label at the top center of the whole window")
         scenario_no_font(path)

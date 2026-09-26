@@ -313,11 +313,6 @@ current.
 
 ## Limits
 
-- `f32` locals and arguments are not reliable with the bootstrap compiler
-  (a float literal stays a 64-bit value); stores into `f32` fields are
-  correct, so structures are fine, but commands taking float scalars
-  (`vkCmdSetLineWidth`, `vkCmdSetDepthBias`, `vkCmdSetDepthBounds`) should
-  not be used yet. Tests pass `1.0` queue priorities as `0x3F800000` bits.
 - Methods with a `*const Self` receiver cannot be called on a value yet, so
   commands are free functions taking their dispatch table.
 - A struct's methods may only name types declared earlier, and a pointer
