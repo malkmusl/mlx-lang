@@ -75,19 +75,30 @@ if [[ $uninstall -eq 1 ]]; then
     exit 0
 fi
 
-# The compiler.
+# The compiler: the canonical one (mlx-out/bin/compiler/mlx4, the
+# self-hosted compiler's fixed point, which builds the same binary from the
+# same sources on every machine, so a crash address from one machine finds
+# its place on another). When only the bootstrap-built mlx1 is there, it
+# builds the chain mlx1 -> mlx2 -> mlx3 and keeps mlx3 as mlx4.
 if [[ -z "$compiler" ]]; then
     if [[ -x mlx-out/bin/compiler/mlx4 ]]; then
         compiler=mlx-out/bin/compiler/mlx4
-    elif [[ -x zig-out/bin/mlx1 ]]; then
-        compiler=zig-out/bin/mlx1
-    elif command -v zig > /dev/null; then
-        echo "building the Mlx compiler (zig build mlx1)"
-        zig build mlx1
-        compiler=zig-out/bin/mlx1
     else
-        echo "install_compositor_session.sh: no Mlx compiler; build one (zig build mlx1) or pass --compiler" >&2
-        exit 1
+        if [[ ! -x zig-out/bin/mlx1 ]]; then
+            if command -v zig > /dev/null; then
+                echo "building the Mlx compiler (zig build mlx1)"
+                zig build mlx1
+            else
+                echo "install_compositor_session.sh: no Mlx compiler; build one (zig build mlx1) or pass --compiler" >&2
+                exit 1
+            fi
+        fi
+        echo "building the canonical compiler (mlx1 -> mlx2 -> mlx3, kept as mlx-out/bin/compiler/mlx4)"
+        mkdir -p mlx-out/bin/compiler
+        zig-out/bin/mlx1 --quiet compiler/selfhost/main.mlx -o mlx-out/bin/compiler/mlx2
+        mlx-out/bin/compiler/mlx2 --quiet compiler/selfhost/main.mlx -o mlx-out/bin/compiler/mlx3
+        cp mlx-out/bin/compiler/mlx3 mlx-out/bin/compiler/mlx4
+        compiler=mlx-out/bin/compiler/mlx4
     fi
 fi
 

@@ -189,7 +189,13 @@ logind), the Vulkan drivers, libxkbcommon, and the last session log,
 whose `modeset failed`, `crashed:` or `killed by signal` lines it points
 out. It wraps `tools/install_compositor_session.sh`, which does the
 building and copying (`--prefix`, default `/usr/local` there; `--destdir`
-stages for packaging; `--build-only` builds into `mlx-out/session`):
+stages for packaging; `--build-only` builds into `mlx-out/session`). The
+build uses the canonical compiler, `mlx-out/bin/compiler/mlx4`, and makes
+it first from the bootstrap-built `zig-out/bin/mlx1` when it is missing
+(`mlx1 -> mlx2 -> mlx3`, the self-hosted compiler's fixed point): that
+compiler builds the same binary from the same sources on every machine,
+so the checksum `--check` prints matches a build elsewhere, and a crash
+address from one machine finds its place in another's disassembly.
 
 It puts `mlx-compositor`, `mlx-terminal` and `mlx-session` into
 `/usr/local/bin` (`--prefix`) and `mlx-compositor.desktop` into
