@@ -1,0 +1,219 @@
+// std.wayland's message storage: sending an event or a request, and
+// handling one, must not grow the process however many there are, so a
+// compositor can run for days. This compiler keeps every value that is not
+// a field of something else in an arena that is only ever bumped, so a
+// message-sized local per send or per dispatch (as before) grows the arena
+// by 4 KiB each. A forked server sends 20000 wl_shm.format events to a
+// client that sends 20000 wl_surface.damage requests back; sending and
+// handling them may grow the arena by less than 1 KiB per message on either
+// side (a handled event costs its decoded payload, some 200 bytes; a sent
+// request nothing). A handler that dispatches again (a roundtrip inside a
+// format handler) still reads its own arguments intact afterwards. Exits 13.
+const std = @import("std")
+const wl = @import("std.wayland")
+const linux = @import("std").linux
+
+const SYS_fork: usize = 57
+const SYS_wait4: usize = 61
+const SYS_kill: usize = 62
+const SYS_exit_group: usize = 231
+
+const MESSAGES: usize = 20000
+const ALLOWED_GROWTH: usize = MESSAGES * 1024
+
+fn exitProcess(code: usize) -> void {
+    const ignored = linux.syscall1(SYS_exit_group, code)
+}
+
+// Where the next value would be placed: a fresh local's address.
+fn arenaMark() -> usize {
+    var probe: [8]u8 = undefined
+    return @intFromPtr(&probe)
+}
+
+// ---------------------------------------------------------------------------
+// Server
+
+const Server = struct {
+    display: wl.server.Display
+    damages: usize
+    firstDamageMark: usize
+    lastDamageMark: usize
+    sendGrowth: usize
+    failures: usize
+}
+
+fn serverOf(context: *anyopaque) -> *Server {
+    unsafe { return @ptrCast(*Server, context) }
+}
+
+fn onSurface(context: *anyopaque, request: wl.server.Request) -> void {
+    const server = serverOf(context)
+    if request.opcode != wl.wl_surface.REQUEST_DAMAGE { return }
+    const decoded = wl.wl_surface.decodeRequest(request)
+    if decoded.damage.x != @intCast(i32, server.*.damages) || decoded.damage.width != 2 { server.*.failures += 1 }
+    server.*.damages += 1
+    if server.*.damages == 1 { server.*.firstDamageMark = arenaMark() }
+    if server.*.damages == MESSAGES { server.*.lastDamageMark = arenaMark() }
+}
+
+fn onCompositor(context: *anyopaque, request: wl.server.Request) -> void {
+    const decoded = wl.wl_compositor.decodeRequest(request)
+    if request.opcode == wl.wl_compositor.REQUEST_CREATE_SURFACE {
+        decoded.create_surface.id.setHandler(onSurface, context)
+    }
+}
+
+fn bindCompositor(context: *anyopaque, client: wl.server.Client, object: wl.server.Object, version: u32) -> void {
+    wl.wl_compositor.Resource.fromObject(object).setHandler(onCompositor, context)
+}
+
+fn bindShm(context: *anyopaque, client: wl.server.Client, object: wl.server.Object, version: u32) -> void {
+    const shm = wl.wl_shm.Resource.fromObject(object)
+    const before = arenaMark()
+    var index: usize = 0
+    while index < MESSAGES {
+        shm.sendFormat(@intCast(u32, index))
+        index += 1
+    }
+    serverOf(context).*.sendGrowth = arenaMark() - before
+}
+
+fn onClientDestroyed(context: *anyopaque, client: wl.server.Client) -> void {
+    serverOf(context).*.display.terminate()
+}
+
+fn runServer(handle: wl.Handle) -> !usize {
+    const allocator = std.page_allocator.init()
+    var server: Server = undefined
+    server.damages = 0
+    server.firstDamageMark = 0
+    server.lastDamageMark = 0
+    server.sendGrowth = 0
+    server.failures = 0
+    var display: wl.server.Display = undefined
+    try wl.server.Display.init(&display, allocator)
+    server.display = display
+    var context: *anyopaque = undefined
+    unsafe { context = @ptrCast(*anyopaque, &server) }
+    display.setClientDestroyedHandler(onClientDestroyed, context)
+    if display.createGlobal(wl.Interface.wl_compositor, 6, bindCompositor, context) != 1 { return 101 }
+    if display.createGlobal(wl.Interface.wl_shm, 1, bindShm, context) != 2 { return 102 }
+    var client: wl.server.Client = undefined
+    try display.addClient(handle, &client)
+    while display.running() {
+        try display.dispatch(5000)
+    }
+    display.deinit()
+    if server.damages != MESSAGES { return 103 }
+    if server.failures != 0 { return 104 }
+    if server.sendGrowth >= ALLOWED_GROWTH { return 105 }
+    if server.lastDamageMark - server.firstDamageMark >= ALLOWED_GROWTH { return 106 }
+    return 13
+}
+
+// ---------------------------------------------------------------------------
+// Client
+
+const Client = struct {
+    display: wl.client.Display
+    compositorName: u32
+    shmName: u32
+    formats: usize
+    failures: usize
+}
+
+fn clientOf(context: *anyopaque) -> *Client {
+    unsafe { return @ptrCast(*Client, context) }
+}
+
+fn onRegistry(context: *anyopaque, event: wl.client.Event) -> void {
+    const client = clientOf(context)
+    const decoded = wl.wl_registry.decodeEvent(event)
+    if event.opcode != wl.wl_registry.EVENT_GLOBAL { return }
+    const global = decoded.global
+    if std.string.eql(global.interface, std.string.fromSlice("wl_compositor")) { client.*.compositorName = global.name }
+    if std.string.eql(global.interface, std.string.fromSlice("wl_shm")) { client.*.shmName = global.name }
+}
+
+fn onShmEvent(context: *anyopaque, event: wl.client.Event) -> void {
+    const client = clientOf(context)
+    const decoded = wl.wl_shm.decodeEvent(event)
+    const value = decoded.format.format
+    if value != @intCast(u32, client.*.formats) { client.*.failures += 1 }
+    client.*.formats += 1
+    // Dispatching again from inside a handler (as a roundtrip does, and it
+    // handles the events that follow this one) must leave this event's
+    // arguments where they were.
+    if client.*.formats <= 3 {
+        @discardError(client.*.display.roundtrip())
+        const again = wl.wl_shm.decodeEvent(event)
+        if again.format.format != value { client.*.failures += 1 }
+    }
+}
+
+fn runClient(handle: wl.Handle) -> !usize {
+    const allocator = std.page_allocator.init()
+    var display: wl.client.Display = undefined
+    try wl.client.Display.connectToHandle(&display, allocator, handle)
+    var client: Client = undefined
+    client.display = display
+    client.compositorName = 0
+    client.shmName = 0
+    client.formats = 0
+    client.failures = 0
+    var context: *anyopaque = undefined
+    unsafe { context = @ptrCast(*anyopaque, &client) }
+    const registry = wl.displayProxy(display).getRegistry()
+    registry.setHandler(onRegistry, context)
+    try display.roundtrip()
+    if client.compositorName == 0 || client.shmName == 0 { return 1 }
+
+    // Binding wl_shm makes the server send MESSAGES format events.
+    const shm = wl.wl_shm.Proxy.fromObject(registry.bind(client.shmName, wl.Interface.wl_shm, 1))
+    shm.setHandler(onShmEvent, context)
+    const before_events = arenaMark()
+    try display.roundtrip()
+    const event_growth = arenaMark() - before_events
+    if client.formats != MESSAGES { return 2 }
+    if client.failures != 0 { return 3 }
+    if event_growth >= ALLOWED_GROWTH { return 4 }
+
+    const compositor = wl.wl_compositor.Proxy.fromObject(registry.bind(client.compositorName, wl.Interface.wl_compositor, 4))
+    const surface = compositor.createSurface()
+    const before_requests = arenaMark()
+    var index: usize = 0
+    while index < MESSAGES {
+        surface.damage(@intCast(i32, index), 1, 2, 3)
+        index += 1
+    }
+    const request_growth = arenaMark() - before_requests
+    if request_growth >= ALLOWED_GROWTH { return 5 }
+    try display.roundtrip()
+    if !display.running() { return 6 }
+    display.disconnect()
+    return 13
+}
+
+pub fn main() -> !void {
+    var server_handle: wl.Handle = undefined
+    var client_handle: wl.Handle = undefined
+    if !wl.transport.socketPair(&server_handle, &client_handle) { exitProcess(30) }
+    const child = linux.syscall0(SYS_fork)
+    if child == 0 {
+        client_handle.close()
+        const status = try runServer(server_handle)
+        exitProcess(status)
+    }
+    server_handle.close()
+    const status = try runClient(client_handle)
+    if status != 13 {
+        const killed = linux.syscall2(SYS_kill, @bitCast(usize, child), 9)
+        exitProcess(40 + status)
+    }
+    var exit_status: [4]u8 = [4]u8{ 0, 0, 0, 0 }
+    const waited = linux.syscall4(SYS_wait4, @bitCast(usize, child), @intFromPtr(&exit_status), 0, 0)
+    // WEXITSTATUS: the child's exit code is the second byte.
+    if exit_status[0] != 0 || exit_status[1] != 13 { exitProcess(@intCast(usize, exit_status[1])) }
+    exitProcess(13)
+}

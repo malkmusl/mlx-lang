@@ -345,6 +345,31 @@ running compositor whose driver fails to compose a frame (`Vulkan could not comp
 on`): the buffers its windows show are copied and the CPU carries on.
 `--renderer cpu` never opens a driver.
 
+## Memory
+
+This compiler keeps every value that is not a field of something else
+(locals, literals, values functions return) in one 256 MiB arena that is
+only ever bumped: nothing in it is released when a function returns. A
+program that runs for long allocates it up (a pointer motion costs a few
+hundred bytes for its decoded event and some rectangles, so a mouse at
+1000 Hz filled it within a minute or two) and dies with an illegal
+instruction when it is full. Two things keep the compositor within it:
+
+- `std.wayland` builds every message in storage that belongs to the
+  connection and handles every request and event from a fixed slot, not
+  from a message-sized local per message
+  (`tests/269_wayland_message_storage_runtime.mlx`);
+- the event loop is a fixed point (`arena.mlx`): everything that outlives a
+  turn of the loop is memory from the allocator or was allocated before the
+  loop started, so the loop notes the arena's fill before its first turn and
+  restores it at the start of every turn. `--verbose` reports the fill
+  kept at the start (`memory: 24 KiB of values kept; each turn of the loop
+  releases its own`) and, at the end, the most a turn allocated.
+  `MLX_ARENA_RELEASE=0` keeps the arena growing (as before), and
+  `MLX_ARENA_POISON=1` overwrites the released bytes so that a value
+  wrongly kept across turns is noticed rather than read back intact; the
+  check scripts run the compositor that way.
+
 ## When it crashes
 
 A failed runtime check (an index out of range, an unsigned subtraction
@@ -393,6 +418,8 @@ once.
 - `main.mlx`: options, the backend choice, the child environment and the
   event loops (nested: the host connection and the server; freestanding:
   the server and the devices).
+- `arena.mlx`: releases what each turn of the event loop allocated (see
+  Memory).
 - `host.mlx`: the nested backend, a window on the session compositor
   (fullscreen at the monitor's resolution with `--fullscreen`) and its seat
   input.

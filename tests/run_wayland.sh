@@ -24,7 +24,7 @@ fi
 work=$(mktemp -d)
 trap 'rm -rf -- "$work"' EXIT
 failures=0
-for test in tests/240_*.mlx tests/241_*.mlx tests/242_*.mlx tests/243_*.mlx tests/244_*.mlx tests/245_*.mlx tests/246_*.mlx; do
+for test in tests/240_*.mlx tests/241_*.mlx tests/242_*.mlx tests/243_*.mlx tests/244_*.mlx tests/245_*.mlx tests/246_*.mlx tests/269_*.mlx; do
     if ! "$compiler" --quiet "$test" -o "$work/test" 2> "$work/errors"; then
         echo "FAIL (compile) $test"
         cat "$work/errors"

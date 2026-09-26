@@ -42,6 +42,9 @@ command -v xkbcli > /dev/null || { echo "check_wayland_compositor.sh: xkbcli is 
 
 work=$(mktemp -d)
 export XDG_RUNTIME_DIR="$work/runtime"
+# Values a turn of the compositor's loop released are overwritten, so one
+# wrongly kept across turns shows (examples/wayland-compositor/arena.mlx).
+export MLX_ARENA_POISON=${MLX_ARENA_POISON:-1}
 mkdir -m 700 "$XDG_RUNTIME_DIR"
 # GTK's document portal may have mounted itself under the runtime directory.
 trap 'fusermount -u "$XDG_RUNTIME_DIR/doc" 2> /dev/null || true; rm -rf -- "$work"' EXIT

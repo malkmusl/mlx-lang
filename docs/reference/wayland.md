@@ -439,6 +439,27 @@ pub fn main() -> !void {
 are the complete programs, with shared memory, xdg-shell configuration and
 frame callbacks.
 
+### Message storage
+
+The compiler keeps every value that is not a field of something else in an
+arena that is only ever bumped (nothing is released when a function
+returns), so a message-sized local per message would grow a process by
+4 KiB for every event or request it sends or handles. Both runtimes
+therefore keep that storage with the connection: a generated send method
+builds its message in `server.messageWriter(object)` or
+`client.messageWriter(object)`, the one `wire.Writer` of the client's
+connection (a send never nests another; the message is copied into the
+output buffer by `endEvent`/`endRequest`), and `dispatch` copies the
+message being handled into the slot for its nesting level of dispatch
+(`DISPATCH_DEPTH` slots per connection; a handler that dispatches again,
+as `roundtrip` does, uses the next slot, so the arguments of the message
+it is handling stay where they were; deeper nesting falls back to a fresh
+copy). `tests/269_wayland_message_storage_runtime.mlx` sends 20000 events
+one way and 20000 requests the other and requires that neither side grew
+the arena by more than 1 KiB per message (a handled event costs its decoded
+payload, some 200 bytes; a sent request nothing), and that a format handler
+that runs a roundtrip reads its own arguments intact afterwards.
+
 ## Larger examples: a nested compositor and a terminal
 
 Two programs use both halves of `std.wayland` with real input:
@@ -488,6 +509,16 @@ weston. `tests/268_compositor_damage_runtime.mlx` (run by
 raised, resized and redrawn, focus, the cursor, a popup) against the
 compositor's damage tracking: frames composed only in what each output
 buffer lacks must equal frames composed from scratch.
+
+The compositor runs for days within the compiler's value arena (see
+[Message storage](#message-storage)): its event loop is a fixed point, so
+`examples/wayland-compositor/arena.mlx` notes the arena's fill before the
+loop's first turn and restores it at the start of every turn, releasing
+what the turn's handlers and frame allocated (everything that outlives a
+turn is memory from the allocator or was allocated before the loop). The
+check scripts run it with `MLX_ARENA_POISON=1`, which overwrites the
+released bytes so a value wrongly kept across turns shows up;
+`MLX_ARENA_RELEASE=0` turns the release off.
 
 ### GPU buffers: linux-dmabuf and Vulkan
 

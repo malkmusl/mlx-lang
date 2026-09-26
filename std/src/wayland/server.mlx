@@ -75,7 +75,23 @@ pub const ClientState = struct {
     freeServerIds: Vector
     callbacks: Vector
     dead: bool
+    // Storage the client's messages are built in and its requests are
+    // handled from. A local aggregate lives until the program ends (the
+    // aggregate arena is never released), so a per-send or per-request
+    // local of a message's size would grow the process by that much on
+    // every event and request: a compositor sending pointer motion at
+    // 1000 Hz would exhaust the arena within a minute. The writer is
+    // reused by every send (a send never nests another), and each nesting
+    // level of dispatch (a handler dispatching again) has a copy slot.
+    writer: wire.Writer
+    copies: [16384]u8 // DISPATCH_DEPTH * wire.MAX_MESSAGE_SIZE
+    copyHandles: [112]isize // DISPATCH_DEPTH * wire.MAX_HANDLES
+    dispatchDepth: usize
 }
+
+// Nesting levels of dispatch that reuse fixed request storage; deeper
+// levels fall back to fresh storage.
+pub const DISPATCH_DEPTH: usize = 4
 
 // A connected client. Copies refer to the same client.
 pub const Client = struct {
@@ -379,17 +395,17 @@ pub fn setDestroyHandler(object: Object, handler: DestroyHandler, context: *anyo
 
 fn sendDisplayEvent(client: *ClientState, opcode: u16, object_id: u32, code: u32, text: [*]const u8, text_length: usize) -> void {
     if client.*.dead { return }
-    var message: wire.Writer = undefined
-    wire.begin(&message, DISPLAY_ID, opcode)
+    const message = writerOf(client)
+    wire.begin(message, DISPLAY_ID, opcode)
     if opcode == 0 {
-        wire.putObject(&message, object_id)
-        wire.putUint(&message, code)
-        wire.putStringParts(&message, text, text_length)
+        wire.putObject(message, object_id)
+        wire.putUint(message, code)
+        wire.putStringParts(message, text, text_length)
     } else {
-        wire.putUint(&message, object_id)
+        wire.putUint(message, object_id)
     }
-    if !wire.finish(&message) { return }
-    if transport.queue(client.*.connection, &message) != 0 { client.*.dead = true }
+    if !wire.finish(message) { return }
+    if transport.queue(client.*.connection, message) != 0 { client.*.dead = true }
 }
 
 // Destroys a resource: runs its destroy handler, releases the id and, for a
@@ -424,6 +440,19 @@ pub fn postError(object: Object, code: u32, message: []const u8) -> void {
 fn postErrorRaw(client: *ClientState, object_id: u32, code: u32, text: [*]const u8, text_length: usize) -> void {
     sendDisplayEvent(client, 0, object_id, code, text, text_length)
     client.*.dead = true
+}
+
+// The storage an event to `object`'s client is built in (see ClientState):
+// begin the event in it, put its arguments and end it before beginning
+// another to the same client.
+pub fn messageWriter(object: Object) -> *wire.Writer {
+    return writerOf(object.client.state)
+}
+
+fn writerOf(client: *ClientState) -> *wire.Writer {
+    var writer: *wire.Writer = undefined
+    unsafe { writer = @ptrCast(*wire.Writer, &client.*.writer) }
+    return writer
 }
 
 pub fn beginEvent(object: Object, opcode: u16, since: u32, message: *wire.Writer) -> bool {
@@ -520,6 +549,7 @@ fn createClient(state: *State, descriptor: isize) -> ?*ClientState {
     }
     client.*.display = state
     client.*.dead = false
+    client.*.dispatchDepth = 0
     var objects: Vector = undefined
     Vector.initAt(&objects, allocator, @sizeOf(ResourceEntry), @alignOf(ResourceEntry), 64)
     var server_objects: Vector = undefined
@@ -614,22 +644,22 @@ fn flushAll(state: *State) -> void {
 
 fn sendGlobal(client: *ClientState, registry: u32, global: *const GlobalEntry) -> void {
     if client.*.dead { return }
-    var message: wire.Writer = undefined
-    wire.begin(&message, registry, 0)
-    wire.putUint(&message, global.*.name)
-    wire.putStringSlice(&message, interfaces.interfaceName(global.*.interface))
-    wire.putUint(&message, global.*.version)
-    if !wire.finish(&message) { return }
-    if transport.queue(client.*.connection, &message) != 0 { client.*.dead = true }
+    const message = writerOf(client)
+    wire.begin(message, registry, 0)
+    wire.putUint(message, global.*.name)
+    wire.putStringSlice(message, interfaces.interfaceName(global.*.interface))
+    wire.putUint(message, global.*.version)
+    if !wire.finish(message) { return }
+    if transport.queue(client.*.connection, message) != 0 { client.*.dead = true }
 }
 
 fn sendGlobalRemove(client: *ClientState, registry: u32, name: u32) -> void {
     if client.*.dead { return }
-    var message: wire.Writer = undefined
-    wire.begin(&message, registry, 1)
-    wire.putUint(&message, name)
-    if !wire.finish(&message) { return }
-    if transport.queue(client.*.connection, &message) != 0 { client.*.dead = true }
+    const message = writerOf(client)
+    wire.begin(message, registry, 1)
+    wire.putUint(message, name)
+    if !wire.finish(message) { return }
+    if transport.queue(client.*.connection, message) != 0 { client.*.dead = true }
 }
 
 fn forEachRegistry(state: *State, global_index: usize, removal: bool) -> void {
@@ -768,12 +798,12 @@ fn handleDisplayRequest(state: *State, client: *ClientState, opcode: u16, payloa
     if opcode == 0 {
         // sync: the callback's done event carries the event serial, and the
         // destructor event destroys the callback (delete_id follows).
-        var message: wire.Writer = undefined
+        const message = writerOf(client)
         const callback = Object.{ .client = client_value, .id = id }
-        if beginEvent(callback, 0, 1, &message) {
+        if beginEvent(callback, 0, 1, message) {
             state.*.serial +%= 1
-            wire.putUint(&message, state.*.serial)
-            endEvent(callback, &message, true)
+            wire.putUint(message, state.*.serial)
+            endEvent(callback, message, true)
         }
         return
     }
@@ -854,8 +884,24 @@ fn dispatchOne(state: *State, client: *ClientState) -> isize {
         return -1
     }
 
-    var copy: [4096]u8 = undefined
-    var handles: [28]isize = undefined
+    // Copy the request out of the receive buffer, into the client's slot
+    // for this nesting level of dispatch (see ClientState).
+    const depth = client.*.dispatchDepth
+    var copy: [*]u8 = undefined
+    var handles: [*]isize = undefined
+    if depth < DISPATCH_DEPTH {
+        unsafe {
+            copy = @ptrFromInt([*]u8, @intFromPtr(&client.*.copies) + depth * wire.MAX_MESSAGE_SIZE)
+            handles = @ptrFromInt([*]isize, @intFromPtr(&client.*.copyHandles) + depth * wire.MAX_HANDLES * 8)
+        }
+    } else {
+        var deep_copy: [4096]u8 = undefined
+        var deep_handles: [28]isize = undefined
+        unsafe {
+            copy = @ptrCast([*]u8, &deep_copy)
+            handles = @ptrCast([*]isize, &deep_handles)
+        }
+    }
     var index: usize = 0
     while index < payload_length {
         copy[index] = payload[index]
@@ -871,10 +917,16 @@ fn dispatchOne(state: *State, client: *ClientState) -> isize {
     var copied_payload: [*]const u8 = undefined
     var copied_handles: [*]const isize = undefined
     unsafe {
-        copied_payload = @ptrCast([*]const u8, &copy)
-        copied_handles = @ptrCast([*]const isize, &handles)
+        copied_payload = @ptrCast([*]const u8, copy)
+        copied_handles = @ptrCast([*]const isize, handles)
     }
+    client.*.dispatchDepth = depth + 1
+    const result = deliver(state, client, id, interface, version, opcode, signature, payload_length, handle_count, copied_payload, copied_handles)
+    client.*.dispatchDepth = depth
+    return result
+}
 
+fn deliver(state: *State, client: *ClientState, id: u32, interface: Interface, version: u32, opcode: u16, signature: []const u8, payload_length: usize, handle_count: usize, copied_payload: [*]const u8, copied_handles: [*]const isize) -> isize {
     if !registerNewObjects(client, interface, version, opcode, signature, copied_payload) {
         closeHandles(copied_handles, handle_count)
         return -1
