@@ -10,6 +10,10 @@
 #               cannot export dma-bufs); the compositor maps it (cpu) or
 #               imports it into Vulkan (vulkan).
 #
+# The vulkan renderer runs once more with MLX_VULKAN_NO_HOST_IMPORT=1, as on
+# drivers that cannot import the shared memory (RADV): the frame is copied
+# into the output and the client's wl_shm buffers are uploaded.
+#
 # tools/wayland-test-host plays the session compositor and saves the frame
 # it receives. Each frame is checked pixel by pixel: the client's window must
 # hold the pattern shader's output for a single time value, with the
@@ -60,7 +64,7 @@ run() {
     "$work/test-host" "host-$name" "$work/us.xkb" "$work/shot.script" > "$work/$name-host.log" 2>&1 &
     local host_pid=$!
     for _ in $(seq 1 50); do [[ -S "$XDG_RUNTIME_DIR/host-$name" ]] && break; sleep 0.1; done
-    WAYLAND_DISPLAY="host-$name" timeout 60 "$work/mlx-compositor" --verbose --renderer "$renderer" --size 640x480 \
+    WAYLAND_DISPLAY="host-$name" MLX_VULKAN_NO_HOST_IMPORT=${no_host_import:-} timeout 60 "$work/mlx-compositor" --verbose --renderer "$renderer" --size 640x480 \
         --socket "nested-$name" --run "$work/$client" > "$work/$name.log" 2>&1 || true
     wait "$host_pid" || { echo "FAIL $name: the test host failed" >&2; cat "$work/$name-host.log" "$work/$name.log" >&2; exit 1; }
     [[ -f "$work/frame.ppm" ]] || { echo "FAIL $name: no frame" >&2; cat "$work/$name.log" >&2; exit 1; }
@@ -117,10 +121,13 @@ if os.path.exists(reference) and reference != sys.argv[1]:
             if pixels[offset:offset + 3] != expected[offset:offset + 3]:
                 sys.exit("differs from the CPU renderer at (%d, %d)" % (x, y))
 PY
-    echo "ok   $renderer renderer, client $client"
+    echo "ok   $renderer renderer${no_host_import:+ (no host-memory import)}, client $client"
 }
 
 check cpu-shm cpu client-shm "mode: shm-direct"
 check cpu-dmabuf cpu client-dmabuf "dmabuf buffer created"
 check vulkan-shm vulkan client-shm "renderer: vulkan"
 check vulkan-dmabuf vulkan client-dmabuf "dmabuf buffer created"
+no_host_import=1
+check vulkan-copy-shm vulkan client-shm "uploading changed buffers"
+check vulkan-copy-dmabuf vulkan client-dmabuf "copying each frame"

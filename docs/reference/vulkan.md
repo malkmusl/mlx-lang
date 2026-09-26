@@ -263,7 +263,8 @@ The examples share one small renderer in `examples/vulkan-shared`:
   sharing extensions the driver supports: dma-buf import and export
   (`VK_EXT_external_memory_dma_buf`) and imported host memory
   (`VK_EXT_external_memory_host`). It creates, imports and destroys storage
-  buffers, compiles kernels and records dispatches.
+  buffers (`createReadbackBuffer`: host-cached memory for results the CPU
+  reads back), compiles kernels and records dispatches.
 - `swapchain.mlx` presents to a window surface: each frame the pattern is
   rendered into a buffer, a callback may draw over it (the Android app's
   label), and the buffer is copied into the acquired image

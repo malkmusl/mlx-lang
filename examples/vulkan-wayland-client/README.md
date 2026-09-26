@@ -16,7 +16,7 @@ Frames go to the compositor the cheapest way both sides support
 | Mode | How a frame reaches the compositor |
 | --- | --- |
 | `dmabuf` | The GPU renders into buffers exported as dma-bufs and handed over with `zwp_linux_dmabuf_v1` (XRGB8888, linear modifier). Zero-copy on GPUs. |
-| `shm-direct` | The GPU renders straight into the `wl_shm` pool, imported with `VK_EXT_external_memory_host`. Zero-copy with CPU drivers such as lavapipe. |
+| `shm-direct` | The GPU renders straight into the `wl_shm` pool, imported with `VK_EXT_external_memory_host`. Zero-copy with CPU drivers such as lavapipe. `auto` picks it only when a test import of such memory works (RADV imports only anonymous memory). |
 | `shm-copy` | The GPU renders into its own memory and the frame is copied into the pool. |
 
 A label in the bottom-left corner (mode and frame count) is laid out with

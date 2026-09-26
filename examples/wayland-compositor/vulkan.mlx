@@ -9,6 +9,14 @@
 //     is itself imported host memory, so the frame is rendered straight into
 //     the host compositor's wl_shm pool.
 //
+// Drivers that cannot import the shared memory (RADV and the other amdgpu
+// drivers take only anonymous memory, not the memfd a wl_shm pool is; some
+// lack VK_EXT_external_memory_host) still work, with copies: the frame is
+// rendered into a host-cached buffer and copied into the output, and a
+// client buffer is uploaded into a per-surface buffer when its content
+// changed. MLX_VULKAN_NO_HOST_IMPORT=1 takes these paths on any driver
+// (tests).
+//
 // Every frame is one command buffer: the background, then for each window
 // bottom to top its frame (solid rectangles: stride-0 blits from a palette)
 // and its buffer, then the cursor. Blending matches the CPU renderer
@@ -48,6 +56,12 @@ pub const Renderer = struct {
     source: vk.Buffer
     offset: u32
     failed: bool
+    // Whether to import host memory (VK_EXT_external_memory_host).
+    hostImport: bool
+    // `target` is not the output itself: copy each frame into it.
+    copyOutput: bool
+    // Client memory had to be uploaded (said once, with --verbose).
+    loggedUpload: bool
 }
 
 fn rendererOf(compositor: *Compositor) -> *Renderer {
@@ -92,6 +106,8 @@ pub fn open(compositor: *Compositor, arguments: [][*]const u8) -> bool {
     renderer.*.context = context
     renderer.*.blit = kernel
     renderer.*.failed = false
+    renderer.*.copyOutput = false
+    renderer.*.loggedUpload = false
     var options = gpu.defaultOptions(@ptrCast([*]const u8, "mlx-compositor"))
     options.wantSharing = true
     const status = gpu.open(context, driver, &options, allocator)
@@ -99,11 +115,6 @@ pub fn open(compositor: *Compositor, arguments: [][*]const u8) -> bool {
         say("mlx-compositor: ")
         say(gpu.statusMessage(status))
         say("\n")
-        return false
-    }
-    if !context.*.hostMemory {
-        say("mlx-compositor: the Vulkan renderer needs VK_EXT_external_memory_host\n")
-        gpu.close(context)
         return false
     }
     var code: [*]u32 = undefined
@@ -114,12 +125,20 @@ pub fn open(compositor: *Compositor, arguments: [][*]const u8) -> bool {
         return false
     }
 
-    // The output: both host frames, imported in place.
+    // The output: both host frames, imported in place, or else a buffer of
+    // the same layout that each frame is copied from.
+    const no_import = state.environmentValue(compositor.*.environment, "MLX_VULKAN_NO_HOST_IMPORT")
+    renderer.*.hostImport = context.*.hostMemory && (@intFromPtr(no_import) == 0 || no_import[0] == 0)
     const host = compositor.*.hostMemory
-    if !gpu.importHostMemory(context, renderer.*.target, host.address, roundUp(host.size, context.*.hostAlignment)) {
-        say("mlx-compositor: cannot import the output into Vulkan\n")
-        gpu.close(context)
-        return false
+    if !renderer.*.hostImport || !gpu.importHostMemory(context, renderer.*.target, host.address, roundUp(host.size, context.*.hostAlignment)) {
+        gpu.destroyBuffer(context, renderer.*.target)
+        if !gpu.createReadbackBuffer(context, renderer.*.target, @intCast(u64, host.size)) {
+            gpu.destroyBuffer(context, renderer.*.target)
+            say("mlx-compositor: cannot create the output buffer in Vulkan\n")
+            gpu.close(context)
+            return false
+        }
+        renderer.*.copyOutput = true
     }
 
     // The background, drawn once.
@@ -182,8 +201,61 @@ pub fn open(compositor: *Compositor, arguments: [][*]const u8) -> bool {
         say("renderer: vulkan (")
         const shown = std.io.writeString(std.io.stdout(), std.process.fromCString(gpu.deviceName(context)))
         say(")\n")
+        if renderer.*.copyOutput { say("renderer: the driver cannot render into the output in place; copying each frame\n") }
     }
     return true
+}
+
+// Copies `bytes` (a multiple of 8) from `source` to `destination`.
+fn copyWords(destination: usize, source: usize, bytes: usize) -> void {
+    var to: [*]u64 = undefined
+    var from: [*]const u64 = undefined
+    unsafe {
+        to = @ptrFromInt([*]u64, destination)
+        from = @ptrFromInt([*]const u64, source)
+    }
+    const words = bytes / 8
+    var index: usize = 0
+    while index + 4 <= words {
+        to[index] = from[index]
+        to[index + 1] = from[index + 1]
+        to[index + 2] = from[index + 2]
+        to[index + 3] = from[index + 3]
+        index += 4
+    }
+    while index < words {
+        to[index] = from[index]
+        index += 1
+    }
+}
+
+// Copies `count` 32-bit pixels.
+fn copyPixels(destination: usize, source: usize, count: usize) -> void {
+    const even = count / 2 * 2
+    if destination % 8 == 0 && source % 8 == 0 {
+        copyWords(destination, source, even * 4)
+    } else {
+        var to: [*]u32 = undefined
+        var from: [*]const u32 = undefined
+        unsafe {
+            to = @ptrFromInt([*]u32, destination)
+            from = @ptrFromInt([*]const u32, source)
+        }
+        var index: usize = 0
+        while index < even {
+            to[index] = from[index]
+            index += 1
+        }
+    }
+    if even < count {
+        var last: [*]u32 = undefined
+        var first: [*]const u32 = undefined
+        unsafe {
+            last = @ptrFromInt([*]u32, destination)
+            first = @ptrFromInt([*]const u32, source)
+        }
+        last[even] = first[even]
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -192,6 +264,7 @@ pub fn open(compositor: *Compositor, arguments: [][*]const u8) -> bool {
 // Imports a pool into Vulkan on first use; false when the driver cannot.
 fn importPool(renderer: *Renderer, pool: *Pool) -> bool {
     if pool.*.imported { return true }
+    if pool.*.importFailed { return false }
     const context = renderer.*.context
     var imported: gpu.Buffer = undefined
     var done = false
@@ -206,11 +279,14 @@ fn importPool(renderer: *Renderer, pool: *Pool) -> bool {
             }
         }
     }
-    if !done {
+    if !done && renderer.*.hostImport {
         done = gpu.importHostMemory(context, &imported, pool.*.memory.address, roundUp(pool.*.memory.size, context.*.hostAlignment))
         if !done { gpu.destroyBuffer(context, &imported) }
     }
-    if !done { return false }
+    if !done {
+        pool.*.importFailed = true
+        return false
+    }
     pool.*.gpuBuffer = imported
     pool.*.imported = true
     return true
@@ -224,6 +300,58 @@ pub fn releasePool(compositor: *Compositor, pool: *Pool) -> void {
     var imported = pool.*.gpuBuffer
     gpu.destroyBuffer(renderer.*.context, &imported)
     pool.*.imported = false
+}
+
+// Frees the upload buffer of a surface (see drawSurface).
+pub fn releaseSurface(compositor: *Compositor, surface: *Surface) -> void {
+    if surface.*.staging == 0 || compositor.*.renderer == 0 { return }
+    const renderer = rendererOf(compositor)
+    var staging: *gpu.Buffer = undefined
+    unsafe { staging = @ptrFromInt(*gpu.Buffer, surface.*.staging) }
+    gpu.destroyBuffer(renderer.*.context, staging)
+    unsafe { state.release(compositor, @ptrFromInt([*]u8, surface.*.staging), @sizeOf(gpu.Buffer)) }
+    surface.*.staging = 0
+    surface.*.stagingSize = 0
+}
+
+// The surface's buffer uploaded into its upload buffer (made or grown as
+// needed; copied only when the content changed since). Null when Vulkan
+// cannot make the buffer.
+fn upload(compositor: *Compositor, renderer: *Renderer, surface: *Surface, buffer: *Buffer) -> ?*gpu.Buffer {
+    const width = @intCast(usize, buffer.*.width)
+    const height = @intCast(usize, buffer.*.height)
+    const size = width * height * 4
+    if surface.*.staging != 0 && surface.*.stagingSize < size { releaseSurface(compositor, surface) }
+    var staging: *gpu.Buffer = undefined
+    if surface.*.staging == 0 {
+        const address = record(compositor, @sizeOf(gpu.Buffer))
+        unsafe { staging = @ptrFromInt(*gpu.Buffer, address) }
+        if !gpu.createBuffer(renderer.*.context, staging, @intCast(u64, size), false) {
+            gpu.destroyBuffer(renderer.*.context, staging)
+            unsafe { state.release(compositor, @ptrFromInt([*]u8, address), @sizeOf(gpu.Buffer)) }
+            return null
+        }
+        surface.*.staging = address
+        surface.*.stagingSize = size
+        surface.*.stagingSerial = 0
+        if compositor.*.verbose && !renderer.*.loggedUpload {
+            say("renderer: the driver cannot import client memory; uploading changed buffers\n")
+            renderer.*.loggedUpload = true
+        }
+    } else {
+        unsafe { staging = @ptrFromInt(*gpu.Buffer, surface.*.staging) }
+    }
+    if surface.*.stagingSerial != surface.*.contentSerial {
+        const source = buffer.*.pool.*.memory.address + @intCast(usize, buffer.*.offset)
+        const stride = @intCast(usize, buffer.*.stride)
+        var row: usize = 0
+        while row < height {
+            copyPixels(staging.*.address + row * width * 4, source + row * stride, width)
+            row += 1
+        }
+        surface.*.stagingSerial = surface.*.contentSerial
+    }
+    return staging
 }
 
 // ---------------------------------------------------------------------------
@@ -275,16 +403,21 @@ fn drawFrame(compositor: *Compositor, renderer: *Renderer, surface: *const Surfa
 }
 
 // Draws the buffer a surface shows with its top-left at (x, y).
-fn drawSurface(compositor: *Compositor, renderer: *Renderer, surface: *const Surface, x: i32, y: i32) -> void {
+fn drawSurface(compositor: *Compositor, renderer: *Renderer, surface: *Surface, x: i32, y: i32) -> void {
     if !surface.*.hasContent || surface.*.current == 0 { return }
     var buffer: *Buffer = undefined
     unsafe { buffer = @ptrFromInt(*Buffer, surface.*.current) }
     const pool = buffer.*.pool
     // The shader addresses whole pixels.
     if buffer.*.offset % 4 != 0 || buffer.*.stride % 4 != 0 { return }
-    if !importPool(renderer, pool) { return }
     const opaque = buffer.*.format == @intFromEnum(wl.wl_shm.Format.xrgb8888)
-    blit(compositor, renderer, pool.*.gpuBuffer.buffer, @intCast(u32, buffer.*.offset / 4), @intCast(u32, buffer.*.stride / 4), buffer.*.width, buffer.*.height, x, y, opaque)
+    if importPool(renderer, pool) {
+        blit(compositor, renderer, pool.*.gpuBuffer.buffer, @intCast(u32, buffer.*.offset / 4), @intCast(u32, buffer.*.stride / 4), buffer.*.width, buffer.*.height, x, y, opaque)
+        return
+    }
+    const staging = upload(compositor, renderer, surface, buffer)
+    if staging == null { return }
+    blit(compositor, renderer, staging.?.*.buffer, 0, @intCast(u32, buffer.*.width), buffer.*.width, buffer.*.height, x, y, opaque)
 }
 
 // Composes the whole output into the host frame starting `offset` bytes
@@ -322,5 +455,9 @@ pub fn compose(compositor: *Compositor, offset: usize) -> bool {
         }
     }
     if renderer.*.failed { return false }
-    return gpu.submit(context)
+    if !gpu.submit(context) { return false }
+    if renderer.*.copyOutput {
+        copyWords(compositor.*.hostMemory.address + offset, renderer.*.target.*.address + offset, compositor.*.width * compositor.*.height * 4)
+    }
+    return true
 }

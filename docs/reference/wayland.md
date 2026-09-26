@@ -316,7 +316,10 @@ object's version is refused. Failures inside request methods are sticky: the
 request returns an inert proxy and the next `flush`, `dispatch` or
 `roundtrip` returns the error. The server's `wl_display.error` surfaces as
 `error.ProtocolError`, and the object id, code and message are available
-from the display. Events go to per-object handler functions and are decoded
+from the display. `failureReason()` says in words why a display stopped
+running; for an event the client cannot decode (unknown object or opcode,
+malformed arguments) `rejectedObjectId`, `rejectedOpcode` and
+`rejectedInterface` name it. Events go to per-object handler functions and are decoded
 with the generated `decodeEvent`. Objects that the server creates through a
 new_id event argument are registered before their event is dispatched.
 

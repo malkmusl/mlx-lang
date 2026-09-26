@@ -213,6 +213,20 @@ frame is written straight into the buffer shown in the host window. A
 buffer is therefore kept until the client commits the next one, then
 released. The result is pixel-identical to the CPU renderer.
 
+Drivers that cannot import that shared memory (RADV and the other amdgpu
+drivers import only anonymous memory, not the memfd behind a `wl_shm`
+pool) use copies instead: the frame is rendered into a host-cached buffer
+and copied into the host window's buffer, and a `wl_shm` client buffer is
+uploaded into a per-window buffer when the client commits new content.
+dma-bufs are still imported. `--verbose` says when this happens
+(`renderer: ... copying each frame`); `MLX_VULKAN_NO_HOST_IMPORT=1` takes
+this path on any driver.
+
+When the compositor stops on its own it says why: for example
+`mlx-compositor: lost the session compositor: the server reported a
+protocol error (object 12, code 3): ...`, or that the Wayland socket is
+taken (`--socket NAME` picks another).
+
 ![The Vulkan client (examples/vulkan-wayland-client) in the Vulkan renderer](screenshots/vulkan-client.png)
 
 ```sh
