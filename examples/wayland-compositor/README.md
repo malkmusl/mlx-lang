@@ -26,6 +26,8 @@ nested|drm` decides).
   GTK). The opposite edges stay where they are.
 - Right-click menus and other `xdg_popup` windows are placed with
   `xdg_positioner` and dismissed by clicking elsewhere.
+- A dock and an app launcher, both Wayland clients of it (see Dock and
+  launcher): Super opens the launcher in the middle of the screen.
 
 ![Two Mlx terminals, the second moved with Alt+drag](screenshots/mlx-terminals.png)
 
@@ -36,6 +38,7 @@ The screenshots are frames the scripted test host received, taken during
 
 | Shortcut | Action |
 | --- | --- |
+| Super | open or close the app launcher (`--launcher`, default `mlx-launcher`) |
 | Alt+Enter | open a terminal (`--terminal`, default `mlx-terminal`) |
 | Alt+drag | move the window under the pointer |
 | Alt+right-drag | resize the window under the pointer from its nearest corner |
@@ -77,8 +80,63 @@ WAYLAND_DISPLAY=wayland-mlx dbus-run-session nautilus
 Options: `--socket NAME`, `--size WxH`, `--fullscreen` (a fullscreen
 window at the monitor's resolution), `--renderer auto|vulkan|cpu` (default
 `auto`: Vulkan when a driver works, else the CPU), `--font PATH|none`,
-`--terminal PROGRAM`, `--run PROGRAM` (repeatable), `--screenshot FILE`,
-`--timeout SECONDS`, `--verbose`.
+`--terminal PROGRAM`, `--launcher PROGRAM|none` (what Super starts),
+`--dock PROGRAM` (started with the compositor), `--run PROGRAM`
+(repeatable), `--screenshot FILE`, `--timeout SECONDS`, `--verbose`.
+
+## Dock and launcher
+
+![The launcher over two terminals, the dock below](screenshots/dock-and-launcher.png)
+
+Both are ordinary Wayland clients in [`examples/mlx-dock`](../mlx-dock/main.mlx)
+and [`examples/mlx-launcher`](../mlx-launcher/main.mlx), sharing
+[`examples/desktop-shared`](../desktop-shared): the layer surface and its
+input (`panel.mlx`), drawing (`canvas.mlx`), the keymap (`keyboard.mlx`),
+desktop entries and their PNG icons (`apps.mlx`, with `std.png`) and the
+per-turn value release (`turns.mlx`). The compositor offers them three
+protocols:
+
+- `zwlr_layer_shell_v1` (wlr-layer-shell): surfaces in four layers
+  (background, bottom, top, overlay; windows sit between bottom and top),
+  anchored to edges or centred, with margins. A surface with an exclusive
+  zone keeps its strip free: new windows are placed beside it and a
+  window's bounds leave it out. A surface that asks for the keyboard
+  exclusively in the top or overlay layer keeps it until it goes.
+- `zwlr_foreign_toplevel_manager_v1` (wlr-foreign-toplevel-management):
+  every window with its title, app id and whether it is active; a client
+  can activate (focus and raise) or close one.
+- `ext_background_effect_manager_v1`: a surface names a region where what
+  is behind it is blurred (three box blurs, radius 6) before the surface
+  is drawn over it. The CPU and the Vulkan renderer blur alike, pixel for
+  pixel.
+
+Super, pressed and released on its own, starts the launcher, or closes it
+when it is open (a Super shortcut with another key does neither). The
+launcher is a surface in the overlay layer, centred, that takes the
+keyboard: typing narrows the apps (by name, id and command; names that
+start with the text first), the arrow keys, Page Up/Down, Home and End
+choose, Enter or a click starts the app (in `$MLX_TERMINAL` when its entry
+says `Terminal=true`), Escape, Super or a click outside close it.
+
+The dock sits in the top layer along the bottom edge with an exclusive
+zone. It shows an apps button (starts `$MLX_LAUNCHER`), the pinned apps,
+and after a separator the apps that have windows but are not pinned; a dot
+marks an app that runs. Icons grow under the pointer, which shows the
+app's name. A click brings the app's window forward (the next one when it
+has several) or starts it. `~/.config/mlx/dock` lists the pinned apps, one
+desktop entry id per line (`org.gnome.Nautilus`, `firefox`), `terminal` for
+the Mlx terminal; without it the dock pins the terminal and the first file
+manager, browser and editor it finds. Icons are PNGs (the hicolor theme or
+`/usr/share/pixmaps`); an app with only an SVG icon gets a tile with its
+initial.
+
+The compositor passes `MLX_TERMINAL` (its `--terminal`) and `MLX_LAUNCHER`
+(its `--launcher`) to its clients. The session starts the dock
+(`MLX_SESSION_DOCK=no` does not). `tools/check_desktop_clients.sh`
+checks both clients with scripted input on the CPU and the Vulkan
+renderer: where their surfaces are, Super, typing, starting apps from both,
+switching windows from the dock, the blur, and that both renderers draw
+the same pixels.
 
 ## Freestanding (DRM/KMS)
 
@@ -452,8 +510,11 @@ mlx4 examples/vulkan-wayland-client/main.mlx -o vulkan-wayland-client
 one takes the pointer only inside it), `wl_shm` (ARGB8888 and XRGB8888),
 `zwp_linux_dmabuf_v1` version 3 (ARGB8888 and XRGB8888, linear, one plane),
 `wl_output`, `wl_seat` with pointer and keyboard, `wl_data_device_manager`
-version 3, `wl_subcompositor` and `xdg_wm_base` with toplevels (with
-`configure_bounds`: the output's size), popups and positioners.
+version 3, `wl_subcompositor`, `xdg_wm_base` with toplevels (with
+`configure_bounds`: the output's size), popups and positioners,
+`zwlr_layer_shell_v1` version 5, `zwlr_foreign_toplevel_manager_v1`
+version 3 and `ext_background_effect_manager_v1` version 1 (see Dock and
+launcher).
 Composition is done in software, or with Vulkan (`--renderer vulkan`).
 
 Subsurfaces (Firefox insists on them) are drawn with the window they are
@@ -498,14 +559,15 @@ once.
   session), `dbus.mlx` (a small D-Bus client) and `device.mlx` (device
   syscalls, and the emulated devices of the test harness).
 - `shell.mlx`: the server side, with globals, surfaces, shared memory,
-  xdg-shell, focus and input delivery, and launching programs.
+  xdg-shell, layer shell, the window list for docks, blur regions, focus
+  and input delivery, and launching programs.
 - `dmabuf.mlx`: linux-dmabuf; each dma-buf becomes a one-buffer pool.
 - `data.mlx`: `wl_data_device_manager`, copy and paste between clients.
 - `session/`: the desktop session's launcher and entry
   (`tools/install_compositor_session.sh` installs them).
 - `vulkan.mlx`: the Vulkan renderer.
-- `scene.mlx`: stacking, hit-testing, title bars, damage tracking and
-  software composition.
+- `scene.mlx`: stacking (layers and windows), hit-testing, title bars,
+  damage tracking, blur and software composition.
 - `state.mlx`: shared records and list helpers.
 
 `tools/check_wayland_compositor.sh [compiler] [cpu|vulkan]` exercises all

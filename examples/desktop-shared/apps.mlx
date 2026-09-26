@@ -1,0 +1,613 @@
+// The applications a dock and a launcher offer: desktop entries
+// (freedesktop.org .desktop files) from $XDG_DATA_HOME/applications
+// (~/.local/share/applications) and every $XDG_DATA_DIRS/applications
+// (/usr/local/share and /usr/share), their icons, and starting them.
+//
+// An entry counts when it is Type=Application with an Exec line and is not
+// NoDisplay or Hidden; the first one with a given file name (its id) wins,
+// the user's first. The name is Name[LANG] when the language of LANG (or
+// LC_ALL, LC_MESSAGES) has one, else Name. Exec field codes (%f, %U, ...)
+// are dropped. Icons are PNGs: an absolute Icon path, or NAME.png in the
+// hicolor theme (the size closest above the one wanted first) under the
+// same data directories, or in /usr/share/pixmaps.
+const std = @import("std")
+const png = @import("std.png")
+
+const Allocator = std.allocator.Allocator
+
+const SYS_open: usize = 2
+const SYS_close: usize = 3
+const SYS_wait4: usize = 61
+const SYS_fork: usize = 57
+const SYS_execve: usize = 59
+const SYS_exit: usize = 60
+const SYS_setsid: usize = 112
+const SYS_getdents64: usize = 217
+const O_DIRECTORY: usize = 65536
+const O_CLOEXEC: usize = 524288
+
+pub const MAX_APPS: usize = 1024
+
+pub const App = struct {
+    id: [96]u8
+    idLength: usize
+    name: [96]u8
+    nameLength: usize
+    exec: [512]u8
+    execLength: usize
+    icon: [160]u8
+    iconLength: usize
+    wmClass: [96]u8
+    wmClassLength: usize
+    terminal: bool
+    // The icon at the size it was last loaded (iconSize 0: not tried yet;
+    // hasImage false: none found).
+    image: png.Image
+    hasImage: bool
+    iconSize: usize
+}
+
+pub const Apps = struct {
+    list: [*]App
+    count: usize
+    allocator: Allocator
+    // Where to look, from the environment.
+    home: [*]const u8
+    dataHome: [*]const u8
+    dataDirs: [*]const u8
+    language: [8]u8
+    languageLength: usize
+}
+
+pub fn appAt(apps: *Apps, index: usize) -> *App {
+    unsafe { return @ptrFromInt(*App, @intFromPtr(apps.*.list) + index * @sizeOf(App)) }
+}
+
+pub fn nameOf(app: *const App) -> []const u8 { return sliceOf(@intFromPtr(app) + @offsetOf(App, "name"), app.*.nameLength) }
+pub fn idOf(app: *const App) -> []const u8 { return sliceOf(@intFromPtr(app) + @offsetOf(App, "id"), app.*.idLength) }
+pub fn wmClassOf(app: *const App) -> []const u8 { return sliceOf(@intFromPtr(app) + @offsetOf(App, "wmClass"), app.*.wmClassLength) }
+pub fn execOf(app: *const App) -> []const u8 { return sliceOf(@intFromPtr(app) + @offsetOf(App, "exec"), app.*.execLength) }
+
+fn sliceOf(address: usize, length: usize) -> []const u8 {
+    var bytes: [*]const u8 = undefined
+    unsafe { bytes = @ptrFromInt([*]const u8, address) }
+    return bytes[0..length]
+}
+
+// The value of `name` in a NUL-terminated environment list (0 when unset).
+pub fn environmentValue(environment: [*][*]const u8, name: []const u8) -> [*]const u8 {
+    var index: usize = 0
+    while @intFromPtr(environment[index]) != 0 {
+        const entry = environment[index]
+        var matches = true
+        var length: usize = 0
+        for byte in name {
+            if matches && entry[length] != byte { matches = false }
+            if matches { length += 1 }
+        }
+        if matches && entry[length] == 61 {
+            unsafe { return @ptrFromInt([*]const u8, @intFromPtr(entry) + length + 1) }
+        }
+        index += 1
+    }
+    unsafe { return @ptrFromInt([*]const u8, 0) }
+}
+
+fn lower(byte: u8) -> u8 { return if byte >= 65 && byte <= 90 { byte + 32 } else { byte } }
+
+// Whether `text` equals `other` ignoring ASCII case.
+pub fn sameText(text: []const u8, other: []const u8) -> bool {
+    if text.length != other.length { return false }
+    var index: usize = 0
+    while index < text.length {
+        if lower(text[index]) != lower(other[index]) { return false }
+        index += 1
+    }
+    return true
+}
+
+// Whether `text` contains `part`, ignoring ASCII case.
+pub fn containsText(text: []const u8, part: []const u8) -> bool {
+    if part.length == 0 { return true }
+    if part.length > text.length { return false }
+    var start: usize = 0
+    while start + part.length <= text.length {
+        var index: usize = 0
+        while index < part.length && lower(text[start + index]) == lower(part[index]) { index += 1 }
+        if index == part.length { return true }
+        start += 1
+    }
+    return false
+}
+
+// A path builder with room for any path we make.
+pub const Path = struct {
+    bytes: [1024]u8
+    length: usize
+}
+
+pub fn pathClear(path: *Path) -> void { path.*.length = 0 }
+
+pub fn pathAdd(path: *Path, text: []const u8) -> void {
+    for byte in text {
+        if path.*.length < 1022 {
+            path.*.bytes[path.*.length] = byte
+            path.*.length += 1
+        }
+    }
+}
+
+pub fn pathAddC(path: *Path, text: [*]const u8) -> void {
+    var index: usize = 0
+    while text[index] != 0 && path.*.length < 1022 {
+        path.*.bytes[path.*.length] = text[index]
+        path.*.length += 1
+        index += 1
+    }
+}
+
+pub fn pathEnd(path: *Path) -> [*]const u8 {
+    path.*.bytes[path.*.length] = 0
+    unsafe { return @ptrCast([*]const u8, path) }
+}
+
+fn exists(path: [*]const u8) -> bool {
+    const file = std.linux.syscall3(SYS_open, @intFromPtr(path), O_CLOEXEC, 0)
+    if file < 0 { return false }
+    const closed = std.linux.syscall1(SYS_close, @bitCast(usize, file))
+    return true
+}
+
+// Where to look, from the environment of this program.
+pub fn init(apps: *Apps, environment: [*][*]const u8, allocator: Allocator) -> bool {
+    apps.*.allocator = allocator
+    apps.*.count = 0
+    const memory = allocator.alloc(MAX_APPS * @sizeOf(App), 16)
+    if memory == null { return false }
+    unsafe { apps.*.list = @ptrCast([*]App, memory.?) }
+    apps.*.home = environmentValue(environment, "HOME")
+    apps.*.dataHome = environmentValue(environment, "XDG_DATA_HOME")
+    apps.*.dataDirs = environmentValue(environment, "XDG_DATA_DIRS")
+    apps.*.languageLength = 0
+    var language = environmentValue(environment, "LC_ALL")
+    if @intFromPtr(language) == 0 || language[0] == 0 { language = environmentValue(environment, "LC_MESSAGES") }
+    if @intFromPtr(language) == 0 || language[0] == 0 { language = environmentValue(environment, "LANG") }
+    if @intFromPtr(language) != 0 {
+        // "de_DE.UTF-8": the language, "de".
+        while language[apps.*.languageLength] >= 97 && language[apps.*.languageLength] <= 122 && apps.*.languageLength < 7 {
+            apps.*.language[apps.*.languageLength] = language[apps.*.languageLength]
+            apps.*.languageLength += 1
+        }
+    }
+    return true
+}
+
+// The data directories: the user's first ($XDG_DATA_HOME, else
+// ~/.local/share), then $XDG_DATA_DIRS (else /usr/local/share:/usr/share).
+// Writes directory `index` into `path`; false past the last.
+pub fn dataDirectory(apps: *Apps, index: usize, path: *Path) -> bool {
+    pathClear(path)
+    if index == 0 {
+        if @intFromPtr(apps.*.dataHome) != 0 && apps.*.dataHome[0] != 0 {
+            pathAddC(path, apps.*.dataHome)
+            return true
+        }
+        if @intFromPtr(apps.*.home) == 0 { return true }
+        pathAddC(path, apps.*.home)
+        pathAdd(path, "/.local/share")
+        return true
+    }
+    var dirs: [*]const u8 = undefined
+    unsafe { dirs = @ptrCast([*]const u8, "/usr/local/share:/usr/share") }
+    if @intFromPtr(apps.*.dataDirs) != 0 && apps.*.dataDirs[0] != 0 { dirs = apps.*.dataDirs }
+    var wanted = index - 1
+    var position: usize = 0
+    while true {
+        const start = position
+        while dirs[position] != 0 && dirs[position] != 58 { position += 1 }
+        if wanted == 0 {
+            if position == start { return false }
+            var at = start
+            while at < position {
+                if path.*.length < 1000 {
+                    path.*.bytes[path.*.length] = dirs[at]
+                    path.*.length += 1
+                }
+                at += 1
+            }
+            return true
+        }
+        if dirs[position] == 0 { return false }
+        position += 1
+        wanted -= 1
+    }
+    return false
+}
+
+// ---------------------------------------------------------------------------
+// Desktop entries
+
+fn startsWith(line: [*]const u8, length: usize, prefix: []const u8) -> bool {
+    if length < prefix.length { return false }
+    var index: usize = 0
+    while index < prefix.length {
+        if line[index] != prefix[index] { return false }
+        index += 1
+    }
+    return true
+}
+
+fn copyValue(target: [*]u8, capacity: usize, line: [*]const u8, start: usize, end: usize) -> usize {
+    var length: usize = 0
+    var index = start
+    while index < end && length < capacity {
+        target[length] = line[index]
+        length += 1
+        index += 1
+    }
+    return length
+}
+
+fn isTrue(line: [*]const u8, start: usize, end: usize) -> bool {
+    return end - start >= 4 && line[start] == 116 && line[start + 1] == 114 && line[start + 2] == 117 && line[start + 3] == 101
+}
+
+// Exec without field codes: %f %F %u %U %i %c %k (and the deprecated ones)
+// go, %% is a %.
+fn copyExec(app: *App, line: [*]const u8, start: usize, end: usize) -> void {
+    var length: usize = 0
+    var index = start
+    while index < end && length < 510 {
+        if line[index] == 37 && index + 1 < end {
+            if line[index + 1] == 37 {
+                app.*.exec[length] = 37
+                length += 1
+            }
+            index += 2
+        } else {
+            app.*.exec[length] = line[index]
+            length += 1
+            index += 1
+        }
+    }
+    while length > 0 && app.*.exec[length - 1] == 32 { length -= 1 }
+    app.*.execLength = length
+}
+
+// Reads one desktop entry into the next slot; false when it does not count.
+fn readEntry(apps: *Apps, path: [*]const u8, id: [*]const u8, id_length: usize) -> bool {
+    if apps.*.count >= MAX_APPS { return false }
+    const file = std.fs.open(path, 0, 0)
+    if !std.fs.isValid(file) { return false }
+    const contents = std.fs.readToEndAlloc(file, apps.*.allocator)
+    const closed = std.fs.close(file)
+    const app = appAt(apps, apps.*.count)
+    app.*.idLength = 0
+    while app.*.idLength < id_length && app.*.idLength < 96 {
+        app.*.id[app.*.idLength] = id[app.*.idLength]
+        app.*.idLength += 1
+    }
+    app.*.nameLength = 0
+    app.*.execLength = 0
+    app.*.iconLength = 0
+    app.*.wmClassLength = 0
+    app.*.terminal = false
+    app.*.hasImage = false
+    app.*.iconSize = 0
+    var localized = false
+    var application = false
+    var hidden = false
+    var in_entry = false
+    const text = contents.items
+    var at: usize = 0
+    while at < contents.length {
+        var end = at
+        while end < contents.length && text[end] != 10 { end += 1 }
+        var line: [*]const u8 = undefined
+        unsafe { line = @ptrFromInt([*]const u8, @intFromPtr(text) + at) }
+        const length = end - at
+        if length > 0 && line[0] == 91 {
+            in_entry = startsWith(line, length, "[Desktop Entry]")
+        } else if in_entry {
+            var equals: usize = 0
+            while equals < length && line[equals] != 61 { equals += 1 }
+            if equals < length {
+                const value_start = equals + 1
+                if startsWith(line, length, "Name=") && !localized {
+                    app.*.nameLength = copyValue(@ptrFromInt([*]u8, @intFromPtr(app) + @offsetOf(App, "name")), 96, line, value_start, length)
+                } else if startsWith(line, length, "Name[") && apps.*.languageLength > 0 && equals == 5 + apps.*.languageLength + 1 {
+                    // Name[de]= (not Name[de_AT]=).
+                    var same = true
+                    var index: usize = 0
+                    while index < apps.*.languageLength {
+                        if line[5 + index] != apps.*.language[index] { same = false }
+                        index += 1
+                    }
+                    if same {
+                        app.*.nameLength = copyValue(@ptrFromInt([*]u8, @intFromPtr(app) + @offsetOf(App, "name")), 96, line, value_start, length)
+                        localized = true
+                    }
+                } else if startsWith(line, length, "Exec=") {
+                    copyExec(app, line, value_start, length)
+                } else if startsWith(line, length, "Icon=") {
+                    app.*.iconLength = copyValue(@ptrFromInt([*]u8, @intFromPtr(app) + @offsetOf(App, "icon")), 160, line, value_start, length)
+                } else if startsWith(line, length, "StartupWMClass=") {
+                    app.*.wmClassLength = copyValue(@ptrFromInt([*]u8, @intFromPtr(app) + @offsetOf(App, "wmClass")), 96, line, value_start, length)
+                } else if startsWith(line, length, "Type=") {
+                    application = startsWith(line, length, "Type=Application")
+                } else if startsWith(line, length, "NoDisplay=") || startsWith(line, length, "Hidden=") {
+                    if isTrue(line, value_start, length) { hidden = true }
+                } else if startsWith(line, length, "Terminal=") {
+                    app.*.terminal = isTrue(line, value_start, length)
+                }
+            }
+        }
+        at = end + 1
+    }
+    std.fs.ArrayList.deinit(contents)
+    return application && !hidden && app.*.execLength > 0 && app.*.nameLength > 0
+}
+
+fn known(apps: *Apps, id: [*]const u8, length: usize) -> bool {
+    var index: usize = 0
+    while index < apps.*.count {
+        const app = appAt(apps, index)
+        if app.*.idLength == length {
+            var same = true
+            var at: usize = 0
+            while at < length {
+                if app.*.id[at] != id[at] { same = false }
+                at += 1
+            }
+            if same { return true }
+        }
+        index += 1
+    }
+    return false
+}
+
+fn scanDirectory(apps: *Apps, directory: *Path) -> void {
+    const base_length = directory.*.length
+    const handle = std.linux.syscall3(SYS_open, @intFromPtr(pathEnd(directory)), O_DIRECTORY | O_CLOEXEC, 0)
+    if handle < 0 { return }
+    var buffer: [8192]u8 = undefined
+    var bytes: [*]u8 = undefined
+    unsafe { bytes = @ptrCast([*]u8, &buffer) }
+    while true {
+        const count = std.linux.syscall3(SYS_getdents64, @bitCast(usize, handle), @intFromPtr(bytes), 8192)
+        if count <= 0 { break }
+        var offset: usize = 0
+        while offset < @bitCast(usize, count) {
+            // struct linux_dirent64: ino, off, u16 reclen, u8 type, name.
+            const record_length = @intCast(usize, bytes[offset + 16]) | (@intCast(usize, bytes[offset + 17]) << 8)
+            var name: [*]const u8 = undefined
+            unsafe { name = @ptrFromInt([*]const u8, @intFromPtr(bytes) + offset + 19) }
+            var length: usize = 0
+            while name[length] != 0 { length += 1 }
+            // NAME.desktop: its id is NAME.
+            if length > 8 && name[length - 8] == 46 && name[length - 7] == 100 && name[length - 1] == 112 && !known(apps, name, length - 8) {
+                directory.*.length = base_length
+                pathAdd(directory, "/")
+                pathAdd(directory, name[0..length])
+                if readEntry(apps, pathEnd(directory), name, length - 8) { apps.*.count += 1 }
+            }
+            if record_length == 0 { break }
+            offset += record_length
+        }
+    }
+    directory.*.length = base_length
+    const closed = std.linux.syscall1(SYS_close, @bitCast(usize, handle))
+}
+
+fn nameBefore(first: *const App, second: *const App) -> bool {
+    var index: usize = 0
+    while index < first.*.nameLength && index < second.*.nameLength {
+        const a = lower(first.*.name[index])
+        const b = lower(second.*.name[index])
+        if a != b { return a < b }
+        index += 1
+    }
+    return first.*.nameLength < second.*.nameLength
+}
+
+// Reads every desktop entry, sorted by name.
+pub fn scan(apps: *Apps) -> void {
+    apps.*.count = 0
+    var path: Path = undefined
+    var index: usize = 0
+    while dataDirectory(apps, index, &path) {
+        if path.length > 0 {
+            pathAdd(&path, "/applications")
+            scanDirectory(apps, &path)
+        }
+        index += 1
+    }
+    // Insertion sort by name (a few hundred entries).
+    var swap: App = undefined
+    var sorted: usize = 1
+    while sorted < apps.*.count {
+        var at = sorted
+        while at > 0 && nameBefore(appAt(apps, at), appAt(apps, at - 1)) {
+            copyApp(&swap, appAt(apps, at))
+            copyApp(appAt(apps, at), appAt(apps, at - 1))
+            copyApp(appAt(apps, at - 1), &swap)
+            at -= 1
+        }
+        sorted += 1
+    }
+}
+
+fn copyApp(target: *App, source: *const App) -> void {
+    var to: [*]u8 = undefined
+    var from: [*]const u8 = undefined
+    unsafe {
+        to = @ptrCast([*]u8, target)
+        from = @ptrCast([*]const u8, source)
+    }
+    var index: usize = 0
+    while index < @sizeOf(App) {
+        to[index] = from[index]
+        index += 1
+    }
+}
+
+// The app whose id (or StartupWMClass) is `name`, ignoring case; also
+// matches reverse-DNS ids by their last part ("org.gnome.Nautilus" for
+// "nautilus"). Returns the index, or count when none.
+pub fn find(apps: *Apps, name: []const u8) -> usize {
+    var index: usize = 0
+    while index < apps.*.count {
+        const app = appAt(apps, index)
+        if sameText(idOf(app), name) || (app.*.wmClassLength > 0 && sameText(wmClassOf(app), name)) { return index }
+        index += 1
+    }
+    index = 0
+    while index < apps.*.count {
+        const app = appAt(apps, index)
+        const id = idOf(app)
+        var dot = id.length
+        while dot > 0 && id[dot - 1] != 46 { dot -= 1 }
+        if dot > 0 && sameText(id[dot..id.length], name) { return index }
+        index += 1
+    }
+    return apps.*.count
+}
+
+// ---------------------------------------------------------------------------
+// Icons
+
+pub fn imageOf(app: *App) -> *png.Image {
+    unsafe { return @ptrCast(*png.Image, &app.*.image) }
+}
+
+fn iconSizeAt(index: usize) -> usize {
+    return match index {
+        0 => 64, 1 => 48, 2 => 96, 3 => 128, 4 => 256, 5 => 512, 6 => 32, 7 => 24, 8 => 22,
+        else => 16
+    }
+}
+
+fn tryIcon(app: *App, path: *Path, size: usize, allocator: Allocator) -> bool {
+    var image: png.Image = undefined
+    if png.loadFile(&image, pathEnd(path), allocator) != png.Status.ok { return false }
+    var scaled: png.Image = undefined
+    const status = png.scale(&scaled, &image, size, size, allocator)
+    png.deinit(&image)
+    if status != png.Status.ok { return false }
+    app.*.image = scaled
+    app.*.hasImage = true
+    return true
+}
+
+// Loads the app's icon at `size` pixels (once per size); false when it has
+// none we can read.
+pub fn loadIcon(apps: *Apps, app: *App, size: usize) -> bool {
+    if app.*.iconSize == size { return app.*.hasImage }
+    if app.*.hasImage { png.deinit(imageOf(app)) }
+    app.*.hasImage = false
+    app.*.iconSize = size
+    if app.*.iconLength == 0 { return false }
+    const icon = sliceOf(@intFromPtr(app) + @offsetOf(App, "icon"), app.*.iconLength)
+    var path: Path = undefined
+    if icon[0] == 47 {
+        pathClear(&path)
+        pathAdd(&path, icon)
+        return tryIcon(app, &path, size, apps.*.allocator)
+    }
+    var directory: usize = 0
+    var base: Path = undefined
+    while dataDirectory(apps, directory, &base) {
+        if base.length > 0 {
+            var index: usize = 0
+            while index < 10 {
+                const pixels = iconSizeAt(index)
+                pathClear(&path)
+                pathAdd(&path, base.bytes[0..base.length])
+                pathAdd(&path, "/icons/hicolor/")
+                appendNumber(&path, pixels)
+                pathAdd(&path, "x")
+                appendNumber(&path, pixels)
+                pathAdd(&path, "/apps/")
+                pathAdd(&path, icon)
+                pathAdd(&path, ".png")
+                if exists(pathEnd(&path)) && tryIcon(app, &path, size, apps.*.allocator) { return true }
+                index += 1
+            }
+        }
+        directory += 1
+    }
+    pathClear(&path)
+    pathAdd(&path, "/usr/share/pixmaps/")
+    pathAdd(&path, icon)
+    pathAdd(&path, ".png")
+    return exists(pathEnd(&path)) && tryIcon(app, &path, size, apps.*.allocator)
+}
+
+fn appendNumber(path: *Path, value: usize) -> void {
+    var digits: [20]u8 = undefined
+    var count: usize = 0
+    var rest = value
+    while rest > 0 || count == 0 {
+        digits[count] = @intCast(u8, 48 + rest % 10)
+        rest = rest / 10
+        count += 1
+    }
+    while count > 0 {
+        count -= 1
+        pathAdd(path, digits[count..count + 1])
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Starting
+
+// Runs `command` with /bin/sh -c (inside `terminal`, a program name or
+// path, when it is not 0, for programs that want one), detached: in a
+// session of its own, and reaped at once (it is a grandchild).
+pub fn run(command: []const u8, terminal: [*]const u8, environment: [*][*]const u8) -> void {
+    var line: Path = undefined
+    pathClear(&line)
+    pathAdd(&line, "exec ")
+    if @intFromPtr(terminal) != 0 {
+        // exec TERMINAL /bin/sh -c 'COMMAND' (a ' in it as '\'').
+        pathAddC(&line, terminal)
+        pathAdd(&line, " /bin/sh -c '")
+        for byte in command {
+            if byte == 39 { pathAdd(&line, "'\\''") }
+            if byte != 39 && line.length < 1020 {
+                line.bytes[line.length] = byte
+                line.length += 1
+            }
+        }
+        pathAdd(&line, "'")
+    } else {
+        pathAdd(&line, command)
+    }
+    const text = pathEnd(&line)
+    const child = std.linux.syscall0(SYS_fork)
+    if child == 0 {
+        const session = std.linux.syscall0(SYS_setsid)
+        if std.linux.syscall0(SYS_fork) == 0 {
+            var arguments: [4][*]const u8 = undefined
+            unsafe {
+                arguments[0] = @ptrCast([*]const u8, "/bin/sh")
+                arguments[1] = @ptrCast([*]const u8, "-c")
+                arguments[2] = text
+                arguments[3] = @ptrFromInt([*]const u8, 0)
+                const ignored = std.linux.syscall3(SYS_execve, @intFromPtr(arguments[0]), @intFromPtr(&arguments), @intFromPtr(environment))
+            }
+        }
+        const exited = std.linux.syscall1(SYS_exit, 0)
+    }
+    if child > 0 {
+        var status: [4]u8 = [4]u8{ 0, 0, 0, 0 }
+        const waited = std.linux.syscall4(SYS_wait4, @bitCast(usize, child), @intFromPtr(&status), 0, 0)
+    }
+}
+
+// Starts the app (in `terminal` when it wants one).
+pub fn launch(app: *const App, terminal: [*]const u8, environment: [*][*]const u8) -> void {
+    var none: [*]const u8 = undefined
+    unsafe { none = @ptrFromInt([*]const u8, 0) }
+    run(execOf(app), if app.*.terminal { terminal } else { none }, environment)
+}

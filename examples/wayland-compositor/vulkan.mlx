@@ -89,7 +89,19 @@ pub const Renderer = struct {
     // frame missing, 2 makes the third compose fail.
     testFailure: u8
     composed: usize
+    // Blur behind surfaces (ext-background-effect-v1; see scene.mlx): the
+    // pass and mask kernels, two scratch buffers of the output's size, the
+    // region records (BLUR_SLOTS surfaces a frame) and the slot in use.
+    hasBlur: bool
+    blurPass: *gpu.Kernel
+    blurMask: *gpu.Kernel
+    blurFirst: *gpu.Buffer
+    blurSecond: *gpu.Buffer
+    blurOps: *gpu.Buffer
+    blurSlot: u32
 }
+
+const BLUR_SLOTS: u32 = 64
 
 fn rendererOf(compositor: *Compositor) -> *Renderer {
     unsafe { return @ptrFromInt(*Renderer, compositor.*.renderer) }
@@ -173,6 +185,11 @@ pub fn open(compositor: *Compositor, arguments: [][*]const u8, output: ?*kms.Out
         renderer.*.background = @ptrFromInt(*gpu.Buffer, record(compositor, @sizeOf(gpu.Buffer)))
         renderer.*.palette = @ptrFromInt(*gpu.Buffer, record(compositor, @sizeOf(gpu.Buffer)))
         renderer.*.arrow = @ptrFromInt(*gpu.Buffer, record(compositor, @sizeOf(gpu.Buffer)))
+        renderer.*.blurPass = @ptrFromInt(*gpu.Kernel, record(compositor, @sizeOf(gpu.Kernel)))
+        renderer.*.blurMask = @ptrFromInt(*gpu.Kernel, record(compositor, @sizeOf(gpu.Kernel)))
+        renderer.*.blurFirst = @ptrFromInt(*gpu.Buffer, record(compositor, @sizeOf(gpu.Buffer)))
+        renderer.*.blurSecond = @ptrFromInt(*gpu.Buffer, record(compositor, @sizeOf(gpu.Buffer)))
+        renderer.*.blurOps = @ptrFromInt(*gpu.Buffer, record(compositor, @sizeOf(gpu.Buffer)))
     }
     renderer.*.context = context
     renderer.*.blit = kernel
@@ -222,6 +239,18 @@ pub fn open(compositor: *Compositor, arguments: [][*]const u8, output: ?*kms.Out
     const box = @intCast(usize, scene.CURSOR_SIZE)
     if !gpu.createBuffer(context, renderer.*.arrow, @intCast(u64, box * box * @intCast(usize, scene.CURSOR_KINDS) * 4), false) { return false }
     fillStatic(compositor, renderer)
+
+    // Blur: without it (no memory, no pipeline) blurred surfaces are drawn
+    // as they are.
+    renderer.*.hasBlur = false
+    var pass_code: [*]u32 = undefined
+    var mask_code: [*]u32 = undefined
+    const pass_words = shaders.buildBlurPassWords(allocator, &pass_code)
+    const mask_words = shaders.buildBlurMaskWords(allocator, &mask_code)
+    if pass_words != 0 && mask_words != 0 && gpu.createKernel(context, renderer.*.blurPass, pass_code, pass_words, 2, shaders.BLUR_PASS_WORDS) && gpu.createKernel(context, renderer.*.blurMask, mask_code, mask_words, 3, shaders.BLUR_MASK_WORDS) {
+        renderer.*.hasBlur = gpu.createBuffer(context, renderer.*.blurFirst, @intCast(u64, width * height * 4), false) && gpu.createBuffer(context, renderer.*.blurSecond, @intCast(u64, width * height * 4), false) && gpu.createBuffer(context, renderer.*.blurOps, @intCast(u64, BLUR_SLOTS * shaders.BLUR_OPS * 5 * 4), false)
+    }
+    if !renderer.*.hasBlur { say("mlx-compositor: no blur in Vulkan (its pipeline or memory is missing); blurred surfaces are drawn as they are\n") }
 
     renderer.*.hasText = false
     if compositor.*.hasText {
@@ -601,6 +630,65 @@ fn drawSurface(compositor: *Compositor, renderer: *Renderer, surface: *Surface, 
     blit(compositor, renderer, staging.?.*.buffer, 0, @intCast(u32, buffer.*.width), buffer.*.width, buffer.*.height, x, y, opaque)
 }
 
+fn blurPassOnce(renderer: *Renderer, source: vk.Buffer, source_offset: u32, source_stride: u32, target: vk.Buffer, target_offset: u32, target_stride: u32, width: u32, height: u32, vertical: bool) -> void {
+    if renderer.*.failed { return }
+    var buffers: [2]vk.Buffer = [2]vk.Buffer{ source, target }
+    const push = shaders.BlurPass.{ .width = width, .height = height, .sourceOffset = source_offset, .sourceStride = source_stride, .targetOffset = target_offset, .targetStride = target_stride, .vertical = if vertical { 1 } else { 0 } }
+    unsafe {
+        if !gpu.dispatch(renderer.*.context, renderer.*.blurPass, @ptrCast([*]const vk.Buffer, &buffers), &push, gpu.groups(width, shaders.GROUP_SIZE), gpu.groups(height, shaders.GROUP_SIZE)) { renderer.*.failed = true }
+    }
+}
+
+// Blurs what is drawn behind the surface's blur region, as scene.mlx does
+// on the CPU (the same passes, so the same pixels): the region's bounds and
+// what lies within reach of them are read from the frame, blurred across
+// and down BLUR_PASSES times in the scratch buffers, and copied back where
+// the region is.
+fn blurBehind(compositor: *Compositor, renderer: *Renderer, surface: *const Surface) -> void {
+    if !renderer.*.hasBlur || renderer.*.failed || renderer.*.blurSlot >= BLUR_SLOTS { return }
+    const area = ui.intersect(scene.blurBounds(surface), scene.outputRect(compositor))
+    if ui.isEmpty(area) { return }
+    const reach = scene.BLUR_REACH
+    const source = ui.intersect(ui.rect(area.x - reach, area.y - reach, area.width + reach * 2, area.height + reach * 2), scene.outputRect(compositor))
+    const width = @intCast(u32, source.width)
+    const height = @intCast(u32, source.height)
+    const first = renderer.*.blurFirst.*.buffer
+    const second = renderer.*.blurSecond.*.buffer
+    const frame_offset = renderer.*.offset + @intCast(u32, source.y) * renderer.*.stride + @intCast(u32, source.x)
+    var pass: i32 = 0
+    while pass < scene.BLUR_PASSES {
+        if pass == 0 {
+            blurPassOnce(renderer, renderer.*.target, frame_offset, renderer.*.stride, second, 0, width, width, height, false)
+        } else {
+            blurPassOnce(renderer, first, 0, width, second, 0, width, width, height, false)
+        }
+        blurPassOnce(renderer, second, 0, width, first, 0, width, width, height, true)
+        pass += 1
+    }
+    // The region's records for the mask.
+    const slot = renderer.*.blurSlot
+    renderer.*.blurSlot += 1
+    var words: [*]u32 = undefined
+    unsafe { words = @ptrFromInt([*]u32, renderer.*.blurOps.*.address + @intCast(usize, slot * shaders.BLUR_OPS * 5) * 4) }
+    const limit = @intCast(usize, shaders.BLUR_OPS)
+    const count = if surface.*.blurCount < limit { surface.*.blurCount } else { limit }
+    var index: usize = 0
+    while index < count {
+        words[index * 5] = if surface.*.blurOps[index].subtract { 1 } else { 0 }
+        words[index * 5 + 1] = @bitCast(u32, surface.*.blurOps[index].x)
+        words[index * 5 + 2] = @bitCast(u32, surface.*.blurOps[index].y)
+        words[index * 5 + 3] = @bitCast(u32, surface.*.blurOps[index].width)
+        words[index * 5 + 4] = @bitCast(u32, surface.*.blurOps[index].height)
+        index += 1
+    }
+    if renderer.*.failed { return }
+    var buffers: [3]vk.Buffer = [3]vk.Buffer{ first, renderer.*.target, renderer.*.blurOps.*.buffer }
+    const push = shaders.BlurMask.{ .width = @intCast(u32, area.width), .height = @intCast(u32, area.height), .sourceOffset = @intCast(u32, area.y - source.y) * width + @intCast(u32, area.x - source.x), .sourceStride = width, .targetOffset = renderer.*.offset, .targetStride = renderer.*.stride, .areaX = @intCast(u32, area.x), .areaY = @intCast(u32, area.y), .originX = @bitCast(u32, scene.originX(surface)), .originY = @bitCast(u32, scene.originY(surface)), .opsOffset = slot * shaders.BLUR_OPS * 5, .opCount = @intCast(u32, count) }
+    unsafe {
+        if !gpu.dispatch(renderer.*.context, renderer.*.blurMask, @ptrCast([*]const vk.Buffer, &buffers), &push, gpu.groups(@intCast(u32, area.width), shaders.GROUP_SIZE), gpu.groups(@intCast(u32, area.height), shaders.GROUP_SIZE)) { renderer.*.failed = true }
+    }
+}
+
 // Draws a surface with its subsurfaces: those below it, itself, those
 // above, each with its own subsurfaces in turn.
 fn drawTree(compositor: *Compositor, renderer: *Renderer, address: usize, depth: usize) -> void {
@@ -610,6 +698,7 @@ fn drawTree(compositor: *Compositor, renderer: *Renderer, address: usize, depth:
         drawTree(compositor, renderer, state.listAt(surface.*.children, index), depth + 1)
         index += 1
     }
+    if surface.*.hasBlur && surface.*.hasContent { blurBehind(compositor, renderer, surface) }
     drawSurface(compositor, renderer, surface, scene.originX(surface), scene.originY(surface))
     index = surface.*.belowCount
     while index < surface.*.children.length && depth < 16 {
@@ -627,6 +716,7 @@ pub fn compose(compositor: *Compositor, slot: usize) -> bool {
     renderer.*.target = renderer.*.targets[slot].*.buffer
     renderer.*.offset = renderer.*.targetOffsets[slot]
     renderer.*.failed = false
+    renderer.*.blurSlot = 0
     renderer.*.composed += 1
     if renderer.*.testFailure == 2 && renderer.*.composed == 3 { return false }
     if !gpu.begin(context) { return false }

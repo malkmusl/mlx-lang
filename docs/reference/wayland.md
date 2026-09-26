@@ -568,6 +568,43 @@ check scripts run it with `MLX_ARENA_POISON=1`, which overwrites the
 released bytes so a value wrongly kept across turns shows up;
 `MLX_ARENA_RELEASE=0` turns the release off.
 
+### A dock and a launcher
+
+The desktop parts beyond windows are Wayland clients of the compositor as
+well: [`examples/mlx-dock`](../../examples/mlx-dock/main.mlx) along the
+bottom edge and [`examples/mlx-launcher`](../../examples/mlx-launcher/main.mlx),
+which Super opens in the middle of the screen (see the compositor's
+[README](../../examples/wayland-compositor/README.md#dock-and-launcher)).
+The compositor offers them three more protocols, materialized like the
+others from `std/protocols/wayland` (`wlr-layer-shell-unstable-v1.xml`,
+`wlr-foreign-toplevel-management-unstable-v1.xml` and
+`ext-background-effect-v1.xml`):
+
+- `zwlr_layer_shell_v1`: surfaces in the background, bottom, top and
+  overlay layers around the windows, anchored to edges or centred, with
+  margins, exclusive zones that windows keep out of, and keyboard
+  interactivity (the launcher takes the keyboard exclusively until it
+  closes).
+- `zwlr_foreign_toplevel_manager_v1`: the windows with their titles, app
+  ids and activation, for the dock, which activates them.
+- `ext_background_effect_manager_v1`: a blur region per surface. The
+  compositor blurs what lies behind it (three box blurs) before drawing the
+  surface over it, on the CPU (`scene.mlx`) or in two Vulkan compute
+  kernels (`examples/vulkan-shared/shaders.mlx`) that give the same
+  pixels; the damage around a blurred surface grows by the blur's reach.
+
+Their shared code is in `examples/desktop-shared`: a layer surface with
+its buffers, pointer and keyboard (key repeat, the keymap through
+libxkbcommon) and the window list (`panel.mlx`), drawing with smooth
+rounded shapes, images and `std.truetype` text (`canvas.mlx`), and the
+apps from their desktop entries with PNG icons through `std.png`
+(`apps.mlx`). `tools/check_desktop_clients.sh` runs both in the nested
+compositor under `tools/wayland-test-host` on the CPU and the Vulkan
+renderer: the surfaces' places and layers, Super, typing into the
+launcher, apps started from the launcher and the dock, windows switched
+from the dock, a window blurred behind the launcher, and the same pixels
+from both renderers.
+
 ### GPU buffers: linux-dmabuf and Vulkan
 
 `wl.zwp_linux_dmabuf_v1`, `wl.zwp_linux_buffer_params_v1` and

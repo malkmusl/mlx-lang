@@ -24,6 +24,21 @@
 //     each quad is four words: atlasX | atlasY << 16, width | height << 16,
 //     x, y (signed, relative to the run origin).
 //
+// blurPass (binding 0: source pixels, binding 1: destination pixels,
+//           push constants: BlurPass)
+//     One box blur pass over a width x height rectangle: each pixel becomes
+//     the mean (per channel, truncated) of the BLUR_RADIUS pixels either
+//     side of it across (or down, with `vertical`), the rectangle's edge
+//     pixels repeated beyond it. Both rectangles start at an offset, rows
+//     `stride` pixels apart.
+//
+// blurMask (binding 0: blurred pixels, binding 1: destination pixels,
+//           binding 2: region, push constants: BlurMask)
+//     Copies the blurred rectangle into the destination at (areaX, areaY)
+//     where the pixel is in a region: `opCount` (at most BLUR_OPS) records of
+//     five words at `opsOffset` (subtract, x, y, width, height, relative to
+//     (originX, originY)); the last one covering a pixel decides.
+//
 // All use 8x8 work groups: dispatch ceil(width / 8) x ceil(height / 8).
 
 const std = @import("std")
@@ -92,6 +107,38 @@ pub const Text = struct {
 pub const PATTERN_WORDS: u32 = 6
 pub const BLIT_WORDS: u32 = 11
 pub const TEXT_WORDS: u32 = 15
+pub const BLUR_PASS_WORDS: u32 = 7
+pub const BLUR_MASK_WORDS: u32 = 12
+
+// The blur's radius (a pass averages 2 * BLUR_RADIUS + 1 pixels) and the
+// most region rectangles blurMask reads.
+pub const BLUR_RADIUS: i32 = 6
+pub const BLUR_OPS: u32 = 32
+
+pub const BlurPass = struct {
+    width: u32
+    height: u32
+    sourceOffset: u32
+    sourceStride: u32
+    targetOffset: u32
+    targetStride: u32
+    vertical: u32
+}
+
+pub const BlurMask = struct {
+    width: u32
+    height: u32
+    sourceOffset: u32
+    sourceStride: u32
+    targetOffset: u32
+    targetStride: u32
+    areaX: u32
+    areaY: u32
+    originX: u32
+    originY: u32
+    opsOffset: u32
+    opCount: u32
+}
 pub const PATTERN: u8 = 0
 pub const BLIT: u8 = 1
 pub const TEXT: u8 = 2
@@ -482,6 +529,154 @@ pub fn buildText(b: *builder.Builder) -> void {
     builder.returnVoid(b)
     builder.functionEnd(b)
     finish(b, &common, main)
+}
+
+fn unsigned(b: *builder.Builder, common: *const Common, value: u32) -> u32 {
+    return builder.unary(b, spv.Op.bitcast, common.*.uint, value)
+}
+
+// min(max(value, 0), limit - 1) for signed `value` and unsigned `limit`.
+fn clampToCount(b: *builder.Builder, common: *const Common, value: u32, limit: u32) -> u32 {
+    const zero = builder.constant(b, common.*.int, 0)
+    const last = op(b, spv.Op.iSub, common.*.int, signed(b, common, limit), builder.constant(b, common.*.int, 1))
+    const low = select(b, common.*.int, op(b, spv.Op.sLessThan, common.*.boolean, value, zero), zero, value)
+    return select(b, common.*.int, op(b, spv.Op.sGreaterThan, common.*.boolean, low, last), last, low)
+}
+
+pub fn buildBlurPass(b: *builder.Builder) -> void {
+    var common: Common = undefined
+    declare(b, &common, BLUR_PASS_WORDS, 2)
+    const main = builder.function(b, common.voidType, spv.FUNCTION_CONTROL_NONE, common.functionType)
+    const entry = builder.label(b)
+    const id = builder.load(b, common.uvec3, common.globalId)
+    const x = builder.compositeExtract(b, common.uint, id, 0)
+    const y = builder.compositeExtract(b, common.uint, id, 1)
+    const width = pushWord(b, &common, 0)
+    const height = pushWord(b, &common, 1)
+    const source_offset = pushWord(b, &common, 2)
+    const source_stride = pushWord(b, &common, 3)
+    const target_offset = pushWord(b, &common, 4)
+    const target_stride = pushWord(b, &common, 5)
+    const vertical = op(b, spv.Op.iNotEqual, common.boolean, pushWord(b, &common, 6), common.zero)
+    const inside = op(b, spv.Op.logicalAnd, common.boolean, op(b, spv.Op.uLessThan, common.boolean, x, width), op(b, spv.Op.uLessThan, common.boolean, y, height))
+    const body = builder.newId(b)
+    const merge = builder.newId(b)
+    builder.selectionMerge(b, merge)
+    builder.branchConditional(b, inside, body, merge)
+
+    const body_label = builder.labelWith(b, body)
+    const sx = signed(b, &common, x)
+    const sy = signed(b, &common, y)
+    var sums: [4]u32 = [4]u32{ common.zero, common.zero, common.zero, common.zero }
+    var offset: i32 = 0 - BLUR_RADIUS
+    while offset <= BLUR_RADIUS {
+        const step = builder.constant(b, common.int, @bitCast(u32, offset))
+        const along_x = clampToCount(b, &common, op(b, spv.Op.iAdd, common.int, sx, step), width)
+        const along_y = clampToCount(b, &common, op(b, spv.Op.iAdd, common.int, sy, step), height)
+        const column = unsigned(b, &common, select(b, common.int, vertical, sx, along_x))
+        const row = unsigned(b, &common, select(b, common.int, vertical, along_y, sy))
+        const index = op(b, spv.Op.iAdd, common.uint, source_offset, op(b, spv.Op.iAdd, common.uint, op(b, spv.Op.iMul, common.uint, row, source_stride), column))
+        const pixel = builder.load(b, common.uint, element(b, &common, common.buffers[0], index))
+        var channel_index: u32 = 0
+        while channel_index < 4 {
+            sums[channel_index] = op(b, spv.Op.iAdd, common.uint, sums[channel_index], channel(b, &common, pixel, 24 - channel_index * 8))
+            channel_index += 1
+        }
+        offset += 1
+    }
+    const window = constant(b, &common, @intCast(u32, BLUR_RADIUS * 2 + 1))
+    var result = common.zero
+    var channel_index: u32 = 0
+    while channel_index < 4 {
+        const mean = op(b, spv.Op.uDiv, common.uint, sums[channel_index], window)
+        const placed = op(b, spv.Op.shiftLeftLogical, common.uint, mean, constant(b, &common, 24 - channel_index * 8))
+        result = op(b, spv.Op.bitwiseOr, common.uint, result, placed)
+        channel_index += 1
+    }
+    const target_index = op(b, spv.Op.iAdd, common.uint, target_offset, op(b, spv.Op.iAdd, common.uint, op(b, spv.Op.iMul, common.uint, y, target_stride), x))
+    builder.store(b, element(b, &common, common.buffers[1], target_index), result)
+    builder.branch(b, merge)
+
+    const merge_label = builder.labelWith(b, merge)
+    builder.returnVoid(b)
+    builder.functionEnd(b)
+    finish(b, &common, main)
+}
+
+pub fn buildBlurMask(b: *builder.Builder) -> void {
+    var common: Common = undefined
+    declare(b, &common, BLUR_MASK_WORDS, 3)
+    const main = builder.function(b, common.voidType, spv.FUNCTION_CONTROL_NONE, common.functionType)
+    const entry = builder.label(b)
+    const id = builder.load(b, common.uvec3, common.globalId)
+    const x = builder.compositeExtract(b, common.uint, id, 0)
+    const y = builder.compositeExtract(b, common.uint, id, 1)
+    const width = pushWord(b, &common, 0)
+    const height = pushWord(b, &common, 1)
+    const source_offset = pushWord(b, &common, 2)
+    const source_stride = pushWord(b, &common, 3)
+    const target_offset = pushWord(b, &common, 4)
+    const target_stride = pushWord(b, &common, 5)
+    const area_x = pushWord(b, &common, 6)
+    const area_y = pushWord(b, &common, 7)
+    const origin_x = signed(b, &common, pushWord(b, &common, 8))
+    const origin_y = signed(b, &common, pushWord(b, &common, 9))
+    const ops_offset = pushWord(b, &common, 10)
+    const op_count = pushWord(b, &common, 11)
+    const in_area = op(b, spv.Op.logicalAnd, common.boolean, op(b, spv.Op.uLessThan, common.boolean, x, width), op(b, spv.Op.uLessThan, common.boolean, y, height))
+    const out_x = op(b, spv.Op.iAdd, common.uint, area_x, x)
+    const out_y = op(b, spv.Op.iAdd, common.uint, area_y, y)
+    // The pixel relative to the surface.
+    const relative_x = op(b, spv.Op.iSub, common.int, signed(b, &common, out_x), origin_x)
+    const relative_y = op(b, spv.Op.iSub, common.int, signed(b, &common, out_y), origin_y)
+    var covered = builder.constantBool(b, common.boolean, false)
+    var index: u32 = 0
+    while index < BLUR_OPS {
+        const base = op(b, spv.Op.iAdd, common.uint, ops_offset, constant(b, &common, index * 5))
+        const subtract = builder.load(b, common.uint, element(b, &common, common.buffers[2], base))
+        const rect_x = signed(b, &common, builder.load(b, common.uint, element(b, &common, common.buffers[2], op(b, spv.Op.iAdd, common.uint, base, constant(b, &common, 1)))))
+        const rect_y = signed(b, &common, builder.load(b, common.uint, element(b, &common, common.buffers[2], op(b, spv.Op.iAdd, common.uint, base, constant(b, &common, 2)))))
+        const rect_width = signed(b, &common, builder.load(b, common.uint, element(b, &common, common.buffers[2], op(b, spv.Op.iAdd, common.uint, base, constant(b, &common, 3)))))
+        const rect_height = signed(b, &common, builder.load(b, common.uint, element(b, &common, common.buffers[2], op(b, spv.Op.iAdd, common.uint, base, constant(b, &common, 4)))))
+        const in_x = op(b, spv.Op.logicalAnd, common.boolean, op(b, spv.Op.sGreaterThanEqual, common.boolean, relative_x, rect_x), op(b, spv.Op.sLessThan, common.boolean, relative_x, op(b, spv.Op.iAdd, common.int, rect_x, rect_width)))
+        const in_y = op(b, spv.Op.logicalAnd, common.boolean, op(b, spv.Op.sGreaterThanEqual, common.boolean, relative_y, rect_y), op(b, spv.Op.sLessThan, common.boolean, relative_y, op(b, spv.Op.iAdd, common.int, rect_y, rect_height)))
+        const counted = op(b, spv.Op.uLessThan, common.boolean, constant(b, &common, index), op_count)
+        const hit = op(b, spv.Op.logicalAnd, common.boolean, counted, op(b, spv.Op.logicalAnd, common.boolean, in_x, in_y))
+        const adds = op(b, spv.Op.iEqual, common.boolean, subtract, common.zero)
+        covered = select(b, common.boolean, hit, adds, covered)
+        index += 1
+    }
+    const copy = op(b, spv.Op.logicalAnd, common.boolean, in_area, covered)
+    const body = builder.newId(b)
+    const merge = builder.newId(b)
+    builder.selectionMerge(b, merge)
+    builder.branchConditional(b, copy, body, merge)
+
+    const body_label = builder.labelWith(b, body)
+    const source_index = op(b, spv.Op.iAdd, common.uint, source_offset, op(b, spv.Op.iAdd, common.uint, op(b, spv.Op.iMul, common.uint, y, source_stride), x))
+    const pixel = builder.load(b, common.uint, element(b, &common, common.buffers[0], source_index))
+    const target_index = op(b, spv.Op.iAdd, common.uint, target_offset, op(b, spv.Op.iAdd, common.uint, op(b, spv.Op.iMul, common.uint, out_y, target_stride), out_x))
+    builder.store(b, element(b, &common, common.buffers[1], target_index), pixel)
+    builder.branch(b, merge)
+
+    const merge_label = builder.labelWith(b, merge)
+    builder.returnVoid(b)
+    builder.functionEnd(b)
+    finish(b, &common, main)
+}
+
+pub fn buildBlurPassWords(allocator: std.allocator.Allocator, result: *[*]u32) -> usize {
+    var b: builder.Builder = undefined
+    builder.init(&b, allocator, spv.version(1, 3))
+    buildBlurPass(&b)
+    return moduleWords(allocator, &b, result)
+}
+
+pub fn buildBlurMaskWords(allocator: std.allocator.Allocator, result: *[*]u32) -> usize {
+    var b: builder.Builder = undefined
+    builder.init(&b, allocator, spv.version(1, 3))
+    buildBlurMask(&b)
+    return moduleWords(allocator, &b, result)
 }
 
 // Builds a shader into words allocated from `allocator`; returns the word

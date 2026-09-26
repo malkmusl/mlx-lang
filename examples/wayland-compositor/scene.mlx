@@ -288,7 +288,49 @@ pub fn raise(compositor: *Compositor, address: usize) -> void {
             index += 1
         }
     }
+    restack(compositor)
     damageSurface(compositor, state.surfaceAt(address))
+}
+
+// Where a surface stacks: layer surfaces of the background and bottom
+// layers below the windows, those of the top and overlay layers above
+// them; a popup or subsurface with the surface it belongs to.
+fn band(address: usize) -> u32 {
+    var current = address
+    var depth: usize = 0
+    while state.surfaceAt(current).*.parent != 0 && depth < 16 {
+        current = state.surfaceAt(current).*.parent
+        depth += 1
+    }
+    const root = state.surfaceAt(current)
+    if root.*.role != state.ROLE_LAYER { return 2 }
+    if root.*.layer <= state.LAYER_BOTTOM { return root.*.layer }
+    return root.*.layer + 1
+}
+
+// Sorts the stack by band, keeping the order within each.
+pub fn restack(compositor: *Compositor) -> void {
+    var sorted = true
+    var index: usize = 1
+    while index < compositor.*.stack.length {
+        if band(state.listAt(compositor.*.stack, index - 1)) > band(state.listAt(compositor.*.stack, index)) { sorted = false }
+        index += 1
+    }
+    if sorted { return }
+    var ordered = state.newList(compositor.*.allocator)
+    var level: u32 = 0
+    while level < 5 {
+        index = 0
+        while index < compositor.*.stack.length {
+            const address = state.listAt(compositor.*.stack, index)
+            if band(address) == level { ordered = state.listAppend(ordered, address) }
+            index += 1
+        }
+        level += 1
+    }
+    compositor.*.stack.deinit()
+    compositor.*.stack = ordered
+    damageAll(compositor)
 }
 
 // Places a new toplevel: cascaded from the top-left, wrapping around.
@@ -297,6 +339,11 @@ pub fn place(compositor: *Compositor, surface: *Surface) -> void {
     const offset_y = if surface.*.hasGeometry { surface.*.geometryY } else { 0 }
     surface.*.x = compositor.*.nextWindowX - offset_x
     surface.*.y = compositor.*.nextWindowY - offset_y
+    // Clear of the edges docks and panels reserve.
+    const below = titleY(surface) + TITLE_HEIGHT + 4 + windowHeight(surface) - (@intCast(i32, compositor.*.height) - compositor.*.reserveBottom)
+    if below > 0 { surface.*.y -= below }
+    if titleY(surface) < compositor.*.reserveTop { surface.*.y += compositor.*.reserveTop - titleY(surface) }
+    if titleX(surface) < compositor.*.reserveLeft { surface.*.x += compositor.*.reserveLeft - titleX(surface) }
     compositor.*.nextWindowX += 40
     compositor.*.nextWindowY += 32
     if compositor.*.nextWindowX > @intCast(i32, compositor.*.width / 2) || compositor.*.nextWindowY > @intCast(i32, compositor.*.height / 2) {
@@ -328,6 +375,173 @@ pub fn damageRect(compositor: *Compositor, area: ui.Rect) -> void {
     if ui.isEmpty(clipped) { return }
     compositor.*.damage = unionRect(compositor.*.damage, clipped)
     compositor.*.needsRedraw = true
+    if compositor.*.blurred.length > 0 { compositor.*.damage = widenForBlur(compositor, compositor.*.damage) }
+}
+
+// ---------------------------------------------------------------------------
+// Blur (ext-background-effect-v1)
+//
+// Behind a surface's blur region what was drawn below it is blurred: three
+// box blurs of radius BLUR_RADIUS one after the other (close to a Gaussian),
+// across and then down. A blurred pixel depends on everything within
+// BLUR_REACH of it, so damage near a blurred area takes in all of it and
+// what it reads (its bounds widened by the reach): a partly redrawn blur
+// would mix old pixels in.
+pub const BLUR_RADIUS: i32 = 6
+pub const BLUR_PASSES: i32 = 3
+pub const BLUR_REACH: i32 = 18
+
+// The blur region's bounds on the output (empty when it has none).
+pub fn blurBounds(surface: *const Surface) -> ui.Rect {
+    var bounds = ui.rect(0, 0, 0, 0)
+    var index: usize = 0
+    while index < surface.*.blurCount {
+        if !surface.*.blurOps[index].subtract {
+            bounds = unionRect(bounds, ui.rect(surface.*.blurOps[index].x, surface.*.blurOps[index].y, surface.*.blurOps[index].width, surface.*.blurOps[index].height))
+        }
+        index += 1
+    }
+    const own = ui.rect(0, 0, @intCast(i32, surface.*.pixelWidth), @intCast(i32, surface.*.pixelHeight))
+    const inside = ui.intersect(bounds, own)
+    if ui.isEmpty(inside) { return ui.rect(0, 0, 0, 0) }
+    return ui.rect(inside.x + originX(surface), inside.y + originY(surface), inside.width, inside.height)
+}
+
+fn widen(area: ui.Rect, amount: i32) -> ui.Rect {
+    return ui.rect(area.x - amount, area.y - amount, area.width + amount * 2, area.height + amount * 2)
+}
+
+fn contains(outer: ui.Rect, inner: ui.Rect) -> bool {
+    return inner.x >= outer.x && inner.y >= outer.y && ui.right(inner) <= ui.right(outer) && ui.bottom(inner) <= ui.bottom(outer)
+}
+
+// `area` and every blurred area it reaches into, whole (with what those
+// read). Also applied to what a frame slot lacks: the union of two frames'
+// damage can reach into a blur neither reached.
+fn widenForBlur(compositor: *Compositor, area: ui.Rect) -> ui.Rect {
+    var result = area
+    var round: usize = 0
+    var changed = true
+    while changed && round < 4 {
+        changed = false
+        var index: usize = 0
+        while index < compositor.*.blurred.length {
+            const surface = state.surfaceAt(state.listAt(compositor.*.blurred, index))
+            const bounds = blurBounds(surface)
+            if !ui.isEmpty(bounds) {
+                const reach = ui.intersect(widen(bounds, BLUR_REACH), outputRect(compositor))
+                if !ui.isEmpty(ui.intersect(reach, result)) && !contains(result, reach) {
+                    result = unionRect(result, reach)
+                    changed = true
+                }
+            }
+            index += 1
+        }
+        round += 1
+    }
+    return result
+}
+
+// One box blur pass over `count` values `step` apart: each becomes the
+// mean of those within `radius` (the ends repeated).
+fn boxPass(source: [*]const u32, target: [*]u32, start: usize, count: usize, step: usize, radius: i32) -> void {
+    const window = @intCast(u32, radius * 2 + 1)
+    var sums: [4]u32 = [4]u32{ 0, 0, 0, 0 }
+    var offset: i32 = 0 - radius
+    while offset <= radius {
+        const at = clampIndex(offset, count)
+        addPixel(&sums, source[start + at * step])
+        offset += 1
+    }
+    var index: usize = 0
+    while index < count {
+        target[start + index * step] = ((sums[0] / window) << 24) | ((sums[1] / window) << 16) | ((sums[2] / window) << 8) | (sums[3] / window)
+        const leaving = clampIndex(@intCast(i32, index) - radius, count)
+        const entering = clampIndex(@intCast(i32, index) + radius + 1, count)
+        subtractPixel(&sums, source[start + leaving * step])
+        addPixel(&sums, source[start + entering * step])
+        index += 1
+    }
+}
+
+fn clampIndex(value: i32, count: usize) -> usize {
+    if value < 0 { return 0 }
+    if value >= @intCast(i32, count) { return count - 1 }
+    return @intCast(usize, value)
+}
+
+fn addPixel(sums: *[4]u32, pixel: u32) -> void {
+    sums.*[0] += pixel >> 24
+    sums.*[1] += (pixel >> 16) & 255
+    sums.*[2] += (pixel >> 8) & 255
+    sums.*[3] += pixel & 255
+}
+
+fn subtractPixel(sums: *[4]u32, pixel: u32) -> void {
+    sums.*[0] -= pixel >> 24
+    sums.*[1] -= (pixel >> 16) & 255
+    sums.*[2] -= (pixel >> 8) & 255
+    sums.*[3] -= pixel & 255
+}
+
+// Blurs what is drawn behind the surface's blur region, in `clip`.
+fn blurBehind(compositor: *Compositor, pixels: [*]u8, clip: ui.Rect, surface: *const Surface) -> void {
+    const bounds = blurBounds(surface)
+    const area = ui.intersect(bounds, clip)
+    if ui.isEmpty(area) { return }
+    // What the blur reads: the area and what lies within reach of it.
+    const source = ui.intersect(widen(area, BLUR_REACH), outputRect(compositor))
+    const width = @intCast(usize, source.width)
+    const height = @intCast(usize, source.height)
+    const size = width * height * 4
+    const first_memory = state.allocate(compositor, size)
+    const second_memory = state.allocate(compositor, size)
+    var first: [*]u32 = undefined
+    var second: [*]u32 = undefined
+    var output: [*]u32 = undefined
+    unsafe {
+        first = @ptrCast([*]u32, first_memory)
+        second = @ptrCast([*]u32, second_memory)
+        output = @ptrCast([*]u32, pixels)
+    }
+    const stride = compositor.*.width
+    var row: usize = 0
+    while row < height {
+        state.copyPixels(@intFromPtr(first) + row * width * 4, @intFromPtr(output) + ((@intCast(usize, source.y) + row) * stride + @intCast(usize, source.x)) * 4, width)
+        row += 1
+    }
+    var pass: i32 = 0
+    while pass < BLUR_PASSES {
+        row = 0
+        while row < height {
+            boxPass(first, second, row * width, width, 1, BLUR_RADIUS)
+            row += 1
+        }
+        var column: usize = 0
+        while column < width {
+            boxPass(second, first, column, height, width, BLUR_RADIUS)
+            column += 1
+        }
+        pass += 1
+    }
+    // Back into the output inside the region.
+    var ops: [*]const state.RegionOp = undefined
+    unsafe { ops = @ptrCast([*]const state.RegionOp, &surface.*.blurOps) }
+    const left = originX(surface)
+    const top = originY(surface)
+    var y = area.y
+    while y < ui.bottom(area) {
+        var x = area.x
+        while x < ui.right(area) {
+            if state.regionContains(ops, surface.*.blurCount, x - left, y - top) {
+                output[@intCast(usize, y) * stride + @intCast(usize, x)] = first[@intCast(usize, y - source.y) * width + @intCast(usize, x - source.x)]
+            }
+            x += 1
+        }
+        y += 1
+    }
+    state.release(compositor, first_memory, size)
+    state.release(compositor, second_memory, size)
 }
 
 pub fn damageAll(compositor: *Compositor) -> void {
@@ -383,7 +597,8 @@ pub fn takeDamage(compositor: *Compositor, slot: usize, changed: *ui.Rect) -> ui
     compositor.*.slotDamage[0] = unionRect(compositor.*.slotDamage[0], changed.*)
     compositor.*.slotDamage[1] = unionRect(compositor.*.slotDamage[1], changed.*)
     const pending = compositor.*.slotDamage[slot]
-    const region = ui.rect(pending.x, pending.y, pending.width, pending.height)
+    var region = ui.rect(pending.x, pending.y, pending.width, pending.height)
+    if compositor.*.blurred.length > 0 && !ui.isEmpty(region) { region = widenForBlur(compositor, region) }
     compositor.*.slotDamage[slot] = ui.rect(0, 0, 0, 0)
     compositor.*.damage = ui.rect(0, 0, 0, 0)
     compositor.*.needsRedraw = false
@@ -616,6 +831,7 @@ fn drawTree(compositor: *Compositor, pixels: [*]u8, clip: ui.Rect, address: usiz
         drawTree(compositor, pixels, clip, state.listAt(surface.*.children, index), depth + 1)
         index += 1
     }
+    if surface.*.hasBlur && surface.*.hasContent { blurBehind(compositor, pixels, clip, surface) }
     blit(compositor, pixels, clip, surface, originX(surface), originY(surface))
     index = surface.*.belowCount
     while index < surface.*.children.length && depth < 16 {

@@ -66,7 +66,7 @@ for test in tests/268_compositor_damage_runtime.mlx tests/270_compositor_input_r
     fi
 done
 
-for example in examples/wayland-client/main.mlx examples/wayland-server/main.mlx examples/wayland-terminal/main.mlx examples/wayland-compositor/main.mlx tools/wayland-test-host/main.mlx; do
+for example in examples/wayland-client/main.mlx examples/wayland-server/main.mlx examples/wayland-terminal/main.mlx examples/wayland-compositor/main.mlx examples/mlx-dock/main.mlx examples/mlx-launcher/main.mlx tools/wayland-test-host/main.mlx; do
     if "$compiler" --quiet "$example" -o "$work/example"; then
         echo "ok   $example (builds)"
     else
