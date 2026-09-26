@@ -1,12 +1,18 @@
-// Scene management and software composition for the nested compositor.
+// Scene management and software composition for the compositor.
 //
-// Windows are drawn bottom to top into the host buffer with premultiplied
+// Windows are drawn bottom to top into the output buffer with premultiplied
 // ARGB8888 blending (the wl_shm pixel convention), each with a thin frame
 // that highlights the keyboard focus, followed by the cursor: the client's
 // cursor surface when one is set, otherwise a built-in arrow.
+//
+// Only what changed is drawn: every change to the scene reports the area
+// it affects (damageRect, damageSurface, damageCursor, damageAll), the
+// backend asks takeDamage what its frame slot lacks (a slot shown two
+// frames ago lacks two frames' changes), and compose draws that clip only.
 
 const state = @import("./state.mlx")
 const tt = @import("std.truetype")
+const ui = @import("std.ui")
 
 const Compositor = state.Compositor
 const Surface = state.Surface
@@ -211,12 +217,13 @@ pub fn raise(compositor: *Compositor, address: usize) -> void {
         if other != address && toplevelOf(other) == address {
             compositor.*.stack = state.listRemove(compositor.*.stack, other)
             compositor.*.stack = state.listAppend(compositor.*.stack, other)
+            damageSurface(compositor, state.surfaceAt(other))
             count -= 1
         } else {
             index += 1
         }
     }
-    compositor.*.needsRedraw = true
+    damageSurface(compositor, state.surfaceAt(address))
 }
 
 // Places a new toplevel: cascaded from the top-left, wrapping around.
@@ -233,69 +240,140 @@ pub fn place(compositor: *Compositor, surface: *Surface) -> void {
     }
 }
 
-fn fillRect(compositor: *Compositor, pixels: [*]u8, x: i32, y: i32, width: i32, height: i32, color: u32) -> void {
-    var top = y
-    if top < 0 { top = 0 }
-    var bottom = y + height
-    if bottom > @intCast(i32, compositor.*.height) { bottom = @intCast(i32, compositor.*.height) }
-    var left = x
-    if left < 0 { left = 0 }
-    var right = x + width
-    if right > @intCast(i32, compositor.*.width) { right = @intCast(i32, compositor.*.width) }
-    if left >= right || top >= bottom { return }
-    const count = @intCast(usize, right - left)
+// ---------------------------------------------------------------------------
+// Damage
+
+fn unionRect(a: ui.Rect, b: ui.Rect) -> ui.Rect {
+    if ui.isEmpty(a) { return b }
+    if ui.isEmpty(b) { return a }
+    const left = if a.x < b.x { a.x } else { b.x }
+    const top = if a.y < b.y { a.y } else { b.y }
+    const right = if ui.right(a) > ui.right(b) { ui.right(a) } else { ui.right(b) }
+    const bottom = if ui.bottom(a) > ui.bottom(b) { ui.bottom(a) } else { ui.bottom(b) }
+    return ui.rect(left, top, right - left, bottom - top)
+}
+
+pub fn outputRect(compositor: *const Compositor) -> ui.Rect {
+    return ui.rect(0, 0, @intCast(i32, compositor.*.width), @intCast(i32, compositor.*.height))
+}
+
+// Records that `area` (output coordinates) has to be drawn again.
+pub fn damageRect(compositor: *Compositor, area: ui.Rect) -> void {
+    const clipped = ui.intersect(area, outputRect(compositor))
+    if ui.isEmpty(clipped) { return }
+    compositor.*.damage = unionRect(compositor.*.damage, clipped)
+    compositor.*.needsRedraw = true
+}
+
+pub fn damageAll(compositor: *Compositor) -> void {
+    compositor.*.damage = outputRect(compositor)
+    compositor.*.needsRedraw = true
+}
+
+// Everything a mapped surface draws: its buffer and, for a toplevel, its
+// frame and title bar.
+pub fn surfaceBounds(surface: *const Surface) -> ui.Rect {
+    const buffer = ui.rect(surface.*.x, surface.*.y, @intCast(i32, surface.*.pixelWidth), @intCast(i32, surface.*.pixelHeight))
+    if surface.*.role != state.ROLE_TOPLEVEL { return buffer }
+    const decorated = ui.rect(titleX(surface), titleY(surface), titleWidth(surface), TITLE_HEIGHT + 2 + windowHeight(surface) + 2)
+    return unionRect(buffer, decorated)
+}
+
+pub fn damageSurface(compositor: *Compositor, surface: *const Surface) -> void {
+    damageRect(compositor, surfaceBounds(surface))
+}
+
+// Where the cursor is drawn: the client's cursor surface, or the box any
+// built-in cursor can cover (the hot spot is the arrow's tip or the box's
+// middle).
+pub fn damageCursor(compositor: *Compositor) -> void {
+    if compositor.*.cursorSurface != 0 {
+        const cursor = state.surfaceAt(compositor.*.cursorSurface)
+        damageRect(compositor, ui.rect(compositor.*.pointerX - compositor.*.cursorHotspotX, compositor.*.pointerY - compositor.*.cursorHotspotY, @intCast(i32, cursor.*.pixelWidth), @intCast(i32, cursor.*.pixelHeight)))
+    } else {
+        const half = CURSOR_SIZE / 2
+        damageRect(compositor, ui.rect(compositor.*.pointerX - half, compositor.*.pointerY - half, CURSOR_SIZE + half, CURSOR_SIZE + half))
+    }
+}
+
+// Starts a frame into slot `slot` (0 or 1): what changed since the last
+// frame goes to `changed`, and the part of the output the slot has to be
+// drawn again in (everything that changed since it was last composed
+// into) is returned. Both slots forget nothing until composed.
+pub fn takeDamage(compositor: *Compositor, slot: usize, changed: *ui.Rect) -> ui.Rect {
+    // (Fields copied one by one: a struct copied into a local and then
+    // overwritten at its source reads the new value with this compiler.)
+    changed.* = ui.rect(compositor.*.damage.x, compositor.*.damage.y, compositor.*.damage.width, compositor.*.damage.height)
+    compositor.*.slotDamage[0] = unionRect(compositor.*.slotDamage[0], changed.*)
+    compositor.*.slotDamage[1] = unionRect(compositor.*.slotDamage[1], changed.*)
+    const pending = compositor.*.slotDamage[slot]
+    const region = ui.rect(pending.x, pending.y, pending.width, pending.height)
+    compositor.*.slotDamage[slot] = ui.rect(0, 0, 0, 0)
+    compositor.*.damage = ui.rect(0, 0, 0, 0)
+    compositor.*.needsRedraw = false
+    return region
+}
+
+// ---------------------------------------------------------------------------
+// Drawing
+
+// Fills the part of the rectangle inside `clip`.
+fn fillRect(compositor: *Compositor, pixels: [*]u8, clip: ui.Rect, x: i32, y: i32, width: i32, height: i32, color: u32) -> void {
+    const area = ui.intersect(ui.rect(x, y, width, height), clip)
+    if ui.isEmpty(area) { return }
+    const count = @intCast(usize, area.width)
     const opaque = color | 4278190080
-    var row = top
-    while row < bottom {
-        const line = (@intCast(usize, row) * compositor.*.width + @intCast(usize, left)) * 4
+    var row = area.y
+    while row < ui.bottom(area) {
+        const line = (@intCast(usize, row) * compositor.*.width + @intCast(usize, area.x)) * 4
         state.fillPixels(@intFromPtr(pixels) + line, count, opaque)
         row += 1
     }
 }
 
-fn blend(destination: u32, source: u32, alpha: u32) -> u32 {
-    const kept = destination * (255 - alpha)
-    const value = source + (kept + 127) / 255
-    return if value > 255 { 255 } else { value }
-}
+// Lane constants: the same 16-bit value in the three lanes at bits 0, 16
+// and 32 of a u64.
+const LANES_1: u64 = 4295032833
+const LANES_127: u64 = 545469169791
+const LANES_255: u64 = 1095233372415
 
-// `source` (premultiplied ARGB, alpha `alpha`, neither 0 nor 255) over
-// `destination`; the result is opaque.
+// `source` (premultiplied ARGB with alpha `alpha`, neither 0 nor 255) over
+// `destination`: each channel min(255, source + (destination * (255 -
+// alpha) + 127) / 255), the result opaque. The three channels are blended
+// at once in 16-bit lanes of a u64; no step carries between lanes.
 fn blendPixel(destination: u32, source: u32, alpha: u32) -> u32 {
-    const red = blend((destination >> 16) & 255, (source >> 16) & 255, alpha)
-    const green = blend((destination >> 8) & 255, (source >> 8) & 255, alpha)
-    const blue = blend(destination & 255, source & 255, alpha)
-    return 4278190080 | (red << 16) | (green << 8) | blue
+    const d = @intCast(u64, destination)
+    const s = @intCast(u64, source)
+    const lanes_d = (d & 255) | ((d & 65280) << 8) | ((d & 16711680) << 16)
+    const lanes_s = (s & 255) | ((s & 65280) << 8) | ((s & 16711680) << 16)
+    // destination * (255 - alpha) + 127: at most 65152 per lane.
+    const kept = lanes_d * @intCast(u64, 255 - alpha) + LANES_127
+    // Exact division by 255: (x + 1 + (x >> 8)) >> 8 for x below 65535.
+    const divided = ((kept + LANES_1 + ((kept >> 8) & LANES_255)) >> 8) & LANES_255
+    const sum = lanes_s + divided
+    // Lanes past 255 (bit 8 set; the sum is at most 510) become 255.
+    const over = (sum >> 8) & LANES_1
+    const clamped = (sum | (over * 255)) & LANES_255
+    return 4278190080 | @intCast(u32, clamped & 255) | @intCast(u32, (clamped >> 8) & 65280) | @intCast(u32, (clamped >> 16) & 16711680)
 }
 
-// Draws `surface` with its top-left at (x, y).
-fn blit(compositor: *Compositor, pixels: [*]u8, surface: *const Surface, x: i32, y: i32) -> void {
+// Draws the part of `surface` inside `clip`, with its top-left at (x, y).
+fn blit(compositor: *Compositor, pixels: [*]u8, clip: ui.Rect, surface: *const Surface, x: i32, y: i32) -> void {
     if !surface.*.hasContent { return }
-    const width = @intCast(i32, surface.*.pixelWidth)
-    const height = @intCast(i32, surface.*.pixelHeight)
-    const screen_width = @intCast(i32, compositor.*.width)
-    const screen_height = @intCast(i32, compositor.*.height)
-    // The part of the surface on screen.
-    var left: i32 = 0
-    if x < 0 { left = 0 - x }
-    var top: i32 = 0
-    if y < 0 { top = 0 - y }
-    var right = width
-    if x + right > screen_width { right = screen_width - x }
-    var bottom = height
-    if y + bottom > screen_height { bottom = screen_height - y }
-    if left >= right || top >= bottom { return }
-    const count = @intCast(usize, right - left)
+    const area = ui.intersect(ui.rect(x, y, @intCast(i32, surface.*.pixelWidth), @intCast(i32, surface.*.pixelHeight)), clip)
+    if ui.isEmpty(area) { return }
+    const count = @intCast(usize, area.width)
+    const left = @intCast(usize, area.x - x)
     var target: [*]u32 = undefined
     var source: [*]const u32 = undefined
     unsafe {
         target = @ptrCast([*]u32, pixels)
         source = @ptrCast([*]const u32, surface.*.pixels)
     }
-    var row = top
-    while row < bottom {
-        const from = @intCast(usize, row) * surface.*.pixelWidth + @intCast(usize, left)
-        const to = @intCast(usize, y + row) * compositor.*.width + @intCast(usize, x + left)
+    var row = area.y
+    while row < ui.bottom(area) {
+        const from = @intCast(usize, row - y) * surface.*.pixelWidth + left
+        const to = @intCast(usize, row) * compositor.*.width + @intCast(usize, area.x)
         if surface.*.opaque {
             state.copyPixels(@intFromPtr(pixels) + to * 4, @intFromPtr(surface.*.pixels) + from * 4, count)
         } else {
@@ -315,25 +393,29 @@ fn blit(compositor: *Compositor, pixels: [*]u8, surface: *const Surface, x: i32,
     }
 }
 
-fn drawTitle(compositor: *Compositor, pixels: [*]u8, surface: *const Surface, focused: bool) -> void {
+fn drawTitle(compositor: *Compositor, pixels: [*]u8, clip: ui.Rect, surface: *const Surface, focused: bool) -> void {
     const color = if focused { FOCUS_COLOR } else { FRAME_COLOR }
-    fillRect(compositor, pixels, titleX(surface), titleY(surface), titleWidth(surface), TITLE_HEIGHT, color)
+    const bar = ui.rect(titleX(surface), titleY(surface), titleWidth(surface), TITLE_HEIGHT)
+    if ui.isEmpty(ui.intersect(bar, clip)) { return }
+    fillRect(compositor, pixels, clip, bar.x, bar.y, bar.width, bar.height, color)
     if !layoutTitle(compositor, surface) { return }
+    // The text is drawn into the clip as an image of its own (rows the
+    // output's width apart), which keeps it inside the clip.
     var words: [*]u32 = undefined
-    unsafe { words = @ptrCast([*]u32, pixels) }
-    tt.drawRun(compositor.*.atlas, compositor.*.run, words, compositor.*.width, compositor.*.height, compositor.*.width, titleTextX(surface), titleTextY(surface), TITLE_COLOR, 0)
+    unsafe { words = @ptrFromInt([*]u32, @intFromPtr(pixels) + (@intCast(usize, clip.y) * compositor.*.width + @intCast(usize, clip.x)) * 4) }
+    tt.drawRun(compositor.*.atlas, compositor.*.run, words, @intCast(usize, clip.width), @intCast(usize, clip.height), compositor.*.width, titleTextX(surface) - clip.x, titleTextY(surface) - clip.y, TITLE_COLOR, 0)
 }
 
-fn drawFrame(compositor: *Compositor, pixels: [*]u8, surface: *const Surface, focused: bool) -> void {
+fn drawFrame(compositor: *Compositor, pixels: [*]u8, clip: ui.Rect, surface: *const Surface, focused: bool) -> void {
     const color = if focused { FOCUS_COLOR } else { FRAME_COLOR }
     const x = windowX(surface)
     const y = windowY(surface)
     const width = windowWidth(surface)
     const height = windowHeight(surface)
-    fillRect(compositor, pixels, x - 2, y - 2, width + 4, 2, color)
-    fillRect(compositor, pixels, x - 2, y + height, width + 4, 2, color)
-    fillRect(compositor, pixels, x - 2, y, 2, height, color)
-    fillRect(compositor, pixels, x + width, y, 2, height, color)
+    fillRect(compositor, pixels, clip, x - 2, y - 2, width + 4, 2, color)
+    fillRect(compositor, pixels, clip, x - 2, y + height, width + 4, 2, color)
+    fillRect(compositor, pixels, clip, x - 2, y, 2, height, color)
+    fillRect(compositor, pixels, clip, x + width, y, 2, height, color)
 }
 
 // The built-in arrow: 0 transparent, 1 outline, 2 fill.
@@ -431,15 +513,17 @@ pub fn backgroundColor(compositor: *const Compositor, row: usize) -> u32 {
     return 4278190080 | ((24 + shade / 2) << 16) | ((34 + shade / 2) << 8) | (52 + shade)
 }
 
-fn drawCursor(compositor: *Compositor, pixels: [*]u8, cursor: u32) -> void {
+fn drawCursor(compositor: *Compositor, pixels: [*]u8, clip: ui.Rect, cursor: u32) -> void {
     const hotspot = cursorHotspot(cursor)
+    const box = ui.rect(compositor.*.pointerX - hotspot, compositor.*.pointerY - hotspot, CURSOR_SIZE, CURSOR_SIZE)
+    if ui.isEmpty(ui.intersect(box, clip)) { return }
     var y: i32 = 0
     while y < CURSOR_SIZE {
         var x: i32 = 0
         while x < CURSOR_SIZE {
             const kind = cursorPixel(cursor, x, y)
             if kind != 0 {
-                fillRect(compositor, pixels, compositor.*.pointerX - hotspot + x, compositor.*.pointerY - hotspot + y, 1, 1, arrowColor(kind))
+                fillRect(compositor, pixels, clip, box.x + x, box.y + y, 1, 1, arrowColor(kind))
             }
             x += 1
         }
@@ -447,13 +531,15 @@ fn drawCursor(compositor: *Compositor, pixels: [*]u8, cursor: u32) -> void {
     }
 }
 
-// Composes the whole output into `pixels` (width x height ARGB8888).
-pub fn compose(compositor: *Compositor, pixels: [*]u8) -> void {
+// Composes the part of the output inside `clip` into `pixels` (width x
+// height ARGB8888; the rest of it is left as it is).
+pub fn compose(compositor: *Compositor, pixels: [*]u8, area: ui.Rect) -> void {
+    const clip = ui.intersect(area, outputRect(compositor))
+    if ui.isEmpty(clip) { return }
     const width = compositor.*.width
-    const height = compositor.*.height
-    var row: usize = 0
-    while row < height {
-        state.fillPixels(@intFromPtr(pixels) + row * width * 4, width, backgroundColor(compositor, row))
+    var row = clip.y
+    while row < ui.bottom(clip) {
+        state.fillPixels(@intFromPtr(pixels) + (@intCast(usize, row) * width + @intCast(usize, clip.x)) * 4, @intCast(usize, clip.width), backgroundColor(compositor, @intCast(usize, row)))
         row += 1
     }
     var index: usize = 0
@@ -461,18 +547,18 @@ pub fn compose(compositor: *Compositor, pixels: [*]u8) -> void {
         const address = state.listAt(compositor.*.stack, index)
         const surface = state.surfaceAt(address)
         if surface.*.role == state.ROLE_TOPLEVEL {
-            drawFrame(compositor, pixels, surface, address == compositor.*.keyboardFocus)
-            drawTitle(compositor, pixels, surface, address == compositor.*.keyboardFocus)
+            drawFrame(compositor, pixels, clip, surface, address == compositor.*.keyboardFocus)
+            drawTitle(compositor, pixels, clip, surface, address == compositor.*.keyboardFocus)
         }
-        blit(compositor, pixels, surface, surface.*.x, surface.*.y)
+        blit(compositor, pixels, clip, surface, surface.*.x, surface.*.y)
         index += 1
     }
     if compositor.*.pointerInside {
         if compositor.*.cursorSurface != 0 {
             const cursor = state.surfaceAt(compositor.*.cursorSurface)
-            blit(compositor, pixels, cursor, compositor.*.pointerX - compositor.*.cursorHotspotX, compositor.*.pointerY - compositor.*.cursorHotspotY)
+            blit(compositor, pixels, clip, cursor, compositor.*.pointerX - compositor.*.cursorHotspotX, compositor.*.pointerY - compositor.*.cursorHotspotY)
         } else if !compositor.*.cursorHidden {
-            drawCursor(compositor, pixels, cursorKind(compositor))
+            drawCursor(compositor, pixels, clip, cursorKind(compositor))
         }
     }
 }

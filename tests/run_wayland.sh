@@ -43,6 +43,28 @@ for test in tests/240_*.mlx tests/241_*.mlx tests/242_*.mlx tests/243_*.mlx test
     fi
 done
 
+# The compositor's damage tracking: frames composed in what changed must
+# equal frames composed from scratch.
+for test in tests/268_compositor_damage_runtime.mlx; do
+    if ! "$compiler" --quiet "$test" -o "$work/test" 2> "$work/errors"; then
+        echo "FAIL (compile) $test"
+        cat "$work/errors"
+        failures=$((failures + 1))
+        continue
+    fi
+    set +e
+    timeout 120 "$work/test" > "$work/output"
+    status=$?
+    set -e
+    if [[ $status -eq 13 ]]; then
+        echo "ok   $test"
+    else
+        echo "FAIL (exit $status) $test"
+        cat "$work/output"
+        failures=$((failures + 1))
+    fi
+done
+
 for example in examples/wayland-client/main.mlx examples/wayland-server/main.mlx examples/wayland-terminal/main.mlx examples/wayland-compositor/main.mlx tools/wayland-test-host/main.mlx; do
     if "$compiler" --quiet "$example" -o "$work/example"; then
         echo "ok   $example (builds)"

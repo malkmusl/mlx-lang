@@ -192,6 +192,24 @@ nested variants of the session as a display manager would, with cage and
 with weston on their headless backends: the compositor must come up at the
 host monitor's resolution with the session's keyboard layout.
 
+## Drawing only what changed
+
+Every change to the scene reports the area it covers (a window moved,
+raised or redrawn, the focus, the cursor, a popup placed), and a frame
+draws only that: the CPU renderer composes the changed rectangle, and each
+of the two output buffers is brought up to date in what it lacks (the
+buffer shown two frames ago lacks two frames' changes; freestanding, the
+changed rows of the compositor's own frame are copied into the dumb
+buffer). Moving the pointer thus redraws a few hundred pixels rather than
+the screen, and the frame after a client's commit only that window. The
+Vulkan renderer redraws everything, which costs the GPU little.
+`tests/268_compositor_damage_runtime.mlx` checks the bookkeeping against
+frames composed from scratch. Composition itself works on whole pixels
+and 64-bit words (`state.copyPixels`, `fillPixels`), copies opaque
+windows' rows outright and blends the three channels of a translucent
+pixel at once; a full 1920x1080 frame with an opaque window takes about 6
+ms on the CPU where it took 88.
+
 ## Title bars
 
 Every window gets a title bar above its frame (the focus color when it has
@@ -295,7 +313,8 @@ once.
 - `session/`: the desktop session's launcher and entry
   (`tools/install_compositor_session.sh` installs them).
 - `vulkan.mlx`: the Vulkan renderer.
-- `scene.mlx`: stacking, hit-testing, title bars and software composition.
+- `scene.mlx`: stacking, hit-testing, title bars, damage tracking and
+  software composition.
 - `state.mlx`: shared records and list helpers.
 
 `tools/check_wayland_compositor.sh [compiler] [cpu|vulkan]` exercises all

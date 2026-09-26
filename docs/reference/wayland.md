@@ -483,7 +483,11 @@ console restored on exit; with `vulkan`, composing on lavapipe into the
 emulated dumb buffers (exported as dma-bufs), then copying frames into
 them.
 `tools/check_wayland_interop.sh` also runs the nested compositor inside
-weston.
+weston. `tests/268_compositor_damage_runtime.mlx` (run by
+`tests/run_wayland.sh`) plays random changes to a scene (windows moved,
+raised, resized and redrawn, focus, the cursor, a popup) against the
+compositor's damage tracking: frames composed only in what each output
+buffer lacks must equal frames composed from scratch.
 
 ### GPU buffers: linux-dmabuf and Vulkan
 
