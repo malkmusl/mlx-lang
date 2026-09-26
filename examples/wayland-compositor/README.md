@@ -75,9 +75,10 @@ WAYLAND_DISPLAY=wayland-mlx dbus-run-session nautilus
 ```
 
 Options: `--socket NAME`, `--size WxH`, `--fullscreen` (a fullscreen
-window at the monitor's resolution), `--renderer cpu|vulkan`,
-`--font PATH|none`, `--terminal PROGRAM`, `--run PROGRAM` (repeatable),
-`--screenshot FILE`, `--timeout SECONDS`, `--verbose`.
+window at the monitor's resolution), `--renderer cpu|vulkan|auto` (`auto`:
+Vulkan when a driver works, else the CPU), `--font PATH|none`,
+`--terminal PROGRAM`, `--run PROGRAM` (repeatable), `--screenshot FILE`,
+`--timeout SECONDS`, `--verbose`.
 
 ## Freestanding (DRM/KMS)
 
@@ -117,7 +118,13 @@ compositor is the display server itself:
 
 Frames are composed on the CPU into memory of the compositor's own and
 copied into the dumb buffer row by row (the buffer's pitch may be wider
-than a row); `--renderer vulkan` applies to the nested compositor only.
+than a row), or, with `--renderer vulkan`, by the GPU straight into the
+dumb buffer: each dumb buffer is exported as a dma-buf
+(`DRM_IOCTL_PRIME_HANDLE_TO_FD`) and imported into Vulkan, and the blit
+shader writes rows the buffer's pitch apart (see [Vulkan](#vulkan)). At a
+monitor's resolution this is what keeps the compositor responsive: CPU
+composition of a 1920x1080 frame takes a good part of a 60 Hz frame time,
+the GPU a fraction of it.
 
 `tools/check_compositor_drm.sh` runs all of this without hardware:
 [`tools/fake_drm_session.py`](../../tools/fake_drm_session.py) plays the
@@ -131,7 +138,11 @@ Real clients connect: typing reaches the Mlx terminal and, through the
 compositor's keymap, weston-terminal; the mouse, the touchpad and a mouse
 plugged in later move the cursor; Ctrl+Alt+F2 pauses and resumes
 everything; Alt+Shift+Q restores the console's CRTC and gives every
-device back.
+device back. `tools/check_compositor_drm.sh vulkan` runs the same with the
+Vulkan renderer on lavapipe, which must export both dumb buffers as
+dma-bufs and render into them (the harness answers PRIME with the buffer's
+memfd), and once more copying each frame in, as on drivers that cannot
+import them.
 
 ## Desktop session (GDM, SDDM)
 
@@ -154,11 +165,13 @@ session menu.
 The session ([`session/mlx-session`](session/mlx-session)) runs the
 compositor freestanding (above), at the monitor's preferred resolution,
 with the system's keyboard layout (`localectl`, `/etc/default/keyboard` or
-`/etc/vconsole.conf`; `XKB_DEFAULT_LAYOUT` wins). Alt+Enter opens a
-terminal, Ctrl+Alt+F1..F12 switch VTs, Alt+Shift+Q ends the session, and
-everything the compositor logs (`--verbose`) goes to
-`~/.local/state/mlx-compositor/session.log`. `MLX_COMPOSITOR_ARGS` adds
-options.
+`/etc/vconsole.conf`; `XKB_DEFAULT_LAYOUT` wins) and `--renderer auto`:
+composed by the GPU when a Vulkan driver works, else on the CPU (the log
+says which). Alt+Enter opens a terminal, Ctrl+Alt+F1..F12 switch VTs,
+Alt+Shift+Q ends the session, and everything the compositor logs
+(`--verbose`) goes to `~/.local/state/mlx-compositor/session.log`.
+`MLX_COMPOSITOR_ARGS` adds options (`--renderer cpu` to stay on the CPU;
+the last `--renderer` wins).
 
 `MLX_SESSION_HOST=cage` or `weston` in the session's environment runs the
 compositor nested instead, fullscreen in a minimal host that drives the
@@ -206,21 +219,30 @@ stay within the client's `set_min_size`/`set_max_size` and never go below
 
 With `--renderer vulkan` the output is composed on the GPU by the blit
 compute shader of `examples/vulkan-shared`, through `std.vulkan` (no C
-loader; `VK_DRIVER_FILES` picks a driver). Client buffers are read where
-they are: `wl_shm` pools are imported as host memory
-(`VK_EXT_external_memory_host`), linux-dmabuf buffers as dma-bufs, and the
-frame is written straight into the buffer shown in the host window. A
-buffer is therefore kept until the client commits the next one, then
-released. The result is pixel-identical to the CPU renderer.
+loader; `VK_DRIVER_FILES` picks a driver), nested and freestanding alike.
+Client buffers are read where they are: `wl_shm` pools are imported as
+host memory (`VK_EXT_external_memory_host`), linux-dmabuf buffers as
+dma-bufs. The frame is written straight into the output: nested, the
+buffer shown in the host window (its `wl_shm` pool imported as host
+memory); freestanding, the DRM dumb buffer the monitor scans out (exported
+as a dma-buf and imported with `VK_EXT_external_memory_dma_buf`, the
+shader stepping rows by the buffer's pitch). A client buffer is therefore
+kept until the client commits the next one, then released. The result is
+pixel-identical to the CPU renderer.
 
-Drivers that cannot import that shared memory (RADV and the other amdgpu
-drivers import only anonymous memory, not the memfd behind a `wl_shm`
-pool) use copies instead: the frame is rendered into a host-cached buffer
-and copied into the host window's buffer, and a `wl_shm` client buffer is
-uploaded into a per-window buffer when the client commits new content.
-dma-bufs are still imported. `--verbose` says when this happens
-(`renderer: ... copying each frame`); `MLX_VULKAN_NO_HOST_IMPORT=1` takes
-this path on any driver.
+Drivers that cannot import the output or that shared memory (RADV and the
+other amdgpu drivers import only anonymous host memory, not the memfd
+behind a `wl_shm` pool) use copies instead: the frame is rendered into a
+host-cached buffer and copied into the output, row by row where the pitch
+differs, and a `wl_shm` client buffer is uploaded into a per-window buffer
+when the client commits new content. dma-bufs, the dumb buffers included,
+are still imported where the driver can. `--verbose` says when this
+happens (`renderer: ... copying each frame`); `MLX_VULKAN_NO_HOST_IMPORT=1`
+takes this path on any driver.
+
+`--renderer auto` tries Vulkan and falls back to the CPU renderer when no
+driver works (`mlx-compositor: no usable Vulkan driver; composing on the
+CPU`).
 
 When the compositor stops on its own it says why: for example
 `mlx-compositor: lost the session compositor: the server reported a

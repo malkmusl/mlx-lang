@@ -5,17 +5,20 @@
 //   - wl_shm pools are imported with VK_EXT_external_memory_host;
 //   - linux-dmabuf buffers are imported with VK_EXT_external_memory_dma_buf
 //     (or, on drivers that cannot, as host memory through their mapping);
-//   - the output (the two buffers this compositor shows in its host window)
-//     is itself imported host memory, so the frame is rendered straight into
-//     the host compositor's wl_shm pool.
+//   - the output is imported too: nested, the two buffers this compositor
+//     shows in its host window are imported host memory (the frame is
+//     rendered straight into the host compositor's wl_shm pool);
+//     freestanding, the two DRM dumb buffers are imported as dma-bufs
+//     (kms.exportBuffer), so the GPU renders into the buffer the monitor
+//     scans out.
 //
-// Drivers that cannot import the shared memory (RADV and the other amdgpu
-// drivers take only anonymous memory, not the memfd a wl_shm pool is; some
-// lack VK_EXT_external_memory_host) still work, with copies: the frame is
-// rendered into a host-cached buffer and copied into the output, and a
-// client buffer is uploaded into a per-surface buffer when its content
-// changed. MLX_VULKAN_NO_HOST_IMPORT=1 takes these paths on any driver
-// (tests).
+// Drivers that cannot import the output (RADV and the other amdgpu drivers
+// take only anonymous host memory, not the memfd a wl_shm pool is; some
+// lack VK_EXT_external_memory_host or dma-buf import) still work, with
+// copies: the frame is rendered into a host-cached buffer and copied into
+// the output, and a client buffer is uploaded into a per-surface buffer
+// when its content changed. MLX_VULKAN_NO_HOST_IMPORT=1 takes these paths
+// on any driver (tests).
 //
 // Every frame is one command buffer: the background, then for each window
 // bottom to top its frame (solid rectangles: stride-0 blits from a palette)
@@ -31,7 +34,9 @@ const state = @import("./state.mlx")
 const scene = @import("./scene.mlx")
 const wl = @import("std.wayland")
 const tt = @import("std.truetype")
+const ui = @import("std.ui")
 const text_module = @import("../vulkan-shared/text.mlx")
+const kms = @import("./kms.mlx")
 
 const Compositor = state.Compositor
 const Surface = state.Surface
@@ -41,8 +46,18 @@ const Buffer = state.Buffer
 pub const Renderer = struct {
     context: *gpu.Context
     blit: *gpu.Kernel
-    // The host window's pool (both frames).
-    target: *gpu.Buffer
+    // The output's two frame slots: the buffer each is rendered into and
+    // its offset in it (pixels); rows are `stride` pixels apart. Nested,
+    // both slots are the host window's pool (or one buffer of its layout);
+    // freestanding, each is a dumb buffer.
+    targets: [2]*gpu.Buffer
+    targetOffsets: [2]u32
+    stride: u32
+    // The slots are not the output itself: each frame is copied from its
+    // slot to `copyTo[slot]`, whose rows are `copyPitch[slot]` bytes apart.
+    copyOutput: bool
+    copyTo: [2]usize
+    copyPitch: [2]usize
     // Device memory: the background, the palette rows (focus, frame) and
     // the cursors.
     background: *gpu.Buffer
@@ -52,14 +67,12 @@ pub const Renderer = struct {
     // Window titles (when the compositor has a font).
     text: *text_module.Text
     hasText: bool
-    // Buffers bound by the frame being recorded.
-    source: vk.Buffer
+    // The frame being recorded: the slot's buffer and offset.
+    target: vk.Buffer
     offset: u32
     failed: bool
     // Whether to import host memory (VK_EXT_external_memory_host).
     hostImport: bool
-    // `target` is not the output itself: copy each frame into it.
-    copyOutput: bool
     // Client memory had to be uploaded (said once, with --verbose).
     loggedUpload: bool
 }
@@ -79,9 +92,11 @@ fn roundUp(value: usize, alignment: u64) -> u64 {
 
 fn say(text: []const u8) -> void { state.say(text) }
 
-// Opens a Vulkan driver and prepares the renderer; false (with a message)
-// when the driver lacks what the renderer needs. Call after host.connect.
-pub fn open(compositor: *Compositor, arguments: [][*]const u8) -> bool {
+// Opens a Vulkan driver and prepares the renderer to compose into the
+// freestanding backend's dumb buffers (`output`), or, without one, into the
+// host window's pool; false (with a message) when the driver lacks what the
+// renderer needs. Call once the output size is known and the font loaded.
+pub fn open(compositor: *Compositor, arguments: [][*]const u8, output: ?*kms.Output) -> bool {
     const allocator = compositor.*.allocator
     var driver: loader.Driver = undefined
     const opened = loader.openFirstDriver(&driver, arguments, allocator)
@@ -98,7 +113,8 @@ pub fn open(compositor: *Compositor, arguments: [][*]const u8) -> bool {
         renderer = @ptrFromInt(*Renderer, record(compositor, @sizeOf(Renderer)))
         context = @ptrFromInt(*gpu.Context, record(compositor, @sizeOf(gpu.Context)))
         kernel = @ptrFromInt(*gpu.Kernel, record(compositor, @sizeOf(gpu.Kernel)))
-        renderer.*.target = @ptrFromInt(*gpu.Buffer, record(compositor, @sizeOf(gpu.Buffer)))
+        renderer.*.targets[0] = @ptrFromInt(*gpu.Buffer, record(compositor, @sizeOf(gpu.Buffer)))
+        renderer.*.targets[1] = @ptrFromInt(*gpu.Buffer, record(compositor, @sizeOf(gpu.Buffer)))
         renderer.*.background = @ptrFromInt(*gpu.Buffer, record(compositor, @sizeOf(gpu.Buffer)))
         renderer.*.palette = @ptrFromInt(*gpu.Buffer, record(compositor, @sizeOf(gpu.Buffer)))
         renderer.*.arrow = @ptrFromInt(*gpu.Buffer, record(compositor, @sizeOf(gpu.Buffer)))
@@ -125,20 +141,20 @@ pub fn open(compositor: *Compositor, arguments: [][*]const u8) -> bool {
         return false
     }
 
-    // The output: both host frames, imported in place, or else a buffer of
-    // the same layout that each frame is copied from.
+    // The output, imported in place when the driver can.
     const no_import = state.environmentValue(compositor.*.environment, "MLX_VULKAN_NO_HOST_IMPORT")
-    renderer.*.hostImport = context.*.hostMemory && (@intFromPtr(no_import) == 0 || no_import[0] == 0)
-    const host = compositor.*.hostMemory
-    if !renderer.*.hostImport || !gpu.importHostMemory(context, renderer.*.target, host.address, roundUp(host.size, context.*.hostAlignment)) {
-        gpu.destroyBuffer(context, renderer.*.target)
-        if !gpu.createReadbackBuffer(context, renderer.*.target, @intCast(u64, host.size)) {
-            gpu.destroyBuffer(context, renderer.*.target)
-            say("mlx-compositor: cannot create the output buffer in Vulkan\n")
-            gpu.close(context)
-            return false
-        }
-        renderer.*.copyOutput = true
+    const import_output = @intFromPtr(no_import) == 0 || no_import[0] == 0
+    renderer.*.hostImport = context.*.hostMemory && import_output
+    var attached = false
+    if output == null {
+        attached = attachHostPool(compositor, renderer)
+    } else {
+        attached = attachDumbBuffers(compositor, renderer, output.?, import_output)
+    }
+    if !attached {
+        say("mlx-compositor: cannot create the output buffer in Vulkan\n")
+        gpu.close(context)
+        return false
     }
 
     // The background, drawn once.
@@ -206,56 +222,87 @@ pub fn open(compositor: *Compositor, arguments: [][*]const u8) -> bool {
     return true
 }
 
-// Copies `bytes` (a multiple of 8) from `source` to `destination`.
-fn copyWords(destination: usize, source: usize, bytes: usize) -> void {
-    var to: [*]u64 = undefined
-    var from: [*]const u64 = undefined
-    unsafe {
-        to = @ptrFromInt([*]u64, destination)
-        from = @ptrFromInt([*]const u64, source)
-    }
-    const words = bytes / 8
-    var index: usize = 0
-    while index + 4 <= words {
-        to[index] = from[index]
-        to[index + 1] = from[index + 1]
-        to[index + 2] = from[index + 2]
-        to[index + 3] = from[index + 3]
-        index += 4
-    }
-    while index < words {
-        to[index] = from[index]
-        index += 1
-    }
+// A buffer record holding nothing (safe to destroy).
+fn clearBuffer(buffer: *gpu.Buffer) -> void {
+    buffer.*.buffer = 0
+    buffer.*.memory = 0
+    buffer.*.size = 0
+    buffer.*.address = 0
+    buffer.*.fd = -1
 }
 
-// Copies `count` 32-bit pixels.
-fn copyPixels(destination: usize, source: usize, count: usize) -> void {
-    const even = count / 2 * 2
-    if destination % 8 == 0 && source % 8 == 0 {
-        copyWords(destination, source, even * 4)
-    } else {
-        var to: [*]u32 = undefined
-        var from: [*]const u32 = undefined
-        unsafe {
-            to = @ptrFromInt([*]u32, destination)
-            from = @ptrFromInt([*]const u32, source)
+// The frame slots in the host window's pool: imported in place, or else a
+// buffer of the pool's layout that each frame is copied from.
+fn attachHostPool(compositor: *Compositor, renderer: *Renderer) -> bool {
+    const context = renderer.*.context
+    const host = compositor.*.hostMemory
+    const frame_bytes = compositor.*.width * compositor.*.height * 4
+    const target = renderer.*.targets[0]
+    clearBuffer(target)
+    if !renderer.*.hostImport || !gpu.importHostMemory(context, target, host.address, roundUp(host.size, context.*.hostAlignment)) {
+        gpu.destroyBuffer(context, target)
+        if !gpu.createReadbackBuffer(context, target, @intCast(u64, host.size)) {
+            gpu.destroyBuffer(context, target)
+            return false
         }
-        var index: usize = 0
-        while index < even {
-            to[index] = from[index]
-            index += 1
-        }
+        renderer.*.copyOutput = true
+        renderer.*.copyTo[0] = host.address
+        renderer.*.copyTo[1] = host.address + frame_bytes
+        renderer.*.copyPitch[0] = compositor.*.width * 4
+        renderer.*.copyPitch[1] = compositor.*.width * 4
     }
-    if even < count {
-        var last: [*]u32 = undefined
-        var first: [*]const u32 = undefined
-        unsafe {
-            last = @ptrFromInt([*]u32, destination)
-            first = @ptrFromInt([*]const u32, source)
+    renderer.*.targets[1] = target
+    renderer.*.targetOffsets[0] = 0
+    renderer.*.targetOffsets[1] = @intCast(u32, frame_bytes / 4)
+    renderer.*.stride = @intCast(u32, compositor.*.width)
+    return true
+}
+
+// The frame slots in the freestanding backend's dumb buffers: each imported
+// as a dma-buf, so the GPU renders into the buffer the monitor scans out;
+// or else a buffer each frame is copied from, row by row (the dumb buffer's
+// pitch may exceed a row).
+fn attachDumbBuffers(compositor: *Compositor, renderer: *Renderer, output: *kms.Output, import_output: bool) -> bool {
+    const context = renderer.*.context
+    clearBuffer(renderer.*.targets[0])
+    clearBuffer(renderer.*.targets[1])
+    var imported = import_output && context.*.dmaBufImport && kms.bufferPitch(output, 0) == kms.bufferPitch(output, 1) && kms.bufferPitch(output, 0) % 4 == 0
+    var slot: usize = 0
+    while imported && slot < 2 {
+        const descriptor = kms.exportBuffer(output, slot)
+        if descriptor < 0 {
+            imported = false
+        } else if !gpu.importBuffer(context, renderer.*.targets[slot], @intCast(i32, descriptor), @intCast(u64, kms.bufferSize(output, slot))) {
+            // The driver did not take the descriptor.
+            wl.Handle.fromDescriptor(descriptor).close()
+            imported = false
         }
-        last[even] = first[even]
+        slot += 1
     }
+    if imported {
+        renderer.*.targetOffsets[0] = 0
+        renderer.*.targetOffsets[1] = 0
+        renderer.*.stride = @intCast(u32, kms.bufferPitch(output, 0) / 4)
+        return true
+    }
+    gpu.destroyBuffer(context, renderer.*.targets[0])
+    gpu.destroyBuffer(context, renderer.*.targets[1])
+    const frame_bytes = compositor.*.width * compositor.*.height * 4
+    const target = renderer.*.targets[0]
+    if !gpu.createReadbackBuffer(context, target, @intCast(u64, frame_bytes * 2)) {
+        gpu.destroyBuffer(context, target)
+        return false
+    }
+    renderer.*.targets[1] = target
+    renderer.*.targetOffsets[0] = 0
+    renderer.*.targetOffsets[1] = @intCast(u32, frame_bytes / 4)
+    renderer.*.stride = @intCast(u32, compositor.*.width)
+    renderer.*.copyOutput = true
+    renderer.*.copyTo[0] = kms.bufferAddress(output, 0)
+    renderer.*.copyTo[1] = kms.bufferAddress(output, 1)
+    renderer.*.copyPitch[0] = kms.bufferPitch(output, 0)
+    renderer.*.copyPitch[1] = kms.bufferPitch(output, 1)
+    return true
 }
 
 // ---------------------------------------------------------------------------
@@ -346,7 +393,7 @@ fn upload(compositor: *Compositor, renderer: *Renderer, surface: *Surface, buffe
         const stride = @intCast(usize, buffer.*.stride)
         var row: usize = 0
         while row < height {
-            copyPixels(staging.*.address + row * width * 4, source + row * stride, width)
+            state.copyPixels(staging.*.address + row * width * 4, source + row * stride, width)
             row += 1
         }
         surface.*.stagingSerial = surface.*.contentSerial
@@ -362,8 +409,8 @@ fn upload(compositor: *Compositor, renderer: *Renderer, surface: *Surface, buffe
 // row) to (x, y) in the frame.
 fn blit(compositor: *Compositor, renderer: *Renderer, source: vk.Buffer, source_offset: u32, stride: u32, width: i32, height: i32, x: i32, y: i32, opaque: bool) -> void {
     if renderer.*.failed || width <= 0 || height <= 0 { return }
-    var buffers: [2]vk.Buffer = [2]vk.Buffer{ source, renderer.*.target.*.buffer }
-    const push = shaders.Blit.{ .sourceWidth = @intCast(u32, width), .sourceHeight = @intCast(u32, height), .sourceStride = stride, .sourceOffset = source_offset, .targetWidth = @intCast(u32, compositor.*.width), .targetHeight = @intCast(u32, compositor.*.height), .targetX = @bitCast(u32, x), .targetY = @bitCast(u32, y), .flags = if opaque { shaders.FLAG_OPAQUE } else { 0 }, .targetOffset = renderer.*.offset }
+    var buffers: [2]vk.Buffer = [2]vk.Buffer{ source, renderer.*.target }
+    const push = shaders.Blit.{ .sourceWidth = @intCast(u32, width), .sourceHeight = @intCast(u32, height), .sourceStride = stride, .sourceOffset = source_offset, .targetWidth = @intCast(u32, compositor.*.width), .targetHeight = @intCast(u32, compositor.*.height), .targetX = @bitCast(u32, x), .targetY = @bitCast(u32, y), .flags = if opaque { shaders.FLAG_OPAQUE } else { 0 }, .targetOffset = renderer.*.offset, .targetStride = renderer.*.stride }
     const groups_x = gpu.groups(@intCast(u32, width), shaders.GROUP_SIZE)
     const groups_y = gpu.groups(@intCast(u32, height), shaders.GROUP_SIZE)
     unsafe {
@@ -385,7 +432,8 @@ fn drawTitle(compositor: *Compositor, renderer: *Renderer, surface: *const Surfa
     if !scene.layoutTitle(compositor, surface) { return }
     const width = @intCast(u32, compositor.*.width)
     const height = @intCast(u32, compositor.*.height)
-    if !text_module.draw(renderer.*.context, renderer.*.text, compositor.*.atlas, compositor.*.run, renderer.*.target.*.buffer, width, height, renderer.*.offset, scene.titleTextX(surface), scene.titleTextY(surface), scene.TITLE_COLOR) {
+    const whole = ui.rect(0, 0, @intCast(i32, width), @intCast(i32, height))
+    if !text_module.drawStrided(renderer.*.context, renderer.*.text, compositor.*.atlas, compositor.*.run, renderer.*.target, width, height, renderer.*.stride, renderer.*.offset, scene.titleTextX(surface), scene.titleTextY(surface), scene.TITLE_COLOR, whole) {
         renderer.*.failed = true
     }
 }
@@ -420,12 +468,14 @@ fn drawSurface(compositor: *Compositor, renderer: *Renderer, surface: *Surface, 
     blit(compositor, renderer, staging.?.*.buffer, 0, @intCast(u32, buffer.*.width), buffer.*.width, buffer.*.height, x, y, opaque)
 }
 
-// Composes the whole output into the host frame starting `offset` bytes
-// into the host pool and waits for it; false when Vulkan failed.
-pub fn compose(compositor: *Compositor, offset: usize) -> bool {
+// Composes the whole output into frame slot `slot` (0 or 1: nested, the
+// host window's first or second buffer; freestanding, the dumb buffer) and
+// waits for it; false when Vulkan failed.
+pub fn compose(compositor: *Compositor, slot: usize) -> bool {
     const renderer = rendererOf(compositor)
     const context = renderer.*.context
-    renderer.*.offset = @intCast(u32, offset / 4)
+    renderer.*.target = renderer.*.targets[slot].*.buffer
+    renderer.*.offset = renderer.*.targetOffsets[slot]
     renderer.*.failed = false
     if !gpu.begin(context) { return false }
     if renderer.*.hasText { text_module.beginFrame(renderer.*.text) }
@@ -457,7 +507,20 @@ pub fn compose(compositor: *Compositor, offset: usize) -> bool {
     if renderer.*.failed { return false }
     if !gpu.submit(context) { return false }
     if renderer.*.copyOutput {
-        copyWords(compositor.*.hostMemory.address + offset, renderer.*.target.*.address + offset, compositor.*.width * compositor.*.height * 4)
+        // From the rendered frame (rows `stride` pixels apart) into the
+        // output buffer.
+        const source = renderer.*.targets[slot].*.address + @intCast(usize, renderer.*.offset) * 4
+        const row_bytes = compositor.*.width * 4
+        const pitch = renderer.*.copyPitch[slot]
+        if pitch == row_bytes && @intCast(usize, renderer.*.stride) == compositor.*.width {
+            state.copyPixels(renderer.*.copyTo[slot], source, compositor.*.width * compositor.*.height)
+        } else {
+            var row: usize = 0
+            while row < compositor.*.height {
+                state.copyPixels(renderer.*.copyTo[slot] + row * pitch, source + row * @intCast(usize, renderer.*.stride) * 4, compositor.*.width)
+                row += 1
+            }
+        }
     }
     return true
 }

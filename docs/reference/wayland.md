@@ -475,11 +475,13 @@ shell must learn each size. weston-terminal, when installed, must
 accept Shift through the forwarded keymap and move by its title bar;
 wl-clipboard, when installed, must paste in one client what another copied;
 gtk4-widget-factory, when installed, must open its window.
-`tools/check_compositor_drm.sh` runs the freestanding compositor against
-an emulated kernel (DRM card, evdev devices) and an emulated logind on a
-private dbus-daemon, with real clients: modeset at the preferred mode,
-typing, mouse, touchpad, hotplug, a VT switch and the console restored on
-exit.
+`tools/check_compositor_drm.sh [cpu|vulkan]` runs the freestanding
+compositor against an emulated kernel (DRM card, evdev devices) and an
+emulated logind on a private dbus-daemon, with real clients: modeset at the
+preferred mode, typing, mouse, touchpad, hotplug, a VT switch and the
+console restored on exit; with `vulkan`, composing on lavapipe into the
+emulated dumb buffers (exported as dma-bufs), then copying frames into
+them.
 `tools/check_wayland_interop.sh` also runs the nested compositor inside
 weston.
 
@@ -497,9 +499,12 @@ with `sendCreated()` (which creates the `wl_buffer` resource) or
 - [`examples/vulkan-wayland-client`](../../examples/vulkan-wayland-client/README.md)
   renders with Vulkan (`std.vulkan`, no C loader) and hands frames over as
   dma-bufs, or renders straight into its `wl_shm` pool.
-- The nested compositor offers linux-dmabuf (ARGB8888/XRGB8888, linear) and,
+- The compositor offers linux-dmabuf (ARGB8888/XRGB8888, linear) and,
   with `--renderer vulkan`, composes on the GPU, reading client pools and
-  dma-bufs in place.
+  dma-bufs in place and rendering into the output in place: nested, the
+  host window's `wl_shm` buffer; freestanding, the DRM dumb buffer the
+  monitor scans out, exported as a dma-buf. `--renderer auto` takes Vulkan
+  when a driver works and the CPU otherwise.
 
 `tools/check_vulkan_wayland.sh` runs the client inside the compositor with
 both renderers, over `wl_shm` and linux-dmabuf, and compares the frames
