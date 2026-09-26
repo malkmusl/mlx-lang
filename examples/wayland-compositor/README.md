@@ -119,9 +119,15 @@ compositor is the display server itself:
   follows the modifiers. Without it a keymap file can be given with
   `MLX_XKB_KEYMAP`.
 - **VT switching**: Ctrl+Alt+F1..F12 asks logind to switch; while another
-  VT is in front the card and the input devices are paused (keys and
+  VT is in front logind pauses the card and the input devices (keys and
   buttons still held are released), and coming back sets the CRTC up
-  again.
+  again. The pause itself never stops the compositor from drawing: it
+  keeps presenting, and the kernel refuses the frames while the card is
+  not ours (`drm: page flip failed (errno 13; the card is paused); trying
+  again`, once), so a pause whose resume never arrives, as seen during
+  SDDM's hand-over from its greeter, cannot leave the screen black. The
+  log names each pause's kind and the VT in front (`session: the card is
+  paused (asked, tty2 in front, ours is tty1)`).
 
 Frames are composed by the GPU straight into the dumb buffer when a Vulkan
 driver works (the default, `--renderer auto`): each dumb buffer is exported
@@ -277,8 +283,10 @@ ms on the CPU where it took 88.
 
 Every window gets a title bar above its frame (the focus color when it has
 the keyboard) showing its `xdg_toplevel` title, drawn with
-[`std.truetype`](../../docs/reference/truetype.md) from `--font` (default
-DejaVu Sans; titles are left out when it cannot be read). Dragging a title
+[`std.truetype`](../../docs/reference/truetype.md) from `--font` (default:
+DejaVu Sans or Liberation Sans wherever the distribution keeps them,
+`/usr/share/fonts/truetype/dejavu`, `/usr/share/fonts/TTF`, ...; titles
+are left out when none reads). Dragging a title
 bar moves the window. Both renderers draw titles identically: the CPU with
 `std.truetype.drawRun`, Vulkan with the `text` compute shader.
 

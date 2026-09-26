@@ -425,12 +425,19 @@ fn openCard(backend: *Backend) -> bool {
                 unsafe { path_bytes = @ptrCast([*]u8, &path) }
                 nodePath(path_bytes, cardDirectoryOf(backend), "card", @intCast(u32, index))
                 var node = nodes[index]
-                const descriptor = openNode(backend, path_bytes, &node)
+                // A plain open does for looking (the seat's ACL lets the
+                // active session in); logind's TakeDevice only when it fails.
+                var took = false
+                var descriptor = device.openPath(path_bytes, device.O_RDWR | device.O_NOCTTY | device.O_NONBLOCK)
+                if descriptor < 0 {
+                    descriptor = openNode(backend, path_bytes, &node)
+                    took = true
+                }
                 var found = false
                 var probe: kms.Output = undefined
                 if descriptor >= 0 {
                     found = kms.probe(&probe, descriptor, allocator(backend))
-                    releaseNode(backend, node.major, node.minor)
+                    if took { releaseNode(backend, node.major, node.minor) }
                 } else {
                     state.say("drm: ")
                     sayPath(path_bytes)
@@ -592,6 +599,38 @@ fn now() -> u32 {
     return @intCast(u32, (device.load64(bytes, 0) * 1000 + device.load64(bytes, 8) / 1000000) & 4294967295)
 }
 
+// Logs ", VT N in front" from /sys/class/tty/tty0/active (nothing when it
+// cannot be read), with the session's own VT.
+fn sayActiveVt(compositor: *Compositor) -> void {
+    var path: [32]u8 = undefined
+    var bytes: [*]u8 = undefined
+    unsafe { bytes = @ptrCast([*]u8, &path) }
+    var length: usize = 0
+    for byte in "/sys/class/tty/tty0/active" {
+        bytes[length] = byte
+        length += 1
+    }
+    bytes[length] = 0
+    const file = std.fs.open(bytes, 0, 0)
+    if !std.fs.isValid(file) { return }
+    var value: [16]u8 = undefined
+    var value_bytes: [*]u8 = undefined
+    unsafe { value_bytes = @ptrCast([*]u8, &value) }
+    const got = std.fs.read(file, value_bytes, 15)
+    const closed = std.fs.close(file)
+    if got <= 0 { return }
+    var count = @bitCast(usize, got)
+    while count > 0 && (value[count - 1] == 10 || value[count - 1] == 13) { count -= 1 }
+    state.say(", ")
+    unsafe { const shown = std.io.writeAllBytes(std.io.stdout(), value_bytes, count) }
+    state.say(" in front")
+    const vt = state.environmentValue(compositor.*.environment, "XDG_VTNR")
+    if @intFromPtr(vt) != 0 && vt[0] != 0 {
+        state.say(", ours is tty")
+        unsafe { const shown = std.io.writeString(std.io.stdout(), std.process.fromCString(vt)) }
+    }
+}
+
 fn sessionEvents(backend: *Backend) -> void {
     if !backend.*.hasSession { return }
     const compositor = backend.*.compositor
@@ -601,13 +640,19 @@ fn sessionEvents(backend: *Backend) -> void {
         const card = event.major == backend.*.cardMajor && event.minor == backend.*.cardMinor
         if event.kind == logind.PAUSE {
             if card {
-                // Another VT is in front: no frames until we are back, and
-                // nothing held down any more.
+                // Another VT is in front: nothing held down any more; frames
+                // are tried anyway (the kernel refuses them while we are
+                // away, see present).
                 backend.*.active = false
                 evdev.releaseAll(compositor, keyboardOf(backend))
-                if compositor.*.verbose { state.say("session: paused\n") }
+                if compositor.*.verbose {
+                    state.say(if event.pauseKind == logind.PAUSE_ASKED { "session: the card is paused (asked" } else if event.pauseKind == logind.PAUSE_GONE { "session: the card is paused (gone" } else { "session: the card is paused (forced" })
+                    sayActiveVt(compositor)
+                    state.say(")\n")
+                }
                 if event.pauseKind == logind.PAUSE_ASKED { logind.pauseComplete(sessionOf(backend), event.major, event.minor) }
             } else {
+                if compositor.*.verbose { state.say("session: an input device is paused\n") }
                 const slot = slotOf(backend, event.major, event.minor)
                 if slot < MAX_INPUTS {
                     if event.pauseKind == logind.PAUSE_GONE {
@@ -626,7 +671,11 @@ fn sessionEvents(backend: *Backend) -> void {
                 kms.resume(outputOf(backend))
                 backend.*.active = true
                 scene.damageAll(compositor)
-                if compositor.*.verbose { state.say("session: resumed\n") }
+                if compositor.*.verbose {
+                    state.say("session: the card is resumed (")
+                    sayActiveVt(compositor)
+                    state.say(")\n")
+                }
             } else {
                 const slot = slotOf(backend, event.major, event.minor)
                 if slot < MAX_INPUTS && event.descriptor >= 0 {
@@ -671,7 +720,11 @@ pub fn dispatch(backend: *Backend) -> void {
 pub fn present(backend: *Backend) -> void {
     const compositor = backend.*.compositor
     const output = outputOf(backend)
-    if !backend.*.active || output.*.flipPending || !compositor.*.needsRedraw { return }
+    // While logind has paused the card its ioctls fail (errno 13) and the
+    // frame waits; the pause itself does not stop us, since a pause whose
+    // resume never arrives (seen with SDDM's hand-over) would otherwise
+    // leave the screen black for good.
+    if output.*.flipPending || !compositor.*.needsRedraw { return }
     const back = kms.backIndex(output)
     // Our frame lacks what changed since the last one; the dumb buffer
     // (shown a frame or two ago) lacks more. The GPU redraws everything.
@@ -719,12 +772,14 @@ pub fn present(backend: *Backend) -> void {
         if !backend.*.presentFailed {
             state.say(if modeset { "drm: modeset failed (errno " } else { "drm: page flip failed (errno " })
             state.sayNumber(kms.lastError(output))
+            if !backend.*.active { state.say("; the card is paused") }
             state.say(if backend.*.presented == 0 { "); nothing shown yet, trying again\n" } else { "); trying again\n" })
             backend.*.presentFailed = true
         }
         scene.damageAll(compositor)
         return
     }
+    if backend.*.presentFailed && compositor.*.verbose { state.say("drm: frames show again\n") }
     backend.*.presentFailed = false
     if backend.*.presented == 0 && compositor.*.verbose { state.say("drm: first frame on screen\n") }
     backend.*.presented += 1
