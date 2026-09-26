@@ -45,6 +45,30 @@ for test in tests/247_*.mlx; do
     fi
 done
 
+# A shared object (--shared): ET_DYN, loaded twice (two copies) by the test.
+if "$compiler" --quiet --shared tests/support/shared_object_library.mlx -o "$work/libshared.so" 2> "$work/errors" \
+    && "$compiler" --quiet tests/271_shared_object_runtime.mlx -o "$work/test" 2>> "$work/errors"; then
+    cp "$work/libshared.so" "$work/libshared-copy.so"
+    set +e
+    timeout 20 "$work/test" "$work/libshared.so" "$work/libshared-copy.so" > "$work/output" 2>&1
+    status=$?
+    set -e
+    if [[ "$(od -An -tx1 -j16 -N2 "$work/libshared.so" | tr -d ' ')" != "0300" ]]; then
+        echo "FAIL --shared did not write an ET_DYN object"
+        failures=$((failures + 1))
+    elif [[ $status -ne 13 ]]; then
+        echo "FAIL (exit $status) tests/271_shared_object_runtime.mlx"
+        cat "$work/output"
+        failures=$((failures + 1))
+    else
+        echo "ok   tests/271_shared_object_runtime.mlx"
+    fi
+else
+    echo "FAIL (compile) tests/271_shared_object_runtime.mlx"
+    cat "$work/errors"
+    failures=$((failures + 1))
+fi
+
 # A program without foreign or exported functions stays a static executable.
 "$compiler" --quiet tests/07_functions.mlx -o "$work/static"
 if [[ "$(head -c 20 "$work/static" | od -An -tx1 -j16 -N2 | tr -d ' ')" != "0200" ]] || grep -q "ld-linux" "$work/static"; then
