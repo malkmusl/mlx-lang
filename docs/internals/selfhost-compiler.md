@@ -380,7 +380,10 @@ backend-shaped instructions the spec doesn't name directly (`func_sym`,
 `label`, `icmp_br` as a fused compare-and-branch, `direct_call` vs `call`,
 `syscall`, `byte_mask_64`, `dead` as an explicit tombstone opcode for
 eliminated instructions, `aggregate_copy`, `mem_copy` for struct and array
-value copies (one instruction per copy, whatever the size), and separate `udiv`/`urem` next
+value copies (one instruction per copy, whatever the size; `lower.mlx`'s
+`copyAggregate` puts a `const` local's copy in the frame and a `var`'s in
+the arena, and `returnedValue` copies frame storage out before a `return`
+hands it back), and separate `udiv`/`urem` next
 to signed `div`/`rem`) and folds some of the spec's saturating/wrapping
 arithmetic variants down to flag bits on a smaller opcode set rather than
 one opcode per variant. Every `Inst` is a fixed-size record — `opcode`,
