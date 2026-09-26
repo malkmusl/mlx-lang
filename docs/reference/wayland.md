@@ -441,8 +441,11 @@ frame callbacks.
 Two programs use both halves of `std.wayland` with real input:
 
 - [`examples/wayland-compositor`](../../examples/wayland-compositor/README.md)
-  is a nested compositor. It is a client of the session compositor (its
-  output is one window there) and a server for its own clients. It routes
+  is a compositor that runs freestanding (DRM/KMS output, evdev input, the
+  devices and VT switching from systemd-logind over its own D-Bus client,
+  the keymap from libxkbcommon) or nested. Nested, it is a client of the
+  session compositor (its output is one window there) and a server for its
+  own clients. It routes
   the session's pointer and keyboard to the window under the pointer or
   with focus, and hands clients the session's xkb keymap. It moves windows
   through `xdg_toplevel.move` or Alt+drag, resizes them by their border,
@@ -469,6 +472,11 @@ shell must learn each size. weston-terminal, when installed, must
 accept Shift through the forwarded keymap and move by its title bar;
 wl-clipboard, when installed, must paste in one client what another copied;
 gtk4-widget-factory, when installed, must open its window.
+`tools/check_compositor_drm.sh` runs the freestanding compositor against
+an emulated kernel (DRM card, evdev devices) and an emulated logind on a
+private dbus-daemon, with real clients: modeset at the preferred mode,
+typing, mouse, touchpad, hotplug, a VT switch and the console restored on
+exit.
 `tools/check_wayland_interop.sh` also runs the nested compositor inside
 weston.
 

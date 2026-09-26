@@ -2,8 +2,10 @@
 # Checks the "Mlx Compositor" desktop session end to end, without a
 # display manager or a monitor: tools/install_compositor_session.sh stages
 # an install under a temporary DESTDIR, then the staged mlx-session is
-# started the way GDM or SDDM would start it, with each host that is
-# installed (cage, weston) on its headless backend. The compositor must come
+# started the way GDM or SDDM would start it, in its nested variants
+# (MLX_SESSION_HOST) with each host that is installed (cage, weston) on its
+# headless backend. (The default, freestanding compositor is checked by
+# tools/check_compositor_drm.sh.) The compositor must come
 # up fullscreen at the host's monitor resolution (the headless outputs are
 # 1280x720 in cage and 1024x640 in weston, not the compositor's 1024x768
 # window size), with the keyboard layout the session picked up.

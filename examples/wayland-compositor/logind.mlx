@@ -1,0 +1,255 @@
+// The login session for the DRM backend, through systemd-logind on the
+// system bus (dbus.mlx), as display managers (GDM, SDDM) set it up.
+//
+// TakeControl makes the compositor the session's controller: logind puts
+// the session's VT into graphics mode with the kernel's keyboard handling
+// off, and hands out the DRM card and the input devices with TakeDevice,
+// without root. When the user switches to another VT (SwitchTo, on
+// Ctrl+Alt+F1..F12) logind pauses the devices (PauseDevice: the card loses
+// DRM master, input descriptors are revoked) and resumes them on return
+// (ResumeDevice, with new input descriptors).
+
+const std = @import("std")
+const linux = std.linux
+const device = @import("./device.mlx")
+const dbus = @import("./dbus.mlx")
+const state = @import("./state.mlx")
+
+const LOGIN1: []const u8 = "org.freedesktop.login1"
+const MANAGER_PATH: []const u8 = "/org/freedesktop/login1"
+const MANAGER: []const u8 = "org.freedesktop.login1.Manager"
+const SESSION: []const u8 = "org.freedesktop.login1.Session"
+const SEAT: []const u8 = "org.freedesktop.login1.Seat"
+
+pub const PAUSE: u8 = 1
+pub const RESUME: u8 = 2
+// PauseDevice's kinds: "pause" (acknowledge with PauseDeviceComplete),
+// "force" (already paused), "gone" (the device was removed).
+pub const PAUSE_ASKED: u8 = 0
+pub const PAUSE_FORCED: u8 = 1
+pub const PAUSE_GONE: u8 = 2
+
+pub const Event = struct {
+    kind: u8
+    major: u32
+    minor: u32
+    pauseKind: u8
+    // RESUME: the device's new descriptor (the caller owns it).
+    descriptor: isize
+}
+
+pub const Session = struct {
+    bus: dbus.Bus
+    path: [128]u8
+    pathLength: usize
+    seatPath: [128]u8
+    seatPathLength: usize
+    storage: [4096]u8
+}
+
+fn busOf(session: *Session) -> *dbus.Bus {
+    unsafe { return @ptrFromInt(*dbus.Bus, @intFromPtr(session) + @offsetOf(Session, "bus")) }
+}
+
+fn pathOf(session: *Session) -> [*]u8 {
+    unsafe { return @ptrFromInt([*]u8, @intFromPtr(session) + @offsetOf(Session, "path")) }
+}
+
+fn seatPathOf(session: *Session) -> [*]u8 {
+    unsafe { return @ptrFromInt([*]u8, @intFromPtr(session) + @offsetOf(Session, "seatPath")) }
+}
+
+fn storageOf(session: *Session) -> [*]u8 {
+    unsafe { return @ptrFromInt([*]u8, @intFromPtr(session) + @offsetOf(Session, "storage")) }
+}
+
+fn copyInto(target: [*]u8, at: usize, text: [*]const u8, length: usize, capacity: usize) -> usize {
+    var index: usize = 0
+    while index < length && at + index < capacity {
+        target[at + index] = text[index]
+        index += 1
+    }
+    return at + index
+}
+
+fn copyText(target: [*]u8, at: usize, text: []const u8, capacity: usize) -> usize {
+    var length: usize = 0
+    for byte in text { length += 1 }
+    unsafe { return copyInto(target, at, @ptrCast([*]const u8, text), length, capacity) }
+}
+
+fn cLength(text: [*]const u8) -> usize {
+    var length: usize = 0
+    while text[length] != 0 { length += 1 }
+    return length
+}
+
+// Calls a method of our session object.
+fn sessionCall(session: *Session, builder: *dbus.Builder, member: []const u8, signature: []const u8) -> void {
+    dbus.beginCall(builder, LOGIN1, pathOf(session), session.*.pathLength, SESSION, member, signature)
+}
+
+fn succeeded(session: *Session, builder: *dbus.Builder, reply: *dbus.Message) -> bool {
+    if !dbus.call(busOf(session), builder, reply) { return false }
+    if reply.*.kind != dbus.METHOD_RETURN {
+        if reply.*.kind == dbus.ERROR {
+            state.say("logind: ")
+            unsafe { const shown = std.io.writeAllBytes(std.io.stdout(), reply.*.errorName, reply.*.errorNameLength) }
+            state.say("\n")
+        }
+        dbus.closeDescriptors(reply)
+        return false
+    }
+    return true
+}
+
+// Connects to logind, finds our session ($XDG_SESSION_ID, else the one of
+// our process) and its seat ($XDG_SEAT, else seat0), listens for its
+// device signals and takes control of it. False (with a message) when any
+// of that fails.
+pub fn open(session: *Session, allocator: std.allocator.Allocator, environment: [*][*]const u8) -> bool {
+    if !dbus.connectSystem(busOf(session), allocator, state.environmentValue(environment, "DBUS_SYSTEM_BUS_ADDRESS")) {
+        state.say("logind: cannot connect to the system bus\n")
+        return false
+    }
+    var builder: dbus.Builder = undefined
+    var reply: dbus.Message = undefined
+    const session_id = state.environmentValue(environment, "XDG_SESSION_ID")
+    if @intFromPtr(session_id) != 0 {
+        dbus.beginCallText(&builder, LOGIN1, MANAGER_PATH, MANAGER, "GetSession", "s")
+        dbus.putStringOf(&builder, session_id, cLength(session_id))
+    } else {
+        dbus.beginCallText(&builder, LOGIN1, MANAGER_PATH, MANAGER, "GetSessionByPID", "u")
+        dbus.putU32(&builder, @intCast(u32, linux.syscall0(device.SYS_getpid)))
+    }
+    if !succeeded(session, &builder, &reply) {
+        state.say("logind: no login session for this process\n")
+        dbus.close(busOf(session))
+        return false
+    }
+    var at = dbus.cursor(&reply)
+    var length: usize = 0
+    const path = dbus.readString(&at, &length)
+    session.*.pathLength = copyInto(pathOf(session), 0, path, length, 128)
+
+    var seat_length: usize = copyText(seatPathOf(session), 0, "/org/freedesktop/login1/seat/", 128)
+    const seat = state.environmentValue(environment, "XDG_SEAT")
+    if @intFromPtr(seat) != 0 {
+        seat_length = copyInto(seatPathOf(session), seat_length, seat, cLength(seat), 128)
+    } else {
+        seat_length = copyText(seatPathOf(session), seat_length, "seat0", 128)
+    }
+    session.*.seatPathLength = seat_length
+
+    // type='signal',sender='org.freedesktop.login1',interface='...Session',path='<ours>'
+    var rule: [320]u8 = undefined
+    var rule_bytes: [*]u8 = undefined
+    unsafe { rule_bytes = @ptrCast([*]u8, &rule) }
+    var rule_length = copyText(rule_bytes, 0, "type='signal',sender='org.freedesktop.login1',interface='org.freedesktop.login1.Session',path='", 320)
+    rule_length = copyInto(rule_bytes, rule_length, pathOf(session), session.*.pathLength, 320)
+    rule_length = copyText(rule_bytes, rule_length, "'", 320)
+    dbus.beginCallText(&builder, "org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus", "AddMatch", "s")
+    dbus.putStringOf(&builder, rule_bytes, rule_length)
+    if !succeeded(session, &builder, &reply) {
+        dbus.close(busOf(session))
+        return false
+    }
+
+    sessionCall(session, &builder, "TakeControl", "b")
+    dbus.putBool(&builder, false)
+    if !succeeded(session, &builder, &reply) {
+        state.say("logind: cannot take control of the session (is another compositor running in it?)\n")
+        dbus.close(busOf(session))
+        return false
+    }
+    return true
+}
+
+pub fn close(session: *Session) -> void {
+    var builder: dbus.Builder = undefined
+    var reply: dbus.Message = undefined
+    sessionCall(session, &builder, "ReleaseControl", "")
+    const released = succeeded(session, &builder, &reply)
+    dbus.close(busOf(session))
+}
+
+// The bus connection's descriptor, to wait on.
+pub fn descriptor(session: *const Session) -> isize { return session.*.bus.descriptor }
+
+// Opens the device `major`:`minor` through logind. Returns its descriptor
+// (-1 when refused); `inactive` tells that the session is not in the
+// foreground right now (the device starts paused).
+pub fn takeDevice(session: *Session, major: u32, minor: u32, inactive: *bool) -> isize {
+    var builder: dbus.Builder = undefined
+    var reply: dbus.Message = undefined
+    sessionCall(session, &builder, "TakeDevice", "uu")
+    dbus.putU32(&builder, major)
+    dbus.putU32(&builder, minor)
+    if !succeeded(session, &builder, &reply) { return -1 }
+    var at = dbus.cursor(&reply)
+    const result = dbus.readHandle(&at)
+    inactive.* = dbus.readBool(&at)
+    dbus.closeDescriptors(&reply)
+    return result
+}
+
+pub fn releaseDevice(session: *Session, major: u32, minor: u32) -> void {
+    var builder: dbus.Builder = undefined
+    var reply: dbus.Message = undefined
+    sessionCall(session, &builder, "ReleaseDevice", "uu")
+    dbus.putU32(&builder, major)
+    dbus.putU32(&builder, minor)
+    const released = succeeded(session, &builder, &reply)
+}
+
+// Tells logind a paused device ("pause") has been let go of.
+pub fn pauseComplete(session: *Session, major: u32, minor: u32) -> void {
+    var builder: dbus.Builder = undefined
+    var reply: dbus.Message = undefined
+    sessionCall(session, &builder, "PauseDeviceComplete", "uu")
+    dbus.putU32(&builder, major)
+    dbus.putU32(&builder, minor)
+    const completed = succeeded(session, &builder, &reply)
+}
+
+// Switches the seat to virtual terminal `number`.
+pub fn switchTo(session: *Session, number: u32) -> bool {
+    var builder: dbus.Builder = undefined
+    var reply: dbus.Message = undefined
+    dbus.beginCall(&builder, LOGIN1, seatPathOf(session), session.*.seatPathLength, SEAT, "SwitchTo", "u")
+    dbus.putU32(&builder, number)
+    return succeeded(session, &builder, &reply)
+}
+
+// The next device signal, if one came. False when there is none (other
+// messages are skipped). `alive` turns false when the bus went away.
+pub fn nextEvent(session: *Session, event: *Event, alive: *bool) -> bool {
+    var message: dbus.Message = undefined
+    while dbus.next(busOf(session), &message, storageOf(session)) {
+        const ours = message.kind == dbus.SIGNAL && dbus.equals(message.interface, message.interfaceLength, SESSION)
+        if ours && dbus.equals(message.member, message.memberLength, "PauseDevice") {
+            var at = dbus.cursor(&message)
+            event.*.kind = PAUSE
+            event.*.major = dbus.readU32(&at)
+            event.*.minor = dbus.readU32(&at)
+            var length: usize = 0
+            const kind = dbus.readString(&at, &length)
+            event.*.pauseKind = if dbus.equals(kind, length, "pause") { PAUSE_ASKED } else if dbus.equals(kind, length, "gone") { PAUSE_GONE } else { PAUSE_FORCED }
+            event.*.descriptor = -1
+            dbus.closeDescriptors(&message)
+            return true
+        }
+        if ours && dbus.equals(message.member, message.memberLength, "ResumeDevice") {
+            var at = dbus.cursor(&message)
+            event.*.kind = RESUME
+            event.*.major = dbus.readU32(&at)
+            event.*.minor = dbus.readU32(&at)
+            event.*.descriptor = dbus.readHandle(&at)
+            dbus.closeDescriptors(&message)
+            return true
+        }
+        dbus.closeDescriptors(&message)
+    }
+    alive.* = dbus.alive(busOf(session))
+    return false
+}

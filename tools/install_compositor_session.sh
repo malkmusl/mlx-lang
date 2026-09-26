@@ -3,9 +3,11 @@
 # session that GDM and SDDM offer at login ("Mlx Compositor").
 #
 # The session (examples/wayland-compositor/session/mlx-session) runs the
-# compositor fullscreen at the monitor's resolution inside a minimal host
-# that drives the display: cage when installed (recommended), else weston's
-# kiosk shell. One of the two must be installed.
+# compositor freestanding: it drives the monitor (DRM/KMS) at its preferred
+# resolution and reads the input devices itself, with systemd-logind
+# handing out the devices and switching VTs; libxkbcommon (installed on any
+# desktop) makes the keymap. MLX_SESSION_HOST=cage|weston in the session's
+# environment runs it nested in one of those hosts instead.
 #
 # Installs:
 #   PREFIX/bin/mlx-compositor, PREFIX/bin/mlx-terminal, PREFIX/bin/mlx-session
@@ -107,15 +109,11 @@ as_owner "$destdir$sessions" install -m 644 "$build/mlx-compositor.desktop" "$de
 for program in "${programs[@]}"; do echo "installed $destdir$bindir/$program"; done
 echo "installed $destdir$sessions/mlx-compositor.desktop"
 
-if ! command -v cage > /dev/null && ! command -v weston > /dev/null; then
-    echo
-    echo "note: the session needs cage (recommended) or weston to drive the monitor; install one:"
-    echo "      sudo apt install cage    # or: sudo dnf install cage / sudo pacman -S cage"
-fi
 if [[ -z "$destdir" ]]; then
     echo
     echo "Log out and pick \"Mlx Compositor\": in GDM with the gear button after"
     echo "choosing your user, in SDDM in the session menu. Alt+Enter opens a"
-    echo "terminal, Alt+Shift+Q ends the session. Its log is"
+    echo "terminal, Ctrl+Alt+F1..F12 switch VTs, Alt+Shift+Q ends the session."
+    echo "Its log is"
     echo "${XDG_STATE_HOME:-$HOME/.local/state}/mlx-compositor/session.log."
 fi

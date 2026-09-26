@@ -1,0 +1,241 @@
+// The keyboard description for the DRM backend: without a host compositor,
+// the compositor makes the xkb keymap its clients get, and tracks the
+// modifier state it sends them.
+//
+// libxkbcommon (loaded at run time with dlopen, so the nested compositor
+// never needs it) compiles the keymap from the system's rules for the
+// layout in XKB_DEFAULT_LAYOUT, XKB_DEFAULT_VARIANT, XKB_DEFAULT_MODEL and
+// XKB_DEFAULT_OPTIONS (what the session launcher exports from the system
+// settings; "us" when unset), and follows every key for the serialized
+// modifiers. Without libxkbcommon a keymap can be given as a file
+// (MLX_XKB_KEYMAP, text as `xkbcli compile-keymap` writes it); modifiers
+// are then tracked for the usual keys (Shift, Caps Lock, Control, Alt,
+// Num Lock, Super, AltGr) with the real modifiers' standard bits.
+
+const std = @import("std")
+const wl = @import("std.wayland")
+const state = @import("./state.mlx")
+const device = @import("./device.mlx")
+
+const Compositor = state.Compositor
+
+extern("c") fn dlopen(name: [*]const u8, flags: i32) -> usize
+extern("c") fn dlsym(handle: usize, name: [*]const u8) -> usize
+extern("c") fn free(pointer: usize) -> void
+extern("c") fn strlen(text: [*]const u8) -> usize
+
+const RTLD_NOW: i32 = 2
+const KEYMAP_FORMAT_TEXT_V1: i32 = 1
+const KEY_UP: i32 = 0
+const KEY_DOWN: i32 = 1
+const STATE_MODS_DEPRESSED: i32 = 1
+const STATE_MODS_LATCHED: i32 = 2
+const STATE_MODS_LOCKED: i32 = 4
+const STATE_LAYOUT_EFFECTIVE: i32 = 128
+
+const ContextNew = fn(i32) -> usize
+const KeymapFromNames = fn(usize, usize, i32) -> usize
+const KeymapAsString = fn(usize, i32) -> usize
+const StateNew = fn(usize) -> usize
+const StateUpdateKey = fn(usize, u32, i32) -> i32
+const StateSerialize = fn(usize, i32) -> u32
+
+pub const Keyboard = struct {
+    // libxkbcommon's state and functions (0 without it).
+    state: usize
+    updateKey: usize
+    serializeMods: usize
+    serializeLayout: usize
+    memory: wl.SharedMemory
+    depressed: u32
+    latched: u32
+    locked: u32
+    group: u32
+    // Keys (evdev codes below 256) and pointer buttons (bit n: code 272 + n)
+    // held down now, to let go of when the session leaves the foreground.
+    pressedKeys: [32]u8
+    pressedButtons: u32
+}
+
+fn symbol(library: usize, name: []const u8) -> usize {
+    unsafe { return dlsym(library, @ptrCast([*]const u8, name)) }
+}
+
+// Hands `text` (`length` bytes) to clients as the keymap.
+fn publish(keyboard: *Keyboard, compositor: *Compositor, text: [*]const u8, length: usize) -> bool {
+    var memory: wl.SharedMemory = undefined
+    if !wl.transport.createSharedMemory(&memory, length + 1) { return false }
+    const bytes = memory.bytes()
+    var index: usize = 0
+    while index < length {
+        bytes[index] = text[index]
+        index += 1
+    }
+    bytes[length] = 0
+    keyboard.*.memory = memory
+    compositor.*.keymap = memory.handle
+    compositor.*.keymapFormat = 1
+    compositor.*.keymapSize = @intCast(u32, length + 1)
+    compositor.*.hasKeymap = true
+    return true
+}
+
+fn loadLibrary(keyboard: *Keyboard, compositor: *Compositor) -> bool {
+    var library: usize = 0
+    unsafe { library = dlopen(@ptrCast([*]const u8, "libxkbcommon.so.0"), RTLD_NOW) }
+    if library == 0 { return false }
+    const context_new = symbol(library, "xkb_context_new")
+    const from_names = symbol(library, "xkb_keymap_new_from_names")
+    const as_string = symbol(library, "xkb_keymap_get_as_string")
+    const state_new = symbol(library, "xkb_state_new")
+    keyboard.*.updateKey = symbol(library, "xkb_state_update_key")
+    keyboard.*.serializeMods = symbol(library, "xkb_state_serialize_mods")
+    keyboard.*.serializeLayout = symbol(library, "xkb_state_serialize_layout")
+    if context_new == 0 || from_names == 0 || as_string == 0 || state_new == 0 || keyboard.*.updateKey == 0 || keyboard.*.serializeMods == 0 || keyboard.*.serializeLayout == 0 { return false }
+    var make_context: ContextNew = undefined
+    var make_keymap: KeymapFromNames = undefined
+    var keymap_text: KeymapAsString = undefined
+    var make_state: StateNew = undefined
+    unsafe {
+        make_context = @ptrFromInt(ContextNew, context_new)
+        make_keymap = @ptrFromInt(KeymapFromNames, from_names)
+        keymap_text = @ptrFromInt(KeymapAsString, as_string)
+        make_state = @ptrFromInt(StateNew, state_new)
+    }
+    const context = make_context(0)
+    if context == 0 { return false }
+    // No names: the defaults, which follow XKB_DEFAULT_*.
+    const keymap = make_keymap(context, 0, 0)
+    if keymap == 0 {
+        state.say("keyboard: libxkbcommon could not compile a keymap for XKB_DEFAULT_LAYOUT\n")
+        return false
+    }
+    const text = keymap_text(keymap, KEYMAP_FORMAT_TEXT_V1)
+    if text == 0 { return false }
+    var published = false
+    unsafe {
+        const pointer = @ptrFromInt([*]const u8, text)
+        published = publish(keyboard, compositor, pointer, strlen(pointer))
+    }
+    free(text)
+    keyboard.*.state = make_state(keymap)
+    return published && keyboard.*.state != 0
+}
+
+// A keymap file named by MLX_XKB_KEYMAP.
+fn loadFile(keyboard: *Keyboard, compositor: *Compositor) -> bool {
+    const path = state.environmentValue(compositor.*.environment, "MLX_XKB_KEYMAP")
+    if @intFromPtr(path) == 0 { return false }
+    const file = device.openPath(path, device.O_RDONLY)
+    if file < 0 { return false }
+    const capacity: usize = 262144
+    const buffer = compositor.*.allocator.alloc(capacity, 16).?
+    var length: usize = 0
+    while length < capacity {
+        const count = std.linux.syscall3(device.SYS_read, @bitCast(usize, file), @intFromPtr(buffer) + length, capacity - length)
+        if count <= 0 { break }
+        length += @bitCast(usize, count)
+    }
+    device.close(file)
+    const published = length > 0 && publish(keyboard, compositor, buffer, length)
+    compositor.*.allocator.free(buffer, capacity, 16)
+    return published
+}
+
+// Makes the keymap (see the top of the file). False when there is none:
+// clients then get no keymap.
+pub fn load(keyboard: *Keyboard, compositor: *Compositor) -> bool {
+    keyboard.*.state = 0
+    keyboard.*.depressed = 0
+    keyboard.*.latched = 0
+    keyboard.*.locked = 0
+    keyboard.*.group = 0
+    keyboard.*.pressedButtons = 0
+    var index: usize = 0
+    while index < 32 {
+        keyboard.*.pressedKeys[index] = 0
+        index += 1
+    }
+    if loadLibrary(keyboard, compositor) {
+        if compositor.*.verbose { state.say("keyboard: xkb keymap from libxkbcommon\n") }
+        return true
+    }
+    keyboard.*.state = 0
+    if loadFile(keyboard, compositor) {
+        state.say("keyboard: keymap from MLX_XKB_KEYMAP (libxkbcommon.so.0 not found)\n")
+        return true
+    }
+    state.say("keyboard: no keymap (install libxkbcommon or set MLX_XKB_KEYMAP)\n")
+    return false
+}
+
+// The modifier bit a key holds or locks without libxkbcommon (0: none),
+// and whether it locks.
+fn modifierOf(key: u32, locks: *bool) -> u32 {
+    locks.* = false
+    if key == 42 || key == 54 { return 1 }
+    if key == 58 {
+        locks.* = true
+        return 2
+    }
+    if key == 29 || key == 97 { return 4 }
+    if key == 56 { return 8 }
+    if key == 69 {
+        locks.* = true
+        return 16
+    }
+    if key == 125 || key == 126 { return 64 }
+    if key == 100 { return 128 }
+    return 0
+}
+
+// Whether key `code` is held down.
+pub fn isPressed(keyboard: *const Keyboard, code: u32) -> bool {
+    return (keyboard.*.pressedKeys[@intCast(usize, code / 8)] >> @intCast(u8, code % 8)) & 1 != 0
+}
+
+// Follows a key press or release (evdev code). True when the modifiers
+// changed (read them from the keyboard).
+pub fn key(keyboard: *Keyboard, code: u32, pressed: bool) -> bool {
+    if code < 256 {
+        const bit = @intCast(u8, 1) << @intCast(u8, code % 8)
+        const slot = @intCast(usize, code / 8)
+        if pressed {
+            keyboard.*.pressedKeys[slot] = keyboard.*.pressedKeys[slot] | bit
+        } else {
+            keyboard.*.pressedKeys[slot] = keyboard.*.pressedKeys[slot] & (255 ^ bit)
+        }
+    }
+    const before_depressed = keyboard.*.depressed
+    const before_latched = keyboard.*.latched
+    const before_locked = keyboard.*.locked
+    const before_group = keyboard.*.group
+    if keyboard.*.state != 0 {
+        var update: StateUpdateKey = undefined
+        var serialize_mods: StateSerialize = undefined
+        var serialize_layout: StateSerialize = undefined
+        unsafe {
+            update = @ptrFromInt(StateUpdateKey, keyboard.*.updateKey)
+            serialize_mods = @ptrFromInt(StateSerialize, keyboard.*.serializeMods)
+            serialize_layout = @ptrFromInt(StateSerialize, keyboard.*.serializeLayout)
+        }
+        const changed = update(keyboard.*.state, code + 8, if pressed { KEY_DOWN } else { KEY_UP })
+        keyboard.*.depressed = serialize_mods(keyboard.*.state, STATE_MODS_DEPRESSED)
+        keyboard.*.latched = serialize_mods(keyboard.*.state, STATE_MODS_LATCHED)
+        keyboard.*.locked = serialize_mods(keyboard.*.state, STATE_MODS_LOCKED)
+        keyboard.*.group = serialize_layout(keyboard.*.state, STATE_LAYOUT_EFFECTIVE)
+    } else {
+        var locks = false
+        const bit = modifierOf(code, &locks)
+        if bit != 0 {
+            if locks {
+                if pressed { keyboard.*.locked = keyboard.*.locked ^ bit }
+            } else if pressed {
+                keyboard.*.depressed = keyboard.*.depressed | bit
+            } else {
+                keyboard.*.depressed = keyboard.*.depressed & (4294967295 ^ bit)
+            }
+        }
+    }
+    return keyboard.*.depressed != before_depressed || keyboard.*.latched != before_latched || keyboard.*.locked != before_locked || keyboard.*.group != before_group
+}

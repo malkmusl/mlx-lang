@@ -1,13 +1,23 @@
-# Nested Wayland compositor
+# Mlx Wayland compositor
 
-A Wayland compositor written in Mlx with `std.wayland`. It runs as a window
-inside your desktop session and is a compositor in its own right: programs
-started with its `WAYLAND_DISPLAY` appear as windows inside it.
+A Wayland compositor written in Mlx with `std.wayland`. It runs either
 
-- The session's keyboard and pointer are routed to the nested clients. The
-  pointer goes to the window under it, a click focuses and raises a window,
-  and keys go to the focused window. Clients receive the session's xkb
-  keymap and key repeat settings.
+- **freestanding**: it drives the monitor itself (DRM/KMS) and reads the
+  keyboard, mouse and touchpad (evdev), as the desktop session a display
+  manager (GDM, SDDM) starts, or from a text console; or
+- **nested**: as a window inside your desktop session (any Wayland
+  compositor).
+
+Either way it is a compositor in its own right: programs started with its
+`WAYLAND_DISPLAY` appear as windows inside it. It picks nested when it is
+started inside a Wayland session, freestanding otherwise (`--backend
+nested|drm` decides).
+
+- Keyboard and pointer go to the clients: the pointer to the window under
+  it, a click focuses and raises a window, and keys go to the focused
+  window. Clients receive the xkb keymap (nested: the session's;
+  freestanding: made with libxkbcommon for the system's layout) and the key
+  repeat settings.
 - Windows move by dragging their title bar (`xdg_toplevel.move`) or with
   Alt+drag anywhere.
 - Windows resize by dragging their border (the cursor shows the
@@ -32,6 +42,8 @@ The screenshots are frames the scripted test host received, taken during
 | Alt+Tab | switch windows |
 | Alt+F4 | close the focused window |
 | Alt+Shift+Q | quit |
+| Ctrl+Alt+F1 .. F12 | switch to that VT (freestanding) |
+| Ctrl+Alt+Backspace | quit (freestanding) |
 
 ## Run it
 
@@ -67,13 +79,66 @@ window at the monitor's resolution), `--renderer cpu|vulkan`,
 `--font PATH|none`, `--terminal PROGRAM`, `--run PROGRAM` (repeatable),
 `--screenshot FILE`, `--timeout SECONDS`, `--verbose`.
 
+## Freestanding (DRM/KMS)
+
+![The freestanding compositor's frame on an emulated 1000x700 monitor (tools/check_compositor_drm.sh)](screenshots/freestanding.png)
+
+Without a Wayland session around it (or with `--backend drm`) the
+compositor is the display server itself:
+
+- **Session**: it becomes the controller of its systemd-logind session
+  (`TakeControl`), over a small D-Bus client of its own
+  ([`dbus.mlx`](dbus.mlx), [`logind.mlx`](logind.mlx)). logind puts the VT
+  into graphics mode and hands out the DRM card and the input devices
+  (`TakeDevice`), so no root is needed. Without logind (no system bus) the
+  devices are opened directly, which needs the rights to them, and there is
+  no VT switching.
+- **Monitor** ([`kms.mlx`](kms.mlx)): the first card (`/dev/dri/cardN`)
+  with a connected connector, at the monitor's preferred mode, on a CRTC
+  one of the connector's encoders can drive. Two XRGB8888 dumb buffers are
+  drawn into in turn and shown with page flips; the flip-complete events
+  pace the frame callbacks, so clients draw at the monitor's refresh
+  rate. On exit the CRTC gets back what it showed before.
+- **Input** ([`evdev.mlx`](evdev.mlx)): every keyboard, mouse and touchpad
+  under `/dev/input`, and those plugged in later (inotify). Mice move with
+  a little acceleration and scroll 15 pixels a notch; touchpads move the
+  pointer about 4 pixels per millimetre, scroll with two fingers (the
+  content follows the fingers), click (two fingers: right click) and tap
+  to click.
+- **Keyboard** ([`xkb.mlx`](xkb.mlx)): libxkbcommon, loaded at run time,
+  compiles the keymap for `XKB_DEFAULT_LAYOUT` (and `_VARIANT`, `_MODEL`,
+  `_OPTIONS`; the session launcher sets them from the system settings) and
+  follows the modifiers. Without it a keymap file can be given with
+  `MLX_XKB_KEYMAP`.
+- **VT switching**: Ctrl+Alt+F1..F12 asks logind to switch; while another
+  VT is in front the card and the input devices are paused (keys and
+  buttons still held are released), and coming back sets the CRTC up
+  again.
+
+Frames are composed on the CPU into memory of the compositor's own and
+copied into the dumb buffer row by row (the buffer's pitch may be wider
+than a row); `--renderer vulkan` applies to the nested compositor only.
+
+`tools/check_compositor_drm.sh` runs all of this without hardware:
+[`tools/fake_drm_session.py`](../../tools/fake_drm_session.py) plays the
+kernel and logind at the lowest level the compositor uses (real device
+nodes; a private dbus-daemon with an emulated logind; device descriptors
+that are sockets speaking [`device.mlx`](device.mlx)'s frame protocol, so
+every ioctl arrives with its number and argument bytes, is checked against
+the kernel's structure layouts, and has the pointers inside it followed in
+the compositor's memory; dumb buffers that are memfds, read back as frames).
+Real clients connect: typing reaches the Mlx terminal and, through the
+compositor's keymap, weston-terminal; the mouse, the touchpad and a mouse
+plugged in later move the cursor; Ctrl+Alt+F2 pauses and resumes
+everything; Alt+Shift+Q restores the console's CRTC and gives every
+device back.
+
 ## Desktop session (GDM, SDDM)
 
 `tools/install_compositor_session.sh` builds the compositor and the
 terminal and installs them as a session that GDM and SDDM offer at login:
 
 ```sh
-sudo apt install cage          # or weston; see below
 tools/install_compositor_session.sh             # asks for sudo to install
 tools/install_compositor_session.sh --uninstall
 ```
@@ -86,22 +151,23 @@ builds (into `mlx-out/session`). Then log out and pick "Mlx Compositor":
 in GDM with the gear button once your user is chosen, in SDDM in the
 session menu.
 
-The compositor is a nested compositor, so the session
-([`session/mlx-session`](session/mlx-session)) starts a minimal host that
-drives the monitor and shows only the compositor's window, fullscreen:
-[cage](https://github.com/cage-kiosk/cage) when it is installed, else
-weston with its kiosk shell (weston 10 or newer). With `--fullscreen` the
-compositor binds the host's `wl_output`, asks for a fullscreen window and
-takes the size the host configures (the monitor's resolution; the mode
-divided by the scale when the host only has a mode), before making its
-buffers. The keyboard layout is the system's (`localectl`,
-`/etc/default/keyboard` or `/etc/vconsole.conf`; `XKB_DEFAULT_LAYOUT`
-wins), passed to the host, whose keymap the compositor hands on to its
-clients. Alt+Enter opens a terminal, Alt+Shift+Q ends the session, and
+The session ([`session/mlx-session`](session/mlx-session)) runs the
+compositor freestanding (above), at the monitor's preferred resolution,
+with the system's keyboard layout (`localectl`, `/etc/default/keyboard` or
+`/etc/vconsole.conf`; `XKB_DEFAULT_LAYOUT` wins). Alt+Enter opens a
+terminal, Ctrl+Alt+F1..F12 switch VTs, Alt+Shift+Q ends the session, and
 everything the compositor logs (`--verbose`) goes to
-`~/.local/state/mlx-compositor/session.log`. `MLX_SESSION_HOST=cage|weston`
-picks the host and `MLX_COMPOSITOR_ARGS` adds options, for example
-`--renderer vulkan`.
+`~/.local/state/mlx-compositor/session.log`. `MLX_COMPOSITOR_ARGS` adds
+options.
+
+`MLX_SESSION_HOST=cage` or `weston` in the session's environment runs the
+compositor nested instead, fullscreen in a minimal host that drives the
+monitor: [cage](https://github.com/cage-kiosk/cage), or weston's kiosk
+shell (weston 10 or newer). With `--fullscreen` the compositor binds the
+host's `wl_output`, asks for a fullscreen window and takes the size the
+host configures (the monitor's resolution; the mode divided by the scale
+when the host only has a mode) before making its buffers; the host's
+keymap is handed on to the clients.
 
 Other programs started from the session's terminal share the session's
 D-Bus bus, so a single-instance application already running elsewhere for
@@ -109,9 +175,9 @@ your user (Nautilus in another session) still opens its window there;
 `dbus-run-session` gives it a bus of its own, as above.
 
 `tools/check_compositor_session.sh` stages an install and starts the
-session as a display manager would, with cage and with weston on their
-headless backends: the compositor must come up at the host monitor's
-resolution with the session's keyboard layout.
+nested variants of the session as a display manager would, with cage and
+with weston on their headless backends: the compositor must come up at the
+host monitor's resolution with the session's keyboard layout.
 
 ## Title bars
 
@@ -175,10 +241,17 @@ once.
 
 ## Files
 
-- `main.mlx`: options, the child environment and the event loop over the
-  session connection and the server.
-- `host.mlx`: the window on the session compositor (fullscreen at the
-  monitor's resolution with `--fullscreen`) and its seat input.
+- `main.mlx`: options, the backend choice, the child environment and the
+  event loops (nested: the host connection and the server; freestanding:
+  the server and the devices).
+- `host.mlx`: the nested backend, a window on the session compositor
+  (fullscreen at the monitor's resolution with `--fullscreen`) and its seat
+  input.
+- `drm.mlx`: the freestanding backend: session, monitor, input devices,
+  frames and VT switching, with `kms.mlx` (DRM/KMS), `evdev.mlx` (input
+  devices), `xkb.mlx` (keymap and modifiers), `logind.mlx` (the login
+  session), `dbus.mlx` (a small D-Bus client) and `device.mlx` (device
+  syscalls, and the emulated devices of the test harness).
 - `shell.mlx`: the server side, with globals, surfaces, shared memory,
   xdg-shell, focus and input delivery, and launching programs.
 - `dmabuf.mlx`: linux-dmabuf; each dma-buf becomes a one-buffer pool.
