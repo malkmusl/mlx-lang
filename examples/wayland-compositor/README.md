@@ -214,6 +214,18 @@ that early while composing with Vulkan, is started once more with
 `--renderer cpu`, so a Vulkan-only failure still leaves a working
 session, and the log shows both attempts.
 
+When even that log does not appear, `/tmp/mlx-session-UID.log` says
+whether the launcher was started at all (its first line is written before
+anything else), and `./install_compositor.sh --log` shows both files and
+the display manager's journal lines about the session.
+
+A compositor started by hand, `mlx-compositor --backend drm` from a text
+console, writes the same log itself (the console it was started from is
+the monitor it draws on): `MLX_COMPOSITOR_LOG` names the file, `-` keeps
+stdout, the default is `~/.config/mlx/compositor.log`, and `--verbose` is
+implied. Starting the session from a text console works too: log in on
+one (Ctrl+Alt+F3) and run `mlx-session`.
+
 `MLX_SESSION_HOST=cage` or `weston` in the session's environment runs the
 compositor nested instead, fullscreen in a minimal host that drives the
 monitor: [cage](https://github.com/cage-kiosk/cage), or weston's kiosk

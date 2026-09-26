@@ -604,6 +604,7 @@ class Harness:
             "XDG_RUNTIME_DIR": self.work, "XDG_SESSION_ID": "31", "XKB_DEFAULT_LAYOUT": "us",
             "DBUS_SYSTEM_BUS_ADDRESS": self.address,
             "MLX_DRM_DIR": os.path.join(self.work, "dri"), "MLX_INPUT_DIR": os.path.join(self.work, "input"),
+            "MLX_COMPOSITOR_LOG": "-",
         }
         # The Vulkan driver (lavapipe) the caller chose.
         for name in ("VK_DRIVER_FILES", "VK_ICD_FILENAMES", "VK_ADD_DRIVER_FILES", "MLX_VULKAN_NO_HOST_IMPORT", "MLX_VULKAN_TEST_FAIL"):

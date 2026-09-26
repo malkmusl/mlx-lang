@@ -53,13 +53,29 @@ bad() { echo "FAIL  $*"; problems=$((problems + 1)); }
 note() { echo "note  $*"; }
 
 if [[ $mode == log ]]; then
+    trace="/tmp/mlx-session-$(id -u).log"
+    if [[ -f "$trace" ]]; then
+        echo "== $trace (every start of the session launcher)"
+        tail -n 20 "$trace"
+        echo
+    else
+        echo "== no $trace: the session launcher (mlx-session) was never started for this user"
+        echo
+    fi
     if [[ -f "$log_file" ]]; then
         echo "== $log_file"
         cat "$log_file"
         [[ -f "$log_file.old" ]] && echo && echo "(the run before that is in $log_file.old)"
     else
-        echo "no session log at $log_file: the session was never started, or it"
-        echo "was installed before the log moved there (reinstall with this script)."
+        echo "== no $log_file"
+        echo "The session launcher never got far enough to write it, and a compositor"
+        echo "started by hand (mlx-compositor --backend drm) writes it only since the"
+        echo "install that added this line. Reinstall with this script."
+    fi
+    if command -v journalctl > /dev/null 2>&1; then
+        echo
+        echo "== the display manager's journal lines about the session (this boot)"
+        journalctl -b --no-pager -q -g 'mlx-session|mlx-compositor|wayland-sessions|Mlx' 2> /dev/null | tail -n 40 || echo "(not readable: try with sudo, or add yourself to the systemd-journal group)"
     fi
     exit 0
 fi
