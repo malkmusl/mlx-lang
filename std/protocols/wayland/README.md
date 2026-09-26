@@ -9,6 +9,9 @@ build inputs; applications only `@import("std.wayland")`.
 | `wayland.xml` | wayland 1.26.0, `protocol/wayland.xml` |
 | `xdg-shell.xml` | wayland-protocols 1.49, `stable/xdg-shell/xdg-shell.xml` |
 | `linux-dmabuf-v1.xml` | wayland-protocols 1.49, `stable/linux-dmabuf/linux-dmabuf-v1.xml` |
+| `ext-background-effect-v1.xml` | wayland-protocols 1.49, `staging/ext-background-effect/ext-background-effect-v1.xml` |
+| `wlr-layer-shell-unstable-v1.xml` | wlr-protocols bf4fc79a, `unstable/wlr-layer-shell-unstable-v1.xml` |
+| `wlr-foreign-toplevel-management-unstable-v1.xml` | wlr-protocols bf4fc79a, `unstable/wlr-foreign-toplevel-management-unstable-v1.xml` |
 
 The files are byte-for-byte copies of the upstream releases. `SOURCES`
 records each file's URL, release and SHA-256. Bootstrap tooling must preserve
