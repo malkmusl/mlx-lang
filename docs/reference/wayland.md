@@ -477,7 +477,11 @@ Two programs use both halves of `std.wayland` with real input:
   opposite edges kept), places `xdg_popup` windows with
   `xdg_positioner`, and launches programs such as a terminal on Alt+Enter.
   Its `wl_data_device_manager` carries the clipboard between clients (GTK 4
-  applications such as Nautilus need it to use the display). With
+  applications such as Nautilus need it to use the display), and its
+  `wl_subcompositor` gives them subsurfaces (Firefox needs them): drawn with
+  their window at their offset, stacked as placed, nested, with
+  synchronized commits kept until the parent's state is applied, and
+  pointer coordinates of their own. With
   `--fullscreen` it takes the host monitor's resolution, which is how
   `install_compositor.sh` installs it as a GDM/SDDM session
   (inside cage or weston's kiosk shell). It waits on
@@ -495,7 +499,9 @@ with Alt+right-drag must give exact window sizes and positions, and its
 shell must learn each size. weston-terminal, when installed, must
 accept Shift through the forwarded keymap and move by its title bar;
 wl-clipboard, when installed, must paste in one client what another copied;
-gtk4-widget-factory, when installed, must open its window.
+gtk4-widget-factory, when installed, must open its window;
+`examples/wayland-client --subsurface` must show its green subsurface at
+its offset in the window, and nothing else of the window may be green.
 `tools/check_compositor_drm.sh [cpu|vulkan]` runs the freestanding
 compositor against an emulated kernel (DRM card, evdev devices) and an
 emulated logind on a private dbus-daemon, with real clients: modeset at the

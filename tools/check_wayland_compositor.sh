@@ -263,7 +263,39 @@ else
     echo "skip weston-terminal is not installed"
 fi
 
-# Scenario 5: copy and paste between two clients through the compositor's
+# Scenario 5: a subsurface (examples/wayland-client --subsurface): green,
+# 100x80, at (40, 30) in a 320x240 window whose content starts at (24, 24).
+"$compiler" --quiet examples/wayland-client/main.mlx -o "$work/hello-wayland"
+cat > "$work/subsurface.sh" <<SCRIPT
+#!/bin/sh
+exec "$work/hello-wayland" --subsurface
+SCRIPT
+chmod +x "$work/subsurface.sh"
+cat > "$work/subsurface.script" <<SCRIPT
+wait 1500
+shot $work/subsurface.ppm
+close
+SCRIPT
+run_scenario subsurface "$work/subsurface.script" --run "$work/subsurface.sh"
+python3 - "$work/subsurface.ppm" <<'PY'
+import sys
+data = open(sys.argv[1], 'rb').read()
+header, rest = data.split(b'\n', 1)
+size, rest = rest.split(b'\n', 1)
+_, pixels = rest.split(b'\n', 1)
+width, height = map(int, size.split())
+def rgb(x, y):
+    offset = (y * width + x) * 3
+    return tuple(pixels[offset:offset + 3])
+green = (0, 255, 0)
+for x, y in ((64, 54), (100, 90), (163, 133)):
+    assert rgb(x, y) == green, ("subsurface pixel", x, y, rgb(x, y))
+for x, y in ((40, 40), (170, 90), (100, 140), (60, 90)):
+    assert rgb(x, y) != green, ("window pixel", x, y, rgb(x, y))
+PY
+echo "ok   a subsurface is drawn at its offset in its window"
+
+# Scenario 6: copy and paste between two clients through the compositor's
 # wl_data_device_manager, with wl-clipboard (if available): wl-copy sets
 # the selection, wl-paste (another client) reads it through a pipe.
 if command -v wl-copy > /dev/null && command -v wl-paste > /dev/null; then
@@ -284,7 +316,7 @@ else
     echo "skip wl-clipboard is not installed"
 fi
 
-# Scenario 6: a GTK 4 application (GTK 4 needs wl_data_device_manager to
+# Scenario 7: a GTK 4 application (GTK 4 needs wl_data_device_manager to
 # use a Wayland display at all), if available.
 if command -v gtk4-widget-factory > /dev/null && command -v dbus-run-session > /dev/null; then
     cat > "$work/gtk4.sh" <<SCRIPT
