@@ -10,6 +10,10 @@ started with its `WAYLAND_DISPLAY` appear as windows inside it.
   keymap and key repeat settings.
 - Windows move by dragging their title bar (`xdg_toplevel.move`) or with
   Alt+drag anywhere.
+- Windows resize by dragging their border (the cursor shows the
+  direction; near a corner, the corner), with Alt+right-drag from the
+  nearest corner, or from the client's own edges (`xdg_toplevel.resize`,
+  GTK). The opposite edges stay where they are.
 - Right-click menus and other `xdg_popup` windows are placed with
   `xdg_positioner` and dismissed by clicking elsewhere.
 
@@ -23,6 +27,8 @@ The screenshots are frames the scripted test host received, taken during
 | Shortcut | Action |
 | --- | --- |
 | Alt+Enter | open a terminal (`--terminal`, default `mlx-terminal`) |
+| Alt+drag | move the window under the pointer |
+| Alt+right-drag | resize the window under the pointer from its nearest corner |
 | Alt+Tab | switch windows |
 | Alt+F4 | close the focused window |
 | Alt+Shift+Q | quit |
@@ -68,6 +74,20 @@ the keyboard) showing its `xdg_toplevel` title, drawn with
 DejaVu Sans; titles are left out when it cannot be read). Dragging a title
 bar moves the window. Both renderers draw titles identically: the CPU with
 `std.truetype.drawRun`, Vulkan with the `text` compute shader.
+
+## Resizing
+
+During a resize the window gets its new size in `xdg_toplevel.configure`
+with the `resizing` state, one size at a time: the next goes out once the
+client has acknowledged the last one and committed a buffer for it, so a
+slow client is never flooded. Clients may snap to their own steps (the
+terminals to whole cells); when a window grows from its left or top edge,
+it is moved as its size arrives so that its right and bottom edges stay
+put. Releasing the button sends the final size without `resizing`. Sizes
+stay within the client's `set_min_size`/`set_max_size` and never go below
+64 x 32. With `--verbose` the log shows each new window size.
+
+![gtk4-demo shrunk by its border, then with Alt+right-drag](screenshots/gtk4-resized.png)
 
 ## Vulkan
 

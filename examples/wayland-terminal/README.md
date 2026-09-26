@@ -1,8 +1,10 @@
 # Mlx terminal
 
 A small terminal emulator written in Mlx with `std.wayland`. It runs a
-shell on a pseudo-terminal and draws its output in an 80x24 window with a
-built-in 8x8 bitmap font.
+shell on a pseudo-terminal and draws its output with a built-in 8x8 bitmap
+font, in an 80x24 window to start with. The window follows the size its
+compositor configures, in whole cells (10x2 up to 256x96), and the shell
+learns each new size (`TIOCSWINSZ`, so `stty size` and `$COLUMNS` follow).
 
 ```sh
 mlx-out/bin/compiler/mlx4 examples/wayland-terminal/main.mlx -o mlx-terminal

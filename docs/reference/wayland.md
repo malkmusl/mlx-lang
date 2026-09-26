@@ -445,7 +445,9 @@ Two programs use both halves of `std.wayland` with real input:
   output is one window there) and a server for its own clients. It routes
   the session's pointer and keyboard to the window under the pointer or
   with focus, and hands clients the session's xkb keymap. It moves windows
-  through `xdg_toplevel.move` or Alt+drag, places `xdg_popup` windows with
+  through `xdg_toplevel.move` or Alt+drag, resizes them by their border,
+  Alt+right-drag or `xdg_toplevel.resize` (one configure at a time, the
+  opposite edges kept), places `xdg_popup` windows with
   `xdg_positioner`, and launches programs such as a terminal on Alt+Enter.
   Its `wl_data_device_manager` carries the clipboard between clients (GTK 4
   applications such as Nautilus need it to use the display). It waits on
@@ -458,7 +460,9 @@ Two programs use both halves of `std.wayland` with real input:
 `tools/wayland-test-host`, a scripted host compositor with a seat. Typed
 commands must reach the shells (they create marker files), Alt+Enter must
 open a second terminal, and Alt+drag must move it to the expected pixel
-position in the host's screenshot. weston-terminal, when installed, must
+position in the host's screenshot. Resizing a terminal by its border and
+with Alt+right-drag must give exact window sizes and positions, and its
+shell must learn each size. weston-terminal, when installed, must
 accept Shift through the forwarded keymap and move by its title bar;
 wl-clipboard, when installed, must paste in one client what another copied;
 gtk4-widget-factory, when installed, must open its window.

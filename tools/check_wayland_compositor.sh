@@ -12,9 +12,14 @@
 #   3. Alt+drag moves it (compositor-driven move), then type into it;
 #   4. drag a window by the compositor's title bar (the title is drawn with
 #      std.truetype when DejaVu Sans is installed);
-#   5. with weston-terminal (if installed): type with Shift through the
+#   5. resize a terminal by its border (bottom-right, then top-left with
+#      the opposite corner kept) and with Alt+right-drag; the shell must
+#      learn each size;
+#   6. with weston-terminal (if installed): type with Shift through the
 #      forwarded xkb keymap, drag it by its title bar (xdg_toplevel.move)
-#      and open its right-click popup menu.
+#      and open its right-click popup menu;
+#   7. with wl-clipboard and gtk4-widget-factory (if installed): copy and
+#      paste between two clients, and a GTK 4 window.
 #
 # Typed commands create marker files, so keyboard delivery is verified at the
 # shell; the moved window's focus frame is checked in the host's screenshot.
@@ -35,7 +40,8 @@ command -v xkbcli > /dev/null || { echo "check_wayland_compositor.sh: xkbcli is 
 work=$(mktemp -d)
 export XDG_RUNTIME_DIR="$work/runtime"
 mkdir -m 700 "$XDG_RUNTIME_DIR"
-trap 'rm -rf -- "$work"' EXIT
+# GTK's document portal may have mounted itself under the runtime directory.
+trap 'fusermount -u "$XDG_RUNTIME_DIR/doc" 2> /dev/null || true; rm -rf -- "$work"' EXIT
 
 "$compiler" --quiet examples/wayland-compositor/main.mlx -o "$work/mlx-compositor"
 "$compiler" --quiet examples/wayland-terminal/main.mlx -o "$work/mlx-terminal"
@@ -143,7 +149,68 @@ if sys.argv[2] == "1":
 PY
 echo "ok   dragging the compositor's title bar moved the window"
 
-# Scenario 3: weston-terminal (libwayland, cairo, xkbcommon) if available.
+# Scenario 3: resizing. The Mlx terminal (652x396 at 24,24: 80x24 cells)
+# snaps to whole cells, so every size is exact: its bottom-right border
+# dragged by (+200, +160) gives 105x34 cells (852x556), its top-left border
+# dragged by (+200, +160) gives 80x24 again with the bottom-right corner
+# kept, and Alt+right-drag near that corner by (-160, -64) gives 60x20.
+# The shell learns each size (stty size).
+cat > "$work/resize.script" <<SCRIPT
+wait 1500
+pointer 678 422
+wait 200
+press 272
+pointer 750 480
+pointer 878 582
+wait 500
+release 272
+wait 800
+pointer 300 300
+press 272
+release 272
+wait 300
+type stty size > $work/resize-large.marker
+enter
+wait 500
+pointer 21 1
+wait 200
+press 272
+pointer 100 80
+pointer 221 161
+wait 500
+release 272
+wait 800
+pointer 400 400
+press 272
+release 272
+wait 300
+type stty size > $work/resize-anchored.marker
+enter
+wait 500
+pointer 800 500
+down 56
+press 273
+pointer 700 470
+pointer 640 436
+wait 500
+release 273
+up 56
+wait 800
+type stty size > $work/resize-small.marker
+enter
+wait 500
+close
+SCRIPT
+run_scenario resize "$work/resize.script" --terminal "$work/mlx-terminal" --run "$work/mlx-terminal"
+for expected in "window: 852x556 at 24,24" "window: 652x396 at 224,184" "window: 492x332 at 224,184"; do
+    grep -qx "$expected" "$work/resize-compositor.log" || { echo "resize: no \"$expected\"" >&2; cat "$work/resize-compositor.log" >&2; exit 1; }
+done
+[[ "$(cat "$work/resize-large.marker" 2> /dev/null)" == "34 105" ]] || { echo "the shell did not learn the larger size" >&2; exit 1; }
+[[ "$(cat "$work/resize-anchored.marker" 2> /dev/null)" == "24 80" ]] || { echo "the shell did not learn the size after the top-left resize" >&2; exit 1; }
+[[ "$(cat "$work/resize-small.marker" 2> /dev/null)" == "20 60" ]] || { echo "the shell did not learn the size after Alt+right-drag" >&2; exit 1; }
+echo "ok   windows resize by their border (the opposite corner kept) and with Alt+right-drag; the Mlx terminal follows"
+
+# Scenario 4: weston-terminal (libwayland, cairo, xkbcommon) if available.
 if command -v weston-terminal > /dev/null; then
     cat > "$work/weston.script" <<SCRIPT
 wait 2500
@@ -181,7 +248,7 @@ else
     echo "skip weston-terminal is not installed"
 fi
 
-# Scenario 4: copy and paste between two clients through the compositor's
+# Scenario 5: copy and paste between two clients through the compositor's
 # wl_data_device_manager, with wl-clipboard (if available): wl-copy sets
 # the selection, wl-paste (another client) reads it through a pipe.
 if command -v wl-copy > /dev/null && command -v wl-paste > /dev/null; then
@@ -202,7 +269,7 @@ else
     echo "skip wl-clipboard is not installed"
 fi
 
-# Scenario 5: a GTK 4 application (GTK 4 needs wl_data_device_manager to
+# Scenario 6: a GTK 4 application (GTK 4 needs wl_data_device_manager to
 # use a Wayland display at all), if available.
 if command -v gtk4-widget-factory > /dev/null && command -v dbus-run-session > /dev/null; then
     cat > "$work/gtk4.sh" <<SCRIPT
