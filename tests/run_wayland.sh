@@ -43,9 +43,10 @@ for test in tests/240_*.mlx tests/241_*.mlx tests/242_*.mlx tests/243_*.mlx test
     fi
 done
 
-# The compositor's damage tracking: frames composed in what changed must
-# equal frames composed from scratch.
-for test in tests/268_compositor_damage_runtime.mlx; do
+# The compositor's damage tracking (frames composed in what changed must
+# equal frames composed from scratch) and its hit-testing with input
+# regions.
+for test in tests/268_compositor_damage_runtime.mlx tests/270_compositor_input_region_runtime.mlx; do
     if ! "$compiler" --quiet "$test" -o "$work/test" 2> "$work/errors"; then
         echo "FAIL (compile) $test"
         cat "$work/errors"

@@ -401,7 +401,8 @@ mlx4 examples/vulkan-wayland-client/main.mlx -o vulkan-wayland-client
 
 ## Supported protocol
 
-`wl_compositor` (surfaces and regions), `wl_shm` (ARGB8888 and XRGB8888),
+`wl_compositor` (surfaces, and regions as input regions: a surface with
+one takes the pointer only inside it), `wl_shm` (ARGB8888 and XRGB8888),
 `zwp_linux_dmabuf_v1` version 3 (ARGB8888 and XRGB8888, linear, one plane),
 `wl_output`, `wl_seat` with pointer and keyboard, `wl_data_device_manager`
 version 3, `wl_subcompositor` and `xdg_wm_base` with toplevels (with
@@ -414,8 +415,11 @@ part of, at their offset from it, in their stacking order (`place_above`,
 subsurface in synchronized mode (the default) keeps its commits until its
 parent's state is applied; `set_desync` applies them at once. The pointer
 enters a subsurface with coordinates relative to it, and a click on it
-focuses and raises its window. `examples/wayland-client --subsurface`
-shows one, and `tools/check_wayland_compositor.sh` checks its pixels.
+focuses and raises its window; Firefox gives its content subsurface an
+empty input region, so the pointer goes to its window instead
+(`tests/270_compositor_input_region_runtime.mlx`).
+`examples/wayland-client --subsurface` shows one, and
+`tools/check_wayland_compositor.sh` checks its pixels.
 
 ## Copy and paste
 

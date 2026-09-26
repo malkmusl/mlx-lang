@@ -497,7 +497,11 @@ Two programs use both halves of `std.wayland` with real input:
   `wl_subcompositor` gives them subsurfaces (Firefox needs them): drawn with
   their window at their offset, stacked as placed, nested, with
   synchronized commits kept until the parent's state is applied, and
-  pointer coordinates of their own. With
+  pointer coordinates of their own. `wl_region` objects serve as input
+  regions: a surface with one takes the pointer only inside it, so
+  Firefox's content subsurface (an empty region) leaves the pointer to its
+  window and GTK 4 windows take nothing on their shadows
+  (`tests/270_compositor_input_region_runtime.mlx`). With
   `--fullscreen` it takes the host monitor's resolution, which is how
   `install_compositor.sh` installs it as a GDM/SDDM session
   (inside cage or weston's kiosk shell). It waits on
