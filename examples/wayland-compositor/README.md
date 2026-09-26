@@ -62,9 +62,56 @@ of their own to get a new copy inside the compositor:
 WAYLAND_DISPLAY=wayland-mlx dbus-run-session nautilus
 ```
 
-Options: `--socket NAME`, `--size WxH`, `--renderer cpu|vulkan`,
+Options: `--socket NAME`, `--size WxH`, `--fullscreen` (a fullscreen
+window at the monitor's resolution), `--renderer cpu|vulkan`,
 `--font PATH|none`, `--terminal PROGRAM`, `--run PROGRAM` (repeatable),
 `--screenshot FILE`, `--timeout SECONDS`, `--verbose`.
+
+## Desktop session (GDM, SDDM)
+
+`tools/install_compositor_session.sh` builds the compositor and the
+terminal and installs them as a session that GDM and SDDM offer at login:
+
+```sh
+sudo apt install cage          # or weston; see below
+tools/install_compositor_session.sh             # asks for sudo to install
+tools/install_compositor_session.sh --uninstall
+```
+
+It puts `mlx-compositor`, `mlx-terminal` and `mlx-session` into
+`/usr/local/bin` (`--prefix`) and `mlx-compositor.desktop` into
+`/usr/share/wayland-sessions` (`--sessions`), where both display managers
+look; `--destdir` stages everything for packaging, `--build-only` only
+builds (into `mlx-out/session`). Then log out and pick "Mlx Compositor":
+in GDM with the gear button once your user is chosen, in SDDM in the
+session menu.
+
+The compositor is a nested compositor, so the session
+([`session/mlx-session`](session/mlx-session)) starts a minimal host that
+drives the monitor and shows only the compositor's window, fullscreen:
+[cage](https://github.com/cage-kiosk/cage) when it is installed, else
+weston with its kiosk shell (weston 10 or newer). With `--fullscreen` the
+compositor binds the host's `wl_output`, asks for a fullscreen window and
+takes the size the host configures (the monitor's resolution; the mode
+divided by the scale when the host only has a mode), before making its
+buffers. The keyboard layout is the system's (`localectl`,
+`/etc/default/keyboard` or `/etc/vconsole.conf`; `XKB_DEFAULT_LAYOUT`
+wins), passed to the host, whose keymap the compositor hands on to its
+clients. Alt+Enter opens a terminal, Alt+Shift+Q ends the session, and
+everything the compositor logs (`--verbose`) goes to
+`~/.local/state/mlx-compositor/session.log`. `MLX_SESSION_HOST=cage|weston`
+picks the host and `MLX_COMPOSITOR_ARGS` adds options, for example
+`--renderer vulkan`.
+
+Other programs started from the session's terminal share the session's
+D-Bus bus, so a single-instance application already running elsewhere for
+your user (Nautilus in another session) still opens its window there;
+`dbus-run-session` gives it a bus of its own, as above.
+
+`tools/check_compositor_session.sh` stages an install and starts the
+session as a display manager would, with cage and with weston on their
+headless backends: the compositor must come up at the host monitor's
+resolution with the session's keyboard layout.
 
 ## Title bars
 
@@ -130,11 +177,14 @@ once.
 
 - `main.mlx`: options, the child environment and the event loop over the
   session connection and the server.
-- `host.mlx`: the window on the session compositor and its seat input.
+- `host.mlx`: the window on the session compositor (fullscreen at the
+  monitor's resolution with `--fullscreen`) and its seat input.
 - `shell.mlx`: the server side, with globals, surfaces, shared memory,
   xdg-shell, focus and input delivery, and launching programs.
 - `dmabuf.mlx`: linux-dmabuf; each dma-buf becomes a one-buffer pool.
 - `data.mlx`: `wl_data_device_manager`, copy and paste between clients.
+- `session/`: the desktop session's launcher and entry
+  (`tools/install_compositor_session.sh` installs them).
 - `vulkan.mlx`: the Vulkan renderer.
 - `scene.mlx`: stacking, hit-testing, title bars and software composition.
 - `state.mlx`: shared records and list helpers.
