@@ -43,6 +43,19 @@ example `WAYLAND_DISPLAY=wayland-mlx weston-terminal` or `--run foot`. The
 compositor needs a Wayland session (GNOME, KDE Plasma, sway, ...). On X11,
 start `weston` first and run it inside weston.
 
+GTK 3 and GTK 4 applications run too, Nautilus for example:
+
+![Nautilus (GTK 4) in the compositor](screenshots/nautilus.png)
+
+Programs that run as a single D-Bus application (Nautilus, gnome-text-editor,
+most GNOME apps) hand a new window to the copy already running in your
+session, which opens it on your desktop instead. Start them on a D-Bus bus
+of their own to get a new copy inside the compositor:
+
+```sh
+WAYLAND_DISPLAY=wayland-mlx dbus-run-session nautilus
+```
+
 Options: `--socket NAME`, `--size WxH`, `--renderer cpu|vulkan`,
 `--font PATH|none`, `--terminal PROGRAM`, `--run PROGRAM` (repeatable),
 `--screenshot FILE`, `--timeout SECONDS`, `--verbose`.
@@ -78,10 +91,20 @@ mlx4 examples/vulkan-wayland-client/main.mlx -o vulkan-wayland-client
 
 `wl_compositor` (surfaces and regions), `wl_shm` (ARGB8888 and XRGB8888),
 `zwp_linux_dmabuf_v1` version 3 (ARGB8888 and XRGB8888, linear, one plane),
-`wl_output`, `wl_seat` with pointer and keyboard, and `xdg_wm_base` with
-toplevels, popups and positioners. There are no subsurfaces or data devices
-(clipboard). Composition is done in software, or with Vulkan
-(`--renderer vulkan`).
+`wl_output`, `wl_seat` with pointer and keyboard, `wl_data_device_manager`
+version 3 and `xdg_wm_base` with toplevels (with `configure_bounds`: the
+output's size), popups and positioners. There are no subsurfaces.
+Composition is done in software, or with Vulkan (`--renderer vulkan`).
+
+## Copy and paste
+
+`wl_data_device_manager` carries the clipboard between clients (GTK 4
+refuses a display without it): the selection is the data source a client
+set last, the focused client receives it as a data offer (when it gains
+focus and when the selection changes), and reading an offer passes the
+reader's pipe to the source's client, which writes the data into it.
+Drag and drop is not supported: the source of a drag is cancelled at
+once.
 
 ## Files
 
@@ -91,11 +114,14 @@ toplevels, popups and positioners. There are no subsurfaces or data devices
 - `shell.mlx`: the server side, with globals, surfaces, shared memory,
   xdg-shell, focus and input delivery, and launching programs.
 - `dmabuf.mlx`: linux-dmabuf; each dma-buf becomes a one-buffer pool.
+- `data.mlx`: `wl_data_device_manager`, copy and paste between clients.
 - `vulkan.mlx`: the Vulkan renderer.
 - `scene.mlx`: stacking, hit-testing, title bars and software composition.
 - `state.mlx`: shared records and list helpers.
 
 `tools/check_wayland_compositor.sh [compiler] [cpu|vulkan]` exercises all
-of this with scripted input (`tools/wayland-test-host`) on either renderer;
+of this with scripted input (`tools/wayland-test-host`) on either renderer,
+with copy and paste between two clients (`wl-copy`, `wl-paste`) and a GTK 4
+window (`gtk4-widget-factory`) when those are installed;
 `tools/check_vulkan_wayland.sh` checks the Vulkan client in both renderers
 over `wl_shm` and linux-dmabuf, pixel by pixel.

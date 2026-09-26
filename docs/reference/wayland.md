@@ -447,7 +447,9 @@ Two programs use both halves of `std.wayland` with real input:
   with focus, and hands clients the session's xkb keymap. It moves windows
   through `xdg_toplevel.move` or Alt+drag, places `xdg_popup` windows with
   `xdg_positioner`, and launches programs such as a terminal on Alt+Enter.
-  It waits on both connections with `wl.transport.waitAny`.
+  Its `wl_data_device_manager` carries the clipboard between clients (GTK 4
+  applications such as Nautilus need it to use the display). It waits on
+  both connections with `wl.transport.waitAny`.
 - [`examples/wayland-terminal`](../../examples/wayland-terminal/README.md)
   is a terminal emulator: a shell on a pseudo-terminal, keyboard input with
   key repeat, and a built-in bitmap font.
@@ -457,7 +459,9 @@ Two programs use both halves of `std.wayland` with real input:
 commands must reach the shells (they create marker files), Alt+Enter must
 open a second terminal, and Alt+drag must move it to the expected pixel
 position in the host's screenshot. weston-terminal, when installed, must
-accept Shift through the forwarded keymap and move by its title bar.
+accept Shift through the forwarded keymap and move by its title bar;
+wl-clipboard, when installed, must paste in one client what another copied;
+gtk4-widget-factory, when installed, must open its window.
 `tools/check_wayland_interop.sh` also runs the nested compositor inside
 weston.
 

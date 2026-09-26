@@ -180,3 +180,42 @@ SCRIPT
 else
     echo "skip weston-terminal is not installed"
 fi
+
+# Scenario 4: copy and paste between two clients through the compositor's
+# wl_data_device_manager, with wl-clipboard (if available): wl-copy sets
+# the selection, wl-paste (another client) reads it through a pipe.
+if command -v wl-copy > /dev/null && command -v wl-paste > /dev/null; then
+    cat > "$work/clipboard.sh" <<SCRIPT
+#!/bin/sh
+wl-copy "copied through mlx"
+sleep 0.5
+timeout 5 wl-paste --no-newline > "$work/clipboard.marker"
+timeout 5 wl-paste --list-types > "$work/clipboard.types"
+SCRIPT
+    chmod +x "$work/clipboard.sh"
+    printf 'wait 4000\nclose\n' > "$work/clipboard.script"
+    run_scenario clipboard "$work/clipboard.script" --run "$work/clipboard.sh"
+    [[ "$(cat "$work/clipboard.marker" 2> /dev/null)" == "copied through mlx" ]] || { echo "wl-paste did not read what wl-copy copied" >&2; cat "$work/clipboard-compositor.log" >&2; exit 1; }
+    grep -qx "text/plain;charset=utf-8" "$work/clipboard.types" || { echo "the offer lacks the source's MIME types" >&2; exit 1; }
+    echo "ok   copy and paste between two clients (wl-copy, wl-paste)"
+else
+    echo "skip wl-clipboard is not installed"
+fi
+
+# Scenario 5: a GTK 4 application (GTK 4 needs wl_data_device_manager to
+# use a Wayland display at all), if available.
+if command -v gtk4-widget-factory > /dev/null && command -v dbus-run-session > /dev/null; then
+    cat > "$work/gtk4.sh" <<SCRIPT
+#!/bin/sh
+unset DISPLAY
+# No portals: they would mount the document portal under XDG_RUNTIME_DIR.
+GDK_DEBUG=no-portals exec dbus-run-session gtk4-widget-factory
+SCRIPT
+    chmod +x "$work/gtk4.sh"
+    printf 'wait 6000\nclose\n' > "$work/gtk4.script"
+    run_scenario gtk4 "$work/gtk4.script" --run "$work/gtk4.sh"
+    grep -q "^map: GTK Widget Factory" "$work/gtk4-compositor.log" || { echo "the GTK 4 window did not appear" >&2; cat "$work/gtk4-compositor.log" >&2; exit 1; }
+    echo "ok   a GTK 4 application (gtk4-widget-factory) opened its window"
+else
+    echo "skip gtk4-widget-factory or dbus-run-session is not installed"
+fi
