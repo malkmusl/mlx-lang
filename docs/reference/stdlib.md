@@ -100,6 +100,39 @@ and `std.ui` (`std/src/ui.mlx`, layout building blocks, see
 [Layout](ui.md)) are extensions for drawing text and laying out pixel user
 interfaces.
 
+`std.png` (`std/src/png.mlx`) decodes PNG images into premultiplied ARGB
+words (`0xAARRGGBB`, the `wl_shm` and compositor convention), for icons
+and the like:
+
+```mlx
+const png = @import("std.png")
+
+var image: png.Image = undefined
+if png.loadFile(&image, path, allocator) == png.Status.ok {
+    var small: png.Image = undefined
+    const status = png.scale(&small, &image, 48, 48, allocator)
+    png.deinit(&image)
+}
+```
+
+`loadFile(image, path, allocator)` and `decode(image, data, length,
+allocator)` return a `Status` (`ok`, `unreadable`, `notPng`,
+`unsupported`, `corrupt`, `noMemory`; `statusMessage` words it). Every
+colour type at every bit depth PNG allows for it is read, with palette
+transparency (`tRNS`), all five row filters and zlib streams of stored,
+fixed and dynamic Huffman blocks; interlaced (Adam7) images are
+`unsupported`. Malformed data gives `corrupt`, never a trap; chunk CRCs
+and the zlib checksum are not checked. `scale(target, source, width,
+height, allocator)` resizes by area averaging, which suits shrinking an
+icon to the size it is shown at, and `deinit` frees the pixels. The dock
+and the launcher of the compositor (see [Wayland](wayland.md)) draw app
+icons with it. `tests/272_png_runtime.mlx` decodes the images in
+`tests/support/png` (written by `tests/support/png/make_pngs.py`, one per
+colour type and depth, every filter, all three block kinds) and compares
+them with the pixels they must give, refuses an interlaced image and a
+file that is not a PNG, finds a truncated one corrupt, and checks
+`scale`.
+
 ## Core: allocators
 
 **Normative source:** `spec/04-stdlib/mem.xml`
