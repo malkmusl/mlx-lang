@@ -9,7 +9,10 @@
 #
 #   1. click the Mlx terminal and type a command (keyboard -> shell);
 #   2. Alt+Enter opens a second terminal (compositor shortcut);
-#   3. Alt+drag moves it (compositor-driven move), then type into it;
+#   3. Alt+drag moves it (compositor-driven move); the pointer and keyboard
+#      leave the window and come back, with a wheel notch and a Super key
+#      in between (as when the user visits another window); then type into
+#      it;
 #   4. drag a window by the compositor's title bar (the title is drawn with
 #      std.truetype when DejaVu Sans is installed);
 #   5. resize a terminal by its border (bottom-right, then top-left with
@@ -80,7 +83,16 @@ pointer 360 340
 pointer 420 380
 release 272
 up 56
-wait 500
+wait 300
+leave
+wait 200
+pointer 430 390
+scroll 2560
+down 125
+up 125
+leave
+wait 300
+pointer 430 390
 type echo moved > $work/second.marker
 enter
 wait 1000

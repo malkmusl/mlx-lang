@@ -18,7 +18,12 @@
 // copies: the frame is rendered into a host-cached buffer and copied into
 // the output, and a client buffer is uploaded into a per-surface buffer
 // when its content changed. MLX_VULKAN_NO_HOST_IMPORT=1 takes these paths
-// on any driver (tests).
+// on any driver (tests). Freestanding, the first frame rendered into a
+// dumb buffer is checked through the buffer's mapping (verifyOutput): a
+// frame the monitor would not show means frames are copied in from then
+// on. A frame Vulkan cannot compose at all hands the output to the CPU
+// renderer for good (shell.adoptCpuRenderer). MLX_VULKAN_TEST_FAIL=1 or 2
+// provokes each of these (tests).
 //
 // Every frame is one command buffer: the background, then for each window
 // bottom to top its frame (solid rectangles: stride-0 blits from a palette)
@@ -58,6 +63,11 @@ pub const Renderer = struct {
     copyOutput: bool
     copyTo: [2]usize
     copyPitch: [2]usize
+    // Freestanding: the slots are the dumb buffers imported as dma-bufs,
+    // and whether a frame the GPU rendered has been seen in one of them
+    // through its mapping (verifyOutput).
+    importedDumb: bool
+    verified: bool
     // Device memory: the background, the palette rows (focus, frame) and
     // the cursors.
     background: *gpu.Buffer
@@ -75,6 +85,10 @@ pub const Renderer = struct {
     hostImport: bool
     // Client memory had to be uploaded (said once, with --verbose).
     loggedUpload: bool
+    // MLX_VULKAN_TEST_FAIL (tests): 1 makes verifyOutput find the first
+    // frame missing, 2 makes the third compose fail.
+    testFailure: u8
+    composed: usize
 }
 
 fn rendererOf(compositor: *Compositor) -> *Renderer {
@@ -123,7 +137,13 @@ pub fn open(compositor: *Compositor, arguments: [][*]const u8, output: ?*kms.Out
     renderer.*.blit = kernel
     renderer.*.failed = false
     renderer.*.copyOutput = false
+    renderer.*.importedDumb = false
+    renderer.*.verified = false
     renderer.*.loggedUpload = false
+    renderer.*.composed = 0
+    renderer.*.testFailure = 0
+    const test_failure = state.environmentValue(compositor.*.environment, "MLX_VULKAN_TEST_FAIL")
+    if @intFromPtr(test_failure) != 0 && test_failure[0] >= 48 && test_failure[0] <= 57 { renderer.*.testFailure = test_failure[0] - 48 }
     var options = gpu.defaultOptions(@ptrCast([*]const u8, "mlx-compositor"))
     options.wantSharing = true
     const status = gpu.open(context, driver, &options, allocator)
@@ -283,10 +303,22 @@ fn attachDumbBuffers(compositor: *Compositor, renderer: *Renderer, output: *kms.
         renderer.*.targetOffsets[0] = 0
         renderer.*.targetOffsets[1] = 0
         renderer.*.stride = @intCast(u32, kms.bufferPitch(output, 0) / 4)
+        // The mappings, for verifyOutput.
+        renderer.*.copyTo[0] = kms.bufferAddress(output, 0)
+        renderer.*.copyTo[1] = kms.bufferAddress(output, 1)
+        renderer.*.importedDumb = true
         return true
     }
+    return attachDumbCopy(compositor, renderer, output)
+}
+
+// The frame slots in a buffer of the renderer's own, copied into the dumb
+// buffers row by row.
+fn attachDumbCopy(compositor: *Compositor, renderer: *Renderer, output: *kms.Output) -> bool {
+    const context = renderer.*.context
     gpu.destroyBuffer(context, renderer.*.targets[0])
     gpu.destroyBuffer(context, renderer.*.targets[1])
+    renderer.*.importedDumb = false
     const frame_bytes = compositor.*.width * compositor.*.height * 4
     const target = renderer.*.targets[0]
     if !gpu.createReadbackBuffer(context, target, @intCast(u64, frame_bytes * 2)) {
@@ -302,6 +334,58 @@ fn attachDumbBuffers(compositor: *Compositor, renderer: *Renderer, output: *kms.
     renderer.*.copyTo[1] = kms.bufferAddress(output, 1)
     renderer.*.copyPitch[0] = kms.bufferPitch(output, 0)
     renderer.*.copyPitch[1] = kms.bufferPitch(output, 1)
+    return true
+}
+
+// After a frame was rendered into an imported dumb buffer: whether the
+// GPU's pixels are there, seen through the buffer's mapping (a driver may
+// import the buffer and still write somewhere the monitor never scans
+// out, which would leave the screen black). Looks at a corner no window
+// covers and compares it with the background; true as well when every
+// corner is covered (checked again with a later frame) or when the output
+// was verified or is copied anyway. False: the frame is not on screen.
+pub fn verifyOutput(compositor: *Compositor, slot: usize) -> bool {
+    const renderer = rendererOf(compositor)
+    if !renderer.*.importedDumb || renderer.*.verified { return true }
+    if renderer.*.testFailure == 1 {
+        renderer.*.testFailure = 0
+        return false
+    }
+    const width = @intCast(i32, compositor.*.width)
+    const height = @intCast(i32, compositor.*.height)
+    var corners: [8]i32 = [8]i32{ 0, height - 1, width - 1, 0, width - 1, height - 1, 0, 0 }
+    var corner: usize = 0
+    while corner < 4 {
+        const x = corners[corner * 2]
+        const y = corners[corner * 2 + 1]
+        var covered = false
+        var index: usize = 0
+        while index < compositor.*.stack.length {
+            if ui.contains(scene.surfaceBounds(state.surfaceAt(state.listAt(compositor.*.stack, index))), x, y) { covered = true }
+            index += 1
+        }
+        if compositor.*.pointerInside && compositor.*.pointerX - scene.CURSOR_SIZE <= x && x <= compositor.*.pointerX + scene.CURSOR_SIZE && compositor.*.pointerY - scene.CURSOR_SIZE <= y && y <= compositor.*.pointerY + scene.CURSOR_SIZE { covered = true }
+        if !covered {
+            var pixels: [*]const u32 = undefined
+            unsafe { pixels = @ptrFromInt([*]const u32, renderer.*.copyTo[slot]) }
+            const shown = pixels[@intCast(usize, y) * @intCast(usize, renderer.*.stride) + @intCast(usize, x)]
+            if shown != scene.backgroundColor(compositor, @intCast(usize, y)) { return false }
+            renderer.*.verified = true
+            return true
+        }
+        corner += 1
+    }
+    return true
+}
+
+// Gives up rendering into the dumb buffers (verifyOutput found the GPU's
+// frame missing): from now on frames are copied in. False when even that
+// cannot be set up (the caller then leaves Vulkan).
+pub fn copyInstead(compositor: *Compositor, output: *kms.Output) -> bool {
+    const renderer = rendererOf(compositor)
+    // Nothing is in flight: frames are waited for.
+    if !attachDumbCopy(compositor, renderer, output) { return false }
+    renderer.*.verified = true
     return true
 }
 
@@ -477,6 +561,8 @@ pub fn compose(compositor: *Compositor, slot: usize) -> bool {
     renderer.*.target = renderer.*.targets[slot].*.buffer
     renderer.*.offset = renderer.*.targetOffsets[slot]
     renderer.*.failed = false
+    renderer.*.composed += 1
+    if renderer.*.testFailure == 2 && renderer.*.composed == 3 { return false }
     if !gpu.begin(context) { return false }
     if renderer.*.hasText { text_module.beginFrame(renderer.*.text) }
     const width = @intCast(i32, compositor.*.width)

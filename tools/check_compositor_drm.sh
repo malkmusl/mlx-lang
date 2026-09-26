@@ -10,9 +10,11 @@
 # ioctl arguments), dbus-daemon and Python with GObject introspection (Gio).
 # With `vulkan` the compositor composes with Vulkan on lavapipe (the
 # manifest from VK_DRIVER_FILES, default /usr/share/vulkan/icd.d/lvp_icd.json):
-# the scenario runs twice, rendering into the emulated dumb buffers through
-# dma-buf import, then (MLX_VULKAN_NO_HOST_IMPORT=1, as on drivers that
-# cannot import them) copying each frame into them.
+# the scenario runs three times: rendering into the emulated dumb buffers
+# through dma-buf import; copying each frame into them
+# (MLX_VULKAN_NO_HOST_IMPORT=1, as on drivers that cannot import them); and
+# switching to copying after a first frame that never reached the buffer
+# (MLX_VULKAN_TEST_FAIL=1, as on a driver whose import does not show).
 #
 # Usage: tools/check_compositor_drm.sh [compiler] [cpu|vulkan] [--screenshot PNG]
 set -euo pipefail
@@ -54,4 +56,6 @@ trap 'rm -rf -- "$work"' EXIT
 if [[ $renderer == vulkan ]]; then
     echo "--- with the output copied into the dumb buffers"
     MLX_VULKAN_NO_HOST_IMPORT=1 "$python" tools/fake_drm_session.py "$work/mlx-compositor" "$work/mlx-terminal" --renderer vulkan
+    echo "--- with the first frame missing from the dumb buffer"
+    MLX_VULKAN_TEST_FAIL=1 "$python" tools/fake_drm_session.py "$work/mlx-compositor" "$work/mlx-terminal" --renderer vulkan
 fi

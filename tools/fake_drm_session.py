@@ -35,7 +35,8 @@ dma-bufs (PRIME_HANDLE_TO_FD, answered with the buffer's memfd) and render
 into them, so the frames read back are the GPU's. With
 MLX_VULKAN_NO_HOST_IMPORT=1 in the environment it must instead render into
 a buffer of its own and copy each frame in (the path drivers that cannot
-import the buffers take).
+import the buffers take); with MLX_VULKAN_TEST_FAIL=1 its first frame is
+made to look missing from the dumb buffer, and it must switch to copying.
 
 Usage: fake_drm_session.py COMPOSITOR TERMINAL [--screenshot PNG] [--renderer cpu|vulkan]
 """
@@ -605,7 +606,7 @@ class Harness:
             "MLX_DRM_DIR": os.path.join(self.work, "dri"), "MLX_INPUT_DIR": os.path.join(self.work, "input"),
         }
         # The Vulkan driver (lavapipe) the caller chose.
-        for name in ("VK_DRIVER_FILES", "VK_ICD_FILENAMES", "VK_ADD_DRIVER_FILES", "MLX_VULKAN_NO_HOST_IMPORT"):
+        for name in ("VK_DRIVER_FILES", "VK_ICD_FILENAMES", "VK_ADD_DRIVER_FILES", "MLX_VULKAN_NO_HOST_IMPORT", "MLX_VULKAN_TEST_FAIL"):
             if name in os.environ:
                 environment[name] = os.environ[name]
         self.log = open(self.log_path, "w")
@@ -729,6 +730,14 @@ def main():
                 if exported or not copying:
                     fail(f"expected frames copied into the dumb buffers (exported {exported}, copying {copying})")
                 print("ok   Vulkan renders into its own buffer and copies frames into the dumb buffers")
+            elif os.environ.get("MLX_VULKAN_TEST_FAIL") == "1":
+                # The buffers were imported, but the first frame (made to)
+                # never showed up in them: the renderer must switch to
+                # copying, and the frames checked below are the copies.
+                harness.wait_log("did not reach the dumb buffer", 5, "the switch to copying")
+                if exported != [1, 2]:
+                    fail(f"expected both dumb buffers exported first (exported {exported})")
+                print("ok   a frame missing from the dumb buffer makes Vulkan copy frames in from then on")
             else:
                 # The GPU renders into the dumb buffers themselves: both
                 # were exported as dma-bufs before the first frame.

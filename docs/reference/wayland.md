@@ -507,8 +507,10 @@ with `sendCreated()` (which creates the `wl_buffer` resource) or
   with `--renderer vulkan`, composes on the GPU, reading client pools and
   dma-bufs in place and rendering into the output in place: nested, the
   host window's `wl_shm` buffer; freestanding, the DRM dumb buffer the
-  monitor scans out, exported as a dma-buf. `--renderer auto` takes Vulkan
-  when a driver works and the CPU otherwise.
+  monitor scans out, exported as a dma-buf. `--renderer auto` (the
+  default) takes Vulkan when a driver works and the CPU otherwise, and the
+  freestanding compositor checks that the GPU's first frame reached the
+  dumb buffer before trusting the import.
 
 `tools/check_vulkan_wayland.sh` runs the client inside the compositor with
 both renderers, over `wl_shm` and linux-dmabuf, and compares the frames
