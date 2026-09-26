@@ -209,8 +209,14 @@ class Memory:
 
 
 class FakeCard(DeviceServer):
-    def __init__(self, harness):
+    # `modes` and `connector_type`: the connected connector's modes and kind
+    # (14: eDP, 1: VGA). The second card plays a server's BMC graphics: a
+    # small VGA "monitor" the compositor must pass over for the real one.
+    def __init__(self, harness, modes=None, connector_type=14, name="card0"):
         super().__init__(harness)
+        self.modes = MODES if modes is None else modes
+        self.connector_type = connector_type
+        self.name = name
         self.master = True
         self.buffers = {}          # handle -> [memfd, size, pitch]
         self.framebuffers = {}     # fb -> handle
@@ -255,14 +261,14 @@ class FakeCard(DeviceServer):
             if connector not in CONNECTORS:
                 return -EINVAL, argument, None
             connected = connector == 42
-            modes = MODES if connected else []
+            modes = self.modes if connected else []
             encoders = [52] if connected else [51]
             if modes_ptr and count_modes >= len(modes) and modes:
                 memory.write(modes_ptr, b"".join(modes))
             if encoders_ptr and count_encoders >= len(encoders):
                 memory.write(encoders_ptr, struct.pack(f"<{len(encoders)}I", *encoders))
             struct.pack_into("<IIIIIIIIII", argument, 32, len(modes), 0, len(encoders), 0, connector,
-                             14 if connected else 11, 1, 1 if connected else 2, 300, 200)
+                             self.connector_type if connected else 11, 1, 1 if connected else 2, 300, 200)
             record("drm", "getconnector", connector)
             return 0, argument, None
         if request == GETENCODER:
@@ -497,11 +503,15 @@ class Harness:
         os.makedirs(os.path.join(self.work, "dri"))
         os.makedirs(os.path.join(self.work, "input"))
         os.mknod(os.path.join(self.work, "dri", "card0"), 0o660 | 0o020000, os.makedev(DRM_MAJOR, 0))
+        # A second card with a small VGA monitor (a BMC's), to be passed over.
+        os.mknod(os.path.join(self.work, "dri", "card1"), 0o660 | 0o020000, os.makedev(DRM_MAJOR, 1))
         for number, (kind, name) in enumerate((("keyboard", "Fake Keyboard"), ("mouse", "Fake Mouse"),
                                                ("touchpad", "Fake Touchpad"))):
             self.add_input(number, kind, name, create_node=True)
         self.devices[(DRM_MAJOR, 0)] = FakeCard(self)
         self.devices[(DRM_MAJOR, 0)].start()
+        self.devices[(DRM_MAJOR, 1)] = FakeCard(self, modes=[mode(800, 600, 60, True)], connector_type=1, name="card1")
+        self.devices[(DRM_MAJOR, 1)].start()
 
     def add_input(self, number, kind, name, create_node):
         device = FakeInput(self, kind, name)
@@ -714,13 +724,18 @@ def main():
         for key in ((DRM_MAJOR, 0), (INPUT_MAJOR, 64), (INPUT_MAJOR, 65), (INPUT_MAJOR, 66)):
             recorder.wait(lambda c, key=key: c[:2] == ("logind", "TakeDevice") and tuple(c[2:]) == key, 5,
                           f"TakeDevice{key}")
-        harness.wait_log("drm: ", 5, "output line")
+        harness.wait_log("drm: driving", 5, "the card chosen")
+        log = harness.log_text()
+        if "/card1: VGA-1 800x600 at 60 Hz" not in log or "/card0: eDP-1 1000x700 at 60 Hz" not in log:
+            fail(f"both cards should be looked at and logged:\n{log}")
+        if "drm: driving " not in log or "/card0: eDP-1 1000x700" not in log.split("drm: driving ", 1)[1]:
+            fail(f"the card with the larger monitor (card0) should be driven, not the BMC's:\n{log}")
         if "input: " not in harness.log_text() or "keyboard: xkb keymap from libxkbcommon" not in harness.log_text():
             fail(f"inputs or keymap missing:\n{harness.log_text()}")
         card = harness.devices[(DRM_MAJOR, 0)]
         if card.pixel(0, HEIGHT - 1) != background(HEIGHT - 1):
             fail(f"background {card.pixel(0, HEIGHT - 1):#x}, expected {background(HEIGHT - 1):#x}")
-        print(f"ok   logind session and devices; modeset CRTC 32 -> connector 42 at its preferred {WIDTH}x{HEIGHT}")
+        print(f"ok   logind session and devices; the card with the monitor chosen over the BMC's VGA; modeset CRTC 32 -> connector 42 at its preferred {WIDTH}x{HEIGHT}")
         if renderer == "vulkan":
             harness.wait_log("renderer: vulkan", 5, "the Vulkan renderer")
             exported = sorted(c[2] for c in recorder.calls if c[:2] == ("drm", "prime_handle_to_fd"))

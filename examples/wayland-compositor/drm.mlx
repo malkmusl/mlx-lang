@@ -23,7 +23,10 @@
 //   Ctrl+Alt+Backspace) quits, and the monitor gets back what it showed.
 //
 // MLX_DRM_DIR and MLX_INPUT_DIR (default /dev/dri and /dev/input) point
-// the backend elsewhere; the test harness uses them.
+// the backend elsewhere; the test harness uses them. With several cards,
+// MLX_DRM_CARD (a path or a number) picks the one to drive; by default it
+// is the one with the largest monitor (a server's BMC graphics reports a
+// small VGA "monitor"), then the boot card, then the first.
 
 const std = @import("std")
 const wl = @import("std.wayland")
@@ -301,38 +304,175 @@ fn readInotify(backend: *Backend) -> void {
 // ---------------------------------------------------------------------------
 // Starting and stopping
 
+// Whether /dev/dri/cardN is the card the machine booted with (sysfs
+// boot_vga), the one the monitor most likely hangs on.
+fn isBootCard(number: u32) -> bool {
+    var path: [64]u8 = undefined
+    var bytes: [*]u8 = undefined
+    unsafe { bytes = @ptrCast([*]u8, &path) }
+    var length: usize = 0
+    for byte in "/sys/class/drm/card" {
+        bytes[length] = byte
+        length += 1
+    }
+    var digits: [12]u8 = undefined
+    var count: usize = 0
+    var rest = number
+    while rest > 0 || count == 0 {
+        digits[count] = @intCast(u8, 48 + rest % 10)
+        rest = rest / 10
+        count += 1
+    }
+    while count > 0 {
+        count -= 1
+        bytes[length] = digits[count]
+        length += 1
+    }
+    for byte in "/device/boot_vga" {
+        bytes[length] = byte
+        length += 1
+    }
+    bytes[length] = 0
+    const file = std.fs.open(bytes, 0, 0)
+    if !std.fs.isValid(file) { return false }
+    var value: [4]u8 = [4]u8{ 0, 0, 0, 0 }
+    var value_bytes: [*]u8 = undefined
+    unsafe { value_bytes = @ptrCast([*]u8, &value) }
+    const got = std.fs.read(file, value_bytes, 4)
+    const closed = std.fs.close(file)
+    return got > 0 && value[0] == 49
+}
+
+// Logs "drm: PATH: HDMI-A-1 WxH at N Hz" (or "no connected monitor"),
+// after `prefix`.
+fn sayCard(prefix: []const u8, path: [*]const u8, output: *const kms.Output, found: bool, boot: bool) -> void {
+    state.say("drm: ")
+    state.say(prefix)
+    sayPath(path)
+    state.say(": ")
+    if !found {
+        state.say("no connected monitor")
+    } else {
+        var name: [24]u8 = undefined
+        var name_bytes: [*]u8 = undefined
+        unsafe { name_bytes = @ptrCast([*]u8, &name) }
+        const length = kms.connectorName(output, name_bytes)
+        unsafe { const shown = std.io.writeAllBytes(std.io.stdout(), name_bytes, length) }
+        state.say(" ")
+        state.sayNumber(output.*.width)
+        state.say("x")
+        state.sayNumber(output.*.height)
+        state.say(" at ")
+        state.sayNumber(@intCast(usize, output.*.refresh))
+        state.say(" Hz")
+    }
+    if boot { state.say(" (the boot card)") }
+    state.say("\n")
+}
+
+// Whether MLX_DRM_CARD (a path or a number) names card `number`; true for
+// every card when it is not set.
+fn cardWanted(backend: *Backend, number: u32, path: [*]const u8) -> bool {
+    const wanted = state.environmentValue(backend.*.compositor.*.environment, "MLX_DRM_CARD")
+    if @intFromPtr(wanted) == 0 || wanted[0] == 0 { return true }
+    var index: usize = 0
+    while wanted[index] != 0 && wanted[index] == path[index] { index += 1 }
+    if wanted[index] == 0 && path[index] == 0 { return true }
+    var value: u32 = 0
+    var digits: usize = 0
+    index = 0
+    while wanted[index] >= 48 && wanted[index] <= 57 {
+        value = value * 10 + @intCast(u32, wanted[index] - 48)
+        index += 1
+        digits += 1
+    }
+    return digits > 0 && wanted[index] == 0 && value == number
+}
+
+// Picks the card to drive: MLX_DRM_CARD when set; else, among the cards
+// with a connected monitor, the one with the largest monitor (a server's
+// BMC graphics reports a small VGA "monitor" and is often the boot card),
+// then the card the machine booted with, then the first. With more than
+// one card every one is looked at and logged first (the log then shows
+// which monitor hangs where).
 fn openCard(backend: *Backend) -> bool {
-    var number: u32 = 0
-    while number < 8 {
+    var cards: [8]bool = [8]bool{ false, false, false, false, false, false, false, false }
+    var nodes: [8]device.Stat = undefined
+    var card_count: usize = 0
+    var index: usize = 0
+    while index < 8 {
         var path: [160]u8 = undefined
         var path_bytes: [*]u8 = undefined
         unsafe { path_bytes = @ptrCast([*]u8, &path) }
-        nodePath(path_bytes, cardDirectoryOf(backend), "card", number)
+        nodePath(path_bytes, cardDirectoryOf(backend), "card", @intCast(u32, index))
         var node: device.Stat = undefined
-        if device.statPath(path_bytes, &node) && device.isCharacterDevice(&node) {
+        if device.statPath(path_bytes, &node) && device.isCharacterDevice(&node) && cardWanted(backend, @intCast(u32, index), path_bytes) {
+            nodes[index] = node
+            cards[index] = true
+            card_count += 1
+        }
+        index += 1
+    }
+    var chosen: usize = 8
+    if card_count > 1 {
+        var best_pixels: usize = 0
+        var best_boot = false
+        index = 0
+        while index < 8 {
+            if cards[index] {
+                var path: [160]u8 = undefined
+                var path_bytes: [*]u8 = undefined
+                unsafe { path_bytes = @ptrCast([*]u8, &path) }
+                nodePath(path_bytes, cardDirectoryOf(backend), "card", @intCast(u32, index))
+                var node = nodes[index]
+                const descriptor = openNode(backend, path_bytes, &node)
+                var found = false
+                var probe: kms.Output = undefined
+                if descriptor >= 0 {
+                    found = kms.probe(&probe, descriptor, allocator(backend))
+                    releaseNode(backend, node.major, node.minor)
+                } else {
+                    state.say("drm: ")
+                    sayPath(path_bytes)
+                    state.say(": cannot open\n")
+                }
+                const boot = isBootCard(@intCast(u32, index))
+                if descriptor >= 0 { sayCard("", path_bytes, &probe, found, boot) }
+                if found {
+                    const pixels = probe.width * probe.height
+                    if chosen == 8 || pixels > best_pixels || (pixels == best_pixels && boot && !best_boot) {
+                        chosen = index
+                        best_pixels = pixels
+                        best_boot = boot
+                    }
+                }
+            }
+            index += 1
+        }
+        if chosen == 8 { return false }
+    }
+    index = if chosen < 8 { chosen } else { 0 }
+    while index < 8 {
+        if cards[index] {
+            var path: [160]u8 = undefined
+            var path_bytes: [*]u8 = undefined
+            unsafe { path_bytes = @ptrCast([*]u8, &path) }
+            nodePath(path_bytes, cardDirectoryOf(backend), "card", @intCast(u32, index))
+            var node = nodes[index]
             const descriptor = openNode(backend, path_bytes, &node)
             if descriptor >= 0 {
                 if kms.open(outputOf(backend), descriptor, allocator(backend)) {
                     backend.*.cardMajor = node.major
                     backend.*.cardMinor = node.minor
-                    if backend.*.compositor.*.verbose {
-                        state.say("drm: ")
-                        sayPath(path_bytes)
-                        state.say(" ")
-                        state.sayNumber(outputOf(backend).*.width)
-                        state.say("x")
-                        state.sayNumber(outputOf(backend).*.height)
-                        state.say(" at ")
-                        state.sayNumber(@intCast(usize, outputOf(backend).*.refresh))
-                        state.say(" Hz\n")
-                    }
+                    sayCard("driving ", path_bytes, outputOf(backend), true, false)
                     return true
                 }
                 device.close(descriptor)
                 releaseNode(backend, node.major, node.minor)
             }
         }
-        number += 1
+        if chosen < 8 { return false }
+        index += 1
     }
     return false
 }

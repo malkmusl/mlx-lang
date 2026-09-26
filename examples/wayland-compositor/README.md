@@ -94,12 +94,19 @@ compositor is the display server itself:
   (`TakeDevice`), so no root is needed. Without logind (no system bus) the
   devices are opened directly, which needs the rights to them, and there is
   no VT switching.
-- **Monitor** ([`kms.mlx`](kms.mlx)): the first card (`/dev/dri/cardN`)
-  with a connected connector, at the monitor's preferred mode, on a CRTC
-  one of the connector's encoders can drive. Two XRGB8888 dumb buffers are
-  drawn into in turn and shown with page flips; the flip-complete events
-  pace the frame callbacks, so clients draw at the monitor's refresh
-  rate. On exit the CRTC gets back what it showed before.
+- **Monitor** ([`kms.mlx`](kms.mlx)): one card (`/dev/dri/cardN`) with a
+  connected connector, at the monitor's preferred mode, on a CRTC one of
+  the connector's encoders can drive. With several cards each is looked
+  at and logged (`drm: /dev/dri/card1: VGA-1 1024x768 at 60 Hz (the boot
+  card)`, `drm: /dev/dri/card2: DP-1 3840x1080 at 60 Hz`), and the one
+  with the largest monitor is driven (a server's BMC graphics, ASPEED for
+  one, reports a small VGA "monitor" and is often the boot card), then the
+  boot card, then the first; `MLX_DRM_CARD=/dev/dri/cardN` (or just `N`)
+  in the environment picks another. Only that card's monitor is driven;
+  the others stay dark. Two XRGB8888 dumb buffers are drawn into
+  in turn and shown with page flips; the flip-complete events pace the
+  frame callbacks, so clients draw at the monitor's refresh rate. On exit
+  the CRTC gets back what it showed before.
 - **Input** ([`evdev.mlx`](evdev.mlx)): every keyboard, mouse and touchpad
   under `/dev/input`, and those plugged in later (inotify). Mice move with
   a little acceleration and scroll 15 pixels a notch; touchpads move the

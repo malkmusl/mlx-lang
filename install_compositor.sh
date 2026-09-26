@@ -194,12 +194,32 @@ if command -v loginctl > /dev/null 2>&1; then
 fi
 cards=$(ls /dev/dri/card* 2> /dev/null || true)
 if [[ -n "$cards" ]]; then
-    ok "DRM cards: $(echo "$cards" | tr '\n' ' ')"
+    with_monitor=0
     for card in $cards; do
         name=$(basename "$card")
-        status=$(cat /sys/class/drm/"$name"-*/status 2> /dev/null | grep -c '^connected' || true)
-        [[ "$status" -gt 0 ]] && ok "$name has $status connected connector(s)"
+        driver=$(basename "$(readlink /sys/class/drm/"$name"/device/driver 2> /dev/null)" 2> /dev/null || true)
+        boot=""
+        [[ "$(cat /sys/class/drm/"$name"/device/boot_vga 2> /dev/null)" == 1 ]] && boot=", the boot card"
+        line="$card (${driver:-unknown driver}$boot):"
+        connected=0
+        for connector in /sys/class/drm/"$name"-*; do
+            [[ -d "$connector" ]] || continue
+            status=$(cat "$connector/status" 2> /dev/null || echo unknown)
+            if [[ "$status" == connected ]]; then
+                connected=$((connected + 1))
+                mode=$(head -n 1 "$connector/modes" 2> /dev/null || true)
+                line="$line ${connector#*/drm/$name-} $status${mode:+ ($mode)}"
+            fi
+        done
+        [[ $connected -eq 0 ]] && line="$line no connected connector"
+        ok "$line"
+        [[ $connected -gt 0 ]] && with_monitor=$((with_monitor + 1))
     done
+    if [[ $with_monitor -gt 1 ]]; then
+        note "monitors on more than one card: the compositor drives one card only, the one with the largest monitor (a BMC's VGA loses); MLX_DRM_CARD=/dev/dri/cardN in the session's environment picks another (see the log's drm: lines)"
+    elif [[ $with_monitor -eq 0 ]]; then
+        bad "no card has a connected connector"
+    fi
 else
     bad "no /dev/dri/card*: no DRM card to drive"
 fi
@@ -214,7 +234,7 @@ if [[ -n "$icds" ]]; then
 else
     note "no Vulkan driver manifests: the compositor composes on the CPU (mesa-vulkan-drivers provides RADV, ANV and NVK)"
 fi
-if ldconfig -p 2> /dev/null | grep -q libxkbcommon.so.0; then ok "libxkbcommon (the keymap)"; else bad "libxkbcommon.so.0 not found: keyboards will have no keymap"; fi
+if ldconfig -p 2> /dev/null | grep -q libxkbcommon.so.0 || ls /usr/lib/libxkbcommon.so.0 /usr/lib64/libxkbcommon.so.0 /usr/lib/*-linux-gnu*/libxkbcommon.so.0 /usr/local/lib/libxkbcommon.so.0 > /dev/null 2>&1; then ok "libxkbcommon (the keymap)"; else bad "libxkbcommon.so.0 not found: keyboards will have no keymap (install libxkbcommon)"; fi
 if [[ -f "$log_file" ]]; then
     note "last session log: $log_file ($(date -r "$log_file" '+%Y-%m-%d %H:%M')); show it with: $0 --log"
     if grep -q "first frame on screen" "$log_file"; then ok "the last session showed a frame"; fi
