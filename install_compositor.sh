@@ -134,7 +134,7 @@ if [[ -n "$found" ]]; then
     if [[ "$found" == "$bindir/mlx-compositor" ]]; then
         ok "mlx-compositor is on PATH ($found)"
     else
-        note "PATH finds another mlx-compositor first: $found (the session uses $bindir/mlx-compositor)"
+        note "PATH finds another mlx-compositor first: $found (the session uses $bindir/mlx-compositor); an earlier install: remove it with sudo rm $(dirname "$found")/mlx-{compositor,terminal,session}"
     fi
 else
     note "$bindir is not on this shell's PATH (the session does not need it: its entry uses absolute paths)"
@@ -234,13 +234,23 @@ if [[ -n "$icds" ]]; then
 else
     note "no Vulkan driver manifests: the compositor composes on the CPU (mesa-vulkan-drivers provides RADV, ANV and NVK)"
 fi
-if ldconfig -p 2> /dev/null | grep -q libxkbcommon.so.0 || ls /usr/lib/libxkbcommon.so.0 /usr/lib64/libxkbcommon.so.0 /usr/lib/*-linux-gnu*/libxkbcommon.so.0 /usr/local/lib/libxkbcommon.so.0 > /dev/null 2>&1; then ok "libxkbcommon (the keymap)"; else bad "libxkbcommon.so.0 not found: keyboards will have no keymap (install libxkbcommon)"; fi
+xkb_found=0
+ldconfig -p 2> /dev/null | grep -q libxkbcommon.so.0 && xkb_found=1
+for candidate in /usr/lib/libxkbcommon.so.0 /usr/lib64/libxkbcommon.so.0 /usr/lib/*-linux-gnu*/libxkbcommon.so.0 /usr/local/lib/libxkbcommon.so.0; do
+    [[ -e "$candidate" ]] && xkb_found=1
+done
+[[ -f "$log_file" ]] && grep -q "keyboard: xkb keymap from libxkbcommon" "$log_file" && xkb_found=1
+if [[ $xkb_found -eq 1 ]]; then ok "libxkbcommon (the keymap)"; else bad "libxkbcommon.so.0 not found: keyboards will have no keymap (install libxkbcommon)"; fi
 if [[ -f "$log_file" ]]; then
     note "last session log: $log_file ($(date -r "$log_file" '+%Y-%m-%d %H:%M')); show it with: $0 --log"
     if grep -q "first frame on screen" "$log_file"; then ok "the last session showed a frame"; fi
     if grep -q "modeset failed" "$log_file"; then bad "the last session could not set the mode: $(grep -m1 'modeset failed' "$log_file")"; fi
     if grep -q "crashed:" "$log_file"; then bad "the last session crashed: $(grep -m1 'crashed:' "$log_file")"; fi
-    if grep -q "killed by signal" "$log_file"; then bad "$(grep -m1 'killed by signal' "$log_file")"; fi
+    if grep -q "killed by signal 15 " "$log_file"; then
+        note "the last session was ended from outside (SIGTERM: the display manager on logout, or a VT switch that closed it)"
+    elif grep -q "killed by signal" "$log_file"; then
+        bad "$(grep -m1 'killed by signal' "$log_file")"
+    fi
 else
     note "no session log yet at $log_file (written when the session starts)"
 fi
