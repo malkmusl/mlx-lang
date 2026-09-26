@@ -72,10 +72,15 @@ if [[ $mode == log ]]; then
         echo "started by hand (mlx-compositor --backend drm) writes it only since the"
         echo "install that added this line. Reinstall with this script."
     fi
+    if command -v coredumpctl > /dev/null 2>&1 && coredumpctl list mlx-compositor > /dev/null 2>&1; then
+        echo
+        echo "== the last core dump of mlx-compositor (coredumpctl): the crashing thread comes first"
+        coredumpctl info --no-pager mlx-compositor 2> /dev/null | tail -n 60 | grep -v "^ *#[0-9]* .*libc.so\|pthread_cond_wait\|libvulkan_radeon\|Stack trace of thread\|^ *$" | head -n 40
+    fi
     if command -v journalctl > /dev/null 2>&1; then
         echo
         echo "== the display manager's journal lines about the session (this boot)"
-        journalctl -b --no-pager -q -g 'mlx-session|mlx-compositor|wayland-sessions|Mlx' 2> /dev/null | tail -n 40 || echo "(not readable: try with sudo, or add yourself to the systemd-journal group)"
+        journalctl -b --no-pager -q -g 'mlx-session|mlx-compositor|wayland-sessions|Mlx' 2> /dev/null | grep -v "Stack trace of thread\|#[0-9]* .*(libc.so\|libvulkan_radeon\|^ *$" | tail -n 40 || echo "(not readable: try with sudo, or add yourself to the systemd-journal group)"
     fi
     exit 0
 fi
