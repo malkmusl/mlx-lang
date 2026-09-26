@@ -385,7 +385,12 @@ with the commit the compositor was built from.
 When the compositor stops on its own it says why: for example
 `mlx-compositor: lost the session compositor: the server reported a
 protocol error (object 12, code 3): ...`, or that the Wayland socket is
-taken (`--socket NAME` picks another).
+taken (`--socket NAME` picks another). When it disconnects a client, the
+log (`--verbose`, and so the session's) says why: `client disconnected: it
+broke the protocol, buffer does not fit the pool (error 1 on request 0 of
+wl_shm_pool 7)`, `it stopped reading its events`, or `a file descriptor
+for it could not be duplicated`; a client that left on its own gets a
+plain `client disconnected`.
 
 ![The Vulkan client (examples/vulkan-wayland-client) in the Vulkan renderer](screenshots/vulkan-client.png)
 

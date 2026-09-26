@@ -439,6 +439,22 @@ pub fn main() -> !void {
 are the complete programs, with shared memory, xdg-shell configuration and
 frame callbacks.
 
+### Why a client was disconnected
+
+A server disconnects a client for a protocol error (one the runtime posts
+for a request it cannot dispatch, or one a handler posts with
+`postError`), a malformed message, events it stopped reading (its output
+buffer is full), a file descriptor that could not be duplicated for it,
+memory that ran out, or because the server asked (`Client.disconnect`);
+a client that leaves on its own is the plain case. The client-destroyed
+handler can tell them apart with `Client.failure()` (`server.FAIL_*`) and,
+for a protocol error, `failureCode()`, `failureText()` and the failing
+request's `failureObject()`, `failureInterface()` and `failureOpcode()`.
+`tests/245_wayland_server_errors_runtime.mlx` checks the reasons its four
+misbehaving clients are given; the compositor logs them (`client
+disconnected: it broke the protocol, invalid method (error 1 on request 9
+of wl_surface 12)`).
+
 ### Message storage
 
 The compiler keeps every value that is not a field of something else in an

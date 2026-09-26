@@ -87,7 +87,39 @@ pub const ClientState = struct {
     copies: [16384]u8 // DISPATCH_DEPTH * wire.MAX_MESSAGE_SIZE
     copyHandles: [112]isize // DISPATCH_DEPTH * wire.MAX_HANDLES
     dispatchDepth: usize
+    // The request being handled (its object, interface and opcode), and
+    // why the client is being disconnected (FAIL_*; the first reason
+    // stays): the request that failed, and for FAIL_PROTOCOL the error's
+    // code and text.
+    requestObject: u32
+    requestOpcode: u16
+    requestInterface: Interface
+    failure: u8
+    failureObject: u32
+    failureOpcode: u16
+    failureInterface: Interface
+    failureCode: u32
+    failureText: [96]u8
+    failureTextLength: usize
 }
+
+// Why a client is being disconnected (Client.failure).
+pub const FAIL_NONE: u8 = 0
+// It closed its connection, or the socket failed.
+pub const FAIL_HANGUP: u8 = 1
+// A protocol error was posted to it (by the runtime for a request it
+// could not dispatch, or by a handler through postError).
+pub const FAIL_PROTOCOL: u8 = 2
+// It sent a message with an impossible header.
+pub const FAIL_MALFORMED: u8 = 3
+// It stopped reading: its events did not fit the output buffer.
+pub const FAIL_OUTPUT_FULL: u8 = 4
+// A file descriptor for an event to it could not be duplicated.
+pub const FAIL_HANDLE: u8 = 5
+// Memory for its objects or its connection ran out.
+pub const FAIL_MEMORY: u8 = 6
+// The server disconnected it (Client.disconnect, or the display ended).
+pub const FAIL_DISCONNECTED: u8 = 7
 
 // Nesting levels of dispatch that reuse fixed request storage; deeper
 // levels fall back to fresh storage.
@@ -99,7 +131,20 @@ pub const Client = struct {
 
     pub fn isAlive(self: Self) -> bool { return !self.state.*.dead }
     // Flushes and disconnects the client at the end of the current dispatch.
-    pub fn disconnect(self: Self) -> void { self.state.*.dead = true }
+    pub fn disconnect(self: Self) -> void { fail(self.state, FAIL_DISCONNECTED) }
+    // Why the client is being disconnected (FAIL_*), the request that
+    // failed (object id, interface, opcode) and, for FAIL_PROTOCOL, the
+    // error's code and text. Meaningful in the client-destroyed handler.
+    pub fn failure(self: Self) -> u8 { return self.state.*.failure }
+    pub fn failureObject(self: Self) -> u32 { return self.state.*.failureObject }
+    pub fn failureOpcode(self: Self) -> u16 { return self.state.*.failureOpcode }
+    pub fn failureInterface(self: Self) -> Interface { return self.state.*.failureInterface }
+    pub fn failureCode(self: Self) -> u32 { return self.state.*.failureCode }
+    pub fn failureText(self: Self) -> []const u8 {
+        var bytes: [*]const u8 = undefined
+        unsafe { bytes = @ptrCast([*]const u8, &self.state.*.failureText) }
+        return bytes[0..self.state.*.failureTextLength]
+    }
     pub fn flush(self: Self) -> void { const ignored = transport.flush(self.state.*.connection) }
     pub fn descriptor(self: Self) -> isize { return self.state.*.connection.*.descriptor }
 }
@@ -342,7 +387,7 @@ fn register(client: *ClientState, id: u32, interface: Interface, version: u32) -
     const server_range = id >= wire.SERVER_ID_START
     const index = if server_range { @intCast(usize, id - wire.SERVER_ID_START) } else { @intCast(usize, id) }
     if !grow(client, server_range, index + 1) {
-        client.*.dead = true
+        fail(client, FAIL_MEMORY)
         return false
     }
     const entry = lookup(client, id).?
@@ -405,7 +450,7 @@ fn sendDisplayEvent(client: *ClientState, opcode: u16, object_id: u32, code: u32
         wire.putUint(message, object_id)
     }
     if !wire.finish(message) { return }
-    if transport.queue(client.*.connection, message) != 0 { client.*.dead = true }
+    if transport.queue(client.*.connection, message) != 0 { fail(client, FAIL_OUTPUT_FULL) }
 }
 
 // Destroys a resource: runs its destroy handler, releases the id and, for a
@@ -439,6 +484,27 @@ pub fn postError(object: Object, code: u32, message: []const u8) -> void {
 
 fn postErrorRaw(client: *ClientState, object_id: u32, code: u32, text: [*]const u8, text_length: usize) -> void {
     sendDisplayEvent(client, 0, object_id, code, text, text_length)
+    if client.*.failure == FAIL_NONE {
+        client.*.failureCode = code
+        var length: usize = 0
+        while length < text_length && length < 96 {
+            client.*.failureText[length] = text[length]
+            length += 1
+        }
+        client.*.failureTextLength = length
+    }
+    fail(client, FAIL_PROTOCOL)
+}
+
+// Disconnects the client at the end of the current dispatch, recording why
+// (the first reason stays) and the request being handled.
+fn fail(client: *ClientState, kind: u8) -> void {
+    if client.*.failure == FAIL_NONE {
+        client.*.failure = kind
+        client.*.failureObject = client.*.requestObject
+        client.*.failureOpcode = client.*.requestOpcode
+        client.*.failureInterface = client.*.requestInterface
+    }
     client.*.dead = true
 }
 
@@ -488,7 +554,7 @@ pub fn putObject(owner: Object, message: *wire.Writer, object: Object) -> void {
 pub fn putHandle(owner: Object, message: *wire.Writer, handle: Handle) -> void {
     const copy = handle.duplicate()
     if !copy.isValid() {
-        owner.client.state.*.dead = true
+        fail(owner.client.state, FAIL_HANDLE)
         return
     }
     wire.putHandle(message, copy.descriptor)
@@ -511,7 +577,7 @@ pub fn endEvent(object: Object, message: *wire.Writer, destructor: bool) -> void
     if transport.queue(client.*.connection, message) != 0 {
         // The client stopped reading and its buffer is full.
         closeWriterHandles(message)
-        client.*.dead = true
+        fail(client, FAIL_OUTPUT_FULL)
         return
     }
     if destructor { destroyObject(object) }
@@ -550,6 +616,15 @@ fn createClient(state: *State, descriptor: isize) -> ?*ClientState {
     client.*.display = state
     client.*.dead = false
     client.*.dispatchDepth = 0
+    client.*.requestObject = 0
+    client.*.requestOpcode = 0
+    client.*.requestInterface = Interface.wl_display
+    client.*.failure = FAIL_NONE
+    client.*.failureObject = 0
+    client.*.failureOpcode = 0
+    client.*.failureInterface = Interface.wl_display
+    client.*.failureCode = 0
+    client.*.failureTextLength = 0
     var objects: Vector = undefined
     Vector.initAt(&objects, allocator, @sizeOf(ResourceEntry), @alignOf(ResourceEntry), 64)
     var server_objects: Vector = undefined
@@ -566,7 +641,7 @@ fn createClient(state: *State, descriptor: isize) -> ?*ClientState {
         if !Vector.appendAt(&clients, @ptrCast([*]const u8, &address)) { return null }
     }
     state.*.clients = clients
-    if !transport.watch(state.*.eventLoop, descriptor, address, false) { client.*.dead = true }
+    if !transport.watch(state.*.eventLoop, descriptor, address, false) { fail(client, FAIL_MEMORY) }
     const record = callbacksOf(state.*.callbacks)
     if record.*.hasCreated { record.*.created(record.*.createdContext, Client.{ .state = client }) }
     return client
@@ -634,7 +709,7 @@ fn flushAll(state: *State) -> void {
     while index < state.*.clients.length {
         const client = clientAt(state, index)
         const flushed = transport.flush(client.*.connection)
-        if flushed < 0 && flushed != transport.EAGAIN { client.*.dead = true }
+        if flushed < 0 && flushed != transport.EAGAIN { fail(client, FAIL_HANGUP) }
         index += 1
     }
 }
@@ -650,7 +725,7 @@ fn sendGlobal(client: *ClientState, registry: u32, global: *const GlobalEntry) -
     wire.putStringSlice(message, interfaces.interfaceName(global.*.interface))
     wire.putUint(message, global.*.version)
     if !wire.finish(message) { return }
-    if transport.queue(client.*.connection, message) != 0 { client.*.dead = true }
+    if transport.queue(client.*.connection, message) != 0 { fail(client, FAIL_OUTPUT_FULL) }
 }
 
 fn sendGlobalRemove(client: *ClientState, registry: u32, name: u32) -> void {
@@ -659,7 +734,7 @@ fn sendGlobalRemove(client: *ClientState, registry: u32, name: u32) -> void {
     wire.begin(message, registry, 1)
     wire.putUint(message, name)
     if !wire.finish(message) { return }
-    if transport.queue(client.*.connection, message) != 0 { client.*.dead = true }
+    if transport.queue(client.*.connection, message) != 0 { fail(client, FAIL_OUTPUT_FULL) }
 }
 
 fn forEachRegistry(state: *State, global_index: usize, removal: bool) -> void {
@@ -852,12 +927,15 @@ fn dispatchOne(state: *State, client: *ClientState) -> isize {
     const bytes = transport.inputPointer(connection)
     const size = wire.headerSize(bytes)
     if size < wire.HEADER_SIZE || size > wire.MAX_MESSAGE_SIZE || (size & 3) != 0 {
-        client.*.dead = true
+        fail(client, FAIL_MALFORMED)
         return -1
     }
     if available < size { return 0 }
     const id = wire.headerObject(bytes)
     const opcode = wire.headerOpcode(bytes)
+    client.*.requestObject = id
+    client.*.requestOpcode = opcode
+    client.*.requestInterface = Interface.wl_display
     const found = lookup(client, id)
     if found == null || found.?.*.status != STATUS_LIVE {
         unsafe { postErrorRaw(client, DISPLAY_ID, ERROR_INVALID_OBJECT, @ptrCast([*]const u8, "invalid object"), 14) }
@@ -865,6 +943,7 @@ fn dispatchOne(state: *State, client: *ClientState) -> isize {
     }
     const interface = found.?.*.interface
     const version = found.?.*.version
+    client.*.requestInterface = interface
     if opcode >= interfaces.requestCount(interface) {
         unsafe { postErrorRaw(client, id, ERROR_INVALID_METHOD, @ptrCast([*]const u8, "invalid method"), 14) }
         return -1
@@ -969,7 +1048,7 @@ fn serviceClient(state: *State, client: *ClientState) -> void {
         const received = transport.receive(client.*.connection)
         if received == transport.EAGAIN { return }
         if received <= 0 {
-            client.*.dead = true
+            fail(client, FAIL_HANGUP)
             return
         }
         while !client.*.dead {
@@ -1089,7 +1168,7 @@ fn addSocketState(state: *State, name: []const u8) -> Error!void {
 fn releaseDisplay(state: *State) -> void {
     var index: usize = 0
     while index < state.*.clients.length {
-        clientAt(state, index).*.dead = true
+        fail(clientAt(state, index), FAIL_DISCONNECTED)
         index += 1
     }
     reapClients(state)
