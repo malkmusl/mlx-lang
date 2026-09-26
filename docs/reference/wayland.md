@@ -458,7 +458,7 @@ Two programs use both halves of `std.wayland` with real input:
   Its `wl_data_device_manager` carries the clipboard between clients (GTK 4
   applications such as Nautilus need it to use the display). With
   `--fullscreen` it takes the host monitor's resolution, which is how
-  `tools/install_compositor_session.sh` installs it as a GDM/SDDM session
+  `install_compositor.sh` installs it as a GDM/SDDM session
   (inside cage or weston's kiosk shell). It waits on
   both connections with `wl.transport.waitAny`.
 - [`examples/wayland-terminal`](../../examples/wayland-terminal/README.md)

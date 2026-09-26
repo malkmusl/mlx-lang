@@ -157,13 +157,26 @@ buffer, after which the renderer must copy.
 
 ## Desktop session (GDM, SDDM)
 
-`tools/install_compositor_session.sh` builds the compositor and the
-terminal and installs them as a session that GDM and SDDM offer at login:
+`install_compositor.sh` at the repository root builds the compositor and
+the terminal, installs them into `/usr/bin` as a session that GDM and SDDM
+offer at login, and then checks the installation and the machine:
 
 ```sh
-tools/install_compositor_session.sh             # asks for sudo to install
-tools/install_compositor_session.sh --uninstall
+./install_compositor.sh                # build, install (asks for sudo), check
+./install_compositor.sh --check        # check an installation and the machine
+./install_compositor.sh --log          # the last session log
+./install_compositor.sh --uninstall
 ```
+
+The checks cover the three programs and the session entry (whose `Exec`
+and `TryExec` must resolve, or the login screen hides the session), the
+display manager, the system bus for logind, the DRM cards and their
+connected connectors, the `video` and `input` groups (needed only without
+logind), the Vulkan drivers, libxkbcommon, and the last session log,
+whose `modeset failed`, `crashed:` or `killed by signal` lines it points
+out. It wraps `tools/install_compositor_session.sh`, which does the
+building and copying (`--prefix`, default `/usr/local` there; `--destdir`
+stages for packaging; `--build-only` builds into `mlx-out/session`):
 
 It puts `mlx-compositor`, `mlx-terminal` and `mlx-session` into
 `/usr/local/bin` (`--prefix`) and `mlx-compositor.desktop` into
@@ -289,8 +302,10 @@ takes this path on any driver.
 
 `--renderer auto` (the default) falls back to the CPU renderer when no
 driver works (`mlx-compositor: no usable Vulkan driver; composing on the
-CPU`), and so does a running compositor whose driver fails to compose a
-frame (`Vulkan could not compose a frame; composing on the CPU from now
+CPU`). With several drivers installed it takes the first whose device is
+a GPU, and a CPU device (lavapipe, whose manifest sorts before RADV's)
+only when no GPU works; `--verbose` notes the ones passed over. So does a
+running compositor whose driver fails to compose a frame (`Vulkan could not compose a frame; composing on the CPU from now
 on`): the buffers its windows show are copied and the CPU carries on.
 `--renderer cpu` never opens a driver.
 
