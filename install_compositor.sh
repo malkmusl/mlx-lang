@@ -85,12 +85,26 @@ if [[ $mode == uninstall ]]; then
 fi
 
 if [[ $mode == install ]]; then
+    # System directories need root: sudo, unless we are root already.
+    if [[ $(id -u) -ne 0 ]] && { [[ ! -w "$bindir" && ! -w "$(dirname "$bindir")" ]] || [[ ! -w "$sessions" && ! -w "$(dirname "$sessions")" ]]; }; then
+        if command -v sudo > /dev/null 2>&1; then
+            echo "== Installing into $bindir and $sessions needs root: sudo will ask for your password"
+            sudo -v || { echo "install_compositor.sh: sudo failed; run the script as root instead (su -c ./install_compositor.sh)" >&2; exit 1; }
+        else
+            echo "install_compositor.sh: $bindir is not writable and sudo is not installed; run the script as root" >&2
+            exit 1
+        fi
+    fi
     compiler_args=()
     [[ -n "$compiler" ]] && compiler_args=(--compiler "$compiler")
+    echo "== Building and installing"
     if ! tools/install_compositor_session.sh --prefix "$prefix" --sessions "$sessions" "${compiler_args[@]}"; then
         echo "install_compositor.sh: the build or the installation failed (above)" >&2
         exit 1
     fi
+    echo
+    echo "== Installed files"
+    ls -l "$bindir"/mlx-compositor "$bindir"/mlx-terminal "$bindir"/mlx-session "$sessions"/mlx-compositor.desktop 2>&1
     echo
 fi
 
