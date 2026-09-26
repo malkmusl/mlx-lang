@@ -192,8 +192,11 @@ with the system's keyboard layout (`localectl`, `/etc/default/keyboard` or
 `/etc/vconsole.conf`; `XKB_DEFAULT_LAYOUT` wins), composed by the GPU when
 a Vulkan driver works, else on the CPU (the log says which). Alt+Enter
 opens a terminal, Ctrl+Alt+F1..F12 switch VTs, Alt+Shift+Q ends the
-session. `MLX_COMPOSITOR_ARGS` adds options (`--renderer cpu` to stay on
-the CPU).
+session. `MLX_SESSION_RENDERER` picks the renderer: `auto` (the default:
+Vulkan when a driver works, else the CPU), `vulkan` (Vulkan or nothing)
+or `cpu`; `MLX_COMPOSITOR_ARGS` adds other options. (`--backend drm` in
+the log is the other, independent choice: the compositor drives the
+monitor itself, which is what makes it a session of its own.)
 
 The session log is `~/.config/mlx/compositor.log` (`MLX_SESSION_LOG`
 names another file; the previous run's log is kept as
