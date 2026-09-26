@@ -323,10 +323,12 @@ if command -v gtk4-widget-factory > /dev/null && command -v dbus-run-session > /
 #!/bin/sh
 unset DISPLAY
 # No portals: they would mount the document portal under XDG_RUNTIME_DIR.
-GDK_DEBUG=no-portals exec dbus-run-session gtk4-widget-factory
+# No accessibility bus either: both can take seconds to start (or time out)
+# where the desktop's services are installed but not running.
+GDK_DEBUG=no-portals GTK_A11Y=none NO_AT_BRIDGE=1 exec dbus-run-session gtk4-widget-factory
 SCRIPT
     chmod +x "$work/gtk4.sh"
-    printf 'wait 6000\nclose\n' > "$work/gtk4.script"
+    printf 'wait 12000\nclose\n' > "$work/gtk4.script"
     run_scenario gtk4 "$work/gtk4.script" --run "$work/gtk4.sh"
     grep -q "^map: GTK Widget Factory" "$work/gtk4-compositor.log" || { echo "the GTK 4 window did not appear" >&2; cat "$work/gtk4-compositor.log" >&2; exit 1; }
     echo "ok   a GTK 4 application (gtk4-widget-factory) opened its window"

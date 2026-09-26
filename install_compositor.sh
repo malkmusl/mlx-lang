@@ -134,6 +134,18 @@ if [[ -x "$bindir/mlx-compositor" ]]; then
         ok "mlx-compositor runs (it rejects an unknown option)"
     fi
 fi
+modules=${MLX_COMPOSITOR_MODULES:-$HOME/.local/lib/mlx-compositor}
+for module in libmlx-shell.so libmlx-render.so; do
+    if [[ -f "$modules/$module" ]]; then
+        if [[ "$(od -An -tx1 -j16 -N2 "$modules/$module" | tr -d ' ')" == "0300" ]]; then
+            ok "$modules/$module (loaded by the session, again when rebuilt; $(date -r "$modules/$module" '+%F %T'))"
+        else
+            bad "$modules/$module is not a shared object; rebuild it: tools/build_compositor_modules.sh"
+        fi
+    else
+        note "no $modules/$module: the compositor runs its built-in copy (tools/build_compositor_modules.sh builds it)"
+    fi
+done
 found=$(command -v mlx-compositor 2> /dev/null || true)
 if [[ -n "$found" ]]; then
     if [[ "$found" == "$bindir/mlx-compositor" ]]; then

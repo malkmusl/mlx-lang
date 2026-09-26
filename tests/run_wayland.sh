@@ -75,6 +75,23 @@ for example in examples/wayland-client/main.mlx examples/wayland-server/main.mlx
     fi
 done
 
+# The compositor's shell and renderer as shared objects (loaded again while
+# it runs), and the shell's handler tables.
+for module in shell render; do
+    if "$compiler" --quiet --shared "examples/wayland-compositor/${module}_module.mlx" -o "$work/libmlx-$module.so"; then
+        echo "ok   examples/wayland-compositor/${module}_module.mlx (builds with --shared)"
+    else
+        echo "FAIL (compile) examples/wayland-compositor/${module}_module.mlx"
+        failures=$((failures + 1))
+    fi
+done
+if python3 tools/check_compositor_modules.py > /dev/null; then
+    echo "ok   the compositor shell's handler tables are complete"
+else
+    python3 tools/check_compositor_modules.py || true
+    failures=$((failures + 1))
+fi
+
 if std/protocols/wayland/materialize.sh --check "$compiler" > /dev/null 2>&1; then
     echo "ok   std/src/wayland/generated is current"
 else

@@ -620,7 +620,7 @@ class Harness:
             "MLX_ARENA_POISON": os.environ.get("MLX_ARENA_POISON", "1"),
         }
         # The Vulkan driver (lavapipe) the caller chose.
-        for name in ("VK_DRIVER_FILES", "VK_ICD_FILENAMES", "VK_ADD_DRIVER_FILES", "MLX_VULKAN_NO_HOST_IMPORT", "MLX_VULKAN_TEST_FAIL", "MLX_ARENA_RELEASE"):
+        for name in ("VK_DRIVER_FILES", "VK_ICD_FILENAMES", "VK_ADD_DRIVER_FILES", "MLX_VULKAN_NO_HOST_IMPORT", "MLX_VULKAN_TEST_FAIL", "MLX_ARENA_RELEASE", "MLX_COMPOSITOR_MODULES"):
             if name in os.environ:
                 environment[name] = os.environ[name]
         self.log = open(self.log_path, "w")
@@ -765,6 +765,10 @@ def main():
                 print("ok   Vulkan renders into the dumb buffers (both exported as dma-bufs)")
 
         # The terminal maps; the keyboard types into it.
+        if os.environ.get("MLX_COMPOSITOR_MODULES"):
+            # Run with the shell and renderer as shared objects.
+            harness.wait_log("libmlx-shell.so (version 1", 5, "the shell module loaded")
+            harness.wait_log("libmlx-render.so (version 1)", 5, "the render module loaded")
         harness.wait_log("map: Mlx Terminal", 10, "the terminal")
         time.sleep(0.3)
         keyboard = harness.devices[(INPUT_MAJOR, 64)]

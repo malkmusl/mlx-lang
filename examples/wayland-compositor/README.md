@@ -345,6 +345,53 @@ running compositor whose driver fails to compose a frame (`Vulkan could not comp
 on`): the buffers its windows show are copied and the CPU carries on.
 `--renderer cpu` never opens a driver.
 
+## Changing it while it runs
+
+The shell (the Wayland protocol and window management: `shell.mlx`,
+`data.mlx`, `dmabuf.mlx`, with `scene.mlx`'s bookkeeping) and the renderer
+(`scene.mlx`'s drawing and `vulkan.mlx`) can be built as shared objects,
+`libmlx-shell.so` and `libmlx-render.so`, which the compositor loads at
+start-up and loads again whenever they change, without a restart:
+
+```sh
+tools/build_compositor_modules.sh          # both, into ~/.local/lib/mlx-compositor
+tools/build_compositor_modules.sh shell    # one
+tools/build_compositor_modules.sh --watch  # again on every saved change
+```
+
+The desktop session watches `~/.local/lib/mlx-compositor`
+(`MLX_COMPOSITOR_MODULES` names another directory; `install_compositor.sh`
+builds both there); a compositor started by hand takes `--modules DIR`.
+Without the files it runs its built-in copies. The log says what happened:
+
+```
+modules: loaded /home/you/.local/lib/mlx-compositor/libmlx-shell.so (version 2, 214 handler uses moved over)
+```
+
+What lives across a reload stays: clients, windows, surfaces, buffers, the
+GPU state. The program keeps the event loop, the monitor, the input
+devices and the session, and calls the shell and the renderer through a
+table (`entries.mlx`) that a load replaces. Every handler the shell
+registered with the Wayland server is replaced by the new build's function
+of the same name (each of `shell.mlx`, `data.mlx` and `dmabuf.mlx` lists
+its handlers at its end; `tools/check_compositor_modules.py` checks the
+lists are complete), and a new renderer fills its fixed pixels (background,
+frame colours, cursors) again. A build whose shared records differ (a field
+added to `state.mlx`, or to a record the renderer keeps) is refused, since
+the running data has the old layout: that needs a restart (`LAYOUT_VERSION`
+in `state.mlx` marks changes sizes do not show). A build that does not
+compile leaves the running version alone. Old versions stay loaded, so
+nothing that still points into one breaks.
+
+The shared objects come from `mlx4 --shared` (see
+[Formats](../../docs/reference/formats.md#shared-objects)); they run on the
+compositor's value arena, which is released every turn of the event loop
+as before. `tools/check_compositor_modules.sh [compiler] [cpu|vulkan]` runs
+the compositor with modules and, while a terminal is open, replaces both
+with builds of changed sources (a red background, new window placement):
+both must load, the terminal must keep taking keys, the changes must show,
+and a shell built for a changed record must be refused.
+
 ## Memory
 
 This compiler keeps every value that is not a field of something else
@@ -438,6 +485,10 @@ once.
   the server and the devices).
 - `arena.mlx`: releases what each turn of the event loop allocated (see
   Memory).
+- `modules.mlx`, `entries.mlx`: loading the shell and the renderer as
+  shared objects and calling them (see Changing it while it runs), with
+  their tables `shell_table.mlx` and `render_table.mlx` and the shared
+  objects' roots `shell_module.mlx` and `render_module.mlx`.
 - `host.mlx`: the nested backend, a window on the session compositor
   (fullscreen at the monitor's resolution with `--fullscreen`) and its seat
   input.

@@ -439,6 +439,20 @@ pub fn main() -> !void {
 are the complete programs, with shared memory, xdg-shell configuration and
 frame callbacks.
 
+### Replacing handlers
+
+`Display.replaceHandler(old, new)` makes every handler at address `old` —
+a resource's request or destroy handler, a global's bind handler, the
+client-created or client-destroyed handler — the function at `new` (of the
+same type), keeping each one's context, and returns how many it replaced.
+It is for code loaded again while the server runs: the compositor's shell
+is a shared object that registers the handlers, and after a new build is
+loaded every resource carries on in the new code
+(`examples/wayland-compositor/modules.mlx`).
+`tests/244_wayland_client_server_runtime.mlx` replaces the compositor
+global's bind handler before its clients bind and checks the replacement
+ran for both.
+
 ### Why a client was disconnected
 
 A server disconnects a client for a protocol error (one the runtime posts
@@ -535,6 +549,14 @@ weston. `tests/268_compositor_damage_runtime.mlx` (run by
 raised, resized and redrawn, focus, the cursor, a popup) against the
 compositor's damage tracking: frames composed only in what each output
 buffer lacks must equal frames composed from scratch.
+
+The shell and the renderer can run as shared objects that the compositor
+loads again whenever they are rebuilt, while its clients stay connected
+(`examples/wayland-compositor/modules.mlx`, built with `mlx4 --shared`):
+every handler the shell registered is moved to the new build with
+`Display.replaceHandler`. `tools/check_compositor_modules.sh` replaces both
+while a terminal is open and checks that the terminal keeps working and
+the changes show.
 
 The compositor runs for days within the compiler's value arena (see
 [Message storage](#message-storage)): its event loop is a fixed point, so

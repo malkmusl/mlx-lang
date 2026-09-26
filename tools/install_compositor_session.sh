@@ -12,6 +12,9 @@
 # Installs:
 #   PREFIX/bin/mlx-compositor, PREFIX/bin/mlx-terminal, PREFIX/bin/mlx-session
 #   SESSIONS/mlx-compositor.desktop   (read by GDM and SDDM)
+#   ~/.local/lib/mlx-compositor/libmlx-shell.so, libmlx-render.so (for the
+#   user running this; the session loads them, and loads them again when
+#   tools/build_compositor_modules.sh rebuilds them)
 #
 # Usage: tools/install_compositor_session.sh [options]
 #   --prefix DIR      programs go to DIR/bin (default /usr/local)
@@ -75,32 +78,9 @@ if [[ $uninstall -eq 1 ]]; then
     exit 0
 fi
 
-# The compiler: the canonical one (mlx-out/bin/compiler/mlx4, the
-# self-hosted compiler's fixed point, which builds the same binary from the
-# same sources on every machine, so a crash address from one machine finds
-# its place on another). When only the bootstrap-built mlx1 is there, it
-# builds the chain mlx1 -> mlx2 -> mlx3 and keeps mlx3 as mlx4.
-if [[ -z "$compiler" ]]; then
-    if [[ -x mlx-out/bin/compiler/mlx4 ]]; then
-        compiler=mlx-out/bin/compiler/mlx4
-    else
-        if [[ ! -x zig-out/bin/mlx1 ]]; then
-            if command -v zig > /dev/null; then
-                echo "building the Mlx compiler (zig build mlx1)"
-                zig build mlx1
-            else
-                echo "install_compositor_session.sh: no Mlx compiler; build one (zig build mlx1) or pass --compiler" >&2
-                exit 1
-            fi
-        fi
-        echo "building the canonical compiler (mlx1 -> mlx2 -> mlx3, kept as mlx-out/bin/compiler/mlx4)"
-        mkdir -p mlx-out/bin/compiler
-        zig-out/bin/mlx1 --quiet compiler/selfhost/main.mlx -o mlx-out/bin/compiler/mlx2
-        mlx-out/bin/compiler/mlx2 --quiet compiler/selfhost/main.mlx -o mlx-out/bin/compiler/mlx3
-        cp mlx-out/bin/compiler/mlx3 mlx-out/bin/compiler/mlx4
-        compiler=mlx-out/bin/compiler/mlx4
-    fi
-fi
+# The compiler: the canonical one (tools/ensure_compiler.sh builds or
+# updates mlx-out/bin/compiler/mlx4 when needed).
+[[ -n "$compiler" ]] || compiler=$(tools/ensure_compiler.sh)
 
 # Build.
 build=mlx-out/session
@@ -119,6 +99,11 @@ as_owner "$destdir$sessions" install -d "$destdir$sessions"
 as_owner "$destdir$sessions" install -m 644 "$build/mlx-compositor.desktop" "$destdir$sessions/"
 for program in "${programs[@]}"; do echo "installed $destdir$bindir/$program"; done
 echo "installed $destdir$sessions/mlx-compositor.desktop"
+# The shell and renderer modules, for the user running this (not when
+# staging a package).
+if [[ -z "$destdir" ]]; then
+    tools/build_compositor_modules.sh --compiler "$compiler"
+fi
 
 if [[ -z "$destdir" ]]; then
     echo
@@ -127,4 +112,6 @@ if [[ -z "$destdir" ]]; then
     echo "terminal, Ctrl+Alt+F1..F12 switch VTs, Alt+Shift+Q ends the session."
     echo "Its log is"
     echo "${XDG_CONFIG_HOME:-$HOME/.config}/mlx/compositor.log."
+    echo "tools/build_compositor_modules.sh [--watch] rebuilds the shell and the"
+    echo "renderer; a running session loads them within a second."
 fi

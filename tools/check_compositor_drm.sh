@@ -15,6 +15,8 @@
 # (MLX_VULKAN_NO_HOST_IMPORT=1, as on drivers that cannot import them); and
 # switching to copying after a first frame that never reached the buffer
 # (MLX_VULKAN_TEST_FAIL=1, as on a driver whose import does not show).
+# The scenario runs once more with the shell and the renderer loaded as
+# shared objects (MLX_COMPOSITOR_MODULES; examples/wayland-compositor/modules.mlx).
 #
 # Usage: tools/check_compositor_drm.sh [compiler] [cpu|vulkan] [--screenshot PNG]
 set -euo pipefail
@@ -53,6 +55,10 @@ trap 'rm -rf -- "$work"' EXIT
 "$compiler" --quiet examples/wayland-compositor/main.mlx -o "$work/mlx-compositor"
 "$compiler" --quiet examples/wayland-terminal/main.mlx -o "$work/mlx-terminal"
 "$python" tools/fake_drm_session.py "$work/mlx-compositor" "$work/mlx-terminal" --renderer "$renderer" "${screenshot[@]}"
+echo "--- with the shell and the renderer as shared objects (--modules)"
+"$compiler" --quiet --shared examples/wayland-compositor/shell_module.mlx -o "$work/libmlx-shell.so"
+"$compiler" --quiet --shared examples/wayland-compositor/render_module.mlx -o "$work/libmlx-render.so"
+MLX_COMPOSITOR_MODULES="$work" "$python" tools/fake_drm_session.py "$work/mlx-compositor" "$work/mlx-terminal" --renderer "$renderer"
 if [[ $renderer == vulkan ]]; then
     echo "--- with the output copied into the dumb buffers"
     MLX_VULKAN_NO_HOST_IMPORT=1 "$python" tools/fake_drm_session.py "$work/mlx-compositor" "$work/mlx-terminal" --renderer vulkan
