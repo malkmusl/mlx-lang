@@ -22,7 +22,9 @@
 #     from the menu;
 #   - opens the launcher, drags the other app onto the dock (it is
 #     pinned: drag and drop through the compositor) and unpins it from the
-#     launcher's right-click menu.
+#     launcher's right-click menu;
+#   - clicks the Downloads folder (its newest files show) and empties the
+#     trash from its menu.
 # The window behind the launcher must show blurred through it, and the
 # screenshots must be the same with the CPU and the Vulkan renderer, and
 # with the apps drawing on the GPU (their standard) and on the CPU
@@ -76,10 +78,15 @@ Name=Other App
 Exec=$work/mark.sh other
 ENTRY
 cp tests/support/png/rgba8.png "$work/data/icons/hicolor/64x64/apps/org.mlx.Marker.png"
+mkdir -p "$work/home/Downloads"
+echo old > "$work/home/Downloads/report.pdf"
+touch -d '2020-01-01' "$work/home/Downloads/report.pdf"
+echo new > "$work/home/Downloads/photo.png"
 printf 'terminal\norg.mlx.Marker\n' > "$work/config/mlx/dock"
 
-# The dock at 1024x768: the apps button, the terminal, the test app, with
-# resting centres at x 454, 512 and 570.
+# The dock at 1024x768: the apps button, the terminal, the test app, then
+# the Downloads folder and the trash, with resting centres at x 387, 445,
+# 503, 577 and 635.
 cat > "$work/desktop.script" <<SCRIPT
 wait 3000
 shot SHOTS/rest.ppm
@@ -91,7 +98,7 @@ type marker
 wait 500
 enter
 wait 1500
-pointer 512 730
+pointer 445 730
 wait 300
 press 272
 release 272
@@ -102,12 +109,12 @@ wait 300
 press 272
 release 272
 wait 500
-pointer 570 730
+pointer 503 730
 wait 300
 press 272
 release 272
 wait 1000
-pointer 454 730
+pointer 387 730
 wait 300
 press 272
 release 272
@@ -115,13 +122,13 @@ wait 2000
 down 1
 up 1
 wait 800
-pointer 570 730
+pointer 503 730
 wait 300
 press 273
 release 273
 wait 1500
 shot SHOTS/menu.ppm
-pointer 560 630
+pointer 493 630
 wait 300
 press 272
 release 272
@@ -139,9 +146,9 @@ pointer 400 400
 wait 100
 pointer 500 600
 wait 100
-pointer 600 725
+pointer 530 725
 wait 500
-pointer 604 728
+pointer 534 728
 wait 1500
 release 272
 wait 2500
@@ -158,6 +165,27 @@ wait 2500
 down 1
 up 1
 wait 800
+pointer 577 730
+wait 300
+press 272
+release 272
+wait 1500
+shot SHOTS/stack.ppm
+pointer 800 300
+wait 300
+press 272
+release 272
+wait 800
+pointer 635 730
+wait 300
+press 273
+release 273
+wait 1500
+pointer 635 671
+wait 300
+press 272
+release 272
+wait 1500
 leave
 wait 300
 close
@@ -174,6 +202,8 @@ run() {
     runtime=$(mktemp -d)
     mkdir -p "$work/$name"
     rm -f "$work/marks"
+    mkdir -p "$work/data/Trash/files" "$work/data/Trash/info"
+    echo thrown > "$work/data/Trash/files/old.txt"
     sed "s|SHOTS|$work/$name|" "$work/desktop.script" > "$work/$name.script"
     XDG_RUNTIME_DIR=$runtime "$work/test-host" host-desktop "$work/us.xkb" "$work/$name.script" > "$work/$name-host.log" 2>&1 &
     local host_pid=$!
@@ -189,7 +219,7 @@ run() {
     [[ $status -eq 0 ]] || fail "$renderer: the compositor exited with status $status" "$work/$name.log"
     local log="$work/$name.log"
 
-    grep -q "^layer: mlx-dock 300x150 at 362,618 in layer 2" "$log" || fail "$renderer: the dock is not along the bottom in the top layer" "$log"
+    grep -q "^layer: mlx-dock 433x150 at 295,618 in layer 2" "$log" || fail "$renderer: the dock is not along the bottom in the top layer" "$log"
     grep -q "^layer: mlx-launcher 720x540 at 152,114 in layer 3" "$log" || fail "$renderer: Super did not open the launcher centred in the overlay layer" "$log"
     grep -q "^focus: mlx-launcher" "$log" || fail "$renderer: the launcher did not get the keyboard" "$log"
     grep -q "^key 50 -> mlx-launcher" "$log" || fail "$renderer: typing did not reach the launcher" "$log"
@@ -207,6 +237,19 @@ run() {
     [[ "$(cat "$work/config/mlx/dock")" == "$(printf 'terminal\norg.mlx.Marker')" ]] || fail "$renderer: the launcher's menu did not unpin the app (pins: $(tr '\n' ' ' < "$work/config/mlx/dock"))" "$log"
     printf 'terminal\norg.mlx.Marker\n' > "$work/config/mlx/dock"
     echo "ok   $renderer: the dock's menu runs an app's action; apps pin by dragging from the launcher and unpin from its menu"
+    [[ "$(cat "$work/config/mlx/dock-folders")" == "~/Downloads" ]] || fail "$renderer: the dock did not pin ~/Downloads by default" "$log"
+    [[ -d "$work/data/Trash/files" && -z "$(ls -A "$work/data/Trash/files")" ]] || fail "$renderer: Empty Trash in the trash's menu left files" "$log"
+    python3 - "$work/$name/stack.ppm" <<'PY' || fail "$renderer: a click on the Downloads folder did not show its newest files" "$log"
+import sys
+data = open(sys.argv[1], 'rb').read()
+header, size, depth, pixels = data.split(b'\n', 3)
+width, height = map(int, size.split())
+def at(x, y): return tuple(pixels[(y * width + x) * 3:(y * width + x) * 3 + 3])
+# The menu's background above the folder (two files, a line, Open).
+assert at(577, 640) == (30, 33, 42), at(577, 640)
+assert at(577, 560) != (30, 33, 42), at(577, 560)
+PY
+    echo "ok   $renderer: the dock shows the Downloads folder as a stack and empties the trash"
 
     python3 - "$work/$name/launcher.ppm" <<'PY' || fail "$renderer: the window behind the launcher is not blurred" "$log"
 import sys
