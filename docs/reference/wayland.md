@@ -619,7 +619,9 @@ with `sendCreated()` (which creates the `wl_buffer` resource) or
 - [`examples/vulkan-wayland-client`](../../examples/vulkan-wayland-client/README.md)
   renders with Vulkan (`std.vulkan`, no C loader) and hands frames over as
   dma-bufs, or renders straight into its `wl_shm` pool.
-- The compositor offers linux-dmabuf (ARGB8888/XRGB8888, linear) and,
+- The compositor offers linux-dmabuf version 4 (ARGB8888/XRGB8888,
+  linear) with feedback naming its GPU, so Mesa's EGL renders on it
+  rather than falling back to llvmpipe, and,
   with `--renderer vulkan`, composes on the GPU, reading client pools and
   dma-bufs in place and rendering into the output in place: nested, the
   host window's `wl_shm` buffer; freestanding, the DRM dumb buffer the

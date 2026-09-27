@@ -572,7 +572,8 @@ mlx4 examples/vulkan-wayland-client/main.mlx -o vulkan-wayland-client
 
 `wl_compositor` (surfaces, and regions as input regions: a surface with
 one takes the pointer only inside it), `wl_shm` (ARGB8888 and XRGB8888),
-`zwp_linux_dmabuf_v1` version 3 (ARGB8888 and XRGB8888, linear, one plane),
+`zwp_linux_dmabuf_v1` version 4 (ARGB8888 and XRGB8888, linear, one plane,
+with feedback: see GPU clients below),
 `wl_output`, `wl_seat` with pointer and keyboard, `wl_data_device_manager`
 version 3, `wl_subcompositor`, `xdg_wm_base` with toplevels (with
 `configure_bounds`: the output's size), popups and positioners,
@@ -580,6 +581,23 @@ version 3, `wl_subcompositor`, `xdg_wm_base` with toplevels (with
 version 3 and `ext_background_effect_manager_v1` version 1 (see Dock and
 launcher).
 Composition is done in software, or with Vulkan (`--renderer vulkan`).
+
+### GPU clients (OpenGL, Vulkan)
+
+Mesa finds the GPU a Wayland client should render on in linux-dmabuf's
+feedback (version 4, `main_device`); the old `wl_drm` is not offered.
+Without that device OpenGL programs (Minecraft, anything through GLFW or
+SDL on EGL) fall back to llvmpipe and render on the CPU: F3 in Minecraft
+then shows `llvmpipe` instead of the graphics card. The compositor names
+the card it drives, or nested the first render node
+(`/dev/dri/renderD128` on), and logs it once with `--verbose`:
+
+    dmabuf: clients are told to render on GPU 226:0
+
+The buffers stay linear, so the Vulkan renderer reads them where they
+are. When the driver refuses one, the log says which step failed (for
+example `vkGetMemoryFdPropertiesKHR refused the dma-buf`) and that
+client's frames are copied by the CPU instead, which works but is slow.
 
 Subsurfaces (Firefox insists on them) are drawn with the window they are
 part of, at their offset from it, in their stacking order (`place_above`,
