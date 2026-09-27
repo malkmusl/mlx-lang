@@ -243,8 +243,11 @@ its bytes, and nothing of it may be handed back by address. `return`
 therefore copies a value that may be, or lie inside, a `const` local's
 frame storage into the arena first, including what a call given such a
 local returns (a callee may return its parameter's storage), and rebases a
-slice into one onto an arena copy of the whole local
-(`tests/265_aggregate_value_copy_runtime.mlx`).
+slice of an array held in one (`copy.bytes[0..2]`) onto an arena copy of
+the whole local (`tests/265_aggregate_value_copy_runtime.mlx`). It does so
+only in a function that has such a local, with the function's return type;
+a slice the local merely holds (a field of slice type) points elsewhere and
+comes back as it is (`tests/273_const_return_paths_runtime.mlx`).
 
 A 20-byte array exceeds the 16-byte register-return threshold, so it returns
 through caller-owned hidden memory instead:
