@@ -16,6 +16,7 @@ build inputs; applications only `@import("std.wayland")`.
 | `relative-pointer-unstable-v1.xml` | wayland-protocols 1.49, `unstable/relative-pointer/relative-pointer-unstable-v1.xml` |
 | `pointer-constraints-unstable-v1.xml` | wayland-protocols 1.49, `unstable/pointer-constraints/pointer-constraints-unstable-v1.xml` |
 | `server-decoration.xml` | plasma-wayland-protocols c5ac4db8, `src/protocols/server-decoration.xml` (KDE's, which GTK 3 uses) |
+| `keyboard-shortcuts-inhibit-unstable-v1.xml` | wayland-protocols 1.49, `unstable/keyboard-shortcuts-inhibit/keyboard-shortcuts-inhibit-unstable-v1.xml` |
 
 The files are byte-for-byte copies of the upstream releases. `SOURCES`
 records each file's URL, release and SHA-256. Bootstrap tooling must preserve

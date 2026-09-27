@@ -160,7 +160,14 @@ the `shrink` kernel, 4x4 samples a pixel), its contents on the CPU, and
 the titles below. The thumbnail under the pointer is highlighted; a
 click on one brings its window forward (a minimized one comes back), a
 click anywhere else, Escape or a second click on the icon closes them.
-The thumbnails follow their windows as they draw. `~/.config/mlx/dock` lists the pinned apps, one
+The thumbnails follow their windows as they draw.
+
+mlx-settings lists the hotkeys: a click on one records the next key
+combination (Escape keeps the old one, Backspace unbinds it, a right click
+restores the default). Meanwhile the compositor passes every key to it,
+Super and its own hotkeys too (keyboard-shortcuts-inhibit-unstable-v1,
+which any client may use while it has the keyboard); Alt+Shift+Q and the
+VT switch stay the compositor's. `~/.config/mlx/dock` lists the pinned apps, one
 desktop entry id per line (`org.gnome.Nautilus`, `firefox`), `terminal` for
 the Mlx terminal; without it the dock pins the terminal and the first file
 manager, browser and editor it finds. Icons are PNGs (the hicolor theme or

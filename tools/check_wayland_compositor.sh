@@ -32,6 +32,9 @@
 #  10. with GTK 3 (through python3's ctypes, if installed): KDE's server
 #      decoration tells it the compositor decorates, so it asks for server
 #      side decoration and draws no title bar of its own.
+#  11. mlx-settings records hotkeys: while it records, the compositor
+#      passes every key to it (keyboard-shortcuts-inhibit), Super+Up too;
+#      Backspace unbinds one; the compositor takes the new keys at once.
 #
 # Typed commands create marker files, so keyboard delivery is verified at the
 # shell; the moved window's focus frame is checked in the host's screenshot.
@@ -364,6 +367,59 @@ def white(x0, y0):
 assert white(100, 100) > 10 and white(200, 150) == 0, (white(100, 100), white(200, 150))
 PY
 echo "ok   a pointer lock holds the cursor and relative motion reaches the client"
+
+# Scenario 11: mlx-settings (its window at (24, 24), the hotkey rows 36
+# pixels apart from y 440). Maximize gets Super+Shift+M; minimize gets
+# Super+Up (the maximize hotkey: it must reach the window); the terminal
+# hotkey is cleared; then Super+Up minimizes.
+"$compiler" --quiet examples/mlx-settings/main.mlx -o "$work/mlx-settings"
+rm -f "$XDG_CONFIG_HOME/mlx/compositor.conf"
+cat > "$work/hotkeys.script" <<SCRIPT
+wait 2500
+pointer 224 482
+press 272
+release 272
+wait 300
+down 125
+down 42
+down 50
+up 50
+up 42
+up 125
+wait 300
+pointer 224 518
+press 272
+release 272
+wait 300
+down 125
+down 103
+up 103
+up 125
+wait 300
+pointer 224 626
+press 272
+release 272
+wait 300
+down 14
+up 14
+wait 800
+down 125
+down 103
+up 103
+up 125
+wait 500
+close
+SCRIPT
+run_scenario hotkeys "$work/hotkeys.script" --no-fps --run "$work/mlx-settings"
+conf="$XDG_CONFIG_HOME/mlx/compositor.conf"
+for line in "key-maximize = Super+Shift+M" "key-minimize = Super+Up" "key-terminal = none" "key-close = Alt+F4"; do
+    grep -qx "$line" "$conf" 2> /dev/null || { echo "mlx-settings did not write \"$line\"" >&2; cat "$conf" "$work/hotkeys-compositor.log" >&2; exit 1; }
+done
+[[ $(grep -c "^shortcuts: inhibited" "$work/hotkeys-compositor.log") -eq 3 ]] || { echo "the compositor did not pass the keys to mlx-settings while it recorded" >&2; cat "$work/hotkeys-compositor.log" >&2; exit 1; }
+! grep -q "^maximize: Settings" "$work/hotkeys-compositor.log" || { echo "Super+Up maximized the window while mlx-settings recorded it" >&2; exit 1; }
+grep -q "^minimize: Settings" "$work/hotkeys-compositor.log" || { echo "the recorded Super+Up did not minimize" >&2; cat "$work/hotkeys-compositor.log" >&2; exit 1; }
+rm -f "$conf"
+echo "ok   mlx-settings records hotkeys (the compositor's too) and the compositor uses them at once"
 
 # Scenario 10: a GTK 3 window (libgtk-3 through ctypes: no GTK 3 program
 # is needed). GTK 3 knows only KDE's server decoration, not xdg-decoration.
