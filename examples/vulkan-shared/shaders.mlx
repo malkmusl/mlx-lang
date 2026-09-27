@@ -13,7 +13,12 @@
 //     the output; the output starts `targetOffset` pixels into binding 1,
 //     its rows `targetStride` pixels apart (a DRM dumb buffer's pitch may
 //     exceed a row). A source stride of 0 repeats the first row (solid
-//     rectangles).
+//     rectangles). Two rounded shapes (A and B: x, y, width and height in
+//     the output, corner radii for the top and the bottom half) mask it:
+//     FLAG_CLIP_CORNERS scales each pixel by A's coverage inside A's
+//     rectangle (rounded window corners; outside it, shadows, nothing
+//     changes), FLAG_RING by A's coverage minus B's (a window's frame).
+//     Coverage is the desktop canvas's: 4x4 samples in the corners.
 //
 // text (binding 0: glyph atlas, binding 1: glyph run, binding 2:
 //      destination pixels, push constants: Text)
@@ -54,6 +59,8 @@ pub const FLAG_SWAP_RED_BLUE: u32 = 4
 
 // Blit flags.
 pub const FLAG_OPAQUE: u32 = 1
+pub const FLAG_CLIP_CORNERS: u32 = 2
+pub const FLAG_RING: u32 = 4
 
 // Push constants (u32 words).
 pub const Pattern = struct {
@@ -77,6 +84,19 @@ pub const Blit = struct {
     flags: u32
     targetOffset: u32
     targetStride: u32
+    // The shapes (signed; see the top).
+    shapeAX: u32
+    shapeAY: u32
+    shapeAWidth: u32
+    shapeAHeight: u32
+    shapeATop: u32
+    shapeABottom: u32
+    shapeBX: u32
+    shapeBY: u32
+    shapeBWidth: u32
+    shapeBHeight: u32
+    shapeBTop: u32
+    shapeBBottom: u32
 }
 
 // Text: the target (as in Blit), the run's origin in the target, its
@@ -105,7 +125,7 @@ pub const Text = struct {
 }
 
 pub const PATTERN_WORDS: u32 = 6
-pub const BLIT_WORDS: u32 = 11
+pub const BLIT_WORDS: u32 = 23
 pub const TEXT_WORDS: u32 = 15
 pub const BLUR_PASS_WORDS: u32 = 7
 pub const BLUR_MASK_WORDS: u32 = 12
@@ -180,10 +200,11 @@ fn declare(b: *builder.Builder, common: *Common, push_words: u32, buffer_count: 
     builder.decorateBuiltIn(b, common.*.globalId, spv.BuiltIn.globalInvocationId)
     common.*.zero = builder.constant(b, common.*.uint, 0)
 
-    // Push constants: a Block of `push_words` (at most 16) u32 members.
-    var members: [16]u32 = undefined
+    // Push constants: a Block of `push_words` (at most 32: 128 bytes, the
+    // least every device offers) u32 members.
+    var members: [32]u32 = undefined
     var member_index: usize = 0
-    while member_index < 16 {
+    while member_index < 32 {
         members[member_index] = common.*.uint
         member_index += 1
     }
@@ -334,8 +355,12 @@ pub fn buildPattern(b: *builder.Builder) -> void {
 pub fn buildBlit(b: *builder.Builder) -> void {
     var common: Common = undefined
     declare(b, &common, BLIT_WORDS, 2)
+    const function_pointer = builder.typePointer(b, spv.StorageClass.function, common.uint)
     const main = builder.function(b, common.voidType, spv.FUNCTION_CONTROL_NONE, common.functionType)
     const entry = builder.label(b)
+    // Function variables come first in the entry block.
+    const cover_a = builder.localVariable(b, function_pointer)
+    const cover_b = builder.localVariable(b, function_pointer)
     const id = builder.load(b, common.uvec3, common.globalId)
     const x = builder.compositeExtract(b, common.uint, id, 0)
     const y = builder.compositeExtract(b, common.uint, id, 1)
@@ -368,7 +393,18 @@ pub fn buildBlit(b: *builder.Builder) -> void {
     const target_index = op(b, spv.Op.iAdd, common.uint, target_offset, op(b, spv.Op.iAdd, common.uint, op(b, spv.Op.iMul, common.uint, builder.unary(b, spv.Op.bitcast, common.uint, dy), target_stride), builder.unary(b, spv.Op.bitcast, common.uint, dx)))
     const target_pointer = element(b, &common, common.buffers[1], target_index)
     const target = builder.load(b, common.uint, target_pointer)
-    const alpha = select(b, common.uint, flagSet(b, &common, flags, FLAG_OPAQUE), constant(b, &common, 255), channel(b, &common, source, 24))
+    const full_alpha = select(b, common.uint, flagSet(b, &common, flags, FLAG_OPAQUE), constant(b, &common, 255), channel(b, &common, source, 24))
+    // The masks' coverage (255 without one).
+    const cover_first = shapeCoverage(b, &common, cover_a, dx, dy, 11)
+    const cover_second = shapeCoverage(b, &common, cover_b, dx, dy, 17)
+    const in_first = shapeContains(b, &common, dx, dy, 11)
+    const full = constant(b, &common, 255)
+    const clipped = select(b, common.uint, in_first, cover_first, full)
+    const ring = select(b, common.uint, op(b, spv.Op.uGreaterThan, common.boolean, cover_first, cover_second), op(b, spv.Op.iSub, common.uint, cover_first, cover_second), common.zero)
+    const coverage = select(b, common.uint, flagSet(b, &common, flags, FLAG_CLIP_CORNERS), clipped, select(b, common.uint, flagSet(b, &common, flags, FLAG_RING), ring, full))
+    // The source and its alpha scaled by the coverage, each (value *
+    // coverage + 127) / 255 (unchanged at 255).
+    const alpha = scaleBy(b, &common, full_alpha, coverage)
     const inverse = op(b, spv.Op.iSub, common.uint, constant(b, &common, 255), alpha)
     // Each channel, premultiplied: min(255, source + (target * (255 - alpha) + 127) / 255).
     var blended: [3]u32 = [3]u32{ 0, 0, 0 }
@@ -376,7 +412,7 @@ pub fn buildBlit(b: *builder.Builder) -> void {
     while index < 3 {
         const shift = 16 - index * 8
         const kept = op(b, spv.Op.iAdd, common.uint, op(b, spv.Op.iMul, common.uint, channel(b, &common, target, shift), inverse), constant(b, &common, 127))
-        const sum = op(b, spv.Op.iAdd, common.uint, channel(b, &common, source, shift), op(b, spv.Op.uDiv, common.uint, kept, constant(b, &common, 255)))
+        const sum = op(b, spv.Op.iAdd, common.uint, scaleBy(b, &common, channel(b, &common, source, shift), coverage), op(b, spv.Op.uDiv, common.uint, kept, constant(b, &common, 255)))
         const saturated = op(b, spv.Op.uGreaterThan, common.boolean, sum, constant(b, &common, 255))
         blended[index] = select(b, common.uint, saturated, constant(b, &common, 255), sum)
         index += 1
@@ -392,6 +428,38 @@ pub fn buildBlit(b: *builder.Builder) -> void {
 
 fn signed(b: *builder.Builder, common: *const Common, value: u32) -> u32 {
     return builder.unary(b, spv.Op.bitcast, common.*.int, value)
+}
+
+// (value * coverage + 127) / 255
+fn scaleBy(b: *builder.Builder, common: *const Common, value: u32, coverage: u32) -> u32 {
+    const product = op(b, spv.Op.iAdd, common.*.uint, op(b, spv.Op.iMul, common.*.uint, value, coverage), constant(b, common, 127))
+    return op(b, spv.Op.uDiv, common.*.uint, product, constant(b, common, 255))
+}
+
+// Whether output pixel (x, y) (signed) is in the rectangle of the Blit
+// shape whose words start at push word `first`.
+fn shapeContains(b: *builder.Builder, common: *const Common, x: u32, y: u32, first: u32) -> u32 {
+    const zero = intConstant(b, common, 0)
+    const lx = op(b, spv.Op.iSub, common.*.int, x, signed(b, common, pushWord(b, common, first)))
+    const ly = op(b, spv.Op.iSub, common.*.int, y, signed(b, common, pushWord(b, common, first + 1)))
+    const width = signed(b, common, pushWord(b, common, first + 2))
+    const height = signed(b, common, pushWord(b, common, first + 3))
+    const in_x = op(b, spv.Op.logicalAnd, common.*.boolean, op(b, spv.Op.sGreaterThanEqual, common.*.boolean, lx, zero), op(b, spv.Op.sLessThan, common.*.boolean, lx, width))
+    const in_y = op(b, spv.Op.logicalAnd, common.*.boolean, op(b, spv.Op.sGreaterThanEqual, common.*.boolean, ly, zero), op(b, spv.Op.sLessThan, common.*.boolean, ly, height))
+    return op(b, spv.Op.logicalAnd, common.*.boolean, in_x, in_y)
+}
+
+// The coverage of output pixel (x, y) by the Blit shape whose words start
+// at push word `first` (scene.shapeCoverage): the top radius in the upper
+// half, the bottom one in the lower half.
+fn shapeCoverage(b: *builder.Builder, common: *const Common, variable: u32, x: u32, y: u32, first: u32) -> u32 {
+    const lx = op(b, spv.Op.iSub, common.*.int, x, signed(b, common, pushWord(b, common, first)))
+    const ly = op(b, spv.Op.iSub, common.*.int, y, signed(b, common, pushWord(b, common, first + 1)))
+    const width = signed(b, common, pushWord(b, common, first + 2))
+    const height = signed(b, common, pushWord(b, common, first + 3))
+    const upper = op(b, spv.Op.sLessThan, common.*.boolean, op(b, spv.Op.iMul, common.*.int, ly, intConstant(b, common, 2)), height)
+    const radius = select(b, common.*.int, upper, signed(b, common, pushWord(b, common, first + 4)), signed(b, common, pushWord(b, common, first + 5)))
+    return emitRounded(b, common, variable, lx, ly, width, height, radius)
 }
 
 pub fn buildText(b: *builder.Builder) -> void {

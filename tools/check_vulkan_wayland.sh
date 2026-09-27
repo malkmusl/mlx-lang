@@ -106,7 +106,13 @@ label = sum(1 for y in range(top + h - 30, top + h) for x in range(left + 8, lef
 assert label > 40, "no label in the client window (%d white pixels)" % label
 # The title bar above the frame: focus color with the title in white.
 bar_top = top - 2 - 20
-assert rgb(left + w - 4, bar_top + 3) == focus, "no title bar"
+assert rgb(left + w - 30, bar_top + 3) == focus, "no title bar"
+# Rounded corners (radius 12): the title bar's and the window's outermost
+# corner pixels show the background (the same as beside the window in that
+# row), not the bar or the client's pattern.
+assert rgb(left - 2, bar_top) == rgb(left - 8, bar_top), "the title bar's corner is not rounded"
+bottom = top + h - 1
+assert rgb(left, bottom) == rgb(left - 8, bottom) and rgb(left + w - 1, bottom) == rgb(left + w + 8, bottom), "the window's bottom corners are not rounded"
 # (anti-aliased white over the bar: red well above the bar's 0x5a)
 title = sum(1 for y in range(bar_top, top - 2) for x in range(left, left + 200) if rgb(x, y)[0] > 180)
 assert title > 40, "no title text in the title bar (%d light pixels)" % title

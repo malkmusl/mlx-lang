@@ -150,7 +150,8 @@ SCRIPT
 run_scenario title "$work/title.script" --terminal "$work/mlx-terminal" --run "$work/mlx-terminal"
 grep -q "^move: Mlx Terminal" "$work/title-compositor.log" || { echo "dragging the title bar did not move the window" >&2; cat "$work/title-compositor.log" >&2; exit 1; }
 # The window starts at (24, 24) and moves by (+100, +100): its frame's left
-# edge is at x = 122, its title bar spans y = 102..121.
+# edge is at x = 122, its title bar spans y = 102..121 (rounded above
+# y = 116).
 font=0
 [[ -f /usr/share/fonts/truetype/dejavu/DejaVuSans.ttf ]] && font=1
 python3 - "$work/title.ppm" "$font" <<'PY'
@@ -162,7 +163,7 @@ def rgb(x, y):
     offset = (y * width + x) * 3
     return tuple(pixels[offset:offset + 3])
 focus = (0x5a, 0xa0, 0xff)
-assert rgb(122, 300) == focus and rgb(122, 110) == focus, (rgb(122, 300), rgb(122, 110))
+assert rgb(122, 300) == focus and rgb(122, 118) == focus, (rgb(122, 300), rgb(122, 118))
 assert rgb(22, 300) != focus, "the window did not leave its original position"
 if sys.argv[2] == "1":
     # The title in white over the bar (the bar's red is 0x5a).

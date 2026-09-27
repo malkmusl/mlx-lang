@@ -374,14 +374,30 @@ title-bars = on
 fps-counter = on
 # on: programs draw their own title bars and frames.
 client-decorations = off
+# Windows' rounded corners in pixels (0 to 20; 0: square).
+corner-radius = 12
 ```
 
 [`examples/mlx-settings`](../mlx-settings/main.mlx) is a small window to
 change them: a row of colours for the border and switches for the title
-bars, the counter and app decorations. It writes the file whole and
-renames it into place, so the compositor never reads half of it. The
-launcher lists it as Settings. Without title bars, windows move with
-Alt+drag.
+bars, the counter, rounded corners (12 pixels or square) and app
+decorations. It writes the file whole and renames it into place, so the
+compositor never reads half of it. The launcher lists it as Settings.
+Without title bars, windows move with Alt+drag.
+
+### Rounded corners
+
+Windows have rounded corners like GTK's: 12 pixels by default, the
+radius of libadwaita's windows (GNOME's GTK 4 programs; plain GTK 4 and
+GTK 3 round only their top corners, by 8). A window's content, its
+subsurfaces included, is cut to its window rectangle with rounded
+corners (under a title bar only the bottom ones); what a client draws
+outside that rectangle, such as GTK's shadows, is left as it is. The
+frame and the title bar around it follow with a radius 2 pixels larger,
+so both curves share their centres. Coverage is sampled 4x4 per corner
+pixel with integers only, as the desktop canvas does, so the CPU and the
+Vulkan renderer (the blit shader's FLAG_CLIP_CORNERS and FLAG_RING masks)
+give the same pixels; `tools/check_vulkan_wayland.sh` compares them.
 
 ### Decorations
 
