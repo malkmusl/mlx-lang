@@ -117,7 +117,7 @@ run() {
     local status=0
     env -i PATH="$PATH" HOME="$work/home" XDG_RUNTIME_DIR="$runtime" WAYLAND_DISPLAY=host-desktop \
         XDG_DATA_HOME="$work/data" XDG_DATA_DIRS="$work/none" XDG_CONFIG_HOME="$work/config" VK_DRIVER_FILES="$manifest" \
-        timeout 60 "$work/mlx-compositor" --verbose --renderer "$renderer" --socket nested-desktop \
+        timeout 60 "$work/mlx-compositor" --verbose --no-fps --renderer "$renderer" --socket nested-desktop \
         --terminal "$work/mlx-terminal" --launcher "$work/mlx-launcher" --dock "$work/mlx-dock" \
         --run "$work/mlx-terminal" --run "$work/mlx-terminal" > "$work/$renderer.log" 2>&1 || status=$?
     wait "$host_pid" || fail "$renderer: the test host failed" "$work/$renderer-host.log"

@@ -64,7 +64,7 @@ run() {
     "$work/test-host" "host-$name" "$work/us.xkb" "$work/shot.script" > "$work/$name-host.log" 2>&1 &
     local host_pid=$!
     for _ in $(seq 1 50); do [[ -S "$XDG_RUNTIME_DIR/host-$name" ]] && break; sleep 0.1; done
-    WAYLAND_DISPLAY="host-$name" MLX_VULKAN_NO_HOST_IMPORT=${no_host_import:-} timeout 60 "$work/mlx-compositor" --verbose --renderer "$renderer" --size 640x480 \
+    WAYLAND_DISPLAY="host-$name" MLX_VULKAN_NO_HOST_IMPORT=${no_host_import:-} timeout 60 "$work/mlx-compositor" --verbose --no-fps --renderer "$renderer" --size 640x480 \
         --socket "nested-$name" --run "$work/$client" > "$work/$name.log" 2>&1 || true
     wait "$host_pid" || { echo "FAIL $name: the test host failed" >&2; cat "$work/$name-host.log" "$work/$name.log" >&2; exit 1; }
     [[ -f "$work/frame.ppm" ]] || { echo "FAIL $name: no frame" >&2; cat "$work/$name.log" >&2; exit 1; }

@@ -82,7 +82,14 @@ window at the monitor's resolution), `--renderer auto|vulkan|cpu` (default
 `auto`: Vulkan when a driver works, else the CPU), `--font PATH|none`,
 `--terminal PROGRAM`, `--launcher PROGRAM|none` (what Super starts),
 `--dock PROGRAM` (started with the compositor), `--run PROGRAM`
-(repeatable), `--screenshot FILE`, `--timeout SECONDS`, `--verbose`.
+(repeatable), `--screenshot FILE`, `--timeout SECONDS`, `--no-fps` (no
+frames-per-second counters in the title bars), `--verbose` (which also
+logs, once a second, `perf:` lines with the frame rate and how long a
+frame takes to compose and present).
+
+Each title bar shows the window's frames per second (the buffers it
+committed) and the desktop's (frames shown). Shown frames follow the
+monitor: at 60 Hz the desktop shows at most 60.
 
 ## Dock and launcher
 
