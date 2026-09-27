@@ -43,8 +43,8 @@ build_modules() {
 }
 build_modules . "$work/modules"
 mkdir -p "$work/changed/examples" "$work/layout/examples"
-cp -r examples/wayland-compositor examples/vulkan-shared "$work/changed/examples/"
-cp -r examples/wayland-compositor examples/vulkan-shared "$work/layout/examples/"
+cp -r examples/wayland-compositor examples/vulkan-shared examples/desktop-shared "$work/changed/examples/"
+cp -r examples/wayland-compositor examples/vulkan-shared examples/desktop-shared "$work/layout/examples/"
 python3 - "$work/changed/examples/wayland-compositor/scene.mlx" <<'PY'
 import sys
 path = sys.argv[1]

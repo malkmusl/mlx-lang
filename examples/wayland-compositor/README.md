@@ -151,8 +151,16 @@ and the dock whether `~/.config/mlx/dock` changed, and take the changes in.
 It shows an apps button, the pinned apps,
 and after a separator the apps that have windows but are not pinned; a dot
 marks an app that runs. Icons grow under the pointer, which shows the
-app's name. A click brings the app's window forward (the next one when it
-has several) or starts it. `~/.config/mlx/dock` lists the pinned apps, one
+app's name. A click brings the app's window forward or starts it. When the
+app has several windows the dock asks the compositor for their previews
+(over the same socket pair: the handles' object ids): a panel above the
+dock with each window scaled down, whole with its frame and title bar on
+the Vulkan renderer (drawn flat into the scratch buffer, then shrunk by
+the `shrink` kernel, 4x4 samples a pixel), its contents on the CPU, and
+the titles below. The thumbnail under the pointer is highlighted; a
+click on one brings its window forward (a minimized one comes back), a
+click anywhere else, Escape or a second click on the icon closes them.
+The thumbnails follow their windows as they draw. `~/.config/mlx/dock` lists the pinned apps, one
 desktop entry id per line (`org.gnome.Nautilus`, `firefox`), `terminal` for
 the Mlx terminal; without it the dock pins the terminal and the first file
 manager, browser and editor it finds. Icons are PNGs (the hicolor theme or
@@ -164,8 +172,8 @@ The compositor passes `MLX_TERMINAL` (its `--terminal`) and `MLX_LAUNCHER`
 (`MLX_SESSION_DOCK=no` does not). `tools/check_desktop_clients.sh`
 checks both clients with scripted input on the CPU and the Vulkan
 renderer: where their surfaces are, Super, typing, starting apps from both,
-switching windows from the dock, the blur, and that both renderers draw
-the same pixels.
+switching windows from the dock's previews, the blur, and that both
+renderers draw the same pixels.
 
 ## Freestanding (DRM/KMS)
 

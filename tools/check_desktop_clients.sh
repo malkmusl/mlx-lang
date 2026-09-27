@@ -13,8 +13,9 @@
 #   - taps Super: the launcher opens centred in the overlay layer and takes
 #     the keyboard; typing narrows it to the test app, Enter starts it and
 #     the launcher closes;
-#   - clicks the dock's terminal (the next terminal window comes forward)
-#     and the dock's test app (it starts);
+#   - clicks the dock's terminal: with two windows it shows their
+#     previews above the dock; a click on one brings it forward; then
+#     clicks the dock's test app (it starts);
 #   - opens the launcher with the dock's apps button and closes it with
 #     Escape.
 # The window behind the launcher must show blurred through it, and the
@@ -84,6 +85,12 @@ pointer 512 730
 wait 300
 press 272
 release 272
+wait 800
+shot SHOTS/previews.ppm
+pointer 498 500
+wait 300
+press 272
+release 272
 wait 500
 pointer 570 730
 wait 300
@@ -137,9 +144,11 @@ run() {
     [[ $(grep -c "^layer: mlx-launcher" "$log") -eq 2 ]] || fail "$renderer: the dock's apps button did not open the launcher" "$log"
     grep -q "^key 1 -> mlx-launcher" "$log" || fail "$renderer: Escape did not reach the launcher" "$log"
     # Focus: the two terminals, the launcher, a terminal again after it
-    # closed, then the other one from the dock.
-    [[ $(grep -c "^focus: Mlx Terminal" "$log") -ge 4 ]] || fail "$renderer: the dock did not bring the next terminal forward" "$log"
-    echo "ok   $renderer: dock along the bottom, Super opens the launcher, apps start from both, the dock switches windows"
+    # closed, then the other one from its preview.
+    grep -q "^previews: 2 windows, panel 516x206 at 254,478" "$log" || fail "$renderer: the dock's terminal (two windows) did not show their previews above the dock" "$log"
+    grep -q "^previews closed" "$log" || fail "$renderer: a click on a preview did not close them" "$log"
+    [[ $(grep -c "^focus: Mlx Terminal" "$log") -ge 4 ]] || fail "$renderer: the preview did not bring the other terminal forward" "$log"
+    echo "ok   $renderer: dock along the bottom, Super opens the launcher, apps start from both, the dock's previews switch windows"
 
     python3 - "$work/$name/launcher.ppm" <<'PY' || fail "$renderer: the window behind the launcher is not blurred" "$log"
 import sys
@@ -152,6 +161,20 @@ y = 300
 row = [tuple(pixels[(y * width + x) * 3:(y * width + x) * 3 + 3]) for x in range(696, 738)]
 steps = sum(1 for a, b in zip(row, row[1:]) if a != b)
 assert steps >= 8, row
+PY
+
+    python3 - "$work/$name/previews.ppm" <<'PY' || fail "$renderer: the previews are not drawn" "$log"
+import sys
+data = open(sys.argv[1], 'rb').read()
+header, size, depth, pixels = data.split(b'\n', 3)
+width, height = map(int, size.split())
+def at(x, y): return tuple(pixels[(y * width + x) * 3:(y * width + x) * 3 + 3])
+# The panel's colour between the thumbnails and below them; each
+# thumbnail shows its terminal's dark background.
+assert at(512, 560) == (0x20, 0x24, 0x30), at(512, 560)
+assert at(262, 670) == (0x20, 0x24, 0x30), at(262, 670)
+assert at(380, 600) != (0x20, 0x24, 0x30) and max(at(380, 600)) < 64, at(380, 600)
+assert at(630, 600) != (0x20, 0x24, 0x30) and max(at(630, 600)) < 64, at(630, 600)
 PY
 }
 
