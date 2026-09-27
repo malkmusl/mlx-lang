@@ -36,7 +36,10 @@
 #     folders first, makes a folder (Ctrl+Shift+N) and names it, moves a
 #     picture into it by dragging, renames a file (F2), moves one to the
 #     trash (Delete), opens a folder with a double click, goes back with
-#     Alt+Left; drawn alike on the GPU and on the CPU.
+#     Alt+Left; drawn alike on the GPU and on the CPU;
+#   - opens a folder from the dock's stack: the file manager's window
+#     grows out of the stack (the compositor's zoom), which goes as it
+#     comes.
 # The window behind the launcher must show blurred through it, and the
 # screenshots must be the same with the CPU and the Vulkan renderer, and
 # with the apps drawing on the GPU (their standard) and on the CPU
@@ -510,6 +513,65 @@ PY
     echo "ok   files ($canvas): folders first; makes, renames, moves, trashes, opens folders"
 }
 
+# The dock's stack opening in the file manager (mlx-files on the PATH):
+# the window grows out of the stack, the stack goes. The dock holds the
+# terminal and the Downloads folder (at x 548); its stack of ten entries
+# has its Open button at (741, 473).
+zoom() {
+    local renderer=$1
+    local runtime
+    runtime=$(mktemp -d)
+    local base="$work/zoom-$renderer"
+    rm -rf -- "$base"
+    mkdir -p "$base/home/Downloads/Photos" "$base/config/mlx" "$base/data" "$base/bin"
+    for i in 1 2 3 4 5 6 7; do echo "$i" > "$base/home/Downloads/doc$i.txt"; done
+    echo paper > "$base/home/Downloads/paper.pdf"
+    cp tests/support/png/rgba8.png "$base/home/Downloads/pic.png"
+    printf 'terminal\n' > "$base/config/mlx/dock"
+    ln -s "$work/mlx-files" "$base/bin/mlx-files"
+    cat > "$base.script" <<SCRIPT
+wait 3500
+pointer 548 728
+wait 300
+press 272
+release 272
+wait 1500
+pointer 741 473
+wait 300
+press 272
+release 272
+wait 3000
+shot $base/opened.ppm
+close
+SCRIPT
+    XDG_RUNTIME_DIR=$runtime "$work/test-host" host-zoom "$work/us.xkb" "$base.script" > "$base-host.log" 2>&1 &
+    local host_pid=$!
+    for _ in $(seq 1 50); do [[ -S "$runtime/host-zoom" ]] && break; sleep 0.1; done
+    local status=0
+    env -i PATH="$base/bin:$PATH" HOME="$base/home" XDG_RUNTIME_DIR="$runtime" WAYLAND_DISPLAY=host-zoom \
+        XDG_DATA_HOME="$base/data" XDG_DATA_DIRS="$work/none" XDG_CONFIG_HOME="$base/config" VK_DRIVER_FILES="$manifest" \
+        LANG=en_US.UTF-8 TZ=UTC \
+        timeout 90 "$work/mlx-compositor" --verbose --no-fps --renderer "$renderer" --socket nested-zoom \
+        --launcher none --dock "$work/mlx-dock" --topbar none > "$base.log" 2>&1 || status=$?
+    wait "$host_pid" || fail "zoom: the test host failed" "$base-host.log"
+    rm -rf -- "$runtime"
+    local log="$base.log"
+    [[ $status -eq 0 ]] || fail "zoom ($renderer): the compositor exited with status $status" "$log"
+    grep -q "^map: Downloads" "$log" || fail "zoom ($renderer): Open in the stack did not open the file manager" "$log"
+    grep -q "^zoom: from 484x242 at 305,450" "$log" || fail "zoom ($renderer): the window did not grow out of the stack" "$log"
+    python3 - "$base/opened.ppm" <<'PY' || fail "zoom ($renderer): the stack is still there" "$log"
+import sys
+data = open(sys.argv[1], 'rb').read()
+header, size, depth, pixels = data.split(b'\n', 3)
+width, height = map(int, size.split())
+def at(x, y): return tuple(pixels[(y * width + x) * 3:(y * width + x) * 3 + 3])
+# Below the window, where the stack's lower part was, the desktop's
+# background shows again: no dark panel.
+assert at(320, 650)[2] > 70 and at(320, 650)[2] > at(320, 650)[0] + 20, at(320, 650)
+PY
+    echo "ok   zoom ($renderer): a folder opened from the dock's stack grows out of it into the file manager"
+}
+
 topbar() {
     local runtime
     runtime=$(mktemp -d)
@@ -589,6 +651,8 @@ drops
 topbar
 files cpu
 files gpu
+zoom cpu
+zoom vulkan
 python3 - "$work/files-cpu/grid.ppm" "$work/files-gpu/grid.ppm" <<'PY' || fail "the file manager drawn on the GPU differs from the one drawn on the CPU" /dev/null
 import sys
 def load(path):

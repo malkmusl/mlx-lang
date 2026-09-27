@@ -186,7 +186,18 @@ folder dragged onto the dock from a file manager joins them. The trash
 it in the file manager (asked over D-Bus, `org.freedesktop.FileManager1`,
 else its directory with `xdg-open`: `xdg-open trash:///` would reach the
 browser), its menu empties it, and files dropped on it go into it (`gio
-trash`; an app dragged from the launcher does not). Should the dock
+trash`; an app dragged from the launcher does not). A folder opened from
+the stack (its Open button, or a folder in it) opens in the file manager
+out of the stack, as on macOS: the dock keeps the stack up and tells the
+compositor a window is coming (`z` on its socket pair); the next window
+to map within three seconds starts at the stack's size and place, the
+stack goes in that same frame, and the window grows to where it rests in
+a third of a second, easing out and fading in (`zoom:` in the log). On
+the Vulkan renderer the window is drawn flat into the scratch buffer and
+scaled by the previews' `shrink` kernel (with an opacity); the CPU
+renderer scales its buffer (nearest pixel) inside the frame's colour. The
+trash and a folder's "Open" grow their window out of the icon (`Z` and
+the icon's rectangle). Should the dock
 crash, it says where first (`mlx-dock: crashed: ...` in the compositor's
 log), as the compositor does.
 
