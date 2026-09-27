@@ -160,8 +160,11 @@ compositor is the display server itself:
   devices are opened directly, which needs the rights to them, and there is
   no VT switching.
 - **Monitor** ([`kms.mlx`](kms.mlx)): one card (`/dev/dri/cardN`) with a
-  connected connector, at the monitor's preferred mode, on a CRTC one of
-  the connector's encoders can drive. With several cards each is looked
+  connected connector, at the monitor's native resolution (that of its
+  preferred mode) with the highest refresh rate it offers there (monitors
+  mark a 60 Hz mode preferred even when they do 144 Hz;
+  `MLX_DRM_REFRESH=HZ` sets an upper limit), on a CRTC one of the
+  connector's encoders can drive. With several cards each is looked
   at and logged (`drm: /dev/dri/card1: VGA-1 1024x768 at 60 Hz (the boot
   card)`, `drm: /dev/dri/card2: DP-1 3840x1080 at 60 Hz`), and the one
   with the largest monitor is driven (a server's BMC graphics, ASPEED for
