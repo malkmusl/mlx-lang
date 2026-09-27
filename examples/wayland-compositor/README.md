@@ -81,7 +81,7 @@ Options: `--socket NAME`, `--size WxH`, `--fullscreen` (a fullscreen
 window at the monitor's resolution), `--renderer auto|vulkan|cpu` (default
 `auto`: Vulkan when a driver works, else the CPU), `--font PATH|none`,
 `--terminal PROGRAM`, `--launcher PROGRAM|none` (what Super starts),
-`--dock PROGRAM` (started with the compositor), `--run PROGRAM`
+`--dock PROGRAM|none` (the dock, kept running), `--run PROGRAM`
 (repeatable), `--screenshot FILE`, `--timeout SECONDS`, `--no-fps` (no
 frames-per-second counters in the title bars), `--verbose` (which also
 logs, once a second, `perf:` lines with the frame rate and how long a
@@ -131,7 +131,16 @@ choose, Enter or a click starts the app (in `$MLX_TERMINAL` when its entry
 says `Terminal=true`), Escape, Super or a click outside close it.
 
 The dock sits in the top layer along the bottom edge with an exclusive
-zone. It shows an apps button (starts `$MLX_LAUNCHER`), the pinned apps,
+zone. Like the launcher it is a helper the compositor starts with itself
+(`--dock PROGRAM|none`, default `mlx-dock` next to the compositor) and
+keeps running: when it ends it is started again (three times at most when
+it keeps ending within five seconds). Its apps button asks the compositor
+for the launcher on its own socket pair (`MLX_DOCK_FD`), so the launcher
+that stays shows at once (a second click closes it). Both look every few
+seconds (the launcher also whenever it is shown) whether apps were
+installed or removed (the application directories' modification times)
+and the dock whether `~/.config/mlx/dock` changed, and take the changes in.
+It shows an apps button, the pinned apps,
 and after a separator the apps that have windows but are not pinned; a dot
 marks an app that runs. Icons grow under the pointer, which shows the
 app's name. A click brings the app's window forward (the next one when it
