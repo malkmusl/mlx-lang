@@ -117,8 +117,13 @@ protocols:
   is drawn over it. The CPU and the Vulkan renderer blur alike, pixel for
   pixel.
 
-Super, pressed and released on its own, starts the launcher, or closes it
+Super, pressed and released on its own, shows the launcher, or closes it
 when it is open (a Super shortcut with another key does neither). The
+compositor starts the launcher with itself and keeps it running hidden,
+with everything loaded (apps, fonts, icons): it hands it one end of a
+socket pair (`MLX_LAUNCHER_FD`), and Super sends it one byte, so it shows
+within a frame. Closing it only hides it; when it went away, the next
+Super starts it again. The
 launcher is a surface in the overlay layer, centred, that takes the
 keyboard: typing narrows the apps (by name, id and command; names that
 start with the text first), the arrow keys, Page Up/Down, Home and End
