@@ -2,16 +2,28 @@
 // as dma-buf file descriptors, typically rendered by a GPU, instead of
 // shared memory.
 //
-// Offered: ARGB8888 and XRGB8888 with the LINEAR modifier, one plane. Each
-// dma-buf is mapped read-only and becomes a one-buffer pool, so the CPU
-// renderer reads it like a wl_shm pool; the Vulkan renderer imports the
-// dma-buf itself (VK_EXT_external_memory_dma_buf).
+// Offered: ARGB8888 and XRGB8888, one plane, with the LINEAR modifier and,
+// when the renderer can read them (Compositor.readsTiled: Vulkan on a
+// GPU), in the layout the client's driver picks by itself (the implicit
+// modifier, DRM_FORMAT_MOD_INVALID). A linear dma-buf is mapped read-only
+// and becomes a one-buffer pool, so the CPU renderer reads it like a
+// wl_shm pool; the Vulkan renderer imports it as a buffer. An implicit
+// one is usually tiled and in video memory the CPU may not map: it is not
+// mapped, and the Vulkan renderer imports it as an image (Pool.tiled).
 //
 // Version 4 adds feedback: the GPU to render on (main device) and the
 // formats as a table. Mesa's EGL looks for its GPU there; without it (and
 // without the old wl_drm) OpenGL programs such as Minecraft fall back to
 // llvmpipe, rendering on the CPU. The device is the card the compositor
-// drives, or nested the first render node (/dev/dri/renderD128 on).
+// drives, or nested the first render node (/dev/dri/renderD128 on). The
+// feedback has two tranches: LINEAR first (GFX9 and newer AMD, Intel),
+// then the implicit layout for scanout (radeonsi before GFX9, Polaris such
+// as the RX 580, supports no explicit modifier, not even LINEAR; Mesa
+// then allocates from the second tranche; scanout keeps DCC compression
+// off). Offered only LINEAR, such a GPU cannot allocate a buffer at all
+// and Mesa 26 crashes (a NULL image in dri2_query_image), so a renderer
+// that cannot read tiled buffers names no device: clients render in
+// software as with version 3.
 
 const std = @import("std")
 const wl = @import("std.wayland")
@@ -78,20 +90,48 @@ fn prepare(params: *Params, resource: wl.zwp_linux_buffer_params_v1.Resource, wi
         fail(resource, wl.zwp_linux_buffer_params_v1.Error.out_of_bounds, "plane does not fit the buffer")
         return CREATE_ERROR
     }
-    // Flags (y-inverted, interlaced) and tiled layouts are not supported:
-    // such buffers fail, as the protocol allows.
+    // Flags (y-inverted, interlaced) and explicit tiled modifiers are not
+    // supported: such buffers fail, as the protocol allows.
     const linear = params.*.modifierHi == 0 && params.*.modifierLo == 0
     const implicit = params.*.modifierHi == MODIFIER_INVALID_HI && params.*.modifierLo == MODIFIER_INVALID_LO
-    if flags != 0 || (!linear && !implicit) { return CREATE_FAILED }
+    if flags != 0 || (!linear && !implicit) {
+        refused(compositor, "flags or a modifier that are not offered")
+        return CREATE_FAILED
+    }
+    // In the driver's own layout: read by the Vulkan renderer as an image
+    // (from offset 0), never mapped.
+    const tiled = implicit && compositor.*.readsTiled
+    if tiled && offset != 0 {
+        refused(compositor, "an implicit layout at an offset")
+        return CREATE_FAILED
+    }
     var memory: wl.SharedMemory = undefined
     const handle = params.*.fd
     params.*.hasPlane = false
-    if !wl.transport.mapSharedMemory(&memory, handle, offset + stride * @intCast(usize, height), false) {
-        handle.close()
-        return CREATE_FAILED
+    const size = offset + stride * @intCast(usize, height)
+    if tiled || !wl.transport.mapSharedMemory(&memory, handle, size, false) {
+        if !compositor.*.readsTiled {
+            handle.close()
+            refused(compositor, "memory the CPU cannot map")
+            return CREATE_FAILED
+        }
+        // The Vulkan renderer imports the memory without a mapping.
+        memory.handle = handle
+        memory.address = 0
+        memory.size = size
     }
-    result.* = @intFromPtr(shell.newPool(compositor, memory, true))
+    const pool = shell.newPool(compositor, memory, true)
+    pool.*.tiled = tiled
+    pool.*.width = width
+    pool.*.height = height
+    result.* = @intFromPtr(pool)
     return CREATE_OK
+}
+
+fn refused(compositor: *Compositor, why: []const u8) -> void {
+    state.say("dmabuf: a client buffer is refused: ")
+    state.say(why)
+    state.say("\n")
 }
 
 // The pool's own reference passes to its only buffer.
@@ -156,8 +196,11 @@ fn onParamsDestroyed(context: *anyopaque, object: wl.server.Object) -> void {
 // ---------------------------------------------------------------------------
 // Feedback (version 4)
 
-// Two table entries of 16 bytes: format (u32), padding, modifier (u64).
-const FORMAT_TABLE_SIZE: usize = 32
+// Four table entries of 16 bytes (format u32, padding, modifier u64):
+// ARGB8888 and XRGB8888 LINEAR, then both with the implicit modifier.
+const FORMAT_TABLE_SIZE: usize = 64
+// zwp_linux_dmabuf_feedback_v1.tranche_flags: scanout.
+const TRANCHE_SCANOUT: u32 = 1
 
 // "/dev/dri/renderD<number>" into `bytes`, NUL-terminated.
 fn renderNodePath(bytes: [*]u8, number: u32) -> void {
@@ -192,8 +235,8 @@ fn gpuDevice(compositor: *Compositor) -> usize {
     return 0
 }
 
-// The whole feedback, once: the format table, the device, one tranche with
-// both formats, done. It never changes, so it is not sent again.
+// The whole feedback, once: the format table, the device, the tranches,
+// done. It never changes, so it is not sent again.
 fn sendFeedback(compositor: *Compositor, feedback: wl.zwp_linux_dmabuf_feedback_v1.Resource) -> void {
     var table: wl.SharedMemory = undefined
     if !wl.transport.createSharedMemory(&table, FORMAT_TABLE_SIZE) {
@@ -205,34 +248,50 @@ fn sendFeedback(compositor: *Compositor, feedback: wl.zwp_linux_dmabuf_feedback_
     device.zero(entries, FORMAT_TABLE_SIZE)
     device.store32(entries, 0, DRM_FORMAT_ARGB8888)
     device.store32(entries, 16, DRM_FORMAT_XRGB8888)
-    // The modifiers stay 0: LINEAR.
+    device.store32(entries, 32, DRM_FORMAT_ARGB8888)
+    device.store32(entries, 40, MODIFIER_INVALID_LO)
+    device.store32(entries, 44, MODIFIER_INVALID_HI)
+    device.store32(entries, 48, DRM_FORMAT_XRGB8888)
+    device.store32(entries, 56, MODIFIER_INVALID_LO)
+    device.store32(entries, 60, MODIFIER_INVALID_HI)
     feedback.sendFormatTable(table.handle, @intCast(u32, FORMAT_TABLE_SIZE))
     // The event carries its own copy of the descriptor.
     table.release()
-    const gpu = gpuDevice(compositor)
+    // No device unless the renderer reads tiled buffers (see the top).
+    const gpu = if compositor.*.readsTiled { gpuDevice(compositor) } else { 0 }
     var number: [8]u8 = undefined
     var number_bytes: [*]u8 = undefined
     unsafe { number_bytes = @ptrCast([*]u8, &number) }
     device.store64(number_bytes, 0, gpu)
     const device_array = wl.wire.ArrayView.fromSlice(number[0..8])
     feedback.sendMainDevice(device_array)
+    // Tranche 1: LINEAR (table indices 0 and 1, u16 each).
     feedback.sendTrancheTargetDevice(device_array)
-    // Indices into the table, u16 each: 0 and 1.
-    var indices: [4]u8 = [4]u8{ 0, 0, 1, 0 }
-    feedback.sendTrancheFormats(wl.wire.ArrayView.fromSlice(indices[0..4]))
+    var linear: [4]u8 = [4]u8{ 0, 0, 1, 0 }
+    feedback.sendTrancheFormats(wl.wire.ArrayView.fromSlice(linear[0..4]))
     feedback.sendTrancheFlags(0)
     feedback.sendTrancheDone()
+    // Tranche 2: the implicit layout, for scanout (indices 2 and 3).
+    if compositor.*.readsTiled {
+        feedback.sendTrancheTargetDevice(device_array)
+        var implicit: [4]u8 = [4]u8{ 2, 0, 3, 0 }
+        feedback.sendTrancheFormats(wl.wire.ArrayView.fromSlice(implicit[0..4]))
+        feedback.sendTrancheFlags(TRANCHE_SCANOUT)
+        feedback.sendTrancheDone()
+    }
     feedback.sendDone()
     if compositor.*.verbose && !compositor.*.saidFeedback {
         compositor.*.saidFeedback = true
-        if gpu == 0 {
+        if !compositor.*.readsTiled {
+            state.say("dmabuf: no GPU named to clients (the renderer cannot read their tiled buffers): OpenGL clients render in software\n")
+        } else if gpu == 0 {
             state.say("dmabuf: no GPU found for clients (no /dev/dri/renderD*): OpenGL clients render in software\n")
         } else {
             state.say("dmabuf: clients are told to render on GPU ")
             state.sayNumber(@intCast(usize, device.deviceMajor(gpu)))
             state.say(":")
             state.sayNumber(@intCast(usize, device.deviceMinor(gpu)))
-            state.say("\n")
+            state.say(" (linear, else its own layout)\n")
         }
     }
 }
@@ -274,10 +333,12 @@ fn bindDmabuf(context: *anyopaque, client: wl.server.Client, object: wl.server.O
     }
 }
 
+const DMABUF_VERSION: u32 = 4
+
 pub fn createGlobal(compositor: *Compositor) -> bool {
     var memory: [*]u8 = undefined
     unsafe { memory = @ptrCast([*]u8, compositor) }
-    return compositor.*.server.createGlobal(wl.Interface.zwp_linux_dmabuf_v1, 4, bindDmabuf, state.contextOf(memory)) != 0
+    return compositor.*.server.createGlobal(wl.Interface.zwp_linux_dmabuf_v1, DMABUF_VERSION, bindDmabuf, state.contextOf(memory)) != 0
 }
 
 // ---------------------------------------------------------------------------

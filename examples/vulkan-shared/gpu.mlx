@@ -623,6 +623,7 @@ pub const IMPORT_FD_PROPERTIES: u32 = 3
 pub const IMPORT_MEMORY_TYPE: u32 = 4
 pub const IMPORT_ALLOCATE: u32 = 5
 pub const IMPORT_BIND: u32 = 6
+pub const IMPORT_CREATE_IMAGE: u32 = 7
 
 // The step, for a log line.
 pub fn importStepName(step: u32) -> []const u8 {
@@ -633,6 +634,7 @@ pub fn importStepName(step: u32) -> []const u8 {
     if step == IMPORT_MEMORY_TYPE { return "no memory type fits both the buffer and the dma-buf" }
     if step == IMPORT_ALLOCATE { return "vkAllocateMemory refused the dma-buf" }
     if step == IMPORT_BIND { return "vkBindBufferMemory failed" }
+    if step == IMPORT_CREATE_IMAGE { return "vkCreateImage failed for a dma-buf image" }
     return "unknown step"
 }
 
@@ -674,6 +676,98 @@ pub fn importBufferStep(context: *Context, result: *Buffer, fd: i32, size: u64) 
     result.*.memory = memory
     if vk.bindBufferMemory(context.*.commands, context.*.device, buffer, memory, 0) != vk.Result.success { return IMPORT_BIND }
     return IMPORT_DONE
+}
+
+// A dma-buf in the layout its driver picks for it by itself (no explicit
+// modifier: DRM_FORMAT_MOD_INVALID), typically tiled: radeonsi before GFX9
+// (Polaris and older) knows no modifiers and allocates window buffers this
+// way. Imported as a B8G8R8A8 image with a dedicated allocation, which lets
+// the driver take the real layout from the buffer's metadata (RADV reads
+// radeonsi's). copyImage copies it into a buffer, pixels in rows.
+pub const Image = struct {
+    image: vk.Image
+    memory: vk.DeviceMemory
+    width: u32
+    height: u32
+}
+
+// Imports `fd` (a dma-buf of `width` x `height` BGRA pixels) as an image;
+// IMPORT_DONE or the step that failed. Vulkan takes ownership of `fd` on
+// success.
+pub fn importImageStep(context: *Context, result: *Image, fd: i32, width: u32, height: u32) -> u32 {
+    result.*.image = 0
+    result.*.memory = 0
+    result.*.width = width
+    result.*.height = height
+    if !context.*.dmaBufImport { return IMPORT_UNSUPPORTED }
+    var external = vk.ExternalMemoryImageCreateInfo.init()
+    external.handleTypes = vk.EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT
+    var info = vk.ImageCreateInfo.init()
+    info.pNext = &external
+    info.imageType = vk.ImageType.type2d
+    info.format = vk.Format.b8g8r8a8Unorm
+    info.extent.width = width
+    info.extent.height = height
+    info.extent.depth = 1
+    info.mipLevels = 1
+    info.arrayLayers = 1
+    info.samples = vk.SAMPLE_COUNT_1_BIT
+    info.tiling = vk.ImageTiling.optimal
+    info.usage = vk.IMAGE_USAGE_TRANSFER_SRC_BIT
+    info.sharingMode = vk.SharingMode.exclusive
+    info.initialLayout = vk.ImageLayout.undefined_
+    var image: vk.Image = 0
+    if vk.createImage(context.*.commands, context.*.device, &info, null, &image) != vk.Result.success { return IMPORT_CREATE_IMAGE }
+    result.*.image = image
+    var requirements: vk.MemoryRequirements = undefined
+    vk.getImageMemoryRequirements(context.*.commands, context.*.device, image, &requirements)
+    var fd_properties = vk.MemoryFdPropertiesKHR.init()
+    if vk.getMemoryFdPropertiesKHR(context.*.commands, context.*.device, vk.EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT, fd, &fd_properties) != vk.Result.success { return IMPORT_FD_PROPERTIES }
+    var dedicated = vk.MemoryDedicatedAllocateInfo.init()
+    dedicated.image = image
+    var import_info = vk.ImportMemoryFdInfoKHR.init()
+    import_info.pNext = &dedicated
+    import_info.handleType = vk.EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT
+    import_info.fd = fd
+    var allocation = vk.MemoryAllocateInfo.init()
+    allocation.pNext = &import_info
+    allocation.allocationSize = requirements.size
+    const importable = if fd_properties.memoryTypeBits != 0 { fd_properties.memoryTypeBits } else { 4294967295 }
+    allocation.memoryTypeIndex = memoryType(context, requirements.memoryTypeBits & importable, 0)
+    if allocation.memoryTypeIndex == 4294967295 { return IMPORT_MEMORY_TYPE }
+    var memory: vk.DeviceMemory = 0
+    if vk.allocateMemory(context.*.commands, context.*.device, &allocation, null, &memory) != vk.Result.success { return IMPORT_ALLOCATE }
+    result.*.memory = memory
+    if vk.bindImageMemory(context.*.commands, context.*.device, image, memory, 0) != vk.Result.success { return IMPORT_BIND }
+    return IMPORT_DONE
+}
+
+pub fn destroyImage(context: *Context, image: *Image) -> void {
+    if image.*.image != 0 { vk.destroyImage(context.*.commands, context.*.device, image.*.image, null) }
+    if image.*.memory != 0 { vk.freeMemory(context.*.commands, context.*.device, image.*.memory, null) }
+    image.*.image = 0
+    image.*.memory = 0
+}
+
+// Records a copy of the whole image into `target` (rows of width pixels,
+// no gaps), made visible to the compute shaders that follow. The producer's
+// rendering is waited for by the kernel (implicit sync of shared buffers).
+// The image stays in the GENERAL layout: a transition from UNDEFINED could
+// make the driver reset compression metadata of memory another process
+// owns.
+pub fn copyImage(context: *Context, image: *const Image, target: vk.Buffer) -> void {
+    const commands = context.*.commandBuffer
+    var region = vk.BufferImageCopy.init()
+    region.imageSubresource.aspectMask = vk.IMAGE_ASPECT_COLOR_BIT
+    region.imageSubresource.layerCount = 1
+    region.imageExtent.width = image.*.width
+    region.imageExtent.height = image.*.height
+    region.imageExtent.depth = 1
+    unsafe { vk.cmdCopyImageToBuffer(context.*.commands, commands, image.*.image, vk.ImageLayout.general, target, 1, @ptrCast([*]const vk.BufferImageCopy, &region)) }
+    var barrier = vk.MemoryBarrier.init()
+    barrier.srcAccessMask = vk.ACCESS_TRANSFER_WRITE_BIT
+    barrier.dstAccessMask = vk.ACCESS_SHADER_READ_BIT
+    vk.cmdPipelineBarrier(context.*.commands, commands, vk.PIPELINE_STAGE_TRANSFER_BIT, vk.PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &barrier, 0, null, 0, null)
 }
 
 // A storage buffer over `size` bytes of this process's memory at `address`

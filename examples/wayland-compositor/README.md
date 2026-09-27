@@ -372,13 +372,29 @@ inactive-border-color = #505060
 title-bars = on
 # Frames per second in the title bars.
 fps-counter = on
+# on: programs draw their own title bars and frames.
+client-decorations = off
 ```
 
 [`examples/mlx-settings`](../mlx-settings/main.mlx) is a small window to
 change them: a row of colours for the border and switches for the title
-bars and the counter. It writes the file whole and renames it into place,
-so the compositor never reads half of it. The launcher lists it as
-Settings. Without title bars, windows move with Alt+drag.
+bars, the counter and app decorations. It writes the file whole and
+renames it into place, so the compositor never reads half of it. The
+launcher lists it as Settings. Without title bars, windows move with
+Alt+drag.
+
+### Decorations
+
+Programs that speak xdg-decoration (`zxdg_decoration_manager_v1`: GLFW and
+libdecor programs such as Minecraft, SDL, Qt, RetroArch, mpv) ask whether
+they should draw their own title bar and frame. With
+`client-decorations = off`, the default, the compositor answers that it
+draws them, so these programs leave theirs out and only the compositor's
+title bar shows. With `on` a program gets what it asks for (its own
+decorations when it does not say). A change reaches open windows at once:
+they are configured again with the new mode. Programs without
+xdg-decoration always draw their own: GTK (client-side decorations by
+design) and weston's demo clients such as weston-terminal.
 
 ## Drawing only what changed
 
@@ -572,44 +588,48 @@ mlx4 examples/vulkan-wayland-client/main.mlx -o vulkan-wayland-client
 
 `wl_compositor` (surfaces, and regions as input regions: a surface with
 one takes the pointer only inside it), `wl_shm` (ARGB8888 and XRGB8888),
-`zwp_linux_dmabuf_v1` version 4 (ARGB8888 and XRGB8888, linear, one plane,
-with feedback: see GPU clients below),
+`zwp_linux_dmabuf_v1` version 4 (ARGB8888 and XRGB8888, one plane, linear
+or in the driver's own layout; see GPU clients below),
 `wl_output`, `wl_seat` with pointer and keyboard, `wl_data_device_manager`
 version 3, `wl_subcompositor`, `xdg_wm_base` with toplevels (with
 `configure_bounds`: the output's size), popups and positioners,
 `zwlr_layer_shell_v1` version 5, `zwlr_foreign_toplevel_manager_v1`
-version 3 and `ext_background_effect_manager_v1` version 1 (see Dock and
-launcher).
+version 3, `ext_background_effect_manager_v1` version 1 (see Dock and
+launcher) and `zxdg_decoration_manager_v1` version 2 (see Decorations).
 Composition is done in software, or with Vulkan (`--renderer vulkan`).
 
 ### GPU clients (OpenGL, Vulkan)
 
 Mesa finds the GPU a Wayland client should render on in linux-dmabuf's
 feedback (version 4, `main_device`); the old `wl_drm` is not offered.
-Without that device OpenGL programs (Minecraft, anything through GLFW or
-SDL on EGL) fall back to llvmpipe and render on the CPU: F3 in Minecraft
-then shows `llvmpipe` instead of the graphics card. The compositor names
-the card it drives, or nested the first render node
+The compositor names the card it drives, or nested the first render node
 (`/dev/dri/renderD128` on), and logs it once with `--verbose`:
 
-    dmabuf: clients are told to render on GPU 226:0
+    dmabuf: clients are told to render on GPU 226:1 (linear, else its own layout)
 
-The buffers stay linear, so the Vulkan renderer reads them where they
-are. When the driver refuses one, the log says which step failed (for
-example `vkGetMemoryFdPropertiesKHR refused the dma-buf`) and that
-client's frames are copied by the CPU instead, which works but is slow.
+The feedback has two tranches. The first offers LINEAR buffers, which
+the Vulkan renderer reads where they are. The second offers the implicit
+modifier (the layout the client's driver picks, usually tiled) for
+scanout: radeonsi before GFX9 (Polaris such as the RX 580, and older)
+supports no explicit modifier, not even LINEAR, so Mesa allocates from
+this tranche (scanout keeps DCC compression off). Such a buffer lives in
+video memory the CPU may not map: it is not mapped, and the Vulkan
+renderer imports it as an image with a dedicated allocation (RADV takes
+the tiling from the buffer's metadata) and copies it into rows on the
+GPU each frame before composing it. The log says so once:
 
-Subsurfaces (Firefox insists on them) are drawn with the window they are
-part of, at their offset from it, in their stacking order (`place_above`,
-`place_below`, with the parent among them), and they can be nested. A
-subsurface in synchronized mode (the default) keeps its commits until its
-parent's state is applied; `set_desync` applies them at once. The pointer
-enters a subsurface with coordinates relative to it, and a click on it
-focuses and raises its window; Firefox gives its content subsurface an
-empty input region, so the pointer goes to its window instead
-(`tests/270_compositor_input_region_runtime.mlx`).
-`examples/wayland-client --subsurface` shows one, and
-`tools/check_wayland_compositor.sh` checks its pixels.
+    renderer: reading client buffers in the GPU's own layout (imported as images)
+
+Only a renderer that reads tiled buffers (Vulkan on a GPU) names a
+device: offered only LINEAR, a Polaris card cannot allocate a buffer and
+Mesa 26 crashes (a NULL image in `dri2_query_image`), so with the CPU
+renderer (or lavapipe) clients render with llvmpipe as with version 3.
+F3 in Minecraft shows which: the graphics card or `llvmpipe`.
+
+When the renderer cannot import a client's dma-buf, the log says which
+step failed (for example `vkGetMemoryFdPropertiesKHR refused the
+dma-buf`): a linear buffer is then copied by the CPU, a tiled one is not
+shown.
 
 ## Copy and paste
 

@@ -91,6 +91,7 @@ pub const Renderer = struct {
     hostImport: bool
     // Client memory had to be uploaded (said once, with --verbose).
     loggedUpload: bool
+    loggedTiled: bool
     // MLX_VULKAN_TEST_FAIL (tests): 1 makes verifyOutput find the first
     // frame missing, 2 makes the third compose fail.
     testFailure: u8
@@ -207,6 +208,7 @@ pub fn open(compositor: *Compositor, arguments: [][*]const u8, output: ?*kms.Out
     renderer.*.scanout = false
     renderer.*.verified = false
     renderer.*.loggedUpload = false
+    renderer.*.loggedTiled = false
     renderer.*.composed = 0
     renderer.*.testFailure = 0
     const test_failure = state.environmentValue(compositor.*.environment, "MLX_VULKAN_TEST_FAIL")
@@ -270,6 +272,11 @@ pub fn open(compositor: *Compositor, arguments: [][*]const u8, output: ?*kms.Out
     }
 
     compositor.*.renderer = @intFromPtr(renderer)
+    // Client buffers in the GPU's own layout are read as images: offered
+    // (linux-dmabuf's implicit modifier) only when the device can import
+    // them and is a GPU (a CPU device such as lavapipe would read another
+    // GPU's tiles as rows).
+    compositor.*.readsTiled = context.*.dmaBufImport && context.*.deviceType != vk.PhysicalDeviceType.cpu
     if compositor.*.verbose {
         say("renderer: vulkan (")
         const shown = std.io.writeString(std.io.stdout(), std.process.fromCString(gpu.deviceName(context)))
@@ -532,6 +539,7 @@ pub fn copyInstead(compositor: *Compositor, output: *kms.Output) -> bool {
 fn importPool(renderer: *Renderer, pool: *Pool) -> bool {
     if pool.*.imported { return true }
     if pool.*.importFailed { return false }
+    if pool.*.tiled { return importTiled(renderer, pool) }
     const context = renderer.*.context
     var imported: gpu.Buffer = undefined
     var done = false
@@ -567,6 +575,48 @@ fn importPool(renderer: *Renderer, pool: *Pool) -> bool {
     return true
 }
 
+// A dma-buf in its driver's own layout (see state.Pool.tiled): imported as
+// an image, plus a buffer in device memory it is copied into each frame
+// (gpu.copyImage), which the blit reads as rows of width pixels.
+fn importTiled(renderer: *Renderer, pool: *Pool) -> bool {
+    const context = renderer.*.context
+    var image: gpu.Image = undefined
+    var step = gpu.IMPORT_UNSUPPORTED
+    const duplicate = pool.*.memory.handle.duplicate()
+    if duplicate.isValid() {
+        step = gpu.importImageStep(context, &image, @intCast(i32, duplicate.descriptor), @intCast(u32, pool.*.width), @intCast(u32, pool.*.height))
+        if step != gpu.IMPORT_DONE {
+            gpu.destroyImage(context, &image)
+            duplicate.close()
+        }
+    }
+    var rows: gpu.Buffer = undefined
+    if step == gpu.IMPORT_DONE && !gpu.createDeviceBuffer(context, &rows, @intCast(u64, pool.*.width) * @intCast(u64, pool.*.height) * 4) {
+        gpu.destroyBuffer(context, &rows)
+        gpu.destroyImage(context, &image)
+        step = gpu.IMPORT_ALLOCATE
+    }
+    if step != gpu.IMPORT_DONE {
+        pool.*.importFailed = true
+        say("renderer: a client's dma-buf in its GPU's own layout (")
+        state.sayNumber(@intCast(usize, pool.*.width))
+        say("x")
+        state.sayNumber(@intCast(usize, pool.*.height))
+        say(") is not imported: ")
+        say(gpu.importStepName(step))
+        say("; it is not shown\n")
+        return false
+    }
+    pool.*.gpuImage = image
+    pool.*.gpuBuffer = rows
+    pool.*.imported = true
+    if !renderer.*.loggedTiled {
+        renderer.*.loggedTiled = true
+        say("renderer: reading client buffers in the GPU's own layout (imported as images)\n")
+    }
+    return true
+}
+
 // Drops a pool's Vulkan import (before its memory is unmapped or remapped).
 pub fn releasePool(compositor: *Compositor, pool: *Pool) -> void {
     if !pool.*.imported || compositor.*.renderer == 0 { return }
@@ -574,6 +624,10 @@ pub fn releasePool(compositor: *Compositor, pool: *Pool) -> void {
     // Nothing is in flight: frames are waited for before presenting.
     var imported = pool.*.gpuBuffer
     gpu.destroyBuffer(renderer.*.context, &imported)
+    if pool.*.tiled {
+        var image = pool.*.gpuImage
+        gpu.destroyImage(renderer.*.context, &image)
+    }
     pool.*.imported = false
 }
 
@@ -593,6 +647,8 @@ pub fn releaseSurface(compositor: *Compositor, surface: *Surface) -> void {
 // needed; copied only when the content changed since). Null when Vulkan
 // cannot make the buffer.
 fn upload(compositor: *Compositor, renderer: *Renderer, surface: *Surface, buffer: *Buffer) -> ?*gpu.Buffer {
+    // A dma-buf the CPU cannot map: nothing to upload from.
+    if buffer.*.pool.*.memory.address == 0 { return null }
     const width = @intCast(usize, buffer.*.width)
     const height = @intCast(usize, buffer.*.height)
     const size = width * height * 4
@@ -698,6 +754,14 @@ fn drawSurface(compositor: *Compositor, renderer: *Renderer, surface: *Surface, 
     // The shader addresses whole pixels.
     if buffer.*.offset % 4 != 0 || buffer.*.stride % 4 != 0 { return }
     const opaque = buffer.*.format == @intFromEnum(wl.wl_shm.Format.xrgb8888)
+    if pool.*.tiled {
+        // Only the GPU can read it: copied into rows first.
+        if !importPool(renderer, pool) || renderer.*.failed { return }
+        const image = pool.*.gpuImage
+        gpu.copyImage(renderer.*.context, &image, pool.*.gpuBuffer.buffer)
+        blit(compositor, renderer, pool.*.gpuBuffer.buffer, 0, @intCast(u32, pool.*.width), buffer.*.width, buffer.*.height, x, y, opaque)
+        return
+    }
     if importPool(renderer, pool) {
         blit(compositor, renderer, pool.*.gpuBuffer.buffer, @intCast(u32, buffer.*.offset / 4), @intCast(u32, buffer.*.stride / 4), buffer.*.width, buffer.*.height, x, y, opaque)
         return

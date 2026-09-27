@@ -22,7 +22,10 @@
 #      forwarded xkb keymap, drag it by its title bar (xdg_toplevel.move)
 #      and open its right-click popup menu;
 #   7. with wl-clipboard and gtk4-widget-factory (if installed): copy and
-#      paste between two clients, and a GTK 4 window.
+#      paste between two clients, and a GTK 4 window;
+#   8. xdg-decoration: a client asking to draw its own title bar is told
+#      the compositor draws it, until the settings file allows client
+#      decorations (and again not when it stops).
 #
 # Typed commands create marker files, so keyboard delivery is verified at the
 # shell; the moved window's focus frame is checked in the host's screenshot.
@@ -46,6 +49,10 @@ export XDG_RUNTIME_DIR="$work/runtime"
 # wrongly kept across turns shows (examples/wayland-compositor/arena.mlx).
 export MLX_ARENA_POISON=${MLX_ARENA_POISON:-1}
 mkdir -m 700 "$XDG_RUNTIME_DIR"
+# The compositor's settings file: the defaults unless a scenario writes one
+# (not the user's own ~/.config/mlx/compositor.conf).
+export XDG_CONFIG_HOME="$work/config"
+mkdir -p "$XDG_CONFIG_HOME/mlx"
 # GTK's document portal may have mounted itself under the runtime directory.
 trap 'fusermount -u "$XDG_RUNTIME_DIR/doc" 2> /dev/null || true; rm -rf -- "$work"' EXIT
 
@@ -294,6 +301,23 @@ for x, y in ((40, 40), (170, 90), (100, 140), (60, 90)):
     assert rgb(x, y) != green, ("window pixel", x, y, rgb(x, y))
 PY
 echo "ok   a subsurface is drawn at its offset in its window"
+
+# Scenario 8: xdg-decoration. The client asks for client-side decorations;
+# the compositor answers server side (its default), client side once the
+# settings file says client-decorations = on, server side again after off.
+cat > "$work/decoration.sh" <<SCRIPT
+#!/bin/sh
+( sleep 2; printf 'client-decorations = on\n' > "$XDG_CONFIG_HOME/mlx/compositor.conf"
+  sleep 2; printf 'client-decorations = off\n' > "$XDG_CONFIG_HOME/mlx/compositor.conf" ) &
+exec "$work/hello-wayland" --decoration client > "$work/decoration.log"
+SCRIPT
+chmod +x "$work/decoration.sh"
+printf 'wait 6000\nclose\n' > "$work/decoration.script"
+run_scenario decoration "$work/decoration.script" --run "$work/decoration.sh"
+rm -f "$XDG_CONFIG_HOME/mlx/compositor.conf"
+modes=$(uniq "$work/decoration.log" | tr '\n' ' ')
+[[ "$modes" == "decoration: server side decoration: client side decoration: server side " ]] || { echo "decoration modes: $modes" >&2; cat "$work/decoration-compositor.log" >&2; exit 1; }
+echo "ok   xdg-decoration: server side by default, client side while the settings allow it"
 
 # Scenario 6: copy and paste between two clients through the compositor's
 # wl_data_device_manager, with wl-clipboard (if available): wl-copy sets

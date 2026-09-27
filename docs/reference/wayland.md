@@ -160,6 +160,9 @@ upstream, the provenance record, and the bootstrap tool:
 | `wayland.xml` | core protocol, wayland 1.26.0 |
 | `xdg-shell.xml` | stable xdg-shell, wayland-protocols 1.49 |
 | `linux-dmabuf-v1.xml` | stable linux-dmabuf (`zwp_linux_dmabuf_v1`, version 6), wayland-protocols 1.49 |
+| `ext-background-effect-v1.xml` | staging background effects (`ext_background_effect_manager_v1`), wayland-protocols 1.49 |
+| `wlr-layer-shell-unstable-v1.xml`, `wlr-foreign-toplevel-management-unstable-v1.xml` | wlr-protocols bf4fc79a |
+| `xdg-decoration-unstable-v1.xml` | unstable xdg-decoration (`zxdg_decoration_manager_v1`, version 2), wayland-protocols 1.49 |
 | `SOURCES` | upstream URL, release and SHA-256 of each XML file |
 | `materialize.mlx` | Stage-1 tool: XML to `std/src/wayland/generated/` |
 | `materialize.sh` | verifies the hashes, builds the tool, runs it |
@@ -620,8 +623,9 @@ with `sendCreated()` (which creates the `wl_buffer` resource) or
   renders with Vulkan (`std.vulkan`, no C loader) and hands frames over as
   dma-bufs, or renders straight into its `wl_shm` pool.
 - The compositor offers linux-dmabuf version 4 (ARGB8888/XRGB8888,
-  linear) with feedback naming its GPU, so Mesa's EGL renders on it
-  rather than falling back to llvmpipe, and,
+  linear or in the driver's own layout, with feedback naming its GPU so
+  Mesa's EGL renders on it rather than on llvmpipe; see the compositor's
+  README) and,
   with `--renderer vulkan`, composes on the GPU, reading client pools and
   dma-bufs in place and rendering into the output in place: nested, the
   host window's `wl_shm` buffer; freestanding, the DRM dumb buffer the
