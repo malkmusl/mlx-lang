@@ -393,7 +393,13 @@ pixel-identical to the CPU renderer.
 
 Drivers that cannot import the output or that shared memory (RADV and the
 other amdgpu drivers import only anonymous host memory, not the memfd
-behind a `wl_shm` pool) use copies instead: the frame is rendered in
+behind a `wl_shm` pool) use copies instead. Freestanding, the renderer
+first tries zero copy: it renders into two buffers of the GPU's own memory,
+exported as dma-bufs and made the monitor's framebuffers
+(`PRIME_FD_TO_HANDLE`, then a framebuffer on the handle), so the monitor
+scans out what the GPU drew and nothing is copied (`renderer: zero copy`
+in the log; `MLX_VULKAN_NO_SCANOUT=1` turns it off). Otherwise the frame is
+rendered into the dumb buffers when the driver can import them, or else in
 device memory, the part the output buffer lacks is copied by the GPU into
 host-cached memory and from there into the output, and a `wl_shm` client
 buffer is uploaded into a per-window buffer (device memory the CPU can
