@@ -27,7 +27,11 @@
 #     from its menu;
 #   - then, with tools/wayland-drag-source as a file manager, drops a
 #     folder on the dock (it is pinned) and a file on the trash (it goes
-#     into it).
+#     into it);
+#   - runs the top bar (mlx-topbar) with a terminal: the bar is along the
+#     top and reserves it (the terminal moves below it, maximized it stays
+#     below), shows the active app and a fixed time in German, and the
+#     local times clock.mlx computes match python's zoneinfo.
 # The window behind the launcher must show blurred through it, and the
 # screenshots must be the same with the CPU and the Vulkan renderer, and
 # with the apps drawing on the GPU (their standard) and on the CPU
@@ -54,6 +58,8 @@ trap 'rm -rf -- "$work"' EXIT
 "$compiler" --quiet examples/mlx-launcher/main.mlx -o "$work/mlx-launcher"
 "$compiler" --quiet tools/wayland-test-host/main.mlx -o "$work/test-host"
 "$compiler" --quiet tools/wayland-drag-source/main.mlx -o "$work/drag-source"
+"$compiler" --quiet examples/mlx-topbar/main.mlx -o "$work/mlx-topbar"
+"$compiler" --quiet tools/clock-probe/main.mlx -o "$work/clock-probe"
 xkbcli compile-keymap --layout us > "$work/us.xkb"
 
 # The apps: only these (no system directories), one with an icon.
@@ -216,7 +222,7 @@ run() {
     env -i PATH="$PATH" HOME="$work/home" XDG_RUNTIME_DIR="$runtime" WAYLAND_DISPLAY=host-desktop \
         XDG_DATA_HOME="$work/data" XDG_DATA_DIRS="$work/none" XDG_CONFIG_HOME="$work/config" VK_DRIVER_FILES="$manifest" MLX_CANVAS="${2:-}" \
         timeout 60 "$work/mlx-compositor" --verbose --no-fps --renderer "$renderer" --socket nested-desktop \
-        --terminal "$work/mlx-terminal" --launcher "$work/mlx-launcher" --dock "$work/mlx-dock" \
+        --terminal "$work/mlx-terminal" --launcher "$work/mlx-launcher" --dock "$work/mlx-dock" --topbar none \
         --run "$work/mlx-terminal" --run "$work/mlx-terminal" > "$work/$name.log" 2>&1 || status=$?
     wait "$host_pid" || fail "$renderer: the test host failed" "$work/$name-host.log"
     rm -rf -- "$runtime"
@@ -352,7 +358,7 @@ SCRIPT
     env -i PATH="$PATH" HOME="$work/home" XDG_RUNTIME_DIR="$runtime" WAYLAND_DISPLAY=host-drops \
         XDG_DATA_HOME="$work/data" XDG_DATA_DIRS="$work/none" XDG_CONFIG_HOME="$work/config" MLX_CANVAS=cpu \
         timeout 60 "$work/mlx-compositor" --verbose --no-fps --renderer cpu --socket nested-drops \
-        --terminal "$work/mlx-terminal" --launcher none --dock "$work/mlx-dock" --run "$work/drag.sh" > "$work/drops.log" 2>&1 || status=$?
+        --terminal "$work/mlx-terminal" --launcher none --dock "$work/mlx-dock" --topbar none --run "$work/drag.sh" > "$work/drops.log" 2>&1 || status=$?
     wait "$host_pid" || fail "drops: the test host failed" "$work/drops-host.log"
     rm -rf -- "$runtime"
     [[ $status -eq 0 ]] || fail "drops: the compositor exited with status $status" "$work/drops.log"
@@ -368,4 +374,82 @@ SCRIPT
     fi
 }
 
+# The top bar with a terminal, at a fixed time (2024-09-27 14:05 UTC, 16:05
+# in Berlin), in German.
+topbar() {
+    local runtime
+    runtime=$(mktemp -d)
+    cat > "$work/topbar.script" <<SCRIPT
+wait 3000
+shot $work/topbar.ppm
+pointer 300 200
+press 272
+release 272
+wait 300
+down 125
+down 103
+up 103
+up 125
+wait 1200
+close
+SCRIPT
+    XDG_RUNTIME_DIR=$runtime "$work/test-host" host-topbar "$work/us.xkb" "$work/topbar.script" > "$work/topbar-host.log" 2>&1 &
+    local host_pid=$!
+    for _ in $(seq 1 50); do [[ -S "$runtime/host-topbar" ]] && break; sleep 0.1; done
+    local status=0
+    env -i PATH="$PATH" HOME="$work/home" XDG_RUNTIME_DIR="$runtime" WAYLAND_DISPLAY=host-topbar \
+        XDG_DATA_HOME="$work/data" XDG_DATA_DIRS="$work/none" XDG_CONFIG_HOME="$work/config" MLX_CANVAS=cpu \
+        LANG=de_DE.UTF-8 TZ="CET-1CEST,M3.5.0,M10.5.0/3" MLX_TOPBAR_TIME=1727445900 \
+        timeout 60 "$work/mlx-compositor" --verbose --no-fps --renderer cpu --socket nested-topbar \
+        --terminal "$work/mlx-terminal" --launcher none --dock none --topbar "$work/mlx-topbar" --run "$work/mlx-terminal" > "$work/topbar.log" 2>&1 || status=$?
+    wait "$host_pid" || fail "topbar: the test host failed" "$work/topbar-host.log"
+    rm -rf -- "$runtime"
+    [[ $status -eq 0 ]] || fail "topbar: the compositor exited with status $status" "$work/topbar.log"
+    local log="$work/topbar.log"
+    grep -q "^layer: mlx-topbar 1024x30 at 0,0 in layer 2" "$log" || fail "topbar: the bar is not along the top in the top layer" "$log"
+    # The terminal came before the bar reserved the top: it moved below.
+    grep -q "^window: 652x396 at 24,24" "$log" || fail "topbar: the terminal did not open at (24, 24)" "$log"
+    grep -q "^maximize: Mlx Terminal" "$log" && grep -q "^window: 1020x700 at 2,52" "$log" || fail "topbar: the maximized terminal is not below the bar" "$log"
+    python3 - "$work/topbar.ppm" <<'PY' || fail "topbar: the bar does not show the app and the time" "$log"
+import sys
+data = open(sys.argv[1], 'rb').read()
+header, size, depth, pixels = data.split(b'\n', 3)
+width, height = map(int, size.split())
+def at(x, y): return tuple(pixels[(y * width + x) * 3:(y * width + x) * 3 + 3])
+def lit(x0, x1): return sum(1 for x in range(x0, x1) for y in range(8, 22) if min(at(x, y)) > 200)
+# White text at the left (the app's name) and the right (the time), none
+# in the middle; the terminal's title bar starts below the bar.
+assert lit(40, 110) > 20, lit(40, 110)
+assert lit(890, 1010) > 40, lit(890, 1010)
+assert lit(400, 600) == 0, lit(400, 600)
+assert min(at(300, 40)) > 80, at(300, 40)
+PY
+    echo "ok   the top bar is along the top, reserves it, and shows the app and the time"
+    # The zone arithmetic against python's zoneinfo, where it is there.
+    if python3 -c 'import zoneinfo; zoneinfo.ZoneInfo("Europe/Berlin")' 2> /dev/null; then
+        python3 - "$work/clock-probe" <<'PY' || fail "clock.mlx and zoneinfo disagree" /dev/null
+import subprocess, random, datetime, zoneinfo, sys
+random.seed(7)
+bad = 0
+for name in ["Europe/Berlin", "America/New_York", "Australia/Sydney", "Asia/Kolkata", "America/St_Johns", "UTC"]:
+    zone = zoneinfo.ZoneInfo(name)
+    times = [random.randint(0, 4102444800) for _ in range(400)]
+    for year in (2024, 2031, 2039):
+        for month in (3, 4, 10, 11):
+            base = int(datetime.datetime(year, month, 1, tzinfo=datetime.timezone.utc).timestamp())
+            times += [base + day * 86400 + hour * 3600 - 1 for day in range(31) for hour in range(4)]
+    lines = subprocess.run([sys.argv[1]] + [str(t) for t in times], env={"TZ": name}, capture_output=True, text=True).stdout.split("\n")
+    for t, line in zip(times, lines):
+        d = datetime.datetime.fromtimestamp(t, zone)
+        want = f"{d.year:04d}-{d.month:02d}-{d.day:02d} {d.hour:02d}:{d.minute:02d}:{d.second:02d} {int(d.utcoffset().total_seconds())}"
+        if line != want:
+            bad += 1
+            if bad < 5: print(name, t, line, "!=", want)
+sys.exit(1 if bad else 0)
+PY
+        echo "ok   local times from zone files match python's zoneinfo"
+    fi
+}
+
 drops
+topbar

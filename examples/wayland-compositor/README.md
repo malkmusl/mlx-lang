@@ -81,7 +81,8 @@ Options: `--socket NAME`, `--size WxH`, `--fullscreen` (a fullscreen
 window at the monitor's resolution), `--renderer auto|vulkan|cpu` (default
 `auto`: Vulkan when a driver works, else the CPU), `--font PATH|none`,
 `--terminal PROGRAM`, `--launcher PROGRAM|none` (what Super starts),
-`--dock PROGRAM|none` (the dock, kept running), `--run PROGRAM`
+`--dock PROGRAM|none` (the dock, kept running), `--topbar PROGRAM|none`
+(the top bar, kept running), `--run PROGRAM`
 (repeatable), `--screenshot FILE`, `--timeout SECONDS`, `--no-fps` (no
 frames-per-second counters in the title bars), `--verbose` (which also
 logs, once a second, `perf:` lines with the frame rate and how long a
@@ -194,6 +195,21 @@ reserves no space, so maximized windows reach the bottom edge. It slides
 out of sight once the pointer has been away from it for 0.6 seconds and
 back up when the pointer touches the output's bottom edge; it stays while
 its previews show or a button is held.
+
+The top bar (`mlx-topbar`, `--topbar PROGRAM|none`, started and kept
+running like the dock over `MLX_TOPBAR_FD`) sits in the top layer along
+the top edge, 30 pixels high with an exclusive zone, as the menu bar of
+macOS: maximized windows start below it and windows placed under it are
+moved down. It is translucent over a blur and shows a mark and the name
+of the active window's app on the left (its desktop entry's name, else
+its app id or title) and the date and time on the right ("So. 27. Sep.
+16:05" when `LC_ALL`, `LC_TIME` or `LANG` is German, else "Sun 27 Sep
+16:05"). The time zone comes from `$TZ` (a zone name looked up in
+`/usr/share/zoneinfo`, a file, or a POSIX rule such as
+`CET-1CEST,M3.5.0,M10.5.0/3`), else `/etc/localtime`; the TZif files
+and their rules for the years after the table are read by
+`desktop-shared/clock.mlx`. `MLX_SESSION_TOPBAR=no` starts the session
+without it.
 
 mlx-settings lists the hotkeys: a click on one records the next key
 combination (Escape keeps the old one, Backspace unbinds it, a right click
