@@ -58,9 +58,12 @@ pub const Renderer = struct {
     targets: [2]*gpu.Buffer
     targetOffsets: [2]u32
     stride: u32
-    // The slots are not the output itself: each frame is copied from its
-    // slot to `copyTo[slot]`, whose rows are `copyPitch[slot]` bytes apart.
+    // The slots are not the output itself: they are in device memory, what
+    // a frame changed is copied by the GPU into `readback` (host memory, the
+    // same layout) and from there to `copyTo[slot]`, whose rows are
+    // `copyPitch[slot]` bytes apart.
     copyOutput: bool
+    readback: *gpu.Buffer
     copyTo: [2]usize
     copyPitch: [2]usize
     // Freestanding: the slots are the dumb buffers imported as dma-bufs,
@@ -182,6 +185,7 @@ pub fn open(compositor: *Compositor, arguments: [][*]const u8, output: ?*kms.Out
         kernel = @ptrFromInt(*gpu.Kernel, record(compositor, @sizeOf(gpu.Kernel)))
         renderer.*.targets[0] = @ptrFromInt(*gpu.Buffer, record(compositor, @sizeOf(gpu.Buffer)))
         renderer.*.targets[1] = @ptrFromInt(*gpu.Buffer, record(compositor, @sizeOf(gpu.Buffer)))
+        renderer.*.readback = @ptrFromInt(*gpu.Buffer, record(compositor, @sizeOf(gpu.Buffer)))
         renderer.*.background = @ptrFromInt(*gpu.Buffer, record(compositor, @sizeOf(gpu.Buffer)))
         renderer.*.palette = @ptrFromInt(*gpu.Buffer, record(compositor, @sizeOf(gpu.Buffer)))
         renderer.*.arrow = @ptrFromInt(*gpu.Buffer, record(compositor, @sizeOf(gpu.Buffer)))
@@ -195,6 +199,7 @@ pub fn open(compositor: *Compositor, arguments: [][*]const u8, output: ?*kms.Out
     renderer.*.blit = kernel
     renderer.*.failed = false
     renderer.*.copyOutput = false
+    clearBuffer(renderer.*.readback)
     renderer.*.importedDumb = false
     renderer.*.verified = false
     renderer.*.loggedUpload = false
@@ -232,12 +237,12 @@ pub fn open(compositor: *Compositor, arguments: [][*]const u8, output: ?*kms.Out
     // fillStatic (again when a new renderer is loaded: reloaded).
     const width = compositor.*.width
     const height = compositor.*.height
-    if !gpu.createBuffer(context, renderer.*.background, @intCast(u64, width * height * 4), false) { return false }
+    if !gpu.createUploadBuffer(context, renderer.*.background, @intCast(u64, width * height * 4)) { return false }
     const longest = if width > height { width } else { height }
     renderer.*.paletteWidth = @intCast(u32, longest + 8)
-    if !gpu.createBuffer(context, renderer.*.palette, @intCast(u64, (longest + 8) * 2 * 4), false) { return false }
+    if !gpu.createUploadBuffer(context, renderer.*.palette, @intCast(u64, (longest + 8) * 2 * 4)) { return false }
     const box = @intCast(usize, scene.CURSOR_SIZE)
-    if !gpu.createBuffer(context, renderer.*.arrow, @intCast(u64, box * box * @intCast(usize, scene.CURSOR_KINDS) * 4), false) { return false }
+    if !gpu.createUploadBuffer(context, renderer.*.arrow, @intCast(u64, box * box * @intCast(usize, scene.CURSOR_KINDS) * 4)) { return false }
     fillStatic(compositor, renderer)
 
     // Blur: without it (no memory, no pipeline) blurred surfaces are drawn
@@ -248,7 +253,7 @@ pub fn open(compositor: *Compositor, arguments: [][*]const u8, output: ?*kms.Out
     const pass_words = shaders.buildBlurPassWords(allocator, &pass_code)
     const mask_words = shaders.buildBlurMaskWords(allocator, &mask_code)
     if pass_words != 0 && mask_words != 0 && gpu.createKernel(context, renderer.*.blurPass, pass_code, pass_words, 2, shaders.BLUR_PASS_WORDS) && gpu.createKernel(context, renderer.*.blurMask, mask_code, mask_words, 3, shaders.BLUR_MASK_WORDS) {
-        renderer.*.hasBlur = gpu.createBuffer(context, renderer.*.blurFirst, @intCast(u64, width * height * 4), false) && gpu.createBuffer(context, renderer.*.blurSecond, @intCast(u64, width * height * 4), false) && gpu.createBuffer(context, renderer.*.blurOps, @intCast(u64, BLUR_SLOTS * shaders.BLUR_OPS * 5 * 4), false)
+        renderer.*.hasBlur = gpu.createDeviceBuffer(context, renderer.*.blurFirst, @intCast(u64, width * height * 4)) && gpu.createDeviceBuffer(context, renderer.*.blurSecond, @intCast(u64, width * height * 4)) && gpu.createUploadBuffer(context, renderer.*.blurOps, @intCast(u64, BLUR_SLOTS * shaders.BLUR_OPS * 5 * 4))
     }
     if !renderer.*.hasBlur { say("mlx-compositor: no blur in Vulkan (its pipeline or memory is missing); blurred surfaces are drawn as they are\n") }
 
@@ -263,7 +268,7 @@ pub fn open(compositor: *Compositor, arguments: [][*]const u8, output: ?*kms.Out
         say("renderer: vulkan (")
         const shown = std.io.writeString(std.io.stdout(), std.process.fromCString(gpu.deviceName(context)))
         say(")\n")
-        if renderer.*.copyOutput { say("renderer: the driver cannot render into the output in place; copying each frame\n") }
+        if renderer.*.copyOutput { say("renderer: the driver cannot render into the output in place; copying each frame (what changed, composed in device memory)\n") }
     }
     return true
 }
@@ -339,8 +344,10 @@ fn attachHostPool(compositor: *Compositor, renderer: *Renderer) -> bool {
     clearBuffer(target)
     if !renderer.*.hostImport || !gpu.importHostMemory(context, target, host.address, roundUp(host.size, context.*.hostAlignment)) {
         gpu.destroyBuffer(context, target)
-        if !gpu.createReadbackBuffer(context, target, @intCast(u64, host.size)) {
+        gpu.destroyBuffer(context, renderer.*.readback)
+        if !gpu.createDeviceBuffer(context, target, @intCast(u64, host.size)) || !gpu.createReadbackBuffer(context, renderer.*.readback, @intCast(u64, host.size)) {
             gpu.destroyBuffer(context, target)
+            gpu.destroyBuffer(context, renderer.*.readback)
             return false
         }
         renderer.*.copyOutput = true
@@ -397,10 +404,12 @@ fn attachDumbCopy(compositor: *Compositor, renderer: *Renderer, output: *kms.Out
     gpu.destroyBuffer(context, renderer.*.targets[0])
     gpu.destroyBuffer(context, renderer.*.targets[1])
     renderer.*.importedDumb = false
+    gpu.destroyBuffer(context, renderer.*.readback)
     const frame_bytes = compositor.*.width * compositor.*.height * 4
     const target = renderer.*.targets[0]
-    if !gpu.createReadbackBuffer(context, target, @intCast(u64, frame_bytes * 2)) {
+    if !gpu.createDeviceBuffer(context, target, @intCast(u64, frame_bytes * 2)) || !gpu.createReadbackBuffer(context, renderer.*.readback, @intCast(u64, frame_bytes * 2)) {
         gpu.destroyBuffer(context, target)
+        gpu.destroyBuffer(context, renderer.*.readback)
         return false
     }
     renderer.*.targets[1] = target
@@ -535,7 +544,7 @@ fn upload(compositor: *Compositor, renderer: *Renderer, surface: *Surface, buffe
     if surface.*.staging == 0 {
         const address = record(compositor, @sizeOf(gpu.Buffer))
         unsafe { staging = @ptrFromInt(*gpu.Buffer, address) }
-        if !gpu.createBuffer(renderer.*.context, staging, @intCast(u64, size), false) {
+        if !gpu.createUploadBuffer(renderer.*.context, staging, @intCast(u64, size)) {
             gpu.destroyBuffer(renderer.*.context, staging)
             unsafe { state.release(compositor, @ptrFromInt([*]u8, address), @sizeOf(gpu.Buffer)) }
             return null
@@ -755,14 +764,19 @@ pub fn compose(compositor: *Compositor, slot: usize) -> bool {
         }
     }
     if renderer.*.failed { return false }
+    // Copied out: only the part the output buffer lacks (the rest is there
+    // from before), first by the GPU into host memory.
+    const area = ui.intersect(compositor.*.copyRegion, scene.outputRect(compositor))
+    if renderer.*.copyOutput && !ui.isEmpty(area) {
+        gpu.copyBlock(context, renderer.*.target, renderer.*.readback.*.buffer, @intCast(u64, renderer.*.offset), @intCast(u64, renderer.*.stride), @intCast(u64, area.x), @intCast(u64, area.y), @intCast(u64, area.width), @intCast(u64, area.height))
+    }
     if !gpu.submit(context) { return false }
     if renderer.*.copyOutput {
-        // From the rendered frame (rows `stride` pixels apart) into the
-        // output buffer: the part it lacks (the rest is there from before).
-        const source = renderer.*.targets[slot].*.address + @intCast(usize, renderer.*.offset) * 4
+        // From the frame in host memory (rows `stride` pixels apart) into
+        // the output buffer.
+        const source = renderer.*.readback.*.address + @intCast(usize, renderer.*.offset) * 4
         const row_bytes = compositor.*.width * 4
         const pitch = renderer.*.copyPitch[slot]
-        const area = ui.intersect(compositor.*.copyRegion, scene.outputRect(compositor))
         if ui.isEmpty(area) { return true }
         const full = area.x == 0 && area.y == 0 && @intCast(usize, area.width) == compositor.*.width && @intCast(usize, area.height) == compositor.*.height
         if full && pitch == row_bytes && @intCast(usize, renderer.*.stride) == compositor.*.width {

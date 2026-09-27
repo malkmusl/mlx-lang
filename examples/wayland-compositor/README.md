@@ -393,10 +393,13 @@ pixel-identical to the CPU renderer.
 
 Drivers that cannot import the output or that shared memory (RADV and the
 other amdgpu drivers import only anonymous host memory, not the memfd
-behind a `wl_shm` pool) use copies instead: the frame is rendered into a
-host-cached buffer and copied into the output, row by row where the pitch
-differs, and a `wl_shm` client buffer is uploaded into a per-window buffer
-when the client commits new content. dma-bufs, the dumb buffers included,
+behind a `wl_shm` pool) use copies instead: the frame is rendered in
+device memory, the part the output buffer lacks is copied by the GPU into
+host-cached memory and from there into the output, and a `wl_shm` client
+buffer is uploaded into a per-window buffer (device memory the CPU can
+write, where there is room) when the client commits new content: only
+what its damage says changed. On discrete GPUs this keeps the GPU's
+reads and writes in its own memory instead of across PCIe. dma-bufs, the dumb buffers included,
 are still imported where the driver can. `--verbose` says when this
 happens (`renderer: ... copying each frame`); `MLX_VULKAN_NO_HOST_IMPORT=1`
 takes this path on any driver.
