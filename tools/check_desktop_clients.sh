@@ -23,8 +23,11 @@
 #   - opens the launcher, drags the other app onto the dock (it is
 #     pinned: drag and drop through the compositor) and unpins it from the
 #     launcher's right-click menu;
-#   - clicks the Downloads folder (its newest files show) and empties the
-#     trash from its menu.
+#   - clicks the Downloads folder (its stack shows) and empties the trash
+#     from its menu;
+#   - then, with tools/wayland-drag-source as a file manager, drops a
+#     folder on the dock (it is pinned) and a file on the trash (it goes
+#     into it).
 # The window behind the launcher must show blurred through it, and the
 # screenshots must be the same with the CPU and the Vulkan renderer, and
 # with the apps drawing on the GPU (their standard) and on the CPU
@@ -50,6 +53,7 @@ trap 'rm -rf -- "$work"' EXIT
 "$compiler" --quiet examples/mlx-dock/main.mlx -o "$work/mlx-dock"
 "$compiler" --quiet examples/mlx-launcher/main.mlx -o "$work/mlx-launcher"
 "$compiler" --quiet tools/wayland-test-host/main.mlx -o "$work/test-host"
+"$compiler" --quiet tools/wayland-drag-source/main.mlx -o "$work/drag-source"
 xkbcli compile-keymap --layout us > "$work/us.xkb"
 
 # The apps: only these (no system directories), one with an icon.
@@ -245,9 +249,12 @@ data = open(sys.argv[1], 'rb').read()
 header, size, depth, pixels = data.split(b'\n', 3)
 width, height = map(int, size.split())
 def at(x, y): return tuple(pixels[(y * width + x) * 3:(y * width + x) * 3 + 3])
-# The menu's background above the folder (two files, a line, Open).
+# The stack above the folder: a grid (two files: the first cell has an
+# icon, the third is empty) under a header with the Open button.
 assert at(577, 640) == (30, 33, 42), at(577, 640)
-assert at(577, 560) != (30, 33, 42), at(577, 560)
+assert at(393, 622) != (30, 33, 42), at(393, 622)
+assert at(742, 566) == (58, 62, 74), at(742, 566)
+assert at(577, 500) != (30, 33, 42), at(577, 500)
 PY
     echo "ok   $renderer: the dock shows the Downloads folder as a stack and empties the trash"
 
@@ -290,3 +297,75 @@ run cpu cpu
 cmp -s "$work/cpu/rest.ppm" "$work/cpu-canvas-cpu/rest.ppm" || fail "the dock drawn on the GPU differs from the dock drawn on the CPU"
 cmp -s "$work/cpu/launcher.ppm" "$work/cpu-canvas-cpu/launcher.ppm" || fail "the launcher drawn on the GPU differs from the launcher drawn on the CPU"
 echo "ok   the apps draw the same pixels on the GPU (paint shader) as on the CPU"
+
+# Files dragged in (tools/wayland-drag-source, as from a file manager): a
+# folder dropped on the dock is pinned among the folders; a file dropped
+# on the trash goes into it.
+drops() {
+    local runtime
+    runtime=$(mktemp -d)
+    mkdir -p "$work/home/Documents"
+    echo junk > "$work/home/junk.txt"
+    cat > "$work/drag.sh" <<SCRIPT
+#!/bin/sh
+exec "$work/drag-source" "file://$work/home/Documents" "file://$work/home/junk.txt"
+SCRIPT
+    chmod +x "$work/drag.sh"
+    # The drag source's window at (24, 24); in the dock it runs as an app
+    # of its own, so the trash is at x 731 once the folder joined.
+    cat > "$work/drops.script" <<SCRIPT
+wait 3000
+pointer 100 100
+wait 300
+press 272
+wait 100
+pointer 110 110
+wait 100
+pointer 300 400
+wait 100
+pointer 540 720
+wait 300
+pointer 541 728
+wait 800
+release 272
+wait 2000
+pointer 100 100
+wait 300
+press 272
+wait 100
+pointer 110 110
+wait 100
+pointer 400 500
+wait 100
+pointer 725 725
+wait 300
+pointer 731 730
+wait 800
+release 272
+wait 2500
+close
+SCRIPT
+    XDG_RUNTIME_DIR=$runtime "$work/test-host" host-drops "$work/us.xkb" "$work/drops.script" > "$work/drops-host.log" 2>&1 &
+    local host_pid=$!
+    for _ in $(seq 1 50); do [[ -S "$runtime/host-drops" ]] && break; sleep 0.1; done
+    local status=0
+    env -i PATH="$PATH" HOME="$work/home" XDG_RUNTIME_DIR="$runtime" WAYLAND_DISPLAY=host-drops \
+        XDG_DATA_HOME="$work/data" XDG_DATA_DIRS="$work/none" XDG_CONFIG_HOME="$work/config" MLX_CANVAS=cpu \
+        timeout 60 "$work/mlx-compositor" --verbose --no-fps --renderer cpu --socket nested-drops \
+        --terminal "$work/mlx-terminal" --launcher none --dock "$work/mlx-dock" --run "$work/drag.sh" > "$work/drops.log" 2>&1 || status=$?
+    wait "$host_pid" || fail "drops: the test host failed" "$work/drops-host.log"
+    rm -rf -- "$runtime"
+    [[ $status -eq 0 ]] || fail "drops: the compositor exited with status $status" "$work/drops.log"
+    ! grep -q "crashed" "$work/drops.log" || fail "drops: the dock crashed" "$work/drops.log"
+    grep -qx "$work/home/Documents" "$work/config/mlx/dock-folders" || fail "drops: a folder dropped on the dock was not pinned (folders: $(tr '\n' ' ' < "$work/config/mlx/dock-folders"))" "$work/drops.log"
+    grep -q "^mlx-dock: moved to the trash" "$work/drops.log" || fail "drops: a file dropped on the trash was not moved there" "$work/drops.log"
+    echo "ok   a folder dropped on the dock is pinned, a file dropped on the trash goes into it"
+    # gio trash does the moving (when it is installed).
+    if command -v gio > /dev/null; then
+        for _ in $(seq 1 20); do [[ -e "$work/data/Trash/files/junk.txt" ]] && break; sleep 0.1; done
+        [[ -e "$work/data/Trash/files/junk.txt" && ! -e "$work/home/junk.txt" ]] || fail "drops: gio trash did not move the file into the trash" "$work/drops.log"
+        echo "ok   gio trash moved the file into \$XDG_DATA_HOME/Trash"
+    fi
+}
+
+drops

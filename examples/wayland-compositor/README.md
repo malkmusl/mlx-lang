@@ -176,13 +176,18 @@ its defaults there when the file is missing).
 
 After a second separator come folders and the trash, as on macOS. The
 folders are listed in `~/.config/mlx/dock-folders` (`~/Downloads` when
-the file is missing); a click on one shows its twelve newest files as a
-menu (a click opens one) with "Open" below, a right click offers "Open"
-and "Remove from Dock", and a folder dragged onto the dock from a file
-manager joins them. The trash (`$XDG_DATA_HOME/Trash`) shows whether it
-holds anything; a click opens it (`xdg-open trash:///`), its menu empties
-it, and files dropped on it go into it (`gio trash`; an app dragged from
-the launcher does not).
+the file is missing); a click on one shows it as a stack: a popup grid of
+its files and folders, newest first, with icons by type (PNG files as
+pictures), scrolled with the wheel, and "Open" above (a click on an entry
+opens it). A right click offers "Open" and "Remove from Dock", and a
+folder dragged onto the dock from a file manager joins them. The trash
+(`$XDG_DATA_HOME/Trash`) shows whether it holds anything; a click opens
+it in the file manager (asked over D-Bus, `org.freedesktop.FileManager1`,
+else its directory with `xdg-open`: `xdg-open trash:///` would reach the
+browser), its menu empties it, and files dropped on it go into it (`gio
+trash`; an app dragged from the launcher does not). Should the dock
+crash, it says where first (`mlx-dock: crashed: ...` in the compositor's
+log), as the compositor does.
 
 With `dock-autohide = on` (mlx-settings: "Auto-hide dock") the dock
 reserves no space, so maximized windows reach the bottom edge. It slides
