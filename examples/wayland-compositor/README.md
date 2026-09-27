@@ -162,6 +162,12 @@ click on one brings its window forward (a minimized one comes back), a
 click anywhere else, Escape or a second click on the icon closes them.
 The thumbnails follow their windows as they draw.
 
+With `dock-autohide = on` (mlx-settings: "Auto-hide dock") the dock
+reserves no space, so maximized windows reach the bottom edge. It slides
+out of sight once the pointer has been away from it for 0.6 seconds and
+back up when the pointer touches the output's bottom edge; it stays while
+its previews show or a button is held.
+
 mlx-settings lists the hotkeys: a click on one records the next key
 combination (Escape keeps the old one, Backspace unbinds it, a right click
 restores the default). Meanwhile the compositor passes every key to it,
