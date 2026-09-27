@@ -414,6 +414,15 @@ they are configured again with the new mode. Programs without
 xdg-decoration always draw their own: GTK (client-side decorations by
 design) and weston's demo clients such as weston-terminal.
 
+While the compositor draws a window's title bar (its xdg-decoration mode
+is server side, or, without xdg-decoration, `client-decorations = off`),
+the window's configure also says it is tiled on every edge, as tiling
+compositors such as niri do. Clients then leave out what only a floating
+window of their own needs: GTK its shadows, rounded corners and resize
+margins, Firefox and Zen (which always decorate themselves on Wayland)
+the space of their own title bar. Moving and resizing stay the
+compositor's (title bar, borders, Alt+drag).
+
 ## Drawing only what changed
 
 Every change to the scene reports the area it covers (a window moved,
