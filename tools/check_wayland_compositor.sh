@@ -28,7 +28,10 @@
 #      decorations (and again not when it stops);
 #   9. pointer constraints and relative motion: a client locks the pointer
 #      on its window; after a click it is locked, the pointer stays put and
-#      the client gets the host's movement as relative motion.
+#      the client gets the host's movement as relative motion;
+#  10. with GTK 3 (through python3's ctypes, if installed): KDE's server
+#      decoration tells it the compositor decorates, so it asks for server
+#      side decoration and draws no title bar of its own.
 #
 # Typed commands create marker files, so keyboard delivery is verified at the
 # shell; the moved window's focus frame is checked in the host's screenshot.
@@ -361,6 +364,38 @@ def white(x0, y0):
 assert white(100, 100) > 10 and white(200, 150) == 0, (white(100, 100), white(200, 150))
 PY
 echo "ok   a pointer lock holds the cursor and relative motion reaches the client"
+
+# Scenario 10: a GTK 3 window (libgtk-3 through ctypes: no GTK 3 program
+# is needed). GTK 3 knows only KDE's server decoration, not xdg-decoration.
+if python3 -c 'import ctypes; ctypes.CDLL("libgtk-3.so.0")' 2> /dev/null; then
+    cat > "$work/gtk3.py" <<'PY'
+import ctypes
+gtk = ctypes.CDLL("libgtk-3.so.0")
+glib = ctypes.CDLL("libglib-2.0.so.0")
+gtk.gtk_init(None, None)
+gtk.gtk_window_new.restype = ctypes.c_void_p
+window = ctypes.c_void_p(gtk.gtk_window_new(0))
+gtk.gtk_window_set_title(window, b"GTK 3")
+gtk.gtk_window_set_default_size(window, 300, 200)
+gtk.gtk_widget_show_all(window)
+quit = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p)(lambda data: (gtk.gtk_main_quit(), 0)[1])
+glib.g_timeout_add(5000, quit, None)
+gtk.gtk_main()
+PY
+    cat > "$work/gtk3.sh" <<SCRIPT
+#!/bin/sh
+unset DISPLAY
+WAYLAND_DEBUG=client GDK_DEBUG=no-portals GTK_A11Y=none NO_AT_BRIDGE=1 exec python3 "$work/gtk3.py" 2> "$work/gtk3-debug.log"
+SCRIPT
+    chmod +x "$work/gtk3.sh"
+    printf 'wait 3000\nclose\n' > "$work/gtk3.script"
+    run_scenario gtk3 "$work/gtk3.script" --run "$work/gtk3.sh"
+    grep -q "^map: GTK 3" "$work/gtk3-compositor.log" || { echo "the GTK 3 window did not appear" >&2; cat "$work/gtk3-compositor.log" >&2; exit 1; }
+    grep -q "org_kde_kwin_server_decoration@[0-9]*\.mode(2)" "$work/gtk3-debug.log" || { echo "GTK 3 was not told the compositor decorates" >&2; grep -i decoration "$work/gtk3-debug.log" >&2; exit 1; }
+    echo "ok   GTK 3 uses the compositor's title bar (KDE server decoration)"
+else
+    echo "skip GTK 3 is not installed"
+fi
 
 # Scenario 6: copy and paste between two clients through the compositor's
 # wl_data_device_manager, with wl-clipboard (if available): wl-copy sets

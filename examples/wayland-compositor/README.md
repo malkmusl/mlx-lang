@@ -414,6 +414,12 @@ they are configured again with the new mode. Programs without
 xdg-decoration always draw their own: GTK (client-side decorations by
 design) and weston's demo clients such as weston-terminal.
 
+GTK 3 (and with it Firefox, Zen and other GTK 3 programs) knows only
+KDE's server decoration (`org_kde_kwin_server_decoration_manager`), not
+xdg-decoration: its default mode is server side unless
+`client-decorations = on`, so GTK 3 draws no title bar of its own, and
+each surface's object reports the mode like xdg-decoration's.
+
 While the compositor draws a window's title bar (its xdg-decoration mode
 is server side, or, without xdg-decoration, `client-decorations = off`),
 the window's configure also says it is tiled on every edge, as tiling
@@ -623,6 +629,7 @@ version 3, `wl_subcompositor`, `xdg_wm_base` with toplevels (with
 `zwlr_layer_shell_v1` version 5, `zwlr_foreign_toplevel_manager_v1`
 version 3, `ext_background_effect_manager_v1` version 1 (see Dock and
 launcher), `zxdg_decoration_manager_v1` version 2 (see Decorations),
+`org_kde_kwin_server_decoration_manager` version 1 (KDE's, for GTK 3),
 `zwp_relative_pointer_manager_v1` and `zwp_pointer_constraints_v1`
 version 1 (see Pointer lock).
 Composition is done in software, or with Vulkan (`--renderer vulkan`).
