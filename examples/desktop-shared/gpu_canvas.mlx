@@ -1,0 +1,380 @@
+// The desktop apps' canvas on the GPU: canvas.mlx records what it is asked
+// to draw as commands here, and paint draws them all at once with the
+// `paint` compute shader (examples/vulkan-shared/shaders.mlx) into the
+// buffer the app shows, with the same integer arithmetic as the CPU canvas
+// (the same pixels).
+//
+// Commands and glyph quads go to one upload buffer, images (the icons,
+// uploaded once and remembered by address) and the fonts' glyph atlases
+// (uploaded again when std.truetype adds glyphs) to another, the heap.
+const std = @import("std")
+const vk = @import("std.vulkan")
+const loader = @import("std.vulkan.loader")
+const png = @import("std.png")
+const tt = @import("std.truetype")
+const gpu = @import("../vulkan-shared/gpu.mlx")
+const shaders = @import("../vulkan-shared/shaders.mlx")
+
+const Allocator = std.allocator.Allocator
+
+const MAX_COMMANDS: usize = 2048
+const COMMAND_WORDS: usize = 16
+// Words of glyph quads after the commands.
+const QUAD_WORDS: usize = 65536
+const DATA_WORDS: usize = MAX_COMMANDS * COMMAND_WORDS + QUAD_WORDS
+// The heap: atlases first (ATLASES of at most ATLAS_BYTES), then images.
+const ATLASES: usize = 4
+const ATLAS_BYTES: usize = 1048576
+const HEAP_BYTES: usize = 20971520
+const MAX_IMAGES: usize = 1024
+
+const Image = struct {
+    address: usize
+    width: usize
+    height: usize
+    offset: usize
+}
+
+const Atlas = struct {
+    atlas: usize
+    revision: u32
+    offset: usize
+}
+
+pub const Device = struct {
+    allocator: Allocator
+    context: gpu.Context
+    kernel: gpu.Kernel
+    data: gpu.Buffer
+    heap: gpu.Buffer
+    commandCount: usize
+    quadsUsed: usize
+    // Where the next image goes in the heap (bytes), and the images there.
+    heapUsed: usize
+    images: [1024]Image
+    imageCount: usize
+    atlases: [4]Atlas
+    atlasCount: usize
+    // The target the commands are for (its size bounds CLEAR).
+    width: u32
+    height: u32
+    // A command did not fit or Vulkan failed: this frame is not drawn.
+    overflow: bool
+}
+
+fn contextOf(device: *Device) -> *gpu.Context {
+    unsafe { return @ptrCast(*gpu.Context, &device.*.context) }
+}
+
+fn kernelOf(device: *Device) -> *gpu.Kernel {
+    unsafe { return @ptrCast(*gpu.Kernel, &device.*.kernel) }
+}
+
+fn dataOf(device: *Device) -> [*]u32 {
+    unsafe { return @ptrFromInt([*]u32, device.*.data.address) }
+}
+
+fn imageAt(device: *Device, index: usize) -> *Image {
+    unsafe { return @ptrFromInt(*Image, @intFromPtr(device) + @offsetOf(Device, "images") + index * @sizeOf(Image)) }
+}
+
+fn atlasAt(device: *Device, index: usize) -> *Atlas {
+    unsafe { return @ptrFromInt(*Atlas, @intFromPtr(device) + @offsetOf(Device, "atlases") + index * @sizeOf(Atlas)) }
+}
+
+pub fn context(device: *Device) -> *gpu.Context { return contextOf(device) }
+
+// Opens a GPU (a CPU device such as lavapipe only when there is no GPU)
+// and makes the paint shader and the buffers. Null without Vulkan.
+pub fn open(arguments: [][*]const u8, allocator: Allocator) -> ?*Device {
+    const memory = allocator.alloc(@sizeOf(Device), 16)
+    if memory == null { return null }
+    var device: *Device = undefined
+    unsafe { device = @ptrCast(*Device, memory.?) }
+    device.*.allocator = allocator
+    device.*.commandCount = 0
+    device.*.quadsUsed = 0
+    device.*.heapUsed = ATLASES * ATLAS_BYTES
+    device.*.imageCount = 0
+    device.*.atlasCount = 0
+    device.*.overflow = false
+    if !openDevice(contextOf(device), arguments, allocator) { return failed("no Vulkan device") }
+    var code: [*]u32 = undefined
+    const words = shaders.buildPaintWords(allocator, &code)
+    if words == 0 || !gpu.createKernel(contextOf(device), kernelOf(device), code, words, 3, shaders.PAINT_WORDS) { return failed("the paint shader was not taken") }
+    var data: gpu.Buffer = undefined
+    var heap: gpu.Buffer = undefined
+    if !gpu.createUploadBuffer(contextOf(device), &data, @intCast(u64, DATA_WORDS * 4)) { return failed("no memory for commands") }
+    if !gpu.createUploadBuffer(contextOf(device), &heap, @intCast(u64, HEAP_BYTES)) { return failed("no memory for images") }
+    device.*.data = data
+    device.*.heap = heap
+    return device
+}
+
+// Says why there is no GPU canvas (the app draws on the CPU).
+fn failed(reason: []const u8) -> ?*Device {
+    const a = std.io.writeAll(std.io.stdout(), "canvas: ")
+    const b = std.io.writeAll(std.io.stdout(), reason)
+    const c = std.io.writeAll(std.io.stdout(), "; drawing on the cpu\n")
+    return null
+}
+
+fn openDevice(context_record: *gpu.Context, arguments: [][*]const u8, allocator: Allocator) -> bool {
+    var manifests: loader.Manifests = undefined
+    if loader.findDrivers(&manifests, arguments, allocator) == 0 { return false }
+    var options = gpu.defaultOptions(@ptrCast([*]const u8, "mlx-desktop"))
+    options.wantSharing = true
+    // First a GPU only; then anything that works.
+    var pass: usize = 0
+    while pass < 2 {
+        var index: usize = 0
+        while index < manifests.count {
+            var driver: loader.Driver = undefined
+            if loader.openDriver(&driver, loader.manifestAt(&manifests, index), allocator) == loader.Status.ok {
+                if gpu.open(context_record, driver, &options, allocator) == gpu.Status.ok {
+                    if pass == 1 || context_record.*.deviceType != vk.PhysicalDeviceType.cpu { return true }
+                    gpu.close(context_record)
+                }
+                loader.closeDriver(&driver)
+            }
+            index += 1
+        }
+        pass += 1
+    }
+    return false
+}
+
+// The device's name (for logs).
+pub fn name(device: *Device) -> [*]const u8 { return gpu.deviceName(contextOf(device)) }
+
+// Starts recording a frame for a width x height target.
+pub fn begin(device: *Device, width: u32, height: u32) -> void {
+    device.*.commandCount = 0
+    device.*.quadsUsed = 0
+    device.*.overflow = false
+    device.*.width = width
+    device.*.height = height
+    // Images live until the heap is three quarters full; then they are
+    // uploaded again as they are drawn.
+    if device.*.heapUsed > HEAP_BYTES / 4 * 3 { forgetImages(device) }
+}
+
+// Forgets the uploaded images (their pixels may have changed: an app that
+// loads its icons again calls this).
+pub fn forgetImages(device: *Device) -> void {
+    device.*.imageCount = 0
+    device.*.heapUsed = ATLASES * ATLAS_BYTES
+}
+
+// A new command's words (zeroed), or null when the list is full.
+fn command(device: *Device, kind: u32, x: i32, y: i32, width: i32, height: i32) -> ?[*]u32 {
+    if device.*.commandCount >= MAX_COMMANDS {
+        device.*.overflow = true
+        return null
+    }
+    var words: [*]u32 = undefined
+    unsafe { words = @ptrFromInt([*]u32, device.*.data.address + device.*.commandCount * COMMAND_WORDS * 4) }
+    var index: usize = 0
+    while index < COMMAND_WORDS {
+        words[index] = 0
+        index += 1
+    }
+    words[0] = kind
+    words[1] = @bitCast(u32, x)
+    words[2] = @bitCast(u32, y)
+    words[3] = @bitCast(u32, width)
+    words[4] = @bitCast(u32, height)
+    device.*.commandCount += 1
+    return words
+}
+
+pub fn clear(device: *Device, color: u32) -> void {
+    const words = command(device, shaders.PAINT_CLEAR, 0, 0, @intCast(i32, device.*.width), @intCast(i32, device.*.height))
+    if words == null { return }
+    words.?[7] = color
+}
+
+pub fn fill(device: *Device, x: i32, y: i32, width: i32, height: i32, radius: i32, color: u32) -> void {
+    if width <= 0 || height <= 0 { return }
+    const words = command(device, shaders.PAINT_FILL, x, y, width, height)
+    if words == null { return }
+    words.?[5] = @bitCast(u32, radius)
+    words.?[7] = color
+}
+
+pub fn stroke(device: *Device, x: i32, y: i32, width: i32, height: i32, radius: i32, thickness: i32, color: u32) -> void {
+    if width <= 0 || height <= 0 { return }
+    const words = command(device, shaders.PAINT_STROKE, x, y, width, height)
+    if words == null { return }
+    words.?[5] = @bitCast(u32, radius)
+    words.?[6] = @bitCast(u32, thickness)
+    words.?[7] = color
+}
+
+// Blocks copied as array values: one mem_copy each (rep movsb on x86_64).
+const Block4096 = [4096]u8
+const Block64 = [64]u8
+
+pub fn copyBytes(destination: usize, source: usize, bytes: usize) -> void {
+    var to = destination
+    var from = source
+    var left = bytes
+    while left >= 4096 {
+        var target: *Block4096 = undefined
+        var origin: *const Block4096 = undefined
+        unsafe {
+            target = @ptrFromInt(*Block4096, to)
+            origin = @ptrFromInt(*const Block4096, from)
+        }
+        target.* = origin.*
+        to += 4096
+        from += 4096
+        left -= 4096
+    }
+    while left >= 64 {
+        var target: *Block64 = undefined
+        var origin: *const Block64 = undefined
+        unsafe {
+            target = @ptrFromInt(*Block64, to)
+            origin = @ptrFromInt(*const Block64, from)
+        }
+        target.* = origin.*
+        to += 64
+        from += 64
+        left -= 64
+    }
+    var bytes_to: [*]u8 = undefined
+    var bytes_from: [*]const u8 = undefined
+    unsafe {
+        bytes_to = @ptrFromInt([*]u8, to)
+        bytes_from = @ptrFromInt([*]const u8, from)
+    }
+    var index: usize = 0
+    while index < left {
+        bytes_to[index] = bytes_from[index]
+        index += 1
+    }
+}
+
+// Where `image` is in the heap (words), uploaded on first use; the heap's
+// size when it does not fit.
+fn imageOffset(device: *Device, image: *const png.Image) -> usize {
+    const address = @intFromPtr(image.*.pixels)
+    var index: usize = 0
+    while index < device.*.imageCount {
+        const known = imageAt(device, index)
+        if known.*.address == address && known.*.width == image.*.width && known.*.height == image.*.height { return known.*.offset }
+        index += 1
+    }
+    const bytes = image.*.width * image.*.height * 4
+    if device.*.imageCount >= MAX_IMAGES || device.*.heapUsed + bytes > HEAP_BYTES { return HEAP_BYTES }
+    const offset = device.*.heapUsed
+    copyBytes(device.*.heap.address + offset, address, bytes)
+    device.*.heapUsed += (bytes + 63) / 64 * 64
+    const entry = imageAt(device, device.*.imageCount)
+    entry.*.address = address
+    entry.*.width = image.*.width
+    entry.*.height = image.*.height
+    entry.*.offset = offset / 4
+    device.*.imageCount += 1
+    return offset / 4
+}
+
+// `image` scaled into the size x size box at (x, y), faded by `opacity`.
+pub fn image(device: *Device, picture: *const png.Image, x: i32, y: i32, size: i32, opacity: u32) -> void {
+    if size <= 0 || picture.*.width == 0 { return }
+    const offset = imageOffset(device, picture)
+    if offset == HEAP_BYTES {
+        device.*.overflow = true
+        return
+    }
+    const words = command(device, shaders.PAINT_IMAGE, x, y, size, size)
+    if words == null { return }
+    words.?[8] = @intCast(u32, offset)
+    words.?[9] = @intCast(u32, picture.*.width)
+    words.?[10] = @intCast(u32, picture.*.height)
+    words.?[11] = opacity
+}
+
+// Where `atlas` is in the heap (bytes), its glyphs uploaded as far as
+// std.truetype has filled it; ATLASES * ATLAS_BYTES when there is no room.
+fn atlasOffset(device: *Device, atlas: *const tt.Atlas) -> usize {
+    const size = @intCast(usize, atlas.*.width) * @intCast(usize, atlas.*.height)
+    if size > ATLAS_BYTES { return ATLASES * ATLAS_BYTES }
+    var slot = device.*.atlasCount
+    var index: usize = 0
+    while index < device.*.atlasCount {
+        if atlasAt(device, index).*.atlas == @intFromPtr(atlas) { slot = index }
+        index += 1
+    }
+    if slot == device.*.atlasCount {
+        if slot >= ATLASES { return ATLASES * ATLAS_BYTES }
+        const entry = atlasAt(device, slot)
+        entry.*.atlas = @intFromPtr(atlas)
+        entry.*.revision = atlas.*.revision +% 1
+        entry.*.offset = slot * ATLAS_BYTES
+        device.*.atlasCount += 1
+    }
+    const entry = atlasAt(device, slot)
+    if entry.*.revision != atlas.*.revision {
+        var rows = @intCast(usize, atlas.*.cursorY + atlas.*.rowHeight)
+        if rows > @intCast(usize, atlas.*.height) { rows = @intCast(usize, atlas.*.height) }
+        copyBytes(device.*.heap.address + entry.*.offset, @intFromPtr(atlas.*.pixels), @intCast(usize, atlas.*.width) * rows)
+        entry.*.revision = atlas.*.revision
+    }
+    return entry.*.offset
+}
+
+// A laid-out run (tt.layout) with its origin at (x, y), the baseline, in
+// `color` (premultiplied); columns from x at `limit` and past are left out
+// (0: none).
+pub fn glyphs(device: *Device, atlas: *const tt.Atlas, run: *const tt.Run, x: i32, y: i32, color: u32, limit: i32) -> void {
+    if run.*.count == 0 { return }
+    const offset = atlasOffset(device, atlas)
+    if offset == ATLASES * ATLAS_BYTES {
+        device.*.overflow = true
+        return
+    }
+    const quad_words = run.*.count * 4
+    if device.*.quadsUsed + quad_words > QUAD_WORDS {
+        device.*.overflow = true
+        return
+    }
+    const words = command(device, shaders.PAINT_GLYPHS, x + run.*.left, y + run.*.top, run.*.right - run.*.left, run.*.bottom - run.*.top)
+    if words == null { return }
+    const base = MAX_COMMANDS * COMMAND_WORDS + device.*.quadsUsed
+    const data = dataOf(device)
+    var index: usize = 0
+    while index < run.*.count {
+        const quad = run.*.quads[index]
+        data[base + index * 4] = quad.atlasX | (quad.atlasY << 16)
+        data[base + index * 4 + 1] = quad.width | (quad.height << 16)
+        data[base + index * 4 + 2] = @bitCast(u32, quad.x)
+        data[base + index * 4 + 3] = @bitCast(u32, quad.y)
+        index += 1
+    }
+    device.*.quadsUsed += quad_words
+    words.?[7] = color
+    words.?[8] = @intCast(u32, base)
+    words.?[9] = @intCast(u32, run.*.count)
+    words.?[10] = @intCast(u32, offset)
+    words.?[11] = atlas.*.width
+    words.?[12] = @bitCast(u32, x)
+    words.?[13] = @bitCast(u32, y)
+    words.?[14] = @bitCast(u32, limit)
+}
+
+// Draws the recorded commands into `target` (rows `stride` pixels apart,
+// from `offset` pixels in) and waits for the GPU. False when Vulkan failed
+// or the frame did not fit (the caller draws it on the CPU instead).
+pub fn paint(device: *Device, target: vk.Buffer, offset: u32, stride: u32) -> bool {
+    if device.*.overflow { return false }
+    const context_record = contextOf(device)
+    if !gpu.begin(context_record) { return false }
+    var buffers: [3]vk.Buffer = [3]vk.Buffer{ target, device.*.data.buffer, device.*.heap.buffer }
+    const push = shaders.Paint.{ .width = device.*.width, .height = device.*.height, .targetOffset = offset, .targetStride = stride, .commandOffset = 0, .commandCount = @intCast(u32, device.*.commandCount) }
+    unsafe {
+        if !gpu.dispatch(context_record, kernelOf(device), @ptrCast([*]const vk.Buffer, &buffers), &push, gpu.groups(device.*.width, shaders.GROUP_SIZE), gpu.groups(device.*.height, shaders.GROUP_SIZE)) { return false }
+    }
+    return gpu.submit(context_record)
+}

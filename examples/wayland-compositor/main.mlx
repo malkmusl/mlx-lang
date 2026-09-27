@@ -23,9 +23,11 @@
 // (pointer and keyboard), wl_data_device_manager (copy and paste between
 // clients; no drag and drop) and xdg_wm_base (toplevels and popups).
 //
-// Windows are composed on the CPU, or with --renderer vulkan by a Vulkan
-// compute shader that reads client buffers (wl_shm pools and dma-bufs) in
-// place and writes the output straight into the host window's buffer.
+// Windows are composed by a Vulkan compute shader that reads client buffers
+// (wl_shm pools and dma-bufs) in place and writes the output straight into
+// the host window's buffer, or, freestanding, into the DRM dumb buffer the
+// monitor scans out; without a working Vulkan driver (or with --renderer
+// cpu) on the CPU.
 //
 //     mlx4 examples/wayland-compositor/main.mlx -o mlx-compositor
 //     mlx4 examples/wayland-terminal/main.mlx -o mlx-terminal
@@ -40,29 +42,54 @@
 //                         monitor's resolution as the output size (what the
 //                         desktop session, tools/install_compositor_session.sh,
 //                         uses)
-//     --renderer NAME     cpu (default) or vulkan
-//     --font PATH         TrueType font for window titles (default DejaVu
-//                         Sans; `none` for bars without titles)
+//     --renderer NAME     auto (default: vulkan when a driver works, else
+//                         cpu), vulkan or cpu
+//     --font PATH         TrueType font for window titles (default: DejaVu
+//                         Sans or Liberation Sans where the distribution
+//                         keeps them; `none` for bars without titles)
 //     --terminal PROGRAM  what Alt+Enter runs (default: mlx-terminal next to
 //                         this program, else mlx-terminal from PATH)
 //     --run PROGRAM       start PROGRAM once the compositor is up (repeatable)
 //     --screenshot FILE   write the last frame to FILE (PPM) on exit
 //     --timeout SECONDS   exit after SECONDS (for demos and tests)
-//     --verbose           log clients, windows, focus and forwarded keys
+//     --no-fps            no frames-per-second counters in the title bars
+//     --verbose           log clients, windows, focus and forwarded keys (and
+//                         once a second, how long frames take)
+//
+// Freestanding, everything it prints goes to a log file, since the console
+// it was started from is the monitor it draws on: $MLX_COMPOSITOR_LOG when
+// set (`-` keeps stdout, for the session launcher and the tests), else
+// ${XDG_CONFIG_HOME:-$HOME/.config}/mlx/compositor.log, and --verbose is
+// implied.
 
 const std = @import("std")
 const wl = @import("std.wayland")
 const state = @import("./state.mlx")
-const shell = @import("./shell.mlx")
+const entries = @import("./entries.mlx")
 const host = @import("./host.mlx")
-const dmabuf = @import("./dmabuf.mlx")
-const data = @import("./data.mlx")
 const drm = @import("./drm.mlx")
-const vulkan = @import("./vulkan.mlx")
+const kms = @import("./kms.mlx")
+const crash = @import("./crash.mlx")
+const arena = @import("./arena.mlx")
+const modules = @import("./modules.mlx")
 const tt = @import("std.truetype")
+const ui = @import("std.ui")
 const scene = @import("./scene.mlx")
+const settings = @import("./settings.mlx")
 
-const DEFAULT_FONT = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
+// Where distributions keep DejaVu Sans and a few stand-ins; the first
+// that reads is the default --font.
+const DEFAULT_FONT_COUNT: usize = 7
+
+fn defaultFont(index: usize) -> []const u8 {
+    if index == 0 { return "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf" }
+    if index == 1 { return "/usr/share/fonts/TTF/DejaVuSans.ttf" }
+    if index == 2 { return "/usr/share/fonts/dejavu/DejaVuSans.ttf" }
+    if index == 3 { return "/usr/share/fonts/dejavu-sans-fonts/DejaVuSans.ttf" }
+    if index == 4 { return "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf" }
+    if index == 5 { return "/usr/share/fonts/TTF/LiberationSans-Regular.ttf" }
+    return "/usr/share/fonts/liberation/LiberationSans-Regular.ttf"
+}
 
 const Compositor = state.Compositor
 const String = std.string.String
@@ -83,8 +110,9 @@ fn parseNumber(text: String, start: usize, end: usize) -> usize {
     return value
 }
 
-// "mlx-terminal" next to this program when it was started by path.
-fn defaultTerminal(compositor: *Compositor, program: String) -> [*]const u8 {
+// The program `name` next to this program when it was started by path,
+// else `name` (looked up on PATH).
+fn defaultProgram(compositor: *Compositor, program: String, name: []const u8) -> [*]const u8 {
     var slash: usize = 0
     var found = false
     var index: usize = 0
@@ -95,11 +123,10 @@ fn defaultTerminal(compositor: *Compositor, program: String) -> [*]const u8 {
         }
         index += 1
     }
-    const name = "mlx-terminal"
     if !found {
         unsafe { return @ptrCast([*]const u8, name) }
     }
-    const memory = state.allocate(compositor, slash + 16)
+    const memory = state.allocate(compositor, slash + name.length + 2)
     index = 0
     while index <= slash {
         memory[index] = program.pointer[index]
@@ -114,18 +141,40 @@ fn defaultTerminal(compositor: *Compositor, program: String) -> [*]const u8 {
     unsafe { return @ptrCast([*]const u8, memory) }
 }
 
-// Our environment for children, with WAYLAND_DISPLAY naming our socket.
+// NAME=VALUE for the environment.
+fn variableOf(compositor: *Compositor, name: []const u8, value: [*]const u8) -> [*]u8 {
+    var value_length: usize = 0
+    while value[value_length] != 0 { value_length += 1 }
+    const variable = state.allocate(compositor, name.length + value_length + 1)
+    var length: usize = 0
+    for byte in name {
+        variable[length] = byte
+        length += 1
+    }
+    var index: usize = 0
+    while index < value_length {
+        variable[length] = value[index]
+        length += 1
+        index += 1
+    }
+    variable[length] = 0
+    return variable
+}
+
+// Our environment for children, with WAYLAND_DISPLAY naming our socket,
+// MLX_TERMINAL our terminal (the dock and the launcher start programs that
+// want one in it) and MLX_LAUNCHER the launcher (the dock's apps button).
 fn childEnvironment(compositor: *Compositor, arguments: [][*]const u8) -> [*][*]const u8 {
     const count = std.process.environmentCount(arguments)
-    const entries = std.process.environmentEntries(arguments)
+    const environment_entries = std.process.environmentEntries(arguments)
     var result: [*][*]const u8 = undefined
-    unsafe { result = @ptrCast([*][*]const u8, state.allocate(compositor, (count + 2) * 8)) }
+    unsafe { result = @ptrCast([*][*]const u8, state.allocate(compositor, (count + 4) * 8)) }
     var used: usize = 0
     var index: usize = 0
     while index < count {
-        const entry = std.process.fromCString(entries[index])
-        if !std.string.startsWith(entry, std.string.fromSlice("WAYLAND_DISPLAY=")) && !std.string.startsWith(entry, std.string.fromSlice("WAYLAND_SOCKET=")) {
-            result[used] = entries[index]
+        const entry = std.process.fromCString(environment_entries[index])
+        if !std.string.startsWith(entry, std.string.fromSlice("WAYLAND_DISPLAY=")) && !std.string.startsWith(entry, std.string.fromSlice("WAYLAND_SOCKET=")) && !std.string.startsWith(entry, std.string.fromSlice("MLX_TERMINAL=")) && !std.string.startsWith(entry, std.string.fromSlice("MLX_LAUNCHER=")) {
+            result[used] = environment_entries[index]
             used += 1
         }
         index += 1
@@ -143,10 +192,17 @@ fn childEnvironment(compositor: *Compositor, arguments: [][*]const u8) -> [*][*]
         index += 1
     }
     variable[length] = 0
-    unsafe {
-        result[used] = @ptrCast([*]const u8, variable)
-        result[used + 1] = @ptrFromInt([*]const u8, 0)
+    unsafe { result[used] = @ptrCast([*]const u8, variable) }
+    used += 1
+    if @intFromPtr(compositor.*.terminal) != 0 {
+        unsafe { result[used] = @ptrCast([*]const u8, variableOf(compositor, "MLX_TERMINAL=", compositor.*.terminal)) }
+        used += 1
     }
+    if compositor.*.hasLauncher {
+        unsafe { result[used] = @ptrCast([*]const u8, variableOf(compositor, "MLX_LAUNCHER=", compositor.*.launcher)) }
+        used += 1
+    }
+    unsafe { result[used] = @ptrFromInt([*]const u8, 0) }
     return result
 }
 
@@ -171,6 +227,15 @@ fn initialize(compositor: *Compositor) -> void {
     compositor.*.height = 768
     compositor.*.running = true
     compositor.*.verbose = false
+    compositor.*.showFps = true
+    compositor.*.focusColor = scene.FOCUS_COLOR
+    compositor.*.frameColor = scene.FRAME_COLOR
+    compositor.*.titleBars = true
+    compositor.*.clientDecorations = false
+    compositor.*.cornerRadius = scene.CORNER_RADIUS
+    compositor.*.wobblyWindows = true
+    compositor.*.noFpsOption = false
+    compositor.*.settingsPathLength = 0
     compositor.*.socketNameLength = 0
     compositor.*.hasHostCompositor = false
     compositor.*.hasHostShm = false
@@ -189,7 +254,11 @@ fn initialize(compositor: *Compositor) -> void {
     compositor.*.hostSecondBusy = false
     compositor.*.hostConfigured = false
     compositor.*.hostFramePending = false
-    compositor.*.needsRedraw = true
+    // The first frame is damaged in full once the output has its size.
+    compositor.*.needsRedraw = false
+    compositor.*.damage = ui.rect(0, 0, 0, 0)
+    compositor.*.slotDamage[0] = ui.rect(0, 0, 0, 0)
+    compositor.*.slotDamage[1] = ui.rect(0, 0, 0, 0)
     compositor.*.frames = 0
     compositor.*.hasKeymap = false
     compositor.*.repeatRate = 25
@@ -202,15 +271,52 @@ fn initialize(compositor: *Compositor) -> void {
     compositor.*.surfaces = state.newList(allocator)
     compositor.*.stack = state.newList(allocator)
     compositor.*.buffers = state.newList(allocator)
+    compositor.*.regions = state.newList(allocator)
     compositor.*.positioners = state.newList(allocator)
     compositor.*.pointers = state.newList(allocator)
+    compositor.*.relativePointers = state.newList(allocator)
+    compositor.*.constraints = state.newList(allocator)
+    compositor.*.hostPointerX = 0
+    compositor.*.hostPointerY = 0
     compositor.*.keyboards = state.newList(allocator)
+    compositor.*.toplevelManagers = state.newList(allocator)
+    compositor.*.toplevelHandles = state.newList(allocator)
+    compositor.*.blurred = state.newList(allocator)
+    compositor.*.hasLauncher = true
+    compositor.*.superDown = false
+    compositor.*.superUsed = false
+    compositor.*.launcherStartedAt = 0
+    compositor.*.launcherChannel = -1
+    compositor.*.launcherPid = -1
+    compositor.*.launcherClosedAt = 0
+    compositor.*.hasDock = true
+    compositor.*.dockChannel = -1
+    compositor.*.dockPid = -1
+    compositor.*.dockStartedAt = 0
+    compositor.*.dockFailures = 0
+    compositor.*.desktopFrames = 0
+    compositor.*.presentMicros = 0
+    compositor.*.renderMicros = 0
+    compositor.*.uploadMicros = 0
+    compositor.*.gpuMicros = 0
+    compositor.*.copyMicros = 0
+    compositor.*.copyRegion = ui.rect(0, 0, 0, 0)
+    compositor.*.presentMax = 0
+    compositor.*.presentCount = 0
+    compositor.*.desktopFps = 0
+    compositor.*.fpsStart = 0
+    compositor.*.exclusiveLayer = 0
+    compositor.*.reserveTop = 0
+    compositor.*.reserveBottom = 0
+    compositor.*.reserveLeft = 0
+    compositor.*.reserveRight = 0
     compositor.*.nextWindowX = 24
     compositor.*.nextWindowY = 24
     compositor.*.pointerX = 0
     compositor.*.pointerY = 0
     compositor.*.pointerInside = false
     compositor.*.pointerFocus = 0
+    compositor.*.pointerEnterSerial = 0
     compositor.*.keyboardFocus = 0
     compositor.*.resizing = 0
     compositor.*.resizeEdges = 0
@@ -231,26 +337,54 @@ fn initialize(compositor: *Compositor) -> void {
     compositor.*.commits = 0
     compositor.*.stage = state.STAGE_ARGUMENTS
     compositor.*.hasText = false
+    compositor.*.arena = 0
+    compositor.*.arenaMark = 0
+    compositor.*.arenaPeak = 0
+    compositor.*.arenaRelease = false
+    compositor.*.arenaPoison = false
+    compositor.*.modules = 0
+    modules.useBuiltins(compositor)
     compositor.*.freestanding = false
     compositor.*.drm = 0
+    compositor.*.gpuDevice = 0
+    compositor.*.saidFeedback = false
+    compositor.*.readsTiled = false
     compositor.*.vtRequest = 0
 }
 
 // Window titles: the font, its atlas and a run for laying titles out.
+// An empty `path` (no --font) tries DEFAULT_FONTS in turn.
 fn loadFont(compositor: *Compositor, path: [*]const u8) -> void {
-    if path[0] == 0 { return }
     const allocator = compositor.*.allocator
     unsafe {
         compositor.*.font = @ptrCast(*tt.Font, state.allocate(compositor, @sizeOf(tt.Font)))
         compositor.*.atlas = @ptrCast(*tt.Atlas, state.allocate(compositor, @sizeOf(tt.Atlas)))
         compositor.*.run = @ptrCast(*tt.Run, state.allocate(compositor, @sizeOf(tt.Run)))
     }
-    const status = tt.loadFile(compositor.*.font, path, allocator)
+    var status = tt.Status.ok
+    if path[0] != 0 {
+        status = tt.loadFile(compositor.*.font, path, allocator)
+    } else {
+        var index: usize = 0
+        var loaded = false
+        while index < DEFAULT_FONT_COUNT && !loaded {
+            var candidate: [80]u8 = undefined
+            var length: usize = 0
+            for byte in defaultFont(index) {
+                candidate[length] = byte
+                length += 1
+            }
+            candidate[length] = 0
+            unsafe { status = tt.loadFile(compositor.*.font, @ptrCast([*]const u8, &candidate), allocator) }
+            loaded = status == tt.Status.ok
+            index += 1
+        }
+    }
     if status != tt.Status.ok {
         if compositor.*.verbose {
             state.say("titles: ")
             state.say(tt.statusMessage(status))
-            state.say("\n")
+            state.say(" (no --font given: DejaVu Sans and Liberation Sans were looked for)\n")
         }
         return
     }
@@ -261,6 +395,71 @@ fn loadFont(compositor: *Compositor, path: [*]const u8) -> void {
 
 const Failure = error { InvalidArguments, GlobalsFailed, NoVulkan, NoMonitor }
 
+const SYS_mkdir: usize = 83
+const SYS_dup2: usize = 33
+const O_WRONLY_CREAT_APPEND: usize = 1089
+
+// Appends `text` to `path` (a NUL-terminated buffer of `capacity` bytes)
+// at `length`; false when it does not fit.
+fn appendPath(path: [*]u8, capacity: usize, length: *usize, text: [*]const u8) -> bool {
+    var index: usize = 0
+    while text[index] != 0 {
+        if length.* + 1 >= capacity { return false }
+        path[length.*] = text[index]
+        length.* += 1
+        index += 1
+    }
+    path[length.*] = 0
+    return true
+}
+
+// Freestanding: sends stdout and stderr to the log file (see the header),
+// creating its directory, and says so on the console first.
+fn logToFile(compositor: *Compositor) -> void {
+    const chosen = state.environmentValue(compositor.*.environment, "MLX_COMPOSITOR_LOG")
+    if @intFromPtr(chosen) != 0 && chosen[0] == 45 && chosen[1] == 0 { return }
+    var path: [512]u8 = undefined
+    var bytes: [*]u8 = undefined
+    unsafe { bytes = @ptrCast([*]u8, &path) }
+    var length: usize = 0
+    bytes[0] = 0
+    if @intFromPtr(chosen) != 0 && chosen[0] != 0 {
+        if !appendPath(bytes, 512, &length, chosen) { return }
+    } else {
+        const config = state.environmentValue(compositor.*.environment, "XDG_CONFIG_HOME")
+        const home = state.environmentValue(compositor.*.environment, "HOME")
+        var ok = true
+        if @intFromPtr(config) != 0 && config[0] != 0 {
+            ok = appendPath(bytes, 512, &length, config)
+        } else if @intFromPtr(home) != 0 && home[0] != 0 {
+            unsafe { ok = appendPath(bytes, 512, &length, home) && appendPath(bytes, 512, &length, @ptrCast([*]const u8, "/.config")) }
+        } else {
+            return
+        }
+        // The directories, one after the other (mkdir -p).
+        const created_config = std.linux.syscall2(SYS_mkdir, @intFromPtr(bytes), 448)
+        unsafe { ok = ok && appendPath(bytes, 512, &length, @ptrCast([*]const u8, "/mlx")) }
+        const created_mlx = std.linux.syscall2(SYS_mkdir, @intFromPtr(bytes), 448)
+        unsafe { ok = ok && appendPath(bytes, 512, &length, @ptrCast([*]const u8, "/compositor.log")) }
+        if !ok { return }
+    }
+    const file = std.fs.open(bytes, O_WRONLY_CREAT_APPEND, 416)
+    if !std.fs.isValid(file) {
+        state.say("mlx-compositor: cannot write the log ")
+        unsafe { const shown = std.io.writeString(std.io.stdout(), std.process.fromCString(@ptrCast([*]const u8, bytes))) }
+        state.say("\n")
+        return
+    }
+    state.say("mlx-compositor: logging to ")
+    unsafe { const shown = std.io.writeString(std.io.stdout(), std.process.fromCString(@ptrCast([*]const u8, bytes))) }
+    state.say("\n")
+    const out = std.linux.syscall2(SYS_dup2, @bitCast(usize, file.descriptor), 1)
+    const err = std.linux.syscall2(SYS_dup2, @bitCast(usize, file.descriptor), 2)
+    const closed = std.fs.close(file)
+    compositor.*.verbose = true
+    state.say("mlx-compositor: started freestanding\n")
+}
+
 fn invalidArguments() -> Failure!void { return Failure.InvalidArguments }
 fn globalsFailed() -> Failure!void { return Failure.GlobalsFailed }
 fn noVulkan() -> Failure!void { return Failure.NoVulkan }
@@ -269,6 +468,25 @@ fn noMonitor() -> Failure!void { return Failure.NoMonitor }
 const BACKEND_AUTO: u8 = 0
 const BACKEND_NESTED: u8 = 1
 const BACKEND_DRM: u8 = 2
+
+const RENDERER_CPU: u8 = 0
+const RENDERER_VULKAN: u8 = 1
+const RENDERER_AUTO: u8 = 2
+
+// Starts the Vulkan renderer when asked for (`output`: the freestanding
+// backend's monitor, null nested). With RENDERER_AUTO a driver that will
+// not do leaves the CPU renderer in place. False when --renderer vulkan
+// cannot be honoured (vulkan.open said why).
+fn openRenderer(compositor: *Compositor, arguments: [][*]const u8, renderer: u8, output: ?*kms.Output) -> bool {
+    if renderer == RENDERER_CPU {
+        if compositor.*.verbose { state.say("renderer: cpu (as asked)\n") }
+        return true
+    }
+    if entries.openRenderer(compositor, arguments, output) { return true }
+    if renderer == RENDERER_VULKAN { return false }
+    state.say("mlx-compositor: no usable Vulkan driver; composing on the CPU\n")
+    return true
+}
 
 // Says why start-up or the event loop stopped the compositor (errors
 // leave `main` without a message of their own).
@@ -317,16 +535,24 @@ fn serve(compositor: *Compositor, arguments: [][*]const u8) -> !void {
     var launch_count: usize = 0
     var terminal_set = false
     var timeout: usize = 0
-    var use_vulkan = false
+    var renderer = RENDERER_AUTO
     var backend = BACKEND_AUTO
     var font_path: [*]const u8 = undefined
-    unsafe { font_path = @ptrCast([*]const u8, DEFAULT_FONT) }
+    var no_font_given = true
+    var dock_set = false
+    var launcher_set = false
+    var modules_path: [*]const u8 = undefined
+    unsafe { modules_path = @ptrFromInt([*]const u8, 0) }
+    unsafe { font_path = @ptrCast([*]const u8, "") }
     var index: usize = 1
     const count = std.process.count(arguments)
     while index < count {
         const argument = std.process.argument(arguments, index)
         const has_value = index + 1 < count
-        if equals(argument, "--verbose") {
+        if equals(argument, "--no-fps") {
+            compositor.*.showFps = false
+            compositor.*.noFpsOption = true
+        } else if equals(argument, "--verbose") {
             compositor.*.verbose = true
         } else if equals(argument, "--fullscreen") {
             compositor.*.fullscreen = true
@@ -347,13 +573,18 @@ fn serve(compositor: *Compositor, arguments: [][*]const u8) -> !void {
             index += 1
             const name = std.process.argument(arguments, index)
             if equals(name, "vulkan") {
-                use_vulkan = true
-            } else if !equals(name, "cpu") {
+                renderer = RENDERER_VULKAN
+            } else if equals(name, "auto") {
+                renderer = RENDERER_AUTO
+            } else if equals(name, "cpu") {
+                renderer = RENDERER_CPU
+            } else {
                 return invalidArguments()
             }
         } else if equals(argument, "--font") && has_value {
             index += 1
             const path = std.process.argument(arguments, index)
+            no_font_given = false
             if equals(path, "none") {
                 unsafe { font_path = @ptrCast([*]const u8, "") }
             } else {
@@ -366,6 +597,22 @@ fn serve(compositor: *Compositor, arguments: [][*]const u8) -> !void {
             index += 1
             compositor.*.terminal = std.process.argument(arguments, index).pointer
             terminal_set = true
+        } else if equals(argument, "--launcher") && has_value {
+            index += 1
+            const program = std.process.argument(arguments, index)
+            compositor.*.launcher = program.pointer
+            compositor.*.hasLauncher = !equals(program, "none")
+            launcher_set = true
+        } else if equals(argument, "--dock") && has_value {
+            // The dock stays running like the launcher (shell.startHelpers).
+            index += 1
+            const program = std.process.argument(arguments, index)
+            compositor.*.dock = program.pointer
+            compositor.*.hasDock = !equals(program, "none")
+            dock_set = true
+        } else if equals(argument, "--modules") && has_value {
+            index += 1
+            modules_path = std.process.argument(arguments, index).pointer
         } else if equals(argument, "--run") && has_value && launch_count < 8 {
             index += 1
             launches[launch_count] = @intFromPtr(std.process.argument(arguments, index).pointer)
@@ -385,7 +632,7 @@ fn serve(compositor: *Compositor, arguments: [][*]const u8) -> !void {
             compositor.*.width = width
             compositor.*.height = height
         } else {
-            const usage = std.io.eprintln("usage: mlx-compositor [--backend auto|nested|drm] [--socket NAME] [--size WxH] [--fullscreen] [--renderer cpu|vulkan] [--font PATH|none] [--terminal PROGRAM] [--run PROGRAM]... [--screenshot FILE] [--timeout SECONDS] [--verbose]")
+            const usage = std.io.eprintln("usage: mlx-compositor [--backend auto|nested|drm] [--socket NAME] [--size WxH] [--fullscreen] [--renderer auto|vulkan|cpu] [--font PATH|none] [--terminal PROGRAM] [--launcher PROGRAM|none] [--dock PROGRAM|none] [--modules DIR] [--run PROGRAM]... [--screenshot FILE] [--timeout SECONDS] [--no-fps] [--verbose]")
             return invalidArguments()
         }
         index += 1
@@ -397,30 +644,42 @@ fn serve(compositor: *Compositor, arguments: [][*]const u8) -> !void {
         index += 1
     }
     compositor.*.socketNameLength = socket.length
-    if !terminal_set { compositor.*.terminal = defaultTerminal(compositor, std.process.argument(arguments, 0)) }
+    if !terminal_set { compositor.*.terminal = defaultProgram(compositor, std.process.argument(arguments, 0), "mlx-terminal") }
+    if !launcher_set { compositor.*.launcher = defaultProgram(compositor, std.process.argument(arguments, 0), "mlx-launcher") }
+    if !dock_set { compositor.*.dock = defaultProgram(compositor, std.process.argument(arguments, 0), "mlx-dock") }
     compositor.*.environment = childEnvironment(compositor, arguments)
+    settings.init(compositor)
 
     compositor.*.stage = state.STAGE_SOCKET
     var server: wl.server.Display = undefined
     try wl.server.Display.init(&server, compositor.*.allocator)
     compositor.*.server = server
     try server.addSocket(std.string.asSlice(socket))
+    // The shell and the renderer from DIR (--modules, or
+    // MLX_COMPOSITOR_MODULES), loaded again whenever they change.
+    if @intFromPtr(modules_path) == 0 { modules_path = state.environmentValue(compositor.*.environment, "MLX_COMPOSITOR_MODULES") }
+    if @intFromPtr(modules_path) != 0 && modules_path[0] != 0 { modules.open(compositor, modules_path) }
     compositor.*.stage = state.STAGE_GLOBALS
-    if !shell.createGlobals(compositor) || !dmabuf.createGlobal(compositor) || !data.createGlobal(compositor) { return globalsFailed() }
+    if !entries.createGlobals(compositor) { return globalsFailed() }
     compositor.*.stage = state.STAGE_OUTPUT
     if backend == BACKEND_AUTO {
         // Inside a Wayland session: a window there. Otherwise (a display
         // manager's session, a text console): the monitor itself.
-        const entries = std.process.environmentEntries(arguments)
-        const inside = @intFromPtr(state.environmentValue(entries, "WAYLAND_DISPLAY")) != 0 || @intFromPtr(state.environmentValue(entries, "WAYLAND_SOCKET")) != 0
+        const environment_entries = std.process.environmentEntries(arguments)
+        const inside = @intFromPtr(state.environmentValue(environment_entries, "WAYLAND_DISPLAY")) != 0 || @intFromPtr(state.environmentValue(environment_entries, "WAYLAND_SOCKET")) != 0
         backend = if inside { BACKEND_NESTED } else { BACKEND_DRM }
     }
     if backend == BACKEND_DRM {
         compositor.*.freestanding = true
+        logToFile(compositor)
         compositor.*.drm = drm.start(compositor)
         if compositor.*.drm == 0 { return noMonitor() }
-        loadFont(compositor, font_path)
-        if use_vulkan { state.say("drm: the freestanding compositor composes on the CPU\n") }
+        if no_font_given || font_path[0] != 0 { loadFont(compositor, font_path) }
+        compositor.*.stage = state.STAGE_RENDERER
+        if !openRenderer(compositor, arguments, renderer, drm.output(drm.backendAt(compositor.*.drm))) {
+            drm.stop(drm.backendAt(compositor.*.drm))
+            return noVulkan()
+        }
         if compositor.*.verbose {
             state.say("listening on ")
             const shown = std.io.writeString(std.io.stdout(), socket)
@@ -428,9 +687,10 @@ fn serve(compositor: *Compositor, arguments: [][*]const u8) -> !void {
         }
         index = 0
         while index < launch_count {
-            unsafe { shell.launch(compositor, @ptrFromInt([*]const u8, launches[index])) }
+            unsafe { entries.launch(compositor, @ptrFromInt([*]const u8, launches[index])) }
             index += 1
         }
+        entries.startHelpers(compositor)
         compositor.*.stage = state.STAGE_RUNNING
         try runFreestanding(compositor, server, timeout)
         compositor.*.stage = state.STAGE_DONE
@@ -445,8 +705,8 @@ fn serve(compositor: *Compositor, arguments: [][*]const u8) -> !void {
     }
     try host.connect(compositor)
     compositor.*.stage = state.STAGE_RENDERER
-    loadFont(compositor, font_path)
-    if use_vulkan && !vulkan.open(compositor, arguments) { return noVulkan() }
+    if no_font_given || font_path[0] != 0 { loadFont(compositor, font_path) }
+    if !openRenderer(compositor, arguments, renderer, null) { return noVulkan() }
     if compositor.*.verbose {
         state.say("output: ")
         state.sayNumber(compositor.*.width)
@@ -470,28 +730,43 @@ fn serve(compositor: *Compositor, arguments: [][*]const u8) -> !void {
     }
     index = 0
     while index < launch_count {
-        unsafe { shell.launch(compositor, @ptrFromInt([*]const u8, launches[index])) }
+        unsafe { entries.launch(compositor, @ptrFromInt([*]const u8, launches[index])) }
         index += 1
     }
+    entries.startHelpers(compositor)
 
     compositor.*.stage = state.STAGE_RUNNING
     const display = compositor.*.host
-    var handles: [2]wl.Handle = undefined
+    var handles: [3]wl.Handle = undefined
     handles[0] = wl.Handle.fromDescriptor(display.descriptor())
     handles[1] = wl.Handle.fromDescriptor(server.descriptor())
-    var ready: [2]bool = [2]bool{ false, false }
+    var ready: [3]bool = [3]bool{ false, false, false }
     const deadline = milliseconds() + timeout
+    arena.begin(compositor)
     while compositor.*.running && display.running() {
+        arena.turn(compositor)
+        modules.poll(compositor)
+        settings.poll(compositor)
         if timeout > 0 && milliseconds() >= deadline { compositor.*.running = false }
-        shell.reapChildren()
+        entries.reapChildren(compositor)
         host.present(compositor)
         try display.flush()
         server.flushClients()
+        // The dock's channel too (it asks for the launcher on it).
+        var watched: usize = 2
+        const dock = compositor.*.dockChannel
+        if dock >= 0 {
+            handles[2] = wl.Handle.fromDescriptor(dock)
+            watched = 3
+        }
+        ready[2] = false
         var waited: isize = 0
-        unsafe { waited = wl.transport.waitAny(@ptrCast([*]const wl.Handle, &handles), 2, @ptrCast([*]bool, &ready), 1000) }
+        unsafe { waited = wl.transport.waitAny(@ptrCast([*]const wl.Handle, &handles), watched, @ptrCast([*]bool, &ready), 1000) }
         if ready[0] { try display.dispatch() }
         if ready[1] { try server.dispatch(0) }
+        if watched == 3 && ready[2] { entries.helperMessages(compositor) }
     }
+    arena.end(compositor)
     // The session compositor went away or rejected something.
     host.reportFailure(compositor)
     compositor.*.stage = state.STAGE_DONE
@@ -511,32 +786,46 @@ fn runFreestanding(compositor: *Compositor, server: wl.server.Display, timeout: 
     var handles: [40]wl.Handle = undefined
     var ready: [40]bool = undefined
     const deadline = milliseconds() + timeout
+    arena.begin(compositor)
     while compositor.*.running {
+        arena.turn(compositor)
+        modules.poll(compositor)
+        settings.poll(compositor)
         if timeout > 0 && milliseconds() >= deadline { compositor.*.running = false }
-        shell.reapChildren()
+        entries.reapChildren(compositor)
         drm.present(backend)
         server.flushClients()
         var count: usize = 0
-        unsafe { count = drm.handles(backend, @ptrCast([*]wl.Handle, &handles), 39) }
+        unsafe { count = drm.handles(backend, @ptrCast([*]wl.Handle, &handles), 38) }
         handles[count] = wl.Handle.fromDescriptor(server.descriptor())
+        // The dock's channel too (it asks for the launcher on it).
+        var watched = count + 1
+        const dock = compositor.*.dockChannel
+        if dock >= 0 {
+            handles[watched] = wl.Handle.fromDescriptor(dock)
+            watched += 1
+        }
         var index: usize = 0
-        while index <= count {
+        while index < watched {
             ready[index] = false
             index += 1
         }
         const wait: isize = if drm.hasBufferedData(backend) { 0 } else { 1000 }
         var waited: isize = 0
-        unsafe { waited = wl.transport.waitAny(@ptrCast([*]const wl.Handle, &handles), count + 1, @ptrCast([*]bool, &ready), wait) }
+        unsafe { waited = wl.transport.waitAny(@ptrCast([*]const wl.Handle, &handles), watched, @ptrCast([*]bool, &ready), wait) }
         if ready[count] { try server.dispatch(0) }
+        if watched > count + 1 && ready[count + 1] { entries.helperMessages(compositor) }
         drm.dispatch(backend)
         if compositor.*.vtRequest != 0 {
             drm.switchTo(backend, compositor.*.vtRequest)
             compositor.*.vtRequest = 0
         }
     }
+    arena.end(compositor)
 }
 
 pub fn main(arguments: [][*]const u8) -> !void {
+    const reporting = crash.install()
     var compositor: Compositor = undefined
     initialize(&compositor)
     try run(&compositor, arguments)

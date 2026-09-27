@@ -103,6 +103,28 @@ imports or exports is still the static executable described above
 (`tests/run_foreign.sh` checks that, and runs
 `tests/247_foreign_c_runtime.mlx`).
 
+## Shared objects
+
+`mlx4 --shared FILE -o libNAME.so` writes the same image as a shared object
+for `dlopen` (`ET_DYN`, linked at address 0; the same writer,
+`elf64_dynamic.writeSharedObject`). The x86_64 code needs no relocations of
+its own: every reference to code, string literals, the GOT and the data area
+is RIP-relative, so it runs wherever the dynamic linker maps it. There is no
+`_start` (the entry is 0) and no `main` is needed; the exported functions
+are the object's symbols, found with `dlsym`. Imports work as in an
+executable (GOT slots with `R_X86_64_GLOB_DAT`, `libc.so.6` needed).
+
+A shared object has no aggregate arena of its own: its exported functions
+keep the caller's (see [ABI](abi.md#c-functions-externc-and-export-fn)), so
+it is meant to be loaded by an Mlx program and called on its threads, its
+functions and the functions it hands out as pointers alike.
+`tests/271_shared_object_runtime.mlx` (run by `tests/run_foreign.sh`) loads
+`tests/support/shared_object_library.mlx` twice from two copies, calls it
+through `dlsym` and through function pointers it returns, and checks that
+the structs it builds grow the caller's arena by exactly their size.
+`examples/wayland-compositor` loads its shell and renderer this way, again
+whenever they are rebuilt.
+
 ## Debug information
 
 `spec/03-formats/debug.xml` specifies target-appropriate debug formats and a

@@ -26,6 +26,8 @@ nested|drm` decides).
   GTK). The opposite edges stay where they are.
 - Right-click menus and other `xdg_popup` windows are placed with
   `xdg_positioner` and dismissed by clicking elsewhere.
+- A dock and an app launcher, both Wayland clients of it (see Dock and
+  launcher): Super opens the launcher in the middle of the screen.
 
 ![Two Mlx terminals, the second moved with Alt+drag](screenshots/mlx-terminals.png)
 
@@ -36,6 +38,7 @@ The screenshots are frames the scripted test host received, taken during
 
 | Shortcut | Action |
 | --- | --- |
+| Super | open or close the app launcher (`--launcher`, default `mlx-launcher`) |
 | Alt+Enter | open a terminal (`--terminal`, default `mlx-terminal`) |
 | Alt+drag | move the window under the pointer |
 | Alt+right-drag | resize the window under the pointer from its nearest corner |
@@ -75,9 +78,94 @@ WAYLAND_DISPLAY=wayland-mlx dbus-run-session nautilus
 ```
 
 Options: `--socket NAME`, `--size WxH`, `--fullscreen` (a fullscreen
-window at the monitor's resolution), `--renderer cpu|vulkan`,
-`--font PATH|none`, `--terminal PROGRAM`, `--run PROGRAM` (repeatable),
-`--screenshot FILE`, `--timeout SECONDS`, `--verbose`.
+window at the monitor's resolution), `--renderer auto|vulkan|cpu` (default
+`auto`: Vulkan when a driver works, else the CPU), `--font PATH|none`,
+`--terminal PROGRAM`, `--launcher PROGRAM|none` (what Super starts),
+`--dock PROGRAM|none` (the dock, kept running), `--run PROGRAM`
+(repeatable), `--screenshot FILE`, `--timeout SECONDS`, `--no-fps` (no
+frames-per-second counters in the title bars), `--verbose` (which also
+logs, once a second, `perf:` lines with the frame rate and how long a
+frame takes to compose and present).
+
+Each title bar shows the window's frames per second (the buffers it
+committed) and the desktop's (frames shown). Shown frames follow the
+monitor: at 60 Hz the desktop shows at most 60.
+
+## Dock and launcher
+
+![The launcher over two terminals, the dock below](screenshots/dock-and-launcher.png)
+
+Both are ordinary Wayland clients in [`examples/mlx-dock`](../mlx-dock/main.mlx)
+and [`examples/mlx-launcher`](../mlx-launcher/main.mlx) (like
+[`examples/mlx-settings`](../mlx-settings/main.mlx)), sharing
+[`examples/desktop-shared`](../desktop-shared): the layer surface or window
+and its input (`panel.mlx`), drawing (`canvas.mlx`), the keymap (`keyboard.mlx`),
+desktop entries and their PNG icons (`apps.mlx`, with `std.png`) and the
+per-turn value release (`turns.mlx`). They draw with Vulkan, the
+desktop's standard for every app: `canvas.mlx` records what it is asked
+to draw and `gpu_canvas.mlx` has the `paint` compute shader draw it all in
+one pass, into buffers handed to the compositor as dma-bufs
+(linux-dmabuf, ARGB8888, in device memory the compositor can map), or,
+where the driver cannot export them (lavapipe), straight into the shared
+memory it imports. Each app logs how (`mlx-dock: drawing on the gpu, into
+dma-bufs (DEVICE)`). Without Vulkan, or with `MLX_CANVAS=cpu`, they draw
+the same pixels on the CPU. The compositor offers them three protocols:
+
+- `zwlr_layer_shell_v1` (wlr-layer-shell): surfaces in four layers
+  (background, bottom, top, overlay; windows sit between bottom and top),
+  anchored to edges or centred, with margins. A surface with an exclusive
+  zone keeps its strip free: new windows are placed beside it and a
+  window's bounds leave it out. A surface that asks for the keyboard
+  exclusively in the top or overlay layer keeps it until it goes.
+- `zwlr_foreign_toplevel_manager_v1` (wlr-foreign-toplevel-management):
+  every window with its title, app id and whether it is active; a client
+  can activate (focus and raise) or close one.
+- `ext_background_effect_manager_v1`: a surface names a region where what
+  is behind it is blurred (three box blurs, radius 6) before the surface
+  is drawn over it. The CPU and the Vulkan renderer blur alike, pixel for
+  pixel.
+
+Super, pressed and released on its own, shows the launcher, or closes it
+when it is open (a Super shortcut with another key does neither). The
+compositor starts the launcher with itself and keeps it running hidden,
+with everything loaded (apps, fonts, icons): it hands it one end of a
+socket pair (`MLX_LAUNCHER_FD`), and Super sends it one byte, so it shows
+within a frame. Closing it only hides it; when it went away, the next
+Super starts it again. The
+launcher is a surface in the overlay layer, centred, that takes the
+keyboard: typing narrows the apps (by name, id and command; names that
+start with the text first), the arrow keys, Page Up/Down, Home and End
+choose, Enter or a click starts the app (in `$MLX_TERMINAL` when its entry
+says `Terminal=true`), Escape, Super or a click outside close it.
+
+The dock sits in the top layer along the bottom edge with an exclusive
+zone. Like the launcher it is a helper the compositor starts with itself
+(`--dock PROGRAM|none`, default `mlx-dock` next to the compositor) and
+keeps running: when it ends it is started again (three times at most when
+it keeps ending within five seconds). Its apps button asks the compositor
+for the launcher on its own socket pair (`MLX_DOCK_FD`), so the launcher
+that stays shows at once (a second click closes it). Both look every few
+seconds (the launcher also whenever it is shown) whether apps were
+installed or removed (the application directories' modification times)
+and the dock whether `~/.config/mlx/dock` changed, and take the changes in.
+It shows an apps button, the pinned apps,
+and after a separator the apps that have windows but are not pinned; a dot
+marks an app that runs. Icons grow under the pointer, which shows the
+app's name. A click brings the app's window forward (the next one when it
+has several) or starts it. `~/.config/mlx/dock` lists the pinned apps, one
+desktop entry id per line (`org.gnome.Nautilus`, `firefox`), `terminal` for
+the Mlx terminal; without it the dock pins the terminal and the first file
+manager, browser and editor it finds. Icons are PNGs (the hicolor theme or
+`/usr/share/pixmaps`); an app with only an SVG icon gets a tile with its
+initial.
+
+The compositor passes `MLX_TERMINAL` (its `--terminal`) and `MLX_LAUNCHER`
+(its `--launcher`) to its clients. The session starts the dock
+(`MLX_SESSION_DOCK=no` does not). `tools/check_desktop_clients.sh`
+checks both clients with scripted input on the CPU and the Vulkan
+renderer: where their surfaces are, Super, typing, starting apps from both,
+switching windows from the dock, the blur, and that both renderers draw
+the same pixels.
 
 ## Freestanding (DRM/KMS)
 
@@ -93,12 +181,22 @@ compositor is the display server itself:
   (`TakeDevice`), so no root is needed. Without logind (no system bus) the
   devices are opened directly, which needs the rights to them, and there is
   no VT switching.
-- **Monitor** ([`kms.mlx`](kms.mlx)): the first card (`/dev/dri/cardN`)
-  with a connected connector, at the monitor's preferred mode, on a CRTC
-  one of the connector's encoders can drive. Two XRGB8888 dumb buffers are
-  drawn into in turn and shown with page flips; the flip-complete events
-  pace the frame callbacks, so clients draw at the monitor's refresh
-  rate. On exit the CRTC gets back what it showed before.
+- **Monitor** ([`kms.mlx`](kms.mlx)): one card (`/dev/dri/cardN`) with a
+  connected connector, at the monitor's native resolution (that of its
+  preferred mode) with the highest refresh rate it offers there (monitors
+  mark a 60 Hz mode preferred even when they do 144 Hz;
+  `MLX_DRM_REFRESH=HZ` sets an upper limit), on a CRTC one of the
+  connector's encoders can drive. With several cards each is looked
+  at and logged (`drm: /dev/dri/card1: VGA-1 1024x768 at 60 Hz (the boot
+  card)`, `drm: /dev/dri/card2: DP-1 3840x1080 at 60 Hz`), and the one
+  with the largest monitor is driven (a server's BMC graphics, ASPEED for
+  one, reports a small VGA "monitor" and is often the boot card), then the
+  boot card, then the first; `MLX_DRM_CARD=/dev/dri/cardN` (or just `N`)
+  in the environment picks another. Only that card's monitor is driven;
+  the others stay dark. Two XRGB8888 dumb buffers are drawn into
+  in turn and shown with page flips; the flip-complete events pace the
+  frame callbacks, so clients draw at the monitor's refresh rate. On exit
+  the CRTC gets back what it showed before.
 - **Input** ([`evdev.mlx`](evdev.mlx)): every keyboard, mouse and touchpad
   under `/dev/input`, and those plugged in later (inotify). Mice move with
   a little acceleration and scroll 15 pixels a notch; touchpads move the
@@ -111,13 +209,35 @@ compositor is the display server itself:
   follows the modifiers. Without it a keymap file can be given with
   `MLX_XKB_KEYMAP`.
 - **VT switching**: Ctrl+Alt+F1..F12 asks logind to switch; while another
-  VT is in front the card and the input devices are paused (keys and
+  VT is in front logind pauses the card and the input devices (keys and
   buttons still held are released), and coming back sets the CRTC up
-  again.
+  again. The pause itself never stops the compositor from drawing: it
+  keeps presenting, and the kernel refuses the frames while the card is
+  not ours (`drm: page flip failed (errno 13; the card is paused); trying
+  again`, once), so a pause whose resume never arrives, as seen during
+  SDDM's hand-over from its greeter, cannot leave the screen black. The
+  log names each pause's kind and the VT in front (`session: the card is
+  paused (asked, tty2 in front, ours is tty1)`).
 
-Frames are composed on the CPU into memory of the compositor's own and
-copied into the dumb buffer row by row (the buffer's pitch may be wider
-than a row); `--renderer vulkan` applies to the nested compositor only.
+Frames are composed by the GPU straight into the dumb buffer when a Vulkan
+driver works (the default, `--renderer auto`): each dumb buffer is exported
+as a dma-buf (`DRM_IOCTL_PRIME_HANDLE_TO_FD`) and imported into Vulkan,
+and the blit shader writes rows the buffer's pitch apart (see
+[Vulkan](#vulkan)). Otherwise, or with `--renderer cpu`, they are composed
+on the CPU into memory of the compositor's own and copied into the dumb
+buffer row by row (the buffer's pitch may be wider than a row). At a
+monitor's resolution the GPU is what keeps the compositor responsive: CPU
+composition of a 1920x1080 frame takes a good part of a 60 Hz frame time,
+the GPU a fraction of it.
+
+The screen never stays black for the renderer's sake: after the first
+frame rendered into a dumb buffer the compositor looks at the buffer
+through its own mapping, and when the GPU's pixels are not there (a driver
+that imports the buffer but writes where the monitor does not scan out)
+it renders into a buffer of its own and copies frames in from then on
+(`renderer: the GPU's frame did not reach the dumb buffer; copying each
+frame instead` in the log); a frame Vulkan cannot compose at all hands the
+output to the CPU renderer for good.
 
 `tools/check_compositor_drm.sh` runs all of this without hardware:
 [`tools/fake_drm_session.py`](../../tools/fake_drm_session.py) plays the
@@ -131,17 +251,41 @@ Real clients connect: typing reaches the Mlx terminal and, through the
 compositor's keymap, weston-terminal; the mouse, the touchpad and a mouse
 plugged in later move the cursor; Ctrl+Alt+F2 pauses and resumes
 everything; Alt+Shift+Q restores the console's CRTC and gives every
-device back.
+device back. `tools/check_compositor_drm.sh vulkan` runs the same with the
+Vulkan renderer on lavapipe, which must export both dumb buffers as
+dma-bufs and render into them (the harness answers PRIME with the buffer's
+memfd), once more copying each frame in, as on drivers that cannot import
+them, and once more with the first frame made to look missing from the
+buffer, after which the renderer must copy.
 
 ## Desktop session (GDM, SDDM)
 
-`tools/install_compositor_session.sh` builds the compositor and the
-terminal and installs them as a session that GDM and SDDM offer at login:
+`install_compositor.sh` at the repository root builds the compositor and
+the terminal, installs them into `/usr/bin` as a session that GDM and SDDM
+offer at login, and then checks the installation and the machine:
 
 ```sh
-tools/install_compositor_session.sh             # asks for sudo to install
-tools/install_compositor_session.sh --uninstall
+./install_compositor.sh                # build, install (asks for sudo), check
+./install_compositor.sh --check        # check an installation and the machine
+./install_compositor.sh --log          # the last session log
+./install_compositor.sh --uninstall
 ```
+
+The checks cover the three programs and the session entry (whose `Exec`
+and `TryExec` must resolve, or the login screen hides the session), the
+display manager, the system bus for logind, the DRM cards and their
+connected connectors, the `video` and `input` groups (needed only without
+logind), the Vulkan drivers, libxkbcommon, and the last session log,
+whose `modeset failed`, `crashed:` or `killed by signal` lines it points
+out. It wraps `tools/install_compositor_session.sh`, which does the
+building and copying (`--prefix`, default `/usr/local` there; `--destdir`
+stages for packaging; `--build-only` builds into `mlx-out/session`). The
+build uses the canonical compiler, `mlx-out/bin/compiler/mlx4`, and makes
+it first from the bootstrap-built `zig-out/bin/mlx1` when it is missing
+(`mlx1 -> mlx2 -> mlx3`, the self-hosted compiler's fixed point): that
+compiler builds the same binary from the same sources on every machine,
+so the checksum `--check` prints matches a build elsewhere, and a crash
+address from one machine finds its place in another's disassembly.
 
 It puts `mlx-compositor`, `mlx-terminal` and `mlx-session` into
 `/usr/local/bin` (`--prefix`) and `mlx-compositor.desktop` into
@@ -154,11 +298,45 @@ session menu.
 The session ([`session/mlx-session`](session/mlx-session)) runs the
 compositor freestanding (above), at the monitor's preferred resolution,
 with the system's keyboard layout (`localectl`, `/etc/default/keyboard` or
-`/etc/vconsole.conf`; `XKB_DEFAULT_LAYOUT` wins). Alt+Enter opens a
-terminal, Ctrl+Alt+F1..F12 switch VTs, Alt+Shift+Q ends the session, and
-everything the compositor logs (`--verbose`) goes to
-`~/.local/state/mlx-compositor/session.log`. `MLX_COMPOSITOR_ARGS` adds
-options.
+`/etc/vconsole.conf`; `XKB_DEFAULT_LAYOUT` wins), composed by the GPU when
+a Vulkan driver works, else on the CPU (the log says which). Alt+Enter
+opens a terminal, Ctrl+Alt+F1..F12 switch VTs, Alt+Shift+Q ends the
+session. `MLX_SESSION_RENDERER` picks the renderer: `auto` (the default:
+Vulkan when a driver works, else the CPU), `vulkan` (Vulkan or nothing)
+or `cpu`; `MLX_COMPOSITOR_ARGS` adds other options. (`--backend drm` in
+the log is the other, independent choice: the compositor drives the
+monitor itself, which is what makes it a session of its own.)
+
+The session log is `~/.config/mlx/compositor.log` (`MLX_SESSION_LOG`
+names another file; the previous run's log is kept as
+`compositor.log.old`). It is the place to look when the session does not
+come up. It starts with the environment the display manager gave the
+session (user, `XDG_SESSION_ID`, seat and VT, the logind session's type
+and activity, the system bus, the DRM devices, the Vulkan drivers
+installed, a checksum of the compositor binary), then holds everything
+the compositor prints with `--verbose`: the card and mode it took
+(`drm: /dev/dri/card1 3840x1080 at 60 Hz`), the renderer, `drm: first
+frame on screen` once the monitor shows a frame, or `drm: modeset failed
+(errno N); nothing shown yet, trying again` when the kernel refuses the
+mode (13 is EACCES: the card is not ours, 22 EINVAL: the mode or buffer),
+every window, and how it all ended (`mlx-compositor exited with status N`
+or `was killed by signal N`, with the crash line below when there was
+one). A compositor that crashes within its first 20 seconds, or gives up
+that early while composing with Vulkan, is started once more with
+`--renderer cpu`, so a Vulkan-only failure still leaves a working
+session, and the log shows both attempts.
+
+When even that log does not appear, `/tmp/mlx-session-UID.log` says
+whether the launcher was started at all (its first line is written before
+anything else), and `./install_compositor.sh --log` shows both files and
+the display manager's journal lines about the session.
+
+A compositor started by hand, `mlx-compositor --backend drm` from a text
+console, writes the same log itself (the console it was started from is
+the monitor it draws on): `MLX_COMPOSITOR_LOG` names the file, `-` keeps
+stdout, the default is `~/.config/mlx/compositor.log`, and `--verbose` is
+implied. Starting the session from a text console works too: log in on
+one (Ctrl+Alt+F3) and run `mlx-session`.
 
 `MLX_SESSION_HOST=cage` or `weston` in the session's environment runs the
 compositor nested instead, fullscreen in a minimal host that drives the
@@ -179,12 +357,89 @@ nested variants of the session as a display manager would, with cage and
 with weston on their headless backends: the compositor must come up at the
 host monitor's resolution with the session's keyboard layout.
 
+## Settings
+
+`~/.config/mlx/compositor.conf` (`$XDG_CONFIG_HOME/mlx/compositor.conf`)
+changes the running compositor: it reads the file at start and again
+within half a second whenever it changes ([`settings.mlx`](settings.mlx)).
+One setting per line, lines starting with `#` are comments:
+
+```
+# The focused window's frame and title bar, and the other windows'.
+border-color = #5aa0ff
+inactive-border-color = #505060
+# off: windows have only their frame.
+title-bars = on
+# Frames per second in the title bars.
+fps-counter = on
+# on: programs draw their own title bars and frames.
+client-decorations = off
+# Windows' rounded corners in pixels (0 to 20; 0: square).
+corner-radius = 12
+# Moved windows wobble (with the Vulkan renderer).
+wobbly-windows = on
+```
+
+[`examples/mlx-settings`](../mlx-settings/main.mlx) is a small window to
+change them: a row of colours for the border and switches for the title
+bars, the counter, rounded corners (12 pixels or square), wobbly windows
+and app decorations. It writes the file whole and renames it into place, so the
+compositor never reads half of it. The launcher lists it as Settings.
+Without title bars, windows move with Alt+drag.
+
+### Rounded corners
+
+Windows have rounded corners like GTK's: 12 pixels by default, the
+radius of libadwaita's windows (GNOME's GTK 4 programs; plain GTK 4 and
+GTK 3 round only their top corners, by 8). A window's content, its
+subsurfaces included, is cut to its window rectangle with rounded
+corners (under a title bar only the bottom ones); what a client draws
+outside that rectangle, such as GTK's shadows, is left as it is. The
+frame and the title bar around it follow with a radius 2 pixels larger,
+so both curves share their centres. Coverage is sampled 4x4 per corner
+pixel with integers only, as the desktop canvas does, so the CPU and the
+Vulkan renderer (the blit shader's FLAG_CLIP_CORNERS and FLAG_RING masks)
+give the same pixels; `tools/check_vulkan_wayland.sh` compares them.
+
+### Decorations
+
+Programs that speak xdg-decoration (`zxdg_decoration_manager_v1`: GLFW and
+libdecor programs such as Minecraft, SDL, Qt, RetroArch, mpv) ask whether
+they should draw their own title bar and frame. With
+`client-decorations = off`, the default, the compositor answers that it
+draws them, so these programs leave theirs out and only the compositor's
+title bar shows. With `on` a program gets what it asks for (its own
+decorations when it does not say). A change reaches open windows at once:
+they are configured again with the new mode. Programs without
+xdg-decoration always draw their own: GTK (client-side decorations by
+design) and weston's demo clients such as weston-terminal.
+
+## Drawing only what changed
+
+Every change to the scene reports the area it covers (a window moved,
+raised or redrawn, the focus, the cursor, a popup placed), and a frame
+draws only that: the CPU renderer composes the changed rectangle, and each
+of the two output buffers is brought up to date in what it lacks (the
+buffer shown two frames ago lacks two frames' changes; freestanding, the
+changed rows of the compositor's own frame are copied into the dumb
+buffer). Moving the pointer thus redraws a few hundred pixels rather than
+the screen, and the frame after a client's commit only that window. The
+Vulkan renderer redraws everything, which costs the GPU little.
+`tests/268_compositor_damage_runtime.mlx` checks the bookkeeping against
+frames composed from scratch. Composition itself works on whole pixels
+and 64-bit words (`state.copyPixels`, `fillPixels`), copies opaque
+windows' rows outright and blends the three channels of a translucent
+pixel at once; a full 1920x1080 frame with an opaque window takes about 6
+ms on the CPU where it took 88.
+
 ## Title bars
 
 Every window gets a title bar above its frame (the focus color when it has
 the keyboard) showing its `xdg_toplevel` title, drawn with
-[`std.truetype`](../../docs/reference/truetype.md) from `--font` (default
-DejaVu Sans; titles are left out when it cannot be read). Dragging a title
+[`std.truetype`](../../docs/reference/truetype.md) from `--font` (default:
+DejaVu Sans or Liberation Sans wherever the distribution keeps them,
+`/usr/share/fonts/truetype/dejavu`, `/usr/share/fonts/TTF`, ...; titles
+are left out when none reads). Dragging a title
 bar moves the window. Both renderers draw titles identically: the CPU with
 `std.truetype.drawRun`, Vulkan with the `text` compute shader.
 
@@ -204,28 +459,141 @@ stay within the client's `set_min_size`/`set_max_size` and never go below
 
 ## Vulkan
 
-With `--renderer vulkan` the output is composed on the GPU by the blit
-compute shader of `examples/vulkan-shared`, through `std.vulkan` (no C
-loader; `VK_DRIVER_FILES` picks a driver). Client buffers are read where
-they are: `wl_shm` pools are imported as host memory
-(`VK_EXT_external_memory_host`), linux-dmabuf buffers as dma-bufs, and the
-frame is written straight into the buffer shown in the host window. A
-buffer is therefore kept until the client commits the next one, then
-released. The result is pixel-identical to the CPU renderer.
+By default (`--renderer auto`, or `vulkan` to insist) the output is
+composed on the GPU by the blit compute shader of `examples/vulkan-shared`,
+through `std.vulkan` (no C loader; `VK_DRIVER_FILES` picks a driver),
+nested and freestanding alike.
+Client buffers are read where they are: `wl_shm` pools are imported as
+host memory (`VK_EXT_external_memory_host`), linux-dmabuf buffers as
+dma-bufs. The frame is written straight into the output: nested, the
+buffer shown in the host window (its `wl_shm` pool imported as host
+memory); freestanding, the DRM dumb buffer the monitor scans out (exported
+as a dma-buf and imported with `VK_EXT_external_memory_dma_buf`, the
+shader stepping rows by the buffer's pitch). A client buffer is therefore
+kept until the client commits the next one, then released. The result is
+pixel-identical to the CPU renderer.
 
-Drivers that cannot import that shared memory (RADV and the other amdgpu
-drivers import only anonymous memory, not the memfd behind a `wl_shm`
-pool) use copies instead: the frame is rendered into a host-cached buffer
-and copied into the host window's buffer, and a `wl_shm` client buffer is
-uploaded into a per-window buffer when the client commits new content.
-dma-bufs are still imported. `--verbose` says when this happens
-(`renderer: ... copying each frame`); `MLX_VULKAN_NO_HOST_IMPORT=1` takes
-this path on any driver.
+Drivers that cannot import the output or that shared memory (RADV and the
+other amdgpu drivers import only anonymous host memory, not the memfd
+behind a `wl_shm` pool) use copies instead. Freestanding, the renderer
+first tries zero copy: it renders into two buffers of the GPU's own memory,
+exported as dma-bufs and made the monitor's framebuffers
+(`PRIME_FD_TO_HANDLE`, then a framebuffer on the handle), so the monitor
+scans out what the GPU drew and nothing is copied (`renderer: zero copy`
+in the log; `MLX_VULKAN_NO_SCANOUT=1` turns it off). Otherwise the frame is
+rendered into the dumb buffers when the driver can import them, or else in
+device memory, the part the output buffer lacks is copied by the GPU into
+host-cached memory and from there into the output, and a `wl_shm` client
+buffer is uploaded into a per-window buffer (device memory the CPU can
+write, where there is room) when the client commits new content: only
+what its damage says changed. On discrete GPUs this keeps the GPU's
+reads and writes in its own memory instead of across PCIe. dma-bufs, the dumb buffers included,
+are still imported where the driver can. `--verbose` says when this
+happens (`renderer: ... copying each frame`); `MLX_VULKAN_NO_HOST_IMPORT=1`
+takes this path on any driver.
+
+`--renderer auto` (the default) falls back to the CPU renderer when no
+driver works (`mlx-compositor: no usable Vulkan driver; composing on the
+CPU`). With several drivers installed it takes the first whose device is
+a GPU, and a CPU device (lavapipe, whose manifest sorts before RADV's)
+only when no GPU works; `--verbose` notes the ones passed over. So does a
+running compositor whose driver fails to compose a frame (`Vulkan could not compose a frame; composing on the CPU from now
+on`): the buffers its windows show are copied and the CPU carries on.
+`--renderer cpu` never opens a driver.
+
+## Changing it while it runs
+
+The shell (the Wayland protocol and window management: `shell.mlx`,
+`data.mlx`, `dmabuf.mlx`, with `scene.mlx`'s bookkeeping) and the renderer
+(`scene.mlx`'s drawing and `vulkan.mlx`) can be built as shared objects,
+`libmlx-shell.so` and `libmlx-render.so`, which the compositor loads at
+start-up and loads again whenever they change, without a restart:
+
+```sh
+tools/build_compositor_modules.sh          # both, into ~/.local/lib/mlx-compositor
+tools/build_compositor_modules.sh shell    # one
+tools/build_compositor_modules.sh --watch  # again on every saved change
+```
+
+The desktop session watches `~/.local/lib/mlx-compositor`
+(`MLX_COMPOSITOR_MODULES` names another directory; `install_compositor.sh`
+builds both there); a compositor started by hand takes `--modules DIR`.
+Without the files it runs its built-in copies. The log says what happened:
+
+```
+modules: loaded /home/you/.local/lib/mlx-compositor/libmlx-shell.so (version 2, 214 handler uses moved over)
+```
+
+What lives across a reload stays: clients, windows, surfaces, buffers, the
+GPU state. The program keeps the event loop, the monitor, the input
+devices and the session, and calls the shell and the renderer through a
+table (`entries.mlx`) that a load replaces. Every handler the shell
+registered with the Wayland server is replaced by the new build's function
+of the same name (each of `shell.mlx`, `data.mlx` and `dmabuf.mlx` lists
+its handlers at its end; `tools/check_compositor_modules.py` checks the
+lists are complete), and a new renderer fills its fixed pixels (background,
+frame colours, cursors) again. A build whose shared records differ (a field
+added to `state.mlx`, or to a record the renderer keeps) is refused, since
+the running data has the old layout: that needs a restart (`LAYOUT_VERSION`
+in `state.mlx` marks changes sizes do not show). A build that does not
+compile leaves the running version alone. Old versions stay loaded, so
+nothing that still points into one breaks.
+
+The shared objects come from `mlx4 --shared` (see
+[Formats](../../docs/reference/formats.md#shared-objects)); they run on the
+compositor's value arena, which is released every turn of the event loop
+as before. `tools/check_compositor_modules.sh [compiler] [cpu|vulkan]` runs
+the compositor with modules and, while a terminal is open, replaces both
+with builds of changed sources (a red background, new window placement):
+both must load, the terminal must keep taking keys, the changes must show,
+and a shell built for a changed record must be refused.
+
+## Memory
+
+This compiler keeps every value that is not a field of something else
+(locals, literals, values functions return) in one 256 MiB arena that is
+only ever bumped: nothing in it is released when a function returns. A
+program that runs for long allocates it up (a pointer motion costs a few
+hundred bytes for its decoded event and some rectangles, so a mouse at
+1000 Hz filled it within a minute or two) and dies with an illegal
+instruction when it is full. Two things keep the compositor within it:
+
+- `std.wayland` builds every message in storage that belongs to the
+  connection and handles every request and event from a fixed slot, not
+  from a message-sized local per message
+  (`tests/269_wayland_message_storage_runtime.mlx`);
+- the event loop is a fixed point (`arena.mlx`): everything that outlives a
+  turn of the loop is memory from the allocator or was allocated before the
+  loop started, so the loop notes the arena's fill before its first turn and
+  restores it at the start of every turn. `--verbose` reports the fill
+  kept at the start (`memory: 24 KiB of values kept; each turn of the loop
+  releases its own`) and, at the end, the most a turn allocated.
+  `MLX_ARENA_RELEASE=0` keeps the arena growing (as before), and
+  `MLX_ARENA_POISON=1` overwrites the released bytes so that a value
+  wrongly kept across turns is noticed rather than read back intact; the
+  check scripts run the compositor that way.
+
+## When it crashes
+
+A failed runtime check (an index out of range, an unsigned subtraction
+below zero, an overflow) is compiled to an illegal instruction. The
+compositor catches that, and the other fatal signals, and says so before
+it dies: `mlx-compositor: crashed: illegal instruction (...) at 0x4a12f3;
+stack: ...`, with the addresses of the instruction and the words on top
+of the stack. The compiler builds the same binary from the same sources,
+so that address finds the place in a disassembly of a fresh build
+(`objdump -d mlx-compositor`); please include the line in a bug report,
+with the commit the compositor was built from.
 
 When the compositor stops on its own it says why: for example
 `mlx-compositor: lost the session compositor: the server reported a
 protocol error (object 12, code 3): ...`, or that the Wayland socket is
-taken (`--socket NAME` picks another).
+taken (`--socket NAME` picks another). When it disconnects a client, the
+log (`--verbose`, and so the session's) says why: `client disconnected: it
+broke the protocol, buffer does not fit the pool (error 1 on request 0 of
+wl_shm_pool 7)`, `it stopped reading its events`, or `a file descriptor
+for it could not be duplicated`; a client that left on its own gets a
+plain `client disconnected`.
 
 ![The Vulkan client (examples/vulkan-wayland-client) in the Vulkan renderer](screenshots/vulkan-client.png)
 
@@ -236,12 +604,91 @@ mlx4 examples/vulkan-wayland-client/main.mlx -o vulkan-wayland-client
 
 ## Supported protocol
 
-`wl_compositor` (surfaces and regions), `wl_shm` (ARGB8888 and XRGB8888),
-`zwp_linux_dmabuf_v1` version 3 (ARGB8888 and XRGB8888, linear, one plane),
+`wl_compositor` (surfaces, and regions as input regions: a surface with
+one takes the pointer only inside it), `wl_shm` (ARGB8888 and XRGB8888),
+`zwp_linux_dmabuf_v1` version 4 (ARGB8888 and XRGB8888, one plane, linear
+or in the driver's own layout; see GPU clients below),
 `wl_output`, `wl_seat` with pointer and keyboard, `wl_data_device_manager`
-version 3 and `xdg_wm_base` with toplevels (with `configure_bounds`: the
-output's size), popups and positioners. There are no subsurfaces.
+version 3, `wl_subcompositor`, `xdg_wm_base` with toplevels (with
+`configure_bounds`: the output's size), popups and positioners,
+`zwlr_layer_shell_v1` version 5, `zwlr_foreign_toplevel_manager_v1`
+version 3, `ext_background_effect_manager_v1` version 1 (see Dock and
+launcher), `zxdg_decoration_manager_v1` version 2 (see Decorations),
+`zwp_relative_pointer_manager_v1` and `zwp_pointer_constraints_v1`
+version 1 (see Pointer lock).
 Composition is done in software, or with Vulkan (`--renderer vulkan`).
+
+### GPU clients (OpenGL, Vulkan)
+
+Mesa finds the GPU a Wayland client should render on in linux-dmabuf's
+feedback (version 4, `main_device`); the old `wl_drm` is not offered.
+The compositor names the card it drives, or nested the first render node
+(`/dev/dri/renderD128` on), and logs it once with `--verbose`:
+
+    dmabuf: clients are told to render on GPU 226:1 (linear, else its own layout)
+
+The feedback has two tranches. The first offers LINEAR buffers, which
+the Vulkan renderer reads where they are. The second offers the implicit
+modifier (the layout the client's driver picks, usually tiled) for
+scanout: radeonsi before GFX9 (Polaris such as the RX 580, and older)
+supports no explicit modifier, not even LINEAR, so Mesa allocates from
+this tranche (scanout keeps DCC compression off). Such a buffer lives in
+video memory the CPU may not map: it is not mapped, and the Vulkan
+renderer imports it as an image with a dedicated allocation (RADV takes
+the tiling from the buffer's metadata) and copies it into rows on the
+GPU each frame before composing it. The log says so once:
+
+    renderer: reading client buffers in the GPU's own layout (imported as images)
+
+Only a renderer that reads tiled buffers (Vulkan on a GPU) names a
+device: offered only LINEAR, a Polaris card cannot allocate a buffer and
+Mesa 26 crashes (a NULL image in `dri2_query_image`), so with the CPU
+renderer (or lavapipe) clients render with llvmpipe as with version 3.
+F3 in Minecraft shows which: the graphics card or `llvmpipe`.
+
+When the renderer cannot import a client's dma-buf, the log says which
+step failed (for example `vkGetMemoryFdPropertiesKHR refused the
+dma-buf`): a linear buffer is then copied by the CPU, a tiled one is not
+shown.
+
+### Wobbly windows
+
+A window being moved bends like jelly and swings back when let go, as
+Compiz's did ([`wobble.mlx`](wobble.mlx)). Its outline is a Bezier
+surface with 4x4 control points over everything it draws (frame, title
+bar, buffers). Neighbouring points pull on each other, every point back
+to its rest, friction settles them; the point nearest the grab stays
+under the pointer while the others lag behind. The springs step in fixed
+4 ms steps after every frame, in fixed point, and damage what the window
+covers until it is still (about a second).
+
+The Vulkan renderer draws a wobbling window flat into a scratch buffer
+and bends it onto the frame with the warp kernel
+(`examples/vulkan-shared/shaders.mlx`): each pixel finds the point of the
+window the surface carries onto it (three fixed-point iterations) and
+samples it bilinearly. The CPU renderer draws windows flat. The setting
+is `wobbly-windows` (on by default).
+
+### Pointer lock
+
+Games and 3D programs turn the camera with the mouse through relative
+motion and pointer constraints ([`pointer.mlx`](pointer.mlx)); SDL3, and
+with it Minecraft, refuses its relative mouse mode without both.
+
+- Relative motion goes to the client under the pointer: the mouse's own
+  movement and the accelerated one, also where the pointer cannot move
+  (the output's edge, a lock). Nested, the host's pointer movement stands
+  in for it.
+- A lock or confinement holds while its window has the pointer and the
+  keyboard. Super (the launcher) or a click on another window always
+  frees the pointer; a oneshot constraint then ends, a persistent one
+  comes back when the window has both again.
+- Locked, the pointer stays put and the client gets no `wl_pointer.motion`;
+  when the lock ends the pointer goes to the client's cursor position
+  hint. Confined, it stays within the surface and the bounds of the
+  region. Regions and hints apply at once, not on the next commit.
+
+`--verbose` logs `pointer: locked` and `pointer: unlocked`.
 
 ## Copy and paste
 
@@ -258,6 +705,12 @@ once.
 - `main.mlx`: options, the backend choice, the child environment and the
   event loops (nested: the host connection and the server; freestanding:
   the server and the devices).
+- `arena.mlx`: releases what each turn of the event loop allocated (see
+  Memory).
+- `modules.mlx`, `entries.mlx`: loading the shell and the renderer as
+  shared objects and calling them (see Changing it while it runs), with
+  their tables `shell_table.mlx` and `render_table.mlx` and the shared
+  objects' roots `shell_module.mlx` and `render_module.mlx`.
 - `host.mlx`: the nested backend, a window on the session compositor
   (fullscreen at the monitor's resolution with `--fullscreen`) and its seat
   input.
@@ -267,13 +720,15 @@ once.
   session), `dbus.mlx` (a small D-Bus client) and `device.mlx` (device
   syscalls, and the emulated devices of the test harness).
 - `shell.mlx`: the server side, with globals, surfaces, shared memory,
-  xdg-shell, focus and input delivery, and launching programs.
+  xdg-shell, layer shell, the window list for docks, blur regions, focus
+  and input delivery, and launching programs.
 - `dmabuf.mlx`: linux-dmabuf; each dma-buf becomes a one-buffer pool.
 - `data.mlx`: `wl_data_device_manager`, copy and paste between clients.
 - `session/`: the desktop session's launcher and entry
   (`tools/install_compositor_session.sh` installs them).
 - `vulkan.mlx`: the Vulkan renderer.
-- `scene.mlx`: stacking, hit-testing, title bars and software composition.
+- `scene.mlx`: stacking (layers and windows), hit-testing, title bars,
+  damage tracking, blur and software composition.
 - `state.mlx`: shared records and list helpers.
 
 `tools/check_wayland_compositor.sh [compiler] [cpu|vulkan]` exercises all

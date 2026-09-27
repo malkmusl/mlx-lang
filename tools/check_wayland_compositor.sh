@@ -9,7 +9,10 @@
 #
 #   1. click the Mlx terminal and type a command (keyboard -> shell);
 #   2. Alt+Enter opens a second terminal (compositor shortcut);
-#   3. Alt+drag moves it (compositor-driven move), then type into it;
+#   3. Alt+drag moves it (compositor-driven move); the pointer and keyboard
+#      leave the window and come back, with a wheel notch and a Super key
+#      in between (as when the user visits another window); then type into
+#      it;
 #   4. drag a window by the compositor's title bar (the title is drawn with
 #      std.truetype when DejaVu Sans is installed);
 #   5. resize a terminal by its border (bottom-right, then top-left with
@@ -19,7 +22,13 @@
 #      forwarded xkb keymap, drag it by its title bar (xdg_toplevel.move)
 #      and open its right-click popup menu;
 #   7. with wl-clipboard and gtk4-widget-factory (if installed): copy and
-#      paste between two clients, and a GTK 4 window.
+#      paste between two clients, and a GTK 4 window;
+#   8. xdg-decoration: a client asking to draw its own title bar is told
+#      the compositor draws it, until the settings file allows client
+#      decorations (and again not when it stops);
+#   9. pointer constraints and relative motion: a client locks the pointer
+#      on its window; after a click it is locked, the pointer stays put and
+#      the client gets the host's movement as relative motion.
 #
 # Typed commands create marker files, so keyboard delivery is verified at the
 # shell; the moved window's focus frame is checked in the host's screenshot.
@@ -39,7 +48,14 @@ command -v xkbcli > /dev/null || { echo "check_wayland_compositor.sh: xkbcli is 
 
 work=$(mktemp -d)
 export XDG_RUNTIME_DIR="$work/runtime"
+# Values a turn of the compositor's loop released are overwritten, so one
+# wrongly kept across turns shows (examples/wayland-compositor/arena.mlx).
+export MLX_ARENA_POISON=${MLX_ARENA_POISON:-1}
 mkdir -m 700 "$XDG_RUNTIME_DIR"
+# The compositor's settings file: the defaults unless a scenario writes one
+# (not the user's own ~/.config/mlx/compositor.conf).
+export XDG_CONFIG_HOME="$work/config"
+mkdir -p "$XDG_CONFIG_HOME/mlx"
 # GTK's document portal may have mounted itself under the runtime directory.
 trap 'fusermount -u "$XDG_RUNTIME_DIR/doc" 2> /dev/null || true; rm -rf -- "$work"' EXIT
 
@@ -80,7 +96,16 @@ pointer 360 340
 pointer 420 380
 release 272
 up 56
-wait 500
+wait 300
+leave
+wait 200
+pointer 430 390
+scroll 2560
+down 125
+up 125
+leave
+wait 300
+pointer 430 390
 type echo moved > $work/second.marker
 enter
 wait 1000
@@ -128,7 +153,8 @@ SCRIPT
 run_scenario title "$work/title.script" --terminal "$work/mlx-terminal" --run "$work/mlx-terminal"
 grep -q "^move: Mlx Terminal" "$work/title-compositor.log" || { echo "dragging the title bar did not move the window" >&2; cat "$work/title-compositor.log" >&2; exit 1; }
 # The window starts at (24, 24) and moves by (+100, +100): its frame's left
-# edge is at x = 122, its title bar spans y = 102..121.
+# edge is at x = 122, its title bar spans y = 102..121 (rounded above
+# y = 116).
 font=0
 [[ -f /usr/share/fonts/truetype/dejavu/DejaVuSans.ttf ]] && font=1
 python3 - "$work/title.ppm" "$font" <<'PY'
@@ -140,7 +166,7 @@ def rgb(x, y):
     offset = (y * width + x) * 3
     return tuple(pixels[offset:offset + 3])
 focus = (0x5a, 0xa0, 0xff)
-assert rgb(122, 300) == focus and rgb(122, 110) == focus, (rgb(122, 300), rgb(122, 110))
+assert rgb(122, 300) == focus and rgb(122, 118) == focus, (rgb(122, 300), rgb(122, 118))
 assert rgb(22, 300) != focus, "the window did not leave its original position"
 if sys.argv[2] == "1":
     # The title in white over the bar (the bar's red is 0x5a).
@@ -248,7 +274,95 @@ else
     echo "skip weston-terminal is not installed"
 fi
 
-# Scenario 5: copy and paste between two clients through the compositor's
+# Scenario 5: a subsurface (examples/wayland-client --subsurface): green,
+# 100x80, at (40, 30) in a 320x240 window whose content starts at (24, 24).
+"$compiler" --quiet examples/wayland-client/main.mlx -o "$work/hello-wayland"
+cat > "$work/subsurface.sh" <<SCRIPT
+#!/bin/sh
+exec "$work/hello-wayland" --subsurface
+SCRIPT
+chmod +x "$work/subsurface.sh"
+cat > "$work/subsurface.script" <<SCRIPT
+wait 1500
+shot $work/subsurface.ppm
+close
+SCRIPT
+run_scenario subsurface "$work/subsurface.script" --run "$work/subsurface.sh"
+python3 - "$work/subsurface.ppm" <<'PY'
+import sys
+data = open(sys.argv[1], 'rb').read()
+header, rest = data.split(b'\n', 1)
+size, rest = rest.split(b'\n', 1)
+_, pixels = rest.split(b'\n', 1)
+width, height = map(int, size.split())
+def rgb(x, y):
+    offset = (y * width + x) * 3
+    return tuple(pixels[offset:offset + 3])
+green = (0, 255, 0)
+for x, y in ((64, 54), (100, 90), (163, 133)):
+    assert rgb(x, y) == green, ("subsurface pixel", x, y, rgb(x, y))
+for x, y in ((40, 40), (170, 90), (100, 140), (60, 90)):
+    assert rgb(x, y) != green, ("window pixel", x, y, rgb(x, y))
+PY
+echo "ok   a subsurface is drawn at its offset in its window"
+
+# Scenario 8: xdg-decoration. The client asks for client-side decorations;
+# the compositor answers server side (its default), client side once the
+# settings file says client-decorations = on, server side again after off.
+cat > "$work/decoration.sh" <<SCRIPT
+#!/bin/sh
+( sleep 2; printf 'client-decorations = on\n' > "$XDG_CONFIG_HOME/mlx/compositor.conf"
+  sleep 2; printf 'client-decorations = off\n' > "$XDG_CONFIG_HOME/mlx/compositor.conf" ) &
+exec "$work/hello-wayland" --decoration client > "$work/decoration.log"
+SCRIPT
+chmod +x "$work/decoration.sh"
+printf 'wait 6000\nclose\n' > "$work/decoration.script"
+run_scenario decoration "$work/decoration.script" --run "$work/decoration.sh"
+rm -f "$XDG_CONFIG_HOME/mlx/compositor.conf"
+modes=$(uniq "$work/decoration.log" | tr '\n' ' ')
+[[ "$modes" == "decoration: server side decoration: client side decoration: server side " ]] || { echo "decoration modes: $modes" >&2; cat "$work/decoration-compositor.log" >&2; exit 1; }
+echo "ok   xdg-decoration: server side by default, client side while the settings allow it"
+
+# Scenario 9: a pointer lock (examples/wayland-client --lock, its window at
+# (24, 24)). The click gives it the pointer and the keyboard, so the lock
+# holds: the cursor stays at (100, 100) while the host's pointer travels
+# (+100, +50), which reaches the client as relative motion.
+cat > "$work/lock.sh" <<SCRIPT
+#!/bin/sh
+exec "$work/hello-wayland" --lock > "$work/lock.log"
+SCRIPT
+chmod +x "$work/lock.sh"
+cat > "$work/lock.script" <<SCRIPT
+wait 1500
+pointer 100 100
+press 272
+release 272
+wait 300
+pointer 130 110
+pointer 170 125
+pointer 200 150
+wait 300
+shot $work/lock.ppm
+close
+SCRIPT
+run_scenario lock "$work/lock.script" --run "$work/lock.sh"
+grep -q "^pointer: locked" "$work/lock.log" || { echo "the pointer was not locked" >&2; cat "$work/lock.log" "$work/lock-compositor.log" >&2; exit 1; }
+[[ "$(grep '^relative:' "$work/lock.log" | tail -1)" == "relative: 100 50" ]] || { echo "relative motion: $(grep '^relative:' "$work/lock.log" | tail -1)" >&2; cat "$work/lock-compositor.log" >&2; exit 1; }
+python3 - "$work/lock.ppm" <<'PY'
+import sys
+data = open(sys.argv[1], 'rb').read()
+_, size, _, pixels = data.split(b'\n', 3)
+width, height = map(int, size.split())
+def white(x0, y0):
+    return sum(1 for y in range(y0, y0 + 17) for x in range(x0, x0 + 17)
+               if pixels[(y * width + x) * 3:(y * width + x) * 3 + 3] == b'\xff\xff\xff')
+# The arrow (white inside) where the lock held it, not where the host's
+# pointer went.
+assert white(100, 100) > 10 and white(200, 150) == 0, (white(100, 100), white(200, 150))
+PY
+echo "ok   a pointer lock holds the cursor and relative motion reaches the client"
+
+# Scenario 6: copy and paste between two clients through the compositor's
 # wl_data_device_manager, with wl-clipboard (if available): wl-copy sets
 # the selection, wl-paste (another client) reads it through a pipe.
 if command -v wl-copy > /dev/null && command -v wl-paste > /dev/null; then
@@ -269,17 +383,19 @@ else
     echo "skip wl-clipboard is not installed"
 fi
 
-# Scenario 6: a GTK 4 application (GTK 4 needs wl_data_device_manager to
+# Scenario 7: a GTK 4 application (GTK 4 needs wl_data_device_manager to
 # use a Wayland display at all), if available.
 if command -v gtk4-widget-factory > /dev/null && command -v dbus-run-session > /dev/null; then
     cat > "$work/gtk4.sh" <<SCRIPT
 #!/bin/sh
 unset DISPLAY
 # No portals: they would mount the document portal under XDG_RUNTIME_DIR.
-GDK_DEBUG=no-portals exec dbus-run-session gtk4-widget-factory
+# No accessibility bus either: both can take seconds to start (or time out)
+# where the desktop's services are installed but not running.
+GDK_DEBUG=no-portals GTK_A11Y=none NO_AT_BRIDGE=1 exec dbus-run-session gtk4-widget-factory
 SCRIPT
     chmod +x "$work/gtk4.sh"
-    printf 'wait 6000\nclose\n' > "$work/gtk4.script"
+    printf 'wait 12000\nclose\n' > "$work/gtk4.script"
     run_scenario gtk4 "$work/gtk4.script" --run "$work/gtk4.sh"
     grep -q "^map: GTK Widget Factory" "$work/gtk4-compositor.log" || { echo "the GTK 4 window did not appear" >&2; cat "$work/gtk4-compositor.log" >&2; exit 1; }
     echo "ok   a GTK 4 application (gtk4-widget-factory) opened its window"

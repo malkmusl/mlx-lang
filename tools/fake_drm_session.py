@@ -29,7 +29,16 @@ quits with the CRTC restored and every device given back.
 weston-terminal, when installed, then types through the compositor's xkb
 keymap and modifiers.
 
-Usage: fake_drm_session.py COMPOSITOR TERMINAL [--screenshot PNG]
+With --renderer vulkan the compositor composes with Vulkan (VK_DRIVER_FILES
+should name lavapipe's manifest): it must export both dumb buffers as
+dma-bufs (PRIME_HANDLE_TO_FD, answered with the buffer's memfd) and render
+into them, so the frames read back are the GPU's. With
+MLX_VULKAN_NO_HOST_IMPORT=1 in the environment it must instead render into
+a buffer of its own and copy each frame in (the path drivers that cannot
+import the buffers take); with MLX_VULKAN_TEST_FAIL=1 its first frame is
+made to look missing from the dumb buffer, and it must switch to copying.
+
+Usage: fake_drm_session.py COMPOSITOR TERMINAL [--screenshot PNG] [--renderer cpu|vulkan]
 """
 import os
 import shutil
@@ -53,8 +62,11 @@ GETRESOURCES, GETCONNECTOR, GETENCODER = 3225445536, 3226494119, 3222561958
 GETCRTC, SETCRTC = 3228066977, 3228066978
 CREATE_DUMB, MAP_DUMB, DESTROY_DUMB = 3223348402, 3222299827, 3221513396
 ADDFB, RMFB, PAGE_FLIP = 3223086254, 3221513391, 3222824112
+PRIME_HANDLE_TO_FD = 3222037549
 SIZES = {GET_CAP: 16, GETRESOURCES: 64, GETCONNECTOR: 80, GETENCODER: 20, GETCRTC: 104, SETCRTC: 104,
-         CREATE_DUMB: 32, MAP_DUMB: 16, DESTROY_DUMB: 4, ADDFB: 28, RMFB: 4, PAGE_FLIP: 24}
+         CREATE_DUMB: 32, MAP_DUMB: 16, DESTROY_DUMB: 4, ADDFB: 28, RMFB: 4, PAGE_FLIP: 24,
+         PRIME_HANDLE_TO_FD: 12}
+DRM_CLOEXEC, DRM_RDWR = 0x80000000, 2
 EACCES, ENOTTY, EINVAL = 13, 25, 22
 DRM_MAJOR, INPUT_MAJOR = 226, 13
 
@@ -197,8 +209,14 @@ class Memory:
 
 
 class FakeCard(DeviceServer):
-    def __init__(self, harness):
+    # `modes` and `connector_type`: the connected connector's modes and kind
+    # (14: eDP, 1: VGA). The second card plays a server's BMC graphics: a
+    # small VGA "monitor" the compositor must pass over for the real one.
+    def __init__(self, harness, modes=None, connector_type=14, name="card0"):
         super().__init__(harness)
+        self.modes = MODES if modes is None else modes
+        self.connector_type = connector_type
+        self.name = name
         self.master = True
         self.buffers = {}          # handle -> [memfd, size, pitch]
         self.framebuffers = {}     # fb -> handle
@@ -243,14 +261,14 @@ class FakeCard(DeviceServer):
             if connector not in CONNECTORS:
                 return -EINVAL, argument, None
             connected = connector == 42
-            modes = MODES if connected else []
+            modes = self.modes if connected else []
             encoders = [52] if connected else [51]
             if modes_ptr and count_modes >= len(modes) and modes:
                 memory.write(modes_ptr, b"".join(modes))
             if encoders_ptr and count_encoders >= len(encoders):
                 memory.write(encoders_ptr, struct.pack(f"<{len(encoders)}I", *encoders))
             struct.pack_into("<IIIIIIIIII", argument, 32, len(modes), 0, len(encoders), 0, connector,
-                             14 if connected else 11, 1, 1 if connected else 2, 300, 200)
+                             self.connector_type if connected else 11, 1, 1 if connected else 2, 300, 200)
             record("drm", "getconnector", connector)
             return 0, argument, None
         if request == GETENCODER:
@@ -309,6 +327,17 @@ class FakeCard(DeviceServer):
             if handle not in self.buffers:
                 return -EINVAL, argument, None
             struct.pack_into("<Q", argument, 8, 0)
+            return 0, argument, os.dup(self.buffers[handle][0])
+        if request == PRIME_HANDLE_TO_FD:
+            # The dumb buffer as a dma-buf: its memfd (lavapipe imports a
+            # memfd as one). The descriptor number is the receiver's.
+            handle, flags = struct.unpack_from("<II", argument)
+            if handle not in self.buffers:
+                return -EINVAL, argument, None
+            if flags & ~(DRM_CLOEXEC | DRM_RDWR):
+                fail(f"PRIME_HANDLE_TO_FD with flags {flags:#x}")
+            struct.pack_into("<i", argument, 8, 0)
+            record("drm", "prime_handle_to_fd", handle)
             return 0, argument, os.dup(self.buffers[handle][0])
         if request == PAGE_FLIP:
             crtc, fb, flags, _, user_data = struct.unpack_from("<IIIIQ", argument)
@@ -455,9 +484,10 @@ SEAT_PATH = "/org/freedesktop/login1/seat/seat0"
 
 
 class Harness:
-    def __init__(self, compositor, terminal):
+    def __init__(self, compositor, terminal, renderer="cpu"):
         self.compositor_path = compositor
         self.terminal_path = terminal
+        self.renderer = renderer
         self.recorder = Recorder()
         self.work = tempfile.mkdtemp(prefix="mlxdrm")
         self.memory = None
@@ -473,11 +503,15 @@ class Harness:
         os.makedirs(os.path.join(self.work, "dri"))
         os.makedirs(os.path.join(self.work, "input"))
         os.mknod(os.path.join(self.work, "dri", "card0"), 0o660 | 0o020000, os.makedev(DRM_MAJOR, 0))
+        # A second card with a small VGA monitor (a BMC's), to be passed over.
+        os.mknod(os.path.join(self.work, "dri", "card1"), 0o660 | 0o020000, os.makedev(DRM_MAJOR, 1))
         for number, (kind, name) in enumerate((("keyboard", "Fake Keyboard"), ("mouse", "Fake Mouse"),
                                                ("touchpad", "Fake Touchpad"))):
             self.add_input(number, kind, name, create_node=True)
         self.devices[(DRM_MAJOR, 0)] = FakeCard(self)
         self.devices[(DRM_MAJOR, 0)].start()
+        self.devices[(DRM_MAJOR, 1)] = FakeCard(self, modes=[mode(800, 600, 60, True)], connector_type=1, name="card1")
+        self.devices[(DRM_MAJOR, 1)].start()
 
     def add_input(self, number, kind, name, create_node):
         device = FakeInput(self, kind, name)
@@ -580,9 +614,18 @@ class Harness:
             "XDG_RUNTIME_DIR": self.work, "XDG_SESSION_ID": "31", "XKB_DEFAULT_LAYOUT": "us",
             "DBUS_SYSTEM_BUS_ADDRESS": self.address,
             "MLX_DRM_DIR": os.path.join(self.work, "dri"), "MLX_INPUT_DIR": os.path.join(self.work, "input"),
+            "MLX_COMPOSITOR_LOG": "-",
+            # Values a turn of the compositor's loop released are overwritten,
+            # so one wrongly kept across turns shows (arena.mlx).
+            "MLX_ARENA_POISON": os.environ.get("MLX_ARENA_POISON", "1"),
         }
+        # The Vulkan driver (lavapipe) the caller chose.
+        for name in ("VK_DRIVER_FILES", "VK_ICD_FILENAMES", "VK_ADD_DRIVER_FILES", "MLX_VULKAN_NO_HOST_IMPORT", "MLX_VULKAN_TEST_FAIL", "MLX_ARENA_RELEASE", "MLX_COMPOSITOR_MODULES"):
+            if name in os.environ:
+                environment[name] = os.environ[name]
         self.log = open(self.log_path, "w")
         self.process = subprocess.Popen([self.compositor_path, "--verbose", "--socket", "wayland-drm",
+                                         "--renderer", self.renderer,
                                          "--terminal", self.terminal_path, "--run", self.terminal_path],
                                         cwd=self.work, env=environment, stdout=self.log, stderr=subprocess.STDOUT)
         # The kernel side reads its memory from the start.
@@ -657,13 +700,20 @@ def write_png(card, path):
 def main():
     arguments = sys.argv[1:]
     screenshot = None
-    if len(arguments) == 4 and arguments[2] == "--screenshot":
-        screenshot = os.path.abspath(arguments[3])
-        arguments = arguments[:2]
+    renderer = "cpu"
+    while len(arguments) > 2:
+        if len(arguments) >= 4 and arguments[-2] == "--screenshot":
+            screenshot = os.path.abspath(arguments[-1])
+        elif len(arguments) >= 4 and arguments[-2] == "--renderer" and arguments[-1] in ("cpu", "vulkan"):
+            renderer = arguments[-1]
+        else:
+            print(__doc__)
+            return 2
+        arguments = arguments[:-2]
     if len(arguments) != 2:
         print(__doc__)
         return 2
-    harness = Harness(os.path.abspath(arguments[0]), os.path.abspath(arguments[1]))
+    harness = Harness(os.path.abspath(arguments[0]), os.path.abspath(arguments[1]), renderer)
     recorder = harness.recorder
     harness.make_nodes()
     harness.start_bus()
@@ -677,15 +727,48 @@ def main():
         for key in ((DRM_MAJOR, 0), (INPUT_MAJOR, 64), (INPUT_MAJOR, 65), (INPUT_MAJOR, 66)):
             recorder.wait(lambda c, key=key: c[:2] == ("logind", "TakeDevice") and tuple(c[2:]) == key, 5,
                           f"TakeDevice{key}")
-        harness.wait_log("drm: ", 5, "output line")
+        harness.wait_log("drm: driving", 5, "the card chosen")
+        log = harness.log_text()
+        if "/card1: VGA-1 800x600 at 60 Hz" not in log or "/card0: eDP-1 1000x700 at 60 Hz" not in log:
+            fail(f"both cards should be looked at and logged:\n{log}")
+        if "drm: driving " not in log or "/card0: eDP-1 1000x700" not in log.split("drm: driving ", 1)[1]:
+            fail(f"the card with the larger monitor (card0) should be driven, not the BMC's:\n{log}")
         if "input: " not in harness.log_text() or "keyboard: xkb keymap from libxkbcommon" not in harness.log_text():
             fail(f"inputs or keymap missing:\n{harness.log_text()}")
         card = harness.devices[(DRM_MAJOR, 0)]
         if card.pixel(0, HEIGHT - 1) != background(HEIGHT - 1):
             fail(f"background {card.pixel(0, HEIGHT - 1):#x}, expected {background(HEIGHT - 1):#x}")
-        print(f"ok   logind session and devices; modeset CRTC 32 -> connector 42 at its preferred {WIDTH}x{HEIGHT}")
+        print(f"ok   logind session and devices; the card with the monitor chosen over the BMC's VGA; modeset CRTC 32 -> connector 42 at its preferred {WIDTH}x{HEIGHT}")
+        if renderer == "vulkan":
+            harness.wait_log("renderer: vulkan", 5, "the Vulkan renderer")
+            exported = sorted(c[2] for c in recorder.calls if c[:2] == ("drm", "prime_handle_to_fd"))
+            copying = "copying each frame" in harness.log_text()
+            if os.environ.get("MLX_VULKAN_NO_HOST_IMPORT"):
+                # The copy path, as on a driver that cannot import the
+                # buffers: rendered elsewhere and copied in, row by row.
+                if exported or not copying:
+                    fail(f"expected frames copied into the dumb buffers (exported {exported}, copying {copying})")
+                print("ok   Vulkan renders into its own buffer and copies frames into the dumb buffers")
+            elif os.environ.get("MLX_VULKAN_TEST_FAIL") == "1":
+                # The buffers were imported, but the first frame (made to)
+                # never showed up in them: the renderer must switch to
+                # copying, and the frames checked below are the copies.
+                harness.wait_log("did not reach the dumb buffer", 5, "the switch to copying")
+                if exported != [1, 2]:
+                    fail(f"expected both dumb buffers exported first (exported {exported})")
+                print("ok   a frame missing from the dumb buffer makes Vulkan copy frames in from then on")
+            else:
+                # The GPU renders into the dumb buffers themselves: both
+                # were exported as dma-bufs before the first frame.
+                if exported != [1, 2] or copying:
+                    fail(f"expected both dumb buffers exported as dma-bufs (exported {exported}, copying {copying})")
+                print("ok   Vulkan renders into the dumb buffers (both exported as dma-bufs)")
 
         # The terminal maps; the keyboard types into it.
+        if os.environ.get("MLX_COMPOSITOR_MODULES"):
+            # Run with the shell and renderer as shared objects.
+            harness.wait_log("libmlx-shell.so (version 1", 5, "the shell module loaded")
+            harness.wait_log("libmlx-render.so (version 1)", 5, "the render module loaded")
         harness.wait_log("map: Mlx Terminal", 10, "the terminal")
         time.sleep(0.3)
         keyboard = harness.devices[(INPUT_MAJOR, 64)]

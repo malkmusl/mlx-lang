@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Builds the Mlx compositor and terminal and installs them as a desktop
-# session that GDM and SDDM offer at login ("Mlx Compositor").
+# Builds the Mlx compositor, terminal, dock and launcher and installs them
+# as a desktop session that GDM and SDDM offer at login ("Mlx Compositor").
 #
 # The session (examples/wayland-compositor/session/mlx-session) runs the
 # compositor freestanding: it drives the monitor (DRM/KMS) at its preferred
@@ -10,8 +10,13 @@
 # environment runs it nested in one of those hosts instead.
 #
 # Installs:
-#   PREFIX/bin/mlx-compositor, PREFIX/bin/mlx-terminal, PREFIX/bin/mlx-session
+#   PREFIX/bin/mlx-compositor, PREFIX/bin/mlx-terminal, PREFIX/bin/mlx-session,
+#   PREFIX/bin/mlx-dock, PREFIX/bin/mlx-launcher, PREFIX/bin/mlx-settings
+#   PREFIX/share/applications/mlx-settings.desktop  (the launcher lists it)
 #   SESSIONS/mlx-compositor.desktop   (read by GDM and SDDM)
+#   ~/.local/lib/mlx-compositor/libmlx-shell.so, libmlx-render.so (for the
+#   user running this; the session loads them, and loads them again when
+#   tools/build_compositor_modules.sh rebuilds them)
 #
 # Usage: tools/install_compositor_session.sh [options]
 #   --prefix DIR      programs go to DIR/bin (default /usr/local)
@@ -50,7 +55,8 @@ while [[ $# -gt 0 ]]; do
 done
 
 bindir="$prefix/bin"
-programs=(mlx-compositor mlx-terminal mlx-session)
+programs=(mlx-compositor mlx-terminal mlx-session mlx-dock mlx-launcher mlx-settings)
+applications="$prefix/share/applications"
 
 # Runs a command with sudo when the target is not writable by us.
 as_owner() {
@@ -72,24 +78,14 @@ if [[ $uninstall -eq 1 ]]; then
     done
     path="$destdir$sessions/mlx-compositor.desktop"
     [[ -e "$path" ]] && as_owner "$path" rm -f -- "$path" && echo "removed $path"
+    path="$destdir$applications/mlx-settings.desktop"
+    [[ -e "$path" ]] && as_owner "$path" rm -f -- "$path" && echo "removed $path"
     exit 0
 fi
 
-# The compiler.
-if [[ -z "$compiler" ]]; then
-    if [[ -x mlx-out/bin/compiler/mlx4 ]]; then
-        compiler=mlx-out/bin/compiler/mlx4
-    elif [[ -x zig-out/bin/mlx1 ]]; then
-        compiler=zig-out/bin/mlx1
-    elif command -v zig > /dev/null; then
-        echo "building the Mlx compiler (zig build mlx1)"
-        zig build mlx1
-        compiler=zig-out/bin/mlx1
-    else
-        echo "install_compositor_session.sh: no Mlx compiler; build one (zig build mlx1) or pass --compiler" >&2
-        exit 1
-    fi
-fi
+# The compiler: the canonical one (tools/ensure_compiler.sh builds or
+# updates mlx-out/bin/compiler/mlx4 when needed).
+[[ -n "$compiler" ]] || compiler=$(tools/ensure_compiler.sh)
 
 # Build.
 build=mlx-out/session
@@ -97,23 +93,38 @@ mkdir -p "$build"
 echo "building with $compiler"
 "$compiler" --quiet examples/wayland-compositor/main.mlx -o "$build/mlx-compositor"
 "$compiler" --quiet examples/wayland-terminal/main.mlx -o "$build/mlx-terminal"
+"$compiler" --quiet examples/mlx-dock/main.mlx -o "$build/mlx-dock"
+"$compiler" --quiet examples/mlx-launcher/main.mlx -o "$build/mlx-launcher"
+"$compiler" --quiet examples/mlx-settings/main.mlx -o "$build/mlx-settings"
+sed "s|@BINDIR@|$bindir|g" examples/mlx-settings/mlx-settings.desktop.in > "$build/mlx-settings.desktop"
 sed "s|@BINDIR@|$bindir|g" examples/wayland-compositor/session/mlx-compositor.desktop.in > "$build/mlx-compositor.desktop"
-echo "built $build/mlx-compositor and $build/mlx-terminal"
+echo "built $build/mlx-compositor, mlx-terminal, mlx-dock, mlx-launcher and mlx-settings"
 [[ $build_only -eq 1 ]] && exit 0
 
 # Install.
 as_owner "$destdir$bindir" install -d "$destdir$bindir"
-as_owner "$destdir$bindir" install -m 755 "$build/mlx-compositor" "$build/mlx-terminal" examples/wayland-compositor/session/mlx-session "$destdir$bindir/"
+as_owner "$destdir$bindir" install -m 755 "$build/mlx-compositor" "$build/mlx-terminal" "$build/mlx-dock" "$build/mlx-launcher" "$build/mlx-settings" examples/wayland-compositor/session/mlx-session "$destdir$bindir/"
 as_owner "$destdir$sessions" install -d "$destdir$sessions"
 as_owner "$destdir$sessions" install -m 644 "$build/mlx-compositor.desktop" "$destdir$sessions/"
+as_owner "$destdir$applications" install -d "$destdir$applications"
+as_owner "$destdir$applications" install -m 644 "$build/mlx-settings.desktop" "$destdir$applications/"
 for program in "${programs[@]}"; do echo "installed $destdir$bindir/$program"; done
 echo "installed $destdir$sessions/mlx-compositor.desktop"
+# The shell and renderer modules, for the user running this (not when
+# staging a package).
+if [[ -z "$destdir" ]]; then
+    tools/build_compositor_modules.sh --compiler "$compiler"
+fi
 
 if [[ -z "$destdir" ]]; then
     echo
     echo "Log out and pick \"Mlx Compositor\": in GDM with the gear button after"
-    echo "choosing your user, in SDDM in the session menu. Alt+Enter opens a"
-    echo "terminal, Ctrl+Alt+F1..F12 switch VTs, Alt+Shift+Q ends the session."
+    echo "choosing your user, in SDDM in the session menu. Super opens the app"
+    echo "launcher, the dock is at the bottom, Alt+Enter opens a terminal,"
+    echo "Ctrl+Alt+F1..F12 switch VTs, Alt+Shift+Q ends the session. Pin apps"
+    echo "in ~/.config/mlx/dock (one desktop entry id per line)."
     echo "Its log is"
-    echo "${XDG_STATE_HOME:-$HOME/.local/state}/mlx-compositor/session.log."
+    echo "${XDG_CONFIG_HOME:-$HOME/.config}/mlx/compositor.log."
+    echo "tools/build_compositor_modules.sh [--watch] rebuilds the shell and the"
+    echo "renderer; a running session loads them within a second."
 fi

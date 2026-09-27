@@ -23,7 +23,7 @@ compiler_args=()
 tools/install_compositor_session.sh --destdir "$work/root" "${compiler_args[@]}" > "$work/install.log"
 bindir="$work/root/usr/local/bin"
 entry="$work/root/usr/share/wayland-sessions/mlx-compositor.desktop"
-for program in mlx-compositor mlx-terminal mlx-session; do
+for program in mlx-compositor mlx-terminal mlx-session mlx-dock mlx-launcher mlx-settings; do
     [[ -x "$bindir/$program" ]] || { echo "not installed: $program" >&2; cat "$work/install.log" >&2; exit 1; }
 done
 grep -qx "Exec=/usr/local/bin/mlx-session" "$entry" || { echo "session entry without the launcher:" >&2; cat "$entry" >&2; exit 1; }
@@ -40,7 +40,7 @@ run_session() {
         XKB_DEFAULT_LAYOUT=de MLX_SESSION_HOST="$host" MLX_SESSION_BACKEND=headless \
         MLX_COMPOSITOR_ARGS="--timeout 2" \
         timeout 30 "$bindir/mlx-session" || true
-    cat "$home/.local/state/mlx-compositor/session.log"
+    cat "$home/.config/mlx/compositor.log"
 }
 
 checked=0
@@ -48,7 +48,8 @@ if command -v cage > /dev/null; then
     log=$(run_session cage)
     grep -q "^output: 1280x720 (monitor 1280x720)" <<< "$log" || { echo "cage: the compositor did not take the monitor's resolution" >&2; echo "$log" >&2; exit 1; }
     grep -q "^mlx-session: keyboard de" <<< "$log" || { echo "cage: keyboard layout not passed on" >&2; exit 1; }
-    echo "ok   cage session: fullscreen at the monitor's 1280x720, keyboard de"
+    grep -q "^launch: .*/mlx-dock$" <<< "$log" || { echo "cage: the session did not start the dock" >&2; echo "$log" >&2; exit 1; }
+    echo "ok   cage session: fullscreen at the monitor's 1280x720, keyboard de, the dock started"
     checked=$((checked + 1))
 else
     echo "skip cage is not installed"
@@ -59,7 +60,8 @@ if command -v weston > /dev/null; then
     size=$(sed -n 's/^output: \([0-9]*x[0-9]*\) (monitor \([0-9]*x[0-9]*\).*/\1 \2/p' <<< "$log")
     [[ "${size% *}" == "${size#* }" ]] || { echo "weston: output ${size% *} is not the monitor's ${size#* }" >&2; exit 1; }
     grep -q "^mlx-session: keyboard de" <<< "$log" || { echo "weston: keyboard layout not passed on" >&2; exit 1; }
-    echo "ok   weston session (kiosk shell): fullscreen at the monitor's ${size#* }, keyboard de"
+    grep -q "^launch: .*/mlx-dock$" <<< "$log" || { echo "weston: the session did not start the dock" >&2; echo "$log" >&2; exit 1; }
+    echo "ok   weston session (kiosk shell): fullscreen at the monitor's ${size#* }, keyboard de, the dock started"
     checked=$((checked + 1))
 else
     echo "skip weston is not installed"

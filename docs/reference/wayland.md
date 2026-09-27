@@ -160,6 +160,9 @@ upstream, the provenance record, and the bootstrap tool:
 | `wayland.xml` | core protocol, wayland 1.26.0 |
 | `xdg-shell.xml` | stable xdg-shell, wayland-protocols 1.49 |
 | `linux-dmabuf-v1.xml` | stable linux-dmabuf (`zwp_linux_dmabuf_v1`, version 6), wayland-protocols 1.49 |
+| `ext-background-effect-v1.xml` | staging background effects (`ext_background_effect_manager_v1`), wayland-protocols 1.49 |
+| `wlr-layer-shell-unstable-v1.xml`, `wlr-foreign-toplevel-management-unstable-v1.xml` | wlr-protocols bf4fc79a |
+| `xdg-decoration-unstable-v1.xml` | unstable xdg-decoration (`zxdg_decoration_manager_v1`, version 2), wayland-protocols 1.49 |
 | `SOURCES` | upstream URL, release and SHA-256 of each XML file |
 | `materialize.mlx` | Stage-1 tool: XML to `std/src/wayland/generated/` |
 | `materialize.sh` | verifies the hashes, builds the tool, runs it |
@@ -439,6 +442,57 @@ pub fn main() -> !void {
 are the complete programs, with shared memory, xdg-shell configuration and
 frame callbacks.
 
+### Replacing handlers
+
+`Display.replaceHandler(old, new)` makes every handler at address `old` —
+a resource's request or destroy handler, a global's bind handler, the
+client-created or client-destroyed handler — the function at `new` (of the
+same type), keeping each one's context, and returns how many it replaced.
+It is for code loaded again while the server runs: the compositor's shell
+is a shared object that registers the handlers, and after a new build is
+loaded every resource carries on in the new code
+(`examples/wayland-compositor/modules.mlx`).
+`tests/244_wayland_client_server_runtime.mlx` replaces the compositor
+global's bind handler before its clients bind and checks the replacement
+ran for both.
+
+### Why a client was disconnected
+
+A server disconnects a client for a protocol error (one the runtime posts
+for a request it cannot dispatch, or one a handler posts with
+`postError`), a malformed message, events it stopped reading (its output
+buffer is full), a file descriptor that could not be duplicated for it,
+memory that ran out, or because the server asked (`Client.disconnect`);
+a client that leaves on its own is the plain case. The client-destroyed
+handler can tell them apart with `Client.failure()` (`server.FAIL_*`) and,
+for a protocol error, `failureCode()`, `failureText()` and the failing
+request's `failureObject()`, `failureInterface()` and `failureOpcode()`.
+`tests/245_wayland_server_errors_runtime.mlx` checks the reasons its four
+misbehaving clients are given; the compositor logs them (`client
+disconnected: it broke the protocol, invalid method (error 1 on request 9
+of wl_surface 12)`).
+
+### Message storage
+
+The compiler keeps every value that is not a field of something else in an
+arena that is only ever bumped (nothing is released when a function
+returns), so a message-sized local per message would grow a process by
+4 KiB for every event or request it sends or handles. Both runtimes
+therefore keep that storage with the connection: a generated send method
+builds its message in `server.messageWriter(object)` or
+`client.messageWriter(object)`, the one `wire.Writer` of the client's
+connection (a send never nests another; the message is copied into the
+output buffer by `endEvent`/`endRequest`), and `dispatch` copies the
+message being handled into the slot for its nesting level of dispatch
+(`DISPATCH_DEPTH` slots per connection; a handler that dispatches again,
+as `roundtrip` does, uses the next slot, so the arguments of the message
+it is handling stay where they were; deeper nesting falls back to a fresh
+copy). `tests/269_wayland_message_storage_runtime.mlx` sends 20000 events
+one way and 20000 requests the other and requires that neither side grew
+the arena by more than 1 KiB per message (a handled event costs its decoded
+payload, some 200 bytes; a sent request nothing), and that a format handler
+that runs a roundtrip reads its own arguments intact afterwards.
+
 ## Larger examples: a nested compositor and a terminal
 
 Two programs use both halves of `std.wayland` with real input:
@@ -456,9 +510,17 @@ Two programs use both halves of `std.wayland` with real input:
   opposite edges kept), places `xdg_popup` windows with
   `xdg_positioner`, and launches programs such as a terminal on Alt+Enter.
   Its `wl_data_device_manager` carries the clipboard between clients (GTK 4
-  applications such as Nautilus need it to use the display). With
+  applications such as Nautilus need it to use the display), and its
+  `wl_subcompositor` gives them subsurfaces (Firefox needs them): drawn with
+  their window at their offset, stacked as placed, nested, with
+  synchronized commits kept until the parent's state is applied, and
+  pointer coordinates of their own. `wl_region` objects serve as input
+  regions: a surface with one takes the pointer only inside it, so
+  Firefox's content subsurface (an empty region) leaves the pointer to its
+  window and GTK 4 windows take nothing on their shadows
+  (`tests/270_compositor_input_region_runtime.mlx`). With
   `--fullscreen` it takes the host monitor's resolution, which is how
-  `tools/install_compositor_session.sh` installs it as a GDM/SDDM session
+  `install_compositor.sh` installs it as a GDM/SDDM session
   (inside cage or weston's kiosk shell). It waits on
   both connections with `wl.transport.waitAny`.
 - [`examples/wayland-terminal`](../../examples/wayland-terminal/README.md)
@@ -474,14 +536,77 @@ with Alt+right-drag must give exact window sizes and positions, and its
 shell must learn each size. weston-terminal, when installed, must
 accept Shift through the forwarded keymap and move by its title bar;
 wl-clipboard, when installed, must paste in one client what another copied;
-gtk4-widget-factory, when installed, must open its window.
-`tools/check_compositor_drm.sh` runs the freestanding compositor against
-an emulated kernel (DRM card, evdev devices) and an emulated logind on a
-private dbus-daemon, with real clients: modeset at the preferred mode,
-typing, mouse, touchpad, hotplug, a VT switch and the console restored on
-exit.
+gtk4-widget-factory, when installed, must open its window;
+`examples/wayland-client --subsurface` must show its green subsurface at
+its offset in the window, and nothing else of the window may be green.
+`tools/check_compositor_drm.sh [cpu|vulkan]` runs the freestanding
+compositor against an emulated kernel (DRM card, evdev devices) and an
+emulated logind on a private dbus-daemon, with real clients: modeset at the
+preferred mode, typing, mouse, touchpad, hotplug, a VT switch and the
+console restored on exit; with `vulkan`, composing on lavapipe into the
+emulated dumb buffers (exported as dma-bufs), then copying frames into
+them.
 `tools/check_wayland_interop.sh` also runs the nested compositor inside
-weston.
+weston. `tests/268_compositor_damage_runtime.mlx` (run by
+`tests/run_wayland.sh`) plays random changes to a scene (windows moved,
+raised, resized and redrawn, focus, the cursor, a popup) against the
+compositor's damage tracking: frames composed only in what each output
+buffer lacks must equal frames composed from scratch.
+
+The shell and the renderer can run as shared objects that the compositor
+loads again whenever they are rebuilt, while its clients stay connected
+(`examples/wayland-compositor/modules.mlx`, built with `mlx4 --shared`):
+every handler the shell registered is moved to the new build with
+`Display.replaceHandler`. `tools/check_compositor_modules.sh` replaces both
+while a terminal is open and checks that the terminal keeps working and
+the changes show.
+
+The compositor runs for days within the compiler's value arena (see
+[Message storage](#message-storage)): its event loop is a fixed point, so
+`examples/wayland-compositor/arena.mlx` notes the arena's fill before the
+loop's first turn and restores it at the start of every turn, releasing
+what the turn's handlers and frame allocated (everything that outlives a
+turn is memory from the allocator or was allocated before the loop). The
+check scripts run it with `MLX_ARENA_POISON=1`, which overwrites the
+released bytes so a value wrongly kept across turns shows up;
+`MLX_ARENA_RELEASE=0` turns the release off.
+
+### A dock and a launcher
+
+The desktop parts beyond windows are Wayland clients of the compositor as
+well: [`examples/mlx-dock`](../../examples/mlx-dock/main.mlx) along the
+bottom edge and [`examples/mlx-launcher`](../../examples/mlx-launcher/main.mlx),
+which Super opens in the middle of the screen (see the compositor's
+[README](../../examples/wayland-compositor/README.md#dock-and-launcher)).
+The compositor offers them three more protocols, materialized like the
+others from `std/protocols/wayland` (`wlr-layer-shell-unstable-v1.xml`,
+`wlr-foreign-toplevel-management-unstable-v1.xml` and
+`ext-background-effect-v1.xml`):
+
+- `zwlr_layer_shell_v1`: surfaces in the background, bottom, top and
+  overlay layers around the windows, anchored to edges or centred, with
+  margins, exclusive zones that windows keep out of, and keyboard
+  interactivity (the launcher takes the keyboard exclusively until it
+  closes).
+- `zwlr_foreign_toplevel_manager_v1`: the windows with their titles, app
+  ids and activation, for the dock, which activates them.
+- `ext_background_effect_manager_v1`: a blur region per surface. The
+  compositor blurs what lies behind it (three box blurs) before drawing the
+  surface over it, on the CPU (`scene.mlx`) or in two Vulkan compute
+  kernels (`examples/vulkan-shared/shaders.mlx`) that give the same
+  pixels; the damage around a blurred surface grows by the blur's reach.
+
+Their shared code is in `examples/desktop-shared`: a layer surface with
+its buffers, pointer and keyboard (key repeat, the keymap through
+libxkbcommon) and the window list (`panel.mlx`), drawing with smooth
+rounded shapes, images and `std.truetype` text (`canvas.mlx`), and the
+apps from their desktop entries with PNG icons through `std.png`
+(`apps.mlx`). `tools/check_desktop_clients.sh` runs both in the nested
+compositor under `tools/wayland-test-host` on the CPU and the Vulkan
+renderer: the surfaces' places and layers, Super, typing into the
+launcher, apps started from the launcher and the dock, windows switched
+from the dock, a window blurred behind the launcher, and the same pixels
+from both renderers.
 
 ### GPU buffers: linux-dmabuf and Vulkan
 
@@ -497,9 +622,17 @@ with `sendCreated()` (which creates the `wl_buffer` resource) or
 - [`examples/vulkan-wayland-client`](../../examples/vulkan-wayland-client/README.md)
   renders with Vulkan (`std.vulkan`, no C loader) and hands frames over as
   dma-bufs, or renders straight into its `wl_shm` pool.
-- The nested compositor offers linux-dmabuf (ARGB8888/XRGB8888, linear) and,
+- The compositor offers linux-dmabuf version 4 (ARGB8888/XRGB8888,
+  linear or in the driver's own layout, with feedback naming its GPU so
+  Mesa's EGL renders on it rather than on llvmpipe; see the compositor's
+  README) and,
   with `--renderer vulkan`, composes on the GPU, reading client pools and
-  dma-bufs in place.
+  dma-bufs in place and rendering into the output in place: nested, the
+  host window's `wl_shm` buffer; freestanding, the DRM dumb buffer the
+  monitor scans out, exported as a dma-buf. `--renderer auto` (the
+  default) takes Vulkan when a driver works and the CPU otherwise, and the
+  freestanding compositor checks that the GPU's first frame reached the
+  dumb buffer before trusting the import.
 
 `tools/check_vulkan_wayland.sh` runs the client inside the compositor with
 both renderers, over `wl_shm` and linux-dmabuf, and compares the frames

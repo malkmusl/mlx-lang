@@ -1,16 +1,35 @@
-// linux-dmabuf (zwp_linux_dmabuf_v1, version 3): clients hand over buffers
+// linux-dmabuf (zwp_linux_dmabuf_v1, version 4): clients hand over buffers
 // as dma-buf file descriptors, typically rendered by a GPU, instead of
 // shared memory.
 //
-// Offered: ARGB8888 and XRGB8888 with the LINEAR modifier, one plane. Each
-// dma-buf is mapped read-only and becomes a one-buffer pool, so the CPU
-// renderer reads it like a wl_shm pool; the Vulkan renderer imports the
-// dma-buf itself (VK_EXT_external_memory_dma_buf).
+// Offered: ARGB8888 and XRGB8888, one plane, with the LINEAR modifier and,
+// when the renderer can read them (Compositor.readsTiled: Vulkan on a
+// GPU), in the layout the client's driver picks by itself (the implicit
+// modifier, DRM_FORMAT_MOD_INVALID). A linear dma-buf is mapped read-only
+// and becomes a one-buffer pool, so the CPU renderer reads it like a
+// wl_shm pool; the Vulkan renderer imports it as a buffer. An implicit
+// one is usually tiled and in video memory the CPU may not map: it is not
+// mapped, and the Vulkan renderer imports it as an image (Pool.tiled).
+//
+// Version 4 adds feedback: the GPU to render on (main device) and the
+// formats as a table. Mesa's EGL looks for its GPU there; without it (and
+// without the old wl_drm) OpenGL programs such as Minecraft fall back to
+// llvmpipe, rendering on the CPU. The device is the card the compositor
+// drives, or nested the first render node (/dev/dri/renderD128 on). The
+// feedback has two tranches: LINEAR first (GFX9 and newer AMD, Intel),
+// then the implicit layout for scanout (radeonsi before GFX9, Polaris such
+// as the RX 580, supports no explicit modifier, not even LINEAR; Mesa
+// then allocates from the second tranche; scanout keeps DCC compression
+// off). Offered only LINEAR, such a GPU cannot allocate a buffer at all
+// and Mesa 26 crashes (a NULL image in dri2_query_image), so a renderer
+// that cannot read tiled buffers names no device: clients render in
+// software as with version 3.
 
 const std = @import("std")
 const wl = @import("std.wayland")
 const state = @import("./state.mlx")
 const shell = @import("./shell.mlx")
+const device = @import("./device.mlx")
 
 const Compositor = state.Compositor
 
@@ -20,7 +39,7 @@ const DRM_FORMAT_XRGB8888: u32 = 875713112
 const MODIFIER_INVALID_HI: u32 = 16777215
 const MODIFIER_INVALID_LO: u32 = 4294967295
 
-const Params = struct {
+pub const Params = struct {
     compositor: *Compositor
     fd: wl.Handle
     hasPlane: bool
@@ -71,20 +90,48 @@ fn prepare(params: *Params, resource: wl.zwp_linux_buffer_params_v1.Resource, wi
         fail(resource, wl.zwp_linux_buffer_params_v1.Error.out_of_bounds, "plane does not fit the buffer")
         return CREATE_ERROR
     }
-    // Flags (y-inverted, interlaced) and tiled layouts are not supported:
-    // such buffers fail, as the protocol allows.
+    // Flags (y-inverted, interlaced) and explicit tiled modifiers are not
+    // supported: such buffers fail, as the protocol allows.
     const linear = params.*.modifierHi == 0 && params.*.modifierLo == 0
     const implicit = params.*.modifierHi == MODIFIER_INVALID_HI && params.*.modifierLo == MODIFIER_INVALID_LO
-    if flags != 0 || (!linear && !implicit) { return CREATE_FAILED }
+    if flags != 0 || (!linear && !implicit) {
+        refused(compositor, "flags or a modifier that are not offered")
+        return CREATE_FAILED
+    }
+    // In the driver's own layout: read by the Vulkan renderer as an image
+    // (from offset 0), never mapped.
+    const tiled = implicit && compositor.*.readsTiled
+    if tiled && offset != 0 {
+        refused(compositor, "an implicit layout at an offset")
+        return CREATE_FAILED
+    }
     var memory: wl.SharedMemory = undefined
     const handle = params.*.fd
     params.*.hasPlane = false
-    if !wl.transport.mapSharedMemory(&memory, handle, offset + stride * @intCast(usize, height), false) {
-        handle.close()
-        return CREATE_FAILED
+    const size = offset + stride * @intCast(usize, height)
+    if tiled || !wl.transport.mapSharedMemory(&memory, handle, size, false) {
+        if !compositor.*.readsTiled {
+            handle.close()
+            refused(compositor, "memory the CPU cannot map")
+            return CREATE_FAILED
+        }
+        // The Vulkan renderer imports the memory without a mapping.
+        memory.handle = handle
+        memory.address = 0
+        memory.size = size
     }
-    result.* = @intFromPtr(shell.newPool(compositor, memory, true))
+    const pool = shell.newPool(compositor, memory, true)
+    pool.*.tiled = tiled
+    pool.*.width = width
+    pool.*.height = height
+    result.* = @intFromPtr(pool)
     return CREATE_OK
+}
+
+fn refused(compositor: *Compositor, why: []const u8) -> void {
+    state.say("dmabuf: a client buffer is refused: ")
+    state.say(why)
+    state.say("\n")
 }
 
 // The pool's own reference passes to its only buffer.
@@ -146,9 +193,121 @@ fn onParamsDestroyed(context: *anyopaque, object: wl.server.Object) -> void {
     unsafe { state.release(params.*.compositor, @ptrCast([*]u8, params), @sizeOf(Params)) }
 }
 
+// ---------------------------------------------------------------------------
+// Feedback (version 4)
+
+// Four table entries of 16 bytes (format u32, padding, modifier u64):
+// ARGB8888 and XRGB8888 LINEAR, then both with the implicit modifier.
+const FORMAT_TABLE_SIZE: usize = 64
+// zwp_linux_dmabuf_feedback_v1.tranche_flags: scanout.
+const TRANCHE_SCANOUT: u32 = 1
+
+// "/dev/dri/renderD<number>" into `bytes`, NUL-terminated.
+fn renderNodePath(bytes: [*]u8, number: u32) -> void {
+    var at: usize = 0
+    for byte in "/dev/dri/renderD" {
+        bytes[at] = byte
+        at += 1
+    }
+    bytes[at] = @intCast(u8, 48 + number / 100)
+    bytes[at + 1] = @intCast(u8, 48 + (number / 10) % 10)
+    bytes[at + 2] = @intCast(u8, 48 + number % 10)
+    bytes[at + 3] = 0
+}
+
+// The GPU for clients (a dev_t): the card the compositor drives (drm.mlx
+// sets it), else the first render node; 0 when there is none.
+fn gpuDevice(compositor: *Compositor) -> usize {
+    if compositor.*.gpuDevice != 0 { return compositor.*.gpuDevice }
+    var number: u32 = 128
+    while number < 136 {
+        var path: [32]u8 = undefined
+        var bytes: [*]u8 = undefined
+        unsafe { bytes = @ptrCast([*]u8, &path) }
+        renderNodePath(bytes, number)
+        var status: device.Stat = undefined
+        if device.statPath(bytes, &status) && device.isCharacterDevice(&status) {
+            compositor.*.gpuDevice = device.deviceNumber(status.major, status.minor)
+            return compositor.*.gpuDevice
+        }
+        number += 1
+    }
+    return 0
+}
+
+// The whole feedback, once: the format table, the device, the tranches,
+// done. It never changes, so it is not sent again.
+fn sendFeedback(compositor: *Compositor, feedback: wl.zwp_linux_dmabuf_feedback_v1.Resource) -> void {
+    var table: wl.SharedMemory = undefined
+    if !wl.transport.createSharedMemory(&table, FORMAT_TABLE_SIZE) {
+        // Without feedback the client picks its GPU as before.
+        state.say("dmabuf: no memory for the format table\n")
+        return
+    }
+    const entries = table.bytes()
+    device.zero(entries, FORMAT_TABLE_SIZE)
+    device.store32(entries, 0, DRM_FORMAT_ARGB8888)
+    device.store32(entries, 16, DRM_FORMAT_XRGB8888)
+    device.store32(entries, 32, DRM_FORMAT_ARGB8888)
+    device.store32(entries, 40, MODIFIER_INVALID_LO)
+    device.store32(entries, 44, MODIFIER_INVALID_HI)
+    device.store32(entries, 48, DRM_FORMAT_XRGB8888)
+    device.store32(entries, 56, MODIFIER_INVALID_LO)
+    device.store32(entries, 60, MODIFIER_INVALID_HI)
+    feedback.sendFormatTable(table.handle, @intCast(u32, FORMAT_TABLE_SIZE))
+    // The event carries its own copy of the descriptor.
+    table.release()
+    // No device unless the renderer reads tiled buffers (see the top).
+    const gpu = if compositor.*.readsTiled { gpuDevice(compositor) } else { 0 }
+    var number: [8]u8 = undefined
+    var number_bytes: [*]u8 = undefined
+    unsafe { number_bytes = @ptrCast([*]u8, &number) }
+    device.store64(number_bytes, 0, gpu)
+    const device_array = wl.wire.ArrayView.fromSlice(number[0..8])
+    feedback.sendMainDevice(device_array)
+    // Tranche 1: LINEAR (table indices 0 and 1, u16 each).
+    feedback.sendTrancheTargetDevice(device_array)
+    var linear: [4]u8 = [4]u8{ 0, 0, 1, 0 }
+    feedback.sendTrancheFormats(wl.wire.ArrayView.fromSlice(linear[0..4]))
+    feedback.sendTrancheFlags(0)
+    feedback.sendTrancheDone()
+    // Tranche 2: the implicit layout, for scanout (indices 2 and 3).
+    if compositor.*.readsTiled {
+        feedback.sendTrancheTargetDevice(device_array)
+        var implicit: [4]u8 = [4]u8{ 2, 0, 3, 0 }
+        feedback.sendTrancheFormats(wl.wire.ArrayView.fromSlice(implicit[0..4]))
+        feedback.sendTrancheFlags(TRANCHE_SCANOUT)
+        feedback.sendTrancheDone()
+    }
+    feedback.sendDone()
+    if compositor.*.verbose && !compositor.*.saidFeedback {
+        compositor.*.saidFeedback = true
+        if !compositor.*.readsTiled {
+            state.say("dmabuf: no GPU named to clients (the renderer cannot read their tiled buffers): OpenGL clients render in software\n")
+        } else if gpu == 0 {
+            state.say("dmabuf: no GPU found for clients (no /dev/dri/renderD*): OpenGL clients render in software\n")
+        } else {
+            state.say("dmabuf: clients are told to render on GPU ")
+            state.sayNumber(@intCast(usize, device.deviceMajor(gpu)))
+            state.say(":")
+            state.sayNumber(@intCast(usize, device.deviceMinor(gpu)))
+            state.say(" (linear, else its own layout)\n")
+        }
+    }
+}
+
 fn onDmabuf(context: *anyopaque, request: wl.server.Request) -> void {
     const compositor = state.compositorOf(context)
     const decoded = wl.zwp_linux_dmabuf_v1.decodeRequest(request)
+    if request.opcode == wl.zwp_linux_dmabuf_v1.REQUEST_GET_DEFAULT_FEEDBACK {
+        sendFeedback(compositor, decoded.get_default_feedback.id)
+        return
+    }
+    // Every surface gets the same feedback as the default.
+    if request.opcode == wl.zwp_linux_dmabuf_v1.REQUEST_GET_SURFACE_FEEDBACK {
+        sendFeedback(compositor, decoded.get_surface_feedback.id)
+        return
+    }
     if request.opcode != wl.zwp_linux_dmabuf_v1.REQUEST_CREATE_PARAMS { return }
     const memory = state.allocate(compositor, @sizeOf(Params))
     var params: *Params = undefined
@@ -164,6 +323,8 @@ fn onDmabuf(context: *anyopaque, request: wl.server.Request) -> void {
 fn bindDmabuf(context: *anyopaque, client: wl.server.Client, object: wl.server.Object, version: u32) -> void {
     const dmabuf = wl.zwp_linux_dmabuf_v1.Resource.fromObject(object)
     dmabuf.setHandler(onDmabuf, context)
+    // From version 4 on the formats come with the feedback only.
+    if dmabuf.version() >= 4 { return }
     dmabuf.sendFormat(DRM_FORMAT_ARGB8888)
     dmabuf.sendFormat(DRM_FORMAT_XRGB8888)
     if dmabuf.version() >= 3 {
@@ -172,8 +333,34 @@ fn bindDmabuf(context: *anyopaque, client: wl.server.Client, object: wl.server.O
     }
 }
 
+const DMABUF_VERSION: u32 = 4
+
 pub fn createGlobal(compositor: *Compositor) -> bool {
     var memory: [*]u8 = undefined
     unsafe { memory = @ptrCast([*]u8, compositor) }
-    return compositor.*.server.createGlobal(wl.Interface.zwp_linux_dmabuf_v1, 3, bindDmabuf, state.contextOf(memory)) != 0
+    return compositor.*.server.createGlobal(wl.Interface.zwp_linux_dmabuf_v1, DMABUF_VERSION, bindDmabuf, state.contextOf(memory)) != 0
+}
+
+// ---------------------------------------------------------------------------
+// The handlers this file registers with the Wayland server, by name: when
+// the shell is loaded again (modules.mlx), each resource's handler is
+// replaced by the new code's function of the same name. Every function
+// passed to setHandler, setDestroyHandler, createGlobal or a client
+// handler here must be listed (tools/check_compositor_modules.py checks;
+// --fix rewrites this table).
+
+pub const HANDLER_COUNT: usize = 3
+
+pub fn handlerAddress(index: usize) -> usize {
+    if index == 0 { return @intFromPtr(onDmabuf) }
+    if index == 1 { return @intFromPtr(onParams) }
+    if index == 2 { return @intFromPtr(onParamsDestroyed) }
+    return 0
+}
+
+pub fn handlerName(index: usize) -> []const u8 {
+    if index == 0 { return "dmabuf.onDmabuf" }
+    if index == 1 { return "dmabuf.onParams" }
+    if index == 2 { return "dmabuf.onParamsDestroyed" }
+    return ""
 }

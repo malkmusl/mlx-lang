@@ -15,7 +15,14 @@
 //     model, entry points, execution modes, debug, annotations, types and
 //     globals, then functions, in that order; functions properly delimited,
 //     with labels only inside them; at least one entry point unless the
-//     Linkage capability is declared.
+//     Linkage capability is declared;
+//   - blocks (SPIR-V 2.2.5, 2.4, 2.16): inside a function, every
+//     instruction after the parameters is in a block that starts with
+//     OpLabel and ends with its one branch or return; OpSelectionMerge
+//     comes right before OpBranchConditional or OpSwitch and OpLoopMerge
+//     right before OpBranch or OpBranchConditional (drivers such as
+//     lavapipe refuse a pipeline otherwise, without a word); function
+//     variables come first in the first block.
 //
 // It does not check typing rules or execution-model requirements (use
 // spirv-val for that); it guarantees a module can be decoded safely.
@@ -51,6 +58,10 @@ pub const Error = enum(u8) {
     unterminatedFunction,
     instructionOutsideFunction,
     outOfMemory,
+    mergeNotBeforeBranch,
+    unterminatedBlock,
+    instructionOutsideBlock,
+    variableNotFirst,
 }
 
 pub fn errorMessage(code: Error) -> []const u8 {
@@ -78,6 +89,10 @@ pub fn errorMessage(code: Error) -> []const u8 {
         .unterminatedFunction => "function without OpFunctionEnd",
         .instructionOutsideFunction => "instruction allowed only inside a function",
         .outOfMemory => "out of memory",
+        .mergeNotBeforeBranch => "OpSelectionMerge or OpLoopMerge not right before its branch",
+        .unterminatedBlock => "block without a branch or return at its end",
+        .instructionOutsideBlock => "function instruction outside a block (after its end, or before a label)",
+        .variableNotFirst => "function OpVariable not at the start of the first block",
     }
 }
 
@@ -287,6 +302,67 @@ fn isUnknown(text: []const u8) -> bool {
     return length == 1 && first == 63
 }
 
+// Opcodes the block rules name.
+const OP_LINE: u32 = 8
+const OP_FUNCTION_PARAMETER: u32 = 55
+const OP_VARIABLE: u32 = 59
+const OP_LOOP_MERGE: u32 = 246
+const OP_SELECTION_MERGE: u32 = 247
+const OP_LABEL: u32 = 248
+const OP_BRANCH: u32 = 249
+const OP_BRANCH_CONDITIONAL: u32 = 250
+const OP_SWITCH: u32 = 251
+const OP_NO_LINE: u32 = 317
+
+// Instructions that end a block (SPIR-V 2.2.5: branch and termination
+// instructions).
+fn endsBlock(opcode: u32) -> bool {
+    if opcode >= OP_BRANCH && opcode <= 255 { return true }
+    return opcode == 4416 || opcode == 4448 || opcode == 4449 || opcode == 5294 || opcode == 5335 || opcode == 5336
+}
+
+// Where a function is in its blocks.
+const Blocks = struct {
+    // Inside a block (after its OpLabel, before its end).
+    open: bool
+    // Blocks begun so far in this function.
+    count: usize
+    // The first block has had an instruction other than OpVariable.
+    begun: bool
+    // The instruction before was OpSelectionMerge (1) or OpLoopMerge (2).
+    merge: u8
+}
+
+// Checks one instruction of a function body against the block rules;
+// Error.none when it keeps them.
+fn checkBlock(blocks: *Blocks, opcode: u32) -> Error {
+    if opcode == OP_LINE || opcode == OP_NO_LINE { return Error.none }
+    if opcode == OP_FUNCTION_PARAMETER {
+        return if blocks.*.count == 0 { Error.none } else { Error.instructionOutsideBlock }
+    }
+    if blocks.*.merge != 0 {
+        const branch_follows = if blocks.*.merge == 1 { opcode == OP_BRANCH_CONDITIONAL || opcode == OP_SWITCH } else { opcode == OP_BRANCH || opcode == OP_BRANCH_CONDITIONAL }
+        blocks.*.merge = 0
+        if !branch_follows { return Error.mergeNotBeforeBranch }
+    }
+    if opcode == OP_LABEL {
+        if blocks.*.open { return Error.unterminatedBlock }
+        blocks.*.open = true
+        blocks.*.count += 1
+        return Error.none
+    }
+    if !blocks.*.open { return Error.instructionOutsideBlock }
+    if opcode == OP_VARIABLE {
+        if blocks.*.count != 1 || blocks.*.begun { return Error.variableNotFirst }
+        return Error.none
+    }
+    blocks.*.begun = true
+    if opcode == OP_SELECTION_MERGE { blocks.*.merge = 1 }
+    if opcode == OP_LOOP_MERGE { blocks.*.merge = 2 }
+    if endsBlock(opcode) { blocks.*.open = false }
+    return Error.none
+}
+
 fn layoutOf(opcode: u32) -> u8 {
     const op = @enumFromInt(spv.Op, @intCast(u16, opcode))
     if op == spv.Op.capability { return LAYOUT_CAPABILITY }
@@ -351,6 +427,7 @@ pub fn validate(words: [*]const u32, count: usize, allocator: Allocator, diagnos
     var linkage = false
     var instruction: Instruction = undefined
     var step_error = Error.none
+    var blocks = Blocks.{ .open = false, .count = 0, .begun = false, .merge = 0 }
     while result == Error.none && nextInstruction(words, count, &position, &instruction, &step_error) {
         const signature_text = spv.operandSignature(instruction.opcode)
         if isUnknown(signature_text) {
@@ -384,11 +461,18 @@ pub fn validate(words: [*]const u32, count: usize, allocator: Allocator, diagnos
                 if in_function { result = report(diagnostic, Error.nestedFunction, &instruction, 0) }
                 in_function = true
                 layout = LAYOUT_FUNCTION
+                blocks = Blocks.{ .open = false, .count = 0, .begun = false, .merge = 0 }
             } else if op == spv.Op.functionEnd {
                 if !in_function { result = report(diagnostic, Error.instructionOutsideFunction, &instruction, 0) }
+                if in_function && blocks.open { result = report(diagnostic, Error.unterminatedBlock, &instruction, 0) }
+                if in_function && blocks.merge != 0 { result = report(diagnostic, Error.mergeNotBeforeBranch, &instruction, 0) }
                 in_function = false
             } else if in_function {
                 if section < LAYOUT_ANYWHERE { result = report(diagnostic, Error.layoutOrder, &instruction, 0) }
+                if result == Error.none {
+                    const block_error = checkBlock(&blocks, instruction.opcode)
+                    if block_error != Error.none { result = report(diagnostic, block_error, &instruction, 0) }
+                }
             } else if section == LAYOUT_BODY {
                 result = report(diagnostic, Error.instructionOutsideFunction, &instruction, 0)
             } else if section == LAYOUT_ANYWHERE {

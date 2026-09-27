@@ -64,7 +64,7 @@ run() {
     "$work/test-host" "host-$name" "$work/us.xkb" "$work/shot.script" > "$work/$name-host.log" 2>&1 &
     local host_pid=$!
     for _ in $(seq 1 50); do [[ -S "$XDG_RUNTIME_DIR/host-$name" ]] && break; sleep 0.1; done
-    WAYLAND_DISPLAY="host-$name" MLX_VULKAN_NO_HOST_IMPORT=${no_host_import:-} timeout 60 "$work/mlx-compositor" --verbose --renderer "$renderer" --size 640x480 \
+    WAYLAND_DISPLAY="host-$name" MLX_VULKAN_NO_HOST_IMPORT=${no_host_import:-} timeout 60 "$work/mlx-compositor" --verbose --no-fps --renderer "$renderer" --size 640x480 \
         --socket "nested-$name" --run "$work/$client" > "$work/$name.log" 2>&1 || true
     wait "$host_pid" || { echo "FAIL $name: the test host failed" >&2; cat "$work/$name-host.log" "$work/$name.log" >&2; exit 1; }
     [[ -f "$work/frame.ppm" ]] || { echo "FAIL $name: no frame" >&2; cat "$work/$name.log" >&2; exit 1; }
@@ -106,7 +106,13 @@ label = sum(1 for y in range(top + h - 30, top + h) for x in range(left + 8, lef
 assert label > 40, "no label in the client window (%d white pixels)" % label
 # The title bar above the frame: focus color with the title in white.
 bar_top = top - 2 - 20
-assert rgb(left + w - 4, bar_top + 3) == focus, "no title bar"
+assert rgb(left + w - 30, bar_top + 3) == focus, "no title bar"
+# Rounded corners (radius 12): the title bar's and the window's outermost
+# corner pixels show the background (the same as beside the window in that
+# row), not the bar or the client's pattern.
+assert rgb(left - 2, bar_top) == rgb(left - 8, bar_top), "the title bar's corner is not rounded"
+bottom = top + h - 1
+assert rgb(left, bottom) == rgb(left - 8, bottom) and rgb(left + w - 1, bottom) == rgb(left + w + 8, bottom), "the window's bottom corners are not rounded"
 # (anti-aliased white over the bar: red well above the bar's 0x5a)
 title = sum(1 for y in range(bar_top, top - 2) for x in range(left, left + 200) if rgb(x, y)[0] > 180)
 assert title > 40, "no title text in the title bar (%d light pixels)" % title

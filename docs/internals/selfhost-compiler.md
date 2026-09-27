@@ -158,8 +158,9 @@ lowering reports `unsupported_instruction_lowering`/`Phase.codegen`
 `-o <path>`, `--quiet`/`--progress`, `--trace`/`--verbose`, `-O0`..`-O3`, and
 `--safety=on`/`--safety=off`, defaulting to `-O2` and `runtimeSafety = true`
 — matching the spec's stated default (`spec/02-compiler/pipeline.xml`'s
-`RuntimeSafety default="on"`). Anything unrecognized is treated as the input
-path.
+`RuntimeSafety default="on"`), and `--shared` (an x86_64 shared object, see
+[Formats](../reference/formats.md#shared-objects)). Anything unrecognized is
+treated as the input path.
 
 `driver/reporter.mlx`'s `Reporter` times every step with
 `time.monotonicNanoseconds()`, prints `[name N/total] message` progress

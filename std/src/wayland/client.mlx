@@ -80,7 +80,22 @@ pub const State = struct {
     rejectedOpcode: u32
     rejectedInterface: Interface
     rejectedKnown: bool
+    // Storage requests are built in and events are handled from. A local
+    // aggregate lives until the program ends (the aggregate arena is never
+    // released), so a per-request or per-event local of a message's size
+    // would grow the process by that much on every message. The writer is
+    // reused by every request (a request never nests another), and each
+    // nesting level of dispatch (a handler that dispatches again, for
+    // example through roundtrip) has a copy slot.
+    writer: wire.Writer
+    copies: [16384]u8 // DISPATCH_DEPTH * wire.MAX_MESSAGE_SIZE
+    copyHandles: [112]isize // DISPATCH_DEPTH * wire.MAX_HANDLES
+    dispatchDepth: usize
 }
+
+// Nesting levels of dispatch that reuse fixed event storage; deeper levels
+// fall back to fresh storage.
+pub const DISPATCH_DEPTH: usize = 4
 
 // The connection handle. It is a small value; copies refer to the same
 // connection.
@@ -334,6 +349,7 @@ fn initialize(display: *Display, allocator: Allocator, descriptor: isize) -> Err
     state.*.serverObjects = server_objects
     state.*.freeIds = free_ids
     state.*.failure = FAIL_NONE
+    state.*.dispatchDepth = 0
     state.*.errorObject = 0
     state.*.errorCode = 0
     state.*.errorMessage = message_memory.?
@@ -457,6 +473,19 @@ pub fn forget(object: Object) -> void {
         entry.?.*.status = STATUS_ZOMBIE
         entry.?.*.hasHandler = false
     }
+}
+
+// The storage a request from `object`'s connection is built in (see State):
+// begin the request in it, put its arguments and end it before beginning
+// another on the same connection.
+pub fn messageWriter(object: Object) -> *wire.Writer {
+    return writerOf(object.display.state)
+}
+
+fn writerOf(state: *State) -> *wire.Writer {
+    var writer: *wire.Writer = undefined
+    unsafe { writer = @ptrCast(*wire.Writer, &state.*.writer) }
+    return writer
 }
 
 pub fn beginRequest(object: Object, opcode: u16, since: u32, message: *wire.Writer) -> bool {
@@ -713,9 +742,25 @@ fn dispatchOne(state: *State) -> isize {
     }
 
     // Copy the message out of the receive buffer: a handler may dispatch
-    // again (for example through roundtrip), which reuses that buffer.
-    var copy: [4096]u8 = undefined
-    var handles: [28]isize = undefined
+    // again (for example through roundtrip), which reuses that buffer. The
+    // copy goes into the slot for this nesting level of dispatch (see
+    // State).
+    const depth = state.*.dispatchDepth
+    var copy: [*]u8 = undefined
+    var handles: [*]isize = undefined
+    if depth < DISPATCH_DEPTH {
+        unsafe {
+            copy = @ptrFromInt([*]u8, @intFromPtr(&state.*.copies) + depth * wire.MAX_MESSAGE_SIZE)
+            handles = @ptrFromInt([*]isize, @intFromPtr(&state.*.copyHandles) + depth * wire.MAX_HANDLES * 8)
+        }
+    } else {
+        var deep_copy: [4096]u8 = undefined
+        var deep_handles: [28]isize = undefined
+        unsafe {
+            copy = @ptrCast([*]u8, &deep_copy)
+            handles = @ptrCast([*]isize, &deep_handles)
+        }
+    }
     var index: usize = 0
     while index < payload_length {
         copy[index] = payload[index]
@@ -731,10 +776,16 @@ fn dispatchOne(state: *State) -> isize {
     var copied_payload: [*]const u8 = undefined
     var copied_handles: [*]const isize = undefined
     unsafe {
-        copied_payload = @ptrCast([*]const u8, &copy)
-        copied_handles = @ptrCast([*]const isize, &handles)
+        copied_payload = @ptrCast([*]const u8, copy)
+        copied_handles = @ptrCast([*]const isize, handles)
     }
+    state.*.dispatchDepth = depth + 1
+    const result = deliver(state, entry, id, interface, opcode, signature, payload_length, handle_count, copied_payload, copied_handles)
+    state.*.dispatchDepth = depth
+    return result
+}
 
+fn deliver(state: *State, entry: *ObjectEntry, id: u32, interface: Interface, opcode: u16, signature: []const u8, payload_length: usize, handle_count: usize, copied_payload: [*]const u8, copied_handles: [*]const isize) -> isize {
     if entry.*.status == STATUS_ZOMBIE {
         closeHandles(copied_handles, handle_count)
         return 1
@@ -825,10 +876,10 @@ fn roundtripState(display: Display) -> Error!void {
     var done = false
     const callback = createObject(displayObject(display), Interface.wl_callback, 1)
     unsafe { setHandler(callback, markDone, @ptrCast(*anyopaque, &done)) }
-    var message: wire.Writer = undefined
-    if beginRequest(displayObject(display), 0, 1, &message) {
-        wire.putNewId(&message, callback.id)
-        endRequest(displayObject(display), &message, false)
+    const message = writerOf(state)
+    if beginRequest(displayObject(display), 0, 1, message) {
+        wire.putNewId(message, callback.id)
+        endRequest(displayObject(display), message, false)
     }
     while !done {
         try dispatchState(state, true)

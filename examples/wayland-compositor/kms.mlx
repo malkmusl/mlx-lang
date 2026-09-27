@@ -8,6 +8,8 @@
 // DRM_IOCTL_MODE_PAGE_FLIP; the flip-complete event (read from the card)
 // says the frame is on screen, which paces frame callbacks to the
 // monitor's refresh. After a VT switch the CRTC is set up again (modeset).
+// A dumb buffer can be handed out as a dma-buf (exportBuffer, PRIME) for a
+// GPU to render into it in place.
 //
 // Structure layouts and ioctl numbers are those of <drm/drm_mode.h> on
 // 64-bit Linux.
@@ -31,11 +33,18 @@ const DESTROY_DUMB: usize = 3221513396
 const ADDFB: usize = 3223086254
 const RMFB: usize = 3221513391
 const PAGE_FLIP: usize = 3222824112
+const PRIME_HANDLE_TO_FD: usize = 3222037549
+const PRIME_FD_TO_HANDLE: usize = 3222037550
+const GEM_CLOSE: usize = 1074291721
+const PRIME_CLOEXEC: u32 = 2147483648
+const PRIME_RDWR: u32 = 2
 
 const CAP_DUMB_BUFFER: usize = 1
 const PAGE_FLIP_EVENT: u32 = 1
 const EVENT_FLIP_COMPLETE: u32 = 2
 const MODE_TYPE_PREFERRED: u32 = 8
+const MODE_FLAG_INTERLACE: u32 = 16
+const MODE_FLAG_DOUBLESCAN: u32 = 32
 const CONNECTED: u32 = 1
 const MODE_SIZE: usize = 68
 const CRTC_SIZE: usize = 104
@@ -43,11 +52,18 @@ const CRTC_SIZE: usize = 104
 pub const Output = struct {
     card: device.Device
     connector: u32
+    // The connector's kind (DRM_MODE_CONNECTOR_*) and number within it:
+    // HDMI-A-1, DP-2.
+    connectorType: u32
+    connectorTypeId: u32
     crtc: u32
     mode: [68]u8
     width: usize
     height: usize
     refresh: u32
+    // The highest refresh rate (Hz) to pick (0: no limit); set before
+    // probe and open.
+    maxRefresh: u32
     // The two dumb buffers: kernel handle, framebuffer, row pitch, size
     // and our mapping.
     handles: [2]u32
@@ -55,13 +71,24 @@ pub const Output = struct {
     pitches: [2]usize
     sizes: [2]usize
     addresses: [2]usize
+    // Zero copy: two buffers of the GPU's (dma-bufs it exported) as
+    // framebuffers, kernel handle and framebuffer each; shown instead of
+    // the dumb buffers while `scanout` is set.
+    scanoutHandles: [2]u32
+    scanoutFramebuffers: [2]u32
+    scanout: bool
     // The buffer to draw the next frame into.
     back: usize
     flipPending: bool
+    // The card's events being read (readEvents). A local there would stay
+    // allocated for every frame.
+    events: [1024]u8
     // The CRTC as it was before us (struct drm_mode_crtc).
     saved: [104]u8
     // The CRTC has to be set up (first frame, after a VT switch).
     needsModeset: bool
+    // The negative errno of the last ioctl that failed (0: none).
+    lastError: isize
 }
 
 fn bytesOf(output: *Output, field: usize) -> [*]u8 {
@@ -76,7 +103,15 @@ fn cardOf(output: *Output) -> *device.Device {
 }
 
 fn call(output: *Output, request: usize, argument: [*]u8, size: usize) -> bool {
-    return device.ioctl(cardOf(output), request, argument, size) >= 0
+    const result = device.ioctl(cardOf(output), request, argument, size)
+    if result < 0 { output.*.lastError = result }
+    return result >= 0
+}
+
+// The errno of the last ioctl that failed, as a positive number.
+pub fn lastError(output: *const Output) -> usize {
+    if output.*.lastError >= 0 { return 0 }
+    return @intCast(usize, 0 - output.*.lastError)
 }
 
 fn allocateWords(allocator: Allocator, count: usize) -> [*]u8 {
@@ -113,8 +148,54 @@ fn pickCrtc(output: *Output, connector: [*]u8, encoders: [*]u8, encoder_count: u
     return 0
 }
 
+// A mode's refresh rate in millihertz, from its pixel clock (kHz) and
+// totals (the vrefresh field is rounded).
+fn modeMillihertz(modes: [*]const u8, index: usize) -> usize {
+    const at = index * MODE_SIZE
+    const clock = @intCast(usize, device.load32(modes, at))
+    const htotal = @intCast(usize, device.load16(modes, at + 10))
+    const vtotal = @intCast(usize, device.load16(modes, at + 20))
+    if htotal == 0 || vtotal == 0 { return @intCast(usize, device.load32(modes, at + 24)) * 1000 }
+    var rate = clock * 1000000 / (htotal * vtotal)
+    // Interlaced modes show half the frames; double scan twice the lines.
+    const flags = device.load32(modes, at + 28)
+    if flags & MODE_FLAG_INTERLACE != 0 { rate = rate * 2 }
+    if flags & MODE_FLAG_DOUBLESCAN != 0 { rate = rate / 2 }
+    return rate
+}
+
+// Among the modes with the resolution of mode `preferred` (the monitor's
+// native one), the one with the highest refresh rate up to `limit` Hz (0:
+// any), progressive only: monitors mark a 60 Hz mode preferred even when
+// they run at 144 Hz.
+fn fastestMode(modes: [*]const u8, count: usize, preferred: usize, limit: u32) -> usize {
+    const width = device.load16(modes, preferred * MODE_SIZE + 4)
+    const height = device.load16(modes, preferred * MODE_SIZE + 14)
+    var chosen = preferred
+    var best_hertz: u32 = 0
+    var best_rate: usize = 0
+    var index: usize = 0
+    while index < count {
+        const at = index * MODE_SIZE
+        const flags = device.load32(modes, at + 28)
+        // The kernel's rounded rate first, the exact one between equals.
+        const hertz = device.load32(modes, at + 24)
+        const rate = modeMillihertz(modes, index)
+        const allowed = limit == 0 || hertz <= limit
+        const faster = hertz > best_hertz || (hertz == best_hertz && rate > best_rate)
+        if device.load16(modes, at + 4) == width && device.load16(modes, at + 14) == height && flags & (MODE_FLAG_INTERLACE | MODE_FLAG_DOUBLESCAN) == 0 && allowed && faster {
+            chosen = index
+            best_hertz = hertz
+            best_rate = rate
+        }
+        index += 1
+    }
+    return chosen
+}
+
 // Looks at one connector: when it is connected and a CRTC can drive it,
-// takes it with its preferred mode. True when taken.
+// takes it at its native resolution with the highest refresh rate (see
+// fastestMode). True when taken.
 fn tryConnector(output: *Output, allocator: Allocator, id: u32, crtcs: [*]u8, crtc_count: usize) -> bool {
     var connector: [80]u8 = undefined
     var bytes: [*]u8 = undefined
@@ -146,6 +227,7 @@ fn tryConnector(output: *Output, allocator: Allocator, id: u32, crtcs: [*]u8, cr
             }
             index += 1
         }
+        chosen = fastestMode(modes, count, chosen, output.*.maxRefresh)
         var usable_encoders = @intCast(usize, device.load32(bytes, 40))
         if usable_encoders > encoder_count { usable_encoders = encoder_count }
         const crtc = pickCrtc(output, bytes, encoders, usable_encoders, crtcs, crtc_count)
@@ -157,6 +239,8 @@ fn tryConnector(output: *Output, allocator: Allocator, id: u32, crtcs: [*]u8, cr
                 index += 1
             }
             output.*.connector = id
+            output.*.connectorType = device.load32(bytes, 52)
+            output.*.connectorTypeId = device.load32(bytes, 56)
             output.*.crtc = crtc
             output.*.width = @intCast(usize, device.load16(modes, chosen * MODE_SIZE + 4))
             output.*.height = @intCast(usize, device.load16(modes, chosen * MODE_SIZE + 14))
@@ -205,33 +289,9 @@ fn createBuffer(output: *Output, index: usize) -> bool {
     return output.*.addresses[index] != 0
 }
 
-// Sets `output` up on the card `descriptor` (owned from now on). False
-// when it has no connected monitor or cannot show buffers.
-pub fn open(output: *Output, descriptor: isize, allocator: Allocator) -> bool {
-    device.init(cardOf(output), descriptor, allocator)
-    output.*.handles[0] = 0
-    output.*.handles[1] = 0
-    output.*.framebuffers[0] = 0
-    output.*.framebuffers[1] = 0
-    output.*.addresses[0] = 0
-    output.*.addresses[1] = 0
-    output.*.back = 0
-    output.*.flipPending = false
-    output.*.needsModeset = true
-    output.*.connector = 0
-    // Without logind the first opener is DRM master already, or becomes it.
-    var none: [8]u8 = undefined
-    var none_bytes: [*]u8 = undefined
-    unsafe { none_bytes = @ptrCast([*]u8, &none) }
-    const master = device.ioctl(cardOf(output), SET_MASTER, none_bytes, 0)
-
-    var capability: [16]u8 = undefined
-    var capability_bytes: [*]u8 = undefined
-    unsafe { capability_bytes = @ptrCast([*]u8, &capability) }
-    device.zero(capability_bytes, 16)
-    device.store64(capability_bytes, 0, CAP_DUMB_BUFFER)
-    if !call(output, GET_CAP, capability_bytes, 16) || device.load64(capability_bytes, 8) == 0 { return false }
-
+// Finds the first connected connector with a CRTC to drive it (into
+// output.connector, mode, width, height, refresh). False when there is none.
+fn findConnector(output: *Output, allocator: Allocator) -> bool {
     var resources: [64]u8 = undefined
     var bytes: [*]u8 = undefined
     unsafe { bytes = @ptrCast([*]u8, &resources) }
@@ -261,7 +321,107 @@ pub fn open(output: *Output, descriptor: isize, allocator: Allocator) -> bool {
     allocator.free(crtcs, if crtc_count == 0 { 8 } else { crtc_count * 4 }, 8)
     allocator.free(connectors, if connector_count == 0 { 8 } else { connector_count * 4 }, 8)
     allocator.free(encoders, if encoder_count == 0 { 8 } else { encoder_count * 4 }, 8)
-    if !found { return false }
+    return found
+}
+
+// Looks at the card `descriptor` without taking it: whether it has a
+// connected monitor, and which (connector, width, height, refresh). The
+// descriptor is closed either way.
+pub fn probe(output: *Output, descriptor: isize, allocator: Allocator) -> bool {
+    device.init(cardOf(output), descriptor, allocator)
+    output.*.connector = 0
+    output.*.lastError = 0
+    const found = findConnector(output, allocator)
+    device.deinit(cardOf(output), allocator)
+    return found
+}
+
+// A connector kind's name (DRM_MODE_CONNECTOR_*).
+fn connectorLabel(kind: u32) -> []const u8 {
+    if kind == 1 { return "VGA" }
+    if kind == 2 { return "DVI-I" }
+    if kind == 3 { return "DVI-D" }
+    if kind == 4 { return "DVI-A" }
+    if kind == 5 { return "Composite" }
+    if kind == 6 { return "SVIDEO" }
+    if kind == 7 { return "LVDS" }
+    if kind == 8 { return "Component" }
+    if kind == 9 { return "DIN" }
+    if kind == 10 { return "DP" }
+    if kind == 11 { return "HDMI-A" }
+    if kind == 12 { return "HDMI-B" }
+    if kind == 13 { return "TV" }
+    if kind == 14 { return "eDP" }
+    if kind == 15 { return "Virtual" }
+    if kind == 16 { return "DSI" }
+    if kind == 17 { return "DPI" }
+    if kind == 18 { return "Writeback" }
+    if kind == 19 { return "SPI" }
+    if kind == 20 { return "USB" }
+    return "Unknown"
+}
+
+// The connector's name as DRM tools show it (HDMI-A-1, DP-2, eDP-1),
+// written to `name` (at least 24 bytes); returns its length.
+pub fn connectorName(output: *const Output, name: [*]u8) -> usize {
+    const label = connectorLabel(output.*.connectorType)
+    var length: usize = 0
+    for byte in label {
+        name[length] = byte
+        length += 1
+    }
+    name[length] = 45
+    length += 1
+    var digits: [12]u8 = undefined
+    var count: usize = 0
+    var rest = output.*.connectorTypeId
+    while rest > 0 || count == 0 {
+        digits[count] = @intCast(u8, 48 + rest % 10)
+        rest = rest / 10
+        count += 1
+    }
+    while count > 0 {
+        count -= 1
+        name[length] = digits[count]
+        length += 1
+    }
+    return length
+}
+
+// Sets `output` up on the card `descriptor` (owned from now on). False
+// when it has no connected monitor or cannot show buffers.
+pub fn open(output: *Output, descriptor: isize, allocator: Allocator) -> bool {
+    device.init(cardOf(output), descriptor, allocator)
+    output.*.handles[0] = 0
+    output.*.handles[1] = 0
+    output.*.framebuffers[0] = 0
+    output.*.framebuffers[1] = 0
+    output.*.addresses[0] = 0
+    output.*.addresses[1] = 0
+    output.*.scanoutHandles[0] = 0
+    output.*.scanoutHandles[1] = 0
+    output.*.scanoutFramebuffers[0] = 0
+    output.*.scanoutFramebuffers[1] = 0
+    output.*.scanout = false
+    output.*.back = 0
+    output.*.flipPending = false
+    output.*.needsModeset = true
+    output.*.lastError = 0
+    output.*.connector = 0
+    // Without logind the first opener is DRM master already, or becomes it.
+    var none: [8]u8 = undefined
+    var none_bytes: [*]u8 = undefined
+    unsafe { none_bytes = @ptrCast([*]u8, &none) }
+    const master = device.ioctl(cardOf(output), SET_MASTER, none_bytes, 0)
+
+    var capability: [16]u8 = undefined
+    var capability_bytes: [*]u8 = undefined
+    unsafe { capability_bytes = @ptrCast([*]u8, &capability) }
+    device.zero(capability_bytes, 16)
+    device.store64(capability_bytes, 0, CAP_DUMB_BUFFER)
+    if !call(output, GET_CAP, capability_bytes, 16) || device.load64(capability_bytes, 8) == 0 { return false }
+
+    if !findConnector(output, allocator) { return false }
 
     // What the CRTC shows now, for restore().
     device.zero(savedOf(output), CRTC_SIZE)
@@ -277,6 +437,87 @@ pub fn descriptor(output: *const Output) -> isize { return output.*.card.descrip
 // Where the next frame goes: its address and row pitch in bytes.
 pub fn backAddress(output: *const Output) -> usize { return output.*.addresses[output.*.back] }
 pub fn backPitch(output: *const Output) -> usize { return output.*.pitches[output.*.back] }
+
+// The dumb buffer to draw the next frame into (0 or 1), and any buffer's
+// mapping, row pitch and size in bytes.
+pub fn backIndex(output: *const Output) -> usize { return output.*.back }
+pub fn bufferAddress(output: *const Output, index: usize) -> usize { return output.*.addresses[index] }
+pub fn bufferPitch(output: *const Output, index: usize) -> usize { return output.*.pitches[index] }
+pub fn bufferSize(output: *const Output, index: usize) -> usize { return output.*.sizes[index] }
+
+// Dumb buffer `index` as a dma-buf (DRM_IOCTL_PRIME_HANDLE_TO_FD), for a
+// GPU to import; the caller owns the descriptor. -1 when the card cannot.
+pub fn exportBuffer(output: *Output, index: usize) -> isize {
+    var prime: [12]u8 = undefined
+    var bytes: [*]u8 = undefined
+    unsafe { bytes = @ptrCast([*]u8, &prime) }
+    device.zero(bytes, 12)
+    device.store32(bytes, 0, output.*.handles[index])
+    device.store32(bytes, 4, PRIME_CLOEXEC | PRIME_RDWR)
+    device.store32(bytes, 8, 4294967295)
+    if !call(output, PRIME_HANDLE_TO_FD, bytes, 12) { return -1 }
+    // An emulated card sends the descriptor with the reply.
+    const received = device.takeDescriptor(cardOf(output))
+    if received >= 0 { return received }
+    return @intCast(isize, device.loadInt(bytes, 8))
+}
+
+// Makes the dma-buf `fd` (a GPU's buffer, rows `pitch` bytes apart) the
+// framebuffer of slot `index` for zero copy (DRM_IOCTL_PRIME_FD_TO_HANDLE,
+// then a framebuffer on the handle). The descriptor stays the caller's.
+// False when the card does not take it (the dumb buffers stay in use).
+pub fn importScanout(output: *Output, index: usize, fd: i32, pitch: usize) -> bool {
+    var prime: [12]u8 = undefined
+    var bytes: [*]u8 = undefined
+    unsafe { bytes = @ptrCast([*]u8, &prime) }
+    device.zero(bytes, 12)
+    device.store32(bytes, 8, @bitCast(u32, fd))
+    if !call(output, PRIME_FD_TO_HANDLE, bytes, 12) { return false }
+    output.*.scanoutHandles[index] = device.load32(bytes, 0)
+    var framebuffer: [28]u8 = undefined
+    var fb_bytes: [*]u8 = undefined
+    unsafe { fb_bytes = @ptrCast([*]u8, &framebuffer) }
+    device.zero(fb_bytes, 28)
+    device.store32(fb_bytes, 4, @intCast(u32, output.*.width))
+    device.store32(fb_bytes, 8, @intCast(u32, output.*.height))
+    device.store32(fb_bytes, 12, @intCast(u32, pitch))
+    device.store32(fb_bytes, 16, 32)
+    device.store32(fb_bytes, 20, 24)
+    device.store32(fb_bytes, 24, output.*.scanoutHandles[index])
+    if !call(output, ADDFB, fb_bytes, 28) { return false }
+    output.*.scanoutFramebuffers[index] = device.load32(fb_bytes, 0)
+    return true
+}
+
+// Shows the GPU's buffers (true) or the dumb buffers (false) from the next
+// frame on.
+pub fn useScanout(output: *Output, on: bool) -> void {
+    output.*.scanout = on && output.*.scanoutFramebuffers[0] != 0 && output.*.scanoutFramebuffers[1] != 0
+}
+
+// Takes the zero-copy framebuffers down (the dumb buffers are shown again).
+pub fn releaseScanout(output: *Output) -> void {
+    output.*.scanout = false
+    var index: usize = 0
+    while index < 2 {
+        var word: [8]u8 = undefined
+        var bytes: [*]u8 = undefined
+        unsafe { bytes = @ptrCast([*]u8, &word) }
+        if output.*.scanoutFramebuffers[index] != 0 {
+            device.zero(bytes, 8)
+            device.store32(bytes, 0, output.*.scanoutFramebuffers[index])
+            const removed = call(output, RMFB, bytes, 4)
+            output.*.scanoutFramebuffers[index] = 0
+        }
+        if output.*.scanoutHandles[index] != 0 {
+            device.zero(bytes, 8)
+            device.store32(bytes, 0, output.*.scanoutHandles[index])
+            const closed = call(output, GEM_CLOSE, bytes, 8)
+            output.*.scanoutHandles[index] = 0
+        }
+        index += 1
+    }
+}
 
 fn setCrtc(output: *Output, framebuffer: u32, mode: [*]const u8, mode_valid: bool) -> bool {
     var crtc: [104]u8 = undefined
@@ -303,7 +544,7 @@ fn setCrtc(output: *Output, framebuffer: u32, mode: [*]const u8, mode_valid: boo
 // true when the frame is already on screen.
 pub fn present(output: *Output, shown: *bool) -> bool {
     shown.* = false
-    const framebuffer = output.*.framebuffers[output.*.back]
+    const framebuffer = if output.*.scanout { output.*.scanoutFramebuffers[output.*.back] } else { output.*.framebuffers[output.*.back] }
     if output.*.needsModeset {
         if !setCrtc(output, framebuffer, modeOf(output), true) { return false }
         output.*.needsModeset = false
@@ -329,9 +570,8 @@ pub fn present(output: *Output, shown: *bool) -> bool {
 // Reads the card's events. True when a flip completed (the last presented
 // frame is on screen); `milliseconds` is its time.
 pub fn readEvents(output: *Output, milliseconds: *u32) -> bool {
-    var buffer: [1024]u8 = undefined
     var bytes: [*]u8 = undefined
-    unsafe { bytes = @ptrCast([*]u8, &buffer) }
+    unsafe { bytes = @ptrCast([*]u8, &output.*.events) }
     var flipped = false
     while true {
         const count = device.read(cardOf(output), bytes, 1024)
@@ -369,6 +609,7 @@ pub fn close(output: *Output, allocator: Allocator) -> void {
     var mode_bytes: [*]const u8 = undefined
     unsafe { mode_bytes = @ptrFromInt([*]const u8, @intFromPtr(saved) + 36) }
     const restored = setCrtc(output, saved_framebuffer, mode_bytes, device.load32(saved, 32) != 0)
+    releaseScanout(output)
     var index: usize = 0
     while index < 2 {
         var word: [8]u8 = undefined

@@ -24,7 +24,7 @@ fi
 work=$(mktemp -d)
 trap 'rm -rf -- "$work"' EXIT
 failures=0
-for test in tests/240_*.mlx tests/241_*.mlx tests/242_*.mlx tests/243_*.mlx tests/244_*.mlx tests/245_*.mlx tests/246_*.mlx; do
+for test in tests/240_*.mlx tests/241_*.mlx tests/242_*.mlx tests/243_*.mlx tests/244_*.mlx tests/245_*.mlx tests/246_*.mlx tests/269_*.mlx; do
     if ! "$compiler" --quiet "$test" -o "$work/test" 2> "$work/errors"; then
         echo "FAIL (compile) $test"
         cat "$work/errors"
@@ -43,7 +43,30 @@ for test in tests/240_*.mlx tests/241_*.mlx tests/242_*.mlx tests/243_*.mlx test
     fi
 done
 
-for example in examples/wayland-client/main.mlx examples/wayland-server/main.mlx examples/wayland-terminal/main.mlx examples/wayland-compositor/main.mlx tools/wayland-test-host/main.mlx; do
+# The compositor's damage tracking (frames composed in what changed must
+# equal frames composed from scratch) and its hit-testing with input
+# regions.
+for test in tests/268_compositor_damage_runtime.mlx tests/270_compositor_input_region_runtime.mlx; do
+    if ! "$compiler" --quiet "$test" -o "$work/test" 2> "$work/errors"; then
+        echo "FAIL (compile) $test"
+        cat "$work/errors"
+        failures=$((failures + 1))
+        continue
+    fi
+    set +e
+    timeout 120 "$work/test" > "$work/output"
+    status=$?
+    set -e
+    if [[ $status -eq 13 ]]; then
+        echo "ok   $test"
+    else
+        echo "FAIL (exit $status) $test"
+        cat "$work/output"
+        failures=$((failures + 1))
+    fi
+done
+
+for example in examples/wayland-client/main.mlx examples/wayland-server/main.mlx examples/wayland-terminal/main.mlx examples/wayland-compositor/main.mlx examples/mlx-dock/main.mlx examples/mlx-launcher/main.mlx examples/mlx-settings/main.mlx tools/wayland-test-host/main.mlx; do
     if "$compiler" --quiet "$example" -o "$work/example"; then
         echo "ok   $example (builds)"
     else
@@ -51,6 +74,23 @@ for example in examples/wayland-client/main.mlx examples/wayland-server/main.mlx
         failures=$((failures + 1))
     fi
 done
+
+# The compositor's shell and renderer as shared objects (loaded again while
+# it runs), and the shell's handler tables.
+for module in shell render; do
+    if "$compiler" --quiet --shared "examples/wayland-compositor/${module}_module.mlx" -o "$work/libmlx-$module.so"; then
+        echo "ok   examples/wayland-compositor/${module}_module.mlx (builds with --shared)"
+    else
+        echo "FAIL (compile) examples/wayland-compositor/${module}_module.mlx"
+        failures=$((failures + 1))
+    fi
+done
+if python3 tools/check_compositor_modules.py > /dev/null; then
+    echo "ok   the compositor shell's handler tables are complete"
+else
+    python3 tools/check_compositor_modules.py || true
+    failures=$((failures + 1))
+fi
 
 if std/protocols/wayland/materialize.sh --check "$compiler" > /dev/null 2>&1; then
     echo "ok   std/src/wayland/generated is current"

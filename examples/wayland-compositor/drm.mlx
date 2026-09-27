@@ -9,10 +9,13 @@
 //   needs the rights to them (root, or the seat's ACLs) and has no VT
 //   switching.
 // - Output: the first card (/dev/dri/cardN) with a connected monitor, at
-//   the monitor's preferred mode (kms.mlx). Frames are composed on the CPU
-//   into memory of our own (blending reads what is under a window, which is
-//   slow in a dumb buffer), copied into the back buffer and page-flipped.
-//   Frame callbacks follow the flips, so clients draw at the monitor's rate.
+//   the monitor's native resolution at its fastest refresh rate (kms.mlx).
+//   Frames are composed on the CPU into memory of our own (blending reads
+//   what is under a window, which is slow in a dumb buffer) and copied into the back buffer, or by the
+//   Vulkan renderer (vulkan.mlx) straight into the back buffer, then
+//   page-flipped. Frame callbacks go out as a flip is queued, so clients
+//   draw their next frame while this one waits for the vertical blank, at
+//   the monitor's rate.
 // - Input: every keyboard, mouse and touchpad under /dev/input (evdev.mlx),
 //   including those plugged in later (inotify); the keymap comes from
 //   libxkbcommon (xkb.mlx).
@@ -21,12 +24,18 @@
 //   Ctrl+Alt+Backspace) quits, and the monitor gets back what it showed.
 //
 // MLX_DRM_DIR and MLX_INPUT_DIR (default /dev/dri and /dev/input) point
-// the backend elsewhere; the test harness uses them.
+// the backend elsewhere; the test harness uses them. With several cards,
+// MLX_DRM_CARD (a path or a number) picks the one to drive; by default it
+// is the one with the largest monitor (a server's BMC graphics reports a
+// small VGA "monitor"), then the boot card, then the first. The monitor
+// runs at its native resolution with the highest refresh rate it offers
+// there (kms.fastestMode); MLX_DRM_REFRESH=HZ sets an upper limit.
 
 const std = @import("std")
 const wl = @import("std.wayland")
+const ui = @import("std.ui")
 const state = @import("./state.mlx")
-const shell = @import("./shell.mlx")
+const entries = @import("./entries.mlx")
 const scene = @import("./scene.mlx")
 const device = @import("./device.mlx")
 const kms = @import("./kms.mlx")
@@ -58,6 +67,10 @@ pub const Backend = struct {
     keyboard: xkb.Keyboard
     // The session is in front (the card is ours).
     active: bool
+    // Frames presented so far, and whether a present failed since the last
+    // one worked (said once).
+    presented: usize
+    presentFailed: bool
     // Directories as NUL-terminated paths.
     cardDirectory: [128]u8
     inputDirectory: [128]u8
@@ -293,38 +306,199 @@ fn readInotify(backend: *Backend) -> void {
 // ---------------------------------------------------------------------------
 // Starting and stopping
 
+// Whether /dev/dri/cardN is the card the machine booted with (sysfs
+// boot_vga), the one the monitor most likely hangs on.
+fn isBootCard(number: u32) -> bool {
+    var path: [64]u8 = undefined
+    var bytes: [*]u8 = undefined
+    unsafe { bytes = @ptrCast([*]u8, &path) }
+    var length: usize = 0
+    for byte in "/sys/class/drm/card" {
+        bytes[length] = byte
+        length += 1
+    }
+    var digits: [12]u8 = undefined
+    var count: usize = 0
+    var rest = number
+    while rest > 0 || count == 0 {
+        digits[count] = @intCast(u8, 48 + rest % 10)
+        rest = rest / 10
+        count += 1
+    }
+    while count > 0 {
+        count -= 1
+        bytes[length] = digits[count]
+        length += 1
+    }
+    for byte in "/device/boot_vga" {
+        bytes[length] = byte
+        length += 1
+    }
+    bytes[length] = 0
+    const file = std.fs.open(bytes, 0, 0)
+    if !std.fs.isValid(file) { return false }
+    var value: [4]u8 = [4]u8{ 0, 0, 0, 0 }
+    var value_bytes: [*]u8 = undefined
+    unsafe { value_bytes = @ptrCast([*]u8, &value) }
+    const got = std.fs.read(file, value_bytes, 4)
+    const closed = std.fs.close(file)
+    return got > 0 && value[0] == 49
+}
+
+// Logs "drm: PATH: HDMI-A-1 WxH at N Hz" (or "no connected monitor"),
+// after `prefix`.
+fn sayCard(prefix: []const u8, path: [*]const u8, output: *const kms.Output, found: bool, boot: bool) -> void {
+    state.say("drm: ")
+    state.say(prefix)
+    sayPath(path)
+    state.say(": ")
+    if !found {
+        state.say("no connected monitor")
+    } else {
+        var name: [24]u8 = undefined
+        var name_bytes: [*]u8 = undefined
+        unsafe { name_bytes = @ptrCast([*]u8, &name) }
+        const length = kms.connectorName(output, name_bytes)
+        unsafe { const shown = std.io.writeAllBytes(std.io.stdout(), name_bytes, length) }
+        state.say(" ")
+        state.sayNumber(output.*.width)
+        state.say("x")
+        state.sayNumber(output.*.height)
+        state.say(" at ")
+        state.sayNumber(@intCast(usize, output.*.refresh))
+        state.say(" Hz")
+    }
+    if boot { state.say(" (the boot card)") }
+    state.say("\n")
+}
+
+// MLX_DRM_REFRESH: the highest refresh rate (Hz) to drive the monitor at
+// (0: none, the default: its native resolution at the fastest rate it has).
+fn refreshLimit(backend: *Backend) -> u32 {
+    const wanted = state.environmentValue(backend.*.compositor.*.environment, "MLX_DRM_REFRESH")
+    if @intFromPtr(wanted) == 0 { return 0 }
+    var value: u32 = 0
+    var index: usize = 0
+    while wanted[index] >= 48 && wanted[index] <= 57 && index < 6 {
+        value = value * 10 + @intCast(u32, wanted[index] - 48)
+        index += 1
+    }
+    return value
+}
+
+// Whether MLX_DRM_CARD (a path or a number) names card `number`; true for
+// every card when it is not set.
+fn cardWanted(backend: *Backend, number: u32, path: [*]const u8) -> bool {
+    const wanted = state.environmentValue(backend.*.compositor.*.environment, "MLX_DRM_CARD")
+    if @intFromPtr(wanted) == 0 || wanted[0] == 0 { return true }
+    var index: usize = 0
+    while wanted[index] != 0 && wanted[index] == path[index] { index += 1 }
+    if wanted[index] == 0 && path[index] == 0 { return true }
+    var value: u32 = 0
+    var digits: usize = 0
+    index = 0
+    while wanted[index] >= 48 && wanted[index] <= 57 {
+        value = value * 10 + @intCast(u32, wanted[index] - 48)
+        index += 1
+        digits += 1
+    }
+    return digits > 0 && wanted[index] == 0 && value == number
+}
+
+// Picks the card to drive: MLX_DRM_CARD when set; else, among the cards
+// with a connected monitor, the one with the largest monitor (a server's
+// BMC graphics reports a small VGA "monitor" and is often the boot card),
+// then the card the machine booted with, then the first. With more than
+// one card every one is looked at and logged first (the log then shows
+// which monitor hangs where).
 fn openCard(backend: *Backend) -> bool {
-    var number: u32 = 0
-    while number < 8 {
+    var cards: [8]bool = [8]bool{ false, false, false, false, false, false, false, false }
+    var nodes: [8]device.Stat = undefined
+    var card_count: usize = 0
+    var index: usize = 0
+    while index < 8 {
         var path: [160]u8 = undefined
         var path_bytes: [*]u8 = undefined
         unsafe { path_bytes = @ptrCast([*]u8, &path) }
-        nodePath(path_bytes, cardDirectoryOf(backend), "card", number)
+        nodePath(path_bytes, cardDirectoryOf(backend), "card", @intCast(u32, index))
         var node: device.Stat = undefined
-        if device.statPath(path_bytes, &node) && device.isCharacterDevice(&node) {
+        if device.statPath(path_bytes, &node) && device.isCharacterDevice(&node) && cardWanted(backend, @intCast(u32, index), path_bytes) {
+            nodes[index] = node
+            cards[index] = true
+            card_count += 1
+        }
+        index += 1
+    }
+    var chosen: usize = 8
+    if card_count > 1 {
+        var best_pixels: usize = 0
+        var best_boot = false
+        index = 0
+        while index < 8 {
+            if cards[index] {
+                var path: [160]u8 = undefined
+                var path_bytes: [*]u8 = undefined
+                unsafe { path_bytes = @ptrCast([*]u8, &path) }
+                nodePath(path_bytes, cardDirectoryOf(backend), "card", @intCast(u32, index))
+                var node = nodes[index]
+                // A plain open does for looking (the seat's ACL lets the
+                // active session in); logind's TakeDevice only when it fails.
+                var took = false
+                var descriptor = device.openPath(path_bytes, device.O_RDWR | device.O_NOCTTY | device.O_NONBLOCK)
+                if descriptor < 0 {
+                    descriptor = openNode(backend, path_bytes, &node)
+                    took = true
+                }
+                var found = false
+                var probe: kms.Output = undefined
+                probe.maxRefresh = refreshLimit(backend)
+                if descriptor >= 0 {
+                    found = kms.probe(&probe, descriptor, allocator(backend))
+                    if took { releaseNode(backend, node.major, node.minor) }
+                } else {
+                    state.say("drm: ")
+                    sayPath(path_bytes)
+                    state.say(": cannot open\n")
+                }
+                const boot = isBootCard(@intCast(u32, index))
+                if descriptor >= 0 { sayCard("", path_bytes, &probe, found, boot) }
+                if found {
+                    const pixels = probe.width * probe.height
+                    if chosen == 8 || pixels > best_pixels || (pixels == best_pixels && boot && !best_boot) {
+                        chosen = index
+                        best_pixels = pixels
+                        best_boot = boot
+                    }
+                }
+            }
+            index += 1
+        }
+        if chosen == 8 { return false }
+    }
+    index = if chosen < 8 { chosen } else { 0 }
+    while index < 8 {
+        if cards[index] {
+            var path: [160]u8 = undefined
+            var path_bytes: [*]u8 = undefined
+            unsafe { path_bytes = @ptrCast([*]u8, &path) }
+            nodePath(path_bytes, cardDirectoryOf(backend), "card", @intCast(u32, index))
+            var node = nodes[index]
             const descriptor = openNode(backend, path_bytes, &node)
             if descriptor >= 0 {
+                outputOf(backend).*.maxRefresh = refreshLimit(backend)
                 if kms.open(outputOf(backend), descriptor, allocator(backend)) {
                     backend.*.cardMajor = node.major
                     backend.*.cardMinor = node.minor
-                    if backend.*.compositor.*.verbose {
-                        state.say("drm: ")
-                        sayPath(path_bytes)
-                        state.say(" ")
-                        state.sayNumber(outputOf(backend).*.width)
-                        state.say("x")
-                        state.sayNumber(outputOf(backend).*.height)
-                        state.say(" at ")
-                        state.sayNumber(@intCast(usize, outputOf(backend).*.refresh))
-                        state.say(" Hz\n")
-                    }
+                    backend.*.compositor.*.gpuDevice = device.deviceNumber(node.major, node.minor)
+                    sayCard("driving ", path_bytes, outputOf(backend), true, false)
                     return true
                 }
                 device.close(descriptor)
                 releaseNode(backend, node.major, node.minor)
             }
         }
-        number += 1
+        if chosen < 8 { return false }
+        index += 1
     }
     return false
 }
@@ -339,6 +513,8 @@ pub fn start(compositor: *Compositor) -> usize {
     backend.*.compositor = compositor
     backend.*.inotify = -1
     backend.*.active = true
+    backend.*.presented = 0
+    backend.*.presentFailed = false
     var slot: usize = 0
     while slot < MAX_INPUTS {
         backend.*.inputs[slot] = 0
@@ -361,10 +537,11 @@ pub fn start(compositor: *Compositor) -> usize {
     compositor.*.height = outputOf(backend).*.height
     backend.*.frame = state.allocate(compositor, compositor.*.width * compositor.*.height * 4)
     compositor.*.lastFrame = backend.*.frame
+    compositor.*.lastFrameStride = compositor.*.width * 4
     compositor.*.pointerX = @intCast(i32, compositor.*.width / 2)
     compositor.*.pointerY = @intCast(i32, compositor.*.height / 2)
     compositor.*.pointerInside = true
-    compositor.*.needsRedraw = true
+    scene.damageAll(compositor)
 
     const loaded = xkb.load(keyboardOf(backend), compositor)
     scanInputs(backend)
@@ -378,6 +555,9 @@ pub fn start(compositor: *Compositor) -> usize {
 pub fn backendAt(address: usize) -> *Backend {
     unsafe { return @ptrFromInt(*Backend, address) }
 }
+
+// The monitor (for the Vulkan renderer to import its buffers).
+pub fn output(backend: *Backend) -> *kms.Output { return outputOf(backend) }
 
 // Gives everything back: the monitor what it showed, the devices to logind.
 pub fn stop(backend: *Backend) -> void {
@@ -438,6 +618,38 @@ fn now() -> u32 {
     return @intCast(u32, (device.load64(bytes, 0) * 1000 + device.load64(bytes, 8) / 1000000) & 4294967295)
 }
 
+// Logs ", VT N in front" from /sys/class/tty/tty0/active (nothing when it
+// cannot be read), with the session's own VT.
+fn sayActiveVt(compositor: *Compositor) -> void {
+    var path: [32]u8 = undefined
+    var bytes: [*]u8 = undefined
+    unsafe { bytes = @ptrCast([*]u8, &path) }
+    var length: usize = 0
+    for byte in "/sys/class/tty/tty0/active" {
+        bytes[length] = byte
+        length += 1
+    }
+    bytes[length] = 0
+    const file = std.fs.open(bytes, 0, 0)
+    if !std.fs.isValid(file) { return }
+    var value: [16]u8 = undefined
+    var value_bytes: [*]u8 = undefined
+    unsafe { value_bytes = @ptrCast([*]u8, &value) }
+    const got = std.fs.read(file, value_bytes, 15)
+    const closed = std.fs.close(file)
+    if got <= 0 { return }
+    var count = @bitCast(usize, got)
+    while count > 0 && (value[count - 1] == 10 || value[count - 1] == 13) { count -= 1 }
+    state.say(", ")
+    unsafe { const shown = std.io.writeAllBytes(std.io.stdout(), value_bytes, count) }
+    state.say(" in front")
+    const vt = state.environmentValue(compositor.*.environment, "XDG_VTNR")
+    if @intFromPtr(vt) != 0 && vt[0] != 0 {
+        state.say(", ours is tty")
+        unsafe { const shown = std.io.writeString(std.io.stdout(), std.process.fromCString(vt)) }
+    }
+}
+
 fn sessionEvents(backend: *Backend) -> void {
     if !backend.*.hasSession { return }
     const compositor = backend.*.compositor
@@ -447,13 +659,19 @@ fn sessionEvents(backend: *Backend) -> void {
         const card = event.major == backend.*.cardMajor && event.minor == backend.*.cardMinor
         if event.kind == logind.PAUSE {
             if card {
-                // Another VT is in front: no frames until we are back, and
-                // nothing held down any more.
+                // Another VT is in front: nothing held down any more; frames
+                // are tried anyway (the kernel refuses them while we are
+                // away, see present).
                 backend.*.active = false
                 evdev.releaseAll(compositor, keyboardOf(backend))
-                if compositor.*.verbose { state.say("session: paused\n") }
+                if compositor.*.verbose {
+                    state.say(if event.pauseKind == logind.PAUSE_ASKED { "session: the card is paused (asked" } else if event.pauseKind == logind.PAUSE_GONE { "session: the card is paused (gone" } else { "session: the card is paused (forced" })
+                    sayActiveVt(compositor)
+                    state.say(")\n")
+                }
                 if event.pauseKind == logind.PAUSE_ASKED { logind.pauseComplete(sessionOf(backend), event.major, event.minor) }
             } else {
+                if compositor.*.verbose { state.say("session: an input device is paused\n") }
                 const slot = slotOf(backend, event.major, event.minor)
                 if slot < MAX_INPUTS {
                     if event.pauseKind == logind.PAUSE_GONE {
@@ -471,8 +689,12 @@ fn sessionEvents(backend: *Backend) -> void {
                 device.close(event.descriptor)
                 kms.resume(outputOf(backend))
                 backend.*.active = true
-                compositor.*.needsRedraw = true
-                if compositor.*.verbose { state.say("session: resumed\n") }
+                scene.damageAll(compositor)
+                if compositor.*.verbose {
+                    state.say("session: the card is resumed (")
+                    sayActiveVt(compositor)
+                    state.say(")\n")
+                }
             } else {
                 const slot = slotOf(backend, event.major, event.minor)
                 if slot < MAX_INPUTS && event.descriptor >= 0 {
@@ -495,8 +717,10 @@ fn sessionEvents(backend: *Backend) -> void {
 pub fn dispatch(backend: *Backend) -> void {
     const compositor = backend.*.compositor
     sessionEvents(backend)
+    // A completed flip lets the next frame be composed (frame callbacks went
+    // out when it was queued).
     var milliseconds: u32 = 0
-    if kms.readEvents(outputOf(backend), &milliseconds) { shell.frameDone(compositor, milliseconds) }
+    const flipped = kms.readEvents(outputOf(backend), &milliseconds)
     readInotify(backend)
     var slot: usize = 0
     while slot < MAX_INPUTS {
@@ -516,45 +740,89 @@ pub fn dispatch(backend: *Backend) -> void {
 // front and the last flip is done.
 pub fn present(backend: *Backend) -> void {
     const compositor = backend.*.compositor
+    if outputOf(backend).*.flipPending || !compositor.*.needsRedraw { return }
+    const start = state.microseconds()
+    presentFrame(backend)
+    state.countPresent(compositor, start)
+}
+
+fn presentFrame(backend: *Backend) -> void {
+    const compositor = backend.*.compositor
     const output = outputOf(backend)
-    if !backend.*.active || output.*.flipPending || !compositor.*.needsRedraw { return }
-    scene.compose(compositor, backend.*.frame)
-    // Row by row into the dumb buffer, eight bytes at a time.
-    const row_words = compositor.*.width * 4 / 8
-    const pitch = kms.backPitch(output)
-    var source: [*]const u64 = undefined
-    var target: [*]u64 = undefined
-    var row: usize = 0
-    while row < compositor.*.height {
-        unsafe {
-            source = @ptrFromInt([*]const u64, @intFromPtr(backend.*.frame) + row * compositor.*.width * 4)
-            target = @ptrFromInt([*]u64, kms.backAddress(output) + row * pitch)
+    // While logind has paused the card its ioctls fail (errno 13) and the
+    // frame waits; the pause itself does not stop us, since a pause whose
+    // resume never arrives (seen with SDDM's hand-over) would otherwise
+    // leave the screen black for good.
+    if output.*.flipPending || !compositor.*.needsRedraw { return }
+    const back = kms.backIndex(output)
+    // Our frame lacks what changed since the last one; the dumb buffer
+    // (shown a frame or two ago) lacks more. The GPU redraws everything.
+    var changed: ui.Rect = undefined
+    var region = scene.takeDamage(compositor, back, &changed)
+    if compositor.*.renderer != 0 {
+        // Into the dumb buffer itself (or copied into it by the renderer:
+        // only what it lacks).
+        compositor.*.copyRegion = region
+        var composed = entries.compose(compositor, back)
+        if composed && !entries.verifyOutput(compositor, back) {
+            // The GPU rendered somewhere the monitor does not scan out.
+            state.say("renderer: the GPU's frame did not reach the dumb buffer; copying each frame instead\n")
+            compositor.*.copyRegion = scene.outputRect(compositor)
+            scene.damageAll(compositor)
+            composed = entries.copyInstead(compositor, output) && entries.compose(compositor, back)
         }
-        var word: usize = 0
-        while word < row_words {
-            target[word] = source[word]
-            word += 1
+        if !composed {
+            // Vulkan is not going to work here: the CPU takes over for good.
+            state.say("mlx-compositor: Vulkan could not compose a frame; composing on the CPU from now on\n")
+            entries.adoptCpuRenderer(compositor)
+            // The CPU draws into the dumb buffers: those are shown again.
+            kms.useScanout(output, false)
+            scene.damageAll(compositor)
+            region = scene.takeDamage(compositor, back, &changed)
         }
-        if compositor.*.width % 2 != 0 {
-            // The last pixel of an odd-width row.
-            var last_source: [*]const u32 = undefined
-            var last_target: [*]u32 = undefined
-            unsafe {
-                last_source = @ptrCast([*]const u32, source)
-                last_target = @ptrCast([*]u32, target)
-            }
-            last_target[compositor.*.width - 1] = last_source[compositor.*.width - 1]
+    }
+    if compositor.*.renderer != 0 {
+        unsafe { compositor.*.lastFrame = @ptrFromInt([*]u8, kms.bufferAddress(output, back)) }
+        compositor.*.lastFrameStride = kms.bufferPitch(output, back)
+    } else {
+        entries.composeCpu(compositor, backend.*.frame, changed)
+        // Row by row into the dumb buffer (its pitch may exceed a row).
+        const pitch = kms.bufferPitch(output, back)
+        const target = kms.bufferAddress(output, back)
+        var row = region.y
+        while row < ui.bottom(region) {
+            const at = @intCast(usize, row)
+            const left = @intCast(usize, region.x)
+            state.copyPixels(target + at * pitch + left * 4, @intFromPtr(backend.*.frame) + (at * compositor.*.width + left) * 4, @intCast(usize, region.width))
+            row += 1
         }
-        row += 1
+        compositor.*.lastFrame = backend.*.frame
+        compositor.*.lastFrameStride = compositor.*.width * 4
     }
     var shown = false
+    const modeset = output.*.needsModeset
     if !kms.present(output, &shown) {
-        // The card is not ours right now (a VT switch under way).
+        // The card is not ours right now (a VT switch under way): the
+        // frame is drawn again when it is back. Said once per streak: a
+        // first modeset that keeps failing is why a screen stays black.
+        if !backend.*.presentFailed {
+            state.say(if modeset { "drm: modeset failed (errno " } else { "drm: page flip failed (errno " })
+            state.sayNumber(kms.lastError(output))
+            if !backend.*.active { state.say("; the card is paused") }
+            state.say(if backend.*.presented == 0 { "); nothing shown yet, trying again\n" } else { "); trying again\n" })
+            backend.*.presentFailed = true
+        }
+        scene.damageAll(compositor)
         return
     }
+    if backend.*.presentFailed && compositor.*.verbose { state.say("drm: frames show again\n") }
+    backend.*.presentFailed = false
+    if backend.*.presented == 0 && compositor.*.verbose { state.say("drm: first frame on screen\n") }
+    backend.*.presented += 1
     compositor.*.frames += 1
-    compositor.*.needsRedraw = false
-    if shown { shell.frameDone(compositor, now()) }
+    // Clients draw their next frame while this one waits for the vertical
+    // blank: their frame callbacks are done now, not when the flip is.
+    entries.frameDone(compositor, now())
 }
 
 // Ctrl+Alt+F<number>.

@@ -1,0 +1,427 @@
+// Loading the shell and the renderer as shared objects, and loading them
+// again while the compositor runs (see entries.mlx for the boundary).
+//
+// With --modules DIR (or MLX_COMPOSITOR_MODULES=DIR) the compositor loads
+// DIR/libmlx-shell.so and DIR/libmlx-render.so at start-up when they are
+// there, and checks twice a second whether either file changed; a changed
+// one is loaded once it has stayed the same for half a second (a compiler
+// still writing it is not caught half way). A file that is missing, not a
+// module of its kind, or built for other records keeps what runs.
+//
+// Loading: the file is copied into a memfd (kept open) and opened with
+// dlopen through /proc/self/fd, so every version is a separate object for
+// the dynamic linker (a path it has seen would return the old one). Its one export,
+// mlx_compositor_module, says what it is and the layout of the records it
+// shares (which must equal the program's: a changed record needs a
+// restart), and gives its entries, which replace the current ones. The
+// shell's resources stay: every handler registered with the Wayland server
+// is replaced by the new version's function of the same name
+// (wl.server.Display.replaceHandler), so surfaces, windows and clients
+// carry on in the new code. Old versions stay loaded (a pointer into one
+// that was missed keeps working, running the old code).
+const std = @import("std")
+const wl = @import("std.wayland")
+const state = @import("./state.mlx")
+const entries = @import("./entries.mlx")
+const scene = @import("./scene.mlx")
+const shell_table = @import("./shell_table.mlx")
+const render_table = @import("./render_table.mlx")
+
+const Compositor = state.Compositor
+
+extern("c") fn dlopen(name: [*]const u8, flags: i32) -> usize
+extern("c") fn dlsym(handle: usize, name: [*]const u8) -> usize
+extern("c") fn dlclose(handle: usize) -> i32
+extern("c") fn dlerror() -> [*]const u8
+
+const RTLD_NOW: i32 = 2
+
+const SYS_read: usize = 0
+const SYS_open: usize = 2
+const SYS_close: usize = 3
+const SYS_stat: usize = 4
+const SYS_sendfile: usize = 40
+const SYS_clock_gettime: usize = 228
+const SYS_memfd_create: usize = 319
+const MFD_CLOEXEC: usize = 1
+const O_CLOEXEC: usize = 524288
+
+const POLL_MILLISECONDS: usize = 500
+const SETTLE_MILLISECONDS: usize = 500
+
+pub const Query = fn(usize, usize) -> usize
+
+// One replaceable part.
+pub const Module = struct {
+    kind: usize
+    // DIR/libmlx-KIND.so, NUL-terminated.
+    path: [512]u8
+    pathLength: usize
+    // The loaded version's query function (0: the built-in one runs).
+    query: usize
+    generation: usize
+    // The file as last loaded or refused (stat: size, mtime), and a change
+    // seen since, waiting to settle.
+    size: usize
+    seconds: usize
+    nanoseconds: usize
+    changed: bool
+    changedAt: usize
+    // What is being loaded is refused: say why only once per file version.
+    present: bool
+}
+
+pub const Modules = struct {
+    shell: Module
+    render: Module
+    lastPoll: usize
+}
+
+fn modulesOf(compositor: *Compositor) -> *Modules {
+    unsafe { return @ptrFromInt(*Modules, compositor.*.modules) }
+}
+
+fn shellOf(modules: *Modules) -> *Module {
+    unsafe { return @ptrCast(*Module, &modules.*.shell) }
+}
+
+fn renderOf(modules: *Modules) -> *Module {
+    unsafe { return @ptrCast(*Module, &modules.*.render) }
+}
+
+fn milliseconds() -> usize {
+    var time: [2]usize = [2]usize{ 0, 0 }
+    const result = std.linux.syscall2(SYS_clock_gettime, 1, @intFromPtr(&time))
+    return time[0] * 1000 + time[1] / 1000000
+}
+
+fn kindName(kind: usize) -> []const u8 {
+    if kind == entries.MODULE_SHELL { return "libmlx-shell.so" }
+    return "libmlx-render.so"
+}
+
+fn entryCount(kind: usize) -> usize {
+    if kind == entries.MODULE_SHELL { return entries.SHELL_ENTRIES }
+    return entries.RENDER_ENTRIES
+}
+
+fn builtinLayout(kind: usize) -> usize {
+    if kind == entries.MODULE_SHELL { return shell_table.layout() }
+    return render_table.layout()
+}
+
+// The program's own shell and renderer.
+pub fn useBuiltins(compositor: *Compositor) -> void {
+    var index: usize = 0
+    while index < 16 {
+        compositor.*.shellEntries[index] = if index < entries.SHELL_ENTRIES { shell_table.entry(index) } else { 0 }
+        compositor.*.renderEntries[index] = if index < entries.RENDER_ENTRIES { render_table.entry(index) } else { 0 }
+        index += 1
+    }
+}
+
+// Loads what DIR has and watches it from now on.
+pub fn open(compositor: *Compositor, directory: [*]const u8) -> void {
+    const memory = state.allocate(compositor, @sizeOf(Modules))
+    compositor.*.modules = @intFromPtr(memory)
+    const modules = modulesOf(compositor)
+    modules.*.lastPoll = milliseconds()
+    setUp(shellOf(modules), entries.MODULE_SHELL, directory)
+    setUp(renderOf(modules), entries.MODULE_RENDER, directory)
+    if compositor.*.verbose {
+        state.say("modules: watching ")
+        sayPath(shellOf(modules))
+        state.say(" and ")
+        sayPath(renderOf(modules))
+        state.say("\n")
+    }
+    check(compositor, renderOf(modules), true)
+    check(compositor, shellOf(modules), true)
+}
+
+fn setUp(module: *Module, kind: usize, directory: [*]const u8) -> void {
+    module.*.kind = kind
+    module.*.query = 0
+    module.*.generation = 0
+    module.*.size = 0
+    module.*.seconds = 0
+    module.*.nanoseconds = 0
+    module.*.changed = false
+    module.*.changedAt = 0
+    module.*.present = false
+    var length: usize = 0
+    while directory[length] != 0 && length < 400 {
+        module.*.path[length] = directory[length]
+        length += 1
+    }
+    if length > 0 && module.*.path[length - 1] != 47 {
+        module.*.path[length] = 47
+        length += 1
+    }
+    for byte in kindName(kind) {
+        module.*.path[length] = byte
+        length += 1
+    }
+    module.*.path[length] = 0
+    module.*.pathLength = length
+}
+
+fn pathOf(module: *Module) -> [*]const u8 {
+    unsafe { return @ptrCast([*]const u8, &module.*.path) }
+}
+
+fn sayPath(module: *Module) -> void {
+    unsafe { const shown = std.io.writeAllBytes(std.io.stdout(), @ptrCast([*]const u8, &module.*.path), module.*.pathLength) }
+}
+
+// Called at the start of every turn of the event loop.
+pub fn poll(compositor: *Compositor) -> void {
+    if compositor.*.modules == 0 { return }
+    const modules = modulesOf(compositor)
+    const now = milliseconds()
+    if now < modules.*.lastPoll + POLL_MILLISECONDS { return }
+    modules.*.lastPoll = now
+    check(compositor, renderOf(modules), false)
+    check(compositor, shellOf(modules), false)
+}
+
+// Loads the module's file when it is new: at once when `now`, else once it
+// stopped changing.
+fn check(compositor: *Compositor, module: *Module, now: bool) -> void {
+    var status: [18]usize = undefined
+    const result = std.linux.syscall2(SYS_stat, @intFromPtr(pathOf(module)), @intFromPtr(&status))
+    if result < 0 {
+        if module.*.present && compositor.*.verbose {
+            state.say("modules: ")
+            sayPath(module)
+            state.say(" is gone; what runs stays\n")
+        }
+        module.*.present = false
+        return
+    }
+    // struct stat: st_size at byte 48, st_mtim at 88.
+    const size = status[6]
+    const seconds = status[11]
+    const nanoseconds = status[12]
+    const same = module.*.present && size == module.*.size && seconds == module.*.seconds && nanoseconds == module.*.nanoseconds
+    if same { return }
+    if !now {
+        if !module.*.changed || size != module.*.size || seconds != module.*.seconds || nanoseconds != module.*.nanoseconds {
+            // Still being written, perhaps: wait until it stays the same.
+            module.*.changed = true
+            module.*.changedAt = milliseconds()
+            module.*.size = size
+            module.*.seconds = seconds
+            module.*.nanoseconds = nanoseconds
+            module.*.present = false
+            return
+        }
+        if milliseconds() < module.*.changedAt + SETTLE_MILLISECONDS { return }
+    }
+    module.*.changed = false
+    module.*.size = size
+    module.*.seconds = seconds
+    module.*.nanoseconds = nanoseconds
+    module.*.present = true
+    load(compositor, module)
+}
+
+fn sayProblem(module: *Module, problem: []const u8) -> void {
+    state.say("modules: ")
+    sayPath(module)
+    state.say(": ")
+    state.say(problem)
+    state.say("; what runs stays\n")
+}
+
+fn sayDlerror() -> void {
+    const text = dlerror()
+    if @intFromPtr(text) == 0 { return }
+    var length: usize = 0
+    while text[length] != 0 { length += 1 }
+    state.say(" (")
+    const shown = std.io.writeAllBytes(std.io.stdout(), text, length)
+    state.say(")")
+}
+
+// A copy of the file in a memfd; -1 when it cannot be read.
+fn copyToMemory(module: *Module) -> isize {
+    const file = std.linux.syscall3(SYS_open, @intFromPtr(pathOf(module)), O_CLOEXEC, 0)
+    if file < 0 { return -1 }
+    const memory = std.linux.syscall2(SYS_memfd_create, @intFromPtr(pathOf(module)) + module.*.pathLength - kindName(module.*.kind).length, MFD_CLOEXEC)
+    if memory < 0 {
+        const closed = std.linux.syscall1(SYS_close, @bitCast(usize, file))
+        return -1
+    }
+    var copied: usize = 0
+    while true {
+        const sent = std.linux.syscall4(SYS_sendfile, @bitCast(usize, memory), @bitCast(usize, file), 0, 1048576)
+        if sent <= 0 { break }
+        copied += @bitCast(usize, sent)
+    }
+    const closed = std.linux.syscall1(SYS_close, @bitCast(usize, file))
+    if copied < 64 {
+        const dropped = std.linux.syscall1(SYS_close, @bitCast(usize, memory))
+        return -1
+    }
+    return memory
+}
+
+fn load(compositor: *Compositor, module: *Module) -> void {
+    const memory = copyToMemory(module)
+    if memory < 0 {
+        sayProblem(module, "cannot read it")
+        return
+    }
+    // /proc/self/fd/N
+    var path: [32]u8 = [32]u8{ 47, 112, 114, 111, 99, 47, 115, 101, 108, 102, 47, 102, 100, 47, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }
+    var digits: [20]u8 = undefined
+    var count: usize = 0
+    var rest = @bitCast(usize, memory)
+    while rest > 0 || count == 0 {
+        digits[count] = @intCast(u8, 48 + rest % 10)
+        rest = rest / 10
+        count += 1
+    }
+    var at: usize = 14
+    while count > 0 {
+        count -= 1
+        path[at] = digits[count]
+        at += 1
+    }
+    path[at] = 0
+    var handle: usize = 0
+    unsafe { handle = dlopen(@ptrCast([*]const u8, &path), RTLD_NOW) }
+    // The memfd stays open: the dynamic linker knows objects by path, and a
+    // closed descriptor's number (so its /proc/self/fd path) comes back for
+    // the next file, which would be taken for the one loaded here.
+    if handle == 0 {
+        state.say("modules: ")
+        sayPath(module)
+        state.say(": the dynamic linker refused it")
+        sayDlerror()
+        state.say("; what runs stays\n")
+        return
+    }
+    var address: usize = 0
+    unsafe { address = dlsym(handle, @ptrCast([*]const u8, "mlx_compositor_module")) }
+    if address == 0 {
+        sayProblem(module, "it is not a compositor module (no mlx_compositor_module)")
+        const ignored = dlclose(handle)
+        return
+    }
+    var query: Query = undefined
+    unsafe { query = @ptrFromInt(Query, address) }
+    if query(entries.QUERY_KIND, 0) != module.*.kind {
+        sayProblem(module, "it is the other kind of module")
+        const ignored = dlclose(handle)
+        return
+    }
+    if query(entries.QUERY_LAYOUT, 0) != builtinLayout(module.*.kind) {
+        sayProblem(module, "it was built for records laid out differently (state.mlx, or a record it keeps, changed): restart the compositor for that")
+        const ignored = dlclose(handle)
+        return
+    }
+    var index: usize = 0
+    while index < entryCount(module.*.kind) {
+        if query(entries.QUERY_ENTRY, index) == 0 {
+            sayProblem(module, "it lacks an entry")
+            const ignored = dlclose(handle)
+            return
+        }
+        index += 1
+    }
+    var moved: usize = 0
+    var unmatched: usize = 0
+    if module.*.kind == entries.MODULE_SHELL { moveHandlers(compositor, module, query, &moved, &unmatched) }
+    index = 0
+    while index < entryCount(module.*.kind) {
+        if module.*.kind == entries.MODULE_SHELL {
+            compositor.*.shellEntries[index] = query(entries.QUERY_ENTRY, index)
+        } else {
+            compositor.*.renderEntries[index] = query(entries.QUERY_ENTRY, index)
+        }
+        index += 1
+    }
+    module.*.query = address
+    module.*.generation += 1
+    if module.*.kind == entries.MODULE_RENDER { entries.rendererReloaded(compositor) }
+    scene.damageAll(compositor)
+    state.say("modules: loaded ")
+    sayPath(module)
+    state.say(" (version ")
+    state.sayNumber(module.*.generation)
+    if module.*.kind == entries.MODULE_SHELL {
+        state.say(", ")
+        state.sayNumber(moved)
+        state.say(" handler uses moved over")
+        if unmatched > 0 {
+            state.say(", ")
+            state.sayNumber(unmatched)
+            state.say(" handlers it no longer has keep their old code")
+        }
+    }
+    state.say(")\n")
+}
+
+// The current shell's handler `index`: its address and name.
+fn currentHandlerCount(module: *Module) -> usize {
+    if module.*.query == 0 { return shell_table.handlerCount() }
+    return queryOf(module.*.query)(entries.QUERY_HANDLER_COUNT, 0)
+}
+
+fn currentHandlerAddress(module: *Module, index: usize) -> usize {
+    if module.*.query == 0 { return shell_table.handlerAddress(index) }
+    return queryOf(module.*.query)(entries.QUERY_HANDLER_ADDRESS, index)
+}
+
+fn currentHandlerName(module: *Module, index: usize) -> []const u8 {
+    if module.*.query == 0 { return shell_table.handlerName(index) }
+    return nameFrom(queryOf(module.*.query), index)
+}
+
+fn queryOf(address: usize) -> Query {
+    var query: Query = undefined
+    unsafe { query = @ptrFromInt(Query, address) }
+    return query
+}
+
+fn nameFrom(query: Query, index: usize) -> []const u8 {
+    var pointer: [*]const u8 = undefined
+    unsafe { pointer = @ptrFromInt([*]const u8, query(entries.QUERY_HANDLER_NAME, index)) }
+    return pointer[0..query(entries.QUERY_HANDLER_NAME_LENGTH, index)]
+}
+
+fn sameName(left: []const u8, right: []const u8) -> bool {
+    if left.length != right.length { return false }
+    var index: usize = 0
+    while index < left.length {
+        if left[index] != right[index] { return false }
+        index += 1
+    }
+    return true
+}
+
+// Every handler of the current shell in use by the server becomes the new
+// shell's function of the same name.
+fn moveHandlers(compositor: *Compositor, module: *Module, query: Query, moved: *usize, unmatched: *usize) -> void {
+    const count = currentHandlerCount(module)
+    const new_count = query(entries.QUERY_HANDLER_COUNT, 0)
+    var index: usize = 0
+    while index < count {
+        const old = currentHandlerAddress(module, index)
+        const name = currentHandlerName(module, index)
+        var found: usize = 0
+        var other: usize = 0
+        while other < new_count && found == 0 {
+            if sameName(name, nameFrom(query, other)) { found = query(entries.QUERY_HANDLER_ADDRESS, other) }
+            other += 1
+        }
+        if found == 0 {
+            unmatched.* += 1
+        } else if found != old {
+            moved.* += compositor.*.server.replaceHandler(old, found)
+        }
+        index += 1
+    }
+}
