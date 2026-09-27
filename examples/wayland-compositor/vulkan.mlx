@@ -42,6 +42,7 @@ const tt = @import("std.truetype")
 const ui = @import("std.ui")
 const text_module = @import("../vulkan-shared/text.mlx")
 const kms = @import("./kms.mlx")
+const wobble = @import("./wobble.mlx")
 
 const Compositor = state.Compositor
 const Surface = state.Surface
@@ -110,10 +111,29 @@ pub const Renderer = struct {
     blurFirst: *gpu.Buffer
     blurSecond: *gpu.Buffer
     blurOps: *gpu.Buffer
+    // Wobbly windows (wobble.mlx): the warp kernel, a scratch buffer of the
+    // output's size a bent window is drawn into flat, its control points
+    // (WARP_SLOTS windows a frame) and the slot in use.
+    hasWarp: bool
+    warp: *gpu.Kernel
+    warpScratch: *gpu.Buffer
+    warpGrid: *gpu.Buffer
+    warpSlot: usize
+    // What blits draw into: the frame, or the scratch buffer (its size,
+    // and where its top-left lies on the output).
+    targetWidth: u32
+    targetHeight: u32
+    originX: i32
+    originY: i32
+    offscreen: bool
     blurSlot: u32
 }
 
 const BLUR_SLOTS: u32 = 64
+// Bent windows a frame, and the words of each one's control points (16 x
+// offsets, 16 y offsets).
+const WARP_SLOTS: usize = 16
+const WARP_WORDS_PER_WINDOW: usize = 32
 
 fn rendererOf(compositor: *Compositor) -> *Renderer {
     unsafe { return @ptrFromInt(*Renderer, compositor.*.renderer) }
@@ -203,6 +223,9 @@ pub fn open(compositor: *Compositor, arguments: [][*]const u8, output: ?*kms.Out
         renderer.*.blurFirst = @ptrFromInt(*gpu.Buffer, record(compositor, @sizeOf(gpu.Buffer)))
         renderer.*.blurSecond = @ptrFromInt(*gpu.Buffer, record(compositor, @sizeOf(gpu.Buffer)))
         renderer.*.blurOps = @ptrFromInt(*gpu.Buffer, record(compositor, @sizeOf(gpu.Buffer)))
+        renderer.*.warp = @ptrFromInt(*gpu.Kernel, record(compositor, @sizeOf(gpu.Kernel)))
+        renderer.*.warpScratch = @ptrFromInt(*gpu.Buffer, record(compositor, @sizeOf(gpu.Buffer)))
+        renderer.*.warpGrid = @ptrFromInt(*gpu.Buffer, record(compositor, @sizeOf(gpu.Buffer)))
     }
     renderer.*.context = context
     renderer.*.blit = kernel
@@ -272,6 +295,21 @@ pub fn open(compositor: *Compositor, arguments: [][*]const u8, output: ?*kms.Out
         renderer.*.hasBlur = gpu.createDeviceBuffer(context, renderer.*.blurFirst, @intCast(u64, width * height * 4)) && gpu.createDeviceBuffer(context, renderer.*.blurSecond, @intCast(u64, width * height * 4)) && gpu.createUploadBuffer(context, renderer.*.blurOps, @intCast(u64, BLUR_SLOTS * shaders.BLUR_OPS * 5 * 4))
     }
     if !renderer.*.hasBlur { say("mlx-compositor: no blur in Vulkan (its pipeline or memory is missing); blurred surfaces are drawn as they are\n") }
+
+    // Wobbly windows: without the kernel or memory they are drawn flat.
+    renderer.*.hasWarp = false
+    renderer.*.warpSlot = 0
+    var warp_code: [*]u32 = undefined
+    const warp_words = shaders.buildWarpWords(allocator, &warp_code)
+    if warp_words != 0 && gpu.createKernel(context, renderer.*.warp, warp_code, warp_words, 3, shaders.WARP_WORDS) {
+        renderer.*.hasWarp = gpu.createDeviceBuffer(context, renderer.*.warpScratch, @intCast(u64, width * height * 4)) && gpu.createUploadBuffer(context, renderer.*.warpGrid, @intCast(u64, WARP_SLOTS * WARP_WORDS_PER_WINDOW * 4))
+    }
+    if !renderer.*.hasWarp { say("mlx-compositor: no wobbly windows in Vulkan (the warp pipeline or its memory is missing); windows are drawn flat\n") }
+    renderer.*.targetWidth = @intCast(u32, width)
+    renderer.*.targetHeight = @intCast(u32, height)
+    renderer.*.originX = 0
+    renderer.*.originY = 0
+    renderer.*.offscreen = false
 
     renderer.*.hasText = false
     if compositor.*.hasText {
@@ -712,9 +750,13 @@ fn upload(compositor: *Compositor, renderer: *Renderer, surface: *Surface, buffe
 fn blit(compositor: *Compositor, renderer: *Renderer, source: vk.Buffer, source_offset: u32, stride: u32, width: i32, height: i32, x: i32, y: i32, opaque: bool) -> void {
     if renderer.*.failed || width <= 0 || height <= 0 { return }
     var buffers: [2]vk.Buffer = [2]vk.Buffer{ source, renderer.*.target }
+    // Output coordinates into the target's (the scratch buffer's are
+    // shifted by its origin).
+    const ox = renderer.*.originX
+    const oy = renderer.*.originY
     const a = renderer.*.maskA
     const b = renderer.*.maskB
-    const push = shaders.Blit.{ .sourceWidth = @intCast(u32, width), .sourceHeight = @intCast(u32, height), .sourceStride = stride, .sourceOffset = source_offset, .targetWidth = @intCast(u32, compositor.*.width), .targetHeight = @intCast(u32, compositor.*.height), .targetX = @bitCast(u32, x), .targetY = @bitCast(u32, y), .flags = renderer.*.maskFlags | (if opaque { shaders.FLAG_OPAQUE } else { 0 }), .targetOffset = renderer.*.offset, .targetStride = renderer.*.stride, .shapeAX = @bitCast(u32, a.x), .shapeAY = @bitCast(u32, a.y), .shapeAWidth = @bitCast(u32, a.width), .shapeAHeight = @bitCast(u32, a.height), .shapeATop = @bitCast(u32, a.top), .shapeABottom = @bitCast(u32, a.bottom), .shapeBX = @bitCast(u32, b.x), .shapeBY = @bitCast(u32, b.y), .shapeBWidth = @bitCast(u32, b.width), .shapeBHeight = @bitCast(u32, b.height), .shapeBTop = @bitCast(u32, b.top), .shapeBBottom = @bitCast(u32, b.bottom) }
+    const push = shaders.Blit.{ .sourceWidth = @intCast(u32, width), .sourceHeight = @intCast(u32, height), .sourceStride = stride, .sourceOffset = source_offset, .targetWidth = renderer.*.targetWidth, .targetHeight = renderer.*.targetHeight, .targetX = @bitCast(u32, x - ox), .targetY = @bitCast(u32, y - oy), .flags = renderer.*.maskFlags | (if opaque { shaders.FLAG_OPAQUE } else { 0 }), .targetOffset = renderer.*.offset, .targetStride = renderer.*.stride, .shapeAX = @bitCast(u32, a.x - ox), .shapeAY = @bitCast(u32, a.y - oy), .shapeAWidth = @bitCast(u32, a.width), .shapeAHeight = @bitCast(u32, a.height), .shapeATop = @bitCast(u32, a.top), .shapeABottom = @bitCast(u32, a.bottom), .shapeBX = @bitCast(u32, b.x - ox), .shapeBY = @bitCast(u32, b.y - oy), .shapeBWidth = @bitCast(u32, b.width), .shapeBHeight = @bitCast(u32, b.height), .shapeBTop = @bitCast(u32, b.top), .shapeBBottom = @bitCast(u32, b.bottom) }
     const groups_x = gpu.groups(@intCast(u32, width), shaders.GROUP_SIZE)
     const groups_y = gpu.groups(@intCast(u32, height), shaders.GROUP_SIZE)
     unsafe {
@@ -755,10 +797,10 @@ fn drawTitle(compositor: *Compositor, renderer: *Renderer, surface: *const Surfa
     if !compositor.*.titleBars { return }
     if !renderer.*.hasText || renderer.*.failed { return }
     if !scene.layoutTitle(compositor, surface) { return }
-    const width = @intCast(u32, compositor.*.width)
-    const height = @intCast(u32, compositor.*.height)
+    const width = renderer.*.targetWidth
+    const height = renderer.*.targetHeight
     const whole = ui.rect(0, 0, @intCast(i32, width), @intCast(i32, height))
-    if !text_module.drawStrided(renderer.*.context, renderer.*.text, compositor.*.atlas, compositor.*.run, renderer.*.target, width, height, renderer.*.stride, renderer.*.offset, scene.titleTextX(surface), scene.titleTextY(surface), scene.TITLE_COLOR, whole) {
+    if !text_module.drawStrided(renderer.*.context, renderer.*.text, compositor.*.atlas, compositor.*.run, renderer.*.target, width, height, renderer.*.stride, renderer.*.offset, scene.titleTextX(surface) - renderer.*.originX, scene.titleTextY(surface) - renderer.*.originY, scene.TITLE_COLOR, whole) {
         renderer.*.failed = true
     }
 }
@@ -804,7 +846,8 @@ fn blurPassOnce(renderer: *Renderer, source: vk.Buffer, source_offset: u32, sour
 // and down BLUR_PASSES times in the scratch buffers, and copied back where
 // the region is.
 fn blurBehind(compositor: *Compositor, renderer: *Renderer, surface: *const Surface) -> void {
-    if !renderer.*.hasBlur || renderer.*.failed || renderer.*.blurSlot >= BLUR_SLOTS { return }
+    // Not into the scratch buffer of a bent window (nothing behind it there).
+    if !renderer.*.hasBlur || renderer.*.failed || renderer.*.offscreen || renderer.*.blurSlot >= BLUR_SLOTS { return }
     const area = ui.intersect(scene.blurBounds(surface), scene.outputRect(compositor))
     if ui.isEmpty(area) { return }
     const reach = scene.BLUR_REACH
@@ -866,6 +909,70 @@ fn drawTree(compositor: *Compositor, renderer: *Renderer, address: usize, depth:
     }
 }
 
+// A toplevel: its frame and title bar, then its surfaces, cut by its
+// rounded corners.
+fn drawWindow(compositor: *Compositor, renderer: *Renderer, address: usize, focused: bool) -> void {
+    const surface = state.surfaceAt(address)
+    drawDecoration(compositor, renderer, surface, focused)
+    renderer.*.maskFlags = shaders.FLAG_CLIP_CORNERS
+    renderer.*.maskA = scene.contentShape(surface)
+    drawTree(compositor, renderer, address, 0)
+    renderer.*.maskFlags = 0
+}
+
+// A wobbling toplevel (wobble.mlx): drawn flat into the scratch buffer (its
+// rest bounds at the buffer's top-left), then bent onto the frame by the
+// warp kernel. False when it cannot be (no kernel, too big, too many):
+// it is then drawn flat.
+fn drawBent(compositor: *Compositor, renderer: *Renderer, address: usize, focused: bool) -> bool {
+    if !renderer.*.hasWarp || renderer.*.failed || renderer.*.warpSlot >= WARP_SLOTS { return false }
+    const surface = state.surfaceAt(address)
+    const rest = scene.restBounds(surface)
+    if rest.width <= 0 || rest.height <= 0 { return false }
+    if @intCast(usize, rest.width) * @intCast(usize, rest.height) > compositor.*.width * compositor.*.height { return false }
+    const box = ui.intersect(scene.surfaceBounds(surface), scene.outputRect(compositor))
+    if ui.isEmpty(box) { return true }
+    const context = renderer.*.context
+    gpu.fillZero(context, renderer.*.warpScratch.*.buffer, @intCast(u64, rest.width) * @intCast(u64, rest.height) * 4)
+    const frame_target = renderer.*.target
+    const frame_offset = renderer.*.offset
+    const frame_stride = renderer.*.stride
+    renderer.*.target = renderer.*.warpScratch.*.buffer
+    renderer.*.offset = 0
+    renderer.*.stride = @intCast(u32, rest.width)
+    renderer.*.targetWidth = @intCast(u32, rest.width)
+    renderer.*.targetHeight = @intCast(u32, rest.height)
+    renderer.*.originX = rest.x
+    renderer.*.originY = rest.y
+    renderer.*.offscreen = true
+    drawWindow(compositor, renderer, address, focused)
+    renderer.*.target = frame_target
+    renderer.*.offset = frame_offset
+    renderer.*.stride = frame_stride
+    renderer.*.targetWidth = @intCast(u32, compositor.*.width)
+    renderer.*.targetHeight = @intCast(u32, compositor.*.height)
+    renderer.*.originX = 0
+    renderer.*.originY = 0
+    renderer.*.offscreen = false
+    if renderer.*.failed { return true }
+    // Its control points, then the bend.
+    const slot = renderer.*.warpSlot
+    renderer.*.warpSlot += 1
+    var words: [*]u32 = undefined
+    unsafe { words = @ptrFromInt([*]u32, renderer.*.warpGrid.*.address + slot * WARP_WORDS_PER_WINDOW * 4) }
+    var point: usize = 0
+    while point < WARP_WORDS_PER_WINDOW {
+        words[point] = @bitCast(u32, wobble.offset(surface, point))
+        point += 1
+    }
+    var buffers: [3]vk.Buffer = [3]vk.Buffer{ renderer.*.warpScratch.*.buffer, renderer.*.target, renderer.*.warpGrid.*.buffer }
+    const push = shaders.Warp.{ .targetWidth = @intCast(u32, compositor.*.width), .targetHeight = @intCast(u32, compositor.*.height), .targetOffset = renderer.*.offset, .targetStride = renderer.*.stride, .boxX = @bitCast(u32, box.x), .boxY = @bitCast(u32, box.y), .boxWidth = @intCast(u32, box.width), .boxHeight = @intCast(u32, box.height), .restX = @bitCast(u32, rest.x), .restY = @bitCast(u32, rest.y), .restWidth = @intCast(u32, rest.width), .restHeight = @intCast(u32, rest.height), .sourceStride = @intCast(u32, rest.width), .gridOffset = @intCast(u32, slot * WARP_WORDS_PER_WINDOW) }
+    unsafe {
+        if !gpu.dispatch(context, renderer.*.warp, @ptrCast([*]const vk.Buffer, &buffers), &push, gpu.groups(@intCast(u32, box.width), shaders.GROUP_SIZE), gpu.groups(@intCast(u32, box.height), shaders.GROUP_SIZE)) { renderer.*.failed = true }
+    }
+    return true
+}
+
 // Composes the whole output into frame slot `slot` (0 or 1: nested, the
 // host window's first or second buffer; freestanding, the dumb buffer) and
 // waits for it; false when Vulkan failed.
@@ -877,6 +984,12 @@ pub fn compose(compositor: *Compositor, slot: usize) -> bool {
     renderer.*.failed = false
     renderer.*.maskFlags = 0
     renderer.*.blurSlot = 0
+    renderer.*.warpSlot = 0
+    renderer.*.targetWidth = @intCast(u32, compositor.*.width)
+    renderer.*.targetHeight = @intCast(u32, compositor.*.height)
+    renderer.*.originX = 0
+    renderer.*.originY = 0
+    renderer.*.offscreen = false
     renderer.*.composed += 1
     if renderer.*.testFailure == 2 && renderer.*.composed == 3 { return false }
     if !gpu.begin(context) { return false }
@@ -889,13 +1002,11 @@ pub fn compose(compositor: *Compositor, slot: usize) -> bool {
         const address = state.listAt(compositor.*.stack, index)
         const surface = state.surfaceAt(address)
         if surface.*.role == state.ROLE_TOPLEVEL {
-            drawDecoration(compositor, renderer, surface, address == compositor.*.keyboardFocus)
-            // Its surfaces are cut by its rounded corners.
-            renderer.*.maskFlags = shaders.FLAG_CLIP_CORNERS
-            renderer.*.maskA = scene.contentShape(surface)
+            const focused = address == compositor.*.keyboardFocus
+            if !surface.*.wobbling || !drawBent(compositor, renderer, address, focused) { drawWindow(compositor, renderer, address, focused) }
+        } else {
+            drawTree(compositor, renderer, address, 0)
         }
-        drawTree(compositor, renderer, address, 0)
-        renderer.*.maskFlags = 0
         index += 1
     }
     if compositor.*.pointerInside {

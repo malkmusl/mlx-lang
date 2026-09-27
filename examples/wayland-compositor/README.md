@@ -376,12 +376,14 @@ fps-counter = on
 client-decorations = off
 # Windows' rounded corners in pixels (0 to 20; 0: square).
 corner-radius = 12
+# Moved windows wobble (with the Vulkan renderer).
+wobbly-windows = on
 ```
 
 [`examples/mlx-settings`](../mlx-settings/main.mlx) is a small window to
 change them: a row of colours for the border and switches for the title
-bars, the counter, rounded corners (12 pixels or square) and app
-decorations. It writes the file whole and renames it into place, so the
+bars, the counter, rounded corners (12 pixels or square), wobbly windows
+and app decorations. It writes the file whole and renames it into place, so the
 compositor never reads half of it. The launcher lists it as Settings.
 Without title bars, windows move with Alt+drag.
 
@@ -648,6 +650,24 @@ When the renderer cannot import a client's dma-buf, the log says which
 step failed (for example `vkGetMemoryFdPropertiesKHR refused the
 dma-buf`): a linear buffer is then copied by the CPU, a tiled one is not
 shown.
+
+### Wobbly windows
+
+A window being moved bends like jelly and swings back when let go, as
+Compiz's did ([`wobble.mlx`](wobble.mlx)). Its outline is a Bezier
+surface with 4x4 control points over everything it draws (frame, title
+bar, buffers). Neighbouring points pull on each other, every point back
+to its rest, friction settles them; the point nearest the grab stays
+under the pointer while the others lag behind. The springs step in fixed
+4 ms steps after every frame, in fixed point, and damage what the window
+covers until it is still (about a second).
+
+The Vulkan renderer draws a wobbling window flat into a scratch buffer
+and bends it onto the frame with the warp kernel
+(`examples/vulkan-shared/shaders.mlx`): each pixel finds the point of the
+window the surface carries onto it (three fixed-point iterations) and
+samples it bilinearly. The CPU renderer draws windows flat. The setting
+is `wobbly-windows` (on by default).
 
 ### Pointer lock
 

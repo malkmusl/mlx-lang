@@ -18,7 +18,20 @@
 //     FLAG_CLIP_CORNERS scales each pixel by A's coverage inside A's
 //     rectangle (rounded window corners; outside it, shadows, nothing
 //     changes), FLAG_RING by A's coverage minus B's (a window's frame).
-//     Coverage is the desktop canvas's: 4x4 samples in the corners.
+//     Coverage is the desktop canvas's: 4x4 samples in the corners. The
+//     target's alpha is blended too (it stays 255 over an opaque target),
+//     so an offscreen target keeps its transparency.
+//
+// warp (binding 0: source pixels, binding 1: destination pixels,
+//       binding 2: control points, push constants: Warp)
+//     Draws a window bent (wobbly windows): the source is the window drawn
+//     flat, its rest rectangle's size, rows `sourceStride` apart; 16
+//     control points (a 4x4 Bezier surface over the rest rectangle) at
+//     `gridOffset` in binding 2 give their offsets from rest in 1/16
+//     pixels, 16 x offsets then 16 y offsets (signed). Each pixel of the
+//     box finds the source point the surface carries onto it (three
+//     fixed-point iterations, s = p - offset(s)), samples it bilinearly
+//     and blends it over the target (premultiplied). Integers only.
 //
 // text (binding 0: glyph atlas, binding 1: glyph run, binding 2:
 //      destination pixels, push constants: Text)
@@ -165,6 +178,27 @@ pub const TEXT: u8 = 2
 pub const PAINT: u8 = 3
 pub const BLUR_PASS: u8 = 4
 pub const BLUR_MASK: u8 = 5
+pub const WARP: u8 = 6
+
+pub const Warp = struct {
+    targetWidth: u32
+    targetHeight: u32
+    targetOffset: u32
+    targetStride: u32
+    // The part of the target to cover, and the rest rectangle (signed).
+    boxX: u32
+    boxY: u32
+    boxWidth: u32
+    boxHeight: u32
+    restX: u32
+    restY: u32
+    restWidth: u32
+    restHeight: u32
+    sourceStride: u32
+    gridOffset: u32
+}
+
+pub const WARP_WORDS: u32 = 14
 
 // Types and variables shared by both shaders.
 const Common = struct {
@@ -287,6 +321,14 @@ fn pack(b: *builder.Builder, common: *const Common, red: u32, green: u32, blue: 
     const rg = op(b, spv.Op.bitwiseOr, common.*.uint, r, g)
     const rgb = op(b, spv.Op.bitwiseOr, common.*.uint, rg, blue)
     return op(b, spv.Op.bitwiseOr, common.*.uint, rgb, constant(b, common, 4278190080))
+}
+
+// alpha << 24 | red << 16 | green << 8 | blue
+fn packAlpha(b: *builder.Builder, common: *const Common, alpha: u32, red: u32, green: u32, blue: u32) -> u32 {
+    const a = op(b, spv.Op.shiftLeftLogical, common.*.uint, alpha, constant(b, common, 24))
+    const r = op(b, spv.Op.shiftLeftLogical, common.*.uint, red, constant(b, common, 16))
+    const g = op(b, spv.Op.shiftLeftLogical, common.*.uint, green, constant(b, common, 8))
+    return op(b, spv.Op.bitwiseOr, common.*.uint, op(b, spv.Op.bitwiseOr, common.*.uint, a, r), op(b, spv.Op.bitwiseOr, common.*.uint, g, blue))
 }
 
 fn finish(b: *builder.Builder, common: *const Common, main: u32) -> void {
@@ -417,7 +459,11 @@ pub fn buildBlit(b: *builder.Builder) -> void {
         blended[index] = select(b, common.uint, saturated, constant(b, &common, 255), sum)
         index += 1
     }
-    builder.store(b, target_pointer, pack(b, &common, blended[0], blended[1], blended[2]))
+    // The target's alpha likewise: 255 over an opaque target.
+    const kept_alpha = op(b, spv.Op.iAdd, common.uint, op(b, spv.Op.iMul, common.uint, channel(b, &common, target, 24), inverse), constant(b, &common, 127))
+    const alpha_sum = op(b, spv.Op.iAdd, common.uint, alpha, op(b, spv.Op.uDiv, common.uint, kept_alpha, constant(b, &common, 255)))
+    const out_alpha = select(b, common.uint, op(b, spv.Op.uGreaterThan, common.boolean, alpha_sum, constant(b, &common, 255)), constant(b, &common, 255), alpha_sum)
+    builder.store(b, target_pointer, packAlpha(b, &common, out_alpha, blended[0], blended[1], blended[2]))
     builder.branch(b, merge)
 
     const merge_label = builder.labelWith(b, merge)
@@ -1182,6 +1228,7 @@ pub fn buildBlurMaskWords(allocator: std.allocator.Allocator, result: *[*]u32) -
 // count (0 when out of memory). `which` is PATTERN, BLIT, TEXT, PAINT,
 // BLUR_PASS or BLUR_MASK.
 pub fn build(allocator: std.allocator.Allocator, which: u8, result: *[*]u32) -> usize {
+    if which == WARP { return buildWarpWords(allocator, result) }
     if which == PATTERN { return buildPatternWords(allocator, result) }
     if which == BLIT { return buildBlitWords(allocator, result) }
     if which == PAINT { return buildPaintWords(allocator, result) }
@@ -1223,4 +1270,199 @@ fn moduleWords(allocator: std.allocator.Allocator, b: *builder.Builder, result: 
     builder.writeWords(b, result.*)
     builder.deinit(b)
     return count
+}
+
+// ---------------------------------------------------------------------------
+// warp
+
+fn iconst(b: *builder.Builder, common: *const Common, value: i32) -> u32 { return intConstant(b, common, value) }
+
+fn iop(b: *builder.Builder, common: *const Common, opcode: spv.Op, left: u32, right: u32) -> u32 {
+    return op(b, opcode, common.*.int, left, right)
+}
+
+fn clampInt(b: *builder.Builder, common: *const Common, value: u32, low: u32, high: u32) -> u32 {
+    const raised = select(b, common.*.int, op(b, spv.Op.sLessThan, common.*.boolean, value, low), low, value)
+    return select(b, common.*.int, op(b, spv.Op.sGreaterThan, common.*.boolean, raised, high), high, raised)
+}
+
+// The four cubic Bernstein weights of t (0-1024) in 1/1024.
+fn bernstein(b: *builder.Builder, common: *const Common, t: u32, weights: *[4]u32) -> void {
+    const s = iop(b, common, spv.Op.iSub, iconst(b, common, 1024), t)
+    const shift = iconst(b, common, 20)
+    const three = iconst(b, common, 3)
+    const ss = iop(b, common, spv.Op.iMul, s, s)
+    const tt = iop(b, common, spv.Op.iMul, t, t)
+    weights.*[0] = iop(b, common, spv.Op.shiftRightArithmetic, iop(b, common, spv.Op.iMul, ss, s), shift)
+    weights.*[1] = iop(b, common, spv.Op.shiftRightArithmetic, iop(b, common, spv.Op.iMul, iop(b, common, spv.Op.iMul, three, t), ss), shift)
+    weights.*[2] = iop(b, common, spv.Op.shiftRightArithmetic, iop(b, common, spv.Op.iMul, iop(b, common, spv.Op.iMul, three, tt), s), shift)
+    weights.*[3] = iop(b, common, spv.Op.shiftRightArithmetic, iop(b, common, spv.Op.iMul, tt, t), shift)
+}
+
+// The surface's offset at point (x, y) (1/16 pixels, relative to the rest
+// rectangle's origin, which is `width` x `height` in 1/16 pixels): the
+// control points' offsets weighted along x in each row, then down.
+fn warpOffset(b: *builder.Builder, common: *const Common, x: u32, y: u32, width: u32, height: u32, offsets: *const [16]u32, out: *u32) -> void {
+    const zero = iconst(b, common, 0)
+    const full = iconst(b, common, 1024)
+    const u = clampInt(b, common, iop(b, common, spv.Op.sDiv, iop(b, common, spv.Op.iMul, x, full), width), zero, full)
+    const v = clampInt(b, common, iop(b, common, spv.Op.sDiv, iop(b, common, spv.Op.iMul, y, full), height), zero, full)
+    var across: [4]u32 = undefined
+    var down: [4]u32 = undefined
+    bernstein(b, common, u, &across)
+    bernstein(b, common, v, &down)
+    const ten = iconst(b, common, 10)
+    var total = zero
+    var row: usize = 0
+    while row < 4 {
+        var sum = zero
+        var column: usize = 0
+        while column < 4 {
+            sum = iop(b, common, spv.Op.iAdd, sum, iop(b, common, spv.Op.iMul, across[column], offsets.*[row * 4 + column]))
+            column += 1
+        }
+        const row_value = iop(b, common, spv.Op.shiftRightArithmetic, sum, ten)
+        total = iop(b, common, spv.Op.iAdd, total, iop(b, common, spv.Op.iMul, down[row], row_value))
+        row += 1
+    }
+    out.* = iop(b, common, spv.Op.shiftRightArithmetic, total, ten)
+}
+
+// Source pixel (x, y) (signed), 0 outside the width x height source.
+fn warpTexel(b: *builder.Builder, common: *const Common, x: u32, y: u32, width: u32, height: u32, stride: u32) -> u32 {
+    const zero = iconst(b, common, 0)
+    const in_x = op(b, spv.Op.logicalAnd, common.*.boolean, op(b, spv.Op.sGreaterThanEqual, common.*.boolean, x, zero), op(b, spv.Op.sLessThan, common.*.boolean, x, width))
+    const in_y = op(b, spv.Op.logicalAnd, common.*.boolean, op(b, spv.Op.sGreaterThanEqual, common.*.boolean, y, zero), op(b, spv.Op.sLessThan, common.*.boolean, y, height))
+    const inside = op(b, spv.Op.logicalAnd, common.*.boolean, in_x, in_y)
+    const index = iop(b, common, spv.Op.iAdd, iop(b, common, spv.Op.iMul, y, stride), x)
+    const safe = builder.unary(b, spv.Op.bitcast, common.*.uint, select(b, common.*.int, inside, index, zero))
+    const value = builder.load(b, common.*.uint, element(b, common, common.*.buffers[0], safe))
+    return select(b, common.*.uint, inside, value, common.*.zero)
+}
+
+pub fn buildWarp(b: *builder.Builder) -> void {
+    var common: Common = undefined
+    declare(b, &common, WARP_WORDS, 3)
+    const main = builder.function(b, common.voidType, spv.FUNCTION_CONTROL_NONE, common.functionType)
+    const entry = builder.label(b)
+    const id = builder.load(b, common.uvec3, common.globalId)
+    const x = builder.compositeExtract(b, common.uint, id, 0)
+    const y = builder.compositeExtract(b, common.uint, id, 1)
+    const target_width = pushWord(b, &common, 0)
+    const target_height = pushWord(b, &common, 1)
+    const target_offset = pushWord(b, &common, 2)
+    const target_stride = pushWord(b, &common, 3)
+    const box_x = signed(b, &common, pushWord(b, &common, 4))
+    const box_y = signed(b, &common, pushWord(b, &common, 5))
+    const box_width = pushWord(b, &common, 6)
+    const box_height = pushWord(b, &common, 7)
+    const rest_x = signed(b, &common, pushWord(b, &common, 8))
+    const rest_y = signed(b, &common, pushWord(b, &common, 9))
+    const rest_width = signed(b, &common, pushWord(b, &common, 10))
+    const rest_height = signed(b, &common, pushWord(b, &common, 11))
+    const source_stride = signed(b, &common, pushWord(b, &common, 12))
+    const grid_offset = pushWord(b, &common, 13)
+    const px = iop(b, &common, spv.Op.iAdd, box_x, signed(b, &common, x))
+    const py = iop(b, &common, spv.Op.iAdd, box_y, signed(b, &common, y))
+    const zero = iconst(b, &common, 0)
+    const in_box = op(b, spv.Op.logicalAnd, common.boolean, op(b, spv.Op.uLessThan, common.boolean, x, box_width), op(b, spv.Op.uLessThan, common.boolean, y, box_height))
+    const in_x = op(b, spv.Op.logicalAnd, common.boolean, op(b, spv.Op.sGreaterThanEqual, common.boolean, px, zero), op(b, spv.Op.sLessThan, common.boolean, px, signed(b, &common, target_width)))
+    const in_y = op(b, spv.Op.logicalAnd, common.boolean, op(b, spv.Op.sGreaterThanEqual, common.boolean, py, zero), op(b, spv.Op.sLessThan, common.boolean, py, signed(b, &common, target_height)))
+    const visible = op(b, spv.Op.logicalAnd, common.boolean, in_box, op(b, spv.Op.logicalAnd, common.boolean, in_x, in_y))
+    const body = builder.newId(b)
+    const merge = builder.newId(b)
+    builder.selectionMerge(b, merge)
+    builder.branchConditional(b, visible, body, merge)
+
+    const body_label = builder.labelWith(b, body)
+    var offsets_x: [16]u32 = undefined
+    var offsets_y: [16]u32 = undefined
+    var index: u32 = 0
+    while index < 16 {
+        offsets_x[index] = signed(b, &common, builder.load(b, common.uint, element(b, &common, common.buffers[2], op(b, spv.Op.iAdd, common.uint, grid_offset, constant(b, &common, index)))))
+        offsets_y[index] = signed(b, &common, builder.load(b, common.uint, element(b, &common, common.buffers[2], op(b, spv.Op.iAdd, common.uint, grid_offset, constant(b, &common, index + 16)))))
+        index += 1
+    }
+    // In 1/16 pixels, relative to the rest rectangle: the pixel's centre,
+    // and the rectangle's size.
+    const sixteen = iconst(b, &common, 16)
+    const px16 = iop(b, &common, spv.Op.iSub, iop(b, &common, spv.Op.iAdd, iop(b, &common, spv.Op.iMul, px, sixteen), iconst(b, &common, 8)), iop(b, &common, spv.Op.iMul, rest_x, sixteen))
+    const py16 = iop(b, &common, spv.Op.iSub, iop(b, &common, spv.Op.iAdd, iop(b, &common, spv.Op.iMul, py, sixteen), iconst(b, &common, 8)), iop(b, &common, spv.Op.iMul, rest_y, sixteen))
+    const width16 = iop(b, &common, spv.Op.iMul, rest_width, sixteen)
+    const height16 = iop(b, &common, spv.Op.iMul, rest_height, sixteen)
+    // s = p - offset(s), three times from s = p.
+    var sx = px16
+    var sy = py16
+    var round: u32 = 0
+    while round < 3 {
+        var offset_x: u32 = 0
+        var offset_y: u32 = 0
+        warpOffset(b, &common, sx, sy, width16, height16, &offsets_x, &offset_x)
+        warpOffset(b, &common, sx, sy, width16, height16, &offsets_y, &offset_y)
+        sx = iop(b, &common, spv.Op.iSub, px16, offset_x)
+        sy = iop(b, &common, spv.Op.iSub, py16, offset_y)
+        round += 1
+    }
+    // Bilinear: the pixel centres around (sx, sy).
+    const centred_x = iop(b, &common, spv.Op.iSub, sx, iconst(b, &common, 8))
+    const centred_y = iop(b, &common, spv.Op.iSub, sy, iconst(b, &common, 8))
+    const four = iconst(b, &common, 4)
+    const fifteen = iconst(b, &common, 15)
+    const ix = iop(b, &common, spv.Op.shiftRightArithmetic, centred_x, four)
+    const iy = iop(b, &common, spv.Op.shiftRightArithmetic, centred_y, four)
+    const fx = builder.unary(b, spv.Op.bitcast, common.uint, iop(b, &common, spv.Op.bitwiseAnd, centred_x, fifteen))
+    const fy = builder.unary(b, spv.Op.bitcast, common.uint, iop(b, &common, spv.Op.bitwiseAnd, centred_y, fifteen))
+    const one = iconst(b, &common, 1)
+    const ix1 = iop(b, &common, spv.Op.iAdd, ix, one)
+    const iy1 = iop(b, &common, spv.Op.iAdd, iy, one)
+    const c00 = warpTexel(b, &common, ix, iy, rest_width, rest_height, source_stride)
+    const c10 = warpTexel(b, &common, ix1, iy, rest_width, rest_height, source_stride)
+    const c01 = warpTexel(b, &common, ix, iy1, rest_width, rest_height, source_stride)
+    const c11 = warpTexel(b, &common, ix1, iy1, rest_width, rest_height, source_stride)
+    const u16 = constant(b, &common, 16)
+    const gx = op(b, spv.Op.iSub, common.uint, u16, fx)
+    const gy = op(b, spv.Op.iSub, common.uint, u16, fy)
+    const w00 = op(b, spv.Op.iMul, common.uint, gx, gy)
+    const w10 = op(b, spv.Op.iMul, common.uint, fx, gy)
+    const w01 = op(b, spv.Op.iMul, common.uint, gx, fy)
+    const w11 = op(b, spv.Op.iMul, common.uint, fx, fy)
+    var sampled: [4]u32 = [4]u32{ 0, 0, 0, 0 }
+    index = 0
+    while index < 4 {
+        const shift = 24 - index * 8
+        var sum = op(b, spv.Op.iMul, common.uint, channel(b, &common, c00, shift), w00)
+        sum = op(b, spv.Op.iAdd, common.uint, sum, op(b, spv.Op.iMul, common.uint, channel(b, &common, c10, shift), w10))
+        sum = op(b, spv.Op.iAdd, common.uint, sum, op(b, spv.Op.iMul, common.uint, channel(b, &common, c01, shift), w01))
+        sum = op(b, spv.Op.iAdd, common.uint, sum, op(b, spv.Op.iMul, common.uint, channel(b, &common, c11, shift), w11))
+        sampled[index] = op(b, spv.Op.shiftRightLogical, common.uint, op(b, spv.Op.iAdd, common.uint, sum, constant(b, &common, 128)), constant(b, &common, 8))
+        index += 1
+    }
+    // Over the target, premultiplied (as the blit shader blends).
+    const target_index = op(b, spv.Op.iAdd, common.uint, target_offset, op(b, spv.Op.iAdd, common.uint, op(b, spv.Op.iMul, common.uint, builder.unary(b, spv.Op.bitcast, common.uint, py), target_stride), builder.unary(b, spv.Op.bitcast, common.uint, px)))
+    const target_pointer = element(b, &common, common.buffers[1], target_index)
+    const target = builder.load(b, common.uint, target_pointer)
+    const inverse = op(b, spv.Op.iSub, common.uint, constant(b, &common, 255), sampled[0])
+    var blended: [4]u32 = [4]u32{ 0, 0, 0, 0 }
+    index = 0
+    while index < 4 {
+        const shift = 24 - index * 8
+        const kept = op(b, spv.Op.iAdd, common.uint, op(b, spv.Op.iMul, common.uint, channel(b, &common, target, shift), inverse), constant(b, &common, 127))
+        const sum = op(b, spv.Op.iAdd, common.uint, sampled[index], op(b, spv.Op.uDiv, common.uint, kept, constant(b, &common, 255)))
+        blended[index] = select(b, common.uint, op(b, spv.Op.uGreaterThan, common.boolean, sum, constant(b, &common, 255)), constant(b, &common, 255), sum)
+        index += 1
+    }
+    builder.store(b, target_pointer, packAlpha(b, &common, blended[0], blended[1], blended[2], blended[3]))
+    builder.branch(b, merge)
+
+    const merge_label = builder.labelWith(b, merge)
+    builder.returnVoid(b)
+    builder.functionEnd(b)
+    finish(b, &common, main)
+}
+
+pub fn buildWarpWords(allocator: std.allocator.Allocator, result: *[*]u32) -> usize {
+    var b: builder.Builder = undefined
+    builder.init(&b, allocator, spv.version(1, 3))
+    buildWarp(&b)
+    return moduleWords(allocator, &b, result)
 }
