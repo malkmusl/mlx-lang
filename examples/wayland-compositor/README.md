@@ -667,6 +667,31 @@ step failed (for example `vkGetMemoryFdPropertiesKHR refused the
 dma-buf`): a linear buffer is then copied by the CPU, a tiled one is not
 shown.
 
+### Window states and hotkeys
+
+Windows can be maximized (the work area, square corners), fullscreen (the
+whole output, no frame or title bar, above docks and panels, below the
+launcher) and minimized (hidden until focused again, for example from the
+dock). Clients ask through xdg_toplevel (Firefox's F11, a video player),
+docks through foreign-toplevel handles; double-clicking a title bar
+toggles maximize, and dragging a maximized window's title bar restores it
+under the pointer. Toplevels are told they may do all three
+(wm_capabilities).
+
+Hotkeys come from the settings file (`key-*`, names as in
+[`keys.mlx`](../desktop-shared/keys.mlx); `none` unbinds):
+
+```
+key-maximize = Super+Up
+key-minimize = Super+Down
+key-fullscreen = Super+F
+key-close = Alt+F4
+key-terminal = Alt+Return
+key-switch = Alt+Tab
+```
+
+Alt+Shift+Q (quit) and Ctrl+Alt+F<n> (switch VT, freestanding) stay fixed.
+
 ### Wobbly windows
 
 A window being moved bends like jelly and swings back when let go, as
