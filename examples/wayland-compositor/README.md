@@ -335,6 +335,29 @@ nested variants of the session as a display manager would, with cage and
 with weston on their headless backends: the compositor must come up at the
 host monitor's resolution with the session's keyboard layout.
 
+## Settings
+
+`~/.config/mlx/compositor.conf` (`$XDG_CONFIG_HOME/mlx/compositor.conf`)
+changes the running compositor: it reads the file at start and again
+within half a second whenever it changes ([`settings.mlx`](settings.mlx)).
+One setting per line, lines starting with `#` are comments:
+
+```
+# The focused window's frame and title bar, and the other windows'.
+border-color = #5aa0ff
+inactive-border-color = #505060
+# off: windows have only their frame.
+title-bars = on
+# Frames per second in the title bars.
+fps-counter = on
+```
+
+[`examples/mlx-settings`](../mlx-settings/main.mlx) is a small window to
+change them: a row of colours for the border and switches for the title
+bars and the counter. It writes the file whole and renames it into place,
+so the compositor never reads half of it. The launcher lists it as
+Settings. Without title bars, windows move with Alt+drag.
+
 ## Drawing only what changed
 
 Every change to the scene reports the area it covers (a window moved,

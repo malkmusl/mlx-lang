@@ -109,12 +109,12 @@ if [[ $mode == install ]]; then
     fi
     echo
     echo "== Installed files"
-    ls -l "$bindir"/mlx-compositor "$bindir"/mlx-terminal "$bindir"/mlx-session "$bindir"/mlx-dock "$bindir"/mlx-launcher "$sessions"/mlx-compositor.desktop 2>&1
+    ls -l "$bindir"/mlx-compositor "$bindir"/mlx-terminal "$bindir"/mlx-session "$bindir"/mlx-dock "$bindir"/mlx-launcher "$bindir"/mlx-settings "$sessions"/mlx-compositor.desktop 2>&1
     echo
 fi
 
 echo "== The installation"
-for program in mlx-compositor mlx-terminal mlx-session mlx-dock mlx-launcher; do
+for program in mlx-compositor mlx-terminal mlx-session mlx-dock mlx-launcher mlx-settings; do
     if [[ -x "$bindir/$program" ]]; then
         ok "$bindir/$program"
     else
@@ -151,7 +151,7 @@ if [[ -n "$found" ]]; then
     if [[ "$found" == "$bindir/mlx-compositor" ]]; then
         ok "mlx-compositor is on PATH ($found)"
     else
-        note "PATH finds another mlx-compositor first: $found (the session uses $bindir/mlx-compositor); an earlier install: remove it with sudo rm $(dirname "$found")/mlx-{compositor,terminal,session,dock,launcher}"
+        note "PATH finds another mlx-compositor first: $found (the session uses $bindir/mlx-compositor); an earlier install: remove it with sudo rm $(dirname "$found")/mlx-{compositor,terminal,session,dock,launcher,settings}"
     fi
 else
     note "$bindir is not on this shell's PATH (the session does not need it: its entry uses absolute paths)"

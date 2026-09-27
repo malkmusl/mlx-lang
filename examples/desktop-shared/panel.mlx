@@ -75,6 +75,15 @@ pub const Panel = struct {
     layerShell: wl.zwlr_layer_shell_v1.Proxy
     effects: wl.ext_background_effect_manager_v1.Proxy
     windowManager: wl.zwlr_foreign_toplevel_manager_v1.Proxy
+    wmBase: wl.xdg_wm_base.Proxy
+    hasWmBase: bool
+    // A window (openWindow) instead of a layer surface: its xdg_surface and
+    // xdg_toplevel, and the size the compositor asked for (0: ours).
+    isWindow: bool
+    xdgSurface: wl.xdg_surface.Proxy
+    toplevel: wl.xdg_toplevel.Proxy
+    wantedWidth: i32
+    wantedHeight: i32
     hasCompositor: bool
     hasShm: bool
     hasSeat: bool
@@ -187,6 +196,10 @@ fn onRegistry(context: *anyopaque, event: wl.client.Event) -> void {
         panel.*.effects = wl.ext_background_effect_manager_v1.Proxy.fromObject(registry.bind(global.name, wl.Interface.ext_background_effect_manager_v1, 1))
         panel.*.effects.setHandler(onEffects, context)
         panel.*.hasEffects = true
+    } else if isNamed(global.interface, "xdg_wm_base") {
+        panel.*.wmBase = wl.xdg_wm_base.Proxy.fromObject(registry.bind(global.name, wl.Interface.xdg_wm_base, smaller(global.version, 2)))
+        panel.*.wmBase.setHandler(onWmBase, context)
+        panel.*.hasWmBase = true
     } else if isNamed(global.interface, "zwlr_foreign_toplevel_manager_v1") && panel.*.wantWindows {
         panel.*.windowManager = wl.zwlr_foreign_toplevel_manager_v1.Proxy.fromObject(registry.bind(global.name, wl.Interface.zwlr_foreign_toplevel_manager_v1, smaller(global.version, 3)))
         panel.*.windowManager.setHandler(onWindowManager, context)
@@ -390,6 +403,34 @@ fn onLayerSurface(context: *anyopaque, event: wl.client.Event) -> void {
     }
 }
 
+fn onWmBase(context: *anyopaque, event: wl.client.Event) -> void {
+    const decoded = wl.xdg_wm_base.decodeEvent(event)
+    panelOf(context).*.wmBase.pong(decoded.ping.serial)
+}
+
+fn onXdgSurface(context: *anyopaque, event: wl.client.Event) -> void {
+    const panel = panelOf(context)
+    const decoded = wl.xdg_surface.decodeEvent(event)
+    if panel.*.wantedWidth > 0 { panel.*.width = @intCast(usize, panel.*.wantedWidth) }
+    if panel.*.wantedHeight > 0 { panel.*.height = @intCast(usize, panel.*.wantedHeight) }
+    panel.*.xdgSurface.ackConfigure(decoded.configure.serial)
+    panel.*.configured = true
+    panel.*.dirty = true
+    panel.*.event(panel.*.context, EVENT_CONFIGURED, 0, 0)
+}
+
+fn onToplevel(context: *anyopaque, event: wl.client.Event) -> void {
+    const panel = panelOf(context)
+    const decoded = wl.xdg_toplevel.decodeEvent(event)
+    if event.opcode == wl.xdg_toplevel.EVENT_CONFIGURE {
+        panel.*.wantedWidth = decoded.configure.width
+        panel.*.wantedHeight = decoded.configure.height
+    } else if event.opcode == wl.xdg_toplevel.EVENT_CLOSE {
+        panel.*.running = false
+        panel.*.event(panel.*.context, EVENT_CLOSED, 0, 0)
+    }
+}
+
 fn onBuffer(context: *anyopaque, event: wl.client.Event) -> void {
     const panel = panelOf(context)
     if event.object.id == panel.*.buffers[0].id() { panel.*.busy[0] = false }
@@ -400,11 +441,12 @@ fn onFrame(context: *anyopaque, event: wl.client.Event) -> void {
     panelOf(context).*.framePending = false
 }
 
-const Failure = error { NoCompositor, NoLayerShell, NoMemory }
+const Failure = error { NoCompositor, NoLayerShell, NoWindows, NoMemory }
 
 fn noCompositor() -> Failure!void { return Failure.NoCompositor }
 fn noLayerShell() -> Failure!void { return Failure.NoLayerShell }
 fn noMemory() -> Failure!void { return Failure.NoMemory }
+fn noWindows() -> Failure!void { return Failure.NoWindows }
 
 // Connects and asks for a layer surface `namespace` in `layer`, anchored at
 // `anchor` (state.ANCHOR_* bits), `width` x `height` (0: stretched between
@@ -412,7 +454,54 @@ fn noMemory() -> Failure!void { return Failure.NoMemory }
 // keyboard interactivity (0 none, 1 exclusive, 2 on demand). `windows`:
 // follow the compositor's windows.
 pub fn open(panel: *Panel, allocator: Allocator, namespace: []const u8, layer: u32, anchor: u32, width: u32, height: u32, zone: i32, margin: i32, keyboard: u32, windows: bool) -> !void {
+    try connect(panel, allocator, width, height, windows)
+    if !panel.*.hasLayerShell { return noLayerShell() }
+    const display = panel.*.display
+    panel.*.surface = panel.*.compositor.createSurface()
+    panel.*.layerSurface = panel.*.layerShell.getLayerSurface(panel.*.surface, null, layer, namespace)
+    panel.*.layerSurface.setHandler(onLayerSurface, contextOf(panel))
+    panel.*.hasSurface = true
+    panel.*.layerSurface.setSize(@intCast(u32, panel.*.width), @intCast(u32, panel.*.height))
+    panel.*.layerSurface.setAnchor(anchor)
+    panel.*.layerSurface.setExclusiveZone(zone)
+    panel.*.layerSurface.setMargin(margin, margin, margin, margin)
+    panel.*.layerSurface.setKeyboardInteractivity(keyboard)
+    if panel.*.hasEffects {
+        panel.*.effect = panel.*.effects.getBackgroundEffect(panel.*.surface)
+        panel.*.hasEffect = true
+    }
+    panel.*.surface.commit()
+    try display.roundtrip()
+}
+
+// Connects and opens an ordinary window (xdg_toplevel) titled `title` with
+// app id `app_id`, `width` x `height` unless the compositor asks for
+// another size.
+pub fn openWindow(panel: *Panel, allocator: Allocator, title: []const u8, app_id: []const u8, width: u32, height: u32) -> !void {
+    try connect(panel, allocator, width, height, false)
+    if !panel.*.hasWmBase { return noWindows() }
+    const display = panel.*.display
+    panel.*.isWindow = true
+    panel.*.surface = panel.*.compositor.createSurface()
+    panel.*.xdgSurface = panel.*.wmBase.getXdgSurface(panel.*.surface)
+    panel.*.xdgSurface.setHandler(onXdgSurface, contextOf(panel))
+    panel.*.toplevel = panel.*.xdgSurface.getToplevel()
+    panel.*.toplevel.setHandler(onToplevel, contextOf(panel))
+    panel.*.toplevel.setTitle(title)
+    panel.*.toplevel.setAppId(app_id)
+    panel.*.toplevel.setMinSize(@intCast(i32, width), @intCast(i32, height))
+    panel.*.hasSurface = true
+    panel.*.surface.commit()
+    try display.roundtrip()
+}
+
+// The connection, its globals and the panel's state.
+fn connect(panel: *Panel, allocator: Allocator, width: u32, height: u32, windows: bool) -> !void {
     panel.*.allocator = allocator
+    panel.*.hasWmBase = false
+    panel.*.isWindow = false
+    panel.*.wantedWidth = 0
+    panel.*.wantedHeight = 0
     panel.*.hasCompositor = false
     panel.*.hasShm = false
     panel.*.hasSeat = false
@@ -455,23 +544,6 @@ pub fn open(panel: *Panel, allocator: Allocator, namespace: []const u8, layer: u
     panel.*.registry.setHandler(onRegistry, contextOf(panel))
     try display.roundtrip()
     if !panel.*.hasCompositor || !panel.*.hasShm { return noCompositor() }
-    if !panel.*.hasLayerShell { return noLayerShell() }
-    try display.roundtrip()
-
-    panel.*.surface = panel.*.compositor.createSurface()
-    panel.*.layerSurface = panel.*.layerShell.getLayerSurface(panel.*.surface, null, layer, namespace)
-    panel.*.layerSurface.setHandler(onLayerSurface, contextOf(panel))
-    panel.*.hasSurface = true
-    panel.*.layerSurface.setSize(@intCast(u32, panel.*.width), @intCast(u32, panel.*.height))
-    panel.*.layerSurface.setAnchor(anchor)
-    panel.*.layerSurface.setExclusiveZone(zone)
-    panel.*.layerSurface.setMargin(margin, margin, margin, margin)
-    panel.*.layerSurface.setKeyboardInteractivity(keyboard)
-    if panel.*.hasEffects {
-        panel.*.effect = panel.*.effects.getBackgroundEffect(panel.*.surface)
-        panel.*.hasEffect = true
-    }
-    panel.*.surface.commit()
     try display.roundtrip()
 }
 
@@ -480,12 +552,17 @@ pub fn resize(panel: *Panel, width: u32, height: u32) -> void {
     panel.*.width = @intCast(usize, width)
     panel.*.height = @intCast(usize, height)
     if !panel.*.hasSurface { return }
+    if panel.*.isWindow {
+        // A window picks its own size: drawn at it with the next frame.
+        panel.*.dirty = true
+        return
+    }
     panel.*.layerSurface.setSize(@intCast(u32, panel.*.width), @intCast(u32, panel.*.height))
     panel.*.surface.commit()
 }
 
 pub fn setExclusiveZone(panel: *Panel, zone: i32) -> void {
-    if !panel.*.hasSurface { return }
+    if !panel.*.hasSurface || panel.*.isWindow { return }
     panel.*.layerSurface.setExclusiveZone(zone)
 }
 
@@ -645,7 +722,12 @@ pub fn close(panel: *Panel) -> void {
     const display = panel.*.display
     if !display.running() { return }
     if panel.*.hasEffect { panel.*.effect.destroy() }
-    panel.*.layerSurface.destroy()
+    if panel.*.isWindow {
+        panel.*.toplevel.destroy()
+        panel.*.xdgSurface.destroy()
+    } else {
+        panel.*.layerSurface.destroy()
+    }
     panel.*.surface.destroy()
     const flushed = display.flush()
     display.disconnect()

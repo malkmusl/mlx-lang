@@ -11,7 +11,8 @@
 #
 # Installs:
 #   PREFIX/bin/mlx-compositor, PREFIX/bin/mlx-terminal, PREFIX/bin/mlx-session,
-#   PREFIX/bin/mlx-dock, PREFIX/bin/mlx-launcher
+#   PREFIX/bin/mlx-dock, PREFIX/bin/mlx-launcher, PREFIX/bin/mlx-settings
+#   PREFIX/share/applications/mlx-settings.desktop  (the launcher lists it)
 #   SESSIONS/mlx-compositor.desktop   (read by GDM and SDDM)
 #   ~/.local/lib/mlx-compositor/libmlx-shell.so, libmlx-render.so (for the
 #   user running this; the session loads them, and loads them again when
@@ -54,7 +55,8 @@ while [[ $# -gt 0 ]]; do
 done
 
 bindir="$prefix/bin"
-programs=(mlx-compositor mlx-terminal mlx-session mlx-dock mlx-launcher)
+programs=(mlx-compositor mlx-terminal mlx-session mlx-dock mlx-launcher mlx-settings)
+applications="$prefix/share/applications"
 
 # Runs a command with sudo when the target is not writable by us.
 as_owner() {
@@ -76,6 +78,8 @@ if [[ $uninstall -eq 1 ]]; then
     done
     path="$destdir$sessions/mlx-compositor.desktop"
     [[ -e "$path" ]] && as_owner "$path" rm -f -- "$path" && echo "removed $path"
+    path="$destdir$applications/mlx-settings.desktop"
+    [[ -e "$path" ]] && as_owner "$path" rm -f -- "$path" && echo "removed $path"
     exit 0
 fi
 
@@ -91,15 +95,19 @@ echo "building with $compiler"
 "$compiler" --quiet examples/wayland-terminal/main.mlx -o "$build/mlx-terminal"
 "$compiler" --quiet examples/mlx-dock/main.mlx -o "$build/mlx-dock"
 "$compiler" --quiet examples/mlx-launcher/main.mlx -o "$build/mlx-launcher"
+"$compiler" --quiet examples/mlx-settings/main.mlx -o "$build/mlx-settings"
+sed "s|@BINDIR@|$bindir|g" examples/mlx-settings/mlx-settings.desktop.in > "$build/mlx-settings.desktop"
 sed "s|@BINDIR@|$bindir|g" examples/wayland-compositor/session/mlx-compositor.desktop.in > "$build/mlx-compositor.desktop"
-echo "built $build/mlx-compositor, mlx-terminal, mlx-dock and mlx-launcher"
+echo "built $build/mlx-compositor, mlx-terminal, mlx-dock, mlx-launcher and mlx-settings"
 [[ $build_only -eq 1 ]] && exit 0
 
 # Install.
 as_owner "$destdir$bindir" install -d "$destdir$bindir"
-as_owner "$destdir$bindir" install -m 755 "$build/mlx-compositor" "$build/mlx-terminal" "$build/mlx-dock" "$build/mlx-launcher" examples/wayland-compositor/session/mlx-session "$destdir$bindir/"
+as_owner "$destdir$bindir" install -m 755 "$build/mlx-compositor" "$build/mlx-terminal" "$build/mlx-dock" "$build/mlx-launcher" "$build/mlx-settings" examples/wayland-compositor/session/mlx-session "$destdir$bindir/"
 as_owner "$destdir$sessions" install -d "$destdir$sessions"
 as_owner "$destdir$sessions" install -m 644 "$build/mlx-compositor.desktop" "$destdir$sessions/"
+as_owner "$destdir$applications" install -d "$destdir$applications"
+as_owner "$destdir$applications" install -m 644 "$build/mlx-settings.desktop" "$destdir$applications/"
 for program in "${programs[@]}"; do echo "installed $destdir$bindir/$program"; done
 echo "installed $destdir$sessions/mlx-compositor.desktop"
 # The shell and renderer modules, for the user running this (not when
