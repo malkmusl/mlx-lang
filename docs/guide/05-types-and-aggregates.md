@@ -78,10 +78,11 @@ fn main() u8 {
 
 (`tests/88_lvalue_assignment_runtime.mlx`)
 
-Structs and arrays are values. A `var` initialized from another value and a
-value assigned to a variable are copies, so changing them leaves the
-original alone, whether it came from a local, a call, a field reached
-through a pointer or an array element:
+Structs and arrays are values. A `var` or `const` initialized from another
+value and a value assigned to a variable are copies, so changing them, or
+later changing what they were made from, leaves the other alone, whether
+it came from a local, a call, a field reached through a pointer or an
+array element:
 
 ```mlx
 var s = S.{ .p = P.{ .x = 1, .y = 2 }, .n = 0 }
@@ -90,14 +91,17 @@ field.x = 3          // s.p.x is still 1
 var h = make(7)
 h = a
 h.x = 1              // a.x is unchanged
+const copy = slots.*[index]
+slots.*[index] = P.{ .x = 0, .y = 0 }   // copy still holds the old element
 ```
 
 (`tests/265_aggregate_value_copy_runtime.mlx`; sizes that are not a
 multiple of 8 in `tests/266_mem_copy_sizes_runtime.mlx`). A literal is not copied
-again: it is built in the variable's own storage. A `const` binding of an
-existing aggregate is not copied either; it cannot be changed through its
-name, but in the bootstrap compiler it still reads the original's storage,
-so it sees later changes made to the original.
+again: it is built in the variable's own storage, and an array literal
+holds its elements' bytes, so `[3]P{ make(1), make(2), make(3) }` copies each
+call's result into the array. A `const` local's copy lives in the
+function's frame; returning it, a field or element of it, a slice into it,
+or what a call given it returns, copies the value out of the frame first.
 
 Struct layout/reflection builtins:
 

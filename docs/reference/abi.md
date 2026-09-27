@@ -234,6 +234,18 @@ runtime's `__mlx_mem_copy` (x0 = destination, x1 = source, x2 = byte count;
 that are not a multiple of 8 copy exactly
 (`tests/266_mem_copy_sizes_runtime.mlx`).
 
+Where a copy lives depends on who owns it. Aggregate literals, `var` copies
+and assignment copies come from the aggregate arena (an `alloca` with a
+byte count), which is never freed, so a function can return such storage
+by address. A `const` local's copy is a region of the function's frame
+instead (the same `alloca` with `arg1 == 1`): the frame-size estimate adds
+its bytes, and nothing of it may be handed back by address. `return`
+therefore copies a value that may be, or lie inside, a `const` local's
+frame storage into the arena first, including what a call given such a
+local returns (a callee may return its parameter's storage), and rebases a
+slice into one onto an arena copy of the whole local
+(`tests/265_aggregate_value_copy_runtime.mlx`).
+
 A 20-byte array exceeds the 16-byte register-return threshold, so it returns
 through caller-owned hidden memory instead:
 

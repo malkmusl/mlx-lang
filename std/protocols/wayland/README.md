@@ -10,6 +10,9 @@ build inputs; applications only `@import("std.wayland")`.
 | `xdg-shell.xml` | wayland-protocols 1.49, `stable/xdg-shell/xdg-shell.xml` |
 | `linux-dmabuf-v1.xml` | wayland-protocols 1.49, `stable/linux-dmabuf/linux-dmabuf-v1.xml` |
 | `ext-background-effect-v1.xml` | wayland-protocols 1.49, `staging/ext-background-effect/ext-background-effect-v1.xml` |
+| `ext-foreign-toplevel-list-v1.xml` | wayland-protocols 1.49, `staging/ext-foreign-toplevel-list/ext-foreign-toplevel-list-v1.xml` |
+| `ext-image-capture-source-v1.xml` | wayland-protocols 1.49, `staging/ext-image-capture-source/ext-image-capture-source-v1.xml` |
+| `ext-image-copy-capture-v1.xml` | wayland-protocols 1.49, `staging/ext-image-copy-capture/ext-image-copy-capture-v1.xml` |
 | `wlr-layer-shell-unstable-v1.xml` | wlr-protocols bf4fc79a, `unstable/wlr-layer-shell-unstable-v1.xml` |
 | `wlr-foreign-toplevel-management-unstable-v1.xml` | wlr-protocols bf4fc79a, `unstable/wlr-foreign-toplevel-management-unstable-v1.xml` |
 | `xdg-decoration-unstable-v1.xml` | wayland-protocols 1.49, `unstable/xdg-decoration/xdg-decoration-unstable-v1.xml` |

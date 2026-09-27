@@ -38,6 +38,9 @@ pub const Binding = struct {
     componentCount: usize
     directValue: bool
     dropFlagAddress: usize
+    // The aggregate's storage is a region of the frame (a `const` local's
+    // copy), gone once the function returns.
+    frameStorage: bool
 }
 
 const GenericArgument = struct {
@@ -674,6 +677,7 @@ fn pushBinding(builder: *LirBuilder, name_ptr: [*]const u8, name_len: usize, add
         .componentCount = component_count,
         .directValue = false,
         .dropFlagAddress = lir.NONE,
+        .frameStorage = false,
     }
     unsafe {
         const appended = vector.Vector.appendAt(bindingsPointer(builder), @ptrCast([*]const u8, &b))
@@ -698,6 +702,7 @@ fn pushBindingComponents(builder: *LirBuilder, name_ptr: [*]const u8, name_len: 
         .componentCount = component_count,
         .directValue = false,
         .dropFlagAddress = lir.NONE,
+        .frameStorage = false,
     }
     unsafe { const appended = vector.Vector.appendAt(bindingsPointer(builder), @ptrCast([*]const u8, &binding)) }
 }
@@ -1250,7 +1255,7 @@ fn lowerNode(builder: *LirBuilder, node_index: usize) -> usize {
         return lowerBuiltin(builder, node_index)
     }
     if n.tag == ast.Tag.return_statement {
-        const val = narrowFloat(builder, lowerNode(builder, n.rhs), builder.*.currentReturnType)
+        const val = returnedValue(builder, n.rhs, narrowFloat(builder, lowerNode(builder, n.rhs), builder.*.currentReturnType))
         emitDefersTo(builder, 0)
         if builder.*.currentReturnType != lir.NONE {
             const return_type = types_store.Store.get(builder.*.typeStore, builder.*.currentReturnType)
@@ -1610,11 +1615,9 @@ fn lowerArrayLiteral(builder: *LirBuilder, node_index: usize) -> usize {
         address_inst.arg1 = index_value
         address_inst.arg2 = stride
         const address = lir.addInst(builder.*.lir, address_inst)
-        var store = lir.initInst(lir.Opcode.store, element_type)
-        store.arg0 = address
-        store.arg1 = lowerNode(builder, child)
-        store.arg2 = storageWidth(builder, element_type)
-        lir.addInst(builder.*.lir, store)
+        // An element of struct or array type is held by address and copied
+        // into the array; a plain store would keep the address instead.
+        storeAggregateValue(builder, address, lowerNode(builder, child), element_type)
         child = child_node.next
         index += 1
     }
@@ -3711,12 +3714,14 @@ fn isFreshAggregate(builder: *LirBuilder, node_index: usize) -> bool {
     return tag == ast.Tag.aggregate_literal || tag == ast.Tag.array_literal || tag == ast.Tag.tuple_literal || tag == ast.Tag.undefined_literal
 }
 
-// A copy of the aggregate at `source` in new storage.
-fn copyAggregate(builder: *LirBuilder, source: usize, type_id: usize) -> usize {
+// A copy of the aggregate at `source` in new storage: a region of the
+// frame when `in_frame`, else the aggregate arena, which is never freed.
+fn copyAggregate(builder: *LirBuilder, source: usize, type_id: usize, in_frame: bool) -> usize {
     var size = types_store.Store.sizeOf(builder.*.typeStore, type_id)
     if size < 8 { size = 8 }
     var allocation = lir.initInst(lir.Opcode.alloca, type_id)
     allocation.arg0 = size
+    if in_frame { allocation.arg1 = 1 }
     const storage = lir.addInst(builder.*.lir, allocation)
     aggregate_copy.emit(builder.*.lir, builder.*.typeStore, storage, source, type_id)
     return storage
@@ -3724,10 +3729,98 @@ fn copyAggregate(builder: *LirBuilder, source: usize, type_id: usize) -> usize {
 
 // A `var` of aggregate type, or an aggregate assigned to a variable, gets
 // its own copy unless the value was built just for it: changing the
-// variable must not change the value it was made from.
+// variable must not change the value it was made from. The copy is in the
+// arena, so the variable's storage can be handed back by `return` as is.
 fn ownedAggregate(builder: *LirBuilder, value: usize, value_node: usize, type_id: usize) -> usize {
     if value == lir.NONE || !aggregate_copy.isMemoryType(builder.*.typeStore, type_id) || isFreshAggregate(builder, value_node) { return value }
-    return copyAggregate(builder, value, type_id)
+    return copyAggregate(builder, value, type_id, false)
+}
+
+// Whether the value `node_index` produces may be, or point into, a `const`
+// local's frame storage: the local itself; a field, element or slice of
+// it; what a call given one of those returns (a callee may return its
+// parameter's storage); or something not inspected here, such as an `if`
+// or `match` expression. Literals and calls without such arguments cannot.
+fn mayReferenceFrameStorage(builder: *LirBuilder, node_index: usize) -> bool {
+    if node_index == ast.NONE { return false }
+    const nodes = getNodes(builder)
+    const node = ast_store.Store.get(nodes, node_index)
+    if node.tag == ast.Tag.identifier {
+        const binding = findBindingRecord(builder, tokenPointer(builder, node.mainToken), tokenLength(builder, node.mainToken))
+        return @intFromPtr(binding) != 0 && binding.*.frameStorage
+    }
+    if node.tag == ast.Tag.field_expression || node.tag == ast.Tag.index_expression || node.tag == ast.Tag.slice_expression || node.tag == ast.Tag.unary_expression {
+        return mayReferenceFrameStorage(builder, node.lhs)
+    }
+    if node.tag == ast.Tag.binary_expression {
+        return mayReferenceFrameStorage(builder, node.lhs) || mayReferenceFrameStorage(builder, node.rhs)
+    }
+    if node.tag == ast.Tag.call_expression || node.tag == ast.Tag.builtin_call {
+        if node.tag == ast.Tag.call_expression && mayReferenceFrameStorage(builder, node.lhs) { return true }
+        var argument = if node.tag == ast.Tag.call_expression { node.rhs } else { node.lhs }
+        while argument != ast.NONE {
+            if mayReferenceFrameStorage(builder, argument) { return true }
+            argument = ast_store.Store.get(nodes, argument).next
+        }
+        return false
+    }
+    if isFreshAggregate(builder, node_index) { return false }
+    return node.tag != ast.Tag.integer_literal && node.tag != ast.Tag.float_literal && node.tag != ast.Tag.string_literal &&
+        node.tag != ast.Tag.byte_string_literal && node.tag != ast.Tag.character_literal && node.tag != ast.Tag.boolean_literal && node.tag != ast.Tag.null_literal
+}
+
+// The identifier a field, element or slice path starts from, when it names
+// a `const` local held in the frame; else ast.NONE.
+fn frameStorageRoot(builder: *LirBuilder, node_index: usize) -> usize {
+    var current = node_index
+    while current != ast.NONE {
+        const node = ast_store.Store.get(getNodes(builder), current)
+        if node.tag == ast.Tag.identifier {
+            const binding = findBindingRecord(builder, tokenPointer(builder, node.mainToken), tokenLength(builder, node.mainToken))
+            return if @intFromPtr(binding) != 0 && binding.*.frameStorage { current } else { ast.NONE }
+        }
+        if node.tag != ast.Tag.field_expression && node.tag != ast.Tag.index_expression && node.tag != ast.Tag.slice_expression { return ast.NONE }
+        current = node.lhs
+    }
+    return ast.NONE
+}
+
+// The value `return` hands back must outlive the frame. An aggregate that
+// may be (part of) a `const` local's frame storage is copied into the
+// arena first; a slice into such a local is rebased onto an arena copy of
+// the whole local.
+fn returnedValue(builder: *LirBuilder, value_node: usize, value: usize) -> usize {
+    if value == lir.NONE || value_node == ast.NONE { return value }
+    const value_type = expressionType(builder, value_node)
+    if value_type == 0 { return value }
+    if aggregate_copy.isMemoryType(builder.*.typeStore, value_type) {
+        if !mayReferenceFrameStorage(builder, value_node) { return value }
+        return copyAggregate(builder, value, value_type, false)
+    }
+    if types_store.Store.get(builder.*.typeStore, value_type).*.kind != types_store.Kind.slice { return value }
+    const root_node = frameStorageRoot(builder, value_node)
+    if root_node == ast.NONE { return value }
+    const root = ast_store.Store.get(getNodes(builder), root_node)
+    const binding = findBindingRecord(builder, tokenPointer(builder, root.mainToken), tokenLength(builder, root.mainToken))
+    const base = lowerNode(builder, root_node)
+    const copy = copyAggregate(builder, base, binding.*.typeId, false)
+    var pointer_extract = lir.initInst(lir.Opcode.tuple_element, lir.NONE)
+    pointer_extract.arg0 = value
+    pointer_extract.arg1 = 0
+    const pointer = lir.addInst(builder.*.lir, pointer_extract)
+    var length_extract = lir.initInst(lir.Opcode.tuple_element, types_store.Store.sizeInteger(builder.*.typeStore, false))
+    length_extract.arg0 = value
+    length_extract.arg1 = 1
+    const length = lir.addInst(builder.*.lir, length_extract)
+    const offset = lir.addInst(builder.*.lir, lir.binary(lir.Opcode.sub, lir.NONE, pointer, base))
+    const rebased = lir.addInst(builder.*.lir, lir.binary(lir.Opcode.add, lir.NONE, copy, offset))
+    const extra_start = builder.*.lir.*.extraData.*.length
+    lir.addExtra(builder.*.lir, rebased)
+    lir.addExtra(builder.*.lir, length)
+    var result = lir.initInst(lir.Opcode.tuple_literal, value_type)
+    result.arg0 = extra_start
+    result.arg1 = 2
+    return lir.addInst(builder.*.lir, result)
 }
 
 fn lowerLocalBinding(builder: *LirBuilder, node_index: usize) -> usize {
@@ -3753,7 +3846,17 @@ fn lowerLocalBinding(builder: *LirBuilder, node_index: usize) -> usize {
 
     var local_type = if n.lhs != ast.NONE { resolveTypeNode(builder, n.lhs) } else { expressionType(builder, n.rhs) }
     var init_val = narrowFloat(builder, lowerBindingInitializer(builder, n.rhs, local_type), local_type)
-    if n.tag == ast.Tag.variable_declaration { init_val = ownedAggregate(builder, init_val, n.rhs, local_type) }
+    // A `const` of aggregate type is a value too: a copy in the frame, so
+    // that a later store to what it was made from (an array element or a
+    // field reached through a pointer, say) does not change what it reads.
+    // `return` copies it out of the frame when it hands the local back.
+    var frame_storage = false
+    if n.tag == ast.Tag.variable_declaration {
+        init_val = ownedAggregate(builder, init_val, n.rhs, local_type)
+    } else if init_val != lir.NONE && aggregate_copy.isMemoryType(builder.*.typeStore, local_type) && !isFreshAggregate(builder, n.rhs) {
+        init_val = copyAggregate(builder, init_val, local_type, true)
+        frame_storage = true
+    }
     const components_start = builder.*.bindingComponents.*.length
     const component_count = typeWordCount(builder, local_type)
     var component: usize = 0
@@ -3775,6 +3878,7 @@ fn lowerLocalBinding(builder: *LirBuilder, node_index: usize) -> usize {
         component += 1
     }
     pushBindingComponents(builder, name_ptr, name_len, components_start, component_count, local_type)
+    if frame_storage { findBindingRecord(builder, name_ptr, name_len).*.frameStorage = true }
     if component_count > 0 { appendAutoDrop(builder, node_index, bindingComponentAt(builder, components_start), local_type) }
 
     return lir.NONE
