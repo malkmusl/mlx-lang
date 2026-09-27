@@ -17,7 +17,12 @@
 #     previews above the dock; a click on one brings it forward; then
 #     clicks the dock's test app (it starts);
 #   - opens the launcher with the dock's apps button and closes it with
-#     Escape.
+#     Escape;
+#   - right-clicks the test app in the dock and runs its desktop action
+#     from the menu;
+#   - opens the launcher, drags the other app onto the dock (it is
+#     pinned: drag and drop through the compositor) and unpins it from the
+#     launcher's right-click menu.
 # The window behind the launcher must show blurred through it, and the
 # screenshots must be the same with the CPU and the Vulkan renderer, and
 # with the apps drawing on the GPU (their standard) and on the CPU
@@ -58,6 +63,11 @@ Type=Application
 Name=Marker Writer
 Exec=$work/mark.sh started %U
 Icon=org.mlx.Marker
+Actions=new-window;
+
+[Desktop Action new-window]
+Name=New Marker Window
+Exec=$work/mark.sh action
 ENTRY
 cat > "$work/data/applications/org.mlx.Other.desktop" <<ENTRY
 [Desktop Entry]
@@ -105,6 +115,49 @@ wait 2000
 down 1
 up 1
 wait 800
+pointer 570 730
+wait 300
+press 273
+release 273
+wait 1500
+shot SHOTS/menu.ppm
+pointer 560 630
+wait 300
+press 272
+release 272
+wait 1000
+down 125
+up 125
+wait 2000
+pointer 344 260
+wait 300
+press 272
+wait 100
+pointer 350 270
+wait 100
+pointer 400 400
+wait 100
+pointer 500 600
+wait 100
+pointer 600 725
+wait 500
+pointer 604 728
+wait 1500
+release 272
+wait 2500
+pointer 344 260
+wait 300
+press 273
+release 273
+wait 2000
+pointer 380 281
+wait 300
+press 272
+release 272
+wait 2500
+down 1
+up 1
+wait 800
 leave
 wait 300
 close
@@ -140,8 +193,8 @@ run() {
     grep -q "^layer: mlx-launcher 720x540 at 152,114 in layer 3" "$log" || fail "$renderer: Super did not open the launcher centred in the overlay layer" "$log"
     grep -q "^focus: mlx-launcher" "$log" || fail "$renderer: the launcher did not get the keyboard" "$log"
     grep -q "^key 50 -> mlx-launcher" "$log" || fail "$renderer: typing did not reach the launcher" "$log"
-    [[ "$(cat "$work/marks" 2> /dev/null)" == "$(printf 'started\nstarted')" ]] || fail "$renderer: the launcher and the dock did not start the app (marks: $(cat "$work/marks" 2> /dev/null | tr '\n' ' '))" "$log"
-    [[ $(grep -c "^layer: mlx-launcher" "$log") -eq 2 ]] || fail "$renderer: the dock's apps button did not open the launcher" "$log"
+    [[ "$(cat "$work/marks" 2> /dev/null)" == "$(printf 'started\nstarted\naction')" ]] || fail "$renderer: the launcher and the dock did not start the app, or the dock's menu its action (marks: $(cat "$work/marks" 2> /dev/null | tr '\n' ' '))" "$log"
+    [[ $(grep -c "^layer: mlx-launcher" "$log") -eq 3 ]] || fail "$renderer: the dock's apps button did not open the launcher" "$log"
     grep -q "^key 1 -> mlx-launcher" "$log" || fail "$renderer: Escape did not reach the launcher" "$log"
     # Focus: the two terminals, the launcher, a terminal again after it
     # closed, then the other one from its preview.
@@ -149,6 +202,11 @@ run() {
     grep -q "^previews closed" "$log" || fail "$renderer: a click on a preview did not close them" "$log"
     [[ $(grep -c "^focus: Mlx Terminal" "$log") -ge 4 ]] || fail "$renderer: the preview did not bring the other terminal forward" "$log"
     echo "ok   $renderer: dock along the bottom, Super opens the launcher, apps start from both, the dock's previews switch windows"
+    grep -q "^drag: dropped on mlx-dock" "$log" && grep -q "^mlx-dock: pinned org.mlx.Other" "$log" || fail "$renderer: an app dragged from the launcher was not pinned to the dock" "$log"
+    grep -q "^mlx-dock: the pinned apps changed" "$log" || fail "$renderer: the dock did not take in the launcher's change to its pins" "$log"
+    [[ "$(cat "$work/config/mlx/dock")" == "$(printf 'terminal\norg.mlx.Marker')" ]] || fail "$renderer: the launcher's menu did not unpin the app (pins: $(tr '\n' ' ' < "$work/config/mlx/dock"))" "$log"
+    printf 'terminal\norg.mlx.Marker\n' > "$work/config/mlx/dock"
+    echo "ok   $renderer: the dock's menu runs an app's action; apps pin by dragging from the launcher and unpin from its menu"
 
     python3 - "$work/$name/launcher.ppm" <<'PY' || fail "$renderer: the window behind the launcher is not blurred" "$log"
 import sys

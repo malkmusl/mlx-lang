@@ -162,6 +162,18 @@ click on one brings its window forward (a minimized one comes back), a
 click anywhere else, Escape or a second click on the icon closes them.
 The thumbnails follow their windows as they draw.
 
+A right click on a dock icon opens its menu (an xdg_popup on the dock's
+layer surface): the app's own actions from its desktop entry (Firefox's
+"New Window" and "New Private Window"; an app without any gets "New
+Window"), "Pin to Dock" or "Unpin from Dock", and "Close Window" or
+"Close All Windows" while it runs. In the launcher a right click on an
+app offers its actions and pinning too, and an app dragged from the
+launcher onto the dock is pinned where it is dropped (dropped again, it
+moves there); the dock takes `text/uri-list` drops of desktop entry
+files, so one dragged from a file manager works as well. Both write
+`~/.config/mlx/dock`, which the dock takes in within a second (it writes
+its defaults there when the file is missing).
+
 With `dock-autohide = on` (mlx-settings: "Auto-hide dock") the dock
 reserves no space, so maximized windows reach the bottom edge. It slides
 out of sight once the pointer has been away from it for 0.6 seconds and
@@ -752,15 +764,24 @@ with it Minecraft, refuses its relative mouse mode without both.
 
 `--verbose` logs `pointer: locked` and `pointer: unlocked`.
 
-## Copy and paste
+## Copy and paste, drag and drop
 
 `wl_data_device_manager` carries the clipboard between clients (GTK 4
 refuses a display without it): the selection is the data source a client
 set last, the focused client receives it as a data offer (when it gains
 focus and when the selection changes), and reading an offer passes the
 reader's pipe to the source's client, which writes the data into it.
-Drag and drop is not supported: the source of a drag is cancelled at
-once.
+
+Drag and drop goes the same way. A client starts a drag while a button is
+held; until the buttons are up the pointer is the drag's (clients get no
+pointer events), the drag's icon surface follows the pointer, and the
+surface under it is offered the source's MIME types (enter, motion,
+leave). The target accepts a type and, from version 3, agrees on an
+action with the source (copy, move, ask); released over it, it gets drop,
+reads the data and says finish, else the source is cancelled. A drag
+without a source stays within its client. `--verbose` logs `drag:
+started`, `drag: dropped on NAME` or `drag: cancelled`, and `drag:
+finished`.
 
 ## Files
 
@@ -785,7 +806,8 @@ once.
   xdg-shell, layer shell, the window list for docks, blur regions, focus
   and input delivery, and launching programs.
 - `dmabuf.mlx`: linux-dmabuf; each dma-buf becomes a one-buffer pool.
-- `data.mlx`: `wl_data_device_manager`, copy and paste between clients.
+- `data.mlx`: `wl_data_device_manager`, copy and paste and drag and drop
+  between clients.
 - `session/`: the desktop session's launcher and entry
   (`tools/install_compositor_session.sh` installs them).
 - `vulkan.mlx`: the Vulkan renderer.
