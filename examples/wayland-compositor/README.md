@@ -174,6 +174,16 @@ files, so one dragged from a file manager works as well. Both write
 `~/.config/mlx/dock`, which the dock takes in within a second (it writes
 its defaults there when the file is missing).
 
+After a second separator come folders and the trash, as on macOS. The
+folders are listed in `~/.config/mlx/dock-folders` (`~/Downloads` when
+the file is missing); a click on one shows its twelve newest files as a
+menu (a click opens one) with "Open" below, a right click offers "Open"
+and "Remove from Dock", and a folder dragged onto the dock from a file
+manager joins them. The trash (`$XDG_DATA_HOME/Trash`) shows whether it
+holds anything; a click opens it (`xdg-open trash:///`), its menu empties
+it, and files dropped on it go into it (`gio trash`; an app dragged from
+the launcher does not).
+
 With `dock-autohide = on` (mlx-settings: "Auto-hide dock") the dock
 reserves no space, so maximized windows reach the bottom edge. It slides
 out of sight once the pointer has been away from it for 0.6 seconds and
