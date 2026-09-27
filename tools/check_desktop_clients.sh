@@ -31,7 +31,12 @@
 #   - runs the top bar (mlx-topbar) with a terminal: the bar is along the
 #     top and reserves it (the terminal moves below it, maximized it stays
 #     below), shows the active app and a fixed time in German, and the
-#     local times clock.mlx computes match python's zoneinfo.
+#     local times clock.mlx computes match python's zoneinfo;
+#   - runs the file manager (mlx-files) on a home of its own: it shows the
+#     folders first, makes a folder (Ctrl+Shift+N) and names it, moves a
+#     picture into it by dragging, renames a file (F2), moves one to the
+#     trash (Delete), opens a folder with a double click, goes back with
+#     Alt+Left; drawn alike on the GPU and on the CPU.
 # The window behind the launcher must show blurred through it, and the
 # screenshots must be the same with the CPU and the Vulkan renderer, and
 # with the apps drawing on the GPU (their standard) and on the CPU
@@ -60,6 +65,7 @@ trap 'rm -rf -- "$work"' EXIT
 "$compiler" --quiet tools/wayland-drag-source/main.mlx -o "$work/drag-source"
 "$compiler" --quiet examples/mlx-topbar/main.mlx -o "$work/mlx-topbar"
 "$compiler" --quiet tools/clock-probe/main.mlx -o "$work/clock-probe"
+"$compiler" --quiet examples/mlx-files/main.mlx -o "$work/mlx-files"
 xkbcli compile-keymap --layout us > "$work/us.xkb"
 
 # The apps: only these (no system directories), one with an icon.
@@ -376,6 +382,134 @@ SCRIPT
 
 # The top bar with a terminal, at a fixed time (2024-09-27 14:05 UTC, 16:05
 # in Berlin), in German.
+# The file manager (mlx-files) on a home of its own, its apps drawing on
+# $1 (cpu or gpu). Its window is at (24, 24), the icons' centres 118
+# pixels apart from x 296, the rows 104 apart from y 125.
+files() {
+    local canvas=$1
+    local runtime
+    runtime=$(mktemp -d)
+    local home="$work/files-$canvas/home"
+    local data="$work/files-$canvas/data"
+    rm -rf -- "$work/files-$canvas"
+    mkdir -p "$home/Documents" "$home/Downloads" "$home/Project 2" "$home/Project 10" "$data" "$work/files-$canvas/config"
+    echo notes > "$home/notes.txt"
+    echo report > "$home/report.pdf"
+    echo hidden > "$home/.hidden"
+    cp tests/support/png/rgba8.png "$home/photo.png"
+    touch -d '2024-03-01 10:00' "$home"/* "$home/Documents" "$home/Downloads"
+    # Folders first, numbers by value: Documents, Downloads, Project 2,
+    # Project 10, notes.txt, photo.png; then report.pdf. After Stuff is
+    # made it comes fifth; photo.png moves into it, report.pdf takes its
+    # place (the second row's first).
+    cat > "$work/files-$canvas.script" <<SCRIPT
+wait 3000
+shot $work/files-$canvas/grid.ppm
+down 29
+down 42
+down 49
+up 49
+up 42
+up 29
+wait 1500
+type Stuff
+enter
+wait 1500
+pointer 296 230
+wait 200
+press 272
+wait 100
+pointer 310 225
+wait 100
+pointer 600 150
+wait 100
+pointer 768 125
+wait 800
+release 272
+wait 2500
+pointer 886 125
+wait 200
+press 272
+release 272
+wait 400
+down 60
+up 60
+wait 500
+type ideas
+enter
+wait 1500
+pointer 296 230
+wait 200
+press 272
+release 272
+wait 400
+down 111
+up 111
+wait 2500
+pointer 296 125
+wait 200
+press 272
+release 272
+wait 100
+press 272
+release 272
+wait 1500
+down 29
+down 42
+down 49
+up 49
+up 42
+up 29
+wait 1500
+type Inner
+enter
+wait 1500
+down 56
+down 105
+up 105
+up 56
+wait 1500
+shot $work/files-$canvas/back.ppm
+close
+SCRIPT
+    XDG_RUNTIME_DIR=$runtime "$work/test-host" host-files "$work/us.xkb" "$work/files-$canvas.script" > "$work/files-$canvas-host.log" 2>&1 &
+    local host_pid=$!
+    for _ in $(seq 1 50); do [[ -S "$runtime/host-files" ]] && break; sleep 0.1; done
+    local status=0
+    env -i PATH="$PATH" HOME="$home" XDG_RUNTIME_DIR="$runtime" WAYLAND_DISPLAY=host-files \
+        XDG_DATA_HOME="$data" XDG_DATA_DIRS="$work/none" XDG_CONFIG_HOME="$work/files-$canvas/config" VK_DRIVER_FILES="$manifest" MLX_CANVAS="$canvas" \
+        LANG=en_US.UTF-8 TZ=UTC \
+        timeout 90 "$work/mlx-compositor" --verbose --no-fps --renderer cpu --socket nested-files \
+        --launcher none --dock none --topbar none --run "$work/mlx-files" > "$work/files-$canvas.log" 2>&1 || status=$?
+    wait "$host_pid" || fail "files: the test host failed" "$work/files-$canvas-host.log"
+    rm -rf -- "$runtime"
+    local log="$work/files-$canvas.log"
+    [[ $status -eq 0 ]] || fail "files: the compositor exited with status $status" "$log"
+    grep -q "^window: 940x580 at 24,24" "$log" || fail "files: the file manager's window did not open" "$log"
+    python3 - "$work/files-$canvas/grid.ppm" <<'PY' || fail "files ($canvas): the folders are not shown first" "$log"
+import sys
+data = open(sys.argv[1], 'rb').read()
+header, size, depth, pixels = data.split(b'\n', 3)
+width, height = map(int, size.split())
+def at(x, y): return tuple(pixels[(y * width + x) * 3:(y * width + x) * 3 + 3])
+def blue(p): return p[2] > 200 and p[0] < 120
+# Four folders (blue) in the first row, then pages (white).
+for x in (296, 414, 532, 650):
+    assert blue(at(x - 18, 130)), (x, at(x - 18, 130))
+assert min(at(768, 128)) > 200, at(768, 128)
+# The sidebar: the home selected, its icon blue.
+assert blue(at(48, 82)), at(48, 82)
+PY
+    [[ -d "$home/Stuff" && ! -e "$home/untitled folder" ]] || fail "files ($canvas): Ctrl+Shift+N and typing did not make the folder Stuff ($(ls "$home" | tr '\n' ' '))" "$log"
+    grep -q "^drag: dropped on" "$log" && [[ -f "$home/Stuff/photo.png" && ! -e "$home/photo.png" ]] || fail "files ($canvas): the picture dragged onto Stuff did not move into it" "$log"
+    [[ -f "$home/ideas.txt" && ! -e "$home/notes.txt" ]] || fail "files ($canvas): F2 did not rename notes.txt to ideas.txt ($(ls "$home" | tr '\n' ' '))" "$log"
+    if command -v gio > /dev/null; then
+        [[ -f "$data/Trash/files/report.pdf" && ! -e "$home/report.pdf" ]] || fail "files ($canvas): Delete did not move report.pdf to the trash" "$log"
+    fi
+    [[ -d "$home/Documents/Inner" ]] || fail "files ($canvas): a double click did not open Documents" "$log"
+    echo "ok   files ($canvas): folders first; makes, renames, moves, trashes, opens folders"
+}
+
 topbar() {
     local runtime
     runtime=$(mktemp -d)
@@ -453,3 +587,20 @@ PY
 
 drops
 topbar
+files cpu
+files gpu
+python3 - "$work/files-cpu/grid.ppm" "$work/files-gpu/grid.ppm" <<'PY' || fail "the file manager drawn on the GPU differs from the one drawn on the CPU" /dev/null
+import sys
+def load(path):
+    data = open(path, 'rb').read()
+    header, size, depth, pixels = data.split(b'\n', 3)
+    width, height = map(int, size.split())
+    return width, pixels
+width, first = load(sys.argv[1])
+_, second = load(sys.argv[2])
+# All but the status bar (the free space on the disk may change).
+rows = [y for y in range(768) if not 574 <= y < 604]
+bad = sum(1 for y in rows if first[y * width * 3:(y + 1) * width * 3] != second[y * width * 3:(y + 1) * width * 3])
+sys.exit(1 if bad else 0)
+PY
+echo "ok   the file manager draws the same pixels on the GPU as on the CPU"

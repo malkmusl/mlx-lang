@@ -211,6 +211,31 @@ and their rules for the years after the table are read by
 `desktop-shared/clock.mlx`. `MLX_SESSION_TOPBAR=no` starts the session
 without it.
 
+The file manager, [`examples/mlx-files`](../mlx-files/main.mlx) (Files in
+the launcher, pinned in the dock by default), is laid out like the Finder:
+a translucent sidebar with the home folder, the user's folders
+(`~/.config/user-dirs.dirs`: Dokumente, Bilder on a German system), the
+computer and the trash; a toolbar with back and forward, the folder's
+name, icons or list and a search field; the files as icons (PNG files as
+pictures) or as a list with the date modified, the size and the kind (a
+click on a column sorts by it); and a status bar with the path to click
+on and how many items there are. Folders come first and names sort as
+people count ("Project 2" before "Project 10"). A click selects (Ctrl
+adds, Shift a range, a rectangle dragged over empty space selects what it
+touches), a double click or Enter opens (a file with `xdg-open`). F2
+renames (the name before its extension selected), Ctrl+Shift+N makes a
+folder, Delete moves to the trash (`gio trash`), Ctrl+C, Ctrl+X and
+Ctrl+V copy, cut and paste within it, Ctrl+F searches, Ctrl+H shows hidden
+files, Backspace or Alt+Left goes back, Alt+Up to the parent; typing jumps
+to a name. The right-click menu offers these, "Add to Dock" for a folder,
+"Open in Terminal", and in the trash "Put Back" and "Delete Immediately".
+Files dragged out go as `text/uri-list` (onto the dock's trash, into
+another folder); files dropped in are copied, its own moved. It reads a
+folder again within a second when it changes, and its labels and dates
+follow the locale. `mlx-files PATH`, `file://` URIs and `trash:///` open
+it where asked; the dock opens its folders and the trash in it when it is
+installed.
+
 mlx-settings lists the hotkeys: a click on one records the next key
 combination (Escape keeps the old one, Backspace unbinds it, a right click
 restores the default). Meanwhile the compositor passes every key to it,
@@ -219,7 +244,7 @@ which any client may use while it has the keyboard); Alt+Shift+Q and the
 VT switch stay the compositor's. `~/.config/mlx/dock` lists the pinned apps, one
 desktop entry id per line (`org.gnome.Nautilus`, `firefox`), `terminal` for
 the Mlx terminal; without it the dock pins the terminal and the first file
-manager, browser and editor it finds. Icons are PNGs (the hicolor theme or
+manager (mlx-files first), browser and editor it finds. Icons are PNGs (the hicolor theme or
 `/usr/share/pixmaps`); an app with only an SVG icon gets a tile with its
 initial.
 
@@ -229,7 +254,8 @@ The compositor passes `MLX_TERMINAL` (its `--terminal`) and `MLX_LAUNCHER`
 checks both clients with scripted input on the CPU and the Vulkan
 renderer: where their surfaces are, Super, typing, starting apps from both,
 switching windows from the dock's previews, the blur, and that both
-renderers draw the same pixels.
+renderers draw the same pixels; and the file manager making, renaming,
+moving and trashing files.
 
 ## Freestanding (DRM/KMS)
 
