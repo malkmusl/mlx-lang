@@ -18,7 +18,9 @@
 #   - opens the launcher with the dock's apps button and closes it with
 #     Escape.
 # The window behind the launcher must show blurred through it, and the
-# screenshots must be the same with the CPU and the Vulkan renderer.
+# screenshots must be the same with the CPU and the Vulkan renderer, and
+# with the apps drawing on the GPU (their standard) and on the CPU
+# (MLX_CANVAS=cpu).
 #
 # The Vulkan run uses lavapipe (the apps' data directories are the test's,
 # so the loader is pointed at its manifest).
@@ -106,24 +108,26 @@ fail() { echo "FAIL $1" >&2; [[ -f "$2" ]] && cat "$2" >&2; exit 1; }
 # Runs the scenario with renderer $1; the screenshots go to $work/$1.
 run() {
     local renderer=$1
+    # $2: cpu draws the apps on the CPU (MLX_CANVAS), else on the GPU.
+    local name=$renderer${2:+-canvas-$2}
     local runtime
     runtime=$(mktemp -d)
-    mkdir -p "$work/$renderer"
+    mkdir -p "$work/$name"
     rm -f "$work/marks"
-    sed "s|SHOTS|$work/$renderer|" "$work/desktop.script" > "$work/$renderer.script"
-    XDG_RUNTIME_DIR=$runtime "$work/test-host" host-desktop "$work/us.xkb" "$work/$renderer.script" > "$work/$renderer-host.log" 2>&1 &
+    sed "s|SHOTS|$work/$name|" "$work/desktop.script" > "$work/$name.script"
+    XDG_RUNTIME_DIR=$runtime "$work/test-host" host-desktop "$work/us.xkb" "$work/$name.script" > "$work/$name-host.log" 2>&1 &
     local host_pid=$!
     for _ in $(seq 1 50); do [[ -S "$runtime/host-desktop" ]] && break; sleep 0.1; done
     local status=0
     env -i PATH="$PATH" HOME="$work/home" XDG_RUNTIME_DIR="$runtime" WAYLAND_DISPLAY=host-desktop \
-        XDG_DATA_HOME="$work/data" XDG_DATA_DIRS="$work/none" XDG_CONFIG_HOME="$work/config" VK_DRIVER_FILES="$manifest" \
+        XDG_DATA_HOME="$work/data" XDG_DATA_DIRS="$work/none" XDG_CONFIG_HOME="$work/config" VK_DRIVER_FILES="$manifest" MLX_CANVAS="${2:-}" \
         timeout 60 "$work/mlx-compositor" --verbose --no-fps --renderer "$renderer" --socket nested-desktop \
         --terminal "$work/mlx-terminal" --launcher "$work/mlx-launcher" --dock "$work/mlx-dock" \
-        --run "$work/mlx-terminal" --run "$work/mlx-terminal" > "$work/$renderer.log" 2>&1 || status=$?
-    wait "$host_pid" || fail "$renderer: the test host failed" "$work/$renderer-host.log"
+        --run "$work/mlx-terminal" --run "$work/mlx-terminal" > "$work/$name.log" 2>&1 || status=$?
+    wait "$host_pid" || fail "$renderer: the test host failed" "$work/$name-host.log"
     rm -rf -- "$runtime"
-    [[ $status -eq 0 ]] || fail "$renderer: the compositor exited with status $status" "$work/$renderer.log"
-    local log="$work/$renderer.log"
+    [[ $status -eq 0 ]] || fail "$renderer: the compositor exited with status $status" "$work/$name.log"
+    local log="$work/$name.log"
 
     grep -q "^layer: mlx-dock 300x150 at 362,618 in layer 2" "$log" || fail "$renderer: the dock is not along the bottom in the top layer" "$log"
     grep -q "^layer: mlx-launcher 720x540 at 152,114 in layer 3" "$log" || fail "$renderer: Super did not open the launcher centred in the overlay layer" "$log"
@@ -137,7 +141,7 @@ run() {
     [[ $(grep -c "^focus: Mlx Terminal" "$log") -ge 4 ]] || fail "$renderer: the dock did not bring the next terminal forward" "$log"
     echo "ok   $renderer: dock along the bottom, Super opens the launcher, apps start from both, the dock switches windows"
 
-    python3 - "$work/$renderer/launcher.ppm" <<'PY' || fail "$renderer: the window behind the launcher is not blurred" "$log"
+    python3 - "$work/$name/launcher.ppm" <<'PY' || fail "$renderer: the window behind the launcher is not blurred" "$log"
 import sys
 data = open(sys.argv[1], 'rb').read()
 header, size, depth, pixels = data.split(b'\n', 3)
@@ -158,3 +162,7 @@ echo "ok   vulkan: the window behind the launcher shows blurred"
 cmp -s "$work/cpu/rest.ppm" "$work/vulkan/rest.ppm" || fail "the dock differs between the CPU and the Vulkan renderer"
 cmp -s "$work/cpu/launcher.ppm" "$work/vulkan/launcher.ppm" || fail "the launcher and its blur differ between the CPU and the Vulkan renderer"
 echo "ok   the CPU and the Vulkan renderer draw the dock, the launcher and the blur alike"
+run cpu cpu
+cmp -s "$work/cpu/rest.ppm" "$work/cpu-canvas-cpu/rest.ppm" || fail "the dock drawn on the GPU differs from the dock drawn on the CPU"
+cmp -s "$work/cpu/launcher.ppm" "$work/cpu-canvas-cpu/launcher.ppm" || fail "the launcher drawn on the GPU differs from the launcher drawn on the CPU"
+echo "ok   the apps draw the same pixels on the GPU (paint shader) as on the CPU"

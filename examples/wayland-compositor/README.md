@@ -96,12 +96,20 @@ monitor: at 60 Hz the desktop shows at most 60.
 ![The launcher over two terminals, the dock below](screenshots/dock-and-launcher.png)
 
 Both are ordinary Wayland clients in [`examples/mlx-dock`](../mlx-dock/main.mlx)
-and [`examples/mlx-launcher`](../mlx-launcher/main.mlx), sharing
-[`examples/desktop-shared`](../desktop-shared): the layer surface and its
-input (`panel.mlx`), drawing (`canvas.mlx`), the keymap (`keyboard.mlx`),
+and [`examples/mlx-launcher`](../mlx-launcher/main.mlx) (like
+[`examples/mlx-settings`](../mlx-settings/main.mlx)), sharing
+[`examples/desktop-shared`](../desktop-shared): the layer surface or window
+and its input (`panel.mlx`), drawing (`canvas.mlx`), the keymap (`keyboard.mlx`),
 desktop entries and their PNG icons (`apps.mlx`, with `std.png`) and the
-per-turn value release (`turns.mlx`). The compositor offers them three
-protocols:
+per-turn value release (`turns.mlx`). They draw with Vulkan, the
+desktop's standard for every app: `canvas.mlx` records what it is asked
+to draw and `gpu_canvas.mlx` has the `paint` compute shader draw it all in
+one pass, into buffers handed to the compositor as dma-bufs
+(linux-dmabuf, ARGB8888, in device memory the compositor can map), or,
+where the driver cannot export them (lavapipe), straight into the shared
+memory it imports. Each app logs how (`mlx-dock: drawing on the gpu, into
+dma-bufs (DEVICE)`). Without Vulkan, or with `MLX_CANVAS=cpu`, they draw
+the same pixels on the CPU. The compositor offers them three protocols:
 
 - `zwlr_layer_shell_v1` (wlr-layer-shell): surfaces in four layers
   (background, bottom, top, overlay; windows sit between bottom and top),

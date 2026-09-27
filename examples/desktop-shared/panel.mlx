@@ -13,6 +13,9 @@
 const std = @import("std")
 const wl = @import("std.wayland")
 const canvas_module = @import("./canvas.mlx")
+const gpu_canvas = @import("./gpu_canvas.mlx")
+const gpu = @import("../vulkan-shared/gpu.mlx")
+const vk = @import("std.vulkan")
 const keyboard_module = @import("./keyboard.mlx")
 const turns_module = @import("./turns.mlx")
 
@@ -54,6 +57,18 @@ pub const KEYBOARD_EXCLUSIVE: u32 = 1
 pub const KEYBOARD_ON_DEMAND: u32 = 2
 
 pub const MAX_WINDOWS: usize = 128
+
+// How frames reach the compositor: drawn on the CPU into shared memory;
+// drawn by the GPU into buffers handed over as dma-bufs (linux-dmabuf);
+// by the GPU straight into shared memory it imported; by the GPU into its
+// own memory and copied into shared memory.
+pub const FRAMES_CPU: u8 = 0
+pub const FRAMES_DMABUF: u8 = 1
+pub const FRAMES_SHM_DIRECT: u8 = 2
+pub const FRAMES_SHM_COPY: u8 = 3
+
+// DRM_FORMAT_ARGB8888 ('AR24').
+const DRM_FORMAT_ARGB8888: u32 = 875713089
 
 // A window of the compositor (a zwlr_foreign_toplevel_handle_v1).
 pub const Window = struct {
@@ -108,6 +123,18 @@ pub const Panel = struct {
     keyboard: keyboard_module.Keyboard
     // Buffers: two of width x height in one pool.
     memory: wl.SharedMemory
+    // Bytes from one frame to the next in the pool (a GPU importing it
+    // wants them aligned).
+    slotBytes: usize
+    // Drawing on the GPU (gpu_canvas.mlx; 0: on the CPU), how frames reach
+    // the compositor (FRAMES_*), and each slot's GPU buffer.
+    device: usize
+    frames: u8
+    targets: [2]gpu.Buffer
+    hasTargets: bool
+    dmabuf: wl.zwp_linux_dmabuf_v1.Proxy
+    hasDmabuf: bool
+    dmabufArgb: bool
     pool: wl.wl_shm_pool.Proxy
     hasPool: bool
     poolSize: usize
@@ -210,6 +237,11 @@ fn onRegistry(context: *anyopaque, event: wl.client.Event) -> void {
         panel.*.effects = wl.ext_background_effect_manager_v1.Proxy.fromObject(registry.bind(global.name, wl.Interface.ext_background_effect_manager_v1, 1))
         panel.*.effects.setHandler(onEffects, context)
         panel.*.hasEffects = true
+    } else if isNamed(global.interface, "zwp_linux_dmabuf_v1") && global.version >= 3 {
+        // Version 3 announces formats and modifiers with events.
+        panel.*.dmabuf = wl.zwp_linux_dmabuf_v1.Proxy.fromObject(registry.bind(global.name, wl.Interface.zwp_linux_dmabuf_v1, 3))
+        panel.*.dmabuf.setHandler(onDmabuf, context)
+        panel.*.hasDmabuf = true
     } else if isNamed(global.interface, "xdg_wm_base") {
         panel.*.wmBase = wl.xdg_wm_base.Proxy.fromObject(registry.bind(global.name, wl.Interface.xdg_wm_base, smaller(global.version, 2)))
         panel.*.wmBase.setHandler(onWmBase, context)
@@ -219,6 +251,12 @@ fn onRegistry(context: *anyopaque, event: wl.client.Event) -> void {
         panel.*.windowManager.setHandler(onWindowManager, context)
         panel.*.hasWindowManager = true
     }
+}
+
+fn onDmabuf(context: *anyopaque, event: wl.client.Event) -> void {
+    if event.opcode != wl.zwp_linux_dmabuf_v1.EVENT_MODIFIER { return }
+    const modifier = wl.zwp_linux_dmabuf_v1.decodeEvent(event).modifier
+    if modifier.format == DRM_FORMAT_ARGB8888 && modifier.modifier_hi == 0 && modifier.modifier_lo == 0 { panelOf(context).*.dmabufArgb = true }
 }
 
 fn onEffects(context: *anyopaque, event: wl.client.Event) -> void {
@@ -467,8 +505,8 @@ fn noWindows() -> Failure!void { return Failure.NoWindows }
 // anchors), with an exclusive zone, a margin at the anchored edges, and
 // keyboard interactivity (0 none, 1 exclusive, 2 on demand). `windows`:
 // follow the compositor's windows.
-pub fn open(panel: *Panel, allocator: Allocator, namespace: []const u8, layer: u32, anchor: u32, width: u32, height: u32, zone: i32, margin: i32, keyboard: u32, windows: bool) -> !void {
-    try connect(panel, allocator, width, height, windows)
+pub fn open(panel: *Panel, allocator: Allocator, arguments: [][*]const u8, namespace: []const u8, layer: u32, anchor: u32, width: u32, height: u32, zone: i32, margin: i32, keyboard: u32, windows: bool) -> !void {
+    try connect(panel, allocator, arguments, width, height, windows)
     if !showLayer(panel, namespace, layer, anchor, width, height, zone, margin, keyboard) { return noLayerShell() }
     try panel.*.display.roundtrip()
 }
@@ -531,8 +569,8 @@ fn hideNow(panel: *Panel) -> void {
 // Connects and opens an ordinary window (xdg_toplevel) titled `title` with
 // app id `app_id`, `width` x `height` unless the compositor asks for
 // another size.
-pub fn openWindow(panel: *Panel, allocator: Allocator, title: []const u8, app_id: []const u8, width: u32, height: u32) -> !void {
-    try connect(panel, allocator, width, height, false)
+pub fn openWindow(panel: *Panel, allocator: Allocator, arguments: [][*]const u8, title: []const u8, app_id: []const u8, width: u32, height: u32) -> !void {
+    try connect(panel, allocator, arguments, width, height, false)
     if !panel.*.hasWmBase { return noWindows() }
     const display = panel.*.display
     panel.*.isWindow = true
@@ -550,9 +588,17 @@ pub fn openWindow(panel: *Panel, allocator: Allocator, title: []const u8, app_id
 }
 
 // The connection, its globals and the panel's state (a surface comes with
-// showLayer or openWindow).
-pub fn connect(panel: *Panel, allocator: Allocator, width: u32, height: u32, windows: bool) -> !void {
+// showLayer or openWindow). Drawing goes to the GPU when Vulkan works
+// (MLX_CANVAS=cpu keeps it on the CPU; `arguments` is the program's, for
+// finding the Vulkan driver).
+pub fn connect(panel: *Panel, allocator: Allocator, arguments: [][*]const u8, width: u32, height: u32, windows: bool) -> !void {
     panel.*.allocator = allocator
+    panel.*.device = 0
+    panel.*.frames = FRAMES_CPU
+    panel.*.hasTargets = false
+    panel.*.hasDmabuf = false
+    panel.*.dmabufArgb = false
+    panel.*.slotBytes = 0
     panel.*.keepAlive = false
     panel.*.hideRequested = false
     panel.*.watch = -1
@@ -604,7 +650,105 @@ pub fn connect(panel: *Panel, allocator: Allocator, width: u32, height: u32, win
     panel.*.registry.setHandler(onRegistry, contextOf(panel))
     try display.roundtrip()
     if !panel.*.hasCompositor || !panel.*.hasShm { return noCompositor() }
+    // The seat's devices and the dma-buf formats.
     try display.roundtrip()
+    useGpu(panel, arguments)
+}
+
+fn environmentValue(arguments: [][*]const u8, name: []const u8) -> [*]const u8 {
+    const entries = std.process.environmentEntries(arguments)
+    var index: usize = 0
+    while @intFromPtr(entries[index]) != 0 {
+        const entry = entries[index]
+        var at: usize = 0
+        while at < name.length && entry[at] == name[at] { at += 1 }
+        if at == name.length && entry[at] == 61 {
+            unsafe { return @ptrFromInt([*]const u8, @intFromPtr(entry) + at + 1) }
+        }
+        index += 1
+    }
+    unsafe { return @ptrFromInt([*]const u8, 0) }
+}
+
+// Opens the GPU and picks how frames reach the compositor.
+fn useGpu(panel: *Panel, arguments: [][*]const u8) -> void {
+    const wanted = environmentValue(arguments, "MLX_CANVAS")
+    if @intFromPtr(wanted) != 0 && wanted[0] == 99 { return }
+    const device = gpu_canvas.open(arguments, panel.*.allocator)
+    if device == null { return }
+    panel.*.device = @intFromPtr(device.?)
+    const context = gpu_canvas.context(device.?)
+    if panel.*.hasDmabuf && panel.*.dmabufArgb && context.*.dmaBufExport {
+        panel.*.frames = FRAMES_DMABUF
+    } else if canImportShared(context) {
+        panel.*.frames = FRAMES_SHM_DIRECT
+    } else {
+        panel.*.frames = FRAMES_SHM_COPY
+    }
+}
+
+// Whether the driver imports shared memory like a wl_shm pool's (a memfd):
+// lavapipe does; RADV and the other amdgpu drivers take only anonymous
+// memory.
+fn canImportShared(context: *gpu.Context) -> bool {
+    if !context.*.hostMemory { return false }
+    const size = @intCast(usize, context.*.hostAlignment)
+    var memory: wl.SharedMemory = undefined
+    if !wl.transport.createSharedMemory(&memory, size) { return false }
+    var probe: gpu.Buffer = undefined
+    const imported = gpu.importHostMemory(context, &probe, memory.address, @intCast(u64, size))
+    gpu.destroyBuffer(context, &probe)
+    memory.release()
+    return imported
+}
+
+// Says how the program draws: "NAME: drawing on the gpu, dma-buf (DEVICE)"
+// or "NAME: drawing on the cpu".
+pub fn report(panel: *Panel, program: []const u8) -> void {
+    var line: [256]u8 = undefined
+    var length: usize = 0
+    for byte in program {
+        line[length] = byte
+        length += 1
+    }
+    for byte in ": drawing on the " {
+        line[length] = byte
+        length += 1
+    }
+    for byte in framesName(panel) {
+        line[length] = byte
+        length += 1
+    }
+    if panel.*.device != 0 {
+        line[length] = 32
+        line[length + 1] = 40
+        length += 2
+        const name = gpu_canvas.name(deviceOf(panel))
+        var index: usize = 0
+        while name[index] != 0 && length < 250 {
+            line[length] = name[index]
+            length += 1
+            index += 1
+        }
+        line[length] = 41
+        length += 1
+    }
+    line[length] = 10
+    length += 1
+    const written = std.io.writeAll(std.io.stdout(), line[0..length])
+}
+
+// Forgets the images the GPU has (an app that loaded its icons again).
+pub fn forgetImages(panel: *Panel) -> void {
+    if panel.*.device != 0 { gpu_canvas.forgetImages(deviceOf(panel)) }
+}
+
+// How frames are drawn (for logs): "cpu", "gpu, dmabuf", ...
+pub fn framesName(panel: *const Panel) -> []const u8 {
+    if panel.*.frames == FRAMES_DMABUF { return "gpu, into dma-bufs" }
+    if panel.*.frames == FRAMES_SHM_DIRECT { return "gpu, into shared memory" }
+    if panel.*.frames == FRAMES_SHM_COPY { return "gpu, copied into shared memory" }
+    return "cpu"
 }
 
 // Asks for another size (the compositor configures it).
@@ -690,39 +834,134 @@ pub fn roundedRects(rects: [*]i32, x: i32, y: i32, width: i32, height: i32, radi
     return count
 }
 
-// Makes sure there are two buffers of the configured size.
-fn fitBuffers(panel: *Panel) -> bool {
-    const width = panel.*.width
-    const height = panel.*.height
-    if width == panel.*.bufferWidth && height == panel.*.bufferHeight { return true }
+// Drops the slots' buffers (and their GPU buffers).
+fn dropBuffers(panel: *Panel) -> void {
     if panel.*.bufferWidth != 0 {
         panel.*.buffers[0].destroy()
         panel.*.buffers[1].destroy()
         panel.*.bufferWidth = 0
     }
+    if panel.*.hasTargets {
+        const context = gpu_canvas.context(deviceOf(panel))
+        var slot: usize = 0
+        while slot < 2 {
+            const target = targetOf(panel, slot)
+            if target.*.fd >= 0 { wl.Handle.fromDescriptor(@intCast(isize, target.*.fd)).close() }
+            gpu.destroyBuffer(context, target)
+            target.*.fd = -1
+            slot += 1
+        }
+        panel.*.hasTargets = false
+    }
+}
+
+fn deviceOf(panel: *Panel) -> *gpu_canvas.Device {
+    unsafe { return @ptrFromInt(*gpu_canvas.Device, panel.*.device) }
+}
+
+fn targetOf(panel: *Panel, slot: usize) -> *gpu.Buffer {
+    unsafe { return @ptrFromInt(*gpu.Buffer, @intFromPtr(panel) + @offsetOf(Panel, "targets") + slot * @sizeOf(gpu.Buffer)) }
+}
+
+// The GPU fails us: from now on frames are drawn on the CPU into shared
+// memory.
+fn leaveGpu(panel: *Panel) -> void {
+    dropBuffers(panel)
+    panel.*.frames = FRAMES_CPU
+    panel.*.dirty = true
+}
+
+// Two dma-bufs of the GPU's (device memory the compositor can map) as the
+// slots' buffers; false when the driver or the compositor will not.
+fn makeDmabufs(panel: *Panel) -> bool {
+    const context = gpu_canvas.context(deviceOf(panel))
+    const width = panel.*.width
+    const height = panel.*.height
+    const size = @intCast(u64, width * height * 4)
+    const visible = vk.MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk.MEMORY_PROPERTY_HOST_COHERENT_BIT
+    var slot: usize = 0
+    while slot < 2 {
+        const target = targetOf(panel, slot)
+        target.*.fd = -1
+        if !gpu.createExportBufferIn(context, target, size, visible | vk.MEMORY_PROPERTY_DEVICE_LOCAL_BIT, visible) || target.*.fd < 0 { return false }
+        panel.*.hasTargets = true
+        const params = panel.*.dmabuf.createParams()
+        params.add(wl.Handle.fromDescriptor(@intCast(isize, target.*.fd)), 0, 0, @intCast(u32, width * 4), 0, 0)
+        panel.*.buffers[slot] = params.createImmed(@intCast(i32, width), @intCast(i32, height), DRM_FORMAT_ARGB8888, 0)
+        params.destroy()
+        panel.*.buffers[slot].setHandler(onBuffer, contextOf(panel))
+        slot += 1
+    }
+    return true
+}
+
+// Makes sure there are two buffers of the configured size.
+fn fitBuffers(panel: *Panel) -> bool {
+    const width = panel.*.width
+    const height = panel.*.height
+    if width == panel.*.bufferWidth && height == panel.*.bufferHeight { return true }
+    dropBuffers(panel)
+    panel.*.busy[0] = false
+    panel.*.busy[1] = false
+    if panel.*.frames == FRAMES_DMABUF {
+        if makeDmabufs(panel) {
+            panel.*.bufferWidth = width
+            panel.*.bufferHeight = height
+            return true
+        }
+        // Not taken: the GPU draws into shared memory instead.
+        dropBuffers(panel)
+        panel.*.frames = FRAMES_SHM_COPY
+    }
     const frame = width * height * 4
-    if frame * 2 > panel.*.poolSize {
+    // Slots aligned for a GPU that imports the pool.
+    var slot_bytes = frame
+    if panel.*.frames == FRAMES_SHM_DIRECT {
+        const alignment = @intCast(usize, gpu_canvas.context(deviceOf(panel)).*.hostAlignment)
+        slot_bytes = (frame + alignment - 1) / alignment * alignment
+    }
+    if slot_bytes * 2 > panel.*.poolSize {
         if panel.*.hasPool {
             panel.*.pool.destroy()
             panel.*.memory.release()
             panel.*.hasPool = false
         }
         var memory: wl.SharedMemory = undefined
-        if !wl.transport.createSharedMemory(&memory, frame * 2) { return false }
+        if !wl.transport.createSharedMemory(&memory, slot_bytes * 2) { return false }
         panel.*.memory = memory
-        panel.*.pool = panel.*.shm.createPool(memory.handle, @intCast(i32, frame * 2))
-        panel.*.poolSize = frame * 2
+        panel.*.pool = panel.*.shm.createPool(memory.handle, @intCast(i32, slot_bytes * 2))
+        panel.*.poolSize = slot_bytes * 2
         panel.*.hasPool = true
     }
+    panel.*.slotBytes = slot_bytes
     const format = @intFromEnum(wl.wl_shm.Format.argb8888)
     panel.*.buffers[0] = panel.*.pool.createBuffer(0, @intCast(i32, width), @intCast(i32, height), @intCast(i32, width * 4), format)
-    panel.*.buffers[1] = panel.*.pool.createBuffer(@intCast(i32, frame), @intCast(i32, width), @intCast(i32, height), @intCast(i32, width * 4), format)
+    panel.*.buffers[1] = panel.*.pool.createBuffer(@intCast(i32, slot_bytes), @intCast(i32, width), @intCast(i32, height), @intCast(i32, width * 4), format)
     panel.*.buffers[0].setHandler(onBuffer, contextOf(panel))
     panel.*.buffers[1].setHandler(onBuffer, contextOf(panel))
-    panel.*.busy[0] = false
-    panel.*.busy[1] = false
     panel.*.bufferWidth = width
     panel.*.bufferHeight = height
+    if panel.*.frames == FRAMES_SHM_DIRECT || panel.*.frames == FRAMES_SHM_COPY {
+        const context = gpu_canvas.context(deviceOf(panel))
+        var slot: usize = 0
+        var made = true
+        while slot < 2 && made {
+            const target = targetOf(panel, slot)
+            target.*.fd = -1
+            if panel.*.frames == FRAMES_SHM_DIRECT {
+                made = gpu.importHostMemory(context, target, panel.*.memory.address + slot * slot_bytes, @intCast(u64, slot_bytes))
+            } else {
+                made = gpu.createReadbackBuffer(context, target, @intCast(u64, frame))
+            }
+            panel.*.hasTargets = true
+            slot += 1
+        }
+        if !made {
+            dropBuffers(panel)
+            panel.*.frames = FRAMES_CPU
+            return fitBuffers(panel)
+        }
+    }
     return true
 }
 
@@ -734,15 +973,35 @@ fn redraw(panel: *Panel) -> void {
         if panel.*.busy[1] { return }
         slot = 1
     }
-    var pixels: [*]u32 = undefined
-    unsafe { pixels = @ptrFromInt([*]u32, @intFromPtr(panel.*.memory.bytes()) + slot * panel.*.width * panel.*.height * 4) }
-    var canvas = Canvas.{ .pixels = pixels, .width = panel.*.width, .height = panel.*.height }
-    panel.*.draw(panel.*.context, &canvas)
+    const width = panel.*.width
+    const height = panel.*.height
+    if panel.*.frames == FRAMES_CPU {
+        var pixels: [*]u32 = undefined
+        unsafe { pixels = @ptrFromInt([*]u32, panel.*.memory.address + slot * panel.*.slotBytes) }
+        var canvas = Canvas.{ .pixels = pixels, .width = width, .height = height, .device = 0 }
+        panel.*.draw(panel.*.context, &canvas)
+    } else {
+        // Recorded, then drawn by the GPU into the slot's buffer.
+        const device = deviceOf(panel)
+        gpu_canvas.begin(device, @intCast(u32, width), @intCast(u32, height))
+        var nowhere: [*]u32 = undefined
+        unsafe { nowhere = @ptrFromInt([*]u32, 16) }
+        var canvas = Canvas.{ .pixels = nowhere, .width = width, .height = height, .device = panel.*.device }
+        panel.*.draw(panel.*.context, &canvas)
+        const target = targetOf(panel, slot)
+        if !gpu_canvas.paint(device, target.*.buffer, 0, @intCast(u32, width)) {
+            leaveGpu(panel)
+            return
+        }
+        if panel.*.frames == FRAMES_SHM_COPY {
+            gpu_canvas.copyBytes(panel.*.memory.address + slot * panel.*.slotBytes, target.*.address, width * height * 4)
+        }
+    }
     panel.*.dirty = false
     panel.*.busy[slot] = true
     const buffer = panel.*.buffers[slot]
     panel.*.surface.attach(&buffer, 0, 0)
-    panel.*.surface.damage(0, 0, @intCast(i32, panel.*.width), @intCast(i32, panel.*.height))
+    panel.*.surface.damage(0, 0, @intCast(i32, width), @intCast(i32, height))
     const callback = panel.*.surface.frame()
     callback.setHandler(onFrame, contextOf(panel))
     panel.*.framePending = true
