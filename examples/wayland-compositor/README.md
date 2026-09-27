@@ -611,7 +611,9 @@ version 3, `wl_subcompositor`, `xdg_wm_base` with toplevels (with
 `configure_bounds`: the output's size), popups and positioners,
 `zwlr_layer_shell_v1` version 5, `zwlr_foreign_toplevel_manager_v1`
 version 3, `ext_background_effect_manager_v1` version 1 (see Dock and
-launcher) and `zxdg_decoration_manager_v1` version 2 (see Decorations).
+launcher), `zxdg_decoration_manager_v1` version 2 (see Decorations),
+`zwp_relative_pointer_manager_v1` and `zwp_pointer_constraints_v1`
+version 1 (see Pointer lock).
 Composition is done in software, or with Vulkan (`--renderer vulkan`).
 
 ### GPU clients (OpenGL, Vulkan)
@@ -646,6 +648,27 @@ When the renderer cannot import a client's dma-buf, the log says which
 step failed (for example `vkGetMemoryFdPropertiesKHR refused the
 dma-buf`): a linear buffer is then copied by the CPU, a tiled one is not
 shown.
+
+### Pointer lock
+
+Games and 3D programs turn the camera with the mouse through relative
+motion and pointer constraints ([`pointer.mlx`](pointer.mlx)); SDL3, and
+with it Minecraft, refuses its relative mouse mode without both.
+
+- Relative motion goes to the client under the pointer: the mouse's own
+  movement and the accelerated one, also where the pointer cannot move
+  (the output's edge, a lock). Nested, the host's pointer movement stands
+  in for it.
+- A lock or confinement holds while its window has the pointer and the
+  keyboard. Super (the launcher) or a click on another window always
+  frees the pointer; a oneshot constraint then ends, a persistent one
+  comes back when the window has both again.
+- Locked, the pointer stays put and the client gets no `wl_pointer.motion`;
+  when the lock ends the pointer goes to the client's cursor position
+  hint. Confined, it stays within the surface and the bounds of the
+  region. Regions and hints apply at once, not on the next commit.
+
+`--verbose` logs `pointer: locked` and `pointer: unlocked`.
 
 ## Copy and paste
 

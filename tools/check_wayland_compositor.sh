@@ -25,7 +25,10 @@
 #      paste between two clients, and a GTK 4 window;
 #   8. xdg-decoration: a client asking to draw its own title bar is told
 #      the compositor draws it, until the settings file allows client
-#      decorations (and again not when it stops).
+#      decorations (and again not when it stops);
+#   9. pointer constraints and relative motion: a client locks the pointer
+#      on its window; after a click it is locked, the pointer stays put and
+#      the client gets the host's movement as relative motion.
 #
 # Typed commands create marker files, so keyboard delivery is verified at the
 # shell; the moved window's focus frame is checked in the host's screenshot.
@@ -319,6 +322,45 @@ rm -f "$XDG_CONFIG_HOME/mlx/compositor.conf"
 modes=$(uniq "$work/decoration.log" | tr '\n' ' ')
 [[ "$modes" == "decoration: server side decoration: client side decoration: server side " ]] || { echo "decoration modes: $modes" >&2; cat "$work/decoration-compositor.log" >&2; exit 1; }
 echo "ok   xdg-decoration: server side by default, client side while the settings allow it"
+
+# Scenario 9: a pointer lock (examples/wayland-client --lock, its window at
+# (24, 24)). The click gives it the pointer and the keyboard, so the lock
+# holds: the cursor stays at (100, 100) while the host's pointer travels
+# (+100, +50), which reaches the client as relative motion.
+cat > "$work/lock.sh" <<SCRIPT
+#!/bin/sh
+exec "$work/hello-wayland" --lock > "$work/lock.log"
+SCRIPT
+chmod +x "$work/lock.sh"
+cat > "$work/lock.script" <<SCRIPT
+wait 1500
+pointer 100 100
+press 272
+release 272
+wait 300
+pointer 130 110
+pointer 170 125
+pointer 200 150
+wait 300
+shot $work/lock.ppm
+close
+SCRIPT
+run_scenario lock "$work/lock.script" --run "$work/lock.sh"
+grep -q "^pointer: locked" "$work/lock.log" || { echo "the pointer was not locked" >&2; cat "$work/lock.log" "$work/lock-compositor.log" >&2; exit 1; }
+[[ "$(grep '^relative:' "$work/lock.log" | tail -1)" == "relative: 100 50" ]] || { echo "relative motion: $(grep '^relative:' "$work/lock.log" | tail -1)" >&2; cat "$work/lock-compositor.log" >&2; exit 1; }
+python3 - "$work/lock.ppm" <<'PY'
+import sys
+data = open(sys.argv[1], 'rb').read()
+_, size, _, pixels = data.split(b'\n', 3)
+width, height = map(int, size.split())
+def white(x0, y0):
+    return sum(1 for y in range(y0, y0 + 17) for x in range(x0, x0 + 17)
+               if pixels[(y * width + x) * 3:(y * width + x) * 3 + 3] == b'\xff\xff\xff')
+# The arrow (white inside) where the lock held it, not where the host's
+# pointer went.
+assert white(100, 100) > 10 and white(200, 150) == 0, (white(100, 100), white(200, 150))
+PY
+echo "ok   a pointer lock holds the cursor and relative motion reaches the client"
 
 # Scenario 6: copy and paste between two clients through the compositor's
 # wl_data_device_manager, with wl-clipboard (if available): wl-copy sets

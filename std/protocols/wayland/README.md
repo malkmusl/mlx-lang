@@ -13,6 +13,8 @@ build inputs; applications only `@import("std.wayland")`.
 | `wlr-layer-shell-unstable-v1.xml` | wlr-protocols bf4fc79a, `unstable/wlr-layer-shell-unstable-v1.xml` |
 | `wlr-foreign-toplevel-management-unstable-v1.xml` | wlr-protocols bf4fc79a, `unstable/wlr-foreign-toplevel-management-unstable-v1.xml` |
 | `xdg-decoration-unstable-v1.xml` | wayland-protocols 1.49, `unstable/xdg-decoration/xdg-decoration-unstable-v1.xml` |
+| `relative-pointer-unstable-v1.xml` | wayland-protocols 1.49, `unstable/relative-pointer/relative-pointer-unstable-v1.xml` |
+| `pointer-constraints-unstable-v1.xml` | wayland-protocols 1.49, `unstable/pointer-constraints/pointer-constraints-unstable-v1.xml` |
 
 The files are byte-for-byte copies of the upstream releases. `SOURCES`
 records each file's URL, release and SHA-256. Bootstrap tooling must preserve
