@@ -215,8 +215,14 @@ validates its structure: header (magic, version, bound, schema), word counts,
 known opcodes, operands decoded exactly by signature (enumerant parameters
 and composites included), result ids inside the bound and defined once,
 every referenced id defined somewhere, the logical layout order, function
-delimiting, exactly one memory model and at least one entry point. It does
-not check typing or execution-model rules — that is `spirv-val`'s job — but
+delimiting, exactly one memory model and at least one entry point, and the
+block rules inside functions: every instruction after the parameters in a
+block that starts with `OpLabel` and ends with its one branch or return,
+`OpSelectionMerge` right before `OpBranchConditional` or `OpSwitch` and
+`OpLoopMerge` right before `OpBranch` or `OpBranchConditional` (lavapipe
+refuses a pipeline that breaks this without saying why), and function
+variables first in the first block. It does not check typing or
+execution-model rules — that is `spirv-val`'s job — but
 it guarantees a driver can decode the module safely.
 
 `tests/255_spirv_module_runtime.mlx` builds the shader, walks and validates
@@ -225,7 +231,10 @@ it, writes it out (`tests/run_vulkan.sh` then runs Khronos `spirv-val
 copies fail with the right error: swapped magic, a future version, a zero
 bound, a truncated instruction, an unterminated function, the memory model
 before the capabilities, an extra operand, an unknown opcode, a zero word
-count and an id at the bound. `run_vulkan.sh` also compiles the sample
+count and an id at the bound; and that small shaders breaking one block
+rule each fail too (an instruction between a merge and its branch, a block
+without an end, an instruction after the last return, a function variable
+after other instructions). `run_vulkan.sh` also compiles the sample
 shaders in `tests/support/spirv/` (`features.comp`, `textures.frag`,
 `camera.vert`) with glslang for Vulkan 1.0 and 1.3 and validates them.
 `tests/254_spirv_compute_runtime.mlx` runs the builder's shader on lavapipe
