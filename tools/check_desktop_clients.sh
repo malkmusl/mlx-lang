@@ -503,6 +503,11 @@ assert min(at(768, 128)) > 200, at(768, 128)
 # The sidebar: the home selected, its icon blue.
 assert blue(at(48, 82)), at(48, 82)
 PY
+    # The picture of photo.png, made by the thumbnail worker into the
+    # freedesktop cache (named by the MD5 of its URI).
+    local thumb
+    thumb=$(python3 -c 'import hashlib, sys; print(hashlib.md5(("file://" + sys.argv[1]).encode()).hexdigest())' "$home/photo.png")
+    [[ -s "$home/.cache/thumbnails/normal/$thumb.png" ]] || fail "files ($canvas): no thumbnail of photo.png in ~/.cache/thumbnails/normal" "$log"
     [[ -d "$home/Stuff" && ! -e "$home/untitled folder" ]] || fail "files ($canvas): Ctrl+Shift+N and typing did not make the folder Stuff ($(ls "$home" | tr '\n' ' '))" "$log"
     grep -q "^drag: dropped on" "$log" && [[ -f "$home/Stuff/photo.png" && ! -e "$home/photo.png" ]] || fail "files ($canvas): the picture dragged onto Stuff did not move into it" "$log"
     [[ -f "$home/ideas.txt" && ! -e "$home/notes.txt" ]] || fail "files ($canvas): F2 did not rename notes.txt to ideas.txt ($(ls "$home" | tr '\n' ' '))" "$log"

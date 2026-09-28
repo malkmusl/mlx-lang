@@ -178,8 +178,11 @@ its defaults there when the file is missing).
 After a second separator come folders and the trash, as on macOS. The
 folders are listed in `~/.config/mlx/dock-folders` (`~/Downloads` when
 the file is missing); a click on one shows it as a stack: a popup grid of
-its files and folders, newest first, with icons by type (PNG files as
-pictures), scrolled with the wheel, and "Open" above (a click on an entry
+its files and folders, newest first, with icons by type (pictures from
+the freedesktop thumbnail cache, `~/.cache/thumbnails`, which Dolphin and
+Nautilus fill too; a PNG without one gets it from a worker process,
+`desktop-shared/thumbs.mlx`, so a folder of big screenshots opens at once
+and its pictures come in as they are made), scrolled with the wheel, and "Open" above (a click on an entry
 opens it). A right click offers "Open" and "Remove from Dock", and a
 folder dragged onto the dock from a file manager joins them. The trash
 (`$XDG_DATA_HOME/Trash`) shows whether it holds anything; a click opens
@@ -227,8 +230,8 @@ the launcher, pinned in the dock by default), is laid out like the Finder:
 a translucent sidebar with the home folder, the user's folders
 (`~/.config/user-dirs.dirs`: Dokumente, Bilder on a German system), the
 computer and the trash; a toolbar with back and forward, the folder's
-name, icons or list and a search field; the files as icons (PNG files as
-pictures) or as a list with the date modified, the size and the kind (a
+name, icons or list and a search field; the files as icons (pictures from the
+thumbnail cache, as in the dock's stacks) or as a list with the date modified, the size and the kind (a
 click on a column sorts by it); and a status bar with the path to click
 on and how many items there are. Folders come first and names sort as
 people count ("Project 2" before "Project 10"). A click selects (Ctrl
