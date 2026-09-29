@@ -235,11 +235,30 @@ def run_system_keyboard(library, fixture, verbose):
 
     # Compact layout at 640x360: Search is x=476..626, y=35..65.
     base = feed(framework, [(ACTION_DOWN, 550, 50, 0), (ACTION_UP, 550, 50, 80 * MS)], 0)
+    editor_focused = framework.jni.focused_text_editor in framework.jni.text_editors
+    editor = framework.jni.focused_text_editor
+    editor_layout = framework.jni.data[editor]["layout"] if editor_focused else 0
+    editor_geometry = framework.jni.data.get(editor_layout)
+    editor_padding = framework.jni.data[editor].get("padding") if editor_focused else None
+    editor_focusable = framework.jni.data[editor].get("setFocusableInTouchMode") if editor_focused else None
     feed(framework, [(ACTION_DOWN, 320, 120, 0), (ACTION_UP, 320, 120, 80 * MS)], base)
+    editor_dismissed = editor_focused and framework.jni.focused_text_editor == 0 and framework.jni.data[editor]["visibility"] == 8
 
     problems = []
-    if framework.ime_shown != [(framework.activity, 0)]:
-        problems.append(f"search did not show the standard IME: {framework.ime_shown}")
+    if not editor_focused:
+        problems.append("search requested the IME without a focused Android text editor")
+    if framework.jni.soft_input_targets != [(editor, 0)]:
+        problems.append(f"standard IME was not targeted at the editor: {framework.jni.soft_input_targets}")
+    if framework.ime_shown:
+        problems.append(f"search still targeted NativeActivity's non-editor view: {framework.ime_shown}")
+    if editor_geometry != {"width": 150, "height": 30, "margins": (476, 35, 0, 0)}:
+        problems.append(f"Android editor did not cover the responsive search field: {editor_geometry}")
+    if editor_padding != (32, 0, 8, 0):
+        problems.append(f"Android editor did not preserve the search glyph inset: {editor_padding}")
+    if editor_focusable != 1:
+        problems.append("Android editor was not focusable in touch mode")
+    if not editor_dismissed:
+        problems.append("leaving search did not remove the Android editor from focus and hit testing")
     if framework.ime_hidden != [(framework.activity, 0)]:
         problems.append(f"leaving search did not hide the standard IME: {framework.ime_hidden}")
     lines = log_lines(framework)

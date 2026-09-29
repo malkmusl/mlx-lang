@@ -132,10 +132,12 @@ finished as handled. Android's safe-area insets and density feed
 the Wayland desktop app instead of maintaining a separate mobile skin. Its
 default renderer is the shared Vulkan Canvas paint shader on a
 `VK_KHR_android_surface` swapchain; a locked RGBA_8888 window buffer is the
-fallback when Vulkan is unavailable or fails. `showSystemKeyboard` and
-`hideSystemKeyboard` wrap NativeActivity's standard IME requests; the Files
-search field uses them for focus gained by touch and dismissal outside the
-field.
+fallback when Vulkan is unavailable or fails. `focusTextInput` layers a
+transparent Java `EditText` over a native field, gives it the
+`InputConnection` required by keyboards such as Gboard, and targets the
+system IME at that editor. The Files search field uses it for focus gained
+by touch; `dismissTextInput` removes it from hit testing and closes the IME
+when focus leaves the field.
 
 `examples/android/gestures.mlx` colors the screen below the status bar
 and above the navigation bar by the last gesture: blue at start, green for
