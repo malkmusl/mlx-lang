@@ -34,6 +34,8 @@ Controls:
 - tap a row to select a file or open that directory;
 - tap a grid cell to select a file or open that directory;
 - tap the toolbar's Back button to go to the parent directory;
+- tap Search in compact or wide layouts to focus it and open Android's
+  configured system keyboard; tap outside it to dismiss the keyboard;
 - swipe up/down to move the selection;
 - swipe left to open the selected directory;
 - swipe right to go to the parent directory;

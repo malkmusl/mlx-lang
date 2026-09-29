@@ -33,6 +33,8 @@ class FilesFramework(VulkanApp):
         self.data_path = os.fsencode(data_path) + b"\0"
         self.freed = []
         self.handled = []
+        self.ime_shown = []
+        self.ime_hidden = []
         super().__init__(library, available=vulkan, verbose=verbose, jni={"sdk": 34, "insets": (24, 0, 30, 0)})
         self.vulkan.first_pipeline = "paint"
         self.vulkan.extent = (360, 640)
@@ -41,11 +43,19 @@ class FilesFramework(VulkanApp):
         imports = super()._imports()
         imports["free"] = lambda process, address, *_: self.freed.append(address) or 0
         imports["AInputQueue_finishEvent"] = self._finish_event
+        imports["ANativeActivity_showSoftInput"] = self._show_soft_input
+        imports["ANativeActivity_hideSoftInput"] = self._hide_soft_input
         return imports
 
     def _finish_event(self, process, queue, event, handled, *_):
         self.finished.append(event)
         self.handled.append(handled & 0xFFFFFFFF)
+
+    def _show_soft_input(self, process, activity, flags, *_):
+        self.ime_shown.append((activity, flags & 0xFFFFFFFF))
+
+    def _hide_soft_input(self, process, activity, flags, *_):
+        self.ime_hidden.append((activity, flags & 0xFFFFFFFF))
 
     def prepare_activity(self):
         super().prepare_activity()
@@ -213,6 +223,45 @@ def run_vulkan(library, fixture, verbose):
     return ok
 
 
+def run_system_keyboard(library, fixture, verbose):
+    """The compact responsive toolbar exposes Search. A direct tap must
+    focus it through Android's NativeActivity IME API, and a tap outside it
+    must dismiss the same system keyboard."""
+    framework = FilesFramework(library, fixture, verbose)
+    framework.vulkan.extent = (640, 360)
+    framework.create()
+    framework.show_window()
+    framework.attach_input()
+
+    # Compact layout at 640x360: Search is x=476..626, y=35..65.
+    base = feed(framework, [(ACTION_DOWN, 550, 50, 0), (ACTION_UP, 550, 50, 80 * MS)], 0)
+    feed(framework, [(ACTION_DOWN, 320, 120, 0), (ACTION_UP, 320, 120, 80 * MS)], base)
+
+    problems = []
+    if framework.ime_shown != [(framework.activity, 0)]:
+        problems.append(f"search did not show the standard IME: {framework.ime_shown}")
+    if framework.ime_hidden != [(framework.activity, 0)]:
+        problems.append(f"leaving search did not hide the standard IME: {framework.ime_hidden}")
+    lines = log_lines(framework)
+    if "files: search focused" not in lines or "files: search dismissed" not in lines:
+        problems.append("search focus changes were not routed through the Files UI")
+    if framework.handled != [1, 1, 1, 1]:
+        problems.append(f"search motion events were not handled: {framework.handled}")
+
+    framework.callback("onNativeWindowDestroyed", WINDOW)
+    framework.callback("onInputQueueDestroyed", QUEUE)
+    framework.callback("onDestroy")
+    if framework.lib.missing:
+        problems.append(f"unmodeled imports called: {sorted(framework.lib.missing)}")
+
+    ok = not problems
+    if verbose or not ok:
+        print(f"{'ok  ' if ok else 'FAIL'} Android system keyboard")
+        for problem in problems:
+            print(f"     {problem}")
+    return ok
+
+
 def run_cpu_fallback(library, fixture, verbose):
     framework = FilesFramework(library, fixture, verbose, vulkan=False)
     framework.create()
@@ -250,10 +299,11 @@ def run(library, fixture, empty_fixture, verbose):
     passed = (
         int(run_empty_toolbar_touch(library, empty_fixture, verbose))
         + int(run_vulkan(library, fixture, verbose))
+        + int(run_system_keyboard(library, fixture, verbose))
         + int(run_cpu_fallback(library, fixture, verbose))
     )
-    print(f"{passed}/3 android file-manager scenarios passed")
-    return passed == 3
+    print(f"{passed}/4 android file-manager scenarios passed")
+    return passed == 4
 
 
 def main():
