@@ -118,6 +118,22 @@ input allocates nothing. `Canvas`, `fill`, `fillRect`, `fillArea` and `rgb`
 draw into the locked RGBA_8888 window buffer; each paint also sets the
 canvas's `reserved` insets and `free` rectangle (below).
 
+Apps whose model is larger than one `usize` use `startWithContext`: its draw
+and update callbacks receive an app-owned context pointer, and its destroy
+callback releases that context when the activity is destroyed. The small
+selection/state value is still saved across recreation. `internalDataPath`
+and `externalDataPath` expose the corresponding zero-terminated paths from
+`ANativeActivity`; the latter may be null. `examples/mlx-files-android`
+uses `internalDataPath` to browse the app-private files directory without a
+storage permission. It owns the raw input/window callbacks used by the
+Vulkan demo, so row and toolbar taps are hit-tested by coordinate and
+finished as handled. Android's safe-area insets and density feed
+`examples/filemanager-shared`, so it renders the same responsive Files UI as
+the Wayland desktop app instead of maintaining a separate mobile skin. Its
+default renderer is the shared Vulkan Canvas paint shader on a
+`VK_KHR_android_surface` swapchain; a locked RGBA_8888 window buffer is the
+fallback when Vulkan is unavailable or fails.
+
 `examples/android/gestures.mlx` colors the screen below the status bar
 and above the navigation bar by the last gesture: blue at start, green for
 a tap, yellow for a long press, red/magenta for a swipe right/left,
@@ -218,6 +234,7 @@ calls), the `O_*` bits that differ, and the `struct stat` and
 | `tools/check_android_packaging.py` | CRC-32, Adler-32, SHA-1, SHA-256 and bignum results of the packaging code, built by mlx0 and by mlx1, against Python |
 | `tools/check_android_apk.py` | `apksigner`, `jarsigner`, `zipalign`, `aapt2` on a built APK; reproducible output |
 | `tools/emulate_android_app.py` | the gesture example against a model of the Android framework: taps, long presses, swipes, cancel, rotation, and the reserved space (a fake `JNIEnv`, see below): only the background under the status and navigation bars, nothing reserved when fullscreen |
+| `tools/emulate_android_files.py` | the Android file manager against real populated and fresh-empty temporary directories exposed as `internalDataPath`: Vulkan-by-default shared-Canvas rendering, direct grid/list toolbar, row, grid-cell and Back-button touch input, handled motion events, natural sorting, navigation, refresh, CPU fallback and activity teardown |
 | `tools/emulate_vulkan_android.py` | `examples/vulkan-android` against the same framework model plus a mock Vulkan driver behind `libvulkan.so`: instance and device extensions, the submitted shader (`spirv-val`), swapchain creation on an R8G8B8A8, "inherit"-alpha surface, every presented frame pixel by pixel, the reserved space (a fake `JNIEnv` answers `getRootWindowInsets` on API 34 through `WindowInsets.Type` and `Insets`, and on API 29 through `getSystemWindowInset*` and `getDisplayCutout`, plus the status bar dimens; before the first layout pass it has none) with only the background under it and the landscape top band at its portrait height, frames paced by a modeled `AChoreographer` (one per vsync; the 60 Hz timer without it), each presented before the app waits for the GPU and never re-recorded before that wait (a modeled fence), one present semaphore per image and `minImageCount` images, the frame counter under the label (`60 FPS`, and the `perf:` log line), the request for 120 Hz (`ANativeWindow_setFrameRate`: 120 frames a second on a display that allows it, 60 with "Smooth Display" off), the fullscreen, navigation bar and gesture bar switches tapped at runtime (the content behind a transparent gesture bar) (`WindowInsetsController` on API 34, system UI flags on API 29) with the reserved space following, the std.truetype label at the top center of the rest and the buttons at its bottom center (the system font served from the test font, the `text` shader run on the fills, atlas and runs the app built), touch, out-of-date and resized swapchains, background and return, and devices without a system font or without Vulkan |
 
 The emulator cannot run Android itself, so the last step is a device:

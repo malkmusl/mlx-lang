@@ -245,10 +245,11 @@ class MockVulkan:
         return 0
 
     def vk_CreateComputePipelines(self, process, device, cache, count, infos, allocator, pipelines, *_):
-        # The app creates the pattern pipeline first, the text one second.
+        # The Vulkan demo creates pattern then text. GPU-canvas clients mark
+        # their single pipeline as paint before activity creation.
         for index in range(count):
             handle = self.handle()
-            self.pipelines[handle] = "pattern" if not self.pipelines else "text"
+            self.pipelines[handle] = getattr(self, "first_pipeline", "pattern") if not self.pipelines else "text"
             self.put_u64(pipelines + 8 * index, handle)
         return 0
 
@@ -381,6 +382,8 @@ class MockVulkan:
                 state["push"] = command[1]
             elif kind == "pipeline":
                 state["pipeline"] = self.pipelines[command[1]]
+            elif kind == "dispatch" and state.get("pipeline") == "paint":
+                self.run_paint(state["push"], state["set"], command[1], command[2])
             elif kind == "dispatch" and state.get("pipeline") == "text":
                 self.run_text(state["push"], state["set"], command[1], command[2])
             elif kind == "dispatch":
@@ -402,6 +405,49 @@ class MockVulkan:
                 assert self.acquire_semaphore in waits, "the copy does not wait for the acquired image"
                 image["pixels"] = struct.unpack(f"<{width * height}I", self.lib.read(self.buffers[source][1] + offset, width * height * 4))
 
+    def run_paint(self, push, bindings, groups_x, groups_y):
+        """The GPU-canvas paint shader, sufficient for the Files UI: clear,
+        filled rectangles and strokes. Glyph/image commands are irrelevant to
+        its palette and interaction assertions."""
+        width, height, target_offset, target_stride, command_offset, command_count = push
+        assert groups_x * 8 >= width and groups_y * 8 >= height, "paint dispatch does not cover the frame"
+        target = self.buffers[bindings[0]][1]
+        data = self.buffers[bindings[1]][1]
+        pixels = list(struct.unpack(f"<{target_stride * height}I", self.lib.read(target + target_offset * 4,
+                                                                                 target_stride * height * 4)))
+
+        def signed(value):
+            return value - (1 << 32) if value >= 1 << 31 else value
+
+        def put(x, y, color):
+            if 0 <= x < width and 0 <= y < height:
+                at = y * target_stride + x
+                pixels[at] = color if color >> 24 == 255 else blend(pixels[at], color)
+
+        for index in range(command_count):
+            address = data + (command_offset + index * 16) * 4
+            words = struct.unpack("<16I", self.lib.read(address, 64))
+            kind = words[0]
+            x, y, box_width, box_height = map(signed, words[1:5])
+            color = words[7]
+            left, top = max(0, x), max(0, y)
+            right, bottom = min(width, x + box_width), min(height, y + box_height)
+            if kind == 0:  # CLEAR
+                for row in range(top, bottom):
+                    start = row * target_stride + left
+                    pixels[start:start + max(0, right - left)] = [color] * max(0, right - left)
+            elif kind == 1:  # FILL (rounding does not affect palette checks)
+                for row in range(top, bottom):
+                    for column in range(left, right):
+                        put(column, row, color)
+            elif kind == 2:  # STROKE
+                thickness = signed(words[6])
+                for row in range(top, bottom):
+                    for column in range(left, right):
+                        if column < x + thickness or column >= x + box_width - thickness or row < y + thickness or row >= y + box_height - thickness:
+                            put(column, row, color)
+        self.lib.write(target + target_offset * 4, struct.pack(f"<{len(pixels)}I", *pixels))
+
     def run_text(self, push, bindings, groups_x, groups_y):
         """The `text` shader: per pixel of the run's box, the largest of the
         base coverage and the atlas coverage of the quads covering it,
@@ -409,7 +455,7 @@ class MockVulkan:
         def signed(value):
             return value - (1 << 32) if value >= 1 << 31 else value
         (width, height, offset, origin_x, origin_y, box_left, box_top, box_width, box_height,
-         count, atlas_width, color, run_offset, base_coverage) = push
+         count, atlas_width, color, run_offset, base_coverage, target_stride) = push
         origin_x, origin_y, box_left, box_top = map(signed, (origin_x, origin_y, box_left, box_top))
         assert groups_x * 8 >= box_width and groups_y * 8 >= box_height, "text dispatch does not cover the run"
         atlas_handle, runs_handle, target_handle = bindings[0], bindings[1], bindings[2]
@@ -437,7 +483,7 @@ class MockVulkan:
             tx, ty = origin_x + x, origin_y + y
             if value == 0 or not (0 <= tx < width and 0 <= ty < height):
                 continue
-            at = target + (offset + ty * width + tx) * 4
+            at = target + (offset + ty * target_stride + tx) * 4
             under = struct.unpack("<I", self.lib.read(at, 4))[0]
             alpha = (value * (color >> 24) + 127) // 255
             result = 0xFF000000

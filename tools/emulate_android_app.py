@@ -27,7 +27,9 @@ sys.path.insert(0, os.path.join(ROOT, "tools"))
 from aarch64_linux_emulator import Float32, SharedLibrary  # noqa: E402
 
 HEAP = 0x6000_0000_0000
-HEAP_SIZE = 16 << 20
+# GPU-canvas clients keep a 20 MiB image/font heap in mapped Vulkan memory.
+# Reserve enough virtual space for that plus the framework and swapchain.
+HEAP_SIZE = 64 << 20
 WINDOW = 0x5700_0000_0001
 QUEUE = 0x5700_0000_0002
 LOOPER = 0x5700_0000_0003
