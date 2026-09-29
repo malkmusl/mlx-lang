@@ -81,7 +81,8 @@ Options: `--socket NAME`, `--size WxH`, `--fullscreen` (a fullscreen
 window at the monitor's resolution), `--renderer auto|vulkan|cpu` (default
 `auto`: Vulkan when a driver works, else the CPU), `--font PATH|none`,
 `--terminal PROGRAM`, `--launcher PROGRAM|none` (what Super starts),
-`--dock PROGRAM|none` (the dock, kept running), `--run PROGRAM`
+`--dock PROGRAM|none` (the dock, kept running), `--topbar PROGRAM|none`
+(the top bar, kept running), `--run PROGRAM`
 (repeatable), `--screenshot FILE`, `--timeout SECONDS`, `--no-fps` (no
 frames-per-second counters in the title bars), `--verbose` (which also
 logs, once a second, `perf:` lines with the frame rate and how long a
@@ -177,15 +178,29 @@ its defaults there when the file is missing).
 After a second separator come folders and the trash, as on macOS. The
 folders are listed in `~/.config/mlx/dock-folders` (`~/Downloads` when
 the file is missing); a click on one shows it as a stack: a popup grid of
-its files and folders, newest first, with icons by type (PNG files as
-pictures), scrolled with the wheel, and "Open" above (a click on an entry
+its files and folders, newest first, with icons by type (pictures from
+the freedesktop thumbnail cache, `~/.cache/thumbnails`, which Dolphin and
+Nautilus fill too; a PNG without one gets it from a worker process,
+`desktop-shared/thumbs.mlx`, so a folder of big screenshots opens at once
+and its pictures come in as they are made), scrolled with the wheel, and "Open" above (a click on an entry
 opens it). A right click offers "Open" and "Remove from Dock", and a
 folder dragged onto the dock from a file manager joins them. The trash
 (`$XDG_DATA_HOME/Trash`) shows whether it holds anything; a click opens
 it in the file manager (asked over D-Bus, `org.freedesktop.FileManager1`,
 else its directory with `xdg-open`: `xdg-open trash:///` would reach the
 browser), its menu empties it, and files dropped on it go into it (`gio
-trash`; an app dragged from the launcher does not). Should the dock
+trash`; an app dragged from the launcher does not). A folder opened from
+the stack (its Open button, or a folder in it) opens in the file manager
+out of the stack, as on macOS: the dock keeps the stack up and tells the
+compositor a window is coming (`z` on its socket pair); the next window
+to map within three seconds starts at the stack's size and place, the
+stack goes in that same frame, and the window grows to where it rests in
+a third of a second, easing out and fading in (`zoom:` in the log). On
+the Vulkan renderer the window is drawn flat into the scratch buffer and
+scaled by the previews' `shrink` kernel (with an opacity); the CPU
+renderer scales its buffer (nearest pixel) inside the frame's colour. The
+trash and a folder's "Open" grow their window out of the icon (`Z` and
+the icon's rectangle). Should the dock
 crash, it says where first (`mlx-dock: crashed: ...` in the compositor's
 log), as the compositor does.
 
@@ -195,6 +210,46 @@ out of sight once the pointer has been away from it for 0.6 seconds and
 back up when the pointer touches the output's bottom edge; it stays while
 its previews show or a button is held.
 
+The top bar (`mlx-topbar`, `--topbar PROGRAM|none`, started and kept
+running like the dock over `MLX_TOPBAR_FD`) sits in the top layer along
+the top edge, 30 pixels high with an exclusive zone, as the menu bar of
+macOS: maximized windows start below it and windows placed under it are
+moved down. It is translucent over a blur and shows a mark and the name
+of the active window's app on the left (its desktop entry's name, else
+its app id or title) and the date and time on the right ("So. 27. Sep.
+16:05" when `LC_ALL`, `LC_TIME` or `LANG` is German, else "Sun 27 Sep
+16:05"). The time zone comes from `$TZ` (a zone name looked up in
+`/usr/share/zoneinfo`, a file, or a POSIX rule such as
+`CET-1CEST,M3.5.0,M10.5.0/3`), else `/etc/localtime`; the TZif files
+and their rules for the years after the table are read by
+`desktop-shared/clock.mlx`. `MLX_SESSION_TOPBAR=no` starts the session
+without it.
+
+The file manager, [`examples/mlx-files`](../mlx-files/main.mlx) (Files in
+the launcher, pinned in the dock by default), is laid out like the Finder:
+a translucent sidebar with the home folder, the user's folders
+(`~/.config/user-dirs.dirs`: Dokumente, Bilder on a German system), the
+computer and the trash; a toolbar with back and forward, the folder's
+name, icons or list and a search field; the files as icons (pictures from the
+thumbnail cache, as in the dock's stacks) or as a list with the date modified, the size and the kind (a
+click on a column sorts by it); and a status bar with the path to click
+on and how many items there are. Folders come first and names sort as
+people count ("Project 2" before "Project 10"). A click selects (Ctrl
+adds, Shift a range, a rectangle dragged over empty space selects what it
+touches), a double click or Enter opens (a file with `xdg-open`). F2
+renames (the name before its extension selected), Ctrl+Shift+N makes a
+folder, Delete moves to the trash (`gio trash`), Ctrl+C, Ctrl+X and
+Ctrl+V copy, cut and paste within it, Ctrl+F searches, Ctrl+H shows hidden
+files, Backspace or Alt+Left goes back, Alt+Up to the parent; typing jumps
+to a name. The right-click menu offers these, "Add to Dock" for a folder,
+"Open in Terminal", and in the trash "Put Back" and "Delete Immediately".
+Files dragged out go as `text/uri-list` (onto the dock's trash, into
+another folder); files dropped in are copied, its own moved. It reads a
+folder again within a second when it changes, and its labels and dates
+follow the locale. `mlx-files PATH`, `file://` URIs and `trash:///` open
+it where asked; the dock opens its folders and the trash in it when it is
+installed.
+
 mlx-settings lists the hotkeys: a click on one records the next key
 combination (Escape keeps the old one, Backspace unbinds it, a right click
 restores the default). Meanwhile the compositor passes every key to it,
@@ -203,7 +258,7 @@ which any client may use while it has the keyboard); Alt+Shift+Q and the
 VT switch stay the compositor's. `~/.config/mlx/dock` lists the pinned apps, one
 desktop entry id per line (`org.gnome.Nautilus`, `firefox`), `terminal` for
 the Mlx terminal; without it the dock pins the terminal and the first file
-manager, browser and editor it finds. Icons are PNGs (the hicolor theme or
+manager (mlx-files first), browser and editor it finds. Icons are PNGs (the hicolor theme or
 `/usr/share/pixmaps`); an app with only an SVG icon gets a tile with its
 initial.
 
@@ -213,7 +268,8 @@ The compositor passes `MLX_TERMINAL` (its `--terminal`) and `MLX_LAUNCHER`
 checks both clients with scripted input on the CPU and the Vulkan
 renderer: where their surfaces are, Super, typing, starting apps from both,
 switching windows from the dock's previews, the blur, and that both
-renderers draw the same pixels.
+renderers draw the same pixels; and the file manager making, renaming,
+moving and trashing files.
 
 ## Freestanding (DRM/KMS)
 

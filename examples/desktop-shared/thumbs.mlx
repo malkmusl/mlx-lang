@@ -1,0 +1,631 @@
+// Pictures of files (the dock's stacks, the file manager) through the
+// freedesktop thumbnail cache ($XDG_CACHE_HOME/thumbnails, ~/.cache/
+// thumbnails): a PNG's picture is read from normal/MD5.png (128 pixels,
+// MD5 of its file:// URI) when that is at least as new as the file, as
+// Dolphin, Nautilus and the others leave them; else it is queued, and a
+// worker (a child process, so the app never waits on a big picture)
+// decodes the file, scales it down and writes the thumbnail (or a mark in
+// fail/mlx/ for a file it cannot read). The app looks again on its next
+// tick and the picture shows.
+const std = @import("std")
+const png = @import("std.png")
+const apps_module = @import("./apps.mlx")
+
+const Path = apps_module.Path
+const Allocator = std.allocator.Allocator
+
+// What lookup says.
+pub const READY: u8 = 0
+pub const COMING: u8 = 1
+pub const NONE: u8 = 2
+
+// The thumbnails' size (freedesktop "normal"), and files not read at all.
+const NORMAL: usize = 128
+const MAX_BYTES: isize = 67108864
+pub const QUEUE: usize = 48
+
+const SYS_fork: usize = 57
+const SYS_wait4: usize = 61
+const SYS_exit_group: usize = 231
+const WNOHANG: usize = 1
+const O_WRONLY_CREATE_TRUNCATE: usize = 577
+
+pub const Thumbs = struct {
+    // The cache directory (…/thumbnails), when there is a home.
+    cache: Path
+    hasCache: bool
+    allocator: Allocator
+    // Paths waiting for the worker, and those it is on (its process; 0:
+    // none).
+    queue: [48]Path
+    queued: usize
+    working: [48]Path
+    workingCount: usize
+    worker: isize
+}
+
+fn queueAt(thumbs: *Thumbs, index: usize) -> *Path {
+    unsafe { return @ptrFromInt(*Path, @intFromPtr(thumbs) + @offsetOf(Thumbs, "queue") + index * @sizeOf(Path)) }
+}
+
+fn workingAt(thumbs: *Thumbs, index: usize) -> *Path {
+    unsafe { return @ptrFromInt(*Path, @intFromPtr(thumbs) + @offsetOf(Thumbs, "working") + index * @sizeOf(Path)) }
+}
+
+fn cacheOf(thumbs: *Thumbs) -> *Path {
+    unsafe { return @ptrCast(*Path, &thumbs.*.cache) }
+}
+
+fn textOf(path: *Path) -> []const u8 {
+    var bytes: [*]const u8 = undefined
+    unsafe { bytes = @ptrCast([*]const u8, path) }
+    return bytes[0..path.*.length]
+}
+
+fn sameBytes(first: []const u8, second: []const u8) -> bool {
+    if first.length != second.length { return false }
+    var index: usize = 0
+    while index < first.length {
+        if first[index] != second[index] { return false }
+        index += 1
+    }
+    return true
+}
+
+pub fn init(thumbs: *Thumbs, environment: [*][*]const u8, allocator: Allocator) -> void {
+    thumbs.*.allocator = allocator
+    thumbs.*.queued = 0
+    thumbs.*.workingCount = 0
+    thumbs.*.worker = 0
+    const cache = cacheOf(thumbs)
+    apps_module.pathClear(cache)
+    const configured = apps_module.environmentValue(environment, "XDG_CACHE_HOME")
+    if @intFromPtr(configured) != 0 && configured[0] == 47 {
+        apps_module.pathAddC(cache, configured)
+    } else {
+        const home = apps_module.environmentValue(environment, "HOME")
+        if @intFromPtr(home) == 0 || home[0] != 47 {
+            thumbs.*.hasCache = false
+            return
+        }
+        apps_module.pathAddC(cache, home)
+        apps_module.pathAdd(cache, "/.cache")
+    }
+    apps_module.pathAdd(cache, "/thumbnails")
+    thumbs.*.hasCache = true
+}
+
+// ---------------------------------------------------------------------------
+// MD5 (RFC 1321), for the cache's file names
+
+fn rotate(value: u32, count: u32) -> u32 {
+    return (value << @intCast(u5, count)) | (value >> @intCast(u5, 32 - count))
+}
+
+fn word(bytes: [*]const u8, at: usize) -> u32 {
+    return @intCast(u32, bytes[at]) | (@intCast(u32, bytes[at + 1]) << 8) | (@intCast(u32, bytes[at + 2]) << 16) | (@intCast(u32, bytes[at + 3]) << 24)
+}
+
+// The MD5 of `data` as 32 lower-case hex digits into `out`.
+pub fn md5Hex(data: []const u8, out: [*]u8) -> void {
+    var k: [64]u32 = [64]u32{ 3614090360, 3905402710, 606105819, 3250441966, 4118548399, 1200080426, 2821735955, 4249261313, 1770035416, 2336552879, 4294925233, 2304563134, 1804603682, 4254626195, 2792965006, 1236535329, 4129170786, 3225465664, 643717713, 3921069994, 3593408605, 38016083, 3634488961, 3889429448, 568446438, 3275163606, 4107603335, 1163531501, 2850285829, 4243563512, 1735328473, 2368359562, 4294588738, 2272392833, 1839030562, 4259657740, 2763975236, 1272893353, 4139469664, 3200236656, 681279174, 3936430074, 3572445317, 76029189, 3654602809, 3873151461, 530742520, 3299628645, 4096336452, 1126891415, 2878612391, 4237533241, 1700485571, 2399980690, 4293915773, 2240044497, 1873313359, 4264355552, 2734768916, 1309151649, 4149444226, 3174756917, 718787259, 3951481745 }
+    var shifts: [16]u32 = [16]u32{ 7, 12, 17, 22, 5, 9, 14, 20, 4, 11, 16, 23, 6, 10, 15, 21 }
+    var state: [4]u32 = [4]u32{ 1732584193, 4023233417, 2562383102, 271733878 }
+    // The message padded: 0x80, zeros, then its length in bits (64-bit
+    // little-endian), a multiple of 64 bytes; at most 1152 bytes of input
+    // (a path's URI).
+    var block: [1280]u8 = undefined
+    const length = if data.length > 1152 { 1152 } else { data.length }
+    var index: usize = 0
+    while index < length {
+        block[index] = data[index]
+        index += 1
+    }
+    block[length] = 128
+    var total = length + 1
+    while total % 64 != 56 {
+        block[total] = 0
+        total += 1
+    }
+    const bits = @intCast(u64, length) * 8
+    var byte: usize = 0
+    while byte < 8 {
+        block[total + byte] = @intCast(u8, (bits >> @intCast(u6, byte * 8)) & 255)
+        byte += 1
+    }
+    total += 8
+    var bytes: [*]const u8 = undefined
+    unsafe { bytes = @ptrCast([*]const u8, &block) }
+    var chunk: usize = 0
+    while chunk < total {
+        var a = state[0]
+        var b = state[1]
+        var c = state[2]
+        var d = state[3]
+        var round: usize = 0
+        while round < 64 {
+            var f: u32 = 0
+            var g: usize = 0
+            if round < 16 {
+                f = (b & c) | (~b & d)
+                g = round
+            } else if round < 32 {
+                f = (d & b) | (~d & c)
+                g = (5 * round + 1) % 16
+            } else if round < 48 {
+                f = b ^ c ^ d
+                g = (3 * round + 5) % 16
+            } else {
+                f = c ^ (b | ~d)
+                g = (7 * round) % 16
+            }
+            const sum = f +% a +% k[round] +% word(bytes, chunk + g * 4)
+            a = d
+            d = c
+            c = b
+            b = b +% rotate(sum, shifts[(round / 16) * 4 + round % 4])
+            round += 1
+        }
+        state[0] = state[0] +% a
+        state[1] = state[1] +% b
+        state[2] = state[2] +% c
+        state[3] = state[3] +% d
+        chunk += 64
+    }
+    const digits = "0123456789abcdef"
+    var at: usize = 0
+    while at < 16 {
+        const value = (state[at / 4] >> @intCast(u5, (at % 4) * 8)) & 255
+        out[at * 2] = digits[@intCast(usize, value >> 4)]
+        out[at * 2 + 1] = digits[@intCast(usize, value & 15)]
+        at += 1
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Where a file's thumbnail is
+
+// `path` as a file:// URI (bytes outside what a URI path allows as %XX, as
+// GLib and Qt write it) into `into`.
+fn uriOf(path: []const u8, into: *Path) -> void {
+    apps_module.pathClear(into)
+    apps_module.pathAdd(into, "file://")
+    const digits = "0123456789ABCDEF"
+    for byte in path {
+        const letter = (byte >= 97 && byte <= 122) || (byte >= 65 && byte <= 90) || (byte >= 48 && byte <= 57)
+        const allowed = letter || byte == 45 || byte == 46 || byte == 95 || byte == 126 || byte == 47 || byte == 33 || byte == 36 || byte == 38 || byte == 39 || byte == 40 || byte == 41 || byte == 42 || byte == 43 || byte == 44 || byte == 59 || byte == 61 || byte == 58 || byte == 64
+        if into.*.length + 3 < 1020 {
+            if allowed {
+                into.*.bytes[into.*.length] = byte
+                into.*.length += 1
+            } else {
+                into.*.bytes[into.*.length] = 37
+                into.*.bytes[into.*.length + 1] = digits[@intCast(usize, byte >> 4)]
+                into.*.bytes[into.*.length + 2] = digits[@intCast(usize, byte & 15)]
+                into.*.length += 3
+            }
+        }
+    }
+}
+
+// The cache file for URI `uri` in `directory` ("normal", "fail/mlx").
+fn cacheFile(thumbs: *Thumbs, uri: *Path, directory: []const u8, into: *Path) -> void {
+    apps_module.pathClear(into)
+    apps_module.pathAdd(into, textOf(cacheOf(thumbs)))
+    apps_module.pathAdd(into, "/")
+    apps_module.pathAdd(into, directory)
+    apps_module.pathAdd(into, "/")
+    var hex: [32]u8 = undefined
+    var bytes: [*]u8 = undefined
+    unsafe { bytes = @ptrCast([*]u8, &hex) }
+    md5Hex(textOf(uri), bytes)
+    apps_module.pathAdd(into, bytes[0..32])
+    apps_module.pathAdd(into, ".png")
+}
+
+// Whether the file at `path` is there and modified at or after `time`.
+fn freshFile(path: *Path, time: isize) -> bool {
+    var status: std.fs.Stat = undefined
+    if std.fs.status(apps_module.pathEnd(path), &status) != 0 { return false }
+    return status.modifiedSeconds >= time
+}
+
+fn lower(byte: u8) -> u8 { return if byte >= 65 && byte <= 90 { byte + 32 } else { byte } }
+
+// Whether the worker can make a picture of it (a PNG file).
+fn canMake(path: []const u8) -> bool {
+    if path.length < 4 { return false }
+    const end = path.length
+    return path[end - 4] == 46 && lower(path[end - 3]) == 112 && lower(path[end - 2]) == 110 && lower(path[end - 1]) == 103
+}
+
+// `source` scaled to fit a `size` square (its shape kept, nothing around
+// it: the GPU draws images as squares) into `target`.
+pub fn fitSquare(target: *png.Image, source: *const png.Image, size: usize, allocator: Allocator) -> bool {
+    var width = size
+    var height = size
+    if source.*.width > source.*.height { height = source.*.height * size / source.*.width } else { width = source.*.width * size / source.*.height }
+    if width == 0 { width = 1 }
+    if height == 0 { height = 1 }
+    var scaled: png.Image = undefined
+    if png.scale(&scaled, source, width, height, allocator) != png.Status.ok { return false }
+    const memory = allocator.alloc(size * size * 4, 16)
+    if memory == null {
+        png.deinit(&scaled)
+        return false
+    }
+    var pixels: [*]u32 = undefined
+    unsafe { pixels = @ptrCast([*]u32, memory.?) }
+    var cleared: usize = 0
+    while cleared < size * size {
+        pixels[cleared] = 0
+        cleared += 1
+    }
+    const left = (size - width) / 2
+    const top = (size - height) / 2
+    var row: usize = 0
+    while row < height {
+        var column: usize = 0
+        while column < width {
+            pixels[(top + row) * size + left + column] = scaled.pixels[row * width + column]
+            column += 1
+        }
+        row += 1
+    }
+    png.deinit(&scaled)
+    target.*.pixels = pixels
+    target.*.width = size
+    target.*.height = size
+    target.*.allocator = allocator
+    return true
+}
+
+// The picture of the file at `path` (modified at `modified`) fitted into a
+// `size` square into `image`: READY (from the cache), COMING (queued for
+// the worker: look again on the next tick) or NONE.
+pub fn lookup(thumbs: *Thumbs, path: []const u8, modified: isize, size: usize, image: *png.Image) -> u8 {
+    if !thumbs.*.hasCache { return NONE }
+    var uri: Path = undefined
+    uriOf(path, &uri)
+    var file: Path = undefined
+    cacheFile(thumbs, &uri, "normal", &file)
+    if freshFile(&file, modified) {
+        var cached: png.Image = undefined
+        if png.loadFile(&cached, apps_module.pathEnd(&file), thumbs.*.allocator) == png.Status.ok {
+            const fitted = fitSquare(image, &cached, size, thumbs.*.allocator)
+            png.deinit(&cached)
+            if fitted { return READY }
+        }
+    }
+    if !canMake(path) { return NONE }
+    cacheFile(thumbs, &uri, "fail/mlx", &file)
+    if freshFile(&file, modified) { return NONE }
+    request(thumbs, path)
+    return COMING
+}
+
+fn request(thumbs: *Thumbs, path: []const u8) -> void {
+    var index: usize = 0
+    while index < thumbs.*.queued {
+        if sameBytes(textOf(queueAt(thumbs, index)), path) { return }
+        index += 1
+    }
+    index = 0
+    while index < thumbs.*.workingCount {
+        if sameBytes(textOf(workingAt(thumbs, index)), path) { return }
+        index += 1
+    }
+    if thumbs.*.queued >= QUEUE { return }
+    const slot = queueAt(thumbs, thumbs.*.queued)
+    apps_module.pathClear(slot)
+    apps_module.pathAdd(slot, path)
+    thumbs.*.queued += 1
+}
+
+// Whether pictures are still being made (the app should look again soon).
+pub fn busy(thumbs: *const Thumbs) -> bool { return thumbs.*.worker != 0 || thumbs.*.queued > 0 }
+
+// Forgets what is queued (the folder shown changed).
+pub fn clearQueue(thumbs: *Thumbs) -> void { thumbs.*.queued = 0 }
+
+// On the app's ticks: the worker done is reaped, and a new one takes what
+// is queued.
+pub fn pump(thumbs: *Thumbs) -> void {
+    if thumbs.*.worker != 0 {
+        var status: [4]u8 = [4]u8{ 0, 0, 0, 0 }
+        const done = std.linux.syscall4(SYS_wait4, @bitCast(usize, thumbs.*.worker), @intFromPtr(&status), WNOHANG, 0)
+        if done == 0 { return }
+        thumbs.*.worker = 0
+        thumbs.*.workingCount = 0
+    }
+    if thumbs.*.queued == 0 { return }
+    var index: usize = 0
+    while index < thumbs.*.queued {
+        const slot = workingAt(thumbs, index)
+        apps_module.pathClear(slot)
+        apps_module.pathAdd(slot, textOf(queueAt(thumbs, index)))
+        index += 1
+    }
+    thumbs.*.workingCount = thumbs.*.queued
+    thumbs.*.queued = 0
+    const child = std.linux.syscall0(SYS_fork)
+    if child == 0 {
+        work(thumbs)
+        const exited = std.linux.syscall1(SYS_exit_group, 0)
+    }
+    if child < 0 {
+        thumbs.*.workingCount = 0
+        return
+    }
+    thumbs.*.worker = child
+}
+
+// ---------------------------------------------------------------------------
+// The worker (a child process): decodes each file, writes its thumbnail
+
+fn work(thumbs: *Thumbs) -> void {
+    // Below the app it works for.
+    const niced = std.linux.syscall3(141, 0, 0, 10)
+    makeDirectories(thumbs)
+    var index: usize = 0
+    while index < thumbs.*.workingCount {
+        makeOne(thumbs, workingAt(thumbs, index))
+        index += 1
+    }
+}
+
+fn makeDirectories(thumbs: *Thumbs) -> void {
+    var path: Path = undefined
+    apps_module.pathClear(&path)
+    // Every directory on the way (~/.cache may be missing too).
+    const cache = textOf(cacheOf(thumbs))
+    var made = false
+    var index: usize = 1
+    while index <= cache.length {
+        if index == cache.length || cache[index] == 47 {
+            apps_module.pathClear(&path)
+            apps_module.pathAdd(&path, cache[0..index])
+            made = std.fs.makeDir(apps_module.pathEnd(&path), 448)
+        }
+        index += 1
+    }
+    apps_module.pathAdd(&path, "/normal")
+    made = std.fs.makeDir(apps_module.pathEnd(&path), 448)
+    apps_module.pathClear(&path)
+    apps_module.pathAdd(&path, textOf(cacheOf(thumbs)))
+    apps_module.pathAdd(&path, "/fail")
+    made = std.fs.makeDir(apps_module.pathEnd(&path), 448)
+    apps_module.pathAdd(&path, "/mlx")
+    made = std.fs.makeDir(apps_module.pathEnd(&path), 448)
+}
+
+fn makeOne(thumbs: *Thumbs, path: *Path) -> void {
+    var uri: Path = undefined
+    uriOf(textOf(path), &uri)
+    var status: std.fs.Stat = undefined
+    if std.fs.status(apps_module.pathEnd(path), &status) != 0 { return }
+    var image: png.Image = undefined
+    var loaded = false
+    if status.size <= MAX_BYTES { loaded = png.loadFile(&image, apps_module.pathEnd(path), thumbs.*.allocator) == png.Status.ok }
+    var target: Path = undefined
+    if !loaded {
+        cacheFile(thumbs, &uri, "fail/mlx", &target)
+        const file = std.fs.open(apps_module.pathEnd(&target), O_WRONLY_CREATE_TRUNCATE, 384)
+        if std.fs.isValid(file) { const closed = std.fs.close(file) }
+        return
+    }
+    // At most 128 pixels on its longer side.
+    var width = image.width
+    var height = image.height
+    if width > NORMAL || height > NORMAL {
+        if width > height {
+            height = height * NORMAL / width
+            width = NORMAL
+        } else {
+            width = width * NORMAL / height
+            height = NORMAL
+        }
+    }
+    if width == 0 { width = 1 }
+    if height == 0 { height = 1 }
+    var small: png.Image = undefined
+    const scaled = png.scale(&small, &image, width, height, thumbs.*.allocator)
+    png.deinit(&image)
+    if scaled != png.Status.ok { return }
+    cacheFile(thumbs, &uri, "normal", &target)
+    writePng(thumbs, &target, &small, &uri, status.modifiedSeconds)
+    png.deinit(&small)
+}
+
+// ---------------------------------------------------------------------------
+// Writing a PNG (straight RGBA, stored deflate blocks) with the thumbnail
+// spec's Thumb::URI and Thumb::MTime, as NAME.tmp renamed over NAME
+
+const Writer = struct {
+    bytes: [*]u8
+    length: usize
+    capacity: usize
+}
+
+fn put(writer: *Writer, byte: u8) -> void {
+    if writer.*.length < writer.*.capacity {
+        writer.*.bytes[writer.*.length] = byte
+        writer.*.length += 1
+    }
+}
+
+fn putText(writer: *Writer, text: []const u8) -> void {
+    for byte in text { put(writer, byte) }
+}
+
+fn put32(writer: *Writer, value: u32) -> void {
+    put(writer, @intCast(u8, value >> 24))
+    put(writer, @intCast(u8, (value >> 16) & 255))
+    put(writer, @intCast(u8, (value >> 8) & 255))
+    put(writer, @intCast(u8, value & 255))
+}
+
+fn crc32(bytes: [*]const u8, from: usize, to: usize) -> u32 {
+    var crc: u32 = 4294967295
+    var index = from
+    while index < to {
+        crc = crc ^ @intCast(u32, bytes[index])
+        var bit: usize = 0
+        while bit < 8 {
+            crc = if crc & 1 != 0 { (crc >> 1) ^ 3988292384 } else { crc >> 1 }
+            bit += 1
+        }
+        index += 1
+    }
+    return ~crc
+}
+
+// A chunk: its length, its type and data (written by `fill` after
+// startChunk), its CRC.
+fn startChunk(writer: *Writer, kind: []const u8, length: usize) -> usize {
+    put32(writer, @intCast(u32, length))
+    const start = writer.*.length
+    putText(writer, kind)
+    return start
+}
+
+fn endChunk(writer: *Writer, start: usize) -> void {
+    put32(writer, crc32(writer.*.bytes, start, writer.*.length))
+}
+
+fn decimal(value: isize, out: [*]u8) -> usize {
+    var digits: [24]u8 = undefined
+    var count: usize = 0
+    var rest = if value > 0 { @intCast(usize, value) } else { 0 }
+    while rest > 0 || count == 0 {
+        digits[count] = @intCast(u8, 48 + rest % 10)
+        rest = rest / 10
+        count += 1
+    }
+    var length: usize = 0
+    while count > 0 {
+        count -= 1
+        out[length] = digits[count]
+        length += 1
+    }
+    return length
+}
+
+fn writePng(thumbs: *Thumbs, target: *Path, image: *const png.Image, uri: *Path, modified: isize) -> void {
+    const width = image.*.width
+    const height = image.*.height
+    const raw = (width * 4 + 1) * height
+    const blocks = raw / 65535 + 1
+    const capacity = raw + blocks * 5 + uri.*.length + 256
+    const memory = thumbs.*.allocator.alloc(capacity, 16)
+    if memory == null { return }
+    var writer = Writer.{ .bytes = memory.?, .length = 0, .capacity = capacity }
+    var signature: [8]u8 = [8]u8{ 137, 80, 78, 71, 13, 10, 26, 10 }
+    var index: usize = 0
+    while index < 8 {
+        put(&writer, signature[index])
+        index += 1
+    }
+    var start = startChunk(&writer, "IHDR", 13)
+    put32(&writer, @intCast(u32, width))
+    put32(&writer, @intCast(u32, height))
+    put(&writer, 8)
+    put(&writer, 6)
+    put(&writer, 0)
+    put(&writer, 0)
+    put(&writer, 0)
+    endChunk(&writer, start)
+    start = startChunk(&writer, "tEXt", 11 + uri.*.length)
+    putText(&writer, "Thumb::URI")
+    put(&writer, 0)
+    putText(&writer, textOf(uri))
+    endChunk(&writer, start)
+    var time: [24]u8 = undefined
+    var time_bytes: [*]u8 = undefined
+    unsafe { time_bytes = @ptrCast([*]u8, &time) }
+    const time_length = decimal(modified, time_bytes)
+    start = startChunk(&writer, "tEXt", 13 + time_length)
+    putText(&writer, "Thumb::MTime")
+    put(&writer, 0)
+    index = 0
+    while index < time_length {
+        put(&writer, time_bytes[index])
+        index += 1
+    }
+    endChunk(&writer, start)
+    // The image data: zlib, stored blocks of up to 65535 bytes, rows
+    // unfiltered, the pixels straight RGBA (the decoder premultiplied them).
+    start = startChunk(&writer, "IDAT", 2 + raw + blocks * 5 + 4)
+    put(&writer, 120)
+    put(&writer, 1)
+    var adler_a: u32 = 1
+    var adler_b: u32 = 0
+    var left = raw
+    var row: usize = 0
+    var column: usize = 0
+    var channel: usize = 5
+    var block: usize = 0
+    while block < blocks {
+        const size = if left > 65535 { 65535 } else { left }
+        var final: u8 = 0
+        if block + 1 == blocks { final = 1 }
+        put(&writer, final)
+        put(&writer, @intCast(u8, size & 255))
+        put(&writer, @intCast(u8, size >> 8))
+        put(&writer, @intCast(u8, ~size & 255))
+        put(&writer, @intCast(u8, (~size >> 8) & 255))
+        var done: usize = 0
+        while done < size {
+            // The next byte of the rows: a 0 filter byte, then RGBA.
+            var value: u8 = 0
+            if channel == 5 {
+                value = 0
+                channel = 0
+            } else {
+                const pixel = image.*.pixels[row * width + column]
+                const alpha = pixel >> 24
+                if channel == 3 {
+                    value = @intCast(u8, alpha)
+                } else {
+                    const premultiplied = (pixel >> @intCast(u5, 16 - channel * 8)) & 255
+                    const straight = if alpha == 0 { 0 } else if alpha == 255 { premultiplied } else { (premultiplied * 255 + alpha / 2) / alpha }
+                    value = @intCast(u8, if straight > 255 { 255 } else { straight })
+                }
+                channel += 1
+                if channel == 4 {
+                    channel = 0
+                    column += 1
+                    if column == width {
+                        column = 0
+                        row += 1
+                        channel = 5
+                    }
+                }
+            }
+            put(&writer, value)
+            adler_a = (adler_a + @intCast(u32, value)) % 65521
+            adler_b = (adler_b + adler_a) % 65521
+            done += 1
+        }
+        left -= size
+        block += 1
+    }
+    put32(&writer, (adler_b << 16) | adler_a)
+    endChunk(&writer, start)
+    start = startChunk(&writer, "IEND", 0)
+    endChunk(&writer, start)
+    // As NAME.tmp, then renamed (a reader never sees half of it).
+    var temporary: Path = undefined
+    apps_module.pathClear(&temporary)
+    apps_module.pathAdd(&temporary, textOf(target))
+    apps_module.pathAdd(&temporary, ".mlx.tmp")
+    const file = std.fs.open(apps_module.pathEnd(&temporary), O_WRONLY_CREATE_TRUNCATE, 384)
+    if std.fs.isValid(file) {
+        const written = std.fs.writeAllBytes(file, writer.bytes, writer.length)
+        const closed = std.fs.close(file)
+        if written {
+            const renamed = std.fs.rename(apps_module.pathEnd(&temporary), apps_module.pathEnd(target))
+        }
+    }
+    thumbs.*.allocator.free(memory.?, capacity, 16)
+}
