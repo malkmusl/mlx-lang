@@ -250,6 +250,14 @@ follow the locale. `mlx-files PATH`, `file://` URIs and `trash:///` open
 it where asked; the dock opens its folders and the trash in it when it is
 installed.
 
+MLX Codemap, [`examples/mlx-codemap`](../mlx-codemap/README.md), flies
+through the code of this repository in 3D, laid out like the file manager.
+Folders are groups, with their files and those files' declarations around
+them. Lines show what is in what and what imports what; a selection shows
+what it calls, uses and imports, and what calls, uses and imports it, with
+its signature and doc comment. It draws with a compute shader under the
+canvas (the panel's `scene` hook), or on the CPU.
+
 mlx-settings lists the hotkeys: a click on one records the next key
 combination (Escape keeps the old one, Backspace unbinds it, a right click
 restores the default). Meanwhile the compositor passes every key to it,

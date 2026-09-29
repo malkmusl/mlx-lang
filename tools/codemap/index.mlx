@@ -1,0 +1,1653 @@
+// The code index behind mlx-codemap and mlx-lsp: every Mlx file of a tree
+// parsed with the canonical compiler's own lexer and parser (so it reads
+// exactly the language the compiler does), its declarations (files,
+// structs, enums, unions, error sets, fields, members, functions, their
+// parameters, constants, variables, locals, imports and type aliases) with
+// where they are, their signatures and their doc comments, and every use
+// of a name resolved to the declaration it means: plain names through the
+// scopes (locals, parameters, the file, Self), `a.b` through what `a` is
+// (a module, a type, or a value of a type: its fields and functions, after
+// `.*`, `.?`, `[i]`, calls, casts and the like), struct literals' fields
+// too. From the uses come the connections: calls (caller, callee),
+// imports (file, file), reads and writes.
+//
+// Build it with build(index, roots); ask with the functions after it.
+// Everything lives in one arena: a new build starts from scratch.
+const std = @import("std")
+const lexer = @import("../../compiler/selfhost/lexer.mlx")
+const parser_module = @import("../../compiler/selfhost/parser.mlx")
+const token_module = @import("../../compiler/selfhost/lexer/token.mlx")
+const arena_allocator = @import("../../std/bootstrap/arena_allocator.mlx")
+
+pub const Allocator = std.allocator.Allocator
+pub const Node = parser_module.Node
+pub const Tag = parser_module.Tag
+pub const Kind = token_module.Kind
+pub const Token = token_module.Token
+
+pub const NONE: u32 = 4294967295
+const NODE_NONE: usize = 18446744073709551615
+
+// Capacities (the arrays are mapped lazily: what is not used costs nothing).
+pub const MAX_FILES: usize = 8192
+pub const MAX_SYMBOLS: usize = 2097152
+pub const MAX_REFS: usize = 8388608
+const TABLE_SLOTS: usize = 4194304
+const FILE_SLOTS: usize = 16384
+const LOCALS: usize = 65536
+const ARENA_BYTES: usize = 3221225472
+
+// Symbol kinds.
+pub const FILE: u8 = 0
+pub const STRUCT: u8 = 1
+pub const ENUM: u8 = 2
+pub const UNION: u8 = 3
+pub const ERROR_SET: u8 = 4
+pub const FIELD: u8 = 5
+pub const MEMBER: u8 = 6
+pub const FUNCTION: u8 = 7
+pub const CONST: u8 = 8
+pub const VAR: u8 = 9
+pub const PARAM: u8 = 10
+pub const LOCAL_CONST: u8 = 11
+pub const LOCAL_VAR: u8 = 12
+pub const CAPTURE: u8 = 13
+pub const TEST: u8 = 14
+pub const IMPORT: u8 = 15
+pub const ALIAS: u8 = 16
+
+// Symbol flags (the parser's modifier bits, and more).
+pub const FLAG_PUB: u32 = 1
+pub const FLAG_EXTERN: u32 = 16
+pub const FLAG_TYPE_ALIAS_DONE: u32 = 256
+pub const FLAG_TYPING: u32 = 512
+pub const FLAG_TYPED: u32 = 1024
+
+// How a name is used.
+pub const USE_DECLARATION: u8 = 0
+pub const USE_READ: u8 = 1
+pub const USE_WRITE: u8 = 2
+pub const USE_CALL: u8 = 3
+pub const USE_TYPE: u8 = 4
+pub const USE_FIELD_INIT: u8 = 5
+pub const USE_IMPORT: u8 = 6
+
+pub const Symbol = struct {
+    kind: u8
+    flags: u32
+    file: u32
+    // The name: bytes in the file's source (a file's: its path).
+    nameStart: u32
+    nameLength: u32
+    // The declaration's node, its type annotation (a function's return
+    // type), its value (an initializer, a capture's iterable), and its
+    // first token (modifiers included: the doc comment is above it).
+    node: u32
+    typeNode: u32
+    valueNode: u32
+    firstToken: u32
+    parent: u32
+    // Children of a container, in order.
+    firstChild: u32
+    lastChild: u32
+    nextSibling: u32
+    // An import's file symbol, an alias's type; the type worked out for a
+    // value (typeSymbol and its wrappers, see Ty).
+    target: u32
+    typeSymbol: u32
+    typeWraps: u64
+    typeFlags: u32
+}
+
+// Where a name is used.
+pub const Ref = struct {
+    file: u32
+    start: u32
+    length: u32
+    symbol: u32
+    // The declaration it is in (a function, or a top-level declaration).
+    from: u32
+    use: u8
+}
+
+pub const FileRecord = struct {
+    path: [*]const u8
+    pathLength: usize
+    source: [*]const u8
+    sourceLength: usize
+    tokens: lexer.Buffer
+    nodes: parser_module.Store
+    root: usize
+    parseErrors: usize
+    symbol: u32
+    lineStarts: [*]u32
+    lineCount: usize
+    // The resolved symbol of each node (identifiers, fields, types).
+    nodeSymbols: [*]u32
+    refStart: usize
+    refEnd: usize
+    loaded: bool
+}
+
+// A type as far as the index follows it: a symbol (a struct, an enum, a
+// union, a file for a module; NONE when unknown or primitive) inside
+// wrappers (3 bits each, the outermost lowest), and whether the value is
+// the type (or module) itself rather than a value of it.
+pub const Ty = struct {
+    symbol: u32
+    wraps: u64
+    depth: u32
+    flags: u32
+}
+
+pub const WRAP_POINTER: u64 = 1
+pub const WRAP_MANY: u64 = 2
+pub const WRAP_SLICE: u64 = 3
+pub const WRAP_ARRAY: u64 = 4
+pub const WRAP_OPTIONAL: u64 = 5
+pub const TY_TYPE: u32 = 1
+pub const TY_FUNCTION: u32 = 2
+
+pub const Index = struct {
+    arena: arena_allocator.Arena
+    allocator: Allocator
+    files: [*]FileRecord
+    fileCount: usize
+    symbols: [*]Symbol
+    symbolCount: usize
+    refs: [*]Ref
+    refCount: usize
+    table: [*]u32
+    fileTable: [*]u32
+    // The tree's root (std/src is under it) and the locals in scope while
+    // bodies are walked.
+    root: [*]u8
+    rootLength: usize
+    locals: [*]u32
+    localCount: usize
+    // Walking: the file, the enclosing struct and declaration.
+    walkFile: u32
+    walkSelf: u32
+    walkFrom: u32
+    unresolved: usize
+}
+
+// ---------------------------------------------------------------------------
+// Access
+
+pub fn fileAt(index: *Index, file: u32) -> *FileRecord {
+    unsafe { return @ptrFromInt(*FileRecord, @intFromPtr(index.*.files) + @intCast(usize, file) * @sizeOf(FileRecord)) }
+}
+
+pub fn symbolAt(index: *Index, symbol: u32) -> *Symbol {
+    unsafe { return @ptrFromInt(*Symbol, @intFromPtr(index.*.symbols) + @intCast(usize, symbol) * @sizeOf(Symbol)) }
+}
+
+pub fn refAt(index: *Index, ref: usize) -> *Ref {
+    unsafe { return @ptrFromInt(*Ref, @intFromPtr(index.*.refs) + ref * @sizeOf(Ref)) }
+}
+
+pub fn nodeAt(index: *Index, file: u32, node: usize) -> Node {
+    const record = fileAt(index, file)
+    unsafe { return @ptrFromInt(*Node, @intFromPtr(record.*.nodes.items) + node * @sizeOf(Node)).* }
+}
+
+pub fn tokenAt(index: *Index, file: u32, token: usize) -> Token {
+    const record = fileAt(index, file)
+    return lexer.tokenAt(record.*.tokens, token)
+}
+
+pub fn sourceOf(index: *Index, file: u32) -> []const u8 {
+    const record = fileAt(index, file)
+    return record.*.source[0..record.*.sourceLength]
+}
+
+pub fn pathOf(index: *Index, file: u32) -> []const u8 {
+    const record = fileAt(index, file)
+    return record.*.path[0..record.*.pathLength]
+}
+
+pub fn nameOf(index: *Index, symbol: u32) -> []const u8 {
+    const value = symbolAt(index, symbol)
+    if value.*.kind == FILE { return pathOf(index, value.*.file) }
+    const record = fileAt(index, value.*.file)
+    var bytes: [*]const u8 = undefined
+    unsafe { bytes = @ptrFromInt([*]const u8, @intFromPtr(record.*.source) + @intCast(usize, value.*.nameStart)) }
+    return bytes[0..@intCast(usize, value.*.nameLength)]
+}
+
+fn tokenText(index: *Index, file: u32, token: usize) -> []const u8 {
+    const value = tokenAt(index, file, token)
+    const record = fileAt(index, file)
+    var bytes: [*]const u8 = undefined
+    unsafe { bytes = @ptrFromInt([*]const u8, @intFromPtr(record.*.source) + value.start) }
+    return bytes[0..value.length]
+}
+
+fn nodeSymbol(index: *Index, file: u32, node: usize) -> u32 {
+    if node == NODE_NONE { return NONE }
+    return fileAt(index, file).*.nodeSymbols[node]
+}
+
+fn setNodeSymbol(index: *Index, file: u32, node: usize, symbol: u32) -> void {
+    if node == NODE_NONE { return }
+    fileAt(index, file).*.nodeSymbols[node] = symbol
+}
+
+pub fn sameBytes(first: []const u8, second: []const u8) -> bool {
+    if first.length != second.length { return false }
+    var at: usize = 0
+    while at < first.length {
+        if first[at] != second[at] { return false }
+        at += 1
+    }
+    return true
+}
+
+fn hashBytes(seed: u64, text: []const u8) -> u64 {
+    var value = seed ^ 14695981039346656037
+    for byte in text {
+        value = (value ^ @intCast(u64, byte)) *% 1099511628211
+    }
+    return value
+}
+
+// ---------------------------------------------------------------------------
+// Symbols
+
+fn addSymbol(index: *Index, kind: u8, file: u32, name_start: usize, name_length: usize, node: usize, parent: u32) -> u32 {
+    if index.*.symbolCount >= MAX_SYMBOLS { return NONE }
+    const id = @intCast(u32, index.*.symbolCount)
+    index.*.symbolCount += 1
+    const value = symbolAt(index, id)
+    value.*.kind = kind
+    value.*.flags = 0
+    value.*.file = file
+    value.*.nameStart = @intCast(u32, name_start)
+    value.*.nameLength = @intCast(u32, name_length)
+    value.*.node = if node == NODE_NONE { NONE } else { @intCast(u32, node) }
+    value.*.typeNode = NONE
+    value.*.valueNode = NONE
+    value.*.firstToken = NONE
+    value.*.parent = parent
+    value.*.firstChild = NONE
+    value.*.lastChild = NONE
+    value.*.nextSibling = NONE
+    value.*.target = NONE
+    value.*.typeSymbol = NONE
+    value.*.typeWraps = 0
+    value.*.typeFlags = 0
+    if parent != NONE {
+        const container = symbolAt(index, parent)
+        if container.*.lastChild == NONE {
+            container.*.firstChild = id
+        } else {
+            symbolAt(index, container.*.lastChild).*.nextSibling = id
+        }
+        container.*.lastChild = id
+    }
+    return id
+}
+
+// A symbol named by token `token` of `file`.
+fn addNamed(index: *Index, kind: u8, file: u32, token: usize, node: usize, parent: u32) -> u32 {
+    const value = tokenAt(index, file, token)
+    return addSymbol(index, kind, file, value.start, value.length, node, parent)
+}
+
+// The member table: (container, name) -> symbol.
+fn slotFor(index: *Index, container: u32, name: []const u8) -> usize {
+    return @intCast(usize, hashBytes(@intCast(u64, container) *% 2654435761, name) % @intCast(u64, TABLE_SLOTS))
+}
+
+fn putMember(index: *Index, container: u32, symbol: u32) -> void {
+    if container == NONE || symbol == NONE { return }
+    const name = nameOf(index, symbol)
+    var slot = slotFor(index, container, name)
+    var probes: usize = 0
+    while probes < TABLE_SLOTS {
+        const held = index.*.table[slot]
+        if held == NONE {
+            index.*.table[slot] = symbol
+            return
+        }
+        // The first declaration of a name wins.
+        if symbolAt(index, held).*.parent == container && sameBytes(nameOf(index, held), name) { return }
+        slot = (slot + 1) % TABLE_SLOTS
+        probes += 1
+    }
+}
+
+pub fn member(index: *Index, container: u32, name: []const u8) -> u32 {
+    if container == NONE { return NONE }
+    var slot = slotFor(index, container, name)
+    while true {
+        const held = index.*.table[slot]
+        if held == NONE { return NONE }
+        if symbolAt(index, held).*.parent == container && sameBytes(nameOf(index, held), name) { return held }
+        slot = (slot + 1) % TABLE_SLOTS
+    }
+    return NONE
+}
+
+// ---------------------------------------------------------------------------
+// Files
+
+fn fileSlot(index: *Index, path: []const u8) -> usize {
+    return @intCast(usize, hashBytes(7, path) % @intCast(u64, FILE_SLOTS))
+}
+
+pub fn findFile(index: *Index, path: []const u8) -> u32 {
+    var slot = fileSlot(index, path)
+    while true {
+        const held = index.*.fileTable[slot]
+        if held == NONE { return NONE }
+        if sameBytes(pathOf(index, held), path) { return held }
+        slot = (slot + 1) % FILE_SLOTS
+    }
+    return NONE
+}
+
+// A file of the index (read and parsed when first asked for); NONE when
+// it cannot be read.
+fn addFile(index: *Index, path: []const u8) -> u32 {
+    const known = findFile(index, path)
+    if known != NONE { return known }
+    if index.*.fileCount >= MAX_FILES { return NONE }
+    // Read it.
+    const copy = index.*.allocator.alloc(path.length + 1, 1)
+    if copy == null { return NONE }
+    const bytes = copy.?
+    var at: usize = 0
+    while at < path.length {
+        bytes[at] = path[at]
+        at += 1
+    }
+    bytes[path.length] = 0
+    const file = std.fs.open(bytes, 0, 0)
+    if !std.fs.isValid(file) { return NONE }
+    var status: std.fs.Stat = undefined
+    if std.fs.fileStatus(file, &status) != 0 || status.size < 0 {
+        const closed = std.fs.close(file)
+        return NONE
+    }
+    const size = @intCast(usize, status.size)
+    const memory = index.*.allocator.alloc(size + 1, 16)
+    if memory == null {
+        const closed = std.fs.close(file)
+        return NONE
+    }
+    const source = memory.?
+    var got: usize = 0
+    while got < size {
+        var chunk: [*]u8 = undefined
+        unsafe { chunk = @ptrFromInt([*]u8, @intFromPtr(source) + got) }
+        const count = std.fs.read(file, chunk, size - got)
+        if count <= 0 { break }
+        got += @intCast(usize, count)
+    }
+    const closed = std.fs.close(file)
+    source[got] = 0
+    const id = @intCast(u32, index.*.fileCount)
+    index.*.fileCount += 1
+    const record = fileAt(index, id)
+    record.*.path = bytes
+    record.*.pathLength = path.length
+    record.*.source = source
+    record.*.sourceLength = got
+    record.*.loaded = false
+    record.*.refStart = 0
+    record.*.refEnd = 0
+    var slot = fileSlot(index, path)
+    while index.*.fileTable[slot] != NONE { slot = (slot + 1) % FILE_SLOTS }
+    index.*.fileTable[slot] = id
+    parseFile(index, id)
+    return id
+}
+
+fn tokensOf(record: *FileRecord) -> *lexer.Buffer {
+    unsafe { return @ptrFromInt(*lexer.Buffer, @intFromPtr(record) + @offsetOf(FileRecord, "tokens")) }
+}
+
+fn nodesOf(record: *FileRecord) -> *parser_module.Store {
+    unsafe { return @ptrFromInt(*parser_module.Store, @intFromPtr(record) + @offsetOf(FileRecord, "nodes")) }
+}
+
+fn arenaOf(index: *Index) -> *arena_allocator.Arena {
+    unsafe { return @ptrFromInt(*arena_allocator.Arena, @intFromPtr(index) + @offsetOf(Index, "arena")) }
+}
+
+fn parseFile(index: *Index, file: u32) -> void {
+    const record = fileAt(index, file)
+    const source = record.*.source[0..record.*.sourceLength]
+    lexer.scanAllLengthInto(tokensOf(record), index.*.allocator, source, record.*.sourceLength)
+    parser_module.initStoreAt(nodesOf(record), index.*.allocator, record.*.sourceLength / 8 + 64)
+    var parser = parser_module.initLength(source, record.*.sourceLength, record.*.tokens, nodesOf(record))
+    record.*.root = parser_module.parse(&parser)
+    record.*.parseErrors = parser.errorCount
+    // Every node unresolved to begin with.
+    const count = record.*.nodes.length
+    const memory = index.*.allocator.alloc(count * 4 + 4, 16)
+    unsafe { record.*.nodeSymbols = @ptrCast([*]u32, memory.?) }
+    var at: usize = 0
+    while at < count {
+        record.*.nodeSymbols[at] = NONE
+        at += 1
+    }
+    // Where the lines start.
+    var lines: usize = 1
+    for byte in source {
+        if byte == 10 { lines += 1 }
+    }
+    const starts = index.*.allocator.alloc(lines * 4 + 4, 16)
+    unsafe { record.*.lineStarts = @ptrCast([*]u32, starts.?) }
+    record.*.lineStarts[0] = 0
+    var line: usize = 1
+    at = 0
+    while at < record.*.sourceLength {
+        if source[at] == 10 {
+            record.*.lineStarts[line] = @intCast(u32, at + 1)
+            line += 1
+        }
+        at += 1
+    }
+    record.*.lineCount = lines
+    record.*.symbol = addSymbol(index, FILE, file, 0, 0, record.*.root, NONE)
+}
+
+// ---------------------------------------------------------------------------
+// Positions
+
+// The 0-based line and byte column of byte `offset` of `file`.
+pub fn lineOf(index: *Index, file: u32, offset: usize) -> usize {
+    const record = fileAt(index, file)
+    var low: usize = 0
+    var high = record.*.lineCount
+    while low + 1 < high {
+        const middle = (low + high) / 2
+        if @intCast(usize, record.*.lineStarts[middle]) <= offset { low = middle } else { high = middle }
+    }
+    return low
+}
+
+pub fn columnOf(index: *Index, file: u32, offset: usize) -> usize {
+    const record = fileAt(index, file)
+    return offset - @intCast(usize, record.*.lineStarts[lineOf(index, file, offset)])
+}
+
+// The byte offset of 0-based line and byte column.
+pub fn offsetOf(index: *Index, file: u32, line: usize, column: usize) -> usize {
+    const record = fileAt(index, file)
+    if line >= record.*.lineCount { return record.*.sourceLength }
+    const offset = @intCast(usize, record.*.lineStarts[line]) + column
+    return if offset > record.*.sourceLength { record.*.sourceLength } else { offset }
+}
+
+// ---------------------------------------------------------------------------
+// Imports
+
+fn stringTokenValue(index: *Index, file: u32, token: usize) -> []const u8 {
+    const text = tokenText(index, file, token)
+    if text.length < 2 { return text[0..0] }
+    return text[1..text.length - 1]
+}
+
+// The path an import names, resolved like the compiler: "./x.mlx" next
+// to the importer, "std" and "std.png" under std/src.
+fn importPath(index: *Index, file: u32, requested: []const u8, out: [*]u8) -> usize {
+    var length: usize = 0
+    if requested.length >= 3 && requested[0] == 115 && requested[1] == 116 && requested[2] == 100 && (requested.length == 3 || requested[3] == 46) {
+        var at: usize = 0
+        while at < index.*.rootLength {
+            out[length] = index.*.root[at]
+            length += 1
+            at += 1
+        }
+        for byte in "/std/src/" {
+            out[length] = byte
+            length += 1
+        }
+        if requested.length == 3 {
+            for byte in "std.mlx" {
+                out[length] = byte
+                length += 1
+            }
+            return length
+        }
+        at = 4
+        while at < requested.length && length < 1000 {
+            out[length] = if requested[at] == 46 { 47 } else { requested[at] }
+            length += 1
+            at += 1
+        }
+        for byte in ".mlx" {
+            out[length] = byte
+            length += 1
+        }
+        return length
+    }
+    if requested.length < 2 || requested[0] != 46 { return 0 }
+    // The importer's directory, then the requested path, "." and ".."
+    // folded.
+    const importer = pathOf(index, file)
+    var directory = importer.length
+    while directory > 0 && importer[directory - 1] != 47 { directory -= 1 }
+    var at: usize = 0
+    while at < directory {
+        out[length] = importer[at]
+        length += 1
+        at += 1
+    }
+    at = 0
+    while at < requested.length && length < 1000 {
+        var end = at
+        while end < requested.length && requested[end] != 47 { end += 1 }
+        const part_length = end - at
+        if part_length == 1 && requested[at] == 46 {
+            // "."
+        } else if part_length == 2 && requested[at] == 46 && requested[at + 1] == 46 {
+            // "..": back one directory (the trailing slash kept).
+            if length > 0 { length -= 1 }
+            while length > 0 && out[length - 1] != 47 { length -= 1 }
+        } else {
+            var copy = at
+            while copy < end {
+                out[length] = requested[copy]
+                length += 1
+                copy += 1
+            }
+            if end < requested.length {
+                out[length] = 47
+                length += 1
+            }
+        }
+        at = end + 1
+    }
+    return length
+}
+
+// Whether node `node` is @import("...") (its string token, else NONE).
+fn importToken(index: *Index, file: u32, node: usize) -> usize {
+    if node == NODE_NONE { return NODE_NONE }
+    const value = nodeAt(index, file, node)
+    if value.tag != Tag.builtin_call { return NODE_NONE }
+    if !sameBytes(tokenText(index, file, value.mainToken), "import") { return NODE_NONE }
+    if value.lhs == NODE_NONE { return NODE_NONE }
+    const argument = nodeAt(index, file, value.lhs)
+    if argument.tag != Tag.string_literal { return NODE_NONE }
+    return argument.mainToken
+}
+
+// ---------------------------------------------------------------------------
+// Pass 1: declarations
+
+// The first token of the declaration whose name is token `name` (the
+// keyword before it, and modifiers before that).
+fn declarationStart(index: *Index, file: u32, name: usize) -> usize {
+    if name == 0 { return 0 }
+    var at = name - 1
+    while at > 0 {
+        const kind = tokenAt(index, file, at - 1).kind
+        if kind == Kind.keyword_pub || kind == Kind.keyword_export || kind == Kind.keyword_inline || kind == Kind.keyword_noinline || kind == Kind.keyword_extern || kind == Kind.keyword_threadlocal {
+            at -= 1
+        } else if kind == Kind.right_parenthesis && at >= 4 && tokenAt(index, file, at - 4).kind == Kind.keyword_extern {
+            // extern("syscall")
+            at -= 4
+        } else {
+            break
+        }
+    }
+    return at
+}
+
+fn containerKind(tag: Tag) -> u8 {
+    if tag == Tag.struct_type { return STRUCT }
+    if tag == Tag.enum_type { return ENUM }
+    if tag == Tag.union_type { return UNION }
+    if tag == Tag.error_set_type { return ERROR_SET }
+    return NONE_KIND
+}
+
+const NONE_KIND: u8 = 255
+
+// The aggregate node a declaration's value is (through @noncopy), else
+// NODE_NONE.
+fn aggregateOf(index: *Index, file: u32, node: usize) -> usize {
+    if node == NODE_NONE { return NODE_NONE }
+    const value = nodeAt(index, file, node)
+    if containerKind(value.tag) != NONE_KIND { return node }
+    if value.tag == Tag.nocopy_type { return aggregateOf(index, file, value.lhs) }
+    return NODE_NONE
+}
+
+fn declareParameters(index: *Index, file: u32, function: u32, first: usize) -> void {
+    var parameter = first
+    while parameter != NODE_NONE {
+        const value = nodeAt(index, file, parameter)
+        const symbol = addNamed(index, PARAM, file, value.mainToken, parameter, function)
+        if symbol != NONE {
+            symbolAt(index, symbol).*.typeNode = if value.lhs == NODE_NONE { NONE } else { @intCast(u32, value.lhs) }
+            symbolAt(index, symbol).*.firstToken = @intCast(u32, value.mainToken)
+        }
+        parameter = value.next
+    }
+}
+
+fn declareFunction(index: *Index, file: u32, node: usize, parent: u32) -> u32 {
+    const value = nodeAt(index, file, node)
+    const symbol = addNamed(index, FUNCTION, file, value.mainToken, node, parent)
+    if symbol == NONE { return NONE }
+    const record = symbolAt(index, symbol)
+    record.*.flags = @intCast(u32, (value.endToken >> 32) & 255)
+    record.*.typeNode = if value.extra == NODE_NONE { NONE } else { @intCast(u32, value.extra) }
+    record.*.firstToken = @intCast(u32, declarationStart(index, file, value.mainToken))
+    putMember(index, parent, symbol)
+    declareParameters(index, file, symbol, value.lhs)
+    return symbol
+}
+
+// The members of an aggregate (fields, enum members, functions).
+fn declareMembers(index: *Index, file: u32, aggregate: usize, container: u32) -> void {
+    const value = nodeAt(index, file, aggregate)
+    var child = value.lhs
+    while child != NODE_NONE {
+        const item = nodeAt(index, file, child)
+        if item.tag == Tag.function_declaration {
+            const function = declareFunction(index, file, child, container)
+        } else if item.tag == Tag.field_declaration || item.tag == Tag.enum_member || item.tag == Tag.union_member {
+            const symbol = addNamed(index, if item.tag == Tag.field_declaration { FIELD } else { MEMBER }, file, item.mainToken, child, container)
+            if symbol != NONE {
+                const record = symbolAt(index, symbol)
+                record.*.typeNode = if item.lhs == NODE_NONE { NONE } else { @intCast(u32, item.lhs) }
+                record.*.valueNode = if item.rhs == NODE_NONE { NONE } else { @intCast(u32, item.rhs) }
+                var first = item.mainToken
+                if first > 0 && tokenAt(index, file, first - 1).kind == Kind.keyword_pub { first -= 1 }
+                record.*.firstToken = @intCast(u32, first)
+                putMember(index, container, symbol)
+            }
+        }
+        child = item.next
+    }
+}
+
+// A binding (const or var) at file level or in a body: a struct, enum,
+// union or error set when that is its value, an import, else a constant or
+// variable (an alias is found out later).
+fn declareBinding(index: *Index, file: u32, node: usize, parent: u32, local: bool) -> u32 {
+    const value = nodeAt(index, file, node)
+    const is_constant = value.tag == Tag.constant_declaration
+    const aggregate = if is_constant { aggregateOf(index, file, value.rhs) } else { NODE_NONE }
+    var kind = if local { if is_constant { LOCAL_CONST } else { LOCAL_VAR } } else { if is_constant { CONST } else { VAR } }
+    if aggregate != NODE_NONE { kind = containerKind(nodeAt(index, file, aggregate).tag) }
+    const import_token = if is_constant { importToken(index, file, value.rhs) } else { NODE_NONE }
+    if import_token != NODE_NONE { kind = IMPORT }
+    const symbol = addNamed(index, kind, file, value.mainToken, node, parent)
+    if symbol == NONE { return NONE }
+    const record = symbolAt(index, symbol)
+    record.*.flags = @intCast(u32, value.extra & 255)
+    record.*.typeNode = if value.lhs == NODE_NONE { NONE } else { @intCast(u32, value.lhs) }
+    record.*.valueNode = if value.rhs == NODE_NONE { NONE } else { @intCast(u32, value.rhs) }
+    record.*.firstToken = @intCast(u32, declarationStart(index, file, value.mainToken))
+    if !local { putMember(index, parent, symbol) }
+    if aggregate != NODE_NONE { declareMembers(index, file, aggregate, symbol) }
+    if import_token != NODE_NONE {
+        var buffer: [1100]u8 = undefined
+        var bytes: [*]u8 = undefined
+        unsafe { bytes = @ptrCast([*]u8, &buffer) }
+        const length = importPath(index, file, stringTokenValue(index, file, import_token), bytes)
+        if length > 0 {
+            const target = addFile(index, bytes[0..length])
+            if target != NONE { symbolAt(index, symbol).*.target = fileAt(index, target).*.symbol }
+        }
+    }
+    return symbol
+}
+
+fn declareFile(index: *Index, file: u32) -> void {
+    const record = fileAt(index, file)
+    if record.*.loaded { return }
+    record.*.loaded = true
+    const container = record.*.symbol
+    const root = nodeAt(index, file, record.*.root)
+    var child = root.lhs
+    while child != NODE_NONE {
+        const item = nodeAt(index, file, child)
+        if item.tag == Tag.function_declaration {
+            const function = declareFunction(index, file, child, container)
+        } else if item.tag == Tag.constant_declaration || item.tag == Tag.variable_declaration {
+            const binding = declareBinding(index, file, child, container, false)
+        } else if item.tag == Tag.test_declaration && item.endToken != NODE_NONE {
+            const test_symbol = addNamed(index, TEST, file, item.endToken, child, container)
+        }
+        child = item.next
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Types
+
+fn unknown() -> Ty { return Ty.{ .symbol = NONE, .wraps = 0, .depth = 0, .flags = 0 } }
+
+fn typeValue(symbol: u32) -> Ty { return Ty.{ .symbol = symbol, .wraps = 0, .depth = 0, .flags = TY_TYPE } }
+
+fn wrap(ty: Ty, kind: u64) -> Ty {
+    if ty.depth >= 20 { return ty }
+    return Ty.{ .symbol = ty.symbol, .wraps = (ty.wraps << 3) | kind, .depth = ty.depth + 1, .flags = ty.flags & ~TY_TYPE }
+}
+
+fn outer(ty: Ty) -> u64 { return if ty.depth == 0 { 0 } else { ty.wraps & 7 } }
+
+fn unwrap(ty: Ty) -> Ty {
+    if ty.depth == 0 { return ty }
+    return Ty.{ .symbol = ty.symbol, .wraps = ty.wraps >> 3, .depth = ty.depth - 1, .flags = ty.flags }
+}
+
+// What a value's type is to find members in: pointers followed.
+fn stripPointers(ty: Ty) -> Ty {
+    var result = ty
+    while result.depth > 0 && outer(result) == WRAP_POINTER { result = unwrap(result) }
+    return result
+}
+
+// An element of an indexed value.
+fn elementOf(ty: Ty) -> Ty {
+    var result = ty
+    if outer(result) == WRAP_POINTER { result = unwrap(result) }
+    const kind = outer(result)
+    if kind == WRAP_MANY || kind == WRAP_SLICE || kind == WRAP_ARRAY { return unwrap(result) }
+    return unknown()
+}
+
+// A type alias's (or import's) target: what the name stands for.
+fn aliasTarget(index: *Index, symbol: u32) -> u32 {
+    var current = symbol
+    var steps: usize = 0
+    while current != NONE && steps < 16 {
+        const record = symbolAt(index, current)
+        if record.*.kind == IMPORT { return record.*.target }
+        if record.*.kind == ALIAS && record.*.target != NONE {
+            current = record.*.target
+            steps += 1
+            continue
+        }
+        if record.*.kind != CONST && record.*.kind != LOCAL_CONST && record.*.kind != ALIAS { return current }
+        if record.*.typeNode != NONE || record.*.valueNode == NONE { return current }
+        // const X = a.b.C: what the value names, when it names a type or
+        // module.
+        const ty = typeOfExpression(index, record.*.file, @intCast(usize, record.*.valueNode), NONE)
+        if ty.flags & TY_TYPE == 0 || ty.depth != 0 || ty.symbol == NONE { return current }
+        record.*.kind = ALIAS
+        record.*.target = ty.symbol
+        current = ty.symbol
+        steps += 1
+    }
+    return current
+}
+
+// The type a type expression names, in `file`, with `self_symbol` for Self.
+fn typeOfTypeNode(index: *Index, file: u32, node: usize, self_symbol: u32) -> Ty {
+    if node == NODE_NONE { return unknown() }
+    const value = nodeAt(index, file, node)
+    const tag = value.tag
+    if tag == Tag.named_type || tag == Tag.identifier {
+        const name = tokenText(index, file, value.mainToken)
+        if sameBytes(name, "Self") && self_symbol != NONE { return typeValue(self_symbol) }
+        var symbol = nodeSymbol(index, file, node)
+        if symbol == NONE { symbol = lookupScoped(index, file, name, self_symbol) }
+        if symbol == NONE { return unknown() }
+        const target = aliasTarget(index, symbol)
+        return typeValue(target)
+    }
+    if tag == Tag.field_expression {
+        if value.lhs == NODE_NONE { return unknown() }
+        const base = typeOfTypeNode(index, file, value.lhs, self_symbol)
+        if base.symbol == NONE || base.depth != 0 { return unknown() }
+        const found = member(index, base.symbol, tokenText(index, file, value.mainToken))
+        if found == NONE { return unknown() }
+        return typeValue(aliasTarget(index, found))
+    }
+    if tag == Tag.pointer_type { return wrap(typeOfTypeNode(index, file, value.lhs, self_symbol), WRAP_POINTER) }
+    if tag == Tag.many_pointer_type { return wrap(typeOfTypeNode(index, file, value.lhs, self_symbol), WRAP_MANY) }
+    if tag == Tag.slice_type { return wrap(typeOfTypeNode(index, file, value.lhs, self_symbol), WRAP_SLICE) }
+    if tag == Tag.array_type { return wrap(typeOfTypeNode(index, file, value.rhs, self_symbol), WRAP_ARRAY) }
+    if tag == Tag.optional_type { return wrap(typeOfTypeNode(index, file, value.lhs, self_symbol), WRAP_OPTIONAL) }
+    if tag == Tag.error_union_type { return typeOfTypeNode(index, file, value.rhs, self_symbol) }
+    if tag == Tag.nocopy_type { return typeOfTypeNode(index, file, value.lhs, self_symbol) }
+    return unknown()
+}
+
+// The struct a symbol's type expressions see as Self.
+fn selfOf(index: *Index, symbol: u32) -> u32 {
+    var current = symbolAt(index, symbol).*.parent
+    while current != NONE {
+        const kind = symbolAt(index, current).*.kind
+        if kind == STRUCT || kind == UNION || kind == ENUM { return current }
+        if kind == FILE { return NONE }
+        current = symbolAt(index, current).*.parent
+    }
+    return NONE
+}
+
+// A value's type from its declaration (worked out once).
+pub fn typeOfSymbol(index: *Index, symbol: u32) -> Ty {
+    if symbol == NONE { return unknown() }
+    const record = symbolAt(index, symbol)
+    const kind = record.*.kind
+    if kind == STRUCT || kind == ENUM || kind == UNION || kind == ERROR_SET || kind == FILE { return typeValue(symbol) }
+    if kind == IMPORT { return typeValue(record.*.target) }
+    if kind == ALIAS { return typeValue(aliasTarget(index, symbol)) }
+    if kind == FUNCTION { return Ty.{ .symbol = symbol, .wraps = 0, .depth = 0, .flags = TY_FUNCTION } }
+    if kind == MEMBER && record.*.typeNode == NONE { return Ty.{ .symbol = record.*.parent, .wraps = 0, .depth = 0, .flags = 0 } }
+    if record.*.flags & FLAG_TYPED != 0 { return Ty.{ .symbol = record.*.typeSymbol, .wraps = record.*.typeWraps, .depth = record.*.typeFlags >> 8, .flags = record.*.typeFlags & 255 } }
+    if record.*.flags & FLAG_TYPING != 0 { return unknown() }
+    record.*.flags = record.*.flags | FLAG_TYPING
+    var result = unknown()
+    if record.*.typeNode != NONE {
+        result = typeOfTypeNode(index, record.*.file, @intCast(usize, record.*.typeNode), selfOf(index, symbol))
+        // A value of the type, not the type.
+        result.flags = result.flags & ~TY_TYPE
+        if result.depth == 0 && result.symbol != NONE && symbolAt(index, result.symbol).*.kind == FILE { result = unknown() }
+    } else if record.*.valueNode != NONE {
+        const value_type = typeOfExpression(index, record.*.file, @intCast(usize, record.*.valueNode), selfOf(index, symbol))
+        result = if kind == CAPTURE { elementOf(value_type) } else { value_type }
+        if kind == CONST || kind == LOCAL_CONST {
+            // const X = SomeType: an alias.
+            if result.flags & TY_TYPE != 0 && result.depth == 0 && result.symbol != NONE {
+                record.*.kind = ALIAS
+                record.*.target = result.symbol
+            }
+        }
+    }
+    record.*.typeSymbol = result.symbol
+    record.*.typeWraps = result.wraps
+    record.*.typeFlags = (result.depth << 8) | (result.flags & 255)
+    record.*.flags = (record.*.flags & ~FLAG_TYPING) | FLAG_TYPED
+    return result
+}
+
+fn isCastBuiltin(name: []const u8) -> bool {
+    return sameBytes(name, "ptrCast") || sameBytes(name, "ptrFromInt") || sameBytes(name, "intCast") || sameBytes(name, "bitCast") || sameBytes(name, "as") || sameBytes(name, "truncate") || sameBytes(name, "floatCast") || sameBytes(name, "alignCast") || sameBytes(name, "enumFromInt") || sameBytes(name, "floatFromInt") || sameBytes(name, "intFromFloat")
+}
+
+// A value's (or type's) type, as far as it can be told.
+pub fn typeOfExpression(index: *Index, file: u32, node: usize, self_symbol: u32) -> Ty {
+    if node == NODE_NONE { return unknown() }
+    const value = nodeAt(index, file, node)
+    const tag = value.tag
+    if tag == Tag.identifier {
+        const name = tokenText(index, file, value.mainToken)
+        if sameBytes(name, "Self") && self_symbol != NONE { return typeValue(self_symbol) }
+        var symbol = nodeSymbol(index, file, node)
+        if symbol == NONE { symbol = lookupScoped(index, file, name, self_symbol) }
+        return typeOfSymbol(index, symbol)
+    }
+    if tag == Tag.field_expression {
+        if value.lhs == NODE_NONE { return unknown() }
+        var symbol = nodeSymbol(index, file, node)
+        if symbol == NONE {
+            const base = typeOfExpression(index, file, value.lhs, self_symbol)
+            symbol = memberOfType(index, base, tokenText(index, file, value.mainToken))
+        }
+        return typeOfSymbol(index, symbol)
+    }
+    if tag == Tag.call_expression {
+        const callee = typeOfExpression(index, file, value.lhs, self_symbol)
+        if callee.flags & TY_FUNCTION != 0 && callee.symbol != NONE {
+            const function = symbolAt(index, callee.symbol)
+            if function.*.typeNode == NONE { return unknown() }
+            var result = typeOfTypeNode(index, function.*.file, @intCast(usize, function.*.typeNode), selfOf(index, callee.symbol))
+            result.flags = result.flags & ~TY_TYPE
+            return result
+        }
+        return unknown()
+    }
+    if tag == Tag.builtin_call {
+        const name = tokenText(index, file, value.mainToken)
+        if sameBytes(name, "import") {
+            const imported = importToken(index, file, node)
+            if imported == NODE_NONE { return unknown() }
+            var buffer: [1100]u8 = undefined
+            var bytes: [*]u8 = undefined
+            unsafe { bytes = @ptrCast([*]u8, &buffer) }
+            const length = importPath(index, file, stringTokenValue(index, file, imported), bytes)
+            const target = if length > 0 { findFile(index, bytes[0..length]) } else { NONE }
+            return if target == NONE { unknown() } else { typeValue(fileAt(index, target).*.symbol) }
+        }
+        if sameBytes(name, "This") { return typeValue(self_symbol) }
+        if isCastBuiltin(name) && value.lhs != NODE_NONE {
+            var result = typeOfTypeNode(index, file, value.lhs, self_symbol)
+            result.flags = result.flags & ~TY_TYPE
+            return result
+        }
+        return unknown()
+    }
+    if tag == Tag.unary_expression {
+        const operator = tokenAt(index, file, value.mainToken).kind
+        const operand = typeOfExpression(index, file, value.lhs, self_symbol)
+        if operator == Kind.dot_asterisk { return if outer(operand) == WRAP_POINTER { unwrap(operand) } else { operand } }
+        if operator == Kind.dot_question { return if outer(operand) == WRAP_OPTIONAL { unwrap(operand) } else { operand } }
+        if operator == Kind.ampersand { return wrap(operand, WRAP_POINTER) }
+        if operator == Kind.keyword_try { return operand }
+        return unknown()
+    }
+    if tag == Tag.index_expression { return elementOf(typeOfExpression(index, file, value.lhs, self_symbol)) }
+    if tag == Tag.slice_expression { return wrap(elementOf(typeOfExpression(index, file, value.lhs, self_symbol)), WRAP_SLICE) }
+    if tag == Tag.aggregate_literal {
+        var result = typeOfTypeNode(index, file, value.lhs, self_symbol)
+        result.flags = result.flags & ~TY_TYPE
+        return result
+    }
+    if tag == Tag.if_statement { return typeOfExpression(index, file, value.rhs, self_symbol) }
+    if tag == Tag.named_type || tag == Tag.pointer_type || tag == Tag.many_pointer_type || tag == Tag.slice_type || tag == Tag.array_type || tag == Tag.optional_type {
+        var result = typeOfTypeNode(index, file, node, self_symbol)
+        result.flags = result.flags | TY_TYPE
+        return result
+    }
+    if tag == Tag.struct_type || tag == Tag.enum_type || tag == Tag.union_type {
+        const symbol = nodeSymbol(index, file, node)
+        return if symbol == NONE { unknown() } else { typeValue(symbol) }
+    }
+    return unknown()
+}
+
+// Member `name` of what `ty` is: a module's declaration, a type's member
+// (a static function, an enum member), or a value's field or function.
+pub fn memberOfType(index: *Index, ty: Ty, name: []const u8) -> u32 {
+    if ty.symbol == NONE { return NONE }
+    if ty.flags & TY_FUNCTION != 0 { return NONE }
+    const stripped = stripPointers(ty)
+    if stripped.depth != 0 {
+        // An optional or an array has no members (a slice's len etc. are
+        // not declarations).
+        return NONE
+    }
+    const container = aliasTarget(index, stripped.symbol)
+    return member(index, container, name)
+}
+
+// ---------------------------------------------------------------------------
+// Scopes
+
+fn pushLocal(index: *Index, symbol: u32) -> void {
+    if symbol == NONE || index.*.localCount >= LOCALS { return }
+    index.*.locals[index.*.localCount] = symbol
+    index.*.localCount += 1
+}
+
+// A name seen from `file` inside `self_symbol` (no locals): the file's
+// declarations, then the enclosing structs' members.
+fn lookupScoped(index: *Index, file: u32, name: []const u8, self_symbol: u32) -> u32 {
+    var container = self_symbol
+    var steps: usize = 0
+    while container != NONE && steps < 16 {
+        const kind = symbolAt(index, container).*.kind
+        if kind == FILE { break }
+        const found = member(index, container, name)
+        if found != NONE && symbolAt(index, found).*.kind != FIELD { return found }
+        container = symbolAt(index, container).*.parent
+        steps += 1
+    }
+    return member(index, fileAt(index, file).*.symbol, name)
+}
+
+// A name inside a body: the locals (innermost first), then as above.
+fn lookup(index: *Index, file: u32, name: []const u8) -> u32 {
+    var at = index.*.localCount
+    while at > 0 {
+        at -= 1
+        const symbol = index.*.locals[at]
+        if sameBytes(nameOf(index, symbol), name) { return symbol }
+    }
+    return lookupScoped(index, file, name, index.*.walkSelf)
+}
+
+// ---------------------------------------------------------------------------
+// Pass 2: uses
+
+fn addRef(index: *Index, file: u32, token: usize, symbol: u32, use: u8) -> void {
+    if symbol == NONE || index.*.refCount >= MAX_REFS { return }
+    const value = tokenAt(index, file, token)
+    const ref = refAt(index, index.*.refCount)
+    ref.*.file = file
+    ref.*.start = @intCast(u32, value.start)
+    ref.*.length = @intCast(u32, value.length)
+    ref.*.symbol = symbol
+    ref.*.from = index.*.walkFrom
+    ref.*.use = use
+    index.*.refCount += 1
+}
+
+fn declarationRef(index: *Index, symbol: u32) -> void {
+    if symbol == NONE { return }
+    const record = symbolAt(index, symbol)
+    const saved = index.*.walkFrom
+    index.*.walkFrom = symbol
+    const ref_index = index.*.refCount
+    if ref_index >= MAX_REFS { return }
+    const ref = refAt(index, ref_index)
+    ref.*.file = record.*.file
+    ref.*.start = record.*.nameStart
+    ref.*.length = record.*.nameLength
+    ref.*.symbol = symbol
+    ref.*.from = if record.*.parent == NONE { symbol } else { record.*.parent }
+    ref.*.use = USE_DECLARATION
+    index.*.refCount += 1
+    index.*.walkFrom = saved
+}
+
+// A type expression's names.
+fn walkType(index: *Index, file: u32, node: usize) -> void {
+    if node == NODE_NONE { return }
+    const value = nodeAt(index, file, node)
+    const tag = value.tag
+    if tag == Tag.named_type {
+        const name = tokenText(index, file, value.mainToken)
+        var symbol = NONE
+        if sameBytes(name, "Self") { symbol = index.*.walkSelf } else { symbol = lookup(index, file, name) }
+        setNodeSymbol(index, file, node, symbol)
+        addRef(index, file, value.mainToken, symbol, USE_TYPE)
+        return
+    }
+    if tag == Tag.field_expression {
+        walkType(index, file, value.lhs)
+        const base = typeOfTypeNode(index, file, value.lhs, index.*.walkSelf)
+        var symbol = NONE
+        if base.symbol != NONE && base.depth == 0 { symbol = member(index, aliasTarget(index, base.symbol), tokenText(index, file, value.mainToken)) }
+        setNodeSymbol(index, file, node, symbol)
+        addRef(index, file, value.mainToken, symbol, USE_TYPE)
+        return
+    }
+    if tag == Tag.pointer_type || tag == Tag.many_pointer_type || tag == Tag.slice_type || tag == Tag.optional_type || tag == Tag.nocopy_type {
+        walkType(index, file, value.lhs)
+        return
+    }
+    if tag == Tag.array_type {
+        walkExpression(index, file, value.lhs, USE_READ)
+        walkType(index, file, value.rhs)
+        return
+    }
+    if tag == Tag.error_union_type {
+        walkType(index, file, value.lhs)
+        walkType(index, file, value.rhs)
+        return
+    }
+    if tag == Tag.function_type || tag == Tag.tuple_type {
+        var child = value.lhs
+        while child != NODE_NONE {
+            walkType(index, file, child)
+            child = nodeAt(index, file, child).next
+        }
+        if tag == Tag.function_type { walkType(index, file, value.extra) }
+        return
+    }
+    if tag == Tag.struct_type || tag == Tag.enum_type || tag == Tag.union_type || tag == Tag.error_set_type {
+        walkAggregate(index, file, node, nodeSymbol(index, file, node))
+        return
+    }
+    walkExpression(index, file, node, USE_READ)
+}
+
+fn walkList(index: *Index, file: u32, first: usize) -> void {
+    var child = first
+    while child != NODE_NONE {
+        walkExpression(index, file, child, USE_READ)
+        child = nodeAt(index, file, child).next
+    }
+}
+
+// An expression's names; `use` says how the value is used (read, written,
+// called).
+fn walkExpression(index: *Index, file: u32, node: usize, use: u8) -> void {
+    if node == NODE_NONE { return }
+    const value = nodeAt(index, file, node)
+    const tag = value.tag
+    if tag == Tag.identifier {
+        const name = tokenText(index, file, value.mainToken)
+        var symbol = NONE
+        if sameBytes(name, "Self") { symbol = index.*.walkSelf } else { symbol = lookup(index, file, name) }
+        if symbol == NONE {
+            index.*.unresolved += 1
+            return
+        }
+        setNodeSymbol(index, file, node, symbol)
+        addRef(index, file, value.mainToken, symbol, use)
+        return
+    }
+    if tag == Tag.field_expression {
+        if value.lhs == NODE_NONE { return }
+        walkExpression(index, file, value.lhs, USE_READ)
+        const base = typeOfExpression(index, file, value.lhs, index.*.walkSelf)
+        const symbol = memberOfType(index, base, tokenText(index, file, value.mainToken))
+        if symbol == NONE {
+            if base.symbol != NONE { index.*.unresolved += 1 }
+            return
+        }
+        setNodeSymbol(index, file, node, symbol)
+        addRef(index, file, value.mainToken, symbol, use)
+        return
+    }
+    if tag == Tag.call_expression {
+        walkExpression(index, file, value.lhs, USE_CALL)
+        walkList(index, file, value.rhs)
+        return
+    }
+    if tag == Tag.builtin_call {
+        // Type arguments come as type syntax (walked as types), the rest as
+        // expressions.
+        walkList(index, file, value.lhs)
+        return
+    }
+    if tag == Tag.binary_expression {
+        const operator = tokenAt(index, file, value.mainToken).kind
+        const assigns = operator >= Kind.equal && operator <= Kind.asterisk_pipe_shift_right_equal
+        walkExpression(index, file, value.lhs, if assigns { USE_WRITE } else { USE_READ })
+        walkExpression(index, file, value.rhs, USE_READ)
+        return
+    }
+    if tag == Tag.range_expression || tag == Tag.index_expression {
+        walkExpression(index, file, value.lhs, if tag == Tag.index_expression { use } else { USE_READ })
+        walkExpression(index, file, value.rhs, USE_READ)
+        return
+    }
+    if tag == Tag.slice_expression {
+        walkExpression(index, file, value.lhs, USE_READ)
+        walkExpression(index, file, value.rhs, USE_READ)
+        walkExpression(index, file, value.extra, USE_READ)
+        return
+    }
+    if tag == Tag.unary_expression {
+        const operator = tokenAt(index, file, value.mainToken).kind
+        walkExpression(index, file, value.lhs, if operator == Kind.dot_asterisk { use } else { USE_READ })
+        return
+    }
+    if tag == Tag.tuple_literal {
+        walkList(index, file, value.lhs)
+        return
+    }
+    if tag == Tag.array_literal {
+        walkType(index, file, value.endToken)
+        walkList(index, file, value.lhs)
+        return
+    }
+    if tag == Tag.aggregate_literal {
+        walkType(index, file, value.lhs)
+        const base = typeOfTypeNode(index, file, value.lhs, index.*.walkSelf)
+        var field = value.rhs
+        while field != NODE_NONE {
+            const item = nodeAt(index, file, field)
+            if base.symbol != NONE && base.depth == 0 {
+                const symbol = member(index, aliasTarget(index, base.symbol), tokenText(index, file, item.mainToken))
+                setNodeSymbol(index, file, field, symbol)
+                addRef(index, file, item.mainToken, symbol, USE_FIELD_INIT)
+            }
+            walkExpression(index, file, item.rhs, USE_READ)
+            field = item.next
+        }
+        return
+    }
+    if tag == Tag.if_statement || tag == Tag.match_statement || tag == Tag.block {
+        walkStatement(index, file, node)
+        return
+    }
+    if tag == Tag.named_type || tag == Tag.pointer_type || tag == Tag.many_pointer_type || tag == Tag.slice_type || tag == Tag.array_type || tag == Tag.optional_type || tag == Tag.error_union_type || tag == Tag.function_type || tag == Tag.struct_type || tag == Tag.enum_type || tag == Tag.union_type || tag == Tag.error_set_type || tag == Tag.nocopy_type {
+        walkType(index, file, node)
+        return
+    }
+}
+
+fn walkBlock(index: *Index, file: u32, node: usize) -> void {
+    if node == NODE_NONE { return }
+    const value = nodeAt(index, file, node)
+    if value.tag != Tag.block {
+        walkStatement(index, file, node)
+        return
+    }
+    const saved = index.*.localCount
+    var child = value.lhs
+    while child != NODE_NONE {
+        walkStatement(index, file, child)
+        child = nodeAt(index, file, child).next
+    }
+    index.*.localCount = saved
+}
+
+fn walkStatement(index: *Index, file: u32, node: usize) -> void {
+    if node == NODE_NONE { return }
+    const value = nodeAt(index, file, node)
+    const tag = value.tag
+    if tag == Tag.block {
+        walkBlock(index, file, node)
+        return
+    }
+    if tag == Tag.constant_declaration || tag == Tag.variable_declaration {
+        // A local: its type and value first, then it is in scope.
+        const symbol = declareBinding(index, file, node, index.*.walkFrom, true)
+        walkType(index, file, value.lhs)
+        const aggregate = if tag == Tag.constant_declaration { aggregateOf(index, file, value.rhs) } else { NODE_NONE }
+        if aggregate != NODE_NONE {
+            setNodeSymbol(index, file, aggregate, symbol)
+            walkAggregate(index, file, aggregate, symbol)
+        } else {
+            walkExpression(index, file, value.rhs, USE_READ)
+        }
+        declarationRef(index, symbol)
+        pushLocal(index, symbol)
+        return
+    }
+    if tag == Tag.function_declaration {
+        const symbol = declareFunction(index, file, node, index.*.walkFrom)
+        pushLocal(index, symbol)
+        walkFunction(index, file, symbol)
+        return
+    }
+    if tag == Tag.if_statement {
+        walkExpression(index, file, value.lhs, USE_READ)
+        walkBlock(index, file, value.rhs)
+        walkBlock(index, file, value.extra)
+        return
+    }
+    if tag == Tag.while_statement || tag == Tag.inline_while_statement {
+        walkExpression(index, file, value.lhs, USE_READ)
+        walkExpression(index, file, value.extra, USE_READ)
+        walkBlock(index, file, value.rhs)
+        return
+    }
+    if tag == Tag.for_statement || tag == Tag.inline_for_statement {
+        walkExpression(index, file, value.lhs, USE_READ)
+        const saved = index.*.localCount
+        if value.extra != NODE_NONE {
+            const capture = nodeAt(index, file, value.extra)
+            const item = addNamed(index, CAPTURE, file, capture.mainToken, value.extra, index.*.walkFrom)
+            if item != NONE {
+                symbolAt(index, item).*.valueNode = if value.lhs == NODE_NONE { NONE } else { @intCast(u32, value.lhs) }
+                symbolAt(index, item).*.firstToken = @intCast(u32, capture.mainToken)
+            }
+            declarationRef(index, item)
+            pushLocal(index, item)
+            if capture.endToken != NODE_NONE {
+                const position = addNamed(index, CAPTURE, file, capture.endToken, value.extra, index.*.walkFrom)
+                if position != NONE { symbolAt(index, position).*.firstToken = @intCast(u32, capture.endToken) }
+                declarationRef(index, position)
+                pushLocal(index, position)
+            }
+        }
+        walkBlock(index, file, value.rhs)
+        index.*.localCount = saved
+        return
+    }
+    if tag == Tag.match_statement {
+        walkExpression(index, file, value.lhs, USE_READ)
+        var arm = value.rhs
+        while arm != NODE_NONE {
+            const item = nodeAt(index, file, arm)
+            walkExpression(index, file, item.lhs, USE_READ)
+            walkBlock(index, file, item.rhs)
+            arm = item.next
+        }
+        return
+    }
+    if tag == Tag.return_statement || tag == Tag.break_statement {
+        walkExpression(index, file, value.rhs, USE_READ)
+        return
+    }
+    if tag == Tag.defer_statement || tag == Tag.error_defer_statement || tag == Tag.unsafe_block || tag == Tag.comptime_block {
+        walkBlock(index, file, value.lhs)
+        return
+    }
+    if tag == Tag.continue_statement { return }
+    walkExpression(index, file, node, USE_READ)
+}
+
+fn walkFunction(index: *Index, file: u32, function: u32) -> void {
+    if function == NONE { return }
+    const record = symbolAt(index, function)
+    const value = nodeAt(index, file, @intCast(usize, record.*.node))
+    const saved_from = index.*.walkFrom
+    const saved_locals = index.*.localCount
+    index.*.walkFrom = function
+    declarationRef(index, function)
+    // The parameters: their types, then in scope.
+    var child = record.*.firstChild
+    while child != NONE {
+        const parameter = symbolAt(index, child)
+        if parameter.*.kind == PARAM {
+            if parameter.*.typeNode != NONE { walkType(index, file, @intCast(usize, parameter.*.typeNode)) }
+            declarationRef(index, child)
+            pushLocal(index, child)
+        }
+        child = parameter.*.nextSibling
+    }
+    walkType(index, file, value.extra)
+    walkBlock(index, file, value.rhs)
+    index.*.localCount = saved_locals
+    index.*.walkFrom = saved_from
+}
+
+// An aggregate's members: fields' types and defaults, functions' bodies.
+fn walkAggregate(index: *Index, file: u32, node: usize, container: u32) -> void {
+    const value = nodeAt(index, file, node)
+    const saved_self = index.*.walkSelf
+    if container != NONE && symbolAt(index, container).*.kind != ERROR_SET { index.*.walkSelf = container }
+    walkType(index, file, value.extra)
+    var child = value.lhs
+    while child != NODE_NONE {
+        const item = nodeAt(index, file, child)
+        if item.tag == Tag.function_declaration {
+            var function = nodeSymbol(index, file, child)
+            if function == NONE {
+                // Found by name among the container's members.
+                function = member(index, container, tokenText(index, file, item.mainToken))
+            }
+            if function != NONE && symbolAt(index, function).*.node == @intCast(u32, child) { walkFunction(index, file, function) }
+        } else {
+            const symbol = member(index, container, tokenText(index, file, item.mainToken))
+            if symbol != NONE && symbolAt(index, symbol).*.node == @intCast(u32, child) { declarationRef(index, symbol) }
+            walkType(index, file, item.lhs)
+            walkExpression(index, file, item.rhs, USE_READ)
+        }
+        child = item.next
+    }
+    index.*.walkSelf = saved_self
+}
+
+fn walkFile(index: *Index, file: u32) -> void {
+    const record = fileAt(index, file)
+    index.*.walkFile = file
+    index.*.walkSelf = NONE
+    index.*.localCount = 0
+    record.*.refStart = index.*.refCount
+    const container = record.*.symbol
+    var symbol = symbolAt(index, container).*.firstChild
+    while symbol != NONE {
+        const item = symbolAt(index, symbol)
+        index.*.walkFrom = symbol
+        if item.*.kind == FUNCTION {
+            walkFunction(index, file, symbol)
+        } else if item.*.kind == TEST {
+            declarationRef(index, symbol)
+            walkBlock(index, file, nodeAt(index, file, @intCast(usize, item.*.node)).rhs)
+        } else if item.*.node != NONE {
+            const value = nodeAt(index, file, @intCast(usize, item.*.node))
+            declarationRef(index, symbol)
+            walkType(index, file, value.lhs)
+            const aggregate = aggregateOf(index, file, value.rhs)
+            if aggregate != NODE_NONE {
+                setNodeSymbol(index, file, aggregate, symbol)
+                walkAggregate(index, file, aggregate, symbol)
+            } else if item.*.kind == IMPORT {
+                const imported = importToken(index, file, value.rhs)
+                if imported != NODE_NONE && item.*.target != NONE { addRef(index, file, imported, item.*.target, USE_IMPORT) }
+            } else {
+                walkExpression(index, file, value.rhs, USE_READ)
+            }
+        }
+        symbol = item.*.nextSibling
+    }
+    record.*.refEnd = index.*.refCount
+    sortRefs(index, record.*.refStart, record.*.refEnd)
+}
+
+// A file's uses by where they are (insertion sort on nearly sorted runs,
+// in place).
+fn sortRefs(index: *Index, from: usize, to: usize) -> void {
+    var at = from + 1
+    while at < to {
+        const held = refAt(index, at).*
+        var place = at
+        while place > from && refAt(index, place - 1).*.start > held.start {
+            refAt(index, place).* = refAt(index, place - 1).*
+            place -= 1
+        }
+        refAt(index, place).* = held
+        at += 1
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Building
+
+fn allocateArray(allocator: Allocator, bytes: usize) -> [*]u8 {
+    return allocator.alloc(bytes, 16).?
+}
+
+pub fn create(root: []const u8) -> *Index {
+    const pages = std.page_allocator.init()
+    const memory = pages.alloc(@sizeOf(Index), 16)
+    var index: *Index = undefined
+    unsafe { index = @ptrCast(*Index, memory.?) }
+    index.*.arena = arena_allocator.init(pages, ARENA_BYTES)
+    index.*.allocator = arena_allocator.interface(arenaOf(index))
+    reset(index, root)
+    return index
+}
+
+// Empties the index (everything is built again).
+pub fn reset(index: *Index, root: []const u8) -> void {
+    arena_allocator.reset(arenaOf(index))
+    const allocator = index.*.allocator
+    unsafe {
+        index.*.files = @ptrCast([*]FileRecord, allocateArray(allocator, MAX_FILES * @sizeOf(FileRecord)))
+        index.*.symbols = @ptrCast([*]Symbol, allocateArray(allocator, MAX_SYMBOLS * @sizeOf(Symbol)))
+        index.*.refs = @ptrCast([*]Ref, allocateArray(allocator, MAX_REFS * @sizeOf(Ref)))
+        index.*.table = @ptrCast([*]u32, allocateArray(allocator, TABLE_SLOTS * 4))
+        index.*.fileTable = @ptrCast([*]u32, allocateArray(allocator, FILE_SLOTS * 4))
+        index.*.locals = @ptrCast([*]u32, allocateArray(allocator, LOCALS * 4))
+        index.*.root = allocateArray(allocator, root.length + 1)
+    }
+    var at: usize = 0
+    while at < TABLE_SLOTS {
+        index.*.table[at] = NONE
+        at += 1
+    }
+    at = 0
+    while at < FILE_SLOTS {
+        index.*.fileTable[at] = NONE
+        at += 1
+    }
+    at = 0
+    while at < root.length {
+        index.*.root[at] = root[at]
+        at += 1
+    }
+    index.*.rootLength = root.length
+    index.*.fileCount = 0
+    index.*.symbolCount = 0
+    index.*.refCount = 0
+    index.*.localCount = 0
+    index.*.unresolved = 0
+    index.*.walkSelf = NONE
+    index.*.walkFrom = NONE
+}
+
+// Adds a file to the index (its imports come with it when built).
+pub fn addPath(index: *Index, path: []const u8) -> u32 {
+    return addFile(index, path)
+}
+
+fn isSkippedDirectory(name: []const u8) -> bool {
+    return sameBytes(name, ".git") || sameBytes(name, "mlx-out") || sameBytes(name, "zig-out") || sameBytes(name, ".zig-cache") || sameBytes(name, "node_modules") || sameBytes(name, ".claude")
+}
+
+// Every .mlx file under directory `path`.
+pub fn addTree(index: *Index, path: []const u8) -> void {
+    var buffer: [1100]u8 = undefined
+    var bytes: [*]u8 = undefined
+    unsafe { bytes = @ptrCast([*]u8, &buffer) }
+    if path.length > 1000 { return }
+    var at: usize = 0
+    while at < path.length {
+        bytes[at] = path[at]
+        at += 1
+    }
+    bytes[path.length] = 0
+    const handle = std.linux.syscall3(2, @intFromPtr(bytes), 65536 | 524288, 0)
+    if handle < 0 { return }
+    var entries: [16384]u8 = undefined
+    var records: [*]u8 = undefined
+    unsafe { records = @ptrCast([*]u8, &entries) }
+    while true {
+        const count = std.linux.syscall3(217, @bitCast(usize, handle), @intFromPtr(records), 16384)
+        if count <= 0 { break }
+        var offset: usize = 0
+        while offset < @bitCast(usize, count) {
+            const record_length = @intCast(usize, records[offset + 16]) | (@intCast(usize, records[offset + 17]) << 8)
+            const kind = records[offset + 18]
+            var name: [*]const u8 = undefined
+            unsafe { name = @ptrFromInt([*]const u8, @intFromPtr(records) + offset + 19) }
+            var length: usize = 0
+            while name[length] != 0 { length += 1 }
+            const entry = name[0..length]
+            const dots = sameBytes(entry, ".") || sameBytes(entry, "..")
+            if !dots && path.length + length + 2 < 1000 {
+                bytes[path.length] = 47
+                var copy: usize = 0
+                while copy < length {
+                    bytes[path.length + 1 + copy] = entry[copy]
+                    copy += 1
+                }
+                const full = bytes[0..path.length + 1 + length]
+                if kind == 4 && !isSkippedDirectory(entry) {
+                    addTree(index, full)
+                } else if kind == 8 && length > 4 && sameBytes(entry[length - 4..length], ".mlx") {
+                    const added = addFile(index, full)
+                }
+            }
+            if record_length == 0 { break }
+            offset += record_length
+        }
+    }
+    const closed = std.linux.syscall1(3, @bitCast(usize, handle))
+}
+
+// Declarations of every file (imports load more files: until none is
+// left), then every use.
+pub fn build(index: *Index) -> void {
+    var file: usize = 0
+    while file < index.*.fileCount {
+        declareFile(index, @intCast(u32, file))
+        file += 1
+    }
+    file = 0
+    while file < index.*.fileCount {
+        walkFile(index, @intCast(u32, file))
+        file += 1
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Questions
+
+// The use (or declaration) at byte `offset` of `file`, else NONE.
+pub fn refAtOffset(index: *Index, file: u32, offset: usize) -> usize {
+    const record = fileAt(index, file)
+    var low = record.*.refStart
+    var high = record.*.refEnd
+    // The last use starting at or before offset.
+    while low < high {
+        const middle = (low + high) / 2
+        if @intCast(usize, refAt(index, middle).*.start) <= offset { low = middle + 1 } else { high = middle }
+    }
+    var at = low
+    while at > record.*.refStart {
+        at -= 1
+        const ref = refAt(index, at)
+        if @intCast(usize, ref.*.start) + @intCast(usize, ref.*.length) >= offset && @intCast(usize, ref.*.start) <= offset { return at }
+        if @intCast(usize, ref.*.start) + 200 < offset { break }
+    }
+    return MAX_REFS
+}
+
+pub fn symbolAtOffset(index: *Index, file: u32, offset: usize) -> u32 {
+    const ref = refAtOffset(index, file, offset)
+    if ref == MAX_REFS { return NONE }
+    return refAt(index, ref).*.symbol
+}
+
+pub fn kindName(kind: u8) -> []const u8 {
+    return match kind {
+        0 => "file", 1 => "struct", 2 => "enum", 3 => "union", 4 => "error set", 5 => "field", 6 => "member",
+        7 => "function", 8 => "const", 9 => "var", 10 => "parameter", 11 => "local const", 12 => "local var",
+        13 => "capture", 14 => "test", 15 => "import", 16 => "alias",
+        else => "?"
+    }
+}
+
+pub fn useName(use: u8) -> []const u8 {
+    return match use { 0 => "declaration", 1 => "read", 2 => "write", 3 => "call", 4 => "type", 5 => "field init", 6 => "import", else => "?" }
+}
+
+// Where a symbol's declaration starts (its first token, else its name).
+pub fn declarationOffset(index: *Index, symbol: u32) -> usize {
+    const record = symbolAt(index, symbol)
+    if record.*.firstToken == NONE { return @intCast(usize, record.*.nameStart) }
+    return tokenAt(index, record.*.file, @intCast(usize, record.*.firstToken)).start
+}
+
+// The doc comment above a declaration: the `//` lines right above it (no
+// blank line between), as a range of the source (start, length); length 0
+// without one.
+pub fn docRange(index: *Index, symbol: u32, start: *usize, length: *usize) -> void {
+    start.* = 0
+    length.* = 0
+    const record = symbolAt(index, symbol)
+    if record.*.kind == FILE {
+        // A file's: the comment block it starts with.
+        const source = sourceOf(index, record.*.file)
+        var end: usize = 0
+        while end < source.length {
+            var at = end
+            while at < source.length && (source[at] == 32 || source[at] == 9) { at += 1 }
+            if at + 1 < source.length && source[at] == 47 && source[at + 1] == 47 {
+                while at < source.length && source[at] != 10 { at += 1 }
+                end = at + 1
+            } else {
+                break
+            }
+        }
+        length.* = if end > source.length { source.length } else { end }
+        return
+    }
+    const file = record.*.file
+    const source = sourceOf(index, file)
+    const declaration = declarationOffset(index, symbol)
+    // The start of the declaration's line.
+    var line_start = declaration
+    while line_start > 0 && source[line_start - 1] != 10 { line_start -= 1 }
+    var top = line_start
+    while top > 0 {
+        // The line above.
+        var above = top - 1
+        while above > 0 && source[above - 1] != 10 { above -= 1 }
+        var at = above
+        while at < top && (source[at] == 32 || source[at] == 9) { at += 1 }
+        if at + 1 < top && source[at] == 47 && source[at + 1] == 47 {
+            top = above
+        } else {
+            break
+        }
+    }
+    start.* = top
+    length.* = line_start - top
+}
+
+// The declaration's first line up to its body or value (a function's
+// header, `name: Type` for a field), as a range of the source.
+pub fn signatureRange(index: *Index, symbol: u32, start: *usize, length: *usize) -> void {
+    const record = symbolAt(index, symbol)
+    const file = record.*.file
+    const source = sourceOf(index, file)
+    start.* = declarationOffset(index, symbol)
+    var end = start.*
+    if record.*.kind == FUNCTION && record.*.node != NONE {
+        const body = nodeAt(index, file, @intCast(usize, record.*.node)).rhs
+        if body != NODE_NONE {
+            end = tokenAt(index, file, nodeAt(index, file, body).mainToken).start
+        } else {
+            while end < source.length && source[end] != 10 { end += 1 }
+        }
+    } else {
+        while end < source.length && source[end] != 10 { end += 1 }
+    }
+    while end > start.* && (source[end - 1] == 32 || source[end - 1] == 123) { end -= 1 }
+    length.* = end - start.*
+}
