@@ -89,32 +89,35 @@ def run_empty_toolbar_touch(library, fixture, verbose):
     framework.show_window()
     framework.attach_input()
 
-    # 360x640 with a 24 px top inset: grid/list/sidebar are
-    # 228..268/268..308/308..348, vertically 32..72. Sample away from their
-    # glyphs and rounded corners.
+    # 360x640 with a 24 px top inset: the closed sidebar toggle is 10..50 on
+    # the left; grid/list are 268..308/308..348 on the right. Opening the
+    # drawer moves its toggle into the drawer header at 228..268.
     selected = 0xFF544642
     unselected = 0xFF3A2F2C
-    grid_sample = (234, 52)
-    list_sample = (302, 52)
-    sidebar_sample = (342, 52)
+    grid_sample = (274, 52)
+    list_sample = (342, 52)
+    sidebar_sample = (262, 52)
     problems = []
     if frame_pixel(framework, *grid_sample) != unselected or frame_pixel(framework, *list_sample) != selected:
         problems.append("initial list-view selection was not painted")
 
-    base = feed(framework, [(ACTION_DOWN, 248, 52, 0), (ACTION_UP, 248, 52, 80 * MS)], 0)
+    base = feed(framework, [(ACTION_DOWN, 288, 52, 0), (ACTION_UP, 288, 52, 80 * MS)], 0)
     if frame_pixel(framework, *grid_sample) != selected or frame_pixel(framework, *list_sample) != unselected:
         problems.append("grid button touch did not switch the visible view")
 
-    base = feed(framework, [(ACTION_DOWN, 288, 52, 0), (ACTION_UP, 288, 52, 80 * MS)], base)
+    base = feed(framework, [(ACTION_DOWN, 328, 52, 0), (ACTION_UP, 328, 52, 80 * MS)], base)
     if frame_pixel(framework, *grid_sample) != unselected or frame_pixel(framework, *list_sample) != selected:
         problems.append("list button touch did not switch the visible view")
 
     content_before = frame_pixel(framework, 20, 200)
-    base = feed(framework, [(ACTION_DOWN, 328, 52, 0), (ACTION_UP, 328, 52, 80 * MS)], base)
+    base = feed(framework, [(ACTION_DOWN, 30, 52, 0), (ACTION_UP, 30, 52, 80 * MS)], base)
     content_with_drawer = frame_pixel(framework, 20, 200)
-    if content_with_drawer == content_before or frame_pixel(framework, *sidebar_sample) != selected:
-        problems.append("sidebar button did not open and paint the phone drawer")
-    feed(framework, [(ACTION_DOWN, 328, 52, 0), (ACTION_UP, 328, 52, 80 * MS)], base)
+    if content_with_drawer == content_before:
+        problems.append("sidebar button did not paint the phone drawer")
+    sidebar_pixel = frame_pixel(framework, *sidebar_sample)
+    if sidebar_pixel != selected:
+        problems.append(f"open drawer did not paint its active sidebar button: {sidebar_pixel:#x}")
+    feed(framework, [(ACTION_DOWN, 264, 52, 0), (ACTION_UP, 264, 52, 80 * MS)], base)
     if frame_pixel(framework, 20, 200) != content_before:
         problems.append("sidebar button did not close the phone drawer")
 
@@ -123,10 +126,10 @@ def run_empty_toolbar_touch(library, fixture, verbose):
     framework.vulkan.extent = (940, 580)
     framework.callback("onNativeWindowResized", WINDOW)
     wide_sidebar = frame_pixel(framework, 100, 200)
-    base = feed(framework, [(ACTION_DOWN, 709, 50, 0), (ACTION_UP, 709, 50, 80 * MS)], base + 100 * MS)
+    base = feed(framework, [(ACTION_DOWN, 171, 50, 0), (ACTION_UP, 171, 50, 80 * MS)], base + 100 * MS)
     if frame_pixel(framework, 100, 200) == wide_sidebar:
         problems.append("wide sidebar did not collapse to an icon rail")
-    feed(framework, [(ACTION_DOWN, 709, 50, 0), (ACTION_UP, 709, 50, 80 * MS)], base)
+    feed(framework, [(ACTION_DOWN, 27, 50, 0), (ACTION_UP, 27, 50, 80 * MS)], base)
     if frame_pixel(framework, 100, 200) != wide_sidebar:
         problems.append("wide icon rail did not expand back to the full sidebar")
 
@@ -170,12 +173,12 @@ def run_vulkan(library, fixture, verbose):
         return [(ACTION_DOWN, x, y, 0), (ACTION_UP, x, y, 80 * MS)]
 
     # 360x640, safe top 24/bottom 30: toolbar 24..128, rows begin at 128.
-    grid_button = tap(248, 52)
-    list_button = tap(288, 52)
+    grid_button = tap(288, 52)
+    list_button = tap(328, 52)
     first_grid_item = tap(96, 188)
     first_row = tap(180, 154)
     second_row = tap(180, 206)
-    back_button = tap(30, 52)
+    back_button = tap(74, 52)
     long_press = [(ACTION_DOWN, 180, 154, 0), (ACTION_UP, 180, 154, 700 * MS)]
 
     # The shared toolbar changes to the real grid renderer; its first cell

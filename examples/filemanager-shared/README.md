@@ -6,6 +6,8 @@ pixel size, safe-area insets, current view, density scale and the two retained
 sidebar preferences. The returned `Layout` contains every interactive and
 painted rectangle plus the list/grid metrics. `layout` provides the default
 expanded-wide/closed-overlay state for callers that do not retain UI state.
+The sidebar toggle lives in the visible sidebar header or icon rail; with a
+closed compact/phone drawer it moves before the Back and Forward buttons.
 
 The logical breakpoints are:
 
