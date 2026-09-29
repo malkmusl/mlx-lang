@@ -89,30 +89,57 @@ def run_empty_toolbar_touch(library, fixture, verbose):
     framework.show_window()
     framework.attach_input()
 
-    # 360x640 with a 24 px top inset: grid/list are 268..308/308..348,
-    # vertically 32..72. Sample away from their glyphs and rounded corners.
+    # 360x640 with a 24 px top inset: grid/list/sidebar are
+    # 228..268/268..308/308..348, vertically 32..72. Sample away from their
+    # glyphs and rounded corners.
     selected = 0xFF544642
     unselected = 0xFF3A2F2C
-    grid_sample = (274, 52)
-    list_sample = (342, 52)
+    grid_sample = (234, 52)
+    list_sample = (302, 52)
+    sidebar_sample = (342, 52)
     problems = []
     if frame_pixel(framework, *grid_sample) != unselected or frame_pixel(framework, *list_sample) != selected:
         problems.append("initial list-view selection was not painted")
 
-    base = feed(framework, [(ACTION_DOWN, 288, 52, 0), (ACTION_UP, 288, 52, 80 * MS)], 0)
+    base = feed(framework, [(ACTION_DOWN, 248, 52, 0), (ACTION_UP, 248, 52, 80 * MS)], 0)
     if frame_pixel(framework, *grid_sample) != selected or frame_pixel(framework, *list_sample) != unselected:
         problems.append("grid button touch did not switch the visible view")
 
-    feed(framework, [(ACTION_DOWN, 328, 52, 0), (ACTION_UP, 328, 52, 80 * MS)], base)
+    base = feed(framework, [(ACTION_DOWN, 288, 52, 0), (ACTION_UP, 288, 52, 80 * MS)], base)
     if frame_pixel(framework, *grid_sample) != unselected or frame_pixel(framework, *list_sample) != selected:
         problems.append("list button touch did not switch the visible view")
+
+    content_before = frame_pixel(framework, 20, 200)
+    base = feed(framework, [(ACTION_DOWN, 328, 52, 0), (ACTION_UP, 328, 52, 80 * MS)], base)
+    content_with_drawer = frame_pixel(framework, 20, 200)
+    if content_with_drawer == content_before or frame_pixel(framework, *sidebar_sample) != selected:
+        problems.append("sidebar button did not open and paint the phone drawer")
+    feed(framework, [(ACTION_DOWN, 328, 52, 0), (ACTION_UP, 328, 52, 80 * MS)], base)
+    if frame_pixel(framework, 20, 200) != content_before:
+        problems.append("sidebar button did not close the phone drawer")
+
+    # The same stateful toggle becomes a full-sidebar/icon-rail switch at the
+    # wide breakpoint instead of hiding desktop navigation completely.
+    framework.vulkan.extent = (940, 580)
+    framework.callback("onNativeWindowResized", WINDOW)
+    wide_sidebar = frame_pixel(framework, 100, 200)
+    base = feed(framework, [(ACTION_DOWN, 709, 50, 0), (ACTION_UP, 709, 50, 80 * MS)], base + 100 * MS)
+    if frame_pixel(framework, 100, 200) == wide_sidebar:
+        problems.append("wide sidebar did not collapse to an icon rail")
+    feed(framework, [(ACTION_DOWN, 709, 50, 0), (ACTION_UP, 709, 50, 80 * MS)], base)
+    if frame_pixel(framework, 100, 200) != wide_sidebar:
+        problems.append("wide icon rail did not expand back to the full sidebar")
 
     lines = log_lines(framework)
     if "files: input queue attached" not in lines or "files: touch input active" not in lines:
         problems.append("Vulkan demo motion path did not reach the Files activity")
     if "files: grid view" not in lines or "files: list view" not in lines:
         problems.append("toolbar touches did not reach the Files UI actions")
-    if framework.handled != [1, 1, 1, 1]:
+    if "files: sidebar drawer opened" not in lines or "files: sidebar drawer closed" not in lines:
+        problems.append("sidebar toggle did not reach the responsive UI state")
+    if "files: sidebar icon rail" not in lines or "files: sidebar expanded" not in lines:
+        problems.append("wide sidebar toggle did not reach the responsive UI state")
+    if framework.handled != [1] * 12:
         problems.append(f"toolbar motion events were not handled: {framework.handled}")
 
     framework.callback("onNativeWindowDestroyed", WINDOW)
@@ -142,14 +169,14 @@ def run_vulkan(library, fixture, verbose):
     def tap(x, y):
         return [(ACTION_DOWN, x, y, 0), (ACTION_UP, x, y, 80 * MS)]
 
-    # 360x640, safe top 24/bottom 30: toolbar 24..80, rows begin at 80.
-    grid_button = tap(288, 52)
-    list_button = tap(328, 52)
-    first_grid_item = tap(96, 140)
-    first_row = tap(180, 106)
-    second_row = tap(180, 158)
+    # 360x640, safe top 24/bottom 30: toolbar 24..128, rows begin at 128.
+    grid_button = tap(248, 52)
+    list_button = tap(288, 52)
+    first_grid_item = tap(96, 188)
+    first_row = tap(180, 154)
+    second_row = tap(180, 206)
     back_button = tap(30, 52)
-    long_press = [(ACTION_DOWN, 180, 106, 0), (ACTION_UP, 180, 106, 700 * MS)]
+    long_press = [(ACTION_DOWN, 180, 154, 0), (ACTION_UP, 180, 154, 700 * MS)]
 
     # The shared toolbar changes to the real grid renderer; its first cell
     # opens Project 2 through the same down/up path as the Vulkan demo. Return
@@ -224,24 +251,23 @@ def run_vulkan(library, fixture, verbose):
 
 
 def run_system_keyboard(library, fixture, verbose):
-    """The compact responsive toolbar exposes Search. A direct tap must
+    """The phone toolbar's second row exposes Search. A direct tap must
     focus it through Android's NativeActivity IME API, and a tap outside it
     must dismiss the same system keyboard."""
     framework = FilesFramework(library, fixture, verbose)
-    framework.vulkan.extent = (640, 360)
     framework.create()
     framework.show_window()
     framework.attach_input()
 
-    # Compact layout at 640x360: Search is x=476..626, y=35..65.
-    base = feed(framework, [(ACTION_DOWN, 550, 50, 0), (ACTION_UP, 550, 50, 80 * MS)], 0)
+    # Phone layout at 360x640: Search is x=12..348, y=84..124.
+    base = feed(framework, [(ACTION_DOWN, 180, 104, 0), (ACTION_UP, 180, 104, 80 * MS)], 0)
     editor_focused = framework.jni.focused_text_editor in framework.jni.text_editors
     editor = framework.jni.focused_text_editor
     editor_layout = framework.jni.data[editor]["layout"] if editor_focused else 0
     editor_geometry = framework.jni.data.get(editor_layout)
     editor_padding = framework.jni.data[editor].get("padding") if editor_focused else None
     editor_focusable = framework.jni.data[editor].get("setFocusableInTouchMode") if editor_focused else None
-    feed(framework, [(ACTION_DOWN, 320, 120, 0), (ACTION_UP, 320, 120, 80 * MS)], base)
+    feed(framework, [(ACTION_DOWN, 180, 180, 0), (ACTION_UP, 180, 180, 80 * MS)], base)
     editor_dismissed = editor_focused and framework.jni.focused_text_editor == 0 and framework.jni.data[editor]["visibility"] == 8
 
     problems = []
@@ -251,7 +277,7 @@ def run_system_keyboard(library, fixture, verbose):
         problems.append(f"standard IME was not targeted at the editor: {framework.jni.soft_input_targets}")
     if framework.ime_shown:
         problems.append(f"search still targeted NativeActivity's non-editor view: {framework.ime_shown}")
-    if editor_geometry != {"width": 150, "height": 30, "margins": (476, 35, 0, 0)}:
+    if editor_geometry != {"width": 336, "height": 40, "margins": (12, 84, 0, 0)}:
         problems.append(f"Android editor did not cover the responsive search field: {editor_geometry}")
     if editor_padding != (32, 0, 8, 0):
         problems.append(f"Android editor did not preserve the search glyph inset: {editor_padding}")

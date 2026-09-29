@@ -1,16 +1,19 @@
 # Shared Files UI
 
 `ui.mlx` is the responsive layout interface shared by the Wayland file
-manager and its Android NativeActivity. Call `layout` with the pixel size,
-safe-area insets, current view and density scale. The returned `Layout`
-contains every interactive and painted rectangle plus the list/grid metrics.
+manager and its Android NativeActivity. Call `layoutWithSidebar` with the
+pixel size, safe-area insets, current view, density scale and the two retained
+sidebar preferences. The returned `Layout` contains every interactive and
+painted rectangle plus the list/grid metrics. `layout` provides the default
+expanded-wide/closed-overlay state for callers that do not retain UI state.
 
 The logical breakpoints are:
 
-- **wide** (`>= 760 px`): desktop sidebar, toolbar, list header and status;
-- **compact** (`>= 520 px`): no sidebar, with the remaining desktop chrome;
-- **phone** (`< 520 px`): touch-sized rows and controls, no list header or
-  search field.
+- **wide** (`>= 760 px`): expandable desktop sidebar or icon rail, toolbar,
+  search, list header and status;
+- **compact** (`>= 520 px`): toolbar search and an optional overlay sidebar;
+- **phone** (`< 520 px`): touch-sized controls, a second toolbar row for
+  search, no list header and an optional overlay sidebar.
 
 `view.mlx` paints the shared chrome and glyphs through
 `desktop-shared/canvas.mlx`. That canvas supports the desktop and Android
