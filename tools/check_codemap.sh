@@ -7,7 +7,7 @@
 #     searches, Enter flies to the result and selects it, with what it
 #     connects to (the function is called from the other file); Escape
 #     clears; a click on a group in the sidebar selects the group, one on
-#     its check box leaves it out;
+#     its check box leaves it out and the camera flies to what is shown;
 #   - drawn alike on the GPU (lavapipe) and on the CPU (MLX_CANVAS=cpu).
 # The app runs under tools/wayland-test-host; MLX_CODEMAP_TRACE makes it
 # say what it read and selected.
@@ -156,6 +156,7 @@ run() {
     # in it; the crash (through main in app) stays.
     grep -q "^codemap: shown [0-9]* nodes, findings 0 0 [0-9]* 2 1$" "$log" || fail "codemap ($name): at first everything is shown" "$log"
     grep -q "^codemap: shown [0-9]* nodes, findings 0 0 [0-9]* 0 1$" "$log" || fail "codemap ($name): the lib group's check box did not leave it out" "$log"
+    grep -q "^codemap: flying to tree/app/$" "$log" || fail "codemap ($name): the camera did not fly to the group still shown" "$log"
     python3 - "$shots/start.ppm" "$shots/selected.ppm" <<'PY' || fail "codemap ($name): the view or the detail panel is not drawn" "$log"
 import sys
 def load(path):

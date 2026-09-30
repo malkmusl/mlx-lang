@@ -145,6 +145,9 @@ findings.
     clear *Everything*, then tick `std`: only the standard library is
     shown.
   - *Everything* shows all, or (when all is shown) nothing.
+  - Then the camera flies to the smallest group holding everything shown
+    (`std` in the example). What was selected and is left out is not
+    selected any more.
 - **Findings:** a finding's check box shows its places in space (Crashes
   is ticked from the start). A click on the finding itself opens its list
   in the panel and ticks it.
