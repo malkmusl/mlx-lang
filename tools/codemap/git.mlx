@@ -1,0 +1,164 @@
+// Asking Git (for the history of the code): runs `git -C ROOT ...` through
+// /bin/sh and reads what it writes. No libc: fork, a pipe, execve.
+//
+//     var git: git_module.Git = undefined
+//     git_module.init(&git, allocator, root, environment)
+//     const text = git_module.run(&git, "log --format=%ct --name-only")
+const std = @import("std")
+
+pub const Allocator = std.allocator.Allocator
+
+const SYS_read: usize = 0
+const SYS_close: usize = 3
+const SYS_dup2: usize = 33
+// vfork: the child only runs execve, and the parent's memory is big (copying
+// its page tables for each git command would cost more than git).
+const SYS_vfork: usize = 58
+const SYS_execve: usize = 59
+const SYS_exit: usize = 60
+const SYS_wait4: usize = 61
+const SYS_open: usize = 2
+const SYS_pipe2: usize = 293
+const O_CLOEXEC: usize = 524288
+
+// The most a command may write (what is more is cut).
+pub const MOST_OUTPUT: usize = 268435456
+
+pub const Git = struct {
+    allocator: Allocator
+    environment: [*][*]const u8
+    // The command line being made (NUL-terminated for sh -c).
+    command: [*]u8
+    commandLength: usize
+    root: [*]u8
+    rootLength: usize
+    // What the last command wrote.
+    output: [*]u8
+    outputLength: usize
+    capacity: usize
+    // Whether the root is a Git work tree (asked once).
+    checked: bool
+    usable: bool
+}
+
+pub fn init(git: *Git, allocator: Allocator, root: []const u8, environment: [*][*]const u8) -> void {
+    git.*.allocator = allocator
+    git.*.environment = environment
+    git.*.command = allocator.alloc(65536, 16).?
+    git.*.root = allocator.alloc(4096, 16).?
+    git.*.rootLength = 0
+    for byte in root {
+        if git.*.rootLength < 4000 {
+            git.*.root[git.*.rootLength] = byte
+            git.*.rootLength += 1
+        }
+    }
+    git.*.capacity = 1048576
+    git.*.output = allocator.alloc(git.*.capacity, 16).?
+    git.*.outputLength = 0
+    git.*.checked = false
+    git.*.usable = false
+}
+
+// Whether Git is there and the root is in a work tree.
+pub fn usable(git: *Git) -> bool {
+    if !git.*.checked {
+        git.*.checked = true
+        const answer = run(git, "rev-parse --is-inside-work-tree")
+        git.*.usable = answer.length >= 4 && answer[0] == 116
+    }
+    return git.*.usable
+}
+
+fn add(git: *Git, text: []const u8) -> void {
+    for byte in text {
+        if git.*.commandLength < 65000 {
+            git.*.command[git.*.commandLength] = byte
+            git.*.commandLength += 1
+        }
+    }
+}
+
+// `text` in single quotes for the shell.
+pub fn addQuoted(git: *Git, text: []const u8) -> void {
+    add(git, "'")
+    for byte in text {
+        if byte == 39 { add(git, "'\\''") } else if git.*.commandLength < 65000 {
+            git.*.command[git.*.commandLength] = byte
+            git.*.commandLength += 1
+        }
+    }
+    add(git, "'")
+}
+
+// Starts a command: `git -C ROOT ` (the rest follows with more/quoted).
+pub fn begin(git: *Git) -> void {
+    git.*.commandLength = 0
+    add(git, "exec git -C ")
+    addQuoted(git, git.*.root[0..git.*.rootLength])
+    add(git, " ")
+}
+
+pub fn more(git: *Git, text: []const u8) -> void { add(git, text) }
+
+// Runs `git -C ROOT arguments` (arguments as the shell reads them);
+// what it wrote to its output (its errors go nowhere).
+pub fn run(git: *Git, arguments: []const u8) -> []const u8 {
+    begin(git)
+    add(git, arguments)
+    return finish(git)
+}
+
+// Runs the command made with begin, more and addQuoted.
+pub fn finish(git: *Git) -> []const u8 {
+    add(git, " 2>/dev/null")
+    git.*.command[git.*.commandLength] = 0
+    git.*.outputLength = 0
+    var pipes: [2]i32 = [2]i32{ -1, -1 }
+    var made: isize = 0
+    unsafe { made = std.linux.syscall2(SYS_pipe2, @intFromPtr(&pipes), O_CLOEXEC) }
+    if made != 0 { return git.*.output[0..0] }
+    const child = std.linux.syscall0(SYS_vfork)
+    if child == 0 {
+        const out = std.linux.syscall2(SYS_dup2, @intCast(usize, pipes[1]), 1)
+        var arguments: [4][*]const u8 = undefined
+        unsafe {
+            arguments[0] = @ptrCast([*]const u8, "/bin/sh")
+            arguments[1] = @ptrCast([*]const u8, "-c")
+            arguments[2] = @ptrCast([*]const u8, git.*.command)
+            arguments[3] = @ptrFromInt([*]const u8, 0)
+            const ran = std.linux.syscall3(SYS_execve, @intFromPtr(arguments[0]), @intFromPtr(&arguments), @intFromPtr(git.*.environment))
+        }
+        const exited = std.linux.syscall1(SYS_exit, 127)
+    }
+    const writing = std.linux.syscall1(SYS_close, @intCast(usize, pipes[1]))
+    if child < 0 {
+        const reading = std.linux.syscall1(SYS_close, @intCast(usize, pipes[0]))
+        return git.*.output[0..0]
+    }
+    while true {
+        if git.*.outputLength + 65536 > git.*.capacity && git.*.capacity < MOST_OUTPUT {
+            const bigger = git.*.capacity * 2
+            const memory = git.*.allocator.alloc(bigger, 16)
+            if memory == null { break }
+            var at: usize = 0
+            while at < git.*.outputLength {
+                memory.?[at] = git.*.output[at]
+                at += 1
+            }
+            git.*.allocator.free(git.*.output, git.*.capacity, 16)
+            git.*.output = memory.?
+            git.*.capacity = bigger
+        }
+        if git.*.outputLength + 65536 > git.*.capacity { break }
+        var chunk: [*]u8 = undefined
+        unsafe { chunk = @ptrFromInt([*]u8, @intFromPtr(git.*.output) + git.*.outputLength) }
+        const got = std.linux.syscall3(SYS_read, @intCast(usize, pipes[0]), @intFromPtr(chunk), 65536)
+        if got <= 0 { break }
+        git.*.outputLength += @bitCast(usize, got)
+    }
+    const reading = std.linux.syscall1(SYS_close, @intCast(usize, pipes[0]))
+    var status: [4]u8 = [4]u8{ 0, 0, 0, 0 }
+    const waited = std.linux.syscall4(SYS_wait4, @bitCast(usize, child), @intFromPtr(&status), 0, 0)
+    return git.*.output[0..git.*.outputLength]
+}
