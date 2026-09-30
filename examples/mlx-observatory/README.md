@@ -415,9 +415,12 @@ What the map knows is in the editor, where the code is:
   shows how much time each declaration took in the profiles. The pointer
   on a line number: who wrote the line, when, in which commit (`git
   blame`).
-- **Hover:** what a name is and where it belongs (field `x` of struct
-  `Point`, local `point` in function `main`, with file and line), a
-  value's type and where that type is declared, the doc comment, and
+- **Hover** (as rust-analyzer shows it): where the name belongs (its
+  file and the containers around it: `lib/helper.mlx › Point` for the
+  field `x`, `app/main.mlx › main` for a local), its signature in the
+  code's colors (a struct, enum or union with its fields or members
+  under it), a value's type and where that type is declared, the doc
+  comment set as text (paragraphs, `code`, items, indented code), and
   what the map measures of it.
 - **Go to the declaration:** Ctrl+click or F12; back (the panel's arrow,
   Alt+Left) returns to where you came from, in the editor.
@@ -425,8 +428,13 @@ What the map knows is in the editor, where the code is:
   line; Enter or a click opens one.
 - **Completion:** typing a name lists what is in scope (the locals and
   parameters so far, the file's declarations, the keywords); after a dot
-  the members of what is before it, after `@` the builtins; each with
-  its signature or type. Up, Down, Enter or Tab, Esc.
+  the members of what is before it (`std.` the modules of std,
+  `std.fs.` their functions, `point.` the fields), after `@` the
+  builtins. The best fit first: what starts with the typed text, then
+  what has its letters in order (`wAB` finds `writeAllBytes`). Each item
+  with its signature, type or module; the chosen one's place, signature
+  and doc comment at the side. A function comes with its parentheses.
+  Ctrl+Space opens it with nothing typed; Up, Down, Enter or Tab, Esc.
 - **Signature help:** in a call (after its `(` or a comma), the
   function's signature above the cursor with the argument lit.
 - **Rename:** F2 on a name, the new name, Enter: every use the index
@@ -461,6 +469,7 @@ rename waits for the next read.
 | F12, Ctrl+click | go to the declaration |
 | Shift+F12 | the references |
 | F2 | rename |
+| Ctrl+Space | completion |
 | Escape | close a list or the signature, drop the selection (the file stays) |
 | Ctrl+E | back to the map |
 | Ctrl+Shift+O | open the file in the outside editor (`MLX_EDITOR`, else VS Code, else `xdg-open`) |
