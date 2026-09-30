@@ -596,3 +596,64 @@ fi
 sed -n '/^codemap: commit done/,$p' "$work/demo.log" | grep -q "^codemap: editor open" && fail "editor: Escape opened another file" "$work/demo.log"
 sed -n '/^codemap: demo view map$/,$p' "$work/demo.log" | grep -q "^codemap: read again$" || fail "map: the saved files were not read again" "$work/demo.log"
 echo "ok   map and editor: Escape stays in the file, the map follows the saved files"
+
+# A German keyboard in the editor: AltGr+Q and Ctrl+Alt+Q type @, AltGr+7
+# types {, the key US keyboards have / on types - (and does not find).
+keys="$work/keys"
+mkdir -p "$keys/tree/lib"
+printf 'pub fn greet() -> u8 { return 1 }\n' > "$keys/tree/lib/a.mlx"
+xkbcli compile-keymap --layout de > "$work/de.xkb"
+cat > "$keys/app.script" << 'SCRIPT'
+wait 5000
+pointer 1040 25
+press 272
+release 272
+type greet
+wait 300
+enter
+wait 300
+down 29
+mods 4
+down 24
+up 24
+up 29
+mods 0
+wait 800
+down 100
+mods 128
+down 16
+up 16
+down 8
+up 8
+up 100
+mods 0
+down 29
+down 56
+mods 12
+down 16
+up 16
+up 56
+up 29
+mods 0
+down 53
+up 53
+wait 300
+down 29
+mods 4
+down 31
+up 31
+up 29
+mods 0
+wait 500
+close
+SCRIPT
+runtime=$(mktemp -d)
+XDG_RUNTIME_DIR=$runtime "$work/test-host" host-keys "$work/de.xkb" "$keys/app.script" > "$keys/host.log" 2>&1 &
+host_pid=$!
+for _ in $(seq 1 50); do [[ -S "$runtime/host-keys" ]] && break; sleep 0.1; done
+env -i PATH="$PATH" HOME="$keys" XDG_RUNTIME_DIR="$runtime" WAYLAND_DISPLAY=host-keys MLX_CANVAS=cpu MLX_CODEMAP_TRACE=1 \
+    timeout 60 "$work/mlx-observatory" "$keys/tree" > "$keys/app.log" 2>&1 || fail "keys: the app failed" "$keys/app.log"
+wait "$host_pid" || fail "keys: the test host failed" "$keys/host.log"
+rm -rf -- "$runtime"
+[[ "$(head -1 "$keys/tree/lib/a.mlx")" == 'pub fn @{@-greet() -> u8 { return 1 }' ]] || fail "keys: AltGr, Ctrl+Alt or - did not type (the file: $(head -1 "$keys/tree/lib/a.mlx"))" "$keys/app.log"
+echo "ok   keys: AltGr and Ctrl+Alt type @ and {, the - key types - in the editor"

@@ -451,6 +451,11 @@ What the map knows is in the editor, where the code is:
   reads the code again, so the map, the findings and the Changed marks
   follow the edit.
 
+Keys type what the keyboard layout says: AltGr types its third level
+(`@`, `{`, `[`, `\` on a German keyboard), and so does Ctrl+Alt, as on
+Windows, for the keys that have one. Such a key is typed, never taken as
+a shortcut.
+
 The index keeps up with the typing: a moment (300 ms) after an edit, the
 tab's file is read into it again, saved or not
 ([`index_module.refreshFile`](../../tools/codemap/index.mlx), about 15 ms
