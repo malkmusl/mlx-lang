@@ -20,6 +20,11 @@ mlx-codemap [ROOT]          the 3D view of ROOT (default: MLX_CODEMAP_ROOT,
                             else the Git work tree around the working
                             directory; the installed desktop entry opens
                             the repository it was installed from)
+    --only GROUP,GROUP      only these groups shown (paths: std,
+                            examples/mlx-files)
+    --view NAME             a view of codemap.views in the search
+    --query WORDS           a query in the search
+    --diff REV              the base of the finding Changed (HEAD)
 mlx-codemap COMMAND ...     the command line (below)
 ```
 
@@ -105,6 +110,14 @@ each group are joined by magenta lines in space.
   ([`measures.mlx`](../../tools/codemap/measures.mlx)).
 - **Hot:** where the programs spend their time, from the profiles of
   `mlx-profile`.
+- **Changed:** declarations added and changed since a commit (`--diff
+  REV`; without it HEAD, so what is not committed yet), mint green. The
+  files Git names as changed are taken out of that commit and indexed on
+  their own; declarations are matched by file, containers, name and kind
+  and compared by their text without blanks
+  ([`diff.mlx`](../../tools/codemap/diff.mlx)). The list ends with the
+  declarations removed. `mlx-codemap diff [BASE] [OTHER]` prints the same
+  (`+` added, `~` changed, `-` removed), also between two commits.
 
 Generated code (`/generated/`) is left out.
 
@@ -191,6 +204,8 @@ The command line lists the same findings: `mlx-codemap copies [PATH]`,
 | click | select |
 | double click | fly there (on empty space: up a group) |
 | typing, Ctrl+F, / | search; Enter or a click flies to a result |
+| a query in the search | leaves out what does not answer it (see Queries); Enter flies to what is left |
+| Ctrl+S | keeps the query in the search as a view (codemap.views) |
 | Escape | clear the search, then the selection, then go up a group |
 | Enter | fly to the selection |
 | Alt+Up | its group |
@@ -280,6 +295,44 @@ that is never freed. See
 index build fills about 80 MB of it. The app takes the arena back after
 each event, frame, layout step and build.
 
+## Queries and views
+
+The search also takes a query
+([`query.mlx`](../../tools/codemap/query.mlx)): words that all have to
+hold, `-` before one turns it around.
+
+| word | the declaration |
+|---|---|
+| `TEXT`, `name:TEXT` | its name contains TEXT |
+| `kind:KIND` | is a `fn`, `struct`, `enum`, `union`, `error`, `field`, `member`, `const`, `var` or `test` |
+| `in:PATH` | is in a file whose path starts with PATH |
+| `file:TEXT` | is in a file whose path contains TEXT |
+| `uses:NAME`, `calls:NAME` | uses (any way) or calls something named NAME |
+| `by:NAME` | is called by something named NAME |
+| `crashed` | a kept crash stopped in it or went through it |
+| `workaround`, `workaround:KIND` | works around something (`dropped`, `counted`, `pointers`, `casts`, `unsafe`, `arena`, `floats`, `math`, `comments`) |
+| `unused`, `unreachable`, `untested`, `complex`, `risky`, `hot`, `copy` | is one of that finding's |
+| `changed`, `added` | changed or added since the base (`since:REV`, else HEAD) |
+
+For example `kind:fn in:std/ uses:Allocator -untested`. What does not
+answer is left out of the galaxy (a group with an answer in it stays), the
+field shows how many answer, and a word it does not understand turns it
+red.
+
+Views are queries kept with the code, in `codemap.views` at the root
+([`views.mlx`](../../tools/codemap/views.mlx)):
+
+```
+# a name, " = ", a query
+Crashes in std = in:std/ crashed
+Changed = changed
+```
+
+They are listed at the end of the sidebar (a click shows one, a second
+click shows everything again); `@NAME` in the search, `--view NAME` at the
+start and `mlx-codemap query @NAME` show one too. Ctrl+S keeps the query in
+the search as a new view.
+
 ## The command line
 
 The same binary with a command, or `tools/codemap/main.mlx` built on its
@@ -294,6 +347,7 @@ mlx-codemap [-C ROOT] stats | files [TEXT] | outline FILE | find TEXT |
     untested [PATH] | sizes [PROGRAM] [PATH] | complex [PATH] | cycles |
     layers | churn [PATH] | risky [PATH] | hot [PATH] | crashes [PATH] |
     rewrite PATTERN [PATH] [--apply] | history [N] | workarounds-count |
+    query WORDS | query @VIEW | views | diff [BASE] [OTHER] |
     unresolved [FILE] | json
 ```
 
@@ -306,12 +360,15 @@ answers are `path:line:col: kind Qualified.name` lines.
 
 1. Validates the shader.
 2. Asks the command line, also for the workarounds and a kept crash, the
-   workarounds at both commits of the tree (`history`), and rewrites a
-   dropped result and a counted length in a program that must still build
-   and exit the same.
+   workarounds at both commits of the tree (`history`), what changed
+   since the first commit (`diff`, `query changed since:HEAD~1`), queries
+   and a view, and rewrites a dropped result and a counted length in a
+   program that must still build and exit the same.
 3. Runs the app under `tools/wayland-test-host` on a small tree, first on
    lavapipe, then on the CPU. In each run it searches, selects, checks the
-   connections of what was selected, clicks a group and then its check box.
+   connections of what was selected, clicks a group and then its check box,
+   and types a query into the search. It starts with `--diff HEAD~1`, so
+   Changed holds the function changed by the second commit.
    `MLX_CODEMAP_TRACE`
    has the app print what it read and selected, the crashes it put on
    declarations, and how much each finding shows.

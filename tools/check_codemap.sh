@@ -144,8 +144,31 @@ if command -v git > /dev/null; then
         && grep -q "^▄▄ 1 Array casts$" "$work/history.txt" && [[ $(wc -l < "$work/.cache/mlx/codemap/workarounds-v1") -eq 2 ]] \
         || fail "history should count the two workarounds at both commits and keep them" "$work/history.txt"
     echo "ok   the command line: history (workarounds per commit)"
+    "$work/mlx-codemap" -C "$tree" diff HEAD~1 > "$work/diff.txt"
+    grep -q "^~ lib/helper.mlx:4:8: function greet$" "$work/diff.txt" \
+        && grep -q "^-- 0 added, 1 changed, 0 removed in 1 files since HEAD~1$" "$work/diff.txt" \
+        || fail "diff HEAD~1 should find greet changed" "$work/diff.txt"
+    "$work/mlx-codemap" -C "$tree" query changed since:HEAD~1 > "$work/changed.txt"
+    grep -q "^lib/helper.mlx:4:8: function greet$" "$work/changed.txt" && grep -q "^-- 1$" "$work/changed.txt" \
+        || fail "the query changed since:HEAD~1 should answer greet" "$work/changed.txt"
+    echo "ok   the command line: diff and changed since a commit"
     have_git=1
 fi
+# Queries and the views kept in codemap.views.
+"$work/mlx-codemap" -C "$tree" query kind:fn calls:greet > "$work/query.txt"
+grep -q "^app/main.mlx:3:8: function main$" "$work/query.txt" && grep -q "^lib/extra.mlx:3:8: function twice$" "$work/query.txt" && grep -q "^-- 2$" "$work/query.txt" \
+    || fail "kind:fn calls:greet should answer main and twice" "$work/query.txt"
+HOME="$work" XDG_STATE_HOME= "$work/mlx-codemap" -C "$tree" query crashed -in:app > "$work/query.txt"
+grep -q "^lib/helper.mlx:4:8: function greet$" "$work/query.txt" && grep -q "^-- 1$" "$work/query.txt" \
+    || fail "crashed -in:app should answer greet alone" "$work/query.txt"
+"$work/mlx-codemap" -C "$tree" query kind:fish > "$work/query.txt"
+grep -q "^not understood: kind:fish$" "$work/query.txt" || fail "kind:fish should not be understood" "$work/query.txt"
+printf '# views\nGreeters = kind:fn calls:greet\n' > "$tree/codemap.views"
+"$work/mlx-codemap" -C "$tree" views > "$work/views.txt"
+grep -q "^@Greeters = kind:fn calls:greet$" "$work/views.txt" || fail "the view Greeters is not listed" "$work/views.txt"
+"$work/mlx-codemap" -C "$tree" query @greeters > "$work/query.txt"
+grep -q "^-- 2$" "$work/query.txt" || fail "the view @greeters should answer main and twice" "$work/query.txt"
+echo "ok   the command line: query (kind, calls, crashed, not) and views"
 # Rewriting workarounds away: a result bound only to be dropped becomes
 # `_ = ...`, a length counted by hand `.length`; the program still builds
 # and does the same.
@@ -208,7 +231,7 @@ wait 200
 press 272
 release 272
 wait 1000
-pointer 100 560
+pointer 100 586
 press 272
 release 272
 wait 500
@@ -220,6 +243,9 @@ pointer 100 210
 press 272
 release 272
 wait 2000
+type kind:fn calls:greet
+wait 1500
+shot SHOTS/query.ppm
 close
 SCRIPT
 
@@ -239,7 +265,7 @@ run() {
     local status=0
     env -i PATH="$PATH" HOME="$work" XDG_RUNTIME_DIR="$runtime" WAYLAND_DISPLAY=host-codemap \
         VK_DRIVER_FILES="$manifest" MLX_CANVAS="$canvas" MLX_CODEMAP_TRACE=1 MLX_CODEMAP_BINARIES="$work/bin" LANG=de_DE.UTF-8 \
-        timeout 60 "$work/mlx-codemap" "$tree" > "$shots/app.log" 2>&1 || status=$?
+        timeout 60 "$work/mlx-codemap" "$tree" --diff HEAD~1 > "$shots/app.log" 2>&1 || status=$?
     wait "$host_pid" || fail "codemap ($name): the test host failed" "$shots/host.log"
     rm -rf -- "$runtime"
     local log="$shots/app.log"
@@ -256,12 +282,17 @@ run() {
     grep -A1 "^codemap: selected tree/app/$" "$log" | grep -q "^codemap: related out 1 in 1$" || fail "codemap ($name): the app group should depend on the lib group (and lib/bad.mlx on app)" "$log"
     # Its check box leaves lib out: its declarations, and the workarounds
     # in it; the crash (through main in app) stays.
-    grep -q "^codemap: shown [0-9]* nodes, findings 0 0 [0-9]* 2 1 [0-9]* [0-9]* [0-9]* 2 [0-9]* 0$" "$log" || fail "codemap ($name): at first everything is shown" "$log"
-    grep -q "^codemap: shown [0-9]* nodes, findings 0 0 [0-9]* 0 1 [0-9]* [0-9]* [0-9]* 0 [0-9]* 0$" "$log" || fail "codemap ($name): the lib group's check box did not leave it out" "$log"
+    grep -q "^codemap: shown [0-9]* nodes, findings 0 0 [0-9]* 2 1 [0-9]* [0-9]* [0-9]* 2 [0-9]* 0 [0-9]*$" "$log" || fail "codemap ($name): at first everything is shown" "$log"
+    grep -q "^codemap: shown [0-9]* nodes, findings 0 0 [0-9]* 0 1 [0-9]* [0-9]* [0-9]* 0 [0-9]* 0 [0-9]*$" "$log" || fail "codemap ($name): the lib group's check box did not leave it out" "$log"
     grep -q "^codemap: flying to tree/app/$" "$log" || fail "codemap ($name): the camera did not fly to the group still shown" "$log"
     if [[ -n "${have_git:-}" ]]; then
         grep -q "^codemap: trend 2 commits, counted 2$" "$log" || fail "codemap ($name): the workarounds of both commits (history) are not read" "$log"
+        grep -q "^codemap: diff since HEAD~1: 0 added, 1 changed, 0 removed$" "$log" || fail "codemap ($name): greet should be changed since HEAD~1" "$log"
+        grep -q "^codemap: shown [0-9]* nodes, findings 0 0 [0-9]* 2 1 [0-9]* [0-9]* [0-9]* 2 [0-9]* 0 1$" "$log" || fail "codemap ($name): the finding Changed should hold greet" "$log"
     fi
+    # A query in the search: of the functions calling greet only main is
+    # left (lib is left out, and the program app is shown).
+    grep -q "^codemap: query kind:fn calls:greet: 1 declarations$" "$log" || fail "codemap ($name): the query in the search should leave main" "$log"
     python3 - "$shots/start.ppm" "$shots/selected.ppm" <<'PY' || fail "codemap ($name): the view or the detail panel is not drawn" "$log"
 import sys
 def load(path):
