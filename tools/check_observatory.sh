@@ -203,8 +203,8 @@ status=0
 [[ ! -s "$work/rewrite.txt" ]] || fail "no workaround should be left after the rewrites" "$work/rewrite.txt"
 echo "ok   the command line: rewrite dropped and counted (preview, --apply)"
 
-# The app: at 1180x760 the sidebar's rows are 26 apart from y 44 (Alles,
-# app, lib).
+# The app: at 1180x760 the sidebar's group rows are 26 apart from y 106
+# (Alles, app, lib), under the view switch.
 cat > "$work/app.script" <<SCRIPT
 wait 4000
 shot SHOTS/start.ppm
@@ -220,26 +220,26 @@ wait 300
 down 1
 up 1
 wait 1500
-pointer 60 83
+pointer 60 145
 wait 200
 press 272
 release 272
 wait 4000
 shot SHOTS/group.ppm
-pointer 20 109
+pointer 20 171
 wait 200
 press 272
 release 272
 wait 1000
-pointer 100 586
+pointer 100 648
 press 272
 release 272
 wait 500
-pointer 100 167
+pointer 100 229
 press 272
 release 272
 wait 500
-pointer 100 210
+pointer 100 272
 press 272
 release 272
 wait 2000
@@ -258,7 +258,7 @@ pointer 700 67
 press 272
 release 272
 wait 800
-pointer 100 28
+pointer 100 90
 press 272
 release 272
 wait 300
@@ -370,6 +370,20 @@ shot query
 escape
 select lib/helper.mlx/greet
 record flight 3 100
+open app/main.mlx 5
+wait 300
+shot editor
+cursor 5 32
+definition
+wait 300
+cursor 5 12
+edit undefinedName + 
+save
+wait 4000
+shot problem
+undo
+save
+wait 4000
 quit
 DEMO
 printf 'wait 120000\nclose\n' > "$work/hold.script"
@@ -379,7 +393,7 @@ host_pid=$!
 for _ in $(seq 1 50); do [[ -S "$runtime/host-demo" ]] && break; sleep 0.1; done
 status=0
 env -i PATH="$PATH" HOME="$work" XDG_RUNTIME_DIR="$runtime" WAYLAND_DISPLAY=host-demo MLX_CANVAS=cpu MLX_CODEMAP_TRACE=1 \
-    MLX_CODEMAP_DEMO="$work/check.demo" MLX_CODEMAP_DEMO_OUT="$work/demo" timeout 60 "$work/mlx-observatory" "$tree" > "$work/demo.log" 2>&1 || status=$?
+    MLX_COMPILER="$repo_root/$compiler" MLX_CODEMAP_DEMO="$work/check.demo" MLX_CODEMAP_DEMO_OUT="$work/demo" timeout 90 "$work/mlx-observatory" "$tree" > "$work/demo.log" 2>&1 || status=$?
 kill "$host_pid" 2> /dev/null || true
 wait "$host_pid" 2> /dev/null || true
 rm -rf -- "$runtime"
@@ -390,3 +404,17 @@ done
 grep -q "^codemap: query kind:fn calls:greet: 2 declarations$" "$work/demo.log" || fail "codemap (demo): the query step did not run" "$work/demo.log"
 cmp -s "$work/demo/flight-000.ppm" "$work/demo/flight-002.ppm" && fail "codemap (demo): the recorded flight does not move" "$work/demo.log"
 echo "ok   codemap (demo): a script played, its frames written"
+# The editor: the file opened, F12 on greet opens its declaration, a
+# name nobody declared is saved and the compiler's error lands on its
+# line; undone and saved, the file is as it was and the error gone.
+for picture in editor problem; do
+    head -c 15 "$work/demo/$picture.ppm" 2> /dev/null | grep -q "^P6$" || fail "editor: $picture.ppm is missing" "$work/demo.log"
+done
+grep -q "^codemap: editor open $tree/app/main.mlx$" "$work/demo.log" || fail "editor: app/main.mlx was not opened" "$work/demo.log"
+grep -q "^codemap: definition greet$" "$work/demo.log" && grep -q "^codemap: editor open $tree/lib/helper.mlx$" "$work/demo.log" \
+    || fail "editor: F12 on greet did not open its declaration" "$work/demo.log"
+grep -q "^codemap: saved lib/helper.mlx$" "$work/demo.log" || fail "editor: the file was not saved" "$work/demo.log"
+grep -A3 "^codemap: saved lib/helper.mlx$" "$work/demo.log" | grep -q "^codemap: checked, problems [1-9]" || fail "editor: the compiler's error did not come back" "$work/demo.log"
+tail -5 "$work/demo.log" | grep -q "^codemap: checked, problems 0$" || fail "editor: the error did not go after undo and save" "$work/demo.log"
+( cd "$tree" && git diff --quiet -- lib/helper.mlx ) 2> /dev/null || [[ -z "${have_git:-}" ]] || fail "editor: undo and save did not bring the file back" "$work/demo.log"
+echo "ok   editor: open, go to a declaration, edit, save, the compiler's problems, undo"

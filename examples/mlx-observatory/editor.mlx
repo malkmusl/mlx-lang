@@ -1,0 +1,653 @@
+// The editor of MLX Observatory: a file's text with a cursor and a
+// selection, editing with undo and redo, a clipboard, and the colors of
+// Mlx's tokens (highlight). Drawing it and what the code map knows about
+// the file (the gutter, the lenses, going to a definition) is main.mlx's.
+//
+// Offsets are bytes; a column counts characters (UTF-8 continuation bytes
+// take none).
+//
+//     var editor: editor_module.Editor = undefined
+//     editor_module.init(&editor, allocator)
+//     editor_module.load(&editor, "/path/file.mlx")
+//     editor_module.insert(&editor, "text")
+//     editor_module.save(&editor)
+const std = @import("std")
+
+pub const Allocator = std.allocator.Allocator
+
+pub const MAX_TEXT: usize = 8388608
+const MAX_LINES: usize = 524288
+const MAX_EDITS: usize = 65536
+const EDIT_TEXT: usize = 8388608
+const CLIPBOARD: usize = 1048576
+
+// Token kinds (highlight).
+pub const PLAIN: u8 = 0
+pub const KEYWORD: u8 = 1
+pub const TYPE: u8 = 2
+pub const BUILTIN: u8 = 3
+pub const STRING: u8 = 4
+pub const NUMBER: u8 = 5
+pub const COMMENT: u8 = 6
+pub const CALL: u8 = 7
+pub const PUNCTUATION: u8 = 8
+pub const CONSTANT: u8 = 9
+pub const DOC: u8 = 10
+
+pub const Editor = struct {
+    allocator: Allocator
+    ready: bool
+    // The text and where each line starts.
+    text: [*]u8
+    length: usize
+    lineStart: [*]u32
+    lineCount: usize
+    // The file.
+    path: [1024]u8
+    pathLength: usize
+    open: bool
+    // Edits since the file was read or written (0: none), and since the
+    // code map read it.
+    version: usize
+    savedVersion: usize
+    // The cursor and the other end of the selection (the same: none), the
+    // column up and down keep to, the first line shown.
+    cursor: usize
+    anchor: usize
+    goal: usize
+    top: usize
+    // Undo: the edits (where, what was removed and put there), the text
+    // they keep, how many are done (the rest can be redone).
+    editAt: [*]u32
+    removedStart: [*]u32
+    removedLength: [*]u32
+    insertedStart: [*]u32
+    insertedLength: [*]u32
+    editCursor: [*]u32
+    edits: usize
+    done: usize
+    editText: [*]u8
+    editTextUsed: usize
+    // Typing is kept together as one edit (while it goes on at its end).
+    merging: bool
+    clipboard: [*]u8
+    clipboardLength: usize
+}
+
+fn words(allocator: Allocator, count: usize) -> [*]u32 {
+    unsafe { return @ptrCast([*]u32, allocator.alloc(count * 4 + 4, 16).?) }
+}
+
+pub fn init(editor: *Editor, allocator: Allocator) -> void {
+    editor.*.allocator = allocator
+    editor.*.ready = false
+    editor.*.open = false
+    editor.*.length = 0
+    editor.*.lineCount = 0
+    editor.*.pathLength = 0
+}
+
+// The buffers, made the first time a file is opened.
+fn prepare(editor: *Editor) -> void {
+    if editor.*.ready { return }
+    const allocator = editor.*.allocator
+    editor.*.text = allocator.alloc(MAX_TEXT, 16).?
+    editor.*.lineStart = words(allocator, MAX_LINES)
+    editor.*.editAt = words(allocator, MAX_EDITS)
+    editor.*.removedStart = words(allocator, MAX_EDITS)
+    editor.*.removedLength = words(allocator, MAX_EDITS)
+    editor.*.insertedStart = words(allocator, MAX_EDITS)
+    editor.*.insertedLength = words(allocator, MAX_EDITS)
+    editor.*.editCursor = words(allocator, MAX_EDITS)
+    editor.*.editText = allocator.alloc(EDIT_TEXT, 16).?
+    editor.*.clipboard = allocator.alloc(CLIPBOARD, 16).?
+    editor.*.clipboardLength = 0
+    editor.*.ready = true
+}
+
+pub fn pathOf(editor: *Editor) -> []const u8 {
+    var bytes: [*]u8 = undefined
+    unsafe { bytes = @ptrCast([*]u8, &editor.*.path) }
+    return bytes[0..editor.*.pathLength]
+}
+
+pub fn textOf(editor: *Editor) -> []const u8 { return editor.*.text[0..editor.*.length] }
+
+pub fn isDirty(editor: *Editor) -> bool { return editor.*.version != editor.*.savedVersion }
+
+// Reads `path` (the cursor at its start); false when it cannot be read.
+pub fn load(editor: *Editor, path: []const u8) -> bool {
+    prepare(editor)
+    var name: [1100]u8 = undefined
+    var length: usize = 0
+    for byte in path {
+        if length < 1023 {
+            name[length] = byte
+            editor.*.path[length] = byte
+            length += 1
+        }
+    }
+    name[length] = 0
+    var file: std.fs.File = undefined
+    unsafe { file = std.fs.open(@ptrCast([*]const u8, &name), 0, 0) }
+    if !std.fs.isValid(file) { return false }
+    editor.*.pathLength = length
+    editor.*.length = 0
+    while editor.*.length + 65536 <= MAX_TEXT {
+        var chunk: [*]u8 = undefined
+        unsafe { chunk = @ptrFromInt([*]u8, @intFromPtr(editor.*.text) + editor.*.length) }
+        const got = std.fs.read(file, chunk, 65536)
+        if got <= 0 { break }
+        editor.*.length += @intCast(usize, got)
+    }
+    const closed = std.fs.close(file)
+    editor.*.open = true
+    editor.*.version = 0
+    editor.*.savedVersion = 0
+    editor.*.cursor = 0
+    editor.*.anchor = 0
+    editor.*.goal = 0
+    editor.*.top = 0
+    editor.*.edits = 0
+    editor.*.done = 0
+    editor.*.editTextUsed = 0
+    editor.*.merging = false
+    findLines(editor)
+    return true
+}
+
+// Writes the text back; false when it cannot be written.
+pub fn save(editor: *Editor) -> bool {
+    if !editor.*.open { return false }
+    var name: [1100]u8 = undefined
+    var length: usize = 0
+    for byte in pathOf(editor) {
+        name[length] = byte
+        length += 1
+    }
+    name[length] = 0
+    var file: std.fs.File = undefined
+    unsafe { file = std.fs.open(@ptrCast([*]const u8, &name), 577, 420) }
+    if !std.fs.isValid(file) { return false }
+    const ok = editor.*.length == 0 || std.fs.writeAllBytes(file, editor.*.text, editor.*.length)
+    const closed = std.fs.close(file)
+    if ok { editor.*.savedVersion = editor.*.version }
+    editor.*.merging = false
+    return ok
+}
+
+fn findLines(editor: *Editor) -> void {
+    editor.*.lineCount = 1
+    editor.*.lineStart[0] = 0
+    var at: usize = 0
+    while at < editor.*.length {
+        if editor.*.text[at] == 10 && editor.*.lineCount < MAX_LINES {
+            editor.*.lineStart[editor.*.lineCount] = @intCast(u32, at + 1)
+            editor.*.lineCount += 1
+        }
+        at += 1
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Lines and columns
+
+// The 0-based line of `offset`.
+pub fn lineOf(editor: *Editor, offset: usize) -> usize {
+    var low: usize = 0
+    var high = editor.*.lineCount
+    while low + 1 < high {
+        const middle = (low + high) / 2
+        if @intCast(usize, editor.*.lineStart[middle]) <= offset { low = middle } else { high = middle }
+    }
+    return low
+}
+
+pub fn lineStart(editor: *Editor, line: usize) -> usize {
+    if line >= editor.*.lineCount { return editor.*.length }
+    return @intCast(usize, editor.*.lineStart[line])
+}
+
+// Where `line` ends (before its newline).
+pub fn lineEnd(editor: *Editor, line: usize) -> usize {
+    if line + 1 >= editor.*.lineCount { return editor.*.length }
+    return @intCast(usize, editor.*.lineStart[line + 1]) - 1
+}
+
+pub fn lineText(editor: *Editor, line: usize) -> []const u8 {
+    return editor.*.text[lineStart(editor, line)..lineEnd(editor, line)]
+}
+
+// The characters from `start` up to `offset`.
+pub fn columnsBetween(editor: *Editor, start: usize, offset: usize) -> usize {
+    var columns: usize = 0
+    var at = start
+    while at < offset && at < editor.*.length {
+        if editor.*.text[at] & 192 != 128 { columns += 1 }
+        at += 1
+    }
+    return columns
+}
+
+pub fn columnOf(editor: *Editor, offset: usize) -> usize {
+    return columnsBetween(editor, lineStart(editor, lineOf(editor, offset)), offset)
+}
+
+// The offset of `column` in `line` (its end when shorter).
+pub fn offsetAt(editor: *Editor, line: usize, column: usize) -> usize {
+    const end = lineEnd(editor, line)
+    var at = lineStart(editor, line)
+    var columns: usize = 0
+    while at < end && columns < column {
+        at += 1
+        while at < end && editor.*.text[at] & 192 == 128 { at += 1 }
+        columns += 1
+    }
+    return at
+}
+
+// ---------------------------------------------------------------------------
+// The cursor and the selection
+
+pub fn hasSelection(editor: *Editor) -> bool { return editor.*.cursor != editor.*.anchor }
+pub fn selectionStart(editor: *Editor) -> usize { return if editor.*.cursor < editor.*.anchor { editor.*.cursor } else { editor.*.anchor } }
+pub fn selectionEnd(editor: *Editor) -> usize { return if editor.*.cursor > editor.*.anchor { editor.*.cursor } else { editor.*.anchor } }
+
+// Moves the cursor (the selection grows with it when `extend`).
+pub fn moveTo(editor: *Editor, offset: usize, extend: bool) -> void {
+    editor.*.cursor = if offset > editor.*.length { editor.*.length } else { offset }
+    if !extend { editor.*.anchor = editor.*.cursor }
+    editor.*.goal = columnOf(editor, editor.*.cursor)
+    editor.*.merging = false
+}
+
+fn isWord(byte: u8) -> bool {
+    return byte == 95 || (byte >= 48 && byte <= 57) || (byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122) || byte >= 128
+}
+
+pub fn left(editor: *Editor, extend: bool, word: bool) -> void {
+    if hasSelection(editor) && !extend {
+        moveTo(editor, selectionStart(editor), false)
+        return
+    }
+    var at = editor.*.cursor
+    if at == 0 { return }
+    at -= 1
+    while at > 0 && editor.*.text[at] & 192 == 128 { at -= 1 }
+    if word {
+        while at > 0 && !isWord(editor.*.text[at]) && editor.*.text[at] != 10 { at -= 1 }
+        while at > 0 && isWord(editor.*.text[at - 1]) { at -= 1 }
+    }
+    moveTo(editor, at, extend)
+}
+
+pub fn right(editor: *Editor, extend: bool, word: bool) -> void {
+    if hasSelection(editor) && !extend {
+        moveTo(editor, selectionEnd(editor), false)
+        return
+    }
+    var at = editor.*.cursor
+    if at >= editor.*.length { return }
+    at += 1
+    while at < editor.*.length && editor.*.text[at] & 192 == 128 { at += 1 }
+    if word {
+        while at < editor.*.length && !isWord(editor.*.text[at]) && editor.*.text[at] != 10 { at += 1 }
+        while at < editor.*.length && isWord(editor.*.text[at]) { at += 1 }
+    }
+    moveTo(editor, at, extend)
+}
+
+// Up or down `lines` lines (negative: up), keeping to the goal column.
+pub fn vertical(editor: *Editor, lines: isize, extend: bool) -> void {
+    const line = lineOf(editor, editor.*.cursor)
+    var target: isize = @intCast(isize, line) + lines
+    if target < 0 { target = 0 }
+    if target >= @intCast(isize, editor.*.lineCount) { target = @intCast(isize, editor.*.lineCount) - 1 }
+    const goal = editor.*.goal
+    editor.*.cursor = offsetAt(editor, @intCast(usize, target), goal)
+    if !extend { editor.*.anchor = editor.*.cursor }
+    editor.*.goal = goal
+    editor.*.merging = false
+}
+
+// Home: the first non-blank of the line, then its start.
+pub fn home(editor: *Editor, extend: bool) -> void {
+    const line = lineOf(editor, editor.*.cursor)
+    const start = lineStart(editor, line)
+    var first = start
+    while first < lineEnd(editor, line) && (editor.*.text[first] == 32 || editor.*.text[first] == 9) { first += 1 }
+    moveTo(editor, if editor.*.cursor == first { start } else { first }, extend)
+}
+
+pub fn end(editor: *Editor, extend: bool) -> void {
+    moveTo(editor, lineEnd(editor, lineOf(editor, editor.*.cursor)), extend)
+}
+
+// The word around `offset` (start and end).
+pub fn wordAt(editor: *Editor, offset: usize, start: *usize, end_at: *usize) -> void {
+    var first = if offset > editor.*.length { editor.*.length } else { offset }
+    var last = first
+    while first > 0 && isWord(editor.*.text[first - 1]) { first -= 1 }
+    while last < editor.*.length && isWord(editor.*.text[last]) { last += 1 }
+    start.* = first
+    end_at.* = last
+}
+
+pub fn selectAll(editor: *Editor) -> void {
+    editor.*.anchor = 0
+    editor.*.cursor = editor.*.length
+    editor.*.merging = false
+}
+
+// ---------------------------------------------------------------------------
+// Editing
+
+// Replaces bytes start..end with `inserted` (kept for undo when `record`).
+fn replace(editor: *Editor, start: usize, end_at: usize, inserted: []const u8, record: bool) -> bool {
+    const removed = end_at - start
+    if editor.*.length - removed + inserted.length > MAX_TEXT { return false }
+    if record { remember(editor, start, end_at, inserted) }
+    // Move the rest.
+    if inserted.length > removed {
+        const grow = inserted.length - removed
+        var at = editor.*.length
+        while at > end_at {
+            at -= 1
+            editor.*.text[at + grow] = editor.*.text[at]
+        }
+    } else if inserted.length < removed {
+        const shrink = removed - inserted.length
+        var at = end_at
+        while at < editor.*.length {
+            editor.*.text[at - shrink] = editor.*.text[at]
+            at += 1
+        }
+    }
+    var at: usize = 0
+    while at < inserted.length {
+        editor.*.text[start + at] = inserted[at]
+        at += 1
+    }
+    editor.*.length = editor.*.length - removed + inserted.length
+    editor.*.version += 1
+    findLines(editor)
+    return true
+}
+
+fn keep(editor: *Editor, bytes: []const u8) -> u32 {
+    const start = editor.*.editTextUsed
+    for byte in bytes {
+        if editor.*.editTextUsed < EDIT_TEXT {
+            editor.*.editText[editor.*.editTextUsed] = byte
+            editor.*.editTextUsed += 1
+        }
+    }
+    return @intCast(u32, start)
+}
+
+fn remember(editor: *Editor, start: usize, end_at: usize, inserted: []const u8) -> void {
+    // Typing on at the end of the last edit: one edit.
+    if editor.*.merging && editor.*.done > 0 && editor.*.done == editor.*.edits && start == end_at {
+        const last = editor.*.done - 1
+        if @intCast(usize, editor.*.editAt[last]) + @intCast(usize, editor.*.insertedLength[last]) == start && @intCast(usize, editor.*.insertedStart[last]) + @intCast(usize, editor.*.insertedLength[last]) == editor.*.editTextUsed {
+            const kept = keep(editor, inserted)
+            editor.*.insertedLength[last] += @intCast(u32, inserted.length)
+            return
+        }
+    }
+    if editor.*.done >= MAX_EDITS || editor.*.editTextUsed + (end_at - start) + inserted.length > EDIT_TEXT {
+        // Full: the history starts over.
+        editor.*.edits = 0
+        editor.*.done = 0
+        editor.*.editTextUsed = 0
+    }
+    const at = editor.*.done
+    editor.*.editAt[at] = @intCast(u32, start)
+    editor.*.editCursor[at] = @intCast(u32, editor.*.cursor)
+    editor.*.removedStart[at] = keep(editor, editor.*.text[start..end_at])
+    editor.*.removedLength[at] = @intCast(u32, end_at - start)
+    editor.*.insertedStart[at] = keep(editor, inserted)
+    editor.*.insertedLength[at] = @intCast(u32, inserted.length)
+    editor.*.done += 1
+    editor.*.edits = editor.*.done
+}
+
+// Types `bytes` in place of the selection.
+pub fn insert(editor: *Editor, bytes: []const u8) -> void {
+    const start = selectionStart(editor)
+    const end_at = selectionEnd(editor)
+    const typing = bytes.length == 1 && start == end_at && bytes[0] != 10 && bytes[0] != 32
+    if !typing { editor.*.merging = false }
+    if !replace(editor, start, end_at, bytes, true) { return }
+    editor.*.cursor = start + bytes.length
+    editor.*.anchor = editor.*.cursor
+    editor.*.goal = columnOf(editor, editor.*.cursor)
+    editor.*.merging = typing
+}
+
+// Enter: a new line with the indentation of this one (and 4 more after an
+// opening brace).
+pub fn newline(editor: *Editor) -> void {
+    const line = lineOf(editor, selectionStart(editor))
+    const start = lineStart(editor, line)
+    var indent = start
+    while indent < editor.*.length && editor.*.text[indent] == 32 { indent += 1 }
+    var columns = indent - start
+    const before = selectionStart(editor)
+    var last = before
+    while last > start && editor.*.text[last - 1] == 32 { last -= 1 }
+    if last > start && editor.*.text[last - 1] == 123 { columns += 4 }
+    var bytes: [256]u8 = undefined
+    bytes[0] = 10
+    var length: usize = 1
+    while length <= columns && length < 250 {
+        bytes[length] = 32
+        length += 1
+    }
+    var pointer: [*]const u8 = undefined
+    unsafe { pointer = @ptrCast([*]const u8, &bytes) }
+    editor.*.merging = false
+    insert(editor, pointer[0..length])
+}
+
+// Tab: spaces to the next multiple of 4.
+pub fn tab(editor: *Editor) -> void {
+    const column = columnOf(editor, editor.*.cursor)
+    const spaces = 4 - column % 4
+    insert(editor, "    "[0..spaces])
+}
+
+pub fn backspace(editor: *Editor, word: bool) -> void {
+    if !hasSelection(editor) { left(editor, true, word) }
+    if !hasSelection(editor) { return }
+    deleteSelection(editor)
+}
+
+pub fn delete(editor: *Editor, word: bool) -> void {
+    if !hasSelection(editor) { right(editor, true, word) }
+    if !hasSelection(editor) { return }
+    deleteSelection(editor)
+}
+
+pub fn deleteSelection(editor: *Editor) -> void {
+    const start = selectionStart(editor)
+    editor.*.merging = false
+    if !replace(editor, start, selectionEnd(editor), "", true) { return }
+    editor.*.cursor = start
+    editor.*.anchor = start
+    editor.*.goal = columnOf(editor, start)
+}
+
+pub fn undo(editor: *Editor) -> void {
+    if editor.*.done == 0 { return }
+    editor.*.done -= 1
+    const at = editor.*.done
+    const start = @intCast(usize, editor.*.editAt[at])
+    const inserted = @intCast(usize, editor.*.insertedLength[at])
+    const removed_start = @intCast(usize, editor.*.removedStart[at])
+    const removed = editor.*.editText[removed_start..removed_start + @intCast(usize, editor.*.removedLength[at])]
+    const replaced = replace(editor, start, start + inserted, removed, false)
+    editor.*.cursor = @intCast(usize, editor.*.editCursor[at])
+    if editor.*.cursor > editor.*.length { editor.*.cursor = editor.*.length }
+    editor.*.anchor = editor.*.cursor
+    editor.*.merging = false
+}
+
+pub fn redo(editor: *Editor) -> void {
+    if editor.*.done >= editor.*.edits { return }
+    const at = editor.*.done
+    const start = @intCast(usize, editor.*.editAt[at])
+    const inserted_start = @intCast(usize, editor.*.insertedStart[at])
+    const inserted = editor.*.editText[inserted_start..inserted_start + @intCast(usize, editor.*.insertedLength[at])]
+    const replaced = replace(editor, start, start + @intCast(usize, editor.*.removedLength[at]), inserted, false)
+    editor.*.done += 1
+    editor.*.cursor = start + inserted.length
+    editor.*.anchor = editor.*.cursor
+    editor.*.merging = false
+}
+
+pub fn copy(editor: *Editor) -> void {
+    if !hasSelection(editor) { return }
+    const start = selectionStart(editor)
+    const end_at = selectionEnd(editor)
+    editor.*.clipboardLength = 0
+    var at = start
+    while at < end_at && editor.*.clipboardLength < CLIPBOARD {
+        editor.*.clipboard[editor.*.clipboardLength] = editor.*.text[at]
+        editor.*.clipboardLength += 1
+        at += 1
+    }
+}
+
+pub fn cut(editor: *Editor) -> void {
+    copy(editor)
+    if hasSelection(editor) { deleteSelection(editor) }
+}
+
+pub fn clipboardText(editor: *Editor) -> []const u8 { return editor.*.clipboard[0..editor.*.clipboardLength] }
+
+// Pastes `text` (the clipboard of another editor: it is shared by the
+// caller).
+pub fn paste(editor: *Editor, text: []const u8) -> void {
+    editor.*.merging = false
+    insert(editor, text)
+    editor.*.merging = false
+}
+
+// Takes over the clipboard of `other` (one clipboard for all tabs).
+pub fn shareClipboard(editor: *Editor, other: *Editor) -> void {
+    if !other.*.ready { return }
+    editor.*.clipboard = other.*.clipboard
+    editor.*.clipboardLength = other.*.clipboardLength
+}
+
+// ---------------------------------------------------------------------------
+// Highlighting
+
+fn isLetter(byte: u8) -> bool {
+    return byte == 95 || (byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122) || byte >= 128
+}
+
+fn isDigit(byte: u8) -> bool { return byte >= 48 && byte <= 57 }
+
+fn same(text: []const u8, word: []const u8) -> bool {
+    if text.length != word.length { return false }
+    var at: usize = 0
+    while at < text.length {
+        if text[at] != word[at] { return false }
+        at += 1
+    }
+    return true
+}
+
+fn isKeyword(word: []const u8) -> bool {
+    const keywords = "const var fn pub return if else while for in break continue struct enum union error try catch defer errdefer match unsafe comptime test and or orelse inline extern export noalias packed opaque nocopy"
+    return listed(keywords, word)
+}
+
+fn isConstantWord(word: []const u8) -> bool {
+    return listed("true false null undefined", word)
+}
+
+fn isPrimitive(word: []const u8) -> bool {
+    return listed("u8 u16 u32 u64 u128 usize i8 i16 i32 i64 i128 isize f16 f32 f64 bool void anyopaque noreturn type anyerror", word)
+}
+
+fn listed(list: []const u8, word: []const u8) -> bool {
+    var start: usize = 0
+    var at: usize = 0
+    while at <= list.length {
+        if at == list.length || list[at] == 32 {
+            if same(list[start..at], word) { return true }
+            start = at + 1
+        }
+        at += 1
+    }
+    return false
+}
+
+// The token of `line` that starts at `at`: where it ends, and its kind.
+pub fn token(line: []const u8, at: usize, kind: *u8) -> usize {
+    const byte = line[at]
+    // Comments (doc comments: ///).
+    if byte == 47 && at + 1 < line.length && line[at + 1] == 47 {
+        kind.* = if at + 2 < line.length && line[at + 2] == 47 { DOC } else { COMMENT }
+        return line.length
+    }
+    if byte == 34 {
+        var end_at = at + 1
+        while end_at < line.length && line[end_at] != 34 {
+            if line[end_at] == 92 && end_at + 1 < line.length { end_at += 1 }
+            end_at += 1
+        }
+        kind.* = STRING
+        return if end_at < line.length { end_at + 1 } else { end_at }
+    }
+    // Multiline string lines: \\...
+    if byte == 92 && at + 1 < line.length && line[at + 1] == 92 {
+        kind.* = STRING
+        return line.length
+    }
+    if isDigit(byte) {
+        var end_at = at + 1
+        while end_at < line.length && (isLetter(line[end_at]) || isDigit(line[end_at]) || (line[end_at] == 46 && end_at + 1 < line.length && isDigit(line[end_at + 1]))) { end_at += 1 }
+        kind.* = NUMBER
+        return end_at
+    }
+    if byte == 64 && at + 1 < line.length && isLetter(line[at + 1]) {
+        var end_at = at + 1
+        while end_at < line.length && (isLetter(line[end_at]) || isDigit(line[end_at])) { end_at += 1 }
+        kind.* = BUILTIN
+        return end_at
+    }
+    if isLetter(byte) {
+        var end_at = at + 1
+        while end_at < line.length && (isLetter(line[end_at]) || isDigit(line[end_at])) { end_at += 1 }
+        const word = line[at..end_at]
+        var next = end_at
+        while next < line.length && line[next] == 32 { next += 1 }
+        if isKeyword(word) {
+            kind.* = KEYWORD
+        } else if isConstantWord(word) {
+            kind.* = CONSTANT
+        } else if isPrimitive(word) || (byte >= 65 && byte <= 90) {
+            kind.* = TYPE
+        } else if next < line.length && line[next] == 40 {
+            kind.* = CALL
+        } else {
+            kind.* = PLAIN
+        }
+        return end_at
+    }
+    if byte == 32 || byte == 9 {
+        var end_at = at + 1
+        while end_at < line.length && (line[end_at] == 32 || line[end_at] == 9) { end_at += 1 }
+        kind.* = PLAIN
+        return end_at
+    }
+    // A UTF-8 character or punctuation, alone.
+    var end_at = at + 1
+    while end_at < line.length && line[end_at] & 192 == 128 { end_at += 1 }
+    kind.* = if byte < 128 { PUNCTUATION } else { PLAIN }
+    return end_at
+}
