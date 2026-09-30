@@ -389,6 +389,13 @@ shot completion
 cursor 3 22
 select-to 4 18
 delete-selection
+open lib/extra.mlx 3
+cursor 3 8
+rename double
+wait 300
+blameat 1
+open app/main.mlx 5
+wait 300
 cursor 5 32
 definition
 wait 300
@@ -474,7 +481,7 @@ grep -q "^codemap: hover local const point in function main, app/main.mlx:4 | ty
 echo "ok   editor: open, go to a declaration, hover (where a name belongs), edit, save, the compiler's problems, undo"
 # What the map knows, in the editor: the lens of greet lists its uses (a
 # click on one opens it), the dropped result's line offers its rewrite.
-grep -q "^codemap: rewritten here:     _ = extra.twice()$" "$work/demo.log" && grep -q "^    _ = extra.twice()$" "$tree/lib/drop.mlx" \
+grep -q "^codemap: rewritten here:     _ = extra.double()$" "$work/demo.log" && grep -q "^    _ = extra.double()$" "$tree/lib/drop.mlx" \
     || fail "editor: the rewrite on the workaround's line did not happen" "$work/demo.log"
 grep -q "^codemap: references greet$" "$work/demo.log" && grep -q "^codemap: references count: 2$" "$work/demo.log" && grep -q "^codemap: reference opened " "$work/demo.log" \
     || fail "editor: the lens's uses did not list greet's two uses" "$work/demo.log"
@@ -486,6 +493,14 @@ grep -q "^codemap: completion first helper$" "$work/demo.log" && grep -q "^codem
     && grep -q "^codemap: signature greet$" "$work/demo.log" && grep -q "^codemap: signature at, argument 0$" "$work/demo.log" \
     || fail "editor: completion (helper, then greet after the dot) or the signature of greet(" "$work/demo.log"
 echo "ok   editor: completion (in scope, after a dot), signature help"
+# F2: twice renamed where it is declared and where it is used; the line
+# number's blame (Git).
+grep -q "^codemap: renamed 2 places in 2 files: double$" "$work/demo.log" && grep -q "^pub fn double() -> usize" "$tree/lib/extra.mlx" \
+    || fail "editor: F2 did not rename twice in both files" "$work/demo.log"
+if [[ -n "${have_git:-}" ]]; then
+    grep -q "^codemap: blame [0-9a-f]\{7\} · check · today · one$" "$work/demo.log" || fail "editor: the blame of a line is not Git's" "$work/demo.log"
+fi
+echo "ok   editor: rename (F2) across files, the blame of a line"
 # Build: the program app into the tree's mlx-out/bin; Commit: the edit
 # with its message (when the tree is a Git work tree).
 grep -q "^codemap: build done: Built app in [0-9.]* s: mlx-out/bin/app$" "$work/demo.log" && [[ -x "$tree/mlx-out/bin/app" ]] \
