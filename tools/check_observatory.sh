@@ -449,6 +449,16 @@ wait 300
 shot references
 choose
 wait 300
+popup base
+wait 200
+shot history
+popup none
+branch-new feature
+branches
+wait 200
+shot branches
+popup none
+branch-switch -
 program app
 build
 settle
@@ -573,6 +583,13 @@ if [[ -n "${have_git:-}" ]]; then
     grep -q "^codemap: commit done: exit 0$" "$work/demo.log" && [[ "$(git -C "$tree" log -1 --format=%s)" == "Observatory check: a line" ]] \
         || fail "commit: the edit was not committed with its message" "$work/demo.log"
     echo "ok   commit: the edit, with its message"
+    # The history's graph (the tree's two commits), a new branch made
+    # (feature) and back to the one before.
+    grep -q "^codemap: history graph, commits 2$" "$work/demo.log" && grep -q "^codemap: branch made feature$" "$work/demo.log" \
+        && grep -q "^codemap: branch switched -$" "$work/demo.log" && git -C "$tree" rev-parse --verify -q feature > /dev/null \
+        && [[ "$(git -C "$tree" rev-parse --abbrev-ref HEAD)" != feature ]] \
+        || fail "git: the history's graph, a new branch, back to the one before" "$work/demo.log"
+    echo "ok   git: the commit graph, a new branch, switching back"
 fi
 # Escape in the editor keeps its file; the map reads the saved files
 # again when it is shown.
