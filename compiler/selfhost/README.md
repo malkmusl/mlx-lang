@@ -49,6 +49,15 @@ runtime foundation remain independent of libc and Zig dependencies:
 - `backend/x86_64/codegen/` separates mutable backend state from label,
   memory, arithmetic, value, call and control-flow instruction emission;
   `backend/x86_64/codegen.mlx` is the public `Codegen` facade.
+- `object/symbol_table.mlx` adds a symbol table (`.symtab`, `.strtab`) to
+  every x86_64 executable and shared object: each function is named where it
+  is declared, `path:line:name` (for example
+  `examples/mlx-files/main.mlx:1234:drawRow`), and the runtime's routines
+  keep theirs (`_start`, `__mlx_*`). `nm`, `gdb` and `perf` show them, and the
+  crash handler of the desktop programs
+  (`examples/wayland-compositor/crash.mlx`) names the functions a crash went
+  through with them. The lowering keeps each function's module and name
+  offset on its LIR symbol for this. `tools/check_crash_report.sh` checks it.
 - `backend/aarch64/` is the AArch64 backend with the same module split, plus
   `codegen/runtime.mlx` (arena, byte mask and the x86_64-to-aarch64 syscall
   translator). `--target=aarch64-linux` writes an executable through

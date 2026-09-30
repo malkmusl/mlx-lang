@@ -51,19 +51,65 @@ each group are joined by magenta lines in space.
 - **Written again:** functions with the same name in several files, that
   is, helpers each file wrote for itself.
 - **Unused:** declarations that nothing uses.
+- **Workarounds:** where the code works around what the language or its
+  compiler does not do yet, grouped by what is missing, the most written
+  first (amber). Each place is one more reason to add the feature
+  ([`tools/codemap/workarounds.mlx`](../../tools/codemap/workarounds.mlx)):
+
+  | pattern | missing |
+  |---|---|
+  | `@ptrFromInt(... @intFromPtr(...) ...)` | pointer offsets (`p + n`), slicing a many-pointer |
+  | `@ptrCast([*]T, &array)` | `*[N]T` coercing to `[*]T` |
+  | `var x: T = undefined` then `unsafe { x = ... }` | unsafe expressions |
+  | `const ignored = call(...)`, never read | `_ = value` |
+  | `for byte in text { length += 1 }` | a slice's length in the bootstrap library |
+  | `aggregates.mark`/`reset`, `turns` | freeing struct literals and structs returned by value |
+  | float literals with 12 decimals and more | folding float arithmetic right |
+  | `sqrt`, `sin`, `exp`, ... written in Mlx | math builtins |
+  | comments: workaround, miscompilation, "does not yet", TODO, FIXME, HACK | what the comment names |
+
+- **Crashes:** what the desktop programs kept when they crashed, newest
+  first, each with the function it stopped in and the functions that called
+  it (red). The calls are drawn as red lines in space.
 
 Generated code (`/generated/`) is left out.
+
+### Crash flags
+
+The compiler names every function `path:line:name` in the executable's
+symbol table. When the file manager, the dock, the compositor or another
+desktop program crashes, its crash handler
+([`crash.mlx`](../wayland-compositor/crash.mlx)) says which functions the
+crash went through and keeps that as a line in
+`$XDG_STATE_HOME/mlx/crashes.log` (`~/.local/state/mlx/crashes.log`). The
+codemap reads the log ([`tools/codemap/crashes.mlx`](../../tools/codemap/crashes.mlx))
+and puts each frame on the function declared at that line. If the file
+has changed since the crash, it puts the frame on the function of that
+name in the file.
+
+- A declaration a crash stopped in glows red; one a crash went through
+  glows faintly.
+- Both, and the files and groups that hold them, carry a red flag that
+  stays in front of everything, so they can be found from far away.
+- The panel says how often it crashed there or on the way, and the last
+  crash.
+
+The log is looked at every two seconds, so a crash while the codemap is
+open shows up at once, with a note in the status bar.
 
 For the selection, the panel shows:
 
 - how often it is used, and how often from elsewhere (its weight);
 - its copies;
 - its namesakes;
+- the crashes that stopped in it or went through it, and the workarounds
+  written in it, with what is missing;
 - what is *used much alike*: the declarations that use the same things,
   as a share of everything either one uses.
 
 The command line lists the same findings: `mlx-codemap copies [PATH]`,
-`mlx-codemap names [PATH]` and `mlx-codemap unused [PATH]`.
+`mlx-codemap names [PATH]`, `mlx-codemap unused [PATH]`,
+`mlx-codemap workarounds [PATH]` and `mlx-codemap crashes [PATH]`.
 
 ## Using it
 
@@ -144,7 +190,8 @@ own:
 mlx-codemap [-C ROOT] stats | files [TEXT] | outline FILE | find TEXT |
     show SYMBOL | def FILE:LINE:COL | refs SYMBOL | callers SYMBOL |
     callees SYMBOL | imports FILE | importers FILE | members SYMBOL |
-    unused [PATH] | copies [PATH] | names [PATH] | unresolved [FILE] | json
+    unused [PATH] | copies [PATH] | names [PATH] | workarounds [PATH] |
+    crashes [PATH] | unresolved [FILE] | json
 ```
 
 SYMBOL is `name`, `Container.name`, `path:name` or `FILE:LINE:COL`. The
@@ -155,9 +202,13 @@ answers are `path:line:col: kind Qualified.name` lines.
 `tools/check_codemap.sh` does the following:
 
 1. Validates the shader.
-2. Asks the command line.
+2. Asks the command line, also for the workarounds and a kept crash.
 3. Runs the app under `tools/wayland-test-host` on a small tree, first on
    lavapipe, then on the CPU. In each run it searches, selects, checks the
    connections of what was selected and clicks a group. `MLX_CODEMAP_TRACE`
-   has the app print what it read and selected.
+   has the app print what it read and selected, and the crashes it put on
+   declarations.
 4. Compares the pictures from both runs.
+
+`tools/check_crash_report.sh` checks the crash reports themselves: the
+symbol table, the functions a crash names and the kept log.

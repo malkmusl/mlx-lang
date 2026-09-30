@@ -1,20 +1,48 @@
-// When the compositor (or the dock) dies of a signal it says so first: which signal, the
-// address of the instruction (a failed runtime check, an index out of
-// range, a subtraction below zero or an overflow, is compiled to an illegal
-// instruction), the address a fault touched, and the code addresses on the
-// stack. The handler runs on a stack of its own, so a stack overflow is
-// reported too. With the compiler building the same binary from the same
-// sources, the addresses find the place. Freestanding, the message is the
-// last line of the session log.
+// When the compositor (or the dock, the file manager, any desktop program
+// that installs this) dies of a signal it says so first: which signal, the
+// function it was in, and the functions that called it:
+//
+//     mlx-files: crashed: illegal instruction (a failed runtime check: ...)
+//       at examples/mlx-files/main.mlx:1234:drawRow+0x1a
+//       from examples/mlx-files/main.mlx:1580:redraw+0x2f3
+//       ...
+//
+// A failed runtime check (an index out of range, a subtraction below zero
+// or an overflow) is compiled to an illegal instruction. The compiler
+// writes a symbol table that names every function path:line:name; the
+// handler reads it from the file each address is in (the program, a
+// compositor module, a C library: /proc/self/maps says which), and walks
+// the frame pointers for the callers. Without a name an address is shown
+// as the file and the offset in it.
+//
+// It also keeps the crash: a line in $XDG_STATE_HOME/mlx/crashes.log
+// (~/.local/state/mlx/crashes.log), which MLX Codemap reads to flag the
+// functions that crashed:
+//
+//     crash <TAB> seconds since 1970 <TAB> program <TAB> reason <TAB> frame <TAB> frame ...
+//
+// The handler runs on a stack of its own, so a stack overflow is reported
+// too, and allocates nothing (it maps what it needs), so an exhausted
+// arena is reported as well. Freestanding, the message is the last line of
+// the session log.
 
 const std = @import("std")
 
+const SYS_read: usize = 0
+const SYS_write: usize = 1
+const SYS_open: usize = 2
+const SYS_close: usize = 3
+const SYS_lseek: usize = 8
+const SYS_mmap: usize = 9
+const SYS_munmap: usize = 11
 const SYS_rt_sigaction: usize = 13
-const SYS_exit_group: usize = 231
 const SYS_rt_sigreturn: usize = 15
 const SYS_mincore: usize = 27
-const SYS_mmap: usize = 9
 const SYS_sigaltstack: usize = 131
+const SYS_mkdir: usize = 83
+const SYS_clock_gettime: usize = 228
+const SYS_exit_group: usize = 231
+const O_WRONLY_CREAT_APPEND: usize = 1089
 const SA_SIGINFO: usize = 4
 const SA_ONSTACK: usize = 134217728
 const SA_RESTORER: usize = 67108864
@@ -28,9 +56,23 @@ const SIGBUS: usize = 7
 const SIGFPE: usize = 8
 const SIGSEGV: usize = 11
 // ucontext_t: uc_flags, uc_link, uc_stack (24 bytes), then uc_mcontext,
-// whose gregs hold rsp at 15 and rip at 16.
+// whose gregs hold rbp at 10, rsp at 15 and rip at 16.
+const RBP_OFFSET: usize = 40 + 10 * 8
 const RSP_OFFSET: usize = 40 + 15 * 8
 const RIP_OFFSET: usize = 40 + 16 * 8
+
+// The memory the handler maps when a crash comes: /proc/self/maps, the
+// message, the record, a path and /proc/self/environ.
+const SCRATCH_SIZE: usize = 1048576
+const MAPS_AT: usize = 0
+const MAPS_SIZE: usize = 524288
+const MESSAGE_AT: usize = 524288
+const RECORD_AT: usize = 655360
+const PATH_AT: usize = 786432
+const ENVIRON_AT: usize = 790528
+const TEXT_SIZE: usize = 131072
+const ENVIRON_SIZE: usize = 258048
+const MAX_FRAMES: usize = 24
 
 const SignalAction = struct {
     handler: usize
@@ -39,85 +81,463 @@ const SignalAction = struct {
     mask: usize
 }
 
-fn say(text: []const u8) -> void {
-    const ignored = std.io.writeAll(std.io.stdout(), text)
+// A byte buffer in the scratch memory: `at` is where the bytes are, the
+// length is kept in the word `length` points to.
+fn put(at: [*]u8, length: *usize, text: []const u8) -> void {
+    for byte in text { putByte(at, length, byte) }
 }
 
-fn sayHex(value: usize) -> void {
-    const ignored = std.io.writeHex(std.io.stdout(), value)
+fn putByte(at: [*]u8, length: *usize, byte: u8) -> void {
+    if length.* + 1 < TEXT_SIZE {
+        at[length.*] = byte
+        length.* += 1
+    }
+}
+
+fn putBytes(at: [*]u8, length: *usize, bytes: [*]const u8, count: usize) -> void {
+    var index: usize = 0
+    while index < count {
+        putByte(at, length, bytes[index])
+        index += 1
+    }
+}
+
+fn putHex(at: [*]u8, length: *usize, value: usize) -> void {
+    put(at, length, "0x")
+    var shift: usize = 60
+    var started = false
+    while true {
+        const digit = (value >> shift) & 15
+        if digit != 0 || started || shift == 0 {
+            started = true
+            putByte(at, length, if digit < 10 { @intCast(u8, 48 + digit) } else { @intCast(u8, 87 + digit) })
+        }
+        if shift == 0 { break }
+        shift -= 4
+    }
+}
+
+fn putNumber(at: [*]u8, length: *usize, value: usize) -> void {
+    var divisor: usize = 1
+    while value / divisor >= 10 { divisor *= 10 }
+    while divisor > 0 {
+        putByte(at, length, @intCast(u8, 48 + (value / divisor) % 10))
+        divisor /= 10
+    }
+}
+
+fn offsetPointer(base: [*]u8, offset: usize) -> [*]u8 {
+    var result: [*]u8 = undefined
+    unsafe { result = @ptrFromInt([*]u8, @intFromPtr(base) + offset) }
+    return result
+}
+
+fn wordsAt(address: usize) -> [*]const usize {
+    var result: [*]const usize = undefined
+    unsafe { result = @ptrFromInt([*]const usize, address) }
+    return result
+}
+
+fn bytesAt(address: usize) -> [*]const u8 {
+    var result: [*]const u8 = undefined
+    unsafe { result = @ptrFromInt([*]const u8, address) }
+    return result
+}
+
+// Reads the whole of a /proc file (NUL-terminated `path`) into `into`;
+// the number of bytes read.
+fn readFile(path: [*]const u8, into: [*]u8, capacity: usize) -> usize {
+    const file = std.linux.syscall3(SYS_open, @intFromPtr(path), 0, 0)
+    if file < 0 { return 0 }
+    var length: usize = 0
+    while length + 1 < capacity {
+        const got = std.linux.syscall3(SYS_read, @bitCast(usize, file), @intFromPtr(into) + length, capacity - 1 - length)
+        if got <= 0 { break }
+        length += @bitCast(usize, got)
+    }
+    const closed = std.linux.syscall1(SYS_close, @bitCast(usize, file))
+    return length
+}
+
+fn hexValue(byte: u8) -> usize {
+    if byte >= 48 && byte <= 57 { return @intCast(usize, byte - 48) }
+    if byte >= 97 && byte <= 102 { return @intCast(usize, byte - 87) }
+    return 16
 }
 
 // The C-ABI handler (the kernel calls it with the signal, siginfo_t and
 // ucontext_t, on the handler stack). It never returns.
 export fn mlxCompositorCrashed(signal: i32, info: usize, context: usize) -> void {
-    // The program's name (the dock uses this too), from /proc/self/comm.
-    var name: [32]u8 = undefined
-    var length: isize = 0
-    const file = std.linux.syscall3(2, @intFromPtr("/proc/self/comm"), 0, 0)
-    if file >= 0 {
-        length = std.linux.syscall3(0, @bitCast(usize, file), @intFromPtr(&name), 31)
-        const closed = std.linux.syscall1(3, @bitCast(usize, file))
-    }
-    if length > 0 && name[@intCast(usize, length - 1)] == 10 { length -= 1 }
-    if length > 0 {
-        const written = std.io.writeAll(std.io.stdout(), name[0..@intCast(usize, length)])
-        say(": crashed: ")
-    } else {
-        say("mlx-compositor: crashed: ")
-    }
-    var registers: [*]const usize = undefined
-    unsafe { registers = @ptrFromInt([*]const usize, context) }
+    const registers = wordsAt(context)
     const rip = registers[RIP_OFFSET / 8]
     const rsp = registers[RSP_OFFSET / 8]
+    const rbp = registers[RBP_OFFSET / 8]
     var fault: usize = 0
-    if info != 0 {
-        var fields: [*]const usize = undefined
-        unsafe { fields = @ptrFromInt([*]const usize, info) }
-        fault = fields[SI_ADDR_OFFSET / 8]
+    if info != 0 { fault = wordsAt(info)[SI_ADDR_OFFSET / 8] }
+    const mapped = std.linux.syscall6(SYS_mmap, 0, SCRATCH_SIZE, 3, 34, 18446744073709551615, 0)
+    if mapped < 0 {
+        const ignored = std.io.writeAll(std.io.stdout(), "mlx: crashed (no memory to say where)\n")
+        const exited = std.linux.syscall1(SYS_exit_group, 128 + @intCast(usize, signal))
     }
-    if signal == 4 {
-        say("illegal instruction (a failed runtime check: an index out of range, an unsigned subtraction below zero, an overflow)")
-    } else if signal == 11 {
-        say("segmentation fault touching ")
-        sayHex(fault)
-        // A fault just below the stack pointer is the stack running out.
-        if fault + 65536 >= rsp && fault <= rsp + 65536 { say(" (next to the stack pointer: the stack ran out, a recursion without end?)") }
-    } else if signal == 7 {
-        say("bus error touching ")
-        sayHex(fault)
-    } else if signal == 8 {
-        say("arithmetic exception")
+    var scratch: [*]u8 = undefined
+    unsafe { scratch = @ptrFromInt([*]u8, @bitCast(usize, mapped)) }
+    const maps = offsetPointer(scratch, MAPS_AT)
+    const maps_length = readFile(@ptrCast([*]const u8, "/proc/self/maps"), maps, MAPS_SIZE)
+    const message = offsetPointer(scratch, MESSAGE_AT)
+    const record = offsetPointer(scratch, RECORD_AT)
+    var message_length: usize = 0
+    var record_length: usize = 0
+
+    // The program's name (the dock uses this too), from /proc/self/comm.
+    var name: [32]u8 = undefined
+    var name_into: [*]u8 = undefined
+    unsafe { name_into = @ptrCast([*]u8, &name) }
+    var name_length = readFile(@ptrCast([*]const u8, "/proc/self/comm"), name_into, 32)
+    if name_length > 0 && name[name_length - 1] == 10 { name_length -= 1 }
+    if name_length == 0 {
+        put(message, &message_length, "mlx")
+        put(record, &record_length, "mlx")
     } else {
-        say("signal")
+        var name_bytes: [*]const u8 = undefined
+        unsafe { name_bytes = @ptrCast([*]const u8, &name) }
+        putBytes(message, &message_length, name_bytes, name_length)
+        putBytes(record, &record_length, name_bytes, name_length)
     }
-    say(" at ")
-    sayHex(rip)
-    say(", stack pointer ")
-    sayHex(rsp)
-    // A rough backtrace: the words on the stack that point into the code
-    // (return addresses among them; the code sits within 2 MB of us and
-    // above the first page).
-    say("; code addresses on the stack:")
-    var here: usize = 0
-    unsafe { here = @intFromPtr(mlxCompositorCrashed) }
-    var low = here - 2097152
-    if here < 2097152 + 65536 { low = 65536 }
-    const high = here + 2097152
-    var words: [*]const usize = undefined
-    unsafe { words = @ptrFromInt([*]const usize, rsp) }
+    put(message, &message_length, ": crashed: ")
+    put(record, &record_length, "\t")
+    const reason_start = message_length
+    if signal == 4 {
+        put(message, &message_length, "illegal instruction (a failed runtime check: an index out of range, an unsigned subtraction below zero, an overflow)")
+    } else if signal == 11 {
+        put(message, &message_length, "segmentation fault touching ")
+        putHex(message, &message_length, fault)
+        // A fault just below the stack pointer is the stack running out.
+        if fault + 65536 >= rsp && fault <= rsp + 65536 { put(message, &message_length, " (next to the stack pointer: the stack ran out, a recursion without end?)") }
+    } else if signal == 7 {
+        put(message, &message_length, "bus error touching ")
+        putHex(message, &message_length, fault)
+    } else if signal == 8 {
+        put(message, &message_length, "arithmetic exception")
+    } else {
+        put(message, &message_length, "signal ")
+        putNumber(message, &message_length, @intCast(usize, signal))
+    }
+    putBytes(record, &record_length, offsetPointer(message, reason_start), message_length - reason_start)
+
+    // The frames: where it stopped, then the return addresses along the
+    // frame pointers (every Mlx function keeps one). Where the chain breaks
+    // right away (in C code without frame pointers), the words on the
+    // stack that point into code stand in.
+    var frames: [24]usize = undefined
+    var frame_count: usize = 1
+    frames[0] = rip
+    var frame = rbp
+    while frame_count < MAX_FRAMES && frame >= rsp && frame < rsp + 8388608 && frame & 7 == 0 && pageMapped(frame) && pageMapped(frame + 8) {
+        const words = wordsAt(frame)
+        const back = words[1]
+        if back < 4096 || !inCode(maps, maps_length, back) { break }
+        frames[frame_count] = back - 1
+        frame_count += 1
+        if words[0] <= frame { break }
+        frame = words[0]
+    }
+    if frame_count == 1 {
+        const words = wordsAt(rsp)
+        var index: usize = 0
+        while index < 2048 && frame_count < 12 && pageMapped(rsp + index * 8) {
+            const word = words[index]
+            if word >= 4096 && inCode(maps, maps_length, word) {
+                frames[frame_count] = word - 1
+                frame_count += 1
+            }
+            index += 1
+        }
+    }
+    put(message, &message_length, "\n")
     var index: usize = 0
-    var shown: usize = 0
-    while index < 2048 && shown < 16 && pageMapped(rsp + index * 8) {
-        const word = words[index]
-        if word >= low && word < high && word != here {
-            say(" ")
-            sayHex(word)
-            shown += 1
+    while index < frame_count {
+        put(message, &message_length, if index == 0 { "  at " } else { "  from " })
+        const shown_from = message_length
+        describe(frames[index], index == 0, maps, maps_length, scratch, message, &message_length)
+        put(record, &record_length, "\t")
+        putBytes(record, &record_length, offsetPointer(message, shown_from), message_length - shown_from)
+        // A recursion: the same call again and again, said once.
+        var repeats: usize = 0
+        while index > 0 && index + 1 < frame_count && frames[index + 1] == frames[index] {
+            repeats += 1
+            index += 1
+        }
+        if repeats > 0 {
+            put(message, &message_length, " (")
+            putNumber(message, &message_length, repeats)
+            put(message, &message_length, " more times)")
+        }
+        put(message, &message_length, "\n")
+        index += 1
+    }
+    const written = std.io.writeAllBytes(std.io.stdout(), message, message_length)
+    keep(scratch, record, record_length)
+    const exited = std.linux.syscall1(SYS_exit_group, 128 + @intCast(usize, signal))
+}
+
+// Whether `address` is in an executable mapping.
+fn inCode(maps: [*]const u8, length: usize, address: usize) -> bool {
+    var line: usize = 0
+    while line < length {
+        var at = line
+        var start: usize = 0
+        while at < length && hexValue(maps[at]) < 16 {
+            start = start * 16 + hexValue(maps[at])
+            at += 1
+        }
+        at += 1
+        var end: usize = 0
+        while at < length && hexValue(maps[at]) < 16 {
+            end = end * 16 + hexValue(maps[at])
+            at += 1
+        }
+        if address >= start && address < end { return at + 3 < length && maps[at + 3] == 120 }
+        while at < length && maps[at] != 10 { at += 1 }
+        line = at + 1
+    }
+    return false
+}
+
+// Says where `address` is: path:line:function+0xOFFSET from the symbol
+// table of the file it is in, else the file and the offset in it, else the
+// address. The first frame is the instruction itself; the others are
+// return addresses moved back into the call, and are shown as they were.
+fn describe(address: usize, exact: bool, maps: [*]const u8, maps_length: usize, scratch: [*]u8, out: [*]u8, out_length: *usize) -> void {
+    const shown = if exact { address } else { address + 1 }
+    var line: usize = 0
+    while line < maps_length {
+        var at = line
+        var start: usize = 0
+        while at < maps_length && hexValue(maps[at]) < 16 {
+            start = start * 16 + hexValue(maps[at])
+            at += 1
+        }
+        at += 1
+        var end: usize = 0
+        while at < maps_length && hexValue(maps[at]) < 16 {
+            end = end * 16 + hexValue(maps[at])
+            at += 1
+        }
+        var line_end = at
+        while line_end < maps_length && maps[line_end] != 10 { line_end += 1 }
+        if address >= start && address < end {
+            // perms, then the offset in the file.
+            at += 6
+            var file_offset: usize = 0
+            while at < line_end && hexValue(maps[at]) < 16 {
+                file_offset = file_offset * 16 + hexValue(maps[at])
+                at += 1
+            }
+            // device, inode, then the path.
+            var fields: usize = 0
+            while at < line_end && fields < 2 {
+                while at < line_end && maps[at] == 32 { at += 1 }
+                while at < line_end && maps[at] != 32 { at += 1 }
+                fields += 1
+            }
+            while at < line_end && maps[at] == 32 { at += 1 }
+            const in_file = address - start + file_offset
+            if at < line_end && maps[at] == 47 && line_end - at < 4000 {
+                const path = offsetPointer(scratch, PATH_AT)
+                var index: usize = 0
+                while at + index < line_end {
+                    path[index] = maps[at + index]
+                    index += 1
+                }
+                path[index] = 0
+                if nameInFile(path, in_file, exact, out, out_length) { return }
+                // The file's name and the offset in it.
+                var base = at
+                var scan = at
+                while scan < line_end {
+                    if maps[scan] == 47 { base = scan + 1 }
+                    scan += 1
+                }
+                putBytes(out, out_length, bytesAt(@intFromPtr(maps) + base), line_end - base)
+                put(out, out_length, "+")
+                putHex(out, out_length, if exact { in_file } else { in_file + 1 })
+                return
+            }
+            break
+        }
+        line = line_end + 1
+    }
+    putHex(out, out_length, shown)
+}
+
+// Looks `in_file` (an offset in the ELF file at `path`) up in its symbol
+// table, or its dynamic symbols; writes name+0xOFFSET when found.
+fn nameInFile(path: [*]const u8, in_file: usize, exact: bool, out: [*]u8, out_length: *usize) -> bool {
+    const file = std.linux.syscall3(SYS_open, @intFromPtr(path), 0, 0)
+    if file < 0 { return false }
+    const size = std.linux.syscall3(SYS_lseek, @bitCast(usize, file), 0, 2)
+    var found = false
+    if size > 64 {
+        const mapped = std.linux.syscall6(SYS_mmap, 0, @bitCast(usize, size), 1, 2, @bitCast(usize, file), 0)
+        if mapped >= 0 {
+            found = nameInImage(@bitCast(usize, mapped), @bitCast(usize, size), in_file, exact, out, out_length)
+            const unmapped = std.linux.syscall2(SYS_munmap, @bitCast(usize, mapped), @bitCast(usize, size))
+        }
+    }
+    const closed = std.linux.syscall1(SYS_close, @bitCast(usize, file))
+    return found
+}
+
+fn read16(image: usize, at: usize) -> usize {
+    const bytes = bytesAt(image + at)
+    return @intCast(usize, bytes[0]) | (@intCast(usize, bytes[1]) << 8)
+}
+
+fn read32(image: usize, at: usize) -> usize {
+    return read16(image, at) | (read16(image, at + 2) << 16)
+}
+
+fn read64(image: usize, at: usize) -> usize {
+    return read32(image, at) | (read32(image, at + 4) << 32)
+}
+
+fn nameInImage(image: usize, size: usize, in_file: usize, exact: bool, out: [*]u8, out_length: *usize) -> bool {
+    const magic = bytesAt(image)
+    if magic[0] != 127 || magic[1] != 69 || magic[2] != 76 || magic[3] != 70 || magic[4] != 2 { return false }
+    // The address the offset is loaded at, from the segment holding it.
+    const program_offset = read64(image, 32)
+    const program_count = read16(image, 56)
+    if program_offset + program_count * 56 > size { return false }
+    var address: usize = 0
+    var placed = false
+    var index: usize = 0
+    while index < program_count {
+        const header = program_offset + index * 56
+        const segment_offset = read64(image, header + 8)
+        if read32(image, header) == 1 && in_file >= segment_offset && in_file < segment_offset + read64(image, header + 32) {
+            address = in_file - segment_offset + read64(image, header + 16)
+            placed = true
+            break
         }
         index += 1
     }
-    say("\n")
-    const ignored = std.linux.syscall1(SYS_exit_group, 128 + @intCast(usize, signal))
+    if !placed { return false }
+    const section_offset = read64(image, 40)
+    const section_count = read16(image, 60)
+    if section_offset + section_count * 64 > size { return false }
+    // The symbol table, else the dynamic symbols (C libraries).
+    var kind: usize = 2
+    while kind != 0 {
+        index = 0
+        while index < section_count {
+            const header = section_offset + index * 64
+            if read32(image, header + 4) == kind {
+                const strings_header = section_offset + read32(image, header + 40) * 64
+                if nameInSymbols(image, size, read64(image, header + 24), read64(image, header + 32), read64(image, strings_header + 24), read64(image, strings_header + 32), address, exact, out, out_length) { return true }
+            }
+            index += 1
+        }
+        kind = if kind == 2 { 11 } else { 0 }
+    }
+    return false
+}
+
+fn nameInSymbols(image: usize, size: usize, symbols: usize, symbols_size: usize, strings: usize, strings_size: usize, address: usize, exact: bool, out: [*]u8, out_length: *usize) -> bool {
+    if symbols + symbols_size > size || strings + strings_size > size { return false }
+    var best_value: usize = 0
+    var best_name: usize = 0
+    var found = false
+    var at = symbols
+    while at + 24 <= symbols + symbols_size {
+        const kind = bytesAt(image + at + 4)[0] & 15
+        const value = read64(image, at + 8)
+        const extent = read64(image, at + 16)
+        if kind == 2 && value <= address && (address < value + extent || extent == 0) && (!found || value > best_value) {
+            best_value = value
+            best_name = read32(image, at)
+            found = true
+        }
+        at += 24
+    }
+    if !found || best_name >= strings_size { return false }
+    const name = bytesAt(image + strings + best_name)
+    var length: usize = 0
+    while best_name + length < strings_size && name[length] != 0 { length += 1 }
+    putBytes(out, out_length, name, length)
+    put(out, out_length, "+")
+    putHex(out, out_length, if exact { address - best_value } else { address + 1 - best_value })
+    return true
+}
+
+// Appends the record to crashes.log (in $XDG_STATE_HOME/mlx, else
+// $HOME/.local/state/mlx), making the directories.
+fn keep(scratch: [*]u8, record: [*]u8, record_length: usize) -> void {
+    const environ = offsetPointer(scratch, ENVIRON_AT)
+    const environ_length = readFile(@ptrCast([*]const u8, "/proc/self/environ"), environ, ENVIRON_SIZE)
+    const path = offsetPointer(scratch, PATH_AT)
+    var path_length: usize = 0
+    const state = variable(environ, environ_length, "XDG_STATE_HOME=")
+    if state != 0 && state < environ_length && environ[state] == 47 {
+        path_length = copyValue(environ, environ_length, state, path)
+    } else {
+        const home = variable(environ, environ_length, "HOME=")
+        if home == 0 || home >= environ_length || environ[home] != 47 { return }
+        path_length = copyValue(environ, environ_length, home, path)
+        put(path, &path_length, "/.local")
+        makeDirectory(path, path_length)
+        put(path, &path_length, "/state")
+    }
+    makeDirectory(path, path_length)
+    put(path, &path_length, "/mlx")
+    makeDirectory(path, path_length)
+    put(path, &path_length, "/crashes.log")
+    path[path_length] = 0
+    const file = std.linux.syscall3(SYS_open, @intFromPtr(path), O_WRONLY_CREAT_APPEND, 420)
+    if file < 0 { return }
+    // crash, the time, then what was put together.
+    const line = offsetPointer(scratch, PATH_AT + 4096)
+    var line_length: usize = 0
+    var time: [2]usize = [2]usize{ 0, 0 }
+    const clock = std.linux.syscall2(SYS_clock_gettime, 0, @intFromPtr(&time))
+    put(line, &line_length, "crash\t")
+    putNumber(line, &line_length, time[0])
+    put(line, &line_length, "\t")
+    putBytes(line, &line_length, record, record_length)
+    put(line, &line_length, "\n")
+    const wrote = std.linux.syscall3(SYS_write, @bitCast(usize, file), @intFromPtr(line), line_length)
+    const closed = std.linux.syscall1(SYS_close, @bitCast(usize, file))
+}
+
+fn makeDirectory(path: [*]u8, length: usize) -> void {
+    path[length] = 0
+    const made = std.linux.syscall2(SYS_mkdir, @intFromPtr(path), 493)
+}
+
+// Where the value of the variable `prefix` (NAME=) starts in the
+// environment, or 0.
+fn variable(environ: [*]const u8, length: usize, prefix: []const u8) -> usize {
+    var entry: usize = 0
+    while entry < length {
+        var matched = true
+        var offset: usize = 0
+        for byte in prefix {
+            if entry + offset >= length || environ[entry + offset] != byte { matched = false }
+            offset += 1
+        }
+        if matched { return entry + offset }
+        while entry < length && environ[entry] != 0 { entry += 1 }
+        entry += 1
+    }
+    return 0
+}
+
+fn copyValue(environ: [*]const u8, length: usize, from: usize, into: [*]u8) -> usize {
+    var count: usize = 0
+    while from + count < length && environ[from + count] != 0 && count < 3000 {
+        into[count] = environ[from + count]
+        count += 1
+    }
+    return count
 }
 
 // Whether the page holding `address` is mapped (the stack ends somewhere

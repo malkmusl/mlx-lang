@@ -201,8 +201,9 @@ scaled by the previews' `shrink` kernel (with an opacity); the CPU
 renderer scales its buffer (nearest pixel) inside the frame's colour. The
 trash and a folder's "Open" grow their window out of the icon (`Z` and
 the icon's rectangle). Should the dock
-crash, it says where first (`mlx-dock: crashed: ...` in the compositor's
-log), as the compositor does.
+crash, it says where first (`mlx-dock: crashed: ...` and the functions,
+in the compositor's log), as the compositor does, and keeps the crash
+for MLX Codemap.
 
 With `dock-autohide = on` (mlx-settings: "Auto-hide dock") the dock
 reserves no space, so maximized windows reach the bottom edge. It slides
@@ -705,12 +706,29 @@ instruction when it is full. Two things keep the compositor within it:
 A failed runtime check (an index out of range, an unsigned subtraction
 below zero, an overflow) is compiled to an illegal instruction. The
 compositor catches that, and the other fatal signals, and says so before
-it dies: `mlx-compositor: crashed: illegal instruction (...) at 0x4a12f3;
-stack: ...`, with the addresses of the instruction and the words on top
-of the stack. The compiler builds the same binary from the same sources,
-so that address finds the place in a disassembly of a fresh build
-(`objdump -d mlx-compositor`); please include the line in a bug report,
-with the commit the compositor was built from.
+it dies, with the function it stopped in and the functions that called
+it:
+
+```
+mlx-compositor: crashed: illegal instruction (a failed runtime check: ...)
+  at examples/wayland-compositor/shell.mlx:812:placeWindow+0x1a3
+  from examples/wayland-compositor/shell.mlx:640:mapWindow+0x88
+  from examples/wayland-compositor/main.mlx:902:run+0x2f1
+```
+
+The compiler writes a symbol table that names every function
+`path:line:name`; the handler (`crash.mlx`) reads it from the file each
+address is in (the compositor, one of its modules, a C library:
+`/proc/self/maps` says which) and follows the frame pointers to the
+callers. A recursion is said once (`(22 more times)`). The dock, the file
+manager and the other desktop programs install the same handler.
+
+Each crash is also kept, as a line in `$XDG_STATE_HOME/mlx/crashes.log`
+(`~/.local/state/mlx/crashes.log`). MLX Codemap
+([`examples/mlx-codemap`](../mlx-codemap/README.md)) reads it and puts a
+red flag on the functions the crashes went through; `mlx-codemap crashes`
+lists them. Please include the lines in a bug report, with the commit the
+program was built from.
 
 When the compositor stops on its own it says why: for example
 `mlx-compositor: lost the session compositor: the server reported a

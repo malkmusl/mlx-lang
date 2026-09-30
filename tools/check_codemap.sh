@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # MLX Codemap (examples/mlx-codemap) end to end, on a small tree of its own:
 #   - the scene shader passes std.spirv.module;
-#   - the command line (the same binary with a command) answers;
+#   - the command line (the same binary with a command) answers, also
+#     with the workarounds and the kept crashes;
 #   - the app reads the tree, lays it out in 3D and draws it; typing
 #     searches, Enter flies to the result and selects it, with what it
 #     connects to (the function is called from the other file); Escape
@@ -21,7 +22,7 @@ manifest=${2:-/usr/share/vulkan/icd.d/lvp_icd.json}
 command -v xkbcli > /dev/null || { echo "check_codemap.sh: xkbcli is not installed" >&2; exit 2; }
 
 work=$(mktemp -d)
-trap 'rm -rf -- "$work"' EXIT
+trap '[[ -n "${KEEP_WORK:-}" ]] || rm -rf -- "$work"' EXIT
 "$compiler" --quiet examples/mlx-codemap/check_shader.mlx -o "$work/check-shader"
 "$compiler" --quiet examples/mlx-codemap/main.mlx -o "$work/mlx-codemap"
 "$compiler" --quiet tools/wayland-test-host/main.mlx -o "$work/test-host"
@@ -54,7 +55,18 @@ cat > "$tree/lib/extra.mlx" <<'MLX'
 const helper = @import("./helper.mlx")
 
 pub fn twice() -> usize { return helper.greet(2) * 2 }
+
+pub fn first(values: [4]u8) -> u8 {
+    var copy = values
+    var bytes: [*]u8 = undefined
+    unsafe { bytes = @ptrCast([*]u8, &copy) }
+    return bytes[0]
+}
 MLX
+# A crash kept by a desktop program (examples/wayland-compositor/crash.mlx)
+# in greet, called from main.
+mkdir -p "$work/.local/state/mlx"
+printf 'crash\t1790000000\tapp\tillegal instruction (a failed runtime check)\tlib/helper.mlx:4:greet+0x1c\tapp/main.mlx:3:main+0x42\t_start+0x58\n' > "$work/.local/state/mlx/crashes.log"
 cat > "$tree/app/main.mlx" <<'MLX'
 const helper = @import("../lib/helper.mlx")
 
@@ -68,6 +80,17 @@ MLX
 "$work/mlx-codemap" -C "$tree" callers greet > "$work/callers.txt"
 grep -q "app/main.mlx:5:.*main" "$work/callers.txt" && grep -q "lib/extra.mlx:3:.*twice" "$work/callers.txt" || fail "the command line did not find greet's callers" "$work/callers.txt"
 echo "ok   the command line: mlx-codemap -C TREE callers greet"
+"$work/mlx-codemap" -C "$tree" workarounds > "$work/workarounds.txt"
+grep -A1 "^== 1x Arrays cast to many-pointers" "$work/workarounds.txt" | grep -q "lib/extra.mlx:5:8: function first" \
+    && grep -A1 "^== 1x Declared undefined, set in unsafe" "$work/workarounds.txt" | grep -q "lib/extra.mlx:5:8: function first" \
+    || fail "the command line did not find the workarounds in first" "$work/workarounds.txt"
+echo "ok   the command line: mlx-codemap -C TREE workarounds"
+HOME="$work" XDG_STATE_HOME= "$work/mlx-codemap" -C "$tree" crashes > "$work/crashes.txt"
+grep -q "^lib/helper.mlx:4:8: function greet (crashed here 1x)$" "$work/crashes.txt" \
+    && grep -q "^app/main.mlx:3:8: function main (on the way 1x)$" "$work/crashes.txt" \
+    && grep -q "^   from _start+0x58$" "$work/crashes.txt" \
+    || fail "the command line did not put the kept crash on greet and main" "$work/crashes.txt"
+echo "ok   the command line: mlx-codemap -C TREE crashes"
 
 # The app: at 1180x760 the sidebar's rows are 26 apart from y 44 (Alles,
 # app, lib).
@@ -90,7 +113,7 @@ pointer 60 83
 wait 200
 press 272
 release 272
-wait 2000
+wait 4000
 shot SHOTS/group.ppm
 close
 SCRIPT
@@ -117,6 +140,7 @@ run() {
     local log="$shots/app.log"
     [[ $status -eq 0 ]] || fail "codemap ($name): the app exited with status $status" "$log"
     grep -q "^codemap: read 3 files, " "$log" || fail "codemap ($name): it did not read the three files" "$log"
+    grep -q "^codemap: crashes 1 kept, on 2 declarations$" "$log" || fail "codemap ($name): the kept crash is not on greet and main" "$log"
     grep -q "^codemap: selected tree/lib/helper.mlx/greet/$" "$log" || fail "codemap ($name): typing greet and Enter did not select it" "$log"
     grep -A1 "^codemap: selected tree/lib/helper.mlx/greet/$" "$log" | grep -q "^codemap: related out 1 in 2$" || fail "codemap ($name): greet should use count and be called from main and twice" "$log"
     grep -q "^codemap: selected $" "$log" || fail "codemap ($name): Escape did not clear the selection" "$log"

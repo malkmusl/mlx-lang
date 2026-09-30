@@ -1,0 +1,353 @@
+// The executable's symbol table (.symtab and .strtab), added to the file the
+// ELF writers wrote. Every function is named where it is declared,
+//
+//     examples/mlx-files/main.mlx:1234:drawRow
+//
+// (the module's path as the compiler loaded it, the line of the function's
+// name, the name), and the runtime's own routines (_start, __mlx_*) keep
+// theirs. nm, gdb and perf show these names; the crash handler of the
+// desktop programs (examples/wayland-compositor/crash.mlx) reads them from
+// /proc/self/exe to say which functions a crash went through, and MLX
+// Codemap puts a crash on the declaration it names.
+
+const mem = @import("../../../std/bootstrap/mem.mlx")
+const fs = @import("../../../std/bootstrap/fs.mlx")
+const elf = @import("../../../std/bootstrap/elf.mlx")
+const allocator_mod = @import("../../../std/bootstrap/allocator.mlx")
+const vector = @import("../../../std/bootstrap/vector.mlx")
+const lir = @import("../ir/lir.mlx")
+const encoder_module = @import("../backend/x86_64/encoder.mlx")
+const modules = @import("../modules.mlx")
+const source_module = @import("../source.mlx")
+
+pub const Allocator = allocator_mod.Allocator
+
+const SYMBOL_SIZE: usize = 24
+const SECTION_SIZE: usize = 64
+const SHF_EXECINSTR: usize = 4
+const STT_FUNC: u8 = 2
+// The names of the two new sections, ".symtab" and ".strtab" (NUL after
+// each), appended to .shstrtab.
+const NEW_NAMES_LENGTH: usize = 16
+
+// The functions found in the code: where each starts, and its name in the
+// string table being built.
+const Table = struct {
+    allocator: Allocator
+    offsets: [*]usize
+    names: [*]usize
+    count: usize
+    capacity: usize
+    strings: [*]u8
+    stringLength: usize
+    stringCapacity: usize
+}
+
+// Adds the symbol table for the code `enc` generated from `ir` to the ELF
+// file at `path`. False when the file cannot be read or written again.
+pub fn addToFile(allocator: Allocator, path: [*]const u8, loader: *modules.Loader, ir: *lir.Lir, enc: *encoder_module.Encoder) -> bool {
+    var table = Table.{ .allocator = allocator, .offsets = undefined, .names = undefined, .count = 0, .capacity = 0, .strings = undefined, .stringLength = 0, .stringCapacity = 0 }
+    if !grow(&table, 1024) { return false }
+    if !growStrings(&table, 65536) { return false }
+    // The string table starts with the empty name.
+    table.strings[0] = 0
+    table.stringLength = 1
+    if !collectFunctions(&table, loader, ir, enc) { return false }
+    if !collectRuntime(&table, enc) { return false }
+    sortByOffset(&table)
+    return rewrite(allocator, path, &table, encoder_module.pos(enc))
+}
+
+fn grow(table: *Table, capacity: usize) -> bool {
+    const offsets = table.*.allocator.alloc(capacity * 8, 8)
+    const names = table.*.allocator.alloc(capacity * 8, 8)
+    if offsets == null || names == null { return false }
+    unsafe {
+        const new_offsets = @ptrCast([*]usize, offsets.?)
+        const new_names = @ptrCast([*]usize, names.?)
+        var index: usize = 0
+        while index < table.*.count {
+            new_offsets[index] = table.*.offsets[index]
+            new_names[index] = table.*.names[index]
+            index += 1
+        }
+        table.*.offsets = new_offsets
+        table.*.names = new_names
+    }
+    table.*.capacity = capacity
+    return true
+}
+
+fn growStrings(table: *Table, capacity: usize) -> bool {
+    const strings = table.*.allocator.alloc(capacity, 1)
+    if strings == null { return false }
+    if table.*.stringLength > 0 { mem.copy(strings.?, table.*.strings, table.*.stringLength) }
+    table.*.strings = strings.?
+    table.*.stringCapacity = capacity
+    return true
+}
+
+fn addByte(table: *Table, value: u8) -> bool {
+    if table.*.stringLength == table.*.stringCapacity {
+        if !growStrings(table, table.*.stringCapacity * 2) { return false }
+    }
+    table.*.strings[table.*.stringLength] = value
+    table.*.stringLength += 1
+    return true
+}
+
+fn addBytes(table: *Table, bytes: [*]const u8, length: usize) -> bool {
+    var index: usize = 0
+    while index < length {
+        if !addByte(table, bytes[index]) { return false }
+        index += 1
+    }
+    return true
+}
+
+fn addNumber(table: *Table, value: usize) -> bool {
+    var divisor: usize = 1
+    while value / divisor >= 10 { divisor *= 10 }
+    while divisor > 0 {
+        if !addByte(table, @intCast(u8, 48 + (value / divisor) % 10)) { return false }
+        divisor /= 10
+    }
+    return true
+}
+
+// Starts an entry at `offset` whose name is written next (and ended with
+// endName).
+fn addEntry(table: *Table, offset: usize) -> bool {
+    if table.*.count == table.*.capacity {
+        if !grow(table, table.*.capacity * 2) { return false }
+    }
+    table.*.offsets[table.*.count] = offset
+    table.*.names[table.*.count] = table.*.stringLength
+    table.*.count += 1
+    return true
+}
+
+fn isNameByte(value: u8) -> bool {
+    return (value >= 97 && value <= 122) || (value >= 65 && value <= 90) || (value >= 48 && value <= 57) || value == 95
+}
+
+// Every function with a declaration that made it into the code, named
+// path:line:name. Lines are counted on from the last function when it is in
+// the same module further down (the functions come mostly in order).
+fn collectFunctions(table: *Table, loader: *modules.Loader, ir: *lir.Lir, enc: *encoder_module.Encoder) -> bool {
+    var line_module: usize = lir.NONE
+    var line_offset: usize = 0
+    var line: usize = 1
+    var index: usize = 0
+    while index < lir.symbolCount(ir) {
+        const symbol = lir.getSymbol(ir, index)
+        index += 1
+        if symbol.sourceModule == lir.NONE || symbol.sourceModule >= modules.moduleCount(loader) { continue }
+        const found = encoder_module.findSymbol(enc, symbol.pointer, symbol.length)
+        if !found.0 { continue }
+        const module = modules.moduleAt(loader, symbol.sourceModule)
+        if module.*.sourceAddress == 0 { continue }
+        var bytes: [*]const u8 = undefined
+        var length: usize = 0
+        unsafe {
+            const source = @ptrFromInt(*source_module.SourceFile, module.*.sourceAddress)
+            bytes = @ptrCast([*]const u8, source.*.bytes)
+            length = source.*.length
+        }
+        if symbol.sourceOffset >= length { continue }
+        if line_module != symbol.sourceModule || line_offset > symbol.sourceOffset {
+            line_module = symbol.sourceModule
+            line_offset = 0
+            line = 1
+        }
+        while line_offset < symbol.sourceOffset {
+            if bytes[line_offset] == 10 { line += 1 }
+            line_offset += 1
+        }
+        if !addEntry(table, found.1) { return false }
+        var path: [*]const u8 = undefined
+        unsafe { path = @ptrCast([*]const u8, module.*.pathPointer) }
+        if !addBytes(table, path, module.*.pathLength) { return false }
+        if !addByte(table, 58) { return false }
+        if !addNumber(table, line) { return false }
+        if !addByte(table, 58) { return false }
+        var end = symbol.sourceOffset
+        while end < length && isNameByte(bytes[end]) { end += 1 }
+        unsafe {
+            if !addBytes(table, @ptrFromInt([*]const u8, @intFromPtr(bytes) + symbol.sourceOffset), end - symbol.sourceOffset) { return false }
+        }
+        if !addByte(table, 0) { return false }
+    }
+    return true
+}
+
+// The routines the backend writes itself: _start and the __mlx_ helpers.
+fn collectRuntime(table: *Table, enc: *encoder_module.Encoder) -> bool {
+    var index: usize = 0
+    while index < enc.*.symbols.*.length {
+        var entry: *encoder_module.SymbolEntry = undefined
+        unsafe { entry = @ptrCast(*encoder_module.SymbolEntry, vector.Vector.at(enc.*.symbols.*, index)) }
+        index += 1
+        if entry.*.nameLength < 2 || entry.*.namePointer[0] != 95 { continue }
+        if !addEntry(table, entry.*.offset) { return false }
+        if !addBytes(table, entry.*.namePointer, entry.*.nameLength) { return false }
+        if !addByte(table, 0) { return false }
+    }
+    return true
+}
+
+// Shell sort by where the functions start (sizes come from the next one).
+fn sortByOffset(table: *Table) -> void {
+    var gap = table.*.count / 2
+    while gap > 0 {
+        var index = gap
+        while index < table.*.count {
+            const offset = table.*.offsets[index]
+            const name = table.*.names[index]
+            var at = index
+            while at >= gap && table.*.offsets[at - gap] > offset {
+                table.*.offsets[at] = table.*.offsets[at - gap]
+                table.*.names[at] = table.*.names[at - gap]
+                at -= gap
+            }
+            table.*.offsets[at] = offset
+            table.*.names[at] = name
+            index += 1
+        }
+        gap /= 2
+    }
+}
+
+fn readU16(bytes: [*]const u8, at: usize) -> usize {
+    return @intCast(usize, bytes[at]) | (@intCast(usize, bytes[at + 1]) << 8)
+}
+
+fn readU64(bytes: [*]const u8, at: usize) -> usize {
+    var value: usize = 0
+    var index: usize = 8
+    while index > 0 {
+        index -= 1
+        value = (value << 8) | @intCast(usize, bytes[at + index])
+    }
+    return value
+}
+
+fn alignUp(value: usize, alignment: usize) -> usize {
+    return (value + alignment - 1) & ~(alignment - 1)
+}
+
+// Reads the file, drops its section headers (the writers put them last),
+// and writes it again with a longer .shstrtab, .symtab, .strtab and the
+// section headers after them.
+fn rewrite(allocator: Allocator, path: [*]const u8, table: *Table, code_length: usize) -> bool {
+    const input = fs.open(path, fs.READ_ONLY, 0)
+    if !fs.isValid(input) { return false }
+    const end = fs.seek(input, 0, 2)
+    if end <= 64 {
+        const closed = fs.close(input)
+        return false
+    }
+    const size = @bitCast(usize, end)
+    const old_memory = allocator.alloc(size, 8)
+    if old_memory == null {
+        const closed = fs.close(input)
+        return false
+    }
+    const old = old_memory.?
+    var got: usize = 0
+    while got < size {
+        var amount: isize = 0
+        unsafe { amount = fs.pread(input, @ptrFromInt([*]u8, @intFromPtr(old) + got), size - got, got) }
+        if amount <= 0 { break }
+        got += @bitCast(usize, amount)
+    }
+    const closed_input = fs.close(input)
+    if got != size { return false }
+
+    const section_offset = readU64(old, 40)
+    const section_count = readU16(old, 60)
+    const names_index = readU16(old, 62)
+    if section_offset + section_count * SECTION_SIZE != size || names_index >= section_count { return false }
+    // The code's section, whose address the symbols count from.
+    var text_index: usize = 0
+    var text_address: usize = 0
+    var index: usize = 1
+    while index < section_count {
+        const header = section_offset + index * SECTION_SIZE
+        if readU64(old, header + 8) & SHF_EXECINSTR != 0 {
+            text_index = index
+            text_address = readU64(old, header + 16)
+            break
+        }
+        index += 1
+    }
+    if text_index == 0 { return false }
+    const names_header = section_offset + names_index * SECTION_SIZE
+    const names_offset = readU64(old, names_header + 24)
+    const names_size = readU64(old, names_header + 32)
+
+    const new_names_offset = section_offset
+    const new_names_size = names_size + NEW_NAMES_LENGTH
+    const symbols_offset = alignUp(new_names_offset + new_names_size, 8)
+    const symbols_size = (table.*.count + 1) * SYMBOL_SIZE
+    const strings_offset = symbols_offset + symbols_size
+    const new_section_offset = alignUp(strings_offset + table.*.stringLength, 8)
+    const new_section_count = section_count + 2
+    const total = new_section_offset + new_section_count * SECTION_SIZE
+    const memory = allocator.alloc(total, 8)
+    if memory == null { return false }
+    const image = memory.?
+    mem.zero(image, total)
+    mem.copy(image, old, section_offset)
+    unsafe {
+        mem.copy(@ptrFromInt([*]u8, @intFromPtr(image) + new_names_offset), @ptrFromInt([*]const u8, @intFromPtr(old) + names_offset), names_size)
+        mem.copy(@ptrFromInt([*]u8, @intFromPtr(image) + new_names_offset + names_size), @ptrCast([*]const u8, ".symtab"), 7)
+        mem.copy(@ptrFromInt([*]u8, @intFromPtr(image) + new_names_offset + names_size + 8), @ptrCast([*]const u8, ".strtab"), 7)
+        mem.copy(@ptrFromInt([*]u8, @intFromPtr(image) + strings_offset), table.*.strings, table.*.stringLength)
+        mem.copy(@ptrFromInt([*]u8, @intFromPtr(image) + new_section_offset), @ptrFromInt([*]const u8, @intFromPtr(old) + section_offset), section_count * SECTION_SIZE)
+    }
+    // The symbols (the first is the null symbol), all local functions.
+    var entry: usize = 0
+    while entry < table.*.count {
+        const at = symbols_offset + (entry + 1) * SYMBOL_SIZE
+        const start = table.*.offsets[entry]
+        const next = if entry + 1 < table.*.count { table.*.offsets[entry + 1] } else { code_length }
+        elf.writeU32(image, at, @intCast(u32, table.*.names[entry]))
+        image[at + 4] = STT_FUNC
+        image[at + 5] = 0
+        elf.writeU16(image, at + 6, @intCast(u16, text_index))
+        elf.writeU64(image, at + 8, @intCast(u64, text_address + start))
+        elf.writeU64(image, at + 16, @intCast(u64, if next > start { next - start } else { 0 }))
+        entry += 1
+    }
+    // .shstrtab moved and grew.
+    const moved = new_section_offset + names_index * SECTION_SIZE
+    elf.writeU64(image, moved + 24, @intCast(u64, new_names_offset))
+    elf.writeU64(image, moved + 32, @intCast(u64, new_names_size))
+    // .symtab: linked to .strtab; every symbol is local, so the first global
+    // would come after the last.
+    const symtab = new_section_offset + section_count * SECTION_SIZE
+    elf.writeU32(image, symtab + 0, @intCast(u32, names_size))
+    elf.writeU32(image, symtab + 4, 2)
+    elf.writeU64(image, symtab + 24, @intCast(u64, symbols_offset))
+    elf.writeU64(image, symtab + 32, @intCast(u64, symbols_size))
+    elf.writeU32(image, symtab + 40, @intCast(u32, section_count + 1))
+    elf.writeU32(image, symtab + 44, @intCast(u32, table.*.count + 1))
+    elf.writeU64(image, symtab + 48, 8)
+    elf.writeU64(image, symtab + 56, @intCast(u64, SYMBOL_SIZE))
+    const strtab = symtab + SECTION_SIZE
+    elf.writeU32(image, strtab + 0, @intCast(u32, names_size + 8))
+    elf.writeU32(image, strtab + 4, 3)
+    elf.writeU64(image, strtab + 24, @intCast(u64, strings_offset))
+    elf.writeU64(image, strtab + 32, @intCast(u64, table.*.stringLength))
+    elf.writeU64(image, strtab + 48, 1)
+    // The ELF header: where the section headers are now, and how many.
+    elf.writeU64(image, 40, @intCast(u64, new_section_offset))
+    elf.writeU16(image, 60, @intCast(u16, new_section_count))
+
+    const output = fs.open(path, fs.WRITE_ONLY | fs.CREATE | fs.TRUNCATE, 493)
+    if !fs.isValid(output) { return false }
+    const wrote = fs.writeAllBytes(output, image, total)
+    const closed = fs.close(output)
+    return wrote && closed
+}
