@@ -30,6 +30,10 @@ pub fn add(first: i32, second: i32) -> i32 {
 pub const origin_x: i32 = 0
 
 fn hidden() -> i32 { return 1 }
+
+fn dropping() -> void {
+    const ignored = hidden()
+}
 '''
 
 MAIN = '''const shapes = @import("../lib/shapes.mlx")
@@ -50,7 +54,7 @@ pub fn main() -> u8 {
 class Client:
     def __init__(self, root):
         self.log = open(os.path.join(root, '..', 'server.log'), 'w')
-        env = dict(os.environ, MLX_COMPILER=COMPILER)
+        env = dict(os.environ, MLX_COMPILER=COMPILER, XDG_STATE_HOME=os.path.join(root, '..', 'state'))
         self.process = subprocess.Popen([SERVER], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=self.log, env=env)
         self.buffer = b''
         self.id = 0
@@ -136,11 +140,15 @@ open(shapes_path, 'w').write(SHAPES)
 open(main_path, 'w').write(MAIN)
 shapes_uri = 'file://' + shapes_path
 main_uri = 'file://' + main_path
+# A crash the desktop programs kept (examples/wayland-compositor/crash.mlx):
+# in add, line 16, called from measure.
+os.makedirs(os.path.join(work, 'state', 'mlx'))
+open(os.path.join(work, 'state', 'mlx', 'crashes.log'), 'w').write('crash\t1790000000\tapp\tillegal instruction (a failed runtime check)\tlib/shapes.mlx:15:add+0x10 at lib/shapes.mlx:16\tapp/main.mlx:3:measure+0x20 at app/main.mlx:4\n')
 client = Client(root)
 try:
     result = client.request('initialize', {'processId': None, 'rootUri': 'file://' + root, 'capabilities': {}})['result']
     capabilities = result['capabilities']
-    check('initialize offers the features', all(capabilities.get(name) for name in ('hoverProvider', 'definitionProvider', 'referencesProvider', 'renameProvider', 'completionProvider', 'signatureHelpProvider', 'semanticTokensProvider', 'documentSymbolProvider', 'workspaceSymbolProvider', 'documentHighlightProvider')), capabilities)
+    check('initialize offers the features', all(capabilities.get(name) for name in ('hoverProvider', 'definitionProvider', 'referencesProvider', 'renameProvider', 'completionProvider', 'signatureHelpProvider', 'semanticTokensProvider', 'documentSymbolProvider', 'workspaceSymbolProvider', 'documentHighlightProvider', 'codeLensProvider')), capabilities)
     client.notify('initialized', {})
     client.notify('textDocument/didOpen', {'textDocument': {'uri': main_uri, 'languageId': 'mlx', 'version': 1, 'text': MAIN}})
     main = {'uri': main_uri}
@@ -211,18 +219,40 @@ try:
     kinds = {(line, column): kind for line, column, width, kind in tokens}
     check('semantic tokens: keyword, namespace, function, parameter, property', kinds.get((0, 0)) == 15 and kinds.get((0, 6)) == 0 and kinds.get((2, 3)) == 12 and kinds.get((2, 11)) == 7 and kinds.get((3, 37)) == 9, tokens[:12])
 
+    # What the code map knows: in hover, code lens and diagnostics.
+    answer = client.request('textDocument/hover', {'textDocument': main, 'position': position(MAIN, 'shapes.add', 8)})['result']
+    text = answer['contents']['value'] if answer else ''
+    check('hover of add: the crash, complexity, the program and no check', '**Crashed** here 1x' in text and 'Complexity: 1 branches' in text and 'Reached by app' in text and 'no check reaches it' in text, text)
+    client.notify('textDocument/didOpen', {'textDocument': {'uri': shapes_uri, 'languageId': 'mlx', 'version': 1, 'text': SHAPES}})
+    shapes = {'uri': shapes_uri}
+    answer = client.request('textDocument/hover', {'textDocument': shapes, 'position': position(SHAPES, 'hidden()')})['result']
+    text = answer['contents']['value'] if answer else ''
+    check('hover of hidden: unreachable', '**Unreachable:**' in text, text)
+    answer = client.request('textDocument/codeLens', {'textDocument': shapes})['result']
+    titles = {(item['range']['start']['line']): item['command']['title'] for item in (answer or [])}
+    check('code lens: add used once, crashed once, no check', titles.get(position(SHAPES, 'add(first')['line']) == '1 use · 1 crash · no check', answer)
+    check('code lens: dropping has a workaround and is unreachable', titles.get(position(SHAPES, 'dropping()')['line']) == '0 uses · 1 workaround · unreachable', answer)
+    listed = client.diagnostics(shapes_uri)
+    crashed = [item for item in listed or [] if item['severity'] == 2]
+    hinted = [item for item in listed or [] if item['severity'] == 4]
+    check('diagnostics: a warning on the line the crash stopped on', crashed and crashed[0]['range']['start']['line'] == 15 and 'Crashed here: app' in crashed[0]['message'], listed)
+    check('diagnostics: a hint on the dropped result', hinted and hinted[0]['range']['start']['line'] == position(SHAPES, 'ignored')['line'] and 'Results bound to be dropped' in hinted[0]['message'], listed)
+
     # Diagnostics: clean, then saved broken, then fixed.
     listed = client.diagnostics(main_uri)
+    through = [item for item in listed or [] if item.get('source') == 'mlx-codemap']
+    check('diagnostics: a warning on the call a crash went through', through and through[0]['range']['start']['line'] == 3 and 'A crash went through this call' in through[0]['message'], listed)
+    listed = [item for item in listed or [] if item.get('source') != 'mlx-codemap']
     check('diagnostics: none for a clean file', listed == [], listed)
     open(main_path, 'w').write(MAIN.replace('return total +', 'return totl +'))
     client.notify('textDocument/didChange', {'textDocument': {'uri': main_uri, 'version': 4}, 'contentChanges': [{'text': MAIN.replace('return total +', 'return totl +')}]})
     client.notify('textDocument/didSave', {'textDocument': main})
-    listed = client.diagnostics(main_uri)
+    listed = [item for item in client.diagnostics(main_uri) or [] if item.get('source') != 'mlx-codemap']
     check('diagnostics: the compiler\'s error where it is, with the name nothing declares', listed and listed[0]['range']['start']['line'] == position(MAIN, 'total +')['line'] and 'not declared: `totl`' in listed[0]['message'] and listed[0]['severity'] == 1, listed)
     open(main_path, 'w').write(MAIN)
     client.notify('textDocument/didChange', {'textDocument': {'uri': main_uri, 'version': 5}, 'contentChanges': [{'text': MAIN}]})
     client.notify('textDocument/didSave', {'textDocument': main})
-    listed = client.diagnostics(main_uri)
+    listed = [item for item in client.diagnostics(main_uri) or [] if item.get('source') != 'mlx-codemap']
     check('diagnostics: cleared once fixed', listed == [], listed)
 
     client.request('shutdown', None)

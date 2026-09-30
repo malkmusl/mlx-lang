@@ -55,3 +55,22 @@ tools/check_lsp.sh                   # a scripted editor session, every request
 - `check.mlx`: the compiler as a child process, and its output turned into
   diagnostics.
 - `protocol.mlx`: framing, JSON, URIs, and UTF-16 positions.
+
+## What the code map knows
+
+The server also tells what MLX Codemap knows
+([`insights.mlx`](insights.mlx), on `tools/codemap`):
+
+- **Hover** of a function: the crashes that stopped in it or went through
+  it (from `~/.local/state/mlx/crashes.log`), its workarounds and what is
+  missing for them, its complexity, and which programs reach it and
+  whether a check does (or that nothing reaches it).
+- **Code lens** above each function: how often it is used, and what is
+  notable: crashes, workarounds, complex, unreachable, no check.
+- **Diagnostics** (source `mlx-codemap`): a warning on the line a crash
+  stopped on and on each call it went through (the compiler's line table
+  says the line); a hint on every workaround.
+
+It is worked out again after the workspace is read again, when first
+asked for. Workarounds are found per file: the whole code base takes a
+while.
