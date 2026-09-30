@@ -386,6 +386,19 @@ shot problem
 undo
 save
 wait 4000
+open lib/drop.mlx 4
+wait 300
+shot droplens
+chip rewrite
+save
+wait 3000
+open lib/helper.mlx 4
+wait 300
+chip uses
+wait 300
+shot references
+choose
+wait 300
 program app
 build
 settle
@@ -401,6 +414,14 @@ view map
 settle
 quit
 DEMO
+# A result bound only to be dropped, for the editor's rewrite.
+cat > "$tree/lib/drop.mlx" <<'MLX'
+const extra = @import("./extra.mlx")
+
+pub fn drop() -> void {
+    const ignored = extra.twice()
+}
+MLX
 printf 'wait 120000\nclose\n' > "$work/hold.script"
 runtime=$(mktemp -d)
 XDG_RUNTIME_DIR=$runtime "$work/test-host" host-demo "$work/us.xkb" "$work/hold.script" > "$work/demo-host.log" 2>&1 &
@@ -437,6 +458,13 @@ grep -q "^codemap: hover local const point in function main, app/main.mlx:4 | ty
     && grep -q "^codemap: hover field x of struct Point, lib/helper.mlx:11 | $" "$work/demo.log" \
     || fail "editor: the hover does not say where a local and a field belong" "$work/demo.log"
 echo "ok   editor: open, go to a declaration, hover (where a name belongs), edit, save, the compiler's problems, undo"
+# What the map knows, in the editor: the lens of greet lists its uses (a
+# click on one opens it), the dropped result's line offers its rewrite.
+grep -q "^codemap: rewritten here:     _ = extra.twice()$" "$work/demo.log" && grep -q "^    _ = extra.twice()$" "$tree/lib/drop.mlx" \
+    || fail "editor: the rewrite on the workaround's line did not happen" "$work/demo.log"
+grep -q "^codemap: references greet$" "$work/demo.log" && grep -q "^codemap: references count: 2$" "$work/demo.log" && grep -q "^codemap: reference opened " "$work/demo.log" \
+    || fail "editor: the lens's uses did not list greet's two uses" "$work/demo.log"
+echo "ok   editor: the lens (uses, a click lists them and opens one), a workaround's rewrite on its line"
 # Build: the program app into the tree's mlx-out/bin; Commit: the edit
 # with its message (when the tree is a Git work tree).
 grep -q "^codemap: build done: Built app in [0-9.]* s: mlx-out/bin/app$" "$work/demo.log" && [[ -x "$tree/mlx-out/bin/app" ]] \
