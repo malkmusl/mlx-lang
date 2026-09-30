@@ -132,9 +132,33 @@ The command line lists the same findings: `mlx-codemap copies [PATH]`,
 | Ctrl+W | close |
 
 The sidebar lists the groups, and the groups inside them on the way to
-what is selected, with how many files each holds. A click flies there. Its
-switches show or hide the imports, the tree's lines and the names. The
-panel lists the connections by kind:
+what is selected, with how many files each holds. A click flies there.
+
+The sidebar's check boxes choose what is shown. What is left out is not
+drawn, not found by the search, and not counted or listed in the
+findings.
+
+- **Groups:** a group's check box leaves it out, or brings it back. A
+  dash means something inside it is left out; a click brings all of it
+  back.
+  - A group inside one that is left out comes back alone. For example,
+    clear *Everything*, then tick `std`: only the standard library is
+    shown.
+  - *Everything* shows all, or (when all is shown) nothing.
+- **Findings:** a finding's check box shows its places in space (Crashes
+  is ticked from the start). A click on the finding itself opens its list
+  in the panel and ticks it.
+- **Workarounds:** the arrow opens the kinds of workarounds, each with a
+  check box and how many places it has in what is shown. The list and
+  the places in space follow them.
+- **Show:** the imports, the tree's lines and the names.
+- **Kinds:** functions, structs and unions, enums, constants, variables,
+  fields and tests (a struct left out takes its members with it). The
+  check boxes are in the kinds' colors.
+
+The groups left out are kept when the code is read again.
+
+The panel lists the connections by kind:
 
 - a declaration: *Calls*, *Uses*, *Called by*, *Used by* and *Members*;
 - a file: *Imports*, *Imported by* and *Declarations*;
@@ -205,9 +229,10 @@ answers are `path:line:col: kind Qualified.name` lines.
 2. Asks the command line, also for the workarounds and a kept crash.
 3. Runs the app under `tools/wayland-test-host` on a small tree, first on
    lavapipe, then on the CPU. In each run it searches, selects, checks the
-   connections of what was selected and clicks a group. `MLX_CODEMAP_TRACE`
-   has the app print what it read and selected, and the crashes it put on
-   declarations.
+   connections of what was selected, clicks a group and then its check box.
+   `MLX_CODEMAP_TRACE`
+   has the app print what it read and selected, the crashes it put on
+   declarations, and how much each finding shows.
 4. Compares the pictures from both runs.
 
 `tools/check_crash_report.sh` checks the crash reports themselves: the

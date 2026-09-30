@@ -6,7 +6,8 @@
 #   - the app reads the tree, lays it out in 3D and draws it; typing
 #     searches, Enter flies to the result and selects it, with what it
 #     connects to (the function is called from the other file); Escape
-#     clears; a click on a group in the sidebar selects the group;
+#     clears; a click on a group in the sidebar selects the group, one on
+#     its check box leaves it out;
 #   - drawn alike on the GPU (lavapipe) and on the CPU (MLX_CANVAS=cpu).
 # The app runs under tools/wayland-test-host; MLX_CODEMAP_TRACE makes it
 # say what it read and selected.
@@ -115,6 +116,11 @@ press 272
 release 272
 wait 4000
 shot SHOTS/group.ppm
+pointer 20 109
+wait 200
+press 272
+release 272
+wait 1000
 close
 SCRIPT
 
@@ -146,6 +152,10 @@ run() {
     grep -q "^codemap: selected $" "$log" || fail "codemap ($name): Escape did not clear the selection" "$log"
     grep -q "^codemap: selected tree/app/$" "$log" || fail "codemap ($name): the sidebar's app group was not selected" "$log"
     grep -A1 "^codemap: selected tree/app/$" "$log" | grep -q "^codemap: related out 1 in 0$" || fail "codemap ($name): the app group should depend on the lib group" "$log"
+    # Its check box leaves lib out: its declarations, and the workarounds
+    # in it; the crash (through main in app) stays.
+    grep -q "^codemap: shown [0-9]* nodes, findings 0 0 [0-9]* 2 1$" "$log" || fail "codemap ($name): at first everything is shown" "$log"
+    grep -q "^codemap: shown [0-9]* nodes, findings 0 0 [0-9]* 0 1$" "$log" || fail "codemap ($name): the lib group's check box did not leave it out" "$log"
     python3 - "$shots/start.ppm" "$shots/selected.ppm" <<'PY' || fail "codemap ($name): the view or the detail panel is not drawn" "$log"
 import sys
 def load(path):
