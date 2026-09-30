@@ -356,3 +356,37 @@ for name in ('start', 'selected', 'group'):
     assert off * 3 * 200 < len(gpu), (name, off)
 PY
 echo "ok   codemap: the same on the GPU and the CPU"
+
+# The demo mode (tools/codemap_screenshots.sh makes the README's pictures
+# with it): the app plays a script and writes its own frames, a shot and a
+# recorded flight.
+mkdir -p "$work/demo"
+cat > "$work/check.demo" <<'DEMO'
+settle
+shot start
+search kind:fn calls:greet
+settle
+shot query
+escape
+select lib/helper.mlx/greet
+record flight 3 100
+quit
+DEMO
+printf 'wait 120000\nclose\n' > "$work/hold.script"
+runtime=$(mktemp -d)
+XDG_RUNTIME_DIR=$runtime "$work/test-host" host-demo "$work/us.xkb" "$work/hold.script" > "$work/demo-host.log" 2>&1 &
+host_pid=$!
+for _ in $(seq 1 50); do [[ -S "$runtime/host-demo" ]] && break; sleep 0.1; done
+status=0
+env -i PATH="$PATH" HOME="$work" XDG_RUNTIME_DIR="$runtime" WAYLAND_DISPLAY=host-demo MLX_CANVAS=cpu MLX_CODEMAP_TRACE=1 \
+    MLX_CODEMAP_DEMO="$work/check.demo" MLX_CODEMAP_DEMO_OUT="$work/demo" timeout 60 "$work/mlx-codemap" "$tree" > "$work/demo.log" 2>&1 || status=$?
+kill "$host_pid" 2> /dev/null || true
+wait "$host_pid" 2> /dev/null || true
+rm -rf -- "$runtime"
+[[ $status -eq 0 ]] || fail "codemap (demo): the app exited with status $status" "$work/demo.log"
+for picture in start query flight-000 flight-001 flight-002; do
+    head -c 15 "$work/demo/$picture.ppm" 2> /dev/null | grep -q "^P6$" || fail "codemap (demo): $picture.ppm is missing" "$work/demo.log"
+done
+grep -q "^codemap: query kind:fn calls:greet: 2 declarations$" "$work/demo.log" || fail "codemap (demo): the query step did not run" "$work/demo.log"
+cmp -s "$work/demo/flight-000.ppm" "$work/demo/flight-002.ppm" && fail "codemap (demo): the recorded flight does not move" "$work/demo.log"
+echo "ok   codemap (demo): a script played, its frames written"
