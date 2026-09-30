@@ -1,0 +1,849 @@
+// mlx-profile: where a program spends its time. It starts the program
+// under ptrace, stops it every few milliseconds, and notes where it is and
+// the functions that called it (along the frame pointers every Mlx function
+// keeps). The addresses are named from the symbol tables of the files they
+// are in, as the compiler writes them (path:line:function), and C
+// libraries by their own symbols.
+//
+//   mlx-profile [-o DIRECTORY] [--every MILLISECONDS] [--wall] PROGRAM [ARGUMENT...]
+//
+// Only samples where the program runs count (not where it waits in the
+// kernel); --wall counts all. At the end it prints the functions the most
+// time went to and writes the profile to DIRECTORY (default:
+// $XDG_STATE_HOME/mlx/profiles, else ~/.local/state/mlx/profiles) as
+// PROGRAM-SECONDS.profile, which MLX Codemap and `mlx-codemap hot` read:
+//
+//     profile <TAB> program <TAB> seconds since 1970 <TAB> samples <TAB> interval in µs
+//     self <TAB> total <TAB> function
+//
+// The main thread is sampled; the program's other threads run on.
+const std = @import("std")
+
+const SYS_read: usize = 0
+const SYS_write: usize = 1
+const SYS_open: usize = 2
+const SYS_close: usize = 3
+const SYS_lseek: usize = 8
+const SYS_mmap: usize = 9
+const SYS_nanosleep: usize = 35
+const SYS_fork: usize = 57
+const SYS_execve: usize = 59
+const SYS_exit: usize = 60
+const SYS_wait4: usize = 61
+const SYS_kill: usize = 62
+const SYS_mkdir: usize = 83
+const SYS_ptrace: usize = 101
+const SYS_clock_gettime: usize = 228
+const SYS_process_vm_readv: usize = 310
+const PTRACE_TRACEME: usize = 0
+const PTRACE_CONT: usize = 7
+const PTRACE_GETREGS: usize = 12
+const PTRACE_SETOPTIONS: usize = 16896
+const PTRACE_O_EXITKILL: usize = 1048576
+const SIGSTOP: usize = 19
+const SIGTRAP: usize = 5
+const SIGKILL: usize = 9
+// user_regs_struct: rbp is word 4, rip 16, rsp 19.
+const REGISTER_WORDS: usize = 27
+
+const MAX_FRAMES: usize = 64
+const MAX_FUNCTIONS: usize = 65536
+const FUNCTION_SLOTS: usize = 131072
+const ADDRESS_SLOTS: usize = 262144
+const MAX_FILES: usize = 64
+const NAMES_SIZE: usize = 8388608
+const MAPS_SIZE: usize = 1048576
+
+// Everything the profiler keeps (big tables, allocated once).
+const Profiler = struct {
+    child: usize
+    // The functions: their names (in names), samples in them and with what
+    // they called; a hash of names to them.
+    names: [*]u8
+    namesUsed: usize
+    nameStart: [*]u32
+    nameLength: [*]u32
+    selfSamples: [*]u32
+    totalSamples: [*]u32
+    marks: [*]u32
+    count: usize
+    slots: [*]u32
+    // Addresses seen: address and its function (hash, open addressing).
+    addressKeys: [*]u64
+    addressValues: [*]u32
+    // /proc/PID/maps, read again when an address is in no mapping known.
+    maps: [*]u8
+    mapsLength: usize
+    // Files mapped in to be read (their path's hash, image, size).
+    fileKeys: [64]u64
+    fileImages: [64]usize
+    fileSizes: [64]usize
+    fileCount: usize
+    // The sample being taken.
+    frames: [64]u64
+    frameCount: usize
+    samples: usize
+    round: u32
+    text: [*]u8
+}
+
+fn say(text: []const u8) -> void {
+    const written = std.io.writeAll(std.io.stdout(), text)
+}
+
+fn sayError(text: []const u8) -> void {
+    const written = std.io.writeAll(std.io.stderr(), text)
+}
+
+fn sayNumber(value: usize) -> void {
+    var digits: [24]u8 = undefined
+    var count: usize = 0
+    var rest = value
+    while rest > 0 || count == 0 {
+        digits[count] = @intCast(u8, 48 + rest % 10)
+        rest = rest / 10
+        count += 1
+    }
+    while count > 0 {
+        count -= 1
+        say(digits[count..count + 1])
+    }
+}
+
+fn cString(value: [*]const u8) -> []const u8 {
+    var length: usize = 0
+    while value[length] != 0 { length += 1 }
+    return value[0..length]
+}
+
+fn same(first: []const u8, second: []const u8) -> bool {
+    if first.length != second.length { return false }
+    var at: usize = 0
+    while at < first.length {
+        if first[at] != second[at] { return false }
+        at += 1
+    }
+    return true
+}
+
+fn hashBytes(bytes: [*]const u8, length: usize) -> u64 {
+    var value: u64 = 14695981039346656037
+    var at: usize = 0
+    while at < length {
+        value = (value ^ @intCast(u64, bytes[at])) *% 1099511628211
+        at += 1
+    }
+    return value
+}
+
+fn allocate(size: usize) -> usize {
+    const mapped = std.linux.syscall6(SYS_mmap, 0, size, 3, 34, 18446744073709551615, 0)
+    if mapped < 0 { return 0 }
+    return @bitCast(usize, mapped)
+}
+
+fn words(count: usize) -> [*]u32 {
+    var result: [*]u32 = undefined
+    unsafe { result = @ptrFromInt([*]u32, allocate(count * 4 + 4)) }
+    return result
+}
+
+fn bytesAt(address: usize) -> [*]const u8 {
+    var result: [*]const u8 = undefined
+    unsafe { result = @ptrFromInt([*]const u8, address) }
+    return result
+}
+
+fn read16(image: usize, at: usize) -> usize {
+    const bytes = bytesAt(image + at)
+    return @intCast(usize, bytes[0]) | (@intCast(usize, bytes[1]) << 8)
+}
+
+fn read32(image: usize, at: usize) -> usize { return read16(image, at) | (read16(image, at + 2) << 16) }
+
+fn read64(image: usize, at: usize) -> usize { return read32(image, at) | (read32(image, at + 4) << 32) }
+
+fn milliseconds() -> usize {
+    var time: [2]usize = [2]usize{ 0, 0 }
+    const clock = std.linux.syscall2(SYS_clock_gettime, 1, @intFromPtr(&time))
+    return time[0] * 1000 + time[1] / 1000000
+}
+
+// ---------------------------------------------------------------------------
+// Functions
+
+// The function called `name` (made when new).
+fn functionOf(profiler: *Profiler, name: [*]const u8, length: usize) -> u32 {
+    const hash = hashBytes(name, length)
+    var slot = @intCast(usize, hash % @intCast(u64, FUNCTION_SLOTS))
+    while true {
+        const held = profiler.*.slots[slot]
+        if held == 0 { break }
+        const function = @intCast(usize, held - 1)
+        const start = @intCast(usize, profiler.*.nameStart[function])
+        if @intCast(usize, profiler.*.nameLength[function]) == length && same(profiler.*.names[start..start + length], name[0..length]) { return held - 1 }
+        slot = (slot + 1) % FUNCTION_SLOTS
+    }
+    if profiler.*.count >= MAX_FUNCTIONS || profiler.*.namesUsed + length > NAMES_SIZE { return 4294967295 }
+    const function = profiler.*.count
+    profiler.*.count += 1
+    profiler.*.nameStart[function] = @intCast(u32, profiler.*.namesUsed)
+    profiler.*.nameLength[function] = @intCast(u32, length)
+    var at: usize = 0
+    while at < length {
+        profiler.*.names[profiler.*.namesUsed] = name[at]
+        profiler.*.namesUsed += 1
+        at += 1
+    }
+    profiler.*.selfSamples[function] = 0
+    profiler.*.totalSamples[function] = 0
+    profiler.*.marks[function] = 0
+    profiler.*.slots[slot] = @intCast(u32, function + 1)
+    return @intCast(u32, function)
+}
+
+// ---------------------------------------------------------------------------
+// Naming addresses
+
+fn hexValue(byte: u8) -> usize {
+    if byte >= 48 && byte <= 57 { return @intCast(usize, byte - 48) }
+    if byte >= 97 && byte <= 102 { return @intCast(usize, byte - 87) }
+    return 16
+}
+
+fn readMaps(profiler: *Profiler) -> void {
+    var path: [64]u8 = undefined
+    var bytes: [*]u8 = undefined
+    unsafe { bytes = @ptrCast([*]u8, &path) }
+    var length: usize = 0
+    for byte in "/proc/" {
+        bytes[length] = byte
+        length += 1
+    }
+    var digits: [24]u8 = undefined
+    var count: usize = 0
+    var rest = profiler.*.child
+    while rest > 0 || count == 0 {
+        digits[count] = @intCast(u8, 48 + rest % 10)
+        rest /= 10
+        count += 1
+    }
+    while count > 0 {
+        count -= 1
+        bytes[length] = digits[count]
+        length += 1
+    }
+    for byte in "/maps" {
+        bytes[length] = byte
+        length += 1
+    }
+    bytes[length] = 0
+    profiler.*.mapsLength = 0
+    const file = std.linux.syscall3(SYS_open, @intFromPtr(bytes), 0, 0)
+    if file < 0 { return }
+    while profiler.*.mapsLength + 4096 < MAPS_SIZE {
+        const got = std.linux.syscall3(SYS_read, @bitCast(usize, file), @intFromPtr(profiler.*.maps) + profiler.*.mapsLength, MAPS_SIZE - profiler.*.mapsLength)
+        if got <= 0 { break }
+        profiler.*.mapsLength += @bitCast(usize, got)
+    }
+    const closed = std.linux.syscall1(SYS_close, @bitCast(usize, file))
+}
+
+// Names `address` (a return address one byte back) into the profiler's
+// text: path:line:function from the file's symbols, else file+0xOFFSET,
+// else 0xADDRESS. Its length (0: in no mapping).
+fn describe(profiler: *Profiler, address: usize) -> usize {
+    const maps = profiler.*.maps
+    const length = profiler.*.mapsLength
+    var line: usize = 0
+    while line < length {
+        var at = line
+        var start: usize = 0
+        while at < length && hexValue(maps[at]) < 16 {
+            start = start * 16 + hexValue(maps[at])
+            at += 1
+        }
+        at += 1
+        var end: usize = 0
+        while at < length && hexValue(maps[at]) < 16 {
+            end = end * 16 + hexValue(maps[at])
+            at += 1
+        }
+        var line_end = at
+        while line_end < length && maps[line_end] != 10 { line_end += 1 }
+        if address >= start && address < end {
+            at += 6
+            var file_offset: usize = 0
+            while at < line_end && hexValue(maps[at]) < 16 {
+                file_offset = file_offset * 16 + hexValue(maps[at])
+                at += 1
+            }
+            var fields: usize = 0
+            while at < line_end && fields < 2 {
+                while at < line_end && maps[at] == 32 { at += 1 }
+                while at < line_end && maps[at] != 32 { at += 1 }
+                fields += 1
+            }
+            while at < line_end && maps[at] == 32 { at += 1 }
+            const in_file = address - start + file_offset
+            if at < line_end && maps[at] == 47 {
+                const named = nameInFile(profiler, at, line_end, in_file)
+                if named > 0 { return named }
+                // The file's name and the offset.
+                var base = at
+                var scan = at
+                while scan < line_end {
+                    if maps[scan] == 47 { base = scan + 1 }
+                    scan += 1
+                }
+                var out: usize = 0
+                while base < line_end && out < 200 {
+                    profiler.*.text[out] = maps[base]
+                    out += 1
+                    base += 1
+                }
+                return out
+            }
+            return writeHex(profiler.*.text, 0, address)
+        }
+        line = line_end + 1
+    }
+    return 0
+}
+
+fn writeHex(into: [*]u8, at: usize, value: usize) -> usize {
+    var length = at
+    into[length] = 48
+    into[length + 1] = 120
+    length += 2
+    var shift: usize = 60
+    var started = false
+    while true {
+        const digit = (value >> shift) & 15
+        if digit != 0 || started || shift == 0 {
+            started = true
+            into[length] = if digit < 10 { @intCast(u8, 48 + digit) } else { @intCast(u8, 87 + digit) }
+            length += 1
+        }
+        if shift == 0 { break }
+        shift -= 4
+    }
+    return length
+}
+
+// The image of the file at maps[from..to] (mapped in once).
+fn imageOf(profiler: *Profiler, from: usize, to: usize, size: *usize) -> usize {
+    var path: [4096]u8 = undefined
+    var bytes: [*]u8 = undefined
+    unsafe { bytes = @ptrCast([*]u8, &path) }
+    var length: usize = 0
+    while from + length < to && length < 4000 {
+        bytes[length] = profiler.*.maps[from + length]
+        length += 1
+    }
+    bytes[length] = 0
+    const key = hashBytes(bytes, length)
+    var file: usize = 0
+    while file < profiler.*.fileCount {
+        if profiler.*.fileKeys[file] == key {
+            size.* = profiler.*.fileSizes[file]
+            return profiler.*.fileImages[file]
+        }
+        file += 1
+    }
+    if profiler.*.fileCount >= MAX_FILES { return 0 }
+    var image: usize = 0
+    var image_size: usize = 0
+    const handle = std.linux.syscall3(SYS_open, @intFromPtr(bytes), 0, 0)
+    if handle >= 0 {
+        const end = std.linux.syscall3(SYS_lseek, @bitCast(usize, handle), 0, 2)
+        if end > 64 {
+            const mapped = std.linux.syscall6(SYS_mmap, 0, @bitCast(usize, end), 1, 2, @bitCast(usize, handle), 0)
+            if mapped >= 0 {
+                image = @bitCast(usize, mapped)
+                image_size = @bitCast(usize, end)
+            }
+        }
+        const closed = std.linux.syscall1(SYS_close, @bitCast(usize, handle))
+    }
+    profiler.*.fileKeys[profiler.*.fileCount] = key
+    profiler.*.fileImages[profiler.*.fileCount] = image
+    profiler.*.fileSizes[profiler.*.fileCount] = image_size
+    profiler.*.fileCount += 1
+    size.* = image_size
+    return image
+}
+
+fn nameInFile(profiler: *Profiler, from: usize, to: usize, in_file: usize) -> usize {
+    var size: usize = 0
+    const image = imageOf(profiler, from, to, &size)
+    if image == 0 || size < 64 { return 0 }
+    const magic = bytesAt(image)
+    if magic[0] != 127 || magic[1] != 69 || magic[2] != 76 || magic[3] != 70 || magic[4] != 2 { return 0 }
+    const program_offset = read64(image, 32)
+    const program_count = read16(image, 56)
+    if program_offset + program_count * 56 > size { return 0 }
+    var address: usize = 0
+    var placed = false
+    var index: usize = 0
+    while index < program_count {
+        const header = program_offset + index * 56
+        const segment_offset = read64(image, header + 8)
+        if read32(image, header) == 1 && in_file >= segment_offset && in_file < segment_offset + read64(image, header + 32) {
+            address = in_file - segment_offset + read64(image, header + 16)
+            placed = true
+            break
+        }
+        index += 1
+    }
+    if !placed { return 0 }
+    const section_offset = read64(image, 40)
+    const section_count = read16(image, 60)
+    if section_offset + section_count * 64 > size { return 0 }
+    var kind: usize = 2
+    while kind != 0 {
+        index = 0
+        while index < section_count {
+            const header = section_offset + index * 64
+            if read32(image, header + 4) == kind {
+                const strings_header = section_offset + read32(image, header + 40) * 64
+                const named = nameInSymbols(profiler, image, size, read64(image, header + 24), read64(image, header + 32), read64(image, strings_header + 24), read64(image, strings_header + 32), address)
+                if named > 0 { return named }
+            }
+            index += 1
+        }
+        kind = if kind == 2 { 11 } else { 0 }
+    }
+    return 0
+}
+
+fn nameInSymbols(profiler: *Profiler, image: usize, size: usize, symbols: usize, symbols_size: usize, strings: usize, strings_size: usize, address: usize) -> usize {
+    if symbols + symbols_size > size || strings + strings_size > size { return 0 }
+    var best_value: usize = 0
+    var best_name: usize = 0
+    var found = false
+    var at = symbols
+    while at + 24 <= symbols + symbols_size {
+        const kind = bytesAt(image + at + 4)[0] & 15
+        const value = read64(image, at + 8)
+        const extent = read64(image, at + 16)
+        if kind == 2 && value <= address && (address < value + extent || extent == 0) && (!found || value > best_value) {
+            best_value = value
+            best_name = read32(image, at)
+            found = true
+        }
+        at += 24
+    }
+    if !found || best_name >= strings_size { return 0 }
+    const name = bytesAt(image + strings + best_name)
+    var length: usize = 0
+    while best_name + length < strings_size && name[length] != 0 && length < 4000 {
+        profiler.*.text[length] = name[length]
+        length += 1
+    }
+    return length
+}
+
+// The function `address` is in (NONE-like 4294967295: unknown), named
+// once per address.
+fn functionAt(profiler: *Profiler, address: usize) -> u32 {
+    const key = @intCast(u64, address)
+    var slot = @intCast(usize, (key *% 11400714819323198485) >> 46) % ADDRESS_SLOTS
+    while true {
+        if profiler.*.addressKeys[slot] == 0 { break }
+        if profiler.*.addressKeys[slot] == key { return profiler.*.addressValues[slot] }
+        slot = (slot + 1) % ADDRESS_SLOTS
+    }
+    var length = describe(profiler, address)
+    if length == 0 {
+        // A mapping made since maps was read (a library loaded).
+        readMaps(profiler)
+        length = describe(profiler, address)
+    }
+    if length == 0 { length = writeHex(profiler.*.text, 0, address) }
+    var text: [*]const u8 = undefined
+    unsafe { text = @ptrCast([*]const u8, profiler.*.text) }
+    const function = functionOf(profiler, text, length)
+    profiler.*.addressKeys[slot] = key
+    profiler.*.addressValues[slot] = function
+    return function
+}
+
+// ---------------------------------------------------------------------------
+// Sampling
+
+fn readWords(profiler: *Profiler, address: usize, into: [*]u64, count: usize) -> bool {
+    var local: [2]usize = [2]usize{ @intFromPtr(into), count * 8 }
+    var remote: [2]usize = [2]usize{ address, count * 8 }
+    const got = std.linux.syscall6(SYS_process_vm_readv, profiler.*.child, @intFromPtr(&local), 1, @intFromPtr(&remote), 1, 0)
+    return got == @intCast(isize, count * 8)
+}
+
+// Where the stopped program is: rip, then the return addresses along
+// rbp (one byte back, into the call).
+fn sample(profiler: *Profiler) -> void {
+    var registers: [27]u64 = undefined
+    const got = std.linux.syscall4(SYS_ptrace, PTRACE_GETREGS, profiler.*.child, 0, @intFromPtr(&registers))
+    if got != 0 { return }
+    profiler.*.frameCount = 0
+    profiler.*.frames[0] = registers[16]
+    profiler.*.frameCount = 1
+    var frame = @intCast(usize, registers[4])
+    const stack = @intCast(usize, registers[19])
+    var pair: [2]u64 = [2]u64{ 0, 0 }
+    var pair_words: [*]u64 = undefined
+    unsafe { pair_words = @ptrCast([*]u64, &pair) }
+    while profiler.*.frameCount < MAX_FRAMES && frame >= stack && frame < stack + 67108864 && frame & 7 == 0 {
+        if !readWords(profiler, frame, pair_words, 2) { break }
+        if pair[1] < 4096 { break }
+        profiler.*.frames[profiler.*.frameCount] = pair[1] - 1
+        profiler.*.frameCount += 1
+        if @intCast(usize, pair[0]) <= frame { break }
+        frame = @intCast(usize, pair[0])
+    }
+    // Self: the first; total: every function once.
+    profiler.*.round += 1
+    var at: usize = 0
+    while at < profiler.*.frameCount {
+        const function = functionAt(profiler, @intCast(usize, profiler.*.frames[at]))
+        if function != 4294967295 {
+            if at == 0 { profiler.*.selfSamples[function] += 1 }
+            if profiler.*.marks[function] != profiler.*.round {
+                profiler.*.marks[function] = profiler.*.round
+                profiler.*.totalSamples[function] += 1
+            }
+        }
+        at += 1
+    }
+    profiler.*.samples += 1
+}
+
+// Whether the program is running (R in /proc/PID/stat), not waiting.
+fn running(profiler: *Profiler) -> bool {
+    var path: [64]u8 = undefined
+    var bytes: [*]u8 = undefined
+    unsafe { bytes = @ptrCast([*]u8, &path) }
+    var length: usize = 0
+    for byte in "/proc/" {
+        bytes[length] = byte
+        length += 1
+    }
+    var digits: [24]u8 = undefined
+    var count: usize = 0
+    var rest = profiler.*.child
+    while rest > 0 || count == 0 {
+        digits[count] = @intCast(u8, 48 + rest % 10)
+        rest /= 10
+        count += 1
+    }
+    while count > 0 {
+        count -= 1
+        bytes[length] = digits[count]
+        length += 1
+    }
+    for byte in "/stat" {
+        bytes[length] = byte
+        length += 1
+    }
+    bytes[length] = 0
+    const file = std.linux.syscall3(SYS_open, @intFromPtr(bytes), 0, 0)
+    if file < 0 { return false }
+    var stat: [512]u8 = undefined
+    const got = std.linux.syscall3(SYS_read, @bitCast(usize, file), @intFromPtr(&stat), 512)
+    const closed = std.linux.syscall1(SYS_close, @bitCast(usize, file))
+    if got <= 0 { return false }
+    // After "pid (name) ": the state; the name may hold spaces.
+    var at = @bitCast(usize, got)
+    while at > 0 && stat[at - 1] != 41 { at -= 1 }
+    return at + 1 < @bitCast(usize, got) && stat[at + 1] == 82
+}
+
+// Waits for the program to stop or end. 1: stopped by `wanted`; 2: ended;
+// other signals are passed on.
+fn waitFor(profiler: *Profiler, wanted: usize) -> usize {
+    while true {
+        var status: [1]u32 = [1]u32{ 0 }
+        const waited = std.linux.syscall4(SYS_wait4, profiler.*.child, @intFromPtr(&status), 1073741824, 0)
+        if waited < 0 { return 2 }
+        const value = @intCast(usize, status[0])
+        if value & 127 == 0 || (value & 127 != 127) { return 2 }
+        const signal = (value >> 8) & 255
+        if signal == wanted { return 1 }
+        // Someone else's signal: on to the program.
+        const passed = std.linux.syscall4(SYS_ptrace, PTRACE_CONT, profiler.*.child, 0, signal)
+    }
+    return 2
+}
+
+// ---------------------------------------------------------------------------
+// The profile
+
+fn append(into: [*]u8, at: usize, text: []const u8) -> usize {
+    var length = at
+    for byte in text {
+        if length < 4000 {
+            into[length] = byte
+            length += 1
+        }
+    }
+    return length
+}
+
+fn appendNumber(into: [*]u8, at: usize, value: usize) -> usize {
+    var digits: [24]u8 = undefined
+    var count: usize = 0
+    var rest = value
+    while rest > 0 || count == 0 {
+        digits[count] = @intCast(u8, 48 + rest % 10)
+        rest /= 10
+        count += 1
+    }
+    var length = at
+    while count > 0 {
+        count -= 1
+        into[length] = digits[count]
+        length += 1
+    }
+    return length
+}
+
+fn variable(environment: [*][*]const u8, name: []const u8) -> []const u8 {
+    var entry: usize = 0
+    while @intFromPtr(environment[entry]) != 0 {
+        const text = environment[entry]
+        var matches = true
+        var length: usize = 0
+        for byte in name {
+            if matches && text[length] != byte { matches = false }
+            if matches { length += 1 }
+        }
+        if matches && text[length] == 61 {
+            var end = length + 1
+            while text[end] != 0 { end += 1 }
+            return text[length + 1..end]
+        }
+        entry += 1
+    }
+    return ""
+}
+
+fn makeDirectory(path: [*]u8, length: usize) -> void {
+    path[length] = 0
+    const made = std.linux.syscall2(SYS_mkdir, @intFromPtr(path), 493)
+}
+
+// The functions by total samples, most first (indexes into `order`).
+fn rank(profiler: *Profiler, order: [*]u32) -> void {
+    var at: usize = 0
+    while at < profiler.*.count {
+        const function = @intCast(u32, at)
+        var place = at
+        while place > 0 && profiler.*.totalSamples[order[place - 1]] < profiler.*.totalSamples[function] {
+            order[place] = order[place - 1]
+            place -= 1
+        }
+        order[place] = function
+        at += 1
+    }
+}
+
+fn writeProfile(profiler: *Profiler, directory: []const u8, environment: [*][*]const u8, program: []const u8, interval: usize, order: [*]u32) -> void {
+    var path: [4096]u8 = undefined
+    var bytes: [*]u8 = undefined
+    unsafe { bytes = @ptrCast([*]u8, &path) }
+    var length: usize = 0
+    if directory.length > 0 {
+        // The directory and those it is in.
+        length = append(bytes, 0, directory)
+        var at: usize = 1
+        while at < length {
+            if bytes[at] == 47 {
+                makeDirectory(bytes, at)
+                bytes[at] = 47
+            }
+            at += 1
+        }
+        makeDirectory(bytes, length)
+    } else {
+        const state = variable(environment, "XDG_STATE_HOME")
+        if state.length > 0 && state[0] == 47 {
+            length = append(bytes, 0, state)
+        } else {
+            const home = variable(environment, "HOME")
+            if home.length == 0 { return }
+            length = append(bytes, 0, home)
+            length = append(bytes, length, "/.local")
+            makeDirectory(bytes, length)
+            length = append(bytes, length, "/state")
+        }
+        makeDirectory(bytes, length)
+        length = append(bytes, length, "/mlx")
+        makeDirectory(bytes, length)
+        length = append(bytes, length, "/profiles")
+        makeDirectory(bytes, length)
+    }
+    var time: [2]usize = [2]usize{ 0, 0 }
+    const clock = std.linux.syscall2(SYS_clock_gettime, 0, @intFromPtr(&time))
+    length = append(bytes, length, "/")
+    length = append(bytes, length, program)
+    length = append(bytes, length, "-")
+    length = appendNumber(bytes, length, time[0])
+    length = append(bytes, length, ".profile")
+    bytes[length] = 0
+    const file = std.linux.syscall3(SYS_open, @intFromPtr(bytes), 577, 420)
+    if file < 0 {
+        sayError("mlx-profile: cannot write ")
+        sayError(bytes[0..length])
+        sayError("\n")
+        return
+    }
+    var line: [8192]u8 = undefined
+    var line_bytes: [*]u8 = undefined
+    unsafe { line_bytes = @ptrCast([*]u8, &line) }
+    var at = append(line_bytes, 0, "profile\t")
+    at = append(line_bytes, at, program)
+    at = append(line_bytes, at, "\t")
+    at = appendNumber(line_bytes, at, time[0])
+    at = append(line_bytes, at, "\t")
+    at = appendNumber(line_bytes, at, profiler.*.samples)
+    at = append(line_bytes, at, "\t")
+    at = appendNumber(line_bytes, at, interval * 1000)
+    at = append(line_bytes, at, "\n")
+    var wrote = std.linux.syscall3(SYS_write, @bitCast(usize, file), @intFromPtr(line_bytes), at)
+    var index: usize = 0
+    while index < profiler.*.count {
+        const function = @intCast(usize, order[index])
+        at = appendNumber(line_bytes, 0, @intCast(usize, profiler.*.selfSamples[function]))
+        at = append(line_bytes, at, "\t")
+        at = appendNumber(line_bytes, at, @intCast(usize, profiler.*.totalSamples[function]))
+        at = append(line_bytes, at, "\t")
+        const start = @intCast(usize, profiler.*.nameStart[function])
+        at = append(line_bytes, at, profiler.*.names[start..start + @intCast(usize, profiler.*.nameLength[function])])
+        at = append(line_bytes, at, "\n")
+        wrote = std.linux.syscall3(SYS_write, @bitCast(usize, file), @intFromPtr(line_bytes), at)
+        index += 1
+    }
+    const closed = std.linux.syscall1(SYS_close, @bitCast(usize, file))
+    say("mlx-profile: wrote ")
+    say(bytes[0..length])
+    say("\n")
+}
+
+fn usage() -> void {
+    sayError("usage: mlx-profile [-o DIRECTORY] [--every MILLISECONDS] [--wall] PROGRAM [ARGUMENT...]\n")
+}
+
+pub fn main(arguments: [][*]const u8) -> u8 {
+    const environment = std.process.environmentEntries(arguments)
+    var first: usize = 1
+    var interval: usize = 5
+    var wall = false
+    var directory: [*]const u8 = undefined
+    var has_directory = false
+    while first < arguments.length {
+        const argument = cString(arguments[first])
+        if same(argument, "-o") && first + 1 < arguments.length {
+            directory = arguments[first + 1]
+            has_directory = true
+            first += 2
+        } else if same(argument, "--every") && first + 1 < arguments.length {
+            interval = 0
+            for byte in cString(arguments[first + 1]) {
+                if byte >= 48 && byte <= 57 { interval = interval * 10 + @intCast(usize, byte - 48) }
+            }
+            if interval == 0 { interval = 1 }
+            first += 2
+        } else if same(argument, "--wall") {
+            wall = true
+            first += 1
+        } else {
+            break
+        }
+    }
+    if first >= arguments.length {
+        usage()
+        return 2
+    }
+    const profiler_memory = allocate(@sizeOf(Profiler))
+    if profiler_memory == 0 { return 1 }
+    var profiler: *Profiler = undefined
+    unsafe { profiler = @ptrFromInt(*Profiler, profiler_memory) }
+    unsafe {
+        profiler.*.names = @ptrFromInt([*]u8, allocate(NAMES_SIZE))
+        profiler.*.maps = @ptrFromInt([*]u8, allocate(MAPS_SIZE))
+        profiler.*.text = @ptrFromInt([*]u8, allocate(8192))
+        profiler.*.addressKeys = @ptrFromInt([*]u64, allocate(ADDRESS_SLOTS * 8))
+    }
+    profiler.*.nameStart = words(MAX_FUNCTIONS)
+    profiler.*.nameLength = words(MAX_FUNCTIONS)
+    profiler.*.selfSamples = words(MAX_FUNCTIONS)
+    profiler.*.totalSamples = words(MAX_FUNCTIONS)
+    profiler.*.marks = words(MAX_FUNCTIONS)
+    profiler.*.slots = words(FUNCTION_SLOTS)
+    profiler.*.addressValues = words(ADDRESS_SLOTS)
+    // The program, traced from its first instruction.
+    const child = std.linux.syscall0(SYS_fork)
+    if child == 0 {
+        const traced = std.linux.syscall4(SYS_ptrace, PTRACE_TRACEME, 0, 0, 0)
+        var program_arguments: [*]const [*]const u8 = undefined
+        unsafe { program_arguments = @ptrFromInt([*]const [*]const u8, @intFromPtr(@ptrCast([*]const [*]const u8, arguments)) + first * 8) }
+        const ran = std.linux.syscall3(SYS_execve, @intFromPtr(arguments[first]), @intFromPtr(program_arguments), @intFromPtr(environment))
+        sayError("mlx-profile: cannot run the program\n")
+        const exited = std.linux.syscall1(SYS_exit, 127)
+    }
+    if child < 0 { return 1 }
+    profiler.*.child = @bitCast(usize, child)
+    // It stops at the exec.
+    if waitFor(profiler, SIGTRAP) != 1 {
+        sayError("mlx-profile: the program did not start\n")
+        return 1
+    }
+    const options = std.linux.syscall4(SYS_ptrace, PTRACE_SETOPTIONS, profiler.*.child, 0, PTRACE_O_EXITKILL)
+    readMaps(profiler)
+    var sleep: [2]usize = [2]usize{ interval / 1000, (interval % 1000) * 1000000 }
+    var skipped: usize = 0
+    while true {
+        const resumed = std.linux.syscall4(SYS_ptrace, PTRACE_CONT, profiler.*.child, 0, 0)
+        if resumed != 0 { break }
+        const slept = std.linux.syscall2(SYS_nanosleep, @intFromPtr(&sleep), 0)
+        const was_running = wall || running(profiler)
+        const stopped = std.linux.syscall2(SYS_kill, profiler.*.child, SIGSTOP)
+        if stopped != 0 { break }
+        if waitFor(profiler, SIGSTOP) != 1 { break }
+        if was_running { sample(profiler) } else { skipped += 1 }
+    }
+    // The program's name: its file's.
+    const program_path = cString(arguments[first])
+    var base: usize = program_path.length
+    while base > 0 && program_path[base - 1] != 47 { base -= 1 }
+    const program = program_path[base..program_path.length]
+    const order = words(profiler.*.count + 1)
+    rank(profiler, order)
+    say("mlx-profile: ")
+    sayNumber(profiler.*.samples)
+    say(" samples")
+    if !wall {
+        say(" (")
+        sayNumber(skipped)
+        say(" more while it waited)")
+    }
+    say("\n")
+    var shown: usize = 0
+    while shown < profiler.*.count && shown < 20 {
+        const function = @intCast(usize, order[shown])
+        const total = @intCast(usize, profiler.*.totalSamples[function])
+        const self_samples = @intCast(usize, profiler.*.selfSamples[function])
+        const all = if profiler.*.samples > 0 { profiler.*.samples } else { 1 }
+        say("  ")
+        sayNumber(total * 100 / all)
+        say("% with calls, ")
+        sayNumber(self_samples * 100 / all)
+        say("% itself: ")
+        const start = @intCast(usize, profiler.*.nameStart[function])
+        say(profiler.*.names[start..start + @intCast(usize, profiler.*.nameLength[function])])
+        say("\n")
+        shown += 1
+    }
+    writeProfile(profiler, if has_directory { cString(directory) } else { "" }, environment, program, interval, order)
+    return 0
+}
