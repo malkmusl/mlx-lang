@@ -164,6 +164,55 @@ shot views
 quit
 DEMO
 
+# The editor on the hottest function of the profiles (scanFile): the
+# heat, the code lens, a hover; then a name nobody declared, saved, and the
+# compiler's error on its line, the commit list with that change; undone
+# and saved again (the file is as it was), then Build of its program.
+scan_file=tools/codemap/workarounds.mlx
+git diff --quiet -- "$scan_file" || { echo "observatory_screenshots.sh: $scan_file has changes (the editor pictures edit it)" >&2; exit 2; }
+# It was clean: whatever happens, it is again at the end.
+trap '[[ -n "${KEEP_WORK:-}" ]] || rm -rf -- "$work"; git checkout -q -- "$scan_file"' EXIT
+scan_line=$(grep -n "^fn scanFile(" "$scan_file" | cut -d: -f1)
+use_line=$((scan_line + 2))
+use_text=$(sed -n "${use_line}p" "$scan_file")
+prefix=${use_text%%sourceOf*}
+hover_column=$((${#prefix} + 3))
+prefix=${use_text%%index_module*}
+edit_column=$((${#prefix} + 1))
+cat > "$work/editor.demo" <<DEMO
+settle
+view editor
+select $scan_file/scanFile
+settle
+wait 300
+shot editor
+hoverat $use_line $hover_column
+wait 300
+shot editor-hover
+hoverat 1 1
+cursor $use_line $edit_column
+edit undefinedName + 
+save
+settle
+wait 300
+shot editor-problem
+popup commit
+message Workarounds: a faster scan
+wait 300
+shot commit
+popup none
+undo
+save
+settle
+build
+settle
+shot build
+view map
+settle
+shot map-after-editor
+quit
+DEMO
+
 run_demo() {
     local name=$1
     local runtime
@@ -181,10 +230,13 @@ run_demo() {
     rm -rf -- "$runtime"
 }
 
-say "the tour"
-run_demo tour
-say "the features"
-run_demo features
+# MLX_SHOTS_ONLY=editor (tour, features): only that part.
+for part in tour features editor; do
+    [[ -z "${MLX_SHOTS_ONLY:-}" || "$MLX_SHOTS_ONLY" == "$part" ]] || continue
+    say "the $part"
+    run_demo "$part"
+done
+git diff --quiet -- "$scan_file" || { echo "observatory_screenshots.sh: $scan_file was left changed" >&2; exit 1; }
 
 say "pictures"
 python3 - "$work/frames" "$out" <<'PY'
