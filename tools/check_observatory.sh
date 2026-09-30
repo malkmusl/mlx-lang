@@ -384,6 +384,16 @@ shot problem
 undo
 save
 wait 4000
+program app
+build
+settle
+edit // a line for the commit\n
+save
+settle
+popup commit
+message Observatory check: a line
+commit
+settle
 quit
 DEMO
 printf 'wait 120000\nclose\n' > "$work/hold.script"
@@ -393,6 +403,7 @@ host_pid=$!
 for _ in $(seq 1 50); do [[ -S "$runtime/host-demo" ]] && break; sleep 0.1; done
 status=0
 env -i PATH="$PATH" HOME="$work" XDG_RUNTIME_DIR="$runtime" WAYLAND_DISPLAY=host-demo MLX_CANVAS=cpu MLX_CODEMAP_TRACE=1 \
+    GIT_AUTHOR_NAME=check GIT_AUTHOR_EMAIL=check@mlx GIT_COMMITTER_NAME=check GIT_COMMITTER_EMAIL=check@mlx \
     MLX_COMPILER="$repo_root/$compiler" MLX_CODEMAP_DEMO="$work/check.demo" MLX_CODEMAP_DEMO_OUT="$work/demo" timeout 90 "$work/mlx-observatory" "$tree" > "$work/demo.log" 2>&1 || status=$?
 kill "$host_pid" 2> /dev/null || true
 wait "$host_pid" 2> /dev/null || true
@@ -415,6 +426,16 @@ grep -q "^codemap: definition greet$" "$work/demo.log" && grep -q "^codemap: edi
     || fail "editor: F12 on greet did not open its declaration" "$work/demo.log"
 grep -q "^codemap: saved lib/helper.mlx$" "$work/demo.log" || fail "editor: the file was not saved" "$work/demo.log"
 grep -A3 "^codemap: saved lib/helper.mlx$" "$work/demo.log" | grep -q "^codemap: checked, problems [1-9]" || fail "editor: the compiler's error did not come back" "$work/demo.log"
-tail -5 "$work/demo.log" | grep -q "^codemap: checked, problems 0$" || fail "editor: the error did not go after undo and save" "$work/demo.log"
+grep -A4 "^codemap: demo undo$" "$work/demo.log" | grep -q "^codemap: checked, problems 0$" || fail "editor: the error did not go after undo and save" "$work/demo.log"
 ( cd "$tree" && git diff --quiet -- lib/helper.mlx ) 2> /dev/null || [[ -z "${have_git:-}" ]] || fail "editor: undo and save did not bring the file back" "$work/demo.log"
 echo "ok   editor: open, go to a declaration, edit, save, the compiler's problems, undo"
+# Build: the program app into the tree's mlx-out/bin; Commit: the edit
+# with its message (when the tree is a Git work tree).
+grep -q "^codemap: build done: Built app in [0-9.]* s: mlx-out/bin/app$" "$work/demo.log" && [[ -x "$tree/mlx-out/bin/app" ]] \
+    || fail "build: the program app was not built" "$work/demo.log"
+echo "ok   build: the chosen program, into mlx-out/bin"
+if [[ -n "${have_git:-}" ]]; then
+    grep -q "^codemap: commit done: exit 0$" "$work/demo.log" && [[ "$(git -C "$tree" log -1 --format=%s)" == "Observatory check: a line" ]] \
+        || fail "commit: the edit was not committed with its message" "$work/demo.log"
+    echo "ok   commit: the edit, with its message"
+fi
