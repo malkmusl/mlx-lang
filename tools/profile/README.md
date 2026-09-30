@@ -14,7 +14,11 @@ mlx-profile [-o DIRECTORY] [--every MILLISECONDS] [--wall] PROGRAM [ARGUMENT...]
 - `--every`: how often to stop the program (default 5 ms).
 - `--wall`: count the samples where the program waits in the kernel too.
   By default only samples where it runs count.
-- The main thread is sampled; the program's other threads run on.
+- The main thread is sampled; the program's other threads run on. The
+  program is seized (`PTRACE_SEIZE`) and each stop is a
+  `PTRACE_INTERRUPT` of the main thread alone: a stop signal would halt
+  every thread, and a program waiting on a thread of its own (a Vulkan
+  driver's) would stand still.
 
 At the end it prints the functions most of the time went to:
 

@@ -28,6 +28,7 @@ const SYS_mmap: usize = 9
 const SYS_nanosleep: usize = 35
 const SYS_fork: usize = 57
 const SYS_execve: usize = 59
+const SYS_getpid: usize = 39
 const SYS_exit: usize = 60
 const SYS_wait4: usize = 61
 const SYS_kill: usize = 62
@@ -35,12 +36,19 @@ const SYS_mkdir: usize = 83
 const SYS_ptrace: usize = 101
 const SYS_clock_gettime: usize = 228
 const SYS_process_vm_readv: usize = 310
-const PTRACE_TRACEME: usize = 0
 const PTRACE_CONT: usize = 7
 const PTRACE_GETREGS: usize = 12
 const PTRACE_SETOPTIONS: usize = 16896
+const PTRACE_SEIZE: usize = 16902
+const PTRACE_INTERRUPT: usize = 16903
+const PTRACE_O_TRACEEXEC: usize = 16
 const PTRACE_O_EXITKILL: usize = 1048576
+const PTRACE_EVENT_EXEC: usize = 4
+const PTRACE_EVENT_STOP: usize = 128
 const SIGSTOP: usize = 19
+const SIGCONT: usize = 18
+const WUNTRACED: usize = 2
+const WALL: usize = 1073741824
 const SIGTRAP: usize = 5
 const SIGKILL: usize = 9
 // user_regs_struct: rbp is word 4, rip 16, rsp 19.
@@ -558,19 +566,29 @@ fn running(profiler: *Profiler) -> bool {
     return at + 1 < @bitCast(usize, got) && stat[at + 1] == 82
 }
 
-// Waits for the program to stop or end. 1: stopped by `wanted`; 2: ended;
-// other signals are passed on.
-fn waitFor(profiler: *Profiler, wanted: usize) -> usize {
+// Waits for the program's main thread to stop with `event` (a ptrace event:
+// PTRACE_EVENT_EXEC, or PTRACE_EVENT_STOP after a PTRACE_INTERRUPT) or end.
+// 1: stopped so; 2: ended. Signals are passed on to the program, and its
+// other stops let go on.
+//
+// The program is seized (PTRACE_SEIZE), so an interrupt stops only its
+// main thread. SIGSTOP would stop all its threads and PTRACE_CONT start only
+// the main one again: a program waiting on a thread of its own (a Vulkan
+// driver's) would stand still.
+fn waitFor(profiler: *Profiler, event: usize) -> usize {
     while true {
         var status: [1]u32 = [1]u32{ 0 }
-        const waited = std.linux.syscall4(SYS_wait4, profiler.*.child, @intFromPtr(&status), 1073741824, 0)
+        const waited = std.linux.syscall4(SYS_wait4, profiler.*.child, @intFromPtr(&status), WALL, 0)
         if waited < 0 { return 2 }
         const value = @intCast(usize, status[0])
         if value & 127 == 0 || (value & 127 != 127) { return 2 }
         const signal = (value >> 8) & 255
-        if signal == wanted { return 1 }
-        // Someone else's signal: on to the program.
-        const passed = std.linux.syscall4(SYS_ptrace, PTRACE_CONT, profiler.*.child, 0, signal)
+        const stop_event = (value >> 16) & 255
+        if stop_event == event && (event != PTRACE_EVENT_STOP || signal == SIGTRAP) { return 1 }
+        // A stop of the whole program or another event: on; a signal: on
+        // to the program.
+        const passed_signal = if stop_event != 0 { 0 } else { signal }
+        const passed = std.linux.syscall4(SYS_ptrace, PTRACE_CONT, profiler.*.child, 0, passed_signal)
     }
     return 2
 }
@@ -781,10 +799,12 @@ pub fn main(arguments: [][*]const u8) -> u8 {
     profiler.*.marks = words(MAX_FUNCTIONS)
     profiler.*.slots = words(FUNCTION_SLOTS)
     profiler.*.addressValues = words(ADDRESS_SLOTS)
-    // The program, traced from its first instruction.
+    // The program, traced from its first instruction: it stops itself,
+    // is seized, and goes on to its exec.
     const child = std.linux.syscall0(SYS_fork)
     if child == 0 {
-        const traced = std.linux.syscall4(SYS_ptrace, PTRACE_TRACEME, 0, 0, 0)
+        const self = std.linux.syscall0(SYS_getpid)
+        const stopped_self = std.linux.syscall2(SYS_kill, @bitCast(usize, self), SIGSTOP)
         var program_arguments: [*]const [*]const u8 = undefined
         unsafe { program_arguments = @ptrFromInt([*]const [*]const u8, @intFromPtr(@ptrCast([*]const [*]const u8, arguments)) + first * 8) }
         const ran = std.linux.syscall3(SYS_execve, @intFromPtr(arguments[first]), @intFromPtr(program_arguments), @intFromPtr(environment))
@@ -793,12 +813,15 @@ pub fn main(arguments: [][*]const u8) -> u8 {
     }
     if child < 0 { return 1 }
     profiler.*.child = @bitCast(usize, child)
+    var first_status: [1]u32 = [1]u32{ 0 }
+    const first_wait = std.linux.syscall4(SYS_wait4, profiler.*.child, @intFromPtr(&first_status), WUNTRACED, 0)
+    const seized = std.linux.syscall4(SYS_ptrace, PTRACE_SEIZE, profiler.*.child, 0, PTRACE_O_EXITKILL | PTRACE_O_TRACEEXEC)
+    const woken = std.linux.syscall2(SYS_kill, profiler.*.child, SIGCONT)
     // It stops at the exec.
-    if waitFor(profiler, SIGTRAP) != 1 {
+    if first_wait < 0 || seized != 0 || waitFor(profiler, PTRACE_EVENT_EXEC) != 1 {
         sayError("mlx-profile: the program did not start\n")
         return 1
     }
-    const options = std.linux.syscall4(SYS_ptrace, PTRACE_SETOPTIONS, profiler.*.child, 0, PTRACE_O_EXITKILL)
     readMaps(profiler)
     var sleep: [2]usize = [2]usize{ interval / 1000, (interval % 1000) * 1000000 }
     var skipped: usize = 0
@@ -807,9 +830,9 @@ pub fn main(arguments: [][*]const u8) -> u8 {
         if resumed != 0 { break }
         const slept = std.linux.syscall2(SYS_nanosleep, @intFromPtr(&sleep), 0)
         const was_running = wall || running(profiler)
-        const stopped = std.linux.syscall2(SYS_kill, profiler.*.child, SIGSTOP)
+        const stopped = std.linux.syscall4(SYS_ptrace, PTRACE_INTERRUPT, profiler.*.child, 0, 0)
         if stopped != 0 { break }
-        if waitFor(profiler, SIGSTOP) != 1 { break }
+        if waitFor(profiler, PTRACE_EVENT_STOP) != 1 { break }
         if was_running { sample(profiler) } else { skipped += 1 }
     }
     // The program's name: its file's.
