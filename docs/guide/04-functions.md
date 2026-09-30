@@ -98,6 +98,27 @@ pub fn main() -> void {
 
 (`tests/144_bootstrap_void_main_runtime.mlx`)
 
+The self-hosted compiler also takes `_ = value`: the value is worked out and
+dropped, with no name left over. The bootstrap compiler (`zig build mlx1`)
+does not, so `compiler/` and `std/bootstrap/` keep binding a name:
+
+```mlx
+fn three() -> usize { return 3 }
+
+pub fn main() -> u8 {
+    _ = three()
+    var count: usize = 0
+    _ = count
+    return 0
+}
+```
+
+(`tests/support/discard.mlx`, which `tools/ensure_compiler.sh` also uses to
+ask a compiler whether it knows `_ = value`)
+
+An error union dropped this way still has to be handled: `_ = source()` is
+`MLX-E4008` like `source()` alone, `_ = try source()` is fine.
+
 ## Recursion
 
 Ordinary (self- and mutual-) recursion works without any special

@@ -3,7 +3,8 @@
 #   - the scene shader passes std.spirv.module;
 #   - the command line (the same binary with a command) answers, also
 #     with the workarounds, the kept crashes, the programs and what they
-#     reach, machine code, cycles, layers and the history (with git);
+#     reach, machine code, cycles, layers and the history (with git), and
+#     rewrites the workarounds the compiler no longer needs;
 #   - the app reads the tree, lays it out in 3D and draws it; typing
 #     searches, Enter flies to the result and selects it, with what it
 #     connects to (the function is called from the other file); Escape
@@ -136,7 +137,48 @@ if command -v git > /dev/null; then
     XDG_CACHE_HOME="$work/cache" "$work/mlx-codemap" -C "$tree" churn > "$work/churn.txt"
     grep -q "^lib/helper.mlx:4:8: function greet (2 commits, the file 2)$" "$work/churn.txt" || fail "greet should have two commits" "$work/churn.txt"
     echo "ok   the command line: churn (git blame)"
+    # The workarounds at both commits (each counted from git archive and
+    # kept in the cache, where the app finds them).
+    HOME="$work" XDG_CACHE_HOME= "$work/mlx-codemap" -C "$tree" history > "$work/history.txt" 2> /dev/null
+    [[ $(grep -c "^20[0-9-]* [0-9a-f]\{7\}  2 0 1 1 0 0 0 0 0 0$" "$work/history.txt") -eq 2 ]] \
+        && grep -q "^▄▄ 1 Array casts$" "$work/history.txt" && [[ $(wc -l < "$work/.cache/mlx/codemap/workarounds-v1") -eq 2 ]] \
+        || fail "history should count the two workarounds at both commits and keep them" "$work/history.txt"
+    echo "ok   the command line: history (workarounds per commit)"
+    have_git=1
 fi
+# Rewriting workarounds away: a result bound only to be dropped becomes
+# `_ = ...`, a length counted by hand `.length`; the program still builds
+# and does the same.
+mkdir -p "$work/rewrite/app"
+cat > "$work/rewrite/app/main.mlx" <<'MLX'
+fn three() -> usize { return 3 }
+
+fn size(text: []const u8) -> usize {
+    var length: usize = 0
+    for byte in text { length += 1 }
+    return length
+}
+
+pub fn main() -> u8 {
+    const ignored = three()
+    return @intCast(u8, size("abcd"))
+}
+MLX
+MLX_COMPILER="$repo_root/$compiler" "$work/mlx-codemap" -C "$work/rewrite" rewrite dropped > "$work/rewrite.txt"
+grep -A1 "^app/main.mlx:10: const ignored = three()$" "$work/rewrite.txt" | grep -q "^  -> _ = three()$" \
+    && grep -q "^the compiler accepts them: --apply writes them$" "$work/rewrite.txt" \
+    || fail "rewrite should show const ignored = three() becoming _ = three()" "$work/rewrite.txt"
+MLX_COMPILER="$repo_root/$compiler" "$work/mlx-codemap" -C "$work/rewrite" rewrite dropped --apply > "$work/rewrite.txt"
+MLX_COMPILER="$repo_root/$compiler" "$work/mlx-codemap" -C "$work/rewrite" rewrite counted --apply >> "$work/rewrite.txt"
+grep -q "^    _ = three()$" "$work/rewrite/app/main.mlx" && grep -q "^    length += text.length$" "$work/rewrite/app/main.mlx" \
+    || fail "rewrite --apply did not write both rewrites" "$work/rewrite/app/main.mlx"
+"$compiler" --quiet "$work/rewrite/app/main.mlx" -o "$work/rewritten"
+status=0
+"$work/rewritten" || status=$?
+[[ $status -eq 4 ]] || fail "the rewritten program should still exit with 4, not $status" "$work/rewrite/app/main.mlx"
+"$work/mlx-codemap" -C "$work/rewrite" workarounds > "$work/rewrite.txt"
+[[ ! -s "$work/rewrite.txt" ]] || fail "no workaround should be left after the rewrites" "$work/rewrite.txt"
+echo "ok   the command line: rewrite dropped and counted (preview, --apply)"
 
 # The app: at 1180x760 the sidebar's rows are 26 apart from y 44 (Alles,
 # app, lib).
@@ -217,6 +259,9 @@ run() {
     grep -q "^codemap: shown [0-9]* nodes, findings 0 0 [0-9]* 2 1 [0-9]* [0-9]* [0-9]* 2 [0-9]* 0$" "$log" || fail "codemap ($name): at first everything is shown" "$log"
     grep -q "^codemap: shown [0-9]* nodes, findings 0 0 [0-9]* 0 1 [0-9]* [0-9]* [0-9]* 0 [0-9]* 0$" "$log" || fail "codemap ($name): the lib group's check box did not leave it out" "$log"
     grep -q "^codemap: flying to tree/app/$" "$log" || fail "codemap ($name): the camera did not fly to the group still shown" "$log"
+    if [[ -n "${have_git:-}" ]]; then
+        grep -q "^codemap: trend 2 commits, counted 2$" "$log" || fail "codemap ($name): the workarounds of both commits (history) are not read" "$log"
+    fi
     python3 - "$shots/start.ppm" "$shots/selected.ppm" <<'PY' || fail "codemap ($name): the view or the detail panel is not drawn" "$log"
 import sys
 def load(path):

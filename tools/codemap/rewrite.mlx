@@ -1,0 +1,237 @@
+// Rewriting workarounds away, once the compiler can do without them
+// (tools/codemap/workarounds.mlx finds them):
+//
+//   - dropped: `const ignored = call(...)` (a local nothing reads) becomes
+//     `_ = call(...)`;
+//   - counted: `for byte in text { length += 1 }` becomes
+//     `length += text.length`.
+//
+// The other kinds wait for the compiler (pointer offsets, *[N]T to [*]T,
+// unsafe expressions, float folding, math builtins). Files under compiler/
+// and std/bootstrap/ are left as they are: the bootstrap compiler (zig
+// build mlx1) builds them and knows neither. So are the ones under tests/
+// (what they check is how they are written).
+//
+//     var edits: rewrite_module.Edits = undefined
+//     rewrite_module.init(&edits, allocator)
+//     rewrite_module.plan(&edits, workarounds, index, pattern, prefix)
+//     rewrite_module.apply(&edits, index)
+const std = @import("std")
+const index_module = @import("./index.mlx")
+const workarounds_module = @import("./workarounds.mlx")
+const programs_module = @import("./programs.mlx")
+
+const Index = index_module.Index
+const NONE = index_module.NONE
+pub const Allocator = std.allocator.Allocator
+
+pub const MAX_EDITS: usize = 65536
+const TEXT_SIZE: usize = 4194304
+
+pub const Edits = struct {
+    allocator: Allocator
+    count: usize
+    // Each edit: its file, the bytes it replaces, the text instead (in
+    // text).
+    file: [*]u32
+    start: [*]u32
+    end: [*]u32
+    textStart: [*]u32
+    textEnd: [*]u32
+    text: [*]u8
+    textUsed: usize
+}
+
+fn words(allocator: Allocator, count: usize) -> [*]u32 {
+    unsafe { return @ptrCast([*]u32, allocator.alloc(count * 4 + 4, 16).?) }
+}
+
+pub fn init(edits: *Edits, allocator: Allocator) -> void {
+    edits.*.allocator = allocator
+    edits.*.count = 0
+    edits.*.file = words(allocator, MAX_EDITS)
+    edits.*.start = words(allocator, MAX_EDITS)
+    edits.*.end = words(allocator, MAX_EDITS)
+    edits.*.textStart = words(allocator, MAX_EDITS)
+    edits.*.textEnd = words(allocator, MAX_EDITS)
+    edits.*.text = allocator.alloc(TEXT_SIZE, 16).?
+    edits.*.textUsed = 0
+}
+
+// Whether the pattern can be rewritten (by this tool; the compiler must
+// accept the result too).
+pub fn rewritable(pattern: u8) -> bool {
+    return pattern == workarounds_module.DROPPED || pattern == workarounds_module.COUNTED
+}
+
+// The pattern a word names (dropped, counted, ...); 255: none.
+pub fn patternNamed(word: []const u8) -> u8 {
+    if index_module.sameBytes(word, "dropped") { return workarounds_module.DROPPED }
+    if index_module.sameBytes(word, "counted") { return workarounds_module.COUNTED }
+    if index_module.sameBytes(word, "pointers") { return workarounds_module.POINTER_MATH }
+    if index_module.sameBytes(word, "casts") { return workarounds_module.ARRAY_CAST }
+    if index_module.sameBytes(word, "unsafe") { return workarounds_module.UNSAFE_SET }
+    if index_module.sameBytes(word, "arena") { return workarounds_module.ARENA }
+    if index_module.sameBytes(word, "floats") { return workarounds_module.FLOATS }
+    if index_module.sameBytes(word, "math") { return workarounds_module.MATH }
+    if index_module.sameBytes(word, "comments") { return workarounds_module.COMMENT }
+    return 255
+}
+
+fn startsWith(text: []const u8, prefix: []const u8) -> bool {
+    return text.length >= prefix.length && index_module.sameBytes(text[0..prefix.length], prefix)
+}
+
+// Files the bootstrap compiler builds, and the tests (left as they are).
+fn bootstrapped(path: []const u8) -> bool {
+    return startsWith(path, "compiler/") || startsWith(path, "std/bootstrap/") || startsWith(path, "tests/")
+}
+
+fn addText(edits: *Edits, text: []const u8) -> void {
+    for byte in text {
+        if edits.*.textUsed < TEXT_SIZE {
+            edits.*.text[edits.*.textUsed] = byte
+            edits.*.textUsed += 1
+        }
+    }
+}
+
+fn addEdit(edits: *Edits, file: u32, start: usize, end: usize) -> void {
+    if edits.*.count >= MAX_EDITS { return }
+    const at = edits.*.count
+    edits.*.file[at] = file
+    edits.*.start[at] = @intCast(u32, start)
+    edits.*.end[at] = @intCast(u32, end)
+    edits.*.textStart[at] = @intCast(u32, edits.*.textUsed)
+    edits.*.count += 1
+}
+
+fn closeEdit(edits: *Edits) -> void {
+    edits.*.textEnd[edits.*.count - 1] = @intCast(u32, edits.*.textUsed)
+}
+
+pub fn replacement(edits: *Edits, edit: usize) -> []const u8 {
+    return edits.*.text[edits.*.textStart[edit]..edits.*.textEnd[edit]]
+}
+
+// The edits for every place of `pattern` in files under `prefix` (a path
+// relative to the root; empty: all).
+pub fn plan(edits: *Edits, workarounds: *workarounds_module.Workarounds, index: *Index, pattern: u8, prefix: []const u8) -> void {
+    edits.*.count = 0
+    edits.*.textUsed = 0
+    var place: usize = 0
+    while place < workarounds.*.count {
+        if workarounds.*.pattern[place] == pattern {
+            const file = workarounds.*.file[place]
+            const path = programs_module.relativePath(index, file)
+            if startsWith(path, prefix) && !bootstrapped(path) {
+                const source = index_module.sourceOf(index, file)
+                const offset = @intCast(usize, workarounds.*.offset[place])
+                if pattern == workarounds_module.DROPPED { planDropped(edits, file, source, offset) }
+                if pattern == workarounds_module.COUNTED { planCounted(edits, file, source, offset) }
+            }
+        }
+        place += 1
+    }
+}
+
+// `const NAME = VALUE` (the name at `offset`; a type may follow it): the
+// part up to and with "=" becomes "_ =".
+fn planDropped(edits: *Edits, file: u32, source: []const u8, offset: usize) -> void {
+    if offset < 6 || !index_module.sameBytes(source[offset - 6..offset], "const ") { return }
+    var at = offset
+    while at < source.length && source[at] != 10 && source[at] != 61 { at += 1 }
+    if at + 1 >= source.length || source[at] != 61 || source[at + 1] != 32 { return }
+    addEdit(edits, file, offset - 6, at + 1)
+    addText(edits, "_ =")
+    closeEdit(edits)
+}
+
+// `for X in Y { Z += 1 }` on one line becomes `Z += Y.length`.
+fn planCounted(edits: *Edits, file: u32, source: []const u8, offset: usize) -> void {
+    var end = offset
+    while end < source.length && source[end] != 10 { end += 1 }
+    var close = end
+    while close > offset && (source[close - 1] == 32 || source[close - 1] == 9) { close -= 1 }
+    const line = source[offset..close]
+    // The iterable: after " in ", up to " {".
+    var in_at: usize = 0
+    while in_at + 4 <= line.length && !index_module.sameBytes(line[in_at..in_at + 4], " in ") { in_at += 1 }
+    var brace = in_at + 4
+    while brace + 2 <= line.length && !index_module.sameBytes(line[brace..brace + 2], " {") { brace += 1 }
+    if in_at + 4 > line.length || brace + 2 > line.length { return }
+    const iterable = line[in_at + 4..brace]
+    // The counter: before " += 1 }".
+    if line.length < 8 || !index_module.sameBytes(line[line.length - 7..line.length], " += 1 }") { return }
+    var counter_start = brace + 2
+    while counter_start < line.length && line[counter_start] == 32 { counter_start += 1 }
+    const counter = line[counter_start..line.length - 7]
+    if counter.length == 0 || iterable.length == 0 { return }
+    var simple = true
+    for byte in iterable {
+        if byte == 32 { simple = false }
+    }
+    addEdit(edits, file, offset, close)
+    addText(edits, counter)
+    addText(edits, " += ")
+    if !simple { addText(edits, "(") }
+    addText(edits, iterable)
+    if !simple { addText(edits, ")") }
+    addText(edits, ".length")
+    closeEdit(edits)
+}
+
+// Writes the edited files; how many.
+pub fn apply(edits: *Edits, index: *Index) -> usize {
+    var written: usize = 0
+    var edit: usize = 0
+    while edit < edits.*.count {
+        const file = edits.*.file[edit]
+        // This file's edits (they come together, in order).
+        var last = edit
+        while last < edits.*.count && edits.*.file[last] == file { last += 1 }
+        if writeFile(edits, index, file, edit, last) { written += 1 }
+        edit = last
+    }
+    return written
+}
+
+fn writeFile(edits: *Edits, index: *Index, file: u32, first: usize, last: usize) -> bool {
+    const source = index_module.sourceOf(index, file)
+    const path = index_module.pathOf(index, file)
+    var z: [4096]u8 = undefined
+    var bytes: [*]u8 = undefined
+    unsafe { bytes = @ptrCast([*]u8, &z) }
+    if path.length >= 4000 { return false }
+    var length: usize = 0
+    for byte in path {
+        bytes[length] = byte
+        length += 1
+    }
+    bytes[length] = 0
+    const handle = std.fs.open(bytes, 577, 420)
+    if !std.fs.isValid(handle) { return false }
+    var at: usize = 0
+    var edit = first
+    var ok = true
+    while edit < last {
+        const start = @intCast(usize, edits.*.start[edit])
+        const end = @intCast(usize, edits.*.end[edit])
+        if start >= at && end <= source.length {
+            ok = ok && writeBytes(handle, source[at..start])
+            ok = ok && writeBytes(handle, replacement(edits, edit))
+            at = end
+        }
+        edit += 1
+    }
+    ok = ok && writeBytes(handle, source[at..source.length])
+    const closed = std.fs.close(handle)
+    return ok
+}
+
+fn writeBytes(handle: std.fs.File, text: []const u8) -> bool {
+    if text.length == 0 { return true }
+    var pointer: [*]const u8 = undefined
+    unsafe { pointer = @ptrCast([*]const u8, text) }
+    return std.fs.writeAllBytes(handle, pointer, text.length)
+}

@@ -188,6 +188,7 @@ Each stage of `<ImplementationPipeline>` is an ordinary Mlx module:
 | XML tokenizer / pull parser | `std.xml` (`std/src/xml.mlx`) | `tests/240_std_xml_tokenizer_runtime.mlx` |
 | protocol parser, AST, validation | `std.wayland.protocol` | `tests/241_wayland_protocol_parser_runtime.mlx` |
 | typed declaration generation | `std.wayland.materialize` | `tests/246_wayland_generated_api_runtime.mlx` |
+| image-copy capture family | `std.wayland.materialize` | `tests/246_wayland_image_capture_generated_api_runtime.mlx` |
 | ordinary `std.wayland` module | `std/src/wayland.mlx` + `generated/` | `tests/244_wayland_client_server_runtime.mlx` |
 
 `std.xml` is an allocation-free pull tokenizer. It reports declarations,

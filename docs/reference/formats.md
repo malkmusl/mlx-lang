@@ -103,6 +103,28 @@ imports or exports is still the static executable described above
 (`tests/run_foreign.sh` checks that, and runs
 `tests/247_foreign_c_runtime.mlx`).
 
+## Symbol table and line table
+
+After an executable is written, `compiler/selfhost/object/symbol_table.mlx`
+adds three sections to it:
+
+- `.symtab` and `.strtab`: every function named where it is declared,
+  `path:line:name` (the module's path as the compiler loaded it, the line
+  of the function's name), next to the runtime's own `_start` and
+  `__mlx_*` routines. `nm`, `gdb` and `perf` show these names.
+- `.mlx_lines`: where the machine code of each source line starts. It is
+  `"MLXLINES"`, the number of entries and of files (u32 each), then per
+  entry the code offset from `.text`, the file and the line (u32 each,
+  lines from 1), then the files' paths, each ended by a NUL.
+
+The crash handler of the desktop programs
+(`examples/wayland-compositor/crash.mlx`) reads both from `/proc/self/exe`
+and writes each frame as `path:line:name+0xOFFSET at path:line`;
+`tools/check_crash_report.sh` crashes `tests/support/crash_report.mlx`
+three ways and checks the lines it names. The sampling profiler
+`mlx-profile` (`tools/profile/`) names the functions it samples the same
+way; `tools/check_profile.sh` profiles `tests/support/profile_busy.mlx`.
+
 ## Shared objects
 
 `mlx4 --shared FILE -o libNAME.so` writes the same image as a shared object

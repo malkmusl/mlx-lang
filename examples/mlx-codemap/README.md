@@ -68,6 +68,23 @@ each group are joined by magenta lines in space.
   | `sqrt`, `sin`, `exp`, ... written in Mlx | math builtins |
   | comments: workaround, miscompilation, "does not yet", TODO, FIXME, HACK | what the comment names |
 
+  Two kinds can be rewritten away, now that the compiler does without
+  them: `mlx-codemap rewrite dropped [PATH]` turns `const ignored =
+  call(...)` into `_ = call(...)`, `mlx-codemap rewrite counted [PATH]`
+  turns `for byte in text { length += 1 }` into `length += text.length`
+  ([`tools/codemap/rewrite.mlx`](../../tools/codemap/rewrite.mlx)). It
+  shows each line before and after; `--apply` writes them, and only when
+  the compiler (`$MLX_COMPILER`, else `mlx-out/bin/compiler/mlx4`, else
+  `mlx4`) builds a program with what they need. Files under `compiler/`,
+  `std/bootstrap/` (the bootstrap compiler builds them) and `tests/` are
+  left as they are.
+
+  `mlx-codemap history [N]` counts the workarounds of each kind at the
+  last N commits (20) and draws each kind's course as a row of bars
+  ([`tools/codemap/trend.mlx`](../../tools/codemap/trend.mlx)). Each
+  commit is taken out with `git archive` and counted once; the counts are
+  kept in `~/.cache/mlx/codemap/workarounds-v1`.
+
 - **Crashes:** what the desktop programs kept when they crashed, newest
   first, each with the function it stopped in and the functions that called
   it (red). The calls are drawn as red lines in space.
@@ -206,7 +223,9 @@ findings.
   in the panel and ticks it.
 - **Workarounds:** the arrow opens the kinds of workarounds, each with a
   check box and how many places it has in what is shown. The list and
-  the places in space follow them.
+  the places in space follow them. Once `mlx-codemap history` has counted
+  the last commits, a small bar chart next to each kind shows how it went
+  (the oldest commit on the left).
 - **Show:** the imports, the tree's lines and the names.
 - **Kinds:** functions, structs and unions, enums, constants, variables,
   fields and tests (a struct left out takes its members with it). The
@@ -274,6 +293,7 @@ mlx-codemap [-C ROOT] stats | files [TEXT] | outline FILE | find TEXT |
     programs | reach PROGRAM [PATH] | unreachable [PATH] |
     untested [PATH] | sizes [PROGRAM] [PATH] | complex [PATH] | cycles |
     layers | churn [PATH] | risky [PATH] | hot [PATH] | crashes [PATH] |
+    rewrite PATTERN [PATH] [--apply] | history [N] | workarounds-count |
     unresolved [FILE] | json
 ```
 
@@ -285,7 +305,10 @@ answers are `path:line:col: kind Qualified.name` lines.
 `tools/check_codemap.sh` does the following:
 
 1. Validates the shader.
-2. Asks the command line, also for the workarounds and a kept crash.
+2. Asks the command line, also for the workarounds and a kept crash, the
+   workarounds at both commits of the tree (`history`), and rewrites a
+   dropped result and a counted length in a program that must still build
+   and exit the same.
 3. Runs the app under `tools/wayland-test-host` on a small tree, first on
    lavapipe, then on the CPU. In each run it searches, selects, checks the
    connections of what was selected, clicks a group and then its check box.
