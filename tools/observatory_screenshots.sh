@@ -44,9 +44,25 @@ done
 HOME="$home" "$work/bin/mlx-observatory" -C "$repo_root" churn > /dev/null
 HOME="$home" "$work/bin/mlx-observatory" -C "$repo_root" history 20 > /dev/null 2>&1
 
+# The editor on the hottest function of the profiles (scanFile): the
+# heat, the code lens, a hover; then a name nobody declared, saved, and the
+# compiler's error on its line, the commit list with that change; undone
+# and saved again (the file is as it was), then Build of its program.
+scan_file=tools/codemap/workarounds.mlx
+git diff --quiet -- "$scan_file" || { echo "observatory_screenshots.sh: $scan_file has changes (the editor pictures edit it)" >&2; exit 2; }
+# It was clean: whatever happens, it is again at the end.
+trap '[[ -n "${KEEP_WORK:-}" ]] || rm -rf -- "$work"; git checkout -q -- "$scan_file"' EXIT
+scan_line=$(grep -n "^fn scanFile(" "$scan_file" | cut -d: -f1)
+use_line=$((scan_line + 2))
+use_text=$(sed -n "${use_line}p" "$scan_file")
+prefix=${use_text%%sourceOf*}
+hover_column=$((${#prefix} + 3))
+prefix=${use_text%%index_module*}
+edit_column=$((${#prefix} + 1))
+
 # The tour (a GIF), then a picture per feature. Each is its own run (they
 # start from the same view).
-cat > "$work/tour.demo" <<'DEMO'
+cat > "$work/tour.demo" <<DEMO
 settle
 spin 220
 record tour1 24 100
@@ -63,6 +79,13 @@ record tour5 8 150
 metric kind
 finding crashes
 record tour6 8 150
+finding none
+view editor
+select $scan_file/scanFile
+settle
+record tour7 6 150
+hoverat $use_line $hover_column
+record tour8 8 150
 quit
 DEMO
 
@@ -164,21 +187,6 @@ shot views
 quit
 DEMO
 
-# The editor on the hottest function of the profiles (scanFile): the
-# heat, the code lens, a hover; then a name nobody declared, saved, and the
-# compiler's error on its line, the commit list with that change; undone
-# and saved again (the file is as it was), then Build of its program.
-scan_file=tools/codemap/workarounds.mlx
-git diff --quiet -- "$scan_file" || { echo "observatory_screenshots.sh: $scan_file has changes (the editor pictures edit it)" >&2; exit 2; }
-# It was clean: whatever happens, it is again at the end.
-trap '[[ -n "${KEEP_WORK:-}" ]] || rm -rf -- "$work"; git checkout -q -- "$scan_file"' EXIT
-scan_line=$(grep -n "^fn scanFile(" "$scan_file" | cut -d: -f1)
-use_line=$((scan_line + 2))
-use_text=$(sed -n "${use_line}p" "$scan_file")
-prefix=${use_text%%sourceOf*}
-hover_column=$((${#prefix} + 3))
-prefix=${use_text%%index_module*}
-edit_column=$((${#prefix} + 1))
 cat > "$work/editor.demo" <<DEMO
 settle
 view editor
