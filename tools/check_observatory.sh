@@ -462,6 +462,12 @@ branch-switch -
 program app
 build
 settle
+run
+settle
+popup run
+wait 300
+shot run
+popup none
 edit // a line for the commit\n
 save
 settle
@@ -579,6 +585,10 @@ echo "ok   sidebar: a new folder, a new file in it (made, read, opened)"
 grep -q "^codemap: build done: Built app in [0-9.]* s: mlx-out/bin/app$" "$work/demo.log" && [[ -x "$tree/mlx-out/bin/app" ]] \
     || fail "build: the program app was not built" "$work/demo.log"
 echo "ok   build: the chosen program, into mlx-out/bin"
+# Run: built again, started, its end said (in Build's list, the shot run).
+grep -q "^codemap: run app$" "$work/demo.log" && grep -q "^codemap: run ended [0-9]*$" "$work/demo.log" \
+    && head -c 15 "$work/demo/run.ppm" 2> /dev/null | grep -q "^P6$" || fail "run: the program app did not run from Build's list" "$work/demo.log"
+echo "ok   run: Build's list builds the program and starts it, and says how it ended"
 if [[ -n "${have_git:-}" ]]; then
     grep -q "^codemap: commit done: exit 0$" "$work/demo.log" && [[ "$(git -C "$tree" log -1 --format=%s)" == "Observatory check: a line" ]] \
         || fail "commit: the edit was not committed with its message" "$work/demo.log"

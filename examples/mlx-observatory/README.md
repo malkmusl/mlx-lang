@@ -441,6 +441,11 @@ What the map knows is in the editor, where the code is:
   knows (the declaration too), in every file; the tabs and the map read
   them again. Not while a file involved holds edits or changed since the
   map read it.
+- **Folding:** the arrow left of a line that opens a function, struct,
+  union or enum body (any `{` whose block spans lines) folds it into
+  `{ … N lines }`; a click on that, the arrow again, or the cursor moving
+  into it opens it. Ctrl+Shift+[ folds the block around the cursor,
+  Ctrl+Shift+] opens it. Folds move with the edits above them.
 - **Map and editor together:** the panel follows the declaration at the
   cursor; *Show in map* switches to the map and flies there.
 - **The compiler's problems:** each file is checked when it opens and
@@ -480,12 +485,13 @@ the whole code again, which it does when files change on disk.
 | F12, Ctrl+click | go to the declaration |
 | Shift+F12 | the references |
 | F2 | rename |
+| Ctrl+Shift+[, Ctrl+Shift+] | fold the block at the cursor, open it |
 | Ctrl+Space | completion |
 | Escape | close a list or the signature, drop the selection (the file stays) |
 | Ctrl+E | back to the map |
 | Ctrl+Shift+O | open the file in the outside editor (`MLX_EDITOR`, else VS Code, else `xdg-open`) |
 
-## Build and commit
+## Build, run, profile and commit
 
 **Build** (toolbar, Ctrl+B) saves the edited tabs and builds a program
 into `ROOT/mlx-out/bin/NAME` in the background: in the editor, the
@@ -495,6 +501,23 @@ one chosen under Program. The status bar says how long it took; a failed
 build opens its first error in the editor. The new binary's machine code
 goes on the declarations at once.
 
+The arrow on the button opens its list ([`run.mlx`](run.mlx)):
+
+- **Build** (Ctrl+B) as above.
+- **Run** (F5) builds, then starts the program in the root, with the
+  Observatory's environment (its window opens on the same display).
+  While it runs the button stops it (so does F5).
+- **Profile** (Ctrl+F5) builds, then runs it under `mlx-profile` (the
+  root's `mlx-out/bin`, next to the Observatory, else the `PATH`); when
+  it ends its profile is read, for *Color by Run time* and the Hot
+  finding.
+
+The button does what was chosen last. Under the three, the list shows
+the last lines the program wrote (its output and its errors) and how it
+ended; the status bar says it too. A crash is the crash handler's line
+(in red), and the crash is on the map and in the editor at once (the
+crash log is read then, not two seconds later).
+
 **Commit** is in the history (*Since HEAD* in the toolbar, Ctrl+K; the
 number on it is how many files changed): at its top the changed files
 (`git status`) and a message, below the commits Changed can compare
@@ -503,6 +526,14 @@ saves the edited tabs and runs `git add -A` and `git commit`; Ctrl+Enter
 or *Commit and push* also runs `git push -u origin HEAD`. Git runs in the
 background; the status bar says how it went (with Git's own error when it
 failed), and Changed and the editor's marks follow.
+
+**Branches** are at the history's top: the branch checked out, a click
+on it lists the local branches (a click on one switches to it, `git
+switch`), and *New branch* asks for a name and makes it (`git switch
+-c`). The tabs without edits and the map follow the files of the branch.
+Below, **the graph**: the last 30 commits of all branches (local and
+remote) with their lanes, the branches and tags on each as pills, and
+their subjects; a click on a commit makes it the base of Changed.
 
 The compiler for checks and Build is `$MLX_COMPILER`, else the root's
 `mlx-out/bin/compiler/mlx4`, else `mlx4` on the `PATH`.
@@ -531,13 +562,17 @@ The compiler for checks and Build is `$MLX_COMPILER`, else the root's
 | Ctrl+O, "Open in editor" | open it at its line in the editor |
 | Ctrl+Shift+O | open it in the outside editor: `MLX_EDITOR`, else VS Code (`code -g`), else `xdg-open` |
 | Ctrl+E, View (sidebar) | switch between the map and the editor |
-| Ctrl+B, Build | build (see Build and commit) |
+| Ctrl+B, Build | build (see Build, run, profile and commit) |
+| F5, Ctrl+F5 | run, profile (the Build button's list; F5 again stops it) |
 | Ctrl+K, Since ... (toolbar) | the history: commit, or commit and push |
-| F5, Ctrl+R | read the code again, keeping the selection (files changed on disk are read again by themselves) |
+| Ctrl+R | read the code again, keeping the selection (files changed on disk are read again by themselves) |
 | Ctrl+W | close (with tabs not saved: press it twice) |
 
 The sidebar lists the groups, and the groups inside them on the way to
 what is selected, with how many files each holds. A click flies there.
+The pointer on a group shows two buttons at its right: a new file and a
+new folder in it. A name and Enter make it (a file without an extension
+gets `.mlx`); a new file opens in the editor, and the map reads it.
 
 The sidebar's check boxes choose what is shown. What is left out is not
 drawn, not found by the search, and not counted or listed in the
@@ -578,6 +613,11 @@ The panel lists the connections by kind:
 
 A click on a connection flies there. While typing a search, what does not
 match fades.
+
+The hover, the lists (history, Filter, Build, search results, completion,
+references), the signature help, the rename and new file fields and the
+blame fade in over 140 ms and slide the last pixels into place, instead
+of popping up.
 
 ## How it works
 

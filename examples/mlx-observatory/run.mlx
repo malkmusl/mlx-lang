@@ -1,0 +1,206 @@
+// Run and Profile: a built program started from MLX Observatory, in the
+// background, in the workspace and with the Observatory's environment (so
+// its window opens on the same display). What it writes (its output and
+// its errors) is kept, the last OUTPUT bytes; when it ends, how. Profile
+// starts it under mlx-profile (tools/profile), which writes the profile
+// the Observatory then reads for Run time.
+const std = @import("std")
+
+const SYS_read: usize = 0
+const SYS_close: usize = 3
+const SYS_dup2: usize = 33
+// vfork: the child only runs execve (the Observatory's memory is big).
+const SYS_vfork: usize = 58
+const SYS_execve: usize = 59
+const SYS_exit: usize = 60
+const SYS_wait4: usize = 61
+const SYS_kill: usize = 62
+const SYS_chdir: usize = 80
+const SYS_pipe2: usize = 293
+const O_CLOEXEC: usize = 524288
+const O_NONBLOCK: usize = 2048
+const WNOHANG: usize = 1
+const SIGTERM: usize = 15
+
+pub const OUTPUT: usize = 16384
+
+pub const Run = struct {
+    running: bool
+    pid: isize
+    pipe: isize
+    // Its output ended (the pipe closed); the process may still be there.
+    drained: bool
+    started: usize
+    ended: usize
+    // How it ended: its exit code, or 128 + the signal that ended it
+    // (-1: it has not ended yet).
+    status: i32
+    profiled: bool
+    stopped: bool
+    output: [16384]u8
+    outputLength: usize
+}
+
+pub fn init(run: *Run) -> void {
+    run.*.running = false
+    run.*.pid = 0
+    run.*.pipe = -1
+    run.*.drained = true
+    run.*.started = 0
+    run.*.ended = 0
+    run.*.status = -1
+    run.*.profiled = false
+    run.*.stopped = false
+    run.*.outputLength = 0
+}
+
+fn outputBytes(run: *Run) -> [*]u8 {
+    unsafe { return @ptrFromInt([*]u8, @intFromPtr(run) + @offsetOf(Run, "output")) }
+}
+
+pub fn output(run: *Run) -> []const u8 { return outputBytes(run)[0..run.*.outputLength] }
+
+// Starts `program` (NUL-terminated), under `profiler` when that is not
+// empty (NUL-terminated too), in `root` (NUL-terminated); false when it
+// did not start (or one still runs).
+pub fn start(run: *Run, root: [*]const u8, program: [*]const u8, profiler: [*]const u8, environment: [*][*]const u8, now: usize) -> bool {
+    if run.*.running { return false }
+    var pipes: [2]i32 = [2]i32{ -1, -1 }
+    var made: isize = 0
+    unsafe { made = std.linux.syscall2(SYS_pipe2, @intFromPtr(&pipes), O_CLOEXEC | O_NONBLOCK) }
+    if made != 0 { return false }
+    const profiled = profiler[0] != 0
+    const child = std.linux.syscall0(SYS_vfork)
+    if child == 0 {
+        const out = std.linux.syscall2(SYS_dup2, @intCast(usize, pipes[1]), 1)
+        const err = std.linux.syscall2(SYS_dup2, @intCast(usize, pipes[1]), 2)
+        const moved = std.linux.syscall1(SYS_chdir, @intFromPtr(root))
+        var arguments: [3][*]const u8 = undefined
+        arguments[0] = if profiled { profiler } else { program }
+        unsafe {
+            arguments[1] = if profiled { program } else { @ptrFromInt([*]const u8, 0) }
+            arguments[2] = @ptrFromInt([*]const u8, 0)
+        }
+        const ran = std.linux.syscall3(SYS_execve, @intFromPtr(arguments[0]), @intFromPtr(&arguments), @intFromPtr(environment))
+        const exited = std.linux.syscall1(SYS_exit, 127)
+    }
+    const writing = std.linux.syscall1(SYS_close, @intCast(usize, pipes[1]))
+    if child < 0 {
+        const reading = std.linux.syscall1(SYS_close, @intCast(usize, pipes[0]))
+        return false
+    }
+    run.*.pid = child
+    run.*.pipe = @intCast(isize, pipes[0])
+    run.*.drained = false
+    run.*.running = true
+    run.*.started = now
+    run.*.ended = 0
+    run.*.status = -1
+    run.*.profiled = profiled
+    run.*.stopped = false
+    run.*.outputLength = 0
+    return true
+}
+
+// Keeps `bytes` at the end of the output (the oldest go when it is full).
+fn keep(run: *Run, bytes: [*]const u8, count: usize) -> void {
+    const kept = outputBytes(run)
+    var from: usize = 0
+    if count > OUTPUT { from = count - OUTPUT }
+    const adding = count - from
+    if run.*.outputLength + adding > OUTPUT {
+        const drop = run.*.outputLength + adding - OUTPUT
+        var at: usize = 0
+        while at + drop < run.*.outputLength {
+            kept[at] = kept[at + drop]
+            at += 1
+        }
+        run.*.outputLength -= drop
+    }
+    var at: usize = 0
+    while at < adding {
+        kept[run.*.outputLength] = bytes[from + at]
+        run.*.outputLength += 1
+        at += 1
+    }
+}
+
+// Reads what came; true when the program has just ended (status says how).
+pub fn pump(run: *Run, now: usize) -> bool {
+    if !run.*.running { return false }
+    var buffer: [4096]u8 = undefined
+    while !run.*.drained {
+        var count: isize = 0
+        unsafe { count = std.linux.syscall3(SYS_read, @bitCast(usize, run.*.pipe), @intFromPtr(&buffer), 4096) }
+        if count > 0 {
+            unsafe { keep(run, @ptrCast([*]const u8, &buffer), @bitCast(usize, count)) }
+        } else if count == 0 {
+            run.*.drained = true
+        } else {
+            // Nothing now (EAGAIN).
+            break
+        }
+    }
+    var status: i32 = 0
+    var waited: isize = 0
+    unsafe { waited = std.linux.syscall4(SYS_wait4, @bitCast(usize, run.*.pid), @intFromPtr(&status), WNOHANG, 0) }
+    if waited == 0 { return false }
+    // Ended: what is left in the pipe, then it is closed.
+    if !run.*.drained {
+        while true {
+            var count: isize = 0
+            unsafe { count = std.linux.syscall3(SYS_read, @bitCast(usize, run.*.pipe), @intFromPtr(&buffer), 4096) }
+            if count <= 0 { break }
+            unsafe { keep(run, @ptrCast([*]const u8, &buffer), @bitCast(usize, count)) }
+        }
+    }
+    const closed = std.linux.syscall1(SYS_close, @bitCast(usize, run.*.pipe))
+    run.*.pipe = -1
+    run.*.drained = true
+    run.*.running = false
+    run.*.ended = now
+    run.*.status = if waited < 0 { 255 } else if status & 127 == 0 { (status >> 8) & 255 } else { 128 + (status & 127) }
+    return true
+}
+
+// Asks the program to end (SIGTERM; under mlx-profile the profiler, which
+// ends it and writes the profile).
+pub fn stop(run: *Run) -> void {
+    if !run.*.running { return }
+    run.*.stopped = true
+    const asked = std.linux.syscall2(SYS_kill, @bitCast(usize, run.*.pid), SIGTERM)
+}
+
+// The last `wanted` lines of the output (at most 16): where each starts
+// and ends in `output(run)`; how many there are.
+pub fn lastLines(run: *Run, wanted: usize, starts: *[16]usize, ends: *[16]usize) -> usize {
+    const text = output(run)
+    var count: usize = 0
+    var end = text.length
+    // A last line without its newline counts; a newline at the very end
+    // does not start one.
+    if end > 0 && text[end - 1] == 10 { end -= 1 }
+    while end > 0 && count < wanted && count < 16 {
+        var start = end
+        while start > 0 && text[start - 1] != 10 { start -= 1 }
+        starts.*[count] = start
+        ends.*[count] = end
+        count += 1
+        end = if start > 0 { start - 1 } else { 0 }
+        if start == 0 { break }
+    }
+    // Oldest first.
+    var low: usize = 0
+    var high = count
+    while high > low + 1 {
+        high -= 1
+        const start_kept = starts.*[low]
+        const end_kept = ends.*[low]
+        starts.*[low] = starts.*[high]
+        ends.*[low] = ends.*[high]
+        starts.*[high] = start_kept
+        ends.*[high] = end_kept
+        low += 1
+    }
+    return count
+}
