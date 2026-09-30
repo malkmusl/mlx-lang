@@ -175,6 +175,19 @@ is exactly that mechanism: the length travels as a real ABI value, not
 something recovered from the pointee, which is what lets a callee's
 bounds check on a parameter slice be sound.
 
+Stored, a slice is written whole as well: assigning to a slice local
+(again, from a literal, a call, a sub-slice or inside a loop) writes both
+of its components, and assigning to a field of slice type writes the
+length 8 bytes after the pointer. An optional slice (`?[]const u8`) is the
+slice itself, two words in registers and in memory, with null as pointer
+0 and length 0; `null` passed, returned or assigned where one is wanted
+becomes that pair, so the arguments after it keep their registers. Before,
+assignment wrote the pointer only (a local kept its old length, a field had
+none) and an optional slice was one word, so its length was lost on the way
+(`tests/274_slice_assignment_runtime.mlx`). The nullable strings of the
+generated Wayland requests (`wl_data_offer.accept`) are such optional
+slices.
+
 ## Aggregate (struct/array) argument and return classification
 
 `AggregateClassification` in `mlxcc-x86_64.xml` fixes the size threshold:
