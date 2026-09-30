@@ -721,8 +721,11 @@ The compiler writes a symbol table that names every function
 is the line the address is on; the handler (`crash.mlx`) reads it from the file each
 address is in (the compositor, one of its modules, a C library:
 `/proc/self/maps` says which) and follows the frame pointers to the
-callers. A recursion is said once (`(22 more times)`). The dock, the file
-manager and the other desktop programs install the same handler.
+callers. A recursion is said once (`(22 more times)`). An abort (a C
+library giving up: an assertion in a driver, memory freed twice) and a
+trap are reported the same way. The dock, the top bar, the launcher,
+the settings, the file manager and the Observatory install the same
+handler.
 
 Each crash is also kept, as a line in `$XDG_STATE_HOME/mlx/crashes.log`
 (`~/.local/state/mlx/crashes.log`). MLX Observatory

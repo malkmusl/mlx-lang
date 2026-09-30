@@ -3,7 +3,7 @@
 # crash.mlx) end to end, on tests/support/crash_report.mlx:
 #   - the compiler names every function path:line:name in the symbol table,
 #     and its line table says the line of each address;
-#   - a failed runtime check, a bad store and a stack overflow each say the
+#   - a failed runtime check, a bad store, a stack overflow and an abort each say the
 #     function they happened in and the functions that called it;
 #   - each crash is kept as a line in $XDG_STATE_HOME/mlx/crashes.log.
 #
@@ -50,9 +50,14 @@ grep -q 'the stack ran out' "$work/deep.out" || fail "the overflow is not recogn
 grep -q '^  from tests/support/crash_report.mlx:21:deeper+0x[0-9a-f]* at tests/support/crash_report.mlx:24 ([0-9]* more times)$' "$work/deep.out" || fail "the recursion is not said once" "$work/deep.out"
 echo "ok   a stack overflow names the recursion once"
 
+run abort 134
+grep -q '^crashy: crashed: aborted' "$work/abort.out" || fail "an abort is not reported" "$work/abort.out"
+grep -q '^  from tests/support/crash_report.mlx:[0-9]*:main+0x' "$work/abort.out" || fail "the abort does not name main" "$work/abort.out"
+echo "ok   an abort (a C library giving up) is reported too"
+
 log="$work/state/mlx/crashes.log"
 [[ -f "$log" ]] || fail "no crashes.log"
-[[ $(wc -l < "$log") -eq 3 ]] || fail "crashes.log does not hold three crashes" "$log"
+[[ $(wc -l < "$log") -eq 4 ]] || fail "crashes.log does not hold four crashes" "$log"
 awk -F'\t' '$1 != "crash" || $2 !~ /^[0-9]+$/ || $3 != "crashy" || NF < 5 { bad = 1 } END { exit bad }' "$log" || fail "crashes.log lines are not crash/time/program/reason/frames" "$log"
 grep -q "	tests/support/crash_report.mlx:12:middle+0x[0-9a-f]* at tests/support/crash_report.mlx:9	" "$log" || fail "the kept crash has no frames" "$log"
 echo "ok   every crash is kept in \$XDG_STATE_HOME/mlx/crashes.log"
