@@ -1,24 +1,24 @@
 #!/usr/bin/env bash
-# The pictures of MLX Codemap's README (examples/mlx-codemap/screenshots),
+# The pictures of MLX Observatory's README (examples/mlx-observatory/screenshots),
 # taken of this whole repository, with real data behind every finding:
 #   - crashes kept by tests/support/crash_report.mlx (crashed three ways);
-#   - profiles of mlx-codemap itself under mlx-profile;
-#   - built programs (mlx-codemap, mlx-lsp, mlx-files) for the machine code;
+#   - profiles of mlx-observatory itself (its command line) under mlx-profile;
+#   - built programs (mlx-observatory, mlx-lsp, mlx-files) for the machine code;
 #   - the Git history (blame, and the workarounds of the last 20 commits).
 # The app plays a demo script (MLX_CODEMAP_DEMO, see runDemo in
-# examples/mlx-codemap/main.mlx) under tools/wayland-test-host, drawn on
+# examples/mlx-observatory/main.mlx) under tools/wayland-test-host, drawn on
 # lavapipe (VK_DRIVER_FILES), and writes its own frames; Python with
 # Pillow turns them into PNGs and the tour into an animated GIF.
 #
-#   tools/codemap_screenshots.sh [compiler] [output directory]
+#   tools/observatory_screenshots.sh [compiler] [output directory]
 set -euo pipefail
 
 repo_root=$(cd "$(dirname "$0")/.." && pwd)
 cd "$repo_root"
 compiler=${1:-${MLX_COMPILER:-mlx-out/bin/compiler/mlx4}}
-out=${2:-examples/mlx-codemap/screenshots}
-python3 -c "import PIL" 2> /dev/null || { echo "codemap_screenshots.sh: needs Python with Pillow (pip install pillow)" >&2; exit 2; }
-command -v xkbcli > /dev/null || { echo "codemap_screenshots.sh: xkbcli is not installed" >&2; exit 2; }
+out=${2:-examples/mlx-observatory/screenshots}
+python3 -c "import PIL" 2> /dev/null || { echo "observatory_screenshots.sh: needs Python with Pillow (pip install pillow)" >&2; exit 2; }
+command -v xkbcli > /dev/null || { echo "observatory_screenshots.sh: xkbcli is not installed" >&2; exit 2; }
 
 work=$(mktemp -d)
 trap '[[ -n "${KEEP_WORK:-}" ]] || rm -rf -- "$work"' EXIT
@@ -28,7 +28,7 @@ mkdir -p "$home" "$state" "$work/bin" "$work/frames" "$out"
 say() { echo "== $*" >&2; }
 
 say "building"
-"$compiler" --quiet examples/mlx-codemap/main.mlx -o "$work/bin/mlx-codemap"
+"$compiler" --quiet examples/mlx-observatory/main.mlx -o "$work/bin/mlx-observatory"
 "$compiler" --quiet tools/mlx-lsp/main.mlx -o "$work/bin/mlx-lsp"
 "$compiler" --quiet examples/mlx-files/main.mlx -o "$work/bin/mlx-files"
 "$compiler" --quiet tools/profile/main.mlx -o "$work/mlx-profile"
@@ -39,10 +39,10 @@ xkbcli compile-keymap --layout us > "$work/us.xkb"
 say "crashes, profiles, history"
 for how in index null deep; do XDG_STATE_HOME="$state" "$work/crashy" "$how" > /dev/null 2>&1 || true; done
 for command in json copies workarounds; do
-    XDG_STATE_HOME="$state" "$work/mlx-profile" "$work/bin/mlx-codemap" -C "$repo_root" "$command" > /dev/null 2>&1 || true
+    XDG_STATE_HOME="$state" "$work/mlx-profile" "$work/bin/mlx-observatory" -C "$repo_root" "$command" > /dev/null 2>&1 || true
 done
-HOME="$home" "$work/bin/mlx-codemap" -C "$repo_root" churn > /dev/null
-HOME="$home" "$work/bin/mlx-codemap" -C "$repo_root" history 20 > /dev/null 2>&1
+HOME="$home" "$work/bin/mlx-observatory" -C "$repo_root" churn > /dev/null
+HOME="$home" "$work/bin/mlx-observatory" -C "$repo_root" history 20 > /dev/null 2>&1
 
 # The tour (a GIF), then a picture per feature. Each is its own run (they
 # start from the same view).
@@ -56,7 +56,7 @@ record tour2 6 150
 enter
 record tour3 14 90
 wait 300
-select examples/mlx-codemap
+select examples/mlx-observatory
 record tour4 14 90
 metric heat
 record tour5 8 150
@@ -78,7 +78,7 @@ settle
 shot selected
 escape
 escape
-select examples/mlx-codemap
+select examples/mlx-observatory
 settle
 shot group
 escape
@@ -87,7 +87,7 @@ settle
 shot only-std
 all
 programs open
-program mlx-codemap
+program mlx-observatory
 programs close
 metric size
 settle
@@ -175,7 +175,7 @@ run_demo() {
     env -i PATH="$PATH" HOME="$home" XDG_RUNTIME_DIR="$runtime" WAYLAND_DISPLAY=host-shots \
         VK_DRIVER_FILES="${VK_DRIVER_FILES:-/usr/share/vulkan/icd.d/lvp_icd.json}" LANG=en_US.UTF-8 MLX_CODEMAP_TRACE=1 MLX_CODEMAP_BINARIES="$work/bin" \
         MLX_CODEMAP_DEMO="$work/$name.demo" MLX_CODEMAP_DEMO_OUT="$work/frames" \
-        timeout 900 "$work/bin/mlx-codemap" "$repo_root" > "$work/app-$name.log" 2>&1 || { cat "$work/app-$name.log" >&2; exit 1; }
+        timeout 900 "$work/bin/mlx-observatory" "$repo_root" > "$work/app-$name.log" 2>&1 || { cat "$work/app-$name.log" >&2; exit 1; }
     kill "$host" 2> /dev/null || true
     wait "$host" 2> /dev/null || true
     rm -rf -- "$runtime"

@@ -1,4 +1,4 @@
-# MLX Codemap
+# MLX Observatory IDE
 
 The code base as a space to fly through. Every folder is a group with its
 files around it, and every file has its declarations around it: functions,
@@ -22,11 +22,11 @@ the colors of where the time goes, then the crashes.](screenshots/tour.gif)
 All pictures here are of this whole repository, with real data: the
 crashes of [`tests/support/crash_report.mlx`](../../tests/support/crash_report.mlx),
 profiles of `mlx-codemap` itself under `mlx-profile`, the programs built,
-and the Git history. [`tools/codemap_screenshots.sh`](../../tools/codemap_screenshots.sh)
+and the Git history. [`tools/observatory_screenshots.sh`](../../tools/observatory_screenshots.sh)
 takes them again (see [Pictures](#pictures)).
 
 ```
-mlx-codemap [ROOT]          the 3D view of ROOT (default: MLX_CODEMAP_ROOT,
+mlx-observatory [ROOT]      the 3D view of ROOT (default: MLX_CODEMAP_ROOT,
                             else the Git work tree around the working
                             directory; the installed desktop entry opens
                             the repository it was installed from)
@@ -35,7 +35,8 @@ mlx-codemap [ROOT]          the 3D view of ROOT (default: MLX_CODEMAP_ROOT,
     --view NAME             a view of codemap.views in the search
     --query WORDS           a query in the search
     --diff REV              the base of the finding Changed (HEAD)
-mlx-codemap COMMAND ...     the command line (below)
+mlx-observatory COMMAND ... the command line (below; installed also as
+                            mlx-codemap)
 ```
 
 ## Screenshots
@@ -307,7 +308,7 @@ The command line lists the same findings: `mlx-codemap copies [PATH]`,
 | Filter (toolbar) | adds a query word to the search: first what fits the selection (in its group, calls it, called by it, uses it), then the findings and kinds |
 | the bookmark, Ctrl+S | keeps the query in the search as a view (codemap.views) |
 | Since ... (toolbar) | the base of Changed: not committed yet, or one of the last 15 commits |
-| a section's heading | folds it up or opens it (kept in `~/.config/mlx/codemap-sections`) |
+| a section's heading | folds it up or opens it (kept in `~/.config/mlx/observatory-sections`) |
 | Escape | clear the search, then the selection, then go up a group |
 | Enter | fly to the selection |
 | Alt+Up | its group |
@@ -467,7 +468,7 @@ choose a program, fold a section, ...; see `runDemo` in
 each recorded frame moves it on by the interval asked for, so a recording
 is smooth however long a frame takes to draw.
 
-`tools/codemap_screenshots.sh [compiler] [directory]` builds what it
+`tools/observatory_screenshots.sh [compiler] [directory]` builds what it
 needs, makes the data (crashes, profiles, built programs, the history of
 the last 20 commits), plays a tour and a script with a picture per
 feature on lavapipe, and writes the PNGs and the GIF (with Python and
@@ -475,7 +476,7 @@ Pillow) into `screenshots/`. It takes about a quarter of an hour.
 
 ## Checks
 
-`tools/check_codemap.sh` does the following:
+`tools/check_observatory.sh` does the following:
 
 1. Validates the shader.
 2. Asks the command line, also for the workarounds and a kept crash, the

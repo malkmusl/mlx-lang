@@ -15,11 +15,11 @@
 #   PREFIX/bin/mlx-settings, PREFIX/bin/mlx-files, PREFIX/bin/mlx-codemap,
 #                                     PREFIX/bin/mlx-profile
 #   PREFIX/share/applications/mlx-settings.desktop, org.mlx.files.desktop,
-#                                     org.mlx.codemap.desktop (the launcher
-#                                     lists them; MLX Codemap shows this
+#                                     org.mlx.observatory.desktop (the launcher
+#                                     lists them; MLX Observatory shows this
 #                                     repository)
 #   PREFIX/share/icons/hicolor/128x128/apps/org.mlx.files.png,
-#                                     org.mlx.codemap.png
+#                                     org.mlx.observatory.png
 #   SESSIONS/mlx-compositor.desktop   (read by GDM and SDDM)
 #   ~/.local/lib/mlx-compositor/libmlx-shell.so, libmlx-render.so (for the
 #   user running this; the session loads them, and loads them again when
@@ -62,7 +62,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 bindir="$prefix/bin"
-programs=(mlx-compositor mlx-terminal mlx-session mlx-dock mlx-topbar mlx-launcher mlx-settings mlx-files mlx-codemap mlx-profile)
+programs=(mlx-compositor mlx-terminal mlx-session mlx-dock mlx-topbar mlx-launcher mlx-settings mlx-files mlx-observatory mlx-codemap mlx-profile)
 applications="$prefix/share/applications"
 icons="$prefix/share/icons/hicolor/128x128/apps"
 
@@ -86,7 +86,7 @@ if [[ $uninstall -eq 1 ]]; then
     done
     path="$destdir$sessions/mlx-compositor.desktop"
     [[ -e "$path" ]] && as_owner "$path" rm -f -- "$path" && echo "removed $path"
-    for path in "$destdir$applications/mlx-settings.desktop" "$destdir$applications/org.mlx.files.desktop" "$destdir$applications/org.mlx.codemap.desktop" "$destdir$icons/org.mlx.files.png" "$destdir$icons/org.mlx.codemap.png"; do
+    for path in "$destdir$applications/mlx-settings.desktop" "$destdir$applications/org.mlx.files.desktop" "$destdir$applications/org.mlx.observatory.desktop" "$destdir$icons/org.mlx.files.png" "$destdir$icons/org.mlx.observatory.png"; do
         [[ -e "$path" ]] && as_owner "$path" rm -f -- "$path" && echo "removed $path"
     done
     exit 0
@@ -107,24 +107,26 @@ echo "building with $compiler"
 "$compiler" --quiet examples/mlx-launcher/main.mlx -o "$build/mlx-launcher"
 "$compiler" --quiet examples/mlx-settings/main.mlx -o "$build/mlx-settings"
 "$compiler" --quiet examples/mlx-files/main.mlx -o "$build/mlx-files"
-"$compiler" --quiet examples/mlx-codemap/main.mlx -o "$build/mlx-codemap"
+"$compiler" --quiet examples/mlx-observatory/main.mlx -o "$build/mlx-observatory"
 "$compiler" --quiet tools/profile/main.mlx -o "$build/mlx-profile"
 sed "s|@BINDIR@|$bindir|g" examples/mlx-settings/mlx-settings.desktop.in > "$build/mlx-settings.desktop"
 sed "s|@BINDIR@|$bindir|g" examples/mlx-files/org.mlx.files.desktop.in > "$build/org.mlx.files.desktop"
-sed "s|@BINDIR@|$bindir|g; s|@ROOT@|$repo_root|g" examples/mlx-codemap/org.mlx.codemap.desktop.in > "$build/org.mlx.codemap.desktop"
+sed "s|@BINDIR@|$bindir|g; s|@ROOT@|$repo_root|g" examples/mlx-observatory/org.mlx.observatory.desktop.in > "$build/org.mlx.observatory.desktop"
 sed "s|@BINDIR@|$bindir|g" examples/wayland-compositor/session/mlx-compositor.desktop.in > "$build/mlx-compositor.desktop"
-echo "built $build/mlx-compositor, mlx-terminal, mlx-dock, mlx-topbar, mlx-launcher, mlx-settings, mlx-files, mlx-codemap and mlx-profile"
+echo "built $build/mlx-compositor, mlx-terminal, mlx-dock, mlx-topbar, mlx-launcher, mlx-settings, mlx-files, mlx-observatory and mlx-profile"
 [[ $build_only -eq 1 ]] && exit 0
 
 # Install.
 as_owner "$destdir$bindir" install -d "$destdir$bindir"
-as_owner "$destdir$bindir" install -m 755 "$build/mlx-compositor" "$build/mlx-terminal" "$build/mlx-dock" "$build/mlx-topbar" "$build/mlx-launcher" "$build/mlx-settings" "$build/mlx-files" "$build/mlx-codemap" "$build/mlx-profile" examples/wayland-compositor/session/mlx-session "$destdir$bindir/"
+as_owner "$destdir$bindir" install -m 755 "$build/mlx-compositor" "$build/mlx-terminal" "$build/mlx-dock" "$build/mlx-topbar" "$build/mlx-launcher" "$build/mlx-settings" "$build/mlx-files" "$build/mlx-observatory" "$build/mlx-profile" examples/wayland-compositor/session/mlx-session "$destdir$bindir/"
+# The command line of the code map under its own name (the same program).
+as_owner "$destdir$bindir" ln -sf mlx-observatory "$destdir$bindir/mlx-codemap"
 as_owner "$destdir$sessions" install -d "$destdir$sessions"
 as_owner "$destdir$sessions" install -m 644 "$build/mlx-compositor.desktop" "$destdir$sessions/"
 as_owner "$destdir$applications" install -d "$destdir$applications"
-as_owner "$destdir$applications" install -m 644 "$build/mlx-settings.desktop" "$build/org.mlx.files.desktop" "$build/org.mlx.codemap.desktop" "$destdir$applications/"
+as_owner "$destdir$applications" install -m 644 "$build/mlx-settings.desktop" "$build/org.mlx.files.desktop" "$build/org.mlx.observatory.desktop" "$destdir$applications/"
 as_owner "$destdir$icons" install -d "$destdir$icons"
-as_owner "$destdir$icons" install -m 644 examples/mlx-files/org.mlx.files.png examples/mlx-codemap/org.mlx.codemap.png "$destdir$icons/"
+as_owner "$destdir$icons" install -m 644 examples/mlx-files/org.mlx.files.png examples/mlx-observatory/org.mlx.observatory.png "$destdir$icons/"
 for program in "${programs[@]}"; do echo "installed $destdir$bindir/$program"; done
 echo "installed $destdir$sessions/mlx-compositor.desktop"
 # The shell and renderer modules, for the user running this (not when
@@ -138,7 +140,7 @@ if [[ -z "$destdir" ]]; then
     echo "Log out and pick \"Mlx Compositor\": in GDM with the gear button after"
     echo "choosing your user, in SDDM in the session menu. Super opens the app"
     echo "launcher, the top bar shows the clock, the dock is at the bottom,"
-    echo "mlx-files (Files in the launcher) browses the files, MLX Codemap"
+    echo "mlx-files (Files in the launcher) browses the files, MLX Observatory"
     echo "flies through this repository's code (mlx-codemap PATH: another),"
     echo "Alt+Enter opens a terminal,"
     echo "Ctrl+Alt+F1..F12 switch VTs, Alt+Shift+Q ends the session. Pin apps"

@@ -203,7 +203,7 @@ trash and a folder's "Open" grow their window out of the icon (`Z` and
 the icon's rectangle). Should the dock
 crash, it says where first (`mlx-dock: crashed: ...` and the functions,
 in the compositor's log), as the compositor does, and keeps the crash
-for MLX Codemap.
+for MLX Observatory.
 
 With `dock-autohide = on` (mlx-settings: "Auto-hide dock") the dock
 reserves no space, so maximized windows reach the bottom edge. It slides
@@ -251,7 +251,7 @@ follow the locale. `mlx-files PATH`, `file://` URIs and `trash:///` open
 it where asked; the dock opens its folders and the trash in it when it is
 installed.
 
-MLX Codemap, [`examples/mlx-codemap`](../mlx-codemap/README.md), flies
+MLX Observatory, [`examples/mlx-observatory`](../mlx-observatory/README.md), flies
 through the code of this repository in 3D, laid out like the file manager.
 Folders are groups, with their files and those files' declarations around
 them. Lines show what is in what and what imports what; a selection shows
@@ -725,8 +725,8 @@ callers. A recursion is said once (`(22 more times)`). The dock, the file
 manager and the other desktop programs install the same handler.
 
 Each crash is also kept, as a line in `$XDG_STATE_HOME/mlx/crashes.log`
-(`~/.local/state/mlx/crashes.log`). MLX Codemap
-([`examples/mlx-codemap`](../mlx-codemap/README.md)) reads it and puts a
+(`~/.local/state/mlx/crashes.log`). MLX Observatory
+([`examples/mlx-observatory`](../mlx-observatory/README.md)) reads it and puts a
 red flag on the functions the crashes went through; `mlx-codemap crashes`
 lists them. Please include the lines in a bug report, with the commit the
 program was built from.

@@ -58,7 +58,7 @@ tools/check_lsp.sh                   # a scripted editor session, every request
 
 ## What the code map knows
 
-The server also tells what MLX Codemap knows
+The server also tells what MLX Observatory knows
 ([`insights.mlx`](insights.mlx), on `tools/codemap`):
 
 - **Hover** of a function: the crashes that stopped in it or went through

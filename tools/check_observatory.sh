@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# MLX Codemap (examples/mlx-codemap) end to end, on a small tree of its own:
+# MLX Observatory (examples/mlx-observatory) end to end, on a small tree of its own:
 #   - the scene shader passes std.spirv.module;
 #   - the command line (the same binary with a command) answers, also
 #     with the workarounds, the kept crashes, the programs and what they
@@ -14,20 +14,20 @@
 # The app runs under tools/wayland-test-host; MLX_CODEMAP_TRACE makes it
 # say what it read and selected.
 #
-#   tools/check_codemap.sh [compiler] [lavapipe manifest]
+#   tools/check_observatory.sh [compiler] [lavapipe manifest]
 set -euo pipefail
 
 repo_root=$(cd "$(dirname "$0")/.." && pwd)
 cd "$repo_root"
 compiler=${1:-${MLX_COMPILER:-mlx-out/bin/compiler/mlx4}}
 manifest=${2:-/usr/share/vulkan/icd.d/lvp_icd.json}
-[[ -f "$manifest" ]] || { echo "check_codemap.sh: no Vulkan driver manifest at $manifest" >&2; exit 2; }
-command -v xkbcli > /dev/null || { echo "check_codemap.sh: xkbcli is not installed" >&2; exit 2; }
+[[ -f "$manifest" ]] || { echo "check_observatory.sh: no Vulkan driver manifest at $manifest" >&2; exit 2; }
+command -v xkbcli > /dev/null || { echo "check_observatory.sh: xkbcli is not installed" >&2; exit 2; }
 
 work=$(mktemp -d)
 trap '[[ -n "${KEEP_WORK:-}" ]] || rm -rf -- "$work"' EXIT
-"$compiler" --quiet examples/mlx-codemap/check_shader.mlx -o "$work/check-shader"
-"$compiler" --quiet examples/mlx-codemap/main.mlx -o "$work/mlx-codemap"
+"$compiler" --quiet examples/mlx-observatory/check_shader.mlx -o "$work/check-shader"
+"$compiler" --quiet examples/mlx-observatory/main.mlx -o "$work/mlx-observatory"
 "$compiler" --quiet tools/wayland-test-host/main.mlx -o "$work/test-host"
 xkbcli compile-keymap --layout us > "$work/us.xkb"
 
@@ -97,15 +97,15 @@ pub fn main() -> u8 {
 MLX
 
 # The command line.
-"$work/mlx-codemap" -C "$tree" callers greet > "$work/callers.txt"
+"$work/mlx-observatory" -C "$tree" callers greet > "$work/callers.txt"
 grep -q "app/main.mlx:5:.*main" "$work/callers.txt" && grep -q "lib/extra.mlx:3:.*twice" "$work/callers.txt" || fail "the command line did not find greet's callers" "$work/callers.txt"
 echo "ok   the command line: mlx-codemap -C TREE callers greet"
-"$work/mlx-codemap" -C "$tree" workarounds > "$work/workarounds.txt"
+"$work/mlx-observatory" -C "$tree" workarounds > "$work/workarounds.txt"
 grep -A1 "^== 1x Arrays cast to many-pointers" "$work/workarounds.txt" | grep -q "lib/extra.mlx:5:8: function first" \
     && grep -A1 "^== 1x Declared undefined, set in unsafe" "$work/workarounds.txt" | grep -q "lib/extra.mlx:5:8: function first" \
     || fail "the command line did not find the workarounds in first" "$work/workarounds.txt"
 echo "ok   the command line: mlx-codemap -C TREE workarounds"
-HOME="$work" XDG_STATE_HOME= "$work/mlx-codemap" -C "$tree" crashes > "$work/crashes.txt"
+HOME="$work" XDG_STATE_HOME= "$work/mlx-observatory" -C "$tree" crashes > "$work/crashes.txt"
 grep -q "^lib/helper.mlx:4:8: function greet (crashed here 1x)$" "$work/crashes.txt" \
     && grep -q "^app/main.mlx:3:8: function main (on the way 1x)$" "$work/crashes.txt" \
     && grep -q "^   from _start+0x58$" "$work/crashes.txt" \
@@ -115,58 +115,58 @@ echo "ok   the command line: mlx-codemap -C TREE crashes"
 # symbol table, and what it reaches.
 mkdir -p "$work/bin"
 "$compiler" --quiet "$tree/app/main.mlx" -o "$work/bin/app"
-MLX_CODEMAP_BINARIES="$work/bin" "$work/mlx-codemap" -C "$tree" programs > "$work/programs.txt"
+MLX_CODEMAP_BINARIES="$work/bin" "$work/mlx-observatory" -C "$tree" programs > "$work/programs.txt"
 grep -q "^app: app/main.mlx, reaches [0-9]* declarations, built: $work/bin/app (" "$work/programs.txt" || fail "the command line did not find the program app and its binary" "$work/programs.txt"
-MLX_CODEMAP_BINARIES="$work/bin" "$work/mlx-codemap" -C "$tree" reach app > "$work/reach.txt"
+MLX_CODEMAP_BINARIES="$work/bin" "$work/mlx-observatory" -C "$tree" reach app > "$work/reach.txt"
 # (greet is small enough to be inlined: it has no code of its own.)
 grep -q "^app/main.mlx:3:8: function main ([0-9]* bytes)$" "$work/reach.txt" && grep -q "^lib/helper.mlx:4:8: function greet" "$work/reach.txt" \
     || fail "app should reach main (with its machine code) and greet" "$work/reach.txt"
-MLX_CODEMAP_BINARIES="$work/bin" "$work/mlx-codemap" -C "$tree" unreachable > "$work/unreachable.txt"
+MLX_CODEMAP_BINARIES="$work/bin" "$work/mlx-observatory" -C "$tree" unreachable > "$work/unreachable.txt"
 grep -q "^lib/extra.mlx:3:8: function twice$" "$work/unreachable.txt" && ! grep -q "greet" "$work/unreachable.txt" || fail "twice (and not greet) should be unreachable" "$work/unreachable.txt"
-MLX_CODEMAP_BINARIES="$work/bin" "$work/mlx-codemap" -C "$tree" sizes app > "$work/sizes.txt"
+MLX_CODEMAP_BINARIES="$work/bin" "$work/mlx-observatory" -C "$tree" sizes app > "$work/sizes.txt"
 grep -q "function main [0-9]* bytes$" "$work/sizes.txt" || fail "the machine code of main is not measured" "$work/sizes.txt"
-"$work/mlx-codemap" -C "$tree" cycles > "$work/cycles.txt"
+"$work/mlx-observatory" -C "$tree" cycles > "$work/cycles.txt"
 grep -A2 "^== 2 files import each other$" "$work/cycles.txt" | grep -q "lib/a.mlx" || fail "the cycle a <-> b is not found" "$work/cycles.txt"
-"$work/mlx-codemap" -C "$tree" layers > "$work/layers.txt"
+"$work/mlx-observatory" -C "$tree" layers > "$work/layers.txt"
 grep -q "^lib/bad.mlx:1:7: imports app/main.mlx (lib !-> app)$" "$work/layers.txt" || fail "the import against codemap.layers is not found" "$work/layers.txt"
 echo "ok   the command line: programs, reach, unreachable, sizes, cycles, layers"
 if command -v git > /dev/null; then
     ( cd "$tree" && git init -q && git add -A && git -c user.email=check@mlx -c user.name=check commit -qm one \
         && sed -i 's/return times + count/return times + count + 0/' lib/helper.mlx \
         && git -c user.email=check@mlx -c user.name=check commit -qam two )
-    XDG_CACHE_HOME="$work/cache" "$work/mlx-codemap" -C "$tree" churn > "$work/churn.txt"
+    XDG_CACHE_HOME="$work/cache" "$work/mlx-observatory" -C "$tree" churn > "$work/churn.txt"
     grep -q "^lib/helper.mlx:4:8: function greet (2 commits, the file 2)$" "$work/churn.txt" || fail "greet should have two commits" "$work/churn.txt"
     echo "ok   the command line: churn (git blame)"
     # The workarounds at both commits (each counted from git archive and
     # kept in the cache, where the app finds them).
-    HOME="$work" XDG_CACHE_HOME= "$work/mlx-codemap" -C "$tree" history > "$work/history.txt" 2> /dev/null
+    HOME="$work" XDG_CACHE_HOME= "$work/mlx-observatory" -C "$tree" history > "$work/history.txt" 2> /dev/null
     [[ $(grep -c "^20[0-9-]* [0-9a-f]\{7\}  2 0 1 1 0 0 0 0 0 0$" "$work/history.txt") -eq 2 ]] \
         && grep -q "^▄▄ 1 Array casts$" "$work/history.txt" && [[ $(wc -l < "$work/.cache/mlx/codemap/workarounds-v1") -eq 2 ]] \
         || fail "history should count the two workarounds at both commits and keep them" "$work/history.txt"
     echo "ok   the command line: history (workarounds per commit)"
-    "$work/mlx-codemap" -C "$tree" diff HEAD~1 > "$work/diff.txt"
+    "$work/mlx-observatory" -C "$tree" diff HEAD~1 > "$work/diff.txt"
     grep -q "^~ lib/helper.mlx:4:8: function greet$" "$work/diff.txt" \
         && grep -q "^-- 0 added, 1 changed, 0 removed in 1 files since HEAD~1$" "$work/diff.txt" \
         || fail "diff HEAD~1 should find greet changed" "$work/diff.txt"
-    "$work/mlx-codemap" -C "$tree" query changed since:HEAD~1 > "$work/changed.txt"
+    "$work/mlx-observatory" -C "$tree" query changed since:HEAD~1 > "$work/changed.txt"
     grep -q "^lib/helper.mlx:4:8: function greet$" "$work/changed.txt" && grep -q "^-- 1$" "$work/changed.txt" \
         || fail "the query changed since:HEAD~1 should answer greet" "$work/changed.txt"
     echo "ok   the command line: diff and changed since a commit"
     have_git=1
 fi
 # Queries and the views kept in codemap.views.
-"$work/mlx-codemap" -C "$tree" query kind:fn calls:greet > "$work/query.txt"
+"$work/mlx-observatory" -C "$tree" query kind:fn calls:greet > "$work/query.txt"
 grep -q "^app/main.mlx:3:8: function main$" "$work/query.txt" && grep -q "^lib/extra.mlx:3:8: function twice$" "$work/query.txt" && grep -q "^-- 2$" "$work/query.txt" \
     || fail "kind:fn calls:greet should answer main and twice" "$work/query.txt"
-HOME="$work" XDG_STATE_HOME= "$work/mlx-codemap" -C "$tree" query crashed -in:app > "$work/query.txt"
+HOME="$work" XDG_STATE_HOME= "$work/mlx-observatory" -C "$tree" query crashed -in:app > "$work/query.txt"
 grep -q "^lib/helper.mlx:4:8: function greet$" "$work/query.txt" && grep -q "^-- 1$" "$work/query.txt" \
     || fail "crashed -in:app should answer greet alone" "$work/query.txt"
-"$work/mlx-codemap" -C "$tree" query kind:fish > "$work/query.txt"
+"$work/mlx-observatory" -C "$tree" query kind:fish > "$work/query.txt"
 grep -q "^not understood: kind:fish$" "$work/query.txt" || fail "kind:fish should not be understood" "$work/query.txt"
 printf '# views\nGreeters = kind:fn calls:greet\n' > "$tree/codemap.views"
-"$work/mlx-codemap" -C "$tree" views > "$work/views.txt"
+"$work/mlx-observatory" -C "$tree" views > "$work/views.txt"
 grep -q "^@Greeters = kind:fn calls:greet$" "$work/views.txt" || fail "the view Greeters is not listed" "$work/views.txt"
-"$work/mlx-codemap" -C "$tree" query @greeters > "$work/query.txt"
+"$work/mlx-observatory" -C "$tree" query @greeters > "$work/query.txt"
 grep -q "^-- 2$" "$work/query.txt" || fail "the view @greeters should answer main and twice" "$work/query.txt"
 echo "ok   the command line: query (kind, calls, crashed, not) and views"
 # Rewriting workarounds away: a result bound only to be dropped becomes
@@ -187,19 +187,19 @@ pub fn main() -> u8 {
     return @intCast(u8, size("abcd"))
 }
 MLX
-MLX_COMPILER="$repo_root/$compiler" "$work/mlx-codemap" -C "$work/rewrite" rewrite dropped > "$work/rewrite.txt"
+MLX_COMPILER="$repo_root/$compiler" "$work/mlx-observatory" -C "$work/rewrite" rewrite dropped > "$work/rewrite.txt"
 grep -A1 "^app/main.mlx:10: const ignored = three()$" "$work/rewrite.txt" | grep -q "^  -> _ = three()$" \
     && grep -q "^the compiler accepts them: --apply writes them$" "$work/rewrite.txt" \
     || fail "rewrite should show const ignored = three() becoming _ = three()" "$work/rewrite.txt"
-MLX_COMPILER="$repo_root/$compiler" "$work/mlx-codemap" -C "$work/rewrite" rewrite dropped --apply > "$work/rewrite.txt"
-MLX_COMPILER="$repo_root/$compiler" "$work/mlx-codemap" -C "$work/rewrite" rewrite counted --apply >> "$work/rewrite.txt"
+MLX_COMPILER="$repo_root/$compiler" "$work/mlx-observatory" -C "$work/rewrite" rewrite dropped --apply > "$work/rewrite.txt"
+MLX_COMPILER="$repo_root/$compiler" "$work/mlx-observatory" -C "$work/rewrite" rewrite counted --apply >> "$work/rewrite.txt"
 grep -q "^    _ = three()$" "$work/rewrite/app/main.mlx" && grep -q "^    length += text.length$" "$work/rewrite/app/main.mlx" \
     || fail "rewrite --apply did not write both rewrites" "$work/rewrite/app/main.mlx"
 "$compiler" --quiet "$work/rewrite/app/main.mlx" -o "$work/rewritten"
 status=0
 "$work/rewritten" || status=$?
 [[ $status -eq 4 ]] || fail "the rewritten program should still exit with 4, not $status" "$work/rewrite/app/main.mlx"
-"$work/mlx-codemap" -C "$work/rewrite" workarounds > "$work/rewrite.txt"
+"$work/mlx-observatory" -C "$work/rewrite" workarounds > "$work/rewrite.txt"
 [[ ! -s "$work/rewrite.txt" ]] || fail "no workaround should be left after the rewrites" "$work/rewrite.txt"
 echo "ok   the command line: rewrite dropped and counted (preview, --apply)"
 
@@ -284,7 +284,7 @@ run() {
     local status=0
     env -i PATH="$PATH" HOME="$work" XDG_RUNTIME_DIR="$runtime" WAYLAND_DISPLAY=host-codemap \
         VK_DRIVER_FILES="$manifest" MLX_CANVAS="$canvas" MLX_CODEMAP_TRACE=1 MLX_CODEMAP_BINARIES="$work/bin" LANG=de_DE.UTF-8 \
-        timeout 60 "$work/mlx-codemap" "$tree" --diff HEAD~1 > "$shots/app.log" 2>&1 || status=$?
+        timeout 60 "$work/mlx-observatory" "$tree" --diff HEAD~1 > "$shots/app.log" 2>&1 || status=$?
     wait "$host_pid" || fail "codemap ($name): the test host failed" "$shots/host.log"
     rm -rf -- "$runtime"
     local log="$shots/app.log"
@@ -357,7 +357,7 @@ for name in ('start', 'selected', 'group'):
 PY
 echo "ok   codemap: the same on the GPU and the CPU"
 
-# The demo mode (tools/codemap_screenshots.sh makes the README's pictures
+# The demo mode (tools/observatory_screenshots.sh makes the README's pictures
 # with it): the app plays a script and writes its own frames, a shot and a
 # recorded flight.
 mkdir -p "$work/demo"
@@ -379,7 +379,7 @@ host_pid=$!
 for _ in $(seq 1 50); do [[ -S "$runtime/host-demo" ]] && break; sleep 0.1; done
 status=0
 env -i PATH="$PATH" HOME="$work" XDG_RUNTIME_DIR="$runtime" WAYLAND_DISPLAY=host-demo MLX_CANVAS=cpu MLX_CODEMAP_TRACE=1 \
-    MLX_CODEMAP_DEMO="$work/check.demo" MLX_CODEMAP_DEMO_OUT="$work/demo" timeout 60 "$work/mlx-codemap" "$tree" > "$work/demo.log" 2>&1 || status=$?
+    MLX_CODEMAP_DEMO="$work/check.demo" MLX_CODEMAP_DEMO_OUT="$work/demo" timeout 60 "$work/mlx-observatory" "$tree" > "$work/demo.log" 2>&1 || status=$?
 kill "$host_pid" 2> /dev/null || true
 wait "$host_pid" 2> /dev/null || true
 rm -rf -- "$runtime"
