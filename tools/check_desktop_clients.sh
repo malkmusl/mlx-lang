@@ -673,3 +673,25 @@ bad = sum(1 for y in rows if first[y * width * 3:(y + 1) * width * 3] != second[
 sys.exit(1 if bad else 0)
 PY
 echo "ok   the file manager draws the same pixels on the GPU as on the CPU"
+
+# A protocol error ends the file manager's connection (as a compositor ends
+# a client that broke the protocol, a drag and drop gone wrong): the file
+# manager says so with where it was, and keeps it in crashes.log for MLX
+# Observatory, instead of its window just going away.
+printf 'wait 3000\nerror\nwait 1000\nclose\n' > "$work/error.script"
+mkdir -p "$work/error-home"
+runtime=$(mktemp -d)
+XDG_RUNTIME_DIR=$runtime "$work/test-host" host-error "$work/us.xkb" "$work/error.script" > "$work/error-host.log" 2>&1 &
+host_pid=$!
+for _ in $(seq 1 50); do [[ -S "$runtime/host-error" ]] && break; sleep 0.1; done
+status=0
+env -i PATH="$PATH" HOME="$work/error-home" XDG_RUNTIME_DIR="$runtime" WAYLAND_DISPLAY=host-error MLX_CANVAS=cpu \
+    timeout 30 "$work/mlx-files" "$work/error-home" > "$work/error.log" 2>&1 || status=$?
+wait "$host_pid" || true
+rm -rf -- "$runtime"
+[[ $status -eq 1 ]] || fail "error: the file manager exited with $status after a protocol error, not 1" "$work/error.log"
+grep -q "^mlx-files: failed: the compositor ended the connection: protocol error 0 on xdg_toplevel [0-9]*: a protocol error from the test host$" "$work/error.log" \
+    && grep -q "^  from examples/mlx-files/main.mlx:[0-9]*:main+0x" "$work/error.log" || fail "error: the protocol error is not reported with where it came" "$work/error.log"
+grep -q "^crash	[0-9]*	mlx-files	the compositor ended the connection: protocol error" "$work/error-home/.local/state/mlx/crashes.log" 2> /dev/null \
+    || fail "error: the protocol error is not in crashes.log" "$work/error.log"
+echo "ok   a protocol error ending the file manager is reported and kept in crashes.log"

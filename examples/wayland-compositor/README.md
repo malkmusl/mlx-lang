@@ -727,6 +727,14 @@ trap are reported the same way. The dock, the top bar, the launcher,
 the settings, the file manager and the Observatory install the same
 handler.
 
+A desktop program whose connection fails is reported the same way, as
+`NAME: failed: ...` with the functions it was in: when the compositor
+ends it over a protocol error (`the compositor ended the connection:
+protocol error 0 on wl_data_offer 45: ...`, for example a drop finished
+without an action chosen, which GNOME and Weston refuse, and so does
+this compositor), or when the program made a request on an object that
+is gone. Before, its window just went away.
+
 Each crash is also kept, as a line in `$XDG_STATE_HOME/mlx/crashes.log`
 (`~/.local/state/mlx/crashes.log`). MLX Observatory
 ([`examples/mlx-observatory`](../mlx-observatory/README.md)) reads it and puts a
