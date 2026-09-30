@@ -6,7 +6,8 @@
 #   - a failed runtime check, a bad store, a stack overflow, an abort and a
 #     failure (crash.fail) each say the
 #     function they happened in and the functions that called it;
-#   - each crash is kept as a line in $XDG_STATE_HOME/mlx/crashes.log.
+#   - each crash is kept as a line in $XDG_STATE_HOME/mlx/crashes.log;
+#   - every Wayland client watches its connection (crash.watch).
 #
 #   tools/check_crash_report.sh [compiler]
 set -euo pipefail
@@ -67,3 +68,12 @@ log="$work/state/mlx/crashes.log"
 awk -F'\t' '$1 != "crash" || $2 !~ /^[0-9]+$/ || $3 != "crashy" || NF < 5 { bad = 1 } END { exit bad }' "$log" || fail "crashes.log lines are not crash/time/program/reason/frames" "$log"
 grep -q "	tests/support/crash_report.mlx:12:middle+0x[0-9a-f]* at tests/support/crash_report.mlx:9	" "$log" || fail "the kept crash has no frames" "$log"
 echo "ok   every crash is kept in \$XDG_STATE_HOME/mlx/crashes.log"
+
+# The rule: every Wayland client in examples/ and tools/ watches its
+# connection (crash.watch, right after it connects), so a protocol error
+# or a request on an object that is gone is reported and kept like a
+# crash instead of the program just ending. (tests/ exercise the library's
+# own failure handling.)
+missing=$(grep -rlE 'Display\.(connect|connectTo|connectToHandle)\(' --include=*.mlx examples tools | while read -r file; do grep -q 'crash\.watch(' "$file" || echo "$file"; done)
+[[ -z "$missing" ]] || fail "these Wayland clients do not watch their connection (crash.watch after connecting): $missing"
+echo "ok   every Wayland client watches its connection (crash.watch)"

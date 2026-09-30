@@ -323,7 +323,12 @@ request returns an inert proxy and the next `flush`, `dispatch` or
 from the display. `failureReason()` says in words why a display stopped
 running; for an event the client cannot decode (unknown object or opcode,
 malformed arguments) `rejectedObjectId`, `rejectedOpcode` and
-`rejectedInterface` name it. Events go to per-object handler functions and are decoded
+`rejectedInterface` name it; for a request refused on this side (an object
+that is gone, a version too old) `refusedObjectId`, `refusedOpcode` and
+`refusedInterface` do. `setFailureHandler` registers a function called
+once when the connection fails, while the failing request or event is
+still on the stack, and `disconnected()` tells the server going away from
+the other failures. Events go to per-object handler functions and are decoded
 with the generated `decodeEvent`. Objects that the server creates through a
 new_id event argument are registered before their event is dispatched.
 
@@ -472,6 +477,23 @@ request's `failureObject()`, `failureInterface()` and `failureOpcode()`.
 misbehaving clients are given; the compositor logs them (`client
 disconnected: it broke the protocol, invalid method (error 1 on request 9
 of wl_surface 12)`).
+
+### The rule: every client reports a failed connection
+
+Every Wayland client in `examples/` and `tools/` calls `crash.watch` on its
+display right after connecting
+([`examples/wayland-compositor/crash.mlx`](../../examples/wayland-compositor/crash.mlx);
+the desktop apps get it from `panel.mlx`). When the connection fails, the
+program says why and where, `NAME: failed: the compositor ended the
+connection: protocol error 0 on wl_data_offer 45: ...` or `a request used an
+object that is gone (request 3 of wl_data_offer 45)`, with the functions it
+was in, keeps it in `$XDG_STATE_HOME/mlx/crashes.log` like a crash (MLX
+Observatory shows it) and ends with status 1, instead of just stopping.
+The compositor going away is no failure of the client's. The compositor, in
+turn, always logs a client it ended for breaking the protocol, `--verbose`
+or not. `tools/check_crash_report.sh` fails for a client that connects
+without `crash.watch`; `tools/check_desktop_clients.sh` ends the file
+manager with a protocol error from the test host and checks the report.
 
 ### Message storage
 
