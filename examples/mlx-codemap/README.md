@@ -74,21 +74,24 @@ each group are joined by magenta lines in space.
   | comments: workaround, miscompilation, "does not yet", TODO, FIXME, HACK | what the comment names |
 
   Two kinds can be rewritten away, now that the compiler does without
-  them: `mlx-codemap rewrite dropped [PATH]` turns `const ignored =
-  call(...)` into `_ = call(...)`, `mlx-codemap rewrite counted [PATH]`
-  turns `for byte in text { length += 1 }` into `length += text.length`
-  ([`tools/codemap/rewrite.mlx`](../../tools/codemap/rewrite.mlx)). It
-  shows each line before and after; `--apply` writes them, and only when
-  the compiler (`$MLX_COMPILER`, else `mlx-out/bin/compiler/mlx4`, else
-  `mlx4`) builds a program with what they need. Files under `compiler/`,
+  them: dropped results (`const ignored = call(...)` becomes `_ =
+  call(...)`) and counted lengths (`for byte in text { length += 1 }`
+  becomes `length += text.length`)
+  ([`tools/codemap/rewrite.mlx`](../../tools/codemap/rewrite.mlx)). In the
+  panel, *Rewrite ...* under the kind shows each line before and after;
+  *Apply* writes them and reads the code again. It can only when the
+  compiler (`$MLX_COMPILER`, else `mlx-out/bin/compiler/mlx4`, else
+  `mlx4`) builds a program with what they need. On the command line:
+  `mlx-codemap rewrite dropped|counted [PATH] [--apply]`. Files under `compiler/`,
   `std/bootstrap/` (the bootstrap compiler builds them) and `tests/` are
   left as they are.
 
-  `mlx-codemap history [N]` counts the workarounds of each kind at the
-  last N commits (20) and draws each kind's course as a row of bars
-  ([`tools/codemap/trend.mlx`](../../tools/codemap/trend.mlx)). Each
-  commit is taken out with `git archive` and counted once; the counts are
-  kept in `~/.cache/mlx/codemap/workarounds-v1`.
+  The panel shows how many workarounds the last 20 commits had, a bar
+  each; *Count the history* counts the commits not counted yet in the
+  background ([`tools/codemap/trend.mlx`](../../tools/codemap/trend.mlx)).
+  Each commit is taken out with `git archive` and counted once; the counts
+  are kept in `~/.cache/mlx/codemap/workarounds-v1`. `mlx-codemap history
+  [N]` does the same on the command line, with a row of bars per kind.
 
 - **Crashes:** what the desktop programs kept when they crashed, newest
   first, each with the function it stopped in and the functions that called
@@ -109,9 +112,12 @@ each group are joined by magenta lines in space.
   commits, complexity, copies and missing checks together
   ([`measures.mlx`](../../tools/codemap/measures.mlx)).
 - **Hot:** where the programs spend their time, from the profiles of
-  `mlx-profile`.
-- **Changed:** declarations added and changed since a commit (`--diff
-  REV`; without it HEAD, so what is not committed yet), mint green. The
+  `mlx-profile`. With a built program chosen under Program, *Profile* in
+  the panel runs it under `mlx-profile` (next to `mlx-codemap`, else on
+  the `PATH`); when it ends, its profile is read.
+- **Changed:** declarations added and changed since a commit, mint
+  green. The base is chosen in the toolbar (*Since HEAD*: what is not
+  committed yet, or one of the last commits) or with `--diff REV`. The
   files Git names as changed are taken out of that commit and indexed on
   their own; declarations are matched by file, containers, name and kind
   and compared by their text without blanks
@@ -205,7 +211,10 @@ The command line lists the same findings: `mlx-codemap copies [PATH]`,
 | double click | fly there (on empty space: up a group) |
 | typing, Ctrl+F, / | search; Enter or a click flies to a result |
 | a query in the search | leaves out what does not answer it (see Queries); Enter flies to what is left |
-| Ctrl+S | keeps the query in the search as a view (codemap.views) |
+| Filter (toolbar) | adds a query word to the search: first what fits the selection (in its group, calls it, called by it, uses it), then the findings and kinds |
+| the bookmark, Ctrl+S | keeps the query in the search as a view (codemap.views) |
+| Since ... (toolbar) | the base of Changed: not committed yet, or one of the last 15 commits |
+| a section's heading | folds it up or opens it (kept in `~/.config/mlx/codemap-sections`) |
 | Escape | clear the search, then the selection, then go up a group |
 | Enter | fly to the selection |
 | Alt+Up | its group |
@@ -329,9 +338,10 @@ Changed = changed
 ```
 
 They are listed at the end of the sidebar (a click shows one, a second
-click shows everything again); `@NAME` in the search, `--view NAME` at the
-start and `mlx-codemap query @NAME` show one too. Ctrl+S keeps the query in
-the search as a new view.
+click shows everything again, the x takes one out); `@NAME` in the search,
+`--view NAME` at the start and `mlx-codemap query @NAME` show one too. The
+bookmark next to the search (or Ctrl+S) keeps the query in the search as a
+new view.
 
 ## The command line
 
@@ -367,8 +377,10 @@ answers are `path:line:col: kind Qualified.name` lines.
 3. Runs the app under `tools/wayland-test-host` on a small tree, first on
    lavapipe, then on the CPU. In each run it searches, selects, checks the
    connections of what was selected, clicks a group and then its check box,
-   and types a query into the search. It starts with `--diff HEAD~1`, so
-   Changed holds the function changed by the second commit.
+   types a query into the search, keeps it with the bookmark, adds a word
+   with Filter and folds the Groups up and open again. It starts with
+   `--diff HEAD~1`, so Changed holds the function changed by the second
+   commit.
    `MLX_CODEMAP_TRACE`
    has the app print what it read and selected, the crashes it put on
    declarations, and how much each finding shows.

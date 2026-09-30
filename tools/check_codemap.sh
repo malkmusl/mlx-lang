@@ -246,6 +246,25 @@ wait 2000
 type kind:fn calls:greet
 wait 1500
 shot SHOTS/query.ppm
+pointer 895 25
+press 272
+release 272
+wait 300
+pointer 840 25
+press 272
+release 272
+wait 300
+pointer 700 67
+press 272
+release 272
+wait 800
+pointer 100 28
+press 272
+release 272
+wait 300
+press 272
+release 272
+wait 300
 close
 SCRIPT
 
@@ -293,6 +312,11 @@ run() {
     # A query in the search: of the functions calling greet only main is
     # left (lib is left out, and the program app is shown).
     grep -q "^codemap: query kind:fn calls:greet: 1 declarations$" "$log" || fail "codemap ($name): the query in the search should leave main" "$log"
+    # The bookmark keeps it as a view, the filter adds a word, the
+    # heading Groups folds up and opens again.
+    grep -q "^codemap: view saved Ansicht [0-9]*$" "$log" || fail "codemap ($name): the bookmark did not keep the query as a view" "$log"
+    grep -q "^codemap: filter word " "$log" || fail "codemap ($name): the filter's first word was not added" "$log"
+    grep -q "^codemap: section 0 folded$" "$log" && grep -q "^codemap: section 0 opened$" "$log" || fail "codemap ($name): the heading Groups did not fold up and open" "$log"
     python3 - "$shots/start.ppm" "$shots/selected.ppm" <<'PY' || fail "codemap ($name): the view or the detail panel is not drawn" "$log"
 import sys
 def load(path):
