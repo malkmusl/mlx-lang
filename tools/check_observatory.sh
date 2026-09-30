@@ -388,6 +388,22 @@ shot completion
 cursor 3 22
 select-to 4 18
 delete-selection
+cursor 3 22
+edit \nconst fresh = helper.Point.{ .x = 3, .y = 4 }
+wait 800
+hoverat 4 11
+cursor 3 22
+select-to 4 200
+delete-selection
+wait 800
+open lib/usestd.mlx 3
+cursor 3 26
+edit \nstd.fs.op
+complete
+escape
+cursor 3 26
+select-to 4 200
+delete-selection
 open lib/extra.mlx 3
 cursor 3 8
 rename double
@@ -434,6 +450,22 @@ view map
 settle
 quit
 DEMO
+# A std of the tree's own (std/src/std.mlx, as the compiler finds it),
+# and a file that uses it, for completion after std.
+mkdir -p "$tree/std/src"
+printf 'pub const fs = @import("./fs.mlx")\n' > "$tree/std/src/std.mlx"
+cat > "$tree/std/src/fs.mlx" <<'MLX'
+// Opens the file at path.
+pub fn open(path: []const u8) -> i32 { return 0 }
+pub fn openAt(directory: i32, path: []const u8) -> i32 { return 0 }
+fn hidden() -> i32 { return 0 }
+MLX
+cat > "$tree/lib/usestd.mlx" <<'MLX'
+const std = @import("std")
+
+pub fn useStd() -> void {
+}
+MLX
 # A result bound only to be dropped, for the editor's rewrite.
 cat > "$tree/lib/drop.mlx" <<'MLX'
 const extra = @import("./extra.mlx")
@@ -491,7 +523,15 @@ grep -q "^codemap: completion first helper$" "$work/demo.log" && grep -q "^codem
     && grep -q "^codemap: completion first greet$" "$work/demo.log" && grep -q "^codemap: completed greet($" "$work/demo.log" \
     && grep -q "^codemap: signature greet$" "$work/demo.log" && grep -q "^codemap: signature at, argument 0$" "$work/demo.log" \
     || fail "editor: completion (helper, then greet after the dot) or the signature of greet(" "$work/demo.log"
-echo "ok   editor: completion (in scope, after a dot), signature help"
+grep -q "^codemap: completion 2, first $" "$work/demo.log" && grep -q "^codemap: completion first open$" "$work/demo.log" \
+    || fail "editor: completion after std.fs. should offer open and openAt (not hidden)" "$work/demo.log"
+echo "ok   editor: completion (in scope, after a dot, in std.fs), signature help"
+# Read again while editing: a local just typed is known to the hover (its
+# type too) a moment after, without saving.
+grep -q "^codemap: index read again app/main.mlx$" "$work/demo.log" \
+    && grep -q "^codemap: hover local const fresh in function main, app/main.mlx:4 | type Point: struct in lib/helper.mlx:10$" "$work/demo.log" \
+    || fail "editor: the index did not read the edited text again" "$work/demo.log"
+echo "ok   editor: the index reads the edited text again (a new local in the hover)"
 # F2: twice renamed where it is declared and where it is used; the line
 # number's blame (Git).
 grep -q "^codemap: renamed 2 places in 2 files: double$" "$work/demo.log" && grep -q "^pub fn double() -> usize" "$tree/lib/extra.mlx" \

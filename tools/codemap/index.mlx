@@ -55,6 +55,8 @@ pub const CAPTURE: u8 = 13
 pub const TEST: u8 = 14
 pub const IMPORT: u8 = 15
 pub const ALIAS: u8 = 16
+// A declaration a file had and has no longer (refreshFile).
+pub const DEAD: u8 = 255
 
 // Symbol flags (the parser's modifier bits, and more).
 pub const FLAG_PUB: u32 = 1
@@ -174,6 +176,21 @@ pub const Index = struct {
     // caller's Overlay array (its address; 0: none), kept across reset.
     overlays: usize
     overlayCount: usize
+    // refreshFile: the file's symbols before, to be given to its
+    // declarations again by (container, name, kind).
+    refreshing: bool
+    refreshingFile: u32
+    reuseCount: usize
+    reuseIds: [*]u32
+    reuseParents: [*]u32
+    reuseKinds: [*]u8
+    reuseUsed: [*]u8
+    reuseNameStart: [*]u32
+    reuseNameLength: [*]u32
+    reuseText: [*]u8
+    reuseHeads: [*]u32
+    reuseNext: [*]u32
+    reuseMask: usize
 }
 
 // A file's text as an editor has it (setOverlays).
@@ -286,9 +303,14 @@ fn hashBytes(seed: u64, text: []const u8) -> u64 {
 // Symbols
 
 fn addSymbol(index: *Index, kind: u8, file: u32, name_start: usize, name_length: usize, node: usize, parent: u32) -> u32 {
-    if index.*.symbolCount >= MAX_SYMBOLS { return NONE }
-    const id = @intCast(u32, index.*.symbolCount)
-    index.*.symbolCount += 1
+    // Read again (refreshFile): the declaration's symbol before, if any.
+    var id = NONE
+    if index.*.refreshing && file == index.*.refreshingFile { id = reusable(index, kind, name_start, name_length, parent) }
+    if id == NONE {
+        if index.*.symbolCount >= MAX_SYMBOLS { return NONE }
+        id = @intCast(u32, index.*.symbolCount)
+        index.*.symbolCount += 1
+    }
     const value = symbolAt(index, id)
     value.*.kind = kind
     value.*.flags = 0
@@ -317,6 +339,35 @@ fn addSymbol(index: *Index, kind: u8, file: u32, name_start: usize, name_length:
         container.*.lastChild = id
     }
     return id
+}
+
+fn sameKinds(first: u8, second: u8) -> bool {
+    if first == second { return true }
+    // A const may have turned out an alias (typeOfSymbol).
+    const first_const = first == CONST || first == LOCAL_CONST || first == ALIAS
+    const second_const = second == CONST || second == LOCAL_CONST || second == ALIAS
+    return first_const && second_const
+}
+
+// The symbol the refreshed file had for this declaration (same container,
+// name and kind; not given out yet); NONE: a new one.
+fn reusable(index: *Index, kind: u8, name_start: usize, name_length: usize, parent: u32) -> u32 {
+    if index.*.reuseCount == 0 { return NONE }
+    const source = sourceOf(index, index.*.refreshingFile)
+    const name = source[name_start..name_start + name_length]
+    var at = index.*.reuseHeads[@intCast(usize, hashBytes(@intCast(u64, parent), name)) & index.*.reuseMask]
+    while at != NONE {
+        const which = @intCast(usize, at)
+        if index.*.reuseUsed[which] == 0 && index.*.reuseParents[which] == parent && sameKinds(index.*.reuseKinds[which], kind) {
+            const start = @intCast(usize, index.*.reuseNameStart[which])
+            if sameBytes(index.*.reuseText[start..start + @intCast(usize, index.*.reuseNameLength[which])], name) {
+                index.*.reuseUsed[which] = 1
+                return index.*.reuseIds[which]
+            }
+        }
+        at = index.*.reuseNext[which]
+    }
+    return NONE
 }
 
 // A symbol named by token `token` of `file`.
@@ -467,6 +518,13 @@ fn arenaOf(index: *Index) -> *arena_allocator.Arena {
 }
 
 fn parseFile(index: *Index, file: u32) -> void {
+    parseText(index, file)
+    const record = fileAt(index, file)
+    record.*.symbol = addSymbol(index, FILE, file, 0, 0, record.*.root, NONE)
+}
+
+// Lexes and parses a file's text; where its lines start.
+fn parseText(index: *Index, file: u32) -> void {
     const record = fileAt(index, file)
     const source = record.*.source[0..record.*.sourceLength]
     lexer.scanAllLengthInto(tokensOf(record), index.*.allocator, source, record.*.sourceLength)
@@ -501,7 +559,6 @@ fn parseFile(index: *Index, file: u32) -> void {
         at += 1
     }
     record.*.lineCount = lines
-    record.*.symbol = addSymbol(index, FILE, file, 0, 0, record.*.root, NONE)
 }
 
 // ---------------------------------------------------------------------------
@@ -1552,6 +1609,8 @@ pub fn reset(index: *Index, root: []const u8) -> void {
     index.*.unresolved = 0
     index.*.walkSelf = NONE
     index.*.walkFrom = NONE
+    index.*.refreshing = false
+    index.*.reuseCount = 0
 }
 
 // Adds a file to the index (its imports come with it when built).
@@ -1627,6 +1686,153 @@ pub fn build(index: *Index) -> void {
         walkFile(index, @intCast(u32, file))
         file += 1
     }
+}
+
+// ---------------------------------------------------------------------------
+// Reading one file again
+
+// How much of the index's memory is in use (bytes); refreshFile adds to
+// it, a build starts it over.
+pub fn memoryUsed(index: *Index) -> usize { return arenaOf(index).*.offset }
+
+// Reads file `file` again from `text` (an editor's, as it is now): parsed,
+// declared and its uses resolved again, the rest of the index as it is.
+// Its declarations keep their symbols (by container, name and kind), so
+// the uses in other files still find them; the ones it has no longer turn
+// DEAD, new ones are added. False when it cannot (the index is full).
+pub fn refreshFile(index: *Index, file: u32, text: []const u8) -> bool {
+    if @intCast(usize, file) >= index.*.fileCount { return false }
+    if index.*.refCount + text.length / 2 + 65536 >= MAX_REFS || index.*.symbolCount + text.length / 4 + 4096 >= MAX_SYMBOLS { return false }
+    const record = fileAt(index, file)
+    const file_symbol = record.*.symbol
+    const allocator = index.*.allocator
+    // Its symbols now, with their names (the text goes).
+    var count: usize = 0
+    var names: usize = 0
+    var symbol: usize = 0
+    while symbol < index.*.symbolCount {
+        const value = symbolAt(index, @intCast(u32, symbol))
+        if value.*.file == file && @intCast(u32, symbol) != file_symbol && value.*.kind != DEAD {
+            count += 1
+            names += @intCast(usize, value.*.nameLength)
+        }
+        symbol += 1
+    }
+    var mask: usize = 1
+    while mask < count * 2 + 2 { mask = mask * 2 }
+    unsafe {
+        index.*.reuseIds = @ptrCast([*]u32, allocateArray(allocator, count * 4 + 4))
+        index.*.reuseParents = @ptrCast([*]u32, allocateArray(allocator, count * 4 + 4))
+        index.*.reuseNameStart = @ptrCast([*]u32, allocateArray(allocator, count * 4 + 4))
+        index.*.reuseNameLength = @ptrCast([*]u32, allocateArray(allocator, count * 4 + 4))
+        index.*.reuseNext = @ptrCast([*]u32, allocateArray(allocator, count * 4 + 4))
+        index.*.reuseHeads = @ptrCast([*]u32, allocateArray(allocator, mask * 4))
+    }
+    index.*.reuseKinds = allocateArray(allocator, count + 1)
+    index.*.reuseUsed = allocateArray(allocator, count + 1)
+    index.*.reuseText = allocateArray(allocator, names + 1)
+    index.*.reuseMask = mask - 1
+    var at: usize = 0
+    while at < mask {
+        index.*.reuseHeads[at] = NONE
+        at += 1
+    }
+    const old_source = sourceOf(index, file)
+    var text_used: usize = 0
+    count = 0
+    symbol = 0
+    while symbol < index.*.symbolCount {
+        const id = @intCast(u32, symbol)
+        const value = symbolAt(index, id)
+        if value.*.file == file && id != file_symbol && value.*.kind != DEAD {
+            const start = @intCast(usize, value.*.nameStart)
+            const length = @intCast(usize, value.*.nameLength)
+            const name = old_source[start..start + length]
+            index.*.reuseIds[count] = id
+            index.*.reuseParents[count] = value.*.parent
+            index.*.reuseKinds[count] = value.*.kind
+            index.*.reuseUsed[count] = 0
+            index.*.reuseNameStart[count] = @intCast(u32, text_used)
+            index.*.reuseNameLength[count] = @intCast(u32, length)
+            var copied: usize = 0
+            while copied < length {
+                index.*.reuseText[text_used + copied] = name[copied]
+                copied += 1
+            }
+            text_used += length
+            const bucket = @intCast(usize, hashBytes(@intCast(u64, value.*.parent), name)) & index.*.reuseMask
+            index.*.reuseNext[count] = index.*.reuseHeads[bucket]
+            index.*.reuseHeads[bucket] = @intCast(u32, count)
+            // Out of the member table and its container until declared
+            // again.
+            value.*.parent = NONE
+            value.*.firstChild = NONE
+            value.*.lastChild = NONE
+            value.*.nextSibling = NONE
+            count += 1
+        }
+        symbol += 1
+    }
+    index.*.reuseCount = count
+    // Its uses before are no one's.
+    var ref = record.*.refStart
+    while ref < record.*.refEnd {
+        refAt(index, ref).*.symbol = NONE
+        ref += 1
+    }
+    // The new text, parsed; the file keeps its symbol.
+    const copy = allocator.alloc(text.length + 1, 16)
+    if copy == null { return false }
+    at = 0
+    while at < text.length {
+        copy.?[at] = text[at]
+        at += 1
+    }
+    copy.?[text.length] = 0
+    record.*.source = copy.?
+    record.*.sourceLength = text.length
+    parseText(index, file)
+    const container = symbolAt(index, file_symbol)
+    container.*.node = @intCast(u32, record.*.root)
+    container.*.firstChild = NONE
+    container.*.lastChild = NONE
+    record.*.loaded = false
+    // Declared and walked again (and files it imports now that were not
+    // read yet).
+    const files_before = index.*.fileCount
+    index.*.refreshing = true
+    index.*.refreshingFile = file
+    declareFile(index, file)
+    var other = files_before
+    while other < index.*.fileCount {
+        declareFile(index, @intCast(u32, other))
+        other += 1
+    }
+    walkFile(index, file)
+    index.*.refreshing = false
+    other = files_before
+    while other < index.*.fileCount {
+        walkFile(index, @intCast(u32, other))
+        other += 1
+    }
+    // What it declares no longer.
+    at = 0
+    while at < count {
+        if index.*.reuseUsed[at] == 0 {
+            const value = symbolAt(index, index.*.reuseIds[at])
+            value.*.kind = DEAD
+            value.*.nameStart = 0
+            value.*.nameLength = 0
+            value.*.node = NONE
+            value.*.typeNode = NONE
+            value.*.valueNode = NONE
+            value.*.firstToken = NONE
+            value.*.flags = 0
+        }
+        at += 1
+    }
+    index.*.reuseCount = 0
+    return true
 }
 
 // ---------------------------------------------------------------------------
