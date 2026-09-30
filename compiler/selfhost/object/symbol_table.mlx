@@ -26,9 +26,9 @@ const SYMBOL_SIZE: usize = 24
 const SECTION_SIZE: usize = 64
 const SHF_EXECINSTR: usize = 4
 const STT_FUNC: u8 = 2
-// The names of the two new sections, ".symtab" and ".strtab" (NUL after
-// each), appended to .shstrtab.
-const NEW_NAMES_LENGTH: usize = 16
+// The names of the three new sections, ".symtab", ".strtab" and
+// ".mlx_lines" (NUL after each), appended to .shstrtab.
+const NEW_NAMES_LENGTH: usize = 27
 
 // The functions found in the code: where each starts, and its name in the
 // string table being built.
@@ -56,7 +56,157 @@ pub fn addToFile(allocator: Allocator, path: [*]const u8, loader: *modules.Loade
     if !collectRuntime(&table, enc) { return false }
     if !collectLiterals(&table, ir, enc) { return false }
     sortByOffset(&table)
-    return rewrite(allocator, path, &table, encoder_module.pos(enc))
+    var lines = Lines.{ .bytes = undefined, .length = 0, .capacity = 0 }
+    if !buildLines(allocator, &lines, loader, ir) { return false }
+    return rewrite(allocator, path, &table, &lines, encoder_module.pos(enc))
+}
+
+// The line table (.mlx_lines): where the machine code of each source line
+// starts. It is
+//
+//     "MLXLINES", entries (u32), files (u32),
+//     per entry: code offset from .text, file, line (u32 each; from 1),
+//     the files' paths, each ended by a NUL (a file is a module).
+//
+// The crash handler and mlx-profile read it to name the line an address
+// is on.
+const Lines = struct {
+    bytes: [*]u8
+    length: usize
+    capacity: usize
+}
+
+fn putWord(lines: *Lines, allocator: Allocator, value: usize) -> bool {
+    if lines.*.length + 4 > lines.*.capacity {
+        const bigger = lines.*.capacity * 2 + 65536
+        const memory = allocator.alloc(bigger, 8)
+        if memory == null { return false }
+        if lines.*.length > 0 { mem.copy(memory.?, lines.*.bytes, lines.*.length) }
+        lines.*.bytes = memory.?
+        lines.*.capacity = bigger
+    }
+    elf.writeU32(lines.*.bytes, lines.*.length, @intCast(u32, value & 4294967295))
+    lines.*.length += 4
+    return true
+}
+
+fn buildLines(allocator: Allocator, lines: *Lines, loader: *modules.Loader, ir: *lir.Lir) -> bool {
+    const module_count = modules.moduleCount(loader)
+    // Each module's line starts, made when first needed.
+    const table_memory = allocator.alloc(module_count * 16 + 16, 8)
+    if table_memory == null { return false }
+    var starts: [*]usize = undefined
+    unsafe { starts = @ptrCast([*]usize, table_memory.?) }
+    var at: usize = 0
+    while at < module_count * 2 {
+        starts[at] = 0
+        at += 1
+    }
+    // The header, the count filled in at the end.
+    var magic: [*]const u8 = undefined
+    unsafe { magic = @ptrCast([*]const u8, "MLXLINES") }
+    if !putWord(lines, allocator, 0) || !putWord(lines, allocator, 0) || !putWord(lines, allocator, 0) || !putWord(lines, allocator, 0) { return false }
+    mem.copy(lines.*.bytes, magic, 8)
+    var count: usize = 0
+    var last_module: usize = lir.NONE
+    var last_line: usize = 0
+    var last_offset: usize = lir.NONE
+    var index: usize = 0
+    while index < lir.instCount(ir) {
+        const source = lir.sourceOf(ir, index)
+        if source != lir.NONE {
+            const module = source >> 32
+            const byte = source & 4294967295
+            const offset = lir.codeOffsetOf(ir, index)
+            if module < module_count {
+                const line = lineOf(allocator, loader, starts, module, byte)
+                if line > 0 {
+                    if count > 0 && offset == last_offset {
+                        // Nothing emitted since: this line starts there.
+                        elf.writeU32(lines.*.bytes, lines.*.length - 8, @intCast(u32, module))
+                        elf.writeU32(lines.*.bytes, lines.*.length - 4, @intCast(u32, line))
+                        last_module = module
+                        last_line = line
+                    } else if module != last_module || line != last_line {
+                        if !putWord(lines, allocator, offset) || !putWord(lines, allocator, module) || !putWord(lines, allocator, line) { return false }
+                        count += 1
+                        last_module = module
+                        last_line = line
+                        last_offset = offset
+                    }
+                }
+            }
+        }
+        index += 1
+    }
+    elf.writeU32(lines.*.bytes, 8, @intCast(u32, count))
+    elf.writeU32(lines.*.bytes, 12, @intCast(u32, module_count))
+    // The files.
+    var module: usize = 0
+    while module < module_count {
+        const value = modules.moduleAt(loader, module)
+        var path: [*]const u8 = undefined
+        unsafe { path = @ptrCast([*]const u8, value.*.pathPointer) }
+        var byte: usize = 0
+        while byte <= value.*.pathLength {
+            if lines.*.length + 1 > lines.*.capacity {
+                if !putWord(lines, allocator, 0) { return false }
+                lines.*.length -= 4
+            }
+            lines.*.bytes[lines.*.length] = if byte < value.*.pathLength { path[byte] } else { 0 }
+            lines.*.length += 1
+            byte += 1
+        }
+        module += 1
+    }
+    return true
+}
+
+// The line (from 1) of byte `offset` of `module` (0: none): the module's
+// line starts are made the first time, then searched.
+fn lineOf(allocator: Allocator, loader: *modules.Loader, starts: [*]usize, module: usize, offset: usize) -> usize {
+    if starts[module * 2] == 0 {
+        const value = modules.moduleAt(loader, module)
+        if value.*.sourceAddress == 0 { return 0 }
+        var bytes: [*]const u8 = undefined
+        var length: usize = 0
+        unsafe {
+            const source = @ptrFromInt(*source_module.SourceFile, value.*.sourceAddress)
+            bytes = @ptrCast([*]const u8, source.*.bytes)
+            length = source.*.length
+        }
+        var count: usize = 1
+        var at: usize = 0
+        while at < length {
+            if bytes[at] == 10 { count += 1 }
+            at += 1
+        }
+        const memory = allocator.alloc(count * 8 + 8, 8)
+        if memory == null { return 0 }
+        var line_starts: [*]usize = undefined
+        unsafe { line_starts = @ptrCast([*]usize, memory.?) }
+        line_starts[0] = 0
+        var line: usize = 1
+        at = 0
+        while at < length {
+            if bytes[at] == 10 {
+                line_starts[line] = at + 1
+                line += 1
+            }
+            at += 1
+        }
+        starts[module * 2] = @intFromPtr(line_starts)
+        starts[module * 2 + 1] = count
+    }
+    var line_starts: [*]usize = undefined
+    unsafe { line_starts = @ptrFromInt([*]usize, starts[module * 2]) }
+    var low: usize = 0
+    var high = starts[module * 2 + 1]
+    while low + 1 < high {
+        const middle = (low + high) / 2
+        if line_starts[middle] <= offset { low = middle } else { high = middle }
+    }
+    return low + 1
 }
 
 fn grow(table: *Table, capacity: usize) -> bool {
@@ -257,7 +407,7 @@ fn alignUp(value: usize, alignment: usize) -> usize {
 // Reads the file, drops its section headers (the writers put them last),
 // and writes it again with a longer .shstrtab, .symtab, .strtab and the
 // section headers after them.
-fn rewrite(allocator: Allocator, path: [*]const u8, table: *Table, code_length: usize) -> bool {
+fn rewrite(allocator: Allocator, path: [*]const u8, table: *Table, lines: *Lines, code_length: usize) -> bool {
     const input = fs.open(path, fs.READ_ONLY, 0)
     if !fs.isValid(input) { return false }
     const end = fs.seek(input, 0, 2)
@@ -309,8 +459,9 @@ fn rewrite(allocator: Allocator, path: [*]const u8, table: *Table, code_length: 
     const symbols_offset = alignUp(new_names_offset + new_names_size, 8)
     const symbols_size = (table.*.count + 1) * SYMBOL_SIZE
     const strings_offset = symbols_offset + symbols_size
-    const new_section_offset = alignUp(strings_offset + table.*.stringLength, 8)
-    const new_section_count = section_count + 2
+    const lines_offset = alignUp(strings_offset + table.*.stringLength, 8)
+    const new_section_offset = alignUp(lines_offset + lines.*.length, 8)
+    const new_section_count = section_count + 3
     const total = new_section_offset + new_section_count * SECTION_SIZE
     const memory = allocator.alloc(total, 8)
     if memory == null { return false }
@@ -321,6 +472,8 @@ fn rewrite(allocator: Allocator, path: [*]const u8, table: *Table, code_length: 
         mem.copy(@ptrFromInt([*]u8, @intFromPtr(image) + new_names_offset), @ptrFromInt([*]const u8, @intFromPtr(old) + names_offset), names_size)
         mem.copy(@ptrFromInt([*]u8, @intFromPtr(image) + new_names_offset + names_size), @ptrCast([*]const u8, ".symtab"), 7)
         mem.copy(@ptrFromInt([*]u8, @intFromPtr(image) + new_names_offset + names_size + 8), @ptrCast([*]const u8, ".strtab"), 7)
+        mem.copy(@ptrFromInt([*]u8, @intFromPtr(image) + new_names_offset + names_size + 16), @ptrCast([*]const u8, ".mlx_lines"), 10)
+        mem.copy(@ptrFromInt([*]u8, @intFromPtr(image) + lines_offset), lines.*.bytes, lines.*.length)
         mem.copy(@ptrFromInt([*]u8, @intFromPtr(image) + strings_offset), table.*.strings, table.*.stringLength)
         mem.copy(@ptrFromInt([*]u8, @intFromPtr(image) + new_section_offset), @ptrFromInt([*]const u8, @intFromPtr(old) + section_offset), section_count * SECTION_SIZE)
     }
@@ -359,6 +512,13 @@ fn rewrite(allocator: Allocator, path: [*]const u8, table: *Table, code_length: 
     elf.writeU64(image, strtab + 24, @intCast(u64, strings_offset))
     elf.writeU64(image, strtab + 32, @intCast(u64, table.*.stringLength))
     elf.writeU64(image, strtab + 48, 1)
+    // .mlx_lines: bytes only this compiler's readers know.
+    const line_table = strtab + SECTION_SIZE
+    elf.writeU32(image, line_table + 0, @intCast(u32, names_size + 16))
+    elf.writeU32(image, line_table + 4, 1)
+    elf.writeU64(image, line_table + 24, @intCast(u64, lines_offset))
+    elf.writeU64(image, line_table + 32, @intCast(u64, lines.*.length))
+    elf.writeU64(image, line_table + 48, 4)
     // The ELF header: where the section headers are now, and how many.
     elf.writeU64(image, 40, @intCast(u64, new_section_offset))
     elf.writeU16(image, 60, @intCast(u16, new_section_count))

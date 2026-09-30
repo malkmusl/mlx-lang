@@ -711,13 +711,14 @@ it:
 
 ```
 mlx-compositor: crashed: illegal instruction (a failed runtime check: ...)
-  at examples/wayland-compositor/shell.mlx:812:placeWindow+0x1a3
-  from examples/wayland-compositor/shell.mlx:640:mapWindow+0x88
-  from examples/wayland-compositor/main.mlx:902:run+0x2f1
+  at examples/wayland-compositor/shell.mlx:812:placeWindow+0x1a3 at examples/wayland-compositor/shell.mlx:830
+  from examples/wayland-compositor/shell.mlx:640:mapWindow+0x88 at examples/wayland-compositor/shell.mlx:671
+  from examples/wayland-compositor/main.mlx:902:run+0x2f1 at examples/wayland-compositor/main.mlx:988
 ```
 
 The compiler writes a symbol table that names every function
-`path:line:name`; the handler (`crash.mlx`) reads it from the file each
+`path:line:name` (where it is declared), and a line table: `at path:line`
+is the line the address is on; the handler (`crash.mlx`) reads it from the file each
 address is in (the compositor, one of its modules, a C library:
 `/proc/self/maps` says which) and follows the frame pointers to the
 callers. A recursion is said once (`(22 more times)`). The dock, the file

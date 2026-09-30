@@ -57,7 +57,13 @@ runtime foundation remain independent of libc and Zig dependencies:
   crash handler of the desktop programs
   (`examples/wayland-compositor/crash.mlx`) names the functions a crash went
   through with them. The lowering keeps each function's module and name
-  offset on its LIR symbol for this. `tools/check_crash_report.sh` checks it.
+  offset on its LIR symbol for this. It also adds a line table
+  (`.mlx_lines`): the lowering notes on every LIR instruction where in the
+  source it comes from (`lir.setSource`), the backend notes where its
+  machine code starts, and the table lists where each line's code begins
+  ("MLXLINES", entries of code offset, file and line, then the files'
+  paths). The crash handler names the exact line with it.
+  `tools/check_crash_report.sh` checks both.
 - `backend/aarch64/` is the AArch64 backend with the same module split, plus
   `codegen/runtime.mlx` (arena, byte mask and the x86_64-to-aarch64 syscall
   translator). `--target=aarch64-linux` writes an executable through
