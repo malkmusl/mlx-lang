@@ -88,23 +88,26 @@ shot only-std
 all
 programs open
 program mlx-codemap
+programs close
 metric size
 settle
 shot program-machine-code
 program all
-programs close
 metric churn
 finding complex
 settle
 shot churn-complex
+check complex off
 metric risk
 finding risky
 settle
 shot risk
+check risky off
 metric heat
 finding hot
 settle
 shot heat
+check hot off
 metric kind
 finding crashes
 settle
@@ -118,23 +121,30 @@ wait 300
 shot rewrite
 back
 workarounds close
+check workarounds off
 finding copies
 settle
 shot copies
+check copies off
 finding untested
 settle
 shot untested
+check untested off
 finding structure
 settle
 shot structure
+check structure off
 finding none
+settle
 popup base
 wait 300
 shot base
-base HEAD~6
+base HEAD~3
 settle
 shot changed
+check changed off
 finding none
+settle
 popup filter
 wait 300
 shot filter
@@ -144,6 +154,7 @@ enter
 settle
 shot query
 search @Untested std
+enter
 settle
 fold groups
 fold program
