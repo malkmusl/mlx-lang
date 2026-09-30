@@ -166,6 +166,7 @@ try:
     answer = client.request('textDocument/hover', {'textDocument': main, 'position': position(MAIN, 'shapes.add', 8)})['result']
     text = answer['contents']['value'] if answer else ''
     check('hover of add: signature, doc comment, place', 'pub fn add(first: i32, second: i32) -> i32' in text and 'Adds two numbers' in text and 'lib/shapes.mlx:15' in text, text)
+    check('hover of add: where it is first', text.startswith('`lib/shapes.mlx`'), text)
     answer = client.request('textDocument/hover', {'textDocument': main, 'position': position(MAIN, 'return total', 7)})['result']
     text = answer['contents']['value'] if answer else ''
     check('hover of a local: its declaration', 'const total = shapes.add' in text, text)

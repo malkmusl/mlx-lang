@@ -382,7 +382,6 @@ accept
 edit .gre
 complete
 accept
-edit (
 signature
 wait 200
 shot completion
@@ -489,7 +488,7 @@ echo "ok   editor: the lens (uses, a click lists them and opens one), a workarou
 # Completion from the index: what is in scope (the import helper), the
 # members after the dot (greet); the signature of the call typed.
 grep -q "^codemap: completion first helper$" "$work/demo.log" && grep -q "^codemap: completed helper$" "$work/demo.log" \
-    && grep -q "^codemap: completion first greet$" "$work/demo.log" && grep -q "^codemap: completed greet$" "$work/demo.log" \
+    && grep -q "^codemap: completion first greet$" "$work/demo.log" && grep -q "^codemap: completed greet($" "$work/demo.log" \
     && grep -q "^codemap: signature greet$" "$work/demo.log" && grep -q "^codemap: signature at, argument 0$" "$work/demo.log" \
     || fail "editor: completion (helper, then greet after the dot) or the signature of greet(" "$work/demo.log"
 echo "ok   editor: completion (in scope, after a dot), signature help"

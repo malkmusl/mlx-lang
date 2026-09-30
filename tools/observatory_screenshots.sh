@@ -70,6 +70,9 @@ call_line=$(awk -v from="$scan_line" 'NR > from && /placeAt\(workarounds/ { prin
 call_text=$(sed -n "${call_line}p" "$scan_file")
 prefix=${call_text%%placeAt*}
 call_column=$((${#prefix} + 2))
+scan_text=$(sed -n "${scan_line}p" "$scan_file")
+prefix=${scan_text%%Workarounds*}
+struct_column=$((${#prefix} + 3))
 after_line=$((use_line + 1))
 after_text=$(sed -n "${after_line}p" "$scan_file")
 after_end=$((${#after_text} + 1))
@@ -213,6 +216,12 @@ shot editor
 hoverat $field_line $field_column
 wait 300
 shot editor-hover
+hoverat $call_line $call_column
+wait 300
+shot hover-doc
+hoverat $scan_line $struct_column
+wait 300
+shot hover-struct
 hoverat 1 1
 cursor $call_line $call_column
 references
@@ -233,6 +242,14 @@ edit \\nworkarounds.*.
 complete
 wait 300
 shot completion
+escape
+cursor $after_line $after_end
+select-to $((after_line + 1)) 200
+delete-selection
+edit \\nstd.fs.op
+complete
+wait 300
+shot completion-std
 escape
 cursor $after_line $after_end
 select-to $((after_line + 1)) 200
