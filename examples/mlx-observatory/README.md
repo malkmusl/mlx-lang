@@ -451,9 +451,15 @@ What the map knows is in the editor, where the code is:
   reads the code again, so the map, the findings and the Changed marks
   follow the edit.
 
-What the index says fits the text as the index read it: in a file edited
-since, the hover, the colors and the lens rows move with the lines, and
-rename waits for the next read.
+The index keeps up with the typing: a moment (300 ms) after an edit, the
+tab's file is read into it again, saved or not
+([`index_module.refreshFile`](../../tools/codemap/index.mlx), about 15 ms
+for a file of 900 lines). Its declarations keep their symbols, so the
+uses in other files still find them; the hover, the colors, the uses at
+the cursor, the lens rows, completion, F12 and the workaround hints know
+the text as it is. A declaration added since the map was made says it is
+new; its measures (machine code, commits, time) come when the map reads
+the whole code again, which it does when files change on disk.
 
 | | |
 |---|---|
@@ -713,7 +719,9 @@ committed).
    the signature of `greet(`; F2 renames `twice` in both its files; a
    line's blame is Git's; Build builds the program; Commit commits an
    edit with its message; Escape keeps the editor's file; the map reads
-   the saved files again.
+   the saved files again; completion after `std.fs.` offers the public
+   functions of a std of the tree's own; a local typed and not saved is
+   in the hover, with its type, a moment after.
 
 `tools/check_crash_report.sh` checks the crash reports themselves: the
 symbol table, the functions a crash names and the kept log.
