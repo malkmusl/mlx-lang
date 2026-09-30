@@ -1,6 +1,12 @@
 # MLX Observatory IDE
 
-The code base as a space to fly through. Every folder is a group with its
+An IDE for Mlx around a map of the code: fly through the code base,
+open what you find in the built-in editor, see the compiler's problems,
+the crashes, the workarounds and the time spent right on the lines, then
+build the program and commit, without leaving the window. *Observatory*
+for short.
+
+The map is the code base as a space to fly through. Every folder is a group with its
 files around it, and every file has its declarations around it: functions,
 structs, enums, constants, variables and tests. Structs have their fields
 and functions around them. Lines show what belongs where and which file
@@ -10,19 +16,25 @@ imports which. Select something and new lines show what it connects to:
 - orange for what calls, uses or imports it.
 
 The panel on the right lists the same connections, with the signature and
-the doc comment. It is laid out like the file manager
-([`examples/mlx-files`](../mlx-files/main.mlx)): the groups in a
-translucent sidebar, back and forward, the name and a search field in the
-toolbar, and where you are in the status bar.
+the doc comment, and has back and forward at its top. It is laid out like
+the file manager ([`examples/mlx-files`](../mlx-files/main.mlx)): the
+groups in a translucent sidebar, the name, Build, Commit and a search
+field in the toolbar, and where you are in the status bar.
+
+At the top of the sidebar, *View* switches between the **Map** and the
+**Editor** (Ctrl+E); see [The editor](#the-editor) and
+[Build and commit](#build-and-commit).
 
 ![A flight through this repository: the galaxy turns, a search finds
 drawSidebar, the camera flies to it and to its group, the spheres take
-the colors of where the time goes, then the crashes.](screenshots/tour.gif)
+the colors of where the time goes, then the crashes, and the hottest
+function opens in the editor.](screenshots/tour.gif)
 
 All pictures here are of this whole repository, with real data: the
 crashes of [`tests/support/crash_report.mlx`](../../tests/support/crash_report.mlx),
 profiles of `mlx-codemap` itself under `mlx-profile`, the programs built,
-and the Git history. [`tools/observatory_screenshots.sh`](../../tools/observatory_screenshots.sh)
+and the Git history. The editor's pictures edit a real file and put it
+back. [`tools/observatory_screenshots.sh`](../../tools/observatory_screenshots.sh)
 takes them again (see [Pictures](#pictures)).
 
 ```
@@ -119,6 +131,32 @@ what does not answer is left out; the field counts what does.</td>
 <td><img src="screenshots/views.png" alt="Views, with sections folded up"><br>
 <b>Views.</b> Queries kept in <code>codemap.views</code>, at the end of
 the sidebar; every section folds up.</td>
+</tr>
+<tr>
+<td><img src="screenshots/editor.png" alt="scanFile in the editor"><br>
+<b>The editor.</b> The hottest function of the profiles: the heat bar by
+the line numbers, the code lens (uses, machine code, commits, time),
+the panel still on the declaration at the cursor.</td>
+<td><img src="screenshots/editor-hover.png" alt="Hovering a call"><br>
+<b>Hover.</b> What a name is, from the index: its signature, uses,
+machine code and commits.</td>
+</tr>
+<tr>
+<td><img src="screenshots/editor-problem.png" alt="A compiler error on its line"><br>
+<b>The compiler's problems.</b> Saved with a name nobody declared: the
+compiler's errors on their lines, the changed line marked, the count and
+the message at the cursor in the status bar.</td>
+<td><img src="screenshots/commit.png" alt="The commit list"><br>
+<b>Commit.</b> The changed files and a message; Enter commits,
+<i>Commit and push</i> pushes too.</td>
+</tr>
+<tr>
+<td><img src="screenshots/build.png" alt="Built"><br>
+<b>Build.</b> The program that reaches the file shown, into
+<code>mlx-out/bin</code>, in the background.</td>
+<td><img src="screenshots/map-after-editor.png" alt="Back in the map"><br>
+<b>Back to the map.</b> The map reads the saved files again and stands
+on the declaration the cursor was on.</td>
 </tr>
 </table>
 
@@ -294,6 +332,75 @@ The command line lists the same findings: `mlx-codemap copies [PATH]`,
 `mlx-codemap names [PATH]`, `mlx-codemap unused [PATH]`,
 `mlx-codemap workarounds [PATH]` and `mlx-codemap crashes [PATH]`.
 
+## The editor
+
+*Open in editor* in the panel, Ctrl+O, or a click on a result while the
+Editor is shown opens a declaration's file at its line
+([`editor.mlx`](editor.mlx)). Up to six files are open as tabs; a dot
+marks one with edits not saved, and its x closes it (Shift+click closes
+one not saved). When all six hold edits, a seventh file does not open
+until one is saved or closed.
+
+- **Colors:** keywords, types, builtins, strings, numbers, comments, doc
+  comments, calls and constants, in the colors of the map's kinds.
+- **The gutter:** lines added (green), changed (blue) and removed (red)
+  since the base of Changed; the compiler's errors and warnings (dots);
+  where a crash stopped or went through, and workarounds. By the line
+  numbers, a bar in the heat colors shows how much time each declaration
+  took in the profiles.
+- **Code lens:** after a declaration's first line, how often it is used,
+  its machine code, its commits, its risk, its crashes and its share of
+  the time.
+- **Hover:** a name's declaration from the index (signature, uses,
+  machine code, commits).
+- **Go to the declaration:** Ctrl+click or F12; back (the panel's arrow,
+  Alt+Left) returns to where you came from, in the editor.
+- **Map and editor together:** the panel follows the declaration at the
+  cursor; *Show in map* switches to the map and flies there.
+- **The compiler's problems:** each file is checked when it opens and
+  when it is saved (the compiler runs in the background, as for
+  `mlx-lsp`). Errors and warnings are underlined, their message is at
+  the end of the line and, for the cursor's line, in the status bar.
+- **Saving** (Ctrl+S, *Save*) writes the file; the next switch to the map
+  reads the code again, so the map, the findings and the Changed marks
+  follow the edit.
+
+| | |
+|---|---|
+| arrows, Ctrl+arrows | move, by words |
+| Shift+ | select |
+| Home, End, Page Up, Page Down, Ctrl+Home, Ctrl+End | line, page, file |
+| click, double click, drag | the cursor, a word, a selection |
+| Enter, Tab | a new line with the indent (one more after `{`), spaces to the next stop of four |
+| Backspace, Delete (Ctrl: a word) | delete |
+| Ctrl+Z, Ctrl+Shift+Z, Ctrl+Y | undo, redo |
+| Ctrl+A, Ctrl+C, Ctrl+X, Ctrl+V | select all, copy, cut, paste |
+| Ctrl+S | save |
+| F12, Ctrl+click | go to the declaration |
+| Escape | drop the selection (the file stays) |
+| Ctrl+E | back to the map |
+| Ctrl+Shift+O | open the file in the outside editor (`MLX_EDITOR`, else VS Code, else `xdg-open`) |
+
+## Build and commit
+
+**Build** (toolbar, Ctrl+B) saves the edited tabs and builds a program
+into `ROOT/mlx-out/bin/NAME` in the background: in the editor, the
+program whose `main` is the file shown, else the one chosen under
+Program, else the first program that reaches the file; in the map, the
+one chosen under Program. The status bar says how long it took; a failed
+build opens its first error in the editor. The new binary's machine code
+goes on the declarations at once.
+
+**Commit** (toolbar; the number is how many files changed) lists the
+changed files (`git status`) and takes a message. Enter or *Commit*
+saves the edited tabs and runs `git add -A` and `git commit`; Ctrl+Enter
+or *Commit and push* also runs `git push -u origin HEAD`. Git runs in the
+background; the status bar says how it went (with Git's own error when it
+failed), and Changed and the editor's marks follow.
+
+The compiler for checks and Build is `$MLX_COMPILER`, else the root's
+`mlx-out/bin/compiler/mlx4`, else `mlx4` on the `PATH`.
+
 ## Using it
 
 | | |
@@ -306,18 +413,22 @@ The command line lists the same findings: `mlx-codemap copies [PATH]`,
 | typing, Ctrl+F, / | search; Enter or a click flies to a result |
 | a query in the search | leaves out what does not answer it (see Queries); Enter flies to what is left |
 | Filter (toolbar) | adds a query word to the search: first what fits the selection (in its group, calls it, called by it, uses it), then the findings and kinds |
-| the bookmark, Ctrl+S | keeps the query in the search as a view (codemap.views) |
+| the bookmark, Ctrl+S (in the map) | keeps the query in the search as a view (codemap.views) |
 | Since ... (toolbar) | the base of Changed: not committed yet, or one of the last 15 commits |
 | a section's heading | folds it up or opens it (kept in `~/.config/mlx/observatory-sections`) |
-| Escape | clear the search, then the selection, then go up a group |
+| Escape | close a list, clear the search, then the selection, then go up a group (in the editor: only the list and the search) |
 | Enter | fly to the selection |
 | Alt+Up | its group |
-| Backspace, Alt+Left / Alt+Right | back / forward |
+| Backspace, Alt+Left / Alt+Right, the arrows at the top of the panel | back / forward |
 | arrows | turn |
 | Home | everything |
-| Ctrl+O, "Open in editor" | open it at its line: `MLX_EDITOR`, else VS Code (`code -g`), else `xdg-open` |
+| Ctrl+O, "Open in editor" | open it at its line in the editor |
+| Ctrl+Shift+O | open it in the outside editor: `MLX_EDITOR`, else VS Code (`code -g`), else `xdg-open` |
+| Ctrl+E, View (sidebar) | switch between the map and the editor |
+| Ctrl+B, Build | build (see Build and commit) |
+| Commit | commit, or commit and push |
 | F5, Ctrl+R, "Read again" | read the code again, keeping the selection |
-| Ctrl+W | close |
+| Ctrl+W | close (with tabs not saved: press it twice) |
 
 The sidebar lists the groups, and the groups inside them on the way to
 what is selected, with how many files each holds. A click flies there.
@@ -472,7 +583,10 @@ is smooth however long a frame takes to draw.
 needs, makes the data (crashes, profiles, built programs, the history of
 the last 20 commits), plays a tour and a script with a picture per
 feature on lavapipe, and writes the PNGs and the GIF (with Python and
-Pillow) into `screenshots/`. It takes about a quarter of an hour.
+Pillow) into `screenshots/`. It takes about a quarter of an hour;
+`MLX_SHOTS_ONLY=tour|features|editor` plays one part. The editor's part
+edits `tools/codemap/workarounds.mlx` and puts it back (it has to be
+committed).
 
 ## Checks
 
@@ -495,7 +609,11 @@ Pillow) into `screenshots/`. It takes about a quarter of an hour.
    has the app print what it read and selected, the crashes it put on
    declarations, and how much each finding shows.
 4. Compares the pictures from both runs.
-5. Plays a small demo script and checks the frames it wrote.
+5. Plays a small demo script and checks the frames it wrote. In it, the
+   editor opens a file, goes to a declaration with F12, saves a name
+   nobody declared and gets the compiler's error on its line, undoes it;
+   Build builds the program; Commit commits an edit with its message;
+   Escape keeps the editor's file; the map reads the saved files again.
 
 `tools/check_crash_report.sh` checks the crash reports themselves: the
 symbol table, the functions a crash names and the kept log.
