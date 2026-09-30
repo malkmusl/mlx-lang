@@ -416,6 +416,13 @@ cursor 3 8
 rename double
 wait 300
 blameat 1
+new-file lib
+wait 200
+shot create
+escape
+new-folder lib tools
+new-file lib/tools util
+wait 300
 open app/main.mlx 5
 wait 300
 cursor 5 32
@@ -552,6 +559,11 @@ if [[ -n "${have_git:-}" ]]; then
     grep -q "^codemap: blame [0-9a-f]\{7\} · check · today · one$" "$work/demo.log" || fail "editor: the blame of a line is not Git's" "$work/demo.log"
 fi
 echo "ok   editor: rename (F2) across files, the blame of a line"
+# A new folder in lib, a new file in it: made, read, opened.
+grep -q "^codemap: created folder lib/tools$" "$work/demo.log" && grep -q "^codemap: created file lib/tools/util.mlx$" "$work/demo.log" \
+    && grep -q "^codemap: editor open $tree/lib/tools/util.mlx$" "$work/demo.log" && [[ -f "$tree/lib/tools/util.mlx" ]] \
+    || fail "sidebar: a new folder and a new file in it" "$work/demo.log"
+echo "ok   sidebar: a new folder, a new file in it (made, read, opened)"
 # Build: the program app into the tree's mlx-out/bin; Commit: the edit
 # with its message (when the tree is a Git work tree).
 grep -q "^codemap: build done: Built app in [0-9.]* s: mlx-out/bin/app$" "$work/demo.log" && [[ -x "$tree/mlx-out/bin/app" ]] \
