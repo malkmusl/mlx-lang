@@ -15,6 +15,16 @@ the doc comment. It is laid out like the file manager
 translucent sidebar, back and forward, the name and a search field in the
 toolbar, and where you are in the status bar.
 
+![A flight through this repository: the galaxy turns, a search finds
+drawSidebar, the camera flies to it and to its group, the spheres take
+the colors of where the time goes, then the crashes.](screenshots/tour.gif)
+
+All pictures here are of this whole repository, with real data: the
+crashes of [`tests/support/crash_report.mlx`](../../tests/support/crash_report.mlx),
+profiles of `mlx-codemap` itself under `mlx-profile`, the programs built,
+and the Git history. [`tools/codemap_screenshots.sh`](../../tools/codemap_screenshots.sh)
+takes them again (see [Pictures](#pictures)).
+
 ```
 mlx-codemap [ROOT]          the 3D view of ROOT (default: MLX_CODEMAP_ROOT,
                             else the Git work tree around the working
@@ -27,6 +37,89 @@ mlx-codemap [ROOT]          the 3D view of ROOT (default: MLX_CODEMAP_ROOT,
     --diff REV              the base of the finding Changed (HEAD)
 mlx-codemap COMMAND ...     the command line (below)
 ```
+
+## Screenshots
+
+<table>
+<tr>
+<td width="50%"><img src="screenshots/galaxy.png" alt="The whole repository as a galaxy"><br>
+<b>The galaxy.</b> Every top folder a group, the files around it, the
+declarations around them; the sidebar lists the groups and the findings.</td>
+<td width="50%"><img src="screenshots/search.png" alt="Searching drawSidebar"><br>
+<b>Search.</b> Typing finds declarations by name, with where they are.</td>
+</tr>
+<tr>
+<td><img src="screenshots/selected.png" alt="drawSidebar selected"><br>
+<b>A declaration selected.</b> Cyan lines to what it calls and uses, the
+panel with its signature, doc comment, machine code, commits,
+complexity, risk and workarounds.</td>
+<td><img src="screenshots/group.png" alt="The group mlx-codemap selected"><br>
+<b>A group selected.</b> What it depends on and what uses it, the files
+it holds.</td>
+</tr>
+<tr>
+<td><img src="screenshots/only-std.png" alt="Only std shown"><br>
+<b>Check boxes.</b> Only <code>std</code> is shown; the findings count
+what is shown.</td>
+<td><img src="screenshots/program-machine-code.png" alt="The program mlx-codemap, colored by machine code"><br>
+<b>A program.</b> Only what <code>mlx-codemap</code> reaches from its
+<code>main</code>, colored by the machine code it became.</td>
+</tr>
+<tr>
+<td><img src="screenshots/churn-complex.png" alt="Colored by changes, the complex functions"><br>
+<b>Changes and complexity.</b> Colored by the commits that wrote each
+declaration (Git blame); the complex functions listed.</td>
+<td><img src="screenshots/risk.png" alt="Colored by risk, the risky functions"><br>
+<b>Risk.</b> Crashes, workarounds, commits, complexity, copies and
+missing checks together.</td>
+</tr>
+<tr>
+<td><img src="screenshots/heat.png" alt="Colored by run time, the hot functions"><br>
+<b>Hot.</b> Where <code>mlx-codemap</code> spent its time under
+<code>mlx-profile</code>.</td>
+<td><img src="screenshots/crashes.png" alt="The crashes kept"><br>
+<b>Crashes.</b> Each kept crash with the line it stopped on and the
+functions that called it; red flags in space.</td>
+</tr>
+<tr>
+<td><img src="screenshots/workarounds.png" alt="The workarounds, with their course over the last commits"><br>
+<b>Workarounds.</b> By what the language is missing, with their course
+over the last 20 commits (the sidebar's small bars, the panel's chart).</td>
+<td><img src="screenshots/rewrite.png" alt="The rewrite of dropped results"><br>
+<b>Rewrite.</b> Every <code>const ignored = f()</code> as it would become
+<code>_ = f()</code>; <i>Apply</i> writes them.</td>
+</tr>
+<tr>
+<td><img src="screenshots/copies.png" alt="Copies"><br>
+<b>Copies.</b> Functions with the same body, the most to gain first.</td>
+<td><img src="screenshots/untested.png" alt="Untested functions"><br>
+<b>Untested.</b> What a program reaches and no check does.</td>
+</tr>
+<tr>
+<td><img src="screenshots/structure.png" alt="Cycles and layers"><br>
+<b>Cycles and layers.</b> Files that import each other round about, and
+imports the rules forbid.</td>
+<td><img src="screenshots/base.png" alt="Choosing the base of Changed"><br>
+<b>Since ...</b> The base Changed compares with: not committed yet, or one
+of the last commits.</td>
+</tr>
+<tr>
+<td><img src="screenshots/changed.png" alt="Changed since HEAD~3"><br>
+<b>Changed.</b> The declarations added and changed since that commit
+(and, at the end of the list, the ones removed).</td>
+<td><img src="screenshots/filter.png" alt="The query builder"><br>
+<b>Filter.</b> Adds query words to the search, first what fits the
+selection.</td>
+</tr>
+<tr>
+<td><img src="screenshots/query.png" alt="A query in the search"><br>
+<b>A query.</b> <code>kind:fn in:std/ uses:Allocator -untested</code>:
+what does not answer is left out; the field counts what does.</td>
+<td><img src="screenshots/views.png" alt="Views, with sections folded up"><br>
+<b>Views.</b> Queries kept in <code>codemap.views</code>, at the end of
+the sidebar; every section folds up.</td>
+</tr>
+</table>
 
 ## The galaxy
 
@@ -364,6 +457,22 @@ mlx-codemap [-C ROOT] stats | files [TEXT] | outline FILE | find TEXT |
 SYMBOL is `name`, `Container.name`, `path:name` or `FILE:LINE:COL`. The
 answers are `path:line:col: kind Qualified.name` lines.
 
+## Pictures
+
+The pictures above are made by the app itself: `MLX_CODEMAP_DEMO` names a
+script it plays (search, select, open a finding, color by a measure,
+choose a program, fold a section, ...; see `runDemo` in
+[`main.mlx`](main.mlx)), and it writes the frames it shows into
+`MLX_CODEMAP_DEMO_OUT`. While a demo plays, flights go by its own clock:
+each recorded frame moves it on by the interval asked for, so a recording
+is smooth however long a frame takes to draw.
+
+`tools/codemap_screenshots.sh [compiler] [directory]` builds what it
+needs, makes the data (crashes, profiles, built programs, the history of
+the last 20 commits), plays a tour and a script with a picture per
+feature on lavapipe, and writes the PNGs and the GIF (with Python and
+Pillow) into `screenshots/`. It takes about a quarter of an hour.
+
 ## Checks
 
 `tools/check_codemap.sh` does the following:
@@ -385,6 +494,7 @@ answers are `path:line:col: kind Qualified.name` lines.
    has the app print what it read and selected, the crashes it put on
    declarations, and how much each finding shows.
 4. Compares the pictures from both runs.
+5. Plays a small demo script and checks the frames it wrote.
 
 `tools/check_crash_report.sh` checks the crash reports themselves: the
 symbol table, the functions a crash names and the kept log.
