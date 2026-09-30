@@ -394,6 +394,9 @@ popup commit
 message Observatory check: a line
 commit
 settle
+escape
+view map
+settle
 quit
 DEMO
 printf 'wait 120000\nclose\n' > "$work/hold.script"
@@ -439,3 +442,8 @@ if [[ -n "${have_git:-}" ]]; then
         || fail "commit: the edit was not committed with its message" "$work/demo.log"
     echo "ok   commit: the edit, with its message"
 fi
+# Escape in the editor keeps its file; the map reads the saved files
+# again when it is shown.
+sed -n '/^codemap: commit done/,$p' "$work/demo.log" | grep -q "^codemap: editor open" && fail "editor: Escape opened another file" "$work/demo.log"
+sed -n '/^codemap: demo view map$/,$p' "$work/demo.log" | grep -q "^codemap: read again$" || fail "map: the saved files were not read again" "$work/demo.log"
+echo "ok   map and editor: Escape stays in the file, the map follows the saved files"
