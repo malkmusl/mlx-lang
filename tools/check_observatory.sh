@@ -375,6 +375,20 @@ wait 300
 shot editor
 hoverat 5 59
 hoverat 5 65
+cursor 3 22
+edit \nhel
+complete
+accept
+edit .gre
+complete
+accept
+edit (
+signature
+wait 200
+shot completion
+cursor 3 22
+select-to 4 18
+delete-selection
 cursor 5 32
 definition
 wait 300
@@ -465,6 +479,13 @@ grep -q "^codemap: rewritten here:     _ = extra.twice()$" "$work/demo.log" && g
 grep -q "^codemap: references greet$" "$work/demo.log" && grep -q "^codemap: references count: 2$" "$work/demo.log" && grep -q "^codemap: reference opened " "$work/demo.log" \
     || fail "editor: the lens's uses did not list greet's two uses" "$work/demo.log"
 echo "ok   editor: the lens (uses, a click lists them and opens one), a workaround's rewrite on its line"
+# Completion from the index: what is in scope (the import helper), the
+# members after the dot (greet); the signature of the call typed.
+grep -q "^codemap: completion first helper$" "$work/demo.log" && grep -q "^codemap: completed helper$" "$work/demo.log" \
+    && grep -q "^codemap: completion first greet$" "$work/demo.log" && grep -q "^codemap: completed greet$" "$work/demo.log" \
+    && grep -q "^codemap: signature greet$" "$work/demo.log" && grep -q "^codemap: signature at, argument 0$" "$work/demo.log" \
+    || fail "editor: completion (helper, then greet after the dot) or the signature of greet(" "$work/demo.log"
+echo "ok   editor: completion (in scope, after a dot), signature help"
 # Build: the program app into the tree's mlx-out/bin; Commit: the edit
 # with its message (when the tree is a Git work tree).
 grep -q "^codemap: build done: Built app in [0-9.]* s: mlx-out/bin/app$" "$work/demo.log" && [[ -x "$tree/mlx-out/bin/app" ]] \
