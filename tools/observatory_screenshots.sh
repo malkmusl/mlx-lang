@@ -59,6 +59,22 @@ prefix=${use_text%%sourceOf*}
 hover_column=$((${#prefix} + 3))
 prefix=${use_text%%index_module*}
 edit_column=$((${#prefix} + 1))
+# A field (workarounds.*.index, the line before), a call of placeAt in
+# scanFile, the line after (completion is typed below it), a dropped
+# result in std (its workaround hint and Rewrite).
+field_line=$((use_line - 1))
+field_text=$(sed -n "${field_line}p" "$scan_file")
+prefix=${field_text%index}
+field_column=$((${#prefix} + 2))
+call_line=$(awk -v from="$scan_line" 'NR > from && /placeAt\(workarounds/ { print NR; exit }' "$scan_file")
+call_text=$(sed -n "${call_line}p" "$scan_file")
+prefix=${call_text%%placeAt*}
+call_column=$((${#prefix} + 2))
+after_line=$((use_line + 1))
+after_text=$(sed -n "${after_line}p" "$scan_file")
+after_end=$((${#after_text} + 1))
+dropped_file=std/src/xml.mlx
+dropped_line=$(grep -n "const ignored = " "$dropped_file" | head -1 | cut -d: -f1)
 
 # The tour (a GIF), then a picture per feature. Each is its own run (they
 # start from the same view).
@@ -194,10 +210,46 @@ select $scan_file/scanFile
 settle
 wait 300
 shot editor
-hoverat $use_line $hover_column
+hoverat $field_line $field_column
 wait 300
 shot editor-hover
 hoverat 1 1
+cursor $call_line $call_column
+references
+wait 300
+shot references
+escape
+cursor $field_line $field_column
+renaming
+wait 300
+shot rename
+escape
+gutterat $scan_line
+wait 300
+shot blame
+hoverat 1 1
+cursor $after_line $after_end
+edit \\nworkarounds.*.
+complete
+wait 300
+shot completion
+escape
+cursor $after_line $after_end
+select-to $((after_line + 1)) 200
+delete-selection
+edit \\nplaceAt(workarounds, 
+signature
+wait 300
+shot signature
+escape
+cursor $after_line $after_end
+select-to $((after_line + 1)) 200
+delete-selection
+open $dropped_file $dropped_line
+wait 300
+shot workaround-hint
+select $scan_file/scanFile
+wait 300
 cursor $use_line $edit_column
 edit undefinedName + 
 save
