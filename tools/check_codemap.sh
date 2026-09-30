@@ -2,7 +2,8 @@
 # MLX Codemap (examples/mlx-codemap) end to end, on a small tree of its own:
 #   - the scene shader passes std.spirv.module;
 #   - the command line (the same binary with a command) answers, also
-#     with the workarounds and the kept crashes;
+#     with the workarounds, the kept crashes, the programs and what they
+#     reach, machine code, cycles, layers and the history (with git);
 #   - the app reads the tree, lays it out in 3D and draws it; typing
 #     searches, Enter flies to the result and selects it, with what it
 #     connects to (the function is called from the other file); Escape
@@ -64,6 +65,23 @@ pub fn first(values: [4]u8) -> u8 {
     return bytes[0]
 }
 MLX
+# A cycle (a <-> b) and an import against a rule (lib !-> app).
+cat > "$tree/lib/a.mlx" <<'MLX'
+const b = @import("./b.mlx")
+
+pub fn alpha() -> usize { return 1 }
+MLX
+cat > "$tree/lib/b.mlx" <<'MLX'
+const a = @import("./a.mlx")
+
+pub fn beta() -> usize { return 2 }
+MLX
+cat > "$tree/lib/bad.mlx" <<'MLX'
+const app = @import("../app/main.mlx")
+
+pub fn gamma() -> usize { return 3 }
+MLX
+echo "lib !-> app" > "$tree/codemap.layers"
 # A crash kept by a desktop program (examples/wayland-compositor/crash.mlx)
 # in greet, called from main.
 mkdir -p "$work/.local/state/mlx"
@@ -92,6 +110,33 @@ grep -q "^lib/helper.mlx:4:8: function greet (crashed here 1x)$" "$work/crashes.
     && grep -q "^   from _start+0x58$" "$work/crashes.txt" \
     || fail "the command line did not put the kept crash on greet and main" "$work/crashes.txt"
 echo "ok   the command line: mlx-codemap -C TREE crashes"
+# The program app, built (from the repository: std is there) with its
+# symbol table, and what it reaches.
+mkdir -p "$work/bin"
+"$compiler" --quiet "$tree/app/main.mlx" -o "$work/bin/app"
+MLX_CODEMAP_BINARIES="$work/bin" "$work/mlx-codemap" -C "$tree" programs > "$work/programs.txt"
+grep -q "^app: app/main.mlx, reaches [0-9]* declarations, built: $work/bin/app (" "$work/programs.txt" || fail "the command line did not find the program app and its binary" "$work/programs.txt"
+MLX_CODEMAP_BINARIES="$work/bin" "$work/mlx-codemap" -C "$tree" reach app > "$work/reach.txt"
+# (greet is small enough to be inlined: it has no code of its own.)
+grep -q "^app/main.mlx:3:8: function main ([0-9]* bytes)$" "$work/reach.txt" && grep -q "^lib/helper.mlx:4:8: function greet" "$work/reach.txt" \
+    || fail "app should reach main (with its machine code) and greet" "$work/reach.txt"
+MLX_CODEMAP_BINARIES="$work/bin" "$work/mlx-codemap" -C "$tree" unreachable > "$work/unreachable.txt"
+grep -q "^lib/extra.mlx:3:8: function twice$" "$work/unreachable.txt" && ! grep -q "greet" "$work/unreachable.txt" || fail "twice (and not greet) should be unreachable" "$work/unreachable.txt"
+MLX_CODEMAP_BINARIES="$work/bin" "$work/mlx-codemap" -C "$tree" sizes app > "$work/sizes.txt"
+grep -q "function main [0-9]* bytes$" "$work/sizes.txt" || fail "the machine code of main is not measured" "$work/sizes.txt"
+"$work/mlx-codemap" -C "$tree" cycles > "$work/cycles.txt"
+grep -A2 "^== 2 files import each other$" "$work/cycles.txt" | grep -q "lib/a.mlx" || fail "the cycle a <-> b is not found" "$work/cycles.txt"
+"$work/mlx-codemap" -C "$tree" layers > "$work/layers.txt"
+grep -q "^lib/bad.mlx:1:7: imports app/main.mlx (lib !-> app)$" "$work/layers.txt" || fail "the import against codemap.layers is not found" "$work/layers.txt"
+echo "ok   the command line: programs, reach, unreachable, sizes, cycles, layers"
+if command -v git > /dev/null; then
+    ( cd "$tree" && git init -q && git add -A && git -c user.email=check@mlx -c user.name=check commit -qm one \
+        && sed -i 's/return times + count/return times + count + 0/' lib/helper.mlx \
+        && git -c user.email=check@mlx -c user.name=check commit -qam two )
+    XDG_CACHE_HOME="$work/cache" "$work/mlx-codemap" -C "$tree" churn > "$work/churn.txt"
+    grep -q "^lib/helper.mlx:4:8: function greet (2 commits, the file 2)$" "$work/churn.txt" || fail "greet should have two commits" "$work/churn.txt"
+    echo "ok   the command line: churn (git blame)"
+fi
 
 # The app: at 1180x760 the sidebar's rows are 26 apart from y 44 (Alles,
 # app, lib).
@@ -121,6 +166,18 @@ wait 200
 press 272
 release 272
 wait 1000
+pointer 100 560
+press 272
+release 272
+wait 500
+pointer 100 167
+press 272
+release 272
+wait 500
+pointer 100 210
+press 272
+release 272
+wait 2000
 close
 SCRIPT
 
@@ -139,23 +196,26 @@ run() {
     for _ in $(seq 1 50); do [[ -S "$runtime/host-codemap" ]] && break; sleep 0.1; done
     local status=0
     env -i PATH="$PATH" HOME="$work" XDG_RUNTIME_DIR="$runtime" WAYLAND_DISPLAY=host-codemap \
-        VK_DRIVER_FILES="$manifest" MLX_CANVAS="$canvas" MLX_CODEMAP_TRACE=1 LANG=de_DE.UTF-8 \
+        VK_DRIVER_FILES="$manifest" MLX_CANVAS="$canvas" MLX_CODEMAP_TRACE=1 MLX_CODEMAP_BINARIES="$work/bin" LANG=de_DE.UTF-8 \
         timeout 60 "$work/mlx-codemap" "$tree" > "$shots/app.log" 2>&1 || status=$?
     wait "$host_pid" || fail "codemap ($name): the test host failed" "$shots/host.log"
     rm -rf -- "$runtime"
     local log="$shots/app.log"
     [[ $status -eq 0 ]] || fail "codemap ($name): the app exited with status $status" "$log"
-    grep -q "^codemap: read 3 files, " "$log" || fail "codemap ($name): it did not read the three files" "$log"
+    grep -q "^codemap: read 6 files, " "$log" || fail "codemap ($name): it did not read the six files" "$log"
+    grep -q "^codemap: measured 1 programs, 1 built$" "$log" || fail "codemap ($name): the program app and its binary are not measured" "$log"
+    grep -q "^codemap: color by Machine code$" "$log" || fail "codemap ($name): the spheres are not colored by machine code" "$log"
+    grep -q "^codemap: program app$" "$log" || fail "codemap ($name): the program app was not chosen" "$log"
     grep -q "^codemap: crashes 1 kept, on 2 declarations$" "$log" || fail "codemap ($name): the kept crash is not on greet and main" "$log"
     grep -q "^codemap: selected tree/lib/helper.mlx/greet/$" "$log" || fail "codemap ($name): typing greet and Enter did not select it" "$log"
     grep -A1 "^codemap: selected tree/lib/helper.mlx/greet/$" "$log" | grep -q "^codemap: related out 1 in 2$" || fail "codemap ($name): greet should use count and be called from main and twice" "$log"
     grep -q "^codemap: selected $" "$log" || fail "codemap ($name): Escape did not clear the selection" "$log"
     grep -q "^codemap: selected tree/app/$" "$log" || fail "codemap ($name): the sidebar's app group was not selected" "$log"
-    grep -A1 "^codemap: selected tree/app/$" "$log" | grep -q "^codemap: related out 1 in 0$" || fail "codemap ($name): the app group should depend on the lib group" "$log"
+    grep -A1 "^codemap: selected tree/app/$" "$log" | grep -q "^codemap: related out 1 in 1$" || fail "codemap ($name): the app group should depend on the lib group (and lib/bad.mlx on app)" "$log"
     # Its check box leaves lib out: its declarations, and the workarounds
     # in it; the crash (through main in app) stays.
-    grep -q "^codemap: shown [0-9]* nodes, findings 0 0 [0-9]* 2 1$" "$log" || fail "codemap ($name): at first everything is shown" "$log"
-    grep -q "^codemap: shown [0-9]* nodes, findings 0 0 [0-9]* 0 1$" "$log" || fail "codemap ($name): the lib group's check box did not leave it out" "$log"
+    grep -q "^codemap: shown [0-9]* nodes, findings 0 0 [0-9]* 2 1 [0-9]* [0-9]* [0-9]* 2 [0-9]* 0$" "$log" || fail "codemap ($name): at first everything is shown" "$log"
+    grep -q "^codemap: shown [0-9]* nodes, findings 0 0 [0-9]* 0 1 [0-9]* [0-9]* [0-9]* 0 [0-9]* 0$" "$log" || fail "codemap ($name): the lib group's check box did not leave it out" "$log"
     grep -q "^codemap: flying to tree/app/$" "$log" || fail "codemap ($name): the camera did not fly to the group still shown" "$log"
     python3 - "$shots/start.ppm" "$shots/selected.ppm" <<'PY' || fail "codemap ($name): the view or the detail panel is not drawn" "$log"
 import sys

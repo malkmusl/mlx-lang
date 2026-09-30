@@ -72,7 +72,60 @@ each group are joined by magenta lines in space.
   first, each with the function it stopped in and the functions that called
   it (red). The calls are drawn as red lines in space.
 
+- **Unreachable:** functions no program and no check reaches from its
+  `main`, and that are in no binary: dead code, however often other dead
+  code uses it. Biggest first.
+- **Untested:** functions a program reaches and no check does. The most
+  complex first.
+- **Complex:** functions with 15 branches or more, blocks 6 deep, or 1500
+  tokens ([`complexity.mlx`](../../tools/codemap/complexity.mlx)).
+- **Cycles and layers:** files that import each other round about, and
+  imports the rules in `codemap.layers` forbid
+  ([`structure.mlx`](../../tools/codemap/structure.mlx)); drawn as blue
+  lines in space.
+- **Risky:** functions most likely to break. Crashes, workarounds,
+  commits, complexity, copies and missing checks together
+  ([`measures.mlx`](../../tools/codemap/measures.mlx)).
+- **Hot:** where the programs spend their time, from the profiles of
+  `mlx-profile`.
+
 Generated code (`/generated/`) is left out.
+
+### Programs
+
+Every file with a `main` (outside the checks) is a program: the coreutils,
+the desktop programs, the tools, the compiler
+([`programs.mlx`](../../tools/codemap/programs.mlx)). What its `main` and
+its exported functions use, and what that uses, is what the program is
+made of. Checks are programs of their own kind: the files under `tests/`,
+`check_*.mlx`, test blocks, and what the check scripts
+(`tools/check_*.sh`, `tests/run_*.sh`) build.
+
+The sidebar's *Program* list shows one program: what it does not reach is
+left out, and the camera flies to what is left.
+
+Built programs are found by their symbol table
+([`binaries.mlx`](../../tools/codemap/binaries.mlx)): beside the codemap
+(the installed programs), in `mlx-out/bin`, and in `MLX_CODEMAP_BINARIES`
+(directories, colon-separated). Each function's machine code is put on its
+declaration.
+
+### Color by
+
+The spheres take their kind's color, or a heat scale (blue, violet,
+orange, yellow) of one measure; a group is as hot as its members together:
+
+- **Machine code:** bytes in the program shown, else in the biggest
+  binary.
+- **Changes:** the commits that wrote a declaration's lines as they are
+  now (`git blame`,
+  [`history.mlx`](../../tools/codemap/history.mlx)). The blame is read
+  file by file in the background and kept in `~/.cache/mlx/codemap`, so it
+  is quick the next time.
+- **Complexity**, **risk** and **run time** (the profiles).
+
+The panel says of a declaration which programs reach it, whether a check
+does, and its machine code, commits, complexity, time and risk.
 
 ### Crash flags
 
@@ -218,7 +271,10 @@ mlx-codemap [-C ROOT] stats | files [TEXT] | outline FILE | find TEXT |
     show SYMBOL | def FILE:LINE:COL | refs SYMBOL | callers SYMBOL |
     callees SYMBOL | imports FILE | importers FILE | members SYMBOL |
     unused [PATH] | copies [PATH] | names [PATH] | workarounds [PATH] |
-    crashes [PATH] | unresolved [FILE] | json
+    programs | reach PROGRAM [PATH] | unreachable [PATH] |
+    untested [PATH] | sizes [PROGRAM] [PATH] | complex [PATH] | cycles |
+    layers | churn [PATH] | risky [PATH] | hot [PATH] | crashes [PATH] |
+    unresolved [FILE] | json
 ```
 
 SYMBOL is `name`, `Container.name`, `path:name` or `FILE:LINE:COL`. The
