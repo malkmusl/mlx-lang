@@ -373,6 +373,8 @@ record flight 3 100
 open app/main.mlx 5
 wait 300
 shot editor
+hoverat 5 59
+hoverat 5 65
 cursor 5 32
 definition
 wait 300
@@ -431,7 +433,10 @@ grep -q "^codemap: saved lib/helper.mlx$" "$work/demo.log" || fail "editor: the 
 grep -A3 "^codemap: saved lib/helper.mlx$" "$work/demo.log" | grep -q "^codemap: checked, problems [1-9]" || fail "editor: the compiler's error did not come back" "$work/demo.log"
 grep -A4 "^codemap: demo undo$" "$work/demo.log" | grep -q "^codemap: checked, problems 0$" || fail "editor: the error did not go after undo and save" "$work/demo.log"
 ( cd "$tree" && git diff --quiet -- lib/helper.mlx ) 2> /dev/null || [[ -z "${have_git:-}" ]] || fail "editor: undo and save did not bring the file back" "$work/demo.log"
-echo "ok   editor: open, go to a declaration, edit, save, the compiler's problems, undo"
+grep -q "^codemap: hover local const point in function main, app/main.mlx:4 | type Point: struct in lib/helper.mlx:10$" "$work/demo.log" \
+    && grep -q "^codemap: hover field x of struct Point, lib/helper.mlx:11 | $" "$work/demo.log" \
+    || fail "editor: the hover does not say where a local and a field belong" "$work/demo.log"
+echo "ok   editor: open, go to a declaration, hover (where a name belongs), edit, save, the compiler's problems, undo"
 # Build: the program app into the tree's mlx-out/bin; Commit: the edit
 # with its message (when the tree is a Git work tree).
 grep -q "^codemap: build done: Built app in [0-9.]* s: mlx-out/bin/app$" "$work/demo.log" && [[ -x "$tree/mlx-out/bin/app" ]] \
