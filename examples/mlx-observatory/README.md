@@ -6,6 +6,13 @@ the crashes, the workarounds and the time spent right on the lines, then
 build the program and commit, without leaving the window. *Observatory*
 for short.
 
+It knows more of the code than an editor usually does: every use of every
+name, which programs and checks reach a function, what it became in
+machine code, how often it crashed and where, how much of the time it
+takes, who changed it, its copies and what the language is missing in
+it. The editor shows all of that where the code is (see
+[The editor](#the-editor)).
+
 The map is the code base as a space to fly through. Every folder is a group with its
 files around it, and every file has its declarations around it: functions,
 structs, enums, constants, variables and tests. Structs have their fields
@@ -18,8 +25,10 @@ imports which. Select something and new lines show what it connects to:
 The panel on the right lists the same connections, with the signature and
 the doc comment, and has back and forward at its top. It is laid out like
 the file manager ([`examples/mlx-files`](../mlx-files/main.mlx)): the
-groups in a translucent sidebar, the name, Build, Commit and a search
-field in the toolbar, and where you are in the status bar.
+groups in a translucent sidebar, the name, Build, the history (*Since
+HEAD*, with Commit) and a search field in the toolbar, and where you are
+in the status bar. There is nothing to read again by hand: files changed
+on disk (by Git, another editor or a save) are read again by themselves.
 
 At the top of the sidebar, *View* switches between the **Map** and the
 **Editor** (Ctrl+E); see [The editor](#the-editor) and
@@ -135,27 +144,55 @@ the sidebar; every section folds up.</td>
 <tr>
 <td><img src="screenshots/editor.png" alt="scanFile in the editor"><br>
 <b>The editor.</b> The hottest function of the profiles: the heat bar by
-the line numbers, the code lens (uses, machine code, commits, time),
-the panel still on the declaration at the cursor.</td>
-<td><img src="screenshots/editor-hover.png" alt="Hovering a call"><br>
-<b>Hover.</b> What a name is, from the index: its signature, uses,
-machine code and commits.</td>
+the line numbers, the lens row above it (uses, time, risk, complexity,
+machine code, commits), names in the colors of what they are
+(parameters, fields, types, functions), the uses of the name at the
+cursor lit.</td>
+<td><img src="screenshots/editor-hover.png" alt="Hovering a field"><br>
+<b>Hover.</b> What a name is and where it belongs: the field
+<code>index</code> of the struct <code>Workarounds</code>, its type
+<code>*Index</code> and where that is declared.</td>
+</tr>
+<tr>
+<td><img src="screenshots/references.png" alt="The uses of placeAt"><br>
+<b>References.</b> Shift+F12 or the lens's uses: every use, with its
+line; Enter opens one.</td>
+<td><img src="screenshots/completion.png" alt="Completion after a dot"><br>
+<b>Completion.</b> The members of <code>*Workarounds</code> after the
+dot, each with its type and where that is.</td>
+</tr>
+<tr>
+<td><img src="screenshots/signature.png" alt="Signature help"><br>
+<b>Signature help.</b> In a call, the function's signature, the argument
+the cursor is at lit.</td>
+<td><img src="screenshots/rename.png" alt="Renaming a field"><br>
+<b>Rename.</b> F2: every use the index knows gets the new name, in every
+file.</td>
+</tr>
+<tr>
+<td><img src="screenshots/blame.png" alt="The blame of a line"><br>
+<b>Blame.</b> The pointer on a line number: the commit that wrote the
+line, who and when.</td>
+<td><img src="screenshots/workaround-hint.png" alt="A dropped result in std"><br>
+<b>Workarounds on their line.</b> What it works around and what the
+language is missing; <i>Rewrite</i> for the kinds that can be.</td>
 </tr>
 <tr>
 <td><img src="screenshots/editor-problem.png" alt="A compiler error on its line"><br>
 <b>The compiler's problems.</b> Saved with a name nobody declared: the
 compiler's errors on their lines, the changed line marked, the count and
 the message at the cursor in the status bar.</td>
-<td><img src="screenshots/commit.png" alt="The commit list"><br>
-<b>Commit.</b> The changed files and a message; Enter commits,
-<i>Commit and push</i> pushes too.</td>
+<td><img src="screenshots/commit.png" alt="The history with the commit"><br>
+<b>Commit.</b> In the history (<i>Since HEAD</i>, Ctrl+K): the changed
+files and a message; Enter commits, <i>Commit and push</i> pushes too;
+below, the commits Changed can compare with.</td>
 </tr>
 <tr>
 <td><img src="screenshots/build.png" alt="Built"><br>
 <b>Build.</b> The program that reaches the file shown, into
 <code>mlx-out/bin</code>, in the background.</td>
 <td><img src="screenshots/map-after-editor.png" alt="Back in the map"><br>
-<b>Back to the map.</b> The map reads the saved files again and stands
+<b>Back to the map.</b> The map has read the saved files again and stands
 on the declaration the cursor was on.</td>
 </tr>
 </table>
@@ -341,20 +378,48 @@ marks one with edits not saved, and its x closes it (Shift+click closes
 one not saved). When all six hold edits, a seventh file does not open
 until one is saved or closed.
 
-- **Colors:** keywords, types, builtins, strings, numbers, comments, doc
-  comments, calls and constants, in the colors of the map's kinds.
+What the map knows is in the editor, where the code is:
+
+- **Colors:** keywords, strings, numbers, comments and doc comments by
+  the text; every name by what the index says it is (a parameter, a
+  field, a local, a type, a function, a constant, a module). The uses of
+  the name at the cursor are lit (where it is written: warmer).
+- **The lens row** above every function and type: how often it is used
+  (a click lists the uses), the crashes that stopped in it or went
+  through it, its workarounds (a click: the next one), its share of the
+  time, its risk, whether it is complex, whether a program or a check
+  reaches it, whether it is unused, the function with the same body or
+  shape and where the same name is written again (a click opens it), its
+  machine code, its commits, and whether it changed since the base.
+- **On the lines:** where a crash stopped (how often, and why) or went
+  through; what a workaround works around and what the language is
+  missing, with *Rewrite* for dropped results and counted lengths (in
+  the text: Ctrl+Z takes it back, Ctrl+S writes it). A line too long for
+  them shows them in the status bar when the cursor is on it.
 - **The gutter:** lines added (green), changed (blue) and removed (red)
   since the base of Changed; the compiler's errors and warnings (dots);
-  where a crash stopped or went through, and workarounds. By the line
-  numbers, a bar in the heat colors shows how much time each declaration
-  took in the profiles.
-- **Code lens:** after a declaration's first line, how often it is used,
-  its machine code, its commits, its risk, its crashes and its share of
-  the time.
-- **Hover:** a name's declaration from the index (signature, uses,
-  machine code, commits).
+  crashes and workarounds. By the line numbers, a bar in the heat colors
+  shows how much time each declaration took in the profiles. The pointer
+  on a line number: who wrote the line, when, in which commit (`git
+  blame`).
+- **Hover:** what a name is and where it belongs (field `x` of struct
+  `Point`, local `point` in function `main`, with file and line), a
+  value's type and where that type is declared, the doc comment, and
+  what the map measures of it.
 - **Go to the declaration:** Ctrl+click or F12; back (the panel's arrow,
   Alt+Left) returns to where you came from, in the editor.
+- **References:** Shift+F12 (or the lens's uses) lists every use with its
+  line; Enter or a click opens one.
+- **Completion:** typing a name lists what is in scope (the locals and
+  parameters so far, the file's declarations, the keywords); after a dot
+  the members of what is before it, after `@` the builtins; each with
+  its signature or type. Up, Down, Enter or Tab, Esc.
+- **Signature help:** in a call (after its `(` or a comma), the
+  function's signature above the cursor with the argument lit.
+- **Rename:** F2 on a name, the new name, Enter: every use the index
+  knows (the declaration too), in every file; the tabs and the map read
+  them again. Not while a file involved holds edits or changed since the
+  map read it.
 - **Map and editor together:** the panel follows the declaration at the
   cursor; *Show in map* switches to the map and flies there.
 - **The compiler's problems:** each file is checked when it opens and
@@ -364,6 +429,10 @@ until one is saved or closed.
 - **Saving** (Ctrl+S, *Save*) writes the file; the next switch to the map
   reads the code again, so the map, the findings and the Changed marks
   follow the edit.
+
+What the index says fits the text as the index read it: in a file edited
+since, the hover, the colors and the lens rows move with the lines, and
+rename waits for the next read.
 
 | | |
 |---|---|
@@ -377,7 +446,9 @@ until one is saved or closed.
 | Ctrl+A, Ctrl+C, Ctrl+X, Ctrl+V | select all, copy, cut, paste |
 | Ctrl+S | save |
 | F12, Ctrl+click | go to the declaration |
-| Escape | drop the selection (the file stays) |
+| Shift+F12 | the references |
+| F2 | rename |
+| Escape | close a list or the signature, drop the selection (the file stays) |
 | Ctrl+E | back to the map |
 | Ctrl+Shift+O | open the file in the outside editor (`MLX_EDITOR`, else VS Code, else `xdg-open`) |
 
@@ -391,8 +462,10 @@ one chosen under Program. The status bar says how long it took; a failed
 build opens its first error in the editor. The new binary's machine code
 goes on the declarations at once.
 
-**Commit** (toolbar; the number is how many files changed) lists the
-changed files (`git status`) and takes a message. Enter or *Commit*
+**Commit** is in the history (*Since HEAD* in the toolbar, Ctrl+K; the
+number on it is how many files changed): at its top the changed files
+(`git status`) and a message, below the commits Changed can compare
+with. Enter or *Commit*
 saves the edited tabs and runs `git add -A` and `git commit`; Ctrl+Enter
 or *Commit and push* also runs `git push -u origin HEAD`. Git runs in the
 background; the status bar says how it went (with Git's own error when it
@@ -426,8 +499,8 @@ The compiler for checks and Build is `$MLX_COMPILER`, else the root's
 | Ctrl+Shift+O | open it in the outside editor: `MLX_EDITOR`, else VS Code (`code -g`), else `xdg-open` |
 | Ctrl+E, View (sidebar) | switch between the map and the editor |
 | Ctrl+B, Build | build (see Build and commit) |
-| Commit | commit, or commit and push |
-| F5, Ctrl+R, "Read again" | read the code again, keeping the selection |
+| Ctrl+K, Since ... (toolbar) | the history: commit, or commit and push |
+| F5, Ctrl+R | read the code again, keeping the selection (files changed on disk are read again by themselves) |
 | Ctrl+W | close (with tabs not saved: press it twice) |
 
 The sidebar lists the groups, and the groups inside them on the way to
@@ -612,8 +685,13 @@ committed).
 5. Plays a small demo script and checks the frames it wrote. In it, the
    editor opens a file, goes to a declaration with F12, saves a name
    nobody declared and gets the compiler's error on its line, undoes it;
-   Build builds the program; Commit commits an edit with its message;
-   Escape keeps the editor's file; the map reads the saved files again.
+   the hover says where a local and a field belong; the lens's uses list
+   greet's two uses and open one; Rewrite drops a dropped result's
+   binding; completion offers `helper` and after the dot `greet`, and
+   the signature of `greet(`; F2 renames `twice` in both its files; a
+   line's blame is Git's; Build builds the program; Commit commits an
+   edit with its message; Escape keeps the editor's file; the map reads
+   the saved files again.
 
 `tools/check_crash_report.sh` checks the crash reports themselves: the
 symbol table, the functions a crash names and the kept log.
