@@ -154,9 +154,17 @@ cursor lit.</td>
 <code>*Index</code> and where that is declared.</td>
 </tr>
 <tr>
-<td><img src="screenshots/references.png" alt="The uses of placeAt"><br>
-<b>References.</b> Shift+F12 or the lens's uses: every use, with its
-line; Enter opens one.</td>
+<td><img src="screenshots/hover-doc.png" alt="Hovering a documented function"><br>
+<b>Hover with its doc.</b> As rust-analyzer shows it: where it is, the
+signature in the code's colors, the doc comment set as text, what the map
+measures.</td>
+<td><img src="screenshots/hover-struct.png" alt="Hovering a struct"><br>
+<b>A struct.</b> Its fields under it, each with its type.</td>
+</tr>
+<tr>
+<td><img src="screenshots/completion-std.png" alt="Completion in std.fs"><br>
+<b>std.fs.op...</b> The members of a module after its dot, the best fit
+first; the chosen one's place, signature and doc at the side.</td>
 <td><img src="screenshots/completion.png" alt="Completion after a dot"><br>
 <b>Completion.</b> The members of <code>*Workarounds</code> after the
 dot, each with its type and where that is.</td>
@@ -165,32 +173,37 @@ dot, each with its type and where that is.</td>
 <td><img src="screenshots/signature.png" alt="Signature help"><br>
 <b>Signature help.</b> In a call, the function's signature, the argument
 the cursor is at lit.</td>
+<td><img src="screenshots/references.png" alt="The uses of placeAt"><br>
+<b>References.</b> Shift+F12 or the lens's uses: every use, with its
+line; Enter opens one.</td>
+</tr>
+<tr>
 <td><img src="screenshots/rename.png" alt="Renaming a field"><br>
 <b>Rename.</b> F2: every use the index knows gets the new name, in every
 file.</td>
-</tr>
-<tr>
 <td><img src="screenshots/blame.png" alt="The blame of a line"><br>
 <b>Blame.</b> The pointer on a line number: the commit that wrote the
 line, who and when.</td>
+</tr>
+<tr>
 <td><img src="screenshots/workaround-hint.png" alt="A dropped result in std"><br>
 <b>Workarounds on their line.</b> What it works around and what the
 language is missing; <i>Rewrite</i> for the kinds that can be.</td>
-</tr>
-<tr>
 <td><img src="screenshots/editor-problem.png" alt="A compiler error on its line"><br>
 <b>The compiler's problems.</b> Saved with a name nobody declared: the
 compiler's errors on their lines, the changed line marked, the count and
 the message at the cursor in the status bar.</td>
+</tr>
+<tr>
 <td><img src="screenshots/commit.png" alt="The history with the commit"><br>
 <b>Commit.</b> In the history (<i>Since HEAD</i>, Ctrl+K): the changed
 files and a message; Enter commits, <i>Commit and push</i> pushes too;
 below, the commits Changed can compare with.</td>
-</tr>
-<tr>
 <td><img src="screenshots/build.png" alt="Built"><br>
 <b>Build.</b> The program that reaches the file shown, into
 <code>mlx-out/bin</code>, in the background.</td>
+</tr>
+<tr>
 <td><img src="screenshots/map-after-editor.png" alt="Back in the map"><br>
 <b>Back to the map.</b> The map has read the saved files again and stands
 on the declaration the cursor was on.</td>
