@@ -375,6 +375,13 @@ wait 300
 shot editor
 hoverat 5 59
 hoverat 5 65
+open lib/helper.mlx 4
+fold 4
+wait 200
+shot folded
+hoverat 8 11
+fold 4
+open app/main.mlx 5
 cursor 3 22
 edit \nhel
 complete
@@ -517,6 +524,11 @@ grep -q "^codemap: rewritten here:     _ = extra.double()$" "$work/demo.log" && 
 grep -q "^codemap: references greet$" "$work/demo.log" && grep -q "^codemap: references count: 2$" "$work/demo.log" && grep -q "^codemap: reference opened " "$work/demo.log" \
     || fail "editor: the lens's uses did not list greet's two uses" "$work/demo.log"
 echo "ok   editor: the lens (uses, a click lists them and opens one), a workaround's rewrite on its line"
+# Folding: greet's body folded, the lines under it move up (the hover on
+# count finds it where it now is), unfolded again.
+grep -q "^codemap: folded 4$" "$work/demo.log" && grep -q "^codemap: hover const count, lib/helper.mlx:8 | $" "$work/demo.log" && grep -q "^codemap: unfolded 4$" "$work/demo.log" \
+    || fail "editor: folding greet's body" "$work/demo.log"
+echo "ok   editor: a function's body folds and opens again"
 # Completion from the index: what is in scope (the import helper), the
 # members after the dot (greet); the signature of the call typed.
 grep -q "^codemap: completion first helper$" "$work/demo.log" && grep -q "^codemap: completed helper$" "$work/demo.log" \
