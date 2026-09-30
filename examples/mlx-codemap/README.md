@@ -23,6 +23,48 @@ mlx-codemap [ROOT]          the 3D view of ROOT (default: MLX_CODEMAP_ROOT,
 mlx-codemap COMMAND ...     the command line (below)
 ```
 
+## The galaxy
+
+Every use has weight. The index turns each use into a weighted edge,
+from the declaration it is in to the declaration it uses; the weight is
+how many times. The edges pull on the layout for a few dozen rounds:
+
+- Each edge pulls its two ends toward each other, harder the more uses
+  (as a logarithm).
+- What pulls on a declaration pulls on its file and on its groups too.
+  The pulls are summed up the tree, so pulls inside a group cancel out
+  there.
+- As a result, a declaration drifts toward the groups that use it, and a
+  group drifts toward the groups it depends on.
+- A spring holds each node near where it was packed, so the order stays
+  readable, and sibling groups are kept from overlapping.
+
+## Findings
+
+The sidebar's *Findings* section opens lists in the panel. The members of
+each group are joined by magenta lines in space.
+
+- **Copies:** functions with the same body. First the exact copies, then
+  the ones that are the same except for the names of their own locals and
+  the values of literals, which one generic function could replace. The
+  groups with the most tokens to save come first.
+- **Written again:** functions with the same name in several files, that
+  is, helpers each file wrote for itself.
+- **Unused:** declarations that nothing uses.
+
+Generated code (`/generated/`) is left out.
+
+For the selection, the panel shows:
+
+- how often it is used, and how often from elsewhere (its weight);
+- its copies;
+- its namesakes;
+- what is *used much alike*: the declarations that use the same things,
+  as a share of everything either one uses.
+
+The command line lists the same findings: `mlx-codemap copies [PATH]`,
+`mlx-codemap names [PATH]` and `mlx-codemap unused [PATH]`.
+
 ## Using it
 
 | | |
@@ -102,7 +144,7 @@ own:
 mlx-codemap [-C ROOT] stats | files [TEXT] | outline FILE | find TEXT |
     show SYMBOL | def FILE:LINE:COL | refs SYMBOL | callers SYMBOL |
     callees SYMBOL | imports FILE | importers FILE | members SYMBOL |
-    unused [PATH] | unresolved [FILE] | json
+    unused [PATH] | copies [PATH] | names [PATH] | unresolved [FILE] | json
 ```
 
 SYMBOL is `name`, `Container.name`, `path:name` or `FILE:LINE:COL`. The
