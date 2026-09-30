@@ -1,0 +1,547 @@
+// The Language Server Protocol's plumbing for mlx-lsp: messages framed by
+// Content-Length headers on stdin and stdout, the fields of a request the
+// server looks at (read with std.json's pull tokenizer), JSON written into
+// a growing buffer, file:// URIs, and positions in UTF-16 code units (what
+// the protocol counts) against byte offsets.
+const std = @import("std")
+const json = @import("std.json")
+
+pub const Allocator = std.allocator.Allocator
+pub const String = json.String
+
+// ---------------------------------------------------------------------------
+// Output
+
+// A growing byte buffer.
+pub const Writer = struct {
+    allocator: Allocator
+    bytes: [*]u8
+    length: usize
+    capacity: usize
+}
+
+pub fn initWriter(writer: *Writer, allocator: Allocator, capacity: usize) -> void {
+    writer.*.allocator = allocator
+    writer.*.bytes = allocator.alloc(capacity, 16).?
+    writer.*.length = 0
+    writer.*.capacity = capacity
+}
+
+fn reserve(writer: *Writer, extra: usize) -> void {
+    if writer.*.length + extra <= writer.*.capacity { return }
+    var capacity = writer.*.capacity * 2
+    while capacity < writer.*.length + extra { capacity = capacity * 2 }
+    const bigger = writer.*.allocator.alloc(capacity, 16).?
+    var at: usize = 0
+    while at < writer.*.length {
+        bigger[at] = writer.*.bytes[at]
+        at += 1
+    }
+    writer.*.allocator.free(writer.*.bytes, writer.*.capacity, 16)
+    writer.*.bytes = bigger
+    writer.*.capacity = capacity
+}
+
+pub fn clear(writer: *Writer) -> void { writer.*.length = 0 }
+
+pub fn byte(writer: *Writer, value: u8) -> void {
+    reserve(writer, 1)
+    writer.*.bytes[writer.*.length] = value
+    writer.*.length += 1
+}
+
+pub fn text(writer: *Writer, value: []const u8) -> void {
+    reserve(writer, value.length)
+    for item in value {
+        writer.*.bytes[writer.*.length] = item
+        writer.*.length += 1
+    }
+}
+
+pub fn number(writer: *Writer, value: usize) -> void {
+    var digits: [24]u8 = undefined
+    var count: usize = 0
+    var rest = value
+    while rest > 0 || count == 0 {
+        digits[count] = @intCast(u8, 48 + rest % 10)
+        rest = rest / 10
+        count += 1
+    }
+    reserve(writer, count)
+    while count > 0 {
+        count -= 1
+        writer.*.bytes[writer.*.length] = digits[count]
+        writer.*.length += 1
+    }
+}
+
+fn hexDigit(value: u8) -> u8 { return if value < 10 { 48 + value } else { 87 + value } }
+
+// `value` as a JSON string, quoted and escaped.
+pub fn string(writer: *Writer, value: []const u8) -> void {
+    reserve(writer, value.length + 2)
+    byte(writer, 34)
+    for item in value {
+        if item == 34 || item == 92 {
+            byte(writer, 92)
+            byte(writer, item)
+        } else if item == 10 {
+            text(writer, "\\n")
+        } else if item == 13 {
+            text(writer, "\\r")
+        } else if item == 9 {
+            text(writer, "\\t")
+        } else if item < 32 {
+            text(writer, "\\u00")
+            byte(writer, hexDigit(item >> 4))
+            byte(writer, hexDigit(item & 15))
+        } else {
+            byte(writer, item)
+        }
+    }
+    byte(writer, 34)
+}
+
+pub fn contents(writer: *Writer) -> []const u8 { return writer.*.bytes[0..writer.*.length] }
+
+fn writeAll(descriptor: usize, bytes: [*]const u8, length: usize) -> void {
+    var done: usize = 0
+    while done < length {
+        const count = std.linux.syscall3(1, descriptor, @intFromPtr(bytes) + done, length - done)
+        if count <= 0 { return }
+        done += @bitCast(usize, count)
+    }
+}
+
+// Sends `body` as one message (with its Content-Length header).
+pub fn send(body: []const u8) -> void {
+    var header: [64]u8 = undefined
+    var length: usize = 0
+    for item in "Content-Length: " {
+        header[length] = item
+        length += 1
+    }
+    var digits: [24]u8 = undefined
+    var count: usize = 0
+    var rest = body.length
+    while rest > 0 || count == 0 {
+        digits[count] = @intCast(u8, 48 + rest % 10)
+        rest = rest / 10
+        count += 1
+    }
+    while count > 0 {
+        count -= 1
+        header[length] = digits[count]
+        length += 1
+    }
+    header[length] = 13
+    header[length + 1] = 10
+    header[length + 2] = 13
+    header[length + 3] = 10
+    length += 4
+    unsafe { writeAll(1, @ptrCast([*]const u8, &header), length) }
+    unsafe { writeAll(1, @ptrCast([*]const u8, body), body.length) }
+}
+
+// A line to stderr (the editor shows it as the server's log).
+pub fn log(first: []const u8, second: []const u8) -> void {
+    unsafe {
+        writeAll(2, @ptrCast([*]const u8, "mlx-lsp: "), 9)
+        writeAll(2, @ptrCast([*]const u8, first), first.length)
+        writeAll(2, @ptrCast([*]const u8, second), second.length)
+        writeAll(2, @ptrCast([*]const u8, "\n"), 1)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Input
+
+pub const Reader = struct {
+    allocator: Allocator
+    bytes: [*]u8
+    length: usize
+    capacity: usize
+    // The message found last: where its body is.
+    bodyStart: usize
+    bodyLength: usize
+    closed: bool
+}
+
+pub fn initReader(reader: *Reader, allocator: Allocator) -> void {
+    reader.*.allocator = allocator
+    reader.*.capacity = 1048576
+    reader.*.bytes = allocator.alloc(reader.*.capacity, 16).?
+    reader.*.length = 0
+    reader.*.bodyStart = 0
+    reader.*.bodyLength = 0
+    reader.*.closed = false
+}
+
+// Reads what stdin has (it is readable); false at its end.
+pub fn fill(reader: *Reader) -> bool {
+    if reader.*.length + 65536 > reader.*.capacity {
+        const capacity = reader.*.capacity * 2
+        const bigger = reader.*.allocator.alloc(capacity, 16).?
+        var at: usize = 0
+        while at < reader.*.length {
+            bigger[at] = reader.*.bytes[at]
+            at += 1
+        }
+        reader.*.allocator.free(reader.*.bytes, reader.*.capacity, 16)
+        reader.*.bytes = bigger
+        reader.*.capacity = capacity
+    }
+    const count = std.linux.syscall3(0, 0, @intFromPtr(reader.*.bytes) + reader.*.length, reader.*.capacity - reader.*.length)
+    if count <= 0 {
+        reader.*.closed = true
+        return false
+    }
+    reader.*.length += @bitCast(usize, count)
+    return true
+}
+
+fn lower(value: u8) -> u8 { return if value >= 65 && value <= 90 { value + 32 } else { value } }
+
+// Whether a whole message is buffered; its body is then at
+// bodyStart/bodyLength.
+pub fn message(reader: *Reader) -> bool {
+    // The headers end at an empty line.
+    var at: usize = 0
+    var header_end: usize = 0
+    while at + 3 < reader.*.length {
+        if reader.*.bytes[at] == 13 && reader.*.bytes[at + 1] == 10 && reader.*.bytes[at + 2] == 13 && reader.*.bytes[at + 3] == 10 {
+            header_end = at + 4
+            break
+        }
+        at += 1
+    }
+    if header_end == 0 { return false }
+    // Content-Length (any case).
+    var length: usize = 0
+    var line: usize = 0
+    while line < header_end {
+        const name = "content-length:"
+        var same = line + name.length < header_end
+        var index: usize = 0
+        while same && index < name.length {
+            if lower(reader.*.bytes[line + index]) != name[index] { same = false }
+            index += 1
+        }
+        if same {
+            var digit = line + name.length
+            while digit < header_end && reader.*.bytes[digit] == 32 { digit += 1 }
+            while digit < header_end && reader.*.bytes[digit] >= 48 && reader.*.bytes[digit] <= 57 {
+                length = length * 10 + @intCast(usize, reader.*.bytes[digit] - 48)
+                digit += 1
+            }
+        }
+        while line < header_end && reader.*.bytes[line] != 10 { line += 1 }
+        line += 1
+    }
+    if header_end + length > reader.*.length { return false }
+    reader.*.bodyStart = header_end
+    reader.*.bodyLength = length
+    return true
+}
+
+pub fn body(reader: *Reader) -> []const u8 { return reader.*.bytes[reader.*.bodyStart..reader.*.bodyStart + reader.*.bodyLength] }
+
+// Drops the message handled.
+pub fn consume(reader: *Reader) -> void {
+    const used = reader.*.bodyStart + reader.*.bodyLength
+    var at: usize = 0
+    while used + at < reader.*.length {
+        reader.*.bytes[at] = reader.*.bytes[used + at]
+        at += 1
+    }
+    reader.*.length = reader.*.length - used
+}
+
+// ---------------------------------------------------------------------------
+// Requests
+
+// The fields of a message the server looks at (raw JSON: strings still
+// escaped; decodeInto decodes them).
+pub const Request = struct {
+    method: String
+    id: String
+    idIsString: bool
+    hasId: bool
+    uri: String
+    text: String
+    hasText: bool
+    line: usize
+    character: usize
+    hasPosition: bool
+    query: String
+    newName: String
+    includeDeclaration: bool
+    rootUri: String
+    rootPath: String
+    folderUri: String
+    triggerCharacter: String
+}
+
+fn empty() -> String {
+    var value: String = undefined
+    unsafe { value.pointer = @ptrCast([*]const u8, "") }
+    value.length = 0
+    return value
+}
+
+fn nameIs(path: []const u8, expected: []const u8) -> bool {
+    if path.length != expected.length { return false }
+    var at: usize = 0
+    while at < path.length {
+        if path[at] != expected[at] { return false }
+        at += 1
+    }
+    return true
+}
+
+fn unsignedOf(raw: String) -> usize {
+    var value: u64 = 0
+    if !json.parseUnsigned(raw, &value) { return 0 }
+    return @intCast(usize, value)
+}
+
+// Reads `source` (one message's body) into request; false when it is not
+// JSON.
+pub fn parse(source: []const u8, request: *Request) -> bool {
+    request.*.method = empty()
+    request.*.id = empty()
+    request.*.idIsString = false
+    request.*.hasId = false
+    request.*.uri = empty()
+    request.*.text = empty()
+    request.*.hasText = false
+    request.*.line = 0
+    request.*.character = 0
+    request.*.hasPosition = false
+    request.*.query = empty()
+    request.*.newName = empty()
+    request.*.includeDeclaration = false
+    request.*.rootUri = empty()
+    request.*.rootPath = empty()
+    request.*.folderUri = empty()
+    request.*.triggerCharacter = empty()
+    var tokenizer: json.Tokenizer = undefined
+    unsafe { json.initAt(&tokenizer, @ptrCast([*]const u8, source), source.length) }
+    var token: json.Token = undefined
+    // The names on the way to a value: object keys, "[]" for array items.
+    var names: [16]String = undefined
+    var depth: usize = 0
+    var path: [256]u8 = undefined
+    while json.next(&tokenizer, &token) {
+        const kind = token.kind
+        if kind == json.TokenKind.objectStart || kind == json.TokenKind.arrayStart {
+            depth += 1
+            if depth < 16 && kind == json.TokenKind.arrayStart {
+                var item: String = undefined
+                unsafe { item.pointer = @ptrCast([*]const u8, "[]") }
+                item.length = 2
+                names[depth] = item
+            }
+        } else if kind == json.TokenKind.objectEnd || kind == json.TokenKind.arrayEnd {
+            if depth > 0 { depth -= 1 }
+        } else if kind == json.TokenKind.key {
+            if depth < 16 { names[depth] = token.value }
+        } else if kind != json.TokenKind.endOfDocument {
+            // A value: where it is ("params.position.line").
+            var length: usize = 0
+            var level: usize = 1
+            while level <= depth && level < 16 {
+                if level > 1 && length < 255 {
+                    path[length] = 46
+                    length += 1
+                }
+                var at: usize = 0
+                while at < names[level].length && length < 255 {
+                    path[length] = names[level].pointer[at]
+                    length += 1
+                    at += 1
+                }
+                level += 1
+            }
+            const where = path[0..length]
+            if nameIs(where, "method") { request.*.method = token.value }
+            if nameIs(where, "id") {
+                request.*.id = token.value
+                request.*.hasId = true
+                request.*.idIsString = kind == json.TokenKind.string
+            }
+            if nameIs(where, "params.textDocument.uri") { request.*.uri = token.value }
+            if nameIs(where, "params.textDocument.text") || nameIs(where, "params.contentChanges.[].text") {
+                request.*.text = token.value
+                request.*.hasText = true
+            }
+            if nameIs(where, "params.position.line") {
+                request.*.line = unsignedOf(token.value)
+                request.*.hasPosition = true
+            }
+            if nameIs(where, "params.position.character") { request.*.character = unsignedOf(token.value) }
+            if nameIs(where, "params.query") { request.*.query = token.value }
+            if nameIs(where, "params.newName") { request.*.newName = token.value }
+            if nameIs(where, "params.context.includeDeclaration") { request.*.includeDeclaration = kind == json.TokenKind.trueValue }
+            if nameIs(where, "params.context.triggerCharacter") { request.*.triggerCharacter = token.value }
+            if nameIs(where, "params.rootUri") { request.*.rootUri = token.value }
+            if nameIs(where, "params.rootPath") { request.*.rootPath = token.value }
+            if nameIs(where, "params.workspaceFolders.[].uri") && request.*.folderUri.length == 0 { request.*.folderUri = token.value }
+        }
+    }
+    return !json.failed(&tokenizer)
+}
+
+pub fn slice(value: String) -> []const u8 { return value.pointer[0..value.length] }
+
+// A raw JSON string decoded into memory from `allocator` (its capacity in
+// capacity); its length.
+pub fn decodeInto(allocator: Allocator, raw: String, result: *[*]u8, capacity: *usize) -> usize {
+    capacity.* = raw.length + 1
+    result.* = allocator.alloc(capacity.*, 16).?
+    const length = json.decodeString(raw, result.*, capacity.*)
+    if length < 0 { return 0 }
+    return @bitCast(usize, length)
+}
+
+// ---------------------------------------------------------------------------
+// URIs
+
+fn hexValue(value: u8) -> u8 {
+    if value >= 48 && value <= 57 { return value - 48 }
+    if value >= 97 && value <= 102 { return value - 87 }
+    if value >= 65 && value <= 70 { return value - 55 }
+    return 0
+}
+
+// The path of a file:// URI (percent escapes decoded) into out; its length
+// (0: not a file URI).
+pub fn uriPath(uri: []const u8, out: [*]u8, capacity: usize) -> usize {
+    const scheme = "file://"
+    if uri.length < scheme.length || !nameIs(uri[0..scheme.length], scheme) { return 0 }
+    var at = scheme.length
+    var length: usize = 0
+    while at < uri.length && length + 1 < capacity {
+        if uri[at] == 37 && at + 2 < uri.length {
+            out[length] = hexValue(uri[at + 1]) * 16 + hexValue(uri[at + 2])
+            at += 3
+        } else {
+            out[length] = uri[at]
+            at += 1
+        }
+        length += 1
+    }
+    return length
+}
+
+fn isPlain(value: u8) -> bool {
+    return (value >= 97 && value <= 122) || (value >= 65 && value <= 90) || (value >= 48 && value <= 57) || value == 45 || value == 46 || value == 95 || value == 126 || value == 47
+}
+
+// A path as a file:// URI, JSON-quoted.
+pub fn uri(writer: *Writer, path: []const u8) -> void {
+    byte(writer, 34)
+    text(writer, "file://")
+    for item in path {
+        if isPlain(item) {
+            byte(writer, item)
+        } else {
+            byte(writer, 37)
+            byte(writer, hexDigit(item >> 4) - (if item >> 4 >= 10 { 32 } else { 0 }))
+            byte(writer, hexDigit(item & 15) - (if item & 15 >= 10 { 32 } else { 0 }))
+        }
+    }
+    byte(writer, 34)
+}
+
+// ---------------------------------------------------------------------------
+// Positions
+
+// UTF-16 code units in text[from..to] (UTF-8).
+pub fn utf16Units(source: []const u8, from: usize, to: usize) -> usize {
+    var units: usize = 0
+    var at = from
+    while at < to && at < source.length {
+        const lead = source[at]
+        if lead < 128 {
+            at += 1
+            units += 1
+        } else if lead >= 240 {
+            at += 4
+            units += 2
+        } else if lead >= 224 {
+            at += 3
+            units += 1
+        } else if lead >= 192 {
+            at += 2
+            units += 1
+        } else {
+            at += 1
+        }
+    }
+    return units
+}
+
+// The byte offset `units` UTF-16 code units into the line at `line_start`.
+pub fn byteAfterUnits(source: []const u8, line_start: usize, units: usize) -> usize {
+    var at = line_start
+    var counted: usize = 0
+    while at < source.length && source[at] != 10 && counted < units {
+        const lead = source[at]
+        if lead < 128 {
+            at += 1
+            counted += 1
+        } else if lead >= 240 {
+            at += 4
+            counted += 2
+        } else if lead >= 224 {
+            at += 3
+            counted += 1
+        } else if lead >= 192 {
+            at += 2
+            counted += 1
+        } else {
+            at += 1
+        }
+    }
+    return if at > source.length { source.length } else { at }
+}
+
+// The byte offset of an LSP position in text.
+pub fn offsetOf(source: []const u8, line: usize, character: usize) -> usize {
+    var at: usize = 0
+    var current: usize = 0
+    while current < line && at < source.length {
+        if source[at] == 10 { current += 1 }
+        at += 1
+    }
+    return byteAfterUnits(source, at, character)
+}
+
+// An LSP position {"line":..,"character":..} of byte `offset`.
+pub fn position(writer: *Writer, source: []const u8, offset: usize) -> void {
+    var line: usize = 0
+    var line_start: usize = 0
+    var at: usize = 0
+    while at < offset && at < source.length {
+        if source[at] == 10 {
+            line += 1
+            line_start = at + 1
+        }
+        at += 1
+    }
+    text(writer, "{\"line\":")
+    number(writer, line)
+    text(writer, ",\"character\":")
+    number(writer, utf16Units(source, line_start, offset))
+    byte(writer, 125)
+}
+
+// The same where the line and its start are known.
+pub fn positionAt(writer: *Writer, source: []const u8, line: usize, line_start: usize, offset: usize) -> void {
+    text(writer, "{\"line\":")
+    number(writer, line)
+    text(writer, ",\"character\":")
+    number(writer, utf16Units(source, line_start, offset))
+    byte(writer, 125)
+}

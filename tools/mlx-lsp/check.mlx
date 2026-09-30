@@ -1,0 +1,376 @@
+// The compiler's own errors for mlx-lsp: the compiler (mlx4, without -o it
+// only analyzes) runs on a file in the background, in the workspace (where
+// std/src is), its output is read as it comes, and its lines
+// ("PATH:LINE:COLUMN: error: CODE: MESSAGE") become diagnostics. One check
+// runs at a time; a file asked for meanwhile is checked next.
+const std = @import("std")
+const protocol = @import("./protocol.mlx")
+
+pub const Allocator = std.allocator.Allocator
+
+const SYS_read: usize = 0
+const SYS_close: usize = 3
+const SYS_poll: usize = 7
+const SYS_dup2: usize = 33
+const SYS_fork: usize = 57
+const SYS_execve: usize = 59
+const SYS_exit: usize = 60
+const SYS_wait4: usize = 61
+const SYS_kill: usize = 62
+const SYS_chdir: usize = 80
+const SYS_pipe2: usize = 293
+const O_CLOEXEC: usize = 524288
+
+pub const MAX_DIAGNOSTICS: usize = 512
+
+pub const Diagnostic = struct {
+    // Where in the finished output the path and message are.
+    pathStart: usize
+    pathLength: usize
+    line: usize
+    column: usize
+    isError: bool
+    codeStart: usize
+    codeLength: usize
+    messageStart: usize
+    messageLength: usize
+}
+
+pub const Check = struct {
+    allocator: Allocator
+    compiler: [1024]u8
+    compilerLength: usize
+    root: [1024]u8
+    rootLength: usize
+    environment: [*][*]const u8
+    running: bool
+    pid: isize
+    pipe: isize
+    started: usize
+    output: protocol.Writer
+    file: [1024]u8
+    fileLength: usize
+    pending: bool
+    pendingFile: [1024]u8
+    pendingLength: usize
+    // The last check's results (finish).
+    diagnostics: [*]Diagnostic
+    count: usize
+}
+
+fn bytesOf(check: *Check, field: usize) -> [*]u8 {
+    unsafe { return @ptrFromInt([*]u8, @intFromPtr(check) + field) }
+}
+
+fn outputOf(check: *Check) -> *protocol.Writer {
+    unsafe { return @ptrFromInt(*protocol.Writer, @intFromPtr(check) + @offsetOf(Check, "output")) }
+}
+
+pub fn filePath(check: *Check) -> []const u8 { return bytesOf(check, @offsetOf(Check, "file"))[0..check.*.fileLength] }
+pub fn rootPath(check: *Check) -> []const u8 { return bytesOf(check, @offsetOf(Check, "root"))[0..check.*.rootLength] }
+pub fn compilerPath(check: *Check) -> []const u8 { return bytesOf(check, @offsetOf(Check, "compiler"))[0..check.*.compilerLength] }
+pub fn outputText(check: *Check) -> []const u8 { return protocol.contents(outputOf(check)) }
+
+pub fn diagnosticAt(check: *Check, at: usize) -> *Diagnostic {
+    unsafe { return @ptrFromInt(*Diagnostic, @intFromPtr(check.*.diagnostics) + at * @sizeOf(Diagnostic)) }
+}
+
+fn copyInto(target: [*]u8, value: []const u8) -> usize {
+    var at: usize = 0
+    while at < value.length && at < 1023 {
+        target[at] = value[at]
+        at += 1
+    }
+    target[at] = 0
+    return at
+}
+
+pub fn init(check: *Check, allocator: Allocator, environment: [*][*]const u8) -> void {
+    check.*.allocator = allocator
+    check.*.environment = environment
+    check.*.compilerLength = 0
+    check.*.rootLength = 0
+    check.*.running = false
+    check.*.pending = false
+    check.*.count = 0
+    protocol.initWriter(outputOf(check), allocator, 65536)
+    unsafe { check.*.diagnostics = @ptrCast([*]Diagnostic, allocator.alloc(MAX_DIAGNOSTICS * @sizeOf(Diagnostic), 16).?) }
+}
+
+fn isExecutable(path: [*]const u8) -> bool {
+    // access(path, X_OK)
+    return std.linux.syscall2(21, @intFromPtr(path), 1) == 0
+}
+
+// The workspace (the compiler runs there) and the compiler: MLX_COMPILER,
+// else the workspace's mlx-out/bin/compiler/mlx4, else mlx4 on the PATH.
+pub fn configure(check: *Check, root: []const u8, environment_compiler: []const u8, path_variable: []const u8) -> void {
+    check.*.rootLength = copyInto(bytesOf(check, @offsetOf(Check, "root")), root)
+    const compiler = bytesOf(check, @offsetOf(Check, "compiler"))
+    check.*.compilerLength = 0
+    if environment_compiler.length > 0 {
+        check.*.compilerLength = copyInto(compiler, environment_compiler)
+        return
+    }
+    var candidate: [1100]u8 = undefined
+    var length: usize = 0
+    for item in root {
+        if length < 1000 {
+            candidate[length] = item
+            length += 1
+        }
+    }
+    for item in "/mlx-out/bin/compiler/mlx4" {
+        candidate[length] = item
+        length += 1
+    }
+    candidate[length] = 0
+    var found = false
+    unsafe { found = isExecutable(@ptrCast([*]const u8, &candidate)) }
+    if found {
+        check.*.compilerLength = copyInto(compiler, candidate[0..length])
+        return
+    }
+    // The PATH's directories.
+    var start: usize = 0
+    var at: usize = 0
+    while at <= path_variable.length {
+        if at == path_variable.length || path_variable[at] == 58 {
+            length = 0
+            var copy = start
+            while copy < at && length < 1000 {
+                candidate[length] = path_variable[copy]
+                length += 1
+                copy += 1
+            }
+            for item in "/mlx4" {
+                candidate[length] = item
+                length += 1
+            }
+            candidate[length] = 0
+            unsafe { found = at > start && isExecutable(@ptrCast([*]const u8, &candidate)) }
+            if found {
+                check.*.compilerLength = copyInto(compiler, candidate[0..length])
+                return
+            }
+            start = at + 1
+        }
+        at += 1
+    }
+}
+
+// Checks `path` (now, or after the check running).
+pub fn request(check: *Check, path: []const u8, now: usize) -> void {
+    if check.*.compilerLength == 0 { return }
+    if check.*.running {
+        check.*.pendingLength = copyInto(bytesOf(check, @offsetOf(Check, "pendingFile")), path)
+        check.*.pending = true
+        return
+    }
+    start(check, path, now)
+}
+
+fn start(check: *Check, path: []const u8, now: usize) -> void {
+    check.*.fileLength = copyInto(bytesOf(check, @offsetOf(Check, "file")), path)
+    protocol.clear(outputOf(check))
+    var pipes: [2]i32 = [2]i32{ -1, -1 }
+    var made: isize = 0
+    unsafe { made = std.linux.syscall2(SYS_pipe2, @intFromPtr(&pipes), O_CLOEXEC) }
+    if made != 0 { return }
+    const child = std.linux.syscall0(SYS_fork)
+    if child == 0 {
+        const reading = std.linux.syscall1(SYS_close, @intCast(usize, pipes[0]))
+        const out = std.linux.syscall2(SYS_dup2, @intCast(usize, pipes[1]), 1)
+        const err = std.linux.syscall2(SYS_dup2, @intCast(usize, pipes[1]), 2)
+        unsafe {
+            const moved = std.linux.syscall1(SYS_chdir, @intFromPtr(bytesOf(check, @offsetOf(Check, "root"))))
+            var arguments: [4][*]const u8 = undefined
+            arguments[0] = @ptrCast([*]const u8, bytesOf(check, @offsetOf(Check, "compiler")))
+            arguments[1] = @ptrCast([*]const u8, "--quiet")
+            arguments[2] = @ptrCast([*]const u8, bytesOf(check, @offsetOf(Check, "file")))
+            arguments[3] = @ptrFromInt([*]const u8, 0)
+            const ran = std.linux.syscall3(SYS_execve, @intFromPtr(arguments[0]), @intFromPtr(&arguments), @intFromPtr(check.*.environment))
+        }
+        const exited = std.linux.syscall1(SYS_exit, 127)
+    }
+    const writing = std.linux.syscall1(SYS_close, @intCast(usize, pipes[1]))
+    if child < 0 {
+        const reading = std.linux.syscall1(SYS_close, @intCast(usize, pipes[0]))
+        return
+    }
+    check.*.pid = child
+    check.*.pipe = @intCast(isize, pipes[0])
+    check.*.running = true
+    check.*.started = now
+}
+
+// Reads what the compiler wrote (its pipe is readable); true when it is
+// done (the results are then in diagnostics).
+pub fn pump(check: *Check) -> bool {
+    if !check.*.running { return false }
+    var buffer: [8192]u8 = undefined
+    var count: isize = 0
+    unsafe { count = std.linux.syscall3(SYS_read, @bitCast(usize, check.*.pipe), @intFromPtr(&buffer), 8192) }
+    if count > 0 {
+        unsafe { protocol.text(outputOf(check), @ptrCast([*]const u8, &buffer)[0..@bitCast(usize, count)]) }
+        return false
+    }
+    finish(check)
+    return true
+}
+
+// Stops a check that takes too long (more than a minute).
+pub fn stopIfStuck(check: *Check, now: usize) -> bool {
+    if !check.*.running || now < check.*.started + 60000 { return false }
+    const killed = std.linux.syscall2(SYS_kill, @bitCast(usize, check.*.pid), 9)
+    finish(check)
+    return true
+}
+
+fn finish(check: *Check) -> void {
+    const closed = std.linux.syscall1(SYS_close, @bitCast(usize, check.*.pipe))
+    var status: i32 = 0
+    unsafe { const waited = std.linux.syscall4(SYS_wait4, @bitCast(usize, check.*.pid), @intFromPtr(&status), 0, 0) }
+    check.*.running = false
+    parseOutput(check)
+}
+
+// Starts the check asked for meanwhile; whether there was one.
+pub fn next(check: *Check, now: usize) -> bool {
+    if check.*.running || !check.*.pending { return false }
+    check.*.pending = false
+    var path: [1024]u8 = undefined
+    var length: usize = 0
+    while length < check.*.pendingLength {
+        path[length] = check.*.pendingFile[length]
+        length += 1
+    }
+    start(check, path[0..length], now)
+    return true
+}
+
+fn isDigit(value: u8) -> bool { return value >= 48 && value <= 57 }
+
+fn startsWith(text: []const u8, at: usize, prefix: []const u8) -> bool {
+    if at + prefix.length > text.length { return false }
+    var index: usize = 0
+    while index < prefix.length {
+        if text[at + index] != prefix[index] { return false }
+        index += 1
+    }
+    return true
+}
+
+// Follow-on lines that only say where the first error made analysis stop.
+fn isFollowOn(message: []const u8) -> bool {
+    return sameText(message, "semantic analysis failed in function") || sameText(message, "function body could not be resolved") || sameText(message, "declaration type could not be resolved") || sameText(message, "module graph could not be loaded")
+}
+
+fn sameText(first: []const u8, second: []const u8) -> bool {
+    if first.length != second.length { return false }
+    var at: usize = 0
+    while at < first.length {
+        if first[at] != second[at] { return false }
+        at += 1
+    }
+    return true
+}
+
+// The lines "PATH:LINE:COLUMN: error: CODE: MESSAGE" (PATH may be missing)
+// into diagnostics; follow-on lines dropped when there is more.
+fn parseOutput(check: *Check) -> void {
+    check.*.count = 0
+    const output = outputText(check)
+    var line_start: usize = 0
+    var kept_real = false
+    while line_start < output.length {
+        var line_end = line_start
+        while line_end < output.length && output[line_end] != 10 { line_end += 1 }
+        // ": error: " or ": warning: ".
+        var marker = line_start
+        var is_error = true
+        var found = false
+        while marker < line_end && !found {
+            if startsWith(output, marker, ": error: ") {
+                found = true
+            } else if startsWith(output, marker, ": warning: ") {
+                found = true
+                is_error = false
+            } else {
+                marker += 1
+            }
+        }
+        if found && check.*.count < MAX_DIAGNOSTICS {
+            // LINE and COLUMN before the marker, PATH before them.
+            var cursor = marker
+            var column: usize = 0
+            var line: usize = 0
+            var scale: usize = 1
+            while cursor > line_start && isDigit(output[cursor - 1]) {
+                column += @intCast(usize, output[cursor - 1] - 48) * scale
+                scale = scale * 10
+                cursor -= 1
+            }
+            if cursor > line_start && output[cursor - 1] == 58 { cursor -= 1 }
+            scale = 1
+            while cursor > line_start && isDigit(output[cursor - 1]) {
+                line += @intCast(usize, output[cursor - 1] - 48) * scale
+                scale = scale * 10
+                cursor -= 1
+            }
+            var path_end = cursor
+            if path_end > line_start && output[path_end - 1] == 58 { path_end -= 1 }
+            const rest_start = marker + (if is_error { 9 } else { 11 })
+            // "CODE: MESSAGE" (the code is optional).
+            var code_end = rest_start
+            while code_end < line_end && output[code_end] != 58 && output[code_end] != 32 { code_end += 1 }
+            var message_start = rest_start
+            var code_length: usize = 0
+            if code_end + 1 < line_end && output[code_end] == 58 && output[code_end + 1] == 32 {
+                code_length = code_end - rest_start
+                message_start = code_end + 2
+            }
+            const message = output[message_start..line_end]
+            const follow_on = isFollowOn(message)
+            if !follow_on || !kept_real {
+                const diagnostic = diagnosticAt(check, check.*.count)
+                diagnostic.*.pathStart = line_start
+                diagnostic.*.pathLength = path_end - line_start
+                diagnostic.*.line = line
+                diagnostic.*.column = column
+                diagnostic.*.isError = is_error
+                diagnostic.*.codeStart = rest_start
+                diagnostic.*.codeLength = code_length
+                diagnostic.*.messageStart = message_start
+                diagnostic.*.messageLength = line_end - message_start
+                check.*.count += 1
+                if !follow_on { kept_real = true }
+            }
+        }
+        line_start = line_end + 1
+    }
+    // A follow-on line kept before the real error came goes again.
+    if kept_real {
+        var kept: usize = 0
+        var at: usize = 0
+        while at < check.*.count {
+            const diagnostic = diagnosticAt(check, at)
+            const message = output[diagnostic.*.messageStart..diagnostic.*.messageStart + diagnostic.*.messageLength]
+            if !isFollowOn(message) {
+                const target = diagnosticAt(check, kept)
+                target.*.pathStart = diagnostic.*.pathStart
+                target.*.pathLength = diagnostic.*.pathLength
+                target.*.line = diagnostic.*.line
+                target.*.column = diagnostic.*.column
+                target.*.isError = diagnostic.*.isError
+                target.*.codeStart = diagnostic.*.codeStart
+                target.*.codeLength = diagnostic.*.codeLength
+                target.*.messageStart = diagnostic.*.messageStart
+                target.*.messageLength = diagnostic.*.messageLength
+                kept += 1
+            }
+            at += 1
+        }
+        check.*.count = kept
+    }
+}
