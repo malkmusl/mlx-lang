@@ -524,7 +524,7 @@ Two programs use both halves of `std.wayland` with real input:
 - [`projects/desktop/compositor`](../../projects/desktop/compositor/README.md)
   is a compositor that runs freestanding (DRM/KMS output, evdev input, the
   devices and VT switching from systemd-logind over its own D-Bus client,
-  the keymap from libxkbcommon) or nested. Nested, it is a client of the
+  the keymap compiled by std.xkb) or nested. Nested, it is a client of the
   session compositor (its output is one window there) and a server for its
   own clients. It routes
   the session's pointer and keyboard to the window under the pointer or
@@ -622,7 +622,7 @@ others from `std/protocols/wayland` (`wlr-layer-shell-unstable-v1.xml`,
 
 Their shared code is in `projects/desktop/shared`: a layer surface with
 its buffers, pointer and keyboard (key repeat, the keymap through
-libxkbcommon) and the window list (`panel.mlx`), drawing with smooth
+std.xkb) and the window list (`panel.mlx`), drawing with smooth
 rounded shapes, images and `std.truetype` text (`canvas.mlx`), and the
 apps from their desktop entries with PNG icons through `std.png`
 (`apps.mlx`). `tools/check_desktop_clients.sh` runs both in the nested

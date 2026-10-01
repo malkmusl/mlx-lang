@@ -733,7 +733,7 @@ def main():
             fail(f"both cards should be looked at and logged:\n{log}")
         if "drm: driving " not in log or "/card0: eDP-1 1000x700" not in log.split("drm: driving ", 1)[1]:
             fail(f"the card with the larger monitor (card0) should be driven, not the BMC's:\n{log}")
-        if "input: " not in harness.log_text() or "keyboard: xkb keymap from libxkbcommon" not in harness.log_text():
+        if "input: " not in harness.log_text() or "keyboard: xkb keymap from the XKB data" not in harness.log_text():
             fail(f"inputs or keymap missing:\n{harness.log_text()}")
         card = harness.devices[(DRM_MAJOR, 0)]
         if card.pixel(0, HEIGHT - 1) != background(HEIGHT - 1):
@@ -828,7 +828,7 @@ def main():
         print(f"ok   Ctrl+Alt+F2 switched VTs through logind; paused, resumed (modeset again), typing works after ({modesets} modesets, {card.flips - flips_before} flips since)")
 
         # weston-terminal translates keys with the keymap and modifiers the
-        # compositor made (libxkbcommon): Shift for '>' and '_' must work.
+        # compositor made (std.xkb): Shift for '>' and '_' must work.
         if shutil.which("weston-terminal"):
             client_environment = dict(os.environ, WAYLAND_DISPLAY="wayland-drm", XDG_RUNTIME_DIR=harness.work)
             client_environment.pop("DISPLAY", None)

@@ -5,9 +5,9 @@
 # The session (projects/desktop/compositor/session/mlx-session) runs the
 # compositor freestanding: it drives the monitor (DRM/KMS) at its preferred
 # resolution and reads the input devices itself, with systemd-logind
-# handing out the devices and switching VTs; libxkbcommon (installed on any
-# desktop) makes the keymap. MLX_SESSION_HOST=cage|weston in the session's
-# environment runs it nested in one of those hosts instead.
+# handing out the devices and switching VTs; std.xkb makes the keymap from
+# the XKB data (installed on any desktop). MLX_SESSION_HOST=cage|weston in
+# the session's environment runs it nested in one of those hosts instead.
 #
 # Installs:
 #   PREFIX/bin/mlx-compositor, PREFIX/bin/mlx-terminal, PREFIX/bin/mlx-session,

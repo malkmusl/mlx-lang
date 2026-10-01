@@ -252,12 +252,11 @@ else
     note "no Vulkan driver manifests: the compositor composes on the CPU (mesa-vulkan-drivers provides RADV, ANV and NVK)"
 fi
 xkb_found=0
-ldconfig -p 2> /dev/null | grep -q libxkbcommon.so.0 && xkb_found=1
-for candidate in /usr/lib/libxkbcommon.so.0 /usr/lib64/libxkbcommon.so.0 /usr/lib/*-linux-gnu*/libxkbcommon.so.0 /usr/local/lib/libxkbcommon.so.0; do
-    [[ -e "$candidate" ]] && xkb_found=1
+for candidate in "${XKB_CONFIG_ROOT:-/usr/share/X11/xkb}" /usr/share/X11/xkb /usr/local/share/X11/xkb; do
+    [[ -f "$candidate/rules/evdev" ]] && xkb_found=1
 done
-[[ -f "$log_file" ]] && grep -q "keyboard: xkb keymap from libxkbcommon" "$log_file" && xkb_found=1
-if [[ $xkb_found -eq 1 ]]; then ok "libxkbcommon (the keymap)"; else bad "libxkbcommon.so.0 not found: keyboards will have no keymap (install libxkbcommon)"; fi
+[[ -f "$log_file" ]] && grep -q "keyboard: xkb keymap from the XKB data" "$log_file" && xkb_found=1
+if [[ $xkb_found -eq 1 ]]; then ok "the XKB data (the keymap)"; else bad "no XKB data (/usr/share/X11/xkb): keyboards will have no keymap (install xkb-data or xkeyboard-config)"; fi
 if [[ -f "$log_file" ]]; then
     note "last session log: $log_file ($(date -r "$log_file" '+%Y-%m-%d %H:%M')); show it with: $0 --log"
     if grep -q "first frame on screen" "$log_file"; then ok "the last session showed a frame"; fi

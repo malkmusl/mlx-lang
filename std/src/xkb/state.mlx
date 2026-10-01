@@ -18,9 +18,32 @@ pub const State = struct {
     // Derived: the effective modifiers and group.
     mods: u32
     group: u32
+    // Following the keys (updateKey): the modifiers a key press sets and
+    // clears, how many held keys set each real modifier, and the actions
+    // in progress (filters, libxkbcommon calls them): the key, the action
+    // (kind 0: a free place), what it keeps, how often its key is down.
+    setMods: u32
+    clearMods: u32
+    modKeyCount: [8]i32
+    filterCount: usize
+    filterKey: [64]u32
+    filterKind: [64]u8
+    filterFlags: [64]u8
+    filterMods: [64]u32
+    filterGroup: [64]i32
+    filterPriv: [64]i32
+    filterRefs: [64]i32
 }
 
 pub fn init(state: *State, keymap: *xkb.Keymap) -> void {
+    state.*.setMods = 0
+    state.*.clearMods = 0
+    state.*.filterCount = 0
+    var index: usize = 0
+    while index < 8 {
+        state.*.modKeyCount[index] = 0
+        index += 1
+    }
     state.*.keymap = keymap
     state.*.baseMods = 0
     state.*.latchedMods = 0
@@ -228,3 +251,256 @@ pub fn keyRepeats(keymap: *xkb.Keymap, keycode: u32) -> bool {
     if keycode >= @intCast(u32, xkb.MAX_KEYCODE) { return false }
     return keymap.*.keyRepeats[@intCast(usize, keycode)]
 }
+
+// ---------------------------------------------------------------------------
+// Following the keys, as libxkbcommon's xkb_state_update_key: a key's
+// action (SetMods, LatchMods, LockMods and the group ones) takes effect
+// while it is down, latches until the next key, or locks.
+
+// Actions in progress at once (one per key held, and latches).
+pub const MAX_FILTERS: usize = 64
+
+const LATCH_NONE: i32 = 0
+const LATCH_KEY_DOWN: i32 = 1
+const LATCH_PENDING: i32 = 2
+
+// The action key `keycode` has now: its kind (ACTION_NONE without one),
+// flags, real modifiers and group.
+fn actionOf(state: *State, keycode: u32, kind: *u8, flags: *u8, mods: *u32, group: *i32) -> void {
+    kind.* = xkb.ACTION_NONE
+    flags.* = 0
+    mods.* = 0
+    group.* = 0
+    const key_group = keyGroup(state, keycode)
+    if key_group == NO_GROUP { return }
+    const level = keyLevel(state, keycode, key_group)
+    if level >= @intCast(u32, xkb.MAX_LEVELS) { return }
+    const keymap = state.*.keymap
+    const slot = xkb.slotOf(@intCast(usize, keycode), @intCast(usize, key_group), @intCast(usize, level))
+    kind.* = keymap.*.actionKind[slot]
+    flags.* = keymap.*.actionFlags[slot]
+    group.* = keymap.*.actionGroup[slot]
+    if flags.* & xkb.FLAG_MODMAP_MODS != 0 {
+        mods.* = @intCast(u32, keymap.*.keyModmap[@intCast(usize, keycode)])
+    } else {
+        mods.* = xkb.realMods(keymap, keymap.*.actionMods[slot])
+    }
+}
+
+// Actions that end a latch when their key is pressed (keys without one).
+fn breaksLatch(kind: u8) -> bool { return kind == xkb.ACTION_NONE || kind == xkb.ACTION_OTHER_BREAKING }
+
+fn freeFilter(state: *State, at: usize) -> void { state.*.filterKind[at] = xkb.ACTION_NONE }
+
+// The group a group action makes of `group`.
+fn groupAfter(flags: u8, action_group: i32, group: i32) -> i32 {
+    return if flags & xkb.FLAG_GROUP_ABSOLUTE != 0 { action_group } else { group + action_group }
+}
+
+// What a filter does when its action starts.
+fn startFilter(state: *State, at: usize) -> void {
+    const mods = state.*.filterMods[at]
+    const flags = state.*.filterFlags[at]
+    const kind = state.*.filterKind[at]
+    if kind == xkb.ACTION_SET_MODS { state.*.setMods = mods }
+    if kind == xkb.ACTION_LATCH_MODS {
+        state.*.filterPriv[at] = LATCH_KEY_DOWN
+        state.*.setMods = mods
+    }
+    if kind == xkb.ACTION_LOCK_MODS {
+        state.*.filterPriv[at] = @bitCast(i32, state.*.lockedMods & mods)
+        state.*.setMods |= mods
+        if flags & xkb.FLAG_LOCK_NO_LOCK == 0 { state.*.lockedMods |= mods }
+    }
+    if kind == xkb.ACTION_SET_GROUP {
+        state.*.filterPriv[at] = state.*.baseGroup
+        state.*.baseGroup = groupAfter(flags, state.*.filterGroup[at], state.*.baseGroup)
+    }
+    if kind == xkb.ACTION_LATCH_GROUP {
+        state.*.filterPriv[at] = LATCH_KEY_DOWN
+        state.*.baseGroup = groupAfter(flags, state.*.filterGroup[at], state.*.baseGroup)
+    }
+    if kind == xkb.ACTION_LOCK_GROUP { state.*.lockedGroup = groupAfter(flags, state.*.filterGroup[at], state.*.lockedGroup) }
+}
+
+// A press or release of `keycode` meeting a filter; true when the filter
+// takes it (the key's own action does not start).
+fn runFilter(state: *State, at: usize, keycode: u32, down: bool) -> bool {
+    const kind = state.*.filterKind[at]
+    const own = keycode == state.*.filterKey[at]
+    const mods = state.*.filterMods[at]
+    if kind == xkb.ACTION_LATCH_MODS || kind == xkb.ACTION_LATCH_GROUP { return runLatch(state, at, keycode, down) }
+    if !own {
+        // Another key pressed while this one is held: it no longer clears
+        // locks when let go.
+        if kind == xkb.ACTION_SET_MODS || kind == xkb.ACTION_SET_GROUP { state.*.filterFlags[at] &= ~xkb.FLAG_CLEAR_LOCKS }
+        return false
+    }
+    if down {
+        state.*.filterRefs[at] += 1
+        return true
+    }
+    state.*.filterRefs[at] -= 1
+    if state.*.filterRefs[at] > 0 { return true }
+    const flags = state.*.filterFlags[at]
+    if kind == xkb.ACTION_SET_MODS {
+        state.*.clearMods = mods
+        if flags & xkb.FLAG_CLEAR_LOCKS != 0 { state.*.lockedMods &= ~mods }
+    }
+    if kind == xkb.ACTION_LOCK_MODS {
+        state.*.clearMods |= mods
+        if flags & xkb.FLAG_LOCK_NO_UNLOCK == 0 { state.*.lockedMods &= ~@bitCast(u32, state.*.filterPriv[at]) }
+    }
+    if kind == xkb.ACTION_SET_GROUP {
+        state.*.baseGroup = state.*.filterPriv[at]
+        if flags & xkb.FLAG_CLEAR_LOCKS != 0 { state.*.lockedGroup = 0 }
+    }
+    freeFilter(state, at)
+    return false
+}
+
+// LatchMods and LatchGroup: set while the key is down; latched after it
+// for the next key, unless another key came while it was down; the same
+// latch again locks it (latchToLock) or sets it.
+fn runLatch(state: *State, at: usize, keycode: u32, down: bool) -> bool {
+    const is_mods = state.*.filterKind[at] == xkb.ACTION_LATCH_MODS
+    const mods = state.*.filterMods[at]
+    const flags = state.*.filterFlags[at]
+    const delta = state.*.filterGroup[at]
+    var latch = state.*.filterPriv[at]
+    if down && latch == LATCH_PENDING {
+        var kind: u8 = 0
+        var key_flags: u8 = 0
+        var key_mods: u32 = 0
+        var key_group: i32 = 0
+        actionOf(state, keycode, &kind, &key_flags, &key_mods, &key_group)
+        const same = kind == state.*.filterKind[at] && key_flags == flags && (if is_mods { key_mods == mods } else { key_group == delta })
+        if same {
+            state.*.filterKey[at] = keycode
+            if is_mods {
+                if flags & xkb.FLAG_LATCH_TO_LOCK != 0 {
+                    state.*.filterKind[at] = xkb.ACTION_LOCK_MODS
+                    state.*.lockedMods |= mods
+                } else {
+                    state.*.filterKind[at] = xkb.ACTION_SET_MODS
+                    state.*.setMods = mods
+                }
+                state.*.latchedMods &= ~mods
+            } else {
+                if flags & xkb.FLAG_LATCH_TO_LOCK != 0 && delta != 0 {
+                    state.*.filterKind[at] = xkb.ACTION_LOCK_GROUP
+                } else {
+                    state.*.filterKind[at] = xkb.ACTION_SET_GROUP
+                }
+                startFilter(state, at)
+                state.*.latchedGroup -= delta
+            }
+            return true
+        }
+        if breaksLatch(kind) {
+            if is_mods { state.*.latchedMods &= ~mods } else { state.*.latchedGroup -= delta }
+            freeFilter(state, at)
+            return false
+        }
+    } else if !down && keycode == state.*.filterKey[at] {
+        const clears = flags & xkb.FLAG_CLEAR_LOCKS != 0 && (if is_mods { state.*.lockedMods & mods == mods } else { state.*.lockedGroup != 0 })
+        if latch == LATCH_NONE || clears {
+            if is_mods {
+                if latch == LATCH_PENDING { state.*.latchedMods &= ~mods } else { state.*.clearMods = mods }
+                state.*.lockedMods &= ~mods
+            } else {
+                if latch == LATCH_PENDING { state.*.latchedGroup -= delta } else { state.*.baseGroup -= delta }
+                if flags & xkb.FLAG_CLEAR_LOCKS != 0 { state.*.lockedGroup = 0 }
+            }
+            freeFilter(state, at)
+        } else {
+            latch = LATCH_PENDING
+            if is_mods {
+                state.*.clearMods = mods
+                state.*.latchedMods |= mods
+            } else {
+                state.*.baseGroup -= delta
+                state.*.latchedGroup += delta
+            }
+        }
+    } else if down && latch == LATCH_KEY_DOWN {
+        latch = LATCH_NONE
+    }
+    if state.*.filterKind[at] == xkb.ACTION_LATCH_MODS || state.*.filterKind[at] == xkb.ACTION_LATCH_GROUP { state.*.filterPriv[at] = latch }
+    return false
+}
+
+// A key pressed (`down`) or let go: its action and those in progress
+// change the modifiers and group. True when they changed.
+pub fn updateKey(state: *State, keycode: u32, down: bool) -> bool {
+    if keycode < state.*.keymap.*.minKeycode || keycode > state.*.keymap.*.maxKeycode || keycode >= @intCast(u32, xkb.MAX_KEYCODE) { return false }
+    const before_base = state.*.baseMods
+    const before_latched = state.*.latchedMods
+    const before_locked = state.*.lockedMods
+    const before_group = state.*.group
+    const before_base_group = state.*.baseGroup
+    const before_latched_group = state.*.latchedGroup
+    const before_locked_group = state.*.lockedGroup
+    state.*.setMods = 0
+    state.*.clearMods = 0
+    var consumed = false
+    var at: usize = 0
+    while at < state.*.filterCount {
+        if state.*.filterKind[at] != xkb.ACTION_NONE {
+            if runFilter(state, at, keycode, down) { consumed = true }
+        }
+        at += 1
+    }
+    if !consumed && down {
+        var kind: u8 = 0
+        var flags: u8 = 0
+        var mods: u32 = 0
+        var group: i32 = 0
+        actionOf(state, keycode, &kind, &flags, &mods, &group)
+        if kind != xkb.ACTION_NONE && kind < xkb.ACTION_OTHER {
+            at = 0
+            while at < state.*.filterCount && state.*.filterKind[at] != xkb.ACTION_NONE { at += 1 }
+            if at < MAX_FILTERS {
+                if at == state.*.filterCount { state.*.filterCount += 1 }
+                state.*.filterKey[at] = keycode
+                state.*.filterKind[at] = kind
+                state.*.filterFlags[at] = flags
+                state.*.filterMods[at] = mods
+                state.*.filterGroup[at] = group
+                state.*.filterPriv[at] = 0
+                state.*.filterRefs[at] = 1
+                startFilter(state, at)
+            }
+        }
+    }
+    var bit: usize = 0
+    while bit < 8 {
+        const mask = @intCast(u32, 1) << @intCast(u5, bit)
+        if state.*.setMods & mask != 0 {
+            state.*.modKeyCount[bit] += 1
+            state.*.baseMods |= mask
+        }
+        bit += 1
+    }
+    bit = 0
+    while bit < 8 {
+        const mask = @intCast(u32, 1) << @intCast(u5, bit)
+        if state.*.clearMods & mask != 0 {
+            state.*.modKeyCount[bit] -= 1
+            if state.*.modKeyCount[bit] <= 0 {
+                state.*.baseMods &= ~mask
+                state.*.modKeyCount[bit] = 0
+            }
+        }
+        bit += 1
+    }
+    derive(state)
+    return state.*.baseMods != before_base || state.*.latchedMods != before_latched || state.*.lockedMods != before_locked || state.*.group != before_group || state.*.baseGroup != before_base_group || state.*.latchedGroup != before_latched_group || state.*.lockedGroup != before_locked_group
+}
+
+// What a compositor sends in wl_keyboard.modifiers: the real modifiers
+// held, latched and locked, and the group in effect.
+pub fn depressedMods(state: *State) -> u32 { return state.*.baseMods }
+pub fn latchedMods(state: *State) -> u32 { return state.*.latchedMods }
+pub fn lockedMods(state: *State) -> u32 { return state.*.lockedMods }
+pub fn effectiveGroup(state: *State) -> u32 { return state.*.group }

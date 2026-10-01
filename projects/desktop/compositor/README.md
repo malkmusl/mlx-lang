@@ -16,7 +16,7 @@ nested|drm` decides).
 - Keyboard and pointer go to the clients: the pointer to the window under
   it, a click focuses and raises a window, and keys go to the focused
   window. Clients receive the xkb keymap (nested: the session's;
-  freestanding: made with libxkbcommon for the system's layout) and the key
+  freestanding: compiled by std.xkb for the system's layout) and the key
   repeat settings.
 - Windows move by dragging their title bar (`xdg_toplevel.move`) or with
   Alt+drag anywhere.
@@ -317,11 +317,12 @@ compositor is the display server itself:
   pointer about 4 pixels per millimetre, scroll with two fingers (the
   content follows the fingers), click (two fingers: right click) and tap
   to click.
-- **Keyboard** ([`xkb.mlx`](xkb.mlx)): libxkbcommon, loaded at run time,
-  compiles the keymap for `XKB_DEFAULT_LAYOUT` (and `_VARIANT`, `_MODEL`,
-  `_OPTIONS`; the session launcher sets them from the system settings) and
-  follows the modifiers. Without it a keymap file can be given with
-  `MLX_XKB_KEYMAP`.
+- **Keyboard** ([`xkb.mlx`](xkb.mlx)): `std.xkb` compiles the keymap from
+  the XKB data (`/usr/share/X11/xkb`) for `XKB_DEFAULT_LAYOUT` (and
+  `_VARIANT`, `_MODEL`, `_OPTIONS`; the session launcher sets them from the
+  system settings) as libxkbcommon would, without it, and follows the
+  modifiers through every key's action. A keymap file can be given instead
+  with `MLX_XKB_KEYMAP`.
 - **VT switching**: Ctrl+Alt+F1..F12 asks logind to switch; while another
   VT is in front logind pauses the card and the input devices (keys and
   buttons still held are released), and coming back sets the CRTC up
@@ -389,7 +390,7 @@ The checks cover the three programs and the session entry (whose `Exec`
 and `TryExec` must resolve, or the login screen hides the session), the
 display manager, the system bus for logind, the DRM cards and their
 connected connectors, the `video` and `input` groups (needed only without
-logind), the Vulkan drivers, libxkbcommon, and the last session log,
+logind), the Vulkan drivers, the XKB data, and the last session log,
 whose `modeset failed`, `crashed:` or `killed by signal` lines it points
 out. It wraps `tools/install_compositor_session.sh`, which does the
 building and copying (`--prefix`, default `/usr/local` there; `--destdir`
