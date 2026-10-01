@@ -289,7 +289,7 @@ specialized over.
 **Source tests:** `134_bootstrap_fs_runtime.mlx`,
 `142_bootstrap_process_arguments_runtime.mlx`,
 `204_process_environment_runtime.mlx`, `205_bootstrap_fs_status_runtime.mlx`,
-`139_bootstrap_elf_file_runtime.mlx`
+`139_bootstrap_elf_file_runtime.mlx`, `277_fs_entries_runtime.mlx`
 
 `fs.xml` names a portable filesystem API (`open create read write seek stat
 iterateDirectory makeDir delete rename`) "over std.os/std.posix backends,"
@@ -302,9 +302,21 @@ portable `std.fs` facade split by backend): `open`/`openAt`, `close`,
 (`stat`/`statx`), `getWorkingDirectory`/`changeDirectory`, `delete`/
 `deleteAt`, `rename`/`renameWithFlags`, `makeDir`/`removeDir`, `chmod`,
 `changeOwner`, `hardLink`/`symbolicLink`/`readLink`, `makePipe`/`splice`, and
-`sync*`. `readDirectory` (`getdents64`) is present as the raw primitive
-`iterateDirectory` from the spec would be built on, but there is no typed
-directory-iterator wrapper yet.
+`sync*`. `readDirectory` (`getdents64`) is the raw primitive; `entries`
+and `nextEntry` iterate a directory through a buffer the caller gives
+(`Entries`, each `Entry` a borrowed name, its `ENTRY_*` kind and inode,
+`failed` set when a read or a record goes wrong), and `isDotName` tells
+`.` and `..` apart (`tests/277_fs_entries_runtime.mlx`):
+
+```mlx
+var reader = std.fs.entries(directory, buffer, 8192)
+var entry: std.fs.Entry = undefined
+while std.fs.nextEntry(&reader, &entry) {
+    if std.fs.isDotName(entry.name) { continue }
+    ...
+}
+if reader.failed { ... }
+```
 
 A round-trip open/write/seek/read/close/delete over `/tmp`:
 
@@ -349,6 +361,12 @@ if std.process.environment(arguments, "MLX_ENVIRONMENT_NAME_THAT_DOES_NOT_EXIST"
 ```
 
 (`tests/204_process_environment_runtime.mlx`)
+
+`std.process.optionValue(arguments, &index, attached)` takes a command-line
+option's value: `attached` (the rest of its own argument, "5" of `-n5`)
+when it is not empty, else the next argument (`-n 5`, moving `index` to
+it), or null after the last one
+(`tests/278_option_value_and_bases_runtime.mlx`).
 
 `std/bootstrap/os/linux/process.mlx` adds the lower-level process primitives:
 `execve`, signal disposition (`ignoreSignal`/`defaultSignal` via
@@ -396,6 +414,8 @@ pub fn writeAll(file: File, source: []const u8) -> bool { return fs.writeAll(fil
 
 It also provides allocation-free `writeUnsigned`/`writeHex` (via
 `fmt.unsignedDecimal`/`fmt.unsignedHex` into a stack buffer),
+`writeUnsignedBase` (any base from 2 to 36, lowercase digits;
+`tests/278_option_value_and_bases_runtime.mlx`),
 `writeLine`/`print`/`println`/`eprint`/`eprintln` convenience wrappers, and
 the `formatArguments`/`format`/`printFmt`/`eprintFmt` entry points into
 `std/bootstrap/fmt.mlx`. `std/src/io.mlx` re-exports this surface one-to-one
