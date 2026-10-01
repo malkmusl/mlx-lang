@@ -43,6 +43,19 @@ Zig is Stage-0 only. The canonical compiler, standard library, normal Mlx progra
 
 Read `AGENT_IMPLEMENTATION.md` and `SPEC_INDEX.md` before implementation.
 
+## Repository layout
+
+- `compiler/`: the self-hosted compiler (`compiler/selfhost/`) and the
+  Zig bootstrap.
+- `std/`: the standard library (`std/bootstrap/` the core, `std/src/` the
+  extensions: Wayland, Vulkan and `std.gpu`, SPIR-V, fonts, UI, ...).
+- `projects/`: programs written in Mlx: the desktop (a Wayland
+  compositor and its clients), MLX Observatory and coreutils.
+- `examples/`: small programs that show one thing each.
+- `tools/`: check scripts and developer tools (codemap, mlx-lsp,
+  mlx-profile, the Wayland test host).
+- `tests/`: the compiler's and the standard library's tests.
+
 ## Documentation
 
 - [`docs/README.md`](docs/README.md) — documentation index: a test-driven

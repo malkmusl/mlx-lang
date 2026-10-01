@@ -15,7 +15,7 @@ import re
 import sys
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent.parent / "examples" / "wayland-compositor"
+ROOT = Path(__file__).resolve().parent.parent / "projects" / "desktop" / "compositor"
 FILES = ["shell.mlx", "protocols.mlx", "data.mlx", "dmabuf.mlx", "pointer.mlx"]
 
 
