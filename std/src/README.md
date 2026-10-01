@@ -48,6 +48,13 @@ crash. `timezone.mlx` (`std.timezone`) gives local time from `$TZ` or
 `/etc/localtime` (TZif files and POSIX rules) and the civil calendar. See
 `docs/reference/stdlib.md`.
 
+`ui.mlx` (`std.ui`) lays out rectangles; `ui/canvas.mlx`, `ui/text.mlx`,
+`ui/gpu_canvas.mlx` and `ui/gpu_upload.mlx` draw on the CPU or the GPU;
+`ui/view.mlx` with `ui/controls.mlx`, `ui/field.mlx`, `ui/scroll.mlx`,
+`ui/lists.mlx`, `ui/tabs.mlx`, `ui/popup.mlx`, `ui/glyphs.mlx`,
+`ui/theme.mlx` and `ui/keys.mlx` are widgets for any platform. See
+`docs/reference/ui.md`.
+
 `xkb.mlx` (`std.xkb`) is the keymap model: `xkb/parse.mlx` reads XKB
 keymaps and source files, `xkb/compile.mlx` makes keymaps from the XKB
 data through `xkb/rules.mlx` and `xkb/merge.mlx`, `xkb/write.mlx` writes

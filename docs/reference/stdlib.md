@@ -98,9 +98,10 @@ extensions of the same kind; see [Vulkan, SPIR-V and JSON](vulkan.md)
 (`tests/248_json_runtime.mlx` covers `std.json`).
 
 `std.truetype` (`std/src/truetype.mlx`, see [TrueType fonts](truetype.md))
-and `std.ui` (`std/src/ui.mlx`, layout building blocks, see
-[Layout](ui.md)) are extensions for drawing text and laying out pixel user
-interfaces.
+and `std.ui` (`std/src/ui.mlx` and `std/src/ui/`: layout, a canvas on the
+CPU or the GPU, and widgets for any platform, see
+[User interfaces](ui.md)) are extensions for drawing text and building
+pixel user interfaces.
 
 `std.crash` (`std/src/crash.mlx`) is a program's crash report: `install()`
 sets a signal handler on a stack of its own that names the signal, the

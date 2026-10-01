@@ -101,11 +101,11 @@ and [`projects/desktop/launcher`](../launcher/main.mlx) (like
 [`projects/desktop/settings`](../settings/main.mlx)), sharing
 [`projects/desktop/shared`](../shared): the layer surface or window
 and its input (`panel.mlx`, with `panel_input.mlx`, `panel_frames.mlx`,
-popup menus in `panel_menu.mlx` and drag and drop in `panel_drag.mlx`), drawing (`canvas.mlx`), the keymap (`keyboard.mlx`),
+popup menus in `panel_menu.mlx` and drag and drop in `panel_drag.mlx`), the keymap (`keyboard.mlx`),
 desktop entries and their PNG icons (`apps.mlx`, with `std.png`) and the
 per-turn value release (`turns.mlx`). They draw with Vulkan, the
-desktop's standard for every app: `canvas.mlx` records what it is asked
-to draw and `gpu_canvas.mlx` has the `paint` compute shader draw it all in
+desktop's standard for every app: `std.ui.canvas` records what it is
+asked to draw and `std.ui.gpu_canvas` has the `paint` compute shader draw it all in
 one pass, into buffers handed to the compositor as dma-bufs
 (linux-dmabuf, ARGB8888, in device memory the compositor can map), or,
 where the driver cannot export them (lavapipe), straight into the shared

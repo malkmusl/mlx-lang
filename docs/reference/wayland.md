@@ -622,8 +622,9 @@ others from `std/protocols/wayland` (`wlr-layer-shell-unstable-v1.xml`,
 
 Their shared code is in `projects/desktop/shared`: a layer surface with
 its buffers, pointer and keyboard (key repeat, the keymap through
-std.xkb) and the window list (`panel.mlx`), drawing with smooth
-rounded shapes, images and `std.truetype` text (`canvas.mlx`), and the
+std.xkb) and the window list (`panel.mlx`), drawing with
+`std.ui.canvas` and `std.ui.text` (smooth rounded shapes, images, text),
+and the
 apps from their desktop entries with PNG icons through `std.png`
 (`apps.mlx`). `tools/check_desktop_clients.sh` runs both in the nested
 compositor under `tools/wayland-test-host` on the CPU and the Vulkan

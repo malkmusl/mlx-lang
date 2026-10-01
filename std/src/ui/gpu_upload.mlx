@@ -1,0 +1,169 @@
+// std.ui.gpu_upload: what a std.ui.gpu_canvas draws from besides its
+// commands: images (uploaded to the heap once, remembered by address) and
+// the fonts' glyph atlases (uploaded again when std.truetype adds glyphs),
+// and the glyph quads of laid-out text.
+const std = @import("std")
+const png = @import("std.png")
+const tt = @import("std.truetype")
+const shaders = @import("std.gpu.shaders")
+const gpu_canvas = @import("std.ui.gpu_canvas")
+
+// Blocks copied as array values: one mem_copy each (rep movsb on x86_64).
+const Block4096 = [4096]u8
+const Block64 = [64]u8
+
+pub fn copyBytes(destination: usize, source: usize, bytes: usize) -> void {
+    var to = destination
+    var from = source
+    var left = bytes
+    while left >= 4096 {
+        var target: *Block4096 = undefined
+        var origin: *const Block4096 = undefined
+        unsafe {
+            target = @ptrFromInt(*Block4096, to)
+            origin = @ptrFromInt(*const Block4096, from)
+        }
+        target.* = origin.*
+        to += 4096
+        from += 4096
+        left -= 4096
+    }
+    while left >= 64 {
+        var target: *Block64 = undefined
+        var origin: *const Block64 = undefined
+        unsafe {
+            target = @ptrFromInt(*Block64, to)
+            origin = @ptrFromInt(*const Block64, from)
+        }
+        target.* = origin.*
+        to += 64
+        from += 64
+        left -= 64
+    }
+    var bytes_to: [*]u8 = undefined
+    var bytes_from: [*]const u8 = undefined
+    unsafe {
+        bytes_to = @ptrFromInt([*]u8, to)
+        bytes_from = @ptrFromInt([*]const u8, from)
+    }
+    var index: usize = 0
+    while index < left {
+        bytes_to[index] = bytes_from[index]
+        index += 1
+    }
+}
+
+// Where `image` is in the heap (words), uploaded on first use; the heap's
+// size when it does not fit.
+fn imageOffset(device: *gpu_canvas.Device, image: *const png.Image) -> usize {
+    const address = @intFromPtr(image.*.pixels)
+    var index: usize = 0
+    while index < device.*.imageCount {
+        const known = gpu_canvas.imageAt(device, index)
+        if known.*.address == address && known.*.width == image.*.width && known.*.height == image.*.height { return known.*.offset }
+        index += 1
+    }
+    const bytes = image.*.width * image.*.height * 4
+    if device.*.imageCount >= gpu_canvas.MAX_IMAGES || device.*.heapUsed + bytes > gpu_canvas.HEAP_BYTES { return gpu_canvas.HEAP_BYTES }
+    const offset = device.*.heapUsed
+    copyBytes(device.*.heap.address + offset, address, bytes)
+    device.*.heapUsed += (bytes + 63) / 64 * 64
+    const entry = gpu_canvas.imageAt(device, device.*.imageCount)
+    entry.*.address = address
+    entry.*.width = image.*.width
+    entry.*.height = image.*.height
+    entry.*.offset = offset / 4
+    device.*.imageCount += 1
+    return offset / 4
+}
+
+// `image` scaled into the size x size box at (x, y), faded by `opacity`.
+pub fn image(device: *gpu_canvas.Device, picture: *const png.Image, x: i32, y: i32, size: i32, opacity: u32) -> void {
+    if size <= 0 || picture.*.width == 0 { return }
+    const offset = imageOffset(device, picture)
+    if offset == gpu_canvas.HEAP_BYTES {
+        device.*.overflow = true
+        return
+    }
+    const words = gpu_canvas.command(device, shaders.PAINT_IMAGE, x, y, size, size)
+    if words == null { return }
+    words.?[8] = @intCast(u32, offset)
+    words.?[9] = @intCast(u32, picture.*.width)
+    words.?[10] = @intCast(u32, picture.*.height)
+    words.?[11] = opacity
+}
+
+// Where `atlas` is in the heap (bytes), its glyphs uploaded as far as
+// std.truetype has filled it; gpu_canvas.ATLASES * gpu_canvas.ATLAS_BYTES when there is no room.
+fn atlasOffset(device: *gpu_canvas.Device, atlas: *const tt.Atlas) -> usize {
+    const size = @intCast(usize, atlas.*.width) * @intCast(usize, atlas.*.height)
+    if size > gpu_canvas.ATLAS_BYTES { return gpu_canvas.ATLASES * gpu_canvas.ATLAS_BYTES }
+    var slot = device.*.atlasCount
+    var index: usize = 0
+    while index < device.*.atlasCount {
+        if gpu_canvas.atlasAt(device, index).*.atlas == @intFromPtr(atlas) { slot = index }
+        index += 1
+    }
+    if slot == device.*.atlasCount {
+        if slot >= gpu_canvas.ATLASES { return gpu_canvas.ATLASES * gpu_canvas.ATLAS_BYTES }
+        const entry = gpu_canvas.atlasAt(device, slot)
+        entry.*.atlas = @intFromPtr(atlas)
+        entry.*.revision = atlas.*.revision +% 1
+        entry.*.offset = slot * gpu_canvas.ATLAS_BYTES
+        device.*.atlasCount += 1
+    }
+    const entry = gpu_canvas.atlasAt(device, slot)
+    if entry.*.revision != atlas.*.revision {
+        var rows = @intCast(usize, atlas.*.cursorY + atlas.*.rowHeight)
+        if rows > @intCast(usize, atlas.*.height) { rows = @intCast(usize, atlas.*.height) }
+        copyBytes(device.*.heap.address + entry.*.offset, @intFromPtr(atlas.*.pixels), @intCast(usize, atlas.*.width) * rows)
+        entry.*.revision = atlas.*.revision
+    }
+    return entry.*.offset
+}
+
+// A laid-out run (tt.layout) with its origin at (x, y), the baseline, in
+// `color` (premultiplied); columns from x at `limit` and past are left out
+// (0: none).
+pub fn glyphs(device: *gpu_canvas.Device, atlas: *const tt.Atlas, run: *const tt.Run, x: i32, y: i32, color: u32, limit: i32) -> void {
+    if run.*.count == 0 { return }
+    const offset = atlasOffset(device, atlas)
+    if offset == gpu_canvas.ATLASES * gpu_canvas.ATLAS_BYTES {
+        device.*.overflow = true
+        return
+    }
+    const quad_words = run.*.count * 4
+    if device.*.quadsUsed + quad_words > gpu_canvas.QUAD_WORDS {
+        device.*.overflow = true
+        return
+    }
+    const words = gpu_canvas.command(device, shaders.PAINT_GLYPHS, x + run.*.left, y + run.*.top, run.*.right - run.*.left, run.*.bottom - run.*.top)
+    if words == null { return }
+    const base = gpu_canvas.MAX_COMMANDS * gpu_canvas.COMMAND_WORDS + device.*.quadsUsed
+    const data = gpu_canvas.dataOf(device)
+    const first_quad = device.*.quadsUsed / 4
+    var index: usize = 0
+    while index < run.*.count {
+        const quad = run.*.quads[index]
+        data[base + index * 4] = quad.atlasX | (quad.atlasY << 16)
+        data[base + index * 4 + 1] = quad.width | (quad.height << 16)
+        data[base + index * 4 + 2] = @bitCast(u32, quad.x)
+        data[base + index * 4 + 3] = @bitCast(u32, quad.y)
+        // The columns it covers (the limit left out: it only takes away).
+        device.*.quadSpans[(first_quad + index) * 2] = x + quad.x
+        device.*.quadSpans[(first_quad + index) * 2 + 1] = x + quad.x + @intCast(i32, quad.width)
+        index += 1
+    }
+    const at = device.*.commandCount - 1
+    device.*.quadFirst[at] = @intCast(u32, first_quad)
+    device.*.quadCount[at] = @intCast(u32, run.*.count)
+    device.*.quadsUsed += quad_words
+    words.?[7] = color
+    words.?[8] = @intCast(u32, base)
+    words.?[9] = @intCast(u32, run.*.count)
+    words.?[10] = @intCast(u32, offset)
+    words.?[11] = atlas.*.width
+    words.?[12] = @bitCast(u32, x)
+    words.?[13] = @bitCast(u32, y)
+    words.?[14] = @bitCast(u32, limit)
+}
