@@ -1,7 +1,7 @@
 # vulkan-android
 
 Vulkan on Android: a NativeActivity that renders the animated pattern of
-`examples/vulkan-shared` with a compute shader and presents it through a
+`std.gpu` with a compute shader and presents it through a
 `VK_KHR_android_surface` swapchain. Touch moves the ring; it turns white
 while a finger is down. Like other Android apps, it keeps the status and
 navigation bars: its window reaches under them, and only its background
@@ -13,7 +13,7 @@ the `text` compute shader.
 
 The Vulkan side is the same code the Linux examples run: the system
 `libvulkan.so` is opened with `std.vulkan.loader.openSystemLoader`, the
-shader comes from `std.spirv.builder`, and `examples/vulkan-shared/
+shader comes from `std.spirv.builder`, and `std/src/gpu/
 swapchain.mlx` renders each frame into a buffer, copies it into the
 acquired image and presents it (FIFO). R8G8B8A8 swapchains, common on
 Android, get red and blue swapped in the shader.

@@ -83,7 +83,7 @@ const app = @import("../app/main.mlx")
 pub fn gamma() -> usize { return 3 }
 MLX
 echo "lib !-> app" > "$tree/codemap.layers"
-# A crash kept by a desktop program (projects/desktop/compositor/crash.mlx)
+# A crash kept by a desktop program (std/src/crash.mlx)
 # in greet, called from main.
 mkdir -p "$work/.local/state/mlx"
 printf 'crash\t1790000000\tapp\tillegal instruction (a failed runtime check)\tlib/helper.mlx:4:greet+0x1c\tapp/main.mlx:3:main+0x42\t_start+0x58\n' > "$work/.local/state/mlx/crashes.log"

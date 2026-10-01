@@ -589,7 +589,7 @@ stay within the client's `set_min_size`/`set_max_size` and never go below
 ## Vulkan
 
 By default (`--renderer auto`, or `vulkan` to insist) the output is
-composed on the GPU by the blit compute shader of `examples/vulkan-shared`,
+composed on the GPU by the blit compute shader of `std.gpu`,
 through `std.vulkan` (no C loader; `VK_DRIVER_FILES` picks a driver),
 nested and freestanding alike.
 Client buffers are read where they are: `wl_shm` pools are imported as
@@ -850,7 +850,7 @@ covers until it is still (about a second).
 
 The Vulkan renderer draws a wobbling window flat into a scratch buffer
 and bends it onto the frame with the warp kernel
-(`examples/vulkan-shared/shaders.mlx`): each pixel finds the point of the
+(`std/src/gpu/shaders.mlx`): each pixel finds the point of the
 window the surface carries onto it (three fixed-point iterations) and
 samples it bilinearly. The CPU renderer draws windows flat. The setting
 is `wobbly-windows` (on by default).

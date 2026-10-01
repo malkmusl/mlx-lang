@@ -5,7 +5,7 @@ rectangles, insets, alignment, containers, stacks and a screen whose edges
 can be reserved for bars. It is integer layout math on screen pixels (x to
 the right, y down) and knows nothing about drawing: a layout hands out
 rectangles, and the caller draws into them with what it has (the CPU, or
-the Vulkan `text` shader of `examples/vulkan-shared`). `fillRect` is the
+the Vulkan `text` shader of `std.gpu`). `fillRect` is the
 one drawing helper.
 
 ```mlx
@@ -86,7 +86,7 @@ color (straight alpha) over the part of `area` inside a buffer of
 0xAARRGGBB pixels: alpha = (255 × a + 127) / 255, each channel
 (color × alpha + under × (255 − alpha) + 127) / 255, result opaque. That is
 the `text` shader's arithmetic at full coverage, and on the GPU
-`text.fill` in `examples/vulkan-shared/text.mlx` draws the same rectangle
+`text.fill` in `std/src/gpu/text.mlx` draws the same rectangle
 (the shader with no glyphs and every pixel starting fully covered);
 `tests/263_vulkan_text_runtime.mlx` checks the two pixel for pixel.
 

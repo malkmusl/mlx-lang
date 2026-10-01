@@ -92,7 +92,8 @@ compiler-core std do not load the generated protocol modules. See
 materialized from the Vulkan registry, with `std.vulkan.loader` and
 `std.vulkan.icd` in `std/src/vulkan/`) and `std.spirv.core`,
 `std.spirv.builder`, `std.spirv.module` and `std.spirv.compute`
-(`std/src/spirv/`) are Stage-1
+(`std/src/spirv/`) and `std.gpu` with `std.gpu.shaders`, `std.gpu.text`
+and `std.gpu.swapchain` (`std/src/gpu.mlx`, `std/src/gpu/`) are Stage-1
 extensions of the same kind; see [Vulkan, SPIR-V and JSON](vulkan.md)
 (`tests/248_json_runtime.mlx` covers `std.json`).
 
@@ -100,6 +101,24 @@ extensions of the same kind; see [Vulkan, SPIR-V and JSON](vulkan.md)
 and `std.ui` (`std/src/ui.mlx`, layout building blocks, see
 [Layout](ui.md)) are extensions for drawing text and laying out pixel user
 interfaces.
+
+`std.crash` (`std/src/crash.mlx`) is a program's crash report: `install()`
+sets a signal handler on a stack of its own that names the signal, the
+function and its callers (from the symbol table the compiler writes, see
+[formats](formats.md)) and keeps the crash in
+`$XDG_STATE_HOME/mlx/crashes.log`; `fail(reason)` ends the program the same
+way for a failure it cannot go on after. `std.wayland.crash.watch(display)`
+(`std/src/wayland/crash.mlx`) makes a Wayland client's failed connection
+such a failure (`tools/check_crash_report.sh` holds every client to it).
+
+`std.timezone` (`std/src/timezone.mlx`) gives local time: `load` reads the
+zone from `$TZ` (a zone name, a path or a POSIX rule) or `/etc/localtime`
+(TZif, RFC 8536, with the POSIX rule past its last transition),
+`offsetAt` gives the offset from UTC at a moment, `civil` and
+`daysFromCivil` convert between seconds and the proleptic Gregorian
+calendar (`tests/279_timezone_runtime.mlx`).
+`std.process.environmentFrom(entries, name)` looks a name up in any
+NUL-terminated environment list, which `load` uses.
 
 `std.png` (`std/src/png.mlx`) decodes PNG images into premultiplied ARGB
 words (`0xAARRGGBB`, the `wl_shm` and compositor convention), for icons

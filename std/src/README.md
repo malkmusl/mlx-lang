@@ -25,8 +25,12 @@ name and are not re-exported from `std.mlx`.
 `vulkan/icd.mlx` (`std.vulkan.icd`) is the driver side of that interface.
 `spirv/core.mlx` (`std.spirv.core`, generated from
 `std/registry/spirv/spirv.core.grammar.json`), `spirv/builder.mlx` and
-`spirv/module.mlx` write, read and validate SPIR-V. See
-`docs/reference/vulkan.md`.
+`spirv/module.mlx` write, read and validate SPIR-V, and
+`spirv/compute.mlx` (`std.spirv.compute`) declares compute kernels.
+`gpu.mlx` (`std.gpu`) runs compute kernels on pixel buffers (one device and
+queue, dma-buf and host-memory sharing), with `gpu/shaders.mlx`
+(`std.gpu.shaders`), `gpu/text.mlx` (`std.gpu.text`) and
+`gpu/swapchain.mlx` (`std.gpu.swapchain`). See `docs/reference/vulkan.md`.
 
 `truetype.mlx` (`std.truetype`) reads TrueType fonts, rasterizes glyphs
 with anti-aliasing, packs them into an atlas and lays out text; see
@@ -35,6 +39,14 @@ with anti-aliasing, packs them into an atlas and lays out text; see
 `ui.mlx` (`std.ui`) has layout building blocks for pixel user interfaces:
 rectangles, insets, alignment, containers, stacks and reserved bars; see
 `docs/reference/ui.md`.
+
+`crash.mlx` (`std.crash`) reports a program's crash (signal, function,
+callers from the compiler's symbol table) and keeps it in
+`$XDG_STATE_HOME/mlx/crashes.log`; `wayland/crash.mlx`
+(`std.wayland.crash`) treats a Wayland client's failed connection like a
+crash. `timezone.mlx` (`std.timezone`) gives local time from `$TZ` or
+`/etc/localtime` (TZif files and POSIX rules) and the civil calendar. See
+`docs/reference/stdlib.md`.
 
 `std.path`, `std.mode`, `std.parse`, `std.shell` and `std.calendar` provide
 coreutils-grade building blocks (path manipulation/canonicalization, chmod-style

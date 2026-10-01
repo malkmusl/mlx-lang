@@ -350,7 +350,7 @@ does, and its machine code, commits, complexity, time and risk.
 The compiler names every function `path:line:name` in the executable's
 symbol table. When the file manager, the dock, the compositor or another
 desktop program crashes, its crash handler
-([`crash.mlx`](../desktop/compositor/crash.mlx)) says which functions the
+([`std.crash`](../../std/src/crash.mlx)) says which functions the
 crash went through and keeps that as a line in
 `$XDG_STATE_HOME/mlx/crashes.log` (`~/.local/state/mlx/crashes.log`). The
 codemap reads the log ([`tools/codemap/crashes.mlx`](../../tools/codemap/crashes.mlx))

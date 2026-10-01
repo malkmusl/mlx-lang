@@ -60,7 +60,7 @@ if [[ $watch -eq 0 ]]; then
 fi
 
 # --watch: the sources the modules are built from.
-sources() { find projects/desktop/compositor examples/vulkan-shared std/src -name '*.mlx' -printf '%T@ %p\n' | sort | md5sum; }
+sources() { find projects/desktop/compositor projects/desktop/shared std/src -name '*.mlx' -printf '%T@ %p\n' | sort | md5sum; }
 build || true
 last=$(sources)
 echo "watching the sources (Ctrl+C stops)"

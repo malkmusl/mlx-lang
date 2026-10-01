@@ -116,9 +116,9 @@ for example in examples/vulkan-info/main.mlx examples/vulkan-wayland-client/main
     fi
 done
 
-# The examples' shaders (examples/vulkan-shared) pass the Khronos validator.
-if "$compiler" --quiet examples/vulkan-shared/check_shaders.mlx -o "$work/check-shaders" 2> "$work/errors" && "$work/check-shaders" "$work" > "$work/output" 2>&1; then
-    echo "ok   examples/vulkan-shared shaders build and pass std.spirv.module"
+# The std.gpu shaders (std/src/gpu) pass the Khronos validator.
+if "$compiler" --quiet tools/check-shaders/main.mlx -o "$work/check-shaders" 2> "$work/errors" && "$work/check-shaders" "$work" > "$work/output" 2>&1; then
+    echo "ok   std.gpu shaders build and pass std.spirv.module"
     if command -v spirv-val > /dev/null; then
         for shader in pattern blit text; do
             if spirv-val --target-env vulkan1.1 "$work/$shader.spv"; then
@@ -130,7 +130,7 @@ if "$compiler" --quiet examples/vulkan-shared/check_shaders.mlx -o "$work/check-
         done
     fi
 else
-    echo "FAIL examples/vulkan-shared/check_shaders.mlx"
+    echo "FAIL tools/check-shaders/main.mlx"
     cat "$work/errors" "$work/output" 2> /dev/null
     failures=$((failures + 1))
 fi

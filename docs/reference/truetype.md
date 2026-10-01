@@ -72,7 +72,7 @@ applied), the run's bounding box and its advance. `drawRun` blends a run
 into a `0xAARRGGBB` image: each pixel takes the largest coverage among the
 glyphs covering it and blends the color at that coverage, in integers.
 
-On the GPU, the `text` compute shader of `examples/vulkan-shared`
+On the GPU, the `text` compute shader of `std.gpu`
 (`text.mlx` keeps the atlas and the frame's runs in GPU memory) does the
 same arithmetic, so a run drawn by Vulkan equals the CPU's pixel for pixel
 (`tests/263_vulkan_text_runtime.mlx`). The Vulkan examples use it: the

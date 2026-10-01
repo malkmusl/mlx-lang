@@ -118,7 +118,7 @@ adds three sections to it:
   lines from 1), then the files' paths, each ended by a NUL.
 
 The crash handler of the desktop programs
-(`projects/desktop/compositor/crash.mlx`) reads both from `/proc/self/exe`
+(`std/src/crash.mlx`) reads both from `/proc/self/exe`
 and writes each frame as `path:line:name+0xOFFSET at path:line`;
 `tools/check_crash_report.sh` crashes `tests/support/crash_report.mlx`
 three ways and checks the lines it names. The sampling profiler

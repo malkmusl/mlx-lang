@@ -42,9 +42,9 @@ build_modules() {
     "$compiler" --quiet --shared "$sources/projects/desktop/compositor/render_module.mlx" -o "$output/libmlx-render.so"
 }
 build_modules . "$work/modules"
-mkdir -p "$work/changed/examples" "$work/layout/examples"
-cp -r projects/desktop/compositor examples/vulkan-shared projects/desktop/shared "$work/changed/examples/"
-cp -r projects/desktop/compositor examples/vulkan-shared projects/desktop/shared "$work/layout/examples/"
+mkdir -p "$work/changed/projects" "$work/layout/projects"
+cp -r projects/desktop "$work/changed/projects/"
+cp -r projects/desktop "$work/layout/projects/"
 python3 - "$work/changed/projects/desktop/compositor/scene.mlx" <<'PY'
 import sys
 path = sys.argv[1]

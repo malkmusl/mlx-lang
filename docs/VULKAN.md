@@ -64,7 +64,7 @@ and `examples/vulkan-android` builds into an APK with
 | [`projects/desktop/compositor`](../projects/desktop/compositor/README.md) `--renderer vulkan` | a compositor that composes its clients' buffers on the GPU, reading `wl_shm` pools and dma-bufs in place |
 | [`examples/vulkan-android`](../examples/vulkan-android/README.md) | an Android NativeActivity presenting through a `VK_KHR_android_surface` swapchain, with touch input |
 
-All of them share `examples/vulkan-shared`: the shaders (built with
+All of them share `std.gpu`: the shaders (built with
 `std.spirv.builder`), device and buffer setup with dma-buf and host-memory
 sharing, swapchain presentation, and text: the client's label, the
 compositor's window titles and the Android label are laid out by

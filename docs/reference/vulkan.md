@@ -18,6 +18,10 @@ interface, and how all of it is tested.
 | `std.spirv.builder` | `std/src/spirv/builder.mlx` | writes SPIR-V modules |
 | `std.spirv.module` | `std/src/spirv/module.mlx` | reads and validates SPIR-V modules |
 | `std.spirv.compute` | `std/src/spirv/compute.mlx` | compute kernels on the builder: invocation id, u32 push constants, storage buffers, select, one-sided ifs, color channels, GLSL.std.450 calls |
+| `std.gpu` | `std/src/gpu.mlx` | one compute device and queue, shareable pixel buffers (dma-buf, host memory), kernels, dispatches |
+| `std.gpu.shaders` | `std/src/gpu/shaders.mlx` (+ `paint_shader.mlx`, `warp_shader.mlx`) | the pattern, blit, text, blur, paint, warp and shrink compute shaders |
+| `std.gpu.text` | `std/src/gpu/text.mlx` | `std.truetype` runs drawn by the text shader |
+| `std.gpu.swapchain` | `std/src/gpu/swapchain.mlx` | presenting through `VK_KHR_swapchain` |
 
 Each is imported by its own name and is not part of `std.mlx`.
 `tests/276_spirv_compute_kit_runtime.mlx` builds a kernel with
@@ -253,31 +257,37 @@ expands escapes including UTF-16 surrogate pairs; `parseInteger` and
 `parseUnsigned` convert numbers with overflow checks; `escapeString` writes
 a JSON string. (`tests/248_json_runtime.mlx`)
 
-## Examples
+## std.gpu
 
-The examples share one small renderer in `examples/vulkan-shared`:
+`std.gpu` (`std/src/gpu.mlx`, with `std/src/gpu/`) is the small compute
+renderer the Vulkan examples, the desktop (`projects/desktop`) and the
+Observatory share:
 
-- `shaders.mlx` builds three compute shaders with `std.spirv.builder`:
+- `std.gpu.shaders` (`shaders.mlx`, with `paint_shader.mlx` and
+  `warp_shader.mlx`) builds the compute shaders with `std.spirv.builder`
+  and `std.spirv.compute`:
   `pattern` (an animated pattern with a ring around the pointer, written as
   `0xAARRGGBB` or, for R8G8B8A8 targets, with red and blue swapped),
   `blit` (composites a premultiplied ARGB or opaque XRGB source into a
-  target at an offset, clipped; a source stride of 0 fills a rectangle) and
+  target at an offset, clipped; a source stride of 0 fills a rectangle),
   `text` (draws a `std.truetype` run from a glyph atlas, with a loop over
   the run's glyphs per pixel; every pixel starts at a base coverage, 0 for
-  text and 255 with no glyphs for a solid fill). `check_shaders.mlx` validates them and
-  writes them out for `spirv-val`.
-- `text.mlx` keeps a `std.truetype` atlas and the frame's glyph runs in
+  text and 255 with no glyphs for a solid fill), `blurPass` and `blurMask`
+  (the compositor's blur), `paint` (the desktop apps' canvas), `warp`
+  (wobbly windows) and `shrink` (window previews).
+  `tools/check-shaders` validates them and writes them out for `spirv-val`.
+- `std.gpu.text` keeps a `std.truetype` atlas and the frame's glyph runs in
   GPU memory and records `text` dispatches; GPU text equals
   `std.truetype.drawRun`'s pixel for pixel and `text.fill` equals
   `std.ui.fillRect`'s (`tests/263_vulkan_text_runtime.mlx`, see
   [truetype.md](truetype.md) and [ui.md](ui.md)).
-- `gpu.mlx` opens a device with one compute queue and, on request, the
+- `std.gpu` opens a device with one compute queue and, on request, the
   sharing extensions the driver supports: dma-buf import and export
   (`VK_EXT_external_memory_dma_buf`) and imported host memory
   (`VK_EXT_external_memory_host`). It creates, imports and destroys storage
   buffers (`createReadbackBuffer`: host-cached memory for results the CPU
   reads back), compiles kernels and records dispatches.
-- `swapchain.mlx` presents to a window surface: each frame the pattern is
+- `std.gpu.swapchain` presents to a window surface: each frame the pattern is
   rendered into a buffer, a callback may draw over it (the Android app's
   label), and the buffer is copied into the acquired image
   (`vkCmdCopyBufferToImage`) and presented (FIFO) with as few images as

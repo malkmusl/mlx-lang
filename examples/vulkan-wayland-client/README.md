@@ -40,5 +40,5 @@ mlx4 projects/desktop/compositor/main.mlx -o mlx-compositor
 ```
 
 The shaders and device setup are shared with the other Vulkan examples in
-`examples/vulkan-shared`. `tools/check_vulkan_wayland.sh` checks this
+`std.gpu`. `tools/check_vulkan_wayland.sh` checks this
 client inside the compositor pixel by pixel. See `docs/reference/vulkan.md`.

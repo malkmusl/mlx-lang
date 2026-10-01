@@ -1,0 +1,411 @@
+// std.timezone: local time. The zone comes from $TZ (a zone name such as
+// "Europe/Berlin", a path, or a POSIX rule such as
+// "CET-1CEST,M3.5.0,M10.5.0/3"), else /etc/localtime. Zone files are TZif
+// (RFC 8536): their transitions (the 64-bit block of version 2 and later)
+// and, past the last one, the POSIX rule at their end, which slim files
+// rely on for every year after the rules last changed. Without a zone the
+// time is UTC. Dates are proleptic Gregorian (days from 1970 and back:
+// Howard Hinnant's civil calendar algorithms).
+//
+//     var zone: timezone.Zone = undefined
+//     timezone.load(&zone, environment, allocator)
+//     const utc = timezone.now()
+//     const local = timezone.civil(utc + timezone.offsetAt(&zone, utc))
+const std = @import("std")
+
+const Allocator = std.allocator.Allocator
+
+const MAX_TRANSITIONS: usize = 2048
+const MAX_TYPES: usize = 64
+
+// One end of a daylight saving period: month m, week w (5: the last), day
+// d (0 Sunday), at `seconds` after midnight local time (Mm.w.d/time); or
+// day of the year (`julian`: Jn, 1-365 without February 29; else n, 0-365).
+const RuleDate = struct {
+    kind: u8
+    month: i64
+    week: i64
+    day: i64
+    seconds: i64
+}
+
+const RULE_MONTH: u8 = 0
+const RULE_JULIAN: u8 = 1
+const RULE_DAY: u8 = 2
+
+pub const Zone = struct {
+    // Transitions (UTC seconds) and the type each starts.
+    times: [2048]i64
+    kinds: [2048]u8
+    count: usize
+    // Each type's offset from UTC (seconds).
+    offsets: [64]i64
+    typeCount: usize
+    // The POSIX rule for times past the last transition.
+    hasRule: bool
+    standard: i64
+    daylight: i64
+    hasDaylight: bool
+    start: RuleDate
+    end: RuleDate
+}
+
+pub const Civil = struct {
+    year: i64
+    // 1-12, 1-31.
+    month: i64
+    day: i64
+    // 0 Sunday to 6 Saturday.
+    weekday: i64
+    hour: i64
+    minute: i64
+    second: i64
+}
+
+// ---------------------------------------------------------------------------
+// The calendar
+
+fn floorDivide(value: i64, divisor: i64) -> i64 {
+    const quotient = value / divisor
+    return if value % divisor != 0 && (value < 0) != (divisor < 0) { quotient - 1 } else { quotient }
+}
+
+// Days since 1970-01-01 of a civil date.
+pub fn daysFromCivil(year: i64, month: i64, day: i64) -> i64 {
+    const y = if month <= 2 { year - 1 } else { year }
+    const era = floorDivide(y, 400)
+    const year_of_era = y - era * 400
+    const shifted_month = if month > 2 { month - 3 } else { month + 9 }
+    const day_of_year = (153 * shifted_month + 2) / 5 + day - 1
+    const day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year
+    return era * 146097 + day_of_era - 719468
+}
+
+// The civil date and time of `seconds` since 1970 (local seconds: the
+// offset already added).
+pub fn civil(seconds: i64) -> Civil {
+    const days = floorDivide(seconds, 86400)
+    const rest = seconds - days * 86400
+    const shifted = days + 719468
+    const era = floorDivide(shifted, 146097)
+    const day_of_era = shifted - era * 146097
+    const year_of_era = (day_of_era - day_of_era / 1460 + day_of_era / 36524 - day_of_era / 146096) / 365
+    const day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100)
+    const month_index = (5 * day_of_year + 2) / 153
+    const day = day_of_year - (153 * month_index + 2) / 5 + 1
+    const month = if month_index < 10 { month_index + 3 } else { month_index - 9 }
+    const year = year_of_era + era * 400 + (if month <= 2 { 1 } else { 0 })
+    var weekday = (days + 4) % 7
+    if weekday < 0 { weekday += 7 }
+    return Civil.{ .year = year, .month = month, .day = day, .weekday = weekday, .hour = rest / 3600, .minute = rest % 3600 / 60, .second = rest % 60 }
+}
+
+fn isLeap(year: i64) -> bool { return (year % 4 == 0 && year % 100 != 0) || year % 400 == 0 }
+
+fn daysInMonth(year: i64, month: i64) -> i64 {
+    if month == 2 { return if isLeap(year) { 29 } else { 28 } }
+    if month == 4 || month == 6 || month == 9 || month == 11 { return 30 }
+    return 31
+}
+
+// Seconds since 1970 (local time) at which `date` falls in `year`.
+fn ruleMoment(date: *const RuleDate, year: i64) -> i64 {
+    var days: i64 = 0
+    if date.*.kind == RULE_MONTH {
+        const first = daysFromCivil(year, date.*.month, 1)
+        var first_weekday = (first + 4) % 7
+        if first_weekday < 0 { first_weekday += 7 }
+        var day = 1 + (date.*.day - first_weekday + 7) % 7 + (date.*.week - 1) * 7
+        while day > daysInMonth(year, date.*.month) { day -= 7 }
+        days = first + day - 1
+    } else if date.*.kind == RULE_JULIAN {
+        // Jn: February 29 is never counted.
+        var ordinal = date.*.day
+        if isLeap(year) && ordinal >= 60 { ordinal += 1 }
+        days = daysFromCivil(year, 1, 1) + ordinal - 1
+    } else {
+        days = daysFromCivil(year, 1, 1) + date.*.day
+    }
+    return days * 86400 + date.*.seconds
+}
+
+// The offset the rule gives at `utc`.
+fn ruleOffset(zone: *const Zone, utc: i64) -> i64 {
+    if !zone.*.hasDaylight { return zone.*.standard }
+    const year = civil(utc + zone.*.standard).year
+    // The start in standard time, the end in daylight time.
+    const start_date = zone.*.start
+    const end_date = zone.*.end
+    const start = ruleMoment(&start_date, year) - zone.*.standard
+    const end = ruleMoment(&end_date, year) - zone.*.daylight
+    const inside = if start < end { utc >= start && utc < end } else { !(utc >= end && utc < start) }
+    return if inside { zone.*.daylight } else { zone.*.standard }
+}
+
+// The offset from UTC (seconds) at `utc` seconds since 1970.
+pub fn offsetAt(zone: *const Zone, utc: i64) -> i64 {
+    if zone.*.count == 0 {
+        if zone.*.hasRule { return ruleOffset(zone, utc) }
+        return if zone.*.typeCount > 0 { zone.*.offsets[0] } else { 0 }
+    }
+    if utc < zone.*.times[0] { return zone.*.offsets[0] }
+    if utc >= zone.*.times[zone.*.count - 1] && zone.*.hasRule { return ruleOffset(zone, utc) }
+    // The last transition at or before utc.
+    var low: usize = 0
+    var high = zone.*.count
+    while high - low > 1 {
+        const middle = (low + high) / 2
+        if zone.*.times[middle] <= utc { low = middle } else { high = middle }
+    }
+    return zone.*.offsets[@intCast(usize, zone.*.kinds[low])]
+}
+
+// ---------------------------------------------------------------------------
+// POSIX rules ("CET-1CEST,M3.5.0,M10.5.0/3")
+
+const Reader = struct {
+    text: []const u8
+    at: usize
+}
+
+fn peek(reader: *Reader) -> u8 { return if reader.*.at < reader.*.text.length { reader.*.text[reader.*.at] } else { 0 } }
+
+fn isDigit(byte: u8) -> bool { return byte >= 48 && byte <= 57 }
+
+fn number(reader: *Reader) -> i64 {
+    var value: i64 = 0
+    while isDigit(peek(reader)) {
+        value = value * 10 + @intCast(i64, peek(reader) - 48)
+        reader.*.at += 1
+    }
+    return value
+}
+
+// A zone name: letters, or anything in <>; false when there is none.
+fn skipName(reader: *Reader) -> bool {
+    if peek(reader) == 60 {
+        while reader.*.at < reader.*.text.length && peek(reader) != 62 { reader.*.at += 1 }
+        if peek(reader) != 62 { return false }
+        reader.*.at += 1
+        return true
+    }
+    const start = reader.*.at
+    while (peek(reader) >= 65 && peek(reader) <= 90) || (peek(reader) >= 97 && peek(reader) <= 122) { reader.*.at += 1 }
+    return reader.*.at - start >= 3
+}
+
+// [+-]hh[:mm[:ss]] in seconds.
+fn clockTime(reader: *Reader) -> i64 {
+    var sign: i64 = 1
+    if peek(reader) == 45 {
+        sign = -1
+        reader.*.at += 1
+    } else if peek(reader) == 43 {
+        reader.*.at += 1
+    }
+    var seconds = number(reader) * 3600
+    if peek(reader) == 58 {
+        reader.*.at += 1
+        seconds += number(reader) * 60
+        if peek(reader) == 58 {
+            reader.*.at += 1
+            seconds += number(reader)
+        }
+    }
+    return sign * seconds
+}
+
+fn ruleDate(reader: *Reader, date: *RuleDate) -> bool {
+    date.*.seconds = 7200
+    if peek(reader) == 77 {
+        reader.*.at += 1
+        date.*.kind = RULE_MONTH
+        date.*.month = number(reader)
+        if peek(reader) != 46 { return false }
+        reader.*.at += 1
+        date.*.week = number(reader)
+        if peek(reader) != 46 { return false }
+        reader.*.at += 1
+        date.*.day = number(reader)
+        if date.*.month < 1 || date.*.month > 12 || date.*.week < 1 || date.*.week > 5 || date.*.day > 6 { return false }
+    } else if peek(reader) == 74 {
+        reader.*.at += 1
+        date.*.kind = RULE_JULIAN
+        date.*.day = number(reader)
+    } else if isDigit(peek(reader)) {
+        date.*.kind = RULE_DAY
+        date.*.day = number(reader)
+    } else {
+        return false
+    }
+    if peek(reader) == 47 {
+        reader.*.at += 1
+        date.*.seconds = clockTime(reader)
+    }
+    return true
+}
+
+// Reads a POSIX TZ rule into the zone; false when it is not one.
+pub fn parseRule(zone: *Zone, text: []const u8) -> bool {
+    var reader = Reader.{ .text = text, .at = 0 }
+    if !skipName(&reader) { return false }
+    if !isDigit(peek(&reader)) && peek(&reader) != 45 && peek(&reader) != 43 { return false }
+    // POSIX offsets are west of UTC: "CET-1" is one hour east.
+    zone.*.standard = -clockTime(&reader)
+    zone.*.hasDaylight = false
+    zone.*.hasRule = true
+    if reader.at >= text.length { return true }
+    if !skipName(&reader) { return true }
+    zone.*.daylight = zone.*.standard + 3600
+    if isDigit(peek(&reader)) || peek(&reader) == 45 || peek(&reader) == 43 { zone.*.daylight = -clockTime(&reader) }
+    // Without dates the US rules of 2007 are meant (M3.2.0,M11.1.0).
+    var start = RuleDate.{ .kind = RULE_MONTH, .month = 3, .week = 2, .day = 0, .seconds = 7200 }
+    var end = RuleDate.{ .kind = RULE_MONTH, .month = 11, .week = 1, .day = 0, .seconds = 7200 }
+    if peek(&reader) == 44 {
+        reader.at += 1
+        if !ruleDate(&reader, &start) { return true }
+        if peek(&reader) != 44 { return true }
+        reader.at += 1
+        if !ruleDate(&reader, &end) { return true }
+    }
+    zone.*.start = start
+    zone.*.end = end
+    zone.*.hasDaylight = true
+    return true
+}
+
+// ---------------------------------------------------------------------------
+// TZif files
+
+fn big32(bytes: [*]const u8, at: usize) -> u32 {
+    return (@intCast(u32, bytes[at]) << 24) | (@intCast(u32, bytes[at + 1]) << 16) | (@intCast(u32, bytes[at + 2]) << 8) | @intCast(u32, bytes[at + 3])
+}
+
+// A 32-bit two's complement value as a signed number.
+fn signed32(bytes: [*]const u8, at: usize) -> i64 {
+    const raw = @intCast(i64, big32(bytes, at))
+    return if raw >= 2147483648 { raw - 4294967296 } else { raw }
+}
+
+fn big64(bytes: [*]const u8, at: usize) -> i64 {
+    return @bitCast(i64, (@intCast(u64, big32(bytes, at)) << 32) | @intCast(u64, big32(bytes, at + 4)))
+}
+
+// Reads TZif data into the zone; false when it is not TZif.
+pub fn parseTzif(zone: *Zone, bytes: [*]const u8, length: usize) -> bool {
+    if length < 44 || bytes[0] != 84 || bytes[1] != 90 || bytes[2] != 105 || bytes[3] != 102 { return false }
+    var header: usize = 0
+    var time_size: usize = 4
+    // Version 2 and later: skip the 32-bit block for the 64-bit one.
+    if bytes[4] >= 50 {
+        const utc_count = @intCast(usize, big32(bytes, 20))
+        const std_count = @intCast(usize, big32(bytes, 24))
+        const leap_count = @intCast(usize, big32(bytes, 28))
+        const time_count = @intCast(usize, big32(bytes, 32))
+        const type_count = @intCast(usize, big32(bytes, 36))
+        const char_count = @intCast(usize, big32(bytes, 40))
+        header = 44 + time_count * 4 + time_count + type_count * 6 + char_count + leap_count * 8 + std_count + utc_count
+        time_size = 8
+        if header + 44 > length || bytes[header] != 84 { return false }
+    }
+    const utc_count = @intCast(usize, big32(bytes, header + 20))
+    const std_count = @intCast(usize, big32(bytes, header + 24))
+    const leap_count = @intCast(usize, big32(bytes, header + 28))
+    const time_count = @intCast(usize, big32(bytes, header + 32))
+    const type_count = @intCast(usize, big32(bytes, header + 36))
+    const char_count = @intCast(usize, big32(bytes, header + 40))
+    const times = header + 44
+    const kinds = times + time_count * time_size
+    const types = kinds + time_count
+    const end = types + type_count * 6 + char_count + leap_count * (time_size + 4) + std_count + utc_count
+    if end > length || type_count == 0 || type_count > MAX_TYPES { return false }
+    zone.*.typeCount = type_count
+    var index: usize = 0
+    while index < type_count {
+        zone.*.offsets[index] = signed32(bytes, types + index * 6)
+        index += 1
+    }
+    // The newest transitions when there are more than we keep.
+    const skipped = if time_count > MAX_TRANSITIONS { time_count - MAX_TRANSITIONS } else { 0 }
+    zone.*.count = 0
+    index = skipped
+    while index < time_count {
+        zone.*.times[zone.*.count] = if time_size == 8 { big64(bytes, times + index * 8) } else { signed32(bytes, times + index * 4) }
+        const kind = bytes[kinds + index]
+        zone.*.kinds[zone.*.count] = if @intCast(usize, kind) < type_count { kind } else { 0 }
+        zone.*.count += 1
+        index += 1
+    }
+    // The footer: "\nRULE\n".
+    if time_size == 8 && end + 2 <= length && bytes[end] == 10 {
+        var stop = end + 1
+        while stop < length && bytes[stop] != 10 { stop += 1 }
+        if stop > end + 1 { const read = parseRule(zone, bytes[end + 1..stop]) }
+    }
+    return true
+}
+
+fn clear(zone: *Zone) -> void {
+    zone.*.count = 0
+    zone.*.typeCount = 0
+    zone.*.hasRule = false
+    zone.*.hasDaylight = false
+    zone.*.standard = 0
+    zone.*.daylight = 0
+}
+
+fn readFile(zone: *Zone, path: [*]const u8, allocator: Allocator) -> bool {
+    const file = std.fs.open(path, 0, 0)
+    if !std.fs.isValid(file) { return false }
+    const contents = std.fs.readToEndAlloc(file, allocator)
+    const closed = std.fs.close(file)
+    const read = parseTzif(zone, contents.items, contents.length)
+    std.fs.ArrayList.deinit(contents)
+    return read
+}
+
+fn environmentValue(environment: [*][*]const u8, name: []const u8) -> []const u8 {
+    const value = std.process.environmentFrom(environment, name)
+    if value == null { return name[0..0] }
+    return value.?.pointer[0..value.?.length]
+}
+
+// The zone of this program's environment: $TZ, else /etc/localtime.
+pub fn load(zone: *Zone, environment: [*][*]const u8, allocator: Allocator) -> void {
+    clear(zone)
+    const given = environmentValue(environment, "TZ")
+    const skip: usize = if given.length > 0 && given[0] == 58 { 1 } else { 0 }
+    const wanted = given[skip..given.length]
+    if wanted.length == 0 {
+        const read = readFile(zone, @ptrCast([*]const u8, "/etc/localtime"), allocator)
+        return
+    }
+    // A path, a zone name, or a rule.
+    var path: [512]u8 = undefined
+    var length: usize = 0
+    if wanted[0] != 47 {
+        for byte in "/usr/share/zoneinfo/" {
+            path[length] = byte
+            length += 1
+        }
+    }
+    for byte in wanted {
+        if length < 510 {
+            path[length] = byte
+            length += 1
+        }
+    }
+    path[length] = 0
+    var bytes: [*]const u8 = undefined
+    unsafe { bytes = @ptrCast([*]const u8, &path) }
+    if readFile(zone, bytes, allocator) { return }
+    clear(zone)
+    if !parseRule(zone, wanted) { clear(zone) }
+}
+
+// Seconds since 1970 now (UTC).
+pub fn now() -> i64 {
+    var time: [2]i64 = [2]i64{ 0, 0 }
+    const result = std.linux.syscall2(228, 0, @intFromPtr(&time))
+    return time[0]
+}

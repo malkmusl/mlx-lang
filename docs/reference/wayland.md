@@ -480,9 +480,10 @@ of wl_surface 12)`).
 
 ### The rule: every client reports a failed connection
 
-Every Wayland client in `examples/` and `tools/` calls `crash.watch` on its
+Every Wayland client in `projects/`, `examples/` and `tools/` calls
+`std.wayland.crash.watch` on its
 display right after connecting
-([`projects/desktop/compositor/crash.mlx`](../../projects/desktop/compositor/crash.mlx);
+([`std/src/crash.mlx`](../../std/src/crash.mlx), [`std/src/wayland/crash.mlx`](../../std/src/wayland/crash.mlx);
 the desktop apps get it from `panel.mlx`). When the connection fails, the
 program says why and where, `NAME: failed: the compositor ended the
 connection: protocol error 0 on wl_data_offer 45: ...` or `a request used an
@@ -492,7 +493,7 @@ Observatory shows it) and ends with status 1, instead of just stopping.
 The compositor going away is no failure of the client's. The compositor, in
 turn, always logs a client it ended for breaking the protocol, `--verbose`
 or not. `tools/check_crash_report.sh` fails for a client that connects
-without `crash.watch`; `tools/check_desktop_clients.sh` ends the file
+without `std.wayland.crash.watch`; `tools/check_desktop_clients.sh` ends the file
 manager with a protocol error from the test host and checks the report.
 
 ### Message storage
@@ -616,7 +617,7 @@ others from `std/protocols/wayland` (`wlr-layer-shell-unstable-v1.xml`,
 - `ext_background_effect_manager_v1`: a blur region per surface. The
   compositor blurs what lies behind it (three box blurs) before drawing the
   surface over it, on the CPU (`scene.mlx`) or in two Vulkan compute
-  kernels (`examples/vulkan-shared/shaders.mlx`) that give the same
+  kernels (`std/src/gpu/shaders.mlx`) that give the same
   pixels; the damage around a blurred surface grows by the blur's reach.
 
 Their shared code is in `projects/desktop/shared`: a layer surface with

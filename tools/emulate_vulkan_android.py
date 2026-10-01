@@ -73,7 +73,7 @@ LABEL_ROWS = 50
 
 
 def pattern(x, y, width, time, pointer_x, pointer_y, flags):
-    """The pattern shader (examples/vulkan-shared/shaders.mlx) for one pixel."""
+    """The pattern shader (std/src/gpu/shaders.mlx) for one pixel."""
     red = (x + time) & 255
     green = (y + (time >> 1)) & 255
     blue = ((x ^ y) + (time << 1)) & 255
