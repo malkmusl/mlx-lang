@@ -201,7 +201,7 @@ functions on the main thread.
 ## Runtime and Linux compatibility
 
 Generated code needs no C runtime. Helpers emitted once per program provide
-the aggregate arena (256 MiB, mapped on first use), `@byteMask64`, and a
+the aggregate arena (1 GiB of address space, mapped on first use), `@byteMask64`, and a
 syscall translator. The standard library issues Linux x86_64 syscall
 numbers; on aarch64 the translator maps them and adapts arguments and
 results: the legacy path calls (`open`, `stat`, `mkdir`, ... become `*at`

@@ -66,6 +66,22 @@ orders_import_cycles() {
     return $ok
 }
 
+# Whether programs $1 builds have the 1 GiB aggregate arena
+# (tests/281_arena_capacity_runtime.mlx exits 13); older compilers mapped
+# 256 MiB, too little for the compiler to build the largest programs.
+has_large_arena() {
+    local probe
+    probe=$(mktemp -d)
+    local ok=1
+    if "$1" --quiet tests/281_arena_capacity_runtime.mlx -o "$probe/probe" > /dev/null 2>&1; then
+        local status=0
+        "$probe/probe" > /dev/null 2>&1 || status=$?
+        [[ $status -eq 13 ]] && ok=0
+    fi
+    rm -rf -- "$probe"
+    return $ok
+}
+
 # Whether $1 keeps a slice's length when it is assigned again, stored in a
 # field or held in an optional (tests/274_slice_assignment_runtime.mlx
 # exits 13); older compilers stored the pointer only.
@@ -96,8 +112,8 @@ if [[ ! -x mlx-out/bin/compiler/mlx4 ]]; then
     zig-out/bin/mlx1 --quiet compiler/selfhost/main.mlx -o mlx-out/bin/compiler/mlx2
     mlx-out/bin/compiler/mlx2 --quiet compiler/selfhost/main.mlx -o mlx-out/bin/compiler/mlx3
     cp mlx-out/bin/compiler/mlx3 mlx-out/bin/compiler/mlx4
-elif ! writes_shared_objects mlx-out/bin/compiler/mlx4 || ! writes_symbol_tables mlx-out/bin/compiler/mlx4 || ! accepts_discards mlx-out/bin/compiler/mlx4 || ! keeps_slice_lengths mlx-out/bin/compiler/mlx4 || ! orders_import_cycles mlx-out/bin/compiler/mlx4; then
-    echo "rebuilding mlx-out/bin/compiler/mlx4 from the current compiler sources (it lacks --shared objects, symbol tables, \`_ = value\`, slice lengths kept on assignment or import cycles broken in order)" >&2
+elif ! writes_shared_objects mlx-out/bin/compiler/mlx4 || ! writes_symbol_tables mlx-out/bin/compiler/mlx4 || ! accepts_discards mlx-out/bin/compiler/mlx4 || ! keeps_slice_lengths mlx-out/bin/compiler/mlx4 || ! orders_import_cycles mlx-out/bin/compiler/mlx4 || ! has_large_arena mlx-out/bin/compiler/mlx4; then
+    echo "rebuilding mlx-out/bin/compiler/mlx4 from the current compiler sources (it lacks --shared objects, symbol tables, \`_ = value\`, slice lengths kept on assignment, import cycles broken in order or the 1 GiB arena)" >&2
     mlx-out/bin/compiler/mlx4 --quiet compiler/selfhost/main.mlx -o mlx-out/bin/compiler/mlx4.next
     mlx-out/bin/compiler/mlx4.next --quiet compiler/selfhost/main.mlx -o mlx-out/bin/compiler/mlx4.fixed
     mv mlx-out/bin/compiler/mlx4.fixed mlx-out/bin/compiler/mlx4

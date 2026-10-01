@@ -682,7 +682,7 @@ and a shell built for a changed record must be refused.
 ## Memory
 
 This compiler keeps every value that is not a field of something else
-(locals, literals, values functions return) in one 256 MiB arena that is
+(locals, literals, values functions return) in one 1 GiB arena that is
 only ever bumped: nothing in it is released when a function returns. A
 program that runs for long allocates it up (a pointer motion costs a few
 hundred bytes for its decoded event and some rectangles, so a mouse at
