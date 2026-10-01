@@ -100,7 +100,8 @@ Both are ordinary Wayland clients in [`examples/mlx-dock`](../mlx-dock/main.mlx)
 and [`examples/mlx-launcher`](../mlx-launcher/main.mlx) (like
 [`examples/mlx-settings`](../mlx-settings/main.mlx)), sharing
 [`examples/desktop-shared`](../desktop-shared): the layer surface or window
-and its input (`panel.mlx`), drawing (`canvas.mlx`), the keymap (`keyboard.mlx`),
+and its input (`panel.mlx`, with `panel_input.mlx`, `panel_frames.mlx`,
+popup menus in `panel_menu.mlx` and drag and drop in `panel_drag.mlx`), drawing (`canvas.mlx`), the keymap (`keyboard.mlx`),
 desktop entries and their PNG icons (`apps.mlx`, with `std.png`) and the
 per-turn value release (`turns.mlx`). They draw with Vulkan, the
 desktop's standard for every app: `canvas.mlx` records what it is asked

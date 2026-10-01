@@ -10,7 +10,11 @@ The small Vulkan renderer the Vulkan examples share. It is not a program.
   blur) and `paint` (the desktop apps' canvas: rounded rectangles,
   outlines, scaled images and glyphs from a list of commands, one pass
   over the image, the same pixels as `examples/desktop-shared/canvas.mlx`
-  draws on the CPU).
+  draws on the CPU), `warp` (wobbly windows) and `shrink` (window
+  previews). `paint` lives in `paint_shader.mlx`, `warp` and `shrink` in
+  `warp_shader.mlx`; every shader starts from `std.spirv.compute`
+  (invocation id, push constants, storage buffers and the small
+  instructions they share).
 - `gpu.mlx`: a device with one compute queue and optional buffer sharing
   (dma-buf import and export, imported host memory); buffers, kernels,
   dispatches.

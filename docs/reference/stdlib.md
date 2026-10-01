@@ -91,7 +91,8 @@ compiler-core std do not load the generated protocol modules. See
 `std.json` (`std/src/json.mlx`), `std.vulkan` (`std/src/vulkan.mlx`,
 materialized from the Vulkan registry, with `std.vulkan.loader` and
 `std.vulkan.icd` in `std/src/vulkan/`) and `std.spirv.core`,
-`std.spirv.builder` and `std.spirv.module` (`std/src/spirv/`) are Stage-1
+`std.spirv.builder`, `std.spirv.module` and `std.spirv.compute`
+(`std/src/spirv/`) are Stage-1
 extensions of the same kind; see [Vulkan, SPIR-V and JSON](vulkan.md)
 (`tests/248_json_runtime.mlx` covers `std.json`).
 

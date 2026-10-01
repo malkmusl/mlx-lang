@@ -17,8 +17,11 @@ interface, and how all of it is tested.
 | `std.spirv.materialize` | `std/src/spirv/materialize.mlx` | writes `std.spirv.core` |
 | `std.spirv.builder` | `std/src/spirv/builder.mlx` | writes SPIR-V modules |
 | `std.spirv.module` | `std/src/spirv/module.mlx` | reads and validates SPIR-V modules |
+| `std.spirv.compute` | `std/src/spirv/compute.mlx` | compute kernels on the builder: invocation id, u32 push constants, storage buffers, select, one-sided ifs, color channels, GLSL.std.450 calls |
 
 Each is imported by its own name and is not part of `std.mlx`.
+`tests/276_spirv_compute_kit_runtime.mlx` builds a kernel with
+`std.spirv.compute` and validates it with `std.spirv.module`.
 
 ## Canonical sources and materialization
 
