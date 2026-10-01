@@ -140,7 +140,7 @@ open(shapes_path, 'w').write(SHAPES)
 open(main_path, 'w').write(MAIN)
 shapes_uri = 'file://' + shapes_path
 main_uri = 'file://' + main_path
-# A crash the desktop programs kept (examples/wayland-compositor/crash.mlx):
+# A crash the desktop programs kept (projects/desktop/compositor/crash.mlx):
 # in add, line 16, called from measure.
 os.makedirs(os.path.join(work, 'state', 'mlx'))
 open(os.path.join(work, 'state', 'mlx', 'crashes.log'), 'w').write('crash\t1790000000\tapp\tillegal instruction (a failed runtime check)\tlib/shapes.mlx:15:add+0x10 at lib/shapes.mlx:16\tapp/main.mlx:3:measure+0x20 at app/main.mlx:4\n')

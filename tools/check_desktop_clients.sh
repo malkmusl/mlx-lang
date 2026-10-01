@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# The dock and the launcher (examples/mlx-dock, examples/mlx-launcher) in
+# The dock and the launcher (projects/desktop/dock, projects/desktop/launcher) in
 # the compositor, end to end: wlr-layer-shell, the compositor's windows
 # for the dock (wlr-foreign-toplevel-management), the blur behind both
 # (ext-background-effect-v1), Super, and starting apps.
@@ -60,15 +60,15 @@ command -v xkbcli > /dev/null || { echo "check_desktop_clients.sh: xkbcli is not
 
 work=$(mktemp -d)
 trap 'rm -rf -- "$work"' EXIT
-"$compiler" --quiet examples/wayland-compositor/main.mlx -o "$work/mlx-compositor"
-"$compiler" --quiet examples/wayland-terminal/main.mlx -o "$work/mlx-terminal"
-"$compiler" --quiet examples/mlx-dock/main.mlx -o "$work/mlx-dock"
-"$compiler" --quiet examples/mlx-launcher/main.mlx -o "$work/mlx-launcher"
+"$compiler" --quiet projects/desktop/compositor/main.mlx -o "$work/mlx-compositor"
+"$compiler" --quiet projects/desktop/terminal/main.mlx -o "$work/mlx-terminal"
+"$compiler" --quiet projects/desktop/dock/main.mlx -o "$work/mlx-dock"
+"$compiler" --quiet projects/desktop/launcher/main.mlx -o "$work/mlx-launcher"
 "$compiler" --quiet tools/wayland-test-host/main.mlx -o "$work/test-host"
 "$compiler" --quiet tools/wayland-drag-source/main.mlx -o "$work/drag-source"
-"$compiler" --quiet examples/mlx-topbar/main.mlx -o "$work/mlx-topbar"
+"$compiler" --quiet projects/desktop/topbar/main.mlx -o "$work/mlx-topbar"
 "$compiler" --quiet tools/clock-probe/main.mlx -o "$work/clock-probe"
-"$compiler" --quiet examples/mlx-files/main.mlx -o "$work/mlx-files"
+"$compiler" --quiet projects/desktop/files/main.mlx -o "$work/mlx-files"
 xkbcli compile-keymap --layout us > "$work/us.xkb"
 
 # The apps: only these (no system directories), one with an icon.
@@ -691,7 +691,7 @@ wait "$host_pid" || true
 rm -rf -- "$runtime"
 [[ $status -eq 1 ]] || fail "error: the file manager exited with $status after a protocol error, not 1" "$work/error.log"
 grep -q "^mlx-files: failed: the compositor ended the connection: protocol error 0 on xdg_toplevel [0-9]*: a protocol error from the test host$" "$work/error.log" \
-    && grep -q "^  from examples/mlx-files/main.mlx:[0-9]*:main+0x" "$work/error.log" || fail "error: the protocol error is not reported with where it came" "$work/error.log"
+    && grep -q "^  from projects/desktop/files/main.mlx:[0-9]*:main+0x" "$work/error.log" || fail "error: the protocol error is not reported with where it came" "$work/error.log"
 grep -q "^crash	[0-9]*	mlx-files	the compositor ended the connection: protocol error" "$work/error-home/.local/state/mlx/crashes.log" 2> /dev/null \
     || fail "error: the protocol error is not in crashes.log" "$work/error.log"
 echo "ok   a protocol error ending the file manager is reported and kept in crashes.log"

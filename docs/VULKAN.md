@@ -61,7 +61,7 @@ and `examples/vulkan-android` builds into an APK with
 | --- | --- |
 | [`examples/vulkan-info`](../examples/vulkan-info/README.md) | every installed driver, its devices and extensions |
 | [`examples/vulkan-wayland-client`](../examples/vulkan-wayland-client/README.md) | a Wayland window rendered by a compute shader, handed to the compositor as dma-bufs or rendered straight into shared memory |
-| [`examples/wayland-compositor`](../examples/wayland-compositor/README.md) `--renderer vulkan` | a compositor that composes its clients' buffers on the GPU, reading `wl_shm` pools and dma-bufs in place |
+| [`projects/desktop/compositor`](../projects/desktop/compositor/README.md) `--renderer vulkan` | a compositor that composes its clients' buffers on the GPU, reading `wl_shm` pools and dma-bufs in place |
 | [`examples/vulkan-android`](../examples/vulkan-android/README.md) | an Android NativeActivity presenting through a `VK_KHR_android_surface` swapchain, with touch input |
 
 All of them share `examples/vulkan-shared`: the shaders (built with
@@ -70,7 +70,7 @@ sharing, swapchain presentation, and text: the client's label, the
 compositor's window titles and the Android label are laid out by
 [`std.truetype`](reference/truetype.md) and drawn by a compute shader.
 
-![The Vulkan client inside the compositor's Vulkan renderer](../examples/wayland-compositor/screenshots/vulkan-client.png)
+![The Vulkan client inside the compositor's Vulkan renderer](../projects/desktop/compositor/screenshots/vulkan-client.png)
 
 The reference — naming rules, the loader, SPIR-V, the driver interface,
 the examples, tests and known limits — is

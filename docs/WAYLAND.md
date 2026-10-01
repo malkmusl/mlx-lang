@@ -61,12 +61,12 @@ implementation order.
 GPU rendering works the same way: the stable linux-dmabuf protocol is
 materialized alongside the core and xdg-shell XML, so a Vulkan client
 (`examples/vulkan-wayland-client`) hands its frames over as dma-bufs, and
-the nested compositor (`examples/wayland-compositor --renderer vulkan`)
+the nested compositor (`projects/desktop/compositor --renderer vulkan`)
 composes client buffers on the GPU. Vulkan itself is native too; see
 [`VULKAN.md`](VULKAN.md).
 
 For larger programs, see
-[`examples/wayland-compositor`](../examples/wayland-compositor/README.md), a
+[`projects/desktop/compositor`](../projects/desktop/compositor/README.md), a
 nested compositor with keyboard and pointer input that launches clients,
-and [`examples/wayland-terminal`](../examples/wayland-terminal/README.md), a
+and [`projects/desktop/terminal`](../projects/desktop/terminal/README.md), a
 terminal emulator client.

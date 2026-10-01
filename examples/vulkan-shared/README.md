@@ -9,7 +9,7 @@ The small Vulkan renderer the Vulkan examples share. It is not a program.
   glyph run from an atlas), `blurPass` and `blurMask` (the compositor's
   blur) and `paint` (the desktop apps' canvas: rounded rectangles,
   outlines, scaled images and glyphs from a list of commands, one pass
-  over the image, the same pixels as `examples/desktop-shared/canvas.mlx`
+  over the image, the same pixels as `projects/desktop/shared/canvas.mlx`
   draws on the CPU), `warp` (wobbly windows) and `shrink` (window
   previews). `paint` lives in `paint_shader.mlx`, `warp` and `shrink` in
   `warp_shader.mlx`; every shader starts from `std.spirv.compute`
@@ -24,8 +24,8 @@ The small Vulkan renderer the Vulkan examples share. It is not a program.
 - `check_shaders.mlx`: validates the shaders with `std.spirv.module` and
   writes them out (`check_shaders DIR`) for `spirv-val`.
 
-Used by `examples/vulkan-wayland-client`, `examples/wayland-compositor`
+Used by `examples/vulkan-wayland-client`, `projects/desktop/compositor`
 (`--renderer vulkan`), `examples/vulkan-android` and the desktop apps
-(`examples/desktop-shared/gpu_canvas.mlx`); tested by
+(`projects/desktop/shared/gpu_canvas.mlx`); tested by
 `tests/257_vulkan_sharing_runtime.mlx` and
 `tests/258_vulkan_swapchain_runtime.mlx`. See `docs/reference/vulkan.md`.

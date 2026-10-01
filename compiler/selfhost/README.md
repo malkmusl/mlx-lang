@@ -52,10 +52,10 @@ runtime foundation remain independent of libc and Zig dependencies:
 - `object/symbol_table.mlx` adds a symbol table (`.symtab`, `.strtab`) to
   every x86_64 executable and shared object: each function is named where it
   is declared, `path:line:name` (for example
-  `examples/mlx-files/main.mlx:1234:drawRow`), and the runtime's routines
+  `projects/desktop/files/main.mlx:1234:drawRow`), and the runtime's routines
   keep theirs (`_start`, `__mlx_*`). `nm`, `gdb` and `perf` show them, and the
   crash handler of the desktop programs
-  (`examples/wayland-compositor/crash.mlx`) names the functions a crash went
+  (`projects/desktop/compositor/crash.mlx`) names the functions a crash went
   through with them. The lowering keeps each function's module and name
   offset on its LIR symbol for this. It also adds a line table
   (`.mlx_lines`): the lowering notes on every LIR instruction where in the

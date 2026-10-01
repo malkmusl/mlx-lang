@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Checks the freestanding compositor (examples/wayland-compositor with
+# Checks the freestanding compositor (projects/desktop/compositor with
 # --backend drm) end to end against an emulated kernel and systemd-logind:
 # tools/fake_drm_session.py plays the DRM card, the input devices and
 # logind on a private dbus-daemon, and drives the scenario (modeset, typing
@@ -16,7 +16,7 @@
 # switching to copying after a first frame that never reached the buffer
 # (MLX_VULKAN_TEST_FAIL=1, as on a driver whose import does not show).
 # The scenario runs once more with the shell and the renderer loaded as
-# shared objects (MLX_COMPOSITOR_MODULES; examples/wayland-compositor/modules.mlx).
+# shared objects (MLX_COMPOSITOR_MODULES; projects/desktop/compositor/modules.mlx).
 #
 # Usage: tools/check_compositor_drm.sh [compiler] [cpu|vulkan] [--screenshot PNG]
 set -euo pipefail
@@ -52,12 +52,12 @@ done
 
 work=$(mktemp -d)
 trap 'rm -rf -- "$work"' EXIT
-"$compiler" --quiet examples/wayland-compositor/main.mlx -o "$work/mlx-compositor"
-"$compiler" --quiet examples/wayland-terminal/main.mlx -o "$work/mlx-terminal"
+"$compiler" --quiet projects/desktop/compositor/main.mlx -o "$work/mlx-compositor"
+"$compiler" --quiet projects/desktop/terminal/main.mlx -o "$work/mlx-terminal"
 "$python" tools/fake_drm_session.py "$work/mlx-compositor" "$work/mlx-terminal" --renderer "$renderer" "${screenshot[@]}"
 echo "--- with the shell and the renderer as shared objects (--modules)"
-"$compiler" --quiet --shared examples/wayland-compositor/shell_module.mlx -o "$work/libmlx-shell.so"
-"$compiler" --quiet --shared examples/wayland-compositor/render_module.mlx -o "$work/libmlx-render.so"
+"$compiler" --quiet --shared projects/desktop/compositor/shell_module.mlx -o "$work/libmlx-shell.so"
+"$compiler" --quiet --shared projects/desktop/compositor/render_module.mlx -o "$work/libmlx-render.so"
 MLX_COMPOSITOR_MODULES="$work" "$python" tools/fake_drm_session.py "$work/mlx-compositor" "$work/mlx-terminal" --renderer "$renderer"
 if [[ $renderer == vulkan ]]; then
     echo "--- with the output copied into the dumb buffers"

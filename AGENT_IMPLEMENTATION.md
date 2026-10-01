@@ -10,7 +10,7 @@ The complete operator algebra in `spec/00-language/operators.xml` is normative; 
 
 Every implemented feature requires positive tests and negative compile-error tests where applicable. Runtime semantics require runtime tests. ABI features require ABI tests. Every user-facing compiler error must use the structured diagnostic model and stable diagnostic code defined under `spec/02-compiler/diagnostics*`.
 
-Every Wayland client program calls `crash.watch(display)` right after connecting (`examples/wayland-compositor/crash.mlx`), so a protocol error or a request on an object that is gone is reported with its call chain and kept in `crashes.log` instead of the program silently ending; `tools/check_crash_report.sh` enforces it (see `docs/reference/wayland.md`, "The rule: every client reports a failed connection").
+Every Wayland client program calls `crash.watch(display)` right after connecting (`projects/desktop/compositor/crash.mlx`), so a protocol error or a request on an object that is gone is reported with its call chain and kept in `crashes.log` instead of the program silently ending; `tools/check_crash_report.sh` enforces it (see `docs/reference/wayland.md`, "The rule: every client reports a failed connection").
 
 Do not add `@protocol`, `@importSchema`, `Build.addProtocol`, or another Wayland/XML compiler special case. JSON and XML are Mlx stdlib modules. Wayland XML is consumed during Stage-0/1 standard-library construction so users later import only `std.wayland`.
 

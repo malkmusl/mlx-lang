@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# The pictures of MLX Observatory's README (examples/mlx-observatory/screenshots),
+# The pictures of MLX Observatory's README (projects/observatory/screenshots),
 # taken of this whole repository, with real data behind every finding:
 #   - crashes kept by tests/support/crash_report.mlx (crashed three ways);
 #   - profiles of mlx-observatory itself (its command line) under mlx-profile;
 #   - built programs (mlx-observatory, mlx-lsp, mlx-files) for the machine code;
 #   - the Git history (blame, and the workarounds of the last 20 commits).
 # The app plays a demo script (MLX_CODEMAP_DEMO, see runDemo in
-# examples/mlx-observatory/main.mlx) under tools/wayland-test-host, drawn on
+# projects/observatory/main.mlx) under tools/wayland-test-host, drawn on
 # lavapipe (VK_DRIVER_FILES), and writes its own frames; Python with
 # Pillow turns them into PNGs and the tour into an animated GIF.
 #
@@ -16,7 +16,7 @@ set -euo pipefail
 repo_root=$(cd "$(dirname "$0")/.." && pwd)
 cd "$repo_root"
 compiler=${1:-${MLX_COMPILER:-mlx-out/bin/compiler/mlx4}}
-out=${2:-examples/mlx-observatory/screenshots}
+out=${2:-projects/observatory/screenshots}
 python3 -c "import PIL" 2> /dev/null || { echo "observatory_screenshots.sh: needs Python with Pillow (pip install pillow)" >&2; exit 2; }
 command -v xkbcli > /dev/null || { echo "observatory_screenshots.sh: xkbcli is not installed" >&2; exit 2; }
 
@@ -28,9 +28,9 @@ mkdir -p "$home" "$state" "$work/bin" "$work/frames" "$out"
 say() { echo "== $*" >&2; }
 
 say "building"
-"$compiler" --quiet examples/mlx-observatory/main.mlx -o "$work/bin/mlx-observatory"
+"$compiler" --quiet projects/observatory/main.mlx -o "$work/bin/mlx-observatory"
 "$compiler" --quiet tools/mlx-lsp/main.mlx -o "$work/bin/mlx-lsp"
-"$compiler" --quiet examples/mlx-files/main.mlx -o "$work/bin/mlx-files"
+"$compiler" --quiet projects/desktop/files/main.mlx -o "$work/bin/mlx-files"
 "$compiler" --quiet tools/profile/main.mlx -o "$work/mlx-profile"
 "$compiler" --quiet tools/wayland-test-host/main.mlx -o "$work/test-host"
 "$compiler" --quiet tests/support/crash_report.mlx -o "$work/crashy"
@@ -91,7 +91,7 @@ record tour2 6 150
 enter
 record tour3 14 90
 wait 300
-select examples/mlx-observatory
+select projects/observatory
 record tour4 14 90
 metric heat
 record tour5 8 150
@@ -120,7 +120,7 @@ settle
 shot selected
 escape
 escape
-select examples/mlx-observatory
+select projects/observatory
 settle
 shot group
 escape

@@ -8,8 +8,8 @@
 #      weston-simple-shm (libwayland clients);
 #   3. the Mlx client talks to the Mlx compositor, which verifies the pixels
 #      it receives through shared memory;
-#   4. examples/wayland-compositor runs nested inside weston and shows
-#      weston-terminal and examples/wayland-terminal.
+#   4. projects/desktop/compositor runs nested inside weston and shows
+#      weston-terminal and projects/desktop/terminal.
 #
 # Needs weston, wayland-info and weston-simple-shm on PATH (Debian/Ubuntu:
 # apt-get install weston wayland-utils). Usage:
@@ -39,8 +39,8 @@ trap cleanup EXIT
 
 "$compiler" --quiet examples/wayland-client/main.mlx -o "$work/mlx-client"
 "$compiler" --quiet examples/wayland-server/main.mlx -o "$work/mlx-compositor"
-"$compiler" --quiet examples/wayland-compositor/main.mlx -o "$work/mlx-nested"
-"$compiler" --quiet examples/wayland-terminal/main.mlx -o "$work/mlx-terminal"
+"$compiler" --quiet projects/desktop/compositor/main.mlx -o "$work/mlx-nested"
+"$compiler" --quiet projects/desktop/terminal/main.mlx -o "$work/mlx-terminal"
 
 wait_for_socket() {
     for _ in $(seq 1 50); do

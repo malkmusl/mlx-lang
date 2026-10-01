@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Builds the compositor's shell and renderer as shared objects into the
 # directory the running compositor watches, so it loads them without a
-# restart (examples/wayland-compositor/modules.mlx).
+# restart (projects/desktop/compositor/modules.mlx).
 #
 #   tools/build_compositor_modules.sh [options] [shell|render]...
 #     --dir DIR        where to put them (default: $MLX_COMPOSITOR_MODULES,
@@ -42,7 +42,7 @@ build() {
     local kind status=0
     for kind in "${kinds[@]}"; do
         local target="$directory/libmlx-$kind.so"
-        if "$compiler" --quiet --shared "examples/wayland-compositor/${kind}_module.mlx" -o "$target.next"; then
+        if "$compiler" --quiet --shared "projects/desktop/compositor/${kind}_module.mlx" -o "$target.next"; then
             mv "$target.next" "$target"
             echo "built $target"
         else
@@ -60,7 +60,7 @@ if [[ $watch -eq 0 ]]; then
 fi
 
 # --watch: the sources the modules are built from.
-sources() { find examples/wayland-compositor examples/vulkan-shared std/src -name '*.mlx' -printf '%T@ %p\n' | sort | md5sum; }
+sources() { find projects/desktop/compositor examples/vulkan-shared std/src -name '*.mlx' -printf '%T@ %p\n' | sort | md5sum; }
 build || true
 last=$(sources)
 echo "watching the sources (Ctrl+C stops)"

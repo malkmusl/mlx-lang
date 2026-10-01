@@ -1,0 +1,1459 @@
+// The dock of the Mlx desktop: a Wayland client in the compositor's top
+// layer, along the bottom edge of the screen, keeping that strip free of
+// windows. It shows an apps button (the launcher), the pinned apps, and
+// after a separator the apps that have windows but are not pinned; a dot
+// under an icon marks an app that runs. Icons grow under the pointer and
+// the one under it shows its name. A click brings an app's window forward
+// (with several: the compositor shows their previews), or starts the app.
+// A right click opens its menu: the app's desktop actions ("New Window"),
+// pinning, closing its windows. An app dropped on the dock (a desktop
+// entry file as text/uri-list, dragged from the launcher) is pinned where
+// it lands. After another separator come the pinned folders (a click
+// shows the newest files, like a stack) and the trash (open, empty, drop
+// files on it: desktop-shared/places.mlx).
+//
+// The windows come from the compositor (wlr-foreign-toplevel-management),
+// the apps from their desktop entries, and the bar asks the compositor to
+// blur what is behind it (ext-background-effect-v1).
+//
+//   mlx-dock
+//
+// Pinned apps are listed in $XDG_CONFIG_HOME/mlx/dock (~/.config/mlx/dock),
+// one desktop entry id per line ("org.gnome.Nautilus", "firefox"), and
+// "terminal" for the Mlx terminal. Without that file the dock pins the
+// terminal, a file manager (Mlx's own, mlx-files, first), a browser and an
+// editor when they are installed. The terminal is $MLX_TERMINAL. Started by the compositor to
+// stay, the apps button asks it for its launcher on MLX_DOCK_FD; otherwise
+// it runs $MLX_LAUNCHER. New apps and a changed configuration are taken in
+// within a second; without a configuration the dock writes the one it
+// made (desktop-shared/pins.mlx).
+const std = @import("std")
+const png = @import("std.png")
+const apps_module = @import("../shared/apps.mlx")
+const canvas_module = @import("../shared/canvas.mlx")
+const panel_module = @import("../shared/panel.mlx")
+const panel_drag = @import("../shared/panel_drag.mlx")
+const panel_menu = @import("../shared/panel_menu.mlx")
+const pins_module = @import("../shared/pins.mlx")
+const menu_module = @import("../shared/menu.mlx")
+const places = @import("../shared/places.mlx")
+const icons = @import("../shared/icons.mlx")
+const thumbs_module = @import("../shared/thumbs.mlx")
+const crash = @import("../compositor/crash.mlx")
+
+const Apps = apps_module.Apps
+const App = apps_module.App
+const Canvas = canvas_module.Canvas
+const Text = canvas_module.Text
+const Panel = panel_module.Panel
+const Window = panel_module.Window
+
+const ICON: i32 = 48
+const MAX_ICON: i32 = 76
+const SPACING: i32 = 10
+const PADDING: i32 = 8
+const SEPARATOR: i32 = 17
+const BAR_HEIGHT: i32 = 64
+const GAP: i32 = 8
+const RADIUS: i32 = 18
+const REACH: i32 = 150
+const HEIGHT: i32 = 150
+const EXTRA_WIDTH: i32 = 120
+const MAX_ITEMS: usize = 48
+const NONE: usize = 1 << 40
+const BUTTON_LEFT: u32 = 272
+const BUTTON_RIGHT: u32 = 273
+
+// What a menu entry does.
+const MENU_ACTION: u32 = 0
+const MENU_NEW_WINDOW: u32 = 1
+const MENU_PIN: u32 = 2
+const MENU_UNPIN: u32 = 3
+const MENU_CLOSE: u32 = 4
+const MENU_OPEN: u32 = 5
+const MENU_REMOVE: u32 = 6
+const MENU_EMPTY_TRASH: u32 = 7
+const MENU_STACK_ENTRY: u32 = 8
+
+// A folder's stack view: a grid of its entries (newest first) under a
+// header with its name and an Open button, scrolled by rows.
+const STACK_COLUMNS: i32 = 5
+const STACK_ROWS: i32 = 3
+const STACK_CELL_WIDTH: i32 = 92
+const STACK_CELL_HEIGHT: i32 = 92
+const STACK_HEADER: i32 = 46
+const STACK_PADDING: i32 = 12
+const STACK_ICON: i32 = 52
+const STACK_OPEN: usize = NONE - 1
+// Entries whose pictures are shown (the newest), and how many are read
+// from the thumbnail cache for one drawing (the rest on the next ticks).
+const THUMBS: usize = 60
+const THUMB_BUDGET: usize = 8
+
+const KIND_APPS: u32 = 0
+const KIND_APP: u32 = 1
+const KIND_TERMINAL: u32 = 2
+const KIND_WINDOW: u32 = 3
+const KIND_FOLDER: u32 = 4
+const KIND_TRASH: u32 = 5
+
+const TERMINAL_ID: []const u8 = "org.mlx.terminal"
+
+// One icon of the dock.
+const Item = struct {
+    kind: u32
+    // The desktop entry (KIND_APP), else NONE.
+    app: usize
+    // The windows' app id (KIND_WINDOW); a folder's path as pinned
+    // (KIND_FOLDER: "~/Downloads").
+    appId: [256]u8
+    appIdLength: usize
+    // How many windows it has, and whether one of them is active.
+    running: usize
+    active: bool
+    // Where it is drawn this frame.
+    x: i32
+    size: i32
+}
+
+const Dock = struct {
+    panel: Panel
+    apps: Apps
+    environment: [*][*]const u8
+    terminal: [*]const u8
+    launcher: [*]const u8
+    items: [48]Item
+    itemCount: usize
+    // The apps button and the pinned apps come first, then the apps that
+    // run; from folderStart the pinned folders and the trash.
+    pinnedCount: usize
+    folderStart: usize
+    folders: pins_module.Pins
+    foldersSignature: usize
+    trashFull: bool
+    // A folder's stack view while it shows (stackItem: the folder's item,
+    // NONE: closed): its entries, the first row shown, the entry under the
+    // pointer, and the entries' pictures (thumbState: 0 not looked up yet,
+    // 1 read, 2 none, 3 coming: the thumbnail worker makes it, or it waits
+    // for the next drawing; desktop-shared/thumbs.mlx).
+    stack: places.Entries
+    stackItem: usize
+    listing: places.Listing
+    stackScroll: i32
+    stackHover: usize
+    // A folder from the stack is opening (when, in milliseconds; 0: not):
+    // the stack stays until the compositor grows the new window out of it
+    // and closes it (three seconds at most).
+    stackOpening: usize
+    thumbs: [60]png.Image
+    thumbState: [60]u8
+    thumbBudget: usize
+    pictures: thumbs_module.Thumbs
+    // When the pins and the trash were last looked at (refresh; the ticks
+    // come faster while pictures are coming).
+    lastRefresh: usize
+    // The pointer.
+    pointerX: i32
+    pointerIn: bool
+    hover: usize
+    // The bar as last laid out, and the region last asked to be blurred.
+    barLeft: i32
+    barWidth: i32
+    blurLeft: i32
+    blurWidth: i32
+    small: Text
+    large: Text
+    // Started by the compositor to stay (MLX_DOCK_FD): the channel the apps
+    // button asks it for the launcher on, else -1.
+    channel: isize
+    // What the apps and the configuration looked like when last read (see
+    // refresh).
+    appsSignature: usize
+    configSignature: usize
+    // The right-click menu: its entries, the item it is for (NONE: closed)
+    // and that item's desktop actions.
+    menu: menu_module.Menu
+    menuItem: usize
+    actions: apps_module.Actions
+    // A drag over the dock: where an app would be pinned (an index into
+    // the pins; NONE: no drag), or whether it is over the trash.
+    dropAt: usize
+    dropOnTrash: bool
+}
+
+fn dockOf(context: *anyopaque) -> *Dock {
+    unsafe { return @ptrCast(*Dock, context) }
+}
+
+fn foldersOf(dock: *Dock) -> *pins_module.Pins {
+    unsafe { return @ptrCast(*pins_module.Pins, &dock.*.folders) }
+}
+
+fn stackOf(dock: *Dock) -> *places.Entries {
+    unsafe { return @ptrCast(*places.Entries, &dock.*.stack) }
+}
+
+fn listingOf(dock: *Dock) -> *places.Listing {
+    unsafe { return @ptrCast(*places.Listing, &dock.*.listing) }
+}
+
+fn thumbAt(dock: *Dock, index: usize) -> *png.Image {
+    unsafe { return @ptrFromInt(*png.Image, @intFromPtr(dock) + @offsetOf(Dock, "thumbs") + index * @sizeOf(png.Image)) }
+}
+
+fn menuOf(dock: *Dock) -> *menu_module.Menu {
+    unsafe { return @ptrCast(*menu_module.Menu, &dock.*.menu) }
+}
+
+fn actionsOf(dock: *Dock) -> *apps_module.Actions {
+    unsafe { return @ptrCast(*apps_module.Actions, &dock.*.actions) }
+}
+
+fn panelOf(dock: *Dock) -> *Panel {
+    unsafe { return @ptrCast(*Panel, &dock.*.panel) }
+}
+
+fn appsOf(dock: *Dock) -> *Apps {
+    unsafe { return @ptrCast(*Apps, &dock.*.apps) }
+}
+
+fn smallOf(dock: *Dock) -> *Text {
+    unsafe { return @ptrCast(*Text, &dock.*.small) }
+}
+
+fn largeOf(dock: *Dock) -> *Text {
+    unsafe { return @ptrCast(*Text, &dock.*.large) }
+}
+
+fn itemAt(dock: *Dock, index: usize) -> *Item {
+    unsafe { return @ptrFromInt(*Item, @intFromPtr(dock) + @offsetOf(Dock, "items") + index * @sizeOf(Item)) }
+}
+
+fn appIdOf(item: *const Item) -> []const u8 {
+    var bytes: [*]const u8 = undefined
+    unsafe { bytes = @ptrFromInt([*]const u8, @intFromPtr(item) + @offsetOf(Item, "appId")) }
+    return bytes[0..item.*.appIdLength]
+}
+
+fn noString() -> [*]const u8 {
+    unsafe { return @ptrFromInt([*]const u8, 0) }
+}
+
+// ---------------------------------------------------------------------------
+// Items
+
+fn addItem(dock: *Dock, kind: u32, app: usize, app_id: []const u8) -> *Item {
+    const item = itemAt(dock, dock.*.itemCount)
+    dock.*.itemCount += 1
+    item.*.kind = kind
+    item.*.app = app
+    item.*.appIdLength = 0
+    for byte in app_id {
+        if item.*.appIdLength < 256 {
+            item.*.appId[item.*.appIdLength] = byte
+            item.*.appIdLength += 1
+        }
+    }
+    item.*.running = 0
+    item.*.active = false
+    item.*.x = 0
+    item.*.size = ICON
+    return item
+}
+
+fn hasApp(dock: *Dock, app: usize) -> bool {
+    var index: usize = 0
+    while index < dock.*.itemCount {
+        if itemAt(dock, index).*.kind == KIND_APP && itemAt(dock, index).*.app == app { return true }
+        index += 1
+    }
+    return false
+}
+
+fn hasTerminal(dock: *Dock) -> bool {
+    var index: usize = 0
+    while index < dock.*.itemCount {
+        if itemAt(dock, index).*.kind == KIND_TERMINAL { return true }
+        index += 1
+    }
+    return false
+}
+
+// Pins what `name` names, when it is installed (or the terminal).
+fn pin(dock: *Dock, name: []const u8) -> void {
+    if name.length == 0 || dock.*.itemCount >= MAX_ITEMS { return }
+    if apps_module.sameText(name, "terminal") || apps_module.sameText(name, TERMINAL_ID) {
+        if !hasTerminal(dock) { const item = addItem(dock, KIND_TERMINAL, NONE, TERMINAL_ID) }
+        return
+    }
+    const app = apps_module.find(appsOf(dock), name)
+    if app < appsOf(dock).*.count && !hasApp(dock, app) { const item = addItem(dock, KIND_APP, app, "") }
+}
+
+// The pinned apps without a configuration: the first of each group that is
+// installed.
+fn defaultPin(index: usize) -> []const u8 {
+    return match index {
+        0 => "terminal",
+        1 => "org.mlx.files", 2 => "org.gnome.Nautilus", 3 => "nautilus", 4 => "org.kde.dolphin", 5 => "thunar", 6 => "pcmanfm",
+        7 => "firefox", 8 => "org.mozilla.firefox", 9 => "chromium", 10 => "google-chrome", 11 => "brave-browser",
+        12 => "code", 13 => "code-oss", 14 => "codium", 15 => "org.gnome.TextEditor", 16 => "gedit", 17 => "org.kde.kate",
+        else => ""
+    }
+}
+
+fn defaultGroupEnd(index: usize) -> bool {
+    return index == 0 || index == 6 || index == 11 || index == 17
+}
+
+fn pinDefaults(dock: *Dock) -> void {
+    var index: usize = 0
+    var group_done = false
+    while index <= 17 {
+        const before = dock.*.itemCount
+        if !group_done { pin(dock, defaultPin(index)) }
+        if dock.*.itemCount != before { group_done = true }
+        if defaultGroupEnd(index) { group_done = false }
+        index += 1
+    }
+}
+
+// The configuration file's path into `path`; false without a home.
+fn configPath(dock: *Dock, path: *apps_module.Path) -> bool {
+    return pins_module.path(dock.*.environment, pins_module.APPS, path)
+}
+
+// When the configuration file last changed (1: there is none).
+fn configSignature(dock: *Dock) -> usize {
+    var path: apps_module.Path = undefined
+    if !configPath(dock, &path) { return 1 }
+    var status: std.fs.Stat = undefined
+    if std.fs.status(apps_module.pathEnd(&path), &status) != 0 { return 1 }
+    return @bitCast(usize, status.modifiedSeconds) *% 1000000007 +% @bitCast(usize, status.modifiedNanoseconds) +% @bitCast(usize, status.size)
+}
+
+// Reads the pinned apps from the configuration file; false without one.
+fn pinConfigured(dock: *Dock) -> bool {
+    var pins: pins_module.Pins = undefined
+    if !pins_module.read(dock.*.environment, pins_module.APPS, appsOf(dock).*.allocator, &pins) { return false }
+    var index: usize = 0
+    while index < pins.count {
+        pin(dock, pins_module.idAt(&pins, index))
+        index += 1
+    }
+    return true
+}
+
+// What the configuration file names for a pinned item ("" for none).
+fn pinId(dock: *Dock, item: *Item) -> []const u8 {
+    if item.*.kind == KIND_TERMINAL { return "terminal" }
+    if item.*.kind == KIND_APP { return apps_module.idOf(apps_module.appAt(appsOf(dock), item.*.app)) }
+    return ""
+}
+
+// The first pinned item (after the apps button).
+fn firstPinned(dock: *Dock) -> usize {
+    return if dock.*.itemCount > 0 && itemAt(dock, 0).*.kind == KIND_APPS { 1 } else { 0 }
+}
+
+// The pinned items as the file would list them.
+fn currentPins(dock: *Dock, pins: *pins_module.Pins) -> void {
+    pins.*.count = 0
+    var index = firstPinned(dock)
+    while index < dock.*.pinnedCount {
+        pins_module.insert(pins, pinId(dock, itemAt(dock, index)), pins.*.count)
+        index += 1
+    }
+}
+
+// Writes the pins and shows them at once.
+fn savePins(dock: *Dock, pins: *pins_module.Pins) -> void {
+    if !pins_module.write(dock.*.environment, pins_module.APPS, pins) { return }
+    dock.*.configSignature = configSignature(dock)
+    reloadItems(dock)
+}
+
+fn isTerminalWindow(window: *const Window) -> bool {
+    return apps_module.sameText(panel_module.appIdOf(window), TERMINAL_ID)
+}
+
+// Whether `window` is one of `item`'s.
+fn owns(dock: *Dock, item: *Item, window: *Window) -> bool {
+    if !window.*.live { return false }
+    if item.*.kind == KIND_TERMINAL { return isTerminalWindow(window) }
+    if item.*.kind == KIND_APP {
+        const app_id = panel_module.appIdOf(window)
+        return app_id.length > 0 && apps_module.find(appsOf(dock), app_id) == item.*.app
+    }
+    if item.*.kind == KIND_WINDOW { return apps_module.sameText(panel_module.appIdOf(window), appIdOf(item)) }
+    return false
+}
+
+// The items again after the windows changed: the pinned ones, then one for
+// each other app that has windows.
+fn rebuild(dock: *Dock) -> void {
+    const panel = panelOf(dock)
+    const before = dock.*.itemCount
+    dock.*.itemCount = dock.*.pinnedCount
+    var index: usize = 0
+    while index < dock.*.itemCount {
+        itemAt(dock, index).*.running = 0
+        itemAt(dock, index).*.active = false
+        index += 1
+    }
+    var window_index: usize = 0
+    while window_index < panel.*.windowCount {
+        const window = panel_module.windowAt(panel, window_index)
+        if window.*.live {
+            var found = NONE
+            index = 0
+            while index < dock.*.itemCount && found == NONE {
+                if owns(dock, itemAt(dock, index), window) { found = index }
+                index += 1
+            }
+            if found == NONE && dock.*.itemCount < MAX_ITEMS {
+                const app_id = panel_module.appIdOf(window)
+                const app = if app_id.length > 0 { apps_module.find(appsOf(dock), app_id) } else { appsOf(dock).*.count }
+                found = dock.*.itemCount
+                if isTerminalWindow(window) {
+                    const item = addItem(dock, KIND_TERMINAL, NONE, TERMINAL_ID)
+                } else if app < appsOf(dock).*.count {
+                    const item = addItem(dock, KIND_APP, app, "")
+                } else {
+                    const item = addItem(dock, KIND_WINDOW, NONE, app_id)
+                }
+            }
+            if found != NONE {
+                const item = itemAt(dock, found)
+                item.*.running += 1
+                if window.*.activated { item.*.active = true }
+            }
+        }
+        window_index += 1
+    }
+    appendPlaces(dock)
+    if dock.*.itemCount != before { fitWidth(dock) }
+    dock.*.hover = NONE
+}
+
+// After the apps: the pinned folders and the trash.
+fn appendPlaces(dock: *Dock) -> void {
+    dock.*.folderStart = dock.*.itemCount
+    var index: usize = 0
+    while index < foldersOf(dock).*.count && dock.*.itemCount + 1 < MAX_ITEMS {
+        const folder = addItem(dock, KIND_FOLDER, NONE, pins_module.idAt(foldersOf(dock), index))
+        index += 1
+    }
+    const trash = addItem(dock, KIND_TRASH, NONE, "")
+}
+
+// Whether a separator comes before item `index`: before the apps that run
+// (when there are some) and before the folders and the trash.
+fn separatorBefore(dock: *Dock, index: usize) -> bool {
+    return index > 0 && (index == dock.*.pinnedCount || index == dock.*.folderStart)
+}
+
+fn separators(dock: *Dock) -> i32 {
+    var count: i32 = 0
+    var index: usize = 0
+    while index < dock.*.itemCount {
+        if separatorBefore(dock, index) { count += 1 }
+        index += 1
+    }
+    return count
+}
+
+// ---------------------------------------------------------------------------
+// Layout
+
+fn baseWidth(dock: *Dock) -> i32 {
+    return PADDING * 2 + @intCast(i32, dock.*.itemCount) * (ICON + SPACING) - SPACING + separators(dock) * SEPARATOR
+}
+
+// Asks for a surface as wide as the dock can grow.
+fn fitWidth(dock: *Dock) -> void {
+    panel_module.resize(panelOf(dock), @intCast(u32, baseWidth(dock) + EXTRA_WIDTH), @intCast(u32, HEIGHT))
+}
+
+// How big an icon is whose resting centre is `distance` pixels from the
+// pointer: full size under it, easing down to the normal size at REACH.
+fn magnified(distance: i32) -> i32 {
+    const away = if distance < 0 { -distance } else { distance }
+    if away >= REACH { return ICON }
+    // Smoothstep of how close it is, in 1/1024.
+    const close = (REACH - away) * 1024 / REACH
+    const eased = close * close * (3072 - 2 * close) / (1024 * 1024)
+    return ICON + (MAX_ICON - ICON) * eased / 1024
+}
+
+fn barTop(dock: *Dock) -> i32 {
+    return @intCast(i32, panelOf(dock).*.height) - GAP - BAR_HEIGHT
+}
+
+// Sizes and places the items for the pointer where it is.
+fn layout(dock: *Dock) -> void {
+    const surface_width = @intCast(i32, panelOf(dock).*.width)
+    const resting = baseWidth(dock)
+    const resting_left = (surface_width - resting) / 2
+    var total = PADDING * 2
+    var offset = resting_left + PADDING
+    var index: usize = 0
+    while index < dock.*.itemCount {
+        if separatorBefore(dock, index) { offset += SEPARATOR }
+        const item = itemAt(dock, index)
+        item.*.size = if dock.*.pointerIn { magnified(dock.*.pointerX - (offset + ICON / 2)) } else { ICON }
+        total += item.*.size + if index + 1 < dock.*.itemCount { SPACING } else { 0 }
+        offset += ICON + SPACING
+        index += 1
+    }
+    total += separators(dock) * SEPARATOR
+    dock.*.barWidth = total
+    dock.*.barLeft = (surface_width - total) / 2
+    var x = dock.*.barLeft + PADDING
+    index = 0
+    while index < dock.*.itemCount {
+        if separatorBefore(dock, index) { x += SEPARATOR }
+        const item = itemAt(dock, index)
+        item.*.x = x
+        x += item.*.size + SPACING
+        index += 1
+    }
+}
+
+fn itemUnder(dock: *Dock, x: i32) -> usize {
+    var index: usize = 0
+    while index < dock.*.itemCount {
+        const item = itemAt(dock, index)
+        if x >= item.*.x - SPACING / 2 && x < item.*.x + item.*.size + SPACING / 2 { return index }
+        index += 1
+    }
+    return NONE
+}
+
+// ---------------------------------------------------------------------------
+// Input
+
+fn nameOf(dock: *Dock, item: *Item) -> []const u8 {
+    if item.*.kind == KIND_APPS { return "Apps" }
+    if item.*.kind == KIND_TERMINAL { return "Terminal" }
+    if item.*.kind == KIND_APP { return apps_module.nameOf(apps_module.appAt(appsOf(dock), item.*.app)) }
+    if item.*.kind == KIND_TRASH { return "Trash" }
+    if item.*.kind == KIND_FOLDER { return places.baseName(appIdOf(item)) }
+    return appIdOf(item)
+}
+
+// Brings the item's next window forward: the one after the active one, else
+// the first. False when it has none.
+fn activateNext(dock: *Dock, item: *Item) -> bool {
+    const panel = panelOf(dock)
+    var first = NONE
+    var active = NONE
+    var next = NONE
+    var index: usize = 0
+    while index < panel.*.windowCount {
+        const window = panel_module.windowAt(panel, index)
+        if owns(dock, item, window) {
+            if first == NONE { first = index }
+            if active != NONE && next == NONE { next = index }
+            if window.*.activated { active = index }
+        }
+        index += 1
+    }
+    if first == NONE { return false }
+    const chosen = if next != NONE { next } else { first }
+    panel_module.activate(panel, panel_module.windowAt(panel, chosen))
+    return true
+}
+
+// Asks the compositor to show the item's windows as previews: 112 'p',
+// their count and their handles' object ids (at most 8). False without a
+// compositor to ask.
+fn showPreviews(dock: *Dock, item: *Item) -> bool {
+    if dock.*.channel < 0 { return false }
+    const panel = panelOf(dock)
+    var message: [34]u8 = undefined
+    message[0] = 112
+    var count: usize = 0
+    var index: usize = 0
+    while index < panel.*.windowCount && count < 8 {
+        const window = panel_module.windowAt(panel, index)
+        if owns(dock, item, window) {
+            const id = window.*.handle.id()
+            message[2 + count * 4] = @intCast(u8, id & 255)
+            message[3 + count * 4] = @intCast(u8, (id >> 8) & 255)
+            message[4 + count * 4] = @intCast(u8, (id >> 16) & 255)
+            message[5 + count * 4] = @intCast(u8, id >> 24)
+            count += 1
+        }
+        index += 1
+    }
+    if count < 2 { return false }
+    message[1] = @intCast(u8, count)
+    const sent = std.linux.syscall6(44, @bitCast(usize, dock.*.channel), @intFromPtr(&message), 2 + count * 4, 64 | 16384, 0, 0)
+    return sent > 0
+}
+
+// The items from scratch: the apps button, the pinned apps (the
+// configuration may have changed), then the apps with windows.
+fn reloadItems(dock: *Dock) -> void {
+    dock.*.itemCount = 0
+    if dock.*.channel >= 0 || @intFromPtr(dock.*.launcher) != 0 { const item = addItem(dock, KIND_APPS, NONE, "") }
+    if !pinConfigured(dock) { pinDefaults(dock) }
+    dock.*.pinnedCount = dock.*.itemCount
+    rebuild(dock)
+    fitWidth(dock)
+    panelOf(dock).*.dirty = true
+}
+
+// Looks whether apps were installed or removed, or the pinned apps
+// changed, and takes them in (twice a minute and more: see main).
+// When the pin file `name` last changed (1: there is none).
+fn pinsSignature(dock: *Dock, name: []const u8) -> usize {
+    var path: apps_module.Path = undefined
+    if !pins_module.path(dock.*.environment, name, &path) { return 1 }
+    var status: std.fs.Stat = undefined
+    if std.fs.status(apps_module.pathEnd(&path), &status) != 0 { return 1 }
+    return @bitCast(usize, status.modifiedSeconds) *% 1000000007 +% @bitCast(usize, status.modifiedNanoseconds) +% @bitCast(usize, status.size)
+}
+
+// The pinned folders from their file; without one ~/Downloads (when there
+// is one), written there.
+fn loadFolders(dock: *Dock) -> void {
+    if pins_module.read(dock.*.environment, pins_module.FOLDERS, appsOf(dock).*.allocator, foldersOf(dock)) { return }
+    var path: apps_module.Path = undefined
+    if places.expand(dock.*.environment, "~/Downloads", &path) && places.isDirectory(apps_module.pathEnd(&path)) { pins_module.insert(foldersOf(dock), "~/Downloads", 0) }
+    const written = pins_module.write(dock.*.environment, pins_module.FOLDERS, foldersOf(dock))
+}
+
+fn refresh(dock: *Dock) -> void {
+    // A folder opened from the stack, but no window came out of it.
+    if dock.*.stackOpening != 0 && panel_module.milliseconds() > dock.*.stackOpening + 3000 {
+        closeStack(dock)
+        panelOf(dock).*.dirty = true
+    }
+    // The trash filled or was emptied.
+    const full = places.trashFull(dock.*.environment)
+    if full != dock.*.trashFull {
+        dock.*.trashFull = full
+        panelOf(dock).*.dirty = true
+    }
+    const folders_now = pinsSignature(dock, pins_module.FOLDERS)
+    if folders_now != dock.*.foldersSignature {
+        dock.*.foldersSignature = folders_now
+        loadFolders(dock)
+        reloadItems(dock)
+    }
+    const apps_now = apps_module.signature(appsOf(dock))
+    const config_now = configSignature(dock)
+    if apps_now == dock.*.appsSignature && config_now == dock.*.configSignature { return }
+    if apps_now != dock.*.appsSignature {
+        apps_module.rescan(appsOf(dock))
+        panel_module.forgetImages(panelOf(dock))
+    }
+    dock.*.appsSignature = apps_now
+    if config_now != dock.*.configSignature { say("mlx-dock: the pinned apps changed\n") }
+    dock.*.configSignature = config_now
+    reloadItems(dock)
+}
+
+// The compositor's end of the channel: its going ends us (it starts a new
+// dock with itself).
+fn listen(dock: *Dock) -> void {
+    var bytes: [16]u8 = undefined
+    const count = std.linux.syscall3(0, @bitCast(usize, dock.*.channel), @intFromPtr(&bytes), 16)
+    if count == 0 { panelOf(dock).*.running = false }
+}
+
+fn click(dock: *Dock, index: usize) -> void {
+    const item = itemAt(dock, index)
+    if dock.*.menuItem != NONE { closeMenu(dock) }
+    // A second click on the folder closes its stack.
+    if dock.*.stackItem != NONE {
+        const again = dock.*.stackItem == index
+        closeStack(dock)
+        if again { return }
+    }
+    if item.*.kind == KIND_APPS {
+        if dock.*.channel >= 0 {
+            // The compositor shows its launcher (that stays: at once).
+            var byte: [1]u8 = [1]u8{ 108 }
+            const sent = std.linux.syscall6(44, @bitCast(usize, dock.*.channel), @intFromPtr(&byte), 1, 64 | 16384, 0, 0)
+            return
+        }
+        if @intFromPtr(dock.*.launcher) != 0 {
+            var length: usize = 0
+            while dock.*.launcher[length] != 0 { length += 1 }
+            apps_module.run(dock.*.launcher[0..length], noString(), dock.*.environment)
+        }
+        return
+    }
+    if item.*.kind == KIND_FOLDER {
+        openStack(dock, index)
+        return
+    }
+    if item.*.kind == KIND_TRASH {
+        zoomFromItem(dock, item)
+        places.openTrash(dock.*.environment)
+        return
+    }
+    if item.*.running >= 2 && showPreviews(dock, item) { return }
+    if activateNext(dock, item) { return }
+    if item.*.kind == KIND_TERMINAL {
+        var length: usize = 0
+        while dock.*.terminal[length] != 0 { length += 1 }
+        apps_module.run(dock.*.terminal[0..length], noString(), dock.*.environment)
+    } else if item.*.kind == KIND_APP {
+        apps_module.launch(apps_module.appAt(appsOf(dock), item.*.app), dock.*.terminal, dock.*.environment)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The right-click menu: the app's own actions ("New Window", "New Private
+// Window"), else a new window of it; pinning; closing its windows.
+
+fn drawMenu(context: *anyopaque, canvas: *Canvas) -> void {
+    const dock = dockOf(context)
+    menu_module.draw(menuOf(dock), canvas, smallOf(dock))
+}
+
+fn closeMenu(dock: *Dock) -> void {
+    dock.*.menuItem = NONE
+    panel_menu.closeMenu(panelOf(dock))
+}
+
+fn showMenu(dock: *Dock, index: usize) -> void {
+    closeStack(dock)
+    const menu = menuOf(dock)
+    if menu.*.count == 0 { return }
+    const item = itemAt(dock, index)
+    dock.*.menuItem = index
+    // The name above the icon would show through.
+    dock.*.hover = NONE
+    dock.*.pointerIn = false
+    panelOf(dock).*.dirty = true
+    const small = smallOf(dock)
+    if !panel_menu.openMenu(panelOf(dock), item.*.x, barTop(dock) - 4, item.*.size, 4, panel_module.PLACE_TOP, menu_module.width(menu, small), menu_module.height(menu), drawMenu) { dock.*.menuItem = NONE }
+}
+
+// ---------------------------------------------------------------------------
+// A folder's stack view
+
+fn stackRows(dock: *Dock) -> i32 {
+    return (@intCast(i32, listingOf(dock).*.count) + STACK_COLUMNS - 1) / STACK_COLUMNS
+}
+
+fn stackVisibleRows(dock: *Dock) -> i32 {
+    const rows = stackRows(dock)
+    if rows < 1 { return 1 }
+    return if rows > STACK_ROWS { STACK_ROWS } else { rows }
+}
+
+fn stackWidth() -> i32 { return STACK_COLUMNS * STACK_CELL_WIDTH + STACK_PADDING * 2 }
+fn stackHeight(dock: *Dock) -> i32 { return STACK_HEADER + stackVisibleRows(dock) * STACK_CELL_HEIGHT + STACK_PADDING }
+
+fn openButtonLeft() -> i32 { return stackWidth() - STACK_PADDING - 70 }
+
+// What stack point (x, y) is over: an entry, STACK_OPEN, or NONE.
+fn stackAt(dock: *Dock, x: i32, y: i32) -> usize {
+    if y >= 10 && y < STACK_HEADER - 8 && x >= openButtonLeft() && x < stackWidth() - STACK_PADDING { return STACK_OPEN }
+    if y < STACK_HEADER || x < STACK_PADDING || x >= stackWidth() - STACK_PADDING { return NONE }
+    const column = (x - STACK_PADDING) / STACK_CELL_WIDTH
+    const row = (y - STACK_HEADER) / STACK_CELL_HEIGHT
+    if row >= stackVisibleRows(dock) { return NONE }
+    const index = @intCast(usize, (row + dock.*.stackScroll) * STACK_COLUMNS + column)
+    return if index < listingOf(dock).*.count { index } else { NONE }
+}
+
+fn dropThumbs(dock: *Dock) -> void {
+    var index: usize = 0
+    while index < THUMBS {
+        if dock.*.thumbState[index] == 1 { png.deinit(thumbAt(dock, index)) }
+        dock.*.thumbState[index] = 0
+        index += 1
+    }
+}
+
+fn closeStack(dock: *Dock) -> void {
+    dock.*.stackOpening = 0
+    thumbs_module.clearQueue(picturesOf(dock))
+    panelOf(dock).*.tickInterval = 1000
+    if dock.*.stackItem == NONE { return }
+    dock.*.stackItem = NONE
+    dropThumbs(dock)
+    panel_menu.closeMenu(panelOf(dock))
+}
+
+fn openStack(dock: *Dock, index: usize) -> void {
+    const item = itemAt(dock, index)
+    var path: apps_module.Path = undefined
+    if !places.expand(dock.*.environment, appIdOf(item), &path) { return }
+    dropThumbs(dock)
+    places.list(apps_module.pathEnd(&path), listingOf(dock))
+    dock.*.stackScroll = 0
+    dock.*.stackHover = NONE
+    dock.*.stackItem = index
+    // Faster ticks while pictures may be coming (stackTick).
+    panelOf(dock).*.tickInterval = 150
+    panelOf(dock).*.nextTick = 0
+    dock.*.menuItem = NONE
+    dock.*.hover = NONE
+    dock.*.pointerIn = false
+    panelOf(dock).*.dirty = true
+    if !panel_menu.openMenu(panelOf(dock), item.*.x, barTop(dock) - 4, item.*.size, 4, panel_module.PLACE_TOP, @intCast(u32, stackWidth()), @intCast(u32, stackHeight(dock)), drawStack) { dock.*.stackItem = NONE }
+}
+
+// The path of entry `index` of the open stack (or the folder itself for
+// NONE) into `into`.
+fn stackPath(dock: *Dock, index: usize, into: *apps_module.Path) -> bool {
+    if dock.*.stackItem == NONE || dock.*.stackItem >= dock.*.itemCount { return false }
+    if !places.expand(dock.*.environment, appIdOf(itemAt(dock, dock.*.stackItem)), into) { return false }
+    if index != NONE {
+        apps_module.pathAdd(into, "/")
+        apps_module.pathAdd(into, places.listedName(listingOf(dock), index))
+    }
+    return true
+}
+
+fn stackClick(dock: *Dock, index: usize) -> void {
+    if dock.*.stackOpening != 0 { return }
+    var path: apps_module.Path = undefined
+    const found = stackPath(dock, if index == STACK_OPEN { NONE } else { index }, &path)
+    if !found {
+        closeStack(dock)
+        return
+    }
+    // A folder: the file manager's window grows out of the stack (the
+    // compositor closes it then).
+    const folder = index == STACK_OPEN || places.listedDirectory(listingOf(dock), index)
+    if folder && zoomFromStack(dock) {
+        dock.*.stackOpening = panel_module.milliseconds()
+        dock.*.stackHover = NONE
+        panel_menu.menuChanged(panelOf(dock))
+    } else {
+        closeStack(dock)
+    }
+    places.open(path.bytes[0..path.length], dock.*.environment)
+}
+
+// Tells the compositor the next window comes out of the stack (z); false
+// without it.
+fn zoomFromStack(dock: *Dock) -> bool {
+    if dock.*.channel < 0 { return false }
+    var byte: [1]u8 = [1]u8{ 122 }
+    const sent = std.linux.syscall6(44, @bitCast(usize, dock.*.channel), @intFromPtr(&byte), 1, 64 | 16384, 0, 0)
+    return sent == 1
+}
+
+// Tells the compositor the next window comes out of an item's icon (Z and
+// its rectangle on the dock).
+fn zoomFromItem(dock: *Dock, item: *Item) -> void {
+    if dock.*.channel < 0 { return }
+    const size = if item.*.size > 0 { item.*.size } else { ICON }
+    var values: [4]i32 = [4]i32{ item.*.x, barTop(dock) + BAR_HEIGHT - 8 - size, size, size }
+    var message: [17]u8 = undefined
+    message[0] = 90
+    var value: usize = 0
+    while value < 4 {
+        const bits = @bitCast(u32, values[value])
+        message[1 + value * 4] = @intCast(u8, bits & 255)
+        message[2 + value * 4] = @intCast(u8, (bits >> 8) & 255)
+        message[3 + value * 4] = @intCast(u8, (bits >> 16) & 255)
+        message[4 + value * 4] = @intCast(u8, bits >> 24)
+        value += 1
+    }
+    const sent = std.linux.syscall6(44, @bitCast(usize, dock.*.channel), @intFromPtr(&message), 17, 64 | 16384, 0, 0)
+}
+
+fn stackScrollBy(dock: *Dock, rows: i32) -> void {
+    const last = stackRows(dock) - stackVisibleRows(dock)
+    var scroll = dock.*.stackScroll + rows
+    if scroll > last { scroll = last }
+    if scroll < 0 { scroll = 0 }
+    if scroll == dock.*.stackScroll { return }
+    dock.*.stackScroll = scroll
+    dock.*.stackHover = NONE
+    panel_menu.menuChanged(panelOf(dock))
+}
+
+fn picturesOf(dock: *Dock) -> *thumbs_module.Thumbs {
+    unsafe { return @ptrCast(*thumbs_module.Thumbs, &dock.*.pictures) }
+}
+
+// The picture of entry `index` (from the thumbnail cache, a few each
+// drawing; the worker makes missing ones of PNG files), else null. Never
+// waits on the file itself: a folder of big screenshots opens at once.
+fn thumbOf(dock: *Dock, index: usize) -> ?*png.Image {
+    if index >= THUMBS || places.listedDirectory(listingOf(dock), index) { return null }
+    if dock.*.thumbState[index] == 0 {
+        if dock.*.thumbBudget == 0 {
+            dock.*.thumbState[index] = 3
+            return null
+        }
+        dock.*.thumbBudget -= 1
+        dock.*.thumbState[index] = 2
+        var path: apps_module.Path = undefined
+        if stackPath(dock, index, &path) {
+            const listing = listingOf(dock)
+            const modified = listing.*.times[listing.*.order[index]]
+            const found = thumbs_module.lookup(picturesOf(dock), path.bytes[0..path.length], modified, @intCast(usize, STACK_ICON), thumbAt(dock, index))
+            if found == thumbs_module.READY { dock.*.thumbState[index] = 1 }
+            if found == thumbs_module.COMING { dock.*.thumbState[index] = 3 }
+        }
+    }
+    if dock.*.thumbState[index] != 1 { return null }
+    return thumbAt(dock, index)
+}
+
+// While the stack shows: the thumbnail worker's progress, and the pictures
+// still coming looked up again.
+fn stackTick(dock: *Dock) -> void {
+    thumbs_module.pump(picturesOf(dock))
+    if dock.*.stackItem == NONE {
+        panelOf(dock).*.tickInterval = if thumbs_module.busy(picturesOf(dock)) { 150 } else { 1000 }
+        return
+    }
+    var waiting = false
+    var index: usize = 0
+    while index < THUMBS {
+        if dock.*.thumbState[index] == 3 {
+            dock.*.thumbState[index] = 0
+            waiting = true
+        }
+        index += 1
+    }
+    if waiting { panel_menu.menuChanged(panelOf(dock)) }
+    const panel = panelOf(dock)
+    panel.*.tickInterval = if waiting || thumbs_module.busy(picturesOf(dock)) { 150 } else { 1000 }
+}
+
+fn drawStack(context: *anyopaque, canvas: *Canvas) -> void {
+    const dock = dockOf(context)
+    dock.*.thumbBudget = THUMB_BUDGET
+    const width = @intCast(i32, canvas.*.width)
+    const height = @intCast(i32, canvas.*.height)
+    const small = smallOf(dock)
+    const white = canvas_module.color(255, 240, 242, 248)
+    canvas_module.clear(canvas, 0)
+    canvas_module.fillRoundedRect(canvas, 0, 0, width, height, 14, canvas_module.color(255, 30, 33, 42))
+    canvas_module.strokeRoundedRect(canvas, 0, 0, width, height, 14, 1, canvas_module.color(60, 255, 255, 255))
+    // The header: the folder's name and Open.
+    if dock.*.stackItem != NONE && dock.*.stackItem < dock.*.itemCount {
+        canvas_module.drawText(canvas, small, places.baseName(appIdOf(itemAt(dock, dock.*.stackItem))), STACK_PADDING + 4, 16, white, openButtonLeft() - STACK_PADDING - 12)
+    }
+    const button = if dock.*.stackHover == STACK_OPEN { canvas_module.color(255, 90, 160, 255) } else { canvas_module.color(255, 58, 62, 74) }
+    canvas_module.fillRoundedRect(canvas, openButtonLeft(), 10, 70, STACK_HEADER - 18, 8, button)
+    const open_width = canvas_module.measure(small, "Open")
+    canvas_module.drawText(canvas, small, "Open", openButtonLeft() + (70 - open_width) / 2, 15, white, 0)
+    canvas_module.fillRect(canvas, STACK_PADDING, STACK_HEADER - 2, width - STACK_PADDING * 2, 1, canvas_module.color(50, 255, 255, 255))
+    const listing = listingOf(dock)
+    if listing.*.count == 0 {
+        const empty = "No files"
+        canvas_module.drawText(canvas, small, empty, (width - canvas_module.measure(small, empty)) / 2, STACK_HEADER + 30, canvas_module.color(255, 140, 146, 160), 0)
+        return
+    }
+    var row: i32 = 0
+    while row < stackVisibleRows(dock) {
+        var column: i32 = 0
+        while column < STACK_COLUMNS {
+            const index = @intCast(usize, (row + dock.*.stackScroll) * STACK_COLUMNS + column)
+            if index < listing.*.count {
+                const x = STACK_PADDING + column * STACK_CELL_WIDTH
+                const y = STACK_HEADER + row * STACK_CELL_HEIGHT
+                if index == dock.*.stackHover { canvas_module.fillRoundedRect(canvas, x + 3, y + 3, STACK_CELL_WIDTH - 6, STACK_CELL_HEIGHT - 6, 10, canvas_module.color(255, 52, 58, 74)) }
+                const name = places.listedName(listing, index)
+                const icon_x = x + (STACK_CELL_WIDTH - STACK_ICON) / 2
+                const icon_y = y + 8
+                const thumb = thumbOf(dock, index)
+                if places.listedDirectory(listing, index) {
+                    icons.drawFolder(smallOf(dock), canvas, name, icon_x, icon_y, STACK_ICON)
+                } else if thumb != null {
+                    const image = thumb.?
+                    const w = @intCast(i32, image.*.width)
+                    const h = @intCast(i32, image.*.height)
+                    canvas_module.drawImageRect(canvas, image, icon_x + (STACK_ICON - w) / 2, icon_y + (STACK_ICON - h) / 2, w, h, 255)
+                } else {
+                    icons.drawFile(small, canvas, name, icon_x, icon_y, STACK_ICON)
+                }
+                var buffer: [100]u8 = undefined
+                var bytes: [*]u8 = undefined
+                unsafe { bytes = @ptrCast([*]u8, &buffer) }
+                const shown = icons.fitText(small, name, STACK_CELL_WIDTH - 8, bytes)
+                canvas_module.drawText(canvas, small, shown, x + (STACK_CELL_WIDTH - canvas_module.measure(small, shown)) / 2, icon_y + STACK_ICON + 6, white, 0)
+            }
+            column += 1
+        }
+        row += 1
+    }
+    // Where the rows shown are among all of them.
+    const rows = stackRows(dock)
+    if rows > STACK_ROWS {
+        const track = height - STACK_HEADER - STACK_PADDING - 8
+        const bar = track * STACK_ROWS / rows
+        const top = STACK_HEADER + 4 + track * dock.*.stackScroll / rows
+        canvas_module.fillRoundedRect(canvas, width - 8, top, 4, bar, 2, canvas_module.color(110, 255, 255, 255))
+    }
+}
+
+fn openMenu(dock: *Dock, index: usize) -> void {
+    const item = itemAt(dock, index)
+    if item.*.kind == KIND_APPS { return }
+    const menu = menuOf(dock)
+    menu_module.clear(menu)
+    if item.*.kind == KIND_FOLDER {
+        menu_module.add(menu, "Open", MENU_OPEN, 0)
+        menu_module.separator(menu)
+        menu_module.add(menu, "Remove from Dock", MENU_REMOVE, 0)
+        showMenu(dock, index)
+        return
+    }
+    if item.*.kind == KIND_TRASH {
+        menu_module.add(menu, "Open", MENU_OPEN, 0)
+        if places.trashFull(dock.*.environment) {
+            menu_module.separator(menu)
+            menu_module.add(menu, "Empty Trash", MENU_EMPTY_TRASH, 0)
+        }
+        showMenu(dock, index)
+        return
+    }
+    actionsOf(dock).*.count = 0
+    if item.*.kind == KIND_APP {
+        const app = apps_module.appAt(appsOf(dock), item.*.app)
+        apps_module.loadActions(appsOf(dock), app, actionsOf(dock))
+        var action: usize = 0
+        while action < actionsOf(dock).*.count {
+            menu_module.add(menu, apps_module.actionName(actionsOf(dock), action), MENU_ACTION, action)
+            action += 1
+        }
+    }
+    if (item.*.kind == KIND_APP && actionsOf(dock).*.count == 0) || item.*.kind == KIND_TERMINAL { menu_module.add(menu, "New Window", MENU_NEW_WINDOW, 0) }
+    menu_module.separator(menu)
+    const pinned = index >= firstPinned(dock) && index < dock.*.pinnedCount
+    if item.*.kind == KIND_APP || item.*.kind == KIND_TERMINAL {
+        if pinned { menu_module.add(menu, "Unpin from Dock", MENU_UNPIN, 0) } else { menu_module.add(menu, "Pin to Dock", MENU_PIN, 0) }
+    }
+    if item.*.running > 0 {
+        menu_module.separator(menu)
+        menu_module.add(menu, if item.*.running > 1 { "Close All Windows" } else { "Close Window" }, MENU_CLOSE, 0)
+    }
+    showMenu(dock, index)
+}
+
+fn choose(dock: *Dock, entry: usize) -> void {
+    const index = dock.*.menuItem
+    closeMenu(dock)
+    if index == NONE || index >= dock.*.itemCount || entry >= menuOf(dock).*.count { return }
+    const item = itemAt(dock, index)
+    const kind = menu_module.kindAt(menuOf(dock), entry)
+    if kind == MENU_ACTION && item.*.kind == KIND_APP {
+        apps_module.runAction(apps_module.appAt(appsOf(dock), item.*.app), actionsOf(dock), menu_module.valueAt(menuOf(dock), entry), dock.*.terminal, dock.*.environment)
+    } else if kind == MENU_NEW_WINDOW {
+        if item.*.kind == KIND_TERMINAL {
+            var length: usize = 0
+            while dock.*.terminal[length] != 0 { length += 1 }
+            apps_module.run(dock.*.terminal[0..length], noString(), dock.*.environment)
+        } else if item.*.kind == KIND_APP {
+            apps_module.launch(apps_module.appAt(appsOf(dock), item.*.app), dock.*.terminal, dock.*.environment)
+        }
+    } else if kind == MENU_PIN || kind == MENU_UNPIN {
+        var pins: pins_module.Pins = undefined
+        currentPins(dock, &pins)
+        const id = pinId(dock, item)
+        if kind == MENU_PIN { pins_module.insert(&pins, id, pins.count) } else { pins_module.remove(&pins, pins_module.find(&pins, id)) }
+        savePins(dock, &pins)
+    } else if kind == MENU_OPEN || kind == MENU_STACK_ENTRY {
+        if kind == MENU_OPEN { zoomFromItem(dock, item) }
+        if item.*.kind == KIND_TRASH {
+            places.openTrash(dock.*.environment)
+            return
+        }
+        var path: apps_module.Path = undefined
+        if !places.expand(dock.*.environment, appIdOf(item), &path) { return }
+        if kind == MENU_STACK_ENTRY {
+            apps_module.pathAdd(&path, "/")
+            apps_module.pathAdd(&path, places.nameAt(stackOf(dock), menu_module.valueAt(menuOf(dock), entry)))
+        }
+        places.open(path.bytes[0..path.length], dock.*.environment)
+    } else if kind == MENU_REMOVE {
+        pins_module.remove(foldersOf(dock), pins_module.find(foldersOf(dock), appIdOf(item)))
+        saveFolders(dock)
+    } else if kind == MENU_EMPTY_TRASH {
+        places.emptyTrash(dock.*.environment)
+    } else if kind == MENU_CLOSE {
+        const panel = panelOf(dock)
+        var window: usize = 0
+        while window < panel.*.windowCount {
+            const each = panel_module.windowAt(panel, window)
+            if owns(dock, item, each) { each.*.handle.close() }
+            window += 1
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Dropping an app on the dock pins it where it is dropped.
+
+// Where among the pins a drop at x goes.
+fn dropIndex(dock: *Dock, x: i32) -> usize {
+    var count: usize = 0
+    var index = firstPinned(dock)
+    while index < dock.*.pinnedCount {
+        const item = itemAt(dock, index)
+        if x > item.*.x + item.*.size / 2 { count += 1 }
+        index += 1
+    }
+    return count
+}
+
+// The trash is under x.
+fn overTrash(dock: *Dock, x: i32) -> bool {
+    const index = itemUnder(dock, x)
+    return index != NONE && itemAt(dock, index).*.kind == KIND_TRASH
+}
+
+fn saveFolders(dock: *Dock) -> void {
+    if !pins_module.write(dock.*.environment, pins_module.FOLDERS, foldersOf(dock)) { return }
+    dock.*.foldersSignature = pinsSignature(dock, pins_module.FOLDERS)
+    reloadItems(dock)
+}
+
+fn drop(dock: *Dock, x: i32) -> void {
+    const data = panel_drag.dropDataOf(panelOf(dock))
+    const on_trash = dock.*.dropOnTrash
+    dock.*.dropAt = NONE
+    dock.*.dropOnTrash = false
+    dock.*.pointerIn = false
+    // Files dropped on the trash go into it.
+    if on_trash {
+        if places.moveToTrash(data, dock.*.environment) > 0 { say("mlx-dock: moved to the trash\n") }
+        return
+    }
+    // A folder is pinned among the folders.
+    var path: apps_module.Path = undefined
+    if places.uriPath(data, 0, &path) && places.isDirectory(apps_module.pathEnd(&path)) {
+        pins_module.insert(foldersOf(dock), path.bytes[0..path.length], foldersOf(dock).*.count)
+        saveFolders(dock)
+        say("mlx-dock: pinned the folder ")
+        say(path.bytes[0..path.length])
+        say("\n")
+        return
+    }
+    const id = pins_module.idFromUri(data)
+    if id.length == 0 { return }
+    const apps = appsOf(dock)
+    const app = apps_module.find(apps, id)
+    if app >= apps.*.count { return }
+    var pins: pins_module.Pins = undefined
+    currentPins(dock, &pins)
+    const own = apps_module.idOf(apps_module.appAt(apps, app))
+    const at = dropIndex(dock, x)
+    // Dropped again elsewhere: moved there.
+    const already = pins_module.find(&pins, own)
+    if already < pins.count {
+        pins_module.remove(&pins, already)
+        pins_module.insert(&pins, own, if at > already { at - 1 } else { at })
+    } else {
+        pins_module.insert(&pins, own, at)
+    }
+    savePins(dock, &pins)
+    say("mlx-dock: pinned ")
+    say(own)
+    say("\n")
+}
+
+fn say(text: []const u8) -> void {
+    const written = std.io.writeAll(std.io.stdout(), text)
+}
+
+fn onEvent(context: *anyopaque, kind: u32, a: u32, b: i32) -> void {
+    const dock = dockOf(context)
+    const panel = panelOf(dock)
+    if kind == panel_module.EVENT_CONFIGURED {
+        // The pointer counts on the bar's strip only; above it, clicks go
+        // to what is behind.
+        var rects: [4]i32 = [4]i32{ 0, barTop(dock), @intCast(i32, panel.*.width), BAR_HEIGHT + GAP }
+        unsafe { panel_module.setInput(panel, @ptrCast([*]const i32, &rects), 1) }
+        dock.*.blurWidth = 0
+    } else if kind == panel_module.EVENT_MOTION {
+        dock.*.pointerX = @bitCast(i32, a)
+        dock.*.pointerIn = true
+        layout(dock)
+        dock.*.hover = itemUnder(dock, dock.*.pointerX)
+    } else if kind == panel_module.EVENT_LEAVE {
+        dock.*.pointerIn = false
+        dock.*.hover = NONE
+    } else if kind == panel_module.EVENT_BUTTON {
+        if a == BUTTON_LEFT && b == 1 && dock.*.hover != NONE { click(dock, dock.*.hover) }
+        if a == BUTTON_RIGHT && b == 1 && dock.*.hover != NONE { openMenu(dock, dock.*.hover) }
+    } else if kind == panel_module.EVENT_MENU_MOTION && dock.*.stackItem != NONE {
+        const hover = stackAt(dock, @bitCast(i32, a), b)
+        if hover != dock.*.stackHover {
+            dock.*.stackHover = hover
+            panel_menu.menuChanged(panel)
+        }
+        return
+    } else if kind == panel_module.EVENT_MENU_LEAVE && dock.*.stackItem != NONE {
+        dock.*.stackHover = NONE
+        panel_menu.menuChanged(panel)
+        return
+    } else if kind == panel_module.EVENT_MENU_BUTTON && dock.*.stackItem != NONE {
+        if a == BUTTON_LEFT && b == 0 && dock.*.stackHover != NONE { stackClick(dock, dock.*.stackHover) }
+    } else if kind == panel_module.EVENT_MENU_WHEEL {
+        if dock.*.stackItem != NONE { stackScrollBy(dock, b) }
+        return
+    } else if kind == panel_module.EVENT_MENU_MOTION {
+        if menu_module.hover(menuOf(dock), b) { panel_menu.menuChanged(panel) }
+        return
+    } else if kind == panel_module.EVENT_MENU_LEAVE {
+        menuOf(dock).*.hover = menu_module.NONE
+        panel_menu.menuChanged(panel)
+        return
+    } else if kind == panel_module.EVENT_MENU_BUTTON {
+        if b == 0 && menuOf(dock).*.hover != menu_module.NONE { choose(dock, menuOf(dock).*.hover) }
+    } else if kind == panel_module.EVENT_MENU_CLOSED {
+        dock.*.menuItem = NONE
+        dock.*.stackOpening = 0
+        if dock.*.stackItem != NONE {
+            dock.*.stackItem = NONE
+            dropThumbs(dock)
+        }
+    } else if kind == panel_module.EVENT_DRAG_MOTION {
+        // An app dragged over the dock: the icons make room where it goes.
+        dock.*.pointerX = @bitCast(i32, a)
+        dock.*.pointerIn = true
+        layout(dock)
+        dock.*.dropOnTrash = overTrash(dock, dock.*.pointerX)
+        dock.*.dropAt = if dock.*.dropOnTrash { NONE } else { dropIndex(dock, dock.*.pointerX) }
+        dock.*.hover = NONE
+    } else if kind == panel_module.EVENT_DRAG_LEAVE {
+        dock.*.dropAt = NONE
+        dock.*.dropOnTrash = false
+        dock.*.pointerIn = false
+    } else if kind == panel_module.EVENT_DROP {
+        layout(dock)
+        drop(dock, @bitCast(i32, a))
+    } else if kind == panel_module.EVENT_WINDOWS {
+        rebuild(dock)
+    } else if kind == panel_module.EVENT_TICK {
+        stackTick(dock)
+        const now = panel_module.milliseconds()
+        if now >= dock.*.lastRefresh + 900 {
+            dock.*.lastRefresh = now
+            refresh(dock)
+        }
+        return
+    } else if kind == panel_module.EVENT_WATCH {
+        listen(dock)
+        return
+    }
+    panel.*.dirty = true
+}
+
+// ---------------------------------------------------------------------------
+// Drawing
+
+fn drawLetter(dock: *Dock, canvas: *Canvas, name: []const u8, x: i32, y: i32, size: i32) -> void {
+    canvas_module.fillRoundedRect(canvas, x + size / 24, y + size / 24, size - size / 12, size - size / 12, size / 4, apps_module.tileColor(name))
+    if name.length == 0 { return }
+    var letter: [1]u8 = [1]u8{ name[0] }
+    if letter[0] >= 97 && letter[0] <= 122 { letter[0] -= 32 }
+    const large = largeOf(dock)
+    const width = canvas_module.measure(large, letter[0..1])
+    canvas_module.drawText(canvas, large, letter[0..1], x + (size - width) / 2, y + (size - 30) / 2, 4294967295, 0)
+}
+
+fn drawAppsIcon(canvas: *Canvas, x: i32, y: i32, size: i32) -> void {
+    canvas_module.fillRoundedRect(canvas, x + size / 24, y + size / 24, size - size / 12, size - size / 12, size / 4, canvas_module.color(255, 88, 96, 112))
+    const dot = size / 8
+    const step = size / 4
+    var row: i32 = 0
+    while row < 3 {
+        var column: i32 = 0
+        while column < 3 {
+            canvas_module.fillRoundedRect(canvas, x + step * (column + 1) - dot / 2, y + step * (row + 1) - dot / 2, dot, dot, dot / 2, canvas_module.color(235, 255, 255, 255))
+            column += 1
+        }
+        row += 1
+    }
+}
+
+fn drawTerminalIcon(dock: *Dock, canvas: *Canvas, x: i32, y: i32, size: i32) -> void {
+    canvas_module.fillRoundedRect(canvas, x + size / 24, y + size / 24, size - size / 12, size - size / 12, size / 4, canvas_module.color(255, 30, 32, 38))
+    canvas_module.strokeRoundedRect(canvas, x + size / 24, y + size / 24, size - size / 12, size - size / 12, size / 4, 1, canvas_module.color(90, 255, 255, 255))
+    const small = smallOf(dock)
+    const width = canvas_module.measure(small, ">_")
+    canvas_module.drawText(canvas, small, ">_", x + (size - width) / 2, y + (size - 16) / 2, canvas_module.color(255, 120, 220, 140), 0)
+}
+
+fn drawItem(dock: *Dock, canvas: *Canvas, item: *Item, y: i32) -> void {
+    const size = item.*.size
+    if item.*.kind == KIND_APPS {
+        drawAppsIcon(canvas, item.*.x, y, size)
+    } else if item.*.kind == KIND_TERMINAL {
+        drawTerminalIcon(dock, canvas, item.*.x, y, size)
+    } else if item.*.kind == KIND_FOLDER {
+        icons.drawFolder(smallOf(dock), canvas, appIdOf(item), item.*.x, y, size)
+    } else if item.*.kind == KIND_TRASH {
+        icons.drawTrash(canvas, item.*.x, y, size, dock.*.trashFull, dock.*.dropOnTrash)
+    } else if item.*.kind == KIND_APP {
+        const app = apps_module.appAt(appsOf(dock), item.*.app)
+        if apps_module.loadIcon(appsOf(dock), app, @intCast(usize, MAX_ICON)) {
+            canvas_module.drawImage(canvas, apps_module.imageOf(app), item.*.x, y, size, 255)
+        } else {
+            drawLetter(dock, canvas, apps_module.nameOf(app), item.*.x, y, size)
+        }
+    } else {
+        drawLetter(dock, canvas, appIdOf(item), item.*.x, y, size)
+    }
+}
+
+// The name above the item under the pointer.
+fn drawName(dock: *Dock, canvas: *Canvas, item: *Item, icon_top: i32) -> void {
+    const small = smallOf(dock)
+    const name = nameOf(dock, item)
+    const width = canvas_module.measure(small, name) + 20
+    var left = item.*.x + item.*.size / 2 - width / 2
+    if left < 2 { left = 2 }
+    const surface_width = @intCast(i32, panelOf(dock).*.width)
+    if left + width > surface_width - 2 { left = surface_width - 2 - width }
+    const top = icon_top - 34
+    canvas_module.fillRoundedRect(canvas, left, top, width, 26, 9, canvas_module.color(225, 28, 30, 36))
+    canvas_module.drawText(canvas, small, name, left + 10, top + 5, 4294967295, 0)
+}
+
+fn draw(context: *anyopaque, canvas: *Canvas) -> void {
+    const dock = dockOf(context)
+    const panel = panelOf(dock)
+    layout(dock)
+    canvas_module.clear(canvas, 0)
+    const top = barTop(dock)
+    // The bar, and the blur behind it when it moved.
+    if dock.*.barLeft != dock.*.blurLeft || dock.*.barWidth != dock.*.blurWidth {
+        var rects: [36]i32 = undefined
+        var count: usize = 0
+        unsafe { count = panel_module.roundedRects(@ptrCast([*]i32, &rects), dock.*.barLeft, top, dock.*.barWidth, BAR_HEIGHT, RADIUS, 4) }
+        unsafe { panel_module.setBlur(panel, @ptrCast([*]const i32, &rects), count) }
+        dock.*.blurLeft = dock.*.barLeft
+        dock.*.blurWidth = dock.*.barWidth
+    }
+    canvas_module.fillRoundedRect(canvas, dock.*.barLeft, top, dock.*.barWidth, BAR_HEIGHT, RADIUS, canvas_module.color(150, 40, 44, 54))
+    canvas_module.strokeRoundedRect(canvas, dock.*.barLeft, top, dock.*.barWidth, BAR_HEIGHT, RADIUS, 1, canvas_module.color(70, 255, 255, 255))
+
+    var index: usize = 0
+    while index < dock.*.itemCount {
+        const item = itemAt(dock, index)
+        if separatorBefore(dock, index) {
+            canvas_module.fillRect(canvas, item.*.x - SPACING / 2 - SEPARATOR / 2 - 1, top + 12, 1, BAR_HEIGHT - 24, canvas_module.color(80, 255, 255, 255))
+        }
+        const icon_top = top + BAR_HEIGHT - 8 - item.*.size
+        drawItem(dock, canvas, item, icon_top)
+        if item.*.running > 0 {
+            const dot_color = if item.*.active { canvas_module.color(255, 255, 255, 255) } else { canvas_module.color(170, 255, 255, 255) }
+            canvas_module.fillRoundedRect(canvas, item.*.x + item.*.size / 2 - 2, top + BAR_HEIGHT - 6, 5, 5, 2, dot_color)
+        }
+        index += 1
+    }
+    if dock.*.hover != NONE && dock.*.hover < dock.*.itemCount {
+        const item = itemAt(dock, dock.*.hover)
+        drawName(dock, canvas, item, top + BAR_HEIGHT - 8 - item.*.size)
+    }
+    // Where a dragged app would be pinned.
+    if dock.*.dropAt != NONE {
+        const slot = firstPinned(dock) + dock.*.dropAt
+        var x = dock.*.barLeft + PADDING
+        if slot < dock.*.itemCount && slot < dock.*.pinnedCount {
+            x = itemAt(dock, slot).*.x - SPACING / 2
+        } else if dock.*.pinnedCount > 0 {
+            const last = itemAt(dock, dock.*.pinnedCount - 1)
+            x = last.*.x + last.*.size + SPACING / 2
+        }
+        canvas_module.fillRoundedRect(canvas, x - 2, top + 8, 4, BAR_HEIGHT - 16, 2, canvas_module.color(255, 90, 160, 255))
+    }
+}
+
+const Failure = error { NoMemory }
+
+fn noMemory() -> Failure!void { return Failure.NoMemory }
+
+pub fn main(arguments: [][*]const u8) -> !void {
+    // A crash says where (in the compositor's log, which has our output).
+    const reporting = crash.install()
+    const allocator = std.page_allocator.init()
+    const environment = std.process.environmentEntries(arguments)
+    const memory = allocator.alloc(@sizeOf(Dock), 16)
+    if memory == null { return noMemory() }
+    var dock: *Dock = undefined
+    unsafe { dock = @ptrCast(*Dock, memory.?) }
+    dock.*.environment = environment
+    dock.*.terminal = apps_module.environmentValue(environment, "MLX_TERMINAL")
+    if @intFromPtr(dock.*.terminal) == 0 {
+        unsafe { dock.*.terminal = @ptrCast([*]const u8, "mlx-terminal") }
+    }
+    dock.*.launcher = apps_module.environmentValue(environment, "MLX_LAUNCHER")
+    dock.*.itemCount = 0
+    dock.*.pointerIn = false
+    dock.*.pointerX = 0
+    dock.*.hover = NONE
+    dock.*.menuItem = NONE
+    dock.*.dropAt = NONE
+    dock.*.dropOnTrash = false
+    dock.*.folderStart = 0
+    dock.*.stackItem = NONE
+    dock.*.stackOpening = 0
+    dock.*.lastRefresh = 0
+    thumbs_module.init(picturesOf(dock), environment, allocator)
+    var thumb: usize = 0
+    while thumb < THUMBS {
+        dock.*.thumbState[thumb] = 0
+        thumb += 1
+    }
+    dock.*.blurLeft = 0
+    dock.*.blurWidth = 0
+    const channel = apps_module.environmentValue(environment, "MLX_DOCK_FD")
+    dock.*.channel = -1
+    if @intFromPtr(channel) != 0 && channel[0] >= 48 && channel[0] <= 57 {
+        var descriptor: isize = 0
+        var digit: usize = 0
+        while channel[digit] >= 48 && channel[digit] <= 57 {
+            descriptor = descriptor * 10 + @intCast(isize, channel[digit] - 48)
+            digit += 1
+        }
+        dock.*.channel = descriptor
+    }
+    if !apps_module.init(appsOf(dock), environment, allocator) { return noMemory() }
+    apps_module.scan(appsOf(dock))
+    dock.*.appsSignature = apps_module.signature(appsOf(dock))
+    dock.*.configSignature = configSignature(dock)
+    if dock.*.channel >= 0 || @intFromPtr(dock.*.launcher) != 0 { const item = addItem(dock, KIND_APPS, NONE, "") }
+    if !pinConfigured(dock) {
+        // The defaults go into the file, for the launcher and the menu to
+        // change.
+        pinDefaults(dock)
+        dock.*.pinnedCount = dock.*.itemCount
+        var pins: pins_module.Pins = undefined
+        currentPins(dock, &pins)
+        if pins_module.write(environment, pins_module.APPS, &pins) { dock.*.configSignature = configSignature(dock) }
+    }
+    dock.*.pinnedCount = dock.*.itemCount
+    loadFolders(dock)
+    dock.*.foldersSignature = pinsSignature(dock, pins_module.FOLDERS)
+    dock.*.trashFull = places.trashFull(environment)
+    appendPlaces(dock)
+    const loaded_small = canvas_module.loadText(smallOf(dock), 13, allocator)
+    const loaded_large = canvas_module.loadText(largeOf(dock), 26, allocator)
+
+    const panel = panelOf(dock)
+    panel.*.context = @ptrCast(*anyopaque, dock)
+    panel.*.draw = draw
+    panel.*.event = onEvent
+    const anchor = panel_module.ANCHOR_BOTTOM
+    try panel_module.open(panel, allocator, arguments, "mlx-dock", panel_module.LAYER_TOP, anchor, @intCast(u32, baseWidth(dock) + EXTRA_WIDTH), @intCast(u32, HEIGHT), BAR_HEIGHT + GAP, 0, panel_module.KEYBOARD_NONE, true)
+    // New apps and a changed configuration are taken in within a second;
+    // the compositor's end of the channel going ends us. Apps dropped on
+    // it come as desktop entry files (text/uri-list).
+    panel_module.report(panel, "mlx-dock")
+    panel_drag.acceptDrops(panel, "text/uri-list")
+    panel.*.tickInterval = 1000
+    panel.*.watch = dock.*.channel
+    try panel_module.run(panel)
+    panel_module.close(panel)
+}

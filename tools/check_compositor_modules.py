@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Checks that the compositor's shell lists every handler it registers.
 
-When the shell module is loaded again (examples/wayland-compositor/modules.mlx),
+When the shell module is loaded again (projects/desktop/compositor/modules.mlx),
 each handler the Wayland server holds is replaced by the new code's function of
 the same name, from the tables handlerAddress/handlerName at the end of
 shell.mlx, protocols.mlx, data.mlx, dmabuf.mlx and pointer.mlx. A function registered with setHandler,

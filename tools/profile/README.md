@@ -38,7 +38,7 @@ profile <TAB> program <TAB> seconds since 1970 <TAB> samples <TAB> interval in Â
 self <TAB> total <TAB> function
 ```
 
-[MLX Observatory](../../examples/mlx-observatory/README.md) reads the newest
+[MLX Observatory](../../projects/observatory/README.md) reads the newest
 profile of each program. It shows them in two places: the *Hot* finding
 lists them, and *Color by â†’ Run time* colors the galaxy by them. The
 codemap notices new profiles while it is open. `mlx-codemap hot` lists

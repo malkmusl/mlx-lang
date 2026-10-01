@@ -35,7 +35,7 @@ path.
 `wl_shm` and xdg-shell, including the Mlx compositor:
 
 ```sh
-mlx4 examples/wayland-compositor/main.mlx -o mlx-compositor
+mlx4 projects/desktop/compositor/main.mlx -o mlx-compositor
 ./mlx-compositor --renderer vulkan --run ./vulkan-wayland-client
 ```
 

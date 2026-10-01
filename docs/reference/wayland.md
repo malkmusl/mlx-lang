@@ -457,7 +457,7 @@ same type), keeping each one's context, and returns how many it replaced.
 It is for code loaded again while the server runs: the compositor's shell
 is a shared object that registers the handlers, and after a new build is
 loaded every resource carries on in the new code
-(`examples/wayland-compositor/modules.mlx`).
+(`projects/desktop/compositor/modules.mlx`).
 `tests/244_wayland_client_server_runtime.mlx` replaces the compositor
 global's bind handler before its clients bind and checks the replacement
 ran for both.
@@ -482,7 +482,7 @@ of wl_surface 12)`).
 
 Every Wayland client in `examples/` and `tools/` calls `crash.watch` on its
 display right after connecting
-([`examples/wayland-compositor/crash.mlx`](../../examples/wayland-compositor/crash.mlx);
+([`projects/desktop/compositor/crash.mlx`](../../projects/desktop/compositor/crash.mlx);
 the desktop apps get it from `panel.mlx`). When the connection fails, the
 program says why and where, `NAME: failed: the compositor ended the
 connection: protocol error 0 on wl_data_offer 45: ...` or `a request used an
@@ -520,7 +520,7 @@ that runs a roundtrip reads its own arguments intact afterwards.
 
 Two programs use both halves of `std.wayland` with real input:
 
-- [`examples/wayland-compositor`](../../examples/wayland-compositor/README.md)
+- [`projects/desktop/compositor`](../../projects/desktop/compositor/README.md)
   is a compositor that runs freestanding (DRM/KMS output, evdev input, the
   devices and VT switching from systemd-logind over its own D-Bus client,
   the keymap from libxkbcommon) or nested. Nested, it is a client of the
@@ -546,7 +546,7 @@ Two programs use both halves of `std.wayland` with real input:
   `install_compositor.sh` installs it as a GDM/SDDM session
   (inside cage or weston's kiosk shell). It waits on
   both connections with `wl.transport.waitAny`.
-- [`examples/wayland-terminal`](../../examples/wayland-terminal/README.md)
+- [`projects/desktop/terminal`](../../projects/desktop/terminal/README.md)
   is a terminal emulator: a shell on a pseudo-terminal, keyboard input with
   key repeat, and a built-in bitmap font.
 
@@ -578,7 +578,7 @@ buffer lacks must equal frames composed from scratch.
 
 The shell and the renderer can run as shared objects that the compositor
 loads again whenever they are rebuilt, while its clients stay connected
-(`examples/wayland-compositor/modules.mlx`, built with `mlx4 --shared`):
+(`projects/desktop/compositor/modules.mlx`, built with `mlx4 --shared`):
 every handler the shell registered is moved to the new build with
 `Display.replaceHandler`. `tools/check_compositor_modules.sh` replaces both
 while a terminal is open and checks that the terminal keeps working and
@@ -586,7 +586,7 @@ the changes show.
 
 The compositor runs for days within the compiler's value arena (see
 [Message storage](#message-storage)): its event loop is a fixed point, so
-`examples/wayland-compositor/arena.mlx` notes the arena's fill before the
+`projects/desktop/compositor/arena.mlx` notes the arena's fill before the
 loop's first turn and restores it at the start of every turn, releasing
 what the turn's handlers and frame allocated (everything that outlives a
 turn is memory from the allocator or was allocated before the loop). The
@@ -597,10 +597,10 @@ released bytes so a value wrongly kept across turns shows up;
 ### A dock and a launcher
 
 The desktop parts beyond windows are Wayland clients of the compositor as
-well: [`examples/mlx-dock`](../../examples/mlx-dock/main.mlx) along the
-bottom edge and [`examples/mlx-launcher`](../../examples/mlx-launcher/main.mlx),
+well: [`projects/desktop/dock`](../../projects/desktop/dock/main.mlx) along the
+bottom edge and [`projects/desktop/launcher`](../../projects/desktop/launcher/main.mlx),
 which Super opens in the middle of the screen (see the compositor's
-[README](../../examples/wayland-compositor/README.md#dock-and-launcher)).
+[README](../../projects/desktop/compositor/README.md#dock-and-launcher)).
 The compositor offers them three more protocols, materialized like the
 others from `std/protocols/wayland` (`wlr-layer-shell-unstable-v1.xml`,
 `wlr-foreign-toplevel-management-unstable-v1.xml` and
@@ -619,7 +619,7 @@ others from `std/protocols/wayland` (`wlr-layer-shell-unstable-v1.xml`,
   kernels (`examples/vulkan-shared/shaders.mlx`) that give the same
   pixels; the damage around a blurred surface grows by the blur's reach.
 
-Their shared code is in `examples/desktop-shared`: a layer surface with
+Their shared code is in `projects/desktop/shared`: a layer surface with
 its buffers, pointer and keyboard (key repeat, the keymap through
 libxkbcommon) and the window list (`panel.mlx`), drawing with smooth
 rounded shapes, images and `std.truetype` text (`canvas.mlx`), and the

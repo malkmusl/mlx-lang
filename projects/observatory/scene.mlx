@@ -1,0 +1,589 @@
+// The 3D view's renderer: the app hands it what the camera sees as flat
+// primitives (lit spheres, glows, lines, in view pixels, each with its
+// depth), it sorts them back to front, bins them into the 16x16 tiles of
+// the view and has scene_shader.mlx draw them on the GPU, under what the
+// 2D canvas drew (panel.mlx's Scene hook). Without a GPU, drawCpu draws the
+// same picture into the canvas's pixels, before the canvas draws on them.
+//
+//     scene.begin(&scene, view_x, view_y, view_width, view_height)
+//     scene.sphere(&scene, x, y, radius, color, depth)   // and glow, line
+//     scene.render(&scene, gpu_context, target, width, height)
+const std = @import("std")
+const vk = @import("std.vulkan")
+const gpu = @import("../../examples/vulkan-shared/gpu.mlx")
+const shader = @import("./scene_shader.mlx")
+const m = @import("./math3d.mlx")
+
+pub const Allocator = std.allocator.Allocator
+
+pub const MAX_PRIMITIVES: usize = 131072
+const MAX_TILES: usize = 65536
+const MAX_INDICES: usize = 8388608
+const WORDS: usize = 8
+const TILE: i32 = 16
+
+pub const Scene = struct {
+    allocator: Allocator
+    // The primitives (shader.PRIM_WORDS words each), their depths, the
+    // tiles they touch (a box, in tiles) and the order to draw them in.
+    words: [*]u32
+    depths: [*]f64
+    boxes: [*]i32
+    order: [*]u32
+    scratch: [*]u32
+    count: usize
+    // The view: where it is in the frame, its tiles.
+    viewX: i32
+    viewY: i32
+    viewWidth: i32
+    viewHeight: i32
+    tilesX: i32
+    tilesY: i32
+    // Per tile: where its list starts and how many; the lists.
+    starts: [*]u32
+    counts: [*]u32
+    stamps: [*]u32
+    stamp: u32
+    indices: [*]u32
+    indexCount: usize
+    touched: usize
+    // Set when the lists did not fit (what came last is left out).
+    full: bool
+    // The GPU side: made on the first render.
+    ready: bool
+    failed: bool
+    kernel: gpu.Kernel
+    buffer: gpu.Buffer
+    bufferBytes: usize
+}
+
+fn allocateWords(allocator: Allocator, count: usize) -> [*]u32 {
+    const memory = allocator.alloc(count * 4, 16)
+    unsafe { return @ptrCast([*]u32, memory.?) }
+}
+
+pub fn init(scene: *Scene, allocator: Allocator) -> void {
+    scene.*.allocator = allocator
+    scene.*.words = allocateWords(allocator, MAX_PRIMITIVES * WORDS)
+    const depths = allocator.alloc(MAX_PRIMITIVES * 8, 16)
+    unsafe { scene.*.depths = @ptrCast([*]f64, depths.?) }
+    const boxes = allocator.alloc(MAX_PRIMITIVES * 16, 16)
+    unsafe { scene.*.boxes = @ptrCast([*]i32, boxes.?) }
+    scene.*.order = allocateWords(allocator, MAX_PRIMITIVES)
+    scene.*.scratch = allocateWords(allocator, MAX_PRIMITIVES)
+    scene.*.starts = allocateWords(allocator, MAX_TILES)
+    scene.*.counts = allocateWords(allocator, MAX_TILES)
+    scene.*.stamps = allocateWords(allocator, MAX_TILES)
+    scene.*.indices = allocateWords(allocator, MAX_INDICES)
+    var tile: usize = 0
+    while tile < MAX_TILES {
+        scene.*.stamps[tile] = 0
+        tile += 1
+    }
+    scene.*.stamp = 0
+    scene.*.count = 0
+    scene.*.indexCount = 0
+    scene.*.full = false
+    scene.*.ready = false
+    scene.*.failed = false
+    scene.*.bufferBytes = 0
+    scene.*.viewWidth = 0
+    scene.*.viewHeight = 0
+}
+
+// A new frame for the view at (x, y), width x height pixels of the window.
+pub fn begin(scene: *Scene, x: i32, y: i32, width: i32, height: i32) -> void {
+    scene.*.viewX = x
+    scene.*.viewY = y
+    scene.*.viewWidth = if width > 0 { width } else { 0 }
+    scene.*.viewHeight = if height > 0 { height } else { 0 }
+    scene.*.tilesX = (scene.*.viewWidth + TILE - 1) / TILE
+    scene.*.tilesY = (scene.*.viewHeight + TILE - 1) / TILE
+    // A view larger than the tiles go: its lower part stays empty.
+    while scene.*.tilesX * scene.*.tilesY > @intCast(i32, MAX_TILES) { scene.*.tilesY -= 1 }
+    scene.*.count = 0
+    scene.*.full = false
+}
+
+fn bitsOf(value: f64) -> u32 {
+    const small: f32 = @floatCast(f32, value)
+    return @bitCast(u32, small)
+}
+
+fn floatOf(bits: u32) -> f64 {
+    const small: f32 = @bitCast(f32, bits)
+    const wide: f64 = @floatCast(f64, small)
+    return wide
+}
+
+fn tileOf(value: f64) -> i32 {
+    const whole = m.floor(value)
+    return @intCast(i32, whole) / TILE - (if whole < 0 { 1 } else { 0 })
+}
+
+fn add(scene: *Scene, kind: u32, a: f64, b: f64, c: f64, d: f64, e: f64, color: u32, far: u32, depth: f64, reach: f64) -> bool {
+    if scene.*.count >= MAX_PRIMITIVES { return false }
+    // Its box (lines: of both ends), in tiles, clipped to the view.
+    var left = a - reach
+    var right = a + reach
+    var top = b - reach
+    var bottom = b + reach
+    if kind == shader.LINE {
+        left = m.minimum(a, c) - reach
+        right = m.maximum(a, c) + reach
+        top = m.minimum(b, d) - reach
+        bottom = m.maximum(b, d) + reach
+    }
+    const view_width: f64 = m.toFloat(@intCast(i64, scene.*.viewWidth))
+    const view_height: f64 = m.toFloat(@intCast(i64, scene.*.viewHeight))
+    if right < 0.0 || bottom < 0.0 || left >= view_width || top >= view_height { return false }
+    const at = scene.*.count
+    const base = at * WORDS
+    scene.*.words[base] = kind
+    scene.*.words[base + 1] = bitsOf(a)
+    scene.*.words[base + 2] = bitsOf(b)
+    scene.*.words[base + 3] = bitsOf(c)
+    scene.*.words[base + 4] = bitsOf(d)
+    scene.*.words[base + 5] = bitsOf(e)
+    scene.*.words[base + 6] = color
+    scene.*.words[base + 7] = far
+    scene.*.depths[at] = depth
+    var first_x = tileOf(left)
+    var first_y = tileOf(top)
+    var last_x = tileOf(right)
+    var last_y = tileOf(bottom)
+    if first_x < 0 { first_x = 0 }
+    if first_y < 0 { first_y = 0 }
+    if last_x >= scene.*.tilesX { last_x = scene.*.tilesX - 1 }
+    if last_y >= scene.*.tilesY { last_y = scene.*.tilesY - 1 }
+    scene.*.boxes[at * 4] = first_x
+    scene.*.boxes[at * 4 + 1] = first_y
+    scene.*.boxes[at * 4 + 2] = last_x
+    scene.*.boxes[at * 4 + 3] = last_y
+    scene.*.count += 1
+    return true
+}
+
+// A lit sphere of `radius` pixels at (x, y), `color` its ARGB (alpha: how
+// opaque).
+pub fn sphere(scene: *Scene, x: f64, y: f64, radius: f64, color: u32, depth: f64) -> void {
+    const added = add(scene, shader.SPHERE, x, y, radius, 0.0, 0.0, color, 0, depth, radius + 1.5)
+}
+
+// A soft glow fading out to `radius`.
+pub fn glow(scene: *Scene, x: f64, y: f64, radius: f64, color: u32, depth: f64) -> void {
+    const added = add(scene, shader.GLOW, x, y, radius, 0.0, 0.0, color, 0, depth, radius + 1.0)
+}
+
+// A line `width` pixels wide from (x1, y1) in `color` to (x2, y2) in
+// `far`.
+pub fn line(scene: *Scene, x1: f64, y1: f64, x2: f64, y2: f64, width: f64, color: u32, far: u32, depth: f64) -> void {
+    const added = add(scene, shader.LINE, x1, y1, x2, y2, width, color, far, depth, width * 0.5 + 1.5)
+}
+
+// ---------------------------------------------------------------------------
+// Sorting and binning
+
+// The primitives by depth, farthest first (a merge sort, stable).
+fn sort(scene: *Scene) -> void {
+    const count = scene.*.count
+    var at: usize = 0
+    while at < count {
+        scene.*.order[at] = @intCast(u32, at)
+        at += 1
+    }
+    var source = scene.*.order
+    var target = scene.*.scratch
+    var width: usize = 1
+    while width < count {
+        var low: usize = 0
+        while low < count {
+            const middle = if low + width < count { low + width } else { count }
+            const high = if low + width * 2 < count { low + width * 2 } else { count }
+            var left = low
+            var right = middle
+            var out = low
+            while out < high {
+                var take_left = left < middle
+                if take_left && right < high {
+                    take_left = scene.*.depths[@intCast(usize, source[left])] >= scene.*.depths[@intCast(usize, source[right])]
+                }
+                if take_left {
+                    target[out] = source[left]
+                    left += 1
+                } else {
+                    target[out] = source[right]
+                    right += 1
+                }
+                out += 1
+            }
+            low = high
+        }
+        const swap = source
+        source = target
+        target = swap
+        width = width * 2
+    }
+    if @intFromPtr(source) != @intFromPtr(scene.*.order) {
+        at = 0
+        while at < count {
+            scene.*.order[at] = source[at]
+            at += 1
+        }
+    }
+}
+
+fn nextStamp(scene: *Scene) -> u32 {
+    if scene.*.stamp >= 4000000000 {
+        var tile: usize = 0
+        while tile < MAX_TILES {
+            scene.*.stamps[tile] = 0
+            tile += 1
+        }
+        scene.*.stamp = 0
+    }
+    scene.*.stamp += 1
+    return scene.*.stamp
+}
+
+// Primitive `primitive` in tile (x, y): counted (fill false) or put in its
+// list; once per primitive and tile (the stamp).
+fn touch(scene: *Scene, x: i32, y: i32, primitive: u32, stamp: u32, fill: bool) -> void {
+    if x < 0 || y < 0 || x >= scene.*.tilesX || y >= scene.*.tilesY { return }
+    const tile = @intCast(usize, y * scene.*.tilesX + x)
+    if scene.*.stamps[tile] == stamp { return }
+    scene.*.stamps[tile] = stamp
+    if scene.*.touched >= MAX_INDICES {
+        scene.*.full = true
+        return
+    }
+    scene.*.touched += 1
+    if fill {
+        const slot = @intCast(usize, scene.*.starts[tile] + scene.*.counts[tile])
+        scene.*.indices[slot] = primitive
+    }
+    scene.*.counts[tile] += 1
+}
+
+// The tiles a line goes through: its points every 8 pixels, and what is
+// within reach of them.
+fn touchLine(scene: *Scene, primitive: u32, stamp: u32, fill: bool) -> void {
+    const base = @intCast(usize, primitive) * WORDS
+    const x1 = floatOf(scene.*.words[base + 1])
+    const y1 = floatOf(scene.*.words[base + 2])
+    const x2 = floatOf(scene.*.words[base + 3])
+    const y2 = floatOf(scene.*.words[base + 4])
+    const reach = floatOf(scene.*.words[base + 5]) * 0.5 + 5.5
+    const dx = x2 - x1
+    const dy = y2 - y1
+    const size = m.sqrt(dx * dx + dy * dy)
+    // Only the part in the view (a line can run far past it).
+    var t0: f64 = 0.0
+    var t1: f64 = 1.0
+    const view_width: f64 = m.toFloat(@intCast(i64, scene.*.viewWidth))
+    const view_height: f64 = m.toFloat(@intCast(i64, scene.*.viewHeight))
+    if !clipAxis(x1, dx, -reach, view_width + reach, &t0, &t1) || !clipAxis(y1, dy, -reach, view_height + reach, &t0, &t1) { return }
+    var steps: i64 = m.toInt(size * (t1 - t0) / 8.0) + 1
+    if steps > 4096 { steps = 4096 }
+    var step: i64 = 0
+    while step <= steps {
+        const t = t0 + (t1 - t0) * m.toFloat(step) / m.toFloat(steps)
+        const px = x1 + dx * t
+        const py = y1 + dy * t
+        const left = tileOf(px - reach)
+        const right = tileOf(px + reach)
+        const top = tileOf(py - reach)
+        const bottom = tileOf(py + reach)
+        var ty = top
+        while ty <= bottom {
+            var tx = left
+            while tx <= right {
+                touch(scene, tx, ty, primitive, stamp, fill)
+                tx += 1
+            }
+            ty += 1
+        }
+        step += 1
+    }
+}
+
+// Liang-Barsky on one axis: narrows t0..t1 to where origin + delta * t is
+// within low..high; false when nothing is left.
+fn clipAxis(origin: f64, delta: f64, low: f64, high: f64, t0: *f64, t1: *f64) -> bool {
+    if m.absolute(delta) < 0.000001 { return origin >= low && origin <= high }
+    var enter = (low - origin) / delta
+    var leave = (high - origin) / delta
+    if enter > leave {
+        const swap = enter
+        enter = leave
+        leave = swap
+    }
+    if enter > t0.* { t0.* = enter }
+    if leave < t1.* { t1.* = leave }
+    return t0.* <= t1.*
+}
+
+fn pass(scene: *Scene, fill: bool) -> void {
+    var at: usize = 0
+    while at < scene.*.count {
+        const primitive = scene.*.order[at]
+        const stamp = nextStamp(scene)
+        const index = @intCast(usize, primitive)
+        if scene.*.words[index * WORDS] == shader.LINE {
+            touchLine(scene, primitive, stamp, fill)
+        } else {
+            var y = scene.*.boxes[index * 4 + 1]
+            while y <= scene.*.boxes[index * 4 + 3] {
+                var x = scene.*.boxes[index * 4]
+                while x <= scene.*.boxes[index * 4 + 2] {
+                    touch(scene, x, y, primitive, stamp, fill)
+                    x += 1
+                }
+                y += 1
+            }
+        }
+        at += 1
+    }
+}
+
+// Sorts and bins what was added: the tiles' lists in indices. Both passes
+// touch the same tiles in the same order, so when the lists would not fit
+// they stop at the same place (full).
+fn bin(scene: *Scene) -> void {
+    sort(scene)
+    const tiles = @intCast(usize, scene.*.tilesX * scene.*.tilesY)
+    var tile: usize = 0
+    while tile < tiles {
+        scene.*.counts[tile] = 0
+        tile += 1
+    }
+    scene.*.touched = 0
+    pass(scene, false)
+    var total: usize = 0
+    tile = 0
+    while tile < tiles {
+        scene.*.starts[tile] = @intCast(u32, total)
+        total += @intCast(usize, scene.*.counts[tile])
+        scene.*.counts[tile] = 0
+        tile += 1
+    }
+    scene.*.touched = 0
+    pass(scene, true)
+    scene.*.indexCount = total
+}
+
+// ---------------------------------------------------------------------------
+// The GPU
+
+fn prepare(scene: *Scene, context: *gpu.Context) -> bool {
+    if scene.*.ready { return true }
+    if scene.*.failed { return false }
+    var code: [*]u32 = undefined
+    const words = shader.words(scene.*.allocator, &code)
+    if words == 0 || !gpu.createKernel(context, kernelOf(scene), code, words, 2, shader.PUSH_WORDS) {
+        scene.*.failed = true
+        return false
+    }
+    scene.*.ready = true
+    return true
+}
+
+fn kernelOf(scene: *Scene) -> *gpu.Kernel {
+    unsafe { return @ptrFromInt(*gpu.Kernel, @intFromPtr(scene) + @offsetOf(Scene, "kernel")) }
+}
+
+fn bufferOf(scene: *Scene) -> *gpu.Buffer {
+    unsafe { return @ptrFromInt(*gpu.Buffer, @intFromPtr(scene) + @offsetOf(Scene, "buffer")) }
+}
+
+// A data buffer of at least `bytes` (grown by half again when too small).
+fn fit(scene: *Scene, context: *gpu.Context, bytes: usize) -> bool {
+    if scene.*.bufferBytes >= bytes { return true }
+    if scene.*.bufferBytes > 0 {
+        gpu.destroyBuffer(context, bufferOf(scene))
+        scene.*.bufferBytes = 0
+    }
+    var size = bytes + bytes / 2
+    if size < 1048576 { size = 1048576 }
+    if !gpu.createUploadBuffer(context, bufferOf(scene), @intCast(u64, size)) { return false }
+    if bufferOf(scene).*.address == 0 {
+        gpu.destroyBuffer(context, bufferOf(scene))
+        return false
+    }
+    scene.*.bufferBytes = size
+    return true
+}
+
+// Records the view's drawing into the frame: after the canvas's dispatch,
+// into `target` (width x height words). False when Vulkan failed.
+pub fn render(scene: *Scene, context: *gpu.Context, target: vk.Buffer, width: u32, height: u32) -> bool {
+    if scene.*.viewWidth <= 0 || scene.*.viewHeight <= 0 { return true }
+    if !prepare(scene, context) { return false }
+    // The view must lie in the frame.
+    var view_width = scene.*.viewWidth
+    var view_height = scene.*.viewHeight
+    if scene.*.viewX < 0 || scene.*.viewY < 0 { return true }
+    if scene.*.viewX + view_width > @intCast(i32, width) { view_width = @intCast(i32, width) - scene.*.viewX }
+    if scene.*.viewY + view_height > @intCast(i32, height) { view_height = @intCast(i32, height) - scene.*.viewY }
+    if view_width <= 0 || view_height <= 0 { return true }
+    bin(scene)
+    const tiles = @intCast(usize, scene.*.tilesX * scene.*.tilesY)
+    const index_offset = tiles * 2
+    const prim_offset = index_offset + scene.*.indexCount
+    const words = prim_offset + scene.*.count * WORDS
+    if !fit(scene, context, words * 4) { return false }
+    var data: [*]u32 = undefined
+    unsafe { data = @ptrFromInt([*]u32, bufferOf(scene).*.address) }
+    var tile: usize = 0
+    while tile < tiles {
+        data[tile * 2] = scene.*.starts[tile]
+        data[tile * 2 + 1] = scene.*.counts[tile]
+        tile += 1
+    }
+    var at: usize = 0
+    while at < scene.*.indexCount {
+        data[index_offset + at] = scene.*.indices[at]
+        at += 1
+    }
+    at = 0
+    while at < scene.*.count * WORDS {
+        data[prim_offset + at] = scene.*.words[at]
+        at += 1
+    }
+    const push = shader.Push.{
+        .viewX = @intCast(u32, scene.*.viewX),
+        .viewY = @intCast(u32, scene.*.viewY),
+        .viewWidth = @intCast(u32, view_width),
+        .viewHeight = @intCast(u32, view_height),
+        .targetOffset = 0,
+        .targetStride = width,
+        .tilesX = @intCast(u32, scene.*.tilesX),
+        .indexOffset = @intCast(u32, index_offset),
+        .primOffset = @intCast(u32, prim_offset),
+        .flags = 0,
+    }
+    var buffers: [2]vk.Buffer = [2]vk.Buffer{ target, bufferOf(scene).*.buffer }
+    unsafe {
+        return gpu.dispatch(context, kernelOf(scene), @ptrCast([*]const vk.Buffer, &buffers), &push, gpu.groups(@intCast(u32, view_width), 16), gpu.groups(@intCast(u32, view_height), 16))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The same on the CPU
+
+fn channel(color: u32, shift: u32) -> f64 { return m.toFloat(@intCast(i64, (color >> shift) & 255)) / 255.0 }
+
+fn toByte(value: f64) -> u32 {
+    const scaled = m.clamp(value, 0.0, 1.0) * 255.0 + 0.5
+    return @intCast(u32, m.toInt(scaled))
+}
+
+fn background(x: f64, y: f64, width: f64, height: f64, rgb: [*]f64) -> void {
+    const fy = y / height
+    const cx = x / width - 0.5
+    const cy = fy - 0.45
+    const light = m.clamp(1.0 - (cx * cx + cy * cy) * 2.2, 0.0, 1.0)
+    rgb[0] = 0.035 + fy * 0.02 + light * 0.035
+    rgb[1] = 0.040 + fy * 0.025 + light * 0.045
+    rgb[2] = 0.070 + fy * 0.045 + light * 0.080
+}
+
+fn blendInto(rgb: [*]f64, red: f64, green: f64, blue: f64, alpha: f64) -> void {
+    const keep = 1.0 - alpha
+    rgb[0] = red * alpha + rgb[0] * keep
+    rgb[1] = green * alpha + rgb[1] * keep
+    rgb[2] = blue * alpha + rgb[2] * keep
+}
+
+// Primitive `primitive` over pixel (px, py) (its center).
+fn shadePixel(scene: *Scene, primitive: usize, px: f64, py: f64, rgb: [*]f64) -> void {
+    const base = primitive * WORDS
+    const kind = scene.*.words[base]
+    const ax = floatOf(scene.*.words[base + 1])
+    const ay = floatOf(scene.*.words[base + 2])
+    const third = floatOf(scene.*.words[base + 3])
+    const fourth = floatOf(scene.*.words[base + 4])
+    const fifth = floatOf(scene.*.words[base + 5])
+    const color = scene.*.words[base + 6]
+    const red = channel(color, 16)
+    const green = channel(color, 8)
+    const blue = channel(color, 0)
+    const opacity = channel(color, 24)
+    const dx = px - ax
+    const dy = py - ay
+    const distance_squared = dx * dx + dy * dy
+    if kind == shader.SPHERE {
+        const reach = third + 1.0
+        if distance_squared >= reach * reach { return }
+        const distance = m.sqrt(distance_squared)
+        const coverage = m.clamp(third + 0.5 - distance, 0.0, 1.0)
+        const inverse = 1.0 / m.maximum(third, 0.5)
+        const nx = dx * inverse
+        const ny = dy * inverse
+        const nz = m.sqrt(m.maximum(0.0, 1.0 - (nx * nx + ny * ny)))
+        const diffuse = m.maximum(0.0, nx * -0.4546 + ny * -0.5556 + nz * 0.7071)
+        const specular_base = m.maximum(0.0, nx * -0.2455 + ny * -0.3001 + nz * 0.9218)
+        const s2 = specular_base * specular_base
+        const s4 = s2 * s2
+        const s8 = s4 * s4
+        const specular = s8 * s8 * s8 * 0.55
+        const edge = 1.0 - nz
+        const light = 0.20 + diffuse * 0.80 + edge * edge * 0.45
+        blendInto(rgb, red * light + specular, green * light + specular, blue * light + specular, coverage * opacity)
+    } else if kind == shader.GLOW {
+        if distance_squared >= third * third { return }
+        const falloff = m.clamp(1.0 - m.sqrt(distance_squared) / m.maximum(third, 1.0), 0.0, 1.0)
+        blendInto(rgb, red, green, blue, falloff * falloff * opacity)
+    } else if kind == shader.LINE {
+        const far = scene.*.words[base + 7]
+        const ex = third - ax
+        const ey = fourth - ay
+        const length_squared = ex * ex + ey * ey + 0.0001
+        const along = m.clamp((dx * ex + dy * ey) / length_squared, 0.0, 1.0)
+        const qx = dx - along * ex
+        const qy = dy - along * ey
+        const coverage = m.clamp(fifth * 0.5 + 0.5 - m.sqrt(qx * qx + qy * qy), 0.0, 1.0)
+        if coverage <= 0.0 { return }
+        const back = 1.0 - along
+        blendInto(rgb, red * back + channel(far, 16) * along, green * back + channel(far, 8) * along, blue * back + channel(far, 0) * along, coverage * (opacity * back + channel(far, 24) * along))
+    }
+}
+
+// Draws the view into `pixels` (rows `stride` words apart), opaque: the
+// canvas draws over it afterwards.
+pub fn drawCpu(scene: *Scene, pixels: [*]u32, stride: usize, width: usize, height: usize) -> void {
+    if scene.*.viewWidth <= 0 || scene.*.viewHeight <= 0 || scene.*.viewX < 0 || scene.*.viewY < 0 { return }
+    bin(scene)
+    var view_width = scene.*.viewWidth
+    var view_height = scene.*.viewHeight
+    if scene.*.viewX + view_width > @intCast(i32, width) { view_width = @intCast(i32, width) - scene.*.viewX }
+    if scene.*.viewY + view_height > @intCast(i32, height) { view_height = @intCast(i32, height) - scene.*.viewY }
+    const full_width: f64 = m.toFloat(@intCast(i64, view_width))
+    const full_height: f64 = m.toFloat(@intCast(i64, view_height))
+    var rgb: [3]f64 = undefined
+    var color: [*]f64 = undefined
+    unsafe { color = @ptrCast([*]f64, &rgb) }
+    var y: i32 = 0
+    while y < view_height {
+        var x: i32 = 0
+        const tile_row = y / TILE
+        while x < view_width {
+            const px = m.toFloat(@intCast(i64, x)) + 0.5
+            const py = m.toFloat(@intCast(i64, y)) + 0.5
+            background(px, py, full_width, full_height, color)
+            if tile_row < scene.*.tilesY {
+                const tile = @intCast(usize, tile_row * scene.*.tilesX + x / TILE)
+                const first = @intCast(usize, scene.*.starts[tile])
+                var at: usize = 0
+                while at < @intCast(usize, scene.*.counts[tile]) {
+                    shadePixel(scene, @intCast(usize, scene.*.indices[first + at]), px, py, color)
+                    at += 1
+                }
+            }
+            const out = 4278190080 | (toByte(rgb[0]) << 16) | (toByte(rgb[1]) << 8) | toByte(rgb[2])
+            pixels[@intCast(usize, scene.*.viewY + y) * stride + @intCast(usize, scene.*.viewX + x)] = out
+            x += 1
+        }
+        y += 1
+    }
+}

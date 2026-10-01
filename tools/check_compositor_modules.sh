@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Loading the compositor's shell and renderer as shared objects and loading
-# them again while it runs (examples/wayland-compositor/modules.mlx).
+# them again while it runs (projects/desktop/compositor/modules.mlx).
 #
 # The nested compositor runs under tools/wayland-test-host with --modules
 # DIR, where libmlx-shell.so and libmlx-render.so were built from the
@@ -29,8 +29,8 @@ mkdir -m 700 "$XDG_RUNTIME_DIR"
 export MLX_ARENA_POISON=1
 trap 'rm -rf -- "$work"' EXIT
 
-"$compiler" --quiet examples/wayland-compositor/main.mlx -o "$work/mlx-compositor"
-"$compiler" --quiet examples/wayland-terminal/main.mlx -o "$work/mlx-terminal"
+"$compiler" --quiet projects/desktop/compositor/main.mlx -o "$work/mlx-compositor"
+"$compiler" --quiet projects/desktop/terminal/main.mlx -o "$work/mlx-terminal"
 "$compiler" --quiet tools/wayland-test-host/main.mlx -o "$work/test-host"
 xkbcli compile-keymap --layout us > "$work/us.xkb"
 
@@ -38,14 +38,14 @@ xkbcli compile-keymap --layout us > "$work/us.xkb"
 build_modules() {
     local sources=$1 output=$2
     mkdir -p "$output"
-    "$compiler" --quiet --shared "$sources/examples/wayland-compositor/shell_module.mlx" -o "$output/libmlx-shell.so"
-    "$compiler" --quiet --shared "$sources/examples/wayland-compositor/render_module.mlx" -o "$output/libmlx-render.so"
+    "$compiler" --quiet --shared "$sources/projects/desktop/compositor/shell_module.mlx" -o "$output/libmlx-shell.so"
+    "$compiler" --quiet --shared "$sources/projects/desktop/compositor/render_module.mlx" -o "$output/libmlx-render.so"
 }
 build_modules . "$work/modules"
 mkdir -p "$work/changed/examples" "$work/layout/examples"
-cp -r examples/wayland-compositor examples/vulkan-shared examples/desktop-shared "$work/changed/examples/"
-cp -r examples/wayland-compositor examples/vulkan-shared examples/desktop-shared "$work/layout/examples/"
-python3 - "$work/changed/examples/wayland-compositor/scene.mlx" <<'PY'
+cp -r projects/desktop/compositor examples/vulkan-shared projects/desktop/shared "$work/changed/examples/"
+cp -r projects/desktop/compositor examples/vulkan-shared projects/desktop/shared "$work/layout/examples/"
+python3 - "$work/changed/projects/desktop/compositor/scene.mlx" <<'PY'
 import sys
 path = sys.argv[1]
 text = open(path).read()
@@ -57,7 +57,7 @@ assert text.count(spacing) == 1
 text = text.replace(spacing, "    compositor.*.nextWindowX += 200\n")
 open(path, "w").write(text)
 PY
-python3 - "$work/layout/examples/wayland-compositor/state.mlx" <<'PY'
+python3 - "$work/layout/projects/desktop/compositor/state.mlx" <<'PY'
 import sys
 path = sys.argv[1]
 text = open(path).read()

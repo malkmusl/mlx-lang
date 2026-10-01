@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# End-to-end check of examples/wayland-compositor (nested compositor) and
-# examples/wayland-terminal (terminal client) with real keyboard and
+# End-to-end check of projects/desktop/compositor (nested compositor) and
+# projects/desktop/terminal (terminal client) with real keyboard and
 # pointer input.
 #
 # tools/wayland-test-host plays the "session compositor": it hosts the
@@ -55,7 +55,7 @@ command -v xkbcli > /dev/null || { echo "check_wayland_compositor.sh: xkbcli is 
 work=$(mktemp -d)
 export XDG_RUNTIME_DIR="$work/runtime"
 # Values a turn of the compositor's loop released are overwritten, so one
-# wrongly kept across turns shows (examples/wayland-compositor/arena.mlx).
+# wrongly kept across turns shows (projects/desktop/compositor/arena.mlx).
 export MLX_ARENA_POISON=${MLX_ARENA_POISON:-1}
 mkdir -m 700 "$XDG_RUNTIME_DIR"
 # The compositor's settings file: the defaults unless a scenario writes one
@@ -65,8 +65,8 @@ mkdir -p "$XDG_CONFIG_HOME/mlx"
 # GTK's document portal may have mounted itself under the runtime directory.
 trap 'fusermount -u "$XDG_RUNTIME_DIR/doc" 2> /dev/null || true; rm -rf -- "$work"' EXIT
 
-"$compiler" --quiet examples/wayland-compositor/main.mlx -o "$work/mlx-compositor"
-"$compiler" --quiet examples/wayland-terminal/main.mlx -o "$work/mlx-terminal"
+"$compiler" --quiet projects/desktop/compositor/main.mlx -o "$work/mlx-compositor"
+"$compiler" --quiet projects/desktop/terminal/main.mlx -o "$work/mlx-terminal"
 "$compiler" --quiet tools/wayland-test-host/main.mlx -o "$work/test-host"
 xkbcli compile-keymap --layout us > "$work/us.xkb"
 
@@ -372,7 +372,7 @@ echo "ok   a pointer lock holds the cursor and relative motion reaches the clien
 # pixels apart from y 448). Maximize gets Super+Shift+M; minimize gets
 # Super+Up (the maximize hotkey: it must reach the window); the terminal
 # hotkey is cleared; then Super+Up minimizes.
-"$compiler" --quiet examples/mlx-settings/main.mlx -o "$work/mlx-settings"
+"$compiler" --quiet projects/desktop/settings/main.mlx -o "$work/mlx-settings"
 rm -f "$XDG_CONFIG_HOME/mlx/compositor.conf"
 cat > "$work/hotkeys.script" <<SCRIPT
 wait 2500

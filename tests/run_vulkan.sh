@@ -106,7 +106,7 @@ if command -v glslangValidator > /dev/null; then
     done
 fi
 
-for example in examples/vulkan-info/main.mlx examples/vulkan-wayland-client/main.mlx examples/wayland-compositor/main.mlx; do
+for example in examples/vulkan-info/main.mlx examples/vulkan-wayland-client/main.mlx projects/desktop/compositor/main.mlx; do
     if "$compiler" --quiet "$example" -o "$work/example" 2> "$work/errors"; then
         echo "ok   $example (builds)"
     else

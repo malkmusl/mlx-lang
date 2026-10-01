@@ -300,7 +300,7 @@ On top of it:
 | Example | What it shows |
 | --- | --- |
 | `examples/vulkan-wayland-client` | A Wayland client (std.wayland) that renders with Vulkan and hands frames over zero-copy: dma-bufs through `zwp_linux_dmabuf_v1`, or rendering straight into its `wl_shm` pool (imported host memory); a copying fallback. |
-| `examples/wayland-compositor --renderer vulkan` | The compositor composes on the GPU: client `wl_shm` pools and linux-dmabuf buffers are imported where they are, and the output is rendered in place: nested, into the host window's buffer; freestanding, into the DRM dumb buffer the monitor scans out (exported as a dma-buf), the shaders stepping rows by its pitch (`targetStride`). |
+| `projects/desktop/compositor --renderer vulkan` | The compositor composes on the GPU: client `wl_shm` pools and linux-dmabuf buffers are imported where they are, and the output is rendered in place: nested, into the host window's buffer; freestanding, into the DRM dumb buffer the monitor scans out (exported as a dma-buf), the shaders stepping rows by its pitch (`targetStride`). |
 | `examples/vulkan-android` | A NativeActivity presenting through a `VK_KHR_android_surface` swapchain from the system `libvulkan.so`, with touch input moving the ring; built with `--target=aarch64-android` and checked by `tools/emulate_vulkan_android.py`. |
 
 `tools/check_vulkan_wayland.sh` runs the client inside the compositor with
@@ -321,7 +321,7 @@ lavapipe and `xkbcli` are; the `spirv-val` and glslang cross-checks
 (including the examples' shaders) when those tools are present; the layout
 check when gcc and `vulkan/vulkan.h` are; and verifies that
 `examples/vulkan-info`, `examples/vulkan-wayland-client` and
-`examples/wayland-compositor` build and that both generated modules are
+`projects/desktop/compositor` build and that both generated modules are
 current.
 
 ## Limits

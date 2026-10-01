@@ -66,7 +66,7 @@ for test in tests/268_compositor_damage_runtime.mlx tests/270_compositor_input_r
     fi
 done
 
-for example in examples/wayland-client/main.mlx examples/wayland-server/main.mlx examples/wayland-terminal/main.mlx examples/wayland-compositor/main.mlx examples/mlx-dock/main.mlx examples/mlx-launcher/main.mlx examples/mlx-settings/main.mlx tools/wayland-test-host/main.mlx; do
+for example in examples/wayland-client/main.mlx examples/wayland-server/main.mlx projects/desktop/terminal/main.mlx projects/desktop/compositor/main.mlx projects/desktop/dock/main.mlx projects/desktop/launcher/main.mlx projects/desktop/settings/main.mlx tools/wayland-test-host/main.mlx; do
     if "$compiler" --quiet "$example" -o "$work/example"; then
         echo "ok   $example (builds)"
     else
@@ -78,10 +78,10 @@ done
 # The compositor's shell and renderer as shared objects (loaded again while
 # it runs), and the shell's handler tables.
 for module in shell render; do
-    if "$compiler" --quiet --shared "examples/wayland-compositor/${module}_module.mlx" -o "$work/libmlx-$module.so"; then
-        echo "ok   examples/wayland-compositor/${module}_module.mlx (builds with --shared)"
+    if "$compiler" --quiet --shared "projects/desktop/compositor/${module}_module.mlx" -o "$work/libmlx-$module.so"; then
+        echo "ok   projects/desktop/compositor/${module}_module.mlx (builds with --shared)"
     else
-        echo "FAIL (compile) examples/wayland-compositor/${module}_module.mlx"
+        echo "FAIL (compile) projects/desktop/compositor/${module}_module.mlx"
         failures=$((failures + 1))
     fi
 done

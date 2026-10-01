@@ -2,7 +2,7 @@
 # Builds the Mlx compositor, terminal, dock and launcher and installs them
 # as a desktop session that GDM and SDDM offer at login ("Mlx Compositor").
 #
-# The session (examples/wayland-compositor/session/mlx-session) runs the
+# The session (projects/desktop/compositor/session/mlx-session) runs the
 # compositor freestanding: it drives the monitor (DRM/KMS) at its preferred
 # resolution and reads the input devices itself, with systemd-logind
 # handing out the devices and switching VTs; libxkbcommon (installed on any
@@ -100,25 +100,25 @@ fi
 build=mlx-out/session
 mkdir -p "$build"
 echo "building with $compiler"
-"$compiler" --quiet examples/wayland-compositor/main.mlx -o "$build/mlx-compositor"
-"$compiler" --quiet examples/wayland-terminal/main.mlx -o "$build/mlx-terminal"
-"$compiler" --quiet examples/mlx-dock/main.mlx -o "$build/mlx-dock"
-"$compiler" --quiet examples/mlx-topbar/main.mlx -o "$build/mlx-topbar"
-"$compiler" --quiet examples/mlx-launcher/main.mlx -o "$build/mlx-launcher"
-"$compiler" --quiet examples/mlx-settings/main.mlx -o "$build/mlx-settings"
-"$compiler" --quiet examples/mlx-files/main.mlx -o "$build/mlx-files"
-"$compiler" --quiet examples/mlx-observatory/main.mlx -o "$build/mlx-observatory"
+"$compiler" --quiet projects/desktop/compositor/main.mlx -o "$build/mlx-compositor"
+"$compiler" --quiet projects/desktop/terminal/main.mlx -o "$build/mlx-terminal"
+"$compiler" --quiet projects/desktop/dock/main.mlx -o "$build/mlx-dock"
+"$compiler" --quiet projects/desktop/topbar/main.mlx -o "$build/mlx-topbar"
+"$compiler" --quiet projects/desktop/launcher/main.mlx -o "$build/mlx-launcher"
+"$compiler" --quiet projects/desktop/settings/main.mlx -o "$build/mlx-settings"
+"$compiler" --quiet projects/desktop/files/main.mlx -o "$build/mlx-files"
+"$compiler" --quiet projects/observatory/main.mlx -o "$build/mlx-observatory"
 "$compiler" --quiet tools/profile/main.mlx -o "$build/mlx-profile"
-sed "s|@BINDIR@|$bindir|g" examples/mlx-settings/mlx-settings.desktop.in > "$build/mlx-settings.desktop"
-sed "s|@BINDIR@|$bindir|g" examples/mlx-files/org.mlx.files.desktop.in > "$build/org.mlx.files.desktop"
-sed "s|@BINDIR@|$bindir|g; s|@ROOT@|$repo_root|g" examples/mlx-observatory/org.mlx.observatory.desktop.in > "$build/org.mlx.observatory.desktop"
-sed "s|@BINDIR@|$bindir|g" examples/wayland-compositor/session/mlx-compositor.desktop.in > "$build/mlx-compositor.desktop"
+sed "s|@BINDIR@|$bindir|g" projects/desktop/settings/mlx-settings.desktop.in > "$build/mlx-settings.desktop"
+sed "s|@BINDIR@|$bindir|g" projects/desktop/files/org.mlx.files.desktop.in > "$build/org.mlx.files.desktop"
+sed "s|@BINDIR@|$bindir|g; s|@ROOT@|$repo_root|g" projects/observatory/org.mlx.observatory.desktop.in > "$build/org.mlx.observatory.desktop"
+sed "s|@BINDIR@|$bindir|g" projects/desktop/compositor/session/mlx-compositor.desktop.in > "$build/mlx-compositor.desktop"
 echo "built $build/mlx-compositor, mlx-terminal, mlx-dock, mlx-topbar, mlx-launcher, mlx-settings, mlx-files, mlx-observatory and mlx-profile"
 [[ $build_only -eq 1 ]] && exit 0
 
 # Install.
 as_owner "$destdir$bindir" install -d "$destdir$bindir"
-as_owner "$destdir$bindir" install -m 755 "$build/mlx-compositor" "$build/mlx-terminal" "$build/mlx-dock" "$build/mlx-topbar" "$build/mlx-launcher" "$build/mlx-settings" "$build/mlx-files" "$build/mlx-observatory" "$build/mlx-profile" examples/wayland-compositor/session/mlx-session "$destdir$bindir/"
+as_owner "$destdir$bindir" install -m 755 "$build/mlx-compositor" "$build/mlx-terminal" "$build/mlx-dock" "$build/mlx-topbar" "$build/mlx-launcher" "$build/mlx-settings" "$build/mlx-files" "$build/mlx-observatory" "$build/mlx-profile" projects/desktop/compositor/session/mlx-session "$destdir$bindir/"
 # The command line of the code map under its own name (the same program).
 as_owner "$destdir$bindir" ln -sf mlx-observatory "$destdir$bindir/mlx-codemap"
 as_owner "$destdir$sessions" install -d "$destdir$sessions"
@@ -126,7 +126,7 @@ as_owner "$destdir$sessions" install -m 644 "$build/mlx-compositor.desktop" "$de
 as_owner "$destdir$applications" install -d "$destdir$applications"
 as_owner "$destdir$applications" install -m 644 "$build/mlx-settings.desktop" "$build/org.mlx.files.desktop" "$build/org.mlx.observatory.desktop" "$destdir$applications/"
 as_owner "$destdir$icons" install -d "$destdir$icons"
-as_owner "$destdir$icons" install -m 644 examples/mlx-files/org.mlx.files.png examples/mlx-observatory/org.mlx.observatory.png "$destdir$icons/"
+as_owner "$destdir$icons" install -m 644 projects/desktop/files/org.mlx.files.png projects/observatory/org.mlx.observatory.png "$destdir$icons/"
 for program in "${programs[@]}"; do echo "installed $destdir$bindir/$program"; done
 echo "installed $destdir$sessions/mlx-compositor.desktop"
 # The shell and renderer modules, for the user running this (not when

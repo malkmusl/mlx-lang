@@ -118,7 +118,7 @@ adds three sections to it:
   lines from 1), then the files' paths, each ended by a NUL.
 
 The crash handler of the desktop programs
-(`examples/wayland-compositor/crash.mlx`) reads both from `/proc/self/exe`
+(`projects/desktop/compositor/crash.mlx`) reads both from `/proc/self/exe`
 and writes each frame as `path:line:name+0xOFFSET at path:line`;
 `tools/check_crash_report.sh` crashes `tests/support/crash_report.mlx`
 three ways and checks the lines it names. The sampling profiler
@@ -144,7 +144,7 @@ functions and the functions it hands out as pointers alike.
 `tests/support/shared_object_library.mlx` twice from two copies, calls it
 through `dlsym` and through function pointers it returns, and checks that
 the structs it builds grow the caller's arena by exactly their size.
-`examples/wayland-compositor` loads its shell and renderer this way, again
+`projects/desktop/compositor` loads its shell and renderer this way, again
 whenever they are rebuilt.
 
 ## Debug information

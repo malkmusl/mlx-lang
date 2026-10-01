@@ -39,4 +39,4 @@ rectangles, insets, alignment, containers, stacks and reserved bars; see
 `std.path`, `std.mode`, `std.parse`, `std.shell` and `std.calendar` provide
 coreutils-grade building blocks (path manipulation/canonicalization, chmod-style
 permission parsing, sized-number/duration parsing, POSIX-ish word splitting and
-calendar/timestamp parsing) that were generalized out of `examples/coreutils`.
+calendar/timestamp parsing) that were generalized out of `projects/coreutils`.

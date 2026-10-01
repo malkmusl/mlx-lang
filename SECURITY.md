@@ -2,7 +2,7 @@
 
 ## Summary
 
-MLX is a manual-memory systems language and self-hosted native compiler. Untrusted source files and imported modules flow through module loading, lexing, parsing, semantic analysis, LIR lowering/optimization, x86_64 code generation, relocation fixups, and direct ELF emission (`compiler/selfhost/driver/pipeline.mlx:25-49`, `compiler/selfhost/driver/pipeline.mlx:108-180`). Generated coreutils accept attacker-controlled command-line strings and filesystem paths and issue raw Linux syscalls without libc (`examples/coreutils/mkdir/main.mlx:146-166`, `examples/coreutils/rmdir/main.mlx:73-94`, `std/bootstrap/os/linux.mlx:8-39`).
+MLX is a manual-memory systems language and self-hosted native compiler. Untrusted source files and imported modules flow through module loading, lexing, parsing, semantic analysis, LIR lowering/optimization, x86_64 code generation, relocation fixups, and direct ELF emission (`compiler/selfhost/driver/pipeline.mlx:25-49`, `compiler/selfhost/driver/pipeline.mlx:108-180`). Generated coreutils accept attacker-controlled command-line strings and filesystem paths and issue raw Linux syscalls without libc (`projects/coreutils/mkdir/main.mlx:146-166`, `projects/coreutils/rmdir/main.mlx:73-94`, `std/bootstrap/os/linux.mlx:8-39`).
 
 ## Assets
 
@@ -16,7 +16,7 @@ MLX is a manual-memory systems language and self-hosted native compiler. Untrust
 
 - Untrusted source and import strings cross into the module graph at `compiler/selfhost/driver/pipeline.mlx:25-38`; the loader must bound all token, AST, path, and module accesses.
 - Typed AST crosses into LIR and then native code generation at `compiler/selfhost/driver/pipeline.mlx:108-168`; optimizer rewrites must preserve types, control flow, memory effects, and symbol identity.
-- User argv paths cross directly into filesystem syscalls in `examples/coreutils/mkdir/main.mlx:150-164` and `examples/coreutils/rmdir/main.mlx:77-91`; path normalization, symlink policy, traversal order, and race resistance are caller-visible security controls.
+- User argv paths cross directly into filesystem syscalls in `projects/coreutils/mkdir/main.mlx:150-164` and `projects/coreutils/rmdir/main.mlx:77-91`; path normalization, symlink policy, traversal order, and race resistance are caller-visible security controls.
 - Raw MLX pointers cross into the Linux kernel through syscall shims at `std/bootstrap/os/linux.mlx:8-14`; wrappers must pass ABI-correct layouts, sizes, flags, and signed results.
 - Explicit allocations cross from safe-looking abstractions into `mmap`/`munmap` at `std/bootstrap/page_allocator.mlx:7-39`; lengths and ownership must remain exact.
 

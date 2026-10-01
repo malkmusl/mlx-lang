@@ -3,7 +3,7 @@
 **Normative source:** `spec/05-build/build-system.xml`, `spec/05-build/packages.xml`,
 `spec/05-build/targets.xml`
 
-**Cross-referenced implementation:** root `build.zig`, `examples/coreutils/build.sh`
+**Cross-referenced implementation:** root `build.zig`, `projects/coreutils/build.sh`
 
 Mlx distinguishes two build systems, per the "Bootstrap chain" in the root
 `README.md`:
@@ -121,7 +121,7 @@ No package manifest file format, field list, or example is specified
 anywhere in `spec/05-build/packages.xml`, and no `build.mlx` file exists yet
 anywhere in this repository (a repo-wide search finds none, and none of the
 example programs under `examples/` — `examples/hello/`,
-`examples/coreutils/`, `examples/wayland-client/`,
+`projects/coreutils/`, `examples/wayland-client/`,
 `examples/wayland-server/` — includes one). This guide therefore does not
 show an example manifest: doing so would mean inventing a shape the spec
 does not define, which the project's own rule in `SPEC_INDEX.md` forbids
@@ -177,17 +177,17 @@ Stage-0 only has direct Zig-side analogues for `build` (`zig build`) and
 `test` (`zig build test`); `run`/`fmt`/`check` are not present in `build.zig`
 at all.
 
-Outside `build.zig`, `examples/coreutils/build.sh` shows how an Mlx program
+Outside `build.zig`, `projects/coreutils/build.sh` shows how an Mlx program
 is actually compiled today — by invoking a compiler binary directly against
 a source file with `-o`, no `build.mlx` involved:
 
 ```sh
 "$compiler" \
-    "$repo_root/examples/coreutils/$utility/main.mlx" \
+    "$repo_root/projects/coreutils/$utility/main.mlx" \
     -o "$bin_dir/$utility"
 ```
 
-(`examples/coreutils/build.sh`)
+(`projects/coreutils/build.sh`)
 
 Summary of what's implemented versus aspirational:
 
@@ -198,7 +198,7 @@ Summary of what's implemented versus aspirational:
 | Target model (`arch os abi endian pointer_bits cpu_features`, `builtin` module) | Normative in `spec/05-build/targets.xml`; not exercised by `build.zig`, which uses Zig's own `standardTargetOptions`/`standardOptimizeOption` |
 | Sandboxed build-script host I/O (`std.Build` APIs only) | Applies to the canonical `build.mlx` system; `build.zig` is ordinary unsandboxed Zig build-script code, since Zig tooling is explicitly Stage-0-only |
 | Package identity/mapping/versioning rules | Normative in `spec/05-build/packages.xml`; no package manifest or resolver exists yet anywhere in the repository |
-| Direct compiler invocation (`compiler source.mlx -o output`) | The actual mechanism in use today, shown by `examples/coreutils/build.sh` |
+| Direct compiler invocation (`compiler source.mlx -o output`) | The actual mechanism in use today, shown by `projects/coreutils/build.sh` |
 
 This gap is expected at this stage of the project: per the bootstrap chain,
 the canonical build/package system is downstream of `mlx1`/`mlx2` and the

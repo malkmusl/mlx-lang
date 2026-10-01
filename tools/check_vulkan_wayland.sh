@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# End-to-end check of the Vulkan Wayland examples: examples/wayland-compositor
+# End-to-end check of the Vulkan Wayland examples: projects/desktop/compositor
 # with both renderers (cpu, vulkan) showing examples/vulkan-wayland-client in
 # both of the client's zero-copy paths:
 #
@@ -41,7 +41,7 @@ export XDG_RUNTIME_DIR="$work/runtime"
 mkdir -m 700 "$XDG_RUNTIME_DIR"
 trap 'rm -rf -- "$work"' EXIT
 
-"$compiler" --quiet examples/wayland-compositor/main.mlx -o "$work/mlx-compositor"
+"$compiler" --quiet projects/desktop/compositor/main.mlx -o "$work/mlx-compositor"
 "$compiler" --quiet examples/vulkan-wayland-client/main.mlx -o "$work/vulkan-client"
 "$compiler" --quiet tools/wayland-test-host/main.mlx -o "$work/test-host"
 xkbcli compile-keymap --layout us > "$work/us.xkb"

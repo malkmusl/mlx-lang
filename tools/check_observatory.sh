@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# MLX Observatory (examples/mlx-observatory) end to end, on a small tree of its own:
+# MLX Observatory (projects/observatory) end to end, on a small tree of its own:
 #   - the scene shader passes std.spirv.module;
 #   - the command line (the same binary with a command) answers, also
 #     with the workarounds, the kept crashes, the programs and what they
@@ -26,8 +26,8 @@ command -v xkbcli > /dev/null || { echo "check_observatory.sh: xkbcli is not ins
 
 work=$(mktemp -d)
 trap '[[ -n "${KEEP_WORK:-}" ]] || rm -rf -- "$work"' EXIT
-"$compiler" --quiet examples/mlx-observatory/check_shader.mlx -o "$work/check-shader"
-"$compiler" --quiet examples/mlx-observatory/main.mlx -o "$work/mlx-observatory"
+"$compiler" --quiet projects/observatory/check_shader.mlx -o "$work/check-shader"
+"$compiler" --quiet projects/observatory/main.mlx -o "$work/mlx-observatory"
 "$compiler" --quiet tools/wayland-test-host/main.mlx -o "$work/test-host"
 xkbcli compile-keymap --layout us > "$work/us.xkb"
 
@@ -83,7 +83,7 @@ const app = @import("../app/main.mlx")
 pub fn gamma() -> usize { return 3 }
 MLX
 echo "lib !-> app" > "$tree/codemap.layers"
-# A crash kept by a desktop program (examples/wayland-compositor/crash.mlx)
+# A crash kept by a desktop program (projects/desktop/compositor/crash.mlx)
 # in greet, called from main.
 mkdir -p "$work/.local/state/mlx"
 printf 'crash\t1790000000\tapp\tillegal instruction (a failed runtime check)\tlib/helper.mlx:4:greet+0x1c\tapp/main.mlx:3:main+0x42\t_start+0x58\n' > "$work/.local/state/mlx/crashes.log"
