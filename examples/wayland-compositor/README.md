@@ -631,8 +631,9 @@ on`): the buffers its windows show are copied and the CPU carries on.
 
 ## Changing it while it runs
 
-The shell (the Wayland protocol and window management: `shell.mlx`,
-`data.mlx`, `dmabuf.mlx`, with `scene.mlx`'s bookkeeping) and the renderer
+The shell (the Wayland protocol and window management: `shell.mlx` with
+its parts `protocols.mlx`, `windows.mlx` and `launching.mlx`, `data.mlx`,
+`dmabuf.mlx`, `pointer.mlx`, with `scene.mlx`'s bookkeeping) and the renderer
 (`scene.mlx`'s drawing and `vulkan.mlx`) can be built as shared objects,
 `libmlx-shell.so` and `libmlx-render.so`, which the compositor loads at
 start-up and loads again whenever they change, without a restart:
@@ -657,8 +658,9 @@ GPU state. The program keeps the event loop, the monitor, the input
 devices and the session, and calls the shell and the renderer through a
 table (`entries.mlx`) that a load replaces. Every handler the shell
 registered with the Wayland server is replaced by the new build's function
-of the same name (each of `shell.mlx`, `data.mlx` and `dmabuf.mlx` lists
-its handlers at its end; `tools/check_compositor_modules.py` checks the
+of the same name (each of `shell.mlx`, `protocols.mlx`, `data.mlx`,
+`dmabuf.mlx` and `pointer.mlx` lists its handlers at its end, and
+`shell_table.mlx` joins the lists; `tools/check_compositor_modules.py` checks the
 lists are complete), and a new renderer fills its fixed pixels (background,
 frame colours, cursors) again. A build whose shared records differ (a field
 added to `state.mlx`, or to a record the renderer keeps) is refused, since
@@ -911,9 +913,11 @@ finished`.
   devices), `xkb.mlx` (keymap and modifiers), `logind.mlx` (the login
   session), `dbus.mlx` (a small D-Bus client) and `device.mlx` (device
   syscalls, and the emulated devices of the test harness).
-- `shell.mlx`: the server side, with globals, surfaces, shared memory,
-  xdg-shell, layer shell, the window list for docks, blur regions, focus
-  and input delivery, and launching programs.
+- `shell.mlx`: the server side, with globals, surfaces, shared memory and
+  xdg-shell. Its parts: `protocols.mlx` (layer shell, the window list for
+  docks, decorations, blur regions), `windows.mlx` (focus, window states,
+  resizing, input delivery, mapping) and `launching.mlx` (launching
+  programs).
 - `dmabuf.mlx`: linux-dmabuf; each dma-buf becomes a one-buffer pool.
 - `data.mlx`: `wl_data_device_manager`, copy and paste and drag and drop
   between clients.

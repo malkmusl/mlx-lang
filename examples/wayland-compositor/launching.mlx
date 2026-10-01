@@ -1,0 +1,580 @@
+// Launching clients; windows zooming out of the dock, previews, the dock hiding (part of shell.mlx, split from it).
+const std = @import("std")
+const wl = @import("std.wayland")
+const ui = @import("std.ui")
+const state = @import("./state.mlx")
+const scene = @import("./scene.mlx")
+const shell = @import("./shell.mlx")
+const protocols_module = @import("./protocols.mlx")
+
+// ---------------------------------------------------------------------------
+// Launching clients
+
+// Runs `program` (a path, or a name looked up in PATH) with our
+// WAYLAND_DISPLAY. Only called in the forked child.
+fn execute(program: [*]const u8, environment: [*][*]const u8) -> void {
+    var arguments: [2][*]const u8 = undefined
+    unsafe {
+        arguments[0] = program
+        arguments[1] = @ptrFromInt([*]const u8, 0)
+    }
+    var has_slash = false
+    var length: usize = 0
+    while program[length] != 0 {
+        if program[length] == 47 { has_slash = true }
+        length += 1
+    }
+    if has_slash {
+        const ignored = std.linux.syscall3(shell.SYS_execve, @intFromPtr(program), @intFromPtr(&arguments), @intFromPtr(environment))
+        return
+    }
+    const path = state.environmentValue(environment, "PATH")
+    if @intFromPtr(path) == 0 { return }
+    var candidate: [512]u8 = undefined
+    var position: usize = 0
+    while true {
+        var used: usize = 0
+        while path[position] != 0 && path[position] != 58 && used < 400 {
+            candidate[used] = path[position]
+            used += 1
+            position += 1
+        }
+        if used > 0 && used + length + 2 < 512 {
+            candidate[used] = 47
+            var index: usize = 0
+            while index <= length {
+                candidate[used + 1 + index] = program[index]
+                index += 1
+            }
+            const ignored = std.linux.syscall3(shell.SYS_execve, @intFromPtr(&candidate), @intFromPtr(&arguments), @intFromPtr(environment))
+        }
+        if path[position] == 0 { return }
+        position += 1
+    }
+}
+
+pub fn launch(compositor: *shell.Compositor, program: [*]const u8) -> void {
+    if compositor.*.verbose {
+        state.say("launch: ")
+        var length: usize = 0
+        while program[length] != 0 { length += 1 }
+        const shown = std.io.writeAllBytes(std.io.stdout(), program, length)
+        state.say("\n")
+    }
+    const child = std.linux.syscall0(shell.SYS_fork)
+    if child == 0 {
+        execute(program, compositor.*.environment)
+        const exited = std.linux.syscall1(shell.SYS_exit_group, 127)
+    }
+}
+
+// Sends the launcher that stays one byte (115 's': show); false when it is
+// gone (never a SIGPIPE: MSG_NOSIGNAL).
+pub fn tellLauncher(compositor: *shell.Compositor, command: u8) -> bool {
+    var byte: [1]u8 = [1]u8{ command }
+    const sent = std.linux.syscall6(shell.SYS_sendto, @bitCast(usize, compositor.*.launcherChannel), @intFromPtr(&byte), 1, shell.MSG_DONTWAIT | shell.MSG_NOSIGNAL, 0, 0)
+    // A full buffer (-EAGAIN) means it is busy, not gone.
+    return sent == 1 || sent == -11
+}
+
+// The helpers that stay running, started with the compositor: the launcher
+// (hidden until Super) and the dock.
+pub fn startHelpers(compositor: *shell.Compositor) -> void {
+    startLauncher(compositor, false)
+    startDock(compositor)
+    startTopbar(compositor)
+}
+
+// Starts the top bar to stay running, with its socket pair as MLX_TOPBAR_FD
+// (its end going tells the bar the compositor went).
+fn startTopbar(compositor: *shell.Compositor) -> void {
+    if !compositor.*.hasTopbar || compositor.*.topbarChannel >= 0 { return }
+    var pid: isize = -1
+    compositor.*.topbarChannel = startHelper(compositor, compositor.*.topbar, "MLX_TOPBAR_FD=", false, &pid)
+    compositor.*.topbarPid = pid
+    compositor.*.topbarStartedAt = @intCast(u32, (state.microseconds() / 1000) & 4294967295)
+}
+
+// Starts the launcher to stay running: with one end of a socket pair as
+// MLX_LAUNCHER_FD, on which it hears when to show itself, and
+// MLX_LAUNCHER_SHOW=1 when it should show itself once ready.
+pub fn startLauncher(compositor: *shell.Compositor, show: bool) -> void {
+    if !compositor.*.hasLauncher || compositor.*.launcherChannel >= 0 { return }
+    var pid: isize = -1
+    compositor.*.launcherChannel = startHelper(compositor, compositor.*.launcher, "MLX_LAUNCHER_FD=", show, &pid)
+    compositor.*.launcherPid = pid
+}
+
+// Starts the dock to stay running, with its socket pair as MLX_DOCK_FD.
+fn startDock(compositor: *shell.Compositor) -> void {
+    if !compositor.*.hasDock || compositor.*.dockChannel >= 0 { return }
+    var pid: isize = -1
+    compositor.*.dockChannel = startHelper(compositor, compositor.*.dock, "MLX_DOCK_FD=", false, &pid)
+    compositor.*.dockPid = pid
+    compositor.*.dockStartedAt = @intCast(u32, (state.microseconds() / 1000) & 4294967295)
+}
+
+// Starts `program` with one end of a new socket pair as `variable` (e.g.
+// "MLX_DOCK_FD=") in its environment; returns our end (nonblocking, not
+// inherited by other children), or -1. Its process id goes to `pid`.
+fn startHelper(compositor: *shell.Compositor, program: [*]const u8, variable: []const u8, show: bool, pid: *isize) -> isize {
+    var descriptors: [2]i32 = [2]i32{ -1, -1 }
+    if std.linux.syscall4(shell.SYS_socketpair, 1, 1, 0, @intFromPtr(&descriptors)) != 0 { return -1 }
+    const ours = @intCast(usize, descriptors[0])
+    const theirs = @intCast(usize, descriptors[1])
+    const cloexec = std.linux.syscall3(shell.SYS_fcntl, ours, shell.F_SETFD, shell.FD_CLOEXEC)
+    const nonblocking = std.linux.syscall3(shell.SYS_fcntl, ours, shell.F_SETFL, shell.O_NONBLOCK)
+    if compositor.*.verbose {
+        state.say("launch: ")
+        var length: usize = 0
+        while program[length] != 0 { length += 1 }
+        const shown = std.io.writeAllBytes(std.io.stdout(), program, length)
+        state.say("\n")
+    }
+    const child = std.linux.syscall0(shell.SYS_fork)
+    if child == 0 {
+        const closed_ours = std.linux.syscall1(shell.SYS_close, ours)
+        execute(program, helperEnvironment(compositor, variable, theirs, show))
+        const exited = std.linux.syscall1(shell.SYS_exit_group, 127)
+    }
+    const closed = std.linux.syscall1(shell.SYS_close, theirs)
+    if child < 0 {
+        const closed_ours = std.linux.syscall1(shell.SYS_close, ours)
+        return -1
+    }
+    pid.* = child
+    return @intCast(isize, ours)
+}
+
+// Our environment for a helper, with `variable``descriptor` (and
+// MLX_LAUNCHER_SHOW=1). Made in the child, just before exec.
+fn helperEnvironment(compositor: *shell.Compositor, name: []const u8, descriptor: usize, show: bool) -> [*][*]const u8 {
+    var count: usize = 0
+    while @intFromPtr(compositor.*.environment[count]) != 0 { count += 1 }
+    var result: [*][*]const u8 = undefined
+    unsafe { result = @ptrCast([*][*]const u8, state.allocate(compositor, (count + 3) * 8)) }
+    var index: usize = 0
+    while index < count {
+        result[index] = compositor.*.environment[index]
+        index += 1
+    }
+    const variable = state.allocate(compositor, 48)
+    var length: usize = 0
+    for byte in name {
+        variable[length] = byte
+        length += 1
+    }
+    var digits: [20]u8 = undefined
+    var digit_count: usize = 0
+    var rest = descriptor
+    while rest > 0 || digit_count == 0 {
+        digits[digit_count] = @intCast(u8, 48 + rest % 10)
+        rest = rest / 10
+        digit_count += 1
+    }
+    while digit_count > 0 {
+        digit_count -= 1
+        variable[length] = digits[digit_count]
+        length += 1
+    }
+    variable[length] = 0
+    unsafe { result[count] = @ptrCast([*]const u8, variable) }
+    count += 1
+    if show {
+        unsafe { result[count] = @ptrCast([*]const u8, "MLX_LAUNCHER_SHOW=1") }
+        count += 1
+    }
+    unsafe { result[count] = @ptrFromInt([*]const u8, 0) }
+    return result
+}
+
+fn closeChannel(channel: isize) -> void {
+    if channel >= 0 { const closed = std.linux.syscall1(shell.SYS_close, @bitCast(usize, channel)) }
+}
+
+// What the dock sent: 108 'l' is its apps button (the launcher shows,
+// unless that same click just closed it: then it stays closed, a toggle);
+// 112 'p', a count and that many u32 object ids (the dock's
+// zwlr_foreign_toplevel_handle_v1 objects) shows those windows' previews
+// (the same toggle); 122 'z': the next window opens out of the dock's
+// popup (a folder from its stack); 90 'Z' and four i32 (x, y, width,
+// height on the dock): out of that rectangle (an icon). The end of the
+// channel is the dock going (reapChildren starts it again).
+pub fn helperMessages(compositor: *shell.Compositor) -> void {
+    if compositor.*.dockChannel < 0 { return }
+    var bytes: [64]u8 = undefined
+    const count = std.linux.syscall3(0, @bitCast(usize, compositor.*.dockChannel), @intFromPtr(&bytes), 64)
+    if count == 0 || (count < 0 && count != -11) {
+        closeChannel(compositor.*.dockChannel)
+        compositor.*.dockChannel = -1
+        return
+    }
+    var index: usize = 0
+    const length = if count > 0 { @intCast(usize, count) } else { 0 }
+    while index < length {
+        const kind = bytes[index]
+        if kind == 108 {
+            const just_closed = compositor.*.launcherClosedAt != 0 && compositor.*.time -% compositor.*.launcherClosedAt < 400
+            if !just_closed && protocols_module.launcherSurface(compositor) == 0 { protocols_module.toggleLauncher(compositor) }
+            index += 1
+        } else if kind == 122 {
+            zoomFromPopup(compositor)
+            index += 1
+        } else if kind == 90 && index + 17 <= length {
+            var values: [4]i32 = [4]i32{ 0, 0, 0, 0 }
+            var value: usize = 0
+            while value < 4 {
+                const at = index + 1 + value * 4
+                values[value] = @bitCast(i32, @intCast(u32, bytes[at]) | (@intCast(u32, bytes[at + 1]) << 8) | (@intCast(u32, bytes[at + 2]) << 16) | (@intCast(u32, bytes[at + 3]) << 24))
+                value += 1
+            }
+            zoomFromDock(compositor, values[0], values[1], values[2], values[3])
+            index += 17
+        } else if kind == 112 && index + 1 < length {
+            const wanted = @intCast(usize, bytes[index + 1])
+            index += 2
+            var ids: [8]u32 = [8]u32{ 0, 0, 0, 0, 0, 0, 0, 0 }
+            var taken: usize = 0
+            while taken < wanted && index + 4 <= length {
+                const id = @intCast(u32, bytes[index]) | (@intCast(u32, bytes[index + 1]) << 8) | (@intCast(u32, bytes[index + 2]) << 16) | (@intCast(u32, bytes[index + 3]) << 24)
+                if taken < 8 { ids[taken] = id }
+                taken += 1
+                index += 4
+            }
+            const kept = if taken < 8 { taken } else { 8 }
+            const just_closed = compositor.*.previewClosedAt != 0 && compositor.*.time -% compositor.*.previewClosedAt < 400
+            if compositor.*.previewCount > 0 {
+                hidePreviews(compositor)
+            } else if !just_closed {
+                unsafe { showPreviews(compositor, @ptrCast([*]const u32, &ids), kept) }
+            }
+        } else {
+            index += 1
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Windows opening out of the dock (scene.zoomRect draws them): the dock
+// says a window is coming (a folder opened from its stack, the trash);
+// the next toplevel to map within three seconds grows out of the stack,
+// or the icon, to where it goes, and the stack goes as it comes.
+
+const ZOOM_WAIT: usize = 3000000
+
+fn expectZoom(compositor: *shell.Compositor, rect: ui.Rect, popup: bool) -> void {
+    if rect.width <= 0 || rect.height <= 0 { return }
+    compositor.*.zoomX = rect.x
+    compositor.*.zoomY = rect.y
+    compositor.*.zoomWidth = rect.width
+    compositor.*.zoomHeight = rect.height
+    compositor.*.zoomFromPopup = popup
+    compositor.*.zoomUntil = state.microseconds() + ZOOM_WAIT
+}
+
+// The dock's popup that shows (0: none).
+fn dockPopup(compositor: *shell.Compositor) -> usize {
+    const dock = dockSurface(compositor)
+    if dock == 0 { return 0 }
+    var index: usize = 0
+    while index < compositor.*.stack.length {
+        const address = state.listAt(compositor.*.stack, index)
+        const surface = state.surfaceAt(address)
+        if surface.*.role == state.ROLE_POPUP && surface.*.hasPopup && !surface.*.dismissed && protocols_module.rootAddress(address) == dock { return address }
+        index += 1
+    }
+    return 0
+}
+
+fn zoomFromPopup(compositor: *shell.Compositor) -> void {
+    const popup = dockPopup(compositor)
+    if popup == 0 { return }
+    expectZoom(compositor, scene.restBounds(state.surfaceAt(popup)), true)
+}
+
+fn zoomFromDock(compositor: *shell.Compositor, x: i32, y: i32, width: i32, height: i32) -> void {
+    const dock = dockSurface(compositor)
+    if dock == 0 { return }
+    const origin = scene.restBounds(state.surfaceAt(dock))
+    expectZoom(compositor, ui.rect(origin.x + x, origin.y + y, width, height), false)
+}
+
+// A toplevel mapped: when the dock said one is coming, it grows out of
+// the rectangle, and the dock's stack goes (not drawn from now on; the
+// dock is told to close it).
+pub fn startZoom(compositor: *shell.Compositor, surface: *shell.Surface) -> void {
+    if compositor.*.zoomUntil == 0 { return }
+    const now = state.microseconds()
+    const fresh = now < compositor.*.zoomUntil
+    compositor.*.zoomUntil = 0
+    if !fresh { return }
+    surface.*.zooming = true
+    surface.*.zoomX = compositor.*.zoomX
+    surface.*.zoomY = compositor.*.zoomY
+    surface.*.zoomWidth = compositor.*.zoomWidth
+    surface.*.zoomHeight = compositor.*.zoomHeight
+    surface.*.zoomStart = now
+    if compositor.*.zoomFromPopup {
+        const popup = dockPopup(compositor)
+        if popup != 0 {
+            const stack = state.surfaceAt(popup)
+            scene.damageSurface(compositor, stack)
+            stack.*.dismissed = true
+            wl.xdg_popup.Resource.fromObject(stack.*.popup).sendPopupDone()
+        }
+    }
+    if compositor.*.verbose {
+        state.say("zoom: from ")
+        state.sayInteger(surface.*.zoomWidth)
+        state.say("x")
+        state.sayInteger(surface.*.zoomHeight)
+        state.say(" at ")
+        state.sayInteger(surface.*.zoomX)
+        state.say(",")
+        state.sayInteger(surface.*.zoomY)
+        state.say("\n")
+    }
+}
+
+// After each frame: opening windows grow on (their bounds damaged, so
+// frames keep coming) until they rest.
+pub fn zoomStep(compositor: *shell.Compositor) -> void {
+    var index: usize = 0
+    while index < compositor.*.surfaces.length {
+        const surface = state.surfaceAt(state.listAt(compositor.*.surfaces, index))
+        index += 1
+        if !surface.*.zooming { continue }
+        scene.damageSurface(compositor, surface)
+        if state.microseconds() - surface.*.zoomStart >= scene.ZOOM_MICROS {
+            surface.*.zooming = false
+            scene.damageSurface(compositor, surface)
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Window previews (scene.mlx draws them): the dock asks for an app's
+// windows; a click on one brings it forward, anywhere else (or Escape)
+// closes them.
+
+// The surface a handle of the dock's client with object id `id` stands for
+// (0: none).
+fn dockWindow(compositor: *shell.Compositor, id: u32) -> usize {
+    const dock = dockSurface(compositor)
+    if dock == 0 { return 0 }
+    const dock_surface = state.surfaceAt(dock)
+    var index: usize = 0
+    while index < compositor.*.toplevelHandles.length {
+        const handle = protocols_module.handleAt(state.listAt(compositor.*.toplevelHandles, index))
+        if !handle.*.closed && handle.*.surface != 0 && handle.*.object.id == id && state.sameClient(handle.*.object, dock_surface.*.resource) { return handle.*.surface }
+        index += 1
+    }
+    return 0
+}
+
+fn showPreviews(compositor: *shell.Compositor, ids: [*]const u32, count: usize) -> void {
+    var shown: usize = 0
+    var index: usize = 0
+    while index < count {
+        const address = dockWindow(compositor, ids[index])
+        if address != 0 && state.surfaceAt(address).*.mapped {
+            compositor.*.previewWindows[shown] = address
+            shown += 1
+        }
+        index += 1
+    }
+    if shown == 0 { return }
+    compositor.*.previewCount = shown
+    compositor.*.previewHover = if compositor.*.pointerInside { scene.previewAt(compositor, compositor.*.pointerX, compositor.*.pointerY) } else { scene.PREVIEW_MAX }
+    scene.damagePreviews(compositor)
+    if compositor.*.verbose {
+        const panel = scene.previewPanel(compositor)
+        state.say("previews: ")
+        state.sayNumber(shown)
+        state.say(" windows, panel ")
+        state.sayInteger(panel.width)
+        state.say("x")
+        state.sayInteger(panel.height)
+        state.say(" at ")
+        state.sayInteger(panel.x)
+        state.say(",")
+        state.sayInteger(panel.y)
+        state.say("\n")
+    }
+}
+
+pub fn hidePreviews(compositor: *shell.Compositor) -> void {
+    if compositor.*.previewCount == 0 { return }
+    scene.damagePreviews(compositor)
+    compositor.*.previewCount = 0
+    compositor.*.previewHover = scene.PREVIEW_MAX
+    compositor.*.previewClosedAt = compositor.*.time
+    if compositor.*.previewClosedAt == 0 { compositor.*.previewClosedAt = 1 }
+    if compositor.*.verbose { state.say("previews closed\n") }
+}
+
+// A window went: out of the previews (which close when none is left).
+pub fn dropPreview(compositor: *shell.Compositor, address: usize) -> void {
+    var index: usize = 0
+    while index < compositor.*.previewCount {
+        if compositor.*.previewWindows[index] == address {
+            scene.damagePreviews(compositor)
+            var rest = index
+            while rest + 1 < compositor.*.previewCount {
+                compositor.*.previewWindows[rest] = compositor.*.previewWindows[rest + 1]
+                rest += 1
+            }
+            compositor.*.previewCount -= 1
+            compositor.*.previewHover = scene.PREVIEW_MAX
+            if compositor.*.previewCount == 0 { compositor.*.previewClosedAt = compositor.*.time }
+            scene.damagePreviews(compositor)
+            return
+        }
+        index += 1
+    }
+}
+
+// Whether (x, y) is on the panel.
+pub fn onPreviews(compositor: *const shell.Compositor, x: i32, y: i32) -> bool {
+    if compositor.*.previewCount == 0 { return false }
+    const panel = scene.previewPanel(compositor)
+    return x >= panel.x && y >= panel.y && x < panel.x + panel.width && y < panel.y + panel.height
+}
+
+// ---------------------------------------------------------------------------
+// The dock hiding (dock-autohide): it slides below the bottom edge when the
+// pointer has been away from it for DOCK_LINGER milliseconds, and back up
+// when the pointer touches the bottom edge. It stays while its previews
+// show or a button is held.
+
+const DOCK_LINGER: u32 = 600
+// Pixels a millisecond.
+const DOCK_SPEED: i32 = 1
+
+pub fn isDock(surface: *const shell.Surface) -> bool {
+    return surface.*.role == state.ROLE_LAYER && surface.*.hasLayerSurface && !surface.*.layerClosed && protocols_module.titleIs(surface, "mlx-dock")
+}
+
+// The dock's surface (0: none).
+fn dockSurface(compositor: *shell.Compositor) -> usize {
+    var index: usize = 0
+    while index < compositor.*.surfaces.length {
+        const address = state.listAt(compositor.*.surfaces, index)
+        if isDock(state.surfaceAt(address)) { return address }
+        index += 1
+    }
+    return 0
+}
+
+pub fn revealDock(compositor: *shell.Compositor) -> void {
+    compositor.*.dockWanted = true
+    compositor.*.dockLeftAt = 0
+    const dock = dockSurface(compositor)
+    if dock != 0 { scene.damageSurface(compositor, state.surfaceAt(dock)) }
+}
+
+// Each frame: whether the dock should show, and a step towards that.
+pub fn dockStep(compositor: *shell.Compositor, time: u32) -> void {
+    const elapsed = time -% compositor.*.dockTime
+    compositor.*.dockTime = time
+    const address = dockSurface(compositor)
+    if address == 0 { return }
+    const dock = state.surfaceAt(address)
+    if !dock.*.mapped { return }
+    var target: i32 = 0
+    if compositor.*.dockAutohide {
+        const hovered = compositor.*.pointerInside && compositor.*.pointerFocus == address
+        const at_edge = compositor.*.pointerInside && compositor.*.pointerY >= @intCast(i32, compositor.*.height) - 2
+        if hovered || at_edge || compositor.*.previewCount > 0 || compositor.*.buttonsDown > 0 {
+            compositor.*.dockLeftAt = 0
+        } else if compositor.*.dockWanted {
+            if compositor.*.dockLeftAt == 0 {
+                compositor.*.dockLeftAt = if time == 0 { 1 } else { time }
+            } else if time -% compositor.*.dockLeftAt >= DOCK_LINGER {
+                compositor.*.dockWanted = false
+                compositor.*.dockLeftAt = 0
+                if compositor.*.verbose { state.say("dock: hidden\n") }
+            }
+            // Frames keep coming while it waits.
+            scene.damageSurface(compositor, dock)
+        }
+        if !compositor.*.dockWanted { target = @intCast(i32, dock.*.pixelHeight) + dock.*.marginBottom }
+    }
+    if compositor.*.dockOffset == target { return }
+    var step = @intCast(i32, if elapsed > 50 { 50 } else { elapsed }) * DOCK_SPEED
+    if step < 1 { step = 1 }
+    scene.damageSurface(compositor, dock)
+    if compositor.*.dockOffset < target {
+        compositor.*.dockOffset = if compositor.*.dockOffset + step > target { target } else { compositor.*.dockOffset + step }
+    } else {
+        compositor.*.dockOffset = if compositor.*.dockOffset - step < target { target } else { compositor.*.dockOffset - step }
+    }
+    protocols_module.placeLayer(dock)
+    scene.damageSurface(compositor, dock)
+    if compositor.*.verbose && compositor.*.dockOffset == 0 && target == 0 { state.say("dock: shown\n") }
+}
+
+// Pointer motion while they show: the thumbnail under it is highlighted.
+pub fn previewMotion(compositor: *shell.Compositor) -> void {
+    const hover = scene.previewAt(compositor, compositor.*.pointerX, compositor.*.pointerY)
+    if hover != compositor.*.previewHover {
+        compositor.*.previewHover = hover
+        scene.damagePreviews(compositor)
+    }
+}
+
+// A window's content changed: its thumbnail too.
+pub fn previewContentChanged(compositor: *shell.Compositor, address: usize) -> void {
+    var index: usize = 0
+    while index < compositor.*.previewCount {
+        if compositor.*.previewWindows[index] == address {
+            scene.damagePreviews(compositor)
+            return
+        }
+        index += 1
+    }
+}
+
+// Collects exited children; a helper that ended is started again (the
+// launcher on the next Super; the dock at once, three times at most when
+// it keeps ending within five seconds).
+pub fn reapChildren(compositor: *shell.Compositor) -> void {
+    var status: [4]u8 = [4]u8{ 0, 0, 0, 0 }
+    while true {
+        const pid = std.linux.syscall4(shell.SYS_wait4, 18446744073709551615, @intFromPtr(&status), 1, 0)
+        if pid <= 0 { return }
+        if pid == compositor.*.launcherPid {
+            compositor.*.launcherPid = -1
+            closeChannel(compositor.*.launcherChannel)
+            compositor.*.launcherChannel = -1
+        }
+        if pid == compositor.*.dockPid {
+            compositor.*.dockPid = -1
+            closeChannel(compositor.*.dockChannel)
+            compositor.*.dockChannel = -1
+            const now = @intCast(u32, (state.microseconds() / 1000) & 4294967295)
+            const quickly = now -% compositor.*.dockStartedAt < 5000
+            compositor.*.dockFailures = if quickly { compositor.*.dockFailures + 1 } else { 0 }
+            if compositor.*.dockFailures < 3 {
+                state.say("dock: it ended; starting it again\n")
+                startDock(compositor)
+            } else {
+                state.say("dock: it keeps ending; not started again\n")
+            }
+        }
+        if pid == compositor.*.topbarPid {
+            compositor.*.topbarPid = -1
+            closeChannel(compositor.*.topbarChannel)
+            compositor.*.topbarChannel = -1
+            const now = @intCast(u32, (state.microseconds() / 1000) & 4294967295)
+            const quickly = now -% compositor.*.topbarStartedAt < 5000
+            compositor.*.topbarFailures = if quickly { compositor.*.topbarFailures + 1 } else { 0 }
+            if compositor.*.topbarFailures < 3 {
+                state.say("topbar: it ended; starting it again\n")
+                startTopbar(compositor)
+            } else {
+                state.say("topbar: it keeps ending; not started again\n")
+            }
+        }
+    }
+}

@@ -632,10 +632,18 @@ of popping up.
   - a file's declarations sit on a sphere around it.
 
   It also works out a node's connections and ranks search matches.
-- [`main.mlx`](main.mlx) projects the nodes with an orbit camera
-  ([`math3d.mlx`](math3d.mlx): sqrt, sin, cos, ln and exp, written out).
-  From that it makes the frame's primitives, and places labels so none
-  covers another.
+- [`main.mlx`](main.mlx) holds the app's state and its frame loop; its
+  parts each take one area: [`map_view.mlx`](map_view.mlx) projects the
+  nodes with an orbit camera ([`math3d.mlx`](math3d.mlx): sqrt, sin, cos,
+  ln and exp, written out), makes the frame's primitives and places labels
+  so none covers another; [`navigation.mlx`](navigation.mlx) (reading,
+  selecting, searching), [`input.mlx`](input.mlx), [`drawing.mlx`](drawing.mlx)
+  and [`detail.mlx`](detail.mlx) (the panels), [`tabs.mlx`](tabs.mlx),
+  [`editor_view.mlx`](editor_view.mlx) and [`assist.mlx`](assist.mlx) (the
+  editor), [`lists.mlx`](lists.mlx), [`filters.mlx`](filters.mlx),
+  [`project.mlx`](project.mlx) and [`actions.mlx`](actions.mlx) (the
+  toolbar's lists and what they do), [`access.mlx`](access.mlx) and
+  [`demo.mlx`](demo.mlx).
 - [`scene.mlx`](scene.mlx) sorts the primitives back to front and bins them
   into 16x16 tiles.
 - [`scene_shader.mlx`](scene_shader.mlx) is a compute shader built with

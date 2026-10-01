@@ -858,6 +858,7 @@ convention the guide's `tests/` citations use):
 | `156_selfhost_aggregate_layout_runtime.mlx` | struct/enum/union layout computation in `sema/types/` |
 | `157_selfhost_modules_runtime.mlx` | `modules.mlx` multi-file module graph loading |
 | `158_selfhost_module_errors_runtime.mlx` | module-graph error paths (import cycles, missing imports) |
+| `275_import_cycle_order_runtime.mlx` | declaration analysis across an import cycle (`tests/support/import_cycle/lib.mlx`, `part.mlx`, `user.mlx`): the cycle is broken at the module its others import, cycles that wait for no other cycle first; a module only waiting for a cycle is never where it is broken |
 | `182_selfhost_atomic_encoder_runtime.mlx` | `backend/x86_64/encoder.mlx` atomic instruction encoding |
 | `194_selfhost_lir_copy_propagation_runtime.mlx` | `ir/optimize.mlx`'s copy-propagation pass specifically |
 | `195_selfhost_encoder_rax_cache_runtime.mlx` | the backend's `rax`-caching optimization (see `cachedRaxLoads` metric in `driver/pipeline.mlx`) |

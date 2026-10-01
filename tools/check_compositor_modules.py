@@ -4,7 +4,7 @@
 When the shell module is loaded again (examples/wayland-compositor/modules.mlx),
 each handler the Wayland server holds is replaced by the new code's function of
 the same name, from the tables handlerAddress/handlerName at the end of
-shell.mlx, data.mlx, dmabuf.mlx and pointer.mlx. A function registered with setHandler,
+shell.mlx, protocols.mlx, data.mlx, dmabuf.mlx and pointer.mlx. A function registered with setHandler,
 setDestroyHandler, createGlobal or a client handler but missing from its file's
 table would keep running old code after a reload. Exit status 1 names it.
 
@@ -16,7 +16,7 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent / "examples" / "wayland-compositor"
-FILES = ["shell.mlx", "data.mlx", "dmabuf.mlx", "pointer.mlx"]
+FILES = ["shell.mlx", "protocols.mlx", "data.mlx", "dmabuf.mlx", "pointer.mlx"]
 
 
 def registered(text):
