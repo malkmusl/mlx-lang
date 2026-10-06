@@ -80,6 +80,14 @@ std.xml std.wayland` — several of which (`std.heap`, `std.math`,
 `std.atomic`) have no implementation under `std/` yet; those names are
 spec-only until a bootstrap or extensions module exists.
 
+A module may differ by platform: `std.X` is `std/src/X.<platform>.mlx`
+when the standard library has one for the target's platform (`linux` for
+`x86_64-linux` and `aarch64-linux`, `android` for `aarch64-android`), else
+`std/src/X.mlx`. `std.platform` (`platform.linux.mlx`,
+`platform.android.mlx`) names the platform, and `std.ui.host` is how a
+std.ui app runs on each (see [UI](ui.md)), so a program's own source is the
+same for every target (`tests/290_platform_module_runtime.mlx`).
+
 `std.xml` (`std/src/xml.mlx`) and `std.wayland` (`std/src/wayland.mlx` and
 `std/src/wayland/`) are implemented as Stage-1 extensions. They are imported
 by their own names (`@import("std.xml")`, `@import("std.wayland")`) and are
