@@ -40,6 +40,11 @@ pub const FrameStatus = enum(u8) { presented, out_of_date, failed }
 // returns false when recording failed.
 pub const DecorateFn = fn(usize, *gpu.Context, *Swapchain) -> bool
 
+// Prepares the swapchain frame before it is copied to the acquired image.
+// The callback may write its mapped memory on the CPU or complete a Vulkan
+// render into the buffer, keeping both on the same presentation path.
+pub const PaintFn = fn(usize, *Swapchain) -> bool
+
 fn clamp(value: u32, low: u32, high: u32) -> u32 {
     if value < low { return low }
     if value > high { return high }
@@ -201,35 +206,11 @@ fn sizeChanged(context: *gpu.Context, swapchain: *Swapchain) -> bool {
     return extent.width != swapchain.*.width || extent.height != swapchain.*.height
 }
 
-// Renders one pattern frame (the previous one is waited for first; this one
-// runs on the GPU after present returns) (`pattern.width`/`height` are set here),
-// lets `decorate` (a DecorateFn address, or 0) draw over it with `data`,
-// and presents it. out_of_date: recreate the swapchain (the window changed).
-pub fn present(context: *gpu.Context, swapchain: *Swapchain, kernel: *const gpu.Kernel, pattern: shaders.Pattern, decorate: usize, data: usize) -> FrameStatus {
-    var index: u32 = 0
-    // The previous frame is done with the acquire semaphore, the frame
-    // buffer and the command buffer.
-    if !gpu.finishPending(context) { return FrameStatus.failed }
-    gpu.step(context, "vkAcquireNextImageKHR")
-    const acquired = vk.acquireNextImageKHR(context.*.commands, context.*.device, swapchain.*.swapchain, 5000000000, swapchain.*.acquired, 0, &index)
-    if acquired == vk.Result.errorOutOfDateKhr { return FrameStatus.out_of_date }
-    if acquired != vk.Result.success && acquired != vk.Result.suboptimalKhr { return FrameStatus.failed }
+// Copies the already prepared frame buffer into `index`, submits it and
+// presents it. The caller owns command-buffer begin and all rendering into
+// swapchain.frame.
+fn presentRecorded(context: *gpu.Context, swapchain: *Swapchain, index: u32) -> FrameStatus {
     const image = swapchain.*.images[index]
-    var push = pattern
-    push.width = swapchain.*.width
-    push.height = swapchain.*.height
-    push.flags = push.flags | swapchain.*.formatFlags
-    gpu.step(context, "record the frame")
-    if !gpu.begin(context) { return FrameStatus.failed }
-    var buffers: [1]vk.Buffer = [1]vk.Buffer{ swapchain.*.frame.buffer }
-    unsafe {
-        if !gpu.dispatch(context, kernel, @ptrCast([*]const vk.Buffer, &buffers), &push, gpu.groups(push.width, shaders.GROUP_SIZE), gpu.groups(push.height, shaders.GROUP_SIZE)) { return FrameStatus.failed }
-    }
-    if decorate != 0 {
-        var function: DecorateFn = undefined
-        unsafe { function = @ptrFromInt(DecorateFn, decorate) }
-        if !function(data, context, swapchain) { return FrameStatus.failed }
-    }
     transition(context, image, vk.ImageLayout.undefined_, vk.ImageLayout.transferDstOptimal, 0, vk.ACCESS_TRANSFER_WRITE_BIT, vk.PIPELINE_STAGE_TRANSFER_BIT, vk.PIPELINE_STAGE_TRANSFER_BIT)
     var layers = vk.ImageSubresourceLayers.init()
     layers.aspectMask = vk.IMAGE_ASPECT_COLOR_BIT
@@ -244,7 +225,7 @@ pub fn present(context: *gpu.Context, swapchain: *Swapchain, kernel: *const gpu.
     vk.cmdCopyBufferToImage(context.*.commands, context.*.commandBuffer, swapchain.*.frame.buffer, image, vk.ImageLayout.transferDstOptimal, 1, &region)
     transition(context, image, vk.ImageLayout.transferDstOptimal, vk.ImageLayout.presentSrcKhr, vk.ACCESS_TRANSFER_WRITE_BIT, 0, vk.PIPELINE_STAGE_TRANSFER_BIT, vk.PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT)
     gpu.step(context, "vkQueueSubmit")
-    // Not waited for: the GPU runs the frame while the caller goes on.
+    // Not waited for: the GPU runs the copy while the caller returns to input.
     const rendered = swapchain.*.rendered[index]
     if !gpu.submitFrame(context, swapchain.*.acquired, vk.PIPELINE_STAGE_TRANSFER_BIT, rendered) { return FrameStatus.failed }
 
@@ -264,6 +245,62 @@ pub fn present(context: *gpu.Context, swapchain: *Swapchain, kernel: *const gpu.
         return if sizeChanged(context, swapchain) { FrameStatus.out_of_date } else { FrameStatus.presented }
     }
     return if result == vk.Result.success { FrameStatus.presented } else { FrameStatus.failed }
+}
+
+// Waits until the frame is no longer in use, lets `paint` prepare it, then
+// presents it through Vulkan. Host-coherent CPU writes are made visible by
+// the HOST -> TRANSFER barrier; GPU callbacks complete their own submission
+// and visibility barrier before returning.
+pub fn presentPixels(context: *gpu.Context, swapchain: *Swapchain, paint: usize, data: usize) -> FrameStatus {
+    if !gpu.finishPending(context) { return FrameStatus.failed }
+    var index: u32 = 0
+    gpu.step(context, "vkAcquireNextImageKHR")
+    const acquired = vk.acquireNextImageKHR(context.*.commands, context.*.device, swapchain.*.swapchain, 5000000000, swapchain.*.acquired, 0, &index)
+    if acquired == vk.Result.errorOutOfDateKhr { return FrameStatus.out_of_date }
+    if acquired != vk.Result.success && acquired != vk.Result.suboptimalKhr { return FrameStatus.failed }
+    if paint != 0 {
+        var function: PaintFn = undefined
+        unsafe { function = @ptrFromInt(PaintFn, paint) }
+        if !function(data, swapchain) { return FrameStatus.failed }
+    }
+    gpu.step(context, "record the frame")
+    if !gpu.begin(context) { return FrameStatus.failed }
+    var barrier = vk.MemoryBarrier.init()
+    barrier.srcAccessMask = vk.ACCESS_HOST_WRITE_BIT
+    barrier.dstAccessMask = vk.ACCESS_TRANSFER_READ_BIT
+    vk.cmdPipelineBarrier(context.*.commands, context.*.commandBuffer, vk.PIPELINE_STAGE_HOST_BIT, vk.PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &barrier, 0, null, 0, null)
+    return presentRecorded(context, swapchain, index)
+}
+
+// Renders one pattern frame (the previous one is waited for first; this one
+// runs on the GPU after present returns) (`pattern.width`/`height` are set here),
+// lets `decorate` (a DecorateFn address, or 0) draw over it with `data`,
+// and presents it. out_of_date: recreate the swapchain (the window changed).
+pub fn present(context: *gpu.Context, swapchain: *Swapchain, kernel: *const gpu.Kernel, pattern: shaders.Pattern, decorate: usize, data: usize) -> FrameStatus {
+    var index: u32 = 0
+    // The previous frame is done with the acquire semaphore, the frame
+    // buffer and the command buffer.
+    if !gpu.finishPending(context) { return FrameStatus.failed }
+    gpu.step(context, "vkAcquireNextImageKHR")
+    const acquired = vk.acquireNextImageKHR(context.*.commands, context.*.device, swapchain.*.swapchain, 5000000000, swapchain.*.acquired, 0, &index)
+    if acquired == vk.Result.errorOutOfDateKhr { return FrameStatus.out_of_date }
+    if acquired != vk.Result.success && acquired != vk.Result.suboptimalKhr { return FrameStatus.failed }
+    var push = pattern
+    push.width = swapchain.*.width
+    push.height = swapchain.*.height
+    push.flags = push.flags | swapchain.*.formatFlags
+    gpu.step(context, "record the frame")
+    if !gpu.begin(context) { return FrameStatus.failed }
+    var buffers: [1]vk.Buffer = [1]vk.Buffer{ swapchain.*.frame.buffer }
+    unsafe {
+        if !gpu.dispatch(context, kernel, @ptrCast([*]const vk.Buffer, &buffers), &push, gpu.groups(push.width, shaders.GROUP_SIZE), gpu.groups(push.height, shaders.GROUP_SIZE)) { return FrameStatus.failed }
+    }
+    if decorate != 0 {
+        var function: DecorateFn = undefined
+        unsafe { function = @ptrFromInt(DecorateFn, decorate) }
+        if !function(data, context, swapchain) { return FrameStatus.failed }
+    }
+    return presentRecorded(context, swapchain, index)
 }
 
 // Destroys the swapchain and its resources; with `keep_surface` the surface

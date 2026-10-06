@@ -18,6 +18,11 @@ projects/.../main.mlx -o ...`) and is checked by a script under `tools/`.
     and GPU), the layer-shell and window surface (`panel.mlx`), keyboard
     text, desktop entries and icons, places and the trash, thumbnails,
     the dock's pins, hotkeys and the clock's text.
+- [`android/files/`](android/files/README.md): the file manager on
+  Android (the same responsive UI); `tools/emulate_android_files.py`.
+- [`filemanager-shared/`](filemanager-shared/README.md): the file
+  manager's responsive layout and chrome, shared by `desktop/files` and
+  `android/files`.
 - [`observatory/`](observatory/README.md): MLX Observatory, an IDE around
   a 3D map of the code (`tools/codemap` is its index, shared with
   `tools/mlx-lsp`); `tools/check_observatory.sh`.

@@ -29,7 +29,9 @@ sys.path.insert(0, os.path.join(ROOT, "tools"))
 from aarch64_linux_emulator import Float32, SharedLibrary  # noqa: E402
 
 HEAP = 0x6000_0000_0000
-HEAP_SIZE = 16 << 20
+# GPU-canvas clients keep a 20 MiB image/font heap in mapped Vulkan memory.
+# Reserve enough virtual space for that plus the framework and swapchain.
+HEAP_SIZE = 64 << 20
 WINDOW = 0x5700_0000_0001
 QUEUE = 0x5700_0000_0002
 LOOPER = 0x5700_0000_0003
@@ -86,16 +88,20 @@ class FakeJni:
     an exception is pending, and unbalanced local frames, fail the run."""
 
     FUNCTIONS = {6: "FindClass", 17: "ExceptionClear", 19: "PushLocalFrame", 20: "PopLocalFrame",
-                 31: "GetObjectClass", 33: "GetMethodID", 36: "CallObjectMethodA", 51: "CallIntMethodA",
+                 21: "NewGlobalRef", 22: "DeleteGlobalRef", 30: "NewObjectA",
+                 31: "GetObjectClass", 33: "GetMethodID", 36: "CallObjectMethodA", 39: "CallBooleanMethodA", 51: "CallIntMethodA",
                  63: "CallVoidMethodA", 94: "GetFieldID", 100: "GetIntField", 113: "GetStaticMethodID",
                  131: "CallStaticIntMethodA", 167: "NewStringUTF", 228: "ExceptionCheck"}
     CLASSES = {"activity": "android/app/NativeActivity", "window": "android/view/Window",
                "attributes": "android/view/WindowManager$LayoutParams",
                "controller": "android/view/WindowInsetsController", "resources": "android/content/res/Resources",
                "string": "java/lang/String", "cutout": "android/view/DisplayCutout",
-               "decor": "android/view/View", "insets": "android/view/WindowInsets", "values": "android/graphics/Insets"}
+               "decor": "android/view/View", "insets": "android/view/WindowInsets", "values": "android/graphics/Insets",
+               "edit_text": "android/widget/EditText", "frame_layout_params": "android/widget/FrameLayout$LayoutParams",
+               "input_method_manager": "android/view/inputmethod/InputMethodManager"}
     METHODS = {("android/app/NativeActivity", "getWindow", "()Landroid/view/Window;"),
                ("android/app/NativeActivity", "getResources", "()Landroid/content/res/Resources;"),
+               ("android/app/NativeActivity", "getSystemService", "(Ljava/lang/String;)Ljava/lang/Object;"),
                ("android/content/res/Resources", "getIdentifier",
                 "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)I"),
                ("android/content/res/Resources", "getDimensionPixelSize", "(I)I"),
@@ -105,7 +111,11 @@ class FakeJni:
                ("android/view/WindowInsets", "getSystemWindowInsetTop", "()I"),
                ("android/view/WindowInsets", "getSystemWindowInsetRight", "()I"),
                ("android/view/WindowInsets", "getSystemWindowInsetBottom", "()I"),
-               ("android/view/WindowInsets", "getSystemWindowInsetLeft", "()I")}
+               ("android/view/WindowInsets", "getSystemWindowInsetLeft", "()I"),
+               ("android/widget/EditText", "<init>", "(Landroid/content/Context;)V"),
+               ("android/widget/EditText", "requestFocus", "()Z"),
+               ("android/view/inputmethod/InputMethodManager", "showSoftInput", "(Landroid/view/View;I)Z"),
+               ("android/widget/FrameLayout$LayoutParams", "<init>", "(II)V")}
     # Only from these API levels on.
     METHODS_SINCE = {28: {("android/view/WindowInsets", "getDisplayCutout", "()Landroid/view/DisplayCutout;"),
                           ("android/view/DisplayCutout", "getSafeInsetTop", "()I"),
@@ -117,7 +127,22 @@ class FakeJni:
                           ("android/view/WindowInsetsController", "setSystemBarsBehavior", "(I)V"),
                           ("android/view/WindowInsetsController", "hide", "(I)V"),
                           ("android/view/WindowInsetsController", "show", "(I)V")}}
-    VOID_METHODS = {("android/view/View", "setSystemUiVisibility", "(I)V")}
+    VOID_METHODS = {("android/view/View", "setSystemUiVisibility", "(I)V"),
+                    ("android/app/NativeActivity", "addContentView",
+                     "(Landroid/view/View;Landroid/view/ViewGroup$LayoutParams;)V"),
+                    ("android/widget/EditText", "setSingleLine", "(Z)V"),
+                    ("android/widget/EditText", "setFocusableInTouchMode", "(Z)V"),
+                    ("android/widget/EditText", "setTextColor", "(I)V"),
+                    ("android/widget/EditText", "setBackgroundColor", "(I)V"),
+                    ("android/widget/EditText", "setPadding", "(IIII)V"),
+                    ("android/widget/EditText", "setInputType", "(I)V"),
+                    ("android/widget/EditText", "setImeOptions", "(I)V"),
+                    ("android/widget/EditText", "setGravity", "(I)V"),
+                    ("android/widget/EditText", "setVisibility", "(I)V"),
+                    ("android/widget/EditText", "setLayoutParams",
+                     "(Landroid/view/ViewGroup$LayoutParams;)V"),
+                    ("android/widget/EditText", "clearFocus", "()V"),
+                    ("android/widget/FrameLayout$LayoutParams", "setMargins", "(IIII)V")}
 
     def __init__(self, framework, stub, sdk=34, insets=(0, 0, 0, 0), fullscreen=False, cutout=(0, 0, 0, 0),
                  portrait_status_bar=None, status_bar=None):
@@ -133,6 +158,12 @@ class FakeJni:
         self.behavior = None
         # (method, argument) of every system bar change, in order.
         self.bar_calls = []
+        # Android only serves a soft keyboard reliably when a real text
+        # editor owns focus. Specialized app models populate these through
+        # the JNI calls they support.
+        self.text_editors = []
+        self.focused_text_editor = 0
+        self.soft_input_targets = []
         self.pending = False
         self.frames = 0
         self.queries = 0
@@ -195,9 +226,33 @@ class FakeJni:
 
     def FindClass(self, process, env, name, *_):
         self.calm("FindClass")
-        if process.cstring(name) == "android/view/WindowInsets$Type" and self.sdk >= 30:
-            return self.new("class:android/view/WindowInsets$Type")
+        class_name = process.cstring(name)
+        if class_name == "android/view/WindowInsets$Type" and self.sdk >= 30:
+            return self.new("class:" + class_name)
+        if class_name in ("android/widget/EditText", "android/widget/FrameLayout$LayoutParams"):
+            return self.new("class:" + class_name)
         return self.throw()
+
+    def NewGlobalRef(self, process, env, obj, *_):
+        self.calm("NewGlobalRef")
+        return obj
+
+    def DeleteGlobalRef(self, process, env, obj, *_):
+        self.calm("DeleteGlobalRef")
+
+    def NewObjectA(self, process, env, cls, method, arguments, *_):
+        self.calm("NewObjectA")
+        class_name = self.objects[cls].split(":", 1)[1]
+        assert self.name_of(method) == "<init>"
+        if class_name == "android/widget/EditText":
+            assert struct.unpack("<Q", process.read(arguments, 8))[0] == ACTIVITY_OBJECT
+            return self.new("edit_text", {"visibility": 8, "layout": 0})
+        assert class_name == "android/widget/FrameLayout$LayoutParams"
+        return self.new("frame_layout_params", {
+            "width": self.int_argument(process, arguments),
+            "height": self.int_argument(process, arguments, 1),
+            "margins": (0, 0, 0, 0),
+        })
 
     def NewStringUTF(self, process, env, text, *_):
         self.calm("NewStringUTF")
@@ -255,6 +310,10 @@ class FakeJni:
                   "getInsetsController": "controller", "getResources": "resources"}
         if name in simple:
             return self.new(simple[name])
+        if name == "getSystemService":
+            service = struct.unpack("<Q", process.read(arguments, 8))[0]
+            assert self.data[service] == "input_method"
+            return self.new("input_method_manager")
         if name == "getRootWindowInsets":
             self.queries += 1
             return 0 if self.insets is None else self.new("insets")
@@ -264,6 +323,20 @@ class FakeJni:
         mask = self.int_argument(process, arguments)
         assert mask in (SYSTEM_BARS, DISPLAY_CUTOUT), f"getInsets({mask}): neither the system bars nor the cutout"
         return self.new("values", self.visible() if mask == SYSTEM_BARS else self.cutout)
+
+    def CallBooleanMethodA(self, process, env, obj, method, arguments, *_):
+        self.calm("CallBooleanMethodA")
+        name = self.name_of(method)
+        if name == "requestFocus":
+            assert obj in self.text_editors and self.data[obj]["visibility"] == 0
+            self.focused_text_editor = obj
+            return 1
+        assert name == "showSoftInput" and self.objects[obj] == "input_method_manager"
+        editor = struct.unpack("<Q", process.read(arguments, 8))[0]
+        flags = self.int_argument(process, arguments, 1)
+        assert editor == self.focused_text_editor
+        self.soft_input_targets.append((editor, flags))
+        return 1
 
     def CallIntMethodA(self, process, env, obj, method, arguments, *_):
         self.calm("CallIntMethodA")
@@ -286,6 +359,40 @@ class FakeJni:
     def CallVoidMethodA(self, process, env, obj, method, arguments, *_):
         self.calm("CallVoidMethodA")
         name = self.name_of(method)
+        if name == "addContentView":
+            editor, layout = (struct.unpack("<Q", process.read(arguments + 8 * index, 8))[0]
+                              for index in range(2))
+            assert self.objects[editor] == "edit_text"
+            assert self.objects[layout] == "frame_layout_params"
+            self.data[editor]["layout"] = layout
+            if editor not in self.text_editors:
+                self.text_editors.append(editor)
+            return
+        if name == "setLayoutParams":
+            layout = struct.unpack("<Q", process.read(arguments, 8))[0]
+            assert self.objects[obj] == "edit_text" and self.objects[layout] == "frame_layout_params"
+            self.data[obj]["layout"] = layout
+            return
+        if name == "setMargins":
+            assert self.objects[obj] == "frame_layout_params"
+            self.data[obj]["margins"] = tuple(self.int_argument(process, arguments, index) for index in range(4))
+            return
+        if name == "setPadding":
+            self.data[obj]["padding"] = tuple(self.int_argument(process, arguments, index) for index in range(4))
+            return
+        if name == "clearFocus":
+            if self.focused_text_editor == obj:
+                self.focused_text_editor = 0
+            return
+        if name == "setVisibility":
+            value = self.int_argument(process, arguments)
+            self.data[obj]["visibility"] = value
+            if value != 0 and self.focused_text_editor == obj:
+                self.focused_text_editor = 0
+            return
+        if self.objects.get(obj) == "edit_text":
+            self.data[obj][name] = self.int_argument(process, arguments)
+            return
         value = self.int_argument(process, arguments)
         self.bar_calls.append((name, value))
         if name == "setSystemBarsBehavior":
