@@ -153,8 +153,8 @@ the next frame.
 | --- | --- |
 | `std.ui.controls` | `button` (plain, normal, primary; disabled), `smallButton`, `toggleButton`, `iconButton`, `miniButton` (a small button in a row), `menuButton` (opens a list), `splitButton` (an action and an arrow for its list), `closeButton` (round, a cross), `chevronButton` (back, forward), `link` (underlined under the pointer), `chip` (a small button in a line of text), `crumb` (a step of a path), `swatch` (a colour to choose), `valueRow` (a row with a value box at its right, such as a key binding being recorded), `checkBox`/`checkRow`/`checkRowIn` (on, off, mixed; a colour of its own), `radioRow`, `switchToggle`/`switchRow` (a settings row), `heading` (a section that folds), `segment` (a choice), `pill`, `progress`, `sparkline`, labels |
 | `std.ui.field` | a one-line text field: `Field` (text, caret, selection), `fieldKey` (typing, Backspace/Delete by character or word, arrows, Home/End, Shift selecting, Ctrl+A, Enter, Escape), `textField` (drawn, a click places the caret; without the focus it shows the text's start), `notedField` (a note at its right, such as a count, and a text colour of its own) |
-| `std.ui.scroll` | `Scroll` (offset, content, view), the wheel over an area, `bar` (drag the thumb, page by a click), `mark`s on the bar, the rows in view |
-| `std.ui.lists` | list and side bar rows (lit, chosen, indent, note, room for an icon), `rowBackground` and `part` (a row the app fills, whose parts have ids of their own), a fold arrow, a divider |
+| `std.ui.scroll` | `Scroll` (offset, content, view), the wheel over an area, `bar` (drag the thumb, page by a click), `indicator` (the same as a thin bar over the content, without a track), `mark`s on the bar, the rows in view |
+| `std.ui.lists` | list and side bar rows (lit, chosen, indent, note, room for an icon), `rowBackground` and `part` (a row the app fills, whose parts have ids of their own), `columnHeader` (a sortable column's title), a fold arrow, a divider |
 | `std.ui.tabs` | a tab bar: tabs with a cross that closes them, a dot for unsaved changes |
 | `std.ui.popup` | a popup's frame (it takes the pointer from what is under it), menu items and separators, tooltips, wrapped text |
 | `std.ui.theme` | colours and sizes: `dark()` (the desktop apps), `light()` |
@@ -166,7 +166,8 @@ the next frame.
 a platform does (hover, clicks, a press let go elsewhere, a popup over a
 button, check rows, switches, segments, a row whose parts take their own
 clicks, a split button, a disabled back button, a crumb, a link, a
-swatch, a value row, a text field edited by keys, a
+swatch, a value row, a column header, a thin indicator, a text field
+edited by keys, a
 list scrolled by the wheel and by its bar, a tab closed, clipping,
 wrapping).
 `tests/264_ui_layout_runtime.mlx` covers the geometry, every alignment
