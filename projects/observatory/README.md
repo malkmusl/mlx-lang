@@ -653,7 +653,7 @@ of popping up.
   - anti-aliased lines with a gradient.
 
   Then it puts what the 2D canvas drew (panels, labels) over them. The panel
-  (`desktop-shared/panel.mlx`) runs it through its `scene` hook, in the same
+  (`std.ui.wayland.panel`) runs it through its `scene` hook, in the same
   frame after the canvas. Without Vulkan, `scene.drawCpu` draws the same
   picture on the CPU.
 

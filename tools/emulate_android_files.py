@@ -1,14 +1,19 @@
 #!/usr/bin/env python3
-"""Runs projects/android/files against the Android/Vulkan model.
+"""Runs Files on Android: projects/desktop/files/main.mlx, the same source
+as the desktop's mlx-files, built for aarch64-android (std.ui.host) and run
+against the Android/Vulkan model.
 
 The fixture is a real host directory exposed as ANativeActivity's
-internalDataPath. The app must use Vulkan by default, paint the shared Files
-UI, route the Vulkan demo's raw motion events into the toolbar and file rows,
-navigate into two naturally sorted directories, refresh, and cleanly destroy
-its activity state.
+internalDataPath (the app's home). The app must draw with Vulkan by
+default (no CPU frame), lay out a phone, compact or wide view by the
+window's size and density, open a folder with a tap, open its menu with a
+long press and make a folder from it, rename that folder with typed keys
+(the on-screen keyboard shown and hidden), go back, filter by the search,
+scroll with a drag without opening anything, and fall back to the CPU
+without Vulkan.
 
 Usage: python3 tools/emulate_android_files.py [-v] [app.apk | libmain.so]
-With no file, the script builds projects/android/files/main.mlx.
+With no file, the script builds projects/desktop/files/main.mlx.
 """
 import os
 import subprocess
@@ -20,42 +25,58 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "tools"))
 from emulate_android_app import (  # noqa: E402
     ACTION_DOWN,
+    ACTION_MOVE,
     ACTION_UP,
     MS,
     QUEUE,
     WINDOW,
+    compiler,
 )
 from emulate_vulkan_android import App as VulkanApp  # noqa: E402
 
+# Colours as an RGBA_8888 frame holds them (red in the low byte).
+FOLDER = 0xFFF0A05C       # the folder icon's front (92, 160, 240)
+BACKGROUND = 0xFF28201E   # the content (filemanager-shared/ui.mlx BACKGROUND)
+TOOLBAR = 0xFF2F2624      # the toolbar (36, 38, 47)
+
+# Android key codes and meta state (AKEYCODE_*, AMETA_SHIFT_ON).
+KEYCODE_ENTER = 66
+META_SHIFT_ON = 1
+KEY_ACTION_DOWN, KEY_ACTION_UP = 0, 1
+
+
+def keycode(letter):
+    return 29 + ord(letter.lower()) - ord("a")
+
 
 class FilesFramework(VulkanApp):
-    def __init__(self, library, data_path, verbose=False, vulkan=True):
+    def __init__(self, library, data_path, verbose=False, vulkan=True, size=(360, 640)):
         self.data_path = os.fsencode(data_path) + b"\0"
-        self.freed = []
         self.handled = []
         self.ime_shown = []
         self.ime_hidden = []
+        self.key_events = {}
         super().__init__(library, available=vulkan, verbose=verbose, jni={"sdk": 34, "insets": (24, 0, 30, 0)})
         self.vulkan.first_pipeline = "paint"
-        self.vulkan.extent = (360, 640)
+        self.vulkan.extent = size
+        self.width, self.height = size
+        self.framebuffer = self.malloc(size[0] * size[1] * 4)
 
     def _imports(self):
         imports = super()._imports()
-        imports["free"] = lambda process, address, *_: self.freed.append(address) or 0
         imports["AInputQueue_finishEvent"] = self._finish_event
-        imports["ANativeActivity_showSoftInput"] = self._show_soft_input
-        imports["ANativeActivity_hideSoftInput"] = self._hide_soft_input
+        imports["ANativeActivity_showSoftInput"] = lambda p, activity, flags, *_: self.ime_shown.append(flags & 0xFFFFFFFF)
+        imports["ANativeActivity_hideSoftInput"] = lambda p, activity, flags, *_: self.ime_hidden.append(flags & 0xFFFFFFFF)
+        imports["AInputEvent_getType"] = lambda p, event, *_: 1 if event in self.key_events else 2
+        imports["AKeyEvent_getAction"] = lambda p, event, *_: self.key_events[event][0]
+        imports["AKeyEvent_getKeyCode"] = lambda p, event, *_: self.key_events[event][1]
+        imports["AKeyEvent_getMetaState"] = lambda p, event, *_: self.key_events[event][2]
+        imports["AKeyEvent_getRepeatCount"] = lambda p, event, *_: 0
         return imports
 
     def _finish_event(self, process, queue, event, handled, *_):
         self.finished.append(event)
         self.handled.append(handled & 0xFFFFFFFF)
-
-    def _show_soft_input(self, process, activity, flags, *_):
-        self.ime_shown.append((activity, flags & 0xFFFFFFFF))
-
-    def _hide_soft_input(self, process, activity, flags, *_):
-        self.ime_hidden.append((activity, flags & 0xFFFFFFFF))
 
     def prepare_activity(self):
         super().prepare_activity()
@@ -63,324 +84,246 @@ class FilesFramework(VulkanApp):
         self.lib.write(address, self.data_path)
         self.put_u64(self.activity + 32, address)  # ANativeActivity.internalDataPath
 
+    def key(self, action, code, meta=0):
+        event = 0x4B00_0000_0000 + len(self.key_events)
+        self.key_events[event] = (action, code, meta)
+        self.pending.append(event)
+        callback, data = self.input_callback
+        keep = self.lib.call_address(callback, 0, 1, data, name="input")
+        assert keep & 0xFFFFFFFF == 1, "input callback unregistered itself"
 
-def feed(framework, events, base):
-    for action, x, y, at in events:
-        framework.touch(action, x, y, base + at)
-    return base + max(at for _, _, _, at in events) + 100 * MS
+    def type_text(self, text):
+        for letter in text:
+            meta = META_SHIFT_ON if letter.isupper() else 0
+            self.key(KEY_ACTION_DOWN, keycode(letter), meta)
+            self.key(KEY_ACTION_UP, keycode(letter), meta)
+        self.settle()
 
+    def press_key(self, code):
+        self.key(KEY_ACTION_DOWN, code)
+        self.key(KEY_ACTION_UP, code)
+        self.settle()
 
-def log_lines(framework):
-    return [text for tag, text in framework.logs if tag == "mlx"]
+    def tap(self, x, y):
+        self.touch(ACTION_DOWN, x, y, self.now + 10 * MS)
+        self.touch(ACTION_UP, x, y, self.now + 80 * MS)
+        self.settle()
 
+    def hold(self, x, y):
+        self.touch(ACTION_DOWN, x, y, self.now + 10 * MS)
+        self.advance(self.now + 700 * MS)
+        self.touch(ACTION_UP, x, y, self.now + 10 * MS)
+        self.settle()
 
-def frame_pixel(framework, x, y):
-    (width, height), pixels = framework.vulkan.frames[-1]
-    assert 0 <= x < width and 0 <= y < height
-    return pixels[y * width + x]
+    def drag(self, x, y, to_y):
+        self.touch(ACTION_DOWN, x, y, self.now + 10 * MS)
+        steps = 6
+        for step in range(1, steps + 1):
+            self.touch(ACTION_MOVE, x, y + (to_y - y) * step // steps, self.now + 16 * MS)
+        self.touch(ACTION_UP, x, to_y, self.now + 16 * MS)
+        self.settle()
 
+    def settle(self):
+        self.advance(self.now + 100 * MS)
 
-def run_empty_toolbar_touch(library, fixture, verbose):
-    """A fresh install has no rows, so its view buttons must still prove that
-    raw Android touch is connected to the shared Files UI."""
-    framework = FilesFramework(library, fixture, verbose)
-    framework.create()
-    runtime = framework.u64(framework.activity + 56)
-    framework.show_window()
-    framework.attach_input()
-
-    # 360x640 with a 24 px top inset: the closed sidebar toggle is 10..50 on
-    # the left; grid/list are 268..308/308..348 on the right. Opening the
-    # drawer moves its toggle into the drawer header at 228..268.
-    selected = 0xFF544642
-    unselected = 0xFF3A2F2C
-    grid_sample = (274, 52)
-    list_sample = (342, 52)
-    sidebar_sample = (262, 52)
-    problems = []
-    if frame_pixel(framework, *grid_sample) != unselected or frame_pixel(framework, *list_sample) != selected:
-        problems.append("initial list-view selection was not painted")
-
-    base = feed(framework, [(ACTION_DOWN, 288, 52, 0), (ACTION_UP, 288, 52, 80 * MS)], 0)
-    if frame_pixel(framework, *grid_sample) != selected or frame_pixel(framework, *list_sample) != unselected:
-        problems.append("grid button touch did not switch the visible view")
-
-    base = feed(framework, [(ACTION_DOWN, 328, 52, 0), (ACTION_UP, 328, 52, 80 * MS)], base)
-    if frame_pixel(framework, *grid_sample) != unselected or frame_pixel(framework, *list_sample) != selected:
-        problems.append("list button touch did not switch the visible view")
-
-    content_before = frame_pixel(framework, 20, 200)
-    base = feed(framework, [(ACTION_DOWN, 30, 52, 0), (ACTION_UP, 30, 52, 80 * MS)], base)
-    content_with_drawer = frame_pixel(framework, 20, 200)
-    if content_with_drawer == content_before:
-        problems.append("sidebar button did not paint the phone drawer")
-    sidebar_pixel = frame_pixel(framework, *sidebar_sample)
-    if sidebar_pixel != selected:
-        problems.append(f"open drawer did not paint its active sidebar button: {sidebar_pixel:#x}")
-    feed(framework, [(ACTION_DOWN, 264, 52, 0), (ACTION_UP, 264, 52, 80 * MS)], base)
-    if frame_pixel(framework, 20, 200) != content_before:
-        problems.append("sidebar button did not close the phone drawer")
-
-    # The same stateful toggle becomes a full-sidebar/icon-rail switch at the
-    # wide breakpoint instead of hiding desktop navigation completely.
-    framework.vulkan.extent = (940, 580)
-    framework.callback("onNativeWindowResized", WINDOW)
-    wide_sidebar = frame_pixel(framework, 100, 200)
-    base = feed(framework, [(ACTION_DOWN, 171, 50, 0), (ACTION_UP, 171, 50, 80 * MS)], base + 100 * MS)
-    if frame_pixel(framework, 100, 200) == wide_sidebar:
-        problems.append("wide sidebar did not collapse to an icon rail")
-    feed(framework, [(ACTION_DOWN, 27, 50, 0), (ACTION_UP, 27, 50, 80 * MS)], base)
-    if frame_pixel(framework, 100, 200) != wide_sidebar:
-        problems.append("wide icon rail did not expand back to the full sidebar")
-
-    lines = log_lines(framework)
-    if "files: input queue attached" not in lines or "files: touch input active" not in lines:
-        problems.append("Vulkan demo motion path did not reach the Files activity")
-    if "files: grid view" not in lines or "files: list view" not in lines:
-        problems.append("toolbar touches did not reach the Files UI actions")
-    if "files: sidebar drawer opened" not in lines or "files: sidebar drawer closed" not in lines:
-        problems.append("sidebar toggle did not reach the responsive UI state")
-    if "files: sidebar icon rail" not in lines or "files: sidebar expanded" not in lines:
-        problems.append("wide sidebar toggle did not reach the responsive UI state")
-    if framework.handled != [1] * 12:
-        problems.append(f"toolbar motion events were not handled: {framework.handled}")
-
-    framework.callback("onNativeWindowDestroyed", WINDOW)
-    framework.callback("onInputQueueDestroyed", QUEUE)
-    framework.callback("onDestroy")
-    if runtime not in framework.freed:
-        problems.append("empty-directory activity state was not released")
-    if framework.lib.missing:
-        problems.append(f"unmodeled imports called: {sorted(framework.lib.missing)}")
-
-    ok = not problems
-    if verbose or not ok:
-        print(f"{'ok  ' if ok else 'FAIL'} empty-directory toolbar touch")
-        for problem in problems:
-            print(f"     {problem}")
-    return ok
-
-
-def run_vulkan(library, fixture, verbose):
-    framework = FilesFramework(library, fixture, verbose)
-    framework.create()
-    runtime = framework.u64(framework.activity + 56)
-    framework.show_window()
-    framework.attach_input()
-    base = 0
-
-    def tap(x, y):
-        return [(ACTION_DOWN, x, y, 0), (ACTION_UP, x, y, 80 * MS)]
-
-    # 360x640, safe top 24/bottom 30: toolbar 24..128, rows begin at 128.
-    grid_button = tap(288, 52)
-    list_button = tap(328, 52)
-    first_grid_item = tap(96, 188)
-    first_row = tap(180, 154)
-    second_row = tap(180, 206)
-    back_button = tap(74, 52)
-    long_press = [(ACTION_DOWN, 180, 154, 0), (ACTION_UP, 180, 154, 700 * MS)]
-
-    # The shared toolbar changes to the real grid renderer; its first cell
-    # opens Project 2 through the same down/up path as the Vulkan demo. Return
-    # to list view, then exercise the existing direct-row gestures.
-    base = feed(framework, grid_button, base)
-    base = feed(framework, first_grid_item, base)
-    base = feed(framework, back_button, base)
-    base = feed(framework, list_button, base)
-    base = feed(framework, first_row, base)
-    base = feed(framework, long_press, base)
-    base = feed(framework, back_button, base)
-    base = feed(framework, second_row, base)
-
-    lines = log_lines(framework)
-    wanted = [
-        "files: private directory loaded",
-        "files: grid view",
-        "files: opened directory",
-        "files: parent directory",
-        "files: list view",
-        "files: opened directory",
-        "files: refreshed",
-        "files: parent directory",
-        "files: opened directory",
-    ]
-    position = 0
-    problems = []
-    for expected in wanted:
-        while position < len(lines) and lines[position] != expected:
-            position += 1
-        if position == len(lines):
-            problems.append(f"missing log line: {expected}")
+    def pixel(self, x, y):
+        if self.vulkan.frames:
+            (width, height), pixels = self.vulkan.frames[-1]
         else:
-            position += 1
-    if "files: Vulkan renderer ready" not in lines:
-        problems.append("Vulkan was not selected as the default renderer")
-    if framework.frames:
-        problems.append("the default path posted an ANativeWindow CPU frame")
-    if len(framework.vulkan.frames) < 5:
-        problems.append(f"only {len(framework.vulkan.frames)} Vulkan frames were presented")
-    else:
-        # Android stores RGBA_8888 with red in the least-significant byte.
-        # These are the shared Files background and toolbar palette entries,
-        # proving the Android adapter went through filemanager-shared/view.mlx
-        # instead of its former standalone dark-list renderer.
-        colors = set(framework.vulkan.frames[0][1])
-        background = 0xFF28201E
-        toolbar = 0xFF2F2624
-        if background not in colors or toolbar not in colors:
-            problems.append("first frame did not use the shared Files palette")
-    if framework.handled and set(framework.handled) != {1}:
-        problems.append(f"motion events were returned as unhandled: {framework.handled}")
-    if len(framework.handled) != 16:
-        problems.append(f"expected 16 finished motion events, got {len(framework.handled)}")
+            width, pixels = self.width, self.pixels()
+        return pixels[y * width + x]
 
-    framework.callback("onNativeWindowDestroyed", WINDOW)
-    framework.callback("onInputQueueDestroyed", QUEUE)
-    framework.callback("onDestroy")
-    if runtime not in framework.freed:
-        problems.append("file-manager activity state was not released")
-    if framework.lib.missing:
-        problems.append(f"unmodeled imports called: {sorted(framework.lib.missing)}")
+    def close(self):
+        self.callback("onNativeWindowDestroyed", WINDOW)
+        self.callback("onInputQueueDestroyed", QUEUE)
+        self.callback("onDestroy")
 
+
+def report(name, problems, verbose):
     ok = not problems
     if verbose or not ok:
-        print(f"{'ok  ' if ok else 'FAIL'} private-directory navigation")
-        if verbose:
-            print("     log: " + " | ".join(lines))
-        for problem in problems:
-            print(f"     {problem}")
+        print(f"{'ok  ' if ok else 'FAIL'} {name}" + "".join(f"\n     {p}" for p in problems))
     return ok
 
 
-def run_system_keyboard(library, fixture, verbose):
-    """The phone toolbar's second row exposes Search. A direct tap must
-    focus it through Android's NativeActivity IME API, and a tap outside it
-    must dismiss the same system keyboard."""
-    framework = FilesFramework(library, fixture, verbose)
+def start(library, fixture, verbose, vulkan=True, size=(360, 640)):
+    framework = FilesFramework(library, fixture, verbose, vulkan=vulkan, size=size)
     framework.create()
     framework.show_window()
     framework.attach_input()
+    framework.settle()
+    return framework
 
-    # Phone layout at 360x640: Search is x=12..348, y=84..124.
-    base = feed(framework, [(ACTION_DOWN, 180, 104, 0), (ACTION_UP, 180, 104, 80 * MS)], 0)
-    editor_focused = framework.jni.focused_text_editor in framework.jni.text_editors
-    editor = framework.jni.focused_text_editor
-    editor_layout = framework.jni.data[editor]["layout"] if editor_focused else 0
-    editor_geometry = framework.jni.data.get(editor_layout)
-    editor_padding = framework.jni.data[editor].get("padding") if editor_focused else None
-    editor_focusable = framework.jni.data[editor].get("setFocusableInTouchMode") if editor_focused else None
-    feed(framework, [(ACTION_DOWN, 180, 180, 0), (ACTION_UP, 180, 180, 80 * MS)], base)
-    editor_dismissed = editor_focused and framework.jni.focused_text_editor == 0 and framework.jni.data[editor]["visibility"] == 8
 
+# A phone at 360 x 640 (density 1): the status bar takes 24 pixels, the
+# navigation bar 30. The toolbar is 24 .. 128 (the search 84 .. 124), the
+# grid's cells 112 x 116 from (12, 140), three across; a cell's folder icon
+# shows its front at (cell x + 56, 185). Back is at 54 .. 94, 32 .. 72.
+def cell(index):
+    return 12 + 112 * (index % 3) + 56, 140 + 116 * (index // 3) + 45
+
+
+def run_phone(library, fixture, verbose):
+    framework = start(library, fixture, verbose)
     problems = []
-    if not editor_focused:
-        problems.append("search requested the IME without a focused Android text editor")
-    if framework.jni.soft_input_targets != [(editor, 0)]:
-        problems.append(f"standard IME was not targeted at the editor: {framework.jni.soft_input_targets}")
-    if framework.ime_shown:
-        problems.append(f"search still targeted NativeActivity's non-editor view: {framework.ime_shown}")
-    if editor_geometry != {"width": 336, "height": 40, "margins": (12, 84, 0, 0)}:
-        problems.append(f"Android editor did not cover the responsive search field: {editor_geometry}")
-    if editor_padding != (32, 0, 8, 0):
-        problems.append(f"Android editor did not preserve the search glyph inset: {editor_padding}")
-    if editor_focusable != 1:
-        problems.append("Android editor was not focusable in touch mode")
-    if not editor_dismissed:
-        problems.append("leaving search did not remove the Android editor from focus and hit testing")
-    if framework.ime_hidden != [(framework.activity, 0)]:
-        problems.append(f"leaving search did not hide the standard IME: {framework.ime_hidden}")
-    lines = log_lines(framework)
-    if "files: search focused" not in lines or "files: search dismissed" not in lines:
-        problems.append("search focus changes were not routed through the Files UI")
-    if framework.handled != [1, 1, 1, 1]:
-        problems.append(f"search motion events were not handled: {framework.handled}")
-
-    framework.callback("onNativeWindowDestroyed", WINDOW)
-    framework.callback("onInputQueueDestroyed", QUEUE)
-    framework.callback("onDestroy")
+    if framework.frames:
+        problems.append("a CPU frame although Vulkan is there")
+    if not framework.vulkan.frames:
+        problems.append("no Vulkan frame")
+        return report("phone: Vulkan", problems, verbose)
+    # Home: Project 2, Project 10 (folders first, numbers by value), then
+    # alpha.txt and Beta.txt.
+    if framework.pixel(*cell(0)) != FOLDER or framework.pixel(*cell(1)) != FOLDER:
+        problems.append(f"home: the folders are not in the first cells ({framework.pixel(*cell(0)):#x}, {framework.pixel(*cell(1)):#x})")
+    if framework.pixel(180, 100) != TOOLBAR and framework.pixel(20, 40) != TOOLBAR:
+        problems.append("home: no phone toolbar under the status bar")
+    # A tap opens Project 2 (one folder in it: Nested).
+    framework.tap(*cell(0))
+    if framework.pixel(*cell(0)) != FOLDER or framework.pixel(*cell(1)) != BACKGROUND:
+        problems.append(f"a tap on Project 2 did not open it ({framework.pixel(*cell(1)):#x} beside Nested)")
+    # A long press on empty space: the menu; its first entry makes a folder.
+    framework.hold(180, 400)
+    framework.tap(230, 420)
+    made = os.path.join(fixture, "Project 2", "untitled folder")
+    if not os.path.isdir(made):
+        problems.append(f"the menu's New Folder made nothing in Project 2: {sorted(os.listdir(os.path.join(fixture, 'Project 2')))}")
+    if 2 not in framework.ime_shown:
+        problems.append(f"renaming the new folder did not show the keyboard: {framework.ime_shown}")
+    # Typed keys rename it.
+    framework.type_text("Docs")
+    framework.press_key(KEYCODE_ENTER)
+    if not os.path.isdir(os.path.join(fixture, "Project 2", "Docs")):
+        problems.append(f"typing Docs and Enter did not rename it: {sorted(os.listdir(os.path.join(fixture, 'Project 2')))}")
+    if not framework.ime_hidden:
+        problems.append("the keyboard stayed up after the rename")
+    # Back home, then the search: "alp" leaves alpha.txt alone.
+    framework.tap(74, 52)
+    if framework.pixel(*cell(1)) != FOLDER:
+        problems.append("Back did not go home")
+    shown_before = len(framework.ime_shown)
+    framework.tap(180, 104)
+    if len(framework.ime_shown) <= shown_before:
+        problems.append("a tap on the search did not show the keyboard")
+    framework.type_text("alp")
+    if framework.pixel(*cell(0)) == FOLDER or framework.pixel(*cell(1)) != BACKGROUND:
+        problems.append("the search for alp still shows the folders")
+    if framework.handled and set(framework.handled) != {1}:
+        problems.append(f"input events were left to the system: {framework.handled}")
+    framework.close()
     if framework.lib.missing:
         problems.append(f"unmodeled imports called: {sorted(framework.lib.missing)}")
+    return report("phone: tap opens, long press menu, typed rename, Back, search (Vulkan)", problems, verbose)
 
-    ok = not problems
-    if verbose or not ok:
-        print(f"{'ok  ' if ok else 'FAIL'} Android system keyboard")
-        for problem in problems:
-            print(f"     {problem}")
-    return ok
+
+def run_scroll(library, fixture, verbose):
+    framework = start(library, fixture, verbose)
+    problems = []
+    before = framework.pixel(*cell(0))
+    first = framework.vulkan.frames[-1][1]
+    framework.drag(180, 520, 200)
+    after = framework.vulkan.frames[-1][1]
+    width = framework.vulkan.frames[-1][0][0]
+    rows = range(140, 560)
+    if all(first[y * width:(y + 1) * width] == after[y * width:(y + 1) * width] for y in rows):
+        problems.append("a drag did not scroll the grid")
+    if before != FOLDER:
+        problems.append("the first cell is not the folder")
+    if os.listdir(os.path.join(fixture, "Folder")) != []:
+        problems.append("the drag opened or changed something")
+    framework.close()
+    if framework.lib.missing:
+        problems.append(f"unmodeled imports called: {sorted(framework.lib.missing)}")
+    return report("phone: a drag scrolls, opens nothing", problems, verbose)
+
+
+def run_views(library, fixture, verbose):
+    """The same app at other sizes and densities: a phone at density 2
+    (720 x 1280: the toolbar twice as tall), a landscape tablet at density
+    2 (1280 x 800: 640 logical pixels, the compact view), and a wide
+    tablet (1600 x 1000: 800 logical pixels, the sidebar)."""
+    problems = []
+    cases = [((720, 1280), "phone"), ((1280, 800), "compact"), ((1600, 1000), "wide")]
+    for size, mode in cases:
+        framework = start(library, fixture, verbose, size=size)
+        if not framework.vulkan.frames:
+            problems.append(f"{size}: no Vulkan frame")
+            continue
+        # Below the status bar by 150 pixels: still the toolbar on a phone
+        # at density 2 (208 tall), the content in the compact view (104).
+        toolbar_deep = framework.pixel(size[0] - 40, 24 + 150) == TOOLBAR
+        # The wide view's sidebar (400 pixels): not the content's colour.
+        sidebar = framework.pixel(100, size[1] // 2) != BACKGROUND
+        if mode == "phone" and not toolbar_deep:
+            problems.append(f"{size}: not the phone view at density 2 (toolbar)")
+        if mode == "compact" and (toolbar_deep or sidebar):
+            problems.append(f"{size}: not the compact view (toolbar {toolbar_deep}, sidebar {sidebar})")
+        if mode == "wide" and not sidebar:
+            problems.append(f"{size}: no sidebar in the wide view")
+        framework.close()
+        if framework.lib.missing:
+            problems.append(f"unmodeled imports called: {sorted(framework.lib.missing)}")
+    return report("views by size and density: phone, compact, wide", problems, verbose)
 
 
 def run_cpu_fallback(library, fixture, verbose):
-    framework = FilesFramework(library, fixture, verbose, vulkan=False)
-    framework.create()
-    runtime = framework.u64(framework.activity + 56)
-    framework.show_window()
-    framework.attach_input()
-    framework.touch(ACTION_DOWN, 20, 16, 0)
-    framework.touch(ACTION_UP, 20, 16, 80 * MS)
-    lines = log_lines(framework)
+    framework = start(library, fixture, verbose, vulkan=False)
     problems = []
-    if "files: Vulkan unavailable" not in lines or "files: CPU window fallback active" not in lines:
-        problems.append("missing Vulkan-to-CPU fallback log")
     if framework.vulkan.frames:
         problems.append("a Vulkan frame was presented without Vulkan")
-    if len(framework.frames) < 2:
-        problems.append(f"only {len(framework.frames)} CPU fallback frames were posted")
-    if framework.handled != [1, 1]:
-        problems.append(f"CPU fallback input was not handled: {framework.handled}")
-    framework.callback("onNativeWindowDestroyed", WINDOW)
-    framework.callback("onInputQueueDestroyed", QUEUE)
-    framework.callback("onDestroy")
-    if runtime not in framework.freed:
-        problems.append("CPU fallback activity state was not released")
+    if not framework.frames:
+        problems.append("no CPU frame")
+    elif framework.pixel(*cell(0)) != FOLDER:
+        problems.append("the CPU frame does not show the folders")
+    framework.tap(*cell(0))
+    if framework.pixel(*cell(1)) != BACKGROUND:
+        problems.append("a tap did not open Project 2 on the CPU path")
+    framework.close()
     if framework.lib.missing:
         problems.append(f"unmodeled imports called: {sorted(framework.lib.missing)}")
-    ok = not problems
-    if verbose or not ok:
-        print(f"{'ok  ' if ok else 'FAIL'} CPU fallback")
-        for problem in problems:
-            print(f"     {problem}")
-    return ok
+    return report("CPU fallback without Vulkan", problems, verbose)
 
 
-def run(library, fixture, empty_fixture, verbose):
-    passed = (
-        int(run_empty_toolbar_touch(library, empty_fixture, verbose))
-        + int(run_vulkan(library, fixture, verbose))
-        + int(run_system_keyboard(library, fixture, verbose))
-        + int(run_cpu_fallback(library, fixture, verbose))
-    )
-    print(f"{passed}/4 android file-manager scenarios passed")
-    return passed == 4
+def fixture_home(root):
+    os.makedirs(os.path.join(root, "Project 2", "Nested"))
+    os.makedirs(os.path.join(root, "Project 10"))
+    open(os.path.join(root, "alpha.txt"), "wb").close()
+    open(os.path.join(root, "Beta.txt"), "wb").close()
+
+
+def run(library, tmp, verbose):
+    homes = [os.path.join(tmp, name) for name in ("phone", "scroll", "views", "cpu")]
+    for home in homes:
+        os.makedirs(home)
+    fixture_home(homes[0])
+    os.makedirs(os.path.join(homes[1], "Folder"))
+    for index in range(40):
+        open(os.path.join(homes[1], f"file {index:02d}.txt"), "wb").close()
+    fixture_home(homes[2])
+    fixture_home(homes[3])
+    results = [
+        run_phone(library, homes[0], verbose),
+        run_scroll(library, homes[1], verbose),
+        run_views(library, homes[2], verbose),
+        run_cpu_fallback(library, homes[3], verbose),
+    ]
+    print(f"{sum(results)}/{len(results)} android file-manager scenarios passed")
+    return all(results)
 
 
 def main():
     arguments = [argument for argument in sys.argv[1:] if argument != "-v"]
     verbose = "-v" in sys.argv[1:]
     with tempfile.TemporaryDirectory() as tmp:
-        fixture = os.path.join(tmp, "files")
-        empty_fixture = os.path.join(tmp, "empty-files")
-        os.makedirs(empty_fixture)
-        os.makedirs(os.path.join(fixture, "Project 2", "Nested"))
-        os.makedirs(os.path.join(fixture, "Project 10"))
-        open(os.path.join(fixture, "alpha.txt"), "wb").close()
-        open(os.path.join(fixture, "Beta.txt"), "wb").close()
-
         library = os.path.join(tmp, "libmain.so")
         if not arguments:
-            subprocess.run([
-                os.path.join(ROOT, "zig-out/bin/mlx1"),
-                "projects/android/files/main.mlx",
-                "-o", library,
-                "--target=aarch64-android",
-                "--quiet",
-            ], cwd=ROOT, check=True)
+            subprocess.run([compiler(), "projects/desktop/files/main.mlx", "-o", library,
+                            "--target=aarch64-android", "--quiet"], cwd=ROOT, check=True)
         elif arguments[0].endswith(".apk"):
             with zipfile.ZipFile(arguments[0]) as apk, open(library, "wb") as output:
                 output.write(apk.read("lib/arm64-v8a/libmain.so"))
         else:
             library = arguments[0]
-        return 0 if run(library, fixture, empty_fixture, verbose) else 1
+        return 0 if run(library, tmp, verbose) else 1
 
 
 if __name__ == "__main__":

@@ -13,9 +13,10 @@ fire when the simulated clock passes its deadline, and checks the color of
 every posted frame and the logcat lines.
 
 Usage: python3 tools/emulate_android_app.py [-v] [app.apk | libmain.so]
-With no file, builds examples/android/gestures.mlx with zig-out/bin/mlx1,
-and also examples/android/widgets.mlx (std.ui widgets on startUi), whose
-switch row and segment it taps in a larger window.
+With no file, builds examples/android/gestures.mlx with tools/ensure_compiler.sh's compiler,
+and also examples/android/widgets.mlx (std.ui widgets on std.ui.host, drawn
+by Vulkan and on the CPU), whose switch row and segment it taps in a larger
+window.
 """
 import os
 import struct
@@ -478,6 +479,8 @@ class Framework:
             "ANativeWindow_setBuffersGeometry": lambda p, *_: 0,
             "ANativeWindow_lock": f._lock,
             "ANativeWindow_unlockAndPost": f._post,
+            "ANativeWindow_getWidth": lambda p, *_: f.width,
+            "ANativeWindow_getHeight": lambda p, *_: f.height,
             "ALooper_forThread": lambda p, *_: LOOPER,
             "ALooper_addFd": f._add_fd,
             "ALooper_removeFd": lambda p, looper, fd, *_: 1 if f.fd_callbacks.pop(fd & 0xFFFFFFFF, None) else 0,
@@ -668,53 +671,86 @@ def check_reserved(library, verbose, fullscreen):
     return not problems
 
 
-# examples/android/widgets.mlx (std.ui on std.android.startUi): its
-# colours as the window holds them (bytes R, G, B, A).
+# examples/android/widgets.mlx (std.ui on std.ui.host, the same source as
+# its desktop build): its colours as the window holds them (bytes R, G, B,
+# A), drawn by Vulkan or, without it, on the CPU.
 DARK_BACKGROUND, LIGHT_BACKGROUND = rgb(26, 28, 36), rgb(246, 246, 248)
 LIGHT_PRESSED = rgb(208, 211, 220)
 WIDGETS_SIZE = (360, 720)
 
 
-def run_widgets(library, verbose):
+def run_widgets(library, verbose, vulkan):
     """Taps on the widgets example: the first switch row turns the dark
     look off (the background turns light), the third segment is chosen
-    (its fill), and a tap on the empty space below changes nothing."""
-    framework = Framework(library, verbose, size=WIDGETS_SIZE)
+    (its fill), a tap on the empty space below changes nothing, and a drag
+    over a row scrolls instead of switching it."""
+    from emulate_vulkan_android import App  # noqa: E402 (it imports this file)
+    framework = App(library, available=vulkan, verbose=verbose, jni={"sdk": 34, "insets": (24, 0, 30, 0)})
+    framework.vulkan.first_pipeline = "paint"
+    framework.vulkan.extent = WIDGETS_SIZE
+    framework.width, framework.height = WIDGETS_SIZE
+    framework.framebuffer = framework.malloc(WIDGETS_SIZE[0] * WIDGETS_SIZE[1] * 4)
     framework.create()
     framework.show_window()
     framework.attach_input()
     width = WIDGETS_SIZE[0]
-    def at(pixels, x, y):
-        return pixels[y * width + x]
+
+    def pixels():
+        if vulkan:
+            return framework.vulkan.frames[-1][1]
+        return framework.pixels()
+
+    def presented():
+        return len(framework.vulkan.frames) if vulkan else len(framework.frames)
+
+    def at(frame, x, y):
+        return frame[y * width + x]
     problems = []
-    first = framework.pixels()
-    if at(first, 2, 2) != DARK_BACKGROUND:
-        problems.append(f"start: background {at(first, 2, 2):#010x}, expected dark {DARK_BACKGROUND:#010x}")
+    first = pixels()
+    if at(first, 2, 100) != DARK_BACKGROUND:
+        problems.append(f"start: background {at(first, 2, 100):#010x}, expected dark {DARK_BACKGROUND:#010x}")
+
     def tap(x, y, start):
         framework.touch(ACTION_DOWN, x, y, start * MS)
         framework.touch(ACTION_UP, x, y, (start + 80) * MS)
-    tap(180, 70, 100)
-    after_switch = framework.pixels()
-    if at(after_switch, 2, 2) != LIGHT_BACKGROUND:
-        problems.append(f"the dark switch: background {at(after_switch, 2, 2):#010x}, expected light {LIGHT_BACKGROUND:#010x}")
-    # Segments: y 352 .. 448, three across 24 .. 336.
-    segment = (300, 380)
+        framework.advance((start + 120) * MS)
+    # Below the 24 px status bar and an 8 px margin: rows of 32 with 8
+    # between, the segments after a 24 px gap (y 168 .. 200).
+    tap(180, 48, 100)
+    after_switch = pixels()
+    if at(after_switch, 2, 100) != LIGHT_BACKGROUND:
+        problems.append(f"the dark switch: background {at(after_switch, 2, 100):#010x}, expected light {LIGHT_BACKGROUND:#010x}")
+    segment = (250, 184)
     if at(after_switch, *segment) == LIGHT_PRESSED:
         problems.append("the third segment is chosen before it was tapped")
     tap(segment[0], segment[1], 400)
-    after_segment = framework.pixels()
+    after_segment = pixels()
     if at(after_segment, *segment) != LIGHT_PRESSED:
         problems.append(f"the third segment: {at(after_segment, *segment):#010x}, expected {LIGHT_PRESSED:#010x}")
-    frames = len(framework.frames)
-    tap(180, 700, 700)
-    if framework.pixels() != after_segment:
+    frames = presented()
+    tap(180, 600, 700)
+    if pixels() != after_segment:
         problems.append("a tap beside the widgets changed the window")
-    if len(framework.frames) <= frames:
+    if presented() <= frames:
         problems.append("a tap was not painted")
+    # A drag starting on the dark switch scrolls: no click.
+    framework.touch(ACTION_DOWN, 180, 48, 1000 * MS)
+    framework.touch(ACTION_MOVE, 180, 120, 1040 * MS)
+    framework.touch(ACTION_UP, 180, 120, 1080 * MS)
+    framework.advance(1200 * MS)
+    if at(pixels(), 2, 100) != LIGHT_BACKGROUND:
+        problems.append("a drag over the dark switch switched it")
+    framework.callback("onNativeWindowDestroyed", WINDOW)
+    framework.callback("onInputQueueDestroyed", QUEUE)
+    framework.callback("onDestroy")
+    if vulkan and framework.frames:
+        problems.append("the Vulkan path posted a CPU frame")
+    if not vulkan and framework.vulkan.frames:
+        problems.append("a Vulkan frame without Vulkan")
     if framework.lib.missing:
         problems.append(f"unmodeled imports called: {sorted(framework.lib.missing)}")
     ok = not problems
-    print(f"{'ok  ' if ok else 'FAIL'} widgets: a switch row, a segment, a tap beside them"
+    print(f"{'ok  ' if ok else 'FAIL'} widgets ({'Vulkan' if vulkan else 'CPU'}): a switch row, a segment, a tap beside them, a drag"
           + "".join(f"\n     {p}" for p in problems))
     return 0 if ok else 1
 
@@ -785,19 +821,28 @@ def run_scenarios(library, verbose):
     return failures
 
 
+def compiler():
+    """The checkout's Mlx compiler (tools/ensure_compiler.sh): the one that
+    knows std's per-target modules (std.ui.host)."""
+    return subprocess.run([os.path.join(ROOT, "tools/ensure_compiler.sh")], cwd=ROOT, check=True,
+                          capture_output=True, text=True).stdout.strip()
+
+
 def main():
     arguments = [a for a in sys.argv[1:] if a != "-v"]
     verbose = "-v" in sys.argv[1:]
     with tempfile.TemporaryDirectory() as tmp:
         library = os.path.join(tmp, "libmain.so")
         if not arguments:
-            subprocess.run([os.path.join(ROOT, "zig-out/bin/mlx1"), "examples/android/gestures.mlx", "-o", library,
+            subprocess.run([compiler(), "examples/android/gestures.mlx", "-o", library,
                             "--target=aarch64-android", "--quiet"], cwd=ROOT, check=True)
             widgets = os.path.join(tmp, "libwidgets.so")
-            subprocess.run([os.path.join(ROOT, "zig-out/bin/mlx1"), "examples/android/widgets.mlx", "-o", widgets,
+            subprocess.run([compiler(), "examples/android/widgets.mlx", "-o", widgets,
                             "--target=aarch64-android", "--quiet"], cwd=ROOT, check=True)
             failed = run_scenarios(library, verbose)
-            return 1 if run_widgets(widgets, verbose) or failed else 0
+            failed += run_widgets(widgets, verbose, vulkan=True)
+            failed += run_widgets(widgets, verbose, vulkan=False)
+            return 1 if failed else 0
         elif arguments[0].endswith(".apk"):
             with zipfile.ZipFile(arguments[0]) as apk, open(library, "wb") as out:
                 out.write(apk.read("lib/arm64-v8a/libmain.so"))

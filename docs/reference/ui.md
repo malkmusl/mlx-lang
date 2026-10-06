@@ -159,18 +159,47 @@ the next frame.
 | `std.ui.popup` | a popup's frame (it takes the pointer from what is under it), menu items and separators, tooltips, wrapped text |
 | `std.ui.theme` | colours and sizes: `dark()` (the desktop apps), `light()` |
 | `std.ui.keys` | keys as widgets take them: Linux input codes and modifier bits on every platform |
-| `std.ui.app` | what a platform gives a std.ui app: the events (pointer, buttons, wheel, keys, configured, closed, tick), `Draw` and `Handler`, and `feed` (a pointer event to the widgets) |
+| `std.ui.app` | what a platform gives a std.ui app: the events (pointer, buttons, wheel, keys, configured, closed, tick; drags and drops where there are any), `Draw` and `Handler`, and `feed` (a pointer event to the widgets) |
+| `std.ui.host` | the platform itself, one API for all: a Wayland window on Linux, a NativeActivity on Android (see Platforms) |
 
 ## Platforms
 
 A std.ui app is a `Draw` and a `Handler` (`std.ui.app`) over the app's
-own state; the platform calls them. The same widgets, theme and fonts
-run on:
+own state; the platform calls them. `std.ui.host` is the platform: the
+compiler takes `std/src/ui/host.linux.mlx` for Linux targets and
+`std/src/ui/host.android.mlx` for `--target=aarch64-android` (see
+`std.platform`), and both have the same functions, so one source builds
+for both. A program has both entries; the other platform's does nothing:
 
-| Platform | Starts with | Notes |
+```mlx
+const host = @import("std.ui.host")
+
+pub fn main(arguments: [][*]const u8) -> !void {
+    const state = newState()     // its std.ui.view.Ui, theme, fonts
+    state.*.host = host.create(options(), @ptrCast(*anyopaque, state), draw, onEvent).?
+    try host.open(state.*.host, arguments)
+    try host.run(state.*.host)
+}
+
+export fn ANativeActivity_onCreate(activity: usize, saved_state: usize, saved_state_size: usize) -> void {
+    const state = newState()
+    state.*.host = host.create(options(), @ptrCast(*anyopaque, state), draw, onEvent).?
+    const opened = host.openActivity(state.*.host, activity, saved_state, saved_state_size)
+}
+```
+
+`create` only allocates, so the app has its host before the first event.
+The app asks the platform through the host: `redraw`, `setTick`,
+`width`/`height`, `insets` (the system bars' space), `scale` (pixels per
+logical pixel), `typed` and `modifiers` (the current key), `wheelPixels`,
+`showKeyboard`/`hideKeyboard`, `home` (where its files are),
+`environmentValue`, `log`; what only a desktop has (`setTitle`,
+`setBlur`, `acceptDrops`, `startDrag`) does nothing on a phone.
+
+| Platform | Drawn by | Input |
 | --- | --- | --- |
-| Wayland (desktop) | `projects/desktop/shared/panel.mlx`: `openWindow` or `open` (layer shell) | CPU or GPU canvas; its own events too (menus, drag and drop, the window list) |
-| Android | `std.android.startUi(activity, ..., context, draw, event)` | the finger is the left button; the system bars' space is `std.android.reservedInsets` |
+| Linux (`std.ui.wayland.panel`) | the GPU (linux-dmabuf or shared memory) or the CPU | pointer, wheel, keyboard (`std.xkb`), drag and drop |
+| Android | the GPU (`std.ui.gpu_canvas` into a `VK_KHR_android_surface` swapchain, frames by `AChoreographer`), the CPU into the locked window without Vulkan | the finger is the left button; dragged past a slop it scrolls (`EVENT_WHEEL`, no click), held still it is the right button; keys (a hardware or the on-screen keyboard) as Linux codes; `$HOME` is the app's `internalDataPath` |
 
 ```mlx
 fn onEvent(context: *anyopaque, kind: u32, a: u32, b: i32) -> void {
@@ -189,8 +218,8 @@ even when the press comes before the first frame (a platform may deliver
 it then) or after a change not drawn yet.
 
 `examples/android/widgets.mlx` is a settings screen of switch rows, a
-check row, segments and a button on Android; mlx-settings is one on
-Wayland.
+check row, segments and a button, from one source on Android and on the
+desktop; mlx-settings is one on Wayland.
 
 ## Tests
 
@@ -202,7 +231,8 @@ swatch, a value row, a column header, a thin indicator, events through
 `std.ui.app.feed`, a text field edited by keys, a list scrolled by the
 wheel and by its bar, a tab closed, clipping, wrapping).
 `tools/emulate_android_app.py` runs `examples/android/widgets.mlx` against
-a model of Android (Unicorn) and taps a switch row and a segment.
+a model of Android (Unicorn), drawn by a mock Vulkan driver and again on
+the CPU, and taps a switch row and a segment and drags over a row.
 `tests/264_ui_layout_runtime.mlx` covers the geometry, every alignment
 (including children that do not fit), bands, containers, stacks, a screen
 with safe insets and reserved top and bottom bars, and `fillRect`'s

@@ -54,8 +54,10 @@ crash. `timezone.mlx` (`std.timezone`) gives local time from `$TZ` or
 `ui/lists.mlx`, `ui/tabs.mlx`, `ui/popup.mlx`, `ui/glyphs.mlx`,
 `ui/theme.mlx` and `ui/keys.mlx` are widgets for any platform;
 `ui/app.mlx` is what a platform gives an app of them (events, `feed`).
-Wayland apps get it from `projects/desktop/shared/panel.mlx`, Android
-apps from `std.android.startUi`. See `docs/reference/ui.md`.
+`ui/host.linux.mlx` (a Wayland window, `ui/wayland/`) and
+`ui/host.android.mlx` (a NativeActivity) are `std.ui.host`: one API, so an
+app's source is the same on both (the compiler takes the target's file).
+See `docs/reference/ui.md`.
 
 `xkb.mlx` (`std.xkb`) is the keymap model: `xkb/parse.mlx` reads XKB
 keymaps and source files, `xkb/compile.mlx` makes keymaps from the XKB
