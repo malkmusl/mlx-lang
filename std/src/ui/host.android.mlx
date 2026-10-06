@@ -1,0 +1,826 @@
+// std.ui.host on Android: a std.ui app in a NativeActivity, drawn by the
+// GPU (std.ui.gpu_canvas into a VK_KHR_android_surface swapchain, as in
+// examples/vulkan-android) or, where Vulkan cannot be opened, on the CPU
+// into the locked window. The same functions as host.linux.mlx (see there
+// for a program's two entries); the compiler takes this file for
+// aarch64-android.
+//
+// The finger is the pointer's left button (std.ui.app). Dragged further
+// than a touch slop it scrolls instead: the press is let go without a
+// click and the moves come as EVENT_WHEEL (how far: wheelPixels). Held
+// still it is the right button (a context menu). Keys (a hardware keyboard,
+// or the on-screen one: showKeyboard) come as EVENT_KEY with Linux key
+// codes; Back is left to the system. Frames follow the display
+// (AChoreographer; a timerfd below API 24).
+const std = @import("std")
+const android = @import("std.android")
+const vk = @import("std.vulkan")
+const swapchain = @import("std.gpu.swapchain")
+const ui = @import("std.ui")
+const ui_app = @import("std.ui.app")
+const keys = @import("std.ui.keys")
+const canvas_module = @import("std.ui.canvas")
+const gpu_canvas = @import("std.ui.gpu_canvas")
+
+pub const Allocator = std.allocator.Allocator
+
+// What the window is called and how big it starts: the activity's window
+// is the screen's, so only the desktop uses these.
+pub const Options = struct {
+    title: []const u8
+    appId: []const u8
+    width: u32
+    height: u32
+    minWidth: i32
+    minHeight: i32
+}
+
+pub const Host = struct {
+    activity: usize
+    window: usize
+    queue: usize
+    looper: usize
+    context: *anyopaque
+    draw: ui_app.Draw
+    event: ui_app.Handler
+    width: i32
+    height: i32
+    insets: ui.Insets
+    scale: i32
+    dirty: bool
+    framePosted: bool
+    destroyed: bool
+    hasClock: bool
+    clock: android.Choreographer
+    // One timerfd for what is due next (monotonic nanoseconds; 0: not
+    // due): a frame without the display's clock, a tick, a held finger.
+    timer: i32
+    frameAt: u64
+    tickAt: u64
+    tickPeriod: u64
+    pressAt: u64
+    vulkan: bool
+    hasSwapchain: bool
+    device: *gpu_canvas.Device
+    chain: swapchain.Swapchain
+    // The finger: down, scrolling (dragged past the slop), held (a right
+    // click), where it went down and where it was last.
+    touching: bool
+    scrolling: bool
+    held: bool
+    downX: i32
+    downY: i32
+    lastY: i32
+    wheel: i32
+    // The current key: what it types, the modifiers held (std.ui.keys).
+    text: [8]u8
+    textLength: usize
+    modifiers: u32
+    homePath: [*]const u8
+    homeLength: usize
+    noEnvironment: usize
+    // Scratch: the AInputEvent* out-parameter, an itimerspec, an
+    // ANativeWindow_Buffer.
+    eventOut: usize
+    timerSpec: [4]u64
+    buffer: [6]u64
+}
+
+// struct ANativeActivity: callbacks at 0, instance at 56; the callback
+// table's entries; ANativeWindow_Buffer's fields.
+const ACTIVITY_CALLBACKS: usize = 0
+const ACTIVITY_INSTANCE: usize = 56
+const ON_DESTROY: usize = 40
+const ON_NATIVE_WINDOW_CREATED: usize = 56
+const ON_NATIVE_WINDOW_RESIZED: usize = 64
+const ON_NATIVE_WINDOW_REDRAW_NEEDED: usize = 72
+const ON_NATIVE_WINDOW_DESTROYED: usize = 80
+const ON_INPUT_QUEUE_CREATED: usize = 88
+const ON_INPUT_QUEUE_DESTROYED: usize = 96
+const ON_CONTENT_RECT_CHANGED: usize = 104
+const BUFFER_WIDTH: usize = 0
+const BUFFER_HEIGHT: usize = 4
+const BUFFER_STRIDE: usize = 8
+const BUFFER_BITS: usize = 16
+
+const CLOCK_MONOTONIC: i32 = 1
+const TIMER_FLAGS: i32 = 526336 // TFD_NONBLOCK | TFD_CLOEXEC
+const FRAME_NANOSECONDS: u64 = 16666666
+const HOLD_NANOSECONDS: u64 = 500000000
+// How far a finger may move and still tap (logical pixels).
+const TOUCH_SLOP: i32 = 8
+
+const Failure = error { Unsupported }
+
+fn unsupported() -> Failure!void { return Failure.Unsupported }
+
+// The app's host: `draw` and `event` get `context`. Null without memory.
+pub fn create(options: Options, context: *anyopaque, draw: ui_app.Draw, event: ui_app.Handler) -> ?*Host {
+    const allocator = std.page_allocator.init()
+    const memory = allocator.alloc(@sizeOf(Host), 16)
+    if memory == null { return null }
+    var host: *Host = undefined
+    unsafe { host = @ptrCast(*Host, memory.?) }
+    host.*.context = context
+    host.*.draw = draw
+    host.*.event = event
+    host.*.activity = 0
+    return host
+}
+
+// A window of its own: not on Android (the activity is the window).
+pub fn open(host: *Host, arguments: [][*]const u8) -> !void { return unsupported() }
+
+// The activity's looper runs the app: nothing to wait for here.
+pub fn run(host: *Host) -> !void {}
+
+// Takes `activity` (ANativeActivity_onCreate's arguments) and its
+// window, input and frames.
+pub fn openActivity(host: *Host, activity: usize, saved_state: usize, saved_state_size: usize) -> bool {
+    const allocator = std.page_allocator.init()
+    host.*.activity = activity
+    host.*.window = 0
+    host.*.queue = 0
+    host.*.looper = android.ALooper_forThread()
+    host.*.width = 0
+    host.*.height = 0
+    host.*.insets = ui.uniform(0)
+    host.*.scale = 1
+    host.*.dirty = true
+    host.*.framePosted = false
+    host.*.destroyed = false
+    host.*.hasSwapchain = false
+    host.*.touching = false
+    host.*.scrolling = false
+    host.*.held = false
+    host.*.wheel = 0
+    host.*.textLength = 0
+    host.*.modifiers = 0
+    host.*.noEnvironment = 0
+    host.*.homePath = android.internalDataPath(activity)
+    host.*.homeLength = 0
+    if @intFromPtr(host.*.homePath) != 0 {
+        while host.*.homePath[host.*.homeLength] != 0 { host.*.homeLength += 1 }
+    }
+    host.*.hasClock = android.choreographer(clockOf(host))
+    host.*.frameAt = 0
+    host.*.tickAt = 0
+    host.*.tickPeriod = 0
+    host.*.pressAt = 0
+    host.*.timer = android.timerfd_create(CLOCK_MONOTONIC, TIMER_FLAGS)
+    if host.*.timer >= 0 && host.*.looper != 0 {
+        const added = android.ALooper_addFd(host.*.looper, host.*.timer, 2, android.LOOPER_EVENT_INPUT, @intFromPtr(onTimer), @intFromPtr(host))
+    }
+    const opened = gpu_canvas.openAndroid(allocator)
+    host.*.vulkan = opened != null
+    if opened != null {
+        host.*.device = opened.?
+    } else {
+        android.log("std.ui.host: no Vulkan, drawing on the CPU")
+    }
+    unsafe { @ptrFromInt(*usize, activity + ACTIVITY_INSTANCE).* = @intFromPtr(host) }
+    setCallback(activity, ON_DESTROY, @intFromPtr(onDestroy))
+    setCallback(activity, ON_NATIVE_WINDOW_CREATED, @intFromPtr(onWindowCreated))
+    setCallback(activity, ON_NATIVE_WINDOW_RESIZED, @intFromPtr(onWindowResized))
+    setCallback(activity, ON_NATIVE_WINDOW_REDRAW_NEEDED, @intFromPtr(onRedrawNeeded))
+    setCallback(activity, ON_NATIVE_WINDOW_DESTROYED, @intFromPtr(onWindowDestroyed))
+    setCallback(activity, ON_INPUT_QUEUE_CREATED, @intFromPtr(onInputQueueCreated))
+    setCallback(activity, ON_INPUT_QUEUE_DESTROYED, @intFromPtr(onInputQueueDestroyed))
+    setCallback(activity, ON_CONTENT_RECT_CHANGED, @intFromPtr(onContentRectChanged))
+    return true
+}
+
+// The window's size (pixels).
+pub fn width(host: *Host) -> i32 { return host.*.width }
+pub fn height(host: *Host) -> i32 { return host.*.height }
+
+// The space the system bars keep (std.android.reservedInsets), and how
+// many pixels a logical pixel is (from the screen's shorter side).
+pub fn insets(host: *Host) -> ui.Insets { return host.*.insets }
+pub fn scale(host: *Host) -> i32 { return host.*.scale }
+
+// The next frame: drawn at the display's next one.
+pub fn redraw(host: *Host) -> void {
+    host.*.dirty = true
+    schedule(host)
+}
+
+// EVENT_TICK every `milliseconds` (0: none).
+pub fn setTick(host: *Host, milliseconds: usize) -> void {
+    host.*.tickPeriod = @intCast(u64, milliseconds) * 1000000
+    host.*.tickAt = if milliseconds == 0 { 0 } else { now() + host.*.tickPeriod }
+    rearm(host)
+}
+
+pub fn typed(host: *Host) -> []const u8 {
+    var bytes: [*]const u8 = undefined
+    unsafe { bytes = @ptrFromInt([*]const u8, @intFromPtr(host) + @offsetOf(Host, "text")) }
+    return bytes[0..host.*.textLength]
+}
+
+pub fn modifiers(host: *Host) -> u32 { return host.*.modifiers }
+
+// How far the finger scrolled since the last EVENT_WHEEL (pixels;
+// positive: toward the end).
+pub fn wheelPixels(host: *Host) -> i32 { return host.*.wheel }
+
+// The on-screen keyboard, for a field at `area`; its keys come as
+// EVENT_KEY.
+pub fn showKeyboard(host: *Host, area: ui.Rect) -> void { android.ANativeActivity_showSoftInput(host.*.activity, android.SHOW_SOFT_INPUT_FORCED) }
+pub fn hideKeyboard(host: *Host) -> void { android.ANativeActivity_hideSoftInput(host.*.activity, 0) }
+
+// The app's own directory (internalDataPath): what it may read and write.
+pub fn home(host: *Host) -> []const u8 {
+    if host.*.homeLength == 0 { return "/" }
+    return host.*.homePath[0..host.*.homeLength]
+}
+
+// No process environment for an activity.
+pub fn environment(host: *Host) -> [*][*]const u8 {
+    unsafe { return @ptrFromInt([*][*]const u8, @intFromPtr(host) + @offsetOf(Host, "noEnvironment")) }
+}
+
+pub fn environmentValue(host: *Host, name: []const u8) -> []const u8 { return "" }
+
+// What only a desktop has: nothing here.
+pub fn setTitle(host: *Host, title: []const u8) -> void {}
+pub fn setBlur(host: *Host, rects: [*]const i32, count: usize) -> void {}
+pub fn acceptDrops(host: *Host, mime: []const u8) -> void {}
+pub fn dropData(host: *Host) -> []const u8 { return "" }
+pub fn startDrag(host: *Host, mime: []const u8, data: []const u8, size: u32, draw: ui_app.Draw) -> bool { return false }
+
+// Ends the activity.
+pub fn quit(host: *Host) -> void { android.ANativeActivity_finish(host.*.activity) }
+
+pub fn forgetImages(host: *Host) -> void {
+    if host.*.vulkan { gpu_canvas.forgetImages(host.*.device) }
+}
+
+// Says in the log how the app draws (GPU or CPU).
+pub fn report(host: *Host, program: []const u8) -> void {
+    android.log(if host.*.vulkan { "std.ui.host: drawn by Vulkan" } else { "std.ui.host: drawn on the CPU" })
+}
+
+// A line for logcat (tag "mlx").
+pub fn log(host: *Host, line: []const u8) -> void {
+    var buffer: [256]u8 = undefined
+    var bytes: [*]u8 = undefined
+    unsafe { bytes = @ptrCast([*]u8, &buffer) }
+    var length: usize = 0
+    while length < line.length && length < 255 {
+        bytes[length] = line[length]
+        length += 1
+    }
+    bytes[length] = 0
+    android.log(bytes[0..length])
+}
+
+// ---------------------------------------------------------------------------
+// The host's parts
+
+fn hostOf(data: usize) -> *Host {
+    unsafe { return @ptrFromInt(*Host, data) }
+}
+
+fn activityHost(activity: usize) -> usize {
+    unsafe { return @ptrFromInt(*usize, activity + ACTIVITY_INSTANCE).* }
+}
+
+fn chainOf(host: *Host) -> *swapchain.Swapchain {
+    unsafe { return @ptrFromInt(*swapchain.Swapchain, @intFromPtr(host) + @offsetOf(Host, "chain")) }
+}
+
+fn clockOf(host: *Host) -> *android.Choreographer {
+    unsafe { return @ptrFromInt(*android.Choreographer, @intFromPtr(host) + @offsetOf(Host, "clock")) }
+}
+
+fn insetsOf(host: *Host) -> *ui.Insets {
+    unsafe { return @ptrFromInt(*ui.Insets, @intFromPtr(host) + @offsetOf(Host, "insets")) }
+}
+
+fn bufferOf(host: *Host) -> usize { return @intFromPtr(host) + @offsetOf(Host, "buffer") }
+
+fn setCallback(activity: usize, offset: usize, function: usize) -> void {
+    unsafe {
+        const callbacks = @ptrFromInt(*usize, activity + ACTIVITY_CALLBACKS).*
+        @ptrFromInt(*usize, callbacks + offset).* = function
+    }
+}
+
+fn readU32(address: usize) -> u32 {
+    unsafe { return @ptrFromInt(*u32, address).* }
+}
+
+fn send(host: *Host, kind: u32, a: u32, b: i32) -> void { host.*.event(host.*.context, kind, a, b) }
+
+// ---------------------------------------------------------------------------
+// The timer (a timerfd on the main looper)
+
+fn now() -> u64 { return @intCast(u64, std.time.monotonicNanoseconds()) }
+
+fn earlier(first: u64, second: u64) -> u64 {
+    if first == 0 { return second }
+    if second == 0 { return first }
+    return if first < second { first } else { second }
+}
+
+// Armed for the next deadline (disarmed without one).
+fn rearm(host: *Host) -> void {
+    if host.*.timer < 0 { return }
+    const next = earlier(earlier(host.*.frameAt, host.*.tickAt), host.*.pressAt)
+    var first: u64 = 0
+    if next != 0 {
+        const current = now()
+        first = if next > current { next - current } else { 1 }
+    }
+    host.*.timerSpec[0] = 0
+    host.*.timerSpec[1] = 0
+    host.*.timerSpec[2] = first / 1000000000
+    host.*.timerSpec[3] = first % 1000000000
+    const set = android.timerfd_settime(host.*.timer, 0, @intFromPtr(host) + @offsetOf(Host, "timerSpec"), 0)
+}
+
+fn onTimer(fd: i32, events: i32, data: usize) -> i32 {
+    const host = hostOf(data)
+    const expirations = android.read(fd, @intFromPtr(host) + @offsetOf(Host, "eventOut"), 8)
+    if host.*.destroyed { return 1 }
+    const current = now()
+    if host.*.pressAt != 0 && host.*.pressAt <= current {
+        host.*.pressAt = 0
+        hold(host)
+    }
+    if host.*.tickAt != 0 && host.*.tickAt <= current {
+        host.*.tickAt = if host.*.tickPeriod > 0 { current + host.*.tickPeriod } else { 0 }
+        send(host, ui_app.EVENT_TICK, 0, 0)
+    }
+    if host.*.frameAt != 0 && host.*.frameAt <= current {
+        host.*.frameAt = 0
+        frame(host)
+    }
+    rearm(host)
+    return 1
+}
+
+// The finger stayed down and still: the right button.
+fn hold(host: *Host) -> void {
+    if !host.*.touching || host.*.scrolling { return }
+    host.*.held = true
+    // The left press is let go without a click.
+    send(host, ui_app.EVENT_LEAVE, 0, 0)
+    send(host, ui_app.EVENT_BUTTON, ui_app.BUTTON_LEFT, 0)
+    send(host, ui_app.EVENT_MOTION, @bitCast(u32, host.*.downX), host.*.downY)
+    send(host, ui_app.EVENT_BUTTON, ui_app.BUTTON_RIGHT, 1)
+    send(host, ui_app.EVENT_BUTTON, ui_app.BUTTON_RIGHT, 0)
+    redraw(host)
+}
+
+fn setPress(host: *Host, at: u64) -> void {
+    host.*.pressAt = at
+    rearm(host)
+}
+
+// ---------------------------------------------------------------------------
+// Frames
+
+// The next frame from the display's clock (or the frame timer).
+fn schedule(host: *Host) -> void {
+    if host.*.framePosted || host.*.window == 0 || host.*.destroyed { return }
+    host.*.framePosted = true
+    if host.*.hasClock {
+        android.postFrameCallback(clockOf(host), @intFromPtr(onFrame), @intFromPtr(host))
+    } else {
+        host.*.frameAt = now() + FRAME_NANOSECONDS
+        rearm(host)
+    }
+}
+
+fn onFrame(time: i64, data: usize) -> void { frame(hostOf(data)) }
+
+fn frame(host: *Host) -> void {
+    host.*.framePosted = false
+    if host.*.dirty && !host.*.destroyed { render(host) }
+}
+
+// The window's size and the reserved space: EVENT_CONFIGURED when either
+// changed.
+fn configure(host: *Host, new_width: i32, new_height: i32) -> void {
+    var reserved = ui.uniform(0)
+    const kind = android.reservedInsets(host.*.activity, &reserved)
+    const before = host.*.insets
+    const changed = new_width != host.*.width || new_height != host.*.height || reserved.top != before.top || reserved.right != before.right || reserved.bottom != before.bottom || reserved.left != before.left
+    if !changed { return }
+    host.*.width = new_width
+    host.*.height = new_height
+    insetsOf(host).* = reserved
+    const shorter = if new_width < new_height { new_width } else { new_height }
+    var factor = shorter / 360
+    if factor < 1 { factor = 1 }
+    if factor > 3 { factor = 3 }
+    host.*.scale = factor
+    host.*.dirty = true
+    send(host, ui_app.EVENT_CONFIGURED, @bitCast(u32, new_width), new_height)
+}
+
+fn createSwapchain(host: *Host) -> void {
+    if !host.*.vulkan || host.*.window == 0 || host.*.hasSwapchain { return }
+    const context = gpu_canvas.context(host.*.device)
+    var info = vk.AndroidSurfaceCreateInfoKHR.init()
+    unsafe { info.window = @ptrFromInt(*anyopaque, host.*.window) }
+    var surface: vk.SurfaceKHR = 0
+    if vk.createAndroidSurfaceKHR(context.*.instanceCommands, context.*.instance, &info, null, &surface) != vk.Result.success {
+        android.log("std.ui.host: no Vulkan surface, drawing on the CPU")
+        host.*.vulkan = false
+        return
+    }
+    if !swapchain.create(context, chainOf(host), surface, 0, 0) {
+        android.log("std.ui.host: no swapchain, drawing on the CPU")
+        swapchain.destroy(context, chainOf(host), false)
+        host.*.vulkan = false
+        return
+    }
+    host.*.hasSwapchain = true
+}
+
+fn destroySwapchain(host: *Host) -> void {
+    if !host.*.hasSwapchain { return }
+    swapchain.destroy(gpu_canvas.context(host.*.device), chainOf(host), false)
+    host.*.hasSwapchain = false
+}
+
+// A new swapchain for the window's new size (the surface stays).
+fn recreateSwapchain(host: *Host) -> void {
+    if !host.*.hasSwapchain { return }
+    const context = gpu_canvas.context(host.*.device)
+    const surface = chainOf(host).*.surface
+    swapchain.destroy(context, chainOf(host), true)
+    if !swapchain.create(context, chainOf(host), surface, 0, 0) {
+        swapchain.destroy(context, chainOf(host), false)
+        host.*.hasSwapchain = false
+        host.*.vulkan = false
+        android.log("std.ui.host: swapchain lost, drawing on the CPU")
+    }
+}
+
+// swapchain.PaintFn: the app draws (recorded for the GPU), the paint
+// shader fills the swapchain's frame.
+fn paintFrame(data: usize, chain: *swapchain.Swapchain) -> bool {
+    const host = hostOf(data)
+    gpu_canvas.setSwapRedBlue(host.*.device, chain.*.formatFlags != 0)
+    gpu_canvas.begin(host.*.device, chain.*.width, chain.*.height)
+    var pixels: [*]u32 = undefined
+    unsafe { pixels = @ptrFromInt([*]u32, chain.*.frame.address) }
+    var canvas = canvas_module.Canvas.{
+        .pixels = pixels,
+        .width = @intCast(usize, chain.*.width),
+        .height = @intCast(usize, chain.*.height),
+        .stride = @intCast(usize, chain.*.width),
+        .swapRedBlue = chain.*.formatFlags != 0,
+        .device = @intFromPtr(host.*.device),
+        .opacity = 255,
+    }
+    host.*.draw(host.*.context, &canvas)
+    return gpu_canvas.paint(host.*.device, chain.*.frame.buffer, 0, chain.*.width)
+}
+
+fn present(host: *Host) -> bool {
+    const context = gpu_canvas.context(host.*.device)
+    configure(host, @intCast(i32, chainOf(host).*.width), @intCast(i32, chainOf(host).*.height))
+    // Before drawing: a draw may ask for the next frame.
+    host.*.dirty = false
+    var status = swapchain.presentPixels(context, chainOf(host), @intFromPtr(paintFrame), @intFromPtr(host))
+    if status == swapchain.FrameStatus.out_of_date {
+        recreateSwapchain(host)
+        if !host.*.hasSwapchain { return false }
+        configure(host, @intCast(i32, chainOf(host).*.width), @intCast(i32, chainOf(host).*.height))
+        host.*.dirty = false
+        status = swapchain.presentPixels(context, chainOf(host), @intFromPtr(paintFrame), @intFromPtr(host))
+    }
+    if status == swapchain.FrameStatus.failed {
+        android.log("std.ui.host: a Vulkan frame failed, drawing on the CPU")
+        destroySwapchain(host)
+        host.*.vulkan = false
+        return false
+    }
+    if status != swapchain.FrameStatus.presented { redraw(host) }
+    return true
+}
+
+// The CPU's frame: drawn straight into the locked window (bytes R, G, B,
+// A: red and blue swapped).
+fn paintCpu(host: *Host) -> void {
+    const window = host.*.window
+    const geometry = android.ANativeWindow_setBuffersGeometry(window, 0, 0, android.WINDOW_FORMAT_RGBA_8888)
+    const buffer = bufferOf(host)
+    if android.ANativeWindow_lock(window, buffer, 0) < 0 { return }
+    const window_width = @intCast(usize, readU32(buffer + BUFFER_WIDTH))
+    const window_height = @intCast(usize, readU32(buffer + BUFFER_HEIGHT))
+    configure(host, @intCast(i32, window_width), @intCast(i32, window_height))
+    host.*.dirty = false
+    var pixels: [*]u32 = undefined
+    unsafe { pixels = @ptrFromInt([*]u32, @ptrFromInt(*usize, buffer + BUFFER_BITS).*) }
+    var canvas = canvas_module.Canvas.{
+        .pixels = pixels,
+        .width = window_width,
+        .height = window_height,
+        .stride = @intCast(usize, readU32(buffer + BUFFER_STRIDE)),
+        .swapRedBlue = true,
+        .device = 0,
+        .opacity = 255,
+    }
+    host.*.draw(host.*.context, &canvas)
+    const posted = android.ANativeWindow_unlockAndPost(window)
+}
+
+fn render(host: *Host) -> void {
+    if host.*.window == 0 { return }
+    if host.*.hasSwapchain && present(host) { return }
+    paintCpu(host)
+}
+
+// ---------------------------------------------------------------------------
+// Activity callbacks
+
+fn onWindowCreated(activity: usize, window: usize) -> void {
+    if activityHost(activity) == 0 { return }
+    const host = hostOf(activityHost(activity))
+    host.*.window = window
+    createSwapchain(host)
+    if !host.*.hasSwapchain { configure(host, android.ANativeWindow_getWidth(window), android.ANativeWindow_getHeight(window)) }
+    render(host)
+}
+
+fn onWindowResized(activity: usize, window: usize) -> void {
+    if activityHost(activity) == 0 { return }
+    const host = hostOf(activityHost(activity))
+    host.*.window = window
+    if host.*.hasSwapchain { recreateSwapchain(host) } else { createSwapchain(host) }
+    render(host)
+}
+
+fn onRedrawNeeded(activity: usize, window: usize) -> void {
+    if activityHost(activity) == 0 { return }
+    render(hostOf(activityHost(activity)))
+}
+
+fn onContentRectChanged(activity: usize, rect: usize) -> void {
+    if activityHost(activity) == 0 { return }
+    const host = hostOf(activityHost(activity))
+    configure(host, host.*.width, host.*.height)
+    redraw(host)
+}
+
+fn onWindowDestroyed(activity: usize, window: usize) -> void {
+    if activityHost(activity) == 0 { return }
+    const host = hostOf(activityHost(activity))
+    destroySwapchain(host)
+    host.*.window = 0
+}
+
+fn onInputQueueCreated(activity: usize, queue: usize) -> void {
+    if activityHost(activity) == 0 { return }
+    const host = hostOf(activityHost(activity))
+    host.*.queue = queue
+    android.AInputQueue_attachLooper(queue, host.*.looper, 1, @intFromPtr(onInput), @intFromPtr(host))
+}
+
+fn onInputQueueDestroyed(activity: usize, queue: usize) -> void {
+    if activityHost(activity) == 0 { return }
+    const host = hostOf(activityHost(activity))
+    android.AInputQueue_detachLooper(queue)
+    host.*.queue = 0
+    if host.*.touching {
+        host.*.touching = false
+        send(host, ui_app.EVENT_LEAVE, 0, 0)
+    }
+}
+
+// The app hears EVENT_CLOSED; the host's memory stays (a frame callback
+// may still come), marked destroyed.
+fn onDestroy(activity: usize) -> void {
+    if activityHost(activity) == 0 { return }
+    const host = hostOf(activityHost(activity))
+    send(host, ui_app.EVENT_CLOSED, 0, 0)
+    host.*.destroyed = true
+    destroySwapchain(host)
+    if host.*.vulkan { gpu_canvas.close(host.*.device) }
+    host.*.vulkan = false
+    host.*.window = 0
+    if host.*.timer >= 0 {
+        if host.*.looper != 0 { const removed = android.ALooper_removeFd(host.*.looper, host.*.timer) }
+        const closed = android.close(host.*.timer)
+    }
+    unsafe { @ptrFromInt(*usize, activity + ACTIVITY_INSTANCE).* = 0 }
+}
+
+// ---------------------------------------------------------------------------
+// Input
+
+// Drains the queue: touches and keys go to the app, the rest (and Back)
+// to the system.
+fn onInput(fd: i32, events: i32, data: usize) -> i32 {
+    const host = hostOf(data)
+    const slot = @intFromPtr(host) + @offsetOf(Host, "eventOut")
+    while host.*.queue != 0 && android.AInputQueue_getEvent(host.*.queue, slot) >= 0 {
+        var event: usize = 0
+        unsafe { event = @ptrFromInt(*usize, slot).* }
+        if android.AInputQueue_preDispatchEvent(host.*.queue, event) == 0 {
+            var handled: i32 = 0
+            const kind = android.AInputEvent_getType(event)
+            if kind == android.INPUT_EVENT_TYPE_MOTION {
+                touch(host, event)
+                handled = 1
+            } else if kind == android.INPUT_EVENT_TYPE_KEY && key(host, event) {
+                handled = 1
+            }
+            android.AInputQueue_finishEvent(host.*.queue, event, handled)
+        }
+    }
+    return 1
+}
+
+fn absolute(value: i32) -> i32 { return if value < 0 { 0 - value } else { value } }
+
+fn touch(host: *Host, event: usize) -> void {
+    const action = android.AMotionEvent_getAction(event) & android.MOTION_ACTION_MASK
+    const x_position: f32 = android.AMotionEvent_getX(event, 0)
+    const y_position: f32 = android.AMotionEvent_getY(event, 0)
+    const wide_x: i64 = @intFromFloat(i64, x_position)
+    const wide_y: i64 = @intFromFloat(i64, y_position)
+    const x = @intCast(i32, wide_x)
+    const y = @intCast(i32, wide_y)
+    if action == android.MOTION_ACTION_DOWN {
+        host.*.touching = true
+        host.*.scrolling = false
+        host.*.held = false
+        host.*.downX = x
+        host.*.downY = y
+        host.*.lastY = y
+        setPress(host, now() + HOLD_NANOSECONDS)
+        send(host, ui_app.EVENT_MOTION, @bitCast(u32, x), y)
+        send(host, ui_app.EVENT_BUTTON, ui_app.BUTTON_LEFT, 1)
+        redraw(host)
+        return
+    }
+    if !host.*.touching { return }
+    if action == android.MOTION_ACTION_MOVE {
+        if host.*.held { return }
+        const slop = TOUCH_SLOP * host.*.scale
+        if !host.*.scrolling && (absolute(x - host.*.downX) > slop || absolute(y - host.*.downY) > slop) {
+            // A drag, not a tap: the press is let go without a click, and
+            // what was under the finger scrolls.
+            host.*.scrolling = true
+            setPress(host, 0)
+            send(host, ui_app.EVENT_LEAVE, 0, 0)
+            send(host, ui_app.EVENT_BUTTON, ui_app.BUTTON_LEFT, 0)
+            send(host, ui_app.EVENT_MOTION, @bitCast(u32, host.*.downX), host.*.downY)
+            redraw(host)
+        }
+        if host.*.scrolling {
+            const moved = host.*.lastY - y
+            if moved != 0 {
+                host.*.wheel = moved
+                host.*.lastY = y
+                send(host, ui_app.EVENT_WHEEL, 0, if moved > 0 { 1 } else { -1 })
+                redraw(host)
+            }
+            return
+        }
+        send(host, ui_app.EVENT_MOTION, @bitCast(u32, x), y)
+        return
+    }
+    if action == android.MOTION_ACTION_UP {
+        host.*.touching = false
+        setPress(host, 0)
+        if !host.*.scrolling && !host.*.held {
+            send(host, ui_app.EVENT_MOTION, @bitCast(u32, x), y)
+            send(host, ui_app.EVENT_BUTTON, ui_app.BUTTON_LEFT, 0)
+        }
+        send(host, ui_app.EVENT_LEAVE, 0, 0)
+        redraw(host)
+        return
+    }
+    if action == android.MOTION_ACTION_CANCEL || action == android.MOTION_ACTION_POINTER_DOWN {
+        host.*.touching = false
+        setPress(host, 0)
+        send(host, ui_app.EVENT_LEAVE, 0, 0)
+        if !host.*.scrolling && !host.*.held { send(host, ui_app.EVENT_BUTTON, ui_app.BUTTON_LEFT, 0) }
+        redraw(host)
+    }
+}
+
+// A key as EVENT_KEY with its Linux code and what it types (a US layout).
+// False for keys the system keeps (Back, volume, ...).
+fn key(host: *Host, event: usize) -> bool {
+    const action = android.AKeyEvent_getAction(event)
+    if action != android.KEY_ACTION_DOWN && action != android.KEY_ACTION_UP { return false }
+    const android_code = android.AKeyEvent_getKeyCode(event)
+    const code = linuxCode(android_code)
+    if code == 0 { return false }
+    const meta = android.AKeyEvent_getMetaState(event)
+    var held: u32 = 0
+    if meta & android.META_SHIFT_ON != 0 { held |= keys.SHIFT }
+    if meta & android.META_CTRL_ON != 0 { held |= keys.CONTROL }
+    if meta & android.META_ALT_ON != 0 { held |= keys.ALT }
+    if meta & android.META_META_ON != 0 { held |= keys.SUPER }
+    host.*.modifiers = held
+    host.*.textLength = 0
+    if action == android.KEY_ACTION_DOWN && held & (keys.CONTROL | keys.ALT | keys.SUPER) == 0 {
+        const shifted = meta & android.META_SHIFT_ON != 0
+        const capital = shifted != (meta & android.META_CAPS_LOCK_ON != 0)
+        const character = typedBy(android_code, shifted, capital)
+        if character != 0 {
+            host.*.text[0] = character
+            host.*.textLength = 1
+        }
+    }
+    const how = if action == android.KEY_ACTION_UP { 0 } else if android.AKeyEvent_getRepeatCount(event) > 0 { 2 } else { 1 }
+    send(host, ui_app.EVENT_KEY, code, how)
+    redraw(host)
+    return true
+}
+
+// The letter's place on a QWERTY keyboard as a Linux code.
+fn letterCode(letter: u8) -> u32 {
+    const rows = "qwertyuiop"
+    const middle = "asdfghjkl"
+    const bottom = "zxcvbnm"
+    var index: usize = 0
+    while index < rows.length {
+        if rows[index] == letter { return 16 + @intCast(u32, index) }
+        index += 1
+    }
+    index = 0
+    while index < middle.length {
+        if middle[index] == letter { return 30 + @intCast(u32, index) }
+        index += 1
+    }
+    index = 0
+    while index < bottom.length {
+        if bottom[index] == letter { return 44 + @intCast(u32, index) }
+        index += 1
+    }
+    return 0
+}
+
+// Android's key code as Linux's (input-event-codes.h); 0: not the app's.
+fn linuxCode(code: i32) -> u32 {
+    // AKEYCODE_A .. AKEYCODE_Z
+    if code >= 29 && code <= 54 { return letterCode(@intCast(u8, 97 + code - 29)) }
+    // AKEYCODE_0 .. AKEYCODE_9
+    if code == 7 { return 11 }
+    if code >= 8 && code <= 16 { return @intCast(u32, code - 6) }
+    if code == 19 { return keys.UP }
+    if code == 20 { return keys.DOWN }
+    if code == 21 { return keys.LEFT }
+    if code == 22 { return keys.RIGHT }
+    if code == 55 { return 51 } // comma
+    if code == 56 { return 52 } // period
+    if code == 61 { return keys.TAB }
+    if code == 62 { return 57 } // space
+    if code == 66 { return keys.ENTER }
+    if code == 67 { return keys.BACKSPACE } // AKEYCODE_DEL
+    if code == 68 { return 41 } // grave
+    if code == 69 { return 12 } // minus
+    if code == 70 { return 13 } // equals
+    if code == 71 { return 26 } // [
+    if code == 72 { return 27 } // ]
+    if code == 73 { return 43 } // backslash
+    if code == 74 { return 39 } // semicolon
+    if code == 75 { return 40 } // apostrophe
+    if code == 76 { return 53 } // slash
+    if code == 77 { return 3 } // @ (Shift 2)
+    if code == 81 { return 13 } // + (Shift =)
+    if code == 92 { return keys.PAGE_UP }
+    if code == 93 { return keys.PAGE_DOWN }
+    if code == 111 { return keys.ESCAPE }
+    if code == 112 { return keys.DELETE } // AKEYCODE_FORWARD_DEL
+    if code == 122 { return keys.HOME }
+    if code == 123 { return keys.END }
+    if code == 160 { return keys.KEYPAD_ENTER }
+    return 0
+}
+
+// What the key types on a US layout (0: nothing).
+fn typedBy(code: i32, shifted: bool, capital: bool) -> u8 {
+    if code >= 29 && code <= 54 { return @intCast(u8, (if capital { 65 } else { 97 }) + code - 29) }
+    if code >= 7 && code <= 16 {
+        if !shifted { return @intCast(u8, 48 + code - 7) }
+        return ")!@#$%^&*("[@intCast(usize, code - 7)]
+    }
+    if code == 62 { return 32 }
+    if code == 77 { return 64 }
+    if code == 81 { return 43 }
+    // , . ` - = [ ] \ ; ' / and their shifted < > ~ _ + { } | : " ?
+    if code == 55 { return if shifted { 60 } else { 44 } }
+    if code == 56 { return if shifted { 62 } else { 46 } }
+    if code == 68 { return if shifted { 126 } else { 96 } }
+    if code == 69 { return if shifted { 95 } else { 45 } }
+    if code == 70 { return if shifted { 43 } else { 61 } }
+    if code == 71 { return if shifted { 123 } else { 91 } }
+    if code == 72 { return if shifted { 125 } else { 93 } }
+    if code == 73 { return if shifted { 124 } else { 92 } }
+    if code == 74 { return if shifted { 58 } else { 59 } }
+    if code == 75 { return if shifted { 34 } else { 39 } }
+    if code == 76 { return if shifted { 63 } else { 47 } }
+    return 0
+}

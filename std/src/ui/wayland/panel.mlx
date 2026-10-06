@@ -1,0 +1,986 @@
+// A layer-shell surface for desktop parts that are Wayland clients (the
+// dock, the launcher): the connection and its globals, one
+// zwlr_layer_surface_v1 in a layer, two shared-memory buffers drawn by the
+// client's `draw` and shown one frame at a time, pointer and keyboard input
+// (with key repeat and the compositor's keymap), a blur region behind it
+// (ext-background-effect-v1, when the compositor offers it), for a dock
+// the compositor's windows (wlr-foreign-toplevel-management), popup menus
+// (openMenu: an xdg_popup drawn on the CPU) and drag and drop (startDrag,
+// acceptDrops: wl_data_device).
+//
+// The client gives a context and two functions: `draw(context, canvas)`
+// paints the whole surface, and `event(context, kind, a, b)` gets EVENT_*
+// notices. Each turn of the loop releases the values the last one
+// allocated (turns.mlx).
+const std = @import("std")
+const wl = @import("std.wayland")
+const canvas_module = @import("std.ui.canvas")
+const ui_app = @import("std.ui.app")
+const gpu_canvas = @import("std.ui.gpu_canvas")
+const gpu_upload = @import("std.ui.gpu_upload")
+const gpu = @import("std.gpu")
+const vk = @import("std.vulkan")
+const keyboard_module = @import("./keyboard.mlx")
+const turns_module = @import("std.turns")
+const crash = @import("std.crash")
+const wayland_crash = @import("std.wayland.crash")
+const panel_input_module = @import("./panel_input.mlx")
+const panel_frames_module = @import("./panel_frames.mlx")
+const panel_menu_module = @import("./panel_menu.mlx")
+const panel_drag_module = @import("./panel_drag.mlx")
+
+const Allocator = std.allocator.Allocator
+pub const Canvas = canvas_module.Canvas
+
+// Events: std.ui.app's (the platform-neutral ones every std.ui app gets:
+// pointer motion in surface pixels, leaving, a button, the wheel, a key
+// with panel.text holding what it types, configured with panel.width and
+// panel.height, closed, a tick), and those only a Wayland panel has: the
+// window list changed, and the ones below.
+pub const EVENT_MOTION: u32 = ui_app.EVENT_MOTION
+pub const EVENT_LEAVE: u32 = ui_app.EVENT_LEAVE
+pub const EVENT_BUTTON: u32 = ui_app.EVENT_BUTTON
+pub const EVENT_WHEEL: u32 = ui_app.EVENT_WHEEL
+pub const EVENT_KEY: u32 = ui_app.EVENT_KEY
+pub const EVENT_WINDOWS: u32 = 5
+pub const EVENT_CONFIGURED: u32 = ui_app.EVENT_CONFIGURED
+pub const EVENT_CLOSED: u32 = ui_app.EVENT_CLOSED
+// `watch` (a descriptor of the client's) can be read.
+pub const EVENT_WATCH: u32 = 8
+// Every `tickInterval` milliseconds (when it is not 0).
+pub const EVENT_TICK: u32 = ui_app.EVENT_TICK
+// The open menu (openMenu): the pointer on it (a = x, b = y, menu pixels),
+// off it, a button on it (as EVENT_BUTTON), and the menu went away (the
+// compositor dismissed it or closeMenu).
+pub const EVENT_MENU_MOTION: u32 = 10
+pub const EVENT_MENU_LEAVE: u32 = 11
+pub const EVENT_MENU_BUTTON: u32 = 12
+pub const EVENT_MENU_CLOSED: u32 = 13
+// The wheel over the open menu (as EVENT_WHEEL).
+pub const EVENT_MENU_WHEEL: u32 = 18
+// A drag of what acceptDrops takes over the surface (a = x, b = y), leaving
+// it, and dropped there (a = x, b = y; the data in dropData); and a drag
+// startDrag began ended (a = 1 dropped somewhere, 0 cancelled).
+pub const EVENT_DRAG_MOTION: u32 = ui_app.EVENT_DRAG_MOTION
+pub const EVENT_DRAG_LEAVE: u32 = ui_app.EVENT_DRAG_LEAVE
+pub const EVENT_DROP: u32 = ui_app.EVENT_DROP
+pub const EVENT_DRAG_END: u32 = ui_app.EVENT_DRAG_END
+// The keyboard went to another surface (keys held now are released
+// elsewhere).
+pub const EVENT_KEYBOARD_LEAVE: u32 = ui_app.EVENT_KEYBOARD_LEAVE
+
+// Where a menu opens against its anchor rectangle (xdg_positioner anchor
+// and gravity).
+pub const PLACE_TOP: u32 = 1
+pub const PLACE_BOTTOM: u32 = 2
+pub const PLACE_BOTTOM_RIGHT: u32 = 8
+
+pub const DRAG_BYTES: usize = 1024
+
+pub const Draw = ui_app.Draw
+pub const Handler = ui_app.Handler
+// A picture the GPU draws under what the canvas drew (Panel.scene): it
+// records its dispatches into the frame after the canvas's, into `target`
+// (width x height words, the canvas's drawing in them), and puts that
+// drawing over its own. False when it failed.
+pub const Scene = fn(context: *anyopaque, gpu_context: *gpu.Context, target: vk.Buffer, width: u32, height: u32) -> bool
+
+// Layers, anchors and keyboard interactivity (wlr-layer-shell).
+pub const LAYER_BOTTOM: u32 = 1
+pub const LAYER_TOP: u32 = 2
+pub const LAYER_OVERLAY: u32 = 3
+pub const ANCHOR_TOP: u32 = 1
+pub const ANCHOR_BOTTOM: u32 = 2
+pub const ANCHOR_LEFT: u32 = 4
+pub const ANCHOR_RIGHT: u32 = 8
+pub const KEYBOARD_NONE: u32 = 0
+pub const KEYBOARD_EXCLUSIVE: u32 = 1
+pub const KEYBOARD_ON_DEMAND: u32 = 2
+
+pub const MAX_WINDOWS: usize = 128
+
+// How frames reach the compositor: drawn on the CPU into shared memory;
+// drawn by the GPU into buffers handed over as dma-bufs (linux-dmabuf);
+// by the GPU straight into shared memory it imported; by the GPU into its
+// own memory and copied into shared memory.
+pub const FRAMES_CPU: u8 = 0
+pub const FRAMES_DMABUF: u8 = 1
+pub const FRAMES_SHM_DIRECT: u8 = 2
+pub const FRAMES_SHM_COPY: u8 = 3
+
+// DRM_FORMAT_ARGB8888 ('AR24').
+pub const DRM_FORMAT_ARGB8888: u32 = 875713089
+
+// A window of the compositor (a zwlr_foreign_toplevel_handle_v1).
+pub const Window = struct {
+    // The panel it belongs to (a *Panel).
+    owner: *anyopaque
+    handle: wl.zwlr_foreign_toplevel_handle_v1.Proxy
+    appId: [96]u8
+    appIdLength: usize
+    title: [96]u8
+    titleLength: usize
+    activated: bool
+    pendingActivated: bool
+    live: bool
+}
+
+pub const Panel = struct {
+    allocator: Allocator
+    display: wl.client.Display
+    registry: wl.wl_registry.Proxy
+    compositor: wl.wl_compositor.Proxy
+    shm: wl.wl_shm.Proxy
+    seat: wl.wl_seat.Proxy
+    layerShell: wl.zwlr_layer_shell_v1.Proxy
+    effects: wl.ext_background_effect_manager_v1.Proxy
+    windowManager: wl.zwlr_foreign_toplevel_manager_v1.Proxy
+    wmBase: wl.xdg_wm_base.Proxy
+    hasWmBase: bool
+    // A window (openWindow) instead of a layer surface: its xdg_surface and
+    // xdg_toplevel, and the size the compositor asked for (0: ours).
+    isWindow: bool
+    xdgSurface: wl.xdg_surface.Proxy
+    toplevel: wl.xdg_toplevel.Proxy
+    wantedWidth: i32
+    wantedHeight: i32
+    hasCompositor: bool
+    hasShm: bool
+    hasSeat: bool
+    hasLayerShell: bool
+    hasEffects: bool
+    hasWindowManager: bool
+    // Keyboard shortcut inhibition (inhibitShortcuts): the manager, the
+    // inhibitor while one is asked for, and whether the compositor made it
+    // active.
+    inhibitManager: wl.zwp_keyboard_shortcuts_inhibit_manager_v1.Proxy
+    hasInhibitManager: bool
+    inhibitor: wl.zwp_keyboard_shortcuts_inhibitor_v1.Proxy
+    hasInhibitor: bool
+    shortcutsInhibited: bool
+    wantWindows: bool
+    blurOffered: bool
+    surface: wl.wl_surface.Proxy
+    layerSurface: wl.zwlr_layer_surface_v1.Proxy
+    hasSurface: bool
+    effect: wl.ext_background_effect_surface_v1.Proxy
+    hasEffect: bool
+    pointer: wl.wl_pointer.Proxy
+    keyboardProxy: wl.wl_keyboard.Proxy
+    hasPointer: bool
+    hasKeyboard: bool
+    keyboard: keyboard_module.Keyboard
+    // Buffers: two of width x height in one pool.
+    memory: wl.SharedMemory
+    // Bytes from one frame to the next in the pool (a GPU importing it
+    // wants them aligned).
+    slotBytes: usize
+    // Drawing on the GPU (std.ui.gpu_canvas; 0: on the CPU), how frames reach
+    // the compositor (FRAMES_*), and each slot's GPU buffer.
+    device: usize
+    frames: u8
+    targets: [2]gpu.Buffer
+    hasTargets: bool
+    dmabuf: wl.zwp_linux_dmabuf_v1.Proxy
+    hasDmabuf: bool
+    dmabufArgb: bool
+    pool: wl.wl_shm_pool.Proxy
+    hasPool: bool
+    poolSize: usize
+    buffers: [2]wl.wl_buffer.Proxy
+    busy: [2]bool
+    // The slot shown last (its pixels: shownPixels), and how many frames
+    // were shown.
+    shownSlot: usize
+    shownFrames: usize
+    bufferWidth: usize
+    bufferHeight: usize
+    // The size the compositor configured, and the state of drawing.
+    width: usize
+    height: usize
+    configured: bool
+    dirty: bool
+    framePending: bool
+    running: bool
+    closed: bool
+    // A panel that stays: the compositor closing its surface hides it (the
+    // client shows it again with showLayer) instead of ending run; and a
+    // hide asked for, done after the events at hand.
+    keepAlive: bool
+    hideRequested: bool
+    // Another descriptor run waits on (EVENT_WATCH), or -1.
+    watch: isize
+    // EVENT_TICK every so many milliseconds (0: none), and when the next is.
+    tickInterval: usize
+    nextTick: usize
+    // Key repeat.
+    repeatRate: i32
+    repeatDelay: i32
+    repeatKey: u32
+    repeatAt: usize
+    // How far the last wheel event scrolls, in pixels (EVENT_WHEEL gives
+    // only its direction).
+    wheelPixels: i32
+    // What the last key typed (UTF-8).
+    text: [8]u8
+    textLength: usize
+    // The compositor's windows.
+    windows: [*]Window
+    windowCount: usize
+    // The last pointer button press (popups and drags name its serial).
+    buttonSerial: u32
+    // A popup menu (openMenu): its surface, xdg_surface and xdg_popup, its
+    // one buffer (drawn on the CPU by menuDraw), and whether the pointer
+    // is on it.
+    menuOpen: bool
+    menuSurface: wl.wl_surface.Proxy
+    menuXdgSurface: wl.xdg_surface.Proxy
+    menuPopup: wl.xdg_popup.Proxy
+    menuMemory: wl.SharedMemory
+    menuPool: wl.wl_shm_pool.Proxy
+    menuBuffer: wl.wl_buffer.Proxy
+    menuWidth: usize
+    menuHeight: usize
+    menuConfigured: bool
+    menuDirty: bool
+    menuDraw: Draw
+    pointerOnMenu: bool
+    // Drag and drop: the data device; a drag this client started (its
+    // source, MIME type and data, and its icon); the MIME type it takes in
+    // drops (none: length 0), the offer made last and whether it has that
+    // type, the offer of a drag over the surface, and what was dropped.
+    dataManager: wl.wl_data_device_manager.Proxy
+    hasDataManager: bool
+    dataDevice: wl.wl_data_device.Proxy
+    hasDataDevice: bool
+    dragSource: wl.wl_data_source.Proxy
+    hasDragSource: bool
+    dragMime: [64]u8
+    dragMimeLength: usize
+    dragData: [1024]u8
+    dragDataLength: usize
+    dragIcon: wl.wl_surface.Proxy
+    dragIconMemory: wl.SharedMemory
+    dragIconPool: wl.wl_shm_pool.Proxy
+    dragIconBuffer: wl.wl_buffer.Proxy
+    hasDragIcon: bool
+    dropMime: [64]u8
+    dropMimeLength: usize
+    lastOffer: wl.wl_data_offer.Proxy
+    hasLastOffer: bool
+    lastOfferMatches: bool
+    dropOffer: wl.wl_data_offer.Proxy
+    hasDropOffer: bool
+    dropMatches: bool
+    // The action the compositor chose for the offer entered (its action
+    // event; 0: none yet). finish is only allowed with one.
+    dropAction: u32
+    dragX: i32
+    dragY: i32
+    dropData: [1024]u8
+    dropDataLength: usize
+    // The client.
+    context: *anyopaque
+    draw: Draw
+    event: Handler
+    // A Scene's address (0: none), drawn when drawing is on the GPU; set
+    // after connect (openWindow, open).
+    scene: usize
+    turns: turns_module.Turns
+}
+
+pub fn windowAt(panel: *Panel, index: usize) -> *Window {
+    unsafe { return @ptrFromInt(*Window, @intFromPtr(panel.*.windows) + index * @sizeOf(Window)) }
+}
+
+pub fn appIdOf(window: *const Window) -> []const u8 {
+    var bytes: [*]const u8 = undefined
+    unsafe { bytes = @ptrFromInt([*]const u8, @intFromPtr(window) + @offsetOf(Window, "appId")) }
+    return bytes[0..window.*.appIdLength]
+}
+
+pub fn textOf(panel: *const Panel) -> []const u8 {
+    var bytes: [*]const u8 = undefined
+    unsafe { bytes = @ptrFromInt([*]const u8, @intFromPtr(panel) + @offsetOf(Panel, "text")) }
+    return bytes[0..panel.*.textLength]
+}
+
+pub fn panelOf(context: *anyopaque) -> *Panel {
+    unsafe { return @ptrCast(*Panel, context) }
+}
+
+pub fn contextOf(panel: *Panel) -> *anyopaque {
+    unsafe { return @ptrCast(*anyopaque, panel) }
+}
+
+// The pixels of the frame shown last (width * height, ARGB; a frame drawn
+// on the GPU is in them too when it goes through shared memory), 0 when
+// there is none; its size is the panel's.
+pub fn shownPixels(panel: *Panel) -> usize {
+    if panel.*.shownFrames == 0 || !panel.*.hasPool { return 0 }
+    return panel.*.memory.address + panel.*.shownSlot * panel.*.slotBytes
+}
+
+pub fn milliseconds() -> usize { return std.time.milliseconds() }
+
+fn isNamed(value: wl.String, name: []const u8) -> bool {
+    return std.string.eql(value, std.string.fromSlice(name))
+}
+
+fn smaller(first: u32, second: u32) -> u32 { return if first < second { first } else { second } }
+
+fn onRegistry(context: *anyopaque, event: wl.client.Event) -> void {
+    const panel = panelOf(context)
+    const decoded = wl.wl_registry.decodeEvent(event)
+    if event.opcode != wl.wl_registry.EVENT_GLOBAL { return }
+    const global = decoded.global
+    const registry = panel.*.registry
+    if isNamed(global.interface, "wl_compositor") {
+        panel.*.compositor = wl.wl_compositor.Proxy.fromObject(registry.bind(global.name, wl.Interface.wl_compositor, smaller(global.version, 4)))
+        panel.*.hasCompositor = true
+    } else if isNamed(global.interface, "wl_shm") {
+        panel.*.shm = wl.wl_shm.Proxy.fromObject(registry.bind(global.name, wl.Interface.wl_shm, 1))
+        panel.*.hasShm = true
+    } else if isNamed(global.interface, "wl_seat") && !panel.*.hasSeat {
+        panel.*.seat = wl.wl_seat.Proxy.fromObject(registry.bind(global.name, wl.Interface.wl_seat, smaller(global.version, 5)))
+        panel.*.seat.setHandler(panel_input_module.onSeat, context)
+        panel.*.hasSeat = true
+    } else if isNamed(global.interface, "zwlr_layer_shell_v1") {
+        panel.*.layerShell = wl.zwlr_layer_shell_v1.Proxy.fromObject(registry.bind(global.name, wl.Interface.zwlr_layer_shell_v1, smaller(global.version, 4)))
+        panel.*.hasLayerShell = true
+    } else if isNamed(global.interface, "ext_background_effect_manager_v1") {
+        panel.*.effects = wl.ext_background_effect_manager_v1.Proxy.fromObject(registry.bind(global.name, wl.Interface.ext_background_effect_manager_v1, 1))
+        panel.*.effects.setHandler(onEffects, context)
+        panel.*.hasEffects = true
+    } else if isNamed(global.interface, "zwp_linux_dmabuf_v1") && global.version >= 3 {
+        // Version 3 announces formats and modifiers with events.
+        panel.*.dmabuf = wl.zwp_linux_dmabuf_v1.Proxy.fromObject(registry.bind(global.name, wl.Interface.zwp_linux_dmabuf_v1, 3))
+        panel.*.dmabuf.setHandler(onDmabuf, context)
+        panel.*.hasDmabuf = true
+    } else if isNamed(global.interface, "xdg_wm_base") {
+        panel.*.wmBase = wl.xdg_wm_base.Proxy.fromObject(registry.bind(global.name, wl.Interface.xdg_wm_base, smaller(global.version, 2)))
+        panel.*.wmBase.setHandler(onWmBase, context)
+        panel.*.hasWmBase = true
+    } else if isNamed(global.interface, "zwlr_foreign_toplevel_manager_v1") && panel.*.wantWindows {
+        panel.*.windowManager = wl.zwlr_foreign_toplevel_manager_v1.Proxy.fromObject(registry.bind(global.name, wl.Interface.zwlr_foreign_toplevel_manager_v1, smaller(global.version, 3)))
+        panel.*.windowManager.setHandler(panel_input_module.onWindowManager, context)
+        panel.*.hasWindowManager = true
+    } else if isNamed(global.interface, "wl_data_device_manager") {
+        panel.*.dataManager = wl.wl_data_device_manager.Proxy.fromObject(registry.bind(global.name, wl.Interface.wl_data_device_manager, smaller(global.version, 3)))
+        panel.*.hasDataManager = true
+    } else if isNamed(global.interface, "zwp_keyboard_shortcuts_inhibit_manager_v1") {
+        panel.*.inhibitManager = wl.zwp_keyboard_shortcuts_inhibit_manager_v1.Proxy.fromObject(registry.bind(global.name, wl.Interface.zwp_keyboard_shortcuts_inhibit_manager_v1, 1))
+        panel.*.hasInhibitManager = true
+    }
+}
+
+fn onInhibitor(context: *anyopaque, event: wl.client.Event) -> void {
+    const panel = panelOf(context)
+    if event.opcode == wl.zwp_keyboard_shortcuts_inhibitor_v1.EVENT_ACTIVE { panel.*.shortcutsInhibited = true }
+    if event.opcode == wl.zwp_keyboard_shortcuts_inhibitor_v1.EVENT_INACTIVE { panel.*.shortcutsInhibited = false }
+}
+
+// Asks the compositor to pass all keys to this surface (its hotkeys and
+// Super too) while it has the keyboard, or no longer. Without the protocol
+// the compositor keeps its hotkeys.
+pub fn inhibitShortcuts(panel: *Panel, on: bool) -> void {
+    if on && !panel.*.hasInhibitor && panel.*.hasInhibitManager && panel.*.hasSurface && panel.*.hasSeat {
+        panel.*.inhibitor = panel.*.inhibitManager.inhibitShortcuts(panel.*.surface, panel.*.seat)
+        panel.*.inhibitor.setHandler(onInhibitor, @ptrCast(*anyopaque, panel))
+        panel.*.hasInhibitor = true
+    } else if !on && panel.*.hasInhibitor {
+        panel.*.inhibitor.destroy()
+        panel.*.hasInhibitor = false
+        panel.*.shortcutsInhibited = false
+    }
+}
+
+fn onDmabuf(context: *anyopaque, event: wl.client.Event) -> void {
+    if event.opcode != wl.zwp_linux_dmabuf_v1.EVENT_MODIFIER { return }
+    const modifier = wl.zwp_linux_dmabuf_v1.decodeEvent(event).modifier
+    if modifier.format == DRM_FORMAT_ARGB8888 && modifier.modifier_hi == 0 && modifier.modifier_lo == 0 { panelOf(context).*.dmabufArgb = true }
+}
+
+fn onEffects(context: *anyopaque, event: wl.client.Event) -> void {
+    const decoded = wl.ext_background_effect_manager_v1.decodeEvent(event)
+    panelOf(context).*.blurOffered = decoded.capabilities.flags & @intFromEnum(wl.ext_background_effect_manager_v1.Capability.blur) != 0
+}
+
+// ---------------------------------------------------------------------------
+// The surface
+
+fn onLayerSurface(context: *anyopaque, event: wl.client.Event) -> void {
+    const panel = panelOf(context)
+    const decoded = wl.zwlr_layer_surface_v1.decodeEvent(event)
+    if event.opcode == wl.zwlr_layer_surface_v1.EVENT_CONFIGURE {
+        const configure = decoded.configure
+        panel.*.layerSurface.ackConfigure(configure.serial)
+        if configure.width > 0 { panel.*.width = @intCast(usize, configure.width) }
+        if configure.height > 0 { panel.*.height = @intCast(usize, configure.height) }
+        panel.*.configured = true
+        panel.*.dirty = true
+        panel.*.event(panel.*.context, EVENT_CONFIGURED, @intCast(u32, panel.*.width), @intCast(i32, panel.*.height))
+    } else if event.opcode == wl.zwlr_layer_surface_v1.EVENT_CLOSED {
+        panel.*.closed = true
+        if panel.*.keepAlive { panel.*.hideRequested = true } else { panel.*.running = false }
+        panel.*.event(panel.*.context, EVENT_CLOSED, 0, 0)
+    }
+}
+
+fn onWmBase(context: *anyopaque, event: wl.client.Event) -> void {
+    const decoded = wl.xdg_wm_base.decodeEvent(event)
+    panelOf(context).*.wmBase.pong(decoded.ping.serial)
+}
+
+fn onXdgSurface(context: *anyopaque, event: wl.client.Event) -> void {
+    const panel = panelOf(context)
+    const decoded = wl.xdg_surface.decodeEvent(event)
+    if panel.*.wantedWidth > 0 { panel.*.width = @intCast(usize, panel.*.wantedWidth) }
+    if panel.*.wantedHeight > 0 { panel.*.height = @intCast(usize, panel.*.wantedHeight) }
+    panel.*.xdgSurface.ackConfigure(decoded.configure.serial)
+    panel.*.configured = true
+    panel.*.dirty = true
+    panel.*.event(panel.*.context, EVENT_CONFIGURED, @intCast(u32, panel.*.width), @intCast(i32, panel.*.height))
+}
+
+fn onToplevel(context: *anyopaque, event: wl.client.Event) -> void {
+    const panel = panelOf(context)
+    const decoded = wl.xdg_toplevel.decodeEvent(event)
+    if event.opcode == wl.xdg_toplevel.EVENT_CONFIGURE {
+        panel.*.wantedWidth = decoded.configure.width
+        panel.*.wantedHeight = decoded.configure.height
+    } else if event.opcode == wl.xdg_toplevel.EVENT_CLOSE {
+        panel.*.running = false
+        panel.*.event(panel.*.context, EVENT_CLOSED, 0, 0)
+    }
+}
+
+pub fn onBuffer(context: *anyopaque, event: wl.client.Event) -> void {
+    const panel = panelOf(context)
+    if event.object.id == panel.*.buffers[0].id() { panel.*.busy[0] = false }
+    if event.object.id == panel.*.buffers[1].id() { panel.*.busy[1] = false }
+}
+
+fn onFrame(context: *anyopaque, event: wl.client.Event) -> void {
+    panelOf(context).*.framePending = false
+}
+
+const Failure = error { NoCompositor, NoLayerShell, NoWindows, NoMemory }
+
+fn noCompositor() -> Failure!void { return Failure.NoCompositor }
+fn noLayerShell() -> Failure!void { return Failure.NoLayerShell }
+fn noMemory() -> Failure!void { return Failure.NoMemory }
+fn noWindows() -> Failure!void { return Failure.NoWindows }
+
+// Connects and asks for a layer surface `namespace` in `layer`, anchored at
+// `anchor` (state.ANCHOR_* bits), `width` x `height` (0: stretched between
+// anchors), with an exclusive zone, a margin at the anchored edges, and
+// keyboard interactivity (0 none, 1 exclusive, 2 on demand). `windows`:
+// follow the compositor's windows.
+pub fn open(panel: *Panel, allocator: Allocator, arguments: [][*]const u8, namespace: []const u8, layer: u32, anchor: u32, width: u32, height: u32, zone: i32, margin: i32, keyboard: u32, windows: bool) -> !void {
+    try connect(panel, allocator, arguments, width, height, windows)
+    if !showLayer(panel, namespace, layer, anchor, width, height, zone, margin, keyboard) { return noLayerShell() }
+    try panel.*.display.roundtrip()
+}
+
+// Makes the layer surface (after connect, or again after a hide); it is
+// drawn once the compositor configured it. False without layer shell.
+pub fn showLayer(panel: *Panel, namespace: []const u8, layer: u32, anchor: u32, width: u32, height: u32, zone: i32, margin: i32, keyboard: u32) -> bool {
+    if !panel.*.hasLayerShell { return false }
+    if panel.*.hasSurface { return true }
+    panel.*.width = @intCast(usize, width)
+    panel.*.height = @intCast(usize, height)
+    panel.*.configured = false
+    panel.*.closed = false
+    panel.*.hideRequested = false
+    panel.*.dirty = true
+    panel.*.framePending = false
+    panel.*.surface = panel.*.compositor.createSurface()
+    panel.*.layerSurface = panel.*.layerShell.getLayerSurface(panel.*.surface, null, layer, namespace)
+    panel.*.layerSurface.setHandler(onLayerSurface, contextOf(panel))
+    panel.*.hasSurface = true
+    panel.*.layerSurface.setSize(@intCast(u32, panel.*.width), @intCast(u32, panel.*.height))
+    panel.*.layerSurface.setAnchor(anchor)
+    panel.*.layerSurface.setExclusiveZone(zone)
+    panel.*.layerSurface.setMargin(margin, margin, margin, margin)
+    panel.*.layerSurface.setKeyboardInteractivity(keyboard)
+    if panel.*.hasEffects {
+        panel.*.effect = panel.*.effects.getBackgroundEffect(panel.*.surface)
+        panel.*.hasEffect = true
+    }
+    panel.*.surface.commit()
+    return true
+}
+
+// Asks for the layer surface to go (after the events at hand; see
+// keepAlive); showLayer brings it back.
+pub fn hide(panel: *Panel) -> void {
+    panel.*.hideRequested = true
+}
+
+// Takes the layer surface down; the connection and everything the client
+// loaded stay.
+fn hideNow(panel: *Panel) -> void {
+    panel.*.hideRequested = false
+    if !panel.*.hasSurface || panel.*.isWindow { return }
+    if panel.*.hasEffect {
+        panel.*.effect.destroy()
+        panel.*.hasEffect = false
+    }
+    panel.*.layerSurface.destroy()
+    panel.*.surface.destroy()
+    panel.*.hasSurface = false
+    panel.*.configured = false
+    // Nothing shows the buffers any more, and no frame callback will come.
+    panel.*.busy[0] = false
+    panel.*.busy[1] = false
+    panel.*.framePending = false
+    panel.*.repeatKey = 0
+}
+
+// Connects and opens an ordinary window (xdg_toplevel) titled `title` with
+// app id `app_id`, `width` x `height` unless the compositor asks for
+// another size.
+pub fn openWindow(panel: *Panel, allocator: Allocator, arguments: [][*]const u8, title: []const u8, app_id: []const u8, width: u32, height: u32) -> !void {
+    try connect(panel, allocator, arguments, width, height, false)
+    if !panel.*.hasWmBase { return noWindows() }
+    const display = panel.*.display
+    panel.*.isWindow = true
+    panel.*.surface = panel.*.compositor.createSurface()
+    panel.*.xdgSurface = panel.*.wmBase.getXdgSurface(panel.*.surface)
+    panel.*.xdgSurface.setHandler(onXdgSurface, contextOf(panel))
+    panel.*.toplevel = panel.*.xdgSurface.getToplevel()
+    panel.*.toplevel.setHandler(onToplevel, contextOf(panel))
+    panel.*.toplevel.setTitle(title)
+    panel.*.toplevel.setAppId(app_id)
+    panel.*.toplevel.setMinSize(@intCast(i32, width), @intCast(i32, height))
+    panel.*.hasSurface = true
+    panel.*.surface.commit()
+    try display.roundtrip()
+}
+
+// The connection, its globals and the panel's state (a surface comes with
+// showLayer or openWindow). Drawing goes to the GPU when Vulkan works
+// (MLX_CANVAS=cpu keeps it on the CPU; `arguments` is the program's, for
+// finding the Vulkan driver).
+pub fn connect(panel: *Panel, allocator: Allocator, arguments: [][*]const u8, width: u32, height: u32, windows: bool) -> !void {
+    panel.*.allocator = allocator
+    panel.*.device = 0
+    panel.*.scene = 0
+    panel.*.frames = FRAMES_CPU
+    panel.*.hasTargets = false
+    panel.*.hasDmabuf = false
+    panel.*.dmabufArgb = false
+    panel.*.slotBytes = 0
+    panel.*.keepAlive = false
+    panel.*.hideRequested = false
+    panel.*.watch = -1
+    panel.*.tickInterval = 0
+    panel.*.nextTick = 0
+    panel.*.hasWmBase = false
+    panel.*.isWindow = false
+    panel.*.wantedWidth = 0
+    panel.*.wantedHeight = 0
+    panel.*.hasCompositor = false
+    panel.*.hasShm = false
+    panel.*.hasSeat = false
+    panel.*.hasLayerShell = false
+    panel.*.hasEffects = false
+    panel.*.hasWindowManager = false
+    panel.*.hasInhibitManager = false
+    panel.*.hasInhibitor = false
+    panel.*.shortcutsInhibited = false
+    panel.*.buttonSerial = 0
+    panel.*.menuOpen = false
+    panel.*.pointerOnMenu = false
+    panel.*.hasDataManager = false
+    panel.*.hasDataDevice = false
+    panel.*.hasDragSource = false
+    panel.*.hasDragIcon = false
+    panel.*.dropMimeLength = 0
+    panel.*.hasLastOffer = false
+    panel.*.hasDropOffer = false
+    panel.*.dropAction = 0
+    panel.*.dropDataLength = 0
+    panel.*.wantWindows = windows
+    panel.*.blurOffered = false
+    panel.*.hasEffect = false
+    panel.*.hasSurface = false
+    panel.*.hasPointer = false
+    panel.*.hasKeyboard = false
+    panel.*.hasPool = false
+    panel.*.poolSize = 0
+    panel.*.bufferWidth = 0
+    panel.*.bufferHeight = 0
+    panel.*.busy[0] = false
+    panel.*.busy[1] = false
+    panel.*.shownSlot = 0
+    panel.*.shownFrames = 0
+    panel.*.width = @intCast(usize, width)
+    panel.*.height = @intCast(usize, height)
+    panel.*.configured = false
+    panel.*.dirty = true
+    panel.*.framePending = false
+    panel.*.running = true
+    panel.*.closed = false
+    panel.*.repeatRate = 25
+    panel.*.repeatDelay = 600
+    panel.*.repeatKey = 0
+    panel.*.textLength = 0
+    panel.*.windowCount = 0
+    keyboard_module.init(panel_input_module.keyboardOf(panel), panel.*.allocator)
+    const memory = allocator.alloc(MAX_WINDOWS * @sizeOf(Window), 16)
+    if memory == null { return noMemory() }
+    unsafe { panel.*.windows = @ptrCast([*]Window, memory.?) }
+
+    var display: wl.client.Display = undefined
+    try wl.client.Display.connect(&display, allocator)
+    panel.*.display = display
+    wayland_crash.watch(display)
+    panel.*.registry = wl.displayProxy(display).getRegistry()
+    panel.*.registry.setHandler(onRegistry, contextOf(panel))
+    try display.roundtrip()
+    if !panel.*.hasCompositor || !panel.*.hasShm { return noCompositor() }
+    // The seat's devices and the dma-buf formats.
+    try display.roundtrip()
+    if panel.*.hasDataManager && panel.*.hasSeat {
+        panel.*.dataDevice = panel.*.dataManager.getDataDevice(panel.*.seat)
+        panel.*.dataDevice.setHandler(panel_drag_module.onDataDevice, contextOf(panel))
+        panel.*.hasDataDevice = true
+    }
+    panel_frames_module.useGpu(panel, arguments)
+}
+
+// Brings the window forward (and its keyboard focus).
+pub fn activate(panel: *Panel, window: *Window) -> void {
+    if !panel.*.hasSeat || !window.*.live { return }
+    window.*.handle.activate(panel.*.seat)
+}
+
+// Says how the program draws: "NAME: drawing on the gpu, dma-buf (DEVICE)"
+// or "NAME: drawing on the cpu".
+pub fn report(panel: *Panel, program: []const u8) -> void {
+    var line: [256]u8 = undefined
+    var length: usize = 0
+    for byte in program {
+        line[length] = byte
+        length += 1
+    }
+    for byte in ": drawing on the " {
+        line[length] = byte
+        length += 1
+    }
+    for byte in framesName(panel) {
+        line[length] = byte
+        length += 1
+    }
+    if panel.*.device != 0 {
+        line[length] = 32
+        line[length + 1] = 40
+        length += 2
+        const name = gpu_canvas.name(panel_frames_module.deviceOf(panel))
+        var index: usize = 0
+        while name[index] != 0 && length < 250 {
+            line[length] = name[index]
+            length += 1
+            index += 1
+        }
+        line[length] = 41
+        length += 1
+    }
+    line[length] = 10
+    length += 1
+    const written = std.io.writeAll(std.io.stdout(), line[0..length])
+}
+
+// Forgets the images the GPU has (an app that loaded its icons again).
+pub fn forgetImages(panel: *Panel) -> void {
+    if panel.*.device != 0 { gpu_canvas.forgetImages(panel_frames_module.deviceOf(panel)) }
+}
+
+// How frames are drawn (for logs): "cpu", "gpu, dmabuf", ...
+pub fn framesName(panel: *const Panel) -> []const u8 {
+    if panel.*.frames == FRAMES_DMABUF { return "gpu, into dma-bufs" }
+    if panel.*.frames == FRAMES_SHM_DIRECT { return "gpu, into shared memory" }
+    if panel.*.frames == FRAMES_SHM_COPY { return "gpu, copied into shared memory" }
+    return "cpu"
+}
+
+// Asks for another size (the compositor configures it).
+pub fn resize(panel: *Panel, width: u32, height: u32) -> void {
+    panel.*.width = @intCast(usize, width)
+    panel.*.height = @intCast(usize, height)
+    if !panel.*.hasSurface { return }
+    if panel.*.isWindow {
+        // A window picks its own size: drawn at it with the next frame.
+        panel.*.dirty = true
+        return
+    }
+    panel.*.layerSurface.setSize(@intCast(u32, panel.*.width), @intCast(u32, panel.*.height))
+    panel.*.surface.commit()
+}
+
+pub fn setExclusiveZone(panel: *Panel, zone: i32) -> void {
+    if !panel.*.hasSurface || panel.*.isWindow { return }
+    panel.*.layerSurface.setExclusiveZone(zone)
+}
+
+// The blur region: `count` rectangles (x, y, width, height in `rects`), in
+// surface pixels; applied with the next frame. No effect without the
+// compositor's support.
+pub fn setBlur(panel: *Panel, rects: [*]const i32, count: usize) -> void {
+    if !panel.*.hasEffect { return }
+    const region = panel.*.compositor.createRegion()
+    var index: usize = 0
+    while index < count {
+        region.add(rects[index * 4], rects[index * 4 + 1], rects[index * 4 + 2], rects[index * 4 + 3])
+        index += 1
+    }
+    panel.*.effect.setBlurRegion(&region)
+    region.destroy()
+}
+
+// Where the pointer counts: `count` rectangles (none: everywhere).
+pub fn setInput(panel: *Panel, rects: [*]const i32, count: usize) -> void {
+    const region = panel.*.compositor.createRegion()
+    var index: usize = 0
+    while index < count {
+        region.add(rects[index * 4], rects[index * 4 + 1], rects[index * 4 + 2], rects[index * 4 + 3])
+        index += 1
+    }
+    panel.*.surface.setInputRegion(&region)
+    region.destroy()
+}
+
+// Rectangles covering a rounded rectangle (for a blur region): the middle,
+// and `steps` rows at the top and at the bottom, narrower towards the ends.
+// Writes 4 * (1 + 2 * steps) values into `rects`; returns the count.
+pub fn roundedRects(rects: [*]i32, x: i32, y: i32, width: i32, height: i32, radius: i32, steps: i32) -> usize {
+    rects[0] = x
+    rects[1] = y + radius
+    rects[2] = width
+    rects[3] = height - radius * 2
+    var count: usize = 1
+    var step: i32 = 0
+    while step < steps {
+        const band = radius / steps
+        const top = y + step * band
+        const height_band = if step == steps - 1 { radius - step * band } else { band }
+        // The inset at the middle of this band: radius - sqrt(r^2 - d^2).
+        const distance = radius - (step * band + height_band / 2)
+        var inset = radius
+        var probe: i32 = 0
+        while probe <= radius {
+            if probe * probe + distance * distance <= radius * radius { inset = radius - probe }
+            probe += 1
+        }
+        rects[count * 4] = x + inset
+        rects[count * 4 + 1] = top
+        rects[count * 4 + 2] = width - inset * 2
+        rects[count * 4 + 3] = height_band
+        count += 1
+        rects[count * 4] = x + inset
+        rects[count * 4 + 1] = y + height - (step * band) - height_band
+        rects[count * 4 + 2] = width - inset * 2
+        rects[count * 4 + 3] = height_band
+        count += 1
+        step += 1
+    }
+    return count
+}
+
+// ---------------------------------------------------------------------------
+// Drawing and the loop
+
+// Makes sure there are two buffers of the configured size.
+fn fitBuffers(panel: *Panel) -> bool {
+    const width = panel.*.width
+    const height = panel.*.height
+    if width == panel.*.bufferWidth && height == panel.*.bufferHeight { return true }
+    panel_frames_module.dropBuffers(panel)
+    panel.*.busy[0] = false
+    panel.*.busy[1] = false
+    if panel.*.frames == FRAMES_DMABUF {
+        if panel_frames_module.makeDmabufs(panel) {
+            panel.*.bufferWidth = width
+            panel.*.bufferHeight = height
+            return true
+        }
+        // Not taken: the GPU draws into shared memory instead.
+        panel_frames_module.dropBuffers(panel)
+        panel.*.frames = FRAMES_SHM_COPY
+    }
+    const frame = width * height * 4
+    // Slots aligned for a GPU that imports the pool.
+    var slot_bytes = frame
+    if panel.*.frames == FRAMES_SHM_DIRECT {
+        const alignment = @intCast(usize, gpu_canvas.context(panel_frames_module.deviceOf(panel)).*.hostAlignment)
+        slot_bytes = (frame + alignment - 1) / alignment * alignment
+    }
+    if slot_bytes * 2 > panel.*.poolSize {
+        if panel.*.hasPool {
+            panel.*.pool.destroy()
+            panel.*.memory.release()
+            panel.*.hasPool = false
+        }
+        var memory: wl.SharedMemory = undefined
+        if !wl.transport.createSharedMemory(&memory, slot_bytes * 2) { return false }
+        panel.*.memory = memory
+        panel.*.pool = panel.*.shm.createPool(memory.handle, @intCast(i32, slot_bytes * 2))
+        panel.*.poolSize = slot_bytes * 2
+        panel.*.hasPool = true
+    }
+    panel.*.slotBytes = slot_bytes
+    const format = @intFromEnum(wl.wl_shm.Format.argb8888)
+    panel.*.buffers[0] = panel.*.pool.createBuffer(0, @intCast(i32, width), @intCast(i32, height), @intCast(i32, width * 4), format)
+    panel.*.buffers[1] = panel.*.pool.createBuffer(@intCast(i32, slot_bytes), @intCast(i32, width), @intCast(i32, height), @intCast(i32, width * 4), format)
+    panel.*.buffers[0].setHandler(onBuffer, contextOf(panel))
+    panel.*.buffers[1].setHandler(onBuffer, contextOf(panel))
+    panel.*.bufferWidth = width
+    panel.*.bufferHeight = height
+    if panel.*.frames == FRAMES_SHM_DIRECT || panel.*.frames == FRAMES_SHM_COPY {
+        const context = gpu_canvas.context(panel_frames_module.deviceOf(panel))
+        var slot: usize = 0
+        var made = true
+        while slot < 2 && made {
+            const target = panel_frames_module.targetOf(panel, slot)
+            target.*.fd = -1
+            if panel.*.frames == FRAMES_SHM_DIRECT {
+                made = gpu.importHostMemory(context, target, panel.*.memory.address + slot * slot_bytes, @intCast(u64, slot_bytes))
+            } else {
+                made = gpu.createReadbackBuffer(context, target, @intCast(u64, frame))
+            }
+            panel.*.hasTargets = true
+            slot += 1
+        }
+        if !made {
+            panel_frames_module.dropBuffers(panel)
+            panel.*.frames = FRAMES_CPU
+            return fitBuffers(panel)
+        }
+    }
+    return true
+}
+
+fn redraw(panel: *Panel) -> void {
+    if !panel.*.hasSurface || !panel.*.configured || panel.*.framePending || !panel.*.dirty || panel.*.width == 0 || panel.*.height == 0 { return }
+    if !fitBuffers(panel) { return }
+    var slot: usize = 0
+    if panel.*.busy[0] {
+        if panel.*.busy[1] { return }
+        slot = 1
+    }
+    const width = panel.*.width
+    const height = panel.*.height
+    // Before drawing: a draw may ask for the next frame (a std.ui widget
+    // took what changed).
+    panel.*.dirty = false
+    if panel.*.frames == FRAMES_CPU {
+        var pixels: [*]u32 = undefined
+        unsafe { pixels = @ptrFromInt([*]u32, panel.*.memory.address + slot * panel.*.slotBytes) }
+        var canvas = Canvas.{ .pixels = pixels, .width = width, .height = height, .stride = width, .swapRedBlue = false, .device = 0, .opacity = 255 }
+        panel.*.draw(panel.*.context, &canvas)
+    } else {
+        // Recorded, then drawn by the GPU into the slot's buffer.
+        const device = panel_frames_module.deviceOf(panel)
+        gpu_canvas.begin(device, @intCast(u32, width), @intCast(u32, height))
+        var nowhere: [*]u32 = undefined
+        unsafe { nowhere = @ptrFromInt([*]u32, 16) }
+        var canvas = Canvas.{ .pixels = nowhere, .width = width, .height = height, .stride = width, .swapRedBlue = false, .device = panel.*.device, .opacity = 255 }
+        panel.*.draw(panel.*.context, &canvas)
+        const target = panel_frames_module.targetOf(panel, slot)
+        var painted = false
+        if panel.*.scene != 0 {
+            var scene: Scene = undefined
+            unsafe { scene = @ptrFromInt(Scene, panel.*.scene) }
+            const context = gpu_canvas.context(device)
+            painted = gpu_canvas.record(device, target.*.buffer, 0, @intCast(u32, width)) && scene(panel.*.context, context, target.*.buffer, @intCast(u32, width), @intCast(u32, height)) && gpu.submit(context)
+        } else {
+            painted = gpu_canvas.paint(device, target.*.buffer, 0, @intCast(u32, width))
+        }
+        if !painted {
+            panel_frames_module.leaveGpu(panel)
+            panel.*.dirty = true
+            return
+        }
+        if panel.*.frames == FRAMES_SHM_COPY {
+            gpu_upload.copyBytes(panel.*.memory.address + slot * panel.*.slotBytes, target.*.address, width * height * 4)
+        }
+    }
+    panel.*.busy[slot] = true
+    panel.*.shownSlot = slot
+    panel.*.shownFrames += 1
+    const buffer = panel.*.buffers[slot]
+    panel.*.surface.attach(&buffer, 0, 0)
+    panel.*.surface.damage(0, 0, @intCast(i32, width), @intCast(i32, height))
+    const callback = panel.*.surface.frame()
+    callback.setHandler(onFrame, contextOf(panel))
+    panel.*.framePending = true
+    panel.*.surface.commit()
+}
+
+// Runs until the client stops the panel (running = false) or the
+// compositor closes it or goes away.
+pub fn run(panel: *Panel) -> !void {
+    const display = panel.*.display
+    var handles: [2]wl.Handle = undefined
+    handles[0] = wl.Handle.fromDescriptor(display.descriptor())
+    var ready: [2]bool = [2]bool{ false, false }
+    var turns: turns_module.Turns = undefined
+    turns_module.begin(&turns, true, false)
+    while panel.*.running && display.running() {
+        turns_module.turn(&turns)
+        if panel.*.hideRequested { hideNow(panel) }
+        redraw(panel)
+        panel_menu_module.redrawMenu(panel)
+        try display.flush()
+        var timeout: isize = -1
+        if panel.*.repeatKey != 0 {
+            const now = milliseconds()
+            timeout = if panel.*.repeatAt > now { @intCast(isize, panel.*.repeatAt - now) } else { 0 }
+        }
+        if panel.*.tickInterval > 0 {
+            const now = milliseconds()
+            if panel.*.nextTick == 0 { panel.*.nextTick = now + panel.*.tickInterval }
+            const until = if panel.*.nextTick > now { @intCast(isize, panel.*.nextTick - now) } else { 0 }
+            if timeout < 0 || until < timeout { timeout = until }
+        }
+        var watched: usize = 1
+        if panel.*.watch >= 0 {
+            handles[1] = wl.Handle.fromDescriptor(panel.*.watch)
+            watched = 2
+        }
+        ready[1] = false
+        var count: isize = 0
+        unsafe { count = wl.transport.waitAny(@ptrCast([*]const wl.Handle, &handles), watched, @ptrCast([*]bool, &ready), timeout) }
+        if ready[0] { try display.dispatch() }
+        if watched == 2 && ready[1] { panel.*.event(panel.*.context, EVENT_WATCH, 0, 0) }
+        if panel.*.tickInterval > 0 && milliseconds() >= panel.*.nextTick {
+            panel.*.nextTick = milliseconds() + panel.*.tickInterval
+            panel.*.event(panel.*.context, EVENT_TICK, 0, 0)
+        }
+        if panel.*.repeatKey != 0 && milliseconds() >= panel.*.repeatAt {
+            panel_input_module.keyEvent(panel, panel.*.repeatKey, 2)
+            panel.*.repeatAt = milliseconds() + 1000 / @intCast(usize, if panel.*.repeatRate > 0 { panel.*.repeatRate } else { 25 })
+        }
+    }
+}
+
+// Takes the surface down and disconnects.
+pub fn close(panel: *Panel) -> void {
+    const display = panel.*.display
+    if !display.running() { return }
+    panel_menu_module.closeMenu(panel)
+    if panel.*.hasSurface {
+        if panel.*.hasEffect { panel.*.effect.destroy() }
+        if panel.*.isWindow {
+            panel.*.toplevel.destroy()
+            panel.*.xdgSurface.destroy()
+        } else {
+            panel.*.layerSurface.destroy()
+        }
+        panel.*.surface.destroy()
+    }
+    const flushed = display.flush()
+    display.disconnect()
+}
