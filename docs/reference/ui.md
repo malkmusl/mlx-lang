@@ -159,6 +159,38 @@ the next frame.
 | `std.ui.popup` | a popup's frame (it takes the pointer from what is under it), menu items and separators, tooltips, wrapped text |
 | `std.ui.theme` | colours and sizes: `dark()` (the desktop apps), `light()` |
 | `std.ui.keys` | keys as widgets take them: Linux input codes and modifier bits on every platform |
+| `std.ui.app` | what a platform gives a std.ui app: the events (pointer, buttons, wheel, keys, configured, closed, tick), `Draw` and `Handler`, and `feed` (a pointer event to the widgets) |
+
+## Platforms
+
+A std.ui app is a `Draw` and a `Handler` (`std.ui.app`) over the app's
+own state; the platform calls them. The same widgets, theme and fonts
+run on:
+
+| Platform | Starts with | Notes |
+| --- | --- | --- |
+| Wayland (desktop) | `projects/desktop/shared/panel.mlx`: `openWindow` or `open` (layer shell) | CPU or GPU canvas; its own events too (menus, drag and drop, the window list) |
+| Android | `std.android.startUi(activity, ..., context, draw, event)` | the finger is the left button; the system bars' space is `std.android.reservedInsets` |
+
+```mlx
+fn onEvent(context: *anyopaque, kind: u32, a: u32, b: i32) -> void {
+    if app.pressing(kind, a, b) { layOut(context) }   // widgets where they are now
+    if app.feed(&state.*.ui, kind, a, b) == app.FEED_CLICK { layOut(context) }   // taken now
+}
+
+fn layOut(context: *anyopaque) -> void {
+    var nowhere = view.layoutCanvas()
+    draw(context, &nowhere)
+}
+```
+
+Laid out before a press, the widgets are where the app's state puts them
+even when the press comes before the first frame (a platform may deliver
+it then) or after a change not drawn yet.
+
+`examples/android/widgets.mlx` is a settings screen of switch rows, a
+check row, segments and a button on Android; mlx-settings is one on
+Wayland.
 
 ## Tests
 
@@ -166,10 +198,11 @@ the next frame.
 a platform does (hover, clicks, a press let go elsewhere, a popup over a
 button, check rows, switches, segments, a row whose parts take their own
 clicks, a split button, a disabled back button, a crumb, a link, a
-swatch, a value row, a column header, a thin indicator, a text field
-edited by keys, a
-list scrolled by the wheel and by its bar, a tab closed, clipping,
-wrapping).
+swatch, a value row, a column header, a thin indicator, events through
+`std.ui.app.feed`, a text field edited by keys, a list scrolled by the
+wheel and by its bar, a tab closed, clipping, wrapping).
+`tools/emulate_android_app.py` runs `examples/android/widgets.mlx` against
+a model of Android (Unicorn) and taps a switch row and a segment.
 `tests/264_ui_layout_runtime.mlx` covers the geometry, every alignment
 (including children that do not fit), bands, containers, stacks, a screen
 with safe insets and reserved top and bottom bars, and `fillRect`'s

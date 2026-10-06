@@ -13,7 +13,9 @@ fire when the simulated clock passes its deadline, and checks the color of
 every posted frame and the logcat lines.
 
 Usage: python3 tools/emulate_android_app.py [-v] [app.apk | libmain.so]
-With no file, builds examples/android/gestures.mlx with zig-out/bin/mlx1.
+With no file, builds examples/android/gestures.mlx with zig-out/bin/mlx1,
+and also examples/android/widgets.mlx (std.ui widgets on startUi), whose
+switch row and segment it taps in a larger window.
 """
 import os
 import struct
@@ -319,8 +321,9 @@ class Framework:
     "fullscreen"} gives the activity a JNIEnv (FakeJni); without it the
     activity has none, as far as the app can tell."""
 
-    def __init__(self, library_path, verbose=False, jni=None):
+    def __init__(self, library_path, verbose=False, jni=None, size=(WIDTH, HEIGHT)):
         self.verbose = verbose
+        self.width, self.height = size
         self.heap_next = HEAP
         self.now = 0
         self.timer_deadline = None
@@ -334,7 +337,7 @@ class Framework:
         self.logs = []
         self.lib = SharedLibrary(library_path, imports=self._imports())
         self.lib.uc.mem_map(HEAP, HEAP_SIZE)
-        self.framebuffer = self.malloc(WIDTH * HEIGHT * 4)
+        self.framebuffer = self.malloc(self.width * self.height * 4)
         self.jni = FakeJni(self, self.stub, **jni) if jni is not None else None
 
     def stub(self, name, function):
@@ -390,14 +393,18 @@ class Framework:
 
     def _lock(self, process, window, buffer, dirty, *_):
         assert window == self.window, "lock of a window that is not current"
-        self.lib.write(buffer, struct.pack("<iiiiQ", WIDTH, HEIGHT, WIDTH, 1, self.framebuffer))
+        self.lib.write(buffer, struct.pack("<iiiiQ", self.width, self.height, self.width, 1, self.framebuffer))
         return 0
 
     def _post(self, process, window, *_):
-        pixels = struct.unpack(f"<{WIDTH * HEIGHT}I", self.lib.read(self.framebuffer, WIDTH * HEIGHT * 4))
+        pixels = self.pixels()
         colors = set(pixels)
         self.frames.append(pixels[0] if len(colors) == 1 else ("mixed", colors))
         return 0
+
+    def pixels(self):
+        count = self.width * self.height
+        return struct.unpack(f"<{count}I", self.lib.read(self.framebuffer, count * 4))
 
     def _add_fd(self, process, looper, fd, ident, events, callback, data, *_):
         self.fd_callbacks[fd & 0xFFFFFFFF] = (callback, data)
@@ -554,6 +561,57 @@ def check_reserved(library, verbose, fullscreen):
     return not problems
 
 
+# examples/android/widgets.mlx (std.ui on std.android.startUi): its
+# colours as the window holds them (bytes R, G, B, A).
+DARK_BACKGROUND, LIGHT_BACKGROUND = rgb(26, 28, 36), rgb(246, 246, 248)
+LIGHT_PRESSED = rgb(208, 211, 220)
+WIDGETS_SIZE = (360, 720)
+
+
+def run_widgets(library, verbose):
+    """Taps on the widgets example: the first switch row turns the dark
+    look off (the background turns light), the third segment is chosen
+    (its fill), and a tap on the empty space below changes nothing."""
+    framework = Framework(library, verbose, size=WIDGETS_SIZE)
+    framework.create()
+    framework.show_window()
+    framework.attach_input()
+    width = WIDGETS_SIZE[0]
+    def at(pixels, x, y):
+        return pixels[y * width + x]
+    problems = []
+    first = framework.pixels()
+    if at(first, 2, 2) != DARK_BACKGROUND:
+        problems.append(f"start: background {at(first, 2, 2):#010x}, expected dark {DARK_BACKGROUND:#010x}")
+    def tap(x, y, start):
+        framework.touch(ACTION_DOWN, x, y, start * MS)
+        framework.touch(ACTION_UP, x, y, (start + 80) * MS)
+    tap(180, 70, 100)
+    after_switch = framework.pixels()
+    if at(after_switch, 2, 2) != LIGHT_BACKGROUND:
+        problems.append(f"the dark switch: background {at(after_switch, 2, 2):#010x}, expected light {LIGHT_BACKGROUND:#010x}")
+    # Segments: y 352 .. 448, three across 24 .. 336.
+    segment = (300, 380)
+    if at(after_switch, *segment) == LIGHT_PRESSED:
+        problems.append("the third segment is chosen before it was tapped")
+    tap(segment[0], segment[1], 400)
+    after_segment = framework.pixels()
+    if at(after_segment, *segment) != LIGHT_PRESSED:
+        problems.append(f"the third segment: {at(after_segment, *segment):#010x}, expected {LIGHT_PRESSED:#010x}")
+    frames = len(framework.frames)
+    tap(180, 700, 700)
+    if framework.pixels() != after_segment:
+        problems.append("a tap beside the widgets changed the window")
+    if len(framework.frames) <= frames:
+        problems.append("a tap was not painted")
+    if framework.lib.missing:
+        problems.append(f"unmodeled imports called: {sorted(framework.lib.missing)}")
+    ok = not problems
+    print(f"{'ok  ' if ok else 'FAIL'} widgets: a switch row, a segment, a tap beside them"
+          + "".join(f"\n     {p}" for p in problems))
+    return 0 if ok else 1
+
+
 def run_scenarios(library, verbose):
     failures = 0
     names = ["tap", "tap, then wait 2 s", "tap within slop", "long press", "slow tap (400 ms)", "swipe right",
@@ -628,6 +686,11 @@ def main():
         if not arguments:
             subprocess.run([os.path.join(ROOT, "zig-out/bin/mlx1"), "examples/android/gestures.mlx", "-o", library,
                             "--target=aarch64-android", "--quiet"], cwd=ROOT, check=True)
+            widgets = os.path.join(tmp, "libwidgets.so")
+            subprocess.run([os.path.join(ROOT, "zig-out/bin/mlx1"), "examples/android/widgets.mlx", "-o", widgets,
+                            "--target=aarch64-android", "--quiet"], cwd=ROOT, check=True)
+            failed = run_scenarios(library, verbose)
+            return 1 if run_widgets(widgets, verbose) or failed else 0
         elif arguments[0].endswith(".apk"):
             with zipfile.ZipFile(arguments[0]) as apk, open(library, "wb") as out:
                 out.write(apk.read("lib/arm64-v8a/libmain.so"))

@@ -123,6 +123,30 @@ and above the navigation bar by the last gesture: blue at start, green for
 a tap, yellow for a long press, red/magenta for a swipe right/left,
 cyan/orange for a swipe down/up.
 
+### std.ui apps
+
+An app made of std.ui widgets (`docs/reference/ui.md`) starts with
+`startUi` instead of `start`: its `draw` gets a `std.ui.canvas.Canvas`
+the size of the window (its own pixels, copied into the RGBA_8888 window
+after each paint) and its handler gets `std.ui.app`'s events. The finger
+is the pointer's left button: a motion and a press when it goes down,
+motions while it moves, a motion, a release and a leave when it lifts (a
+cancel is a leave). `EVENT_CONFIGURED` comes when the window has a new
+size (a: width, b: height; lay out from it, as a layout pass's canvas is
+0 x 0). Every touch is painted; the space the system bars keep is
+`reservedInsets(activity, &insets)`.
+
+```mlx
+export fn ANativeActivity_onCreate(activity: usize, saved_state: usize, saved_state_size: usize) -> void {
+    // ... the app's state, its std.ui.view.Ui, theme and fonts
+    android.startUi(activity, saved_state, saved_state_size, @ptrCast(*anyopaque, state), draw, onEvent)
+}
+```
+
+`examples/android/widgets.mlx` is a settings screen made of the desktop
+apps' widgets (switch rows, a check row, segments, a button), with the
+fonts in `/system/fonts`.
+
 ### Frame clock
 
 `choreographer(&clock)` finds Android's frame clock (`AChoreographer`,
@@ -217,7 +241,7 @@ calls), the `O_*` bits that differ, and the `struct stat` and
 | `tools/check_aarch64_shared_library.py` | exports, imports, stack arguments and narrow-integer extension of a `.so` |
 | `tools/check_android_packaging.py` | CRC-32, Adler-32, SHA-1, SHA-256 and bignum results of the packaging code, built by mlx0 and by mlx1, against Python |
 | `tools/check_android_apk.py` | `apksigner`, `jarsigner`, `zipalign`, `aapt2` on a built APK; reproducible output |
-| `tools/emulate_android_app.py` | the gesture example against a model of the Android framework: taps, long presses, swipes, cancel, rotation, and the reserved space (a fake `JNIEnv`, see below): only the background under the status and navigation bars, nothing reserved when fullscreen |
+| `tools/emulate_android_app.py` | the gesture example against a model of the Android framework: taps, long presses, swipes, cancel, rotation, and the reserved space (a fake `JNIEnv`, see below): only the background under the status and navigation bars, nothing reserved when fullscreen; and `examples/android/widgets.mlx` (std.ui on `startUi`) in a 360 x 720 window: a tap on a switch row turns the theme light, one on a segment chooses it, one beside the widgets changes nothing |
 | `tools/emulate_vulkan_android.py` | `examples/vulkan-android` against the same framework model plus a mock Vulkan driver behind `libvulkan.so`: instance and device extensions, the submitted shader (`spirv-val`), swapchain creation on an R8G8B8A8, "inherit"-alpha surface, every presented frame pixel by pixel, the reserved space (a fake `JNIEnv` answers `getRootWindowInsets` on API 34 through `WindowInsets.Type` and `Insets`, and on API 29 through `getSystemWindowInset*` and `getDisplayCutout`, plus the status bar dimens; before the first layout pass it has none) with only the background under it and the landscape top band at its portrait height, frames paced by a modeled `AChoreographer` (one per vsync; the 60 Hz timer without it), each presented before the app waits for the GPU and never re-recorded before that wait (a modeled fence), one present semaphore per image and `minImageCount` images, the frame counter under the label (`60 FPS`, and the `perf:` log line), the request for 120 Hz (`ANativeWindow_setFrameRate`: 120 frames a second on a display that allows it, 60 with "Smooth Display" off), the fullscreen, navigation bar and gesture bar switches tapped at runtime (the content behind a transparent gesture bar) (`WindowInsetsController` on API 34, system UI flags on API 29) with the reserved space following, the std.truetype label at the top center of the rest and the buttons at its bottom center (the system font served from the test font, the `text` shader run on the fills, atlas and runs the app built), touch, out-of-date and resized swapchains, background and return, and devices without a system font or without Vulkan |
 
 The emulator cannot run Android itself, so the last step is a device:
