@@ -1,0 +1,885 @@
+// std.dbus: the D-Bus wire format, without libc or libdbus: marshalling
+// (Reader and Writer, either byte order, D-Bus alignment), message headers
+// (parse and build), and a stream connection with Unix descriptor passing
+// (the transport std.wayland uses). The MLXIPC bus (projects/desktop/ipc)
+// speaks it to D-Bus programs; clients can use it too.
+//
+//     var header: dbus.Header = undefined
+//     const size = dbus.messageSize(bytes, length)       0: not complete yet
+//     if dbus.parseHeader(bytes, size, &header) { ... header.member ... }
+//
+//     var writer: dbus.Writer = undefined
+//     dbus.begin(&writer, memory, capacity, false)       little-endian
+//     dbus.putString(&writer, "hello")
+//
+// A message is at most MAX_MESSAGE bytes here (the connection's buffer).
+const allocator_module = @import("../bootstrap/allocator.mlx")
+const transport = @import("./wayland/transport/linux.mlx")
+const linux = @import("../bootstrap/os/linux.mlx")
+
+pub const Allocator = allocator_module.Allocator
+
+pub const MAX_MESSAGE: usize = 65536
+
+// Message types.
+pub const METHOD_CALL: u8 = 1
+pub const METHOD_RETURN: u8 = 2
+pub const ERROR: u8 = 3
+pub const SIGNAL: u8 = 4
+
+// Flags.
+pub const NO_REPLY_EXPECTED: u8 = 1
+pub const NO_AUTO_START: u8 = 2
+
+// Header field codes.
+pub const FIELD_PATH: u8 = 1
+pub const FIELD_INTERFACE: u8 = 2
+pub const FIELD_MEMBER: u8 = 3
+pub const FIELD_ERROR_NAME: u8 = 4
+pub const FIELD_REPLY_SERIAL: u8 = 5
+pub const FIELD_DESTINATION: u8 = 6
+pub const FIELD_SENDER: u8 = 7
+pub const FIELD_SIGNATURE: u8 = 8
+pub const FIELD_UNIX_FDS: u8 = 9
+
+// ---------------------------------------------------------------------------
+// Reading
+
+pub const Reader = struct {
+    bytes: [*]const u8
+    length: usize
+    position: usize
+    big: bool
+    failed: bool
+}
+
+pub fn reader(bytes: [*]const u8, length: usize, big: bool) -> Reader {
+    return Reader.{ .bytes = bytes, .length = length, .position = 0, .big = big, .failed = false }
+}
+
+// Skips to the next multiple of `alignment` (counted from the message's
+// start: readers are made at the start of the message or its body, both
+// 8-aligned).
+pub fn alignTo(reading: *Reader, alignment: usize) -> void {
+    const target = (reading.*.position + alignment - 1) / alignment * alignment
+    if target > reading.*.length {
+        reading.*.failed = true
+        return
+    }
+    reading.*.position = target
+}
+
+pub fn readByte(reading: *Reader) -> u8 {
+    if reading.*.position + 1 > reading.*.length {
+        reading.*.failed = true
+        return 0
+    }
+    const value = reading.*.bytes[reading.*.position]
+    reading.*.position += 1
+    return value
+}
+
+pub fn load32(bytes: [*]const u8, at: usize, big: bool) -> u32 {
+    if big { return (@intCast(u32, bytes[at]) << 24) | (@intCast(u32, bytes[at + 1]) << 16) | (@intCast(u32, bytes[at + 2]) << 8) | @intCast(u32, bytes[at + 3]) }
+    return @intCast(u32, bytes[at]) | (@intCast(u32, bytes[at + 1]) << 8) | (@intCast(u32, bytes[at + 2]) << 16) | (@intCast(u32, bytes[at + 3]) << 24)
+}
+
+pub fn readU32(reading: *Reader) -> u32 {
+    alignTo(reading, 4)
+    if reading.*.failed || reading.*.position + 4 > reading.*.length {
+        reading.*.failed = true
+        return 0
+    }
+    const value = load32(reading.*.bytes, reading.*.position, reading.*.big)
+    reading.*.position += 4
+    return value
+}
+
+pub fn readBool(reading: *Reader) -> bool { return readU32(reading) != 0 }
+
+// A string or object path (u32 length, bytes, NUL): its bytes, in place.
+pub fn readString(reading: *Reader) -> []const u8 {
+    const length = @intCast(usize, readU32(reading))
+    if reading.*.failed || reading.*.position + length + 1 > reading.*.length {
+        reading.*.failed = true
+        return reading.*.bytes[0..0]
+    }
+    const start = reading.*.position
+    reading.*.position += length + 1
+    return reading.*.bytes[start..start + length]
+}
+
+// A signature (byte length, bytes, NUL).
+pub fn readSignature(reading: *Reader) -> []const u8 {
+    const length = @intCast(usize, readByte(reading))
+    if reading.*.failed || reading.*.position + length + 1 > reading.*.length {
+        reading.*.failed = true
+        return reading.*.bytes[0..0]
+    }
+    const start = reading.*.position
+    reading.*.position += length + 1
+    return reading.*.bytes[start..start + length]
+}
+
+// The alignment of the type that `code` starts.
+pub fn alignmentOf(code: u8) -> usize {
+    if code == 121 || code == 103 || code == 118 { return 1 }
+    if code == 110 || code == 113 { return 2 }
+    if code == 120 || code == 116 || code == 100 || code == 40 || code == 123 { return 8 }
+    return 4
+}
+
+// The end of the single complete type starting at signature[at].
+pub fn typeEnd(signature: []const u8, at: usize) -> usize {
+    if at >= signature.length { return signature.length }
+    const code = signature[at]
+    if code == 97 { return typeEnd(signature, at + 1) }
+    if code == 40 || code == 123 {
+        const close: u8 = if code == 40 { 41 } else { 125 }
+        var position = at + 1
+        while position < signature.length && signature[position] != close { position = typeEnd(signature, position) }
+        return position + 1
+    }
+    return at + 1
+}
+
+// Skips one value of the type at signature[at..end]; false when it does
+// not fit.
+pub fn skipValue(reading: *Reader, signature: []const u8, at: usize, depth: usize) -> bool {
+    if depth > 32 || at >= signature.length {
+        reading.*.failed = true
+        return false
+    }
+    const code = signature[at]
+    if code == 121 {
+        const ignored = readByte(reading)
+    } else if code == 110 || code == 113 {
+        alignTo(reading, 2)
+        reading.*.position += 2
+    } else if code == 98 || code == 105 || code == 117 || code == 104 {
+        const ignored = readU32(reading)
+    } else if code == 120 || code == 116 || code == 100 {
+        alignTo(reading, 8)
+        reading.*.position += 8
+    } else if code == 115 || code == 111 {
+        const ignored = readString(reading)
+    } else if code == 103 {
+        const ignored = readSignature(reading)
+    } else if code == 118 {
+        const inner = readSignature(reading)
+        if reading.*.failed || inner.length == 0 { return false }
+        return skipValue(reading, inner, 0, depth + 1)
+    } else if code == 97 {
+        const length = @intCast(usize, readU32(reading))
+        alignTo(reading, alignmentOf(signature[at + 1]))
+        reading.*.position += length
+    } else if code == 40 || code == 123 {
+        alignTo(reading, 8)
+        var position = at + 1
+        const close: u8 = if code == 40 { 41 } else { 125 }
+        while position < signature.length && signature[position] != close && !reading.*.failed {
+            if !skipValue(reading, signature, position, depth + 1) { return false }
+            position = typeEnd(signature, position)
+        }
+    } else {
+        reading.*.failed = true
+    }
+    if reading.*.position > reading.*.length { reading.*.failed = true }
+    return !reading.*.failed
+}
+
+// ---------------------------------------------------------------------------
+// Writing
+
+pub const Writer = struct {
+    bytes: [*]u8
+    capacity: usize
+    length: usize
+    big: bool
+    failed: bool
+}
+
+pub fn begin(writing: *Writer, bytes: [*]u8, capacity: usize, big: bool) -> void {
+    writing.*.bytes = bytes
+    writing.*.capacity = capacity
+    writing.*.length = 0
+    writing.*.big = big
+    writing.*.failed = false
+}
+
+pub fn pad(writing: *Writer, alignment: usize) -> void {
+    while writing.*.length % alignment != 0 {
+        if writing.*.length >= writing.*.capacity {
+            writing.*.failed = true
+            return
+        }
+        writing.*.bytes[writing.*.length] = 0
+        writing.*.length += 1
+    }
+}
+
+pub fn putByte(writing: *Writer, value: u8) -> void {
+    if writing.*.length >= writing.*.capacity {
+        writing.*.failed = true
+        return
+    }
+    writing.*.bytes[writing.*.length] = value
+    writing.*.length += 1
+}
+
+pub fn store32(bytes: [*]u8, at: usize, value: u32, big: bool) -> void {
+    if big {
+        bytes[at] = @intCast(u8, value >> 24)
+        bytes[at + 1] = @intCast(u8, (value >> 16) & 255)
+        bytes[at + 2] = @intCast(u8, (value >> 8) & 255)
+        bytes[at + 3] = @intCast(u8, value & 255)
+        return
+    }
+    bytes[at] = @intCast(u8, value & 255)
+    bytes[at + 1] = @intCast(u8, (value >> 8) & 255)
+    bytes[at + 2] = @intCast(u8, (value >> 16) & 255)
+    bytes[at + 3] = @intCast(u8, value >> 24)
+}
+
+pub fn putU32(writing: *Writer, value: u32) -> void {
+    pad(writing, 4)
+    if writing.*.length + 4 > writing.*.capacity {
+        writing.*.failed = true
+        return
+    }
+    store32(writing.*.bytes, writing.*.length, value, writing.*.big)
+    writing.*.length += 4
+}
+
+pub fn putBool(writing: *Writer, value: bool) -> void { putU32(writing, if value { 1 } else { 0 }) }
+
+pub fn putBytes(writing: *Writer, bytes: [*]const u8, length: usize) -> void {
+    if writing.*.length + length > writing.*.capacity {
+        writing.*.failed = true
+        return
+    }
+    var index: usize = 0
+    while index < length {
+        writing.*.bytes[writing.*.length + index] = bytes[index]
+        index += 1
+    }
+    writing.*.length += length
+}
+
+// A string or object path.
+pub fn putString(writing: *Writer, text: []const u8) -> void {
+    putU32(writing, @intCast(u32, text.length))
+    var bytes: [*]const u8 = undefined
+    unsafe { bytes = @ptrCast([*]const u8, text) }
+    putBytes(writing, bytes, text.length)
+    putByte(writing, 0)
+}
+
+pub fn putSignature(writing: *Writer, text: []const u8) -> void {
+    putByte(writing, @intCast(u8, text.length))
+    var bytes: [*]const u8 = undefined
+    unsafe { bytes = @ptrCast([*]const u8, text) }
+    putBytes(writing, bytes, text.length)
+    putByte(writing, 0)
+}
+
+// An array: its length word now (beginArray returns where it is), its
+// elements, then endArray fills it in. `alignment`: the elements'.
+pub fn beginArray(writing: *Writer, alignment: usize) -> usize {
+    putU32(writing, 0)
+    const at = writing.*.length - 4
+    pad(writing, alignment)
+    return at
+}
+
+pub fn endArray(writing: *Writer, at: usize, alignment: usize) -> void {
+    if writing.*.failed { return }
+    // The length counts from the first element (after the padding).
+    const first = (at + 4 + alignment - 1) / alignment * alignment
+    store32(writing.*.bytes, at, @intCast(u32, writing.*.length - first), writing.*.big)
+}
+
+// A variant holding a string ("s"), a u32 ("u") or an object path ("o").
+pub fn putVariantString(writing: *Writer, text: []const u8) -> void {
+    putSignature(writing, "s")
+    putString(writing, text)
+}
+
+pub fn putVariantU32(writing: *Writer, value: u32) -> void {
+    putSignature(writing, "u")
+    putU32(writing, value)
+}
+
+// ---------------------------------------------------------------------------
+// Messages
+
+pub const Header = struct {
+    big: bool
+    kind: u8
+    flags: u8
+    bodyLength: usize
+    serial: u32
+    // Where the body starts, and the message's whole size.
+    bodyStart: usize
+    size: usize
+    path: []const u8
+    interface: []const u8
+    member: []const u8
+    errorName: []const u8
+    replySerial: u32
+    hasReplySerial: bool
+    destination: []const u8
+    sender: []const u8
+    signature: []const u8
+    unixFds: u32
+}
+
+// The size of the message at `bytes` (`length` of them buffered): 0 while
+// its fixed header is incomplete, else its whole size (which may be more
+// than is buffered); MAX_MESSAGE + 1 when it is impossible.
+pub fn messageSize(bytes: [*]const u8, length: usize) -> usize {
+    if length < 16 { return 0 }
+    const endian = bytes[0]
+    if endian != 108 && endian != 66 { return MAX_MESSAGE + 1 }
+    const big = endian == 66
+    const body = @intCast(usize, load32(bytes, 4, big))
+    const fields = @intCast(usize, load32(bytes, 12, big))
+    if body > 134217728 || fields > 67108864 { return MAX_MESSAGE + 1 }
+    const header_end = (16 + fields + 7) / 8 * 8
+    return header_end + body
+}
+
+fn empty(bytes: [*]const u8) -> []const u8 { return bytes[0..0] }
+
+// Reads the header of a complete message of `size` bytes; false when it is
+// malformed.
+pub fn parseHeader(bytes: [*]const u8, size: usize, header: *Header) -> bool {
+    const big = bytes[0] == 66
+    header.*.big = big
+    header.*.kind = bytes[1]
+    header.*.flags = bytes[2]
+    if bytes[3] != 1 || header.*.kind == 0 || header.*.kind > 4 { return false }
+    header.*.bodyLength = @intCast(usize, load32(bytes, 4, big))
+    header.*.serial = load32(bytes, 8, big)
+    if header.*.serial == 0 { return false }
+    const fields_length = @intCast(usize, load32(bytes, 12, big))
+    header.*.bodyStart = (16 + fields_length + 7) / 8 * 8
+    header.*.size = header.*.bodyStart + header.*.bodyLength
+    if header.*.size != size { return false }
+    header.*.path = empty(bytes)
+    header.*.interface = empty(bytes)
+    header.*.member = empty(bytes)
+    header.*.errorName = empty(bytes)
+    header.*.replySerial = 0
+    header.*.hasReplySerial = false
+    header.*.destination = empty(bytes)
+    header.*.sender = empty(bytes)
+    header.*.signature = empty(bytes)
+    header.*.unixFds = 0
+    var reading = reader(bytes, 16 + fields_length, big)
+    reading.position = 16
+    while reading.position < 16 + fields_length && !reading.failed {
+        alignTo(&reading, 8)
+        if reading.position >= 16 + fields_length { break }
+        const code = readByte(&reading)
+        const kind = readSignature(&reading)
+        if reading.failed || kind.length != 1 { return false }
+        const type_code = kind[0]
+        if type_code == 115 || type_code == 111 {
+            const value = readString(&reading)
+            if code == FIELD_PATH { header.*.path = value }
+            if code == FIELD_INTERFACE { header.*.interface = value }
+            if code == FIELD_MEMBER { header.*.member = value }
+            if code == FIELD_ERROR_NAME { header.*.errorName = value }
+            if code == FIELD_DESTINATION { header.*.destination = value }
+            if code == FIELD_SENDER { header.*.sender = value }
+        } else if type_code == 103 {
+            const value = readSignature(&reading)
+            if code == FIELD_SIGNATURE { header.*.signature = value }
+        } else if type_code == 117 {
+            const value = readU32(&reading)
+            if code == FIELD_REPLY_SERIAL {
+                header.*.replySerial = value
+                header.*.hasReplySerial = true
+            }
+            if code == FIELD_UNIX_FDS { header.*.unixFds = value }
+        } else {
+            if !skipValue(&reading, kind, 0, 0) { return false }
+        }
+    }
+    if reading.failed { return false }
+    // What each type requires.
+    if header.*.kind == METHOD_CALL && (header.*.path.length == 0 || header.*.member.length == 0) { return false }
+    if header.*.kind == SIGNAL && (header.*.path.length == 0 || header.*.member.length == 0 || header.*.interface.length == 0) { return false }
+    if header.*.kind == ERROR && (header.*.errorName.length == 0 || !header.*.hasReplySerial) { return false }
+    if header.*.kind == METHOD_RETURN && !header.*.hasReplySerial { return false }
+    return true
+}
+
+fn putStringField(writing: *Writer, code: u8, kind: []const u8, value: []const u8) -> void {
+    if value.length == 0 { return }
+    pad(writing, 8)
+    putByte(writing, code)
+    putSignature(writing, kind)
+    putString(writing, value)
+}
+
+fn putU32Field(writing: *Writer, code: u8, value: u32) -> void {
+    pad(writing, 8)
+    putByte(writing, code)
+    putSignature(writing, "u")
+    putU32(writing, value)
+}
+
+// Writes a message: its header from `header` (its byte order, type,
+// flags, serial and fields; sender `sender` instead of the header's), then
+// `body` (header.bodyLength bytes, in the header's byte order).
+pub fn writeMessage(writing: *Writer, header: *const Header, sender: []const u8, body: [*]const u8) -> void {
+    putByte(writing, if header.*.big { 66 } else { 108 })
+    putByte(writing, header.*.kind)
+    putByte(writing, header.*.flags)
+    putByte(writing, 1)
+    putU32(writing, @intCast(u32, header.*.bodyLength))
+    putU32(writing, header.*.serial)
+    const fields_at = writing.*.length
+    putU32(writing, 0)
+    const fields_start = writing.*.length
+    putStringField(writing, FIELD_PATH, "o", header.*.path)
+    putStringField(writing, FIELD_INTERFACE, "s", header.*.interface)
+    putStringField(writing, FIELD_MEMBER, "s", header.*.member)
+    putStringField(writing, FIELD_ERROR_NAME, "s", header.*.errorName)
+    if header.*.hasReplySerial { putU32Field(writing, FIELD_REPLY_SERIAL, header.*.replySerial) }
+    putStringField(writing, FIELD_DESTINATION, "s", header.*.destination)
+    putStringField(writing, FIELD_SENDER, "s", sender)
+    if header.*.signature.length > 0 {
+        pad(writing, 8)
+        putByte(writing, FIELD_SIGNATURE)
+        putSignature(writing, "g")
+        putSignature(writing, header.*.signature)
+    }
+    if header.*.unixFds > 0 { putU32Field(writing, FIELD_UNIX_FDS, header.*.unixFds) }
+    if writing.*.failed { return }
+    store32(writing.*.bytes, fields_at, @intCast(u32, writing.*.length - fields_start), writing.*.big)
+    pad(writing, 8)
+    putBytes(writing, body, header.*.bodyLength)
+}
+
+// A header to fill in for a new message (no fields yet).
+pub fn newHeader(kind: u8, serial: u32) -> Header {
+    var nothing: [*]const u8 = undefined
+    unsafe { nothing = @ptrCast([*]const u8, "") }
+    return Header.{ .big = false, .kind = kind, .flags = 0, .bodyLength = 0, .serial = serial, .bodyStart = 0, .size = 0, .path = nothing[0..0], .interface = nothing[0..0], .member = nothing[0..0], .errorName = nothing[0..0], .replySerial = 0, .hasReplySerial = false, .destination = nothing[0..0], .sender = nothing[0..0], .signature = nothing[0..0], .unixFds = 0 }
+}
+
+// ---------------------------------------------------------------------------
+// Connections: a stream socket's bytes and descriptors (std.wayland's
+// transport).
+
+pub const Connection = transport.Connection
+
+pub fn open(connection: *Connection, allocator: Allocator, descriptor: isize) -> bool {
+    if !transport.setNonBlocking(descriptor) { return false }
+    return transport.init(connection, allocator, descriptor)
+}
+
+pub fn close(connection: *Connection) -> void { transport.deinit(connection) }
+
+// Reads what has arrived: bytes read, 0 at the end, a negative errno
+// (EAGAIN: nothing yet).
+pub fn receive(connection: *Connection) -> isize { return transport.receive(connection) }
+
+pub fn buffered(connection: *const Connection) -> usize { return transport.bufferedInput(connection) }
+pub fn bufferedHandles(connection: *const Connection) -> usize { return transport.bufferedHandles(connection) }
+pub fn input(connection: *const Connection) -> [*]const u8 { return transport.inputPointer(connection) }
+pub fn handles(connection: *const Connection) -> [*]const isize { return transport.handlePointer(connection) }
+
+// Drops `size` bytes and hands over `count` descriptors (the caller owns
+// them now).
+pub fn consume(connection: *Connection, size: usize, count: usize) -> void { transport.consume(connection, size, count) }
+
+// Queues bytes (and descriptors, which the connection then owns and closes
+// once sent); false when they do not fit (the peer does not read).
+pub fn queue(connection: *Connection, bytes: [*]const u8, length: usize, descriptors: [*]const isize, count: usize) -> bool {
+    return transport.queueBytes(connection, bytes, length, descriptors, count) == 0
+}
+
+// Sends what is queued: 0 when all of it went, EAGAIN when the socket is
+// full, another negative errno when it broke.
+pub fn flush(connection: *Connection) -> isize { return transport.flush(connection) }
+
+pub fn pendingOutput(connection: *const Connection) -> usize { return transport.pendingOutput(connection) }
+
+pub const EAGAIN: isize = transport.EAGAIN
+
+// ---------------------------------------------------------------------------
+// Listening and the event loop (epoll), for a bus
+
+// Binds and listens on `path` (non-blocking): the descriptor, or a negative
+// errno.
+pub fn listen(path: []const u8) -> isize {
+    unsafe { return transport.listenPath(@ptrCast([*]const u8, path), path.length) }
+}
+
+// A pending connection (non-blocking), or a negative errno.
+pub fn accept(listener: isize) -> isize { return transport.accept(listener) }
+
+// Connects to the socket at `path` (non-blocking): the descriptor, or a
+// negative errno.
+pub fn connect(path: []const u8) -> isize {
+    unsafe { return transport.connectPath(@ptrCast([*]const u8, path), path.length) }
+}
+
+pub fn closeDescriptor(descriptor: isize) -> void { transport.close(descriptor) }
+
+pub const Events = transport.Events
+
+pub fn createEventLoop() -> isize { return transport.createEventLoop() }
+pub fn watch(event_loop: isize, descriptor: isize, token: usize, writable: bool) -> bool { return transport.watch(event_loop, descriptor, token, writable) }
+pub fn rewatch(event_loop: isize, descriptor: isize, token: usize, writable: bool) -> bool { return transport.rewatch(event_loop, descriptor, token, writable) }
+pub fn unwatch(event_loop: isize, descriptor: isize) -> bool { return transport.unwatch(event_loop, descriptor) }
+pub fn waitEvents(event_loop: isize, events: *Events, timeout_milliseconds: isize) -> isize { return transport.waitEvents(event_loop, events, timeout_milliseconds) }
+pub fn eventToken(events: *const Events, index: usize) -> usize { return transport.eventToken(events, index) }
+pub fn eventFlags(events: *const Events, index: usize) -> u32 { return transport.eventFlags(events, index) }
+
+pub const EPOLLIN: u32 = 1
+pub const EPOLLOUT: u32 = 4
+pub const EPOLLHUP: u32 = 16
+pub const EPOLLERR: u32 = 8
+
+// The peer's process, user and group (SO_PEERCRED); false when the kernel
+// would not say.
+pub fn peerCredentials(descriptor: isize, pid: *u32, uid: *u32, gid: *u32) -> bool {
+    var credentials: [12]u8 = undefined
+    var length: [4]u8 = [4]u8{ 12, 0, 0, 0 }
+    const result = linux.syscall5(55, @bitCast(usize, descriptor), 1, 17, @intFromPtr(&credentials), @intFromPtr(&length))
+    if result != 0 { return false }
+    unsafe {
+        const bytes = @ptrCast([*]const u8, &credentials)
+        pid.* = load32(bytes, 0, false)
+        uid.* = load32(bytes, 4, false)
+        gid.* = load32(bytes, 8, false)
+    }
+    return true
+}
+
+// ---------------------------------------------------------------------------
+// A client of a bus: connecting (EXTERNAL authentication, Unix descriptor
+// passing, Hello), sending, and the messages that arrive, one at a time.
+//
+//     var client: dbus.Client = undefined
+//     if !dbus.connectSession(&client, allocator, environment) { ... }
+//     var header = dbus.newHeader(dbus.METHOD_CALL, 0)
+//     header.destination = "org.freedesktop.DBus" ...
+//     const serial = dbus.send(&client, &header, body, length, nothing, 0)
+//     var reply: dbus.Header = undefined
+//     if dbus.waitReply(&client, serial, &reply, 5000) { ... dbus.bodyOf(&client, &reply) ... }
+
+pub const Client = struct {
+    connection: Connection
+    serial: u32
+    unique: [64]u8
+    uniqueLength: usize
+    unixFds: bool
+    // Where messages are built.
+    out: [*]u8
+    // The message `next` returned last: dropped by the next call.
+    pendingSize: usize
+    pendingCount: usize
+}
+
+pub fn connectionOf(client: *Client) -> *Connection {
+    unsafe { return @ptrCast(*Connection, &client.*.connection) }
+}
+
+pub fn uniqueName(client: *Client) -> []const u8 {
+    var bytes: [*]const u8 = undefined
+    unsafe { bytes = @ptrCast([*]const u8, &client.*.unique) }
+    return bytes[0..client.*.uniqueLength]
+}
+
+// The session bus's socket path (DBUS_SESSION_BUS_ADDRESS's unix:path=,
+// else $XDG_RUNTIME_DIR/bus) into `path`: its length, 0 when there is
+// none.
+pub fn sessionPath(environment: [*][*]const u8, path: [*]u8, capacity: usize) -> usize {
+    var index: usize = 0
+    while @intFromPtr(environment[index]) != 0 {
+        const entry = environment[index]
+        if startsWithBytes(entry, "DBUS_SESSION_BUS_ADDRESS=") {
+            // Each address of the list: the first unix:path= one.
+            var at: usize = 25
+            while entry[at] != 0 {
+                if startsWithBytes(advanceConst(entry, at), "unix:path=") {
+                    at += 10
+                    var length: usize = 0
+                    while entry[at] != 0 && entry[at] != 44 && entry[at] != 59 && length + 1 < capacity {
+                        path[length] = entry[at]
+                        length += 1
+                        at += 1
+                    }
+                    path[length] = 0
+                    return length
+                }
+                while entry[at] != 0 && entry[at] != 59 { at += 1 }
+                if entry[at] == 59 { at += 1 }
+            }
+        }
+        index += 1
+    }
+    index = 0
+    while @intFromPtr(environment[index]) != 0 {
+        const entry = environment[index]
+        if startsWithBytes(entry, "XDG_RUNTIME_DIR=") {
+            var length: usize = 0
+            while entry[16 + length] != 0 && length + 5 < capacity {
+                path[length] = entry[16 + length]
+                length += 1
+            }
+            const suffix = "/bus"
+            var at: usize = 0
+            while at < 4 {
+                path[length] = suffix[at]
+                length += 1
+                at += 1
+            }
+            path[length] = 0
+            return length
+        }
+        index += 1
+    }
+    return 0
+}
+
+fn startsWithBytes(text: [*]const u8, prefix: []const u8) -> bool {
+    var index: usize = 0
+    while index < prefix.length {
+        if text[index] != prefix[index] { return false }
+        index += 1
+    }
+    return true
+}
+
+fn advanceConst(bytes: [*]const u8, count: usize) -> [*]const u8 {
+    unsafe { return @ptrFromInt([*]const u8, @intFromPtr(bytes) + count) }
+}
+
+// The next line of the authentication (without its CRLF): its length, or
+// -1 when the connection ended.
+fn authLine(client: *Client, line: [*]u8, capacity: usize) -> isize {
+    const connection = connectionOf(client)
+    while true {
+        const available = buffered(connection)
+        const bytes = input(connection)
+        var end: usize = 0
+        while end + 1 < available && !(bytes[end] == 13 && bytes[end + 1] == 10) { end += 1 }
+        if end + 1 < available {
+            var index: usize = 0
+            while index < end && index < capacity {
+                line[index] = bytes[index]
+                index += 1
+            }
+            consume(connection, end + 2, 0)
+            return @intCast(isize, index)
+        }
+        if transport.wait(connection.*.descriptor, false, 5000) <= 0 { return -1 }
+        const got = receive(connection)
+        if got == 0 || (got < 0 && got != EAGAIN) { return -1 }
+    }
+    return -1
+}
+
+// Queues and sends everything (waiting while the socket is full).
+fn flushAll(client: *Client) -> bool {
+    const connection = connectionOf(client)
+    while true {
+        const flushed = flush(connection)
+        if flushed == 0 { return true }
+        if flushed != EAGAIN { return false }
+        if transport.wait(connection.*.descriptor, true, 5000) <= 0 { return false }
+    }
+    return false
+}
+
+// Connects to the bus at `path`, authenticates and says Hello; false when
+// any of it failed.
+pub fn connectClient(client: *Client, allocator: Allocator, path: []const u8) -> bool {
+    const descriptor = connect(path)
+    if descriptor < 0 { return false }
+    if !open(connectionOf(client), allocator, descriptor) {
+        closeDescriptor(descriptor)
+        return false
+    }
+    client.*.serial = 0
+    client.*.uniqueLength = 0
+    client.*.unixFds = false
+    client.*.pendingSize = 0
+    client.*.pendingCount = 0
+    const memory = allocator.alloc(MAX_MESSAGE, 16)
+    if memory == null { return false }
+    client.*.out = memory.?
+    // "\0AUTH EXTERNAL <hex of the uid's digits>\r\nNEGOTIATE_UNIX_FD\r\nBEGIN\r\n"
+    var hello: [128]u8 = undefined
+    var length: usize = 0
+    hello[0] = 0
+    length = 1
+    length = appendText(&hello, length, "AUTH EXTERNAL ")
+    var digits: [12]u8 = undefined
+    var count: usize = 0
+    var uid = @bitCast(usize, linux.syscall0(102))
+    while true {
+        digits[count] = @intCast(u8, 48 + uid % 10)
+        count += 1
+        uid = uid / 10
+        if uid == 0 { break }
+    }
+    const hex = "0123456789abcdef"
+    while count > 0 {
+        count -= 1
+        hello[length] = hex[@intCast(usize, digits[count] >> 4)]
+        hello[length + 1] = hex[@intCast(usize, digits[count] & 15)]
+        length += 2
+    }
+    length = appendText(&hello, length, "\r\nNEGOTIATE_UNIX_FD\r\nBEGIN\r\n")
+    var nothing: [1]isize = [1]isize{ 0 }
+    var bytes: [*]const u8 = undefined
+    unsafe { bytes = @ptrCast([*]const u8, &hello) }
+    unsafe { if !queue(connectionOf(client), bytes, length, @ptrCast([*]const isize, &nothing), 0) { return false } }
+    if !flushAll(client) { return false }
+    var line: [256]u8 = undefined
+    var line_bytes: [*]u8 = undefined
+    unsafe { line_bytes = @ptrCast([*]u8, &line) }
+    const first = authLine(client, line_bytes, 256)
+    if first < 2 || line[0] != 79 || line[1] != 75 { return false }
+    const second = authLine(client, line_bytes, 256)
+    if second < 0 { return false }
+    client.*.unixFds = second >= 13 && line[0] == 65 && line[1] == 71
+    // Hello.
+    var header = newHeader(METHOD_CALL, 0)
+    header.destination = "org.freedesktop.DBus"
+    header.path = "/org/freedesktop/DBus"
+    header.interface = "org.freedesktop.DBus"
+    header.member = "Hello"
+    unsafe { const serial = send(client, &header, bytes, 0, @ptrCast([*]const isize, &nothing), 0) }
+    var reply: Header = undefined
+    if !waitReply(client, client.*.serial, &reply, 5000) || reply.kind != METHOD_RETURN { return false }
+    var reading = reader(bodyOf(client, &reply), reply.bodyLength, reply.big)
+    const unique = readString(&reading)
+    var index: usize = 0
+    while index < unique.length && index < 64 {
+        client.*.unique[index] = unique[index]
+        index += 1
+    }
+    client.*.uniqueLength = index
+    return !reading.failed
+}
+
+fn appendText(target: *[128]u8, at: usize, text: []const u8) -> usize {
+    var index: usize = 0
+    while index < text.length && at + index < 128 {
+        target.*[at + index] = text[index]
+        index += 1
+    }
+    return at + index
+}
+
+// Connects to the session bus.
+pub fn connectSession(client: *Client, allocator: Allocator, environment: [*][*]const u8) -> bool {
+    var path: [256]u8 = undefined
+    var path_bytes: [*]u8 = undefined
+    unsafe { path_bytes = @ptrCast([*]u8, &path) }
+    const length = sessionPath(environment, path_bytes, 256)
+    if length == 0 { return false }
+    return connectClient(client, allocator, path_bytes[0..length])
+}
+
+// Sends `header` (its serial is set here) with `length` bytes of body and
+// `count` descriptors (which the connection then owns): the serial, 0
+// when it could not be sent.
+pub fn send(client: *Client, header: *Header, body: [*]const u8, length: usize, descriptors: [*]const isize, count: usize) -> u32 {
+    client.*.serial +%= 1
+    if client.*.serial == 0 { client.*.serial = 1 }
+    header.*.serial = client.*.serial
+    header.*.bodyLength = length
+    header.*.unixFds = @intCast(u32, count)
+    var writing: Writer = undefined
+    begin(&writing, client.*.out, MAX_MESSAGE, header.*.big)
+    var none: [*]const u8 = undefined
+    unsafe { none = @ptrCast([*]const u8, "") }
+    writeMessage(&writing, header, none[0..0], body)
+    if writing.failed { return 0 }
+    if !queue(connectionOf(client), writing.bytes, writing.length, descriptors, count) { return 0 }
+    if !flushAll(client) { return 0 }
+    return header.*.serial
+}
+
+// A method call to `destination`: its serial (0: not sent).
+pub fn call(client: *Client, destination: []const u8, path: []const u8, interface: []const u8, member: []const u8, signature: []const u8, body: [*]const u8, length: usize) -> u32 {
+    var header = newHeader(METHOD_CALL, 0)
+    header.destination = destination
+    header.path = path
+    header.interface = interface
+    header.member = member
+    header.signature = signature
+    var nothing: [1]isize = [1]isize{ 0 }
+    unsafe { return send(client, &header, body, length, @ptrCast([*]const isize, &nothing), 0) }
+}
+
+// The reply to `request` (a message `next` returned) with `length` bytes
+// of body of `signature`.
+pub fn reply(client: *Client, request: *const Header, signature: []const u8, body: [*]const u8, length: usize, descriptors: [*]const isize, count: usize) -> u32 {
+    var header = newHeader(METHOD_RETURN, 0)
+    header.replySerial = request.*.serial
+    header.hasReplySerial = true
+    header.destination = request.*.sender
+    header.signature = signature
+    return send(client, &header, body, length, descriptors, count)
+}
+
+// Waits up to `timeout` milliseconds (negative: forever) for the next
+// message; false when the connection ended or none came. Its body is at
+// bodyOf, its descriptors at descriptorOf: they are the caller's (to
+// close when it does not keep them).
+pub fn next(client: *Client, header: *Header, timeout: isize) -> bool {
+    const connection = connectionOf(client)
+    if client.*.pendingSize > 0 {
+        consume(connection, client.*.pendingSize, client.*.pendingCount)
+        client.*.pendingSize = 0
+        client.*.pendingCount = 0
+    }
+    while true {
+        const available = buffered(connection)
+        const bytes = input(connection)
+        const size = messageSize(bytes, available)
+        if size > MAX_MESSAGE { return false }
+        if size > 0 && available >= size {
+            if !parseHeader(bytes, size, header) { return false }
+            client.*.pendingSize = size
+            client.*.pendingCount = @intCast(usize, header.*.unixFds)
+            if client.*.pendingCount > bufferedHandles(connection) { client.*.pendingCount = bufferedHandles(connection) }
+            return true
+        }
+        if transport.wait(connection.*.descriptor, false, timeout) <= 0 { return false }
+        const got = receive(connection)
+        if got == 0 || (got < 0 && got != EAGAIN) { return false }
+    }
+    return false
+}
+
+pub fn bodyOf(client: *Client, header: *const Header) -> [*]const u8 {
+    return advanceConst(input(connectionOf(client)), header.*.bodyStart)
+}
+
+// The message's descriptor `index` (-1 when it has none such).
+pub fn descriptorOf(client: *Client, index: usize) -> isize {
+    if index >= client.*.pendingCount { return -1 }
+    const descriptor = handles(connectionOf(client))[index]
+    return descriptor
+}
+
+// Waits for the reply (or error) to `serial`; other messages are passed
+// over.
+pub fn waitReply(client: *Client, serial: u32, header: *Header, timeout: isize) -> bool {
+    while next(client, header, timeout) {
+        if (header.*.kind == METHOD_RETURN || header.*.kind == ERROR) && header.*.hasReplySerial && header.*.replySerial == serial { return true }
+    }
+    return false
+}

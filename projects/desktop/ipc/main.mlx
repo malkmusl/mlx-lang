@@ -1,0 +1,385 @@
+// mlx-ipcd: MLXIPC's message bus. D-Bus programs use it as they would
+// dbus-daemon (the same wire protocol, org.freedesktop.DBus, match rules,
+// activation, monitoring: bus.mlx, driver.mlx, activation.mlx), and it adds
+// what the D-Bus session bus lacks: permissions per app, not per user
+// (policy.mlx), and direct channels between two apps past the bus
+// (org.mlx.IPC.Connect, driver.mlx). No libc, no libdbus.
+//
+//     mlx4 projects/desktop/ipc/main.mlx -o mlx-ipcd
+//     ./mlx-ipcd --run mlx-compositor          a session on this bus
+//
+// Options:
+//     --address PATH      listen on PATH (default $XDG_RUNTIME_DIR/bus, where
+//                         D-Bus programs look without DBUS_SESSION_BUS_ADDRESS;
+//                         a bus that already listens there is left alone:
+//                         with --run, $XDG_RUNTIME_DIR/mlx-ipc-PID then)
+//     --policy FILE       the permissions (default ~/.config/mlx/ipc.conf,
+//                         $XDG_CONFIG_HOME respected); read again when it
+//                         changes, on SIGHUP and on ReloadConfig
+//     --services DIR      look for .service files in DIR first
+//     --print-address     print the bus's address once it listens
+//     --run PROGRAM ...   run PROGRAM (the rest are its arguments) with
+//                         DBUS_SESSION_BUS_ADDRESS set, and end with it (as
+//                         dbus-run-session does), with its exit status
+//     --verbose           log connections, their apps, started services and
+//                         refusals
+const std = @import("std")
+const dbus = @import("std.dbus")
+const state = @import("./state.mlx")
+const turns_module = @import("std.turns")
+const crash = @import("std.crash")
+const bus_module = @import("./bus.mlx")
+const policy = @import("./policy.mlx")
+const activation = @import("./activation.mlx")
+
+
+// Event tokens below any client's address.
+const LISTENER: usize = 1
+const SIGNALS: usize = 2
+const WATCHER: usize = 3
+
+const SIGHUP: usize = 1
+const SIGINT: usize = 2
+const SIGTERM: usize = 15
+const SIGCHLD: usize = 17
+
+const SYS_unlink: usize = 87
+const SYS_wait4: usize = 61
+const SYS_signalfd4: usize = 289
+const SYS_inotify_init1: usize = 294
+const SYS_inotify_add_watch: usize = 254
+const SYS_getrandom: usize = 318
+const SYS_exit_group: usize = 231
+const SYS_fork: usize = 57
+const SYS_rt_sigprocmask: usize = 14
+
+const Failure = error { Usage, NoMemory, NoRuntimeDirectory, Taken, NoListen, NoLoop }
+
+fn fail(message: []const u8, failure: Failure) -> Failure!void {
+    const said = std.io.eprintln(message)
+    return failure
+}
+
+fn named(text: std.string.String, name: []const u8) -> bool { return std.string.eql(text, std.string.fromSlice(name)) }
+
+fn bit(signal: usize) -> usize { return 1 << (signal - 1) }
+
+// "PATH" NUL-terminated into `bytes`, from `first` and `second`.
+fn joinPath(bytes: [*]u8, capacity: usize, first: []const u8, second: []const u8) -> usize {
+    var length = bus_module.copyInto(bytes, capacity - 1, first)
+    length += bus_module.copyInto(bus_module.advance(bytes, length), capacity - 1 - length, second)
+    bytes[length] = 0
+    return length
+}
+
+fn appendNumber(bytes: [*]u8, at: usize, value: usize) -> usize {
+    var digits: [20]u8 = undefined
+    var count: usize = 0
+    var rest = value
+    while true {
+        digits[count] = @intCast(u8, 48 + rest % 10)
+        count += 1
+        rest = rest / 10
+        if rest == 0 { break }
+    }
+    var length = at
+    while count > 0 {
+        count -= 1
+        bytes[length] = digits[count]
+        length += 1
+    }
+    bytes[length] = 0
+    return length
+}
+
+// The bus's id: 32 hex digits from the kernel's randomness.
+fn makeGuid(bus: *state.Bus) -> void {
+    var random: [16]u8 = undefined
+    const got = std.linux.syscall3(SYS_getrandom, @intFromPtr(&random), 16, 0)
+    const digits = "0123456789abcdef"
+    var index: usize = 0
+    while index < 16 {
+        bus.*.guid[index * 2] = digits[@intCast(usize, random[index] >> 4)]
+        bus.*.guid[index * 2 + 1] = digits[@intCast(usize, random[index] & 15)]
+        index += 1
+    }
+}
+
+// Runs the --run program with the bus's address: its process id.
+fn runProgram(bus: *state.Bus, arguments: [][*]const u8, first: usize) -> isize {
+    var argv: [64][*]const u8 = undefined
+    var count: usize = 0
+    var index = first
+    while index < arguments.length && count < 63 {
+        argv[count] = arguments[index]
+        count += 1
+        index += 1
+    }
+    unsafe { argv[count] = @ptrFromInt([*]const u8, 0) }
+    var environment: [512][*]const u8 = undefined
+    var entries: usize = 0
+    index = 0
+    while @intFromPtr(bus.*.environment[index]) != 0 && entries < 500 {
+        const entry = bus.*.environment[index]
+        if !activation.sets(entry, "DBUS_SESSION_BUS_ADDRESS") {
+            environment[entries] = entry
+            entries += 1
+        }
+        index += 1
+    }
+    var setting: [320]u8 = undefined
+    var setting_bytes: [*]u8 = undefined
+    unsafe { setting_bytes = @ptrCast([*]u8, &setting) }
+    var address: [*]const u8 = undefined
+    unsafe { address = @ptrCast([*]const u8, &bus.*.address) }
+    const ignored = joinPath(setting_bytes, 320, "DBUS_SESSION_BUS_ADDRESS=", address[0..bus.*.addressLength])
+    environment[entries] = setting_bytes
+    unsafe { environment[entries + 1] = @ptrFromInt([*]const u8, 0) }
+    var argument_pointer: [*][*]const u8 = undefined
+    var environment_pointer: [*][*]const u8 = undefined
+    unsafe {
+        argument_pointer = @ptrCast([*][*]const u8, &argv)
+        environment_pointer = @ptrCast([*][*]const u8, &environment)
+    }
+    const child = std.linux.syscall0(SYS_fork)
+    if child == 0 {
+        var none: usize = 0
+        const unblocked = std.linux.syscall4(SYS_rt_sigprocmask, 2, @intFromPtr(&none), 0, 8)
+        activation.execute(argv[0], argument_pointer, environment_pointer)
+        const said = std.io.eprintln("mlx-ipcd: the --run program could not be started")
+        const exited = std.linux.syscall1(SYS_exit_group, 127)
+    }
+    return child
+}
+
+// Reaps ended children: the --run program (its status, and the bus ends)
+// or services that were starting.
+fn reap(bus: *state.Bus, run_pid: isize, status: *usize) -> void {
+    var raw: [4]u8 = [4]u8{ 0, 0, 0, 0 }
+    while true {
+        const pid = std.linux.syscall4(SYS_wait4, 18446744073709551615, @intFromPtr(&raw), 1, 0)
+        if pid <= 0 { return }
+        if pid == run_pid {
+            bus.*.running = false
+            // Exited: its code; killed: 128 + the signal.
+            if raw[0] & 127 == 0 { status.* = @intCast(usize, raw[1]) } else { status.* = 128 + @intCast(usize, raw[0] & 127) }
+        } else {
+            activation.reaped(bus, pid)
+        }
+    }
+}
+
+fn serve(bus: *state.Bus, signals: isize, watcher: isize, run_pid: isize, status: *usize) -> void {
+    var turns: turns_module.Turns = undefined
+    turns_module.begin(&turns, true, false)
+    var events: dbus.Events = undefined
+    var record: [128]u8 = undefined
+    while bus.*.running {
+        turns_module.turn(&turns)
+        const timeout: isize = if activation.busy(bus) { 1000 } else { -1 }
+        const count = dbus.waitEvents(bus.*.eventLoop, &events, timeout)
+        var index: usize = 0
+        while count > 0 && index < @intCast(usize, count) {
+            const token = dbus.eventToken(&events, index)
+            const flags = dbus.eventFlags(&events, index)
+            if token == LISTENER {
+                while true {
+                    const accepted = dbus.accept(bus.*.listener)
+                    if accepted < 0 { break }
+                    bus_module.accepted(bus, accepted)
+                }
+                // The policy's directory may have come after the bus
+                // started (nothing watched it then).
+                policy.refresh(policy.of(bus), bus)
+            } else if token == SIGNALS {
+                while std.linux.syscall3(0, @bitCast(usize, signals), @intFromPtr(&record), 128) == 128 {
+                    const number = @intCast(usize, record[0])
+                    if number == SIGCHLD {
+                        reap(bus, run_pid, status)
+                    } else if number == SIGHUP {
+                        policy.reload(policy.of(bus), bus)
+                    } else {
+                        bus.*.running = false
+                    }
+                }
+            } else if token == WATCHER {
+                var drained: [4096]u8 = undefined
+                while std.linux.syscall3(0, @bitCast(usize, watcher), @intFromPtr(&drained), 4096) > 0 {}
+                policy.refresh(policy.of(bus), bus)
+            } else {
+                const client = bus_module.clientAt(token)
+                if !client.*.dead && flags & (dbus.EPOLLIN | dbus.EPOLLHUP | dbus.EPOLLERR) != 0 { bus_module.readable(bus, client) }
+            }
+            index += 1
+        }
+        if activation.busy(bus) { activation.tick(bus) }
+        bus_module.flushAll(bus)
+    }
+}
+
+fn run(arguments: [][*]const u8) -> !usize {
+    const allocator = std.page_allocator.init()
+    var address_option = std.string.fromSlice("")
+    var policy_option = std.string.fromSlice("")
+    var services_option = std.string.fromSlice("")
+    var print_address = false
+    var verbose = false
+    var run_from: usize = 0
+    var index: usize = 1
+    const count = std.process.count(arguments)
+    while index < count {
+        const argument = std.process.argument(arguments, index)
+        if named(argument, "--address") && index + 1 < count {
+            index += 1
+            address_option = std.process.argument(arguments, index)
+        } else if named(argument, "--policy") && index + 1 < count {
+            index += 1
+            policy_option = std.process.argument(arguments, index)
+        } else if named(argument, "--services") && index + 1 < count {
+            index += 1
+            services_option = std.process.argument(arguments, index)
+        } else if named(argument, "--print-address") {
+            print_address = true
+        } else if named(argument, "--verbose") {
+            verbose = true
+        } else if named(argument, "--run") && index + 1 < count {
+            run_from = index + 1
+            break
+        } else {
+            try fail("usage: mlx-ipcd [--address PATH] [--policy FILE] [--services DIR] [--print-address] [--verbose] [--run PROGRAM ARGUMENTS...]", Failure.Usage)
+        }
+        index += 1
+    }
+    const memory = allocator.alloc(@sizeOf(state.Bus), 16)
+    const scratch = allocator.alloc(dbus.MAX_MESSAGE, 16)
+    const body = allocator.alloc(dbus.MAX_MESSAGE, 16)
+    if memory == null || scratch == null || body == null { try fail("mlx-ipcd: out of memory", Failure.NoMemory) }
+    var bus: *state.Bus = undefined
+    unsafe { bus = @ptrCast(*state.Bus, memory.?) }
+    bus.*.allocator = allocator
+    bus.*.running = true
+    bus.*.verbose = verbose
+    bus.*.nextId = 1
+    bus.*.clientCount = 0
+    bus.*.nameCount = 0
+    bus.*.matchCount = 0
+    bus.*.expectedCount = 0
+    bus.*.scratch = scratch.?
+    bus.*.body = body.?
+    bus.*.delivered = 0
+    bus.*.denied = 0
+    bus.*.environment = std.process.environmentEntries(arguments)
+    makeGuid(bus)
+
+    // Where to listen.
+    var path: [256]u8 = undefined
+    var path_bytes: [*]u8 = undefined
+    unsafe { path_bytes = @ptrCast([*]u8, &path) }
+    var path_length: usize = 0
+    if address_option.length > 0 {
+        path_length = joinPath(path_bytes, 200, std.string.asSlice(address_option), "")
+    } else {
+        const runtime = std.process.environmentFrom(bus.*.environment, "XDG_RUNTIME_DIR")
+        if runtime == null { try fail("mlx-ipcd: XDG_RUNTIME_DIR is not set (or give --address PATH)", Failure.NoRuntimeDirectory) }
+        path_length = joinPath(path_bytes, 200, std.string.asSlice(runtime.?), "/bus")
+        const live = dbus.connect(path_bytes[0..path_length])
+        if live >= 0 {
+            dbus.closeDescriptor(live)
+            if run_from == 0 { try fail("mlx-ipcd: a bus already listens at $XDG_RUNTIME_DIR/bus (give --address PATH)", Failure.Taken) }
+            // Next to it, our own.
+            path_length = joinPath(path_bytes, 200, std.string.asSlice(runtime.?), "/mlx-ipc-")
+            path_length = appendNumber(path_bytes, path_length, @bitCast(usize, std.linux.syscall0(39)))
+        }
+    }
+    const live = dbus.connect(path_bytes[0..path_length])
+    if live >= 0 {
+        dbus.closeDescriptor(live)
+        try fail("mlx-ipcd: a bus already listens at that address", Failure.Taken)
+    }
+    // A socket nobody listens on any more goes.
+    const unlinked = std.linux.syscall1(SYS_unlink, @intFromPtr(path_bytes))
+    bus.*.listener = dbus.listen(path_bytes[0..path_length])
+    if bus.*.listener < 0 { try fail("mlx-ipcd: could not listen there", Failure.NoListen) }
+    var address_bytes: [*]u8 = undefined
+    unsafe { address_bytes = @ptrCast([*]u8, &bus.*.address) }
+    bus.*.addressLength = joinPath(address_bytes, 256, "unix:path=", path_bytes[0..path_length])
+
+    // The policy.
+    var policy_path: [512]u8 = undefined
+    var policy_bytes: [*]u8 = undefined
+    unsafe { policy_bytes = @ptrCast([*]u8, &policy_path) }
+    var policy_length: usize = 0
+    if policy_option.length > 0 {
+        policy_length = joinPath(policy_bytes, 512, std.string.asSlice(policy_option), "")
+    } else {
+        const config = std.process.environmentFrom(bus.*.environment, "XDG_CONFIG_HOME")
+        const home = std.process.environmentFrom(bus.*.environment, "HOME")
+        if config != null && config.?.length > 0 {
+            policy_length = joinPath(policy_bytes, 512, std.string.asSlice(config.?), "/mlx/ipc.conf")
+        } else if home != null {
+            policy_length = joinPath(policy_bytes, 512, std.string.asSlice(home.?), "/.config/mlx/ipc.conf")
+        }
+    }
+    policy.load(policy.of(bus), bus, policy_bytes[0..policy_length])
+    activation.init(activation.of(bus), std.string.asSlice(services_option))
+
+    // Signals as events: the bus ends on INT and TERM, reads the policy
+    // again on HUP and reaps on CHLD.
+    const mask = bit(SIGHUP) | bit(SIGINT) | bit(SIGTERM) | bit(SIGCHLD)
+    var blocked = mask
+    const masked = std.linux.syscall4(SYS_rt_sigprocmask, 0, @intFromPtr(&blocked), 0, 8)
+    // SFD_NONBLOCK | SFD_CLOEXEC.
+    const signals = std.linux.syscall4(SYS_signalfd4, 18446744073709551615, @intFromPtr(&blocked), 8, 526336)
+    bus.*.eventLoop = dbus.createEventLoop()
+    if bus.*.eventLoop < 0 || signals < 0 { try fail("mlx-ipcd: no event loop", Failure.NoLoop) }
+    const watching_listener = dbus.watch(bus.*.eventLoop, bus.*.listener, LISTENER, false)
+    const watching_signals = dbus.watch(bus.*.eventLoop, signals, SIGNALS, false)
+    // The policy's directory, for changes (IN_NONBLOCK | IN_CLOEXEC).
+    const watcher = std.linux.syscall1(SYS_inotify_init1, 526336)
+    if watcher >= 0 && policy_length > 0 {
+        var directory_length = policy_length
+        while directory_length > 0 && policy_path[directory_length - 1] != 47 { directory_length -= 1 }
+        if directory_length > 1 {
+            policy_path[directory_length - 1] = 0
+            // IN_CLOSE_WRITE | IN_MOVED_FROM | IN_MOVED_TO | IN_CREATE | IN_DELETE.
+            const watched = std.linux.syscall3(SYS_inotify_add_watch, @bitCast(usize, watcher), @intFromPtr(policy_bytes), 968)
+            policy_path[directory_length - 1] = 47
+            if watched >= 0 { const watching = dbus.watch(bus.*.eventLoop, watcher, WATCHER, false) }
+        }
+    }
+
+    var run_pid: isize = -1
+    if run_from > 0 { run_pid = runProgram(bus, arguments, run_from) }
+    var address_text: [*]const u8 = undefined
+    unsafe { address_text = @ptrCast([*]const u8, &bus.*.address) }
+    if print_address {
+        const said = std.io.writeAll(std.io.stdout(), address_text[0..bus.*.addressLength])
+        var guid: [*]const u8 = undefined
+        unsafe { guid = @ptrCast([*]const u8, &bus.*.guid) }
+        const comma = std.io.writeAll(std.io.stdout(), ",guid=")
+        const shown = std.io.writeAll(std.io.stdout(), guid[0..32])
+        const ended = std.io.writeAll(std.io.stdout(), "\n")
+    }
+    bus_module.say(bus, "ipc: listening at ")
+    bus_module.say(bus, address_text[0..bus.*.addressLength])
+    bus_module.say(bus, "\n")
+
+    var status: usize = 0
+    serve(bus, signals, watcher, run_pid, &status)
+
+    // Ending: the socket goes; started services and clients see the bus
+    // go.
+    const removed = std.linux.syscall1(SYS_unlink, @intFromPtr(path_bytes))
+    bus_module.say(bus, "ipc: ended (")
+    bus_module.sayNumber(bus, bus.*.delivered)
+    bus_module.say(bus, " messages delivered, ")
+    bus_module.sayNumber(bus, bus.*.denied)
+    bus_module.say(bus, " refused)\n")
+    return status
+}
+
+pub fn main(arguments: [][*]const u8) -> !void {
+    const installed = crash.install()
+    const status = try run(arguments)
+    if status != 0 { const exited = std.linux.syscall1(SYS_exit_group, status) }
+}

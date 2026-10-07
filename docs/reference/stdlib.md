@@ -178,6 +178,19 @@ complete message (the setup's answer, a reply, an error or an event) at a
 time, and requests with a reply return their sequence number. The
 compositor's X window manager (see [Wayland](wayland.md)) uses it.
 
+`std.dbus` (`std/src/dbus.mlx`) is the D-Bus wire format without libc or
+libdbus: marshalling (`Reader`, `Writer`, either byte order, D-Bus
+alignment), message headers (`parseHeader`, `writeMessage`, `newHeader`),
+a stream connection with Unix descriptor passing (std.wayland's
+transport), and a client: `connectSession` (or `connectClient` with a
+socket path) authenticates with EXTERNAL, negotiates descriptor passing
+and says Hello; `send`, `call` and `reply` write messages, `next` waits
+for the next one (its body at `bodyOf`, its descriptors at
+`descriptorOf`) and `waitReply` for the reply to a call. MLXIPC's bus
+(`projects/desktop/ipc`, mlx-ipcd) and its tool mlx-ipc use it;
+`tools/check_ipc.sh` runs both against dbus-send, gdbus, busctl and
+dbus-monitor.
+
 `std.png` (`std/src/png.mlx`) decodes PNG images into premultiplied ARGB
 words (`0xAARRGGBB`, the `wl_shm` and compositor convention), for icons
 and the like:

@@ -1,0 +1,480 @@
+// MLXIPC's permissions: which app each connection is, and what each app
+// may do on the bus. Unlike dbus-daemon's they are per app, not per user
+// (as in hyprtavern): every program of the session runs as the same user.
+//
+// An app is its Flatpak id (from /proc/PID/root/.flatpak-info; it is then
+// sandboxed) or its program's file name (/proc/PID/exe). What an app may
+// do, for a NAME:
+//
+//   own    own NAME (RequestName)
+//   talk   call NAME's methods, send it signals
+//   see    hear NAME's signals, find it (ListNames, GetNameOwner)
+//
+// A rule names the connection it talks to by any of the names that
+// connection owns (as dbus-daemon's send_destination does). NAME is a
+// name, "prefix.*" (prefix and the names under it), "*" (all) or "self"
+// (the app's own id and the names under it, and other connections of the
+// same app).
+//
+// The rules come from ~/.config/mlx/ipc.conf (--policy FILE), read again
+// when it changes:
+//
+//   # MLXIPC permissions
+//   group media obs com.obsproject.Studio
+//   allow @media talk,see org.mlx.Audio
+//   deny firefox talk org.freedesktop.secrets
+//   strict
+//
+// Subjects: an app, @GROUP, @sandboxed, @unsandboxed or @all. Before the
+// file's rules come the defaults: an unsandboxed app may do anything (as
+// on any D-Bus session bus; "strict" takes that away), a sandboxed one may
+// own "self" and talk to and see "self", the portals
+// (org.freedesktop.portal.*) and org.freedesktop.Notifications. The last
+// rule that applies wins. The bus itself is open to everyone, and replies
+// to calls go back whatever the rules say.
+const std = @import("std")
+const dbus = @import("std.dbus")
+const state = @import("./state.mlx")
+const bus_module = @import("./bus.mlx")
+
+pub const OWN: u8 = 1
+pub const TALK: u8 = 2
+pub const SEE: u8 = 4
+
+pub const MAX_RULES: usize = 256
+pub const MAX_GROUPS: usize = 32
+pub const APP: usize = 128
+
+
+
+
+
+fn same(first: []const u8, second: []const u8) -> bool { return bus_module.same(first, second) }
+fn startsWith(text: []const u8, prefix: []const u8) -> bool { return bus_module.startsWith(text, prefix) }
+fn textOf(bytes: [*]const u8, length: usize) -> []const u8 { return bus_module.textOf(bytes, length) }
+fn copyInto(target: [*]u8, capacity: usize, text: []const u8) -> usize { return bus_module.copyInto(target, capacity, text) }
+
+// The bus's policy.
+pub fn of(bus: *state.Bus) -> *state.Policy {
+    unsafe { return @ptrCast(*state.Policy, &bus.*.policy) }
+}
+
+pub fn identityOf(client: *state.Client) -> *state.Identity {
+    unsafe { return @ptrCast(*state.Identity, &client.*.identity) }
+}
+
+pub fn appOf(identity: *const state.Identity) -> []const u8 {
+    var bytes: [*]const u8 = undefined
+    unsafe { bytes = @ptrCast([*]const u8, &identity.*.app) }
+    return textOf(bytes, identity.*.appLength)
+}
+
+// ---------------------------------------------------------------------------
+// Who a connection is
+
+// Reads the file at `path` (NUL-terminated) into `buffer`: its length, 0
+// when it is not there or empty.
+pub fn readFile(path: [*]const u8, buffer: [*]u8, capacity: usize) -> usize {
+    const file = std.fs.open(path, 524288, 0)
+    if file.descriptor < 0 { return 0 }
+    var length: usize = 0
+    while length < capacity {
+        const got = std.fs.read(file, bus_module.advance(buffer, length), capacity - length)
+        if got <= 0 { break }
+        length += @intCast(usize, got)
+    }
+    const closed = std.fs.close(file)
+    return length
+}
+
+// "/proc/PID/" followed by `rest`, NUL-terminated, into `path`.
+fn procPath(path: [*]u8, pid: u32, rest: []const u8) -> void {
+    const prefix = "/proc/"
+    var length = copyInto(path, 6, prefix)
+    var digits: [12]u8 = undefined
+    var count: usize = 0
+    var value = pid
+    while true {
+        digits[count] = @intCast(u8, 48 + value % 10)
+        count += 1
+        value = value / 10
+        if value == 0 { break }
+    }
+    while count > 0 {
+        count -= 1
+        path[length] = digits[count]
+        length += 1
+    }
+    path[length] = 47
+    length += 1
+    length += copyInto(bus_module.advance(path, length), 200, rest)
+    path[length] = 0
+}
+
+fn setApp(identity: *state.Identity, text: []const u8) -> void {
+    var bytes: [*]u8 = undefined
+    unsafe { bytes = @ptrCast([*]u8, &identity.*.app) }
+    identity.*.appLength = copyInto(bytes, APP, text)
+}
+
+// Finds which app process `pid` is.
+pub fn identify(identity: *state.Identity, pid: u32) -> void {
+    identity.*.pid = pid
+    identity.*.sandboxed = false
+    setApp(identity, "unknown")
+    if pid == 0 { return }
+    var path: [256]u8 = undefined
+    var path_bytes: [*]u8 = undefined
+    unsafe { path_bytes = @ptrCast([*]u8, &path) }
+    // A Flatpak app: [Application] name=ID.
+    var info: [4096]u8 = undefined
+    var info_bytes: [*]u8 = undefined
+    unsafe { info_bytes = @ptrCast([*]u8, &info) }
+    procPath(path_bytes, pid, "root/.flatpak-info")
+    const length = readFile(path_bytes, info_bytes, 4096)
+    if length > 0 {
+        identity.*.sandboxed = true
+        var line: usize = 0
+        while line < length {
+            var end = line
+            while end < length && info[end] != 10 { end += 1 }
+            const text = info_bytes[line..end]
+            if startsWith(text, "name=") {
+                setApp(identity, text[5..text.length])
+                return
+            }
+            line = end + 1
+        }
+        // Sandboxed, and no id: an app of its own nobody can name.
+        setApp(identity, "flatpak")
+        return
+    }
+    var target: [512]u8 = undefined
+    var target_bytes: [*]u8 = undefined
+    unsafe { target_bytes = @ptrCast([*]u8, &target) }
+    procPath(path_bytes, pid, "exe")
+    const linked = std.fs.readLink(path_bytes, target_bytes, 512)
+    if linked <= 0 { return }
+    var end = @intCast(usize, linked)
+    // A replaced program: "/usr/bin/obs (deleted)".
+    const whole = textOf(target_bytes, end)
+    if end > 10 && same(whole[end - 10..end], " (deleted)") { end -= 10 }
+    var start = end
+    while start > 0 && target[start - 1] != 47 { start -= 1 }
+    if start < end { setApp(identity, target_bytes[start..end]) }
+}
+
+// ---------------------------------------------------------------------------
+// The rules file
+
+fn isSpace(byte: u8) -> bool { return byte == 32 || byte == 9 || byte == 13 }
+
+// The next word of `line` from `at` (moved past it).
+fn word(line: []const u8, at: *usize) -> []const u8 {
+    while at.* < line.length && isSpace(line[at.*]) { at.* += 1 }
+    const start = at.*
+    while at.* < line.length && !isSpace(line[at.*]) { at.* += 1 }
+    return line[start..at.*]
+}
+
+// "own,talk,see" or "all": the actions, 0 when one is not known.
+fn actionsOf(text: []const u8) -> u8 {
+    if same(text, "all") { return OWN | TALK | SEE }
+    var actions: u8 = 0
+    var start: usize = 0
+    while start <= text.length {
+        var end = start
+        while end < text.length && text[end] != 44 { end += 1 }
+        const action = text[start..end]
+        if same(action, "own") {
+            actions = actions | OWN
+        } else if same(action, "talk") {
+            actions = actions | TALK
+        } else if same(action, "see") {
+            actions = actions | SEE
+        } else {
+            return 0
+        }
+        start = end + 1
+    }
+    return actions
+}
+
+fn ruleAt(policy: *state.Policy, index: usize) -> *state.Rule {
+    unsafe { return @ptrCast(*state.Rule, &policy.*.rules[index]) }
+}
+fn groupAt(policy: *state.Policy, index: usize) -> *state.Group {
+    unsafe { return @ptrCast(*state.Group, &policy.*.groups[index]) }
+}
+
+fn addRule(policy: *state.Policy, allow: bool, actions: u8, subject: []const u8, pattern: []const u8) -> void {
+    if policy.*.ruleCount >= MAX_RULES { return }
+    const rule = ruleAt(policy, policy.*.ruleCount)
+    rule.*.allow = allow
+    rule.*.actions = actions
+    var bytes: [*]u8 = undefined
+    unsafe { bytes = @ptrCast([*]u8, &rule.*.subject) }
+    rule.*.subjectLength = copyInto(bytes, 128, subject)
+    unsafe { bytes = @ptrCast([*]u8, &rule.*.pattern) }
+    rule.*.patternLength = copyInto(bytes, 256, pattern)
+    policy.*.ruleCount += 1
+}
+
+fn addGroup(policy: *state.Policy, line: []const u8, at: *usize) -> void {
+    const name = word(line, at)
+    if name.length == 0 || policy.*.groupCount >= MAX_GROUPS { return }
+    const group = groupAt(policy, policy.*.groupCount)
+    var bytes: [*]u8 = undefined
+    unsafe { bytes = @ptrCast([*]u8, &group.*.name) }
+    group.*.nameLength = copyInto(bytes, 64, name)
+    unsafe { bytes = @ptrCast([*]u8, &group.*.members) }
+    group.*.membersLength = 0
+    while true {
+        const member = word(line, at)
+        if member.length == 0 || group.*.membersLength + member.length + 1 > 1024 { break }
+        group.*.membersLength += copyInto(bus_module.advance(bytes, group.*.membersLength), member.length, member)
+        bytes[group.*.membersLength] = 32
+        group.*.membersLength += 1
+    }
+    policy.*.groupCount += 1
+}
+
+fn parse(policy: *state.Policy, text: []const u8, bus: *state.Bus) -> void {
+    var start: usize = 0
+    var number: usize = 1
+    while start < text.length {
+        var end = start
+        while end < text.length && text[end] != 10 { end += 1 }
+        const line = text[start..end]
+        var at: usize = 0
+        const keyword = word(line, &at)
+        if keyword.length == 0 || keyword[0] == 35 {
+            // Empty, or a comment.
+        } else if same(keyword, "strict") {
+            policy.*.strict = true
+        } else if same(keyword, "group") {
+            addGroup(policy, line, &at)
+        } else if same(keyword, "allow") || same(keyword, "deny") {
+            const subject = word(line, &at)
+            const actions = actionsOf(word(line, &at))
+            const pattern = word(line, &at)
+            if subject.length == 0 || actions == 0 || pattern.length == 0 {
+                complain(bus, number)
+            } else {
+                addRule(policy, same(keyword, "allow"), actions, subject, pattern)
+            }
+        } else {
+            complain(bus, number)
+        }
+        start = end + 1
+        number += 1
+    }
+}
+
+fn complain(bus: *state.Bus, number: usize) -> void {
+    const said = std.io.writeAll(std.io.stderr(), "mlx-ipcd: the policy's line ")
+    const shown = std.io.writeUnsigned(std.io.stderr(), number)
+    const rest = std.io.writeAll(std.io.stderr(), " is not understood (allow|deny SUBJECT own,talk,see NAME; group NAME APP...; strict)\n")
+}
+
+fn pathOf(policy: *state.Policy) -> [*]const u8 {
+    unsafe { return @ptrCast([*]const u8, &policy.*.path) }
+}
+
+// Reads the rules again (none when the file is not there).
+fn read(policy: *state.Policy, bus: *state.Bus) -> void {
+    policy.*.ruleCount = 0
+    policy.*.groupCount = 0
+    policy.*.strict = false
+    policy.*.modifiedSeconds = 0
+    policy.*.modifiedNanoseconds = 0
+    if policy.*.pathLength == 0 { return }
+    var status: std.fs.Stat = undefined
+    if std.fs.status(pathOf(policy), &status) != 0 { return }
+    policy.*.modifiedSeconds = status.modifiedSeconds
+    policy.*.modifiedNanoseconds = status.modifiedNanoseconds
+    const memory = bus.*.allocator.alloc(65536, 16)
+    if memory == null { return }
+    const length = readFile(pathOf(policy), memory.?, 65536)
+    parse(policy, textOf(memory.?, length), bus)
+    bus.*.allocator.free(memory.?, 65536, 16)
+    bus_module.say(bus, "ipc: policy read (")
+    bus_module.sayNumber(bus, policy.*.ruleCount)
+    bus_module.say(bus, " rules)\n")
+}
+
+// Takes the rules from the file at `path` ("": none).
+pub fn load(policy: *state.Policy, bus: *state.Bus, path: []const u8) -> void {
+    var bytes: [*]u8 = undefined
+    unsafe { bytes = @ptrCast([*]u8, &policy.*.path) }
+    policy.*.pathLength = copyInto(bytes, 511, path)
+    bytes[policy.*.pathLength] = 0
+    read(policy, bus)
+}
+
+// Reads the file again when it changed (or came or went).
+pub fn refresh(policy: *state.Policy, bus: *state.Bus) -> void {
+    if policy.*.pathLength == 0 { return }
+    var status: std.fs.Stat = undefined
+    var seconds: isize = 0
+    var nanoseconds: isize = 0
+    if std.fs.status(pathOf(policy), &status) == 0 {
+        seconds = status.modifiedSeconds
+        nanoseconds = status.modifiedNanoseconds
+    }
+    if seconds != policy.*.modifiedSeconds || nanoseconds != policy.*.modifiedNanoseconds { read(policy, bus) }
+}
+
+pub fn reload(policy: *state.Policy, bus: *state.Bus) -> void { read(policy, bus) }
+
+// ---------------------------------------------------------------------------
+// Deciding
+
+// Whether `name` is `prefix` or under it ("prefix.").
+fn under(name: []const u8, prefix: []const u8) -> bool {
+    if same(name, prefix) { return true }
+    return startsWith(name, prefix) && name.length > prefix.length && name[prefix.length] == 46
+}
+
+fn isSelf(identity: *const state.Identity, name: []const u8) -> bool {
+    if identity.*.appLength == 0 { return false }
+    return under(name, appOf(identity))
+}
+
+fn subjectApplies(policy: *state.Policy, rule: *const state.Rule, identity: *const state.Identity) -> bool {
+    var bytes: [*]const u8 = undefined
+    unsafe { bytes = @ptrCast([*]const u8, &rule.*.subject) }
+    const subject = textOf(bytes, rule.*.subjectLength)
+    if same(subject, "@all") || same(subject, "*") { return true }
+    if same(subject, "@sandboxed") { return identity.*.sandboxed }
+    if same(subject, "@unsandboxed") { return !identity.*.sandboxed }
+    const app = appOf(identity)
+    if subject.length > 0 && subject[0] == 64 {
+        const wanted = subject[1..subject.length]
+        var index: usize = 0
+        while index < policy.*.groupCount {
+            const group = groupAt(policy, index)
+            var name_bytes: [*]const u8 = undefined
+            unsafe { name_bytes = @ptrCast([*]const u8, &group.*.name) }
+            if same(textOf(name_bytes, group.*.nameLength), wanted) {
+                var members: [*]const u8 = undefined
+                unsafe { members = @ptrCast([*]const u8, &group.*.members) }
+                var start: usize = 0
+                while start < group.*.membersLength {
+                    var end = start
+                    while end < group.*.membersLength && members[end] != 32 { end += 1 }
+                    if same(members[start..end], app) { return true }
+                    start = end + 1
+                }
+            }
+            index += 1
+        }
+        return false
+    }
+    return same(subject, app)
+}
+
+fn patternMatches(pattern: []const u8, name: []const u8, identity: *const state.Identity) -> bool {
+    if same(pattern, "*") { return true }
+    if same(pattern, "self") { return isSelf(identity, name) }
+    if pattern.length >= 2 && pattern[pattern.length - 1] == 42 && pattern[pattern.length - 2] == 46 { return under(name, pattern[0..pattern.length - 2]) }
+    return same(pattern, name)
+}
+
+// What the defaults say about `action` on `name`.
+fn byDefault(policy: *state.Policy, identity: *const state.Identity, action: u8, name: []const u8) -> bool {
+    if !identity.*.sandboxed { return !policy.*.strict }
+    if isSelf(identity, name) { return true }
+    if action == OWN { return false }
+    return under(name, "org.freedesktop.portal") || same(name, "org.freedesktop.Notifications")
+}
+
+// Whether the app `identity` may do `action` on `name`.
+pub fn decide(policy: *state.Policy, identity: *const state.Identity, action: u8, name: []const u8) -> bool {
+    if same(name, bus_module.BUS_NAME) && action != OWN { return true }
+    var allowed = byDefault(policy, identity, action, name)
+    var index: usize = 0
+    while index < policy.*.ruleCount {
+        const rule = ruleAt(policy, index)
+        if rule.*.actions & action != 0 && subjectApplies(policy, rule, identity) {
+            var bytes: [*]const u8 = undefined
+            unsafe { bytes = @ptrCast([*]const u8, &rule.*.pattern) }
+            if patternMatches(textOf(bytes, rule.*.patternLength), name, identity) { allowed = rule.*.allow }
+        }
+        index += 1
+    }
+    return allowed
+}
+
+// Whether `client` may do `action` on the connection `target`: on any of
+// the names it owns, by the last rule that applies to one of them (with
+// the defaults first). A connection of the same app is "self".
+pub fn decideFor(bus: *state.Bus, client: *state.Client, action: u8, target: *state.Client) -> bool {
+    const policy = of(bus)
+    const identity = identityOf(client)
+    if target == client { return true }
+    const same_app = same(appOf(identity), appOf(identityOf(target))) && identity.*.appLength > 0 && identity.*.sandboxed == target.*.identity.sandboxed
+    var allowed = !identity.*.sandboxed && !policy.*.strict
+    if same_app { allowed = true }
+    // The defaults, on each name.
+    const address = @intFromPtr(target)
+    var index: usize = 0
+    while index < bus.*.nameCount {
+        const name = bus_module.nameAt(bus.*.names[index])
+        if name.*.owner == address && byDefault(policy, identity, action, bus_module.nameText(name)) { allowed = true }
+        index += 1
+    }
+    // The rules, in order: one applies when it names any of the names.
+    var rule_index: usize = 0
+    while rule_index < policy.*.ruleCount {
+        const rule = ruleAt(policy, rule_index)
+        if rule.*.actions & action != 0 && subjectApplies(policy, rule, identity) {
+            var bytes: [*]const u8 = undefined
+            unsafe { bytes = @ptrCast([*]const u8, &rule.*.pattern) }
+            const pattern = textOf(bytes, rule.*.patternLength)
+            var applies = same(pattern, "*") || (same(pattern, "self") && same_app)
+            index = 0
+            while index < bus.*.nameCount && !applies {
+                const name = bus_module.nameAt(bus.*.names[index])
+                if name.*.owner == address && patternMatches(pattern, bus_module.nameText(name), identity) { applies = true }
+                index += 1
+            }
+            if applies { allowed = rule.*.allow }
+        }
+        rule_index += 1
+    }
+    return allowed
+}
+
+// ---------------------------------------------------------------------------
+// The bus's questions
+
+pub fn mayOwn(bus: *state.Bus, client: *state.Client, name: []const u8) -> bool {
+    return decide(of(bus), identityOf(client), OWN, name)
+}
+
+// Whether `client` may send `header` to the connection it is addressed to
+// (`target`).
+pub fn mayTalk(bus: *state.Bus, client: *state.Client, target: *state.Client) -> bool {
+    return decideFor(bus, client, TALK, target)
+}
+
+// Whether `client` may hear what the connection named `sender` (a unique
+// name, or the bus's) sends.
+pub fn maySee(bus: *state.Bus, client: *state.Client, sender: []const u8) -> bool {
+    if same(sender, bus_module.BUS_NAME) { return true }
+    const address = bus_module.findUnique(bus, sender)
+    if address == 0 { return true }
+    return decideFor(bus, client, SEE, bus_module.clientAt(address))
+}
+
+// Whether `client` may learn of the name `name` (well-known or unique).
+pub fn maySeeName(bus: *state.Bus, client: *state.Client, name: []const u8) -> bool {
+    if name.length > 0 && name[0] == 58 {
+        if same(name, bus_module.uniqueOf(client)) { return true }
+        const address = bus_module.findUnique(bus, name)
+        if address == 0 { return !client.*.identity.sandboxed && !bus.*.policy.strict }
+        return decideFor(bus, client, SEE, bus_module.clientAt(address))
+    }
+    return decide(of(bus), identityOf(client), SEE, name)
+}

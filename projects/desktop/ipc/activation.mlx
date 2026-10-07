@@ -1,0 +1,722 @@
+// Starting services by name (D-Bus activation). A call to a name nobody
+// owns, or StartServiceByName, finds the .service file that provides it
+//
+//   [D-BUS Service]
+//   Name=org.freedesktop.Notifications
+//   Exec=/usr/bin/mako --config /etc/mako
+//
+// (in --services DIR, $XDG_RUNTIME_DIR/dbus-1/services,
+// $XDG_DATA_HOME/dbus-1/services and each of $XDG_DATA_DIRS's), runs its
+// Exec line with the bus's address in the environment (and what
+// UpdateActivationEnvironment added), and holds the calls until the name
+// has an owner (they are then routed as if just sent), the program ended
+// (Spawn.ChildExited) or TIMEOUT went by (Spawn.Timeout).
+const std = @import("std")
+const dbus = @import("std.dbus")
+const state = @import("./state.mlx")
+const bus_module = @import("./bus.mlx")
+const driver = @import("./driver.mlx")
+const policy = @import("./policy.mlx")
+
+pub const MAX_STARTING: usize = 16
+pub const MAX_WAITING: usize = 16
+pub const MAX_STARTERS: usize = 8
+// Milliseconds.
+pub const TIMEOUT: usize = 25000
+
+const SYS_open: usize = 2
+const SYS_close: usize = 3
+const SYS_fork: usize = 57
+const SYS_execve: usize = 59
+const SYS_exit_group: usize = 231
+const SYS_rt_sigprocmask: usize = 14
+const O_DIRECTORY: usize = 65536
+const O_CLOEXEC: usize = 524288
+
+fn same(first: []const u8, second: []const u8) -> bool { return bus_module.same(first, second) }
+fn startsWith(text: []const u8, prefix: []const u8) -> bool { return bus_module.startsWith(text, prefix) }
+fn copyInto(target: [*]u8, capacity: usize, text: []const u8) -> usize { return bus_module.copyInto(target, capacity, text) }
+fn advance(bytes: [*]u8, count: usize) -> [*]u8 { return bus_module.advance(bytes, count) }
+
+
+
+
+pub fn init(activation: *state.Activation, directory: []const u8) -> void {
+    var index: usize = 0
+    while index < MAX_STARTING {
+        activation.*.starting[index].used = false
+        index += 1
+    }
+    activation.*.environmentLength = 0
+    var bytes: [*]u8 = undefined
+    unsafe { bytes = @ptrCast([*]u8, &activation.*.directory) }
+    activation.*.directoryLength = copyInto(bytes, 511, directory)
+}
+
+pub fn of(bus: *state.Bus) -> *state.Activation {
+    unsafe { return @ptrCast(*state.Activation, &bus.*.activation) }
+}
+
+pub fn milliseconds() -> usize {
+    var time: [2]usize = [2]usize{ 0, 0 }
+    const result = std.linux.syscall2(228, 1, @intFromPtr(&time))
+    return time[0] * 1000 + time[1] / 1000000
+}
+
+fn startingAt(bus: *state.Bus, index: usize) -> *state.Starting {
+    unsafe { return @ptrCast(*state.Starting, &bus.*.activation.starting[index]) }
+}
+
+fn nameOf(starting: *const state.Starting) -> []const u8 {
+    var bytes: [*]const u8 = undefined
+    unsafe { bytes = @ptrCast([*]const u8, &starting.*.name) }
+    return bytes[0..starting.*.nameLength]
+}
+
+fn waitingAt(address: usize) -> *state.Waiting {
+    unsafe { return @ptrFromInt(*state.Waiting, address) }
+}
+
+fn environmentValue(bus: *state.Bus, name: []const u8) -> []const u8 {
+    const value = std.process.environmentFrom(bus.*.environment, name)
+    if value == null { return name[0..0] }
+    return std.string.asSlice(value.?)
+}
+
+// ---------------------------------------------------------------------------
+// Service files
+
+// The directories to search, each ended by a NUL, into `list`; their
+// total length.
+fn directories(bus: *state.Bus, list: [*]u8, capacity: usize) -> usize {
+    var length: usize = 0
+    if bus.*.activation.directoryLength > 0 {
+        var own: [*]const u8 = undefined
+        unsafe { own = @ptrCast([*]const u8, &bus.*.activation.directory) }
+        length = add(list, capacity, length, own[0..bus.*.activation.directoryLength], "")
+    }
+    const runtime = environmentValue(bus, "XDG_RUNTIME_DIR")
+    if runtime.length > 0 { length = add(list, capacity, length, runtime, "/dbus-1/services") }
+    const data_home = environmentValue(bus, "XDG_DATA_HOME")
+    if data_home.length > 0 {
+        length = add(list, capacity, length, data_home, "/dbus-1/services")
+    } else {
+        const home = environmentValue(bus, "HOME")
+        if home.length > 0 { length = add(list, capacity, length, home, "/.local/share/dbus-1/services") }
+    }
+    var data_dirs = environmentValue(bus, "XDG_DATA_DIRS")
+    if data_dirs.length == 0 { data_dirs = "/usr/local/share:/usr/share" }
+    var start: usize = 0
+    while start < data_dirs.length {
+        var end = start
+        while end < data_dirs.length && data_dirs[end] != 58 { end += 1 }
+        if end > start { length = add(list, capacity, length, data_dirs[start..end], "/dbus-1/services") }
+        start = end + 1
+    }
+    return length
+}
+
+fn add(list: [*]u8, capacity: usize, length: usize, first: []const u8, second: []const u8) -> usize {
+    if length + first.length + second.length + 1 > capacity { return length }
+    var at = length + copyInto(advance(list, length), first.length, first)
+    at += copyInto(advance(list, at), second.length, second)
+    list[at] = 0
+    return at + 1
+}
+
+// The value of `key` ("Name=", "Exec=") in a service file's [D-BUS
+// Service] section ("" when it has none).
+fn serviceField(text: []const u8, key: []const u8) -> []const u8 {
+    var inside = false
+    var start: usize = 0
+    while start < text.length {
+        var end = start
+        while end < text.length && text[end] != 10 { end += 1 }
+        var line_end = end
+        if line_end > start && text[line_end - 1] == 13 { line_end -= 1 }
+        const line = text[start..line_end]
+        if line.length > 0 && line[0] == 91 {
+            inside = same(line, "[D-BUS Service]")
+        } else if inside && startsWith(line, key) {
+            return line[key.length..line.length]
+        }
+        start = end + 1
+    }
+    return text[0..0]
+}
+
+fn endsWith(text: []const u8, suffix: []const u8) -> bool {
+    return text.length >= suffix.length && same(text[text.length - suffix.length..text.length], suffix)
+}
+
+// The Exec line of the service that provides `name` (into `exec`): its
+// length, 0 when no file provides it.
+fn findService(bus: *state.Bus, name: []const u8, exec: [*]u8, capacity: usize) -> usize {
+    var list: [4096]u8 = undefined
+    var list_bytes: [*]u8 = undefined
+    unsafe { list_bytes = @ptrCast([*]u8, &list) }
+    const total = directories(bus, list_bytes, 4096)
+    var text: [8192]u8 = undefined
+    var text_bytes: [*]u8 = undefined
+    unsafe { text_bytes = @ptrCast([*]u8, &text) }
+    var path: [1024]u8 = undefined
+    var path_bytes: [*]u8 = undefined
+    unsafe { path_bytes = @ptrCast([*]u8, &path) }
+    var start: usize = 0
+    while start < total {
+        var end = start
+        while list[end] != 0 { end += 1 }
+        const directory = list_bytes[start..end]
+        // NAME.service first (the usual file), then every file.
+        var length = copyInto(path_bytes, 600, directory)
+        path[length] = 47
+        length += 1
+        length += copyInto(advance(path_bytes, length), 300, name)
+        length += copyInto(advance(path_bytes, length), 9, ".service")
+        path[length] = 0
+        var read = policy.readFile(path_bytes, text_bytes, 8192)
+        if same(serviceField(text_bytes[0..read], "Name="), name) {
+            const found = serviceField(text_bytes[0..read], "Exec=")
+            if found.length > 0 { return copyInto(exec, capacity, found) }
+        }
+        path[end - start] = 0
+        const handle = std.linux.syscall3(SYS_open, @intFromPtr(path_bytes), O_DIRECTORY | O_CLOEXEC, 0)
+        if handle >= 0 {
+            var buffer: [8192]u8 = undefined
+            var bytes: [*]u8 = undefined
+            unsafe { bytes = @ptrCast([*]u8, &buffer) }
+            var reader = std.fs.entries(std.fs.File.{ .descriptor = handle }, bytes, 8192)
+            var entry: std.fs.Entry = undefined
+            var result: usize = 0
+            while result == 0 && std.fs.nextEntry(&reader, &entry) {
+                const file = std.string.asSlice(entry.name)
+                if endsWith(file, ".service") {
+                    var file_length = end - start
+                    path[file_length] = 47
+                    file_length += 1
+                    file_length += copyInto(advance(path_bytes, file_length), 300, file)
+                    path[file_length] = 0
+                    read = policy.readFile(path_bytes, text_bytes, 8192)
+                    const found_exec = serviceField(text_bytes[0..read], "Exec=")
+                    if same(serviceField(text_bytes[0..read], "Name="), name) && found_exec.length > 0 { result = copyInto(exec, capacity, found_exec) }
+                }
+            }
+            const closed = std.linux.syscall1(SYS_close, @bitCast(usize, handle))
+            if result > 0 { return result }
+        }
+        start = end + 1
+    }
+    return 0
+}
+
+// The names the service files provide (that `client` may know of), as
+// strings of an array being written.
+pub fn putNames(bus: *state.Bus, client: *state.Client, writing: *dbus.Writer) -> void {
+    var list: [4096]u8 = undefined
+    var list_bytes: [*]u8 = undefined
+    unsafe { list_bytes = @ptrCast([*]u8, &list) }
+    const total = directories(bus, list_bytes, 4096)
+    var text: [8192]u8 = undefined
+    var text_bytes: [*]u8 = undefined
+    unsafe { text_bytes = @ptrCast([*]u8, &text) }
+    var path: [1024]u8 = undefined
+    var path_bytes: [*]u8 = undefined
+    unsafe { path_bytes = @ptrCast([*]u8, &path) }
+    // The names written so far, each ended by a newline (none twice).
+    var seen: [16384]u8 = undefined
+    var seen_bytes: [*]u8 = undefined
+    unsafe { seen_bytes = @ptrCast([*]u8, &seen) }
+    var seen_length: usize = 0
+    var start: usize = 0
+    while start < total {
+        var end = start
+        while list[end] != 0 { end += 1 }
+        const handle = std.linux.syscall3(SYS_open, @intFromPtr(advance(list_bytes, start)), O_DIRECTORY | O_CLOEXEC, 0)
+        if handle >= 0 {
+            var buffer: [8192]u8 = undefined
+            var bytes: [*]u8 = undefined
+            unsafe { bytes = @ptrCast([*]u8, &buffer) }
+            var reader = std.fs.entries(std.fs.File.{ .descriptor = handle }, bytes, 8192)
+            var entry: std.fs.Entry = undefined
+            while std.fs.nextEntry(&reader, &entry) {
+                const file = std.string.asSlice(entry.name)
+                if endsWith(file, ".service") {
+                    var length = copyInto(path_bytes, 600, list_bytes[start..end])
+                    path[length] = 47
+                    length += 1
+                    length += copyInto(advance(path_bytes, length), 300, file)
+                    path[length] = 0
+                    const read = policy.readFile(path_bytes, text_bytes, 8192)
+                    const name = serviceField(text_bytes[0..read], "Name=")
+                    if name.length > 0 && !listed(seen_bytes[0..seen_length], name) && policy.maySeeName(bus, client, name) {
+                        dbus.putString(writing, name)
+                        if seen_length + name.length + 1 <= 16384 {
+                            seen_length += copyInto(advance(seen_bytes, seen_length), name.length, name)
+                            seen[seen_length] = 10
+                            seen_length += 1
+                        }
+                    }
+                }
+            }
+            const closed = std.linux.syscall1(SYS_close, @bitCast(usize, handle))
+        }
+        start = end + 1
+    }
+}
+
+fn listed(seen: []const u8, name: []const u8) -> bool {
+    var start: usize = 0
+    while start < seen.length {
+        var end = start
+        while end < seen.length && seen[end] != 10 { end += 1 }
+        if same(seen[start..end], name) { return true }
+        start = end + 1
+    }
+    return false
+}
+
+// ---------------------------------------------------------------------------
+// Running a service
+
+// Splits an Exec line as a shell would its words (quotes, backslashes;
+// nothing expanded) into `buffer`, the words' starts into `words`: their
+// count.
+fn splitWords(line: []const u8, buffer: [*]u8, capacity: usize, words: [*]usize, most: usize) -> usize {
+    var count: usize = 0
+    var length: usize = 0
+    var at: usize = 0
+    while at < line.length && count + 1 < most {
+        while at < line.length && (line[at] == 32 || line[at] == 9) { at += 1 }
+        if at >= line.length { break }
+        words[count] = length
+        count += 1
+        var quote: u8 = 0
+        while at < line.length && length + 1 < capacity {
+            const byte = line[at]
+            if quote == 0 && (byte == 32 || byte == 9) { break }
+            if quote == 0 && (byte == 34 || byte == 39) {
+                quote = byte
+            } else if quote != 0 && byte == quote {
+                quote = 0
+            } else if byte == 92 && quote != 39 && at + 1 < line.length {
+                at += 1
+                buffer[length] = line[at]
+                length += 1
+            } else {
+                buffer[length] = byte
+                length += 1
+            }
+            at += 1
+        }
+        buffer[length] = 0
+        length += 1
+    }
+    return count
+}
+
+// Whether the environment entry `entry` ("KEY=VALUE") sets `key`.
+pub fn sets(entry: [*]const u8, key: []const u8) -> bool {
+    var index: usize = 0
+    while index < key.length {
+        if entry[index] != key[index] { return false }
+        index += 1
+    }
+    return entry[key.length] == 61
+}
+
+fn keyOf(entry: [*]const u8) -> []const u8 {
+    var length: usize = 0
+    while entry[length] != 0 && entry[length] != 61 { length += 1 }
+    return entry[0..length]
+}
+
+// Whether `entry` sets a key the bus sets itself, or one
+// UpdateActivationEnvironment set.
+fn replaced(bus: *state.Bus, entry: [*]const u8) -> bool {
+    if sets(entry, "DBUS_SESSION_BUS_ADDRESS") || sets(entry, "DBUS_STARTER_ADDRESS") || sets(entry, "DBUS_STARTER_BUS_TYPE") { return true }
+    var own: [*]u8 = undefined
+    unsafe { own = @ptrCast([*]u8, &bus.*.activation.environment) }
+    var start: usize = 0
+    while start < bus.*.activation.environmentLength {
+        const current = advance(own, start)
+        if sets(entry, keyOf(current)) { return true }
+        while own[start] != 0 { start += 1 }
+        start += 1
+    }
+    return false
+}
+
+// Runs `exec` (an Exec line): the child's process id, or a negative
+// errno.
+fn spawn(bus: *state.Bus, exec: []const u8) -> isize {
+    var words: [64]usize = undefined
+    var word_starts: [*]usize = undefined
+    unsafe { word_starts = @ptrCast([*]usize, &words) }
+    var text: [4096]u8 = undefined
+    var text_bytes: [*]u8 = undefined
+    unsafe { text_bytes = @ptrCast([*]u8, &text) }
+    const count = splitWords(exec, text_bytes, 4096, word_starts, 64)
+    if count == 0 { return -2 }
+    var arguments: [64][*]const u8 = undefined
+    var index: usize = 0
+    while index < count {
+        arguments[index] = advance(text_bytes, words[index])
+        index += 1
+    }
+    unsafe { arguments[count] = @ptrFromInt([*]const u8, 0) }
+    // The environment: the bus's, what was added, the bus's address.
+    var environment: [512][*]const u8 = undefined
+    var entries: usize = 0
+    index = 0
+    while @intFromPtr(bus.*.environment[index]) != 0 && entries < 480 {
+        if !replaced(bus, bus.*.environment[index]) {
+            environment[entries] = bus.*.environment[index]
+            entries += 1
+        }
+        index += 1
+    }
+    var own: [*]u8 = undefined
+    unsafe { own = @ptrCast([*]u8, &bus.*.activation.environment) }
+    var start: usize = 0
+    while start < bus.*.activation.environmentLength && entries < 500 {
+        environment[entries] = advance(own, start)
+        entries += 1
+        while own[start] != 0 { start += 1 }
+        start += 1
+    }
+    var extra: [1024]u8 = undefined
+    var extra_bytes: [*]u8 = undefined
+    unsafe { extra_bytes = @ptrCast([*]u8, &extra) }
+    var address: [*]const u8 = undefined
+    unsafe { address = @ptrCast([*]const u8, &bus.*.address) }
+    const address_text = address[0..bus.*.addressLength]
+    var used: usize = 0
+    environment[entries] = advance(extra_bytes, used)
+    entries += 1
+    used = entry(extra_bytes, used, "DBUS_SESSION_BUS_ADDRESS=", address_text)
+    environment[entries] = advance(extra_bytes, used)
+    entries += 1
+    used = entry(extra_bytes, used, "DBUS_STARTER_ADDRESS=", address_text)
+    environment[entries] = advance(extra_bytes, used)
+    entries += 1
+    used = entry(extra_bytes, used, "DBUS_STARTER_BUS_TYPE=", "session")
+    unsafe { environment[entries] = @ptrFromInt([*]const u8, 0) }
+    var environment_pointer: [*][*]const u8 = undefined
+    unsafe { environment_pointer = @ptrCast([*][*]const u8, &environment) }
+    var argument_pointer: [*][*]const u8 = undefined
+    unsafe { argument_pointer = @ptrCast([*][*]const u8, &arguments) }
+    const child = std.linux.syscall0(SYS_fork)
+    if child == 0 {
+        // Signals the bus blocked (for its signalfd) are the service's to
+        // take.
+        var none: usize = 0
+        const unblocked = std.linux.syscall4(SYS_rt_sigprocmask, 2, @intFromPtr(&none), 0, 8)
+        execute(arguments[0], argument_pointer, environment_pointer)
+        const exited = std.linux.syscall1(SYS_exit_group, 127)
+    }
+    return child
+}
+
+fn entry(bytes: [*]u8, at: usize, key: []const u8, value: []const u8) -> usize {
+    var length = at + copyInto(advance(bytes, at), key.length, key)
+    length += copyInto(advance(bytes, length), 1000 - length, value)
+    bytes[length] = 0
+    return length + 1
+}
+
+// execve `program`, looked up in PATH when it has no slash. Returns only
+// when it could not run (in the forked child).
+pub fn execute(program: [*]const u8, arguments: [*][*]const u8, environment: [*][*]const u8) -> void {
+    var length: usize = 0
+    var has_slash = false
+    while program[length] != 0 {
+        if program[length] == 47 { has_slash = true }
+        length += 1
+    }
+    if has_slash {
+        const ignored = std.linux.syscall3(SYS_execve, @intFromPtr(program), @intFromPtr(arguments), @intFromPtr(environment))
+        return
+    }
+    const found = std.process.environmentFrom(environment, "PATH")
+    var path: []const u8 = "/usr/local/bin:/usr/bin:/bin"
+    if found != null { path = std.string.asSlice(found.?) }
+    var candidate: [1024]u8 = undefined
+    var candidate_bytes: [*]u8 = undefined
+    unsafe { candidate_bytes = @ptrCast([*]u8, &candidate) }
+    var start: usize = 0
+    while start <= path.length {
+        var end = start
+        while end < path.length && path[end] != 58 { end += 1 }
+        if end > start && end - start + length + 2 < 1024 {
+            var at = copyInto(candidate_bytes, end - start, path[start..end])
+            candidate[at] = 47
+            at += 1
+            at += copyInto(advance(candidate_bytes, at), length, program[0..length])
+            candidate[at] = 0
+            const ignored = std.linux.syscall3(SYS_execve, @intFromPtr(candidate_bytes), @intFromPtr(arguments), @intFromPtr(environment))
+        }
+        start = end + 1
+    }
+}
+
+// UpdateActivationEnvironment: KEY=VALUE for the services started from
+// now on.
+pub fn setEnvironment(bus: *state.Bus, key: []const u8, value: []const u8) -> void {
+    if key.length == 0 || key.length > 255 || value.length > 4096 { return }
+    if same(key, "DBUS_SESSION_BUS_ADDRESS") || same(key, "DBUS_STARTER_ADDRESS") || same(key, "DBUS_STARTER_BUS_TYPE") { return }
+    var own: [*]u8 = undefined
+    unsafe { own = @ptrCast([*]u8, &bus.*.activation.environment) }
+    // The old value goes.
+    var start: usize = 0
+    while start < bus.*.activation.environmentLength {
+        var end = start
+        while own[end] != 0 { end += 1 }
+        if sets(advance(own, start), key) {
+            const removed = end + 1 - start
+            var move = start
+            while move + removed < bus.*.activation.environmentLength {
+                own[move] = own[move + removed]
+                move += 1
+            }
+            bus.*.activation.environmentLength -= removed
+        } else {
+            start = end + 1
+        }
+    }
+    const length = bus.*.activation.environmentLength
+    if length + key.length + value.length + 2 > 16384 { return }
+    var at = length + copyInto(advance(own, length), key.length, key)
+    own[at] = 61
+    at += 1
+    at += copyInto(advance(own, at), value.length, value)
+    own[at] = 0
+    bus.*.activation.environmentLength = at + 1
+}
+
+// ---------------------------------------------------------------------------
+// Calls waiting for their service
+
+fn findStarting(bus: *state.Bus, name: []const u8) -> usize {
+    var index: usize = 0
+    while index < MAX_STARTING {
+        const starting = startingAt(bus, index)
+        if starting.*.used && same(nameOf(starting), name) { return index + 1 }
+        index += 1
+    }
+    return 0
+}
+
+// The service of `name` being started (it is started now when it was not
+// yet): its slot + 1, 0 when no service file provides it or it could not
+// start.
+fn begin(bus: *state.Bus, name: []const u8) -> usize {
+    const known = findStarting(bus, name)
+    if known != 0 { return known }
+    var slot: usize = MAX_STARTING
+    var index: usize = 0
+    while index < MAX_STARTING {
+        if !startingAt(bus, index).*.used {
+            slot = index
+            break
+        }
+        index += 1
+    }
+    if slot == MAX_STARTING { return 0 }
+    var exec: [2048]u8 = undefined
+    var exec_bytes: [*]u8 = undefined
+    unsafe { exec_bytes = @ptrCast([*]u8, &exec) }
+    const length = findService(bus, name, exec_bytes, 2048)
+    if length == 0 { return 0 }
+    const pid = spawn(bus, exec_bytes[0..length])
+    if pid < 0 { return 0 }
+    const starting = startingAt(bus, slot)
+    starting.*.used = true
+    var name_bytes: [*]u8 = undefined
+    unsafe { name_bytes = @ptrCast([*]u8, &starting.*.name) }
+    starting.*.nameLength = copyInto(name_bytes, 255, name)
+    starting.*.pid = pid
+    starting.*.startedAt = milliseconds()
+    starting.*.waitingCount = 0
+    starting.*.starterCount = 0
+    bus_module.say(bus, "ipc: starting ")
+    bus_module.say(bus, name)
+    bus_module.say(bus, ": ")
+    bus_module.say(bus, exec_bytes[0..length])
+    bus_module.say(bus, "\n")
+    return slot + 1
+}
+
+// A call to `header.destination`, which nobody owns: held until its
+// service has started (it then owns the message's descriptors); false
+// when no service provides the name.
+pub fn queueCall(bus: *state.Bus, client: *state.Client, header: *const dbus.Header, bytes: [*]const u8, descriptors: [*]const isize, count: usize) -> bool {
+    const slot = begin(bus, header.*.destination)
+    if slot == 0 { return false }
+    const starting = startingAt(bus, slot - 1)
+    if starting.*.waitingCount >= MAX_WAITING { return false }
+    const memory = bus.*.allocator.alloc(@sizeOf(state.Waiting), 16)
+    if memory == null { return false }
+    const message = bus.*.allocator.alloc(header.*.size, 16)
+    if message == null {
+        bus.*.allocator.free(memory.?, @sizeOf(state.Waiting), 16)
+        return false
+    }
+    var waiting: *state.Waiting = undefined
+    unsafe { waiting = @ptrCast(*state.Waiting, memory.?) }
+    waiting.*.caller = @intFromPtr(client)
+    waiting.*.message = message.?
+    waiting.*.size = header.*.size
+    var index: usize = 0
+    while index < header.*.size {
+        message.?[index] = bytes[index]
+        index += 1
+    }
+    index = 0
+    while index < count {
+        waiting.*.descriptors[index] = descriptors[index]
+        index += 1
+    }
+    waiting.*.count = count
+    starting.*.waiting[starting.*.waitingCount] = @intFromPtr(memory.?)
+    starting.*.waitingCount += 1
+    return true
+}
+
+// StartServiceByName: the reply (1) comes once the name has an owner;
+// false when no service provides it.
+pub fn startFor(bus: *state.Bus, client: *state.Client, name: []const u8, serial: u32) -> bool {
+    const slot = begin(bus, name)
+    if slot == 0 { return false }
+    const starting = startingAt(bus, slot - 1)
+    if starting.*.starterCount < MAX_STARTERS {
+        starting.*.starters[starting.*.starterCount] = @intFromPtr(client)
+        starting.*.starterSerials[starting.*.starterCount] = serial
+        starting.*.starterCount += 1
+    }
+    return true
+}
+
+fn freeWaiting(bus: *state.Bus, address: usize, close: bool) -> void {
+    const waiting = waitingAt(address)
+    if close {
+        var descriptors: [*]const isize = undefined
+        unsafe { descriptors = @ptrCast([*]const isize, &waiting.*.descriptors) }
+        bus_module.closeAll(descriptors, waiting.*.count)
+    }
+    bus.*.allocator.free(waiting.*.message, waiting.*.size, 16)
+    var memory: [*]u8 = undefined
+    unsafe { memory = @ptrCast([*]u8, waiting) }
+    bus.*.allocator.free(memory, @sizeOf(state.Waiting), 16)
+}
+
+// The service failed: the calls get `error_name`, and its slot is free.
+fn fail(bus: *state.Bus, starting: *state.Starting, error_name: []const u8, message: []const u8) -> void {
+    bus_module.say(bus, "ipc: ")
+    bus_module.say(bus, nameOf(starting))
+    bus_module.say(bus, ": ")
+    bus_module.say(bus, message)
+    bus_module.say(bus, "\n")
+    starting.*.used = false
+    var index: usize = 0
+    while index < starting.*.waitingCount {
+        const waiting = waitingAt(starting.*.waiting[index])
+        var header: dbus.Header = undefined
+        if dbus.parseHeader(waiting.*.message, waiting.*.size, &header) { bus_module.replyError(bus, bus_module.clientAt(waiting.*.caller), &header, error_name, message) }
+        freeWaiting(bus, starting.*.waiting[index], true)
+        index += 1
+    }
+    index = 0
+    while index < starting.*.starterCount {
+        var call = dbus.newHeader(dbus.METHOD_CALL, starting.*.starterSerials[index])
+        bus_module.replyError(bus, bus_module.clientAt(starting.*.starters[index]), &call, error_name, message)
+        index += 1
+    }
+}
+
+// `name` has an owner now: what waited for it goes to it.
+pub fn nameAcquired(bus: *state.Bus, name: []const u8, owner: usize) -> void {
+    const slot = findStarting(bus, name)
+    if slot == 0 { return }
+    const starting = startingAt(bus, slot - 1)
+    starting.*.used = false
+    var index: usize = 0
+    while index < starting.*.waitingCount {
+        const waiting = waitingAt(starting.*.waiting[index])
+        var header: dbus.Header = undefined
+        if dbus.parseHeader(waiting.*.message, waiting.*.size, &header) {
+            var descriptors: [*]const isize = undefined
+            unsafe { descriptors = @ptrCast([*]const isize, &waiting.*.descriptors) }
+            bus_module.route(bus, bus_module.clientAt(waiting.*.caller), waiting.*.message, &header, descriptors, waiting.*.count)
+            freeWaiting(bus, starting.*.waiting[index], false)
+        } else {
+            freeWaiting(bus, starting.*.waiting[index], true)
+        }
+        index += 1
+    }
+    index = 0
+    while index < starting.*.starterCount {
+        driver.replyStarted(bus, bus_module.clientAt(starting.*.starters[index]), starting.*.starterSerials[index])
+        index += 1
+    }
+}
+
+// The client at `address` left: its waiting calls go.
+pub fn clientGone(bus: *state.Bus, address: usize) -> void {
+    var slot: usize = 0
+    while slot < MAX_STARTING {
+        const starting = startingAt(bus, slot)
+        if starting.*.used {
+            var index = starting.*.waitingCount
+            while index > 0 {
+                index -= 1
+                if waitingAt(starting.*.waiting[index]).*.caller == address {
+                    freeWaiting(bus, starting.*.waiting[index], true)
+                    starting.*.waitingCount -= 1
+                    starting.*.waiting[index] = starting.*.waiting[starting.*.waitingCount]
+                }
+            }
+            index = starting.*.starterCount
+            while index > 0 {
+                index -= 1
+                if starting.*.starters[index] == address {
+                    starting.*.starterCount -= 1
+                    starting.*.starters[index] = starting.*.starters[starting.*.starterCount]
+                    starting.*.starterSerials[index] = starting.*.starterSerials[starting.*.starterCount]
+                }
+            }
+        }
+        slot += 1
+    }
+}
+
+// The child `pid` ended: when it was a service that never took its name,
+// its calls fail.
+pub fn reaped(bus: *state.Bus, pid: isize) -> void {
+    var slot: usize = 0
+    while slot < MAX_STARTING {
+        const starting = startingAt(bus, slot)
+        if starting.*.used && starting.*.pid == pid { fail(bus, starting, "org.freedesktop.DBus.Error.Spawn.ChildExited", "The service ended before it owned its name") }
+        slot += 1
+    }
+}
+
+// Services that took too long fail.
+pub fn tick(bus: *state.Bus) -> void {
+    const now = milliseconds()
+    var slot: usize = 0
+    while slot < MAX_STARTING {
+        const starting = startingAt(bus, slot)
+        if starting.*.used && now - starting.*.startedAt > TIMEOUT { fail(bus, starting, "org.freedesktop.DBus.Error.Spawn.Timeout", "The service did not own its name in time") }
+        slot += 1
+    }
+}
+
+// Whether a service is being started (the loop then wakes to time it out).
+pub fn busy(bus: *state.Bus) -> bool {
+    var slot: usize = 0
+    while slot < MAX_STARTING {
+        if startingAt(bus, slot).*.used { return true }
+        slot += 1
+    }
+    return false
+}

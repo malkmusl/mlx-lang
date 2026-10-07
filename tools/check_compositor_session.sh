@@ -23,7 +23,7 @@ compiler_args=()
 tools/install_compositor_session.sh --destdir "$work/root" "${compiler_args[@]}" > "$work/install.log"
 bindir="$work/root/usr/local/bin"
 entry="$work/root/usr/share/wayland-sessions/mlx-compositor.desktop"
-for program in mlx-compositor mlx-terminal mlx-session mlx-dock mlx-topbar mlx-launcher mlx-settings mlx-files mlx-observatory mlx-codemap mlx-profile; do
+for program in mlx-compositor mlx-terminal mlx-session mlx-dock mlx-topbar mlx-launcher mlx-settings mlx-files mlx-observatory mlx-codemap mlx-profile mlx-capture mlx-ipcd mlx-ipc; do
     [[ -x "$bindir/$program" ]] || { echo "not installed: $program" >&2; cat "$work/install.log" >&2; exit 1; }
 done
 grep -qx "Exec=/usr/local/bin/mlx-session" "$entry" || { echo "session entry without the launcher:" >&2; cat "$entry" >&2; exit 1; }
@@ -65,7 +65,8 @@ if command -v weston > /dev/null; then
     [[ "${size% *}" == "${size#* }" ]] || { echo "weston: output ${size% *} is not the monitor's ${size#* }" >&2; exit 1; }
     grep -q "^mlx-session: keyboard de" <<< "$log" || { echo "weston: keyboard layout not passed on" >&2; exit 1; }
     grep -q "^launch: .*/mlx-dock$" <<< "$log" || { echo "weston: the session did not start the dock" >&2; echo "$log" >&2; exit 1; }
-    echo "ok   weston session (kiosk shell): fullscreen at the monitor's ${size#* }, keyboard de, the dock started"
+    grep -q "^mlx-session: session bus: mlx-ipcd" <<< "$log" || { echo "weston: the session is not on mlx-ipcd" >&2; echo "$log" >&2; exit 1; }
+    echo "ok   weston session (kiosk shell): fullscreen at the monitor's ${size#* }, keyboard de, the dock started, on mlx-ipcd"
     checked=$((checked + 1))
 else
     echo "skip weston is not installed"
