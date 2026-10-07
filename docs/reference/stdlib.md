@@ -200,6 +200,14 @@ them with the pixels they must give, refuses an interlaced image and a
 file that is not a PNG, finds a truncated one corrupt, and checks
 `scale`.
 
+`saveFile(path, pixels, width, height, stride, alpha, allocator)` writes
+premultiplied ARGB words (rows `stride` words apart) as an 8-bit RGBA PNG,
+or RGB with `alpha` false, and returns whether it was written: each row
+with the filter that leaves the smallest differences, deflated with fixed
+Huffman codes and LZ77 matches over a 32 KiB window. `mlx-screenshot`
+saves captures with it. `tests/292_png_encode_runtime.mlx` writes an image
+both ways and reads it back with `loadFile`.
+
 ## Core: allocators
 
 **Normative source:** `spec/04-stdlib/mem.xml`

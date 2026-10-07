@@ -1,0 +1,839 @@
+// Screen and window capture (part of the shell): ext-foreign-toplevel-list-v1
+// (the windows, each with an identifier that is never reused),
+// ext-image-capture-source-v1 (what can be captured: the output, or a
+// window named by one of those handles) and ext-image-copy-capture-v1
+// (copying it into a client's wl_shm buffer, again whenever it changed).
+//
+// A capture session tells the client the size and the formats its buffers
+// must have (ARGB8888 or XRGB8888 shared memory); each frame it asks for is
+// copied when the source changed since its last one (the first at once),
+// with what changed as damage. The output's frames are the frames the
+// compositor presented (lastFrame, with the pointer drawn in); a window's
+// are its own pixels and its subsurfaces', without the compositor's
+// frame, title bar or anything over it. A pointer cursor session never
+// sees the pointer: its capture sessions stop at once.
+const std = @import("std")
+const wl = @import("std.wayland")
+const ui = @import("std.ui")
+const state = @import("./state.mlx")
+const scene = @import("./scene.mlx")
+const shell = @import("./shell.mlx")
+
+const Compositor = state.Compositor
+const Surface = state.Surface
+
+// An ext_foreign_toplevel_handle_v1: one window, for one list's client.
+pub const ExtHandle = struct {
+    compositor: *Compositor
+    object: wl.server.Object
+    // The window's address; 0 once it closed.
+    surface: usize
+}
+
+// An ext_image_capture_source_v1: the output (surface 0, toplevel false)
+// or a window (its address; 0 once it is gone).
+pub const Source = struct {
+    compositor: *Compositor
+    object: wl.server.Object
+    toplevel: bool
+    surface: usize
+}
+
+// An ext_image_copy_capture_session_v1 (or one a cursor session made,
+// stopped from the start).
+pub const Session = struct {
+    compositor: *Compositor
+    object: wl.server.Object
+    toplevel: bool
+    surface: usize
+    stopped: bool
+    // The buffer size last announced.
+    width: i32
+    height: i32
+    // A frame was captured; what changed since (the output: the frames
+    // presented since; a window: its content serial then).
+    captured: bool
+    damage: ui.Rect
+    serial: usize
+    // Its frame (0: none).
+    frame: usize
+}
+
+// An ext_image_copy_capture_frame_v1.
+pub const Frame = struct {
+    compositor: *Compositor
+    object: wl.server.Object
+    // Its session (0 once the session went).
+    session: usize
+    hasBuffer: bool
+    buffer: wl.server.Object
+    // What the client says its buffer lacks (buffer pixels).
+    clientDamage: ui.Rect
+    capturing: bool
+    finished: bool
+}
+
+const SHM_ARGB8888: u32 = 0
+const SHM_XRGB8888: u32 = 1
+
+fn handleAt(address: usize) -> *ExtHandle {
+    unsafe { return @ptrFromInt(*ExtHandle, address) }
+}
+
+fn sourceAt(address: usize) -> *Source {
+    unsafe { return @ptrFromInt(*Source, address) }
+}
+
+fn sessionAt(address: usize) -> *Session {
+    unsafe { return @ptrFromInt(*Session, address) }
+}
+
+fn frameAt(address: usize) -> *Frame {
+    unsafe { return @ptrFromInt(*Frame, address) }
+}
+
+fn record(compositor: *Compositor, size: usize) -> [*]u8 { return state.allocate(compositor, size) }
+
+fn surfaceSlice(bytes: [*]const u8, length: usize) -> []const u8 { return bytes[0..length] }
+
+fn titleOf(surface: *const Surface) -> []const u8 {
+    var bytes: [*]const u8 = undefined
+    unsafe { bytes = @ptrCast([*]const u8, &surface.*.title) }
+    return surfaceSlice(bytes, surface.*.titleLength)
+}
+
+fn appIdOf(surface: *const Surface) -> []const u8 {
+    var bytes: [*]const u8 = undefined
+    unsafe { bytes = @ptrCast([*]const u8, &surface.*.appId) }
+    return surfaceSlice(bytes, surface.*.appIdLength)
+}
+
+fn isSurface(compositor: *Compositor, address: usize) -> bool {
+    if address == 0 { return false }
+    var index: usize = 0
+    while index < compositor.*.surfaces.length {
+        if state.listAt(compositor.*.surfaces, index) == address { return true }
+        index += 1
+    }
+    return false
+}
+
+// ---------------------------------------------------------------------------
+// ext-foreign-toplevel-list-v1
+
+// The window's identifier: its number in hexadecimal, 16 digits.
+fn sendIdentifier(resource: wl.ext_foreign_toplevel_handle_v1.Resource, surface: *const Surface) -> void {
+    var text: [16]u8 = undefined
+    var value = surface.*.toplevelIdentifier
+    var index: usize = 16
+    while index > 0 {
+        index -= 1
+        const digit = @intCast(u8, value % 16)
+        text[index] = if digit < 10 { 48 + digit } else { 87 + digit }
+        value = value / 16
+    }
+    var bytes: [*]const u8 = undefined
+    unsafe { bytes = @ptrCast([*]const u8, &text) }
+    resource.sendIdentifier(bytes[0..16])
+}
+
+fn sendHandleInfo(handle: *ExtHandle, first: bool) -> void {
+    if handle.*.surface == 0 { return }
+    const surface = state.surfaceAt(handle.*.surface)
+    const resource = wl.ext_foreign_toplevel_handle_v1.Resource.fromObject(handle.*.object)
+    if first { sendIdentifier(resource, surface) }
+    resource.sendTitle(titleOf(surface))
+    resource.sendAppId(appIdOf(surface))
+    resource.sendDone()
+}
+
+fn announce(compositor: *Compositor, list: *shell.SeatResource, address: usize) -> void {
+    const resource = wl.ext_foreign_toplevel_list_v1.Resource.fromObject(list.*.object).sendToplevel()
+    if resource.object.id == 0 { return }
+    const memory = record(compositor, @sizeOf(ExtHandle))
+    const handle = handleAt(@intFromPtr(memory))
+    handle.*.compositor = compositor
+    handle.*.object = resource.object
+    handle.*.surface = address
+    compositor.*.extHandles = state.listAppend(compositor.*.extHandles, @intFromPtr(memory))
+    resource.setHandler(onExtHandle, state.contextOf(memory))
+    resource.setDestroyHandler(onExtHandleDestroyed, state.contextOf(memory))
+    sendHandleInfo(handle, true)
+}
+
+// A window was mapped (protocols.toplevelMapped): it gets an identifier
+// and every list hears of it.
+pub fn toplevelMapped(compositor: *Compositor, address: usize) -> void {
+    const surface = state.surfaceAt(address)
+    if surface.*.toplevelIdentifier == 0 {
+        compositor.*.nextToplevelIdentifier += 1
+        surface.*.toplevelIdentifier = compositor.*.nextToplevelIdentifier
+    }
+    var index: usize = 0
+    while index < compositor.*.toplevelLists.length {
+        announce(compositor, shell.seatResourceAt(state.listAt(compositor.*.toplevelLists, index)), address)
+        index += 1
+    }
+}
+
+// Its title or app id changed.
+pub fn toplevelChanged(compositor: *Compositor, address: usize) -> void {
+    var index: usize = 0
+    while index < compositor.*.extHandles.length {
+        const handle = handleAt(state.listAt(compositor.*.extHandles, index))
+        if handle.*.surface == address { sendHandleInfo(handle, false) }
+        index += 1
+    }
+}
+
+// It went: its handles close, its captures stop. Mapped again, it is
+// another window (another identifier).
+pub fn toplevelUnmapped(compositor: *Compositor, address: usize) -> void {
+    var index: usize = 0
+    while index < compositor.*.extHandles.length {
+        const handle = handleAt(state.listAt(compositor.*.extHandles, index))
+        if handle.*.surface == address {
+            wl.ext_foreign_toplevel_handle_v1.Resource.fromObject(handle.*.object).sendClosed()
+            handle.*.surface = 0
+        }
+        index += 1
+    }
+    index = 0
+    while index < compositor.*.captureSources.length {
+        const source = sourceAt(state.listAt(compositor.*.captureSources, index))
+        if source.*.toplevel && source.*.surface == address { source.*.surface = 0 }
+        index += 1
+    }
+    index = 0
+    while index < compositor.*.captureSessions.length {
+        const session = sessionAt(state.listAt(compositor.*.captureSessions, index))
+        if session.*.toplevel && session.*.surface == address { stopSession(session) }
+        index += 1
+    }
+    state.surfaceAt(address).*.toplevelIdentifier = 0
+}
+
+pub fn onExtHandle(context: *anyopaque, request: wl.server.Request) -> void {}
+
+pub fn onExtHandleDestroyed(context: *anyopaque, object: wl.server.Object) -> void {
+    const handle = handleAt(@intFromPtr(context))
+    const compositor = handle.*.compositor
+    compositor.*.extHandles = state.listRemove(compositor.*.extHandles, @intFromPtr(context))
+    unsafe { state.release(compositor, @ptrCast([*]u8, context), @sizeOf(ExtHandle)) }
+}
+
+pub fn onToplevelList(context: *anyopaque, request: wl.server.Request) -> void {
+    if request.opcode == wl.ext_foreign_toplevel_list_v1.REQUEST_STOP {
+        const list = shell.seatResourceAt(@intFromPtr(context))
+        const compositor = list.*.compositor
+        // No more windows for it; finished says so.
+        compositor.*.toplevelLists = state.listRemove(compositor.*.toplevelLists, @intFromPtr(context))
+        wl.ext_foreign_toplevel_list_v1.Resource.fromObject(request.object).sendFinished()
+    }
+}
+
+pub fn onToplevelListDestroyed(context: *anyopaque, object: wl.server.Object) -> void {
+    const list = shell.seatResourceAt(@intFromPtr(context))
+    const compositor = list.*.compositor
+    compositor.*.toplevelLists = state.listRemove(compositor.*.toplevelLists, @intFromPtr(context))
+    unsafe { state.release(compositor, @ptrCast([*]u8, context), @sizeOf(shell.SeatResource)) }
+}
+
+pub fn bindToplevelList(context: *anyopaque, client: wl.server.Client, object: wl.server.Object, version: u32) -> void {
+    const compositor = state.compositorOf(context)
+    const memory = record(compositor, @sizeOf(shell.SeatResource))
+    const list = shell.seatResourceAt(@intFromPtr(memory))
+    list.*.compositor = compositor
+    list.*.object = object
+    list.*.kind = state.SEAT_TOPLEVEL_LIST
+    compositor.*.toplevelLists = state.listAppend(compositor.*.toplevelLists, @intFromPtr(memory))
+    wl.server.setHandler(object, onToplevelList, state.contextOf(memory))
+    wl.server.setDestroyHandler(object, onToplevelListDestroyed, state.contextOf(memory))
+    var index: usize = 0
+    while index < compositor.*.stack.length {
+        const address = state.listAt(compositor.*.stack, index)
+        if state.surfaceAt(address).*.role == state.ROLE_TOPLEVEL { announce(compositor, list, address) }
+        index += 1
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ext-image-capture-source-v1
+
+fn addSource(compositor: *Compositor, object: wl.server.Object, toplevel: bool, surface: usize) -> void {
+    const memory = record(compositor, @sizeOf(Source))
+    const source = sourceAt(@intFromPtr(memory))
+    source.*.compositor = compositor
+    source.*.object = object
+    source.*.toplevel = toplevel
+    source.*.surface = surface
+    compositor.*.captureSources = state.listAppend(compositor.*.captureSources, @intFromPtr(memory))
+    wl.server.setHandler(object, onSource, state.contextOf(memory))
+    wl.server.setDestroyHandler(object, onSourceDestroyed, state.contextOf(memory))
+}
+
+pub fn onSource(context: *anyopaque, request: wl.server.Request) -> void {}
+
+pub fn onSourceDestroyed(context: *anyopaque, object: wl.server.Object) -> void {
+    const source = sourceAt(@intFromPtr(context))
+    const compositor = source.*.compositor
+    compositor.*.captureSources = state.listRemove(compositor.*.captureSources, @intFromPtr(context))
+    unsafe { state.release(compositor, @ptrCast([*]u8, context), @sizeOf(Source)) }
+}
+
+pub fn onOutputSourceManager(context: *anyopaque, request: wl.server.Request) -> void {
+    const compositor = state.compositorOf(context)
+    if request.opcode == wl.ext_output_image_capture_source_manager_v1.REQUEST_CREATE_SOURCE {
+        const decoded = wl.ext_output_image_capture_source_manager_v1.decodeRequest(request)
+        // The compositor has one output: every wl_output is it.
+        addSource(compositor, decoded.create_source.source.object, false, 0)
+    }
+}
+
+pub fn onToplevelSourceManager(context: *anyopaque, request: wl.server.Request) -> void {
+    const compositor = state.compositorOf(context)
+    if request.opcode == wl.ext_foreign_toplevel_image_capture_source_manager_v1.REQUEST_CREATE_SOURCE {
+        const decoded = wl.ext_foreign_toplevel_image_capture_source_manager_v1.decodeRequest(request)
+        const wanted = decoded.create_source.toplevel_handle.object
+        var surface: usize = 0
+        var index: usize = 0
+        while index < compositor.*.extHandles.length {
+            const handle = handleAt(state.listAt(compositor.*.extHandles, index))
+            if state.sameObject(handle.*.object, wanted) { surface = handle.*.surface }
+            index += 1
+        }
+        // A closed window's source makes sessions that stop at once.
+        addSource(compositor, decoded.create_source.source.object, true, surface)
+    }
+}
+
+pub fn bindOutputSourceManager(context: *anyopaque, client: wl.server.Client, object: wl.server.Object, version: u32) -> void {
+    wl.server.setHandler(object, onOutputSourceManager, context)
+}
+
+pub fn bindToplevelSourceManager(context: *anyopaque, client: wl.server.Client, object: wl.server.Object, version: u32) -> void {
+    wl.server.setHandler(object, onToplevelSourceManager, context)
+}
+
+// ---------------------------------------------------------------------------
+// ext-image-copy-capture-v1: sessions
+
+// What a session's buffers must be: the output's size, or the window's
+// buffer's (0 x 0 while it has none).
+fn sourceWidth(session: *Session) -> i32 {
+    if !session.*.toplevel { return @intCast(i32, session.*.compositor.*.width) }
+    if !isSurface(session.*.compositor, session.*.surface) { return 0 }
+    return @intCast(i32, state.surfaceAt(session.*.surface).*.pixelWidth)
+}
+
+fn sourceHeight(session: *Session) -> i32 {
+    if !session.*.toplevel { return @intCast(i32, session.*.compositor.*.height) }
+    if !isSurface(session.*.compositor, session.*.surface) { return 0 }
+    return @intCast(i32, state.surfaceAt(session.*.surface).*.pixelHeight)
+}
+
+fn sendConstraints(session: *Session) -> void {
+    const resource = wl.ext_image_copy_capture_session_v1.Resource.fromObject(session.*.object)
+    session.*.width = sourceWidth(session)
+    session.*.height = sourceHeight(session)
+    const width = if session.*.width > 0 { session.*.width } else { 1 }
+    const height = if session.*.height > 0 { session.*.height } else { 1 }
+    resource.sendBufferSize(@intCast(u32, width), @intCast(u32, height))
+    resource.sendShmFormat(SHM_ARGB8888)
+    resource.sendShmFormat(SHM_XRGB8888)
+    resource.sendDone()
+}
+
+fn failFrame(frame: *Frame, reason: u32) -> void {
+    if frame.*.finished { return }
+    frame.*.finished = true
+    wl.ext_image_copy_capture_frame_v1.Resource.fromObject(frame.*.object).sendFailed(reason)
+}
+
+fn stopSession(session: *Session) -> void {
+    if session.*.stopped { return }
+    session.*.stopped = true
+    wl.ext_image_copy_capture_session_v1.Resource.fromObject(session.*.object).sendStopped()
+    if session.*.frame != 0 {
+        const frame = frameAt(session.*.frame)
+        if frame.*.capturing { failFrame(frame, @intFromEnum(wl.ext_image_copy_capture_frame_v1.FailureReason.stopped)) }
+    }
+}
+
+fn addSession(compositor: *Compositor, object: wl.server.Object, toplevel: bool, surface: usize) -> *Session {
+    const memory = record(compositor, @sizeOf(Session))
+    const session = sessionAt(@intFromPtr(memory))
+    session.*.compositor = compositor
+    session.*.object = object
+    session.*.toplevel = toplevel
+    session.*.surface = surface
+    session.*.stopped = false
+    session.*.width = 0
+    session.*.height = 0
+    session.*.captured = false
+    session.*.damage = ui.rect(0, 0, 0, 0)
+    session.*.serial = 0
+    session.*.frame = 0
+    compositor.*.captureSessions = state.listAppend(compositor.*.captureSessions, @intFromPtr(memory))
+    wl.server.setHandler(object, onSession, state.contextOf(memory))
+    wl.server.setDestroyHandler(object, onSessionDestroyed, state.contextOf(memory))
+    return session
+}
+
+pub fn onSession(context: *anyopaque, request: wl.server.Request) -> void {
+    const session = sessionAt(@intFromPtr(context))
+    const compositor = session.*.compositor
+    if request.opcode != wl.ext_image_copy_capture_session_v1.REQUEST_CREATE_FRAME { return }
+    const decoded = wl.ext_image_copy_capture_session_v1.decodeRequest(request)
+    const object = decoded.create_frame.frame.object
+    if session.*.frame != 0 {
+        wl.server.postError(request.object, @intFromEnum(wl.ext_image_copy_capture_session_v1.Error.duplicate_frame), "a frame of this session exists")
+        return
+    }
+    const memory = record(compositor, @sizeOf(Frame))
+    const frame = frameAt(@intFromPtr(memory))
+    frame.*.compositor = compositor
+    frame.*.object = object
+    frame.*.session = @intFromPtr(context)
+    frame.*.hasBuffer = false
+    frame.*.clientDamage = ui.rect(0, 0, 0, 0)
+    frame.*.capturing = false
+    frame.*.finished = false
+    session.*.frame = @intFromPtr(memory)
+    compositor.*.captureFrames = state.listAppend(compositor.*.captureFrames, @intFromPtr(memory))
+    wl.server.setHandler(object, onFrame, state.contextOf(memory))
+    wl.server.setDestroyHandler(object, onFrameDestroyed, state.contextOf(memory))
+}
+
+pub fn onSessionDestroyed(context: *anyopaque, object: wl.server.Object) -> void {
+    const session = sessionAt(@intFromPtr(context))
+    const compositor = session.*.compositor
+    if session.*.frame != 0 { frameAt(session.*.frame).*.session = 0 }
+    compositor.*.captureSessions = state.listRemove(compositor.*.captureSessions, @intFromPtr(context))
+    unsafe { state.release(compositor, @ptrCast([*]u8, context), @sizeOf(Session)) }
+}
+
+// A pointer cursor session: this compositor does not hand the pointer's
+// image out, so the capture session it makes is stopped from the start.
+pub fn onCursorSession(context: *anyopaque, request: wl.server.Request) -> void {
+    const compositor = state.compositorOf(context)
+    if request.opcode != wl.ext_image_copy_capture_cursor_session_v1.REQUEST_GET_CAPTURE_SESSION { return }
+    const decoded = wl.ext_image_copy_capture_cursor_session_v1.decodeRequest(request)
+    const session = addSession(compositor, decoded.get_capture_session.session.object, false, 0)
+    session.*.width = 1
+    session.*.height = 1
+    stopSession(session)
+}
+
+pub fn onCaptureManager(context: *anyopaque, request: wl.server.Request) -> void {
+    const compositor = state.compositorOf(context)
+    const decoded = wl.ext_image_copy_capture_manager_v1.decodeRequest(request)
+    if request.opcode == wl.ext_image_copy_capture_manager_v1.REQUEST_CREATE_SESSION {
+        if decoded.create_session.options > 1 {
+            wl.server.postError(request.object, @intFromEnum(wl.ext_image_copy_capture_manager_v1.Error.invalid_option), "unknown option")
+            return
+        }
+        const wanted = decoded.create_session.source.object
+        var toplevel = false
+        var surface: usize = 0
+        var index: usize = 0
+        while index < compositor.*.captureSources.length {
+            const source = sourceAt(state.listAt(compositor.*.captureSources, index))
+            if state.sameObject(source.*.object, wanted) {
+                toplevel = source.*.toplevel
+                surface = source.*.surface
+            }
+            index += 1
+        }
+        const session = addSession(compositor, decoded.create_session.session.object, toplevel, surface)
+        if toplevel && !isSurface(compositor, surface) {
+            session.*.width = 1
+            session.*.height = 1
+            stopSession(session)
+            return
+        }
+        sendConstraints(session)
+        if compositor.*.verbose {
+            state.say("capture: a session on ")
+            state.say(if toplevel { "a window" } else { "the output" })
+            state.say("\n")
+        }
+    } else if request.opcode == wl.ext_image_copy_capture_manager_v1.REQUEST_CREATE_POINTER_CURSOR_SESSION {
+        const object = decoded.create_pointer_cursor_session.session.object
+        wl.server.setHandler(object, onCursorSession, context)
+    }
+}
+
+pub fn bindCaptureManager(context: *anyopaque, client: wl.server.Client, object: wl.server.Object, version: u32) -> void {
+    wl.server.setHandler(object, onCaptureManager, context)
+}
+
+// ---------------------------------------------------------------------------
+// Frames
+
+pub fn onFrame(context: *anyopaque, request: wl.server.Request) -> void {
+    const frame = frameAt(@intFromPtr(context))
+    const decoded = wl.ext_image_copy_capture_frame_v1.decodeRequest(request)
+    if request.opcode == wl.ext_image_copy_capture_frame_v1.REQUEST_DESTROY { return }
+    if frame.*.capturing {
+        wl.server.postError(request.object, @intFromEnum(wl.ext_image_copy_capture_frame_v1.Error.already_captured), "the frame was captured")
+        return
+    }
+    if request.opcode == wl.ext_image_copy_capture_frame_v1.REQUEST_ATTACH_BUFFER {
+        frame.*.hasBuffer = true
+        frame.*.buffer = decoded.attach_buffer.buffer.object
+    } else if request.opcode == wl.ext_image_copy_capture_frame_v1.REQUEST_DAMAGE_BUFFER {
+        const damage = decoded.damage_buffer
+        if damage.x < 0 || damage.y < 0 || damage.width <= 0 || damage.height <= 0 {
+            wl.server.postError(request.object, @intFromEnum(wl.ext_image_copy_capture_frame_v1.Error.invalid_buffer_damage), "invalid damage")
+            return
+        }
+        frame.*.clientDamage = scene.unionRect(frame.*.clientDamage, ui.rect(damage.x, damage.y, damage.width, damage.height))
+    } else if request.opcode == wl.ext_image_copy_capture_frame_v1.REQUEST_CAPTURE {
+        if !frame.*.hasBuffer {
+            wl.server.postError(request.object, @intFromEnum(wl.ext_image_copy_capture_frame_v1.Error.no_buffer), "no buffer attached")
+            return
+        }
+        frame.*.capturing = true
+        fulfil(frame)
+    }
+}
+
+pub fn onFrameDestroyed(context: *anyopaque, object: wl.server.Object) -> void {
+    const frame = frameAt(@intFromPtr(context))
+    const compositor = frame.*.compositor
+    if frame.*.session != 0 { sessionAt(frame.*.session).*.frame = 0 }
+    compositor.*.captureFrames = state.listRemove(compositor.*.captureFrames, @intFromPtr(context))
+    unsafe { state.release(compositor, @ptrCast([*]u8, context), @sizeOf(Frame)) }
+}
+
+// The newest content serial of a window and its subsurfaces.
+fn contentSerial(surface: *Surface, depth: usize) -> usize {
+    var newest = surface.*.contentSerial
+    if depth > 8 { return newest }
+    var index: usize = 0
+    while index < surface.*.children.length {
+        const serial = contentSerial(state.surfaceAt(state.listAt(surface.*.children, index)), depth + 1)
+        if serial > newest { newest = serial }
+        index += 1
+    }
+    return newest
+}
+
+fn clip(rect: ui.Rect, width: i32, height: i32) -> ui.Rect {
+    var left = rect.x
+    var top = rect.y
+    var right = rect.x + rect.width
+    var bottom = rect.y + rect.height
+    if left < 0 { left = 0 }
+    if top < 0 { top = 0 }
+    if right > width { right = width }
+    if bottom > height { bottom = height }
+    if right <= left || bottom <= top { return ui.rect(0, 0, 0, 0) }
+    return ui.rect(left, top, right - left, bottom - top)
+}
+
+// Copies the frame when its session's source has something new (at once
+// for the session's first), or fails it.
+fn fulfil(frame: *Frame) -> void {
+    if !frame.*.capturing || frame.*.finished { return }
+    const compositor = frame.*.compositor
+    if frame.*.session == 0 {
+        failFrame(frame, @intFromEnum(wl.ext_image_copy_capture_frame_v1.FailureReason.stopped))
+        return
+    }
+    const session = sessionAt(frame.*.session)
+    if session.*.stopped {
+        failFrame(frame, @intFromEnum(wl.ext_image_copy_capture_frame_v1.FailureReason.stopped))
+        return
+    }
+    if session.*.toplevel && !isSurface(compositor, session.*.surface) {
+        stopSession(session)
+        return
+    }
+    const width = sourceWidth(session)
+    const height = sourceHeight(session)
+    if width != session.*.width || height != session.*.height {
+        // Another size: the client hears the new constraints and tries again.
+        sendConstraints(session)
+        failFrame(frame, @intFromEnum(wl.ext_image_copy_capture_frame_v1.FailureReason.buffer_constraints))
+        return
+    }
+    if width <= 0 || height <= 0 { return }
+    var serial: usize = 0
+    if session.*.toplevel {
+        serial = contentSerial(state.surfaceAt(session.*.surface), 0)
+        if session.*.captured && serial == session.*.serial { return }
+    } else {
+        if compositor.*.frames == 0 { return }
+        if session.*.captured && ui.isEmpty(session.*.damage) { return }
+    }
+    const address = shell.findBuffer(compositor, frame.*.buffer)
+    if address == 0 {
+        failFrame(frame, @intFromEnum(wl.ext_image_copy_capture_frame_v1.FailureReason.buffer_constraints))
+        return
+    }
+    const buffer = shell.bufferAt(address)
+    const format_ok = buffer.*.format == SHM_ARGB8888 || buffer.*.format == SHM_XRGB8888
+    if buffer.*.width != width || buffer.*.height != height || !format_ok || buffer.*.stride < width * 4 || buffer.*.pool.*.memory.address == 0 || buffer.*.pool.*.tiled {
+        failFrame(frame, @intFromEnum(wl.ext_image_copy_capture_frame_v1.FailureReason.buffer_constraints))
+        return
+    }
+    const full = ui.rect(0, 0, width, height)
+    const damage = if session.*.captured && !session.*.toplevel { clip(session.*.damage, width, height) } else { full }
+    // The compositor maps client memory read-only: the copy goes through a
+    // writable mapping of its own.
+    const pool = buffer.*.pool
+    var view: wl.SharedMemory = undefined
+    if pool.*.dmabuf || !wl.transport.mapSharedMemory(&view, pool.*.memory.handle.duplicate(), pool.*.memory.size, true) {
+        failFrame(frame, @intFromEnum(wl.ext_image_copy_capture_frame_v1.FailureReason.buffer_constraints))
+        return
+    }
+    var target: [*]u8 = undefined
+    unsafe { target = @ptrFromInt([*]u8, view.address + @intCast(usize, buffer.*.offset)) }
+    const stride = @intCast(usize, buffer.*.stride)
+    if session.*.toplevel {
+        copyWindow(state.surfaceAt(session.*.surface), target, stride, width, height)
+    } else {
+        // What the client's buffer lacks, and what changed.
+        const region = clip(scene.unionRect(damage, frame.*.clientDamage), width, height)
+        copyOutput(compositor, target, stride, region)
+    }
+    view.release()
+    // (Copied field by field before the session's damage is reset: see
+    // scene.takeDamage.)
+    const damage_x = damage.x
+    const damage_y = damage.y
+    const damage_width = damage.width
+    const damage_height = damage.height
+    session.*.captured = true
+    session.*.damage = ui.rect(0, 0, 0, 0)
+    session.*.serial = serial
+    frame.*.finished = true
+    const resource = wl.ext_image_copy_capture_frame_v1.Resource.fromObject(frame.*.object)
+    resource.sendTransform(0)
+    resource.sendDamage(damage_x, damage_y, damage_width, damage_height)
+    const now = state.microseconds()
+    const seconds = now / 1000000
+    resource.sendPresentationTime(@intCast(u32, seconds >> 32), @intCast(u32, seconds & 4294967295), @intCast(u32, (now % 1000000) * 1000))
+    resource.sendReady()
+}
+
+// The output's last frame (BGRX rows) into the buffer, opaque.
+fn copyOutput(compositor: *Compositor, target: [*]u8, stride: usize, region: ui.Rect) -> void {
+    if ui.isEmpty(region) { return }
+    var from: [*]const u32 = undefined
+    var to: [*]u32 = undefined
+    unsafe {
+        from = @ptrCast([*]const u32, compositor.*.lastFrame)
+        to = @ptrCast([*]u32, target)
+    }
+    const from_stride = compositor.*.lastFrameStride / 4
+    const to_stride = stride / 4
+    var row = @intCast(usize, region.y)
+    const bottom = @intCast(usize, region.y + region.height)
+    const left = @intCast(usize, region.x)
+    const right = @intCast(usize, region.x + region.width)
+    while row < bottom {
+        var column = left
+        while column < right {
+            to[row * to_stride + column] = from[row * from_stride + column] | 4278190080
+            column += 1
+        }
+        row += 1
+    }
+}
+
+// Where a surface's pixels can be read: the CPU renderer's copy of them, or
+// the buffer the Vulkan renderer shows (unless the CPU cannot map it).
+fn pixelsOf(surface: *Surface, base: *usize, stride: *usize, xrgb: *bool) -> bool {
+    if !surface.*.hasContent { return false }
+    if surface.*.compositor.*.renderer == 0 {
+        if surface.*.pixelCapacity == 0 { return false }
+        base.* = @intFromPtr(surface.*.pixels)
+        stride.* = surface.*.pixelWidth * 4
+        xrgb.* = false
+        return true
+    }
+    if surface.*.current == 0 { return false }
+    const buffer = shell.bufferAt(surface.*.current)
+    if buffer.*.pool.*.memory.address == 0 || buffer.*.pool.*.tiled { return false }
+    base.* = buffer.*.pool.*.memory.address + @intCast(usize, buffer.*.offset)
+    stride.* = @intCast(usize, buffer.*.stride)
+    xrgb.* = buffer.*.format == SHM_XRGB8888
+    return true
+}
+
+// A surface's pixels over the buffer at (x, y) (premultiplied: what it
+// covers shows through where it is translucent).
+fn blend(surface: *Surface, to: [*]u32, to_stride: usize, width: i32, height: i32, x: i32, y: i32) -> void {
+    var base: usize = 0
+    var from_stride: usize = 0
+    var xrgb = false
+    if !pixelsOf(surface, &base, &from_stride, &xrgb) { return }
+    var from: [*]const u32 = undefined
+    unsafe { from = @ptrFromInt([*]const u32, base) }
+    const from_pixels = from_stride / 4
+    const area = clip(ui.rect(x, y, @intCast(i32, surface.*.pixelWidth), @intCast(i32, surface.*.pixelHeight)), width, height)
+    var row = area.y
+    while row < area.y + area.height {
+        var column = area.x
+        const source_row = @intCast(usize, row - y) * from_pixels
+        const target_row = @intCast(usize, row) * to_stride
+        while column < area.x + area.width {
+            var pixel = from[source_row + @intCast(usize, column - x)]
+            if xrgb { pixel = pixel | 4278190080 }
+            const alpha = pixel >> 24
+            const at = target_row + @intCast(usize, column)
+            if alpha == 255 {
+                to[at] = pixel
+            } else if alpha != 0 || (pixel & 16777215) != 0 {
+                const under = to[at]
+                const keep = 255 - alpha
+                var result: u32 = 0
+                var shift: u32 = 0
+                while shift < 32 {
+                    const channel = ((pixel >> shift) & 255) + (((under >> shift) & 255) * keep + 127) / 255
+                    result = result | ((if channel > 255 { 255 } else { channel }) << shift)
+                    shift += 8
+                }
+                to[at] = result
+            }
+            column += 1
+        }
+        row += 1
+    }
+}
+
+// A surface and its subsurfaces (those below it first) at (x, y).
+fn drawTree(surface: *Surface, to: [*]u32, to_stride: usize, width: i32, height: i32, x: i32, y: i32, depth: usize) -> void {
+    var index: usize = 0
+    while index < surface.*.children.length {
+        if index == surface.*.belowCount { blend(surface, to, to_stride, width, height, x, y) }
+        const child = state.surfaceAt(state.listAt(surface.*.children, index))
+        if child.*.mapped || child.*.hasContent {
+            if depth < 8 { drawTree(child, to, to_stride, width, height, x + child.*.subX, y + child.*.subY, depth + 1) }
+        }
+        index += 1
+    }
+    if surface.*.belowCount >= surface.*.children.length { blend(surface, to, to_stride, width, height, x, y) }
+}
+
+// A window (its buffer's size) into the buffer: cleared to transparent,
+// then the window's surfaces over it.
+fn copyWindow(surface: *Surface, target: [*]u8, stride: usize, width: i32, height: i32) -> void {
+    var to: [*]u32 = undefined
+    unsafe { to = @ptrCast([*]u32, target) }
+    const to_stride = stride / 4
+    var row: usize = 0
+    while row < @intCast(usize, height) {
+        var column: usize = 0
+        while column < @intCast(usize, width) {
+            to[row * to_stride + column] = 0
+            column += 1
+        }
+        row += 1
+    }
+    drawTree(surface, to, to_stride, width, height, 0, 0, 0)
+}
+
+// ---------------------------------------------------------------------------
+// When there is something new
+
+// A frame was presented (windows.frameDone): output sessions take what
+// changed, and frames waiting for news are copied.
+pub fn framePresented(compositor: *Compositor) -> void {
+    // (Field by field: see scene.takeDamage.)
+    const changed = ui.rect(compositor.*.presentedDamage.x, compositor.*.presentedDamage.y, compositor.*.presentedDamage.width, compositor.*.presentedDamage.height)
+    compositor.*.presentedDamage = ui.rect(0, 0, 0, 0)
+    if compositor.*.captureSessions.length == 0 { return }
+    var index: usize = 0
+    while index < compositor.*.captureSessions.length {
+        const session = sessionAt(state.listAt(compositor.*.captureSessions, index))
+        if !session.*.toplevel && !session.*.stopped { session.*.damage = scene.unionRect(session.*.damage, changed) }
+        index += 1
+    }
+    fulfilWaiting(compositor)
+}
+
+// A surface committed new content: frames of windows waiting for news
+// are copied (a window that is hidden is not presented).
+pub fn contentCommitted(compositor: *Compositor) -> void {
+    if compositor.*.captureFrames.length == 0 { return }
+    fulfilWaiting(compositor)
+}
+
+fn fulfilWaiting(compositor: *Compositor) -> void {
+    var index: usize = 0
+    while index < compositor.*.captureFrames.length {
+        const frame = frameAt(state.listAt(compositor.*.captureFrames, index))
+        if frame.*.capturing && !frame.*.finished { fulfil(frame) }
+        index += 1
+    }
+}
+
+// The globals.
+pub fn createGlobals(compositor: *Compositor) -> bool {
+    var memory: [*]u8 = undefined
+    unsafe { memory = @ptrCast([*]u8, compositor) }
+    const context = state.contextOf(memory)
+    const server = compositor.*.server
+    if server.createGlobal(wl.Interface.ext_foreign_toplevel_list_v1, 1, bindToplevelList, context) == 0 { return false }
+    if server.createGlobal(wl.Interface.ext_output_image_capture_source_manager_v1, 1, bindOutputSourceManager, context) == 0 { return false }
+    if server.createGlobal(wl.Interface.ext_foreign_toplevel_image_capture_source_manager_v1, 1, bindToplevelSourceManager, context) == 0 { return false }
+    return server.createGlobal(wl.Interface.ext_image_copy_capture_manager_v1, 1, bindCaptureManager, context) != 0
+}
+
+// ---------------------------------------------------------------------------
+// The handlers this file registers with the Wayland server, by name: when
+// the shell is loaded again (modules.mlx), each resource's handler is
+// replaced by the new code's function of the same name. Every function
+// passed to setHandler, setDestroyHandler, createGlobal or a client
+// handler here must be listed (tools/check_compositor_modules.py checks;
+// --fix rewrites this table).
+
+pub const HANDLER_COUNT: usize = 18
+
+pub fn handlerAddress(index: usize) -> usize {
+    if index == 0 { return @intFromPtr(bindCaptureManager) }
+    if index == 1 { return @intFromPtr(bindOutputSourceManager) }
+    if index == 2 { return @intFromPtr(bindToplevelList) }
+    if index == 3 { return @intFromPtr(bindToplevelSourceManager) }
+    if index == 4 { return @intFromPtr(onCaptureManager) }
+    if index == 5 { return @intFromPtr(onCursorSession) }
+    if index == 6 { return @intFromPtr(onExtHandle) }
+    if index == 7 { return @intFromPtr(onExtHandleDestroyed) }
+    if index == 8 { return @intFromPtr(onFrame) }
+    if index == 9 { return @intFromPtr(onFrameDestroyed) }
+    if index == 10 { return @intFromPtr(onOutputSourceManager) }
+    if index == 11 { return @intFromPtr(onSession) }
+    if index == 12 { return @intFromPtr(onSessionDestroyed) }
+    if index == 13 { return @intFromPtr(onSource) }
+    if index == 14 { return @intFromPtr(onSourceDestroyed) }
+    if index == 15 { return @intFromPtr(onToplevelList) }
+    if index == 16 { return @intFromPtr(onToplevelListDestroyed) }
+    if index == 17 { return @intFromPtr(onToplevelSourceManager) }
+    return 0
+}
+
+pub fn handlerName(index: usize) -> []const u8 {
+    if index == 0 { return "capture.bindCaptureManager" }
+    if index == 1 { return "capture.bindOutputSourceManager" }
+    if index == 2 { return "capture.bindToplevelList" }
+    if index == 3 { return "capture.bindToplevelSourceManager" }
+    if index == 4 { return "capture.onCaptureManager" }
+    if index == 5 { return "capture.onCursorSession" }
+    if index == 6 { return "capture.onExtHandle" }
+    if index == 7 { return "capture.onExtHandleDestroyed" }
+    if index == 8 { return "capture.onFrame" }
+    if index == 9 { return "capture.onFrameDestroyed" }
+    if index == 10 { return "capture.onOutputSourceManager" }
+    if index == 11 { return "capture.onSession" }
+    if index == 12 { return "capture.onSessionDestroyed" }
+    if index == 13 { return "capture.onSource" }
+    if index == 14 { return "capture.onSourceDestroyed" }
+    if index == 15 { return "capture.onToplevelList" }
+    if index == 16 { return "capture.onToplevelListDestroyed" }
+    if index == 17 { return "capture.onToplevelSourceManager" }
+    return ""
+}

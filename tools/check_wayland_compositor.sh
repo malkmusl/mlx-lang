@@ -35,6 +35,9 @@
 #  11. mlx-settings records hotkeys: while it records, the compositor
 #      passes every key to it (keyboard-shortcuts-inhibit), Super+Up too;
 #      Backspace unbinds one; the compositor takes the new keys at once.
+#  12. mlx-screenshot captures the screen and a window
+#      (ext-image-copy-capture-v1): the PNGs agree, and a later frame
+#      waits for damage.
 #
 # Typed commands create marker files, so keyboard delivery is verified at the
 # shell; the moved window's focus frame is checked in the host's screenshot.
@@ -430,6 +433,88 @@ done
 grep -q "^minimize: Settings" "$work/hotkeys-compositor.log" || { echo "the recorded Super+Up did not minimize" >&2; cat "$work/hotkeys-compositor.log" >&2; exit 1; }
 rm -f "$conf"
 echo "ok   mlx-settings records hotkeys (the compositor's too) and the compositor uses them at once"
+
+# Scenario 12: screen and window capture (ext-image-copy-capture-v1 with
+# ext-image-capture-source-v1 and ext-foreign-toplevel-list-v1), with
+# projects/desktop/screenshot: the window list names mlx-settings; the
+# screen and the window are saved as PNGs whose pixels agree (the window's
+# content at (24, 24) on the screen); a second frame of the screen waits
+# until something changes (the pointer moves) and carries only that as
+# damage.
+"$compiler" --quiet projects/desktop/screenshot/main.mlx -o "$work/mlx-screenshot"
+cat > "$work/capture.sh" <<SCRIPT
+#!/bin/sh
+sleep 2
+"$work/mlx-screenshot" --list > "$work/capture-list.log" 2>&1
+"$work/mlx-screenshot" "$work/capture-screen.png" > "$work/capture.log" 2>&1
+"$work/mlx-screenshot" --window org.mlx.settings "$work/capture-window.png" >> "$work/capture.log" 2>&1
+# (A client leaving redraws everything: that frame first.)
+sleep 1
+"$work/mlx-screenshot" --frames 2 "$work/capture-frames.png" >> "$work/capture.log" 2>&1
+SCRIPT
+chmod +x "$work/capture.sh"
+cat > "$work/capture.script" <<SCRIPT
+wait 5500
+pointer 600 600
+wait 200
+pointer 620 610
+wait 200
+pointer 640 620
+wait 200
+pointer 660 630
+wait 1500
+close
+SCRIPT
+run_scenario capture "$work/capture.script" --no-fps --run "$work/mlx-settings" --run "$work/capture.sh"
+grep -q "org.mlx.settings  Settings" "$work/capture-list.log" || { echo "the window list does not name mlx-settings" >&2; cat "$work/capture-list.log" "$work/capture-compositor.log" >&2; exit 1; }
+[[ $(grep -c "^saved " "$work/capture.log") -eq 3 ]] || { echo "mlx-screenshot did not save three captures" >&2; cat "$work/capture.log" "$work/capture-compositor.log" >&2; exit 1; }
+python3 - "$work" <<'PY'
+import struct, sys, zlib
+def load(path):
+    data = open(path, 'rb').read()
+    assert data[:8] == b'\x89PNG\r\n\x1a\n', path
+    at, idat = 8, b''
+    while at < len(data):
+        length, kind = struct.unpack('>I4s', data[at:at + 8])
+        body = data[at + 8:at + 8 + length]
+        assert zlib.crc32(kind + body) == struct.unpack('>I', data[at + 8 + length:at + 12 + length])[0], (path, kind)
+        if kind == b'IHDR':
+            width, height, depth, colour = struct.unpack('>IIBB', body[:10])
+        elif kind == b'IDAT':
+            idat += body
+        at += 12 + length
+    channels = 4 if colour == 6 else 3
+    raw, stride = zlib.decompress(idat), width * channels
+    rows, previous = [], bytearray(stride)
+    for y in range(height):
+        kind, line = raw[y * (stride + 1)], bytearray(raw[y * (stride + 1) + 1:(y + 1) * (stride + 1)])
+        for i in range(stride):
+            left = line[i - channels] if i >= channels else 0
+            up, corner = previous[i], previous[i - channels] if i >= channels else 0
+            if kind == 1: line[i] = (line[i] + left) & 255
+            elif kind == 2: line[i] = (line[i] + up) & 255
+            elif kind == 3: line[i] = (line[i] + (left + up) // 2) & 255
+            elif kind == 4:
+                p = left + up - corner
+                pa, pb, pc = abs(p - left), abs(p - up), abs(p - corner)
+                line[i] = (line[i] + (left if pa <= pb and pa <= pc else up if pb <= pc else corner)) & 255
+        rows.append(bytes(line))
+        previous = line
+    return width, height, channels, rows
+work = sys.argv[1]
+sw, sh, sc, screen = load(work + '/capture-screen.png')
+ww, wh, wc, window = load(work + '/capture-window.png')
+assert sc == 3 and wc == 4, (sc, wc)
+assert ww < sw and wh < sh, (sw, sh, ww, wh)
+# Opaque content of the window, where the screen shows it.
+for x, y in ((ww - 60, wh - 60), (ww // 2, wh // 2)):
+    on_window = window[y][x * 4:x * 4 + 3]
+    on_screen = screen[24 + y][(24 + x) * 3:(24 + x) * 3 + 3]
+    assert window[y][x * 4 + 3] == 255 and on_window == on_screen, (x, y, on_window, on_screen)
+PY
+damage=$(grep "^frame 2: damage" "$work/capture.log" | sed 's/.* damage //')
+[[ -n "$damage" && "$damage" != "0,0 "* ]] || { echo "the second frame did not wait for a change, or carried full damage ($damage)" >&2; cat "$work/capture.log" >&2; exit 1; }
+echo "ok   screen and window capture (ext-image-copy-capture): PNGs agree, later frames wait for damage"
 
 # Scenario 10: a GTK 3 window (libgtk-3 through ctypes: no GTK 3 program
 # is needed). GTK 3 knows only KDE's server decoration, not xdg-decoration.

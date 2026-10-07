@@ -643,7 +643,7 @@ on`): the buffers its windows show are copied and the CPU carries on.
 
 The shell (the Wayland protocol and window management: `shell.mlx` with
 its parts `protocols.mlx`, `windows.mlx` and `launching.mlx`, `data.mlx`,
-`dmabuf.mlx`, `pointer.mlx`, with `scene.mlx`'s bookkeeping) and the renderer
+`dmabuf.mlx`, `pointer.mlx`, `capture.mlx`, with `scene.mlx`'s bookkeeping) and the renderer
 (`scene.mlx`'s drawing and `vulkan.mlx`) can be built as shared objects,
 `libmlx-shell.so` and `libmlx-render.so`, which the compositor loads at
 start-up and loads again whenever they change, without a restart:
@@ -669,7 +669,7 @@ devices and the session, and calls the shell and the renderer through a
 table (`entries.mlx`) that a load replaces. Every handler the shell
 registered with the Wayland server is replaced by the new build's function
 of the same name (each of `shell.mlx`, `protocols.mlx`, `data.mlx`,
-`dmabuf.mlx` and `pointer.mlx` lists its handlers at its end, and
+`dmabuf.mlx`, `pointer.mlx` and `capture.mlx` lists its handlers at its end, and
 `shell_table.mlx` joins the lists; `tools/check_compositor_modules.py` checks the
 lists are complete), and a new renderer fills its fixed pixels (background,
 frame colours, cursors) again. A build whose shared records differ (a field
@@ -785,7 +785,10 @@ version 3, `ext_background_effect_manager_v1` version 1 (see Dock and
 launcher), `zxdg_decoration_manager_v1` version 2 (see Decorations),
 `org_kde_kwin_server_decoration_manager` version 1 (KDE's, for GTK 3),
 `zwp_relative_pointer_manager_v1` and `zwp_pointer_constraints_v1`
-version 1 (see Pointer lock).
+version 1 (see Pointer lock), `ext_foreign_toplevel_list_v1`,
+`ext_output_image_capture_source_manager_v1`,
+`ext_foreign_toplevel_image_capture_source_manager_v1` and
+`ext_image_copy_capture_manager_v1` version 1 (see Screen capture).
 Composition is done in software, or with Vulkan (`--renderer vulkan`).
 
 ### GPU clients (OpenGL, Vulkan)
@@ -884,6 +887,41 @@ with it Minecraft, refuses its relative mouse mode without both.
   region. Regions and hints apply at once, not on the next commit.
 
 `--verbose` logs `pointer: locked` and `pointer: unlocked`.
+
+## Screen capture
+
+Programs capture the screen or a single window through
+`ext-image-copy-capture-v1` ([`capture.mlx`](capture.mlx)): a source is
+the output (`ext-image-capture-source-v1`, any `wl_output`) or a window,
+named by its handle in `ext-foreign-toplevel-list-v1` (every window, with
+an identifier that is never reused). A capture session tells the client
+the buffer size and the formats (ARGB8888 and XRGB8888 shared memory; no
+dma-bufs yet). The first frame is copied at once with full damage; each
+later one waits until the source changed and carries only what changed
+as damage, so a recorder gets a frame per change, not per request.
+
+- The output's frames are the frames the compositor presents, pointer and
+  all (the `paint_cursors` option changes nothing).
+- A window's frames are its own pixels and its subsurfaces' (at its
+  buffer's size, translucent where it is), without the compositor's title
+  bar and frame or anything over it, also while it is minimized or covered.
+  When the window goes, the session stops.
+- A pointer cursor session never sees the pointer: its capture sessions
+  stop at once.
+
+The compositor maps client memory read-only; it copies a frame through a
+writable mapping of its own for the moment of the copy.
+
+[`projects/desktop/screenshot`](../screenshot/main.mlx) is a client of
+it, `mlx-screenshot` (installed with the session), which writes PNGs
+(`std.png.saveFile`):
+
+```sh
+mlx-screenshot screen.png                         # the screen
+mlx-screenshot --list                             # identifier, app id, title
+mlx-screenshot --window org.mlx.settings win.png  # a window by app id or title
+mlx-screenshot --frames 3 last.png                # three frames, each after a change
+```
 
 ## Copy and paste, drag and drop
 
