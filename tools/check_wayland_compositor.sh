@@ -368,15 +368,21 @@ assert white(100, 100) > 10 and white(200, 150) == 0, (white(100, 100), white(20
 PY
 echo "ok   a pointer lock holds the cursor and relative motion reaches the client"
 
-# Scenario 11: mlx-settings (its window at (24, 24), the hotkey rows 30
-# pixels apart from y 448). Maximize gets Super+Shift+M; minimize gets
+# Scenario 11: mlx-settings (its window at (24, 24); the categories in
+# its sidebar 40 pixels apart from y 66; on the Window management page the
+# hotkey rows 34 pixels apart from y 328, on the General page the
+# terminal's at y 178). Maximize gets Super+Shift+M; minimize gets
 # Super+Up (the maximize hotkey: it must reach the window); the terminal
 # hotkey is cleared; then Super+Up minimizes.
 "$compiler" --quiet projects/desktop/settings/main.mlx -o "$work/mlx-settings"
 rm -f "$XDG_CONFIG_HOME/mlx/compositor.conf"
 cat > "$work/hotkeys.script" <<SCRIPT
 wait 2500
-pointer 224 484
+pointer 124 148
+press 272
+release 272
+wait 300
+pointer 524 367
 press 272
 release 272
 wait 300
@@ -387,7 +393,7 @@ up 50
 up 42
 up 125
 wait 300
-pointer 224 514
+pointer 524 401
 press 272
 release 272
 wait 300
@@ -396,7 +402,11 @@ down 103
 up 103
 up 125
 wait 300
-pointer 224 604
+pointer 124 108
+press 272
+release 272
+wait 300
+pointer 524 217
 press 272
 release 272
 wait 300

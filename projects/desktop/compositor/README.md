@@ -493,13 +493,21 @@ client-decorations = off
 corner-radius = 12
 # Moved windows wobble (with the Vulkan renderer).
 wobbly-windows = on
+# The apps' language (de, en, or system: LC_ALL, LC_TIME, LANG); the
+# compositor leaves it to them.
+language = system
 ```
 
-[`projects/desktop/settings`](../settings/main.mlx) is a small window to
-change them: a row of colours for the border and switches for the title
-bars, the counter, rounded corners (12 pixels or square), wobbly windows
-and app decorations. It writes the file whole and renames it into place, so the
-compositor never reads half of it. The launcher lists it as Settings.
+[`projects/desktop/settings`](../settings/main.mlx) changes them, in a
+window with a sidebar of categories (std.ui.host, drawn at the screen's
+density): General (the dock hiding, the terminal's hotkey, where the file
+is), Window management (title bars, the counter, app decorations, wobbly
+windows, the window hotkeys), Appearance (colours for the focused and the
+other windows' borders, square, small, medium or large corners) and
+Language (German, English or the system's; the settings app follows at
+once, the other apps when they start). It writes the file whole and
+renames it into place, so the compositor never reads half of it. The
+launcher lists it as Settings.
 Without title bars, windows move with Alt+drag.
 
 ### Rounded corners
