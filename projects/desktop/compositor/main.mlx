@@ -50,6 +50,8 @@
 //     --terminal PROGRAM  what Alt+Enter runs (default: mlx-terminal next to
 //                         this program, else mlx-terminal from PATH)
 //     --run PROGRAM       start PROGRAM once the compositor is up (repeatable)
+//     --xwayland PROGRAM  the X server for X programs (default Xwayland from
+//                         PATH, rootless on a free display; `none`: no X)
 //     --screenshot FILE   write the last frame to FILE (PPM) on exit
 //     --timeout SECONDS   exit after SECONDS (for demos and tests)
 //     --no-fps            no frames-per-second counters in the title bars
@@ -76,6 +78,7 @@ const tt = @import("std.truetype")
 const ui = @import("std.ui")
 const scene = @import("./scene.mlx")
 const settings = @import("./settings.mlx")
+const xserver = @import("./xserver.mlx")
 
 // Where distributions keep DejaVu Sans and a few stand-ins; the first
 // that reads is the default --font.
@@ -305,6 +308,16 @@ fn initialize(compositor: *Compositor) -> void {
     compositor.*.topbarPid = -1
     compositor.*.topbarStartedAt = 0
     compositor.*.topbarFailures = 0
+    unsafe { compositor.*.xwayland = @ptrCast([*]const u8, "Xwayland") }
+    compositor.*.hasXwayland = true
+    compositor.*.xDisplay = -1
+    compositor.*.xListen[0] = -1
+    compositor.*.xListen[1] = -1
+    compositor.*.xwaylandPid = -1
+    compositor.*.xwaylandStartedAt = 0
+    compositor.*.xwaylandClient = 0
+    compositor.*.xwmChannel = -1
+    compositor.*.xwm = 0
     compositor.*.desktopFrames = 0
     compositor.*.presentMicros = 0
     compositor.*.renderMicros = 0
@@ -544,6 +557,8 @@ fn socketName(compositor: *Compositor) -> std.string.String {
 // compiler got the freestanding path's exit status wrong.)
 fn run(compositor: *Compositor, arguments: [][*]const u8) -> !void {
     defer reportStop(compositor)
+    // The X display's sockets and lock go with the compositor.
+    defer xserver.release(compositor)
     try serve(compositor, arguments)
 }
 
@@ -637,6 +652,12 @@ fn serve(compositor: *Compositor, arguments: [][*]const u8) -> !void {
             compositor.*.topbar = program.pointer
             compositor.*.hasTopbar = !equals(program, "none")
             topbar_set = true
+        } else if equals(argument, "--xwayland") && has_value {
+            // X programs: Xwayland (xwayland.mlx), or none.
+            index += 1
+            const program = std.process.argument(arguments, index)
+            compositor.*.xwayland = program.pointer
+            compositor.*.hasXwayland = !equals(program, "none")
         } else if equals(argument, "--modules") && has_value {
             index += 1
             modules_path = std.process.argument(arguments, index).pointer
@@ -659,7 +680,7 @@ fn serve(compositor: *Compositor, arguments: [][*]const u8) -> !void {
             compositor.*.width = width
             compositor.*.height = height
         } else {
-            const usage = std.io.eprintln("usage: mlx-compositor [--backend auto|nested|drm] [--socket NAME] [--size WxH] [--fullscreen] [--renderer auto|vulkan|cpu] [--font PATH|none] [--terminal PROGRAM] [--launcher PROGRAM|none] [--dock PROGRAM|none] [--topbar PROGRAM|none] [--modules DIR] [--run PROGRAM]... [--screenshot FILE] [--timeout SECONDS] [--no-fps] [--verbose]")
+            const usage = std.io.eprintln("usage: mlx-compositor [--backend auto|nested|drm] [--socket NAME] [--size WxH] [--fullscreen] [--renderer auto|vulkan|cpu] [--font PATH|none] [--terminal PROGRAM] [--launcher PROGRAM|none] [--dock PROGRAM|none] [--topbar PROGRAM|none] [--xwayland PROGRAM|none] [--modules DIR] [--run PROGRAM]... [--screenshot FILE] [--timeout SECONDS] [--no-fps] [--verbose]")
             return invalidArguments()
         }
         index += 1
@@ -676,6 +697,9 @@ fn serve(compositor: *Compositor, arguments: [][*]const u8) -> !void {
     if !dock_set { compositor.*.dock = defaultProgram(compositor, std.process.argument(arguments, 0), "mlx-dock") }
     if !topbar_set { compositor.*.topbar = defaultProgram(compositor, std.process.argument(arguments, 0), "mlx-topbar") }
     compositor.*.environment = childEnvironment(compositor, arguments)
+    // The X display, before any program starts (DISPLAY in their
+    // environment); Xwayland itself starts with the helpers.
+    const has_display = xserver.reserve(compositor)
     settings.init(compositor)
 
     compositor.*.stage = state.STAGE_SOCKET
@@ -765,10 +789,10 @@ fn serve(compositor: *Compositor, arguments: [][*]const u8) -> !void {
 
     compositor.*.stage = state.STAGE_RUNNING
     const display = compositor.*.host
-    var handles: [3]wl.Handle = undefined
+    var handles: [4]wl.Handle = undefined
     handles[0] = wl.Handle.fromDescriptor(display.descriptor())
     handles[1] = wl.Handle.fromDescriptor(server.descriptor())
-    var ready: [3]bool = [3]bool{ false, false, false }
+    var ready: [4]bool = [4]bool{ false, false, false, false }
     const deadline = std.time.milliseconds() + timeout
     arena.begin(compositor)
     while compositor.*.running && display.running() {
@@ -780,19 +804,26 @@ fn serve(compositor: *Compositor, arguments: [][*]const u8) -> !void {
         host.present(compositor)
         try display.flush()
         server.flushClients()
-        // The dock's channel too (it asks for the launcher on it).
+        // The dock's channel too (it asks for the launcher on it), and the
+        // X window manager's connection.
         var watched: usize = 2
         const dock = compositor.*.dockChannel
         if dock >= 0 {
-            handles[2] = wl.Handle.fromDescriptor(dock)
-            watched = 3
+            handles[watched] = wl.Handle.fromDescriptor(dock)
+            watched += 1
+        }
+        const xwm_channel = compositor.*.xwmChannel
+        if xwm_channel >= 0 {
+            handles[watched] = wl.Handle.fromDescriptor(xwm_channel)
+            watched += 1
         }
         ready[2] = false
+        ready[3] = false
         var waited: isize = 0
         unsafe { waited = wl.transport.waitAny(@ptrCast([*]const wl.Handle, &handles), watched, @ptrCast([*]bool, &ready), 1000) }
         if ready[0] { try display.dispatch() }
         if ready[1] { try server.dispatch(0) }
-        if watched == 3 && ready[2] { entries.helperMessages(compositor) }
+        if (watched > 2 && ready[2]) || (watched > 3 && ready[3]) { entries.helperMessages(compositor) }
     }
     arena.end(compositor)
     // The session compositor went away or rejected something.
@@ -824,13 +855,19 @@ fn runFreestanding(compositor: *Compositor, server: wl.server.Display, timeout: 
         drm.present(backend)
         server.flushClients()
         var count: usize = 0
-        unsafe { count = drm.handles(backend, @ptrCast([*]wl.Handle, &handles), 38) }
+        unsafe { count = drm.handles(backend, @ptrCast([*]wl.Handle, &handles), 37) }
         handles[count] = wl.Handle.fromDescriptor(server.descriptor())
-        // The dock's channel too (it asks for the launcher on it).
+        // The dock's channel too (it asks for the launcher on it), and the
+        // X window manager's connection.
         var watched = count + 1
         const dock = compositor.*.dockChannel
         if dock >= 0 {
             handles[watched] = wl.Handle.fromDescriptor(dock)
+            watched += 1
+        }
+        const xwm_channel = compositor.*.xwmChannel
+        if xwm_channel >= 0 {
+            handles[watched] = wl.Handle.fromDescriptor(xwm_channel)
             watched += 1
         }
         var index: usize = 0
@@ -842,7 +879,7 @@ fn runFreestanding(compositor: *Compositor, server: wl.server.Display, timeout: 
         var waited: isize = 0
         unsafe { waited = wl.transport.waitAny(@ptrCast([*]const wl.Handle, &handles), watched, @ptrCast([*]bool, &ready), wait) }
         if ready[count] { try server.dispatch(0) }
-        if watched > count + 1 && ready[count + 1] { entries.helperMessages(compositor) }
+        if (watched > count + 1 && ready[count + 1]) || (watched > count + 2 && ready[count + 2]) { entries.helperMessages(compositor) }
         drm.dispatch(backend)
         if compositor.*.vtRequest != 0 {
             drm.switchTo(backend, compositor.*.vtRequest)

@@ -38,6 +38,8 @@
 #  12. mlx-screenshot captures the screen and a window
 #      (ext-image-copy-capture-v1): the PNGs agree, and a later frame
 #      waits for damage.
+#  13. with Xwayland and xev: an X program's window shows, takes focus and
+#      gets keys (the compositor's own X window manager).
 #
 # Typed commands create marker files, so keyboard delivery is verified at the
 # shell; the moved window's focus frame is checked in the host's screenshot.
@@ -515,6 +517,37 @@ PY
 damage=$(grep "^frame 2: damage" "$work/capture.log" | sed 's/.* damage //')
 [[ -n "$damage" && "$damage" != "0,0 "* ]] || { echo "the second frame did not wait for a change, or carried full damage ($damage)" >&2; cat "$work/capture.log" >&2; exit 1; }
 echo "ok   screen and window capture (ext-image-copy-capture): PNGs agree, later frames wait for damage"
+
+# Scenario 13: X programs through Xwayland (if Xwayland and xev are
+# installed): xev's window is paired with its wl_surface by the window
+# manager (projects/desktop/compositor/xwm.mlx), mapped with its title,
+# focused by a click, and gets the keys typed (KeyPress for a, b, c).
+if command -v Xwayland > /dev/null && command -v xev > /dev/null; then
+    cat > "$work/x11.sh" <<SCRIPT
+#!/bin/sh
+exec xev -geometry 300x200 > "$work/xev.log" 2>&1
+SCRIPT
+    chmod +x "$work/x11.sh"
+    cat > "$work/x11.script" <<SCRIPT
+wait 3000
+pointer 150 150
+press 272
+release 272
+wait 300
+type abc
+wait 800
+close
+SCRIPT
+    run_scenario x11 "$work/x11.script" --no-fps --run "$work/x11.sh"
+    grep -q "^xwm: paired" "$work/x11-compositor.log" || { echo "the X window was not paired with its surface" >&2; cat "$work/x11-compositor.log" >&2; exit 1; }
+    grep -q "^map: Event Tester" "$work/x11-compositor.log" || { echo "xev's window was not mapped with its title" >&2; cat "$work/x11-compositor.log" >&2; exit 1; }
+    for key in a b c; do
+        grep -A2 "^KeyPress" "$work/xev.log" | grep -q "keysym 0x6[123], $key)" || { echo "xev did not get the key $key" >&2; cat "$work/xev.log" "$work/x11-compositor.log" >&2; exit 1; }
+    done
+    echo "ok   X programs run through Xwayland: xev's window is mapped, titled, focused and gets keys"
+else
+    echo "skip X programs (Xwayland or xev not installed)"
+fi
 
 # Scenario 10: a GTK 3 window (libgtk-3 through ctypes: no GTK 3 program
 # is needed). GTK 3 knows only KDE's server decoration, not xdg-decoration.

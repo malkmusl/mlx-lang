@@ -1,0 +1,603 @@
+// std.x11: the X11 wire protocol over a connected stream socket, without
+// libc or libxcb: the connection setup, the requests a window manager
+// sends, and the messages (replies, events, errors) it reads back. Nothing
+// here blocks on the server: requests are written as they are made (a
+// short write waits for the socket), and what arrives is read when the
+// socket is readable (fill) and taken one message at a time (take). A
+// request that has a reply returns its sequence number, which the reply
+// carries.
+//
+//     var connection: x11.Connection = undefined     (a record of the caller's)
+//     x11.begin(&connection, descriptor)             sends the setup request
+//     ... when the descriptor is readable:
+//     if !x11.fill(&connection) { ... gone }
+//     var message: x11.Message = undefined
+//     while x11.take(&connection, &message) { ... }  the first is the setup
+//
+// Values are little-endian (the setup asks for that byte order).
+const linux = @import("../bootstrap/os/linux.mlx")
+
+pub const INPUT_SIZE: usize = 65536
+
+pub const Connection = struct {
+    descriptor: usize
+    input: [65536]u8
+    inputLength: usize
+    // Where the next message starts in `input`.
+    inputStart: usize
+    // Requests sent (the low 16 bits are the sequence numbers messages carry).
+    sequence: u32
+    setupDone: bool
+    failed: bool
+    // From the setup: the first screen's root window, size and visual, and
+    // the resource ids this client may make.
+    root: u32
+    rootVisual: u32
+    width: u32
+    height: u32
+    idBase: u32
+    idMask: u32
+    nextId: u32
+}
+
+// Message kinds (Message.kind): an error, a reply, the setup's answer, or
+// an event (its code, without the sent-by-SendEvent bit).
+pub const KIND_ERROR: u8 = 0
+pub const KIND_REPLY: u8 = 1
+pub const KIND_SETUP: u8 = 255
+
+pub const Message = struct {
+    kind: u8
+    // An event sent with SendEvent.
+    synthetic: bool
+    sequence: u16
+    // The whole message (32 bytes, a reply's more), valid until the next
+    // fill.
+    data: [*]const u8
+    length: usize
+}
+
+// Event codes.
+pub const KEY_PRESS: u8 = 2
+pub const FOCUS_IN: u8 = 9
+pub const FOCUS_OUT: u8 = 10
+pub const CREATE_NOTIFY: u8 = 16
+pub const DESTROY_NOTIFY: u8 = 17
+pub const UNMAP_NOTIFY: u8 = 18
+pub const MAP_NOTIFY: u8 = 19
+pub const MAP_REQUEST: u8 = 20
+pub const REPARENT_NOTIFY: u8 = 21
+pub const CONFIGURE_NOTIFY: u8 = 22
+pub const CONFIGURE_REQUEST: u8 = 23
+pub const PROPERTY_NOTIFY: u8 = 28
+pub const CLIENT_MESSAGE: u8 = 33
+
+// Event masks.
+pub const MASK_STRUCTURE_NOTIFY: u32 = 131072
+pub const MASK_SUBSTRUCTURE_NOTIFY: u32 = 524288
+pub const MASK_SUBSTRUCTURE_REDIRECT: u32 = 1048576
+pub const MASK_FOCUS_CHANGE: u32 = 2097152
+pub const MASK_PROPERTY_CHANGE: u32 = 4194304
+
+// Window attribute and configuration value masks.
+pub const CW_EVENT_MASK: u32 = 2048
+pub const CW_OVERRIDE_REDIRECT: u32 = 512
+pub const CONFIG_X: u16 = 1
+pub const CONFIG_Y: u16 = 2
+pub const CONFIG_WIDTH: u16 = 4
+pub const CONFIG_HEIGHT: u16 = 8
+pub const CONFIG_BORDER: u16 = 16
+pub const CONFIG_SIBLING: u16 = 32
+pub const CONFIG_STACK_MODE: u16 = 64
+pub const STACK_ABOVE: u32 = 0
+
+// Predefined atoms.
+pub const ATOM_ANY: u32 = 0
+pub const ATOM_ATOM: u32 = 4
+pub const ATOM_CARDINAL: u32 = 6
+pub const ATOM_STRING: u32 = 31
+pub const ATOM_WINDOW: u32 = 33
+pub const ATOM_WM_HINTS: u32 = 35
+pub const ATOM_WM_NAME: u32 = 39
+pub const ATOM_WM_NORMAL_HINTS: u32 = 40
+pub const ATOM_WM_CLASS: u32 = 67
+pub const ATOM_WM_TRANSIENT_FOR: u32 = 68
+
+pub const PROPERTY_REPLACE: u8 = 0
+pub const INPUT_FOCUS_POINTER_ROOT: u32 = 1
+pub const NONE: u32 = 0
+
+const SYS_read: usize = 0
+const SYS_sendto: usize = 44
+const SYS_recvfrom: usize = 45
+const MSG_DONTWAIT: usize = 64
+const MSG_NOSIGNAL: usize = 16384
+const EAGAIN: isize = -11
+const EINTR: isize = -4
+
+// ---------------------------------------------------------------------------
+// Reading and writing
+
+fn put16(bytes: [*]u8, at: usize, value: u32) -> void {
+    bytes[at] = @intCast(u8, value & 255)
+    bytes[at + 1] = @intCast(u8, (value >> 8) & 255)
+}
+
+fn put32(bytes: [*]u8, at: usize, value: u32) -> void {
+    bytes[at] = @intCast(u8, value & 255)
+    bytes[at + 1] = @intCast(u8, (value >> 8) & 255)
+    bytes[at + 2] = @intCast(u8, (value >> 16) & 255)
+    bytes[at + 3] = @intCast(u8, value >> 24)
+}
+
+pub fn get16(bytes: [*]const u8, at: usize) -> u32 {
+    return @intCast(u32, bytes[at]) | (@intCast(u32, bytes[at + 1]) << 8)
+}
+
+pub fn get32(bytes: [*]const u8, at: usize) -> u32 {
+    return @intCast(u32, bytes[at]) | (@intCast(u32, bytes[at + 1]) << 8) | (@intCast(u32, bytes[at + 2]) << 16) | (@intCast(u32, bytes[at + 3]) << 24)
+}
+
+// A signed 16-bit value (coordinates).
+pub fn getInt16(bytes: [*]const u8, at: usize) -> i32 {
+    const value = get16(bytes, at)
+    return if value >= 32768 { @intCast(i32, value) - 65536 } else { @intCast(i32, value) }
+}
+
+// Writes all of `length` bytes (waiting while the socket is full); false
+// when the connection broke.
+fn send(connection: *Connection, bytes: [*]const u8, length: usize) -> bool {
+    if connection.*.failed { return false }
+    var sent: usize = 0
+    while sent < length {
+        const result = linux.syscall6(SYS_sendto, connection.*.descriptor, @intFromPtr(bytes) + sent, length - sent, MSG_NOSIGNAL, 0, 0)
+        if result == EINTR || result == EAGAIN { continue }
+        if result <= 0 {
+            connection.*.failed = true
+            return false
+        }
+        sent += @intCast(usize, result)
+    }
+    return true
+}
+
+// Sends a request of `length` bytes (a multiple of 4, its length field
+// filled in here); returns its sequence number.
+fn request(connection: *Connection, bytes: [*]u8, length: usize) -> u32 {
+    put16(bytes, 2, @intCast(u32, length / 4))
+    connection.*.sequence +%= 1
+    const ok = send(connection, bytes, length)
+    return connection.*.sequence & 65535
+}
+
+// Sends the setup request (no authorization: the window manager's
+// connection is one the server made for it).
+pub fn begin(connection: *Connection, descriptor: usize) -> void {
+    connection.*.descriptor = descriptor
+    connection.*.inputLength = 0
+    connection.*.inputStart = 0
+    connection.*.sequence = 0
+    connection.*.setupDone = false
+    connection.*.failed = false
+    connection.*.root = 0
+    connection.*.nextId = 0
+    var bytes: [12]u8 = [12]u8{ 108, 0, 11, 0, 0, 0, 0, 0, 0, 0, 0, 0 }
+    unsafe { const ok = send(connection, @ptrCast([*]const u8, &bytes), 12) }
+}
+
+// Reads what the server sent (as much as there is, without waiting);
+// false when the connection ended.
+pub fn fill(connection: *Connection) -> bool {
+    if connection.*.failed { return false }
+    // What was taken goes; the rest moves to the front.
+    if connection.*.inputStart > 0 {
+        var index: usize = 0
+        while connection.*.inputStart + index < connection.*.inputLength {
+            connection.*.input[index] = connection.*.input[connection.*.inputStart + index]
+            index += 1
+        }
+        connection.*.inputLength -= connection.*.inputStart
+        connection.*.inputStart = 0
+    }
+    while connection.*.inputLength < INPUT_SIZE {
+        var target: usize = 0
+        unsafe { target = @intFromPtr(&connection.*.input) + connection.*.inputLength }
+        const result = linux.syscall6(SYS_recvfrom, connection.*.descriptor, target, INPUT_SIZE - connection.*.inputLength, MSG_DONTWAIT, 0, 0)
+        if result == EINTR { continue }
+        if result == EAGAIN { return true }
+        if result <= 0 {
+            connection.*.failed = true
+            return false
+        }
+        connection.*.inputLength += @intCast(usize, result)
+    }
+    return true
+}
+
+fn inputAt(connection: *Connection, at: usize) -> [*]const u8 {
+    var bytes: [*]const u8 = undefined
+    unsafe { bytes = @ptrFromInt([*]const u8, @intFromPtr(&connection.*.input) + at) }
+    return bytes
+}
+
+// The setup's answer: the first screen.
+fn readSetup(connection: *Connection, bytes: [*]const u8) -> void {
+    connection.*.idBase = get32(bytes, 12)
+    connection.*.idMask = get32(bytes, 16)
+    const vendor_length = get16(bytes, 24)
+    const formats = @intCast(usize, bytes[29])
+    const vendor_padded = (@intCast(usize, vendor_length) + 3) / 4 * 4
+    const screen = 40 + vendor_padded + formats * 8
+    connection.*.root = get32(bytes, screen)
+    connection.*.width = get16(bytes, screen + 20)
+    connection.*.height = get16(bytes, screen + 22)
+    connection.*.rootVisual = get32(bytes, screen + 32)
+    connection.*.setupDone = true
+}
+
+// The next complete message, if one is in; false when none is (fill when
+// the socket is readable).
+pub fn take(connection: *Connection, message: *Message) -> bool {
+    const start = connection.*.inputStart
+    const available = connection.*.inputLength - start
+    const bytes = inputAt(connection, start)
+    if !connection.*.setupDone {
+        if available < 8 { return false }
+        const length = 8 + @intCast(usize, get16(bytes, 6)) * 4
+        if available < length { return false }
+        if bytes[0] != 1 { connection.*.failed = true }
+        if bytes[0] == 1 { readSetup(connection, bytes) }
+        message.*.kind = KIND_SETUP
+        message.*.synthetic = false
+        message.*.sequence = 0
+        message.*.data = bytes
+        message.*.length = length
+        connection.*.inputStart += length
+        return true
+    }
+    if available < 32 { return false }
+    var length: usize = 32
+    if bytes[0] == 1 { length = 32 + @intCast(usize, get32(bytes, 4)) * 4 }
+    if available < length {
+        // A reply larger than the buffer could never complete.
+        if length > INPUT_SIZE { connection.*.failed = true }
+        return false
+    }
+    message.*.kind = bytes[0] & 127
+    message.*.synthetic = bytes[0] & 128 != 0
+    message.*.sequence = @intCast(u16, get16(bytes, 2))
+    message.*.data = bytes
+    message.*.length = length
+    connection.*.inputStart += length
+    return true
+}
+
+// A new resource id (windows).
+pub fn generateId(connection: *Connection) -> u32 {
+    const id = connection.*.idBase | (connection.*.nextId & connection.*.idMask)
+    connection.*.nextId += 1
+    return id
+}
+
+// ---------------------------------------------------------------------------
+// Requests
+
+// InternAtom: the reply's atom is at byte 8 (atomOf).
+pub fn internAtom(connection: *Connection, name: []const u8) -> u32 {
+    var bytes: [64]u8 = undefined
+    var pointer: [*]u8 = undefined
+    unsafe { pointer = @ptrCast([*]u8, &bytes) }
+    const count = if name.length < 56 { name.length } else { 56 }
+    bytes[0] = 16
+    bytes[1] = 0
+    put16(pointer, 4, @intCast(u32, count))
+    bytes[6] = 0
+    bytes[7] = 0
+    var index: usize = 0
+    while index < count {
+        bytes[8 + index] = name[index]
+        index += 1
+    }
+    var length = 8 + count
+    while length % 4 != 0 {
+        bytes[length] = 0
+        length += 1
+    }
+    return request(connection, pointer, length)
+}
+
+pub fn atomOf(reply: [*]const u8) -> u32 { return get32(reply, 8) }
+
+// QueryExtension: the reply says whether it is there (byte 8) and its
+// major opcode (byte 9).
+pub fn queryExtension(connection: *Connection, name: []const u8) -> u32 {
+    var bytes: [64]u8 = undefined
+    var pointer: [*]u8 = undefined
+    unsafe { pointer = @ptrCast([*]u8, &bytes) }
+    const count = if name.length < 56 { name.length } else { 56 }
+    bytes[0] = 98
+    bytes[1] = 0
+    put16(pointer, 4, @intCast(u32, count))
+    bytes[6] = 0
+    bytes[7] = 0
+    var index: usize = 0
+    while index < count {
+        bytes[8 + index] = name[index]
+        index += 1
+    }
+    var length = 8 + count
+    while length % 4 != 0 {
+        bytes[length] = 0
+        length += 1
+    }
+    return request(connection, pointer, length)
+}
+
+pub fn extensionPresent(reply: [*]const u8) -> bool { return reply[8] != 0 }
+pub fn extensionOpcode(reply: [*]const u8) -> u8 { return reply[9] }
+
+// Composite (its major opcode from QueryExtension): the client's version,
+// then the root's children redirected for the window manager (Manual):
+// rootless Xwayland gives each such window a wl_surface.
+pub fn compositeQueryVersion(connection: *Connection, opcode: u8) -> u32 {
+    var bytes: [12]u8 = undefined
+    var pointer: [*]u8 = undefined
+    unsafe { pointer = @ptrCast([*]u8, &bytes) }
+    bytes[0] = opcode
+    bytes[1] = 0
+    put32(pointer, 4, 0)
+    put32(pointer, 8, 4)
+    return request(connection, pointer, 12)
+}
+
+pub fn compositeRedirectSubwindows(connection: *Connection, opcode: u8, window: u32) -> void {
+    var bytes: [12]u8 = undefined
+    var pointer: [*]u8 = undefined
+    unsafe { pointer = @ptrCast([*]u8, &bytes) }
+    bytes[0] = opcode
+    bytes[1] = 2
+    put32(pointer, 4, window)
+    // Manual.
+    bytes[8] = 1
+    bytes[9] = 0
+    bytes[10] = 0
+    bytes[11] = 0
+    const sequence = request(connection, pointer, 12)
+}
+
+// CreateWindow: an input-only window (the window manager's own, for
+// _NET_SUPPORTING_WM_CHECK), 1x1 at -1,-1, not mapped.
+pub fn createInputWindow(connection: *Connection, window: u32, parent: u32) -> void {
+    var bytes: [32]u8 = undefined
+    var pointer: [*]u8 = undefined
+    unsafe { pointer = @ptrCast([*]u8, &bytes) }
+    bytes[0] = 1
+    bytes[1] = 0
+    put32(pointer, 4, window)
+    put32(pointer, 8, parent)
+    put16(pointer, 12, 65535)
+    put16(pointer, 14, 65535)
+    put16(pointer, 16, 1)
+    put16(pointer, 18, 1)
+    put16(pointer, 20, 0)
+    // InputOnly, CopyFromParent visual, override-redirect on.
+    put16(pointer, 22, 2)
+    put32(pointer, 24, 0)
+    put32(pointer, 28, CW_OVERRIDE_REDIRECT)
+    var with_value: [36]u8 = undefined
+    var target: [*]u8 = undefined
+    unsafe { target = @ptrCast([*]u8, &with_value) }
+    var index: usize = 0
+    while index < 32 {
+        with_value[index] = bytes[index]
+        index += 1
+    }
+    put32(target, 32, 1)
+    const sequence = request(connection, target, 36)
+}
+
+// ChangeWindowAttributes with the event mask.
+pub fn selectInput(connection: *Connection, window: u32, mask: u32) -> void {
+    var bytes: [16]u8 = undefined
+    var pointer: [*]u8 = undefined
+    unsafe { pointer = @ptrCast([*]u8, &bytes) }
+    bytes[0] = 2
+    bytes[1] = 0
+    put32(pointer, 4, window)
+    put32(pointer, 8, CW_EVENT_MASK)
+    put32(pointer, 12, mask)
+    const sequence = request(connection, pointer, 16)
+}
+
+pub fn mapWindow(connection: *Connection, window: u32) -> void {
+    var bytes: [8]u8 = undefined
+    var pointer: [*]u8 = undefined
+    unsafe { pointer = @ptrCast([*]u8, &bytes) }
+    bytes[0] = 8
+    bytes[1] = 0
+    put32(pointer, 4, window)
+    const sequence = request(connection, pointer, 8)
+}
+
+// ConfigureWindow: `values` in the order of the bits of `mask` (x, y,
+// width, height, border, sibling, stack mode).
+pub fn configureWindow(connection: *Connection, window: u32, mask: u16, values: [*]const u32, count: usize) -> void {
+    var bytes: [40]u8 = undefined
+    var pointer: [*]u8 = undefined
+    unsafe { pointer = @ptrCast([*]u8, &bytes) }
+    bytes[0] = 12
+    bytes[1] = 0
+    put32(pointer, 4, window)
+    put16(pointer, 8, @intCast(u32, mask))
+    put16(pointer, 10, 0)
+    var index: usize = 0
+    while index < count && index < 7 {
+        put32(pointer, 12 + index * 4, values[index])
+        index += 1
+    }
+    const sequence = request(connection, pointer, 12 + count * 4)
+}
+
+// ChangeProperty (replace) with `count` items of `format` bits (8, 16 or
+// 32) from `data`.
+pub fn changeProperty(connection: *Connection, window: u32, property: u32, kind: u32, format: u8, data: [*]const u8, count: usize) -> void {
+    const data_length = count * @intCast(usize, format / 8)
+    if data_length > 1000 { return }
+    var bytes: [1024]u8 = undefined
+    var pointer: [*]u8 = undefined
+    unsafe { pointer = @ptrCast([*]u8, &bytes) }
+    bytes[0] = 18
+    bytes[1] = PROPERTY_REPLACE
+    put32(pointer, 4, window)
+    put32(pointer, 8, property)
+    put32(pointer, 12, kind)
+    bytes[16] = format
+    bytes[17] = 0
+    bytes[18] = 0
+    bytes[19] = 0
+    put32(pointer, 20, @intCast(u32, count))
+    var index: usize = 0
+    while index < data_length {
+        bytes[24 + index] = data[index]
+        index += 1
+    }
+    var length = 24 + data_length
+    while length % 4 != 0 {
+        bytes[length] = 0
+        length += 1
+    }
+    const sequence = request(connection, pointer, length)
+}
+
+// A property of one 32-bit value (a window, an atom, a cardinal).
+pub fn changeProperty32(connection: *Connection, window: u32, property: u32, kind: u32, value: u32) -> void {
+    var data: [4]u8 = undefined
+    unsafe {
+        put32(@ptrCast([*]u8, &data), 0, value)
+        changeProperty(connection, window, property, kind, 32, @ptrCast([*]const u8, &data), 1)
+    }
+}
+
+// GetProperty (not deleting it), up to `longs` 32-bit units of it. The
+// reply: format at byte 1, type at 8, the item count at 16, the value from
+// byte 32 (propertyValue).
+pub fn getProperty(connection: *Connection, window: u32, property: u32, kind: u32, longs: u32) -> u32 {
+    var bytes: [24]u8 = undefined
+    var pointer: [*]u8 = undefined
+    unsafe { pointer = @ptrCast([*]u8, &bytes) }
+    bytes[0] = 20
+    bytes[1] = 0
+    put32(pointer, 4, window)
+    put32(pointer, 8, property)
+    put32(pointer, 12, kind)
+    put32(pointer, 16, 0)
+    put32(pointer, 20, longs)
+    return request(connection, pointer, 24)
+}
+
+// The value of a GetProperty reply in bytes (format / 8 per item).
+pub fn propertyFormat(reply: [*]const u8) -> u8 { return reply[1] }
+pub fn propertyType(reply: [*]const u8) -> u32 { return get32(reply, 8) }
+
+pub fn propertyBytes(reply: [*]const u8) -> usize {
+    return @intCast(usize, get32(reply, 16)) * @intCast(usize, reply[1] / 8)
+}
+
+pub fn propertyValue(reply: [*]const u8) -> [*]const u8 {
+    var bytes: [*]const u8 = undefined
+    unsafe { bytes = @ptrFromInt([*]const u8, @intFromPtr(reply) + 32) }
+    return bytes
+}
+
+// SendEvent of a 32-byte event to `destination` with `mask` (0: its
+// owner only).
+pub fn sendEvent(connection: *Connection, destination: u32, mask: u32, event: [*]const u8) -> void {
+    var bytes: [44]u8 = undefined
+    var pointer: [*]u8 = undefined
+    unsafe { pointer = @ptrCast([*]u8, &bytes) }
+    bytes[0] = 25
+    bytes[1] = 0
+    put32(pointer, 4, destination)
+    put32(pointer, 8, mask)
+    var index: usize = 0
+    while index < 32 {
+        bytes[12 + index] = event[index]
+        index += 1
+    }
+    const sequence = request(connection, pointer, 44)
+}
+
+// A ClientMessage of 32-bit data to `window`.
+pub fn sendClientMessage(connection: *Connection, window: u32, kind: u32, first: u32, second: u32, third: u32) -> void {
+    var event: [32]u8 = undefined
+    var pointer: [*]u8 = undefined
+    unsafe { pointer = @ptrCast([*]u8, &event) }
+    var index: usize = 0
+    while index < 32 {
+        event[index] = 0
+        index += 1
+    }
+    event[0] = CLIENT_MESSAGE
+    event[1] = 32
+    put32(pointer, 4, window)
+    put32(pointer, 8, kind)
+    put32(pointer, 12, first)
+    put32(pointer, 16, second)
+    put32(pointer, 20, third)
+    sendEvent(connection, window, 0, pointer)
+}
+
+// A synthetic ConfigureNotify telling `window` where it is (ICCCM: when a
+// ConfigureRequest changed nothing).
+pub fn sendConfigureNotify(connection: *Connection, window: u32, x: i32, y: i32, width: u32, height: u32) -> void {
+    var event: [32]u8 = undefined
+    var pointer: [*]u8 = undefined
+    unsafe { pointer = @ptrCast([*]u8, &event) }
+    var index: usize = 0
+    while index < 32 {
+        event[index] = 0
+        index += 1
+    }
+    event[0] = CONFIGURE_NOTIFY
+    put32(pointer, 4, window)
+    put32(pointer, 8, window)
+    put16(pointer, 16, @bitCast(u32, x) & 65535)
+    put16(pointer, 18, @bitCast(u32, y) & 65535)
+    put16(pointer, 20, width)
+    put16(pointer, 22, height)
+    sendEvent(connection, window, MASK_STRUCTURE_NOTIFY, pointer)
+}
+
+// SetSelectionOwner (window managers own WM_S<screen>).
+pub fn setSelectionOwner(connection: *Connection, owner: u32, selection: u32) -> void {
+    var bytes: [16]u8 = undefined
+    var pointer: [*]u8 = undefined
+    unsafe { pointer = @ptrCast([*]u8, &bytes) }
+    bytes[0] = 22
+    bytes[1] = 0
+    put32(pointer, 4, owner)
+    put32(pointer, 8, selection)
+    put32(pointer, 12, 0)
+    const sequence = request(connection, pointer, 16)
+}
+
+pub fn setInputFocus(connection: *Connection, window: u32, revert: u32) -> void {
+    var bytes: [12]u8 = undefined
+    var pointer: [*]u8 = undefined
+    unsafe { pointer = @ptrCast([*]u8, &bytes) }
+    bytes[0] = 42
+    bytes[1] = @intCast(u8, revert)
+    put32(pointer, 4, window)
+    put32(pointer, 8, 0)
+    const sequence = request(connection, pointer, 12)
+}
+
+pub fn killClient(connection: *Connection, resource: u32) -> void {
+    var bytes: [8]u8 = undefined
+    var pointer: [*]u8 = undefined
+    unsafe { pointer = @ptrCast([*]u8, &bytes) }
+    bytes[0] = 113
+    bytes[1] = 0
+    put32(pointer, 4, resource)
+    const sequence = request(connection, pointer, 8)
+}

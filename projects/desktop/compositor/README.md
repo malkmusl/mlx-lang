@@ -82,7 +82,8 @@ window at the monitor's resolution), `--renderer auto|vulkan|cpu` (default
 `auto`: Vulkan when a driver works, else the CPU), `--font PATH|none`,
 `--terminal PROGRAM`, `--launcher PROGRAM|none` (what Super starts),
 `--dock PROGRAM|none` (the dock, kept running), `--topbar PROGRAM|none`
-(the top bar, kept running), `--run PROGRAM`
+(the top bar, kept running), `--xwayland PROGRAM|none` (X programs, see
+X programs), `--run PROGRAM`
 (repeatable), `--screenshot FILE`, `--timeout SECONDS`, `--no-fps` (no
 frames-per-second counters in the title bars), `--verbose` (which also
 logs, once a second, `perf:` lines with the frame rate and how long a
@@ -643,7 +644,8 @@ on`): the buffers its windows show are copied and the CPU carries on.
 
 The shell (the Wayland protocol and window management: `shell.mlx` with
 its parts `protocols.mlx`, `windows.mlx` and `launching.mlx`, `data.mlx`,
-`dmabuf.mlx`, `pointer.mlx`, `capture.mlx`, with `scene.mlx`'s bookkeeping) and the renderer
+`dmabuf.mlx`, `pointer.mlx`, `capture.mlx`, `xwayland.mlx` and `xwm.mlx`,
+with `scene.mlx`'s bookkeeping) and the renderer
 (`scene.mlx`'s drawing and `vulkan.mlx`) can be built as shared objects,
 `libmlx-shell.so` and `libmlx-render.so`, which the compositor loads at
 start-up and loads again whenever they change, without a restart:
@@ -669,7 +671,7 @@ devices and the session, and calls the shell and the renderer through a
 table (`entries.mlx`) that a load replaces. Every handler the shell
 registered with the Wayland server is replaced by the new build's function
 of the same name (each of `shell.mlx`, `protocols.mlx`, `data.mlx`,
-`dmabuf.mlx`, `pointer.mlx` and `capture.mlx` lists its handlers at its end, and
+`dmabuf.mlx`, `pointer.mlx`, `capture.mlx` and `xwayland.mlx` lists its handlers at its end, and
 `shell_table.mlx` joins the lists; `tools/check_compositor_modules.py` checks the
 lists are complete), and a new renderer fills its fixed pixels (background,
 frame colours, cursors) again. A build whose shared records differ (a field
@@ -788,7 +790,8 @@ launcher), `zxdg_decoration_manager_v1` version 2 (see Decorations),
 version 1 (see Pointer lock), `ext_foreign_toplevel_list_v1`,
 `ext_output_image_capture_source_manager_v1`,
 `ext_foreign_toplevel_image_capture_source_manager_v1` and
-`ext_image_copy_capture_manager_v1` version 1 (see Screen capture).
+`ext_image_copy_capture_manager_v1` version 1 (see Screen capture),
+`xwayland_shell_v1` version 1 (to Xwayland alone; see X programs).
 Composition is done in software, or with Vulkan (`--renderer vulkan`).
 
 ### GPU clients (OpenGL, Vulkan)
@@ -922,6 +925,59 @@ mlx-screenshot --list                             # identifier, app id, title
 mlx-screenshot --window org.mlx.settings win.png  # a window by app id or title
 mlx-screenshot --frames 3 last.png                # three frames, each after a change
 ```
+
+## X programs (Xwayland)
+
+X11 programs run as windows of the compositor through Xwayland, rootless,
+with a window manager of the compositor's own written in Mlx
+([`xwm.mlx`](xwm.mlx) on [`std.x11`](../../../std/src/x11.mlx), the X11
+wire protocol without libc or libxcb):
+
+- At start ([`xserver.mlx`](xserver.mlx)) the compositor takes a free X
+  display (its `/tmp/.X<n>-lock` and both listening sockets,
+  `/tmp/.X11-unix/X<n>` and the abstract one) and gives every program
+  `DISPLAY=:<n>`. X programs started with it connect at once; they wait in
+  the sockets' backlog until Xwayland takes them.
+- It starts Xwayland ([`xwayland.mlx`](xwayland.mlx)) on those sockets
+  (`-listenfd`), as a Wayland client of its own (`WAYLAND_SOCKET`), with a
+  connection for the window manager (`-wm`). Without a GPU named in
+  linux-dmabuf's feedback (the CPU renderer, lavapipe) it adds `-shm`:
+  Xwayland's glamor needs one.
+- The window manager redirects the root's children (Composite), so each
+  top-level X window gets a wl_surface, and owns `WM_S0` (only then does
+  Xwayland take X clients). `xwayland_shell_v1`, offered to Xwayland alone,
+  names each surface's serial; the window's `WL_SURFACE_SERIAL` message
+  names the same, and the two are paired (or `WL_SURFACE_ID`, from an
+  older Xwayland).
+- A paired window that X maps becomes a window like any other: placed,
+  framed and titled by the compositor unless `_MOTIF_WM_HINTS` asks for no
+  decorations (GTK and most toolkits that draw their own), focused
+  (`SetInputFocus`, `WM_TAKE_FOCUS`, `_NET_ACTIVE_WINDOW`), in the dock and
+  the window lists with its title (`_NET_WM_NAME`, else `WM_NAME`) and app
+  id (`WM_CLASS`'s class), within its `WM_NORMAL_HINTS` limits. Moves and
+  resizes go to X (`ConfigureWindow`); a client's own `ConfigureRequest`
+  gets its size and keeps the compositor's position. Closing sends
+  `WM_DELETE_WINDOW`, or ends a client that does not take it.
+  `_NET_WM_STATE` (fullscreen, maximized) and `_NET_WM_MOVERESIZE` (moving
+  and resizing from the client's own title bar) work as for Wayland
+  windows.
+- Override-redirect windows (menus, drop-downs, tooltips) show where X puts
+  them, above the windows, without a frame or the keyboard.
+
+`--xwayland PROGRAM` names another X server, `--xwayland none` runs none.
+The log (`--verbose`) says what happens:
+
+```
+xwayland: display :0
+launch: Xwayland (rootless, display :0)
+xwm: ready
+xwm: map 0x00600001
+xwm: paired 0x00600001
+map: Event Tester
+```
+
+Not yet: copy and paste and drag and drop between X and Wayland programs,
+X windows' own scale on HiDPI outputs.
 
 ## Copy and paste, drag and drop
 

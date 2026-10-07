@@ -167,6 +167,17 @@ by `tools/materialize_xkb_keysyms.py` from the X11 keysym headers in
 compiles keymaps from a small data tree (`tests/support/xkb/data`),
 follows keys through them and reads back what `std.xkb.write` gives.
 
+`std.x11` (`std/src/x11.mlx`) speaks the X11 wire protocol on a connected
+stream socket, without libc or libxcb: the connection setup, the requests
+a window manager sends (InternAtom, CreateWindow, ChangeWindowAttributes,
+MapWindow, ConfigureWindow, ChangeProperty, GetProperty, SendEvent,
+SetInputFocus, SetSelectionOwner, KillClient, QueryExtension and
+Composite's RedirectSubwindows) and the messages it reads back. It never
+waits for the server: `fill` reads what arrived, `take` hands out one
+complete message (the setup's answer, a reply, an error or an event) at a
+time, and requests with a reply return their sequence number. The
+compositor's X window manager (see [Wayland](wayland.md)) uses it.
+
 `std.png` (`std/src/png.mlx`) decodes PNG images into premultiplied ARGB
 words (`0xAARRGGBB`, the `wl_shm` and compositor convention), for icons
 and the like:

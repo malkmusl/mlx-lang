@@ -1,0 +1,925 @@
+// The X window manager (part of the shell): Xwayland's windows as the
+// compositor's. It speaks X11 (std.x11) on the connection Xwayland made
+// for it (-wm), never waiting for an answer: replies are handled when they
+// come, by their sequence numbers.
+//
+// - Every top-level X window is followed from its creation. One that asks
+//   to be mapped is mapped (WM_STATE Normal); once mapped and paired with
+//   its wl_surface (its WL_SURFACE_SERIAL, or WL_SURFACE_ID from an older
+//   Xwayland) it becomes a window of the compositor: placed, decorated
+//   (unless _MOTIF_WM_HINTS asks for none), focused, in the dock, with its
+//   title (_NET_WM_NAME, else WM_NAME) and app id (WM_CLASS's class).
+// - Override-redirect windows (menus, tooltips, drop-downs) are shown
+//   where X puts them, undecorated and unfocused (as popups without a
+//   parent).
+// - The compositor's moves and sizes go to X (ConfigureWindow); a client's
+//   ConfigureRequest gets its size and keeps the compositor's position.
+// - Focus: SetInputFocus (and WM_TAKE_FOCUS, _NET_ACTIVE_WINDOW). Closing
+//   sends WM_DELETE_WINDOW, or kills a client that does not take it.
+// - _NET_WM_STATE requests (fullscreen, maximized) and _NET_WM_MOVERESIZE
+//   (moving and resizing from the client's own title bar) work as for
+//   Wayland windows; WM_NORMAL_HINTS give the size limits.
+const std = @import("std")
+const wl = @import("std.wayland")
+const x11 = @import("std.x11")
+const state = @import("./state.mlx")
+const scene = @import("./scene.mlx")
+const shell = @import("./shell.mlx")
+const windows_module = @import("./windows.mlx")
+const protocols_module = @import("./protocols.mlx")
+
+const Compositor = state.Compositor
+const Surface = state.Surface
+
+// The atoms it uses (Xwm.atoms).
+const A_WL_SURFACE_ID: usize = 0
+const A_WL_SURFACE_SERIAL: usize = 1
+const A_WM_PROTOCOLS: usize = 2
+const A_WM_DELETE_WINDOW: usize = 3
+const A_WM_TAKE_FOCUS: usize = 4
+const A_WM_STATE: usize = 5
+const A_NET_WM_NAME: usize = 6
+const A_UTF8_STRING: usize = 7
+const A_NET_SUPPORTED: usize = 8
+const A_NET_SUPPORTING_WM_CHECK: usize = 9
+const A_NET_ACTIVE_WINDOW: usize = 10
+const A_NET_WM_STATE: usize = 11
+const A_NET_WM_STATE_FULLSCREEN: usize = 12
+const A_NET_WM_STATE_MAXIMIZED_VERT: usize = 13
+const A_NET_WM_STATE_MAXIMIZED_HORZ: usize = 14
+const A_NET_WM_MOVERESIZE: usize = 15
+const A_MOTIF_WM_HINTS: usize = 16
+const A_WM_S0: usize = 17
+const A_NET_WM_CM_S0: usize = 18
+const ATOMS: usize = 19
+
+fn atomName(index: usize) -> []const u8 {
+    if index == A_WL_SURFACE_ID { return "WL_SURFACE_ID" }
+    if index == A_WL_SURFACE_SERIAL { return "WL_SURFACE_SERIAL" }
+    if index == A_WM_PROTOCOLS { return "WM_PROTOCOLS" }
+    if index == A_WM_DELETE_WINDOW { return "WM_DELETE_WINDOW" }
+    if index == A_WM_TAKE_FOCUS { return "WM_TAKE_FOCUS" }
+    if index == A_WM_STATE { return "WM_STATE" }
+    if index == A_NET_WM_NAME { return "_NET_WM_NAME" }
+    if index == A_UTF8_STRING { return "UTF8_STRING" }
+    if index == A_NET_SUPPORTED { return "_NET_SUPPORTED" }
+    if index == A_NET_SUPPORTING_WM_CHECK { return "_NET_SUPPORTING_WM_CHECK" }
+    if index == A_NET_ACTIVE_WINDOW { return "_NET_ACTIVE_WINDOW" }
+    if index == A_NET_WM_STATE { return "_NET_WM_STATE" }
+    if index == A_NET_WM_STATE_FULLSCREEN { return "_NET_WM_STATE_FULLSCREEN" }
+    if index == A_NET_WM_STATE_MAXIMIZED_VERT { return "_NET_WM_STATE_MAXIMIZED_VERT" }
+    if index == A_NET_WM_STATE_MAXIMIZED_HORZ { return "_NET_WM_STATE_MAXIMIZED_HORZ" }
+    if index == A_NET_WM_MOVERESIZE { return "_NET_WM_MOVERESIZE" }
+    if index == A_WM_S0 { return "WM_S0" }
+    if index == A_NET_WM_CM_S0 { return "_NET_WM_CM_S0" }
+    return "_MOTIF_WM_HINTS"
+}
+
+// A property read that awaits its reply.
+const PENDING: usize = 64
+
+// One top-level X window.
+pub const XWindow = struct {
+    id: u32
+    override: bool
+    // Mapped on the X side; a window of the compositor (paired and mapped).
+    mapped: bool
+    managed: bool
+    // Its wl_surface (an address; 0 until paired), and what names it.
+    surface: usize
+    hasSerial: bool
+    serial: u64
+    surfaceId: u32
+    // Its geometry as X has it (x, y: the root's coordinates, the output's).
+    x: i32
+    y: i32
+    width: i32
+    height: i32
+    title: [64]u8
+    titleLength: usize
+    netTitle: bool
+    appId: [64]u8
+    appIdLength: usize
+    deleteWindow: bool
+    takeFocus: bool
+    undecorated: bool
+    minWidth: i32
+    minHeight: i32
+    maxWidth: i32
+    maxHeight: i32
+}
+
+pub const Xwm = struct {
+    compositor: *Compositor
+    atoms: [19]u32
+    atomSequence: u32
+    atomsLeft: usize
+    // Composite: its QueryExtension's sequence and its opcode (0: none).
+    compositeSequence: u32
+    composite: u8
+    ready: bool
+    wmWindow: u32
+    windows: state.Vector
+    pendingSequence: [64]u32
+    pendingWindow: [64]u32
+    pendingProperty: [64]u32
+    pendingNext: usize
+    focused: u32
+    connection: x11.Connection
+}
+
+fn xwmOf(compositor: *Compositor) -> *Xwm {
+    unsafe { return @ptrFromInt(*Xwm, compositor.*.xwm) }
+}
+
+fn windowAt(address: usize) -> *XWindow {
+    unsafe { return @ptrFromInt(*XWindow, address) }
+}
+
+fn connectionOf(xwm: *Xwm) -> *x11.Connection {
+    unsafe { return @ptrCast(*x11.Connection, &xwm.*.connection) }
+}
+
+fn find(xwm: *Xwm, id: u32) -> usize {
+    var index: usize = 0
+    while index < xwm.*.windows.length {
+        const address = state.listAt(xwm.*.windows, index)
+        if windowAt(address).*.id == id { return address }
+        index += 1
+    }
+    return 0
+}
+
+fn say(xwm: *Xwm, text: []const u8, window: u32) -> void {
+    if !xwm.*.compositor.*.verbose { return }
+    state.say("xwm: ")
+    state.say(text)
+    state.say(" 0x")
+    var digits: [8]u8 = undefined
+    var value = window
+    var index: usize = 8
+    while index > 0 {
+        index -= 1
+        const digit = @intCast(u8, value % 16)
+        digits[index] = if digit < 10 { 48 + digit } else { 87 + digit }
+        value = value / 16
+    }
+    unsafe { const shown = std.io.writeAllBytes(std.io.stdout(), @ptrCast([*]const u8, &digits), 8) }
+    state.say("\n")
+}
+
+// ---------------------------------------------------------------------------
+// Starting and stopping
+
+// Starts on Xwayland's window manager connection (its setup request goes
+// out now; the rest when the answer comes).
+pub fn start(compositor: *Compositor, descriptor: isize) -> void {
+    const memory = state.allocate(compositor, @sizeOf(Xwm))
+    var xwm: *Xwm = undefined
+    unsafe { xwm = @ptrCast(*Xwm, memory) }
+    xwm.*.compositor = compositor
+    xwm.*.atomsLeft = ATOMS
+    xwm.*.compositeSequence = 65536
+    xwm.*.composite = 0
+    xwm.*.ready = false
+    xwm.*.wmWindow = 0
+    xwm.*.windows = state.newList(compositor.*.allocator)
+    xwm.*.pendingNext = 0
+    xwm.*.focused = 0
+    var index: usize = 0
+    while index < PENDING {
+        xwm.*.pendingSequence[index] = 65536
+        index += 1
+    }
+    compositor.*.xwm = @intFromPtr(memory)
+    compositor.*.xwmChannel = descriptor
+    x11.begin(connectionOf(xwm), @bitCast(usize, descriptor))
+}
+
+// Xwayland went: its windows leave the compositor.
+pub fn stop(compositor: *Compositor) -> void {
+    if compositor.*.xwm == 0 { return }
+    const xwm = xwmOf(compositor)
+    var index: usize = 0
+    while index < xwm.*.windows.length {
+        const window = windowAt(state.listAt(xwm.*.windows, index))
+        unmanage(xwm, window)
+        if window.*.surface != 0 { state.surfaceAt(window.*.surface).*.xwindow = 0 }
+        unsafe { state.release(compositor, @ptrCast([*]u8, window), @sizeOf(XWindow)) }
+        index += 1
+    }
+    xwm.*.windows.deinit()
+    if compositor.*.xwmChannel >= 0 { const closed = std.linux.syscall1(shell.SYS_close, @bitCast(usize, compositor.*.xwmChannel)) }
+    compositor.*.xwmChannel = -1
+    unsafe { state.release(compositor, @ptrCast([*]u8, xwm), @sizeOf(Xwm)) }
+    compositor.*.xwm = 0
+}
+
+// The setup is in: the atoms are asked for, and the root's children
+// followed (SubstructureRedirect makes this the window manager).
+fn setupDone(xwm: *Xwm) -> void {
+    const connection = connectionOf(xwm)
+    if connection.*.failed {
+        state.say("xwm: Xwayland refused the window manager's connection\n")
+        return
+    }
+    // Composite first: its answer comes before the atoms'.
+    xwm.*.compositeSequence = x11.queryExtension(connection, "Composite")
+    var index: usize = 0
+    while index < ATOMS {
+        const sequence = x11.internAtom(connection, atomName(index))
+        if index == 0 { xwm.*.atomSequence = sequence }
+        index += 1
+    }
+    x11.selectInput(connection, connection.*.root, x11.MASK_SUBSTRUCTURE_REDIRECT | x11.MASK_SUBSTRUCTURE_NOTIFY | x11.MASK_PROPERTY_CHANGE)
+}
+
+// The atoms are in: the window manager says it is one (EWMH).
+fn atomsDone(xwm: *Xwm) -> void {
+    const connection = connectionOf(xwm)
+    const root = connection.*.root
+    xwm.*.wmWindow = x11.generateId(connection)
+    x11.createInputWindow(connection, xwm.*.wmWindow, root)
+    x11.changeProperty32(connection, xwm.*.wmWindow, xwm.*.atoms[A_NET_SUPPORTING_WM_CHECK], x11.ATOM_WINDOW, xwm.*.wmWindow)
+    x11.changeProperty32(connection, root, xwm.*.atoms[A_NET_SUPPORTING_WM_CHECK], x11.ATOM_WINDOW, xwm.*.wmWindow)
+    var name: [*]const u8 = undefined
+    unsafe { name = @ptrCast([*]const u8, "mlx-compositor") }
+    x11.changeProperty(connection, xwm.*.wmWindow, xwm.*.atoms[A_NET_WM_NAME], xwm.*.atoms[A_UTF8_STRING], 8, name, 14)
+    var supported: [6]u32 = undefined
+    supported[0] = xwm.*.atoms[A_NET_WM_STATE]
+    supported[1] = xwm.*.atoms[A_NET_WM_STATE_FULLSCREEN]
+    supported[2] = xwm.*.atoms[A_NET_WM_STATE_MAXIMIZED_VERT]
+    supported[3] = xwm.*.atoms[A_NET_WM_STATE_MAXIMIZED_HORZ]
+    supported[4] = xwm.*.atoms[A_NET_ACTIVE_WINDOW]
+    supported[5] = xwm.*.atoms[A_NET_WM_MOVERESIZE]
+    unsafe { x11.changeProperty(connection, root, xwm.*.atoms[A_NET_SUPPORTED], x11.ATOM_ATOM, 32, @ptrCast([*]const u8, &supported), 6) }
+    // Top-level windows redirected: rootless Xwayland shows those (each
+    // with a wl_surface).
+    if xwm.*.composite != 0 {
+        const version = x11.compositeQueryVersion(connection, xwm.*.composite)
+        x11.compositeRedirectSubwindows(connection, xwm.*.composite, root)
+    } else {
+        state.say("xwm: Xwayland has no Composite extension; X windows will not show\n")
+    }
+    // Owning WM_S0 says a window manager runs: only then does Xwayland
+    // take X clients on its sockets.
+    x11.setSelectionOwner(connection, xwm.*.wmWindow, xwm.*.atoms[A_WM_S0])
+    x11.setSelectionOwner(connection, xwm.*.wmWindow, xwm.*.atoms[A_NET_WM_CM_S0])
+    xwm.*.ready = true
+    if xwm.*.compositor.*.verbose { state.say("xwm: ready\n") }
+    // Windows that came first.
+    var index: usize = 0
+    while index < xwm.*.windows.length {
+        const window = windowAt(state.listAt(xwm.*.windows, index))
+        if !window.*.override {
+            askAll(xwm, window.*.id)
+            if window.*.mapped { setWmState(xwm, window.*.id, 1) }
+        }
+        index += 1
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Property reads
+
+fn ask(xwm: *Xwm, window: u32, property: u32, kind: u32, longs: u32) -> void {
+    const sequence = x11.getProperty(connectionOf(xwm), window, property, kind, longs)
+    const slot = xwm.*.pendingNext
+    xwm.*.pendingSequence[slot] = sequence
+    xwm.*.pendingWindow[slot] = window
+    xwm.*.pendingProperty[slot] = property
+    xwm.*.pendingNext = (slot + 1) % PENDING
+}
+
+// What a window has that the compositor shows or obeys.
+fn askAll(xwm: *Xwm, window: u32) -> void {
+    // (Windows made before the atoms were in are asked again then.)
+    if !xwm.*.ready { return }
+    ask(xwm, window, x11.ATOM_WM_NAME, x11.ATOM_ANY, 64)
+    ask(xwm, window, xwm.*.atoms[A_NET_WM_NAME], x11.ATOM_ANY, 64)
+    ask(xwm, window, x11.ATOM_WM_CLASS, x11.ATOM_ANY, 64)
+    ask(xwm, window, xwm.*.atoms[A_WM_PROTOCOLS], x11.ATOM_ATOM, 16)
+    ask(xwm, window, xwm.*.atoms[A_MOTIF_WM_HINTS], x11.ATOM_ANY, 5)
+    ask(xwm, window, x11.ATOM_WM_NORMAL_HINTS, x11.ATOM_ANY, 18)
+}
+
+fn copyText(target: [*]u8, source: [*]const u8, length: usize) -> usize {
+    var count: usize = 0
+    while count < length && count < 63 && source[count] != 0 {
+        target[count] = source[count]
+        count += 1
+    }
+    return count
+}
+
+// The window's title and app id on its surface (title bar, dock, lists).
+fn showNames(xwm: *Xwm, window: *XWindow) -> void {
+    if window.*.surface == 0 { return }
+    const surface = state.surfaceAt(window.*.surface)
+    var index: usize = 0
+    while index < window.*.titleLength {
+        surface.*.title[index] = window.*.title[index]
+        index += 1
+    }
+    surface.*.titleLength = window.*.titleLength
+    index = 0
+    while index < window.*.appIdLength {
+        surface.*.appId[index] = window.*.appId[index]
+        index += 1
+    }
+    surface.*.appIdLength = window.*.appIdLength
+    if surface.*.mapped {
+        protocols_module.toplevelChanged(surface)
+        scene.damageTitle(xwm.*.compositor, surface)
+    }
+}
+
+fn propertyReply(xwm: *Xwm, window: *XWindow, property: u32, reply: [*]const u8) -> void {
+    const length = x11.propertyBytes(reply)
+    const value = x11.propertyValue(reply)
+    const format = x11.propertyFormat(reply)
+    var title: [*]u8 = undefined
+    unsafe { title = @ptrCast([*]u8, &window.*.title) }
+    if property == x11.ATOM_WM_NAME {
+        // _NET_WM_NAME (UTF-8) wins over WM_NAME.
+        if window.*.netTitle || format != 8 { return }
+        window.*.titleLength = copyText(title, value, length)
+        showNames(xwm, window)
+    } else if property == xwm.*.atoms[A_NET_WM_NAME] {
+        if format != 8 || length == 0 { return }
+        window.*.netTitle = true
+        window.*.titleLength = copyText(title, value, length)
+        showNames(xwm, window)
+    } else if property == x11.ATOM_WM_CLASS {
+        // "instance\0class\0": the class.
+        if format != 8 { return }
+        var start: usize = 0
+        while start < length && value[start] != 0 { start += 1 }
+        start += 1
+        if start >= length { return }
+        var class: [*]const u8 = undefined
+        unsafe { class = @ptrFromInt([*]const u8, @intFromPtr(value) + start) }
+        var app_id: [*]u8 = undefined
+        unsafe { app_id = @ptrCast([*]u8, &window.*.appId) }
+        window.*.appIdLength = copyText(app_id, class, length - start)
+        showNames(xwm, window)
+    } else if property == xwm.*.atoms[A_WM_PROTOCOLS] {
+        if format != 32 { return }
+        window.*.deleteWindow = false
+        window.*.takeFocus = false
+        var index: usize = 0
+        while index + 4 <= length {
+            const atom = x11.get32(value, index)
+            if atom == xwm.*.atoms[A_WM_DELETE_WINDOW] { window.*.deleteWindow = true }
+            if atom == xwm.*.atoms[A_WM_TAKE_FOCUS] { window.*.takeFocus = true }
+            index += 4
+        }
+    } else if property == xwm.*.atoms[A_MOTIF_WM_HINTS] {
+        // flags, functions, decorations, ...: decorations 0 asks for none.
+        if format != 32 || length < 12 { return }
+        const flags = x11.get32(value, 0)
+        window.*.undecorated = flags & 2 != 0 && x11.get32(value, 8) == 0
+        if window.*.surface != 0 {
+            const surface = state.surfaceAt(window.*.surface)
+            if surface.*.undecorated != window.*.undecorated {
+                scene.damageSurface(xwm.*.compositor, surface)
+                surface.*.undecorated = window.*.undecorated
+                scene.damageSurface(xwm.*.compositor, surface)
+            }
+        }
+    } else if property == x11.ATOM_WM_NORMAL_HINTS {
+        // flags, (x, y, width, height), min, max, ...: PMinSize 16, PMaxSize 32.
+        if format != 32 || length < 36 { return }
+        const flags = x11.get32(value, 0)
+        if flags & 16 != 0 {
+            window.*.minWidth = @intCast(i32, x11.get32(value, 20) & 65535)
+            window.*.minHeight = @intCast(i32, x11.get32(value, 24) & 65535)
+        }
+        if flags & 32 != 0 {
+            window.*.maxWidth = @intCast(i32, x11.get32(value, 28) & 65535)
+            window.*.maxHeight = @intCast(i32, x11.get32(value, 32) & 65535)
+        }
+        limits(window)
+    }
+}
+
+fn limits(window: *XWindow) -> void {
+    if window.*.surface == 0 { return }
+    const surface = state.surfaceAt(window.*.surface)
+    surface.*.minWidth = window.*.minWidth
+    surface.*.minHeight = window.*.minHeight
+    surface.*.maxWidth = window.*.maxWidth
+    surface.*.maxHeight = window.*.maxHeight
+}
+
+// ---------------------------------------------------------------------------
+// Pairing windows with surfaces, and managing them
+
+fn isXwaylandSurface(compositor: *Compositor, surface: *Surface) -> bool {
+    return compositor.*.xwaylandClient != 0 && @intFromPtr(surface.*.resource.client.state) == compositor.*.xwaylandClient
+}
+
+fn pair(xwm: *Xwm, window: *XWindow) -> void {
+    if window.*.surface != 0 { return }
+    const compositor = xwm.*.compositor
+    var index: usize = 0
+    while index < compositor.*.surfaces.length {
+        const address = state.listAt(compositor.*.surfaces, index)
+        const surface = state.surfaceAt(address)
+        var found = false
+        if isXwaylandSurface(compositor, surface) && surface.*.xwindow == 0 {
+            if window.*.hasSerial && surface.*.hasXSerial && surface.*.xSerial == window.*.serial { found = true }
+            if !window.*.hasSerial && window.*.surfaceId != 0 && surface.*.resource.id == window.*.surfaceId { found = true }
+        }
+        if found {
+            window.*.surface = address
+            surface.*.xwindow = @intFromPtr(window)
+            surface.*.undecorated = window.*.undecorated
+            showNames(xwm, window)
+            limits(window)
+            say(xwm, "paired", window.*.id)
+            manage(xwm, window)
+            return
+        }
+        index += 1
+    }
+}
+
+// A surface got its serial (xwayland.mlx): its window, if known.
+pub fn serialSet(compositor: *Compositor, address: usize) -> void {
+    if compositor.*.xwm == 0 { return }
+    const xwm = xwmOf(compositor)
+    const surface = state.surfaceAt(address)
+    var index: usize = 0
+    while index < xwm.*.windows.length {
+        const window = windowAt(state.listAt(xwm.*.windows, index))
+        if window.*.surface == 0 && window.*.hasSerial && window.*.serial == surface.*.xSerial { pair(xwm, window) }
+        index += 1
+    }
+}
+
+// A mapped, paired window becomes the compositor's.
+fn manage(xwm: *Xwm, window: *XWindow) -> void {
+    if window.*.managed || !window.*.mapped || window.*.surface == 0 { return }
+    const surface = state.surfaceAt(window.*.surface)
+    window.*.managed = true
+    if window.*.override {
+        // Where X put it, above the windows, without a frame.
+        surface.*.role = state.ROLE_POPUP
+        surface.*.parent = 0
+        surface.*.undecorated = true
+        surface.*.x = window.*.x
+        surface.*.y = window.*.y
+    } else {
+        surface.*.role = state.ROLE_TOPLEVEL
+        surface.*.undecorated = window.*.undecorated
+    }
+    surface.*.configured = true
+    if surface.*.hasContent && !surface.*.mapped { windows_module.mapSurface(surface) }
+}
+
+fn unmanage(xwm: *Xwm, window: *XWindow) -> void {
+    if !window.*.managed { return }
+    window.*.managed = false
+    if window.*.surface == 0 { return }
+    const surface = state.surfaceAt(window.*.surface)
+    surface.*.configured = false
+    if surface.*.mapped { windows_module.unmap(surface) }
+    if xwm.*.focused == window.*.id { xwm.*.focused = 0 }
+}
+
+// A surface went: its window loses it.
+pub fn surfaceGone(compositor: *Compositor, address: usize) -> void {
+    if compositor.*.xwm == 0 { return }
+    const xwm = xwmOf(compositor)
+    var index: usize = 0
+    while index < xwm.*.windows.length {
+        const window = windowAt(state.listAt(xwm.*.windows, index))
+        if window.*.surface == address {
+            window.*.surface = 0
+            window.*.managed = false
+        }
+        index += 1
+    }
+}
+
+// ---------------------------------------------------------------------------
+// From the compositor to X
+
+fn windowOfSurface(surface: *Surface) -> *XWindow { return windowAt(surface.*.xwindow) }
+
+// The window's place and size as the compositor has them (its configure).
+pub fn configure(surface: *Surface) -> void {
+    const compositor = surface.*.compositor
+    if compositor.*.xwm == 0 || surface.*.xwindow == 0 { return }
+    const xwm = xwmOf(compositor)
+    const window = windowOfSurface(surface)
+    surface.*.configurePending = false
+    if window.*.override { return }
+    var values: [4]u32 = undefined
+    values[0] = @bitCast(u32, surface.*.x)
+    values[1] = @bitCast(u32, surface.*.y)
+    var mask: u16 = x11.CONFIG_X | x11.CONFIG_Y
+    var count: usize = 2
+    if surface.*.configuredWidth > 0 && surface.*.configuredHeight > 0 {
+        values[2] = @intCast(u32, surface.*.configuredWidth)
+        values[3] = @intCast(u32, surface.*.configuredHeight)
+        mask = mask | x11.CONFIG_WIDTH | x11.CONFIG_HEIGHT
+        count = 4
+        window.*.width = surface.*.configuredWidth
+        window.*.height = surface.*.configuredHeight
+    }
+    window.*.x = surface.*.x
+    window.*.y = surface.*.y
+    unsafe { x11.configureWindow(connectionOf(xwm), window.*.id, mask, @ptrCast([*]const u32, &values), count) }
+    // _NET_WM_STATE: fullscreen, maximized.
+    var states: [3]u32 = undefined
+    var held: usize = 0
+    if surface.*.fullscreen {
+        states[held] = xwm.*.atoms[A_NET_WM_STATE_FULLSCREEN]
+        held += 1
+    }
+    if surface.*.maximized {
+        states[held] = xwm.*.atoms[A_NET_WM_STATE_MAXIMIZED_VERT]
+        states[held + 1] = xwm.*.atoms[A_NET_WM_STATE_MAXIMIZED_HORZ]
+        held += 2
+    }
+    unsafe { x11.changeProperty(connectionOf(xwm), window.*.id, xwm.*.atoms[A_NET_WM_STATE], x11.ATOM_ATOM, 32, @ptrCast([*]const u8, &states), held) }
+}
+
+// Windows the compositor moved (placed, dragged) tell X where they are, so
+// the menus and dialogs X places for them land right (each frame).
+pub fn sync(compositor: *Compositor) -> void {
+    if compositor.*.xwm == 0 { return }
+    const xwm = xwmOf(compositor)
+    var index: usize = 0
+    while index < xwm.*.windows.length {
+        const window = windowAt(state.listAt(xwm.*.windows, index))
+        if window.*.managed && !window.*.override && window.*.surface != 0 {
+            const surface = state.surfaceAt(window.*.surface)
+            if surface.*.x != window.*.x || surface.*.y != window.*.y {
+                window.*.x = surface.*.x
+                window.*.y = surface.*.y
+                var values: [2]u32 = undefined
+                values[0] = @bitCast(u32, surface.*.x)
+                values[1] = @bitCast(u32, surface.*.y)
+                unsafe { x11.configureWindow(connectionOf(xwm), window.*.id, x11.CONFIG_X | x11.CONFIG_Y, @ptrCast([*]const u32, &values), 2) }
+            }
+        }
+        index += 1
+    }
+}
+
+// Keyboard focus moved to `surface` (0: away from X windows).
+pub fn focus(compositor: *Compositor, address: usize) -> void {
+    if compositor.*.xwm == 0 { return }
+    const xwm = xwmOf(compositor)
+    if !xwm.*.ready { return }
+    const connection = connectionOf(xwm)
+    var id: u32 = 0
+    if address != 0 && state.surfaceAt(address).*.xwindow != 0 {
+        const window = windowAt(state.surfaceAt(address).*.xwindow)
+        if !window.*.override { id = window.*.id }
+    }
+    if id == xwm.*.focused { return }
+    xwm.*.focused = id
+    if id == 0 {
+        x11.setInputFocus(connection, x11.INPUT_FOCUS_POINTER_ROOT, x11.INPUT_FOCUS_POINTER_ROOT)
+        x11.changeProperty32(connection, connection.*.root, xwm.*.atoms[A_NET_ACTIVE_WINDOW], x11.ATOM_WINDOW, 0)
+        return
+    }
+    const window = windowAt(state.surfaceAt(address).*.xwindow)
+    if window.*.takeFocus { x11.sendClientMessage(connection, id, xwm.*.atoms[A_WM_PROTOCOLS], xwm.*.atoms[A_WM_TAKE_FOCUS], 0, 0) }
+    x11.setInputFocus(connection, id, x11.INPUT_FOCUS_POINTER_ROOT)
+    x11.changeProperty32(connection, connection.*.root, xwm.*.atoms[A_NET_ACTIVE_WINDOW], x11.ATOM_WINDOW, id)
+    var above: [1]u32 = [1]u32{ x11.STACK_ABOVE }
+    unsafe { x11.configureWindow(connection, id, x11.CONFIG_STACK_MODE, @ptrCast([*]const u32, &above), 1) }
+}
+
+// Asks the window to close (WM_DELETE_WINDOW), or ends its client.
+pub fn close(surface: *Surface) -> void {
+    const compositor = surface.*.compositor
+    if compositor.*.xwm == 0 || surface.*.xwindow == 0 { return }
+    const xwm = xwmOf(compositor)
+    const window = windowOfSurface(surface)
+    if window.*.deleteWindow {
+        x11.sendClientMessage(connectionOf(xwm), window.*.id, xwm.*.atoms[A_WM_PROTOCOLS], xwm.*.atoms[A_WM_DELETE_WINDOW], 0, 0)
+    } else {
+        x11.killClient(connectionOf(xwm), window.*.id)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// From X
+
+fn created(xwm: *Xwm, event: [*]const u8) -> void {
+    const id = x11.get32(event, 8)
+    if x11.get32(event, 4) != connectionOf(xwm).*.root || id == xwm.*.wmWindow || find(xwm, id) != 0 { return }
+    const compositor = xwm.*.compositor
+    const memory = state.allocate(compositor, @sizeOf(XWindow))
+    var window: *XWindow = undefined
+    unsafe { window = @ptrCast(*XWindow, memory) }
+    window.*.id = id
+    window.*.override = event[22] != 0
+    window.*.mapped = false
+    window.*.managed = false
+    window.*.surface = 0
+    window.*.hasSerial = false
+    window.*.serial = 0
+    window.*.surfaceId = 0
+    window.*.x = x11.getInt16(event, 12)
+    window.*.y = x11.getInt16(event, 14)
+    window.*.width = @intCast(i32, x11.get16(event, 16))
+    window.*.height = @intCast(i32, x11.get16(event, 18))
+    window.*.titleLength = 0
+    window.*.netTitle = false
+    window.*.appIdLength = 0
+    window.*.deleteWindow = false
+    window.*.takeFocus = false
+    window.*.undecorated = false
+    window.*.minWidth = 0
+    window.*.minHeight = 0
+    window.*.maxWidth = 0
+    window.*.maxHeight = 0
+    xwm.*.windows = state.listAppend(xwm.*.windows, @intFromPtr(memory))
+    x11.selectInput(connectionOf(xwm), id, x11.MASK_PROPERTY_CHANGE | x11.MASK_FOCUS_CHANGE)
+    if !window.*.override { askAll(xwm, id) }
+}
+
+fn destroyed(xwm: *Xwm, id: u32) -> void {
+    const address = find(xwm, id)
+    if address == 0 { return }
+    const window = windowAt(address)
+    unmanage(xwm, window)
+    if window.*.surface != 0 { state.surfaceAt(window.*.surface).*.xwindow = 0 }
+    xwm.*.windows = state.listRemove(xwm.*.windows, address)
+    unsafe { state.release(xwm.*.compositor, @ptrCast([*]u8, window), @sizeOf(XWindow)) }
+}
+
+// WM_STATE: Normal (1) when mapped, Withdrawn (0) when not.
+fn setWmState(xwm: *Xwm, id: u32, value: u32) -> void {
+    if !xwm.*.ready { return }
+    var data: [2]u32 = [2]u32{ value, 0 }
+    unsafe { x11.changeProperty(connectionOf(xwm), id, xwm.*.atoms[A_WM_STATE], xwm.*.atoms[A_WM_STATE], 32, @ptrCast([*]const u8, &data), 2) }
+}
+
+fn mapRequested(xwm: *Xwm, id: u32) -> void {
+    if find(xwm, id) == 0 { return }
+    setWmState(xwm, id, 1)
+    x11.mapWindow(connectionOf(xwm), id)
+}
+
+fn mapped(xwm: *Xwm, event: [*]const u8) -> void {
+    const address = find(xwm, x11.get32(event, 8))
+    if address == 0 { return }
+    const window = windowAt(address)
+    window.*.mapped = true
+    window.*.override = event[12] != 0
+    say(xwm, if window.*.override { "map (override-redirect)" } else { "map" }, window.*.id)
+    pair(xwm, window)
+    manage(xwm, window)
+}
+
+fn unmapped(xwm: *Xwm, id: u32) -> void {
+    const address = find(xwm, id)
+    if address == 0 { return }
+    const window = windowAt(address)
+    window.*.mapped = false
+    unmanage(xwm, window)
+    if !window.*.override { setWmState(xwm, id, 0) }
+}
+
+// A client asks for a place and size: unmanaged windows get it; the
+// compositor's keep their place and get the size (unless maximized or
+// fullscreen), and hear where they are.
+fn configureRequested(xwm: *Xwm, event: [*]const u8) -> void {
+    const id = x11.get32(event, 8)
+    const address = find(xwm, id)
+    if address == 0 { return }
+    const window = windowAt(address)
+    const mask = x11.get16(event, 26)
+    const connection = connectionOf(xwm)
+    var values: [4]u32 = undefined
+    var count: usize = 0
+    var send_mask: u16 = 0
+    if !window.*.managed {
+        if mask & 1 != 0 {
+            window.*.x = x11.getInt16(event, 16)
+            values[count] = @bitCast(u32, window.*.x)
+            count += 1
+            send_mask = send_mask | x11.CONFIG_X
+        }
+        if mask & 2 != 0 {
+            window.*.y = x11.getInt16(event, 18)
+            values[count] = @bitCast(u32, window.*.y)
+            count += 1
+            send_mask = send_mask | x11.CONFIG_Y
+        }
+    }
+    var fixed = false
+    if window.*.surface != 0 {
+        const surface = state.surfaceAt(window.*.surface)
+        fixed = surface.*.maximized || surface.*.fullscreen
+    }
+    if !fixed {
+        if mask & 4 != 0 {
+            window.*.width = @intCast(i32, x11.get16(event, 20))
+            values[count] = @intCast(u32, window.*.width)
+            count += 1
+            send_mask = send_mask | x11.CONFIG_WIDTH
+        }
+        if mask & 8 != 0 {
+            window.*.height = @intCast(i32, x11.get16(event, 22))
+            values[count] = @intCast(u32, window.*.height)
+            count += 1
+            send_mask = send_mask | x11.CONFIG_HEIGHT
+        }
+    }
+    if count > 0 { unsafe { x11.configureWindow(connection, id, send_mask, @ptrCast([*]const u32, &values), count) } }
+    x11.sendConfigureNotify(connection, id, window.*.x, window.*.y, @intCast(u32, window.*.width), @intCast(u32, window.*.height))
+}
+
+fn configured(xwm: *Xwm, event: [*]const u8) -> void {
+    const address = find(xwm, x11.get32(event, 8))
+    if address == 0 { return }
+    const window = windowAt(address)
+    const x = x11.getInt16(event, 16)
+    const y = x11.getInt16(event, 18)
+    window.*.width = @intCast(i32, x11.get16(event, 20))
+    window.*.height = @intCast(i32, x11.get16(event, 22))
+    window.*.override = event[26] != 0
+    if !window.*.override {
+        if !window.*.managed {
+            window.*.x = x
+            window.*.y = y
+        }
+        return
+    }
+    window.*.x = x
+    window.*.y = y
+    if window.*.managed && window.*.surface != 0 {
+        // An override-redirect window moved itself.
+        const surface = state.surfaceAt(window.*.surface)
+        if surface.*.x != x || surface.*.y != y {
+            scene.damageSurface(xwm.*.compositor, surface)
+            surface.*.x = x
+            surface.*.y = y
+            scene.damageSurface(xwm.*.compositor, surface)
+        }
+    }
+}
+
+fn propertyChanged(xwm: *Xwm, event: [*]const u8) -> void {
+    const id = x11.get32(event, 4)
+    const atom = x11.get32(event, 8)
+    if find(xwm, id) == 0 { return }
+    if atom == x11.ATOM_WM_NAME || atom == xwm.*.atoms[A_NET_WM_NAME] || atom == x11.ATOM_WM_CLASS || atom == xwm.*.atoms[A_WM_PROTOCOLS] || atom == xwm.*.atoms[A_MOTIF_WM_HINTS] || atom == x11.ATOM_WM_NORMAL_HINTS {
+        const longs: u32 = if atom == xwm.*.atoms[A_MOTIF_WM_HINTS] { 5 } else if atom == x11.ATOM_WM_NORMAL_HINTS { 18 } else { 64 }
+        ask(xwm, id, atom, if atom == xwm.*.atoms[A_WM_PROTOCOLS] { x11.ATOM_ATOM } else { x11.ATOM_ANY }, longs)
+    }
+}
+
+// _NET_WM_MOVERESIZE directions: 0..7 the edges (top-left clockwise),
+// 8 moving.
+fn edgesOf(direction: u32) -> u32 {
+    if direction == 0 { return scene.EDGE_TOP | scene.EDGE_LEFT }
+    if direction == 1 { return scene.EDGE_TOP }
+    if direction == 2 { return scene.EDGE_TOP | scene.EDGE_RIGHT }
+    if direction == 3 { return scene.EDGE_RIGHT }
+    if direction == 4 { return scene.EDGE_BOTTOM | scene.EDGE_RIGHT }
+    if direction == 5 { return scene.EDGE_BOTTOM }
+    if direction == 6 { return scene.EDGE_BOTTOM | scene.EDGE_LEFT }
+    if direction == 7 { return scene.EDGE_LEFT }
+    return 0
+}
+
+fn clientMessage(xwm: *Xwm, event: [*]const u8) -> void {
+    const id = x11.get32(event, 4)
+    const kind = x11.get32(event, 8)
+    const address = find(xwm, id)
+    if address == 0 { return }
+    const window = windowAt(address)
+    const compositor = xwm.*.compositor
+    if kind == xwm.*.atoms[A_WL_SURFACE_SERIAL] {
+        window.*.serial = (@intCast(u64, x11.get32(event, 16)) << 32) | @intCast(u64, x11.get32(event, 12))
+        window.*.hasSerial = true
+        say(xwm, "serial for", window.*.id)
+        pair(xwm, window)
+        return
+    }
+    if kind == xwm.*.atoms[A_WL_SURFACE_ID] {
+        window.*.surfaceId = x11.get32(event, 12)
+        say(xwm, "surface id for", window.*.id)
+        pair(xwm, window)
+        return
+    }
+    if window.*.surface == 0 { return }
+    const surface = state.surfaceAt(window.*.surface)
+    if kind == xwm.*.atoms[A_NET_WM_STATE] {
+        // remove (0), add (1), toggle (2) one or two states.
+        const action = x11.get32(event, 12)
+        var index: usize = 0
+        while index < 2 {
+            const atom = x11.get32(event, 16 + index * 4)
+            if atom == xwm.*.atoms[A_NET_WM_STATE_FULLSCREEN] {
+                const on = if action == 2 { !surface.*.fullscreen } else { action == 1 }
+                windows_module.setFullscreen(surface, on)
+            } else if atom == xwm.*.atoms[A_NET_WM_STATE_MAXIMIZED_VERT] || atom == xwm.*.atoms[A_NET_WM_STATE_MAXIMIZED_HORZ] {
+                const on = if action == 2 { !surface.*.maximized } else { action == 1 }
+                windows_module.setMaximized(surface, on)
+            }
+            index += 1
+        }
+    } else if kind == xwm.*.atoms[A_NET_WM_MOVERESIZE] {
+        const direction = x11.get32(event, 20)
+        if direction == 8 {
+            windows_module.startMove(compositor, window.*.surface)
+        } else if direction < 8 {
+            windows_module.startResize(compositor, window.*.surface, edgesOf(direction))
+        }
+    } else if kind == xwm.*.atoms[A_NET_ACTIVE_WINDOW] {
+        if surface.*.mapped && !window.*.override { windows_module.focus(compositor, window.*.surface) }
+    }
+}
+
+fn handle(xwm: *Xwm, message: *x11.Message) -> void {
+    const data = message.*.data
+    if message.*.kind == x11.KIND_SETUP {
+        setupDone(xwm)
+        return
+    }
+    if message.*.kind == x11.KIND_REPLY {
+        const sequence = @intCast(u32, message.*.sequence)
+        if sequence == xwm.*.compositeSequence {
+            xwm.*.compositeSequence = 65536
+            if x11.extensionPresent(data) { xwm.*.composite = x11.extensionOpcode(data) }
+            return
+        }
+        if xwm.*.atomsLeft > 0 {
+            const index = @intCast(usize, (sequence -% xwm.*.atomSequence) & 65535)
+            if index < ATOMS {
+                xwm.*.atoms[index] = x11.atomOf(data)
+                xwm.*.atomsLeft -= 1
+                if xwm.*.atomsLeft == 0 { atomsDone(xwm) }
+                return
+            }
+        }
+        var slot: usize = 0
+        while slot < PENDING {
+            if xwm.*.pendingSequence[slot] == sequence {
+                xwm.*.pendingSequence[slot] = 65536
+                const address = find(xwm, xwm.*.pendingWindow[slot])
+                if address != 0 { propertyReply(xwm, windowAt(address), xwm.*.pendingProperty[slot], data) }
+                return
+            }
+            slot += 1
+        }
+        return
+    }
+    if message.*.kind == x11.KIND_ERROR {
+        // A window gone before a request about it reached the server is
+        // normal (BadWindow, 3).
+        if xwm.*.compositor.*.verbose && data[1] != 3 {
+            state.say("xwm: X error ")
+            state.sayNumber(@intCast(usize, data[1]))
+            state.say(" for request ")
+            state.sayNumber(@intCast(usize, data[10]))
+            state.say("\n")
+        }
+        return
+    }
+    const kind = message.*.kind
+    if kind == x11.CREATE_NOTIFY {
+        created(xwm, data)
+    } else if kind == x11.DESTROY_NOTIFY {
+        destroyed(xwm, x11.get32(data, 8))
+    } else if kind == x11.MAP_REQUEST {
+        mapRequested(xwm, x11.get32(data, 8))
+    } else if kind == x11.MAP_NOTIFY {
+        mapped(xwm, data)
+    } else if kind == x11.UNMAP_NOTIFY {
+        unmapped(xwm, x11.get32(data, 8))
+    } else if kind == x11.CONFIGURE_REQUEST {
+        configureRequested(xwm, data)
+    } else if kind == x11.CONFIGURE_NOTIFY {
+        configured(xwm, data)
+    } else if kind == x11.PROPERTY_NOTIFY {
+        propertyChanged(xwm, data)
+    } else if kind == x11.CLIENT_MESSAGE {
+        clientMessage(xwm, data)
+    }
+}
+
+// The connection is readable (the event loop): everything X sent.
+pub fn dispatch(compositor: *Compositor) -> void {
+    if compositor.*.xwm == 0 { return }
+    const xwm = xwmOf(compositor)
+    const connection = connectionOf(xwm)
+    const alive = x11.fill(connection)
+    var message: x11.Message = undefined
+    while x11.take(connection, &message) { handle(xwm, &message) }
+    if !alive || connection.*.failed {
+        state.say("xwm: the connection to Xwayland ended\n")
+        stop(compositor)
+    }
+}

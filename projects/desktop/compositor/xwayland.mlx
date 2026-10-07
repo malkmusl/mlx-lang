@@ -1,0 +1,274 @@
+// Xwayland (part of the shell): X programs as windows of the compositor.
+// Xwayland runs rootless on the display xserver.mlx reserved: it is a
+// Wayland client of ours (one end of a socket pair as WAYLAND_SOCKET), it
+// serves X clients on the display's sockets (-listenfd), and it gives the
+// window manager (xwm.mlx) a connection of its own (-wm). Each X window it
+// shows has a wl_surface; xwayland_shell_v1 (offered to Xwayland alone)
+// tells which: the surface's serial (set_serial) is the one the window
+// manager reads from the window's WL_SURFACE_SERIAL message.
+const std = @import("std")
+const wl = @import("std.wayland")
+const state = @import("./state.mlx")
+const shell = @import("./shell.mlx")
+const xwm = @import("./xwm.mlx")
+
+const Compositor = state.Compositor
+
+const SOCK_STREAM_CLOEXEC: usize = 524289
+const F_SETFD: usize = 2
+
+// The text of `value` into `target`; its length.
+fn digits(target: [*]u8, value: usize) -> usize {
+    var reversed: [20]u8 = undefined
+    var count: usize = 0
+    var rest = value
+    while rest > 0 || count == 0 {
+        reversed[count] = @intCast(u8, 48 + rest % 10)
+        rest = rest / 10
+        count += 1
+    }
+    var index: usize = 0
+    while index < count {
+        target[index] = reversed[count - 1 - index]
+        index += 1
+    }
+    target[count] = 0
+    return count
+}
+
+// "<prefix><value>" in new memory.
+fn text(compositor: *Compositor, prefix: []const u8, value: usize) -> [*]const u8 {
+    const memory = state.allocate(compositor, 48)
+    var length: usize = 0
+    for byte in prefix {
+        memory[length] = byte
+        length += 1
+    }
+    var tail: [*]u8 = undefined
+    unsafe { tail = @ptrFromInt([*]u8, @intFromPtr(memory) + length) }
+    const added = digits(tail, value)
+    var result: [*]const u8 = undefined
+    unsafe { result = @ptrCast([*]const u8, memory) }
+    return result
+}
+
+fn literal(value: []const u8) -> [*]const u8 {
+    var result: [*]const u8 = undefined
+    unsafe { result = @ptrCast([*]const u8, value) }
+    return result
+}
+
+// Runs Xwayland (a path, or a name looked up in PATH) with `arguments`.
+// Only called in the forked child.
+fn execute(program: [*]const u8, arguments: [*][*]const u8, environment: [*][*]const u8) -> void {
+    var length: usize = 0
+    var has_slash = false
+    while program[length] != 0 {
+        if program[length] == 47 { has_slash = true }
+        length += 1
+    }
+    if has_slash {
+        const ignored = std.linux.syscall3(shell.SYS_execve, @intFromPtr(program), @intFromPtr(arguments), @intFromPtr(environment))
+        return
+    }
+    const path = state.environmentValue(environment, "PATH")
+    if @intFromPtr(path) == 0 { return }
+    var candidate: [512]u8 = undefined
+    var position: usize = 0
+    while true {
+        var used: usize = 0
+        while path[position] != 0 && path[position] != 58 && used < 400 {
+            candidate[used] = path[position]
+            used += 1
+            position += 1
+        }
+        if used > 0 && used + length + 2 < 512 {
+            candidate[used] = 47
+            var index: usize = 0
+            while index <= length {
+                candidate[used + 1 + index] = program[index]
+                index += 1
+            }
+            const ignored = std.linux.syscall3(shell.SYS_execve, @intFromPtr(&candidate), @intFromPtr(arguments), @intFromPtr(environment))
+        }
+        if path[position] == 0 { return }
+        position += 1
+    }
+}
+
+fn keepOnExec(descriptor: usize) -> void { const kept = std.linux.syscall3(shell.SYS_fcntl, descriptor, F_SETFD, 0) }
+
+// The child's side: its descriptors kept across exec, its arguments and
+// environment, and Xwayland.
+fn child(compositor: *Compositor, wayland: usize, manager: usize) -> void {
+    const abstract = @bitCast(usize, compositor.*.xListen[0])
+    const filed = @bitCast(usize, compositor.*.xListen[1])
+    keepOnExec(wayland)
+    keepOnExec(manager)
+    keepOnExec(abstract)
+    keepOnExec(filed)
+    var arguments: [12][*]const u8 = undefined
+    arguments[0] = compositor.*.xwayland
+    arguments[1] = text(compositor, ":", @intCast(usize, compositor.*.xDisplay))
+    arguments[2] = literal("-rootless")
+    arguments[3] = literal("-listenfd")
+    arguments[4] = text(compositor, "", abstract)
+    arguments[5] = literal("-listenfd")
+    arguments[6] = text(compositor, "", filed)
+    arguments[7] = literal("-wm")
+    arguments[8] = text(compositor, "", manager)
+    // Without a GPU named in linux-dmabuf's feedback (the renderer reads
+    // only linear buffers: the CPU renderer, lavapipe) Xwayland's glamor
+    // crashes: shared memory instead.
+    if compositor.*.readsTiled {
+        unsafe { arguments[9] = @ptrFromInt([*]const u8, 0) }
+    } else {
+        arguments[9] = literal("-shm")
+        unsafe { arguments[10] = @ptrFromInt([*]const u8, 0) }
+    }
+    var count: usize = 0
+    while @intFromPtr(compositor.*.environment[count]) != 0 { count += 1 }
+    var environment: [*][*]const u8 = undefined
+    unsafe { environment = @ptrCast([*][*]const u8, state.allocate(compositor, (count + 2) * 8)) }
+    var index: usize = 0
+    while index < count {
+        environment[index] = compositor.*.environment[index]
+        index += 1
+    }
+    environment[count] = text(compositor, "WAYLAND_SOCKET=", wayland)
+    unsafe { environment[count + 1] = @ptrFromInt([*]const u8, 0) }
+    unsafe { execute(compositor.*.xwayland, @ptrCast([*][*]const u8, &arguments), environment) }
+}
+
+// Starts Xwayland on the reserved display, and the window manager.
+pub fn start(compositor: *Compositor) -> void {
+    if !compositor.*.hasXwayland || compositor.*.xDisplay < 0 || compositor.*.xwaylandPid >= 0 { return }
+    var wayland: [2]i32 = [2]i32{ -1, -1 }
+    var manager: [2]i32 = [2]i32{ -1, -1 }
+    if std.linux.syscall4(shell.SYS_socketpair, 1, SOCK_STREAM_CLOEXEC, 0, @intFromPtr(&wayland)) != 0 { return }
+    if std.linux.syscall4(shell.SYS_socketpair, 1, SOCK_STREAM_CLOEXEC, 0, @intFromPtr(&manager)) != 0 {
+        const closed_first = std.linux.syscall1(shell.SYS_close, @intCast(usize, wayland[0]))
+        const closed_second = std.linux.syscall1(shell.SYS_close, @intCast(usize, wayland[1]))
+        return
+    }
+    if compositor.*.verbose {
+        state.say("launch: ")
+        var length: usize = 0
+        while compositor.*.xwayland[length] != 0 { length += 1 }
+        const shown = std.io.writeAllBytes(std.io.stdout(), compositor.*.xwayland, length)
+        state.say(" (rootless, display :")
+        state.sayInteger(compositor.*.xDisplay)
+        state.say(")\n")
+    }
+    const pid = std.linux.syscall0(shell.SYS_fork)
+    if pid == 0 {
+        child(compositor, @intCast(usize, wayland[1]), @intCast(usize, manager[1]))
+        const exited = std.linux.syscall1(shell.SYS_exit_group, 127)
+    }
+    const closed_wayland = std.linux.syscall1(shell.SYS_close, @intCast(usize, wayland[1]))
+    const closed_manager = std.linux.syscall1(shell.SYS_close, @intCast(usize, manager[1]))
+    if pid < 0 {
+        const closed_ours = std.linux.syscall1(shell.SYS_close, @intCast(usize, wayland[0]))
+        const closed_wm = std.linux.syscall1(shell.SYS_close, @intCast(usize, manager[0]))
+        return
+    }
+    compositor.*.xwaylandPid = pid
+    compositor.*.xwaylandStartedAt = @intCast(u32, (state.microseconds() / 1000) & 4294967295)
+    var client: wl.server.Client = undefined
+    if !compositor.*.server.adoptClient(wl.Handle.fromDescriptor(@intCast(isize, wayland[0])), &client) {
+        state.say("xwayland: cannot add its Wayland connection\n")
+        return
+    }
+    compositor.*.xwaylandClient = @intFromPtr(client.state)
+    xwm.start(compositor, @intCast(isize, manager[0]))
+}
+
+// A child ended (launching.reapChildren): when it was Xwayland, the
+// window manager stops.
+pub fn reaped(compositor: *Compositor, pid: isize) -> void {
+    if pid != compositor.*.xwaylandPid { return }
+    compositor.*.xwaylandPid = -1
+    compositor.*.xwaylandClient = 0
+    xwm.stop(compositor)
+    const now = @intCast(u32, (state.microseconds() / 1000) & 4294967295)
+    if now -% compositor.*.xwaylandStartedAt < 3000 {
+        state.say("xwayland: Xwayland ended at once (is it installed? --xwayland PROGRAM|none)\n")
+    } else {
+        state.say("xwayland: Xwayland ended\n")
+    }
+}
+
+// ---------------------------------------------------------------------------
+// xwayland_shell_v1: which wl_surface shows which X window (Xwayland's
+// alone).
+
+fn isXwayland(compositor: *Compositor, object: wl.server.Object) -> bool {
+    return compositor.*.xwaylandClient != 0 && @intFromPtr(object.client.state) == compositor.*.xwaylandClient
+}
+
+pub fn onXwaylandSurface(context: *anyopaque, request: wl.server.Request) -> void {
+    const surface = state.surfaceOf(context)
+    if request.opcode != wl.xwayland_surface_v1.REQUEST_SET_SERIAL { return }
+    const decoded = wl.xwayland_surface_v1.decodeRequest(request)
+    surface.*.xSerial = (@intCast(u64, decoded.set_serial.serial_hi) << 32) | @intCast(u64, decoded.set_serial.serial_lo)
+    surface.*.hasXSerial = true
+    if surface.*.compositor.*.verbose {
+        state.say("xwayland: a surface has serial ")
+        state.sayNumber(@intCast(usize, decoded.set_serial.serial_lo))
+        state.say("\n")
+    }
+    xwm.serialSet(surface.*.compositor, state.addressOfSurface(surface))
+}
+
+pub fn onXwaylandShell(context: *anyopaque, request: wl.server.Request) -> void {
+    const compositor = state.compositorOf(context)
+    if request.opcode != wl.xwayland_shell_v1.REQUEST_GET_XWAYLAND_SURFACE { return }
+    const decoded = wl.xwayland_shell_v1.decodeRequest(request)
+    const address = state.findSurface(compositor, decoded.get_xwayland_surface.surface.object)
+    const object = decoded.get_xwayland_surface.id.object
+    if address == 0 { return }
+    var memory: [*]u8 = undefined
+    unsafe { memory = @ptrFromInt([*]u8, address) }
+    wl.server.setHandler(object, onXwaylandSurface, state.contextOf(memory))
+}
+
+pub fn bindXwaylandShell(context: *anyopaque, client: wl.server.Client, object: wl.server.Object, version: u32) -> void {
+    const compositor = state.compositorOf(context)
+    // Only Xwayland may name X windows' surfaces.
+    if !isXwayland(compositor, object) {
+        state.say("xwayland: a client other than Xwayland asked for xwayland_shell_v1; disconnected\n")
+        client.disconnect()
+        return
+    }
+    wl.server.setHandler(object, onXwaylandShell, context)
+}
+
+pub fn createGlobals(compositor: *Compositor) -> bool {
+    var memory: [*]u8 = undefined
+    unsafe { memory = @ptrCast([*]u8, compositor) }
+    return compositor.*.server.createGlobal(wl.Interface.xwayland_shell_v1, 1, bindXwaylandShell, state.contextOf(memory)) != 0
+}
+
+// ---------------------------------------------------------------------------
+// The handlers this file registers with the Wayland server, by name: when
+// the shell is loaded again (modules.mlx), each resource's handler is
+// replaced by the new code's function of the same name. Every function
+// passed to setHandler, setDestroyHandler, createGlobal or a client
+// handler here must be listed (tools/check_compositor_modules.py checks;
+// --fix rewrites this table).
+
+pub const HANDLER_COUNT: usize = 3
+
+pub fn handlerAddress(index: usize) -> usize {
+    if index == 0 { return @intFromPtr(bindXwaylandShell) }
+    if index == 1 { return @intFromPtr(onXwaylandShell) }
+    if index == 2 { return @intFromPtr(onXwaylandSurface) }
+    return 0
+}
+
+pub fn handlerName(index: usize) -> []const u8 {
+    if index == 0 { return "xwayland.bindXwaylandShell" }
+    if index == 1 { return "xwayland.onXwaylandShell" }
+    if index == 2 { return "xwayland.onXwaylandSurface" }
+    return ""
+}

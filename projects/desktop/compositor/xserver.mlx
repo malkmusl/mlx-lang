@@ -1,0 +1,194 @@
+// The X display Xwayland serves (part of the program, not the shell): a
+// display number nobody uses, its lock file (/tmp/.X<n>-lock) and its two
+// listening sockets (/tmp/.X11-unix/X<n> and the abstract one of the same
+// name), made before any program starts so that X clients started with the
+// compositor can connect at once (they wait in the backlog until Xwayland
+// accepts). Children get DISPLAY=:<n>. xwayland.mlx starts Xwayland on
+// these sockets; release() removes them when the compositor ends.
+const std = @import("std")
+const state = @import("./state.mlx")
+
+const Compositor = state.Compositor
+
+const SYS_write: usize = 1
+const SYS_open: usize = 2
+const SYS_close: usize = 3
+const SYS_socket: usize = 41
+const SYS_bind: usize = 49
+const SYS_listen: usize = 50
+const SYS_getpid: usize = 39
+const SYS_mkdir: usize = 83
+const SYS_chmod: usize = 90
+const SYS_unlink: usize = 87
+const O_WRONLY_CREATE_EXCLUSIVE: usize = 193
+const SOCK_STREAM_CLOEXEC: usize = 524289
+const AF_UNIX: usize = 1
+const DISPLAYS: u32 = 32
+
+// "<prefix><n>" with a NUL, into `target` (at least 32 bytes); its length.
+fn numbered(target: [*]u8, prefix: []const u8, number: u32, suffix: []const u8) -> usize {
+    var length: usize = 0
+    for byte in prefix {
+        target[length] = byte
+        length += 1
+    }
+    if number >= 10 {
+        target[length] = @intCast(u8, 48 + number / 10)
+        length += 1
+    }
+    target[length] = @intCast(u8, 48 + number % 10)
+    length += 1
+    for byte in suffix {
+        target[length] = byte
+        length += 1
+    }
+    target[length] = 0
+    return length
+}
+
+// A listening socket at `path` (`abstract`: in the abstract namespace),
+// close-on-exec; -1 when it cannot be had.
+fn listenAt(path: [*]const u8, length: usize, abstract: bool) -> isize {
+    const descriptor = std.linux.syscall3(SYS_socket, AF_UNIX, SOCK_STREAM_CLOEXEC, 0)
+    if descriptor < 0 { return -1 }
+    var address: [110]u8 = undefined
+    address[0] = 1
+    address[1] = 0
+    var at: usize = 2
+    if abstract {
+        address[2] = 0
+        at = 3
+    }
+    var index: usize = 0
+    while index < length && at < 109 {
+        address[at] = path[index]
+        at += 1
+        index += 1
+    }
+    // A path's address ends with its NUL; an abstract name's does not.
+    const size = if abstract { at } else { at + 1 }
+    if !abstract { address[at] = 0 }
+    const bound = std.linux.syscall3(SYS_bind, @bitCast(usize, descriptor), @intFromPtr(&address), size)
+    if bound != 0 || std.linux.syscall2(SYS_listen, @bitCast(usize, descriptor), 1) != 0 {
+        const closed = std.linux.syscall1(SYS_close, @bitCast(usize, descriptor))
+        return -1
+    }
+    return descriptor
+}
+
+// Takes display `number`: its lock file (with our process id, as X
+// servers write it) and both sockets. False when another server has it.
+fn take(compositor: *Compositor, number: u32) -> bool {
+    var lock: [32]u8 = undefined
+    var socket: [32]u8 = undefined
+    var lock_path: [*]u8 = undefined
+    var socket_path: [*]u8 = undefined
+    unsafe {
+        lock_path = @ptrCast([*]u8, &lock)
+        socket_path = @ptrCast([*]u8, &socket)
+    }
+    const lock_length = numbered(lock_path, "/tmp/.X", number, "-lock")
+    const socket_length = numbered(socket_path, "/tmp/.X11-unix/X", number, "")
+    const file = std.linux.syscall3(SYS_open, @intFromPtr(lock_path), O_WRONLY_CREATE_EXCLUSIVE, 292)
+    if file < 0 { return false }
+    // "%10d\n".
+    var text: [11]u8 = [11]u8{ 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 10 }
+    var pid = @bitCast(usize, std.linux.syscall0(SYS_getpid))
+    var at: usize = 10
+    while at > 0 && (pid > 0 || at == 10) {
+        at -= 1
+        text[at] = @intCast(u8, 48 + pid % 10)
+        pid = pid / 10
+    }
+    const written = std.linux.syscall3(SYS_write, @bitCast(usize, file), @intFromPtr(&text), 11)
+    const closed = std.linux.syscall1(SYS_close, @bitCast(usize, file))
+    const abstract = listenAt(socket_path, socket_length, true)
+    if abstract < 0 {
+        const removed = std.linux.syscall1(SYS_unlink, @intFromPtr(lock_path))
+        return false
+    }
+    // A socket file left by a server that is gone (its lock was free).
+    const stale = std.linux.syscall1(SYS_unlink, @intFromPtr(socket_path))
+    const filed = listenAt(socket_path, socket_length, false)
+    if filed < 0 {
+        const closed_abstract = std.linux.syscall1(SYS_close, @bitCast(usize, abstract))
+        const removed = std.linux.syscall1(SYS_unlink, @intFromPtr(lock_path))
+        return false
+    }
+    compositor.*.xDisplay = @intCast(i32, number)
+    compositor.*.xListen[0] = abstract
+    compositor.*.xListen[1] = filed
+    return true
+}
+
+// Children's environment with DISPLAY=:<n> instead of any DISPLAY.
+fn setDisplay(compositor: *Compositor) -> void {
+    var count: usize = 0
+    while @intFromPtr(compositor.*.environment[count]) != 0 { count += 1 }
+    var result: [*][*]const u8 = undefined
+    unsafe { result = @ptrCast([*][*]const u8, state.allocate(compositor, (count + 2) * 8)) }
+    var used: usize = 0
+    var index: usize = 0
+    while index < count {
+        const entry = compositor.*.environment[index]
+        const display = entry[0] == 68 && entry[1] == 73 && entry[2] == 83 && entry[3] == 80 && entry[4] == 76 && entry[5] == 65 && entry[6] == 89 && entry[7] == 61
+        if !display {
+            result[used] = entry
+            used += 1
+        }
+        index += 1
+    }
+    const variable = state.allocate(compositor, 16)
+    const length = numbered(variable, "DISPLAY=:", @intCast(u32, compositor.*.xDisplay), "")
+    unsafe { result[used] = @ptrCast([*]const u8, variable) }
+    used += 1
+    unsafe { result[used] = @ptrFromInt([*]const u8, 0) }
+    compositor.*.environment = result
+}
+
+// Finds a free display and makes its sockets (with --xwayland none, or
+// when none is free: no X). True when there is one.
+pub fn reserve(compositor: *Compositor) -> bool {
+    if !compositor.*.hasXwayland { return false }
+    // /tmp/.X11-unix, sticky and writable by all, as X servers make it.
+    var directory: usize = 0
+    unsafe { directory = @intFromPtr(@ptrCast([*]const u8, "/tmp/.X11-unix")) }
+    const made = std.linux.syscall2(SYS_mkdir, directory, 1023)
+    if made == 0 { const changed = std.linux.syscall2(SYS_chmod, directory, 1023) }
+    var number: u32 = 0
+    while number < DISPLAYS {
+        if take(compositor, number) {
+            setDisplay(compositor)
+            if compositor.*.verbose {
+                state.say("xwayland: display :")
+                state.sayNumber(@intCast(usize, number))
+                state.say("\n")
+            }
+            return true
+        }
+        number += 1
+    }
+    state.say("xwayland: no free X display (/tmp/.X<n>-lock); X programs will not run\n")
+    compositor.*.hasXwayland = false
+    return false
+}
+
+// Removes the display's sockets and lock file.
+pub fn release(compositor: *Compositor) -> void {
+    if compositor.*.xDisplay < 0 { return }
+    var lock: [32]u8 = undefined
+    var socket: [32]u8 = undefined
+    unsafe {
+        const lock_length = numbered(@ptrCast([*]u8, &lock), "/tmp/.X", @intCast(u32, compositor.*.xDisplay), "-lock")
+        const socket_length = numbered(@ptrCast([*]u8, &socket), "/tmp/.X11-unix/X", @intCast(u32, compositor.*.xDisplay), "")
+    }
+    var index: usize = 0
+    while index < 2 {
+        if compositor.*.xListen[index] >= 0 { const closed = std.linux.syscall1(SYS_close, @bitCast(usize, compositor.*.xListen[index])) }
+        compositor.*.xListen[index] = -1
+        index += 1
+    }
+    const removed_socket = std.linux.syscall1(SYS_unlink, @intFromPtr(&socket))
+    const removed_lock = std.linux.syscall1(SYS_unlink, @intFromPtr(&lock))
+    compositor.*.xDisplay = -1
+}
