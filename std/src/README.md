@@ -44,8 +44,7 @@ rectangles, insets, alignment, containers, stacks and reserved bars; see
 callers from the compiler's symbol table) and keeps it in
 `$XDG_STATE_HOME/mlx/crashes.log`; `wayland/crash.mlx`
 (`std.wayland.crash`) treats a Wayland client's failed connection like a
-crash. `filetree.mlx` (`std.filetree`) copies, moves and removes files and
-folders without external programs. `timezone.mlx` (`std.timezone`) gives local time from `$TZ` or
+crash. `timezone.mlx` (`std.timezone`) gives local time from `$TZ` or
 `/etc/localtime` (TZif files and POSIX rules) and the civil calendar. See
 `docs/reference/stdlib.md`.
 

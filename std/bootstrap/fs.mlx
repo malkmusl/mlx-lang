@@ -540,3 +540,278 @@ pub fn copy(source: File, destination: File) -> bool {
     if spliced != null { return spliced.? }
     return copyBuffered(source, destination)
 }
+
+// ---------------------------------------------------------------------------
+// Folders with everything in them: what a file manager does (copy, move,
+// remove, a free name), by the kernel's calls alone (no cp, mv or rm).
+// Nothing is overwritten. Paths are NUL-terminated, up to PATH_MAX bytes,
+// nested as deep as the stack lets (a few KiB a level).
+
+pub const PATH_MAX: usize = 4096
+
+// struct stat's mode: the kind of file.
+const MODE_KIND: u32 = 61440
+const MODE_DIRECTORY: u32 = 16384
+const MODE_FILE: u32 = 32768
+const MODE_LINK: u32 = 40960
+const OPEN_EXCLUSIVE: usize = 128
+const RENAME_NO_REPLACE: usize = 1
+const EXDEV: isize = -18
+const EINVAL: isize = -22
+
+// A path being built: `length` bytes and a NUL.
+const TreePath = struct {
+    bytes: [4096]u8
+    length: usize
+}
+
+fn treeLoad(path: *TreePath, text: [*]const u8) -> bool {
+    path.*.length = 0
+    while text[path.*.length] != 0 {
+        if path.*.length + 1 >= PATH_MAX { return false }
+        path.*.bytes[path.*.length] = text[path.*.length]
+        path.*.length += 1
+    }
+    path.*.bytes[path.*.length] = 0
+    return true
+}
+
+// path + "/" + name; false when it would not fit.
+fn treePush(path: *TreePath, name: []const u8) -> bool {
+    if path.*.length + 1 + name.length + 1 > PATH_MAX { return false }
+    path.*.bytes[path.*.length] = 47
+    var index: usize = 0
+    while index < name.length {
+        path.*.bytes[path.*.length + 1 + index] = name[index]
+        index += 1
+    }
+    path.*.length += 1 + name.length
+    path.*.bytes[path.*.length] = 0
+    return true
+}
+
+fn treeCut(path: *TreePath, length: usize) -> void {
+    path.*.length = length
+    path.*.bytes[length] = 0
+}
+
+fn treeText(path: *TreePath) -> [*]const u8 {
+    unsafe { return @ptrCast([*]const u8, path) }
+}
+
+fn sameBytes(first: []const u8, second: []const u8) -> bool {
+    if first.length != second.length { return false }
+    var index: usize = 0
+    while index < first.length {
+        if first[index] != second[index] { return false }
+        index += 1
+    }
+    return true
+}
+
+// Whether something (even a dangling link) is at `path`.
+pub fn exists(path: [*]const u8) -> bool {
+    var status: Stat = undefined
+    return statusAt(path, &status, true) == 0
+}
+
+// Copies `source` to `target` (which must not be there yet): a file with
+// its bytes, mode and modification time, a folder with everything in it, a
+// symbolic link as a link. False when anything could not be copied (what
+// could be stays).
+pub fn copyTree(source: [*]const u8, target: [*]const u8) -> bool {
+    var from: TreePath = undefined
+    var to: TreePath = undefined
+    if !treeLoad(&from, source) || !treeLoad(&to, target) { return false }
+    if exists(target) { return false }
+    // Not into itself.
+    if from.length <= to.length && sameBytes(from.bytes[0..from.length], to.bytes[0..from.length]) && (to.length == from.length || to.bytes[from.length] == 47) { return false }
+    return copyTreeAt(&from, &to)
+}
+
+fn copyTreeAt(from: *TreePath, to: *TreePath) -> bool {
+    var status: Stat = undefined
+    if statusAt(treeText(from), &status, true) != 0 { return false }
+    const kind = status.mode & MODE_KIND
+    if kind == MODE_LINK {
+        var link: [4096]u8 = undefined
+        var bytes: [*]u8 = undefined
+        unsafe { bytes = @ptrCast([*]u8, &link) }
+        const length = readLink(treeText(from), bytes, PATH_MAX - 1)
+        if length < 0 { return false }
+        bytes[@intCast(usize, length)] = 0
+        return symbolicLink(bytes, treeText(to))
+    }
+    if kind == MODE_DIRECTORY { return copyTreeDirectory(from, to, status.mode & 4095) }
+    if kind != MODE_FILE { return false }
+    if !copyTreeFile(treeText(from), treeText(to), status.mode & 4095) { return false }
+    const timed = setTimes(treeText(to), status.accessedSeconds, status.accessedNanoseconds, status.modifiedSeconds, status.modifiedNanoseconds, true)
+    return true
+}
+
+fn copyTreeFile(source: [*]const u8, target: [*]const u8, mode: u32) -> bool {
+    const input = open(source, READ_ONLY, 0)
+    if !isValid(input) { return false }
+    const output = open(target, WRITE_ONLY | CREATE | OPEN_EXCLUSIVE, @intCast(usize, mode))
+    if !isValid(output) {
+        const closed = close(input)
+        return false
+    }
+    // The bytes as copy (above) moves them: splice, else a buffer.
+    const ok = copy(input, output)
+    const closed_input = close(input)
+    const closed_output = close(output)
+    if !ok { const removed = delete(target) }
+    return ok
+}
+
+fn copyTreeDirectory(from: *TreePath, to: *TreePath, mode: u32) -> bool {
+    // Writable for us while it fills, its own mode after.
+    if !makeDir(treeText(to), @intCast(usize, mode | 448)) { return false }
+    const directory = open(treeText(from), READ_ONLY | DIRECTORY, 0)
+    if !isValid(directory) { return false }
+    var buffer: [8192]u8 = undefined
+    var bytes: [*]u8 = undefined
+    unsafe { bytes = @ptrCast([*]u8, &buffer) }
+    var reader = entries(directory, bytes, 8192)
+    var entry: Entry = undefined
+    var ok = true
+    const from_length = from.*.length
+    const to_length = to.*.length
+    while nextEntry(&reader, &entry) {
+        if !isDotName(entry.name) {
+            const name = entry.name.pointer[0..entry.name.length]
+            if treePush(from, name) && treePush(to, name) {
+                if !copyTreeAt(from, to) { ok = false }
+            } else {
+                ok = false
+            }
+            treeCut(from, from_length)
+            treeCut(to, to_length)
+        }
+    }
+    if reader.failed { ok = false }
+    const closed = close(directory)
+    const moded = chmod(treeText(to), @intCast(usize, mode))
+    return ok
+}
+
+// Removes `path` and, for a folder, everything in it. False when anything
+// stayed.
+pub fn removeTree(path: [*]const u8) -> bool {
+    var at: TreePath = undefined
+    if !treeLoad(&at, path) { return false }
+    return removeTreeAt(&at)
+}
+
+fn removeTreeAt(path: *TreePath) -> bool {
+    var status: Stat = undefined
+    if statusAt(treeText(path), &status, true) != 0 { return false }
+    if status.mode & MODE_KIND != MODE_DIRECTORY { return delete(treeText(path)) }
+    const directory = open(treeText(path), READ_ONLY | DIRECTORY, 0)
+    if !isValid(directory) { return false }
+    var buffer: [8192]u8 = undefined
+    var bytes: [*]u8 = undefined
+    unsafe { bytes = @ptrCast([*]u8, &buffer) }
+    var ok = true
+    const length = path.*.length
+    // Read again from the start after each batch: removing while reading
+    // can skip entries on some file systems.
+    var removed_any = true
+    while removed_any {
+        removed_any = false
+        const rewound = seek(directory, 0, SEEK_START)
+        var reader = entries(directory, bytes, 8192)
+        var entry: Entry = undefined
+        while nextEntry(&reader, &entry) {
+            if !isDotName(entry.name) {
+                if treePush(path, entry.name.pointer[0..entry.name.length]) {
+                    if removeTreeAt(path) { removed_any = true } else { ok = false }
+                } else {
+                    ok = false
+                }
+                treeCut(path, length)
+            }
+        }
+        if !ok { removed_any = false }
+    }
+    const closed = close(directory)
+    return removeDir(treeText(path)) && ok
+}
+
+// Moves `source` to `target` (which must not be there yet): renamed on the
+// same file system, else copied and, once all of it is, removed.
+pub fn moveTree(source: [*]const u8, target: [*]const u8) -> bool {
+    var result: isize = 0
+    unsafe { result = linux.syscall5(linux.SYS_renameat2, AT_CURRENT_WORKING_DIRECTORY, @intFromPtr(source), AT_CURRENT_WORKING_DIRECTORY, @intFromPtr(target), RENAME_NO_REPLACE) }
+    if result == 0 { return true }
+    // A file system without RENAME_NOREPLACE (FUSE, Android's shared
+    // storage): a plain rename when nothing is there.
+    if result == EINVAL {
+        if exists(target) { return false }
+        if rename(source, target) { return true }
+    } else if result != EXDEV {
+        return false
+    }
+    if !copyTree(source, target) { return false }
+    return removeTree(source)
+}
+
+// A name for `name` in `folder` that nothing has yet: name, "name 2",
+// "name 3", ... (before the extension: "photo 2.png") into `into`
+// (NUL-terminated); its length, 0 when none fits.
+pub fn freeName(folder: []const u8, name: []const u8, into: [*]u8, capacity: usize) -> usize {
+    var dot = name.length
+    var index: usize = 1
+    while index < name.length {
+        if name[index] == 46 { dot = index }
+        index += 1
+    }
+    var number: usize = 1
+    while number < 10000 {
+        var length: usize = 0
+        var ok = true
+        for byte in folder {
+            if length + 1 < capacity { into[length] = byte } else { ok = false }
+            length += 1
+        }
+        if length + 1 < capacity { into[length] = 47 } else { ok = false }
+        length += 1
+        const start = length
+        var at: usize = 0
+        while at < name.length {
+            if at == dot && number > 1 {
+                length = appendNameNumber(into, length, capacity, number, &ok)
+            }
+            if length + 1 < capacity { into[length] = name[at] } else { ok = false }
+            length += 1
+            at += 1
+        }
+        if dot == name.length && number > 1 { length = appendNameNumber(into, length, capacity, number, &ok) }
+        if !ok { return 0 }
+        into[length] = 0
+        if !exists(into) { return length }
+        number += 1
+    }
+    return 0
+}
+
+fn appendNameNumber(into: [*]u8, at: usize, capacity: usize, number: usize, ok: *bool) -> usize {
+    var length = at
+    if length + 1 < capacity { into[length] = 32 } else { ok.* = false }
+    length += 1
+    var digits: [20]u8 = undefined
+    var count: usize = 0
+    var rest = number
+    while rest > 0 {
+        digits[count] = @intCast(u8, 48 + rest % 10)
+        rest /= 10
+        count += 1
+    }
+    while count > 0 {
+        count -= 1
+        if length + 1 < capacity { into[length] = digits[count] } else { ok.* = false }
+        length += 1
+    }
+    return length
+}
