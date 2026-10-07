@@ -419,6 +419,16 @@ pub fn main() -> !void {
 }
 ```
 
+Code that cannot pass an error union on (an exported function a C host
+calls, such as a plugin's: see [Formats](formats.md#shared-objects)) uses
+the same calls in a form that says whether they worked: `Display.open
+(display, allocator, path)` (`""`: the environment's socket),
+`display.sync()` (a roundtrip), `display.poll()` (sends what is pending,
+reads what has arrived and dispatches it, never waiting) and
+`display.send()`; `display.running()` and the failure details say why one
+failed. `projects/desktop/capture/client.mlx` is written that way, for
+mlx-capture and its OBS plugin alike.
+
 A server:
 
 ```mlx

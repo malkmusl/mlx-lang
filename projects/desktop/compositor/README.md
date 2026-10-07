@@ -915,16 +915,41 @@ as damage, so a recorder gets a frame per change, not per request.
 The compositor maps client memory read-only; it copies a frame through a
 writable mapping of its own for the moment of the copy.
 
-[`projects/desktop/screenshot`](../screenshot/main.mlx) is a client of
-it, `mlx-screenshot` (installed with the session), which writes PNGs
-(`std.png.saveFile`):
+[`projects/desktop/capture`](../capture) is `mlx-capture` (installed with the
+session), its client: `client.mlx` holds the connection, the window list
+and a capture session, `main.mlx` writes PNGs (`std.png.saveFile`):
 
 ```sh
-mlx-screenshot screen.png                         # the screen
-mlx-screenshot --list                             # identifier, app id, title
-mlx-screenshot --window org.mlx.settings win.png  # a window by app id or title
-mlx-screenshot --frames 3 last.png                # three frames, each after a change
+mlx-capture screen.png                         # the screen
+mlx-capture --list                             # identifier, app id, title
+mlx-capture --window org.mlx.settings win.png  # a window by app id or title
+mlx-capture --frames 3 last.png                # three frames, each after a change
 ```
+
+### OBS
+
+`obs.mlx` is an OBS Studio plugin with the source **MLX Capture**: the
+screen, or a window chosen in its properties (by app id, so the choice
+outlives the window), through the same client. It is built with `mlx4
+--plugin` (see [Formats](../../../docs/reference/formats.md#shared-objects)):
+a shared object OBS loads whose exported functions each run on an arena of
+their own, on whichever of OBS's threads calls them. It calls libobs
+(`obs_register_source_s`, `obs_source_output_video`, ...) as `extern("c")`
+functions. The source is asynchronous: its connection lives on OBS's video
+thread, polled every frame without waiting, and each frame the compositor
+hands over (only when something changed) goes to OBS, which copies it. The
+installer puts it in `~/.config/obs-studio/plugins/mlx-capture/bin/64bit/`;
+by hand:
+
+```sh
+mlx4 --plugin projects/desktop/capture/obs.mlx -o mlx-capture.so
+mkdir -p ~/.config/obs-studio/plugins/mlx-capture/bin/64bit
+cp mlx-capture.so ~/.config/obs-studio/plugins/mlx-capture/bin/64bit/
+```
+
+`tools/check_obs_plugin.sh` runs OBS (as a Wayland client of the nested
+compositor) with a scene of only that source, records, and checks the log,
+the recording and OBS's preview.
 
 ## X programs (Xwayland)
 

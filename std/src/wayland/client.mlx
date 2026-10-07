@@ -161,6 +161,32 @@ pub const Display = struct {
     // every event caused by earlier requests has been handled.
     pub fn roundtrip(self: Self) -> Error!void { return roundtripState(self) }
 
+    // The same without error unions, for code that cannot pass one on (an
+    // exported function a C host calls, such as a plugin's): each says
+    // whether it worked, running() and the failure details why not.
+
+    // Connects like connect (`path` ""), or to the socket at `path`.
+    pub fn open(display: *Self, allocator: Allocator, path: []const u8) -> bool {
+        var descriptor: isize = -1
+        if path.length == 0 {
+            descriptor = environmentDescriptor(allocator)
+        } else {
+            unsafe { descriptor = transport.connectPath(@ptrCast([*]const u8, path), path.length) }
+        }
+        if descriptor < 0 || !transport.setNonBlocking(descriptor) { return false }
+        return initializeState(display, allocator, descriptor)
+    }
+
+    // A roundtrip (waits for the server).
+    pub fn sync(self: Self) -> bool { return syncState(self) }
+
+    // Sends what is pending, reads what has arrived and dispatches it,
+    // without waiting.
+    pub fn poll(self: Self) -> bool { return pollState(self.state) }
+
+    // Sends what is pending.
+    pub fn send(self: Self) -> bool { return flushOk(self.state) }
+
     // `handler` is called once, when the connection fails (not when it is
     // disconnected on purpose), with the failure still on the stack.
     pub fn setFailureHandler(self: Self, handler: FailureHandler, context: *anyopaque) -> void {
@@ -377,16 +403,20 @@ fn check(state: *State) -> Error!void {
 // Connection setup
 
 fn initialize(display: *Display, allocator: Allocator, descriptor: isize) -> Error!void {
+    if !initializeState(display, allocator, descriptor) { return Error.OutOfMemory }
+}
+
+fn initializeState(display: *Display, allocator: Allocator, descriptor: isize) -> bool {
     const state_memory = allocator.alloc(@sizeOf(State), @alignOf(State))
     if state_memory == null {
         transport.close(descriptor)
-        return Error.OutOfMemory
+        return false
     }
     const connection_memory = allocator.alloc(@sizeOf(transport.Connection), @alignOf(transport.Connection))
     const message_memory = allocator.alloc(ERROR_MESSAGE_CAPACITY, 1)
     if connection_memory == null || message_memory == null {
         transport.close(descriptor)
-        return Error.OutOfMemory
+        return false
     }
     var state: *State = undefined
     unsafe {
@@ -395,7 +425,7 @@ fn initialize(display: *Display, allocator: Allocator, descriptor: isize) -> Err
     }
     if !transport.init(state.*.connection, allocator, descriptor) {
         transport.close(descriptor)
-        return Error.OutOfMemory
+        return false
     }
     state.*.allocator = allocator
     var objects: Vector = undefined
@@ -421,9 +451,56 @@ fn initialize(display: *Display, allocator: Allocator, descriptor: isize) -> Err
     state.*.refusedKnown = false
     state.*.hasFailureHandler = false
     // Id 0 is the null object; id 1 is wl_display.
-    if !grow(state, false, 1) { return Error.OutOfMemory }
-    if !register(state, DISPLAY_ID, Interface.wl_display, 1) { return Error.OutOfMemory }
+    if !grow(state, false, 1) { return false }
+    if !register(state, DISPLAY_ID, Interface.wl_display, 1) { return false }
     display.*.state = state
+    return true
+}
+
+// The socket the environment names, connected (WAYLAND_SOCKET, else
+// WAYLAND_DISPLAY in XDG_RUNTIME_DIR); -1 when there is none.
+fn environmentDescriptor(allocator: Allocator) -> isize {
+    var environment: transport.Environment = undefined
+    if !transport.loadEnvironment(&environment, allocator) { return -1 }
+    const socket = transport.lookupEnvironment(&environment, "WAYLAND_SOCKET")
+    if !wire.isNull(socket) {
+        const descriptor = parseDescriptor(socket)
+        transport.freeEnvironment(&environment)
+        return descriptor
+    }
+    var name = transport.lookupEnvironment(&environment, "WAYLAND_DISPLAY")
+    if wire.isNull(name) || name.length == 0 { name = string.fromSlice("wayland-0") }
+    var path: [112]u8 = undefined
+    var length: usize = 0
+    if name.pointer[0] != 47 {
+        const runtime = transport.lookupEnvironment(&environment, "XDG_RUNTIME_DIR")
+        if wire.isNull(runtime) || runtime.length == 0 || runtime.length + 1 + name.length > 107 {
+            transport.freeEnvironment(&environment)
+            return -1
+        }
+        var index: usize = 0
+        while index < runtime.length {
+            path[length] = runtime.pointer[index]
+            length += 1
+            index += 1
+        }
+        path[length] = 47
+        length += 1
+    }
+    if length + name.length > 107 {
+        transport.freeEnvironment(&environment)
+        return -1
+    }
+    var index: usize = 0
+    while index < name.length {
+        path[length] = name.pointer[index]
+        length += 1
+        index += 1
+    }
+    transport.freeEnvironment(&environment)
+    var descriptor: isize = 0
+    unsafe { descriptor = transport.connectPath(@ptrCast([*]const u8, &path), length) }
+    return descriptor
 }
 
 fn parseDescriptor(value: String) -> isize {
@@ -678,6 +755,77 @@ pub fn eventObject(event: Event, id: u32) -> Object {
 
 // ---------------------------------------------------------------------------
 // Flushing and dispatch
+
+// flushState without an error union.
+fn flushOk(state: *State) -> bool {
+    if state.*.failure != FAIL_NONE { return false }
+    while true {
+        const flushed = transport.flush(state.*.connection)
+        if flushed == 0 { return true }
+        if flushed != transport.EAGAIN || transport.wait(state.*.connection.*.descriptor, true, -1) < 0 {
+            setFailure(state, FAIL_DISCONNECTED)
+            return false
+        }
+    }
+    return false
+}
+
+// Every complete buffered event, dispatched (dispatchBuffered without an
+// error union).
+fn dispatchAll(state: *State) -> void {
+    while state.*.failure == FAIL_NONE {
+        const result = dispatchOne(state)
+        if result <= 0 { break }
+    }
+}
+
+// Reads once; false when the connection ended. `wait`: when nothing has
+// arrived, waits for it.
+fn receiveOnce(state: *State, wait: bool) -> bool {
+    const received = transport.receive(state.*.connection)
+    if received == transport.EAGAIN {
+        if !wait { return true }
+        if transport.wait(state.*.connection.*.descriptor, false, -1) < 0 {
+            setFailure(state, FAIL_DISCONNECTED)
+            return false
+        }
+        return true
+    }
+    if received <= 0 {
+        setFailure(state, FAIL_DISCONNECTED)
+        return false
+    }
+    return true
+}
+
+fn pollState(state: *State) -> bool {
+    if !flushOk(state) { return false }
+    dispatchAll(state)
+    if !receiveOnce(state, false) { return false }
+    dispatchAll(state)
+    return state.*.failure == FAIL_NONE
+}
+
+fn syncState(display: Display) -> bool {
+    const state = display.state
+    if state.*.failure != FAIL_NONE { return false }
+    var done = false
+    const callback = createObject(displayObject(display), Interface.wl_callback, 1)
+    unsafe { setHandler(callback, markDone, @ptrCast(*anyopaque, &done)) }
+    const message = writerOf(state)
+    if beginRequest(displayObject(display), 0, 1, message) {
+        wire.putNewId(message, callback.id)
+        endRequest(displayObject(display), message, false)
+    }
+    while !done && state.*.failure == FAIL_NONE {
+        if !flushOk(state) { return false }
+        dispatchAll(state)
+        if done { break }
+        if !receiveOnce(state, true) { return false }
+        dispatchAll(state)
+    }
+    return state.*.failure == FAIL_NONE
+}
 
 fn flushState(state: *State) -> Error!void {
     try check(state)

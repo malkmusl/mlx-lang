@@ -1,0 +1,365 @@
+// mlx-capture's OBS plugin: a source "MLX Capture" that shows the screen,
+// or one window, through the compositor's ext-image-copy-capture-v1
+// (client.mlx, as mlx-capture uses it). Built with `mlx4 --plugin`: a
+// shared object OBS loads, whose exported functions each run on an arena of
+// their own on whichever thread OBS calls them.
+//
+//   mlx4 --plugin projects/desktop/capture/obs.mlx -o mlx-capture.so
+//   ~/.config/obs-studio/plugins/mlx-capture/bin/64bit/mlx-capture.so
+//
+// The source is asynchronous (OBS_SOURCE_ASYNC_VIDEO): every frame the
+// compositor hands over (only when something changed) goes to OBS with
+// obs_source_output_video, which copies it. Its connection lives on OBS's
+// video thread (video_tick polls it, never waiting); the window list in the
+// source's properties comes from a connection of its own on the UI thread.
+// The setting "target" is "" for the screen, else the window's app id (or
+// identifier).
+const std = @import("std")
+const client = @import("./client.mlx")
+
+const Capture = client.Capture
+
+// libobs (in OBS's process) and libc.
+extern("c") fn obs_register_source_s(info: usize, size: usize) -> void
+extern("c") fn obs_source_output_video(source: usize, frame: usize) -> void
+extern("c") fn obs_properties_create() -> usize
+extern("c") fn obs_properties_add_list(properties: usize, name: [*]const u8, description: [*]const u8, kind: i32, format: i32) -> usize
+extern("c") fn obs_property_list_add_string(property: usize, name: [*]const u8, value: [*]const u8) -> usize
+extern("c") fn obs_data_get_string(data: usize, name: [*]const u8) -> usize
+extern("c") fn obs_data_set_default_string(data: usize, name: [*]const u8, value: [*]const u8) -> void
+extern("c") fn blog(level: i32, format: [*]const u8, text: [*]const u8) -> void
+
+// libobs 30's struct obs_source_info and struct obs_source_frame (byte
+// offsets; tools probed them from the headers).
+const INFO_SIZE: usize = 408
+const INFO_ID: usize = 0
+const INFO_TYPE: usize = 8
+const INFO_OUTPUT_FLAGS: usize = 12
+const INFO_GET_NAME: usize = 16
+const INFO_CREATE: usize = 24
+const INFO_DESTROY: usize = 32
+const INFO_GET_WIDTH: usize = 40
+const INFO_GET_HEIGHT: usize = 48
+const INFO_GET_DEFAULTS: usize = 56
+const INFO_GET_PROPERTIES: usize = 64
+const INFO_UPDATE: usize = 72
+const INFO_VIDEO_TICK: usize = 112
+const INFO_ICON_TYPE: usize = 288
+const FRAME_SIZE: usize = 232
+const FRAME_DATA: usize = 0
+const FRAME_LINESIZE: usize = 64
+const FRAME_WIDTH: usize = 96
+const FRAME_HEIGHT: usize = 100
+const FRAME_TIMESTAMP: usize = 104
+const FRAME_FORMAT: usize = 112
+const FRAME_FULL_RANGE: usize = 180
+
+const SOURCE_TYPE_INPUT: u32 = 0
+// OBS_SOURCE_ASYNC_VIDEO | OBS_SOURCE_DO_NOT_DUPLICATE | OBS_SOURCE_SRGB.
+const OUTPUT_FLAGS: u32 = 32901
+const ICON_DESKTOP_CAPTURE: u32 = 6
+const VIDEO_FORMAT_BGRA: u32 = 7
+const VIDEO_FORMAT_BGRX: u32 = 8
+const COMBO_TYPE_LIST: i32 = 2
+const COMBO_FORMAT_STRING: i32 = 3
+const LOG_WARNING: i32 = 200
+const LOG_INFO: i32 = 300
+// libobs 30.0.0: the oldest libobs this plugin was made for.
+const API_VERSION: u32 = 503316480
+// How long a failed connection waits before the next attempt (ns).
+const RETRY: u64 = 2000000000
+
+// One MLX Capture source.
+const Source = struct {
+    source: usize
+    target: [65]u8
+    targetLength: usize
+    // The target changed (update, on the UI thread): the video thread
+    // starts over.
+    restart: bool
+    opened: bool
+    started: bool
+    lastAttempt: u64
+    saidNoCompositor: bool
+    saidFirstFrame: bool
+    frame: [232]u8
+    capture: Capture
+}
+
+fn text(literal: []const u8) -> [*]const u8 {
+    unsafe { return @ptrCast([*]const u8, literal) }
+}
+
+fn sourceAt(address: usize) -> *Source {
+    unsafe { return @ptrFromInt(*Source, address) }
+}
+
+fn captureOf(source: *Source) -> *Capture {
+    unsafe { return @ptrCast(*Capture, &source.*.capture) }
+}
+
+fn put32(bytes: [*]u8, at: usize, value: u32) -> void {
+    bytes[at] = @intCast(u8, value & 255)
+    bytes[at + 1] = @intCast(u8, (value >> 8) & 255)
+    bytes[at + 2] = @intCast(u8, (value >> 16) & 255)
+    bytes[at + 3] = @intCast(u8, value >> 24)
+}
+
+fn put64(bytes: [*]u8, at: usize, value: usize) -> void {
+    put32(bytes, at, @intCast(u32, value & 4294967295))
+    put32(bytes, at + 4, @intCast(u32, value >> 32))
+}
+
+// CLOCK_MONOTONIC in nanoseconds (OBS's os_gettime_ns).
+fn now() -> u64 {
+    var time: [2]usize = [2]usize{ 0, 0 }
+    const result = std.linux.syscall2(228, 1, @intFromPtr(&time))
+    return @intCast(u64, time[0]) * 1000000000 + @intCast(u64, time[1])
+}
+
+// A C string's bytes (up to 64) into the source's target.
+fn setTarget(source: *Source, value: usize) -> void {
+    var length: usize = 0
+    if value != 0 {
+        var bytes: [*]const u8 = undefined
+        unsafe { bytes = @ptrFromInt([*]const u8, value) }
+        while length < 64 && bytes[length] != 0 {
+            source.*.target[length] = bytes[length]
+            length += 1
+        }
+    }
+    source.*.target[length] = 0
+    source.*.targetLength = length
+}
+
+fn targetOf(source: *Source) -> []const u8 {
+    var bytes: [*]const u8 = undefined
+    unsafe { bytes = @ptrCast([*]const u8, &source.*.target) }
+    return bytes[0..source.*.targetLength]
+}
+
+// ---------------------------------------------------------------------------
+// The module
+
+export fn obs_module_set_pointer(module: usize) -> void {}
+
+export fn obs_module_ver() -> u32 { return API_VERSION }
+
+export fn obs_module_name() -> [*]const u8 { return text("MLX Capture") }
+
+export fn obs_module_description() -> [*]const u8 { return text("The screen or a window of the Mlx compositor (ext-image-copy-capture-v1)") }
+
+export fn obs_module_load() -> bool {
+    const allocator = std.page_allocator.init()
+    const memory = allocator.alloc(INFO_SIZE, 16)
+    if memory == null { return false }
+    const info = memory.?
+    var index: usize = 0
+    while index < INFO_SIZE {
+        info[index] = 0
+        index += 1
+    }
+    put64(info, INFO_ID, @intFromPtr(text("mlx_capture_source")))
+    put32(info, INFO_TYPE, SOURCE_TYPE_INPUT)
+    put32(info, INFO_OUTPUT_FLAGS, OUTPUT_FLAGS)
+    put64(info, INFO_GET_NAME, @intFromPtr(mlx_capture_get_name))
+    put64(info, INFO_CREATE, @intFromPtr(mlx_capture_create))
+    put64(info, INFO_DESTROY, @intFromPtr(mlx_capture_destroy))
+    put64(info, INFO_GET_WIDTH, @intFromPtr(mlx_capture_get_width))
+    put64(info, INFO_GET_HEIGHT, @intFromPtr(mlx_capture_get_height))
+    put64(info, INFO_GET_DEFAULTS, @intFromPtr(mlx_capture_get_defaults))
+    put64(info, INFO_GET_PROPERTIES, @intFromPtr(mlx_capture_get_properties))
+    put64(info, INFO_UPDATE, @intFromPtr(mlx_capture_update))
+    put64(info, INFO_VIDEO_TICK, @intFromPtr(mlx_capture_video_tick))
+    put32(info, INFO_ICON_TYPE, ICON_DESKTOP_CAPTURE)
+    // libobs copies the record.
+    obs_register_source_s(@intFromPtr(info), INFO_SIZE)
+    allocator.free(info, INFO_SIZE, 16)
+    blog(LOG_INFO, text("[mlx-capture] %s"), text("loaded: source MLX Capture"))
+    return true
+}
+
+// ---------------------------------------------------------------------------
+// The source
+
+export fn mlx_capture_get_name(type_data: usize) -> [*]const u8 { return text("MLX Capture") }
+
+export fn mlx_capture_create(settings: usize, obs_source: usize) -> usize {
+    const allocator = std.page_allocator.init()
+    const memory = allocator.alloc(@sizeOf(Source), 16)
+    if memory == null { return 0 }
+    var source: *Source = undefined
+    unsafe { source = @ptrCast(*Source, memory.?) }
+    source.*.source = obs_source
+    source.*.restart = false
+    source.*.opened = false
+    source.*.started = false
+    source.*.lastAttempt = 0
+    source.*.saidNoCompositor = false
+    source.*.saidFirstFrame = false
+    source.*.capture.connected = false
+    source.*.capture.width = 0
+    source.*.capture.height = 0
+    setTarget(source, obs_data_get_string(settings, text("target")))
+    return @intFromPtr(memory.?)
+}
+
+export fn mlx_capture_destroy(data: usize) -> void {
+    if data == 0 { return }
+    const source = sourceAt(data)
+    client.close(captureOf(source))
+    var memory: [*]u8 = undefined
+    unsafe { memory = @ptrFromInt([*]u8, data) }
+    std.page_allocator.init().free(memory, @sizeOf(Source), 16)
+}
+
+export fn mlx_capture_get_width(data: usize) -> u32 { return if data == 0 { 0 } else { sourceAt(data).*.capture.width } }
+
+export fn mlx_capture_get_height(data: usize) -> u32 { return if data == 0 { 0 } else { sourceAt(data).*.capture.height } }
+
+export fn mlx_capture_get_defaults(settings: usize) -> void {
+    obs_data_set_default_string(settings, text("target"), text(""))
+}
+
+export fn mlx_capture_update(data: usize, settings: usize) -> void {
+    if data == 0 { return }
+    const source = sourceAt(data)
+    setTarget(source, obs_data_get_string(settings, text("target")))
+    source.*.restart = true
+}
+
+// "Title (app id)" as a C string.
+fn labelOf(window: *const client.Window, target: [*]u8) -> void {
+    var length: usize = 0
+    for byte in client.titleOf(window) {
+        if length < 120 {
+            target[length] = byte
+            length += 1
+        }
+    }
+    const app_id = client.appIdOf(window)
+    if app_id.length > 0 {
+        target[length] = 32
+        target[length + 1] = 40
+        length += 2
+        for byte in app_id {
+            if length < 190 {
+                target[length] = byte
+                length += 1
+            }
+        }
+        target[length] = 41
+        length += 1
+    }
+    target[length] = 0
+}
+
+// The choice of what to capture: the screen, or one of the windows open
+// now (asked for on a connection of its own: this runs on OBS's UI thread).
+export fn mlx_capture_get_properties(data: usize) -> usize {
+    const properties = obs_properties_create()
+    const list = obs_properties_add_list(properties, text("target"), text("Capture"), COMBO_TYPE_LIST, COMBO_FORMAT_STRING)
+    const added = obs_property_list_add_string(list, text("Screen"), text(""))
+    const allocator = std.page_allocator.init()
+    const memory = allocator.alloc(@sizeOf(Capture), 16)
+    if memory == null { return properties }
+    var capture: *Capture = undefined
+    unsafe { capture = @ptrCast(*Capture, memory.?) }
+    if client.open(capture, "") {
+        var label: [200]u8 = undefined
+        var label_bytes: [*]u8 = undefined
+        unsafe { label_bytes = @ptrCast([*]u8, &label) }
+        var index: usize = 0
+        while index < capture.*.windowCount {
+            const window = &capture.*.windows[index]
+            if !window.*.closed {
+                labelOf(window, label_bytes)
+                // The app id is the value (it outlives the window); without
+                // one, its identifier.
+                var value: [*]const u8 = undefined
+                unsafe { value = if window.*.appIdLength > 0 { @ptrCast([*]const u8, &window.*.appId) } else { @ptrCast([*]const u8, &window.*.identifier) } }
+                const added_window = obs_property_list_add_string(list, label_bytes, value)
+            }
+            index += 1
+        }
+        client.close(capture)
+    }
+    allocator.free(memory.?, @sizeOf(Capture), 16)
+    return properties
+}
+
+// Hands the frame just copied to OBS (it copies it).
+fn output(source: *Source) -> void {
+    const capture = captureOf(source)
+    var frame: [*]u8 = undefined
+    unsafe { frame = @ptrCast([*]u8, &source.*.frame) }
+    var index: usize = 0
+    while index < FRAME_SIZE {
+        frame[index] = 0
+        index += 1
+    }
+    put64(frame, FRAME_DATA, @intFromPtr(client.pixels(capture)))
+    put32(frame, FRAME_LINESIZE, capture.*.width * 4)
+    put32(frame, FRAME_WIDTH, capture.*.width)
+    put32(frame, FRAME_HEIGHT, capture.*.height)
+    put64(frame, FRAME_TIMESTAMP, @intCast(usize, if capture.*.time != 0 { capture.*.time } else { now() }))
+    // A window keeps its translucency; the screen is opaque.
+    put32(frame, FRAME_FORMAT, if source.*.targetLength > 0 { VIDEO_FORMAT_BGRA } else { VIDEO_FORMAT_BGRX })
+    frame[FRAME_FULL_RANGE] = 1
+    obs_source_output_video(source.*.source, @intFromPtr(frame))
+    if !source.*.saidFirstFrame {
+        source.*.saidFirstFrame = true
+        blog(LOG_INFO, text("[mlx-capture] %s"), text("first frame handed to OBS"))
+    }
+}
+
+// Each video frame of OBS's: the connection is polled (never waited for),
+// a frame that came goes to OBS, and the next is asked for (the compositor
+// answers when something changed).
+export fn mlx_capture_video_tick(data: usize, seconds: f32) -> void {
+    if data == 0 { return }
+    const source = sourceAt(data)
+    const capture = captureOf(source)
+    if !source.*.opened {
+        const time = now()
+        if source.*.lastAttempt != 0 && time - source.*.lastAttempt < RETRY { return }
+        source.*.lastAttempt = time
+        source.*.opened = client.open(capture, "")
+        if !source.*.opened {
+            if !source.*.saidNoCompositor { blog(LOG_WARNING, text("[mlx-capture] %s"), text("no Mlx compositor with ext-image-copy-capture-v1 (WAYLAND_DISPLAY); trying again")) }
+            source.*.saidNoCompositor = true
+            return
+        }
+        blog(LOG_INFO, text("[mlx-capture] %s"), text("connected to the compositor"))
+        source.*.started = false
+    }
+    if !client.poll(capture) {
+        blog(LOG_WARNING, text("[mlx-capture] %s"), text("the compositor went; trying again"))
+        client.close(capture)
+        source.*.opened = false
+        source.*.started = false
+        return
+    }
+    if source.*.restart {
+        source.*.restart = false
+        client.stop(capture)
+        source.*.started = false
+    }
+    if !source.*.started {
+        source.*.started = client.start(capture, targetOf(source))
+        return
+    }
+    if capture.*.stopped {
+        // The window went: when it (or one of its app) is back, again.
+        client.stop(capture)
+        source.*.started = false
+        return
+    }
+    if capture.*.ready {
+        capture.*.ready = false
+        output(source)
+    }
+    if !capture.*.capturing && capture.*.constraintsDone {
+        const asked = client.requestFrame(capture)
+    }
+}

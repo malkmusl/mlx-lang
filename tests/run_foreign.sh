@@ -69,6 +69,49 @@ else
     failures=$((failures + 1))
 fi
 
+# A plugin (--plugin): a shared object a C host loads (python3's ctypes),
+# called on four threads at once, many times: each call has an arena of its
+# own, given back on return (the process does not grow).
+if ! command -v python3 > /dev/null; then
+    echo "skip --plugin (no python3)"
+elif "$compiler" --quiet --plugin tests/support/plugin_library.mlx -o "$work/libplugin.so" 2> "$work/errors"; then
+    if python3 - "$work/libplugin.so" > "$work/output" 2>&1 <<'PY'
+import ctypes, sys, threading
+library = ctypes.CDLL(sys.argv[1])
+library.mlx_plugin_sum.restype = ctypes.c_int64
+library.mlx_plugin_sum.argtypes = [ctypes.c_int64]
+library.mlx_plugin_twice.restype = ctypes.c_int64
+library.mlx_plugin_twice.argtypes = [ctypes.c_int64]
+def resident():
+    return int(open('/proc/self/statm').read().split()[1])
+failures = []
+def work():
+    for _ in range(2000):
+        if library.mlx_plugin_sum(1000) != 4 * 999 * 1000 // 2:
+            failures.append('sum')
+        if library.mlx_plugin_twice(21) != 42:
+            failures.append('twice')
+before = resident()
+threads = [threading.Thread(target=work) for _ in range(4)]
+for thread in threads: thread.start()
+for thread in threads: thread.join()
+grown = resident() - before
+assert not failures, failures[:3]
+assert grown < 4096, grown
+PY
+    then
+        echo "ok   --plugin: a C host calls its exports on four threads, each call on its own arena"
+    else
+        echo "FAIL --plugin"
+        cat "$work/output"
+        failures=$((failures + 1))
+    fi
+else
+    echo "FAIL (compile) tests/support/plugin_library.mlx"
+    cat "$work/errors"
+    failures=$((failures + 1))
+fi
+
 # A program without foreign or exported functions stays a static executable.
 "$compiler" --quiet tests/07_functions.mlx -o "$work/static"
 if [[ "$(head -c 20 "$work/static" | od -An -tx1 -j16 -N2 | tr -d ' ')" != "0200" ]] || grep -q "ld-linux" "$work/static"; then

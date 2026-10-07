@@ -13,7 +13,7 @@
 #   PREFIX/bin/mlx-compositor, PREFIX/bin/mlx-terminal, PREFIX/bin/mlx-session,
 #   PREFIX/bin/mlx-dock, PREFIX/bin/mlx-topbar, PREFIX/bin/mlx-launcher,
 #   PREFIX/bin/mlx-settings, PREFIX/bin/mlx-files, PREFIX/bin/mlx-codemap,
-#                                     PREFIX/bin/mlx-profile
+#                                     PREFIX/bin/mlx-profile, PREFIX/bin/mlx-capture
 #   PREFIX/share/applications/mlx-settings.desktop, org.mlx.files.desktop,
 #                                     org.mlx.observatory.desktop (the launcher
 #                                     lists them; MLX Observatory shows this
@@ -24,6 +24,8 @@
 #   ~/.local/lib/mlx-compositor/libmlx-shell.so, libmlx-render.so (for the
 #   user running this; the session loads them, and loads them again when
 #   tools/build_compositor_modules.sh rebuilds them)
+#   ~/.config/obs-studio/plugins/mlx-capture/bin/64bit/mlx-capture.so (the
+#   OBS source "MLX Capture", for the user running this)
 #
 # Usage: tools/install_compositor_session.sh [options]
 #   --prefix DIR      programs go to DIR/bin (default /usr/local)
@@ -62,7 +64,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 bindir="$prefix/bin"
-programs=(mlx-compositor mlx-terminal mlx-session mlx-dock mlx-topbar mlx-launcher mlx-settings mlx-files mlx-observatory mlx-codemap mlx-profile mlx-screenshot)
+programs=(mlx-compositor mlx-terminal mlx-session mlx-dock mlx-topbar mlx-launcher mlx-settings mlx-files mlx-observatory mlx-codemap mlx-profile mlx-capture)
 applications="$prefix/share/applications"
 icons="$prefix/share/icons/hicolor/128x128/apps"
 
@@ -109,17 +111,18 @@ echo "building with $compiler"
 "$compiler" --quiet projects/desktop/files/main.mlx -o "$build/mlx-files"
 "$compiler" --quiet projects/observatory/main.mlx -o "$build/mlx-observatory"
 "$compiler" --quiet tools/profile/main.mlx -o "$build/mlx-profile"
-"$compiler" --quiet projects/desktop/screenshot/main.mlx -o "$build/mlx-screenshot"
+"$compiler" --quiet projects/desktop/capture/main.mlx -o "$build/mlx-capture"
+"$compiler" --quiet --plugin projects/desktop/capture/obs.mlx -o "$build/mlx-capture.so"
 sed "s|@BINDIR@|$bindir|g" projects/desktop/settings/mlx-settings.desktop.in > "$build/mlx-settings.desktop"
 sed "s|@BINDIR@|$bindir|g" projects/desktop/files/org.mlx.files.desktop.in > "$build/org.mlx.files.desktop"
 sed "s|@BINDIR@|$bindir|g; s|@ROOT@|$repo_root|g" projects/observatory/org.mlx.observatory.desktop.in > "$build/org.mlx.observatory.desktop"
 sed "s|@BINDIR@|$bindir|g" projects/desktop/compositor/session/mlx-compositor.desktop.in > "$build/mlx-compositor.desktop"
-echo "built $build/mlx-compositor, mlx-terminal, mlx-dock, mlx-topbar, mlx-launcher, mlx-settings, mlx-files, mlx-observatory, mlx-profile and mlx-screenshot"
+echo "built $build/mlx-compositor, mlx-terminal, mlx-dock, mlx-topbar, mlx-launcher, mlx-settings, mlx-files, mlx-observatory, mlx-profile, mlx-capture and its OBS plugin"
 [[ $build_only -eq 1 ]] && exit 0
 
 # Install.
 as_owner "$destdir$bindir" install -d "$destdir$bindir"
-as_owner "$destdir$bindir" install -m 755 "$build/mlx-compositor" "$build/mlx-terminal" "$build/mlx-dock" "$build/mlx-topbar" "$build/mlx-launcher" "$build/mlx-settings" "$build/mlx-files" "$build/mlx-observatory" "$build/mlx-profile" "$build/mlx-screenshot" projects/desktop/compositor/session/mlx-session "$destdir$bindir/"
+as_owner "$destdir$bindir" install -m 755 "$build/mlx-compositor" "$build/mlx-terminal" "$build/mlx-dock" "$build/mlx-topbar" "$build/mlx-launcher" "$build/mlx-settings" "$build/mlx-files" "$build/mlx-observatory" "$build/mlx-profile" "$build/mlx-capture" projects/desktop/compositor/session/mlx-session "$destdir$bindir/"
 # The command line of the code map under its own name (the same program).
 as_owner "$destdir$bindir" ln -sf mlx-observatory "$destdir$bindir/mlx-codemap"
 as_owner "$destdir$sessions" install -d "$destdir$sessions"
@@ -134,6 +137,11 @@ echo "installed $destdir$sessions/mlx-compositor.desktop"
 # staging a package).
 if [[ -z "$destdir" ]]; then
     tools/build_compositor_modules.sh --compiler "$compiler"
+    # OBS's per-user plugin directory.
+    obs_plugin="${XDG_CONFIG_HOME:-$HOME/.config}/obs-studio/plugins/mlx-capture/bin/64bit"
+    mkdir -p "$obs_plugin"
+    install -m 755 "$build/mlx-capture.so" "$obs_plugin/mlx-capture.so"
+    echo "installed $obs_plugin/mlx-capture.so"
 fi
 
 if [[ -z "$destdir" ]]; then

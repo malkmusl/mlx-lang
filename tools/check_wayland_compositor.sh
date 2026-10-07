@@ -35,7 +35,7 @@
 #  11. mlx-settings records hotkeys: while it records, the compositor
 #      passes every key to it (keyboard-shortcuts-inhibit), Super+Up too;
 #      Backspace unbinds one; the compositor takes the new keys at once.
-#  12. mlx-screenshot captures the screen and a window
+#  12. mlx-capture captures the screen and a window
 #      (ext-image-copy-capture-v1): the PNGs agree, and a later frame
 #      waits for damage.
 #  13. with Xwayland and xev: an X program's window shows, takes focus and
@@ -438,21 +438,21 @@ echo "ok   mlx-settings records hotkeys (the compositor's too) and the composito
 
 # Scenario 12: screen and window capture (ext-image-copy-capture-v1 with
 # ext-image-capture-source-v1 and ext-foreign-toplevel-list-v1), with
-# projects/desktop/screenshot: the window list names mlx-settings; the
+# projects/desktop/capture (mlx-capture): the window list names mlx-settings; the
 # screen and the window are saved as PNGs whose pixels agree (the window's
 # content at (24, 24) on the screen); a second frame of the screen waits
 # until something changes (the pointer moves) and carries only that as
 # damage.
-"$compiler" --quiet projects/desktop/screenshot/main.mlx -o "$work/mlx-screenshot"
+"$compiler" --quiet projects/desktop/capture/main.mlx -o "$work/mlx-capture"
 cat > "$work/capture.sh" <<SCRIPT
 #!/bin/sh
 sleep 2
-"$work/mlx-screenshot" --list > "$work/capture-list.log" 2>&1
-"$work/mlx-screenshot" "$work/capture-screen.png" > "$work/capture.log" 2>&1
-"$work/mlx-screenshot" --window org.mlx.settings "$work/capture-window.png" >> "$work/capture.log" 2>&1
+"$work/mlx-capture" --list > "$work/capture-list.log" 2>&1
+"$work/mlx-capture" "$work/capture-screen.png" > "$work/capture.log" 2>&1
+"$work/mlx-capture" --window org.mlx.settings "$work/capture-window.png" >> "$work/capture.log" 2>&1
 # (A client leaving redraws everything: that frame first.)
 sleep 1
-"$work/mlx-screenshot" --frames 2 "$work/capture-frames.png" >> "$work/capture.log" 2>&1
+"$work/mlx-capture" --frames 2 "$work/capture-frames.png" >> "$work/capture.log" 2>&1
 SCRIPT
 chmod +x "$work/capture.sh"
 cat > "$work/capture.script" <<SCRIPT
@@ -469,7 +469,7 @@ close
 SCRIPT
 run_scenario capture "$work/capture.script" --no-fps --run "$work/mlx-settings" --run "$work/capture.sh"
 grep -q "org.mlx.settings  Settings" "$work/capture-list.log" || { echo "the window list does not name mlx-settings" >&2; cat "$work/capture-list.log" "$work/capture-compositor.log" >&2; exit 1; }
-[[ $(grep -c "^saved " "$work/capture.log") -eq 3 ]] || { echo "mlx-screenshot did not save three captures" >&2; cat "$work/capture.log" "$work/capture-compositor.log" >&2; exit 1; }
+[[ $(grep -c "^saved " "$work/capture.log") -eq 3 ]] || { echo "mlx-capture did not save three captures" >&2; cat "$work/capture.log" "$work/capture-compositor.log" >&2; exit 1; }
 python3 - "$work" <<'PY'
 import struct, sys, zlib
 def load(path):

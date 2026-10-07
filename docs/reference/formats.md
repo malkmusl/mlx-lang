@@ -140,6 +140,17 @@ A shared object has no aggregate arena of its own: its exported functions
 keep the caller's (see [ABI](abi.md#c-functions-externc-and-export-fn)), so
 it is meant to be loaded by an Mlx program and called on its threads, its
 functions and the functions it hands out as pointers alike.
+
+`mlx4 --plugin` writes the same kind of object for a host that is not an
+Mlx program (an OBS plugin): each exported function, on entry, reserves an
+aggregate arena of its own (256 MiB of address space, `MAP_NORESERVE`:
+only the pages it touches count) and unmaps it on return, keeping its
+results. Calls on several of the host's threads at once each have their
+own, and a host calling for hours does not grow the process. What has to
+outlive a call goes in memory from an allocator; functions handed to the
+host as callbacks are `export fn` too. `tests/run_foreign.sh` loads
+`tests/support/plugin_library.mlx` from python3 (ctypes) and calls it on
+four threads at once; `projects/desktop/capture/obs.mlx` is such a plugin.
 `tests/271_shared_object_runtime.mlx` (run by `tests/run_foreign.sh`) loads
 `tests/support/shared_object_library.mlx` twice from two copies, calls it
 through `dlsym` and through function pointers it returns, and checks that

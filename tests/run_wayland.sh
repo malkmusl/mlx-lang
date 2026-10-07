@@ -66,7 +66,7 @@ for test in tests/268_compositor_damage_runtime.mlx tests/270_compositor_input_r
     fi
 done
 
-for example in examples/wayland-client/main.mlx examples/wayland-server/main.mlx projects/desktop/terminal/main.mlx projects/desktop/compositor/main.mlx projects/desktop/dock/main.mlx projects/desktop/launcher/main.mlx projects/desktop/settings/main.mlx tools/wayland-test-host/main.mlx; do
+for example in examples/wayland-client/main.mlx examples/wayland-server/main.mlx projects/desktop/terminal/main.mlx projects/desktop/compositor/main.mlx projects/desktop/dock/main.mlx projects/desktop/launcher/main.mlx projects/desktop/settings/main.mlx projects/desktop/capture/main.mlx tools/wayland-test-host/main.mlx; do
     if "$compiler" --quiet "$example" -o "$work/example"; then
         echo "ok   $example (builds)"
     else
@@ -85,6 +85,13 @@ for module in shell render; do
         failures=$((failures + 1))
     fi
 done
+# mlx-capture's OBS plugin (a plugin: arenas of its own for OBS's threads).
+if "$compiler" --quiet --plugin projects/desktop/capture/obs.mlx -o "$work/mlx-capture.so"; then
+    echo "ok   projects/desktop/capture/obs.mlx (builds with --plugin)"
+else
+    echo "FAIL (compile) projects/desktop/capture/obs.mlx"
+    failures=$((failures + 1))
+fi
 if python3 tools/check_compositor_modules.py > /dev/null; then
     echo "ok   the compositor shell's handler tables are complete"
 else
