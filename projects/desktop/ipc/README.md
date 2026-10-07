@@ -2,9 +2,10 @@
 
 MLXIPC is the desktop's message bus: `mlx-ipcd`, a session bus that D-Bus
 programs use as they would dbus-daemon, with what the D-Bus session bus
-lacks: permissions per app, and direct channels between two apps past
-the bus. It is written in Mlx on `std.dbus` (no libc, no libdbus) and is
-the base MLX Audio (the PipeWire replacement) will build on.
+lacks: permissions per app, permissions services ask about, and direct
+channels between two apps past the bus. It is written in Mlx on
+`std.dbus` (no libc, no libdbus). MLX Audio (`projects/desktop/audio`,
+the PipeWire replacement) runs on it.
 
 ```sh
 mlx4 projects/desktop/ipc/main.mlx -o mlx-ipcd
@@ -56,12 +57,16 @@ runs as the same user. MLXIPC's is per app, as in hyprtavern:
   ListNames, GetNameOwner, NameOwnerChanged). A rule names the connection
   it talks to by any name that connection owns, as dbus-daemon's
   `send_destination` does.
+- And **use** a service's permission: `audio.play`, `audio.record`
+  (MLX Audio). Services ask the bus (`org.mlx.IPC.Check(s app's
+  connection, s permission) -> b`) before they do what it names, so the
+  rules for every service are in one place.
 - By default an unsandboxed app may do anything (as on any session bus),
   and a sandboxed one may own its own names (its id and the names under
   it), talk to and see those, other connections of the same app, the
-  portals (`org.freedesktop.portal.*`) and
-  `org.freedesktop.Notifications`; it sees nothing else, not even the
-  other connections' unique names. Replies to calls an app made always
+  portals (`org.freedesktop.portal.*`), `org.freedesktop.Notifications`
+  and MLX Audio (`org.mlx.Audio`), and use `audio.play`; it sees nothing
+  else, not even the other connections' unique names. Replies to calls an app made always
   come back; a reply nobody asked for needs the rules.
 - `~/.config/mlx/ipc.conf` (`--policy FILE`) adds rules, read again when
   it changes (and on SIGHUP, ReloadConfig, `mlx-ipc reload`). The last
@@ -70,7 +75,7 @@ runs as the same user. MLXIPC's is per app, as in hyprtavern:
 ```
 # MLXIPC permissions
 group media obs com.obsproject.Studio
-allow @media talk,see org.mlx.Audio
+allow @media use audio.record
 allow org.mozilla.firefox talk org.freedesktop.secrets
 deny firefox talk org.freedesktop.secrets
 deny @sandboxed own *
@@ -89,12 +94,13 @@ pair, hands one end to the caller and the other to NAME's owner (a call
 `org.mlx.IPC.Peer.Connected(h channel, s caller, s app)` that wants no
 reply), and from then on the two talk directly, in D-Bus messages or a
 protocol of their own; the bus never sees that traffic. The policy
-decides as for a call: the caller must be allowed to talk to NAME. MLX
-Audio's streams will go this way (and their buffers as memfds through
-it).
+decides as for a call: the caller must be allowed to talk to NAME. The
+bus remembers who opened each channel, so the service can still Check
+the app's permissions after the app left the bus. MLX Audio's streams go
+this way.
 
-`org.mlx.IPC` also answers GetAppId(s) -> (s app, b sandboxed),
-ListApps() -> a(ssbu) and Reload().
+`org.mlx.IPC` also answers Check(s, s) -> b, GetAppId(s) -> (s app, b
+sandboxed), ListApps() -> a(ssbu) and Reload().
 
 ## mlx-ipc
 
@@ -126,5 +132,3 @@ mlx-ipc connect NAME       a direct channel to NAME; prints what comes through
 - Permission prompts: an app asks, the user answers once in a dialog of
   the desktop's, and the answer goes into `ipc.conf`; the rules in
   mlx-settings.
-- MLX Audio on it: the audio server as a bus name, streams over direct
-  channels.

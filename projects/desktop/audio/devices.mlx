@@ -1,0 +1,381 @@
+// Where the mix goes and where recordings come from:
+//
+//   output  auto (the first sound card, else null), alsa[:pcmC1D0p],
+//           file:PATH.wav (the mix, 16-bit stereo, written as it plays),
+//           null (played to nobody, at the real pace)
+//   input   auto (the first sound card's capture, else none), alsa[:NAME],
+//           sine:HZ (a tone), file:PATH.wav (looped), none (silence)
+//
+// A sound card paces the server itself (the event loop moves a period
+// whenever it has room); otherwise a timer does, a period at a time.
+const std = @import("std")
+const audio = @import("std.audio")
+const wav = @import("std.wav")
+const state = @import("./state.mlx")
+const samples = @import("./samples.mlx")
+const alsa = @import("./alsa.mlx")
+
+const SYS_open: usize = 2
+const SYS_close: usize = 3
+const SYS_write: usize = 1
+const SYS_pwrite: usize = 18
+const SYS_lseek: usize = 8
+const O_WRONLY: usize = 1
+const O_CREAT: usize = 64
+const O_TRUNC: usize = 512
+const O_CLOEXEC: usize = 524288
+
+pub fn outputOf(server: *state.Server) -> *state.Device {
+    unsafe { return @ptrCast(*state.Device, &server.*.output) }
+}
+
+pub fn inputOf(server: *state.Server) -> *state.Device {
+    unsafe { return @ptrCast(*state.Device, &server.*.input) }
+}
+
+fn resamplerOf(device: *state.Device) -> *state.Resampler {
+    unsafe { return @ptrCast(*state.Resampler, &device.*.resampler) }
+}
+
+fn startsWith(text: []const u8, prefix: []const u8) -> bool {
+    if text.length < prefix.length { return false }
+    var index: usize = 0
+    while index < prefix.length {
+        if text[index] != prefix[index] { return false }
+        index += 1
+    }
+    return true
+}
+
+fn same(first: []const u8, second: []const u8) -> bool { return first.length == second.length && startsWith(first, second) }
+
+fn say(server: *state.Server, text: []const u8) -> void {
+    if server.*.verbose { const ignored = std.io.writeAll(std.io.stdout(), text) }
+}
+
+fn sayNumber(server: *state.Server, value: usize) -> void {
+    if server.*.verbose { const ignored = std.io.writeUnsigned(std.io.stdout(), value) }
+}
+
+// `text` NUL-terminated into the device's path.
+fn setPath(device: *state.Device, first: []const u8, second: []const u8) -> [*]const u8 {
+    var length: usize = 0
+    var index: usize = 0
+    while index < first.length && length < 250 {
+        device.*.path[length] = first[index]
+        length += 1
+        index += 1
+    }
+    index = 0
+    while index < second.length && length < 250 {
+        device.*.path[length] = second[index]
+        length += 1
+        index += 1
+    }
+    device.*.path[length] = 0
+    device.*.pathLength = length
+    unsafe { return @ptrCast([*]const u8, &device.*.path) }
+}
+
+fn reset(device: *state.Device) -> void {
+    device.*.kind = state.NONE
+    device.*.descriptor = -1
+    device.*.encoding = audio.S16
+    device.*.channels = 2
+    device.*.period = 0
+    device.*.buffer = 0
+    device.*.pathLength = 0
+    device.*.written = 0
+    device.*.dataLength = 0
+    device.*.position = 0
+    device.*.pendingCount = 0
+    device.*.phase = 0
+    device.*.phaseStep = 0
+    device.*.xruns = 0
+}
+
+// Opens the first sound card's PCM device for playing (`suffix` "p") or
+// recording ("c"), or the one `name` names.
+fn openCard(server: *state.Server, device: *state.Device, name: []const u8, capture: bool) -> bool {
+    const suffix = if capture { "c" } else { "p" }
+    if name.length > 0 {
+        const path = if name[0] == 47 { setPath(device, name, "") } else { setPath(device, "/dev/snd/", name) }
+        return alsa.open(device, path, capture, server.*.rate, server.*.period)
+    }
+    var card: u8 = 0
+    while card < 8 {
+        var first: [16]u8 = undefined
+        const prefix = "pcmC"
+        var at: usize = 0
+        while at < 4 {
+            first[at] = prefix[at]
+            at += 1
+        }
+        first[4] = 48 + card
+        first[5] = 68
+        first[6] = 48
+        first[7] = suffix[0]
+        var name_bytes: [*]const u8 = undefined
+        unsafe { name_bytes = @ptrCast([*]const u8, &first) }
+        const path = setPath(device, "/dev/snd/", name_bytes[0..8])
+        if alsa.open(device, path, capture, server.*.rate, server.*.period) { return true }
+        card += 1
+    }
+    return false
+}
+
+// Reads the file at `path` (NUL-terminated) whole into allocated memory:
+// its length, 0 when it cannot.
+fn readWhole(server: *state.Server, path: [*]const u8, device: *state.Device) -> usize {
+    const file = std.fs.open(path, O_CLOEXEC, 0)
+    if file.descriptor < 0 { return 0 }
+    var status: std.fs.Stat = undefined
+    if std.fs.fileStatus(file, &status) != 0 || status.size <= 0 || status.size > 268435456 {
+        const closed = std.fs.close(file)
+        return 0
+    }
+    const size = @intCast(usize, status.size)
+    const memory = server.*.allocator.alloc(size, 16)
+    if memory == null { return 0 }
+    var length: usize = 0
+    while length < size {
+        var at: [*]u8 = undefined
+        unsafe { at = @ptrFromInt([*]u8, @intFromPtr(memory.?) + length) }
+        const got = std.fs.read(file, at, size - length)
+        if got <= 0 { break }
+        length += @intCast(usize, got)
+    }
+    const closed = std.fs.close(file)
+    device.*.data = memory.?
+    return length
+}
+
+fn parseNumber(text: []const u8) -> u32 {
+    var value: u32 = 0
+    var index: usize = 0
+    while index < text.length && text[index] >= 48 && text[index] <= 57 {
+        value = value * 10 + @intCast(u32, text[index] - 48)
+        index += 1
+    }
+    return value
+}
+
+// Opens the output `spec`; false (and why, said) when it cannot.
+pub fn openOutput(server: *state.Server, spec: []const u8) -> bool {
+    const device = outputOf(server)
+    reset(device)
+    if same(spec, "auto") || startsWith(spec, "alsa") {
+        const name = if startsWith(spec, "alsa:") { spec[5..spec.length] } else { spec[0..0] }
+        if openCard(server, device, name, false) {
+            server.*.rate = device.*.rate
+            server.*.period = device.*.period
+            say(server, "audio: playing to ")
+            say(server, device.*.path[0..device.*.pathLength])
+            say(server, " at ")
+            sayNumber(server, @intCast(usize, device.*.rate))
+            say(server, " Hz, periods of ")
+            sayNumber(server, device.*.period)
+            say(server, " frames\n")
+            return true
+        }
+        if !same(spec, "auto") {
+            const said = std.io.eprintln("mlx-audiod: the sound card could not be opened (missing, or another sound server has it)")
+            return false
+        }
+        say(server, "audio: no sound card; playing to nobody\n")
+        device.*.kind = state.NULL
+        return true
+    }
+    if same(spec, "null") {
+        device.*.kind = state.NULL
+        return true
+    }
+    if startsWith(spec, "file:") {
+        const path = setPath(device, spec[5..spec.length], "")
+        // O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC.
+        const descriptor = std.linux.syscall3(SYS_open, @intFromPtr(path), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 420)
+        if descriptor < 0 {
+            const said = std.io.eprintln("mlx-audiod: the output file could not be written")
+            return false
+        }
+        device.*.kind = state.FILE
+        device.*.descriptor = descriptor
+        writeFileHeader(device, server.*.rate)
+        // The samples follow the header (which is written in place, again
+        // and again, as they grow).
+        const moved = std.linux.syscall3(SYS_lseek, @bitCast(usize, descriptor), wav.HEADER_SIZE, 0)
+        return true
+    }
+    const said = std.io.eprintln("mlx-audiod: --output is auto, alsa[:NAME], file:PATH.wav or null")
+    return false
+}
+
+// Opens the input `spec`.
+pub fn openInput(server: *state.Server, spec: []const u8) -> bool {
+    const device = inputOf(server)
+    reset(device)
+    if same(spec, "auto") || startsWith(spec, "alsa") {
+        const name = if startsWith(spec, "alsa:") { spec[5..spec.length] } else { spec[0..0] }
+        if openCard(server, device, name, true) {
+            say(server, "audio: recording from ")
+            say(server, device.*.path[0..device.*.pathLength])
+            say(server, "\n")
+            if device.*.rate != server.*.rate { samples.startResampler(resamplerOf(device), device.*.rate, server.*.rate) }
+            return true
+        }
+        if !same(spec, "auto") {
+            const said = std.io.eprintln("mlx-audiod: the sound card's input could not be opened")
+            return false
+        }
+        device.*.kind = state.NONE
+        return true
+    }
+    if same(spec, "none") { return true }
+    if startsWith(spec, "sine:") {
+        const hertz = parseNumber(spec[5..spec.length])
+        device.*.kind = state.SINE
+        device.*.phaseStep = @intCast(u32, (@intCast(u64, hertz) << 32) / @intCast(u64, server.*.rate))
+        return true
+    }
+    if startsWith(spec, "file:") {
+        const path = setPath(device, spec[5..spec.length], "")
+        const length = readWhole(server, path, device)
+        var info: wav.Info = undefined
+        if length == 0 || !wav.parse(device.*.data, length, &info) {
+            const said = std.io.eprintln("mlx-audiod: the input file is not a WAVE file this reads")
+            return false
+        }
+        device.*.kind = state.FILE
+        device.*.position = info.dataStart
+        device.*.dataLength = info.dataStart + info.dataLength
+        device.*.fileChannels = info.channels
+        device.*.fileRate = info.rate
+        device.*.fileEncoding = if info.format == wav.FORMAT_FLOAT { audio.F32 } else if info.bits == 8 { state.U8 } else if info.bits == 16 { audio.S16 } else if info.bits == 24 { state.S24 } else { audio.S32 }
+        device.*.fileFrame = samples.bytesOf(device.*.fileEncoding) * @intCast(usize, info.channels)
+        // Its first frame, again and again from dataStart.
+        device.*.buffer = info.dataStart
+        samples.startResampler(resamplerOf(device), info.rate, server.*.rate)
+        return true
+    }
+    const said = std.io.eprintln("mlx-audiod: --input is auto, alsa[:NAME], sine:HZ, file:PATH.wav or none")
+    return false
+}
+
+fn writeFileHeader(device: *state.Device, rate: u32) -> void {
+    var header: [44]u8 = undefined
+    var bytes: [*]u8 = undefined
+    unsafe { bytes = @ptrCast([*]u8, &header) }
+    wav.writeHeader(bytes, rate, 2, wav.FORMAT_PCM, 16, device.*.written)
+    const written = std.linux.syscall4(SYS_pwrite, @bitCast(usize, device.*.descriptor), @intFromPtr(bytes), 44, 0)
+}
+
+// Plays `frames` frames of the device's bytes: how many it took (a sound
+// card may take fewer, or none, when it is full).
+pub fn play(server: *state.Server, bytes: [*]u8, frames: usize) -> usize {
+    const device = outputOf(server)
+    if device.*.kind == state.ALSA { return alsa.write(device, bytes, frames) }
+    if device.*.kind == state.FILE {
+        const length = frames * 4
+        const written = std.linux.syscall3(SYS_write, @bitCast(usize, device.*.descriptor), @intFromPtr(bytes), length)
+        if written > 0 { device.*.written += @intCast(usize, written) }
+        // The header follows about once a second, so that the file is
+        // whole even when the server is killed.
+        server.*.periods += 1
+        if server.*.periods % 100 == 0 { writeFileHeader(device, server.*.rate) }
+    }
+    return frames
+}
+
+// A period of input into `out` (interleaved stereo) from a tone, a file
+// or nothing.
+pub fn generate(server: *state.Server, out: [*]i32, frames: usize) -> void {
+    const device = inputOf(server)
+    var index: usize = 0
+    if device.*.kind == state.SINE {
+        while index < frames {
+            const value = samples.sine(device.*.phase)
+            out[index * 2] = value
+            out[index * 2 + 1] = value
+            device.*.phase +%= device.*.phaseStep
+            index += 1
+        }
+        return
+    }
+    if device.*.kind == state.FILE {
+        while index < frames {
+            if device.*.pendingCount == 0 {
+                var left: i32 = 0
+                var right: i32 = 0
+                samples.decodeFrame(device.*.data, device.*.position, device.*.fileEncoding, device.*.fileChannels, &left, &right)
+                device.*.position += device.*.fileFrame
+                if device.*.position + device.*.fileFrame > device.*.dataLength { device.*.position = device.*.buffer }
+                var pending: [*]i32 = undefined
+                unsafe { pending = @ptrCast([*]i32, &device.*.pending) }
+                device.*.pendingCount = samples.resample(resamplerOf(device), left, right, pending, 32)
+                device.*.pendingAt = 0
+            }
+            if device.*.pendingCount > 0 {
+                const at = device.*.pendingAt
+                out[index * 2] = device.*.pending[at * 2]
+                out[index * 2 + 1] = device.*.pending[at * 2 + 1]
+                device.*.pendingAt += 1
+                device.*.pendingCount -= 1
+                index += 1
+            }
+        }
+        return
+    }
+    while index < frames * 2 {
+        out[index] = 0
+        index += 1
+    }
+}
+
+// What the sound card recorded (up to `most` frames of its own), in the
+// server's rate, into `out`: how many frames.
+pub fn record(server: *state.Server, out: [*]i32, most: usize) -> usize {
+    const device = inputOf(server)
+    var frames = device.*.period
+    if frames > 2048 { frames = 2048 }
+    const got = alsa.read(device, server.*.recorded, frames)
+    const size = samples.bytesOf(device.*.encoding) * 2
+    var count: usize = 0
+    var index: usize = 0
+    var left: i32 = 0
+    var right: i32 = 0
+    while index < got {
+        samples.decodeFrame(server.*.recorded, index * size, device.*.encoding, 2, &left, &right)
+        if device.*.rate == server.*.rate {
+            if count < most {
+                out[count * 2] = left
+                out[count * 2 + 1] = right
+                count += 1
+            }
+        } else {
+            var made: [64]i32 = undefined
+            var made_bytes: [*]i32 = undefined
+            unsafe { made_bytes = @ptrCast([*]i32, &made) }
+            const produced = samples.resample(resamplerOf(device), left, right, made_bytes, 32)
+            var each: usize = 0
+            while each < produced && count < most {
+                out[count * 2] = made[each * 2]
+                out[count * 2 + 1] = made[each * 2 + 1]
+                count += 1
+                each += 1
+            }
+        }
+        index += 1
+    }
+    return count
+}
+
+pub fn close(server: *state.Server) -> void {
+    const output = outputOf(server)
+    if output.*.kind == state.ALSA { alsa.close(output) }
+    if output.*.kind == state.FILE {
+        writeFileHeader(output, server.*.rate)
+        const closed = std.linux.syscall1(SYS_close, @bitCast(usize, output.*.descriptor))
+    }
+    const input = inputOf(server)
+    if input.*.kind == state.ALSA { alsa.close(input) }
+}

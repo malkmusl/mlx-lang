@@ -1,0 +1,216 @@
+// mlx-audiod: MLX Audio, the desktop's sound server, on MLXIPC. It owns
+// org.mlx.Audio on the session bus (mlx-ipcd); apps reach it through
+// direct MLXIPC channels (std.audio's client), and the bus's per-app
+// permissions decide who may play (audio.play) and record (audio.record).
+// It mixes the playing streams (any rate, format and channel count,
+// converted to the device's) into the sound card, or a file, and hands
+// the recording streams the input. No libc, no alsa-lib, no PipeWire.
+//
+//     mlx4 projects/desktop/audio/main.mlx -o mlx-audiod
+//     mlx-ipcd --run sh -c 'mlx-audiod & mlx-audio play song.wav'
+//
+// Options:
+//     --output SPEC   auto (default: the first sound card, else nobody),
+//                     alsa[:pcmC1D0p], file:PATH.wav (the mix, as it plays)
+//                     or null
+//     --input SPEC    auto (default: the first sound card's capture, else
+//                     none), alsa[:NAME], sine:HZ, file:PATH.wav (looped) or
+//                     none
+//     --rate HZ       the mix's rate (default 48000; a sound card may
+//                     choose another)
+//     --period MS     how much it mixes at a time (default 10)
+//     --verbose       log apps, streams and refusals
+const std = @import("std")
+const dbus = @import("std.dbus")
+const audio = @import("std.audio")
+const turns_module = @import("std.turns")
+const crash = @import("std.crash")
+const state = @import("./state.mlx")
+const devices = @import("./devices.mlx")
+const mixer = @import("./mixer.mlx")
+const protocol = @import("./protocol.mlx")
+
+// Event tokens below any peer's address.
+const BUS: usize = 1
+const TIMER: usize = 2
+const SIGNALS: usize = 3
+const CARD_OUT: usize = 4
+const CARD_IN: usize = 5
+
+const SYS_read: usize = 0
+const SYS_rt_sigprocmask: usize = 14
+const SYS_signalfd4: usize = 289
+const SYS_timerfd_create: usize = 283
+const SYS_timerfd_settime: usize = 286
+const SYS_exit_group: usize = 231
+
+const Failure = error { Usage, NoMemory, NoDevice, NoBus, NoLoop }
+
+fn fail(message: []const u8, failure: Failure) -> Failure!void {
+    if message.length > 0 { const said = std.io.eprintln(message) }
+    return failure
+}
+
+fn named(text: std.string.String, name: []const u8) -> bool { return std.string.eql(text, std.string.fromSlice(name)) }
+
+fn number(text: std.string.String) -> u32 {
+    var value: u32 = 0
+    var index: usize = 0
+    while index < text.length && text.pointer[index] >= 48 && text.pointer[index] <= 57 {
+        value = value * 10 + @intCast(u32, text.pointer[index] - 48)
+        index += 1
+    }
+    return value
+}
+
+// A timer that fires every period.
+fn startTimer(server: *state.Server) -> isize {
+    // CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC.
+    const timer = std.linux.syscall2(SYS_timerfd_create, 1, 526336)
+    if timer < 0 { return timer }
+    const nanoseconds = @intCast(u64, server.*.period) * 1000000000 / @intCast(u64, server.*.rate)
+    var spec: [4]u64 = [4]u64{ nanoseconds / 1000000000, nanoseconds % 1000000000, nanoseconds / 1000000000, nanoseconds % 1000000000 }
+    const set = std.linux.syscall4(SYS_timerfd_settime, @bitCast(usize, timer), 0, @intFromPtr(&spec), 0)
+    return timer
+}
+
+fn serve(server: *state.Server, signals: isize) -> void {
+    // What the loop keeps comes before the turns' mark (each turn releases
+    // what was made after it).
+    var events: dbus.Events = undefined
+    var record: [128]u8 = undefined
+    var turns: turns_module.Turns = undefined
+    turns_module.begin(&turns, true, false)
+    while server.*.running {
+        turns_module.turn(&turns)
+        const count = dbus.waitEvents(server.*.eventLoop, &events, -1)
+        var index: usize = 0
+        while count > 0 && index < @intCast(usize, count) {
+            const token = dbus.eventToken(&events, index)
+            const flags = dbus.eventFlags(&events, index)
+            if token == BUS {
+                protocol.busReadable(server)
+            } else if token == TIMER {
+                var expirations: u64 = 0
+                if std.linux.syscall3(SYS_read, @bitCast(usize, server.*.timer), @intFromPtr(&expirations), 8) == 8 { mixer.timerPeriods(server, @intCast(usize, expirations)) }
+            } else if token == CARD_OUT {
+                mixer.cardWritable(server)
+            } else if token == CARD_IN {
+                mixer.cardReadable(server)
+            } else if token == SIGNALS {
+                while std.linux.syscall3(SYS_read, @bitCast(usize, signals), @intFromPtr(&record), 128) == 128 { server.*.running = false }
+            } else if protocol.isPeer(server, token) {
+                const peer = protocol.peerAt(token)
+                if !peer.*.dead && flags & (dbus.EPOLLIN | dbus.EPOLLHUP | dbus.EPOLLERR) != 0 { protocol.peerReadable(server, peer) }
+            }
+            index += 1
+        }
+        protocol.flushPeers(server)
+    }
+}
+
+fn run(arguments: [][*]const u8) -> !void {
+    const allocator = std.page_allocator.init()
+    var output = std.string.fromSlice("auto")
+    var input = std.string.fromSlice("auto")
+    var rate: u32 = 48000
+    var period_ms: u32 = 10
+    var verbose = false
+    var index: usize = 1
+    const count = std.process.count(arguments)
+    while index < count {
+        const argument = std.process.argument(arguments, index)
+        if named(argument, "--output") && index + 1 < count {
+            index += 1
+            output = std.process.argument(arguments, index)
+        } else if named(argument, "--input") && index + 1 < count {
+            index += 1
+            input = std.process.argument(arguments, index)
+        } else if named(argument, "--rate") && index + 1 < count {
+            index += 1
+            rate = number(std.process.argument(arguments, index))
+        } else if named(argument, "--period") && index + 1 < count {
+            index += 1
+            period_ms = number(std.process.argument(arguments, index))
+        } else if named(argument, "--verbose") {
+            verbose = true
+        } else {
+            try fail("usage: mlx-audiod [--output auto|alsa[:NAME]|file:PATH.wav|null] [--input auto|alsa[:NAME]|sine:HZ|file:PATH.wav|none] [--rate HZ] [--period MS] [--verbose]", Failure.Usage)
+        }
+        index += 1
+    }
+    if rate < 8000 || rate > 192000 { rate = 48000 }
+    if period_ms < 1 || period_ms > 100 { period_ms = 10 }
+    const memory = allocator.alloc(@sizeOf(state.Server), 16)
+    if memory == null { try fail("mlx-audiod: out of memory", Failure.NoMemory) }
+    var server: *state.Server = undefined
+    unsafe { server = @ptrCast(*state.Server, memory.?) }
+    server.*.allocator = allocator
+    server.*.running = true
+    server.*.verbose = verbose
+    server.*.peerCount = 0
+    server.*.rate = rate
+    server.*.period = @intCast(usize, rate * period_ms / 1000)
+    server.*.master = 65536
+    server.*.timer = -1
+    server.*.periods = 0
+    server.*.encodedStart = 0
+    server.*.encodedFrames = 0
+    var slot: usize = 0
+    while slot < state.MAX_STREAMS {
+        mixer.streamAt(server, slot).*.used = false
+        slot += 1
+    }
+    if !devices.openOutput(server, std.string.asSlice(output)) { try fail("", Failure.NoDevice) }
+    if !devices.openInput(server, std.string.asSlice(input)) { try fail("", Failure.NoDevice) }
+    // A period may be up to 2048 frames (a sound card's).
+    const most: usize = if server.*.period > 2048 { server.*.period } else { 2048 }
+    const mix = allocator.alloc(most * 8, 16)
+    const captured = allocator.alloc(most * 8, 16)
+    const encoded = allocator.alloc(most * 8, 16)
+    const recorded = allocator.alloc(most * 8, 16)
+    const message = allocator.alloc(audio.MAX_PAYLOAD + 64, 16)
+    if mix == null || captured == null || encoded == null || recorded == null || message == null { try fail("mlx-audiod: out of memory", Failure.NoMemory) }
+    unsafe {
+        server.*.mix = @ptrCast([*]i32, mix.?)
+        server.*.captured = @ptrCast([*]i32, captured.?)
+    }
+    server.*.encoded = encoded.?
+    server.*.recorded = recorded.?
+    server.*.message = message.?
+
+    if !protocol.startBus(server, std.process.environmentEntries(arguments)) { try fail("", Failure.NoBus) }
+
+    // INT and TERM end it (a file output gets its final header).
+    var blocked: usize = (1 << 1) | (1 << 14)
+    const masked = std.linux.syscall4(SYS_rt_sigprocmask, 0, @intFromPtr(&blocked), 0, 8)
+    const signals = std.linux.syscall4(SYS_signalfd4, 18446744073709551615, @intFromPtr(&blocked), 8, 526336)
+    server.*.eventLoop = dbus.createEventLoop()
+    if server.*.eventLoop < 0 || signals < 0 { try fail("mlx-audiod: no event loop", Failure.NoLoop) }
+    const watching_bus = dbus.watch(server.*.eventLoop, dbus.descriptorOfClient(protocol.busOf(server)), BUS, false)
+    const watching_signals = dbus.watch(server.*.eventLoop, signals, SIGNALS, false)
+    if devices.outputOf(server).*.kind == state.ALSA {
+        const watching = dbus.watch(server.*.eventLoop, devices.outputOf(server).*.descriptor, CARD_OUT, true)
+    } else {
+        server.*.timer = startTimer(server)
+        const watching = dbus.watch(server.*.eventLoop, server.*.timer, TIMER, false)
+    }
+    if devices.inputOf(server).*.kind == state.ALSA { const watching = dbus.watch(server.*.eventLoop, devices.inputOf(server).*.descriptor, CARD_IN, false) }
+    protocol.say(server, "audio: org.mlx.Audio at ")
+    protocol.sayNumber(server, @intCast(usize, server.*.rate))
+    protocol.say(server, " Hz, periods of ")
+    protocol.sayNumber(server, server.*.period)
+    protocol.say(server, " frames\n")
+    // Anything that came with the name.
+    protocol.busReadable(server)
+
+    serve(server, signals)
+
+    devices.close(server)
+    protocol.say(server, "audio: ended\n")
+}
+
+pub fn main(arguments: [][*]const u8) -> !void {
+    const installed = crash.install()
+    try run(arguments)
+}

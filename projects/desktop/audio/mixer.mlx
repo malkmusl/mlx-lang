@@ -1,0 +1,215 @@
+// The mix: what playing streams sent goes, converted to the device's rate
+// and stereo, into each stream's ring; a period at a time the rings are
+// mixed (each at its volume, then the output's volume) into the device's
+// format; streams are asked (REQUEST) for what keeps their ring at its
+// latency; and each period of input goes, converted, to the recording
+// streams (RECORDED).
+const std = @import("std")
+const audio = @import("std.audio")
+const state = @import("./state.mlx")
+const samples = @import("./samples.mlx")
+const devices = @import("./devices.mlx")
+const protocol = @import("./protocol.mlx")
+const alsa = @import("./alsa.mlx")
+
+pub fn streamAt(server: *state.Server, index: usize) -> *state.Stream {
+    unsafe { return @ptrCast(*state.Stream, &server.*.streams[index]) }
+}
+
+fn resamplerOf(stream: *state.Stream) -> *state.Resampler {
+    unsafe { return @ptrCast(*state.Resampler, &stream.*.resampler) }
+}
+
+fn ringPush(stream: *state.Stream, left: i32, right: i32) -> void {
+    if stream.*.filled >= stream.*.capacity { return }
+    const at = (stream.*.start + stream.*.filled) % stream.*.capacity
+    stream.*.ring[at * 2] = left
+    stream.*.ring[at * 2 + 1] = right
+    stream.*.filled += 1
+}
+
+fn pushFrame(server: *state.Server, stream: *state.Stream, left: i32, right: i32) -> void {
+    if stream.*.rate == server.*.rate {
+        ringPush(stream, left, right)
+        return
+    }
+    var made: [64]i32 = undefined
+    var out: [*]i32 = undefined
+    unsafe { out = @ptrCast([*]i32, &made) }
+    const count = samples.resample(resamplerOf(stream), left, right, out, 32)
+    var index: usize = 0
+    while index < count {
+        ringPush(stream, made[index * 2], made[index * 2 + 1])
+        index += 1
+    }
+}
+
+// DATA: `length` bytes of the stream's samples (a frame may be split
+// across messages).
+pub fn feed(server: *state.Server, stream: *state.Stream, bytes: [*]const u8, length: usize) -> void {
+    const size = stream.*.frameBytes
+    var left: i32 = 0
+    var right: i32 = 0
+    var at: usize = 0
+    if stream.*.carryLength > 0 {
+        while stream.*.carryLength < size && at < length {
+            stream.*.carry[stream.*.carryLength] = bytes[at]
+            stream.*.carryLength += 1
+            at += 1
+        }
+        if stream.*.carryLength == size {
+            var carried: [*]const u8 = undefined
+            unsafe { carried = @ptrCast([*]const u8, &stream.*.carry) }
+            samples.decodeFrame(carried, 0, stream.*.format, stream.*.channels, &left, &right)
+            pushFrame(server, stream, left, right)
+            stream.*.carryLength = 0
+        }
+    }
+    while at + size <= length {
+        samples.decodeFrame(bytes, at, stream.*.format, stream.*.channels, &left, &right)
+        pushFrame(server, stream, left, right)
+        at += size
+    }
+    while at < length {
+        stream.*.carry[stream.*.carryLength] = bytes[at]
+        stream.*.carryLength += 1
+        at += 1
+    }
+    stream.*.requested = if length < stream.*.requested { stream.*.requested - length } else { 0 }
+    stream.*.started = true
+}
+
+// Asks a playing stream for what fills its ring to its latency.
+pub fn requestMore(server: *state.Server, stream: *state.Stream) -> void {
+    if stream.*.state != state.OPEN || stream.*.direction != audio.PLAY || stream.*.filled >= stream.*.target { return }
+    const frames = stream.*.target - stream.*.filled
+    // In the stream's frames and bytes.
+    const wanted = @intCast(usize, @intCast(u64, frames) * @intCast(u64, stream.*.rate) / @intCast(u64, server.*.rate)) * stream.*.frameBytes
+    if wanted <= stream.*.requested { return }
+    const more = (wanted - stream.*.requested) / stream.*.frameBytes * stream.*.frameBytes
+    // Not in crumbs: at least a period's worth.
+    const least = @intCast(usize, @intCast(u64, server.*.period) * @intCast(u64, stream.*.rate) / @intCast(u64, server.*.rate)) * stream.*.frameBytes
+    if more < least && stream.*.requested > 0 { return }
+    if more == 0 { return }
+    protocol.sendStreamValue(server, stream, audio.REQUEST, @intCast(u32, more))
+    stream.*.requested += more
+}
+
+// Mixes a period of the playing streams into server.encoded.
+pub fn mixPeriod(server: *state.Server) -> void {
+    const frames = server.*.period
+    var index: usize = 0
+    while index < frames * 2 {
+        server.*.mix[index] = 0
+        index += 1
+    }
+    var slot: usize = 0
+    while slot < state.MAX_STREAMS {
+        const stream = streamAt(server, slot)
+        if stream.*.used && stream.*.state == state.OPEN && stream.*.direction == audio.PLAY && stream.*.started {
+            var count = stream.*.filled
+            if count > frames { count = frames }
+            if count < frames && !stream.*.draining { stream.*.underruns += 1 }
+            const volume = @intCast(i64, stream.*.volume)
+            index = 0
+            while index < count {
+                const at = (stream.*.start + index) % stream.*.capacity
+                server.*.mix[index * 2] += @intCast(i32, @intCast(i64, stream.*.ring[at * 2]) * volume / 65536)
+                server.*.mix[index * 2 + 1] += @intCast(i32, @intCast(i64, stream.*.ring[at * 2 + 1]) * volume / 65536)
+                index += 1
+            }
+            stream.*.start = (stream.*.start + count) % stream.*.capacity
+            stream.*.filled -= count
+            if stream.*.draining && stream.*.filled == 0 {
+                stream.*.draining = false
+                stream.*.started = false
+                protocol.sendStreamValue(server, stream, audio.DRAINED, 0)
+            }
+        }
+        slot += 1
+    }
+    const master = @intCast(i64, server.*.master)
+    const encoding = devices.outputOf(server).*.encoding
+    const size = samples.bytesOf(encoding)
+    index = 0
+    while index < frames * 2 {
+        const value = samples.clamp(@intCast(i64, server.*.mix[index]) * master / 65536)
+        samples.encode(server.*.encoded, index * size, encoding, value)
+        index += 1
+    }
+}
+
+// A period of input to the recording streams.
+pub fn distribute(server: *state.Server, frames: usize) -> void {
+    var slot: usize = 0
+    while slot < state.MAX_STREAMS {
+        const stream = streamAt(server, slot)
+        if stream.*.used && stream.*.state == state.OPEN && stream.*.direction == audio.RECORD { protocol.sendRecorded(server, stream, server.*.captured, frames) }
+        slot += 1
+    }
+}
+
+fn requestAll(server: *state.Server) -> void {
+    var slot: usize = 0
+    while slot < state.MAX_STREAMS {
+        const stream = streamAt(server, slot)
+        if stream.*.used { requestMore(server, stream) }
+        slot += 1
+    }
+}
+
+// One period played (and recorded, unless a sound card records on its
+// own pace).
+fn period(server: *state.Server) -> void {
+    mixPeriod(server)
+    const played = devices.play(server, server.*.encoded, server.*.period)
+    if devices.inputOf(server).*.kind != state.ALSA {
+        devices.generate(server, server.*.captured, server.*.period)
+        distribute(server, server.*.period)
+    }
+}
+
+// The timer fired `count` times: as many periods (a few at most when the
+// server fell behind).
+pub fn timerPeriods(server: *state.Server, count: usize) -> void {
+    var left = count
+    if left > 10 { left = 10 }
+    while left > 0 {
+        period(server)
+        left -= 1
+    }
+    requestAll(server)
+}
+
+// The sound card has room: periods until it is full (a period it took
+// only in part is finished first).
+pub fn cardWritable(server: *state.Server) -> void {
+    const device = devices.outputOf(server)
+    const frame = samples.bytesOf(device.*.encoding) * 2
+    var rounds: usize = 0
+    while rounds < 16 {
+        if server.*.encodedFrames == 0 {
+            mixPeriod(server)
+            server.*.encodedFrames = server.*.period
+            server.*.encodedStart = 0
+            if devices.inputOf(server).*.kind != state.ALSA {
+                devices.generate(server, server.*.captured, server.*.period)
+                distribute(server, server.*.period)
+            }
+        }
+        var at: [*]u8 = undefined
+        unsafe { at = @ptrFromInt([*]u8, @intFromPtr(server.*.encoded) + server.*.encodedStart * frame) }
+        const took = alsa.write(device, at, server.*.encodedFrames)
+        if took == 0 { break }
+        server.*.encodedStart += took
+        server.*.encodedFrames -= took
+        rounds += 1
+    }
+    requestAll(server)
+}
+
+// The sound card recorded: to the recording streams.
+pub fn cardReadable(server: *state.Server) -> void {
+    const frames = devices.record(server, server.*.captured, server.*.period)
+    if frames > 0 { distribute(server, frames) }
+}

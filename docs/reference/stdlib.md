@@ -191,6 +191,17 @@ for the next one (its body at `bodyOf`, its descriptors at
 `tools/check_ipc.sh` runs both against dbus-send, gdbus, busctl and
 dbus-monitor.
 
+`std.audio` (`std/src/audio.mlx`) is MLX Audio's protocol and client:
+`connect` finds the sound server on the session bus and gets a direct
+MLXIPC channel to it (starting it when needed), `openStream` opens a
+playing or recording stream (any rate, 1 to 8 channels, S16, S32 or
+F32; `refusal` says when the app's MLXIPC permissions refused it),
+`write` plays as fast as the server asks, `read` returns what was
+recorded, `drain`, `setVolume`, `list` and `closeStream`. `std.wav`
+(`std/src/wav.mlx`) reads WAVE headers (8 to 32-bit PCM, 32-bit float,
+extensible files) and writes them. `projects/desktop/audio` (mlx-audiod,
+mlx-audio) uses both; `tools/check_audio.sh` checks them end to end.
+
 `std.png` (`std/src/png.mlx`) decodes PNG images into premultiplied ARGB
 words (`0xAARRGGBB`, the `wl_shm` and compositor convention), for icons
 and the like:
