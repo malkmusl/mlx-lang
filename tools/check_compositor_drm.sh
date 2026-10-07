@@ -2,9 +2,11 @@
 # Checks the freestanding compositor (projects/desktop/compositor with
 # --backend drm) end to end against an emulated kernel and systemd-logind:
 # tools/fake_drm_session.py plays the DRM card, the input devices and
-# logind on a private dbus-daemon, and drives the scenario (modeset, typing
-# into real Wayland terminals, mouse, touchpad, hotplug, a VT switch, quit
-# with the CRTC restored).
+# logind on a private dbus-daemon, and drives the scenario (modeset at the
+# settings' display-mode, the output told for mlx-settings, night light in
+# the CRTC's gamma table, typing into real Wayland terminals, mouse,
+# touchpad, hotplug, a VT switch, quit with the CRTC and its gamma table
+# restored).
 #
 # Needs root (mknod for the device nodes, /proc/PID/mem for the pointers in
 # ioctl arguments), dbus-daemon and Python with GObject introspection (Gio).

@@ -300,7 +300,9 @@ compositor is the display server itself:
   connected connector, at the monitor's native resolution (that of its
   preferred mode) with the highest refresh rate it offers there (monitors
   mark a 60 Hz mode preferred even when they do 144 Hz;
-  `MLX_DRM_REFRESH=HZ` sets an upper limit), on a CRTC one of the
+  `MLX_DRM_REFRESH=HZ` sets an upper limit), or at the settings'
+  `display-mode` when the monitor offers it (see [Display and night
+  light](#display-and-night-light)), on a CRTC one of the
   connector's encoders can drive. With several cards each is looked
   at and logged (`drm: /dev/dri/card1: VGA-1 1024x768 at 60 Hz (the boot
   card)`, `drm: /dev/dri/card2: DP-1 3840x1080 at 60 Hz`), and the one
@@ -311,7 +313,7 @@ compositor is the display server itself:
   the others stay dark. Two XRGB8888 dumb buffers are drawn into
   in turn and shown with page flips; the flip-complete events pace the
   frame callbacks, so clients draw at the monitor's refresh rate. On exit
-  the CRTC gets back what it showed before.
+  the CRTC gets back what it showed before, its gamma table too.
 - **Input** ([`evdev.mlx`](evdev.mlx)): every keyboard, mouse and touchpad
   under `/dev/input`, and those plugged in later (inotify). Mice move with
   a little acceleration and scroll 15 pixels a notch; touchpads move the
@@ -367,7 +369,12 @@ Real clients connect: typing reaches the Mlx terminal and, through the
 compositor's keymap, weston-terminal; the mouse, the touchpad and a mouse
 plugged in later move the cursor; Ctrl+Alt+F2 pauses and resumes
 everything; Alt+Shift+Q restores the console's CRTC and gives every
-device back. `tools/check_compositor_drm.sh vulkan` runs the same with the
+device back. The settings file asks for the monitor's size at 50 Hz
+instead of its preferred 60 and for night light: the CRTC must be set to
+that mode, `wayland-drm.display` must list the connector's modes, and
+the gamma table must be warmed from the console's (3000 K, then 2000 K
+when the file changes), set again after the VT switch (the other session
+put its own) and put back at the end. `tools/check_compositor_drm.sh vulkan` runs the same with the
 Vulkan renderer on lavapipe, which must export both dumb buffers as
 dma-bufs and render into them (the harness answers PRIME with the buffer's
 memfd), once more copying each frame in, as on drivers that cannot import
@@ -497,19 +504,66 @@ wobbly-windows = on
 # The apps' language (de, en, or system: LC_ALL, LC_TIME, LANG); the
 # compositor leaves it to them.
 language = system
+# The monitor's mode at the next start: WxH@HZ, WxH (the fastest of that
+# size) or auto (the native one at its fastest rate).
+display-mode = auto
+# Night light: warmer colours, at once (Kelvin, 1000 to 6500).
+night-light = off
+night-light-temperature = 4000
 ```
 
 [`projects/desktop/settings`](../settings/main.mlx) changes them, in a
 window with a sidebar of categories (std.ui.host, drawn at the screen's
 density): General (the dock hiding, the terminal's hotkey, where the file
-is), Window management (title bars, the counter, app decorations, wobbly
-windows, the window hotkeys), Appearance (colours for the focused and the
-other windows' borders, square, small, medium or large corners) and
-Language (German, English or the system's; the settings app follows at
-once, the other apps when they start). It writes the file whole and
+is), Display (the monitor, its mode and night light; see below), Sound
+(MLX Audio's outputs, inputs, volumes and apps, and which apps may use
+the microphone; [`projects/desktop/audio`](../audio/README.md)), Window
+management (title bars, the counter, app decorations, wobbly windows, the
+window hotkeys), Appearance (colours for the focused and the other
+windows' borders, square, small, medium or large corners) and Language
+(German, English or the system's; the settings app follows at once, the
+other apps when they start). It writes the file whole and
 renames it into place, so the compositor never reads half of it. The
 launcher lists it as Settings.
 Without title bars, windows move with Alt+drag.
+
+### Display and night light
+
+The compositor tells what it drives in
+`$XDG_RUNTIME_DIR/<socket>.display` ([`display.mlx`](display.mlx);
+removed when it ends), for mlx-settings' Display page:
+
+```
+backend = drm
+output = DP-2
+mode = 2560x1440@144
+millihertz = 143912
+available = 2560x1440@144
+available = 2560x1440@120
+available = 1920x1080@60
+gamma = 256
+```
+
+`available` lists the connector's progressive modes; `gamma` is the size
+of the CRTC's gamma table (0: none). Nested, the backend is `nested` and
+the mode the window's size at the host monitor's rate. wl_output tells
+clients the same name and refresh rate.
+
+`display-mode` is read when the compositor starts: it takes the mode of
+that size (and rate) when the monitor has it, else its native one and
+says so (`drm: the monitor has no such display-mode; its native one
+instead`). The Display page lists the modes and writes the choice, which
+applies at the next start.
+
+Night light warms the colours the monitor shows through the CRTC's gamma
+table ([`kms.mlx`](kms.mlx), `setTemperature`): the table the CRTC had
+(read once, `DRM_IOCTL_MODE_GETGAMMA`) with its green and blue scaled to
+a black body's white at that temperature (Tanner Helland's fit, every
+500 K, 6500 K being white). It applies as soon as the file changes, costs
+nothing per frame and leaves frames and screenshots as composed; after a
+VT switch it is set again, and on exit the old table goes back. Nested
+there is no gamma table of the compositor's own, so night light is left
+to the session around it.
 
 ### Rounded corners
 
@@ -1038,7 +1092,8 @@ finished`.
   (fullscreen at the monitor's resolution with `--fullscreen`) and its seat
   input.
 - `drm.mlx`: the freestanding backend: session, monitor, input devices,
-  frames and VT switching, with `kms.mlx` (DRM/KMS), `evdev.mlx` (input
+  frames and VT switching, with `kms.mlx` (DRM/KMS, modes, the gamma
+  table), `evdev.mlx` (input
   devices), `xkb.mlx` (keymap and modifiers), `logind.mlx` (the login
   session), `dbus.mlx` (a small D-Bus client) and `device.mlx` (device
   syscalls, and the emulated devices of the test harness).
@@ -1056,6 +1111,8 @@ finished`.
 - `scene.mlx`: stacking (layers and windows), hit-testing, title bars,
   damage tracking, blur and software composition.
 - `state.mlx`: shared records and list helpers.
+- `settings.mlx`: the settings file; `display.mlx`: the output told for
+  mlx-settings, and night light.
 
 `tools/check_wayland_compositor.sh [compiler] [cpu|vulkan]` exercises all
 of this with scripted input (`tools/wayland-test-host`) on either renderer,

@@ -40,6 +40,10 @@
 #      waits for damage.
 #  13. with Xwayland and xev: an X program's window shows, takes focus and
 #      gets keys (the compositor's own X window manager).
+#  14. mlx-settings' Sound and Display pages: on MLXIPC with MLX Audio
+#      (started by the bus) it mutes the output and turns the volume down;
+#      the nested compositor tells its output in <socket>.display, and the
+#      Display page's night light switch reaches compositor.conf.
 #
 # Typed commands create marker files, so keyboard delivery is verified at the
 # shell; the moved window's focus frame is checked in the host's screenshot.
@@ -374,7 +378,8 @@ PY
 echo "ok   a pointer lock holds the cursor and relative motion reaches the client"
 
 # Scenario 11: mlx-settings (its window at (24, 24); the categories in
-# its sidebar 28 pixels apart from y 44; on the Window management page the
+# its sidebar 28 pixels apart from y 44: General, Display, Sound, Window
+# management, Appearance, Language; on the Window management page the
 # hotkey rows 34 pixels apart from y 336, on the General page the
 # terminal's at y 186). Maximize gets Super+Shift+M; minimize gets
 # Super+Up (the maximize hotkey: it must reach the window); the terminal
@@ -383,7 +388,7 @@ echo "ok   a pointer lock holds the cursor and relative motion reaches the clien
 rm -f "$XDG_CONFIG_HOME/mlx/compositor.conf"
 cat > "$work/hotkeys.script" <<SCRIPT
 wait 2500
-pointer 124 110
+pointer 124 166
 press 272
 release 272
 wait 300
@@ -548,6 +553,75 @@ SCRIPT
 else
     echo "skip X programs (Xwayland or xev not installed)"
 fi
+
+# Scenario 14: mlx-settings' Sound and Display pages. MLXIPC is the
+# session bus and starts MLX Audio (into a file) when mlx-settings first
+# asks for it. On the Sound page (no sound card: Automatic at y 141, None
+# at y 179, the volume slider at y 220) None is chosen and the volume
+# dragged from 100% to about half; on the Display page the night light
+# switch (y 371) is turned on.
+"$compiler" --quiet projects/desktop/ipc/main.mlx -o "$work/mlx-ipcd"
+"$compiler" --quiet projects/desktop/audio/main.mlx -o "$work/mlx-audiod"
+"$compiler" --quiet projects/desktop/audio/tool.mlx -o "$work/mlx-audio"
+mkdir -p "$work/services"
+cat > "$work/services/org.mlx.Audio.service" <<SERVICE
+[D-BUS Service]
+Name=org.mlx.Audio
+Exec=$work/mlx-audiod --verbose --output file:$work/mix.wav --input sine:440
+SERVICE
+"$work/mlx-ipcd" --services "$work/services" > "$work/ipc.log" 2>&1 &
+ipc_pid=$!
+for _ in $(seq 1 50); do [[ -S "$XDG_RUNTIME_DIR/bus" ]] && break; sleep 0.1; done
+export DBUS_SESSION_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/bus"
+rm -f "$XDG_CONFIG_HOME/mlx/compositor.conf"
+cat > "$work/pages.script" <<SCRIPT
+wait 2500
+pointer 124 138
+press 272
+release 272
+wait 1200
+pointer 300 179
+press 272
+release 272
+wait 600
+pointer 718 220
+press 272
+pointer 650 220
+wait 50
+pointer 600 220
+wait 100
+release 272
+wait 600
+pointer 124 110
+press 272
+release 272
+wait 800
+pointer 753 371
+press 272
+release 272
+wait 1500
+close
+SCRIPT
+cat > "$work/pages-watch.sh" <<SCRIPT
+#!/bin/sh
+sleep 2
+cp "$XDG_RUNTIME_DIR/nested-pages.display" "$work/pages.display"
+SCRIPT
+chmod +x "$work/pages-watch.sh"
+run_scenario pages "$work/pages.script" --no-fps --run "$work/mlx-settings" --run "$work/pages-watch.sh"
+"$work/mlx-audio" status > "$work/pages-audio.txt" 2>&1 || true
+kill "$ipc_pid" 2> /dev/null || true
+pkill -x mlx-audiod 2> /dev/null || true
+unset DBUS_SESSION_BUS_ADDRESS
+grep -qx "output = null" "$work/pages-audio.txt" || { echo "mlx-settings did not switch MLX Audio's output off" >&2; cat "$work/pages-audio.txt" "$work/pages-compositor.log" >&2; exit 1; }
+volume=$(sed -n 's/^volume = //p' "$work/pages-audio.txt")
+[[ -n "$volume" && $volume -gt 20000 && $volume -lt 50000 ]] || { echo "mlx-settings' volume slider set $volume" >&2; cat "$work/pages-audio.txt" >&2; exit 1; }
+grep -qx "backend = nested" "$work/pages.display" && grep -q "^mode = 1024x768@" "$work/pages.display" || { echo "the nested compositor did not tell its output" >&2; cat "$work/pages.display" "$work/pages-compositor.log" >&2; exit 1; }
+[[ ! -e "$XDG_RUNTIME_DIR/nested-pages.display" ]] || { echo "nested-pages.display outlived the compositor" >&2; exit 1; }
+grep -qx "night-light = on" "$XDG_CONFIG_HOME/mlx/compositor.conf" && grep -qx "display-mode = auto" "$XDG_CONFIG_HOME/mlx/compositor.conf" || { echo "the Display page did not write night light" >&2; cat "$XDG_CONFIG_HOME/mlx/compositor.conf" >&2; exit 1; }
+grep -q "night light 4000 K" "$work/pages-compositor.log" || { echo "the compositor did not read night light" >&2; cat "$work/pages-compositor.log" >&2; exit 1; }
+rm -f "$XDG_CONFIG_HOME/mlx/compositor.conf"
+echo "ok   mlx-settings' Sound page controls MLX Audio (output off, volume $((volume * 100 / 65536))%); the Display page reads the output and writes night light"
 
 # Scenario 10: a GTK 3 window (libgtk-3 through ctypes: no GTK 3 program
 # is needed). GTK 3 knows only KDE's server decoration, not xdg-decoration.

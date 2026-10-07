@@ -1,15 +1,18 @@
 // The monitor, through the kernel's DRM/KMS interface (legacy modesetting
 // with dumb buffers), for the DRM backend.
 //
-// open() finds the first connected connector, takes its preferred mode and
-// a CRTC that can drive it, remembers what that CRTC showed (to restore
-// it on exit), and makes two XRGB8888 dumb buffers, mapped for drawing.
+// open() finds the first connected connector, takes its preferred mode (or
+// the one asked for: wantWidth, wantHeight, wantHertz) and a CRTC that can
+// drive it, remembers what that CRTC showed and its gamma table (to restore
+// them on exit), and makes two XRGB8888 dumb buffers, mapped for drawing.
 // The compositor draws a frame into the back buffer and flips to it with
 // DRM_IOCTL_MODE_PAGE_FLIP; the flip-complete event (read from the card)
 // says the frame is on screen, which paces frame callbacks to the
 // monitor's refresh. After a VT switch the CRTC is set up again (modeset).
 // A dumb buffer can be handed out as a dma-buf (exportBuffer, PRIME) for a
-// GPU to render into it in place.
+// GPU to render into it in place. Night light (setTemperature) scales the
+// CRTC's gamma table toward a warmer white: the monitor shows it, every
+// frame and screenshot stays as composed, and it costs nothing per frame.
 //
 // Structure layouts and ioctl numbers are those of <drm/drm_mode.h> on
 // 64-bit Linux.
@@ -36,6 +39,8 @@ const PAGE_FLIP: usize = 3222824112
 const PRIME_HANDLE_TO_FD: usize = 3222037549
 const PRIME_FD_TO_HANDLE: usize = 3222037550
 const GEM_CLOSE: usize = 1074291721
+const GETGAMMA: usize = 3223348388
+const SETGAMMA: usize = 3223348389
 const PRIME_CLOEXEC: u32 = 2147483648
 const PRIME_RDWR: u32 = 2
 
@@ -48,6 +53,13 @@ const MODE_FLAG_DOUBLESCAN: u32 = 32
 const CONNECTED: u32 = 1
 const MODE_SIZE: usize = 68
 const CRTC_SIZE: usize = 104
+const LUT_SIZE: usize = 32
+// The most modes listed for the settings app, the largest gamma table
+// taken.
+pub const MAX_MODES: usize = 32
+const MAX_GAMMA: u32 = 4096
+// Night light's white at this temperature is the monitor's own (Kelvin).
+pub const NEUTRAL: u32 = 6500
 
 pub const Output = struct {
     card: device.Device
@@ -64,6 +76,29 @@ pub const Output = struct {
     // The highest refresh rate (Hz) to pick (0: no limit); set before
     // probe and open.
     maxRefresh: u32
+    // The mode to take, set before probe and open (wantWidth 0: the
+    // native one at the highest refresh rate; wantHertz 0: the fastest of
+    // that size); wantFound: the connector had it.
+    wantWidth: u32
+    wantHeight: u32
+    wantHertz: u32
+    wantFound: bool
+    // The mode's refresh rate in millihertz.
+    millihertz: u32
+    // The connector's progressive modes (pixels, Hz), each once, as the
+    // kernel lists them.
+    modeCount: usize
+    modeWidths: [32]u32
+    modeHeights: [32]u32
+    modeHertz: [32]u32
+    // The CRTC's gamma table: its entries per colour (0: it has none),
+    // what it held before us and the one we set (red, then green, then
+    // blue: gammaSize u16 each), and the night light's temperature in it
+    // (Kelvin; 0: ours untouched).
+    gammaSize: u32
+    gammaSaved: usize
+    gammaRamp: usize
+    temperature: u32
     // The two dumb buffers: kernel handle, framebuffer, row pitch, size
     // and our mapping.
     handles: [2]u32
@@ -193,9 +228,57 @@ fn fastestMode(modes: [*]const u8, count: usize, preferred: usize, limit: u32) -
     return chosen
 }
 
+// The progressive mode of the size asked for (wantWidth, wantHeight) at
+// wantHertz (the kernel's rounded rate; 0: any), the fastest of those;
+// `count` when there is none.
+fn wantedMode(output: *Output, modes: [*]const u8, count: usize) -> usize {
+    var chosen = count
+    var best_rate: usize = 0
+    var index: usize = 0
+    while index < count {
+        const at = index * MODE_SIZE
+        const progressive = device.load32(modes, at + 28) & (MODE_FLAG_INTERLACE | MODE_FLAG_DOUBLESCAN) == 0
+        const sized = device.load16(modes, at + 4) == output.*.wantWidth && device.load16(modes, at + 14) == output.*.wantHeight
+        const hertz = device.load32(modes, at + 24)
+        const rate = modeMillihertz(modes, index)
+        if progressive && sized && (output.*.wantHertz == 0 || hertz == output.*.wantHertz) && (chosen == count || rate > best_rate) {
+            chosen = index
+            best_rate = rate
+        }
+        index += 1
+    }
+    return chosen
+}
+
+// The connector's progressive modes into output.modeWidths, modeHeights,
+// modeHertz, each size and rate once.
+fn listModes(output: *Output, modes: [*]const u8, count: usize) -> void {
+    output.*.modeCount = 0
+    var index: usize = 0
+    while index < count && output.*.modeCount < MAX_MODES {
+        const at = index * MODE_SIZE
+        const width = device.load16(modes, at + 4)
+        const height = device.load16(modes, at + 14)
+        const hertz = device.load32(modes, at + 24)
+        var known = device.load32(modes, at + 28) & (MODE_FLAG_INTERLACE | MODE_FLAG_DOUBLESCAN) != 0
+        var other: usize = 0
+        while other < output.*.modeCount && !known {
+            known = output.*.modeWidths[other] == width && output.*.modeHeights[other] == height && output.*.modeHertz[other] == hertz
+            other += 1
+        }
+        if !known {
+            output.*.modeWidths[output.*.modeCount] = width
+            output.*.modeHeights[output.*.modeCount] = height
+            output.*.modeHertz[output.*.modeCount] = hertz
+            output.*.modeCount += 1
+        }
+        index += 1
+    }
+}
+
 // Looks at one connector: when it is connected and a CRTC can drive it,
 // takes it at its native resolution with the highest refresh rate (see
-// fastestMode). True when taken.
+// fastestMode), or at the mode asked for when it has it. True when taken.
 fn tryConnector(output: *Output, allocator: Allocator, id: u32, crtcs: [*]u8, crtc_count: usize) -> bool {
     var connector: [80]u8 = undefined
     var bytes: [*]u8 = undefined
@@ -228,6 +311,15 @@ fn tryConnector(output: *Output, allocator: Allocator, id: u32, crtcs: [*]u8, cr
             index += 1
         }
         chosen = fastestMode(modes, count, chosen, output.*.maxRefresh)
+        output.*.wantFound = false
+        if output.*.wantWidth != 0 {
+            const wanted = wantedMode(output, modes, count)
+            if wanted < count {
+                chosen = wanted
+                output.*.wantFound = true
+            }
+        }
+        listModes(output, modes, count)
         var usable_encoders = @intCast(usize, device.load32(bytes, 40))
         if usable_encoders > encoder_count { usable_encoders = encoder_count }
         const crtc = pickCrtc(output, bytes, encoders, usable_encoders, crtcs, crtc_count)
@@ -245,6 +337,7 @@ fn tryConnector(output: *Output, allocator: Allocator, id: u32, crtcs: [*]u8, cr
             output.*.width = @intCast(usize, device.load16(modes, chosen * MODE_SIZE + 4))
             output.*.height = @intCast(usize, device.load16(modes, chosen * MODE_SIZE + 14))
             output.*.refresh = device.load32(modes, chosen * MODE_SIZE + 24)
+            output.*.millihertz = @intCast(u32, modeMillihertz(modes, chosen))
             taken = true
         }
     }
@@ -408,6 +501,10 @@ pub fn open(output: *Output, descriptor: isize, allocator: Allocator) -> bool {
     output.*.needsModeset = true
     output.*.lastError = 0
     output.*.connector = 0
+    output.*.gammaSize = 0
+    output.*.gammaSaved = 0
+    output.*.gammaRamp = 0
+    output.*.temperature = 0
     // Without logind the first opener is DRM master already, or becomes it.
     var none: [8]u8 = undefined
     var none_bytes: [*]u8 = undefined
@@ -427,6 +524,7 @@ pub fn open(output: *Output, descriptor: isize, allocator: Allocator) -> bool {
     device.zero(savedOf(output), CRTC_SIZE)
     device.store32(savedOf(output), 12, output.*.crtc)
     if !call(output, GETCRTC, savedOf(output), CRTC_SIZE) { device.zero(savedOf(output), CRTC_SIZE) }
+    saveGamma(output, allocator)
 
     return createBuffer(output, 0) && createBuffer(output, 1)
 }
@@ -538,6 +636,104 @@ fn setCrtc(output: *Output, framebuffer: u32, mode: [*]const u8, mode_valid: boo
     return call(output, SETCRTC, bytes, CRTC_SIZE)
 }
 
+// ---------------------------------------------------------------------------
+// Night light
+
+// The CRTC's gamma table as it was (GETCRTC said how big), kept to build
+// ours from and to put back; gammaSize stays 0 when there is none.
+fn saveGamma(output: *Output, allocator: Allocator) -> void {
+    const size = device.load32(savedOf(output), 28)
+    if size == 0 || size > MAX_GAMMA { return }
+    const bytes = @intCast(usize, size) * 6
+    const saved = allocator.alloc(bytes, 8).?
+    const ramp = allocator.alloc(bytes, 8).?
+    output.*.gammaSize = size
+    output.*.gammaSaved = @intFromPtr(saved)
+    output.*.gammaRamp = @intFromPtr(ramp)
+    if !lut(output, GETGAMMA, output.*.gammaSaved) {
+        allocator.free(saved, bytes, 8)
+        allocator.free(ramp, bytes, 8)
+        output.*.gammaSize = 0
+    }
+}
+
+// GETGAMMA or SETGAMMA with the three ramps at `table`.
+fn lut(output: *Output, request: usize, table: usize) -> bool {
+    var argument: [32]u8 = undefined
+    var bytes: [*]u8 = undefined
+    unsafe { bytes = @ptrCast([*]u8, &argument) }
+    const size = @intCast(usize, output.*.gammaSize)
+    device.zero(bytes, LUT_SIZE)
+    device.store32(bytes, 0, output.*.crtc)
+    device.store32(bytes, 4, output.*.gammaSize)
+    device.store64(bytes, 8, table)
+    device.store64(bytes, 16, table + size * 2)
+    device.store64(bytes, 24, table + size * 4)
+    return call(output, request, bytes, LUT_SIZE)
+}
+
+fn loadGamma(output: *Output, table: usize) -> bool { return lut(output, SETGAMMA, table) }
+
+// A black body's colour at every 500 K from 1000 K (index 0) to 6500 K
+// (index 11): green and blue per mille of red (Tanner Helland's fit,
+// scaled so that 6500 K is white).
+fn knotGreen(index: u32) -> u32 {
+    return match index { 0 => 267, 1 => 426, 2 => 539, 3 => 626, 4 => 697, 5 => 758, 6 => 810, 7 => 856, 8 => 897, 9 => 935, 10 => 969, else => 1000 }
+}
+
+fn knotBlue(index: u32) -> u32 {
+    return match index { 0 => 0, 1 => 0, 2 => 56, 3 => 280, 4 => 440, 5 => 563, 6 => 664, 7 => 750, 8 => 824, 9 => 889, 10 => 947, else => 1000 }
+}
+
+// White at `kelvin` (1000 to 6500): green and blue per mille of red,
+// between the knots in a straight line.
+pub fn whitePoint(kelvin: u32, green: *u32, blue: *u32) -> void {
+    var clamped = if kelvin < 1000 { 1000 } else { kelvin }
+    if clamped > NEUTRAL { clamped = NEUTRAL }
+    const index = (clamped - 1000) / 500
+    const part = (clamped - 1000) % 500
+    if index >= 11 {
+        green.* = 1000
+        blue.* = 1000
+        return
+    }
+    green.* = (knotGreen(index) * (500 - part) + knotGreen(index + 1) * part) / 500
+    blue.* = (knotBlue(index) * (500 - part) + knotBlue(index + 1) * part) / 500
+}
+
+// Night light at `kelvin` (NEUTRAL or above: none): the gamma table the
+// CRTC had, its green and blue scaled to that white. False when the CRTC
+// has no gamma table or the kernel refused it.
+pub fn setTemperature(output: *Output, kelvin: u32) -> bool {
+    if output.*.gammaSize == 0 { return false }
+    const wanted = if kelvin >= NEUTRAL { 0 } else { kelvin }
+    if wanted == output.*.temperature { return true }
+    if wanted == 0 {
+        output.*.temperature = 0
+        return loadGamma(output, output.*.gammaSaved)
+    }
+    var green: u32 = 0
+    var blue: u32 = 0
+    whitePoint(wanted, &green, &blue)
+    var saved: [*]u8 = undefined
+    var ramp: [*]u8 = undefined
+    unsafe {
+        saved = @ptrFromInt([*]u8, output.*.gammaSaved)
+        ramp = @ptrFromInt([*]u8, output.*.gammaRamp)
+    }
+    const size = @intCast(usize, output.*.gammaSize)
+    var index: usize = 0
+    while index < size {
+        device.store16(ramp, index * 2, device.load16(saved, index * 2))
+        device.store16(ramp, (size + index) * 2, device.load16(saved, (size + index) * 2) * green / 1000)
+        device.store16(ramp, (size * 2 + index) * 2, device.load16(saved, (size * 2 + index) * 2) * blue / 1000)
+        index += 1
+    }
+    if !loadGamma(output, output.*.gammaRamp) { return false }
+    output.*.temperature = wanted
+    return true
+}
+
 // Shows the back buffer. The first time (and after a VT switch) that sets
 // the CRTC up and is on screen at once; otherwise it is a page flip, done
 // when its event arrives (true either way when it worked). `shown` is
@@ -600,10 +796,25 @@ pub fn readEvents(output: *Output, milliseconds: *u32) -> bool {
 pub fn resume(output: *Output) -> void {
     output.*.needsModeset = true
     output.*.flipPending = false
+    // The other session may have set a gamma table of its own.
+    if output.*.temperature != 0 {
+        const kelvin = output.*.temperature
+        output.*.temperature = 0
+        const set = setTemperature(output, kelvin)
+    }
 }
 
 // Puts back what the CRTC showed before us, and frees our buffers.
 pub fn close(output: *Output, allocator: Allocator) -> void {
+    if output.*.temperature != 0 { const restored_gamma = loadGamma(output, output.*.gammaSaved) }
+    if output.*.gammaSize != 0 {
+        const size = @intCast(usize, output.*.gammaSize) * 6
+        unsafe {
+            allocator.free(@ptrFromInt([*]u8, output.*.gammaSaved), size, 8)
+            allocator.free(@ptrFromInt([*]u8, output.*.gammaRamp), size, 8)
+        }
+        output.*.gammaSize = 0
+    }
     const saved = savedOf(output)
     const saved_framebuffer = device.load32(saved, 16)
     var mode_bytes: [*]const u8 = undefined

@@ -35,8 +35,14 @@ tools/check_audio.sh            # the end-to-end check
 
 The protocol (in `std/src/audio.mlx`): messages of an 8-byte header
 (kind, length) and a payload, little-endian; OPEN, DATA, CLOSE, VOLUME,
-DRAIN, LIST from the app; OPENED, REFUSED, REQUEST, RECORDED, DRAINED,
-STREAMS, ENDED from the server.
+DRAIN, LIST, STATUS, SET from the app; OPENED, REFUSED, REQUEST,
+RECORDED, DRAINED, STREAMS, ENDED, STATE from the server. STATUS and SET
+are the controls (they take `audio.control`): STATE is the server's state
+as `key = value` lines (output and input, why one is not playing,
+volumes, mute, the sound cards' devices, the streams, the apps that asked
+for sound and whether they may), SET changes one thing (the volume, mute,
+the input's volume or mute, a stream's volume, the output or the input,
+or "check every stream's permission again").
 
 ## Permissions
 
@@ -51,9 +57,13 @@ deny org.example.Noisy use audio.play
 deny org.example.Spy talk org.mlx.Audio        # no channel at all
 ```
 
-By default an unsandboxed app may play and record (as with PipeWire); a
-sandboxed one (Flatpak) may play, not record. A refused stream gets
-REFUSED with the reason, and `mlx-audio` says so.
+By default an unsandboxed app may play, record and control the server
+(`audio.control`: switch outputs, set volumes; as with PipeWire); a
+sandboxed one (Flatpak) may play, not record and not control. A refused
+stream gets REFUSED with the reason, and `mlx-audio` says so. When a rule
+takes recording from an app that records, the server ends its stream
+(ENDED) once it is told to check again (SET's recheck; mlx-settings sends
+it after writing `ipc.conf`).
 
 ## The server
 
@@ -74,11 +84,25 @@ mlx-audiod [--output auto|alsa[:pcmC1D0p]|file:PATH.wav|null]
            [--rate HZ] [--period MS] [--verbose]
 ```
 
-The sound card path follows the kernel's interface (checked against its
-headers), but this repository's checks run without a sound card: they
-play into a file and record from a tone or a file. A card another sound
-server holds (PipeWire, PulseAudio) cannot be opened; `auto` then plays
-to nobody and says so.
+A card another sound server holds (PipeWire, PulseAudio) cannot be
+opened: the server then plays to nobody, says who holds it (`holder`,
+from `/proc/*/fd`) and tries again every 2 seconds, taking the card once
+it is free. The desktop session (`projects/desktop/compositor/session`)
+stops PipeWire, WirePlumber and PulseAudio for its time, so the card is
+MLX Audio's (`MLX_SESSION_AUDIO=pipewire` keeps them instead). Outputs
+and inputs switch while streams play; the choice, the volumes and mute
+are kept in `~/.config/mlx/audio.conf` ([`config.mlx`](config.mlx);
+`--output` and `--input` win over it).
+
+The sound card path is tested without a sound card:
+[`tools/fake_alsa.py`](../../../tools/fake_alsa.py) plays one. When a
+device path is a Unix socket the server speaks frames over it instead of
+ioctls (hello, ioctl with its number and argument bytes, wake), so the
+emulated card sees every PCM ioctl, checks it against the kernel's
+structure layouts (`snd_pcm_hw_params`, `sw_params`, `xferi`) and answers
+as the kernel would; it takes only S32_LE for playback and only 44100 Hz
+for capture, so the server must negotiate and convert, and it counts
+underruns. `MLX_SND_DIR` and `MLX_ASOUND_DIR` point the server at it.
 
 ## mlx-audio
 
@@ -88,6 +112,11 @@ mlx-audio tone HZ SECONDS
 mlx-audio record FILE.wav SECONDS    --rate HZ, --channels N
 mlx-audio streams                    app, direction, rate, channels, volume, name
 mlx-audio volume PERCENT             the output's volume
+mlx-audio mute on|off                the output muted
+mlx-audio output DEVICE              auto, alsa:pcmC1D0p, null (remembered)
+mlx-audio input DEVICE               auto, alsa:NAME, none
+mlx-audio status                     the server's state (STATE)
+mlx-audio recheck                    every stream's permission asked again
   --volume PERCENT                   the stream's volume
   --latency MS                       the server's buffer for it (default 100)
 ```
@@ -102,14 +131,26 @@ mlx-audio volume PERCENT             the output's volume
 | `mixer.mlx` | rings, mixing, requests, recording |
 | `samples.mlx` | sample formats, resampling, a tone |
 | `devices.mlx` | outputs and inputs: sound card, file, tone, nothing |
-| `alsa.mlx` | the kernel's PCM interface |
+| `alsa.mlx` | the kernel's PCM interface (and the emulated card's frames) |
+| `config.mlx` | audio.conf |
 | `tool.mlx` | mlx-audio |
+
+## In mlx-settings
+
+The settings app's Sound page
+([`projects/desktop/settings/sound.mlx`](../settings/sound.mlx)) shows
+STATE and asks for it twice a second while it is shown: the output and
+the input (automatic, each card's device, none) with a note when the card
+is busy or missing, their volumes and mute, a test tone, the apps playing
+and recording with a volume each, and the apps that wanted to record with
+a switch each: it writes `allow APP use audio.record` (or `deny`) into
+`ipc.conf` and sends the recheck.
 
 ## Next
 
 - PulseAudio's protocol on top (as pipewire-pulse does), for the programs
   that only speak it, each of them an app to MLXIPC's permissions.
 - Shared-memory streams over the channel (memfd), for low latency.
-- Devices: several cards, choosing and switching them, hotplug; volume
-  and streams in mlx-settings; a permission prompt the first time an app
-  wants to record.
+- Hotplug: a card plugged in is found only by the 2-second retry while
+  there is none to play to; watching `/dev/snd` would find it at once.
+- A permission prompt the first time an app wants to record.

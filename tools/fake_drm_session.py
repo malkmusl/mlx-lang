@@ -20,11 +20,16 @@ compositor talks to, at the lowest level it uses:
   read back. Input devices answer the EVIOCG* queries and send
   struct input_event records.
 
-The scenario: start (modeset on the connected connector at its preferred
-mode), the Mlx terminal maps and gets typed into from the keyboard, the
-mouse and the touchpad move the cursor, a mouse plugged in later works, a
-VT switch (Ctrl+Alt+F2) pauses and resumes everything, and Alt+Shift+Q
-quits with the CRTC restored and every device given back.
+The scenario: start (modeset on the connected connector at the mode the
+settings ask for: its preferred size at 50 Hz instead of 60; the output
+told in $XDG_RUNTIME_DIR/wayland-drm.display for mlx-settings; night light
+at 3000 K in the CRTC's gamma table, the console's table kept), the Mlx
+terminal maps and gets typed into from the keyboard, the
+mouse and the touchpad move the cursor, a mouse plugged in later works,
+night light follows the settings file (2000 K), a VT switch (Ctrl+Alt+F2)
+pauses and resumes everything (night light set again), and Alt+Shift+Q
+quits with the CRTC and its gamma table restored and every device given
+back.
 
 weston-terminal, when installed, then types through the compositor's xkb
 keymap and modifiers.
@@ -63,9 +68,10 @@ GETCRTC, SETCRTC = 3228066977, 3228066978
 CREATE_DUMB, MAP_DUMB, DESTROY_DUMB = 3223348402, 3222299827, 3221513396
 ADDFB, RMFB, PAGE_FLIP = 3223086254, 3221513391, 3222824112
 PRIME_HANDLE_TO_FD = 3222037549
+GETGAMMA, SETGAMMA = 3223348388, 3223348389
 SIZES = {GET_CAP: 16, GETRESOURCES: 64, GETCONNECTOR: 80, GETENCODER: 20, GETCRTC: 104, SETCRTC: 104,
          CREATE_DUMB: 32, MAP_DUMB: 16, DESTROY_DUMB: 4, ADDFB: 28, RMFB: 4, PAGE_FLIP: 24,
-         PRIME_HANDLE_TO_FD: 12}
+         PRIME_HANDLE_TO_FD: 12, GETGAMMA: 32, SETGAMMA: 32}
 DRM_CLOEXEC, DRM_RDWR = 0x80000000, 2
 EACCES, ENOTTY, EINVAL = 13, 25, 22
 DRM_MAJOR, INPUT_MAJOR = 226, 13
@@ -78,7 +84,8 @@ BTN_TOOL_FINGER, BTN_TOUCH, BTN_TOOL_DOUBLETAP = 325, 330, 333
 KEY_LEFTSHIFT, KEY_LEFTCTRL, KEY_LEFTALT, KEY_F2, KEY_Q, KEY_ENTER = 42, 29, 56, 60, 16, 28
 
 # The monitor: connector 42 (eDP, connected) with a preferred 1000x700 mode
-# (not the first one) and no current encoder; 41 is a disconnected HDMI.
+# (not the first one; the same size at 50 Hz too) and no current encoder;
+# 41 is a disconnected HDMI. The CRTCs' gamma tables have 256 entries.
 WIDTH, HEIGHT = 1000, 700
 CRTCS = [31, 32]
 CONNECTORS = [41, 42]
@@ -94,7 +101,19 @@ def mode(width, height, refresh, preferred):
                        8 if preferred else 0) + name
 
 
-MODES = [mode(1280, 800, 60, False), mode(WIDTH, HEIGHT, 60, True)]
+MODES = [mode(1280, 800, 60, False), mode(WIDTH, HEIGHT, 60, True), mode(WIDTH, HEIGHT, 50, False)]
+GAMMA_SIZE = 256
+# The console's gamma table (not quite linear, to see it put back).
+CONSOLE_GAMMA = tuple(index * 256 for index in range(GAMMA_SIZE))
+# compositor.conf: the preferred size at 50 Hz, night light at 3000 K.
+SETTINGS = "display-mode = 1000x700@50\nnight-light = on\nnight-light-temperature = 3000\n"
+
+
+def warmer(green, blue):
+    """The console's table with green and blue scaled (per mille), as night
+    light sets it (kms.setTemperature)."""
+    return (CONSOLE_GAMMA, tuple(v * green // 1000 for v in CONSOLE_GAMMA),
+            tuple(v * blue // 1000 for v in CONSOLE_GAMMA))
 CONSOLE_MODE = mode(800, 600, 60, False)
 
 
@@ -224,6 +243,7 @@ class FakeCard(DeviceServer):
         self.next_fb = 101
         self.flips = 0
         self.shown = None          # framebuffer on screen
+        self.gamma = (CONSOLE_GAMMA, CONSOLE_GAMMA, CONSOLE_GAMMA)
 
     def ioctl(self, request, argument):
         record = self.harness.record
@@ -297,6 +317,22 @@ class FakeCard(DeviceServer):
                 fail(f"SETCRTC with unknown framebuffer {fb}")
             self.shown = fb
             record("drm", "setcrtc", crtc, fb, connectors, valid, width, height)
+            record("drm", "setcrtc_rate", struct.unpack_from("<I", argument, 36 + 24)[0])
+            return 0, argument, None
+        if request in (GETGAMMA, SETGAMMA):
+            crtc, size, red, green, blue = struct.unpack_from("<IIQQQ", argument)
+            if crtc not in CRTCS or size != GAMMA_SIZE:
+                fail(f"gamma ioctl for CRTC {crtc} with {size} entries")
+            if request == GETGAMMA:
+                for pointer, ramp in zip((red, green, blue), self.gamma):
+                    memory.write(pointer, struct.pack(f"<{GAMMA_SIZE}H", *ramp))
+                record("drm", "getgamma", crtc)
+                return 0, argument, None
+            if not self.master:
+                return -EACCES, argument, None
+            self.gamma = tuple(struct.unpack(f"<{GAMMA_SIZE}H", memory.read(pointer, GAMMA_SIZE * 2))
+                               for pointer in (red, green, blue))
+            record("drm", "setgamma", crtc, self.gamma)
             return 0, argument, None
         if request == CREATE_DUMB:
             height, width, bpp, flags = struct.unpack_from("<IIII", argument)
@@ -592,6 +628,8 @@ class Harness:
         inputs = [key for key in self.devices if key[0] == INPUT_MAJOR]
         card.master = False
         self.signal("PauseDevice", DRM_MAJOR, 0, "pause")
+        # The other VT's session sets a gamma table of its own.
+        card.gamma = (CONSOLE_GAMMA, CONSOLE_GAMMA, CONSOLE_GAMMA)
         for key in inputs:
             self.devices[key].revoke()
             self.signal("PauseDevice", key[0], key[1], "force")
@@ -635,6 +673,14 @@ class Harness:
                 break
             except OSError:
                 time.sleep(0.01)
+
+    def write_settings(self, text):
+        """compositor.conf (~/.config/mlx: HOME is the work directory)."""
+        directory = os.path.join(self.work, ".config", "mlx")
+        os.makedirs(directory, exist_ok=True)
+        with open(os.path.join(directory, "compositor.conf.new"), "w") as target:
+            target.write(text)
+        os.rename(os.path.join(directory, "compositor.conf.new"), os.path.join(directory, "compositor.conf"))
 
     def log_text(self):
         with open(self.log_path) as source:
@@ -717,6 +763,7 @@ def main():
     recorder = harness.recorder
     harness.make_nodes()
     harness.start_bus()
+    harness.write_settings(SETTINGS)
     harness.start_compositor()
     try:
         # Start: the session, the card, the monitor's preferred mode.
@@ -729,7 +776,7 @@ def main():
                           f"TakeDevice{key}")
         harness.wait_log("drm: driving", 5, "the card chosen")
         log = harness.log_text()
-        if "/card1: VGA-1 800x600 at 60 Hz" not in log or "/card0: eDP-1 1000x700 at 60 Hz" not in log:
+        if "/card1: VGA-1 800x600 at 60 Hz" not in log or "/card0: eDP-1 1000x700 at 50 Hz" not in log:
             fail(f"both cards should be looked at and logged:\n{log}")
         if "drm: driving " not in log or "/card0: eDP-1 1000x700" not in log.split("drm: driving ", 1)[1]:
             fail(f"the card with the larger monitor (card0) should be driven, not the BMC's:\n{log}")
@@ -739,6 +786,23 @@ def main():
         if card.pixel(0, HEIGHT - 1) != background(HEIGHT - 1):
             fail(f"background {card.pixel(0, HEIGHT - 1):#x}, expected {background(HEIGHT - 1):#x}")
         print(f"ok   logind session and devices; the card with the monitor chosen over the BMC's VGA; modeset CRTC 32 -> connector 42 at its preferred {WIDTH}x{HEIGHT}")
+        # The mode the settings asked for, told to mlx-settings.
+        rates = [c[2] for c in recorder.calls if c[:2] == ("drm", "setcrtc_rate")]
+        if rates[:1] != [50]:
+            fail(f"the settings' display-mode asks for 50 Hz; the CRTC was set to {rates[:1]} Hz")
+        harness.wait_log("display: told in", 5, "the output's file for mlx-settings")
+        with open(os.path.join(harness.work, "wayland-drm.display")) as source:
+            told = source.read().splitlines()
+        for line in ("backend = drm", "output = eDP-1", f"mode = {WIDTH}x{HEIGHT}@50", "available = 1280x800@60",
+                     f"available = {WIDTH}x{HEIGHT}@60", f"available = {WIDTH}x{HEIGHT}@50", f"gamma = {GAMMA_SIZE}"):
+            if line not in told:
+                fail(f"wayland-drm.display lacks {line!r}: {told}")
+        print("ok   display-mode picks the 50 Hz mode; the output, its mode and modes told in wayland-drm.display")
+        # Night light at 3000 K: the console's table kept, ours set from it.
+        recorder.wait(lambda c: c[:2] == ("drm", "setgamma") and c[3] == warmer(697, 440), 5, "night light at 3000 K")
+        if recorder.count(lambda c: c[:2] == ("drm", "getgamma")) != 1:
+            fail("the console's gamma table should be read once")
+        print("ok   night light: the CRTC's gamma table warmed to 3000 K, the console's kept")
         if renderer == "vulkan":
             harness.wait_log("renderer: vulkan", 5, "the Vulkan renderer")
             exported = sorted(c[2] for c in recorder.calls if c[:2] == ("drm", "prime_handle_to_fd"))
@@ -807,6 +871,11 @@ def main():
         harness.cursor_at(x - 2, y - 1)
         print("ok   a mouse plugged in later (inotify) works")
 
+        # Night light follows the settings file while it runs.
+        harness.write_settings(SETTINGS.replace("= 3000", "= 2000"))
+        recorder.wait(lambda c: c[:2] == ("drm", "setgamma") and c[3] == warmer(539, 56), 5, "night light at 2000 K")
+        print("ok   night light changed to 2000 K from the settings file at once")
+
         # Ctrl+Alt+F2: logind switches VTs; the card and inputs pause, then resume.
         flips_before = card.flips
         keyboard.key(KEY_LEFTCTRL, True)
@@ -821,6 +890,9 @@ def main():
         recorder.wait(lambda c: recorder.count(lambda d: d[:2] == ("drm", "setcrtc")) > 1, 5,
                       "the modeset after resuming")
         modesets = recorder.count(lambda c: c[:2] == ("drm", "setcrtc"))
+        # The other session's table replaced by ours again.
+        recorder.wait(lambda c: card.gamma == warmer(539, 56) and recorder.count(
+            lambda d: d[:2] == ("drm", "setgamma") and d[3] == warmer(539, 56)) >= 2, 5, "night light set again after resuming")
         time.sleep(0.3)
         keyboard = harness.devices[(INPUT_MAJOR, 64)]
         type_text(keyboard, "echo back > m2\n")
@@ -867,7 +939,11 @@ def main():
         if (DRM_MAJOR, 0) not in released or (INPUT_MAJOR, 64) not in released or \
                 recorder.count(lambda c: c[:2] == ("logind", "ReleaseControl")) != 1:
             fail(f"devices not released: {released}")
-        print("ok   Alt+Shift+Q: the console's CRTC restored, buffers freed, devices and control given back")
+        if card.gamma != (CONSOLE_GAMMA, CONSOLE_GAMMA, CONSOLE_GAMMA):
+            fail("the console's gamma table was not put back")
+        if os.path.exists(os.path.join(harness.work, "wayland-drm.display")):
+            fail("wayland-drm.display outlived the compositor")
+        print("ok   Alt+Shift+Q: the console's CRTC and gamma table restored, buffers freed, devices and control given back")
     finally:
         if harness.process.poll() is None:
             harness.process.kill()

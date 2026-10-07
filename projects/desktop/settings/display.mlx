@@ -1,0 +1,424 @@
+// The Display page: the monitor the compositor drives, the mode it starts
+// in and night light. What the monitor is comes from the compositor, which
+// writes $XDG_RUNTIME_DIR/<WAYLAND_DISPLAY>.display when it has set it up
+// (projects/desktop/compositor/display.mlx):
+//
+//     backend = drm                  (drm: the monitor itself; nested: a
+//                                     window in another session)
+//     output = HDMI-A-1
+//     mode = 2560x1440@144           (as it runs: pixels and Hz)
+//     millihertz = 143912
+//     available = 2560x1440@144      (one line each, the monitor's modes)
+//     gamma = 256                    (the CRTC's gamma table's size, for
+//                                     night light; 0: it has none)
+//
+// What to change goes into compositor.conf with the other settings (main
+// loads and saves these keys):
+//
+//     display-mode = auto            (or WxH@HZ: taken at the next start)
+//     night-light = off
+//     night-light-temperature = 4000 (Kelvin, 1500 to 6500)
+const std = @import("std")
+const apps_module = @import("../shared/apps.mlx")
+const page_module = @import("./page.mlx")
+
+const Page = page_module.Page
+
+pub const MAX_MODES: usize = 32
+pub const COOLEST: u32 = 6500
+pub const WARMEST: u32 = 1500
+pub const DEFAULT_TEMPERATURE: u32 = 4000
+
+// The widgets' items (page_module.idOf): above everything main.mlx uses.
+const ITEM_MODE: usize = 1500
+const ITEM_NIGHT: usize = 1600
+const ITEM_TEMPERATURE: usize = 1601
+
+// Whether widget item `item` is the page's slider (the wheel turns it
+// rather than scrolling the page).
+pub fn isSlider(item: usize) -> bool { return item == ITEM_TEMPERATURE }
+
+pub const Mode = struct {
+    width: u32
+    height: u32
+    hertz: u32
+}
+
+pub const Display = struct {
+    environment: [*][*]const u8
+    // What compositor.conf says: the mode to start in (width 0: the
+    // compositor's choice), night light and its colour temperature.
+    wantWidth: u32
+    wantHeight: u32
+    wantHertz: u32
+    nightLight: bool
+    temperature: u32
+    // A setting changed on the page (main saves the file and clears it).
+    changed: bool
+    // What the compositor said (known: it did).
+    known: bool
+    backend: [16]u8
+    backendLength: usize
+    output: [32]u8
+    outputLength: usize
+    width: u32
+    height: u32
+    hertz: u32
+    millihertz: u32
+    modes: [32]Mode
+    modeCount: usize
+    gamma: bool
+    // The compositor's file (NUL-terminated).
+    statePath: [256]u8
+    statePathLength: usize
+}
+
+fn same(first: []const u8, second: []const u8) -> bool { return std.text.same(first, second) }
+
+fn copyInto(target: [*]u8, capacity: usize, text: []const u8) -> usize {
+    var length: usize = 0
+    while length < text.length && length < capacity {
+        target[length] = text[length]
+        length += 1
+    }
+    return length
+}
+
+// `bytes` from `offset` on.
+fn after(bytes: [*]u8, offset: usize) -> [*]u8 {
+    unsafe { return @ptrFromInt([*]u8, @intFromPtr(bytes) + offset) }
+}
+
+fn modeAt(display: *Display, index: usize) -> *Mode {
+    unsafe { return @ptrCast(*Mode, &display.*.modes[index]) }
+}
+
+fn number(text: []const u8, end: *usize) -> u32 {
+    var value: u32 = 0
+    var index: usize = 0
+    while index < text.length && text[index] >= 48 && text[index] <= 57 && index < 9 {
+        value = value * 10 + @intCast(u32, text[index] - 48)
+        index += 1
+    }
+    end.* = index
+    return value
+}
+
+// "WxH@HZ" into `mode`; false when it is not one.
+pub fn parseMode(text: []const u8, mode: *Mode) -> bool {
+    var used: usize = 0
+    const width = number(text, &used)
+    if used == 0 || used >= text.length || text[used] != 120 { return false }
+    var at = used + 1
+    const height = number(text[at..text.length], &used)
+    if used == 0 { return false }
+    at += used
+    var hertz: u32 = 0
+    if at < text.length {
+        if text[at] != 64 { return false }
+        at += 1
+        hertz = number(text[at..text.length], &used)
+        if used == 0 || at + used != text.length { return false }
+    }
+    if width == 0 || height == 0 { return false }
+    mode.*.width = width
+    mode.*.height = height
+    mode.*.hertz = hertz
+    return true
+}
+
+fn writeNumber(out: [*]u8, at: usize, value: u32) -> usize {
+    var reversed: [12]u8 = undefined
+    var count: usize = 0
+    var rest = value
+    while true {
+        reversed[count] = @intCast(u8, 48 + rest % 10)
+        count += 1
+        rest = rest / 10
+        if rest == 0 { break }
+    }
+    var length = at
+    while count > 0 {
+        count -= 1
+        out[length] = reversed[count]
+        length += 1
+    }
+    return length
+}
+
+// "WxH@HZ" (the form compositor.conf and the compositor's file use).
+fn writeMode(out: [*]u8, at: usize, width: u32, height: u32, hertz: u32) -> usize {
+    var length = writeNumber(out, at, width)
+    out[length] = 120
+    length = writeNumber(out, length + 1, height)
+    out[length] = 64
+    return writeNumber(out, length + 1, hertz)
+}
+
+pub fn init(display: *Display, environment: [*][*]const u8) -> void {
+    display.*.environment = environment
+    display.*.changed = false
+    display.*.known = false
+    display.*.modeCount = 0
+    defaults(display)
+    // $XDG_RUNTIME_DIR/$WAYLAND_DISPLAY.display (WAYLAND_DISPLAY may be a
+    // path of its own).
+    var bytes: [*]u8 = undefined
+    unsafe { bytes = @ptrCast([*]u8, &display.*.statePath) }
+    var length: usize = 0
+    const socket = apps_module.environmentValue(environment, "WAYLAND_DISPLAY")
+    var socket_length: usize = 0
+    if @intFromPtr(socket) != 0 {
+        while socket[socket_length] != 0 && socket_length < 120 { socket_length += 1 }
+    }
+    if socket_length == 0 || socket[0] != 47 {
+        const runtime = apps_module.environmentValue(environment, "XDG_RUNTIME_DIR")
+        if @intFromPtr(runtime) != 0 {
+            while runtime[length] != 0 && length < 120 {
+                bytes[length] = runtime[length]
+                length += 1
+            }
+        }
+        bytes[length] = 47
+        length += 1
+    }
+    if socket_length == 0 {
+        length += copyInto(after(bytes, length), 16, "wayland-0")
+    } else {
+        length += copyInto(after(bytes, length), 120, socket[0..socket_length])
+    }
+    length += copyInto(after(bytes, length), 8, ".display")
+    bytes[length] = 0
+    display.*.statePathLength = length
+}
+
+// The keys' defaults (before main reads compositor.conf).
+pub fn defaults(display: *Display) -> void {
+    display.*.wantWidth = 0
+    display.*.wantHeight = 0
+    display.*.wantHertz = 0
+    display.*.nightLight = false
+    display.*.temperature = DEFAULT_TEMPERATURE
+}
+
+// A compositor.conf line; true when it was one of the page's.
+pub fn loadKey(display: *Display, key: []const u8, value: []const u8) -> bool {
+    if same(key, "display-mode") {
+        var mode: Mode = undefined
+        if same(value, "auto") {
+            display.*.wantWidth = 0
+        } else if parseMode(value, &mode) {
+            display.*.wantWidth = mode.width
+            display.*.wantHeight = mode.height
+            display.*.wantHertz = mode.hertz
+        }
+        return true
+    }
+    if same(key, "night-light") {
+        if same(value, "on") || same(value, "yes") || same(value, "true") || same(value, "1") { display.*.nightLight = true }
+        if same(value, "off") || same(value, "no") || same(value, "false") || same(value, "0") { display.*.nightLight = false }
+        return true
+    }
+    if same(key, "night-light-temperature") {
+        var used: usize = 0
+        const kelvin = number(value, &used)
+        if used == value.length && kelvin >= WARMEST && kelvin <= COOLEST { display.*.temperature = kelvin }
+        return true
+    }
+    return false
+}
+
+// The page's keys for compositor.conf, from `at`; the length after them.
+pub fn save(display: *Display, text: [*]u8, at: usize) -> usize {
+    var length = at + copyInto(after(text, at), 16, "display-mode = ")
+    if display.*.wantWidth == 0 {
+        length += copyInto(after(text, length), 4, "auto")
+    } else {
+        length = writeMode(text, length, display.*.wantWidth, display.*.wantHeight, display.*.wantHertz)
+    }
+    length += copyInto(after(text, length), 32, if display.*.nightLight { "\nnight-light = on\n" } else { "\nnight-light = off\n" })
+    length += copyInto(after(text, length), 32, "night-light-temperature = ")
+    length = writeNumber(text, length, display.*.temperature)
+    text[length] = 10
+    return length + 1
+}
+
+// Reads what the compositor said; false when it said nothing (yet).
+pub fn refresh(display: *Display, allocator: std.allocator.Allocator) -> bool {
+    var path: [*]const u8 = undefined
+    unsafe { path = @ptrCast([*]const u8, &display.*.statePath) }
+    const file = std.fs.open(path, 524288, 0)
+    display.*.known = false
+    if !std.fs.isValid(file) { return false }
+    const contents = std.fs.readToEndAlloc(file, allocator)
+    const closed = std.fs.close(file)
+    const text = contents.items
+    display.*.modeCount = 0
+    display.*.gamma = false
+    display.*.backendLength = 0
+    display.*.outputLength = 0
+    display.*.millihertz = 0
+    var bytes: [*]u8 = undefined
+    var at: usize = 0
+    while at < contents.length {
+        var end = at
+        while end < contents.length && text[end] != 10 { end += 1 }
+        const line = text[at..end]
+        var equals: usize = 0
+        while equals < line.length && line[equals] != 61 { equals += 1 }
+        if equals < line.length {
+            const key = std.text.trimmed(line[0..equals])
+            const value = std.text.trimmed(line[equals + 1..line.length])
+            var mode: Mode = undefined
+            if same(key, "backend") {
+                unsafe { bytes = @ptrCast([*]u8, &display.*.backend) }
+                display.*.backendLength = copyInto(bytes, 16, value)
+                display.*.known = true
+            }
+            if same(key, "output") {
+                unsafe { bytes = @ptrCast([*]u8, &display.*.output) }
+                display.*.outputLength = copyInto(bytes, 32, value)
+            }
+            if same(key, "mode") && parseMode(value, &mode) {
+                display.*.width = mode.width
+                display.*.height = mode.height
+                display.*.hertz = mode.hertz
+            }
+            if same(key, "millihertz") {
+                var used: usize = 0
+                display.*.millihertz = number(value, &used)
+            }
+            if same(key, "available") && display.*.modeCount < MAX_MODES && parseMode(value, &mode) {
+                const slot = modeAt(display, display.*.modeCount)
+                slot.*.width = mode.width
+                slot.*.height = mode.height
+                slot.*.hertz = mode.hertz
+                display.*.modeCount += 1
+            }
+            if same(key, "gamma") {
+                var used: usize = 0
+                display.*.gamma = number(value, &used) > 0
+            }
+        }
+        at = end + 1
+    }
+    std.fs.ArrayList.deinit(contents)
+    return display.*.known
+}
+
+fn backendOf(display: *Display) -> []const u8 {
+    var bytes: [*]const u8 = undefined
+    unsafe { bytes = @ptrCast([*]const u8, &display.*.backend) }
+    return bytes[0..display.*.backendLength]
+}
+
+fn outputOf(display: *Display) -> []const u8 {
+    var bytes: [*]const u8 = undefined
+    unsafe { bytes = @ptrCast([*]const u8, &display.*.output) }
+    return bytes[0..display.*.outputLength]
+}
+
+// "1920 × 1080" and, with `hertz`, ", 60 Hz" into `out`; its length.
+fn modeLabel(out: [*]u8, width: u32, height: u32, hertz: u32) -> usize {
+    var length = writeNumber(out, 0, width)
+    length += copyInto(after(out, length), 8, " × ")
+    length = writeNumber(out, length, height)
+    if hertz != 0 {
+        length += copyInto(after(out, length), 2, ", ")
+        length = writeNumber(out, length, hertz)
+        length += copyInto(after(out, length), 3, " Hz")
+    }
+    return length
+}
+
+// The refresh rate with two decimals (59.94 Hz), from millihertz.
+fn rateLabel(out: [*]u8, millihertz: u32, hertz: u32) -> usize {
+    if millihertz == 0 {
+        const length = writeNumber(out, 0, hertz)
+        return length + copyInto(after(out, length), 3, " Hz")
+    }
+    const hundredths = (millihertz + 5) / 10
+    var length = writeNumber(out, 0, hundredths / 100)
+    const rest = hundredths % 100
+    if rest != 0 {
+        out[length] = 46
+        out[length + 1] = @intCast(u8, 48 + rest / 10)
+        length += 2
+        if rest % 10 != 0 {
+            out[length] = @intCast(u8, 48 + rest % 10)
+            length += 1
+        }
+    }
+    return length + copyInto(after(out, length), 3, " Hz")
+}
+
+fn chooseMode(display: *Display, width: u32, height: u32, hertz: u32) -> void {
+    display.*.wantWidth = width
+    display.*.wantHeight = height
+    display.*.wantHertz = hertz
+    display.*.changed = true
+}
+
+// The page; the y after it.
+pub fn draw(display: *Display, page: *const Page, top: i32) -> i32 {
+    var text: [160]u8 = undefined
+    var bytes: [*]u8 = undefined
+    unsafe { bytes = @ptrCast([*]u8, &text) }
+    var y = page_module.section(page, top, page_module.say(page, "Monitor", "Monitor"))
+    const drm = same(backendOf(display), "drm")
+    if !display.*.known {
+        y = page_module.note(page, y, page_module.say(page, "The compositor has not said which monitor it drives (an Mlx compositor writes it at start).", "Der Compositor hat nicht mitgeteilt, welchen Monitor er ansteuert (ein Mlx-Compositor schreibt das beim Start)."))
+    } else {
+        if display.*.outputLength > 0 { y = page_module.infoRow(page, y, page_module.say(page, "Connector", "Anschluss"), outputOf(display)) }
+        var length = modeLabel(bytes, display.*.width, display.*.height, 0)
+        y = page_module.infoRow(page, y, page_module.say(page, "Resolution", "Auflösung"), bytes[0..length])
+        length = rateLabel(bytes, display.*.millihertz, display.*.hertz)
+        y = page_module.infoRow(page, y, page_module.say(page, "Refresh rate", "Bildwiederholrate"), bytes[0..length])
+        y = page_module.infoRow(page, y, page_module.say(page, "Shown", "Anzeige"), if drm { page_module.say(page, "On the monitor itself (DRM)", "Direkt auf dem Monitor (DRM)") } else { page_module.say(page, "In a window of another session", "In einem Fenster einer anderen Sitzung") })
+    }
+
+    y = page_module.section(page, y, page_module.say(page, "Resolution and refresh rate", "Auflösung und Bildwiederholrate"))
+    if page_module.choiceRow(page, y, ITEM_MODE, page_module.say(page, "Automatic (native resolution, fastest refresh)", "Automatisch (native Auflösung, schnellste Rate)"), display.*.wantWidth == 0) { chooseMode(display, 0, 0, 0) }
+    y += page_module.px(page, page_module.CHOICE_ROW)
+    var listed = false
+    var index: usize = 0
+    while index < display.*.modeCount {
+        const mode = modeAt(display, index)
+        const chosen = display.*.wantWidth == mode.*.width && display.*.wantHeight == mode.*.height && display.*.wantHertz == mode.*.hertz
+        if chosen { listed = true }
+        const length = modeLabel(bytes, mode.*.width, mode.*.height, mode.*.hertz)
+        if page_module.choiceRow(page, y, ITEM_MODE + 1 + index, bytes[0..length], chosen) { chooseMode(display, mode.*.width, mode.*.height, mode.*.hertz) }
+        y += page_module.px(page, page_module.CHOICE_ROW)
+        index += 1
+    }
+    // A mode compositor.conf asks for that this monitor does not list.
+    if display.*.wantWidth != 0 && !listed {
+        const length = modeLabel(bytes, display.*.wantWidth, display.*.wantHeight, display.*.wantHertz)
+        const choice = page_module.choiceRow(page, y, ITEM_MODE + 1 + MAX_MODES, bytes[0..length], true)
+        y += page_module.px(page, page_module.CHOICE_ROW)
+        y = page_module.note(page, y, page_module.say(page, "The monitor has no such mode: the compositor takes the automatic one.", "Der Monitor kennt diesen Modus nicht: der Compositor nimmt den automatischen."))
+    }
+    y = page_module.note(page, y, if drm || !display.*.known { page_module.say(page, "Takes effect when the compositor starts next.", "Gilt ab dem nächsten Start des Compositors.") } else { page_module.say(page, "In a window the window's size counts; this is for the monitor itself.", "Im Fenster zählt dessen Größe; dies gilt für den Monitor selbst.") })
+
+    y = page_module.section(page, y, page_module.say(page, "Night light", "Nachtlicht"))
+    if page_module.switchRow(page, y, ITEM_NIGHT, page_module.say(page, "Night light", "Nachtlicht"), page_module.say(page, "Warmer colours, easier on the eyes at night", "Wärmere Farben, angenehmer für die Augen am Abend"), display.*.nightLight) {
+        display.*.nightLight = !display.*.nightLight
+        display.*.changed = true
+    }
+    y += page_module.px(page, page_module.SWITCH_ROW)
+    // Warmth: 0 at 6500 K (no change), all the way at 1500 K.
+    const range = COOLEST - WARMEST
+    const warmth = page_module.sliderRow(page, y, ITEM_TEMPERATURE, page_module.say(page, "Warmth", "Wärme"), COOLEST - display.*.temperature, range, range)
+    const kelvin = COOLEST - warmth / 100 * 100
+    if kelvin != display.*.temperature {
+        display.*.temperature = kelvin
+        display.*.changed = true
+    }
+    y += page_module.px(page, page_module.SLIDER_ROW)
+    var length = writeNumber(bytes, 0, display.*.temperature)
+    length += copyInto(after(bytes, length), 2, " K")
+    if display.*.known && !display.*.gamma {
+        length += copyInto(after(bytes, length), 120, page_module.say(page, "; this output has no gamma table (night light needs the monitor itself, DRM)", "; diese Ausgabe hat keine Gammatabelle (Nachtlicht braucht den Monitor selbst, DRM)"))
+    }
+    return page_module.note(page, y, bytes[0..length])
+}
