@@ -369,20 +369,20 @@ PY
 echo "ok   a pointer lock holds the cursor and relative motion reaches the client"
 
 # Scenario 11: mlx-settings (its window at (24, 24); the categories in
-# its sidebar 40 pixels apart from y 66; on the Window management page the
-# hotkey rows 34 pixels apart from y 328, on the General page the
-# terminal's at y 178). Maximize gets Super+Shift+M; minimize gets
+# its sidebar 28 pixels apart from y 44; on the Window management page the
+# hotkey rows 34 pixels apart from y 336, on the General page the
+# terminal's at y 186). Maximize gets Super+Shift+M; minimize gets
 # Super+Up (the maximize hotkey: it must reach the window); the terminal
 # hotkey is cleared; then Super+Up minimizes.
 "$compiler" --quiet projects/desktop/settings/main.mlx -o "$work/mlx-settings"
 rm -f "$XDG_CONFIG_HOME/mlx/compositor.conf"
 cat > "$work/hotkeys.script" <<SCRIPT
 wait 2500
-pointer 124 148
+pointer 124 110
 press 272
 release 272
 wait 300
-pointer 524 367
+pointer 524 375
 press 272
 release 272
 wait 300
@@ -393,7 +393,7 @@ up 50
 up 42
 up 125
 wait 300
-pointer 524 401
+pointer 524 409
 press 272
 release 272
 wait 300
@@ -402,11 +402,11 @@ down 103
 up 103
 up 125
 wait 300
-pointer 124 108
+pointer 124 82
 press 272
 release 272
 wait 300
-pointer 524 217
+pointer 524 225
 press 272
 release 272
 wait 300
