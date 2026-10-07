@@ -34,6 +34,18 @@ observatory_entry="$work/root/usr/local/share/applications/org.mlx.observatory.d
 grep -qx "Exec=/usr/local/bin/mlx-observatory $repo_root" "$observatory_entry" && [[ -f "$work/root/usr/local/share/icons/hicolor/128x128/apps/org.mlx.observatory.png" ]] || { echo "MLX Observatory's entry or icon is missing" >&2; exit 1; }
 echo "ok   staged install: programs in PREFIX/bin, session entry in wayland-sessions"
 
+# A systemctl that has PipeWire's user units and logs what it is told:
+# the session must stop and mask them for itself and start them again.
+mkdir -p "$work/fakebin"
+cat > "$work/fakebin/systemctl" <<SCRIPT
+#!/bin/sh
+echo "\$*" >> "$work/systemctl.log"
+case "\$*" in
+*list-unit-files*) printf 'pipewire.socket enabled enabled\npipewire.service disabled enabled\nwireplumber.service enabled enabled\n' ;;
+esac
+SCRIPT
+chmod +x "$work/fakebin/systemctl"
+
 # Starts the staged session with host $1; the compositor quits after two
 # seconds. Echoes the session log.
 run_session() {
@@ -41,7 +53,7 @@ run_session() {
     local home="$work/home-$host"
     mkdir -p "$home" "$work/runtime-$host"
     chmod 700 "$work/runtime-$host"
-    env -i PATH="$PATH" HOME="$home" XDG_RUNTIME_DIR="$work/runtime-$host" \
+    env -i PATH="$work/fakebin:$PATH" HOME="$home" XDG_RUNTIME_DIR="$work/runtime-$host" \
         XKB_DEFAULT_LAYOUT=de MLX_SESSION_HOST="$host" MLX_SESSION_BACKEND=headless \
         MLX_COMPOSITOR_ARGS="--timeout 2" \
         timeout 30 "$bindir/mlx-session" || true
@@ -67,7 +79,9 @@ if command -v weston > /dev/null; then
     grep -q "^mlx-session: keyboard de" <<< "$log" || { echo "weston: keyboard layout not passed on" >&2; exit 1; }
     grep -q "^launch: .*/mlx-dock$" <<< "$log" || { echo "weston: the session did not start the dock" >&2; echo "$log" >&2; exit 1; }
     grep -q "^mlx-session: session bus: mlx-ipcd" <<< "$log" || { echo "weston: the session is not on mlx-ipcd" >&2; echo "$log" >&2; exit 1; }
-    echo "ok   weston session (kiosk shell): fullscreen at the monitor's ${size#* }, keyboard de, the dock started, on mlx-ipcd"
+    grep -q "^mlx-session: sound: MLX Audio has the card; stopped for the session: pipewire.socket pipewire.service wireplumber.service" <<< "$log" || { echo "weston: PipeWire was not stopped" >&2; echo "$log" >&2; exit 1; }
+    grep -q "^mlx-session: sound: given back" <<< "$log" && grep -qx -- "--user mask --runtime pipewire.socket pipewire.service wireplumber.service" "$work/systemctl.log" && grep -qx -- "--user unmask --runtime pipewire.socket pipewire.service wireplumber.service" "$work/systemctl.log" && grep -qx -- "--user start pipewire.socket" "$work/systemctl.log" || { echo "weston: PipeWire was not given back" >&2; cat "$work/systemctl.log" >&2; echo "$log" >&2; exit 1; }
+    echo "ok   weston session (kiosk shell): fullscreen at the monitor's ${size#* }, keyboard de, the dock started, on mlx-ipcd, PipeWire stopped and given back"
     checked=$((checked + 1))
 else
     echo "skip weston is not installed"

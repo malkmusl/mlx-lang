@@ -8,8 +8,23 @@
 // The layouts and numbers are the kernel's (include/uapi/sound/asound.h,
 // x86_64): snd_pcm_hw_params is 608 bytes (masks from 4, intervals from
 // 260, rmask at 512), snd_pcm_sw_params 136, snd_xferi 24.
+//
+// When the device's path is a Unix socket, the card is emulated by a test
+// harness (tools/fake_alsa.py), and the same ioctls travel as frames (as
+// the compositor's DRM card does, projects/desktop/compositor/device.mlx):
+//
+//   hello:    u32 kind (3), u32 length (8), i64 0, or -EBUSY when the
+//             card is taken
+//   request:  u32 kind (1), u32 length, u64 request, the argument's
+//             bytes, then (WRITEI_FRAMES) the frames written
+//   reply:    u32 kind (1), u32 length, i64 result, the argument's bytes
+//             back, then (READI_FRAMES) the frames read
+//   wake:     u32 kind (2), u32 length (0): the card has room (or a
+//             period recorded); the event loop then watches the socket for
+//             reading, where a real card is polled for writing.
 const std = @import("std")
 const audio = @import("std.audio")
+const dbus = @import("std.dbus")
 const state = @import("./state.mlx")
 
 const SYS_ioctl: usize = 16
@@ -43,6 +58,13 @@ const PCM_VERSION: u32 = 131089
 const EAGAIN: isize = -11
 const EPIPE: isize = -32
 const ESTRPIPE: isize = -86
+pub const EBUSY: isize = -16
+
+const S_IFMT: u32 = 61440
+const S_IFSOCK: u32 = 49152
+const FRAME_IOCTL: u32 = 1
+const FRAME_WAKE: u32 = 2
+const FRAME_HELLO: u32 = 3
 
 fn store32(bytes: [*]u8, at: usize, value: u32) -> void { audio.store32(bytes, at, value) }
 fn load32(bytes: [*]const u8, at: usize) -> u32 { return audio.load32(bytes, at) }
@@ -54,6 +76,128 @@ fn store64(bytes: [*]u8, at: usize, value: u64) -> void {
 
 fn ioctl(descriptor: isize, request: usize, argument: usize) -> isize {
     return std.linux.syscall3(SYS_ioctl, @bitCast(usize, descriptor), request, argument)
+}
+
+// ---------------------------------------------------------------------------
+// An emulated card's frames
+
+fn advance(bytes: [*]u8, count: usize) -> [*]u8 {
+    unsafe { return @ptrFromInt([*]u8, @intFromPtr(bytes) + count) }
+}
+
+fn sendAll(descriptor: isize, bytes: [*]const u8, length: usize) -> bool {
+    var done: usize = 0
+    while done < length {
+        // sendto(..., MSG_NOSIGNAL)
+        const sent = std.linux.syscall6(44, @bitCast(usize, descriptor), @intFromPtr(bytes) + done, length - done, 16384, 0, 0)
+        if sent <= 0 { return false }
+        done += @intCast(usize, sent)
+    }
+    return true
+}
+
+fn receiveAll(descriptor: isize, bytes: [*]u8, length: usize) -> bool {
+    var done: usize = 0
+    while done < length {
+        const got = std.linux.syscall3(0, @bitCast(usize, descriptor), @intFromPtr(bytes) + done, length - done)
+        if got <= 0 { return false }
+        done += @intCast(usize, got)
+    }
+    return true
+}
+
+// The next frame that is not a wake: its kind and length (the header
+// read; the payload not).
+fn nextFrame(descriptor: isize, kind: *u32, length: *usize) -> bool {
+    var header: [8]u8 = undefined
+    var bytes: [*]u8 = undefined
+    unsafe { bytes = @ptrCast([*]u8, &header) }
+    while true {
+        if !receiveAll(descriptor, bytes, 8) { return false }
+        kind.* = load32(bytes, 0)
+        length.* = @intCast(usize, load32(bytes, 4))
+        if kind.* != FRAME_WAKE { return true }
+        var skipped: [64]u8 = undefined
+        var rest = length.*
+        while rest > 0 {
+            const part = if rest > 64 { 64 } else { rest }
+            unsafe { if !receiveAll(descriptor, @ptrCast([*]u8, &skipped), part) { return false } }
+            rest -= part
+        }
+    }
+    return false
+}
+
+// An ioctl to the emulated card: the `size` bytes at `argument` go out
+// (and `extra` after them) and come back changed; `back` takes what the
+// reply carries after them. The result, or a negative errno.
+fn emulatedIoctl(device: *state.Device, request: usize, argument: [*]u8, size: usize, extra: [*]const u8, extra_length: usize, back: [*]u8, back_capacity: usize) -> isize {
+    var header: [16]u8 = undefined
+    var bytes: [*]u8 = undefined
+    unsafe { bytes = @ptrCast([*]u8, &header) }
+    store32(bytes, 0, FRAME_IOCTL)
+    store32(bytes, 4, @intCast(u32, 8 + size + extra_length))
+    store64(bytes, 8, @intCast(u64, request))
+    const descriptor = device.*.descriptor
+    if !sendAll(descriptor, bytes, 16) || !sendAll(descriptor, argument, size) || !sendAll(descriptor, extra, extra_length) { return -5 }
+    var kind: u32 = 0
+    var length: usize = 0
+    if !nextFrame(descriptor, &kind, &length) || kind != FRAME_IOCTL || length < 8 + size { return -5 }
+    if !receiveAll(descriptor, bytes, 8) || !receiveAll(descriptor, argument, size) { return -5 }
+    const rest = length - 8 - size
+    if rest > back_capacity { return -5 }
+    if rest > 0 && !receiveAll(descriptor, back, rest) { return -5 }
+    const result = @bitCast(isize, @intCast(usize, load32(bytes, 0)) | (@intCast(usize, load32(bytes, 4)) << 32))
+    return result
+}
+
+// Takes the wakes that came (the event loop's readiness); the card's
+// frames come only as replies, so nothing else waits on the socket.
+pub fn takeWakes(device: *state.Device) -> void {
+    if !device.*.emulated { return }
+    var bytes: [256]u8 = undefined
+    // recvfrom(..., MSG_DONTWAIT)
+    while std.linux.syscall6(45, @bitCast(usize, device.*.descriptor), @intFromPtr(&bytes), 256, 64, 0, 0) > 0 {}
+}
+
+// The ioctl, to the card or its emulation.
+fn control(device: *state.Device, request: usize, argument: [*]u8, size: usize) -> isize {
+    if device.*.emulated {
+        var nothing: [1]u8 = [1]u8{ 0 }
+        unsafe { return emulatedIoctl(device, request, argument, size, @ptrCast([*]const u8, &nothing), 0, @ptrCast([*]u8, &nothing), 0) }
+    }
+    return ioctl(device.*.descriptor, request, @intFromPtr(argument))
+}
+
+// Opens `path`: a sound card's device node, or the socket of an emulated
+// one (its hello read). The descriptor, or a negative errno.
+fn openDevice(device: *state.Device, path: [*]const u8) -> isize {
+    var status: std.fs.Stat = undefined
+    device.*.emulated = std.fs.status(path, &status) == 0 && status.mode & S_IFMT == S_IFSOCK
+    if !device.*.emulated {
+        // O_RDWR | O_NONBLOCK | O_CLOEXEC.
+        return std.linux.syscall3(SYS_open, @intFromPtr(path), 2 | 2048 | 524288, 0)
+    }
+    var length: usize = 0
+    while path[length] != 0 { length += 1 }
+    const descriptor = dbus.connect(path[0..length])
+    if descriptor < 0 { return descriptor }
+    // Blocking: an ioctl waits for its reply.
+    const flags = std.linux.syscall2(72, @bitCast(usize, descriptor), 3)
+    const set = std.linux.syscall3(72, @bitCast(usize, descriptor), 4, @bitCast(usize, flags) & 18446744073709549567)
+    var kind: u32 = 0
+    var hello: [8]u8 = undefined
+    var bytes: [*]u8 = undefined
+    unsafe { bytes = @ptrCast([*]u8, &hello) }
+    if !nextFrame(descriptor, &kind, &length) || kind != FRAME_HELLO || length != 8 || !receiveAll(descriptor, bytes, 8) {
+        dbus.closeDescriptor(descriptor)
+        return -5
+    }
+    if load32(bytes, 0) != 0 {
+        dbus.closeDescriptor(descriptor)
+        return EBUSY
+    }
+    return descriptor
 }
 
 // Everything allowed: what the card then narrows down.
@@ -101,7 +245,7 @@ fn setInterval(params: [*]u8, param: usize, low: u32, high: u32) -> void {
 fn intervalOf(params: [*]const u8, param: usize) -> u32 { return load32(params, 260 + (param - 8) * 12) }
 
 // One try at the hardware parameters: true when the card took them.
-fn tryParams(descriptor: isize, params: [*]u8, format: u32, bits: u32, rate: u32, period: usize) -> bool {
+fn tryParams(device: *state.Device, params: [*]u8, format: u32, bits: u32, rate: u32, period: usize) -> bool {
     initParams(params)
     setMask(params, PARAM_ACCESS, ACCESS_RW_INTERLEAVED)
     setMask(params, PARAM_FORMAT, format)
@@ -114,16 +258,17 @@ fn tryParams(descriptor: isize, params: [*]u8, format: u32, bits: u32, rate: u32
         setInterval(params, PARAM_PERIOD_SIZE, @intCast(u32, period), @intCast(u32, period))
         setInterval(params, PARAM_PERIODS, 4, 8)
     }
-    return ioctl(descriptor, HW_PARAMS, @intFromPtr(params)) == 0
+    return control(device, HW_PARAMS, params, 608) == 0
 }
 
 // Opens the PCM device at `path` (NUL-terminated) for playing or
 // recording at `rate` (or 48000 or 44100 when the card lacks it), in
-// periods near `period` frames; false when it cannot (busy, missing).
-pub fn open(device: *state.Device, path: [*]const u8, capture: bool, rate: u32, period: usize) -> bool {
-    // O_RDWR | O_NONBLOCK | O_CLOEXEC.
-    const descriptor = std.linux.syscall3(SYS_open, @intFromPtr(path), 2 | 2048 | 524288, 0)
-    if descriptor < 0 { return false }
+// periods near `period` frames: 0, or a negative errno (EBUSY: another
+// program has it; ENOENT: no such card).
+pub fn open(device: *state.Device, path: [*]const u8, capture: bool, rate: u32, period: usize) -> isize {
+    const descriptor = openDevice(device, path)
+    if descriptor < 0 { return descriptor }
+    device.*.descriptor = descriptor
     var params: [608]u8 = undefined
     var bytes: [*]u8 = undefined
     unsafe { bytes = @ptrCast([*]u8, &params) }
@@ -139,7 +284,7 @@ pub fn open(device: *state.Device, path: [*]const u8, capture: bool, rate: u32, 
         while rate_index < 3 && !done {
             var period_index: usize = 0
             while period_index < 4 && !done {
-                if tryParams(descriptor, bytes, format, bits, rates[rate_index], periods[period_index]) {
+                if tryParams(device, bytes, format, bits, rates[rate_index], periods[period_index]) {
                     done = true
                     encoding = if format_index == 0 { audio.S16 } else { audio.S32 }
                 }
@@ -151,9 +296,8 @@ pub fn open(device: *state.Device, path: [*]const u8, capture: bool, rate: u32, 
     }
     if !done {
         const closed = std.linux.syscall1(SYS_close, @bitCast(usize, descriptor))
-        return false
+        return -22
     }
-    device.*.descriptor = descriptor
     device.*.encoding = encoding
     device.*.channels = 2
     device.*.rate = intervalOf(bytes, PARAM_RATE)
@@ -179,13 +323,16 @@ pub fn open(device: *state.Device, path: [*]const u8, capture: bool, rate: u32, 
     while boundary * 2 <= 2147483647 { boundary = boundary * 2 }
     store64(soft, 64, boundary)
     store32(soft, 72, PCM_VERSION)
-    if ioctl(descriptor, SW_PARAMS, @intFromPtr(soft)) != 0 || ioctl(descriptor, PREPARE, 0) != 0 {
+    var nothing: [8]u8 = [8]u8{ 0, 0, 0, 0, 0, 0, 0, 0 }
+    var none: [*]u8 = undefined
+    unsafe { none = @ptrCast([*]u8, &nothing) }
+    if control(device, SW_PARAMS, soft, 136) != 0 || control(device, PREPARE, none, 0) != 0 {
         const closed = std.linux.syscall1(SYS_close, @bitCast(usize, descriptor))
-        return false
+        return -22
     }
-    if capture { const started = ioctl(descriptor, START, 0) }
+    if capture { const started = control(device, START, none, 0) }
     device.*.kind = state.ALSA
-    return true
+    return 0
 }
 
 // Moves `frames` frames between `bytes` and the card: how many went, 0
@@ -198,20 +345,40 @@ fn transfer(device: *state.Device, bytes: [*]u8, frames: usize, capture: bool) -
     store64(record, 0, 0)
     store64(record, 8, @intCast(u64, @intFromPtr(bytes)))
     store64(record, 16, @intCast(u64, frames))
-    const result = ioctl(device.*.descriptor, if capture { READI_FRAMES } else { WRITEI_FRAMES }, @intFromPtr(record))
+    var result: isize = 0
+    if device.*.emulated {
+        const size = frameBytesOf(device) * frames
+        if capture {
+            var nothing: [1]u8 = [1]u8{ 0 }
+            unsafe { result = emulatedIoctl(device, READI_FRAMES, record, 24, @ptrCast([*]const u8, &nothing), 0, bytes, size) }
+        } else {
+            result = emulatedIoctl(device, WRITEI_FRAMES, record, 24, bytes, size, bytes, 0)
+        }
+    } else {
+        result = ioctl(device.*.descriptor, if capture { READI_FRAMES } else { WRITEI_FRAMES }, @intFromPtr(record))
+    }
     if result == 0 { return @intCast(usize, load32(record, 0)) }
     if result == EPIPE || result == ESTRPIPE {
         device.*.xruns += 1
-        const prepared = ioctl(device.*.descriptor, PREPARE, 0)
-        if capture { const started = ioctl(device.*.descriptor, START, 0) }
+        var nothing: [8]u8 = [8]u8{ 0, 0, 0, 0, 0, 0, 0, 0 }
+        var none: [*]u8 = undefined
+        unsafe { none = @ptrCast([*]u8, &nothing) }
+        const prepared = control(device, PREPARE, none, 0)
+        if capture { const started = control(device, START, none, 0) }
     }
     return 0
 }
+
+// The bytes of a frame (stereo).
+fn frameBytesOf(device: *state.Device) -> usize { return if device.*.encoding == audio.S16 { 4 } else { 8 } }
 
 pub fn write(device: *state.Device, bytes: [*]u8, frames: usize) -> usize { return transfer(device, bytes, frames, false) }
 pub fn read(device: *state.Device, bytes: [*]u8, frames: usize) -> usize { return transfer(device, bytes, frames, true) }
 
 pub fn close(device: *state.Device) -> void {
-    const dropped = ioctl(device.*.descriptor, DROP, 0)
+    var nothing: [8]u8 = [8]u8{ 0, 0, 0, 0, 0, 0, 0, 0 }
+    var none: [*]u8 = undefined
+    unsafe { none = @ptrCast([*]u8, &nothing) }
+    const dropped = control(device, DROP, none, 0)
     const closed = std.linux.syscall1(SYS_close, @bitCast(usize, device.*.descriptor))
 }

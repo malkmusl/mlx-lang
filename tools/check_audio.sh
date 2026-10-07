@@ -52,6 +52,16 @@ fail() {
     exit 1
 }
 
+expect() {
+    # expect NAME WANTED COMMAND...: the command's output contains WANTED.
+    local name=$1 wanted=$2
+    shift 2
+    local output
+    output=$(timeout 10 "$@" 2>&1 || true)
+    [[ "$output" == *"$wanted"* ]] || fail "$name: wanted \"$wanted\", got: $output"
+    echo "ok   $name"
+}
+
 # Test sounds, and the analysis: the amplitude of each frequency where the
 # file is loud.
 python3 - "$work" <<'PY'
@@ -75,15 +85,17 @@ frames = len(body) // (channels * 2)
 left = struct.unpack('<%dh' % (frames * channels), body[:frames * channels * 2])[::channels]
 block = rate // 10
 loud = [i for i in range(0, frames - block, block) if math.sqrt(sum(v * v for v in left[i:i + block]) / block) > 1000]
-segment = left[loud[0]:loud[-1] + block] if loud else []
-def amplitude(f):
+# Each loud tenth of a second on its own, the mean of what they show.
+def block_amplitude(segment, f):
     w = 2 * math.pi * f / rate; c = 2 * math.cos(w); s1 = s2 = 0.0
     for v in segment: s1, s2 = v + c * s1 - s2, s1
     return math.sqrt(max(s1 * s1 + s2 * s2 - c * s1 * s2, 0)) / max(len(segment), 1) * 2
+def amplitude(f):
+    return sum(block_amplitude(left[i:i + block], f) for i in loud) / max(len(loud), 1)
 print(rate, channels, len(loud) / 10.0, *[round(amplitude(float(f))) for f in sys.argv[2:]])
 PY
 # expect_sound NAME FILE RATE CHANNELS SECONDS FREQUENCY AMPLITUDE [FREQUENCY AMPLITUDE...]
-# (amplitudes within 10%; SECONDS of sound within 0.25 s)
+# (amplitudes within 10%; SECONDS of sound within 0.25 s, - for any)
 expect_sound() {
     local name=$1 file=$2 rate=$3 channels=$4 seconds=$5
     shift 5
@@ -96,7 +108,7 @@ import sys
 got = sys.argv[1].split()
 rate, channels, seconds = int(got[0]), int(got[1]), float(got[2])
 assert rate == int(sys.argv[2]) and channels == int(sys.argv[3]), 'format'
-assert abs(seconds - float(sys.argv[4])) <= 0.25, 'length'
+assert sys.argv[4] == '-' or abs(seconds - float(sys.argv[4])) <= 0.25, 'length'
 for value, wanted in zip(map(int, got[3:]), map(int, sys.argv[5:])):
     assert abs(value - wanted) <= max(wanted * 0.1, 200), (value, wanted)
 PY
@@ -206,4 +218,57 @@ wait "$first"
 kill "$(cat "$work/audiod.pid")"; sleep 0.3
 expect_sound "mixed: 440 Hz at half volume and the resampled 1000 Hz file" "$work/two.wav" 48000 2 1 440 8000 1000 12000
 expect_sound "recorded from a looped file, at 22050 Hz" "$work/fromfile.wav" 22050 2 0.9 1000 12000
+# A sound card (emulated, tools/fake_alsa.py: the kernel's PCM ioctls as
+# frames), busy at first as when PipeWire has it. Playback takes only
+# S32_LE, capture only 44100 Hz: the server must negotiate and convert.
+python3 tools/fake_alsa.py "$work/card" --busy 2 > "$work/fake.log" 2>&1 &
+fake_pid=$!
+for _ in $(seq 1 50); do [[ -f "$work/card/ready" ]] && break; sleep 0.1; done
+: > "$XDG_CONFIG_HOME/mlx/ipc.conf"
+MLX_SND_DIR="$work/card/snd" MLX_ASOUND_DIR="$work/card/asound" "$work/mlx-audiod" --verbose > "$work/audiod.log" 2>&1 &
+echo $! > "$work/audiod.pid"
+sleep 0.5
+expect "a busy card: playing to nobody, and why" "output-problem = busy" "$play" status
+sleep 2.5
+state=$("$play" status)
+[[ "$state" == *"output-problem = "$'\n'* && "$state" == *"device = p"$'\t'"pcmC0D0p"$'\t'"FakeCard: Fake Speakers"* && "$state" == *"device = c"$'\t'"pcmC0D0c"* ]] || fail "the card once free: $state"
+grep -q "pcmC0D0p: S32_LE 48000 Hz" "$work/fake.log" && grep -q "pcmC0D0c: S16_LE 44100 Hz" "$work/fake.log" || fail "the card's parameters: $(cat "$work/fake.log")"
+echo "ok   the card taken once free (S32_LE playback, 44100 Hz capture negotiated)"
+"$play" tone 440 1 || fail "playing to the card"
+"$play" record "$work/card-rec.wav" 1 > /dev/null || fail "recording from the card"
+expect_sound "recorded from the card (44100 Hz, resampled)" "$work/card-rec.wav" 48000 2 0.9 523 12000
+
+# Controls (mlx-settings uses them): switching while a tone plays,
+# remembered in audio.conf.
+"$play" tone 440 3 &
+first=$!
+sleep 0.5
+"$play" output null && expect "the output switched" "output = null" "$play" status
+"$play" output alsa:pcmC0D0p && expect "and back" "output = alsa:pcmC0D0p" "$play" status
+wait "$first" || fail "the tone across the switch"
+grep -q "^output = alsa:pcmC0D0p" "$XDG_CONFIG_HOME/mlx/audio.conf" || fail "audio.conf: $(cat "$XDG_CONFIG_HOME/mlx/audio.conf")"
+echo "ok   switching outputs while playing; audio.conf keeps the choice"
+if command -v bwrap > /dev/null && bwrap --bind / / true 2> /dev/null; then
+    expect "sandboxed: no controls (audio.control)" "control = 0" "${sandboxed[@]}" "$play" status
+    # Permission taken back while it records.
+    echo "allow org.example.Player use audio.record" > "$XDG_CONFIG_HOME/mlx/ipc.conf"
+    sleep 0.3
+    "${sandboxed[@]}" "$play" record "$work/taken.wav" 6 > "$work/taken.txt" 2>&1 &
+    first=$!
+    sleep 1
+    : > "$XDG_CONFIG_HOME/mlx/ipc.conf"
+    sleep 0.3
+    "$play" recheck
+    start=$(date +%s)
+    wait "$first" || true
+    [[ $(( $(date +%s) - start )) -lt 3 ]] && grep -q "ended" "$work/taken.txt" || fail "the recording went on: $(cat "$work/taken.txt")"
+    echo "ok   a recording ends when its permission is taken back"
+fi
+kill "$(cat "$work/audiod.pid")"
+sleep 0.3
+kill "$fake_pid"
+sleep 0.5
+grep -q FAIL "$work/card/result" && fail "the card saw: $(cat "$work/card/result")"
+expect_sound "played to the card" "$work/card/played.wav" 48000 2 - 440 16000
+echo "ok   the card saw well-formed ioctls ($(head -1 "$work/card/result"))"
 echo "all MLX Audio checks passed"

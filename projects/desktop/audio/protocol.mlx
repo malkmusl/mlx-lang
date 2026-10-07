@@ -13,6 +13,8 @@ const audio = @import("std.audio")
 const state = @import("./state.mlx")
 const samples = @import("./samples.mlx")
 const mixer = @import("./mixer.mlx")
+const devices = @import("./devices.mlx")
+const config = @import("./config.mlx")
 
 pub fn busOf(server: *state.Server) -> *dbus.Client {
     unsafe { return @ptrCast(*dbus.Client, &server.*.bus) }
@@ -104,32 +106,87 @@ pub fn startBus(server: *state.Server, environment: [*][*]const u8) -> bool {
     return true
 }
 
-// Asks the bus whether the stream's app may play or record.
-fn askPermission(server: *state.Server, stream: *state.Stream) -> void {
-    const peer = peerAt(stream.*.peer)
+// Asks the bus (org.mlx.IPC.Check) whether the app behind `peer` may use
+// `permission`: the call's serial (0: not sent).
+fn askBus(server: *state.Server, peer: *state.Peer, permission: []const u8) -> u32 {
     var body: [256]u8 = undefined
     var bytes: [*]u8 = undefined
     unsafe { bytes = @ptrCast([*]u8, &body) }
     var writing: dbus.Writer = undefined
     dbus.begin(&writing, bytes, 256, false)
     dbus.putString(&writing, uniqueOf(peer))
-    dbus.putString(&writing, if stream.*.direction == audio.PLAY { "audio.play" } else { "audio.record" })
-    stream.*.checkSerial = dbus.call(busOf(server), "org.freedesktop.DBus", "/org/mlx/IPC", "org.mlx.IPC", "Check", "ss", bytes, writing.length)
-    if stream.*.checkSerial == 0 { refuse(server, stream, audio.DENIED, "the bus did not answer") }
+    dbus.putString(&writing, permission)
+    return dbus.call(busOf(server), "org.freedesktop.DBus", "/org/mlx/IPC", "org.mlx.IPC", "Check", "ss", bytes, writing.length)
 }
 
-// The answer to a Check.
+// Asks the bus whether the stream's app may play or record (when it opens,
+// and again when the permissions changed).
+fn askPermission(server: *state.Server, stream: *state.Stream) -> void {
+    stream.*.checkSerial = askBus(server, peerAt(stream.*.peer), if stream.*.direction == audio.PLAY { "audio.play" } else { "audio.record" })
+    if stream.*.checkSerial == 0 && stream.*.state == state.CHECKING { refuse(server, stream, audio.DENIED, "the bus did not answer") }
+}
+
+// Keeps the bus's last answer for an app and permission (the Sound
+// settings list who asked to record).
+fn remember(server: *state.Server, app: []const u8, record: bool, allowed: bool) -> void {
+    var index: usize = 0
+    while index < server.*.askedCount {
+        var bytes: [*]const u8 = undefined
+        unsafe { bytes = @ptrCast([*]const u8, &server.*.asked[index].app) }
+        if server.*.asked[index].record == record && same(bytes[0..server.*.asked[index].appLength], app) {
+            server.*.asked[index].allowed = allowed
+            return
+        }
+        index += 1
+    }
+    if server.*.askedCount >= state.MAX_ASKED { return }
+    const slot = server.*.askedCount
+    var target: [*]u8 = undefined
+    unsafe { target = @ptrCast([*]u8, &server.*.asked[slot].app) }
+    server.*.asked[slot].appLength = copy(target, 128, app)
+    server.*.asked[slot].record = record
+    server.*.asked[slot].allowed = allowed
+    server.*.askedCount += 1
+}
+
+fn answerOf(reply: *const dbus.Header, body: [*]const u8) -> bool {
+    if reply.*.kind != dbus.METHOD_RETURN { return false }
+    var reading = dbus.reader(body, reply.*.bodyLength, reply.*.big)
+    const allowed = dbus.readBool(&reading)
+    return allowed && !reading.failed
+}
+
+// The answer to a Check: a peer's control, a stream opening, or a stream
+// asked about again (ended when no longer allowed).
 fn checked(server: *state.Server, reply: *const dbus.Header, body: [*]const u8) -> void {
+    const allowed = answerOf(reply, body)
+    var index: usize = 0
+    while index < server.*.peerCount {
+        const peer = peerAt(server.*.peers[index])
+        if peer.*.control == state.CONTROL_CHECKING && peer.*.controlSerial == reply.*.replySerial {
+            peer.*.control = if allowed { state.CONTROL_ALLOWED } else { state.CONTROL_DENIED }
+            sendState(server, peer)
+            return
+        }
+        index += 1
+    }
     var slot: usize = 0
     while slot < state.MAX_STREAMS {
         const stream = mixer.streamAt(server, slot)
-        if stream.*.used && stream.*.state == state.CHECKING && stream.*.checkSerial == reply.*.replySerial {
-            var allowed = false
-            if reply.*.kind == dbus.METHOD_RETURN {
-                var reading = dbus.reader(body, reply.*.bodyLength, reply.*.big)
-                allowed = dbus.readBool(&reading) && !reading.failed
+        if stream.*.used && stream.*.checkSerial == reply.*.replySerial {
+            stream.*.checkSerial = 0
+            remember(server, appOf(peerAt(stream.*.peer)), stream.*.direction == audio.RECORD, allowed)
+            if stream.*.state == state.CHECKING {
+                if allowed { open(server, stream) } else { refuse(server, stream, audio.DENIED, if stream.*.direction == audio.PLAY { "this app may not play sound (audio.play, ~/.config/mlx/ipc.conf)" } else { "this app may not record (audio.record, ~/.config/mlx/ipc.conf)" }) }
+            } else if !allowed {
+                say(server, "audio: ")
+                say(server, appOf(peerAt(stream.*.peer)))
+                say(server, " may no longer ")
+                say(server, if stream.*.direction == audio.PLAY { "play" } else { "record" })
+                say(server, "; its stream ended\n")
+                sendStreamValue(server, stream, audio.ENDED, 0)
+                freeStream(server, stream)
             }
-            if allowed { open(server, stream) } else { refuse(server, stream, audio.DENIED, if stream.*.direction == audio.PLAY { "this app may not play sound (audio.play, ~/.config/mlx/ipc.conf)" } else { "this app may not record (audio.record, ~/.config/mlx/ipc.conf)" }) }
             return
         }
         slot += 1
@@ -195,6 +252,8 @@ fn addPeer(server: *state.Server, descriptor: isize, unique: []const u8, app: []
     peer.*.appLength = copy(bytes, 128, app)
     peer.*.dead = false
     peer.*.watchingOutput = false
+    peer.*.control = state.CONTROL_UNKNOWN
+    peer.*.controlSerial = 0
     server.*.peers[server.*.peerCount] = @intFromPtr(memory.?)
     server.*.peerCount += 1
     const watched = dbus.watch(server.*.eventLoop, descriptor, @intFromPtr(memory.?), false)
@@ -464,6 +523,124 @@ fn listStreams(server: *state.Server, peer: *state.Peer) -> void {
     const sent = sendTo(server, peer, bytes, at)
 }
 
+// SET: what mlx-settings changes.
+fn setting(server: *state.Server, what: u32, value: u32, target: u32, text: []const u8) -> void {
+    var limited = value
+    if limited > 98304 { limited = 98304 }
+    if what == audio.SET_VOLUME {
+        server.*.master = limited
+    } else if what == audio.SET_MUTE {
+        server.*.mute = value != 0
+    } else if what == audio.SET_INPUT_VOLUME {
+        server.*.inputVolume = limited
+    } else if what == audio.SET_INPUT_MUTE {
+        server.*.inputMute = value != 0
+    } else if what == audio.SET_STREAM_VOLUME {
+        if target >= 1 && target <= @intCast(u32, state.MAX_STREAMS) {
+            const stream = mixer.streamAt(server, @intCast(usize, target - 1))
+            if stream.*.used { stream.*.volume = limited }
+        }
+        return
+    } else if what == audio.SET_OUTPUT && text.length > 0 {
+        say(server, "audio: output: ")
+        say(server, text)
+        say(server, "\n")
+        const switched = devices.switchOutput(server, text)
+    } else if what == audio.SET_INPUT && text.length > 0 {
+        say(server, "audio: input: ")
+        say(server, text)
+        say(server, "\n")
+        const switched = devices.switchInput(server, text)
+    } else if what == audio.SET_RECHECK {
+        var slot: usize = 0
+        while slot < state.MAX_STREAMS {
+            const stream = mixer.streamAt(server, slot)
+            if stream.*.used && stream.*.state == state.OPEN { askPermission(server, stream) }
+            slot += 1
+        }
+        return
+    } else {
+        return
+    }
+    config.save(server)
+}
+
+fn putLine(bytes: [*]u8, at: usize, key: []const u8, value: []const u8) -> usize {
+    var length = appendText(bytes, at, key)
+    length = appendText(bytes, length, " = ")
+    length = appendText(bytes, length, value)
+    return appendText(bytes, length, "\n")
+}
+
+fn putNumberLine(bytes: [*]u8, at: usize, key: []const u8, value: usize) -> usize {
+    var length = appendText(bytes, at, key)
+    length = appendText(bytes, length, " = ")
+    length = appendNumber(bytes, length, value)
+    return appendText(bytes, length, "\n")
+}
+
+fn problemText(problem: isize) -> []const u8 {
+    if problem == 0 { return "" }
+    if problem == -16 { return "busy" }
+    if problem == -2 { return "missing" }
+    return "failed"
+}
+
+// STATE: what mlx-settings shows.
+fn sendState(server: *state.Server, peer: *state.Peer) -> void {
+    const bytes = server.*.message
+    var at: usize = audio.HEADER
+    if peer.*.control != state.CONTROL_ALLOWED {
+        at = putLine(bytes, at, "control", "0")
+    } else {
+        at = putLine(bytes, at, "control", "1")
+        at = putNumberLine(bytes, at, "rate", @intCast(usize, server.*.rate))
+        at = putLine(bytes, at, "output", devices.outputSpec(server))
+        at = putLine(bytes, at, "output-problem", problemText(server.*.outputProblem))
+        at = putLine(bytes, at, "input", devices.inputSpec(server))
+        at = putLine(bytes, at, "input-problem", problemText(server.*.inputProblem))
+        var holder: [*]const u8 = undefined
+        unsafe { holder = @ptrCast([*]const u8, &server.*.holder) }
+        at = putLine(bytes, at, "holder", if server.*.outputProblem == -16 || server.*.inputProblem == -16 { holder[0..server.*.holderLength] } else { holder[0..0] })
+        at = putNumberLine(bytes, at, "volume", @intCast(usize, server.*.master))
+        at = putLine(bytes, at, "mute", if server.*.mute { "1" } else { "0" })
+        at = putNumberLine(bytes, at, "input-volume", @intCast(usize, server.*.inputVolume))
+        at = putLine(bytes, at, "input-mute", if server.*.inputMute { "1" } else { "0" })
+        at = devices.listCards(server, false, bytes, at, audio.MAX_PAYLOAD - 512)
+        at = devices.listCards(server, true, bytes, at, audio.MAX_PAYLOAD - 512)
+        var slot: usize = 0
+        while slot < state.MAX_STREAMS && at + 600 < audio.MAX_PAYLOAD {
+            const stream = mixer.streamAt(server, slot)
+            if stream.*.used && stream.*.state == state.OPEN {
+                at = appendText(bytes, at, "stream = ")
+                at = appendNumber(bytes, at, slot + 1)
+                at = appendText(bytes, at, "\t")
+                at = appendText(bytes, at, appOf(peerAt(stream.*.peer)))
+                at = appendText(bytes, at, if stream.*.direction == audio.PLAY { "\tplay\t" } else { "\trecord\t" })
+                at = appendNumber(bytes, at, @intCast(usize, stream.*.volume))
+                at = appendText(bytes, at, "\t")
+                at = appendNumber(bytes, at, @intCast(usize, stream.*.rate))
+                at = appendText(bytes, at, "\t")
+                at = appendText(bytes, at, nameOf(stream))
+                at = appendText(bytes, at, "\n")
+            }
+            slot += 1
+        }
+        var index: usize = 0
+        while index < server.*.askedCount && at + 300 < audio.MAX_PAYLOAD {
+            var app: [*]const u8 = undefined
+            unsafe { app = @ptrCast([*]const u8, &server.*.asked[index].app) }
+            at = appendText(bytes, at, "asked = ")
+            at = appendText(bytes, at, app[0..server.*.asked[index].appLength])
+            at = appendText(bytes, at, if server.*.asked[index].record { "\trecord\t" } else { "\tplay\t" })
+            at = appendText(bytes, at, if server.*.asked[index].allowed { "1\n" } else { "0\n" })
+            index += 1
+        }
+    }
+    audio.header(bytes, audio.STATE, at - audio.HEADER)
+    const sent = sendTo(server, peer, bytes, at)
+}
+
 // One message from a peer.
 fn handle(server: *state.Server, peer: *state.Peer, kind: u32, payload: [*]const u8, length: usize) -> void {
     if kind == audio.OPEN {
@@ -472,6 +649,19 @@ fn handle(server: *state.Server, peer: *state.Peer, kind: u32, payload: [*]const
     }
     if kind == audio.LIST {
         listStreams(server, peer)
+        return
+    }
+    if kind == audio.STATUS {
+        if peer.*.control == state.CONTROL_UNKNOWN {
+            peer.*.control = state.CONTROL_CHECKING
+            peer.*.controlSerial = askBus(server, peer, "audio.control")
+            if peer.*.controlSerial == 0 { peer.*.control = state.CONTROL_DENIED }
+        }
+        if peer.*.control != state.CONTROL_CHECKING { sendState(server, peer) }
+        return
+    }
+    if kind == audio.SET {
+        if peer.*.control == state.CONTROL_ALLOWED && length >= 12 { setting(server, audio.load32(payload, 0), audio.load32(payload, 4), audio.load32(payload, 8), payload[12..length]) }
         return
     }
     if length < 4 { return }

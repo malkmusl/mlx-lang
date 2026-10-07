@@ -1,19 +1,25 @@
 // Where the mix goes and where recordings come from:
 //
-//   output  auto (the first sound card, else null), alsa[:pcmC1D0p],
-//           file:PATH.wav (the mix, 16-bit stereo, written as it plays),
-//           null (played to nobody, at the real pace)
-//   input   auto (the first sound card's capture, else none), alsa[:NAME],
-//           sine:HZ (a tone), file:PATH.wav (looped), none (silence)
+//   output  auto (the first sound card), alsa[:pcmC1D0p], file:PATH.wav
+//           (the mix, 16-bit stereo, written as it plays), null (played
+//           to nobody, at the real pace)
+//   input   auto (the first sound card's capture), alsa[:NAME], sine:HZ
+//           (a tone), file:PATH.wav (looped), none (silence)
 //
 // A sound card paces the server itself (the event loop moves a period
-// whenever it has room); otherwise a timer does, a period at a time.
+// whenever it has room); otherwise a timer does, a period at a time. A
+// card that is missing or busy (PipeWire or PulseAudio has it: who, is
+// said) is tried again every 2 seconds, playing to nobody meanwhile, so a
+// card that comes or is freed is taken. mlx-settings switches them while
+// they play (switchOutput, switchInput).
 const std = @import("std")
 const audio = @import("std.audio")
 const wav = @import("std.wav")
 const state = @import("./state.mlx")
 const samples = @import("./samples.mlx")
 const alsa = @import("./alsa.mlx")
+const mixer = @import("./mixer.mlx")
+const dbus = @import("std.dbus")
 
 const SYS_open: usize = 2
 const SYS_close: usize = 3
@@ -80,6 +86,8 @@ fn setPath(device: *state.Device, first: []const u8, second: []const u8) -> [*]c
 fn reset(device: *state.Device) -> void {
     device.*.kind = state.NONE
     device.*.descriptor = -1
+    device.*.emulated = false
+    device.*.hertz = 0
     device.*.encoding = audio.S16
     device.*.channels = 2
     device.*.period = 0
@@ -94,34 +102,321 @@ fn reset(device: *state.Device) -> void {
     device.*.xruns = 0
 }
 
-// Opens the first sound card's PCM device for playing (`suffix` "p") or
-// recording ("c"), or the one `name` names.
-fn openCard(server: *state.Server, device: *state.Device, name: []const u8, capture: bool) -> bool {
-    const suffix = if capture { "c" } else { "p" }
-    if name.length > 0 {
-        const path = if name[0] == 47 { setPath(device, name, "") } else { setPath(device, "/dev/snd/", name) }
-        return alsa.open(device, path, capture, server.*.rate, server.*.period)
-    }
-    var card: u8 = 0
-    while card < 8 {
-        var first: [16]u8 = undefined
-        const prefix = "pcmC"
-        var at: usize = 0
-        while at < 4 {
-            first[at] = prefix[at]
-            at += 1
+// Where the sound cards are: /dev/snd and /proc/asound, or what
+// MLX_SND_DIR and MLX_ASOUND_DIR say (tests: tools/fake_alsa.py).
+fn sndDirectory(server: *state.Server) -> []const u8 {
+    const value = std.process.environmentFrom(server.*.environment, "MLX_SND_DIR")
+    if value != null && value.?.length > 0 { return std.string.asSlice(value.?) }
+    return "/dev/snd"
+}
+
+fn asoundDirectory(server: *state.Server) -> []const u8 {
+    const value = std.process.environmentFrom(server.*.environment, "MLX_ASOUND_DIR")
+    if value != null && value.?.length > 0 { return std.string.asSlice(value.?) }
+    return "/proc/asound"
+}
+
+// Whether `name` is a PCM device "pcmC<card>D<device><p|c>" of the kind
+// wanted (playback "p", capture "c").
+fn isPcm(name: []const u8, capture: bool) -> bool {
+    if name.length < 8 || !startsWith(name, "pcmC") { return false }
+    const last = name[name.length - 1]
+    return last == (if capture { 99 } else { 112 })
+}
+
+// The card number of a PCM device's name.
+fn cardOf(name: []const u8) -> u32 { return parseNumber(name[4..name.length]) }
+
+// The device number (after "D").
+fn deviceOf(name: []const u8) -> u32 {
+    var at: usize = 4
+    while at < name.length && name[at] != 68 { at += 1 }
+    if at + 1 >= name.length { return 0 }
+    return parseNumber(name[at + 1..name.length])
+}
+
+// The PCM devices of the kind wanted, each followed by a NUL, sorted by
+// name; their total length.
+fn pcmNames(server: *state.Server, capture: bool, out: [*]u8, capacity: usize) -> usize {
+    var path: [256]u8 = undefined
+    var path_bytes: [*]u8 = undefined
+    unsafe { path_bytes = @ptrCast([*]u8, &path) }
+    const directory = sndDirectory(server)
+    var length = copyText(path_bytes, 0, directory)
+    path[length] = 0
+    const handle = std.linux.syscall3(SYS_open, @intFromPtr(path_bytes), 65536 | O_CLOEXEC, 0)
+    if handle < 0 { return 0 }
+    var buffer: [4096]u8 = undefined
+    var bytes: [*]u8 = undefined
+    unsafe { bytes = @ptrCast([*]u8, &buffer) }
+    var reader = std.fs.entries(std.fs.File.{ .descriptor = handle }, bytes, 4096)
+    var entry: std.fs.Entry = undefined
+    var total: usize = 0
+    while std.fs.nextEntry(&reader, &entry) {
+        const name = std.string.asSlice(entry.name)
+        if isPcm(name, capture) && total + name.length + 1 <= capacity {
+            // Insertion in order.
+            var at: usize = 0
+            while at < total {
+                var end = at
+                while out[end] != 0 { end += 1 }
+                if before(name, out[at..end]) { break }
+                at = end + 1
+            }
+            var move = total
+            while move > at {
+                move -= 1
+                out[move + name.length + 1] = out[move]
+            }
+            var index: usize = 0
+            while index < name.length {
+                out[at + index] = name[index]
+                index += 1
+            }
+            out[at + name.length] = 0
+            total += name.length + 1
         }
-        first[4] = 48 + card
-        first[5] = 68
-        first[6] = 48
-        first[7] = suffix[0]
-        var name_bytes: [*]const u8 = undefined
-        unsafe { name_bytes = @ptrCast([*]const u8, &first) }
-        const path = setPath(device, "/dev/snd/", name_bytes[0..8])
-        if alsa.open(device, path, capture, server.*.rate, server.*.period) { return true }
-        card += 1
     }
-    return false
+    const closed = std.linux.syscall1(SYS_close, @bitCast(usize, handle))
+    return total
+}
+
+fn before(first: []const u8, second: []const u8) -> bool {
+    var index: usize = 0
+    while index < first.length && index < second.length {
+        if first[index] != second[index] { return first[index] < second[index] }
+        index += 1
+    }
+    return first.length < second.length
+}
+
+fn copyText(target: [*]u8, at: usize, text: []const u8) -> usize {
+    var index: usize = 0
+    while index < text.length && at + index < 250 {
+        target[at + index] = text[index]
+        index += 1
+    }
+    return at + index
+}
+
+// The first line of a small file, trimmed, into `out`: its length.
+fn firstLine(path: [*]const u8, out: [*]u8, capacity: usize) -> usize {
+    const file = std.fs.open(path, O_CLOEXEC, 0)
+    if file.descriptor < 0 { return 0 }
+    const got = std.fs.read(file, out, capacity)
+    const closed = std.fs.close(file)
+    if got <= 0 { return 0 }
+    var length: usize = 0
+    while length < @intCast(usize, got) && out[length] != 10 { length += 1 }
+    while length > 0 && out[length - 1] == 32 { length -= 1 }
+    return length
+}
+
+// What a PCM device is called: "<card id>: <its name>" from the
+// asound directory, or the device's own name.
+pub fn labelOf(server: *state.Server, name: []const u8, out: [*]u8, capacity: usize) -> usize {
+    var path: [300]u8 = undefined
+    var path_bytes: [*]u8 = undefined
+    unsafe { path_bytes = @ptrCast([*]u8, &path) }
+    var digits: [24]u8 = undefined
+    var digit_bytes: [*]u8 = undefined
+    unsafe { digit_bytes = @ptrCast([*]u8, &digits) }
+    const card_length = numberText(digit_bytes, cardOf(name))
+    var length = copyText(path_bytes, 0, asoundDirectory(server))
+    length = copyText(path_bytes, length, "/card")
+    length = copyText(path_bytes, length, digit_bytes[0..card_length])
+    const card_end = length
+    length = copyText(path_bytes, length, "/id")
+    path[length] = 0
+    var id: [64]u8 = undefined
+    var id_bytes: [*]u8 = undefined
+    unsafe { id_bytes = @ptrCast([*]u8, &id) }
+    const id_length = firstLine(path_bytes, id_bytes, 63)
+    // card<N>/pcm<D><p|c>/info: "name: ..." on one of its lines.
+    length = copyText(path_bytes, card_end, "/pcm")
+    length = copyText(path_bytes, length, digit_bytes[0..numberText(digit_bytes, deviceOf(name))])
+    length = copyText(path_bytes, length, name[name.length - 1..name.length])
+    length = copyText(path_bytes, length, "/info")
+    path[length] = 0
+    var info: [1024]u8 = undefined
+    var info_bytes: [*]u8 = undefined
+    unsafe { info_bytes = @ptrCast([*]u8, &info) }
+    var info_length: usize = 0
+    const file = std.fs.open(path_bytes, O_CLOEXEC, 0)
+    if file.descriptor >= 0 {
+        const got = std.fs.read(file, info_bytes, 1024)
+        const closed = std.fs.close(file)
+        if got > 0 { info_length = @intCast(usize, got) }
+    }
+    var pcm_name: []const u8 = info_bytes[0..0]
+    var at: usize = 0
+    while at < info_length {
+        var end = at
+        while end < info_length && info[end] != 10 { end += 1 }
+        if startsWith(info_bytes[at..end], "name: ") { pcm_name = info_bytes[at + 6..end] }
+        at = end + 1
+    }
+    if id_length == 0 && pcm_name.length == 0 { return copyLimited(out, 0, capacity, name) }
+    var made = copyLimited(out, 0, capacity, id_bytes[0..id_length])
+    if pcm_name.length > 0 {
+        if made > 0 { made = copyLimited(out, made, capacity, ": ") }
+        made = copyLimited(out, made, capacity, pcm_name)
+    }
+    return made
+}
+
+fn copyLimited(target: [*]u8, at: usize, capacity: usize, text: []const u8) -> usize {
+    var index: usize = 0
+    while index < text.length && at + index < capacity {
+        target[at + index] = text[index]
+        index += 1
+    }
+    return at + index
+}
+
+fn numberText(out: [*]u8, value: u32) -> usize {
+    var digits: [12]u8 = undefined
+    var count: usize = 0
+    var rest = value
+    while true {
+        digits[count] = @intCast(u8, 48 + rest % 10)
+        count += 1
+        rest = rest / 10
+        if rest == 0 { break }
+    }
+    var length: usize = 0
+    while count > 0 {
+        count -= 1
+        out[length] = digits[count]
+        length += 1
+    }
+    return length
+}
+
+// Lists the cards' devices of a kind for the Sound settings: lines
+// "device = <p|c>\t<name>\t<label>\n" appended at `at`; the new end.
+pub fn listCards(server: *state.Server, capture: bool, out: [*]u8, at: usize, capacity: usize) -> usize {
+    var names: [2048]u8 = undefined
+    var names_bytes: [*]u8 = undefined
+    unsafe { names_bytes = @ptrCast([*]u8, &names) }
+    const total = pcmNames(server, capture, names_bytes, 2048)
+    var label: [160]u8 = undefined
+    var label_bytes: [*]u8 = undefined
+    unsafe { label_bytes = @ptrCast([*]u8, &label) }
+    var length = at
+    var start: usize = 0
+    while start < total && length + 300 < capacity {
+        var end = start
+        while names[end] != 0 { end += 1 }
+        const name = names_bytes[start..end]
+        length = copyLimited(out, length, capacity, if capture { "device = c\t" } else { "device = p\t" })
+        length = copyLimited(out, length, capacity, name)
+        length = copyLimited(out, length, capacity, "\t")
+        length = copyLimited(out, length, capacity, label_bytes[0..labelOf(server, name, label_bytes, 160)])
+        length = copyLimited(out, length, capacity, "\n")
+        start = end + 1
+    }
+    return length
+}
+
+// Who has `path` open (a process's name from /proc), into the server's
+// holder; told when a card is busy.
+fn findHolder(server: *state.Server, path: []const u8) -> void {
+    server.*.holderLength = 0
+    var proc_path: [*]const u8 = undefined
+    unsafe { proc_path = @ptrCast([*]const u8, "/proc") }
+    const proc = std.linux.syscall3(SYS_open, @intFromPtr(proc_path), 65536 | O_CLOEXEC, 0)
+    if proc < 0 { return }
+    var buffer: [8192]u8 = undefined
+    var bytes: [*]u8 = undefined
+    unsafe { bytes = @ptrCast([*]u8, &buffer) }
+    var reader = std.fs.entries(std.fs.File.{ .descriptor = proc }, bytes, 8192)
+    var entry: std.fs.Entry = undefined
+    var link: [300]u8 = undefined
+    var link_bytes: [*]u8 = undefined
+    unsafe { link_bytes = @ptrCast([*]u8, &link) }
+    var target: [300]u8 = undefined
+    var target_bytes: [*]u8 = undefined
+    unsafe { target_bytes = @ptrCast([*]u8, &target) }
+    while server.*.holderLength == 0 && std.fs.nextEntry(&reader, &entry) {
+        const pid = std.string.asSlice(entry.name)
+        if pid.length > 0 && pid[0] >= 49 && pid[0] <= 57 {
+            var length = copyText(link_bytes, 0, "/proc/")
+            length = copyText(link_bytes, length, pid)
+            const pid_end = length
+            length = copyText(link_bytes, length, "/fd")
+            link[length] = 0
+            const fds = std.linux.syscall3(SYS_open, @intFromPtr(link_bytes), 65536 | O_CLOEXEC, 0)
+            if fds >= 0 {
+                var fd_buffer: [4096]u8 = undefined
+                var fd_bytes: [*]u8 = undefined
+                unsafe { fd_bytes = @ptrCast([*]u8, &fd_buffer) }
+                var fd_reader = std.fs.entries(std.fs.File.{ .descriptor = fds }, fd_bytes, 4096)
+                var fd_entry: std.fs.Entry = undefined
+                while server.*.holderLength == 0 && std.fs.nextEntry(&fd_reader, &fd_entry) {
+                    var at = copyText(link_bytes, length, "/")
+                    at = copyText(link_bytes, at, std.string.asSlice(fd_entry.name))
+                    link[at] = 0
+                    const got = std.fs.readLink(link_bytes, target_bytes, 299)
+                    if got > 0 && same(target_bytes[0..@intCast(usize, got)], path) {
+                        var comm = copyText(link_bytes, pid_end, "/comm")
+                        link[comm] = 0
+                        var name: [*]u8 = undefined
+                        unsafe { name = @ptrCast([*]u8, &server.*.holder) }
+                        server.*.holderLength = firstLine(link_bytes, name, 63)
+                    }
+                }
+                const closed_fds = std.linux.syscall1(SYS_close, @bitCast(usize, fds))
+            }
+        }
+    }
+    const closed = std.linux.syscall1(SYS_close, @bitCast(usize, proc))
+}
+
+// Opens a card's PCM device for playing or recording: `name` (pcmC1D0p,
+// or a path), or the first there is. 0, or a negative errno: the first
+// card's problem (EBUSY, and who has it), ENOENT when there is none.
+fn openCard(server: *state.Server, device: *state.Device, name: []const u8, capture: bool) -> isize {
+    if name.length > 0 {
+        const path = if name[0] == 47 { setPath(device, name, "") } else { setPath(device, sndDirectory(server), "/") }
+        if name[0] != 47 { const appended = appendPath(device, name) }
+        const result = alsa.open(device, path, capture, server.*.rate, server.*.period)
+        if result == alsa.EBUSY { findHolder(server, device.*.path[0..device.*.pathLength]) }
+        return result
+    }
+    var names: [2048]u8 = undefined
+    var names_bytes: [*]u8 = undefined
+    unsafe { names_bytes = @ptrCast([*]u8, &names) }
+    const total = pcmNames(server, capture, names_bytes, 2048)
+    var first_problem: isize = -2
+    var start: usize = 0
+    while start < total {
+        var end = start
+        while names[end] != 0 { end += 1 }
+        const path = setPath(device, sndDirectory(server), "/")
+        const appended = appendPath(device, names_bytes[start..end])
+        const result = alsa.open(device, path, capture, server.*.rate, server.*.period)
+        if result == 0 { return 0 }
+        if first_problem == -2 {
+            first_problem = result
+            if result == alsa.EBUSY { findHolder(server, device.*.path[0..device.*.pathLength]) }
+        }
+        start = end + 1
+    }
+    return first_problem
+}
+
+fn appendPath(device: *state.Device, text: []const u8) -> [*]const u8 {
+    var length = device.*.pathLength
+    var index: usize = 0
+    while index < text.length && length < 250 {
+        device.*.path[length] = text[index]
+        length += 1
+        index += 1
+    }
+    device.*.path[length] = 0
+    device.*.pathLength = length
+    unsafe { return @ptrCast([*]const u8, &device.*.path) }
 }
 
 // Reads the file at `path` (NUL-terminated) whole into allocated memory:
@@ -160,15 +455,65 @@ fn parseNumber(text: []const u8) -> u32 {
     return value
 }
 
-// Opens the output `spec`; false (and why, said) when it cannot.
-pub fn openOutput(server: *state.Server, spec: []const u8) -> bool {
+pub fn outputSpec(server: *state.Server) -> []const u8 {
+    var bytes: [*]const u8 = undefined
+    unsafe { bytes = @ptrCast([*]const u8, &server.*.outputSpec) }
+    return bytes[0..server.*.outputSpecLength]
+}
+
+pub fn inputSpec(server: *state.Server) -> []const u8 {
+    var bytes: [*]const u8 = undefined
+    unsafe { bytes = @ptrCast([*]const u8, &server.*.inputSpec) }
+    return bytes[0..server.*.inputSpecLength]
+}
+
+pub fn setOutputSpec(server: *state.Server, spec: []const u8) -> void {
+    var bytes: [*]u8 = undefined
+    unsafe { bytes = @ptrCast([*]u8, &server.*.outputSpec) }
+    server.*.outputSpecLength = copyLimited(bytes, 0, 159, spec)
+}
+
+pub fn setInputSpec(server: *state.Server, spec: []const u8) -> void {
+    var bytes: [*]u8 = undefined
+    unsafe { bytes = @ptrCast([*]u8, &server.*.inputSpec) }
+    server.*.inputSpecLength = copyLimited(bytes, 0, 159, spec)
+}
+
+// Whether a spec names a card (auto, alsa, alsa:NAME).
+pub fn wantsCard(spec: []const u8) -> bool { return same(spec, "auto") || startsWith(spec, "alsa") }
+
+fn tell(server: *state.Server, what: []const u8, problem: isize) -> void {
+    say(server, "audio: ")
+    say(server, what)
+    if problem == alsa.EBUSY {
+        say(server, ": the sound card is busy")
+        if server.*.holderLength > 0 {
+            say(server, " (")
+            var bytes: [*]const u8 = undefined
+            unsafe { bytes = @ptrCast([*]const u8, &server.*.holder) }
+            say(server, bytes[0..server.*.holderLength])
+            say(server, " has it)")
+        }
+        say(server, "; trying again every 2 s\n")
+    } else {
+        say(server, ": no sound card; trying again every 2 s\n")
+    }
+}
+
+// Opens the output the spec asks for: a card (else, for now, nobody: its
+// problem kept, the card tried again), a file, or nobody. False when the
+// spec is not one, or a file cannot be written.
+pub fn openOutput(server: *state.Server) -> bool {
+    const spec = outputSpec(server)
     const device = outputOf(server)
     reset(device)
-    if same(spec, "auto") || startsWith(spec, "alsa") {
+    server.*.outputProblem = 0
+    if wantsCard(spec) {
         const name = if startsWith(spec, "alsa:") { spec[5..spec.length] } else { spec[0..0] }
-        if openCard(server, device, name, false) {
+        const result = openCard(server, device, name, false)
+        if result == 0 {
             server.*.rate = device.*.rate
-            server.*.period = device.*.period
+            server.*.period = if device.*.period > state.MAX_PERIOD { state.MAX_PERIOD } else { device.*.period }
             say(server, "audio: playing to ")
             say(server, device.*.path[0..device.*.pathLength])
             say(server, " at ")
@@ -178,12 +523,10 @@ pub fn openOutput(server: *state.Server, spec: []const u8) -> bool {
             say(server, " frames\n")
             return true
         }
-        if !same(spec, "auto") {
-            const said = std.io.eprintln("mlx-audiod: the sound card could not be opened (missing, or another sound server has it)")
-            return false
-        }
-        say(server, "audio: no sound card; playing to nobody\n")
+        reset(device)
         device.*.kind = state.NULL
+        server.*.outputProblem = result
+        tell(server, "playing to nobody", result)
         return true
     }
     if same(spec, "null") {
@@ -206,35 +549,36 @@ pub fn openOutput(server: *state.Server, spec: []const u8) -> bool {
         const moved = std.linux.syscall3(SYS_lseek, @bitCast(usize, descriptor), wav.HEADER_SIZE, 0)
         return true
     }
-    const said = std.io.eprintln("mlx-audiod: --output is auto, alsa[:NAME], file:PATH.wav or null")
+    const said = std.io.eprintln("mlx-audiod: an output is auto, alsa[:NAME], file:PATH.wav or null")
     return false
 }
 
-// Opens the input `spec`.
-pub fn openInput(server: *state.Server, spec: []const u8) -> bool {
+// Opens the input the spec asks for (a card, else silence for now).
+pub fn openInput(server: *state.Server) -> bool {
+    const spec = inputSpec(server)
     const device = inputOf(server)
     reset(device)
-    if same(spec, "auto") || startsWith(spec, "alsa") {
+    server.*.inputProblem = 0
+    if wantsCard(spec) {
         const name = if startsWith(spec, "alsa:") { spec[5..spec.length] } else { spec[0..0] }
-        if openCard(server, device, name, true) {
+        const result = openCard(server, device, name, true)
+        if result == 0 {
             say(server, "audio: recording from ")
             say(server, device.*.path[0..device.*.pathLength])
             say(server, "\n")
-            if device.*.rate != server.*.rate { samples.startResampler(resamplerOf(device), device.*.rate, server.*.rate) }
+            samples.startResampler(resamplerOf(device), device.*.rate, server.*.rate)
             return true
         }
-        if !same(spec, "auto") {
-            const said = std.io.eprintln("mlx-audiod: the sound card's input could not be opened")
-            return false
-        }
-        device.*.kind = state.NONE
+        reset(device)
+        server.*.inputProblem = result
+        tell(server, "recording silence", result)
         return true
     }
     if same(spec, "none") { return true }
     if startsWith(spec, "sine:") {
-        const hertz = parseNumber(spec[5..spec.length])
         device.*.kind = state.SINE
-        device.*.phaseStep = @intCast(u32, (@intCast(u64, hertz) << 32) / @intCast(u64, server.*.rate))
+        device.*.hertz = parseNumber(spec[5..spec.length])
+        retune(server)
         return true
     }
     if startsWith(spec, "file:") {
@@ -257,8 +601,141 @@ pub fn openInput(server: *state.Server, spec: []const u8) -> bool {
         samples.startResampler(resamplerOf(device), info.rate, server.*.rate)
         return true
     }
-    const said = std.io.eprintln("mlx-audiod: --input is auto, alsa[:NAME], sine:HZ, file:PATH.wav or none")
+    const said = std.io.eprintln("mlx-audiod: an input is auto, alsa[:NAME], sine:HZ, file:PATH.wav or none")
     return false
+}
+
+// After the server's rate changed (another output): every stream's and
+// device's conversion again.
+pub fn retune(server: *state.Server) -> void {
+    const input = inputOf(server)
+    if input.*.kind == state.SINE { input.*.phaseStep = @intCast(u32, (@intCast(u64, input.*.hertz) << 32) / @intCast(u64, server.*.rate)) }
+    if input.*.kind == state.FILE { samples.startResampler(resamplerOf(input), input.*.fileRate, server.*.rate) }
+    if input.*.kind == state.ALSA { samples.startResampler(resamplerOf(input), input.*.rate, server.*.rate) }
+}
+
+// Watches what paces the server: the sound card (its descriptor; an
+// emulated one for reading), else the timer; the card being recorded
+// from; the retry timer while a card is missing or busy.
+pub fn arm(server: *state.Server) -> void {
+    const output = outputOf(server)
+    if output.*.kind == state.ALSA {
+        const watching = dbus.watch(server.*.eventLoop, output.*.descriptor, state.CARD_OUT, !output.*.emulated)
+        // Its buffer filled at once (a card has room until it is full).
+        mixer.cardWritable(server)
+    } else {
+        // CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC.
+        server.*.timer = std.linux.syscall2(283, 1, 526336)
+        const nanoseconds = @intCast(u64, server.*.period) * 1000000000 / @intCast(u64, server.*.rate)
+        setTimer(server.*.timer, nanoseconds)
+        const watching = dbus.watch(server.*.eventLoop, server.*.timer, state.TIMER, false)
+    }
+    const input = inputOf(server)
+    if input.*.kind == state.ALSA { const watching = dbus.watch(server.*.eventLoop, input.*.descriptor, state.CARD_IN, false) }
+    const retrying = server.*.outputProblem != 0 || server.*.inputProblem != 0
+    setTimer(server.*.retryTimer, if retrying { 2000000000 } else { 0 })
+}
+
+fn setTimer(timer: isize, nanoseconds: u64) -> void {
+    var spec: [4]u64 = [4]u64{ nanoseconds / 1000000000, nanoseconds % 1000000000, nanoseconds / 1000000000, nanoseconds % 1000000000 }
+    const set = std.linux.syscall4(286, @bitCast(usize, timer), 0, @intFromPtr(&spec), 0)
+}
+
+// Stops watching the output and input (before they change).
+pub fn disarm(server: *state.Server) -> void {
+    const output = outputOf(server)
+    if output.*.kind == state.ALSA {
+        const unwatched = dbus.unwatch(server.*.eventLoop, output.*.descriptor)
+    } else if server.*.timer >= 0 {
+        const unwatched = dbus.unwatch(server.*.eventLoop, server.*.timer)
+        dbus.closeDescriptor(server.*.timer)
+        server.*.timer = -1
+    }
+    const input = inputOf(server)
+    if input.*.kind == state.ALSA { const unwatched = dbus.unwatch(server.*.eventLoop, input.*.descriptor) }
+}
+
+fn closeOutput(server: *state.Server) -> void {
+    const output = outputOf(server)
+    if output.*.kind == state.ALSA { alsa.close(output) }
+    if output.*.kind == state.FILE {
+        writeFileHeader(output, server.*.rate)
+        const closed = std.linux.syscall1(SYS_close, @bitCast(usize, output.*.descriptor))
+    }
+    output.*.kind = state.NONE
+    server.*.encodedFrames = 0
+}
+
+fn closeInput(server: *state.Server) -> void {
+    const input = inputOf(server)
+    if input.*.kind == state.ALSA { alsa.close(input) }
+    if input.*.kind == state.FILE && input.*.dataLength > 0 { server.*.allocator.free(input.*.data, input.*.dataLength, 16) }
+    input.*.kind = state.NONE
+}
+
+// Another output (mlx-settings, or the card that came back): the streams
+// carry on at the new device's rate. False when the spec is not one.
+pub fn switchOutput(server: *state.Server, spec: []const u8) -> bool {
+    disarm(server)
+    closeOutput(server)
+    setOutputSpec(server, spec)
+    const opened = openOutput(server)
+    if !opened {
+        setOutputSpec(server, "null")
+        const fallback = openOutput(server)
+    }
+    retune(server)
+    mixer.retuneStreams(server)
+    arm(server)
+    return opened
+}
+
+pub fn switchInput(server: *state.Server, spec: []const u8) -> bool {
+    disarm(server)
+    closeInput(server)
+    setInputSpec(server, spec)
+    const opened = openInput(server)
+    if !opened {
+        setInputSpec(server, "none")
+        const fallback = openInput(server)
+    }
+    arm(server)
+    return opened
+}
+
+// The retry timer: the cards that were missing or busy, again.
+pub fn retry(server: *state.Server) -> void {
+    var expirations: u64 = 0
+    const read = std.linux.syscall3(0, @bitCast(usize, server.*.retryTimer), @intFromPtr(&expirations), 8)
+    if server.*.outputProblem != 0 {
+        var probe: state.Device = undefined
+        reset(&probe)
+        const spec = outputSpec(server)
+        const result = openCard(server, &probe, if startsWith(spec, "alsa:") { spec[5..spec.length] } else { spec[0..0] }, false)
+        if result == 0 {
+            alsa.close(&probe)
+            say(server, "audio: the sound card is free now\n")
+            var again: [160]u8 = undefined
+            var again_bytes: [*]u8 = undefined
+            unsafe { again_bytes = @ptrCast([*]u8, &again) }
+            const length = copyLimited(again_bytes, 0, 159, spec)
+            const switched = switchOutput(server, again_bytes[0..length])
+        }
+    }
+    if server.*.inputProblem != 0 {
+        var probe: state.Device = undefined
+        reset(&probe)
+        const spec = inputSpec(server)
+        const result = openCard(server, &probe, if startsWith(spec, "alsa:") { spec[5..spec.length] } else { spec[0..0] }, true)
+        if result == 0 {
+            alsa.close(&probe)
+            var again: [160]u8 = undefined
+            var again_bytes: [*]u8 = undefined
+            unsafe { again_bytes = @ptrCast([*]u8, &again) }
+            const length = copyLimited(again_bytes, 0, 159, spec)
+            const switched = switchInput(server, again_bytes[0..length])
+        }
+    }
 }
 
 fn writeFileHeader(device: *state.Device, rate: u32) -> void {
@@ -370,12 +847,6 @@ pub fn record(server: *state.Server, out: [*]i32, most: usize) -> usize {
 }
 
 pub fn close(server: *state.Server) -> void {
-    const output = outputOf(server)
-    if output.*.kind == state.ALSA { alsa.close(output) }
-    if output.*.kind == state.FILE {
-        writeFileHeader(output, server.*.rate)
-        const closed = std.linux.syscall1(SYS_close, @bitCast(usize, output.*.descriptor))
-    }
-    const input = inputOf(server)
-    if input.*.kind == state.ALSA { alsa.close(input) }
+    closeOutput(server)
+    closeInput(server)
 }
