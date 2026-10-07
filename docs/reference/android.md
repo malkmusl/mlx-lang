@@ -29,6 +29,7 @@ Run `mlx1` from the repository root so the standard library resolves.
 | `--android-min-sdk=N` | `21` | `minSdkVersion` (21 or higher: the first release with arm64-v8a) |
 | `--android-target-sdk=N` | `37` | `targetSdkVersion`; also selects the signature schemes |
 | `--android-fullscreen` | off | hide the status bar |
+| `--android-permission=A,B` | none | `<uses-permission>` for each (a bare name is `android.permission.NAME`, e.g. `MANAGE_EXTERNAL_STORAGE`) |
 | `--android-extract-native-libs` | off | let the package manager extract `libmain.so` at install (`extractNativeLibs=true`) |
 | `--android-key=PATH` | `$HOME/.mlx/android-debug.key` | signing key |
 

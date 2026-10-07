@@ -9,8 +9,9 @@
 // than a touch slop it scrolls instead: the press is let go without a
 // click and the moves come as EVENT_WHEEL (how far: wheelPixels). Held
 // still it is the right button (a context menu). Keys (a hardware keyboard,
-// or the on-screen one: showKeyboard) come as EVENT_KEY with Linux key
-// codes; Back is left to the system. Frames follow the display
+// or the on-screen one: showKeyboard, through a hidden EditText whose text
+// changes come as typed keys) come as EVENT_KEY with Linux key codes; Back
+// is left to the system. Frames follow the display
 // (AChoreographer; a timerfd below API 24).
 const std = @import("std")
 const android = @import("std.android")
@@ -59,6 +60,14 @@ pub const Host = struct {
     tickAt: u64
     tickPeriod: u64
     pressAt: u64
+    // The on-screen keyboard: a hidden EditText has the keys
+    // (std.android.TextInput); its text is read every INPUT_POLL and what
+    // changed comes as EVENT_KEY (seen: the text last read).
+    keyboardUp: bool
+    inputAt: u64
+    textInput: android.TextInput
+    seen: [520]u8
+    seenLength: usize
     vulkan: bool
     hasSwapchain: bool
     device: *gpu_canvas.Device
@@ -112,6 +121,11 @@ const FRAME_NANOSECONDS: u64 = 16666666
 const HOLD_NANOSECONDS: u64 = 500000000
 // How far a finger may move and still tap (logical pixels).
 const TOUCH_SLOP: i32 = 8
+// How often the editor's text is read while the keyboard is up.
+const INPUT_POLL: u64 = 50000000
+// The editor's text between changes: zero-width spaces (U+200B), so a
+// Backspace on an empty field still changes it.
+const SEED_CHARACTERS: usize = 16
 
 const Failure = error { Unsupported }
 
@@ -190,6 +204,10 @@ pub fn openActivity(host: *Host, activity: usize, saved_state: usize, saved_stat
     host.*.tickAt = 0
     host.*.tickPeriod = 0
     host.*.pressAt = 0
+    host.*.keyboardUp = false
+    host.*.inputAt = 0
+    host.*.textInput.view = 0
+    host.*.seenLength = 0
     host.*.timer = android.timerfd_create(CLOCK_MONOTONIC, TIMER_FLAGS)
     if host.*.timer >= 0 && host.*.looper != 0 {
         const added = android.ALooper_addFd(host.*.looper, host.*.timer, 2, android.LOOPER_EVENT_INPUT, @intFromPtr(onTimer), @intFromPtr(host))
@@ -255,14 +273,45 @@ pub fn wheelPixels(host: *Host) -> i32 { return host.*.wheel }
 
 // The on-screen keyboard, for a field at `area`; its keys come as
 // EVENT_KEY.
-pub fn showKeyboard(host: *Host, area: ui.Rect) -> void { android.ANativeActivity_showSoftInput(host.*.activity, android.SHOW_SOFT_INPUT_FORCED) }
-pub fn hideKeyboard(host: *Host) -> void { android.ANativeActivity_hideSoftInput(host.*.activity, 0) }
+pub fn showKeyboard(host: *Host, area: ui.Rect) -> void {
+    if host.*.keyboardUp { return }
+    var place = area
+    if place.width <= 0 || place.height <= 0 { place = ui.rect(0, host.*.insets.top, 1, 1) }
+    // Transparent: the app draws its own field.
+    if !android.focusTextInput(host.*.activity, inputOf(host), place, 0, 0, 0) {
+        android.log("std.ui.host: no text editor, asking for the keyboard directly")
+        android.ANativeActivity_showSoftInput(host.*.activity, android.SHOW_SOFT_INPUT_FORCED)
+        return
+    }
+    host.*.keyboardUp = true
+    reseed(host)
+    host.*.inputAt = now() + INPUT_POLL
+    rearm(host)
+}
+
+pub fn hideKeyboard(host: *Host) -> void {
+    if host.*.keyboardUp {
+        // What was typed before it went.
+        pollText(host)
+    }
+    host.*.keyboardUp = false
+    host.*.inputAt = 0
+    android.dismissTextInput(host.*.activity, inputOf(host))
+}
 
 // The app's own directory (internalDataPath): what it may read and write.
 pub fn home(host: *Host) -> []const u8 {
     if host.*.homeLength == 0 { return "/" }
     return host.*.homePath[0..host.*.homeLength]
 }
+
+// The device's shared storage (Download, DCIM, Pictures, ...), whether the
+// app may use all of it, and asking the user for that (the system's page;
+// the answer shows in sharedStorageAllowed when the app is back). The
+// manifest needs MANAGE_EXTERNAL_STORAGE (--android-permission).
+pub fn sharedStorage(host: *Host) -> []const u8 { return android.SHARED_STORAGE }
+pub fn sharedStorageAllowed(host: *Host) -> bool { return android.hasAllFilesAccess(host.*.activity) }
+pub fn askSharedStorage(host: *Host) -> bool { return android.requestAllFilesAccess(host.*.activity) }
 
 // An activity has no process environment: only HOME, the app's directory.
 pub fn environment(host: *Host) -> [*][*]const u8 {
@@ -332,6 +381,89 @@ fn insetsOf(host: *Host) -> *ui.Insets {
 
 fn bufferOf(host: *Host) -> usize { return @intFromPtr(host) + @offsetOf(Host, "buffer") }
 
+fn inputOf(host: *Host) -> *android.TextInput {
+    unsafe { return @ptrFromInt(*android.TextInput, @intFromPtr(host) + @offsetOf(Host, "textInput")) }
+}
+
+fn seenOf(host: *Host) -> [*]u8 {
+    unsafe { return @ptrFromInt([*]u8, @intFromPtr(host) + @offsetOf(Host, "seen")) }
+}
+
+// The editor back to the seed (what seen then holds).
+fn reseed(host: *Host) -> void {
+    const seen = seenOf(host)
+    var at: usize = 0
+    while at < SEED_CHARACTERS * 3 {
+        seen[at] = 226
+        seen[at + 1] = 128
+        seen[at + 2] = 139
+        at += 3
+    }
+    seen[at] = 0
+    host.*.seenLength = at
+    const set = android.setTextInput(host.*.activity, inputOf(host), seen[0..at], @intCast(i32, SEED_CHARACTERS))
+}
+
+// A key pressed and let go, typing `text`.
+fn keyStroke(host: *Host, code: u32, text: []const u8) -> void {
+    var at: usize = 0
+    while at < text.length && at < 8 {
+        host.*.text[at] = text[at]
+        at += 1
+    }
+    host.*.textLength = at
+    host.*.modifiers = 0
+    send(host, ui_app.EVENT_KEY, code, 1)
+    host.*.textLength = 0
+    send(host, ui_app.EVENT_KEY, code, 0)
+}
+
+// What changed in the editor since it was last read: a character gone is
+// Backspace, a newline Enter, any other one typed (key code 0, its text
+// in `typed`). Then the editor holds the seed again.
+fn pollText(host: *Host) -> void {
+    if !host.*.keyboardUp { return }
+    var buffer: [512]u8 = undefined
+    var bytes: [*]u8 = undefined
+    unsafe { bytes = @ptrCast([*]u8, &buffer) }
+    const got = android.readTextInput(host.*.activity, inputOf(host), bytes, 512)
+    if got < 0 { return }
+    const length = @intCast(usize, got)
+    const seen = seenOf(host)
+    var prefix: usize = 0
+    while prefix < length && prefix < host.*.seenLength && bytes[prefix] == seen[prefix] { prefix += 1 }
+    // Back to the start of the character the texts part in.
+    while prefix > 0 && prefix < host.*.seenLength && seen[prefix] & 192 == 128 { prefix -= 1 }
+    if prefix == length && prefix == host.*.seenLength { return }
+    var removed: usize = 0
+    var index = prefix
+    while index < host.*.seenLength {
+        if seen[index] & 192 != 128 { removed += 1 }
+        index += 1
+    }
+    while removed > 0 && host.*.keyboardUp {
+        keyStroke(host, keys.BACKSPACE, "")
+        removed -= 1
+    }
+    index = prefix
+    while index < length && host.*.keyboardUp {
+        const byte = bytes[index]
+        var size: usize = 1
+        if byte >= 240 { size = 4 } else if byte >= 224 { size = 3 } else if byte >= 192 { size = 2 }
+        if index + size > length { size = length - index }
+        if byte == 10 {
+            keyStroke(host, keys.ENTER, "")
+        } else if size == 3 && byte == 226 && bytes[index + 1] == 128 && bytes[index + 2] == 139 {
+            // A seed's zero-width space.
+        } else {
+            keyStroke(host, 0, bytes[index..index + size])
+        }
+        index += size
+    }
+    if host.*.keyboardUp { reseed(host) }
+    redraw(host)
+}
+
 fn setCallback(activity: usize, offset: usize, function: usize) -> void {
     unsafe {
         const callbacks = @ptrFromInt(*usize, activity + ACTIVITY_CALLBACKS).*
@@ -359,7 +491,7 @@ fn earlier(first: u64, second: u64) -> u64 {
 // Armed for the next deadline (disarmed without one).
 fn rearm(host: *Host) -> void {
     if host.*.timer < 0 { return }
-    const next = earlier(earlier(host.*.frameAt, host.*.tickAt), host.*.pressAt)
+    const next = earlier(earlier(earlier(host.*.frameAt, host.*.tickAt), host.*.pressAt), host.*.inputAt)
     var first: u64 = 0
     if next != 0 {
         const current = now()
@@ -377,6 +509,11 @@ fn onTimer(fd: i32, events: i32, data: usize) -> i32 {
     const expirations = android.read(fd, @intFromPtr(host) + @offsetOf(Host, "eventOut"), 8)
     if host.*.destroyed { return 1 }
     const current = now()
+    if host.*.inputAt != 0 && host.*.inputAt <= current {
+        host.*.inputAt = current + INPUT_POLL
+        pollText(host)
+        if !host.*.keyboardUp { host.*.inputAt = 0 }
+    }
     if host.*.pressAt != 0 && host.*.pressAt <= current {
         host.*.pressAt = 0
         hold(host)
@@ -633,6 +770,9 @@ fn onDestroy(activity: usize) -> void {
     const host = hostOf(activityHost(activity))
     send(host, ui_app.EVENT_CLOSED, 0, 0)
     host.*.destroyed = true
+    host.*.keyboardUp = false
+    host.*.inputAt = 0
+    android.destroyTextInput(activity, inputOf(host))
     destroySwapchain(host)
     if host.*.vulkan { gpu_canvas.close(host.*.device) }
     host.*.vulkan = false
