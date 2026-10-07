@@ -88,6 +88,14 @@ when the standard library has one for the target's platform (`linux` for
 std.ui app runs on each (see [UI](ui.md)), so a program's own source is the
 same for every target (`tests/290_platform_module_runtime.mlx`).
 
+`std.filetree` (`std/src/filetree.mlx`) does to files and folders what a
+file manager does, by the kernel's calls alone: `copy` (a folder with
+everything in it, files with their mode and modification time, symbolic
+links as links), `move` (a rename on the same file system, else copied
+and then removed), `remove` (with everything in it) and `freeName` (a name
+nothing in a folder has: "photo 2.png"). Nothing is overwritten, and
+nothing is copied into itself (`tests/291_filetree_runtime.mlx`).
+
 `std.xml` (`std/src/xml.mlx`) and `std.wayland` (`std/src/wayland.mlx` and
 `std/src/wayland/`) are implemented as Stage-1 extensions. They are imported
 by their own names (`@import("std.xml")`, `@import("std.wayland")`) and are
