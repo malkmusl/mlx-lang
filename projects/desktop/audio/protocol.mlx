@@ -8,7 +8,9 @@
 // (audio.record) or record a sink's monitor (audio.monitor):
 // org.mlx.IPC.Check, the policy's `use` rules. A refused stream gets
 // REFUSED (DENIED). Where streams play and what they record from is
-// routing.mlx's.
+// routing.mlx's. PulseAudio apps reach the server past the bus, on its
+// own socket (pulse.mlx); their streams are asked about the same way
+// (org.mlx.IPC.CheckProcess, by the socket's peer process).
 const std = @import("std")
 const dbus = @import("std.dbus")
 const audio = @import("std.audio")
@@ -18,6 +20,7 @@ const mixer = @import("./mixer.mlx")
 const devices = @import("./devices.mlx")
 const config = @import("./config.mlx")
 const routing = @import("./routing.mlx")
+const pulse = @import("./pulse.mlx")
 
 pub fn busOf(server: *state.Server) -> *dbus.Client {
     unsafe { return @ptrCast(*dbus.Client, &server.*.bus) }
@@ -27,7 +30,7 @@ pub fn peerAt(address: usize) -> *state.Peer {
     unsafe { return @ptrFromInt(*state.Peer, address) }
 }
 
-fn channelOf(peer: *state.Peer) -> *dbus.Connection {
+pub fn channelOf(peer: *state.Peer) -> *dbus.Connection {
     unsafe { return @ptrCast(*dbus.Connection, &peer.*.connection) }
 }
 
@@ -133,14 +136,20 @@ fn recheck(server: *state.Server) -> void {
     }
 }
 
-// Asks the bus (org.mlx.IPC.Check) whether the app behind `peer` may use
-// `permission`: the call's serial (0: not sent).
-fn askBus(server: *state.Server, peer: *state.Peer, permission: []const u8) -> u32 {
+// Asks the bus (org.mlx.IPC.Check; CheckProcess for a PulseAudio app)
+// whether the app behind `peer` may use `permission`: the call's serial
+// (0: not sent).
+pub fn askBus(server: *state.Server, peer: *state.Peer, permission: []const u8) -> u32 {
     var body: [256]u8 = undefined
     var bytes: [*]u8 = undefined
     unsafe { bytes = @ptrCast([*]u8, &body) }
     var writing: dbus.Writer = undefined
     dbus.begin(&writing, bytes, 256, false)
+    if peer.*.pulse {
+        dbus.putU32(&writing, peer.*.pid)
+        dbus.putString(&writing, permission)
+        return dbus.call(busOf(server), "org.freedesktop.DBus", "/org/mlx/IPC", "org.mlx.IPC", "CheckProcess", "us", bytes, writing.length)
+    }
     dbus.putString(&writing, uniqueOf(peer))
     dbus.putString(&writing, permission)
     return dbus.call(busOf(server), "org.freedesktop.DBus", "/org/mlx/IPC", "org.mlx.IPC", "Check", "ss", bytes, writing.length)
@@ -158,7 +167,7 @@ fn permissionOf(kind: u8) -> []const u8 {
 
 // Asks the bus whether the stream's app may play or record (when it opens,
 // and again when the permissions changed).
-fn askPermission(server: *state.Server, stream: *state.Stream) -> void {
+pub fn askPermission(server: *state.Server, stream: *state.Stream) -> void {
     stream.*.checkSerial = askBus(server, peerAt(stream.*.peer), permissionOf(kindOf(stream)))
     if stream.*.checkSerial == 0 && stream.*.state == state.CHECKING { refuse(server, stream, audio.DENIED, "the bus did not answer") }
 }
@@ -202,7 +211,7 @@ fn checked(server: *state.Server, reply: *const dbus.Header, body: [*]const u8) 
         const peer = peerAt(server.*.peers[index])
         if peer.*.control == state.CONTROL_CHECKING && peer.*.controlSerial == reply.*.replySerial {
             peer.*.control = if allowed { state.CONTROL_ALLOWED } else { state.CONTROL_DENIED }
-            sendState(server, peer)
+            if peer.*.pulse { pulse.authorized(server, peer) } else { sendState(server, peer) }
             return
         }
         index += 1
@@ -295,9 +304,15 @@ fn addPeer(server: *state.Server, descriptor: isize, unique: []const u8, app: []
     peer.*.watchingOutput = false
     peer.*.control = state.CONTROL_UNKNOWN
     peer.*.controlSerial = 0
+    peer.*.pulse = false
+    peer.*.pid = 0
+    peer.*.sandboxed = false
+    peer.*.index = server.*.nextClient
+    server.*.nextClient += 1
     server.*.peers[server.*.peerCount] = @intFromPtr(memory.?)
     server.*.peerCount += 1
     const watched = dbus.watch(server.*.eventLoop, descriptor, @intFromPtr(memory.?), false)
+    pulse.event(server, pulse.FACILITY_CLIENT, pulse.EVENT_NEW, peer.*.index)
     say(server, "audio: ")
     say(server, app)
     say(server, " (")
@@ -314,7 +329,8 @@ pub fn isPeer(server: *state.Server, token: usize) -> bool {
     return false
 }
 
-fn freeStream(server: *state.Server, stream: *state.Stream) -> void {
+pub fn freeStream(server: *state.Server, stream: *state.Stream) -> void {
+    pulse.streamGone(server, stream)
     if stream.*.direction == audio.PLAY && stream.*.capacity > 0 {
         var memory: [*]u8 = undefined
         unsafe { memory = @ptrCast([*]u8, stream.*.ring) }
@@ -343,6 +359,7 @@ fn dropPeer(server: *state.Server, peer: *state.Peer) -> void {
         }
         index += 1
     }
+    if peer.*.pulse { pulse.clientGone(server, peer) } else { pulse.event(server, pulse.FACILITY_CLIENT, pulse.EVENT_REMOVE, peer.*.index) }
     say(server, "audio: ")
     say(server, appOf(peer))
     say(server, " left\n")
@@ -352,7 +369,7 @@ fn dropPeer(server: *state.Server, peer: *state.Peer) -> void {
 }
 
 // Queues a message to `peer`; false (dropped) when its channel is full.
-fn sendTo(server: *state.Server, peer: *state.Peer, bytes: [*]const u8, length: usize) -> bool {
+pub fn sendTo(server: *state.Server, peer: *state.Peer, bytes: [*]const u8, length: usize) -> bool {
     if peer.*.dead { return false }
     var nothing: [1]isize = [1]isize{ 0 }
     var queued = false
@@ -362,6 +379,10 @@ fn sendTo(server: *state.Server, peer: *state.Peer, bytes: [*]const u8, length: 
 
 // A message of the stream id and one value (REQUEST, DRAINED, ENDED...).
 pub fn sendStreamValue(server: *state.Server, stream: *state.Stream, kind: u32, value: u32) -> void {
+    if stream.*.pulse {
+        pulse.streamValue(server, stream, kind, value)
+        return
+    }
     var message: [16]u8 = undefined
     var bytes: [*]u8 = undefined
     unsafe { bytes = @ptrCast([*]u8, &message) }
@@ -373,6 +394,16 @@ pub fn sendStreamValue(server: *state.Server, stream: *state.Stream, kind: u32, 
 
 fn refuse(server: *state.Server, stream: *state.Stream, reason: u32, text: []const u8) -> void {
     const peer = peerAt(stream.*.peer)
+    if stream.*.pulse {
+        pulse.refused(server, stream)
+        say(server, "audio: refused ")
+        say(server, appOf(peer))
+        say(server, "'s stream: ")
+        say(server, text)
+        say(server, "\n")
+        freeStream(server, stream)
+        return
+    }
     var message: [256]u8 = undefined
     var bytes: [*]u8 = undefined
     unsafe { bytes = @ptrCast([*]u8, &message) }
@@ -405,6 +436,8 @@ fn open(server: *state.Server, stream: *state.Stream) -> void {
     stream.*.capacity = 0
     if stream.*.direction == audio.PLAY {
         stream.*.capacity = target * 2 + 256
+        // A PulseAudio stream may queue up to its maxlength.
+        if stream.*.pulse && pulse.ringFrames(server, stream) + 256 > stream.*.capacity { stream.*.capacity = pulse.ringFrames(server, stream) + 256 }
         const memory = server.*.allocator.alloc(stream.*.capacity * 8, 16)
         if memory == null {
             refuse(server, stream, audio.LIMIT, "out of memory")
@@ -416,14 +449,19 @@ fn open(server: *state.Server, stream: *state.Stream) -> void {
         samples.startResampler(mixerResampler(stream), server.*.rate, stream.*.rate)
     }
     stream.*.state = state.OPEN
-    var message: [24]u8 = undefined
-    var bytes: [*]u8 = undefined
-    unsafe { bytes = @ptrCast([*]u8, &message) }
-    audio.header(bytes, audio.OPENED, 12)
-    audio.store32(bytes, 8, stream.*.id)
-    audio.store32(bytes, 12, server.*.rate)
-    audio.store32(bytes, 16, stream.*.latency)
-    const sent = sendTo(server, peerAt(stream.*.peer), bytes, 20)
+    if stream.*.pulse {
+        pulse.opened(server, stream)
+    } else {
+        var message: [24]u8 = undefined
+        var bytes: [*]u8 = undefined
+        unsafe { bytes = @ptrCast([*]u8, &message) }
+        audio.header(bytes, audio.OPENED, 12)
+        audio.store32(bytes, 8, stream.*.id)
+        audio.store32(bytes, 12, server.*.rate)
+        audio.store32(bytes, 16, stream.*.latency)
+        const sent = sendTo(server, peerAt(stream.*.peer), bytes, 20)
+        pulse.event(server, if stream.*.direction == audio.PLAY { pulse.FACILITY_SINK_INPUT } else { pulse.FACILITY_SOURCE_OUTPUT }, pulse.EVENT_NEW, slotOf(server, stream))
+    }
     say(server, "audio: ")
     say(server, appOf(peerAt(stream.*.peer)))
     say(server, if stream.*.direction == audio.PLAY { " plays \"" } else { " records \"" })
@@ -435,7 +473,11 @@ fn open(server: *state.Server, stream: *state.Stream) -> void {
     say(server, " Hz, ")
     sayNumber(server, @intCast(usize, stream.*.channels))
     say(server, " channels)\n")
-    mixer.requestMore(server, stream)
+    if !stream.*.pulse { mixer.requestMore(server, stream) }
+}
+
+fn slotOf(server: *state.Server, stream: *state.Stream) -> u32 {
+    return @intCast(u32, (@intFromPtr(stream) - @intFromPtr(mixer.streamAt(server, 0))) / @sizeOf(state.Stream))
 }
 
 fn mixerResampler(stream: *state.Stream) -> *state.Resampler {
@@ -535,6 +577,14 @@ fn openRequest(server: *state.Server, peer: *state.Peer, payload: [*]const u8, l
     stream.*.draining = false
     stream.*.started = false
     stream.*.underruns = 0
+    stream.*.muted = false
+    stream.*.pulse = false
+    stream.*.corked = false
+    stream.*.mapLength = 0
+    stream.*.written = 0
+    stream.*.playingFor = 0
+    stream.*.createTag = state.NO_TAG
+    stream.*.drainTag = state.NO_TAG
     if !routing.place(server, stream, appOf(peer), target) {
         refuse(server, stream, audio.INVALID, "there is no such sink")
         return
@@ -677,6 +727,7 @@ fn setting(server: *state.Server, what: u32, value: u32, target: u32, text: []co
     } else {
         return
     }
+    pulse.changed(server)
     config.save(server)
 }
 
@@ -838,6 +889,10 @@ fn handle(server: *state.Server, peer: *state.Peer, kind: u32, payload: [*]const
 
 // What a peer sent.
 pub fn peerReadable(server: *state.Server, peer: *state.Peer) -> void {
+    if peer.*.pulse {
+        pulse.readable(server, peer)
+        return
+    }
     const channel = channelOf(peer)
     const received = dbus.receive(channel)
     if received == 0 || (received < 0 && received != dbus.EAGAIN) {
@@ -865,6 +920,10 @@ pub fn peerReadable(server: *state.Server, peer: *state.Peer) -> void {
 // stream's rate, channels and format; dropped when the app does not
 // read.
 pub fn sendRecorded(server: *state.Server, stream: *state.Stream, input: [*]const i32, frames: usize) -> void {
+    if stream.*.pulse {
+        pulse.sendRecorded(server, stream, input, frames)
+        return
+    }
     const bytes = server.*.message
     const size = stream.*.frameBytes
     const room = (audio.MAX_PAYLOAD - 4) / size

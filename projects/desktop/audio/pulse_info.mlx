@@ -1,0 +1,598 @@
+// What MLX Audio's PulseAudio server (pulse.mlx) says about itself and
+// lets apps change. Its sinks: the output's mix (index 0, mlx.output) and
+// the virtual sinks (routing.mlx; index = slot + 1, by their names). Its
+// sources: the input (index 0, mlx.input), the output's monitor (index 1,
+// mlx.output.monitor) and each virtual sink's (slot + 2, NAME.monitor).
+// Every stream is a sink input or source output (its index is its slot),
+// whichever protocol its app speaks, and every app a client. Volumes are
+// PulseAudio's (cubic; 65536 is 100%), the server's linear. Changing a
+// sink, a source or another app's stream takes audio.control (the bus's
+// answer at AUTH); an app may change its own streams.
+const std = @import("std")
+const audio = @import("std.audio")
+const state = @import("./state.mlx")
+const ts = @import("./tagstruct.mlx")
+const mixer = @import("./mixer.mlx")
+const protocol = @import("./protocol.mlx")
+const routing = @import("./routing.mlx")
+const config = @import("./config.mlx")
+const pulse = @import("./pulse.mlx")
+
+pub const SINK_NAME: []const u8 = "mlx.output"
+pub const MONITOR_NAME: []const u8 = "mlx.output.monitor"
+pub const SOURCE_NAME: []const u8 = "mlx.input"
+const DRIVER: []const u8 = "mlx-audiod"
+// Sinks and sources: hardware volume and mute, latency, decibel volume.
+const DEVICE_FLAGS: u32 = 51
+// Sink and source states.
+const RUNNING: u32 = 0
+const IDLE: u32 = 1
+
+fn same(first: []const u8, second: []const u8) -> bool {
+    if first.length != second.length { return false }
+    var index: usize = 0
+    while index < first.length {
+        if first[index] != second[index] { return false }
+        index += 1
+    }
+    return true
+}
+
+fn copy(target: [*]u8, capacity: usize, text: []const u8) -> usize {
+    var length: usize = 0
+    while length < text.length && length < capacity {
+        target[length] = text[length]
+        length += 1
+    }
+    return length
+}
+
+fn advance(bytes: [*]u8, count: usize) -> [*]u8 {
+    unsafe { return @ptrFromInt([*]u8, @intFromPtr(bytes) + count) }
+}
+
+fn streamOf(address: usize) -> *state.Stream {
+    unsafe { return @ptrFromInt(*state.Stream, address) }
+}
+
+fn versionOf(peer: *state.Peer) -> u32 { return pulse.clientOf(peer).*.version }
+
+// ---------------------------------------------------------------------------
+// Volumes
+
+// PulseAudio's cubic volume as the server's linear gain.
+pub fn linearOf(cubic: u32) -> u32 {
+    var value = @intCast(u64, cubic)
+    if value > 131072 { value = 131072 }
+    return @intCast(u32, value * value / 65536 * value / 65536)
+}
+
+// The server's linear gain as PulseAudio's cubic volume.
+pub fn cubicOf(linear: u32) -> u32 {
+    const wanted = @intCast(u64, linear) * 4294967296
+    var low: u64 = 0
+    var high: u64 = 131073
+    while low + 1 < high {
+        const middle = (low + high) / 2
+        if middle * middle * middle <= wanted { low = middle } else { high = middle }
+    }
+    return @intCast(u32, low)
+}
+
+// ---------------------------------------------------------------------------
+// Devices
+
+fn sinkCount() -> u32 { return @intCast(u32, state.MAX_SINKS) + 1 }
+
+fn sinkExists(server: *state.Server, index: u32) -> bool {
+    if index == 0 { return true }
+    if index >= sinkCount() { return false }
+    return routing.sinkAt(server, @intCast(usize, index - 1)).*.used
+}
+
+fn sourceExists(server: *state.Server, index: u32) -> bool {
+    if index <= 1 { return true }
+    return sinkExists(server, index - 1)
+}
+
+pub fn sinkIndexOf(stream: *state.Stream) -> u32 {
+    if stream.*.sink > state.MAX_SINKS { return 0 }
+    return @intCast(u32, stream.*.sink)
+}
+
+pub fn sourceIndexOf(stream: *state.Stream) -> u32 {
+    if !stream.*.monitor { return 0 }
+    return sinkIndexOf(stream) + 1
+}
+
+pub fn sinkNameOf(server: *state.Server, index: u32) -> []const u8 {
+    if index == 0 || !sinkExists(server, index) { return SINK_NAME }
+    return routing.sinkName(routing.sinkAt(server, @intCast(usize, index - 1)))
+}
+
+// A source's name into `out` (a monitor's is its sink's and ".monitor").
+pub fn sourceName(server: *state.Server, index: u32, out: [*]u8) -> usize {
+    if index == 0 { return copy(out, 16, SOURCE_NAME) }
+    if index == 1 || !sourceExists(server, index) { return copy(out, 32, MONITOR_NAME) }
+    const length = copy(out, 32, sinkNameOf(server, index - 1))
+    return length + copy(advance(out, length), 8, ".monitor")
+}
+
+pub fn putSourceName(writing: *ts.Writer, server: *state.Server, index: u32) -> void {
+    var name: [48]u8 = undefined
+    var bytes: [*]u8 = undefined
+    unsafe { bytes = @ptrCast([*]u8, &name) }
+    const length = sourceName(server, index, bytes)
+    ts.putString(writing, bytes[0..length])
+}
+
+fn sinkIndexByName(server: *state.Server, name: []const u8) -> u32 {
+    if same(name, SINK_NAME) || same(name, "@DEFAULT_SINK@") { return 0 }
+    const found = routing.findSink(server, name)
+    if found == routing.NO_SINK || found == state.DEFAULT_SINK { return pulse.INVALID }
+    return @intCast(u32, found)
+}
+
+fn sourceIndexByName(server: *state.Server, name: []const u8) -> u32 {
+    if same(name, SOURCE_NAME) || same(name, "@DEFAULT_SOURCE@") { return 0 }
+    if same(name, MONITOR_NAME) || same(name, "@DEFAULT_MONITOR@") { return 1 }
+    if name.length > 8 && same(name[name.length - 8..name.length], ".monitor") {
+        const sink = sinkIndexByName(server, name[0..name.length - 8])
+        if sink != pulse.INVALID { return sink + 1 }
+    }
+    return pulse.INVALID
+}
+
+// Whether a stream plays to (records from) the device.
+fn busy(server: *state.Server, source: bool, index: u32) -> bool {
+    var slot: usize = 0
+    while slot < state.MAX_STREAMS {
+        const stream = mixer.streamAt(server, slot)
+        if stream.*.used && stream.*.state == state.OPEN {
+            if !source && stream.*.direction == audio.PLAY && sinkIndexOf(stream) == index { return true }
+            if source && stream.*.direction == audio.RECORD && sourceIndexOf(stream) == index { return true }
+        }
+        slot += 1
+    }
+    return false
+}
+
+fn putDeviceTail(writing: *ts.Writer, server: *state.Server, version: u32, source: bool, index: u32) -> void {
+    ts.putUsec(writing, pulse.deviceUsec(server))
+    if version >= 15 {
+        ts.putVolume(writing, 65536)
+        ts.putU32(writing, if busy(server, source, index) { RUNNING } else { IDLE })
+        ts.putU32(writing, 65537)
+        ts.putU32(writing, pulse.INVALID)
+    }
+    if version >= 16 {
+        ts.putU32(writing, 0)
+        ts.putNullString(writing)
+    }
+    if (!source && version >= 21) || (source && version >= 22) {
+        ts.putU8(writing, 1)
+        ts.putPcmFormat(writing)
+    }
+}
+
+fn putSink(writing: *ts.Writer, server: *state.Server, version: u32, index: u32) -> void {
+    var description: [96]u8 = undefined
+    var bytes: [*]u8 = undefined
+    unsafe { bytes = @ptrCast([*]u8, &description) }
+    var length: usize = 0
+    var volume = server.*.master
+    var mute = server.*.mute
+    if index == 0 {
+        length = copy(bytes, 16, "MLX Audio")
+    } else {
+        const sink = routing.sinkAt(server, @intCast(usize, index - 1))
+        length = copy(bytes, 32, routing.sinkName(sink))
+        length += copy(advance(bytes, length), 32, " (MLX Audio sink)")
+        volume = sink.*.volume
+        mute = sink.*.mute
+    }
+    ts.putU32(writing, index)
+    ts.putString(writing, sinkNameOf(server, index))
+    ts.putString(writing, bytes[0..length])
+    ts.putSampleSpec(writing, pulse.FORMAT_FLOAT32LE, 2, server.*.rate)
+    ts.putDefaultChannelMap(writing, 2)
+    ts.putU32(writing, pulse.INVALID)
+    ts.putCvolume(writing, 2, cubicOf(volume))
+    ts.putBool(writing, mute)
+    ts.putU32(writing, index + 1)
+    putSourceName(writing, server, index + 1)
+    ts.putUsec(writing, pulse.deviceUsec(server))
+    ts.putString(writing, DRIVER)
+    ts.putU32(writing, DEVICE_FLAGS)
+    ts.beginProplist(writing)
+    ts.putProperty(writing, "device.description", bytes[0..length])
+    ts.putProperty(writing, "device.class", if index == 0 { "sound" } else { "filter" })
+    ts.putProperty(writing, "media.class", "Audio/Sink")
+    ts.endProplist(writing)
+    putDeviceTail(writing, server, version, false, index)
+}
+
+fn putSource(writing: *ts.Writer, server: *state.Server, version: u32, index: u32) -> void {
+    var description: [96]u8 = undefined
+    var bytes: [*]u8 = undefined
+    unsafe { bytes = @ptrCast([*]u8, &description) }
+    var length: usize = 0
+    var volume: u32 = 65536
+    var mute = false
+    if index == 0 {
+        length = copy(bytes, 32, "MLX Audio input")
+        volume = server.*.inputVolume
+        mute = server.*.inputMute
+    } else {
+        length = copy(bytes, 16, "Monitor of ")
+        length += copy(advance(bytes, length), 32, if index == 1 { "MLX Audio" } else { sinkNameOf(server, index - 1) })
+    }
+    ts.putU32(writing, index)
+    putSourceName(writing, server, index)
+    ts.putString(writing, bytes[0..length])
+    ts.putSampleSpec(writing, pulse.FORMAT_FLOAT32LE, 2, server.*.rate)
+    ts.putDefaultChannelMap(writing, 2)
+    ts.putU32(writing, pulse.INVALID)
+    ts.putCvolume(writing, 2, cubicOf(volume))
+    ts.putBool(writing, mute)
+    if index == 0 {
+        ts.putU32(writing, pulse.INVALID)
+        ts.putNullString(writing)
+    } else {
+        ts.putU32(writing, index - 1)
+        ts.putString(writing, sinkNameOf(server, index - 1))
+    }
+    ts.putUsec(writing, pulse.deviceUsec(server))
+    ts.putString(writing, DRIVER)
+    ts.putU32(writing, DEVICE_FLAGS)
+    ts.beginProplist(writing)
+    ts.putProperty(writing, "device.description", bytes[0..length])
+    ts.putProperty(writing, "device.class", if index == 0 { "sound" } else { "monitor" })
+    ts.putProperty(writing, "media.class", "Audio/Source")
+    ts.endProplist(writing)
+    putDeviceTail(writing, server, version, true, index)
+}
+
+// GET_SERVER_INFO: its name and version, the user's and the host's
+// names, the default format, sink and source.
+pub fn serverInfo(server: *state.Server, peer: *state.Peer, tag: u32) -> void {
+    var writing: ts.Writer = undefined
+    pulse.beginReply(server, &writing, tag)
+    ts.putString(&writing, "PulseAudio (on MLX Audio)")
+    ts.putString(&writing, "15.0.0")
+    const user = std.process.environmentFrom(server.*.environment, "USER")
+    ts.putString(&writing, if user != null { std.string.asSlice(user.?) } else { "user" })
+    // The host's name (uname's nodename).
+    var names: [390]u8 = undefined
+    var host: [*]const u8 = undefined
+    unsafe { host = @ptrFromInt([*]const u8, @intFromPtr(&names) + 65) }
+    var host_length: usize = 0
+    if std.linux.syscall1(63, @intFromPtr(&names)) == 0 {
+        while host_length < 64 && host[host_length] != 0 { host_length += 1 }
+    }
+    ts.putString(&writing, if host_length > 0 { host[0..host_length] } else { "localhost" })
+    ts.putSampleSpec(&writing, pulse.FORMAT_FLOAT32LE, 2, server.*.rate)
+    ts.putString(&writing, SINK_NAME)
+    ts.putString(&writing, SOURCE_NAME)
+    ts.putU32(&writing, 1296848961)
+    if versionOf(peer) >= 15 { ts.putDefaultChannelMap(&writing, 2) }
+    pulse.send(server, peer, &writing)
+}
+
+// GET_SINK_INFO (by index or name) and GET_SINK_INFO_LIST.
+pub fn sinks(server: *state.Server, peer: *state.Peer, tag: u32, reading: *ts.Reader, list: bool) -> void {
+    var writing: ts.Writer = undefined
+    if list {
+        pulse.beginReply(server, &writing, tag)
+        var index: u32 = 0
+        while index < sinkCount() {
+            if sinkExists(server, index) { putSink(&writing, server, versionOf(peer), index) }
+            index += 1
+        }
+        pulse.send(server, peer, &writing)
+        return
+    }
+    var index = ts.readU32(reading)
+    const name = ts.readString(reading)
+    if name.length > 0 { index = sinkIndexByName(server, name) } else if index == pulse.INVALID { index = 0 }
+    if reading.*.failed || !sinkExists(server, index) {
+        pulse.sendError(server, peer, tag, pulse.ERR_NOENTITY)
+        return
+    }
+    pulse.beginReply(server, &writing, tag)
+    putSink(&writing, server, versionOf(peer), index)
+    pulse.send(server, peer, &writing)
+}
+
+// GET_SOURCE_INFO and GET_SOURCE_INFO_LIST.
+pub fn sources(server: *state.Server, peer: *state.Peer, tag: u32, reading: *ts.Reader, list: bool) -> void {
+    var writing: ts.Writer = undefined
+    if list {
+        pulse.beginReply(server, &writing, tag)
+        var index: u32 = 0
+        while index < sinkCount() + 1 {
+            if sourceExists(server, index) { putSource(&writing, server, versionOf(peer), index) }
+            index += 1
+        }
+        pulse.send(server, peer, &writing)
+        return
+    }
+    var index = ts.readU32(reading)
+    const name = ts.readString(reading)
+    if name.length > 0 { index = sourceIndexByName(server, name) } else if index == pulse.INVALID { index = 0 }
+    if reading.*.failed || index == pulse.INVALID || !sourceExists(server, index) {
+        pulse.sendError(server, peer, tag, pulse.ERR_NOENTITY)
+        return
+    }
+    pulse.beginReply(server, &writing, tag)
+    putSource(&writing, server, versionOf(peer), index)
+    pulse.send(server, peer, &writing)
+}
+
+// LOOKUP_SINK and LOOKUP_SOURCE: a name's index.
+pub fn lookup(server: *state.Server, peer: *state.Peer, tag: u32, reading: *ts.Reader, source: bool) -> void {
+    const name = ts.readString(reading)
+    const index = if source { sourceIndexByName(server, name) } else { sinkIndexByName(server, name) }
+    if reading.*.failed || index == pulse.INVALID {
+        pulse.sendError(server, peer, tag, pulse.ERR_NOENTITY)
+        return
+    }
+    var writing: ts.Writer = undefined
+    pulse.beginReply(server, &writing, tag)
+    ts.putU32(&writing, index)
+    pulse.send(server, peer, &writing)
+}
+
+// ---------------------------------------------------------------------------
+// Streams and clients
+
+fn slotOf(server: *state.Server, stream: *state.Stream) -> u32 {
+    return @intCast(u32, (@intFromPtr(stream) - @intFromPtr(mixer.streamAt(server, 0))) / @sizeOf(state.Stream))
+}
+
+fn putStreamProperties(writing: *ts.Writer, server: *state.Server, stream: *state.Stream) -> void {
+    const peer = protocol.peerAt(stream.*.peer)
+    var name: [*]const u8 = undefined
+    unsafe { name = @ptrCast([*]const u8, &stream.*.name) }
+    var digits: [20]u8 = undefined
+    var digit_bytes: [*]u8 = undefined
+    unsafe { digit_bytes = @ptrCast([*]u8, &digits) }
+    const count = number(digit_bytes, @intCast(usize, peer.*.pid))
+    ts.beginProplist(writing)
+    ts.putProperty(writing, "media.name", name[0..stream.*.nameLength])
+    ts.putProperty(writing, "application.name", pulse.clientName(peer))
+    ts.putProperty(writing, "application.id", protocol.appOf(peer))
+    if peer.*.pulse { ts.putProperty(writing, "application.process.id", digit_bytes[0..count]) }
+    ts.endProplist(writing)
+}
+
+fn number(out: [*]u8, value: usize) -> usize {
+    var digits: [20]u8 = undefined
+    var count: usize = 0
+    var rest = value
+    while true {
+        digits[count] = @intCast(u8, 48 + rest % 10)
+        count += 1
+        rest = rest / 10
+        if rest == 0 { break }
+    }
+    var length: usize = 0
+    while count > 0 {
+        count -= 1
+        out[length] = digits[count]
+        length += 1
+    }
+    return length
+}
+
+fn putChannelMapOf(writing: *ts.Writer, stream: *state.Stream) -> void {
+    if stream.*.pulse && stream.*.mapLength > 0 {
+        var map: [*]const u8 = undefined
+        unsafe { map = @ptrCast([*]const u8, &stream.*.map) }
+        ts.putChannelMap(writing, map, stream.*.mapLength)
+    } else {
+        ts.putDefaultChannelMap(writing, @intCast(usize, stream.*.channels))
+    }
+}
+
+fn putStream(writing: *ts.Writer, server: *state.Server, version: u32, stream: *state.Stream) -> void {
+    const peer = protocol.peerAt(stream.*.peer)
+    const record = stream.*.direction == audio.RECORD
+    var name: [*]const u8 = undefined
+    unsafe { name = @ptrCast([*]const u8, &stream.*.name) }
+    ts.putU32(writing, slotOf(server, stream))
+    ts.putString(writing, name[0..stream.*.nameLength])
+    ts.putU32(writing, pulse.INVALID)
+    ts.putU32(writing, peer.*.index)
+    ts.putU32(writing, if record { sourceIndexOf(stream) } else { sinkIndexOf(stream) })
+    ts.putSampleSpec(writing, pulse.formatOf(stream), @intCast(u8, stream.*.channels), stream.*.rate)
+    putChannelMapOf(writing, stream)
+    if !record { ts.putCvolume(writing, @intCast(usize, stream.*.channels), cubicOf(stream.*.volume)) }
+    ts.putUsec(writing, if record { @intCast(u64, 0) } else { pulse.usecOf(stream, pulse.queuedBytes(server, stream)) })
+    ts.putUsec(writing, pulse.deviceUsec(server))
+    ts.putString(writing, "linear")
+    ts.putString(writing, DRIVER)
+    if !record { ts.putBool(writing, stream.*.muted) }
+    putStreamProperties(writing, server, stream)
+    if version >= 19 { ts.putBool(writing, stream.*.pulse && stream.*.corked) }
+    if !record {
+        if version >= 20 {
+            ts.putBool(writing, true)
+            ts.putBool(writing, true)
+        }
+        if version >= 21 { ts.putPcmFormat(writing) }
+        return
+    }
+    if version >= 22 {
+        ts.putCvolume(writing, @intCast(usize, stream.*.channels), cubicOf(stream.*.volume))
+        ts.putBool(writing, stream.*.muted)
+        ts.putBool(writing, true)
+        ts.putBool(writing, true)
+        ts.putPcmFormat(writing)
+    }
+}
+
+// GET_SINK_INPUT_INFO(_LIST) and GET_SOURCE_OUTPUT_INFO(_LIST).
+pub fn streams(server: *state.Server, peer: *state.Peer, tag: u32, reading: *ts.Reader, direction: u32, list: bool) -> void {
+    var writing: ts.Writer = undefined
+    const version = versionOf(peer)
+    if list {
+        pulse.beginReply(server, &writing, tag)
+        var slot: usize = 0
+        while slot < state.MAX_STREAMS {
+            const stream = mixer.streamAt(server, slot)
+            if stream.*.used && stream.*.state == state.OPEN && stream.*.direction == direction { putStream(&writing, server, version, stream) }
+            slot += 1
+        }
+        pulse.send(server, peer, &writing)
+        return
+    }
+    const address = pulse.streamByIndex(server, ts.readU32(reading), direction)
+    if address == 0 {
+        pulse.sendError(server, peer, tag, pulse.ERR_NOENTITY)
+        return
+    }
+    pulse.beginReply(server, &writing, tag)
+    putStream(&writing, server, version, streamOf(address))
+    pulse.send(server, peer, &writing)
+}
+
+fn putClient(writing: *ts.Writer, other: *state.Peer) -> void {
+    var digits: [20]u8 = undefined
+    var digit_bytes: [*]u8 = undefined
+    unsafe { digit_bytes = @ptrCast([*]u8, &digits) }
+    const count = number(digit_bytes, @intCast(usize, other.*.pid))
+    ts.putU32(writing, other.*.index)
+    ts.putString(writing, pulse.clientName(other))
+    ts.putU32(writing, pulse.INVALID)
+    ts.putString(writing, DRIVER)
+    ts.beginProplist(writing)
+    ts.putProperty(writing, "application.name", pulse.clientName(other))
+    ts.putProperty(writing, "application.id", protocol.appOf(other))
+    if other.*.pulse { ts.putProperty(writing, "application.process.id", digit_bytes[0..count]) }
+    ts.endProplist(writing)
+}
+
+// GET_CLIENT_INFO and GET_CLIENT_INFO_LIST: every app connected, by
+// either protocol.
+pub fn clients(server: *state.Server, peer: *state.Peer, tag: u32, reading: *ts.Reader, list: bool) -> void {
+    var writing: ts.Writer = undefined
+    var wanted = pulse.INVALID
+    if !list { wanted = ts.readU32(reading) }
+    pulse.beginReply(server, &writing, tag)
+    var found = false
+    var index: usize = 0
+    while index < server.*.peerCount {
+        const other = protocol.peerAt(server.*.peers[index])
+        if !other.*.dead && (list || other.*.index == wanted) {
+            putClient(&writing, other)
+            found = true
+        }
+        index += 1
+    }
+    if !list && !found {
+        pulse.sendError(server, peer, tag, pulse.ERR_NOENTITY)
+        return
+    }
+    pulse.send(server, peer, &writing)
+}
+
+// ---------------------------------------------------------------------------
+// Changes
+
+fn mayControl(peer: *state.Peer) -> bool { return peer.*.control == state.CONTROL_ALLOWED }
+
+// SET_SINK_VOLUME, SET_SINK_MUTE, SET_SOURCE_VOLUME, SET_SOURCE_MUTE.
+pub fn setDevice(server: *state.Server, peer: *state.Peer, tag: u32, reading: *ts.Reader, source: bool, mute: bool) -> void {
+    var index = ts.readU32(reading)
+    const name = ts.readString(reading)
+    var volume: u32 = 0
+    var muted = false
+    if mute { muted = ts.readBool(reading) } else { volume = linearOf(ts.readCvolume(reading)) }
+    if name.length > 0 { index = if source { sourceIndexByName(server, name) } else { sinkIndexByName(server, name) } }
+    if reading.*.failed || index == pulse.INVALID || (source && !sourceExists(server, index)) || (!source && !sinkExists(server, index)) {
+        pulse.sendError(server, peer, tag, pulse.ERR_NOENTITY)
+        return
+    }
+    if !mayControl(peer) {
+        pulse.sendError(server, peer, tag, pulse.ERR_ACCESS)
+        return
+    }
+    if volume > 98304 { volume = 98304 }
+    if !source && index == 0 {
+        if mute { server.*.mute = muted } else { server.*.master = volume }
+    } else if !source {
+        const sink = routing.sinkAt(server, @intCast(usize, index - 1))
+        if mute { sink.*.mute = muted } else { sink.*.volume = volume }
+    } else if index == 0 {
+        if mute { server.*.inputMute = muted } else { server.*.inputVolume = volume }
+    }
+    config.save(server)
+    pulse.ack(server, peer, tag)
+    pulse.changed(server)
+}
+
+// SET_SINK_INPUT_VOLUME and _MUTE, SET_SOURCE_OUTPUT_VOLUME and _MUTE:
+// an app's own streams, or any with audio.control.
+pub fn setStream(server: *state.Server, peer: *state.Peer, tag: u32, reading: *ts.Reader, direction: u32, mute: bool) -> void {
+    const address = pulse.streamByIndex(server, ts.readU32(reading), direction)
+    var volume: u32 = 0
+    var muted = false
+    if mute { muted = ts.readBool(reading) } else { volume = linearOf(ts.readCvolume(reading)) }
+    if address == 0 || reading.*.failed {
+        pulse.sendError(server, peer, tag, if address == 0 { pulse.ERR_NOENTITY } else { pulse.ERR_PROTOCOL })
+        return
+    }
+    const stream = streamOf(address)
+    if stream.*.peer != @intFromPtr(peer) && !mayControl(peer) {
+        pulse.sendError(server, peer, tag, pulse.ERR_ACCESS)
+        return
+    }
+    if mute { stream.*.muted = muted } else { stream.*.volume = if volume > 98304 { @intCast(u32, 98304) } else { volume } }
+    pulse.ack(server, peer, tag)
+    pulse.event(server, if direction == audio.PLAY { pulse.FACILITY_SINK_INPUT } else { pulse.FACILITY_SOURCE_OUTPUT }, pulse.EVENT_CHANGE, slotOf(server, stream))
+}
+
+// MOVE_SINK_INPUT and MOVE_SOURCE_OUTPUT: to another sink, or to record
+// from the input or a monitor (asked about again: audio.monitor).
+pub fn move(server: *state.Server, peer: *state.Peer, tag: u32, reading: *ts.Reader, direction: u32) -> void {
+    const address = pulse.streamByIndex(server, ts.readU32(reading), direction)
+    var index = ts.readU32(reading)
+    const name = ts.readString(reading)
+    if name.length > 0 { index = if direction == audio.PLAY { sinkIndexByName(server, name) } else { sourceIndexByName(server, name) } }
+    if address == 0 || reading.*.failed || index == pulse.INVALID || (direction == audio.PLAY && !sinkExists(server, index)) || (direction == audio.RECORD && !sourceExists(server, index)) {
+        pulse.sendError(server, peer, tag, pulse.ERR_NOENTITY)
+        return
+    }
+    const stream = streamOf(address)
+    if stream.*.peer != @intFromPtr(peer) && !mayControl(peer) {
+        pulse.sendError(server, peer, tag, pulse.ERR_ACCESS)
+        return
+    }
+    if direction == audio.PLAY {
+        const moved = routing.moveStream(server, stream, if index == 0 { "default" } else { sinkNameOf(server, index) })
+    } else {
+        stream.*.monitor = index != 0
+        stream.*.sink = if index <= 1 { state.DEFAULT_SINK } else { @intCast(usize, index - 1) }
+        protocol.askPermission(server, stream)
+    }
+    pulse.ack(server, peer, tag)
+    pulse.event(server, if direction == audio.PLAY { pulse.FACILITY_SINK_INPUT } else { pulse.FACILITY_SOURCE_OUTPUT }, pulse.EVENT_CHANGE, slotOf(server, stream))
+}
+
+// KILL_SINK_INPUT and KILL_SOURCE_OUTPUT (audio.control).
+pub fn kill(server: *state.Server, peer: *state.Peer, tag: u32, reading: *ts.Reader, direction: u32) -> void {
+    const address = pulse.streamByIndex(server, ts.readU32(reading), direction)
+    if address == 0 {
+        pulse.sendError(server, peer, tag, pulse.ERR_NOENTITY)
+        return
+    }
+    if !mayControl(peer) {
+        pulse.sendError(server, peer, tag, pulse.ERR_ACCESS)
+        return
+    }
+    const stream = streamOf(address)
+    protocol.sendStreamValue(server, stream, audio.ENDED, 0)
+    protocol.freeStream(server, stream)
+    pulse.ack(server, peer, tag)
+}

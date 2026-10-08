@@ -5,7 +5,8 @@ and it runs on MLXIPC (`projects/desktop/ipc`): apps find it on the
 session bus, talk to it over a direct MLXIPC channel, and what each app
 may do with sound is an MLXIPC permission. `mlx-audiod` is the server,
 `std.audio` the client library, `mlx-audio` the command line. All of it
-is Mlx: no libc, no alsa-lib, no PipeWire.
+is Mlx: no libc, no alsa-lib, no PipeWire. PulseAudio apps reach it on
+PulseAudio's own socket (below).
 
 ```sh
 mlx4 projects/desktop/audio/main.mlx -o mlx-audiod
@@ -112,6 +113,43 @@ as the kernel would; it takes only S32_LE for playback and only 44100 Hz
 for capture, so the server must negotiate and convert, and it counts
 underruns. `MLX_SND_DIR` and `MLX_ASOUND_DIR` point the server at it.
 
+## PulseAudio apps
+
+Programs that speak only PulseAudio (Firefox, Chromium and Electron apps,
+SDL games, mpv, VLC, GStreamer, Wine, pactl, pavucontrol) play and record
+through MLX Audio as they would through pipewire-pulse: mlx-audiod
+answers PulseAudio's native protocol at `$XDG_RUNTIME_DIR/pulse/native`
+([`pulse.mlx`](pulse.mlx), [`pulse_info.mlx`](pulse_info.mlx),
+[`tagstruct.mlx`](tagstruct.mlx); version 35, as libpulse 15 and later,
+samples in the packets, no shared memory). Flatpak hands the same socket
+to apps with `--socket=pulseaudio`. Their streams are the server's like
+any other: mixed, routed, in the Sound settings, and allowed by MLXIPC.
+The app is the process at the socket's other end (SO_PEERCRED, named by
+`std.appid` as the bus names apps: a Flatpak's id, else the program's
+name), and the bus is asked about it by process
+(`org.mlx.IPC.CheckProcess`): a sandboxed app may play, is asked before
+it records, and may not change the server; a recording ends when its
+permission goes.
+
+What PulseAudio apps see: one sink, `mlx.output` (the output's mix), and
+each virtual sink by its name; the sources `mlx.input` (the input),
+`mlx.output.monitor` and `NAME.monitor`; every stream as a sink input or
+source output, whichever protocol its app speaks; S16, S24, S24 in 32
+bits, S32, float and U8 samples, 1 to 32 channels, 8000 to 192000 Hz.
+Volumes are PulseAudio's (cubic), so pavucontrol's 50% is a quarter's
+loudness, as with PulseAudio. The buffer's sizes, prebuffering, corking,
+draining, flushing, underflow notices and the latency figures behind an
+app's clock (`pa_stream_get_time`) are PulseAudio's. Another server at
+the socket (PulseAudio, pipewire-pulse) keeps it; `--no-pulse` leaves it
+alone.
+
+Since PulseAudio apps do not come through the bus, the session starts
+mlx-audiod with it (`mlx-ipcd --start org.mlx.Audio`).
+`tools/check_pulse.sh` plays every sample format through pacat, records
+the input and the monitor with parec, changes volumes with pactl, checks
+a sandboxed app's permissions, and plays an `<audio>` element in Firefox
+when one is installed.
+
 ## Sinks and routing
 
 Every playing stream plays to a sink ([`routing.mlx`](routing.mlx)). The
@@ -175,6 +213,9 @@ mlx-audio move STREAM SINK           one stream (its id in status)
 | `alsa.mlx` | the kernel's PCM interface (and the emulated card's frames) |
 | `routing.mlx` | sinks, monitors, each app's volume, mute and route |
 | `config.mlx` | audio.conf |
+| `pulse.mlx` | the PulseAudio socket: clients, packets, AUTH, streams, latency |
+| `pulse_info.mlx` | what PulseAudio apps ask about (server, sinks, sources, streams, clients) and change (volumes, mute, moving) |
+| `tagstruct.mlx` | PulseAudio's tagstructs, read and written |
 | `tool.mlx` | mlx-audio |
 
 ## In mlx-settings
@@ -191,9 +232,9 @@ a switch each: it writes `allow APP use audio.record` (or `deny`) into
 
 ## Next
 
-- PulseAudio's protocol on top (as pipewire-pulse does), for the programs
-  that only speak it, each of them an app to MLXIPC's permissions.
-- Shared-memory streams over the channel (memfd), for low latency.
+- Shared-memory streams over the channel (memfd), for low latency; for
+  PulseAudio apps too (its memfd blocks).
 - Hotplug: a card plugged in is found only by the 2-second retry while
   there is none to play to; watching `/dev/snd` would find it at once.
-- A permission prompt the first time an app wants to record.
+- More than stereo: the mix has two channels; a 5.1 stream plays its
+  front left and right.

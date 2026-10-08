@@ -204,6 +204,11 @@ the server's state (devices, volumes, sinks, each app's route). `std.wav`
 (`std/src/wav.mlx`) reads WAVE headers (8 to 32-bit PCM, 32-bit float,
 extensible files) and writes them. `projects/desktop/audio` (mlx-audiod,
 mlx-audio) uses both; `tools/check_audio.sh` checks them end to end.
+`std.appid` (`std/src/appid.mlx`) says which app a process is, as the
+desktop names apps: `identify` gives a Flatpak app's id (from
+`/proc/PID/root/.flatpak-info`, then sandboxed) or its program's name
+(`/proc/PID/exe`, without a `-bin` at its end). MLXIPC's permissions and
+MLX Audio's PulseAudio socket name apps with it.
 
 `std.jpeg` (`std/src/jpeg.mlx`) encodes premultiplied ARGB words as
 baseline JPEG (4:2:0, standard tables scaled by a quality of 1 to 100,

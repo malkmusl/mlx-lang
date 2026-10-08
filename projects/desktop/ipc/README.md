@@ -39,7 +39,9 @@ Activation: a call to a name nobody owns starts the service whose
 `$XDG_RUNTIME_DIR/dbus-1/services`, `$XDG_DATA_HOME/dbus-1/services`,
 each of `$XDG_DATA_DIRS`), with the bus's address in its environment;
 the call waits until the service owns the name (or it ended:
-Spawn.ChildExited, or 25 seconds went: Spawn.Timeout).
+Spawn.ChildExited, or 25 seconds went: Spawn.Timeout). `--start NAME`
+starts a service with the bus (the session starts MLX Audio so, for its
+PulseAudio apps).
 
 dbus-send, gdbus, busctl and dbus-monitor are checked against it
 (`tools/check_ipc.sh`).
@@ -135,9 +137,11 @@ bus remembers who opened each channel, so the service can still Check
 the app's permissions after the app left the bus. MLX Audio's streams go
 this way.
 
-`org.mlx.IPC` also answers Check(s, s) -> b, GetAppId(s) -> (s app, b
-sandboxed), ListApps() -> a(ssbu), ListPermissions() -> a(sssb),
-SetPermission(sss) and Reload().
+`org.mlx.IPC` also answers Check(s, s) -> b, CheckProcess(u pid, s
+permission) -> b (as Check, for an app that reached the service past the
+bus: MLX Audio's PulseAudio socket names its peer process), GetAppId(s)
+-> (s app, b sandboxed), ListApps() -> a(ssbu), ListPermissions() ->
+a(sssb), SetPermission(sss) and Reload(). Sandboxed apps may not Check.
 
 ## mlx-ipc
 
