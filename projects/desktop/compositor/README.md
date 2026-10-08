@@ -517,7 +517,10 @@ window with a sidebar of categories (std.ui.host, drawn at the screen's
 density): General (the dock hiding, the terminal's hotkey, where the file
 is), Display (the monitor, its mode and night light; see below), Sound
 (MLX Audio's outputs, inputs, volumes and apps, and which apps may use
-the microphone; [`projects/desktop/audio`](../audio/README.md)), Window
+the microphone; [`projects/desktop/audio`](../audio/README.md)), Apps
+(every app that asked for a permission, with Allow, Ask, Deny or the
+default for each; MLXIPC's ListPermissions and SetPermission,
+[`projects/desktop/ipc`](../ipc/README.md)), Window
 management (title bars, the counter, app decorations, wobbly windows, the
 window hotkeys), Appearance (colours for the focused and the other
 windows' borders, square, small, medium or large corners) and Language

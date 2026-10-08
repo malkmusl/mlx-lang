@@ -39,8 +39,10 @@ tools/check_wayland_compositor.sh     # scenario 15: the dialog clicked
 5. The bus answers every Check waiting on that question. Remembered, the
    answer is a rule of `ipc.conf`; otherwise it holds for the session.
    Either can be changed in mlx-settings' Apps category
-   (`org.mlx.IPC.SetPermission`), and services check again at once
-   (`org.mlx.IPC.PermissionsChanged`).
+   (`projects/desktop/settings/permissions.mlx`: every app that asked,
+   each permission with Allow, Ask, Deny or Default;
+   `org.mlx.IPC.ListPermissions` and `SetPermission`), and services check
+   again at once (`org.mlx.IPC.PermissionsChanged`).
 
 The dialog needs the compositor: the agent passes its own
 `WAYLAND_DISPLAY`, else the Mlx compositor's socket

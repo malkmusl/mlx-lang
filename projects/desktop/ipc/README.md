@@ -110,7 +110,8 @@ MLX Audio ends a recording whose permission went.
 
 The bus keeps which app asked for which permission
 (`$XDG_STATE_HOME/mlx/ipc-seen`, `~/.local/state/mlx/ipc-seen`), for
-mlx-settings' Apps category:
+mlx-settings' Apps category (`projects/desktop/settings/permissions.mlx`),
+which shows every app with Allow, Ask, Deny or Default per permission:
 
 - `org.mlx.IPC.ListPermissions() -> a(sssb)`: app, permission, decision,
   sandboxed. The decision is `allow`, `deny` or `ask` (a rule of

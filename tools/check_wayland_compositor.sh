@@ -46,7 +46,8 @@
 #      Display page's night light switch reaches compositor.conf.
 #  15. the permission dialog (mlx-permissions, with bwrap): a sandboxed
 #      app records, MLXIPC starts the agent, its dialog opens; Remember and
-#      Allow are clicked: the app records and ipc.conf keeps the rule.
+#      Allow are clicked: the app records and ipc.conf keeps the rule;
+#      mlx-settings' Apps page shows it and denies it again.
 #
 # Typed commands create marker files, so keyboard delivery is verified at the
 # shell; the moved window's focus frame is checked in the host's screenshot.
@@ -383,8 +384,8 @@ PY
 echo "ok   a pointer lock holds the cursor and relative motion reaches the client"
 
 # Scenario 11: mlx-settings (its window at (24, 24); the categories in
-# its sidebar 28 pixels apart from y 44: General, Display, Sound, Window
-# management, Appearance, Language; on the Window management page the
+# its sidebar 28 pixels apart from y 44: General, Display, Sound, Apps,
+# Window management, Appearance, Language; on the Window management page the
 # hotkey rows 34 pixels apart from y 336, on the General page the
 # terminal's at y 186). Maximize gets Super+Shift+M; minimize gets
 # Super+Up (the maximize hotkey: it must reach the window); the terminal
@@ -393,7 +394,7 @@ echo "ok   a pointer lock holds the cursor and relative motion reaches the clien
 rm -f "$XDG_CONFIG_HOME/mlx/compositor.conf"
 cat > "$work/hotkeys.script" <<SCRIPT
 wait 2500
-pointer 124 166
+pointer 124 194
 press 272
 release 272
 wait 300
@@ -633,7 +634,10 @@ echo "ok   mlx-settings' Sound page controls MLX Audio (output off, volume $((vo
 # (audio.record), starts mlx-permissions from its service file, and its
 # dialog opens on the compositor (at (24, 24); the question takes two
 # lines: "Remember this decision" at y 153, Allow at (422, 198)). Both are
-# clicked: the app records and ipc.conf keeps the answer.
+# clicked: the app records and ipc.conf keeps the answer. Then
+# mlx-settings' Apps page (the category at y 166) lists the app's
+# microphone as allowed; Deny (at (662, 208)) is clicked: ipc.conf says
+# so.
 if command -v bwrap > /dev/null && bwrap --bind / / true 2> /dev/null; then
     "$compiler" --quiet projects/desktop/permissions/main.mlx -o "$work/mlx-permissions"
     cat > "$work/services/org.mlx.PermissionAgent.service" <<SERVICE
@@ -644,7 +648,8 @@ SERVICE
     : > "$XDG_CONFIG_HOME/mlx/ipc.conf"
     # The bus starts before the compositor (as in mlx-session): the agent
     # gets the compositor's display from it.
-    WAYLAND_DISPLAY=nested-permission LC_ALL=C "$work/mlx-ipcd" --verbose --services "$work/services" > "$work/permission-ipc.log" 2>&1 &
+    # The apps that asked: only this scenario's.
+    XDG_STATE_HOME="$work/permission-state" WAYLAND_DISPLAY=nested-permission LC_ALL=C "$work/mlx-ipcd" --verbose --services "$work/services" > "$work/permission-ipc.log" 2>&1 &
     ipc_pid=$!
     for _ in $(seq 1 50); do [[ -S "$XDG_RUNTIME_DIR/bus" ]] && break; sleep 0.1; done
     export DBUS_SESSION_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/bus"
@@ -668,14 +673,30 @@ wait 2500
 close
 SCRIPT
     run_scenario permission "$work/permission.script" --no-fps --run "$work/record.sh"
-    kill "$ipc_pid" 2> /dev/null || true
-    pkill -x -P "$ipc_pid" mlx-audiod 2> /dev/null || true
-    unset DBUS_SESSION_BUS_ADDRESS
-    sleep 0.3
     grep -q "^map: Permission" "$work/permission-compositor.log" || { echo "the permission dialog did not open" >&2; cat "$work/permission-ipc.log" "$work/permission-compositor.log" >&2; exit 1; }
     grep -q "status 0" "$work/record.log" && [[ -s "$work/permitted.wav" ]] || { echo "the app did not record after Allow: $(cat "$work/record.log")" >&2; cat "$work/permission-ipc.log" >&2; exit 1; }
     grep -qx "allow org.example.Recorder use audio.record" "$XDG_CONFIG_HOME/mlx/ipc.conf" || { echo "Remember did not keep the answer: $(cat "$XDG_CONFIG_HOME/mlx/ipc.conf")" >&2; cat "$work/permission-ipc.log" >&2; exit 1; }
     echo "ok   the permission dialog asks the user; Allow with Remember lets the app record and becomes a rule"
+    cat > "$work/apps.script" <<SCRIPT
+wait 2500
+pointer 124 166
+press 272
+release 272
+wait 1000
+pointer 662 208
+press 272
+release 272
+wait 1500
+close
+SCRIPT
+    run_scenario apps "$work/apps.script" --no-fps --run "$work/mlx-settings"
+    kill "$ipc_pid" 2> /dev/null || true
+    pkill -x -P "$ipc_pid" mlx-audiod 2> /dev/null || true
+    unset DBUS_SESSION_BUS_ADDRESS
+    sleep 0.3
+    grep -qx "deny org.example.Recorder use audio.record" "$XDG_CONFIG_HOME/mlx/ipc.conf" && [[ $(wc -l < "$XDG_CONFIG_HOME/mlx/ipc.conf") -eq 1 ]] || { echo "the Apps page did not deny the microphone: $(cat "$XDG_CONFIG_HOME/mlx/ipc.conf")" >&2; cat "$work/permission-ipc.log" >&2; exit 1; }
+    grep -q "org.example.Recorder audio.record: deny" "$work/permission-ipc.log" || { echo "the bus got no SetPermission" >&2; cat "$work/permission-ipc.log" >&2; exit 1; }
+    echo "ok   mlx-settings' Apps page lists the app's permission and Deny changes it (SetPermission)"
     : > "$XDG_CONFIG_HOME/mlx/ipc.conf"
 else
     echo "skip the permission dialog (no working bwrap)"
