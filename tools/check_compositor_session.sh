@@ -20,7 +20,7 @@ trap 'rm -rf -- "$work"' EXIT
 
 compiler_args=()
 [[ $# -gt 0 ]] && compiler_args=(--compiler "$1")
-tools/install_compositor_session.sh --destdir "$work/root" "${compiler_args[@]}" > "$work/install.log"
+tools/install_compositor_session.sh --destdir "$work/root" --replace-sound-servers "${compiler_args[@]}" > "$work/install.log"
 bindir="$work/root/usr/local/bin"
 entry="$work/root/usr/share/wayland-sessions/mlx-compositor.desktop"
 for program in mlx-compositor mlx-terminal mlx-session mlx-dock mlx-topbar mlx-launcher mlx-settings mlx-files mlx-observatory mlx-codemap mlx-profile mlx-capture mlx-ipcd mlx-ipc mlx-audiod mlx-audio mlx-permissions; do
@@ -29,11 +29,18 @@ done
 grep -qx "Exec=/usr/local/bin/mlx-session" "$entry" || { echo "session entry without the launcher:" >&2; cat "$entry" >&2; exit 1; }
 grep -qx "Exec=/usr/local/bin/mlx-audiod" "$work/root/usr/local/share/mlx/dbus-1/services/org.mlx.Audio.service" || { echo "MLX Audio's service file is missing" >&2; exit 1; }
 grep -qx "Exec=/usr/local/bin/mlx-permissions" "$work/root/usr/local/share/mlx/dbus-1/services/org.mlx.PermissionAgent.service" || { echo "the permission agent's service file is missing" >&2; exit 1; }
+grep -q "type pulse" "$work/root/etc/alsa/conf.d/99-zz-mlx-audio.conf" && grep -qx "autospawn = no" "$work/root/etc/pulse/client.conf.d/50-mlx-audio.conf" || { echo "--replace-sound-servers did not stage the ALSA and libpulse settings" >&2; cat "$work/install.log" >&2; exit 1; }
+if command -v systemctl > /dev/null; then
+    [[ "$(readlink "$work/root/etc/systemd/user/pipewire.socket")" == /dev/null && "$(readlink "$work/root/etc/systemd/user/pulseaudio.service")" == /dev/null ]] || { echo "--replace-sound-servers did not mask PipeWire and PulseAudio" >&2; cat "$work/install.log" >&2; exit 1; }
+fi
+tools/install_compositor_session.sh --destdir "$work/root" --restore-sound-servers > "$work/restore.log"
+[[ ! -e "$work/root/etc/systemd/user/pipewire.socket" ]] || { echo "--restore-sound-servers left PipeWire masked" >&2; cat "$work/restore.log" >&2; exit 1; }
+[[ ! -e "$work/root/etc/alsa/conf.d/99-zz-mlx-audio.conf" && ! -e "$work/root/etc/pulse/client.conf.d/50-mlx-audio.conf" ]] || { echo "--restore-sound-servers left the settings" >&2; cat "$work/restore.log" >&2; exit 1; }
 files_entry="$work/root/usr/local/share/applications/org.mlx.files.desktop"
 grep -qx "Exec=/usr/local/bin/mlx-files %U" "$files_entry" && [[ -f "$work/root/usr/local/share/icons/hicolor/128x128/apps/org.mlx.files.png" ]] || { echo "the file manager's entry or icon is missing" >&2; exit 1; }
 observatory_entry="$work/root/usr/local/share/applications/org.mlx.observatory.desktop"
 grep -qx "Exec=/usr/local/bin/mlx-observatory $repo_root" "$observatory_entry" && [[ -f "$work/root/usr/local/share/icons/hicolor/128x128/apps/org.mlx.observatory.png" ]] || { echo "MLX Observatory's entry or icon is missing" >&2; exit 1; }
-echo "ok   staged install: programs in PREFIX/bin, session entry in wayland-sessions"
+echo "ok   staged install: programs in PREFIX/bin, session entry in wayland-sessions; the sound servers replaced and restored"
 
 # A systemctl that has PipeWire's user units and logs what it is told:
 # the session must stop and mask them for itself and start them again.

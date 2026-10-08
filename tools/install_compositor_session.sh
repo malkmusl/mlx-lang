@@ -35,6 +35,9 @@
 #   tools/build_compositor_modules.sh rebuilds them)
 #   ~/.config/obs-studio/plugins/mlx-capture/bin/64bit/mlx-capture.so (the
 #   OBS source "MLX Capture", for the user running this)
+#   with --replace-sound-servers: /etc/alsa/conf.d/99-zz-mlx-audio.conf,
+#   /etc/pulse/client.conf.d/50-mlx-audio.conf, the sound servers' user
+#   units masked in /etc/systemd/user
 #
 # Usage: tools/install_compositor_session.sh [options]
 #   --prefix DIR      programs go to DIR/bin (default /usr/local)
@@ -44,7 +47,21 @@
 #   --compiler PATH   the Mlx compiler (default: mlx-out/bin/compiler/mlx4,
 #                     else zig-out/bin/mlx1, else built with `zig build mlx1`)
 #   --build-only      build into mlx-out/session and stop
-#   --uninstall       remove what an install put there
+#   --uninstall       remove what an install put there (and restore the
+#                     sound servers when they were replaced)
+#   --replace-sound-servers
+#                     MLX Audio becomes the system's sound server: PipeWire,
+#                     WirePlumber and PulseAudio are masked for every user
+#                     (systemctl --global; from the next login), libpulse
+#                     no longer starts a PulseAudio of its own, and ALSA
+#                     programs play through MLX Audio
+#                     (/etc/alsa/conf.d/99-zz-mlx-audio.conf). Their packages
+#                     may then be removed; libpulse (PulseAudio's client
+#                     library, which Firefox and others load) and
+#                     alsa-plugins' pulse plugin stay. Other desktops have
+#                     no sound server then.
+#   --restore-sound-servers
+#                     undoes --replace-sound-servers
 #
 # Installing into system directories asks for sudo when not run as root.
 set -euo pipefail
@@ -58,6 +75,8 @@ destdir=""
 compiler=""
 build_only=0
 uninstall=0
+replace_sound=0
+restore_sound=0
 while [[ $# -gt 0 ]]; do
     case $1 in
     --prefix) prefix=$2; shift ;;
@@ -66,6 +85,8 @@ while [[ $# -gt 0 ]]; do
     --compiler) compiler=$2; shift ;;
     --build-only) build_only=1 ;;
     --uninstall) uninstall=1 ;;
+    --replace-sound-servers) replace_sound=1 ;;
+    --restore-sound-servers) restore_sound=1 ;;
     -h|--help) sed -n '2,/^set -euo/p' "$0" | sed '$d; s/^# \{0,1\}//'; exit 0 ;;
     *) echo "install_compositor_session.sh: unknown option $1 (see --help)" >&2; exit 2 ;;
     esac
@@ -91,7 +112,68 @@ as_owner() {
     fi
 }
 
+# PipeWire's, WirePlumber's and PulseAudio's user units; what replacing
+# them leaves.
+sound_units=(pipewire.socket pipewire.service pipewire-pulse.socket pipewire-pulse.service wireplumber.service pulseaudio.socket pulseaudio.service)
+alsa_default="/etc/alsa/conf.d/99-zz-mlx-audio.conf"
+pulse_client="/etc/pulse/client.conf.d/50-mlx-audio.conf"
+sound_marker="$prefix/share/mlx/sound-servers-replaced"
+
+# MLX Audio as the sound server for good (and back).
+replace_sound_servers() {
+    as_owner "$destdir$alsa_default" install -d "$(dirname "$destdir$alsa_default")"
+    as_owner "$destdir$alsa_default" install -m 644 projects/desktop/audio/asound.conf "$destdir$alsa_default"
+    echo "installed $destdir$alsa_default (ALSA programs play through MLX Audio)"
+    as_owner "$destdir$pulse_client" install -d "$(dirname "$destdir$pulse_client")"
+    printf '# MLX Audio answers PulseAudio apps; libpulse starts no PulseAudio.\nautospawn = no\n' > "$build/50-mlx-audio.conf"
+    as_owner "$destdir$pulse_client" install -m 644 "$build/50-mlx-audio.conf" "$destdir$pulse_client"
+    echo "installed $destdir$pulse_client (libpulse starts no PulseAudio)"
+    # Staged (--destdir): masked inside the staged tree, every one of them.
+    local masked=() root=()
+    [[ -n "$destdir" ]] && root=(--root="$destdir")
+    if command -v systemctl > /dev/null; then
+        for unit in "${sound_units[@]}"; do
+            if [[ -n "$destdir" || -n "$(systemctl --global list-unit-files --no-legend "$unit" 2> /dev/null)" ]]; then
+                as_owner "$destdir/etc/systemd/user" systemctl "${root[@]}" --global mask "$unit" > /dev/null 2>&1 && masked+=("$unit")
+            fi
+        done
+        [[ ${#masked[@]} -gt 0 ]] && echo "masked for every user (from the next login): ${masked[*]}"
+    fi
+    as_owner "$destdir$sound_marker" install -d "$(dirname "$destdir$sound_marker")"
+    printf '%s\n' "${masked[@]}" > "$build/sound-servers-replaced"
+    as_owner "$destdir$sound_marker" install -m 644 "$build/sound-servers-replaced" "$destdir$sound_marker"
+    echo
+    echo "MLX Audio is the sound server now. PipeWire, WirePlumber and PulseAudio"
+    echo "no longer start; their packages (pipewire, pipewire-pulse, pipewire-alsa,"
+    echo "wireplumber, pulseaudio) may be removed. Keep libpulse0 and"
+    echo "libasound2-plugins: PulseAudio's client library and ALSA's pulse plugin,"
+    echo "which apps use to reach MLX Audio. Other desktops (GNOME, KDE) have no"
+    echo "sound now; --restore-sound-servers gives it back."
+}
+
+restore_sound_servers() {
+    local path root=()
+    [[ -n "$destdir" ]] && root=(--root="$destdir")
+    if [[ -f "$destdir$sound_marker" ]] && command -v systemctl > /dev/null; then
+        while read -r unit; do
+            [[ -n "$unit" ]] && as_owner "$destdir/etc/systemd/user" systemctl "${root[@]}" --global unmask "$unit" > /dev/null 2>&1 && echo "unmasked $unit"
+        done < "$destdir$sound_marker"
+    fi
+    for path in "$destdir$alsa_default" "$destdir$pulse_client" "$destdir$sound_marker"; do
+        [[ -e "$path" ]] && as_owner "$path" rm -f -- "$path" && echo "removed $path"
+    done
+    return 0
+}
+
+build=mlx-out/session
+mkdir -p "$build"
+if [[ $restore_sound -eq 1 ]]; then
+    restore_sound_servers
+    exit 0
+fi
+
 if [[ $uninstall -eq 1 ]]; then
+    [[ -f "$destdir$sound_marker" ]] && restore_sound_servers
     for program in "${programs[@]}"; do
         path="$destdir$bindir/$program"
         [[ -e "$path" ]] && as_owner "$path" rm -f -- "$path" && echo "removed $path"
@@ -109,8 +191,6 @@ fi
 [[ -n "$compiler" ]] || compiler=$(tools/ensure_compiler.sh)
 
 # Build.
-build=mlx-out/session
-mkdir -p "$build"
 echo "building with $compiler"
 "$compiler" --quiet projects/desktop/compositor/main.mlx -o "$build/mlx-compositor"
 "$compiler" --quiet projects/desktop/terminal/main.mlx -o "$build/mlx-terminal"
@@ -152,6 +232,7 @@ as_owner "$destdir$services" install -d "$destdir$services"
 as_owner "$destdir$services" install -m 644 "$build/org.mlx.Audio.service" "$build/org.mlx.PermissionAgent.service" "$destdir$services/"
 for program in "${programs[@]}"; do echo "installed $destdir$bindir/$program"; done
 echo "installed $destdir$sessions/mlx-compositor.desktop"
+[[ $replace_sound -eq 1 ]] && replace_sound_servers
 # The shell and renderer modules, for the user running this (not when
 # staging a package).
 if [[ -z "$destdir" ]]; then

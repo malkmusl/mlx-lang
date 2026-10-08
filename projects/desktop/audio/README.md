@@ -144,7 +144,25 @@ the socket (PulseAudio, pipewire-pulse) keeps it; `--no-pulse` leaves it
 alone.
 
 Since PulseAudio apps do not come through the bus, the session starts
-mlx-audiod with it (`mlx-ipcd --start org.mlx.Audio`).
+mlx-audiod with it (`mlx-ipcd --start org.mlx.Audio`). ALSA programs
+(aplay, arecord, games that open `default`) reach it through
+alsa-plugins' pulse plugin: [`asound.conf`](asound.conf) makes it ALSA's
+default device.
+
+### Replacing PipeWire and PulseAudio
+
+`tools/install_compositor_session.sh --replace-sound-servers` makes MLX
+Audio the system's sound server for good: PipeWire, WirePlumber and
+PulseAudio are masked for every user (`systemctl --global mask`, from
+the next login; the session otherwise stops them only for its time),
+libpulse starts no PulseAudio of its own
+(`/etc/pulse/client.conf.d/50-mlx-audio.conf`: `autospawn = no`), and
+`asound.conf` goes to `/etc/alsa/conf.d/99-zz-mlx-audio.conf` (after
+pipewire-alsa's default, which it overrides). Their packages may then
+be removed; libpulse (PulseAudio's client library, which Firefox and the
+others load to speak the protocol) and alsa-plugins' pulse plugin stay.
+Other desktops (GNOME, KDE) have no sound server then.
+`--restore-sound-servers` (and `--uninstall`) undoes it.
 `tools/check_pulse.sh` plays every sample format through pacat, records
 the input and the monitor with parec, changes volumes with pactl, checks
 a sandboxed app's permissions, and plays an `<audio>` element in Firefox
@@ -216,6 +234,7 @@ mlx-audio move STREAM SINK           one stream (its id in status)
 | `pulse.mlx` | the PulseAudio socket: clients, packets, AUTH, streams, latency |
 | `pulse_info.mlx` | what PulseAudio apps ask about (server, sinks, sources, streams, clients) and change (volumes, mute, moving) |
 | `tagstruct.mlx` | PulseAudio's tagstructs, read and written |
+| `asound.conf` | ALSA's default device through MLX Audio |
 | `tool.mlx` | mlx-audio |
 
 ## In mlx-settings

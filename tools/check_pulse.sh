@@ -16,6 +16,8 @@
 #   - a sandboxed app (bwrap with a .flatpak-info) plays, may not record
 #     until a rule allows it, may not change the server, and its
 #     recording ends when the rule goes;
+#   - ALSA programs (aplay, arecord) through alsa-plugins' pulse plugin
+#     and asound.conf;
 #   - with Firefox (FIREFOX=PATH, or firefox installed): an <audio>
 #     element plays through MLX Audio and its clock reaches the end.
 #
@@ -157,6 +159,33 @@ timeout 3 parec --format=s16le --rate=48000 --channels=2 > "$work/input.raw" || 
 read -r seconds amplitude < <(python3 "$work/sound.py" measure "$work/input.raw" 440)
 python3 -c "import sys; sys.exit(0 if abs(int('$amplitude') - 16384) < 1600 else 1)" || fail "parec: the input's 440 Hz at $amplitude"
 echo "ok   parec records the input (440 Hz at $amplitude)"
+
+# ALSA programs, through alsa-plugins' pulse plugin (asound.conf; the
+# installer puts it in /etc/alsa/conf.d, here the user's asoundrc, which
+# ALSA reads last).
+if command -v aplay > /dev/null && ls /usr/lib/*/alsa-lib/libasound_module_pcm_pulse.so > /dev/null 2>&1; then
+    mkdir -p "$XDG_CONFIG_HOME/alsa"
+    cp projects/desktop/audio/asound.conf "$XDG_CONFIG_HOME/alsa/asoundrc"
+    python3 "$work/sound.py" make "$work/alsa.raw" s16le 44100 2 1 660 12000
+    parec -d mlx.output.monitor --format=s16le --rate=48000 --channels=2 > "$work/monitor.raw" &
+    recorder=$!
+    sleep 0.4
+    timeout 10 aplay -q -t raw -f S16_LE -r 44100 -c 2 "$work/alsa.raw" || fail "aplay"
+    sleep 0.3
+    kill "$recorder"
+    wait "$recorder" 2> /dev/null || true
+    read -r seconds amplitude < <(python3 "$work/sound.py" measure "$work/monitor.raw" 660)
+    python3 -c "import sys; s, a = float('$seconds'), int('$amplitude'); sys.exit(0 if abs(s - 1) < 0.2 and abs(a - 12000) < 1200 else 1)" || fail "aplay: the monitor has $seconds s at $amplitude"
+    grep -q "aplay plays" "$work/bus.log" || fail "aplay did not play through MLX Audio"
+    played=$amplitude
+    timeout 5 arecord -q -t raw -f S16_LE -r 48000 -c 2 -d 1 "$work/arecord.raw" || fail "arecord"
+    read -r seconds amplitude < <(python3 "$work/sound.py" measure "$work/arecord.raw" 440)
+    python3 -c "import sys; sys.exit(0 if abs(int('$amplitude') - 16384) < 1600 else 1)" || fail "arecord: 440 Hz at $amplitude"
+    echo "ok   ALSA programs: aplay plays (660 Hz at $played in the monitor), arecord records the input (440 Hz at $amplitude)"
+    rm -f "$XDG_CONFIG_HOME/alsa/asoundrc"
+else
+    echo "skip ALSA programs (no aplay or no alsa-plugins pulse plugin)"
+fi
 
 # Streams, volumes, mute, events.
 timeout 10 pactl subscribe > "$work/events.txt" 2>&1 &
