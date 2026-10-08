@@ -25,7 +25,8 @@ tools/check_audio.sh            # the end-to-end check
    to the server with who the app is (`org.mlx.IPC.Peer.Connected`). The
    app leaves the bus; from here on it talks to the server directly.
 3. For each stream it opens, the server asks the bus whether the app may
-   play (`audio.play`) or record (`audio.record`):
+   play (`audio.play`), record (`audio.record`) or record what plays (a
+   sink's monitor, `audio.monitor`):
    `org.mlx.IPC.Check`. The bus remembers who opened each channel, so it
    answers for the app even after the app left the bus.
 4. The stream plays: the server says how much it wants (REQUEST), the app
@@ -57,9 +58,10 @@ deny org.example.Noisy use audio.play
 deny org.example.Spy talk org.mlx.Audio        # no channel at all
 ```
 
-By default an unsandboxed app may play, record and control the server
-(`audio.control`: switch outputs, set volumes; as with PipeWire); a
-sandboxed one (Flatpak) may play, not record and not control. A refused
+By default an unsandboxed app may play, record, record what plays and
+control the server (`audio.control`: switch outputs, set volumes, route
+apps; as with PipeWire); a sandboxed one (Flatpak) may play, nothing
+else. A refused
 stream gets REFUSED with the reason, and `mlx-audio` says so. When a rule
 takes recording from an app that records, the server ends its stream
 (ENDED) once it is told to check again (SET's recheck; mlx-settings sends
@@ -104,6 +106,32 @@ as the kernel would; it takes only S32_LE for playback and only 44100 Hz
 for capture, so the server must negotiate and convert, and it counts
 underruns. `MLX_SND_DIR` and `MLX_ASOUND_DIR` point the server at it.
 
+## Sinks and routing
+
+Every playing stream plays to a sink ([`routing.mlx`](routing.mlx)). The
+default sink is the output's mix. Virtual sinks mix their streams apart,
+at a volume of their own, and pass the mix on to the default sink or to
+nothing (then only their monitor has it). Each sink has a monitor: a
+recording stream opened from `monitor` (the default sink's: the
+desktop's sound) or `monitor:NAME` gets what plays to it, before the
+sink's volume, so turning the speakers down does not change a recording.
+That is how mlx-capture records the desktop's sound apart from the
+microphone, and how one app's sound can be recorded alone: route it to a
+sink of its own.
+
+Each app (by its MLXIPC name) has a volume and mute over all its streams
+and a route, the sink its streams play to unless a stream named one when
+it opened (std.audio's `openStreamOn`); changing the route moves its
+streams at once. Sinks and the apps' settings are kept in `audio.conf`.
+
+```sh
+mlx-audio sink add music              # into the output
+mlx-audio sink add obs none           # only recordable
+mlx-audio app firefox sink obs        # firefox plays there from now on
+mlx-audio app firefox volume 60
+mlx-audio record mix.wav 10 --source monitor:obs
+```
+
 ## mlx-audio
 
 ```
@@ -117,6 +145,13 @@ mlx-audio output DEVICE              auto, alsa:pcmC1D0p, null (remembered)
 mlx-audio input DEVICE               auto, alsa:NAME, none
 mlx-audio status                     the server's state (STATE)
 mlx-audio recheck                    every stream's permission asked again
+mlx-audio sinks | apps               the virtual sinks; the apps' settings
+mlx-audio sink add NAME [none]       a virtual sink (none: to nothing)
+mlx-audio sink remove|volume|mute NAME [VALUE]
+mlx-audio app NAME volume|mute|sink VALUE
+mlx-audio move STREAM SINK           one stream (its id in status)
+  --sink NAME                        the sink to play to (play, tone)
+  --source input|monitor|monitor:SINK  what record records
   --volume PERCENT                   the stream's volume
   --latency MS                       the server's buffer for it (default 100)
 ```
@@ -132,6 +167,7 @@ mlx-audio recheck                    every stream's permission asked again
 | `samples.mlx` | sample formats, resampling, a tone |
 | `devices.mlx` | outputs and inputs: sound card, file, tone, nothing |
 | `alsa.mlx` | the kernel's PCM interface (and the emulated card's frames) |
+| `routing.mlx` | sinks, monitors, each app's volume, mute and route |
 | `config.mlx` | audio.conf |
 | `tool.mlx` | mlx-audio |
 
@@ -141,8 +177,9 @@ The settings app's Sound page
 ([`projects/desktop/settings/sound.mlx`](../settings/sound.mlx)) shows
 STATE and asks for it twice a second while it is shown: the output and
 the input (automatic, each card's device, none) with a note when the card
-is busy or missing, their volumes and mute, a test tone, the apps playing
-and recording with a volume each, and the apps that wanted to record with
+is busy or missing, their volumes and mute, a test tone, the apps with a
+volume each and the sink each plays to (a click takes the next), the
+virtual sinks' volumes, and the apps that wanted to record with
 a switch each: it writes `allow APP use audio.record` (or `deny`) into
 `ipc.conf` and sends the recheck.
 

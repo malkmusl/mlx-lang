@@ -15,7 +15,11 @@
 #     (`use audio.record`), a deny rule takes playing from an unsandboxed
 #     app, and one taking org.mlx.Audio leaves the app no channel;
 #   - an app killed while it plays leaves no stream behind; the server's
-#     memory stays the same over a long stream.
+#     memory stays the same over a long stream;
+#   - virtual sinks: a stream played to one is in its monitor, in the
+#     desktop's sound (the default sink's monitor) when the sink goes to
+#     the output and not when it goes nowhere; an app's volume and route
+#     apply to its streams and are kept in audio.conf.
 #
 #   tools/check_audio.sh [compiler]
 set -euo pipefail
@@ -159,6 +163,9 @@ if command -v bwrap > /dev/null && bwrap --bind / / true 2> /dev/null; then
     sleep 0.3
     "${sandboxed[@]}" "$play" record "$work/x.wav" 1 > /dev/null 2>&1 || fail "the rule did not let it record"
     echo "ok   sandboxed: records once ipc.conf allows it"
+    if "${sandboxed[@]}" "$play" record "$work/x.wav" 1 --source monitor > "$work/out.txt" 2>&1; then fail "a sandboxed app recorded what plays"; fi
+    grep -q "refused" "$work/out.txt" || fail "sandboxed monitor: $(cat "$work/out.txt")"
+    echo "ok   sandboxed: may not record what plays (audio.monitor), recording allowed or not"
     echo "deny org.example.Player talk org.mlx.Audio" > "$XDG_CONFIG_HOME/mlx/ipc.conf"
     sleep 0.3
     if "${sandboxed[@]}" "$play" tone 440 1 > "$work/out.txt" 2>&1; then fail "a denied app got a channel"; fi
@@ -218,6 +225,55 @@ wait "$first"
 kill "$(cat "$work/audiod.pid")"; sleep 0.3
 expect_sound "mixed: 440 Hz at half volume and the resampled 1000 Hz file" "$work/two.wav" 48000 2 1 440 8000 1000 12000
 expect_sound "recorded from a looped file, at 22050 Hz" "$work/fromfile.wav" 22050 2 0.9 1000 12000
+
+# Sinks, monitors and app settings (routing.mlx), on a fresh server whose
+# input is an 880 Hz tone (it must never reach a monitor).
+"$work/mlx-audiod" --verbose --output "file:$work/routed.wav" --input sine:880 > "$work/audiod.log" 2>&1 &
+echo $! > "$work/audiod.pid"
+sleep 0.4
+"$play" sink add music || fail "adding a sink"
+"$play" sink add hidden none || fail "adding a sink that goes nowhere"
+sinks=$("$play" sinks)
+[[ "$sinks" == *"music"$'\t'"output"* && "$sinks" == *"hidden"$'\t'"none"* ]] || fail "sinks: $sinks"
+"$play" tone 660 2 --sink hidden &
+first=$!
+sleep 0.3
+"$play" record "$work/hidden.wav" 1 --source monitor:hidden > /dev/null || fail "recording a sink's monitor"
+"$play" record "$work/desktop.wav" 1 --source monitor > /dev/null || fail "recording the desktop's sound"
+wait "$first"
+expect_sound "a sink's monitor has what plays to it, not the input" "$work/hidden.wav" 48000 2 0.9 660 16000 880 0
+expect_sound "a sink to nothing stays out of the output (the default monitor)" "$work/desktop.wav" 48000 2 0 660 0
+"$play" app mlx-audio volume 50 || fail "an app's volume"
+"$play" tone 440 2 --sink music &
+first=$!
+sleep 0.3
+"$play" record "$work/desktop.wav" 1 --source monitor > /dev/null || fail "recording the desktop's sound"
+wait "$first"
+expect_sound "a sink to the output: in the desktop's sound, at the app's volume (50%)" "$work/desktop.wav" 48000 2 0.9 440 8000 880 0
+"$play" app mlx-audio sink hidden || fail "routing an app"
+"$play" tone 440 3 &
+first=$!
+sleep 0.3
+"$play" record "$work/desktop.wav" 1 --source monitor > /dev/null || fail "recording the desktop's sound"
+"$play" record "$work/hidden.wav" 1 --source monitor:hidden > /dev/null || fail "recording a sink's monitor"
+wait "$first"
+expect_sound "the app's route takes its streams to its sink" "$work/hidden.wav" 48000 2 0.9 440 8000
+expect_sound "and out of the output" "$work/desktop.wav" 48000 2 0 440 0
+for line in "sink = music"$'\t'"output"$'\t'"100"$'\t'"off" "sink = hidden"$'\t'"none"$'\t'"100"$'\t'"off" "app = mlx-audio"$'\t'"50"$'\t'"off"$'\t'"hidden"; do
+    grep -qxF "$line" "$XDG_CONFIG_HOME/mlx/audio.conf" || fail "audio.conf lacks \"$line\": $(cat "$XDG_CONFIG_HOME/mlx/audio.conf")"
+done
+kill "$(cat "$work/audiod.pid")"; sleep 0.3
+"$work/mlx-audiod" --output null --input none > "$work/audiod.log" 2>&1 &
+echo $! > "$work/audiod.pid"
+sleep 0.4
+apps=$("$play" apps)
+[[ "$("$play" sinks)" == *"hidden"* && "$apps" == *"mlx-audio"$'\t'"32768"$'\t'"0"$'\t'"hidden"* ]] || fail "after a restart: sinks $("$play" sinks), apps $apps"
+"$play" app mlx-audio sink default && "$play" app mlx-audio volume 100 && "$play" sink remove music && "$play" sink remove hidden || fail "undoing the routing"
+[[ -z "$("$play" sinks)" ]] || fail "sinks left: $("$play" sinks)"
+kill "$(cat "$work/audiod.pid")"; sleep 0.3
+# The next server takes the card (no output kept from these).
+rm -f "$XDG_CONFIG_HOME/mlx/audio.conf"
+echo "ok   sinks and app settings are kept in audio.conf and undone"
 # A sound card (emulated, tools/fake_alsa.py: the kernel's PCM ioctls as
 # frames), busy at first as when PipeWire has it. Playback takes only
 # S32_LE, capture only 44100 Hz: the server must negotiate and convert.
