@@ -1,0 +1,695 @@
+// PulseAudio's main loop (pa_mainloop) and the interface every main loop
+// offers the library and its programs (pa_mainloop_api: a table of C
+// function pointers, 112 bytes, its userdata first): I/O events on file
+// descriptors, time events, deferred events. An iteration prepares (the
+// descriptors to watch, the time to wait), polls (through the program's
+// poll function when it set one: the threaded loop unlocks around it) and
+// dispatches: deferred events first, else what is due, then what the
+// descriptors say. Events freed meanwhile are only marked (their destroy
+// callbacks run at once) and go at the next preparation, so the poll's
+// array stays as it was while another thread holds the loop's lock.
+//
+// The loop, its events and its descriptors are C memory; the functions in
+// the table are exported, as C calls them.
+const std = @import("std")
+const turns_module = @import("std.turns")
+const c = @import("./c.mlx")
+const util = @import("./util.mlx")
+
+// pa_mainloop_api.
+pub const API: usize = 112
+const API_USERDATA: usize = 0
+const API_IO_NEW: usize = 8
+const API_IO_ENABLE: usize = 16
+const API_IO_FREE: usize = 24
+const API_IO_SET_DESTROY: usize = 32
+const API_TIME_NEW: usize = 40
+const API_TIME_RESTART: usize = 48
+const API_TIME_FREE: usize = 56
+const API_TIME_SET_DESTROY: usize = 64
+const API_DEFER_NEW: usize = 72
+const API_DEFER_ENABLE: usize = 80
+const API_DEFER_FREE: usize = 88
+const API_DEFER_SET_DESTROY: usize = 96
+const API_QUIT: usize = 104
+
+// The loop: its table first (pa_mainloop_get_api hands that out).
+const LOOP: usize = 256
+const WAKE: usize = 112
+const IO_EVENTS: usize = 120
+const TIME_EVENTS: usize = 128
+const DEFER_EVENTS: usize = 136
+const POLLFDS: usize = 144
+const POLLFD_COUNT: usize = 152
+const POLLFD_ROOM: usize = 160
+const REBUILD: usize = 168
+const STATE: usize = 172
+const QUIT: usize = 176
+const RETVAL: usize = 180
+const POLL_FUNCTION: usize = 184
+const POLL_USERDATA: usize = 192
+const TIMEOUT: usize = 200
+const POLLED: usize = 204
+const DEAD: usize = 208
+
+const STATE_PASSIVE: u32 = 0
+const STATE_PREPARED: u32 = 1
+const STATE_POLLING: u32 = 2
+const STATE_POLLED: u32 = 3
+const STATE_DISPATCHING: u32 = 4
+const STATE_QUIT: u32 = 5
+
+// An event: its loop, whether it is dead, its flags (I/O: the events
+// watched; time and deferred: enabled), the descriptor or the time, the
+// callback, its userdata, the destroy callback, the next event, and (I/O)
+// its place in the poll array, (time) the timeval handed to the callback
+// and whether it is on the monotonic clock.
+const EVENT: usize = 80
+const EVENT_LOOP: usize = 0
+const EVENT_DEAD: usize = 8
+const EVENT_FLAGS: usize = 12
+const EVENT_FD: usize = 16
+const EVENT_TIME: usize = 16
+const EVENT_CALLBACK: usize = 24
+const EVENT_USERDATA: usize = 32
+const EVENT_DESTROY: usize = 40
+const EVENT_NEXT: usize = 48
+const EVENT_SLOT: usize = 56
+const EVENT_TIMEVAL: usize = 56
+const EVENT_RTCLOCK: usize = 72
+const NO_SLOT: u64 = 18446744073709551615
+
+// pa_io_event_flags_t and poll(2)'s.
+pub const IO_INPUT: u32 = 1
+pub const IO_OUTPUT: u32 = 2
+pub const IO_HANGUP: u32 = 4
+pub const IO_ERROR: u32 = 8
+const POLLIN: u32 = 1
+const POLLOUT: u32 = 4
+const POLLERR: u32 = 8
+const POLLHUP: u32 = 16
+const POLLNVAL: u32 = 32
+
+const SYS_poll: usize = 7
+const EINTR: isize = -4
+
+// ---------------------------------------------------------------------------
+// The table's functions
+
+export fn mlx_pulse_io_new(api: usize, fd: i32, events: u32, callback: usize, userdata: usize) -> usize {
+    const loop = c.getPointer(api, API_USERDATA)
+    const event = newEvent(loop, IO_EVENTS, callback, userdata)
+    if event == 0 { return 0 }
+    c.put64(event, EVENT_FD, @intCast(u64, @bitCast(u32, fd)))
+    c.put32(event, EVENT_FLAGS, events)
+    c.put64(event, EVENT_SLOT, NO_SLOT)
+    changed(loop)
+    return event
+}
+
+export fn mlx_pulse_io_enable(event: usize, events: u32) -> void {
+    if c.get32(event, EVENT_FLAGS) == events { return }
+    c.put32(event, EVENT_FLAGS, events)
+    changed(c.getPointer(event, EVENT_LOOP))
+}
+
+export fn mlx_pulse_io_free(event: usize) -> void { kill(event) }
+
+export fn mlx_pulse_io_set_destroy(event: usize, callback: usize) -> void { c.putPointer(event, EVENT_DESTROY, callback) }
+
+export fn mlx_pulse_time_new(api: usize, time: usize, callback: usize, userdata: usize) -> usize {
+    const loop = c.getPointer(api, API_USERDATA)
+    const event = newEvent(loop, TIME_EVENTS, callback, userdata)
+    if event == 0 { return 0 }
+    restart(event, time)
+    return event
+}
+
+export fn mlx_pulse_time_restart(event: usize, time: usize) -> void { restart(event, time) }
+
+export fn mlx_pulse_time_free(event: usize) -> void { kill(event) }
+
+export fn mlx_pulse_time_set_destroy(event: usize, callback: usize) -> void { c.putPointer(event, EVENT_DESTROY, callback) }
+
+export fn mlx_pulse_defer_new(api: usize, callback: usize, userdata: usize) -> usize {
+    const loop = c.getPointer(api, API_USERDATA)
+    const event = newEvent(loop, DEFER_EVENTS, callback, userdata)
+    if event == 0 { return 0 }
+    c.put32(event, EVENT_FLAGS, 1)
+    wakeup(loop)
+    return event
+}
+
+export fn mlx_pulse_defer_enable(event: usize, enabled: i32) -> void {
+    c.put32(event, EVENT_FLAGS, if enabled != 0 { 1 } else { 0 })
+    if enabled != 0 { wakeup(c.getPointer(event, EVENT_LOOP)) }
+}
+
+export fn mlx_pulse_defer_free(event: usize) -> void { kill(event) }
+
+export fn mlx_pulse_defer_set_destroy(event: usize, callback: usize) -> void { c.putPointer(event, EVENT_DESTROY, callback) }
+
+export fn mlx_pulse_quit(api: usize, retval: i32) -> void { quit(c.getPointer(api, API_USERDATA), retval) }
+
+// Whether `api` is one of this library's loops (its time events take
+// monotonic timevals).
+pub fn ours(api: usize) -> bool { return api != 0 && c.getPointer(api, API_IO_NEW) == @intFromPtr(mlx_pulse_io_new) }
+
+// Fills a table whose functions are this loop's, for `loop`.
+pub fn fillApi(api: usize, loop: usize) -> void {
+    c.putPointer(api, API_USERDATA, loop)
+    c.putPointer(api, API_IO_NEW, @intFromPtr(mlx_pulse_io_new))
+    c.putPointer(api, API_IO_ENABLE, @intFromPtr(mlx_pulse_io_enable))
+    c.putPointer(api, API_IO_FREE, @intFromPtr(mlx_pulse_io_free))
+    c.putPointer(api, API_IO_SET_DESTROY, @intFromPtr(mlx_pulse_io_set_destroy))
+    c.putPointer(api, API_TIME_NEW, @intFromPtr(mlx_pulse_time_new))
+    c.putPointer(api, API_TIME_RESTART, @intFromPtr(mlx_pulse_time_restart))
+    c.putPointer(api, API_TIME_FREE, @intFromPtr(mlx_pulse_time_free))
+    c.putPointer(api, API_TIME_SET_DESTROY, @intFromPtr(mlx_pulse_time_set_destroy))
+    c.putPointer(api, API_DEFER_NEW, @intFromPtr(mlx_pulse_defer_new))
+    c.putPointer(api, API_DEFER_ENABLE, @intFromPtr(mlx_pulse_defer_enable))
+    c.putPointer(api, API_DEFER_FREE, @intFromPtr(mlx_pulse_defer_free))
+    c.putPointer(api, API_DEFER_SET_DESTROY, @intFromPtr(mlx_pulse_defer_set_destroy))
+    c.putPointer(api, API_QUIT, @intFromPtr(mlx_pulse_quit))
+}
+
+fn newEvent(loop: usize, list: usize, callback: usize, userdata: usize) -> usize {
+    const event = c.alloc(EVENT)
+    if event == 0 { return 0 }
+    c.putPointer(event, EVENT_LOOP, loop)
+    c.putPointer(event, EVENT_CALLBACK, callback)
+    c.putPointer(event, EVENT_USERDATA, userdata)
+    c.putPointer(event, EVENT_NEXT, c.getPointer(loop, list))
+    c.putPointer(loop, list, event)
+    return event
+}
+
+fn changed(loop: usize) -> void {
+    c.put32(loop, REBUILD, 1)
+    wakeup(loop)
+}
+
+// Marks the event dead; its destroy callback runs now, its memory goes at
+// the next preparation.
+fn kill(event: usize) -> void {
+    if c.get32(event, EVENT_DEAD) != 0 { return }
+    const loop = c.getPointer(event, EVENT_LOOP)
+    c.put32(event, EVENT_DEAD, 1)
+    c.put32(loop, DEAD, c.get32(loop, DEAD) + 1)
+    c.put32(loop, REBUILD, 1)
+    c.call3(c.getPointer(event, EVENT_DESTROY), loop, event, c.getPointer(event, EVENT_USERDATA))
+}
+
+fn restart(event: usize, time: usize) -> void {
+    if time == 0 {
+        c.put32(event, EVENT_FLAGS, 0)
+        return
+    }
+    c.put64(event, EVENT_TIME, util.monotonicOf(time))
+    c.put32(event, EVENT_RTCLOCK, if util.micro(time) & util.RTCLOCK != 0 { 1 } else { 0 })
+    c.put32(event, EVENT_FLAGS, 1)
+    wakeup(c.getPointer(event, EVENT_LOOP))
+}
+
+// ---------------------------------------------------------------------------
+// The loop
+
+pub fn new() -> usize {
+    const loop = c.alloc(LOOP)
+    if loop == 0 { return 0 }
+    const wake = c.counter()
+    if wake < 0 {
+        c.release(loop)
+        return 0
+    }
+    fillApi(loop, loop)
+    c.put64(loop, WAKE, @bitCast(u64, @intCast(i64, wake)))
+    c.put32(loop, REBUILD, 1)
+    c.put32(loop, TIMEOUT, @bitCast(u32, @intCast(i32, -1)))
+    return loop
+}
+
+fn wakeFd(loop: usize) -> isize { return @intCast(isize, @bitCast(i64, c.get64(loop, WAKE))) }
+
+pub fn wakeup(loop: usize) -> void { c.bump(wakeFd(loop)) }
+
+pub fn quit(loop: usize, retval: i32) -> void {
+    c.put32(loop, QUIT, 1)
+    c.put32(loop, RETVAL, @bitCast(u32, retval))
+    wakeup(loop)
+}
+
+// Undoes a quit (a threaded loop started again).
+pub fn resume(loop: usize) -> void { c.put32(loop, QUIT, 0) }
+
+pub fn retval(loop: usize) -> i32 { return @bitCast(i32, c.get32(loop, RETVAL)) }
+
+pub fn setPollFunction(loop: usize, function: usize, userdata: usize) -> void {
+    c.putPointer(loop, POLL_FUNCTION, function)
+    c.putPointer(loop, POLL_USERDATA, userdata)
+}
+
+fn freeList(loop: usize, list: usize, all: bool) -> void {
+    var previous: usize = 0
+    var event = c.getPointer(loop, list)
+    while event != 0 {
+        const next = c.getPointer(event, EVENT_NEXT)
+        if all || c.get32(event, EVENT_DEAD) != 0 {
+            if c.get32(event, EVENT_DEAD) == 0 { c.call3(c.getPointer(event, EVENT_DESTROY), loop, event, c.getPointer(event, EVENT_USERDATA)) }
+            if previous == 0 { c.putPointer(loop, list, next) } else { c.putPointer(previous, EVENT_NEXT, next) }
+            c.release(event)
+        } else {
+            previous = event
+        }
+        event = next
+    }
+}
+
+pub fn free(loop: usize) -> void {
+    if loop == 0 { return }
+    freeList(loop, IO_EVENTS, true)
+    freeList(loop, TIME_EVENTS, true)
+    freeList(loop, DEFER_EVENTS, true)
+    c.close(wakeFd(loop))
+    c.release(c.getPointer(loop, POLLFDS))
+    c.release(loop)
+}
+
+fn pollFlags(events: u32) -> u32 {
+    var flags: u32 = 0
+    if events & IO_INPUT != 0 { flags = flags | POLLIN }
+    if events & IO_OUTPUT != 0 { flags = flags | POLLOUT }
+    if events & IO_HANGUP != 0 { flags = flags | POLLHUP }
+    if events & IO_ERROR != 0 { flags = flags | POLLERR }
+    return flags
+}
+
+fn ioFlags(revents: u32) -> u32 {
+    var flags: u32 = 0
+    if revents & POLLIN != 0 { flags = flags | IO_INPUT }
+    if revents & POLLOUT != 0 { flags = flags | IO_OUTPUT }
+    if revents & POLLHUP != 0 { flags = flags | IO_HANGUP }
+    if revents & (POLLERR | POLLNVAL) != 0 { flags = flags | IO_ERROR }
+    return flags
+}
+
+// The poll array: the wake-up counter, then every live I/O event that
+// watches something.
+fn rebuild(loop: usize) -> void {
+    var needed: usize = 1
+    var event = c.getPointer(loop, IO_EVENTS)
+    while event != 0 {
+        needed += 1
+        event = c.getPointer(event, EVENT_NEXT)
+    }
+    if needed > c.getPointer(loop, POLLFD_ROOM) {
+        const grown = c.grow(c.getPointer(loop, POLLFDS), needed * 8 + 64)
+        if grown == 0 { return }
+        c.putPointer(loop, POLLFDS, grown)
+        c.putPointer(loop, POLLFD_ROOM, needed + 8)
+    }
+    const fds = c.getPointer(loop, POLLFDS)
+    c.put32(fds, 0, @intCast(u32, @bitCast(u64, @intCast(i64, wakeFd(loop))) & 4294967295))
+    c.put32(fds, 4, POLLIN)
+    var count: usize = 1
+    event = c.getPointer(loop, IO_EVENTS)
+    while event != 0 {
+        if c.get32(event, EVENT_DEAD) == 0 && c.get32(event, EVENT_FLAGS) != 0 {
+            c.put32(fds, count * 8, @intCast(u32, c.get64(event, EVENT_FD) & 4294967295))
+            c.put32(fds, count * 8 + 4, pollFlags(c.get32(event, EVENT_FLAGS)))
+            c.put64(event, EVENT_SLOT, @intCast(u64, count))
+            count += 1
+        } else {
+            c.put64(event, EVENT_SLOT, NO_SLOT)
+        }
+        event = c.getPointer(event, EVENT_NEXT)
+    }
+    c.putPointer(loop, POLLFD_COUNT, count)
+    c.put32(loop, REBUILD, 0)
+}
+
+fn anyDeferred(loop: usize) -> bool {
+    var event = c.getPointer(loop, DEFER_EVENTS)
+    while event != 0 {
+        if c.get32(event, EVENT_DEAD) == 0 && c.get32(event, EVENT_FLAGS) != 0 { return true }
+        event = c.getPointer(event, EVENT_NEXT)
+    }
+    return false
+}
+
+// The enabled time event due first, 0 when there is none.
+fn nextTime(loop: usize) -> usize {
+    var best: usize = 0
+    var event = c.getPointer(loop, TIME_EVENTS)
+    while event != 0 {
+        if c.get32(event, EVENT_DEAD) == 0 && c.get32(event, EVENT_FLAGS) != 0 {
+            if best == 0 || c.get64(event, EVENT_TIME) < c.get64(best, EVENT_TIME) { best = event }
+        }
+        event = c.getPointer(event, EVENT_NEXT)
+    }
+    return best
+}
+
+// pa_mainloop_prepare: `timeout` in microseconds, -1 for none.
+pub fn prepare(loop: usize, timeout: i32) -> i32 {
+    if c.get32(loop, QUIT) != 0 {
+        c.put32(loop, STATE, STATE_QUIT)
+        return -2
+    }
+    if c.get32(loop, DEAD) > 0 {
+        freeList(loop, IO_EVENTS, false)
+        freeList(loop, TIME_EVENTS, false)
+        freeList(loop, DEFER_EVENTS, false)
+        c.put32(loop, DEAD, 0)
+    }
+    if c.get32(loop, REBUILD) != 0 { rebuild(loop) }
+    var wait: u64 = util.USEC_INVALID
+    if anyDeferred(loop) {
+        wait = 0
+    } else {
+        const next = nextTime(loop)
+        if next != 0 {
+            const now = c.monotonic()
+            const due = c.get64(next, EVENT_TIME)
+            wait = if due <= now { 0 } else { due - now }
+        }
+    }
+    if timeout >= 0 && (wait == util.USEC_INVALID || @intCast(u64, timeout) < wait) { wait = @intCast(u64, timeout) }
+    var milliseconds: i32 = -1
+    if wait != util.USEC_INVALID {
+        const rounded = (wait + 999) / 1000
+        milliseconds = if rounded > 2147483647 { 2147483647 } else { @intCast(i32, rounded) }
+    }
+    c.put32(loop, TIMEOUT, @bitCast(u32, milliseconds))
+    c.put32(loop, STATE, STATE_PREPARED)
+    return 0
+}
+
+pub fn poll(loop: usize) -> i32 {
+    c.put32(loop, STATE, STATE_POLLING)
+    var result: i32 = 0
+    if !anyDeferred(loop) {
+        const fds = c.getPointer(loop, POLLFDS)
+        const count = c.getPointer(loop, POLLFD_COUNT)
+        var index: usize = 0
+        while index < count {
+            c.put32(fds, index * 8 + 4, c.get32(fds, index * 8 + 4) & 65535)
+            index += 1
+        }
+        const milliseconds = @bitCast(i32, c.get32(loop, TIMEOUT))
+        const function = c.getPointer(loop, POLL_FUNCTION)
+        if function != 0 {
+            result = c.callPoll(function, fds, count, c.int(milliseconds), c.getPointer(loop, POLL_USERDATA))
+        } else {
+            const polled = std.linux.syscall3(SYS_poll, fds, count, c.int(milliseconds))
+            result = if polled == EINTR { 0 } else { @intCast(i32, polled) }
+        }
+        if result < 0 { result = 0 }
+    }
+    c.put32(loop, POLLED, @bitCast(u32, result))
+    c.put32(loop, STATE, STATE_POLLED)
+    return result
+}
+
+fn dispatchDeferred(loop: usize) -> i32 {
+    var count: i32 = 0
+    var event = c.getPointer(loop, DEFER_EVENTS)
+    while event != 0 {
+        if c.get32(loop, QUIT) != 0 { break }
+        const next = c.getPointer(event, EVENT_NEXT)
+        if c.get32(event, EVENT_DEAD) == 0 && c.get32(event, EVENT_FLAGS) != 0 {
+            c.call3(c.getPointer(event, EVENT_CALLBACK), loop, event, c.getPointer(event, EVENT_USERDATA))
+            count += 1
+        }
+        event = next
+    }
+    return count
+}
+
+fn dispatchTimes(loop: usize) -> i32 {
+    var count: i32 = 0
+    const now = c.monotonic()
+    while c.get32(loop, QUIT) == 0 {
+        const event = nextTime(loop)
+        if event == 0 || c.get64(event, EVENT_TIME) > now { break }
+        c.put32(event, EVENT_FLAGS, 0)
+        const time = event + EVENT_TIMEVAL
+        const stored = util.storeMonotonic(time, c.get64(event, EVENT_TIME), c.get32(event, EVENT_RTCLOCK) != 0)
+        c.call4(c.getPointer(event, EVENT_CALLBACK), loop, event, time, c.getPointer(event, EVENT_USERDATA))
+        count += 1
+    }
+    return count
+}
+
+fn dispatchDescriptors(loop: usize) -> i32 {
+    const fds = c.getPointer(loop, POLLFDS)
+    if c.get32(fds, 4) >> 16 != 0 { c.drain(wakeFd(loop)) }
+    var count: i32 = 0
+    var event = c.getPointer(loop, IO_EVENTS)
+    while event != 0 {
+        if c.get32(loop, QUIT) != 0 { break }
+        const next = c.getPointer(event, EVENT_NEXT)
+        const slot = c.get64(event, EVENT_SLOT)
+        if c.get32(event, EVENT_DEAD) == 0 && slot != NO_SLOT {
+            const place = @intCast(usize, slot) * 8
+            const revents = c.get32(fds, place + 4) >> 16
+            if revents != 0 {
+                c.put32(fds, place + 4, c.get32(fds, place + 4) & 65535)
+                c.call5(c.getPointer(event, EVENT_CALLBACK), loop, event, @intCast(usize, c.get64(event, EVENT_FD)), @intCast(usize, ioFlags(revents)), c.getPointer(event, EVENT_USERDATA))
+                count += 1
+            }
+        }
+        event = next
+    }
+    return count
+}
+
+pub fn dispatch(loop: usize) -> i32 {
+    c.put32(loop, STATE, STATE_DISPATCHING)
+    var count: i32 = 0
+    if c.get32(loop, QUIT) == 0 {
+        if anyDeferred(loop) {
+            count += dispatchDeferred(loop)
+        } else {
+            count += dispatchTimes(loop)
+            if c.get32(loop, QUIT) == 0 && @bitCast(i32, c.get32(loop, POLLED)) > 0 { count += dispatchDescriptors(loop) }
+        }
+    }
+    if c.get32(loop, QUIT) != 0 {
+        c.put32(loop, STATE, STATE_QUIT)
+        return -2
+    }
+    c.put32(loop, STATE, STATE_PASSIVE)
+    return count
+}
+
+// For a loop another one polls for (the GLib loop, glib.mlx): the
+// descriptors prepare chose (pollfd structs), the time to wait (ms, -1 for
+// none), what came back, and whether anything is due without them.
+pub fn pollfds(loop: usize) -> usize { return c.getPointer(loop, POLLFDS) }
+
+pub fn pollCount(loop: usize) -> usize { return c.getPointer(loop, POLLFD_COUNT) }
+
+pub fn timeout(loop: usize) -> i32 { return @bitCast(i32, c.get32(loop, TIMEOUT)) }
+
+pub fn setPolled(loop: usize, count: i32) -> void {
+    c.put32(loop, POLLED, @bitCast(u32, count))
+    c.put32(loop, STATE, STATE_POLLED)
+}
+
+pub fn due(loop: usize) -> bool {
+    if anyDeferred(loop) { return true }
+    const next = nextTime(loop)
+    return next != 0 && c.get64(next, EVENT_TIME) <= c.monotonic()
+}
+
+// One iteration: blocking (waits for an event) or not; -2 once the loop
+// was told to quit (its value in `result`, when given).
+pub fn iterate(loop: usize, block: bool, result: usize) -> i32 {
+    var got = prepare(loop, if block { -1 } else { 0 })
+    if got >= 0 {
+        got = poll(loop)
+        if got >= 0 { got = dispatch(loop) }
+    }
+    if got == -2 && result != 0 { c.put32(result, 0, @bitCast(u32, retval(loop))) }
+    return got
+}
+
+// Iterates until told to quit: 1 then (its value in `result`), -1 on an
+// error. Each iteration's values are released (std.turns).
+pub fn run(loop: usize, result: usize) -> i32 {
+    var turns: turns_module.Turns = undefined
+    turns_module.begin(&turns, true, false)
+    var got: i32 = 0
+    while true {
+        turns_module.turn(&turns)
+        got = iterate(loop, true, result)
+        if got < 0 { break }
+    }
+    return if got == -2 { 1 } else { -1 }
+}
+
+// ---------------------------------------------------------------------------
+// Through any loop's table
+
+pub fn ioNew(api: usize, fd: i32, events: u32, callback: usize, userdata: usize) -> usize {
+    var function: c.Call5Result = undefined
+    unsafe { function = @ptrFromInt(c.Call5Result, c.getPointer(api, API_IO_NEW)) }
+    return function(api, c.int(fd), @intCast(usize, events), callback, userdata)
+}
+
+pub fn ioEnable(api: usize, event: usize, events: u32) -> void { c.call2(c.getPointer(api, API_IO_ENABLE), event, @intCast(usize, events)) }
+
+pub fn ioFree(api: usize, event: usize) -> void { c.call1(c.getPointer(api, API_IO_FREE), event) }
+
+pub fn timeNew(api: usize, time: usize, callback: usize, userdata: usize) -> usize {
+    var function: c.Call4Result = undefined
+    unsafe { function = @ptrFromInt(c.Call4Result, c.getPointer(api, API_TIME_NEW)) }
+    return function(api, time, callback, userdata)
+}
+
+pub fn timeRestart(api: usize, event: usize, time: usize) -> void { c.call2(c.getPointer(api, API_TIME_RESTART), event, time) }
+
+pub fn timeFree(api: usize, event: usize) -> void { c.call1(c.getPointer(api, API_TIME_FREE), event) }
+
+pub fn deferNew(api: usize, callback: usize, userdata: usize) -> usize {
+    var function: c.Call3Result = undefined
+    unsafe { function = @ptrFromInt(c.Call3Result, c.getPointer(api, API_DEFER_NEW)) }
+    return function(api, callback, userdata)
+}
+
+pub fn deferEnable(api: usize, event: usize, enabled: bool) -> void { c.call2(c.getPointer(api, API_DEFER_ENABLE), event, if enabled { 1 } else { 0 }) }
+
+pub fn deferFree(api: usize, event: usize) -> void { c.call1(c.getPointer(api, API_DEFER_FREE), event) }
+
+pub fn deferSetDestroy(api: usize, event: usize, callback: usize) -> void { c.call2(c.getPointer(api, API_DEFER_SET_DESTROY), event, callback) }
+
+// ---------------------------------------------------------------------------
+// pa_mainloop_api_once: `callback(api, userdata)` once, from the loop.
+
+export fn mlx_pulse_once(api: usize, event: usize, data: usize) -> void {
+    c.call2(c.getPointer(data, 0), api, c.getPointer(data, 8))
+    deferFree(api, event)
+}
+
+export fn mlx_pulse_once_done(api: usize, event: usize, data: usize) -> void { c.release(data) }
+
+pub fn once(api: usize, callback: usize, userdata: usize) -> void {
+    const data = c.alloc(16)
+    c.putPointer(data, 0, callback)
+    c.putPointer(data, 8, userdata)
+    const event = deferNew(api, @intFromPtr(mlx_pulse_once), data)
+    if event == 0 {
+        c.release(data)
+        return
+    }
+    deferSetDestroy(api, event, @intFromPtr(mlx_pulse_once_done))
+}
+
+// ---------------------------------------------------------------------------
+// Signals (pa_signal_*): handlers write the signal's number into a pipe the
+// loop watches. The process has one such set (pa_signal_init's loop), in
+// a page at a fixed address (c.anchor): the library has no globals.
+
+const ANCHOR_API: usize = 8
+const ANCHOR_READ: usize = 16
+const ANCHOR_WRITE: usize = 24
+const ANCHOR_EVENT: usize = 32
+const ANCHOR_SIGNALS: usize = 40
+
+// A signal event: its number, callback, userdata, destroy callback, the
+// next one and the handler it replaced (struct sigaction, 152 bytes).
+const SIGNAL_EVENT: usize = 192
+const SIGNAL_NUMBER: usize = 0
+const SIGNAL_CALLBACK: usize = 8
+const SIGNAL_USERDATA: usize = 16
+const SIGNAL_DESTROY: usize = 24
+const SIGNAL_NEXT: usize = 32
+const SIGNAL_PREVIOUS: usize = 40
+
+const SIGACTION: usize = 152
+const SA_RESTART: u32 = 268435456
+
+extern("c") fn sigaction(number: i32, action: usize, previous: usize) -> i32
+
+export fn mlx_pulse_signal_handler(number: i32) -> void {
+    const anchor = c.anchor(false)
+    if anchor == 0 { return }
+    var value: u32 = @bitCast(u32, number)
+    const written = std.linux.syscall3(1, c.getPointer(anchor, ANCHOR_WRITE), @intFromPtr(&value), 4)
+}
+
+export fn mlx_pulse_signal_readable(api: usize, event: usize, fd: i32, flags: u32, anchor: usize) -> void {
+    var value: u32 = 0
+    while std.linux.syscall3(0, @intCast(usize, @bitCast(u32, fd)), @intFromPtr(&value), 4) == 4 {
+        var signal = c.getPointer(anchor, ANCHOR_SIGNALS)
+        while signal != 0 {
+            const next = c.getPointer(signal, SIGNAL_NEXT)
+            if c.get32(signal, SIGNAL_NUMBER) == value { c.call4(c.getPointer(signal, SIGNAL_CALLBACK), api, signal, @intCast(usize, value), c.getPointer(signal, SIGNAL_USERDATA)) }
+            signal = next
+        }
+    }
+}
+
+pub fn signalInit(api: usize) -> i32 {
+    const anchor = c.anchor(true)
+    if anchor == 0 || c.getPointer(anchor, ANCHOR_API) != 0 { return -1 }
+    var ends: [2]i32 = [2]i32{ -1, -1 }
+    // O_CLOEXEC | O_NONBLOCK
+    if std.linux.syscall2(293, @intFromPtr(&ends), 526336) != 0 { return -1 }
+    c.putPointer(anchor, ANCHOR_API, api)
+    c.putPointer(anchor, ANCHOR_READ, @intCast(usize, @bitCast(u32, ends[0])))
+    c.putPointer(anchor, ANCHOR_WRITE, @intCast(usize, @bitCast(u32, ends[1])))
+    c.putPointer(anchor, ANCHOR_EVENT, ioNew(api, ends[0], IO_INPUT, @intFromPtr(mlx_pulse_signal_readable), anchor))
+    return 0
+}
+
+pub fn signalDone() -> void {
+    const anchor = c.anchor(false)
+    if anchor == 0 || c.getPointer(anchor, ANCHOR_API) == 0 { return }
+    while c.getPointer(anchor, ANCHOR_SIGNALS) != 0 { signalFree(c.getPointer(anchor, ANCHOR_SIGNALS)) }
+    ioFree(c.getPointer(anchor, ANCHOR_API), c.getPointer(anchor, ANCHOR_EVENT))
+    c.close(@intCast(isize, c.getPointer(anchor, ANCHOR_READ)))
+    c.close(@intCast(isize, c.getPointer(anchor, ANCHOR_WRITE)))
+    c.putPointer(anchor, ANCHOR_API, 0)
+}
+
+pub fn signalNew(number: i32, callback: usize, userdata: usize) -> usize {
+    const anchor = c.anchor(false)
+    if anchor == 0 || c.getPointer(anchor, ANCHOR_API) == 0 { return 0 }
+    const signal = c.alloc(SIGNAL_EVENT)
+    if signal == 0 { return 0 }
+    c.put32(signal, SIGNAL_NUMBER, @bitCast(u32, number))
+    c.putPointer(signal, SIGNAL_CALLBACK, callback)
+    c.putPointer(signal, SIGNAL_USERDATA, userdata)
+    const action = c.alloc(SIGACTION)
+    c.putPointer(action, 0, @intFromPtr(mlx_pulse_signal_handler))
+    c.put32(action, 136, SA_RESTART)
+    const installed = sigaction(number, action, signal + SIGNAL_PREVIOUS)
+    c.release(action)
+    if installed != 0 {
+        c.release(signal)
+        return 0
+    }
+    c.putPointer(signal, SIGNAL_NEXT, c.getPointer(anchor, ANCHOR_SIGNALS))
+    c.putPointer(anchor, ANCHOR_SIGNALS, signal)
+    return signal
+}
+
+pub fn signalSetDestroy(signal: usize, callback: usize) -> void { c.putPointer(signal, SIGNAL_DESTROY, callback) }
+
+pub fn signalFree(signal: usize) -> void {
+    const anchor = c.anchor(false)
+    if anchor == 0 { return }
+    var previous: usize = 0
+    var current = c.getPointer(anchor, ANCHOR_SIGNALS)
+    while current != 0 && current != signal {
+        previous = current
+        current = c.getPointer(current, SIGNAL_NEXT)
+    }
+    if current == 0 { return }
+    if previous == 0 { c.putPointer(anchor, ANCHOR_SIGNALS, c.getPointer(signal, SIGNAL_NEXT)) } else { c.putPointer(previous, SIGNAL_NEXT, c.getPointer(signal, SIGNAL_NEXT)) }
+    const restored = sigaction(@bitCast(i32, c.get32(signal, SIGNAL_NUMBER)), signal + SIGNAL_PREVIOUS, 0)
+    c.call3(c.getPointer(signal, SIGNAL_DESTROY), c.getPointer(anchor, ANCHOR_API), signal, c.getPointer(signal, SIGNAL_USERDATA))
+    c.release(signal)
+}

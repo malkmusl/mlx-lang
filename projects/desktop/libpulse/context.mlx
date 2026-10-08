@@ -1,0 +1,568 @@
+// pa_context: the connection to the server. Connecting finds the socket
+// ($PULSE_SERVER's unix: entries, else $XDG_RUNTIME_DIR/pulse/native, where
+// mlx-audiod listens), then from the loop: AUTH (protocol 35, the cookie,
+// no shared memory: samples travel in the packets), SET_CLIENT_NAME with
+// the program's properties, READY. Packets that come in are replies (to
+// the request awaiting their tag), the server's commands (requests for
+// samples, stream and subscription events) or recorded samples.
+const std = @import("std")
+const c = @import("./c.mlx")
+const core = @import("./core.mlx")
+const wire = @import("./wire.mlx")
+const util = @import("./util.mlx")
+const mainloop = @import("./mainloop.mlx")
+const proplist = @import("./proplist.mlx")
+const sample = @import("./sample.mlx")
+const stream = @import("./stream.mlx")
+const introspect = @import("./introspect.mlx")
+
+pub const PROTOCOL_VERSION: u32 = 35
+
+// pa_context_flags_t.
+const NOAUTOSPAWN: u32 = 1
+const NOFAIL: u32 = 2
+
+// Commands.
+const ERROR: u32 = 0
+const TIMEOUT: u32 = 1
+const REPLY: u32 = 2
+const EXIT: u32 = 7
+const AUTH: u32 = 8
+const SET_CLIENT_NAME: u32 = 9
+const SUBSCRIBE: u32 = 35
+const SET_DEFAULT_SINK: u32 = 44
+const SET_DEFAULT_SOURCE: u32 = 45
+const SUBSCRIBE_EVENT: u32 = 66
+const UPDATE_CLIENT_PROPLIST: u32 = 82
+const REMOVE_CLIENT_PROPLIST: u32 = 85
+const CLIENT_EVENT: u32 = 91
+
+// The largest payload accepted.
+const PACKET_MAX: u32 = 16777216
+
+// ---------------------------------------------------------------------------
+// Creating
+
+pub fn new(api: usize, name: usize, properties: usize) -> usize {
+    const context = c.alloc(core.CONTEXT)
+    if context == 0 { return 0 }
+    c.put32(context, core.C_REFS, 1)
+    c.putPointer(context, core.C_API, api)
+    c.put64(context, core.C_FD, @bitCast(u64, @intCast(i64, -1)))
+    c.put32(context, core.C_RTCLOCK, if mainloop.ours(api) { 1 } else { 0 })
+    const list = if properties != 0 { proplist.copy(properties) } else { proplist.new() }
+    c.putPointer(context, core.C_PROPLIST, list)
+    if name != 0 { const set = proplist.setString(list, "application.name", c.slice(name)) }
+    return context
+}
+
+// The properties PulseAudio sends for every program (pa_init_proplist),
+// where the program did not set them, and $PULSE_PROP's.
+fn initProperties(list: usize) -> void {
+    var buffer: [256]u8 = undefined
+    const at = @intFromPtr(&buffer)
+    const extra = c.environment("PULSE_PROP")
+    if extra.length > 0 {
+        const parsed = proplist.fromString(extra)
+        if parsed != 0 {
+            proplist.update(list, proplist.UPDATE_MERGE, parsed)
+            proplist.free(parsed)
+        }
+    }
+    if !proplist.contains(list, "application.process.id") {
+        var writing = util.text()
+        util.addNumber(&writing, @intCast(u64, std.linux.syscall0(39)))
+        const text = util.finish(&writing)
+        const set = proplist.setString(list, "application.process.id", c.slice(text))
+        c.release(text)
+    }
+    if !proplist.contains(list, "application.process.user") && util.userName(at, 256) != 0 { const set = proplist.setString(list, "application.process.user", c.slice(at)) }
+    if !proplist.contains(list, "application.process.host") && util.hostName(at, 256) != 0 { const set = proplist.setString(list, "application.process.host", c.slice(at)) }
+    if !proplist.contains(list, "application.process.binary") && util.binaryName(at, 256) != 0 { const set = proplist.setString(list, "application.process.binary", c.slice(at)) }
+    if !proplist.contains(list, "application.name") && util.binaryName(at, 256) != 0 { const set = proplist.setString(list, "application.name", c.slice(at)) }
+    if !proplist.contains(list, "application.language") {
+        var language = c.environment("LC_ALL")
+        if language.length == 0 { language = c.environment("LC_MESSAGES") }
+        if language.length == 0 { language = c.environment("LANG") }
+        if language.length == 0 { language = "C" }
+        const set = proplist.setString(list, "application.language", language)
+    }
+    const display = c.environment("DISPLAY")
+    if display.length > 0 && !proplist.contains(list, "window.x11.display") { const set = proplist.setString(list, "window.x11.display", display) }
+    const override = c.environment("PULSE_PROP_OVERRIDE")
+    if override.length > 0 {
+        const parsed = proplist.fromString(override)
+        if parsed != 0 {
+            proplist.update(list, proplist.UPDATE_REPLACE, parsed)
+            proplist.free(parsed)
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Connecting
+
+const SYS_socket: usize = 41
+const SYS_connect: usize = 42
+const SYS_recvfrom: usize = 45
+const SYS_fcntl: usize = 72
+const AF_UNIX: usize = 1
+// SOCK_STREAM | SOCK_CLOEXEC
+const SOCK_STREAM_CLOEXEC: usize = 524289
+const EAGAIN: isize = -11
+
+// A connected socket to the Unix socket at `path`, -1 when none.
+fn connectTo(path: []const u8) -> i64 {
+    if path.length == 0 || path.length > 107 { return -1 }
+    const fd = std.linux.syscall3(SYS_socket, AF_UNIX, SOCK_STREAM_CLOEXEC, 0)
+    if fd < 0 { return -1 }
+    var address: [110]u8 = undefined
+    address[0] = 1
+    address[1] = 0
+    var index: usize = 0
+    while index < path.length {
+        address[2 + index] = path[index]
+        index += 1
+    }
+    address[2 + path.length] = 0
+    if std.linux.syscall3(SYS_connect, @bitCast(usize, fd), @intFromPtr(&address), 2 + path.length + 1) != 0 {
+        c.close(fd)
+        return -1
+    }
+    // O_NONBLOCK
+    const flags = std.linux.syscall3(SYS_fcntl, @bitCast(usize, fd), 3, 0)
+    const set = std.linux.syscall3(SYS_fcntl, @bitCast(usize, fd), 4, @bitCast(usize, flags) | 2048)
+    return @intCast(i64, fd)
+}
+
+// The servers to try, as one text of paths separated by NULs... tried in
+// order: `server` (or $PULSE_SERVER): its unix: entries and paths; else
+// the runtime directory's socket.
+fn tryServers(context: usize, given: []const u8) -> bool {
+    var list = given
+    if list.length == 0 { list = c.environment("PULSE_SERVER") }
+    var at: usize = 0
+    while at < list.length {
+        while at < list.length && (list[at] == 32 || list[at] == 9) { at += 1 }
+        const start = at
+        while at < list.length && list[at] != 32 && list[at] != 9 { at += 1 }
+        var entry = list[start..at]
+        // "{machine id}" prefixes say which machine the entry is for.
+        if entry.length > 0 && entry[0] == 123 {
+            var close: usize = 0
+            while close < entry.length && entry[close] != 125 { close += 1 }
+            entry = if close < entry.length { entry[close + 1..entry.length] } else { "" }
+        }
+        if c.startsWith(entry, "unix:") { entry = entry[5..entry.length] }
+        if entry.length > 0 && entry[0] == 47 {
+            if attach(context, entry, connectTo(entry)) { return true }
+        }
+    }
+    if list.length > 0 { return false }
+    const runtime = c.environment("XDG_RUNTIME_DIR")
+    if runtime.length > 0 {
+        var path: [256]u8 = undefined
+        var writing = c.out(@intFromPtr(&path), 256)
+        c.append(&writing, runtime)
+        c.append(&writing, "/pulse/native")
+        const full = c.slice(@intFromPtr(&path))
+        if attach(context, full, connectTo(full)) { return true }
+    }
+    return false
+}
+
+export fn mlx_pulse_context_setup(api: usize, event: usize, context: usize) -> void {
+    mainloop.deferFree(api, event)
+    c.putPointer(context, core.C_SETUP, 0)
+    if core.state(context) != core.CONNECTING { return }
+    core.ref(context)
+    const tag = core.nextTag(context)
+    var writing = wire.command(AUTH, tag)
+    wire.putU32(&writing, PROTOCOL_VERSION)
+    var cookie: [256]u8 = undefined
+    readCookie(context, @intFromPtr(&cookie))
+    wire.putArbitrary(&writing, @intFromPtr(&cookie), 256)
+    core.send(context, &writing)
+    core.expectReply(context, tag, core.R_SETUP, context, 0)
+    core.setState(context, core.AUTHORIZING)
+    core.unref(context)
+}
+
+fn attach(context: usize, path: []const u8, fd: i64) -> bool {
+    if fd < 0 { return false }
+    c.put64(context, core.C_FD, @bitCast(u64, fd))
+    // (`path` may lie in the old name: copied before that goes.)
+    var writing = util.text()
+    util.add(&writing, path)
+    c.release(c.getPointer(context, core.C_SERVER))
+    c.putPointer(context, core.C_SERVER, util.finish(&writing))
+    c.put32(context, core.C_LOCAL, 1)
+    const api = core.api(context)
+    c.putPointer(context, core.C_IO, mainloop.ioNew(api, @intCast(i32, fd), mainloop.IO_INPUT, @intFromPtr(mlx_pulse_context_io), context))
+    c.putPointer(context, core.C_SETUP, mainloop.deferNew(api, @intFromPtr(mlx_pulse_context_setup), context))
+    return true
+}
+
+// The cookie (256 bytes): $PULSE_COOKIE's file, the program's, the
+// user's; zeros when there is none (MLX Audio does not ask for one).
+fn readCookie(context: usize, cookie: usize) -> void {
+    c.zero(cookie, 256)
+    var path: [512]u8 = undefined
+    const at = @intFromPtr(&path)
+    var writing = c.out(at, 512)
+    const given = c.getPointer(context, core.C_COOKIE)
+    if given != 0 {
+        c.append(&writing, c.slice(given))
+    } else if c.environment("PULSE_COOKIE").length > 0 {
+        c.append(&writing, c.environment("PULSE_COOKIE"))
+    } else if c.environment("XDG_CONFIG_HOME").length > 0 {
+        c.append(&writing, c.environment("XDG_CONFIG_HOME"))
+        c.append(&writing, "/pulse/cookie")
+    } else {
+        c.append(&writing, c.environment("HOME"))
+        c.append(&writing, "/.config/pulse/cookie")
+    }
+    const file = std.linux.syscall3(2, at, 524288, 0)
+    if file < 0 { return }
+    const got = std.linux.syscall3(0, @bitCast(usize, file), cookie, 256)
+    c.close(file)
+}
+
+export fn mlx_pulse_context_retry(api: usize, event: usize, time: usize, context: usize) -> void {
+    if core.state(context) != core.CONNECTING || @bitCast(i64, c.get64(context, core.C_FD)) >= 0 { return }
+    if tryServers(context, c.slice(c.getPointer(context, core.C_SERVER))) {
+        mainloop.timeFree(api, event)
+        c.putPointer(context, core.C_RETRY, 0)
+        return
+    }
+    core.timeRestart(context, event, c.monotonic() + 1000000)
+}
+
+pub fn connect(context: usize, server: usize, flags: u32) -> i32 {
+    if core.state(context) != core.UNCONNECTED { return core.fail(context, util.ERR_BADSTATE) }
+    if flags & ~(NOAUTOSPAWN | NOFAIL) != 0 { return core.fail(context, util.ERR_INVALID) }
+    c.put32(context, core.C_FLAGS, flags)
+    core.ref(context)
+    initProperties(c.getPointer(context, core.C_PROPLIST))
+    core.setState(context, core.CONNECTING)
+    var result: i32 = 0
+    if !tryServers(context, c.slice(server)) {
+        if flags & NOFAIL != 0 {
+            // Waits for a server to appear.
+            if server != 0 { c.putPointer(context, core.C_SERVER, c.duplicateC(server)) }
+            c.putPointer(context, core.C_RETRY, core.timeNew(context, c.monotonic() + 1000000, @intFromPtr(mlx_pulse_context_retry), context))
+        } else {
+            core.failWith(context, util.ERR_CONNECTIONREFUSED)
+            result = -1
+        }
+    }
+    core.unref(context)
+    return result
+}
+
+pub fn disconnect(context: usize) -> void {
+    if core.good(core.state(context)) { core.setState(context, core.TERMINATED) }
+}
+
+// ---------------------------------------------------------------------------
+// Receiving
+
+export fn mlx_pulse_context_io(api: usize, event: usize, fd: i32, flags: u32, context: usize) -> void {
+    core.ref(context)
+    if flags & mainloop.IO_OUTPUT != 0 { core.flush(context) }
+    if flags & mainloop.IO_INPUT != 0 { receive(context) }
+    if core.good(core.state(context)) {
+        if c.get32(context, core.C_BROKEN) != 0 || (flags & (mainloop.IO_HANGUP | mainloop.IO_ERROR) != 0 && flags & mainloop.IO_INPUT == 0) { core.failWith(context, util.ERR_CONNECTIONTERMINATED) }
+    }
+    core.unref(context)
+}
+
+fn receive(context: usize) -> void {
+    while core.good(core.state(context)) {
+        const fd = @bitCast(i64, c.get64(context, core.C_FD))
+        if fd < 0 { return }
+        var have = c.getPointer(context, core.C_RECEIVE_HAVE)
+        if have + 65536 > c.getPointer(context, core.C_RECEIVE_ROOM) {
+            var room = c.getPointer(context, core.C_RECEIVE_ROOM) * 2
+            if room < 131072 { room = 131072 }
+            const grown = c.grow(c.getPointer(context, core.C_RECEIVE), room)
+            if grown == 0 { return }
+            c.putPointer(context, core.C_RECEIVE, grown)
+            c.putPointer(context, core.C_RECEIVE_ROOM, room)
+        }
+        const buffer = c.getPointer(context, core.C_RECEIVE)
+        // MSG_DONTWAIT
+        const got = std.linux.syscall6(SYS_recvfrom, @intCast(usize, fd), buffer + have, c.getPointer(context, core.C_RECEIVE_ROOM) - have, 64, 0, 0)
+        if got == EAGAIN { return }
+        if got <= 0 {
+            core.failWith(context, util.ERR_CONNECTIONTERMINATED)
+            return
+        }
+        have += @bitCast(usize, got)
+        c.putPointer(context, core.C_RECEIVE_HAVE, have)
+        packets(context)
+    }
+}
+
+// Handles the complete packets received, keeps the rest.
+fn packets(context: usize) -> void {
+    var at: usize = 0
+    while core.good(core.state(context)) {
+        const buffer = c.getPointer(context, core.C_RECEIVE)
+        const have = c.getPointer(context, core.C_RECEIVE_HAVE)
+        if have - at < wire.DESCRIPTOR { break }
+        const length = wire.load32(buffer, at)
+        if length > PACKET_MAX {
+            core.failWith(context, util.ERR_PROTOCOL)
+            return
+        }
+        const total = wire.DESCRIPTOR + @intCast(usize, length)
+        if have - at < total { break }
+        const channel = wire.load32(buffer, at + 4)
+        // Handled from a copy: callbacks may receive more.
+        const payload = c.alloc(@intCast(usize, length) + 1)
+        c.copy(payload, buffer + at + wire.DESCRIPTOR, @intCast(usize, length))
+        at += total
+        if channel == wire.CONTROL {
+            dispatch(context, payload, @intCast(usize, length))
+        } else {
+            stream.received(context, channel, payload, @intCast(usize, length))
+        }
+        c.release(payload)
+    }
+    // (A callback may have ended the connection: nothing is kept then.)
+    const buffer = c.getPointer(context, core.C_RECEIVE)
+    const have = c.getPointer(context, core.C_RECEIVE_HAVE)
+    if at > 0 && buffer != 0 && have >= at {
+        c.copy(buffer, buffer + at, have - at)
+        c.putPointer(context, core.C_RECEIVE_HAVE, have - at)
+    }
+}
+
+fn dispatch(context: usize, payload: usize, length: usize) -> void {
+    var reading = wire.reader(payload, length)
+    const code = wire.readU32(&reading)
+    const tag = wire.readU32(&reading)
+    if reading.failed {
+        core.failWith(context, util.ERR_PROTOCOL)
+        return
+    }
+    if code == REPLY || code == ERROR || code == TIMEOUT {
+        const entry = core.takeReply(context, tag)
+        if entry == 0 { return }
+        const kind = c.get32(entry, core.P_KIND)
+        if kind == core.R_SETUP {
+            setupReply(context, code, &reading)
+        } else if kind < core.R_CONTEXT_ACK {
+            stream.reply(context, entry, code, &reading)
+        } else {
+            introspect.reply(context, entry, code, &reading)
+        }
+        core.dropPending(entry)
+        checkDrain(context)
+        return
+    }
+    if code == SUBSCRIBE_EVENT {
+        const event = wire.readU32(&reading)
+        const index = wire.readU32(&reading)
+        if reading.failed {
+            core.failWith(context, util.ERR_PROTOCOL)
+            return
+        }
+        c.call4(c.getPointer(context, core.C_SUBSCRIBE_CALLBACK), context, @intCast(usize, event), @intCast(usize, index), c.getPointer(context, core.C_SUBSCRIBE_USERDATA))
+        return
+    }
+    if code == CLIENT_EVENT {
+        const name = wire.readString(&reading)
+        const list = proplist.new()
+        wire.readProplist(&reading, list)
+        if reading.failed || name == 0 {
+            proplist.free(list)
+            core.failWith(context, util.ERR_PROTOCOL)
+            return
+        }
+        c.call4(c.getPointer(context, core.C_EVENT_CALLBACK), context, name, list, c.getPointer(context, core.C_EVENT_USERDATA))
+        proplist.free(list)
+        return
+    }
+    stream.command(context, code, &reading)
+}
+
+fn setupReply(context: usize, code: u32, reading: *wire.Reader) -> void {
+    if code != REPLY {
+        if core.handleError(context, code, reading) == 0 { core.failWith(context, @bitCast(i32, c.get32(context, core.C_ERROR))) }
+        return
+    }
+    if core.state(context) == core.AUTHORIZING {
+        var server_version = wire.readU32(reading)
+        if reading.*.failed {
+            core.failWith(context, util.ERR_PROTOCOL)
+            return
+        }
+        if (server_version & 65535) >= 13 { server_version = server_version & 65535 }
+        if server_version < 8 {
+            core.failWith(context, util.ERR_VERSION)
+            return
+        }
+        c.put32(context, core.C_VERSION, server_version)
+        const tag = core.nextTag(context)
+        var writing = wire.command(SET_CLIENT_NAME, tag)
+        if server_version >= 13 {
+            wire.putProplist(&writing, c.getPointer(context, core.C_PROPLIST))
+        } else {
+            wire.putCString(&writing, proplist.getString(c.getPointer(context, core.C_PROPLIST), "application.name"))
+        }
+        core.send(context, &writing)
+        core.expectReply(context, tag, core.R_SETUP, context, 0)
+        core.setState(context, core.SETTING_NAME)
+        return
+    }
+    if core.state(context) == core.SETTING_NAME {
+        if core.version(context) >= 13 {
+            const index = wire.readU32(reading)
+            if reading.*.failed || index == wire.INVALID {
+                core.failWith(context, util.ERR_PROTOCOL)
+                return
+            }
+            c.put32(context, core.C_CLIENT, index)
+        }
+        core.setState(context, core.READY)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The context's requests
+
+pub fn isPending(context: usize) -> i32 {
+    if !core.good(core.state(context)) { return core.fail(context, util.ERR_BADSTATE) }
+    return if core.awaiting(context) || core.pendingOutput(context) || c.getPointer(context, core.C_SETUP) != 0 { 1 } else { 0 }
+}
+
+fn checkDrain(context: usize) -> void {
+    const operation = c.getPointer(context, core.C_DRAIN)
+    if operation == 0 || core.awaiting(context) || core.pendingOutput(context) { return }
+    c.putPointer(context, core.C_DRAIN, 0)
+    c.call2(c.getPointer(operation, core.O_CALLBACK), context, c.getPointer(operation, core.O_USERDATA))
+    core.done(operation)
+    core.operationUnref(operation)
+}
+
+pub fn drain(context: usize, callback: usize, userdata: usize) -> usize {
+    if core.state(context) != core.READY {
+        const failed = core.fail(context, util.ERR_BADSTATE)
+        return 0
+    }
+    if !core.awaiting(context) && !core.pendingOutput(context) {
+        const failed = core.fail(context, util.ERR_BADSTATE)
+        return 0
+    }
+    const operation = core.operationNew(context, 0, callback, userdata)
+    if c.getPointer(context, core.C_DRAIN) != 0 {
+        // One drain at a time: the older one is cancelled.
+        const older = c.getPointer(context, core.C_DRAIN)
+        core.cancel(older)
+        core.operationUnref(older)
+    }
+    core.operationRef(operation)
+    c.putPointer(context, core.C_DRAIN, operation)
+    return operation
+}
+
+fn ready(context: usize) -> bool {
+    if core.state(context) == core.READY { return true }
+    const failed = core.fail(context, util.ERR_BADSTATE)
+    return false
+}
+
+pub fn exitDaemon(context: usize, callback: usize, userdata: usize) -> usize {
+    if !ready(context) { return 0 }
+    const tag = core.nextTag(context)
+    var writing = wire.command(EXIT, tag)
+    return core.simple(context, &writing, tag, core.R_CONTEXT_ACK, callback, userdata)
+}
+
+pub fn setDefault(context: usize, sink: bool, name: usize, callback: usize, userdata: usize) -> usize {
+    if !ready(context) { return 0 }
+    const tag = core.nextTag(context)
+    var writing = wire.command(if sink { SET_DEFAULT_SINK } else { SET_DEFAULT_SOURCE }, tag)
+    wire.putCString(&writing, name)
+    return core.simple(context, &writing, tag, core.R_CONTEXT_ACK, callback, userdata)
+}
+
+pub fn subscribe(context: usize, mask: u32, callback: usize, userdata: usize) -> usize {
+    if !ready(context) { return 0 }
+    const tag = core.nextTag(context)
+    var writing = wire.command(SUBSCRIBE, tag)
+    wire.putU32(&writing, mask)
+    return core.simple(context, &writing, tag, core.R_CONTEXT_ACK, callback, userdata)
+}
+
+pub fn proplistUpdate(context: usize, mode: u32, list: usize, callback: usize, userdata: usize) -> usize {
+    if !ready(context) { return 0 }
+    if mode > proplist.UPDATE_REPLACE {
+        const failed = core.fail(context, util.ERR_INVALID)
+        return 0
+    }
+    const tag = core.nextTag(context)
+    var writing = wire.command(UPDATE_CLIENT_PROPLIST, tag)
+    wire.putU32(&writing, mode)
+    wire.putProplist(&writing, list)
+    return core.simple(context, &writing, tag, core.R_CONTEXT_ACK, callback, userdata)
+}
+
+pub fn proplistRemove(context: usize, keys: usize, callback: usize, userdata: usize) -> usize {
+    if !ready(context) { return 0 }
+    if keys == 0 || c.getPointer(keys, 0) == 0 {
+        const failed = core.fail(context, util.ERR_INVALID)
+        return 0
+    }
+    const tag = core.nextTag(context)
+    var writing = wire.command(REMOVE_CLIENT_PROPLIST, tag)
+    var index: usize = 0
+    while c.getPointer(keys, index * 8) != 0 {
+        wire.putCString(&writing, c.getPointer(keys, index * 8))
+        index += 1
+    }
+    wire.putCString(&writing, 0)
+    return core.simple(context, &writing, tag, core.R_CONTEXT_ACK, callback, userdata)
+}
+
+pub fn setName(context: usize, name: usize, callback: usize, userdata: usize) -> usize {
+    if !ready(context) { return 0 }
+    const list = proplist.new()
+    const set = proplist.setString(list, "application.name", c.slice(name))
+    const operation = proplistUpdate(context, proplist.UPDATE_REPLACE, list, callback, userdata)
+    proplist.free(list)
+    return operation
+}
+
+// The server's name (its socket's path), 0 when not connected.
+pub fn server(context: usize) -> usize {
+    const name = c.getPointer(context, core.C_SERVER)
+    if name == 0 {
+        const failed = core.fail(context, util.ERR_NOENTITY)
+        return 0
+    }
+    return name
+}
+
+pub fn tileSize(context: usize, spec: usize) -> usize {
+    var frame: usize = 1
+    if spec != 0 {
+        const given = sample.read(spec)
+        if !sample.valid(given) {
+            const failed = core.fail(context, util.ERR_INVALID)
+            return 18446744073709551615
+        }
+        frame = sample.frameSize(given)
+    }
+    const most = 65472 / frame * frame
+    return if most > frame { most } else { frame }
+}
+
+pub fn loadCookie(context: usize, path: usize) -> i32 {
+    if core.state(context) != core.UNCONNECTED { return core.fail(context, util.ERR_BADSTATE) }
+    c.release(c.getPointer(context, core.C_COOKIE))
+    c.putPointer(context, core.C_COOKIE, c.duplicateC(path))
+    return 0
+}

@@ -11,8 +11,8 @@
 # lacks what they added since (it cannot write --shared objects, or writes
 # no symbol table, or knows no `_ = value`, or loses a slice's length when
 # it is assigned again, or stores a match's arms at their own widths, or
-# loads a signed if/match result unsigned), it builds them twice (mlx4 ->
-# new mlx -> mlx4 again).
+# loads a signed if/match result unsigned, or knows no --symbol-version),
+# it builds them twice (mlx4 -> new mlx -> mlx4 again).
 # Messages go to stderr.
 #
 #   compiler=$(tools/ensure_compiler.sh)
@@ -117,6 +117,20 @@ extends_signed_results() {
     return $ok
 }
 
+# Whether $1 gives a plugin a soname and its exports a symbol version
+# (--soname, --symbol-version; projects/desktop/libpulse needs them).
+writes_symbol_versions() {
+    local probe
+    probe=$(mktemp -d)
+    local ok=1
+    if "$1" --quiet --plugin --soname=libmlxprobe.so.1 --symbol-version=MLXPROBE_1 tests/support/plugin_library.mlx -o "$probe/probe.so" > /dev/null 2>&1 \
+        && grep -qa MLXPROBE_1 "$probe/probe.so" && grep -qa libmlxprobe.so.1 "$probe/probe.so"; then
+        ok=0
+    fi
+    rm -rf -- "$probe"
+    return $ok
+}
+
 # Whether $1 keeps a slice's length when it is assigned again, stored in a
 # field or held in an optional (tests/274_slice_assignment_runtime.mlx
 # exits 13); older compilers stored the pointer only.
@@ -147,8 +161,8 @@ if [[ ! -x mlx-out/bin/compiler/mlx4 ]]; then
     zig-out/bin/mlx1 --quiet compiler/selfhost/main.mlx -o mlx-out/bin/compiler/mlx2
     mlx-out/bin/compiler/mlx2 --quiet compiler/selfhost/main.mlx -o mlx-out/bin/compiler/mlx3
     cp mlx-out/bin/compiler/mlx3 mlx-out/bin/compiler/mlx4
-elif ! writes_shared_objects mlx-out/bin/compiler/mlx4 || ! writes_symbol_tables mlx-out/bin/compiler/mlx4 || ! accepts_discards mlx-out/bin/compiler/mlx4 || ! keeps_slice_lengths mlx-out/bin/compiler/mlx4 || ! orders_import_cycles mlx-out/bin/compiler/mlx4 || ! has_large_arena mlx-out/bin/compiler/mlx4 || ! keeps_match_widths mlx-out/bin/compiler/mlx4 || ! extends_signed_results mlx-out/bin/compiler/mlx4; then
-    echo "rebuilding mlx-out/bin/compiler/mlx4 from the current compiler sources (it lacks --shared objects, symbol tables, \`_ = value\`, slice lengths kept on assignment, import cycles broken in order, the 1 GiB arena, match values stored at their width or signed results sign-extended)" >&2
+elif ! writes_shared_objects mlx-out/bin/compiler/mlx4 || ! writes_symbol_tables mlx-out/bin/compiler/mlx4 || ! accepts_discards mlx-out/bin/compiler/mlx4 || ! keeps_slice_lengths mlx-out/bin/compiler/mlx4 || ! orders_import_cycles mlx-out/bin/compiler/mlx4 || ! has_large_arena mlx-out/bin/compiler/mlx4 || ! keeps_match_widths mlx-out/bin/compiler/mlx4 || ! extends_signed_results mlx-out/bin/compiler/mlx4 || ! writes_symbol_versions mlx-out/bin/compiler/mlx4; then
+    echo "rebuilding mlx-out/bin/compiler/mlx4 from the current compiler sources (it lacks --shared objects, symbol tables, \`_ = value\`, slice lengths kept on assignment, import cycles broken in order, the 1 GiB arena, match values stored at their width, signed results sign-extended or symbol versions)" >&2
     mlx-out/bin/compiler/mlx4 --quiet compiler/selfhost/main.mlx -o mlx-out/bin/compiler/mlx4.next
     mlx-out/bin/compiler/mlx4.next --quiet compiler/selfhost/main.mlx -o mlx-out/bin/compiler/mlx4.fixed
     mv mlx-out/bin/compiler/mlx4.fixed mlx-out/bin/compiler/mlx4

@@ -112,6 +112,45 @@ else
     failures=$((failures + 1))
 fi
 
+# A plugin with a soname and a symbol version (--soname, --symbol-version):
+# what a library standing in for another needs (projects/desktop/libpulse,
+# libpulse.so.0 with PULSE_0), since glibc's loader insists that a program
+# linked against a versioned library find that version. The host asks for
+# the export at its version (dlvsym).
+if ! command -v python3 > /dev/null; then
+    echo "skip --symbol-version (no python3)"
+elif "$compiler" --quiet --plugin --soname=libmlxprobe.so.1 --symbol-version=MLXPROBE_1 tests/support/plugin_library.mlx -o "$work/libmlxprobe.so.1" 2> "$work/errors"; then
+    if python3 - "$work/libmlxprobe.so.1" > "$work/output" 2>&1 <<'PY'
+import ctypes, sys
+library = ctypes.CDLL(sys.argv[1])
+libc = ctypes.CDLL(None)
+libc.dlvsym.restype = ctypes.c_void_p
+libc.dlvsym.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p]
+address = libc.dlvsym(library._handle, b"mlx_plugin_twice", b"MLXPROBE_1")
+assert address, "no mlx_plugin_twice@MLXPROBE_1"
+assert not libc.dlvsym(library._handle, b"mlx_plugin_twice", b"OTHER_1"), "found under another version"
+twice = ctypes.CFUNCTYPE(ctypes.c_int64, ctypes.c_int64)(address)
+assert twice(21) == 42
+PY
+    then
+        if command -v readelf > /dev/null && ! readelf -d "$work/libmlxprobe.so.1" | grep -q "Library soname: \[libmlxprobe.so.1\]"; then
+            echo "FAIL --soname: no DT_SONAME libmlxprobe.so.1"
+            readelf -d "$work/libmlxprobe.so.1"
+            failures=$((failures + 1))
+        else
+            echo "ok   --soname, --symbol-version: the exports found at their version (dlvsym)"
+        fi
+    else
+        echo "FAIL --symbol-version"
+        cat "$work/output"
+        failures=$((failures + 1))
+    fi
+else
+    echo "FAIL (compile) tests/support/plugin_library.mlx --soname --symbol-version"
+    cat "$work/errors"
+    failures=$((failures + 1))
+fi
+
 # A program without foreign or exported functions stays a static executable.
 "$compiler" --quiet tests/07_functions.mlx -o "$work/static"
 if [[ "$(head -c 20 "$work/static" | od -An -tx1 -j16 -N2 | tr -d ' ')" != "0200" ]] || grep -q "ld-linux" "$work/static"; then

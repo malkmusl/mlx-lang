@@ -158,6 +158,18 @@ the structs it builds grow the caller's arena by exactly their size.
 `projects/desktop/compositor` loads its shell and renderer this way, again
 whenever they are rebuilt.
 
+`--soname=NAME` gives either kind its `DT_SONAME`, and
+`--symbol-version=NAME` a version definition (`.gnu.version_d`: the base
+version, named after the soname, and NAME) with every export at NAME and
+every import unversioned (`.gnu.version`, `DT_VERSYM`, `DT_VERDEF`,
+`DT_VERDEFNUM`). A library standing in for another needs both: programs
+linked against a versioned library ask for its symbols at their version,
+and glibc's loader stops a program whose versioned reference lands on an
+unversioned definition. `projects/desktop/libpulse` builds
+`libpulse.so.0` with `--soname=libpulse.so.0 --symbol-version=PULSE_0`,
+as PulseAudio's. `tests/run_foreign.sh` finds a plugin's export at its
+version with `dlvsym` (and not at another).
+
 ## Debug information
 
 `spec/03-formats/debug.xml` specifies target-appropriate debug formats and a

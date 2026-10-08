@@ -32,6 +32,13 @@
 #                                     repository)
 #   PREFIX/share/icons/hicolor/128x128/apps/org.mlx.files.png,
 #                                     org.mlx.observatory.png
+#   PREFIX/lib/mlx-audio/libpulse.so.0, libpulse-simple.so.0,
+#                                     libpulse-mainloop-glib.so.0,
+#                                     libasound_module_pcm_pulse.so,
+#                                     libasound_module_ctl_pulse.so (MLX
+#                                     Audio's client libraries, Mlx's own
+#                                     libpulse and ALSA pulse plugin:
+#                                     projects/desktop/libpulse)
 #   SESSIONS/mlx-compositor.desktop   (read by GDM and SDDM)
 #   ~/.local/lib/mlx-compositor/libmlx-shell.so, libmlx-render.so (for the
 #   user running this; the session loads them, and loads them again when
@@ -41,6 +48,9 @@
 #   with --replace-sound-servers: /etc/alsa/conf.d/99-zz-mlx-audio.conf,
 #   /etc/pulse/client.conf.d/50-mlx-audio.conf, the sound servers' user
 #   units masked in /etc/systemd/user
+#   with --replace-libpulse: the package mlx-audio-libs (built into
+#   mlx-out/session/libpulse when dpkg-deb is there), in place of libpulse0,
+#   libpulse-mainloop-glib0 and libasound2-plugins
 #
 # Usage: tools/install_compositor_session.sh [options]
 #   --prefix DIR      programs go to DIR/bin (default /usr/local)
@@ -57,14 +67,20 @@
 #                     WirePlumber and PulseAudio are masked for every user
 #                     (systemctl --global; from the next login), libpulse
 #                     no longer starts a PulseAudio of its own, and ALSA
-#                     programs play through MLX Audio
+#                     programs play through MLX Audio by its own plugin
 #                     (/etc/alsa/conf.d/99-zz-mlx-audio.conf). Their packages
-#                     may then be removed; libpulse (PulseAudio's client
-#                     library, which Firefox and others load) and
-#                     alsa-plugins' pulse plugin stay. Other desktops have
-#                     no sound server then.
+#                     may then be removed, and libasound2-plugins too.
+#                     Other desktops have no sound server then.
+#   --replace-libpulse
+#                     installs mlx-audio-libs with apt: MLX Audio's libpulse
+#                     takes the place of PulseAudio's (libpulse0,
+#                     libpulse-mainloop-glib0) for every program, and its
+#                     ALSA plugin that of alsa-plugins' (libasound2-plugins).
+#                     pulseaudio-utils (pactl, pacat) goes with libpulse0;
+#                     mlx-audio does their work.
 #   --restore-sound-servers
-#                     undoes --replace-sound-servers
+#                     undoes --replace-sound-servers (PulseAudio's libpulse
+#                     comes back with apt install libpulse0)
 #
 # Installing into system directories asks for sudo when not run as root.
 set -euo pipefail
@@ -79,6 +95,7 @@ compiler=""
 build_only=0
 uninstall=0
 replace_sound=0
+replace_libpulse=0
 restore_sound=0
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -89,18 +106,25 @@ while [[ $# -gt 0 ]]; do
     --build-only) build_only=1 ;;
     --uninstall) uninstall=1 ;;
     --replace-sound-servers) replace_sound=1 ;;
+    --replace-libpulse) replace_libpulse=1 ;;
     --restore-sound-servers) restore_sound=1 ;;
     -h|--help) sed -n '2,/^set -euo/p' "$0" | sed '$d; s/^# \{0,1\}//'; exit 0 ;;
     *) echo "install_compositor_session.sh: unknown option $1 (see --help)" >&2; exit 2 ;;
     esac
     shift
 done
+if [[ $replace_libpulse -eq 1 && -n "$destdir" ]]; then
+    echo "install_compositor_session.sh: --replace-libpulse installs a package, not into --destdir" >&2
+    exit 2
+fi
 
 bindir="$prefix/bin"
 programs=(mlx-compositor mlx-terminal mlx-session mlx-dock mlx-topbar mlx-launcher mlx-settings mlx-files mlx-observatory mlx-codemap mlx-profile mlx-capture mlx-ipcd mlx-ipc mlx-audiod mlx-audio mlx-permissions)
 applications="$prefix/share/applications"
 icons="$prefix/share/icons/hicolor/128x128/apps"
 services="$prefix/share/mlx/dbus-1/services"
+audio_libs="$prefix/lib/mlx-audio"
+audio_lib_files=(libpulse.so.0 libpulse-simple.so.0 libpulse-mainloop-glib.so.0 libasound_module_pcm_pulse.so libasound_module_ctl_pulse.so)
 
 # Runs a command with sudo when the target is not writable by us.
 as_owner() {
@@ -125,7 +149,8 @@ sound_marker="$prefix/share/mlx/sound-servers-replaced"
 # MLX Audio as the sound server for good (and back).
 replace_sound_servers() {
     as_owner "$destdir$alsa_default" install -d "$(dirname "$destdir$alsa_default")"
-    as_owner "$destdir$alsa_default" install -m 644 projects/desktop/audio/asound.conf "$destdir$alsa_default"
+    sed "s|@ALSA_PLUGIN@|$audio_libs/libasound_module_pcm_pulse.so|" projects/desktop/audio/asound.conf.in > "$build/99-zz-mlx-audio.conf"
+    as_owner "$destdir$alsa_default" install -m 644 "$build/99-zz-mlx-audio.conf" "$destdir$alsa_default"
     echo "installed $destdir$alsa_default (ALSA programs play through MLX Audio)"
     as_owner "$destdir$pulse_client" install -d "$(dirname "$destdir$pulse_client")"
     printf '# MLX Audio answers PulseAudio apps; libpulse starts no PulseAudio.\nautospawn = no\n' > "$build/50-mlx-audio.conf"
@@ -148,10 +173,14 @@ replace_sound_servers() {
     echo
     echo "MLX Audio is the sound server now. PipeWire, WirePlumber and PulseAudio"
     echo "no longer start; their packages (pipewire, pipewire-pulse, pipewire-alsa,"
-    echo "wireplumber, pulseaudio) may be removed. Keep libpulse0 and"
-    echo "libasound2-plugins: PulseAudio's client library and ALSA's pulse plugin,"
-    echo "which apps use to reach MLX Audio. Other desktops (GNOME, KDE) have no"
-    echo "sound now; --restore-sound-servers gives it back."
+    echo "wireplumber, pulseaudio) may be removed, and libasound2-plugins: ALSA"
+    echo "programs use MLX Audio's plugin ($audio_libs)."
+    if [[ -z "$destdir" ]] && ! libpulse_replaced; then
+        echo "PulseAudio's libpulse0 stays until --replace-libpulse puts MLX Audio's"
+        echo "in its place."
+    fi
+    echo "Other desktops (GNOME, KDE) have no sound now; --restore-sound-servers"
+    echo "gives it back."
 }
 
 restore_sound_servers() {
@@ -165,7 +194,29 @@ restore_sound_servers() {
     for path in "$destdir$alsa_default" "$destdir$pulse_client" "$destdir$sound_marker"; do
         [[ -e "$path" ]] && as_owner "$path" rm -f -- "$path" && echo "removed $path"
     done
+    if [[ -z "$destdir" ]] && libpulse_replaced; then
+        echo "MLX Audio's libpulse (mlx-audio-libs) stays; PulseAudio's comes back with"
+        echo "sudo apt install libpulse0 libpulse-mainloop-glib0 libasound2-plugins"
+    fi
     return 0
+}
+
+# Whether mlx-audio-libs is installed.
+libpulse_replaced() {
+    dpkg-query -W -f '${Status}' mlx-audio-libs 2> /dev/null | grep -q "ok installed"
+}
+
+# MLX Audio's client libraries for every program: the package in place of
+# libpulse0, libpulse-mainloop-glib0 and libasound2-plugins.
+replace_libpulse() {
+    local package
+    package=$(ls "$build"/libpulse/mlx-audio-libs_*.deb 2> /dev/null | head -n 1)
+    [[ -n "$package" ]] || { echo "install_compositor_session.sh: --replace-libpulse needs dpkg-deb (to build mlx-audio-libs)" >&2; exit 1; }
+    command -v apt-get > /dev/null || { echo "install_compositor_session.sh: --replace-libpulse needs apt-get" >&2; exit 1; }
+    as_owner /var/lib/dpkg apt-get install -y "$repo_root/$package"
+    echo "installed $package: MLX Audio's libpulse and ALSA plugin for every program"
+    echo "(apt install libpulse0 libpulse-mainloop-glib0 libasound2-plugins brings"
+    echo "PulseAudio's back)"
 }
 
 build=mlx-out/session
@@ -183,6 +234,11 @@ if [[ $uninstall -eq 1 ]]; then
     done
     path="$destdir$sessions/mlx-compositor.desktop"
     [[ -e "$path" ]] && as_owner "$path" rm -f -- "$path" && echo "removed $path"
+    for library in "${audio_lib_files[@]}"; do
+        path="$destdir$audio_libs/$library"
+        [[ -e "$path" ]] && as_owner "$path" rm -f -- "$path" && echo "removed $path"
+    done
+    [[ -d "$destdir$audio_libs" ]] && as_owner "$destdir$audio_libs" rmdir --ignore-fail-on-non-empty -- "$destdir$audio_libs"
     for path in "$destdir$applications/mlx-settings.desktop" "$destdir$applications/org.mlx.files.desktop" "$destdir$applications/org.mlx.observatory.desktop" "$destdir$icons/org.mlx.files.png" "$destdir$icons/org.mlx.observatory.png" "$destdir$services/org.mlx.Audio.service" "$destdir$services/org.mlx.PermissionAgent.service" "$destdir$services/org.freedesktop.portal.Desktop.service"; do
         [[ -e "$path" ]] && as_owner "$path" rm -f -- "$path" && echo "removed $path"
     done
@@ -211,6 +267,9 @@ echo "building with $compiler"
 "$compiler" --quiet projects/desktop/audio/main.mlx -o "$build/mlx-audiod"
 "$compiler" --quiet projects/desktop/audio/tool.mlx -o "$build/mlx-audio"
 "$compiler" --quiet projects/desktop/permissions/main.mlx -o "$build/mlx-permissions"
+deb=()
+command -v dpkg-deb > /dev/null && deb=(--deb)
+tools/build_libpulse.sh --compiler "$compiler" --out "$build/libpulse" "${deb[@]}" > /dev/null
 sed "s|@BINDIR@|$bindir|g" projects/desktop/audio/org.mlx.Audio.service.in > "$build/org.mlx.Audio.service"
 sed "s|@BINDIR@|$bindir|g" projects/desktop/permissions/org.mlx.PermissionAgent.service.in > "$build/org.mlx.PermissionAgent.service"
 sed "s|@BINDIR@|$bindir|g" projects/desktop/capture/org.freedesktop.portal.Desktop.service.in > "$build/org.freedesktop.portal.Desktop.service"
@@ -219,6 +278,7 @@ sed "s|@BINDIR@|$bindir|g" projects/desktop/files/org.mlx.files.desktop.in > "$b
 sed "s|@BINDIR@|$bindir|g; s|@ROOT@|$repo_root|g" projects/observatory/org.mlx.observatory.desktop.in > "$build/org.mlx.observatory.desktop"
 sed "s|@BINDIR@|$bindir|g" projects/desktop/compositor/session/mlx-compositor.desktop.in > "$build/mlx-compositor.desktop"
 echo "built $build/mlx-compositor, mlx-terminal, mlx-dock, mlx-topbar, mlx-launcher, mlx-settings, mlx-files, mlx-observatory, mlx-profile, mlx-capture and its OBS plugin, mlx-ipcd and mlx-ipc, mlx-audiod and mlx-audio, mlx-permissions"
+echo "built $build/libpulse: MLX Audio's libpulse, libpulse-simple, libpulse-mainloop-glib and ALSA plugin${deb:+, the package mlx-audio-libs}"
 [[ $build_only -eq 1 ]] && exit 0
 
 # Install.
@@ -234,8 +294,12 @@ as_owner "$destdir$icons" install -d "$destdir$icons"
 as_owner "$destdir$icons" install -m 644 projects/desktop/files/org.mlx.files.png projects/observatory/org.mlx.observatory.png "$destdir$icons/"
 as_owner "$destdir$services" install -d "$destdir$services"
 as_owner "$destdir$services" install -m 644 "$build/org.mlx.Audio.service" "$build/org.mlx.PermissionAgent.service" "$build/org.freedesktop.portal.Desktop.service" "$destdir$services/"
+as_owner "$destdir$audio_libs" install -d "$destdir$audio_libs"
+as_owner "$destdir$audio_libs" install -m 644 "${audio_lib_files[@]/#/$build/libpulse/}" "$destdir$audio_libs/"
 for program in "${programs[@]}"; do echo "installed $destdir$bindir/$program"; done
 echo "installed $destdir$sessions/mlx-compositor.desktop"
+echo "installed $destdir$audio_libs: ${audio_lib_files[*]}"
+[[ $replace_libpulse -eq 1 ]] && replace_libpulse
 [[ $replace_sound -eq 1 ]] && replace_sound_servers
 # The shell and renderer modules, for the user running this (not when
 # staging a package).

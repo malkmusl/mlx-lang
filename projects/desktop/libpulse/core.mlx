@@ -1,0 +1,668 @@
+// The client's objects, as C memory: contexts (pa_context: a connection to
+// the server), streams (pa_stream) and operations (pa_operation: a request
+// whose reply is awaited), with their reference counts and states; sending
+// packets (buffered when the socket is full) and the replies awaited (by
+// tag, with what to do with them: a kind and its object). context.mlx
+// connects and dispatches, stream.mlx and introspect.mlx build on this.
+const std = @import("std")
+const c = @import("./c.mlx")
+const wire = @import("./wire.mlx")
+const util = @import("./util.mlx")
+const mainloop = @import("./mainloop.mlx")
+const proplist = @import("./proplist.mlx")
+const format = @import("./format.mlx")
+
+// ---------------------------------------------------------------------------
+// Contexts
+
+pub const CONTEXT: usize = 320
+pub const C_REFS: usize = 0
+pub const C_STATE: usize = 4
+pub const C_API: usize = 8
+pub const C_ERROR: usize = 16
+pub const C_VERSION: usize = 20
+pub const C_CLIENT: usize = 24
+pub const C_TAG: usize = 28
+pub const C_PROPLIST: usize = 32
+pub const C_STATE_CALLBACK: usize = 40
+pub const C_STATE_USERDATA: usize = 48
+pub const C_SUBSCRIBE_CALLBACK: usize = 56
+pub const C_SUBSCRIBE_USERDATA: usize = 64
+pub const C_EVENT_CALLBACK: usize = 72
+pub const C_EVENT_USERDATA: usize = 80
+pub const C_FD: usize = 88
+pub const C_IO: usize = 96
+pub const C_SERVER: usize = 104
+pub const C_PENDING: usize = 112
+pub const C_OPERATIONS: usize = 120
+pub const C_STREAMS: usize = 128
+pub const C_SEND: usize = 136
+pub const C_SEND_LENGTH: usize = 144
+pub const C_SEND_ROOM: usize = 152
+pub const C_SEND_DONE: usize = 160
+pub const C_RECEIVE: usize = 168
+pub const C_RECEIVE_HAVE: usize = 176
+pub const C_RECEIVE_ROOM: usize = 184
+pub const C_RTCLOCK: usize = 200
+pub const C_FLAGS: usize = 204
+pub const C_DRAIN: usize = 208
+pub const C_COOKIE: usize = 216
+pub const C_RETRY: usize = 224
+pub const C_LOCAL: usize = 232
+pub const C_SETUP: usize = 240
+pub const C_BROKEN: usize = 248
+pub const C_OUTPUT: usize = 252
+pub const C_EXT_STREAM_CALLBACK: usize = 256
+pub const C_EXT_STREAM_USERDATA: usize = 264
+pub const C_SYNCID: usize = 272
+
+// pa_context_state_t.
+pub const UNCONNECTED: u32 = 0
+pub const CONNECTING: u32 = 1
+pub const AUTHORIZING: u32 = 2
+pub const SETTING_NAME: u32 = 3
+pub const READY: u32 = 4
+pub const FAILED: u32 = 5
+pub const TERMINATED: u32 = 6
+
+pub fn good(state: u32) -> bool { return state >= CONNECTING && state <= READY }
+
+pub fn state(context: usize) -> u32 { return c.get32(context, C_STATE) }
+
+pub fn version(context: usize) -> u32 { return c.get32(context, C_VERSION) }
+
+pub fn api(context: usize) -> usize { return c.getPointer(context, C_API) }
+
+pub fn ref(context: usize) -> void { c.put32(context, C_REFS, c.get32(context, C_REFS) + 1) }
+
+// Sets the error; returns it negated (for returning from a function that
+// failed with it).
+pub fn fail(context: usize, code: i32) -> i32 {
+    if context != 0 { c.put32(context, C_ERROR, @bitCast(u32, code)) }
+    return 0 - code
+}
+
+pub fn nextTag(context: usize) -> u32 {
+    const tag = c.get32(context, C_TAG)
+    c.put32(context, C_TAG, tag + 1)
+    return tag
+}
+
+pub fn unref(context: usize) -> void {
+    const refs = c.get32(context, C_REFS)
+    if refs > 1 {
+        c.put32(context, C_REFS, refs - 1)
+        return
+    }
+    unlink(context)
+    proplist.free(c.getPointer(context, C_PROPLIST))
+    c.release(c.getPointer(context, C_SERVER))
+    c.release(c.getPointer(context, C_COOKIE))
+    c.release(c.getPointer(context, C_SEND))
+    c.release(c.getPointer(context, C_RECEIVE))
+    c.release(context)
+}
+
+pub fn setState(context: usize, next: u32) -> void {
+    if state(context) == next { return }
+    ref(context)
+    c.put32(context, C_STATE, next)
+    c.call2(c.getPointer(context, C_STATE_CALLBACK), context, c.getPointer(context, C_STATE_USERDATA))
+    if next == FAILED || next == TERMINATED { unlink(context) }
+    unref(context)
+}
+
+pub fn failWith(context: usize, code: i32) -> void {
+    const failed = fail(context, code)
+    setState(context, FAILED)
+}
+
+// Ends the connection: streams fail (or end), operations are cancelled,
+// awaited replies forgotten, the socket closed.
+pub fn unlink(context: usize) -> void {
+    const ending = if state(context) == FAILED { S_FAILED } else { S_TERMINATED }
+    while c.getPointer(context, C_STREAMS) != 0 {
+        const stream = c.getPointer(context, C_STREAMS)
+        streamRef(stream)
+        setStreamState(stream, ending)
+        // (A stream that did not unlink itself is unlinked here.)
+        if c.getPointer(context, C_STREAMS) == stream { streamUnlink(stream) }
+        streamUnref(stream)
+    }
+    while c.getPointer(context, C_OPERATIONS) != 0 { cancel(c.getPointer(context, C_OPERATIONS)) }
+    while c.getPointer(context, C_PENDING) != 0 {
+        const entry = c.getPointer(context, C_PENDING)
+        c.putPointer(context, C_PENDING, c.getPointer(entry, P_NEXT))
+        dropPending(entry)
+    }
+    const api_table = api(context)
+    if c.getPointer(context, C_IO) != 0 {
+        mainloop.ioFree(api_table, c.getPointer(context, C_IO))
+        c.putPointer(context, C_IO, 0)
+    }
+    if c.getPointer(context, C_RETRY) != 0 {
+        mainloop.timeFree(api_table, c.getPointer(context, C_RETRY))
+        c.putPointer(context, C_RETRY, 0)
+    }
+    if c.getPointer(context, C_SETUP) != 0 {
+        mainloop.deferFree(api_table, c.getPointer(context, C_SETUP))
+        c.putPointer(context, C_SETUP, 0)
+    }
+    const fd = @bitCast(i64, c.get64(context, C_FD))
+    if fd >= 0 {
+        c.close(@intCast(isize, fd))
+        c.put64(context, C_FD, @bitCast(u64, @intCast(i64, -1)))
+    }
+    c.putPointer(context, C_SEND_LENGTH, 0)
+    c.putPointer(context, C_SEND_DONE, 0)
+    c.putPointer(context, C_RECEIVE_HAVE, 0)
+    c.putPointer(context, C_STATE_CALLBACK, 0)
+    c.putPointer(context, C_SUBSCRIBE_CALLBACK, 0)
+    c.putPointer(context, C_EVENT_CALLBACK, 0)
+    c.putPointer(context, C_EXT_STREAM_CALLBACK, 0)
+}
+
+// ---------------------------------------------------------------------------
+// Sending
+
+const SYS_sendto: usize = 44
+// MSG_DONTWAIT | MSG_NOSIGNAL
+const SEND_FLAGS: usize = 16448
+const EAGAIN: isize = -11
+
+fn watchOutput(context: usize, wanted: bool) -> void {
+    const watching = c.get32(context, C_OUTPUT) != 0
+    if watching == wanted || c.getPointer(context, C_IO) == 0 { return }
+    c.put32(context, C_OUTPUT, if wanted { 1 } else { 0 })
+    mainloop.ioEnable(api(context), c.getPointer(context, C_IO), if wanted { mainloop.IO_INPUT | mainloop.IO_OUTPUT } else { mainloop.IO_INPUT })
+}
+
+// Writes what is queued, as much as the socket takes; the rest waits for
+// it to be writable.
+pub fn flush(context: usize) -> void {
+    const fd = @bitCast(i64, c.get64(context, C_FD))
+    if fd < 0 { return }
+    const buffer = c.getPointer(context, C_SEND)
+    var done = c.getPointer(context, C_SEND_DONE)
+    const length = c.getPointer(context, C_SEND_LENGTH)
+    while done < length {
+        const sent = std.linux.syscall6(SYS_sendto, @intCast(usize, fd), buffer + done, length - done, SEND_FLAGS, 0, 0)
+        if sent == EAGAIN { break }
+        if sent <= 0 {
+            // The loop sees the socket's end (its I/O event) and fails the
+            // context there.
+            c.put32(context, C_BROKEN, 1)
+            done = length
+            break
+        }
+        done += @bitCast(usize, sent)
+    }
+    if done >= length {
+        c.putPointer(context, C_SEND_LENGTH, 0)
+        c.putPointer(context, C_SEND_DONE, 0)
+        watchOutput(context, c.get32(context, C_BROKEN) != 0)
+        return
+    }
+    c.putPointer(context, C_SEND_DONE, done)
+    watchOutput(context, true)
+}
+
+fn queue(context: usize, data: usize, count: usize) -> void {
+    var length = c.getPointer(context, C_SEND_LENGTH)
+    var done = c.getPointer(context, C_SEND_DONE)
+    if done > 0 && done == length {
+        length = 0
+        done = 0
+    }
+    if done > 65536 {
+        c.copy(c.getPointer(context, C_SEND), c.getPointer(context, C_SEND) + done, length - done)
+        length -= done
+        done = 0
+    }
+    if length + count > c.getPointer(context, C_SEND_ROOM) {
+        var room = c.getPointer(context, C_SEND_ROOM) * 2
+        if room < 65536 { room = 65536 }
+        while room < length + count { room = room * 2 }
+        const grown = c.grow(c.getPointer(context, C_SEND), room)
+        if grown == 0 { return }
+        c.putPointer(context, C_SEND, grown)
+        c.putPointer(context, C_SEND_ROOM, room)
+    }
+    c.copy(c.getPointer(context, C_SEND) + length, data, count)
+    c.putPointer(context, C_SEND_LENGTH, length + count)
+    c.putPointer(context, C_SEND_DONE, done)
+}
+
+// Sends a command (its writer's memory is released).
+pub fn send(context: usize, writing: *wire.Writer) -> void {
+    wire.finish(writing, wire.CONTROL, 0, 0)
+    if @bitCast(i64, c.get64(context, C_FD)) >= 0 { queue(context, writing.*.data, writing.*.length) }
+    c.release(writing.*.data)
+    flush(context)
+}
+
+// Sends samples on a stream's channel.
+pub fn sendData(context: usize, channel: u32, data: usize, count: usize, offset: i64, seek: u32) -> void {
+    var header: [5]u32 = undefined
+    const at = @intFromPtr(&header)
+    wire.store32(at, 0, @intCast(u32, count))
+    wire.store32(at, 4, channel)
+    wire.store32(at, 8, @intCast(u32, @bitCast(u64, offset) >> 32))
+    wire.store32(at, 12, @intCast(u32, @bitCast(u64, offset) & 4294967295))
+    wire.store32(at, 16, seek & 255)
+    if @bitCast(i64, c.get64(context, C_FD)) < 0 { return }
+    queue(context, at, wire.DESCRIPTOR)
+    queue(context, data, count)
+    flush(context)
+}
+
+pub fn pendingOutput(context: usize) -> bool { return c.getPointer(context, C_SEND_LENGTH) > c.getPointer(context, C_SEND_DONE) }
+
+// ---------------------------------------------------------------------------
+// Replies awaited: the tag, what kind of reply, the object it is for (an
+// operation, a stream or the context; operations are referenced while
+// they wait), a value, the next one.
+
+const PENDING: usize = 32
+pub const P_TAG: usize = 0
+pub const P_KIND: usize = 4
+pub const P_OBJECT: usize = 8
+pub const P_VALUE: usize = 16
+pub const P_NEXT: usize = 24
+
+// Kinds: those below OPERATION_KINDS hold a stream or the context, the
+// others an operation.
+pub const R_SETUP: u32 = 1
+pub const R_STREAM_CREATE: u32 = 2
+pub const R_STREAM_DISCONNECT: u32 = 3
+pub const OPERATION_KINDS: u32 = 10
+pub const R_STREAM_ACK: u32 = 10
+pub const R_STREAM_TIMING: u32 = 11
+pub const R_STREAM_BUFFER_ATTR: u32 = 12
+pub const R_STREAM_RATE: u32 = 13
+pub const R_CONTEXT_ACK: u32 = 20
+pub const R_INDEX: u32 = 21
+pub const R_STRING: u32 = 22
+pub const R_SERVER_INFO: u32 = 23
+pub const R_STAT: u32 = 24
+pub const R_SINK_INFO: u32 = 25
+pub const R_SOURCE_INFO: u32 = 26
+pub const R_CLIENT_INFO: u32 = 27
+pub const R_MODULE_INFO: u32 = 28
+pub const R_SINK_INPUT_INFO: u32 = 29
+pub const R_SOURCE_OUTPUT_INFO: u32 = 30
+pub const R_CARD_INFO: u32 = 31
+pub const R_SAMPLE_INFO: u32 = 32
+pub const R_EXT_TEST: u32 = 33
+pub const R_EXT_LIST: u32 = 34
+pub const R_EXT_ACK: u32 = 35
+pub const R_UPLOAD_CREATE: u32 = 4
+
+pub fn expectReply(context: usize, tag: u32, kind: u32, object: usize, value: u64) -> void {
+    const entry = c.alloc(PENDING)
+    c.put32(entry, P_TAG, tag)
+    c.put32(entry, P_KIND, kind)
+    c.putPointer(entry, P_OBJECT, object)
+    c.put64(entry, P_VALUE, value)
+    if kind >= OPERATION_KINDS { operationRef(object) }
+    // Kept in the order sent (replies come in it).
+    var last = c.getPointer(context, C_PENDING)
+    if last == 0 {
+        c.putPointer(context, C_PENDING, entry)
+        return
+    }
+    while c.getPointer(last, P_NEXT) != 0 { last = c.getPointer(last, P_NEXT) }
+    c.putPointer(last, P_NEXT, entry)
+}
+
+// The entry awaiting `tag`, taken off the list (0 when none).
+pub fn takeReply(context: usize, tag: u32) -> usize {
+    var previous: usize = 0
+    var entry = c.getPointer(context, C_PENDING)
+    while entry != 0 {
+        if c.get32(entry, P_TAG) == tag {
+            if previous == 0 { c.putPointer(context, C_PENDING, c.getPointer(entry, P_NEXT)) } else { c.putPointer(previous, P_NEXT, c.getPointer(entry, P_NEXT)) }
+            return entry
+        }
+        previous = entry
+        entry = c.getPointer(entry, P_NEXT)
+    }
+    return 0
+}
+
+pub fn dropPending(entry: usize) -> void {
+    if c.get32(entry, P_KIND) >= OPERATION_KINDS { operationUnref(c.getPointer(entry, P_OBJECT)) }
+    c.release(entry)
+}
+
+// Forgets the replies awaited for a stream (it went away).
+fn forgetStream(context: usize, stream: usize) -> void {
+    var previous: usize = 0
+    var entry = c.getPointer(context, C_PENDING)
+    while entry != 0 {
+        const next = c.getPointer(entry, P_NEXT)
+        if c.get32(entry, P_KIND) < OPERATION_KINDS && c.getPointer(entry, P_OBJECT) == stream {
+            if previous == 0 { c.putPointer(context, C_PENDING, next) } else { c.putPointer(previous, P_NEXT, next) }
+            c.release(entry)
+        } else {
+            previous = entry
+        }
+        entry = next
+    }
+}
+
+pub fn awaiting(context: usize) -> bool { return c.getPointer(context, C_PENDING) != 0 }
+
+// ---------------------------------------------------------------------------
+// Operations
+
+pub const OPERATION: usize = 80
+const O_REFS: usize = 0
+const O_STATE: usize = 4
+pub const O_CONTEXT: usize = 8
+pub const O_STREAM: usize = 16
+pub const O_CALLBACK: usize = 24
+pub const O_USERDATA: usize = 32
+const O_STATE_CALLBACK: usize = 40
+const O_STATE_USERDATA: usize = 48
+const O_NEXT: usize = 56
+pub const O_VALUE: usize = 64
+
+pub const OP_RUNNING: u32 = 0
+pub const OP_DONE: u32 = 1
+pub const OP_CANCELLED: u32 = 2
+
+// A running operation (two references: the context's list and the
+// caller's).
+pub fn operationNew(context: usize, stream: usize, callback: usize, userdata: usize) -> usize {
+    const operation = c.alloc(OPERATION)
+    c.put32(operation, O_REFS, 2)
+    c.putPointer(operation, O_CONTEXT, context)
+    c.putPointer(operation, O_STREAM, stream)
+    if stream != 0 { streamRef(stream) }
+    c.putPointer(operation, O_CALLBACK, callback)
+    c.putPointer(operation, O_USERDATA, userdata)
+    c.putPointer(operation, O_NEXT, c.getPointer(context, C_OPERATIONS))
+    c.putPointer(context, C_OPERATIONS, operation)
+    return operation
+}
+
+pub fn operationRef(operation: usize) -> void { c.put32(operation, O_REFS, c.get32(operation, O_REFS) + 1) }
+
+pub fn operationUnref(operation: usize) -> void {
+    const refs = c.get32(operation, O_REFS)
+    if refs > 1 {
+        c.put32(operation, O_REFS, refs - 1)
+        return
+    }
+    c.release(operation)
+}
+
+pub fn operationState(operation: usize) -> u32 { return c.get32(operation, O_STATE) }
+
+pub fn operationContext(operation: usize) -> usize { return c.getPointer(operation, O_CONTEXT) }
+
+pub fn setOperationStateCallback(operation: usize, callback: usize, userdata: usize) -> void {
+    if operationState(operation) != OP_RUNNING { return }
+    c.putPointer(operation, O_STATE_CALLBACK, callback)
+    c.putPointer(operation, O_STATE_USERDATA, userdata)
+}
+
+fn setOperationState(operation: usize, next: u32) -> void {
+    if operationState(operation) == next || operationState(operation) != OP_RUNNING { return }
+    operationRef(operation)
+    c.put32(operation, O_STATE, next)
+    c.call2(c.getPointer(operation, O_STATE_CALLBACK), operation, c.getPointer(operation, O_STATE_USERDATA))
+    // Off the context's list (its reference goes with it).
+    const context = c.getPointer(operation, O_CONTEXT)
+    if context != 0 {
+        var previous: usize = 0
+        var current = c.getPointer(context, C_OPERATIONS)
+        while current != 0 && current != operation {
+            previous = current
+            current = c.getPointer(current, O_NEXT)
+        }
+        if current != 0 {
+            if previous == 0 { c.putPointer(context, C_OPERATIONS, c.getPointer(operation, O_NEXT)) } else { c.putPointer(previous, O_NEXT, c.getPointer(operation, O_NEXT)) }
+            c.putPointer(operation, O_NEXT, 0)
+            const stream = c.getPointer(operation, O_STREAM)
+            c.putPointer(operation, O_STREAM, 0)
+            c.putPointer(operation, O_CONTEXT, 0)
+            c.putPointer(operation, O_CALLBACK, 0)
+            c.putPointer(operation, O_STATE_CALLBACK, 0)
+            if stream != 0 { streamUnref(stream) }
+            operationUnref(operation)
+        }
+    }
+    operationUnref(operation)
+}
+
+pub fn done(operation: usize) -> void { setOperationState(operation, OP_DONE) }
+
+pub fn cancel(operation: usize) -> void { setOperationState(operation, OP_CANCELLED) }
+
+// A request answered with an acknowledgement: (context, success,
+// userdata).
+pub fn simple(context: usize, writing: *wire.Writer, tag: u32, kind: u32, callback: usize, userdata: usize) -> usize {
+    const operation = operationNew(context, 0, callback, userdata)
+    send(context, writing)
+    expectReply(context, tag, kind, operation, 0)
+    return operation
+}
+
+// ---------------------------------------------------------------------------
+// Streams (their layout; stream.mlx has the rest)
+
+pub const STREAM: usize = 1024
+pub const S_REFS: usize = 0
+pub const S_STATE: usize = 4
+pub const S_CONTEXT: usize = 8
+pub const S_NEXT: usize = 16
+pub const S_DIRECTION: usize = 24
+pub const S_FLAGS: usize = 28
+pub const S_SPEC: usize = 32
+pub const S_MAP: usize = 48
+pub const S_PROPLIST: usize = 184
+pub const S_FORMAT_COUNT: usize = 192
+pub const S_FORMATS: usize = 200
+pub const S_FORMAT: usize = 208
+pub const S_CHANNEL: usize = 216
+pub const S_CHANNEL_VALID: usize = 220
+pub const S_INDEX: usize = 224
+pub const S_SYNCID: usize = 228
+pub const S_REQUESTED: usize = 232
+pub const S_ATTR: usize = 240
+pub const S_DEVICE_INDEX: usize = 260
+pub const S_DEVICE_NAME: usize = 264
+pub const S_SUSPENDED: usize = 272
+pub const S_CORKED: usize = 276
+pub const S_TIMING_VALID: usize = 280
+pub const S_TIMING_REQUESTED: usize = 284
+pub const S_TIMING: usize = 288
+pub const S_PREVIOUS_TIME: usize = 392
+pub const S_WRITE_NOT_BEFORE: usize = 400
+pub const S_READ_NOT_BEFORE: usize = 404
+pub const S_CORRECTIONS: usize = 408
+pub const S_CORRECTION: usize = 728
+pub const S_AUTO_EVENT: usize = 736
+pub const S_AUTO_INTERVAL: usize = 744
+pub const S_SMOOTH_AT: usize = 752
+pub const S_SMOOTH_VALUE: usize = 760
+pub const S_SMOOTH_RUNNING: usize = 768
+pub const S_SMOOTH_HAVE: usize = 772
+pub const S_STATE_CALLBACK: usize = 776
+pub const S_STATE_USERDATA: usize = 784
+pub const S_READ_CALLBACK: usize = 792
+pub const S_WRITE_CALLBACK: usize = 808
+pub const S_OVERFLOW_CALLBACK: usize = 824
+pub const S_UNDERFLOW_CALLBACK: usize = 840
+pub const S_LATENCY_CALLBACK: usize = 856
+pub const S_MOVED_CALLBACK: usize = 872
+pub const S_SUSPENDED_CALLBACK: usize = 888
+pub const S_STARTED_CALLBACK: usize = 904
+pub const S_EVENT_CALLBACK: usize = 920
+pub const S_BUFFER_ATTR_CALLBACK: usize = 936
+pub const S_WRITE_BUFFER: usize = 952
+pub const S_WRITE_SIZE: usize = 960
+pub const S_QUEUE_HEAD: usize = 968
+pub const S_QUEUE_TAIL: usize = 976
+pub const S_QUEUE_BYTES: usize = 984
+pub const S_PEEKED: usize = 992
+pub const S_PEEK_LENGTH: usize = 1000
+pub const S_UNDERFLOW_INDEX: usize = 1008
+pub const S_DIRECT_ON_INPUT: usize = 1016
+pub const S_UPLOAD_LENGTH: usize = 1020
+
+// pa_stream_state_t and pa_stream_direction_t.
+pub const S_UNCONNECTED: u32 = 0
+pub const S_CREATING: u32 = 1
+pub const S_READY: u32 = 2
+pub const S_FAILED: u32 = 3
+pub const S_TERMINATED: u32 = 4
+pub const NODIRECTION: u32 = 0
+pub const PLAYBACK: u32 = 1
+pub const RECORD: u32 = 2
+pub const UPLOAD: u32 = 3
+
+pub fn streamRef(stream: usize) -> void { c.put32(stream, S_REFS, c.get32(stream, S_REFS) + 1) }
+
+pub fn streamState(stream: usize) -> u32 { return c.get32(stream, S_STATE) }
+
+pub fn streamContext(stream: usize) -> usize { return c.getPointer(stream, S_CONTEXT) }
+
+// A recorded chunk: the next one, its length, how much was read, its
+// samples (after these 24 bytes).
+pub const CHUNK: usize = 24
+
+pub fn clearQueue(stream: usize) -> void {
+    var chunk = c.getPointer(stream, S_QUEUE_HEAD)
+    while chunk != 0 {
+        const next = c.getPointer(chunk, 0)
+        c.release(chunk)
+        chunk = next
+    }
+    c.putPointer(stream, S_QUEUE_HEAD, 0)
+    c.putPointer(stream, S_QUEUE_TAIL, 0)
+    c.put64(stream, S_QUEUE_BYTES, 0)
+    c.putPointer(stream, S_PEEKED, 0)
+    c.putPointer(stream, S_PEEK_LENGTH, 0)
+}
+
+pub fn streamUnref(stream: usize) -> void {
+    const refs = c.get32(stream, S_REFS)
+    if refs > 1 {
+        c.put32(stream, S_REFS, refs - 1)
+        return
+    }
+    streamUnlink(stream)
+    clearQueue(stream)
+    c.release(c.getPointer(stream, S_WRITE_BUFFER))
+    proplist.free(c.getPointer(stream, S_PROPLIST))
+    var index: u32 = 0
+    while index < c.get32(stream, S_FORMAT_COUNT) {
+        format.free(c.getPointer(c.getPointer(stream, S_FORMATS), @intCast(usize, index) * 8))
+        index += 1
+    }
+    c.release(c.getPointer(stream, S_FORMATS))
+    format.free(c.getPointer(stream, S_FORMAT))
+    c.release(c.getPointer(stream, S_DEVICE_NAME))
+    c.release(stream)
+}
+
+// Detaches the stream from its context: its operations are cancelled, the
+// replies it awaited forgotten, its timer freed; the context's reference
+// to it goes.
+pub fn streamUnlink(stream: usize) -> void {
+    const context = c.getPointer(stream, S_CONTEXT)
+    if context == 0 { return }
+    var operation = c.getPointer(context, C_OPERATIONS)
+    while operation != 0 {
+        const next = c.getPointer(operation, O_NEXT)
+        if c.getPointer(operation, O_STREAM) == stream { cancel(operation) }
+        operation = next
+    }
+    forgetStream(context, stream)
+    c.put32(stream, S_CHANNEL_VALID, 0)
+    var previous: usize = 0
+    var current = c.getPointer(context, C_STREAMS)
+    while current != 0 && current != stream {
+        previous = current
+        current = c.getPointer(current, S_NEXT)
+    }
+    if current != 0 {
+        if previous == 0 { c.putPointer(context, C_STREAMS, c.getPointer(stream, S_NEXT)) } else { c.putPointer(previous, S_NEXT, c.getPointer(stream, S_NEXT)) }
+    }
+    if c.getPointer(stream, S_AUTO_EVENT) != 0 {
+        mainloop.timeFree(api(context), c.getPointer(stream, S_AUTO_EVENT))
+        c.putPointer(stream, S_AUTO_EVENT, 0)
+    }
+    c.putPointer(stream, S_CONTEXT, 0)
+    var callback = S_STATE_CALLBACK
+    while callback <= S_BUFFER_ATTR_CALLBACK + 8 {
+        c.putPointer(stream, callback, 0)
+        callback += 8
+    }
+    // The context held the stream while it was attached.
+    if current != 0 { streamUnref(stream) }
+}
+
+pub fn setStreamState(stream: usize, next: u32) -> void {
+    if streamState(stream) == next { return }
+    streamRef(stream)
+    c.put32(stream, S_STATE, next)
+    c.call2(c.getPointer(stream, S_STATE_CALLBACK), stream, c.getPointer(stream, S_STATE_USERDATA))
+    if next == S_FAILED || next == S_TERMINATED { streamUnlink(stream) }
+    streamUnref(stream)
+}
+
+// The attached stream on `channel` in that direction, 0 when none.
+pub fn streamOn(context: usize, channel: u32, record: bool) -> usize {
+    var stream = c.getPointer(context, C_STREAMS)
+    while stream != 0 {
+        if c.get32(stream, S_CHANNEL_VALID) != 0 && c.get32(stream, S_CHANNEL) == channel && (c.get32(stream, S_DIRECTION) == RECORD) == record { return stream }
+        stream = c.getPointer(stream, S_NEXT)
+    }
+    return 0
+}
+
+// pa_context_rttime_new / _restart: a monotonic time for the context's
+// loop (marked when the loop is this library's).
+pub fn timeNew(context: usize, usec: u64, callback: usize, userdata: usize) -> usize {
+    if usec == util.USEC_INVALID { return mainloop.timeNew(api(context), 0, callback, userdata) }
+    var time: [2]u64 = [2]u64{ 0, 0 }
+    const stored = util.storeMonotonic(@intFromPtr(&time), usec, c.get32(context, C_RTCLOCK) != 0)
+    return mainloop.timeNew(api(context), @intFromPtr(&time), callback, userdata)
+}
+
+pub fn timeRestart(context: usize, event: usize, usec: u64) -> void {
+    if usec == util.USEC_INVALID {
+        mainloop.timeRestart(api(context), event, 0)
+        return
+    }
+    var time: [2]u64 = [2]u64{ 0, 0 }
+    const stored = util.storeMonotonic(@intFromPtr(&time), usec, c.get32(context, C_RTCLOCK) != 0)
+    mainloop.timeRestart(api(context), event, @intFromPtr(&time))
+}
+
+// Reads an error reply: 0 when it was one (the context's error set),
+// -1 when the context failed over it.
+pub fn handleError(context: usize, code: u32, reading: *wire.Reader) -> i32 {
+    var error_code: u32 = @bitCast(u32, util.ERR_TIMEOUT)
+    if code == 0 {
+        error_code = wire.readU32(reading)
+        if reading.*.failed {
+            failWith(context, util.ERR_PROTOCOL)
+            return -1
+        }
+    } else if code != 1 {
+        failWith(context, util.ERR_PROTOCOL)
+        return -1
+    }
+    if error_code == 0 {
+        failWith(context, util.ERR_PROTOCOL)
+        return -1
+    }
+    if error_code >= @bitCast(u32, util.ERR_MAX) { error_code = @bitCast(u32, util.ERR_UNKNOWN) }
+    const failed = fail(context, @bitCast(i32, error_code))
+    return 0
+}

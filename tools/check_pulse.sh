@@ -1,7 +1,13 @@
 #!/usr/bin/env bash
 # MLX Audio's PulseAudio server (projects/desktop/audio/pulse.mlx) end to
 # end, with PulseAudio's own programs as the apps (pactl, pacat, paplay,
-# parec from pulseaudio-utils; there is no PulseAudio server) on MLXIPC:
+# parec from pulseaudio-utils; there is no PulseAudio server) on MLXIPC,
+# and MLX Audio's client libraries (projects/desktop/libpulse, built by
+# tools/build_libpulse.sh) as theirs: pulseaudio-utils' programs get its
+# libpulse.so.0 preloaded (they also link PulseAudio's libpulsecommon,
+# which has some of the same functions), Firefox finds it first, ALSA
+# loads its pulse plugin. SYSTEM_LIBPULSE=1 leaves the apps PulseAudio's
+# libpulse (the ALSA plugin stays MLX Audio's):
 #
 #   - mlx-ipcd starts mlx-audiod at once (--start org.mlx.Audio), which
 #     answers at $XDG_RUNTIME_DIR/pulse/native: pactl info, its sink, the
@@ -16,10 +22,11 @@
 #   - a sandboxed app (bwrap with a .flatpak-info) plays, may not record
 #     until a rule allows it, may not change the server, and its
 #     recording ends when the rule goes;
-#   - ALSA programs (aplay, arecord) through alsa-plugins' pulse plugin
-#     and asound.conf;
+#   - ALSA programs (aplay, arecord, amixer) through the pulse plugin and
+#     asound.conf;
 #   - with Firefox (FIREFOX=PATH, or firefox installed): an <audio>
-#     element plays through MLX Audio and its clock reaches the end.
+#     element plays through MLX Audio and its clock reaches the end (with
+#     MLX Audio's libpulse in it).
 #
 #   tools/check_pulse.sh [compiler]
 set -euo pipefail
@@ -52,6 +59,18 @@ mkdir -p "$XDG_CONFIG_HOME/mlx" "$work/services" "$HOME"
 "$compiler" --quiet projects/desktop/ipc/tool.mlx -o "$work/mlx-ipc"
 "$compiler" --quiet projects/desktop/audio/main.mlx -o "$work/mlx-audiod"
 "$compiler" --quiet projects/desktop/audio/tool.mlx -o "$work/mlx-audio"
+tools/build_libpulse.sh --compiler "$compiler" --out "$work/lib" > /dev/null
+
+# pulseaudio-utils' programs, with MLX Audio's libpulse preloaded: wrappers
+# found first on the PATH (timeout and bwrap run them too).
+if [[ -z "${SYSTEM_LIBPULSE:-}" ]]; then
+    mkdir -p "$work/bin"
+    for tool in pactl pacat parec; do
+        printf '#!/bin/sh\nLD_PRELOAD="%s" exec "%s" "$@"\n' "$work/lib/libpulse.so.0" "$(command -v "$tool")" > "$work/bin/$tool"
+        chmod +x "$work/bin/$tool"
+    done
+    export PATH="$work/bin:$PATH"
+fi
 
 fail() {
     echo "FAIL $1" >&2
@@ -160,12 +179,12 @@ read -r seconds amplitude < <(python3 "$work/sound.py" measure "$work/input.raw"
 python3 -c "import sys; sys.exit(0 if abs(int('$amplitude') - 16384) < 1600 else 1)" || fail "parec: the input's 440 Hz at $amplitude"
 echo "ok   parec records the input (440 Hz at $amplitude)"
 
-# ALSA programs, through alsa-plugins' pulse plugin (asound.conf; the
+# ALSA programs, through MLX Audio's pulse plugin (asound.conf; the
 # installer puts it in /etc/alsa/conf.d, here the user's asoundrc, which
 # ALSA reads last).
-if command -v aplay > /dev/null && ls /usr/lib/*/alsa-lib/libasound_module_pcm_pulse.so > /dev/null 2>&1; then
+if command -v aplay > /dev/null; then
     mkdir -p "$XDG_CONFIG_HOME/alsa"
-    cp projects/desktop/audio/asound.conf "$XDG_CONFIG_HOME/alsa/asoundrc"
+    sed "s|@ALSA_PLUGIN@|$work/lib/libasound_module_pcm_pulse.so|" projects/desktop/audio/asound.conf.in > "$XDG_CONFIG_HOME/alsa/asoundrc"
     python3 "$work/sound.py" make "$work/alsa.raw" s16le 44100 2 1 660 12000
     parec -d mlx.output.monitor --format=s16le --rate=48000 --channels=2 > "$work/monitor.raw" &
     recorder=$!
@@ -182,9 +201,16 @@ if command -v aplay > /dev/null && ls /usr/lib/*/alsa-lib/libasound_module_pcm_p
     read -r seconds amplitude < <(python3 "$work/sound.py" measure "$work/arecord.raw" 440)
     python3 -c "import sys; sys.exit(0 if abs(int('$amplitude') - 16384) < 1600 else 1)" || fail "arecord: 440 Hz at $amplitude"
     echo "ok   ALSA programs: aplay plays (660 Hz at $played in the monitor), arecord records the input (440 Hz at $amplitude)"
+    if command -v amixer > /dev/null; then
+        timeout 5 amixer -q set Master 40% || fail "amixer set Master"
+        expect "amixer: the sink's volume" "40%" pactl list sinks
+        expect "amixer: reads it back" "[40%]" amixer get Master
+        pactl set-sink-volume @DEFAULT_SINK@ 100%
+        echo "ok   amixer sets the sink's volume (Master) and reads it"
+    fi
     rm -f "$XDG_CONFIG_HOME/alsa/asoundrc"
 else
-    echo "skip ALSA programs (no aplay or no alsa-plugins pulse plugin)"
+    echo "skip ALSA programs (no aplay)"
 fi
 
 # Streams, volumes, mute, events.
@@ -278,9 +304,20 @@ JS
     parec -d mlx.output.monitor --format=s16le --rate=48000 --channels=2 > "$work/firefox.raw" &
     recorder=$!
     sleep 0.5
-    GDK_DEBUG=no-portals timeout 60 "$firefox" --headless --no-remote --profile "$work/profile" "http://127.0.0.1:8765/page.html" > "$work/firefox.log" 2>&1 &
+    # (Firefox loads libpulse.so.0 where LD_LIBRARY_PATH says first.)
+    library_path=
+    [[ -z "${SYSTEM_LIBPULSE:-}" ]] && library_path="$work/lib"
+    GDK_DEBUG=no-portals LD_LIBRARY_PATH="$library_path" timeout 60 "$firefox" --headless --no-remote --profile "$work/profile" "http://127.0.0.1:8765/page.html" > "$work/firefox.log" 2>&1 &
     browser=$!
-    for _ in $(seq 1 500); do grep -q "GET /ended" "$work/http.log" 2> /dev/null && break; kill -0 "$browser" 2> /dev/null || break; sleep 0.1; done
+    loaded=
+    for _ in $(seq 1 500); do
+        grep -q "GET /ended" "$work/http.log" 2> /dev/null && break
+        kill -0 "$browser" 2> /dev/null || break
+        if [[ -z "$loaded" && -n "$library_path" ]] && grep -q "GET /playing" "$work/http.log" 2> /dev/null; then
+            grep -qs "$work/lib/libpulse.so.0" /proc/[0-9]*/maps && loaded=yes
+        fi
+        sleep 0.1
+    done
     sleep 0.3
     kill "$browser" "$recorder" "$server" 2> /dev/null || true
     wait "$browser" 2> /dev/null || true
@@ -289,7 +326,10 @@ JS
     read -r seconds amplitude < <(python3 "$work/sound.py" measure "$work/firefox.raw" 523)
     python3 -c "import sys; s, a = float('$seconds'), int('$amplitude'); sys.exit(0 if abs(s - 3) < 0.4 and a > 9000 else 1)" || fail "Firefox's tone: $seconds s at amplitude $amplitude"
     grep -q "firefox connected (PulseAudio" "$work/bus.log" || fail "Firefox was not known as firefox"
-    echo "ok   Firefox plays through MLX Audio: $seconds s of 523 Hz at $amplitude; its clock reached ${ended#GET /ended?} s"
+    [[ -z "$library_path" || -n "$loaded" ]] || fail "Firefox did not load MLX Audio's libpulse"
+    with=
+    [[ -n "$library_path" ]] && with=" with MLX Audio's libpulse"
+    echo "ok   Firefox plays through MLX Audio$with: $seconds s of 523 Hz at $amplitude; its clock reached ${ended#GET /ended?} s"
 else
     echo "skip Firefox (not installed; FIREFOX=PATH names one)"
 fi
