@@ -1,0 +1,877 @@
+// mlx-permissions: MLXIPC's permission agent and its dialog, where the
+// desktop asks the user whether an app may do something (the bus's side:
+// projects/desktop/ipc/prompts.mlx). It is what polkit's authentication
+// agent will stand on (README.md).
+//
+//   mlx-permissions                  the agent: owns org.mlx.PermissionAgent
+//                                    on the session bus (mlx-ipcd starts it
+//                                    from its service file when it first
+//                                    has to ask) and answers the bus's
+//                                    Ask(s app, s permission, b sandboxed)
+//                                    -> (b allowed, b remember) with a
+//                                    dialog (this program again, --ask)
+//   mlx-permissions --answer ANSWER  the agent answering every question at
+//                                    once: allow, deny, allow-remember or
+//                                    deny-remember (for tests)
+//   mlx-permissions --ask APP PERMISSION [--sandboxed] [--answer-fd N]
+//                                    the dialog: "allow" or "deny", and
+//                                    " remember" when its box was ticked,
+//                                    written to descriptor N (else
+//                                    printed); closing it, Escape or two
+//                                    minutes without an answer are a no
+const std = @import("std")
+const dbus = @import("std.dbus")
+const crash = @import("std.crash")
+const canvas_module = @import("std.ui.canvas")
+const text_module = @import("std.ui.text")
+const ui = @import("std.ui")
+const view = @import("std.ui.view")
+const ui_app = @import("std.ui.app")
+const theme_module = @import("std.ui.theme")
+const controls = @import("std.ui.controls")
+const popup = @import("std.ui.popup")
+const host_module = @import("std.ui.host")
+const apps_module = @import("../shared/apps.mlx")
+const clock = @import("../shared/clock.mlx")
+
+const Canvas = canvas_module.Canvas
+const Text = text_module.Text
+const Host = host_module.Host
+
+const BUS: []const u8 = "org.freedesktop.DBus"
+const BUS_PATH: []const u8 = "/org/freedesktop/DBus"
+const AGENT_NAME: []const u8 = "org.mlx.PermissionAgent"
+
+const SYS_read: usize = 0
+const SYS_write: usize = 1
+const SYS_close: usize = 3
+const SYS_poll: usize = 7
+const SYS_access: usize = 21
+const SYS_fork: usize = 57
+const SYS_execve: usize = 59
+const SYS_exit_group: usize = 231
+const SYS_wait4: usize = 61
+const SYS_fcntl: usize = 72
+const SYS_pipe2: usize = 293
+const O_CLOEXEC: usize = 524288
+const F_SETFD: usize = 2
+const POLLIN: u32 = 1
+
+// The agent's answers without a dialog (--answer).
+const ASK_USER: u8 = 0
+const ALLOW: u8 = 1
+const DENY: u8 = 2
+const ALLOW_REMEMBER: u8 = 3
+const DENY_REMEMBER: u8 = 4
+
+// Dialogs open at once.
+const MAX_DIALOGS: usize = 8
+
+// An unanswered dialog is a no after this long (milliseconds; the bus
+// gives up then too).
+const DIALOG_TIMEOUT: usize = 120000
+
+// The dialog's window (logical pixels).
+const WIDTH: i32 = 460
+const HEIGHT: i32 = 214
+const PADDING: i32 = 22
+const ICON: i32 = 48
+
+const KEY_ESCAPE: u32 = 1
+
+// The widgets' ids.
+const ID_REMEMBER: u64 = 1
+const ID_DENY: u64 = 2
+const ID_ALLOW: u64 = 3
+
+const Failure = error { Usage, NoBus, Taken, NoMemory }
+
+fn fail(message: []const u8, failure: Failure) -> Failure!void {
+    const said = std.io.eprintln(message)
+    return failure
+}
+
+fn say(text: []const u8) -> void { const ignored = std.io.writeAll(std.io.stdout(), text) }
+
+fn same(first: []const u8, second: []const u8) -> bool {
+    if first.length != second.length { return false }
+    var index: usize = 0
+    while index < first.length {
+        if first[index] != second[index] { return false }
+        index += 1
+    }
+    return true
+}
+
+fn named(text: std.string.String, name: []const u8) -> bool { return std.string.eql(text, std.string.fromSlice(name)) }
+
+fn copyInto(target: [*]u8, capacity: usize, text: []const u8) -> usize {
+    var index: usize = 0
+    while index < text.length && index < capacity {
+        target[index] = text[index]
+        index += 1
+    }
+    return index
+}
+
+fn advance(bytes: [*]u8, count: usize) -> [*]u8 {
+    unsafe { return @ptrFromInt([*]u8, @intFromPtr(bytes) + count) }
+}
+
+fn nothing() -> [*]const isize {
+    var none: [1]isize = [1]isize{ 0 }
+    unsafe { return @ptrCast([*]const isize, &none) }
+}
+
+fn milliseconds() -> usize {
+    var time: [2]usize = [2]usize{ 0, 0 }
+    const result = std.linux.syscall2(228, 1, @intFromPtr(&time))
+    return time[0] * 1000 + time[1] / 1000000
+}
+
+// ---------------------------------------------------------------------------
+// The agent
+
+// A dialog asking the user, and the bus's call it answers.
+const Dialog = struct {
+    used: bool
+    pid: isize
+    // The read end of the pipe the dialog answers through.
+    pipe: isize
+    serial: u32
+    sender: [256]u8
+    senderLength: usize
+    answer: [64]u8
+    answerLength: usize
+}
+
+const Agent = struct {
+    client: *dbus.Client
+    environment: [*][*]const u8
+    // ASK_USER, or the answer --answer gave.
+    fixed: u8
+    dialogs: [8]Dialog
+}
+
+fn dialogAt(agent: *Agent, slot: usize) -> *Dialog {
+    unsafe { return @ptrCast(*Dialog, &agent.*.dialogs[slot]) }
+}
+
+fn senderOf(dialog: *Dialog) -> []const u8 {
+    var bytes: [*]const u8 = undefined
+    unsafe { bytes = @ptrCast([*]const u8, &dialog.*.sender) }
+    return bytes[0..dialog.*.senderLength]
+}
+
+// The reply (b allowed, b remember) to the call `serial` from `sender`.
+fn answer(agent: *Agent, serial: u32, sender: []const u8, allowed: bool, remember: bool) -> void {
+    var memory: [64]u8 = undefined
+    var bytes: [*]u8 = undefined
+    unsafe { bytes = @ptrCast([*]u8, &memory) }
+    var writing: dbus.Writer = undefined
+    dbus.begin(&writing, bytes, 64, false)
+    dbus.putBool(&writing, allowed)
+    dbus.putBool(&writing, remember)
+    var call = dbus.newHeader(dbus.METHOD_CALL, serial)
+    call.sender = sender
+    const sent = dbus.reply(agent.*.client, &call, "bb", bytes, writing.length, nothing(), 0)
+}
+
+fn refuse(agent: *Agent, message: *const dbus.Header, error_name: []const u8, text: []const u8) -> void {
+    if message.*.flags & dbus.NO_REPLY_EXPECTED != 0 { return }
+    var memory: [512]u8 = undefined
+    var bytes: [*]u8 = undefined
+    unsafe { bytes = @ptrCast([*]u8, &memory) }
+    var writing: dbus.Writer = undefined
+    dbus.begin(&writing, bytes, 512, false)
+    dbus.putString(&writing, text)
+    var header = dbus.newHeader(dbus.ERROR, 0)
+    header.errorName = error_name
+    header.replySerial = message.*.serial
+    header.hasReplySerial = true
+    header.destination = message.*.sender
+    header.signature = "s"
+    const sent = dbus.send(agent.*.client, &header, bytes, writing.length, nothing(), 0)
+}
+
+// `text` NUL-terminated into `target` (at most `capacity` - 1 bytes); the
+// next free byte.
+fn terminated(target: [*]u8, capacity: usize, text: []const u8) -> usize {
+    const length = copyInto(target, capacity - 1, text)
+    target[length] = 0
+    return length + 1
+}
+
+// `value` in decimal into `out`; how many digits.
+fn decimal(out: [*]u8, value: usize) -> usize {
+    var reversed: [24]u8 = undefined
+    var count: usize = 0
+    var rest = value
+    while true {
+        reversed[count] = @intCast(u8, 48 + rest % 10)
+        count += 1
+        rest = rest / 10
+        if rest == 0 { break }
+    }
+    var index: usize = 0
+    while index < count {
+        out[index] = reversed[count - 1 - index]
+        index += 1
+    }
+    return count
+}
+
+// The Wayland display for the dialogs: the agent's own, else the Mlx
+// compositor's socket ($XDG_RUNTIME_DIR/wayland-mlx) when the bus started
+// before it (mlx-session runs the compositor under mlx-ipcd).
+fn waylandEntry(agent: *Agent, entry: [*]u8) -> bool {
+    if std.process.environmentFrom(agent.*.environment, "WAYLAND_DISPLAY") != null { return false }
+    const runtime = std.process.environmentFrom(agent.*.environment, "XDG_RUNTIME_DIR")
+    if runtime == null { return false }
+    var path: [512]u8 = undefined
+    var path_bytes: [*]u8 = undefined
+    unsafe { path_bytes = @ptrCast([*]u8, &path) }
+    var length = copyInto(path_bytes, 480, std.string.asSlice(runtime.?))
+    length += terminated(advance(path_bytes, length), 32, "/wayland-mlx") - 1
+    if std.linux.syscall2(SYS_access, @intFromPtr(path_bytes), 0) != 0 { return false }
+    const ignored = terminated(entry, 64, "WAYLAND_DISPLAY=wayland-mlx")
+    return true
+}
+
+// Shows the dialog for `app` and `permission`; false when it could not.
+fn openDialog(agent: *Agent, message: *const dbus.Header, app: []const u8, permission: []const u8, sandboxed: bool) -> bool {
+    var slot: usize = 0
+    while slot < MAX_DIALOGS && dialogAt(agent, slot).*.used { slot += 1 }
+    if slot == MAX_DIALOGS { return false }
+    var pipe: [2]i32 = [2]i32{ -1, -1 }
+    if std.linux.syscall2(SYS_pipe2, @intFromPtr(&pipe), O_CLOEXEC) != 0 { return false }
+    const read_end = @intCast(isize, pipe[0])
+    const write_end = @intCast(isize, pipe[1])
+    // The arguments: mlx-permissions --ask APP PERMISSION [--sandboxed]
+    // --answer-fd N.
+    var text: [1024]u8 = undefined
+    var text_bytes: [*]u8 = undefined
+    unsafe { text_bytes = @ptrCast([*]u8, &text) }
+    var starts: [8]usize = undefined
+    var count: usize = 0
+    var used: usize = 0
+    starts[count] = used
+    count += 1
+    used += terminated(advance(text_bytes, used), 32, "mlx-permissions")
+    starts[count] = used
+    count += 1
+    used += terminated(advance(text_bytes, used), 32, "--ask")
+    starts[count] = used
+    count += 1
+    used += terminated(advance(text_bytes, used), 256, app)
+    starts[count] = used
+    count += 1
+    used += terminated(advance(text_bytes, used), 128, permission)
+    if sandboxed {
+        starts[count] = used
+        count += 1
+        used += terminated(advance(text_bytes, used), 32, "--sandboxed")
+    }
+    starts[count] = used
+    count += 1
+    used += terminated(advance(text_bytes, used), 32, "--answer-fd")
+    starts[count] = used
+    count += 1
+    var digits: [24]u8 = undefined
+    var digit_bytes: [*]u8 = undefined
+    unsafe { digit_bytes = @ptrCast([*]u8, &digits) }
+    const digit_count = decimal(digit_bytes, @intCast(usize, write_end))
+    used += terminated(advance(text_bytes, used), 32, digit_bytes[0..digit_count])
+    var arguments: [9][*]const u8 = undefined
+    var index: usize = 0
+    while index < count {
+        arguments[index] = advance(text_bytes, starts[index])
+        index += 1
+    }
+    unsafe { arguments[count] = @ptrFromInt([*]const u8, 0) }
+    // The environment, and a Wayland display when it has none.
+    var environment: [512][*]const u8 = undefined
+    var entries: usize = 0
+    while @intFromPtr(agent.*.environment[entries]) != 0 && entries < 500 {
+        environment[entries] = agent.*.environment[entries]
+        entries += 1
+    }
+    var wayland: [64]u8 = undefined
+    var wayland_bytes: [*]u8 = undefined
+    unsafe { wayland_bytes = @ptrCast([*]u8, &wayland) }
+    if waylandEntry(agent, wayland_bytes) {
+        environment[entries] = wayland_bytes
+        entries += 1
+    }
+    unsafe { environment[entries] = @ptrFromInt([*]const u8, 0) }
+    var argument_pointer: [*][*]const u8 = undefined
+    unsafe { argument_pointer = @ptrCast([*][*]const u8, &arguments) }
+    var environment_pointer: [*][*]const u8 = undefined
+    unsafe { environment_pointer = @ptrCast([*][*]const u8, &environment) }
+    const child = std.linux.syscall0(SYS_fork)
+    if child == 0 {
+        // The write end stays open in the dialog; the bus's socket is the
+        // agent's alone.
+        const kept = std.linux.syscall3(SYS_fcntl, @bitCast(usize, write_end), F_SETFD, 0)
+        dbus.closeDescriptor(dbus.descriptorOfClient(agent.*.client))
+        const ignored = std.linux.syscall3(SYS_execve, @intFromPtr("/proc/self/exe"), @intFromPtr(argument_pointer), @intFromPtr(environment_pointer))
+        const exited = std.linux.syscall1(SYS_exit_group, 127)
+    }
+    dbus.closeDescriptor(write_end)
+    if child < 0 {
+        dbus.closeDescriptor(read_end)
+        return false
+    }
+    const dialog = dialogAt(agent, slot)
+    dialog.*.used = true
+    dialog.*.pid = child
+    dialog.*.pipe = read_end
+    dialog.*.serial = message.*.serial
+    var sender: [*]u8 = undefined
+    unsafe { sender = @ptrCast([*]u8, &dialog.*.sender) }
+    dialog.*.senderLength = copyInto(sender, 256, message.*.sender)
+    dialog.*.answerLength = 0
+    return true
+}
+
+// What the dialog wrote; at its end the bus gets the answer.
+fn readDialog(agent: *Agent, dialog: *Dialog) -> void {
+    var answer_bytes: [*]u8 = undefined
+    unsafe { answer_bytes = @ptrCast([*]u8, &dialog.*.answer) }
+    if dialog.*.answerLength < 63 {
+        const got = std.linux.syscall3(SYS_read, @bitCast(usize, dialog.*.pipe), @intFromPtr(advance(answer_bytes, dialog.*.answerLength)), 63 - dialog.*.answerLength)
+        if got > 0 {
+            dialog.*.answerLength += @intCast(usize, got)
+            return
+        }
+        if got < 0 && got != -4 && got != -11 {
+            // An error ends it as the end of the pipe does.
+        } else if got < 0 {
+            return
+        }
+    }
+    dbus.closeDescriptor(dialog.*.pipe)
+    var status: i32 = 0
+    const reaped = std.linux.syscall4(SYS_wait4, @bitCast(usize, dialog.*.pid), @intFromPtr(&status), 0, 0)
+    const said = answer_bytes[0..dialog.*.answerLength]
+    const allowed = said.length >= 5 && same(said[0..5], "allow")
+    var remember = false
+    var index: usize = 0
+    while index + 8 <= said.length {
+        if same(said[index..index + 8], "remember") { remember = true }
+        index += 1
+    }
+    if said.length == 0 { say("mlx-permissions: the dialog ended without an answer (no\n") }
+    answer(agent, dialog.*.serial, senderOf(dialog), allowed, remember)
+    dialog.*.used = false
+}
+
+fn handle(agent: *Agent, message: *const dbus.Header) -> void {
+    if message.*.kind != dbus.METHOD_CALL { return }
+    if !same(message.*.member, "Ask") || !same(message.*.signature, "ssb") {
+        refuse(agent, message, "org.freedesktop.DBus.Error.UnknownMethod", "mlx-permissions answers org.mlx.PermissionAgent.Ask(ssb)")
+        return
+    }
+    // Only the bus asks: an app could otherwise show a question of its
+    // own making in the desktop's dialog.
+    if !same(message.*.sender, BUS) {
+        refuse(agent, message, "org.freedesktop.DBus.Error.AccessDenied", "only the bus asks the permission agent")
+        return
+    }
+    var reading = dbus.reader(dbus.bodyOf(agent.*.client, message), message.*.bodyLength, message.*.big)
+    const app = dbus.readString(&reading)
+    const permission = dbus.readString(&reading)
+    const sandboxed = dbus.readBool(&reading)
+    if reading.failed {
+        refuse(agent, message, "org.freedesktop.DBus.Error.InvalidArgs", "Ask takes (s app, s permission, b sandboxed)")
+        return
+    }
+    say("mlx-permissions: ")
+    say(app)
+    say(" asks for ")
+    say(permission)
+    say(if sandboxed { " (sandboxed)\n" } else { "\n" })
+    if agent.*.fixed != ASK_USER {
+        answer(agent, message.*.serial, message.*.sender, agent.*.fixed == ALLOW || agent.*.fixed == ALLOW_REMEMBER, agent.*.fixed == ALLOW_REMEMBER || agent.*.fixed == DENY_REMEMBER)
+        return
+    }
+    if !openDialog(agent, message, app, permission, sandboxed) {
+        say("mlx-permissions: no dialog could be shown; the answer is no\n")
+        answer(agent, message.*.serial, message.*.sender, false, false)
+    }
+}
+
+fn takeName(client: *dbus.Client) -> !void {
+    var memory: [512]u8 = undefined
+    var bytes: [*]u8 = undefined
+    unsafe { bytes = @ptrCast([*]u8, &memory) }
+    var writing: dbus.Writer = undefined
+    dbus.begin(&writing, bytes, 512, false)
+    dbus.putString(&writing, AGENT_NAME)
+    // DO_NOT_QUEUE.
+    dbus.putU32(&writing, 4)
+    const serial = dbus.call(client, BUS, BUS_PATH, BUS, "RequestName", "su", bytes, writing.length)
+    var reply: dbus.Header = undefined
+    if serial == 0 || !dbus.waitReply(client, serial, &reply, 25000) { return fail("mlx-permissions: no reply from the bus", Failure.NoBus) }
+    if reply.kind == dbus.ERROR { return fail("mlx-permissions: the bus does not let it be the agent", Failure.Taken) }
+    var reading = dbus.reader(dbus.bodyOf(client, &reply), reply.bodyLength, reply.big)
+    if dbus.readU32(&reading) != 1 { return fail("mlx-permissions: another agent runs", Failure.Taken) }
+}
+
+fn runAgent(environment: [*][*]const u8, fixed: u8) -> !void {
+    const allocator = std.page_allocator.init()
+    const memory = allocator.alloc(@sizeOf(Agent), 16)
+    const client_memory = allocator.alloc(@sizeOf(dbus.Client), 16)
+    if memory == null || client_memory == null { return fail("mlx-permissions: no memory", Failure.NoMemory) }
+    var agent: *Agent = undefined
+    unsafe { agent = @ptrCast(*Agent, memory.?) }
+    unsafe { agent.*.client = @ptrCast(*dbus.Client, client_memory.?) }
+    agent.*.environment = environment
+    agent.*.fixed = fixed
+    var slot: usize = 0
+    while slot < MAX_DIALOGS {
+        dialogAt(agent, slot).*.used = false
+        slot += 1
+    }
+    if !dbus.connectSession(agent.*.client, allocator, environment) { return fail("mlx-permissions: no session bus (DBUS_SESSION_BUS_ADDRESS)", Failure.NoBus) }
+    try takeName(agent.*.client)
+    say("mlx-permissions: the permission agent, as ")
+    say(dbus.uniqueName(agent.*.client))
+    say("\n")
+    // The bus's socket and each dialog's pipe (struct pollfd: the
+    // descriptor, then the events wanted and those that came, 16 bits
+    // each).
+    var polled: [18]u32 = undefined
+    var slots: [9]usize = undefined
+    var message: dbus.Header = undefined
+    while true {
+        // What already came (RequestName's reply may have brought more
+        // than itself), then the wait.
+        while dbus.next(agent.*.client, &message, 0) { handle(agent, &message) }
+        if agent.*.client.*.closed { break }
+        polled[0] = @intCast(u32, dbus.descriptorOfClient(agent.*.client))
+        polled[1] = POLLIN
+        var count: usize = 1
+        slot = 0
+        while slot < MAX_DIALOGS {
+            const dialog = dialogAt(agent, slot)
+            if dialog.*.used {
+                polled[count * 2] = @intCast(u32, dialog.*.pipe)
+                polled[count * 2 + 1] = POLLIN
+                slots[count] = slot
+                count += 1
+            }
+            slot += 1
+        }
+        const ready = std.linux.syscall3(SYS_poll, @intFromPtr(&polled), count, @bitCast(usize, @intCast(isize, -1)))
+        if ready < 0 && ready != -4 { break }
+        var index: usize = 1
+        while index < count {
+            if polled[index * 2 + 1] >> 16 != 0 { readDialog(agent, dialogAt(agent, slots[index])) }
+            index += 1
+        }
+    }
+    say("mlx-permissions: the bus went; ending\n")
+}
+
+// ---------------------------------------------------------------------------
+// The dialog
+
+const Ask = struct {
+    host: *Host
+    ready: bool
+    german: bool
+    environment: [*][*]const u8
+    // The question: the app (its id), its name, whether it runs in a
+    // sandbox, and the permission.
+    app: [256]u8
+    appLength: usize
+    name: [96]u8
+    nameLength: usize
+    sandboxed: bool
+    permission: [128]u8
+    permissionLength: usize
+    // Its icon, when its desktop entry has one.
+    apps: apps_module.Apps
+    appIndex: usize
+    remember: bool
+    // Where the answer goes (-1: printed), and whether it went.
+    answerFd: isize
+    answered: bool
+    openedAt: usize
+    scale: i32
+    fontScale: i32
+    title: Text
+    body: Text
+    small: Text
+    ui: view.Ui
+    theme: theme_module.Theme
+}
+
+fn askOf(context: *anyopaque) -> *Ask {
+    unsafe { return @ptrCast(*Ask, context) }
+}
+
+fn titleOf(ask: *Ask) -> *Text {
+    unsafe { return @ptrCast(*Text, &ask.*.title) }
+}
+
+fn bodyOf(ask: *Ask) -> *Text {
+    unsafe { return @ptrCast(*Text, &ask.*.body) }
+}
+
+fn smallOf(ask: *Ask) -> *Text {
+    unsafe { return @ptrCast(*Text, &ask.*.small) }
+}
+
+fn themeOf(ask: *Ask) -> *theme_module.Theme {
+    unsafe { return @ptrCast(*theme_module.Theme, &ask.*.theme) }
+}
+
+fn uiOf(ask: *Ask) -> *view.Ui {
+    unsafe { return @ptrCast(*view.Ui, &ask.*.ui) }
+}
+
+fn appsOf(ask: *Ask) -> *apps_module.Apps {
+    unsafe { return @ptrCast(*apps_module.Apps, &ask.*.apps) }
+}
+
+fn appText(ask: *Ask) -> []const u8 {
+    var bytes: [*]const u8 = undefined
+    unsafe { bytes = @ptrCast([*]const u8, &ask.*.app) }
+    return bytes[0..ask.*.appLength]
+}
+
+fn nameText(ask: *Ask) -> []const u8 {
+    var bytes: [*]const u8 = undefined
+    unsafe { bytes = @ptrCast([*]const u8, &ask.*.name) }
+    return bytes[0..ask.*.nameLength]
+}
+
+fn permissionText(ask: *Ask) -> []const u8 {
+    var bytes: [*]const u8 = undefined
+    unsafe { bytes = @ptrCast([*]const u8, &ask.*.permission) }
+    return bytes[0..ask.*.permissionLength]
+}
+
+fn px(ask: *Ask, value: i32) -> i32 { return value * ask.*.scale }
+
+fn tr(ask: *Ask, english: []const u8, german: []const u8) -> []const u8 { return if ask.*.german { german } else { english } }
+
+fn redraw(ask: *Ask) -> void { host_module.redraw(ask.*.host) }
+
+// The answer, once: to the agent's pipe (or printed), then the window
+// goes.
+fn decide(ask: *Ask, allowed: bool) -> void {
+    if !ask.*.answered {
+        ask.*.answered = true
+        var line: [32]u8 = undefined
+        var bytes: [*]u8 = undefined
+        unsafe { bytes = @ptrCast([*]u8, &line) }
+        var length = copyInto(bytes, 8, if allowed { "allow" } else { "deny" })
+        if ask.*.remember { length += copyInto(advance(bytes, length), 16, " remember") }
+        bytes[length] = 10
+        length += 1
+        if ask.*.answerFd >= 0 {
+            const written = std.linux.syscall3(SYS_write, @bitCast(usize, ask.*.answerFd), @intFromPtr(bytes), length)
+            const closed = std.linux.syscall1(SYS_close, @bitCast(usize, ask.*.answerFd))
+        }
+        say("mlx-permissions: ")
+        say(bytes[0..length])
+    }
+    host_module.quit(ask.*.host)
+}
+
+// What the permission lets an app do ("use the microphone").
+fn doing(ask: *Ask) -> []const u8 {
+    const permission = permissionText(ask)
+    if same(permission, "audio.record") { return tr(ask, "use the microphone", "das Mikrofon verwenden") }
+    if same(permission, "audio.monitor") { return tr(ask, "record the sound of other apps", "den Ton anderer Apps aufnehmen") }
+    if same(permission, "audio.play") { return tr(ask, "play sound", "Ton abspielen") }
+    if same(permission, "audio.manage") { return tr(ask, "change the sound settings", "die Toneinstellungen ändern") }
+    if same(permission, "ipc.manage") { return tr(ask, "change the permissions of apps", "die Berechtigungen von Apps ändern") }
+    return ""
+}
+
+// "Allow Firefox to use the microphone?"
+fn question(ask: *Ask, out: [*]u8) -> usize {
+    var length: usize = 0
+    const what = doing(ask)
+    if ask.*.german {
+        length += copyInto(advance(out, length), 16, "Darf ")
+        length += copyInto(advance(out, length), 96, nameText(ask))
+        if what.length > 0 {
+            length += copyInto(advance(out, length), 4, " ")
+            length += copyInto(advance(out, length), 64, what)
+        } else {
+            length += copyInto(advance(out, length), 4, " ")
+            length += copyInto(advance(out, length), 128, permissionText(ask))
+            length += copyInto(advance(out, length), 16, " verwenden")
+        }
+        length += copyInto(advance(out, length), 4, "?")
+        return length
+    }
+    length += copyInto(advance(out, length), 16, "Allow ")
+    length += copyInto(advance(out, length), 96, nameText(ask))
+    if what.length > 0 {
+        length += copyInto(advance(out, length), 4, " to ")
+        length += copyInto(advance(out, length), 64, what)
+    } else {
+        length += copyInto(advance(out, length), 8, " to use ")
+        length += copyInto(advance(out, length), 128, permissionText(ask))
+    }
+    length += copyInto(advance(out, length), 4, "?")
+    return length
+}
+
+// Who asks and what follows from the answer.
+fn explanation(ask: *Ask, out: [*]u8) -> usize {
+    var length: usize = 0
+    length += copyInto(advance(out, length), 256, appText(ask))
+    if ask.*.sandboxed {
+        length += copyInto(advance(out, length), 64, tr(ask, " runs in a sandbox. ", " läuft in einer Sandbox. "))
+    } else {
+        length += copyInto(advance(out, length), 64, tr(ask, " asks for ", " fragt nach "))
+        length += copyInto(advance(out, length), 128, permissionText(ask))
+        length += copyInto(advance(out, length), 4, ". ")
+    }
+    length += copyInto(advance(out, length), 128, tr(ask, "You can change this later in Settings, Apps.", "Das lässt sich später in Einstellungen, Apps ändern."))
+    return length
+}
+
+fn onEvent(context: *anyopaque, kind: u32, a: u32, b: i32) -> void {
+    const ask = askOf(context)
+    if !ask.*.ready { return }
+    if kind == ui_app.EVENT_CLOSED {
+        // Closing it is a no (not remembered).
+        ask.*.remember = false
+        decide(ask, false)
+        return
+    }
+    if kind == ui_app.EVENT_CONFIGURED {
+        fitScale(ask)
+        redraw(ask)
+        return
+    }
+    if kind == ui_app.EVENT_TICK {
+        if milliseconds() - ask.*.openedAt > DIALOG_TIMEOUT {
+            ask.*.remember = false
+            decide(ask, false)
+        }
+        return
+    }
+    if kind == ui_app.EVENT_KEY && b != 0 && a == KEY_ESCAPE {
+        ask.*.remember = false
+        decide(ask, false)
+        return
+    }
+    const widgets = uiOf(ask)
+    if ui_app.pressing(kind, a, b) { layOut(context) }
+    const fed = ui_app.feed(widgets, kind, a, b)
+    if fed == ui_app.FEED_CLICK { layOut(context) }
+    if (kind == ui_app.EVENT_MOTION || kind == ui_app.EVENT_LEAVE) && fed == ui_app.FEED_NONE { return }
+    redraw(ask)
+}
+
+// The widgets laid out (and a click taken) without drawing.
+fn layOut(context: *anyopaque) -> void {
+    var nowhere = view.layoutCanvas()
+    draw(context, &nowhere)
+}
+
+fn draw(context: *anyopaque, canvas: *Canvas) -> void {
+    const ask = askOf(context)
+    if !ask.*.ready { return }
+    const widgets = uiOf(ask)
+    const theme = themeOf(ask)
+    view.begin(widgets, canvas)
+    const width = host_module.width(ask.*.host)
+    const height = host_module.height(ask.*.host)
+    const s = ask.*.scale
+    canvas_module.fillRect(canvas, 0, 0, width, height, canvas_module.color(255, 30, 32, 40))
+    const padding = px(ask, PADDING)
+    // The app's icon, else a shield.
+    const icon = px(ask, ICON)
+    var drawn = false
+    if ask.*.appIndex < ask.*.apps.count {
+        const app = apps_module.appAt(appsOf(ask), ask.*.appIndex)
+        if apps_module.loadIcon(appsOf(ask), app, @intCast(usize, icon)) {
+            canvas_module.drawImage(canvas, apps_module.imageOf(app), padding, padding, icon, 255)
+            drawn = true
+        }
+    }
+    if !drawn { drawShield(canvas, padding, padding, icon, theme.*.accent) }
+    const left = padding * 2 + icon
+    const room = width - left - padding
+    var text: [768]u8 = undefined
+    var text_bytes: [*]u8 = undefined
+    unsafe { text_bytes = @ptrCast([*]u8, &text) }
+    var length = question(ask, text_bytes)
+    const title_line = px(ask, 22)
+    const title_lines = popup.wrapped(widgets, titleOf(ask), text_bytes[0..length], left, padding - px(ask, 2), room, title_line, 2, theme.*.text)
+    var y = padding + @intCast(i32, title_lines) * title_line + px(ask, 6)
+    length = explanation(ask, text_bytes)
+    const body_line = px(ask, 18)
+    const body_lines = popup.wrapped(widgets, smallOf(ask), text_bytes[0..length], left, y, room, body_line, 3, theme.*.dim)
+    y += @intCast(i32, body_lines) * body_line + px(ask, 8)
+    if controls.checkRow(widgets, ID_REMEMBER, ui.rect(left - px(ask, 4), y, room + px(ask, 4), px(ask, 28)), tr(ask, "Remember this decision", "Diese Entscheidung merken"), if ask.*.remember { controls.CHECK_ON } else { controls.CHECK_OFF }) {
+        ask.*.remember = !ask.*.remember
+    }
+    // Deny and Allow at the bottom right.
+    const button_height = px(ask, 34)
+    const allow_label = tr(ask, "Allow", "Erlauben")
+    const deny_label = tr(ask, "Deny", "Ablehnen")
+    const allow_width = controls.buttonWidth(widgets, bodyOf(ask), allow_label) + px(ask, 24)
+    const deny_width = controls.buttonWidth(widgets, bodyOf(ask), deny_label) + px(ask, 24)
+    const bottom = height - padding - button_height
+    const allow_x = width - padding - allow_width
+    const deny_x = allow_x - px(ask, 10) - deny_width
+    if controls.button(widgets, ID_DENY, ui.rect(deny_x, bottom, deny_width, button_height), deny_label, controls.BUTTON_NORMAL, true) { decide(ask, false) }
+    if controls.button(widgets, ID_ALLOW, ui.rect(allow_x, bottom, allow_width, button_height), allow_label, controls.BUTTON_PRIMARY, true) { decide(ask, true) }
+    if view.end(widgets) { redraw(ask) }
+}
+
+// A shield of `size` pixels at (x, y): what the dialog shows for an app
+// without an icon.
+fn drawShield(canvas: *Canvas, x: i32, y: i32, size: i32, color: u32) -> void {
+    const middle = x + size / 2
+    var row: i32 = 0
+    const span = size - size / 2
+    while row < size {
+        // Straight sides for the upper half, then curving to a point.
+        var half = size * 2 / 5
+        if row > size / 2 {
+            const below = row - size / 2
+            half = half * (span * span - below * below) / (span * span)
+        }
+        canvas_module.fillRect(canvas, middle - half, y + row, half * 2, 1, color)
+        row += 1
+    }
+    // A keyhole.
+    const hole = size / 8
+    canvas_module.fillRoundedRect(canvas, middle - hole, y + size / 3 - hole, hole * 2, hole * 2, hole, canvas_module.color(255, 30, 32, 40))
+    canvas_module.fillRect(canvas, middle - hole / 2, y + size / 3, hole, size / 4, canvas_module.color(255, 30, 32, 40))
+}
+
+// Fonts and theme for the screen's density (again when it changes).
+fn fitScale(ask: *Ask) -> void {
+    const scale = host_module.scale(ask.*.host)
+    ask.*.scale = scale
+    if scale == ask.*.fontScale { return }
+    if ask.*.fontScale != 0 {
+        text_module.unloadText(titleOf(ask))
+        text_module.unloadText(bodyOf(ask))
+        text_module.unloadText(smallOf(ask))
+    }
+    ask.*.fontScale = scale
+    const factor = @intCast(u32, scale)
+    const allocator = std.page_allocator.init()
+    const loaded_title = text_module.loadText(titleOf(ask), 16 * factor, allocator)
+    const loaded_body = text_module.loadText(bodyOf(ask), 13 * factor, allocator)
+    const loaded_small = text_module.loadText(smallOf(ask), 13 * factor, allocator)
+    ask.*.theme = theme_module.scaled(theme_module.dark(), scale)
+    view.init(uiOf(ask), themeOf(ask), bodyOf(ask), smallOf(ask), bodyOf(ask))
+}
+
+fn options() -> host_module.Options {
+    return host_module.Options.{ .title = "Permission", .appId = "org.mlx.permissions", .width = @intCast(u32, WIDTH), .height = @intCast(u32, HEIGHT), .minWidth = WIDTH, .minHeight = HEIGHT }
+}
+
+fn runDialog(arguments: [][*]const u8) -> !void {
+    const count = std.process.count(arguments)
+    if count < 4 { return fail("usage: mlx-permissions --ask APP PERMISSION [--sandboxed] [--answer-fd N]", Failure.Usage) }
+    const allocator = std.page_allocator.init()
+    const memory = allocator.alloc(@sizeOf(Ask), 16)
+    if memory == null { return fail("mlx-permissions: no memory", Failure.NoMemory) }
+    var ask: *Ask = undefined
+    unsafe { ask = @ptrCast(*Ask, memory.?) }
+    ask.*.ready = false
+    ask.*.remember = false
+    ask.*.answered = false
+    ask.*.answerFd = -1
+    ask.*.sandboxed = false
+    ask.*.scale = 1
+    ask.*.fontScale = 0
+    var bytes: [*]u8 = undefined
+    unsafe { bytes = @ptrCast([*]u8, &ask.*.app) }
+    ask.*.appLength = copyInto(bytes, 255, std.string.asSlice(std.process.argument(arguments, 2)))
+    unsafe { bytes = @ptrCast([*]u8, &ask.*.permission) }
+    ask.*.permissionLength = copyInto(bytes, 127, std.string.asSlice(std.process.argument(arguments, 3)))
+    var index: usize = 4
+    while index < count {
+        const argument = std.process.argument(arguments, index)
+        if named(argument, "--sandboxed") {
+            ask.*.sandboxed = true
+        } else if named(argument, "--answer-fd") && index + 1 < count {
+            index += 1
+            const digits = std.string.asSlice(std.process.argument(arguments, index))
+            var value: isize = 0
+            var at: usize = 0
+            while at < digits.length && digits[at] >= 48 && digits[at] <= 57 {
+                value = value * 10 + @intCast(isize, digits[at] - 48)
+                at += 1
+            }
+            ask.*.answerFd = value
+        }
+        index += 1
+    }
+    const host = host_module.create(options(), @ptrCast(*anyopaque, ask), draw, onEvent)
+    if host == null { return fail("mlx-permissions: no memory", Failure.NoMemory) }
+    ask.*.host = host.?
+    try host_module.open(ask.*.host, arguments)
+    ask.*.environment = host_module.environment(ask.*.host)
+    ask.*.german = clock.germanLocale(ask.*.environment)
+    // The app's name and icon from its desktop entry; its id otherwise.
+    ask.*.appIndex = 0
+    unsafe { bytes = @ptrCast([*]u8, &ask.*.name) }
+    ask.*.nameLength = copyInto(bytes, 96, appText(ask))
+    if apps_module.init(appsOf(ask), ask.*.environment, allocator) {
+        apps_module.scan(appsOf(ask))
+        ask.*.appIndex = apps_module.find(appsOf(ask), appText(ask))
+        if ask.*.appIndex < ask.*.apps.count { ask.*.nameLength = copyInto(bytes, 96, apps_module.nameOf(apps_module.appAt(appsOf(ask), ask.*.appIndex))) }
+    } else {
+        ask.*.apps.count = 0
+    }
+    fitScale(ask)
+    host_module.setTitle(ask.*.host, tr(ask, "Permission", "Berechtigung"))
+    host_module.setTick(ask.*.host, 1000)
+    ask.*.openedAt = milliseconds()
+    ask.*.ready = true
+    redraw(ask)
+    defer unanswered(ask)
+    try host_module.run(ask.*.host)
+}
+
+// The window went without an answer (the compositor ended): a no.
+fn unanswered(ask: *Ask) -> void {
+    if ask.*.answered { return }
+    ask.*.remember = false
+    decide(ask, false)
+}
+
+pub fn main(arguments: [][*]const u8) -> !void {
+    const installed = crash.install()
+    const count = std.process.count(arguments)
+    if count >= 2 && named(std.process.argument(arguments, 1), "--ask") {
+        try runDialog(arguments)
+        return
+    }
+    var fixed = ASK_USER
+    if count >= 3 && named(std.process.argument(arguments, 1), "--answer") {
+        const given = std.process.argument(arguments, 2)
+        if named(given, "allow") {
+            fixed = ALLOW
+        } else if named(given, "deny") {
+            fixed = DENY
+        } else if named(given, "allow-remember") {
+            fixed = ALLOW_REMEMBER
+        } else if named(given, "deny-remember") {
+            fixed = DENY_REMEMBER
+        } else {
+            return fail("mlx-permissions: --answer takes allow, deny, allow-remember or deny-remember", Failure.Usage)
+        }
+    } else if count >= 2 {
+        return fail("usage: mlx-permissions [--answer allow|deny|allow-remember|deny-remember] | --ask APP PERMISSION [--sandboxed] [--answer-fd N]", Failure.Usage)
+    }
+    try runAgent(std.process.environmentEntries(arguments), fixed)
+}

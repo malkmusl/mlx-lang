@@ -25,6 +25,8 @@ work=$(mktemp -d)
 # A short runtime directory: Unix socket paths are limited.
 export XDG_RUNTIME_DIR=$(mktemp -d /tmp/record.XXXXXX)
 export XDG_CONFIG_HOME="$work/config"
+# Which apps asked for which permission (MLXIPC keeps it there).
+export XDG_STATE_HOME="$work/state"
 mkdir -p "$XDG_CONFIG_HOME/mlx" "$work/services"
 bus_pid=
 cleanup() {

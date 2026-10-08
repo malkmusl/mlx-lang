@@ -14,6 +14,11 @@
 #     .flatpak-info) may play but not record until ipc.conf allows it
 #     (`use audio.record`), a deny rule takes playing from an unsandboxed
 #     app, and one taking org.mlx.Audio leaves the app no channel;
+#   - asking (MLXIPC's `ask`, the default for recording): the bus starts
+#     the permission agent (mlx-permissions --answer), a plain answer holds
+#     for the session, a remembered one is a rule; SetPermission
+#     (mlx-ipc permit) changes it and a recording ends at once; with no
+#     agent the answer is no;
 #   - an app killed while it plays leaves no stream behind; the server's
 #     memory stays the same over a long stream;
 #   - virtual sinks: a stream played to one is in its monitor, in the
@@ -39,6 +44,8 @@ cleanup() {
 trap cleanup EXIT
 export XDG_RUNTIME_DIR="$work/runtime"
 export XDG_CONFIG_HOME="$work/config"
+# Which apps asked for which permission (MLXIPC keeps it there).
+export XDG_STATE_HOME="$work/state"
 mkdir -m 700 "$XDG_RUNTIME_DIR"
 mkdir -p "$XDG_CONFIG_HOME/mlx" "$work/services"
 : > "$XDG_CONFIG_HOME/mlx/ipc.conf"
@@ -171,6 +178,63 @@ if command -v bwrap > /dev/null && bwrap --bind / / true 2> /dev/null; then
     if "${sandboxed[@]}" "$play" tone 440 1 > "$work/out.txt" 2>&1; then fail "a denied app got a channel"; fi
     grep -q "may not talk to MLX Audio" "$work/out.txt" || fail "no channel: $(cat "$work/out.txt")"
     echo "ok   sandboxed: no channel when it may not talk to org.mlx.Audio"
+
+    # The permission agent (projects/desktop/permissions), answering at
+    # once (--answer): the bus starts it when it has to ask, keeps a plain
+    # answer for the session and a remembered one as a rule of ipc.conf.
+    "$compiler" --quiet projects/desktop/permissions/main.mlx -o "$work/mlx-permissions"
+    "$compiler" --quiet projects/desktop/ipc/tool.mlx -o "$work/mlx-ipc"
+    ipc="$work/mlx-ipc"
+    agent() {
+        pkill -x -P "$bus_pid" mlx-permissions 2> /dev/null || true
+        sleep 0.2
+        if [[ $1 == none ]]; then
+            rm -f "$work/services/org.mlx.PermissionAgent.service"
+        else
+            printf '[D-BUS Service]\nName=org.mlx.PermissionAgent\nExec=%s --answer %s\n' "$work/mlx-permissions" "$1" > "$work/services/org.mlx.PermissionAgent.service"
+        fi
+    }
+    asked() { grep -c "asking the user whether org.example.Player may use audio.record" "$work/bus.log" || true; }
+    : > "$XDG_CONFIG_HOME/mlx/ipc.conf"
+    sleep 0.3
+    agent deny
+    if "${sandboxed[@]}" "$play" record "$work/x.wav" 1 > "$work/out.txt" 2>&1; then fail "it recorded though the user said no"; fi
+    grep -q "starting org.mlx.PermissionAgent" "$work/bus.log" && [[ $(asked) -eq 1 ]] || fail "the bus did not start the agent and ask"
+    if "${sandboxed[@]}" "$play" record "$work/x.wav" 1 > /dev/null 2>&1; then fail "the second time it recorded"; fi
+    [[ $(asked) -eq 1 ]] || fail "the bus asked again within the session"
+    expect "the answer holds for the session" "org.example.Player  audio.record  session-deny  sandboxed" "$ipc" permissions
+    [[ ! -s "$XDG_CONFIG_HOME/mlx/ipc.conf" ]] || fail "a plain answer became a rule: $(cat "$XDG_CONFIG_HOME/mlx/ipc.conf")"
+    grep -q "org.example.Player	audio.record	1" "$XDG_STATE_HOME/mlx/ipc-seen" || fail "ipc-seen: $(cat "$XDG_STATE_HOME/mlx/ipc-seen")"
+    echo "ok   the agent asked once; the no holds for the session, not as a rule"
+    "$ipc" permit org.example.Player audio.record default > /dev/null || fail "permit default"
+    agent allow-remember
+    "${sandboxed[@]}" "$play" record "$work/x.wav" 1 > /dev/null 2>&1 || fail "the user said yes, it did not record"
+    grep -qx "allow org.example.Player use audio.record" "$XDG_CONFIG_HOME/mlx/ipc.conf" || fail "no rule remembered: $(cat "$XDG_CONFIG_HOME/mlx/ipc.conf")"
+    expect "the remembered answer" "org.example.Player  audio.record  allow  sandboxed" "$ipc" permissions
+    echo "ok   a remembered yes is a rule of ipc.conf"
+    # Taken back in the settings (SetPermission): the recording ends
+    # (org.mlx.IPC.PermissionsChanged, no recheck asked for).
+    "${sandboxed[@]}" "$play" record "$work/taken.wav" 6 > "$work/taken.txt" 2>&1 &
+    first=$!
+    sleep 1
+    "$ipc" permit org.example.Player audio.record deny > /dev/null || fail "permit deny"
+    start=$(date +%s)
+    wait "$first" || true
+    [[ $(( $(date +%s) - start )) -lt 3 ]] && grep -q "ended" "$work/taken.txt" || fail "the recording went on: $(cat "$work/taken.txt")"
+    grep -qx "deny org.example.Player use audio.record" "$XDG_CONFIG_HOME/mlx/ipc.conf" && [[ $(wc -l < "$XDG_CONFIG_HOME/mlx/ipc.conf") -eq 1 ]] || fail "SetPermission wrote: $(cat "$XDG_CONFIG_HOME/mlx/ipc.conf")"
+    echo "ok   SetPermission replaces the rule and a recording ends at once"
+    expect "a sandboxed app may not change permissions" "AccessDenied" "${sandboxed[@]}" "$ipc" permit org.example.Player audio.record allow
+    "$ipc" permit org.example.Player audio.record default > /dev/null || fail "permit default"
+    [[ ! -s "$XDG_CONFIG_HOME/mlx/ipc.conf" ]] || fail "default left: $(cat "$XDG_CONFIG_HOME/mlx/ipc.conf")"
+    expect "back to the default" "org.example.Player  audio.record  default-ask  sandboxed" "$ipc" permissions
+    if command -v dbus-send > /dev/null; then
+        expect "only the bus asks the agent" "AccessDenied" dbus-send --session --print-reply --dest=org.mlx.PermissionAgent /org/mlx/PermissionAgent org.mlx.PermissionAgent.Ask string:org.example.Fake string:audio.record boolean:true
+    fi
+    agent none
+    if "${sandboxed[@]}" "$play" record "$work/x.wav" 1 > /dev/null 2>&1; then fail "it recorded with nobody to ask"; fi
+    echo "ok   with no agent to ask the answer is no"
+    : > "$XDG_CONFIG_HOME/mlx/ipc.conf"
+    sleep 0.3
 else
     echo "skip the sandboxed app (no working bwrap)"
 fi

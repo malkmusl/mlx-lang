@@ -44,6 +44,9 @@
 #      (started by the bus) it mutes the output and turns the volume down;
 #      the nested compositor tells its output in <socket>.display, and the
 #      Display page's night light switch reaches compositor.conf.
+#  15. the permission dialog (mlx-permissions, with bwrap): a sandboxed
+#      app records, MLXIPC starts the agent, its dialog opens; Remember and
+#      Allow are clicked: the app records and ipc.conf keeps the rule.
 #
 # Typed commands create marker files, so keyboard delivery is verified at the
 # shell; the moved window's focus frame is checked in the host's screenshot.
@@ -70,6 +73,8 @@ mkdir -m 700 "$XDG_RUNTIME_DIR"
 # The compositor's settings file: the defaults unless a scenario writes one
 # (not the user's own ~/.config/mlx/compositor.conf).
 export XDG_CONFIG_HOME="$work/config"
+# Which apps asked for which permission (MLXIPC keeps it there).
+export XDG_STATE_HOME="$work/state"
 mkdir -p "$XDG_CONFIG_HOME/mlx"
 # GTK's document portal may have mounted itself under the runtime directory.
 trap 'fusermount -u "$XDG_RUNTIME_DIR/doc" 2> /dev/null || true; rm -rf -- "$work"' EXIT
@@ -622,6 +627,59 @@ grep -qx "night-light = on" "$XDG_CONFIG_HOME/mlx/compositor.conf" && grep -qx "
 grep -q "night light 4000 K" "$work/pages-compositor.log" || { echo "the compositor did not read night light" >&2; cat "$work/pages-compositor.log" >&2; exit 1; }
 rm -f "$XDG_CONFIG_HOME/mlx/compositor.conf"
 echo "ok   mlx-settings' Sound page controls MLX Audio (output off, volume $((volume * 100 / 65536))%); the Display page reads the output and writes night light"
+
+# Scenario 15: the permission dialog (projects/desktop/permissions). A
+# sandboxed app (bwrap with a .flatpak-info) records; MLXIPC has to ask
+# (audio.record), starts mlx-permissions from its service file, and its
+# dialog opens on the compositor (at (24, 24); the question takes two
+# lines: "Remember this decision" at y 153, Allow at (422, 198)). Both are
+# clicked: the app records and ipc.conf keeps the answer.
+if command -v bwrap > /dev/null && bwrap --bind / / true 2> /dev/null; then
+    "$compiler" --quiet projects/desktop/permissions/main.mlx -o "$work/mlx-permissions"
+    cat > "$work/services/org.mlx.PermissionAgent.service" <<SERVICE
+[D-BUS Service]
+Name=org.mlx.PermissionAgent
+Exec=$work/mlx-permissions
+SERVICE
+    : > "$XDG_CONFIG_HOME/mlx/ipc.conf"
+    # The bus starts before the compositor (as in mlx-session): the agent
+    # gets the compositor's display from it.
+    WAYLAND_DISPLAY=nested-permission LC_ALL=C "$work/mlx-ipcd" --verbose --services "$work/services" > "$work/permission-ipc.log" 2>&1 &
+    ipc_pid=$!
+    for _ in $(seq 1 50); do [[ -S "$XDG_RUNTIME_DIR/bus" ]] && break; sleep 0.1; done
+    export DBUS_SESSION_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/bus"
+    printf '[Application]\nname=org.example.Recorder\n' > "$work/flatpak-info"
+    cat > "$work/record.sh" <<SCRIPT
+#!/bin/sh
+bwrap --bind / / --ro-bind "$work/flatpak-info" /.flatpak-info "$work/mlx-audio" record "$work/permitted.wav" 1 > "$work/record.log" 2>&1
+echo "status \$?" >> "$work/record.log"
+SCRIPT
+    chmod +x "$work/record.sh"
+    cat > "$work/permission.script" <<SCRIPT
+wait 5000
+pointer 123 153
+press 272
+release 272
+wait 300
+pointer 422 198
+press 272
+release 272
+wait 2500
+close
+SCRIPT
+    run_scenario permission "$work/permission.script" --no-fps --run "$work/record.sh"
+    kill "$ipc_pid" 2> /dev/null || true
+    pkill -x -P "$ipc_pid" mlx-audiod 2> /dev/null || true
+    unset DBUS_SESSION_BUS_ADDRESS
+    sleep 0.3
+    grep -q "^map: Permission" "$work/permission-compositor.log" || { echo "the permission dialog did not open" >&2; cat "$work/permission-ipc.log" "$work/permission-compositor.log" >&2; exit 1; }
+    grep -q "status 0" "$work/record.log" && [[ -s "$work/permitted.wav" ]] || { echo "the app did not record after Allow: $(cat "$work/record.log")" >&2; cat "$work/permission-ipc.log" >&2; exit 1; }
+    grep -qx "allow org.example.Recorder use audio.record" "$XDG_CONFIG_HOME/mlx/ipc.conf" || { echo "Remember did not keep the answer: $(cat "$XDG_CONFIG_HOME/mlx/ipc.conf")" >&2; cat "$work/permission-ipc.log" >&2; exit 1; }
+    echo "ok   the permission dialog asks the user; Allow with Remember lets the app record and becomes a rule"
+    : > "$XDG_CONFIG_HOME/mlx/ipc.conf"
+else
+    echo "skip the permission dialog (no working bwrap)"
+fi
 
 # Scenario 10: a GTK 3 window (libgtk-3 through ctypes: no GTK 3 program
 # is needed). GTK 3 knows only KDE's server decoration, not xdg-decoration.

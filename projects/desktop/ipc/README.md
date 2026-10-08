@@ -57,10 +57,11 @@ runs as the same user. MLXIPC's is per app, as in hyprtavern:
   ListNames, GetNameOwner, NameOwnerChanged). A rule names the connection
   it talks to by any name that connection owns, as dbus-daemon's
   `send_destination` does.
-- And **use** a service's permission: `audio.play`, `audio.record`
-  (MLX Audio). Services ask the bus (`org.mlx.IPC.Check(s app's
-  connection, s permission) -> b`) before they do what it names, so the
-  rules for every service are in one place.
+- And **use** a service's permission: `audio.play`, `audio.record`,
+  `audio.monitor`, `audio.control` (MLX Audio). Services ask the bus
+  (`org.mlx.IPC.Check(s app's connection, s permission) -> b`) before
+  they do what it names, so the rules for every service are in one
+  place.
 - By default an unsandboxed app may do anything (as on any session bus),
   and a sandboxed one may own its own names (its id and the names under
   it), talk to and see those, other connections of the same app, the
@@ -68,6 +69,8 @@ runs as the same user. MLXIPC's is per app, as in hyprtavern:
   and MLX Audio (`org.mlx.Audio`), and use `audio.play`; it sees nothing
   else, not even the other connections' unique names. Replies to calls an app made always
   come back; a reply nobody asked for needs the rules.
+- For a sandboxed app the microphone (`audio.record`) and the sound of
+  other apps (`audio.monitor`) are **asked**: the user decides (below).
 - `~/.config/mlx/ipc.conf` (`--policy FILE`) adds rules, read again when
   it changes (and on SIGHUP, ReloadConfig, `mlx-ipc reload`). The last
   rule that applies wins:
@@ -76,6 +79,7 @@ runs as the same user. MLXIPC's is per app, as in hyprtavern:
 # MLXIPC permissions
 group media obs com.obsproject.Studio
 allow @media use audio.record
+ask org.example.Chat use audio.record
 allow org.mozilla.firefox talk org.freedesktop.secrets
 deny firefox talk org.freedesktop.secrets
 deny @sandboxed own *
@@ -84,7 +88,38 @@ strict            # unsandboxed apps get nothing by default either
 
 Subjects: an app, `@GROUP`, `@sandboxed`, `@unsandboxed` or `@all`.
 Names: a name, `prefix.*` (prefix and the names under it), `*` or `self`.
-A refused call gets `org.freedesktop.DBus.Error.AccessDenied`.
+A refused call gets `org.freedesktop.DBus.Error.AccessDenied`. `ask`
+(for `use` only) has the user decide.
+
+## Asking the user
+
+When the decision is to ask, the Check waits and the bus asks the
+permission agent: `org.mlx.PermissionAgent.Ask(s app, s permission, b
+sandboxed) -> (b allowed, b remember)` on whoever owns that name. It is
+`mlx-permissions` (`projects/desktop/permissions`), started from its
+service file when nobody owns the name yet; it shows a dialog. The answer
+goes to every Check waiting on the same question. Remembered, it becomes
+a rule of `ipc.conf` (the app's other lines for that permission go);
+otherwise it holds until the bus ends. With no agent to be had, or no
+answer within two minutes, the answer is no. The agent takes Ask from the
+bus only.
+
+Whenever the rules change (the file, a remembered answer, SetPermission),
+the bus sends `org.mlx.IPC.PermissionsChanged` and services check again:
+MLX Audio ends a recording whose permission went.
+
+The bus keeps which app asked for which permission
+(`$XDG_STATE_HOME/mlx/ipc-seen`, `~/.local/state/mlx/ipc-seen`), for
+mlx-settings' Apps category:
+
+- `org.mlx.IPC.ListPermissions() -> a(sssb)`: app, permission, decision,
+  sandboxed. The decision is `allow`, `deny` or `ask` (a rule of
+  `ipc.conf`), `session-allow` or `session-deny` (an answer for this
+  session), or `default-allow`, `default-deny`, `default-ask` (what the
+  defaults say).
+- `org.mlx.IPC.SetPermission(s app, s permission, s decision)`: `allow`,
+  `deny`, `ask`, or `default` (the app's rule for it goes). It needs the
+  permission `ipc.manage` (unsandboxed apps have it, sandboxed ones not).
 
 ## Direct channels
 
@@ -100,7 +135,8 @@ the app's permissions after the app left the bus. MLX Audio's streams go
 this way.
 
 `org.mlx.IPC` also answers Check(s, s) -> b, GetAppId(s) -> (s app, b
-sandboxed), ListApps() -> a(ssbu) and Reload().
+sandboxed), ListApps() -> a(ssbu), ListPermissions() -> a(sssb),
+SetPermission(sss) and Reload().
 
 ## mlx-ipc
 
@@ -111,6 +147,9 @@ mlx-ipc reload             the bus reads its policy again
 mlx-ipc serve NAME         owns NAME, answers org.mlx.Echo.Echo(s)
 mlx-ipc call NAME TEXT     calls NAME's org.mlx.Echo.Echo(TEXT)
 mlx-ipc connect NAME       a direct channel to NAME; prints what comes through
+mlx-ipc permissions        what apps asked for: app, permission, decision
+mlx-ipc permit APP PERMISSION allow|deny|ask|default
+                           a rule for it in ipc.conf (default: none)
 ```
 
 ## Modules
@@ -121,7 +160,8 @@ mlx-ipc connect NAME       a direct channel to NAME; prints what comes through
 | `state.mlx` | the records: bus, clients, names, match rules, waiting replies, policy, activation |
 | `bus.mlx` | clients, authentication, names, match rules, routing, monitors |
 | `driver.mlx` | what the bus answers itself (org.freedesktop.DBus, org.mlx.IPC) and its signals |
-| `policy.mlx` | who a connection is, the rules file, the decisions |
+| `policy.mlx` | who a connection is, the rules file, the decisions, rules written back (`setRule`) |
+| `prompts.mlx` | asking the user through the permission agent, answers for the session, the apps that asked, ListPermissions and SetPermission |
 | `activation.mlx` | `.service` files, starting services, calls waiting for them |
 | `tool.mlx` | mlx-ipc |
 
@@ -129,6 +169,5 @@ mlx-ipc connect NAME       a direct channel to NAME; prints what comes through
 
 - A native MLXIPC protocol next to D-Bus: typed messages (as hyprwire),
   discovery on the bus, the traffic over direct channels.
-- Permission prompts: an app asks, the user answers once in a dialog of
-  the desktop's, and the answer goes into `ipc.conf`; the rules in
-  mlx-settings.
+- polkit: the same agent asks for the system's actions (README of
+  `projects/desktop/permissions`).

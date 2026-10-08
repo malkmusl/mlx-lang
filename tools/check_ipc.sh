@@ -41,6 +41,8 @@ cleanup() {
 trap cleanup EXIT
 export XDG_RUNTIME_DIR="$work/runtime"
 export XDG_CONFIG_HOME="$work/config"
+# Which apps asked for which permission (MLXIPC keeps it there).
+export XDG_STATE_HOME="$work/state"
 mkdir -m 700 "$XDG_RUNTIME_DIR"
 mkdir -p "$XDG_CONFIG_HOME/mlx" "$work/services"
 

@@ -1,0 +1,569 @@
+// Asking the user. When the policy says `ask` (policy.decideUse: a
+// sandboxed app wants the microphone, or a rule says so), the Check that
+// asked waits while the permission agent asks the user: the bus calls
+// org.mlx.PermissionAgent.Ask(s app, s permission, b sandboxed) -> (b
+// allowed, b remember) on whoever owns that name (mlx-permissions, which
+// shows a dialog; projects/desktop/permissions), started from its service
+// file when nobody does. The answer goes to every Check waiting for the
+// same app and permission. Remembered, it becomes a rule in ipc.conf
+// (policy.setRule); otherwise it holds for this session (until the bus
+// ends). With no agent, or no answer within two minutes, the answer is
+// no.
+//
+// The bus also keeps which apps asked for which permission
+// ($XDG_STATE_HOME/mlx/ipc-seen), and answers for the Apps settings:
+//
+//   org.mlx.IPC.ListPermissions() -> a(sssb): app, permission, decision
+//     (allow, deny, ask: a rule of ipc.conf; session-allow, session-deny:
+//     an answer for this session; default-allow, default-deny,
+//     default-ask: what the defaults say), sandboxed
+//   org.mlx.IPC.SetPermission(s app, s permission, s decision): allow,
+//     deny, ask or default (the rule goes); needs ipc.manage
+const std = @import("std")
+const dbus = @import("std.dbus")
+const state = @import("./state.mlx")
+const bus_module = @import("./bus.mlx")
+const policy = @import("./policy.mlx")
+const driver = @import("./driver.mlx")
+const activation = @import("./activation.mlx")
+
+pub const AGENT_NAME: []const u8 = "org.mlx.PermissionAgent"
+pub const MAX_PROMPTS: usize = 16
+pub const MAX_GRANTS: usize = 64
+pub const MAX_SEEN: usize = 256
+// An unanswered question is a no after this long (milliseconds).
+const TIMEOUT: usize = 120000
+
+fn same(first: []const u8, second: []const u8) -> bool { return bus_module.same(first, second) }
+fn copyInto(target: [*]u8, capacity: usize, text: []const u8) -> usize { return bus_module.copyInto(target, capacity, text) }
+
+fn milliseconds() -> usize {
+    var time: [2]usize = [2]usize{ 0, 0 }
+    const result = std.linux.syscall2(228, 1, @intFromPtr(&time))
+    return time[0] * 1000 + time[1] / 1000000
+}
+
+fn promptAt(bus: *state.Bus, slot: usize) -> *state.Prompt {
+    unsafe { return @ptrCast(*state.Prompt, &bus.*.prompts[slot]) }
+}
+
+fn grantAt(bus: *state.Bus, slot: usize) -> *state.Grant {
+    unsafe { return @ptrCast(*state.Grant, &bus.*.grants[slot]) }
+}
+
+fn seenAt(bus: *state.Bus, slot: usize) -> *state.Seen {
+    unsafe { return @ptrCast(*state.Seen, &bus.*.seen[slot]) }
+}
+
+fn promptApp(prompt: *state.Prompt) -> []const u8 {
+    var bytes: [*]const u8 = undefined
+    unsafe { bytes = @ptrCast([*]const u8, &prompt.*.app) }
+    return bytes[0..prompt.*.appLength]
+}
+
+fn promptPermission(prompt: *state.Prompt) -> []const u8 {
+    var bytes: [*]const u8 = undefined
+    unsafe { bytes = @ptrCast([*]const u8, &prompt.*.permission) }
+    return bytes[0..prompt.*.permissionLength]
+}
+
+fn grantApp(grant: *state.Grant) -> []const u8 {
+    var bytes: [*]const u8 = undefined
+    unsafe { bytes = @ptrCast([*]const u8, &grant.*.app) }
+    return bytes[0..grant.*.appLength]
+}
+
+fn grantPermission(grant: *state.Grant) -> []const u8 {
+    var bytes: [*]const u8 = undefined
+    unsafe { bytes = @ptrCast([*]const u8, &grant.*.permission) }
+    return bytes[0..grant.*.permissionLength]
+}
+
+fn seenApp(seen: *state.Seen) -> []const u8 {
+    var bytes: [*]const u8 = undefined
+    unsafe { bytes = @ptrCast([*]const u8, &seen.*.app) }
+    return bytes[0..seen.*.appLength]
+}
+
+fn seenPermission(seen: *state.Seen) -> []const u8 {
+    var bytes: [*]const u8 = undefined
+    unsafe { bytes = @ptrCast([*]const u8, &seen.*.permission) }
+    return bytes[0..seen.*.permissionLength]
+}
+
+// ---------------------------------------------------------------------------
+// The apps that asked
+
+fn appendPath(bus: *state.Bus, text: []const u8) -> void {
+    var bytes: [*]u8 = undefined
+    unsafe { bytes = @ptrCast([*]u8, &bus.*.seenPath) }
+    bus.*.seenPathLength += copyInto(bus_module.advance(bytes, bus.*.seenPathLength), 480 - bus.*.seenPathLength, text)
+    bytes[bus.*.seenPathLength] = 0
+}
+
+fn seenPathOf(bus: *state.Bus) -> [*]u8 {
+    unsafe { return @ptrCast([*]u8, &bus.*.seenPath) }
+}
+
+// The directory of the path so far, made (errors ignored).
+fn makeDirectory(bus: *state.Bus) -> void { const made = std.fs.makeDir(seenPathOf(bus), 448) }
+
+pub fn init(bus: *state.Bus) -> void {
+    var slot: usize = 0
+    while slot < MAX_PROMPTS {
+        promptAt(bus, slot).*.used = false
+        slot += 1
+    }
+    bus.*.grantCount = 0
+    bus.*.seenCount = 0
+    bus.*.seenPathLength = 0
+    const directory = std.process.environmentFrom(bus.*.environment, "XDG_STATE_HOME")
+    if directory != null && directory.?.length > 0 {
+        appendPath(bus, std.string.asSlice(directory.?))
+    } else {
+        const home = std.process.environmentFrom(bus.*.environment, "HOME")
+        if home == null || home.?.length == 0 { return }
+        appendPath(bus, std.string.asSlice(home.?))
+        appendPath(bus, "/.local")
+        makeDirectory(bus)
+        appendPath(bus, "/state")
+    }
+    makeDirectory(bus)
+    appendPath(bus, "/mlx")
+    makeDirectory(bus)
+    appendPath(bus, "/ipc-seen")
+    loadSeen(bus)
+}
+
+fn field(line: []const u8, index: usize) -> []const u8 {
+    var at: usize = 0
+    var count: usize = 0
+    while count < index {
+        while at < line.length && line[at] != 9 { at += 1 }
+        if at >= line.length { return line[0..0] }
+        at += 1
+        count += 1
+    }
+    var end = at
+    while end < line.length && line[end] != 9 { end += 1 }
+    return line[at..end]
+}
+
+fn addSeen(bus: *state.Bus, app: []const u8, permission: []const u8, sandboxed: bool) -> void {
+    if bus.*.seenCount >= MAX_SEEN || app.length == 0 || permission.length == 0 { return }
+    const seen = seenAt(bus, bus.*.seenCount)
+    var bytes: [*]u8 = undefined
+    unsafe { bytes = @ptrCast([*]u8, &seen.*.app) }
+    seen.*.appLength = copyInto(bytes, 128, app)
+    unsafe { bytes = @ptrCast([*]u8, &seen.*.permission) }
+    seen.*.permissionLength = copyInto(bytes, 64, permission)
+    seen.*.sandboxed = sandboxed
+    bus.*.seenCount += 1
+}
+
+fn loadSeen(bus: *state.Bus) -> void {
+    const memory = bus.*.allocator.alloc(65536, 16)
+    if memory == null { return }
+    const length = policy.readFile(seenPathOf(bus), memory.?, 65536)
+    var start: usize = 0
+    while start < length {
+        var end = start
+        while end < length && memory.?[end] != 10 { end += 1 }
+        const line = memory.?[start..end]
+        addSeen(bus, field(line, 0), field(line, 1), same(field(line, 2), "1"))
+        start = end + 1
+    }
+    bus.*.allocator.free(memory.?, 65536, 16)
+}
+
+fn saveSeen(bus: *state.Bus) -> void {
+    if bus.*.seenPathLength == 0 { return }
+    const memory = bus.*.allocator.alloc(65536, 16)
+    if memory == null { return }
+    var length: usize = 0
+    var slot: usize = 0
+    while slot < bus.*.seenCount && length + 256 < 65536 {
+        const seen = seenAt(bus, slot)
+        length += copyInto(bus_module.advance(memory.?, length), 128, seenApp(seen))
+        memory.?[length] = 9
+        length += 1
+        length += copyInto(bus_module.advance(memory.?, length), 64, seenPermission(seen))
+        length += copyInto(bus_module.advance(memory.?, length), 3, if seen.*.sandboxed { "\t1\n" } else { "\t0\n" })
+        slot += 1
+    }
+    // O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC.
+    const file = std.fs.open(seenPathOf(bus), 1 | 64 | 512 | 524288, 384)
+    if file.descriptor >= 0 {
+        const written = std.fs.writeAllBytes(file, memory.?, length)
+        const closed = std.fs.close(file)
+    }
+    bus.*.allocator.free(memory.?, 65536, 16)
+}
+
+// Notes that `identity` asked for `permission` (kept when it is new).
+pub fn note(bus: *state.Bus, identity: *const state.Identity, permission: []const u8) -> void {
+    const app = policy.appOf(identity)
+    var slot: usize = 0
+    while slot < bus.*.seenCount {
+        const seen = seenAt(bus, slot)
+        if same(seenApp(seen), app) && same(seenPermission(seen), permission) { return }
+        slot += 1
+    }
+    addSeen(bus, app, permission, identity.*.sandboxed)
+    saveSeen(bus)
+}
+
+// ---------------------------------------------------------------------------
+// This session's answers
+
+// The answer the user gave this session (state.ALLOW, DENY), or
+// policy.NO_RULE.
+pub fn sessionAnswer(bus: *state.Bus, app: []const u8, permission: []const u8) -> u8 {
+    var slot: usize = 0
+    while slot < bus.*.grantCount {
+        const grant = grantAt(bus, slot)
+        if same(grantApp(grant), app) && same(grantPermission(grant), permission) { return if grant.*.allowed { state.ALLOW } else { state.DENY } }
+        slot += 1
+    }
+    return policy.NO_RULE
+}
+
+fn forget(bus: *state.Bus, app: []const u8, permission: []const u8) -> void {
+    var slot: usize = 0
+    while slot < bus.*.grantCount {
+        const grant = grantAt(bus, slot)
+        if same(grantApp(grant), app) && same(grantPermission(grant), permission) {
+            // The last one takes its place.
+            const last = grantAt(bus, bus.*.grantCount - 1)
+            var bytes: [*]u8 = undefined
+            unsafe { bytes = @ptrCast([*]u8, &grant.*.app) }
+            grant.*.appLength = copyInto(bytes, 128, grantApp(last))
+            unsafe { bytes = @ptrCast([*]u8, &grant.*.permission) }
+            grant.*.permissionLength = copyInto(bytes, 64, grantPermission(last))
+            grant.*.allowed = last.*.allowed
+            bus.*.grantCount -= 1
+            return
+        }
+        slot += 1
+    }
+}
+
+fn remember(bus: *state.Bus, app: []const u8, permission: []const u8, allowed: bool) -> void {
+    forget(bus, app, permission)
+    if bus.*.grantCount >= MAX_GRANTS { return }
+    const grant = grantAt(bus, bus.*.grantCount)
+    var bytes: [*]u8 = undefined
+    unsafe { bytes = @ptrCast([*]u8, &grant.*.app) }
+    grant.*.appLength = copyInto(bytes, 128, app)
+    unsafe { bytes = @ptrCast([*]u8, &grant.*.permission) }
+    grant.*.permissionLength = copyInto(bytes, 64, permission)
+    grant.*.allowed = allowed
+    bus.*.grantCount += 1
+}
+
+// ---------------------------------------------------------------------------
+// Questions
+
+// The agent's connection (0: there is none).
+pub fn agent(bus: *state.Bus) -> usize { return bus_module.resolve(bus, AGENT_NAME) }
+
+// Whether a connection is still on the bus.
+fn alive(bus: *state.Bus, address: usize) -> bool {
+    var index: usize = 0
+    while index < bus.*.clientCount {
+        if bus.*.clients[index] == address { return !bus_module.clientAt(address).*.dead }
+        index += 1
+    }
+    return false
+}
+
+fn addWaiter(prompt: *state.Prompt, client: *state.Client, serial: u32) -> void {
+    if prompt.*.waiterCount >= 16 { return }
+    prompt.*.waiters[prompt.*.waiterCount] = @intFromPtr(client)
+    prompt.*.waiterSerials[prompt.*.waiterCount] = serial
+    prompt.*.waiterCount += 1
+}
+
+// A Check the policy says to ask about: put to the agent, or joined to
+// the same question already put. With no agent on the bus it is started
+// (its service file: org.mlx.PermissionAgent.service) and asked once it
+// owns its name. False when there is no agent to be had (or no room):
+// the caller answers no.
+pub fn ask(bus: *state.Bus, client: *state.Client, call: *const dbus.Header, identity: *const state.Identity, permission: []const u8) -> bool {
+    const app = policy.appOf(identity)
+    var slot: usize = 0
+    while slot < MAX_PROMPTS {
+        const prompt = promptAt(bus, slot)
+        if prompt.*.used && same(promptApp(prompt), app) && same(promptPermission(prompt), permission) && prompt.*.waiterCount < 16 {
+            addWaiter(prompt, client, call.*.serial)
+            return true
+        }
+        slot += 1
+    }
+    const agent_address = agent(bus)
+    slot = 0
+    while slot < MAX_PROMPTS && promptAt(bus, slot).*.used { slot += 1 }
+    if slot == MAX_PROMPTS { return false }
+    if agent_address == 0 && !activation.start(bus, AGENT_NAME) { return false }
+    const prompt = promptAt(bus, slot)
+    var bytes: [*]u8 = undefined
+    unsafe { bytes = @ptrCast([*]u8, &prompt.*.app) }
+    prompt.*.appLength = copyInto(bytes, 128, app)
+    unsafe { bytes = @ptrCast([*]u8, &prompt.*.permission) }
+    prompt.*.permissionLength = copyInto(bytes, 64, permission)
+    prompt.*.sandboxed = identity.*.sandboxed
+    prompt.*.agent = 0
+    prompt.*.startedAt = milliseconds()
+    prompt.*.waiterCount = 0
+    addWaiter(prompt, client, call.*.serial)
+    prompt.*.used = true
+    if agent_address != 0 {
+        put(bus, prompt, agent_address)
+    } else {
+        bus_module.say(bus, "ipc: starting the permission agent to ask about ")
+        bus_module.say(bus, app)
+        bus_module.say(bus, "\n")
+    }
+    return true
+}
+
+// The question to the agent at `agent_address`: Ask(s app, s permission,
+// b sandboxed).
+fn put(bus: *state.Bus, prompt: *state.Prompt, agent_address: usize) -> void {
+    const agent_client = bus_module.clientAt(agent_address)
+    var writing: dbus.Writer = undefined
+    driver.body(bus, &writing)
+    dbus.putString(&writing, promptApp(prompt))
+    dbus.putString(&writing, promptPermission(prompt))
+    dbus.putBool(&writing, prompt.*.sandboxed)
+    prompt.*.agent = agent_address
+    prompt.*.serial = driver.nextSerial(agent_client)
+    var header = dbus.newHeader(dbus.METHOD_CALL, prompt.*.serial)
+    header.path = "/org/mlx/PermissionAgent"
+    header.interface = AGENT_NAME
+    header.member = "Ask"
+    header.destination = bus_module.uniqueOf(agent_client)
+    header.signature = "ssb"
+    header.bodyLength = writing.length
+    driver.sendFromBus(bus, agent_client, &header, writing.bytes)
+    bus_module.say(bus, "ipc: asking the user whether ")
+    bus_module.say(bus, promptApp(prompt))
+    bus_module.say(bus, " may use ")
+    bus_module.say(bus, promptPermission(prompt))
+    bus_module.say(bus, "\n")
+}
+
+// A name has a new owner (activation.nameAcquired): when it is the agent,
+// the questions that waited for it are put to it.
+pub fn nameAcquired(bus: *state.Bus, name: []const u8, owner: usize) -> void {
+    if !same(name, AGENT_NAME) { return }
+    var slot: usize = 0
+    while slot < MAX_PROMPTS {
+        const prompt = promptAt(bus, slot)
+        if prompt.*.used && prompt.*.agent == 0 { put(bus, prompt, owner) }
+        slot += 1
+    }
+}
+
+// The answer to every Check waiting on `prompt`, and the prompt gone.
+fn finish(bus: *state.Bus, prompt: *state.Prompt, allowed: bool) -> void {
+    var index: usize = 0
+    while index < prompt.*.waiterCount {
+        const waiter = prompt.*.waiters[index]
+        if waiter != 0 && alive(bus, waiter) { driver.replyBoolTo(bus, bus_module.clientAt(waiter), prompt.*.waiterSerials[index], allowed) }
+        index += 1
+    }
+    if !allowed { bus.*.denied += 1 }
+    bus_module.say(bus, "ipc: ")
+    bus_module.say(bus, promptApp(prompt))
+    bus_module.say(bus, if allowed { " may use " } else { " may not use " })
+    bus_module.say(bus, promptPermission(prompt))
+    bus_module.say(bus, " (the user's answer)\n")
+    prompt.*.used = false
+}
+
+// A reply to a call of the bus's own: the agent's answer.
+pub fn answered(bus: *state.Bus, client: *state.Client, header: *const dbus.Header, bytes: [*]const u8) -> void {
+    if !header.*.hasReplySerial { return }
+    var slot: usize = 0
+    while slot < MAX_PROMPTS {
+        const prompt = promptAt(bus, slot)
+        if prompt.*.used && prompt.*.agent == @intFromPtr(client) && prompt.*.serial == header.*.replySerial {
+            var allowed = false
+            var kept = false
+            if header.*.kind == dbus.METHOD_RETURN && same(header.*.signature, "bb") {
+                var reading = dbus.reader(bytes, header.*.bodyLength, header.*.big)
+                allowed = dbus.readBool(&reading)
+                kept = dbus.readBool(&reading)
+                if reading.failed {
+                    allowed = false
+                    kept = false
+                }
+            }
+            const app = promptApp(prompt)
+            const permission = promptPermission(prompt)
+            if kept {
+                const written = policy.setRule(policy.of(bus), bus, app, permission, if allowed { state.ALLOW } else { state.DENY })
+            } else {
+                remember(bus, app, permission, allowed)
+            }
+            finish(bus, prompt, allowed)
+            return
+        }
+        slot += 1
+    }
+}
+
+// A connection left: its questions are a no (it was the agent), its
+// waiting Checks need no answer.
+pub fn clientGone(bus: *state.Bus, address: usize) -> void {
+    var slot: usize = 0
+    while slot < MAX_PROMPTS {
+        const prompt = promptAt(bus, slot)
+        if prompt.*.used {
+            var index: usize = 0
+            while index < prompt.*.waiterCount {
+                if prompt.*.waiters[index] == address { prompt.*.waiters[index] = 0 }
+                index += 1
+            }
+            if prompt.*.agent == address { finish(bus, prompt, false) }
+        }
+        slot += 1
+    }
+}
+
+pub fn busy(bus: *state.Bus) -> bool {
+    var slot: usize = 0
+    while slot < MAX_PROMPTS {
+        if promptAt(bus, slot).*.used { return true }
+        slot += 1
+    }
+    return false
+}
+
+// Questions nobody answered in time, or with no agent after all, are a
+// no.
+pub fn tick(bus: *state.Bus) -> void {
+    const now = milliseconds()
+    var slot: usize = 0
+    while slot < MAX_PROMPTS {
+        const prompt = promptAt(bus, slot)
+        if prompt.*.used && now - prompt.*.startedAt > TIMEOUT {
+            finish(bus, prompt, false)
+        } else if prompt.*.used && prompt.*.agent == 0 && !activation.starting(bus, AGENT_NAME) {
+            // The agent's service failed to start.
+            finish(bus, prompt, false)
+        }
+        slot += 1
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The Apps settings
+
+fn decisionText(bus: *state.Bus, app: []const u8, permission: []const u8, sandboxed: bool) -> []const u8 {
+    const rule = policy.ruleFor(policy.of(bus), app, permission)
+    if rule == state.ALLOW { return "allow" }
+    if rule == state.DENY { return "deny" }
+    if rule == state.ASK { return "ask" }
+    const answer = sessionAnswer(bus, app, permission)
+    if answer == state.ALLOW { return "session-allow" }
+    if answer == state.DENY { return "session-deny" }
+    var identity: state.Identity = undefined
+    identity.pid = 0
+    var bytes: [*]u8 = undefined
+    unsafe { bytes = @ptrCast([*]u8, &identity.app) }
+    identity.appLength = copyInto(bytes, 128, app)
+    identity.sandboxed = sandboxed
+    const decided = policy.decideUse(policy.of(bus), &identity, permission)
+    if decided == state.ALLOW { return "default-allow" }
+    if decided == state.ASK { return "default-ask" }
+    return "default-deny"
+}
+
+fn putEntry(bus: *state.Bus, writing: *dbus.Writer, app: []const u8, permission: []const u8, sandboxed: bool) -> void {
+    dbus.pad(writing, 8)
+    dbus.putString(writing, app)
+    dbus.putString(writing, permission)
+    dbus.putString(writing, decisionText(bus, app, permission, sandboxed))
+    dbus.putBool(writing, sandboxed)
+}
+
+// ListPermissions() -> a(sssb): every app that asked, and every rule of
+// one app for one permission.
+pub fn list(bus: *state.Bus, client: *state.Client, call: *const dbus.Header) -> void {
+    var writing: dbus.Writer = undefined
+    driver.body(bus, &writing)
+    const at = dbus.beginArray(&writing, 8)
+    var slot: usize = 0
+    while slot < bus.*.seenCount {
+        const seen = seenAt(bus, slot)
+        putEntry(bus, &writing, seenApp(seen), seenPermission(seen), seen.*.sandboxed)
+        slot += 1
+    }
+    const rules = policy.of(bus)
+    var index: usize = 0
+    while index < policy.ruleCount(rules) {
+        if policy.ruleNames(rules, index) {
+            const app = policy.ruleSubject(rules, index)
+            const permission = policy.rulePattern(rules, index)
+            // Once each (a seen app, or an earlier rule, listed it).
+            var listed = false
+            slot = 0
+            while slot < bus.*.seenCount && !listed {
+                const seen = seenAt(bus, slot)
+                listed = same(seenApp(seen), app) && same(seenPermission(seen), permission)
+                slot += 1
+            }
+            var earlier: usize = 0
+            while earlier < index && !listed {
+                listed = policy.ruleNames(rules, earlier) && same(policy.ruleSubject(rules, earlier), app) && same(policy.rulePattern(rules, earlier), permission)
+                earlier += 1
+            }
+            if !listed { putEntry(bus, &writing, app, permission, false) }
+        }
+        index += 1
+    }
+    dbus.endArray(&writing, at, 8)
+    driver.replyWith(bus, client, call, "a(sssb)", &writing)
+}
+
+// SetPermission(s app, s permission, s decision).
+pub fn set(bus: *state.Bus, client: *state.Client, call: *const dbus.Header, bytes: [*]const u8) -> void {
+    if !same(call.*.signature, "sss") {
+        bus_module.replyError(bus, client, call, "org.freedesktop.DBus.Error.InvalidArgs", "SetPermission takes (sss)")
+        return
+    }
+    if !policy.mayUse(bus, client, "ipc.manage") {
+        bus.*.denied += 1
+        bus_module.replyError(bus, client, call, "org.freedesktop.DBus.Error.AccessDenied", "MLXIPC: this app may not change permissions (ipc.manage)")
+        return
+    }
+    var reading = dbus.reader(bytes, call.*.bodyLength, call.*.big)
+    const app = dbus.readString(&reading)
+    const permission = dbus.readString(&reading)
+    const decision_text = dbus.readString(&reading)
+    var decision = policy.NO_RULE
+    if same(decision_text, "allow") { decision = state.ALLOW }
+    if same(decision_text, "deny") { decision = state.DENY }
+    if same(decision_text, "ask") { decision = state.ASK }
+    if reading.failed || app.length == 0 || permission.length == 0 || (decision == policy.NO_RULE && !same(decision_text, "default")) {
+        bus_module.replyError(bus, client, call, "org.freedesktop.DBus.Error.InvalidArgs", "SetPermission(app, permission, allow|deny|ask|default)")
+        return
+    }
+    forget(bus, app, permission)
+    if !policy.setRule(policy.of(bus), bus, app, permission, decision) {
+        bus_module.replyError(bus, client, call, "org.freedesktop.DBus.Error.Failed", "MLXIPC: ipc.conf could not be written")
+        return
+    }
+    bus_module.say(bus, "ipc: ")
+    bus_module.say(bus, app)
+    bus_module.say(bus, " ")
+    bus_module.say(bus, permission)
+    bus_module.say(bus, ": ")
+    bus_module.say(bus, decision_text)
+    bus_module.say(bus, "\n")
+    var writing: dbus.Writer = undefined
+    driver.body(bus, &writing)
+    driver.replyWith(bus, client, call, "", &writing)
+}

@@ -16,9 +16,13 @@
 #                                     PREFIX/bin/mlx-profile, PREFIX/bin/mlx-capture,
 #                                     PREFIX/bin/mlx-ipcd, PREFIX/bin/mlx-ipc (MLXIPC,
 #                                     the session bus), PREFIX/bin/mlx-audiod,
-#                                     PREFIX/bin/mlx-audio (MLX Audio)
-#   PREFIX/share/mlx/dbus-1/services/org.mlx.Audio.service (MLX Audio starts
-#                                     on the first use, on MLXIPC only)
+#                                     PREFIX/bin/mlx-audio (MLX Audio),
+#                                     PREFIX/bin/mlx-permissions (the
+#                                     permission agent and its dialog)
+#   PREFIX/share/mlx/dbus-1/services/org.mlx.Audio.service,
+#                                     org.mlx.PermissionAgent.service (MLX Audio
+#                                     and the agent start on the first use, on
+#                                     MLXIPC only)
 #   PREFIX/share/applications/mlx-settings.desktop, org.mlx.files.desktop,
 #                                     org.mlx.observatory.desktop (the launcher
 #                                     lists them; MLX Observatory shows this
@@ -69,7 +73,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 bindir="$prefix/bin"
-programs=(mlx-compositor mlx-terminal mlx-session mlx-dock mlx-topbar mlx-launcher mlx-settings mlx-files mlx-observatory mlx-codemap mlx-profile mlx-capture mlx-ipcd mlx-ipc mlx-audiod mlx-audio)
+programs=(mlx-compositor mlx-terminal mlx-session mlx-dock mlx-topbar mlx-launcher mlx-settings mlx-files mlx-observatory mlx-codemap mlx-profile mlx-capture mlx-ipcd mlx-ipc mlx-audiod mlx-audio mlx-permissions)
 applications="$prefix/share/applications"
 icons="$prefix/share/icons/hicolor/128x128/apps"
 services="$prefix/share/mlx/dbus-1/services"
@@ -123,17 +127,19 @@ echo "building with $compiler"
 "$compiler" --quiet projects/desktop/ipc/tool.mlx -o "$build/mlx-ipc"
 "$compiler" --quiet projects/desktop/audio/main.mlx -o "$build/mlx-audiod"
 "$compiler" --quiet projects/desktop/audio/tool.mlx -o "$build/mlx-audio"
+"$compiler" --quiet projects/desktop/permissions/main.mlx -o "$build/mlx-permissions"
 sed "s|@BINDIR@|$bindir|g" projects/desktop/audio/org.mlx.Audio.service.in > "$build/org.mlx.Audio.service"
+sed "s|@BINDIR@|$bindir|g" projects/desktop/permissions/org.mlx.PermissionAgent.service.in > "$build/org.mlx.PermissionAgent.service"
 sed "s|@BINDIR@|$bindir|g" projects/desktop/settings/mlx-settings.desktop.in > "$build/mlx-settings.desktop"
 sed "s|@BINDIR@|$bindir|g" projects/desktop/files/org.mlx.files.desktop.in > "$build/org.mlx.files.desktop"
 sed "s|@BINDIR@|$bindir|g; s|@ROOT@|$repo_root|g" projects/observatory/org.mlx.observatory.desktop.in > "$build/org.mlx.observatory.desktop"
 sed "s|@BINDIR@|$bindir|g" projects/desktop/compositor/session/mlx-compositor.desktop.in > "$build/mlx-compositor.desktop"
-echo "built $build/mlx-compositor, mlx-terminal, mlx-dock, mlx-topbar, mlx-launcher, mlx-settings, mlx-files, mlx-observatory, mlx-profile, mlx-capture and its OBS plugin, mlx-ipcd and mlx-ipc, mlx-audiod and mlx-audio"
+echo "built $build/mlx-compositor, mlx-terminal, mlx-dock, mlx-topbar, mlx-launcher, mlx-settings, mlx-files, mlx-observatory, mlx-profile, mlx-capture and its OBS plugin, mlx-ipcd and mlx-ipc, mlx-audiod and mlx-audio, mlx-permissions"
 [[ $build_only -eq 1 ]] && exit 0
 
 # Install.
 as_owner "$destdir$bindir" install -d "$destdir$bindir"
-as_owner "$destdir$bindir" install -m 755 "$build/mlx-compositor" "$build/mlx-terminal" "$build/mlx-dock" "$build/mlx-topbar" "$build/mlx-launcher" "$build/mlx-settings" "$build/mlx-files" "$build/mlx-observatory" "$build/mlx-profile" "$build/mlx-capture" "$build/mlx-ipcd" "$build/mlx-ipc" "$build/mlx-audiod" "$build/mlx-audio" projects/desktop/compositor/session/mlx-session "$destdir$bindir/"
+as_owner "$destdir$bindir" install -m 755 "$build/mlx-compositor" "$build/mlx-terminal" "$build/mlx-dock" "$build/mlx-topbar" "$build/mlx-launcher" "$build/mlx-settings" "$build/mlx-files" "$build/mlx-observatory" "$build/mlx-profile" "$build/mlx-capture" "$build/mlx-ipcd" "$build/mlx-ipc" "$build/mlx-audiod" "$build/mlx-audio" "$build/mlx-permissions" projects/desktop/compositor/session/mlx-session "$destdir$bindir/"
 # The command line of the code map under its own name (the same program).
 as_owner "$destdir$bindir" ln -sf mlx-observatory "$destdir$bindir/mlx-codemap"
 as_owner "$destdir$sessions" install -d "$destdir$sessions"
@@ -143,7 +149,7 @@ as_owner "$destdir$applications" install -m 644 "$build/mlx-settings.desktop" "$
 as_owner "$destdir$icons" install -d "$destdir$icons"
 as_owner "$destdir$icons" install -m 644 projects/desktop/files/org.mlx.files.png projects/observatory/org.mlx.observatory.png "$destdir$icons/"
 as_owner "$destdir$services" install -d "$destdir$services"
-as_owner "$destdir$services" install -m 644 "$build/org.mlx.Audio.service" "$destdir$services/"
+as_owner "$destdir$services" install -m 644 "$build/org.mlx.Audio.service" "$build/org.mlx.PermissionAgent.service" "$destdir$services/"
 for program in "${programs[@]}"; do echo "installed $destdir$bindir/$program"; done
 echo "installed $destdir$sessions/mlx-compositor.desktop"
 # The shell and renderer modules, for the user running this (not when

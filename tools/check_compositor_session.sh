@@ -23,11 +23,12 @@ compiler_args=()
 tools/install_compositor_session.sh --destdir "$work/root" "${compiler_args[@]}" > "$work/install.log"
 bindir="$work/root/usr/local/bin"
 entry="$work/root/usr/share/wayland-sessions/mlx-compositor.desktop"
-for program in mlx-compositor mlx-terminal mlx-session mlx-dock mlx-topbar mlx-launcher mlx-settings mlx-files mlx-observatory mlx-codemap mlx-profile mlx-capture mlx-ipcd mlx-ipc mlx-audiod mlx-audio; do
+for program in mlx-compositor mlx-terminal mlx-session mlx-dock mlx-topbar mlx-launcher mlx-settings mlx-files mlx-observatory mlx-codemap mlx-profile mlx-capture mlx-ipcd mlx-ipc mlx-audiod mlx-audio mlx-permissions; do
     [[ -x "$bindir/$program" ]] || { echo "not installed: $program" >&2; cat "$work/install.log" >&2; exit 1; }
 done
 grep -qx "Exec=/usr/local/bin/mlx-session" "$entry" || { echo "session entry without the launcher:" >&2; cat "$entry" >&2; exit 1; }
 grep -qx "Exec=/usr/local/bin/mlx-audiod" "$work/root/usr/local/share/mlx/dbus-1/services/org.mlx.Audio.service" || { echo "MLX Audio's service file is missing" >&2; exit 1; }
+grep -qx "Exec=/usr/local/bin/mlx-permissions" "$work/root/usr/local/share/mlx/dbus-1/services/org.mlx.PermissionAgent.service" || { echo "the permission agent's service file is missing" >&2; exit 1; }
 files_entry="$work/root/usr/local/share/applications/org.mlx.files.desktop"
 grep -qx "Exec=/usr/local/bin/mlx-files %U" "$files_entry" && [[ -f "$work/root/usr/local/share/icons/hicolor/128x128/apps/org.mlx.files.png" ]] || { echo "the file manager's entry or icon is missing" >&2; exit 1; }
 observatory_entry="$work/root/usr/local/share/applications/org.mlx.observatory.desktop"
