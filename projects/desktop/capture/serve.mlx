@@ -1,0 +1,168 @@
+// mlx-capture --portal: the screen-sharing service. It owns
+// org.freedesktop.portal.Desktop on the session bus (MLXIPC starts it from
+// its service file when an app first asks), answers ScreenCast
+// (portal.mlx), asks the user what to share (picker.mlx), captures it
+// (sources.mlx) and streams it over the PipeWire connections it hands out
+// (pipewire.mlx, stream.mlx). One event loop: the bus, each picker's
+// pipe, each PipeWire connection and stream, each source's compositor
+// connection and pacing timer.
+//
+//   mlx-capture --portal [--choose screen|deny|window:NAME] [--verbose]
+//
+// --choose answers every Start without a picker (for tests).
+const std = @import("std")
+const dbus = @import("std.dbus")
+const turns_module = @import("std.turns")
+const service = @import("./service.mlx")
+const portal = @import("./portal.mlx")
+const pipewire = @import("./pipewire.mlx")
+const stream = @import("./stream.mlx")
+const sources = @import("./sources.mlx")
+
+const SYS_read: usize = 0
+const SYS_rt_sigprocmask: usize = 14
+const SYS_signalfd4: usize = 289
+
+const Failure = error { Usage, NoMemory, NoBus, Taken, NoLoop }
+
+fn fail(message: []const u8, failure: Failure) -> Failure!void {
+    const said = std.io.eprintln(message)
+    return failure
+}
+
+fn named(text: std.string.String, name: []const u8) -> bool { return std.string.eql(text, std.string.fromSlice(name)) }
+
+fn serve(server: *service.Server, signals: isize) -> void {
+    var events: dbus.Events = undefined
+    var record: [128]u8 = undefined
+    var turns: turns_module.Turns = undefined
+    turns_module.begin(&turns, true, false)
+    while server.*.running {
+        turns_module.turn(&turns)
+        const timeout: isize = if stream.starting(server) { 100 } else { -1 }
+        const count = dbus.waitEvents(server.*.eventLoop, &events, timeout)
+        var index: usize = 0
+        while count > 0 && index < @intCast(usize, count) {
+            const token = dbus.eventToken(&events, index)
+            const flags = dbus.eventFlags(&events, index)
+            if token == service.TOKEN_BUS {
+                portal.busReadable(server)
+            } else if token == service.TOKEN_SIGNALS {
+                while std.linux.syscall3(SYS_read, @bitCast(usize, signals), @intFromPtr(&record), 128) == 128 { server.*.running = false }
+            } else if token >= service.TOKEN_PICKER && token < service.TOKEN_PICKER + service.MAX_PICKERS {
+                portal.pickerReadable(server, token - service.TOKEN_PICKER)
+            } else if token >= service.TOKEN_PEER && token < service.TOKEN_PEER + service.MAX_PEERS {
+                const slot = token - service.TOKEN_PEER
+                if service.peerAt(server, slot).*.used && flags & (dbus.EPOLLIN | dbus.EPOLLHUP | dbus.EPOLLERR) != 0 { pipewire.readable(server, slot) }
+            } else if token >= service.TOKEN_DONE && token < service.TOKEN_DONE + service.MAX_CONSUMERS {
+                stream.finished(server, token - service.TOKEN_DONE)
+            } else if token >= service.TOKEN_SOURCE && token < service.TOKEN_SOURCE + service.MAX_SOURCES {
+                sources.readable(server, token - service.TOKEN_SOURCE)
+            } else if token >= service.TOKEN_TIMER && token < service.TOKEN_TIMER + service.MAX_SOURCES {
+                sources.timerFired(server, token - service.TOKEN_TIMER)
+            }
+            index += 1
+        }
+        sources.pump(server)
+        portal.pump(server)
+        pipewire.flushAll(server)
+    }
+}
+
+pub fn run(arguments: [][*]const u8) -> !void {
+    const allocator = std.page_allocator.init()
+    const memory = allocator.alloc(@sizeOf(service.Server), 16)
+    const bus_memory = allocator.alloc(@sizeOf(dbus.Client), 16)
+    const message = allocator.alloc(pipewire.MESSAGE, 16)
+    const body = allocator.alloc(16384, 16)
+    if memory == null || bus_memory == null || message == null || body == null { return fail("mlx-capture: out of memory", Failure.NoMemory) }
+    var server: *service.Server = undefined
+    unsafe { server = @ptrCast(*service.Server, memory.?) }
+    unsafe { server.*.bus = @ptrCast(*dbus.Client, bus_memory.?) }
+    server.*.allocator = allocator
+    server.*.environment = std.process.environmentEntries(arguments)
+    server.*.message = message.?
+    server.*.body = body.?
+    server.*.running = true
+    server.*.verbose = false
+    server.*.choose = service.PICK_ASK
+    server.*.chooseWindowLength = 0
+    server.*.nextId = 40
+    server.*.requests = 0
+    var slot: usize = 0
+    while slot < service.MAX_SESSIONS {
+        service.sessionAt(server, slot).*.used = false
+        slot += 1
+    }
+    slot = 0
+    while slot < service.MAX_SOURCES {
+        service.sourceAt(server, slot).*.used = false
+        slot += 1
+    }
+    slot = 0
+    while slot < service.MAX_PEERS {
+        service.peerAt(server, slot).*.used = false
+        slot += 1
+    }
+    slot = 0
+    while slot < service.MAX_CONSUMERS {
+        service.consumerAt(server, slot).*.used = false
+        slot += 1
+    }
+    slot = 0
+    while slot < service.MAX_PICKERS {
+        service.pickerAt(server, slot).*.used = false
+        slot += 1
+    }
+    var index: usize = 2
+    const count = std.process.count(arguments)
+    while index < count {
+        const argument = std.process.argument(arguments, index)
+        if named(argument, "--verbose") {
+            server.*.verbose = true
+        } else if named(argument, "--choose") && index + 1 < count {
+            index += 1
+            const given = std.string.asSlice(std.process.argument(arguments, index))
+            if service.same(given, "screen") {
+                server.*.choose = service.PICK_SCREEN
+            } else if service.same(given, "deny") {
+                server.*.choose = service.PICK_DENY
+            } else if given.length > 7 && service.same(given[0..7], "window:") {
+                server.*.choose = service.PICK_WINDOW
+                var bytes: [*]u8 = undefined
+                unsafe { bytes = @ptrCast([*]u8, &server.*.chooseWindow) }
+                server.*.chooseWindowLength = service.copyInto(bytes, 64, given[7..given.length])
+            } else {
+                try fail("mlx-capture: --choose takes screen, deny or window:NAME", Failure.Usage)
+            }
+        } else {
+            try fail("usage: mlx-capture --portal [--choose screen|deny|window:NAME] [--verbose]", Failure.Usage)
+        }
+        index += 1
+    }
+
+    // INT and TERM end it.
+    var blocked: usize = (1 << 1) | (1 << 14)
+    const masked = std.linux.syscall4(SYS_rt_sigprocmask, 0, @intFromPtr(&blocked), 0, 8)
+    const signals = std.linux.syscall4(SYS_signalfd4, 18446744073709551615, @intFromPtr(&blocked), 8, 526336)
+    server.*.eventLoop = dbus.createEventLoop()
+    if server.*.eventLoop < 0 || signals < 0 { try fail("mlx-capture: no event loop", Failure.NoLoop) }
+    if !dbus.connectSession(server.*.bus, allocator, server.*.environment) { try fail("mlx-capture: no session bus (DBUS_SESSION_BUS_ADDRESS)", Failure.NoBus) }
+    if !portal.takeName(server) { try fail("mlx-capture: another portal has org.freedesktop.portal.Desktop", Failure.Taken) }
+    const watching_bus = dbus.watch(server.*.eventLoop, dbus.descriptorOfClient(server.*.bus), service.TOKEN_BUS, false)
+    const watching_signals = dbus.watch(server.*.eventLoop, signals, service.TOKEN_SIGNALS, false)
+    service.say(server, "capture: the ScreenCast portal, as ")
+    service.say(server, dbus.uniqueName(server.*.bus))
+    service.say(server, "\n")
+    // Anything that came with the name.
+    portal.busReadable(server)
+
+    serve(server, signals)
+
+    slot = 0
+    while slot < service.MAX_SESSIONS {
+        portal.closeSession(server, slot, true)
+        slot += 1
+    }
+    service.say(server, "capture: the portal ended\n")
+}

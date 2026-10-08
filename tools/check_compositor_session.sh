@@ -29,6 +29,7 @@ done
 grep -qx "Exec=/usr/local/bin/mlx-session" "$entry" || { echo "session entry without the launcher:" >&2; cat "$entry" >&2; exit 1; }
 grep -qx "Exec=/usr/local/bin/mlx-audiod" "$work/root/usr/local/share/mlx/dbus-1/services/org.mlx.Audio.service" || { echo "MLX Audio's service file is missing" >&2; exit 1; }
 grep -qx "Exec=/usr/local/bin/mlx-permissions" "$work/root/usr/local/share/mlx/dbus-1/services/org.mlx.PermissionAgent.service" || { echo "the permission agent's service file is missing" >&2; exit 1; }
+grep -qx "Exec=/usr/local/bin/mlx-capture --portal" "$work/root/usr/local/share/mlx/dbus-1/services/org.freedesktop.portal.Desktop.service" || { echo "the screen-sharing portal's service file is missing" >&2; exit 1; }
 grep -q "type pulse" "$work/root/etc/alsa/conf.d/99-zz-mlx-audio.conf" && grep -qx "autospawn = no" "$work/root/etc/pulse/client.conf.d/50-mlx-audio.conf" || { echo "--replace-sound-servers did not stage the ALSA and libpulse settings" >&2; cat "$work/install.log" >&2; exit 1; }
 if command -v systemctl > /dev/null; then
     [[ "$(readlink "$work/root/etc/systemd/user/pipewire.socket")" == /dev/null && "$(readlink "$work/root/etc/systemd/user/pulseaudio.service")" == /dev/null ]] || { echo "--replace-sound-servers did not mask PipeWire and PulseAudio" >&2; cat "$work/install.log" >&2; exit 1; }

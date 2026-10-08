@@ -1,0 +1,471 @@
+// mlx-capture --pick: the dialog the ScreenCast portal (portal.mlx) shows
+// when an app asks to share the screen: the whole screen or one of the
+// windows (the compositor's list, client.mlx), Share or Cancel. It looks
+// like the permission agent's dialog (projects/desktop/permissions).
+//
+//   mlx-capture --pick APP [--sandboxed] [--types 1|2|3] [--answer-fd N]
+//
+// It writes "screen", "window IDENTIFIER" or "deny" (a line) to
+// descriptor N (else prints it). Closing it, Escape or two minutes
+// without an answer are a no. --types: 1 the screen only, 2 windows only,
+// 3 both (the default).
+const std = @import("std")
+const crash = @import("std.crash")
+const canvas_module = @import("std.ui.canvas")
+const text_module = @import("std.ui.text")
+const ui = @import("std.ui")
+const view = @import("std.ui.view")
+const ui_app = @import("std.ui.app")
+const theme_module = @import("std.ui.theme")
+const controls = @import("std.ui.controls")
+const popup = @import("std.ui.popup")
+const host_module = @import("std.ui.host")
+const apps_module = @import("../shared/apps.mlx")
+const clock = @import("../shared/clock.mlx")
+const client = @import("./client.mlx")
+
+const Canvas = canvas_module.Canvas
+const Text = text_module.Text
+const Host = host_module.Host
+
+const SYS_write: usize = 1
+const SYS_close: usize = 3
+
+// The dialog (logical pixels); a row per choice, at most ROWS of them.
+const WIDTH: i32 = 480
+const PADDING: i32 = 22
+const ICON: i32 = 48
+const ROW: i32 = 32
+const ROWS: usize = 9
+const TOP: i32 = 118
+const BOTTOM: i32 = 78
+
+const TIMEOUT: usize = 120000
+const KEY_ESCAPE: u32 = 1
+
+const ID_CANCEL: u64 = 1
+const ID_SHARE: u64 = 2
+const ID_ROW: u64 = 16
+
+const Failure = error { Usage, NoMemory }
+
+fn fail(message: []const u8, failure: Failure) -> Failure!void {
+    const said = std.io.eprintln(message)
+    return failure
+}
+
+fn named(text: std.string.String, name: []const u8) -> bool { return std.string.eql(text, std.string.fromSlice(name)) }
+
+fn copyInto(target: [*]u8, capacity: usize, text: []const u8) -> usize {
+    var index: usize = 0
+    while index < text.length && index < capacity {
+        target[index] = text[index]
+        index += 1
+    }
+    return index
+}
+
+fn advance(bytes: [*]u8, count: usize) -> [*]u8 {
+    unsafe { return @ptrFromInt([*]u8, @intFromPtr(bytes) + count) }
+}
+
+fn milliseconds() -> usize {
+    var time: [2]usize = [2]usize{ 0, 0 }
+    const result = std.linux.syscall2(228, 1, @intFromPtr(&time))
+    return time[0] * 1000 + time[1] / 1000000
+}
+
+// A choice: the screen (window MAX_WINDOWS) or a window of the list.
+const Choice = struct {
+    window: usize
+    label: [128]u8
+    labelLength: usize
+}
+
+const Pick = struct {
+    host: *Host
+    ready: bool
+    german: bool
+    environment: [*][*]const u8
+    app: [256]u8
+    appLength: usize
+    name: [96]u8
+    nameLength: usize
+    sandboxed: bool
+    types: u32
+    apps: apps_module.Apps
+    appIndex: usize
+    capture: client.Capture
+    choices: [9]Choice
+    choiceCount: usize
+    chosen: usize
+    answerFd: isize
+    answered: bool
+    openedAt: usize
+    scale: i32
+    fontScale: i32
+    title: Text
+    body: Text
+    small: Text
+    ui: view.Ui
+    theme: theme_module.Theme
+}
+
+fn pickOf(context: *anyopaque) -> *Pick {
+    unsafe { return @ptrCast(*Pick, context) }
+}
+
+fn titleOf(pick: *Pick) -> *Text {
+    unsafe { return @ptrCast(*Text, &pick.*.title) }
+}
+
+fn bodyOf(pick: *Pick) -> *Text {
+    unsafe { return @ptrCast(*Text, &pick.*.body) }
+}
+
+fn smallOf(pick: *Pick) -> *Text {
+    unsafe { return @ptrCast(*Text, &pick.*.small) }
+}
+
+fn themeOf(pick: *Pick) -> *theme_module.Theme {
+    unsafe { return @ptrCast(*theme_module.Theme, &pick.*.theme) }
+}
+
+fn uiOf(pick: *Pick) -> *view.Ui {
+    unsafe { return @ptrCast(*view.Ui, &pick.*.ui) }
+}
+
+fn appsOf(pick: *Pick) -> *apps_module.Apps {
+    unsafe { return @ptrCast(*apps_module.Apps, &pick.*.apps) }
+}
+
+fn captureOf(pick: *Pick) -> *client.Capture {
+    unsafe { return @ptrCast(*client.Capture, &pick.*.capture) }
+}
+
+fn choiceAt(pick: *Pick, index: usize) -> *Choice {
+    unsafe { return @ptrCast(*Choice, &pick.*.choices[index]) }
+}
+
+fn labelOf(choice: *Choice) -> []const u8 {
+    var bytes: [*]const u8 = undefined
+    unsafe { bytes = @ptrCast([*]const u8, &choice.*.label) }
+    return bytes[0..choice.*.labelLength]
+}
+
+fn appText(pick: *Pick) -> []const u8 {
+    var bytes: [*]const u8 = undefined
+    unsafe { bytes = @ptrCast([*]const u8, &pick.*.app) }
+    return bytes[0..pick.*.appLength]
+}
+
+fn nameText(pick: *Pick) -> []const u8 {
+    var bytes: [*]const u8 = undefined
+    unsafe { bytes = @ptrCast([*]const u8, &pick.*.name) }
+    return bytes[0..pick.*.nameLength]
+}
+
+fn px(pick: *Pick, value: i32) -> i32 { return value * pick.*.scale }
+
+fn tr(pick: *Pick, english: []const u8, german: []const u8) -> []const u8 { return if pick.*.german { german } else { english } }
+
+fn redraw(pick: *Pick) -> void { host_module.redraw(pick.*.host) }
+
+// The answer, once: to the portal's pipe (or printed), then the window
+// goes.
+fn decide(pick: *Pick, share: bool) -> void {
+    if !pick.*.answered {
+        pick.*.answered = true
+        var line: [64]u8 = undefined
+        var bytes: [*]u8 = undefined
+        unsafe { bytes = @ptrCast([*]u8, &line) }
+        var length: usize = 0
+        if share && pick.*.chosen < pick.*.choiceCount {
+            const window = choiceAt(pick, pick.*.chosen).*.window
+            if window == client.MAX_WINDOWS {
+                length = copyInto(bytes, 8, "screen")
+            } else {
+                length = copyInto(bytes, 8, "window ")
+                length += copyInto(advance(bytes, length), 40, client.identifierOf(&captureOf(pick).*.windows[window]))
+            }
+        } else {
+            length = copyInto(bytes, 8, "deny")
+        }
+        bytes[length] = 10
+        length += 1
+        if pick.*.answerFd >= 0 {
+            const written = std.linux.syscall3(SYS_write, @bitCast(usize, pick.*.answerFd), @intFromPtr(bytes), length)
+            const closed = std.linux.syscall1(SYS_close, @bitCast(usize, pick.*.answerFd))
+        }
+        const said = std.io.writeAll(std.io.stdout(), bytes[0..length])
+    }
+    host_module.quit(pick.*.host)
+}
+
+// The choices: the screen, then each open window ("Title - app").
+fn listChoices(pick: *Pick) -> void {
+    pick.*.choiceCount = 0
+    var bytes: [*]u8 = undefined
+    if pick.*.types & 1 != 0 {
+        const choice = choiceAt(pick, 0)
+        choice.*.window = client.MAX_WINDOWS
+        unsafe { bytes = @ptrCast([*]u8, &choice.*.label) }
+        choice.*.labelLength = copyInto(bytes, 128, tr(pick, "Entire screen", "Ganzer Bildschirm"))
+        pick.*.choiceCount = 1
+    }
+    if pick.*.types & 2 == 0 { return }
+    const capture = captureOf(pick)
+    var index: usize = 0
+    while index < capture.*.windowCount && pick.*.choiceCount < ROWS {
+        const window = &capture.*.windows[index]
+        if !window.*.closed && window.*.identifierLength > 0 {
+            const choice = choiceAt(pick, pick.*.choiceCount)
+            choice.*.window = index
+            unsafe { bytes = @ptrCast([*]u8, &choice.*.label) }
+            var length = copyInto(bytes, 80, client.titleOf(window))
+            const app = client.appIdOf(window)
+            if app.length > 0 {
+                if length > 0 { length += copyInto(advance(bytes, length), 3, " - ") }
+                length += copyInto(advance(bytes, length), 128 - length, app)
+            }
+            if length == 0 { length = copyInto(bytes, 32, tr(pick, "A window", "Ein Fenster")) }
+            choice.*.labelLength = length
+            pick.*.choiceCount += 1
+        }
+        index += 1
+    }
+}
+
+fn question(pick: *Pick, out: [*]u8) -> usize {
+    var length: usize = 0
+    if pick.*.german {
+        length += copyInto(advance(out, length), 16, "Was darf ")
+        length += copyInto(advance(out, length), 96, nameText(pick))
+        length += copyInto(advance(out, length), 16, " sehen?")
+        return length
+    }
+    length += copyInto(advance(out, length), 32, "What may ")
+    length += copyInto(advance(out, length), 96, nameText(pick))
+    length += copyInto(advance(out, length), 16, " see?")
+    return length
+}
+
+fn explanation(pick: *Pick, out: [*]u8) -> usize {
+    var length: usize = 0
+    length += copyInto(advance(out, length), 256, appText(pick))
+    if pick.*.sandboxed {
+        length += copyInto(advance(out, length), 64, tr(pick, " (sandboxed)", " (in einer Sandbox)"))
+    }
+    length += copyInto(advance(out, length), 128, tr(pick, " wants to share your screen. It sees what you choose until it stops.", " möchte deinen Bildschirm teilen. Es sieht, was du wählst, bis es aufhört."))
+    return length
+}
+
+fn onEvent(context: *anyopaque, kind: u32, a: u32, b: i32) -> void {
+    const pick = pickOf(context)
+    if !pick.*.ready { return }
+    if kind == ui_app.EVENT_CLOSED {
+        decide(pick, false)
+        return
+    }
+    if kind == ui_app.EVENT_CONFIGURED {
+        fitScale(pick)
+        redraw(pick)
+        return
+    }
+    if kind == ui_app.EVENT_TICK {
+        if milliseconds() - pick.*.openedAt > TIMEOUT { decide(pick, false) }
+        return
+    }
+    if kind == ui_app.EVENT_KEY && b != 0 && a == KEY_ESCAPE {
+        decide(pick, false)
+        return
+    }
+    const widgets = uiOf(pick)
+    if ui_app.pressing(kind, a, b) { layOut(context) }
+    const fed = ui_app.feed(widgets, kind, a, b)
+    if fed == ui_app.FEED_CLICK { layOut(context) }
+    if (kind == ui_app.EVENT_MOTION || kind == ui_app.EVENT_LEAVE) && fed == ui_app.FEED_NONE { return }
+    redraw(pick)
+}
+
+fn layOut(context: *anyopaque) -> void {
+    var nowhere = view.layoutCanvas()
+    draw(context, &nowhere)
+}
+
+fn draw(context: *anyopaque, canvas: *Canvas) -> void {
+    const pick = pickOf(context)
+    if !pick.*.ready { return }
+    const widgets = uiOf(pick)
+    const theme = themeOf(pick)
+    view.begin(widgets, canvas)
+    const width = host_module.width(pick.*.host)
+    const height = host_module.height(pick.*.host)
+    canvas_module.fillRect(canvas, 0, 0, width, height, canvas_module.color(255, 30, 32, 40))
+    const padding = px(pick, PADDING)
+    const icon = px(pick, ICON)
+    var drawn = false
+    if pick.*.appIndex < pick.*.apps.count {
+        const app = apps_module.appAt(appsOf(pick), pick.*.appIndex)
+        if apps_module.loadIcon(appsOf(pick), app, @intCast(usize, icon)) {
+            canvas_module.drawImage(canvas, apps_module.imageOf(app), padding, padding, icon, 255)
+            drawn = true
+        }
+    }
+    if !drawn { drawScreen(canvas, padding, padding, icon, theme.*.accent) }
+    const left = padding * 2 + icon
+    const room = width - left - padding
+    var text: [768]u8 = undefined
+    var text_bytes: [*]u8 = undefined
+    unsafe { text_bytes = @ptrCast([*]u8, &text) }
+    var length = question(pick, text_bytes)
+    const title_line = px(pick, 22)
+    const title_lines = popup.wrapped(widgets, titleOf(pick), text_bytes[0..length], left, padding - px(pick, 2), room, title_line, 1, theme.*.text)
+    var y = padding + @intCast(i32, title_lines) * title_line + px(pick, 6)
+    length = explanation(pick, text_bytes)
+    const body_line = px(pick, 18)
+    const body_lines = popup.wrapped(widgets, smallOf(pick), text_bytes[0..length], left, y, room, body_line, 3, theme.*.dim)
+    y = px(pick, TOP)
+    // A row per choice.
+    var index: usize = 0
+    while index < pick.*.choiceCount {
+        const choice = choiceAt(pick, index)
+        if controls.radioRow(widgets, ID_ROW + @intCast(u64, index), ui.rect(padding, y, width - padding * 2, px(pick, ROW - 4)), labelOf(choice), pick.*.chosen == index) { pick.*.chosen = index }
+        y += px(pick, ROW)
+        index += 1
+    }
+    if pick.*.choiceCount == 0 {
+        controls.label(widgets, bodyOf(pick), tr(pick, "There is nothing to share.", "Es gibt nichts zu teilen."), padding, y, theme.*.dim, width - padding * 2)
+    }
+    // Cancel and Share at the bottom right.
+    const button_height = px(pick, 34)
+    const share_label = tr(pick, "Share", "Teilen")
+    const cancel_label = tr(pick, "Cancel", "Abbrechen")
+    const share_width = controls.buttonWidth(widgets, bodyOf(pick), share_label) + px(pick, 24)
+    const cancel_width = controls.buttonWidth(widgets, bodyOf(pick), cancel_label) + px(pick, 24)
+    const bottom = height - padding - button_height
+    const share_x = width - padding - share_width
+    const cancel_x = share_x - px(pick, 10) - cancel_width
+    if controls.button(widgets, ID_CANCEL, ui.rect(cancel_x, bottom, cancel_width, button_height), cancel_label, controls.BUTTON_NORMAL, true) { decide(pick, false) }
+    if controls.button(widgets, ID_SHARE, ui.rect(share_x, bottom, share_width, button_height), share_label, controls.BUTTON_PRIMARY, pick.*.choiceCount > 0) { decide(pick, true) }
+    if view.end(widgets) { redraw(pick) }
+}
+
+// A screen of `size` pixels at (x, y): what the dialog shows for an app
+// without an icon.
+fn drawScreen(canvas: *Canvas, x: i32, y: i32, size: i32, color: u32) -> void {
+    const background = canvas_module.color(255, 30, 32, 40)
+    const top = y + size / 8
+    const tall = size * 5 / 8
+    canvas_module.fillRoundedRect(canvas, x, top, size, tall, size / 12, color)
+    const edge = size / 14 + 1
+    canvas_module.fillRect(canvas, x + edge, top + edge, size - edge * 2, tall - edge * 2, background)
+    canvas_module.fillRect(canvas, x + size / 2 - size / 16, top + tall, size / 8, size / 8, color)
+    canvas_module.fillRoundedRect(canvas, x + size / 4, top + tall + size / 8, size / 2, size / 12 + 1, size / 24, color)
+}
+
+fn fitScale(pick: *Pick) -> void {
+    const scale = host_module.scale(pick.*.host)
+    pick.*.scale = scale
+    if scale == pick.*.fontScale { return }
+    if pick.*.fontScale != 0 {
+        text_module.unloadText(titleOf(pick))
+        text_module.unloadText(bodyOf(pick))
+        text_module.unloadText(smallOf(pick))
+    }
+    pick.*.fontScale = scale
+    const factor = @intCast(u32, scale)
+    const allocator = std.page_allocator.init()
+    const loaded_title = text_module.loadText(titleOf(pick), 16 * factor, allocator)
+    const loaded_body = text_module.loadText(bodyOf(pick), 13 * factor, allocator)
+    const loaded_small = text_module.loadText(smallOf(pick), 13 * factor, allocator)
+    pick.*.theme = theme_module.scaled(theme_module.dark(), scale)
+    view.init(uiOf(pick), themeOf(pick), bodyOf(pick), smallOf(pick), bodyOf(pick))
+}
+
+pub fn run(arguments: [][*]const u8) -> !void {
+    const count = std.process.count(arguments)
+    if count < 3 { return fail("usage: mlx-capture --pick APP [--sandboxed] [--types 1|2|3] [--answer-fd N]", Failure.Usage) }
+    const allocator = std.page_allocator.init()
+    const memory = allocator.alloc(@sizeOf(Pick), 16)
+    if memory == null { return fail("mlx-capture: no memory", Failure.NoMemory) }
+    var pick: *Pick = undefined
+    unsafe { pick = @ptrCast(*Pick, memory.?) }
+    pick.*.ready = false
+    pick.*.answered = false
+    pick.*.answerFd = -1
+    pick.*.sandboxed = false
+    pick.*.types = 3
+    pick.*.chosen = 0
+    pick.*.scale = 1
+    pick.*.fontScale = 0
+    var bytes: [*]u8 = undefined
+    unsafe { bytes = @ptrCast([*]u8, &pick.*.app) }
+    pick.*.appLength = copyInto(bytes, 255, std.string.asSlice(std.process.argument(arguments, 2)))
+    var index: usize = 3
+    while index < count {
+        const argument = std.process.argument(arguments, index)
+        if named(argument, "--sandboxed") {
+            pick.*.sandboxed = true
+        } else if (named(argument, "--answer-fd") || named(argument, "--types")) && index + 1 < count {
+            index += 1
+            const digits = std.string.asSlice(std.process.argument(arguments, index))
+            var value: isize = 0
+            var at: usize = 0
+            while at < digits.length && digits[at] >= 48 && digits[at] <= 57 {
+                value = value * 10 + @intCast(isize, digits[at] - 48)
+                at += 1
+            }
+            if named(argument, "--types") {
+                pick.*.types = @intCast(u32, value & 3)
+                if pick.*.types == 0 { pick.*.types = 3 }
+            } else {
+                pick.*.answerFd = value
+            }
+        }
+        index += 1
+    }
+    pick.*.environment = std.process.environmentEntries(arguments)
+    pick.*.german = clock.germanLocale(pick.*.environment)
+    // The windows, from the compositor's list (before this dialog's own
+    // window is on it); the dialog is tall enough for each.
+    pick.*.capture.windowCount = 0
+    if client.open(captureOf(pick), "") {
+        listChoices(pick)
+        client.close(captureOf(pick))
+    } else {
+        listChoices(pick)
+    }
+    const rows = if pick.*.choiceCount > 0 { @intCast(i32, pick.*.choiceCount) } else { 1 }
+    const height = TOP + rows * ROW + BOTTOM
+    const host = host_module.create(host_module.Options.{ .title = "Share", .appId = "org.mlx.capture", .width = @intCast(u32, WIDTH), .height = @intCast(u32, height), .minWidth = WIDTH, .minHeight = height }, @ptrCast(*anyopaque, pick), draw, onEvent)
+    if host == null { return fail("mlx-capture: no memory", Failure.NoMemory) }
+    pick.*.host = host.?
+    try host_module.open(pick.*.host, arguments)
+    pick.*.environment = host_module.environment(pick.*.host)
+    // The app's name and icon from its desktop entry; its id otherwise.
+    pick.*.appIndex = 0
+    unsafe { bytes = @ptrCast([*]u8, &pick.*.name) }
+    pick.*.nameLength = copyInto(bytes, 96, appText(pick))
+    if apps_module.init(appsOf(pick), pick.*.environment, allocator) {
+        apps_module.scan(appsOf(pick))
+        pick.*.appIndex = apps_module.find(appsOf(pick), appText(pick))
+        if pick.*.appIndex < pick.*.apps.count { pick.*.nameLength = copyInto(bytes, 96, apps_module.nameOf(apps_module.appAt(appsOf(pick), pick.*.appIndex))) }
+    } else {
+        pick.*.apps.count = 0
+    }
+    fitScale(pick)
+    host_module.setTitle(pick.*.host, tr(pick, "Share screen", "Bildschirm teilen"))
+    host_module.setTick(pick.*.host, 1000)
+    pick.*.openedAt = milliseconds()
+    pick.*.ready = true
+    redraw(pick)
+    defer unanswered(pick)
+    try host_module.run(pick.*.host)
+}
+
+// The window went without an answer (the compositor ended): a no.
+fn unanswered(pick: *Pick) -> void {
+    if pick.*.answered { return }
+    decide(pick, false)
+}

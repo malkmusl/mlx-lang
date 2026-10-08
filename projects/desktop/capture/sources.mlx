@@ -1,0 +1,193 @@
+// The screens and windows a portal session shares: each a compositor
+// connection of its own (client.mlx) capturing frames while a stream
+// takes them, at most `rate` a second, and handing each to its streams
+// (stream.mlx). A stream that starts later gets the last frame at once
+// (the compositor sends one only when something changed).
+const std = @import("std")
+const dbus = @import("std.dbus")
+const wl = @import("std.wayland")
+const service = @import("./service.mlx")
+const client = @import("./client.mlx")
+const stream = @import("./stream.mlx")
+
+const Server = service.Server
+const Source = service.Source
+
+// Frames a second, at most.
+pub const RATE: u32 = 30
+
+// The compositor's socket: WAYLAND_DISPLAY (a name in $XDG_RUNTIME_DIR, or
+// a path), else the Mlx compositor's wayland-mlx (the bus may have started
+// the service before the compositor ran). Its length, 0 for none.
+fn socketPath(server: *Server, path: [*]u8) -> usize {
+    const runtime = std.process.environmentFrom(server.*.environment, "XDG_RUNTIME_DIR")
+    const display = std.process.environmentFrom(server.*.environment, "WAYLAND_DISPLAY")
+    var length: usize = 0
+    if display != null && display.?.length > 0 && display.?.pointer[0] == 47 {
+        return service.copyInto(path, 250, std.string.asSlice(display.?))
+    }
+    if runtime == null { return 0 }
+    length = service.copyInto(path, 200, std.string.asSlice(runtime.?))
+    path[length] = 47
+    length += 1
+    if display != null && display.?.length > 0 {
+        length += service.copyInto(service.advance(path, length), 48, std.string.asSlice(display.?))
+    } else {
+        length += service.copyInto(service.advance(path, length), 48, "wayland-mlx")
+    }
+    return length
+}
+
+// Starts sharing the screen (`window` "") or the window with that
+// identifier for `session`: its slot, NO_SLOT when the compositor would
+// not.
+pub fn open(server: *Server, session: usize, window: []const u8) -> usize {
+    var slot: usize = 0
+    while slot < service.MAX_SOURCES && service.sourceAt(server, slot).*.used { slot += 1 }
+    if slot == service.MAX_SOURCES { return service.NO_SLOT }
+    const source = service.sourceAt(server, slot)
+    const capture = service.captureOf(source)
+    var path: [256]u8 = undefined
+    var path_bytes: [*]u8 = undefined
+    unsafe { path_bytes = @ptrCast([*]u8, &path) }
+    const length = socketPath(server, path_bytes)
+    if length == 0 || !client.open(capture, path_bytes[0..length]) {
+        service.say(server, "capture: no compositor to capture from\n")
+        return service.NO_SLOT
+    }
+    if !client.start(capture, window) {
+        service.say(server, "capture: the compositor cannot capture that\n")
+        client.close(capture)
+        return service.NO_SLOT
+    }
+    source.*.timer = service.timer()
+    if source.*.timer < 0 {
+        client.close(capture)
+        return service.NO_SLOT
+    }
+    source.*.used = true
+    source.*.session = session
+    source.*.nodeId = server.*.nextId
+    server.*.nextId += 1
+    var bytes: [*]u8 = undefined
+    unsafe { bytes = @ptrCast([*]u8, &source.*.window) }
+    source.*.windowLength = service.copyInto(bytes, 32, window)
+    source.*.connected = true
+    source.*.paced = false
+    source.*.rate = RATE
+    source.*.width = 0
+    source.*.height = 0
+    source.*.lastFrame = 0
+    source.*.frames = 0
+    source.*.stopped = false
+    const flushed = capture.*.display.send()
+    const watched = dbus.watch(server.*.eventLoop, capture.*.display.descriptor(), service.TOKEN_SOURCE + slot, false)
+    const timed = dbus.watch(server.*.eventLoop, source.*.timer, service.TOKEN_TIMER + slot, false)
+    service.say(server, "capture: sharing ")
+    service.say(server, if window.length == 0 { "the screen" } else { window })
+    service.say(server, " as node ")
+    service.sayNumber(server, @intCast(usize, source.*.nodeId))
+    service.say(server, "\n")
+    return slot
+}
+
+pub fn close(server: *Server, slot: usize) -> void {
+    const source = service.sourceAt(server, slot)
+    if !source.*.used { return }
+    const capture = service.captureOf(source)
+    if source.*.connected {
+        const unwatched = dbus.unwatch(server.*.eventLoop, capture.*.display.descriptor())
+        client.close(capture)
+        source.*.connected = false
+    }
+    const untimed = dbus.unwatch(server.*.eventLoop, source.*.timer)
+    dbus.closeDescriptor(source.*.timer)
+    source.*.used = false
+}
+
+// What the compositor sent: the session's size, a frame, or the end.
+pub fn readable(server: *Server, slot: usize) -> void {
+    const source = service.sourceAt(server, slot)
+    const capture = service.captureOf(source)
+    if !source.*.connected { return }
+    if !client.poll(capture) || !client.alive(capture) {
+        const unwatched = dbus.unwatch(server.*.eventLoop, capture.*.display.descriptor())
+        client.close(capture)
+        source.*.connected = false
+        source.*.stopped = true
+        return
+    }
+    if capture.*.stopped {
+        source.*.stopped = true
+        return
+    }
+    if capture.*.constraintsDone && (capture.*.width != source.*.width || capture.*.height != source.*.height) {
+        source.*.width = capture.*.width
+        source.*.height = capture.*.height
+        stream.sourceReady(server, slot)
+    }
+    if capture.*.ready {
+        capture.*.ready = false
+        source.*.frames += 1
+        deliver(server, slot)
+    } else if capture.*.failed {
+        // A buffer of the old size (the window was resized): again, with
+        // the new constraints.
+        capture.*.failed = false
+    }
+}
+
+// The last frame to the source's streams.
+fn deliver(server: *Server, slot: usize) -> void {
+    const source = service.sourceAt(server, slot)
+    const capture = service.captureOf(source)
+    source.*.lastFrame = service.now()
+    stream.frame(server, slot, @intFromPtr(client.pixels(capture)), capture.*.bufferWidth, capture.*.bufferHeight, capture.*.damageX, capture.*.damageY, capture.*.damageWidth, capture.*.damageHeight, capture.*.time)
+}
+
+// The pacing timer fired: the next frame may be asked for.
+pub fn timerFired(server: *Server, slot: usize) -> void {
+    const source = service.sourceAt(server, slot)
+    const expirations = service.readCounter(source.*.timer)
+    source.*.paced = false
+}
+
+// Asks each source with streams for its next frame (once the last one is
+// old enough), and hands streams that have none yet the last frame.
+pub fn pump(server: *Server) -> void {
+    var slot: usize = 0
+    while slot < service.MAX_SOURCES {
+        const source = service.sourceAt(server, slot)
+        if source.*.used && source.*.connected && !source.*.stopped {
+            const capture = service.captureOf(source)
+            if source.*.frames > 0 && stream.hungry(server, slot) { deliver(server, slot) }
+            if stream.wanted(server, slot) && !capture.*.capturing && !source.*.paced {
+                const period = 1000000000 / @intCast(u64, source.*.rate)
+                const moment = service.now()
+                if source.*.lastFrame != 0 && moment < source.*.lastFrame + period {
+                    service.arm(source.*.timer, source.*.lastFrame + period - moment)
+                    source.*.paced = true
+                } else if client.requestFrame(capture) {
+                    // Asked; the compositor answers when something changed.
+                }
+            }
+        }
+        slot += 1
+    }
+}
+
+// Whether `session`'s sources all went (their windows closed, the
+// compositor ended).
+pub fn sessionStopped(server: *Server, session: usize) -> bool {
+    var any = false
+    var slot: usize = 0
+    while slot < service.MAX_SOURCES {
+        const source = service.sourceAt(server, slot)
+        if source.*.used && source.*.session == session {
+            if !source.*.stopped { return false }
+            any = true
+        }
+        slot += 1
+    }
+    return any
+}

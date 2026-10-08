@@ -20,8 +20,11 @@
 #                                     PREFIX/bin/mlx-permissions (the
 #                                     permission agent and its dialog)
 #   PREFIX/share/mlx/dbus-1/services/org.mlx.Audio.service,
-#                                     org.mlx.PermissionAgent.service (MLX Audio
-#                                     and the agent start on the first use, on
+#                                     org.mlx.PermissionAgent.service,
+#                                     org.freedesktop.portal.Desktop.service
+#                                     (MLX Audio, the agent and the
+#                                     screen-sharing portal, mlx-capture
+#                                     --portal, start on the first use, on
 #                                     MLXIPC only)
 #   PREFIX/share/applications/mlx-settings.desktop, org.mlx.files.desktop,
 #                                     org.mlx.observatory.desktop (the launcher
@@ -180,7 +183,7 @@ if [[ $uninstall -eq 1 ]]; then
     done
     path="$destdir$sessions/mlx-compositor.desktop"
     [[ -e "$path" ]] && as_owner "$path" rm -f -- "$path" && echo "removed $path"
-    for path in "$destdir$applications/mlx-settings.desktop" "$destdir$applications/org.mlx.files.desktop" "$destdir$applications/org.mlx.observatory.desktop" "$destdir$icons/org.mlx.files.png" "$destdir$icons/org.mlx.observatory.png"; do
+    for path in "$destdir$applications/mlx-settings.desktop" "$destdir$applications/org.mlx.files.desktop" "$destdir$applications/org.mlx.observatory.desktop" "$destdir$icons/org.mlx.files.png" "$destdir$icons/org.mlx.observatory.png" "$destdir$services/org.mlx.Audio.service" "$destdir$services/org.mlx.PermissionAgent.service" "$destdir$services/org.freedesktop.portal.Desktop.service"; do
         [[ -e "$path" ]] && as_owner "$path" rm -f -- "$path" && echo "removed $path"
     done
     exit 0
@@ -210,6 +213,7 @@ echo "building with $compiler"
 "$compiler" --quiet projects/desktop/permissions/main.mlx -o "$build/mlx-permissions"
 sed "s|@BINDIR@|$bindir|g" projects/desktop/audio/org.mlx.Audio.service.in > "$build/org.mlx.Audio.service"
 sed "s|@BINDIR@|$bindir|g" projects/desktop/permissions/org.mlx.PermissionAgent.service.in > "$build/org.mlx.PermissionAgent.service"
+sed "s|@BINDIR@|$bindir|g" projects/desktop/capture/org.freedesktop.portal.Desktop.service.in > "$build/org.freedesktop.portal.Desktop.service"
 sed "s|@BINDIR@|$bindir|g" projects/desktop/settings/mlx-settings.desktop.in > "$build/mlx-settings.desktop"
 sed "s|@BINDIR@|$bindir|g" projects/desktop/files/org.mlx.files.desktop.in > "$build/org.mlx.files.desktop"
 sed "s|@BINDIR@|$bindir|g; s|@ROOT@|$repo_root|g" projects/observatory/org.mlx.observatory.desktop.in > "$build/org.mlx.observatory.desktop"
@@ -229,7 +233,7 @@ as_owner "$destdir$applications" install -m 644 "$build/mlx-settings.desktop" "$
 as_owner "$destdir$icons" install -d "$destdir$icons"
 as_owner "$destdir$icons" install -m 644 projects/desktop/files/org.mlx.files.png projects/observatory/org.mlx.observatory.png "$destdir$icons/"
 as_owner "$destdir$services" install -d "$destdir$services"
-as_owner "$destdir$services" install -m 644 "$build/org.mlx.Audio.service" "$build/org.mlx.PermissionAgent.service" "$destdir$services/"
+as_owner "$destdir$services" install -m 644 "$build/org.mlx.Audio.service" "$build/org.mlx.PermissionAgent.service" "$build/org.freedesktop.portal.Desktop.service" "$destdir$services/"
 for program in "${programs[@]}"; do echo "installed $destdir$bindir/$program"; done
 echo "installed $destdir$sessions/mlx-compositor.desktop"
 [[ $replace_sound -eq 1 ]] && replace_sound_servers

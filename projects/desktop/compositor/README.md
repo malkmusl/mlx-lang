@@ -1037,6 +1037,61 @@ cp mlx-capture.so ~/.config/obs-studio/plugins/mlx-capture/bin/64bit/
 compositor) with a scene of only that source, records, and checks the log,
 the recording and OBS's preview.
 
+### Screen sharing (browsers, Discord, OBS)
+
+Browsers and the apps built on them (Firefox, Chromium, Discord, Meet in a
+tab) share the screen on Wayland through the ScreenCast portal and take
+the frames over PipeWire with the libpipewire they carry. In the MLX
+session `mlx-capture --portal` ([`serve.mlx`](../capture/serve.mlx)) is
+both, without xdg-desktop-portal and without a PipeWire daemon:
+
+- It owns `org.freedesktop.portal.Desktop` on MLXIPC
+  ([`portal.mlx`](../capture/portal.mlx)), started from its service file
+  (`PREFIX/share/mlx/dbus-1/services`, which MLXIPC searches before the
+  system's) when an app first asks: `CreateSession`, `SelectSources`
+  (the screen, windows), `Start` and `OpenPipeWireRemote`, each answered
+  with a request object's `Response` as xdg-desktop-portal does. Only
+  ScreenCast: the portal's other interfaces (Settings, FileChooser, ...)
+  are refused, and apps fall back (GTK reads its settings elsewhere).
+- `Start` shows a picker ([`picker.mlx`](../capture/picker.mlx),
+  `mlx-capture --pick`, in the permission agent's style): the whole
+  screen or one of the windows the compositor lists, Share or Cancel (a
+  no after two minutes). The app is named from its process (`std.appid`).
+- `OpenPipeWireRemote` hands the app one end of a socket pair; the other
+  end speaks PipeWire's native protocol, version 3
+  ([`pipewire.mlx`](../capture/pipewire.mlx), on SPA pods from
+  [`pod.mlx`](../capture/pod.mlx)): the core, the client, a registry
+  with the session's nodes, and the client nodes apps create for their
+  streams. A connection sees its session's screens and windows only.
+- Each stream ([`stream.mlx`](../capture/stream.mlx)) is linked as
+  PipeWire's session manager would: the format (BGRx, or BGRA when the
+  app asks only for that, at the source's size, frames as they come at
+  most 30 a second), then buffers in shared memory as the app's Buffers
+  and Meta params ask (the header, crop and damage metas filled; the
+  pixels page-aligned, since Firefox maps them itself), the activation
+  records and the io area. mlx-capture drives the graph: a frame goes into
+  a free buffer, the client is woken through its activation's counter,
+  and counts the driver's activation down when it is done, giving a
+  buffer back. The records are the same from PipeWire 0.3 to 1.4.
+- The frames come from the compositor's capture
+  ([`sources.mlx`](../capture/sources.mlx)): a connection per shared
+  screen or window, double-buffered so a stream that joins later gets the
+  last frame at once.
+
+`mlx-capture --share -- COMMAND` ([`share.mlx`](../capture/share.mlx)) asks
+the portal as a browser does and runs COMMAND with the PipeWire
+connection as descriptor 3 (`%n` in its arguments is the node):
+
+```sh
+mlx-capture --share -- gst-launch-1.0 pipewiresrc fd=3 path=%n ! videoconvert ! autovideosink
+```
+
+`tools/check_screencast.sh` runs the portal under MLXIPC with a nested
+compositor and takes the streams with GStreamer's pipewiresrc (the
+system's libpipewire): the screen's frames follow the pointer, a window's
+have its size, a no shares nothing, Share in the picker shares, and with
+Firefox (`FIREFOX=PATH`) a page's `getDisplayMedia` shows the screen.
+
 ## X programs (Xwayland)
 
 X11 programs run as windows of the compositor through Xwayland, rootless,

@@ -1,0 +1,484 @@
+// PipeWire's native protocol (version 3), as far as a screen-sharing
+// stream needs it: the server's end of the connection the portal hands
+// an app (portal.mlx's OpenPipeWireRemote). Browsers and the like keep
+// their own libpipewire, and connect it to that socket; mlx-capture
+// answers as the PipeWire daemon would, with the screens and windows the
+// app's session shares as video nodes (sources.mlx), and their client
+// nodes taking the frames (stream.mlx). No PipeWire on the system.
+//
+// A message: the object's id (u32), the opcode (8 bits) and the payload's
+// size (24 bits), a sequence number and the count of descriptors that
+// came with it (SCM_RIGHTS), then the payload, one Struct pod (pod.mlx).
+// Object 0 is the core, 1 the client; the client names the objects it
+// creates (its registry, its client nodes).
+const std = @import("std")
+const dbus = @import("std.dbus")
+const appid = @import("std.appid")
+const service = @import("./service.mlx")
+const pod = @import("./pod.mlx")
+const stream = @import("./stream.mlx")
+
+const Server = service.Server
+const Peer = service.Peer
+
+// What a message may be (the connection's buffer).
+pub const MESSAGE: usize = 65536
+const HEADER: usize = 16
+
+// The version the service says it is (what the protocol here follows).
+const VERSION: []const u8 = "1.0.5"
+
+// Core methods.
+const CORE_HELLO: u32 = 1
+const CORE_SYNC: u32 = 2
+const CORE_PONG: u32 = 3
+const CORE_ERROR: u32 = 4
+const CORE_GET_REGISTRY: u32 = 5
+const CORE_CREATE_OBJECT: u32 = 6
+const CORE_DESTROY: u32 = 7
+// Core events.
+const CORE_INFO: u32 = 0
+const CORE_DONE: u32 = 1
+const CORE_EVENT_ERROR: u32 = 3
+const CORE_REMOVE_ID: u32 = 4
+const CORE_ADD_MEM: u32 = 6
+const CORE_REMOVE_MEM: u32 = 7
+const CORE_BOUND_PROPS: u32 = 8
+// Client: method UpdateProperties, event Info.
+const CLIENT_UPDATE_PROPERTIES: u32 = 2
+const CLIENT_INFO: u32 = 0
+// Registry: method Bind, event Global.
+const REGISTRY_BIND: u32 = 1
+const REGISTRY_GLOBAL: u32 = 0
+
+const CLIENT_ID: u32 = 1
+
+// SPA_DATA_MemFd; PW_MEMBLOCK_FLAG_READWRITE.
+const MEM_FD: u32 = 2
+const READ_WRITE: i32 = 3
+
+// errnos the client is told.
+pub const ENOENT: i32 = -2
+pub const EPERM: i32 = -1
+pub const EINVAL: i32 = -22
+pub const ENOMEM: i32 = -12
+
+fn nothing() -> [*]const isize {
+    var none: [1]isize = [1]isize{ 0 }
+    unsafe { return @ptrCast([*]const isize, &none) }
+}
+
+fn closeAll(descriptors: [*]const isize, count: usize) -> void {
+    var index: usize = 0
+    while index < count {
+        if descriptors[index] >= 0 { dbus.closeDescriptor(descriptors[index]) }
+        index += 1
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Connections
+
+// Takes `descriptor` (the service's end of a socket pair) as a connection
+// for `session`'s app; false when there is no room.
+pub fn addPeer(server: *Server, descriptor: isize, session: usize) -> bool {
+    var slot: usize = 0
+    while slot < service.MAX_PEERS && service.peerAt(server, slot).*.used { slot += 1 }
+    if slot == service.MAX_PEERS { return false }
+    const peer = service.peerAt(server, slot)
+    if !dbus.open(service.connectionOf(peer), server.*.allocator, descriptor) { return false }
+    peer.*.used = true
+    peer.*.descriptor = descriptor
+    peer.*.dead = false
+    peer.*.session = session
+    peer.*.clientId = server.*.nextId
+    server.*.nextId += 1
+    peer.*.registry = service.NO_ID
+    peer.*.nextMem = 0
+    peer.*.sequence = 0
+    peer.*.hello = false
+    peer.*.watchingOutput = false
+    const watched = dbus.watch(server.*.eventLoop, descriptor, service.TOKEN_PEER + slot, false)
+    service.say(server, "capture: a PipeWire connection\n")
+    return true
+}
+
+// Ends the connection (and its streams).
+pub fn dropPeer(server: *Server, slot: usize) -> void {
+    const peer = service.peerAt(server, slot)
+    if !peer.*.used { return }
+    var index: usize = 0
+    while index < service.MAX_CONSUMERS {
+        const consumer = service.consumerAt(server, index)
+        if consumer.*.used && consumer.*.peer == slot { stream.destroy(server, index, false) }
+        index += 1
+    }
+    const unwatched = dbus.unwatch(server.*.eventLoop, peer.*.descriptor)
+    dbus.close(service.connectionOf(peer))
+    peer.*.used = false
+    service.say(server, "capture: a PipeWire connection ended\n")
+}
+
+// Ends every connection of `session`.
+pub fn dropSession(server: *Server, session: usize) -> void {
+    var slot: usize = 0
+    while slot < service.MAX_PEERS {
+        const peer = service.peerAt(server, slot)
+        if peer.*.used && peer.*.session == session { dropPeer(server, slot) }
+        slot += 1
+    }
+}
+
+// Sends what each connection has queued; ends the ones that broke.
+pub fn flushAll(server: *Server) -> void {
+    var slot: usize = 0
+    while slot < service.MAX_PEERS {
+        const peer = service.peerAt(server, slot)
+        if peer.*.used && !peer.*.dead && dbus.pendingOutput(service.connectionOf(peer)) > 0 {
+            const flushed = dbus.flush(service.connectionOf(peer))
+            if flushed == dbus.EAGAIN {
+                if !peer.*.watchingOutput {
+                    const rewatched = dbus.rewatch(server.*.eventLoop, peer.*.descriptor, service.TOKEN_PEER + slot, true)
+                    peer.*.watchingOutput = true
+                }
+            } else if flushed < 0 {
+                peer.*.dead = true
+            } else if peer.*.watchingOutput {
+                const rewatched = dbus.rewatch(server.*.eventLoop, peer.*.descriptor, service.TOKEN_PEER + slot, false)
+                peer.*.watchingOutput = false
+            }
+        }
+        if peer.*.used && peer.*.dead { dropPeer(server, slot) }
+        slot += 1
+    }
+}
+
+// What came on connection `slot`: each whole message, handled.
+pub fn readable(server: *Server, slot: usize) -> void {
+    const peer = service.peerAt(server, slot)
+    const connection = service.connectionOf(peer)
+    while !peer.*.dead {
+        const got = dbus.receive(connection)
+        if got == 0 || (got < 0 && got != dbus.EAGAIN) {
+            peer.*.dead = true
+            return
+        }
+        handleAll(server, slot)
+        if got < 0 { return }
+    }
+}
+
+fn handleAll(server: *Server, slot: usize) -> void {
+    const peer = service.peerAt(server, slot)
+    const connection = service.connectionOf(peer)
+    var descriptors: [32]isize = undefined
+    while !peer.*.dead {
+        const available = dbus.buffered(connection)
+        if available < HEADER { return }
+        const bytes = dbus.input(connection)
+        const id = pod.load32(bytes, 0)
+        const word = pod.load32(bytes, 4)
+        const opcode = word >> 24
+        const size = @intCast(usize, word & 16777215)
+        const sequence = pod.load32(bytes, 8)
+        var count = @intCast(usize, pod.load32(bytes, 12))
+        if HEADER + size > MESSAGE || count > 28 {
+            peer.*.dead = true
+            return
+        }
+        if available < HEADER + size { return }
+        if count > dbus.bufferedHandles(connection) { count = dbus.bufferedHandles(connection) }
+        var index: usize = 0
+        const handles = dbus.handles(connection)
+        while index < count {
+            descriptors[index] = handles[index]
+            index += 1
+        }
+        var body: [*]const u8 = undefined
+        unsafe { body = @ptrFromInt([*]const u8, @intFromPtr(bytes) + HEADER) }
+        handle(server, slot, id, opcode, sequence, body, size)
+        dbus.consume(connection, HEADER + size, count)
+        // No method here takes a descriptor along.
+        var held: [*]const isize = undefined
+        unsafe { held = @ptrCast([*]const isize, &descriptors) }
+        closeAll(held, count)
+    }
+}
+
+fn handle(server: *Server, slot: usize, id: u32, opcode: u32, sequence: u32, body: [*]const u8, size: usize) -> void {
+    const peer = service.peerAt(server, slot)
+    const payload = pod.podAt(body, 0, size)
+    if payload.kind != pod.STRUCT {
+        peer.*.dead = true
+        return
+    }
+    if id == 0 {
+        coreMethod(server, slot, opcode, sequence, body, payload)
+    } else if id == CLIENT_ID {
+        // UpdateProperties and the rest: nothing to do.
+    } else if id == peer.*.registry {
+        registryMethod(server, slot, opcode, sequence, body, payload)
+    } else {
+        const consumer = stream.find(server, slot, id)
+        if consumer != service.NO_SLOT { stream.method(server, consumer, opcode, body, payload) }
+    }
+}
+
+fn coreMethod(server: *Server, slot: usize, opcode: u32, sequence: u32, body: [*]const u8, payload: pod.Pod) -> void {
+    const peer = service.peerAt(server, slot)
+    var cursor = pod.children(body, payload)
+    if opcode == CORE_HELLO {
+        peer.*.hello = true
+        coreInfo(server, slot)
+        clientInfo(server, slot)
+    } else if opcode == CORE_SYNC {
+        const id = pod.uintOf(body, pod.next(&cursor))
+        const asked = pod.uintOf(body, pod.next(&cursor))
+        done(server, slot, id, asked)
+    } else if opcode == CORE_GET_REGISTRY {
+        const version = pod.next(&cursor)
+        peer.*.registry = pod.uintOf(body, pod.next(&cursor))
+        globals(server, slot)
+    } else if opcode == CORE_CREATE_OBJECT {
+        const factory = pod.stringOf(body, pod.next(&cursor))
+        const kind = pod.next(&cursor)
+        const version = pod.next(&cursor)
+        const props = pod.next(&cursor)
+        const id = pod.uintOf(body, pod.next(&cursor))
+        if !service.same(factory, "client-node") {
+            coreError(server, slot, id, sequence, ENOENT, "mlx-capture makes client nodes only")
+            removeId(server, slot, id)
+            return
+        }
+        if !stream.create(server, slot, id, body, props) {
+            coreError(server, slot, id, sequence, ENOMEM, "no room for another stream")
+            removeId(server, slot, id)
+        }
+    } else if opcode == CORE_DESTROY {
+        const id = pod.uintOf(body, pod.next(&cursor))
+        if id == peer.*.registry {
+            peer.*.registry = service.NO_ID
+        } else {
+            const consumer = stream.find(server, slot, id)
+            if consumer != service.NO_SLOT { stream.destroy(server, consumer, true) }
+        }
+        removeId(server, slot, id)
+    }
+}
+
+// A registry can list the session's nodes; binding them is not needed
+// for a stream (it names its target), and refused.
+fn registryMethod(server: *Server, slot: usize, opcode: u32, sequence: u32, body: [*]const u8, payload: pod.Pod) -> void {
+    if opcode != REGISTRY_BIND { return }
+    var cursor = pod.children(body, payload)
+    const id = pod.next(&cursor)
+    const kind = pod.next(&cursor)
+    const version = pod.next(&cursor)
+    const new_id = pod.uintOf(body, pod.next(&cursor))
+    coreError(server, slot, new_id, sequence, EPERM, "mlx-capture's nodes are not bound")
+    removeId(server, slot, new_id)
+}
+
+// ---------------------------------------------------------------------------
+// Sending
+
+// Begins a message in the service's scratch area: the payload's Struct.
+pub fn begin(server: *Server, writing: *pod.Writer) -> usize {
+    pod.begin(writing, service.advance(server.*.message, HEADER), MESSAGE - HEADER)
+    return pod.beginStruct(writing)
+}
+
+// Sends the message to object `id` with `count` descriptors (which it
+// then owns).
+pub fn send(server: *Server, slot: usize, id: u32, opcode: u32, writing: *pod.Writer, top: usize, descriptors: [*]const isize, count: usize) -> void {
+    const peer = service.peerAt(server, slot)
+    pod.end(writing, top)
+    if writing.*.failed || peer.*.dead {
+        closeAll(descriptors, count)
+        return
+    }
+    const length = writing.*.length
+    pod.store32(server.*.message, 0, id)
+    pod.store32(server.*.message, 4, (opcode << 24) | @intCast(u32, length))
+    pod.store32(server.*.message, 8, peer.*.sequence)
+    pod.store32(server.*.message, 12, @intCast(u32, count))
+    peer.*.sequence += 1
+    if !dbus.queue(service.connectionOf(peer), server.*.message, HEADER + length, descriptors, count) {
+        closeAll(descriptors, count)
+        peer.*.dead = true
+    }
+}
+
+fn sendPlain(server: *Server, slot: usize, id: u32, opcode: u32, writing: *pod.Writer, top: usize) -> void { send(server, slot, id, opcode, writing, top, nothing(), 0) }
+
+fn hostName(out: [*]u8) -> usize {
+    var path: [*]const u8 = undefined
+    unsafe { path = @ptrCast([*]const u8, "/proc/sys/kernel/hostname") }
+    const length = appid.readFile(path, out, 63)
+    var end: usize = 0
+    while end < length && out[end] != 10 { end += 1 }
+    if end == 0 { return service.copyInto(out, 63, "localhost") }
+    return end
+}
+
+fn coreInfo(server: *Server, slot: usize) -> void {
+    var host: [64]u8 = undefined
+    var host_bytes: [*]u8 = undefined
+    unsafe { host_bytes = @ptrCast([*]u8, &host) }
+    const host_length = hostName(host_bytes)
+    var user = std.process.environmentFrom(server.*.environment, "USER")
+    var writing: pod.Writer = undefined
+    const top = begin(server, &writing)
+    pod.putInt(&writing, 0)
+    pod.putUint(&writing, 1296850040)
+    pod.putString(&writing, if user != null { std.string.asSlice(user.?) } else { "user" })
+    pod.putString(&writing, host_bytes[0..host_length])
+    pod.putString(&writing, VERSION)
+    pod.putString(&writing, "pipewire-0")
+    // PW_CORE_CHANGE_MASK_PROPS.
+    pod.putLong(&writing, 1)
+    const dict = pod.beginDict(&writing, 6)
+    pod.putItem(&writing, "core.name", "pipewire-0")
+    pod.putItem(&writing, "core.daemon", "true")
+    pod.putItem(&writing, "core.version", VERSION)
+    pod.putItem(&writing, "object.id", "0")
+    pod.putItem(&writing, "object.serial", "0")
+    pod.putItem(&writing, "application.name", "mlx-capture")
+    pod.end(&writing, dict)
+    sendPlain(server, slot, 0, CORE_INFO, &writing, top)
+}
+
+// The client's global id (BoundProps) and its info.
+fn clientInfo(server: *Server, slot: usize) -> void {
+    const peer = service.peerAt(server, slot)
+    var digits: [24]u8 = undefined
+    var digit_bytes: [*]u8 = undefined
+    unsafe { digit_bytes = @ptrCast([*]u8, &digits) }
+    const count = service.decimal(digit_bytes, @intCast(usize, peer.*.clientId))
+    var writing: pod.Writer = undefined
+    var top = begin(server, &writing)
+    pod.putUint(&writing, CLIENT_ID)
+    pod.putUint(&writing, peer.*.clientId)
+    var dict = pod.beginDict(&writing, 2)
+    pod.putItem(&writing, "object.serial", digit_bytes[0..count])
+    pod.putItem(&writing, "pipewire.protocol", "protocol-native")
+    pod.end(&writing, dict)
+    sendPlain(server, slot, 0, CORE_BOUND_PROPS, &writing, top)
+    top = begin(server, &writing)
+    pod.putUint(&writing, peer.*.clientId)
+    // PW_CLIENT_CHANGE_MASK_PROPS.
+    pod.putLong(&writing, 1)
+    dict = pod.beginDict(&writing, 3)
+    pod.putItem(&writing, "object.id", digit_bytes[0..count])
+    pod.putItem(&writing, "object.serial", digit_bytes[0..count])
+    pod.putItem(&writing, "pipewire.protocol", "protocol-native")
+    pod.end(&writing, dict)
+    sendPlain(server, slot, CLIENT_ID, CLIENT_INFO, &writing, top)
+}
+
+pub fn done(server: *Server, slot: usize, id: u32, sequence: u32) -> void {
+    var writing: pod.Writer = undefined
+    const top = begin(server, &writing)
+    pod.putUint(&writing, id)
+    pod.putUint(&writing, sequence)
+    sendPlain(server, slot, 0, CORE_DONE, &writing, top)
+}
+
+pub fn coreError(server: *Server, slot: usize, id: u32, sequence: u32, result: i32, message: []const u8) -> void {
+    var writing: pod.Writer = undefined
+    const top = begin(server, &writing)
+    pod.putUint(&writing, id)
+    pod.putUint(&writing, sequence)
+    pod.putInt(&writing, result)
+    pod.putString(&writing, message)
+    sendPlain(server, slot, 0, CORE_EVENT_ERROR, &writing, top)
+}
+
+pub fn removeId(server: *Server, slot: usize, id: u32) -> void {
+    var writing: pod.Writer = undefined
+    const top = begin(server, &writing)
+    pod.putUint(&writing, id)
+    sendPlain(server, slot, 0, CORE_REMOVE_ID, &writing, top)
+}
+
+// Tells the client of shared memory (a copy of `descriptor` goes along):
+// its id on the connection, NO_ID when it could not.
+pub fn addMem(server: *Server, slot: usize, descriptor: isize) -> u32 {
+    const peer = service.peerAt(server, slot)
+    const copy = service.duplicate(descriptor)
+    if copy < 0 { return service.NO_ID }
+    const id = peer.*.nextMem
+    peer.*.nextMem += 1
+    var writing: pod.Writer = undefined
+    const top = begin(server, &writing)
+    pod.putUint(&writing, id)
+    pod.putId(&writing, MEM_FD)
+    pod.putFd(&writing, 0)
+    pod.putInt(&writing, READ_WRITE)
+    var descriptors: [1]isize = [1]isize{ copy }
+    var held: [*]const isize = undefined
+    unsafe { held = @ptrCast([*]const isize, &descriptors) }
+    send(server, slot, 0, CORE_ADD_MEM, &writing, top, held, 1)
+    return id
+}
+
+pub fn removeMem(server: *Server, slot: usize, id: u32) -> void {
+    if id == service.NO_ID { return }
+    var writing: pod.Writer = undefined
+    const top = begin(server, &writing)
+    pod.putUint(&writing, id)
+    sendPlain(server, slot, 0, CORE_REMOVE_MEM, &writing, top)
+}
+
+// A client node's global id and properties.
+pub fn boundProps(server: *Server, slot: usize, object: u32, global: u32) -> void {
+    const peer = service.peerAt(server, slot)
+    var digits: [24]u8 = undefined
+    var digit_bytes: [*]u8 = undefined
+    unsafe { digit_bytes = @ptrCast([*]u8, &digits) }
+    const count = service.decimal(digit_bytes, @intCast(usize, global))
+    var client_digits: [24]u8 = undefined
+    var client_bytes: [*]u8 = undefined
+    unsafe { client_bytes = @ptrCast([*]u8, &client_digits) }
+    const client_count = service.decimal(client_bytes, @intCast(usize, peer.*.clientId))
+    var writing: pod.Writer = undefined
+    const top = begin(server, &writing)
+    pod.putUint(&writing, object)
+    pod.putUint(&writing, global)
+    const dict = pod.beginDict(&writing, 3)
+    pod.putItem(&writing, "object.serial", digit_bytes[0..count])
+    pod.putItem(&writing, "client.id", client_bytes[0..client_count])
+    pod.putItem(&writing, "media.class", "Stream/Input/Video")
+    pod.end(&writing, dict)
+    sendPlain(server, slot, 0, CORE_BOUND_PROPS, &writing, top)
+}
+
+// The session's sources, as nodes, to the registry.
+fn globals(server: *Server, slot: usize) -> void {
+    const peer = service.peerAt(server, slot)
+    var index: usize = 0
+    while index < service.MAX_SOURCES {
+        const source = service.sourceAt(server, index)
+        if source.*.used && source.*.session == peer.*.session {
+            var digits: [24]u8 = undefined
+            var digit_bytes: [*]u8 = undefined
+            unsafe { digit_bytes = @ptrCast([*]u8, &digits) }
+            const count = service.decimal(digit_bytes, @intCast(usize, source.*.nodeId))
+            var writing: pod.Writer = undefined
+            const top = begin(server, &writing)
+            pod.putUint(&writing, source.*.nodeId)
+            // PW_PERM_R | PW_PERM_X.
+            pod.putUint(&writing, 320)
+            pod.putString(&writing, "PipeWire:Interface:Node")
+            pod.putInt(&writing, 3)
+            const dict = pod.beginDict(&writing, 4)
+            pod.putItem(&writing, "object.serial", digit_bytes[0..count])
+            pod.putItem(&writing, "node.name", "mlx-capture")
+            pod.putItem(&writing, "node.description", if source.*.windowLength == 0 { "Screen" } else { "Window" })
+            pod.putItem(&writing, "media.class", "Video/Source")
+            pod.end(&writing, dict)
+            sendPlain(server, slot, peer.*.registry, REGISTRY_GLOBAL, &writing, top)
+        }
+        index += 1
+    }
+}

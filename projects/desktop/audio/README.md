@@ -162,7 +162,10 @@ pipewire-alsa's default, which it overrides). Their packages may then
 be removed; libpulse (PulseAudio's client library, which Firefox and the
 others load to speak the protocol) and alsa-plugins' pulse plugin stay.
 Other desktops (GNOME, KDE) have no sound server then.
-`--restore-sound-servers` (and `--uninstall`) undoes it.
+`--restore-sound-servers` (and `--uninstall`) undoes it. PipeWire's other
+part, video, is mlx-capture's: browsers share the screen through its
+ScreenCast portal and PipeWire connections of its own (see the
+compositor's README, "Screen sharing").
 `tools/check_pulse.sh` plays every sample format through pacat, records
 the input and the monitor with parec, changes volumes with pactl, checks
 a sandboxed app's permissions, and plays an `<audio>` element in Firefox

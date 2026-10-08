@@ -1,0 +1,855 @@
+// The desktop's ScreenCast portal, served by mlx-capture on the session bus
+// (MLXIPC) as org.freedesktop.portal.Desktop: what browsers (Firefox,
+// Chromium, Electron apps such as Discord) and OBS ask when a page or app
+// wants to share the screen or a window. No xdg-desktop-portal, no
+// PipeWire: the stream the app gets is a PipeWire connection mlx-capture
+// itself answers (pipewire.mlx).
+//
+//   CreateSession(a{sv}) -> o            a session (Response: session_handle)
+//   SelectSources(o, a{sv}) -> o         types (1 the screen, 2 windows),
+//                                        cursor_mode
+//   Start(o, s, a{sv}) -> o              the picker (picker.mlx) asks the
+//                                        user what to share; Response:
+//                                        streams a(ua{sv}), each a node id
+//                                        with position, size, source_type
+//   OpenPipeWireRemote(o, a{sv}) -> h    the connection to take them over
+//
+// Each call answers with a request object's path; the result follows as
+// that object's org.freedesktop.portal.Request.Response(u, a{sv}) (0
+// shared, 1 the user said no, 2 it failed). Session.Close ends a session,
+// as its app leaving the bus does; a session whose windows all closed
+// says Session.Closed.
+const std = @import("std")
+const dbus = @import("std.dbus")
+const appid = @import("std.appid")
+const service = @import("./service.mlx")
+const sources = @import("./sources.mlx")
+const pipewire = @import("./pipewire.mlx")
+
+const Server = service.Server
+const Session = service.Session
+
+pub const NAME: []const u8 = "org.freedesktop.portal.Desktop"
+const PATH: []const u8 = "/org/freedesktop/portal/desktop"
+const REQUEST_PREFIX: []const u8 = "/org/freedesktop/portal/desktop/request/"
+const SESSION_PREFIX: []const u8 = "/org/freedesktop/portal/desktop/session/"
+const SCREEN_CAST: []const u8 = "org.freedesktop.portal.ScreenCast"
+const REQUEST: []const u8 = "org.freedesktop.portal.Request"
+const SESSION: []const u8 = "org.freedesktop.portal.Session"
+const PROPERTIES: []const u8 = "org.freedesktop.DBus.Properties"
+const BUS: []const u8 = "org.freedesktop.DBus"
+const BUS_PATH: []const u8 = "/org/freedesktop/DBus"
+
+const VERSION: u32 = 4
+// Source types and cursor modes offered: the screen and windows; the
+// cursor hidden or in the picture (the screen's frames have it drawn in,
+// a window's not).
+const SOURCE_MONITOR: u32 = 1
+const SOURCE_WINDOW: u32 = 2
+const SOURCE_TYPES: u32 = 3
+const CURSOR_MODES: u32 = 3
+
+// Response codes.
+const SUCCESS: u32 = 0
+const CANCELLED: u32 = 1
+const FAILED: u32 = 2
+
+const BODY: usize = 16384
+
+const SYS_socketpair: usize = 53
+
+const INTROSPECTION: []const u8 = "<!DOCTYPE node PUBLIC \"-//freedesktop//DTD D-BUS Object Introspection 1.0//EN\" \"http://www.freedesktop.org/standards/dbus/1.0/introspect.dtd\">\n<node>\n <interface name=\"org.freedesktop.portal.ScreenCast\">\n  <method name=\"CreateSession\"><arg type=\"a{sv}\" name=\"options\" direction=\"in\"/><arg type=\"o\" name=\"handle\" direction=\"out\"/></method>\n  <method name=\"SelectSources\"><arg type=\"o\" name=\"session_handle\" direction=\"in\"/><arg type=\"a{sv}\" name=\"options\" direction=\"in\"/><arg type=\"o\" name=\"handle\" direction=\"out\"/></method>\n  <method name=\"Start\"><arg type=\"o\" name=\"session_handle\" direction=\"in\"/><arg type=\"s\" name=\"parent_window\" direction=\"in\"/><arg type=\"a{sv}\" name=\"options\" direction=\"in\"/><arg type=\"o\" name=\"handle\" direction=\"out\"/></method>\n  <method name=\"OpenPipeWireRemote\"><arg type=\"o\" name=\"session_handle\" direction=\"in\"/><arg type=\"a{sv}\" name=\"options\" direction=\"in\"/><arg type=\"h\" name=\"fd\" direction=\"out\"/></method>\n  <property name=\"AvailableSourceTypes\" type=\"u\" access=\"read\"/>\n  <property name=\"AvailableCursorModes\" type=\"u\" access=\"read\"/>\n  <property name=\"version\" type=\"u\" access=\"read\"/>\n </interface>\n <interface name=\"org.freedesktop.DBus.Properties\">\n  <method name=\"Get\"><arg type=\"s\" direction=\"in\"/><arg type=\"s\" direction=\"in\"/><arg type=\"v\" direction=\"out\"/></method>\n  <method name=\"GetAll\"><arg type=\"s\" direction=\"in\"/><arg type=\"a{sv}\" direction=\"out\"/></method>\n </interface>\n <interface name=\"org.freedesktop.DBus.Introspectable\">\n  <method name=\"Introspect\"><arg type=\"s\" direction=\"out\"/></method>\n </interface>\n</node>\n"
+
+fn nothing() -> [*]const isize {
+    var none: [1]isize = [1]isize{ 0 }
+    unsafe { return @ptrCast([*]const isize, &none) }
+}
+
+fn startsWith(text: []const u8, prefix: []const u8) -> bool { return text.length >= prefix.length && service.same(text[0..prefix.length], prefix) }
+
+fn writer(server: *Server, writing: *dbus.Writer) -> void { dbus.begin(writing, server.*.body, BODY, false) }
+
+// ---------------------------------------------------------------------------
+// The bus
+
+// Takes the portal's name (and hears of apps leaving the bus); false when
+// another portal has it.
+pub fn takeName(server: *Server) -> bool {
+    var writing: dbus.Writer = undefined
+    writer(server, &writing)
+    dbus.putString(&writing, NAME)
+    // DBUS_NAME_FLAG_DO_NOT_QUEUE.
+    dbus.putU32(&writing, 4)
+    const serial = dbus.call(server.*.bus, BUS, BUS_PATH, BUS, "RequestName", "su", writing.bytes, writing.length)
+    var reply: dbus.Header = undefined
+    if serial == 0 || !dbus.waitReply(server.*.bus, serial, &reply, 25000) || reply.kind == dbus.ERROR { return false }
+    var reading = dbus.reader(dbus.bodyOf(server.*.bus, &reply), reply.bodyLength, reply.big)
+    if dbus.readU32(&reading) != 1 { return false }
+    writer(server, &writing)
+    dbus.putString(&writing, "type='signal',sender='org.freedesktop.DBus',interface='org.freedesktop.DBus',member='NameOwnerChanged'")
+    const matched = dbus.call(server.*.bus, BUS, BUS_PATH, BUS, "AddMatch", "s", writing.bytes, writing.length)
+    return true
+}
+
+// Everything the bus sent.
+pub fn busReadable(server: *Server) -> void {
+    var message: dbus.Header = undefined
+    while dbus.next(server.*.bus, &message, 0) {
+        // No call here takes a descriptor along.
+        var index: usize = 0
+        while index < @intCast(usize, message.unixFds) {
+            const descriptor = dbus.descriptorOf(server.*.bus, index)
+            if descriptor >= 0 { dbus.closeDescriptor(descriptor) }
+            index += 1
+        }
+        handle(server, &message)
+    }
+    if server.*.bus.*.closed { server.*.running = false }
+}
+
+fn handle(server: *Server, message: *const dbus.Header) -> void {
+    if message.*.kind == dbus.METHOD_RETURN || message.*.kind == dbus.ERROR {
+        if message.*.hasReplySerial { replied(server, message) }
+        return
+    }
+    if message.*.kind == dbus.SIGNAL {
+        if service.same(message.*.member, "NameOwnerChanged") && service.same(message.*.sender, BUS) { ownerChanged(server, message) }
+        return
+    }
+    if message.*.kind != dbus.METHOD_CALL { return }
+    const path = message.*.path
+    const interface = message.*.interface
+    const member = message.*.member
+    if service.same(interface, "org.freedesktop.DBus.Peer") {
+        if service.same(member, "Ping") {
+            replyEmpty(server, message)
+            return
+        }
+    }
+    if service.same(path, PATH) {
+        if service.same(interface, PROPERTIES) {
+            properties(server, message)
+        } else if service.same(interface, "org.freedesktop.DBus.Introspectable") && service.same(member, "Introspect") {
+            var writing: dbus.Writer = undefined
+            writer(server, &writing)
+            dbus.putString(&writing, INTROSPECTION)
+            const sent = dbus.reply(server.*.bus, message, "s", writing.bytes, writing.length, nothing(), 0)
+        } else if service.same(interface, SCREEN_CAST) || interface.length == 0 {
+            screenCast(server, message)
+        } else {
+            refuse(server, message, "org.freedesktop.DBus.Error.UnknownInterface", "mlx-capture's portal serves org.freedesktop.portal.ScreenCast only")
+        }
+        return
+    }
+    if startsWith(path, REQUEST_PREFIX) && service.same(member, "Close") {
+        cancelRequest(server, message)
+        return
+    }
+    if startsWith(path, SESSION_PREFIX) {
+        if service.same(member, "Close") {
+            const slot = sessionByPath(server, path, message.*.sender)
+            if slot != service.NO_SLOT { closeSession(server, slot, false) }
+            replyEmpty(server, message)
+        } else if service.same(interface, PROPERTIES) {
+            // Session's one property: version 1.
+            var writing: dbus.Writer = undefined
+            writer(server, &writing)
+            if service.same(member, "GetAll") {
+                const at = dbus.beginArray(&writing, 8)
+                entryU32(&writing, "version", 1)
+                dbus.endArray(&writing, at, 8)
+                const sent = dbus.reply(server.*.bus, message, "a{sv}", writing.bytes, writing.length, nothing(), 0)
+            } else {
+                dbus.putVariantU32(&writing, 1)
+                const sent = dbus.reply(server.*.bus, message, "v", writing.bytes, writing.length, nothing(), 0)
+            }
+        } else {
+            refuse(server, message, "org.freedesktop.DBus.Error.UnknownMethod", "a session knows Close")
+        }
+        return
+    }
+    refuse(server, message, "org.freedesktop.DBus.Error.UnknownObject", "no such object")
+}
+
+fn replyEmpty(server: *Server, message: *const dbus.Header) -> void {
+    if message.*.flags & dbus.NO_REPLY_EXPECTED != 0 { return }
+    const sent = dbus.reply(server.*.bus, message, "", server.*.body, 0, nothing(), 0)
+}
+
+fn refuse(server: *Server, message: *const dbus.Header, error_name: []const u8, text: []const u8) -> void {
+    if message.*.flags & dbus.NO_REPLY_EXPECTED != 0 { return }
+    var writing: dbus.Writer = undefined
+    writer(server, &writing)
+    dbus.putString(&writing, text)
+    var header = dbus.newHeader(dbus.ERROR, 0)
+    header.errorName = error_name
+    header.replySerial = message.*.serial
+    header.hasReplySerial = true
+    header.destination = message.*.sender
+    header.signature = "s"
+    const sent = dbus.send(server.*.bus, &header, writing.bytes, writing.length, nothing(), 0)
+}
+
+fn emit(server: *Server, destination: []const u8, path: []const u8, interface: []const u8, member: []const u8, signature: []const u8, writing: *dbus.Writer) -> void {
+    var header = dbus.newHeader(dbus.SIGNAL, 0)
+    header.path = path
+    header.interface = interface
+    header.member = member
+    header.signature = signature
+    header.destination = destination
+    const sent = dbus.send(server.*.bus, &header, writing.*.bytes, writing.*.length, nothing(), 0)
+}
+
+// A dictionary entry {sv} with a u32.
+fn entryU32(writing: *dbus.Writer, key: []const u8, value: u32) -> void {
+    dbus.pad(writing, 8)
+    dbus.putString(writing, key)
+    dbus.putVariantU32(writing, value)
+}
+
+fn entryString(writing: *dbus.Writer, key: []const u8, value: []const u8) -> void {
+    dbus.pad(writing, 8)
+    dbus.putString(writing, key)
+    dbus.putVariantString(writing, value)
+}
+
+// A (ii) pair.
+fn entryPair(writing: *dbus.Writer, key: []const u8, first: i32, second: i32) -> void {
+    dbus.pad(writing, 8)
+    dbus.putString(writing, key)
+    dbus.putSignature(writing, "(ii)")
+    dbus.pad(writing, 8)
+    dbus.putU32(writing, @bitCast(u32, first))
+    dbus.putU32(writing, @bitCast(u32, second))
+}
+
+// org.freedesktop.DBus.Properties on the portal: the ScreenCast
+// interface's (and none of any other).
+fn properties(server: *Server, message: *const dbus.Header) -> void {
+    var reading = dbus.reader(dbus.bodyOf(server.*.bus, message), message.*.bodyLength, message.*.big)
+    const interface = dbus.readString(&reading)
+    var writing: dbus.Writer = undefined
+    writer(server, &writing)
+    if service.same(message.*.member, "GetAll") {
+        const at = dbus.beginArray(&writing, 8)
+        if service.same(interface, SCREEN_CAST) {
+            entryU32(&writing, "AvailableSourceTypes", SOURCE_TYPES)
+            entryU32(&writing, "AvailableCursorModes", CURSOR_MODES)
+            entryU32(&writing, "version", VERSION)
+        }
+        dbus.endArray(&writing, at, 8)
+        const sent = dbus.reply(server.*.bus, message, "a{sv}", writing.bytes, writing.length, nothing(), 0)
+        return
+    }
+    if service.same(message.*.member, "Get") {
+        const name = dbus.readString(&reading)
+        var value: u32 = 0
+        if service.same(interface, SCREEN_CAST) && service.same(name, "AvailableSourceTypes") {
+            value = SOURCE_TYPES
+        } else if service.same(interface, SCREEN_CAST) && service.same(name, "AvailableCursorModes") {
+            value = CURSOR_MODES
+        } else if service.same(interface, SCREEN_CAST) && service.same(name, "version") {
+            value = VERSION
+        } else {
+            refuse(server, message, "org.freedesktop.DBus.Error.UnknownProperty", "no such property")
+            return
+        }
+        dbus.putVariantU32(&writing, value)
+        const sent = dbus.reply(server.*.bus, message, "v", writing.bytes, writing.length, nothing(), 0)
+        return
+    }
+    refuse(server, message, "org.freedesktop.DBus.Error.PropertyReadOnly", "the portal's properties are read-only")
+}
+
+// ---------------------------------------------------------------------------
+// Paths
+
+// An app's part of a request or session path: its unique name without
+// the colon, dots as underscores (":1.42" -> "1_42").
+fn senderPart(sender: []const u8, out: [*]u8) -> usize {
+    var length: usize = 0
+    var index: usize = 0
+    while index < sender.length && length < 60 {
+        const byte = sender[index]
+        if byte == 46 {
+            out[length] = 95
+            length += 1
+        } else if byte != 58 {
+            out[length] = byte
+            length += 1
+        }
+        index += 1
+    }
+    return length
+}
+
+// A token as a path element: letters, digits and underscores.
+fn tokenPart(token: []const u8, out: [*]u8) -> usize {
+    var length: usize = 0
+    var index: usize = 0
+    while index < token.length && length < 64 {
+        const byte = token[index]
+        const fits = (byte >= 48 && byte <= 57) || (byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122) || byte == 95
+        out[length] = if fits { byte } else { 95 }
+        length += 1
+        index += 1
+    }
+    return length
+}
+
+// PREFIX + sender + "/" + token (one made up when there is none).
+fn makePath(server: *Server, prefix: []const u8, sender: []const u8, token: []const u8, out: [*]u8) -> usize {
+    var length = service.copyInto(out, 64, prefix)
+    length += senderPart(sender, service.advance(out, length))
+    out[length] = 47
+    length += 1
+    if token.length > 0 {
+        length += tokenPart(token, service.advance(out, length))
+    } else {
+        server.*.requests += 1
+        length += service.copyInto(service.advance(out, length), 8, "mlx")
+        length += service.decimal(service.advance(out, length), server.*.requests)
+    }
+    return length
+}
+
+// The options a call brought (a{sv}): the ones the portal takes.
+const Options = struct {
+    handleToken: []const u8
+    sessionToken: []const u8
+    types: u32
+    cursorMode: u32
+}
+
+fn readOptions(reading: *dbus.Reader) -> Options {
+    var options = Options.{ .handleToken = reading.*.bytes[0..0], .sessionToken = reading.*.bytes[0..0], .types = 0, .cursorMode = 0 }
+    const length = @intCast(usize, dbus.readU32(reading))
+    dbus.alignTo(reading, 8)
+    const end = reading.*.position + length
+    while !reading.*.failed && reading.*.position < end {
+        dbus.alignTo(reading, 8)
+        const key = dbus.readString(reading)
+        const signature = dbus.readSignature(reading)
+        if reading.*.failed || signature.length == 0 { break }
+        if signature.length == 1 && signature[0] == 115 && service.same(key, "handle_token") {
+            options.handleToken = dbus.readString(reading)
+        } else if signature.length == 1 && signature[0] == 115 && service.same(key, "session_handle_token") {
+            options.sessionToken = dbus.readString(reading)
+        } else if signature.length == 1 && signature[0] == 117 && service.same(key, "types") {
+            options.types = dbus.readU32(reading)
+        } else if signature.length == 1 && signature[0] == 117 && service.same(key, "cursor_mode") {
+            options.cursorMode = dbus.readU32(reading)
+        } else if !dbus.skipValue(reading, signature, 0, 0) {
+            break
+        }
+    }
+    return options
+}
+
+// The session at `path` that `owner` made, or NO_SLOT.
+fn sessionByPath(server: *Server, path: []const u8, owner: []const u8) -> usize {
+    var slot: usize = 0
+    while slot < service.MAX_SESSIONS {
+        const session = service.sessionAt(server, slot)
+        if session.*.used && service.same(service.pathOf(session), path) && service.same(service.ownerOf(session), owner) { return slot }
+        slot += 1
+    }
+    return service.NO_SLOT
+}
+
+// ---------------------------------------------------------------------------
+// ScreenCast
+
+fn screenCast(server: *Server, message: *const dbus.Header) -> void {
+    const member = message.*.member
+    var reading = dbus.reader(dbus.bodyOf(server.*.bus, message), message.*.bodyLength, message.*.big)
+    if service.same(member, "CreateSession") && service.same(message.*.signature, "a{sv}") {
+        createSession(server, message, readOptions(&reading))
+        return
+    }
+    if !(service.same(member, "SelectSources") || service.same(member, "Start") || service.same(member, "OpenPipeWireRemote")) {
+        refuse(server, message, "org.freedesktop.DBus.Error.UnknownMethod", "ScreenCast has CreateSession, SelectSources, Start and OpenPipeWireRemote")
+        return
+    }
+    const path = dbus.readString(&reading)
+    const slot = sessionByPath(server, path, message.*.sender)
+    if reading.failed || slot == service.NO_SLOT {
+        refuse(server, message, "org.freedesktop.portal.Error.InvalidArgument", "no such session")
+        return
+    }
+    const session = service.sessionAt(server, slot)
+    if service.same(member, "SelectSources") {
+        const options = readOptions(&reading)
+        if session.*.started || session.*.picking {
+            refuse(server, message, "org.freedesktop.portal.Error.Failed", "the session already started")
+            return
+        }
+        session.*.types = if options.types & SOURCE_TYPES != 0 { options.types & SOURCE_TYPES } else { SOURCE_MONITOR }
+        session.*.cursorMode = options.cursorMode
+        session.*.selected = true
+        var request: [256]u8 = undefined
+        var request_bytes: [*]u8 = undefined
+        unsafe { request_bytes = @ptrCast([*]u8, &request) }
+        const length = makePath(server, REQUEST_PREFIX, message.*.sender, options.handleToken, request_bytes)
+        replyPath(server, message, request_bytes[0..length])
+        var writing: dbus.Writer = undefined
+        writer(server, &writing)
+        dbus.putU32(&writing, SUCCESS)
+        const at = dbus.beginArray(&writing, 8)
+        dbus.endArray(&writing, at, 8)
+        emit(server, message.*.sender, request_bytes[0..length], REQUEST, "Response", "ua{sv}", &writing)
+    } else if service.same(member, "Start") {
+        const parent = dbus.readString(&reading)
+        const options = readOptions(&reading)
+        if session.*.started || session.*.picking {
+            refuse(server, message, "org.freedesktop.portal.Error.Failed", "the session already started")
+            return
+        }
+        var bytes: [*]u8 = undefined
+        unsafe { bytes = @ptrCast([*]u8, &session.*.request) }
+        session.*.requestLength = makePath(server, REQUEST_PREFIX, message.*.sender, options.handleToken, bytes)
+        replyPath(server, message, service.requestOf(session))
+        session.*.picking = true
+        askWho(server, slot)
+    } else {
+        openRemote(server, message, slot)
+    }
+}
+
+fn replyPath(server: *Server, message: *const dbus.Header, path: []const u8) -> void {
+    var writing: dbus.Writer = undefined
+    writer(server, &writing)
+    dbus.putString(&writing, path)
+    const sent = dbus.reply(server.*.bus, message, "o", writing.bytes, writing.length, nothing(), 0)
+}
+
+fn createSession(server: *Server, message: *const dbus.Header, options: Options) -> void {
+    var slot: usize = 0
+    while slot < service.MAX_SESSIONS && service.sessionAt(server, slot).*.used { slot += 1 }
+    if slot == service.MAX_SESSIONS {
+        refuse(server, message, "org.freedesktop.portal.Error.Failed", "too many screen-sharing sessions")
+        return
+    }
+    const session = service.sessionAt(server, slot)
+    session.*.used = true
+    var bytes: [*]u8 = undefined
+    unsafe { bytes = @ptrCast([*]u8, &session.*.owner) }
+    session.*.ownerLength = service.copyInto(bytes, 64, message.*.sender)
+    session.*.appLength = 0
+    session.*.sandboxed = false
+    unsafe { bytes = @ptrCast([*]u8, &session.*.path) }
+    session.*.pathLength = makePath(server, SESSION_PREFIX, message.*.sender, options.sessionToken, bytes)
+    session.*.types = SOURCE_MONITOR
+    session.*.cursorMode = 0
+    session.*.selected = false
+    session.*.started = false
+    session.*.requestLength = 0
+    session.*.picking = false
+    session.*.waiting = false
+    session.*.picker = service.NO_SLOT
+    session.*.appSerial = 0
+    session.*.sourceCount = 0
+    var request: [256]u8 = undefined
+    var request_bytes: [*]u8 = undefined
+    unsafe { request_bytes = @ptrCast([*]u8, &request) }
+    const length = makePath(server, REQUEST_PREFIX, message.*.sender, options.handleToken, request_bytes)
+    replyPath(server, message, request_bytes[0..length])
+    var writing: dbus.Writer = undefined
+    writer(server, &writing)
+    dbus.putU32(&writing, SUCCESS)
+    const at = dbus.beginArray(&writing, 8)
+    entryString(&writing, "session_handle", service.pathOf(session))
+    dbus.endArray(&writing, at, 8)
+    emit(server, message.*.sender, request_bytes[0..length], REQUEST, "Response", "ua{sv}", &writing)
+    service.say(server, "capture: a screen-sharing session for ")
+    service.say(server, message.*.sender)
+    service.say(server, "\n")
+}
+
+// Who the app is: its process (the bus says), then its app id.
+fn askWho(server: *Server, slot: usize) -> void {
+    const session = service.sessionAt(server, slot)
+    var writing: dbus.Writer = undefined
+    writer(server, &writing)
+    dbus.putString(&writing, service.ownerOf(session))
+    session.*.appSerial = dbus.call(server.*.bus, BUS, BUS_PATH, BUS, "GetConnectionUnixProcessID", "s", writing.bytes, writing.length)
+    if session.*.appSerial == 0 { identified(server, slot, 0) }
+}
+
+fn replied(server: *Server, message: *const dbus.Header) -> void {
+    var slot: usize = 0
+    while slot < service.MAX_SESSIONS {
+        const session = service.sessionAt(server, slot)
+        if session.*.used && session.*.appSerial != 0 && session.*.appSerial == message.*.replySerial {
+            session.*.appSerial = 0
+            var pid: u32 = 0
+            if message.*.kind == dbus.METHOD_RETURN {
+                var reading = dbus.reader(dbus.bodyOf(server.*.bus, message), message.*.bodyLength, message.*.big)
+                pid = dbus.readU32(&reading)
+            }
+            identified(server, slot, pid)
+            return
+        }
+        slot += 1
+    }
+}
+
+fn identified(server: *Server, slot: usize, pid: u32) -> void {
+    const session = service.sessionAt(server, slot)
+    var bytes: [*]u8 = undefined
+    unsafe { bytes = @ptrCast([*]u8, &session.*.app) }
+    var sandboxed = false
+    session.*.appLength = appid.identify(pid, bytes, 128, &sandboxed)
+    session.*.sandboxed = sandboxed
+    service.say(server, "capture: ")
+    service.say(server, service.appOf(session))
+    service.say(server, " asks to share the screen\n")
+    ask(server, slot)
+}
+
+// The answer for a session: from --choose, else from the picker.
+fn ask(server: *Server, slot: usize) -> void {
+    if server.*.choose == service.PICK_SCREEN {
+        chosen(server, slot, "screen")
+    } else if server.*.choose == service.PICK_DENY {
+        chosen(server, slot, "deny")
+    } else if server.*.choose == service.PICK_WINDOW {
+        var line: [80]u8 = undefined
+        var bytes: [*]u8 = undefined
+        unsafe { bytes = @ptrCast([*]u8, &line) }
+        var length = service.copyInto(bytes, 8, "window ")
+        var window: [*]const u8 = undefined
+        unsafe { window = @ptrCast([*]const u8, &server.*.chooseWindow) }
+        length += service.copyInto(service.advance(bytes, length), 64, window[0..server.*.chooseWindowLength])
+        chosen(server, slot, bytes[0..length])
+    } else if !openPicker(server, slot) {
+        service.say(server, "capture: no picker could be shown; nothing is shared\n")
+        chosen(server, slot, "deny")
+    }
+}
+
+// What the user chose ("screen", "window NAME", or anything else for no):
+// the sources start; the Response waits for their sizes (pump).
+pub fn chosen(server: *Server, slot: usize, answer: []const u8) -> void {
+    const session = service.sessionAt(server, slot)
+    if !session.*.used || !session.*.picking { return }
+    session.*.picking = false
+    session.*.picker = service.NO_SLOT
+    var opened = service.NO_SLOT
+    if service.same(answer, "screen") {
+        opened = sources.open(server, slot, "")
+    } else if answer.length > 7 && service.same(answer[0..7], "window ") {
+        opened = sources.open(server, slot, answer[7..answer.length])
+    } else {
+        service.say(server, "capture: the user shares nothing\n")
+        respondStart(server, slot, CANCELLED)
+        return
+    }
+    if opened == service.NO_SLOT {
+        respondStart(server, slot, FAILED)
+        return
+    }
+    session.*.sources[0] = opened
+    session.*.sourceCount = 1
+    session.*.waiting = true
+}
+
+// Start's Response: the streams (when `code` is SUCCESS).
+fn respondStart(server: *Server, slot: usize, code: u32) -> void {
+    const session = service.sessionAt(server, slot)
+    var writing: dbus.Writer = undefined
+    writer(server, &writing)
+    dbus.putU32(&writing, code)
+    const at = dbus.beginArray(&writing, 8)
+    if code == SUCCESS {
+        dbus.pad(&writing, 8)
+        dbus.putString(&writing, "streams")
+        dbus.putSignature(&writing, "a(ua{sv})")
+        const streams = dbus.beginArray(&writing, 8)
+        var index: usize = 0
+        while index < session.*.sourceCount {
+            const source = service.sourceAt(server, session.*.sources[index])
+            dbus.pad(&writing, 8)
+            dbus.putU32(&writing, source.*.nodeId)
+            const props = dbus.beginArray(&writing, 8)
+            var digits: [24]u8 = undefined
+            var digit_bytes: [*]u8 = undefined
+            unsafe { digit_bytes = @ptrCast([*]u8, &digits) }
+            const count = service.decimal(digit_bytes, index)
+            entryString(&writing, "id", digit_bytes[0..count])
+            entryPair(&writing, "position", 0, 0)
+            entryPair(&writing, "size", @intCast(i32, source.*.width), @intCast(i32, source.*.height))
+            entryU32(&writing, "source_type", if source.*.windowLength == 0 { SOURCE_MONITOR } else { SOURCE_WINDOW })
+            dbus.endArray(&writing, props, 8)
+            index += 1
+        }
+        dbus.endArray(&writing, streams, 8)
+        session.*.started = true
+    }
+    dbus.endArray(&writing, at, 8)
+    emit(server, service.ownerOf(session), service.requestOf(session), REQUEST, "Response", "ua{sv}", &writing)
+    session.*.requestLength = 0
+    session.*.waiting = false
+    if code != SUCCESS { closeSession(server, slot, false) }
+}
+
+// OpenPipeWireRemote: a socket pair; the service keeps one end as a
+// PipeWire connection that sees the session's sources, the app gets the
+// other.
+fn openRemote(server: *Server, message: *const dbus.Header, slot: usize) -> void {
+    const session = service.sessionAt(server, slot)
+    if !session.*.started {
+        refuse(server, message, "org.freedesktop.portal.Error.Failed", "the session has not started")
+        return
+    }
+    var pair: [2]i32 = [2]i32{ -1, -1 }
+    // AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC.
+    if std.linux.syscall4(SYS_socketpair, 1, 524289, 0, @intFromPtr(&pair)) != 0 {
+        refuse(server, message, "org.freedesktop.portal.Error.Failed", "no socket")
+        return
+    }
+    if !pipewire.addPeer(server, @intCast(isize, pair[0]), slot) {
+        dbus.closeDescriptor(@intCast(isize, pair[0]))
+        dbus.closeDescriptor(@intCast(isize, pair[1]))
+        refuse(server, message, "org.freedesktop.portal.Error.Failed", "too many PipeWire connections")
+        return
+    }
+    var writing: dbus.Writer = undefined
+    writer(server, &writing)
+    dbus.putU32(&writing, 0)
+    var descriptors: [1]isize = [1]isize{ @intCast(isize, pair[1]) }
+    var held: [*]const isize = undefined
+    unsafe { held = @ptrCast([*]const isize, &descriptors) }
+    const sent = dbus.reply(server.*.bus, message, "h", writing.bytes, writing.length, held, 1)
+}
+
+// Request.Close: the app no longer waits (the picker goes).
+fn cancelRequest(server: *Server, message: *const dbus.Header) -> void {
+    var slot: usize = 0
+    while slot < service.MAX_SESSIONS {
+        const session = service.sessionAt(server, slot)
+        if session.*.used && session.*.requestLength > 0 && service.same(service.requestOf(session), message.*.path) && service.same(service.ownerOf(session), message.*.sender) {
+            closeSession(server, slot, false)
+        }
+        slot += 1
+    }
+    replyEmpty(server, message)
+}
+
+// Ends a session: its picker, sources and connections; `tell`: the app
+// hears Session.Closed.
+pub fn closeSession(server: *Server, slot: usize, tell: bool) -> void {
+    const session = service.sessionAt(server, slot)
+    if !session.*.used { return }
+    if tell {
+        var writing: dbus.Writer = undefined
+        writer(server, &writing)
+        const at = dbus.beginArray(&writing, 8)
+        dbus.endArray(&writing, at, 8)
+        emit(server, service.ownerOf(session), service.pathOf(session), SESSION, "Closed", "a{sv}", &writing)
+    }
+    if session.*.picker != service.NO_SLOT {
+        const picker = service.pickerAt(server, session.*.picker)
+        picker.*.session = service.NO_SLOT
+        // SIGTERM: its answer no longer matters.
+        const killed = std.linux.syscall2(62, @bitCast(usize, picker.*.pid), 15)
+    }
+    pipewire.dropSession(server, slot)
+    var index: usize = 0
+    while index < service.MAX_SOURCES {
+        const source = service.sourceAt(server, index)
+        if source.*.used && source.*.session == slot { sources.close(server, index) }
+        index += 1
+    }
+    session.*.used = false
+    service.say(server, "capture: a screen-sharing session ended\n")
+}
+
+// An app left the bus: its sessions end.
+fn ownerChanged(server: *Server, message: *const dbus.Header) -> void {
+    var reading = dbus.reader(dbus.bodyOf(server.*.bus, message), message.*.bodyLength, message.*.big)
+    const name = dbus.readString(&reading)
+    const old = dbus.readString(&reading)
+    const owner = dbus.readString(&reading)
+    if reading.failed || owner.length != 0 || name.length == 0 || name[0] != 58 { return }
+    var slot: usize = 0
+    while slot < service.MAX_SESSIONS {
+        const session = service.sessionAt(server, slot)
+        if session.*.used && service.same(service.ownerOf(session), name) { closeSession(server, slot, false) }
+        slot += 1
+    }
+}
+
+// The Responses due once the sources know their sizes, and the sessions
+// whose sources all went.
+pub fn pump(server: *Server) -> void {
+    var slot: usize = 0
+    while slot < service.MAX_SESSIONS {
+        const session = service.sessionAt(server, slot)
+        if session.*.used && session.*.waiting {
+            var ready = true
+            var failed = false
+            var index: usize = 0
+            while index < session.*.sourceCount {
+                const source = service.sourceAt(server, session.*.sources[index])
+                if source.*.stopped { failed = true }
+                if source.*.width == 0 { ready = false }
+                index += 1
+            }
+            if failed {
+                respondStart(server, slot, FAILED)
+            } else if ready {
+                respondStart(server, slot, SUCCESS)
+            }
+        } else if session.*.used && session.*.started && sources.sessionStopped(server, slot) {
+            closeSession(server, slot, true)
+        }
+        slot += 1
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The picker (this program again, --pick)
+
+const SYS_read: usize = 0
+const SYS_access: usize = 21
+const SYS_fork: usize = 57
+const SYS_execve: usize = 59
+const SYS_wait4: usize = 61
+const SYS_fcntl: usize = 72
+const SYS_exit_group: usize = 231
+const SYS_pipe2: usize = 293
+const O_CLOEXEC: usize = 524288
+const F_SETFD: usize = 2
+
+fn terminated(target: [*]u8, capacity: usize, text: []const u8) -> usize {
+    const length = service.copyInto(target, capacity - 1, text)
+    target[length] = 0
+    return length + 1
+}
+
+// Shows the picker for session `slot`; false when it could not.
+fn openPicker(server: *Server, slot: usize) -> bool {
+    const session = service.sessionAt(server, slot)
+    var index: usize = 0
+    while index < service.MAX_PICKERS && service.pickerAt(server, index).*.used { index += 1 }
+    if index == service.MAX_PICKERS { return false }
+    var pipe: [2]i32 = [2]i32{ -1, -1 }
+    if std.linux.syscall2(SYS_pipe2, @intFromPtr(&pipe), O_CLOEXEC) != 0 { return false }
+    const read_end = @intCast(isize, pipe[0])
+    const write_end = @intCast(isize, pipe[1])
+    // mlx-capture --pick APP [--sandboxed] --types N --answer-fd N
+    var text: [1024]u8 = undefined
+    var text_bytes: [*]u8 = undefined
+    unsafe { text_bytes = @ptrCast([*]u8, &text) }
+    var starts: [10]usize = undefined
+    var count: usize = 0
+    var used: usize = 0
+    starts[count] = used
+    count += 1
+    used += terminated(service.advance(text_bytes, used), 32, "mlx-capture")
+    starts[count] = used
+    count += 1
+    used += terminated(service.advance(text_bytes, used), 32, "--pick")
+    starts[count] = used
+    count += 1
+    used += terminated(service.advance(text_bytes, used), 130, service.appOf(session))
+    if session.*.sandboxed {
+        starts[count] = used
+        count += 1
+        used += terminated(service.advance(text_bytes, used), 32, "--sandboxed")
+    }
+    starts[count] = used
+    count += 1
+    used += terminated(service.advance(text_bytes, used), 32, "--types")
+    var types: []const u8 = "3"
+    if session.*.types == SOURCE_WINDOW { types = "2" }
+    if session.*.types == SOURCE_MONITOR { types = "1" }
+    starts[count] = used
+    count += 1
+    used += terminated(service.advance(text_bytes, used), 4, types)
+    starts[count] = used
+    count += 1
+    used += terminated(service.advance(text_bytes, used), 32, "--answer-fd")
+    starts[count] = used
+    count += 1
+    var digits: [24]u8 = undefined
+    var digit_bytes: [*]u8 = undefined
+    unsafe { digit_bytes = @ptrCast([*]u8, &digits) }
+    const digit_count = service.decimal(digit_bytes, @intCast(usize, write_end))
+    used += terminated(service.advance(text_bytes, used), 32, digit_bytes[0..digit_count])
+    var arguments: [11][*]const u8 = undefined
+    var at: usize = 0
+    while at < count {
+        arguments[at] = service.advance(text_bytes, starts[at])
+        at += 1
+    }
+    unsafe { arguments[count] = @ptrFromInt([*]const u8, 0) }
+    // The environment, and a Wayland display when it has none.
+    var environment: [512][*]const u8 = undefined
+    var entries: usize = 0
+    while @intFromPtr(server.*.environment[entries]) != 0 && entries < 500 {
+        environment[entries] = server.*.environment[entries]
+        entries += 1
+    }
+    var wayland: [64]u8 = undefined
+    var wayland_bytes: [*]u8 = undefined
+    unsafe { wayland_bytes = @ptrCast([*]u8, &wayland) }
+    if std.process.environmentFrom(server.*.environment, "WAYLAND_DISPLAY") == null {
+        const ignored = terminated(wayland_bytes, 64, "WAYLAND_DISPLAY=wayland-mlx")
+        environment[entries] = wayland_bytes
+        entries += 1
+    }
+    unsafe { environment[entries] = @ptrFromInt([*]const u8, 0) }
+    var argument_pointer: [*][*]const u8 = undefined
+    unsafe { argument_pointer = @ptrCast([*][*]const u8, &arguments) }
+    var environment_pointer: [*][*]const u8 = undefined
+    unsafe { environment_pointer = @ptrCast([*][*]const u8, &environment) }
+    const child = std.linux.syscall0(SYS_fork)
+    if child == 0 {
+        // The write end stays open in the picker; the bus's socket is the
+        // service's alone.
+        const kept = std.linux.syscall3(SYS_fcntl, @bitCast(usize, write_end), F_SETFD, 0)
+        dbus.closeDescriptor(dbus.descriptorOfClient(server.*.bus))
+        const ignored = std.linux.syscall3(SYS_execve, @intFromPtr("/proc/self/exe"), @intFromPtr(argument_pointer), @intFromPtr(environment_pointer))
+        const exited = std.linux.syscall1(SYS_exit_group, 127)
+    }
+    dbus.closeDescriptor(write_end)
+    if child < 0 {
+        dbus.closeDescriptor(read_end)
+        return false
+    }
+    const picker = service.pickerAt(server, index)
+    picker.*.used = true
+    picker.*.pid = child
+    picker.*.pipe = read_end
+    picker.*.session = slot
+    picker.*.answerLength = 0
+    session.*.picker = index
+    const watched = dbus.watch(server.*.eventLoop, read_end, service.TOKEN_PICKER + index, false)
+    return true
+}
+
+// What the picker wrote; at its end the session gets the answer.
+pub fn pickerReadable(server: *Server, index: usize) -> void {
+    const picker = service.pickerAt(server, index)
+    if !picker.*.used { return }
+    var answer_bytes: [*]u8 = undefined
+    unsafe { answer_bytes = @ptrCast([*]u8, &picker.*.answer) }
+    if picker.*.answerLength < 127 {
+        const got = std.linux.syscall3(SYS_read, @bitCast(usize, picker.*.pipe), @intFromPtr(service.advance(answer_bytes, picker.*.answerLength)), 127 - picker.*.answerLength)
+        if got > 0 {
+            picker.*.answerLength += @intCast(usize, got)
+            return
+        }
+        if got == -4 || got == -11 { return }
+    }
+    const unwatched = dbus.unwatch(server.*.eventLoop, picker.*.pipe)
+    dbus.closeDescriptor(picker.*.pipe)
+    var status: i32 = 0
+    const reaped = std.linux.syscall4(SYS_wait4, @bitCast(usize, picker.*.pid), @intFromPtr(&status), 0, 0)
+    picker.*.used = false
+    var length = picker.*.answerLength
+    while length > 0 && (answer_bytes[length - 1] == 10 || answer_bytes[length - 1] == 32) { length -= 1 }
+    if picker.*.session != service.NO_SLOT { chosen(server, picker.*.session, answer_bytes[0..length]) }
+}
