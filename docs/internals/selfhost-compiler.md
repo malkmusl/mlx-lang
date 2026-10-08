@@ -861,6 +861,7 @@ convention the guide's `tests/` citations use):
 | `275_import_cycle_order_runtime.mlx` | declaration analysis across an import cycle (`tests/support/import_cycle/lib.mlx`, `part.mlx`, `user.mlx`): the cycle is broken at the module its others import, cycles that wait for no other cycle first; a module only waiting for a cycle is never where it is broken |
 | `281_arena_capacity_runtime.mlx` | the aggregate arena holds more than 256 MiB of values (1 GiB of address space, `MAP_NORESERVE`): 320 MiB of 4 KiB locals fit; the compiler needs this for the largest programs |
 | `282_match_result_width_runtime.mlx` | a match's arms store its value at the match's width (as `if` expressions do): a u32 arm next to literal arms used to fill half the slot the result is loaded from |
+| `293_signed_result_runtime.mlx` | a narrow signed value an `if` or `match` made (or a `for` took from an array) is loaded sign-extended like any other: the result slot was loaded as an unsigned word, so a function returning a negative i32 from an `if` gave its caller a large positive number |
 | `182_selfhost_atomic_encoder_runtime.mlx` | `backend/x86_64/encoder.mlx` atomic instruction encoding |
 | `194_selfhost_lir_copy_propagation_runtime.mlx` | `ir/optimize.mlx`'s copy-propagation pass specifically |
 | `195_selfhost_encoder_rax_cache_runtime.mlx` | the backend's `rax`-caching optimization (see `cachedRaxLoads` metric in `driver/pipeline.mlx`) |

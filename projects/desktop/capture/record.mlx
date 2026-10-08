@@ -1,0 +1,346 @@
+// mlx-capture --record: the screen (or a window) and its sound as a
+// Matroska video (std.matroska): a JPEG per frame (std.jpeg) and 16-bit
+// PCM sound at 48000 Hz, stereo.
+//
+// Frames come from the compositor (ext-image-copy-capture-v1) when
+// something changed, at most --fps a second; each is timed from the
+// recording's start, so a still screen costs nothing and the video's rate
+// varies. Only the rows of blocks a frame's damage covers are coded again
+// (jpeg.encodeFrame).
+//
+// Sound comes from MLX Audio (std.audio) in tracks of their own: the
+// desktop's (what plays: the default sink's monitor, or the sink named
+// by --desktop; MLXIPC's audio.monitor) and the microphone (the input:
+// audio.record). With --mix both are one track. A track the app may not
+// have is left out, and it says why. Each track is timed by its samples.
+//
+// It ends after --duration seconds, or on Ctrl+C (SIGINT, SIGTERM), and
+// says what it wrote.
+const std = @import("std")
+const wl = @import("std.wayland")
+const audio = @import("std.audio")
+const jpeg = @import("std.jpeg")
+const matroska = @import("std.matroska")
+const client = @import("./client.mlx")
+
+const Capture = client.Capture
+
+const RATE: u32 = 48000
+const FRAME_BYTES: usize = 4
+// What is read from a sound stream at once (100 ms).
+const CHUNK: usize = 19200
+
+const SYS_rt_sigprocmask: usize = 14
+const SYS_signalfd4: usize = 289
+const SIGINT_MASK: usize = 2
+const SIGTERM_MASK: usize = 16384
+
+pub const Options = struct {
+    window: []const u8
+    // Milliseconds (0: until Ctrl+C).
+    duration: u64
+    fps: u32
+    quality: u32
+    desktop: bool
+    microphone: bool
+    mix: bool
+    // Where the desktop's sound comes from ("monitor", "monitor:SINK").
+    desktopSource: []const u8
+    environment: [*][*]const u8
+}
+
+// A sound track being recorded: its connection, stream, track number,
+// samples written (frames) and what came but is not written yet (--mix).
+const Sound = struct {
+    connection: audio.Audio
+    open: bool
+    stream: u32
+    track: usize
+    frames: u64
+    pending: [*]u8
+    pendingLength: usize
+}
+
+fn say(text: []const u8) -> void { const ignored = std.io.writeAll(std.io.stdout(), text) }
+
+fn sayNumber(value: u64) -> void { const ignored = std.io.writeUnsigned(std.io.stdout(), @intCast(usize, value)) }
+
+fn complain(text: []const u8) -> void { const ignored = std.io.writeAll(std.io.stderr(), text) }
+
+fn milliseconds() -> u64 {
+    var time: [2]usize = [2]usize{ 0, 0 }
+    const result = std.linux.syscall2(228, 1, @intFromPtr(&time))
+    return @intCast(u64, time[0] * 1000 + time[1] / 1000000)
+}
+
+// Opens a recording stream of the desktop's sound or the microphone;
+// false (and why, said) when it cannot.
+fn openSound(sound: *Sound, allocator: std.allocator.Allocator, environment: [*][*]const u8, name: []const u8, source: []const u8, what: []const u8) -> bool {
+    sound.*.open = false
+    sound.*.frames = 0
+    sound.*.pendingLength = 0
+    const memory = allocator.alloc(CHUNK * 4, 16)
+    if memory == null { return false }
+    sound.*.pending = memory.?
+    var connection: *audio.Audio = undefined
+    unsafe { connection = @ptrCast(*audio.Audio, &sound.*.connection) }
+    const connected = audio.connect(connection, allocator, environment)
+    if connected != audio.OK {
+        complain("mlx-capture: no ")
+        complain(what)
+        complain(if connected == audio.NO_BUS { ": no session bus (MLXIPC)\n" } else if connected == audio.NOT_ALLOWED { ": this app may not talk to MLX Audio\n" } else { ": MLX Audio is not running\n" })
+        return false
+    }
+    sound.*.stream = audio.openStreamOn(connection, audio.RECORD, audio.S16, 2, RATE, 100, name, source)
+    if sound.*.stream == 0 || audio.refusal(connection, sound.*.stream) != 0 {
+        complain("mlx-capture: no ")
+        complain(what)
+        complain(if sound.*.stream != 0 && audio.refusal(connection, sound.*.stream) == audio.DENIED { ": this app may not record it (MLXIPC permissions)\n" } else { ": MLX Audio refused the stream\n" })
+        audio.disconnect(connection)
+        return false
+    }
+    sound.*.open = true
+    return true
+}
+
+fn connectionOf(sound: *Sound) -> *audio.Audio {
+    unsafe { return @ptrCast(*audio.Audio, &sound.*.connection) }
+}
+
+// What came of a sound stream, into its pending bytes; false when the
+// server went.
+fn gather(sound: *Sound) -> bool {
+    if !sound.*.open { return true }
+    const connection = connectionOf(sound)
+    while sound.*.pendingLength + 4096 <= CHUNK * 4 {
+        var at: [*]u8 = undefined
+        unsafe { at = @ptrFromInt([*]u8, @intFromPtr(sound.*.pending) + sound.*.pendingLength) }
+        const got = audio.read(connection, sound.*.stream, at, CHUNK * 4 - sound.*.pendingLength, 0)
+        if got == 0 { break }
+        sound.*.pendingLength += got
+    }
+    if !connection.*.connected {
+        sound.*.open = false
+        return false
+    }
+    return true
+}
+
+// A sound track's pending samples as a block (timed by the samples before
+// them).
+fn writeSound(writer: *matroska.Writer, sound: *Sound) -> bool {
+    if sound.*.pendingLength == 0 { return true }
+    const time = sound.*.frames * 1000 / @intCast(u64, RATE)
+    const ok = matroska.block(writer, sound.*.track, time, sound.*.pending, sound.*.pendingLength)
+    sound.*.frames += @intCast(u64, sound.*.pendingLength / FRAME_BYTES)
+    sound.*.pendingLength = 0
+    return ok
+}
+
+fn sampleAt(bytes: [*]const u8, at: usize) -> i32 {
+    const value = @intCast(i32, bytes[at]) | (@intCast(i32, bytes[at + 1]) << 8)
+    return if value >= 32768 { value - 65536 } else { value }
+}
+
+// --mix: what both streams have (as much as the shorter), summed into the
+// first's track.
+fn writeMixed(writer: *matroska.Writer, desktop: *Sound, microphone: *Sound) -> bool {
+    var length = desktop.*.pendingLength
+    if microphone.*.pendingLength < length { length = microphone.*.pendingLength }
+    length = length / FRAME_BYTES * FRAME_BYTES
+    if length == 0 { return true }
+    var index: usize = 0
+    while index < length {
+        var sum = sampleAt(desktop.*.pending, index) + sampleAt(microphone.*.pending, index)
+        if sum > 32767 { sum = 32767 }
+        if sum < -32768 { sum = -32768 }
+        const bits = @bitCast(u32, sum)
+        desktop.*.pending[index] = @intCast(u8, bits & 255)
+        desktop.*.pending[index + 1] = @intCast(u8, (bits >> 8) & 255)
+        index += 2
+    }
+    const time = desktop.*.frames * 1000 / @intCast(u64, RATE)
+    const ok = matroska.block(writer, desktop.*.track, time, desktop.*.pending, length)
+    desktop.*.frames += @intCast(u64, length / FRAME_BYTES)
+    // What is left goes to the front.
+    shift(desktop, length)
+    shift(microphone, length)
+    return ok
+}
+
+fn shift(sound: *Sound, count: usize) -> void {
+    var index: usize = 0
+    while index + count < sound.*.pendingLength {
+        sound.*.pending[index] = sound.*.pending[index + count]
+        index += 1
+    }
+    sound.*.pendingLength -= count
+}
+
+// Ctrl+C and SIGTERM as a descriptor to read (they no longer end the
+// program on their own).
+fn signals() -> isize {
+    var mask: usize = SIGINT_MASK | SIGTERM_MASK
+    const blocked = std.linux.syscall4(SYS_rt_sigprocmask, 0, @intFromPtr(&mask), 0, 8)
+    // SFD_NONBLOCK | SFD_CLOEXEC.
+    return std.linux.syscall4(SYS_signalfd4, 18446744073709551615, @intFromPtr(&mask), 8, 526336)
+}
+
+fn signalled(descriptor: isize) -> bool {
+    if descriptor < 0 { return false }
+    var record: [128]u8 = undefined
+    return std.linux.syscall3(0, @bitCast(usize, descriptor), @intFromPtr(&record), 128) == 128
+}
+
+// Handles what the compositor sent, waiting up to `timeout` milliseconds
+// for it.
+fn pumpWayland(capture: *Capture, timeout: isize) -> bool {
+    if !capture.*.connected || !capture.*.display.send() { return false }
+    if !capture.*.display.poll() { return false }
+    const waited = wl.transport.wait(wl.Handle.fromDescriptor(capture.*.display.descriptor()), false, timeout)
+    return capture.*.display.poll()
+}
+
+const Failure = error { NoCapture, NoWindow, Stopped, NotWritten }
+
+fn fail(message: []const u8, failure: Failure) -> Failure!void {
+    const said = std.io.eprintln(message)
+    return failure
+}
+
+pub fn record(capture: *Capture, path: std.string.String, options: *const Options) -> !void {
+    const allocator = std.page_allocator.init()
+    if !client.open(capture, "") { return fail("mlx-capture: no compositor with screen capture (ext-image-copy-capture-v1)", Failure.NoCapture) }
+    if !client.start(capture, options.*.window) {
+        if options.*.window.length == 0 { return fail("mlx-capture: the compositor offers no screen capture", Failure.NoCapture) }
+        return fail("mlx-capture: no such window (mlx-capture --list shows them)", Failure.NoWindow)
+    }
+    while !capture.*.constraintsDone && !capture.*.stopped {
+        if !client.wait(capture) { return fail("mlx-capture: the compositor went", Failure.Stopped) }
+    }
+    if capture.*.stopped { return fail("mlx-capture: the capture stopped (the window went)", Failure.Stopped) }
+    const width = @intCast(usize, capture.*.width)
+    const height = @intCast(usize, capture.*.height)
+
+    // The sound: the desktop's and the microphone's.
+    var desktop: Sound = undefined
+    var microphone: Sound = undefined
+    desktop.open = false
+    desktop.frames = 0
+    desktop.pendingLength = 0
+    microphone.open = false
+    microphone.frames = 0
+    microphone.pendingLength = 0
+    if options.*.desktop { const opened = openSound(&desktop, allocator, options.*.environment, "mlx-capture: desktop", options.*.desktopSource, "desktop sound") }
+    if options.*.microphone { const opened = openSound(&microphone, allocator, options.*.environment, "mlx-capture: microphone", "input", "microphone") }
+    const mixing = options.*.mix && desktop.open && microphone.open
+
+    var writer: matroska.Writer = undefined
+    if !matroska.create(&writer, path.pointer, allocator) { return fail("mlx-capture: the file could not be made", Failure.NotWritten) }
+    const video = matroska.addVideo(&writer, @intCast(u32, width), @intCast(u32, height), if options.*.window.length > 0 { "Window" } else { "Screen" })
+    if mixing {
+        desktop.track = matroska.addAudio(&writer, RATE, 2, "Desktop and microphone", true)
+    } else {
+        if desktop.open { desktop.track = matroska.addAudio(&writer, RATE, 2, "Desktop", true) }
+        if microphone.open { microphone.track = matroska.addAudio(&writer, RATE, 2, "Microphone", !desktop.open) }
+    }
+    if !matroska.begin(&writer) { return fail("mlx-capture: the file could not be written", Failure.NotWritten) }
+
+    var encoder: jpeg.Encoder = undefined
+    jpeg.init(&encoder, options.*.quality)
+    if !jpeg.startVideo(&encoder, width, height, allocator) { return fail("mlx-capture: out of memory", Failure.NotWritten) }
+    const capacity = encoder.rows * encoder.rowCapacity + 2048
+    const frame_memory = allocator.alloc(capacity, 16)
+    if frame_memory == null { return fail("mlx-capture: out of memory", Failure.NotWritten) }
+    const out = frame_memory.?
+
+    say("recording ")
+    say(std.string.asSlice(path))
+    say(" (")
+    sayNumber(@intCast(u64, width))
+    say("x")
+    sayNumber(@intCast(u64, height))
+    if mixing { say(", desktop sound and microphone mixed") } else {
+        if desktop.open { say(", desktop sound") }
+        if microphone.open { say(", microphone") }
+    }
+    say(if options.*.duration == 0 { "); Ctrl+C ends it\n" } else { ")\n" })
+
+    const stop = signals()
+    const start = milliseconds()
+    const spacing = @intCast(u64, 1000 / (if options.*.fps == 0 { 30 } else { options.*.fps }))
+    var next_frame = start
+    var frames: u64 = 0
+    var resized = false
+    var failed = false
+    while !failed {
+        const now = milliseconds()
+        if signalled(stop) || capture.*.stopped || (options.*.duration > 0 && now - start >= options.*.duration) { break }
+        if !capture.*.capturing && !capture.*.ready && now >= next_frame {
+            if !client.requestFrame(capture) && !capture.*.constraintsDone { break }
+        }
+        if !pumpWayland(capture, 10) { break }
+        if capture.*.ready {
+            capture.*.ready = false
+            const time = milliseconds() - start
+            if capture.*.width == @intCast(u32, width) && capture.*.height == @intCast(u32, height) {
+                // The rows the damage covers (all, for the first frame).
+                var top: usize = 0
+                var bottom = height
+                if frames > 0 {
+                    top = if capture.*.damageY > 0 { @intCast(usize, capture.*.damageY) } else { 0 }
+                    const end = capture.*.damageY + capture.*.damageHeight
+                    bottom = if end > 0 { @intCast(usize, end) } else { 0 }
+                }
+                const length = jpeg.encodeFrame(&encoder, client.pixels(capture), width, top, bottom, out, capacity)
+                if length > 0 {
+                    if !matroska.block(&writer, video, time, out, length) { failed = true }
+                    frames += 1
+                }
+            } else if !resized {
+                resized = true
+                complain("mlx-capture: the window changed its size; its frames of another size are left out\n")
+            }
+            next_frame = start + time + spacing
+        } else if capture.*.failed {
+            capture.*.failed = false
+            // The buffer no longer fits: the new constraints, then on.
+            if capture.*.failure != 1 { break }
+        }
+        // The sound that came meanwhile.
+        if !gather(&desktop) { complain("mlx-capture: MLX Audio went\n") }
+        if !gather(&microphone) { complain("mlx-capture: MLX Audio went\n") }
+        if mixing {
+            if !writeMixed(&writer, &desktop, &microphone) { failed = true }
+        } else {
+            if !writeSound(&writer, &desktop) || !writeSound(&writer, &microphone) { failed = true }
+        }
+    }
+    const ended = milliseconds() - start
+    if desktop.open {
+        audio.closeStream(connectionOf(&desktop), desktop.stream)
+        audio.disconnect(connectionOf(&desktop))
+    }
+    if microphone.open {
+        audio.closeStream(connectionOf(&microphone), microphone.stream)
+        audio.disconnect(connectionOf(&microphone))
+    }
+    jpeg.endVideo(&encoder, allocator)
+    client.close(capture)
+    if !matroska.finish(&writer, ended) || failed { return fail("mlx-capture: the file could not be written", Failure.NotWritten) }
+    say("saved ")
+    say(std.string.asSlice(path))
+    say(": ")
+    sayNumber(frames)
+    say(" frames in ")
+    sayNumber(ended / 1000)
+    say(".")
+    sayNumber(ended % 1000 / 100)
+    say(" s")
+    if desktop.open || microphone.open {
+        say(", ")
+        sayNumber((if desktop.open { desktop.frames } else { microphone.frames }) * 1000 / @intCast(u64, RATE))
+        say(" ms of sound")
+    }
+    say("\n")
+}

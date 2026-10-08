@@ -980,6 +980,35 @@ mlx-capture --window org.mlx.settings win.png  # a window by app id or title
 mlx-capture --frames 3 last.png                # three frames, each after a change
 ```
 
+`mlx-capture --record FILE.mkv` records a video
+([`record.mlx`](../capture/record.mlx)): the screen (or `--window NAME`)
+as Motion JPEG (`std.jpeg`) and its sound as 16-bit PCM at 48000 Hz, in a
+Matroska file (`std.matroska`) that mpv, VLC and ffmpeg play and seek.
+Frames come when the screen changed, at most `--fps` (30) a second, each
+timed from the start, and only the rows of blocks a frame's damage covers
+are coded again (the JPEG's rows are restart intervals, kept between
+frames), so a desktop that mostly stands still costs little. The sound
+comes from MLX Audio in tracks of their own: the desktop's (the default
+sink's monitor: what plays, before the speakers' volume; MLXIPC's
+`audio.monitor`) and the microphone (the input: `audio.record`); `--mix`
+puts both in one track, `--audio desktop|microphone|none` picks, and
+`--desktop monitor:SINK` records one virtual sink's sound only (an app
+routed there alone). A track the app may not have is left out, and it
+says why. It ends after `--duration SECONDS` or on Ctrl+C.
+
+```sh
+mlx-capture --record talk.mkv                        # screen, desktop sound, microphone
+mlx-capture --record game.mkv --window Minecraft --audio desktop --fps 60
+```
+
+`tools/check_capture_record.sh` records a nested compositor while the
+pointer moves and MLX Audio plays a 440 Hz tone with an 880 Hz tone as
+its input, and reads the file back with
+[`tools/check_mkv.py`](../../../tools/check_mkv.py): the Matroska
+structure, frames PIL decodes at the screen's size, 440 Hz in the
+desktop's track only and 880 Hz in the microphone's only (both with
+`--mix`).
+
 ### OBS
 
 `obs.mlx` is an OBS Studio plugin with the source **MLX Capture**: the

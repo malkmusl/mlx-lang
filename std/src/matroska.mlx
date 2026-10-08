@@ -1,0 +1,509 @@
+// std.matroska: writes Matroska (.mkv) files: tracks of Motion JPEG video
+// (a JPEG per frame, std.jpeg) and 16-bit PCM sound, blocks as they come
+// with their own times (a video's frames need not come at a fixed rate:
+// a screen recording gets one when something changed). Players (mpv, VLC,
+// ffmpeg) play and seek them.
+//
+//     var writer: matroska.Writer = undefined
+//     matroska.create(&writer, path, allocator)
+//     const video = matroska.addVideo(&writer, width, height, "Screen")
+//     const sound = matroska.addAudio(&writer, 48000, 2, "Desktop", true)
+//     matroska.begin(&writer)
+//     matroska.block(&writer, video, milliseconds, jpeg, length)   ...
+//     matroska.finish(&writer, milliseconds)
+//
+// The file: the EBML header; a Segment whose size, the duration, the
+// clusters' sizes and the SeekHead (at a reserved place near the start)
+// are filled in by finish; Info (a millisecond time scale); Tracks;
+// clusters of SimpleBlocks (a new one each second); Cues (each cluster's
+// time and place, for seeking).
+const allocator_module = @import("../bootstrap/allocator.mlx")
+const fs = @import("../bootstrap/fs.mlx")
+
+pub const Allocator = allocator_module.Allocator
+
+pub const MAX_TRACKS: usize = 4
+pub const MAX_CUES: usize = 65536
+const BUFFER: usize = 262144
+const SEEK_ROOM: usize = 96
+// A new cluster after this long (milliseconds).
+const CLUSTER_SPAN: u64 = 1000
+
+pub const Track = struct {
+    video: bool
+    width: u32
+    height: u32
+    rate: u32
+    channels: u32
+    name: [32]u8
+    nameLength: usize
+    isDefault: bool
+}
+
+pub const Writer = struct {
+    file: fs.File
+    allocator: Allocator
+    failed: bool
+    // Bytes not written yet, and where in the file they go.
+    buffer: [*]u8
+    length: usize
+    written: usize
+    tracks: [4]Track
+    trackCount: usize
+    // Offsets in the file: the Segment's size, its data (positions in
+    // SeekHead and Cues count from there), the reserved SeekHead room,
+    // Info, Tracks and the duration's float.
+    segmentSize: usize
+    segmentData: usize
+    seekRoom: usize
+    info: usize
+    trackList: usize
+    duration: usize
+    // The open cluster: whether there is one, its start, its size field,
+    // its time (milliseconds).
+    inCluster: bool
+    clusterStart: usize
+    clusterSize: usize
+    clusterTime: u64
+    // Each cluster's time and place (from segmentData).
+    cueTimes: [*]u64
+    cuePlaces: [*]u64
+    cueCount: usize
+}
+
+fn position(writer: *Writer) -> usize { return writer.*.written + writer.*.length }
+
+fn flush(writer: *Writer) -> void {
+    if writer.*.length == 0 || writer.*.failed { return }
+    if !fs.writeAllBytes(writer.*.file, writer.*.buffer, writer.*.length) { writer.*.failed = true }
+    writer.*.written += writer.*.length
+    writer.*.length = 0
+}
+
+fn put(writer: *Writer, bytes: [*]const u8, count: usize) -> void {
+    if writer.*.length + count > BUFFER { flush(writer) }
+    if count > BUFFER {
+        if !fs.writeAllBytes(writer.*.file, bytes, count) { writer.*.failed = true }
+        writer.*.written += count
+        return
+    }
+    var index: usize = 0
+    while index < count {
+        writer.*.buffer[writer.*.length + index] = bytes[index]
+        index += 1
+    }
+    writer.*.length += count
+}
+
+fn putByte(writer: *Writer, value: u64) -> void {
+    if writer.*.length + 1 > BUFFER { flush(writer) }
+    writer.*.buffer[writer.*.length] = @intCast(u8, value & 255)
+    writer.*.length += 1
+}
+
+// An element ID (its marker bits included), 1 to 4 bytes.
+fn putId(writer: *Writer, id: u32) -> void {
+    if id >= 16777216 { putByte(writer, @intCast(u64, id >> 24)) }
+    if id >= 65536 { putByte(writer, @intCast(u64, (id >> 16) & 255)) }
+    if id >= 256 { putByte(writer, @intCast(u64, (id >> 8) & 255)) }
+    putByte(writer, @intCast(u64, id & 255))
+}
+
+// A size as a variable-length integer (the shortest that holds it).
+fn putSize(writer: *Writer, size: u64) -> void {
+    var bytes: usize = 1
+    while bytes < 8 && size >= (@intCast(u64, 1) << @intCast(u64, 7 * bytes)) - 1 { bytes += 1 }
+    var index: usize = 0
+    while index < bytes {
+        var value = (size >> @intCast(u64, 8 * (bytes - 1 - index))) & 255
+        if index == 0 { value = value | (@intCast(u64, 128) >> @intCast(u64, bytes - 1)) }
+        putByte(writer, value)
+        index += 1
+    }
+}
+
+// An 8-byte size to fill in later: where its bytes are.
+fn putLaterSize(writer: *Writer) -> usize {
+    const at = position(writer)
+    putByte(writer, 1)
+    var index: usize = 0
+    while index < 7 {
+        putByte(writer, 255)
+        index += 1
+    }
+    return at
+}
+
+fn bytesOf(value: u64) -> usize {
+    var count: usize = 1
+    while count < 8 && value >= (@intCast(u64, 1) << @intCast(u64, 8 * count)) { count += 1 }
+    return count
+}
+
+fn putUnsigned(writer: *Writer, id: u32, value: u64) -> void {
+    const count = bytesOf(value)
+    putId(writer, id)
+    putSize(writer, @intCast(u64, count))
+    var index: usize = 0
+    while index < count {
+        putByte(writer, (value >> @intCast(u64, 8 * (count - 1 - index))) & 255)
+        index += 1
+    }
+}
+
+fn putText(writer: *Writer, id: u32, text: []const u8) -> void {
+    putId(writer, id)
+    putSize(writer, @intCast(u64, text.length))
+    for byte in text { putByte(writer, @intCast(u64, byte)) }
+}
+
+// A 4-byte float.
+fn putFloat(writer: *Writer, id: u32, value: f32) -> void {
+    putId(writer, id)
+    putSize(writer, 4)
+    const bits = @bitCast(u32, value)
+    putByte(writer, @intCast(u64, bits >> 24))
+    putByte(writer, @intCast(u64, (bits >> 16) & 255))
+    putByte(writer, @intCast(u64, (bits >> 8) & 255))
+    putByte(writer, @intCast(u64, bits & 255))
+}
+
+// Writes `count` bytes at `at` in the file (flushed first).
+fn patch(writer: *Writer, at: usize, bytes: [*]const u8, count: usize) -> void {
+    flush(writer)
+    if writer.*.failed { return }
+    if fs.pwrite(writer.*.file, bytes, count, at) != @intCast(isize, count) { writer.*.failed = true }
+}
+
+// An 8-byte size (from putLaterSize) filled in.
+fn patchSize(writer: *Writer, at: usize, size: u64) -> void {
+    var bytes: [8]u8 = undefined
+    bytes[0] = 1
+    var index: usize = 1
+    while index < 8 {
+        bytes[index] = @intCast(u8, (size >> @intCast(u64, 8 * (7 - index))) & 255)
+        index += 1
+    }
+    var pointer: [*]const u8 = undefined
+    unsafe { pointer = @ptrCast([*]const u8, &bytes) }
+    patch(writer, at, pointer, 8)
+}
+
+fn trackAt(writer: *Writer, index: usize) -> *Track {
+    unsafe { return @ptrCast(*Track, &writer.*.tracks[index]) }
+}
+
+// Opens `path` (made anew) for writing; false when it cannot be.
+pub fn create(writer: *Writer, path: [*]const u8, allocator: Allocator) -> bool {
+    writer.*.allocator = allocator
+    writer.*.failed = false
+    writer.*.length = 0
+    writer.*.written = 0
+    writer.*.trackCount = 0
+    writer.*.inCluster = false
+    writer.*.cueCount = 0
+    // O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC.
+    writer.*.file = fs.open(path, 1 | 64 | 512 | 524288, 420)
+    if !fs.isValid(writer.*.file) { return false }
+    const buffer = allocator.alloc(BUFFER, 16)
+    const times = allocator.alloc(MAX_CUES * 8, 16)
+    const places = allocator.alloc(MAX_CUES * 8, 16)
+    if buffer == null || times == null || places == null { return false }
+    writer.*.buffer = buffer.?
+    unsafe {
+        writer.*.cueTimes = @ptrCast([*]u64, times.?)
+        writer.*.cuePlaces = @ptrCast([*]u64, places.?)
+    }
+    return true
+}
+
+fn addTrack(writer: *Writer, name: []const u8) -> usize {
+    if writer.*.trackCount >= MAX_TRACKS { return 0 }
+    const track = trackAt(writer, writer.*.trackCount)
+    var index: usize = 0
+    while index < name.length && index < 32 {
+        track.*.name[index] = name[index]
+        index += 1
+    }
+    track.*.nameLength = index
+    writer.*.trackCount += 1
+    return writer.*.trackCount
+}
+
+// A video track (Motion JPEG): its number (0: no room).
+pub fn addVideo(writer: *Writer, width: u32, height: u32, name: []const u8) -> usize {
+    const number = addTrack(writer, name)
+    if number == 0 { return 0 }
+    const track = trackAt(writer, number - 1)
+    track.*.video = true
+    track.*.width = width
+    track.*.height = height
+    track.*.isDefault = true
+    return number
+}
+
+// A sound track (16-bit little-endian PCM, interleaved): its number.
+// `default`: the one players take first.
+pub fn addAudio(writer: *Writer, rate: u32, channels: u32, name: []const u8, default: bool) -> usize {
+    const number = addTrack(writer, name)
+    if number == 0 { return 0 }
+    const track = trackAt(writer, number - 1)
+    track.*.video = false
+    track.*.rate = rate
+    track.*.channels = channels
+    track.*.isDefault = default
+    return number
+}
+
+// The header, Info and Tracks (after the tracks were added).
+pub fn begin(writer: *Writer) -> bool {
+    // EBML: version 1, IDs up to 4 bytes, sizes up to 8, "matroska" v4.
+    putId(writer, 440786851)
+    const header_size = putLaterSize(writer)
+    const header_start = position(writer)
+    putUnsigned(writer, 17030, 1)
+    putUnsigned(writer, 17143, 1)
+    putUnsigned(writer, 17138, 4)
+    putUnsigned(writer, 17139, 8)
+    putText(writer, 17026, "matroska")
+    putUnsigned(writer, 17031, 4)
+    putUnsigned(writer, 17029, 2)
+    const header_end = position(writer)
+    // Segment.
+    putId(writer, 408125543)
+    writer.*.segmentSize = putLaterSize(writer)
+    writer.*.segmentData = position(writer)
+    // Room for the SeekHead: a Void for now.
+    writer.*.seekRoom = position(writer)
+    putId(writer, 236)
+    putSize(writer, @intCast(u64, SEEK_ROOM - 2))
+    var index: usize = 0
+    while index < SEEK_ROOM - 2 {
+        putByte(writer, 0)
+        index += 1
+    }
+    // Info: milliseconds, the apps, the duration (filled in at the end).
+    writer.*.info = position(writer)
+    putId(writer, 357149030)
+    const info_size = putLaterSize(writer)
+    const info_start = position(writer)
+    putUnsigned(writer, 2807729, 1000000)
+    putText(writer, 19840, "mlx-capture")
+    putText(writer, 22337, "mlx-capture")
+    writer.*.duration = position(writer) + 3
+    putFloat(writer, 17545, 0.0)
+    const info_end = position(writer)
+    // Tracks.
+    writer.*.trackList = position(writer)
+    putId(writer, 374648427)
+    const tracks_size = putLaterSize(writer)
+    const tracks_start = position(writer)
+    index = 0
+    while index < writer.*.trackCount {
+        const track = trackAt(writer, index)
+        putId(writer, 174)
+        const entry_size = putLaterSize(writer)
+        const entry_start = position(writer)
+        putUnsigned(writer, 215, @intCast(u64, index + 1))
+        putUnsigned(writer, 29637, @intCast(u64, index + 1))
+        putUnsigned(writer, 131, if track.*.video { 1 } else { 2 })
+        putUnsigned(writer, 156, 0)
+        putUnsigned(writer, 136, if track.*.isDefault { 1 } else { 0 })
+        var name: [*]const u8 = undefined
+        unsafe { name = @ptrCast([*]const u8, &track.*.name) }
+        putText(writer, 21358, name[0..track.*.nameLength])
+        if track.*.video {
+            putText(writer, 134, "V_MJPEG")
+            putId(writer, 224)
+            const video_size = putLaterSize(writer)
+            const video_start = position(writer)
+            putUnsigned(writer, 176, @intCast(u64, track.*.width))
+            putUnsigned(writer, 186, @intCast(u64, track.*.height))
+            patchLater(writer, video_size, position(writer) - video_start)
+        } else {
+            putText(writer, 134, "A_PCM/INT/LIT")
+            putId(writer, 225)
+            const audio_size = putLaterSize(writer)
+            const audio_start = position(writer)
+            putFloat(writer, 181, @floatFromInt(f32, track.*.rate))
+            putUnsigned(writer, 159, @intCast(u64, track.*.channels))
+            putUnsigned(writer, 25188, 16)
+            patchLater(writer, audio_size, position(writer) - audio_start)
+        }
+        patchLater(writer, entry_size, position(writer) - entry_start)
+        index += 1
+    }
+    patchLater(writer, tracks_size, position(writer) - tracks_start)
+    patchLater(writer, info_size, info_end - info_start)
+    patchLater(writer, header_size, header_end - header_start)
+    return !writer.*.failed
+}
+
+// A size field that is still in the buffer filled in there (else in the
+// file).
+fn patchLater(writer: *Writer, at: usize, size: usize) -> void {
+    if at >= writer.*.written {
+        const offset = at - writer.*.written
+        writer.*.buffer[offset] = 1
+        var index: usize = 1
+        while index < 8 {
+            writer.*.buffer[offset + index] = @intCast(u8, (@intCast(u64, size) >> @intCast(u64, 8 * (7 - index))) & 255)
+            index += 1
+        }
+        return
+    }
+    patchSize(writer, at, @intCast(u64, size))
+}
+
+fn closeCluster(writer: *Writer) -> void {
+    if !writer.*.inCluster { return }
+    patchLater(writer, writer.*.clusterSize, position(writer) - writer.*.clusterSize - 8)
+    writer.*.inCluster = false
+}
+
+// A block of `track` at `time` milliseconds (from the recording's start):
+// a frame's JPEG or interleaved samples. Blocks come in time order, each
+// track's at least.
+pub fn block(writer: *Writer, track: usize, time: u64, data: [*]const u8, length: usize) -> bool {
+    if track == 0 || track > writer.*.trackCount { return false }
+    if writer.*.inCluster && (time >= writer.*.clusterTime + CLUSTER_SPAN || time + 30000 < writer.*.clusterTime) { closeCluster(writer) }
+    if !writer.*.inCluster {
+        writer.*.clusterStart = position(writer)
+        putId(writer, 524531317)
+        writer.*.clusterSize = putLaterSize(writer)
+        putUnsigned(writer, 231, time)
+        writer.*.clusterTime = time
+        writer.*.inCluster = true
+        if writer.*.cueCount < MAX_CUES {
+            writer.*.cueTimes[writer.*.cueCount] = time
+            writer.*.cuePlaces[writer.*.cueCount] = @intCast(u64, writer.*.clusterStart - writer.*.segmentData)
+            writer.*.cueCount += 1
+        }
+    }
+    // SimpleBlock: the track (a 1-byte number), the time from the
+    // cluster's (signed 16 bits), keyframe, the data.
+    putId(writer, 163)
+    putSize(writer, @intCast(u64, length + 4))
+    putByte(writer, @intCast(u64, 128 | track))
+    const relative = @bitCast(u64, @intCast(i64, time) - @intCast(i64, writer.*.clusterTime)) & 65535
+    putByte(writer, relative >> 8)
+    putByte(writer, relative & 255)
+    putByte(writer, 128)
+    put(writer, data, length)
+    return !writer.*.failed
+}
+
+// The last cluster closed, the Cues, the SeekHead, the duration and the
+// Segment's size written; the file closed. False when writing failed.
+pub fn finish(writer: *Writer, duration: u64) -> bool {
+    closeCluster(writer)
+    // Cues: each cluster, for the first track (the video, when there is
+    // one).
+    const cues = position(writer)
+    putId(writer, 475249515)
+    const cues_size = putLaterSize(writer)
+    const cues_start = position(writer)
+    var index: usize = 0
+    while index < writer.*.cueCount {
+        putId(writer, 187)
+        const point_size = putLaterSize(writer)
+        const point_start = position(writer)
+        putUnsigned(writer, 179, writer.*.cueTimes[index])
+        putId(writer, 183)
+        const positions_size = putLaterSize(writer)
+        const positions_start = position(writer)
+        putUnsigned(writer, 247, 1)
+        putUnsigned(writer, 241, writer.*.cuePlaces[index])
+        patchLater(writer, positions_size, position(writer) - positions_start)
+        patchLater(writer, point_size, position(writer) - point_start)
+        index += 1
+    }
+    patchLater(writer, cues_size, position(writer) - cues_start)
+    const end = position(writer)
+    flush(writer)
+    // The SeekHead in its room (Info, Tracks, Cues), a Void after it.
+    var room: [96]u8 = undefined
+    var bytes: [*]u8 = undefined
+    unsafe { bytes = @ptrCast([*]u8, &room) }
+    var length: usize = 0
+    length = seekEntry(bytes, length, 357149030, @intCast(u64, writer.*.info - writer.*.segmentData))
+    length = seekEntry(bytes, length, 374648427, @intCast(u64, writer.*.trackList - writer.*.segmentData))
+    length = seekEntry(bytes, length, 475249515, @intCast(u64, cues - writer.*.segmentData))
+    var head: [96]u8 = undefined
+    var head_bytes: [*]u8 = undefined
+    unsafe { head_bytes = @ptrCast([*]u8, &head) }
+    // SeekHead ID (4 bytes), a 1-byte size, the entries; then a Void with
+    // a 1-byte size for the rest.
+    head[0] = 17
+    head[1] = 77
+    head[2] = 155
+    head[3] = 116
+    head[4] = @intCast(u8, 128 | length)
+    index = 0
+    while index < length {
+        head[5 + index] = room[index]
+        index += 1
+    }
+    const used = 5 + length
+    head[used] = 236
+    head[used + 1] = @intCast(u8, 128 | (SEEK_ROOM - used - 2))
+    index = used + 2
+    while index < SEEK_ROOM {
+        head[index] = 0
+        index += 1
+    }
+    patch(writer, writer.*.seekRoom, head_bytes, SEEK_ROOM)
+    // The duration (milliseconds, a float).
+    const ticks = @floatFromInt(f32, @intCast(u32, duration))
+    const bits = @bitCast(u32, ticks)
+    var float_bytes: [4]u8 = undefined
+    float_bytes[0] = @intCast(u8, bits >> 24)
+    float_bytes[1] = @intCast(u8, (bits >> 16) & 255)
+    float_bytes[2] = @intCast(u8, (bits >> 8) & 255)
+    float_bytes[3] = @intCast(u8, bits & 255)
+    var float_pointer: [*]const u8 = undefined
+    unsafe { float_pointer = @ptrCast([*]const u8, &float_bytes) }
+    patch(writer, writer.*.duration, float_pointer, 4)
+    patchSize(writer, writer.*.segmentSize, @intCast(u64, end - writer.*.segmentData))
+    const closed = fs.close(writer.*.file)
+    writer.*.allocator.free(writer.*.buffer, BUFFER, 16)
+    var times: [*]u8 = undefined
+    var places: [*]u8 = undefined
+    unsafe {
+        times = @ptrCast([*]u8, writer.*.cueTimes)
+        places = @ptrCast([*]u8, writer.*.cuePlaces)
+    }
+    writer.*.allocator.free(times, MAX_CUES * 8, 16)
+    writer.*.allocator.free(places, MAX_CUES * 8, 16)
+    return !writer.*.failed
+}
+
+// A Seek entry (the element's ID, 4 bytes, and its place) into `bytes`
+// from `at`; the length after it.
+fn seekEntry(bytes: [*]u8, at: usize, id: u32, place: u64) -> usize {
+    const count = bytesOf(place)
+    var length = at
+    // Seek, its size: SeekID (2 + 1 + 4) and SeekPosition (2 + 1 + count).
+    bytes[length] = 77
+    bytes[length + 1] = 187
+    bytes[length + 2] = @intCast(u8, 128 | (7 + 3 + count))
+    length += 3
+    bytes[length] = 83
+    bytes[length + 1] = 171
+    bytes[length + 2] = 132
+    bytes[length + 3] = @intCast(u8, id >> 24)
+    bytes[length + 4] = @intCast(u8, (id >> 16) & 255)
+    bytes[length + 5] = @intCast(u8, (id >> 8) & 255)
+    bytes[length + 6] = @intCast(u8, id & 255)
+    length += 7
+    bytes[length] = 83
+    bytes[length + 1] = 172
+    bytes[length + 2] = @intCast(u8, 128 | count)
+    length += 3
+    var index: usize = 0
+    while index < count {
+        bytes[length + index] = @intCast(u8, (place >> @intCast(u64, 8 * (count - 1 - index))) & 255)
+        index += 1
+    }
+    return length + count
+}

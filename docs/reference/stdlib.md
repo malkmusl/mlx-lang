@@ -197,10 +197,22 @@ MLXIPC channel to it (starting it when needed), `openStream` opens a
 playing or recording stream (any rate, 1 to 8 channels, S16, S32 or
 F32; `refusal` says when the app's MLXIPC permissions refused it),
 `write` plays as fast as the server asks, `read` returns what was
-recorded, `drain`, `setVolume`, `list` and `closeStream`. `std.wav`
+recorded, `drain`, `setVolume`, `list` and `closeStream`;
+`openStreamOn` names the sink to play to or the source to record from
+(`input`, `monitor`, `monitor:SINK`), `status` and `set` read and change
+the server's state (devices, volumes, sinks, each app's route). `std.wav`
 (`std/src/wav.mlx`) reads WAVE headers (8 to 32-bit PCM, 32-bit float,
 extensible files) and writes them. `projects/desktop/audio` (mlx-audiod,
 mlx-audio) uses both; `tools/check_audio.sh` checks them end to end.
+
+`std.jpeg` (`std/src/jpeg.mlx`) encodes premultiplied ARGB words as
+baseline JPEG (4:2:0, standard tables scaled by a quality of 1 to 100,
+each row of blocks a restart interval); `startVideo` and `encodeFrame`
+code again only the rows a frame changed. `std.matroska`
+(`std/src/matroska.mlx`) writes Matroska files: Motion JPEG and 16-bit
+PCM tracks, blocks with their own times, clusters, Cues and a SeekHead
+for seeking. mlx-capture's recordings use both
+(`tools/check_capture_record.sh`).
 
 `std.png` (`std/src/png.mlx`) decodes PNG images into premultiplied ARGB
 words (`0xAARRGGBB`, the `wl_shm` and compositor convention), for icons

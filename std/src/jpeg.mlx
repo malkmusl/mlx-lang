@@ -1,0 +1,637 @@
+// std.jpeg: encodes premultiplied ARGB words (the wl_shm and screen
+// capture convention) as baseline JPEG: YCbCr with the colour halved both
+// ways (4:2:0), the standard quantization tables scaled by a quality of 1
+// to 100 (as libjpeg scales them), a floating-point AAN forward DCT and
+// the standard Huffman tables. Premultiplied pixels come out as if laid
+// over black. mlx-capture's videos are a JPEG per frame (Motion JPEG).
+//
+//     var encoder: jpeg.Encoder = undefined
+//     jpeg.init(&encoder, 85)
+//     const length = jpeg.encode(&encoder, pixels, width, height, stride, out, capacity)
+//     (0: `capacity` was too small; width * height * 3 + 2048 always does)
+//
+// Each row of 16-pixel blocks is a restart interval (DRI, RST markers),
+// so its bytes stand on their own. For a video, startVideo keeps every
+// row's bytes and encodeFrame codes again only the rows a frame changed
+// (the damage the compositor reports): a desktop that mostly stands still
+// costs little. A block of one colour skips the DCT.
+
+const allocator_module = @import("../bootstrap/allocator.mlx")
+
+pub const Allocator = allocator_module.Allocator
+
+pub const Encoder = struct {
+    quality: u32
+    // The quantization tables in zigzag order (as DQT writes them).
+    lumTable: [64]u8
+    chromTable: [64]u8
+    // What a DCT coefficient (natural order) is multiplied by to quantize
+    // it: 1 / (its quantizer and the AAN scale).
+    lumDivisor: [64]f32
+    chromDivisor: [64]f32
+    // Natural order index of the k-th coefficient in zigzag order.
+    zigzag: [64]u8
+    // The Huffman tables as DHT writes them: four times 16 counts by code
+    // length; the symbols (DC luminance 12, DC chrominance 12, AC
+    // luminance 162, AC chrominance 162).
+    bits: [64]u8
+    values: [348]u8
+    // Code and length by symbol.
+    dcLumCode: [16]u32
+    dcLumSize: [16]u32
+    dcChromCode: [16]u32
+    dcChromSize: [16]u32
+    acLumCode: [256]u32
+    acLumSize: [256]u32
+    acChromCode: [256]u32
+    acChromSize: [256]u32
+    // A video's rows (startVideo): each row's bytes, `rowCapacity` apart,
+    // and their lengths (0: not coded yet).
+    rows: usize
+    rowCapacity: usize
+    rowBytes: [*]u8
+    rowLengths: [*]usize
+    videoWidth: usize
+    videoHeight: usize
+    // The output while encoding.
+    out: [*]u8
+    capacity: usize
+    length: usize
+    overflow: bool
+    bitBuffer: u32
+    bitCount: u32
+}
+
+// A table field of the encoder's, by its offset.
+fn wordsAt(encoder: *Encoder, offset: usize) -> [*]u32 {
+    unsafe { return @ptrFromInt([*]u32, @intFromPtr(encoder) + offset) }
+}
+
+fn floatsAt(encoder: *Encoder, offset: usize) -> [*]f32 {
+    unsafe { return @ptrFromInt([*]f32, @intFromPtr(encoder) + offset) }
+}
+
+fn bytesOf(table: *[64]u8) -> [*]u8 {
+    unsafe { return @ptrCast([*]u8, table) }
+}
+
+// The standard tables (ITU T.81 Annex K) and the zigzag order.
+fn standardTables(encoder: *Encoder, luminance: [*]u8, chrominance: [*]u8) -> void {
+    var lum: [64]u8 = [64]u8{ 16, 11, 10, 16, 24, 40, 51, 61, 12, 12, 14, 19, 26, 58, 60, 55, 14, 13, 16, 24, 40, 57, 69, 56, 14, 17, 22, 29, 51, 87, 80, 62, 18, 22, 37, 56, 68, 109, 103, 77, 24, 35, 55, 64, 81, 104, 113, 92, 49, 64, 78, 87, 103, 121, 120, 101, 72, 92, 95, 98, 112, 100, 103, 99 }
+    var chrom: [64]u8 = [64]u8{ 17, 18, 24, 47, 99, 99, 99, 99, 18, 21, 26, 66, 99, 99, 99, 99, 24, 26, 56, 99, 99, 99, 99, 99, 47, 66, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99 }
+    var zigzag: [64]u8 = [64]u8{ 0, 1, 8, 16, 9, 2, 3, 10, 17, 24, 32, 25, 18, 11, 4, 5, 12, 19, 26, 33, 40, 48, 41, 34, 27, 20, 13, 6, 7, 14, 21, 28, 35, 42, 49, 56, 57, 50, 43, 36, 29, 22, 15, 23, 30, 37, 44, 51, 58, 59, 52, 45, 38, 31, 39, 46, 53, 60, 61, 54, 47, 55, 62, 63 }
+    var bits: [64]u8 = [64]u8{ 0, 1, 5, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 3, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 2, 1, 3, 3, 2, 4, 3, 5, 5, 4, 4, 0, 0, 1, 125, 0, 2, 1, 2, 4, 4, 3, 4, 7, 5, 4, 4, 0, 1, 2, 119 }
+    var values: [348]u8 = [348]u8{
+        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11,
+        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11,
+        1, 2, 3, 0, 4, 17, 5, 18, 33, 49, 65, 6, 19, 81, 97, 7, 34, 113, 20, 50, 129, 145, 161, 8, 35, 66, 177, 193, 21, 82, 209, 240, 36, 51, 98, 114, 130, 9, 10, 22, 23, 24, 25, 26, 37, 38, 39, 40, 41, 42, 52, 53, 54, 55, 56, 57, 58, 67, 68, 69, 70, 71, 72, 73, 74, 83, 84, 85, 86, 87, 88, 89, 90, 99, 100, 101, 102, 103, 104, 105, 106, 115, 116, 117, 118, 119, 120, 121, 122, 131, 132, 133, 134, 135, 136, 137, 138, 146, 147, 148, 149, 150, 151, 152, 153, 154, 162, 163, 164, 165, 166, 167, 168, 169, 170, 178, 179, 180, 181, 182, 183, 184, 185, 186, 194, 195, 196, 197, 198, 199, 200, 201, 202, 210, 211, 212, 213, 214, 215, 216, 217, 218, 225, 226, 227, 228, 229, 230, 231, 232, 233, 234, 241, 242, 243, 244, 245, 246, 247, 248, 249, 250,
+        0, 1, 2, 3, 17, 4, 5, 33, 49, 6, 18, 65, 81, 7, 97, 113, 19, 34, 50, 129, 8, 20, 66, 145, 161, 177, 193, 9, 35, 51, 82, 240, 21, 98, 114, 209, 10, 22, 36, 52, 225, 37, 241, 23, 24, 25, 26, 38, 39, 40, 41, 42, 53, 54, 55, 56, 57, 58, 67, 68, 69, 70, 71, 72, 73, 74, 83, 84, 85, 86, 87, 88, 89, 90, 99, 100, 101, 102, 103, 104, 105, 106, 115, 116, 117, 118, 119, 120, 121, 122, 130, 131, 132, 133, 134, 135, 136, 137, 138, 146, 147, 148, 149, 150, 151, 152, 153, 154, 162, 163, 164, 165, 166, 167, 168, 169, 170, 178, 179, 180, 181, 182, 183, 184, 185, 186, 194, 195, 196, 197, 198, 199, 200, 201, 202, 210, 211, 212, 213, 214, 215, 216, 217, 218, 226, 227, 228, 229, 230, 231, 232, 233, 234, 242, 243, 244, 245, 246, 247, 248, 249, 250
+    }
+    var index: usize = 0
+    while index < 64 {
+        luminance[index] = lum[index]
+        chrominance[index] = chrom[index]
+        encoder.*.zigzag[index] = zigzag[index]
+        encoder.*.bits[index] = bits[index]
+        index += 1
+    }
+    index = 0
+    while index < 348 {
+        encoder.*.values[index] = values[index]
+        index += 1
+    }
+}
+
+// Codes by symbol for the table whose counts start at bits[table * 16]
+// and symbols at values[offset].
+fn buildCodes(encoder: *Encoder, table: usize, offset: usize, codes: [*]u32, sizes: [*]u32) -> void {
+    var code: u32 = 0
+    var at = offset
+    var length: usize = 1
+    while length <= 16 {
+        var count: usize = 0
+        while count < @intCast(usize, encoder.*.bits[table * 16 + length - 1]) {
+            const symbol = @intCast(usize, encoder.*.values[at])
+            codes[symbol] = code
+            sizes[symbol] = @intCast(u32, length)
+            code += 1
+            at += 1
+            count += 1
+        }
+        code = code << 1
+        length += 1
+    }
+}
+
+// Sets the encoder up for `quality` (1 to 100; 85 is a good default).
+pub fn init(encoder: *Encoder, quality: u32) -> void {
+    var given = quality
+    if given < 1 { given = 1 }
+    if given > 100 { given = 100 }
+    encoder.*.quality = given
+    var luminance: [64]u8 = undefined
+    var chrominance: [64]u8 = undefined
+    standardTables(encoder, bytesOf(&luminance), bytesOf(&chrominance))
+    // libjpeg's scaling of the tables by quality.
+    const scale = if given < 50 { 5000 / given } else { 200 - given * 2 }
+    var aan: [8]f32 = [8]f32{ 1.0, 1.387039845, 1.306562965, 1.175875602, 1.0, 0.785694958, 0.5411961, 0.275899379 }
+    var index: usize = 0
+    while index < 64 {
+        var lum = (@intCast(u32, luminance[index]) * scale + 50) / 100
+        var chrom = (@intCast(u32, chrominance[index]) * scale + 50) / 100
+        if lum < 1 { lum = 1 }
+        if lum > 255 { lum = 255 }
+        if chrom < 1 { chrom = 1 }
+        if chrom > 255 { chrom = 255 }
+        const factor: f32 = aan[index / 8] * aan[index % 8] * 8.0
+        encoder.*.lumDivisor[index] = 1.0 / (@floatFromInt(f32, lum) * factor)
+        encoder.*.chromDivisor[index] = 1.0 / (@floatFromInt(f32, chrom) * factor)
+        luminance[index] = @intCast(u8, lum)
+        chrominance[index] = @intCast(u8, chrom)
+        index += 1
+    }
+    index = 0
+    while index < 64 {
+        const natural = @intCast(usize, encoder.*.zigzag[index])
+        encoder.*.lumTable[index] = luminance[natural]
+        encoder.*.chromTable[index] = chrominance[natural]
+        index += 1
+    }
+    buildCodes(encoder, 0, 0, wordsAt(encoder, @offsetOf(Encoder, "dcLumCode")), wordsAt(encoder, @offsetOf(Encoder, "dcLumSize")))
+    buildCodes(encoder, 1, 12, wordsAt(encoder, @offsetOf(Encoder, "dcChromCode")), wordsAt(encoder, @offsetOf(Encoder, "dcChromSize")))
+    buildCodes(encoder, 2, 24, wordsAt(encoder, @offsetOf(Encoder, "acLumCode")), wordsAt(encoder, @offsetOf(Encoder, "acLumSize")))
+    buildCodes(encoder, 3, 186, wordsAt(encoder, @offsetOf(Encoder, "acChromCode")), wordsAt(encoder, @offsetOf(Encoder, "acChromSize")))
+}
+
+// ---------------------------------------------------------------------------
+// Output
+
+fn byte(encoder: *Encoder, value: u32) -> void {
+    if encoder.*.length >= encoder.*.capacity {
+        encoder.*.overflow = true
+        return
+    }
+    encoder.*.out[encoder.*.length] = @intCast(u8, value & 255)
+    encoder.*.length += 1
+}
+
+fn word(encoder: *Encoder, value: u32) -> void {
+    byte(encoder, value >> 8)
+    byte(encoder, value)
+}
+
+// `size` bits of `code`, most significant first (a 0xFF in the data is
+// followed by a 0).
+fn putBits(encoder: *Encoder, code: u32, size: u32) -> void {
+    encoder.*.bitBuffer = (encoder.*.bitBuffer << size) | (code & ((@intCast(u32, 1) << size) - 1))
+    encoder.*.bitCount += size
+    while encoder.*.bitCount >= 8 {
+        const value = (encoder.*.bitBuffer >> (encoder.*.bitCount - 8)) & 255
+        byte(encoder, value)
+        if value == 255 { byte(encoder, 0) }
+        encoder.*.bitCount -= 8
+    }
+}
+
+// The rest of a byte filled with ones.
+fn flushBits(encoder: *Encoder) -> void {
+    if encoder.*.bitCount > 0 { putBits(encoder, 127, 8 - encoder.*.bitCount) }
+    encoder.*.bitBuffer = 0
+    encoder.*.bitCount = 0
+}
+
+fn headers(encoder: *Encoder, width: usize, height: usize) -> void {
+    const interval = (width + 15) / 16
+    // SOI, APP0 (JFIF 1.1, no thumbnail).
+    word(encoder, 65496)
+    word(encoder, 65504)
+    word(encoder, 16)
+    byte(encoder, 74)
+    byte(encoder, 70)
+    byte(encoder, 73)
+    byte(encoder, 70)
+    byte(encoder, 0)
+    word(encoder, 257)
+    byte(encoder, 0)
+    word(encoder, 1)
+    word(encoder, 1)
+    word(encoder, 0)
+    // DQT: the two tables, 8-bit.
+    word(encoder, 65499)
+    word(encoder, 132)
+    byte(encoder, 0)
+    var index: usize = 0
+    while index < 64 {
+        byte(encoder, @intCast(u32, encoder.*.lumTable[index]))
+        index += 1
+    }
+    byte(encoder, 1)
+    index = 0
+    while index < 64 {
+        byte(encoder, @intCast(u32, encoder.*.chromTable[index]))
+        index += 1
+    }
+    // SOF0: 8 bits, the size, Y at 2x2 with table 0, Cb and Cr at 1x1 with
+    // table 1.
+    word(encoder, 65472)
+    word(encoder, 17)
+    byte(encoder, 8)
+    word(encoder, @intCast(u32, height))
+    word(encoder, @intCast(u32, width))
+    byte(encoder, 3)
+    byte(encoder, 1)
+    byte(encoder, 34)
+    byte(encoder, 0)
+    byte(encoder, 2)
+    byte(encoder, 17)
+    byte(encoder, 1)
+    byte(encoder, 3)
+    byte(encoder, 17)
+    byte(encoder, 1)
+    // DHT: the four tables in one segment.
+    word(encoder, 65476)
+    word(encoder, 2 + 4 * 17 + 348)
+    var table: usize = 0
+    var at: usize = 0
+    while table < 4 {
+        // Class (DC 0, AC 1) and number (luminance 0, chrominance 1).
+        byte(encoder, @intCast(u32, (table / 2) * 16 + table % 2))
+        var count: usize = 0
+        var symbols: usize = 0
+        while count < 16 {
+            byte(encoder, @intCast(u32, encoder.*.bits[table * 16 + count]))
+            symbols += @intCast(usize, encoder.*.bits[table * 16 + count])
+            count += 1
+        }
+        count = 0
+        while count < symbols {
+            byte(encoder, @intCast(u32, encoder.*.values[at + count]))
+            count += 1
+        }
+        at += symbols
+        table += 1
+    }
+    // DRI: a restart after each row of blocks.
+    word(encoder, 65501)
+    word(encoder, 4)
+    word(encoder, @intCast(u32, interval))
+    // SOS: the three components, their tables, the whole spectrum.
+    word(encoder, 65498)
+    word(encoder, 12)
+    byte(encoder, 3)
+    byte(encoder, 1)
+    byte(encoder, 0)
+    byte(encoder, 2)
+    byte(encoder, 17)
+    byte(encoder, 3)
+    byte(encoder, 17)
+    byte(encoder, 0)
+    byte(encoder, 63)
+    byte(encoder, 0)
+}
+
+// ---------------------------------------------------------------------------
+// Blocks
+
+// The forward DCT of an 8x8 block in place (Arai, Agui and Nakajima; the
+// output scaled by the divisors' AAN factors), rows then columns.
+fn transform(data: [*]f32) -> void {
+    var pass: usize = 0
+    while pass < 2 {
+        const step: usize = if pass == 0 { 1 } else { 8 }
+        const next: usize = if pass == 0 { 8 } else { 1 }
+        var line: usize = 0
+        while line < 8 {
+            const base = line * next
+            const d0 = data[base]
+            const d1 = data[base + step]
+            const d2 = data[base + step * 2]
+            const d3 = data[base + step * 3]
+            const d4 = data[base + step * 4]
+            const d5 = data[base + step * 5]
+            const d6 = data[base + step * 6]
+            const d7 = data[base + step * 7]
+            const tmp0 = d0 + d7
+            const tmp7 = d0 - d7
+            const tmp1 = d1 + d6
+            const tmp6 = d1 - d6
+            const tmp2 = d2 + d5
+            const tmp5 = d2 - d5
+            const tmp3 = d3 + d4
+            const tmp4 = d3 - d4
+            const even0 = tmp0 + tmp3
+            const even3 = tmp0 - tmp3
+            const even1 = tmp1 + tmp2
+            const even2 = tmp1 - tmp2
+            data[base] = even0 + even1
+            data[base + step * 4] = even0 - even1
+            const z1 = (even2 + even3) * 0.707106781
+            data[base + step * 2] = even3 + z1
+            data[base + step * 6] = even3 - z1
+            const odd0 = tmp4 + tmp5
+            const odd1 = tmp5 + tmp6
+            const odd2 = tmp6 + tmp7
+            const z5 = (odd0 - odd2) * 0.382683433
+            const z2 = odd0 * 0.5411961 + z5
+            const z4 = odd2 * 1.306562965 + z5
+            const z3 = odd1 * 0.707106781
+            const z11 = tmp7 + z3
+            const z13 = tmp7 - z3
+            data[base + step * 5] = z13 + z2
+            data[base + step * 3] = z13 - z2
+            data[base + step] = z11 + z4
+            data[base + step * 7] = z11 - z4
+            line += 1
+        }
+        pass += 1
+    }
+}
+
+// The bits a value takes (its JPEG category).
+fn category(value: i32) -> u32 {
+    var magnitude = if value < 0 { 0 - value } else { value }
+    var count: u32 = 0
+    while magnitude > 0 {
+        count += 1
+        magnitude = magnitude >> 1
+    }
+    return count
+}
+
+// A value's bits after its category (negative ones less one, as JPEG
+// writes them).
+fn putValue(encoder: *Encoder, value: i32, size: u32) -> void {
+    if size == 0 { return }
+    const bits = if value < 0 { @bitCast(u32, value - 1) } else { @bitCast(u32, value) }
+    putBits(encoder, bits, size)
+}
+
+// A block (level-shifted samples) transformed, quantized and written;
+// `previous` is the component's last DC.
+fn block(encoder: *Encoder, data: [*]f32, divisor: [*]f32, previous: *i32, chroma: bool) -> void {
+    // One colour: only the DC (the DCT's first term is 64 times it).
+    const first = data[0]
+    var flat = true
+    var at: usize = 1
+    while at < 64 {
+        if data[at] != first {
+            flat = false
+            break
+        }
+        at += 1
+    }
+    if flat {
+        const scaled = first * 64.0 * divisor[0]
+        const shifted: f32 = if scaled < 0.0 { scaled - 0.5 } else { scaled + 0.5 }
+        const value: i32 = @intFromFloat(i32, shifted)
+        const flat_difference = value - previous.*
+        previous.* = value
+        const flat_size = category(flat_difference)
+        const flat_slot = @intCast(usize, flat_size)
+        if chroma {
+            putBits(encoder, encoder.*.dcChromCode[flat_slot], encoder.*.dcChromSize[flat_slot])
+            putValue(encoder, flat_difference, flat_size)
+            putBits(encoder, encoder.*.acChromCode[0], encoder.*.acChromSize[0])
+        } else {
+            putBits(encoder, encoder.*.dcLumCode[flat_slot], encoder.*.dcLumSize[flat_slot])
+            putValue(encoder, flat_difference, flat_size)
+            putBits(encoder, encoder.*.acLumCode[0], encoder.*.acLumSize[0])
+        }
+        return
+    }
+    transform(data)
+    var coefficients: [64]i32 = undefined
+    var index: usize = 0
+    while index < 64 {
+        const natural = @intCast(usize, encoder.*.zigzag[index])
+        // Rounded to the nearest (half away from zero).
+        const scaled = data[natural] * divisor[natural]
+        const shifted: f32 = if scaled < 0.0 { scaled - 0.5 } else { scaled + 0.5 }
+        const whole: i32 = @intFromFloat(i32, shifted)
+        coefficients[index] = whole
+        index += 1
+    }
+    const difference = coefficients[0] - previous.*
+    previous.* = coefficients[0]
+    const size = category(difference)
+    const slot = @intCast(usize, size)
+    if chroma {
+        putBits(encoder, encoder.*.dcChromCode[slot], encoder.*.dcChromSize[slot])
+    } else {
+        putBits(encoder, encoder.*.dcLumCode[slot], encoder.*.dcLumSize[slot])
+    }
+    putValue(encoder, difference, size)
+    var run: u32 = 0
+    index = 1
+    while index < 64 {
+        const value = coefficients[index]
+        if value == 0 {
+            run += 1
+        } else {
+            while run > 15 {
+                if chroma { putBits(encoder, encoder.*.acChromCode[240], encoder.*.acChromSize[240]) } else { putBits(encoder, encoder.*.acLumCode[240], encoder.*.acLumSize[240]) }
+                run -= 16
+            }
+            const bits = category(value)
+            const symbol = @intCast(usize, run * 16 + bits)
+            if chroma { putBits(encoder, encoder.*.acChromCode[symbol], encoder.*.acChromSize[symbol]) } else { putBits(encoder, encoder.*.acLumCode[symbol], encoder.*.acLumSize[symbol]) }
+            putValue(encoder, value, bits)
+            run = 0
+        }
+        index += 1
+    }
+    if run > 0 {
+        if chroma { putBits(encoder, encoder.*.acChromCode[0], encoder.*.acChromSize[0]) } else { putBits(encoder, encoder.*.acLumCode[0], encoder.*.acLumSize[0]) }
+    }
+}
+
+// Row `row` of 16-pixel blocks, appended to the output: its blocks, the
+// bits padded to a byte, and (but after the last row) its RST marker.
+fn encodeRow(encoder: *Encoder, pixels: [*]const u32, width: usize, height: usize, stride: usize, row: usize) -> void {
+    var luma: [256]f32 = undefined
+    var blue: [64]f32 = undefined
+    var red: [64]f32 = undefined
+    var data: [64]f32 = undefined
+    var luma_values: [*]f32 = undefined
+    var blue_values: [*]f32 = undefined
+    var red_values: [*]f32 = undefined
+    var block_values: [*]f32 = undefined
+    unsafe {
+        luma_values = @ptrCast([*]f32, &luma)
+        blue_values = @ptrCast([*]f32, &blue)
+        red_values = @ptrCast([*]f32, &red)
+        block_values = @ptrCast([*]f32, &data)
+    }
+    const lum_divisor = floatsAt(encoder, @offsetOf(Encoder, "lumDivisor"))
+    const chrom_divisor = floatsAt(encoder, @offsetOf(Encoder, "chromDivisor"))
+    var red_sums: [64]i32 = undefined
+    var green_sums: [64]i32 = undefined
+    var blue_sums: [64]i32 = undefined
+    // A restart: the DC predictions start again.
+    var previous_y: i32 = 0
+    var previous_blue: i32 = 0
+    var previous_red: i32 = 0
+    const top = row * 16
+    var left: usize = 0
+    while left < width && !encoder.*.overflow {
+        // The MCU's 16x16 pixels (the edges repeated past the image):
+        // luminance per pixel, colour summed per 2x2.
+        var sum: usize = 0
+        while sum < 64 {
+            red_sums[sum] = 0
+            green_sums[sum] = 0
+            blue_sums[sum] = 0
+            sum += 1
+        }
+        const inside = left + 16 <= width
+        var dy: usize = 0
+        while dy < 16 {
+            var y = top + dy
+            if y >= height { y = height - 1 }
+            const row_start = y * stride
+            const chroma_row = (dy / 2) * 8
+            var dx: usize = 0
+            while dx < 16 {
+                var x = left + dx
+                if !inside && x >= width { x = width - 1 }
+                const pixel = pixels[row_start + x]
+                const r = @intCast(i32, (pixel >> 16) & 255)
+                const g = @intCast(i32, (pixel >> 8) & 255)
+                const b = @intCast(i32, pixel & 255)
+                const chroma_at = chroma_row + dx / 2
+                red_sums[chroma_at] += r
+                green_sums[chroma_at] += g
+                blue_sums[chroma_at] += b
+                luma_values[dy * 16 + dx] = @floatFromInt(f32, ((19595 * r + 38470 * g + 7471 * b + 32768) >> 16) - 128)
+                dx += 1
+            }
+            dy += 1
+        }
+        sum = 0
+        while sum < 64 {
+            const cb = (0 - 11059 * red_sums[sum] - 21709 * green_sums[sum] + 32768 * blue_sums[sum] + 131072) >> 18
+            const cr = (32768 * red_sums[sum] - 27439 * green_sums[sum] - 5329 * blue_sums[sum] + 131072) >> 18
+            blue_values[sum] = @floatFromInt(f32, cb)
+            red_values[sum] = @floatFromInt(f32, cr)
+            sum += 1
+        }
+        // The four luminance blocks, then Cb, then Cr.
+        var quarter: usize = 0
+        while quarter < 4 {
+            const origin = (quarter / 2) * 128 + (quarter % 2) * 8
+            var at: usize = 0
+            while at < 64 {
+                block_values[at] = luma_values[origin + (at / 8) * 16 + at % 8]
+                at += 1
+            }
+            block(encoder, block_values, lum_divisor, &previous_y, false)
+            quarter += 1
+        }
+        block(encoder, blue_values, chrom_divisor, &previous_blue, true)
+        block(encoder, red_values, chrom_divisor, &previous_red, true)
+        left += 16
+    }
+    flushBits(encoder)
+    if (row + 1) * 16 < height {
+        byte(encoder, 255)
+        byte(encoder, @intCast(u32, 208 + row % 8))
+    }
+}
+
+fn begin(encoder: *Encoder, out: [*]u8, capacity: usize) -> void {
+    encoder.*.out = out
+    encoder.*.capacity = capacity
+    encoder.*.length = 0
+    encoder.*.overflow = false
+    encoder.*.bitBuffer = 0
+    encoder.*.bitCount = 0
+}
+
+// Encodes `width` x `height` pixels (rows `stride` words apart) into
+// `out`: the JPEG's length, 0 when it did not fit in `capacity`.
+pub fn encode(encoder: *Encoder, pixels: [*]const u32, width: usize, height: usize, stride: usize, out: [*]u8, capacity: usize) -> usize {
+    begin(encoder, out, capacity)
+    if width == 0 || height == 0 || width > 65535 || height > 65535 { return 0 }
+    headers(encoder, width, height)
+    var row: usize = 0
+    while row * 16 < height && !encoder.*.overflow {
+        encodeRow(encoder, pixels, width, height, stride, row)
+        row += 1
+    }
+    // EOI.
+    word(encoder, 65497)
+    if encoder.*.overflow { return 0 }
+    return encoder.*.length
+}
+
+// A video of `width` x `height` frames: room for each row's bytes (from
+// `allocator`). False when there is no memory for it.
+pub fn startVideo(encoder: *Encoder, width: usize, height: usize, allocator: Allocator) -> bool {
+    encoder.*.rows = (height + 15) / 16
+    encoder.*.rowCapacity = ((width + 15) / 16) * 16 * 16 * 3 + 64
+    encoder.*.videoWidth = width
+    encoder.*.videoHeight = height
+    const bytes = allocator.alloc(encoder.*.rows * encoder.*.rowCapacity, 16)
+    const lengths = allocator.alloc(encoder.*.rows * 8, 16)
+    if bytes == null || lengths == null { return false }
+    encoder.*.rowBytes = bytes.?
+    unsafe { encoder.*.rowLengths = @ptrCast([*]usize, lengths.?) }
+    var row: usize = 0
+    while row < encoder.*.rows {
+        encoder.*.rowLengths[row] = 0
+        row += 1
+    }
+    return true
+}
+
+pub fn endVideo(encoder: *Encoder, allocator: Allocator) -> void {
+    allocator.free(encoder.*.rowBytes, encoder.*.rows * encoder.*.rowCapacity, 16)
+    var lengths: [*]u8 = undefined
+    unsafe { lengths = @ptrCast([*]u8, encoder.*.rowLengths) }
+    allocator.free(lengths, encoder.*.rows * 8, 16)
+    encoder.*.rows = 0
+}
+
+fn rowStart(encoder: *Encoder, row: usize) -> [*]u8 {
+    unsafe { return @ptrFromInt([*]u8, @intFromPtr(encoder.*.rowBytes) + row * encoder.*.rowCapacity) }
+}
+
+// The next frame of the video into `out`: the rows from pixel row `top`
+// up to `bottom` (what changed) coded again, the others as they were. Its
+// length, 0 when it did not fit in `capacity` (rows * rowCapacity + 2048
+// always does).
+pub fn encodeFrame(encoder: *Encoder, pixels: [*]const u32, stride: usize, top: usize, bottom: usize, out: [*]u8, capacity: usize) -> usize {
+    const width = encoder.*.videoWidth
+    const height = encoder.*.videoHeight
+    var row: usize = 0
+    while row < encoder.*.rows {
+        const changed = row * 16 < bottom && (row + 1) * 16 > top
+        if changed || encoder.*.rowLengths[row] == 0 {
+            begin(encoder, rowStart(encoder, row), encoder.*.rowCapacity)
+            encodeRow(encoder, pixels, width, height, stride, row)
+            encoder.*.rowLengths[row] = if encoder.*.overflow { 0 } else { encoder.*.length }
+        }
+        row += 1
+    }
+    begin(encoder, out, capacity)
+    headers(encoder, width, height)
+    row = 0
+    while row < encoder.*.rows && !encoder.*.overflow {
+        const bytes = rowStart(encoder, row)
+        const length = encoder.*.rowLengths[row]
+        if encoder.*.length + length > capacity {
+            encoder.*.overflow = true
+        } else {
+            var index: usize = 0
+            while index < length {
+                out[encoder.*.length + index] = bytes[index]
+                index += 1
+            }
+            encoder.*.length += length
+        }
+        row += 1
+    }
+    word(encoder, 65497)
+    if encoder.*.overflow { return 0 }
+    return encoder.*.length
+}
