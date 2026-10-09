@@ -1,0 +1,1219 @@
+// pw_core: the connection to a PipeWire server, over its native protocol
+// (version 3), as the client. A message is the object's id (u32), the
+// opcode (8 bits) and the payload's size (24 bits), a sequence number and
+// how many descriptors came with it, then the payload: one Struct pod
+// (projects/desktop/capture/pod.mlx). Object 0 is the core, 1 the client;
+// the client names the objects it makes (a registry, nodes it binds, a
+// stream's client node). The core is a proxy too (proxy.mlx) and keeps the
+// socket (a std.dbus connection in C memory: it reads and writes bytes
+// with descriptors), the map from ids to proxies, the memory the server
+// shares (AddMem: a descriptor per block), and the properties.
+//
+// What comes in is dispatched by the proxy's kind: the core's and the
+// client's events here, a registry's too; nodes, ports, devices and the
+// other globals in objects.mlx; a stream's client node in stream.mlx.
+const std = @import("std")
+const dbus = @import("std.dbus")
+const c = @import("../libpulse/c.mlx")
+const pod = @import("../capture/pod.mlx")
+const hooks = @import("./hooks.mlx")
+const loop_module = @import("./loop.mlx")
+const context_module = @import("./context.mlx")
+const properties = @import("./properties.mlx")
+const proxy_module = @import("./proxy.mlx")
+const process = @import("./process.mlx")
+const objects = @import("./objects.mlx")
+const stream = @import("./stream.mlx")
+const util = @import("./util.mlx")
+
+pub const MESSAGE: usize = 65536
+const HEADER: usize = 16
+
+// The core record: a proxy, then its own fields, then the user data.
+pub const SIZE: usize = 304
+const CONTEXT: usize = 112
+const PROPERTIES: usize = 120
+const CONNECTION: usize = 128
+const FD: usize = 136
+const SOURCE: usize = 144
+const OBJECTS: usize = 152
+const OBJECT_CAPACITY: usize = 160
+const CLIENT: usize = 168
+pub const STREAMS: usize = 176
+const RECV_SEQ: usize = 184
+const SEND_SEQ: usize = 188
+const STATE: usize = 192
+const MEM: usize = 200
+const MEM_COUNT: usize = 208
+const SCRATCH: usize = 216
+const CONTEXT_NEXT: usize = 224
+const USER_DATA_SIZE: usize = 232
+const FDS: usize = 240
+const FD_COUNT: usize = 248
+const FD_TAKEN: usize = 252
+const WATCHING_OUTPUT: usize = 256
+const INFO_PROPS: usize = 264
+
+// The core's state.
+const CONNECTED: u32 = 1
+const REMOVED: u32 = 2
+const DESTROYED: u32 = 4
+const DISCONNECTING: u32 = 8
+
+// Core methods and events, client methods and events, registry methods and
+// events.
+pub const CORE_HELLO: u32 = 1
+pub const CORE_SYNC: u32 = 2
+pub const CORE_PONG: u32 = 3
+pub const CORE_ERROR: u32 = 4
+pub const CORE_GET_REGISTRY: u32 = 5
+pub const CORE_CREATE_OBJECT: u32 = 6
+pub const CORE_DESTROY: u32 = 7
+const EVENT_INFO: u32 = 0
+const EVENT_DONE: u32 = 1
+const EVENT_PING: u32 = 2
+const EVENT_ERROR: u32 = 3
+const EVENT_REMOVE_ID: u32 = 4
+const EVENT_BOUND_ID: u32 = 5
+const EVENT_ADD_MEM: u32 = 6
+const EVENT_REMOVE_MEM: u32 = 7
+const EVENT_BOUND_PROPS: u32 = 8
+pub const CLIENT_ERROR: u32 = 1
+pub const CLIENT_UPDATE_PROPERTIES: u32 = 2
+pub const CLIENT_GET_PERMISSIONS: u32 = 3
+pub const CLIENT_UPDATE_PERMISSIONS: u32 = 4
+const CLIENT_EVENT_INFO: u32 = 0
+const CLIENT_EVENT_PERMISSIONS: u32 = 1
+pub const REGISTRY_BIND: u32 = 1
+pub const REGISTRY_DESTROY: u32 = 2
+const REGISTRY_EVENT_GLOBAL: u32 = 0
+const REGISTRY_EVENT_GLOBAL_REMOVE: u32 = 1
+
+// A shared memory block the server told of: id, type, fd, flags, used.
+const MEM_ENTRY: usize = 32
+const MAX_MEM: usize = 128
+
+pub const PAGE: usize = 4096
+
+// ---------------------------------------------------------------------------
+// Pods and C
+
+// A pod in a message as C sees it: the address of its header (0 for a
+// None or nothing).
+pub fn podAddress(bytes: [*]const u8, value: pod.Pod) -> usize {
+    if value.kind == 0 || value.kind == pod.NONE { return 0 }
+    return @intFromPtr(bytes) + value.body - 8
+}
+
+// A C string's address for a String pod (0 for a None).
+pub fn stringAddress(bytes: [*]const u8, value: pod.Pod) -> usize {
+    if value.kind != pod.STRING || value.size == 0 { return 0 }
+    return @intFromPtr(bytes) + value.body
+}
+
+// A pod from C memory (struct spa_pod: size, type, body) copied into the
+// message; a None for address 0.
+pub fn putPod(writing: *pod.Writer, address: usize) -> void {
+    if address == 0 {
+        pod.putNone(writing)
+        return
+    }
+    const size = @intCast(usize, c.get32(address, 0))
+    const total = 8 + (size + 7) / 8 * 8
+    var at: usize = 0
+    while at < total {
+        pod.putRaw32(writing, c.get32(address, at))
+        at += 4
+    }
+}
+
+// A C string into the message (None for NULL).
+pub fn putCString(writing: *pod.Writer, text: usize) -> void {
+    if text == 0 {
+        pod.putNone(writing)
+        return
+    }
+    pod.putString(writing, c.slice(text))
+}
+
+// A spa_dict from C memory as the protocol carries one (a Struct of the
+// count, then keys and values); an empty one for 0.
+pub fn putDict(writing: *pod.Writer, dict: usize) -> void {
+    const count = properties.dictCount(dict)
+    const top = pod.beginDict(writing, @intCast(u32, count))
+    var index: usize = 0
+    while index < count {
+        pod.putString(writing, c.slice(properties.dictKey(dict, index)))
+        var value = properties.dictValue(dict, index)
+        // Pointers are not for the wire.
+        if value != 0 && c.startsWith(c.slice(value), "pointer:") { value = 0 }
+        if value == 0 { pod.putString(writing, "") } else { pod.putString(writing, c.slice(value)) }
+        index += 1
+    }
+    pod.end(writing, top)
+}
+
+// An Array of Ids.
+pub fn putIdArray(writing: *pod.Writer, ids: usize, count: usize) -> void {
+    const at = writing.*.length
+    pod.putRaw32(writing, 0)
+    pod.putRaw32(writing, pod.ARRAY)
+    pod.putRaw32(writing, 4)
+    pod.putRaw32(writing, pod.ID)
+    var index: usize = 0
+    while index < count {
+        pod.putRaw32(writing, c.get32(ids, index * 4))
+        index += 1
+    }
+    pod.end(writing, at)
+}
+
+// A dictionary of a message as a C spa_dict (one allocation: the dict and
+// its items, the strings pointing into the message); released with
+// c.release after the callback.
+pub fn dictToC(bytes: [*]const u8, dict: pod.Pod) -> usize {
+    var count: u32 = 0
+    var cursor = pod.children(bytes, dict)
+    if dict.kind == pod.STRUCT { count = pod.uintOf(bytes, pod.next(&cursor)) }
+    if count > 4096 { count = 0 }
+    const made = c.alloc(properties.DICT + @intCast(usize, count) * properties.ITEM)
+    if made == 0 { return 0 }
+    c.put32(made, 4, count)
+    c.putPointer(made, 8, made + properties.DICT)
+    var index: u32 = 0
+    while index < count {
+        const key = pod.next(&cursor)
+        const value = pod.next(&cursor)
+        var key_address = stringAddress(bytes, key)
+        var value_address = stringAddress(bytes, value)
+        if key_address == 0 { key_address = c.literal("") }
+        if value_address == 0 { value_address = c.literal("") }
+        c.putPointer(made + properties.DICT + @intCast(usize, index) * properties.ITEM, 0, key_address)
+        c.putPointer(made + properties.DICT + @intCast(usize, index) * properties.ITEM, 8, value_address)
+        index += 1
+    }
+    return made
+}
+
+// The params of a message (a Struct of the count, then id and flags
+// pairs) as an array of struct spa_param_info (id, flags, user, seq);
+// how many in `count`.
+pub fn paramsToC(bytes: [*]const u8, params: pod.Pod, count: *u32) -> usize {
+    count.* = 0
+    if params.kind != pod.STRUCT { return 0 }
+    var cursor = pod.children(bytes, params)
+    var total = pod.uintOf(bytes, pod.next(&cursor))
+    if total > 1024 { total = 0 }
+    const made = c.alloc(if total == 0 { 16 } else { @intCast(usize, total) * 16 })
+    if made == 0 { return 0 }
+    var index: u32 = 0
+    while index < total {
+        c.put32(made + @intCast(usize, index) * 16, 0, pod.uintOf(bytes, pod.next(&cursor)))
+        c.put32(made + @intCast(usize, index) * 16, 4, pod.uintOf(bytes, pod.next(&cursor)))
+        index += 1
+    }
+    count.* = total
+    return made
+}
+
+// ---------------------------------------------------------------------------
+// Shared memory
+
+// Maps `size` bytes at `offset` of `fd`, read and write: the address, 0
+// when it could not; the mapping's start and length (page-aligned) in
+// `base` and `length`, for the unmapping.
+pub fn mapRange(fd: isize, offset: usize, size: usize, base: *usize, length: *usize) -> usize {
+    const start = offset / PAGE * PAGE
+    const total = (offset - start + size + PAGE - 1) / PAGE * PAGE
+    // PROT_READ | PROT_WRITE, MAP_SHARED
+    const mapped = std.linux.syscall6(9, 0, total, 3, 1, @bitCast(usize, fd), start)
+    if mapped < 0 || mapped == 0 {
+        base.* = 0
+        length.* = 0
+        return 0
+    }
+    base.* = @bitCast(usize, mapped)
+    length.* = total
+    return @bitCast(usize, mapped) + (offset - start)
+}
+
+pub fn unmap(base: usize, length: usize) -> void {
+    if base != 0 && length != 0 { const unmapped = std.linux.syscall2(11, base, length) }
+}
+
+fn memAt(core: usize, index: usize) -> usize { return c.getPointer(core, MEM) + index * MEM_ENTRY }
+
+fn memAdd(core: usize, id: u32, kind: u32, fd: isize, flags: u32) -> void {
+    var index: usize = 0
+    while index < MAX_MEM {
+        const entry = memAt(core, index)
+        if c.get32(entry, 16) == 0 {
+            c.put32(entry, 0, id)
+            c.put32(entry, 4, kind)
+            c.put32(entry, 8, @bitCast(u32, @intCast(i32, fd)))
+            c.put32(entry, 12, flags)
+            c.put32(entry, 16, 1)
+            return
+        }
+        index += 1
+    }
+    c.close(fd)
+}
+
+fn memIndex(core: usize, id: u32) -> usize {
+    var index: usize = 0
+    while index < MAX_MEM {
+        const entry = memAt(core, index)
+        if c.get32(entry, 16) != 0 && c.get32(entry, 0) == id { return index }
+        index += 1
+    }
+    return MAX_MEM
+}
+
+fn memRemove(core: usize, id: u32) -> void {
+    const index = memIndex(core, id)
+    if index == MAX_MEM { return }
+    const entry = memAt(core, index)
+    c.close(@intCast(isize, @bitCast(i32, c.get32(entry, 8))))
+    c.put32(entry, 16, 0)
+}
+
+// The descriptor of shared memory `id`, -1 when the server told of none.
+pub fn memFd(core: usize, id: u32) -> isize {
+    const index = memIndex(core, id)
+    if index == MAX_MEM { return -1 }
+    return @intCast(isize, @bitCast(i32, c.get32(memAt(core, index), 8)))
+}
+
+pub fn memType(core: usize, id: u32) -> u32 {
+    const index = memIndex(core, id)
+    if index == MAX_MEM { return 0 }
+    return c.get32(memAt(core, index), 4)
+}
+
+// ---------------------------------------------------------------------------
+// The objects
+
+pub fn objectAt(core: usize, id: u32) -> usize {
+    if @intCast(usize, id) >= @intCast(usize, c.get32(core, OBJECT_CAPACITY)) { return 0 }
+    return c.getPointer(c.getPointer(core, OBJECTS), @intCast(usize, id) * 8)
+}
+
+fn setObject(core: usize, id: u32, proxy: usize) -> void {
+    if @intCast(usize, id) >= @intCast(usize, c.get32(core, OBJECT_CAPACITY)) { return }
+    c.putPointer(c.getPointer(core, OBJECTS), @intCast(usize, id) * 8, proxy)
+}
+
+// The lowest free id (growing the map), INVALID_ID when there is no memory.
+fn allocateId(core: usize, proxy: usize) -> u32 {
+    var capacity = @intCast(usize, c.get32(core, OBJECT_CAPACITY))
+    var id: usize = 0
+    while id < capacity && c.getPointer(c.getPointer(core, OBJECTS), id * 8) != 0 { id += 1 }
+    if id == capacity {
+        const grown = c.grow(c.getPointer(core, OBJECTS), capacity * 2 * 8)
+        if grown == 0 { return proxy_module.INVALID_ID }
+        c.zero(grown + capacity * 8, capacity * 8)
+        c.putPointer(core, OBJECTS, grown)
+        c.put32(core, OBJECT_CAPACITY, @intCast(u32, capacity * 2))
+    }
+    c.putPointer(c.getPointer(core, OBJECTS), id * 8, proxy)
+    return @intCast(u32, id)
+}
+
+fn removeFromMap(proxy: usize) -> void {
+    if !proxy_module.has(proxy, proxy_module.IN_MAP) { return }
+    proxy_module.clear(proxy, proxy_module.IN_MAP)
+    const core = proxy_module.coreOf(proxy)
+    if core != 0 && objectAt(core, proxy_module.idOf(proxy)) == proxy { setObject(core, proxy_module.idOf(proxy), 0) }
+}
+
+// A new proxy of `kind` on `core` (pw_proxy_new): 0 when there is no
+// memory.
+pub fn newProxy(core: usize, kind: u32, type_name: []const u8, version: u32, user_data_size: usize) -> usize {
+    const proxy = c.alloc(proxy_module.SIZE + user_data_size)
+    if proxy == 0 { return 0 }
+    const id = allocateId(core, proxy)
+    if id == proxy_module.INVALID_ID {
+        c.release(proxy)
+        return 0
+    }
+    proxy_module.init(proxy, core, kind, type_name, version, user_data_size, id)
+    return proxy
+}
+
+fn isRemoved(core: usize) -> bool { return c.get32(core, STATE) & REMOVED != 0 }
+
+fn isDestroyed(core: usize) -> bool { return c.get32(core, STATE) & DESTROYED != 0 }
+
+fn setState(core: usize, flag: u32) -> void { c.put32(core, STATE, c.get32(core, STATE) | flag) }
+
+// The last reference gone: the memory (a core's with everything it holds).
+fn freeProxy(proxy: usize) -> void {
+    if proxy_module.kindOfProxy(proxy) == proxy_module.KIND_CORE {
+        freeCore(proxy)
+    } else {
+        proxy_module.release(proxy)
+    }
+}
+
+pub fn unrefProxy(proxy: usize) -> void {
+    if proxy_module.unref(proxy) { freeProxy(proxy) }
+}
+
+// pw_proxy_destroy: the server is told (Destroy) unless it took the
+// object away already; the program hears destroy once, and nothing after.
+pub fn destroyProxy(proxy: usize) -> void {
+    if proxy_module.has(proxy, proxy_module.DESTROYED) { return }
+    proxy_module.set(proxy, proxy_module.DESTROYED)
+    const core = proxy_module.coreOf(proxy)
+    if !proxy_module.has(proxy, proxy_module.REMOVED) {
+        if core != 0 && !isRemoved(core) && proxy != core {
+            sendDestroy(core, proxy_module.idOf(proxy))
+            proxy_module.ref(proxy)
+        } else {
+            proxy_module.set(proxy, proxy_module.REMOVED)
+        }
+    }
+    if proxy_module.has(proxy, proxy_module.REMOVED) { removeFromMap(proxy) }
+    if !proxy_module.has(proxy, proxy_module.ZOMBIE) {
+        proxy_module.set(proxy, proxy_module.ZOMBIE)
+        if proxy_module.kindOfProxy(proxy) == proxy_module.KIND_CLIENT_NODE { stream.proxyGone(proxy) }
+        proxy_module.emitDestroy(proxy)
+        if proxy_module.kindOfProxy(proxy) == proxy_module.KIND_CORE { coreDestroyed(proxy) }
+    }
+    unrefProxy(proxy)
+}
+
+// pw_proxy_remove: the server took the object away (RemoveId), or the
+// connection went.
+pub fn removeProxy(proxy: usize) -> void {
+    if !proxy_module.has(proxy, proxy_module.DESTROYED) { proxy_module.ref(proxy) }
+    if !proxy_module.has(proxy, proxy_module.REMOVED) {
+        proxy_module.set(proxy, proxy_module.REMOVED)
+        if !proxy_module.has(proxy, proxy_module.DESTROYED) {
+            if proxy_module.kindOfProxy(proxy) == proxy_module.KIND_CLIENT_NODE { stream.proxyGone(proxy) }
+            proxy_module.emitRemoved(proxy)
+            if proxy_module.kindOfProxy(proxy) == proxy_module.KIND_CORE { coreRemoved(proxy) }
+        }
+    }
+    if proxy_module.has(proxy, proxy_module.DESTROYED) { removeFromMap(proxy) }
+    unrefProxy(proxy)
+}
+
+// ---------------------------------------------------------------------------
+// The core
+
+pub fn contextOf(core: usize) -> usize { return c.getPointer(core, CONTEXT) }
+
+pub fn propertiesOf(core: usize) -> usize { return c.getPointer(core, PROPERTIES) }
+
+pub fn clientOf(core: usize) -> usize { return c.getPointer(core, CLIENT) }
+
+pub fn userData(core: usize) -> usize { return if c.getPointer(core, USER_DATA_SIZE) > 0 { core + SIZE } else { 0 } }
+
+pub fn receivedSequence(core: usize) -> u32 { return c.get32(core, RECV_SEQ) }
+
+// The sequence number the next message goes out with.
+pub fn sendSequence(core: usize) -> u32 { return c.get32(core, SEND_SEQ) }
+
+pub fn loopOf(core: usize) -> usize { return context_module.loopOf(c.getPointer(core, CONTEXT)) }
+
+pub fn alive(core: usize) -> bool { return core != 0 && !isRemoved(core) }
+
+pub fn nextInContext(core: usize) -> usize { return c.getPointer(core, CONTEXT_NEXT) }
+
+fn connectionOf(core: usize) -> *dbus.Connection {
+    unsafe { return @ptrFromInt(*dbus.Connection, c.getPointer(core, CONNECTION)) }
+}
+
+// The method tables, made once per process.
+fn tables() -> void {
+    if process.field(process.CORE_METHODS) != 0 { return }
+    var table = hooks.table(8, 0)
+    hooks.set(table, 0, @intFromPtr(mlx_pw_core_add_listener))
+    hooks.set(table, 1, @intFromPtr(mlx_pw_core_hello))
+    hooks.set(table, 2, @intFromPtr(mlx_pw_core_sync))
+    hooks.set(table, 3, @intFromPtr(mlx_pw_core_pong))
+    hooks.set(table, 4, @intFromPtr(mlx_pw_core_error))
+    hooks.set(table, 5, @intFromPtr(mlx_pw_core_get_registry))
+    hooks.set(table, 6, @intFromPtr(mlx_pw_core_create_object))
+    hooks.set(table, 7, @intFromPtr(mlx_pw_core_destroy))
+    process.setField(process.CORE_METHODS, table)
+    table = hooks.table(3, 0)
+    hooks.set(table, 0, @intFromPtr(mlx_pw_registry_add_listener))
+    hooks.set(table, 1, @intFromPtr(mlx_pw_registry_bind))
+    hooks.set(table, 2, @intFromPtr(mlx_pw_registry_destroy))
+    process.setField(process.REGISTRY_METHODS, table)
+    table = hooks.table(5, 0)
+    hooks.set(table, 0, @intFromPtr(mlx_pw_client_add_listener))
+    hooks.set(table, 1, @intFromPtr(mlx_pw_client_error))
+    hooks.set(table, 2, @intFromPtr(mlx_pw_client_update_properties))
+    hooks.set(table, 3, @intFromPtr(mlx_pw_client_get_permissions))
+    hooks.set(table, 4, @intFromPtr(mlx_pw_client_update_permissions))
+    process.setField(process.CLIENT_METHODS, table)
+    objects.tables()
+}
+
+// A core for `context` with `props` (taken over) and `user_data_size`
+// bytes for the program; not connected yet. 0 when there is no memory.
+fn newCore(context: usize, props: usize, user_data_size: usize) -> usize {
+    tables()
+    const core = c.alloc(SIZE + user_data_size)
+    var owned = props
+    if owned == 0 { owned = properties.new() }
+    const objects_map = c.alloc(64 * 8)
+    const mem = c.alloc(MAX_MEM * MEM_ENTRY)
+    const scratch = c.alloc(MESSAGE)
+    const connection = c.alloc(@sizeOf(dbus.Connection))
+    const fds = c.alloc(32 * 8)
+    if core == 0 || owned == 0 || objects_map == 0 || mem == 0 || scratch == 0 || connection == 0 || fds == 0 {
+        c.release(core)
+        properties.free(owned)
+        c.release(objects_map)
+        c.release(mem)
+        c.release(scratch)
+        c.release(connection)
+        c.release(fds)
+        return 0
+    }
+    const added = properties.add(owned, context_module.propertiesOf(context))
+    c.putPointer(core, CONTEXT, context)
+    c.putPointer(core, PROPERTIES, owned)
+    c.putPointer(core, OBJECTS, objects_map)
+    c.put32(core, OBJECT_CAPACITY, 64)
+    c.putPointer(core, MEM, mem)
+    c.putPointer(core, SCRATCH, scratch)
+    c.putPointer(core, CONNECTION, connection)
+    c.putPointer(core, FDS, fds)
+    c.putPointer(core, FD, @bitCast(usize, @intCast(isize, -1)))
+    c.putPointer(core, USER_DATA_SIZE, user_data_size)
+    // The core is object 0, the client object 1.
+    const core_id = allocateId(core, core)
+    proxy_module.init(core, core, proxy_module.KIND_CORE, proxy_module.typeName(proxy_module.KIND_CORE), 4, user_data_size, 0)
+    const client = newProxy(core, proxy_module.KIND_CLIENT, proxy_module.typeName(proxy_module.KIND_CLIENT), 3, 0)
+    c.putPointer(core, CLIENT, client)
+    // Onto the context's list.
+    c.putPointer(core, CONTEXT_NEXT, context_module.firstCore(context))
+    context_module.setFirstCore(context, core)
+    return core
+}
+
+fn unlinkFromContext(core: usize) -> void {
+    const context = c.getPointer(core, CONTEXT)
+    if context == 0 { return }
+    var at = context_module.firstCore(context)
+    var before: usize = 0
+    while at != 0 && at != core {
+        before = at
+        at = c.getPointer(at, CONTEXT_NEXT)
+    }
+    if at == 0 { return }
+    if before == 0 { context_module.setFirstCore(context, c.getPointer(core, CONTEXT_NEXT)) } else { c.putPointer(before, CONTEXT_NEXT, c.getPointer(core, CONTEXT_NEXT)) }
+}
+
+// The socket's name: $PIPEWIRE_REMOTE or "remote.name" of the properties,
+// else pipewire-0, in $PIPEWIRE_RUNTIME_DIR, $XDG_RUNTIME_DIR or
+// $USERPROFILE unless it is absolute. Into `out`; its length, 0 for none.
+fn socketPath(core: usize, out: [*]u8) -> usize {
+    var name = c.environment("PIPEWIRE_REMOTE")
+    if name.length == 0 {
+        const from_properties = properties.get(c.getPointer(core, PROPERTIES), "remote.name")
+        if from_properties != 0 { name = c.slice(from_properties) }
+    }
+    if name.length == 0 || c.same(name, "internal") { name = "pipewire-0" }
+    var writing = c.out(@intFromPtr(out), 108)
+    if name[0] != 47 {
+        var directory = c.environment("PIPEWIRE_RUNTIME_DIR")
+        if directory.length == 0 { directory = c.environment("XDG_RUNTIME_DIR") }
+        if directory.length == 0 { directory = c.environment("USERPROFILE") }
+        if directory.length == 0 { return 0 }
+        c.append(&writing, directory)
+        c.append(&writing, "/")
+    }
+    c.append(&writing, name)
+    return writing.length
+}
+
+// Connects `core` on `fd` (closed with the core when `close`): the hello
+// and the client's properties go out; 0, or a negative errno.
+fn connectFd(core: usize, fd: isize, close: bool) -> i32 {
+    const allocator = std.page_allocator.init()
+    if !dbus.open(connectionOf(core), allocator, fd) { return util.ENOMEM }
+    c.putPointer(core, FD, @bitCast(usize, fd))
+    // SPA_IO_IN | SPA_IO_ERR | SPA_IO_HUP
+    const source = loop_module.addIo(loopOf(core), fd, 25, false, @intFromPtr(mlx_pw_core_on_data), core)
+    if source == 0 {
+        dbus.close(connectionOf(core))
+        return util.ENOMEM
+    }
+    c.putPointer(core, SOURCE, source)
+    setState(core, CONNECTED)
+    sendHello(core)
+    sendClientUpdateProperties(core, c.getPointer(core, PROPERTIES))
+    return 0
+}
+
+// pw_context_connect: the server's socket by name.
+pub fn connect(context: usize, props: usize, user_data_size: usize) -> usize {
+    const core = newCore(context, props, user_data_size)
+    if core == 0 { return 0 }
+    var path: [108]u8 = undefined
+    var path_bytes: [*]u8 = undefined
+    unsafe { path_bytes = @ptrCast([*]u8, &path) }
+    const length = socketPath(core, path_bytes)
+    var fd: isize = -2
+    if length > 0 { fd = dbus.connect(path_bytes[0..length]) }
+    if fd < 0 || connectFd(core, fd, true) < 0 {
+        if fd >= 0 { c.close(fd) }
+        disconnect(core)
+        return 0
+    }
+    return core
+}
+
+// pw_context_connect_fd: a socket the program has (the portal's).
+pub fn connectWithFd(context: usize, fd: isize, props: usize, user_data_size: usize) -> usize {
+    const core = newCore(context, props, user_data_size)
+    if core == 0 { return 0 }
+    if connectFd(core, fd, true) < 0 {
+        disconnect(core)
+        return 0
+    }
+    return core
+}
+
+// The connection went (RemoveId of the core, or the socket broke): the
+// streams disconnect, every other proxy is removed.
+fn coreRemoved(core: usize) -> void {
+    if isRemoved(core) { return }
+    setState(core, REMOVED)
+    stream.disconnectAll(core)
+    var id: u32 = 1
+    while @intCast(usize, id) < @intCast(usize, c.get32(core, OBJECT_CAPACITY)) {
+        const proxy = objectAt(core, id)
+        if proxy != 0 && proxy != core { removeProxy(proxy) }
+        id += 1
+    }
+}
+
+// pw_core_disconnect's end: the streams and the client proxy destroyed,
+// the socket closed.
+fn coreDestroyed(core: usize) -> void {
+    if isDestroyed(core) { return }
+    setState(core, DESTROYED)
+    stream.destroyAll(core)
+    const client = c.getPointer(core, CLIENT)
+    if client != 0 {
+        destroyProxy(client)
+        c.putPointer(core, CLIENT, 0)
+    }
+    // Proxies the program keeps: they lose their core.
+    var id: u32 = 1
+    while @intCast(usize, id) < @intCast(usize, c.get32(core, OBJECT_CAPACITY)) {
+        const proxy = objectAt(core, id)
+        if proxy != 0 && proxy != core {
+            c.putPointer(proxy, proxy_module.CORE, 0)
+            proxy_module.clear(proxy, proxy_module.IN_MAP)
+            setObject(core, id, 0)
+        }
+        id += 1
+    }
+    closeConnection(core)
+    var index: usize = 0
+    while index < MAX_MEM {
+        const entry = memAt(core, index)
+        if c.get32(entry, 16) != 0 {
+            c.close(@intCast(isize, @bitCast(i32, c.get32(entry, 8))))
+            c.put32(entry, 16, 0)
+        }
+        index += 1
+    }
+    unlinkFromContext(core)
+}
+
+fn closeConnection(core: usize) -> void {
+    if c.get32(core, STATE) & CONNECTED == 0 { return }
+    c.put32(core, STATE, c.get32(core, STATE) & ~CONNECTED)
+    const source = c.getPointer(core, SOURCE)
+    if source != 0 {
+        loop_module.destroySource(loopOf(core), source)
+        c.putPointer(core, SOURCE, 0)
+    }
+    // The connection closes the socket.
+    dbus.close(connectionOf(core))
+}
+
+fn freeCore(core: usize) -> void {
+    closeConnection(core)
+    properties.free(c.getPointer(core, PROPERTIES))
+    c.release(c.getPointer(core, INFO_PROPS))
+    c.release(c.getPointer(core, OBJECTS))
+    c.release(c.getPointer(core, MEM))
+    c.release(c.getPointer(core, SCRATCH))
+    c.release(c.getPointer(core, CONNECTION))
+    c.release(c.getPointer(core, FDS))
+    proxy_module.release(core)
+}
+
+// pw_core_disconnect.
+pub fn disconnect(core: usize) -> i32 {
+    if !isRemoved(core) { removeProxy(core) }
+    if !isDestroyed(core) { destroyProxy(core) }
+    return 0
+}
+
+// pw_core_steal_fd: the socket, which the core then no longer has.
+pub fn stealFd(core: usize) -> i32 {
+    if c.get32(core, STATE) & CONNECTED == 0 { return util.EIO }
+    const fd = @bitCast(isize, c.getPointer(core, FD))
+    // F_DUPFD_CLOEXEC
+    const copy = std.linux.syscall3(72, @bitCast(usize, fd), 1030, 3)
+    if copy < 0 { return @intCast(i32, copy) }
+    closeConnection(core)
+    return @intCast(i32, copy)
+}
+
+pub fn setPaused(core: usize, paused: bool) -> i32 {
+    const source = c.getPointer(core, SOURCE)
+    if source == 0 { return util.EIO }
+    var mask: u32 = if paused { 24 } else { 25 }
+    if c.get32(core, WATCHING_OUTPUT) != 0 { mask = mask | 4 }
+    return loop_module.updateIo(loopOf(core), source, mask)
+}
+
+pub fn updateProperties(core: usize, dict: usize) -> i32 {
+    const changed = properties.update(c.getPointer(core, PROPERTIES), dict)
+    if changed > 0 && c.getPointer(core, CLIENT) != 0 { sendClientUpdateProperties(core, c.getPointer(core, PROPERTIES)) }
+    return changed
+}
+
+// ---------------------------------------------------------------------------
+// Sending
+
+// Begins a message in the core's scratch: the payload's Struct (its top,
+// for send).
+pub fn begin(core: usize, writing: *pod.Writer) -> usize {
+    pod.begin(writing, c.bytes(c.getPointer(core, SCRATCH) + HEADER), MESSAGE - HEADER)
+    return pod.beginStruct(writing)
+}
+
+fn watchOutput(core: usize, watching: bool) -> void {
+    if (c.get32(core, WATCHING_OUTPUT) != 0) == watching { return }
+    c.put32(core, WATCHING_OUTPUT, if watching { 1 } else { 0 })
+    const source = c.getPointer(core, SOURCE)
+    if source != 0 { const updated = loop_module.updateIo(loopOf(core), source, if watching { 29 } else { 25 }) }
+}
+
+fn flush(core: usize) -> void {
+    if c.get32(core, STATE) & CONNECTED == 0 { return }
+    const connection = connectionOf(core)
+    if dbus.pendingOutput(connection) == 0 {
+        watchOutput(core, false)
+        return
+    }
+    const flushed = dbus.flush(connection)
+    if flushed == dbus.EAGAIN {
+        watchOutput(core, true)
+    } else if flushed < 0 {
+        connectionBroke(core, @intCast(i32, flushed))
+    } else {
+        watchOutput(core, false)
+    }
+}
+
+// Sends the message to object `id` with `count` descriptors (which the
+// connection then owns): the sequence number it went with.
+pub fn send(core: usize, id: u32, opcode: u32, writing: *pod.Writer, top: usize, descriptors: [*]const isize, count: usize) -> u32 {
+    pod.end(writing, top)
+    const seq = c.get32(core, SEND_SEQ)
+    if writing.*.failed || c.get32(core, STATE) & CONNECTED == 0 {
+        var index: usize = 0
+        while index < count {
+            c.close(descriptors[index])
+            index += 1
+        }
+        return seq
+    }
+    const scratch = c.getPointer(core, SCRATCH)
+    const length = writing.*.length
+    c.put32(scratch, 0, id)
+    c.put32(scratch, 4, (opcode << 24) | @intCast(u32, length))
+    c.put32(scratch, 8, seq)
+    c.put32(scratch, 12, @intCast(u32, count))
+    c.put32(core, SEND_SEQ, seq + 1)
+    if !dbus.queue(connectionOf(core), c.bytes(scratch), HEADER + length, descriptors, count) {
+        connectionBroke(core, util.EPIPE)
+        return seq
+    }
+    flush(core)
+    return seq
+}
+
+fn none() -> [*]const isize {
+    var nothing: [1]isize = [1]isize{ 0 }
+    unsafe { return @ptrCast([*]const isize, &nothing) }
+}
+
+pub fn sendPlain(core: usize, id: u32, opcode: u32, writing: *pod.Writer, top: usize) -> u32 { return send(core, id, opcode, writing, top, none(), 0) }
+
+// SPA_RESULT_RETURN_ASYNC(seq).
+pub fn asyncResult(seq: u32) -> i32 { return @bitCast(i32, (1 << 30) | (seq & 1073741823)) }
+
+fn sendHello(core: usize) -> void {
+    var writing: pod.Writer = undefined
+    const top = begin(core, &writing)
+    pod.putInt(&writing, 4)
+    const sent = sendPlain(core, 0, CORE_HELLO, &writing, top)
+}
+
+// pw_core_sync: Done comes back with this sequence number (made async).
+pub fn sync(core: usize, id: u32, seq: i32) -> i32 {
+    if !alive(core) { return util.EIO }
+    var writing: pod.Writer = undefined
+    const top = begin(core, &writing)
+    pod.putUint(&writing, id)
+    const result = asyncResult(c.get32(core, SEND_SEQ))
+    pod.putInt(&writing, result)
+    const sent = sendPlain(core, 0, CORE_SYNC, &writing, top)
+    return result
+}
+
+pub fn pong(core: usize, id: u32, seq: i32) -> i32 {
+    var writing: pod.Writer = undefined
+    const top = begin(core, &writing)
+    pod.putUint(&writing, id)
+    pod.putInt(&writing, seq)
+    const sent = sendPlain(core, 0, CORE_PONG, &writing, top)
+    return 0
+}
+
+pub fn sendError(core: usize, id: u32, seq: i32, result: i32, message: usize) -> i32 {
+    if !alive(core) { return util.EIO }
+    var writing: pod.Writer = undefined
+    const top = begin(core, &writing)
+    pod.putUint(&writing, id)
+    pod.putInt(&writing, seq)
+    pod.putInt(&writing, result)
+    putCString(&writing, message)
+    const sent = sendPlain(core, 0, CORE_ERROR, &writing, top)
+    return 0
+}
+
+// pw_core_get_registry: a registry proxy; the server lists its globals.
+pub fn getRegistry(core: usize, version: u32, user_data_size: usize) -> usize {
+    if !alive(core) { return 0 }
+    const registry = newProxy(core, proxy_module.KIND_REGISTRY, proxy_module.typeName(proxy_module.KIND_REGISTRY), version, user_data_size)
+    if registry == 0 { return 0 }
+    var writing: pod.Writer = undefined
+    const top = begin(core, &writing)
+    pod.putUint(&writing, version)
+    pod.putUint(&writing, proxy_module.idOf(registry))
+    const sent = sendPlain(core, 0, CORE_GET_REGISTRY, &writing, top)
+    return registry
+}
+
+// pw_core_create_object: an object the server's `factory` makes, as a
+// proxy of `type_name`.
+pub fn createObject(core: usize, factory: usize, type_name: usize, version: u32, dict: usize, user_data_size: usize) -> usize {
+    if !alive(core) || factory == 0 || type_name == 0 { return 0 }
+    const kind = proxy_module.kindOf(c.slice(type_name))
+    const proxy = newProxy(core, kind, c.slice(type_name), version, user_data_size)
+    if proxy == 0 { return 0 }
+    var writing: pod.Writer = undefined
+    const top = begin(core, &writing)
+    pod.putString(&writing, c.slice(factory))
+    pod.putString(&writing, c.slice(type_name))
+    pod.putUint(&writing, version)
+    putDict(&writing, dict)
+    pod.putUint(&writing, proxy_module.idOf(proxy))
+    const sent = sendPlain(core, 0, CORE_CREATE_OBJECT, &writing, top)
+    return proxy
+}
+
+fn sendDestroy(core: usize, id: u32) -> void {
+    var writing: pod.Writer = undefined
+    const top = begin(core, &writing)
+    pod.putUint(&writing, id)
+    const sent = sendPlain(core, 0, CORE_DESTROY, &writing, top)
+}
+
+fn sendClientUpdateProperties(core: usize, dict: usize) -> void {
+    const client = c.getPointer(core, CLIENT)
+    if client == 0 { return }
+    var writing: pod.Writer = undefined
+    const top = begin(core, &writing)
+    putDict(&writing, dict)
+    const sent = sendPlain(core, proxy_module.idOf(client), CLIENT_UPDATE_PROPERTIES, &writing, top)
+}
+
+// pw_registry_bind: a proxy for global `id` of `type_name`.
+pub fn bind(registry: usize, id: u32, type_name: usize, version: u32, user_data_size: usize) -> usize {
+    const core = proxy_module.coreOf(registry)
+    if !alive(core) || type_name == 0 { return 0 }
+    const kind = proxy_module.kindOf(c.slice(type_name))
+    const proxy = newProxy(core, kind, c.slice(type_name), version, user_data_size)
+    if proxy == 0 { return 0 }
+    var writing: pod.Writer = undefined
+    const top = begin(core, &writing)
+    pod.putUint(&writing, id)
+    pod.putString(&writing, c.slice(type_name))
+    pod.putUint(&writing, version)
+    pod.putUint(&writing, proxy_module.idOf(proxy))
+    const sent = sendPlain(core, proxy_module.idOf(registry), REGISTRY_BIND, &writing, top)
+    return proxy
+}
+
+pub fn registryDestroy(registry: usize, id: u32) -> i32 {
+    const core = proxy_module.coreOf(registry)
+    if !alive(core) { return util.EIO }
+    var writing: pod.Writer = undefined
+    const top = begin(core, &writing)
+    pod.putUint(&writing, id)
+    const sent = sendPlain(core, proxy_module.idOf(registry), REGISTRY_DESTROY, &writing, top)
+    return 0
+}
+
+// ---------------------------------------------------------------------------
+// Receiving
+
+fn connectionBroke(core: usize, result: i32) -> void {
+    if c.get32(core, STATE) & CONNECTED == 0 { return }
+    closeConnection(core)
+    stream.coreBroke(core)
+    // The program hears an error on the core; what it does then (usually
+    // pw_core_disconnect) is its own.
+    proxy_module.emit4(core, @intCast(usize, EVENT_ERROR), 0, c.int(@bitCast(i32, c.get32(core, RECV_SEQ))), c.int(result), c.literal("connection error"))
+}
+
+// The socket: what came, sent what waits.
+export fn mlx_pw_core_on_data(core: usize, fd: i32, mask: u32) -> void {
+    proxy_module.ref(core)
+    if mask & 24 != 0 {
+        connectionBroke(core, util.EPIPE)
+    } else {
+        if mask & 1 != 0 { receive(core) }
+        if mask & 4 != 0 && c.get32(core, STATE) & CONNECTED != 0 { flush(core) }
+    }
+    unrefProxy(core)
+}
+
+fn receive(core: usize) -> void {
+    const connection = connectionOf(core)
+    while c.get32(core, STATE) & CONNECTED != 0 {
+        const got = dbus.receive(connection)
+        if got == 0 || (got < 0 && got != dbus.EAGAIN) {
+            connectionBroke(core, util.EPIPE)
+            return
+        }
+        handleAll(core)
+        if got < 0 { return }
+    }
+}
+
+fn handleAll(core: usize) -> void {
+    const connection = connectionOf(core)
+    const fds = c.getPointer(core, FDS)
+    while c.get32(core, STATE) & CONNECTED != 0 {
+        const available = dbus.buffered(connection)
+        if available < HEADER { return }
+        const bytes = dbus.input(connection)
+        const id = pod.load32(bytes, 0)
+        const word = pod.load32(bytes, 4)
+        const opcode = word >> 24
+        const size = @intCast(usize, word & 16777215)
+        const seq = pod.load32(bytes, 8)
+        var count = @intCast(usize, pod.load32(bytes, 12))
+        if HEADER + size > MESSAGE || count > 28 {
+            connectionBroke(core, util.EPROTO)
+            return
+        }
+        if available < HEADER + size { return }
+        if count > dbus.bufferedHandles(connection) { count = dbus.bufferedHandles(connection) }
+        const handles = dbus.handles(connection)
+        var index: usize = 0
+        while index < count {
+            c.putPointer(fds, index * 8, @bitCast(usize, handles[index]))
+            index += 1
+        }
+        c.put32(core, FD_COUNT, @intCast(u32, count))
+        c.put32(core, FD_TAKEN, 0)
+        c.put32(core, RECV_SEQ, seq)
+        var body: [*]const u8 = undefined
+        unsafe { body = @ptrFromInt([*]const u8, @intFromPtr(bytes) + HEADER) }
+        handle(core, id, opcode, body, size)
+        // The descriptors nobody took.
+        index = 0
+        while index < count {
+            if c.get32(core, FD_TAKEN) & (1 << @intCast(u5, index)) == 0 { c.close(@bitCast(isize, c.getPointer(fds, index * 8))) }
+            index += 1
+        }
+        dbus.consume(connection, HEADER + size, count)
+    }
+}
+
+// The descriptor at `index` of the message being handled, which the
+// caller then owns (-1 when there is none).
+pub fn takeFd(core: usize, index: i64) -> isize {
+    if index < 0 || index >= @intCast(i64, c.get32(core, FD_COUNT)) { return -1 }
+    c.put32(core, FD_TAKEN, c.get32(core, FD_TAKEN) | (1 << @intCast(u5, index)))
+    return @bitCast(isize, c.getPointer(c.getPointer(core, FDS), @intCast(usize, index) * 8))
+}
+
+fn handle(core: usize, id: u32, opcode: u32, body: [*]const u8, size: usize) -> void {
+    const payload = pod.podAt(body, 0, size)
+    if payload.kind != pod.STRUCT { return }
+    const proxy = objectAt(core, id)
+    if proxy == 0 || proxy_module.has(proxy, proxy_module.ZOMBIE) { return }
+    const kind = proxy_module.kindOfProxy(proxy)
+    proxy_module.ref(proxy)
+    if kind == proxy_module.KIND_CORE {
+        coreEvent(core, opcode, body, payload)
+    } else if kind == proxy_module.KIND_CLIENT {
+        clientEvent(core, proxy, opcode, body, payload)
+    } else if kind == proxy_module.KIND_REGISTRY {
+        registryEvent(core, proxy, opcode, body, payload)
+    } else if kind == proxy_module.KIND_CLIENT_NODE {
+        stream.event(core, proxy, opcode, body, payload)
+    } else {
+        objects.event(core, proxy, kind, opcode, body, payload)
+    }
+    unrefProxy(proxy)
+}
+
+fn coreEvent(core: usize, opcode: u32, body: [*]const u8, payload: pod.Pod) -> void {
+    var cursor = pod.children(body, payload)
+    if opcode == EVENT_INFO {
+        // struct pw_core_info: id, cookie, user_name, host_name, version,
+        // name, change_mask, props.
+        var info: [7]usize = [7]usize{ 0, 0, 0, 0, 0, 0, 0 }
+        const id = pod.uintOf(body, pod.next(&cursor))
+        const cookie = pod.uintOf(body, pod.next(&cursor))
+        info[0] = @intCast(usize, id) | (@intCast(usize, cookie) << 32)
+        info[1] = stringAddress(body, pod.next(&cursor))
+        info[2] = stringAddress(body, pod.next(&cursor))
+        info[3] = stringAddress(body, pod.next(&cursor))
+        info[4] = stringAddress(body, pod.next(&cursor))
+        info[5] = @bitCast(usize, pod.longOf(body, pod.next(&cursor)))
+        const dict = dictToC(body, pod.next(&cursor))
+        info[6] = dict
+        proxy_module.emit1(core, @intCast(usize, EVENT_INFO), @intFromPtr(&info))
+        c.release(dict)
+    } else if opcode == EVENT_DONE {
+        const id = pod.uintOf(body, pod.next(&cursor))
+        const seq = pod.intOf(body, pod.next(&cursor))
+        if id == proxy_module.INVALID_ID { return }
+        proxy_module.emit2(core, @intCast(usize, EVENT_DONE), @intCast(usize, id), c.int(seq))
+        const proxy = objectAt(core, id)
+        if proxy != 0 { proxy_module.emitDone(proxy, seq) }
+    } else if opcode == EVENT_PING {
+        const id = pod.uintOf(body, pod.next(&cursor))
+        const seq = pod.intOf(body, pod.next(&cursor))
+        const answered = pong(core, id, seq)
+        proxy_module.emit2(core, @intCast(usize, EVENT_PING), @intCast(usize, id), c.int(seq))
+    } else if opcode == EVENT_ERROR {
+        const id = pod.uintOf(body, pod.next(&cursor))
+        const seq = pod.intOf(body, pod.next(&cursor))
+        const result = pod.intOf(body, pod.next(&cursor))
+        var message = stringAddress(body, pod.next(&cursor))
+        if message == 0 { message = c.literal("") }
+        proxy_module.emit4(core, @intCast(usize, EVENT_ERROR), @intCast(usize, id), c.int(seq), c.int(result), message)
+        const proxy = objectAt(core, id)
+        if proxy != 0 {
+            if proxy_module.kindOfProxy(proxy) == proxy_module.KIND_CLIENT_NODE { stream.proxyError(proxy, seq, result, message) }
+            proxy_module.emitError(proxy, seq, result, message)
+        }
+    } else if opcode == EVENT_REMOVE_ID {
+        const id = pod.uintOf(body, pod.next(&cursor))
+        proxy_module.emit1(core, @intCast(usize, EVENT_REMOVE_ID), @intCast(usize, id))
+        const proxy = objectAt(core, id)
+        if proxy != 0 { removeProxy(proxy) }
+    } else if opcode == EVENT_BOUND_ID {
+        const id = pod.uintOf(body, pod.next(&cursor))
+        const global = pod.uintOf(body, pod.next(&cursor))
+        var empty: [2]usize = [2]usize{ 0, 0 }
+        proxy_module.emit2(core, @intCast(usize, EVENT_BOUND_ID), @intCast(usize, id), @intCast(usize, global))
+        proxy_module.emit3Versioned(core, @intCast(usize, EVENT_BOUND_PROPS), 1, @intCast(usize, id), @intCast(usize, global), @intFromPtr(&empty))
+        bound(core, id, global, @intFromPtr(&empty))
+    } else if opcode == EVENT_ADD_MEM {
+        const id = pod.uintOf(body, pod.next(&cursor))
+        const kind = pod.uintOf(body, pod.next(&cursor))
+        const fd_index = pod.longOf(body, pod.next(&cursor))
+        const flags = pod.uintOf(body, pod.next(&cursor))
+        const fd = takeFd(core, fd_index)
+        if fd >= 0 {
+            // A copy for the program's listeners stays theirs; the pool
+            // keeps the original.
+            memAdd(core, id, kind, fd, flags)
+            proxy_module.emit4(core, @intCast(usize, EVENT_ADD_MEM), @intCast(usize, id), @intCast(usize, kind), @bitCast(usize, fd), @intCast(usize, flags))
+        }
+    } else if opcode == EVENT_REMOVE_MEM {
+        const id = pod.uintOf(body, pod.next(&cursor))
+        proxy_module.emit1(core, @intCast(usize, EVENT_REMOVE_MEM), @intCast(usize, id))
+        memRemove(core, id)
+    } else if opcode == EVENT_BOUND_PROPS {
+        const id = pod.uintOf(body, pod.next(&cursor))
+        const global = pod.uintOf(body, pod.next(&cursor))
+        const dict = dictToC(body, pod.next(&cursor))
+        proxy_module.emit2(core, @intCast(usize, EVENT_BOUND_ID), @intCast(usize, id), @intCast(usize, global))
+        proxy_module.emit3Versioned(core, @intCast(usize, EVENT_BOUND_PROPS), 1, @intCast(usize, id), @intCast(usize, global), dict)
+        bound(core, id, global, dict)
+        c.release(dict)
+    }
+}
+
+// Object `id` got its global id: the proxy hears bound and bound_props.
+fn bound(core: usize, id: u32, global: u32, dict: usize) -> void {
+    const proxy = objectAt(core, id)
+    if proxy == 0 { return }
+    c.put32(proxy, proxy_module.BOUND_ID, global)
+    proxy_module.emitBound(proxy, global)
+    if proxy_module.kindOfProxy(proxy) == proxy_module.KIND_CLIENT_NODE { stream.bound(proxy, global, dict) }
+    proxy_module.emitBoundProps(proxy, global, dict)
+}
+
+fn clientEvent(core: usize, client: usize, opcode: u32, body: [*]const u8, payload: pod.Pod) -> void {
+    var cursor = pod.children(body, payload)
+    if opcode == CLIENT_EVENT_INFO {
+        // struct pw_client_info: id, change_mask, props.
+        var info: [3]usize = [3]usize{ 0, 0, 0 }
+        info[0] = @intCast(usize, pod.uintOf(body, pod.next(&cursor)))
+        info[1] = @bitCast(usize, pod.longOf(body, pod.next(&cursor)))
+        const dict = dictToC(body, pod.next(&cursor))
+        info[2] = dict
+        proxy_module.emit1(client, @intCast(usize, CLIENT_EVENT_INFO), @intFromPtr(&info))
+        c.release(dict)
+    } else if opcode == CLIENT_EVENT_PERMISSIONS {
+        const index = pod.uintOf(body, pod.next(&cursor))
+        const list = pod.next(&cursor)
+        var inner = pod.children(body, list)
+        var count = pod.uintOf(body, pod.next(&inner))
+        if count > 4096 { count = 0 }
+        const permissions = c.alloc(if count == 0 { 8 } else { @intCast(usize, count) * 8 })
+        if permissions == 0 { return }
+        var at: u32 = 0
+        while at < count {
+            c.put32(permissions, @intCast(usize, at) * 8, pod.uintOf(body, pod.next(&inner)))
+            c.put32(permissions, @intCast(usize, at) * 8 + 4, pod.uintOf(body, pod.next(&inner)))
+            at += 1
+        }
+        proxy_module.emit3(client, @intCast(usize, CLIENT_EVENT_PERMISSIONS), @intCast(usize, index), @intCast(usize, count), permissions)
+        c.release(permissions)
+    }
+}
+
+fn registryEvent(core: usize, registry: usize, opcode: u32, body: [*]const u8, payload: pod.Pod) -> void {
+    var cursor = pod.children(body, payload)
+    if opcode == REGISTRY_EVENT_GLOBAL {
+        const id = pod.uintOf(body, pod.next(&cursor))
+        const permissions = pod.uintOf(body, pod.next(&cursor))
+        var type_name = stringAddress(body, pod.next(&cursor))
+        if type_name == 0 { type_name = c.literal("") }
+        const version = pod.uintOf(body, pod.next(&cursor))
+        const dict = dictToC(body, pod.next(&cursor))
+        proxy_module.emit5(registry, @intCast(usize, REGISTRY_EVENT_GLOBAL), @intCast(usize, id), @intCast(usize, permissions), type_name, @intCast(usize, version), dict)
+        c.release(dict)
+    } else if opcode == REGISTRY_EVENT_GLOBAL_REMOVE {
+        const id = pod.uintOf(body, pod.next(&cursor))
+        proxy_module.emit1(registry, @intCast(usize, REGISTRY_EVENT_GLOBAL_REMOVE), @intCast(usize, id))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The method tables' functions (C calls them with the proxy as `object`)
+
+export fn mlx_pw_core_add_listener(object: usize, hook: usize, events: usize, data: usize) -> i32 {
+    proxy_module.addObjectListener(object, hook, events, data)
+    return 0
+}
+
+export fn mlx_pw_core_hello(object: usize, version: u32) -> i32 {
+    if !alive(object) { return util.EIO }
+    var writing: pod.Writer = undefined
+    const top = begin(object, &writing)
+    pod.putUint(&writing, version)
+    const sent = sendPlain(object, 0, CORE_HELLO, &writing, top)
+    return 0
+}
+
+export fn mlx_pw_core_sync(object: usize, id: u32, seq: i32) -> i32 { return sync(object, id, seq) }
+
+export fn mlx_pw_core_pong(object: usize, id: u32, seq: i32) -> i32 {
+    if !alive(object) { return util.EIO }
+    return pong(object, id, seq)
+}
+
+export fn mlx_pw_core_error(object: usize, id: u32, seq: i32, result: i32, message: usize) -> i32 { return sendError(object, id, seq, result, message) }
+
+export fn mlx_pw_core_get_registry(object: usize, version: u32, user_data_size: usize) -> usize { return getRegistry(object, version, user_data_size) }
+
+export fn mlx_pw_core_create_object(object: usize, factory: usize, type_name: usize, version: u32, dict: usize, user_data_size: usize) -> usize { return createObject(object, factory, type_name, version, dict, user_data_size) }
+
+export fn mlx_pw_core_destroy(object: usize, proxy: usize) -> i32 {
+    if proxy == 0 || !alive(object) { return util.EIO }
+    sendDestroy(object, proxy_module.idOf(proxy))
+    return 0
+}
+
+export fn mlx_pw_registry_add_listener(object: usize, hook: usize, events: usize, data: usize) -> i32 {
+    proxy_module.addObjectListener(object, hook, events, data)
+    return 0
+}
+
+export fn mlx_pw_registry_bind(object: usize, id: u32, type_name: usize, version: u32, user_data_size: usize) -> usize { return bind(object, id, type_name, version, user_data_size) }
+
+export fn mlx_pw_registry_destroy(object: usize, id: u32) -> i32 { return registryDestroy(object, id) }
+
+export fn mlx_pw_client_add_listener(object: usize, hook: usize, events: usize, data: usize) -> i32 {
+    proxy_module.addObjectListener(object, hook, events, data)
+    return 0
+}
+
+export fn mlx_pw_client_error(object: usize, id: u32, result: i32, message: usize) -> i32 {
+    const core = proxy_module.coreOf(object)
+    if !alive(core) { return util.EIO }
+    var writing: pod.Writer = undefined
+    const top = begin(core, &writing)
+    pod.putUint(&writing, id)
+    pod.putInt(&writing, result)
+    putCString(&writing, message)
+    const sent = sendPlain(core, proxy_module.idOf(object), CLIENT_ERROR, &writing, top)
+    return 0
+}
+
+export fn mlx_pw_client_update_properties(object: usize, dict: usize) -> i32 {
+    const core = proxy_module.coreOf(object)
+    if !alive(core) { return util.EIO }
+    var writing: pod.Writer = undefined
+    const top = begin(core, &writing)
+    putDict(&writing, dict)
+    const sent = sendPlain(core, proxy_module.idOf(object), CLIENT_UPDATE_PROPERTIES, &writing, top)
+    return 0
+}
+
+export fn mlx_pw_client_get_permissions(object: usize, index: u32, count: u32) -> i32 {
+    const core = proxy_module.coreOf(object)
+    if !alive(core) { return util.EIO }
+    var writing: pod.Writer = undefined
+    const top = begin(core, &writing)
+    pod.putUint(&writing, index)
+    pod.putUint(&writing, count)
+    const sent = sendPlain(core, proxy_module.idOf(object), CLIENT_GET_PERMISSIONS, &writing, top)
+    return 0
+}
+
+// struct pw_permission: id, permissions.
+export fn mlx_pw_client_update_permissions(object: usize, count: u32, permissions: usize) -> i32 {
+    const core = proxy_module.coreOf(object)
+    if !alive(core) { return util.EIO }
+    var writing: pod.Writer = undefined
+    const top = begin(core, &writing)
+    pod.putUint(&writing, count)
+    var index: usize = 0
+    while index < @intCast(usize, count) {
+        pod.putUint(&writing, c.get32(permissions, index * 8))
+        pod.putUint(&writing, c.get32(permissions, index * 8 + 4))
+        index += 1
+    }
+    const sent = sendPlain(core, proxy_module.idOf(object), CLIENT_UPDATE_PERMISSIONS, &writing, top)
+    return 0
+}

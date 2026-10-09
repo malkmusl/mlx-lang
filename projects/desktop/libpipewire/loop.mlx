@@ -1,0 +1,764 @@
+// pw_loop: the event loop, as SPA's loop interfaces (struct pw_loop is
+// four interface pointers: system, loop, control, utils, and programs call
+// through them: pw_loop_add_io, pw_loop_add_timer, pw_loop_iterate...).
+// Underneath: an epoll, the sources (I/O on a descriptor, an eventfd, a
+// timerfd, a signalfd, or an idle run before every poll), hooks called
+// around the poll (the thread loop gives its lock up there), and a queue
+// of functions other threads ask the loop to run (spa_loop_invoke). The
+// loop, its sources and the queue are C memory; the interfaces' functions
+// are exported, as C calls them.
+const std = @import("std")
+const c = @import("../libpulse/c.mlx")
+const hooks = @import("./hooks.mlx")
+const process = @import("./process.mlx")
+const util = @import("./util.mlx")
+
+extern("c") fn pthread_self() -> u64
+
+const SYS_read: usize = 0
+const SYS_write: usize = 1
+const SYS_close: usize = 3
+const SYS_rt_sigprocmask: usize = 14
+const SYS_gettid: usize = 186
+const SYS_epoll_wait: usize = 232
+const SYS_epoll_ctl: usize = 233
+const SYS_timerfd_create: usize = 283
+const SYS_timerfd_settime: usize = 286
+const SYS_timerfd_gettime: usize = 287
+const SYS_signalfd4: usize = 289
+const SYS_epoll_create1: usize = 291
+const SYS_futex: usize = 202
+
+// struct pw_loop, then the loop's own fields.
+pub const SIZE: usize = 512
+const SYSTEM: usize = 0
+const LOOP: usize = 8
+const CONTROL: usize = 16
+const UTILS: usize = 24
+const EPOLL: usize = 32
+const WAKE: usize = 40
+const SOURCES: usize = 48
+const THREAD_ID: usize = 56
+const ENTERED: usize = 60
+const HOOKS: usize = 64
+const CALLBACKS_FUNCS: usize = 80
+const CALLBACKS_DATA: usize = 88
+const IFACE_LOOP: usize = 96
+const IFACE_CONTROL: usize = 128
+const IFACE_UTILS: usize = 160
+const QUEUE_LOCK: usize = 192
+const QUEUE: usize = 208
+const QUEUE_HEAD: usize = 216
+const QUEUE_TAIL: usize = 220
+const DISPATCHING: usize = 224
+const IDLE_COUNT: usize = 228
+const DEAD: usize = 232
+const IFACE_SYSTEM: usize = 240
+const NAME: usize = 272
+
+// struct spa_source (loop, func, data, fd, mask, rmask, priv), then ours.
+pub const SOURCE: usize = 112
+pub const S_LOOP: usize = 0
+pub const S_FUNC: usize = 8
+pub const S_DATA: usize = 16
+pub const S_FD: usize = 24
+pub const S_MASK: usize = 28
+pub const S_RMASK: usize = 32
+const S_PRIV: usize = 40
+const S_KIND: usize = 48
+const S_CLOSE: usize = 52
+const S_CALLBACK: usize = 56
+const S_CALLBACK_DATA: usize = 64
+const S_ENABLED: usize = 72
+const S_DEAD: usize = 76
+const S_NEXT: usize = 80
+const S_SIGNAL: usize = 88
+
+const KIND_IO: u32 = 1
+const KIND_IDLE: u32 = 2
+const KIND_EVENT: u32 = 3
+const KIND_TIMER: u32 = 4
+const KIND_SIGNAL: u32 = 5
+// A source added with spa_loop_add_source: the program's own, called with
+// the source.
+const KIND_RAW: u32 = 6
+
+// The invoke queue: 64 entries of func, seq, size, data, user_data,
+// result, done (a futex word), block.
+const QUEUE_ENTRIES: usize = 64
+const ENTRY: usize = 64
+const E_FUNC: usize = 0
+const E_SEQ: usize = 8
+const E_SIZE: usize = 12
+const E_DATA: usize = 16
+const E_USER_DATA: usize = 24
+const E_RESULT: usize = 32
+const E_DONE: usize = 36
+const E_BLOCK: usize = 40
+
+// epoll's events are SPA's io masks (IN 1, OUT 4, ERR 8, HUP 16).
+const EPOLL_CTL_ADD: usize = 1
+const EPOLL_CTL_DEL: usize = 2
+const EPOLL_CTL_MOD: usize = 3
+
+// SPA_RESULT_RETURN_ASYNC
+fn asyncResult(seq: u32) -> i32 { return @bitCast(i32, (1 << 30) | (seq & 1073741823)) }
+
+fn thread() -> u32 { return @intCast(u32, std.linux.syscall0(SYS_gettid)) }
+
+// ---------------------------------------------------------------------------
+// The loop
+
+fn control(loop: usize, operation: usize, descriptor: isize, events: u32, token: usize) -> bool {
+    var record: [12]u8 = undefined
+    var bytes: [*]u8 = undefined
+    unsafe { bytes = @ptrCast([*]u8, &record) }
+    c.put32(@intFromPtr(bytes), 0, events)
+    bytes[4] = @intCast(u8, token & 255)
+    bytes[5] = @intCast(u8, (token >> 8) & 255)
+    bytes[6] = @intCast(u8, (token >> 16) & 255)
+    bytes[7] = @intCast(u8, (token >> 24) & 255)
+    bytes[8] = @intCast(u8, (token >> 32) & 255)
+    bytes[9] = @intCast(u8, (token >> 40) & 255)
+    bytes[10] = @intCast(u8, (token >> 48) & 255)
+    bytes[11] = @intCast(u8, (token >> 56) & 255)
+    return std.linux.syscall4(SYS_epoll_ctl, @bitCast(usize, c.getPointer(loop, EPOLL)), operation, @bitCast(usize, descriptor), @intFromPtr(bytes)) == 0
+}
+
+fn epollOf(loop: usize) -> isize { return @bitCast(isize, c.getPointer(loop, EPOLL)) }
+
+// The method tables, made once per process.
+fn tables() -> void {
+    if process.field(process.LOOP_METHODS) != 0 { return }
+    var table = hooks.table(4, 0)
+    hooks.set(table, 0, @intFromPtr(mlx_pw_loop_add_source))
+    hooks.set(table, 1, @intFromPtr(mlx_pw_loop_update_source))
+    hooks.set(table, 2, @intFromPtr(mlx_pw_loop_remove_source))
+    hooks.set(table, 3, @intFromPtr(mlx_pw_loop_invoke))
+    process.setField(process.LOOP_METHODS, table)
+    table = hooks.table(6, 1)
+    hooks.set(table, 0, @intFromPtr(mlx_pw_loop_get_fd))
+    hooks.set(table, 1, @intFromPtr(mlx_pw_loop_add_hook))
+    hooks.set(table, 2, @intFromPtr(mlx_pw_loop_enter))
+    hooks.set(table, 3, @intFromPtr(mlx_pw_loop_leave))
+    hooks.set(table, 4, @intFromPtr(mlx_pw_loop_iterate))
+    hooks.set(table, 5, @intFromPtr(mlx_pw_loop_check))
+    process.setField(process.LOOP_CONTROL_METHODS, table)
+    table = hooks.table(10, 0)
+    hooks.set(table, 0, @intFromPtr(mlx_pw_loop_add_io))
+    hooks.set(table, 1, @intFromPtr(mlx_pw_loop_update_io))
+    hooks.set(table, 2, @intFromPtr(mlx_pw_loop_add_idle))
+    hooks.set(table, 3, @intFromPtr(mlx_pw_loop_enable_idle))
+    hooks.set(table, 4, @intFromPtr(mlx_pw_loop_add_event))
+    hooks.set(table, 5, @intFromPtr(mlx_pw_loop_signal_event))
+    hooks.set(table, 6, @intFromPtr(mlx_pw_loop_add_timer))
+    hooks.set(table, 7, @intFromPtr(mlx_pw_loop_update_timer))
+    hooks.set(table, 8, @intFromPtr(mlx_pw_loop_add_signal))
+    hooks.set(table, 9, @intFromPtr(mlx_pw_loop_destroy_source))
+    process.setField(process.LOOP_UTILS_METHODS, table)
+    table = hooks.table(20, 0)
+    hooks.set(table, 0, @intFromPtr(mlx_pw_system_read))
+    hooks.set(table, 1, @intFromPtr(mlx_pw_system_write))
+    hooks.set(table, 2, @intFromPtr(mlx_pw_system_ioctl))
+    hooks.set(table, 3, @intFromPtr(mlx_pw_system_close))
+    hooks.set(table, 4, @intFromPtr(mlx_pw_system_clock_gettime))
+    hooks.set(table, 5, @intFromPtr(mlx_pw_system_clock_getres))
+    hooks.set(table, 6, @intFromPtr(mlx_pw_system_pollfd_create))
+    hooks.set(table, 7, @intFromPtr(mlx_pw_system_pollfd_add))
+    hooks.set(table, 8, @intFromPtr(mlx_pw_system_pollfd_mod))
+    hooks.set(table, 9, @intFromPtr(mlx_pw_system_pollfd_del))
+    hooks.set(table, 10, @intFromPtr(mlx_pw_system_pollfd_wait))
+    hooks.set(table, 11, @intFromPtr(mlx_pw_system_timerfd_create))
+    hooks.set(table, 12, @intFromPtr(mlx_pw_system_timerfd_settime))
+    hooks.set(table, 13, @intFromPtr(mlx_pw_system_timerfd_gettime))
+    hooks.set(table, 14, @intFromPtr(mlx_pw_system_timerfd_read))
+    hooks.set(table, 15, @intFromPtr(mlx_pw_system_eventfd_create))
+    hooks.set(table, 16, @intFromPtr(mlx_pw_system_eventfd_write))
+    hooks.set(table, 17, @intFromPtr(mlx_pw_system_eventfd_read))
+    hooks.set(table, 18, @intFromPtr(mlx_pw_system_signalfd_create))
+    hooks.set(table, 19, @intFromPtr(mlx_pw_system_signalfd_read))
+    process.setField(process.SYSTEM_METHODS, table)
+}
+
+// A loop: 0 when there is no memory or no epoll.
+pub fn new() -> usize {
+    tables()
+    const loop = c.alloc(SIZE)
+    if loop == 0 { return 0 }
+    const epoll = std.linux.syscall1(SYS_epoll_create1, 524288)
+    const wake = c.counter()
+    const queue = c.alloc(QUEUE_ENTRIES * ENTRY)
+    if epoll < 0 || wake < 0 || queue == 0 {
+        c.close(epoll)
+        c.close(wake)
+        c.release(queue)
+        c.release(loop)
+        return 0
+    }
+    c.putPointer(loop, EPOLL, @bitCast(usize, epoll))
+    c.putPointer(loop, WAKE, @bitCast(usize, wake))
+    c.putPointer(loop, QUEUE, queue)
+    hooks.init(loop + HOOKS)
+    // The wake-up counter's token is the loop itself.
+    const watched = control(loop, EPOLL_CTL_ADD, wake, 1, loop)
+    hooks.interface(loop + IFACE_LOOP, c.literal("Spa:Pointer:Interface:Loop"), 0, process.field(process.LOOP_METHODS), loop)
+    hooks.interface(loop + IFACE_CONTROL, c.literal("Spa:Pointer:Interface:LoopControl"), 1, process.field(process.LOOP_CONTROL_METHODS), loop)
+    hooks.interface(loop + IFACE_UTILS, c.literal("Spa:Pointer:Interface:LoopUtils"), 0, process.field(process.LOOP_UTILS_METHODS), loop)
+    hooks.interface(loop + IFACE_SYSTEM, c.literal("Spa:Pointer:Interface:System"), 0, process.field(process.SYSTEM_METHODS), loop)
+    c.putPointer(loop, SYSTEM, loop + IFACE_SYSTEM)
+    c.putPointer(loop, LOOP, loop + IFACE_LOOP)
+    c.putPointer(loop, CONTROL, loop + IFACE_CONTROL)
+    c.putPointer(loop, UTILS, loop + IFACE_UTILS)
+    return loop
+}
+
+pub fn free(loop: usize) -> void {
+    if loop == 0 { return }
+    while c.getPointer(loop, SOURCES) != 0 { destroySource(loop, c.getPointer(loop, SOURCES)) }
+    freeDead(loop)
+    hooks.clean(loop + HOOKS)
+    c.close(epollOf(loop))
+    c.close(@bitCast(isize, c.getPointer(loop, WAKE)))
+    c.release(c.getPointer(loop, QUEUE))
+    c.release(loop)
+}
+
+// The loop a spa_loop, spa_loop_control or spa_loop_utils interface
+// pointer belongs to (the interface's data).
+pub fn ofInterface(iface: usize) -> usize { return c.getPointer(iface, 24) }
+
+pub fn descriptor(loop: usize) -> isize { return epollOf(loop) }
+
+// Whether this thread runs the loop (it entered it), or nobody does.
+pub fn inThread(loop: usize) -> bool {
+    const owner = c.get32(loop, THREAD_ID)
+    return owner == 0 || owner == thread()
+}
+
+pub fn isOwned(loop: usize) -> bool { return c.get32(loop, THREAD_ID) == thread() && c.get32(loop, ENTERED) > 0 }
+
+pub fn enter(loop: usize) -> void {
+    const depth = c.get32(loop, ENTERED)
+    if depth == 0 { c.put32(loop, THREAD_ID, thread()) }
+    c.put32(loop, ENTERED, depth + 1)
+}
+
+pub fn leave(loop: usize) -> void {
+    const depth = c.get32(loop, ENTERED)
+    if depth == 0 { return }
+    c.put32(loop, ENTERED, depth - 1)
+    if depth == 1 { c.put32(loop, THREAD_ID, 0) }
+}
+
+pub fn wakeup(loop: usize) -> void { c.bump(@bitCast(isize, c.getPointer(loop, WAKE))) }
+
+// ---------------------------------------------------------------------------
+// Sources
+
+fn addSource(loop: usize, kind: u32, fd: isize, mask: u32, callback: usize, data: usize) -> usize {
+    const source = c.alloc(SOURCE)
+    if source == 0 { return 0 }
+    c.putPointer(source, S_LOOP, loop + IFACE_LOOP)
+    c.put32(source, S_FD, @bitCast(u32, @intCast(i32, fd)))
+    c.put32(source, S_MASK, mask)
+    c.put32(source, S_KIND, kind)
+    c.putPointer(source, S_CALLBACK, callback)
+    c.putPointer(source, S_CALLBACK_DATA, data)
+    c.putPointer(source, S_NEXT, c.getPointer(loop, SOURCES))
+    c.putPointer(loop, SOURCES, source)
+    return source
+}
+
+fn watch(loop: usize, source: usize) -> bool {
+    const fd = @intCast(isize, @bitCast(i32, c.get32(source, S_FD)))
+    if fd < 0 { return true }
+    return control(loop, EPOLL_CTL_ADD, fd, c.get32(source, S_MASK), source)
+}
+
+fn fdOf(source: usize) -> isize { return @intCast(isize, @bitCast(i32, c.get32(source, S_FD))) }
+
+// spa_loop_add_source: the program's own source (its func is called with
+// the source) on its descriptor.
+pub fn addRaw(loop: usize, source: usize) -> i32 {
+    c.putPointer(source, S_LOOP, loop + IFACE_LOOP)
+    if !control(loop, EPOLL_CTL_ADD, fdOf(source), c.get32(source, S_MASK), source) { return util.EIO }
+    // Its words after the public ones are the program's: nothing kept
+    // there. It is not on the list (the program owns it).
+    return 0
+}
+
+pub fn updateRaw(loop: usize, source: usize) -> i32 {
+    if !control(loop, EPOLL_CTL_MOD, fdOf(source), c.get32(source, S_MASK), source) { return util.EIO }
+    return 0
+}
+
+pub fn removeRaw(loop: usize, source: usize) -> i32 {
+    const removed = control(loop, EPOLL_CTL_DEL, fdOf(source), 0, 0)
+    c.putPointer(source, S_LOOP, 0)
+    return 0
+}
+
+pub fn addIo(loop: usize, fd: isize, mask: u32, close: bool, callback: usize, data: usize) -> usize {
+    const source = addSource(loop, KIND_IO, fd, mask, callback, data)
+    if source == 0 { return 0 }
+    c.put32(source, S_CLOSE, if close { 1 } else { 0 })
+    if !watch(loop, source) {
+        destroySource(loop, source)
+        return 0
+    }
+    return source
+}
+
+pub fn updateIo(loop: usize, source: usize, mask: u32) -> i32 {
+    if c.get32(source, S_MASK) == mask { return 0 }
+    c.put32(source, S_MASK, mask)
+    if !control(loop, EPOLL_CTL_MOD, fdOf(source), mask, source) { return util.EIO }
+    return 0
+}
+
+pub fn addIdle(loop: usize, enabled: bool, callback: usize, data: usize) -> usize {
+    const source = addSource(loop, KIND_IDLE, -1, 0, callback, data)
+    if source == 0 { return 0 }
+    const result = enableIdle(loop, source, enabled)
+    return source
+}
+
+pub fn enableIdle(loop: usize, source: usize, enabled: bool) -> i32 {
+    const was = c.get32(source, S_ENABLED) != 0
+    if was == enabled { return 0 }
+    c.put32(source, S_ENABLED, if enabled { 1 } else { 0 })
+    const count = c.get32(loop, IDLE_COUNT)
+    c.put32(loop, IDLE_COUNT, if enabled { count + 1 } else { count - 1 })
+    if enabled { wakeup(loop) }
+    return 0
+}
+
+pub fn addEvent(loop: usize, callback: usize, data: usize) -> usize {
+    const fd = c.counter()
+    if fd < 0 { return 0 }
+    const source = addSource(loop, KIND_EVENT, fd, 1, callback, data)
+    if source == 0 || !watch(loop, source) {
+        if source != 0 { destroySource(loop, source) } else { c.close(fd) }
+        return 0
+    }
+    return source
+}
+
+pub fn signalEvent(loop: usize, source: usize) -> i32 {
+    c.bump(fdOf(source))
+    return 0
+}
+
+pub fn addTimer(loop: usize, callback: usize, data: usize) -> usize {
+    // CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC
+    const fd = std.linux.syscall2(SYS_timerfd_create, 1, 526336)
+    if fd < 0 { return 0 }
+    const source = addSource(loop, KIND_TIMER, fd, 1, callback, data)
+    if source == 0 || !watch(loop, source) {
+        if source != 0 { destroySource(loop, source) } else { c.close(fd) }
+        return 0
+    }
+    return source
+}
+
+// spa_loop_utils_update_timer: the first expiry `value` (a timespec, 0 or
+// zero to disarm) and the `interval` after it; `absolute`: the value is a
+// time of the monotonic clock.
+pub fn updateTimer(loop: usize, source: usize, value: usize, interval: usize, absolute: bool) -> i32 {
+    var spec: [4]usize = [4]usize{ 0, 0, 0, 0 }
+    if interval != 0 {
+        spec[0] = c.getPointer(interval, 0)
+        spec[1] = c.getPointer(interval, 8)
+    }
+    if value != 0 {
+        spec[2] = c.getPointer(value, 0)
+        spec[3] = c.getPointer(value, 8)
+    }
+    const flags: usize = if absolute { 1 } else { 0 }
+    const result = std.linux.syscall4(SYS_timerfd_settime, @bitCast(usize, fdOf(source)), flags, @intFromPtr(&spec), 0)
+    if result < 0 { return @intCast(i32, result) }
+    return 0
+}
+
+pub fn addSignal(loop: usize, signal_number: i32, callback: usize, data: usize) -> usize {
+    if signal_number < 1 || signal_number > 64 { return 0 }
+    var mask: u64 = 1 << @intCast(u6, signal_number - 1)
+    // The signal has to be blocked to come through the descriptor.
+    const blocked = std.linux.syscall4(SYS_rt_sigprocmask, 0, @intFromPtr(&mask), 0, 8)
+    // SFD_NONBLOCK | SFD_CLOEXEC
+    const fd = std.linux.syscall4(SYS_signalfd4, @bitCast(usize, @intCast(isize, -1)), @intFromPtr(&mask), 8, 526336)
+    if fd < 0 { return 0 }
+    const source = addSource(loop, KIND_SIGNAL, fd, 1, callback, data)
+    if source == 0 || !watch(loop, source) {
+        if source != 0 { destroySource(loop, source) } else { c.close(fd) }
+        return 0
+    }
+    c.put32(source, S_SIGNAL, @bitCast(u32, signal_number))
+    return source
+}
+
+fn unlinkSource(loop: usize, source: usize) -> void {
+    var at = c.getPointer(loop, SOURCES)
+    var before: usize = 0
+    while at != 0 && at != source {
+        before = at
+        at = c.getPointer(at, S_NEXT)
+    }
+    if at == 0 { return }
+    if before == 0 {
+        c.putPointer(loop, SOURCES, c.getPointer(source, S_NEXT))
+    } else {
+        c.putPointer(before, S_NEXT, c.getPointer(source, S_NEXT))
+    }
+}
+
+// Ends a source: taken off the epoll and the list, its descriptor closed
+// when the loop made it (or was told to); freed now, or after the
+// dispatch that is running (its events may still name it).
+pub fn destroySource(loop: usize, source: usize) -> void {
+    if source == 0 || c.get32(source, S_DEAD) != 0 { return }
+    const kind = c.get32(source, S_KIND)
+    const fd = fdOf(source)
+    if kind == KIND_IDLE && c.get32(source, S_ENABLED) != 0 { c.put32(loop, IDLE_COUNT, c.get32(loop, IDLE_COUNT) - 1) }
+    if fd >= 0 {
+        const removed = control(loop, EPOLL_CTL_DEL, fd, 0, 0)
+        if kind != KIND_IO || c.get32(source, S_CLOSE) != 0 { c.close(fd) }
+    }
+    c.put32(source, S_FD, @bitCast(u32, @intCast(i32, -1)))
+    unlinkSource(loop, source)
+    c.put32(source, S_DEAD, 1)
+    if c.get32(loop, DISPATCHING) != 0 {
+        c.putPointer(source, S_NEXT, c.getPointer(loop, DEAD))
+        c.putPointer(loop, DEAD, source)
+    } else {
+        c.release(source)
+    }
+}
+
+fn freeDead(loop: usize) -> void {
+    var source = c.getPointer(loop, DEAD)
+    while source != 0 {
+        const next = c.getPointer(source, S_NEXT)
+        c.release(source)
+        source = next
+    }
+    c.putPointer(loop, DEAD, 0)
+}
+
+// ---------------------------------------------------------------------------
+// Invoking: a function run on the loop's thread (spa_loop_invoke): at
+// once when this is that thread (or none is), else queued and the loop
+// woken; `block` waits for its result.
+
+pub const Invoke = fn(usize, bool, u32, usize, usize, usize) -> i32
+
+fn callInvoke(loop: usize, function: usize, is_async: bool, seq: u32, data: usize, size: usize, user_data: usize) -> i32 {
+    if function == 0 { return 0 }
+    var target: Invoke = undefined
+    unsafe { target = @ptrFromInt(Invoke, function) }
+    return target(loop + IFACE_LOOP, is_async, seq, data, size, user_data)
+}
+
+pub fn invoke(loop: usize, function: usize, seq: u32, data: usize, size: usize, block: bool, user_data: usize) -> i32 {
+    if inThread(loop) { return callInvoke(loop, function, false, seq, data, size, user_data) }
+    c.lock(loop + QUEUE_LOCK)
+    const head = c.get32(loop, QUEUE_HEAD)
+    const tail = c.get32(loop, QUEUE_TAIL)
+    if tail - head >= @intCast(u32, QUEUE_ENTRIES) {
+        c.unlock(loop + QUEUE_LOCK)
+        return util.EPIPE
+    }
+    const entry = c.getPointer(loop, QUEUE) + @intCast(usize, tail % @intCast(u32, QUEUE_ENTRIES)) * ENTRY
+    c.putPointer(entry, E_FUNC, function)
+    c.put32(entry, E_SEQ, seq)
+    c.put32(entry, E_SIZE, @intCast(u32, size))
+    var copy: usize = 0
+    if data != 0 && size > 0 {
+        copy = c.alloc(size)
+        if copy != 0 { c.copy(copy, data, size) }
+    }
+    c.putPointer(entry, E_DATA, copy)
+    c.putPointer(entry, E_USER_DATA, user_data)
+    c.put32(entry, E_RESULT, 0)
+    c.put32(entry, E_DONE, 0)
+    c.put32(entry, E_BLOCK, if block { 1 } else { 0 })
+    c.put32(loop, QUEUE_TAIL, tail + 1)
+    c.unlock(loop + QUEUE_LOCK)
+    wakeup(loop)
+    if !block { return asyncResult(seq) }
+    // FUTEX_WAIT_PRIVATE until the loop said done.
+    while c.get32(entry, E_DONE) == 0 { const waited = std.linux.syscall4(SYS_futex, entry + E_DONE, 128, 0, 0) }
+    return @bitCast(i32, c.get32(entry, E_RESULT))
+}
+
+fn runInvokes(loop: usize) -> void {
+    while true {
+        c.lock(loop + QUEUE_LOCK)
+        const head = c.get32(loop, QUEUE_HEAD)
+        if head == c.get32(loop, QUEUE_TAIL) {
+            c.unlock(loop + QUEUE_LOCK)
+            return
+        }
+        const entry = c.getPointer(loop, QUEUE) + @intCast(usize, head % @intCast(u32, QUEUE_ENTRIES)) * ENTRY
+        c.unlock(loop + QUEUE_LOCK)
+        const data = c.getPointer(entry, E_DATA)
+        const result = callInvoke(loop, c.getPointer(entry, E_FUNC), true, c.get32(entry, E_SEQ), data, @intCast(usize, c.get32(entry, E_SIZE)), c.getPointer(entry, E_USER_DATA))
+        c.release(data)
+        c.put32(entry, E_RESULT, @bitCast(u32, result))
+        c.put32(entry, E_DONE, 1)
+        // FUTEX_WAKE_PRIVATE
+        if c.get32(entry, E_BLOCK) != 0 { const woken = std.linux.syscall3(SYS_futex, entry + E_DONE, 129, 1) }
+        c.lock(loop + QUEUE_LOCK)
+        c.put32(loop, QUEUE_HEAD, head + 1)
+        c.unlock(loop + QUEUE_LOCK)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Running
+
+pub fn addHook(loop: usize, hook: usize, funcs: usize, data: usize) -> void { hooks.append(loop + HOOKS, hook, funcs, data) }
+
+fn dispatch(loop: usize, source: usize, events: u32) -> void {
+    if c.get32(source, S_DEAD) != 0 { return }
+    c.put32(source, S_RMASK, events)
+    const kind = c.get32(source, S_KIND)
+    const callback = c.getPointer(source, S_CALLBACK)
+    const data = c.getPointer(source, S_CALLBACK_DATA)
+    const fd = fdOf(source)
+    if kind == KIND_IO {
+        c.call3(callback, data, @bitCast(usize, fd), @intCast(usize, events))
+    } else if kind == KIND_EVENT {
+        var count: u64 = 0
+        const got = std.linux.syscall3(SYS_read, @bitCast(usize, fd), @intFromPtr(&count), 8)
+        if got == 8 { c.call2(callback, data, @intCast(usize, count)) }
+    } else if kind == KIND_TIMER {
+        var expirations: u64 = 0
+        const got = std.linux.syscall3(SYS_read, @bitCast(usize, fd), @intFromPtr(&expirations), 8)
+        if got == 8 { c.call2(callback, data, @intCast(usize, expirations)) }
+    } else if kind == KIND_SIGNAL {
+        var info: [128]u8 = undefined
+        const got = std.linux.syscall3(SYS_read, @bitCast(usize, fd), @intFromPtr(&info), 128)
+        if got == 128 { c.call2(callback, data, @intCast(usize, c.get32(source, S_SIGNAL))) }
+    }
+}
+
+// One turn of the loop: the idle sources, a poll of at most `timeout`
+// milliseconds (-1: as long as it takes; the hooks are called before and
+// after it), and what the descriptors say. How many sources were ready,
+// or a negative errno.
+pub fn iterate(loop: usize, timeout: i32) -> i32 {
+    freeDead(loop)
+    var events: [64 * 12]u8 = undefined
+    var bytes: [*]u8 = undefined
+    unsafe { bytes = @ptrCast([*]u8, &events) }
+    const wait: usize = if c.get32(loop, IDLE_COUNT) > 0 { 0 } else { c.int(timeout) }
+    hooks.call0(loop + HOOKS, 0, 0)
+    const count = std.linux.syscall4(SYS_epoll_wait, @bitCast(usize, epollOf(loop)), @intFromPtr(bytes), 64, wait)
+    hooks.call0(loop + HOOKS, 1, 0)
+    if count < 0 {
+        if count == -4 { return 0 }
+        return @intCast(i32, count)
+    }
+    c.put32(loop, DISPATCHING, 1)
+    var index: usize = 0
+    while index < @bitCast(usize, count) {
+        const at = @intFromPtr(bytes) + index * 12
+        const ready = c.get32(at, 0)
+        var token: usize = 0
+        var byte: usize = 0
+        while byte < 8 {
+            token = token | (@intCast(usize, bytes[index * 12 + 4 + byte]) << @intCast(u6, byte * 8))
+            byte += 1
+        }
+        if token == loop {
+            c.drain(@bitCast(isize, c.getPointer(loop, WAKE)))
+            runInvokes(loop)
+        } else if token != 0 {
+            // A raw source (the program's) has no kind: its func gets it.
+            if c.get32(token, S_KIND) == 0 {
+                c.put32(token, S_RMASK, ready)
+                c.call1(c.getPointer(token, S_FUNC), token)
+            } else {
+                dispatch(loop, token, ready)
+            }
+        }
+        index += 1
+    }
+    if c.get32(loop, IDLE_COUNT) > 0 {
+        var source = c.getPointer(loop, SOURCES)
+        while source != 0 {
+            const next = c.getPointer(source, S_NEXT)
+            if c.get32(source, S_KIND) == KIND_IDLE && c.get32(source, S_ENABLED) != 0 && c.get32(source, S_DEAD) == 0 { c.call1(c.getPointer(source, S_CALLBACK), c.getPointer(source, S_CALLBACK_DATA)) }
+            source = next
+        }
+    }
+    c.put32(loop, DISPATCHING, 0)
+    freeDead(loop)
+    return @intCast(i32, count)
+}
+
+pub fn setCallbacks(loop: usize, funcs: usize, data: usize) -> void {
+    c.putPointer(loop, CALLBACKS_FUNCS, funcs)
+    c.putPointer(loop, CALLBACKS_DATA, data)
+}
+
+// pw_loop_check: whether the caller may use the loop now: 1 when it runs
+// it (or holds the thread loop's lock, which the thread loop's check
+// says), -EPERM when another thread does.
+pub fn check(loop: usize) -> i32 {
+    const funcs = c.getPointer(loop, CALLBACKS_FUNCS)
+    if funcs != 0 && hooks.has(funcs, 0, 0) { return @intCast(i32, @bitCast(isize, c.call2Result(hooks.methodOf(funcs, 0), c.getPointer(loop, CALLBACKS_DATA), loop))) }
+    if isOwned(loop) { return 1 }
+    if c.get32(loop, THREAD_ID) == 0 { return 1 }
+    return -1
+}
+
+// ---------------------------------------------------------------------------
+// The interfaces' functions (C calls them with the loop as `object`)
+
+export fn mlx_pw_loop_add_source(object: usize, source: usize) -> i32 { return addRaw(object, source) }
+
+export fn mlx_pw_loop_update_source(object: usize, source: usize) -> i32 { return updateRaw(object, source) }
+
+export fn mlx_pw_loop_remove_source(object: usize, source: usize) -> i32 { return removeRaw(object, source) }
+
+export fn mlx_pw_loop_invoke(object: usize, function: usize, seq: u32, data: usize, size: usize, block: u8, user_data: usize) -> i32 { return invoke(object, function, seq, data, size, block != 0, user_data) }
+
+export fn mlx_pw_loop_get_fd(object: usize) -> i32 { return @intCast(i32, descriptor(object)) }
+
+export fn mlx_pw_loop_add_hook(object: usize, hook: usize, funcs: usize, data: usize) -> void { addHook(object, hook, funcs, data) }
+
+export fn mlx_pw_loop_enter(object: usize) -> void { enter(object) }
+
+export fn mlx_pw_loop_leave(object: usize) -> void { leave(object) }
+
+export fn mlx_pw_loop_iterate(object: usize, timeout: i32) -> i32 { return iterate(object, timeout) }
+
+export fn mlx_pw_loop_check(object: usize) -> i32 {
+    if isOwned(object) { return 1 }
+    if c.get32(object, THREAD_ID) == 0 { return 1 }
+    return -1
+}
+
+export fn mlx_pw_loop_add_io(object: usize, fd: i32, mask: u32, close: u8, callback: usize, data: usize) -> usize { return addIo(object, @intCast(isize, fd), mask, close != 0, callback, data) }
+
+export fn mlx_pw_loop_update_io(object: usize, source: usize, mask: u32) -> i32 { return updateIo(object, source, mask) }
+
+export fn mlx_pw_loop_add_idle(object: usize, enabled: u8, callback: usize, data: usize) -> usize { return addIdle(object, enabled != 0, callback, data) }
+
+export fn mlx_pw_loop_enable_idle(object: usize, source: usize, enabled: u8) -> i32 { return enableIdle(object, source, enabled != 0) }
+
+export fn mlx_pw_loop_add_event(object: usize, callback: usize, data: usize) -> usize { return addEvent(object, callback, data) }
+
+export fn mlx_pw_loop_signal_event(object: usize, source: usize) -> i32 { return signalEvent(object, source) }
+
+export fn mlx_pw_loop_add_timer(object: usize, callback: usize, data: usize) -> usize { return addTimer(object, callback, data) }
+
+export fn mlx_pw_loop_update_timer(object: usize, source: usize, value: usize, interval: usize, absolute: u8) -> i32 { return updateTimer(object, source, value, interval, absolute != 0) }
+
+export fn mlx_pw_loop_add_signal(object: usize, signal_number: i32, callback: usize, data: usize) -> usize { return addSignal(object, signal_number, callback, data) }
+
+export fn mlx_pw_loop_destroy_source(object: usize, source: usize) -> void { destroySource(object, source) }
+
+// spa_system: the system calls PipeWire's code reaches through the loop's
+// `system` (what a program's own SPA plugins would use).
+fn errnoOf(result: isize) -> i32 { return if result < 0 { @intCast(i32, result) } else { 0 } }
+
+export fn mlx_pw_system_read(object: usize, fd: i32, buffer: usize, count: usize) -> isize { return std.linux.syscall3(SYS_read, c.int(fd), buffer, count) }
+
+export fn mlx_pw_system_write(object: usize, fd: i32, buffer: usize, count: usize) -> isize { return std.linux.syscall3(SYS_write, c.int(fd), buffer, count) }
+
+export fn mlx_pw_system_ioctl(object: usize, fd: i32, request: usize, argument: usize) -> i32 { return @intCast(i32, std.linux.syscall3(16, c.int(fd), request, argument)) }
+
+export fn mlx_pw_system_close(object: usize, fd: i32) -> i32 { return errnoOf(std.linux.syscall1(SYS_close, c.int(fd))) }
+
+export fn mlx_pw_system_clock_gettime(object: usize, clock: i32, time: usize) -> i32 { return errnoOf(std.linux.syscall2(228, c.int(clock), time)) }
+
+export fn mlx_pw_system_clock_getres(object: usize, clock: i32, time: usize) -> i32 { return errnoOf(std.linux.syscall2(229, c.int(clock), time)) }
+
+export fn mlx_pw_system_pollfd_create(object: usize, flags: i32) -> i32 { return @intCast(i32, std.linux.syscall1(SYS_epoll_create1, if flags & 524288 != 0 { 524288 } else { 0 })) }
+
+fn pollfdControl(operation: usize, pfd: i32, fd: i32, events: u32, data: usize) -> i32 {
+    var record: [12]u8 = undefined
+    var bytes: [*]u8 = undefined
+    unsafe { bytes = @ptrCast([*]u8, &record) }
+    c.put32(@intFromPtr(bytes), 0, events)
+    var byte: usize = 0
+    while byte < 8 {
+        bytes[4 + byte] = @intCast(u8, (data >> @intCast(u6, byte * 8)) & 255)
+        byte += 1
+    }
+    return errnoOf(std.linux.syscall4(SYS_epoll_ctl, c.int(pfd), operation, c.int(fd), @intFromPtr(bytes)))
+}
+
+export fn mlx_pw_system_pollfd_add(object: usize, pfd: i32, fd: i32, events: u32, data: usize) -> i32 { return pollfdControl(EPOLL_CTL_ADD, pfd, fd, events, data) }
+
+export fn mlx_pw_system_pollfd_mod(object: usize, pfd: i32, fd: i32, events: u32, data: usize) -> i32 { return pollfdControl(EPOLL_CTL_MOD, pfd, fd, events, data) }
+
+export fn mlx_pw_system_pollfd_del(object: usize, pfd: i32, fd: i32) -> i32 { return pollfdControl(EPOLL_CTL_DEL, pfd, fd, 0, 0) }
+
+// pollfd_wait(pfd, struct spa_poll_event *ev, n_ev, timeout): spa_poll_event
+// is events and data, as epoll's record but padded to 16 bytes.
+export fn mlx_pw_system_pollfd_wait(object: usize, pfd: i32, out: usize, count: i32, timeout: i32) -> i32 {
+    if count <= 0 || count > 64 { return util.EINVAL }
+    var events: [64 * 12]u8 = undefined
+    var bytes: [*]u8 = undefined
+    unsafe { bytes = @ptrCast([*]u8, &events) }
+    const got = std.linux.syscall4(SYS_epoll_wait, c.int(pfd), @intFromPtr(bytes), @intCast(usize, count), c.int(timeout))
+    if got < 0 { return @intCast(i32, got) }
+    var index: usize = 0
+    while index < @bitCast(usize, got) {
+        c.put32(out + index * 16, 0, c.get32(@intFromPtr(bytes), index * 12))
+        var token: usize = 0
+        var byte: usize = 0
+        while byte < 8 {
+            token = token | (@intCast(usize, bytes[index * 12 + 4 + byte]) << @intCast(u6, byte * 8))
+            byte += 1
+        }
+        c.putPointer(out + index * 16, 8, token)
+        index += 1
+    }
+    return @intCast(i32, got)
+}
+
+export fn mlx_pw_system_timerfd_create(object: usize, clock: i32, flags: i32) -> i32 { return @intCast(i32, std.linux.syscall2(SYS_timerfd_create, c.int(clock), c.int(flags))) }
+
+export fn mlx_pw_system_timerfd_settime(object: usize, fd: i32, flags: i32, new_value: usize, old_value: usize) -> i32 { return errnoOf(std.linux.syscall4(SYS_timerfd_settime, c.int(fd), c.int(flags), new_value, old_value)) }
+
+export fn mlx_pw_system_timerfd_gettime(object: usize, fd: i32, value: usize) -> i32 { return errnoOf(std.linux.syscall2(SYS_timerfd_gettime, c.int(fd), value)) }
+
+export fn mlx_pw_system_timerfd_read(object: usize, fd: i32, expirations: usize) -> i32 {
+    const got = std.linux.syscall3(SYS_read, c.int(fd), expirations, 8)
+    if got < 0 { return @intCast(i32, got) }
+    return if got == 8 { 0 } else { util.EIO }
+}
+
+export fn mlx_pw_system_eventfd_create(object: usize, flags: i32) -> i32 { return @intCast(i32, std.linux.syscall2(290, 0, c.int(flags))) }
+
+export fn mlx_pw_system_eventfd_write(object: usize, fd: i32, count: u64) -> i32 {
+    var value = count
+    return errnoOf(std.linux.syscall3(SYS_write, c.int(fd), @intFromPtr(&value), 8))
+}
+
+export fn mlx_pw_system_eventfd_read(object: usize, fd: i32, count: usize) -> i32 {
+    const got = std.linux.syscall3(SYS_read, c.int(fd), count, 8)
+    if got < 0 { return @intCast(i32, got) }
+    return if got == 8 { 0 } else { util.EIO }
+}
+
+export fn mlx_pw_system_signalfd_create(object: usize, signal_number: i32, flags: i32) -> i32 {
+    if signal_number < 1 || signal_number > 64 { return util.EINVAL }
+    var mask: u64 = 1 << @intCast(u6, signal_number - 1)
+    return @intCast(i32, std.linux.syscall4(SYS_signalfd4, @bitCast(usize, @intCast(isize, -1)), @intFromPtr(&mask), 8, c.int(flags)))
+}
+
+export fn mlx_pw_system_signalfd_read(object: usize, fd: i32, signal_number: usize) -> i32 {
+    var info: [128]u8 = undefined
+    const got = std.linux.syscall3(SYS_read, c.int(fd), @intFromPtr(&info), 128)
+    if got < 0 { return @intCast(i32, got) }
+    if got != 128 { return util.EIO }
+    // signalfd_siginfo starts with ssi_signo.
+    c.put32(signal_number, 0, c.get32(@intFromPtr(&info), 0))
+    return 0
+}

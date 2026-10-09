@@ -1,0 +1,358 @@
+// pw_thread_loop: a pw_loop on a thread of its own, with the lock programs
+// take around everything they do with the library (the thread holds it
+// while it dispatches and gives it up while it polls, through the loop's
+// hooks), a condition the callbacks signal and the program waits on, and
+// the accept handshake. Also pw_main_loop (the loop run on the calling
+// thread until quit) and pw_data_loop (a loop on a thread without the
+// lock, as PipeWire's own data loop), which share the thread.
+const std = @import("std")
+const turns_module = @import("std.turns")
+const c = @import("../libpulse/c.mlx")
+const hooks = @import("./hooks.mlx")
+const loop_module = @import("./loop.mlx")
+const properties = @import("./properties.mlx")
+const util = @import("./util.mlx")
+
+extern("c") fn pthread_setname_np(thread: u64, name: [*]const u8) -> i32
+extern("c") fn pthread_self() -> u64
+
+pub const SIZE: usize = 224
+const LOOP: usize = 0
+const CREATED: usize = 8
+const RECURSE: usize = 12
+const NAME: usize = 16
+const LISTENERS: usize = 32
+const MUTEX: usize = 48
+const COND: usize = 64
+const ACCEPT: usize = 72
+const THREAD: usize = 80
+const N_WAITING: usize = 88
+const N_WAITING_FOR_ACCEPT: usize = 92
+const RUNNING: usize = 96
+const THREAD_ID: usize = 100
+const STOP_EVENT: usize = 104
+const START_SIGNAL: usize = 112
+const HOOK: usize = 120
+const HOOK_TABLE: usize = 168
+const CHECK_TABLE: usize = 192
+
+fn thread() -> u32 { return @intCast(u32, std.linux.syscall0(186)) }
+
+// The loop's hooks around its poll: the lock given up (at whatever depth
+// it was held) and taken again.
+export fn mlx_pw_thread_loop_before(threaded: usize) -> void {
+    const mutex = threaded + MUTEX
+    c.put32(threaded, RECURSE, c.get32(mutex, 8))
+    c.put32(mutex, 8, 1)
+    c.unlock(mutex)
+}
+
+export fn mlx_pw_thread_loop_after(threaded: usize) -> void {
+    const mutex = threaded + MUTEX
+    c.lock(mutex)
+    c.put32(mutex, 8, c.get32(threaded, RECURSE))
+}
+
+// pw_loop_check for a loop a thread loop runs: fine from the loop's thread
+// and for whoever holds the lock; -EPERM for anyone else.
+export fn mlx_pw_thread_loop_check(threaded: usize, loop: usize) -> i32 {
+    if loop_module.isOwned(loop) { return 1 }
+    if c.holding(threaded + MUTEX) { return 1 }
+    return -1
+}
+
+export fn mlx_pw_thread_loop_stop_event(threaded: usize, count: u64) -> void { c.put32(threaded, RUNNING, 0) }
+
+// The loop's thread: signals stay with the program's other threads.
+export fn mlx_pw_thread_loop_main(threaded: usize) -> usize {
+    var all: u64 = 18446744073709551615
+    const masked = std.linux.syscall4(14, 0, @intFromPtr(&all), 0, 8)
+    c.put32(threaded, THREAD_ID, thread())
+    const named = pthread_setname_np(pthread_self(), c.bytes(threaded + NAME))
+    const loop = c.getPointer(threaded, LOOP)
+    c.lock(threaded + MUTEX)
+    loop_module.enter(loop)
+    if c.get32(threaded, START_SIGNAL) != 0 { signal(threaded, false) }
+    var turns: turns_module.Turns = undefined
+    turns_module.begin(&turns, true, false)
+    while c.get32(threaded, RUNNING) != 0 {
+        turns_module.turn(&turns)
+        const result = loop_module.iterate(loop, -1)
+        if result < 0 && result != -4 { break }
+    }
+    loop_module.leave(loop)
+    c.unlock(threaded + MUTEX)
+    return 0
+}
+
+// A thread loop around `loop` (0: a loop of its own) named `name`;
+// `props` may ask for "thread-loop.start-signal".
+pub fn new(loop: usize, name: usize, props: usize) -> usize {
+    const threaded = c.alloc(SIZE)
+    if threaded == 0 { return 0 }
+    var owned = loop
+    if owned == 0 {
+        owned = loop_module.new()
+        if owned == 0 {
+            c.release(threaded)
+            return 0
+        }
+        c.put32(threaded, CREATED, 1)
+    }
+    c.putPointer(threaded, LOOP, owned)
+    var out = c.out(threaded + NAME, 16)
+    c.append(&out, if name != 0 { c.slice(name) } else { "pw-thread-loop" })
+    if props != 0 {
+        const start = properties.dictLookup(props, "thread-loop.start-signal")
+        if start != 0 && properties.parseBool(c.slice(start)) { c.put32(threaded, START_SIGNAL, 1) }
+    }
+    hooks.init(threaded + LISTENERS)
+    // struct spa_loop_control_hooks: version, before, after.
+    c.put32(threaded + HOOK_TABLE, 0, 0)
+    c.putPointer(threaded + HOOK_TABLE, 8, @intFromPtr(mlx_pw_thread_loop_before))
+    c.putPointer(threaded + HOOK_TABLE, 16, @intFromPtr(mlx_pw_thread_loop_after))
+    loop_module.addHook(owned, threaded + HOOK, threaded + HOOK_TABLE, threaded)
+    // struct pw_loop_callbacks: version, check.
+    c.put32(threaded + CHECK_TABLE, 0, 0)
+    c.putPointer(threaded + CHECK_TABLE, 8, @intFromPtr(mlx_pw_thread_loop_check))
+    loop_module.setCallbacks(owned, threaded + CHECK_TABLE, threaded)
+    c.putPointer(threaded, STOP_EVENT, loop_module.addEvent(owned, @intFromPtr(mlx_pw_thread_loop_stop_event), threaded))
+    return threaded
+}
+
+pub fn free(threaded: usize) -> void {
+    if threaded == 0 { return }
+    hooks.call0(threaded + LISTENERS, 0, 0)
+    stop(threaded)
+    const loop = c.getPointer(threaded, LOOP)
+    loop_module.setCallbacks(loop, 0, 0)
+    hooks.remove(threaded + HOOK)
+    hooks.clean(threaded + LISTENERS)
+    loop_module.destroySource(loop, c.getPointer(threaded, STOP_EVENT))
+    if c.get32(threaded, CREATED) != 0 { loop_module.free(loop) }
+    c.release(threaded)
+}
+
+pub fn addListener(threaded: usize, hook: usize, events: usize, data: usize) -> void { hooks.append(threaded + LISTENERS, hook, events, data) }
+
+pub fn loopOf(threaded: usize) -> usize { return c.getPointer(threaded, LOOP) }
+
+pub fn start(threaded: usize) -> i32 {
+    if c.get32(threaded, RUNNING) != 0 { return 0 }
+    c.put32(threaded, RUNNING, 1)
+    const handle = c.spawn(@intFromPtr(mlx_pw_thread_loop_main), threaded)
+    if handle == 0 {
+        c.put32(threaded, RUNNING, 0)
+        return -11
+    }
+    c.put64(threaded, THREAD, handle)
+    return 0
+}
+
+pub fn stop(threaded: usize) -> void {
+    if c.get32(threaded, RUNNING) == 0 { return }
+    const result = loop_module.signalEvent(c.getPointer(threaded, LOOP), c.getPointer(threaded, STOP_EVENT))
+    c.join(c.get64(threaded, THREAD))
+    c.put32(threaded, RUNNING, 0)
+}
+
+pub fn lock(threaded: usize) -> void { c.lock(threaded + MUTEX) }
+
+pub fn unlock(threaded: usize) -> void { c.unlock(threaded + MUTEX) }
+
+pub fn signal(threaded: usize, wait_for_accept: bool) -> void {
+    if c.get32(threaded, N_WAITING) > 0 { c.broadcast(threaded + COND) }
+    if !wait_for_accept { return }
+    c.put32(threaded, N_WAITING_FOR_ACCEPT, c.get32(threaded, N_WAITING_FOR_ACCEPT) + 1)
+    while c.get32(threaded, N_WAITING_FOR_ACCEPT) > 0 { c.wait(threaded + ACCEPT, threaded + MUTEX) }
+}
+
+pub fn wait(threaded: usize) -> void {
+    c.put32(threaded, N_WAITING, c.get32(threaded, N_WAITING) + 1)
+    c.wait(threaded + COND, threaded + MUTEX)
+    c.put32(threaded, N_WAITING, c.get32(threaded, N_WAITING) - 1)
+}
+
+// 0, or -ETIMEDOUT when `deadline` (a timespec of CLOCK_REALTIME) came
+// first.
+pub fn timedWait(threaded: usize, deadline: usize) -> i32 {
+    if !c.holding(threaded + MUTEX) { return util.EIO }
+    const when = @intCast(u64, c.getPointer(deadline, 0)) * 1000000000 + @intCast(u64, c.getPointer(deadline, 8))
+    c.put32(threaded, N_WAITING, c.get32(threaded, N_WAITING) + 1)
+    const signalled = c.waitUntil(threaded + COND, threaded + MUTEX, when)
+    c.put32(threaded, N_WAITING, c.get32(threaded, N_WAITING) - 1)
+    return if signalled { 0 } else { util.ETIMEDOUT }
+}
+
+// pw_thread_loop_get_time: now plus `timeout` nanoseconds, as a timespec of
+// CLOCK_REALTIME.
+pub fn time(deadline: usize, timeout: i64) -> i32 {
+    const when = @bitCast(i64, c.realtimeNanoseconds()) + timeout
+    c.putPointer(deadline, 0, @intCast(usize, when / 1000000000))
+    c.putPointer(deadline, 8, @intCast(usize, when % 1000000000))
+    return 0
+}
+
+pub fn accept(threaded: usize) -> void {
+    if c.get32(threaded, N_WAITING_FOR_ACCEPT) > 0 { c.put32(threaded, N_WAITING_FOR_ACCEPT, c.get32(threaded, N_WAITING_FOR_ACCEPT) - 1) }
+    c.broadcast(threaded + ACCEPT)
+}
+
+pub fn inThread(threaded: usize) -> bool { return c.get32(threaded, RUNNING) != 0 && c.get32(threaded, THREAD_ID) == thread() }
+
+// ---------------------------------------------------------------------------
+// pw_main_loop: the loop run on the calling thread (pw_main_loop_run) until
+// pw_main_loop_quit.
+
+pub const MAIN_SIZE: usize = 64
+const M_LOOP: usize = 0
+const M_RUNNING: usize = 8
+const M_LISTENERS: usize = 16
+const M_STOP_EVENT: usize = 32
+
+export fn mlx_pw_main_loop_stop_event(main: usize, count: u64) -> void { c.put32(main, M_RUNNING, 0) }
+
+pub fn mainNew(props: usize) -> usize {
+    const main = c.alloc(MAIN_SIZE)
+    if main == 0 { return 0 }
+    const loop = loop_module.new()
+    if loop == 0 {
+        c.release(main)
+        return 0
+    }
+    c.putPointer(main, M_LOOP, loop)
+    hooks.init(main + M_LISTENERS)
+    c.putPointer(main, M_STOP_EVENT, loop_module.addEvent(loop, @intFromPtr(mlx_pw_main_loop_stop_event), main))
+    return main
+}
+
+pub fn mainFree(main: usize) -> void {
+    if main == 0 { return }
+    hooks.call0(main + M_LISTENERS, 0, 0)
+    hooks.clean(main + M_LISTENERS)
+    loop_module.free(c.getPointer(main, M_LOOP))
+    c.release(main)
+}
+
+pub fn mainLoopOf(main: usize) -> usize { return c.getPointer(main, M_LOOP) }
+
+pub fn mainAddListener(main: usize, hook: usize, events: usize, data: usize) -> void { hooks.append(main + M_LISTENERS, hook, events, data) }
+
+pub fn mainRun(main: usize) -> i32 {
+    const loop = c.getPointer(main, M_LOOP)
+    c.put32(main, M_RUNNING, 1)
+    loop_module.enter(loop)
+    var turns: turns_module.Turns = undefined
+    turns_module.begin(&turns, true, false)
+    var result: i32 = 0
+    while c.get32(main, M_RUNNING) != 0 {
+        turns_module.turn(&turns)
+        result = loop_module.iterate(loop, -1)
+        if result < 0 && result != -4 { break }
+    }
+    loop_module.leave(loop)
+    return if result < 0 { result } else { 0 }
+}
+
+pub fn mainQuit(main: usize) -> i32 {
+    c.put32(main, M_RUNNING, 0)
+    return loop_module.signalEvent(c.getPointer(main, M_LOOP), c.getPointer(main, M_STOP_EVENT))
+}
+
+// ---------------------------------------------------------------------------
+// pw_data_loop: a loop on a thread without a lock (what PipeWire runs its
+// nodes' processing on).
+
+pub const DATA_SIZE: usize = 96
+const D_LOOP: usize = 0
+const D_RUNNING: usize = 8
+const D_THREAD_ID: usize = 12
+const D_LISTENERS: usize = 16
+const D_THREAD: usize = 32
+const D_STOP_EVENT: usize = 40
+const D_NAME: usize = 48
+
+export fn mlx_pw_data_loop_stop_event(data_loop: usize, count: u64) -> void { c.put32(data_loop, D_RUNNING, 0) }
+
+export fn mlx_pw_data_loop_main(data_loop: usize) -> usize {
+    var all: u64 = 18446744073709551615
+    const masked = std.linux.syscall4(14, 0, @intFromPtr(&all), 0, 8)
+    c.put32(data_loop, D_THREAD_ID, thread())
+    const named = pthread_setname_np(pthread_self(), c.bytes(data_loop + D_NAME))
+    const loop = c.getPointer(data_loop, D_LOOP)
+    loop_module.enter(loop)
+    var turns: turns_module.Turns = undefined
+    turns_module.begin(&turns, true, false)
+    while c.get32(data_loop, D_RUNNING) != 0 {
+        turns_module.turn(&turns)
+        const result = loop_module.iterate(loop, -1)
+        if result < 0 && result != -4 { break }
+    }
+    loop_module.leave(loop)
+    return 0
+}
+
+pub fn dataNew(props: usize) -> usize {
+    const data_loop = c.alloc(DATA_SIZE)
+    if data_loop == 0 { return 0 }
+    const loop = loop_module.new()
+    if loop == 0 {
+        c.release(data_loop)
+        return 0
+    }
+    c.putPointer(data_loop, D_LOOP, loop)
+    hooks.init(data_loop + D_LISTENERS)
+    var out = c.out(data_loop + D_NAME, 16)
+    var name: usize = 0
+    if props != 0 { name = properties.dictLookup(props, "loop.name") }
+    c.append(&out, if name != 0 { c.slice(name) } else { "pw-data-loop" })
+    c.putPointer(data_loop, D_STOP_EVENT, loop_module.addEvent(loop, @intFromPtr(mlx_pw_data_loop_stop_event), data_loop))
+    return data_loop
+}
+
+pub fn dataFree(data_loop: usize) -> void {
+    if data_loop == 0 { return }
+    hooks.call0(data_loop + D_LISTENERS, 0, 0)
+    const stopped = dataStop(data_loop)
+    hooks.clean(data_loop + D_LISTENERS)
+    loop_module.free(c.getPointer(data_loop, D_LOOP))
+    c.release(data_loop)
+}
+
+pub fn dataLoopOf(data_loop: usize) -> usize { return c.getPointer(data_loop, D_LOOP) }
+
+pub fn dataAddListener(data_loop: usize, hook: usize, events: usize, data: usize) -> void { hooks.append(data_loop + D_LISTENERS, hook, events, data) }
+
+pub fn dataStart(data_loop: usize) -> i32 {
+    if c.get32(data_loop, D_RUNNING) != 0 { return 0 }
+    c.put32(data_loop, D_RUNNING, 1)
+    const handle = c.spawn(@intFromPtr(mlx_pw_data_loop_main), data_loop)
+    if handle == 0 {
+        c.put32(data_loop, D_RUNNING, 0)
+        return -11
+    }
+    c.put64(data_loop, D_THREAD, handle)
+    return 0
+}
+
+pub fn dataStop(data_loop: usize) -> i32 {
+    if c.get32(data_loop, D_RUNNING) == 0 { return 0 }
+    const result = loop_module.signalEvent(c.getPointer(data_loop, D_LOOP), c.getPointer(data_loop, D_STOP_EVENT))
+    c.join(c.get64(data_loop, D_THREAD))
+    c.put32(data_loop, D_RUNNING, 0)
+    return 0
+}
+
+pub fn dataExit(data_loop: usize) -> void { c.put32(data_loop, D_RUNNING, 0) }
+
+pub fn dataInThread(data_loop: usize) -> bool { return c.get32(data_loop, D_RUNNING) != 0 && c.get32(data_loop, D_THREAD_ID) == thread() }
+
+pub fn dataThread(data_loop: usize) -> usize { return @intCast(usize, c.get64(data_loop, D_THREAD)) }
+
+// pw_data_loop_wait: one turn of the loop on the calling thread (for a
+// loop not started), at most `timeout` milliseconds.
+pub fn dataWait(data_loop: usize, timeout: i32) -> i32 { return loop_module.iterate(c.getPointer(data_loop, D_LOOP), timeout) }
+
+pub fn dataInvoke(data_loop: usize, function: usize, seq: u32, data: usize, size: usize, block: bool, user_data: usize) -> i32 {
+    return loop_module.invoke(c.getPointer(data_loop, D_LOOP), function, seq, data, size, block, user_data)
+}

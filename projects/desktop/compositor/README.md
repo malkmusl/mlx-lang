@@ -1092,6 +1092,14 @@ system's libpipewire): the screen's frames follow the pointer, a window's
 have its size, a no shares nothing, Share in the picker shares, and with
 Firefox (`FIREFOX=PATH`) a page's `getDisplayMedia` shows the screen.
 
+The library the apps take the frames with has an Mlx stand-in too:
+[`projects/desktop/libpipewire`](../libpipewire/README.md) builds
+`libpipewire-0.3.so.0` (every function of libpipewire 1.0.5, PipeWire's
+protocol on the portal's socket), so PipeWire's `libpipewire-0.3-0` is not
+needed for sharing either; `tools/install_compositor_session.sh
+--replace-libpipewire` puts it in that package's place.
+`tools/check_libpipewire.sh` shares the screen through it.
+
 ## X programs (Xwayland)
 
 X11 programs run as windows of the compositor through Xwayland, rootless,
