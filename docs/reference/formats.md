@@ -158,6 +158,21 @@ outlive a call goes in memory from an allocator; functions handed to the
 host as callbacks are `export fn` too. `tests/run_foreign.sh` loads
 `tests/support/plugin_library.mlx` from python3 (ctypes) and calls it on
 four threads at once; `projects/desktop/capture/obs.mlx` is such a plugin.
+
+`--stack-arena[=BYTES]` (with `--plugin`; 65536 when no size is given,
+rounded up to a multiple of 16) makes each export take its arena from its
+own stack instead: the prologue moves `rsp` down by that many bytes and
+points `r14`/`r15` at the reservation, the epilogue's `leave` gives it
+back, so a call costs no system call (what a C library's `strlen` or
+`malloc` written in Mlx needs). The host's threads must have that much
+stack to spare below the export's frame (the usual 8 MiB thread stacks
+have); an export whose aggregates outgrow the reservation traps, as any
+exhausted arena does. `--no-libc` leaves `libc.so.6` out of `DT_NEEDED`,
+which then names only the `--library` libraries (none, for an image that
+imports nothing; imports, if there are any, bind against whatever the
+loading process has). `tests/support/plugin_freestanding.mlx`, built with
+both and checked by `tests/run_foreign.sh` (no `NEEDED` entry; under
+`strace`, no mapping per call), is the shape of mlxlibc.
 `tests/271_shared_object_runtime.mlx` (run by `tests/run_foreign.sh`) loads
 `tests/support/shared_object_library.mlx` twice from two copies, calls it
 through `dlsym` and through function pointers it returns, and checks that

@@ -525,7 +525,10 @@ adds on x86_64:
   thread's registers). In a plugin
   (`--plugin`) each exported function maps an arena of its own after
   storing its parameters, and unmaps it before it returns (its results,
-  `rax` and `rdx`, kept in two more frame words meanwhile);
+  `rax` and `rdx`, kept in two more frame words meanwhile); with
+  `--stack-arena[=BYTES]` it reserves the arena below its frame instead
+  (`sub rsp`, `r14`/`r15` at the reservation) and `leave` gives it back,
+  no system call either way (see [Formats](formats.md#shared-objects));
 - a program with imports is a dynamically linked executable (see
   [Formats](formats.md#dynamically-linked-executables)) that exits through
   libc's `exit`, so stdio is flushed and library destructors run.

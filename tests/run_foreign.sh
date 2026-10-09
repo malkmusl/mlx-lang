@@ -184,6 +184,68 @@ else
     failures=$((failures + 1))
 fi
 
+# A plugin without a C library (--plugin --stack-arena --no-libc): no
+# DT_NEEDED at all, and its exports take their arena from their own stack,
+# so a call makes no system call (strace sees no arena mapping, where it
+# is installed). The host calls it on four threads at once as above.
+if ! command -v python3 > /dev/null; then
+    echo "skip --stack-arena --no-libc (no python3)"
+elif "$compiler" --quiet --plugin --stack-arena --no-libc tests/support/plugin_freestanding.mlx -o "$work/libfree.so" 2> "$work/errors"; then
+    if python3 - "$work/libfree.so" > "$work/output" 2>&1 <<'PY'
+import ctypes, sys, threading
+library = ctypes.CDLL(sys.argv[1])
+library.mlx_free_sum.restype = ctypes.c_int64
+library.mlx_free_sum.argtypes = [ctypes.c_int64]
+library.mlx_free_count.restype = ctypes.c_uint64
+library.mlx_free_count.argtypes = []
+def resident():
+    return int(open('/proc/self/statm').read().split()[1])
+failures = []
+def work():
+    for _ in range(2000):
+        if library.mlx_free_sum(1000) != 4 * 999 * 1000 // 2:
+            failures.append('sum')
+before = resident()
+threads = [threading.Thread(target=work) for _ in range(4)]
+for thread in threads: thread.start()
+for thread in threads: thread.join()
+grown = resident() - before
+assert not failures, failures[:3]
+assert grown < 4096, grown
+calls = ctypes.c_uint64.in_dll(library, "mlx_free_calls")
+assert library.mlx_free_count() == 1 and calls.value == 1, calls.value
+calls.value = 10
+assert library.mlx_free_count() == 11
+PY
+    then
+        if command -v readelf > /dev/null && readelf -d "$work/libfree.so" | grep -q "NEEDED"; then
+            echo "FAIL --no-libc: the plugin still needs a library"
+            readelf -d "$work/libfree.so"
+            failures=$((failures + 1))
+        elif command -v strace > /dev/null && strace -f -e trace=mmap,munmap -o "$work/strace" python3 -c "
+import ctypes, sys
+library = ctypes.CDLL(sys.argv[1])
+library.mlx_free_sum.restype = ctypes.c_int64
+library.mlx_free_sum.argtypes = [ctypes.c_int64]
+for _ in range(200): library.mlx_free_sum(100)
+" "$work/libfree.so" > "$work/output" 2>&1 && grep -q "268435464" "$work/strace"; then
+            echo "FAIL --stack-arena: the exports still map an arena per call"
+            grep "268435464" "$work/strace" | head -3
+            failures=$((failures + 1))
+        else
+            echo "ok   --stack-arena --no-libc: a plugin without libc, its exports on stack arenas (no system call per call)"
+        fi
+    else
+        echo "FAIL --stack-arena --no-libc"
+        cat "$work/output"
+        failures=$((failures + 1))
+    fi
+else
+    echo "FAIL (compile) tests/support/plugin_freestanding.mlx"
+    cat "$work/errors"
+    failures=$((failures + 1))
+fi
+
 # A program without foreign functions stays a static executable, also with
 # exported ones (std.crash's signal handler): nothing loads glibc.
 "$compiler" --quiet tests/07_functions.mlx -o "$work/static"

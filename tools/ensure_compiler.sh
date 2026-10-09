@@ -207,6 +207,19 @@ lowers_globals() {
     return $ok
 }
 
+# Whether the compiler builds a plugin without a C library whose exports
+# run on stack arenas (--plugin --stack-arena --no-libc), what mlxlibc is.
+builds_freestanding_plugins() {
+    local probe
+    probe=$(mktemp -d)
+    printf 'const Pair = struct { a: i64, b: i64 }\n\nfn pair(v: i64) -> Pair { return Pair.{ .a = v, .b = v } }\n\nexport fn probe_twice(v: i64) -> i64 {\n    const made = pair(v)\n    return made.a + made.b\n}\n' > "$probe/probe.mlx"
+    local ok=1
+    # (An older compiler takes the options and still names libc.so.6.)
+    if "$1" --quiet --plugin --stack-arena --no-libc "$probe/probe.mlx" -o "$probe/probe.so" > /dev/null 2>&1 && ! grep -q "libc.so.6" "$probe/probe.so"; then ok=0; fi
+    rm -rf -- "$probe"
+    return $ok
+}
+
 if [[ ! -x mlx-out/bin/compiler/mlx4 ]]; then
     if [[ ! -x zig-out/bin/mlx1 ]]; then
         if command -v zig > /dev/null; then
@@ -221,8 +234,8 @@ if [[ ! -x mlx-out/bin/compiler/mlx4 ]]; then
     zig-out/bin/mlx1 --quiet compiler/selfhost/main.mlx -o mlx-out/bin/compiler/mlx2
     mlx-out/bin/compiler/mlx2 --quiet compiler/selfhost/main.mlx -o mlx-out/bin/compiler/mlx3
     cp mlx-out/bin/compiler/mlx3 mlx-out/bin/compiler/mlx4
-elif ! writes_shared_objects mlx-out/bin/compiler/mlx4 || ! writes_symbol_tables mlx-out/bin/compiler/mlx4 || ! accepts_discards mlx-out/bin/compiler/mlx4 || ! keeps_slice_lengths mlx-out/bin/compiler/mlx4 || ! orders_import_cycles mlx-out/bin/compiler/mlx4 || ! has_large_arena mlx-out/bin/compiler/mlx4 || ! keeps_match_widths mlx-out/bin/compiler/mlx4 || ! extends_signed_results mlx-out/bin/compiler/mlx4 || ! writes_symbol_versions mlx-out/bin/compiler/mlx4 || ! resolves_named_array_lengths mlx-out/bin/compiler/mlx4 || ! exports_data mlx-out/bin/compiler/mlx4 || ! lowers_atomics mlx-out/bin/compiler/mlx4 || ! lowers_globals mlx-out/bin/compiler/mlx4; then
-    echo "rebuilding mlx-out/bin/compiler/mlx4 from the current compiler sources (it lacks --shared objects, symbol tables, \`_ = value\`, slice lengths kept on assignment, import cycles broken in order, the 1 GiB arena, match values stored at their width, signed results sign-extended, symbol versions, array lengths from named constants, data symbols for export const, the atomic builtins or module-level var globals)" >&2
+elif ! writes_shared_objects mlx-out/bin/compiler/mlx4 || ! writes_symbol_tables mlx-out/bin/compiler/mlx4 || ! accepts_discards mlx-out/bin/compiler/mlx4 || ! keeps_slice_lengths mlx-out/bin/compiler/mlx4 || ! orders_import_cycles mlx-out/bin/compiler/mlx4 || ! has_large_arena mlx-out/bin/compiler/mlx4 || ! keeps_match_widths mlx-out/bin/compiler/mlx4 || ! extends_signed_results mlx-out/bin/compiler/mlx4 || ! writes_symbol_versions mlx-out/bin/compiler/mlx4 || ! resolves_named_array_lengths mlx-out/bin/compiler/mlx4 || ! exports_data mlx-out/bin/compiler/mlx4 || ! lowers_atomics mlx-out/bin/compiler/mlx4 || ! lowers_globals mlx-out/bin/compiler/mlx4 || ! builds_freestanding_plugins mlx-out/bin/compiler/mlx4; then
+    echo "rebuilding mlx-out/bin/compiler/mlx4 from the current compiler sources (it lacks --shared objects, symbol tables, \`_ = value\`, slice lengths kept on assignment, import cycles broken in order, the 1 GiB arena, match values stored at their width, signed results sign-extended, symbol versions, array lengths from named constants, data symbols for export const, the atomic builtins, module-level var globals or plugins without libc on stack arenas)" >&2
     mlx-out/bin/compiler/mlx4 --quiet compiler/selfhost/main.mlx -o mlx-out/bin/compiler/mlx4.next
     mlx-out/bin/compiler/mlx4.next --quiet compiler/selfhost/main.mlx -o mlx-out/bin/compiler/mlx4.fixed
     mv mlx-out/bin/compiler/mlx4.fixed mlx-out/bin/compiler/mlx4
