@@ -12,9 +12,9 @@
 # no symbol table, or knows no `_ = value`, or loses a slice's length when
 # it is assigned again, or stores a match's arms at their own widths, or
 # loads a signed if/match result unsigned, knows no --symbol-version,
-# gives an array whose length is a named constant no size, or makes no
-# data symbol of an export const), it builds them twice (mlx4 -> new mlx
-# -> mlx4 again).
+# gives an array whose length is a named constant no size, makes no
+# data symbol of an export const, or makes the address of a field a
+# *const T), it builds them twice (mlx4 -> new mlx -> mlx4 again).
 # Messages go to stderr.
 #
 #   compiler=$(tools/ensure_compiler.sh)
@@ -166,6 +166,23 @@ keeps_slice_lengths() {
     return $ok
 }
 
+# Whether programs $1 builds take the address of a field as a pointer that
+# can be written through (tests/295_field_address_runtime.mlx exits 13);
+# older compilers made every address but a plain var's a *const T, so
+# &state.*.on could not go to a function taking *bool (std.ui.widgets).
+addresses_fields() {
+    local probe
+    probe=$(mktemp -d)
+    local ok=1
+    if "$1" --quiet tests/295_field_address_runtime.mlx -o "$probe/probe" > /dev/null 2>&1; then
+        local status=0
+        "$probe/probe" > /dev/null 2>&1 || status=$?
+        [[ $status -eq 13 ]] && ok=0
+    fi
+    rm -rf -- "$probe"
+    return $ok
+}
+
 # Whether $1 makes an `export const` a data symbol of a plugin
 # (tests/support/plugin_library.mlx's mlx_plugin_level, read as a C global
 # from python3; projects/desktop/libpipewire needs it for pw_log_level).
@@ -196,8 +213,8 @@ if [[ ! -x mlx-out/bin/compiler/mlx4 ]]; then
     zig-out/bin/mlx1 --quiet compiler/selfhost/main.mlx -o mlx-out/bin/compiler/mlx2
     mlx-out/bin/compiler/mlx2 --quiet compiler/selfhost/main.mlx -o mlx-out/bin/compiler/mlx3
     cp mlx-out/bin/compiler/mlx3 mlx-out/bin/compiler/mlx4
-elif ! writes_shared_objects mlx-out/bin/compiler/mlx4 || ! writes_symbol_tables mlx-out/bin/compiler/mlx4 || ! accepts_discards mlx-out/bin/compiler/mlx4 || ! keeps_slice_lengths mlx-out/bin/compiler/mlx4 || ! orders_import_cycles mlx-out/bin/compiler/mlx4 || ! has_large_arena mlx-out/bin/compiler/mlx4 || ! keeps_match_widths mlx-out/bin/compiler/mlx4 || ! extends_signed_results mlx-out/bin/compiler/mlx4 || ! writes_symbol_versions mlx-out/bin/compiler/mlx4 || ! resolves_named_array_lengths mlx-out/bin/compiler/mlx4 || ! exports_data mlx-out/bin/compiler/mlx4; then
-    echo "rebuilding mlx-out/bin/compiler/mlx4 from the current compiler sources (it lacks --shared objects, symbol tables, \`_ = value\`, slice lengths kept on assignment, import cycles broken in order, the 1 GiB arena, match values stored at their width, signed results sign-extended, symbol versions, array lengths from named constants or data symbols for export const)" >&2
+elif ! writes_shared_objects mlx-out/bin/compiler/mlx4 || ! writes_symbol_tables mlx-out/bin/compiler/mlx4 || ! accepts_discards mlx-out/bin/compiler/mlx4 || ! keeps_slice_lengths mlx-out/bin/compiler/mlx4 || ! orders_import_cycles mlx-out/bin/compiler/mlx4 || ! has_large_arena mlx-out/bin/compiler/mlx4 || ! keeps_match_widths mlx-out/bin/compiler/mlx4 || ! extends_signed_results mlx-out/bin/compiler/mlx4 || ! writes_symbol_versions mlx-out/bin/compiler/mlx4 || ! resolves_named_array_lengths mlx-out/bin/compiler/mlx4 || ! exports_data mlx-out/bin/compiler/mlx4 || ! addresses_fields mlx-out/bin/compiler/mlx4; then
+    echo "rebuilding mlx-out/bin/compiler/mlx4 from the current compiler sources (it lacks --shared objects, symbol tables, \`_ = value\`, slice lengths kept on assignment, import cycles broken in order, the 1 GiB arena, match values stored at their width, signed results sign-extended, symbol versions, array lengths from named constants, data symbols for export const or writable addresses of fields)" >&2
     mlx-out/bin/compiler/mlx4 --quiet compiler/selfhost/main.mlx -o mlx-out/bin/compiler/mlx4.next
     mlx-out/bin/compiler/mlx4.next --quiet compiler/selfhost/main.mlx -o mlx-out/bin/compiler/mlx4.fixed
     mv mlx-out/bin/compiler/mlx4.fixed mlx-out/bin/compiler/mlx4

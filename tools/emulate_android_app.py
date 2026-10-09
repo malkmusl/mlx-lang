@@ -674,8 +674,9 @@ def check_reserved(library, verbose, fullscreen):
 # examples/android/widgets.mlx (std.ui on std.ui.host, the same source as
 # its desktop build): its colours as the window holds them (bytes R, G, B,
 # A), drawn by Vulkan or, without it, on the CPU.
-DARK_BACKGROUND, LIGHT_BACKGROUND = rgb(26, 28, 36), rgb(246, 246, 248)
-LIGHT_PRESSED = rgb(208, 211, 220)
+DARK_BACKGROUND, LIGHT_BACKGROUND = rgb(16, 17, 26), rgb(240, 241, 247)
+# The chosen segment is a raised capsule (std.ui.theme.light().raised).
+LIGHT_PRESSED = rgb(255, 255, 255)
 WIDGETS_SIZE = (360, 720)
 
 
@@ -707,20 +708,23 @@ def run_widgets(library, verbose, vulkan):
         return frame[y * width + x]
     problems = []
     first = pixels()
-    if at(first, 2, 100) != DARK_BACKGROUND:
-        problems.append(f"start: background {at(first, 2, 100):#010x}, expected dark {DARK_BACKGROUND:#010x}")
+    # In the status bar's band: the card's shadow reaches no pixel there.
+    if at(first, 2, 12) != DARK_BACKGROUND:
+        problems.append(f"start: background {at(first, 2, 12):#010x}, expected dark {DARK_BACKGROUND:#010x}")
 
     def tap(x, y, start):
         framework.touch(ACTION_DOWN, x, y, start * MS)
         framework.touch(ACTION_UP, x, y, (start + 80) * MS)
         framework.advance((start + 120) * MS)
-    # Below the 24 px status bar and an 8 px margin: rows of 32 with 8
-    # between, the segments after a 24 px gap (y 168 .. 200).
-    tap(180, 48, 100)
+    # Below the 24 px status bar and an 8 px margin, a card (padding 8):
+    # the dark switch row 40 .. 88, the sounds row 94 .. 142, the check row
+    # 148 .. 184, the segments 190 .. 226 (std.ui.widgets' rows, 6 apart);
+    # the third segment from x 236.
+    tap(180, 64, 100)
     after_switch = pixels()
-    if at(after_switch, 2, 100) != LIGHT_BACKGROUND:
-        problems.append(f"the dark switch: background {at(after_switch, 2, 100):#010x}, expected light {LIGHT_BACKGROUND:#010x}")
-    segment = (250, 184)
+    if at(after_switch, 2, 12) != LIGHT_BACKGROUND:
+        problems.append(f"the dark switch: background {at(after_switch, 2, 12):#010x}, expected light {LIGHT_BACKGROUND:#010x}")
+    segment = (290, 208)
     if at(after_switch, *segment) == LIGHT_PRESSED:
         problems.append("the third segment is chosen before it was tapped")
     tap(segment[0], segment[1], 400)
@@ -734,11 +738,11 @@ def run_widgets(library, verbose, vulkan):
     if presented() <= frames:
         problems.append("a tap was not painted")
     # A drag starting on the dark switch scrolls: no click.
-    framework.touch(ACTION_DOWN, 180, 48, 1000 * MS)
-    framework.touch(ACTION_MOVE, 180, 120, 1040 * MS)
-    framework.touch(ACTION_UP, 180, 120, 1080 * MS)
+    framework.touch(ACTION_DOWN, 180, 64, 1000 * MS)
+    framework.touch(ACTION_MOVE, 180, 136, 1040 * MS)
+    framework.touch(ACTION_UP, 180, 136, 1080 * MS)
     framework.advance(1200 * MS)
-    if at(pixels(), 2, 100) != LIGHT_BACKGROUND:
+    if at(pixels(), 2, 12) != LIGHT_BACKGROUND:
         problems.append("a drag over the dark switch switched it")
     framework.callback("onNativeWindowDestroyed", WINDOW)
     framework.callback("onInputQueueDestroyed", QUEUE)

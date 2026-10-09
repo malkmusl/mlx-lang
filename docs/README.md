@@ -50,6 +50,9 @@ exercise it:
   `std.json` (expands [`VULKAN.md`](VULKAN.md))
 - [`reference/truetype.md`](reference/truetype.md) — `std.truetype`: TrueType
   parsing, anti-aliased rasterization, atlas, layout, and text on Vulkan
+- [`reference/design.md`](reference/design.md) — the Mlx look: glass,
+  depth from light, one seed colour; what `std.ui`'s widgets draw and
+  the desktop's apps follow
 - [`reference/ui.md`](reference/ui.md) — `std.ui`: layout building blocks
   (rectangles, insets, alignment, containers, stacks, reserved bars)
 - [`reference/memory-and-concurrency.md`](reference/memory-and-concurrency.md)

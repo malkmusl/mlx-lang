@@ -60,8 +60,12 @@ crash. `timezone.mlx` (`std.timezone`) gives local time from `$TZ` or
 `ui/gpu_canvas.mlx` and `ui/gpu_upload.mlx` draw on the CPU or the GPU;
 `ui/view.mlx` with `ui/controls.mlx`, `ui/field.mlx`, `ui/scroll.mlx`,
 `ui/lists.mlx`, `ui/tabs.mlx`, `ui/popup.mlx`, `ui/glyphs.mlx`,
-`ui/theme.mlx` and `ui/keys.mlx` are widgets for any platform;
-`ui/app.mlx` is what a platform gives an app of them (events, `feed`).
+`ui/theme.mlx` (a palette from one seed colour), `ui/surface.mlx` (the
+Mlx look's shadows, glows, cards and glass, see
+`docs/reference/design.md`) and `ui/keys.mlx` are widgets for any
+platform; `ui/flow.mlx` and `ui/widgets.mlx` lay them out as rows that
+keep the app's state; `ui/app.mlx` is what a platform gives an app of
+them (events, `feed`).
 `ui/host.linux.mlx` (a Wayland window, `ui/wayland/`) and
 `ui/host.android.mlx` (a NativeActivity) are `std.ui.host`: one API, so an
 app's source is the same on both (the compiler takes the target's file).

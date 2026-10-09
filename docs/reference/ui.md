@@ -2,8 +2,11 @@
 
 `std.ui` is user interfaces on any platform (a Wayland buffer, an Android
 window): layout (this module), drawing (`std.ui.canvas`, `std.ui.text`,
-on the CPU or the GPU) and widgets (`std.ui.view` and the modules after
-it, see [Widgets](#widgets)). Its first building blocks are
+on the CPU or the GPU), widgets (`std.ui.view` and the modules after it,
+see [Widgets](#widgets)) and, the easy way, rows of widgets that keep
+the app's state (`std.ui.flow` and `std.ui.widgets`, see
+[Rows and cards](#rows-and-cards)). They draw in the Mlx look, see
+[The Mlx look](design.md). Its first building blocks are
 rectangles, insets, alignment, containers, stacks and a screen whose edges
 can be reserved for bars. It is integer layout math on screen pixels (x to
 the right, y down) and knows nothing about drawing: a layout hands out
@@ -107,7 +110,15 @@ background is filled into the reserved bands (`takeTop`/`takeBottom`/`takeLeft`/
 `std.ui.canvas` draws in premultiplied ARGB: `clear`, `fillRect`,
 `fillRoundedRect`, `strokeRoundedRect` (smooth corners, the coverage of
 `ui.roundedCoverage`), `drawImage`/`drawImageRect` (`std.png` images,
-bilinear) and `setOpacity` (what is drawn fades). A `Canvas` is pixels, or
+bilinear), `setOpacity` (what is drawn fades), and depth: `shadow` (a
+soft shadow of a rounded box, `blur` rounded rectangles each a pixel
+larger and fainter than the one inside it, so the GPU draws the same
+pixels), `shadowBelow`/`shadowRightOf` (a shadow cast from an edge),
+`topHighlight` (a hairline of light along a top edge) and `fade` (a
+colour at a share of itself). `std.ui.surface` puts them together:
+`raised` (shadow, fill, hairline), `glow` (the accent around what is
+on), `card`, `glass` (a translucent panel the compositor blurs behind,
+see [The Mlx look](design.md)), `bar` and `sidePanel`. A `Canvas` is pixels, or
 with `device` a `std.ui.gpu_canvas.Device`: then every call is a command
 the `paint` compute shader draws, the same pixels as the CPU
 (`std.ui.gpu_upload` takes images and glyph atlases to the GPU).
@@ -157,10 +168,47 @@ the next frame.
 | `std.ui.lists` | list and side bar rows (lit, chosen, indent, note, room for an icon), `rowBackground` and `part` (a row the app fills, whose parts have ids of their own), `columnHeader` (a sortable column's title), a fold arrow, a divider |
 | `std.ui.tabs` | a tab bar: tabs with a cross that closes them, a dot for unsaved changes |
 | `std.ui.popup` | a popup's frame (it takes the pointer from what is under it), menu items and separators, tooltips, wrapped text |
-| `std.ui.theme` | colours and sizes: `dark()` (the desktop apps), `light()` |
+| `std.ui.theme` | colours and sizes from one seed colour: `fromSeed(seed, dark)` (the seed's hue in every colour, as Material You does it), `dark()` and `light()` (the default seed's), `hsl`, `hueOf` |
+| `std.ui.surface` | what the look is made of: `raised`, `glow`, `card`, `glass`, `bar`, `sidePanel`, `hairline` |
+| `std.ui.flow` | rows down an area in logical pixels, ids from labels within scopes, see [Rows and cards](#rows-and-cards) |
+| `std.ui.widgets` | the controls as rows of a flow that keep the app's state: `toggle(&bool)`, `check`, `radio`, `segments`/`segment(&usize)`, `slider(&u32)`, `valueRow`, `textField`, `button`, `wideButton`, `section`, `note`, `line`, `infoRow`, `cardBegin`/`cardEnd` |
 | `std.ui.keys` | keys as widgets take them: Linux input codes and modifier bits on every platform |
 | `std.ui.app` | what a platform gives a std.ui app: the events (pointer, buttons, wheel, keys, configured, closed, tick; drags and drops where there are any), `Draw` and `Handler`, and `feed` (a pointer event to the widgets) |
 | `std.ui.host` | the platform itself, one API for all: a Wayland window on Linux, a NativeActivity on Android (see Platforms) |
+
+## Rows and cards
+
+`std.ui.flow` lays rows out one under another in logical pixels (times
+the scale, so one layout serves every screen), and `std.ui.widgets` are
+the controls as such rows, keeping the app's state themselves: a
+`toggle` flips the bool it is given, a `segment` sets the choice, a
+`slider` moves the value; each returns true when it changed something
+(or was clicked). A widget's id comes from its label within the flow's
+scope (`pushScope`/`pushIndex` for a list's rows, `popScope` after), or
+from `flow.id` when the app sets one for the next widget (mlx-settings
+maps hits back to its items that way, `projects/desktop/settings/page.mlx`).
+Rows group in cards floating on the page: a card draws its background
+as tall as it was in the last frame (`view.measured`), and the frame
+that first shows it, or whose rows changed, is drawn again at once
+(`view.end` says so).
+
+```mlx
+var page = flow.begin(&ui, area, host.scale(state.host))
+widgets.section(&page, "Appearance")
+widgets.cardBegin(&page, "appearance")
+if widgets.toggle(&page, "Dark look", "The desktop apps' colours", &state.dark) { ... }
+var size = widgets.segments(&page, 3)
+_ = widgets.segment(&page, &size, "Small", &state.size)
+_ = widgets.segment(&page, &size, "Medium", &state.size)
+_ = widgets.segment(&page, &size, "Large", &state.size)
+widgets.cardEnd(&page)
+if widgets.wideButton(&page, "Apply", controls.BUTTON_PRIMARY) { apply() }
+state.pageHeight = flow.used(&page)          // for scrolling
+```
+
+`examples/android/widgets.mlx` is such a page, from one source on
+Android and on the desktop. The address of a field, `&state.dark`, is a
+pointer that can be written through (`tests/295_field_address_runtime.mlx`).
 
 ## Platforms
 
@@ -194,7 +242,17 @@ The app asks the platform through the host: `redraw`, `setTick`,
 logical pixel), `typed` and `modifiers` (the current key), `wheelPixels`,
 `showKeyboard`/`hideKeyboard`, `home` (where its files are),
 `environmentValue`, `log`; what only a desktop has (`setTitle`,
-`setBlur`, `acceptDrops`, `startDrag`) does nothing on a phone.
+`setBlur`, `acceptDrops`, `startDrag`) does nothing on a phone. Glass:
+after each frame `applyBlur(host, &ui)` hands the frame's glass areas
+(`surface.glass`, `view.blurRegion`) to the compositor, which blurs what
+is behind the window there; it tells the compositor only when they
+changed. Popups: `openPopup` opens a surface of its own beside an anchor
+rectangle of the window (an `xdg_popup`, glass with rounded corners: the
+window's content blurs through it), drawn by a `Draw` of its own on the
+CPU; the pointer in it comes as `EVENT_POPUP_*`, which `app.feedPopup`
+hands to a `Ui` of the popup's own; `closePopup`, `redrawPopup`,
+`popupOpen`. A phone has none (`openPopup` is false there): draw the
+popup in the window with `std.ui.popup` instead.
 
 | Platform | Drawn by | Input |
 | --- | --- | --- |
@@ -236,4 +294,8 @@ the CPU, and taps a switch row and a segment and drags over a row.
 `tests/264_ui_layout_runtime.mlx` covers the geometry, every alignment
 (including children that do not fit), bands, containers, stacks, a screen
 with safe insets and reserved top and bottom bars, and `fillRect`'s
-blending and clipping.
+blending and clipping. `tests/296_ui_flow_runtime.mlx` drives
+`std.ui.flow` and `std.ui.widgets` (rows at a scale, ids and scopes, a
+toggle, segments, a slider and radio rows by clicks, a card's remembered
+height) and checks the surfaces (a soft shadow's falloff and reach, a
+raised surface's fill and hairline, a shadow cast below an edge).

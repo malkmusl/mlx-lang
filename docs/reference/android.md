@@ -163,8 +163,10 @@ Keys come as `EVENT_KEY` with Linux codes (Back stays the system's);
 comes when the window or the reserved space changes (`host.insets`).
 
 `examples/android/widgets.mlx` is a settings screen made of the desktop
-apps' widgets (switch rows, a check row, segments, a button), with the
-fonts in `/system/fonts`, and builds for the desktop too.
+apps' widgets as rows that keep the state (`std.ui.flow`,
+`std.ui.widgets`: a card of switch rows, a check row and segments, and a
+button; see [ui.md](ui.md#rows-and-cards)), with the fonts in
+`/system/fonts`, and builds for the desktop too.
 
 ### Frame clock
 
