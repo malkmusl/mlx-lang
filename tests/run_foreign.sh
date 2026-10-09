@@ -151,13 +151,18 @@ else
     failures=$((failures + 1))
 fi
 
-# A program without foreign or exported functions stays a static executable.
+# A program without foreign functions stays a static executable, also with
+# exported ones (std.crash's signal handler): nothing loads glibc.
 "$compiler" --quiet tests/07_functions.mlx -o "$work/static"
+"$compiler" --quiet tests/support/crash_report.mlx -o "$work/static-exports"
 if [[ "$(head -c 20 "$work/static" | od -An -tx1 -j16 -N2 | tr -d ' ')" != "0200" ]] || grep -q "ld-linux" "$work/static"; then
     echo "FAIL static output changed for programs without foreign functions"
     failures=$((failures + 1))
+elif [[ "$(od -An -tx1 -j16 -N2 "$work/static-exports" | tr -d ' ')" != "0200" ]] || grep -q "ld-linux" "$work/static-exports"; then
+    echo "FAIL a program with exports but no imports is linked dynamically"
+    failures=$((failures + 1))
 else
-    echo "ok   static executables stay static"
+    echo "ok   static executables stay static (with exports too)"
 fi
 
 if [[ $failures -ne 0 ]]; then

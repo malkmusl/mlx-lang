@@ -517,11 +517,14 @@ adds on x86_64:
   comparator) work when C calls them on the calling thread. In a shared
   object (`--shared`, see [Formats](formats.md#shared-objects)) there is no
   `_start`: exported functions keep the caller's `r14`/`r15`, so they run on
-  the arena of the Mlx program that loaded the object. In a plugin
+  the arena of the Mlx program that loaded the object. So do the exports
+  of a program without imports (a static executable, where no C code
+  runs: the kernel calls them, as signal handlers, with the interrupted
+  thread's registers). In a plugin
   (`--plugin`) each exported function maps an arena of its own after
   storing its parameters, and unmaps it before it returns (its results,
   `rax` and `rdx`, kept in two more frame words meanwhile);
-- a program with imports or exports is a dynamically linked executable (see
+- a program with imports is a dynamically linked executable (see
   [Formats](formats.md#dynamically-linked-executables)) that exits through
   libc's `exit`, so stdio is flushed and library destructors run.
 

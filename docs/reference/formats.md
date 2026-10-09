@@ -81,7 +81,7 @@ virtual address.
 
 ## Dynamically linked executables
 
-A program that imports C functions or exports functions (see
+A program that imports C functions (see
 [ABI](abi.md#c-functions-externc-and-export-fn)) is written by
 `compiler/selfhost/object/elf64_dynamic.mlx` instead: still `ET_EXEC` at the
 same fixed address, but loaded by the system dynamic linker
@@ -99,9 +99,11 @@ Imports are unversioned undefined symbols, bound immediately (`DF_BIND_NOW`,
 `DF_1_NOW`) to the default version in any `DT_NEEDED` library: always
 `libc.so.6`, plus each library named with `--library NAME` on the command
 line. Exports are global `STT_FUNC` symbols in `.text`. A program without
-imports or exports is still the static executable described above
-(`tests/run_foreign.sh` checks that, and runs
-`tests/247_foreign_c_runtime.mlx`).
+imports is still the static executable described above, exports or not:
+its exports are C-ABI functions only (signal handlers, which the kernel
+calls; `std.crash` installs one in every desktop program), so nothing
+there needs glibc. `tests/run_foreign.sh` checks that, and runs
+`tests/247_foreign_c_runtime.mlx`.
 
 ## Symbol table and line table
 
