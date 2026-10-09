@@ -20,6 +20,11 @@ name and are not re-exported from `std.mlx`.
 `json.mlx` (`std.json`) is the allocation-free JSON pull tokenizer.
 `sha2.mlx` (`std.sha2`) has SHA-256, SHA-512, HMAC-SHA256 and
 PBKDF2-HMAC-SHA256.
+
+`crypt.mlx` (`std.crypt`) checks a password against the hashes of
+`/etc/shadow`, as crypt(3) writes them, with `crypt/shacrypt.mlx` for
+the SHA-256 and SHA-512 ones; `tools/check_crypt.sh` compares it with
+the system's crypt(3).
 `vulkan.mlx` (`std.vulkan`) is the Vulkan API, materialized from
 `std/registry/vulkan/vk.xml` by `vulkan/registry.mlx` and
 `vulkan/materialize.mlx` — do not edit it by hand. `vulkan/loader.mlx`

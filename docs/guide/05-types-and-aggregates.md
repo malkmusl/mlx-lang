@@ -317,7 +317,11 @@ pub fn main() u8 {
 ## Arrays and slices
 
 A fixed-size array literal is `[_]T{...}` (size inferred) or `[N]T{...}`
-(size explicit); its type is `[N]T`. A slice, `[]T`, is a pointer+length
+(size explicit); its type is `[N]T`. The `N` of an array type may be any
+value known at compile time, not only a number written out: a named
+constant, another module's constant, an expression over them
+(`[room.ROOM * 2 + 8]u8`); `tests/294_array_length_constant_runtime.mlx`
+covers those. A slice, `[]T`, is a pointer+length
 view and supports Python-style range indexing:
 
 ```mlx
