@@ -211,6 +211,46 @@ exercises every operation at every width and signedness and has four
 threads count on one word through `@atomicRmw` and through a lock made of
 `@cmpxchgWeak` and `@atomicStore`.
 
+### The thread builtins
+
+Two more builtins in `atomics-tls.xml`'s `<Threads>` do what no Mlx
+function can: start a thread, and read the thread pointer.
+
+```mlx
+tcb[0] = @intFromPtr(&tcb)                      // the TCB's own address first
+if linux.syscall2(SYS_arch_prctl, ARCH_SET_FS, @intFromPtr(&tcb)) != 0 { return 1 }
+if @threadPointer() != @intFromPtr(&tcb) { return 2 }
+const tid = @spawnThread(flags, top, @intFromPtr(&shared.parentTid), @intFromPtr(&shared.childTid), @intFromPtr(&childTcb), worker, @intFromPtr(&shared))
+```
+
+- `@threadPointer() -> usize`: the calling thread's thread pointer. On
+  x86_64 that is the word at `fs:0`, where the x86_64 TLS ABI keeps the
+  thread control block's own address (glibc's and musl's threads have it
+  there; a static Mlx program sets `fs` with `arch_prctl(ARCH_SET_FS)` and
+  the word itself); on aarch64 it is `TPIDR_EL0`.
+- `@spawnThread(flags, stack, parent_tid, child_tid, tls, entry, argument)
+  -> isize`: the `clone` system call. The new thread runs on `stack` (the
+  address of its top, 16-byte aligned), gets `tls` as its thread pointer
+  with `CLONE_SETTLS`, and the kernel writes its id to `parent_tid` and
+  `child_tid` for `CLONE_PARENT_SETTID`, `CLONE_CHILD_SETTID` and
+  `CLONE_CHILD_CLEARTID`. It calls `entry(argument)` (`entry` a `fn(usize)
+  -> usize` or its address) and exits with the result; the parent gets the
+  id, or the negated errno.
+
+Why a builtin: the child returns from `clone` on the new stack, so the
+code issuing the system call can not be a function with a frame, and the
+thread pointer lives in a segment register. The backends emit the
+sequence: on x86_64 the entry and the argument are pushed on the new stack,
+`syscall`, and the child pops them, `call`s and exits (`exit`); on aarch64
+the same with `svc`, `blr` and the architecture's argument order. The
+caller's aggregate arena registers are inherited by the child (the
+mapping is shared), so a child of a static program allocates from the
+program's arena; a plugin's exports make their own. Joining is the
+caller's: `CLONE_CHILD_CLEARTID` zeroes `child_tid` when the thread exits
+and wakes it as a shared futex (so the waiter is a shared one too, as
+`tests/298_spawn_thread_runtime.mlx` does with `std.linux.thread.futexWait`).
+These are what mlxlibc builds `pthread_create` and `__errno_location` on.
+
 ### What `atomics-tls.xml` fixes for `threadlocal`
 
 ```xml
@@ -287,6 +327,7 @@ checks one encoder primitive (`lock xadd`) at the byte level.
 | `threadlocal` keyword, scope, initializer rule | Specified at the source level; **no executable TLS ABI** — the compiler rejects any use with `MLX-E9001` |
 | `@atomicLoad`/`@atomicStore`/`@atomicRmw`/`@cmpxchgWeak`/`@cmpxchgStrong`/`@fence`, the six memory orders | Specified (names, call shapes, result types, operations, order rules) and implemented on x86_64 and aarch64 (`tests/295_atomics_runtime.mlx`); Stage 0 (mlx0) still rejects them |
 | Data race definition | Specified (non-atomic concurrent conflicting access with a write is UB); the atomics are the way to share mutable state across threads |
+| `@threadPointer`, `@spawnThread` | Specified (call shapes, the thread pointer's place, the clone semantics) and implemented on x86_64 and aarch64 (`tests/298_spawn_thread_runtime.mlx`) |
 
 Of the three rows, `threadlocal` is the one still closed off: per
 `SPEC_CONFLICTS.md`'s framing, the compiler "cannot emit a private TLS ABI
