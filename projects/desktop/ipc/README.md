@@ -46,6 +46,14 @@ PulseAudio apps).
 dbus-send, gdbus, busctl and dbus-monitor are checked against it
 (`tools/check_ipc.sh`).
 
+`mlx-ipcd --system` is the same bus as the system's: it listens at
+`/run/mlx/bus` (or `--address`) with the socket open to every user, root
+alone may own names, and the policy comes from `/etc/mlx/ipc.conf`.
+Programs reach it through `DBUS_SYSTEM_BUS_ADDRESS=unix:path=/run/mlx/bus`
+(the compositor's logind client reads that variable). It is where a
+display manager of the desktop's own would offer its login and seat
+services.
+
 ## Permissions per app
 
 dbus-daemon's policy is per user, and every program of a desktop session
