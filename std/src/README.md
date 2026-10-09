@@ -18,6 +18,8 @@ server runtimes. `wayland/generated/` holds the modules materialized from
 name and are not re-exported from `std.mlx`.
 
 `json.mlx` (`std.json`) is the allocation-free JSON pull tokenizer.
+`sha2.mlx` (`std.sha2`) has SHA-256, SHA-512, HMAC-SHA256 and
+PBKDF2-HMAC-SHA256.
 `vulkan.mlx` (`std.vulkan`) is the Vulkan API, materialized from
 `std/registry/vulkan/vk.xml` by `vulkan/registry.mlx` and
 `vulkan/materialize.mlx` — do not edit it by hand. `vulkan/loader.mlx`
