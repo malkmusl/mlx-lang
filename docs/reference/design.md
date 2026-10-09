@@ -5,11 +5,11 @@ built on `std.ui` share one design language. It is not GTK's, Qt's or
 macOS's: it is made of three things, and the widgets of
 [`std.ui`](ui.md) draw it on their own, so an app gets it by using them.
 
-## Three ideas
+## Four rules
 
-**Glass.** Surfaces at the window's edges (a side bar, a header or
-toolbar) and everything that floats over the window (a popup, a menu)
-are translucent, and the compositor blurs what is behind them
+**Glass at the edges.** Surfaces at the window's edges (a side bar, a
+header or toolbar) and everything that floats over the window (a popup,
+a menu) are translucent, and the compositor blurs what is behind them
 (`ext-background-effect-v1`; the Mlx compositor offers it, see
 [wayland.md](wayland.md)). A window is clear (alpha 0) under its glass
 and paints the opaque content beside it. In the window, `std.ui.surface`
@@ -21,45 +21,49 @@ A popup is a surface of its own over the window (`host.openPopup`, an
 through it; where a platform has no popups of its own (a phone)
 `std.ui.popup` draws one in the window instead.
 
-**Depth from light, not lines.** Nothing has an outline. A surface that
-floats casts a soft shadow (`canvas.shadow`: layers of rounded
-rectangles, the same pixels on the CPU and the GPU), and a hairline of
-light runs along its top edge (`canvas.topHighlight`). What is on, or
-has the focus, glows in the accent (`surface.glow`): a switch that is
-on, a chosen radio button, a field being typed in, a slider under the
-pointer, a chosen row. Cards (`widgets.cardBegin`) group rows on a page
-and float on their shadow; popups float higher (twice the elevation).
+**Depth from contrast, not effects.** Surfaces are flat and a clear
+step apart: the page, a card on it, a control on the card. Nothing has
+an outline, a highlight or a glow; the one shadow is under what floats
+(a popup, `surface.raised` with an elevation; `canvas.shadow` draws it
+as layers of rounded rectangles, the same pixels on the CPU and the
+GPU). A field with the focus has a ring in the accent; that is the only
+ring.
+
+**One edge, one grid.** Every size is logical pixels times the screen's
+scale (`std.ui.flow`). A page's title, its section labels and the text
+of its rows start on one vertical edge, 16 logical pixels in from the
+cards' edge (`widgets.TEXT_INSET`); a card pads its rows by 8 and the
+controls pad their text by 8, which adds up to the same edge. Rows are
+40 logical pixels tall, 52 with a note under the title, 6 apart; cards
+are 16 apart. Titles and section labels are bold (`view.setBold`,
+`text.loadBoldText`), section labels in the dim colour; everything else
+is the regular face.
 
 **One seed, every colour.** A theme is made from one colour
 (`theme.fromSeed(seed, dark)`), the way Material You makes a palette
-from a wallpaper: the seed's hue carries through everything, strong in
-the accent (at a lightness that reads on the surfaces), faint in the
-surfaces themselves (a near-neutral with a little of the hue), dark or
-light. The desktop takes the seed from mlx-settings (Appearance, "Accent
-colour": `accent-color` in `compositor.conf`,
-`projects/desktop/shared/look.mlx` reads it for every app); a wallpaper's
-colour can take its place later. `theme.dark()` and `theme.light()` are
-the palettes of the default seed, an indigo.
+from a wallpaper: the seed's hue is the accent (at a lightness that
+reads on the surfaces) and a trace of it tints the near-neutral
+surfaces, dark or light. The accent is used sparingly: a switch that is
+on, a chosen radio button, a slider's fill, the primary button, the
+chosen category's icon. The desktop takes the seed from mlx-settings
+(Appearance, "Accent colour": `accent-color` in `compositor.conf`,
+`projects/desktop/shared/look.mlx` reads it for every app); a
+wallpaper's colour can take its place later. `theme.dark()` and
+`theme.light()` are the palettes of the default seed, an indigo.
 
 ## Shapes and sizes
 
 | Thing | Shape |
 | --- | --- |
-| Buttons, fields, segments, value boxes, tabs | rounded, `theme.radius` (10 logical pixels) |
+| Buttons, fields, segments, value boxes, tabs, rows | rounded, `theme.radius` (8 logical pixels) |
 | Switches, chips, pills, scroll thumbs, a slider's trough and handle | capsules |
-| Cards, popups | `theme.largeRadius` (16) |
-| Rows (hover, chosen) | `theme.radius` |
+| Cards, popups | `theme.largeRadius` (12) |
 
-A slider is a trough (14 logical pixels tall) the accent fills up to
-the value, with a narrow handle standing out of the trough at the end of
-the fill; the whole row takes the pointer and the wheel. A chosen
-segment is a raised tile in a sunken trough. A chosen tab is a raised
-tile in the bar. A selected row glows faintly from within.
-
-Rows of settings are 36 logical pixels tall, 48 with a note under the
-title, 6 apart; a card pads them by 8 and the cards are 12 apart
-(`std.ui.widgets`). Every size is logical pixels times the screen's
-scale (`std.ui.flow`), so one layout serves a laptop and a phone.
+A slider is a trough (12 logical pixels tall) the accent fills up to the
+value, with a narrow handle standing out of the trough at the end of the
+fill; the whole row takes the pointer and the wheel. A chosen segment is
+a lighter tile in a darker trough. A chosen tab is a lighter tile in the
+bar. A selected row has the selected fill.
 
 ## Do and don't
 
@@ -70,8 +74,7 @@ scale (`std.ui.flow`), so one layout serves a laptop and a phone.
 - Do group settings in cards; do not draw lines between rows.
 - Do take colours from the theme (`context.theme`), never fixed ones:
   a fixed colour ignores the seed and the light look.
-- Do not draw outlines or borders around controls; a focus or an "on"
-  state is a glow.
+- Do not draw outlines, highlights, glows or shadows around controls.
 - Do not blur in the window itself: the compositor blurs what is behind
   the window, so content never scrolls under a glass bar (the content
   area starts below the bar).
@@ -79,8 +82,8 @@ scale (`std.ui.flow`), so one layout serves a laptop and a phone.
 ## Tests
 
 `tests/296_ui_flow_runtime.mlx` checks the surfaces (a soft shadow's
-falloff, a raised surface's hairline, a bar's shadow) and the rows,
-cards and widgets of `std.ui.flow` and `std.ui.widgets`;
+falloff, a floating surface's shadow, a shadow cast from an edge) and
+the rows, cards and widgets of `std.ui.flow` and `std.ui.widgets`;
 `tests/284_ui_widgets_runtime.mlx` the controls' behaviour under the
 pointer. `tools/emulate_android_app.py` taps the widgets of
 `examples/android/widgets.mlx` on a model of Android.

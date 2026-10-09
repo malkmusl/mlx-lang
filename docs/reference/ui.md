@@ -116,14 +116,15 @@ larger and fainter than the one inside it, so the GPU draws the same
 pixels), `shadowBelow`/`shadowRightOf` (a shadow cast from an edge),
 `topHighlight` (a hairline of light along a top edge) and `fade` (a
 colour at a share of itself). `std.ui.surface` puts them together:
-`raised` (shadow, fill, hairline), `glow` (the accent around what is
-on), `card`, `glass` (a translucent panel the compositor blurs behind,
-see [The Mlx look](design.md)), `bar` and `sidePanel`. A `Canvas` is pixels, or
+`raised` (a flat surface, or one floating on its shadow), `card`,
+`glass` (a translucent panel the compositor blurs behind, see
+[The Mlx look](design.md)), `bar` and `sidePanel`. A `Canvas` is pixels, or
 with `device` a `std.ui.gpu_canvas.Device`: then every call is a command
 the `paint` compute shader draws, the same pixels as the CPU
 (`std.ui.gpu_upload` takes images and glyph atlases to the GPU).
-`std.ui.text` loads a font (`loadText`, `loadMonoText`: the usual places
-on Linux desktops and on Android), `measure`s and `drawText`s.
+`std.ui.text` loads a font (`loadText`, `loadMonoText`, `loadBoldText`:
+the usual places on Linux desktops and on Android), `measure`s and
+`drawText`s.
 `std.ui.glyphs` has the small marks widgets use (check mark, arrows,
 chevron, cross, dot, magnifier, plus).
 
@@ -169,7 +170,7 @@ the next frame.
 | `std.ui.tabs` | a tab bar: tabs with a cross that closes them, a dot for unsaved changes |
 | `std.ui.popup` | a popup's frame (it takes the pointer from what is under it), menu items and separators, tooltips, wrapped text |
 | `std.ui.theme` | colours and sizes from one seed colour: `fromSeed(seed, dark)` (the seed's hue in every colour, as Material You does it), `dark()` and `light()` (the default seed's), `hsl`, `hueOf` |
-| `std.ui.surface` | what the look is made of: `raised`, `glow`, `card`, `glass`, `bar`, `sidePanel`, `hairline` |
+| `std.ui.surface` | what the look is made of: `raised`, `card`, `glass`, `bar`, `sidePanel` |
 | `std.ui.flow` | rows down an area in logical pixels, ids from labels within scopes, see [Rows and cards](#rows-and-cards) |
 | `std.ui.widgets` | the controls as rows of a flow that keep the app's state: `toggle(&bool)`, `check`, `radio`, `segments`/`segment(&usize)`, `slider(&u32)`, `valueRow`, `textField`, `button`, `wideButton`, `section`, `note`, `line`, `infoRow`, `cardBegin`/`cardEnd` |
 | `std.ui.keys` | keys as widgets take them: Linux input codes and modifier bits on every platform |
