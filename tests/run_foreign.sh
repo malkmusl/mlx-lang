@@ -98,9 +98,23 @@ for thread in threads: thread.join()
 grown = resident() - before
 assert not failures, failures[:3]
 assert grown < 4096, grown
+# An exported constant is a data symbol: read where C reads a global, and
+# writable (the plugin reads the word back through the dynamic linker).
+level = ctypes.c_uint32.in_dll(library, "mlx_plugin_level")
+assert level.value == 7, level.value
+library.mlx_plugin_level_now.restype = ctypes.c_uint32
+library.mlx_plugin_level_now.argtypes = []
+assert library.mlx_plugin_level_now() == 7
+level.value = 9
+assert library.mlx_plugin_level_now() == 9, library.mlx_plugin_level_now()
 PY
     then
-        echo "ok   --plugin: a C host calls its exports on four threads, each call on its own arena"
+        if command -v readelf > /dev/null && ! readelf --dyn-syms "$work/libplugin.so" | grep -q "OBJECT.*mlx_plugin_level"; then
+            echo "FAIL --plugin: mlx_plugin_level is not an OBJECT symbol"
+            readelf --dyn-syms "$work/libplugin.so"
+            failures=$((failures + 1))
+        fi
+        echo "ok   --plugin: a C host calls its exports on four threads, each call on its own arena; an export const is its data symbol"
     else
         echo "FAIL --plugin"
         cat "$work/output"

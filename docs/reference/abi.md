@@ -486,7 +486,9 @@ libclang, or header translator (`NoRequiredCParser`).
 `extern("c")` (or `extern` without an ABI string) declares a bodiless
 function with the target's C ABI, imported from a shared library at load
 time under its source name; `export fn` defines an Mlx function the dynamic
-linker (and so C code) can see under its plain name:
+linker (and so C code) can see under its plain name, and `export const`
+(an integer type, a compile-time value) a data symbol it can see (see
+[Formats](formats.md#shared-objects)):
 
 ```mlx
 extern("c") fn dlopen(name: [*]const u8, flags: i32) -> usize

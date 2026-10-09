@@ -160,6 +160,16 @@ the structs it builds grow the caller's arena by exactly their size.
 `projects/desktop/compositor` loads its shell and renderer this way, again
 whenever they are rebuilt.
 
+A module-level `export const NAME: T = value` of an integer type is a data
+symbol of the image (`STT_OBJECT`, in `.data`, its size that of `T`): the
+dynamic linker binds C references to such a variable (`extern enum
+spa_log_level pw_log_level` in PipeWire's headers) to a word holding the
+value, which C code reads and may write. To Mlx the constant stays a
+compile-time value; a library that has to read the word as C sees it finds
+it through the dynamic linker (`tests/support/plugin_library.mlx`,
+`mlx_plugin_level_now`). A dynamically linked executable gets the symbol
+too; a static one has no dynamic symbols.
+
 `--soname=NAME` gives either kind its `DT_SONAME`, and
 `--symbol-version=NAME` a version definition (`.gnu.version_d`: the base
 version, named after the soname, and NAME) with every export at NAME and
