@@ -10,10 +10,12 @@
 #     resampled to the mix's 48000 Hz;
 #   - recordings come back at 48000 Hz stereo and at 16000 Hz mono, and
 #     from a looped file;
-#   - the permissions are MLXIPC's: a sandboxed app (bwrap with a
-#     .flatpak-info) may play but not record until ipc.conf allows it
-#     (`use audio.record`), a deny rule takes playing from an unsandboxed
-#     app, and one taking org.mlx.Audio leaves the app no channel;
+#   - the permissions are MLXIPC's: recording is asked about for every
+#     app (unsandboxed too; with no agent the answer is no) until ipc.conf
+#     allows it (`use audio.record`); a sandboxed app (bwrap with a
+#     .flatpak-info) may play but not record until then, a deny rule
+#     takes playing from an unsandboxed app, and one taking org.mlx.Audio
+#     leaves the app no channel;
 #   - asking (MLXIPC's `ask`, the default for recording): the bus starts
 #     the permission agent (mlx-permissions --answer), a plain answer holds
 #     for the session, a remembered one is a rule; SetPermission
@@ -61,6 +63,14 @@ fail() {
         [[ -f "$work/$log.log" ]] && { echo "--- $log log" >&2; cat "$work/$log.log" >&2; }
     done
     exit 1
+}
+
+# The microphone and the monitors are asked about for every app, sandboxed
+# or not; the check has no agent to answer, so a rule lets its own tool
+# (mlx-audio, unsandboxed) record.
+allow_recording() {
+    printf 'allow mlx-audio use audio.record\nallow mlx-audio use audio.monitor\n' > "$XDG_CONFIG_HOME/mlx/ipc.conf"
+    sleep 0.3
 }
 
 expect() {
@@ -154,8 +164,16 @@ listing=$("$play" streams)
 [[ "$listing" == *"mono44.wav"* && "$listing" == *"50%"* ]] || fail "streams: $listing"
 echo "ok   streams lists both, with their volume"
 wait "$first" "$second"
+# Recording is asked about for every app, sandboxed or not: with no agent
+# to ask, the answer is no until a rule says otherwise.
+if "$play" record "$work/rec.wav" 1 > "$work/out.txt" 2>&1; then fail "an unsandboxed app recorded unasked"; fi
+grep -q "refused" "$work/out.txt" || fail "unsandboxed record: $(cat "$work/out.txt")"
+grep -q "asking the user whether mlx-audio may use audio.record\|no permission agent to ask" "$work/bus.log" || fail "the bus did not try to ask about mlx-audio"
+echo "ok   unsandboxed: recording is asked about too (no agent: refused)"
+allow_recording
 "$play" record "$work/rec.wav" 1 > /dev/null || fail "recording"
 "$play" record "$work/rec16.wav" 1 --rate 16000 --channels 1 > /dev/null || fail "recording at 16000 Hz"
+echo "ok   unsandboxed: records once ipc.conf allows it"
 
 # Permissions.
 if command -v bwrap > /dev/null && bwrap --bind / / true 2> /dev/null; then
@@ -242,8 +260,7 @@ echo "deny mlx-audio use audio.play" > "$XDG_CONFIG_HOME/mlx/ipc.conf"
 sleep 0.3
 if "$play" tone 440 1 > "$work/out.txt" 2>&1; then fail "a denied app played"; fi
 echo "ok   a deny rule takes playing from an unsandboxed app"
-: > "$XDG_CONFIG_HOME/mlx/ipc.conf"
-sleep 0.3
+allow_recording
 
 # An app killed while it plays; a long stream.
 timeout 1 "$play" tone 500 30 || true
@@ -344,7 +361,7 @@ echo "ok   sinks and app settings are kept in audio.conf and undone"
 python3 tools/fake_alsa.py "$work/card" --busy 2 > "$work/fake.log" 2>&1 &
 fake_pid=$!
 for _ in $(seq 1 50); do [[ -f "$work/card/ready" ]] && break; sleep 0.1; done
-: > "$XDG_CONFIG_HOME/mlx/ipc.conf"
+allow_recording
 MLX_SND_DIR="$work/card/snd" MLX_ASOUND_DIR="$work/card/asound" "$work/mlx-audiod" --verbose > "$work/audiod.log" 2>&1 &
 echo $! > "$work/audiod.pid"
 sleep 0.5

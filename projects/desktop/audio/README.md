@@ -59,16 +59,17 @@ deny org.example.Noisy use audio.play
 deny org.example.Spy talk org.mlx.Audio        # no channel at all
 ```
 
-A sandboxed app with no rule for the microphone or the monitors is asked
-about: the stream waits while the user answers in mlx-permissions' dialog
+An app with no rule for the microphone or the monitors is asked about,
+sandboxed or not: the stream waits while the user answers in
+mlx-permissions' dialog
 (`projects/desktop/permissions`). When the rules change the bus says so
 (`org.mlx.IPC.PermissionsChanged`) and the server checks every stream
 again: a recording whose permission went ends.
 
-By default an unsandboxed app may play, record, record what plays and
-control the server (`audio.control`: switch outputs, set volumes, route
-apps; as with PipeWire); a sandboxed one (Flatpak) may play, nothing
-else. A refused
+By default an unsandboxed app may play and control the server
+(`audio.control`: switch outputs, set volumes, route apps; as with
+PipeWire), and is asked before it records or records what plays; a
+sandboxed one (Flatpak) may play, nothing else. A refused
 stream gets REFUSED with the reason, and `mlx-audio` says so. When a rule
 takes recording from an app that records, the server ends its stream
 (ENDED) once it is told to check again (SET's recheck; mlx-settings sends

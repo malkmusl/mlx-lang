@@ -72,15 +72,18 @@ runs as the same user. MLXIPC's is per app, as in hyprtavern:
   (`org.mlx.IPC.Check(s app's connection, s permission) -> b`) before
   they do what it names, so the rules for every service are in one
   place.
-- By default an unsandboxed app may do anything (as on any session bus),
-  and a sandboxed one may own its own names (its id and the names under
-  it), talk to and see those, other connections of the same app, the
-  portals (`org.freedesktop.portal.*`), `org.freedesktop.Notifications`
-  and MLX Audio (`org.mlx.Audio`), and use `audio.play`; it sees nothing
-  else, not even the other connections' unique names. Replies to calls an app made always
-  come back; a reply nobody asked for needs the rules.
-- For a sandboxed app the microphone (`audio.record`) and the sound of
-  other apps (`audio.monitor`) are **asked**: the user decides (below).
+- By default an unsandboxed app may do anything but the two permissions
+  below (as on any session bus), and a sandboxed one may own its own
+  names (its id and the names under it), talk to and see those, other
+  connections of the same app, the portals (`org.freedesktop.portal.*`),
+  `org.freedesktop.Notifications` and MLX Audio (`org.mlx.Audio`), and
+  use `audio.play`; it sees nothing else, not even the other connections'
+  unique names. Replies to calls an app made always come back; a reply
+  nobody asked for needs the rules.
+- The microphone (`audio.record`) and the sound of other apps
+  (`audio.monitor`) are **asked** for every app, sandboxed or not: the
+  user decides (below). A rule (`allow firefox use audio.record`, or the
+  answer remembered) settles it.
 - `~/.config/mlx/ipc.conf` (`--policy FILE`) adds rules, read again when
   it changes (and on SIGHUP, ReloadConfig, `mlx-ipc reload`). The last
   rule that applies wins:

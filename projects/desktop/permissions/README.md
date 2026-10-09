@@ -15,9 +15,9 @@ tools/check_wayland_compositor.sh     # scenario 15: the dialog clicked
 ## How a question is asked
 
 1. A service checks an app's permission with the bus
-   (`org.mlx.IPC.Check`), and the policy says `ask`: by default, a
-   sandboxed app wanting the microphone (`audio.record`) or the sound of
-   other apps (`audio.monitor`), or a rule of `ipc.conf` such as
+   (`org.mlx.IPC.Check`), and the policy says `ask`: by default, any app
+   wanting the microphone (`audio.record`) or the sound of other apps
+   (`audio.monitor`), sandboxed or not, or a rule of `ipc.conf` such as
    `ask org.example.Chat use audio.record`.
 2. The bus holds the Check and calls
    `org.mlx.PermissionAgent.Ask(s app, s permission, b sandboxed) -> (b

@@ -39,7 +39,10 @@ export HOME="$work/home"
 unset PULSE_SERVER PULSE_COOKIE
 mkdir -m 700 "$XDG_RUNTIME_DIR"
 mkdir -p "$XDG_CONFIG_HOME/mlx" "$work/services" "$HOME"
-: > "$XDG_CONFIG_HOME/mlx/ipc.conf"
+# The microphone and the monitors are asked about for every app, sandboxed
+# or not; the check has no agent to answer, so a rule lets its unsandboxed
+# clients record.
+printf 'allow @unsandboxed use audio.record\nallow @unsandboxed use audio.monitor\n' > "$XDG_CONFIG_HOME/mlx/ipc.conf"
 
 fail() {
     echo "FAIL $1" >&2

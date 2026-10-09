@@ -19,9 +19,11 @@
 #   - sink inputs are listed with their app, a stream's volume and the
 #     sink's volume and mute change (pactl), subscribers hear streams come
 #     and go;
-#   - a sandboxed app (bwrap with a .flatpak-info) plays, may not record
-#     until a rule allows it, may not change the server, and its
-#     recording ends when the rule goes;
+#   - recording is asked about for every app (a rule lets the check's
+#     unsandboxed tools record; without it parec is refused); a sandboxed
+#     app (bwrap with a .flatpak-info) plays, may not record until a rule
+#     allows it, may not change the server, and its recording ends when
+#     the rule goes;
 #   - ALSA programs (aplay, arecord, amixer) through the pulse plugin and
 #     asound.conf;
 #   - with Firefox (FIREFOX=PATH, or firefox installed): an <audio>
@@ -53,7 +55,14 @@ export HOME="$work/home"
 unset PULSE_SERVER PULSE_COOKIE
 mkdir -m 700 "$XDG_RUNTIME_DIR"
 mkdir -p "$XDG_CONFIG_HOME/mlx" "$work/services" "$HOME"
-: > "$XDG_CONFIG_HOME/mlx/ipc.conf"
+# The microphone and the monitors are asked about for every app, sandboxed
+# or not; the check has no agent to answer, so a rule lets the unsandboxed
+# tools (parec, arecord, Firefox) record.
+allow_recording() {
+    printf 'allow @unsandboxed use audio.record\nallow @unsandboxed use audio.monitor\n' > "$XDG_CONFIG_HOME/mlx/ipc.conf"
+    sleep 0.3
+}
+allow_recording
 
 "$compiler" --quiet projects/desktop/ipc/main.mlx -o "$work/mlx-ipcd"
 "$compiler" --quiet projects/desktop/ipc/tool.mlx -o "$work/mlx-ipc"
@@ -240,6 +249,15 @@ kill "$subscriber" 2> /dev/null || true
 grep -q "Event 'new' on sink-input" "$work/events.txt" && grep -q "Event 'remove' on sink-input" "$work/events.txt" || fail "events: $(cat "$work/events.txt")"
 echo "ok   subscribers hear a sink input come and go"
 
+# Recording is asked about for every app, sandboxed or not: without the
+# rule (and with no agent to ask) an unsandboxed parec is refused too.
+: > "$XDG_CONFIG_HOME/mlx/ipc.conf"
+sleep 0.3
+if timeout 5 parec --format=s16le > /dev/null 2> "$work/out.txt"; then fail "an unsandboxed app recorded unasked"; fi
+grep -qi "denied" "$work/out.txt" || fail "unsandboxed parec: $(cat "$work/out.txt")"
+echo "ok   unsandboxed: recording is asked about too (no agent: refused)"
+allow_recording
+
 # A sandboxed app.
 if command -v bwrap > /dev/null && bwrap --bind / / true 2> /dev/null; then
     printf '[Application]\nname=org.example.PulsePlayer\n' > "$work/flatpak-info"
@@ -264,7 +282,7 @@ if command -v bwrap > /dev/null && bwrap --bind / / true 2> /dev/null; then
     for _ in $(seq 1 30); do kill -0 "$recorder" 2> /dev/null || break; sleep 0.1; done
     kill -0 "$recorder" 2> /dev/null && { kill "$recorder"; fail "the recording went on after the rule went"; }
     echo "ok   sandboxed: its recording ends when the permission goes ($(tr '\n' ' ' < "$work/taken.txt"))"
-    : > "$XDG_CONFIG_HOME/mlx/ipc.conf"
+    allow_recording
 else
     echo "skip the sandboxed app (no working bwrap)"
 fi
