@@ -107,6 +107,20 @@ library.mlx_plugin_level_now.argtypes = []
 assert library.mlx_plugin_level_now() == 7
 level.value = 9
 assert library.mlx_plugin_level_now() == 9, library.mlx_plugin_level_now()
+# An exported global (`export var`): one word, read and written by the
+# plugin's own code and by the host.
+library.mlx_plugin_count.restype = ctypes.c_uint64
+library.mlx_plugin_count.argtypes = []
+library.mlx_plugin_private_calls.restype = ctypes.c_uint64
+library.mlx_plugin_private_calls.argtypes = []
+calls = ctypes.c_uint64.in_dll(library, "mlx_plugin_calls")
+assert calls.value == 0, calls.value
+assert library.mlx_plugin_count() == 1
+assert calls.value == 1, calls.value
+calls.value = 40
+assert library.mlx_plugin_count() == 41
+assert calls.value == 41, calls.value
+assert library.mlx_plugin_private_calls() == 2
 PY
     then
         if command -v readelf > /dev/null && ! readelf --dyn-syms "$work/libplugin.so" | grep -q "OBJECT.*mlx_plugin_level"; then
@@ -114,7 +128,12 @@ PY
             readelf --dyn-syms "$work/libplugin.so"
             failures=$((failures + 1))
         fi
-        echo "ok   --plugin: a C host calls its exports on four threads, each call on its own arena; an export const is its data symbol"
+        if command -v readelf > /dev/null && ! readelf --dyn-syms "$work/libplugin.so" | grep -q " 8 OBJECT.*mlx_plugin_calls"; then
+            echo "FAIL --plugin: mlx_plugin_calls is not an 8-byte OBJECT symbol"
+            readelf --dyn-syms "$work/libplugin.so"
+            failures=$((failures + 1))
+        fi
+        echo "ok   --plugin: a C host calls its exports on four threads, each call on its own arena; export const and export var are its data symbols"
     else
         echo "FAIL --plugin"
         cat "$work/output"

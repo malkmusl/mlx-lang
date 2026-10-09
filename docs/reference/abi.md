@@ -540,6 +540,23 @@ Struct arguments and returns by value are not classified for C yet; C APIs
 that take structures by pointer (Vulkan, Wayland's C libraries) are fully
 usable.
 
+## Globals
+
+A module-level `var` (`var counter: u32 = 0`, `pub var` for other modules,
+`export var` for C) lives in the image's data area, not in any frame: one
+slot per global after the area's fixed words, aligned to its type and at
+least 8 bytes long, with the initial value of an integer or bool
+initializer written into the image (`undefined` and `null` zero it). Code
+takes a slot's address RIP-relative on x86_64 (`lea reg, [rip + disp32]`
+with a fixup the pipeline resolves against where the area lands) and with
+`adrp`/`add` on aarch64; reads, writes, `&global`, field and index access
+then work on that address exactly as on a local's. Nothing is relocated at
+load time: the area moves with the code, so the same code serves a static
+executable (where the area is the `.data` segment on the page after the
+code), a dynamic one, a `--shared` object and a `--plugin`. An `export var`
+is also an `STT_OBJECT` symbol of `T`'s size, so a C host and the Mlx code
+share one word ([Formats](formats.md#globals)).
+
 ## Atomics
 
 The atomic builtins (`spec/00-language/atomics-tls.xml`, `<CallShapes>`;

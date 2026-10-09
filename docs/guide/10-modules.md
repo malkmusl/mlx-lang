@@ -114,6 +114,33 @@ if cLength(pointer) != 14 || pointer[3] != 75 { return 3 }
 (`tests/249_string_constant_runtime.mlx`, constants in
 `tests/support/strings/constants.mlx`)
 
+A module-level `var` is a global: one slot in the program's data area that
+every function sees, with its initial value (`spec/00-language/modules.xml`
+asks that it be comptime evaluable; an integer or bool, or `undefined` and
+`null` for a zeroed slot, an aggregate among them). `pub var` opens it to
+other modules, which read and write it as `module.name` and may take its
+address:
+
+```mlx
+const globals = @import("./support/module_globals.mlx")
+
+var counter: u32 = 0
+
+fn bump() -> u32 {
+    counter += 1
+    return counter
+}
+
+if globals.count != 3 { return 20 }
+globals.count = 40
+if globals.bump() != 41 { return 22 }
+globals.cursor = &scratch
+```
+
+(`tests/297_module_globals_runtime.mlx`, globals in
+`tests/support/module_globals.mlx`; `export var` makes one a data symbol C
+code shares, see [Formats](../reference/formats.md#globals))
+
 ## Visibility
 
 Only `pub` declarations are visible outside their module. Accessing a
