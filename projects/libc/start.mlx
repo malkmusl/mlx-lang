@@ -1,0 +1,178 @@
+// The entry of mlxlibc as a dynamic loader. The kernel starts a program
+// whose PT_INTERP names this library by entering `__mlx_start` here with
+// the stack as it left it (argc, argv, envp, the aux vector); the main
+// thread gets its control block and thread pointer, loader.mlx maps the
+// program's libraries and relocates everything, and the program's own
+// `_start` is entered with the stack untouched. Run directly
+// (`libmlxc.so.1 PROGRAM ARGS`), it maps PROGRAM itself first. The
+// program's `_start` (crt1.o) then calls `__libc_start_main`, also here.
+const sys = @import("./sys.mlx")
+const tcb = @import("./tcb.mlx")
+const heap = @import("./heap.mlx")
+const loader = @import("./loader.mlx")
+const stdlib = @import("./stdlib.mlx")
+const misc = @import("./misc.mlx")
+const stdio = @import("./stdio.mlx")
+
+const AT_PHDR: usize = 3
+const AT_PHNUM: usize = 5
+const AT_BASE: usize = 7
+const AT_ENTRY: usize = 9
+const AT_RANDOM: usize = 25
+const AT_EXECFN: usize = 31
+const ARCH_SET_FS: usize = 4098
+const PT_INTERP: u32 = 3
+
+// The main thread's control block, with the static TLS area below it,
+// as this thread's thread pointer (fs). Before it, nothing here may
+// touch errno.
+fn makeMainThread(random: usize) -> usize {
+    const region = sys.mmap(loader.MAIN_TLS + tcb.SIZE, sys.PROT_READ | sys.PROT_WRITE, sys.MAP_PRIVATE | sys.MAP_ANONYMOUS | sys.MAP_NORESERVE)
+    if region == sys.MAP_FAILED { loader.fatal("cannot map the main thread's control block", 0) }
+    const block = region + loader.MAIN_TLS
+    tcb.initialize(block)
+    sys.put32(block + tcb.TID, sys.getTid())
+    // The stack protector's guard: random bytes from the kernel, the low
+    // byte zero so a string overflow stops at it.
+    var canary: u64 = 7593726537832627976
+    if random != 0 { canary = sys.get64(random) }
+    sys.put64(block + tcb.CANARY, canary & 18446744073709551360)
+    const set = sys.syscall2(sys.SYS_arch_prctl, ARCH_SET_FS, block)
+    if sys.failed(set) { loader.fatal("cannot set the thread pointer", 0) }
+    return block
+}
+
+// mov rsp, rdi; xor edx, edx; jmp rsi: the program's _start sees the
+// stack as the kernel left it, and no rtld_fini (exit here runs the
+// destructors).
+fn jumpTo(stack: usize, entry: usize) -> void {
+    const page = sys.mmap(sys.PAGE, sys.PROT_READ | sys.PROT_WRITE, sys.MAP_PRIVATE | sys.MAP_ANONYMOUS)
+    if page == sys.MAP_FAILED { loader.fatal("cannot map the start trampoline", 0) }
+    sys.put8(page, 72)
+    sys.put8(page + 1, 137)
+    sys.put8(page + 2, 252)
+    sys.put8(page + 3, 49)
+    sys.put8(page + 4, 210)
+    sys.put8(page + 5, 255)
+    sys.put8(page + 6, 230)
+    const protected = sys.syscall3(sys.SYS_mprotect, page, sys.PAGE, sys.PROT_READ | sys.PROT_EXEC)
+    if sys.failed(protected) { loader.fatal("cannot make the start trampoline executable", 0) }
+    sys.call2(page, stack, entry)
+}
+
+// The path the kernel loaded this library from: the program's PT_INTERP.
+fn interpreterName(phdr: usize, phnum: usize, bias: usize) -> usize {
+    var index: usize = 0
+    while index < phnum {
+        const header = phdr + index * 56
+        if sys.get32(header) == PT_INTERP { return bias + sys.getPointer(header + 16) }
+        index += 1
+    }
+    return sys.literal("libmlxc.so.1")
+}
+
+fn setAux(aux: usize, kind: usize, value: usize) -> void {
+    var at = aux
+    while sys.getPointer(at) != 0 {
+        if sys.getPointer(at) == kind {
+            sys.putPointer(at + 8, value)
+            return
+        }
+        at += 16
+    }
+}
+
+fn banner() -> void {
+    const text = "mlxlibc 0.1: the C library and dynamic loader of Mlx (projects/libc).\nUsage: libmlxc.so.1 PROGRAM [ARGUMENTS]\n  runs PROGRAM with this library as its libc, whatever its PT_INTERP says.\n"
+    const wrote = sys.syscall3(sys.SYS_write, 1, sys.literal(text), text.length)
+}
+
+fn finishHook() -> void { loader.finish() }
+
+pub export fn __mlx_start() -> void {
+    // The kernel's stack: argc, argv..., 0, envp..., 0, the aux vector.
+    var stack = @frameAddress() + 8
+    var argc = sys.getPointer(stack)
+    var argv = stack + 8
+    const envp = argv + (argc + 1) * 8
+    var aux = envp
+    while sys.getPointer(aux) != 0 { aux += 8 }
+    aux += 8
+    loader.auxv = aux
+    const block = makeMainThread(loader.auxValue(AT_RANDOM))
+    var self_base = loader.auxValue(AT_BASE)
+    var program_phdr = loader.auxValue(AT_PHDR)
+    var program_phnum = loader.auxValue(AT_PHNUM)
+    var entry = loader.auxValue(AT_ENTRY)
+    var program_name = loader.auxValue(AT_EXECFN)
+    var program: usize = 0
+    var self_name: usize = 0
+    if self_base == 0 {
+        // Run as a program itself: the aux vector describes this library.
+        self_base = program_phdr - 64
+        self_name = if program_name != 0 { program_name } else { sys.getPointer(argv) }
+        if argc < 2 {
+            banner()
+            const ended = sys.syscall1(sys.SYS_exit_group, 0)
+        }
+        program = loader.mapProgram(sys.getPointer(argv + 8))
+        if program == 0 { loader.fatal("", loader.failure) }
+        // The program's view of the stack: argc one less, argv from its name.
+        argc -= 1
+        stack += 8
+        sys.putPointer(stack, argc)
+        argv = stack + 8
+        program_phdr = sys.getPointer(program + loader.M_PHDR)
+        program_phnum = sys.getPointer(program + loader.M_PHNUM)
+        entry = loader.entryOf(program)
+        program_name = sys.getPointer(program + loader.M_NAME)
+        setAux(aux, AT_PHDR, program_phdr)
+        setAux(aux, AT_PHNUM, program_phnum)
+        setAux(aux, AT_ENTRY, entry)
+        setAux(aux, AT_EXECFN, program_name)
+    } else {
+        if program_name == 0 { program_name = sys.getPointer(argv) }
+        program = loader.fromMemory(program_phdr, program_phnum, program_name, true)
+        if program == 0 { loader.fatal("out of memory at start", 0) }
+        self_name = interpreterName(program_phdr, program_phnum, sys.getPointer(program + loader.M_BASE))
+    }
+    const self_module = loader.fromMemory(self_base + 64, @intCast(usize, sys.get16(self_base + 56)), self_name, false)
+    if self_module == 0 { loader.fatal("out of memory at start", 0) }
+    // This library's exported variables (stdout, environ, optind) are
+    // reached through GOT slots: bound to its own definitions first, so
+    // the standard streams can be set up, whose addresses the program's
+    // copies then take when it is relocated.
+    loader.relocateLocal(self_module)
+    stdio.standardStreams()
+    loader.prepare(program, self_module, argc, argv, envp, aux)
+    // From here on this library's exported variables are the program's.
+    loader.initializeTls(block)
+    stdlib.setEnvironment(envp)
+    misc.setProgramName(sys.getPointer(argv))
+    stdlib.setFiniHook(@intFromPtr(finishHook))
+    loader.constructAll()
+    jumpTo(stack, entry)
+}
+
+// DT_INIT of this library: what the dynamic linker of a process another
+// loader started calls once this library is in (a program linked against
+// libmlxc under glibc's ld.so): the standard streams, so `stdout` and the
+// others name their records from the first use on.
+pub export fn __mlx_init() -> void {
+    stdio.standardStreams()
+}
+
+// What crt1.o's _start calls: the program's constructors (glibc 2.34's
+// crt leaves `init` null and has libc run them), main, exit.
+pub export fn __libc_start_main(main: usize, argc: i32, argv: usize, init: usize, fini: usize, rtld_fini: usize, stack_end: usize) -> i32 {
+    const count = sys.int(argc)
+    const environment = argv + (count + 1) * 8
+    if !loader.active { stdlib.setEnvironment(environment) }
+    // rtld_fini is 0 from this library's loader (exit runs the destructors
+    // itself); another loader's is left alone, its state being its own.
+    sys.call3(init, count, argv, environment)
+    if loader.active { loader.initializeProgram() }
+    const status = sys.call3Result(main, count, argv, stdlib.environ)
+    stdlib.exit(sys.toInt(status))
+    return 0
+}

@@ -31,6 +31,6 @@ mkdir -p "$out"
 
 # A plugin on a stack arena with no C library under it: each export takes
 # its aggregates from its own stack and the image names no DT_NEEDED.
-"$compiler" --quiet --plugin --stack-arena --no-libc --soname=libmlxc.so.1 projects/libc/libc.mlx -o "$out/libmlxc.so.1"
+"$compiler" --quiet --plugin --stack-arena --no-libc --soname=libmlxc.so.1 --entry=__mlx_start --init=__mlx_init projects/libc/libc.mlx -o "$out/libmlxc.so.1"
 ln -sfn libmlxc.so.1 "$out/libmlxc.so"
 echo "built $out/libmlxc.so.1"

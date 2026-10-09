@@ -1,0 +1,1396 @@
+// The dynamic loader: mlxlibc as a program's PT_INTERP (as musl's libc.so
+// is its own loader) and the machinery behind dlopen. It maps the
+// program's DT_NEEDED libraries (the names of glibc's pieces, libc.so.6
+// and the rest, are this library itself), lays out their static TLS below
+// each thread's control block, applies their relocations (symbol versions
+// are not compared: whatever defines a name first in load order is it),
+// runs their constructors, and keeps the list of what is loaded for
+// dlsym, dladdr and dl_iterate_phdr. start.mlx is the entry that drives
+// it when the kernel starts a program with this library as interpreter.
+const sys = @import("./sys.mlx")
+const heap = @import("./heap.mlx")
+const tcb = @import("./tcb.mlx")
+
+// --- a loaded object -------------------------------------------------------
+// The record's first five words are glibc's struct link_map (l_addr,
+// l_name, l_ld, l_next, l_prev), so dlinfo(RTLD_DI_LINKMAP) and a debugger
+// walking _r_debug read what they expect; the rest is this loader's.
+pub const M_BASE: usize = 0           // the load bias (0 for a fixed executable)
+pub const M_NAME: usize = 8           // the path, a C string
+pub const M_DYNAMIC: usize = 16       // the dynamic section's address
+pub const M_NEXT: usize = 24
+pub const M_PREV: usize = 32
+pub const M_PHDR: usize = 40
+pub const M_PHNUM: usize = 48
+const M_SYMTAB: usize = 56
+const M_STRTAB: usize = 64
+const M_GNU_HASH: usize = 72
+const M_HASH: usize = 80
+const M_RELA: usize = 88
+const M_RELASZ: usize = 96
+const M_JMPREL: usize = 104
+const M_PLTRELSZ: usize = 112
+const M_RELR: usize = 120
+const M_RELRSZ: usize = 128
+const M_INIT: usize = 136
+const M_INIT_ARRAY: usize = 144
+const M_INIT_ARRAYSZ: usize = 152
+const M_FINI: usize = 160
+const M_FINI_ARRAY: usize = 168
+const M_FINI_ARRAYSZ: usize = 176
+const M_TLS_IMAGE: usize = 184        // the initialization image's address
+const M_TLS_FILESZ: usize = 192
+const M_TLS_MEMSZ: usize = 200
+const M_TLS_ALIGN: usize = 208
+pub const M_TLS_OFFSET: usize = 216   // the block's distance below the thread pointer
+pub const M_TLS_ID: usize = 224       // the module id of DTPMOD64 (0: no TLS)
+pub const M_MAP_START: usize = 232
+pub const M_MAP_END: usize = 240
+const M_SONAME: usize = 248           // C string (0 for none)
+const M_RUNPATH: usize = 256          // DT_RUNPATH, else DT_RPATH (0 for none)
+const M_FLAGS: usize = 264
+const M_REFERENCES: usize = 272       // dlopen handles outstanding
+const M_DEPS: usize = 280             // the DT_NEEDED modules, an array of pointers
+const M_DEP_COUNT: usize = 288
+const M_SYMBOL_COUNT: usize = 296
+const M_RELRO_START: usize = 304
+const M_RELRO_SIZE: usize = 312
+const M_ENTRY: usize = 320            // an executable's entry point
+const M_SIZE: usize = 384
+
+const F_RELOCATED: u64 = 1
+const F_INITIALIZED: u64 = 2
+pub const F_SELF: u64 = 4             // this library
+pub const F_PROGRAM: u64 = 8          // the executable
+const F_FINISHED: u64 = 16            // its destructors ran
+const F_TEXTREL: u64 = 32
+
+// ELF constants.
+const PT_LOAD: u32 = 1
+const PT_DYNAMIC: u32 = 2
+const PT_PHDR: u32 = 6
+const PT_TLS: u32 = 7
+const PT_GNU_RELRO: u32 = 1685382482
+const PF_X: u32 = 1
+const PF_W: u32 = 2
+const PF_R: u32 = 4
+const ET_EXEC: u16 = 2
+const ET_DYN: u16 = 3
+const SHN_UNDEF: u16 = 0
+const STB_LOCAL: u8 = 0
+const STB_WEAK: u8 = 2
+const STT_TLS: u8 = 6
+const STT_GNU_IFUNC: u8 = 10
+const STV_PROTECTED: u8 = 3
+
+const R_X86_64_64: u32 = 1
+const R_X86_64_COPY: u32 = 5
+const R_X86_64_GLOB_DAT: u32 = 6
+const R_X86_64_JUMP_SLOT: u32 = 7
+const R_X86_64_RELATIVE: u32 = 8
+const R_X86_64_DTPMOD64: u32 = 16
+const R_X86_64_DTPOFF64: u32 = 17
+const R_X86_64_TPOFF64: u32 = 18
+const R_X86_64_IRELATIVE: u32 = 37
+
+// The modules in load order (the program first), and this library's own.
+pub var first: usize = 0
+pub var last: usize = 0
+pub var count: usize = 0
+pub var selfModule: usize = 0
+pub var programModule: usize = 0
+// Whether this library is the process's loader (started by start.mlx).
+pub var active: bool = false
+var loaderLock: u32 = 0
+// What the program was started with, for constructors.
+pub var argc: usize = 0
+pub var argv: usize = 0
+pub var envp: usize = 0
+pub var auxv: usize = 0
+var libraryPath: usize = 0        // LD_LIBRARY_PATH's value (0 for none)
+var secure: bool = false          // AT_SECURE: no environment paths
+var debug: bool = false           // MLX_LD_DEBUG: say what is loaded
+// Static TLS: the extent assigned so far below the thread pointer, the
+// module ids given out, the size every thread reserves (fixed once the
+// program's libraries are in: a surplus for dlopen).
+var tlsEnd: usize = 0
+var tlsModules: usize = 0
+var tlsReserved: usize = 0
+const TLS_SURPLUS: usize = 32768
+const TLS_ALIGNMENT: usize = 64
+// The last failure, for dlerror (a C string).
+pub var failure: usize = 0
+// gdb's view: struct r_debug (version, the list, a breakpoint, the state,
+// this library's base), reached through the program's DT_DEBUG entry, and
+// the function it breaks on when the list changes.
+var rDebug: [5]u64 = [5]u64{ 1, 0, 0, 0, 0 }
+pub export fn _dl_debug_state() -> void {}
+
+// --- messages ----------------------------------------------------------------
+
+fn writeText(text: []const u8) -> void {
+    const wrote = sys.syscall3(sys.SYS_write, 2, sys.literal(text), text.length)
+}
+
+fn writeC(address: usize) -> void {
+    if address == 0 { return }
+    const wrote = sys.syscall3(sys.SYS_write, 2, address, sys.length(address))
+}
+
+fn warn(text: []const u8, name: usize) -> void {
+    writeText("mlxlibc: ")
+    writeText(text)
+    writeC(name)
+    writeText("\n")
+}
+
+pub fn fatal(text: []const u8, name: usize) -> void {
+    warn(text, name)
+    const ended = sys.syscall1(sys.SYS_exit_group, 127)
+}
+
+fn fail(text: []const u8, name: usize) -> void {
+    // The message kept for dlerror: text, then the name.
+    const length = text.length + (if name != 0 { sys.length(name) } else { 0 })
+    const block = heap.allocate(length + 1, 16)
+    if block == 0 {
+        failure = sys.literal(text)
+        return
+    }
+    sys.copy(block, sys.literal(text), text.length)
+    if name != 0 { sys.copy(block + text.length, name, sys.length(name)) }
+    sys.put8(block + length, 0)
+    failure = block
+    if active && debug { warn(text, name) }
+}
+
+fn pageDown(value: usize) -> usize { return value & ~(sys.PAGE - 1) }
+fn pageUp(value: usize) -> usize { return (value + sys.PAGE - 1) & ~(sys.PAGE - 1) }
+fn alignUp(value: usize, alignment: usize) -> usize {
+    if alignment <= 1 { return value }
+    return (value + alignment - 1) & ~(alignment - 1)
+}
+
+// --- the list ----------------------------------------------------------------
+
+fn newModule(name: usize) -> usize {
+    const module = heap.allocate(M_SIZE, 16)
+    if module == 0 { return 0 }
+    sys.fill(module, 0, M_SIZE)
+    sys.putPointer(module + M_NAME, name)
+    return module
+}
+
+fn append(module: usize) -> void {
+    sys.putPointer(module + M_PREV, last)
+    if last != 0 { sys.putPointer(last + M_NEXT, module) } else { first = module }
+    last = module
+    count += 1
+}
+
+fn flags(module: usize) -> u64 { return sys.get64(module + M_FLAGS) }
+fn addFlag(module: usize, flag: u64) -> void { sys.put64(module + M_FLAGS, flags(module) | flag) }
+fn base(module: usize) -> usize { return sys.getPointer(module + M_BASE) }
+
+// A copy of a C string on the heap.
+fn copyString(text: usize) -> usize {
+    const length = sys.length(text)
+    const block = heap.allocate(length + 1, 16)
+    if block == 0 { return 0 }
+    sys.copy(block, text, length + 1)
+    return block
+}
+
+fn sameText(first_text: usize, second_text: usize) -> bool {
+    if first_text == 0 || second_text == 0 { return false }
+    return sys.same(sys.slice(first_text), sys.slice(second_text))
+}
+
+// The file name part of a path.
+fn baseName(path: usize) -> usize {
+    var at = path
+    var start = path
+    while sys.get8(at) != 0 {
+        if sys.get8(at) == 47 { start = at + 1 }
+        at += 1
+    }
+    return start
+}
+
+fn hasSlash(name: usize) -> bool {
+    var at = name
+    while sys.get8(at) != 0 {
+        if sys.get8(at) == 47 { return true }
+        at += 1
+    }
+    return false
+}
+
+// --- the dynamic section -----------------------------------------------------
+
+// A dynamic section's address value plus the load bias; one another loader
+// relocated in place already (glibc's ld.so does, for the program this
+// library is loaded into) is absolute and stays.
+fn placed(bias: usize, value: usize) -> usize {
+    if bias != 0 && value >= bias { return value }
+    return bias + value
+}
+
+fn parseDynamic(module: usize) -> void {
+    const dynamic = sys.getPointer(module + M_DYNAMIC)
+    const bias = base(module)
+    if dynamic == 0 { return }
+    var soname_offset: usize = 0
+    var runpath_offset: usize = 0
+    var rpath_offset: usize = 0
+    var at = dynamic
+    while sys.get64(at) != 0 {
+        const tag = sys.get64(at)
+        const value = sys.getPointer(at + 8)
+        if tag == 2 { sys.putPointer(module + M_PLTRELSZ, value) } else if tag == 4 { sys.putPointer(module + M_HASH, placed(bias, value)) } else if tag == 5 { sys.putPointer(module + M_STRTAB, placed(bias, value)) } else if tag == 6 { sys.putPointer(module + M_SYMTAB, placed(bias, value)) } else if tag == 7 { sys.putPointer(module + M_RELA, placed(bias, value)) } else if tag == 8 { sys.putPointer(module + M_RELASZ, value) } else if tag == 12 { sys.putPointer(module + M_INIT, placed(bias, value)) } else if tag == 13 { sys.putPointer(module + M_FINI, placed(bias, value)) } else if tag == 14 { soname_offset = value } else if tag == 15 { rpath_offset = value } else if tag == 23 { sys.putPointer(module + M_JMPREL, placed(bias, value)) } else if tag == 25 { sys.putPointer(module + M_INIT_ARRAY, placed(bias, value)) } else if tag == 26 { sys.putPointer(module + M_FINI_ARRAY, placed(bias, value)) } else if tag == 27 { sys.putPointer(module + M_INIT_ARRAYSZ, value) } else if tag == 28 { sys.putPointer(module + M_FINI_ARRAYSZ, value) } else if tag == 29 { runpath_offset = value } else if tag == 30 { if value & 4 != 0 { addFlag(module, F_TEXTREL) } } else if tag == 35 { sys.putPointer(module + M_RELRSZ, value) } else if tag == 36 { sys.putPointer(module + M_RELR, placed(bias, value)) } else if tag == 1879047925 { sys.putPointer(module + M_GNU_HASH, placed(bias, value)) }
+        at += 16
+    }
+    const strtab = sys.getPointer(module + M_STRTAB)
+    if strtab != 0 {
+        if soname_offset != 0 { sys.putPointer(module + M_SONAME, strtab + soname_offset) }
+        if runpath_offset != 0 { sys.putPointer(module + M_RUNPATH, strtab + runpath_offset) } else if rpath_offset != 0 { sys.putPointer(module + M_RUNPATH, strtab + rpath_offset) }
+    }
+    sys.putPointer(module + M_SYMBOL_COUNT, countSymbols(module))
+}
+
+// How many entries the symbol table has: the hash tables know.
+fn countSymbols(module: usize) -> usize {
+    const gnu = sys.getPointer(module + M_GNU_HASH)
+    if gnu != 0 {
+        const buckets_count = @intCast(usize, sys.get32(gnu))
+        const symbol_offset = @intCast(usize, sys.get32(gnu + 4))
+        const bloom_size = @intCast(usize, sys.get32(gnu + 8))
+        const buckets = gnu + 16 + bloom_size * 8
+        const chains = buckets + buckets_count * 4
+        var highest: usize = 0
+        var index: usize = 0
+        while index < buckets_count {
+            const start = @intCast(usize, sys.get32(buckets + index * 4))
+            if start > highest { highest = start }
+            index += 1
+        }
+        if highest == 0 { return symbol_offset }
+        while sys.get32(chains + (highest - symbol_offset) * 4) & 1 == 0 { highest += 1 }
+        return highest + 1
+    }
+    const sysv = sys.getPointer(module + M_HASH)
+    if sysv != 0 { return @intCast(usize, sys.get32(sysv + 4)) }
+    return 0
+}
+
+// --- program headers -------------------------------------------------------------
+
+// What the program headers say: the dynamic section, TLS, RELRO, the
+// mapped range (for a module whose segments are in memory already).
+fn readHeaders(module: usize, phdr: usize, phnum: usize) -> void {
+    const bias = base(module)
+    sys.putPointer(module + M_PHDR, phdr)
+    sys.putPointer(module + M_PHNUM, phnum)
+    var lowest: usize = 18446744073709551615
+    var highest: usize = 0
+    var index: usize = 0
+    while index < phnum {
+        const header = phdr + index * 56
+        const kind = sys.get32(header)
+        const vaddr = sys.getPointer(header + 16)
+        const filesz = sys.getPointer(header + 32)
+        const memsz = sys.getPointer(header + 40)
+        if kind == PT_LOAD {
+            if bias + pageDown(vaddr) < lowest { lowest = bias + pageDown(vaddr) }
+            if bias + vaddr + memsz > highest { highest = bias + vaddr + memsz }
+        } else if kind == PT_DYNAMIC {
+            sys.putPointer(module + M_DYNAMIC, bias + vaddr)
+        } else if kind == PT_TLS {
+            sys.putPointer(module + M_TLS_IMAGE, bias + vaddr)
+            sys.putPointer(module + M_TLS_FILESZ, filesz)
+            sys.putPointer(module + M_TLS_MEMSZ, memsz)
+            sys.putPointer(module + M_TLS_ALIGN, sys.getPointer(header + 48))
+        } else if kind == PT_GNU_RELRO {
+            sys.putPointer(module + M_RELRO_START, bias + vaddr)
+            sys.putPointer(module + M_RELRO_SIZE, memsz)
+        }
+        index += 1
+    }
+    if lowest == 18446744073709551615 { lowest = 0 }
+    sys.putPointer(module + M_MAP_START, lowest)
+    sys.putPointer(module + M_MAP_END, highest)
+}
+
+// A module for an image in memory already: the program the kernel mapped
+// (its headers from the aux vector) or this library (its own headers).
+pub fn fromMemory(phdr: usize, phnum: usize, name: usize, program: bool) -> usize {
+    var bias: usize = 0
+    var index: usize = 0
+    var found_phdr = false
+    while index < phnum {
+        const header = phdr + index * 56
+        if sys.get32(header) == PT_PHDR {
+            bias = phdr - sys.getPointer(header + 16)
+            found_phdr = true
+        }
+        index += 1
+    }
+    if !found_phdr {
+        // No PT_PHDR: the headers follow the ELF header in the first load.
+        index = 0
+        while index < phnum {
+            const header = phdr + index * 56
+            if sys.get32(header) == PT_LOAD && sys.getPointer(header + 8) == 0 {
+                bias = phdr - 64 - sys.getPointer(header + 16)
+                index = phnum
+            }
+            index += 1
+        }
+    }
+    const module = newModule(name)
+    if module == 0 { return 0 }
+    sys.putPointer(module + M_BASE, bias)
+    readHeaders(module, phdr, phnum)
+    parseDynamic(module)
+    if program { addFlag(module, F_PROGRAM) }
+    append(module)
+    return module
+}
+
+// --- mapping a file ------------------------------------------------------------
+
+fn protection(flags_value: u32) -> usize {
+    var prot: usize = 0
+    if flags_value & PF_R != 0 { prot |= sys.PROT_READ }
+    if flags_value & PF_W != 0 { prot |= sys.PROT_WRITE }
+    if flags_value & PF_X != 0 { prot |= sys.PROT_EXEC }
+    return prot
+}
+
+// Maps an ELF file's PT_LOAD segments (a shared object anywhere, an
+// executable at its addresses) and returns its module, appended to the
+// list; 0 with `failure` set otherwise.
+fn mapFile(fd: i32, path: usize, program: bool) -> usize {
+    var header: [64]u8 = undefined
+    const header_address = @intFromPtr(&header)
+    const got = sys.syscall4(sys.SYS_pread64, sys.int(fd), header_address, 64, 0)
+    if got != 64 || sys.get32(header_address) != 1179403647 || sys.get8(header_address + 4) != 2 || sys.get16(header_address + 18) != 62 {
+        fail("not an x86_64 ELF file: ", path)
+        return 0
+    }
+    const kind = sys.get16(header_address + 16)
+    if kind != ET_DYN && kind != ET_EXEC {
+        fail("neither a shared object nor an executable: ", path)
+        return 0
+    }
+    const entry = sys.getPointer(header_address + 24)
+    const phoff = sys.getPointer(header_address + 32)
+    const phnum = @intCast(usize, sys.get16(header_address + 56))
+    const headers_size = phnum * 56
+    const headers = heap.allocate(headers_size, 16)
+    if headers == 0 {
+        fail("out of memory loading ", path)
+        return 0
+    }
+    const read_headers = sys.syscall4(sys.SYS_pread64, sys.int(fd), headers, headers_size, phoff)
+    if read_headers != @intCast(isize, headers_size) {
+        heap.release(headers)
+        fail("cannot read the program headers of ", path)
+        return 0
+    }
+    // The span of the loadable segments.
+    var lowest: usize = 18446744073709551615
+    var highest: usize = 0
+    var index: usize = 0
+    while index < phnum {
+        const segment = headers + index * 56
+        if sys.get32(segment) == PT_LOAD {
+            const vaddr = sys.getPointer(segment + 16)
+            const memsz = sys.getPointer(segment + 40)
+            if pageDown(vaddr) < lowest { lowest = pageDown(vaddr) }
+            if pageUp(vaddr + memsz) > highest { highest = pageUp(vaddr + memsz) }
+        }
+        index += 1
+    }
+    if highest <= lowest {
+        heap.release(headers)
+        fail("nothing to load in ", path)
+        return 0
+    }
+    var bias: usize = 0
+    if kind == ET_DYN {
+        // Reserve the whole span, then map the segments over it.
+        const reserved = sys.syscall6(sys.SYS_mmap, 0, highest - lowest, 0, sys.MAP_PRIVATE | sys.MAP_ANONYMOUS, sys.MAP_FAILED, 0)
+        if sys.failed(reserved) {
+            heap.release(headers)
+            fail("cannot reserve address space for ", path)
+            return 0
+        }
+        bias = @bitCast(usize, reserved) - lowest
+    }
+    index = 0
+    while index < phnum {
+        const segment = headers + index * 56
+        if sys.get32(segment) == PT_LOAD {
+            const prot = protection(sys.get32(segment + 4))
+            const offset = sys.getPointer(segment + 8)
+            const vaddr = sys.getPointer(segment + 16)
+            const filesz = sys.getPointer(segment + 32)
+            const memsz = sys.getPointer(segment + 40)
+            const start = bias + pageDown(vaddr)
+            const file_end = bias + vaddr + filesz
+            const memory_end = bias + vaddr + memsz
+            if filesz > 0 {
+                const mapped = sys.syscall6(sys.SYS_mmap, start, pageUp(file_end) - start, prot, sys.MAP_PRIVATE | sys.MAP_FIXED, sys.int(fd), pageDown(offset))
+                if sys.failed(mapped) {
+                    heap.release(headers)
+                    fail("cannot map a segment of ", path)
+                    return 0
+                }
+            }
+            if memsz > filesz {
+                // The tail of the last file page is zeroed; the rest is fresh.
+                if pageUp(file_end) > file_end && prot & sys.PROT_WRITE != 0 { sys.fill(file_end, 0, pageUp(file_end) - file_end) }
+                if pageUp(memory_end) > pageUp(file_end) {
+                    const zeroed = sys.syscall6(sys.SYS_mmap, pageUp(file_end), pageUp(memory_end) - pageUp(file_end), prot, sys.MAP_PRIVATE | sys.MAP_FIXED | sys.MAP_ANONYMOUS, sys.MAP_FAILED, 0)
+                    if sys.failed(zeroed) {
+                        heap.release(headers)
+                        fail("cannot map the zeroed part of ", path)
+                        return 0
+                    }
+                }
+            }
+        }
+        index += 1
+    }
+    // The headers as mapped: in the segment that starts at file offset 0.
+    var phdr_address: usize = 0
+    index = 0
+    while index < phnum {
+        const segment = headers + index * 56
+        if sys.get32(segment) == PT_LOAD && sys.getPointer(segment + 8) == 0 && phdr_address == 0 {
+            phdr_address = bias + sys.getPointer(segment + 16) + phoff
+        }
+        index += 1
+    }
+    heap.release(headers)
+    if phdr_address == 0 {
+        fail("program headers outside the image of ", path)
+        return 0
+    }
+    const module = newModule(path)
+    if module == 0 {
+        fail("out of memory loading ", path)
+        return 0
+    }
+    sys.putPointer(module + M_BASE, bias)
+    sys.putPointer(module + M_ENTRY, bias + entry)
+    readHeaders(module, phdr_address, phnum)
+    parseDynamic(module)
+    if program { addFlag(module, F_PROGRAM) }
+    append(module)
+    if debug {
+        warn("loaded ", path)
+    }
+    return module
+}
+
+// --- finding libraries ---------------------------------------------------------
+
+// The names of glibc's pieces: all of them are this library.
+fn isSelfName(name: usize) -> bool {
+    const text = sys.slice(name)
+    return sys.same(text, "libc.so.6") || sys.same(text, "libpthread.so.0") || sys.same(text, "libdl.so.2") || sys.same(text, "librt.so.1") || sys.same(text, "libutil.so.1") || sys.same(text, "ld-linux-x86-64.so.2") || sys.same(text, "libmlxc.so.1") || sys.same(text, "libmlxc.so")
+}
+
+pub fn findLoaded(name: usize) -> usize {
+    var module = first
+    const file = baseName(name)
+    while module != 0 {
+        const path = sys.getPointer(module + M_NAME)
+        if sameText(path, name) || sameText(sys.getPointer(module + M_SONAME), name) || (path != 0 && sameText(baseName(path), file)) { return module }
+        module = sys.getPointer(module + M_NEXT)
+    }
+    return 0
+}
+
+// Tries `directory/name` (directory `length` bytes long) into `buffer`.
+fn tryOpen(directory: usize, length: usize, name: usize, buffer: usize) -> i32 {
+    const name_length = sys.length(name)
+    if length + 1 + name_length + 1 > 4096 { return -1 }
+    sys.copy(buffer, directory, length)
+    sys.put8(buffer + length, 47)
+    sys.copy(buffer + length + 1, name, name_length + 1)
+    const fd = sys.syscall4(sys.SYS_openat, sys.AT_FDCWD, buffer, sys.O_RDONLY | sys.O_CLOEXEC, 0)
+    if sys.failed(fd) { return -1 }
+    return @intCast(i32, fd)
+}
+
+// Whether the directory entry at `at` starts with $ORIGIN.
+fn startsWithOrigin(at: usize) -> bool {
+    const origin = "$ORIGIN"
+    var index: usize = 0
+    while index < origin.length {
+        if sys.get8(at + index) != origin[index] { return false }
+        index += 1
+    }
+    return true
+}
+
+// Tries the colon-separated directories of `list`; $ORIGIN is the
+// requester's directory.
+fn tryList(list: usize, name: usize, requester: usize, buffer: usize) -> i32 {
+    var at = list
+    var more = true
+    while more {
+        var end = at
+        while sys.get8(end) != 0 && sys.get8(end) != 58 { end += 1 }
+        if end > at {
+            var directory = at
+            var length = end - at
+            var expanded: usize = 0
+            if length >= 7 && requester != 0 && startsWithOrigin(at) {
+                // The requester's directory, then the rest of the entry.
+                const path = sys.getPointer(requester + M_NAME)
+                const origin_length = baseName(path) - path
+                const rest = length - 7
+                expanded = heap.allocate(origin_length + rest + 2, 16)
+                if expanded != 0 {
+                    var prefix: usize = 1
+                    if origin_length > 1 {
+                        prefix = origin_length - 1
+                        sys.copy(expanded, path, prefix)
+                    } else {
+                        sys.put8(expanded, 46)
+                    }
+                    sys.copy(expanded + prefix, at + 7, rest)
+                    directory = expanded
+                    length = prefix + rest
+                }
+            }
+            const fd = tryOpen(directory, length, name, buffer)
+            if expanded != 0 { heap.release(expanded) }
+            if fd >= 0 { return fd }
+        }
+        if sys.get8(end) == 0 { more = false } else { at = end + 1 }
+    }
+    return -1
+}
+
+// Opens the library `name` for `requester`: a path as it is, else through
+// the requester's runpath, LD_LIBRARY_PATH, and the system's directories.
+// The path found is written to `buffer` (4096 bytes).
+fn openLibrary(name: usize, requester: usize, buffer: usize) -> i32 {
+    if hasSlash(name) {
+        const fd = sys.syscall4(sys.SYS_openat, sys.AT_FDCWD, name, sys.O_RDONLY | sys.O_CLOEXEC, 0)
+        if sys.failed(fd) { return -1 }
+        sys.copy(buffer, name, sys.length(name) + 1)
+        return @intCast(i32, fd)
+    }
+    if requester != 0 {
+        const runpath = sys.getPointer(requester + M_RUNPATH)
+        if runpath != 0 {
+            const fd = tryList(runpath, name, requester, buffer)
+            if fd >= 0 { return fd }
+        }
+    }
+    if programModule != 0 && programModule != requester {
+        const runpath = sys.getPointer(programModule + M_RUNPATH)
+        if runpath != 0 {
+            const fd = tryList(runpath, name, programModule, buffer)
+            if fd >= 0 { return fd }
+        }
+    }
+    if libraryPath != 0 && !secure {
+        const fd = tryList(libraryPath, name, requester, buffer)
+        if fd >= 0 { return fd }
+    }
+    return tryList(sys.literal("/lib/mlx:/usr/lib/mlx:/usr/local/lib:/lib/x86_64-linux-gnu:/usr/lib/x86_64-linux-gnu:/lib64:/usr/lib64:/lib:/usr/lib"), name, requester, buffer)
+}
+
+// The module for `name` needed by `requester`: loaded already, this
+// library (glibc's names), or mapped now; 0 with `failure` set.
+fn dependency(name: usize, requester: usize) -> usize {
+    if isSelfName(name) { return selfModule }
+    const loaded = findLoaded(name)
+    if loaded != 0 { return loaded }
+    const buffer = heap.allocate(4096, 16)
+    if buffer == 0 {
+        fail("out of memory loading ", name)
+        return 0
+    }
+    const fd = openLibrary(name, requester, buffer)
+    if fd < 0 {
+        heap.release(buffer)
+        fail("cannot find the library ", name)
+        return 0
+    }
+    const path = copyString(buffer)
+    heap.release(buffer)
+    const module = mapFile(fd, path, false)
+    const closed = sys.syscall1(sys.SYS_close, sys.int(fd))
+    return module
+}
+
+// Loads the DT_NEEDED libraries of every module from `start` on (those
+// appended on the way included: breadth-first), recording each module's
+// dependencies. False with `failure` set when one is missing.
+fn loadNeeded(start: usize) -> bool {
+    var module = start
+    while module != 0 {
+        if sys.getPointer(module + M_DEPS) == 0 && flags(module) & F_SELF == 0 {
+            const dynamic = sys.getPointer(module + M_DYNAMIC)
+            const strtab = sys.getPointer(module + M_STRTAB)
+            var needed: usize = 0
+            var at = dynamic
+            while dynamic != 0 && sys.get64(at) != 0 {
+                if sys.get64(at) == 1 { needed += 1 }
+                at += 16
+            }
+            const deps = heap.allocate((needed + 1) * 8, 16)
+            if deps == 0 {
+                fail("out of memory loading dependencies", 0)
+                return false
+            }
+            var filled: usize = 0
+            at = dynamic
+            while dynamic != 0 && sys.get64(at) != 0 {
+                if sys.get64(at) == 1 {
+                    const dep = dependency(strtab + sys.getPointer(at + 8), module)
+                    if dep == 0 { return false }
+                    sys.putPointer(deps + filled * 8, dep)
+                    filled += 1
+                }
+                at += 16
+            }
+            sys.putPointer(module + M_DEPS, deps)
+            sys.putPointer(module + M_DEP_COUNT, filled)
+        }
+        module = sys.getPointer(module + M_NEXT)
+    }
+    return true
+}
+
+// --- symbols ---------------------------------------------------------------------
+
+fn gnuHash(name: usize) -> u32 {
+    var hash: u32 = 5381
+    var at = name
+    while sys.get8(at) != 0 {
+        hash = hash *% 33 +% @intCast(u32, sys.get8(at))
+        at += 1
+    }
+    return hash
+}
+
+fn sysvHash(name: usize) -> u32 {
+    var hash: u32 = 0
+    var at = name
+    while sys.get8(at) != 0 {
+        hash = (hash << 4) +% @intCast(u32, sys.get8(at))
+        const high = hash & 4026531840
+        if high != 0 { hash ^= high >> 24 }
+        hash &= ~high
+        at += 1
+    }
+    return hash
+}
+
+// Whether symbol entry `symbol` defines `name` as something another object
+// may bind to (not undefined, not local, not hidden); TLS symbols only
+// when asked for.
+fn defines(module: usize, symbol: usize, name: usize, want_tls: bool) -> bool {
+    if sys.get16(symbol + 6) == SHN_UNDEF { return false }
+    const info = sys.get8(symbol + 4)
+    const binding = info >> 4
+    const kind = info & 15
+    if binding == STB_LOCAL { return false }
+    if (kind == STT_TLS) != want_tls { return false }
+    const visibility = sys.get8(symbol + 5) & 3
+    if visibility == 1 || visibility == 2 { return false }
+    const strtab = sys.getPointer(module + M_STRTAB)
+    return sameText(strtab + @intCast(usize, sys.get32(symbol)), name)
+}
+
+// The symbol entry defining `name` in `module` (0 for none).
+pub fn lookupIn(module: usize, name: usize, want_tls: bool) -> usize {
+    const symtab = sys.getPointer(module + M_SYMTAB)
+    if symtab == 0 { return 0 }
+    const gnu = sys.getPointer(module + M_GNU_HASH)
+    if gnu != 0 {
+        const hash = gnuHash(name)
+        const buckets_count = @intCast(usize, sys.get32(gnu))
+        const symbol_offset = @intCast(usize, sys.get32(gnu + 4))
+        const bloom_size = @intCast(usize, sys.get32(gnu + 8))
+        const bloom_shift = @intCast(usize, sys.get32(gnu + 12))
+        if buckets_count == 0 || bloom_size == 0 { return 0 }
+        const bloom = gnu + 16
+        const word = sys.get64(bloom + ((@intCast(usize, hash) / 64) % bloom_size) * 8)
+        const mask = (@intCast(u64, 1) << @intCast(u6, hash % 64)) | (@intCast(u64, 1) << @intCast(u6, (@intCast(usize, hash) >> @intCast(u6, bloom_shift % 64)) % 64))
+        if word & mask != mask { return 0 }
+        const buckets = bloom + bloom_size * 8
+        const chains = buckets + buckets_count * 4
+        var index = @intCast(usize, sys.get32(buckets + (@intCast(usize, hash) % buckets_count) * 4))
+        if index == 0 { return 0 }
+        while true {
+            const chain = sys.get32(chains + (index - symbol_offset) * 4)
+            if (chain | 1) == (hash | 1) {
+                const symbol = symtab + index * 24
+                if defines(module, symbol, name, want_tls) { return symbol }
+            }
+            if chain & 1 != 0 { return 0 }
+            index += 1
+        }
+    }
+    const sysv = sys.getPointer(module + M_HASH)
+    if sysv != 0 {
+        const buckets_count = @intCast(usize, sys.get32(sysv))
+        if buckets_count == 0 { return 0 }
+        const buckets = sysv + 8
+        const chains = buckets + buckets_count * 4
+        var index = @intCast(usize, sys.get32(buckets + (@intCast(usize, sysvHash(name)) % buckets_count) * 4))
+        while index != 0 {
+            const symbol = symtab + index * 24
+            if defines(module, symbol, name, want_tls) { return symbol }
+            index = @intCast(usize, sys.get32(chains + index * 4))
+        }
+        return 0
+    }
+    // No hash table: every entry.
+    const total = sys.getPointer(module + M_SYMBOL_COUNT)
+    var index: usize = 1
+    while index < total {
+        const symbol = symtab + index * 24
+        if defines(module, symbol, name, want_tls) { return symbol }
+        index += 1
+    }
+    return 0
+}
+
+// Names glibc gives the same storage twice, and error(3), whose name is a
+// keyword of Mlx: the name this library defines instead (0 for none).
+fn aliasOf(name: usize) -> usize {
+    const text = sys.slice(name)
+    if sys.same(text, "__environ") || sys.same(text, "_environ") { return sys.literal("environ") }
+    if sys.same(text, "__progname") { return sys.literal("program_invocation_short_name") }
+    if sys.same(text, "__progname_full") { return sys.literal("program_invocation_name") }
+    if sys.same(text, "error") { return sys.literal("__mlx_error") }
+    return 0
+}
+
+// setjmp and longjmp save and restore the callee-saved registers, the
+// stack pointer and the return address, which no function with a frame
+// can do: both are machine code in a page of their own, the names bound
+// to it by the loader. jmp_buf: rbx, rbp, r12, r13, r14, r15, rsp, rip.
+var jumpPage: usize = 0
+var jumpSymbols: usize = 0      // eight 24-byte entries, made with the page
+
+fn jumpCode() -> usize {
+    if jumpPage != 0 { return jumpPage }
+    const page = sys.mmap(sys.PAGE, sys.PROT_READ | sys.PROT_WRITE, sys.MAP_PRIVATE | sys.MAP_ANONYMOUS)
+    if page == sys.MAP_FAILED { return 0 }
+    // setjmp at 0: mov [rdi+0..40], rbx rbp r12 r13 r14 r15; lea rdx,[rsp+8];
+    // mov [rdi+48], rdx; mov rdx,[rsp]; mov [rdi+56], rdx; xor eax,eax; ret
+    const setjmp_bytes = [43]u8{ 72, 137, 31, 72, 137, 111, 8, 76, 137, 103, 16, 76, 137, 111, 24, 76, 137, 119, 32, 76, 137, 127, 40, 72, 141, 84, 36, 8, 72, 137, 87, 48, 72, 139, 20, 36, 72, 137, 87, 56, 49, 192, 195 }
+    // longjmp at 64: mov rbx rbp r12 r13 r14 r15 rsp from [rdi..]; mov eax,esi;
+    // test eax,eax; jnz +5; mov eax,1; jmp [rdi+56]
+    const longjmp_bytes = [43]u8{ 72, 139, 31, 72, 139, 111, 8, 76, 139, 103, 16, 76, 139, 111, 24, 76, 139, 119, 32, 76, 139, 127, 40, 72, 139, 103, 48, 137, 240, 133, 192, 117, 5, 184, 1, 0, 0, 0, 255, 103, 56, 195, 195 }
+    var index: usize = 0
+    while index < 43 {
+        sys.put8(page + index, setjmp_bytes[index])
+        sys.put8(page + 64 + index, longjmp_bytes[index])
+        index += 1
+    }
+    const protected = sys.syscall3(sys.SYS_mprotect, page, sys.PAGE, sys.PROT_READ | sys.PROT_EXEC)
+    if sys.failed(protected) { return 0 }
+    jumpPage = page
+    return page
+}
+
+// A symbol entry of this library's for an address in the jump page, so the
+// relocation code binds to it like any other definition.
+fn codeSymbol(offset: usize) -> usize {
+    const page = jumpCode()
+    if page == 0 || selfModule == 0 { return 0 }
+    if jumpSymbols == 0 {
+        jumpSymbols = heap.allocate(48, 16)
+        if jumpSymbols == 0 { return 0 }
+        sys.fill(jumpSymbols, 0, 48)
+        var index: usize = 0
+        while index < 2 {
+            const entry = jumpSymbols + index * 24
+            sys.put8(entry + 4, 18)           // STB_GLOBAL, STT_FUNC
+            sys.put16(entry + 6, 1)
+            sys.putPointer(entry + 8, page + index * 64 - base(selfModule))
+            sys.putPointer(entry + 16, 43)
+            index += 1
+        }
+    }
+    return jumpSymbols + (offset / 64) * 24
+}
+
+fn specialSymbol(name: usize) -> usize {
+    const text = sys.slice(name)
+    if sys.same(text, "setjmp") || sys.same(text, "_setjmp") || sys.same(text, "__sigsetjmp") || sys.same(text, "sigsetjmp") { return codeSymbol(0) }
+    if sys.same(text, "longjmp") || sys.same(text, "_longjmp") || sys.same(text, "siglongjmp") || sys.same(text, "__longjmp_chk") { return codeSymbol(64) }
+    return 0
+}
+
+// The first module in load order defining `name` (not `exclude`), and the
+// entry: (module, symbol), (0, 0) for none. A name nobody defines is
+// tried under its alias, and the jump functions are this library's.
+pub fn lookupGlobal(name: usize, exclude: usize, want_tls: bool) -> (usize, usize) {
+    var module = first
+    while module != 0 {
+        if module != exclude {
+            const symbol = lookupIn(module, name, want_tls)
+            if symbol != 0 { return -> (module, symbol) }
+        }
+        module = sys.getPointer(module + M_NEXT)
+    }
+    if want_tls { return -> (0, 0) }
+    const alias = aliasOf(name)
+    if alias != 0 { return lookupGlobal(alias, exclude, false) }
+    const special = specialSymbol(name)
+    if special != 0 { return -> (selfModule, special) }
+    return -> (0, 0)
+}
+
+// A defined symbol's address: its value in its module, through the
+// resolver for an ifunc.
+pub fn symbolAddress(module: usize, symbol: usize) -> usize {
+    const value = base(module) + sys.getPointer(symbol + 8)
+    if sys.get8(symbol + 4) & 15 == STT_GNU_IFUNC { return sys.call0Result(value) }
+    return value
+}
+
+// --- TLS ---------------------------------------------------------------------------
+
+// Static TLS (variant II): a module's block lies below the thread
+// pointer, at the offset the program's own code already assumes for the
+// executable (its block ends at the thread pointer); the next modules
+// follow further down.
+fn assignTls() -> void {
+    var module = first
+    while module != 0 {
+        if sys.getPointer(module + M_TLS_MEMSZ) != 0 && sys.getPointer(module + M_TLS_ID) == 0 {
+            var alignment = sys.getPointer(module + M_TLS_ALIGN)
+            if alignment == 0 { alignment = 1 }
+            const offset = alignUp(tlsEnd + sys.getPointer(module + M_TLS_MEMSZ), alignment)
+            sys.putPointer(module + M_TLS_OFFSET, offset)
+            tlsEnd = offset
+            tlsModules += 1
+            sys.putPointer(module + M_TLS_ID, tlsModules)
+        }
+        module = sys.getPointer(module + M_NEXT)
+    }
+    if tlsReserved == 0 { tlsReserved = alignUp(tlsEnd, TLS_ALIGNMENT) + TLS_SURPLUS }
+}
+
+// The bytes a thread reserves below its control block for static TLS (0
+// when no module has any and nothing was loaded by this loader).
+pub fn staticTlsSize() -> usize { return tlsReserved }
+
+pub fn tlsModuleCount() -> usize { return tlsModules }
+
+// Copies the initialization images of the TLS modules this thread has
+// not seen yet (`block` its control block, the thread pointer) into their
+// places below it; the memory there is zero already.
+pub fn initializeTls(block: usize) -> void {
+    const known = sys.getPointer(block + tcb.TLS_MODULES)
+    if known >= tlsModules { return }
+    var module = first
+    while module != 0 {
+        const id = sys.getPointer(module + M_TLS_ID)
+        if id > known {
+            const place = block - sys.getPointer(module + M_TLS_OFFSET)
+            const filesz = sys.getPointer(module + M_TLS_FILESZ)
+            if filesz > 0 { sys.copy(place, sys.getPointer(module + M_TLS_IMAGE), filesz) }
+        }
+        module = sys.getPointer(module + M_NEXT)
+    }
+    sys.putPointer(block + tcb.TLS_MODULES, tlsModules)
+}
+
+fn moduleById(id: usize) -> usize {
+    var module = first
+    while module != 0 {
+        if sys.getPointer(module + M_TLS_ID) == id { return module }
+        module = sys.getPointer(module + M_NEXT)
+    }
+    return 0
+}
+
+// __tls_get_addr(tls_index{ module, offset }): the address of a TLS
+// variable of a module compiled for the general-dynamic model. Every
+// module has a place in static TLS here, so it is arithmetic; a thread
+// that started before the module was loaded gets the module's image first.
+pub export fn __tls_get_addr(index: usize) -> usize {
+    const module = moduleById(sys.getPointer(index))
+    if module == 0 { return 0 }
+    const block = @threadPointer()
+    if tcb.isOurs(block) { initializeTls(block) }
+    return block - sys.getPointer(module + M_TLS_OFFSET) + sys.getPointer(index + 8)
+}
+
+// --- relocations -------------------------------------------------------------------
+
+// The definition a relocation of `module` binds to: (module, symbol) for
+// symbol index `index`, resolving locals and protected symbols in place
+// and the rest through the global scope; (0, 0) for a weak symbol nobody
+// defines, and a fatal error (or a dlopen failure) for a strong one.
+fn resolve(module: usize, index: usize, want_tls: bool, fatal_errors: bool) -> (usize, usize) {
+    const symbol = sys.getPointer(module + M_SYMTAB) + index * 24
+    const info = sys.get8(symbol + 4)
+    const binding = info >> 4
+    const defined = sys.get16(symbol + 6) != SHN_UNDEF
+    if defined && (binding == STB_LOCAL || sys.get8(symbol + 5) & 3 == STV_PROTECTED) { return -> (module, symbol) }
+    const name = sys.getPointer(module + M_STRTAB) + @intCast(usize, sys.get32(symbol))
+    const found = lookupGlobal(name, 0, want_tls)
+    if found.0 != 0 { return found }
+    if defined { return -> (module, symbol) }
+    if binding == STB_WEAK { return -> (0, 0) }
+    if fatal_errors {
+        writeText("mlxlibc: symbol lookup error: undefined symbol: ")
+        writeC(name)
+        writeText(" (needed by ")
+        writeC(sys.getPointer(module + M_NAME))
+        writeText(")\n")
+        const ended = sys.syscall1(sys.SYS_exit_group, 127)
+    }
+    fail("undefined symbol: ", name)
+    return -> (0, 0)
+}
+
+fn applyRelr(module: usize) -> void {
+    const relr = sys.getPointer(module + M_RELR)
+    const size = sys.getPointer(module + M_RELRSZ)
+    if relr == 0 || size == 0 { return }
+    const bias = base(module)
+    var where: usize = 0
+    var at = relr
+    while at < relr + size {
+        const entry = sys.getPointer(at)
+        if entry & 1 == 0 {
+            where = bias + entry
+            sys.putPointer(where, sys.getPointer(where) + bias)
+            where += 8
+        } else {
+            var bits = entry >> 1
+            var slot = where
+            while bits != 0 {
+                if bits & 1 != 0 { sys.putPointer(slot, sys.getPointer(slot) + bias) }
+                bits >>= 1
+                slot += 8
+            }
+            where += 63 * 8
+        }
+        at += 8
+    }
+}
+
+fn applyRela(module: usize, table: usize, size: usize, fatal_errors: bool) -> bool {
+    if table == 0 || size == 0 { return true }
+    const bias = base(module)
+    var at = table
+    while at < table + size {
+        const where = bias + sys.getPointer(at)
+        const info = sys.get64(at + 8)
+        const kind = @intCast(u32, info & 4294967295)
+        const index = @intCast(usize, info >> 32)
+        const addend = sys.getPointer(at + 16)
+        if kind == R_X86_64_RELATIVE {
+            sys.putPointer(where, bias + addend)
+        } else if kind == R_X86_64_IRELATIVE {
+            sys.putPointer(where, sys.call0Result(bias + addend))
+        } else if kind == R_X86_64_64 || kind == R_X86_64_GLOB_DAT || kind == R_X86_64_JUMP_SLOT {
+            const found = resolve(module, index, false, fatal_errors)
+            if found.0 == 0 && failure != 0 && !fatal_errors { return false }
+            var value: usize = 0
+            if found.0 != 0 { value = symbolAddress(found.0, found.1) }
+            if kind == R_X86_64_64 { value += addend }
+            sys.putPointer(where, value)
+        } else if kind == R_X86_64_COPY {
+            // The program's own copy of a library's variable: its initial
+            // bytes from the definition elsewhere.
+            const symbol = sys.getPointer(module + M_SYMTAB) + index * 24
+            const name = sys.getPointer(module + M_STRTAB) + @intCast(usize, sys.get32(symbol))
+            const found = lookupGlobal(name, module, false)
+            if found.0 == 0 {
+                if fatal_errors { fatal("no definition to copy for ", name) }
+                fail("no definition to copy for ", name)
+                return false
+            }
+            sys.copy(where, symbolAddress(found.0, found.1), sys.getPointer(found.1 + 16))
+        } else if kind == R_X86_64_DTPMOD64 {
+            var owner = module
+            if index != 0 {
+                const found = resolve(module, index, true, fatal_errors)
+                if found.0 != 0 { owner = found.0 }
+            }
+            sys.putPointer(where, sys.getPointer(owner + M_TLS_ID))
+        } else if kind == R_X86_64_DTPOFF64 {
+            var value = addend
+            if index != 0 {
+                const found = resolve(module, index, true, fatal_errors)
+                if found.0 != 0 { value += sys.getPointer(found.1 + 8) }
+            }
+            sys.putPointer(where, value)
+        } else if kind == R_X86_64_TPOFF64 {
+            var owner = module
+            var value = addend
+            if index != 0 {
+                const found = resolve(module, index, true, fatal_errors)
+                if found.0 != 0 {
+                    owner = found.0
+                    value += sys.getPointer(found.1 + 8)
+                }
+            }
+            sys.putPointer(where, value -% sys.getPointer(owner + M_TLS_OFFSET))
+        } else if kind != 0 {
+            if fatal_errors { fatal("unsupported relocation in ", sys.getPointer(module + M_NAME)) }
+            fail("unsupported relocation in ", sys.getPointer(module + M_NAME))
+            return false
+        }
+        at += 24
+    }
+    return true
+}
+
+// This library's own relocations bound to its own definitions: what its
+// code needs to run (its exported variables through their GOT slots)
+// before the program is relocated; relocate() rebinds them afterwards.
+pub fn relocateLocal(module: usize) -> void {
+    const saved_first = first
+    const saved_next = sys.getPointer(module + M_NEXT)
+    first = module
+    sys.putPointer(module + M_NEXT, 0)
+    applyRelr(module)
+    const applied = applyRela(module, sys.getPointer(module + M_RELA), sys.getPointer(module + M_RELASZ), true)
+    first = saved_first
+    sys.putPointer(module + M_NEXT, saved_next)
+}
+
+// In a process another loader started (glibc's ld.so with this library as
+// a plugin's libc): the program's TLS from the aux vector in /proc, so the
+// threads pthread_create makes carry the program's thread-local variables.
+var adopted: bool = false
+
+pub fn adoptProgram() -> void {
+    if active || adopted { return }
+    adopted = true
+    const fd = sys.syscall4(sys.SYS_openat, sys.AT_FDCWD, sys.literal("/proc/self/auxv"), sys.O_RDONLY | sys.O_CLOEXEC, 0)
+    if sys.failed(fd) { return }
+    const buffer = heap.allocate(1024, 16)
+    if buffer == 0 { return }
+    const got = sys.syscall3(sys.SYS_read, @bitCast(usize, fd), buffer, 1008)
+    const closed = sys.syscall1(sys.SYS_close, @bitCast(usize, fd))
+    if got <= 0 { return }
+    sys.putPointer(buffer + @bitCast(usize, got), 0)
+    sys.putPointer(buffer + @bitCast(usize, got) + 8, 0)
+    auxv = buffer
+    const phdr = auxValue(3)
+    const phnum = auxValue(5)
+    if phdr == 0 || phnum == 0 { return }
+    const program = fromMemory(phdr, phnum, sys.literal("program"), true)
+    if program == 0 { return }
+    programModule = program
+    assignTls()
+}
+
+fn relocate(module: usize, fatal_errors: bool) -> bool {
+    if flags(module) & F_RELOCATED != 0 { return true }
+    applyRelr(module)
+    if !applyRela(module, sys.getPointer(module + M_RELA), sys.getPointer(module + M_RELASZ), fatal_errors) { return false }
+    if !applyRela(module, sys.getPointer(module + M_JMPREL), sys.getPointer(module + M_PLTRELSZ), fatal_errors) { return false }
+    addFlag(module, F_RELOCATED)
+    // RELRO: read-only once relocated.
+    const relro = sys.getPointer(module + M_RELRO_START)
+    const relro_size = sys.getPointer(module + M_RELRO_SIZE)
+    if relro != 0 && relro_size != 0 {
+        const protected = sys.syscall3(sys.SYS_mprotect, pageDown(relro), pageUp(relro + relro_size) - pageDown(relro), sys.PROT_READ)
+    }
+    return true
+}
+
+// Relocates every module from `start` on.
+fn relocateFrom(start: usize, fatal_errors: bool) -> bool {
+    var module = start
+    while module != 0 {
+        if !relocate(module, fatal_errors) { return false }
+        module = sys.getPointer(module + M_NEXT)
+    }
+    return true
+}
+
+// --- constructors and destructors --------------------------------------------------
+
+fn runInit(module: usize) -> void {
+    if flags(module) & F_INITIALIZED != 0 { return }
+    addFlag(module, F_INITIALIZED)
+    if flags(module) & F_SELF != 0 { return }
+    sys.call3(sys.getPointer(module + M_INIT), argc, argv, envp)
+    const array = sys.getPointer(module + M_INIT_ARRAY)
+    const size = sys.getPointer(module + M_INIT_ARRAYSZ)
+    var at: usize = 0
+    while at < size {
+        const function = sys.getPointer(array + at)
+        if function != 0 && function != 18446744073709551615 { sys.call3(function, argc, argv, envp) }
+        at += 8
+    }
+}
+
+// Constructors of the modules from `start` on, dependencies first (the
+// last loaded first, as glibc orders them), the program's excepted: its
+// run from __libc_start_main.
+fn initializeFrom(start: usize) -> void {
+    var module = last
+    while module != 0 {
+        if flags(module) & F_PROGRAM == 0 { runInit(module) }
+        if module == start { module = 0 } else { module = sys.getPointer(module + M_PREV) }
+    }
+}
+
+pub fn initializeProgram() -> void {
+    if programModule != 0 { runInit(programModule) }
+}
+
+fn runFini(module: usize) -> void {
+    if flags(module) & F_INITIALIZED == 0 || flags(module) & F_FINISHED != 0 { return }
+    addFlag(module, F_FINISHED)
+    if flags(module) & F_SELF != 0 { return }
+    const array = sys.getPointer(module + M_FINI_ARRAY)
+    const size = sys.getPointer(module + M_FINI_ARRAYSZ)
+    var at = size
+    while at > 0 {
+        at -= 8
+        const function = sys.getPointer(array + at)
+        if function != 0 && function != 18446744073709551615 { sys.call0(function) }
+    }
+    sys.call0(sys.getPointer(module + M_FINI))
+}
+
+// Every destructor, the program's first, then the libraries in load
+// order (the reverse of their constructors): what exit runs.
+pub fn finish() -> void {
+    if !active { return }
+    var module = first
+    while module != 0 {
+        runFini(module)
+        module = sys.getPointer(module + M_NEXT)
+    }
+}
+
+// --- the program's start ----------------------------------------------------------
+
+// Reads the aux vector's values this loader needs and the environment
+// variables it honours.
+pub fn auxValue(kind: usize) -> usize {
+    var at = auxv
+    while at != 0 && sys.getPointer(at) != 0 {
+        if sys.getPointer(at) == kind { return sys.getPointer(at + 8) }
+        at += 16
+    }
+    return 0
+}
+
+fn environmentValue(name: []const u8) -> usize {
+    var at = envp
+    while at != 0 && sys.getPointer(at) != 0 {
+        const entry = sys.getPointer(at)
+        const text = sys.constBytes(entry)
+        var index: usize = 0
+        while index < name.length && text[index] == name[index] { index += 1 }
+        if index == name.length && text[index] == 61 { return entry + name.length + 1 }
+        at += 8
+    }
+    return 0
+}
+
+// Loads the program's libraries, lays out TLS and relocates everything
+// (this library included: its GOT slots for its exported variables bind
+// to the program's copies). `program` is the executable's module,
+// `self_module` this library's. Fatal on error. The constructors run from
+// constructAll once the main thread's TLS holds the images.
+pub fn prepare(program: usize, self_module: usize, arguments_count: usize, arguments: usize, environment: usize, aux: usize) -> void {
+    active = true
+    programModule = program
+    selfModule = self_module
+    addFlag(self_module, F_SELF)
+    argc = arguments_count
+    argv = arguments
+    envp = environment
+    auxv = aux
+    secure = auxValue(23) != 0
+    libraryPath = environmentValue("LD_LIBRARY_PATH")
+    debug = environmentValue("MLX_LD_DEBUG") != 0
+    if !loadNeeded(first) { fatal("", failure) }
+    assignTls()
+    if tlsEnd > MAIN_TLS { fatal("the program's static TLS does not fit", 0) }
+    // gdb: r_debug through the program's DT_DEBUG, written before the
+    // program's dynamic section turns read-only (RELRO) with relocation.
+    rDebug[1] = @intCast(u64, first)
+    rDebug[2] = @intCast(u64, @intFromPtr(_dl_debug_state))
+    rDebug[4] = @intCast(u64, base(self_module))
+    const dynamic = sys.getPointer(program + M_DYNAMIC)
+    var at = dynamic
+    while dynamic != 0 && sys.get64(at) != 0 {
+        if sys.get64(at) == 21 { sys.putPointer(at + 8, @intFromPtr(&rDebug)) }
+        at += 16
+    }
+    // Relocate the program first (its copies get their values), then the rest.
+    const relocated = relocateFrom(first, true)
+    _dl_debug_state()
+}
+
+// The libraries' constructors (the program's run from __libc_start_main).
+pub fn constructAll() -> void { initializeFrom(first) }
+
+// The static TLS the main thread gets below its control block: more than
+// any program needs, reserved without committing it.
+pub const MAIN_TLS: usize = 1048576
+
+// A program named on this library's own command line (`libmlxc.so.1
+// PROGRAM ARGS`): mapped here, as the kernel would have; 0 with a message.
+pub fn mapProgram(path: usize) -> usize {
+    const fd = sys.syscall4(sys.SYS_openat, sys.AT_FDCWD, path, sys.O_RDONLY | sys.O_CLOEXEC, 0)
+    if sys.failed(fd) {
+        fail("cannot open the program ", path)
+        return 0
+    }
+    const module = mapFile(@intCast(i32, fd), path, true)
+    const closed = sys.syscall1(sys.SYS_close, @bitCast(usize, fd))
+    return module
+}
+
+pub fn entryOf(module: usize) -> usize { return sys.getPointer(module + M_ENTRY) }
+
+// --- dlopen's side -------------------------------------------------------------------
+
+pub fn lock() -> void { sys.lock(@ptrCast(*u32, &loaderLock)) }
+pub fn unlock() -> void { sys.unlock(@ptrCast(*u32, &loaderLock)) }
+
+// Loads `name` (and what it needs) at run time; the module, or 0 with
+// `failure` set. The caller holds the lock.
+pub fn open(name: usize) -> usize {
+    failure = 0
+    var module = findLoaded(name)
+    if module == 0 && isSelfName(name) { module = selfModule }
+    if module != 0 {
+        sys.putPointer(module + M_REFERENCES, sys.getPointer(module + M_REFERENCES) + 1)
+        return module
+    }
+    const previous_last = last
+    module = dependency(name, programModule)
+    if module == 0 { return 0 }
+    const added = if previous_last != 0 { sys.getPointer(previous_last + M_NEXT) } else { first }
+    if !loadNeeded(added) { return 0 }
+    assignTls()
+    if tlsEnd > tlsReserved {
+        fail("no room in static TLS for ", name)
+        return 0
+    }
+    if !relocateFrom(added, false) { return 0 }
+    rDebug[3] = 1
+    _dl_debug_state()
+    rDebug[3] = 0
+    _dl_debug_state()
+    initializeFrom(added)
+    sys.putPointer(module + M_REFERENCES, 1)
+    return module
+}
+
+pub fn release(module: usize) -> void {
+    const references = sys.getPointer(module + M_REFERENCES)
+    if references > 0 { sys.putPointer(module + M_REFERENCES, references - 1) }
+    // The mapping stays: a later dlopen finds it, and nothing else in the
+    // process can lose addresses into it.
+}
+
+// The symbol `name` in `handle`'s module or what it depends on, breadth
+// first: its address, or 0.
+pub fn symbolIn(handle: usize, name: usize) -> usize {
+    var queue: [64]usize = undefined
+    var head: usize = 0
+    var tail: usize = 0
+    queue[tail] = handle
+    tail += 1
+    while head < tail {
+        const module = queue[head]
+        head += 1
+        const symbol = lookupIn(module, name, false)
+        if symbol != 0 { return symbolAddress(module, symbol) }
+        const deps = sys.getPointer(module + M_DEPS)
+        const dep_count = sys.getPointer(module + M_DEP_COUNT)
+        var index: usize = 0
+        while index < dep_count && tail < 64 {
+            const dep = sys.getPointer(deps + index * 8)
+            var seen = false
+            var look: usize = 0
+            while look < tail {
+                if queue[look] == dep { seen = true }
+                look += 1
+            }
+            if !seen {
+                queue[tail] = dep
+                tail += 1
+            }
+            index += 1
+        }
+    }
+    return 0
+}
+
+pub fn symbolGlobal(name: usize) -> usize {
+    const found = lookupGlobal(name, 0, false)
+    if found.0 == 0 { return 0 }
+    return symbolAddress(found.0, found.1)
+}
+
+// The module whose mapping holds `address` (0 for none).
+pub fn moduleOf(address: usize) -> usize {
+    var module = first
+    while module != 0 {
+        if address >= sys.getPointer(module + M_MAP_START) && address < sys.getPointer(module + M_MAP_END) { return module }
+        module = sys.getPointer(module + M_NEXT)
+    }
+    return 0
+}
+
+// RTLD_NEXT: the first definition after the module holding `caller`.
+pub fn symbolAfter(caller: usize, name: usize) -> usize {
+    var module = moduleOf(caller)
+    if module == 0 { return 0 }
+    module = sys.getPointer(module + M_NEXT)
+    while module != 0 {
+        const symbol = lookupIn(module, name, false)
+        if symbol != 0 { return symbolAddress(module, symbol) }
+        module = sys.getPointer(module + M_NEXT)
+    }
+    return 0
+}
+
+// For dladdr: the defined function or object of `module` nearest below
+// `address`: (name, address), (0, 0) for none.
+pub fn nearestSymbol(module: usize, address: usize) -> (usize, usize) {
+    const symtab = sys.getPointer(module + M_SYMTAB)
+    const strtab = sys.getPointer(module + M_STRTAB)
+    const total = sys.getPointer(module + M_SYMBOL_COUNT)
+    const bias = base(module)
+    var best_name: usize = 0
+    var best_address: usize = 0
+    var index: usize = 1
+    while index < total {
+        const symbol = symtab + index * 24
+        const kind = sys.get8(symbol + 4) & 15
+        if sys.get16(symbol + 6) != SHN_UNDEF && (kind == 1 || kind == 2 || kind == STT_GNU_IFUNC) {
+            const value = bias + sys.getPointer(symbol + 8)
+            if value <= address && value >= best_address {
+                best_address = value
+                best_name = strtab + @intCast(usize, sys.get32(symbol))
+            }
+        }
+        index += 1
+    }
+    return -> (best_name, best_address)
+}

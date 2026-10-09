@@ -1,8 +1,14 @@
 // stdio.h: FILE streams on descriptors, the printf and scanf families on
-// format.mlx, and the standard streams. A FILE is this library's own
-// record; `stdin`, `stdout` and `stderr` are the handles 1, 2 and 3 (what
-// a C program reads from the data symbols), which fileOf turns into the
-// three static records; fopen's streams are the records' addresses.
+// format.mlx, and the standard streams. A FILE is glibc's struct _IO_FILE
+// in the fields C programs reach on their own: glibc's headers inline
+// getc_unlocked, putc_unlocked, feof_unlocked and ferror_unlocked (and
+// getchar/putchar when optimizing) as reads and writes of _flags, the
+// read pointers and the write pointers, calling __uflow and __overflow
+// here only when a buffer runs out. The pointers are the buffer state
+// (what is pending, what is unread); the rest of the record is this
+// library's. `stdin`, `stdout` and `stderr` are the three static records'
+// addresses (set by standardStreams, which the loader runs before the
+// program starts); fopen's streams are heap records.
 const sys = @import("./sys.mlx")
 const errno = @import("./errno.mlx")
 const heap = @import("./heap.mlx")
@@ -11,19 +17,31 @@ const stdlib = @import("./stdlib.mlx")
 const unistd = @import("./unistd.mlx")
 const format = @import("./format.mlx")
 
-// The FILE record (80 bytes).
-const F_FD: usize = 0          // i32
-const F_FLAGS: usize = 4       // u32
-const F_BUFFER: usize = 8
-const F_CAPACITY: usize = 16
-const F_POSITION: usize = 24   // writing: bytes pending; reading: bytes consumed
-const F_LENGTH: usize = 32     // reading: bytes in the buffer
-const F_UNGOT: usize = 40      // i32, -1 for none
-const F_LOCK: usize = 44       // u32
-const F_OWNER: usize = 48      // the locking thread
-const F_DEPTH: usize = 56      // u32, the lock's recursion
-const F_NEXT: usize = 64
-const F_SIZE: usize = 80
+// The FILE record (216 bytes, glibc's layout).
+const F_IOFLAGS: usize = 0       // i32 _flags: IO_MAGIC, IO_EOF_SEEN, IO_ERR_SEEN
+const F_READ_PTR: usize = 8      // reading: the next unread byte
+const F_READ_END: usize = 16     // reading: the end of what was read
+const F_READ_BASE: usize = 24
+const F_WRITE_BASE: usize = 32   // writing: the buffer's start
+const F_WRITE_PTR: usize = 40    // writing: where the next byte goes
+const F_WRITE_END: usize = 48    // writing: the buffer's end (the start when every byte must come here)
+const F_BUFFER: usize = 56       // _IO_buf_base
+const F_BUFFER_END: usize = 64   // _IO_buf_end
+const F_LOCK: usize = 72         // u32
+const F_DEPTH: usize = 76        // u32, the lock's recursion
+const F_OWNER: usize = 80        // the locking thread
+const F_FLAGS: usize = 88        // u32: this library's flags below
+const F_NEXT: usize = 96         // the open streams' list
+const F_FD: usize = 112          // i32 _fileno
+const F_SMALL: usize = 200       // 16 bytes: an unbuffered stream's buffer (8 spare, 8 data)
+const F_SIZE: usize = 216
+
+const IO_MAGIC: u32 = 4222222336   // 0xFBAD0000
+const IO_UNBUFFERED: u32 = 2
+const IO_NO_READS: u32 = 4
+const IO_NO_WRITES: u32 = 8
+const IO_EOF_SEEN: u32 = 16
+const IO_ERR_SEEN: u32 = 32
 
 const READABLE: u32 = 1
 const WRITABLE: u32 = 2
@@ -37,52 +55,98 @@ const LINE_BUFFERED: u32 = 256
 const BUFFERING_DECIDED: u32 = 512
 const READING: u32 = 1024
 const WRITING: u32 = 2048
+const SPARE: u32 = 4096          // eight bytes before the buffer, for ungetc at its start
 
 pub const BUFFER_SIZE: usize = 4096
 
-var stdinRecord: [80]u8 = undefined
-var stdoutRecord: [80]u8 = undefined
-var stderrRecord: [80]u8 = undefined
-var stdinBuffer: [4096]u8 = undefined
-var stdoutBuffer: [4096]u8 = undefined
+var stdinRecord: [216]u8 = undefined
+var stdoutRecord: [216]u8 = undefined
+var stderrRecord: [216]u8 = undefined
+var stdinBuffer: [4104]u8 = undefined
+var stdoutBuffer: [4104]u8 = undefined
 var streamsReady: u32 = 0
 var streamsLock: u32 = 0
 var openStreams: usize = 0
 var listLock: u32 = 0
 
-pub export var stdin: usize = 1
-pub export var stdout: usize = 2
-pub export var stderr: usize = 3
+pub export var stdin: usize = 0
+pub export var stdout: usize = 0
+pub export var stderr: usize = 0
 
 fn flags(file: usize) -> u32 { return sys.get32(file + F_FLAGS) }
 fn setFlags(file: usize, value: u32) -> void { sys.put32(file + F_FLAGS, value) }
-fn addFlags(file: usize, value: u32) -> void { setFlags(file, flags(file) | value) }
-fn clearFlags(file: usize, value: u32) -> void { setFlags(file, flags(file) & ~value) }
-fn descriptor(file: usize) -> i32 { return sys.getI32(file + F_FD) }
 
-fn initRecord(file: usize, fd: i32, mode: u32, buffer: usize, capacity: usize) -> void {
-    sys.fill(file, 0, F_SIZE)
-    sys.putI32(file + F_FD, fd)
-    sys.put32(file + F_FLAGS, mode)
-    sys.putPointer(file + F_BUFFER, buffer)
-    sys.putPointer(file + F_CAPACITY, capacity)
-    sys.putI32(file + F_UNGOT, -1)
+// The EOF and error flags are mirrored into _flags, where glibc's inline
+// feof_unlocked and ferror_unlocked read them.
+fn addFlags(file: usize, value: u32) -> void {
+    setFlags(file, flags(file) | value)
+    var io = sys.get32(file + F_IOFLAGS)
+    if value & EOF_SEEN != 0 { io |= IO_EOF_SEEN }
+    if value & ERROR_SEEN != 0 { io |= IO_ERR_SEEN }
+    sys.put32(file + F_IOFLAGS, io)
 }
 
-fn standardStreams() -> void {
+fn clearFlags(file: usize, value: u32) -> void {
+    setFlags(file, flags(file) & ~value)
+    var io = sys.get32(file + F_IOFLAGS)
+    if value & EOF_SEEN != 0 { io &= ~IO_EOF_SEEN }
+    if value & ERROR_SEEN != 0 { io &= ~IO_ERR_SEEN }
+    sys.put32(file + F_IOFLAGS, io)
+}
+
+fn descriptor(file: usize) -> i32 { return sys.getI32(file + F_FD) }
+
+fn bufferCapacity(file: usize) -> usize { return sys.getPointer(file + F_BUFFER_END) - sys.getPointer(file + F_BUFFER) }
+fn pendingWrites(file: usize) -> usize { return sys.getPointer(file + F_WRITE_PTR) - sys.getPointer(file + F_WRITE_BASE) }
+fn unreadBytes(file: usize) -> usize { return sys.getPointer(file + F_READ_END) - sys.getPointer(file + F_READ_PTR) }
+
+fn setReadPointers(file: usize, base: usize, pointer: usize, end: usize) -> void {
+    sys.putPointer(file + F_READ_BASE, base)
+    sys.putPointer(file + F_READ_PTR, pointer)
+    sys.putPointer(file + F_READ_END, end)
+}
+
+fn setWritePointers(file: usize, base: usize, pointer: usize, end: usize) -> void {
+    sys.putPointer(file + F_WRITE_BASE, base)
+    sys.putPointer(file + F_WRITE_PTR, pointer)
+    sys.putPointer(file + F_WRITE_END, end)
+}
+
+// `buffer` has eight spare bytes before it when `spare`.
+fn initRecord(file: usize, fd: i32, mode: u32, buffer: usize, capacity: usize, spare: bool) -> void {
+    sys.fill(file, 0, F_SIZE)
+    var io = IO_MAGIC
+    if mode & READABLE == 0 { io |= IO_NO_READS }
+    if mode & WRITABLE == 0 { io |= IO_NO_WRITES }
+    if mode & UNBUFFERED != 0 { io |= IO_UNBUFFERED }
+    sys.put32(file + F_IOFLAGS, io)
+    sys.putI32(file + F_FD, fd)
+    sys.put32(file + F_FLAGS, mode | (if spare { SPARE } else { 0 }))
+    sys.putPointer(file + F_BUFFER, buffer)
+    sys.putPointer(file + F_BUFFER_END, buffer + capacity)
+}
+
+pub fn standardStreams() -> void {
     if @atomicLoad(u32, @ptrCast(*u32, &streamsReady), acquire) == 1 { return }
     sys.lock(@ptrCast(*u32, &streamsLock))
     if streamsReady == 0 {
-        initRecord(@intFromPtr(&stdinRecord), 0, READABLE | STATIC, @intFromPtr(&stdinBuffer), BUFFER_SIZE)
-        initRecord(@intFromPtr(&stdoutRecord), 1, WRITABLE | STATIC, @intFromPtr(&stdoutBuffer), BUFFER_SIZE)
-        initRecord(@intFromPtr(&stderrRecord), 2, WRITABLE | STATIC | UNBUFFERED | BUFFERING_DECIDED, 0, 0)
+        initRecord(@intFromPtr(&stdinRecord), 0, READABLE | STATIC, @intFromPtr(&stdinBuffer) + 8, BUFFER_SIZE, true)
+        initRecord(@intFromPtr(&stdoutRecord), 1, WRITABLE | STATIC, @intFromPtr(&stdoutBuffer) + 8, BUFFER_SIZE, true)
+        initRecord(@intFromPtr(&stderrRecord), 2, WRITABLE | STATIC | UNBUFFERED | BUFFERING_DECIDED, 0, 0, false)
+        // The variables are the program's (its copies, or through the
+        // GOT the ones another C library defined when this library is
+        // loaded next to one): set only while nobody has.
+        if stdin == 0 { stdin = @intFromPtr(&stdinRecord) }
+        if stdout == 0 { stdout = @intFromPtr(&stdoutRecord) }
+        if stderr == 0 { stderr = @intFromPtr(&stderrRecord) }
         stdlib.setExitHook(@intFromPtr(flushAtExit))
         @atomicStore(u32, @ptrCast(*u32, &streamsReady), 1, release)
     }
     sys.unlock(@ptrCast(*u32, &streamsLock))
 }
 
-// The record a FILE* names.
+// The record a FILE* names (the handles 1, 2, 3 stand for the standard
+// streams too, for callers inside this library).
 pub fn fileOf(handle: usize) -> usize {
     standardStreams()
     if handle == 1 { return @intFromPtr(&stdinRecord) }
@@ -90,6 +154,19 @@ pub fn fileOf(handle: usize) -> usize {
     if handle == 3 { return @intFromPtr(&stderrRecord) }
     return handle
 }
+
+// This library's record for descriptor 0, 1 or 2 (the standard streams),
+// for a host that has streams of its own next to these.
+pub export fn mlxlibc_stream(fd: i32) -> usize {
+    if fd == 0 { return fileOf(1) }
+    if fd == 1 { return fileOf(2) }
+    if fd == 2 { return fileOf(3) }
+    return 0
+}
+
+pub fn standardIn() -> usize { return fileOf(1) }
+pub fn standardOut() -> usize { return fileOf(2) }
+pub fn standardErr() -> usize { return fileOf(3) }
 
 // A recursive lock per stream (flockfile may be held across the calls).
 fn lockFile(file: usize) -> void {
@@ -145,10 +222,12 @@ fn writeAll(fd: i32, source: usize, count: usize) -> bool {
 
 // Pending output to the descriptor; false with the error flag set on failure.
 fn flushWrites(file: usize) -> bool {
-    const pending = sys.getPointer(file + F_POSITION)
-    if flags(file) & WRITING == 0 || pending == 0 { return true }
-    sys.putPointer(file + F_POSITION, 0)
-    if !writeAll(descriptor(file), sys.getPointer(file + F_BUFFER), pending) {
+    if flags(file) & WRITING == 0 { return true }
+    const pending = pendingWrites(file)
+    if pending == 0 { return true }
+    const base = sys.getPointer(file + F_WRITE_BASE)
+    sys.putPointer(file + F_WRITE_PTR, base)
+    if !writeAll(descriptor(file), base, pending) {
         addFlags(file, ERROR_SEEN)
         return false
     }
@@ -158,25 +237,53 @@ fn flushWrites(file: usize) -> bool {
 // Buffered input given back to the descriptor's position.
 fn dropReads(file: usize) -> void {
     if flags(file) & READING == 0 { return }
-    const consumed = sys.getPointer(file + F_POSITION)
-    const length = sys.getPointer(file + F_LENGTH)
-    var back: isize = @intCast(isize, length - consumed)
-    if sys.getI32(file + F_UNGOT) >= 0 { back += 1 }
-    if back != 0 { const sought = sys.syscall3(sys.SYS_lseek, sys.int(descriptor(file)), @bitCast(usize, 0 - back), 1) }
-    sys.putPointer(file + F_POSITION, 0)
-    sys.putPointer(file + F_LENGTH, 0)
-    sys.putI32(file + F_UNGOT, -1)
+    const back = unreadBytes(file)
+    if back != 0 { const sought = sys.syscall3(sys.SYS_lseek, sys.int(descriptor(file)), @bitCast(usize, 0 - @intCast(isize, back)), 1) }
+    setReadPointers(file, 0, 0, 0)
     clearFlags(file, READING)
 }
 
+// A buffer for the stream: its own, or the small one in the record for an
+// unbuffered stream (one byte read at a time).
 fn ensureBuffer(file: usize) -> bool {
-    if sys.getPointer(file + F_BUFFER) != 0 || flags(file) & UNBUFFERED != 0 { return true }
-    const buffer = heap.allocate(BUFFER_SIZE, 16)
-    if buffer == 0 { return false }
-    sys.putPointer(file + F_BUFFER, buffer)
-    sys.putPointer(file + F_CAPACITY, BUFFER_SIZE)
-    addFlags(file, OWN_BUFFER)
+    if sys.getPointer(file + F_BUFFER) != 0 { return true }
+    if flags(file) & UNBUFFERED != 0 {
+        sys.putPointer(file + F_BUFFER, file + F_SMALL + 8)
+        sys.putPointer(file + F_BUFFER_END, file + F_SMALL + 16)
+        addFlags(file, SPARE)
+        return true
+    }
+    const block = heap.allocate(BUFFER_SIZE + 8, 16)
+    if block == 0 { return false }
+    sys.putPointer(file + F_BUFFER, block + 8)
+    sys.putPointer(file + F_BUFFER_END, block + 8 + BUFFER_SIZE)
+    addFlags(file, OWN_BUFFER | SPARE)
     return true
+}
+
+fn releaseBuffer(file: usize) -> void {
+    if flags(file) & OWN_BUFFER != 0 { heap.release(sys.getPointer(file + F_BUFFER) - 8) }
+    clearFlags(file, OWN_BUFFER | SPARE)
+    sys.putPointer(file + F_BUFFER, 0)
+    sys.putPointer(file + F_BUFFER_END, 0)
+}
+
+// The stream turns to writing: the write pointers span the buffer when
+// it is fully buffered; otherwise the end is the start, so every inline
+// putc comes to __overflow, which flushes at newlines or at once.
+fn beginWriting(file: usize) -> void {
+    addFlags(file, WRITING)
+    setReadPointers(file, 0, 0, 0)
+    const buffer = sys.getPointer(file + F_BUFFER)
+    const end = if flags(file) & (UNBUFFERED | LINE_BUFFERED) != 0 { buffer } else { sys.getPointer(file + F_BUFFER_END) }
+    setWritePointers(file, buffer, buffer, end)
+}
+
+fn beginReading(file: usize) -> void {
+    addFlags(file, READING)
+    setWritePointers(file, 0, 0, 0)
+    const buffer = sys.getPointer(file + F_BUFFER)
+    setReadPointers(file, buffer, buffer, buffer)
 }
 
 // `count` bytes to the stream (locked by the caller).
@@ -188,7 +295,6 @@ pub fn putBytes(file: usize, source: usize, count: usize) -> usize {
     }
     dropReads(file)
     decideBuffering(file)
-    addFlags(file, WRITING)
     if flags(file) & UNBUFFERED != 0 || !ensureBuffer(file) {
         if !writeAll(descriptor(file), source, count) {
             addFlags(file, ERROR_SEEN)
@@ -196,11 +302,11 @@ pub fn putBytes(file: usize, source: usize, count: usize) -> usize {
         }
         return count
     }
-    const buffer = sys.getPointer(file + F_BUFFER)
-    const capacity = sys.getPointer(file + F_CAPACITY)
+    if flags(file) & WRITING == 0 { beginWriting(file) }
+    const capacity = bufferCapacity(file)
     var done: usize = 0
     while done < count {
-        var pending = sys.getPointer(file + F_POSITION)
+        var pending = pendingWrites(file)
         if pending == capacity {
             if !flushWrites(file) { return done }
             pending = 0
@@ -216,8 +322,9 @@ pub fn putBytes(file: usize, source: usize, count: usize) -> usize {
             done += capacity
             continue
         }
-        sys.copy(buffer + pending, source + done, room)
-        sys.putPointer(file + F_POSITION, pending + room)
+        const target = sys.getPointer(file + F_WRITE_PTR)
+        sys.copy(target, source + done, room)
+        sys.putPointer(file + F_WRITE_PTR, target + room)
         done += room
     }
     if flags(file) & LINE_BUFFERED != 0 {
@@ -236,11 +343,6 @@ fn writeToStream(context: usize, bytes: usize, count: usize) -> void { const wro
 
 // One byte read (-1 at the end or on error); the caller holds the lock.
 pub fn getByte(file: usize) -> i32 {
-    const ungot = sys.getI32(file + F_UNGOT)
-    if ungot >= 0 {
-        sys.putI32(file + F_UNGOT, -1)
-        return ungot
-    }
     if flags(file) & READABLE == 0 {
         errno.set(sys.EBADF)
         addFlags(file, ERROR_SEEN)
@@ -249,35 +351,29 @@ pub fn getByte(file: usize) -> i32 {
     if flags(file) & WRITING != 0 {
         const flushed = flushWrites(file)
         clearFlags(file, WRITING)
+        setWritePointers(file, 0, 0, 0)
     }
-    addFlags(file, READING)
-    var position = sys.getPointer(file + F_POSITION)
-    var length = sys.getPointer(file + F_LENGTH)
-    if position >= length {
-        if flags(file) & UNBUFFERED != 0 || !ensureBuffer(file) {
-            var one: u8 = 0
-            const got = sys.syscall3(sys.SYS_read, sys.int(descriptor(file)), @intFromPtr(&one), 1)
-            if got <= 0 {
-                addFlags(file, if got == 0 { EOF_SEEN } else { ERROR_SEEN })
-                if got < 0 { errno.set(@intCast(i32, 0 - got)) }
-                return -1
-            }
-            return @intCast(i32, one)
-        }
-        const got = sys.syscall3(sys.SYS_read, sys.int(descriptor(file)), sys.getPointer(file + F_BUFFER), sys.getPointer(file + F_CAPACITY))
+    if !ensureBuffer(file) {
+        addFlags(file, ERROR_SEEN)
+        return -1
+    }
+    if flags(file) & READING == 0 { beginReading(file) }
+    var pointer = sys.getPointer(file + F_READ_PTR)
+    if pointer >= sys.getPointer(file + F_READ_END) {
+        const buffer = sys.getPointer(file + F_BUFFER)
+        const wanted = if flags(file) & UNBUFFERED != 0 { 1 } else { bufferCapacity(file) }
+        const got = sys.syscall3(sys.SYS_read, sys.int(descriptor(file)), buffer, wanted)
         if got <= 0 {
             addFlags(file, if got == 0 { EOF_SEEN } else { ERROR_SEEN })
             if got < 0 { errno.set(@intCast(i32, 0 - got)) }
-            sys.putPointer(file + F_POSITION, 0)
-            sys.putPointer(file + F_LENGTH, 0)
+            setReadPointers(file, buffer, buffer, buffer)
             return -1
         }
-        position = 0
-        length = @bitCast(usize, got)
-        sys.putPointer(file + F_LENGTH, length)
+        pointer = buffer
+        setReadPointers(file, buffer, buffer, buffer + @bitCast(usize, got))
     }
-    sys.putPointer(file + F_POSITION, position + 1)
-    return @intCast(i32, sys.get8(sys.getPointer(file + F_BUFFER) + position))
+    sys.putPointer(file + F_READ_PTR, pointer + 1)
+    return @intCast(i32, sys.get8(pointer))
 }
 
 // --- opening and closing ---------------------------------------------------
@@ -316,7 +412,7 @@ fn parseMode(mode: usize) -> (u32, i32) {
 fn newStream(fd: i32, stream_flags: u32) -> usize {
     const file = heap.allocate(F_SIZE, 16)
     if file == 0 { return 0 }
-    initRecord(file, fd, stream_flags, 0, 0)
+    initRecord(file, fd, stream_flags, 0, 0, false)
     sys.lock(@ptrCast(*u32, &listLock))
     sys.putPointer(file + F_NEXT, openStreams)
     openStreams = file
@@ -375,6 +471,9 @@ pub export fn freopen(path: usize, mode: usize, handle: usize) -> usize {
         errno.set(sys.EINVAL)
         return 0
     }
+    setReadPointers(file, 0, 0, 0)
+    setWritePointers(file, 0, 0, 0)
+    clearFlags(file, READING | WRITING | EOF_SEEN | ERROR_SEEN)
     var fd = descriptor(file)
     if path != 0 {
         const opened = unistd.open(path, parsed.1, 438)
@@ -402,7 +501,9 @@ pub export fn fclose(handle: usize) -> i32 {
     if !flushWrites(file) { status = -1 }
     dropReads(file)
     if unistd.close(descriptor(file)) != 0 { status = -1 }
-    if flags(file) & OWN_BUFFER != 0 { heap.release(sys.getPointer(file + F_BUFFER)) }
+    releaseBuffer(file)
+    setReadPointers(file, 0, 0, 0)
+    setWritePointers(file, 0, 0, 0)
     unlockFile(file)
     if flags(file) & STATIC == 0 {
         forgetStream(file)
@@ -450,16 +551,20 @@ pub export fn setvbuf(handle: usize, buffer: usize, mode: i32, size: usize) -> i
     const file = fileOf(handle)
     lockFile(file)
     const flushed = flushWrites(file)
-    clearFlags(file, UNBUFFERED | LINE_BUFFERED)
+    dropReads(file)
+    clearFlags(file, UNBUFFERED | LINE_BUFFERED | WRITING)
+    setWritePointers(file, 0, 0, 0)
     if mode == 2 {
+        releaseBuffer(file)
         addFlags(file, UNBUFFERED)
+        sys.put32(file + F_IOFLAGS, sys.get32(file + F_IOFLAGS) | IO_UNBUFFERED)
     } else {
+        sys.put32(file + F_IOFLAGS, sys.get32(file + F_IOFLAGS) & ~IO_UNBUFFERED)
         if mode == 1 { addFlags(file, LINE_BUFFERED) }
         if buffer != 0 && size > 0 {
-            if flags(file) & OWN_BUFFER != 0 { heap.release(sys.getPointer(file + F_BUFFER)) }
-            clearFlags(file, OWN_BUFFER)
+            releaseBuffer(file)
             sys.putPointer(file + F_BUFFER, buffer)
-            sys.putPointer(file + F_CAPACITY, size)
+            sys.putPointer(file + F_BUFFER_END, buffer + size)
         }
     }
     addFlags(file, BUFFERING_DECIDED)
@@ -512,7 +617,7 @@ pub export fn fputs(text: usize, handle: usize) -> i32 {
 pub export fn fputs_unlocked(text: usize, handle: usize) -> i32 { return fputs(text, handle) }
 
 pub export fn puts(text: usize) -> i32 {
-    const file = fileOf(2)
+    const file = standardOut()
     const length = sys.length(text)
     lockFile(file)
     var ok = putBytes(file, text, length) == length
@@ -535,21 +640,41 @@ pub export fn fgetc(handle: usize) -> i32 {
 pub export fn getc(handle: usize) -> i32 { return fgetc(handle) }
 pub export fn getc_unlocked(handle: usize) -> i32 { return fgetc(handle) }
 pub export fn fgetc_unlocked(handle: usize) -> i32 { return fgetc(handle) }
-pub export fn getchar() -> i32 { return fgetc(1) }
-pub export fn getchar_unlocked() -> i32 { return fgetc(1) }
+pub export fn getchar() -> i32 { return fgetc(standardIn()) }
+pub export fn getchar_unlocked() -> i32 { return fgetc(standardIn()) }
 pub export fn __uflow(handle: usize) -> i32 { return fgetc(handle) }
 
+// The byte goes back into the buffer before the next unread one, or into
+// the spare bytes before the buffer when it is full to the start.
 pub export fn ungetc(value: i32, handle: usize) -> i32 {
     if value < 0 { return -1 }
     const file = fileOf(handle)
     lockFile(file)
-    if sys.getI32(file + F_UNGOT) >= 0 {
+    if flags(file) & READABLE == 0 || !ensureBuffer(file) {
         unlockFile(file)
         return -1
     }
-    sys.putI32(file + F_UNGOT, value & 255)
+    if flags(file) & WRITING != 0 {
+        const flushed = flushWrites(file)
+        clearFlags(file, WRITING)
+        setWritePointers(file, 0, 0, 0)
+    }
+    if flags(file) & READING == 0 { beginReading(file) }
+    var pointer = sys.getPointer(file + F_READ_PTR)
+    if pointer > sys.getPointer(file + F_READ_BASE) {
+        pointer -= 1
+    } else {
+        const spare = if flags(file) & SPARE != 0 { sys.getPointer(file + F_BUFFER) - 8 } else { sys.getPointer(file + F_BUFFER) }
+        if pointer <= spare {
+            unlockFile(file)
+            return -1
+        }
+        pointer -= 1
+        sys.putPointer(file + F_READ_BASE, pointer)
+    }
+    sys.put8(pointer, @intCast(u8, value & 255))
+    sys.putPointer(file + F_READ_PTR, pointer)
     clearFlags(file, EOF_SEEN)
-    addFlags(file, READING)
     unlockFile(file)
     return value & 255
 }
@@ -664,16 +789,12 @@ pub export fn fseeko(handle: usize, offset: i64, whence: i32) -> i32 {
     lockFile(file)
     const flushed = flushWrites(file)
     var target = offset
-    if whence == 1 {
+    if whence == 1 && flags(file) & READING != 0 {
         // Relative to what the program has consumed, not what was read ahead.
-        const consumed = sys.getPointer(file + F_POSITION)
-        const length = sys.getPointer(file + F_LENGTH)
-        if flags(file) & READING != 0 { target -= @intCast(i64, length - consumed) }
-        if sys.getI32(file + F_UNGOT) >= 0 { target -= 1 }
+        target -= @intCast(i64, unreadBytes(file))
     }
-    sys.putPointer(file + F_POSITION, 0)
-    sys.putPointer(file + F_LENGTH, 0)
-    sys.putI32(file + F_UNGOT, -1)
+    setReadPointers(file, 0, 0, 0)
+    setWritePointers(file, 0, 0, 0)
     clearFlags(file, READING | WRITING | EOF_SEEN)
     const sought = unistd.lseek(descriptor(file), target, whence)
     unlockFile(file)
@@ -689,10 +810,9 @@ pub export fn ftello(handle: usize) -> i64 {
     var position = unistd.lseek(descriptor(file), 0, 1)
     if position >= 0 {
         if flags(file) & READING != 0 {
-            position -= @intCast(i64, sys.getPointer(file + F_LENGTH) - sys.getPointer(file + F_POSITION))
-            if sys.getI32(file + F_UNGOT) >= 0 { position -= 1 }
+            position -= @intCast(i64, unreadBytes(file))
         } else if flags(file) & WRITING != 0 {
-            position += @intCast(i64, sys.getPointer(file + F_POSITION))
+            position += @intCast(i64, pendingWrites(file))
         }
     }
     unlockFile(file)
@@ -813,7 +933,7 @@ pub export fn printf(pattern: usize, a1: usize, a2: usize, a3: usize, a4: usize,
     var words: [6]usize = [6]usize{ pattern, a1, a2, a3, a4, a5 }
     var doubles: [8]f64 = [8]f64{ x0, x1, x2, x3, x4, x5, x6, x7 }
     var source = format.callSource(&call, 1, @frameAddress(), @intFromPtr(&words), @intFromPtr(&doubles))
-    return toStream(2, pattern, &source)
+    return toStream(standardOut(), pattern, &source)
 }
 
 pub export fn fprintf(handle: usize, pattern: usize, a2: usize, a3: usize, a4: usize, a5: usize, x0: f64, x1: f64, x2: f64, x3: f64, x4: f64, x5: f64, x6: f64, x7: f64) -> i32 {
@@ -858,7 +978,7 @@ pub export fn asprintf(target: usize, pattern: usize, a2: usize, a3: usize, a4: 
 
 pub export fn vprintf(pattern: usize, list: usize) -> i32 {
     var source = format.vaList(list)
-    return toStream(2, pattern, &source)
+    return toStream(standardOut(), pattern, &source)
 }
 
 pub export fn vfprintf(handle: usize, pattern: usize, list: usize) -> i32 {
@@ -893,7 +1013,7 @@ pub export fn __printf_chk(flag: i32, pattern: usize, a2: usize, a3: usize, a4: 
     var words: [6]usize = [6]usize{ sys.int(flag), pattern, a2, a3, a4, a5 }
     var doubles: [8]f64 = [8]f64{ x0, x1, x2, x3, x4, x5, x6, x7 }
     var source = format.callSource(&call, 2, @frameAddress(), @intFromPtr(&words), @intFromPtr(&doubles))
-    return toStream(2, pattern, &source)
+    return toStream(standardOut(), pattern, &source)
 }
 
 pub export fn __fprintf_chk(handle: usize, flag: i32, pattern: usize, a3: usize, a4: usize, a5: usize, x0: f64, x1: f64, x2: f64, x3: f64, x4: f64, x5: f64, x6: f64, x7: f64) -> i32 {
@@ -1331,7 +1451,7 @@ pub export fn scanf(pattern: usize, a1: usize, a2: usize, a3: usize, a4: usize, 
     var words: [6]usize = [6]usize{ pattern, a1, a2, a3, a4, a5 }
     var doubles: [8]f64 = [8]f64{ 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 }
     var source = format.callSource(&call, 1, @frameAddress(), @intFromPtr(&words), @intFromPtr(&doubles))
-    return scanStream(1, pattern, &source)
+    return scanStream(standardIn(), pattern, &source)
 }
 
 pub export fn __isoc99_scanf(pattern: usize, a1: usize, a2: usize, a3: usize, a4: usize, a5: usize) -> i32 {
@@ -1339,7 +1459,7 @@ pub export fn __isoc99_scanf(pattern: usize, a1: usize, a2: usize, a3: usize, a4
     var words: [6]usize = [6]usize{ pattern, a1, a2, a3, a4, a5 }
     var doubles: [8]f64 = [8]f64{ 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 }
     var source = format.callSource(&call, 1, @frameAddress(), @intFromPtr(&words), @intFromPtr(&doubles))
-    return scanStream(1, pattern, &source)
+    return scanStream(standardIn(), pattern, &source)
 }
 
 pub export fn __isoc23_scanf(pattern: usize, a1: usize, a2: usize, a3: usize, a4: usize, a5: usize) -> i32 {
@@ -1347,10 +1467,10 @@ pub export fn __isoc23_scanf(pattern: usize, a1: usize, a2: usize, a3: usize, a4
     var words: [6]usize = [6]usize{ pattern, a1, a2, a3, a4, a5 }
     var doubles: [8]f64 = [8]f64{ 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 }
     var source = format.callSource(&call, 1, @frameAddress(), @intFromPtr(&words), @intFromPtr(&doubles))
-    return scanStream(1, pattern, &source)
+    return scanStream(standardIn(), pattern, &source)
 }
 
-pub export fn vscanf(pattern: usize, list: usize) -> i32 { return vfscanf(1, pattern, list) }
+pub export fn vscanf(pattern: usize, list: usize) -> i32 { return vfscanf(standardIn(), pattern, list) }
 pub export fn __isoc99_vsscanf(text: usize, pattern: usize, list: usize) -> i32 { return vsscanf(text, pattern, list) }
 pub export fn __isoc99_vfscanf(handle: usize, pattern: usize, list: usize) -> i32 { return vfscanf(handle, pattern, list) }
 pub export fn __isoc99_vscanf(pattern: usize, list: usize) -> i32 { return vscanf(pattern, list) }
@@ -1359,3 +1479,39 @@ pub export fn __isoc23_vfscanf(handle: usize, pattern: usize, list: usize) -> i3
 pub export fn __isoc23_vscanf(pattern: usize, list: usize) -> i32 { return vscanf(pattern, list) }
 // getline is an inline call of this in glibc's headers.
 pub export fn __getdelim(line: usize, capacity: usize, delimiter: i32, handle: usize) -> isize { return getdelim(line, capacity, delimiter, handle) }
+
+// --- stdio_ext.h (glibc): what coreutils ask a stream about ------------------
+
+pub export fn __fpending(handle: usize) -> usize {
+    const file = fileOf(handle)
+    if flags(file) & WRITING != 0 { return pendingWrites(file) }
+    return 0
+}
+
+pub export fn __freading(handle: usize) -> i32 {
+    const file = fileOf(handle)
+    return if flags(file) & READING != 0 || flags(file) & WRITABLE == 0 { 1 } else { 0 }
+}
+
+pub export fn __fwriting(handle: usize) -> i32 {
+    const file = fileOf(handle)
+    return if flags(file) & WRITING != 0 || flags(file) & READABLE == 0 { 1 } else { 0 }
+}
+
+pub export fn __freadable(handle: usize) -> i32 { return if flags(fileOf(handle)) & READABLE != 0 { 1 } else { 0 } }
+pub export fn __fwritable(handle: usize) -> i32 { return if flags(fileOf(handle)) & WRITABLE != 0 { 1 } else { 0 } }
+pub export fn __flbf(handle: usize) -> i32 { return if flags(fileOf(handle)) & LINE_BUFFERED != 0 { 1 } else { 0 } }
+pub export fn __fbufsize(handle: usize) -> usize { return bufferCapacity(fileOf(handle)) }
+
+// Drops what is buffered, unread or unwritten.
+pub export fn __fpurge(handle: usize) -> void {
+    const file = fileOf(handle)
+    lockFile(file)
+    setReadPointers(file, 0, 0, 0)
+    setWritePointers(file, 0, 0, 0)
+    clearFlags(file, READING | WRITING)
+    unlockFile(file)
+}
+
+// Streams lock internally here whatever a program asks (FSETLOCKING_INTERNAL).
+pub export fn __fsetlocking(handle: usize, kind: i32) -> i32 { return 1 }

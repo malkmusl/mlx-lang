@@ -5,13 +5,18 @@
 // addresses, times or ids). The work directory for files is argv[1];
 // argv[2] names the library the run expects under it (mlx or glibc).
 //
-//   mlxlibc_check WORKDIR mlx|glibc
+//   mlxlibc_check WORKDIR mlx|glibc [PLUGIN.so]
+//
+// With PLUGIN.so (an Mlx --plugin shared object, tests/support/plugin_library.mlx
+// built by the check script) the dlfcn functions are exercised on it.
 #define _GNU_SOURCE
 // Truncating copies and formats are what some of the calls below check.
 #pragma GCC diagnostic ignored "-Wstringop-truncation"
 #pragma GCC diagnostic ignored "-Wformat-truncation"
 #include <ctype.h>
+#include <dlfcn.h>
 #include <errno.h>
+#include <link.h>
 #include <fcntl.h>
 #include <inttypes.h>
 #include <libgen.h>
@@ -275,6 +280,10 @@ static void check_time(void) {
 
 static pthread_mutex_t counter_lock = PTHREAD_MUTEX_INITIALIZER;
 static long counter = 0;
+// Thread-local storage of the program itself: each thread's own copy,
+// starting from the initialization image.
+static __thread long per_thread = 5;
+static __thread char per_thread_text[32];
 
 static void *count_up(void *argument) {
     long rounds = (long)argument;
@@ -282,8 +291,10 @@ static void *count_up(void *argument) {
         pthread_mutex_lock(&counter_lock);
         counter++;
         pthread_mutex_unlock(&counter_lock);
+        per_thread++;
     }
-    return (void *)(rounds * 2);
+    per_thread_text[0] = 'a' + (char)(rounds % 26);
+    return (void *)(per_thread * 1000 + per_thread_text[0]);
 }
 
 static pthread_mutex_t flag_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -327,7 +338,8 @@ static void check_pthread(void) {
         pthread_join(threads[i], &result);
         total += (long)result;
     }
-    printf("%ld %ld\n", counter, total);
+    per_thread += 2;
+    printf("%ld %ld %ld %d\n", counter, total, per_thread, per_thread_text[0]);
     pthread_t waiter;
     pthread_create(&waiter, NULL, wait_for_flag, NULL);
     usleep(20000);
@@ -443,6 +455,49 @@ static void check_unistd(const char *work) {
     printf("%d %d\n", first, (int)signaled);
 }
 
+static int saw_plugin = 0;
+static int note_module(struct dl_phdr_info *info, size_t size, void *data) {
+    (void)size;
+    (void)data;
+    if (info->dlpi_name && strstr(info->dlpi_name, "libmlxplugin") && info->dlpi_phnum > 0) saw_plugin++;
+    return 0;
+}
+
+static void check_dl(const char *plugin) {
+    section("dlfcn");
+    void *handle = dlopen(plugin, RTLD_NOW);
+    if (!handle) {
+        printf("dlopen failed: %s\n", dlerror());
+        return;
+    }
+    long (*sum)(long) = (long (*)(long))dlsym(handle, "mlx_plugin_sum");
+    long (*twice)(long) = (long (*)(long))dlsym(handle, "mlx_plugin_twice");
+    unsigned long (*count)(void) = (unsigned long (*)(void))dlsym(handle, "mlx_plugin_count");
+    unsigned long *calls = (unsigned long *)dlsym(handle, "mlx_plugin_calls");
+    unsigned *level = (unsigned *)dlsym(handle, "mlx_plugin_level");
+    printf("%d %d %d %d %d\n", sum != NULL, twice != NULL, count != NULL, calls != NULL, level != NULL);
+    if (!sum || !twice || !count || !calls || !level) return;
+    printf("%ld %ld %u\n", sum(10), twice(21), *level);
+    unsigned long before = *calls;
+    count();
+    count();
+    printf("%lu %lu\n", before, *calls);
+    Dl_info info;
+    int found = dladdr((void *)sum, &info);
+    printf("%d %s %s %d\n", found, found && info.dli_sname ? info.dli_sname : "?", found && info.dli_fname ? strrchr(info.dli_fname, '/') + 1 : "?", found && info.dli_saddr == (void *)sum);
+    printf("%d %d\n", dlsym(RTLD_DEFAULT, "strlen") != NULL, dlsym(handle, "no_such_symbol") == NULL);
+    void *missing = dlopen("libmlxc-no-such-library.so.9", RTLD_NOW);
+    const char *message = dlerror();
+    printf("%d %d %d\n", missing == NULL, message != NULL, dlerror() == NULL);
+    dl_iterate_phdr(note_module, NULL);
+    printf("%d %d\n", saw_plugin, dlclose(handle));
+    // (Whether dlclose unmapped the plugin, and so whether its counter
+    // starts over, is the loader's choice; only the handle is compared.)
+    void *again = dlopen(plugin, RTLD_NOW);
+    printf("%d %d\n", again == handle, dlsym(again, "mlx_plugin_calls") != NULL);
+    dlclose(again);
+}
+
 static void say_goodbye(void) { printf("atexit ran\n"); }
 
 int main(int argc, char **argv) {
@@ -465,6 +520,7 @@ int main(int argc, char **argv) {
     check_time();
     check_pthread();
     check_unistd(argv[1]);
+    if (argc > 3) check_dl(argv[3]);
     // exit, not a return from main: glibc's start code calls its own exit,
     // which knows nothing of mlxlibc's atexit handlers and stdout buffer.
     exit(0);

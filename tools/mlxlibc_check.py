@@ -534,13 +534,21 @@ if wanted("stdio"):
     t = fn(mlx, "tmpfile", cv, [])(); check("tmpfile", t is not None, True); fputs(b"tmp", t); check("tmpfile rewind", fseek(t, 0, 0), 0); check("tmpfile read", (fread(buf, 1, 3, t), buf.raw[:3]), (3, b"tmp")); fclose(t)
     check("remove", fn(mlx, "remove", ci, [cp])(path), 0); check("removed", os.path.exists(path), False)
     check("remove dir", fn(mlx, "remove", ci, [cp])(work.encode()), 0)
-    # The standard streams through their handles: stdout data symbol is 2.
-    check("stdout handle", ctypes.c_size_t.in_dll(mlx, "stdout").value, 2)
-    check("stderr handle", ctypes.c_size_t.in_dll(mlx, "stderr").value, 3)
+    # The standard streams: the data symbols hold their records' addresses
+    # (set by the library's DT_INIT when the dynamic linker loaded it), and
+    # the records have glibc's _IO_FILE layout where C's inline putc and
+    # getc look (_flags at 0, _fileno at 112).
+    # (Loaded next to glibc, the library leaves `stdout` and the others to
+    # glibc's values; its own records are asked for by descriptor.)
+    stream = fn(mlx, "mlxlibc_stream", cv, [ci]); out = stream(1); err = stream(2); inp = stream(0)
+    check("stdout set", out is not None and err is not None and inp is not None and len({out, err, inp}) == 3, True)
+    check("stdout _fileno", ctypes.c_int.from_address(out + 112).value, 1)
+    check("stderr _fileno", ctypes.c_int.from_address(err + 112).value, 2)
+    check("stdout _flags magic", ctypes.c_uint.from_address(out).value & 0xFFFF0000, 4222222336)
     r, w = os.pipe(); saved = os.dup(1); os.dup2(w, 1)
     try:
         pf = fn(mlx, "printf", ci, None); puts = fn(mlx, "puts", ci, [cp]); putchar = fn(mlx, "putchar", ci, [ci])
-        pf(b"via printf %d\n", ci(1)); puts(b"via puts"); putchar(ord("Z")); fn(mlx, "fflush", ci, [cv])(ctypes.c_void_p(2))
+        pf(b"via printf %d\n", ci(1)); puts(b"via puts"); putchar(ord("Z")); fn(mlx, "fflush", ci, [cv])(ctypes.c_void_p(out))
     finally:
         os.dup2(saved, 1); os.close(saved); os.close(w)
     check("stdout output", os.read(r, 256), b"via printf 1\nvia puts\nZ"); os.close(r)
