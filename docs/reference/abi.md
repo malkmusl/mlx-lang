@@ -540,6 +540,18 @@ Struct arguments and returns by value are not classified for C yet; C APIs
 that take structures by pointer (Vulkan, Wayland's C libraries) are fully
 usable.
 
+## Atomics
+
+The atomic builtins (`spec/00-language/atomics-tls.xml`, `<CallShapes>`;
+[Memory model and concurrency](memory-and-concurrency.md#the-atomic-builtins))
+lower to the LIR's `atomic_load`, `atomic_store`, `atomic_rmw`, `cmpxchg`
+and `fence`, and on x86_64 to `mov`/`xchg`, `lock xadd`, `lock cmpxchg`
+(in a loop for the operations the processor has no single instruction for)
+and `mfence`; on aarch64 to `LDAR`/`STLR`, `LDAXR`/`STLXR` loops and `DMB`.
+A compare-exchange's two result words follow the two-word return convention
+(the flag first, then the value seen). Narrow results come back extended by
+the type's signedness.
+
 ## Open ABI gap: thread-local storage
 
 Unlike every rule above, thread-local storage has no defined ABI yet.

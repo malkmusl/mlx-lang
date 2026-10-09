@@ -171,3 +171,37 @@ fn main() -> u8 {
 ```
 
 (`tests/232_optional_pointer_unwrap_valid.mlx`)
+
+## Atomics
+
+Memory shared between threads is written and read through the atomic
+builtins; a plain store and a load of the same word on two threads is a
+data race, which is undefined. The builtins take the type first, then the
+pointer, then the operands, then the memory order as a bare name
+(`unordered`, `monotonic`, `acquire`, `release`, `acq_rel`, `seq_cst`):
+
+```mlx
+var counter: u64 = 0
+const before = @atomicRmw(u64, &counter, add, 1, monotonic)   // the old value
+const now = @atomicLoad(u64, &counter, acquire)
+@atomicStore(u64, &counter, 0, release)
+
+// A lock: the word goes from 0 to 1 when it was 0 (the swap tells).
+var lock: u32 = 0
+while true {
+    const taken = @cmpxchgWeak(u32, &lock, 0, 1, acquire, monotonic)
+    if taken.0 { break }
+}
+// ... the guarded work ...
+@atomicStore(u32, &lock, 0, release)
+@fence(seq_cst)
+```
+
+`@atomicRmw`'s operation is one of `xchg add sub and nand or xor max min`;
+a compare-exchange answers `(bool, T)`: whether it swapped, and the value it
+saw. The type is an integer of 1, 2, 4 or 8 bytes, a `bool`, an enum or a
+pointer. The compiler rejects orders that make no sense for the operation
+(a load that would release, a store that would acquire, a fence below
+acquire, a compare-exchange whose failure order exceeds its success order).
+`docs/reference/memory-and-concurrency.md` has the rules and what each
+builtin becomes on x86_64 and aarch64.

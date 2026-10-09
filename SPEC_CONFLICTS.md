@@ -5,14 +5,17 @@
 These are omissions rather than contradictions, but they prevent a conforming
 implementation from choosing behavior without designing new language rules.
 
-### Atomic builtin call shapes
+### Atomic builtin call shapes (resolved)
 
-`spec/00-language/atomics-tls.xml` names `@atomicLoad`, `@atomicStore`,
-`@atomicRmw`, `@cmpxchgWeak`, `@cmpxchgStrong`, and `@fence`, and defines the
-available memory orders. It does not define argument order, result types, the
-representation of an RMW operation, or the valid order combinations per
-builtin. Stage 0 and the canonical compiler recognize every name and report
-MLX-E9001; neither lowers an invented calling convention.
+`spec/00-language/atomics-tls.xml` now fixes the call shapes
+(`<CallShapes>`): `@atomicLoad(T, pointer, order)`,
+`@atomicStore(T, pointer, value, order)`, `@atomicRmw(T, pointer, op,
+value, order)` answering the old value, `@cmpxchgStrong` and
+`@cmpxchgWeak(T, pointer, expected, new, success, failure)` answering
+`(bool, T)`, `@fence(order)`; the orders and operations are bare names; the
+valid order combinations are the C11 ones. The canonical compiler implements
+them on x86_64 and aarch64 (`tests/295_atomics_runtime.mlx`); Stage 0
+(mlx0) still reports MLX-E9001.
 
 ### Vector builtin call shapes
 
