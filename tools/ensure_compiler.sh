@@ -232,6 +232,18 @@ lowers_thread_builtins() {
     return $ok
 }
 
+# What mlxlibc (projects/libc) needs: @frameAddress, a narrow signed value
+# read through a pointer kept signed, a module var with an array initializer.
+builds_mlxlibc() {
+    local probe
+    probe=$(mktemp -d)
+    printf 'var table: [3]u16 = [3]u16{ 7, 8, 9 }\n\nfn load(address: usize) -> i32 {\n    unsafe { return @ptrFromInt(*i32, address).* }\n}\n\npub fn main() -> u8 {\n    var value: i32 = -1\n    if load(@intFromPtr(&value)) >= 0 { return 1 }\n    if table[2] != 9 { return 2 }\n    if @frameAddress() <= @intFromPtr(&value) { return 3 }\n    return 0\n}\n' > "$probe/probe.mlx"
+    local ok=1
+    if "$1" --quiet "$probe/probe.mlx" -o "$probe/probe" > /dev/null 2>&1 && "$probe/probe"; then ok=0; fi
+    rm -rf -- "$probe"
+    return $ok
+}
+
 if [[ ! -x mlx-out/bin/compiler/mlx4 ]]; then
     if [[ ! -x zig-out/bin/mlx1 ]]; then
         if command -v zig > /dev/null; then
@@ -246,8 +258,8 @@ if [[ ! -x mlx-out/bin/compiler/mlx4 ]]; then
     zig-out/bin/mlx1 --quiet compiler/selfhost/main.mlx -o mlx-out/bin/compiler/mlx2
     mlx-out/bin/compiler/mlx2 --quiet compiler/selfhost/main.mlx -o mlx-out/bin/compiler/mlx3
     cp mlx-out/bin/compiler/mlx3 mlx-out/bin/compiler/mlx4
-elif ! writes_shared_objects mlx-out/bin/compiler/mlx4 || ! writes_symbol_tables mlx-out/bin/compiler/mlx4 || ! accepts_discards mlx-out/bin/compiler/mlx4 || ! keeps_slice_lengths mlx-out/bin/compiler/mlx4 || ! orders_import_cycles mlx-out/bin/compiler/mlx4 || ! has_large_arena mlx-out/bin/compiler/mlx4 || ! keeps_match_widths mlx-out/bin/compiler/mlx4 || ! extends_signed_results mlx-out/bin/compiler/mlx4 || ! writes_symbol_versions mlx-out/bin/compiler/mlx4 || ! resolves_named_array_lengths mlx-out/bin/compiler/mlx4 || ! exports_data mlx-out/bin/compiler/mlx4 || ! lowers_atomics mlx-out/bin/compiler/mlx4 || ! lowers_globals mlx-out/bin/compiler/mlx4 || ! builds_freestanding_plugins mlx-out/bin/compiler/mlx4 || ! lowers_thread_builtins mlx-out/bin/compiler/mlx4; then
-    echo "rebuilding mlx-out/bin/compiler/mlx4 from the current compiler sources (it lacks --shared objects, symbol tables, \`_ = value\`, slice lengths kept on assignment, import cycles broken in order, the 1 GiB arena, match values stored at their width, signed results sign-extended, symbol versions, array lengths from named constants, data symbols for export const, the atomic builtins, module-level var globals, plugins without libc on stack arenas or the thread builtins)" >&2
+elif ! writes_shared_objects mlx-out/bin/compiler/mlx4 || ! writes_symbol_tables mlx-out/bin/compiler/mlx4 || ! accepts_discards mlx-out/bin/compiler/mlx4 || ! keeps_slice_lengths mlx-out/bin/compiler/mlx4 || ! orders_import_cycles mlx-out/bin/compiler/mlx4 || ! has_large_arena mlx-out/bin/compiler/mlx4 || ! keeps_match_widths mlx-out/bin/compiler/mlx4 || ! extends_signed_results mlx-out/bin/compiler/mlx4 || ! writes_symbol_versions mlx-out/bin/compiler/mlx4 || ! resolves_named_array_lengths mlx-out/bin/compiler/mlx4 || ! exports_data mlx-out/bin/compiler/mlx4 || ! lowers_atomics mlx-out/bin/compiler/mlx4 || ! lowers_globals mlx-out/bin/compiler/mlx4 || ! builds_freestanding_plugins mlx-out/bin/compiler/mlx4 || ! lowers_thread_builtins mlx-out/bin/compiler/mlx4 || ! builds_mlxlibc mlx-out/bin/compiler/mlx4; then
+    echo "rebuilding mlx-out/bin/compiler/mlx4 from the current compiler sources (it lacks --shared objects, symbol tables, \`_ = value\`, slice lengths kept on assignment, import cycles broken in order, the 1 GiB arena, match values stored at their width, signed results sign-extended, symbol versions, array lengths from named constants, data symbols for export const, the atomic builtins, module-level var globals, plugins without libc on stack arenas, the thread builtins or what mlxlibc needs: @frameAddress, signed loads through pointers, array initializers of module vars)" >&2
     mlx-out/bin/compiler/mlx4 --quiet compiler/selfhost/main.mlx -o mlx-out/bin/compiler/mlx4.next
     mlx-out/bin/compiler/mlx4.next --quiet compiler/selfhost/main.mlx -o mlx-out/bin/compiler/mlx4.fixed
     mv mlx-out/bin/compiler/mlx4.fixed mlx-out/bin/compiler/mlx4

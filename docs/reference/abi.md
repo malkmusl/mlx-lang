@@ -548,17 +548,24 @@ usable.
 A module-level `var` (`var counter: u32 = 0`, `pub var` for other modules,
 `export var` for C) lives in the image's data area, not in any frame: one
 slot per global after the area's fixed words, aligned to its type and at
-least 8 bytes long, with the initial value of an integer or bool
-initializer written into the image (`undefined` and `null` zero it). Code
-takes a slot's address RIP-relative on x86_64 (`lea reg, [rip + disp32]`
-with a fixup the pipeline resolves against where the area lands) and with
-`adrp`/`add` on aarch64; reads, writes, `&global`, field and index access
-then work on that address exactly as on a local's. Nothing is relocated at
-load time: the area moves with the code, so the same code serves a static
-executable (where the area is the `.data` segment on the page after the
-code), a dynamic one, a `--shared` object and a `--plugin`. An `export var`
-is also an `STT_OBJECT` symbol of `T`'s size, so a C host and the Mlx code
-share one word ([Formats](formats.md#globals)).
+least 8 bytes long, with the initial value of an integer, bool, array or
+struct literal initializer written into the image byte by byte
+(`undefined` and `null` zero it). Code takes a slot's address RIP-relative
+on x86_64 (`lea reg, [rip + disp32]` with a fixup the pipeline resolves
+against where the area lands) and with `adrp`/`add` on aarch64; reads,
+writes, `&global`, field and index access then work on that address
+exactly as on a local's. Nothing is relocated at load time: the area moves
+with the code, so the same code serves a static executable (where the area
+is the `.data` segment on the page after the code), a dynamic one, a
+`--shared` object and a `--plugin`. An `export var` is also an `STT_OBJECT`
+symbol of `T`'s size, so a C host and the Mlx code share one word
+([Formats](formats.md#globals)). In a `--shared` or `--plugin` object the
+code reaches an `export var` through a GOT slot the dynamic linker fills
+(`mov reg, [rip + slot]`, `R_X86_64_GLOB_DAT` against the symbol itself)
+rather than RIP-relative: a C program linked against the object takes its
+own copy of such a variable (`R_X86_64_COPY`, as gcc does for `optind` or
+`stdout`), the dynamic linker binds the symbol to that copy, and the slot
+makes the Mlx code read and write the copy too.
 
 ## Atomics
 

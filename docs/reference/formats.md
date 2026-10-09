@@ -172,7 +172,10 @@ which then names only the `--library` libraries (none, for an image that
 imports nothing; imports, if there are any, bind against whatever the
 loading process has). `tests/support/plugin_freestanding.mlx`, built with
 both and checked by `tests/run_foreign.sh` (no `NEEDED` entry; under
-`strace`, no mapping per call), is the shape of mlxlibc.
+`strace`, no mapping per call), is the shape of mlxlibc: `projects/libc`
+(its [README](../../projects/libc/README.md)), built by
+`tools/build_mlxlibc.sh` as `libmlxc.so.1` with no `DT_NEEDED` at all and
+checked against glibc by `tools/check_mlxlibc.sh`.
 `tests/271_shared_object_runtime.mlx` (run by `tests/run_foreign.sh`) loads
 `tests/support/shared_object_library.mlx` twice from two copies, calls it
 through `dlsym` and through function pointers it returns, and checks that
@@ -202,14 +205,26 @@ so the same code runs in a static executable, a dynamic one, a `--shared`
 object and a `--plugin`); loads and stores go through that address like any
 other memory, and `&NAME` is it. An integer or bool initializer (comptime
 evaluable, as `spec/00-language/modules.xml` asks) writes the slot's
-initial bytes; `undefined` and `null` leave it zeroed. Other initializers
-(strings, aggregate literals, floats) are not lowered yet and are reported. A static executable with globals gets the `.data` segment
-described above; a dynamic image keeps them in its `R+W` segment.
+initial bytes, and so does an array or struct literal of such values
+(element by element at the type's layout, `writeInitialBytes` in
+`ir/lower.mlx`; `var table: [3]u16 = [3]u16{ 7, 8, 9 }`); `undefined` and
+`null` leave it zeroed. Other initializers (strings, floats) are not
+lowered yet and are reported with the module's position. A static
+executable with globals gets the `.data` segment described above; a dynamic
+image keeps them in its `R+W` segment.
 
 An `export var` is such a slot and a data symbol too (`STT_OBJECT`, its size
 that of `T`, in `.dynsym`): C code reads and writes the same word the Mlx
 code does (`tests/support/plugin_library.mlx`, `mlx_plugin_calls`, checked
-from python3 by `tests/run_foreign.sh`). `tests/297_module_globals_runtime.mlx`
+from python3 by `tests/run_foreign.sh`). In a `--shared` or `--plugin`
+object the Mlx code itself reaches an `export var` through a GOT slot
+(`data_got_rel32`: `mov reg, [rip + slot]`, the slot after the imports'
+with an `R_X86_64_GLOB_DAT` against the variable's own symbol), because a
+C program linked against the object may hold its own copy of the variable
+(`R_X86_64_COPY`, which gcc emits for `optind`, `optarg` or `stdout`): the
+dynamic linker resolves the symbol to that copy, and through the slot the
+library's `getopt` writes where the program reads (`tools/check_mlxlibc.sh`
+checks it with a C program). `tests/297_module_globals_runtime.mlx`
 covers the static image: scalars with initial values, aggregates, a slice
 over an array global, a pointer global, and another module's `pub var`
 globals read and written as `module.name` (`tests/support/module_globals.mlx`).

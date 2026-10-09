@@ -236,6 +236,13 @@ const tid = @spawnThread(flags, top, @intFromPtr(&shared.parentTid), @intFromPtr
   `CLONE_CHILD_CLEARTID`. It calls `entry(argument)` (`entry` a `fn(usize)
   -> usize` or its address) and exits with the result; the parent gets the
   id, or the negated errno.
+- `@frameAddress() -> usize`: the calling function's frame pointer (`rbp`
+  on x86_64, `x29` on aarch64), which every Mlx function keeps: the saved
+  caller frame pointer is there, the return address one word above it, and
+  above that the arguments the caller passed on the stack. A variadic C
+  function written in Mlx (mlxlibc's `printf`, `projects/libc/format.mlx`)
+  builds its `va_list` from it: the register arguments it declared, then
+  the caller's stack words from `@frameAddress() + 16`.
 
 Why a builtin: the child returns from `clone` on the new stack, so the
 code issuing the system call can not be a function with a frame, and the
@@ -327,7 +334,7 @@ checks one encoder primitive (`lock xadd`) at the byte level.
 | `threadlocal` keyword, scope, initializer rule | Specified at the source level; **no executable TLS ABI** — the compiler rejects any use with `MLX-E9001` |
 | `@atomicLoad`/`@atomicStore`/`@atomicRmw`/`@cmpxchgWeak`/`@cmpxchgStrong`/`@fence`, the six memory orders | Specified (names, call shapes, result types, operations, order rules) and implemented on x86_64 and aarch64 (`tests/295_atomics_runtime.mlx`); Stage 0 (mlx0) still rejects them |
 | Data race definition | Specified (non-atomic concurrent conflicting access with a write is UB); the atomics are the way to share mutable state across threads |
-| `@threadPointer`, `@spawnThread` | Specified (call shapes, the thread pointer's place, the clone semantics) and implemented on x86_64 and aarch64 (`tests/298_spawn_thread_runtime.mlx`) |
+| `@threadPointer`, `@spawnThread`, `@frameAddress` | Specified (call shapes, the thread pointer's place, the clone semantics, the frame's layout) and implemented on x86_64 and aarch64 (`tests/298_spawn_thread_runtime.mlx`, `tests/300_signed_pointer_loads_runtime.mlx`) |
 
 Of the three rows, `threadlocal` is the one still closed off: per
 `SPEC_CONFLICTS.md`'s framing, the compiler "cannot emit a private TLS ABI
