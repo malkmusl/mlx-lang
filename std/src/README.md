@@ -22,9 +22,10 @@ name and are not re-exported from `std.mlx`.
 PBKDF2-HMAC-SHA256.
 
 `crypt.mlx` (`std.crypt`) checks a password against the hashes of
-`/etc/shadow`, as crypt(3) writes them, with `crypt/shacrypt.mlx` for
-the SHA-256 and SHA-512 ones; `tools/check_crypt.sh` compares it with
-the system's crypt(3).
+`/etc/shadow`, as crypt(3) writes them: `crypt/yescrypt.mlx` for the
+yescrypt ($y$, Ubuntu's default) and scrypt ($7$) ones,
+`crypt/shacrypt.mlx` for SHA-256 and SHA-512 ($5$, $6$);
+`tools/check_crypt.sh` compares it with the system's crypt(3).
 `vulkan.mlx` (`std.vulkan`) is the Vulkan API, materialized from
 `std/registry/vulkan/vk.xml` by `vulkan/registry.mlx` and
 `vulkan/materialize.mlx` — do not edit it by hand. `vulkan/loader.mlx`

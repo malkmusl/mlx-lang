@@ -59,6 +59,27 @@ for password in passwords:
         lines.append(f"{setting} {made} {password.encode().hex()}")
         expected.append(made)
 
+# yescrypt: Ubuntu's default setting ($y$j9T: N = 4096, r = 32, the one
+# at the pre-hashing line), a small one for the password matrix, the
+# classic scrypt and WORM modes through $y$, a setting with p, t, and a
+# $7$ scrypt hash. (Each takes std.crypt a second or so; the matrix uses
+# the small one.)
+quick = "$y$j85$" + salt(16)
+for password in passwords[::3]:
+    made = crypt.crypt(password, quick)
+    lines.append(f"{quick} {made} {password.encode().hex()}")
+    expected.append(made)
+for password, setting in [("test", "$y$j9T$" + salt(22)), ("", "$y$j9T$" + salt(22)),
+                          ("correct horse battery staple", "$y$j9T$" + salt(22)),
+                          ("test", "$y$.85$" + salt(16)), ("test", "$y$/85$" + salt(16)),
+                          ("test", "$y$j85.1$" + salt(16)), ("test", "$y$j85/.1$" + salt(16)),
+                          ("test", "$7$B6....1....abcdefghijklmnop"), ("pleaseletmein", "$7$C6..../....SodiumChloride")]:
+    made = crypt.crypt(password, setting)
+    if made is None or made.startswith("*"):
+        continue
+    lines.append(f"{setting} {made} {password.encode().hex()}")
+    expected.append(made)
+
 result = subprocess.run([work + "/crypt_hashes"], input="\n".join(lines) + "\n",
                         capture_output=True, text=True)
 if result.returncode != 0:
@@ -99,12 +120,14 @@ $md5$abcdefgh $md5$abcdefgh$ignored 74657374
 $6$rounds=999$abcdefghijklmnop *0 74657374
 $6$rounds=2000000000$abcdefghijklmnop *0 74657374
 $6$rounds=$abcdefghijklmnop *0 74657374
+$y$j9T$abcdefghijklmnopqrstu *0 74657374
+$y$jZT$abcdefghijklmnop *0 74657374
 CASES
 refused=$("$work/crypt_hashes" < "$work/refused")
-[[ "$(grep -c '^- refused$' <<< "$refused")" == 7 ]] || { echo "FAIL a setting std.crypt cannot read was not refused:" >&2; echo "$refused" >&2; exit 1; }
-for setting in '*unusable*' '!$6$abcdefgh' '$6$rounds=999$abcdefghijklmnop' '$6$rounds=2000000000$abcdefghijklmnop' '$6$rounds=$abcdefghijklmnop'; do
+[[ "$(grep -c '^- refused$' <<< "$refused")" == 9 ]] || { echo "FAIL a setting std.crypt cannot read was not refused:" >&2; echo "$refused" >&2; exit 1; }
+for setting in '*unusable*' '!$6$abcdefgh' '$6$rounds=999$abcdefghijklmnop' '$6$rounds=2000000000$abcdefghijklmnop' '$6$rounds=$abcdefghijklmnop' '$y$j9T$abcdefghijklmnopqrstu' '$y$jZT$abcdefghijklmnop'; do
     theirs=$(python3 -W ignore -c 'import crypt, sys; print(crypt.crypt("test", sys.argv[1]))' "$setting")
     [[ "$theirs" == "*"* || "$theirs" == "None" ]] || { echo "FAIL crypt(3) answers $theirs for $setting, where std.crypt refuses it" >&2; exit 1; }
 done
-echo "ok   refused rather than guessed at: a locked account and rounds out of range (crypt(3) refuses those too), and MD5 on purpose"
+echo "ok   refused rather than guessed at: a locked account, rounds out of range, a yescrypt salt or N that is not one (crypt(3) refuses those too), and MD5 on purpose"
 echo "all std.crypt checks passed"

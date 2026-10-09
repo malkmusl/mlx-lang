@@ -1,0 +1,647 @@
+// yescrypt: the $y$ hashes of /etc/shadow (Debian's and Ubuntu's default
+// since 2021) and the $7$ scrypt hashes, as Alexander Peslyak's reference
+// implementation (yescrypt-ref.c, yescrypt-common.c) computes them and
+// libxcrypt writes them. scrypt's SMix over Salsa20/8 for $7$ and the
+// classic and WORM modes; for the read-write mode, which every $y$ uses,
+// SMix over pwxform with its S-boxes, the pre-hashing of large settings,
+// and the HMAC steps around them. No ROM (yescrypt_init_shared), which
+// no stored hash asks for.
+//
+// std.crypt calls this; it is the one that reads the setting's prefix.
+//
+// Memory for the work (V: 128 r N bytes, 16 MiB for Ubuntu's N = 4096,
+// r = 32) is mapped for the call and unmapped after, wiped. The arrays
+// in the loops come from the value arena, which the loops give back each
+// turn (std.turns).
+const linux = @import("../../bootstrap/os/linux.mlx")
+const sha2 = @import("std.sha2")
+const base64 = @import("std.crypt.base64")
+const turns_module = @import("std.turns")
+
+const MASK32: u32 = 4294967295
+
+// The flags a setting's flavor stands for.
+const FLAG_WORM: u32 = 1
+const FLAG_RW: u32 = 2
+const FLAG_PREHASH: u32 = 268435456
+// The one pwxform flavor this implements, as the reference does: 6
+// rounds, gather 4, simple 2, 12 KiB of S-boxes (ROUNDS_6 | GATHER_4 |
+// SIMPLE_2 | SBOX_12K).
+const RW_FLAVOR: u32 = 180
+const RW_FLAVOR_MASK: u32 = 1020
+// pwxform's shape, from those.
+const PWX_SIMPLE: usize = 2
+const PWX_GATHER: usize = 4
+const PWX_ROUNDS: usize = 6
+const PWX_WORDS: usize = 16
+const S_WORDS: usize = 3072
+const S_MASK: u32 = 4080
+const S_BOX_WORDS: usize = 1024
+const W_MASK: usize = 511
+// The most memory a setting may ask for: 1 GiB (a login waits for no
+// more; a setting asking more is refused).
+const MEMORY_MOST: u64 = 1073741824
+// How many parallel lanes (p) this has S-boxes for.
+const LANES_MOST: usize = 8
+
+pub const Params = struct {
+    flags: u32
+    n: u64
+    r: u32
+    p: u32
+    t: u32
+    g: u32
+}
+
+// A lane's pwxform state: where its S-boxes are in `s` (word offsets),
+// which of the three is S0, S1 and S2 now, and the write position.
+const Lane = struct {
+    base: usize
+    s0: usize
+    s1: usize
+    s2: usize
+    w: usize
+}
+
+fn laneAt(lanes: usize, index: usize) -> *Lane {
+    unsafe { return @ptrFromInt(*Lane, lanes + index * @sizeOf(Lane)) }
+}
+
+fn rotate(value: u32, count: u32) -> u32 {
+    return ((value << count) & MASK32) | (value >> (32 - count))
+}
+
+fn copyWords(into: [*]u32, at: usize, from: [*]u32, fromAt: usize, count: usize) -> void {
+    var index: usize = 0
+    while index < count {
+        into[at + index] = from[fromAt + index]
+        index += 1
+    }
+}
+
+fn xorWords(into: [*]u32, at: usize, from: [*]u32, fromAt: usize, count: usize) -> void {
+    var index: usize = 0
+    while index < count {
+        into[at + index] = into[at + index] ^ from[fromAt + index]
+        index += 1
+    }
+}
+
+// One Salsa20 quarter-round group on the words a, b, c, d of x.
+fn quarter(x: [*]u32, a: usize, b: usize, c: usize, d: usize) -> void {
+    x[b] = x[b] ^ rotate(x[a] +% x[d], 7)
+    x[c] = x[c] ^ rotate(x[b] +% x[a], 9)
+    x[d] = x[d] ^ rotate(x[c] +% x[b], 13)
+    x[a] = x[a] ^ rotate(x[d] +% x[c], 18)
+}
+
+// The Salsa20 core with `rounds` rounds over the 16 words at `at`, in
+// scrypt's SIMD-shuffled word order.
+fn salsa20(b: [*]u32, at: usize, rounds: usize) -> void {
+    var words: [16]u32 = undefined
+    var x: [*]u32 = undefined
+    unsafe { x = @ptrCast([*]u32, &words) }
+    var index: usize = 0
+    while index < 16 {
+        x[index * 5 % 16] = b[at + index]
+        index += 1
+    }
+    var round: usize = 0
+    while round < rounds {
+        quarter(x, 0, 4, 8, 12)
+        quarter(x, 5, 9, 13, 1)
+        quarter(x, 10, 14, 2, 6)
+        quarter(x, 15, 3, 7, 11)
+        quarter(x, 0, 1, 2, 3)
+        quarter(x, 5, 6, 7, 4)
+        quarter(x, 10, 11, 8, 9)
+        quarter(x, 15, 12, 13, 14)
+        round += 2
+    }
+    index = 0
+    while index < 16 {
+        b[at + index] = b[at + index] +% x[index * 5 % 16]
+        index += 1
+    }
+}
+
+// BlockMix over Salsa20/8: B (2r blocks of 16 words at `at`) through
+// `y` (as many words of room at `yat`).
+fn blockmixSalsa8(b: [*]u32, at: usize, y: [*]u32, yat: usize, r: usize) -> void {
+    var words: [16]u32 = undefined
+    var x: [*]u32 = undefined
+    unsafe { x = @ptrCast([*]u32, &words) }
+    copyWords(x, 0, b, at + (2 * r - 1) * 16, 16)
+    var index: usize = 0
+    while index < 2 * r {
+        xorWords(x, 0, b, at + index * 16, 16)
+        salsa20(x, 0, 8)
+        copyWords(y, yat + index * 16, x, 0, 16)
+        index += 1
+    }
+    index = 0
+    while index < r {
+        copyWords(b, at + index * 16, y, yat + index * 2 * 16, 16)
+        copyWords(b, at + (index + r) * 16, y, yat + (index * 2 + 1) * 16, 16)
+        index += 1
+    }
+}
+
+// pwxform over the 16 words at `at` of x, with the lane's S-boxes in
+// `s`: six rounds of gathering four pairs of words, multiplying and
+// mixing them with S0 and S1, writing the middle rounds into S2, then
+// rotating the three boxes.
+fn pwxform(x: [*]u32, at: usize, s: [*]u32, lane: *Lane) -> void {
+    const s0 = lane.*.s0
+    const s1 = lane.*.s1
+    const s2 = lane.*.s2
+    var w = lane.*.w
+    var round: usize = 0
+    while round < PWX_ROUNDS {
+        var gather: usize = 0
+        while gather < PWX_GATHER {
+            const first = at + gather * PWX_SIMPLE * 2
+            const p0 = s0 + @intCast(usize, x[first] & S_MASK) / 4
+            const p1 = s1 + @intCast(usize, x[first + 1] & S_MASK) / 4
+            var simple: usize = 0
+            while simple < PWX_SIMPLE {
+                const where = first + simple * 2
+                const box0 = (@intCast(u64, s[p0 + simple * 2 + 1]) << 32) + @intCast(u64, s[p0 + simple * 2])
+                const box1 = (@intCast(u64, s[p1 + simple * 2 + 1]) << 32) + @intCast(u64, s[p1 + simple * 2])
+                var value = @intCast(u64, x[where + 1]) * @intCast(u64, x[where])
+                value = value +% box0
+                value = value ^ box1
+                const low = @intCast(u32, value & 4294967295)
+                const high = @intCast(u32, value >> 32)
+                x[where] = low
+                x[where + 1] = high
+                if round != 0 && round != PWX_ROUNDS - 1 {
+                    s[s2 + w * 2] = low
+                    s[s2 + w * 2 + 1] = high
+                    w += 1
+                }
+                simple += 1
+            }
+            gather += 1
+        }
+        round += 1
+    }
+    lane.*.s0 = s2
+    lane.*.s1 = s0
+    lane.*.s2 = s1
+    lane.*.w = w & W_MASK
+}
+
+// BlockMix over pwxform (and Salsa20/2 for the last block): B, 2r blocks
+// of 16 words at `at`.
+fn blockmixPwxform(b: [*]u32, at: usize, s: [*]u32, lane: *Lane, r: usize) -> void {
+    var words: [16]u32 = undefined
+    var x: [*]u32 = undefined
+    unsafe { x = @ptrCast([*]u32, &words) }
+    // 128 r bytes in 64-byte pwxform blocks: 2r of them, 16 words each.
+    const count = 2 * r
+    copyWords(x, 0, b, at + (count - 1) * PWX_WORDS, PWX_WORDS)
+    var index: usize = 0
+    while index < count {
+        if count > 1 { xorWords(x, 0, b, at + index * PWX_WORDS, PWX_WORDS) }
+        pwxform(x, 0, s, lane)
+        copyWords(b, at + index * PWX_WORDS, x, 0, PWX_WORDS)
+        index += 1
+    }
+    // The last 64-byte block through Salsa20/2 (and, were pwxform's
+    // blocks smaller than Salsa20's, the ones after it: with these
+    // settings there are none).
+    index = count - 1
+    salsa20(b, at + index * 16, 2)
+    index += 1
+    while index < 2 * r {
+        xorWords(b, at + index * 16, b, at + (index - 1) * 16, 16)
+        salsa20(b, at + index * 16, 2)
+        index += 1
+    }
+}
+
+// The last block of B as a little-endian integer (word 13 is its second
+// word, after the SIMD shuffle).
+fn integerify(b: [*]u32, at: usize, r: usize) -> u64 {
+    const last = at + (2 * r - 1) * 16
+    return (@intCast(u64, b[last + 13]) << 32) + @intCast(u64, b[last])
+}
+
+// The largest power of two not above `value`.
+fn powerOfTwoBelow(value: u64) -> u64 {
+    var x = value
+    while true {
+        const y = x & (x - 1)
+        if y == 0 { break }
+        x = y
+    }
+    return x
+}
+
+// `x` brought into 0 .. count - 1, as yescrypt does it.
+fn wrap(x: u64, count: u64) -> u64 {
+    const n = powerOfTwoBelow(count)
+    return (x & (n - 1)) + (count - n)
+}
+
+// X <- B, with the shuffle into Salsa20's word order; and back.
+fn shuffleIn(x: [*]u32, xat: usize, b: [*]u32, bat: usize, r: usize) -> void {
+    var block: usize = 0
+    while block < 2 * r {
+        var index: usize = 0
+        while index < 16 {
+            x[xat + block * 16 + index] = b[bat + block * 16 + (index * 5 % 16)]
+            index += 1
+        }
+        block += 1
+    }
+}
+
+fn shuffleOut(b: [*]u32, bat: usize, x: [*]u32, xat: usize, r: usize) -> void {
+    var block: usize = 0
+    while block < 2 * r {
+        var index: usize = 0
+        while index < 16 {
+            b[bat + block * 16 + (index * 5 % 16)] = x[xat + block * 16 + index]
+            index += 1
+        }
+        block += 1
+    }
+}
+
+// The first loop of SMix: V filled from B through n BlockMixes (in the
+// read-write mode, each after the one at a wrapped index was mixed in).
+fn smix1(b: [*]u32, bat: usize, r: usize, n: u64, flags: u32, v: [*]u32, vat: usize, xy: [*]u32, xyat: usize, s: [*]u32, lane: *Lane, withLane: bool) -> void {
+    const width = 32 * r
+    const yat = xyat + width
+    shuffleIn(xy, xyat, b, bat, r)
+    var turns: turns_module.Turns = undefined
+    turns_module.begin(&turns, true, false)
+    var index: u64 = 0
+    while index < n {
+        turns_module.turn(&turns)
+        const slot = vat + @intCast(usize, index) * width
+        copyWords(v, slot, xy, xyat, width)
+        if flags & FLAG_RW != 0 && index > 1 {
+            const j = wrap(integerify(xy, xyat, r), index)
+            xorWords(xy, xyat, v, vat + @intCast(usize, j) * width, width)
+        }
+        if withLane { blockmixPwxform(xy, xyat, s, lane, r) } else { blockmixSalsa8(xy, xyat, xy, yat, r) }
+        index += 1
+    }
+    shuffleOut(b, bat, xy, xyat, r)
+}
+
+// The second loop of SMix: `loops` BlockMixes of B with blocks of V
+// picked by its own value (written back in the read-write mode). `n`
+// is a power of two.
+fn smix2(b: [*]u32, bat: usize, r: usize, n: u64, loops: u64, flags: u32, v: [*]u32, vat: usize, xy: [*]u32, xyat: usize, s: [*]u32, lane: *Lane, withLane: bool) -> void {
+    const width = 32 * r
+    const yat = xyat + width
+    shuffleIn(xy, xyat, b, bat, r)
+    var turns: turns_module.Turns = undefined
+    turns_module.begin(&turns, true, false)
+    var index: u64 = 0
+    while index < loops {
+        turns_module.turn(&turns)
+        const j = integerify(xy, xyat, r) & (n - 1)
+        const slot = vat + @intCast(usize, j) * width
+        xorWords(xy, xyat, v, slot, width)
+        if flags & FLAG_RW != 0 { copyWords(v, slot, xy, xyat, width) }
+        if withLane { blockmixPwxform(xy, xyat, s, lane, r) } else { blockmixSalsa8(xy, xyat, xy, yat, r) }
+        index += 1
+    }
+    shuffleOut(b, bat, xy, xyat, r)
+}
+
+// SMix over B's p lanes (128 r p bytes at `bat`), with t more time; in
+// the read-write mode each lane first makes its S-boxes and the first
+// lane folds its last block into `passwd` (32 bytes).
+fn smix(b: [*]u32, bat: usize, r: usize, n: u64, p: usize, t: u32, flags: u32, v: [*]u32, xy: [*]u32, s: [*]u32, lanes: usize, passwd: [*]u8) -> void {
+    const width = 32 * r
+    var chunk = n / @intCast(u64, p)
+    var loopsAll = chunk
+    if flags & FLAG_RW != 0 {
+        if t <= 1 {
+            if t != 0 { loopsAll = loopsAll * 2 }
+            loopsAll = (loopsAll + 2) / 3
+        } else {
+            loopsAll = loopsAll * @intCast(u64, t - 1)
+        }
+    } else if t != 0 {
+        if t == 1 { loopsAll = loopsAll + (loopsAll + 1) / 2 }
+        loopsAll = loopsAll * @intCast(u64, t)
+    }
+    var loopsRw: u64 = 0
+    if flags & FLAG_RW != 0 { loopsRw = loopsAll / @intCast(u64, p) }
+    chunk = chunk & 18446744073709551614
+    loopsAll = (loopsAll + 1) & 18446744073709551614
+    loopsRw = (loopsRw + 1) & 18446744073709551614
+    var lane: usize = 0
+    var start: u64 = 0
+    while lane < p {
+        const count: u64 = if lane + 1 < p { chunk } else { n - start }
+        const laneAt_ = bat + lane * width
+        const vat = @intCast(usize, start) * width
+        const state = laneAt(lanes, lane)
+        if flags & FLAG_RW != 0 {
+            // The lane's S-boxes: SMix1 over Salsa20/8 of its block into
+            // them (3072 words: 96 blocks of 32), then S2, S1, S0 in
+            // that order inside, and nothing written yet.
+            smix1(b, laneAt_, 1, @intCast(u64, S_WORDS / 32), 0, s, state.*.base, xy, 0, s, state, false)
+            state.*.s2 = state.*.base
+            state.*.s1 = state.*.base + S_BOX_WORDS
+            state.*.s0 = state.*.base + 2 * S_BOX_WORDS
+            state.*.w = 0
+            if lane == 0 {
+                // passwd <- HMAC-SHA256(B_{0, 2r-1}, passwd).
+                var key: [*]const u8 = undefined
+                unsafe { key = @ptrFromInt([*]const u8, @intFromPtr(b) + (laneAt_ + width - 16) * 4) }
+                var folded: [32]u8 = undefined
+                sha2.hmacSha256(key[0..64], passwd[0..32], &folded)
+                var index: usize = 0
+                while index < 32 {
+                    passwd[index] = folded[index]
+                    folded[index] = 0
+                    index += 1
+                }
+            }
+        }
+        smix1(b, laneAt_, r, count, flags, v, vat, xy, 0, s, state, flags & FLAG_RW != 0)
+        smix2(b, laneAt_, r, powerOfTwoBelow(count), loopsRw, flags, v, vat, xy, 0, s, state, flags & FLAG_RW != 0)
+        start += chunk
+        lane += 1
+    }
+    lane = 0
+    while lane < p {
+        smix2(b, bat + lane * width, r, n, loopsAll - loopsRw, flags & (FLAG_RW ^ MASK32), v, 0, xy, 0, s, laneAt(lanes, lane), flags & FLAG_RW != 0)
+        lane += 1
+    }
+}
+
+// Whether `params` are ones this computes: the modes it has, N a power
+// of two above 1, sizes within reach.
+fn acceptable(params: Params) -> bool {
+    const mode = params.flags & 3
+    if mode == 0 {
+        if params.flags != 0 || params.t != 0 { return false }
+    } else if mode == FLAG_WORM {
+        if params.flags != FLAG_WORM { return false }
+    } else if mode == FLAG_RW {
+        if params.flags & RW_FLAVOR_MASK != RW_FLAVOR { return false }
+        if params.flags & (RW_FLAVOR_MASK | 3 | FLAG_PREHASH) != params.flags { return false }
+    } else {
+        return false
+    }
+    if params.n < 2 || params.n & (params.n - 1) != 0 { return false }
+    if params.r < 1 || params.p < 1 { return false }
+    if @intCast(u64, params.r) * @intCast(u64, params.p) >= 1073741824 { return false }
+    if params.g != 0 { return false }
+    if @intCast(usize, params.p) > LANES_MOST { return false }
+    if params.flags & FLAG_RW != 0 && params.n / @intCast(u64, params.p) <= 1 { return false }
+    // 128 r N bytes of V, and the rest beside it.
+    if params.n > MEMORY_MOST / (128 * @intCast(u64, params.r)) { return false }
+    return true
+}
+
+// yescrypt_kdf_body: `out` (32 bytes) from the password and salt under
+// `params`. False when the parameters are refused or there is no memory.
+fn body(params: Params, password: []const u8, salt: []const u8, out: *[32]u8) -> bool {
+    if !acceptable(params) { return false }
+    const r = @intCast(usize, params.r)
+    const p = @intCast(usize, params.p)
+    const vWords = 32 * r * @intCast(usize, params.n)
+    const bWords = 32 * r * p
+    const xyWords = 64 * r
+    const sWords = if params.flags & FLAG_RW != 0 { S_WORDS * p } else { 0 }
+    const words = vWords + bWords + xyWords + sWords
+    const mapped = linux.syscall6(linux.SYS_mmap, 0, words * 4, 3, 16418, 18446744073709551615, 0)
+    if mapped < 0 { return false }
+    var memory: [*]u32 = undefined
+    var bytes: [*]u8 = undefined
+    unsafe {
+        memory = @ptrFromInt([*]u32, @bitCast(usize, mapped))
+        bytes = @ptrFromInt([*]u8, @bitCast(usize, mapped))
+    }
+    const v = memory
+    const bat = vWords
+    const xyat = vWords + bWords
+    const sat = vWords + bWords + xyWords
+    var xy: [*]u32 = undefined
+    var s: [*]u32 = undefined
+    var bBytes: [*]u8 = undefined
+    unsafe {
+        xy = @ptrFromInt([*]u32, @bitCast(usize, mapped) + xyat * 4)
+        s = @ptrFromInt([*]u32, @bitCast(usize, mapped) + sat * 4)
+        bBytes = @ptrFromInt([*]u8, @bitCast(usize, mapped) + bat * 4)
+    }
+    // The pre-hash of the password, when the flags say so.
+    var digest: [32]u8 = undefined
+    var digestBytes: [*]u8 = undefined
+    unsafe { digestBytes = @ptrCast([*]u8, &digest) }
+    var key = password
+    if params.flags != 0 {
+        const label = "yescrypt-prehash"
+        const labelLength: usize = if params.flags & FLAG_PREHASH != 0 { 16 } else { 8 }
+        sha2.hmacSha256(label[0..labelLength], password, &digest)
+        key = digestBytes[0..32]
+    }
+    // 1: B <- PBKDF2(P, S, 1, 128 r p).
+    sha2.pbkdf2Sha256(key, salt, 1, bBytes, bWords * 4)
+    if params.flags != 0 {
+        var index: usize = 0
+        while index < 32 {
+            digest[index] = bBytes[index]
+            index += 1
+        }
+    }
+    var lanes: [LANES_MOST]Lane = undefined
+    const laneBase = @intFromPtr(&lanes)
+    if params.flags & FLAG_RW != 0 {
+        var lane: usize = 0
+        while lane < p {
+            laneAt(laneBase, lane).*.base = lane * S_WORDS
+            lane += 1
+        }
+        smix(memory, bat, r, params.n, p, params.t, params.flags, v, xy, s, laneBase, digestBytes)
+    } else {
+        var lane: usize = 0
+        while lane < p {
+            smix(memory, bat + 32 * r * lane, r, params.n, 1, params.t, params.flags, v, xy, s, laneBase, digestBytes)
+            lane += 1
+        }
+    }
+    // 5: DK <- PBKDF2(P, B, 1, 32).
+    var outBytes: [*]u8 = undefined
+    unsafe { outBytes = @ptrCast([*]u8, out) }
+    sha2.pbkdf2Sha256(key, bBytes[0 .. bWords * 4], 1, outBytes, 32)
+    // The final steps, SCRAM's: ClientKey and StoredKey.
+    if params.flags != 0 && params.flags & FLAG_PREHASH == 0 {
+        sha2.hmacSha256(outBytes[0..32], "Client Key", &digest)
+        var stored: [32]u8 = undefined
+        sha2.sha256(digestBytes[0..32], &stored)
+        var index: usize = 0
+        while index < 32 {
+            outBytes[index] = stored[index]
+            stored[index] = 0
+            index += 1
+        }
+    }
+    sha2.wipe(digestBytes, 32)
+    sha2.wipe(bytes, (bWords + xyWords + sWords) * 4 + (if vWords * 4 > 1048576 { 1048576 } else { vWords * 4 }))
+    const unmapped = linux.syscall2(linux.SYS_munmap, @bitCast(usize, mapped), words * 4)
+    return true
+}
+
+// yescrypt_kdf: the key, pre-hashed first for the larger settings (in
+// the read-write mode with N/p >= 256 and N/p r >= 2^17: Ubuntu's N =
+// 4096, r = 32 is exactly at that line).
+pub fn kdf(params: Params, password: []const u8, salt: []const u8, out: *[32]u8) -> bool {
+    if params.g != 0 { return false }
+    var key = password
+    var prehashed: [32]u8 = undefined
+    var prehashedBytes: [*]u8 = undefined
+    unsafe { prehashedBytes = @ptrCast([*]u8, &prehashed) }
+    if params.flags & FLAG_RW != 0 && params.p >= 1 && params.n / @intCast(u64, params.p) >= 256 && params.n / @intCast(u64, params.p) * @intCast(u64, params.r) >= 131072 {
+        var first = params
+        first.flags = params.flags | FLAG_PREHASH
+        first.n = params.n >> 6
+        first.t = 0
+        if !body(first, password, salt, &prehashed) { return false }
+        key = prehashedBytes[0..32]
+    }
+    const made = body(params, key, salt, out)
+    sha2.wipe(prehashedBytes, 32)
+    return made
+}
+
+// The hash of `password` under `setting` ("$y$PARAMS$SALT", "$7$...", a
+// whole stored hash as well) into `out`: its length, or 0 when the
+// setting is not one of these, asks for what this has not, or does not
+// fit.
+pub fn hash(password: []const u8, setting: []const u8, out: [*]u8, capacity: usize) -> usize {
+    if setting.length < 4 || setting[0] != 36 || setting[2] != 36 { return 0 }
+    const seven = setting[1] == 55
+    if !seven && setting[1] != 121 { return 0 }
+    var params = Params.{ .flags = 0, .n = 0, .r = 0, .p = 1, .t = 0, .g = 0 }
+    var at: usize = 3
+    if seven {
+        // $7$: log2 N in one character, then r and p in five each.
+        const nLog2 = base64.value(setting[at])
+        at += 1
+        if nLog2 < 1 || nLog2 > 63 { return 0 }
+        params.n = @intCast(u64, 1) << @intCast(u6, nLog2)
+        const r = fixedNumber(setting, &at, 30)
+        if !r.0 { return 0 }
+        params.r = r.1
+        const p = fixedNumber(setting, &at, 30)
+        if !p.0 { return 0 }
+        params.p = p.1
+    } else {
+        const flavor = base64.decodeNumber(setting, &at, 0)
+        if !flavor.0 { return 0 }
+        if flavor.1 < FLAG_RW {
+            params.flags = flavor.1
+        } else if flavor.1 <= FLAG_RW + (RW_FLAVOR_MASK >> 2) {
+            params.flags = FLAG_RW + ((flavor.1 - FLAG_RW) << 2)
+        } else {
+            return 0
+        }
+        const nLog2 = base64.decodeNumber(setting, &at, 1)
+        if !nLog2.0 || nLog2.1 > 63 { return 0 }
+        params.n = @intCast(u64, 1) << @intCast(u6, nLog2.1)
+        const r = base64.decodeNumber(setting, &at, 1)
+        if !r.0 { return 0 }
+        params.r = r.1
+        if at >= setting.length { return 0 }
+        if setting[at] != 36 {
+            const have = base64.decodeNumber(setting, &at, 1)
+            if !have.0 { return 0 }
+            if have.1 & 1 != 0 {
+                const p = base64.decodeNumber(setting, &at, 2)
+                if !p.0 { return 0 }
+                params.p = p.1
+            }
+            if have.1 & 2 != 0 {
+                const t = base64.decodeNumber(setting, &at, 1)
+                if !t.0 { return 0 }
+                params.t = t.1
+            }
+            if have.1 & 4 != 0 {
+                const g = base64.decodeNumber(setting, &at, 1)
+                if !g.0 { return 0 }
+                params.g = g.1
+            }
+            // A ROM (have & 8): no stored hash uses one; refused.
+            if have.1 & 8 != 0 { return 0 }
+        }
+        if at >= setting.length || setting[at] != 36 { return 0 }
+        at += 1
+    }
+    const prefixLength = at
+    // The salt: up to the last '$' (the hash's), or the end.
+    var saltEnd = setting.length
+    var index = setting.length
+    while index > prefixLength {
+        index -= 1
+        if setting[index] == 36 {
+            saltEnd = index
+            break
+        }
+    }
+    const saltText = setting[prefixLength..saltEnd]
+    var saltBytes: [64]u8 = undefined
+    var saltPointer: [*]u8 = undefined
+    unsafe { saltPointer = @ptrCast([*]u8, &saltBytes) }
+    var salt = saltText
+    if !seven {
+        const decoded = base64.decode(saltPointer, 64, saltText)
+        if decoded == 0 && saltText.length != 0 { return 0 }
+        salt = saltPointer[0..decoded]
+    }
+    var derived: [32]u8 = undefined
+    if !kdf(params, password, salt, &derived) {
+        sha2.wipe(saltPointer, 64)
+        return 0
+    }
+    // The hash: the setting up to and with the salt, '$', 43 characters.
+    var written: usize = 0
+    var ok = prefixLength + saltText.length + 1 + 43 <= capacity
+    index = 0
+    while ok && index < saltEnd {
+        out[index] = setting[index]
+        index += 1
+    }
+    if ok {
+        out[saltEnd] = 36
+        written = saltEnd + 1
+        var derivedBytes: [*]const u8 = undefined
+        unsafe { derivedBytes = @ptrCast([*]const u8, &derived) }
+        ok = base64.encode(out, capacity, &written, derivedBytes, 32)
+    }
+    var derivedWipe: [*]u8 = undefined
+    unsafe { derivedWipe = @ptrCast([*]u8, &derived) }
+    sha2.wipe(derivedWipe, 32)
+    sha2.wipe(saltPointer, 64)
+    if !ok {
+        sha2.wipe(out, capacity)
+        return 0
+    }
+    return written
+}
+
+// A $7$ setting's 30-bit number: five characters, low bits first.
+fn fixedNumber(text: []const u8, at: *usize, bits: usize) -> (bool, u32) {
+    var number: u32 = 0
+    var done: usize = 0
+    while done < bits {
+        if at.* >= text.length { return (false, 0) }
+        const got = base64.value(text[at.*])
+        at.* += 1
+        if got > 63 { return (false, 0) }
+        number = number | (got << @intCast(u5, done))
+        done += 6
+    }
+    return (true, number)
+}
