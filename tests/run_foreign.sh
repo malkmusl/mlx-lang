@@ -246,6 +246,41 @@ else
     failures=$((failures + 1))
 fi
 
+# A plugin with --entry and --init (tests/support/plugin_entry.mlx): run as
+# a program it starts at its entry (no PT_INTERP: the kernel enters it
+# directly) and exits with argc + 6; loaded by the dynamic linker, its
+# DT_INIT has run before the host's first call.
+if "$compiler" --quiet --plugin --stack-arena --no-libc --entry=mlx_entry_start --init=mlx_entry_init tests/support/plugin_entry.mlx -o "$work/libentry.so" 2> "$work/errors"; then
+    chmod +x "$work/libentry.so"
+    status=0
+    "$work/libentry.so" || status=$?
+    status_two=0
+    "$work/libentry.so" one two || status_two=$?
+    if [[ $status -ne 7 || $status_two -ne 9 ]]; then
+        echo "FAIL --entry: the plugin run as a program exited $status and $status_two (7 and 9 expected)"
+        failures=$((failures + 1))
+    elif command -v readelf > /dev/null && readelf -l "$work/libentry.so" | grep -q "INTERP"; then
+        echo "FAIL --entry: the shared object still names an interpreter"
+        failures=$((failures + 1))
+    elif command -v python3 > /dev/null && ! python3 -c "
+import ctypes, sys
+library = ctypes.CDLL(sys.argv[1])
+library.mlx_entry_ready_now.restype = ctypes.c_uint64
+assert library.mlx_entry_ready_now() == 7, library.mlx_entry_ready_now()
+assert ctypes.c_uint64.in_dll(library, 'mlx_entry_ready').value == 7
+" "$work/libentry.so" > "$work/output" 2>&1; then
+        echo "FAIL --init: the initializer did not run when the dynamic linker loaded the plugin"
+        cat "$work/output"
+        failures=$((failures + 1))
+    else
+        echo "ok   --entry --init: a plugin runs as a program from its entry, and its initializer runs when loaded"
+    fi
+else
+    echo "FAIL (compile) tests/support/plugin_entry.mlx"
+    cat "$work/errors"
+    failures=$((failures + 1))
+fi
+
 # A program without foreign functions stays a static executable, also with
 # exported ones (std.crash's signal handler): nothing loads glibc.
 "$compiler" --quiet tests/07_functions.mlx -o "$work/static"

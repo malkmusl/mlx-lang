@@ -176,6 +176,22 @@ both and checked by `tests/run_foreign.sh` (no `NEEDED` entry; under
 (its [README](../../projects/libc/README.md)), built by
 `tools/build_mlxlibc.sh` as `libmlxc.so.1` with no `DT_NEEDED` at all and
 checked against glibc by `tools/check_mlxlibc.sh`.
+
+`--entry=NAME` makes an exported function the shared object's entry point
+(`e_entry`), and `--init=NAME` its `DT_INIT`. A shared object names no
+interpreter (the `PT_INTERP` slot is `PT_NULL`), so run as a program the
+kernel maps it and enters its entry directly, with the stack as the ABI
+leaves it (`argc` at `@frameAddress() + 8` inside the entry export); named
+as a program's `PT_INTERP`, the kernel maps it after the program and enters
+it the same way, the program's headers and entry in the aux vector. That is
+how mlxlibc is the dynamic loader of the programs on it
+(`projects/libc/start.mlx`, `loader.mlx`): the entry export maps the
+program's `DT_NEEDED` libraries, relocates everything and jumps to the
+program's `_start`. `DT_INIT` is for the other direction: a dynamic linker
+that loads the object (glibc's, for a program linked against libmlxc next
+to glibc) calls it before the program's first call into it.
+`tests/support/plugin_entry.mlx` is run as a program and loaded from
+python3 by `tests/run_foreign.sh`.
 `tests/271_shared_object_runtime.mlx` (run by `tests/run_foreign.sh`) loads
 `tests/support/shared_object_library.mlx` twice from two copies, calls it
 through `dlsym` and through function pointers it returns, and checks that
