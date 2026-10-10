@@ -28,6 +28,11 @@ projects/.../main.mlx -o ...`) and is checked by a script under `tools/`.
   `tools/mlx-lsp`); `tools/check_observatory.sh`.
 - [`coreutils/`](coreutils/README.md): Linux userland programs;
   `projects/coreutils/build.sh` and `test.sh`.
+- [`libc/`](libc/README.md): mlxlibc, the C library and dynamic loader in
+  Mlx for legacy programs; `tools/check_mlxlibc.sh`.
+- [`init/`](init/README.md): mlx-init, PID 1 of MLX/Linux (mounts,
+  services, supervision, the control socket, shutdown) and mlx-initctl;
+  `tools/check_init.sh`.
 
 What the projects share beyond one project lives in `std` (`std.gpu`,
 `std.crash`, `std.timezone`, `std.ui`, `std.png`, `std.truetype`, ...).

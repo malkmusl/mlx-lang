@@ -1,0 +1,547 @@
+// What the init supervises: the services, read from NAME.service files in
+// one directory (/etc/mlx/init/services), each a few `key = value` lines:
+//
+//     description = MLXIPC system bus
+//     exec = /usr/bin/mlx-ipcd --system      the command line (double quotes
+//                                            keep spaces in an argument)
+//     after = mounts hostname                start once these run (or, for
+//                                            oneshots, finished)
+//     ready = /run/mlx/bus                   running once this path exists
+//                                            (else right after the start)
+//     type = simple | oneshot                a oneshot runs to its end
+//     restart = always | on-failure | no     default: always (oneshot: no)
+//     stop-timeout = 10s                     SIGTERM, then SIGKILL after this
+//     ready-timeout = 30s                    ready at the latest after this
+//     log = /var/log/NAME.log | console      default: LOGDIR/NAME.log
+//     stdio = /dev/tty1                      a terminal as the service's
+//                                            stdin/stdout/stderr (a shell on
+//                                            the console)
+//     env = KEY=VALUE                        more environment (repeatable)
+//     disabled = yes                         defined but not started
+//
+// The service's state lives next to its definition (one record per
+// service, in the init's one block of memory), so a reload keeps it.
+const std = @import("std")
+const linux = @import("./linux.mlx")
+
+pub const MAX_SERVICES: usize = 64
+pub const MAX_CLIENTS: usize = 8
+pub const NAME_CAPACITY: usize = 64
+pub const TEXT_CAPACITY: usize = 256
+pub const LINE_CAPACITY: usize = 512
+pub const PATH_CAPACITY: usize = 256
+pub const ENVIRONMENT_CAPACITY: usize = 1024
+pub const SCRATCH_CAPACITY: usize = 65536
+
+pub const RESTART_ALWAYS: u8 = 0
+pub const RESTART_ON_FAILURE: u8 = 1
+pub const RESTART_NEVER: u8 = 2
+
+// A service's states.
+pub const STOPPED: u8 = 0
+pub const WAITING: u8 = 1
+pub const STARTING: u8 = 2
+pub const RUNNING: u8 = 3
+pub const DONE: u8 = 4
+pub const STOPPING: u8 = 5
+pub const RESTARTING: u8 = 6
+
+// What the init does once its loop ends.
+pub const ACTION_NONE: u8 = 0
+pub const ACTION_POWEROFF: u8 = 1
+pub const ACTION_REBOOT: u8 = 2
+pub const ACTION_HALT: u8 = 3
+pub const ACTION_EXIT: u8 = 4
+
+pub const DEFAULT_STOP_TIMEOUT: usize = 10000
+pub const DEFAULT_READY_TIMEOUT: usize = 30000
+
+pub const Service = struct {
+    name: [NAME_CAPACITY]u8
+    nameLength: usize
+    description: [TEXT_CAPACITY]u8
+    descriptionLength: usize
+    exec: [LINE_CAPACITY]u8
+    execLength: usize
+    after: [TEXT_CAPACITY]u8
+    afterLength: usize
+    ready: [PATH_CAPACITY]u8
+    readyLength: usize
+    log: [PATH_CAPACITY]u8
+    logLength: usize
+    stdio: [PATH_CAPACITY]u8
+    stdioLength: usize
+    // KEY=VALUE entries, each NUL-terminated.
+    environment: [ENVIRONMENT_CAPACITY]u8
+    environmentLength: usize
+    oneshot: bool
+    restart: u8
+    disabled: bool
+    stopTimeout: usize
+    readyTimeout: usize
+    // Seen in the last reading of the directory.
+    present: bool
+    // Meant to run (started, not stopped by request).
+    wanted: bool
+    state: u8
+    pid: isize
+    // Milliseconds (monotonic): the start, when stopping began, when to
+    // start again.
+    startedAt: usize
+    stoppingSince: usize
+    restartAt: usize
+    restarts: usize
+    // The pause before the next restart.
+    delay: usize
+    // The last exit code, or 128 plus the signal.
+    lastStatus: usize
+    // The sequence number of the last start (shutdown stops in reverse).
+    order: usize
+    // Said once: an unknown name in `after`.
+    warned: bool
+    // SIGKILL was sent after the stop-timeout.
+    killed: bool
+}
+
+pub const ControlClient = struct {
+    descriptor: isize
+    buffer: [256]u8
+    length: usize
+    used: bool
+}
+
+pub const State = struct {
+    services: [MAX_SERVICES]Service
+    count: usize
+    sequence: usize
+    verbose: bool
+    pid1: bool
+    running: bool
+    action: u8
+    servicesDirectory: [PATH_CAPACITY]u8
+    servicesDirectoryLength: usize
+    mountsFile: [PATH_CAPACITY]u8
+    mountsFileLength: usize
+    hostnameFile: [PATH_CAPACITY]u8
+    hostnameFileLength: usize
+    controlPath: [PATH_CAPACITY]u8
+    controlPathLength: usize
+    logDirectory: [PATH_CAPACITY]u8
+    logDirectoryLength: usize
+    listener: isize
+    signals: isize
+    eventLoop: isize
+    clients: [MAX_CLIENTS]ControlClient
+    // File contents while reading them, replies while building them.
+    scratch: [SCRATCH_CAPACITY]u8
+}
+
+pub fn bytesOf(array: [*]const u8, length: usize) -> []const u8 { return array[0..length] }
+
+pub fn name(service: *const Service) -> []const u8 {
+    var pointer: [*]const u8 = undefined
+    unsafe { pointer = @ptrCast([*]const u8, &service.*.name) }
+    return pointer[0..service.*.nameLength]
+}
+
+pub fn description(service: *const Service) -> []const u8 {
+    var pointer: [*]const u8 = undefined
+    unsafe { pointer = @ptrCast([*]const u8, &service.*.description) }
+    return pointer[0..service.*.descriptionLength]
+}
+
+pub fn exec(service: *const Service) -> []const u8 {
+    var pointer: [*]const u8 = undefined
+    unsafe { pointer = @ptrCast([*]const u8, &service.*.exec) }
+    return pointer[0..service.*.execLength]
+}
+
+pub fn after(service: *const Service) -> []const u8 {
+    var pointer: [*]const u8 = undefined
+    unsafe { pointer = @ptrCast([*]const u8, &service.*.after) }
+    return pointer[0..service.*.afterLength]
+}
+
+pub fn ready(service: *const Service) -> []const u8 {
+    var pointer: [*]const u8 = undefined
+    unsafe { pointer = @ptrCast([*]const u8, &service.*.ready) }
+    return pointer[0..service.*.readyLength]
+}
+
+pub fn log(service: *const Service) -> []const u8 {
+    var pointer: [*]const u8 = undefined
+    unsafe { pointer = @ptrCast([*]const u8, &service.*.log) }
+    return pointer[0..service.*.logLength]
+}
+
+pub fn stdio(service: *const Service) -> []const u8 {
+    var pointer: [*]const u8 = undefined
+    unsafe { pointer = @ptrCast([*]const u8, &service.*.stdio) }
+    return pointer[0..service.*.stdioLength]
+}
+
+pub fn environment(service: *const Service) -> []const u8 {
+    var pointer: [*]const u8 = undefined
+    unsafe { pointer = @ptrCast([*]const u8, &service.*.environment) }
+    return pointer[0..service.*.environmentLength]
+}
+
+pub fn servicesDirectory(state: *const State) -> []const u8 {
+    var pointer: [*]const u8 = undefined
+    unsafe { pointer = @ptrCast([*]const u8, &state.*.servicesDirectory) }
+    return pointer[0..state.*.servicesDirectoryLength]
+}
+
+pub fn mountsFile(state: *const State) -> []const u8 {
+    var pointer: [*]const u8 = undefined
+    unsafe { pointer = @ptrCast([*]const u8, &state.*.mountsFile) }
+    return pointer[0..state.*.mountsFileLength]
+}
+
+pub fn hostnameFile(state: *const State) -> []const u8 {
+    var pointer: [*]const u8 = undefined
+    unsafe { pointer = @ptrCast([*]const u8, &state.*.hostnameFile) }
+    return pointer[0..state.*.hostnameFileLength]
+}
+
+pub fn controlPath(state: *const State) -> []const u8 {
+    var pointer: [*]const u8 = undefined
+    unsafe { pointer = @ptrCast([*]const u8, &state.*.controlPath) }
+    return pointer[0..state.*.controlPathLength]
+}
+
+pub fn logDirectory(state: *const State) -> []const u8 {
+    var pointer: [*]const u8 = undefined
+    unsafe { pointer = @ptrCast([*]const u8, &state.*.logDirectory) }
+    return pointer[0..state.*.logDirectoryLength]
+}
+
+pub fn scratch(state: *State) -> [*]u8 {
+    var pointer: [*]u8 = undefined
+    unsafe { pointer = @ptrCast([*]u8, &state.*.scratch) }
+    return pointer
+}
+
+pub fn serviceAt(state: *State, index: usize) -> *Service {
+    var pointer: *Service = undefined
+    unsafe { pointer = @ptrCast(*Service, &state.*.services[index]) }
+    return pointer
+}
+
+// Copies `value` into a fixed field; the length kept.
+pub fn setText(into: [*]u8, capacity: usize, value: []const u8) -> usize {
+    var length: usize = 0
+    for byte in value {
+        if length < capacity {
+            into[length] = byte
+            length += 1
+        }
+    }
+    return length
+}
+
+fn field(array: *const [TEXT_CAPACITY]u8) -> [*]u8 {
+    var pointer: [*]u8 = undefined
+    unsafe { pointer = @ptrCast([*]u8, array) }
+    return pointer
+}
+
+fn pathField(array: *const [PATH_CAPACITY]u8) -> [*]u8 {
+    var pointer: [*]u8 = undefined
+    unsafe { pointer = @ptrCast([*]u8, array) }
+    return pointer
+}
+
+pub fn setServicesDirectory(state: *State, value: []const u8) -> void {
+    state.*.servicesDirectoryLength = setText(pathField(&state.*.servicesDirectory), PATH_CAPACITY, value)
+}
+
+pub fn setMountsFile(state: *State, value: []const u8) -> void {
+    state.*.mountsFileLength = setText(pathField(&state.*.mountsFile), PATH_CAPACITY, value)
+}
+
+pub fn setHostnameFile(state: *State, value: []const u8) -> void {
+    state.*.hostnameFileLength = setText(pathField(&state.*.hostnameFile), PATH_CAPACITY, value)
+}
+
+pub fn setControlPath(state: *State, value: []const u8) -> void {
+    state.*.controlPathLength = setText(pathField(&state.*.controlPath), PATH_CAPACITY, value)
+}
+
+pub fn setLogDirectory(state: *State, value: []const u8) -> void {
+    state.*.logDirectoryLength = setText(pathField(&state.*.logDirectory), PATH_CAPACITY, value)
+}
+
+pub fn find(state: *State, wanted_name: []const u8) -> ?*Service {
+    var index: usize = 0
+    while index < state.*.count {
+        const service = serviceAt(state, index)
+        if std.text.same(name(service), wanted_name) { return service }
+        index += 1
+    }
+    return null
+}
+
+// The init's own line on stderr: "mlx-init: TEXT".
+pub fn say(text: []const u8) -> void {
+    const wrote = linux.writeAll(2, "mlx-init: ")
+    const said = linux.writeAll(2, text)
+    const ended = linux.writeAll(2, "\n")
+}
+
+// "mlx-init: SERVICE: TEXT", with a number after when `with_number`.
+pub fn sayAbout(service: *const Service, text: []const u8, with_number: bool, number: usize) -> void {
+    var line: [512]u8 = undefined
+    var bytes: [*]u8 = undefined
+    unsafe { bytes = @ptrCast([*]u8, &line) }
+    var length = std.text.append(bytes, 0, 512, "mlx-init: ")
+    length = std.text.append(bytes, length, 512, name(service))
+    length = std.text.append(bytes, length, 512, ": ")
+    length = std.text.append(bytes, length, 512, text)
+    if with_number { length = std.text.appendUnsigned(bytes, length, 512, number) }
+    length = std.text.append(bytes, length, 512, "\n")
+    const wrote = linux.write(2, bytes, length)
+}
+
+// "mlx-init: FIRST SECOND", with a number after when `with_number`.
+pub fn sayWith(first: []const u8, second: []const u8, with_number: bool, number: usize) -> void {
+    var line: [1024]u8 = undefined
+    var bytes: [*]u8 = undefined
+    unsafe { bytes = @ptrCast([*]u8, &line) }
+    var length = std.text.append(bytes, 0, 1024, "mlx-init: ")
+    length = std.text.append(bytes, length, 1024, first)
+    length = std.text.append(bytes, length, 1024, second)
+    if with_number { length = std.text.appendUnsigned(bytes, length, 1024, number) }
+    length = std.text.append(bytes, length, 1024, "\n")
+    const wrote = linux.write(2, bytes, length)
+}
+
+// "mlx-init: FIRST SECOND (errno N)" for a system call that returned
+// `result` (negative).
+pub fn sayFailed(first: []const u8, second: []const u8, result: isize) -> void {
+    var line: [1024]u8 = undefined
+    var bytes: [*]u8 = undefined
+    unsafe { bytes = @ptrCast([*]u8, &line) }
+    var length = std.text.append(bytes, 0, 1024, "mlx-init: ")
+    length = std.text.append(bytes, length, 1024, first)
+    length = std.text.append(bytes, length, 1024, second)
+    length = std.text.append(bytes, length, 1024, " (errno ")
+    length = std.text.appendUnsigned(bytes, length, 1024, if result < 0 { @bitCast(usize, 0 - result) } else { 0 })
+    length = std.text.append(bytes, length, 1024, ")\n")
+    const wrote = linux.write(2, bytes, length)
+}
+
+fn whitespace(byte: u8) -> bool { return byte == 32 || byte == 9 || byte == 13 }
+
+// A duration "10", "10s", "500ms", "2m" in milliseconds; `fallback` when
+// it is not one.
+pub fn duration(text: []const u8, fallback: usize) -> usize {
+    var value: usize = 0
+    var digits: usize = 0
+    var at: usize = 0
+    while at < text.length && text[at] >= 48 && text[at] <= 57 {
+        value = value * 10 + @intCast(usize, text[at] - 48)
+        digits += 1
+        at += 1
+    }
+    if digits == 0 { return fallback }
+    const unit = text[at..text.length]
+    if unit.length == 0 || std.text.same(unit, "s") { return value * 1000 }
+    if std.text.same(unit, "ms") { return value }
+    if std.text.same(unit, "m") { return value * 60000 }
+    return fallback
+}
+
+// One `key = value` line applied to a service; false for an unknown key.
+fn apply(service: *Service, key: []const u8, value: []const u8) -> bool {
+    if std.text.same(key, "description") {
+        service.*.descriptionLength = setText(field(&service.*.description), TEXT_CAPACITY, value)
+    } else if std.text.same(key, "exec") {
+        var pointer: [*]u8 = undefined
+        unsafe { pointer = @ptrCast([*]u8, &service.*.exec) }
+        service.*.execLength = setText(pointer, LINE_CAPACITY, value)
+    } else if std.text.same(key, "after") {
+        service.*.afterLength = setText(field(&service.*.after), TEXT_CAPACITY, value)
+    } else if std.text.same(key, "ready") {
+        service.*.readyLength = setText(pathField(&service.*.ready), PATH_CAPACITY, value)
+    } else if std.text.same(key, "log") {
+        service.*.logLength = setText(pathField(&service.*.log), PATH_CAPACITY, value)
+    } else if std.text.same(key, "stdio") {
+        service.*.stdioLength = setText(pathField(&service.*.stdio), PATH_CAPACITY, value)
+    } else if std.text.same(key, "type") {
+        service.*.oneshot = std.text.same(value, "oneshot")
+    } else if std.text.same(key, "restart") {
+        if std.text.same(value, "always") {
+            service.*.restart = RESTART_ALWAYS
+        } else if std.text.same(value, "on-failure") {
+            service.*.restart = RESTART_ON_FAILURE
+        } else {
+            service.*.restart = RESTART_NEVER
+        }
+    } else if std.text.same(key, "stop-timeout") {
+        service.*.stopTimeout = duration(value, DEFAULT_STOP_TIMEOUT)
+    } else if std.text.same(key, "ready-timeout") {
+        service.*.readyTimeout = duration(value, DEFAULT_READY_TIMEOUT)
+    } else if std.text.same(key, "disabled") {
+        service.*.disabled = std.text.same(value, "yes") || std.text.same(value, "true")
+    } else if std.text.same(key, "env") {
+        var pointer: [*]u8 = undefined
+        unsafe { pointer = @ptrCast([*]u8, &service.*.environment) }
+        var length = service.*.environmentLength
+        if length + value.length + 1 <= ENVIRONMENT_CAPACITY {
+            length = std.text.append(pointer, length, ENVIRONMENT_CAPACITY, value)
+            pointer[length] = 0
+            service.*.environmentLength = length + 1
+        }
+    } else {
+        return false
+    }
+    return true
+}
+
+// The definition fields back to their defaults (the state fields stay).
+fn clearDefinition(service: *Service) -> void {
+    service.*.descriptionLength = 0
+    service.*.execLength = 0
+    service.*.afterLength = 0
+    service.*.readyLength = 0
+    service.*.logLength = 0
+    service.*.stdioLength = 0
+    service.*.environmentLength = 0
+    service.*.oneshot = false
+    service.*.restart = 255
+    service.*.disabled = false
+    service.*.stopTimeout = DEFAULT_STOP_TIMEOUT
+    service.*.readyTimeout = DEFAULT_READY_TIMEOUT
+}
+
+// Reads a whole file into the scratch area; its length, or 0.
+pub fn readFile(state: *State, path: []const u8) -> usize {
+    const file = linux.open(path, linux.O_RDONLY | linux.O_CLOEXEC, 0)
+    if file < 0 { return 0 }
+    const into = scratch(state)
+    var length: usize = 0
+    while length + 1 < SCRATCH_CAPACITY {
+        const got = linux.read(file, offset(into, length), SCRATCH_CAPACITY - 1 - length)
+        if got <= 0 { break }
+        length += @bitCast(usize, got)
+    }
+    linux.close(file)
+    return length
+}
+
+pub fn offset(bytes: [*]u8, by: usize) -> [*]u8 {
+    var result: [*]u8 = undefined
+    unsafe { result = @ptrFromInt([*]u8, @intFromPtr(bytes) + by) }
+    return result
+}
+
+// Parses one service file (already in the scratch area) into `service`.
+fn parse(service: *Service, text: []const u8) -> void {
+    clearDefinition(service)
+    var start: usize = 0
+    while start < text.length {
+        var end = start
+        while end < text.length && text[end] != 10 { end += 1 }
+        const line = std.text.trimmed(text[start..end])
+        start = end + 1
+        if line.length == 0 || line[0] == 35 { continue }
+        var equals: usize = 0
+        while equals < line.length && line[equals] != 61 { equals += 1 }
+        if equals == line.length {
+            sayAbout(service, "a line without '=' in its service file is ignored", false, 0)
+            continue
+        }
+        const key = std.text.trimmed(line[0..equals])
+        const value = std.text.trimmed(line[equals + 1..line.length])
+        if !apply(service, key, value) { sayAbout(service, "unknown key in its service file is ignored", false, 0) }
+    }
+    if service.*.restart == 255 { service.*.restart = if service.*.oneshot { RESTART_NEVER } else { RESTART_ALWAYS } }
+    if service.*.execLength == 0 { sayAbout(service, "has no exec line", false, 0) }
+}
+
+// A new record for `service_name`, stopped and wanted; null when the
+// table is full.
+fn add(state: *State, service_name: []const u8) -> ?*Service {
+    if state.*.count >= MAX_SERVICES { return null }
+    const service = serviceAt(state, state.*.count)
+    state.*.count += 1
+    var pointer: [*]u8 = undefined
+    unsafe { pointer = @ptrCast([*]u8, &service.*.name) }
+    service.*.nameLength = setText(pointer, NAME_CAPACITY, service_name)
+    service.*.wanted = true
+    service.*.state = STOPPED
+    service.*.pid = 0
+    service.*.startedAt = 0
+    service.*.stoppingSince = 0
+    service.*.restartAt = 0
+    service.*.restarts = 0
+    service.*.delay = 0
+    service.*.lastStatus = 0
+    service.*.order = 0
+    service.*.warned = false
+    service.*.killed = false
+    clearDefinition(service)
+    return service
+}
+
+// Reads the services directory: new services are added (wanted unless
+// disabled), known ones get their definition again, and ones whose file
+// is gone are no longer wanted (supervision stops them). The number of
+// services defined.
+pub fn load(state: *State) -> usize {
+    var index: usize = 0
+    while index < state.*.count {
+        serviceAt(state, index).*.present = false
+        index += 1
+    }
+    const directory = linux.open(servicesDirectory(state), linux.O_RDONLY | linux.O_DIRECTORY | linux.O_CLOEXEC, 0)
+    if directory < 0 {
+        say("no services directory (nothing to start)")
+        return 0
+    }
+    var names: [8192]u8 = undefined
+    var names_pointer: [*]u8 = undefined
+    unsafe { names_pointer = @ptrCast([*]u8, &names) }
+    var reader = std.fs.entries(std.fs.File.{ .descriptor = directory }, names_pointer, 8192)
+    var entry: std.fs.Entry = undefined
+    var defined: usize = 0
+    while std.fs.nextEntry(&reader, &entry) {
+        const file_name = std.string.asSlice(entry.name)
+        if file_name.length <= 8 || !std.text.same(file_name[file_name.length - 8..file_name.length], ".service") { continue }
+        const service_name = file_name[0..file_name.length - 8]
+        var path: [PATH_CAPACITY * 2]u8 = undefined
+        var path_pointer: [*]u8 = undefined
+        unsafe { path_pointer = @ptrCast([*]u8, &path) }
+        var length = std.text.append(path_pointer, 0, PATH_CAPACITY * 2, servicesDirectory(state))
+        length = std.text.append(path_pointer, length, PATH_CAPACITY * 2, "/")
+        length = std.text.append(path_pointer, length, PATH_CAPACITY * 2, file_name)
+        const size = readFile(state, path_pointer[0..length])
+        var service = find(state, service_name)
+        var is_new = false
+        if service == null {
+            service = add(state, service_name)
+            if service == null {
+                say("too many services (the rest are ignored)")
+                break
+            }
+            is_new = true
+        }
+        const text = scratch(state)
+        parse(service.?, text[0..size])
+        service.?.*.present = true
+        if is_new && service.?.*.disabled { service.?.*.wanted = false }
+        defined += 1
+    }
+    linux.close(directory)
+    index = 0
+    while index < state.*.count {
+        const service = serviceAt(state, index)
+        if !service.*.present && service.*.wanted {
+            sayAbout(service, "has no service file any more and is stopped", false, 0)
+            service.*.wanted = false
+        }
+        index += 1
+    }
+    return defined
+}

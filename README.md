@@ -50,7 +50,7 @@ Read `AGENT_IMPLEMENTATION.md` and `SPEC_INDEX.md` before implementation.
 - `std/`: the standard library (`std/bootstrap/` the core, `std/src/` the
   extensions: Wayland, Vulkan and `std.gpu`, SPIR-V, fonts, UI, ...).
 - `projects/`: programs written in Mlx: the desktop (a Wayland
-  compositor and its clients), MLX Observatory, coreutils and mlxlibc (the
+  compositor and its clients), MLX Observatory, coreutils, mlxlibc and mlx-init (the
   C library, `projects/libc`).
 - `examples/`: small programs that show one thing each.
 - `tools/`: check scripts and developer tools (codemap, mlx-lsp,
