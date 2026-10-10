@@ -8,7 +8,9 @@
 #   - a script file (by path, by shebang, from stdin, with -s) against dash;
 #   - --parse dumps the tree (and says what is incomplete or wrong);
 #   - the line editor through a pty: cursor keys, Ctrl-A/K, history recall,
-#     completion, Ctrl-C, Ctrl-D, the history file.
+#     completion, Ctrl-C, Ctrl-D, the history file;
+#   - job control through a pty: Ctrl-Z, jobs, bg, fg, kill %n, wait %n,
+#     and traps, aliases and set -u in an interactive session.
 #
 #   tools/check_shell.sh [compiler]
 set -euo pipefail
@@ -108,6 +110,36 @@ b'
     'if echo piped | grep -q piped; then echo found; fi'
     'x=; echo "[${x:-empty}]" "[${x-set}]"'
     'echo ${#*} $# "${*:-none}"'
+    'trap "echo caught" USR1; kill -USR1 $$; echo after'
+    'trap "echo bye" EXIT; echo main'
+    'trap "" USR1; kill -USR1 $$; echo survived'
+    'trap "echo t" TERM INT; trap'
+    'trap "echo t" TERM; trap - TERM; trap; echo listed'
+    'trap "echo caught $?" USR1; false; kill -USR1 $$; echo "status $?"'
+    'trap "echo in-trap; exit 7" USR1; kill -USR1 $$; echo not-reached'
+    'sleep 1 & trap "echo got" USR1; kill -USR1 $$; wait; echo w=$?'
+    '(exit 3) & wait %1; echo $?'
+    'sleep 0.2 & wait $!; echo $?'
+    'set -u; echo ${nope:-d} "${nope-x}" ok'
+    'set -u; echo $nope; echo not-reached'
+    'set -u; echo "${1}"; echo not-reached'
+    'set -u; set -- a; echo "$1" "$@" $#; echo ${#nope}'
+    'set -- -a -b val -c rest; while getopts ab:c o; do echo "$o:${OPTARG-}"; done; echo $OPTIND; shift $((OPTIND-1)); echo "$@"'
+    'set -- -ab val -x; while getopts :ab:c o; do echo "$o:${OPTARG-}"; done; echo $OPTIND'
+    'set -- -b; while getopts :b: o; do echo "$o:${OPTARG-}"; done'
+    'set -- -b; getopts b: o; echo "$?:$o:${OPTARG-}"'
+    'f() { OPTIND=1; while getopts xy: o "$@"; do echo "$o=${OPTARG-}"; done; }; f -x -y 1; f -y 2'
+    'alias e="echo al"
+e x; unalias e; alias ll="ls -1"; alias; alias ll'
+    'alias say="echo said"
+x=1 say hi; say "$x"; unalias -a; alias'
+    'alias ls="ls -1"; alias nest="ls"
+nest *.txt'
+    'alias su="echo prefix "; alias who="echo chained"
+su who'
+    'alias e=echo
+e one; unalias e
+e two'
 )
 index=0
 for snippet in "${snippets[@]}"; do
@@ -150,6 +182,14 @@ expect 'help | tr " " "\n" | grep -c "^cd$"' '1'
 expect 'echo ${x:?unset}; echo not-reached' '' 2
 expect 'echo ${x:?unset} || echo not-reached' '' 2
 expect '(echo ${x:?unset}) 2>&1; echo "reached $?"' $'mlx-sh: x: unset\nreached 2'
+# A job killed by TERM: wait says 143 (dash says 0 there).
+expect 'sleep 5 & kill %1; wait %1; echo $?' '143'
+expect '(set -u; echo $nope) 2>&1; echo "reached $?"' $'mlx-sh: nope: parameter not set\nreached 2'
+expect 'alias x=y; type x; alias nothing' $'x is an alias for y' 1
+expect 'fg' '' 1
+expect 'trap "echo one" USR1 USR2; kill -USR2 $$; trap - USR1; trap' $'one\ntrap -- '"'"'echo one'"'"' USR2'
+expect 'echo $-; set -u; set -f; echo $-' $'\nfu'
+expect 'getopts' '' 2
 echo "ok   substrings, local, help, \${x:?} ends a script as expected"
 
 # --- Scripts.
@@ -286,5 +326,70 @@ done
 grep -q 'cancelled' <<< "$plain" && { grep -q '^cancelled$' <<< "$plain" && fail "Ctrl-C ran the cancelled line" "$work/pty.log"; }
 [[ "$(cat "$HOME/.mlx_sh_history")" == $'echo hello world\necho second\necho /usr/\necho after' ]] || fail "the history file" "$HOME/.mlx_sh_history"
 echo "ok   the line editor: cursor keys, Ctrl-A/K, history, completion, Ctrl-C, Ctrl-D, the history file"
+
+# --- Job control on a pty: Ctrl-Z stops the foreground job, jobs, bg, fg,
+# Ctrl-C, kill %n, wait %n, a trap and an alias in the session, set -u
+# does not end an interactive shell, exit warns of stopped jobs.
+cat > "$work/jobs.py" <<'PY'
+import os, pty, sys, time, select
+shell = sys.argv[1]
+pid, fd = pty.fork()
+if pid == 0:
+    os.environ["TERM"] = "xterm-256color"
+    os.environ["PS1"] = "P> "
+    os.execv(shell, [shell, "-i"])
+def read_for(seconds):
+    out = b""
+    end = time.time() + seconds
+    while time.time() < end:
+        r, _, _ = select.select([fd], [], [], 0.05)
+        if r:
+            try:
+                data = os.read(fd, 4096)
+            except OSError:
+                break
+            if not data:
+                break
+            out += data
+    return out
+def send(data, wait=0.5):
+    os.write(fd, data)
+    return read_for(wait)
+log = read_for(0.8)
+log += send(b"sleep 30\r", 0.6)
+log += send(b"\x1a", 0.8)                # Ctrl-Z stops it
+log += send(b"echo status=$?\r", 0.6)
+log += send(b"jobs\r", 0.6)
+log += send(b"bg\r", 0.6)
+log += send(b"jobs | sed s/Running/going/\r", 0.8)
+log += send(b"fg\r", 0.8)
+log += send(b"\x03", 0.8)                # Ctrl-C ends it
+log += send(b"echo after-int=$?\r", 0.6)
+log += send(b"sleep 30 &\r", 0.6)
+log += send(b"kill %1\r", 0.6)
+log += send(b"wait %1; echo waited=$?\r", 0.8)
+log += send(b"jobs; echo jobs-done\r", 0.6)
+log += send(b"trap 'echo trapped' USR1; kill -USR1 $$\r", 0.8)
+log += send(b"alias hi='echo hello'\r", 0.5)
+log += send(b"hi there\r", 0.6)
+log += send(b"set -u; echo $undefined_thing; echo still-here\r", 0.6)
+log += send(b"sleep 30\r", 0.6)
+log += send(b"\x1a", 0.8)
+log += send(b"exit\r", 0.6)              # warned: a stopped job
+log += send(b"kill %1; exit\r", 1.0)
+time.sleep(0.3)
+try:
+    _, status = os.waitpid(pid, os.WNOHANG)
+except ChildProcessError:
+    status = -1
+sys.stdout.buffer.write(log)
+sys.stdout.write("\n--- status %d\n" % status)
+PY
+timeout 60 python3 -I "$work/jobs.py" "$sh" > "$work/jobs.log" 2>&1 || fail "the job control driver failed" "$work/jobs.log"
+plain=$(sed 's/\x1b\[[0-9;]*[A-Za-z]//g; s/\r//g' "$work/jobs.log")
+for expected in '^\[1\]+ Stopped  sleep 30' '^status=148' '^\[1\]+ sleep 30 &' '^\[1\]+ going  sleep 30' '^after-int=130' '^waited=143' '^jobs-done' '^trapped' '^hello there' 'undefined_thing: parameter not set' '^still-here' 'You have stopped jobs' '--- status 0'; do
+    grep -q -- "$expected" <<< "$plain" || fail "job control: no '$expected' in the session" "$work/jobs.log"
+done
+echo "ok   job control on a pty: Ctrl-Z, jobs, bg, fg, Ctrl-C, kill %n, wait %n; traps, aliases and set -u in a session"
 
 echo PASS

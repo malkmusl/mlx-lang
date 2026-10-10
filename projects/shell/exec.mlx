@@ -4,7 +4,9 @@
 // PATH in a child), redirections (saved and restored around what runs in
 // the shell), the compound commands with break, continue and return, set
 // -e, functions with their positional parameters and locals, background
-// jobs, and command substitution's child.
+// jobs (with job control: each job in its own process group, in front of
+// the terminal while it runs there), the traps between commands, and
+// command substitution's child.
 const std = @import("std")
 const sys = @import("./sys.mlx")
 const state = @import("./state.mlx")
@@ -13,6 +15,8 @@ const expand = @import("./expand.mlx")
 const glob = @import("./glob.mlx")
 const builtins = @import("./builtins.mlx")
 const programs = @import("./programs.mlx")
+const jobs = @import("./jobs.mlx")
+const traps = @import("./traps.mlx")
 
 const Shell = state.Shell
 const Node = state.Node
@@ -43,9 +47,16 @@ pub fn runText(shell: *Shell, text: []const u8) -> usize {
         shell.*.lastStatus = 2
         return 2
     }
+    // Item by item: each runs before the next is parsed, so an alias
+    // defined on one line applies to the lines after it.
     var parser: parser_module.Parser = undefined
-    const root = parser_module.parse(&parser, shell, state.textOf(shell, @intCast(u32, at), @intCast(u32, text.length)), at)
+    parser_module.begin(&parser, shell, state.textOf(shell, @intCast(u32, at), @intCast(u32, text.length)), at)
     var status: usize = 0
+    var going = true
+    while going && !leaving(shell) {
+        const item = parser_module.parseItem(&parser)
+        if item == 0 { going = false } else { status = runItem(shell, item) }
+    }
     if parser.status == parser_module.INCOMPLETE {
         state.complain("syntax error: unexpected end of input", "")
         status = 2
@@ -57,8 +68,6 @@ pub fn runText(shell: *Shell, text: []const u8) -> usize {
         length = std.text.appendUnsigned(line_bytes, length, 64, parser_module.errorLine(&parser))
         state.complainAbout("syntax error at ", line_bytes[0..length], parser.message)
         status = 2
-    } else {
-        status = runNode(shell, root)
     }
     // Function bodies and heredocs from this text that something keeps
     // were copied: the arenas go back.
@@ -99,15 +108,30 @@ fn runList(shell: *Shell, node: u32) -> usize {
     var status: usize = 0
     var child = state.nodeAt(shell, node).*.first
     while child != 0 && !leaving(shell) {
-        const record = state.nodeAt(shell, child)
-        if record.*.flags & state.BACKGROUND != 0 {
-            status = runBackground(shell, child)
-        } else {
-            status = runAndOr(shell, child)
-        }
-        child = record.*.next
+        status = runItem(shell, child)
+        child = state.nodeAt(shell, child).*.next
     }
     return status
+}
+
+// One item of a list: an and-or list, in the background when `&` followed
+// it; then the actions of the trapped signals that arrived meanwhile.
+fn runItem(shell: *Shell, node: u32) -> usize {
+    var status: usize = 0
+    if state.nodeAt(shell, node).*.flags & state.BACKGROUND != 0 {
+        status = runBackground(shell, node)
+    } else {
+        status = runAndOr(shell, node)
+    }
+    traps.runPending(shell)
+    return status
+}
+
+// The source of a command (a job's text), as the parser kept its span.
+fn spanText(shell: *Shell, node: u32) -> []const u8 {
+    const record = state.nodeAt(shell, node)
+    if record.*.length == 0 { return "" }
+    return state.textOf(shell, record.*.text, record.*.length)
 }
 
 // A && B || C: each pipeline's flags say what came before it.
@@ -143,23 +167,19 @@ fn runBackground(shell: *Shell, node: u32) -> usize {
         return 1
     }
     if pid == 0 {
-        shell.*.interactive = false
-        sys.setSignal(sys.SIGINT, 1)
-        sys.setSignal(sys.SIGQUIT, 1)
+        jobs.enterChild(shell, 0, false)
         const status = runAndOr(shell, node)
         finishChild(shell, status)
     }
-    if shell.*.jobCount < state.MAX_JOBS {
-        shell.*.jobs[shell.*.jobCount] = pid
-        shell.*.jobCount += 1
-    }
+    jobs.placeChild(shell, pid, 0)
+    const number = jobs.add(shell, pid, pid, spanText(shell, node), state.JOB_RUNNING)
     shell.*.lastBackground = pid
     if shell.*.interactive {
         var line: [32]u8 = undefined
         var bytes: [*]u8 = undefined
         unsafe { bytes = @ptrCast([*]u8, &line) }
         var length = std.text.append(bytes, 0, 32, "[")
-        length = std.text.appendUnsigned(bytes, length, 32, shell.*.jobCount)
+        length = std.text.appendUnsigned(bytes, length, 32, number)
         length = std.text.append(bytes, length, 32, "] ")
         length = std.text.appendUnsigned(bytes, length, 32, @intCast(usize, pid))
         length = std.text.append(bytes, length, 32, "\n")
@@ -191,7 +211,7 @@ fn runPipeline(shell: *Shell, node: u32) -> usize {
         status = runCommand(shell, record.*.first)
         if negated { shell.*.conditionDepth -= 1 }
     } else if count > 1 {
-        status = runPipes(shell, record.*.first, count)
+        status = runPipes(shell, node, record.*.first, count)
     }
     if negated { status = if status == 0 { 1 } else { 0 } }
     // $? is the last pipeline's status.
@@ -203,12 +223,14 @@ fn runPipeline(shell: *Shell, node: u32) -> usize {
     return status
 }
 
-// Every command in a child, connected by pipes; the last one's status.
-fn runPipes(shell: *Shell, first: u32, count: usize) -> usize {
+// Every command in a child, connected by pipes (one process group, in
+// front of the terminal, with job control); the last one's status.
+fn runPipes(shell: *Shell, node: u32, first: u32, count: usize) -> usize {
     var pids: [MAX_PIPELINE]isize = undefined
     var previous_read: isize = -1
     var command = first
     var index: usize = 0
+    var group: isize = 0
     while command != 0 && index < MAX_PIPELINE {
         const last = state.nodeAt(shell, command).*.next == 0
         var read_end: isize = -1
@@ -223,7 +245,7 @@ fn runPipes(shell: *Shell, first: u32, count: usize) -> usize {
             return 1
         }
         if pid == 0 {
-            shell.*.interactive = false
+            jobs.enterChild(shell, group, true)
             if previous_read >= 0 {
                 const stdin_set = sys.dup2(previous_read, 0)
                 sys.close(previous_read)
@@ -236,6 +258,8 @@ fn runPipes(shell: *Shell, first: u32, count: usize) -> usize {
             const status = runCommand(shell, command)
             finishChild(shell, status)
         }
+        jobs.placeChild(shell, pid, group)
+        if group == 0 { group = pid }
         if previous_read >= 0 { sys.close(previous_read) }
         if !last {
             sys.close(write_end)
@@ -245,15 +269,9 @@ fn runPipes(shell: *Shell, first: u32, count: usize) -> usize {
         index += 1
         command = state.nodeAt(shell, command).*.next
     }
-    var status: usize = 0
-    var waited: usize = 0
-    while waited < index {
-        var raw: usize = 0
-        const pid = sys.wait(pids[waited], &raw, false)
-        if waited + 1 == index { status = sys.exitStatus(raw) }
-        waited += 1
-    }
-    return status
+    var pids_pointer: [*]const isize = undefined
+    unsafe { pids_pointer = @ptrCast([*]const isize, &pids) }
+    return jobs.waitPipeline(shell, pids_pointer, index, group, spanText(shell, node))
 }
 
 // ---------------------------------------------------------------------------
@@ -560,6 +578,7 @@ fn runSimple(shell: *Shell, node: u32) -> usize {
         return 1
     }
     if pid == 0 {
+        jobs.enterChild(shell, 0, true)
         var saved_count: usize = 0
         if !applyAssignments(shell, node, false, &saved_count) { sys.exit(1) }
         // Exported for the program.
@@ -575,10 +594,9 @@ fn runSimple(shell: *Shell, node: u32) -> usize {
         if !applyRedirects(shell, node, &saved, true) { sys.exit(1) }
         programs.executeProgram(shell, &fields)
     }
-    var raw: usize = 0
-    const waited = sys.wait(pid, &raw, false)
-    status = sys.exitStatus(raw)
-    if status > 128 && shell.*.interactive && status != 130 {
+    jobs.placeChild(shell, pid, 0)
+    status = jobs.waitForeground(shell, pid, pid, spanText(shell, node))
+    if status > 128 && shell.*.interactive && status != 130 && status != 128 + sys.SIGTSTP && status != 128 + sys.SIGSTOP && status != 128 + sys.SIGTTIN && status != 128 + sys.SIGTTOU {
         var line: [64]u8 = undefined
         var bytes: [*]u8 = undefined
         unsafe { bytes = @ptrCast([*]u8, &line) }
@@ -615,16 +633,15 @@ fn runCommand(shell: *Shell, node: u32) -> usize {
             return 1
         }
         if pid == 0 {
-            shell.*.interactive = false
+            jobs.enterChild(shell, 0, true)
             var saved: Saved = undefined
             initSaved(&saved)
             if !applyRedirects(shell, node, &saved, true) { sys.exit(1) }
             const status = runList(shell, record.*.first)
             finishChild(shell, status)
         }
-        var raw: usize = 0
-        const waited = sys.wait(pid, &raw, false)
-        return sys.exitStatus(raw)
+        jobs.placeChild(shell, pid, 0)
+        return jobs.waitForeground(shell, pid, pid, spanText(shell, node))
     }
     // The rest run in the shell, with their redirections around them.
     var saved: Saved = undefined

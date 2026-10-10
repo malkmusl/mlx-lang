@@ -21,7 +21,11 @@ pub const MAX_POSITIONAL: usize = 4096
 pub const HISTORY_CAPACITY: usize = 262144
 pub const MAX_HISTORY: usize = 1000
 pub const MAX_JOBS: usize = 64
+pub const JOB_TEXT_CAPACITY: usize = 16384
 pub const NAME_CAPACITY: usize = 256
+pub const MAX_ALIASES: usize = 128
+// Signals 1..31 have a trap slot each; slot 0 is EXIT.
+pub const MAX_SIGNALS: usize = 32
 
 // Node kinds.
 pub const NONE: u8 = 0
@@ -96,6 +100,33 @@ pub const Function = struct {
     used: bool
 }
 
+pub const Alias = struct {
+    name: u32
+    nameLength: u32
+    value: u32
+    valueLength: u32
+    used: bool
+}
+
+// A job: a background command, or a foreground one the terminal stopped.
+// `pid` is the process the shell waits for (the last of a pipeline),
+// `group` the job's process group when job control is on (else the pid),
+// the text its command as written, in the job arena. A slot with pid 0
+// is free; the job number is the slot's index plus one.
+pub const JOB_RUNNING: u8 = 0
+pub const JOB_STOPPED: u8 = 1
+pub const JOB_DONE: u8 = 2
+
+pub const Job = struct {
+    pid: isize
+    group: isize
+    state: u8
+    reported: bool
+    status: usize
+    text: u32
+    textLength: u32
+}
+
 pub const MAX_LOCALS: usize = 256
 pub const LOCAL_CAPACITY: usize = 65536
 
@@ -154,11 +185,23 @@ pub const Shell = struct {
     errexit: bool
     xtrace: bool
     noglob: bool
+    nounset: bool
     interactive: bool
     loginShell: bool
+    // Job control (an interactive shell on a terminal, set -m): the
+    // terminal's descriptor kept above the ones redirections use, and the
+    // shell's own process group, which the terminal comes back to.
+    jobControl: bool
+    terminal: isize
+    shellGroup: isize
+    warnedStopped: bool
+    // The job the % builtins mean without a number (a slot plus one).
+    currentJob: usize
     // Background jobs not waited for yet.
-    jobs: [MAX_JOBS]isize
+    jobs: [MAX_JOBS]Job
     jobCount: usize
+    jobBytes: [JOB_TEXT_CAPACITY]u8
+    jobLength: usize
     // The history (the editor's): a ring of lines.
     history: [HISTORY_CAPACITY]u8
     historyLength: usize
@@ -170,8 +213,19 @@ pub const Shell = struct {
     cooked: sys.Termios
     hasCooked: bool
     // The trap for EXIT (a command string in the function arena; 0: none).
-    exitTrap: u32
-    exitTrapLength: u32
+    // The traps: the action's text in the function arena per signal (slot
+    // 0: EXIT), whether one is set (an empty one ignores the signal), and
+    // the set of signals with an action, which the shell keeps blocked.
+    trapAt: [MAX_SIGNALS]u32
+    trapLength: [MAX_SIGNALS]u32
+    trapSet: [MAX_SIGNALS]bool
+    trappedMask: usize
+    // getopts: OPTIND as the shell last set it, and how far into the
+    // current word's option letters it is.
+    optLast: usize
+    optOffset: usize
+    aliases: [MAX_ALIASES]Alias
+    aliasCount: usize
     // The parse of the current input (the parser's).
     parseStart: usize
     // `local` variables: what to put back when the function returns.
@@ -220,15 +274,31 @@ pub fn create(allocator: Allocator) -> ?*Shell {
     shell.*.errexit = false
     shell.*.xtrace = false
     shell.*.noglob = false
+    shell.*.nounset = false
     shell.*.interactive = false
     shell.*.loginShell = false
+    shell.*.jobControl = false
+    shell.*.terminal = -1
+    shell.*.shellGroup = 0
+    shell.*.warnedStopped = false
+    shell.*.currentJob = 0
     shell.*.jobCount = 0
+    shell.*.jobLength = 0
     shell.*.historyLength = 0
     shell.*.historyCount = 0
     shell.*.historyStart = 0
     shell.*.hasCooked = false
-    shell.*.exitTrap = 0
-    shell.*.exitTrapLength = 0
+    var signal: usize = 0
+    while signal < MAX_SIGNALS {
+        shell.*.trapAt[signal] = 0
+        shell.*.trapLength[signal] = 0
+        shell.*.trapSet[signal] = false
+        signal += 1
+    }
+    shell.*.trappedMask = 0
+    shell.*.optLast = 0
+    shell.*.optOffset = 0
+    shell.*.aliasCount = 0
     shell.*.parseStart = 0
     shell.*.localCount = 0
     shell.*.localLength = 0
@@ -677,6 +747,133 @@ pub fn keepText(shell: *Shell, text: []const u8) -> usize { return keepFunctionB
 pub fn keptText(shell: *Shell, at: usize, length: usize) -> []const u8 {
     const bytes = functionBytes(shell)
     return bytes[at..at + length]
+}
+
+// ---------------------------------------------------------------------------
+// Aliases (their names and values in the function arena)
+
+pub fn aliasAt(shell: *Shell, index: usize) -> *Alias {
+    var pointer: *Alias = undefined
+    unsafe { pointer = @ptrCast(*Alias, &shell.*.aliases[index]) }
+    return pointer
+}
+
+pub fn aliasName(shell: *Shell, alias: *Alias) -> []const u8 {
+    const bytes = functionBytes(shell)
+    return bytes[alias.*.name..alias.*.name + alias.*.nameLength]
+}
+
+pub fn aliasValue(shell: *Shell, alias: *Alias) -> []const u8 {
+    const bytes = functionBytes(shell)
+    return bytes[alias.*.value..alias.*.value + alias.*.valueLength]
+}
+
+// The slot of alias `name`, or MAX_ALIASES.
+pub fn findAlias(shell: *Shell, name: []const u8) -> usize {
+    var index: usize = 0
+    while index < shell.*.aliasCount {
+        const alias = aliasAt(shell, index)
+        if alias.*.used && std.text.same(aliasName(shell, alias), name) { return index }
+        index += 1
+    }
+    return MAX_ALIASES
+}
+
+pub fn defineAlias(shell: *Shell, name: []const u8, value: []const u8) -> bool {
+    var slot = findAlias(shell, name)
+    if slot == MAX_ALIASES {
+        slot = shell.*.aliasCount
+        var index: usize = 0
+        while index < shell.*.aliasCount {
+            if !aliasAt(shell, index).*.used && slot == shell.*.aliasCount { slot = index }
+            index += 1
+        }
+        if slot == shell.*.aliasCount {
+            if slot >= MAX_ALIASES { return false }
+            shell.*.aliasCount += 1
+        }
+    }
+    const name_at = keepFunctionBytes(shell, name)
+    const value_at = keepFunctionBytes(shell, value)
+    if name_at == FUNCTION_CAPACITY || value_at == FUNCTION_CAPACITY { return false }
+    const alias = aliasAt(shell, slot)
+    alias.*.name = @intCast(u32, name_at)
+    alias.*.nameLength = @intCast(u32, name.length)
+    alias.*.value = @intCast(u32, value_at)
+    alias.*.valueLength = @intCast(u32, value.length)
+    alias.*.used = true
+    return true
+}
+
+// Forgets alias `name`; false when there was none.
+pub fn undefineAlias(shell: *Shell, name: []const u8) -> bool {
+    const slot = findAlias(shell, name)
+    if slot == MAX_ALIASES { return false }
+    aliasAt(shell, slot).*.used = false
+    return true
+}
+
+// ---------------------------------------------------------------------------
+// Jobs' command texts (the job arena, compacted when full)
+
+fn jobBytesOf(shell: *Shell) -> [*]u8 {
+    var pointer: [*]u8 = undefined
+    unsafe { pointer = @ptrCast([*]u8, &shell.*.jobBytes) }
+    return pointer
+}
+
+pub fn jobAt(shell: *Shell, index: usize) -> *Job {
+    var pointer: *Job = undefined
+    unsafe { pointer = @ptrCast(*Job, &shell.*.jobs[index]) }
+    return pointer
+}
+
+pub fn jobText(shell: *Shell, job: *Job) -> []const u8 {
+    const bytes = jobBytesOf(shell)
+    return bytes[job.*.text..job.*.text + job.*.textLength]
+}
+
+fn compactJobTexts(shell: *Shell) -> void {
+    const bytes = jobBytesOf(shell)
+    var used: usize = 0
+    var index: usize = 0
+    while index < shell.*.jobCount {
+        const job = jobAt(shell, index)
+        if job.*.pid != 0 {
+            const length = @intCast(usize, job.*.textLength)
+            const from = @intCast(usize, job.*.text)
+            var at: usize = 0
+            while at < length {
+                bytes[used + at] = bytes[from + at]
+                at += 1
+            }
+            job.*.text = @intCast(u32, used)
+            used += length
+        }
+        index += 1
+    }
+    shell.*.jobLength = used
+}
+
+// Keeps a job's command text; its offset (a text that does not fit is cut).
+pub fn keepJobText(shell: *Shell, text: []const u8) -> usize {
+    var kept = text
+    if kept.length > JOB_TEXT_CAPACITY / 4 { kept = kept[0..JOB_TEXT_CAPACITY / 4] }
+    if shell.*.jobLength + kept.length > JOB_TEXT_CAPACITY { compactJobTexts(shell) }
+    const at = shell.*.jobLength
+    const bytes = jobBytesOf(shell)
+    var index: usize = 0
+    for byte in kept {
+        bytes[at + index] = byte
+        index += 1
+    }
+    shell.*.jobLength += kept.length
+    return at
+}
+
+pub fn keptJobLength(text: []const u8) -> usize {
+    if text.length > JOB_TEXT_CAPACITY / 4 { return JOB_TEXT_CAPACITY / 4 }
+    return text.length
 }
 
 // ---------------------------------------------------------------------------
