@@ -1,0 +1,534 @@
+// mlx-console: the Mlx terminal on the Linux console, without a
+// compositor: the framebuffer as the screen, the keyboards' evdev nodes
+// for the keys (through the xkb keymap), a shell on a pty, drawn with the
+// monospaced TrueType font (std.terminal, std.ui.terminal, std.ui.text).
+// For tests the screen can be a file and the keys a file of input events.
+//
+//     mlx4 projects/console/main.mlx -o mlx-console
+//     sudo ./mlx-console                   # /dev/fb0, /dev/input/event*, /dev/tty0 in graphics mode
+//     ./mlx-console --framebuffer screen.argb --size 640x400 --keyboard keys.fifo -- /bin/sh
+//
+//     --framebuffer PATH   the device (default /dev/fb0), or with --size a plain file
+//     --size WxH           the file's size in pixels (then it is a file, not a device)
+//     --keyboard PATH      one file of struct input_event records instead of the keyboards
+//     --tty PATH           the console to put into graphics mode (default /dev/tty0 with a device)
+//     --no-tty             leave the console alone (the default with --size)
+//     --font-size N        the font's pixel height (default 16, or MLX_CONSOLE_FONT_SIZE)
+//     --font FILE          a TrueType font file (default: the monospaced font std.ui.text finds)
+//     --layout L           the xkb layout (with --variant V, --model M, --options O);
+//                          default XKB_DEFAULT_LAYOUT, else us
+//     --history N          lines kept above the screen (default 5000)
+//     -- PROGRAM ARGS...   what to run (default $SHELL, else mlx-sh beside this program
+//                          or installed, else /bin/sh); the console ends with its status
+const std = @import("std")
+const crash = @import("std.crash")
+const ui = @import("std.ui")
+const terminal = @import("std.terminal")
+const ui_terminal = @import("std.ui.terminal")
+const pty = @import("std.terminal.pty")
+const text_module = @import("std.ui.text")
+const sys = @import("./sys.mlx")
+const framebuffer = @import("./framebuffer.mlx")
+const input_module = @import("./input.mlx")
+
+const Allocator = std.allocator.Allocator
+const MAX_KEYS: usize = 128
+const MAX_ARGUMENTS: usize = 64
+
+const Console = struct {
+    fb: framebuffer.Framebuffer
+    input: input_module.Input
+    screen: terminal.Screen
+    mono: text_module.Text
+    view: ui_terminal.View
+    child: pty.Child
+    keys: [MAX_KEYS]input_module.Key
+    // The console (a tty) put into graphics mode, and its modes before.
+    tty: isize
+    ttyMode: usize
+    keyboardMode: usize
+    hasTty: bool
+    columns: usize
+    rows: usize
+}
+
+// What the options say.
+const Options = struct {
+    framebufferPath: [*]const u8
+    width: usize
+    height: usize
+    isFile: bool
+    keyboardPath: [*]const u8
+    hasKeyboardFile: bool
+    ttyPath: [*]const u8
+    useTty: bool
+    fontSize: usize
+    fontPath: [*]const u8
+    hasFont: bool
+    layout: []const u8
+    variant: []const u8
+    model: []const u8
+    xkbOptions: []const u8
+    history: usize
+    programAt: usize
+}
+
+fn fbOf(console: *Console) -> *framebuffer.Framebuffer {
+    unsafe { return @ptrCast(*framebuffer.Framebuffer, &console.*.fb) }
+}
+
+fn inputOf(console: *Console) -> *input_module.Input {
+    unsafe { return @ptrCast(*input_module.Input, &console.*.input) }
+}
+
+fn screenOf(console: *Console) -> *terminal.Screen {
+    unsafe { return @ptrCast(*terminal.Screen, &console.*.screen) }
+}
+
+fn monoOf(console: *Console) -> *text_module.Text {
+    unsafe { return @ptrCast(*text_module.Text, &console.*.mono) }
+}
+
+fn viewOf(console: *Console) -> *ui_terminal.View {
+    unsafe { return @ptrCast(*ui_terminal.View, &console.*.view) }
+}
+
+fn childOf(console: *Console) -> *pty.Child {
+    unsafe { return @ptrCast(*pty.Child, &console.*.child) }
+}
+
+fn keysOf(console: *Console) -> [*]input_module.Key {
+    unsafe { return @ptrCast([*]input_module.Key, &console.*.keys) }
+}
+
+fn named(option: std.string.String, name: []const u8) -> bool {
+    return std.text.same(std.string.asSlice(option), name)
+}
+
+fn parseNumber(text: []const u8, value: *usize) -> bool {
+    if text.length == 0 { return false }
+    var result: usize = 0
+    for byte in text {
+        if byte < 48 || byte > 57 { return false }
+        result = result * 10 + @intCast(usize, byte - 48)
+    }
+    value.* = result
+    return true
+}
+
+// WxH.
+fn parseSize(text: []const u8, options: *Options) -> bool {
+    var split: usize = 0
+    while split < text.length && text[split] != 120 { split += 1 }
+    if split == 0 || split + 1 >= text.length { return false }
+    var width: usize = 0
+    var height: usize = 0
+    if !parseNumber(text[0..split], &width) || !parseNumber(text[split + 1..text.length], &height) { return false }
+    if width < 64 || height < 32 || width > 16384 || height > 16384 { return false }
+    options.*.width = width
+    options.*.height = height
+    options.*.isFile = true
+    return true
+}
+
+// The options; 0 when they are fine, else the exit code (after a word).
+fn parseOptions(arguments: [][*]const u8, entries: [*][*]const u8, options: *Options) -> u8 {
+    unsafe {
+        options.*.framebufferPath = @ptrCast([*]const u8, "/dev/fb0")
+        options.*.ttyPath = @ptrCast([*]const u8, "/dev/tty0")
+        options.*.keyboardPath = @ptrCast([*]const u8, "")
+        options.*.fontPath = @ptrCast([*]const u8, "")
+    }
+    options.*.width = 0
+    options.*.height = 0
+    options.*.isFile = false
+    options.*.hasKeyboardFile = false
+    options.*.useTty = true
+    options.*.fontSize = 16
+    options.*.hasFont = false
+    options.*.layout = ""
+    options.*.variant = ""
+    options.*.model = ""
+    options.*.xkbOptions = ""
+    options.*.history = 5000
+    options.*.programAt = 0
+    const from_environment = std.process.environmentFrom(entries, "MLX_CONSOLE_FONT_SIZE")
+    if from_environment != null {
+        var size: usize = 0
+        if parseNumber(std.string.asSlice(from_environment.?), &size) && size >= 6 && size <= 200 { options.*.fontSize = size }
+    }
+    var no_tty = false
+    const count = arguments.length
+    var index: usize = 1
+    while index < count {
+        const option = std.process.argument(arguments, index)
+        const has_value = index + 1 < count
+        if named(option, "--framebuffer") && has_value {
+            options.*.framebufferPath = std.process.argument(arguments, index + 1).pointer
+            index += 2
+        } else if named(option, "--size") && has_value {
+            if !parseSize(std.string.asSlice(std.process.argument(arguments, index + 1)), options) {
+                sys.say("--size wants WIDTHxHEIGHT (at least 64x32)")
+                return 2
+            }
+            index += 2
+        } else if named(option, "--keyboard") && has_value {
+            options.*.keyboardPath = std.process.argument(arguments, index + 1).pointer
+            options.*.hasKeyboardFile = true
+            index += 2
+        } else if named(option, "--tty") && has_value {
+            options.*.ttyPath = std.process.argument(arguments, index + 1).pointer
+            index += 2
+        } else if named(option, "--no-tty") {
+            no_tty = true
+            index += 1
+        } else if named(option, "--font-size") && has_value {
+            var size: usize = 0
+            if !parseNumber(std.string.asSlice(std.process.argument(arguments, index + 1)), &size) || size < 6 || size > 200 {
+                sys.say("--font-size wants a number from 6 to 200")
+                return 2
+            }
+            options.*.fontSize = size
+            index += 2
+        } else if named(option, "--font") && has_value {
+            options.*.fontPath = std.process.argument(arguments, index + 1).pointer
+            options.*.hasFont = true
+            index += 2
+        } else if named(option, "--layout") && has_value {
+            options.*.layout = std.string.asSlice(std.process.argument(arguments, index + 1))
+            index += 2
+        } else if named(option, "--variant") && has_value {
+            options.*.variant = std.string.asSlice(std.process.argument(arguments, index + 1))
+            index += 2
+        } else if named(option, "--model") && has_value {
+            options.*.model = std.string.asSlice(std.process.argument(arguments, index + 1))
+            index += 2
+        } else if named(option, "--options") && has_value {
+            options.*.xkbOptions = std.string.asSlice(std.process.argument(arguments, index + 1))
+            index += 2
+        } else if named(option, "--history") && has_value {
+            var lines: usize = 0
+            if !parseNumber(std.string.asSlice(std.process.argument(arguments, index + 1)), &lines) || lines > 100000 {
+                sys.say("--history wants a number up to 100000")
+                return 2
+            }
+            options.*.history = lines
+            index += 2
+        } else if named(option, "--") {
+            if has_value { options.*.programAt = index + 1 }
+            index = count
+        } else if named(option, "--help") || named(option, "-h") {
+            const said = sys.writeAll(1, "usage: mlx-console [--framebuffer PATH] [--size WxH] [--keyboard PATH] [--tty PATH | --no-tty] [--font-size N] [--font FILE] [--layout L [--variant V] [--model M] [--options O]] [--history N] [-- PROGRAM ARGS...]\n")
+            return 1
+        } else {
+            sys.sayAbout("unknown option: ", std.string.asSlice(option))
+            return 2
+        }
+    }
+    if no_tty || options.*.isFile { options.*.useTty = false }
+    return 0
+}
+
+// The program's environment: ours, with TERM and COLORTERM for a
+// 256-colour, direct-colour xterm.
+fn programEnvironment(entries: [*][*]const u8, allocator: Allocator) -> ?[*][*]const u8 {
+    var count: usize = 0
+    while @intFromPtr(entries[count]) != 0 { count += 1 }
+    const memory = allocator.alloc((count + 3) * @sizeOf([*]const u8), 8)
+    if memory == null { return null }
+    var result: [*][*]const u8 = undefined
+    unsafe { result = @ptrCast([*][*]const u8, memory.?) }
+    var used: usize = 0
+    var index: usize = 0
+    while index < count {
+        const entry = std.process.fromCString(entries[index])
+        if !std.string.startsWith(entry, std.string.fromSlice("TERM=")) && !std.string.startsWith(entry, std.string.fromSlice("COLORTERM=")) {
+            result[used] = entries[index]
+            used += 1
+        }
+        index += 1
+    }
+    unsafe {
+        result[used] = @ptrCast([*]const u8, "TERM=xterm-256color")
+        result[used + 1] = @ptrCast([*]const u8, "COLORTERM=truecolor")
+        result[used + 2] = @ptrFromInt([*]const u8, 0)
+    }
+    return result
+}
+
+// The shell: $SHELL, else mlx-sh beside this program or where it is
+// installed, else /bin/sh.
+var shell_path: [4096]u8 = undefined
+
+fn defaultShell(entries: [*][*]const u8) -> [*]const u8 {
+    const shell = std.process.environmentFrom(entries, "SHELL")
+    if shell != null && shell.?.length > 0 { return shell.?.pointer }
+    var candidate: [*]const u8 = undefined
+    var own: [*]u8 = undefined
+    unsafe {
+        own = @ptrCast([*]u8, &shell_path)
+        candidate = @ptrCast([*]const u8, "/proc/self/exe")
+    }
+    const got = std.fs.readLink(candidate, own, 4000)
+    if got > 0 {
+        var length = @bitCast(usize, got)
+        while length > 0 && own[length - 1] != 47 { length -= 1 }
+        length = std.text.append(own, length, 4000, "mlx-sh")
+        own[length] = 0
+        if std.fs.exists(own) { return own }
+    }
+    unsafe { candidate = @ptrCast([*]const u8, "/usr/local/bin/mlx-sh") }
+    if std.fs.exists(candidate) { return candidate }
+    unsafe { candidate = @ptrCast([*]const u8, "/usr/bin/mlx-sh") }
+    if std.fs.exists(candidate) { return candidate }
+    unsafe { candidate = @ptrCast([*]const u8, "/bin/sh") }
+    return candidate
+}
+
+// The console into graphics mode with its keyboard off (the kernel would
+// otherwise draw text over us and act on the keys too).
+fn takeTty(console: *Console, path: [*]const u8) -> void {
+    console.*.hasTty = false
+    console.*.tty = sys.open(path, sys.O_RDWR | sys.O_CLOEXEC, 0)
+    if console.*.tty < 0 {
+        sys.sayAbout("cannot open the console (--no-tty leaves it alone): ", std.text.cString(path))
+        return
+    }
+    var mode: [4]u8 = undefined
+    var mode_bytes: [*]u8 = undefined
+    unsafe { mode_bytes = @ptrCast([*]u8, &mode) }
+    sys.store32(mode_bytes, 0, 0)
+    console.*.ttyMode = sys.KD_TEXT
+    if sys.ioctlBytes(console.*.tty, sys.KDGETMODE, mode_bytes) >= 0 { console.*.ttyMode = @intCast(usize, sys.load32(mode_bytes, 0)) }
+    sys.store32(mode_bytes, 0, 3)
+    console.*.keyboardMode = sys.K_UNICODE
+    if sys.ioctlBytes(console.*.tty, sys.KDGKBMODE, mode_bytes) >= 0 { console.*.keyboardMode = @intCast(usize, sys.load32(mode_bytes, 0)) }
+    if sys.ioctl(console.*.tty, sys.KDSETMODE, sys.KD_GRAPHICS) < 0 {
+        sys.sayAbout("the console does not switch to graphics mode: ", std.text.cString(path))
+        sys.close(console.*.tty)
+        return
+    }
+    const keyboard_off = sys.ioctl(console.*.tty, sys.KDSKBMODE, sys.K_OFF)
+    console.*.hasTty = true
+}
+
+fn giveTtyBack(console: *Console) -> void {
+    if !console.*.hasTty { return }
+    const keyboard = sys.ioctl(console.*.tty, sys.KDSKBMODE, console.*.keyboardMode)
+    const mode = sys.ioctl(console.*.tty, sys.KDSETMODE, console.*.ttyMode)
+    sys.close(console.*.tty)
+    console.*.hasTty = false
+}
+
+fn draw(console: *Console) -> void {
+    const fb = fbOf(console)
+    ui_terminal.draw(viewOf(console), framebuffer.canvasOf(fb), ui.rect(0, 0, @intCast(i32, fb.*.width), @intCast(i32, fb.*.height)))
+    framebuffer.show(fb)
+}
+
+// The program's output into the screen, its answers back; false once the
+// program is gone.
+fn readOutput(console: *Console) -> bool {
+    var buffer: [65536]u8 = undefined
+    var bytes: [*]u8 = undefined
+    unsafe { bytes = @ptrCast([*]u8, &buffer) }
+    var alive = true
+    var more = true
+    while more {
+        const got = pty.read(childOf(console), bytes, 65536)
+        if got == pty.EAGAIN || got == sys.EINTR {
+            more = false
+        } else if got <= 0 {
+            alive = false
+            more = false
+        } else {
+            terminal.feed(screenOf(console), bytes[0..@bitCast(usize, got)])
+            if @bitCast(usize, got) < 65536 { more = false }
+        }
+    }
+    var answers: [256]u8 = undefined
+    var answer_bytes: [*]u8 = undefined
+    unsafe { answer_bytes = @ptrCast([*]u8, &answers) }
+    const length = terminal.takeResponses(screenOf(console), answer_bytes, 256)
+    if length > 0 && alive { pty.write(childOf(console), answer_bytes, length) }
+    const title_changed = terminal.takeTitleChange(screenOf(console))
+    const rang = terminal.takeBell(screenOf(console))
+    return alive
+}
+
+// Keys from device `index` to the program.
+fn readKeys(console: *Console, index: usize) -> void {
+    const input = inputOf(console)
+    const keys = keysOf(console)
+    const count = input_module.read(input, index, keys, MAX_KEYS)
+    if count <= 0 { return }
+    var out: [16]u8 = undefined
+    var out_bytes: [*]u8 = undefined
+    unsafe { out_bytes = @ptrCast([*]u8, &out) }
+    var at: usize = 0
+    while at < @bitCast(usize, count) {
+        const key = keys[at]
+        input_module.press(input, key.code, key.pressed, key.repeat)
+        if key.pressed {
+            const length = ui_terminal.key(viewOf(console), key.code, input_module.modifiers(input), input_module.textOf(input), input_module.plainTextOf(input), out_bytes)
+            if length > 0 && !childOf(console).*.ended { pty.write(childOf(console), out_bytes, length) }
+        }
+        at += 1
+    }
+}
+
+// Waits on the signals, the program and the keyboards; draws what changed.
+// True when the program ended (false: a signal said stop).
+fn run(console: *Console, signals: isize) -> bool {
+    var program_ended = false
+    const input = inputOf(console)
+    var entries: [160]u8 = undefined
+    var entry_bytes: [*]u8 = undefined
+    unsafe { entry_bytes = @ptrCast([*]u8, &entries) }
+    var running = true
+    draw(console)
+    while running {
+        var count: usize = 0
+        sys.pollSet(entry_bytes, 0, signals)
+        sys.pollSet(entry_bytes, 1, childOf(console).*.master)
+        count = 2
+        var device: usize = 0
+        while device < input.*.count && count < 20 {
+            sys.pollSet(entry_bytes, count, input_module.descriptor(input, device))
+            count += 1
+            device += 1
+        }
+        const timeout: isize = if input.*.fixed { -1 } else { 2000 }
+        const ready = sys.poll(entry_bytes, count, timeout)
+        if ready < 0 && ready != sys.EINTR { running = false }
+        if ready == 0 {
+            // Nothing for a while: a keyboard may have been plugged in.
+            const devices = input_module.scan(input)
+        }
+        if ready > 0 {
+            if sys.pollResult(entry_bytes, 0) != 0 { running = false }
+            if sys.pollResult(entry_bytes, 1) != 0 {
+                if !readOutput(console) {
+                    running = false
+                    program_ended = true
+                }
+            }
+            // Devices from the last to the first: a dropped one shifts the
+            // ones after it.
+            var which = count
+            while which > 2 {
+                which -= 1
+                const result = sys.pollResult(entry_bytes, which)
+                if result & (sys.POLLIN | sys.POLLERR | sys.POLLHUP) != 0 { readKeys(console, which - 2) }
+            }
+        }
+        if terminal.takeDirty(screenOf(console)) { draw(console) }
+    }
+    return program_ended
+}
+
+pub fn main(arguments: [][*]const u8) -> u8 {
+    const reporting = crash.install()
+    const allocator = std.page_allocator.init()
+    const entries = std.process.environmentEntries(arguments)
+    var options: Options = undefined
+    const option_status = parseOptions(arguments, entries, &options)
+    if option_status != 0 { return if option_status == 1 { 0 } else { option_status } }
+    const memory = allocator.alloc(@sizeOf(Console), 16)
+    if memory == null {
+        sys.say("out of memory")
+        return 1
+    }
+    var console: *Console = undefined
+    unsafe { console = @ptrCast(*Console, memory.?) }
+    console.*.hasTty = false
+    // The screen.
+    var opened = false
+    if options.isFile {
+        opened = framebuffer.openFile(fbOf(console), options.framebufferPath, options.width, options.height, allocator)
+    } else {
+        opened = framebuffer.openDevice(fbOf(console), options.framebufferPath, allocator)
+    }
+    if !opened { return 1 }
+    // The font, the cells, the screen's size.
+    var font_loaded = false
+    if options.hasFont {
+        font_loaded = text_module.loadFontFile(monoOf(console), options.fontPath, @intCast(u32, options.fontSize), allocator)
+    } else {
+        font_loaded = text_module.loadMonoText(monoOf(console), @intCast(u32, options.fontSize), allocator)
+    }
+    if !font_loaded {
+        sys.say("no font (install DejaVu Sans Mono, Liberation Mono or Noto Sans Mono, or give --font FILE)")
+        framebuffer.close(fbOf(console))
+        return 1
+    }
+    ui_terminal.init(viewOf(console), screenOf(console), monoOf(console), @intCast(i32, options.fontSize), 0)
+    console.*.columns = ui_terminal.columnsFor(viewOf(console), @intCast(i32, fbOf(console).*.width))
+    console.*.rows = ui_terminal.rowsFor(viewOf(console), @intCast(i32, fbOf(console).*.height))
+    if console.*.columns < 2 { console.*.columns = 2 }
+    if console.*.rows < 1 { console.*.rows = 1 }
+    if !terminal.init(screenOf(console), allocator, console.*.columns, console.*.rows, options.history) {
+        sys.say("out of memory for the screen")
+        framebuffer.close(fbOf(console))
+        return 1
+    }
+    viewOf(console).*.focused = true
+    // The keys.
+    input_module.init(inputOf(console), allocator)
+    const keymap_loaded = input_module.loadKeymap(inputOf(console), entries, options.layout, options.variant, options.model, options.xkbOptions)
+    if options.hasKeyboardFile {
+        if !input_module.useFile(inputOf(console), options.keyboardPath) {
+            framebuffer.close(fbOf(console))
+            return 1
+        }
+    } else if input_module.scan(inputOf(console)) == 0 {
+        sys.say("no keyboard in /dev/input (looking again every two seconds)")
+    }
+    // The console.
+    if options.useTty { takeTty(console, options.ttyPath) }
+    // The program.
+    const environment = programEnvironment(entries, allocator)
+    if environment == null {
+        giveTtyBack(console)
+        sys.say("out of memory")
+        return 1
+    }
+    var argv: [MAX_ARGUMENTS][*]const u8 = undefined
+    var argv_pointer: [*][*]const u8 = undefined
+    unsafe { argv_pointer = @ptrCast([*][*]const u8, &argv) }
+    var argc: usize = 0
+    const count = arguments.length
+    if options.programAt != 0 {
+        while options.programAt + argc < count && argc < MAX_ARGUMENTS - 1 {
+            unsafe { argv[argc] = @ptrCast([*]const u8, arguments[options.programAt + argc]) }
+            argc += 1
+        }
+    } else {
+        argv[0] = defaultShell(entries)
+        argc = 1
+    }
+    unsafe { argv[argc] = @ptrFromInt([*]const u8, 0) }
+    if !pty.spawn(childOf(console), argv[0], argv_pointer, environment.?, @intCast(u16, console.*.columns), @intCast(u16, console.*.rows)) {
+        giveTtyBack(console)
+        sys.sayAbout("the program could not be started: ", std.text.cString(argv[0]))
+        return 1
+    }
+    const signals = sys.signalDescriptor()
+    const program_ended = run(console, signals)
+    // The program's status: it has usually ended already (its pty closed);
+    // one that is still running is hung up and given two seconds.
+    var status = pty.wait(childOf(console))
+    pty.hangUp(childOf(console))
+    var tries: usize = 0
+    while status == null && tries < 200 {
+        const slept = std.time.sleepNanoseconds(10000000)
+        status = pty.wait(childOf(console))
+        tries += 1
+    }
+    giveTtyBack(console)
+    input_module.close(inputOf(console))
+    framebuffer.close(fbOf(console))
+    // Stopped by a signal: 0; else the program's status.
+    if !program_ended || status == null { return 0 }
+    return @intCast(u8, status.? & 255)
+}

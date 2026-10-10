@@ -135,7 +135,11 @@ the monospaced font of `std.ui.text` and handles its keys and wheel, for
 `projects/desktop/terminal` and any app with a terminal pane. A
 `std.ui.host` app watches a descriptor (the pty) with `watchDescriptor()`
 and gets `EVENT_WATCH`; `plainTyped()` is the key's text without Control
-and Alt.
+and Alt. Without a compositor the same screen and drawing run on the
+Linux framebuffer (`projects/console`, mlx-console): `std.ui.text`'s
+`loadFontFile()` takes a font by path, and `std.ui.wayland.keyboard`
+reads keys from evdev with a keymap of the program's own through
+`useKeymap()` and `press()`.
 
 `std.crash` (`std/src/crash.mlx`) is a program's crash report: `install()`
 sets a signal handler on a stack of its own that names the signal, the

@@ -10,7 +10,7 @@
 # the session's environment runs it nested in one of those hosts instead.
 #
 # Installs:
-#   PREFIX/bin/mlx-compositor, PREFIX/bin/mlx-terminal, PREFIX/bin/mlx-sh, PREFIX/bin/mlx-session,
+#   PREFIX/bin/mlx-compositor, PREFIX/bin/mlx-terminal, PREFIX/bin/mlx-sh, PREFIX/bin/mlx-console, PREFIX/bin/mlx-session,
 #   PREFIX/bin/mlx-dock, PREFIX/bin/mlx-topbar, PREFIX/bin/mlx-launcher,
 #   PREFIX/bin/mlx-settings, PREFIX/bin/mlx-files, PREFIX/bin/mlx-codemap,
 #                                     PREFIX/bin/mlx-profile, PREFIX/bin/mlx-capture,
@@ -140,7 +140,7 @@ if [[ $replace_libpipewire -eq 1 && -n "$destdir" ]]; then
 fi
 
 bindir="$prefix/bin"
-programs=(mlx-compositor mlx-terminal mlx-sh mlx-session mlx-dock mlx-topbar mlx-launcher mlx-settings mlx-files mlx-observatory mlx-codemap mlx-profile mlx-capture mlx-ipcd mlx-ipc mlx-audiod mlx-audio mlx-permissions)
+programs=(mlx-compositor mlx-terminal mlx-sh mlx-console mlx-session mlx-dock mlx-topbar mlx-launcher mlx-settings mlx-files mlx-observatory mlx-codemap mlx-profile mlx-capture mlx-ipcd mlx-ipc mlx-audiod mlx-audio mlx-permissions)
 applications="$prefix/share/applications"
 icons="$prefix/share/icons/hicolor/128x128/apps"
 services="$prefix/share/mlx/dbus-1/services"
@@ -297,6 +297,7 @@ echo "building with $compiler"
 "$compiler" --quiet projects/desktop/compositor/main.mlx -o "$build/mlx-compositor"
 "$compiler" --quiet projects/desktop/terminal/main.mlx -o "$build/mlx-terminal"
 "$compiler" --quiet projects/shell/main.mlx -o "$build/mlx-sh"
+"$compiler" --quiet projects/console/main.mlx -o "$build/mlx-console"
 "$compiler" --quiet projects/desktop/dock/main.mlx -o "$build/mlx-dock"
 "$compiler" --quiet projects/desktop/topbar/main.mlx -o "$build/mlx-topbar"
 "$compiler" --quiet projects/desktop/launcher/main.mlx -o "$build/mlx-launcher"
@@ -322,14 +323,14 @@ sed "s|@BINDIR@|$bindir|g" projects/desktop/settings/mlx-settings.desktop.in > "
 sed "s|@BINDIR@|$bindir|g" projects/desktop/files/org.mlx.files.desktop.in > "$build/org.mlx.files.desktop"
 sed "s|@BINDIR@|$bindir|g; s|@ROOT@|$repo_root|g" projects/observatory/org.mlx.observatory.desktop.in > "$build/org.mlx.observatory.desktop"
 sed "s|@BINDIR@|$bindir|g" projects/desktop/compositor/session/mlx-compositor.desktop.in > "$build/mlx-compositor.desktop"
-echo "built $build/mlx-compositor, mlx-terminal, mlx-sh, mlx-dock, mlx-topbar, mlx-launcher, mlx-settings, mlx-files, mlx-observatory, mlx-profile, mlx-capture and its OBS plugin, mlx-ipcd and mlx-ipc, mlx-audiod and mlx-audio, mlx-permissions"
+echo "built $build/mlx-compositor, mlx-terminal, mlx-sh, mlx-console, mlx-dock, mlx-topbar, mlx-launcher, mlx-settings, mlx-files, mlx-observatory, mlx-profile, mlx-capture and its OBS plugin, mlx-ipcd and mlx-ipc, mlx-audiod and mlx-audio, mlx-permissions"
 echo "built $build/libpulse: MLX Audio's libpulse, libpulse-simple, libpulse-mainloop-glib and ALSA plugin${deb:+, the package mlx-audio-libs}"
 echo "built $build/libpipewire: MLX Capture's libpipewire${deb:+, the package mlx-capture-libs}"
 [[ $build_only -eq 1 ]] && exit 0
 
 # Install.
 as_owner "$destdir$bindir" install -d "$destdir$bindir"
-as_owner "$destdir$bindir" install -m 755 "$build/mlx-compositor" "$build/mlx-terminal" "$build/mlx-sh" "$build/mlx-dock" "$build/mlx-topbar" "$build/mlx-launcher" "$build/mlx-settings" "$build/mlx-files" "$build/mlx-observatory" "$build/mlx-profile" "$build/mlx-capture" "$build/mlx-ipcd" "$build/mlx-ipc" "$build/mlx-audiod" "$build/mlx-audio" "$build/mlx-permissions" projects/desktop/compositor/session/mlx-session "$destdir$bindir/"
+as_owner "$destdir$bindir" install -m 755 "$build/mlx-compositor" "$build/mlx-terminal" "$build/mlx-sh" "$build/mlx-console" "$build/mlx-dock" "$build/mlx-topbar" "$build/mlx-launcher" "$build/mlx-settings" "$build/mlx-files" "$build/mlx-observatory" "$build/mlx-profile" "$build/mlx-capture" "$build/mlx-ipcd" "$build/mlx-ipc" "$build/mlx-audiod" "$build/mlx-audio" "$build/mlx-permissions" projects/desktop/compositor/session/mlx-session "$destdir$bindir/"
 # The command line of the code map under its own name (the same program).
 as_owner "$destdir$bindir" ln -sf mlx-observatory "$destdir$bindir/mlx-codemap"
 as_owner "$destdir$sessions" install -d "$destdir$sessions"

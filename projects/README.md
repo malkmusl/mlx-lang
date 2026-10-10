@@ -38,6 +38,9 @@ projects/.../main.mlx -o ...`) and is checked by a script under `tools/`.
 - [`shell/`](shell/README.md): mlx-sh, the POSIX shell of MLX/Linux with
   a line editor (scripts as dash runs them, the shell of mlx-terminal and
   mlx-console); `tools/check_shell.sh`.
+- [`console/`](console/README.md): mlx-console, the terminal on the Linux
+  console without a compositor (framebuffer, evdev keyboards through the
+  xkb keymap, the shell on a pty); `tools/check_console.sh`.
 
 What the projects share beyond one project lives in `std` (`std.gpu`,
 `std.crash`, `std.timezone`, `std.ui`, `std.png`, `std.truetype`, ...).

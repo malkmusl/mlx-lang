@@ -23,7 +23,7 @@ compiler_args=()
 tools/install_compositor_session.sh --destdir "$work/root" --replace-sound-servers "${compiler_args[@]}" > "$work/install.log"
 bindir="$work/root/usr/local/bin"
 entry="$work/root/usr/share/wayland-sessions/mlx-compositor.desktop"
-for program in mlx-compositor mlx-terminal mlx-sh mlx-session mlx-dock mlx-topbar mlx-launcher mlx-settings mlx-files mlx-observatory mlx-codemap mlx-profile mlx-capture mlx-ipcd mlx-ipc mlx-audiod mlx-audio mlx-permissions; do
+for program in mlx-compositor mlx-terminal mlx-sh mlx-console mlx-session mlx-dock mlx-topbar mlx-launcher mlx-settings mlx-files mlx-observatory mlx-codemap mlx-profile mlx-capture mlx-ipcd mlx-ipc mlx-audiod mlx-audio mlx-permissions; do
     [[ -x "$bindir/$program" ]] || { echo "not installed: $program" >&2; cat "$work/install.log" >&2; exit 1; }
 done
 grep -qx "Exec=/usr/local/bin/mlx-session" "$entry" || { echo "session entry without the launcher:" >&2; cat "$entry" >&2; exit 1; }
