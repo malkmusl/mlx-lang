@@ -12,9 +12,10 @@
 # no symbol table, or knows no `_ = value`, or loses a slice's length when
 # it is assigned again, or stores a match's arms at their own widths, or
 # loads a signed if/match result unsigned, knows no --symbol-version,
-# gives an array whose length is a named constant no size, or makes no
-# data symbol of an export const), it builds them twice (mlx4 -> new mlx
-# -> mlx4 again).
+# gives an array whose length is a named constant no size, makes no
+# data symbol of an export const, knows no \xHH escapes, or loses the
+# length of a slice stored through its address), it builds them twice
+# (mlx4 -> new mlx -> mlx4 again).
 # Messages go to stderr.
 #
 #   compiler=$(tools/ensure_compiler.sh)
@@ -251,6 +252,40 @@ builds_mlxlibc() {
     return $ok
 }
 
+# Whether $1 decodes \xHH and \u{H..H} in string and character literals
+# (tests/302_string_escapes_runtime.mlx exits 13); older compilers took
+# "\x1b" as the bytes 'x', '1', 'b', and std.terminal needs ESC.
+decodes_escapes() {
+    local probe
+    probe=$(mktemp -d)
+    local ok=1
+    if "$1" --quiet tests/302_string_escapes_runtime.mlx -o "$probe/probe" > /dev/null 2>&1; then
+        local status=0
+        "$probe/probe" > /dev/null 2>&1 || status=$?
+        [[ $status -eq 13 ]] && ok=0
+    fi
+    rm -rf -- "$probe"
+    return $ok
+}
+
+# Whether a slice stored through its address (`into.* = text` in a callee,
+# `&local` passed on) keeps its length when the local reads it again
+# (tests/303_slice_address_runtime.mlx exits 13); older compilers kept
+# the words of such a local apart, so the store reached the pointer only,
+# and loaded one word of a slice through a pointer.
+stores_through_slice_addresses() {
+    local probe
+    probe=$(mktemp -d)
+    local ok=1
+    if "$1" --quiet tests/303_slice_address_runtime.mlx -o "$probe/probe" > /dev/null 2>&1; then
+        local status=0
+        "$probe/probe" > /dev/null 2>&1 || status=$?
+        [[ $status -eq 13 ]] && ok=0
+    fi
+    rm -rf -- "$probe"
+    return $ok
+}
+
 if [[ ! -x mlx-out/bin/compiler/mlx4 ]]; then
     if [[ ! -x zig-out/bin/mlx1 ]]; then
         if command -v zig > /dev/null; then
@@ -265,8 +300,8 @@ if [[ ! -x mlx-out/bin/compiler/mlx4 ]]; then
     zig-out/bin/mlx1 --quiet compiler/selfhost/main.mlx -o mlx-out/bin/compiler/mlx2
     mlx-out/bin/compiler/mlx2 --quiet compiler/selfhost/main.mlx -o mlx-out/bin/compiler/mlx3
     cp mlx-out/bin/compiler/mlx3 mlx-out/bin/compiler/mlx4
-elif ! writes_shared_objects mlx-out/bin/compiler/mlx4 || ! writes_symbol_tables mlx-out/bin/compiler/mlx4 || ! accepts_discards mlx-out/bin/compiler/mlx4 || ! keeps_slice_lengths mlx-out/bin/compiler/mlx4 || ! orders_import_cycles mlx-out/bin/compiler/mlx4 || ! has_large_arena mlx-out/bin/compiler/mlx4 || ! keeps_match_widths mlx-out/bin/compiler/mlx4 || ! extends_signed_results mlx-out/bin/compiler/mlx4 || ! writes_symbol_versions mlx-out/bin/compiler/mlx4 || ! resolves_named_array_lengths mlx-out/bin/compiler/mlx4 || ! exports_data mlx-out/bin/compiler/mlx4 || ! lowers_atomics mlx-out/bin/compiler/mlx4 || ! lowers_globals mlx-out/bin/compiler/mlx4 || ! builds_freestanding_plugins mlx-out/bin/compiler/mlx4 || ! lowers_thread_builtins mlx-out/bin/compiler/mlx4 || ! builds_mlxlibc mlx-out/bin/compiler/mlx4; then
-    echo "rebuilding mlx-out/bin/compiler/mlx4 from the current compiler sources (it lacks --shared objects, symbol tables, \`_ = value\`, slice lengths kept on assignment, import cycles broken in order, the 1 GiB arena, match values stored at their width, signed results sign-extended, symbol versions, array lengths from named constants, data symbols for export const, the atomic builtins, module-level var globals, plugins without libc on stack arenas, the thread builtins or what mlxlibc needs: @frameAddress, signed loads through pointers, array initializers of module vars, --entry and --init for plugins)" >&2
+elif ! writes_shared_objects mlx-out/bin/compiler/mlx4 || ! writes_symbol_tables mlx-out/bin/compiler/mlx4 || ! accepts_discards mlx-out/bin/compiler/mlx4 || ! keeps_slice_lengths mlx-out/bin/compiler/mlx4 || ! orders_import_cycles mlx-out/bin/compiler/mlx4 || ! has_large_arena mlx-out/bin/compiler/mlx4 || ! keeps_match_widths mlx-out/bin/compiler/mlx4 || ! extends_signed_results mlx-out/bin/compiler/mlx4 || ! writes_symbol_versions mlx-out/bin/compiler/mlx4 || ! resolves_named_array_lengths mlx-out/bin/compiler/mlx4 || ! exports_data mlx-out/bin/compiler/mlx4 || ! lowers_atomics mlx-out/bin/compiler/mlx4 || ! lowers_globals mlx-out/bin/compiler/mlx4 || ! builds_freestanding_plugins mlx-out/bin/compiler/mlx4 || ! lowers_thread_builtins mlx-out/bin/compiler/mlx4 || ! builds_mlxlibc mlx-out/bin/compiler/mlx4 || ! decodes_escapes mlx-out/bin/compiler/mlx4 || ! stores_through_slice_addresses mlx-out/bin/compiler/mlx4; then
+    echo "rebuilding mlx-out/bin/compiler/mlx4 from the current compiler sources (it lacks --shared objects, symbol tables, \`_ = value\`, slice lengths kept on assignment, import cycles broken in order, the 1 GiB arena, match values stored at their width, signed results sign-extended, symbol versions, array lengths from named constants, data symbols for export const, the atomic builtins, module-level var globals, plugins without libc on stack arenas, the thread builtins or what mlxlibc needs: @frameAddress, signed loads through pointers, array initializers of module vars, --entry and --init for plugins; or \\xHH escapes, or slices stored through their address keeping their length)" >&2
     mlx-out/bin/compiler/mlx4 --quiet compiler/selfhost/main.mlx -o mlx-out/bin/compiler/mlx4.next
     mlx-out/bin/compiler/mlx4.next --quiet compiler/selfhost/main.mlx -o mlx-out/bin/compiler/mlx4.fixed
     mv mlx-out/bin/compiler/mlx4.fixed mlx-out/bin/compiler/mlx4

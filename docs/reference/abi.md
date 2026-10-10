@@ -188,6 +188,18 @@ none) and an optional slice was one word, so its length was lost on the way
 generated Wayland requests (`wl_data_offer.accept`) are such optional
 slices.
 
+A local of several words (a slice, an optional slice, an error union)
+normally lives in one frame slot per word, which the optimizer forwards
+and promotes to registers. When the module takes the local's address
+(`&value`), its words share one block of the frame, pointer first and
+length 8 bytes after it, so a store through that address (`into.* = text`
+in a callee, `pointer.* = text` through a local pointer) changes every
+word the local reads back; and `pointer.*` of a pointer to such a type
+loads every word, so `into.*.length` is the length. Before, the words
+were kept apart and the store reached the pointer alone, while the load
+took one word (`tests/303_slice_address_runtime.mlx`, run by
+`tests/run_literals.sh`).
+
 ## Aggregate (struct/array) argument and return classification
 
 `AggregateClassification` in `mlxcc-x86_64.xml` fixes the size threshold:

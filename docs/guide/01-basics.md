@@ -89,6 +89,26 @@ fn main() u8 {
 
 (adapted from `tests/33_function_call_result_type.mlx`, which returns 42)
 
+## String and character literals
+
+A string literal is a `[]const u8` of the bytes between its quotes. The
+escapes are `\n`, `\r`, `\t`, `\0`, `\\`, `\"`, `\'`, `\xHH` (one byte from
+two hexadecimal digits) and `\u{H..H}` (a Unicode scalar of one to six
+hexadecimal digits, written as UTF-8). The length counts the bytes the
+escapes produce: `"\x1b[0m".length` is 4. A backslash before anything else
+is rejected by the lexer (`MLX-E1001`, "unknown escape in a quoted
+literal"). A character literal is the number of its one character, with
+the same escapes: `'A'` is 65, `'\x1b'` is 27, `'\u{20AC}'` is 8364 and
+`'ä'` 228.
+
+```mlx
+const escape = "\x1b[0m"
+const bell: u8 = '\x07'
+```
+
+(`tests/302_string_escapes_runtime.mlx`, run by `tests/run_literals.sh`
+together with the rejected escapes in `tests/support/escapes_invalid`)
+
 ## Core reflection/cast builtins
 
 A handful of builtins are used throughout the test suite for compile-time
