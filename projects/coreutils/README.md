@@ -1,8 +1,9 @@
 # MLX coreutils
 
 Dependency-free Linux userland programs written in MLX. Each utility lives in
-its own directory and imports only the MLX standard library plus the small
-set of CLI diagnostic helpers in `common.mlx`. Path manipulation and
+its own directory and imports only the MLX standard library plus the shared
+modules next to it: the CLI diagnostic helpers in `common.mlx`, the digests in
+`checksum.mlx`, and the base encodings in `codec.mlx`. Path manipulation and
 canonicalization, chmod-style mode parsing, sized-number/duration parsing,
 POSIX-ish word splitting, and calendar/timestamp parsing were generalized out
 of these examples into `std.path`, `std.mode`, `std.parse`, `std.shell`, and
@@ -43,6 +44,28 @@ Initial utilities:
 - `chown`, `chgrp`: numeric and named identities, filters, references, symlinks, and recursive traversal
 - `stat`: file, symlink, birth-time, identity, device, and filesystem metadata with custom formats
 - `ls`: owned directory scans, hidden-entry policies, type indicators, recursive traversal, metadata listings, and name/size/time/extension/version sorting
+- `fold`: byte, column, and space-aware line wrapping
+- `uniq`: duplicate filtering with counts, repeated/unique selection, skipped fields and characters, and case folding
+- `cut`: byte, character, and delimited field selection with ranges and complement
+- `comm`: three-column comparison of sorted files with column suppression and custom delimiters
+- `tr`: character translation, deletion, squeezing, ranges, POSIX classes, and complement sets
+- `expr`: integer arithmetic, comparisons, boolean operators, regex matching, and string functions
+- `test`, `[`: file tests, string and numeric comparisons, and boolean composition
+- `base64`, `base32`, `basenc`: encoding and decoding with wrapping, garbage skipping, and basenc's alphabets
+- `md5sum`, `sha1sum`, `sha224sum`, `sha256sum`, `sha384sum`, `sha512sum`: digests in MLX, BSD tags, and checksum-file verification modes
+- `sum`: BSD and System V checksums
+- `cksum`: CRC-32 plus the sysv, bsd, and hash algorithms with tagged output
+- `b2sum`: BLAKE2b-512 digests and checksum-file verification
+- `expand`, `unexpand`: tab/space conversion with tab width, initial-only, and all/first-only modes
+- `paste`: serial and parallel line merging with delimiter lists and NUL records
+- `shuf`: Fisher-Yates permutations of lines, arguments, and ranges with head counts, repeats, and random sources
+- `date`: current, epoch, reference-file, and ISO/RFC-style dates with format specifiers and UTC
+- `sort`: byte-order sorting with keys, field separators, numeric/reverse/unique/stable modes, checks, and output files
+- `join`: relational joins on sorted files with unpaired lines, empty fills, field selection, headers, and case folding
+- `split`: line, byte, and line-byte splitting with suffix lengths, numeric/hex suffixes, and separators
+- `fmt`: paragraph reflow with width, uniform spacing, and split-only modes
+- `csplit`: context splits by line numbers and regular expressions with repetition, prefixes, digits, and kept files
+- `pr`: single-column pagination with headers, line numbers, indentation, double spacing, and form feeds
 
 Build all utilities with the self-hosted compiler:
 
