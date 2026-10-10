@@ -148,7 +148,9 @@ reads keys from evdev with a keymap of the program's own through
 `std.crash` (`std/src/crash.mlx`) is a program's crash report: `install()`
 sets a signal handler on a stack of its own that names the signal, the
 function and its callers (from the symbol table the compiler writes, see
-[formats](formats.md)) and keeps the crash in
+[formats](formats.md); a frame in a module loaded from a memfd, as the
+compositor's shell module is, is named through `/proc/self/fd`) and keeps
+the crash in
 `$XDG_STATE_HOME/mlx/crashes.log`; `fail(reason)` ends the program the same
 way for a failure it cannot go on after. The report goes to stderr. Every
 desktop program, every coreutil and mlxlibc (for the programs its loader

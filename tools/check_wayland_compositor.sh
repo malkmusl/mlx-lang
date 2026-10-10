@@ -95,9 +95,10 @@ run_scenario() {
     wait "$host_pid" || { echo "test host failed ($name):" >&2; cat "$work/$name-host.log" >&2; exit 1; }
 }
 
-# Scenario 1: Mlx terminals.
+# Scenario 1: Mlx terminals (the terminal's title follows its shell once
+# bash names it, so the log lines are matched by their kind alone).
 cat > "$work/terminal.script" <<SCRIPT
-wait 1500
+wait 2500
 pointer 200 200
 press 272
 release 272
@@ -138,7 +139,7 @@ run_scenario terminal "$work/terminal.script" --terminal "$work/mlx-terminal" --
 echo "ok   keys typed on the host reached the shell in the Mlx terminal"
 [[ $(grep -c "^map: Mlx Terminal" "$work/terminal-compositor.log") -eq 2 ]] || { echo "Alt+Enter did not open a second terminal" >&2; exit 1; }
 echo "ok   Alt+Enter launched a second terminal"
-grep -q "^move: Mlx Terminal" "$work/terminal-compositor.log" || { echo "Alt+drag did not start a move" >&2; exit 1; }
+grep -q "^move: " "$work/terminal-compositor.log" || { echo "Alt+drag did not start a move" >&2; exit 1; }
 [[ "$(cat "$work/second.marker" 2> /dev/null)" == "moved" ]] || { echo "keyboard input did not reach the second terminal" >&2; exit 1; }
 # The second window starts at (64, 56); dragging by (+120, +80) puts its
 # focus frame's left edge at x = 182..183, from y = 136 down.
@@ -172,7 +173,7 @@ shot $work/title.ppm
 close
 SCRIPT
 run_scenario title "$work/title.script" --terminal "$work/mlx-terminal" --run "$work/mlx-terminal"
-grep -q "^move: Mlx Terminal" "$work/title-compositor.log" || { echo "dragging the title bar did not move the window" >&2; cat "$work/title-compositor.log" >&2; exit 1; }
+grep -q "^move: " "$work/title-compositor.log" || { echo "dragging the title bar did not move the window" >&2; cat "$work/title-compositor.log" >&2; exit 1; }
 # The window starts at (24, 24) and moves by (+100, +100): its frame's left
 # edge is at x = 122, its title bar spans y = 102..121 (rounded above
 # y = 116).
@@ -326,6 +327,45 @@ for x, y in ((40, 40), (170, 90), (100, 140), (60, 90)):
     assert rgb(x, y) != green, ("window pixel", x, y, rgb(x, y))
 PY
 echo "ok   a subsurface is drawn at its offset in its window"
+
+# Scenario 5b: the pointer over a subsurface that its client then destroys
+# (--subsurface-gone destroys it on the first pointer enter). A subsurface
+# is never "mapped", so the compositor once kept its pointer focus on the
+# freed surface and crashed in sameClient on the next motion.
+cat > "$work/subsurface-gone.sh" <<SCRIPT
+#!/bin/sh
+exec "$work/hello-wayland" --subsurface-gone > "$work/subsurface-gone-client.log" 2>&1
+SCRIPT
+chmod +x "$work/subsurface-gone.sh"
+cat > "$work/subsurface-gone.script" <<SCRIPT
+wait 1500
+pointer 100 90
+wait 600
+pointer 110 95
+pointer 120 100
+pointer 60 60
+pointer 100 90
+wait 400
+shot $work/subsurface-gone.ppm
+close
+SCRIPT
+run_scenario subsurface-gone "$work/subsurface-gone.script" --run "$work/subsurface-gone.sh"
+grep -q "subsurface destroyed on pointer enter" "$work/subsurface-gone-client.log" || { echo "the client did not destroy its subsurface:" >&2; cat "$work/subsurface-gone-client.log" >&2; exit 1; }
+grep -q "crash" "$work/subsurface-gone-compositor.log" && { echo "the compositor crashed after the subsurface went:" >&2; cat "$work/subsurface-gone-compositor.log" >&2; exit 1; }
+python3 - "$work/subsurface-gone.ppm" <<'PY'
+import sys
+data = open(sys.argv[1], 'rb').read()
+header, rest = data.split(b'\n', 1)
+size, rest = rest.split(b'\n', 1)
+_, pixels = rest.split(b'\n', 1)
+width, height = map(int, size.split())
+def rgb(x, y):
+    offset = (y * width + x) * 3
+    return tuple(pixels[offset:offset + 3])
+for x, y in ((64, 54), (100, 90), (163, 133)):
+    assert rgb(x, y) != (0, 255, 0), ("the subsurface is still drawn", x, y)
+PY
+echo "ok   the pointer moves on after the subsurface under it is destroyed"
 
 # Scenario 8: xdg-decoration. The client asks for client-side decorations;
 # the compositor answers server side (its default), client side once the
@@ -758,13 +798,30 @@ fi
 # Scenario 7: a GTK 4 application (GTK 4 needs wl_data_device_manager to
 # use a Wayland display at all), if available.
 if command -v gtk4-widget-factory > /dev/null && command -v dbus-run-session > /dev/null; then
+    # A session bus that activates no service: GTK still asks the portals
+    # (org.freedesktop.portal.Desktop) for its settings, and where they are
+    # installed but no desktop runs them, their activation can take longer
+    # than this scenario waits, or mount the document portal under
+    # XDG_RUNTIME_DIR; on this bus the name is unknown at once and GTK
+    # goes on without it.
+    cat > "$work/session.conf" <<'CONF'
+<!DOCTYPE busconfig PUBLIC "-//freedesktop//DTD D-Bus Bus Configuration 1.0//EN" "http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">
+<busconfig>
+  <type>session</type>
+  <listen>unix:tmpdir=/tmp</listen>
+  <policy context="default">
+    <allow send_destination="*" eavesdrop="true"/>
+    <allow eavesdrop="true"/>
+    <allow own="*"/>
+  </policy>
+</busconfig>
+CONF
     cat > "$work/gtk4.sh" <<SCRIPT
 #!/bin/sh
 unset DISPLAY
-# No portals: they would mount the document portal under XDG_RUNTIME_DIR.
-# No accessibility bus either: both can take seconds to start (or time out)
-# where the desktop's services are installed but not running.
-GDK_DEBUG=no-portals GTK_A11Y=none NO_AT_BRIDGE=1 exec dbus-run-session gtk4-widget-factory
+# No portals, no accessibility bus: both can take seconds to start (or
+# time out) where the desktop's services are installed but not running.
+GDK_DEBUG=no-portals GTK_A11Y=none NO_AT_BRIDGE=1 exec dbus-run-session --config-file="$work/session.conf" gtk4-widget-factory
 SCRIPT
     chmod +x "$work/gtk4.sh"
     printf 'wait 12000\nclose\n' > "$work/gtk4.script"
