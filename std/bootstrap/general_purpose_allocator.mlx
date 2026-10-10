@@ -1,0 +1,307 @@
+// The general-purpose allocator (spec/04-stdlib/mem.xml's
+// GeneralPurposeAllocator): a heap for blocks of any size that are freed
+// in any order, behind the same Allocator interface as the arena and the
+// fixed buffer, for every thread of a process at once.
+//
+// Small blocks (up to 32 KiB) come from size classes: each class carves
+// its blocks out of slabs of SLAB bytes taken from the child allocator (the
+// page allocator) and keeps the freed ones on a list threaded through the
+// blocks themselves, so a free costs a few stores and the next allocation
+// of that size gets the block back. A power-of-two class in a page-aligned
+// slab has its blocks aligned to the class size, which is how alignments
+// above 16 are met. Larger blocks are a mapping of their own from the
+// child, page-rounded; one aligned beyond a page gets a header before it
+// that names the mapping. The interface carries the length and alignment
+// into free, as Zig's does, so no block needs a header of its own.
+//
+// One lock (a futex word) covers the lists: taken with a compare-exchange,
+// slept on through the kernel when contended.
+const allocator_module = @import("./allocator.mlx")
+const linux = @import("./os/linux.mlx")
+const mem = @import("./mem.mlx")
+
+pub const Allocator = allocator_module.Allocator
+
+pub const CLASS_COUNT: usize = 22
+pub const SLAB: usize = 262144
+pub const LARGEST_CLASS: usize = 32768
+const PAGE: usize = 4096
+// The slab record (the next slab, for deinit) sits in the slab's last
+// RECORD bytes.
+const RECORD: usize = 16
+
+pub const Heap = struct {
+    child: Allocator
+    lock: u32
+    // Per class: the first free block (0: none), and the slab space not yet
+    // carved (cursor < limit).
+    freeLists: [CLASS_COUNT]usize
+    cursor: [CLASS_COUNT]usize
+    limit: [CLASS_COUNT]usize
+    // The slabs, newest first, through their records.
+    slabs: usize
+    slabCount: usize
+    // Bytes the program holds (as it asked for them) and large mappings
+    // out at the moment.
+    liveBytes: usize
+    largeCount: usize
+}
+
+// The classes, every one a multiple of 16 (so a block of any class is
+// 16-aligned, as C's malloc promises): 16, 32, 48, then 64 .. 32768 in
+// steps of a half power of two.
+fn classSize(index: usize) -> usize {
+    if index == 0 { return 16 }
+    if index == 1 { return 32 }
+    if index == 2 { return 48 }
+    const step = index - 3
+    const base: usize = @intCast(usize, 64) << @intCast(u6, step / 2)
+    return if step % 2 == 0 { base } else { base + base / 2 }
+}
+
+fn roundUpPowerOfTwo(value: usize) -> usize {
+    var power: usize = 16
+    while power < value { power *= 2 }
+    return power
+}
+
+// The class a block of `length` bytes at `alignment` comes from, or
+// CLASS_COUNT when it is a large block. Alignments above 16 need a
+// power-of-two class at least as large as the alignment (and no more than
+// a page, the slab's own alignment).
+fn classFor(length: usize, alignment: usize) -> usize {
+    var wanted = length
+    if alignment > 16 {
+        if alignment > PAGE { return CLASS_COUNT }
+        wanted = roundUpPowerOfTwo(if length > alignment { length } else { alignment })
+    }
+    if wanted > LARGEST_CLASS { return CLASS_COUNT }
+    var index: usize = 0
+    while index < CLASS_COUNT {
+        const size = classSize(index)
+        if size >= wanted && (alignment <= 16 || size == wanted) { return index }
+        index += 1
+    }
+    return CLASS_COUNT
+}
+
+fn readWord(address: usize) -> usize {
+    unsafe { return @ptrFromInt(*const usize, address).* }
+}
+
+fn writeWord(address: usize, value: usize) -> void {
+    unsafe { @ptrFromInt(*usize, address).* = value }
+}
+
+// The lock: 0 free, 1 taken, 2 taken with waiters (Drepper's second
+// mutex). The fast path is one compare-exchange; a loser marks the word
+// contended and sleeps on it until the holder's release wakes it. (The
+// casts: sema types `&heap.*.lock` as a const pointer.)
+fn acquire(heap: *Heap) -> void {
+    const word = @ptrCast(*u32, &heap.*.lock)
+    const fast = @cmpxchgWeak(u32, word, 0, 1, acquire, monotonic)
+    if fast.0 { return }
+    while true {
+        const previous = @atomicRmw(u32, word, xchg, 2, acquire)
+        if previous == 0 { return }
+        const slept = linux.thread.futexWait(word, 2, 0, true)
+    }
+}
+
+fn release(heap: *Heap) -> void {
+    const word = @ptrCast(*u32, &heap.*.lock)
+    const previous = @atomicRmw(u32, word, xchg, 0, release)
+    if previous == 2 { const woken = linux.thread.futexWake(word, 1, true) }
+}
+
+// A new slab for `class`: the record at its end, the blocks before it.
+fn addSlab(heap: *Heap, class: usize) -> bool {
+    const slab = heap.*.child.alloc(SLAB, PAGE)
+    if slab == null { return false }
+    const base = @intFromPtr(slab.?)
+    writeWord(base + SLAB - RECORD, heap.*.slabs)
+    writeWord(base + SLAB - RECORD + 8, class)
+    heap.*.slabs = base
+    heap.*.slabCount += 1
+    const size = classSize(class)
+    heap.*.cursor[class] = base
+    heap.*.limit[class] = base + (SLAB - RECORD) / size * size
+    return true
+}
+
+fn takeBlock(heap: *Heap, class: usize) -> usize {
+    const head = heap.*.freeLists[class]
+    if head != 0 {
+        heap.*.freeLists[class] = readWord(head)
+        return head
+    }
+    if heap.*.cursor[class] >= heap.*.limit[class] && !addSlab(heap, class) { return 0 }
+    const block = heap.*.cursor[class]
+    heap.*.cursor[class] += classSize(class)
+    return block
+}
+
+fn pageRound(length: usize) -> usize { return (length + PAGE - 1) / PAGE * PAGE }
+
+// A large block: its own mapping. Aligned beyond a page, the mapping is
+// over-allocated and the block starts at the first aligned address after
+// a header word pair naming the mapping's base and size.
+fn largeAlloc(heap: *Heap, length: usize, alignment: usize) -> ?[*]u8 {
+    if alignment <= PAGE {
+        const block = heap.*.child.alloc(pageRound(length), PAGE)
+        if block != null { heap.*.largeCount += 1 }
+        return block
+    }
+    const total = pageRound(length + alignment + RECORD)
+    const mapping = heap.*.child.alloc(total, PAGE)
+    if mapping == null { return null }
+    const base = @intFromPtr(mapping.?)
+    const start = (base + RECORD + alignment - 1) / alignment * alignment
+    writeWord(start - RECORD, base)
+    writeWord(start - RECORD + 8, total)
+    heap.*.largeCount += 1
+    unsafe { return @ptrFromInt([*]u8, start) }
+}
+
+fn largeFree(heap: *Heap, memory: [*]u8, length: usize, alignment: usize) -> void {
+    heap.*.largeCount -= 1
+    if alignment <= PAGE {
+        heap.*.child.free(memory, pageRound(length), PAGE)
+        return
+    }
+    const start = @intFromPtr(memory)
+    unsafe { heap.*.child.free(@ptrFromInt([*]u8, readWord(start - RECORD)), readWord(start - RECORD + 8), PAGE) }
+}
+
+fn heapAlloc(context: *anyopaque, length: usize, alignment: usize) -> ?[*]u8 {
+    if length == 0 { return null }
+    var heap: *Heap = undefined
+    unsafe { heap = @ptrCast(*Heap, context) }
+    const class = classFor(length, alignment)
+    acquire(heap)
+    var result: ?[*]u8 = null
+    if class == CLASS_COUNT {
+        result = largeAlloc(heap, length, alignment)
+    } else {
+        const block = takeBlock(heap, class)
+        if block != 0 { unsafe { result = @ptrFromInt([*]u8, block) } }
+    }
+    if result != null { heap.*.liveBytes += length }
+    release(heap)
+    return result
+}
+
+// In place when the new length stays in the block's class (or the large
+// block's pages); the length accounting follows.
+fn heapResize(context: *anyopaque, memory: [*]u8, length: usize, alignment: usize, new_length: usize) -> bool {
+    if new_length == 0 { return false }
+    var heap: *Heap = undefined
+    unsafe { heap = @ptrCast(*Heap, context) }
+    const class = classFor(length, alignment)
+    var fits = false
+    if class == CLASS_COUNT {
+        fits = classFor(new_length, alignment) == CLASS_COUNT && pageRound(new_length) == pageRound(length)
+    } else {
+        fits = classFor(new_length, alignment) == class
+    }
+    if !fits { return false }
+    acquire(heap)
+    heap.*.liveBytes = heap.*.liveBytes + new_length - length
+    release(heap)
+    return true
+}
+
+fn heapRemap(context: *anyopaque, memory: [*]u8, length: usize, alignment: usize, new_length: usize) -> ?[*]u8 {
+    if heapResize(context, memory, length, alignment, new_length) { return memory }
+    const replacement = heapAlloc(context, new_length, alignment)
+    if replacement == null { return null }
+    const result = replacement.?
+    mem.copy(result, memory, if length < new_length { length } else { new_length })
+    heapFree(context, memory, length, alignment)
+    return result
+}
+
+fn heapFree(context: *anyopaque, memory: [*]u8, length: usize, alignment: usize) -> void {
+    if length == 0 { return }
+    var heap: *Heap = undefined
+    unsafe { heap = @ptrCast(*Heap, context) }
+    const class = classFor(length, alignment)
+    acquire(heap)
+    heap.*.liveBytes -= length
+    if class == CLASS_COUNT {
+        largeFree(heap, memory, length, alignment)
+    } else {
+        const block = @intFromPtr(memory)
+        writeWord(block, heap.*.freeLists[class])
+        heap.*.freeLists[class] = block
+    }
+    release(heap)
+}
+
+pub fn init(child: Allocator) -> Heap {
+    var heap = Heap.{
+        .child = child,
+        .lock = 0,
+        .freeLists = undefined,
+        .cursor = undefined,
+        .limit = undefined,
+        .slabs = 0,
+        .slabCount = 0,
+        .liveBytes = 0,
+        .largeCount = 0,
+    }
+    var index: usize = 0
+    while index < CLASS_COUNT {
+        heap.freeLists[index] = 0
+        heap.cursor[index] = 0
+        heap.limit[index] = 0
+        index += 1
+    }
+    return heap
+}
+
+pub fn interface(heap: *Heap) -> Allocator {
+    unsafe {
+        return Allocator.{
+            .context = @ptrCast(*anyopaque, heap),
+            .allocFn = heapAlloc,
+            .resizeFn = heapResize,
+            .remapFn = heapRemap,
+            .freeFn = heapFree,
+        }
+    }
+}
+
+// Gives the slabs back (large blocks still out stay the program's to
+// free); the heap is empty afterwards and usable again.
+pub fn deinit(heap: *Heap) -> void {
+    var slab = heap.*.slabs
+    while slab != 0 {
+        const next = readWord(slab + SLAB - RECORD)
+        unsafe { heap.*.child.free(@ptrFromInt([*]u8, slab), SLAB, PAGE) }
+        slab = next
+    }
+    heap.*.slabs = 0
+    heap.*.slabCount = 0
+    var index: usize = 0
+    while index < CLASS_COUNT {
+        heap.*.freeLists[index] = 0
+        heap.*.cursor[index] = 0
+        heap.*.limit[index] = 0
+        index += 1
+    }
+}
+
+// The bytes the program holds through this heap (as it asked for them).
+pub fn liveBytes(heap: *Heap) -> usize { return heap.*.liveBytes }
+
+pub fn slabCount(heap: *Heap) -> usize { return heap.*.slabCount }
+
+pub fn largeCount(heap: *Heap) -> usize { return heap.*.largeCount }
+
+// The class size a block of `length` bytes at `alignment` occupies, 0 for a
+// large block (tests and the C library's malloc_usable_size).
+pub fn blockSize(length: usize, alignment: usize) -> usize {
+    const class = classFor(length, alignment)
+    return if class == CLASS_COUNT { 0 } else { classSize(class) }
+}

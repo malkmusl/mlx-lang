@@ -107,6 +107,20 @@ library.mlx_plugin_level_now.argtypes = []
 assert library.mlx_plugin_level_now() == 7
 level.value = 9
 assert library.mlx_plugin_level_now() == 9, library.mlx_plugin_level_now()
+# An exported global (`export var`): one word, read and written by the
+# plugin's own code and by the host.
+library.mlx_plugin_count.restype = ctypes.c_uint64
+library.mlx_plugin_count.argtypes = []
+library.mlx_plugin_private_calls.restype = ctypes.c_uint64
+library.mlx_plugin_private_calls.argtypes = []
+calls = ctypes.c_uint64.in_dll(library, "mlx_plugin_calls")
+assert calls.value == 0, calls.value
+assert library.mlx_plugin_count() == 1
+assert calls.value == 1, calls.value
+calls.value = 40
+assert library.mlx_plugin_count() == 41
+assert calls.value == 41, calls.value
+assert library.mlx_plugin_private_calls() == 2
 PY
     then
         if command -v readelf > /dev/null && ! readelf --dyn-syms "$work/libplugin.so" | grep -q "OBJECT.*mlx_plugin_level"; then
@@ -114,7 +128,12 @@ PY
             readelf --dyn-syms "$work/libplugin.so"
             failures=$((failures + 1))
         fi
-        echo "ok   --plugin: a C host calls its exports on four threads, each call on its own arena; an export const is its data symbol"
+        if command -v readelf > /dev/null && ! readelf --dyn-syms "$work/libplugin.so" | grep -q " 8 OBJECT.*mlx_plugin_calls"; then
+            echo "FAIL --plugin: mlx_plugin_calls is not an 8-byte OBJECT symbol"
+            readelf --dyn-syms "$work/libplugin.so"
+            failures=$((failures + 1))
+        fi
+        echo "ok   --plugin: a C host calls its exports on four threads, each call on its own arena; export const and export var are its data symbols"
     else
         echo "FAIL --plugin"
         cat "$work/output"
@@ -161,6 +180,103 @@ PY
     fi
 else
     echo "FAIL (compile) tests/support/plugin_library.mlx --soname --symbol-version"
+    cat "$work/errors"
+    failures=$((failures + 1))
+fi
+
+# A plugin without a C library (--plugin --stack-arena --no-libc): no
+# DT_NEEDED at all, and its exports take their arena from their own stack,
+# so a call makes no system call (strace sees no arena mapping, where it
+# is installed). The host calls it on four threads at once as above.
+if ! command -v python3 > /dev/null; then
+    echo "skip --stack-arena --no-libc (no python3)"
+elif "$compiler" --quiet --plugin --stack-arena --no-libc tests/support/plugin_freestanding.mlx -o "$work/libfree.so" 2> "$work/errors"; then
+    if python3 - "$work/libfree.so" > "$work/output" 2>&1 <<'PY'
+import ctypes, sys, threading
+library = ctypes.CDLL(sys.argv[1])
+library.mlx_free_sum.restype = ctypes.c_int64
+library.mlx_free_sum.argtypes = [ctypes.c_int64]
+library.mlx_free_count.restype = ctypes.c_uint64
+library.mlx_free_count.argtypes = []
+def resident():
+    return int(open('/proc/self/statm').read().split()[1])
+failures = []
+def work():
+    for _ in range(2000):
+        if library.mlx_free_sum(1000) != 4 * 999 * 1000 // 2:
+            failures.append('sum')
+before = resident()
+threads = [threading.Thread(target=work) for _ in range(4)]
+for thread in threads: thread.start()
+for thread in threads: thread.join()
+grown = resident() - before
+assert not failures, failures[:3]
+assert grown < 4096, grown
+calls = ctypes.c_uint64.in_dll(library, "mlx_free_calls")
+assert library.mlx_free_count() == 1 and calls.value == 1, calls.value
+calls.value = 10
+assert library.mlx_free_count() == 11
+PY
+    then
+        if command -v readelf > /dev/null && readelf -d "$work/libfree.so" | grep -q "NEEDED"; then
+            echo "FAIL --no-libc: the plugin still needs a library"
+            readelf -d "$work/libfree.so"
+            failures=$((failures + 1))
+        elif command -v strace > /dev/null && strace -f -e trace=mmap,munmap -o "$work/strace" python3 -c "
+import ctypes, sys
+library = ctypes.CDLL(sys.argv[1])
+library.mlx_free_sum.restype = ctypes.c_int64
+library.mlx_free_sum.argtypes = [ctypes.c_int64]
+for _ in range(200): library.mlx_free_sum(100)
+" "$work/libfree.so" > "$work/output" 2>&1 && grep -q "268435464" "$work/strace"; then
+            echo "FAIL --stack-arena: the exports still map an arena per call"
+            grep "268435464" "$work/strace" | head -3
+            failures=$((failures + 1))
+        else
+            echo "ok   --stack-arena --no-libc: a plugin without libc, its exports on stack arenas (no system call per call)"
+        fi
+    else
+        echo "FAIL --stack-arena --no-libc"
+        cat "$work/output"
+        failures=$((failures + 1))
+    fi
+else
+    echo "FAIL (compile) tests/support/plugin_freestanding.mlx"
+    cat "$work/errors"
+    failures=$((failures + 1))
+fi
+
+# A plugin with --entry and --init (tests/support/plugin_entry.mlx): run as
+# a program it starts at its entry (no PT_INTERP: the kernel enters it
+# directly) and exits with argc + 6; loaded by the dynamic linker, its
+# DT_INIT has run before the host's first call.
+if "$compiler" --quiet --plugin --stack-arena --no-libc --entry=mlx_entry_start --init=mlx_entry_init tests/support/plugin_entry.mlx -o "$work/libentry.so" 2> "$work/errors"; then
+    chmod +x "$work/libentry.so"
+    status=0
+    "$work/libentry.so" || status=$?
+    status_two=0
+    "$work/libentry.so" one two || status_two=$?
+    if [[ $status -ne 7 || $status_two -ne 9 ]]; then
+        echo "FAIL --entry: the plugin run as a program exited $status and $status_two (7 and 9 expected)"
+        failures=$((failures + 1))
+    elif command -v readelf > /dev/null && readelf -l "$work/libentry.so" | grep -q "INTERP"; then
+        echo "FAIL --entry: the shared object still names an interpreter"
+        failures=$((failures + 1))
+    elif command -v python3 > /dev/null && ! python3 -c "
+import ctypes, sys
+library = ctypes.CDLL(sys.argv[1])
+library.mlx_entry_ready_now.restype = ctypes.c_uint64
+assert library.mlx_entry_ready_now() == 7, library.mlx_entry_ready_now()
+assert ctypes.c_uint64.in_dll(library, 'mlx_entry_ready').value == 7
+" "$work/libentry.so" > "$work/output" 2>&1; then
+        echo "FAIL --init: the initializer did not run when the dynamic linker loaded the plugin"
+        cat "$work/output"
+        failures=$((failures + 1))
+    else
+        echo "ok   --entry --init: a plugin runs as a program from its entry, and its initializer runs when loaded"
+    fi
+else
+    echo "FAIL (compile) tests/support/plugin_entry.mlx"
     cat "$work/errors"
     failures=$((failures + 1))
 fi

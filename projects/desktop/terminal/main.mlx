@@ -1,456 +1,325 @@
-// A small Wayland terminal emulator written with std.wayland.
-//
-// It runs a shell on a pseudo-terminal, shows its output in an xdg_toplevel
-// window rendered with a built-in 8x8 bitmap font (80x24 cells to start
-// with; the window follows the size its compositor configures, and the
-// shell learns the new size), and sends keyboard input (US layout, with
-// Shift, Ctrl, Caps Lock and key repeat) to the shell. Output is interpreted as a dumb terminal (TERM=dumb) with a
-// small escape-sequence subset; see screen.mlx.
+// mlx-terminal: the terminal emulator of the Mlx desktop, a window
+// (std.ui.host) around std.terminal: it runs a shell on a pseudo-terminal
+// (std.terminal.pty), draws the screen with the monospaced TrueType font
+// of std.ui.text (std.truetype, any size) through std.ui.terminal, and
+// sends what is typed as the compositor's keymap says it (std.xkb through
+// the host: any layout, AltGr, Ctrl on any key) encoded as xterm does
+// (std.terminal.keys). TERM is xterm-256color. The window follows the size
+// its compositor configures, in whole cells, and the shell learns each new
+// size (TIOCSWINSZ). The wheel and Shift+Page Up/Down scroll through the
+// history; the title follows the program's (OSC 0 and 2).
 //
 //     mlx4 projects/desktop/terminal/main.mlx -o mlx-terminal
-//     ./mlx-terminal                  # runs /bin/sh
-//     ./mlx-terminal /bin/bash -l     # runs the given program (absolute path)
+//     ./mlx-terminal                       # $SHELL, else mlx-sh beside it or installed, else /bin/sh
+//     ./mlx-terminal /bin/bash -l          # another program (absolute path)
+//     ./mlx-terminal --font-size 18        # or MLX_TERMINAL_FONT_SIZE
+//     ./mlx-terminal --columns 120 --rows 40
 //
-// projects/desktop/compositor launches it with Alt+Enter.
-
+// projects/desktop/compositor launches it with Alt+Enter. The same
+// std.terminal and std.ui.terminal draw the console without a compositor
+// (projects/desktop/console) and a terminal pane in any std.ui app.
 const std = @import("std")
-const wl = @import("std.wayland")
-const screens = @import("./screen.mlx")
-const keys = @import("std.ui.wayland.us_layout")
-const pty = @import("./pty.mlx")
+const ui = @import("std.ui")
+const app = @import("std.ui.app")
+const host = @import("std.ui.host")
+const text = @import("std.ui.text")
+const ui_terminal = @import("std.ui.terminal")
+const terminal = @import("std.terminal")
+const pty = @import("std.terminal.pty")
 const crash = @import("std.crash")
-const wayland_crash = @import("std.wayland.crash")
 
-// Two frames of the largest size; only the pages of the current size are
-// ever touched.
-const FRAME_SIZE: usize = 2 * screens.MAX_PIXEL_WIDTH * screens.MAX_PIXEL_HEIGHT * 4
+const DEFAULT_COLUMNS: usize = 80
+const DEFAULT_ROWS: usize = 24
+const DEFAULT_FONT_HEIGHT: i32 = 15
+const HISTORY_LINES: usize = 5000
+const PADDING: i32 = 6
+const READ_CAPACITY: usize = 65536
 
-const App = struct {
-    display: wl.client.Display
-    registry: wl.wl_registry.Proxy
-    compositor: wl.wl_compositor.Proxy
-    shm: wl.wl_shm.Proxy
-    wmBase: wl.xdg_wm_base.Proxy
-    seat: wl.wl_seat.Proxy
-    keyboard: wl.wl_keyboard.Proxy
-    hasCompositor: bool
-    hasShm: bool
-    hasWmBase: bool
-    hasSeat: bool
-    hasKeyboard: bool
-    surface: wl.wl_surface.Proxy
-    xdgSurface: wl.xdg_surface.Proxy
-    toplevel: wl.xdg_toplevel.Proxy
-    memory: wl.SharedMemory
-    pool: wl.wl_shm_pool.Proxy
-    // The buffers' size (they are made again when it changes), and the
-    // window size the compositor asked for last (0: none).
-    bufferWidth: usize
-    bufferHeight: usize
-    wantedWidth: i32
-    wantedHeight: i32
-    firstBuffer: wl.wl_buffer.Proxy
-    secondBuffer: wl.wl_buffer.Proxy
-    firstBusy: bool
-    secondBusy: bool
-    configured: bool
-    framePending: bool
-    dirty: bool
-    running: bool
-    screen: *screens.Screen
+const Terminal = struct {
+    host: *host.Host
+    screen: terminal.Screen
+    mono: text.Text
+    view: ui_terminal.View
     child: pty.Child
     hasChild: bool
-    shift: bool
-    control: bool
-    caps: bool
-    repeatKey: u32
-    repeating: bool
-    repeatAt: usize
-    repeatInterval: usize
-    repeatDelay: usize
+    fontHeight: i32
+    columns: usize
+    rows: usize
+    width: i32
+    height: i32
+    status: u8
+    input: [READ_CAPACITY]u8
 }
 
-fn appOf(context: *anyopaque) -> *App {
-    unsafe { return @ptrCast(*App, context) }
+fn terminalOf(context: *anyopaque) -> *Terminal {
+    unsafe { return @ptrCast(*Terminal, context) }
 }
 
-fn contextOf(app: *App) -> *anyopaque {
-    unsafe { return @ptrCast(*anyopaque, app) }
+fn screenOf(terminal_state: *Terminal) -> *terminal.Screen {
+    unsafe { return @ptrCast(*terminal.Screen, &terminal_state.*.screen) }
 }
 
-fn minimum(left: u32, right: u32) -> u32 {
-    return if left < right { left } else { right }
+fn viewOf(terminal_state: *Terminal) -> *ui_terminal.View {
+    unsafe { return @ptrCast(*ui_terminal.View, &terminal_state.*.view) }
 }
 
-fn isNamed(value: wl.String, name: []const u8) -> bool {
-    return std.string.eql(value, std.string.fromSlice(name))
+fn monoOf(terminal_state: *Terminal) -> *text.Text {
+    unsafe { return @ptrCast(*text.Text, &terminal_state.*.mono) }
 }
 
-// ---------------------------------------------------------------------------
-// Keyboard
-
-fn sendKey(app: *App, key: u32) -> void {
-    var bytes: [4]u8 = undefined
-    var length: usize = 0
-    unsafe { length = keys.encode(key, app.*.shift, app.*.control, app.*.caps, @ptrCast([*]u8, &bytes)) }
-    if length == 0 { return }
-    const child = app.*.child
-    unsafe { pty.write(&child, @ptrCast([*]const u8, &bytes), length) }
+fn childOf(terminal_state: *Terminal) -> *pty.Child {
+    unsafe { return @ptrCast(*pty.Child, &terminal_state.*.child) }
 }
 
-fn keyPressed(app: *App, key: u32) -> void {
-    if key == keys.KEY_LEFTSHIFT || key == keys.KEY_RIGHTSHIFT { app.*.shift = true }
-    if key == keys.KEY_LEFTCTRL || key == keys.KEY_RIGHTCTRL { app.*.control = true }
-    if key == keys.KEY_CAPSLOCK { app.*.caps = !app.*.caps }
-    if keys.isModifier(key) { return }
-    sendKey(app, key)
-    if app.*.repeatInterval > 0 {
-        app.*.repeating = true
-        app.*.repeatKey = key
-        app.*.repeatAt = pty.milliseconds() + app.*.repeatDelay
+fn inputOf(terminal_state: *Terminal) -> [*]u8 {
+    unsafe { return @ptrCast([*]u8, &terminal_state.*.input) }
+}
+
+fn named(value: std.string.String, name: []const u8) -> bool { return std.string.eql(value, std.string.fromSlice(name)) }
+
+fn number(value: std.string.String, fallback: usize) -> usize {
+    const parsed = std.parse.unsigned(value)
+    return if parsed.valid && parsed.value > 0 { parsed.value } else { fallback }
+}
+
+// What the program sees after the pty's reports and the screen's changes.
+fn afterOutput(terminal_state: *Terminal) -> void {
+    const screen = screenOf(terminal_state)
+    var reply: [terminal.RESPONSE_CAPACITY]u8 = undefined
+    var reply_bytes: [*]u8 = undefined
+    unsafe { reply_bytes = @ptrCast([*]u8, &reply) }
+    const owed = terminal.takeResponses(screen, reply_bytes, terminal.RESPONSE_CAPACITY)
+    if owed > 0 && terminal_state.*.hasChild { pty.write(childOf(terminal_state), reply_bytes, owed) }
+    if terminal.takeTitleChange(screen) {
+        const title = terminal.titleText(screen)
+        host.setTitle(terminal_state.*.host, if title.length > 0 { title } else { "Mlx Terminal" })
     }
+    const rang = terminal.takeBell(screen)
+    if terminal.takeDirty(screen) { host.redraw(terminal_state.*.host) }
 }
 
-fn keyReleased(app: *App, key: u32) -> void {
-    if key == keys.KEY_LEFTSHIFT || key == keys.KEY_RIGHTSHIFT { app.*.shift = false }
-    if key == keys.KEY_LEFTCTRL || key == keys.KEY_RIGHTCTRL { app.*.control = false }
-    if app.*.repeating && app.*.repeatKey == key { app.*.repeating = false }
-}
-
-fn onKeyboard(context: *anyopaque, event: wl.client.Event) -> void {
-    const app = appOf(context)
-    const decoded = wl.wl_keyboard.decodeEvent(event)
-    if event.opcode == wl.wl_keyboard.EVENT_KEYMAP {
-        // Keys are decoded from evdev codes; the xkb keymap is not needed.
-        decoded.keymap.fd.close()
-    } else if event.opcode == wl.wl_keyboard.EVENT_ENTER {
-        app.*.screen.*.focused = true
-        app.*.dirty = true
-    } else if event.opcode == wl.wl_keyboard.EVENT_LEAVE {
-        app.*.screen.*.focused = false
-        app.*.repeating = false
-        app.*.shift = false
-        app.*.control = false
-        app.*.dirty = true
-    } else if event.opcode == wl.wl_keyboard.EVENT_KEY {
-        if decoded.key.state == @intFromEnum(wl.wl_keyboard.KeyState.pressed) {
-            keyPressed(app, decoded.key.key)
+// The program wrote: everything waiting, into the screen; the program
+// ended: the window closes.
+fn readOutput(terminal_state: *Terminal) -> void {
+    if !terminal_state.*.hasChild { return }
+    const child = childOf(terminal_state)
+    const buffer = inputOf(terminal_state)
+    var more = true
+    while more {
+        const got = pty.read(child, buffer, READ_CAPACITY)
+        if got > 0 {
+            terminal.feed(screenOf(terminal_state), buffer[0..@bitCast(usize, got)])
+        } else if got == pty.EAGAIN {
+            more = false
         } else {
-            keyReleased(app, decoded.key.key)
-        }
-    } else if event.opcode == wl.wl_keyboard.EVENT_REPEAT_INFO {
-        const rate = decoded.repeat_info.rate
-        if rate > 0 {
-            app.*.repeatInterval = 1000 / @intCast(usize, rate)
-            app.*.repeatDelay = @intCast(usize, decoded.repeat_info.delay)
-        } else {
-            app.*.repeatInterval = 0
+            // 0 or EIO: the program closed its side.
+            more = false
+            const status = pty.wait(child)
+            terminal_state.*.status = if status == null { 0 } else { @intCast(u8, status.? & 255) }
+            host.quit(terminal_state.*.host)
         }
     }
+    afterOutput(terminal_state)
 }
 
-fn onSeat(context: *anyopaque, event: wl.client.Event) -> void {
-    const app = appOf(context)
-    const decoded = wl.wl_seat.decodeEvent(event)
-    if event.opcode != wl.wl_seat.EVENT_CAPABILITIES { return }
-    const capabilities = decoded.capabilities.capabilities
-    if wl.flags.has(capabilities, @intFromEnum(wl.wl_seat.Capability.keyboard)) && !app.*.hasKeyboard {
-        app.*.keyboard = app.*.seat.getKeyboard()
-        app.*.keyboard.setHandler(onKeyboard, context)
-        app.*.hasKeyboard = true
+fn draw(context: *anyopaque, canvas: *app.Canvas) -> void {
+    const terminal_state = terminalOf(context)
+    if canvas.*.width == 0 || canvas.*.height == 0 { return }
+    ui_terminal.draw(viewOf(terminal_state), canvas, ui.rect(0, 0, @intCast(i32, canvas.*.width), @intCast(i32, canvas.*.height)))
+}
+
+// The window's size in cells changed: the screen and the program follow.
+fn configured(terminal_state: *Terminal, width: i32, height: i32) -> void {
+    terminal_state.*.width = width
+    terminal_state.*.height = height
+    const view = viewOf(terminal_state)
+    const columns = ui_terminal.columnsFor(view, width)
+    const rows = ui_terminal.rowsFor(view, height)
+    if columns != terminal_state.*.columns || rows != terminal_state.*.rows {
+        terminal_state.*.columns = columns
+        terminal_state.*.rows = rows
+        const resized = terminal.resize(screenOf(terminal_state), columns, rows)
+        if terminal_state.*.hasChild { pty.resize(childOf(terminal_state), @intCast(u16, columns), @intCast(u16, rows)) }
     }
+    host.redraw(terminal_state.*.host)
 }
 
-// ---------------------------------------------------------------------------
-// Window
-
-fn onRegistry(context: *anyopaque, event: wl.client.Event) -> void {
-    const app = appOf(context)
-    const decoded = wl.wl_registry.decodeEvent(event)
-    if event.opcode != wl.wl_registry.EVENT_GLOBAL { return }
-    const global = decoded.global
-    if isNamed(global.interface, "wl_compositor") {
-        app.*.compositor = wl.wl_compositor.Proxy.fromObject(app.*.registry.bind(global.name, wl.Interface.wl_compositor, minimum(global.version, 4)))
-        app.*.hasCompositor = true
-    } else if isNamed(global.interface, "wl_shm") {
-        app.*.shm = wl.wl_shm.Proxy.fromObject(app.*.registry.bind(global.name, wl.Interface.wl_shm, 1))
-        app.*.hasShm = true
-    } else if isNamed(global.interface, "xdg_wm_base") {
-        app.*.wmBase = wl.xdg_wm_base.Proxy.fromObject(app.*.registry.bind(global.name, wl.Interface.xdg_wm_base, minimum(global.version, 2)))
-        app.*.hasWmBase = true
-    } else if isNamed(global.interface, "wl_seat") && !app.*.hasSeat {
-        app.*.seat = wl.wl_seat.Proxy.fromObject(app.*.registry.bind(global.name, wl.Interface.wl_seat, minimum(global.version, 5)))
-        app.*.seat.setHandler(onSeat, context)
-        app.*.hasSeat = true
-    }
+// The window is whole cells: a configured size is rounded down to them
+// (the compositor places the smaller window), as xterm does.
+fn sizeRule(context: *anyopaque, width: *u32, height: *u32) -> void {
+    const view = viewOf(terminalOf(context))
+    if width.* > 0 { width.* = @intCast(u32, ui_terminal.pixelWidth(view, ui_terminal.columnsFor(view, @intCast(i32, width.*)))) }
+    if height.* > 0 { height.* = @intCast(u32, ui_terminal.pixelHeight(view, ui_terminal.rowsFor(view, @intCast(i32, height.*)))) }
 }
 
-fn onWmBase(context: *anyopaque, event: wl.client.Event) -> void {
-    const decoded = wl.xdg_wm_base.decodeEvent(event)
-    appOf(context).*.wmBase.pong(decoded.ping.serial)
-}
-
-fn onXdgSurface(context: *anyopaque, event: wl.client.Event) -> void {
-    const app = appOf(context)
-    const decoded = wl.xdg_surface.decodeEvent(event)
-    // The size the toplevel configure asked for: as many whole cells as fit.
-    if app.*.wantedWidth > 0 && app.*.wantedHeight > 0 {
-        const padding = @intCast(i32, 2 * screens.PADDING)
-        const columns = if app.*.wantedWidth > padding { @intCast(usize, app.*.wantedWidth - padding) / screens.CELL_WIDTH } else { 0 }
-        const rows = if app.*.wantedHeight > padding { @intCast(usize, app.*.wantedHeight - padding) / screens.CELL_HEIGHT } else { 0 }
-        if screens.resize(app.*.screen, columns, rows) && app.*.hasChild {
-            const child = app.*.child
-            pty.resize(&child, @intCast(u16, app.*.screen.*.columns), @intCast(u16, app.*.screen.*.rows))
+fn onEvent(context: *anyopaque, kind: u32, a: u32, b: i32) -> void {
+    const terminal_state = terminalOf(context)
+    const own_host = terminal_state.*.host
+    if kind == app.EVENT_CONFIGURED {
+        configured(terminal_state, @intCast(i32, a), b)
+    } else if kind == app.EVENT_WATCH {
+        readOutput(terminal_state)
+    } else if kind == app.EVENT_KEY {
+        viewOf(terminal_state).*.focused = true
+        if b != 0 {
+            var bytes: [16]u8 = undefined
+            var bytes_pointer: [*]u8 = undefined
+            unsafe { bytes_pointer = @ptrCast([*]u8, &bytes) }
+            const length = ui_terminal.key(viewOf(terminal_state), a, host.modifiers(own_host), host.typed(own_host), host.plainTyped(own_host), bytes_pointer)
+            if length > 0 && terminal_state.*.hasChild { pty.write(childOf(terminal_state), bytes_pointer, length) }
+            if terminal.takeDirty(screenOf(terminal_state)) { host.redraw(own_host) }
         }
-    }
-    app.*.xdgSurface.ackConfigure(decoded.configure.serial)
-    app.*.configured = true
-    app.*.dirty = true
-}
-
-fn onToplevel(context: *anyopaque, event: wl.client.Event) -> void {
-    const app = appOf(context)
-    const decoded = wl.xdg_toplevel.decodeEvent(event)
-    if event.opcode == wl.xdg_toplevel.EVENT_CONFIGURE {
-        // 0 x 0: our choice (the size we have).
-        app.*.wantedWidth = decoded.configure.width
-        app.*.wantedHeight = decoded.configure.height
-    } else if event.opcode == wl.xdg_toplevel.EVENT_CLOSE {
-        app.*.running = false
+    } else if kind == app.EVENT_WHEEL {
+        if a == 0 {
+            ui_terminal.wheel(viewOf(terminal_state), b)
+            if terminal.takeDirty(screenOf(terminal_state)) { host.redraw(own_host) }
+        }
+    } else if kind == app.EVENT_KEYBOARD_LEAVE {
+        viewOf(terminal_state).*.focused = false
+        host.redraw(own_host)
+    } else if kind == app.EVENT_CLOSED {
+        host.quit(own_host)
     }
 }
 
-// Buffers of the screen's current size, made again when it changed.
-fn fitBuffers(app: *App) -> void {
-    const width = screens.pixelWidth(app.*.screen)
-    const height = screens.pixelHeight(app.*.screen)
-    if width == app.*.bufferWidth && height == app.*.bufferHeight { return }
-    if app.*.bufferWidth != 0 {
-        app.*.firstBuffer.destroy()
-        app.*.secondBuffer.destroy()
-    }
-    const format = @intFromEnum(wl.wl_shm.Format.argb8888)
-    const stride = @intCast(i32, width * 4)
-    app.*.firstBuffer = app.*.pool.createBuffer(0, @intCast(i32, width), @intCast(i32, height), stride, format)
-    app.*.secondBuffer = app.*.pool.createBuffer(@intCast(i32, FRAME_SIZE / 2), @intCast(i32, width), @intCast(i32, height), stride, format)
-    app.*.firstBuffer.setHandler(onBuffer, contextOf(app))
-    app.*.secondBuffer.setHandler(onBuffer, contextOf(app))
-    app.*.firstBusy = false
-    app.*.secondBusy = false
-    app.*.bufferWidth = width
-    app.*.bufferHeight = height
-}
-
-fn onBuffer(context: *anyopaque, event: wl.client.Event) -> void {
-    const app = appOf(context)
-    if event.object.id == app.*.firstBuffer.id() { app.*.firstBusy = false }
-    if event.object.id == app.*.secondBuffer.id() { app.*.secondBusy = false }
-}
-
-fn onFrame(context: *anyopaque, event: wl.client.Event) -> void {
-    appOf(context).*.framePending = false
-}
-
-fn redraw(app: *App) -> void {
-    if !app.*.configured || app.*.framePending || !app.*.dirty { return }
-    fitBuffers(app)
-    var use_first = true
-    if app.*.firstBusy {
-        if app.*.secondBusy { return }
-        use_first = false
-    }
-    var pixels = app.*.memory.bytes()
-    if !use_first {
-        unsafe { pixels = @ptrFromInt([*]u8, app.*.memory.address + FRAME_SIZE / 2) }
-    }
-    const screen = app.*.screen
-    screens.render(screen, pixels)
-    var buffer = app.*.firstBuffer
-    if use_first {
-        app.*.firstBusy = true
-    } else {
-        buffer = app.*.secondBuffer
-        app.*.secondBusy = true
-    }
-    app.*.surface.attach(&buffer, 0, 0)
-    app.*.surface.damage(0, 0, @intCast(i32, app.*.bufferWidth), @intCast(i32, app.*.bufferHeight))
-    const callback = app.*.surface.frame()
-    callback.setHandler(onFrame, contextOf(app))
-    app.*.surface.commit()
-    app.*.framePending = true
-    app.*.dirty = false
-}
-
-const Failure = error { MissingGlobals, NoSharedMemory, NoTerminal }
-
-fn missingGlobals() -> Failure!void { return Failure.MissingGlobals }
-fn noSharedMemory() -> Failure!void { return Failure.NoSharedMemory }
-fn noTerminal() -> Failure!void { return Failure.NoTerminal }
-
-fn createWindow(app: *App) -> !void {
-    app.*.registry = wl.displayProxy(app.*.display).getRegistry()
-    app.*.registry.setHandler(onRegistry, contextOf(app))
-    try app.*.display.roundtrip()
-    if !app.*.hasCompositor || !app.*.hasShm || !app.*.hasWmBase { return missingGlobals() }
-    app.*.wmBase.setHandler(onWmBase, contextOf(app))
-    var memory: wl.SharedMemory = undefined
-    if !wl.transport.createSharedMemory(&memory, FRAME_SIZE) { return noSharedMemory() }
-    app.*.memory = memory
-    app.*.pool = app.*.shm.createPool(memory.handle, @intCast(i32, FRAME_SIZE))
-    fitBuffers(app)
-    app.*.surface = app.*.compositor.createSurface()
-    app.*.xdgSurface = app.*.wmBase.getXdgSurface(app.*.surface)
-    app.*.xdgSurface.setHandler(onXdgSurface, contextOf(app))
-    app.*.toplevel = app.*.xdgSurface.getToplevel()
-    app.*.toplevel.setHandler(onToplevel, contextOf(app))
-    app.*.toplevel.setTitle("Mlx Terminal")
-    app.*.toplevel.setAppId("org.mlx.terminal")
-    app.*.toplevel.setMinSize(@intCast(i32, screens.MIN_COLUMNS * screens.CELL_WIDTH + 2 * screens.PADDING), @intCast(i32, screens.MIN_ROWS * screens.CELL_HEIGHT + 2 * screens.PADDING))
-    app.*.surface.commit()
-    try app.*.display.roundtrip()
-}
-
-// ---------------------------------------------------------------------------
-// Shell
-
-// The environment passed to the shell: ours, with TERM=dumb.
-fn shellEnvironment(arguments: [][*]const u8, allocator: std.allocator.Allocator) -> [*][*]const u8 {
-    const count = std.process.environmentCount(arguments)
-    const memory = allocator.alloc((count + 2) * 8, 8).?
+// The program's environment: ours, with TERM and COLORTERM for a
+// 256-colour, direct-colour xterm.
+fn programEnvironment(entries: [*][*]const u8, allocator: std.allocator.Allocator) -> ?[*][*]const u8 {
+    var count: usize = 0
+    while @intFromPtr(entries[count]) != 0 { count += 1 }
+    const memory = allocator.alloc((count + 3) * @sizeOf([*]const u8), 8)
+    if memory == null { return null }
     var result: [*][*]const u8 = undefined
-    unsafe { result = @ptrCast([*][*]const u8, memory) }
-    const entries = std.process.environmentEntries(arguments)
+    unsafe { result = @ptrCast([*][*]const u8, memory.?) }
     var used: usize = 0
     var index: usize = 0
     while index < count {
         const entry = std.process.fromCString(entries[index])
-        if !std.string.startsWith(entry, std.string.fromSlice("TERM=")) {
+        if !std.string.startsWith(entry, std.string.fromSlice("TERM=")) && !std.string.startsWith(entry, std.string.fromSlice("COLORTERM=")) {
             result[used] = entries[index]
             used += 1
         }
         index += 1
     }
     unsafe {
-        result[used] = @ptrCast([*]const u8, "TERM=dumb")
-        result[used + 1] = @ptrFromInt([*]const u8, 0)
+        result[used] = @ptrCast([*]const u8, "TERM=xterm-256color")
+        result[used + 1] = @ptrCast([*]const u8, "COLORTERM=truecolor")
+        result[used + 2] = @ptrFromInt([*]const u8, 0)
     }
     return result
 }
 
-fn startShell(app: *App, arguments: [][*]const u8, allocator: std.allocator.Allocator) -> bool {
-    const environment = shellEnvironment(arguments, allocator)
-    var child: pty.Child = undefined
-    var started = false
-    if std.process.count(arguments) > 1 {
-        // Run the given program: argv[1..] is already NULL-terminated.
-        unsafe {
-            const argv = @ptrFromInt([*][*]const u8, @intFromPtr(@ptrCast([*][*]const u8, arguments)) + 8)
-            started = pty.spawn(&child, argv[0], argv, environment, @intCast(u16, app.*.screen.*.columns), @intCast(u16, app.*.screen.*.rows))
-        }
-    } else {
-        var argv: [2][*]const u8 = undefined
-        unsafe {
-            argv[0] = @ptrCast([*]const u8, "/bin/sh")
-            argv[1] = @ptrFromInt([*]const u8, 0)
-            started = pty.spawn(&child, argv[0], @ptrCast([*][*]const u8, &argv), environment, @intCast(u16, app.*.screen.*.columns), @intCast(u16, app.*.screen.*.rows))
-        }
+// The shell: $SHELL, else mlx-sh beside this program or where it is
+// installed, else /bin/sh.
+var shell_path: [4096]u8 = undefined
+
+fn defaultShell(entries: [*][*]const u8) -> [*]const u8 {
+    const shell = std.process.environmentFrom(entries, "SHELL")
+    if shell != null && shell.?.length > 0 { return shell.?.pointer }
+    var candidate: [*]const u8 = undefined
+    var own: [*]u8 = undefined
+    unsafe {
+        own = @ptrCast([*]u8, &shell_path)
+        candidate = @ptrCast([*]const u8, "/proc/self/exe")
     }
-    app.*.child = child
-    app.*.hasChild = started
-    return started
+    const got = std.fs.readLink(candidate, own, 4000)
+    if got > 0 {
+        var length = @bitCast(usize, got)
+        while length > 0 && own[length - 1] != 47 { length -= 1 }
+        length = std.text.append(own, length, 4000, "mlx-sh")
+        own[length] = 0
+        if std.fs.exists(own) { return own }
+    }
+    unsafe { candidate = @ptrCast([*]const u8, "/usr/local/bin/mlx-sh") }
+    if std.fs.exists(candidate) { return candidate }
+    unsafe { candidate = @ptrCast([*]const u8, "/usr/bin/mlx-sh") }
+    if std.fs.exists(candidate) { return candidate }
+    unsafe { candidate = @ptrCast([*]const u8, "/bin/sh") }
+    return candidate
 }
 
-fn readShell(app: *App) -> void {
-    var buffer: [4096]u8 = undefined
-    const child = app.*.child
-    while true {
-        var amount: isize = 0
-        unsafe { amount = pty.read(&child, @ptrCast([*]u8, &buffer), 4096) }
-        if amount == pty.EAGAIN { return }
-        if amount <= 0 {
-            // The shell exited (EOF or EIO on the master side).
-            app.*.running = false
-            return
-        }
-        var index: usize = 0
-        while index < @bitCast(usize, amount) {
-            screens.feed(app.*.screen, buffer[index])
-            index += 1
-        }
-        app.*.dirty = true
-    }
-}
+const Failure = error { Usage, NoMemory, NoFont, NoProgram }
 
-fn run(app: *App, arguments: [][*]const u8) -> !void {
-    const allocator = std.page_allocator.init()
-    var display: wl.client.Display = undefined
-    try wl.client.Display.connect(&display, allocator)
-    wayland_crash.watch(display)
-    app.*.display = display
-    try createWindow(app)
-    if !startShell(app, arguments, allocator) { return noTerminal() }
-
-    var handles: [2]wl.Handle = undefined
-    handles[0] = wl.Handle.fromDescriptor(display.descriptor())
-    handles[1] = wl.Handle.fromDescriptor(app.*.child.master)
-    var ready: [2]bool = [2]bool{ false, false }
-    while app.*.running && display.running() {
-        redraw(app)
-        try display.flush()
-        var timeout: isize = -1
-        if app.*.repeating {
-            const now = pty.milliseconds()
-            timeout = if app.*.repeatAt > now { @intCast(isize, app.*.repeatAt - now) } else { 0 }
-        }
-        var count: isize = 0
-        unsafe { count = wl.transport.waitAny(@ptrCast([*]const wl.Handle, &handles), 2, @ptrCast([*]bool, &ready), timeout) }
-        if ready[0] { try display.dispatch() }
-        if ready[1] { readShell(app) }
-        if app.*.repeating && pty.milliseconds() >= app.*.repeatAt {
-            sendKey(app, app.*.repeatKey)
-            app.*.repeatAt = pty.milliseconds() + app.*.repeatInterval
-        }
-    }
-    const child = app.*.child
-    pty.hangUp(&child)
-    app.*.toplevel.destroy()
-    app.*.xdgSurface.destroy()
-    app.*.surface.destroy()
-    try display.roundtrip()
-    app.*.pool.destroy()
-    app.*.memory.release()
-    display.disconnect()
+fn fail(message: []const u8, failure: Failure) -> Failure!void {
+    const said = std.io.eprintln(message)
+    return failure
 }
 
 pub fn main(arguments: [][*]const u8) -> !void {
-    const installed = crash.install()
-    var screen: screens.Screen = undefined
-    screens.initAt(&screen)
-    var app: App = undefined
-    app.hasCompositor = false
-    app.hasShm = false
-    app.hasWmBase = false
-    app.hasSeat = false
-    app.hasKeyboard = false
-    app.firstBusy = false
-    app.secondBusy = false
-    app.hasChild = false
-    app.bufferWidth = 0
-    app.bufferHeight = 0
-    app.wantedWidth = 0
-    app.wantedHeight = 0
-    app.configured = false
-    app.framePending = false
-    app.dirty = true
-    app.running = true
-    app.screen = &screen
-    app.shift = false
-    app.control = false
-    app.caps = false
-    app.repeating = false
-    app.repeatKey = 0
-    app.repeatAt = 0
-    app.repeatInterval = 40
-    app.repeatDelay = 400
-    try run(&app, arguments)
+    const reporting = crash.install()
+    const allocator = std.page_allocator.init()
+    const memory = allocator.alloc(@sizeOf(Terminal), 16)
+    if memory == null { try fail("mlx-terminal: out of memory", Failure.NoMemory) }
+    var terminal_state: *Terminal = undefined
+    unsafe { terminal_state = @ptrCast(*Terminal, memory.?) }
+    const entries = std.process.environmentEntries(arguments)
+    var font_height: usize = @intCast(usize, DEFAULT_FONT_HEIGHT)
+    const from_environment = std.process.environmentFrom(entries, "MLX_TERMINAL_FONT_SIZE")
+    if from_environment != null { font_height = number(from_environment.?, font_height) }
+    var columns = DEFAULT_COLUMNS
+    var rows = DEFAULT_ROWS
+    const count = std.process.count(arguments)
+    var index: usize = 1
+    var program_at: usize = 0
+    while index < count && program_at == 0 {
+        const option = std.process.argument(arguments, index)
+        const has_value = index + 1 < count
+        if named(option, "--font-size") && has_value {
+            font_height = number(std.process.argument(arguments, index + 1), font_height)
+            index += 2
+        } else if named(option, "--columns") && has_value {
+            columns = number(std.process.argument(arguments, index + 1), columns)
+            index += 2
+        } else if named(option, "--rows") && has_value {
+            rows = number(std.process.argument(arguments, index + 1), rows)
+            index += 2
+        } else if option.length > 0 && option.pointer[0] == 45 {
+            try fail("usage: mlx-terminal [--font-size PIXELS] [--columns N] [--rows N] [PROGRAM ARGUMENTS...]", Failure.Usage)
+        } else {
+            program_at = index
+        }
+    }
+    if font_height < 6 { font_height = 6 }
+    if font_height > 96 { font_height = 96 }
+    if columns > terminal.MAX_COLUMNS { columns = terminal.MAX_COLUMNS }
+    if rows > terminal.MAX_ROWS { rows = terminal.MAX_ROWS }
+    terminal_state.*.fontHeight = @intCast(i32, font_height)
+    if !text.loadMonoText(monoOf(terminal_state), @intCast(u32, font_height), allocator) { try fail("mlx-terminal: no TrueType font found (DejaVu Sans Mono, Liberation Mono or Noto Sans Mono)", Failure.NoFont) }
+    if !terminal.init(screenOf(terminal_state), allocator, columns, rows, HISTORY_LINES) { try fail("mlx-terminal: out of memory for the screen", Failure.NoMemory) }
+    ui_terminal.init(viewOf(terminal_state), screenOf(terminal_state), monoOf(terminal_state), terminal_state.*.fontHeight, PADDING)
+    terminal_state.*.columns = columns
+    terminal_state.*.rows = rows
+    terminal_state.*.hasChild = false
+    terminal_state.*.status = 0
+    const view = viewOf(terminal_state)
+    terminal_state.*.width = ui_terminal.pixelWidth(view, columns)
+    terminal_state.*.height = ui_terminal.pixelHeight(view, rows)
+    const options = host.Options.{ .title = "Mlx Terminal", .appId = "org.mlx.terminal", .width = @intCast(u32, terminal_state.*.width), .height = @intCast(u32, terminal_state.*.height), .minWidth = ui_terminal.pixelWidth(view, 10), .minHeight = ui_terminal.pixelHeight(view, 2) }
+    const created = host.create(options, @ptrCast(*anyopaque, terminal_state), draw, onEvent)
+    if created == null { try fail("mlx-terminal: out of memory for the window", Failure.NoMemory) }
+    terminal_state.*.host = created.?
+    host.setSizeRule(terminal_state.*.host, sizeRule)
+    try host.open(terminal_state.*.host, arguments)
+    // The program: the arguments after the options, or the shell.
+    const environment = programEnvironment(entries, allocator)
+    if environment == null { try fail("mlx-terminal: out of memory", Failure.NoMemory) }
+    var argv: [64][*]const u8 = undefined
+    var argv_pointer: [*][*]const u8 = undefined
+    unsafe { argv_pointer = @ptrCast([*][*]const u8, &argv) }
+    var argc: usize = 0
+    if program_at != 0 {
+        while program_at + argc < count && argc < 63 {
+            unsafe { argv[argc] = @ptrCast([*]const u8, arguments[program_at + argc]) }
+            argc += 1
+        }
+    } else {
+        argv[0] = defaultShell(entries)
+        argc = 1
+    }
+    unsafe { argv[argc] = @ptrFromInt([*]const u8, 0) }
+    if !pty.spawn(childOf(terminal_state), argv[0], argv_pointer, environment.?, @intCast(u16, columns), @intCast(u16, rows)) { try fail("mlx-terminal: the program could not be started", Failure.NoProgram) }
+    terminal_state.*.hasChild = true
+    host.watchDescriptor(terminal_state.*.host, childOf(terminal_state).*.master)
+    try host.run(terminal_state.*.host)
+    pty.hangUp(childOf(terminal_state))
 }

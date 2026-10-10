@@ -1,0 +1,209 @@
+// mlx-init: the init of MLX/Linux, PID 1, written in Mlx without libc. As
+// PID 1 it mounts /proc, /sys, /dev (with pts and shm) and /run, mounts
+// what the mounts file lists, sets the hostname, and starts the services
+// defined in the services directory (config.mlx says how), in their order.
+// Then it supervises them (supervise.mlx): ended ones are started again
+// after a pause that grows while they keep failing, orphans are reaped,
+// and requests come in over the control socket (control.mlx), from
+// mlx-initctl: status, start, stop, restart, reload, poweroff, reboot,
+// halt. The shutdown (power.mlx) stops the services in the reverse order,
+// kills what is left, syncs, unmounts, and hands over to the kernel.
+//
+//     mlx4 projects/init/main.mlx -o mlx-init
+//     mlx4 projects/init/tool.mlx -o mlx-initctl
+//     tools/check_init.sh                      the end-to-end check
+//
+// Not PID 1 (started by hand or by a test), it supervises the same way,
+// without the mounts, the hostname and the reboot: a shutdown request or
+// SIGTERM stops the services and ends it.
+//
+// Options:
+//     --services DIR    the NAME.service files (default /etc/mlx/init/services)
+//     --mounts FILE     the mounts file (default /etc/mlx/init/mounts)
+//     --hostname FILE   the hostname (default /etc/hostname; PID 1 only)
+//     --control PATH    the control socket (default /run/mlx/init)
+//     --log DIR         the services' logs, DIR/NAME.log (default /run/mlx/log)
+//     --verbose         say every start, stop, ready and reaping
+//
+// Signals: SIGCHLD reaps, SIGHUP reads the services again, SIGINT
+// (Ctrl-Alt-Del) and SIGTERM reboot, SIGUSR1 halts, SIGUSR2 powers off
+// (not PID 1: each of the four ends the init).
+const std = @import("std")
+const crash = @import("std.crash")
+const turns_module = @import("std.turns")
+const linux = @import("./linux.mlx")
+const config = @import("./config.mlx")
+const supervise = @import("./supervise.mlx")
+const mounts = @import("./mounts.mlx")
+const control = @import("./control.mlx")
+const power = @import("./power.mlx")
+
+const State = config.State
+
+fn named(text: std.string.String, name: []const u8) -> bool { return std.string.eql(text, std.string.fromSlice(name)) }
+
+fn usage() -> u8 {
+    const said = std.io.eprintln("usage: mlx-init [--services DIR] [--mounts FILE] [--hostname FILE] [--control PATH] [--log DIR] [--verbose]")
+    return 2
+}
+
+// The directory holding `path`, made (with its parent) when missing.
+fn makeParent(path: []const u8) -> void {
+    var end = path.length
+    while end > 0 && path[end - 1] != 47 { end -= 1 }
+    if end <= 1 { return }
+    const parent = path[0..end - 1]
+    makeParent(parent)
+    const made = linux.makeDirectory(parent, 493)
+}
+
+fn makeDirectories(path: []const u8) -> void {
+    makeParent(path)
+    const made = linux.makeDirectory(path, 493)
+}
+
+// /etc/hostname's first line as the hostname.
+fn setHostname(state: *State) -> void {
+    const size = config.readFile(state, config.hostnameFile(state))
+    if size == 0 { return }
+    const text = config.scratch(state)
+    var end: usize = 0
+    while end < size && text[end] != 10 { end += 1 }
+    const name = std.text.trimmed(text[0..end])
+    if name.length == 0 || name[0] == 35 { return }
+    if linux.setHostname(name) != 0 {
+        config.sayWith("could not set the hostname ", name, false, 0)
+    } else if state.*.verbose {
+        config.sayWith("hostname ", name, false, 0)
+    }
+}
+
+// What a signal asks for.
+fn onSignal(state: *State, signal: usize) -> void {
+    if signal == linux.SIGCHLD {
+        supervise.reapAll(state)
+    } else if signal == linux.SIGHUP {
+        config.say("reading the services again (SIGHUP)")
+        const defined = config.load(state)
+    } else if signal == linux.SIGINT || signal == linux.SIGTERM {
+        state.*.action = if state.*.pid1 { config.ACTION_REBOOT } else { config.ACTION_EXIT }
+        state.*.running = false
+    } else if signal == linux.SIGUSR1 {
+        state.*.action = if state.*.pid1 { config.ACTION_HALT } else { config.ACTION_EXIT }
+        state.*.running = false
+    } else if signal == linux.SIGUSR2 {
+        state.*.action = if state.*.pid1 { config.ACTION_POWEROFF } else { config.ACTION_EXIT }
+        state.*.running = false
+    }
+}
+
+fn serve(state: *State) -> void {
+    var events: [linux.EVENT_SIZE * linux.MAX_EVENTS]u8 = undefined
+    var events_pointer: [*]u8 = undefined
+    unsafe { events_pointer = @ptrCast([*]u8, &events) }
+    // What the loop keeps was made before the turns' mark; each turn
+    // releases what came after it.
+    var turns: turns_module.Turns = undefined
+    turns_module.begin(&turns, true, false)
+    while state.*.running {
+        turns_module.turn(&turns)
+        const count = linux.waitEvents(state.*.eventLoop, events_pointer, supervise.nextTimeout(state))
+        var index: usize = 0
+        while count > 0 && index < @intCast(usize, count) {
+            const token = linux.eventToken(events_pointer, index)
+            if token == control.LISTENER {
+                control.accept(state)
+            } else if token == control.SIGNALS {
+                var signal = linux.readSignal(state.*.signals)
+                while signal != 0 {
+                    onSignal(state, signal)
+                    signal = linux.readSignal(state.*.signals)
+                }
+            } else if control.isClient(token) {
+                control.readable(state, token)
+            }
+            index += 1
+        }
+        if state.*.running { supervise.tick(state) }
+    }
+}
+
+pub fn main(arguments: [][*]const u8) -> u8 {
+    const reporting = crash.install()
+    const allocator = std.page_allocator.init()
+    const memory = allocator.alloc(@sizeOf(State), 16)
+    if memory == null {
+        config.say("out of memory")
+        return 1
+    }
+    var state: *State = undefined
+    unsafe { state = @ptrCast(*State, memory.?) }
+    state.*.count = 0
+    state.*.sequence = 0
+    state.*.verbose = false
+    state.*.running = true
+    state.*.action = config.ACTION_NONE
+    config.setServicesDirectory(state, "/etc/mlx/init/services")
+    config.setMountsFile(state, "/etc/mlx/init/mounts")
+    config.setHostnameFile(state, "/etc/hostname")
+    config.setControlPath(state, "/run/mlx/init")
+    config.setLogDirectory(state, "/run/mlx/log")
+    const argument_count = std.process.count(arguments)
+    var index: usize = 1
+    while index < argument_count {
+        const option = std.process.argument(arguments, index)
+        const has_value = index + 1 < argument_count
+        if named(option, "--verbose") {
+            state.*.verbose = true
+        } else if named(option, "--services") && has_value {
+            config.setServicesDirectory(state, std.string.asSlice(std.process.argument(arguments, index + 1)))
+            index += 1
+        } else if named(option, "--mounts") && has_value {
+            config.setMountsFile(state, std.string.asSlice(std.process.argument(arguments, index + 1)))
+            index += 1
+        } else if named(option, "--hostname") && has_value {
+            config.setHostnameFile(state, std.string.asSlice(std.process.argument(arguments, index + 1)))
+            index += 1
+        } else if named(option, "--control") && has_value {
+            config.setControlPath(state, std.string.asSlice(std.process.argument(arguments, index + 1)))
+            index += 1
+        } else if named(option, "--log") && has_value {
+            config.setLogDirectory(state, std.string.asSlice(std.process.argument(arguments, index + 1)))
+            index += 1
+        } else {
+            return usage()
+        }
+        index += 1
+    }
+    state.*.pid1 = linux.getPid() == 1
+    if state.*.pid1 {
+        config.say("MLX/Linux init starting")
+        const mask = std.linux.syscall1(linux.SYS_umask, 18)
+        const root = linux.changeDirectory("/")
+        mounts.early()
+        // Ctrl-Alt-Del comes as SIGINT instead of a reboot at once.
+        const cad = linux.reboot(linux.REBOOT_CAD_OFF)
+        setHostname(state)
+    }
+    mounts.fromFile(state)
+    makeDirectories(config.logDirectory(state))
+    makeParent(config.controlPath(state))
+    // The signals come through a descriptor, blocked otherwise (the
+    // children unblock them before they run their programs).
+    const signals = linux.bit(linux.SIGCHLD) | linux.bit(linux.SIGHUP) | linux.bit(linux.SIGINT) | linux.bit(linux.SIGTERM) | linux.bit(linux.SIGUSR1) | linux.bit(linux.SIGUSR2)
+    linux.blockSignals(signals)
+    state.*.signals = linux.signalDescriptor(signals)
+    state.*.eventLoop = linux.eventLoop()
+    if state.*.signals < 0 || state.*.eventLoop < 0 {
+        config.say("no signal descriptor or event loop from the kernel")
+        return 1
+    }
+    const watched = linux.watch(state.*.eventLoop, state.*.signals, control.SIGNALS)
+    if !control.listen(state) { config.sayWith("could not listen at ", config.controlPath(state), false, 0) }
+    const defined = config.load(state)
+    config.sayWith("services defined: ", "", true, defined)
+    supervise.tick(state)
+    serve(state)
+    power.shutdown(state)
+    return 0
+}

@@ -18,6 +18,7 @@ const comptime_value = @import("../sema/comptime/value.mlx")
 const comptime_module = @import("../comptime.mlx")
 const declarations = @import("../sema/declarations.mlx")
 const builtins = @import("../builtins.mlx")
+const atomics = @import("../sema/builtins/atomics.mlx")
 const loader_module = @import("../modules/loader.mlx")
 const model = @import("../modules/model.mlx")
 const store_module = @import("../modules/store.mlx")
@@ -138,6 +139,7 @@ pub const LirBuilder = struct {
     unsupportedLoweringCount: usize
     firstUnsupportedOffset: usize
     firstUnsupportedLength: usize
+    firstUnsupportedModule: usize
     inlinedCallCount: usize
     automaticallyInlinedCallCount: usize
     inlineMissCount: usize
@@ -215,6 +217,7 @@ pub fn init(
             .unsupportedLoweringCount = 0,
             .firstUnsupportedOffset = 0,
             .firstUnsupportedLength = 0,
+            .firstUnsupportedModule = 0,
             .inlinedCallCount = 0,
             .automaticallyInlinedCallCount = 0,
             .inlineMissCount = 0,
@@ -350,9 +353,191 @@ pub fn generate(builder: *LirBuilder, root_index: usize) -> void {
         if !isGenericDeclaration(nodes, child) { lowerDeclaration(builder, child) }
         if node.tag == ast.Tag.constant_declaration || node.tag == ast.Tag.variable_declaration { lowerAggregateDeclarations(builder, child) }
         if node.tag == ast.Tag.constant_declaration { lowerDataExport(builder, child) }
+        if node.tag == ast.Tag.variable_declaration { lowerGlobalDeclaration(builder, child) }
         child = node.next
         count += 1
     }
+}
+
+// A module-level `var` is a global (lir.Global): storage in the image's
+// data area, reached RIP-relative, found by its sema symbol. One is made
+// the first time it is declared or referred to (a function of an earlier
+// module may use a global of a later one). Its initial value is a scalar
+// known at compile time (an integer, a bool, null); `undefined` and
+// aggregates start zeroed; any other initializer has no lowering yet and
+// is reported. `threadlocal` stays unsupported (lowerDeclaration).
+fn lowerGlobalDeclaration(builder: *LirBuilder, declaration: usize) -> void {
+    const node = ast_store.Store.get(getNodes(builder), declaration)
+    if node.extra & 32 != 0 { return }
+    const found = scope_module.Scope.lookup(currentScope(builder), tokenPointer(builder, node.mainToken), tokenLength(builder, node.mainToken))
+    if !found.0 { return }
+    if !isGlobalSymbol(symbols_store.Store.get(builder.*.symbolStore, found.1)) { return }
+    const index = globalIndexFor(builder, found.1)
+}
+
+fn isGlobalSymbol(symbol: *symbol_module.Symbol) -> bool {
+    if symbol.*.flags & (symbol_module.FLAG_CONSTANT | symbol_module.FLAG_FUNCTION | symbol_module.FLAG_PARAMETER | symbol_module.FLAG_EXTERN | symbol_module.FLAG_THREADLOCAL) != 0 { return false }
+    return symbol.*.declaration != ast.NONE && symbol.*.typeId != 0 && symbol.*.ownerTypeId == 0
+}
+
+fn globalIndexFor(builder: *LirBuilder, symbol_index: usize) -> usize {
+    const existing = lir.findGlobal(builder.*.lir, symbol_index)
+    if existing != lir.NONE { return existing }
+    const symbol = symbols_store.Store.get(builder.*.symbolStore, symbol_index)
+    const module_id = moduleForSymbol(builder, symbol_index)
+    const previous_module = builder.*.currentModuleId
+    if module_id != previous_module { switchToModule(builder, module_id) }
+    var value: u64 = 0
+    var bytes: [*]const u8 = undefined
+    unsafe { bytes = @ptrFromInt([*]const u8, 0) }
+    var byte_count: usize = 0
+    var size = types_store.Store.sizeOf(builder.*.typeStore, symbol.*.typeId)
+    if size == 0 { size = 8 }
+    const nodes = getNodes(builder)
+    if symbol.*.declaration < nodes.*.length {
+        const declaration = ast_store.Store.get(nodes, symbol.*.declaration)
+        if declaration.tag == ast.Tag.variable_declaration && declaration.rhs != ast.NONE {
+            const initializer = ast_store.Store.get(nodes, declaration.rhs)
+            if initializer.tag == ast.Tag.array_literal || initializer.tag == ast.Tag.aggregate_literal {
+                // An aggregate of compile-time scalars: its bytes.
+                const image = builder.*.allocator.alloc(size, 8)
+                if image != null {
+                    var target = image.?
+                    var index: usize = 0
+                    while index < size {
+                        target[index] = 0
+                        index += 1
+                    }
+                    if writeInitialBytes(builder, declaration.rhs, symbol.*.typeId, target) {
+                        bytes = target
+                        byte_count = size
+                    } else {
+                        recordUnsupportedBuiltin(builder, initializer.mainToken)
+                    }
+                }
+            } else if isScalarInitializer(initializer.tag) {
+                const initial = lowerComptimeValue(builder, declaration.rhs)
+                if initial.kind == comptime_value.Kind.integer || initial.kind == comptime_value.Kind.boolean {
+                    value = @bitCast(u64, @intCast(i64, initial.integer))
+                } else {
+                    recordUnsupportedBuiltin(builder, initializer.mainToken)
+                }
+            } else if initializer.tag != ast.Tag.undefined_literal && initializer.tag != ast.Tag.null_literal {
+                recordUnsupportedBuiltin(builder, initializer.mainToken)
+            }
+        }
+    }
+    if module_id != previous_module { switchToModule(builder, previous_module) }
+    var alignment = types_store.Store.alignOf(builder.*.typeStore, symbol.*.typeId)
+    if alignment == 0 { alignment = 1 }
+    if symbol.*.flags & symbol_module.FLAG_EXPORT != 0 {
+        return lir.addGlobal(builder.*.lir, symbol.*.namePointer, symbol.*.nameLength, size, alignment, value, bytes, byte_count, true, symbol_index)
+    }
+    const label = lir.globalLabel(builder.*.lir, lir.globalCount(builder.*.lir))
+    return lir.addGlobal(builder.*.lir, label.0, label.1, size, alignment, value, bytes, byte_count, false, symbol_index)
+}
+
+// The initializer shapes a compile-time scalar can take (what
+// lowerComptimeValue reads without the comptime evaluator).
+fn isScalarInitializer(tag: ast.Tag) -> bool {
+    return tag == ast.Tag.integer_literal || tag == ast.Tag.character_literal || tag == ast.Tag.boolean_literal || tag == ast.Tag.identifier || tag == ast.Tag.named_type || tag == ast.Tag.unary_expression || tag == ast.Tag.binary_expression || tag == ast.Tag.builtin_call || tag == ast.Tag.field_expression
+}
+
+// A global's aggregate initializer written into `target` (zeroed, the
+// type's size): array literals element by element, struct literals field
+// by field, scalars at their width; false for a value not known at
+// compile time.
+fn writeInitialBytes(builder: *LirBuilder, node_index: usize, type_id: usize, target: [*]u8) -> bool {
+    const nodes = getNodes(builder)
+    const node = ast_store.Store.get(nodes, node_index)
+    const value_type = types_store.Store.get(builder.*.typeStore, type_id)
+    if node.tag == ast.Tag.array_literal {
+        if value_type.*.kind != types_store.Kind.array { return false }
+        const element_type = value_type.*.lhs
+        const element_size = types_store.Store.sizeOf(builder.*.typeStore, element_type)
+        var child = node.lhs
+        var index: usize = 0
+        while child != ast.NONE {
+            if index >= value_type.*.bits { return false }
+            var element: [*]u8 = undefined
+            unsafe { element = @ptrFromInt([*]u8, @intFromPtr(target) + index * element_size) }
+            if !writeInitialBytes(builder, child, element_type, element) { return false }
+            child = ast_store.Store.get(nodes, child).next
+            index += 1
+        }
+        return true
+    }
+    if node.tag == ast.Tag.aggregate_literal {
+        if value_type.*.kind != types_store.Kind.struct_type { return false }
+        var initializer_index = node.rhs
+        while initializer_index != ast.NONE {
+            const initializer = ast_store.Store.get(nodes, initializer_index)
+            const metadata = fieldMetadata(builder, type_id, initializer.mainToken)
+            if !metadata.found { return false }
+            var field: [*]u8 = undefined
+            unsafe { field = @ptrFromInt([*]u8, @intFromPtr(target) + metadata.offset) }
+            if !writeInitialBytes(builder, initializer.rhs, metadata.typeId, field) { return false }
+            initializer_index = initializer.next
+        }
+        return true
+    }
+    if node.tag == ast.Tag.undefined_literal || node.tag == ast.Tag.null_literal { return true }
+    if !isScalarInitializer(node.tag) { return false }
+    const scalar = lowerComptimeValue(builder, node_index)
+    if scalar.kind != comptime_value.Kind.integer && scalar.kind != comptime_value.Kind.boolean { return false }
+    var width = types_store.Store.sizeOf(builder.*.typeStore, type_id)
+    if width == 0 || width > 8 { return false }
+    const bits = @bitCast(u64, @intCast(i64, scalar.integer))
+    var byte: usize = 0
+    while byte < width {
+        target[byte] = @intCast(u8, (bits >> @intCast(u6, byte * 8)) & 255)
+        byte += 1
+    }
+    return true
+}
+
+fn globalAddress(builder: *LirBuilder, symbol_index: usize) -> usize {
+    var inst = lir.initInst(lir.Opcode.global_address, lir.NONE)
+    inst.arg0 = globalIndexFor(builder, symbol_index)
+    return lir.addInst(builder.*.lir, inst)
+}
+
+// The module-level var called `name`, when there is one (the function's
+// bindings are looked up first by the callers).
+fn globalSymbolNamed(builder: *LirBuilder, name_ptr: [*]const u8, name_len: usize) -> (bool, usize) {
+    const module = loader_module.Loader.moduleAt(builder.*.loader, builder.*.currentModuleId)
+    if module.*.scopeAddress == 0 { return -> (false, 0) }
+    unsafe {
+        const scope = @ptrFromInt(*scope_module.Scope, module.*.scopeAddress)
+        const found = scope_module.Scope.lookup(scope, name_ptr, name_len)
+        if !found.0 { return -> (false, 0) }
+        if !isGlobalSymbol(symbols_store.Store.get(builder.*.symbolStore, found.1)) { return -> (false, 0) }
+        return -> (true, found.1)
+    }
+}
+
+// Whether an assignment's target (or an address taken) is a global: a bare
+// name that is no local, or `module.name`.
+fn globalTarget(builder: *LirBuilder, node_index: usize) -> (bool, usize) {
+    if node_index == ast.NONE { return -> (false, 0) }
+    const node = ast_store.Store.get(getNodes(builder), node_index)
+    if node.tag == ast.Tag.identifier {
+        const name_ptr = tokenPointer(builder, node.mainToken)
+        const name_len = tokenLength(builder, node.mainToken)
+        if @intFromPtr(findBindingRecord(builder, name_ptr, name_len)) != 0 { return -> (false, 0) }
+        return globalSymbolNamed(builder, name_ptr, name_len)
+    }
+    if node.tag == ast.Tag.field_expression {
+        const referenced = referencedSymbolIndex(builder, node_index)
+        if referenced.0 && isGlobalSymbol(symbols_store.Store.get(builder.*.symbolStore, referenced.1)) { return -> (true, referenced.1) }
+    }
+    return -> (false, 0)
+}
+
+// The value of a global: an aggregate is its address, a value of several
+// words (a slice) its words loaded, a scalar loaded at its width.
+fn lowerGlobalValue(builder: *LirBuilder, symbol_index: usize, symbol: *symbol_module.Symbol) -> usize {
+    return lowerMemoryValue(builder, globalAddress(builder, symbol_index), symbol.*.typeId)
 }
 
 // A module-level `export const NAME: T = value` of an integer type is a
@@ -647,6 +832,10 @@ pub fn unsupportedInstructionCount(builder: *LirBuilder) -> usize { return build
 pub fn firstUnsupportedInstructionOffset(builder: *LirBuilder) -> usize { return builder.*.firstUnsupportedOffset }
 
 pub fn firstUnsupportedInstructionLength(builder: *LirBuilder) -> usize { return builder.*.firstUnsupportedLength }
+
+// The module the first unsupported construct is in (the offset is into
+// its source).
+pub fn firstUnsupportedModuleId(builder: *LirBuilder) -> usize { return builder.*.firstUnsupportedModule }
 
 pub fn inlinedCallCount(builder: *LirBuilder) -> usize { return builder.*.inlinedCallCount }
 
@@ -994,6 +1183,9 @@ fn findBinding(builder: *LirBuilder, name_ptr: [*]const u8, name_len: usize) -> 
             }
         }
     }
+    // No local: a module-level var's storage.
+    const global = globalSymbolNamed(builder, name_ptr, name_len)
+    if global.0 { return globalAddress(builder, global.1) }
     return lir.NONE
 }
 
@@ -1906,15 +2098,134 @@ fn lowerMemoryValue(builder: *LirBuilder, address: usize, type_id: usize) -> usi
 }
 
 fn isUnsupportedRuntimeBuiltin(kind: builtins.Kind) -> bool {
-    return kind == builtins.Kind.atomicLoad || kind == builtins.Kind.atomicRmw || kind == builtins.Kind.atomicStore ||
-        kind == builtins.Kind.cmpxchgStrong || kind == builtins.Kind.cmpxchgWeak || kind == builtins.Kind.fence ||
-        kind == builtins.Kind.splat || kind == builtins.Kind.shuffle || kind == builtins.Kind.reduce || kind == builtins.Kind.select
+    return kind == builtins.Kind.splat || kind == builtins.Kind.shuffle || kind == builtins.Kind.reduce || kind == builtins.Kind.select
+}
+
+// The atomic builtins (sema/builtins/atomics.mlx, which checked the
+// arguments): T is the first argument, the orders and the operation are
+// names in the source and become the codes the backends read.
+fn lowerAtomic(builder: *LirBuilder, node_index: usize, kind: builtins.Kind) -> usize {
+    const nodes = getNodes(builder)
+    const node = ast_store.Store.get(nodes, node_index)
+    var arguments: [6]usize = [6]usize{ ast.NONE, ast.NONE, ast.NONE, ast.NONE, ast.NONE, ast.NONE }
+    var argument = node.lhs
+    var count: usize = 0
+    while argument != ast.NONE && count < 6 {
+        arguments[count] = argument
+        argument = ast_store.Store.get(nodes, argument).next
+        count += 1
+    }
+    if count != atomics.arity(kind) { return lir.NONE }
+    if kind == builtins.Kind.fence {
+        var fence = lir.initInst(lir.Opcode.fence, lir.NONE)
+        fence.arg0 = atomicName(builder, arguments[0], false)
+        return lir.addInst(builder.*.lir, fence)
+    }
+    const value_type = resolveTypeNode(builder, arguments[0])
+    if value_type == 0 { return lir.NONE }
+    const width = types_store.Store.sizeOf(builder.*.typeStore, value_type)
+    const signed: usize = if isSignedIntegerType(builder, value_type) { 1 } else { 0 }
+    const address = lowerNode(builder, arguments[1])
+    if address == lir.NONE { return lir.NONE }
+    if kind == builtins.Kind.atomicLoad {
+        var load = lir.initInst(lir.Opcode.atomic_load, value_type)
+        load.arg0 = address
+        load.arg1 = width
+        load.arg2 = signed | (atomicName(builder, arguments[2], false) << 4)
+        return lir.addInst(builder.*.lir, load)
+    }
+    if kind == builtins.Kind.atomicStore {
+        const value = atomicOperand(builder, arguments[2], value_type)
+        if value == lir.NONE { return lir.NONE }
+        var store = lir.initInst(lir.Opcode.atomic_store, lir.NONE)
+        store.arg0 = address
+        store.arg1 = value
+        store.arg2 = width | (atomicName(builder, arguments[3], false) << 8)
+        return lir.addInst(builder.*.lir, store)
+    }
+    if kind == builtins.Kind.atomicRmw {
+        const value = atomicOperand(builder, arguments[3], value_type)
+        if value == lir.NONE { return lir.NONE }
+        var rmw = lir.initInst(lir.Opcode.atomic_rmw, value_type)
+        rmw.arg0 = address
+        rmw.arg1 = value
+        rmw.arg2 = width | (atomicName(builder, arguments[2], true) << 8) | (atomicName(builder, arguments[4], false) << 16) | (signed << 24)
+        return lir.addInst(builder.*.lir, rmw)
+    }
+    // A compare-exchange: two words, whether it swapped and the value seen
+    // (the expected one when it did), like a call's two result words.
+    const expected = atomicOperand(builder, arguments[2], value_type)
+    const replacement = atomicOperand(builder, arguments[3], value_type)
+    if expected == lir.NONE || replacement == lir.NONE { return lir.NONE }
+    var exchange = lir.initInst(lir.Opcode.cmpxchg, expressionType(builder, node_index))
+    exchange.arg0 = address
+    exchange.arg1 = expected
+    exchange.arg2 = replacement
+    var width_code: usize = 3
+    if width == 1 { width_code = 0 } else if width == 2 { width_code = 1 } else if width == 4 { width_code = 2 }
+    const weak: usize = if kind == builtins.Kind.cmpxchgWeak { 16 } else { 0 }
+    // Bit 0 of flags is the optimizer's (lir.FLAG_RETAIN_NEXT).
+    exchange.flags = @intCast(u8, (width_code << 1) | (signed << 3) | weak | (atomicName(builder, arguments[4], false) << 5))
+    return lir.addInst(builder.*.lir, exchange)
+}
+
+// An order's or an operation's code from its name (0 when sema let an
+// unknown one through, which it does not).
+fn atomicName(builder: *LirBuilder, node_index: usize, operation: bool) -> usize {
+    const node = ast_store.Store.get(getNodes(builder), node_index)
+    const pointer = tokenPointer(builder, node.mainToken)
+    const length = tokenLength(builder, node.mainToken)
+    const code = if operation { atomics.opOf(pointer, length) } else { atomics.orderOf(pointer, length) }
+    return if code == atomics.NONE { 0 } else { code }
+}
+
+// A value argument of an atomic, as a T.
+// @spawnThread(flags, stack, parent_tid, child_tid, tls, entry, argument):
+// the seven operands, the integers widened to usize, in extraData for the
+// backends' clone sequence.
+fn lowerSpawnThread(builder: *LirBuilder, node_index: usize) -> usize {
+    const nodes = getNodes(builder)
+    const node = ast_store.Store.get(nodes, node_index)
+    var arguments: [7]usize = [7]usize{ ast.NONE, ast.NONE, ast.NONE, ast.NONE, ast.NONE, ast.NONE, ast.NONE }
+    var argument = node.lhs
+    var count: usize = 0
+    while argument != ast.NONE && count < 7 {
+        arguments[count] = argument
+        argument = ast_store.Store.get(nodes, argument).next
+        count += 1
+    }
+    if count != 7 { return lir.NONE }
+    const usize_type = types_store.Store.sizeInteger(builder.*.typeStore, false)
+    var operands: [7]usize = [7]usize{ lir.NONE, lir.NONE, lir.NONE, lir.NONE, lir.NONE, lir.NONE, lir.NONE }
+    var index: usize = 0
+    while index < 7 {
+        operands[index] = if index == 5 { lowerNode(builder, arguments[index]) } else { atomicOperand(builder, arguments[index], usize_type) }
+        if operands[index] == lir.NONE { return lir.NONE }
+        index += 1
+    }
+    const extra_start = lir.addExtra(builder.*.lir, operands[0])
+    index = 1
+    while index < 7 {
+        const added = lir.addExtra(builder.*.lir, operands[index])
+        index += 1
+    }
+    var spawn = lir.initInst(lir.Opcode.clone_thread, types_store.Store.sizeInteger(builder.*.typeStore, true))
+    spawn.arg0 = extra_start
+    spawn.arg1 = 7
+    return lir.addInst(builder.*.lir, spawn)
+}
+
+fn atomicOperand(builder: *LirBuilder, node_index: usize, value_type: usize) -> usize {
+    const value = lowerNode(builder, node_index)
+    if value == lir.NONE { return lir.NONE }
+    return widenToType(builder, narrowFloat(builder, value, value_type), value_type)
 }
 
 fn recordUnsupportedBuiltin(builder: *LirBuilder, token_index: usize) -> void {
     if builder.*.unsupportedLoweringCount == 0 {
         builder.*.firstUnsupportedOffset = tokenStart(builder, token_index)
         builder.*.firstUnsupportedLength = tokenLength(builder, token_index)
+        builder.*.firstUnsupportedModule = builder.*.currentModuleId
     }
     builder.*.unsupportedLoweringCount += 1
 }
@@ -1926,6 +2237,14 @@ fn lowerBuiltin(builder: *LirBuilder, node_index: usize) -> usize {
         recordUnsupportedBuiltin(builder, node.mainToken)
         return lir.NONE
     }
+    if atomics.isAtomic(kind) { return lowerAtomic(builder, node_index, kind) }
+    if kind == builtins.Kind.threadPointer {
+        return lir.addInst(builder.*.lir, lir.initInst(lir.Opcode.thread_pointer, types_store.Store.sizeInteger(builder.*.typeStore, false)))
+    }
+    if kind == builtins.Kind.frameAddress {
+        return lir.addInst(builder.*.lir, lir.initInst(lir.Opcode.frame_address, types_store.Store.sizeInteger(builder.*.typeStore, false)))
+    }
+    if kind == builtins.Kind.spawnThread { return lowerSpawnThread(builder, node_index) }
     if kind == builtins.Kind.typeOf || kind == builtins.Kind.childType { return lir.NONE }
     if kind == builtins.Kind.sizeOf || kind == builtins.Kind.alignOf || kind == builtins.Kind.bitSizeOf || kind == builtins.Kind.fieldCount || kind == builtins.Kind.offsetOf ||
        kind == builtins.Kind.isArray || kind == builtins.Kind.isBool || kind == builtins.Kind.isCopyable || kind == builtins.Kind.isEnum || kind == builtins.Kind.isErrorUnion || kind == builtins.Kind.isFloat || kind == builtins.Kind.isInteger || kind == builtins.Kind.isOptional || kind == builtins.Kind.isPointer || kind == builtins.Kind.isSigned || kind == builtins.Kind.isSlice || kind == builtins.Kind.isStruct || kind == builtins.Kind.isTuple || kind == builtins.Kind.isUnion {
@@ -2128,6 +2447,7 @@ fn lowerSymbolValue(builder: *LirBuilder, symbol_index: usize, symbol: *symbol_m
         function_inst.arg0 = sym_id
         return lir.addInst(builder.*.lir, function_inst)
     }
+    if isGlobalSymbol(symbol) { return lowerGlobalValue(builder, symbol_index, symbol) }
     return lowerStringConstant(builder, symbol, module_id)
 }
 
@@ -2377,6 +2697,19 @@ fn expressionTypeUncached(builder: *LirBuilder, node_index: usize) -> usize {
             return 0
         }
         if kind == builtins.Kind.move && node.lhs != ast.NONE { return expressionType(builder, node.lhs) }
+        // The atomics: T (the first argument) for a load and a read-modify-
+        // write, (bool, T) for a compare-exchange, nothing for the rest.
+        if kind == builtins.Kind.atomicLoad || kind == builtins.Kind.atomicRmw { return resolveTypeNode(builder, node.lhs) }
+        if atomics.isCompareExchange(kind) {
+            const value_type = resolveTypeNode(builder, node.lhs)
+            if value_type == 0 { return 0 }
+            const elements_start = types_store.Store.appendExtra(builder.*.typeStore, types_store.Store.primitive(builder.*.typeStore, types_store.Kind.bool_type))
+            const appended = types_store.Store.appendExtra(builder.*.typeStore, value_type)
+            return types_store.Store.tuple(builder.*.typeStore, elements_start, 2)
+        }
+        if kind == builtins.Kind.atomicStore || kind == builtins.Kind.fence { return types_store.Store.primitive(builder.*.typeStore, types_store.Kind.void_type) }
+        if kind == builtins.Kind.threadPointer || kind == builtins.Kind.frameAddress { return types_store.Store.sizeInteger(builder.*.typeStore, false) }
+        if kind == builtins.Kind.spawnThread { return types_store.Store.sizeInteger(builder.*.typeStore, true) }
         return 0
     }
     if node.tag == ast.Tag.field_expression && node.lhs != ast.NONE {
@@ -2452,7 +2785,18 @@ fn expressionTypeUncached(builder: *LirBuilder, node_index: usize) -> usize {
         if types_store.Store.isCoercible(builder.*.typeStore, left_type, right_type) { return right_type }
         return left_type
     }
-    if node.tag == ast.Tag.if_statement { return expressionType(builder, node.rhs) }
+    if node.tag == ast.Tag.if_statement {
+        // `if c { 1 } else { size }` is a usize: a branch that is a bare
+        // literal takes the other branch's type.
+        const then_type = expressionType(builder, node.rhs)
+        if node.extra == ast.NONE || then_type == 0 { return if node.extra == ast.NONE { then_type } else { expressionType(builder, node.extra) } }
+        const then_value = types_store.Store.get(builder.*.typeStore, then_type)
+        if then_value.*.kind == types_store.Kind.comptime_int_type || then_value.*.kind == types_store.Kind.comptime_float_type {
+            const else_type = expressionType(builder, node.extra)
+            if else_type != 0 { return else_type }
+        }
+        return then_type
+    }
     if node.tag == ast.Tag.match_statement && node.rhs != ast.NONE {
         const first_arm = ast_store.Store.get(nodes, node.rhs)
         return expressionType(builder, first_arm.rhs)
@@ -2686,7 +3030,11 @@ fn lowerAddress(builder: *LirBuilder, node_index: usize) -> usize {
     if node.tag == ast.Tag.identifier {
         return findBinding(builder, tokenPointer(builder, node.mainToken), tokenLength(builder, node.mainToken))
     }
-    if node.tag == ast.Tag.field_expression { return lowerFieldAddress(builder, node_index) }
+    if node.tag == ast.Tag.field_expression {
+        const global = globalTarget(builder, node_index)
+        if global.0 { return globalAddress(builder, global.1) }
+        return lowerFieldAddress(builder, node_index)
+    }
     if node.tag == ast.Tag.index_expression { return lowerIndexAddress(builder, node_index) }
     if node.tag == ast.Tag.unary_expression && tokenKind(builder, node.mainToken) == lexer.Kind.dot_asterisk { return lowerNode(builder, node.lhs) }
     return lir.NONE
@@ -2982,6 +3330,7 @@ fn isDiscardTarget(builder: *LirBuilder, node_index: usize) -> bool {
 }
 
 fn isMemoryAggregateTarget(builder: *LirBuilder, node_index: usize, type_id: usize) -> bool {
+    if globalTarget(builder, node_index).0 { return aggregate_copy.isMemoryType(builder.*.typeStore, type_id) }
     const node = ast_store.Store.get(getNodes(builder), node_index)
     const addresses_inline_storage = node.tag == ast.Tag.field_expression || node.tag == ast.Tag.index_expression || node.tag == ast.Tag.unary_expression && tokenKind(builder, node.mainToken) == lexer.Kind.dot_asterisk
     return addresses_inline_storage && aggregate_copy.isMemoryType(builder.*.typeStore, type_id)
@@ -3037,7 +3386,7 @@ fn lowerBinaryOp(builder: *LirBuilder, node_index: usize) -> usize {
                 setBindingDropFlag(builder, n.lhs, 1)
                 return stored
             }
-            if target_node.tag != ast.Tag.identifier {
+            if target_node.tag != ast.Tag.identifier || globalTarget(builder, n.lhs).0 {
                 storeAggregateValue(builder, address, rhs_value, target_type)
                 setBindingDropFlag(builder, n.lhs, 1)
                 return rhs_value
@@ -3074,7 +3423,11 @@ fn lowerBinaryOp(builder: *LirBuilder, node_index: usize) -> usize {
         var pred: usize = 0
         if kind == lexer.Kind.equal_equal { pred = @intCast(usize, @intFromEnum(lir.CmpPredicate.eq)) }
         if kind == lexer.Kind.bang_equal { pred = @intCast(usize, @intFromEnum(lir.CmpPredicate.ne)) }
-        const unsigned = isUnsignedIntegerType(builder, expressionType(builder, n.lhs))
+        // Unsigned when either side is an unsigned integer (the other may
+        // be a literal, which has no signedness of its own).
+        const left_type = expressionType(builder, n.lhs)
+        const right_type = expressionType(builder, n.rhs)
+        const unsigned = isUnsignedIntegerType(builder, left_type) || (!isSignedIntegerType(builder, left_type) && isUnsignedIntegerType(builder, right_type))
         if kind == lexer.Kind.less { pred = @intCast(usize, @intFromEnum(if unsigned { lir.CmpPredicate.ult } else { lir.CmpPredicate.lt })) }
         if kind == lexer.Kind.less_equal { pred = @intCast(usize, @intFromEnum(if unsigned { lir.CmpPredicate.ule } else { lir.CmpPredicate.le })) }
         if kind == lexer.Kind.greater { pred = @intCast(usize, @intFromEnum(if unsigned { lir.CmpPredicate.ugt } else { lir.CmpPredicate.gt })) }
@@ -4081,6 +4434,9 @@ fn lowerDereference(builder: *LirBuilder, node_index: usize, operand: usize) -> 
     var load = lir.initInst(lir.Opcode.load, child_type_id)
     load.arg0 = operand
     load.arg1 = storageWidth(builder, child_type_id)
+    // A narrow signed value read through a pointer is sign-extended like
+    // every other load of its type, so `pointer.* >= 0` holds for -1.
+    load.arg2 = if isSignedIntegerType(builder, child_type_id) { 1 } else { 0 }
     return lir.addInst(builder.*.lir, load)
 }
 

@@ -3,6 +3,19 @@ const lir_module = @import("../../../ir/lir.mlx")
 const state_module = @import("./state.mlx")
 const runtime = @import("./runtime.mlx")
 
+// The atomics' codes, sema/builtins/atomics.mlx's.
+const ORDER_ACQUIRE: usize = 2
+const ORDER_RELEASE: usize = 3
+const OP_XCHG: usize = 0
+const OP_ADD: usize = 1
+const OP_SUB: usize = 2
+const OP_AND: usize = 3
+const OP_NAND: usize = 4
+const OP_OR: usize = 5
+const OP_XOR: usize = 6
+const OP_MAX: usize = 7
+const OP_MIN: usize = 8
+
 pub const Memory = struct {
     pub fn emit(state: *state_module.State, index: usize, instruction: lir_module.Inst) -> bool {
         match instruction.opcode {
@@ -17,6 +30,14 @@ pub const Memory = struct {
             lir_module.Opcode.bitcast => { Self.emitCopy(state, index, instruction) },
             lir_module.Opcode.aggregate_copy => { Self.emitCopy(state, index, instruction) },
             lir_module.Opcode.mem_copy => { Self.emitMemCopy(state, instruction) },
+            lir_module.Opcode.atomic_load => { Self.emitAtomicLoad(state, index, instruction) },
+            lir_module.Opcode.atomic_store => { Self.emitAtomicStore(state, instruction) },
+            lir_module.Opcode.atomic_rmw => { Self.emitAtomicRmw(state, index, instruction) },
+            lir_module.Opcode.cmpxchg => { Self.emitCompareExchange(state, index, instruction) },
+            lir_module.Opcode.fence => { Self.emitFence(state, instruction) },
+            lir_module.Opcode.thread_pointer => { Self.emitThreadPointer(state, index) },
+            lir_module.Opcode.frame_address => { Self.emitFrameAddress(state, index) },
+            lir_module.Opcode.clone_thread => { Self.emitCloneThread(state, index, instruction) },
             else => { return false },
         }
         return true
@@ -53,6 +74,48 @@ pub const Memory = struct {
         state_module.State.storeResult(state, index, encoder.X0)
     }
 
+    // The thread pointer: TPIDR_EL0 (mrs x0, tpidr_el0).
+    // mov x0, x29: the frame pointer.
+    fn emitFrameAddress(state: *state_module.State, index: usize) -> void {
+        encoder.emit32(state.*.enc, 0xAA1D03E0)
+        state_module.State.storeResult(state, index, encoder.X0)
+    }
+
+    fn emitThreadPointer(state: *state_module.State, index: usize) -> void {
+        encoder.emit32(state.*.enc, 0xD53BD040)
+        state_module.State.storeResult(state, index, encoder.X0)
+    }
+
+    // clone(flags, stack, parent_tid, tls, child_tid) (this architecture's
+    // order) with argument and entry stored at the new stack's top first:
+    // the child loads them from its sp, calls entry(argument) and exits the
+    // thread with the result; the parent keeps the child's id or -errno.
+    fn emitCloneThread(state: *state_module.State, index: usize, instruction: lir_module.Inst) -> void {
+        const operands = instruction.arg0
+        state_module.State.loadOp(state, encoder.X0, lir_module.getExtra(state.*.lir, operands))
+        state_module.State.loadOp(state, encoder.X1, lir_module.getExtra(state.*.lir, operands + 1))
+        state_module.State.loadOp(state, encoder.X2, lir_module.getExtra(state.*.lir, operands + 2))
+        state_module.State.loadOp(state, 4, lir_module.getExtra(state.*.lir, operands + 3))
+        state_module.State.loadOp(state, encoder.X3, lir_module.getExtra(state.*.lir, operands + 4))
+        state_module.State.loadOp(state, 5, lir_module.getExtra(state.*.lir, operands + 5))
+        state_module.State.loadOp(state, 6, lir_module.getExtra(state.*.lir, operands + 6))
+        encoder.emit32(state.*.enc, encoder.subImm(encoder.X1, encoder.X1, 16))
+        encoder.emit32(state.*.enc, encoder.strX(6, encoder.X1, 0))
+        encoder.emit32(state.*.enc, encoder.strX(5, encoder.X1, 8))
+        encoder.emitLoadImm(state.*.enc, encoder.X8, 220)
+        encoder.emit32(state.*.enc, encoder.SVC0)
+        const branch = encoder.pos(state.*.enc)
+        encoder.emit32(state.*.enc, 0)
+        encoder.emit32(state.*.enc, encoder.ldrX(encoder.X0, encoder.SP, 0))
+        encoder.emit32(state.*.enc, encoder.ldrX(encoder.X1, encoder.SP, 8))
+        encoder.emit32(state.*.enc, encoder.addImm(encoder.SP, encoder.SP, 16))
+        encoder.emit32(state.*.enc, encoder.blr(encoder.X1))
+        encoder.emitLoadImm(state.*.enc, encoder.X8, 93)
+        encoder.emit32(state.*.enc, encoder.SVC0)
+        encoder.patch32(state.*.enc, branch, encoder.cbnzX(encoder.X0, encoder.delta(branch, encoder.pos(state.*.enc))))
+        state_module.State.storeResult(state, index, encoder.X0)
+    }
+
     fn emitGep(state: *state_module.State, index: usize, instruction: lir_module.Inst) -> void {
         state_module.State.loadOp(state, encoder.X1, instruction.arg1)
         state_module.State.loadOp(state, encoder.X0, instruction.arg0)
@@ -75,6 +138,102 @@ pub const Memory = struct {
         const width = if instruction.arg1 == lir_module.NONE { 8 } else { instruction.arg1 }
         encoder.emitLoadPointer(state.*.enc, encoder.X0, encoder.X0, width, instruction.arg2 == 1)
         state_module.State.storeResult(state, index, encoder.X0)
+    }
+
+    // The atomics (lir.mlx; the codes are sema/builtins/atomics.mlx's):
+    // LDAR and STLR for the acquiring loads and releasing stores, plain
+    // accesses below those orders, and for the read-modify-writes and the
+    // compare-exchange a loop of LDAXR, the operation and STLXR until the
+    // store succeeds; a fence is DMB ISH (ISHLD for acquire alone).
+    fn sizeCode(width: usize) -> u32 {
+        if width == 1 { return 0 }
+        if width == 2 { return 1 }
+        if width == 4 { return 2 }
+        return 3
+    }
+
+    fn emitAtomicLoad(state: *state_module.State, index: usize, instruction: lir_module.Inst) -> void {
+        state_module.State.loadOp(state, encoder.X1, instruction.arg0)
+        const width = instruction.arg1
+        const signed = instruction.arg2 & 1 != 0
+        if instruction.arg2 >> 4 >= ORDER_ACQUIRE {
+            encoder.emit32(state.*.enc, encoder.ldarSized(Self.sizeCode(width), encoder.X0, encoder.X1))
+            if signed && width < 8 { encoder.emit32(state.*.enc, encoder.sbfmLow(encoder.X0, encoder.X0, @intCast(u32, width * 8))) }
+        } else {
+            encoder.emitLoadPointer(state.*.enc, encoder.X0, encoder.X1, width, signed)
+        }
+        state_module.State.storeResult(state, index, encoder.X0)
+    }
+
+    fn emitAtomicStore(state: *state_module.State, instruction: lir_module.Inst) -> void {
+        state_module.State.loadOp(state, encoder.X1, instruction.arg0)
+        state_module.State.loadOp(state, encoder.X0, instruction.arg1)
+        const width = instruction.arg2 & 255
+        if instruction.arg2 >> 8 >= ORDER_RELEASE {
+            encoder.emit32(state.*.enc, encoder.stlrSized(Self.sizeCode(width), encoder.X0, encoder.X1))
+        } else {
+            encoder.emitStorePointer(state.*.enc, encoder.X1, encoder.X0, width)
+        }
+    }
+
+    // x1 the address, x2 the operand, x0 the value seen (the result), x3 the
+    // new value, w4 the store's status.
+    fn emitAtomicRmw(state: *state_module.State, index: usize, instruction: lir_module.Inst) -> void {
+        state_module.State.loadOp(state, encoder.X1, instruction.arg0)
+        state_module.State.loadOp(state, encoder.X2, instruction.arg1)
+        const width = instruction.arg2 & 255
+        const op = (instruction.arg2 >> 8) & 255
+        const signed = (instruction.arg2 >> 24) & 1 != 0
+        const size = Self.sizeCode(width)
+        const loop = encoder.pos(state.*.enc)
+        encoder.emit32(state.*.enc, encoder.ldaxrSized(size, encoder.X0, encoder.X1))
+        if signed && width < 8 { encoder.emit32(state.*.enc, encoder.sbfmLow(encoder.X0, encoder.X0, @intCast(u32, width * 8))) }
+        if op == OP_XCHG { encoder.emit32(state.*.enc, encoder.movReg(encoder.X3, encoder.X2)) }
+        if op == OP_ADD { encoder.emit32(state.*.enc, encoder.addReg(encoder.X3, encoder.X0, encoder.X2)) }
+        if op == OP_SUB { encoder.emit32(state.*.enc, encoder.subReg(encoder.X3, encoder.X0, encoder.X2)) }
+        if op == OP_AND || op == OP_NAND { encoder.emit32(state.*.enc, encoder.andReg(encoder.X3, encoder.X0, encoder.X2)) }
+        if op == OP_NAND { encoder.emit32(state.*.enc, encoder.mvn(encoder.X3, encoder.X3)) }
+        if op == OP_OR { encoder.emit32(state.*.enc, encoder.orrReg(encoder.X3, encoder.X0, encoder.X2)) }
+        if op == OP_XOR { encoder.emit32(state.*.enc, encoder.eorReg(encoder.X3, encoder.X0, encoder.X2)) }
+        if op == OP_MAX || op == OP_MIN {
+            encoder.emit32(state.*.enc, encoder.cmpReg(encoder.X0, encoder.X2))
+            var condition = if signed { encoder.COND_GE } else { encoder.COND_HS }
+            if op == OP_MIN { condition = if signed { encoder.COND_LE } else { encoder.COND_LS } }
+            encoder.emit32(state.*.enc, encoder.csel(encoder.X3, encoder.X0, encoder.X2, condition))
+        }
+        encoder.emit32(state.*.enc, encoder.stlxrSized(size, 4, encoder.X3, encoder.X1))
+        encoder.emit32(state.*.enc, encoder.cbnzW(4, encoder.delta(encoder.pos(state.*.enc), loop)))
+        state_module.State.storeResult(state, index, encoder.X0)
+    }
+
+    // x1 the address, x2 the expected value, x3 the new one; x0 the value
+    // seen, and the flags of the compare say whether it swapped (the two
+    // result words, like a call's: the flag, then the value). The exclusive
+    // load zero-extends, so the expected value is compared at the width.
+    fn emitCompareExchange(state: *state_module.State, index: usize, instruction: lir_module.Inst) -> void {
+        state_module.State.loadOp(state, encoder.X1, instruction.arg0)
+        state_module.State.loadOp(state, encoder.X2, instruction.arg1)
+        state_module.State.loadOp(state, encoder.X3, instruction.arg2)
+        const width: usize = @intCast(usize, 1) << @intCast(u6, (instruction.flags >> 1) & 3)
+        const signed = instruction.flags & 8 != 0
+        const size = Self.sizeCode(width)
+        if width < 8 { encoder.emit32(state.*.enc, encoder.ubfmLow(encoder.X2, encoder.X2, @intCast(u32, width * 8))) }
+        const loop = encoder.pos(state.*.enc)
+        encoder.emit32(state.*.enc, encoder.ldaxrSized(size, encoder.X0, encoder.X1))
+        encoder.emit32(state.*.enc, encoder.cmpReg(encoder.X0, encoder.X2))
+        const to_done = encoder.pos(state.*.enc)
+        encoder.emit32(state.*.enc, 0)
+        encoder.emit32(state.*.enc, encoder.stlxrSized(size, 4, encoder.X3, encoder.X1))
+        encoder.emit32(state.*.enc, encoder.cbnzW(4, encoder.delta(encoder.pos(state.*.enc), loop)))
+        encoder.patch32(state.*.enc, to_done, encoder.bCond(encoder.COND_NE, encoder.delta(to_done, encoder.pos(state.*.enc))))
+        encoder.emit32(state.*.enc, encoder.cset(5, encoder.COND_EQ))
+        if signed && width < 8 { encoder.emit32(state.*.enc, encoder.sbfmLow(encoder.X0, encoder.X0, @intCast(u32, width * 8))) }
+        state_module.State.storeResult(state, index, 5)
+        encoder.emitStoreSlot(state.*.enc, state_module.State.allocateSecondaryOp(state, index), encoder.X0)
+    }
+
+    fn emitFence(state: *state_module.State, instruction: lir_module.Inst) -> void {
+        encoder.emit32(state.*.enc, if instruction.arg0 == ORDER_ACQUIRE { encoder.DMB_ISHLD } else { encoder.DMB_ISH })
     }
 
     // x0 = destination, x1 = source, x2 = byte count, then the runtime's

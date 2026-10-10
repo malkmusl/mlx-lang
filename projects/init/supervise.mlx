@@ -1,0 +1,452 @@
+// Supervision: starting the services in their order (`after`, `ready`),
+// reaping what ends, starting again after a pause that grows while a
+// service keeps failing, and stopping on request (SIGTERM to the
+// service's process group, SIGKILL once its stop-timeout is over).
+const std = @import("std")
+const linux = @import("./linux.mlx")
+const config = @import("./config.mlx")
+
+const Service = config.Service
+const State = config.State
+
+const FIRST_DELAY: usize = 1000
+const MAX_DELAY: usize = 30000
+// A service that ran this long before it ended starts again after the
+// first delay, not a longer one.
+const STABLE_RUN: usize = 60000
+// How often a service's ready path is looked for.
+const READY_POLL: usize = 100
+const MAX_ARGUMENTS: usize = 64
+const MAX_ENVIRONMENT: usize = 48
+const SEARCH_PATH: []const u8 = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+fn now() -> usize { return std.time.milliseconds() }
+
+// Whether every service named in `after` runs (or, a oneshot, finished).
+// A name nobody defines is said once and does not hold the service up.
+fn dependenciesMet(state: *State, service: *Service) -> bool {
+    const list = config.after(service)
+    var start: usize = 0
+    while start < list.length {
+        while start < list.length && list[start] == 32 { start += 1 }
+        var end = start
+        while end < list.length && list[end] != 32 { end += 1 }
+        if end > start {
+            const found = config.find(state, list[start..end])
+            if found == null {
+                if !service.*.warned {
+                    config.sayAbout(service, "waits for a service that is not defined (after)", false, 0)
+                    service.*.warned = true
+                }
+            } else {
+                const dependency = found.?
+                if dependency.*.state != config.RUNNING && dependency.*.state != config.DONE { return false }
+            }
+        }
+        start = end
+    }
+    return true
+}
+
+fn advance(bytes: [*]u8, by: usize) -> [*]const u8 {
+    var result: [*]const u8 = undefined
+    unsafe { result = @ptrFromInt([*]const u8, @intFromPtr(bytes) + by) }
+    return result
+}
+
+// The command line as argv: words split at blanks, double quotes keeping
+// theirs; the words NUL-terminated in `storage`, `items` ended by null.
+fn splitCommand(line: []const u8, storage: [*]u8, capacity: usize, items: [*][*]const u8) -> usize {
+    var count: usize = 0
+    var used: usize = 0
+    var at: usize = 0
+    while at < line.length && count + 1 < MAX_ARGUMENTS {
+        while at < line.length && (line[at] == 32 || line[at] == 9) { at += 1 }
+        if at >= line.length { break }
+        items[count] = advance(storage, used)
+        var quoted = false
+        while at < line.length && (quoted || (line[at] != 32 && line[at] != 9)) {
+            if line[at] == 34 {
+                quoted = !quoted
+            } else if used + 1 < capacity {
+                storage[used] = line[at]
+                used += 1
+            }
+            at += 1
+        }
+        storage[used] = 0
+        used += 1
+        count += 1
+    }
+    unsafe { items[count] = @ptrFromInt([*]const u8, 0) }
+    return count
+}
+
+fn addEntry(storage: [*]u8, capacity: usize, used: usize, items: [*][*]const u8, count: *usize, key: []const u8, value: []const u8) -> usize {
+    if used + key.length + value.length + 1 > capacity || count.* + 1 >= MAX_ENVIRONMENT { return used }
+    items[count.*] = advance(storage, used)
+    var at = std.text.append(storage, used, capacity, key)
+    at = std.text.append(storage, at, capacity, value)
+    storage[at] = 0
+    count.* += 1
+    return at + 1
+}
+
+// The service's environment: PATH, HOME, TERM, where the init listens,
+// then its own `env` entries.
+fn buildEnvironment(state: *State, service: *Service, storage: [*]u8, capacity: usize, items: [*][*]const u8) -> usize {
+    var count: usize = 0
+    var used = addEntry(storage, capacity, 0, items, &count, "PATH=", SEARCH_PATH)
+    used = addEntry(storage, capacity, used, items, &count, "HOME=", "/")
+    used = addEntry(storage, capacity, used, items, &count, "TERM=", "linux")
+    used = addEntry(storage, capacity, used, items, &count, "MLX_INIT_CONTROL=", config.controlPath(state))
+    const own = config.environment(service)
+    var start: usize = 0
+    while start < own.length {
+        var end = start
+        while end < own.length && own[end] != 0 { end += 1 }
+        if end > start { used = addEntry(storage, capacity, used, items, &count, own[start..end], "") }
+        start = end + 1
+    }
+    unsafe { items[count] = @ptrFromInt([*]const u8, 0) }
+    return count
+}
+
+// execve the program, looked up along SEARCH_PATH when it has no slash.
+// Returns only when nothing could run.
+fn execute(program: [*]const u8, arguments: [*][*]const u8, environment: [*][*]const u8) -> void {
+    var length: usize = 0
+    var has_slash = false
+    while program[length] != 0 {
+        if program[length] == 47 { has_slash = true }
+        length += 1
+    }
+    if has_slash {
+        const ignored = linux.execute(program, arguments, environment)
+        return
+    }
+    var candidate: [1024]u8 = undefined
+    var candidate_bytes: [*]u8 = undefined
+    unsafe { candidate_bytes = @ptrCast([*]u8, &candidate) }
+    var start: usize = 0
+    while start <= SEARCH_PATH.length {
+        var end = start
+        while end < SEARCH_PATH.length && SEARCH_PATH[end] != 58 { end += 1 }
+        if end > start && end - start + length + 2 < 1024 {
+            var at = std.text.append(candidate_bytes, 0, 1024, SEARCH_PATH[start..end])
+            at = std.text.append(candidate_bytes, at, 1024, "/")
+            at = std.text.append(candidate_bytes, at, 1024, program[0..length])
+            candidate[at] = 0
+            const ignored = linux.execute(candidate_bytes, arguments, environment)
+        }
+        start = end + 1
+    }
+}
+
+// Where the service's output goes without `log` or `stdio`:
+// LOGDIR/NAME.log.
+fn logPath(state: *State, service: *Service, into: [*]u8, capacity: usize) -> usize {
+    const own = config.log(service)
+    if own.length > 0 { return std.text.append(into, 0, capacity, own) }
+    var length = std.text.append(into, 0, capacity, config.logDirectory(state))
+    length = std.text.append(into, length, capacity, "/")
+    length = std.text.append(into, length, capacity, config.name(service))
+    return std.text.append(into, length, capacity, ".log")
+}
+
+// The child's side: a session of its own, stdio on its terminal or its
+// log, then the program.
+fn child(state: *State, service: *Service, arguments: [*][*]const u8, environment: [*][*]const u8, log: []const u8) -> void {
+    linux.unblockAllSignals()
+    const session = linux.setSession()
+    const terminal_path = config.stdio(service)
+    if terminal_path.length > 0 {
+        const terminal = linux.open(terminal_path, linux.O_RDWR | linux.O_NOCTTY, 0)
+        if terminal >= 0 {
+            const controlling = linux.ioctl(terminal, linux.TIOCSCTTY, 0)
+            const stdin_set = linux.dup2(terminal, 0)
+            const stdout_set = linux.dup2(terminal, 1)
+            const stderr_set = linux.dup2(terminal, 2)
+            if terminal > 2 { linux.close(terminal) }
+        }
+    } else if !std.text.same(log, "console") {
+        const input = linux.open("/dev/null", linux.O_RDONLY, 0)
+        if input >= 0 {
+            const stdin_set = linux.dup2(input, 0)
+            if input > 2 { linux.close(input) }
+        }
+        const output = linux.open(log, linux.O_WRONLY | linux.O_CREAT | linux.O_APPEND, 420)
+        if output >= 0 {
+            const stdout_set = linux.dup2(output, 1)
+            const stderr_set = linux.dup2(output, 2)
+            if output > 2 { linux.close(output) }
+        }
+    }
+    execute(arguments[0], arguments, environment)
+    config.sayAbout(service, "cannot run its program", false, 0)
+    linux.exit(127)
+}
+
+// Starts the service's process and notes it: running at once, or starting
+// until its ready path appears (a oneshot: until it ends).
+fn spawn(state: *State, service: *Service, at: usize) -> void {
+    var storage: [config.LINE_CAPACITY + MAX_ARGUMENTS]u8 = undefined
+    var items: [MAX_ARGUMENTS][*]const u8 = undefined
+    var environment_storage: [2048]u8 = undefined
+    var environment_items: [MAX_ENVIRONMENT][*]const u8 = undefined
+    var storage_bytes: [*]u8 = undefined
+    var items_pointer: [*][*]const u8 = undefined
+    var environment_bytes: [*]u8 = undefined
+    var environment_pointer: [*][*]const u8 = undefined
+    unsafe {
+        storage_bytes = @ptrCast([*]u8, &storage)
+        items_pointer = @ptrCast([*][*]const u8, &items)
+        environment_bytes = @ptrCast([*]u8, &environment_storage)
+        environment_pointer = @ptrCast([*][*]const u8, &environment_items)
+    }
+    const count = splitCommand(config.exec(service), storage_bytes, config.LINE_CAPACITY + MAX_ARGUMENTS, items_pointer)
+    if count == 0 {
+        config.sayAbout(service, "has nothing to run (no exec line)", false, 0)
+        service.*.wanted = false
+        service.*.state = config.STOPPED
+        return
+    }
+    const entries = buildEnvironment(state, service, environment_bytes, 2048, environment_pointer)
+    var log: [config.PATH_CAPACITY + config.NAME_CAPACITY + 8]u8 = undefined
+    var log_bytes: [*]u8 = undefined
+    unsafe { log_bytes = @ptrCast([*]u8, &log) }
+    const log_length = logPath(state, service, log_bytes, config.PATH_CAPACITY + config.NAME_CAPACITY + 8)
+    const pid = linux.fork()
+    if pid < 0 {
+        config.sayAbout(service, "could not be started (fork failed), trying again later", false, 0)
+        service.*.delay = if service.*.delay == 0 { FIRST_DELAY } else { service.*.delay }
+        service.*.restartAt = at + service.*.delay
+        service.*.state = config.RESTARTING
+        return
+    }
+    if pid == 0 { child(state, service, items_pointer, environment_pointer, log_bytes[0..log_length]) }
+    service.*.pid = pid
+    service.*.startedAt = at
+    service.*.killed = false
+    state.*.sequence += 1
+    service.*.order = state.*.sequence
+    if service.*.oneshot || service.*.readyLength > 0 { service.*.state = config.STARTING } else { service.*.state = config.RUNNING }
+    if state.*.verbose { config.sayAbout(service, "started, pid ", true, @intCast(usize, pid)) }
+}
+
+fn byPid(state: *State, pid: isize) -> ?*Service {
+    var index: usize = 0
+    while index < state.*.count {
+        const service = config.serviceAt(state, index)
+        if service.*.pid == pid { return service }
+        index += 1
+    }
+    return null
+}
+
+fn smaller(left: usize, right: usize) -> usize { return if left < right { left } else { right } }
+
+// A service's process ended: stopped (by request, or for a restart), a
+// oneshot finished, or it is to run again after its pause.
+fn ended(state: *State, service: *Service, status: usize, at: usize) -> void {
+    service.*.pid = 0
+    service.*.lastStatus = status
+    if service.*.state == config.STOPPING {
+        service.*.state = config.STOPPED
+        if service.*.wanted {
+            // A restart: at once.
+            service.*.delay = 0
+            if state.*.verbose { config.sayAbout(service, "stopped, starting again", false, 0) }
+        } else {
+            config.sayAbout(service, "stopped", false, 0)
+        }
+        return
+    }
+    if service.*.oneshot && status == 0 {
+        service.*.state = config.DONE
+        if state.*.verbose { config.sayAbout(service, "finished", false, 0) }
+        return
+    }
+    const ran = at - service.*.startedAt
+    if status == 0 { config.sayAbout(service, "ended", false, 0) } else { config.sayAbout(service, "ended with status ", true, status) }
+    if !service.*.wanted || service.*.restart == config.RESTART_NEVER || (service.*.restart == config.RESTART_ON_FAILURE && status == 0) {
+        service.*.state = config.STOPPED
+        return
+    }
+    if ran >= STABLE_RUN || service.*.delay == 0 { service.*.delay = FIRST_DELAY } else { service.*.delay = smaller(service.*.delay * 2, MAX_DELAY) }
+    service.*.restartAt = at + service.*.delay
+    service.*.restarts += 1
+    service.*.state = config.RESTARTING
+    config.sayAbout(service, "starting again in ms: ", true, service.*.delay)
+}
+
+// Reaps every ended child: the services' processes, and orphans that came
+// to PID 1.
+pub fn reapAll(state: *State) -> void {
+    const at = now()
+    var more = true
+    while more {
+        var raw: usize = 0
+        const pid = linux.reap(&raw)
+        if pid <= 0 {
+            more = false
+        } else {
+            const found = byPid(state, pid)
+            if found == null {
+                if state.*.verbose { config.sayWith("reaped a process of nobody's, pid ", "", true, @intCast(usize, pid)) }
+            } else {
+                ended(state, found.?, linux.exitStatus(raw), at)
+            }
+        }
+    }
+}
+
+// SIGTERM to the service's process group; stopping from now.
+fn terminate(service: *Service, at: usize) -> void {
+    const sent = linux.kill(0 - service.*.pid, linux.SIGTERM)
+    service.*.state = config.STOPPING
+    service.*.stoppingSince = at
+    service.*.killed = false
+}
+
+// Moves every service along: stops what is not wanted, kills what did not
+// stop in time, starts what may start (its dependencies met, its pause
+// over), and takes a starting service as running once its ready path is
+// there or its ready-timeout is over. Starting one service can let others
+// start, so it goes round until nothing changes.
+pub fn tick(state: *State) -> void {
+    const at = now()
+    var changed = true
+    while changed {
+        changed = false
+        var index: usize = 0
+        while index < state.*.count {
+            const service = config.serviceAt(state, index)
+            if service.*.state == config.STOPPING {
+                if !service.*.killed && at - service.*.stoppingSince >= service.*.stopTimeout {
+                    const sent = linux.kill(0 - service.*.pid, linux.SIGKILL)
+                    service.*.killed = true
+                    config.sayAbout(service, "did not stop in time, killed", false, 0)
+                }
+            } else if !service.*.wanted {
+                if service.*.pid > 0 {
+                    terminate(service, at)
+                } else if service.*.state == config.WAITING || service.*.state == config.RESTARTING {
+                    service.*.state = config.STOPPED
+                }
+            } else if service.*.state == config.STOPPED || service.*.state == config.WAITING || (service.*.state == config.RESTARTING && at >= service.*.restartAt) {
+                if dependenciesMet(state, service) {
+                    spawn(state, service, at)
+                    changed = true
+                } else if service.*.state != config.WAITING {
+                    service.*.state = config.WAITING
+                }
+            } else if service.*.state == config.STARTING && !service.*.oneshot {
+                if service.*.readyLength == 0 || linux.exists(config.ready(service)) {
+                    service.*.state = config.RUNNING
+                    changed = true
+                    if state.*.verbose { config.sayAbout(service, "ready", false, 0) }
+                } else if at - service.*.startedAt >= service.*.readyTimeout {
+                    service.*.state = config.RUNNING
+                    changed = true
+                    config.sayAbout(service, "not ready in time (its ready path did not appear), taken as running", false, 0)
+                }
+            }
+            index += 1
+        }
+    }
+}
+
+// How long the loop may wait for events: until the next pause ends, the
+// next stop-timeout, or the next look for a ready path; -1 for ever.
+pub fn nextTimeout(state: *State) -> isize {
+    const at = now()
+    var timeout: isize = -1
+    var index: usize = 0
+    while index < state.*.count {
+        const service = config.serviceAt(state, index)
+        var due: usize = 18446744073709551615
+        if service.*.state == config.RESTARTING {
+            due = if service.*.restartAt > at { service.*.restartAt - at } else { 0 }
+        } else if service.*.state == config.STOPPING && !service.*.killed {
+            const deadline = service.*.stoppingSince + service.*.stopTimeout
+            due = if deadline > at { deadline - at } else { 0 }
+        } else if service.*.state == config.STARTING && !service.*.oneshot {
+            due = READY_POLL
+        }
+        if due != 18446744073709551615 && (timeout < 0 || due < @intCast(usize, timeout)) { timeout = @intCast(isize, due) }
+        index += 1
+    }
+    return timeout
+}
+
+// A request to start: wanted from now (a pause is cut short); the next
+// tick starts it.
+pub fn requestStart(state: *State, service: *Service) -> bool {
+    if service.*.state == config.RUNNING || service.*.state == config.STARTING || service.*.state == config.DONE { return false }
+    service.*.wanted = true
+    service.*.restartAt = 0
+    return true
+}
+
+// A request to stop: not wanted from now; its process gets SIGTERM.
+pub fn requestStop(state: *State, service: *Service) -> void {
+    service.*.wanted = false
+    if service.*.pid > 0 && service.*.state != config.STOPPING { terminate(service, now()) }
+}
+
+// A request to restart: its process gets SIGTERM and, wanted still, the
+// service starts again as soon as it has ended.
+pub fn requestRestart(state: *State, service: *Service) -> void {
+    service.*.wanted = true
+    service.*.restartAt = 0
+    if service.*.pid > 0 {
+        if service.*.state != config.STOPPING { terminate(service, now()) }
+    } else if service.*.state == config.DONE {
+        service.*.state = config.STOPPED
+    }
+}
+
+pub fn anyRunning(state: *State) -> bool {
+    var index: usize = 0
+    while index < state.*.count {
+        if config.serviceAt(state, index).*.pid > 0 { return true }
+        index += 1
+    }
+    return false
+}
+
+// Stops every service for the shutdown: SIGTERM to each in the reverse
+// order of their starts, then waits for them (SIGKILL to those past their
+// stop-timeout), at most a minute in all.
+pub fn stopAll(state: *State) -> void {
+    const began = now()
+    var index: usize = 0
+    while index < state.*.count {
+        config.serviceAt(state, index).*.wanted = false
+        index += 1
+    }
+    // The most recently started first.
+    var remaining = true
+    while remaining {
+        remaining = false
+        var latest: usize = 0
+        var pick: usize = 0
+        index = 0
+        while index < state.*.count {
+            const service = config.serviceAt(state, index)
+            if service.*.pid > 0 && service.*.state != config.STOPPING && service.*.order >= latest {
+                latest = service.*.order
+                pick = index
+                remaining = true
+            }
+            index += 1
+        }
+        if remaining { terminate(config.serviceAt(state, pick), began) }
+    }
+    while anyRunning(state) && now() - began < 60000 {
+        linux.sleepMilliseconds(50)
+        reapAll(state)
+        tick(state)
+    }
+}

@@ -55,11 +55,44 @@ pub const Opcode = enum(u8) {
     error_payload_part,
     builtin_sym,
     string_literal,
+    // The address of global arg0 (lir.Global): a module-level `var`'s
+    // storage in the data area.
+    global_address,
     tuple_literal,
     tuple_element,
     // Copies arg2 bytes (a constant) from the address arg1 to the address
     // arg0; the storage does not overlap. Struct and array values.
     mem_copy,
+    // The atomics (spec atomics-tls.xml; the codes are
+    // sema/builtins/atomics.mlx's). atomic_load: arg0 the address, arg1
+    // the width, arg2 bit 0 signed and bits 4.. the order. atomic_store:
+    // arg0 the address, arg1 the value, arg2 the width | order << 8.
+    // atomic_rmw: arg0 the address, arg1 the operand, arg2 the width |
+    // op << 8 | order << 16 | signed << 24; the old value. cmpxchg: arg0
+    // the address, arg1 the expected value, arg2 the new one; flags bits
+    // 1..2 the width (1, 2, 4, 8 bytes), bit 3 signed, bit 4 weak, bits 5..
+    // the success order (bit 0 is FLAG_RETAIN_NEXT); two result words, as a
+    // call's: whether it swapped, then the value seen (the expected one
+    // when it swapped).
+    // fence: arg0 the order.
+    atomic_load,
+    atomic_store,
+    atomic_rmw,
+    cmpxchg,
+    fence,
+    // The thread builtins (spec atomics-tls.xml, <Threads>). thread_pointer:
+    // the thread pointer (x86_64: the word at fs:0; aarch64: TPIDR_EL0).
+    // clone_thread: arg0 the start of its seven operands in extraData
+    // (flags, stack, parent_tid, child_tid, tls, entry, argument), arg1
+    // their count; the clone system call, the child calling entry(argument)
+    // on the stack and exiting with the result; the parent's result the
+    // child's id or -errno.
+    thread_pointer,
+    clone_thread,
+    // frame_address: the current function's frame pointer (x86_64 rbp,
+    // aarch64 x29): the saved caller frame pointer's slot, the return
+    // address above it, then the arguments the caller passed on the stack.
+    frame_address,
     dead,
 }
 
@@ -185,16 +218,26 @@ pub const StringLiteral = struct {
     nameLength: usize
 }
 
-// A module constant exported as a data symbol (`export const NAME: T =
-// value`, T an integer type): `size` bytes holding `value` in the data area
-// of a dynamically linked image, which the dynamic linker (and so C code)
-// finds under the plain name. To Mlx the constant stays a compile-time
-// value.
-pub const DataExport = struct {
+// A word or block of the image's data area: a module-level `var` (its
+// storage, RIP-relative to the code) or an `export const` (a data symbol
+// of a dynamically linked image, which the dynamic linker and so C code
+// find under the plain name; to Mlx the constant stays a compile-time
+// value). `value` is the initial content of a global of at most 8 bytes;
+// larger ones start zeroed. `symbolIndex` names the sema symbol of a
+// `var` (NONE for an export const), so a reference finds its global.
+// A module-level var: its slot in the data area. `value` holds a scalar
+// initializer's bits; an aggregate initializer's bytes (`byteCount` of
+// them, zero for none) come from `bytes`.
+pub const Global = struct {
     pointer: [*]const u8
     length: usize
-    value: u64
     size: usize
+    alignment: usize
+    value: u64
+    bytes: [*]const u8
+    byteCount: usize
+    exported: bool
+    symbolIndex: usize
 }
 
 pub const Lir = struct {
@@ -203,7 +246,7 @@ pub const Lir = struct {
     symbols: *vector.Vector
     ownedSymbolNames: *vector.Vector
     stringLiterals: *vector.Vector
-    dataExports: *vector.Vector
+    globals: *vector.Vector
     allocator: Allocator
     // Per instruction: where in the source it comes from (module << 32 |
     // byte offset; NONE: nowhere) and where its machine code starts (the
@@ -221,13 +264,13 @@ pub fn initCapacity(allocator: Allocator, instruction_capacity: usize, extra_cap
         const symbols = @ptrCast(*vector.Vector, allocator.alloc(@sizeOf(vector.Vector), @alignOf(vector.Vector)).?)
         const owned_symbol_names = @ptrCast(*vector.Vector, allocator.alloc(@sizeOf(vector.Vector), @alignOf(vector.Vector)).?)
         const string_literals = @ptrCast(*vector.Vector, allocator.alloc(@sizeOf(vector.Vector), @alignOf(vector.Vector)).?)
-        const data_exports = @ptrCast(*vector.Vector, allocator.alloc(@sizeOf(vector.Vector), @alignOf(vector.Vector)).?)
+        const globals = @ptrCast(*vector.Vector, allocator.alloc(@sizeOf(vector.Vector), @alignOf(vector.Vector)).?)
         vector.Vector.initAt(instructions, allocator, @sizeOf(Inst), @alignOf(Inst), instruction_capacity)
         vector.Vector.initAt(extra_data, allocator, @sizeOf(usize), @alignOf(usize), extra_capacity)
         vector.Vector.initAt(symbols, allocator, @sizeOf(Symbol), @alignOf(Symbol), 16)
         vector.Vector.initAt(owned_symbol_names, allocator, @sizeOf(array_list.ArrayList), @alignOf(array_list.ArrayList), 32)
         vector.Vector.initAt(string_literals, allocator, @sizeOf(StringLiteral), @alignOf(StringLiteral), 16)
-        vector.Vector.initAt(data_exports, allocator, @sizeOf(DataExport), @alignOf(DataExport), 4)
+        vector.Vector.initAt(globals, allocator, @sizeOf(Global), @alignOf(Global), 8)
         const sources = @ptrCast(*vector.Vector, allocator.alloc(@sizeOf(vector.Vector), @alignOf(vector.Vector)).?)
         const code_offsets = @ptrCast(*vector.Vector, allocator.alloc(@sizeOf(vector.Vector), @alignOf(vector.Vector)).?)
         vector.Vector.initAt(sources, allocator, @sizeOf(usize), @alignOf(usize), instruction_capacity)
@@ -240,7 +283,7 @@ pub fn initCapacity(allocator: Allocator, instruction_capacity: usize, extra_cap
             .symbols = symbols,
             .ownedSymbolNames = owned_symbol_names,
             .stringLiterals = string_literals,
-            .dataExports = data_exports,
+            .globals = globals,
             .allocator = allocator,
             .sources = sources,
             .codeOffsets = code_offsets,
@@ -576,17 +619,59 @@ pub inline fn stringLiteralCount(lir: *Lir) -> usize {
     return lir.*.stringLiterals.*.length
 }
 
+// An `export const`: an exported word with its value.
 pub fn addDataExport(lir: *Lir, pointer: [*]const u8, length: usize, value: u64, size: usize) -> void {
-    var entry = DataExport.{ .pointer = pointer, .length = length, .value = value, .size = size }
-    unsafe { const appended = vector.Vector.appendAt(lir.*.dataExports, @ptrCast([*]const u8, &entry)) }
+    unsafe { const added = addGlobal(lir, pointer, length, size, size, value, @ptrFromInt([*]const u8, 0), 0, true, NONE) }
 }
 
-pub fn getDataExport(lir: *Lir, index: usize) -> DataExport {
-    unsafe { return @ptrCast(*DataExport, vector.Vector.at(lir.*.dataExports.*, index)).* }
+// A global of `size` bytes at `alignment`, named `pointer` (the symbol's
+// name when exported, else a label of the lowering's); its index.
+pub fn addGlobal(lir: *Lir, pointer: [*]const u8, length: usize, size: usize, alignment: usize, value: u64, bytes: [*]const u8, byte_count: usize, exported: bool, symbol_index: usize) -> usize {
+    const index = lir.*.globals.*.length
+    var entry = Global.{ .pointer = pointer, .length = length, .size = size, .alignment = alignment, .value = value, .bytes = bytes, .byteCount = byte_count, .exported = exported, .symbolIndex = symbol_index }
+    unsafe { const appended = vector.Vector.appendAt(lir.*.globals, @ptrCast([*]const u8, &entry)) }
+    return index
 }
 
-pub inline fn dataExportCount(lir: *Lir) -> usize {
-    return lir.*.dataExports.*.length
+pub fn getGlobal(lir: *Lir, index: usize) -> Global {
+    unsafe { return @ptrCast(*Global, vector.Vector.at(lir.*.globals.*, index)).* }
+}
+
+pub inline fn globalCount(lir: *Lir) -> usize {
+    return lir.*.globals.*.length
+}
+
+// The global of sema symbol `symbol_index`, NONE when none was made yet.
+pub fn findGlobal(lir: *Lir, symbol_index: usize) -> usize {
+    var index: usize = 0
+    while index < lir.*.globals.*.length {
+        if getGlobal(lir, index).symbolIndex == symbol_index { return index }
+        index += 1
+    }
+    return NONE
+}
+
+// A label for a global that is not exported: `.__mlx_global_N`.
+pub fn globalLabel(lir: *Lir, index: usize) -> ([*]const u8, usize) {
+    var allocator = lir.*.allocator
+    var name = array_list.ArrayList.init(allocator, 32)
+    const prefix = ".__mlx_global_"
+    var at: usize = 0
+    while at < prefix.length {
+        name = array_list.ArrayList.append(name, prefix[at])
+        at += 1
+    }
+    if index == 0 {
+        name = array_list.ArrayList.append(name, 48)
+    } else {
+        var divisor: usize = 1
+        while index / divisor >= 10 { divisor *= 10 }
+        while divisor > 0 {
+            name = array_list.ArrayList.append(name, @intCast(u8, 48 + (index / divisor) % 10))
+            divisor /= 10
+        }
+    }
+    return -> (name.items, name.length)
 }
 
 pub fn deinit(lir: *Lir) -> void {
@@ -603,7 +688,7 @@ pub fn deinit(lir: *Lir) -> void {
     vector.Vector.deinit(lir.*.symbols.*)
     vector.Vector.deinit(lir.*.ownedSymbolNames.*)
     vector.Vector.deinit(lir.*.stringLiterals.*)
-    vector.Vector.deinit(lir.*.dataExports.*)
+    vector.Vector.deinit(lir.*.globals.*)
     vector.Vector.deinit(lir.*.sources.*)
     vector.Vector.deinit(lir.*.codeOffsets.*)
     unsafe {
@@ -612,6 +697,6 @@ pub fn deinit(lir: *Lir) -> void {
         lir.*.allocator.free(@ptrCast([*]u8, lir.*.symbols), @sizeOf(vector.Vector), @alignOf(vector.Vector))
         lir.*.allocator.free(@ptrCast([*]u8, lir.*.ownedSymbolNames), @sizeOf(vector.Vector), @alignOf(vector.Vector))
         lir.*.allocator.free(@ptrCast([*]u8, lir.*.stringLiterals), @sizeOf(vector.Vector), @alignOf(vector.Vector))
-        lir.*.allocator.free(@ptrCast([*]u8, lir.*.dataExports), @sizeOf(vector.Vector), @alignOf(vector.Vector))
+        lir.*.allocator.free(@ptrCast([*]u8, lir.*.globals), @sizeOf(vector.Vector), @alignOf(vector.Vector))
     }
 }

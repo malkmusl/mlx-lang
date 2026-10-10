@@ -1,0 +1,887 @@
+// Word expansion: a word as written becomes the fields a command gets.
+// Tilde, parameters ($NAME, ${NAME}, the ${NAME:-word} family, ${#NAME},
+// ${NAME#pattern} and ${NAME%pattern}, ${NAME:offset:length}, the special
+// parameters $? $$ $# $0..$9 ${10} $@ $* $! $-), command substitution
+// ($(...) and `...`, run in a child with its output read back), arithmetic
+// ($((...))), then field splitting at IFS of what was not quoted, pathname
+// expansion (glob.mlx) of fields with unquoted * ? [, and quote removal.
+//
+// Expansions build bytes with a flag per byte saying whether it was
+// quoted (splitting and globbing leave quoted bytes alone), all on the
+// shell's work stack: the caller marks it before and releases it after
+// the command.
+const std = @import("std")
+const sys = @import("./sys.mlx")
+const state = @import("./state.mlx")
+const arith = @import("./arith.mlx")
+const glob = @import("./glob.mlx")
+
+const Shell = state.Shell
+
+// A field separator from "$@" (quoted) between parameters: a byte that
+// cannot occur in text, with its flag set to this.
+const BREAK: u8 = 2
+const QUOTED: u8 = 1
+// The byte came from an expansion (a parameter, a command, arithmetic)
+// unquoted: field splitting applies to it, not to the word's own text.
+const EXPANDED: u8 = 4
+
+pub const MAX_FIELDS: usize = 8192
+
+// The fields of a command: pointers to NUL-terminated strings on the
+// work stack.
+pub const Fields = struct {
+    items: [*][*]const u8
+    count: usize
+    capacity: usize
+}
+
+// The bytes of an expansion with their flags, on the work stack: the
+// bytes from `mark`, the flags right after them, both `capacity` long. The
+// builder grows by doubling while it is the top of the work stack; what a
+// nested expansion put above it is released (releaseAbove) once used.
+const Builder = struct {
+    shell: *Shell
+    bytes: [*]u8
+    flags: [*]u8
+    mark: usize
+    length: usize
+    capacity: usize
+    failed: bool
+    // The text being expanded came from inside double quotes.
+    inDouble: bool
+    // "$@" with no positional parameters: the quotes make no field.
+    noField: bool
+    // The bytes being put are an expansion's result (EXPANDED).
+    expanding: bool
+}
+
+const INITIAL_CAPACITY: usize = 4096
+
+fn beginBuilder(shell: *Shell, builder: *Builder) -> bool {
+    const bytes = state.workAlloc(shell, 2 * INITIAL_CAPACITY)
+    if bytes == null { return false }
+    builder.*.shell = shell
+    builder.*.bytes = bytes.?
+    builder.*.flags = state.offset(bytes.?, INITIAL_CAPACITY)
+    builder.*.mark = state.workMark(shell) - 2 * INITIAL_CAPACITY
+    builder.*.length = 0
+    builder.*.capacity = INITIAL_CAPACITY
+    builder.*.failed = false
+    builder.*.inDouble = false
+    builder.*.noField = false
+    builder.*.expanding = false
+    return true
+}
+
+// The end of the builder's own memory on the work stack.
+fn topOf(builder: *Builder) -> usize { return builder.*.mark + 2 * builder.*.capacity }
+
+// Drops what was put on the work stack above the builder (a nested
+// expansion's buffers), so the builder can grow again.
+fn releaseAbove(builder: *Builder) -> void {
+    state.workRelease(builder.*.shell, topOf(builder))
+}
+
+// Doubles the builder's capacity; false when it is not the top of the work
+// stack or the stack is full.
+fn grow(builder: *Builder) -> bool {
+    const shell = builder.*.shell
+    if state.workMark(shell) != topOf(builder) { return false }
+    const capacity = builder.*.capacity
+    const more = state.workAlloc(shell, 2 * capacity)
+    if more == null { return false }
+    // The flags move from mark + capacity to mark + 2 * capacity (the two
+    // ranges do not overlap: only `length` <= capacity flags are live).
+    const new_flags = state.offset(builder.*.bytes, 2 * capacity)
+    var index: usize = 0
+    while index < builder.*.length {
+        new_flags[index] = builder.*.flags[index]
+        index += 1
+    }
+    builder.*.flags = new_flags
+    builder.*.capacity = 2 * capacity
+    return true
+}
+
+fn put(builder: *Builder, byte: u8, quoted: bool) -> void {
+    if builder.*.length >= builder.*.capacity && !grow(builder) {
+        builder.*.failed = true
+        return
+    }
+    builder.*.bytes[builder.*.length] = byte
+    builder.*.flags[builder.*.length] = if quoted { QUOTED } else if builder.*.expanding { EXPANDED } else { 0 }
+    builder.*.length += 1
+}
+
+fn putText(builder: *Builder, text: []const u8, quoted: bool) -> void {
+    for byte in text { put(builder, byte, quoted) }
+}
+
+// An expansion's result: its unquoted bytes are split at IFS later.
+fn putValue(builder: *Builder, text: []const u8, quoted: bool) -> void {
+    const was = builder.*.expanding
+    builder.*.expanding = true
+    putText(builder, text, quoted)
+    builder.*.expanding = was
+}
+
+fn putBreak(builder: *Builder) -> void {
+    if builder.*.length >= builder.*.capacity && !grow(builder) {
+        builder.*.failed = true
+        return
+    }
+    builder.*.bytes[builder.*.length] = 0
+    builder.*.flags[builder.*.length] = BREAK
+    builder.*.length += 1
+}
+
+fn putNumber(builder: *Builder, value: usize, quoted: bool) -> void {
+    var digits: [24]u8 = undefined
+    var bytes: [*]u8 = undefined
+    unsafe { bytes = @ptrCast([*]u8, &digits) }
+    const length = std.text.appendUnsigned(bytes, 0, 24, value)
+    putValue(builder, bytes[0..length], quoted)
+}
+
+fn putSigned(builder: *Builder, value: i64, quoted: bool) -> void {
+    var digits: [24]u8 = undefined
+    var bytes: [*]u8 = undefined
+    unsafe { bytes = @ptrCast([*]u8, &digits) }
+    const length = std.text.appendSigned(bytes, 0, 24, @intCast(isize, value))
+    putValue(builder, bytes[0..length], quoted)
+}
+
+fn nameStart(byte: u8) -> bool { return (byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122) || byte == 95 }
+fn nameByte(byte: u8) -> bool { return nameStart(byte) || (byte >= 48 && byte <= 57) }
+fn digit(byte: u8) -> bool { return byte >= 48 && byte <= 57 }
+
+// The IFS: the variable, or space, tab, newline.
+fn ifs(shell: *Shell) -> []const u8 {
+    const value = state.getVariable(shell, "IFS")
+    if value == null { return " \t\n" }
+    return value.?
+}
+
+fn isIfs(shell: *Shell, byte: u8) -> bool {
+    for separator in ifs(shell) {
+        if separator == byte { return true }
+    }
+    return false
+}
+
+fn isIfsWhitespace(byte: u8) -> bool { return byte == 32 || byte == 9 || byte == 10 }
+
+// ---------------------------------------------------------------------------
+// Parameters
+
+// The value of special parameter `byte`, or null for none.
+fn putSpecial(builder: *Builder, byte: u8, quoted: bool) -> bool {
+    const shell = builder.*.shell
+    if byte == 63 {
+        putNumber(builder, shell.*.lastStatus, quoted)
+    } else if byte == 36 {
+        putNumber(builder, @intCast(usize, sys.getPid()), quoted)
+    } else if byte == 35 {
+        putNumber(builder, state.positionalCount(shell), quoted)
+    } else if byte == 33 {
+        if shell.*.lastBackground > 0 { putNumber(builder, @intCast(usize, shell.*.lastBackground), quoted) }
+    } else if byte == 45 {
+        if shell.*.errexit { put(builder, 101, quoted) }
+        if shell.*.xtrace { put(builder, 120, quoted) }
+        if shell.*.interactive { put(builder, 105, quoted) }
+    } else if byte == 48 {
+        putValue(builder, state.scriptName(shell), quoted)
+    } else if byte == 64 || byte == 42 {
+        putAllPositional(builder, byte == 64, quoted)
+    } else {
+        return false
+    }
+    return true
+}
+
+// "$@": every parameter, separate fields when quoted; "$*": joined by the
+// first byte of IFS.
+fn putAllPositional(builder: *Builder, separate: bool, quoted: bool) -> void {
+    const shell = builder.*.shell
+    const count = state.positionalCount(shell)
+    if count == 0 && separate && quoted { builder.*.noField = true }
+    const separators = ifs(shell)
+    const was = builder.*.expanding
+    builder.*.expanding = true
+    var index: usize = 1
+    while index <= count {
+        if index > 1 {
+            if separate && quoted {
+                putBreak(builder)
+            } else if separate {
+                put(builder, 32, false)
+            } else if separators.length > 0 {
+                put(builder, separators[0], quoted)
+            }
+        }
+        putValue(builder, state.positional(shell, index), quoted)
+        index += 1
+    }
+    builder.*.expanding = was
+}
+
+// The value of a named or positional parameter, or null when unset.
+fn parameterValue(shell: *Shell, name: []const u8) -> ?[]const u8 {
+    if name.length > 0 && digit(name[0]) {
+        var number: usize = 0
+        for byte in name { number = number * 10 + @intCast(usize, byte - 48) }
+        if number == 0 { return state.scriptName(shell) }
+        if number > state.positionalCount(shell) { return null }
+        return state.positional(shell, number)
+    }
+    return state.getVariable(shell, name)
+}
+
+// A nested expansion's result: its bytes and their literal flags (QUOTED
+// where the byte came from quotes), for ${NAME#pattern}, case patterns and
+// arithmetic.
+pub const Subword = struct {
+    text: []const u8
+    flags: [*]u8
+}
+
+fn expandSubword(shell: *Shell, text: []const u8, in_double: bool, into: *Subword) -> bool {
+    var builder: Builder = undefined
+    if !beginBuilder(shell, &builder) { return false }
+    builder.inDouble = in_double
+    expandInto(&builder, text, in_double)
+    if builder.failed { return false }
+    // The markers of empty quotes only matter to field splitting.
+    var kept: usize = 0
+    var index: usize = 0
+    while index < builder.length {
+        if builder.flags[index] != EMPTY {
+            builder.bytes[kept] = builder.bytes[index]
+            builder.flags[kept] = builder.flags[index]
+            kept += 1
+        }
+        index += 1
+    }
+    into.*.text = builder.bytes[0..kept]
+    into.*.flags = builder.flags
+    return true
+}
+
+// Removes the prefix (or suffix) matching `pattern` from `value`, the
+// shortest or the longest.
+fn trimmed(value: []const u8, pattern: []const u8, pattern_flags: [*]const u8, suffix: bool, longest: bool) -> []const u8 {
+    if suffix {
+        // Try cut points from the end (shortest) or the start (longest).
+        var cut: usize = if longest { 0 } else { value.length }
+        var tries: usize = 0
+        while tries <= value.length {
+            if glob.patternMatch(pattern, pattern_flags, value[cut..value.length]) { return value[0..cut] }
+            if longest { cut += 1 } else { if cut == 0 { break } cut -= 1 }
+            tries += 1
+        }
+        return value
+    }
+    var cut: usize = if longest { value.length } else { 0 }
+    var tries: usize = 0
+    while tries <= value.length {
+        if glob.patternMatch(pattern, pattern_flags, value[0..cut]) { return value[cut..value.length] }
+        if longest { if cut == 0 { break } cut -= 1 } else { cut += 1 }
+        tries += 1
+    }
+    return value
+}
+
+// ${...}: from the byte after '{' to the matching '}' (text is the inside).
+fn expandBraced(builder: *Builder, text: []const u8, quoted: bool) -> void {
+    const shell = builder.*.shell
+    if text.length == 0 { return }
+    // ${#NAME}: the length.
+    if text[0] == 35 && text.length > 1 {
+        const name = text[1..text.length]
+        if name.length == 1 && (name[0] == 64 || name[0] == 42 || name[0] == 35) {
+            putNumber(builder, state.positionalCount(shell), quoted)
+            return
+        }
+        const value = parameterValue(shell, name)
+        putNumber(builder, if value != null { value.?.length } else { 0 }, quoted)
+        return
+    }
+    // The name, then an operator.
+    var end: usize = 0
+    if text.length > 0 && (text[0] == 64 || text[0] == 42 || text[0] == 35 || text[0] == 63 || text[0] == 36 || text[0] == 33 || text[0] == 45) {
+        end = 1
+    } else {
+        while end < text.length && nameByte(text[end]) { end += 1 }
+    }
+    const name = text[0..end]
+    if name.length == 0 {
+        state.complainAbout("bad substitution", "", text)
+        builder.*.failed = true
+        return
+    }
+    if end == text.length {
+        if name.length == 1 && putSpecial(builder, name[0], quoted) { return }
+        const plain = parameterValue(shell, name)
+        if plain != null { putValue(builder, plain.?, quoted) }
+        return
+    }
+    var is_set = false
+    var value: []const u8 = ""
+    if name.length == 1 && (name[0] == 64 || name[0] == 42) {
+        is_set = state.positionalCount(shell) > 0
+    } else {
+        const found = parameterValue(shell, name)
+        is_set = found != null
+        if found != null { value = found.? }
+    }
+    const operator = text[end]
+    var colon = false
+    var at = end
+    if operator == 58 && at + 1 < text.length && (text[at + 1] == 45 || text[at + 1] == 61 || text[at + 1] == 43 || text[at + 1] == 63) {
+        colon = true
+        at += 1
+    }
+    const kind = text[at]
+    const word = text[at + 1..text.length]
+    const empty_counts = colon && value.length == 0
+    if kind == 45 && (operator == 58 || operator == 45) && (colon || operator == 45) {
+        // ${NAME:-word} / ${NAME-word}
+        if is_set && !empty_counts {
+            if name.length == 1 && (name[0] == 64 || name[0] == 42) { putAllPositional(builder, name[0] == 64, quoted) } else { putValue(builder, value, quoted) }
+        } else {
+            expandInto(builder, word, quoted)
+        }
+        return
+    }
+    if kind == 61 && (operator == 58 || operator == 61) && (colon || operator == 61) {
+        // ${NAME:=word}
+        if is_set && !empty_counts {
+            putValue(builder, value, quoted)
+        } else {
+            var expanded: Subword = undefined
+            if expandSubword(shell, word, quoted, &expanded) {
+                const set = state.setVariable(shell, name, expanded.text, false)
+                // The value now lives in the variable arena: the nested
+                // builder can go.
+                releaseAbove(builder)
+                const stored = state.getVariable(shell, name)
+                if stored != null { putValue(builder, stored.?, quoted) }
+            }
+        }
+        return
+    }
+    if kind == 43 && (operator == 58 || operator == 43) && (colon || operator == 43) {
+        // ${NAME:+word}
+        if is_set && !empty_counts { expandInto(builder, word, quoted) }
+        return
+    }
+    if kind == 63 && (operator == 58 || operator == 63) && (colon || operator == 63) {
+        // ${NAME:?word}
+        if is_set && !empty_counts {
+            putValue(builder, value, quoted)
+        } else {
+            state.complainAbout("", name, if word.length > 0 { word } else { "parameter not set" })
+            builder.*.failed = true
+        }
+        return
+    }
+    if operator == 58 {
+        // ${NAME:offset:length}
+        var offset_end = end + 1
+        while offset_end < text.length && text[offset_end] != 58 { offset_end += 1 }
+        var ok = false
+        var offset = arith.evaluate(shell, text[end + 1..offset_end], &ok)
+        if !ok { builder.*.failed = true }
+        var length: i64 = @intCast(i64, value.length)
+        if offset_end < text.length {
+            length = arith.evaluate(shell, text[offset_end + 1..text.length], &ok)
+            if !ok { builder.*.failed = true }
+        }
+        if offset < 0 { offset += @intCast(i64, value.length) }
+        if offset < 0 { offset = 0 }
+        if offset > @intCast(i64, value.length) { offset = @intCast(i64, value.length) }
+        if length < 0 { length = 0 }
+        var finish = offset + length
+        if finish > @intCast(i64, value.length) { finish = @intCast(i64, value.length) }
+        putValue(builder, value[@intCast(usize, offset)..@intCast(usize, finish)], quoted)
+        return
+    }
+    if operator == 35 || operator == 37 {
+        // ${NAME#pattern} ${NAME##pattern} ${NAME%pattern} ${NAME%%pattern}
+        var longest = false
+        var pattern_start = end + 1
+        if pattern_start < text.length && text[pattern_start] == operator {
+            longest = true
+            pattern_start += 1
+        }
+        var pattern: Subword = undefined
+        if !expandSubword(shell, text[pattern_start..text.length], false, &pattern) {
+            builder.*.failed = true
+            return
+        }
+        // What is left of the value is a part of it (not of the pattern).
+        const rest = trimmed(value, pattern.text, pattern.flags, operator == 37, longest)
+        releaseAbove(builder)
+        putValue(builder, rest, quoted)
+        return
+    }
+    state.complainAbout("bad substitution", "", text)
+    builder.*.failed = true
+}
+
+// ---------------------------------------------------------------------------
+// Command substitution
+
+// Runs `text` in a child whose output comes back into the builder, its
+// trailing newlines removed.
+fn substituteCommand(builder: *Builder, text: []const u8, quoted: bool) -> void {
+    const shell = builder.*.shell
+    var read_end: isize = 0
+    var write_end: isize = 0
+    if !sys.pipe(&read_end, &write_end) {
+        builder.*.failed = true
+        return
+    }
+    const pid = sys.fork()
+    if pid < 0 {
+        sys.close(read_end)
+        sys.close(write_end)
+        builder.*.failed = true
+        return
+    }
+    if pid == 0 {
+        sys.close(read_end)
+        const out = sys.dup2(write_end, 1)
+        sys.close(write_end)
+        shell.*.interactive = false
+        const status = shell.*.runText(@ptrCast(*anyopaque, shell), text)
+        sys.exit(status)
+    }
+    sys.close(write_end)
+    const start = builder.*.length
+    const was = builder.*.expanding
+    builder.*.expanding = true
+    var buffer: [4096]u8 = undefined
+    var buffer_bytes: [*]u8 = undefined
+    unsafe { buffer_bytes = @ptrCast([*]u8, &buffer) }
+    var more = true
+    while more {
+        const got = sys.read(read_end, buffer_bytes, 4096)
+        if got <= 0 {
+            more = false
+        } else {
+            var index: usize = 0
+            while index < @bitCast(usize, got) {
+                put(builder, buffer[index], quoted)
+                index += 1
+            }
+        }
+    }
+    sys.close(read_end)
+    builder.*.expanding = was
+    var raw: usize = 0
+    const waited = sys.wait(pid, &raw, false)
+    shell.*.lastStatus = sys.exitStatus(raw)
+    while builder.*.length > start && builder.*.bytes[builder.*.length - 1] == 10 { builder.*.length -= 1 }
+}
+
+
+// ---------------------------------------------------------------------------
+// Words
+
+// Where the part opened at `at` (a quote, '(' or '{') ends; the text's
+// length when unclosed.
+fn closingOf(text: []const u8, at: usize) -> usize {
+    const opener = text[at]
+    var index = at + 1
+    if opener == 39 {
+        while index < text.length && text[index] != 39 { index += 1 }
+        return index
+    }
+    if opener == 96 {
+        while index < text.length {
+            if text[index] == 92 {
+                index += 2
+                continue
+            }
+            if text[index] == 96 { return index }
+            index += 1
+        }
+        return index
+    }
+    const closer: u8 = if opener == 40 { 41 } else if opener == 123 { 125 } else { 34 }
+    var depth: usize = 1
+    while index < text.length {
+        const byte = text[index]
+        if byte == 92 {
+            index += 2
+            continue
+        }
+        if opener != 34 && (byte == 39 || byte == 34 || byte == 96) {
+            index = closingOf(text, index) + 1
+            continue
+        }
+        if opener == 34 && byte == 36 && index + 1 < text.length && (text[index + 1] == 40 || text[index + 1] == 123) {
+            index = closingOf(text, index + 1) + 1
+            continue
+        }
+        if opener == 34 && byte == 96 {
+            index = closingOf(text, index) + 1
+            continue
+        }
+        if opener != 34 && byte == opener {
+            depth += 1
+        } else if byte == closer {
+            if opener == 34 { return index }
+            depth -= 1
+            if depth == 0 { return index }
+        }
+        index += 1
+    }
+    return index
+}
+
+// Expands `text` (a word, or the inside of double quotes when
+// `in_double`) into the builder.
+fn expandInto(builder: *Builder, text: []const u8, in_double: bool) -> void {
+    const shell = builder.*.shell
+    var index: usize = 0
+    while index < text.length && !builder.*.failed {
+        const byte = text[index]
+        if byte == 39 && !in_double {
+            const end = closingOf(text, index)
+            // Empty quotes still make a field: a quoted nothing.
+            if end == index + 1 { putEmptyQuoted(builder) }
+            putValue(builder, text[index + 1..end], true)
+            index = end + 1
+            continue
+        }
+        if byte == 34 && !in_double {
+            const end = closingOf(text, index)
+            const before = builder.*.length
+            builder.*.noField = false
+            expandInto(builder, text[index + 1..end], true)
+            // Quotes around nothing (or around parameters that are empty)
+            // still make a field, except "$@" of no parameters.
+            if builder.*.length == before && !builder.*.noField { putEmptyQuoted(builder) }
+            index = end + 1
+            continue
+        }
+        if byte == 92 {
+            if index + 1 >= text.length {
+                put(builder, 92, true)
+                index += 1
+                continue
+            }
+            const next = text[index + 1]
+            if in_double {
+                // Only these are escapes inside double quotes.
+                if next == 36 || next == 96 || next == 34 || next == 92 {
+                    put(builder, next, true)
+                } else if next == 10 {
+                    // A joined line.
+                } else {
+                    put(builder, 92, true)
+                    put(builder, next, true)
+                }
+            } else if next != 10 {
+                put(builder, next, true)
+            }
+            index += 2
+            continue
+        }
+        if byte == 96 {
+            const end = closingOf(text, index)
+            // Backslashes before $ ` \ are removed first.
+            var inner: [4096]u8 = undefined
+            var inner_bytes: [*]u8 = undefined
+            unsafe { inner_bytes = @ptrCast([*]u8, &inner) }
+            var inner_length: usize = 0
+            var at = index + 1
+            while at < end && inner_length < 4096 {
+                if text[at] == 92 && at + 1 < end && (text[at + 1] == 36 || text[at + 1] == 96 || text[at + 1] == 92) { at += 1 }
+                inner[inner_length] = text[at]
+                inner_length += 1
+                at += 1
+            }
+            substituteCommand(builder, inner_bytes[0..inner_length], in_double)
+            index = end + 1
+            continue
+        }
+        if byte == 36 && index + 1 < text.length {
+            const next = text[index + 1]
+            if next == 40 && index + 2 < text.length && text[index + 2] == 40 {
+                // $(( ... ))
+                const end = closingOf(text, index + 1)
+                var inner_end = end
+                if inner_end > index + 3 && text[inner_end - 1] == 41 { inner_end -= 1 }
+                var expression: Subword = undefined
+                if expandSubword(shell, text[index + 3..inner_end], true, &expression) {
+                    var ok = false
+                    const value = arith.evaluate(shell, expression.text, &ok)
+                    releaseAbove(builder)
+                    if ok { putSigned(builder, value, in_double) } else { builder.*.failed = true }
+                } else {
+                    builder.*.failed = true
+                }
+                index = end + 1
+                continue
+            }
+            if next == 40 {
+                const end = closingOf(text, index + 1)
+                substituteCommand(builder, text[index + 2..end], in_double)
+                index = end + 1
+                continue
+            }
+            if next == 123 {
+                const end = closingOf(text, index + 1)
+                expandBraced(builder, text[index + 2..end], in_double)
+                index = end + 1
+                continue
+            }
+            if nameStart(next) {
+                var end = index + 1
+                while end < text.length && nameByte(text[end]) { end += 1 }
+                const value = parameterValue(shell, text[index + 1..end])
+                if value != null { putValue(builder, value.?, in_double) }
+                index = end
+                continue
+            }
+            if digit(next) {
+                const value = parameterValue(shell, text[index + 1..index + 2])
+                if value != null { putValue(builder, value.?, in_double) }
+                index += 2
+                continue
+            }
+            if putSpecial(builder, next, in_double) {
+                index += 2
+                continue
+            }
+            put(builder, 36, in_double)
+            index += 1
+            continue
+        }
+        if byte == 126 && !in_double && index == 0 {
+            // ~ and ~user (the latter left alone).
+            var end = index + 1
+            while end < text.length && text[end] != 47 { end += 1 }
+            if end == index + 1 {
+                const home = state.getVariable(shell, "HOME")
+                if home != null { putValue(builder, home.?, true) } else { put(builder, 126, false) }
+                index = end
+                continue
+            }
+        }
+        put(builder, byte, in_double)
+        index += 1
+    }
+}
+
+// A quoted empty string: a byte that is removed at splitting but keeps
+// the field.
+const EMPTY: u8 = 3
+
+fn putEmptyQuoted(builder: *Builder) -> void {
+    if builder.*.length >= builder.*.capacity && !grow(builder) {
+        builder.*.failed = true
+        return
+    }
+    builder.*.bytes[builder.*.length] = 0
+    builder.*.flags[builder.*.length] = EMPTY
+    builder.*.length += 1
+}
+
+// ---------------------------------------------------------------------------
+// Fields
+
+fn addField(shell: *Shell, fields: *Fields, bytes: [*]const u8, length: usize) -> bool {
+    if fields.*.count >= fields.*.capacity { return false }
+    const copy = state.workString(shell, bytes[0..length])
+    if copy == null { return false }
+    fields.*.items[fields.*.count] = copy.?
+    fields.*.count += 1
+    return true
+}
+
+// A finished field (bytes with flags): globbed when it has unquoted
+// pattern characters and globbing is on, else added as is.
+fn finishField(shell: *Shell, fields: *Fields, bytes: [*]const u8, flags: [*]const u8, length: usize, allow_glob: bool) -> bool {
+    // Drop the EMPTY markers (they only kept the field).
+    var clean: [*]u8 = undefined
+    const memory = state.workAlloc(shell, length + 1)
+    const flag_memory = state.workAlloc(shell, length + 1)
+    if memory == null || flag_memory == null { return false }
+    clean = memory.?
+    const clean_flags = flag_memory.?
+    var count: usize = 0
+    var index: usize = 0
+    while index < length {
+        if flags[index] != EMPTY {
+            clean[count] = bytes[index]
+            clean_flags[count] = flags[index]
+            count += 1
+        }
+        index += 1
+    }
+    if allow_glob && !shell.*.noglob {
+        var matches: glob.Matches = undefined
+        if glob.expand(shell, clean[0..count], clean_flags, &matches) {
+            var which: usize = 0
+            while which < matches.count {
+                const path = glob.matchText(shell, &matches, which)
+                if !addField(shell, fields, state.constOffset(@ptrCast([*]const u8, path), 0), path.length) { return false }
+                which += 1
+            }
+            return true
+        }
+    }
+    return addField(shell, fields, clean, count)
+}
+
+// Splits the builder's bytes into fields at unquoted IFS bytes.
+fn splitFields(shell: *Shell, builder: *Builder, fields: *Fields, allow_glob: bool) -> bool {
+    const bytes = builder.*.bytes
+    const flags = builder.*.flags
+    const length = builder.*.length
+    var start: usize = 0
+    var index: usize = 0
+    var has_field = false
+    while index <= length {
+        var separator = index == length
+        var whitespace = false
+        if !separator {
+            if flags[index] == BREAK {
+                separator = true
+            } else if flags[index] == EXPANDED && isIfs(shell, bytes[index]) {
+                separator = true
+                whitespace = isIfsWhitespace(bytes[index])
+            }
+        }
+        if separator {
+            if index > start || (!whitespace && index < length && flags[index] != BREAK) || (index == length && has_field) {
+                // A non-whitespace separator makes a field even when empty.
+                if index > start || !whitespace {
+                    if !finishField(shell, fields, state.constOffset(bytes, start), state.constOffset(flags, start), index - start, allow_glob) { return false }
+                }
+            }
+            if index < length && flags[index] == BREAK && index > start {
+                // Already added above.
+            } else if index < length && flags[index] == BREAK {
+                // An empty parameter between breaks: an empty field.
+                if !finishField(shell, fields, state.constOffset(bytes, start), state.constOffset(flags, start), 0, false) { return false }
+            }
+            start = index + 1
+            has_field = false
+        } else {
+            has_field = true
+        }
+        index += 1
+    }
+    return true
+}
+
+// Expands the WORD children of `first` (ASSIGNMENT words skipped) into
+// `fields` on the work stack. False when the expansion failed (said).
+pub fn expandWords(shell: *Shell, first: u32, fields: *Fields) -> bool {
+    const memory = state.workAlloc(shell, MAX_FIELDS * 8)
+    if memory == null { return false }
+    unsafe { fields.*.items = @ptrCast([*][*]const u8, memory.?) }
+    fields.*.count = 0
+    fields.*.capacity = MAX_FIELDS - 1
+    var word = first
+    while word != 0 {
+        const node = state.nodeAt(shell, word)
+        if node.*.kind == state.WORD && node.*.flags & state.ASSIGNMENT == 0 {
+            if !expandWord(shell, state.wordText(shell, word), fields, true) { return false }
+        }
+        word = node.*.next
+    }
+    unsafe { fields.*.items[fields.*.count] = @ptrFromInt([*]const u8, 0) }
+    return true
+}
+
+// One word into fields (split and globbed when `split`). The fields'
+// strings end up right at the work stack's mark from before the call: the
+// builder and the scratch of the expansion are released.
+pub fn expandWord(shell: *Shell, text: []const u8, fields: *Fields, split: bool) -> bool {
+    const mark = state.workMark(shell)
+    const first = fields.*.count
+    var builder: Builder = undefined
+    if !beginBuilder(shell, &builder) { return false }
+    expandInto(&builder, text, false)
+    if builder.failed { return false }
+    if split {
+        if !splitFields(shell, &builder, fields, true) { return false }
+    } else {
+        // One field, quotes removed, no splitting or globbing.
+        const memory = state.workAlloc(shell, builder.length + 1)
+        if memory == null { return false }
+        const clean = memory.?
+        var count: usize = 0
+        var index: usize = 0
+        while index < builder.length {
+            if builder.flags[index] == BREAK {
+                clean[count] = 32
+                count += 1
+            } else if builder.flags[index] != EMPTY {
+                clean[count] = builder.bytes[index]
+                count += 1
+            }
+            index += 1
+        }
+        if !addField(shell, fields, clean, count) { return false }
+    }
+    state.compactStrings(shell, fields.*.items, first, fields.*.count, mark)
+    return true
+}
+
+// A word as one string (a redirection's target, a case word, a for list
+// item's source): quote removal, no splitting, no globbing. Null when the
+// expansion failed.
+pub fn expandOne(shell: *Shell, text: []const u8) -> ?[]const u8 {
+    var fields: Fields = undefined
+    const memory = state.workAlloc(shell, 2 * 8)
+    if memory == null { return null }
+    unsafe { fields.items = @ptrCast([*][*]const u8, memory.?) }
+    fields.count = 0
+    fields.capacity = 1
+    if !expandWord(shell, text, &fields, false) || fields.count != 1 { return null }
+    return std.text.cString(fields.items[0])
+}
+
+// NAME=value: the name and the expanded value (no splitting; tilde after
+// the '=').
+pub const Assignment = struct {
+    name: []const u8
+    value: []const u8
+}
+
+pub fn expandAssignment(shell: *Shell, text: []const u8, into: *Assignment) -> bool {
+    var equals: usize = 0
+    while equals < text.length && text[equals] != 61 { equals += 1 }
+    into.*.name = text[0..equals]
+    const expanded = expandOne(shell, text[equals + 1..text.length])
+    if expanded == null { return false }
+    into.*.value = expanded.?
+    return true
+}
+
+// A heredoc body with its expansions (parameters, commands, arithmetic;
+// no quotes), or as written when the delimiter was quoted.
+pub fn expandHeredoc(shell: *Shell, text: []const u8, expand: bool) -> ?[]const u8 {
+    if !expand { return text }
+    var builder: Builder = undefined
+    if !beginBuilder(shell, &builder) { return null }
+    // Inside a heredoc only $ ` \ matter, as inside double quotes.
+    expandInto(&builder, text, true)
+    if builder.failed { return null }
+    return builder.bytes[0..builder.length]
+}
+
+// A pattern (a case item's) expanded with its literal flags: quoted bytes
+// match themselves, the rest may be * ? [. The result stays on the work
+// stack (the caller releases its mark).
+pub fn expandPattern(shell: *Shell, text: []const u8, into: *Subword) -> bool {
+    return expandSubword(shell, text, false, into)
+}

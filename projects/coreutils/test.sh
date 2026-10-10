@@ -191,7 +191,7 @@ compare_wc_flags -c --total=always "$work_dir/a" || fail 'wc always total differ
 compare_wc_flags -c --total=only "$work_dir/a" "$work_dir/b" || fail 'wc only total differs'
 compare_wc_flags -c --total=never "$work_dir/a" "$work_dir/b" || fail 'wc never total differs'
 LC_ALL=C "$bin_dir/wc" --debug -l "$work_dir/a" > "$work_dir/actual" 2> "$work_dir/wc-debug"
-grep -q 'mlx-wc:' "$work_dir/wc-debug" || fail 'wc --debug emitted no strategy diagnostic'
+grep -q 'wc:' "$work_dir/wc-debug" || fail 'wc --debug emitted no strategy diagnostic'
 if "$bin_dir/wc" --files0-from="$work_dir/wc-files0" "$work_dir/a" >/dev/null 2>&1; then
     fail 'wc combined files0 and operands'
 fi
@@ -405,7 +405,7 @@ cmp "$work_dir/actual" "$work_dir/expected" || fail 'tail descriptor follow outp
 timeout 3 "$bin_dir/tail" --debug --pid=999999 -F -s 0.01 "$work_dir/tail-b" > "$work_dir/actual" 2> "$work_dir/tail-debug"
 /usr/bin/tail --pid=999999 -F -s 0.01 "$work_dir/tail-b" > "$work_dir/expected"
 cmp "$work_dir/actual" "$work_dir/expected" || fail 'tail name follow output differs'
-grep -q 'mlx-tail:' "$work_dir/tail-debug" || fail 'tail --debug emitted no strategy diagnostic'
+grep -q 'tail:' "$work_dir/tail-debug" || fail 'tail --debug emitted no strategy diagnostic'
 printf 'follow-start\n' > "$work_dir/tail-follow"
 (
     sleep 0.05
@@ -494,7 +494,7 @@ cmp "$work_dir/actual" "$work_dir/expected" || fail 'env --chdir output differs'
 "$bin_dir/env" --debug MLX_ENV_DEBUG=value /usr/bin/printenv MLX_ENV_DEBUG > "$work_dir/actual" 2> "$work_dir/env-debug"
 printf 'value\n' > "$work_dir/expected"
 cmp "$work_dir/actual" "$work_dir/expected" || fail 'env --debug changed command output'
-grep -q 'mlx-env:' "$work_dir/env-debug" || fail 'env --debug emitted no trace'
+grep -q 'env:' "$work_dir/env-debug" || fail 'env --debug emitted no trace'
 "$bin_dir/env" --ignore-signal=PIPE /bin/sh -c 'kill -s PIPE $$; printf survived' > "$work_dir/actual"
 [[ "$(cat "$work_dir/actual")" == survived ]] || fail 'env --ignore-signal did not preserve the command'
 "$bin_dir/env" --block-signal=TERM /bin/sh -c 'kill -s TERM $$; printf blocked' > "$work_dir/actual"
@@ -504,7 +504,7 @@ grep -q 'signals ignored' "$work_dir/env-signals" || fail 'env did not list sign
 "$bin_dir/env" -vS '/usr/bin/printf "split:%s:%s\n" one' two > "$work_dir/actual" 2> "$work_dir/env-split-debug"
 /usr/bin/env -S '/usr/bin/printf "split:%s:%s\n" one' two > "$work_dir/expected"
 cmp "$work_dir/actual" "$work_dir/expected" || fail 'env --split-string output differs'
-grep -q 'mlx-env:' "$work_dir/env-split-debug" || fail 'env -vS emitted no trace'
+grep -q 'env:' "$work_dir/env-split-debug" || fail 'env -vS emitted no trace'
 
 "$bin_dir/nproc" > "$work_dir/actual"
 /usr/bin/nproc > "$work_dir/expected"
@@ -1139,5 +1139,440 @@ done
 printf 'a\nb' | "$bin_dir/nl" > "$work_dir/actual"
 printf 'a\nb' | /usr/bin/nl > "$work_dir/expected"
 cmp "$work_dir/actual" "$work_dir/expected" || fail 'nl no-trailing-newline differs'
+
+printf 'abcdefghij\n' > "$work_dir/fold1"
+printf 'a\tbcdefg\n' > "$work_dir/fold2"
+printf 'one two three four five\n' > "$work_dir/fold3"
+printf 'abc\ndef\n' > "$work_dir/fold4"
+for fold_case in 'fold1 -w4' 'fold2 -w4' 'fold2 -bw4' 'fold3 -sw10' 'fold4 -w2' 'fold1' 'fold1 -w 4' 'fold1 --width=4'; do
+    set -- $fold_case
+    file="$work_dir/$1"
+    shift
+    "$bin_dir/fold" "$@" "$file" > "$work_dir/actual"
+    /usr/bin/fold "$@" "$file" > "$work_dir/expected"
+    cmp "$work_dir/actual" "$work_dir/expected" || fail "fold $fold_case output differs"
+done
+printf 'abcdefghij' | "$bin_dir/fold" -w4 > "$work_dir/actual"
+printf 'abcdefghij' | /usr/bin/fold -w4 > "$work_dir/expected"
+cmp "$work_dir/actual" "$work_dir/expected" || fail 'fold no-trailing-newline differs'
+
+printf 'a\na\nb\nb\nb\nc\n' > "$work_dir/uniq1"
+printf 'A a\nA b\nB c\n' > "$work_dir/uniq2"
+printf 'AAAa\nAAAb\n' > "$work_dir/uniq3"
+printf 'apple\nApple\nbanana\n' > "$work_dir/uniq4"
+printf 'abcX\nabcY\nabd\n' > "$work_dir/uniq5"
+for uniq_case in 'uniq1' 'uniq1 -c' 'uniq1 -d' 'uniq1 -u' 'uniq1 -D' 'uniq1 -cd' 'uniq2 -f1' 'uniq3 -s3' 'uniq4 -i' 'uniq5 -w3'; do
+    set -- $uniq_case
+    file="$work_dir/$1"
+    shift
+    "$bin_dir/uniq" "$@" "$file" > "$work_dir/actual"
+    /usr/bin/uniq "$@" "$file" > "$work_dir/expected"
+    cmp "$work_dir/actual" "$work_dir/expected" || fail "uniq $uniq_case output differs"
+done
+printf 'a\na\nb' | "$bin_dir/uniq" > "$work_dir/actual"
+printf 'a\na\nb' | /usr/bin/uniq > "$work_dir/expected"
+cmp "$work_dir/actual" "$work_dir/expected" || fail 'uniq no-trailing-newline differs'
+"$bin_dir/uniq" "$work_dir/uniq1" "$work_dir/uniq-out"
+/usr/bin/uniq "$work_dir/uniq1" "$work_dir/uniq-out-gnu"
+cmp "$work_dir/uniq-out" "$work_dir/uniq-out-gnu" || fail 'uniq explicit output file differs'
+set +e
+"$bin_dir/uniq" -cD "$work_dir/uniq1" >/dev/null 2>&1
+mlx_uniq_cd_status=$?
+/usr/bin/uniq -cD "$work_dir/uniq1" >/dev/null 2>&1
+gnu_uniq_cd_status=$?
+set -e
+[[ "$mlx_uniq_cd_status" -eq "$gnu_uniq_cd_status" ]] || fail 'uniq -cD exit status differs'
+
+printf 'hello\n' > "$work_dir/cut1"
+printf 'a:b:c:d\n' > "$work_dir/cut2"
+printf 'a:b:c\nnodel\n' > "$work_dir/cut3"
+printf 'abcdefgh\n' > "$work_dir/cut4"
+for cut_case in 'cut1 -c1-3' 'cut1 -c2-' 'cut1 -c-3' 'cut1 -c1,3,5' 'cut2 -d: -f2,4' 'cut2 -d: -f2-3' 'cut3 -d: -f2' 'cut3 -d: -f2 -s' 'cut2 -d: -f2 --complement' 'cut2 -d: -f1,3 --output-delimiter=,' 'cut4 -c2-4,3-6'; do
+    set -- $cut_case
+    file="$work_dir/$1"
+    shift
+    "$bin_dir/cut" "$@" "$file" > "$work_dir/actual"
+    /usr/bin/cut "$@" "$file" > "$work_dir/expected"
+    cmp "$work_dir/actual" "$work_dir/expected" || fail "cut $cut_case output differs"
+done
+printf 'abc' | "$bin_dir/cut" -c1-2 > "$work_dir/actual"
+printf 'abc' | /usr/bin/cut -c1-2 > "$work_dir/expected"
+cmp "$work_dir/actual" "$work_dir/expected" || fail 'cut no-trailing-newline differs'
+set +e
+"$bin_dir/cut" "$work_dir/cut1" >/dev/null 2>&1
+mlx_cut_nomode_status=$?
+/usr/bin/cut "$work_dir/cut1" >/dev/null 2>&1
+gnu_cut_nomode_status=$?
+set -e
+[[ "$mlx_cut_nomode_status" -eq "$gnu_cut_nomode_status" ]] || fail 'cut no-mode exit status differs'
+
+printf 'a\nb\nc\nd\n' > "$work_dir/comm1"
+printf 'b\nc\ne\n' > "$work_dir/comm2"
+printf '' > "$work_dir/comm-empty"
+for comm_case in '' '-1' '-2' '-3' '-12' '-13' '-23' '-123' '--output-delimiter=:'; do
+    "$bin_dir/comm" $comm_case "$work_dir/comm1" "$work_dir/comm2" > "$work_dir/actual"
+    /usr/bin/comm $comm_case "$work_dir/comm1" "$work_dir/comm2" > "$work_dir/expected"
+    cmp "$work_dir/actual" "$work_dir/expected" || fail "comm $comm_case output differs"
+done
+"$bin_dir/comm" "$work_dir/comm1" "$work_dir/comm1" > "$work_dir/actual"
+/usr/bin/comm "$work_dir/comm1" "$work_dir/comm1" > "$work_dir/expected"
+cmp "$work_dir/actual" "$work_dir/expected" || fail 'comm identical files output differs'
+"$bin_dir/comm" "$work_dir/comm1" "$work_dir/comm-empty" > "$work_dir/actual"
+/usr/bin/comm "$work_dir/comm1" "$work_dir/comm-empty" > "$work_dir/expected"
+cmp "$work_dir/actual" "$work_dir/expected" || fail 'comm empty file2 output differs'
+printf 'a\nb\n' | "$bin_dir/comm" - "$work_dir/comm2" > "$work_dir/actual"
+printf 'a\nb\n' | /usr/bin/comm - "$work_dir/comm2" > "$work_dir/expected"
+cmp "$work_dir/actual" "$work_dir/expected" || fail 'comm stdin as file1 differs'
+set +e
+"$bin_dir/comm" - - </dev/null >/dev/null 2>&1
+mlx_comm_stdin_status=$?
+/usr/bin/comm - - </dev/null >/dev/null 2>&1
+gnu_comm_stdin_status=$?
+set -e
+[[ "$mlx_comm_stdin_status" -eq "$gnu_comm_stdin_status" ]] || fail 'comm both-stdin exit status differs'
+
+tr_case() {
+    local input=$1
+    shift
+    printf '%s' "$input" | "$bin_dir/tr" "$@" > "$work_dir/actual"
+    printf '%s' "$input" | /usr/bin/tr "$@" > "$work_dir/expected"
+    cmp "$work_dir/actual" "$work_dir/expected" || fail "tr $* output differs"
+}
+tr_case $'hello world\n' 'a-z' 'A-Z'
+tr_case $'hello   world\n' -s ' '
+tr_case $'hello world\n' -d 'lo'
+tr_case $'hello world\n' -c 'a-z' '_'
+tr_case $'aabbccdd\n' -s 'a-z'
+tr_case $'foo bar\n' 'ab' 'X'
+tr_case $'Hello123\n' '[:upper:]' '[:lower:]'
+tr_case $'Hello123!\n' -d '[:punct:]'
+tr_case $'a\tb\n' '\t' ' '
+tr_case $'A\101B\n' '\101' 'X'
+tr_case $'abcdef\n' -t 'a-f' 'XY'
+tr_case $'aabbccdd\n' -ds 'a-b' 'c'
+tr_case $'aabbccdd\n' -s 'a-z' 'A-Z'
+printf 'abc' | "$bin_dir/tr" 'a-z' 'A-Z' > "$work_dir/actual"
+printf 'abc' | /usr/bin/tr 'a-z' 'A-Z' > "$work_dir/expected"
+cmp "$work_dir/actual" "$work_dir/expected" || fail 'tr no-trailing-newline differs'
+
+expr_case() {
+    local mlx_out gnu_out mlx_status gnu_status
+    set +e
+    mlx_out=$("$bin_dir/expr" "$@" 2>/dev/null)
+    mlx_status=$?
+    gnu_out=$(/usr/bin/expr "$@" 2>/dev/null)
+    gnu_status=$?
+    set -e
+    [[ "$mlx_status" -eq "$gnu_status" ]] || fail "expr $* exit status differs"
+    if [[ "$mlx_status" -ne 2 ]]; then
+        [[ "$mlx_out" == "$gnu_out" ]] || fail "expr $* output differs"
+    fi
+}
+expr_case 1 + 2
+expr_case 10 / 3
+expr_case 10 % 3
+expr_case 3 '*' 4
+expr_case 5 - 2
+expr_case 5 '>' 3
+expr_case 5 '<' 3
+expr_case 5 = 5
+expr_case abc = abc
+expr_case abc = def
+expr_case 3 '|' 5
+expr_case 0 '|' 5
+expr_case 0 '&' 5
+expr_case 3 '&' 5
+expr_case length hello
+expr_case substr hello 2 3
+expr_case index hello lo
+expr_case hello : 'h.l'
+expr_case hello : '\(h.l\)'
+expr_case '(' 1 + 2 ')' '*' 3
+expr_case 0
+expr_case ''
+expr_case 1 = 2
+expr_case 'abc123' : '[a-z]*\([0-9]*\)'
+expr_case 'aaab' : 'a*b'
+expr_case 'hello' : 'hello$'
+expr_case 'hello!' : 'hello$'
+expr_case 'abc' : '[^0-9]*'
+
+test_case() {
+    local mlx_status gnu_status
+    set +e
+    "$bin_dir/test" "$@" >/dev/null 2>&1
+    mlx_status=$?
+    /usr/bin/test "$@" >/dev/null 2>&1
+    gnu_status=$?
+    set -e
+    [[ "$mlx_status" -eq "$gnu_status" ]] || fail "test $* exit status differs"
+}
+test_case
+test_case ''
+test_case foo
+test_case ! foo
+test_case ! ''
+test_case 1 -eq 1
+test_case 1 -a 1
+test_case '' -o foo
+test_case -z ''
+test_case -n foo
+test_case -e /etc/passwd
+test_case -f /etc/passwd
+test_case -d /etc
+test_case -r /etc/passwd
+test_case /etc/passwd -nt /etc/group
+test_case '(' foo = foo ')'
+test_case ! foo -a bar
+test_case 1 -eq abc
+test_case foo != bar
+test_case 1 -lt 2
+test_case -f /nonexistent/xyz123
+test_case -L /etc/passwd
+test_case -w /tmp
+test_case -x /etc
+test_case -s /etc/passwd
+test_case /etc/passwd -ef /etc/passwd
+"$bin_dir/[" foo = foo ']'
+[[ $? -eq 0 ]] || fail '[ foo = foo ] should succeed'
+set +e
+"$bin_dir/[" foo = foo >/dev/null 2>&1
+mlx_bracket_status=$?
+/usr/bin/[ foo = foo >/dev/null 2>&1
+gnu_bracket_status=$?
+set -e
+[[ "$mlx_bracket_status" -eq "$gnu_bracket_status" ]] || fail '[ missing close exit status differs'
+
+printf 'hello world' | "$bin_dir/base64" > "$work_dir/actual"
+printf 'hello world' | /usr/bin/base64 > "$work_dir/expected"
+cmp "$work_dir/actual" "$work_dir/expected" || fail 'base64 encode differs'
+printf 'hello world' | "$bin_dir/base64" | "$bin_dir/base64" -d > "$work_dir/actual"
+printf 'hello world' > "$work_dir/expected"
+cmp "$work_dir/actual" "$work_dir/expected" || fail 'base64 roundtrip differs'
+printf 'a longer test string to check line wrapping behavior of base64 encoding output format here' | "$bin_dir/base64" > "$work_dir/actual"
+printf 'a longer test string to check line wrapping behavior of base64 encoding output format here' | /usr/bin/base64 > "$work_dir/expected"
+cmp "$work_dir/actual" "$work_dir/expected" || fail 'base64 wrap differs'
+printf 'hello world' | "$bin_dir/base64" -w0 > "$work_dir/actual"
+printf 'hello world' | /usr/bin/base64 -w0 > "$work_dir/expected"
+cmp "$work_dir/actual" "$work_dir/expected" || fail 'base64 -w0 differs'
+printf 'hello' | "$bin_dir/base32" > "$work_dir/actual"
+printf 'hello' | /usr/bin/base32 > "$work_dir/expected"
+cmp "$work_dir/actual" "$work_dir/expected" || fail 'base32 encode differs'
+printf 'hello world' | "$bin_dir/base32" | "$bin_dir/base32" -d > "$work_dir/actual"
+printf 'hello world' > "$work_dir/expected"
+cmp "$work_dir/actual" "$work_dir/expected" || fail 'base32 roundtrip differs'
+for basenc_mode in --base16 --base2msbf --base2lsbf --base32hex --base64url; do
+    printf 'hello world, this is a longer test string 1234567890' | "$bin_dir/basenc" $basenc_mode > "$work_dir/actual"
+    printf 'hello world, this is a longer test string 1234567890' | /usr/bin/basenc $basenc_mode > "$work_dir/expected"
+    cmp "$work_dir/actual" "$work_dir/expected" || fail "basenc $basenc_mode output differs"
+done
+printf '414243' | "$bin_dir/basenc" --base16 -d > "$work_dir/actual"
+printf '414243' | /usr/bin/basenc --base16 -d > "$work_dir/expected"
+cmp "$work_dir/actual" "$work_dir/expected" || fail 'basenc --base16 -d differs'
+
+printf 'hello\n' > "$work_dir/ck1"
+printf 'world\n' > "$work_dir/ck3"
+for util in md5sum sha1sum sha224sum sha256sum sha384sum sha512sum; do
+    "$bin_dir/$util" "$work_dir/ck1" > "$work_dir/actual"
+    "/usr/bin/$util" "$work_dir/ck1" > "$work_dir/expected"
+    cmp "$work_dir/actual" "$work_dir/expected" || fail "$util basic output differs"
+    "$bin_dir/$util" --tag "$work_dir/ck1" > "$work_dir/actual"
+    "/usr/bin/$util" --tag "$work_dir/ck1" > "$work_dir/expected"
+    cmp "$work_dir/actual" "$work_dir/expected" || fail "$util --tag output differs"
+    "/usr/bin/$util" "$work_dir/ck1" "$work_dir/ck3" > "$work_dir/ck-list"
+    "$bin_dir/$util" -c "$work_dir/ck-list" > "$work_dir/actual"
+    "/usr/bin/$util" -c "$work_dir/ck-list" > "$work_dir/expected"
+    cmp "$work_dir/actual" "$work_dir/expected" || fail "$util -c output differs"
+    "/usr/bin/$util" --tag "$work_dir/ck1" "$work_dir/ck3" > "$work_dir/ck-tag-list"
+    "$bin_dir/$util" -c "$work_dir/ck-tag-list" > "$work_dir/actual"
+    "/usr/bin/$util" -c "$work_dir/ck-tag-list" > "$work_dir/expected"
+    cmp "$work_dir/actual" "$work_dir/expected" || fail "$util -c (tag format) output differs"
+done
+
+for sum_mode in -r -s; do
+    "$bin_dir/sum" $sum_mode "$work_dir/ck1" > "$work_dir/actual"
+    "/usr/bin/sum" $sum_mode "$work_dir/ck1" > "$work_dir/expected"
+    cmp "$work_dir/actual" "$work_dir/expected" || fail "sum $sum_mode output differs"
+    "$bin_dir/sum" $sum_mode "$work_dir/ck1" "$work_dir/ck3" > "$work_dir/actual"
+    "/usr/bin/sum" $sum_mode "$work_dir/ck1" "$work_dir/ck3" > "$work_dir/expected"
+    cmp "$work_dir/actual" "$work_dir/expected" || fail "sum $sum_mode multi-file output differs"
+    "$bin_dir/sum" $sum_mode < "$work_dir/ck1" > "$work_dir/actual"
+    "/usr/bin/sum" $sum_mode < "$work_dir/ck1" > "$work_dir/expected"
+    cmp "$work_dir/actual" "$work_dir/expected" || fail "sum $sum_mode stdin output differs"
+done
+
+"$bin_dir/cksum" "$work_dir/ck1" > "$work_dir/actual"
+"/usr/bin/cksum" "$work_dir/ck1" > "$work_dir/expected"
+cmp "$work_dir/actual" "$work_dir/expected" || fail 'cksum default output differs'
+"$bin_dir/cksum" "$work_dir/ck1" "$work_dir/ck3" > "$work_dir/actual"
+"/usr/bin/cksum" "$work_dir/ck1" "$work_dir/ck3" > "$work_dir/expected"
+cmp "$work_dir/actual" "$work_dir/expected" || fail 'cksum default multi-file output differs'
+for cksum_alg in crc sysv bsd md5 sha1 sha224 sha256 sha384 sha512; do
+    "$bin_dir/cksum" -a "$cksum_alg" "$work_dir/ck1" > "$work_dir/actual"
+    "/usr/bin/cksum" -a "$cksum_alg" "$work_dir/ck1" > "$work_dir/expected"
+    cmp "$work_dir/actual" "$work_dir/expected" || fail "cksum -a $cksum_alg output differs"
+done
+"$bin_dir/cksum" -a md5 --untagged "$work_dir/ck1" > "$work_dir/actual"
+"/usr/bin/cksum" -a md5 --untagged "$work_dir/ck1" > "$work_dir/expected"
+cmp "$work_dir/actual" "$work_dir/expected" || fail 'cksum -a md5 --untagged output differs'
+
+"$bin_dir/b2sum" "$work_dir/ck1" > "$work_dir/actual"
+"/usr/bin/b2sum" "$work_dir/ck1" > "$work_dir/expected"
+cmp "$work_dir/actual" "$work_dir/expected" || fail 'b2sum basic output differs'
+"$bin_dir/b2sum" --tag "$work_dir/ck1" > "$work_dir/actual"
+"/usr/bin/b2sum" --tag "$work_dir/ck1" > "$work_dir/expected"
+cmp "$work_dir/actual" "$work_dir/expected" || fail 'b2sum --tag output differs'
+"/usr/bin/b2sum" "$work_dir/ck1" "$work_dir/ck3" > "$work_dir/ck-b2-list"
+"$bin_dir/b2sum" -c "$work_dir/ck-b2-list" > "$work_dir/actual"
+"/usr/bin/b2sum" -c "$work_dir/ck-b2-list" > "$work_dir/expected"
+cmp "$work_dir/actual" "$work_dir/expected" || fail 'b2sum -c output differs'
+
+printf '\t\thello\tworld\n' > "$work_dir/expand1"
+"$bin_dir/expand" "$work_dir/expand1" > "$work_dir/actual"
+/usr/bin/expand "$work_dir/expand1" > "$work_dir/expected"
+cmp "$work_dir/actual" "$work_dir/expected" || fail 'expand default output differs'
+"$bin_dir/expand" -i "$work_dir/expand1" > "$work_dir/actual"
+/usr/bin/expand -i "$work_dir/expand1" > "$work_dir/expected"
+cmp "$work_dir/actual" "$work_dir/expected" || fail 'expand -i output differs'
+"$bin_dir/expand" -t 4 "$work_dir/expand1" > "$work_dir/actual"
+/usr/bin/expand -t 4 "$work_dir/expand1" > "$work_dir/expected"
+cmp "$work_dir/actual" "$work_dir/expected" || fail 'expand -t 4 output differs'
+
+printf '        hello   world\nb       c\n' > "$work_dir/unexpand1"
+"$bin_dir/unexpand" "$work_dir/unexpand1" > "$work_dir/actual"
+/usr/bin/unexpand "$work_dir/unexpand1" > "$work_dir/expected"
+cmp "$work_dir/actual" "$work_dir/expected" || fail 'unexpand default output differs'
+"$bin_dir/unexpand" -a "$work_dir/unexpand1" > "$work_dir/actual"
+/usr/bin/unexpand -a "$work_dir/unexpand1" > "$work_dir/expected"
+cmp "$work_dir/actual" "$work_dir/expected" || fail 'unexpand -a output differs'
+"$bin_dir/unexpand" -a -t 4 "$work_dir/unexpand1" > "$work_dir/actual"
+/usr/bin/unexpand -a -t 4 "$work_dir/unexpand1" > "$work_dir/expected"
+cmp "$work_dir/actual" "$work_dir/expected" || fail 'unexpand -a -t 4 output differs'
+
+printf 'a\nb\nc\n' > "$work_dir/paste1"
+printf '1\n2\n3\n' > "$work_dir/paste2"
+"$bin_dir/paste" "$work_dir/paste1" "$work_dir/paste2" > "$work_dir/actual"
+/usr/bin/paste "$work_dir/paste1" "$work_dir/paste2" > "$work_dir/expected"
+cmp "$work_dir/actual" "$work_dir/expected" || fail 'paste default output differs'
+"$bin_dir/paste" -s "$work_dir/paste1" "$work_dir/paste2" > "$work_dir/actual"
+/usr/bin/paste -s "$work_dir/paste1" "$work_dir/paste2" > "$work_dir/expected"
+cmp "$work_dir/actual" "$work_dir/expected" || fail 'paste -s output differs'
+"$bin_dir/paste" -d, "$work_dir/paste1" "$work_dir/paste2" > "$work_dir/actual"
+/usr/bin/paste -d, "$work_dir/paste1" "$work_dir/paste2" > "$work_dir/expected"
+cmp "$work_dir/actual" "$work_dir/expected" || fail 'paste -d, output differs'
+
+printf 'a\nb\nc\nd\ne\n' > "$work_dir/shuf1"
+sort "$work_dir/shuf1" > "$work_dir/shuf1-sorted"
+"$bin_dir/shuf" "$work_dir/shuf1" | sort > "$work_dir/actual"
+cmp "$work_dir/actual" "$work_dir/shuf1-sorted" || fail 'shuf output is not a permutation of input'
+[[ "$("$bin_dir/shuf" -n 3 "$work_dir/shuf1" | wc -l)" -eq 3 ]] || fail 'shuf -n 3 did not produce 3 lines'
+[[ "$("$bin_dir/shuf" -n 3 "$work_dir/shuf1" | sort -u | wc -l)" -eq 3 ]] || fail 'shuf -n 3 produced duplicate lines'
+[[ "$("$bin_dir/shuf" -e x y z | sort | tr '\n' ' ')" == "x y z " ]] || fail 'shuf -e did not permute its arguments'
+[[ "$("$bin_dir/shuf" -i 1-10 | sort -n | tr '\n' ' ')" == "1 2 3 4 5 6 7 8 9 10 " ]] || fail 'shuf -i 1-10 did not permute the range'
+r1=$("$bin_dir/shuf" --random-source=/dev/zero "$work_dir/shuf1")
+r2=$("$bin_dir/shuf" --random-source=/dev/zero "$work_dir/shuf1")
+[[ "$r1" == "$r2" ]] || fail 'shuf --random-source=/dev/zero was not deterministic'
+
+diff <("$bin_dir/date" '+%Y-%m-%d %H:%M') <(/usr/bin/date '+%Y-%m-%d %H:%M') > /dev/null || fail 'date default (minute precision) output differs'
+diff <("$bin_dir/date" -u '+%Y-%m-%d %H:%M') <(/usr/bin/date -u '+%Y-%m-%d %H:%M') > /dev/null || fail 'date -u (minute precision) output differs'
+diff <("$bin_dir/date" -d @1700000000 -R) <(/usr/bin/date -d @1700000000 -R) > /dev/null || fail 'date -R output differs'
+diff <("$bin_dir/date" -d @1700000000 -Iseconds) <(/usr/bin/date -d @1700000000 -Iseconds) > /dev/null || fail 'date -Iseconds output differs'
+diff <("$bin_dir/date" -d @1700000000 --rfc-3339=seconds) <(/usr/bin/date -d @1700000000 --rfc-3339=seconds) > /dev/null || fail 'date --rfc-3339=seconds output differs'
+diff <("$bin_dir/date" -d @1700000000 '+%Y-%m-%d %H:%M:%S %a %Z') <(/usr/bin/date -d @1700000000 '+%Y-%m-%d %H:%M:%S %a %Z') > /dev/null || fail 'date custom format output differs'
+diff <("$bin_dir/date" -d @1700000000) <(/usr/bin/date -d @1700000000) > /dev/null || fail 'date -d @epoch output differs'
+diff <("$bin_dir/date" -d '2024-01-15 10:30:00' '+%Y-%m-%d %H:%M:%S') <(/usr/bin/date -d '2024-01-15 10:30:00' '+%Y-%m-%d %H:%M:%S') > /dev/null || fail 'date -d STRING output differs'
+
+printf 'banana\napple\ncherry\napple\n' > "$work_dir/sort1"
+printf '10\n2\n33\n4\n' > "$work_dir/sort2"
+printf 'b:2\na:10\nc:1\n' > "$work_dir/sort3"
+diff <("$bin_dir/sort" "$work_dir/sort1") <(/usr/bin/sort "$work_dir/sort1") > /dev/null || fail 'sort default output differs'
+diff <("$bin_dir/sort" -r "$work_dir/sort1") <(/usr/bin/sort -r "$work_dir/sort1") > /dev/null || fail 'sort -r output differs'
+diff <("$bin_dir/sort" -u "$work_dir/sort1") <(/usr/bin/sort -u "$work_dir/sort1") > /dev/null || fail 'sort -u output differs'
+diff <("$bin_dir/sort" -n "$work_dir/sort2") <(/usr/bin/sort -n "$work_dir/sort2") > /dev/null || fail 'sort -n output differs'
+diff <("$bin_dir/sort" -nr "$work_dir/sort2") <(/usr/bin/sort -nr "$work_dir/sort2") > /dev/null || fail 'sort -nr (bundled flags) output differs'
+diff <("$bin_dir/sort" -t: -k2n "$work_dir/sort3") <(/usr/bin/sort -t: -k2n "$work_dir/sort3") > /dev/null || fail 'sort -t: -k2n output differs'
+diff <("$bin_dir/sort" "$work_dir/sort1" "$work_dir/sort2") <(/usr/bin/sort "$work_dir/sort1" "$work_dir/sort2") > /dev/null || fail 'sort multi-file output differs'
+"$bin_dir/sort" -c "$work_dir/sort2" || fail 'sort -c on sorted input should exit 0'
+if "$bin_dir/sort" -c "$work_dir/sort1" > /dev/null 2>&1; then
+    fail 'sort -c on unsorted input should exit nonzero'
+fi
+
+printf '1 a\n2 b\n3 c\n' > "$work_dir/join1"
+printf '1 x\n2 y\n4 z\n' > "$work_dir/join2"
+diff <("$bin_dir/join" "$work_dir/join1" "$work_dir/join2") <(/usr/bin/join "$work_dir/join1" "$work_dir/join2") > /dev/null || fail 'join default output differs'
+diff <("$bin_dir/join" -a 1 "$work_dir/join1" "$work_dir/join2") <(/usr/bin/join -a 1 "$work_dir/join1" "$work_dir/join2") > /dev/null || fail 'join -a 1 output differs'
+diff <("$bin_dir/join" -a1 -a2 "$work_dir/join1" "$work_dir/join2") <(/usr/bin/join -a1 -a2 "$work_dir/join1" "$work_dir/join2") > /dev/null || fail 'join -a1 -a2 (attached) output differs'
+diff <("$bin_dir/join" -v 1 "$work_dir/join1" "$work_dir/join2") <(/usr/bin/join -v 1 "$work_dir/join1" "$work_dir/join2") > /dev/null || fail 'join -v 1 output differs'
+diff <("$bin_dir/join" -o 1.1,2.2,1.2 "$work_dir/join1" "$work_dir/join2") <(/usr/bin/join -o 1.1,2.2,1.2 "$work_dir/join1" "$work_dir/join2") > /dev/null || fail 'join -o output differs'
+printf '1:a\n2:b\n' > "$work_dir/join3"
+printf '1:x\n2:y\n' > "$work_dir/join4"
+diff <("$bin_dir/join" -t: "$work_dir/join3" "$work_dir/join4") <(/usr/bin/join -t: "$work_dir/join3" "$work_dir/join4") > /dev/null || fail 'join -t: (attached) output differs'
+printf 'id val1\n1 a\n2 b\n' > "$work_dir/join5"
+printf 'id val2\n1 x\n2 y\n' > "$work_dir/join6"
+diff <("$bin_dir/join" --header "$work_dir/join5" "$work_dir/join6") <(/usr/bin/join --header "$work_dir/join5" "$work_dir/join6") > /dev/null || fail 'join --header output differs'
+
+seq 1 25 > "$work_dir/split-input"
+mkdir -p "$work_dir/split-mine" "$work_dir/split-gnu"
+(cd "$work_dir/split-mine" && "$bin_dir/split" -l 5 "$work_dir/split-input")
+(cd "$work_dir/split-gnu" && /usr/bin/split -l 5 "$work_dir/split-input")
+diff -rq "$work_dir/split-mine" "$work_dir/split-gnu" > /dev/null || fail 'split -l 5 output differs'
+rm -rf "$work_dir/split-mine" "$work_dir/split-gnu"
+mkdir -p "$work_dir/split-mine" "$work_dir/split-gnu"
+(cd "$work_dir/split-mine" && "$bin_dir/split" -b 10 -d "$work_dir/split-input" byt)
+(cd "$work_dir/split-gnu" && /usr/bin/split -b 10 -d "$work_dir/split-input" byt)
+diff -rq "$work_dir/split-mine" "$work_dir/split-gnu" > /dev/null || fail 'split -b 10 -d output differs'
+rm -rf "$work_dir/split-mine" "$work_dir/split-gnu"
+mkdir -p "$work_dir/split-mine" "$work_dir/split-gnu"
+(cd "$work_dir/split-mine" && "$bin_dir/split" -C 15 "$work_dir/split-input")
+(cd "$work_dir/split-gnu" && /usr/bin/split -C 15 "$work_dir/split-input")
+diff -rq "$work_dir/split-mine" "$work_dir/split-gnu" > /dev/null || fail 'split -C 15 output differs'
+
+printf 'This is a simple test of the fmt utility that should reflow this paragraph nicely into lines of the given width.\n\nAnd a second paragraph here that is also long enough to need wrapping across several lines of output text.\n' > "$work_dir/fmt1"
+"$bin_dir/fmt" -w 40 "$work_dir/fmt1" > "$work_dir/fmt1-actual"
+awk '{ if (length($0) > 40) exit 1 }' "$work_dir/fmt1-actual" || fail 'fmt -w 40 produced a line exceeding the width'
+diff <(tr -s ' \n' ' ' < "$work_dir/fmt1-actual") <(tr -s ' \n' ' ' < "$work_dir/fmt1") > /dev/null || fail 'fmt -w 40 changed word content or order'
+printf 'word1    word2.  Word3     word4.\n' > "$work_dir/fmt2"
+diff <("$bin_dir/fmt" -u -w 40 "$work_dir/fmt2") <(/usr/bin/fmt -u -w 40 "$work_dir/fmt2") > /dev/null || fail 'fmt -u output differs'
+printf 'a    b   c\n' > "$work_dir/fmt3"
+diff <("$bin_dir/fmt" -s -w 40 "$work_dir/fmt3") <(/usr/bin/fmt -s -w 40 "$work_dir/fmt3") > /dev/null || fail 'fmt -s (line already fits, spacing preserved) output differs'
+
+seq 1 20 > "$work_dir/csdata"
+mkdir -p "$work_dir/cs-mine" "$work_dir/cs-gnu"
+(cd "$work_dir/cs-mine" && "$bin_dir/csplit" "$work_dir/csdata" 5 10 15 > out.txt)
+(cd "$work_dir/cs-gnu" && /usr/bin/csplit "$work_dir/csdata" 5 10 15 > out.txt)
+diff -rq "$work_dir/cs-mine" "$work_dir/cs-gnu" > /dev/null || fail 'csplit integer-pattern output differs'
+rm -rf "$work_dir/cs-mine" "$work_dir/cs-gnu"
+printf 'a\nb\nSTART\nc\nd\nSTART\ne\nf\n' > "$work_dir/cspat"
+mkdir -p "$work_dir/cs-mine" "$work_dir/cs-gnu"
+(cd "$work_dir/cs-mine" && "$bin_dir/csplit" "$work_dir/cspat" '/START/' '{*}' > out.txt)
+(cd "$work_dir/cs-gnu" && /usr/bin/csplit "$work_dir/cspat" '/START/' '{*}' > out.txt)
+diff -rq "$work_dir/cs-mine" "$work_dir/cs-gnu" > /dev/null || fail 'csplit regex {*} output differs'
+rm -rf "$work_dir/cs-mine" "$work_dir/cs-gnu"
+mkdir -p "$work_dir/cs-mine" "$work_dir/cs-gnu"
+(cd "$work_dir/cs-mine" && rc=0 && { "$bin_dir/csplit" "$work_dir/csdata" 5 100 > out.txt 2> err.txt || rc=$?; }; echo "exit=$rc" > exit.txt)
+(cd "$work_dir/cs-gnu" && rc=0 && { /usr/bin/csplit "$work_dir/csdata" 5 100 > out.txt 2> /dev/null || rc=$?; }; echo "exit=$rc" > exit.txt)
+diff "$work_dir/cs-mine/out.txt" "$work_dir/cs-gnu/out.txt" > /dev/null || fail 'csplit out-of-range stdout differs'
+diff "$work_dir/cs-mine/exit.txt" "$work_dir/cs-gnu/exit.txt" > /dev/null || fail 'csplit out-of-range exit status differs'
+if [[ -e "$work_dir/cs-mine/xx00" || -e "$work_dir/cs-mine/xx01" ]]; then
+    fail 'csplit removed output files on error by default, should be absent'
+fi
+
+normalize_pr_date() {
+    sed 's/^[0-9]\{4\}-[0-9]\{2\}-[0-9]\{2\} [0-9:]* /DATE /'
+}
+seq 1 10 > "$work_dir/prtest"
+diff <("$bin_dir/pr" -l 20 "$work_dir/prtest" | normalize_pr_date) <(/usr/bin/pr -l 20 "$work_dir/prtest" | normalize_pr_date) > /dev/null || fail 'pr basic pagination output differs'
+diff <("$bin_dir/pr" -l 20 -t -n "$work_dir/prtest") <(/usr/bin/pr -l 20 -t -n "$work_dir/prtest") > /dev/null || fail 'pr -t -n output differs'
+diff <("$bin_dir/pr" -l 20 -t -o 4 "$work_dir/prtest") <(/usr/bin/pr -l 20 -t -o 4 "$work_dir/prtest") > /dev/null || fail 'pr -t -o 4 output differs'
+diff <("$bin_dir/pr" -l 20 -F "$work_dir/prtest" | normalize_pr_date) <(/usr/bin/pr -l 20 -F "$work_dir/prtest" | normalize_pr_date) > /dev/null || fail 'pr -F output differs'
+printf '1\n2\n3\n' > "$work_dir/pr3"
+diff <("$bin_dir/pr" -l 15 "$work_dir/pr3" | normalize_pr_date) <(/usr/bin/pr -l 15 "$work_dir/pr3" | normalize_pr_date) > /dev/null || fail 'pr short-input padding output differs'
+
+# Every utility installs std.crash first thing in main: a crash says the
+# function, the line and the callers on stderr and is kept in crashes.log.
+for program in "$bin_dir"/*; do
+    [[ -x "$program" ]] || continue
+    grep -q -a 'mlxCompositorCrashed' "$program" || fail "$(basename "$program") does not carry the crash handler (std.crash)"
+done
 
 printf 'all coreutils smoke tests passed\n'

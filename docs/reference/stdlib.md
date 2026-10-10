@@ -119,12 +119,32 @@ CPU or the GPU, and widgets for any platform, see
 [User interfaces](ui.md)) are extensions for drawing text and building
 pixel user interfaces.
 
+`std.terminal` (`std/src/terminal.mlx`) is a terminal emulator's screen for
+any front end: `feed()` takes the bytes a program writes (UTF-8 with wide
+characters, the C0 controls, ECMA-48 cursor movement, erasing, inserting
+and deleting, scrolling regions, SGR with 16, 256 and direct colours and
+the attributes, the DEC modes for application cursor keys, autowrap,
+origin, the cursor, the alternate screen, bracketed paste and the mouse,
+the title, the DSR and DA reports), the cells come out through
+`visibleCell()` (with the history behind `scrollView()`), the replies the
+program is owed through `takeResponses()`. `std.terminal.keys` encodes a
+key (Linux key code, modifiers, the text it types and the text without
+Control and Alt) as xterm does; `std.terminal.pty` runs a program on a
+pseudo-terminal. `std.ui.terminal` draws a screen on a `std.ui` canvas with
+the monospaced font of `std.ui.text` and handles its keys and wheel, for
+`projects/desktop/terminal` and any app with a terminal pane. A
+`std.ui.host` app watches a descriptor (the pty) with `watchDescriptor()`
+and gets `EVENT_WATCH`; `plainTyped()` is the key's text without Control
+and Alt.
+
 `std.crash` (`std/src/crash.mlx`) is a program's crash report: `install()`
 sets a signal handler on a stack of its own that names the signal, the
 function and its callers (from the symbol table the compiler writes, see
 [formats](formats.md)) and keeps the crash in
 `$XDG_STATE_HOME/mlx/crashes.log`; `fail(reason)` ends the program the same
-way for a failure it cannot go on after. `std.wayland.crash.watch(display)`
+way for a failure it cannot go on after. The report goes to stderr. Every
+desktop program, every coreutil and mlxlibc (for the programs its loader
+starts) install it. `std.wayland.crash.watch(display)`
 (`std/src/wayland/crash.mlx`) makes a Wayland client's failed connection
 such a failure (`tools/check_crash_report.sh` holds every client to it).
 
@@ -264,10 +284,12 @@ both ways and reads it back with `loadFile`.
 
 **Normative source:** `spec/04-stdlib/mem.xml`
 **Implementation:** `std/bootstrap/allocator.mlx`, `page_allocator.mlx`,
-`arena_allocator.mlx`, `fixed_buffer_allocator.mlx`, `mem.mlx`
+`arena_allocator.mlx`, `fixed_buffer_allocator.mlx`,
+`general_purpose_allocator.mlx`, `mem.mlx`
 **Source tests:** `120_bootstrap_mem_runtime.mlx`,
 `131_bootstrap_allocator_runtime.mlx`, `132_page_allocator_runtime.mlx`,
-`137_bootstrap_arena_allocators_runtime.mlx`
+`137_bootstrap_arena_allocators_runtime.mlx`,
+`296_general_purpose_allocator_runtime.mlx`
 
 `spec/04-stdlib/mem.xml` specifies an `Allocator` with `alloc`/`resize`/`free`
 operations, four allocator kinds (`PageAllocator`, `ArenaAllocator`,
@@ -277,19 +299,21 @@ operations, four allocator kinds (`PageAllocator`, `ArenaAllocator`,
 `set`, `zero`, `eql`).
 
 The bootstrap implementation matches the allocator contract exactly. The
-interface is a struct of function-pointer fields plus an opaque `usize`
-context (function values are ordinary indirect-callable values in Mlx;
-opaque-pointer ergonomics richer than `usize` context await Stage 1):
+interface is a struct of function-pointer fields plus an opaque context
+pointer (function values are ordinary indirect-callable values in Mlx), as
+Zig's `Allocator` with its vtable flattened into the struct:
 
 ```mlx
-pub const AllocFn = fn(context: usize, length: usize, alignment: usize) -> ?[*]u8
-pub const ResizeFn = fn(context: usize, memory: [*]u8, old_length: usize, new_length: usize, alignment: usize) -> ?[*]u8
-pub const FreeFn = fn(context: usize, memory: [*]u8, length: usize, alignment: usize) -> void
+pub const AllocFn = fn(context: *anyopaque, length: usize, alignment: usize) -> ?[*]u8
+pub const ResizeFn = fn(context: *anyopaque, memory: [*]u8, length: usize, alignment: usize, new_length: usize) -> bool
+pub const RemapFn = fn(context: *anyopaque, memory: [*]u8, length: usize, alignment: usize, new_length: usize) -> ?[*]u8
+pub const FreeFn = fn(context: *anyopaque, memory: [*]u8, length: usize, alignment: usize) -> void
 
 pub const Allocator = struct {
-    context: usize
+    context: *anyopaque
     allocFn: AllocFn
     resizeFn: ResizeFn
+    remapFn: RemapFn
     freeFn: FreeFn
     ...
 }
@@ -297,13 +321,39 @@ pub const Allocator = struct {
 
 (`std/bootstrap/allocator.mlx`)
 
-Three of the four spec'd allocators are implemented: `page_allocator.mlx`
-(backed directly by `mmap`/`munmap` via `std.os.linux`),
-`arena_allocator.mlx` (bump-allocates out of one page-allocated block, with
-`reset`/`deinit`), and `fixed_buffer_allocator.mlx` (bump-allocates over a
-caller-owned buffer, with `reset`). `GeneralPurposeAllocator` from
-`mem.xml` has no bootstrap implementation yet. A runtime fixture exercises
-fixed-buffer alignment/reset and arena alignment/reset/deinit together:
+All four spec'd allocators are implemented: `page_allocator.mlx` (backed
+directly by `mmap`/`munmap` via `std.os.linux`), `arena_allocator.mlx`
+(bump-allocates out of one page-allocated block, with `reset`/`deinit`),
+`fixed_buffer_allocator.mlx` (bump-allocates over a caller-owned buffer,
+with `reset`), and `general_purpose_allocator.mlx`, the heap for blocks of
+any size freed in any order, for every thread of a process at once:
+
+```mlx
+var heap = std.general_purpose_allocator.init(std.page_allocator.init())
+const allocator = std.general_purpose_allocator.interface(&heap)
+const block = allocator.alloc(100, 8).?
+allocator.free(block, 100, 8)
+std.general_purpose_allocator.deinit(&heap)   // gives the slabs back
+```
+
+Blocks up to 32 KiB come from 22 size classes (16, 32, 48, 64, 96, ...,
+32768 bytes, every one a multiple of 16), carved out of 256 KiB slabs from
+the child allocator and kept on a free list per class when freed; a
+power-of-two class in a page-aligned slab meets alignments above 16 up to a
+page. Larger blocks are page mappings of their own (one aligned beyond a
+page carries a header naming its mapping). Since the interface hands the
+length and alignment back on `free`, no block needs a header; `resize`
+succeeds in place while the new length stays in the block's class (or the
+large block's pages). One lock, a futex word taken with `@cmpxchgWeak` and
+slept on through the kernel when contended, covers the lists.
+`liveBytes`, `slabCount` and `largeCount` report the heap's state;
+`blockSize(length, alignment)` the class a block occupies.
+`296_general_purpose_allocator_runtime.mlx` exercises every class, the
+alignments, resizing, deinit and four threads allocating and freeing
+through one heap. mlxlibc's `malloc`/`free`/`realloc` sit on it.
+
+A runtime fixture exercises fixed-buffer alignment/reset and arena
+alignment/reset/deinit together:
 
 ```mlx
 var fixed_state = bootstrap.fixed_buffer_allocator.init(@ptrCast([*]u8, storage[0..16]), 16)

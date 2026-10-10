@@ -1,0 +1,868 @@
+// pthread.h on the kernel alone: threads with @spawnThread (clone), their
+// control blocks at the top of their stacks as their thread pointers
+// (tcb.mlx), joins on the id word the kernel clears at exit, mutexes and
+// condition variables on futexes, once, keys, read-write locks, spin locks
+// and barriers. The objects have glibc's sizes (pthread_mutex_t 40 bytes,
+// pthread_cond_t 48, pthread_rwlock_t 56, pthread_barrier_t 32) with their
+// static initializers all zero, so programs' PTHREAD_*_INITIALIZERs work.
+const sys = @import("./sys.mlx")
+const errno = @import("./errno.mlx")
+const tcb = @import("./tcb.mlx")
+const heap = @import("./heap.mlx")
+const unistd = @import("./unistd.mlx")
+const loader = @import("./loader.mlx")
+
+const DEFAULT_STACK: usize = 8388608
+const GUARD: usize = 4096
+
+// Keys: destructors, and the generation that tells a reused key apart.
+var keyUsed: [128]u8 = undefined
+var keyDestructors: [128]usize = undefined
+var keyLock: u32 = 0
+
+// Threads this library started, for pthread_join and detach to tell them
+// apart, and stacks given back when their threads are gone.
+var threadsLock: u32 = 0
+var freeStacks: [32]usize = undefined
+var freeStackSizes: [32]usize = undefined
+var freeStackCount: usize = 0
+// The threads started here and still joinable, linked through tcb.NEXT: a
+// handle of a thread already joined or released is refused (ESRCH) rather
+// than read from memory that is gone.
+var liveThreads: usize = 0
+
+fn remember(block: usize) -> void {
+    sys.lock(@ptrCast(*u32, &threadsLock))
+    sys.putPointer(block + tcb.NEXT, liveThreads)
+    liveThreads = block
+    sys.unlock(@ptrCast(*u32, &threadsLock))
+}
+
+fn forget(block: usize) -> void {
+    sys.lock(@ptrCast(*u32, &threadsLock))
+    var link: usize = @intFromPtr(&liveThreads)
+    while sys.getPointer(link) != 0 && sys.getPointer(link) != block { link = sys.getPointer(link) + tcb.NEXT }
+    if sys.getPointer(link) == block { sys.putPointer(link, sys.getPointer(block + tcb.NEXT)) }
+    sys.unlock(@ptrCast(*u32, &threadsLock))
+}
+
+// The block of a joinable thread started here (0 for any other handle).
+fn liveBlock(thread: usize) -> usize {
+    sys.lock(@ptrCast(*u32, &threadsLock))
+    var block = liveThreads
+    while block != 0 && block != thread { block = sys.getPointer(block + tcb.NEXT) }
+    sys.unlock(@ptrCast(*u32, &threadsLock))
+    return block
+}
+
+// pthread_attr_t: stack size, detach state, guard size, stack address,
+// stack length (words 0..4 of its 56 bytes).
+pub export fn pthread_attr_init(attributes: usize) -> i32 {
+    sys.fill(attributes, 0, 56)
+    sys.putPointer(attributes, DEFAULT_STACK)
+    sys.putPointer(attributes + 16, GUARD)
+    return 0
+}
+pub export fn pthread_attr_destroy(attributes: usize) -> i32 { return 0 }
+pub export fn pthread_attr_setstacksize(attributes: usize, size: usize) -> i32 {
+    if size < 16384 { return sys.EINVAL }
+    sys.putPointer(attributes, size)
+    return 0
+}
+pub export fn pthread_attr_getstacksize(attributes: usize, size: usize) -> i32 {
+    sys.putPointer(size, sys.getPointer(attributes))
+    return 0
+}
+pub export fn pthread_attr_setdetachstate(attributes: usize, state: i32) -> i32 {
+    sys.putPointer(attributes + 8, @intCast(usize, state))
+    return 0
+}
+pub export fn pthread_attr_getdetachstate(attributes: usize, state: usize) -> i32 {
+    sys.putI32(state, @intCast(i32, sys.getPointer(attributes + 8)))
+    return 0
+}
+pub export fn pthread_attr_setguardsize(attributes: usize, size: usize) -> i32 {
+    sys.putPointer(attributes + 16, size)
+    return 0
+}
+pub export fn pthread_attr_getguardsize(attributes: usize, size: usize) -> i32 {
+    sys.putPointer(size, sys.getPointer(attributes + 16))
+    return 0
+}
+pub export fn pthread_attr_setstack(attributes: usize, address: usize, size: usize) -> i32 {
+    sys.putPointer(attributes + 24, address)
+    sys.putPointer(attributes, size)
+    return 0
+}
+pub export fn pthread_attr_getstack(attributes: usize, address: usize, size: usize) -> i32 {
+    sys.putPointer(address, sys.getPointer(attributes + 24))
+    sys.putPointer(size, sys.getPointer(attributes))
+    return 0
+}
+pub export fn pthread_attr_setscope(attributes: usize, scope: i32) -> i32 { return 0 }
+pub export fn pthread_attr_getscope(attributes: usize, scope: usize) -> i32 {
+    sys.putI32(scope, 0)
+    return 0
+}
+pub export fn pthread_attr_setschedpolicy(attributes: usize, policy: i32) -> i32 { return 0 }
+pub export fn pthread_attr_setschedparam(attributes: usize, parameter: usize) -> i32 { return 0 }
+pub export fn pthread_attr_setinheritsched(attributes: usize, inherit: i32) -> i32 { return 0 }
+pub export fn pthread_getattr_np(thread: usize, attributes: usize) -> i32 {
+    const block = tcb.find(thread)
+    const initialized = pthread_attr_init(attributes)
+    if block != 0 && tcb.isOurs(block) {
+        sys.putPointer(attributes, sys.getPointer(block + tcb.STACK_SIZE) - tcb.SIZE - GUARD)
+        sys.putPointer(attributes + 24, sys.getPointer(block + tcb.STACK) + GUARD)
+        sys.putPointer(attributes + 8, @intCast(usize, sys.get32(block + tcb.DETACHED)))
+    }
+    return 0
+}
+pub export fn pthread_attr_setaffinity_np(attributes: usize, size: usize, set: usize) -> i32 { return 0 }
+
+// The thread's first function: the start routine, its result kept, then
+// the key destructors; the thread exits when this returns (the clone
+// trampoline makes the exit system call). An export: in the plugin each
+// export sets up an aggregate arena of its own, which a new thread needs.
+pub export fn __mlxlibc_thread_start(block: usize) -> usize {
+    const result = sys.call1Result(sys.getPointer(block + tcb.START), sys.getPointer(block + tcb.ARGUMENT))
+    finishThread(block, result)
+    return 0
+}
+
+fn runDestructors(block: usize) -> void {
+    var round: usize = 0
+    while round < 4 {
+        var any = false
+        var key: usize = 0
+        while key < tcb.KEY_COUNT {
+            const value = sys.getPointer(block + tcb.KEYS + key * 8)
+            if value != 0 && keyUsed[key] != 0 && keyDestructors[key] != 0 {
+                sys.putPointer(block + tcb.KEYS + key * 8, 0)
+                sys.call1(keyDestructors[key], value)
+                any = true
+            }
+            key += 1
+        }
+        if !any { return }
+        round += 1
+    }
+}
+
+fn finishThread(block: usize, result: usize) -> void {
+    sys.putPointer(block + tcb.RESULT, result)
+    runDestructors(block)
+    @atomicStore(u32, sys.word(block + tcb.FINISHED), 1, release)
+    if @atomicLoad(u32, sys.word(block + tcb.DETACHED), acquire) != 0 {
+        // Nobody joins: the stack is reused once the kernel has cleared
+        // the id word (a later pthread_create checks it).
+        forget(block)
+        sys.lock(@ptrCast(*u32, &threadsLock))
+        if freeStackCount < 32 {
+            freeStacks[freeStackCount] = sys.getPointer(block + tcb.STACK)
+            freeStackSizes[freeStackCount] = sys.getPointer(block + tcb.STACK_SIZE)
+            freeStackCount += 1
+        }
+        sys.unlock(@ptrCast(*u32, &threadsLock))
+    }
+}
+
+fn takeFreeStack(size: usize) -> usize {
+    sys.lock(@ptrCast(*u32, &threadsLock))
+    var index: usize = 0
+    var found: usize = 0
+    while index < freeStackCount && found == 0 {
+        const candidate = freeStacks[index]
+        const candidate_block = candidate + freeStackSizes[index] - tcb.SIZE
+        if freeStackSizes[index] == size && @atomicLoad(u32, sys.word(candidate_block + tcb.TID), acquire) == 0 {
+            found = candidate
+            freeStackCount -= 1
+            freeStacks[index] = freeStacks[freeStackCount]
+            freeStackSizes[index] = freeStackSizes[freeStackCount]
+        } else {
+            index += 1
+        }
+    }
+    sys.unlock(@ptrCast(*u32, &threadsLock))
+    return found
+}
+
+pub export fn pthread_create(thread: usize, attributes: usize, start: usize, argument: usize) -> i32 {
+    var stack_size = DEFAULT_STACK
+    var detached = false
+    if attributes != 0 {
+        stack_size = sys.getPointer(attributes)
+        detached = sys.getPointer(attributes + 8) != 0
+    }
+    stack_size = (stack_size + sys.PAGE - 1) & ~(sys.PAGE - 1)
+    // The static TLS of the loaded modules lies below the control block.
+    loader.adoptProgram()
+    const tls_size = loader.staticTlsSize()
+    const total = stack_size + GUARD + tls_size + tcb.SIZE
+    var mapping = takeFreeStack(total)
+    if mapping == 0 {
+        mapping = sys.mmap(total, sys.PROT_READ | sys.PROT_WRITE, sys.MAP_PRIVATE | sys.MAP_ANONYMOUS | sys.MAP_NORESERVE)
+        if mapping == sys.MAP_FAILED { return sys.EAGAIN }
+        const guarded = sys.syscall3(sys.SYS_mprotect, mapping, GUARD, 0)
+    }
+    const block = mapping + total - tcb.SIZE
+    tcb.initialize(block)
+    if tls_size > 0 {
+        sys.fill(block - tls_size, 0, tls_size)
+        loader.initializeTls(block)
+    }
+    const parent = tcb.current()
+    if parent != 0 { sys.put64(block + tcb.CANARY, sys.get64(parent + tcb.CANARY)) }
+    sys.putPointer(block + tcb.START, start)
+    sys.putPointer(block + tcb.ARGUMENT, argument)
+    sys.putPointer(block + tcb.STACK, mapping)
+    sys.putPointer(block + tcb.STACK_SIZE, total)
+    sys.put32(block + tcb.OWN, 1)
+    sys.put32(block + tcb.DETACHED, if detached { 1 } else { 0 })
+    // The kernel writes the id before the child runs and clears it at its
+    // end; 1 meanwhile, so a join does not see 0 too soon.
+    sys.put32(block + tcb.TID, 1)
+    remember(block)
+    const flags = sys.CLONE_VM | sys.CLONE_FS | sys.CLONE_FILES | sys.CLONE_SIGHAND | sys.CLONE_THREAD | sys.CLONE_SYSVSEM | sys.CLONE_SETTLS | sys.CLONE_PARENT_SETTID | sys.CLONE_CHILD_CLEARTID | sys.CLONE_CHILD_SETTID
+    // The stack grows down from below the static TLS area.
+    const started = @spawnThread(flags, block - tls_size, block + tcb.TID, block + tcb.TID, block, __mlxlibc_thread_start, block)
+    if started < 0 {
+        forget(block)
+        const unmapped = sys.munmap(mapping, total)
+        return @intCast(i32, 0 - started)
+    }
+    sys.putPointer(thread, block)
+    return 0
+}
+
+fn waitForExit(block: usize) -> void {
+    while true {
+        const seen = @atomicLoad(u32, sys.word(block + tcb.TID), acquire)
+        if seen == 0 { return }
+        const waited = sys.futexWait(block + tcb.TID, seen, 0, false)
+    }
+}
+
+pub export fn pthread_join(thread: usize, result: usize) -> i32 {
+    const block = liveBlock(thread)
+    if block == 0 { return sys.ESRCH }
+    if block == @threadPointer() { return sys.EDEADLK }
+    if @atomicLoad(u32, sys.word(block + tcb.DETACHED), acquire) != 0 { return sys.EINVAL }
+    waitForExit(block)
+    if result != 0 { sys.putPointer(result, sys.getPointer(block + tcb.RESULT)) }
+    forget(block)
+    const unmapped = sys.munmap(sys.getPointer(block + tcb.STACK), sys.getPointer(block + tcb.STACK_SIZE))
+    return 0
+}
+
+pub export fn pthread_tryjoin_np(thread: usize, result: usize) -> i32 {
+    const block = liveBlock(thread)
+    if block == 0 { return sys.ESRCH }
+    if @atomicLoad(u32, sys.word(block + tcb.TID), acquire) != 0 { return sys.EBUSY }
+    return pthread_join(thread, result)
+}
+
+pub export fn pthread_timedjoin_np(thread: usize, result: usize, deadline: usize) -> i32 {
+    const block = liveBlock(thread)
+    if block == 0 { return sys.ESRCH }
+    while @atomicLoad(u32, sys.word(block + tcb.TID), acquire) != 0 {
+        var relative: [2]i64 = [2]i64{ 0, 0 }
+        if !relativeTimeout(deadline, 0, &relative) { return sys.ETIMEDOUT }
+        const seen = @atomicLoad(u32, sys.word(block + tcb.TID), acquire)
+        if seen != 0 {
+            const waited = sys.futexWait(block + tcb.TID, seen, @intFromPtr(&relative), false)
+            if waited == -110 { return sys.ETIMEDOUT }
+        }
+    }
+    return pthread_join(thread, result)
+}
+
+pub export fn pthread_detach(thread: usize) -> i32 {
+    const block = liveBlock(thread)
+    if block == 0 { return sys.ESRCH }
+    if @atomicRmw(u32, sys.word(block + tcb.DETACHED), xchg, 1, acq_rel) != 0 { return sys.EINVAL }
+    if @atomicLoad(u32, sys.word(block + tcb.FINISHED), acquire) != 0 {
+        // Finished before the detach: its stack is this caller's to free
+        // once the kernel has let go of the id word.
+        waitForExit(block)
+        forget(block)
+        const unmapped = sys.munmap(sys.getPointer(block + tcb.STACK), sys.getPointer(block + tcb.STACK_SIZE))
+    }
+    return 0
+}
+
+pub export fn pthread_exit(result: usize) -> void {
+    const block = tcb.current()
+    if block != 0 && tcb.isOurs(block) && sys.get32(block + tcb.OWN) != 0 { finishThread(block, result) }
+    const ended = sys.syscall1(sys.SYS_exit, 0)
+}
+
+pub export fn pthread_self() -> usize { return @threadPointer() }
+pub export fn pthread_equal(first: usize, second: usize) -> i32 { return if first == second { 1 } else { 0 } }
+pub export fn pthread_yield() -> i32 { return unistd.sched_yield() }
+
+pub export fn pthread_kill(thread: usize, signal: i32) -> i32 {
+    const block = tcb.find(thread)
+    var tid: u32 = 0
+    if block != 0 && tcb.isOurs(block) && sys.get32(block + tcb.OWN) != 0 {
+        tid = @atomicLoad(u32, sys.word(block + tcb.TID), acquire)
+        if tid == 0 { return sys.ESRCH }
+    } else if thread == @threadPointer() {
+        tid = sys.getTid()
+    } else {
+        return sys.ESRCH
+    }
+    return errno.code(sys.syscall3(sys.SYS_tgkill, @intCast(usize, sys.getPid()), @intCast(usize, tid), sys.int(signal)))
+}
+
+fn threadId(thread: usize) -> u32 {
+    const block = tcb.find(thread)
+    if block != 0 && tcb.isOurs(block) && sys.get32(block + tcb.OWN) != 0 { return @atomicLoad(u32, sys.word(block + tcb.TID), acquire) }
+    if thread == @threadPointer() { return sys.getTid() }
+    return 0
+}
+
+fn commPath(tid: u32, buffer: *[64]u8) -> usize {
+    const prefix = "/proc/self/task/"
+    var at: usize = 0
+    while at < prefix.length {
+        buffer.*[at] = prefix[at]
+        at += 1
+    }
+    var digits: [12]u8 = undefined
+    var count: usize = 0
+    var value = tid
+    while true {
+        digits[count] = @intCast(u8, 48 + value % 10)
+        count += 1
+        value /= 10
+        if value == 0 { break }
+    }
+    while count > 0 {
+        count -= 1
+        buffer.*[at] = digits[count]
+        at += 1
+    }
+    const suffix = "/comm"
+    var index: usize = 0
+    while index < suffix.length {
+        buffer.*[at] = suffix[index]
+        at += 1
+        index += 1
+    }
+    buffer.*[at] = 0
+    return @intFromPtr(buffer)
+}
+
+pub export fn pthread_setname_np(thread: usize, name: usize) -> i32 {
+    if sys.length(name) > 15 { return sys.ERANGE }
+    if thread == @threadPointer() { return errno.code(sys.syscall5(sys.SYS_prctl, 15, name, 0, 0, 0)) }
+    const tid = threadId(thread)
+    if tid == 0 { return sys.ESRCH }
+    var path: [64]u8 = undefined
+    const fd = unistd.open(commPath(tid, &path), 1, 0)
+    if fd < 0 { return errno.get() }
+    const wrote = sys.syscall3(sys.SYS_write, sys.int(fd), name, sys.length(name))
+    const closed = unistd.close(fd)
+    return errno.code(wrote)
+}
+
+pub export fn pthread_getname_np(thread: usize, name: usize, size: usize) -> i32 {
+    if size < 16 { return sys.ERANGE }
+    if thread == @threadPointer() { return errno.code(sys.syscall5(sys.SYS_prctl, 16, name, 0, 0, 0)) }
+    const tid = threadId(thread)
+    if tid == 0 { return sys.ESRCH }
+    var path: [64]u8 = undefined
+    const fd = unistd.open(commPath(tid, &path), 0, 0)
+    if fd < 0 { return errno.get() }
+    const got = sys.syscall3(sys.SYS_read, sys.int(fd), name, size - 1)
+    const closed = unistd.close(fd)
+    if sys.failed(got) { return @intCast(i32, 0 - got) }
+    var length = @bitCast(usize, got)
+    if length > 0 && sys.get8(name + length - 1) == 10 { length -= 1 }
+    sys.put8(name + length, 0)
+    return 0
+}
+
+pub export fn pthread_setaffinity_np(thread: usize, size: usize, set: usize) -> i32 {
+    const tid = threadId(thread)
+    if tid == 0 { return sys.ESRCH }
+    return errno.code(sys.syscall3(sys.SYS_sched_setaffinity, @intCast(usize, tid), size, set))
+}
+
+pub export fn pthread_getaffinity_np(thread: usize, size: usize, set: usize) -> i32 {
+    const tid = threadId(thread)
+    if tid == 0 { return sys.ESRCH }
+    const got = sys.syscall3(sys.SYS_sched_getaffinity, @intCast(usize, tid), size, set)
+    if sys.failed(got) { return @intCast(i32, 0 - got) }
+    if @bitCast(usize, got) < size { sys.fill(set + @bitCast(usize, got), 0, size - @bitCast(usize, got)) }
+    return 0
+}
+
+pub export fn pthread_setschedparam(thread: usize, policy: i32, parameter: usize) -> i32 { return 0 }
+pub export fn pthread_getschedparam(thread: usize, policy: usize, parameter: usize) -> i32 {
+    sys.putI32(policy, 0)
+    sys.putI32(parameter, 0)
+    return 0
+}
+pub export fn pthread_setcancelstate(state: i32, old: usize) -> i32 {
+    if old != 0 { sys.putI32(old, 0) }
+    return 0
+}
+pub export fn pthread_setcanceltype(kind: i32, old: usize) -> i32 {
+    if old != 0 { sys.putI32(old, 0) }
+    return 0
+}
+pub export fn pthread_cancel(thread: usize) -> i32 { return sys.ENOTSUP }
+pub export fn pthread_testcancel() -> void {}
+pub export fn pthread_atfork(prepare: usize, parent: usize, child: usize) -> i32 { return 0 }
+
+// --- keys ---------------------------------------------------------------------
+
+pub export fn pthread_key_create(key: usize, destructor: usize) -> i32 {
+    sys.lock(@ptrCast(*u32, &keyLock))
+    var index: usize = 0
+    while index < tcb.KEY_COUNT && keyUsed[index] != 0 { index += 1 }
+    if index == tcb.KEY_COUNT {
+        sys.unlock(@ptrCast(*u32, &keyLock))
+        return sys.EAGAIN
+    }
+    keyUsed[index] = 1
+    keyDestructors[index] = destructor
+    sys.unlock(@ptrCast(*u32, &keyLock))
+    sys.put32(key, @intCast(u32, index))
+    return 0
+}
+
+pub export fn pthread_key_delete(key: u32) -> i32 {
+    if @intCast(usize, key) >= tcb.KEY_COUNT { return sys.EINVAL }
+    sys.lock(@ptrCast(*u32, &keyLock))
+    keyUsed[@intCast(usize, key)] = 0
+    keyDestructors[@intCast(usize, key)] = 0
+    sys.unlock(@ptrCast(*u32, &keyLock))
+    return 0
+}
+
+pub export fn pthread_getspecific(key: u32) -> usize {
+    if @intCast(usize, key) >= tcb.KEY_COUNT { return 0 }
+    const block = tcb.current()
+    if block == 0 { return 0 }
+    return sys.getPointer(block + tcb.KEYS + @intCast(usize, key) * 8)
+}
+
+pub export fn pthread_setspecific(key: u32, value: usize) -> i32 {
+    if @intCast(usize, key) >= tcb.KEY_COUNT || keyUsed[@intCast(usize, key)] == 0 { return sys.EINVAL }
+    const block = tcb.current()
+    if block == 0 { return sys.ENOMEM }
+    sys.putPointer(block + tcb.KEYS + @intCast(usize, key) * 8, value)
+    return 0
+}
+
+// --- once -----------------------------------------------------------------------
+
+pub export fn pthread_once(control: usize, routine: usize) -> i32 {
+    const word = sys.word(control)
+    while true {
+        const state = @atomicLoad(u32, word, acquire)
+        if state == 2 { return 0 }
+        if state == 0 {
+            const claimed = @cmpxchgStrong(u32, word, 0, 1, acq_rel, acquire)
+            if claimed.0 {
+                sys.call0(routine)
+                @atomicStore(u32, word, 2, release)
+                const woken = sys.futexWake(control, 2147483647, true)
+                return 0
+            }
+            continue
+        }
+        const waited = sys.futexWait(control, 1, 0, true)
+    }
+    return 0
+}
+
+pub export fn __pthread_once(control: usize, routine: usize) -> i32 { return pthread_once(control, routine) }
+
+// --- mutexes ------------------------------------------------------------------------
+// Word 0 the futex (0 free, 1 taken, 2 taken with waiters), word 1 the
+// recursion count, word 2 the owner, word 4 the kind (0 normal, 1
+// recursive, 2 error-checking), as glibc lays them out.
+
+const KIND_NORMAL: i32 = 0
+const KIND_RECURSIVE: i32 = 1
+const KIND_ERRORCHECK: i32 = 2
+
+fn mutexKind(mutex: usize) -> i32 { return sys.getI32(mutex + 16) & 3 }
+
+fn relativeTimeout(deadline: usize, clock: i32, relative: *[2]i64) -> bool {
+    var now: [2]i64 = [2]i64{ 0, 0 }
+    const got = sys.syscall2(sys.SYS_clock_gettime, sys.int(clock), @intFromPtr(&now))
+    var seconds = @bitCast(i64, sys.get64(deadline)) - now[0]
+    var nanoseconds = @bitCast(i64, sys.get64(deadline + 8)) - now[1]
+    if nanoseconds < 0 {
+        nanoseconds += 1000000000
+        seconds -= 1
+    }
+    if seconds < 0 { return false }
+    relative.*[0] = seconds
+    relative.*[1] = nanoseconds
+    return true
+}
+
+fn lockWord(word: *u32, deadline: usize, clock: i32) -> i32 {
+    const first = @cmpxchgStrong(u32, word, 0, 1, acquire, monotonic)
+    if first.0 { return 0 }
+    var seen = first.1
+    while true {
+        var wait = seen == 2
+        if !wait {
+            const marked = @cmpxchgStrong(u32, word, 1, 2, acquire, monotonic)
+            wait = marked.1 != 0
+        }
+        if wait {
+            if deadline != 0 {
+                var relative: [2]i64 = [2]i64{ 0, 0 }
+                if !relativeTimeout(deadline, clock, &relative) { return sys.ETIMEDOUT }
+                const waited = sys.futexWait(@intFromPtr(word), 2, @intFromPtr(&relative), false)
+                if waited == -110 { return sys.ETIMEDOUT }
+            } else {
+                const waited = sys.futexWait(@intFromPtr(word), 2, 0, false)
+            }
+        }
+        const again = @cmpxchgStrong(u32, word, 0, 2, acquire, monotonic)
+        if again.0 { return 0 }
+        seen = again.1
+    }
+    return 0
+}
+
+fn unlockWord(word: *u32) -> void {
+    const previous = @atomicRmw(u32, word, xchg, 0, release)
+    if previous == 2 { const woken = sys.futexWake(@intFromPtr(word), 1, false) }
+}
+
+fn mutexLock(mutex: usize, deadline: usize, clock: i32) -> i32 {
+    const kind = mutexKind(mutex)
+    const me = sys.getTid()
+    if kind != KIND_NORMAL && @atomicLoad(u32, sys.word(mutex), acquire) != 0 && sys.get32(mutex + 8) == me {
+        if kind == KIND_ERRORCHECK { return sys.EDEADLK }
+        sys.put32(mutex + 4, sys.get32(mutex + 4) + 1)
+        return 0
+    }
+    const status = lockWord(sys.word(mutex), deadline, clock)
+    if status != 0 { return status }
+    sys.put32(mutex + 8, me)
+    sys.put32(mutex + 4, 1)
+    return 0
+}
+
+pub export fn pthread_mutex_init(mutex: usize, attributes: usize) -> i32 {
+    sys.fill(mutex, 0, 40)
+    if attributes != 0 { sys.putI32(mutex + 16, sys.getI32(attributes) & 3) }
+    return 0
+}
+pub export fn pthread_mutex_destroy(mutex: usize) -> i32 { return 0 }
+pub export fn pthread_mutex_lock(mutex: usize) -> i32 { return mutexLock(mutex, 0, 0) }
+pub export fn pthread_mutex_timedlock(mutex: usize, deadline: usize) -> i32 { return mutexLock(mutex, deadline, 0) }
+pub export fn pthread_mutex_clocklock(mutex: usize, clock: i32, deadline: usize) -> i32 { return mutexLock(mutex, deadline, clock) }
+
+pub export fn pthread_mutex_trylock(mutex: usize) -> i32 {
+    const kind = mutexKind(mutex)
+    const me = sys.getTid()
+    if kind == KIND_RECURSIVE && @atomicLoad(u32, sys.word(mutex), acquire) != 0 && sys.get32(mutex + 8) == me {
+        sys.put32(mutex + 4, sys.get32(mutex + 4) + 1)
+        return 0
+    }
+    const taken = @cmpxchgStrong(u32, sys.word(mutex), 0, 1, acquire, monotonic)
+    if !taken.0 { return sys.EBUSY }
+    sys.put32(mutex + 8, me)
+    sys.put32(mutex + 4, 1)
+    return 0
+}
+
+pub export fn pthread_mutex_unlock(mutex: usize) -> i32 {
+    const kind = mutexKind(mutex)
+    if kind != KIND_NORMAL {
+        if @atomicLoad(u32, sys.word(mutex), acquire) == 0 || sys.get32(mutex + 8) != sys.getTid() { return sys.EPERM }
+        const count = sys.get32(mutex + 4)
+        if count > 1 {
+            sys.put32(mutex + 4, count - 1)
+            return 0
+        }
+    }
+    sys.put32(mutex + 8, 0)
+    sys.put32(mutex + 4, 0)
+    unlockWord(sys.word(mutex))
+    return 0
+}
+
+pub export fn pthread_mutex_consistent(mutex: usize) -> i32 { return 0 }
+pub export fn pthread_mutexattr_init(attributes: usize) -> i32 {
+    sys.putI32(attributes, 0)
+    return 0
+}
+pub export fn pthread_mutexattr_destroy(attributes: usize) -> i32 { return 0 }
+pub export fn pthread_mutexattr_settype(attributes: usize, kind: i32) -> i32 {
+    if kind < 0 || kind > 3 { return sys.EINVAL }
+    sys.putI32(attributes, if kind == 3 { 0 } else { kind })
+    return 0
+}
+pub export fn pthread_mutexattr_gettype(attributes: usize, kind: usize) -> i32 {
+    sys.putI32(kind, sys.getI32(attributes) & 3)
+    return 0
+}
+pub export fn pthread_mutexattr_setpshared(attributes: usize, shared: i32) -> i32 { return 0 }
+pub export fn pthread_mutexattr_getpshared(attributes: usize, shared: usize) -> i32 {
+    sys.putI32(shared, 0)
+    return 0
+}
+pub export fn pthread_mutexattr_setprotocol(attributes: usize, protocol: i32) -> i32 { return 0 }
+pub export fn pthread_mutexattr_setrobust(attributes: usize, robust: i32) -> i32 { return 0 }
+
+// --- condition variables --------------------------------------------------------------
+// Word 0 a sequence number the signals advance, word 1 the count of
+// waiters, word 2 the clock (pthread_condattr_setclock), all zero at rest.
+
+pub export fn pthread_cond_init(cond: usize, attributes: usize) -> i32 {
+    sys.fill(cond, 0, 48)
+    if attributes != 0 { sys.putI32(cond + 8, sys.getI32(attributes) >> 1) }
+    return 0
+}
+pub export fn pthread_cond_destroy(cond: usize) -> i32 { return 0 }
+
+fn condWait(cond: usize, mutex: usize, deadline: usize, clock_override: i32) -> i32 {
+    const sequence = @atomicLoad(u32, sys.word(cond), acquire)
+    const added = @atomicRmw(u32, sys.word(cond + 4), add, 1, acq_rel)
+    const unlocked = pthread_mutex_unlock(mutex)
+    var status: i32 = 0
+    if deadline != 0 {
+        const clock = if clock_override >= 0 { clock_override } else { sys.getI32(cond + 8) }
+        var relative: [2]i64 = [2]i64{ 0, 0 }
+        if !relativeTimeout(deadline, clock, &relative) {
+            status = sys.ETIMEDOUT
+        } else {
+            const waited = sys.futexWait(cond, sequence, @intFromPtr(&relative), false)
+            if waited == -110 { status = sys.ETIMEDOUT }
+        }
+    } else {
+        const waited = sys.futexWait(cond, sequence, 0, false)
+    }
+    const removed = @atomicRmw(u32, sys.word(cond + 4), sub, 1, acq_rel)
+    const relocked = pthread_mutex_lock(mutex)
+    return status
+}
+
+pub export fn pthread_cond_wait(cond: usize, mutex: usize) -> i32 { return condWait(cond, mutex, 0, -1) }
+pub export fn pthread_cond_timedwait(cond: usize, mutex: usize, deadline: usize) -> i32 { return condWait(cond, mutex, deadline, -1) }
+pub export fn pthread_cond_clockwait(cond: usize, mutex: usize, clock: i32, deadline: usize) -> i32 { return condWait(cond, mutex, deadline, clock) }
+
+pub export fn pthread_cond_signal(cond: usize) -> i32 {
+    const advanced = @atomicRmw(u32, sys.word(cond), add, 1, acq_rel)
+    if @atomicLoad(u32, sys.word(cond + 4), acquire) != 0 { const woken = sys.futexWake(cond, 1, false) }
+    return 0
+}
+
+pub export fn pthread_cond_broadcast(cond: usize) -> i32 {
+    const advanced = @atomicRmw(u32, sys.word(cond), add, 1, acq_rel)
+    if @atomicLoad(u32, sys.word(cond + 4), acquire) != 0 { const woken = sys.futexWake(cond, 2147483647, false) }
+    return 0
+}
+
+pub export fn pthread_condattr_init(attributes: usize) -> i32 {
+    sys.putI32(attributes, 0)
+    return 0
+}
+pub export fn pthread_condattr_destroy(attributes: usize) -> i32 { return 0 }
+pub export fn pthread_condattr_setclock(attributes: usize, clock: i32) -> i32 {
+    if clock != 0 && clock != 1 { return sys.EINVAL }
+    sys.putI32(attributes, (sys.getI32(attributes) & 1) | (clock << 1))
+    return 0
+}
+pub export fn pthread_condattr_getclock(attributes: usize, clock: usize) -> i32 {
+    sys.putI32(clock, sys.getI32(attributes) >> 1)
+    return 0
+}
+pub export fn pthread_condattr_setpshared(attributes: usize, shared: i32) -> i32 { return 0 }
+
+// --- read-write locks -----------------------------------------------------------------
+// Word 0: the readers, or 0x80000000 for a writer; word 1 a futex the
+// waiters sleep on (its value changes with every release).
+
+const WRITER: u32 = 2147483648
+
+pub export fn pthread_rwlock_init(lock: usize, attributes: usize) -> i32 {
+    sys.fill(lock, 0, 56)
+    return 0
+}
+pub export fn pthread_rwlock_destroy(lock: usize) -> i32 { return 0 }
+
+fn rwWait(lock: usize) -> void {
+    const generation = @atomicLoad(u32, sys.word(lock + 4), acquire)
+    const waited = sys.futexWait(lock + 4, generation, 0, false)
+}
+
+fn rwRelease(lock: usize) -> void {
+    const advanced = @atomicRmw(u32, sys.word(lock + 4), add, 1, acq_rel)
+    const woken = sys.futexWake(lock + 4, 2147483647, false)
+}
+
+pub export fn pthread_rwlock_rdlock(lock: usize) -> i32 {
+    while true {
+        const state = @atomicLoad(u32, sys.word(lock), acquire)
+        if state & WRITER == 0 {
+            const taken = @cmpxchgWeak(u32, sys.word(lock), state, state + 1, acq_rel, acquire)
+            if taken.0 { return 0 }
+            continue
+        }
+        rwWait(lock)
+    }
+    return 0
+}
+
+pub export fn pthread_rwlock_tryrdlock(lock: usize) -> i32 {
+    while true {
+        const state = @atomicLoad(u32, sys.word(lock), acquire)
+        if state & WRITER != 0 { return sys.EBUSY }
+        const taken = @cmpxchgWeak(u32, sys.word(lock), state, state + 1, acq_rel, acquire)
+        if taken.0 { return 0 }
+    }
+    return 0
+}
+
+pub export fn pthread_rwlock_wrlock(lock: usize) -> i32 {
+    while true {
+        const taken = @cmpxchgStrong(u32, sys.word(lock), 0, WRITER, acq_rel, acquire)
+        if taken.0 { return 0 }
+        rwWait(lock)
+    }
+    return 0
+}
+
+pub export fn pthread_rwlock_trywrlock(lock: usize) -> i32 {
+    const taken = @cmpxchgStrong(u32, sys.word(lock), 0, WRITER, acq_rel, acquire)
+    return if taken.0 { 0 } else { sys.EBUSY }
+}
+
+pub export fn pthread_rwlock_unlock(lock: usize) -> i32 {
+    const state = @atomicLoad(u32, sys.word(lock), acquire)
+    if state & WRITER != 0 {
+        @atomicStore(u32, sys.word(lock), 0, release)
+    } else if state > 0 {
+        const left = @atomicRmw(u32, sys.word(lock), sub, 1, acq_rel)
+        if left != 1 { return 0 }
+    } else {
+        return sys.EPERM
+    }
+    rwRelease(lock)
+    return 0
+}
+
+pub export fn pthread_rwlock_timedrdlock(lock: usize, deadline: usize) -> i32 { return pthread_rwlock_rdlock(lock) }
+pub export fn pthread_rwlock_timedwrlock(lock: usize, deadline: usize) -> i32 { return pthread_rwlock_wrlock(lock) }
+pub export fn pthread_rwlockattr_init(attributes: usize) -> i32 {
+    sys.put64(attributes, 0)
+    return 0
+}
+pub export fn pthread_rwlockattr_destroy(attributes: usize) -> i32 { return 0 }
+pub export fn pthread_rwlockattr_setkind_np(attributes: usize, kind: i32) -> i32 { return 0 }
+pub export fn pthread_rwlockattr_setpshared(attributes: usize, shared: i32) -> i32 { return 0 }
+
+// --- spin locks and barriers --------------------------------------------------------------
+
+pub export fn pthread_spin_init(lock: usize, shared: i32) -> i32 {
+    sys.put32(lock, 0)
+    return 0
+}
+pub export fn pthread_spin_destroy(lock: usize) -> i32 { return 0 }
+pub export fn pthread_spin_lock(lock: usize) -> i32 {
+    while @atomicRmw(u32, sys.word(lock), xchg, 1, acquire) != 0 {
+        while @atomicLoad(u32, sys.word(lock), monotonic) != 0 { const yielded = sys.syscall0(sys.SYS_sched_yield) }
+    }
+    return 0
+}
+pub export fn pthread_spin_trylock(lock: usize) -> i32 { return if @atomicRmw(u32, sys.word(lock), xchg, 1, acquire) == 0 { 0 } else { sys.EBUSY } }
+pub export fn pthread_spin_unlock(lock: usize) -> i32 {
+    @atomicStore(u32, sys.word(lock), 0, release)
+    return 0
+}
+
+// Barrier: word 0 the count to reach, word 1 the arrivals, word 2 the
+// round (waited on).
+pub export fn pthread_barrier_init(barrier: usize, attributes: usize, count: u32) -> i32 {
+    if count == 0 { return sys.EINVAL }
+    sys.fill(barrier, 0, 32)
+    sys.put32(barrier, count)
+    return 0
+}
+pub export fn pthread_barrier_destroy(barrier: usize) -> i32 { return 0 }
+pub export fn pthread_barrier_wait(barrier: usize) -> i32 {
+    const round = @atomicLoad(u32, sys.word(barrier + 8), acquire)
+    const arrived = @atomicRmw(u32, sys.word(barrier + 4), add, 1, acq_rel) + 1
+    if arrived == sys.get32(barrier) {
+        @atomicStore(u32, sys.word(barrier + 4), 0, release)
+        const advanced = @atomicRmw(u32, sys.word(barrier + 8), add, 1, acq_rel)
+        const woken = sys.futexWake(barrier + 8, 2147483647, false)
+        // PTHREAD_BARRIER_SERIAL_THREAD
+        return -1
+    }
+    while @atomicLoad(u32, sys.word(barrier + 8), acquire) == round {
+        const waited = sys.futexWait(barrier + 8, round, 0, false)
+    }
+    return 0
+}
+
+// --- semaphores (semaphore.h): word 0 the count, word 1 the waiters ------------------
+
+pub export fn sem_init(semaphore: usize, shared: i32, value: u32) -> i32 {
+    sys.fill(semaphore, 0, 32)
+    sys.put32(semaphore, value)
+    return 0
+}
+pub export fn sem_destroy(semaphore: usize) -> i32 { return 0 }
+pub export fn sem_post(semaphore: usize) -> i32 {
+    const previous = @atomicRmw(u32, sys.word(semaphore), add, 1, acq_rel)
+    if @atomicLoad(u32, sys.word(semaphore + 4), acquire) != 0 { const woken = sys.futexWake(semaphore, 1, false) }
+    return 0
+}
+pub export fn sem_wait(semaphore: usize) -> i32 {
+    while true {
+        const count = @atomicLoad(u32, sys.word(semaphore), acquire)
+        if count > 0 {
+            const taken = @cmpxchgWeak(u32, sys.word(semaphore), count, count - 1, acq_rel, acquire)
+            if taken.0 { return 0 }
+            continue
+        }
+        const added = @atomicRmw(u32, sys.word(semaphore + 4), add, 1, acq_rel)
+        const waited = sys.futexWait(semaphore, 0, 0, false)
+        const removed = @atomicRmw(u32, sys.word(semaphore + 4), sub, 1, acq_rel)
+    }
+    return 0
+}
+pub export fn sem_trywait(semaphore: usize) -> i32 {
+    while true {
+        const count = @atomicLoad(u32, sys.word(semaphore), acquire)
+        if count == 0 { return errno.failWith(sys.EAGAIN) }
+        const taken = @cmpxchgWeak(u32, sys.word(semaphore), count, count - 1, acq_rel, acquire)
+        if taken.0 { return 0 }
+    }
+    return 0
+}
+pub export fn sem_timedwait(semaphore: usize, deadline: usize) -> i32 {
+    while true {
+        const count = @atomicLoad(u32, sys.word(semaphore), acquire)
+        if count > 0 {
+            const taken = @cmpxchgWeak(u32, sys.word(semaphore), count, count - 1, acq_rel, acquire)
+            if taken.0 { return 0 }
+            continue
+        }
+        var relative: [2]i64 = [2]i64{ 0, 0 }
+        if !relativeTimeout(deadline, 0, &relative) { return errno.failWith(sys.ETIMEDOUT) }
+        const added = @atomicRmw(u32, sys.word(semaphore + 4), add, 1, acq_rel)
+        const waited = sys.futexWait(semaphore, 0, @intFromPtr(&relative), false)
+        const removed = @atomicRmw(u32, sys.word(semaphore + 4), sub, 1, acq_rel)
+        if waited == -110 { return errno.failWith(sys.ETIMEDOUT) }
+    }
+    return 0
+}
+pub export fn sem_getvalue(semaphore: usize, value: usize) -> i32 {
+    sys.putI32(value, @intCast(i32, @atomicLoad(u32, sys.word(semaphore), acquire)))
+    return 0
+}

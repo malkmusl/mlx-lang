@@ -36,6 +36,11 @@ pub const Pipeline = struct {
                 reporter_module.Reporter.finish(&reporter)
                 return 2
             }
+            if options.stackArena != 0 && !options.plugin {
+                reporter_module.Reporter.failure(diagnostic.Code.import_not_found, diagnostic.Phase.resolve, "--stack-arena needs --plugin (only a plugin's exports make arenas of their own)")
+                reporter_module.Reporter.finish(&reporter)
+                return 2
+            }
             Self.tracePaths(&reporter, options)
             const pages = page_allocator.init()
             var arena = arena_allocator.init(pages, 268435456)
@@ -172,14 +177,15 @@ pub const Pipeline = struct {
         if lower.unsupportedInstructionCount(&builder) != 0 {
             const unsupported = lower.unsupportedInstructionCount(&builder)
             reporter_module.Reporter.metric(reporter, "unsupported executable lowerings", unsupported)
+            const unsupported_module = lower.firstUnsupportedModuleId(&builder)
             reporter_module.Reporter.failureAt(
                 diagnostic.Code.unsupported_instruction_lowering,
                 diagnostic.Phase.codegen,
                 lower.firstUnsupportedInstructionOffset(&builder),
                 lower.firstUnsupportedInstructionLength(&builder),
                 "construct has no specified executable lowering",
-                "",
-                "",
+                modules.modulePath(loader, unsupported_module),
+                modules.moduleSource(loader, unsupported_module),
             )
             reporter_module.Reporter.failActiveStep(reporter, unsupported)
             lower.deinit(&builder)
@@ -211,7 +217,7 @@ pub const Pipeline = struct {
         var encoder = encoder_module.init(allocator)
         var codegen = codegen_module.Codegen.init(allocator, &encoder, &ir, type_store)
         if options.plugin {
-            codegen_module.Codegen.generatePlugin(&codegen)
+            codegen_module.Codegen.generatePlugin(&codegen, options.stackArena)
         } else if options.shared {
             codegen_module.Codegen.generateShared(&codegen)
         } else {
@@ -246,14 +252,29 @@ pub const Pipeline = struct {
             reporter_module.Reporter.metric(reporter, "imported functions", encoder_module.importCount(&encoder))
             reporter_module.Reporter.metric(reporter, "exported functions", encoder_module.exportCount(&encoder))
             wrote = Self.writeDynamicExecutable(allocator, &encoder, options)
-        } else if encoder_module.hasLinkFixups(&encoder) || encoder_module.exportCount(&encoder) > 0 {
+        } else if encoder_module.importCount(&encoder) > 0 || encoder_module.exportCount(&encoder) > 0 {
             reporter_module.Reporter.metric(reporter, "imported functions", encoder_module.importCount(&encoder))
             reporter_module.Reporter.metric(reporter, "exported functions", encoder_module.exportCount(&encoder))
             wrote = Self.writeDynamicExecutable(allocator, &encoder, options)
         } else {
-            var empty_rodata: [*]const u8 = undefined
-            unsafe { empty_rodata = @ptrFromInt([*]const u8, 0) }
-            wrote = elf64.writeExecutable(allocator, encoder.buf.*.items, encoder.buf.*.length, 0, empty_rodata, 0, options.outputPointer)
+            // A static executable's data area (its globals), on the page
+            // after the code; the code's references to it are resolved
+            // against that place.
+            var data: [*]u8 = undefined
+            var data_length: usize = 0
+            unsafe { data = @ptrFromInt([*]u8, 0) }
+            if encoder_module.dataEntryCount(&encoder) > 0 || encoder_module.hasDataFixups(&encoder) {
+                data_length = encoder_module.dataSize(&encoder)
+                data = allocator.alloc(data_length, 8).?
+                var byte: usize = 0
+                while byte < data_length {
+                    data[byte] = 0
+                    byte += 1
+                }
+                encoder_module.fillData(&encoder, data)
+                encoder_module.applyLinkFixups(&encoder, 0, elf64.dataOffsetAfterCode(encoder.buf.*.length))
+            }
+            wrote = elf64.writeExecutable(allocator, encoder.buf.*.items, encoder.buf.*.length, 0, data, data_length, options.outputPointer)
         }
         if wrote {
             wrote = symbol_table.addToFile(allocator, options.outputPointer, loader, &ir, &encoder)
@@ -268,25 +289,32 @@ pub const Pipeline = struct {
     }
 
     // A program that calls C functions is loaded by the system dynamic
-    // linker; it always links libc.so.6 (dlopen, dlsym and the rest of the
-    // C library), plus every library named with --library.
+    // linker; it links libc.so.6 (dlopen, dlsym and the rest of the C
+    // library) unless --no-libc leaves it out, plus every library named
+    // with --library. (Without libc the imports, if any, bind against what
+    // the loading process has.)
     fn writeDynamicExecutable(allocator: arena_allocator.Allocator, encoder: *encoder_module.Encoder, options: options_module.Options) -> bool {
         const extra = options_module.Options.libraryCount(options)
         var needed: [*][*]const u8 = undefined
+        var count: usize = 0
         unsafe {
             needed = @ptrCast([*][*]const u8, allocator.alloc((extra + 1) * 8, 8).?)
-            needed[0] = @ptrCast([*]const u8, "libc.so.6")
+            if !options.noLibc {
+                needed[0] = @ptrCast([*]const u8, "libc.so.6")
+                count = 1
+            }
         }
         var index: usize = 0
         while index < extra {
-            needed[index + 1] = options_module.Options.library(options, index)
+            needed[count] = options_module.Options.library(options, index)
+            count += 1
             index += 1
         }
         if options.shared {
-            const naming = elf64_dynamic.Naming.{ .sonamePointer = options.sonamePointer, .sonameLength = options.sonameLength, .versionPointer = options.symbolVersionPointer, .versionLength = options.symbolVersionLength }
-            unsafe { return elf64_dynamic.writeSharedObject(allocator, encoder, @ptrCast([*]const [*]const u8, needed), extra + 1, naming, options.outputPointer) }
+            const naming = elf64_dynamic.Naming.{ .sonamePointer = options.sonamePointer, .sonameLength = options.sonameLength, .versionPointer = options.symbolVersionPointer, .versionLength = options.symbolVersionLength, .entryPointer = options.entryPointer, .entryLength = options.entryLength, .initPointer = options.initPointer, .initLength = options.initLength }
+            unsafe { return elf64_dynamic.writeSharedObject(allocator, encoder, @ptrCast([*]const [*]const u8, needed), count, naming, options.outputPointer) }
         }
-        unsafe { return elf64_dynamic.writeExecutable(allocator, encoder, @ptrCast([*]const [*]const u8, needed), extra + 1, options.outputPointer) }
+        unsafe { return elf64_dynamic.writeExecutable(allocator, encoder, @ptrCast([*]const [*]const u8, needed), count, options.outputPointer) }
     }
 
     fn emitAarch64(allocator: arena_allocator.Allocator, ir: *lir.Lir, type_store: *types.Store, options: options_module.Options, reporter: *reporter_module.Reporter) -> u8 {
@@ -325,7 +353,7 @@ pub const Pipeline = struct {
             return 8
         }
         reporter_module.Reporter.progress(reporter, 9, "write ELF64 executable (aarch64)")
-        const wrote = elf64_aarch64.writeExecutable(allocator, encoder.buf.*.items, code_length, 0, encoder.dataSize, options.outputPointer)
+        const wrote = elf64_aarch64.writeExecutable(allocator, encoder.buf.*.items, code_length, 0, &encoder, options.outputPointer)
         a64_codegen.Codegen.deinit(&codegen)
         a64_encoder.deinit(&encoder)
         if !wrote {

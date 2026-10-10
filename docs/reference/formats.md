@@ -53,19 +53,23 @@ from the code:
   (program headers immediately follow the 64-byte ELF header), and
   `e_shoff` computed after code/rodata/`.shstrtab` are laid out.
 - **Program headers:** always one `PT_LOAD` segment covering `.text`
-  (`PF_R | PF_X`); a second `PT_LOAD` segment for `.rodata` (`PF_R` only) is
-  added only `if has_rodata` (i.e., `rodata_length > 0`).
+  (`PF_R | PF_X`; the string literals live in the code); a second `PT_LOAD`
+  segment for `.data` (`PF_R | PF_W`), on the page after the code, is added
+  only when the program has a data area (module-level `var` globals, see
+  [Globals](#globals) below): `elf64.dataOffsetAfterCode` names its place
+  and the pipeline resolves the code's RIP-relative references against it
+  before writing.
 - **Section headers:** a `SHT_NULL` entry, a `.text` `SHT_PROGBITS` section
-  (`SHF_ALLOC | SHF_EXECINSTR`), an optional `.rodata` `SHT_PROGBITS` section
-  (`SHF_ALLOC`) when `has_rodata`, and a trailing `.shstrtab` `SHT_STRTAB`
-  section. `num_shdrs` is 3 or 4 depending on whether `.rodata` is present —
-  there is no `.data`, `.bss`, `.symtab`, or `.strtab` section written by
-  this function, so this writer covers the "directly executable static ELF"
-  requirement for code+rodata-only programs rather than the spec's full
-  required-section list.
+  (`SHF_ALLOC | SHF_EXECINSTR`), an optional `.data` `SHT_PROGBITS` section
+  (`SHF_ALLOC | SHF_WRITE`) when there is a data area, and a trailing
+  `.shstrtab` `SHT_STRTAB` section. `num_shdrs` is 3 or 4 depending on
+  whether `.data` is present — there is no `.rodata` or `.bss` section
+  written by this function (`.symtab` and `.strtab` are appended afterwards,
+  see below), so this writer covers the "directly executable static ELF"
+  requirement rather than the spec's full required-section list.
 - **`.shstrtab` contents:** the section name string table is hand-written
-  byte-by-byte as the literal string `"\0.text\0.rodata\0.shstrtab\0"`
-  (25 bytes, matching `shstrtab_size`), rather than built from a general
+  byte-by-byte as the literal string `"\0.text\0.data\0.shstrtab\0"`
+  (23 bytes, matching `shstrtab_size`), rather than built from a general
   string-table builder.
 - **File writing:** `writeExecutable` calls `buildExecutable` to produce an
   in-memory buffer, then opens the output path with
@@ -92,7 +96,8 @@ same fixed address, but loaded by the system dynamic linker
 - the `R+X` `.text` segment, at the static layout's address;
 - an `R+W` segment with `.dynamic`, `.got` (one slot per import, filled by an
   `R_X86_64_GLOB_DAT` relocation) and `.data` (the aggregate-arena words
-  `_start` records for exported functions);
+  `_start` records for exported functions, then the globals, see
+  [Globals](#globals));
 - `PT_DYNAMIC`, `PT_PHDR` and a non-executable `PT_GNU_STACK`.
 
 Imports are unversioned undefined symbols, bound immediately (`DF_BIND_NOW`,
@@ -101,7 +106,7 @@ Imports are unversioned undefined symbols, bound immediately (`DF_BIND_NOW`,
 line. Exports are global `STT_FUNC` symbols in `.text`. A program without
 imports is still the static executable described above, exports or not:
 its exports are C-ABI functions only (signal handlers, which the kernel
-calls; `std.crash` installs one in every desktop program), so nothing
+calls; `std.crash` installs one in every desktop program and coreutil), so nothing
 there needs glibc. `tests/run_foreign.sh` checks that, and runs
 `tests/247_foreign_c_runtime.mlx`.
 
@@ -119,8 +124,8 @@ adds three sections to it:
   entry the code offset from `.text`, the file and the line (u32 each,
   lines from 1), then the files' paths, each ended by a NUL.
 
-The crash handler of the desktop programs
-(`std/src/crash.mlx`) reads both from `/proc/self/exe`
+The crash handler of the desktop programs, the coreutils and mlxlibc
+(`std/src/crash.mlx`) reads both from the file each address is in
 and writes each frame as `path:line:name+0xOFFSET at path:line`;
 `tools/check_crash_report.sh` crashes `tests/support/crash_report.mlx`
 three ways and checks the lines it names. The sampling profiler
@@ -153,6 +158,40 @@ outlive a call goes in memory from an allocator; functions handed to the
 host as callbacks are `export fn` too. `tests/run_foreign.sh` loads
 `tests/support/plugin_library.mlx` from python3 (ctypes) and calls it on
 four threads at once; `projects/desktop/capture/obs.mlx` is such a plugin.
+
+`--stack-arena[=BYTES]` (with `--plugin`; 65536 when no size is given,
+rounded up to a multiple of 16) makes each export take its arena from its
+own stack instead: the prologue moves `rsp` down by that many bytes and
+points `r14`/`r15` at the reservation, the epilogue's `leave` gives it
+back, so a call costs no system call (what a C library's `strlen` or
+`malloc` written in Mlx needs). The host's threads must have that much
+stack to spare below the export's frame (the usual 8 MiB thread stacks
+have); an export whose aggregates outgrow the reservation traps, as any
+exhausted arena does. `--no-libc` leaves `libc.so.6` out of `DT_NEEDED`,
+which then names only the `--library` libraries (none, for an image that
+imports nothing; imports, if there are any, bind against whatever the
+loading process has). `tests/support/plugin_freestanding.mlx`, built with
+both and checked by `tests/run_foreign.sh` (no `NEEDED` entry; under
+`strace`, no mapping per call), is the shape of mlxlibc: `projects/libc`
+(its [README](../../projects/libc/README.md)), built by
+`tools/build_mlxlibc.sh` as `libmlxc.so.1` with no `DT_NEEDED` at all and
+checked against glibc by `tools/check_mlxlibc.sh`.
+
+`--entry=NAME` makes an exported function the shared object's entry point
+(`e_entry`), and `--init=NAME` its `DT_INIT`. A shared object names no
+interpreter (the `PT_INTERP` slot is `PT_NULL`), so run as a program the
+kernel maps it and enters its entry directly, with the stack as the ABI
+leaves it (`argc` at `@frameAddress() + 8` inside the entry export); named
+as a program's `PT_INTERP`, the kernel maps it after the program and enters
+it the same way, the program's headers and entry in the aux vector. That is
+how mlxlibc is the dynamic loader of the programs on it
+(`projects/libc/start.mlx`, `loader.mlx`): the entry export maps the
+program's `DT_NEEDED` libraries, relocates everything and jumps to the
+program's `_start`. `DT_INIT` is for the other direction: a dynamic linker
+that loads the object (glibc's, for a program linked against libmlxc next
+to glibc) calls it before the program's first call into it.
+`tests/support/plugin_entry.mlx` is run as a program and loaded from
+python3 by `tests/run_foreign.sh`.
 `tests/271_shared_object_runtime.mlx` (run by `tests/run_foreign.sh`) loads
 `tests/support/shared_object_library.mlx` twice from two copies, calls it
 through `dlsym` and through function pointers it returns, and checks that
@@ -170,6 +209,43 @@ it through the dynamic linker (`tests/support/plugin_library.mlx`,
 `mlx_plugin_level_now`; `projects/desktop/libpipewire` exports
 `pw_log_level` and `PW_LOG_TOPIC_DEFAULT` this way). A dynamically linked
 executable gets the symbol too; a static one has no dynamic symbols.
+
+## Globals
+
+A module-level `var NAME: T = value` is a slot of the image's data area:
+one per global, after the area's fixed words (`DATA_SIZE`, the arena
+pointers), each at its type's alignment with its type's size (at least 8
+bytes), in the order the lowering first meets them. The code reaches a slot
+RIP-relative (`lea`, a `data_rel32` fixup resolved against the area's place,
+so the same code runs in a static executable, a dynamic one, a `--shared`
+object and a `--plugin`); loads and stores go through that address like any
+other memory, and `&NAME` is it. An integer or bool initializer (comptime
+evaluable, as `spec/00-language/modules.xml` asks) writes the slot's
+initial bytes, and so does an array or struct literal of such values
+(element by element at the type's layout, `writeInitialBytes` in
+`ir/lower.mlx`; `var table: [3]u16 = [3]u16{ 7, 8, 9 }`); `undefined` and
+`null` leave it zeroed. Other initializers (strings, floats) are not
+lowered yet and are reported with the module's position. A static
+executable with globals gets the `.data` segment described above; a dynamic
+image keeps them in its `R+W` segment.
+
+An `export var` is such a slot and a data symbol too (`STT_OBJECT`, its size
+that of `T`, in `.dynsym`): C code reads and writes the same word the Mlx
+code does (`tests/support/plugin_library.mlx`, `mlx_plugin_calls`, checked
+from python3 by `tests/run_foreign.sh`). In a `--shared` or `--plugin`
+object the Mlx code itself reaches an `export var` through a GOT slot
+(`data_got_rel32`: `mov reg, [rip + slot]`, the slot after the imports'
+with an `R_X86_64_GLOB_DAT` against the variable's own symbol), because a
+C program linked against the object may hold its own copy of the variable
+(`R_X86_64_COPY`, which gcc emits for `optind`, `optarg` or `stdout`): the
+dynamic linker resolves the symbol to that copy, and through the slot the
+library's `getopt` writes where the program reads (`tools/check_mlxlibc.sh`
+checks it with a C program). `tests/297_module_globals_runtime.mlx`
+covers the static image: scalars with initial values, aggregates, a slice
+over an array global, a pointer global, and another module's `pub var`
+globals read and written as `module.name` (`tests/support/module_globals.mlx`).
+On aarch64 a global is a local data symbol reached with `adrp`/`add`
+(`backend/aarch64/encoder.mlx`, `defineGlobal`).
 
 `--soname=NAME` gives either kind its `DT_SONAME`, and
 `--symbol-version=NAME` a version definition (`.gnu.version_d`: the base

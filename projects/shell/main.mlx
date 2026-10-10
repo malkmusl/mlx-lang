@@ -1,0 +1,397 @@
+// mlx-sh: the shell of MLX/Linux, written in Mlx without libc. A POSIX
+// shell: words with quotes and escapes, parameters and their expansions,
+// command substitution, arithmetic, globbing, pipelines, the && || ! ; &
+// operators, redirections and heredocs, if/for/while/until/case,
+// functions, the builtins a shell must have, scripts and -c, and an
+// interactive line editor (history, cursor keys, completion) on a
+// terminal. parser.mlx reads the source, expand.mlx takes the words apart,
+// exec.mlx runs the tree, builtins.mlx holds the builtins, editor.mlx the
+// line editor, programs.mlx finds and runs programs.
+//
+//     mlx4 projects/shell/main.mlx -o mlx-sh
+//     ./mlx-sh                         # interactive
+//     ./mlx-sh script.sh args...       # a script
+//     ./mlx-sh -c 'echo $((1 + 2))'    # a command line
+//     tools/check_shell.sh             # against dash, and the editor on a pty
+//
+// Options: -c TEXT [NAME ARGS...], -e (exit on a failure), -x (trace each
+// command), -i (interactive), -l / --login, -s (commands from stdin),
+// --parse TEXT (print the parse tree and stop). Interactive, it reads
+// $HOME/.mlx_shrc first and keeps its history in $HOME/.mlx_sh_history;
+// the prompt is PS1 (\u \h \w \W \$ \n as in bash; default "\u@\h:\w\$ ").
+const std = @import("std")
+const crash = @import("std.crash")
+const sys = @import("./sys.mlx")
+const state = @import("./state.mlx")
+const parser_module = @import("./parser.mlx")
+const exec = @import("./exec.mlx")
+const editor_module = @import("./editor.mlx")
+const programs = @import("./programs.mlx")
+
+const Shell = state.Shell
+const Node = state.Node
+
+fn named(value: std.string.String, name: []const u8) -> bool { return std.string.eql(value, std.string.fromSlice(name)) }
+
+fn kindName(kind: u8) -> []const u8 {
+    if kind == state.LIST { return "list" }
+    if kind == state.ANDOR { return "andor" }
+    if kind == state.PIPELINE { return "pipeline" }
+    if kind == state.SIMPLE { return "simple" }
+    if kind == state.SUBSHELL { return "subshell" }
+    if kind == state.GROUP { return "group" }
+    if kind == state.IF { return "if" }
+    if kind == state.FOR { return "for" }
+    if kind == state.WHILE { return "while" }
+    if kind == state.UNTIL { return "until" }
+    if kind == state.CASE { return "case" }
+    if kind == state.FUNCTION { return "function" }
+    if kind == state.WORD { return "word" }
+    if kind == state.REDIRECT { return "redirect" }
+    if kind == state.CLAUSE { return "clause" }
+    if kind == state.ELSE { return "else" }
+    if kind == state.ITEM { return "item" }
+    if kind == state.BODY { return "body" }
+    return "none"
+}
+
+// The parse tree, one node per line, indented by depth (--parse).
+fn dump(shell: *Shell, node: u32, depth: usize) -> void {
+    if node == 0 { return }
+    const record = state.nodeAt(shell, node)
+    var line: [1024]u8 = undefined
+    var bytes: [*]u8 = undefined
+    unsafe { bytes = @ptrCast([*]u8, &line) }
+    var length: usize = 0
+    var pad: usize = 0
+    while pad < depth {
+        length = std.text.append(bytes, length, 1024, "  ")
+        pad += 1
+    }
+    length = std.text.append(bytes, length, 1024, kindName(record.*.kind))
+    if record.*.flags != 0 {
+        length = std.text.append(bytes, length, 1024, " flags=")
+        length = std.text.appendUnsigned(bytes, length, 1024, @intCast(usize, record.*.flags))
+    }
+    if record.*.kind == state.REDIRECT {
+        length = std.text.append(bytes, length, 1024, " fd=")
+        length = std.text.appendUnsigned(bytes, length, 1024, @intCast(usize, record.*.number & 255))
+        length = std.text.append(bytes, length, 1024, " op=")
+        length = std.text.appendUnsigned(bytes, length, 1024, @intCast(usize, record.*.number >> 8))
+        if record.*.length > 0 {
+            length = std.text.append(bytes, length, 1024, " body=[")
+            length = std.text.append(bytes, length, 1024, state.textOf(shell, record.*.text, record.*.length))
+            length = std.text.append(bytes, length, 1024, "]")
+        }
+    } else if record.*.length > 0 {
+        length = std.text.append(bytes, length, 1024, " [")
+        length = std.text.append(bytes, length, 1024, state.textOf(shell, record.*.text, record.*.length))
+        length = std.text.append(bytes, length, 1024, "]")
+    }
+    length = std.text.append(bytes, length, 1024, "\n")
+    const wrote = sys.write(1, bytes, length)
+    var child = record.*.first
+    while child != 0 {
+        dump(shell, child, depth + 1)
+        child = state.nodeAt(shell, child).*.next
+    }
+    if record.*.extra != 0 && record.*.kind != state.FUNCTION { dump(shell, record.*.extra, depth + 1) }
+}
+
+// exec.runText for the modules below exec (through the shell).
+fn runTextHook(context: *anyopaque, text: []const u8) -> usize {
+    var shell: *Shell = undefined
+    unsafe { shell = @ptrCast(*Shell, context) }
+    return exec.runText(shell, text)
+}
+
+// The prompt from PS1: \u \h \H \w \W \$ \n \\ and the rest as written.
+fn prompt(shell: *Shell, into: [*]u8, capacity: usize) -> usize {
+    var format: []const u8 = "\\u@\\h:\\w\\$ "
+    const variable = state.getVariable(shell, "PS1")
+    if variable != null { format = variable.? }
+    var length: usize = 0
+    var index: usize = 0
+    while index < format.length {
+        const byte = format[index]
+        if byte != 92 || index + 1 >= format.length {
+            length = std.text.appendByte(into, length, capacity, byte)
+            index += 1
+            continue
+        }
+        const code = format[index + 1]
+        index += 2
+        if code == 117 {
+            const user = state.getVariable(shell, "USER")
+            if user != null { length = std.text.append(into, length, capacity, user.?) } else { length = std.text.appendUnsigned(into, length, capacity, sys.getUid()) }
+        } else if code == 104 || code == 72 {
+            var host: [128]u8 = undefined
+            var host_bytes: [*]u8 = undefined
+            unsafe { host_bytes = @ptrCast([*]u8, &host) }
+            var host_length = sys.hostname(host_bytes, 128)
+            if code == 104 {
+                var dot: usize = 0
+                while dot < host_length && host[dot] != 46 { dot += 1 }
+                host_length = dot
+            }
+            length = std.text.append(into, length, capacity, host_bytes[0..host_length])
+        } else if code == 119 || code == 87 {
+            const directory = state.workingDirectory(shell)
+            const home = state.getVariable(shell, "HOME")
+            if code == 87 {
+                var slash = directory.length
+                while slash > 0 && directory[slash - 1] != 47 { slash -= 1 }
+                if directory.length == 1 { length = std.text.append(into, length, capacity, "/") } else { length = std.text.append(into, length, capacity, directory[slash..directory.length]) }
+            } else if home != null && home.?.length > 0 && std.text.startsWith(directory, home.?) && (directory.length == home.?.length || directory[home.?.length] == 47) {
+                length = std.text.append(into, length, capacity, "~")
+                length = std.text.append(into, length, capacity, directory[home.?.length..directory.length])
+            } else {
+                length = std.text.append(into, length, capacity, directory)
+            }
+        } else if code == 36 {
+            length = std.text.append(into, length, capacity, if sys.getUid() == 0 { "#" } else { "$" })
+        } else if code == 110 {
+            length = std.text.append(into, length, capacity, "\n")
+        } else if code == 92 {
+            length = std.text.append(into, length, capacity, "\\")
+        } else if code == 91 || code == 93 {
+            // Bash's non-printing markers: nothing.
+        } else {
+            length = std.text.appendByte(into, length, capacity, 92)
+            length = std.text.appendByte(into, length, capacity, code)
+        }
+    }
+    return length
+}
+
+// Runs the EXIT trap (once), then ends.
+fn finish(shell: *Shell, status: usize) -> u8 {
+    if shell.*.exitTrapLength > 0 {
+        const trap_text = state.keptText(shell, @intCast(usize, shell.*.exitTrap), @intCast(usize, shell.*.exitTrapLength))
+        shell.*.exitTrapLength = 0
+        shell.*.exiting = false
+        const ignored = exec.runText(shell, trap_text)
+    }
+    return @intCast(u8, status & 255)
+}
+
+// Reads a whole file; its contents on the page allocator (empty when it
+// could not be read, with `ok` false).
+fn readWholeFile(shell: *Shell, path: []const u8, ok: *bool) -> std.array_list.ArrayList {
+    var buffer: [4096]u8 = undefined
+    var buffer_bytes: [*]u8 = undefined
+    unsafe { buffer_bytes = @ptrCast([*]u8, &buffer) }
+    const file = std.fs.open(sys.cString(buffer_bytes, 4096, path), 0, 0)
+    ok.* = std.fs.isValid(file)
+    if !ok.* { return std.array_list.ArrayList.init(shell.*.allocator, 16) }
+    const contents = std.fs.readToEndAlloc(file, shell.*.allocator)
+    const closed = std.fs.close(file)
+    return contents
+}
+
+fn homePath(shell: *Shell, name: []const u8, into: [*]u8, capacity: usize) -> usize {
+    const home = state.getVariable(shell, "HOME")
+    if home == null { return 0 }
+    var length = std.text.append(into, 0, capacity, home.?)
+    length = std.text.append(into, length, capacity, "/")
+    return std.text.append(into, length, capacity, name)
+}
+
+// The interactive loop: a prompt, a line (more while the parse is
+// incomplete), the command.
+fn interact(shell: *Shell) -> usize {
+    const allocator = shell.*.allocator
+    const memory = allocator.alloc(@sizeOf(editor_module.Editor), 16)
+    if memory == null { return 1 }
+    var editor: *editor_module.Editor = undefined
+    unsafe { editor = @ptrCast(*editor_module.Editor, memory.?) }
+    var history_path: [4096]u8 = undefined
+    var history_bytes: [*]u8 = undefined
+    unsafe { history_bytes = @ptrCast([*]u8, &history_path) }
+    const history_length = homePath(shell, ".mlx_sh_history", history_bytes, 4096)
+    if history_length > 0 { editor_module.loadHistory(shell, history_bytes[0..history_length]) }
+    var rc_path: [4096]u8 = undefined
+    var rc_bytes: [*]u8 = undefined
+    unsafe { rc_bytes = @ptrCast([*]u8, &rc_path) }
+    const rc_length = homePath(shell, ".mlx_shrc", rc_bytes, 4096)
+    if rc_length > 0 && sys.access(rc_bytes[0..rc_length], 4) {
+        var ok = false
+        const rc = readWholeFile(shell, rc_bytes[0..rc_length], &ok)
+        if ok { const status = exec.runText(shell, rc.items[0..rc.length]) }
+        rc.deinit()
+    }
+    var command: [editor_module.LINE_CAPACITY]u8 = undefined
+    var command_bytes: [*]u8 = undefined
+    unsafe { command_bytes = @ptrCast([*]u8, &command) }
+    var prompt_text: [1024]u8 = undefined
+    var prompt_bytes: [*]u8 = undefined
+    unsafe { prompt_bytes = @ptrCast([*]u8, &prompt_text) }
+    while !shell.*.exiting {
+        programs.reapJobs(shell)
+        state.refreshWorkingDirectory(shell)
+        var command_length: usize = 0
+        var complete = false
+        var first = true
+        var dropped = false
+        while !complete && !dropped {
+            var prompt_length: usize = 0
+            if first { prompt_length = prompt(shell, prompt_bytes, 1024) } else { prompt_length = std.text.append(prompt_bytes, 0, 1024, "> ") }
+            const result = editor_module.readLine(shell, editor, prompt_bytes[0..prompt_length])
+            if result == editor_module.RESULT_EOF {
+                if first {
+                    shell.*.exiting = true
+                    shell.*.exitStatus = shell.*.lastStatus
+                }
+                dropped = true
+            } else if result == editor_module.RESULT_INTERRUPT {
+                dropped = true
+            } else {
+                const line = editor_module.text(editor)
+                if !first { command_length = std.text.append(command_bytes, command_length, editor_module.LINE_CAPACITY, "\n") }
+                command_length = std.text.append(command_bytes, command_length, editor_module.LINE_CAPACITY, line)
+                // Complete yet? A trial parse says.
+                const node_mark = shell.*.nodeCount
+                const text_mark = shell.*.textLength
+                const at = state.appendText(shell, command_bytes[0..command_length])
+                var parser: parser_module.Parser = undefined
+                const root = parser_module.parse(&parser, shell, state.textOf(shell, @intCast(u32, at), @intCast(u32, command_length)), at)
+                shell.*.nodeCount = node_mark
+                shell.*.textLength = text_mark
+                complete = parser.status != parser_module.INCOMPLETE
+                first = false
+            }
+        }
+        if complete && command_length > 0 {
+            editor_module.remember(shell, command_bytes[0..command_length])
+            const status = exec.runText(shell, command_bytes[0..command_length])
+            shell.*.breaking = 0
+            shell.*.continuing = 0
+            shell.*.returning = false
+        }
+    }
+    if history_length > 0 { editor_module.saveHistory(shell, history_bytes[0..history_length]) }
+    return shell.*.exitStatus
+}
+
+pub fn main(arguments: [][*]const u8) -> u8 {
+    const reporting = crash.install()
+    const allocator = std.page_allocator.init()
+    const created = state.create(allocator)
+    if created == null {
+        state.say("mlx-sh: out of memory\n")
+        return 1
+    }
+    const shell = created.?
+    shell.*.runText = runTextHook
+    const entries = std.process.environmentEntries(arguments)
+    state.importEnvironment(shell, entries)
+    state.refreshWorkingDirectory(shell)
+    if state.getVariable(shell, "PWD") == null { const set = state.setVariable(shell, "PWD", state.workingDirectory(shell), true) }
+    if state.getVariable(shell, "PATH") == null { const set = state.setVariable(shell, "PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", true) }
+    if state.getVariable(shell, "IFS") == null { const set = state.setVariable(shell, "IFS", " \t\n", false) }
+    const count = std.process.count(arguments)
+    state.setScriptName(shell, if count > 0 { std.string.asSlice(std.process.argument(arguments, 0)) } else { "mlx-sh" })
+    var index: usize = 1
+    var command: []const u8 = ""
+    var has_command = false
+    var interactive_asked = false
+    var from_stdin = false
+    while index < count {
+        const option = std.process.argument(arguments, index)
+        if named(option, "--parse") && index + 1 < count {
+            const source = std.string.asSlice(std.process.argument(arguments, index + 1))
+            const at = state.appendText(shell, source)
+            var parser: parser_module.Parser = undefined
+            const root = parser_module.parse(&parser, shell, state.textOf(shell, @intCast(u32, at), @intCast(u32, source.length)), at)
+            if parser.status == parser_module.INCOMPLETE {
+                state.say("incomplete\n")
+                return 2
+            }
+            if parser.status == parser_module.SYNTAX {
+                state.complain("syntax error: ", parser.message)
+                return 2
+            }
+            dump(shell, root, 0)
+            return 0
+        }
+        if named(option, "-c") && index + 1 < count {
+            command = std.string.asSlice(std.process.argument(arguments, index + 1))
+            has_command = true
+            index += 2
+            break
+        }
+        if named(option, "-l") || named(option, "--login") {
+            shell.*.loginShell = true
+        } else if named(option, "-i") {
+            interactive_asked = true
+        } else if named(option, "-s") {
+            from_stdin = true
+        } else if named(option, "-e") {
+            shell.*.errexit = true
+        } else if named(option, "-x") {
+            shell.*.xtrace = true
+        } else if named(option, "--") {
+            index += 1
+            break
+        } else if option.length > 1 && option.pointer[0] == 45 {
+            state.complain("unknown option: ", std.string.asSlice(option))
+            return 2
+        } else {
+            break
+        }
+        index += 1
+    }
+    // -c TEXT NAME ARGS...: NAME is $0, the rest the parameters.
+    if has_command {
+        if index < count {
+            state.setScriptName(shell, std.string.asSlice(std.process.argument(arguments, index)))
+            index += 1
+        }
+        while index < count {
+            const pushed = state.pushPositional(shell, std.string.asSlice(std.process.argument(arguments, index)))
+            index += 1
+        }
+        const status = exec.runText(shell, command)
+        return finish(shell, if shell.*.exiting { shell.*.exitStatus } else { status })
+    }
+    // A script file, with its parameters.
+    if index < count && !from_stdin {
+        const path = std.string.asSlice(std.process.argument(arguments, index))
+        state.setScriptName(shell, path)
+        index += 1
+        while index < count {
+            const pushed = state.pushPositional(shell, std.string.asSlice(std.process.argument(arguments, index)))
+            index += 1
+        }
+        var ok = false
+        const script = readWholeFile(shell, path, &ok)
+        if !ok {
+            state.complainAbout("", path, "cannot open")
+            return 127
+        }
+        const status = exec.runText(shell, script.items[0..script.length])
+        return finish(shell, if shell.*.exiting { shell.*.exitStatus } else { status })
+    }
+    // -s ARGS...: the parameters of the script read from stdin.
+    if from_stdin {
+        while index < count {
+            const pushed = state.pushPositional(shell, std.string.asSlice(std.process.argument(arguments, index)))
+            index += 1
+        }
+    }
+    // Interactive on a terminal, else a script from stdin.
+    const terminal = sys.isTerminal(0) && sys.isTerminal(1)
+    if (terminal && !from_stdin) || interactive_asked {
+        shell.*.interactive = true
+        var cooked: *sys.Termios = undefined
+        unsafe { cooked = @ptrCast(*sys.Termios, &shell.*.cooked) }
+        shell.*.hasCooked = sys.getTermios(0, cooked)
+        sys.setSignal(sys.SIGINT, 1)
+        sys.setSignal(sys.SIGQUIT, 1)
+        const status = interact(shell)
+        return finish(shell, status)
+    }
+    const input = std.fs.readToEndAlloc(std.io.stdin(), allocator)
+    const status = exec.runText(shell, input.items[0..input.length])
+    return finish(shell, if shell.*.exiting { shell.*.exitStatus } else { status })
+}

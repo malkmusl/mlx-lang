@@ -1,0 +1,1517 @@
+// stdio.h: FILE streams on descriptors, the printf and scanf families on
+// format.mlx, and the standard streams. A FILE is glibc's struct _IO_FILE
+// in the fields C programs reach on their own: glibc's headers inline
+// getc_unlocked, putc_unlocked, feof_unlocked and ferror_unlocked (and
+// getchar/putchar when optimizing) as reads and writes of _flags, the
+// read pointers and the write pointers, calling __uflow and __overflow
+// here only when a buffer runs out. The pointers are the buffer state
+// (what is pending, what is unread); the rest of the record is this
+// library's. `stdin`, `stdout` and `stderr` are the three static records'
+// addresses (set by standardStreams, which the loader runs before the
+// program starts); fopen's streams are heap records.
+const sys = @import("./sys.mlx")
+const errno = @import("./errno.mlx")
+const heap = @import("./heap.mlx")
+const string = @import("./string.mlx")
+const stdlib = @import("./stdlib.mlx")
+const unistd = @import("./unistd.mlx")
+const format = @import("./format.mlx")
+
+// The FILE record (216 bytes, glibc's layout).
+const F_IOFLAGS: usize = 0       // i32 _flags: IO_MAGIC, IO_EOF_SEEN, IO_ERR_SEEN
+const F_READ_PTR: usize = 8      // reading: the next unread byte
+const F_READ_END: usize = 16     // reading: the end of what was read
+const F_READ_BASE: usize = 24
+const F_WRITE_BASE: usize = 32   // writing: the buffer's start
+const F_WRITE_PTR: usize = 40    // writing: where the next byte goes
+const F_WRITE_END: usize = 48    // writing: the buffer's end (the start when every byte must come here)
+const F_BUFFER: usize = 56       // _IO_buf_base
+const F_BUFFER_END: usize = 64   // _IO_buf_end
+const F_LOCK: usize = 72         // u32
+const F_DEPTH: usize = 76        // u32, the lock's recursion
+const F_OWNER: usize = 80        // the locking thread
+const F_FLAGS: usize = 88        // u32: this library's flags below
+const F_NEXT: usize = 96         // the open streams' list
+const F_FD: usize = 112          // i32 _fileno
+const F_SMALL: usize = 200       // 16 bytes: an unbuffered stream's buffer (8 spare, 8 data)
+const F_SIZE: usize = 216
+
+const IO_MAGIC: u32 = 4222222336   // 0xFBAD0000
+const IO_UNBUFFERED: u32 = 2
+const IO_NO_READS: u32 = 4
+const IO_NO_WRITES: u32 = 8
+const IO_EOF_SEEN: u32 = 16
+const IO_ERR_SEEN: u32 = 32
+
+const READABLE: u32 = 1
+const WRITABLE: u32 = 2
+const APPEND: u32 = 4
+const EOF_SEEN: u32 = 8
+const ERROR_SEEN: u32 = 16
+const OWN_BUFFER: u32 = 32
+const STATIC: u32 = 64
+const UNBUFFERED: u32 = 128
+const LINE_BUFFERED: u32 = 256
+const BUFFERING_DECIDED: u32 = 512
+const READING: u32 = 1024
+const WRITING: u32 = 2048
+const SPARE: u32 = 4096          // eight bytes before the buffer, for ungetc at its start
+
+pub const BUFFER_SIZE: usize = 4096
+
+var stdinRecord: [216]u8 = undefined
+var stdoutRecord: [216]u8 = undefined
+var stderrRecord: [216]u8 = undefined
+var stdinBuffer: [4104]u8 = undefined
+var stdoutBuffer: [4104]u8 = undefined
+var streamsReady: u32 = 0
+var streamsLock: u32 = 0
+var openStreams: usize = 0
+var listLock: u32 = 0
+
+pub export var stdin: usize = 0
+pub export var stdout: usize = 0
+pub export var stderr: usize = 0
+
+fn flags(file: usize) -> u32 { return sys.get32(file + F_FLAGS) }
+fn setFlags(file: usize, value: u32) -> void { sys.put32(file + F_FLAGS, value) }
+
+// The EOF and error flags are mirrored into _flags, where glibc's inline
+// feof_unlocked and ferror_unlocked read them.
+fn addFlags(file: usize, value: u32) -> void {
+    setFlags(file, flags(file) | value)
+    var io = sys.get32(file + F_IOFLAGS)
+    if value & EOF_SEEN != 0 { io |= IO_EOF_SEEN }
+    if value & ERROR_SEEN != 0 { io |= IO_ERR_SEEN }
+    sys.put32(file + F_IOFLAGS, io)
+}
+
+fn clearFlags(file: usize, value: u32) -> void {
+    setFlags(file, flags(file) & ~value)
+    var io = sys.get32(file + F_IOFLAGS)
+    if value & EOF_SEEN != 0 { io &= ~IO_EOF_SEEN }
+    if value & ERROR_SEEN != 0 { io &= ~IO_ERR_SEEN }
+    sys.put32(file + F_IOFLAGS, io)
+}
+
+fn descriptor(file: usize) -> i32 { return sys.getI32(file + F_FD) }
+
+fn bufferCapacity(file: usize) -> usize { return sys.getPointer(file + F_BUFFER_END) - sys.getPointer(file + F_BUFFER) }
+fn pendingWrites(file: usize) -> usize { return sys.getPointer(file + F_WRITE_PTR) - sys.getPointer(file + F_WRITE_BASE) }
+fn unreadBytes(file: usize) -> usize { return sys.getPointer(file + F_READ_END) - sys.getPointer(file + F_READ_PTR) }
+
+fn setReadPointers(file: usize, base: usize, pointer: usize, end: usize) -> void {
+    sys.putPointer(file + F_READ_BASE, base)
+    sys.putPointer(file + F_READ_PTR, pointer)
+    sys.putPointer(file + F_READ_END, end)
+}
+
+fn setWritePointers(file: usize, base: usize, pointer: usize, end: usize) -> void {
+    sys.putPointer(file + F_WRITE_BASE, base)
+    sys.putPointer(file + F_WRITE_PTR, pointer)
+    sys.putPointer(file + F_WRITE_END, end)
+}
+
+// `buffer` has eight spare bytes before it when `spare`.
+fn initRecord(file: usize, fd: i32, mode: u32, buffer: usize, capacity: usize, spare: bool) -> void {
+    sys.fill(file, 0, F_SIZE)
+    var io = IO_MAGIC
+    if mode & READABLE == 0 { io |= IO_NO_READS }
+    if mode & WRITABLE == 0 { io |= IO_NO_WRITES }
+    if mode & UNBUFFERED != 0 { io |= IO_UNBUFFERED }
+    sys.put32(file + F_IOFLAGS, io)
+    sys.putI32(file + F_FD, fd)
+    sys.put32(file + F_FLAGS, mode | (if spare { SPARE } else { 0 }))
+    sys.putPointer(file + F_BUFFER, buffer)
+    sys.putPointer(file + F_BUFFER_END, buffer + capacity)
+}
+
+pub fn standardStreams() -> void {
+    if @atomicLoad(u32, @ptrCast(*u32, &streamsReady), acquire) == 1 { return }
+    sys.lock(@ptrCast(*u32, &streamsLock))
+    if streamsReady == 0 {
+        initRecord(@intFromPtr(&stdinRecord), 0, READABLE | STATIC, @intFromPtr(&stdinBuffer) + 8, BUFFER_SIZE, true)
+        initRecord(@intFromPtr(&stdoutRecord), 1, WRITABLE | STATIC, @intFromPtr(&stdoutBuffer) + 8, BUFFER_SIZE, true)
+        initRecord(@intFromPtr(&stderrRecord), 2, WRITABLE | STATIC | UNBUFFERED | BUFFERING_DECIDED, 0, 0, false)
+        // The variables are the program's (its copies, or through the
+        // GOT the ones another C library defined when this library is
+        // loaded next to one): set only while nobody has.
+        if stdin == 0 { stdin = @intFromPtr(&stdinRecord) }
+        if stdout == 0 { stdout = @intFromPtr(&stdoutRecord) }
+        if stderr == 0 { stderr = @intFromPtr(&stderrRecord) }
+        stdlib.setExitHook(@intFromPtr(flushAtExit))
+        @atomicStore(u32, @ptrCast(*u32, &streamsReady), 1, release)
+    }
+    sys.unlock(@ptrCast(*u32, &streamsLock))
+}
+
+// The record a FILE* names (the handles 1, 2, 3 stand for the standard
+// streams too, for callers inside this library).
+pub fn fileOf(handle: usize) -> usize {
+    standardStreams()
+    if handle == 1 { return @intFromPtr(&stdinRecord) }
+    if handle == 2 { return @intFromPtr(&stdoutRecord) }
+    if handle == 3 { return @intFromPtr(&stderrRecord) }
+    return handle
+}
+
+// This library's record for descriptor 0, 1 or 2 (the standard streams),
+// for a host that has streams of its own next to these.
+pub export fn mlxlibc_stream(fd: i32) -> usize {
+    if fd == 0 { return fileOf(1) }
+    if fd == 1 { return fileOf(2) }
+    if fd == 2 { return fileOf(3) }
+    return 0
+}
+
+pub fn standardIn() -> usize { return fileOf(1) }
+pub fn standardOut() -> usize { return fileOf(2) }
+pub fn standardErr() -> usize { return fileOf(3) }
+
+// A recursive lock per stream (flockfile may be held across the calls).
+fn lockFile(file: usize) -> void {
+    const me = @threadPointer()
+    if sys.get32(file + F_DEPTH) != 0 && sys.getPointer(file + F_OWNER) == me {
+        sys.put32(file + F_DEPTH, sys.get32(file + F_DEPTH) + 1)
+        return
+    }
+    sys.lock(sys.word(file + F_LOCK))
+    sys.putPointer(file + F_OWNER, me)
+    sys.put32(file + F_DEPTH, 1)
+}
+
+fn unlockFile(file: usize) -> void {
+    const depth = sys.get32(file + F_DEPTH)
+    if depth > 1 {
+        sys.put32(file + F_DEPTH, depth - 1)
+        return
+    }
+    sys.put32(file + F_DEPTH, 0)
+    sys.putPointer(file + F_OWNER, 0)
+    sys.unlock(sys.word(file + F_LOCK))
+}
+
+pub export fn flockfile(handle: usize) -> void { lockFile(fileOf(handle)) }
+pub export fn funlockfile(handle: usize) -> void { unlockFile(fileOf(handle)) }
+pub export fn ftrylockfile(handle: usize) -> i32 {
+    lockFile(fileOf(handle))
+    return 0
+}
+
+// stdout is line buffered on a terminal and fully buffered otherwise,
+// decided at the first write.
+fn decideBuffering(file: usize) -> void {
+    if flags(file) & BUFFERING_DECIDED != 0 { return }
+    if descriptor(file) == 1 && unistd.isatty(1) != 0 { addFlags(file, LINE_BUFFERED) }
+    addFlags(file, BUFFERING_DECIDED)
+}
+
+fn writeAll(fd: i32, source: usize, count: usize) -> bool {
+    var done: usize = 0
+    while done < count {
+        const wrote = sys.syscall3(sys.SYS_write, sys.int(fd), source + done, count - done)
+        if wrote == -4 { continue }
+        if sys.failed(wrote) {
+            errno.set(@intCast(i32, 0 - wrote))
+            return false
+        }
+        done += @bitCast(usize, wrote)
+    }
+    return true
+}
+
+// Pending output to the descriptor; false with the error flag set on failure.
+fn flushWrites(file: usize) -> bool {
+    if flags(file) & WRITING == 0 { return true }
+    const pending = pendingWrites(file)
+    if pending == 0 { return true }
+    const base = sys.getPointer(file + F_WRITE_BASE)
+    sys.putPointer(file + F_WRITE_PTR, base)
+    if !writeAll(descriptor(file), base, pending) {
+        addFlags(file, ERROR_SEEN)
+        return false
+    }
+    return true
+}
+
+// Buffered input given back to the descriptor's position.
+fn dropReads(file: usize) -> void {
+    if flags(file) & READING == 0 { return }
+    const back = unreadBytes(file)
+    if back != 0 { const sought = sys.syscall3(sys.SYS_lseek, sys.int(descriptor(file)), @bitCast(usize, 0 - @intCast(isize, back)), 1) }
+    setReadPointers(file, 0, 0, 0)
+    clearFlags(file, READING)
+}
+
+// A buffer for the stream: its own, or the small one in the record for an
+// unbuffered stream (one byte read at a time).
+fn ensureBuffer(file: usize) -> bool {
+    if sys.getPointer(file + F_BUFFER) != 0 { return true }
+    if flags(file) & UNBUFFERED != 0 {
+        sys.putPointer(file + F_BUFFER, file + F_SMALL + 8)
+        sys.putPointer(file + F_BUFFER_END, file + F_SMALL + 16)
+        addFlags(file, SPARE)
+        return true
+    }
+    const block = heap.allocate(BUFFER_SIZE + 8, 16)
+    if block == 0 { return false }
+    sys.putPointer(file + F_BUFFER, block + 8)
+    sys.putPointer(file + F_BUFFER_END, block + 8 + BUFFER_SIZE)
+    addFlags(file, OWN_BUFFER | SPARE)
+    return true
+}
+
+fn releaseBuffer(file: usize) -> void {
+    if flags(file) & OWN_BUFFER != 0 { heap.release(sys.getPointer(file + F_BUFFER) - 8) }
+    clearFlags(file, OWN_BUFFER | SPARE)
+    sys.putPointer(file + F_BUFFER, 0)
+    sys.putPointer(file + F_BUFFER_END, 0)
+}
+
+// The stream turns to writing: the write pointers span the buffer when
+// it is fully buffered; otherwise the end is the start, so every inline
+// putc comes to __overflow, which flushes at newlines or at once.
+fn beginWriting(file: usize) -> void {
+    addFlags(file, WRITING)
+    setReadPointers(file, 0, 0, 0)
+    const buffer = sys.getPointer(file + F_BUFFER)
+    const end = if flags(file) & (UNBUFFERED | LINE_BUFFERED) != 0 { buffer } else { sys.getPointer(file + F_BUFFER_END) }
+    setWritePointers(file, buffer, buffer, end)
+}
+
+fn beginReading(file: usize) -> void {
+    addFlags(file, READING)
+    setWritePointers(file, 0, 0, 0)
+    const buffer = sys.getPointer(file + F_BUFFER)
+    setReadPointers(file, buffer, buffer, buffer)
+}
+
+// `count` bytes to the stream (locked by the caller).
+pub fn putBytes(file: usize, source: usize, count: usize) -> usize {
+    if flags(file) & WRITABLE == 0 {
+        errno.set(sys.EBADF)
+        addFlags(file, ERROR_SEEN)
+        return 0
+    }
+    dropReads(file)
+    decideBuffering(file)
+    if flags(file) & UNBUFFERED != 0 || !ensureBuffer(file) {
+        if !writeAll(descriptor(file), source, count) {
+            addFlags(file, ERROR_SEEN)
+            return 0
+        }
+        return count
+    }
+    if flags(file) & WRITING == 0 { beginWriting(file) }
+    const capacity = bufferCapacity(file)
+    var done: usize = 0
+    while done < count {
+        var pending = pendingWrites(file)
+        if pending == capacity {
+            if !flushWrites(file) { return done }
+            pending = 0
+        }
+        var room = capacity - pending
+        if room > count - done { room = count - done }
+        if pending == 0 && count - done >= capacity {
+            // Whole buffers go straight out.
+            if !writeAll(descriptor(file), source + done, capacity) {
+                addFlags(file, ERROR_SEEN)
+                return done
+            }
+            done += capacity
+            continue
+        }
+        const target = sys.getPointer(file + F_WRITE_PTR)
+        sys.copy(target, source + done, room)
+        sys.putPointer(file + F_WRITE_PTR, target + room)
+        done += room
+    }
+    if flags(file) & LINE_BUFFERED != 0 {
+        var index = count
+        var newline = false
+        while index > 0 && !newline {
+            index -= 1
+            if sys.get8(source + index) == 10 { newline = true }
+        }
+        if newline && !flushWrites(file) { return count }
+    }
+    return count
+}
+
+fn writeToStream(context: usize, bytes: usize, count: usize) -> void { const wrote = putBytes(context, bytes, count) }
+
+// One byte read (-1 at the end or on error); the caller holds the lock.
+pub fn getByte(file: usize) -> i32 {
+    if flags(file) & READABLE == 0 {
+        errno.set(sys.EBADF)
+        addFlags(file, ERROR_SEEN)
+        return -1
+    }
+    if flags(file) & WRITING != 0 {
+        const flushed = flushWrites(file)
+        clearFlags(file, WRITING)
+        setWritePointers(file, 0, 0, 0)
+    }
+    if !ensureBuffer(file) {
+        addFlags(file, ERROR_SEEN)
+        return -1
+    }
+    if flags(file) & READING == 0 { beginReading(file) }
+    var pointer = sys.getPointer(file + F_READ_PTR)
+    if pointer >= sys.getPointer(file + F_READ_END) {
+        const buffer = sys.getPointer(file + F_BUFFER)
+        const wanted = if flags(file) & UNBUFFERED != 0 { 1 } else { bufferCapacity(file) }
+        const got = sys.syscall3(sys.SYS_read, sys.int(descriptor(file)), buffer, wanted)
+        if got <= 0 {
+            addFlags(file, if got == 0 { EOF_SEEN } else { ERROR_SEEN })
+            if got < 0 { errno.set(@intCast(i32, 0 - got)) }
+            setReadPointers(file, buffer, buffer, buffer)
+            return -1
+        }
+        pointer = buffer
+        setReadPointers(file, buffer, buffer, buffer + @bitCast(usize, got))
+    }
+    sys.putPointer(file + F_READ_PTR, pointer + 1)
+    return @intCast(i32, sys.get8(pointer))
+}
+
+// --- opening and closing ---------------------------------------------------
+
+fn parseMode(mode: usize) -> (u32, i32) {
+    const text = sys.constBytes(mode)
+    var stream_flags: u32 = 0
+    var open_flags: i32 = 0
+    if text[0] == 114 {
+        stream_flags = READABLE
+        open_flags = 0
+    } else if text[0] == 119 {
+        stream_flags = WRITABLE
+        open_flags = 1 | 64 | 512
+    } else if text[0] == 97 {
+        stream_flags = WRITABLE | APPEND
+        open_flags = 1 | 64 | 1024
+    } else {
+        return -> (0, 0)
+    }
+    var index: usize = 1
+    while text[index] != 0 {
+        if text[index] == 43 {
+            stream_flags |= READABLE | WRITABLE
+            open_flags = (open_flags & ~3) | 2
+        } else if text[index] == 120 {
+            open_flags |= 128
+        } else if text[index] == 101 {
+            open_flags |= 524288
+        }
+        index += 1
+    }
+    return -> (stream_flags, open_flags)
+}
+
+fn newStream(fd: i32, stream_flags: u32) -> usize {
+    const file = heap.allocate(F_SIZE, 16)
+    if file == 0 { return 0 }
+    initRecord(file, fd, stream_flags, 0, 0, false)
+    sys.lock(@ptrCast(*u32, &listLock))
+    sys.putPointer(file + F_NEXT, openStreams)
+    openStreams = file
+    sys.unlock(@ptrCast(*u32, &listLock))
+    return file
+}
+
+fn forgetStream(file: usize) -> void {
+    sys.lock(@ptrCast(*u32, &listLock))
+    var cursor = @intFromPtr(&openStreams)
+    while sys.getPointer(cursor) != 0 {
+        const current = sys.getPointer(cursor)
+        if current == file {
+            sys.putPointer(cursor, sys.getPointer(current + F_NEXT))
+            break
+        }
+        cursor = current + F_NEXT
+    }
+    sys.unlock(@ptrCast(*u32, &listLock))
+}
+
+pub export fn fopen(path: usize, mode: usize) -> usize {
+    standardStreams()
+    const parsed = parseMode(mode)
+    if parsed.0 == 0 {
+        errno.set(sys.EINVAL)
+        return 0
+    }
+    const fd = unistd.open(path, parsed.1, 438)
+    if fd < 0 { return 0 }
+    const file = newStream(fd, parsed.0)
+    if file == 0 { const closed = unistd.close(fd) }
+    return file
+}
+
+pub export fn fopen64(path: usize, mode: usize) -> usize { return fopen(path, mode) }
+
+pub export fn fdopen(fd: i32, mode: usize) -> usize {
+    standardStreams()
+    const parsed = parseMode(mode)
+    if parsed.0 == 0 {
+        errno.set(sys.EINVAL)
+        return 0
+    }
+    return newStream(fd, parsed.0)
+}
+
+pub export fn freopen(path: usize, mode: usize, handle: usize) -> usize {
+    const file = fileOf(handle)
+    lockFile(file)
+    const flushed = flushWrites(file)
+    dropReads(file)
+    const parsed = parseMode(mode)
+    if parsed.0 == 0 {
+        unlockFile(file)
+        errno.set(sys.EINVAL)
+        return 0
+    }
+    setReadPointers(file, 0, 0, 0)
+    setWritePointers(file, 0, 0, 0)
+    clearFlags(file, READING | WRITING | EOF_SEEN | ERROR_SEEN)
+    var fd = descriptor(file)
+    if path != 0 {
+        const opened = unistd.open(path, parsed.1, 438)
+        if opened < 0 {
+            unlockFile(file)
+            return 0
+        }
+        if fd >= 0 {
+            const moved = unistd.dup2(opened, fd)
+            const closed = unistd.close(opened)
+        } else {
+            fd = opened
+            sys.putI32(file + F_FD, fd)
+        }
+    }
+    setFlags(file, (flags(file) & (STATIC | OWN_BUFFER | UNBUFFERED | LINE_BUFFERED | BUFFERING_DECIDED)) | parsed.0)
+    unlockFile(file)
+    return handle
+}
+
+pub export fn fclose(handle: usize) -> i32 {
+    const file = fileOf(handle)
+    lockFile(file)
+    var status: i32 = 0
+    if !flushWrites(file) { status = -1 }
+    dropReads(file)
+    if unistd.close(descriptor(file)) != 0 { status = -1 }
+    releaseBuffer(file)
+    setReadPointers(file, 0, 0, 0)
+    setWritePointers(file, 0, 0, 0)
+    unlockFile(file)
+    if flags(file) & STATIC == 0 {
+        forgetStream(file)
+        heap.release(file)
+    } else {
+        sys.putI32(file + F_FD, -1)
+    }
+    return status
+}
+
+pub export fn fflush(handle: usize) -> i32 {
+    standardStreams()
+    if handle == 0 {
+        flushAll()
+        return 0
+    }
+    const file = fileOf(handle)
+    lockFile(file)
+    const ok = flushWrites(file)
+    unlockFile(file)
+    return if ok { 0 } else { -1 }
+}
+
+pub export fn fflush_unlocked(handle: usize) -> i32 { return fflush(handle) }
+
+fn flushAll() -> void {
+    const out = @intFromPtr(&stdoutRecord)
+    lockFile(out)
+    const flushed_out = flushWrites(out)
+    unlockFile(out)
+    sys.lock(@ptrCast(*u32, &listLock))
+    var file = openStreams
+    while file != 0 {
+        lockFile(file)
+        const flushed = flushWrites(file)
+        unlockFile(file)
+        file = sys.getPointer(file + F_NEXT)
+    }
+    sys.unlock(@ptrCast(*u32, &listLock))
+}
+
+fn flushAtExit() -> void { flushAll() }
+
+pub export fn setvbuf(handle: usize, buffer: usize, mode: i32, size: usize) -> i32 {
+    const file = fileOf(handle)
+    lockFile(file)
+    const flushed = flushWrites(file)
+    dropReads(file)
+    clearFlags(file, UNBUFFERED | LINE_BUFFERED | WRITING)
+    setWritePointers(file, 0, 0, 0)
+    if mode == 2 {
+        releaseBuffer(file)
+        addFlags(file, UNBUFFERED)
+        sys.put32(file + F_IOFLAGS, sys.get32(file + F_IOFLAGS) | IO_UNBUFFERED)
+    } else {
+        sys.put32(file + F_IOFLAGS, sys.get32(file + F_IOFLAGS) & ~IO_UNBUFFERED)
+        if mode == 1 { addFlags(file, LINE_BUFFERED) }
+        if buffer != 0 && size > 0 {
+            releaseBuffer(file)
+            sys.putPointer(file + F_BUFFER, buffer)
+            sys.putPointer(file + F_BUFFER_END, buffer + size)
+        }
+    }
+    addFlags(file, BUFFERING_DECIDED)
+    unlockFile(file)
+    return 0
+}
+
+pub export fn setbuf(handle: usize, buffer: usize) -> void { const unused = setvbuf(handle, buffer, if buffer == 0 { 2 } else { 0 }, BUFFER_SIZE) }
+pub export fn setbuffer(handle: usize, buffer: usize, size: usize) -> void { const unused = setvbuf(handle, buffer, if buffer == 0 { 2 } else { 0 }, size) }
+pub export fn setlinebuf(handle: usize) -> void { const unused = setvbuf(handle, 0, 1, 0) }
+
+// --- writing ------------------------------------------------------------------
+
+pub export fn fwrite(source: usize, size: usize, count: usize, handle: usize) -> usize {
+    if size == 0 || count == 0 { return 0 }
+    const file = fileOf(handle)
+    lockFile(file)
+    const written = putBytes(file, source, size * count)
+    unlockFile(file)
+    return written / size
+}
+
+pub export fn fwrite_unlocked(source: usize, size: usize, count: usize, handle: usize) -> usize { return fwrite(source, size, count, handle) }
+
+pub export fn fputc(value: i32, handle: usize) -> i32 {
+    const file = fileOf(handle)
+    var byte: u8 = @intCast(u8, value & 255)
+    lockFile(file)
+    const written = putBytes(file, @intFromPtr(&byte), 1)
+    unlockFile(file)
+    return if written == 1 { @intCast(i32, byte) } else { -1 }
+}
+
+pub export fn putc(value: i32, handle: usize) -> i32 { return fputc(value, handle) }
+pub export fn putc_unlocked(value: i32, handle: usize) -> i32 { return fputc(value, handle) }
+pub export fn fputc_unlocked(value: i32, handle: usize) -> i32 { return fputc(value, handle) }
+pub export fn putchar(value: i32) -> i32 { return fputc(value, 2) }
+pub export fn putchar_unlocked(value: i32) -> i32 { return fputc(value, 2) }
+pub export fn __overflow(handle: usize, value: i32) -> i32 { return fputc(value, handle) }
+
+pub export fn fputs(text: usize, handle: usize) -> i32 {
+    const file = fileOf(handle)
+    const length = sys.length(text)
+    lockFile(file)
+    const written = putBytes(file, text, length)
+    unlockFile(file)
+    return if written == length { 1 } else { -1 }
+}
+
+pub export fn fputs_unlocked(text: usize, handle: usize) -> i32 { return fputs(text, handle) }
+
+pub export fn puts(text: usize) -> i32 {
+    const file = standardOut()
+    const length = sys.length(text)
+    lockFile(file)
+    var ok = putBytes(file, text, length) == length
+    var newline: u8 = 10
+    if ok { ok = putBytes(file, @intFromPtr(&newline), 1) == 1 }
+    unlockFile(file)
+    return if ok { 1 } else { -1 }
+}
+
+// --- reading ---------------------------------------------------------------------
+
+pub export fn fgetc(handle: usize) -> i32 {
+    const file = fileOf(handle)
+    lockFile(file)
+    const value = getByte(file)
+    unlockFile(file)
+    return value
+}
+
+pub export fn getc(handle: usize) -> i32 { return fgetc(handle) }
+pub export fn getc_unlocked(handle: usize) -> i32 { return fgetc(handle) }
+pub export fn fgetc_unlocked(handle: usize) -> i32 { return fgetc(handle) }
+pub export fn getchar() -> i32 { return fgetc(standardIn()) }
+pub export fn getchar_unlocked() -> i32 { return fgetc(standardIn()) }
+pub export fn __uflow(handle: usize) -> i32 { return fgetc(handle) }
+
+// The byte goes back into the buffer before the next unread one, or into
+// the spare bytes before the buffer when it is full to the start.
+pub export fn ungetc(value: i32, handle: usize) -> i32 {
+    if value < 0 { return -1 }
+    const file = fileOf(handle)
+    lockFile(file)
+    if flags(file) & READABLE == 0 || !ensureBuffer(file) {
+        unlockFile(file)
+        return -1
+    }
+    if flags(file) & WRITING != 0 {
+        const flushed = flushWrites(file)
+        clearFlags(file, WRITING)
+        setWritePointers(file, 0, 0, 0)
+    }
+    if flags(file) & READING == 0 { beginReading(file) }
+    var pointer = sys.getPointer(file + F_READ_PTR)
+    if pointer > sys.getPointer(file + F_READ_BASE) {
+        pointer -= 1
+    } else {
+        const spare = if flags(file) & SPARE != 0 { sys.getPointer(file + F_BUFFER) - 8 } else { sys.getPointer(file + F_BUFFER) }
+        if pointer <= spare {
+            unlockFile(file)
+            return -1
+        }
+        pointer -= 1
+        sys.putPointer(file + F_READ_BASE, pointer)
+    }
+    sys.put8(pointer, @intCast(u8, value & 255))
+    sys.putPointer(file + F_READ_PTR, pointer)
+    clearFlags(file, EOF_SEEN)
+    unlockFile(file)
+    return value & 255
+}
+
+pub export fn fread(target: usize, size: usize, count: usize, handle: usize) -> usize {
+    if size == 0 || count == 0 { return 0 }
+    const file = fileOf(handle)
+    const wanted = size * count
+    lockFile(file)
+    var done: usize = 0
+    while done < wanted {
+        const value = getByte(file)
+        if value < 0 { break }
+        sys.put8(target + done, @intCast(u8, value))
+        done += 1
+    }
+    unlockFile(file)
+    return done / size
+}
+
+pub export fn fread_unlocked(target: usize, size: usize, count: usize, handle: usize) -> usize { return fread(target, size, count, handle) }
+
+pub export fn fgets(buffer: usize, size: i32, handle: usize) -> usize {
+    if size <= 0 { return 0 }
+    const file = fileOf(handle)
+    lockFile(file)
+    var length: usize = 0
+    const room = @intCast(usize, size) - 1
+    var got_any = false
+    while length < room {
+        const value = getByte(file)
+        if value < 0 { break }
+        got_any = true
+        sys.put8(buffer + length, @intCast(u8, value))
+        length += 1
+        if value == 10 { break }
+    }
+    unlockFile(file)
+    if !got_any && room > 0 { return 0 }
+    sys.put8(buffer + length, 0)
+    return buffer
+}
+
+pub export fn fgets_unlocked(buffer: usize, size: i32, handle: usize) -> usize { return fgets(buffer, size, handle) }
+
+pub export fn gets(buffer: usize) -> usize {
+    const got = fgets(buffer, 2147483647, 1)
+    if got == 0 { return 0 }
+    const length = sys.length(buffer)
+    if length > 0 && sys.get8(buffer + length - 1) == 10 { sys.put8(buffer + length - 1, 0) }
+    return buffer
+}
+
+pub export fn getdelim(line: usize, capacity: usize, delimiter: i32, handle: usize) -> isize {
+    if line == 0 || capacity == 0 {
+        errno.set(sys.EINVAL)
+        return -1
+    }
+    const file = fileOf(handle)
+    lockFile(file)
+    var buffer = sys.getPointer(line)
+    var room = sys.getPointer(capacity)
+    if buffer == 0 || room == 0 {
+        room = 128
+        buffer = heap.allocate(room, 16)
+        if buffer == 0 {
+            unlockFile(file)
+            return -1
+        }
+    }
+    var length: usize = 0
+    var got_any = false
+    while true {
+        const value = getByte(file)
+        if value < 0 { break }
+        got_any = true
+        if length + 2 > room {
+            const grown = heap.allocate(room * 2, 16)
+            if grown == 0 { break }
+            sys.copy(grown, buffer, length)
+            heap.release(buffer)
+            buffer = grown
+            room = room * 2
+        }
+        sys.put8(buffer + length, @intCast(u8, value))
+        length += 1
+        if value == delimiter { break }
+    }
+    unlockFile(file)
+    sys.put8(buffer + length, 0)
+    sys.putPointer(line, buffer)
+    sys.putPointer(capacity, room)
+    if !got_any { return -1 }
+    return @intCast(isize, length)
+}
+
+pub export fn getline(line: usize, capacity: usize, handle: usize) -> isize { return getdelim(line, capacity, 10, handle) }
+
+// --- status and position ----------------------------------------------------------
+
+pub export fn feof(handle: usize) -> i32 { return if flags(fileOf(handle)) & EOF_SEEN != 0 { 1 } else { 0 } }
+pub export fn ferror(handle: usize) -> i32 { return if flags(fileOf(handle)) & ERROR_SEEN != 0 { 1 } else { 0 } }
+pub export fn clearerr(handle: usize) -> void { clearFlags(fileOf(handle), EOF_SEEN | ERROR_SEEN) }
+pub export fn feof_unlocked(handle: usize) -> i32 { return feof(handle) }
+pub export fn ferror_unlocked(handle: usize) -> i32 { return ferror(handle) }
+pub export fn clearerr_unlocked(handle: usize) -> void { clearerr(handle) }
+pub export fn fileno(handle: usize) -> i32 { return descriptor(fileOf(handle)) }
+pub export fn fileno_unlocked(handle: usize) -> i32 { return fileno(handle) }
+
+pub export fn fseeko(handle: usize, offset: i64, whence: i32) -> i32 {
+    const file = fileOf(handle)
+    lockFile(file)
+    const flushed = flushWrites(file)
+    var target = offset
+    if whence == 1 && flags(file) & READING != 0 {
+        // Relative to what the program has consumed, not what was read ahead.
+        target -= @intCast(i64, unreadBytes(file))
+    }
+    setReadPointers(file, 0, 0, 0)
+    setWritePointers(file, 0, 0, 0)
+    clearFlags(file, READING | WRITING | EOF_SEEN)
+    const sought = unistd.lseek(descriptor(file), target, whence)
+    unlockFile(file)
+    return if sought < 0 { -1 } else { 0 }
+}
+
+pub export fn fseek(handle: usize, offset: i64, whence: i32) -> i32 { return fseeko(handle, offset, whence) }
+pub export fn fseeko64(handle: usize, offset: i64, whence: i32) -> i32 { return fseeko(handle, offset, whence) }
+
+pub export fn ftello(handle: usize) -> i64 {
+    const file = fileOf(handle)
+    lockFile(file)
+    var position = unistd.lseek(descriptor(file), 0, 1)
+    if position >= 0 {
+        if flags(file) & READING != 0 {
+            position -= @intCast(i64, unreadBytes(file))
+        } else if flags(file) & WRITING != 0 {
+            position += @intCast(i64, pendingWrites(file))
+        }
+    }
+    unlockFile(file)
+    return position
+}
+
+pub export fn ftell(handle: usize) -> i64 { return ftello(handle) }
+pub export fn ftello64(handle: usize) -> i64 { return ftello(handle) }
+pub export fn rewind(handle: usize) -> void {
+    const sought = fseeko(handle, 0, 0)
+    clearerr(handle)
+}
+
+pub export fn fgetpos(handle: usize, position: usize) -> i32 {
+    const where = ftello(handle)
+    if where < 0 { return -1 }
+    sys.put64(position, @bitCast(u64, where))
+    return 0
+}
+
+pub export fn fsetpos(handle: usize, position: usize) -> i32 { return fseeko(handle, @bitCast(i64, sys.get64(position)), 0) }
+
+pub export fn remove(path: usize) -> i32 {
+    if unistd.unlink(path) == 0 { return 0 }
+    if errno.get() == sys.EISDIR { return unistd.rmdir(path) }
+    return -1
+}
+
+pub export fn tmpfile() -> usize {
+    // O_TMPFILE | O_RDWR | O_EXCL in /tmp; an unlinked file otherwise.
+    var fd = unistd.open(sys.literal("/tmp"), 4259842, 384)
+    if fd < 0 {
+        var name: [20]u8 = undefined
+        sys.copy(@intFromPtr(&name), sys.literal("/tmp/tmpf.XXXXXX"), 17)
+        fd = unistd.mkstemp(@intFromPtr(&name))
+        if fd < 0 { return 0 }
+        const unlinked = unistd.unlink(@intFromPtr(&name))
+    }
+    return fdopen(fd, sys.literal("w+"))
+}
+
+pub export fn tmpfile64() -> usize { return tmpfile() }
+
+pub export fn perror(prefix: usize) -> void {
+    const file = fileOf(3)
+    const text = string.message(errno.get())
+    lockFile(file)
+    if prefix != 0 && sys.get8(prefix) != 0 {
+        const wrote_prefix = putBytes(file, prefix, sys.length(prefix))
+        const wrote_colon = putBytes(file, sys.literal(": "), 2)
+    }
+    if text.length != 0 {
+        const wrote = putBytes(file, sys.literal(text), text.length)
+    } else {
+        const unknown = string.strerror(errno.get())
+        const wrote = putBytes(file, unknown, sys.length(unknown))
+    }
+    const wrote_newline = putBytes(file, sys.literal("\n"), 1)
+    unlockFile(file)
+}
+
+// --- the printf family ---------------------------------------------------------------
+
+fn toStream(handle: usize, pattern: usize, source: *format.Source) -> i32 {
+    const file = fileOf(handle)
+    var chunk: [512]u8 = undefined
+    var sink = format.streamSink(@intFromPtr(writeToStream), file, @intFromPtr(&chunk), 512)
+    lockFile(file)
+    format.format(&sink, pattern, source)
+    format.flush(&sink)
+    const failed = flags(file) & ERROR_SEEN != 0
+    unlockFile(file)
+    if failed { return -1 }
+    return @intCast(i32, sink.written)
+}
+
+fn writeToDescriptor(context: usize, bytes: usize, count: usize) -> void { const wrote = writeAll(@intCast(i32, @bitCast(isize, context)), bytes, count) }
+
+fn toDescriptor(fd: i32, pattern: usize, source: *format.Source) -> i32 {
+    var chunk: [512]u8 = undefined
+    var sink = format.streamSink(@intFromPtr(writeToDescriptor), sys.int(fd), @intFromPtr(&chunk), 512)
+    format.format(&sink, pattern, source)
+    format.flush(&sink)
+    return @intCast(i32, sink.written)
+}
+
+fn toBuffer(buffer: usize, size: usize, pattern: usize, source: *format.Source) -> i32 {
+    var sink = format.bufferSink(buffer, if size == 0 { 0 } else { size - 1 })
+    format.format(&sink, pattern, source)
+    if size > 0 { sys.put8(buffer + sink.length, 0) }
+    return @intCast(i32, sink.written)
+}
+
+fn toAllocated(target: usize, pattern: usize, source: *format.Source) -> i32 {
+    // Once for the length, once into the block.
+    var storage: [4]u64 = undefined
+    var probe = format.duplicate(source, &storage)
+    var counting = format.bufferSink(0, 0)
+    format.format(&counting, pattern, &probe)
+    const block = heap.allocate(counting.written + 1, 16)
+    if block == 0 {
+        sys.putPointer(target, 0)
+        return -1
+    }
+    var sink = format.bufferSink(block, counting.written)
+    format.format(&sink, pattern, source)
+    sys.put8(block + sink.length, 0)
+    sys.putPointer(target, block)
+    return @intCast(i32, sink.written)
+}
+
+// The variadic forms read their arguments as a va_list over the call: the
+// integer registers after the fixed parameters, the eight double
+// registers, then the caller's stack words (format.callSource), so any
+// number of arguments reaches them.
+pub export fn printf(pattern: usize, a1: usize, a2: usize, a3: usize, a4: usize, a5: usize, x0: f64, x1: f64, x2: f64, x3: f64, x4: f64, x5: f64, x6: f64, x7: f64) -> i32 {
+    var call: format.CallList = undefined
+    var words: [6]usize = [6]usize{ pattern, a1, a2, a3, a4, a5 }
+    var doubles: [8]f64 = [8]f64{ x0, x1, x2, x3, x4, x5, x6, x7 }
+    var source = format.callSource(&call, 1, @frameAddress(), @intFromPtr(&words), @intFromPtr(&doubles))
+    return toStream(standardOut(), pattern, &source)
+}
+
+pub export fn fprintf(handle: usize, pattern: usize, a2: usize, a3: usize, a4: usize, a5: usize, x0: f64, x1: f64, x2: f64, x3: f64, x4: f64, x5: f64, x6: f64, x7: f64) -> i32 {
+    var call: format.CallList = undefined
+    var words: [6]usize = [6]usize{ handle, pattern, a2, a3, a4, a5 }
+    var doubles: [8]f64 = [8]f64{ x0, x1, x2, x3, x4, x5, x6, x7 }
+    var source = format.callSource(&call, 2, @frameAddress(), @intFromPtr(&words), @intFromPtr(&doubles))
+    return toStream(handle, pattern, &source)
+}
+
+pub export fn dprintf(fd: i32, pattern: usize, a2: usize, a3: usize, a4: usize, a5: usize, x0: f64, x1: f64, x2: f64, x3: f64, x4: f64, x5: f64, x6: f64, x7: f64) -> i32 {
+    var call: format.CallList = undefined
+    var words: [6]usize = [6]usize{ sys.int(fd), pattern, a2, a3, a4, a5 }
+    var doubles: [8]f64 = [8]f64{ x0, x1, x2, x3, x4, x5, x6, x7 }
+    var source = format.callSource(&call, 2, @frameAddress(), @intFromPtr(&words), @intFromPtr(&doubles))
+    return toDescriptor(fd, pattern, &source)
+}
+
+pub export fn sprintf(buffer: usize, pattern: usize, a2: usize, a3: usize, a4: usize, a5: usize, x0: f64, x1: f64, x2: f64, x3: f64, x4: f64, x5: f64, x6: f64, x7: f64) -> i32 {
+    var call: format.CallList = undefined
+    var words: [6]usize = [6]usize{ buffer, pattern, a2, a3, a4, a5 }
+    var doubles: [8]f64 = [8]f64{ x0, x1, x2, x3, x4, x5, x6, x7 }
+    var source = format.callSource(&call, 2, @frameAddress(), @intFromPtr(&words), @intFromPtr(&doubles))
+    return toBuffer(buffer, 2147483647, pattern, &source)
+}
+
+pub export fn snprintf(buffer: usize, size: usize, pattern: usize, a3: usize, a4: usize, a5: usize, x0: f64, x1: f64, x2: f64, x3: f64, x4: f64, x5: f64, x6: f64, x7: f64) -> i32 {
+    var call: format.CallList = undefined
+    var words: [6]usize = [6]usize{ buffer, size, pattern, a3, a4, a5 }
+    var doubles: [8]f64 = [8]f64{ x0, x1, x2, x3, x4, x5, x6, x7 }
+    var source = format.callSource(&call, 3, @frameAddress(), @intFromPtr(&words), @intFromPtr(&doubles))
+    return toBuffer(buffer, size, pattern, &source)
+}
+
+pub export fn asprintf(target: usize, pattern: usize, a2: usize, a3: usize, a4: usize, a5: usize, x0: f64, x1: f64, x2: f64, x3: f64, x4: f64, x5: f64, x6: f64, x7: f64) -> i32 {
+    var call: format.CallList = undefined
+    var words: [6]usize = [6]usize{ target, pattern, a2, a3, a4, a5 }
+    var doubles: [8]f64 = [8]f64{ x0, x1, x2, x3, x4, x5, x6, x7 }
+    var source = format.callSource(&call, 2, @frameAddress(), @intFromPtr(&words), @intFromPtr(&doubles))
+    return toAllocated(target, pattern, &source)
+}
+
+pub export fn vprintf(pattern: usize, list: usize) -> i32 {
+    var source = format.vaList(list)
+    return toStream(standardOut(), pattern, &source)
+}
+
+pub export fn vfprintf(handle: usize, pattern: usize, list: usize) -> i32 {
+    var source = format.vaList(list)
+    return toStream(handle, pattern, &source)
+}
+
+pub export fn vdprintf(fd: i32, pattern: usize, list: usize) -> i32 {
+    var source = format.vaList(list)
+    return toDescriptor(fd, pattern, &source)
+}
+
+pub export fn vsprintf(buffer: usize, pattern: usize, list: usize) -> i32 {
+    var source = format.vaList(list)
+    return toBuffer(buffer, 2147483647, pattern, &source)
+}
+
+pub export fn vsnprintf(buffer: usize, size: usize, pattern: usize, list: usize) -> i32 {
+    var source = format.vaList(list)
+    return toBuffer(buffer, size, pattern, &source)
+}
+
+pub export fn vasprintf(target: usize, pattern: usize, list: usize) -> i32 {
+    var source = format.vaList(list)
+    return toAllocated(target, pattern, &source)
+}
+
+// The fortified forms (_FORTIFY_SOURCE): the same with a flag, and a
+// known buffer length for the string forms.
+pub export fn __printf_chk(flag: i32, pattern: usize, a2: usize, a3: usize, a4: usize, a5: usize, x0: f64, x1: f64, x2: f64, x3: f64, x4: f64, x5: f64, x6: f64, x7: f64) -> i32 {
+    var call: format.CallList = undefined
+    var words: [6]usize = [6]usize{ sys.int(flag), pattern, a2, a3, a4, a5 }
+    var doubles: [8]f64 = [8]f64{ x0, x1, x2, x3, x4, x5, x6, x7 }
+    var source = format.callSource(&call, 2, @frameAddress(), @intFromPtr(&words), @intFromPtr(&doubles))
+    return toStream(standardOut(), pattern, &source)
+}
+
+pub export fn __fprintf_chk(handle: usize, flag: i32, pattern: usize, a3: usize, a4: usize, a5: usize, x0: f64, x1: f64, x2: f64, x3: f64, x4: f64, x5: f64, x6: f64, x7: f64) -> i32 {
+    var call: format.CallList = undefined
+    var words: [6]usize = [6]usize{ handle, sys.int(flag), pattern, a3, a4, a5 }
+    var doubles: [8]f64 = [8]f64{ x0, x1, x2, x3, x4, x5, x6, x7 }
+    var source = format.callSource(&call, 3, @frameAddress(), @intFromPtr(&words), @intFromPtr(&doubles))
+    return toStream(handle, pattern, &source)
+}
+
+pub export fn __dprintf_chk(fd: i32, flag: i32, pattern: usize, a3: usize, a4: usize, a5: usize, x0: f64, x1: f64, x2: f64, x3: f64, x4: f64, x5: f64, x6: f64, x7: f64) -> i32 {
+    var call: format.CallList = undefined
+    var words: [6]usize = [6]usize{ sys.int(fd), sys.int(flag), pattern, a3, a4, a5 }
+    var doubles: [8]f64 = [8]f64{ x0, x1, x2, x3, x4, x5, x6, x7 }
+    var source = format.callSource(&call, 3, @frameAddress(), @intFromPtr(&words), @intFromPtr(&doubles))
+    return toDescriptor(fd, pattern, &source)
+}
+
+pub export fn __sprintf_chk(buffer: usize, flag: i32, length: usize, pattern: usize, a4: usize, a5: usize, x0: f64, x1: f64, x2: f64, x3: f64, x4: f64, x5: f64, x6: f64, x7: f64) -> i32 {
+    var call: format.CallList = undefined
+    var words: [6]usize = [6]usize{ buffer, sys.int(flag), length, pattern, a4, a5 }
+    var doubles: [8]f64 = [8]f64{ x0, x1, x2, x3, x4, x5, x6, x7 }
+    var source = format.callSource(&call, 4, @frameAddress(), @intFromPtr(&words), @intFromPtr(&doubles))
+    return toBuffer(buffer, if length == 18446744073709551615 { 2147483647 } else { length }, pattern, &source)
+}
+
+pub export fn __snprintf_chk(buffer: usize, size: usize, flag: i32, length: usize, pattern: usize, a5: usize, x0: f64, x1: f64, x2: f64, x3: f64, x4: f64, x5: f64, x6: f64, x7: f64) -> i32 {
+    var call: format.CallList = undefined
+    var words: [6]usize = [6]usize{ buffer, size, sys.int(flag), length, pattern, a5 }
+    var doubles: [8]f64 = [8]f64{ x0, x1, x2, x3, x4, x5, x6, x7 }
+    var source = format.callSource(&call, 5, @frameAddress(), @intFromPtr(&words), @intFromPtr(&doubles))
+    return toBuffer(buffer, size, pattern, &source)
+}
+
+pub export fn __asprintf_chk(target: usize, flag: i32, pattern: usize, a3: usize, a4: usize, a5: usize, x0: f64, x1: f64, x2: f64, x3: f64, x4: f64, x5: f64, x6: f64, x7: f64) -> i32 {
+    var call: format.CallList = undefined
+    var words: [6]usize = [6]usize{ target, sys.int(flag), pattern, a3, a4, a5 }
+    var doubles: [8]f64 = [8]f64{ x0, x1, x2, x3, x4, x5, x6, x7 }
+    var source = format.callSource(&call, 3, @frameAddress(), @intFromPtr(&words), @intFromPtr(&doubles))
+    return toAllocated(target, pattern, &source)
+}
+
+pub export fn __vprintf_chk(flag: i32, pattern: usize, list: usize) -> i32 { return vprintf(pattern, list) }
+pub export fn __vfprintf_chk(handle: usize, flag: i32, pattern: usize, list: usize) -> i32 { return vfprintf(handle, pattern, list) }
+pub export fn __vdprintf_chk(fd: i32, flag: i32, pattern: usize, list: usize) -> i32 { return vdprintf(fd, pattern, list) }
+pub export fn __vsprintf_chk(buffer: usize, flag: i32, length: usize, pattern: usize, list: usize) -> i32 { return vsnprintf(buffer, if length == 18446744073709551615 { 2147483647 } else { length }, pattern, list) }
+pub export fn __vsnprintf_chk(buffer: usize, size: usize, flag: i32, length: usize, pattern: usize, list: usize) -> i32 { return vsnprintf(buffer, size, pattern, list) }
+pub export fn __vasprintf_chk(target: usize, flag: i32, pattern: usize, list: usize) -> i32 { return vasprintf(target, pattern, list) }
+pub export fn __fgets_chk(buffer: usize, length: usize, size: i32, handle: usize) -> usize { return fgets(buffer, size, handle) }
+pub export fn __fread_chk(target: usize, length: usize, size: usize, count: usize, handle: usize) -> usize { return fread(target, size, count, handle) }
+
+// --- the scanf family -----------------------------------------------------------------
+
+// A reader over a string or a stream, one byte of lookahead.
+const Reader = struct {
+    text: usize
+    at: usize
+    file: usize
+    consumed: usize
+    peeked: i32
+    hasPeek: bool
+}
+
+fn peek(reader: *Reader) -> i32 {
+    if reader.*.hasPeek { return reader.*.peeked }
+    var value: i32 = -1
+    if reader.*.file != 0 {
+        value = getByte(reader.*.file)
+    } else {
+        const byte = sys.get8(reader.*.text + reader.*.at)
+        if byte != 0 {
+            value = @intCast(i32, byte)
+            reader.*.at += 1
+        }
+    }
+    reader.*.peeked = value
+    reader.*.hasPeek = true
+    return value
+}
+
+fn take(reader: *Reader) -> i32 {
+    const value = peek(reader)
+    reader.*.hasPeek = false
+    if value >= 0 { reader.*.consumed += 1 }
+    return value
+}
+
+fn finishReader(reader: *Reader) -> void {
+    if reader.*.hasPeek && reader.*.peeked >= 0 {
+        if reader.*.file != 0 { const back = ungetc(reader.*.peeked, reader.*.file) } else { reader.*.at -= 1 }
+    }
+    reader.*.hasPeek = false
+}
+
+fn isSpaceByte(value: i32) -> bool { return value == 32 || (value >= 9 && value <= 13) }
+
+fn skipSpaces(reader: *Reader) -> void {
+    while true {
+        const value = peek(reader)
+        if value < 0 || !isSpaceByte(value) { return }
+        const taken = take(reader)
+    }
+}
+
+fn storeInteger(target: usize, size: usize, value: u64) -> void {
+    if target == 0 { return }
+    if size == 1 { sys.put8(target, @intCast(u8, value & 255)) } else if size == 2 { sys.put16(target, @intCast(u16, value & 65535)) } else if size == 4 { sys.put32(target, @intCast(u32, value & 4294967295)) } else { sys.put64(target, value) }
+}
+
+fn digitValue(value: i32) -> u32 {
+    if value >= 48 && value <= 57 { return @intCast(u32, value - 48) }
+    if value >= 97 && value <= 122 { return @intCast(u32, value - 97 + 10) }
+    if value >= 65 && value <= 90 { return @intCast(u32, value - 65 + 10) }
+    return 99
+}
+
+// The engine behind sscanf and fscanf: the count of conversions stored, or
+// -1 when input ended before the first.
+fn scan(reader: *Reader, pattern: usize, source: *format.Source) -> i32 {
+    const text = sys.constBytes(pattern)
+    var at: usize = 0
+    var stored: i32 = 0
+    var any_input = false
+    while text[at] != 0 {
+        const byte = text[at]
+        if isSpaceByte(@intCast(i32, byte)) {
+            skipSpaces(reader)
+            at += 1
+            continue
+        }
+        if byte != 37 {
+            const value = peek(reader)
+            if value != @intCast(i32, byte) {
+                finishReader(reader)
+                return if value < 0 && !any_input && stored == 0 { -1 } else { stored }
+            }
+            const taken = take(reader)
+            any_input = true
+            at += 1
+            continue
+        }
+        at += 1
+        if text[at] == 37 {
+            skipSpaces(reader)
+            if peek(reader) != 37 {
+                finishReader(reader)
+                return stored
+            }
+            const taken = take(reader)
+            at += 1
+            continue
+        }
+        var suppress = false
+        if text[at] == 42 {
+            suppress = true
+            at += 1
+        }
+        var width: usize = 0
+        while text[at] >= 48 && text[at] <= 57 {
+            width = width * 10 + @intCast(usize, text[at] - 48)
+            at += 1
+        }
+        if width == 0 { width = 18446744073709551615 }
+        var size: usize = 4
+        while true {
+            const modifier = text[at]
+            if modifier == 104 { size = if size == 2 { 1 } else { 2 } } else if modifier == 108 || modifier == 106 || modifier == 122 || modifier == 116 || modifier == 76 || modifier == 113 { size = 8 } else { break }
+            at += 1
+        }
+        const conversion = text[at]
+        if conversion == 0 { break }
+        at += 1
+        var target: usize = 0
+        if !suppress && conversion != 91 { target = @intCast(usize, nextArgument(source)) }
+        if conversion == 110 {
+            storeInteger(target, size, @intCast(u64, reader.*.consumed))
+            continue
+        }
+        if conversion == 99 {
+            var count = if width == 18446744073709551615 { 1 } else { width }
+            var index: usize = 0
+            while index < count {
+                const value = take(reader)
+                if value < 0 {
+                    finishReader(reader)
+                    return if !any_input && stored == 0 { -1 } else { stored }
+                }
+                any_input = true
+                if target != 0 { sys.put8(target + index, @intCast(u8, value)) }
+                index += 1
+            }
+            if !suppress { stored += 1 }
+            continue
+        }
+        if conversion == 91 {
+            // A set: [chars], [^chars], with ranges a-z.
+            var negate = false
+            if text[at] == 94 {
+                negate = true
+                at += 1
+            }
+            var set_start = at
+            if text[at] == 93 { at += 1 }
+            while text[at] != 0 && text[at] != 93 { at += 1 }
+            const set_end = at
+            if text[at] == 93 { at += 1 }
+            if !suppress { target = @intCast(usize, nextArgument(source)) }
+            var length: usize = 0
+            while length < width {
+                const value = peek(reader)
+                if value < 0 { break }
+                var member = false
+                var look = set_start
+                while look < set_end {
+                    if look + 2 < set_end && text[look + 1] == 45 {
+                        if value >= @intCast(i32, text[look]) && value <= @intCast(i32, text[look + 2]) { member = true }
+                        look += 3
+                    } else {
+                        if value == @intCast(i32, text[look]) { member = true }
+                        look += 1
+                    }
+                }
+                if member == negate { break }
+                const taken = take(reader)
+                any_input = true
+                if target != 0 { sys.put8(target + length, @intCast(u8, value)) }
+                length += 1
+            }
+            if length == 0 {
+                finishReader(reader)
+                return if peek(reader) < 0 && !any_input && stored == 0 { -1 } else { stored }
+            }
+            if target != 0 { sys.put8(target + length, 0) }
+            if !suppress { stored += 1 }
+            continue
+        }
+        skipSpaces(reader)
+        if peek(reader) < 0 {
+            finishReader(reader)
+            return if !any_input && stored == 0 { -1 } else { stored }
+        }
+        if conversion == 115 {
+            var length: usize = 0
+            while length < width {
+                const value = peek(reader)
+                if value < 0 || isSpaceByte(value) { break }
+                const taken = take(reader)
+                any_input = true
+                if target != 0 { sys.put8(target + length, @intCast(u8, value)) }
+                length += 1
+            }
+            if target != 0 { sys.put8(target + length, 0) }
+            if !suppress { stored += 1 }
+            continue
+        }
+        if conversion == 100 || conversion == 105 || conversion == 117 || conversion == 120 || conversion == 88 || conversion == 111 || conversion == 112 {
+            var base: u64 = 10
+            if conversion == 120 || conversion == 88 || conversion == 112 { base = 16 } else if conversion == 111 { base = 8 } else if conversion == 105 { base = 0 }
+            var negative = false
+            var taken_any: usize = 0
+            var value: u64 = 0
+            var digits: usize = 0
+            if (peek(reader) == 45 || peek(reader) == 43) && width > 0 {
+                negative = take(reader) == 45
+                taken_any += 1
+            }
+            if (base == 0 || base == 16) && peek(reader) == 48 && taken_any < width {
+                const zero = take(reader)
+                taken_any += 1
+                digits += 1
+                if (peek(reader) == 120 || peek(reader) == 88) && taken_any < width {
+                    const x = take(reader)
+                    taken_any += 1
+                    base = 16
+                    digits = 0
+                } else if base == 0 {
+                    base = 8
+                }
+            }
+            if base == 0 { base = 10 }
+            while taken_any < width {
+                const digit = digitValue(peek(reader))
+                if @intCast(u64, digit) >= base { break }
+                const consumed_digit = take(reader)
+                value = value *% base +% @intCast(u64, digit)
+                digits += 1
+                taken_any += 1
+            }
+            if digits == 0 {
+                finishReader(reader)
+                return stored
+            }
+            any_input = true
+            if negative { value = 0 -% value }
+            if conversion == 112 { size = 8 }
+            storeInteger(target, size, value)
+            if !suppress { stored += 1 }
+            continue
+        }
+        if conversion == 102 || conversion == 101 || conversion == 103 || conversion == 97 || conversion == 70 || conversion == 69 || conversion == 71 || conversion == 65 {
+            var buffer: [128]u8 = undefined
+            var length: usize = 0
+            while length < 127 && length < width {
+                const value = peek(reader)
+                if value < 0 { break }
+                const ok = (value >= 48 && value <= 57) || value == 46 || value == 45 || value == 43 || value == 101 || value == 69 || value == 120 || value == 88 || value == 112 || value == 80 || (value >= 97 && value <= 102) || (value >= 65 && value <= 70) || value == 105 || value == 110 || value == 73 || value == 78 || value == 116 || value == 121 || value == 84 || value == 89
+                if !ok { break }
+                const taken = take(reader)
+                buffer[length] = @intCast(u8, value)
+                length += 1
+            }
+            buffer[length] = 0
+            var end: usize = 0
+            const parsed = stdlib.strtod(@intFromPtr(&buffer), @intFromPtr(&end))
+            if end == @intFromPtr(&buffer) {
+                finishReader(reader)
+                return stored
+            }
+            any_input = true
+            if target != 0 {
+                if size == 8 || size == 4 && conversion >= 65 && conversion <= 90 { sys.put64(target, @bitCast(u64, parsed)) } else if size == 4 || size == 2 || size == 1 { sys.put32(target, @bitCast(u32, @floatCast(f32, parsed))) } else { sys.put64(target, @bitCast(u64, parsed)) }
+            }
+            if !suppress { stored += 1 }
+            continue
+        }
+        finishReader(reader)
+        return stored
+    }
+    finishReader(reader)
+    return stored
+}
+
+fn nextArgument(source: *format.Source) -> u64 {
+    // The scanf arguments are all pointers: integers in the source.
+    var probe = format.Source.{ .fromList = source.*.fromList, .integers = source.*.integers, .integerCount = source.*.integerCount, .nextInteger = source.*.nextInteger, .doubles = 0, .doubleCount = 0, .nextDouble = 0, .list = source.*.list }
+    const value = takeInteger(&probe)
+    source.*.nextInteger = probe.nextInteger
+    return value
+}
+
+fn takeInteger(source: *format.Source) -> u64 {
+    if source.*.fromList {
+        const offset = sys.get32(source.*.list)
+        if offset < 48 {
+            sys.put32(source.*.list, offset + 8)
+            return sys.get64(sys.getPointer(source.*.list + 16) + @intCast(usize, offset))
+        }
+        const overflow = sys.getPointer(source.*.list + 8)
+        sys.putPointer(source.*.list + 8, overflow + 8)
+        return sys.get64(overflow)
+    }
+    if source.*.nextInteger >= source.*.integerCount { return 0 }
+    const value = sys.get64(source.*.integers + source.*.nextInteger * 8)
+    source.*.nextInteger += 1
+    return value
+}
+
+fn scanText(text: usize, pattern: usize, source: *format.Source) -> i32 {
+    var reader = Reader.{ .text = text, .at = 0, .file = 0, .consumed = 0, .peeked = -1, .hasPeek = false }
+    return scan(&reader, pattern, source)
+}
+
+fn scanStream(handle: usize, pattern: usize, source: *format.Source) -> i32 {
+    const file = fileOf(handle)
+    var reader = Reader.{ .text = 0, .at = 0, .file = file, .consumed = 0, .peeked = -1, .hasPeek = false }
+    lockFile(file)
+    const result = scan(&reader, pattern, source)
+    unlockFile(file)
+    return result
+}
+
+// The scanf forms take pointers alone, so no double register is read; each
+// name glibc's headers use (the C99 and C23 redirections too) is its own
+// export, since the va_list is built over the export's own call.
+pub export fn sscanf(text: usize, pattern: usize, a2: usize, a3: usize, a4: usize, a5: usize) -> i32 {
+    var call: format.CallList = undefined
+    var words: [6]usize = [6]usize{ text, pattern, a2, a3, a4, a5 }
+    var doubles: [8]f64 = [8]f64{ 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 }
+    var source = format.callSource(&call, 2, @frameAddress(), @intFromPtr(&words), @intFromPtr(&doubles))
+    return scanText(text, pattern, &source)
+}
+
+pub export fn __isoc99_sscanf(text: usize, pattern: usize, a2: usize, a3: usize, a4: usize, a5: usize) -> i32 {
+    var call: format.CallList = undefined
+    var words: [6]usize = [6]usize{ text, pattern, a2, a3, a4, a5 }
+    var doubles: [8]f64 = [8]f64{ 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 }
+    var source = format.callSource(&call, 2, @frameAddress(), @intFromPtr(&words), @intFromPtr(&doubles))
+    return scanText(text, pattern, &source)
+}
+
+pub export fn __isoc23_sscanf(text: usize, pattern: usize, a2: usize, a3: usize, a4: usize, a5: usize) -> i32 {
+    var call: format.CallList = undefined
+    var words: [6]usize = [6]usize{ text, pattern, a2, a3, a4, a5 }
+    var doubles: [8]f64 = [8]f64{ 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 }
+    var source = format.callSource(&call, 2, @frameAddress(), @intFromPtr(&words), @intFromPtr(&doubles))
+    return scanText(text, pattern, &source)
+}
+
+pub export fn vsscanf(text: usize, pattern: usize, list: usize) -> i32 {
+    var source = format.vaList(list)
+    return scanText(text, pattern, &source)
+}
+
+pub export fn fscanf(handle: usize, pattern: usize, a2: usize, a3: usize, a4: usize, a5: usize) -> i32 {
+    var call: format.CallList = undefined
+    var words: [6]usize = [6]usize{ handle, pattern, a2, a3, a4, a5 }
+    var doubles: [8]f64 = [8]f64{ 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 }
+    var source = format.callSource(&call, 2, @frameAddress(), @intFromPtr(&words), @intFromPtr(&doubles))
+    return scanStream(handle, pattern, &source)
+}
+
+pub export fn __isoc99_fscanf(handle: usize, pattern: usize, a2: usize, a3: usize, a4: usize, a5: usize) -> i32 {
+    var call: format.CallList = undefined
+    var words: [6]usize = [6]usize{ handle, pattern, a2, a3, a4, a5 }
+    var doubles: [8]f64 = [8]f64{ 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 }
+    var source = format.callSource(&call, 2, @frameAddress(), @intFromPtr(&words), @intFromPtr(&doubles))
+    return scanStream(handle, pattern, &source)
+}
+
+pub export fn __isoc23_fscanf(handle: usize, pattern: usize, a2: usize, a3: usize, a4: usize, a5: usize) -> i32 {
+    var call: format.CallList = undefined
+    var words: [6]usize = [6]usize{ handle, pattern, a2, a3, a4, a5 }
+    var doubles: [8]f64 = [8]f64{ 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 }
+    var source = format.callSource(&call, 2, @frameAddress(), @intFromPtr(&words), @intFromPtr(&doubles))
+    return scanStream(handle, pattern, &source)
+}
+
+pub export fn vfscanf(handle: usize, pattern: usize, list: usize) -> i32 {
+    var source = format.vaList(list)
+    return scanStream(handle, pattern, &source)
+}
+
+pub export fn scanf(pattern: usize, a1: usize, a2: usize, a3: usize, a4: usize, a5: usize) -> i32 {
+    var call: format.CallList = undefined
+    var words: [6]usize = [6]usize{ pattern, a1, a2, a3, a4, a5 }
+    var doubles: [8]f64 = [8]f64{ 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 }
+    var source = format.callSource(&call, 1, @frameAddress(), @intFromPtr(&words), @intFromPtr(&doubles))
+    return scanStream(standardIn(), pattern, &source)
+}
+
+pub export fn __isoc99_scanf(pattern: usize, a1: usize, a2: usize, a3: usize, a4: usize, a5: usize) -> i32 {
+    var call: format.CallList = undefined
+    var words: [6]usize = [6]usize{ pattern, a1, a2, a3, a4, a5 }
+    var doubles: [8]f64 = [8]f64{ 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 }
+    var source = format.callSource(&call, 1, @frameAddress(), @intFromPtr(&words), @intFromPtr(&doubles))
+    return scanStream(standardIn(), pattern, &source)
+}
+
+pub export fn __isoc23_scanf(pattern: usize, a1: usize, a2: usize, a3: usize, a4: usize, a5: usize) -> i32 {
+    var call: format.CallList = undefined
+    var words: [6]usize = [6]usize{ pattern, a1, a2, a3, a4, a5 }
+    var doubles: [8]f64 = [8]f64{ 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 }
+    var source = format.callSource(&call, 1, @frameAddress(), @intFromPtr(&words), @intFromPtr(&doubles))
+    return scanStream(standardIn(), pattern, &source)
+}
+
+pub export fn vscanf(pattern: usize, list: usize) -> i32 { return vfscanf(standardIn(), pattern, list) }
+pub export fn __isoc99_vsscanf(text: usize, pattern: usize, list: usize) -> i32 { return vsscanf(text, pattern, list) }
+pub export fn __isoc99_vfscanf(handle: usize, pattern: usize, list: usize) -> i32 { return vfscanf(handle, pattern, list) }
+pub export fn __isoc99_vscanf(pattern: usize, list: usize) -> i32 { return vscanf(pattern, list) }
+pub export fn __isoc23_vsscanf(text: usize, pattern: usize, list: usize) -> i32 { return vsscanf(text, pattern, list) }
+pub export fn __isoc23_vfscanf(handle: usize, pattern: usize, list: usize) -> i32 { return vfscanf(handle, pattern, list) }
+pub export fn __isoc23_vscanf(pattern: usize, list: usize) -> i32 { return vscanf(pattern, list) }
+// getline is an inline call of this in glibc's headers.
+pub export fn __getdelim(line: usize, capacity: usize, delimiter: i32, handle: usize) -> isize { return getdelim(line, capacity, delimiter, handle) }
+
+// --- stdio_ext.h (glibc): what coreutils ask a stream about ------------------
+
+pub export fn __fpending(handle: usize) -> usize {
+    const file = fileOf(handle)
+    if flags(file) & WRITING != 0 { return pendingWrites(file) }
+    return 0
+}
+
+pub export fn __freading(handle: usize) -> i32 {
+    const file = fileOf(handle)
+    return if flags(file) & READING != 0 || flags(file) & WRITABLE == 0 { 1 } else { 0 }
+}
+
+pub export fn __fwriting(handle: usize) -> i32 {
+    const file = fileOf(handle)
+    return if flags(file) & WRITING != 0 || flags(file) & READABLE == 0 { 1 } else { 0 }
+}
+
+pub export fn __freadable(handle: usize) -> i32 { return if flags(fileOf(handle)) & READABLE != 0 { 1 } else { 0 } }
+pub export fn __fwritable(handle: usize) -> i32 { return if flags(fileOf(handle)) & WRITABLE != 0 { 1 } else { 0 } }
+pub export fn __flbf(handle: usize) -> i32 { return if flags(fileOf(handle)) & LINE_BUFFERED != 0 { 1 } else { 0 } }
+pub export fn __fbufsize(handle: usize) -> usize { return bufferCapacity(fileOf(handle)) }
+
+// Drops what is buffered, unread or unwritten.
+pub export fn __fpurge(handle: usize) -> void {
+    const file = fileOf(handle)
+    lockFile(file)
+    setReadPointers(file, 0, 0, 0)
+    setWritePointers(file, 0, 0, 0)
+    clearFlags(file, READING | WRITING)
+    unlockFile(file)
+}
+
+// Streams lock internally here whatever a program asks (FSETLOCKING_INTERNAL).
+pub export fn __fsetlocking(handle: usize, kind: i32) -> i32 { return 1 }

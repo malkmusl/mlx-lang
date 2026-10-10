@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# The crash reports of the desktop programs (projects/desktop/compositor/
-# crash.mlx) end to end, on tests/support/crash_report.mlx:
+# The crash reports of the desktop programs, the coreutils and mlxlibc
+# (std/src/crash.mlx) end to end, on tests/support/crash_report.mlx:
 #   - the compiler names every function path:line:name in the symbol table,
 #     and its line table says the line of each address;
 #   - a failed runtime check, a bad store, a stack overflow, an abort and a

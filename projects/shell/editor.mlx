@@ -1,0 +1,627 @@
+// The line editor of the interactive shell: the terminal in raw mode, the
+// line drawn after the prompt, the cursor moved by character and word,
+// Home and End, Backspace and Delete, Ctrl-A/E/B/F/D/K/U/W/L, the history
+// with Up and Down (and Ctrl-P/N), Tab completion of commands (builtins and
+// PATH) and file names, Ctrl-C to drop the line, Ctrl-D on an empty line
+// for the end.
+const std = @import("std")
+const sys = @import("./sys.mlx")
+const state = @import("./state.mlx")
+const programs = @import("./programs.mlx")
+const builtins = @import("./builtins.mlx")
+
+const Shell = state.Shell
+
+pub const LINE_CAPACITY: usize = 65536
+
+pub const RESULT_LINE: u8 = 0
+pub const RESULT_EOF: u8 = 1
+pub const RESULT_INTERRUPT: u8 = 2
+
+pub const Editor = struct {
+    line: [LINE_CAPACITY]u8
+    length: usize
+    cursor: usize
+    prompt: []const u8
+    // While going through the history: which entry is shown (historyCount
+    // for the line being typed, kept in `draft`).
+    historyAt: usize
+    draft: [LINE_CAPACITY]u8
+    draftLength: usize
+    // A second Tab in a row lists the matches.
+    lastWasTab: bool
+}
+
+fn lineBytes(editor: *Editor) -> [*]u8 {
+    var pointer: [*]u8 = undefined
+    unsafe { pointer = @ptrCast([*]u8, &editor.*.line) }
+    return pointer
+}
+
+fn draftBytes(editor: *Editor) -> [*]u8 {
+    var pointer: [*]u8 = undefined
+    unsafe { pointer = @ptrCast([*]u8, &editor.*.draft) }
+    return pointer
+}
+
+pub fn text(editor: *Editor) -> []const u8 {
+    const bytes = lineBytes(editor)
+    return bytes[0..editor.*.length]
+}
+
+fn write(text_out: []const u8) -> void {
+    const wrote = sys.writeAll(1, text_out)
+}
+
+fn writeEscape(rest: []const u8) -> void {
+    var bytes: [32]u8 = undefined
+    var pointer: [*]u8 = undefined
+    unsafe { pointer = @ptrCast([*]u8, &bytes) }
+    bytes[0] = 27
+    const length = std.text.append(pointer, 1, 32, rest)
+    const wrote = sys.write(1, pointer, length)
+}
+
+fn writeNumberEscape(prefix: []const u8, number: usize, suffix: []const u8) -> void {
+    var bytes: [32]u8 = undefined
+    var pointer: [*]u8 = undefined
+    unsafe { pointer = @ptrCast([*]u8, &bytes) }
+    bytes[0] = 27
+    var length = std.text.append(pointer, 1, 32, prefix)
+    length = std.text.appendUnsigned(pointer, length, 32, number)
+    length = std.text.append(pointer, length, 32, suffix)
+    const wrote = sys.write(1, pointer, length)
+}
+
+// Where a UTF-8 character starts: the bytes 10xxxxxx continue one.
+fn continuation(byte: u8) -> bool { return byte & 192 == 128 }
+
+// The number of characters (not bytes) in `bytes`: how wide it is.
+fn widthOf(bytes: []const u8) -> usize {
+    var count: usize = 0
+    for byte in bytes {
+        if !continuation(byte) { count += 1 }
+    }
+    return count
+}
+
+// Draws the prompt and the line again, the cursor where it belongs.
+fn redraw(editor: *Editor) -> void {
+    write("\r")
+    write(editor.*.prompt)
+    write(text(editor))
+    writeEscape("[K")
+    const after = widthOf(lineBytes(editor)[editor.*.cursor..editor.*.length])
+    if after > 0 { writeNumberEscape("[", after, "D") }
+}
+
+fn insert(editor: *Editor, bytes: []const u8) -> void {
+    if editor.*.length + bytes.length >= LINE_CAPACITY { return }
+    const line = lineBytes(editor)
+    var index = editor.*.length
+    while index > editor.*.cursor {
+        line[index + bytes.length - 1] = line[index - 1]
+        index -= 1
+    }
+    var at: usize = 0
+    for byte in bytes {
+        line[editor.*.cursor + at] = byte
+        at += 1
+    }
+    editor.*.length += bytes.length
+    editor.*.cursor += bytes.length
+}
+
+fn removeRange(editor: *Editor, from: usize, to: usize) -> void {
+    if from >= to { return }
+    const line = lineBytes(editor)
+    var index = to
+    while index < editor.*.length {
+        line[from + (index - to)] = line[index]
+        index += 1
+    }
+    editor.*.length -= to - from
+    if editor.*.cursor > to {
+        editor.*.cursor -= to - from
+    } else if editor.*.cursor > from {
+        editor.*.cursor = from
+    }
+}
+
+fn previousCharacter(editor: *Editor, from: usize) -> usize {
+    const line = lineBytes(editor)
+    var at = from
+    if at == 0 { return 0 }
+    at -= 1
+    while at > 0 && continuation(line[at]) { at -= 1 }
+    return at
+}
+
+fn nextCharacter(editor: *Editor, from: usize) -> usize {
+    const line = lineBytes(editor)
+    var at = from
+    if at >= editor.*.length { return editor.*.length }
+    at += 1
+    while at < editor.*.length && continuation(line[at]) { at += 1 }
+    return at
+}
+
+fn isWordByte(byte: u8) -> bool { return byte != 32 && byte != 9 && byte != 47 }
+
+fn wordStart(editor: *Editor, from: usize) -> usize {
+    const line = lineBytes(editor)
+    var at = from
+    while at > 0 && !isWordByte(line[at - 1]) { at -= 1 }
+    while at > 0 && isWordByte(line[at - 1]) { at -= 1 }
+    return at
+}
+
+fn wordEnd(editor: *Editor, from: usize) -> usize {
+    const line = lineBytes(editor)
+    var at = from
+    while at < editor.*.length && !isWordByte(line[at]) { at += 1 }
+    while at < editor.*.length && isWordByte(line[at]) { at += 1 }
+    return at
+}
+
+// ---------------------------------------------------------------------------
+// History
+
+fn historyBytes(shell: *Shell) -> [*]u8 {
+    var pointer: [*]u8 = undefined
+    unsafe { pointer = @ptrCast([*]u8, &shell.*.history) }
+    return pointer
+}
+
+pub fn historyEntry(shell: *Shell, index: usize) -> []const u8 {
+    const slot = (shell.*.historyStart + index) % state.MAX_HISTORY
+    const bytes = historyBytes(shell)
+    const at = @intCast(usize, shell.*.historyOffsets[slot])
+    return bytes[at..at + @intCast(usize, shell.*.historyLengths[slot])]
+}
+
+// Adds `line` to the history (not when it repeats the last entry or is
+// blank). The byte arena is append-only: when full, it starts over.
+pub fn remember(shell: *Shell, line: []const u8) -> void {
+    var blank = true
+    for byte in line {
+        if byte != 32 && byte != 9 { blank = false }
+    }
+    if blank { return }
+    if shell.*.historyCount > 0 && std.text.same(historyEntry(shell, shell.*.historyCount - 1), line) { return }
+    if shell.*.historyLength + line.length > state.HISTORY_CAPACITY {
+        shell.*.historyLength = 0
+        shell.*.historyCount = 0
+        shell.*.historyStart = 0
+    }
+    var slot: usize = 0
+    if shell.*.historyCount < state.MAX_HISTORY {
+        slot = (shell.*.historyStart + shell.*.historyCount) % state.MAX_HISTORY
+        shell.*.historyCount += 1
+    } else {
+        slot = shell.*.historyStart
+        shell.*.historyStart = (shell.*.historyStart + 1) % state.MAX_HISTORY
+    }
+    const bytes = historyBytes(shell)
+    const at = shell.*.historyLength
+    var index: usize = 0
+    for byte in line {
+        bytes[at + index] = byte
+        index += 1
+    }
+    shell.*.historyOffsets[slot] = @intCast(u32, at)
+    shell.*.historyLengths[slot] = @intCast(u32, line.length)
+    shell.*.historyLength += line.length
+}
+
+// Reads $HOME/.mlx_sh_history (one line each) into the history.
+pub fn loadHistory(shell: *Shell, path: []const u8) -> void {
+    const file = sys.open(path, sys.O_RDONLY, 0)
+    if file < 0 { return }
+    var buffer: [state.HISTORY_CAPACITY]u8 = undefined
+    var buffer_bytes: [*]u8 = undefined
+    unsafe { buffer_bytes = @ptrCast([*]u8, &buffer) }
+    var length: usize = 0
+    var more = true
+    while more && length < state.HISTORY_CAPACITY {
+        const got = sys.read(file, state.offset(buffer_bytes, length), state.HISTORY_CAPACITY - length)
+        if got <= 0 { more = false } else { length += @bitCast(usize, got) }
+    }
+    sys.close(file)
+    var start: usize = 0
+    while start < length {
+        var end = start
+        while end < length && buffer[end] != 10 { end += 1 }
+        remember(shell, buffer_bytes[start..end])
+        start = end + 1
+    }
+}
+
+pub fn saveHistory(shell: *Shell, path: []const u8) -> void {
+    const file = sys.open(path, sys.O_WRONLY | sys.O_CREAT | sys.O_TRUNC, 384)
+    if file < 0 { return }
+    var index: usize = 0
+    while index < shell.*.historyCount {
+        const wrote = sys.writeAll(file, historyEntry(shell, index))
+        const ended = sys.writeAll(file, "\n")
+        index += 1
+    }
+    sys.close(file)
+}
+
+fn showHistory(shell: *Shell, editor: *Editor, index: usize) -> void {
+    const line = lineBytes(editor)
+    if index >= shell.*.historyCount {
+        // Back to the draft.
+        var at: usize = 0
+        while at < editor.*.draftLength {
+            line[at] = draftBytes(editor)[at]
+            at += 1
+        }
+        editor.*.length = editor.*.draftLength
+    } else {
+        const entry = historyEntry(shell, index)
+        var at: usize = 0
+        for byte in entry {
+            line[at] = byte
+            at += 1
+        }
+        editor.*.length = entry.length
+    }
+    editor.*.cursor = editor.*.length
+    editor.*.historyAt = index
+}
+
+fn historyUp(shell: *Shell, editor: *Editor) -> void {
+    if editor.*.historyAt == 0 { return }
+    if editor.*.historyAt == shell.*.historyCount {
+        var at: usize = 0
+        while at < editor.*.length {
+            draftBytes(editor)[at] = lineBytes(editor)[at]
+            at += 1
+        }
+        editor.*.draftLength = editor.*.length
+    }
+    showHistory(shell, editor, editor.*.historyAt - 1)
+}
+
+fn historyDown(shell: *Shell, editor: *Editor) -> void {
+    if editor.*.historyAt >= shell.*.historyCount { return }
+    showHistory(shell, editor, editor.*.historyAt + 1)
+}
+
+// ---------------------------------------------------------------------------
+// Completion
+
+const MAX_CANDIDATES: usize = 512
+
+const Candidates = struct {
+    bytes: [65536]u8
+    length: usize
+    offsets: [MAX_CANDIDATES]usize
+    lengths: [MAX_CANDIDATES]usize
+    directory: [MAX_CANDIDATES]bool
+    count: usize
+}
+
+fn candidateText(candidates: *Candidates, index: usize) -> []const u8 {
+    var bytes: [*]const u8 = undefined
+    unsafe { bytes = @ptrCast([*]const u8, &candidates.*.bytes) }
+    return bytes[candidates.*.offsets[index]..candidates.*.offsets[index] + candidates.*.lengths[index]]
+}
+
+fn addCandidate(candidates: *Candidates, name: []const u8, directory: bool) -> void {
+    if candidates.*.count >= MAX_CANDIDATES || candidates.*.length + name.length > 65536 { return }
+    var index: usize = 0
+    while index < candidates.*.count {
+        if std.text.same(candidateText(candidates, index), name) { return }
+        index += 1
+    }
+    var bytes: [*]u8 = undefined
+    unsafe { bytes = @ptrCast([*]u8, &candidates.*.bytes) }
+    var at: usize = 0
+    for byte in name {
+        bytes[candidates.*.length + at] = byte
+        at += 1
+    }
+    candidates.*.offsets[candidates.*.count] = candidates.*.length
+    candidates.*.lengths[candidates.*.count] = name.length
+    candidates.*.directory[candidates.*.count] = directory
+    candidates.*.count += 1
+    candidates.*.length += name.length
+}
+
+// The entries of `directory` starting with `prefix`.
+fn addDirectoryEntries(candidates: *Candidates, directory: []const u8, prefix: []const u8, executables_only: bool) -> void {
+    var path: [4096]u8 = undefined
+    var path_bytes: [*]u8 = undefined
+    unsafe { path_bytes = @ptrCast([*]u8, &path) }
+    var path_length = std.text.append(path_bytes, 0, 4095, if directory.length == 0 { "." } else { directory })
+    path_bytes[path_length] = 0
+    const file = std.fs.open(path_bytes, 65536, 0)
+    if !std.fs.isValid(file) { return }
+    var names: [65536]u8 = undefined
+    var names_bytes: [*]u8 = undefined
+    unsafe { names_bytes = @ptrCast([*]u8, &names) }
+    var reader = std.fs.entries(file, names_bytes, 65536)
+    var entry: std.fs.Entry = undefined
+    while std.fs.nextEntry(&reader, &entry) {
+        const name = std.string.asSlice(entry.name)
+        if std.text.same(name, ".") || std.text.same(name, "..") { continue }
+        if !std.text.startsWith(name, prefix) { continue }
+        if name.length > 0 && name[0] == 46 && (prefix.length == 0 || prefix[0] != 46) { continue }
+        var full_length = std.text.append(path_bytes, path_length, 4095, "/")
+        full_length = std.text.append(path_bytes, full_length, 4095, name)
+        path_bytes[full_length] = 0
+        var status: std.fs.Stat = undefined
+        var is_directory = entry.kind == std.fs.ENTRY_DIRECTORY
+        if entry.kind == std.fs.ENTRY_UNKNOWN || entry.kind == std.fs.ENTRY_SYMBOLIC_LINK {
+            if std.fs.status(path_bytes, &status) == 0 { is_directory = status.mode & 61440 == 16384 }
+        }
+        if executables_only && (is_directory || !sys.access(path_bytes[0..full_length], 1)) { continue }
+        addCandidate(candidates, name, is_directory)
+    }
+    const closed = std.fs.close(file)
+}
+
+fn commonPrefixLength(candidates: *Candidates) -> usize {
+    if candidates.*.count == 0 { return 0 }
+    var length = candidateText(candidates, 0).length
+    var index: usize = 1
+    while index < candidates.*.count {
+        const other = candidateText(candidates, index)
+        const first = candidateText(candidates, 0)
+        var same: usize = 0
+        while same < length && same < other.length && first[same] == other[same] { same += 1 }
+        length = same
+        index += 1
+    }
+    return length
+}
+
+fn listCandidates(editor: *Editor, candidates: *Candidates) -> void {
+    write("\n")
+    var columns = sys.terminalColumns(1)
+    if columns == 0 { columns = 80 }
+    var widest: usize = 0
+    var index: usize = 0
+    while index < candidates.*.count {
+        if candidates.*.lengths[index] + 2 > widest { widest = candidates.*.lengths[index] + 2 }
+        index += 1
+    }
+    const per_row = if widest > 0 && columns / widest > 0 { columns / widest } else { 1 }
+    index = 0
+    while index < candidates.*.count {
+        const name = candidateText(candidates, index)
+        write(name)
+        if candidates.*.directory[index] { write("/") }
+        var pad = name.length + (if candidates.*.directory[index] { 1 } else { 0 })
+        if (index + 1) % per_row == 0 || index + 1 == candidates.*.count {
+            write("\n")
+        } else {
+            while pad < widest {
+                write(" ")
+                pad += 1
+            }
+        }
+        index += 1
+    }
+    redraw(editor)
+}
+
+// Completes the word before the cursor: a command (the first word, no
+// slash) from the builtins and PATH, else a file name.
+fn complete(shell: *Shell, editor: *Editor, list_them: bool) -> void {
+    const line = lineBytes(editor)
+    var start = editor.*.cursor
+    while start > 0 && line[start - 1] != 32 && line[start - 1] != 9 && line[start - 1] != 124 && line[start - 1] != 59 && line[start - 1] != 40 && line[start - 1] != 38 { start -= 1 }
+    const word = line[start..editor.*.cursor]
+    // Is it the command position?
+    var before = start
+    while before > 0 && (line[before - 1] == 32 || line[before - 1] == 9) { before -= 1 }
+    const command_position = before == 0 || line[before - 1] == 124 || line[before - 1] == 59 || line[before - 1] == 40 || line[before - 1] == 38
+    var has_slash = false
+    for byte in word {
+        if byte == 47 { has_slash = true }
+    }
+    var candidates: Candidates = undefined
+    candidates.count = 0
+    candidates.length = 0
+    var directory: []const u8 = ""
+    var prefix = word
+    if command_position && !has_slash {
+        const names: []const u8 = ": . source break cd command continue echo eval exec exit export false hash help history jobs kill local printf pwd read readonly return set shift test trap true type umask unset wait"
+        var at: usize = 0
+        while at < names.length {
+            var end = at
+            while end < names.length && names[end] != 32 { end += 1 }
+            if std.text.startsWith(names[at..end], word) { addCandidate(&candidates, names[at..end], false) }
+            at = end + 1
+        }
+        var path: []const u8 = "/usr/local/bin:/usr/bin:/bin"
+        const variable = state.getVariable(shell, "PATH")
+        if variable != null { path = variable.? }
+        at = 0
+        while at <= path.length {
+            var end = at
+            while end < path.length && path[end] != 58 { end += 1 }
+            if end > at { addDirectoryEntries(&candidates, path[at..end], word, true) }
+            at = end + 1
+        }
+    } else {
+        var slash = word.length
+        while slash > 0 && word[slash - 1] != 47 { slash -= 1 }
+        directory = word[0..slash]
+        prefix = word[slash..word.length]
+        var expanded_directory = directory
+        var home_path: [4096]u8 = undefined
+        var home_bytes: [*]u8 = undefined
+        unsafe { home_bytes = @ptrCast([*]u8, &home_path) }
+        if directory.length > 0 && directory[0] == 126 {
+            const home = state.getVariable(shell, "HOME")
+            if home != null {
+                var length = std.text.append(home_bytes, 0, 4096, home.?)
+                length = std.text.append(home_bytes, length, 4096, directory[1..directory.length])
+                expanded_directory = home_bytes[0..length]
+            }
+        }
+        addDirectoryEntries(&candidates, expanded_directory, prefix, false)
+    }
+    if candidates.count == 0 { return }
+    const common = commonPrefixLength(&candidates)
+    if common > prefix.length {
+        const first = candidateText(&candidates, 0)
+        insert(editor, first[prefix.length..common])
+    }
+    if candidates.count == 1 {
+        insert(editor, if candidates.directory[0] { "/" } else { " " })
+    } else if list_them || common <= prefix.length {
+        listCandidates(editor, &candidates)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Reading a line
+
+fn readByte(byte: *u8) -> bool {
+    var buffer: [1]u8 = [1]u8{ 0 }
+    var pointer: [*]u8 = undefined
+    unsafe { pointer = @ptrCast([*]u8, &buffer) }
+    if sys.read(0, pointer, 1) != 1 { return false }
+    byte.* = buffer[0]
+    return true
+}
+
+// A whole escape sequence after ESC: the final byte, with the parameter
+// (for CSI 1;5C: 5 in `modifier`, 3 in `number` for CSI 3~).
+fn readEscape(final: *u8, number: *usize, modifier: *usize) -> bool {
+    var byte: u8 = 0
+    number.* = 0
+    modifier.* = 0
+    if !readByte(&byte) { return false }
+    if byte != 91 && byte != 79 {
+        // Alt+KEY: the key as the final with modifier 8.
+        final.* = byte
+        modifier.* = 8
+        return true
+    }
+    var value: usize = 0
+    var seen_semicolon = false
+    while readByte(&byte) {
+        if byte >= 48 && byte <= 57 {
+            value = value * 10 + @intCast(usize, byte - 48)
+        } else if byte == 59 {
+            number.* = value
+            value = 0
+            seen_semicolon = true
+        } else {
+            if seen_semicolon { modifier.* = value } else { number.* = value }
+            final.* = byte
+            return true
+        }
+    }
+    return false
+}
+
+// Reads a line with the prompt; RESULT_LINE with the text in the editor,
+// RESULT_EOF (Ctrl-D on an empty line, or the input ended) or
+// RESULT_INTERRUPT (Ctrl-C).
+pub fn readLine(shell: *Shell, editor: *Editor, prompt: []const u8) -> u8 {
+    editor.*.length = 0
+    editor.*.cursor = 0
+    editor.*.prompt = prompt
+    editor.*.historyAt = shell.*.historyCount
+    editor.*.draftLength = 0
+    editor.*.lastWasTab = false
+    var raw: sys.Termios = undefined
+    sys.rawMode(&shell.*.cooked, &raw)
+    const set_raw = sys.setTermios(0, &raw)
+    redraw(editor)
+    var result: u8 = RESULT_LINE
+    var reading = true
+    while reading {
+        var byte: u8 = 0
+        if !readByte(&byte) {
+            result = RESULT_EOF
+            break
+        }
+        const was_tab = editor.*.lastWasTab
+        editor.*.lastWasTab = false
+        if byte == 13 || byte == 10 {
+            reading = false
+        } else if byte == 3 {
+            result = RESULT_INTERRUPT
+            reading = false
+        } else if byte == 4 {
+            if editor.*.length == 0 {
+                result = RESULT_EOF
+                reading = false
+            } else {
+                removeRange(editor, editor.*.cursor, nextCharacter(editor, editor.*.cursor))
+            }
+        } else if byte == 127 || byte == 8 {
+            const from = previousCharacter(editor, editor.*.cursor)
+            removeRange(editor, from, editor.*.cursor)
+        } else if byte == 1 {
+            editor.*.cursor = 0
+        } else if byte == 5 {
+            editor.*.cursor = editor.*.length
+        } else if byte == 2 {
+            editor.*.cursor = previousCharacter(editor, editor.*.cursor)
+        } else if byte == 6 {
+            editor.*.cursor = nextCharacter(editor, editor.*.cursor)
+        } else if byte == 11 {
+            removeRange(editor, editor.*.cursor, editor.*.length)
+        } else if byte == 21 {
+            removeRange(editor, 0, editor.*.cursor)
+        } else if byte == 23 {
+            removeRange(editor, wordStart(editor, editor.*.cursor), editor.*.cursor)
+        } else if byte == 12 {
+            writeEscape("[H")
+            writeEscape("[2J")
+        } else if byte == 16 {
+            historyUp(shell, editor)
+        } else if byte == 14 {
+            historyDown(shell, editor)
+        } else if byte == 9 {
+            complete(shell, editor, was_tab)
+            editor.*.lastWasTab = true
+        } else if byte == 27 {
+            var final: u8 = 0
+            var number: usize = 0
+            var modifier: usize = 0
+            if readEscape(&final, &number, &modifier) {
+                if modifier == 8 {
+                    // Alt+b, Alt+f, Alt+Backspace, Alt+d.
+                    if final == 98 { editor.*.cursor = wordStart(editor, editor.*.cursor) }
+                    if final == 102 { editor.*.cursor = wordEnd(editor, editor.*.cursor) }
+                    if final == 127 { removeRange(editor, wordStart(editor, editor.*.cursor), editor.*.cursor) }
+                    if final == 100 { removeRange(editor, editor.*.cursor, wordEnd(editor, editor.*.cursor)) }
+                } else if final == 65 {
+                    historyUp(shell, editor)
+                } else if final == 66 {
+                    historyDown(shell, editor)
+                } else if final == 67 {
+                    editor.*.cursor = if modifier == 5 || modifier == 3 { wordEnd(editor, editor.*.cursor) } else { nextCharacter(editor, editor.*.cursor) }
+                } else if final == 68 {
+                    editor.*.cursor = if modifier == 5 || modifier == 3 { wordStart(editor, editor.*.cursor) } else { previousCharacter(editor, editor.*.cursor) }
+                } else if final == 72 || (final == 126 && (number == 1 || number == 7)) {
+                    editor.*.cursor = 0
+                } else if final == 70 || (final == 126 && (number == 4 || number == 8)) {
+                    editor.*.cursor = editor.*.length
+                } else if final == 126 && number == 3 {
+                    removeRange(editor, editor.*.cursor, nextCharacter(editor, editor.*.cursor))
+                }
+            }
+        } else if byte >= 32 {
+            var inserted: [1]u8 = [1]u8{ byte }
+            var inserted_bytes: [*]const u8 = undefined
+            unsafe { inserted_bytes = @ptrCast([*]const u8, &inserted) }
+            insert(editor, inserted_bytes[0..1])
+        }
+        if reading { redraw(editor) }
+    }
+    write("\n")
+    const restored = sys.setTermios(0, &shell.*.cooked)
+    return result
+}

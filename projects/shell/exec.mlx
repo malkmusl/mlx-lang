@@ -1,0 +1,780 @@
+// Running the tree: lists and their && || & operators, pipelines (every
+// command in a child of its own, connected by pipes), simple commands
+// (assignments, builtins in the shell, functions, programs found along
+// PATH in a child), redirections (saved and restored around what runs in
+// the shell), the compound commands with break, continue and return, set
+// -e, functions with their positional parameters and locals, background
+// jobs, and command substitution's child.
+const std = @import("std")
+const sys = @import("./sys.mlx")
+const state = @import("./state.mlx")
+const parser_module = @import("./parser.mlx")
+const expand = @import("./expand.mlx")
+const glob = @import("./glob.mlx")
+const builtins = @import("./builtins.mlx")
+const programs = @import("./programs.mlx")
+
+const Shell = state.Shell
+const Node = state.Node
+
+const MAX_SAVED: usize = 16
+const MAX_PIPELINE: usize = 64
+const MAX_TEMPORARY: usize = 16
+
+// Descriptors saved around a redirection applied in the shell itself.
+pub const Saved = struct {
+    descriptors: [MAX_SAVED]isize
+    copies: [MAX_SAVED]isize
+    count: usize
+}
+
+// ---------------------------------------------------------------------------
+// Parsing and running text
+
+// Parses and runs `text` (a script, -c, eval, a function body, a
+// substitution); the status. Nodes and text the parse added are released
+// after, so a long session does not fill the arenas.
+pub fn runText(shell: *Shell, text: []const u8) -> usize {
+    const node_mark = shell.*.nodeCount
+    const text_mark = shell.*.textLength
+    const at = state.appendText(shell, text)
+    if at == state.TEXT_CAPACITY {
+        state.complain("the text is too long to run", "")
+        shell.*.lastStatus = 2
+        return 2
+    }
+    var parser: parser_module.Parser = undefined
+    const root = parser_module.parse(&parser, shell, state.textOf(shell, @intCast(u32, at), @intCast(u32, text.length)), at)
+    var status: usize = 0
+    if parser.status == parser_module.INCOMPLETE {
+        state.complain("syntax error: unexpected end of input", "")
+        status = 2
+    } else if parser.status == parser_module.SYNTAX {
+        var line: [64]u8 = undefined
+        var line_bytes: [*]u8 = undefined
+        unsafe { line_bytes = @ptrCast([*]u8, &line) }
+        var length = std.text.append(line_bytes, 0, 64, "line ")
+        length = std.text.appendUnsigned(line_bytes, length, 64, parser_module.errorLine(&parser))
+        state.complainAbout("syntax error at ", line_bytes[0..length], parser.message)
+        status = 2
+    } else {
+        status = runNode(shell, root)
+    }
+    // Function bodies and heredocs from this text that something keeps
+    // were copied: the arenas go back.
+    if !shell.*.exiting {
+        shell.*.nodeCount = node_mark
+        shell.*.textLength = text_mark
+    }
+    shell.*.lastStatus = status
+    return status
+}
+
+// An expansion failed (a bad substitution, an arithmetic error, ${X:?}):
+// a non-interactive shell ends with 2, as dash does; an interactive one
+// goes on with that status.
+fn failedExpansion(shell: *Shell) -> usize {
+    if !shell.*.interactive {
+        shell.*.exiting = true
+        shell.*.exitStatus = 2
+    }
+    return 2
+}
+
+// Whether a loop or the function is being left, or the shell.
+fn leaving(shell: *Shell) -> bool {
+    return shell.*.exiting || shell.*.returning || shell.*.breaking > 0 || shell.*.continuing > 0
+}
+
+pub fn runNode(shell: *Shell, node: u32) -> usize {
+    if node == 0 { return 0 }
+    const kind = state.nodeAt(shell, node).*.kind
+    if kind == state.LIST { return runList(shell, node) }
+    if kind == state.ANDOR { return runAndOr(shell, node) }
+    if kind == state.PIPELINE { return runPipeline(shell, node) }
+    return runCommand(shell, node)
+}
+
+fn runList(shell: *Shell, node: u32) -> usize {
+    var status: usize = 0
+    var child = state.nodeAt(shell, node).*.first
+    while child != 0 && !leaving(shell) {
+        const record = state.nodeAt(shell, child)
+        if record.*.flags & state.BACKGROUND != 0 {
+            status = runBackground(shell, child)
+        } else {
+            status = runAndOr(shell, child)
+        }
+        child = record.*.next
+    }
+    return status
+}
+
+// A && B || C: each pipeline's flags say what came before it.
+fn runAndOr(shell: *Shell, node: u32) -> usize {
+    var status: usize = 0
+    var child = state.nodeAt(shell, node).*.first
+    var first = true
+    while child != 0 && !leaving(shell) {
+        const record = state.nodeAt(shell, child)
+        const next = record.*.next
+        var run = true
+        if !first {
+            if record.*.flags & state.AND_BEFORE != 0 { run = status == 0 }
+            if record.*.flags & state.OR_BEFORE != 0 { run = status != 0 }
+        }
+        if run {
+            // Only the last pipeline's failure counts for set -e.
+            if next != 0 { shell.*.conditionDepth += 1 }
+            status = runPipeline(shell, child)
+            if next != 0 { shell.*.conditionDepth -= 1 }
+        }
+        first = false
+        child = next
+    }
+    return status
+}
+
+// A list in a child that nobody waits for.
+fn runBackground(shell: *Shell, node: u32) -> usize {
+    const pid = sys.fork()
+    if pid < 0 {
+        state.complain("cannot fork", "")
+        return 1
+    }
+    if pid == 0 {
+        shell.*.interactive = false
+        sys.setSignal(sys.SIGINT, 1)
+        sys.setSignal(sys.SIGQUIT, 1)
+        const status = runAndOr(shell, node)
+        finishChild(shell, status)
+    }
+    if shell.*.jobCount < state.MAX_JOBS {
+        shell.*.jobs[shell.*.jobCount] = pid
+        shell.*.jobCount += 1
+    }
+    shell.*.lastBackground = pid
+    if shell.*.interactive {
+        var line: [32]u8 = undefined
+        var bytes: [*]u8 = undefined
+        unsafe { bytes = @ptrCast([*]u8, &line) }
+        var length = std.text.append(bytes, 0, 32, "[")
+        length = std.text.appendUnsigned(bytes, length, 32, shell.*.jobCount)
+        length = std.text.append(bytes, length, 32, "] ")
+        length = std.text.appendUnsigned(bytes, length, 32, @intCast(usize, pid))
+        length = std.text.append(bytes, length, 32, "\n")
+        const wrote = sys.write(2, bytes, length)
+    }
+    return 0
+}
+
+// A child of the shell ends: the EXIT trap does not run in it.
+pub fn finishChild(shell: *Shell, status: usize) -> void {
+    sys.exit(if shell.*.exiting { shell.*.exitStatus } else { status })
+}
+
+// ---------------------------------------------------------------------------
+// Pipelines
+
+fn runPipeline(shell: *Shell, node: u32) -> usize {
+    const record = state.nodeAt(shell, node)
+    const negated = record.*.flags & state.NEGATED != 0
+    var count: usize = 0
+    var child = record.*.first
+    while child != 0 {
+        count += 1
+        child = state.nodeAt(shell, child).*.next
+    }
+    var status: usize = 0
+    if count == 1 {
+        if negated { shell.*.conditionDepth += 1 }
+        status = runCommand(shell, record.*.first)
+        if negated { shell.*.conditionDepth -= 1 }
+    } else if count > 1 {
+        status = runPipes(shell, record.*.first, count)
+    }
+    if negated { status = if status == 0 { 1 } else { 0 } }
+    // $? is the last pipeline's status.
+    shell.*.lastStatus = status
+    if shell.*.errexit && status != 0 && shell.*.conditionDepth == 0 && !shell.*.exiting {
+        shell.*.exiting = true
+        shell.*.exitStatus = status
+    }
+    return status
+}
+
+// Every command in a child, connected by pipes; the last one's status.
+fn runPipes(shell: *Shell, first: u32, count: usize) -> usize {
+    var pids: [MAX_PIPELINE]isize = undefined
+    var previous_read: isize = -1
+    var command = first
+    var index: usize = 0
+    while command != 0 && index < MAX_PIPELINE {
+        const last = state.nodeAt(shell, command).*.next == 0
+        var read_end: isize = -1
+        var write_end: isize = -1
+        if !last && !sys.pipe(&read_end, &write_end) {
+            state.complain("cannot make a pipe", "")
+            return 1
+        }
+        const pid = sys.fork()
+        if pid < 0 {
+            state.complain("cannot fork", "")
+            return 1
+        }
+        if pid == 0 {
+            shell.*.interactive = false
+            if previous_read >= 0 {
+                const stdin_set = sys.dup2(previous_read, 0)
+                sys.close(previous_read)
+            }
+            if !last {
+                sys.close(read_end)
+                const out = sys.dup2(write_end, 1)
+                sys.close(write_end)
+            }
+            const status = runCommand(shell, command)
+            finishChild(shell, status)
+        }
+        if previous_read >= 0 { sys.close(previous_read) }
+        if !last {
+            sys.close(write_end)
+            previous_read = read_end
+        }
+        pids[index] = pid
+        index += 1
+        command = state.nodeAt(shell, command).*.next
+    }
+    var status: usize = 0
+    var waited: usize = 0
+    while waited < index {
+        var raw: usize = 0
+        const pid = sys.wait(pids[waited], &raw, false)
+        if waited + 1 == index { status = sys.exitStatus(raw) }
+        waited += 1
+    }
+    return status
+}
+
+// ---------------------------------------------------------------------------
+// Redirections
+
+fn initSaved(saved: *Saved) -> void { saved.*.count = 0 }
+
+// Applies the REDIRECT children of `node`. In the shell (`permanent`
+// false) the old descriptors are kept in `saved` for restore(); in a child
+// nothing is saved. False (said) when a file could not be opened.
+pub fn applyRedirects(shell: *Shell, node: u32, saved: *Saved, permanent: bool) -> bool {
+    var child = state.nodeAt(shell, node).*.first
+    while child != 0 {
+        const record = state.nodeAt(shell, child)
+        if record.*.kind == state.REDIRECT {
+            if !applyOne(shell, child, saved, permanent) { return false }
+        }
+        child = record.*.next
+    }
+    return true
+}
+
+fn remember(saved: *Saved, descriptor: isize) -> void {
+    if saved.*.count >= MAX_SAVED { return }
+    var index: usize = 0
+    while index < saved.*.count {
+        if saved.*.descriptors[index] == descriptor { return }
+        index += 1
+    }
+    saved.*.descriptors[saved.*.count] = descriptor
+    // A copy on a high descriptor, or -1 when `descriptor` was closed.
+    const copy = sys.dup(descriptor)
+    saved.*.copies[saved.*.count] = if copy < 0 { -1 } else { copy }
+    saved.*.count += 1
+}
+
+pub fn restore(saved: *Saved) -> void {
+    var index = saved.*.count
+    while index > 0 {
+        index -= 1
+        const descriptor = saved.*.descriptors[index]
+        const copy = saved.*.copies[index]
+        if copy >= 0 {
+            const back = sys.dup2(copy, descriptor)
+            sys.close(copy)
+        } else {
+            sys.close(descriptor)
+        }
+    }
+    saved.*.count = 0
+}
+
+fn parseNumber(text: []const u8, value: *usize) -> bool {
+    if text.length == 0 { return false }
+    var result: usize = 0
+    for byte in text {
+        if byte < 48 || byte > 57 { return false }
+        result = result * 10 + @intCast(usize, byte - 48)
+    }
+    value.* = result
+    return true
+}
+
+fn applyOne(shell: *Shell, node: u32, saved: *Saved, permanent: bool) -> bool {
+    const record = state.nodeAt(shell, node)
+    const fd = @intCast(isize, record.*.number & 255)
+    const operator = record.*.number >> 8
+    const target_node = record.*.first
+    if operator == state.R_HEREDOC {
+        const body = state.textOf(shell, record.*.text, record.*.length)
+        const expanded = expand.expandHeredoc(shell, body, record.*.flags & state.NO_EXPAND == 0)
+        if expanded == null {
+            const failed = failedExpansion(shell)
+            return false
+        }
+        const source = heredocDescriptor(expanded.?)
+        if source < 0 {
+            state.complain("cannot make the heredoc", "")
+            return false
+        }
+        if !permanent { remember(saved, fd) }
+        const placed = sys.dup2(source, fd)
+        sys.close(source)
+        return true
+    }
+    const target = expand.expandOne(shell, state.wordText(shell, target_node))
+    if target == null {
+        const failed = failedExpansion(shell)
+        return false
+    }
+    const name = target.?
+    if operator == state.R_DUP_INPUT || operator == state.R_DUP_OUTPUT {
+        if !permanent { remember(saved, fd) }
+        if std.text.same(name, "-") {
+            sys.close(fd)
+            return true
+        }
+        var other: usize = 0
+        if !parseNumber(name, &other) {
+            state.complainAbout("bad file descriptor", "", name)
+            return false
+        }
+        if sys.dup2(@intCast(isize, other), fd) < 0 {
+            state.complainAbout("bad file descriptor", "", name)
+            return false
+        }
+        return true
+    }
+    var flags: usize = sys.O_RDONLY
+    if operator == state.R_OUTPUT || operator == state.R_CLOBBER || operator == state.R_BOTH {
+        flags = sys.O_WRONLY | sys.O_CREAT | sys.O_TRUNC
+    } else if operator == state.R_APPEND {
+        flags = sys.O_WRONLY | sys.O_CREAT | sys.O_APPEND
+    } else if operator == state.R_READ_WRITE {
+        flags = sys.O_RDWR | sys.O_CREAT
+    }
+    const file = sys.open(name, flags, 438)
+    if file < 0 {
+        state.complainAbout("cannot open ", name, if flags == sys.O_RDONLY { "no such file" } else { "cannot write" })
+        return false
+    }
+    if operator == state.R_BOTH {
+        if !permanent {
+            remember(saved, 1)
+            remember(saved, 2)
+        }
+        const out = sys.dup2(file, 1)
+        const err = sys.dup2(file, 2)
+        sys.close(file)
+        return true
+    }
+    if !permanent { remember(saved, fd) }
+    if file != fd {
+        const placed = sys.dup2(file, fd)
+        sys.close(file)
+    }
+    return true
+}
+
+// A descriptor reading `body`: a pipe for short bodies, a temporary file
+// for long ones.
+fn heredocDescriptor(body: []const u8) -> isize {
+    if body.length < 60000 {
+        var read_end: isize = 0
+        var write_end: isize = 0
+        if !sys.pipe(&read_end, &write_end) { return -1 }
+        const wrote = sys.writeAll(write_end, body)
+        sys.close(write_end)
+        return read_end
+    }
+    // O_TMPFILE | O_RDWR in /tmp.
+    const file = sys.open("/tmp", 4259840 | sys.O_RDWR, 384)
+    if file < 0 { return -1 }
+    const wrote = sys.writeAll(file, body)
+    const rewound = std.linux.syscall3(8, @bitCast(usize, file), 0, 0)
+    return file
+}
+
+// ---------------------------------------------------------------------------
+// Simple commands
+
+fn trace(shell: *Shell, fields: *expand.Fields) -> void {
+    var line: [4096]u8 = undefined
+    var bytes: [*]u8 = undefined
+    unsafe { bytes = @ptrCast([*]u8, &line) }
+    var length = std.text.append(bytes, 0, 4096, "+")
+    var index: usize = 0
+    while index < fields.*.count {
+        length = std.text.append(bytes, length, 4096, " ")
+        length = std.text.append(bytes, length, 4096, std.text.cString(fields.*.items[index]))
+        index += 1
+    }
+    length = std.text.append(bytes, length, 4096, "\n")
+    const wrote = sys.write(2, bytes, length)
+}
+
+// The assignments before a command: set in the shell, exported when the
+// command is a program (they are its environment); the old values are
+// saved for builtins and functions, which see them only while they run.
+fn applyAssignments(shell: *Shell, node: u32, temporary: bool, saved_count: *usize) -> bool {
+    saved_count.* = 0
+    var child = state.nodeAt(shell, node).*.first
+    while child != 0 {
+        const record = state.nodeAt(shell, child)
+        if record.*.kind == state.WORD && record.*.flags & state.ASSIGNMENT != 0 {
+            var assignment: expand.Assignment = undefined
+            if !expand.expandAssignment(shell, state.wordText(shell, child), &assignment) {
+                const failed = failedExpansion(shell)
+                return false
+            }
+            if temporary {
+                const kept = state.saveLocal(shell, assignment.name, 1000000 + saved_count.*)
+                saved_count.* += 1
+            }
+            if !state.setVariable(shell, assignment.name, assignment.value, temporary) {
+                state.complainAbout("", assignment.name, "readonly variable")
+                return false
+            }
+        }
+        child = record.*.next
+    }
+    return true
+}
+
+fn undoAssignments(shell: *Shell, saved_count: usize) -> void {
+    if saved_count > 0 { state.restoreLocals(shell, 1000000) }
+}
+
+// A function call: the fields after the name become its parameters.
+fn runFunction(shell: *Shell, body: []const u8, fields: *expand.Fields) -> usize {
+    const frame = state.pushFrame(shell)
+    var index: usize = 1
+    while index < fields.*.count {
+        const pushed = state.pushPositional(shell, std.text.cString(fields.*.items[index]))
+        index += 1
+    }
+    shell.*.functionDepth += 1
+    const depth = shell.*.functionDepth
+    const status = runText(shell, body)
+    var result = status
+    if shell.*.returning {
+        shell.*.returning = false
+        result = shell.*.returnStatus
+    }
+    state.restoreLocals(shell, depth)
+    shell.*.functionDepth -= 1
+    state.popFrame(shell, frame)
+    shell.*.lastStatus = result
+    return result
+}
+
+fn runSimple(shell: *Shell, node: u32) -> usize {
+    const mark = state.workMark(shell)
+    var fields: expand.Fields = undefined
+    if !expand.expandWords(shell, state.nodeAt(shell, node).*.first, &fields) {
+        state.workRelease(shell, mark)
+        return failedExpansion(shell)
+    }
+    var saved: Saved = undefined
+    initSaved(&saved)
+    var status: usize = 0
+    if fields.count == 0 {
+        // Assignments alone, and redirections for their side effects.
+        var saved_count: usize = 0
+        if !applyAssignments(shell, node, false, &saved_count) {
+            status = 1
+        } else if !applyRedirects(shell, node, &saved, false) {
+            status = 1
+        } else {
+            status = shell.*.lastStatus
+        }
+        restore(&saved)
+        state.workRelease(shell, mark)
+        return status
+    }
+    if shell.*.xtrace { trace(shell, &fields) }
+    const name = std.text.cString(fields.items[0])
+    const function = state.findFunction(shell, name)
+    if function != null {
+        var saved_count: usize = 0
+        if !applyAssignments(shell, node, true, &saved_count) {
+            undoAssignments(shell, saved_count)
+            state.workRelease(shell, mark)
+            return 1
+        }
+        if !applyRedirects(shell, node, &saved, false) {
+            restore(&saved)
+            undoAssignments(shell, saved_count)
+            state.workRelease(shell, mark)
+            return 1
+        }
+        status = runFunction(shell, function.?, &fields)
+        restore(&saved)
+        undoAssignments(shell, saved_count)
+        state.workRelease(shell, mark)
+        return status
+    }
+    if builtins.isBuiltin(name) {
+        var saved_count: usize = 0
+        if !applyAssignments(shell, node, true, &saved_count) {
+            undoAssignments(shell, saved_count)
+            state.workRelease(shell, mark)
+            return 1
+        }
+        // exec's redirections stay.
+        const permanent = std.text.same(name, "exec") && fields.count == 1
+        if !applyRedirects(shell, node, &saved, permanent) {
+            restore(&saved)
+            undoAssignments(shell, saved_count)
+            state.workRelease(shell, mark)
+            return 1
+        }
+        status = builtins.run(shell, &fields)
+        if !permanent { restore(&saved) }
+        undoAssignments(shell, saved_count)
+        state.workRelease(shell, mark)
+        return status
+    }
+    // A program, in a child.
+    const pid = sys.fork()
+    if pid < 0 {
+        state.complain("cannot fork", "")
+        state.workRelease(shell, mark)
+        return 1
+    }
+    if pid == 0 {
+        var saved_count: usize = 0
+        if !applyAssignments(shell, node, false, &saved_count) { sys.exit(1) }
+        // Exported for the program.
+        var child = state.nodeAt(shell, node).*.first
+        while child != 0 {
+            const record = state.nodeAt(shell, child)
+            if record.*.kind == state.WORD && record.*.flags & state.ASSIGNMENT != 0 {
+                var assignment: expand.Assignment = undefined
+                if expand.expandAssignment(shell, state.wordText(shell, child), &assignment) { state.exportVariable(shell, assignment.name) }
+            }
+            child = record.*.next
+        }
+        if !applyRedirects(shell, node, &saved, true) { sys.exit(1) }
+        programs.executeProgram(shell, &fields)
+    }
+    var raw: usize = 0
+    const waited = sys.wait(pid, &raw, false)
+    status = sys.exitStatus(raw)
+    if status > 128 && shell.*.interactive && status != 130 {
+        var line: [64]u8 = undefined
+        var bytes: [*]u8 = undefined
+        unsafe { bytes = @ptrCast([*]u8, &line) }
+        var length = std.text.append(bytes, 0, 64, "mlx-sh: ended by signal ")
+        length = std.text.appendUnsigned(bytes, length, 64, status - 128)
+        length = std.text.append(bytes, length, 64, "\n")
+        const wrote = sys.write(2, bytes, length)
+    }
+    if status == 130 && shell.*.interactive { const wrote = sys.writeAll(2, "\n") }
+    state.workRelease(shell, mark)
+    return status
+}
+
+// ---------------------------------------------------------------------------
+// Compound commands
+
+fn runCommand(shell: *Shell, node: u32) -> usize {
+    const record = state.nodeAt(shell, node)
+    const kind = record.*.kind
+    if kind == state.SIMPLE { return runSimple(shell, node) }
+    if kind == state.FUNCTION {
+        const name = state.textOf(shell, record.*.text, record.*.length)
+        const body = state.textOf(shell, record.*.extra, @intCast(u32, record.*.number))
+        if !state.defineFunction(shell, name, body) {
+            state.complain("too many functions", "")
+            return 1
+        }
+        return 0
+    }
+    if kind == state.SUBSHELL {
+        const pid = sys.fork()
+        if pid < 0 {
+            state.complain("cannot fork", "")
+            return 1
+        }
+        if pid == 0 {
+            shell.*.interactive = false
+            var saved: Saved = undefined
+            initSaved(&saved)
+            if !applyRedirects(shell, node, &saved, true) { sys.exit(1) }
+            const status = runList(shell, record.*.first)
+            finishChild(shell, status)
+        }
+        var raw: usize = 0
+        const waited = sys.wait(pid, &raw, false)
+        return sys.exitStatus(raw)
+    }
+    // The rest run in the shell, with their redirections around them.
+    var saved: Saved = undefined
+    initSaved(&saved)
+    if !applyRedirects(shell, node, &saved, false) {
+        restore(&saved)
+        return 1
+    }
+    var status: usize = 0
+    if kind == state.GROUP {
+        status = runList(shell, record.*.first)
+    } else if kind == state.IF {
+        status = runIf(shell, node)
+    } else if kind == state.FOR {
+        status = runFor(shell, node)
+    } else if kind == state.WHILE || kind == state.UNTIL {
+        status = runWhile(shell, node, kind == state.WHILE)
+    } else if kind == state.CASE {
+        status = runCase(shell, node)
+    }
+    restore(&saved)
+    return status
+}
+
+fn runIf(shell: *Shell, node: u32) -> usize {
+    var child = state.nodeAt(shell, node).*.first
+    while child != 0 {
+        const clause = state.nodeAt(shell, child)
+        if clause.*.kind == state.CLAUSE {
+            shell.*.conditionDepth += 1
+            const condition = runList(shell, clause.*.first)
+            shell.*.conditionDepth -= 1
+            if leaving(shell) { return condition }
+            if condition == 0 { return runList(shell, clause.*.extra) }
+        } else if clause.*.kind == state.ELSE {
+            return runList(shell, clause.*.extra)
+        }
+        child = clause.*.next
+    }
+    return 0
+}
+
+// After a loop body: break and continue counted down; whether to go on.
+fn afterBody(shell: *Shell) -> bool {
+    if shell.*.breaking > 0 {
+        shell.*.breaking -= 1
+        return false
+    }
+    if shell.*.continuing > 0 {
+        shell.*.continuing -= 1
+        return shell.*.continuing == 0
+    }
+    return !shell.*.exiting && !shell.*.returning
+}
+
+fn runFor(shell: *Shell, node: u32) -> usize {
+    const record = state.nodeAt(shell, node)
+    const name = state.textOf(shell, record.*.text, record.*.length)
+    const body = state.nodeAt(shell, record.*.extra).*.first
+    const mark = state.workMark(shell)
+    var fields: expand.Fields = undefined
+    if record.*.flags & state.IN_WORDS != 0 {
+        if !expand.expandWords(shell, record.*.first, &fields) {
+            state.workRelease(shell, mark)
+            return failedExpansion(shell)
+        }
+    } else {
+        // Without `in`: the positional parameters.
+        const memory = state.workAlloc(shell, (state.positionalCount(shell) + 1) * 8)
+        if memory == null {
+            state.workRelease(shell, mark)
+            return 1
+        }
+        unsafe { fields.items = @ptrCast([*][*]const u8, memory.?) }
+        fields.count = 0
+        fields.capacity = state.positionalCount(shell)
+        var index: usize = 1
+        while index <= state.positionalCount(shell) {
+            const copy = state.workString(shell, state.positional(shell, index))
+            if copy == null { break }
+            fields.items[fields.count] = copy.?
+            fields.count += 1
+            index += 1
+        }
+    }
+    var status: usize = 0
+    shell.*.loopDepth += 1
+    var index: usize = 0
+    var going = true
+    while going && index < fields.count {
+        const set = state.setVariable(shell, name, std.text.cString(fields.items[index]), false)
+        status = runList(shell, body)
+        going = afterBody(shell)
+        index += 1
+    }
+    shell.*.loopDepth -= 1
+    state.workRelease(shell, mark)
+    return status
+}
+
+fn runWhile(shell: *Shell, node: u32, is_while: bool) -> usize {
+    const record = state.nodeAt(shell, node)
+    const body = state.nodeAt(shell, record.*.extra).*.first
+    var status: usize = 0
+    shell.*.loopDepth += 1
+    var going = true
+    while going {
+        shell.*.conditionDepth += 1
+        const condition = runList(shell, record.*.first)
+        shell.*.conditionDepth -= 1
+        if leaving(shell) {
+            // break or continue in the condition itself.
+            going = afterBody(shell) && false
+            break
+        }
+        if (condition == 0) != is_while { break }
+        status = runList(shell, body)
+        going = afterBody(shell)
+    }
+    shell.*.loopDepth -= 1
+    return status
+}
+
+fn runCase(shell: *Shell, node: u32) -> usize {
+    const record = state.nodeAt(shell, node)
+    const mark = state.workMark(shell)
+    const subject = expand.expandOne(shell, state.textOf(shell, record.*.text, record.*.length))
+    if subject == null {
+        state.workRelease(shell, mark)
+        return failedExpansion(shell)
+    }
+    var status: usize = 0
+    var item = record.*.first
+    var matched = false
+    while item != 0 && !matched {
+        const item_record = state.nodeAt(shell, item)
+        if item_record.*.kind == state.ITEM {
+            var pattern_node = item_record.*.first
+            while pattern_node != 0 && !matched {
+                var pattern: expand.Subword = undefined
+                if expand.expandPattern(shell, state.wordText(shell, pattern_node), &pattern) {
+                    if glob.patternMatch(pattern.text, pattern.flags, subject.?) { matched = true }
+                }
+                pattern_node = state.nodeAt(shell, pattern_node).*.next
+            }
+            if matched { status = runList(shell, state.nodeAt(shell, item_record.*.extra).*.first) }
+        }
+        item = item_record.*.next
+    }
+    state.workRelease(shell, mark)
+    return status
+}
+

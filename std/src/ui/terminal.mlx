@@ -1,0 +1,229 @@
+// std.ui.terminal: a terminal in a std.ui app: a std.terminal.Screen drawn
+// on a std.ui canvas with the monospaced font of std.ui.text (std.truetype,
+// so any size and any script the font has), the cursor, the view into the
+// history, and the keys (std.terminal.keys) with Shift+Page Up and Down
+// scrolling the view.
+//
+//     var mono: text.Text = undefined
+//     const loaded = text.loadMonoText(&mono, 15, allocator)
+//     var view: ui_terminal.View = undefined
+//     ui_terminal.init(&view, &screen, &mono, 15, 6)
+//     ui_terminal.draw(&view, canvas, area)              // each frame
+//     const length = ui_terminal.key(&view, key, modifiers, typed, plain, &bytes)
+//
+// The host (a Wayland window through std.ui.host, a framebuffer, a pane of
+// another app) owns the screen, the font and the program on the pty; this
+// module only draws and translates.
+const std = @import("std")
+const ui = @import("std.ui")
+const canvas_module = @import("std.ui.canvas")
+const text_module = @import("std.ui.text")
+const ui_keys = @import("std.ui.keys")
+const terminal = @import("std.terminal")
+const terminal_keys = @import("std.terminal.keys")
+
+pub const Canvas = canvas_module.Canvas
+pub const Text = text_module.Text
+
+pub const View = struct {
+    screen: *terminal.Screen
+    font: *Text
+    // The pixel height the font was loaded at, and the cell from it.
+    fontHeight: i32
+    cellWidth: i32
+    cellHeight: i32
+    padding: i32
+    // The default colours (a cell's DEFAULT) and the cursor's.
+    foreground: u32
+    background: u32
+    cursorColor: u32
+    // Drawn as a block when the window has the keyboard, an outline else.
+    focused: bool
+    // Every glyph is as wide as the cell: runs of cells are drawn at once.
+    monospaced: bool
+}
+
+pub const PAGE_UP: u32 = 104
+pub const PAGE_DOWN: u32 = 109
+
+// A view of `screen` in `font`, loaded at `font_height` pixels, with
+// `padding` pixels around the cells.
+pub fn init(view: *View, screen: *terminal.Screen, font: *Text, font_height: i32, padding: i32) -> void {
+    view.*.screen = screen
+    view.*.font = font
+    view.*.fontHeight = font_height
+    view.*.padding = padding
+    var width = text_module.measure(font, "M")
+    if width <= 0 { width = if font_height / 2 > 0 { font_height / 2 } else { 1 } }
+    view.*.cellWidth = width
+    // A line is the font height plus a sixteenth (15 px: 16 px rows).
+    view.*.cellHeight = font_height + (font_height + 8) / 16
+    view.*.monospaced = text_module.measure(font, "i") == width && text_module.measure(font, "W") == width
+    view.*.foreground = 4293322470
+    view.*.background = 4280032284
+    view.*.cursorColor = 4293322470
+    view.*.focused = true
+}
+
+// How many cells fit in `width` x `height` pixels (at least one).
+pub fn columnsFor(view: *const View, width: i32) -> usize {
+    const inner = width - 2 * view.*.padding
+    return if inner >= view.*.cellWidth { @intCast(usize, inner / view.*.cellWidth) } else { 1 }
+}
+
+pub fn rowsFor(view: *const View, height: i32) -> usize {
+    const inner = height - 2 * view.*.padding
+    return if inner >= view.*.cellHeight { @intCast(usize, inner / view.*.cellHeight) } else { 1 }
+}
+
+// The pixels `columns` x `rows` cells take.
+pub fn pixelWidth(view: *const View, columns: usize) -> i32 { return @intCast(i32, columns) * view.*.cellWidth + 2 * view.*.padding }
+pub fn pixelHeight(view: *const View, rows: usize) -> i32 { return @intCast(i32, rows) * view.*.cellHeight + 2 * view.*.padding }
+
+// A colour at half strength over the background (SGR dim).
+fn dimmed(color: u32, background: u32) -> u32 {
+    const red = ((color >> 16) & 255 + (background >> 16) & 255) / 2
+    const green = ((color >> 8) & 255 + (background >> 8) & 255) / 2
+    const blue = (color & 255 + background & 255) / 2
+    return 4278190080 | (red << 16) | (green << 8) | blue
+}
+
+// The colours a cell is drawn in.
+fn colorsOf(view: *const View, cell: *terminal.Cell, foreground: *u32, background: *u32) -> void {
+    const reverse = view.*.screen.*.reverseVideo
+    var fore = if cell.*.foreground == terminal.DEFAULT { view.*.foreground } else { cell.*.foreground }
+    var back = if cell.*.background == terminal.DEFAULT { view.*.background } else { cell.*.background }
+    if reverse {
+        const swapped = fore
+        fore = back
+        back = swapped
+    }
+    if cell.*.flags & terminal.INVERSE != 0 {
+        const swapped = fore
+        fore = back
+        back = swapped
+    }
+    if cell.*.flags & terminal.DIM != 0 { fore = dimmed(fore, back) }
+    if cell.*.flags & terminal.HIDDEN != 0 { fore = back }
+    foreground.* = fore
+    background.* = back
+}
+
+fn advance(bytes: [*]u8, by: usize) -> [*]u8 {
+    var result: [*]u8 = undefined
+    unsafe { result = @ptrFromInt([*]u8, @intFromPtr(bytes) + by) }
+    return result
+}
+
+fn sameLook(left: *terminal.Cell, right: *terminal.Cell) -> bool {
+    return left.*.foreground == right.*.foreground && left.*.background == right.*.background && left.*.flags == right.*.flags
+}
+
+// Draws the screen into `area`: its background, then each line as runs
+// of cells of one look, then the cursor.
+pub fn draw(view: *View, canvas: *Canvas, area: ui.Rect) -> void {
+    const screen = view.*.screen
+    const page_background = if screen.*.reverseVideo { view.*.foreground } else { view.*.background }
+    canvas_module.fillRect(canvas, area.x, area.y, area.width, area.height, page_background)
+    const columns = screen.*.columns
+    const rows = screen.*.rows
+    const left = area.x + view.*.padding
+    const top = area.y + view.*.padding
+    const text_offset = (view.*.cellHeight - view.*.fontHeight) / 2
+    var run: [4096]u8 = undefined
+    var run_bytes: [*]u8 = undefined
+    unsafe { run_bytes = @ptrCast([*]u8, &run) }
+    var row: usize = 0
+    while row < rows {
+        const y = top + @intCast(i32, row) * view.*.cellHeight
+        if y + view.*.cellHeight > area.y + area.height { break }
+        var column: usize = 0
+        while column < columns {
+            const first = terminal.visibleCell(screen, row, column)
+            if first.*.width == 0 {
+                column += 1
+                continue
+            }
+            // The run: cells of the same look, single width when the font
+            // is monospaced (else one cell at a time), stopping before a
+            // wide character or at the line's end.
+            var count: usize = 1
+            var cells_wide: usize = @intCast(usize, first.*.width)
+            var run_length: usize = terminal.encodeUtf8(first.*.codepoint, run_bytes)
+            if view.*.monospaced && first.*.width == 1 {
+                while column + count < columns {
+                    const next = terminal.visibleCell(screen, row, column + count)
+                    if next.*.width != 1 || !sameLook(first, next) || run_length + 4 > 4096 { break }
+                    run_length += terminal.encodeUtf8(next.*.codepoint, advance(run_bytes, run_length))
+                    count += 1
+                    cells_wide += 1
+                }
+            }
+            var foreground: u32 = 0
+            var background: u32 = 0
+            colorsOf(view, first, &foreground, &background)
+            const x = left + @intCast(i32, column) * view.*.cellWidth
+            const run_width = @intCast(i32, cells_wide) * view.*.cellWidth
+            if background != page_background { canvas_module.fillRect(canvas, x, y, run_width, view.*.cellHeight, background) }
+            // Blank runs have nothing to draw.
+            var blank = true
+            var index: usize = 0
+            while index < run_length && blank {
+                if run_bytes[index] != 32 { blank = false }
+                index += 1
+            }
+            if !blank { text_module.drawText(canvas, view.*.font, run_bytes[0..run_length], x, y + text_offset, foreground, 0) }
+            if first.*.flags & terminal.UNDERLINE != 0 { canvas_module.fillRect(canvas, x, y + view.*.cellHeight - 2, run_width, 1, foreground) }
+            if first.*.flags & terminal.STRIKE != 0 { canvas_module.fillRect(canvas, x, y + view.*.cellHeight / 2, run_width, 1, foreground) }
+            column += count + (if first.*.width == 2 { 1 } else { 0 })
+        }
+        row += 1
+    }
+    if terminal.cursorShown(screen) && screen.*.cursorRow < rows && screen.*.cursorColumn < columns {
+        const x = left + @intCast(i32, screen.*.cursorColumn) * view.*.cellWidth
+        const y = top + @intCast(i32, screen.*.cursorRow) * view.*.cellHeight
+        const under = terminal.visibleCell(screen, screen.*.cursorRow, screen.*.cursorColumn)
+        const width = view.*.cellWidth * (if under.*.width == 2 { 2 } else { 1 })
+        const style = screen.*.cursorStyle
+        if !view.*.focused {
+            canvas_module.strokeRoundedRect(canvas, x, y, width, view.*.cellHeight, 0, 1, view.*.cursorColor)
+        } else if style == 3 || style == 4 {
+            canvas_module.fillRect(canvas, x, y + view.*.cellHeight - 2, width, 2, view.*.cursorColor)
+        } else if style == 5 || style == 6 {
+            canvas_module.fillRect(canvas, x, y, 2, view.*.cellHeight, view.*.cursorColor)
+        } else {
+            canvas_module.fillRect(canvas, x, y, width, view.*.cellHeight, view.*.cursorColor)
+            if under.*.width > 0 && under.*.codepoint > 32 {
+                var glyph: [4]u8 = undefined
+                var glyph_bytes: [*]u8 = undefined
+                unsafe { glyph_bytes = @ptrCast([*]u8, &glyph) }
+                const length = terminal.encodeUtf8(under.*.codepoint, glyph_bytes)
+                var foreground: u32 = 0
+                var background: u32 = 0
+                colorsOf(view, under, &foreground, &background)
+                text_module.drawText(canvas, view.*.font, glyph_bytes[0..length], x, y + text_offset, background, 0)
+            }
+        }
+    }
+}
+
+// The bytes a key sends to the program (at most 16 into `out`), or 0.
+// Shift+Page Up and Shift+Page Down scroll the view half a screen through
+// the history instead; any other key brings the live screen back.
+pub fn key(view: *View, key_code: u32, modifiers: u32, typed: []const u8, plain: []const u8, out: [*]u8) -> usize {
+    const screen = view.*.screen
+    if modifiers & ui_keys.SHIFT != 0 && (key_code == PAGE_UP || key_code == PAGE_DOWN) && !screen.*.onAlternate {
+        const half = @intCast(isize, if screen.*.rows / 2 > 0 { screen.*.rows / 2 } else { 1 })
+        terminal.scrollView(screen, if key_code == PAGE_UP { half } else { 0 - half })
+        return 0
+    }
+    const length = terminal_keys.encode(key_code, modifiers, typed, plain, screen.*.applicationCursor, screen.*.newlineMode, out)
+    if length > 0 { terminal.resetView(screen) }
+    return length
+}
+
+// The wheel: `steps` notches (positive: down) scroll the view three lines
+// each.
+pub fn wheel(view: *View, steps: i32) -> void {
+    terminal.scrollView(view.*.screen, @intCast(isize, 0 - steps) * 3)
+}

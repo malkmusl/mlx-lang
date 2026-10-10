@@ -1,0 +1,928 @@
+// The printf engine: a pattern, its arguments (as the variadic call put
+// them in registers and on the stack, or through a va_list), and a sink
+// (a buffer with a limit, or a stream). Integers and strings are exact by
+// nature; doubles are formatted exactly too (bignum.mlx), digit by digit,
+// rounded to nearest with ties to even as glibc does, so what a program
+// printed with glibc it prints with mlxlibc.
+const sys = @import("./sys.mlx")
+const errno = @import("./errno.mlx")
+const string = @import("./string.mlx")
+const bignum = @import("./bignum.mlx")
+
+// Where the bytes go. With `write` set the buffer is a chunk flushed to
+// write(context, bytes, count) when full; without it the buffer is the
+// caller's and `capacity` bytes are kept (snprintf's limit less the NUL),
+// the rest counted only.
+pub const Sink = struct {
+    write: usize
+    context: usize
+    buffer: usize
+    capacity: usize
+    length: usize
+    written: usize
+}
+
+pub const WriteFn = fn(usize, usize, usize) -> void
+
+pub fn bufferSink(buffer: usize, capacity: usize) -> Sink {
+    return Sink.{ .write = 0, .context = 0, .buffer = buffer, .capacity = capacity, .length = 0, .written = 0 }
+}
+
+pub fn streamSink(write: usize, context: usize, chunk: usize, chunk_size: usize) -> Sink {
+    return Sink.{ .write = write, .context = context, .buffer = chunk, .capacity = chunk_size, .length = 0, .written = 0 }
+}
+
+pub fn flush(sink: *Sink) -> void {
+    if sink.*.write == 0 || sink.*.length == 0 { return }
+    var target: WriteFn = undefined
+    unsafe { target = @ptrFromInt(WriteFn, sink.*.write) }
+    target(sink.*.context, sink.*.buffer, sink.*.length)
+    sink.*.length = 0
+}
+
+pub fn put(sink: *Sink, byte: u8) -> void {
+    sink.*.written += 1
+    if sink.*.length < sink.*.capacity {
+        sys.put8(sink.*.buffer + sink.*.length, byte)
+        sink.*.length += 1
+        if sink.*.write != 0 && sink.*.length == sink.*.capacity { flush(sink) }
+    }
+}
+
+pub fn putAll(sink: *Sink, bytes: []const u8) -> void {
+    var index: usize = 0
+    while index < bytes.length {
+        put(sink, bytes[index])
+        index += 1
+    }
+}
+
+fn putRepeated(sink: *Sink, byte: u8, count: usize) -> void {
+    var index: usize = 0
+    while index < count {
+        put(sink, byte)
+        index += 1
+    }
+}
+
+// The arguments: the integer registers and stack words in order, the
+// double registers, or a va_list (gp_offset, fp_offset, overflow area,
+// register save area).
+pub const Source = struct {
+    fromList: bool
+    integers: usize
+    integerCount: usize
+    nextInteger: usize
+    doubles: usize
+    doubleCount: usize
+    nextDouble: usize
+    list: usize
+}
+
+pub fn registers(integers: usize, integer_count: usize, doubles: usize, double_count: usize) -> Source {
+    return Source.{ .fromList = false, .integers = integers, .integerCount = integer_count, .nextInteger = 0, .doubles = doubles, .doubleCount = double_count, .nextDouble = 0, .list = 0 }
+}
+
+pub fn vaList(list: usize) -> Source {
+    return Source.{ .fromList = true, .integers = 0, .integerCount = 0, .nextInteger = 0, .doubles = 0, .doubleCount = 0, .nextDouble = 0, .list = list }
+}
+
+// A second reading of the same arguments (va_copy): a list source's
+// header, which reading advances, is copied into `storage`.
+pub fn duplicate(source: *const Source, storage: *[4]u64) -> Source {
+    if !source.*.fromList { return source.* }
+    sys.copy(@intFromPtr(storage), source.*.list, 24)
+    return vaList(@intFromPtr(storage))
+}
+
+// What a variadic export was called with, as a va_list (System V: the
+// gp_offset and fp_offset words, the overflow area, the register save
+// area of six integer and eight double registers). The export passes the
+// six integer registers (its fixed parameters among them, `fixed` of them
+// counted off), the eight double registers it declared, and its frame
+// pointer: the caller's stack words begin two words above it, past the
+// saved frame pointer and the return address. `words` are the six
+// integer registers, `doubles` the eight double registers, as arrays.
+pub const CallList = struct {
+    header: [4]u64
+    save: [22]u64
+}
+
+pub fn callSource(call: *CallList, fixed: usize, frame: usize, words: usize, doubles: usize) -> Source {
+    const save = @intFromPtr(&call.*.save)
+    sys.copy(save, words, 48)
+    var index: usize = 0
+    while index < 8 {
+        sys.put64(save + 48 + index * 16, sys.get64(doubles + index * 8))
+        sys.put64(save + 56 + index * 16, 0)
+        index += 1
+    }
+    const header = @intFromPtr(&call.*.header)
+    sys.put32(header, @intCast(u32, fixed * 8))
+    sys.put32(header + 4, 48)
+    sys.putPointer(header + 8, frame + 16)
+    sys.putPointer(header + 16, save)
+    return vaList(header)
+}
+
+fn nextInteger(source: *Source) -> u64 {
+    if source.*.fromList {
+        const offset = sys.get32(source.*.list)
+        if offset < 48 {
+            sys.put32(source.*.list, offset + 8)
+            return sys.get64(sys.getPointer(source.*.list + 16) + @intCast(usize, offset))
+        }
+        const overflow = sys.getPointer(source.*.list + 8)
+        sys.putPointer(source.*.list + 8, overflow + 8)
+        return sys.get64(overflow)
+    }
+    if source.*.nextInteger >= source.*.integerCount { return 0 }
+    const value = sys.get64(source.*.integers + source.*.nextInteger * 8)
+    source.*.nextInteger += 1
+    return value
+}
+
+fn nextDouble(source: *Source) -> f64 {
+    if source.*.fromList {
+        const offset = sys.get32(source.*.list + 4)
+        if offset < 176 {
+            sys.put32(source.*.list + 4, offset + 16)
+            return @bitCast(f64, sys.get64(sys.getPointer(source.*.list + 16) + @intCast(usize, offset)))
+        }
+        const overflow = sys.getPointer(source.*.list + 8)
+        sys.putPointer(source.*.list + 8, overflow + 8)
+        return @bitCast(f64, sys.get64(overflow))
+    }
+    if source.*.nextDouble >= source.*.doubleCount { return 0.0 }
+    const value = @bitCast(f64, sys.get64(source.*.doubles + source.*.nextDouble * 8))
+    source.*.nextDouble += 1
+    return value
+}
+
+// One conversion's parsed shape.
+const Spec = struct {
+    left: bool
+    plus: bool
+    space: bool
+    alternate: bool
+    zero: bool
+    width: usize
+    precision: usize
+    hasPrecision: bool
+    size: usize
+    conversion: u8
+}
+
+fn isDigit(value: u8) -> bool { return value >= 48 && value <= 57 }
+
+// text with sign and prefix in a field: padding with zeros goes between
+// the prefix and the digits, spaces around the whole.
+fn emitField(sink: *Sink, spec: *const Spec, sign: []const u8, prefix: []const u8, zeros: usize, digits: []const u8, zero_pad: bool) -> void {
+    const content = sign.length + prefix.length + zeros + digits.length
+    const padding = if spec.*.width > content { spec.*.width - content } else { 0 }
+    if !spec.*.left && !zero_pad { putRepeated(sink, 32, padding) }
+    putAll(sink, sign)
+    putAll(sink, prefix)
+    if !spec.*.left && zero_pad { putRepeated(sink, 48, padding) }
+    putRepeated(sink, 48, zeros)
+    putAll(sink, digits)
+    if spec.*.left { putRepeated(sink, 32, padding) }
+}
+
+fn digitsOf(value: u64, base: u64, upper: bool, buffer: *[32]u8) -> usize {
+    var count: usize = 0
+    var rest = value
+    while true {
+        const digit = @intCast(u8, rest % base)
+        buffer.*[31 - count] = if digit < 10 { 48 + digit } else { (if upper { 55 } else { 87 }) + digit }
+        count += 1
+        rest = rest / base
+        if rest == 0 { break }
+    }
+    return count
+}
+
+fn emitInteger(sink: *Sink, spec: *const Spec, raw: u64) -> void {
+    const conversion = spec.*.conversion
+    var magnitude = raw
+    if spec.*.size == 1 { magnitude = raw & 255 } else if spec.*.size == 2 { magnitude = raw & 65535 } else if spec.*.size == 4 { magnitude = raw & 4294967295 }
+    var negative = false
+    var base: u64 = 10
+    var upper = false
+    if conversion == 100 || conversion == 105 {
+        const top: u64 = if spec.*.size == 1 { 128 } else { if spec.*.size == 2 { 32768 } else { if spec.*.size == 4 { 2147483648 } else { 9223372036854775808 } } }
+        negative = magnitude & top != 0
+        if negative {
+            const mask: u64 = if spec.*.size == 8 { 18446744073709551615 } else { top * 2 - 1 }
+            magnitude = (~magnitude +% 1) & mask
+        }
+    } else if conversion == 120 || conversion == 88 {
+        base = 16
+        upper = conversion == 88
+    } else if conversion == 111 {
+        base = 8
+    }
+    var buffer: [32]u8 = undefined
+    var count: usize = 0
+    if magnitude != 0 || !spec.*.hasPrecision || spec.*.precision != 0 { count = digitsOf(magnitude, base, upper, &buffer) }
+    var digits: [*]const u8 = undefined
+    unsafe { digits = @ptrCast([*]const u8, &buffer) }
+    var zeros: usize = 0
+    if spec.*.hasPrecision && spec.*.precision > count { zeros = spec.*.precision - count }
+    var prefix: []const u8 = ""
+    if spec.*.alternate {
+        if base == 16 && magnitude != 0 { prefix = if upper { "0X" } else { "0x" } }
+        if base == 8 && zeros == 0 && (count == 0 || buffer[32 - count] != 48) { zeros = 1 }
+    }
+    var sign: []const u8 = ""
+    if conversion == 100 || conversion == 105 {
+        if negative { sign = "-" } else if spec.*.plus { sign = "+" } else if spec.*.space { sign = " " }
+    }
+    emitField(sink, spec, sign, prefix, zeros, digits[32 - count..32], spec.*.zero && !spec.*.left && !spec.*.hasPrecision)
+}
+
+// Decimal digits of a double: the integer part (`integer`, most
+// significant first) and as many fraction digits as asked, plus what
+// follows them (the next digit and whether anything nonzero comes after
+// it), all exact.
+const Digits = struct {
+    integer: [330]u8
+    integerCount: usize
+    fraction: [400]u8
+    fractionCount: usize
+}
+
+fn decompose(value: f64) -> (u64, i64) {
+    const bits = @bitCast(u64, value)
+    const biased = (bits >> 52) & 2047
+    const fraction = bits & 4503599627370495
+    if biased == 0 { return -> (fraction, -1074) }
+    return -> (fraction | 4503599627370496, @intCast(i64, biased) - 1075)
+}
+
+// The integer part's digits into `digits.integer`.
+// %e: `precision` digits after the leading one; the decimal exponent.
+const Scientific = struct {
+    digits: [420]u8
+    count: usize
+    exponent: i64
+    carried: bool      // rounding carried into a new leading digit
+}
+
+// The buffers of a float conversion, one set per format() call: an
+// export's arena grows with every aggregate until it returns, and a
+// pattern with a dozen conversions must not outgrow a stack arena.
+const Scratch = struct {
+    digits: Digits
+    scientific: Scientific
+    text: [900]u8
+    all: [800]u8
+    whole: bignum.Big
+    part: bignum.Big
+    chunks: [60]u32
+}
+
+fn integerDigits(mantissa: u64, exponent: i64, scratch: *Scratch) -> void {
+    const digits = @ptrCast(*Digits, &scratch.*.digits)
+    const whole = @ptrCast(*bignum.Big, &scratch.*.whole)
+    bignum.setZero(whole)
+    if exponent >= 0 {
+        bignum.setU64(whole, mantissa)
+        bignum.shiftLeft(whole, @intCast(usize, exponent))
+    } else if exponent > -64 {
+        bignum.setU64(whole, mantissa >> @intCast(u6, 0 - exponent))
+    }
+    var chunk_count: usize = 0
+    while !bignum.isZero(whole) {
+        scratch.*.chunks[chunk_count] = bignum.divSmall(whole, 1000000000)
+        chunk_count += 1
+    }
+    digits.*.integerCount = 0
+    if chunk_count == 0 {
+        digits.*.integer[0] = 48
+        digits.*.integerCount = 1
+        return
+    }
+    var index = chunk_count
+    while index > 0 {
+        index -= 1
+        var chunk = scratch.*.chunks[index]
+        var text: [9]u8 = undefined
+        var position: usize = 9
+        while position > 0 {
+            position -= 1
+            text[position] = @intCast(u8, 48 + chunk % 10)
+            chunk /= 10
+        }
+        var start: usize = 0
+        if index == chunk_count - 1 { while start < 8 && text[start] == 48 { start += 1 } }
+        while start < 9 {
+            digits.*.integer[digits.*.integerCount] = text[start]
+            digits.*.integerCount += 1
+            start += 1
+        }
+    }
+}
+
+// `count` fraction digits into `digits.fraction`, then one more and the
+// sticky flag: (next digit, anything after it).
+fn fractionDigits(mantissa: u64, exponent: i64, count: usize, scratch: *Scratch) -> (u8, bool) {
+    const digits = @ptrCast(*Digits, &scratch.*.digits)
+    digits.*.fractionCount = 0
+    if exponent >= 0 {
+        var index: usize = 0
+        while index < count {
+            digits.*.fraction[index] = 48
+            index += 1
+        }
+        digits.*.fractionCount = count
+        return -> (0, false)
+    }
+    const bits = @intCast(usize, 0 - exponent)
+    const part = @ptrCast(*bignum.Big, &scratch.*.part)
+    if bits < 64 {
+        bignum.setU64(part, mantissa & ((@intCast(u64, 1) << @intCast(u6, bits)) - 1))
+    } else {
+        bignum.setU64(part, mantissa)
+    }
+    var index: usize = 0
+    while index < count {
+        bignum.mulSmall(part, 10)
+        digits.*.fraction[index] = 48 + takeAbove(part, bits)
+        index += 1
+    }
+    digits.*.fractionCount = count
+    bignum.mulSmall(part, 10)
+    const next = takeAbove(part, bits)
+    return -> (next, !bignum.isZero(part))
+}
+
+// The value of the bits at and above `bits` (below ten), cleared from
+// `big`.
+fn takeAbove(big: *bignum.Big, bits: usize) -> u8 {
+    const limb = bits / 32
+    const offset = @intCast(u32, bits % 32)
+    var value: u32 = 0
+    if limb < big.*.count {
+        value = big.*.limbs[limb] >> @intCast(u5, offset)
+        if offset != 0 && limb + 1 < big.*.count { value |= big.*.limbs[limb + 1] << @intCast(u5, 32 - offset) }
+        big.*.limbs[limb] &= if offset == 0 { 0 } else { (@intCast(u32, 1) << @intCast(u5, offset)) - 1 }
+        var clear = limb + 1
+        while clear < big.*.count {
+            big.*.limbs[clear] = 0
+            clear += 1
+        }
+        big.*.count = if offset == 0 { limb } else { limb + 1 }
+        while big.*.count > 0 && big.*.limbs[big.*.count - 1] == 0 { big.*.count -= 1 }
+    }
+    return @intCast(u8, value & 15)
+}
+
+// Rounds the digit sequence (integer then fraction) up by one unit in the
+// last fraction digit (or last integer digit when there are none); the
+// carry may add a digit in front.
+fn roundUp(digits: *Digits) -> void {
+    var index = digits.*.fractionCount
+    while index > 0 {
+        index -= 1
+        if digits.*.fraction[index] != 57 {
+            digits.*.fraction[index] += 1
+            return
+        }
+        digits.*.fraction[index] = 48
+    }
+    index = digits.*.integerCount
+    while index > 0 {
+        index -= 1
+        if digits.*.integer[index] != 57 {
+            digits.*.integer[index] += 1
+            return
+        }
+        digits.*.integer[index] = 48
+    }
+    // All nines: a new leading one.
+    var move = digits.*.integerCount
+    while move > 0 {
+        digits.*.integer[move] = digits.*.integer[move - 1]
+        move -= 1
+    }
+    digits.*.integer[0] = 49
+    digits.*.integerCount += 1
+}
+
+fn shouldRoundUp(next: u8, sticky: bool, last_digit: u8) -> bool {
+    if next > 5 { return true }
+    if next < 5 { return false }
+    if sticky { return true }
+    return (last_digit - 48) % 2 == 1
+}
+
+// %f: the exact digits with `precision` after the point.
+fn fixedDigits(value: f64, precision: usize, scratch: *Scratch) -> void {
+    const digits = @ptrCast(*Digits, &scratch.*.digits)
+    const parts = decompose(value)
+    integerDigits(parts.0, parts.1, scratch)
+    const rest = fractionDigits(parts.0, parts.1, if precision > 399 { 399 } else { precision }, scratch)
+    const last = if digits.*.fractionCount > 0 { digits.*.fraction[digits.*.fractionCount - 1] } else { digits.*.integer[digits.*.integerCount - 1] }
+    if shouldRoundUp(rest.0, rest.1, last) { roundUp(digits) }
+    while digits.*.fractionCount < precision && digits.*.fractionCount < 400 {
+        digits.*.fraction[digits.*.fractionCount] = 48
+        digits.*.fractionCount += 1
+    }
+}
+
+
+fn scientificDigits(value: f64, precision: usize, scratch: *Scratch) -> void {
+    const result = @ptrCast(*Scientific, &scratch.*.scientific)
+    const digits = @ptrCast(*Digits, &scratch.*.digits)
+    const parts = decompose(value)
+    const wanted = precision + 1
+    result.*.carried = false
+    if parts.0 == 0 {
+        // Zero: 0.000e+00, not an exponent counted from the last zero kept.
+        result.*.exponent = 0
+        result.*.count = wanted
+        var index: usize = 0
+        while index < wanted {
+            result.*.digits[index] = 48
+            index += 1
+        }
+        return
+    }
+    integerDigits(parts.0, parts.1, scratch)
+    if digits.*.integerCount > 1 || digits.*.integer[0] != 48 {
+        // Significant digits begin in the integer part.
+        var fraction_needed: usize = 0
+        if wanted + 1 > digits.*.integerCount { fraction_needed = wanted + 1 - digits.*.integerCount }
+        const rest = fractionDigits(parts.0, parts.1, fraction_needed, scratch)
+        var all: [*]u8 = undefined
+        unsafe { all = @ptrCast([*]u8, &scratch.*.all) }
+        var total: usize = 0
+        var index: usize = 0
+        while index < digits.*.integerCount {
+            all[total] = digits.*.integer[index]
+            total += 1
+            index += 1
+        }
+        index = 0
+        while index < digits.*.fractionCount {
+            all[total] = digits.*.fraction[index]
+            total += 1
+            index += 1
+        }
+        // Round at `wanted`: the next digit is all[wanted] (or the rest).
+        var next: u8 = 0
+        var sticky = rest.1 || rest.0 != 0
+        if wanted < total {
+            next = all[wanted] - 48
+            var look = wanted + 1
+            while look < total && !sticky {
+                if all[look] != 48 { sticky = true }
+                look += 1
+            }
+        } else {
+            next = rest.0
+            sticky = rest.1
+        }
+        result.*.exponent = @intCast(i64, digits.*.integerCount) - 1
+        result.*.count = wanted
+        index = 0
+        while index < wanted {
+            result.*.digits[index] = if index < total { all[index] } else { 48 }
+            index += 1
+        }
+        if shouldRoundUp(next, sticky, result.*.digits[wanted - 1]) { roundScientific(result) }
+        return
+    }
+    // Below one: skip the leading zeros of the fraction.
+    const probe = fractionDigits(parts.0, parts.1, 399, scratch)
+    var zeros: usize = 0
+    while zeros < digits.*.fractionCount && digits.*.fraction[zeros] == 48 { zeros += 1 }
+    result.*.exponent = 0 - @intCast(i64, zeros) - 1
+    result.*.count = wanted
+    var index: usize = 0
+    while index < wanted {
+        result.*.digits[index] = if zeros + index < digits.*.fractionCount { digits.*.fraction[zeros + index] } else { 48 }
+        index += 1
+    }
+    var next: u8 = 0
+    var sticky = probe.1 || probe.0 != 0
+    if zeros + wanted < digits.*.fractionCount {
+        next = digits.*.fraction[zeros + wanted] - 48
+        var look = zeros + wanted + 1
+        while look < digits.*.fractionCount && !sticky {
+            if digits.*.fraction[look] != 48 { sticky = true }
+            look += 1
+        }
+    } else {
+        next = probe.0
+        sticky = probe.1
+    }
+    if shouldRoundUp(next, sticky, result.*.digits[wanted - 1]) { roundScientific(result) }
+}
+
+fn roundScientific(result: *Scientific) -> void {
+    var index = result.*.count
+    while index > 0 {
+        index -= 1
+        if result.*.digits[index] != 57 {
+            result.*.digits[index] += 1
+            return
+        }
+        result.*.digits[index] = 48
+    }
+    result.*.digits[0] = 49
+    result.*.exponent += 1
+    result.*.carried = true
+}
+
+fn emitExponent(sink: *Sink, upper: bool, exponent: i64) -> void {
+    put(sink, if upper { 69 } else { 101 })
+    put(sink, if exponent < 0 { 45 } else { 43 })
+    var magnitude: u64 = @intCast(u64, if exponent < 0 { 0 - exponent } else { exponent })
+    var buffer: [32]u8 = undefined
+    var count = digitsOf(magnitude, 10, false, &buffer)
+    if count < 2 {
+        put(sink, 48)
+    }
+    var index = 32 - count
+    while index < 32 {
+        put(sink, buffer[index])
+        index += 1
+    }
+}
+
+fn emitFloat(sink: *Sink, spec: *const Spec, value: f64, scratch: *Scratch) -> void {
+    const conversion = spec.*.conversion
+    const upper = conversion == 70 || conversion == 69 || conversion == 71 || conversion == 65
+    const bits = @bitCast(u64, value)
+    const negative = bits >> 63 != 0
+    var sign: []const u8 = ""
+    if negative { sign = "-" } else if spec.*.plus { sign = "+" } else if spec.*.space { sign = " " }
+    const magnitude = @bitCast(f64, bits & 9223372036854775807)
+    const exponent_bits = (bits >> 52) & 2047
+    if exponent_bits == 2047 {
+        var word: []const u8 = "nan"
+        if bits & 4503599627370495 == 0 { word = if upper { "INF" } else { "inf" } } else if upper { word = "NAN" }
+        emitField(sink, spec, sign, "", 0, word, false)
+        return
+    }
+    var precision: usize = if spec.*.hasPrecision { spec.*.precision } else { 6 }
+    if conversion == 97 || conversion == 65 {
+        emitHexFloat(sink, spec, sign, magnitude, upper)
+        return
+    }
+    var style = conversion
+    var strip = false
+    const scientific = @ptrCast(*Scientific, &scratch.*.scientific)
+    const digits = @ptrCast(*Digits, &scratch.*.digits)
+    if conversion == 103 || conversion == 71 {
+        if precision == 0 { precision = 1 }
+        scientificDigits(magnitude, precision - 1, scratch)
+        const exponent = scientific.*.exponent
+        if exponent < -4 || exponent >= @intCast(i64, precision) {
+            style = if upper { 69 } else { 101 }
+            // glibc prints the style-e form a rounding carry forced (999999.5
+            // with %#g) as "1.e+06": the fixed form's zero decimals kept.
+            if scientific.*.carried && exponent == @intCast(i64, precision) {
+                precision = 0
+                scientific.*.count = 1
+            } else {
+                precision -= 1
+            }
+        } else {
+            style = 102
+            const decimals: i64 = @intCast(i64, precision) - 1 - exponent
+            precision = @intCast(usize, decimals)
+        }
+        strip = !spec.*.alternate
+    }
+    var text: [*]u8 = undefined
+    unsafe { text = @ptrCast([*]u8, &scratch.*.text) }
+    var length: usize = 0
+    if style == 102 || style == 70 {
+        if precision > 399 { precision = 399 }
+        fixedDigits(magnitude, precision, scratch)
+        var index: usize = 0
+        while index < digits.*.integerCount {
+            text[length] = digits.*.integer[index]
+            length += 1
+            index += 1
+        }
+        var fraction_count = digits.*.fractionCount
+        if strip { while fraction_count > 0 && digits.*.fraction[fraction_count - 1] == 48 { fraction_count -= 1 } }
+        if fraction_count > 0 || spec.*.alternate {
+            text[length] = 46
+            length += 1
+        }
+        index = 0
+        while index < fraction_count {
+            text[length] = digits.*.fraction[index]
+            length += 1
+            index += 1
+        }
+    } else {
+        if precision > 399 { precision = 399 }
+        if conversion != 103 && conversion != 71 { scientificDigits(magnitude, precision, scratch) }
+        text[0] = scientific.*.digits[0]
+        length = 1
+        var count = scientific.*.count
+        if strip { while count > 1 && scientific.*.digits[count - 1] == 48 { count -= 1 } }
+        if count > 1 || spec.*.alternate {
+            text[length] = 46
+            length += 1
+        }
+        var index: usize = 1
+        while index < count {
+            text[length] = scientific.*.digits[index]
+            length += 1
+            index += 1
+        }
+        // The exponent goes through the same field, so it is appended here.
+        text[length] = if upper { 69 } else { 101 }
+        length += 1
+        text[length] = if scientific.*.exponent < 0 { 45 } else { 43 }
+        length += 1
+        var exponent_magnitude: u64 = @intCast(u64, if scientific.*.exponent < 0 { 0 - scientific.*.exponent } else { scientific.*.exponent })
+        var buffer: [32]u8 = undefined
+        const exponent_digits = digitsOf(exponent_magnitude, 10, false, &buffer)
+        if exponent_digits < 2 {
+            text[length] = 48
+            length += 1
+        }
+        index = 32 - exponent_digits
+        while index < 32 {
+            text[length] = buffer[index]
+            length += 1
+            index += 1
+        }
+    }
+    var bytes: [*]const u8 = undefined
+    unsafe { bytes = @ptrCast([*]const u8, text) }
+    emitField(sink, spec, sign, "", 0, bytes[0..length], spec.*.zero && !spec.*.left)
+}
+
+// %a: 0xh.hhhp+d, the shortest exact digits (or `precision` of them).
+fn emitHexFloat(sink: *Sink, spec: *const Spec, sign: []const u8, magnitude: f64, upper: bool) -> void {
+    const bits = @bitCast(u64, magnitude)
+    const exponent_bits = (bits >> 52) & 2047
+    var fraction = bits & 4503599627370495
+    var leading: u8 = 49
+    var exponent: i64 = @intCast(i64, exponent_bits) - 1023
+    if exponent_bits == 0 {
+        leading = 48
+        exponent = if fraction == 0 { 0 } else { -1022 }
+    }
+    var text: [64]u8 = undefined
+    var length: usize = 0
+    text[0] = 48
+    text[1] = if upper { 88 } else { 120 }
+    text[2] = leading
+    length = 3
+    var hex: [13]u8 = undefined
+    var index: usize = 0
+    while index < 13 {
+        const digit = @intCast(u8, (fraction >> @intCast(u6, 48 - index * 4)) & 15)
+        hex[index] = if digit < 10 { 48 + digit } else { (if upper { 55 } else { 87 }) + digit }
+        index += 1
+    }
+    var count: usize = 13
+    if spec.*.hasPrecision {
+        if spec.*.precision < 13 {
+            // Round the kept digits to nearest, ties to even.
+            const keep = spec.*.precision
+            const shift = @intCast(u6, (13 - keep) * 4)
+            var kept = fraction >> shift
+            const dropped = fraction & ((@intCast(u64, 1) << shift) - 1)
+            const half = @intCast(u64, 1) << @intCast(u6, @intCast(usize, shift) - 1)
+            // With no digit kept the leading digit decides a tie (1.8 -> 2).
+            const last_odd = if keep == 0 { leading & 1 == 1 } else { kept & 1 == 1 }
+            if dropped > half || (dropped == half && last_odd) { kept += 1 }
+            if keep > 0 && kept >> @intCast(u6, keep * 4) != 0 {
+                kept &= (@intCast(u64, 1) << @intCast(u6, keep * 4)) - 1
+                text[2] = leading + 1
+            } else if keep == 0 && kept != 0 {
+                text[2] = leading + 1
+            }
+            index = 0
+            while index < keep {
+                const digit = @intCast(u8, (kept >> @intCast(u6, (keep - 1 - index) * 4)) & 15)
+                hex[index] = if digit < 10 { 48 + digit } else { (if upper { 55 } else { 87 }) + digit }
+                index += 1
+            }
+            count = keep
+        }
+    } else {
+        while count > 0 && hex[count - 1] == 48 { count -= 1 }
+    }
+    if count > 0 || spec.*.alternate {
+        text[length] = 46
+        length += 1
+    }
+    index = 0
+    while index < count {
+        text[length] = hex[index]
+        length += 1
+        index += 1
+    }
+    text[length] = if upper { 80 } else { 112 }
+    length += 1
+    text[length] = if exponent < 0 { 45 } else { 43 }
+    length += 1
+    var buffer: [32]u8 = undefined
+    const exponent_digits = digitsOf(@intCast(u64, if exponent < 0 { 0 - exponent } else { exponent }), 10, false, &buffer)
+    index = 32 - exponent_digits
+    while index < 32 {
+        text[length] = buffer[index]
+        length += 1
+        index += 1
+    }
+    var bytes: [*]const u8 = undefined
+    unsafe { bytes = @ptrCast([*]const u8, &text) }
+    // The zero padding goes after "0x".
+    if spec.*.zero && !spec.*.left && spec.*.width > sign.length + length {
+        putAll(sink, sign)
+        putAll(sink, bytes[0..2])
+        putRepeated(sink, 48, spec.*.width - sign.length - length)
+        putAll(sink, bytes[2..length])
+        return
+    }
+    emitField(sink, spec, sign, "", 0, bytes[0..length], false)
+}
+
+fn encodeUtf8(sink: *Sink, code: u32) -> void {
+    if code < 128 {
+        put(sink, @intCast(u8, code))
+    } else if code < 2048 {
+        put(sink, @intCast(u8, 192 | (code >> 6)))
+        put(sink, @intCast(u8, 128 | (code & 63)))
+    } else if code < 65536 {
+        put(sink, @intCast(u8, 224 | (code >> 12)))
+        put(sink, @intCast(u8, 128 | ((code >> 6) & 63)))
+        put(sink, @intCast(u8, 128 | (code & 63)))
+    } else {
+        put(sink, @intCast(u8, 240 | (code >> 18)))
+        put(sink, @intCast(u8, 128 | ((code >> 12) & 63)))
+        put(sink, @intCast(u8, 128 | ((code >> 6) & 63)))
+        put(sink, @intCast(u8, 128 | (code & 63)))
+    }
+}
+
+fn utf8Length(code: u32) -> usize {
+    if code < 128 { return 1 }
+    if code < 2048 { return 2 }
+    if code < 65536 { return 3 }
+    return 4
+}
+
+// The engine. Returns the count of bytes the output has (also kept in the
+// sink); the caller flushes the sink.
+pub fn format(sink: *Sink, pattern: usize, source: *Source) -> void {
+    const text = sys.constBytes(pattern)
+    var scratch: Scratch = undefined
+    var at: usize = 0
+    while text[at] != 0 {
+        const byte = text[at]
+        at += 1
+        if byte != 37 {
+            put(sink, byte)
+            continue
+        }
+        if text[at] == 37 {
+            put(sink, 37)
+            at += 1
+            continue
+        }
+        var spec = Spec.{ .left = false, .plus = false, .space = false, .alternate = false, .zero = false, .width = 0, .precision = 0, .hasPrecision = false, .size = 4, .conversion = 0 }
+        while true {
+            const flag = text[at]
+            if flag == 45 { spec.left = true } else if flag == 43 { spec.plus = true } else if flag == 32 { spec.space = true } else if flag == 35 { spec.alternate = true } else if flag == 48 { spec.zero = true } else if flag == 39 {} else { break }
+            at += 1
+        }
+        if text[at] == 42 {
+            // The int argument, read as its low 32 bits so a negative width
+            // is recognised without relying on a narrowing cast.
+            const width = nextInteger(source) & 4294967295
+            if width >= 2147483648 {
+                spec.left = true
+                spec.width = @intCast(usize, 4294967296 - width)
+            } else {
+                spec.width = @intCast(usize, width)
+            }
+            at += 1
+        } else {
+            while isDigit(text[at]) {
+                spec.width = spec.width * 10 + @intCast(usize, text[at] - 48)
+                at += 1
+            }
+        }
+        if text[at] == 46 {
+            at += 1
+            spec.hasPrecision = true
+            if text[at] == 42 {
+                const precision = nextInteger(source) & 4294967295
+                if precision >= 2147483648 { spec.hasPrecision = false } else { spec.precision = @intCast(usize, precision) }
+                at += 1
+            } else {
+                while isDigit(text[at]) {
+                    spec.precision = spec.precision * 10 + @intCast(usize, text[at] - 48)
+                    at += 1
+                }
+            }
+        }
+        var wide = false
+        while true {
+            const modifier = text[at]
+            if modifier == 104 {
+                spec.size = if spec.size == 2 { 1 } else { 2 }
+            } else if modifier == 108 {
+                spec.size = 8
+                wide = true
+            } else if modifier == 122 || modifier == 106 || modifier == 116 || modifier == 76 || modifier == 113 {
+                spec.size = 8
+            } else {
+                break
+            }
+            at += 1
+        }
+        if text[at] == 0 { break }
+        spec.conversion = text[at]
+        at += 1
+        const conversion = spec.conversion
+        if conversion == 100 || conversion == 105 || conversion == 117 || conversion == 120 || conversion == 88 || conversion == 111 {
+            emitInteger(sink, &spec, nextInteger(source))
+        } else if conversion == 99 {
+            const value = nextInteger(source)
+            if wide {
+                const code = @intCast(u32, value & 4294967295)
+                var holder = Spec.{ .left = spec.left, .plus = false, .space = false, .alternate = false, .zero = false, .width = spec.width, .precision = 0, .hasPrecision = false, .size = 8, .conversion = 99 }
+                const content = utf8Length(code)
+                const padding = if spec.width > content { spec.width - content } else { 0 }
+                if !spec.left { putRepeated(sink, 32, padding) }
+                encodeUtf8(sink, code)
+                if spec.left { putRepeated(sink, 32, padding) }
+            } else {
+                var one: [1]u8 = [1]u8{ @intCast(u8, value & 255) }
+                var bytes: [*]const u8 = undefined
+                unsafe { bytes = @ptrCast([*]const u8, &one) }
+                emitField(sink, &spec, "", "", 0, bytes[0..1], false)
+            }
+        } else if conversion == 115 {
+            const address = @intCast(usize, nextInteger(source))
+            if wide && address != 0 {
+                // A wchar_t string: code points to UTF-8, at most `precision` bytes.
+                var count: usize = 0
+                var index: usize = 0
+                while sys.get32(address + index * 4) != 0 {
+                    const code_length = utf8Length(sys.get32(address + index * 4))
+                    if spec.hasPrecision && count + code_length > spec.precision { break }
+                    count += code_length
+                    index += 1
+                }
+                const padding = if spec.width > count { spec.width - count } else { 0 }
+                if !spec.left { putRepeated(sink, 32, padding) }
+                var emit: usize = 0
+                while emit < index {
+                    encodeUtf8(sink, sys.get32(address + emit * 4))
+                    emit += 1
+                }
+                if spec.left { putRepeated(sink, 32, padding) }
+            } else {
+                var value: []const u8 = "(null)"
+                if address != 0 {
+                    const data = sys.constBytes(address)
+                    var length: usize = 0
+                    while data[length] != 0 && (!spec.hasPrecision || length < spec.precision) { length += 1 }
+                    value = data[0..length]
+                } else if spec.hasPrecision && spec.precision < 6 {
+                    value = ""
+                }
+                emitField(sink, &spec, "", "", 0, value, false)
+            }
+        } else if conversion == 112 {
+            const address = nextInteger(source)
+            if address == 0 {
+                emitField(sink, &spec, "", "", 0, "(nil)", false)
+            } else {
+                var pointer_spec = spec
+                pointer_spec.conversion = 120
+                pointer_spec.alternate = true
+                pointer_spec.size = 8
+                emitInteger(sink, &pointer_spec, address)
+            }
+        } else if conversion == 102 || conversion == 70 || conversion == 101 || conversion == 69 || conversion == 103 || conversion == 71 || conversion == 97 || conversion == 65 {
+            emitFloat(sink, &spec, nextDouble(source), &scratch)
+        } else if conversion == 110 {
+            const target = @intCast(usize, nextInteger(source))
+            if target != 0 {
+                if spec.size == 8 { sys.put64(target, @intCast(u64, sink.*.written)) } else if spec.size == 2 { sys.put16(target, @intCast(u16, sink.*.written & 65535)) } else if spec.size == 1 { sys.put8(target, @intCast(u8, sink.*.written & 255)) } else { sys.put32(target, @intCast(u32, sink.*.written & 4294967295)) }
+            }
+        } else if conversion == 109 {
+            emitField(sink, &spec, "", "", 0, string.message(errno.get()), false)
+        } else {
+            // An unknown conversion is printed as it stands.
+            put(sink, 37)
+            put(sink, conversion)
+        }
+    }
+}
