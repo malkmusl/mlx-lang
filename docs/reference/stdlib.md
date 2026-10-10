@@ -139,7 +139,11 @@ and Alt. Without a compositor the same screen and drawing run on the
 Linux framebuffer (`projects/console`, mlx-console): `std.ui.text`'s
 `loadFontFile()` takes a font by path, and `std.ui.wayland.keyboard`
 reads keys from evdev with a keymap of the program's own through
-`useKeymap()` and `press()`.
+`useKeymap()` and `press()`. The emulation is checked by
+`tests/301_terminal_core_runtime.mlx`, the drawing and the pty by
+`tests/support/terminal_render.mlx` and `tests/support/terminal_pty.mlx`
+(`tools/check_terminal.sh`), the console's picture against
+`tests/support/console_expected.mlx` (`tools/check_console.sh`).
 
 `std.crash` (`std/src/crash.mlx`) is a program's crash report: `install()`
 sets a signal handler on a stack of its own that names the signal, the
