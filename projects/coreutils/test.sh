@@ -1568,4 +1568,11 @@ diff <("$bin_dir/pr" -l 20 -F "$work_dir/prtest" | normalize_pr_date) <(/usr/bin
 printf '1\n2\n3\n' > "$work_dir/pr3"
 diff <("$bin_dir/pr" -l 15 "$work_dir/pr3" | normalize_pr_date) <(/usr/bin/pr -l 15 "$work_dir/pr3" | normalize_pr_date) > /dev/null || fail 'pr short-input padding output differs'
 
+# Every utility installs std.crash first thing in main: a crash says the
+# function, the line and the callers on stderr and is kept in crashes.log.
+for program in "$bin_dir"/*; do
+    [[ -x "$program" ]] || continue
+    grep -q -a 'mlxCompositorCrashed' "$program" || fail "$(basename "$program") does not carry the crash handler (std.crash)"
+done
+
 printf 'all coreutils smoke tests passed\n'

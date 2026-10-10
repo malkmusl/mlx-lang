@@ -9,6 +9,13 @@ POSIX-ish word splitting, and calendar/timestamp parsing were generalized out
 of these examples into `std.path`, `std.mode`, `std.parse`, `std.shell`, and
 `std.calendar` respectively, so other MLX programs can reuse them too.
 
+Every utility calls `std.crash.install()` first thing in `main`, as the
+desktop programs do: a crash (a failed runtime check, a bad pointer, a stack
+overflow) says the signal, the function with its line and the callers on
+stderr, exits with 128 plus the signal, and is kept in
+`$XDG_STATE_HOME/mlx/crashes.log`, where MLX Observatory flags the function.
+`test.sh` checks that every built utility carries the handler.
+
 Initial utilities:
 
 - `true`, `false`: minimal process/exit-status programs

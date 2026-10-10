@@ -124,7 +124,9 @@ sets a signal handler on a stack of its own that names the signal, the
 function and its callers (from the symbol table the compiler writes, see
 [formats](formats.md)) and keeps the crash in
 `$XDG_STATE_HOME/mlx/crashes.log`; `fail(reason)` ends the program the same
-way for a failure it cannot go on after. `std.wayland.crash.watch(display)`
+way for a failure it cannot go on after. The report goes to stderr. Every
+desktop program, every coreutil and mlxlibc (for the programs its loader
+starts) install it. `std.wayland.crash.watch(display)`
 (`std/src/wayland/crash.mlx`) makes a Wayland client's failed connection
 such a failure (`tools/check_crash_report.sh` holds every client to it).
 

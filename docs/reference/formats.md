@@ -106,7 +106,7 @@ Imports are unversioned undefined symbols, bound immediately (`DF_BIND_NOW`,
 line. Exports are global `STT_FUNC` symbols in `.text`. A program without
 imports is still the static executable described above, exports or not:
 its exports are C-ABI functions only (signal handlers, which the kernel
-calls; `std.crash` installs one in every desktop program), so nothing
+calls; `std.crash` installs one in every desktop program and coreutil), so nothing
 there needs glibc. `tests/run_foreign.sh` checks that, and runs
 `tests/247_foreign_c_runtime.mlx`.
 
@@ -124,8 +124,8 @@ adds three sections to it:
   entry the code offset from `.text`, the file and the line (u32 each,
   lines from 1), then the files' paths, each ended by a NUL.
 
-The crash handler of the desktop programs
-(`std/src/crash.mlx`) reads both from `/proc/self/exe`
+The crash handler of the desktop programs, the coreutils and mlxlibc
+(`std/src/crash.mlx`) reads both from the file each address is in
 and writes each frame as `path:line:name+0xOFFSET at path:line`;
 `tools/check_crash_report.sh` crashes `tests/support/crash_report.mlx`
 three ways and checks the lines it names. The sampling profiler

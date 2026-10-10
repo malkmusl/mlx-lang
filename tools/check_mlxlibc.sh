@@ -111,6 +111,38 @@ env -i TZ=UTC LC_ALL=C MLXLIBC_CHECK=present "$work/check_interp" "$work/interp"
 [[ $status -eq 0 ]] || fail "the program with libmlxc as PT_INTERP exited $status: $(tail -3 "$work/interp.err")"
 cmp -s "$work/reference.out" "$work/interp.out" || fail "as PT_INTERP, stdout differs: $(diff "$work/reference.out" "$work/interp.out" | head -12)"
 echo "ok   PT_INTERP: the program linked with libmlxc.so.1 as its interpreter runs on its own"
+# A crash of a program under the loader is reported by std.crash's handler,
+# which the loader installs: the signal, the function (from the program's
+# symbol table) and its callers on stderr, 128 plus the signal as the exit
+# status, and a line in crashes.log naming the program.
+cat > "$work/crash.c" <<'EOF'
+#include <stdlib.h>
+#include <string.h>
+static void store(long *at) { *at = 1; }
+int main(int argc, char **argv) {
+    if (argc > 1 && strcmp(argv[1], "abort") == 0) abort();
+    store((long *)8);
+    return 0;
+}
+EOF
+gcc -O0 -fno-omit-frame-pointer "$work/crash.c" -o "$work/crash"
+crash_under_loader() {
+    set +e
+    env -i XDG_STATE_HOME="$work/state" "$lib" "$work/crash" "$1" > "$work/crash.out" 2> "$work/crash.err"
+    status=$?
+    set -e
+    [[ $status -eq $2 ]] || fail "the crashing program ($1) under the loader exited $status, not $2: $(head -3 "$work/crash.err")"
+    [[ ! -s "$work/crash.out" ]] || fail "the crash report ($1) went to stdout"
+}
+crash_under_loader null 139
+grep -q '^crash: crashed: segmentation fault touching 0x8$' "$work/crash.err" || fail "the bad store is not reported: $(head -3 "$work/crash.err")"
+grep -q '^  at store+0x[0-9a-f]*$' "$work/crash.err" || fail "the fault is not placed in store: $(head -4 "$work/crash.err")"
+grep -q '^  from main+0x[0-9a-f]*$' "$work/crash.err" || fail "main is not among the callers: $(head -4 "$work/crash.err")"
+crash_under_loader abort 134
+grep -q '^crash: crashed: aborted' "$work/crash.err" || fail "abort() is not reported: $(head -3 "$work/crash.err")"
+[[ $(wc -l < "$work/state/mlx/crashes.log") -eq 2 ]] || fail "crashes.log does not hold the two crashes"
+awk -F'\t' '$1 != "crash" || $3 != "crash" { bad = 1 } END { exit bad }' "$work/state/mlx/crashes.log" || fail "crashes.log does not name the program: $(cat "$work/state/mlx/crashes.log")"
+echo "ok   crash report: a program crashing under the loader says the function and the callers, and the crash is kept"
 # The system's own programs (glibc-linked) under the loader.
 ran=()
 if [[ -x /bin/echo ]]; then

@@ -133,8 +133,10 @@ glibc, the two programs print the same 121 lines; the glibc-linked one run
 under `libmlxc.so.1` as loader (no glibc in the process) prints the same
 130 lines as under glibc, the dlfcn section on an Mlx plugin and the
 program's `__thread` variables included; linked with libmlxc as its
-`PT_INTERP` it runs on its own; and the system's echo, env, cat and sh run
-under the loader.
+`PT_INTERP` it runs on its own; the system's echo, env, cat and sh run
+under the loader; and a C program crashing under it (a store through
+address 8, `abort()`) is reported with its functions and kept in
+`crashes.log`.
 
 ## What a program on mlxlibc gets, and does not yet
 
@@ -144,6 +146,16 @@ under the loader.
   compared: a name is bound to the first object defining it in load order,
   as musl does; a program asking for something not here stops with
   "symbol lookup error: undefined symbol".
+- The loader installs `std.crash`'s handler before the program's
+  constructors run (`__libc_start_main` installs it when another loader
+  started the process): a crash in the program, its libraries or this
+  library says the signal, the function from the file's symbol table and
+  the callers on stderr, exits with 128 plus the signal and is kept in
+  `$XDG_STATE_HOME/mlx/crashes.log`, as the desktop programs' and the
+  coreutils' crashes are. A handler the program sets with `sigaction`
+  replaces it; a process glibc started (ctypes) gets none. Run as
+  `libmlxc.so.1 PROGRAM`, the process is named after PROGRAM
+  (`prctl(PR_SET_NAME)`), so the report and `ps` say its name.
 - Next to glibc (a program linked with `-lmlxc`, or ctypes), glibc's
   `ld.so` starts the process and owns `dlopen`; a `main` that returns goes
   through glibc's `exit`, which knows nothing of mlxlibc's `atexit`
