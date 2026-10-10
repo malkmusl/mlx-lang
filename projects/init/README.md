@@ -18,7 +18,8 @@ tools/check_init.sh                      # the end-to-end check
 As the system's init: install it as `/sbin/init` (or boot with
 `init=/usr/bin/mlx-init`), the services into `/etc/mlx/init/services/`,
 the mounts into `/etc/mlx/init/mounts`; `examples/` holds a start
-(the MLXIPC system bus, a shell on the console, a oneshot).
+(the MLXIPC system bus, the Mlx console with mlx-sh on the framebuffer, a
+oneshot).
 
 ## What happens at boot
 
