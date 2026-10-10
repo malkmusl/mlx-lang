@@ -1,0 +1,1624 @@
+// std.terminal: a terminal emulator's screen, for any front end. The bytes
+// a program writes (through std.terminal.pty) go in with feed(); the cells
+// (a character with its colours and attributes) come out for drawing
+// (std.ui.terminal draws them on a std.ui canvas); what the program is
+// owed in return (cursor position reports, device attributes) waits in
+// takeResponses(). Keys become the bytes a program expects through
+// std.terminal.keys.
+//
+//     var screen: terminal.Screen = undefined
+//     if !terminal.init(&screen, allocator, 80, 24, 1000) { ... }
+//     terminal.feed(&screen, bytes)
+//     const cell = terminal.visibleCell(&screen, row, column)
+//     var reply: [64]u8 = undefined
+//     const owed = terminal.takeResponses(&screen, &reply, 64)   // to the pty
+//
+// Understood: UTF-8 (wide characters take two cells), the C0 controls,
+// ECMA-48 cursor movement, erasing, inserting and deleting (characters and
+// lines), scrolling regions, SGR with the 16 colours, the 256-colour table
+// and direct colours, bold, dim, italic, underline, blink, inverse, hidden
+// and strike-through, the DEC modes for application cursor keys, autowrap,
+// origin, the cursor's visibility, the alternate screen (47, 1047, 1049),
+// bracketed paste and the mouse (kept in mouseMode for the front end),
+// insert and newline modes, saving and restoring the cursor, tab stops,
+// the DEC special graphics (line drawing) set, the window title (OSC 0 and
+// 2), and the reports a program asks for (DSR, DA). TERM=xterm-256color
+// programs are at home. Lines scrolled off the main screen go into the
+// history, which a front end shows by scrolling the view (scrollView).
+const std = @import("std")
+
+pub const Allocator = std.allocator.Allocator
+
+pub const MAX_PARAMETERS: usize = 16
+pub const OSC_CAPACITY: usize = 512
+pub const TITLE_CAPACITY: usize = 256
+pub const RESPONSE_CAPACITY: usize = 256
+pub const MAX_COLUMNS: usize = 1024
+pub const MAX_ROWS: usize = 512
+
+// A cell's attribute flags.
+pub const BOLD: u16 = 1
+pub const DIM: u16 = 2
+pub const ITALIC: u16 = 4
+pub const UNDERLINE: u16 = 8
+pub const BLINK: u16 = 16
+pub const INVERSE: u16 = 32
+pub const STRIKE: u16 = 64
+pub const HIDDEN: u16 = 128
+
+// A colour is ARGB with alpha 255; 0 is the default (the front end's
+// foreground or background).
+pub const DEFAULT: u32 = 0
+const DEFAULT_INDEX: u16 = 256
+const DIRECT_INDEX: u16 = 257
+
+pub const Cell = struct {
+    codepoint: u32
+    foreground: u32
+    background: u32
+    flags: u16
+    // 1, or 2 for a wide character; 0 for the cell a wide character's
+    // right half takes (nothing to draw there).
+    width: u8
+    reserved: u8
+}
+
+// The parser's states.
+const GROUND: u8 = 0
+const ESCAPE: u8 = 1
+const ESCAPE_CHARSET: u8 = 2
+const ESCAPE_HASH: u8 = 3
+const CSI: u8 = 4
+const CSI_IGNORE: u8 = 5
+const OSC: u8 = 6
+const OSC_ESCAPE: u8 = 7
+const STRING: u8 = 8
+const STRING_ESCAPE: u8 = 9
+
+pub const Screen = struct {
+    allocator: Allocator
+    columns: usize
+    rows: usize
+    // The main grid and the alternate one, columns x rows cells each;
+    // `capacity` cells are allocated for either.
+    main: [*]Cell
+    alternate: [*]Cell
+    capacity: usize
+    onAlternate: bool
+    // The history: lines scrolled off the main screen, a ring of
+    // `historyLines` lines of `columns` cells, `historyCount` of them
+    // used, the oldest at `historyStart`.
+    history: [*]Cell
+    historyLines: usize
+    historyCount: usize
+    historyStart: usize
+    historyCapacity: usize
+    // Lines of history shown above the live screen (0: the live screen).
+    viewOffset: usize
+    cursorRow: usize
+    cursorColumn: usize
+    // The cursor sits past the last column: the next character wraps.
+    pendingWrap: bool
+    scrollTop: usize
+    scrollBottom: usize
+    // What print() writes, and the foreground's palette index (for bold).
+    foreground: u32
+    background: u32
+    flags: u16
+    foregroundIndex: u16
+    // DECSC / DECRC.
+    savedRow: usize
+    savedColumn: usize
+    savedForeground: u32
+    savedBackground: u32
+    savedFlags: u16
+    savedForegroundIndex: u16
+    savedCharsetIndex: u8
+    savedCharsets: [2]u8
+    savedPendingWrap: bool
+    // The modes.
+    autowrap: bool
+    originMode: bool
+    cursorVisible: bool
+    applicationCursor: bool
+    applicationKeypad: bool
+    insertMode: bool
+    newlineMode: bool
+    bracketedPaste: bool
+    reverseVideo: bool
+    focusEvents: bool
+    // Mouse reporting the program asked for: 0 none, else 9, 1000, 1002 or
+    // 1003; and its encoding, 0 (X10 bytes) or 1006 (SGR).
+    mouseMode: u32
+    mouseEncoding: u32
+    // DECSCUSR: 0 or 1 blinking block, 2 block, 3 blinking underline, 4
+    // underline, 5 blinking bar, 6 bar.
+    cursorStyle: u8
+    // G0 and G1 ('B' ASCII, '0' DEC special graphics) and which is in use.
+    charsets: [2]u8
+    charsetIndex: u8
+    // Tab stops, one bit per column.
+    tabs: [MAX_COLUMNS / 8]u8
+    // The parser.
+    state: u8
+    parameters: [MAX_PARAMETERS]usize
+    parameterCount: usize
+    privateMarker: u8
+    intermediate: u8
+    oscBuffer: [OSC_CAPACITY]u8
+    oscLength: usize
+    // UTF-8: the code point so far and the bytes still to come.
+    utf8Pending: u32
+    utf8Remaining: u8
+    // What REP repeats.
+    lastPrinted: u32
+    // For the front end.
+    title: [TITLE_CAPACITY]u8
+    titleLength: usize
+    titleChanged: bool
+    responses: [RESPONSE_CAPACITY]u8
+    responseLength: usize
+    bell: bool
+    dirty: bool
+}
+
+// ---------------------------------------------------------------------------
+// Colours
+
+// The 16 colours as xterm has them.
+fn ansiColor(index: usize) -> u32 {
+    if index == 0 { return 4278190080 }
+    if index == 1 { return 4291624960 }
+    if index == 2 { return 4278242560 }
+    if index == 3 { return 4291677440 }
+    if index == 4 { return 4278190318 }
+    if index == 5 { return 4291625165 }
+    if index == 6 { return 4278242765 }
+    if index == 7 { return 4293256677 }
+    if index == 8 { return 4286545791 }
+    if index == 9 { return 4294901760 }
+    if index == 10 { return 4278255360 }
+    if index == 11 { return 4294967040 }
+    if index == 12 { return 4284243199 }
+    if index == 13 { return 4294902015 }
+    if index == 14 { return 4278255615 }
+    return 4294967295
+}
+
+fn rgb(red: usize, green: usize, blue: usize) -> u32 {
+    return 4278190080 | (@intCast(u32, red & 255) << 16) | (@intCast(u32, green & 255) << 8) | @intCast(u32, blue & 255)
+}
+
+// The colour of a 256-colour index: the 16 colours, the 6x6x6 cube, the
+// greys.
+pub fn paletteColor(index: usize) -> u32 {
+    if index < 16 { return ansiColor(index) }
+    if index < 232 {
+        const value = index - 16
+        const red = value / 36
+        const green = (value / 6) % 6
+        const blue = value % 6
+        return rgb(if red == 0 { 0 } else { 55 + 40 * red }, if green == 0 { 0 } else { 55 + 40 * green }, if blue == 0 { 0 } else { 55 + 40 * blue })
+    }
+    if index < 256 {
+        const grey = 8 + 10 * (index - 232)
+        return rgb(grey, grey, grey)
+    }
+    return DEFAULT
+}
+
+// ---------------------------------------------------------------------------
+// Cells
+
+fn cellAt(cells: [*]Cell, index: usize) -> *Cell {
+    var pointer: *Cell = undefined
+    unsafe { pointer = @ptrFromInt(*Cell, @intFromPtr(cells) + index * @sizeOf(Cell)) }
+    return pointer
+}
+
+fn setCell(cell: *Cell, codepoint: u32, foreground: u32, background: u32, flags: u16, width: u8) -> void {
+    cell.*.codepoint = codepoint
+    cell.*.foreground = foreground
+    cell.*.background = background
+    cell.*.flags = flags
+    cell.*.width = width
+    cell.*.reserved = 0
+}
+
+fn copyCell(into: *Cell, from: *Cell) -> void {
+    into.*.codepoint = from.*.codepoint
+    into.*.foreground = from.*.foreground
+    into.*.background = from.*.background
+    into.*.flags = from.*.flags
+    into.*.width = from.*.width
+    into.*.reserved = 0
+}
+
+// A blank cell: a space in the current background (erasing keeps it, as
+// xterm does).
+fn blankCell(screen: *Screen, cell: *Cell) -> void {
+    setCell(cell, 32, DEFAULT, screen.*.background, 0, 1)
+}
+
+fn clearCells(screen: *Screen, cells: [*]Cell, from: usize, count: usize) -> void {
+    var index: usize = 0
+    while index < count {
+        blankCell(screen, cellAt(cells, from + index))
+        index += 1
+    }
+}
+
+// Copies `count` cells (the ranges may overlap).
+fn moveCells(cells: [*]Cell, into: usize, from: usize, count: usize) -> void {
+    if into == from || count == 0 { return }
+    if into < from {
+        var index: usize = 0
+        while index < count {
+            copyCell(cellAt(cells, into + index), cellAt(cells, from + index))
+            index += 1
+        }
+    } else {
+        var index = count
+        while index > 0 {
+            index -= 1
+            copyCell(cellAt(cells, into + index), cellAt(cells, from + index))
+        }
+    }
+}
+
+fn grid(screen: *Screen) -> [*]Cell {
+    return if screen.*.onAlternate { screen.*.alternate } else { screen.*.main }
+}
+
+fn allocateCells(allocator: Allocator, count: usize) -> ?[*]Cell {
+    const memory = allocator.alloc(count * @sizeOf(Cell), 16)
+    if memory == null { return null }
+    var cells: [*]Cell = undefined
+    unsafe { cells = @ptrCast([*]Cell, memory.?) }
+    return cells
+}
+
+fn freeCells(allocator: Allocator, cells: [*]Cell, count: usize) -> void {
+    var bytes: [*]u8 = undefined
+    unsafe { bytes = @ptrCast([*]u8, cells) }
+    allocator.free(bytes, count * @sizeOf(Cell), 16)
+}
+
+// ---------------------------------------------------------------------------
+// Set-up
+
+fn resetAttributes(screen: *Screen) -> void {
+    screen.*.foreground = DEFAULT
+    screen.*.background = DEFAULT
+    screen.*.flags = 0
+    screen.*.foregroundIndex = DEFAULT_INDEX
+}
+
+fn resetTabs(screen: *Screen) -> void {
+    var index: usize = 0
+    while index < MAX_COLUMNS / 8 {
+        screen.*.tabs[index] = 0
+        index += 1
+    }
+    var column: usize = 8
+    while column < MAX_COLUMNS {
+        setTab(screen, column)
+        column += 8
+    }
+}
+
+fn resetModes(screen: *Screen) -> void {
+    screen.*.autowrap = true
+    screen.*.originMode = false
+    screen.*.cursorVisible = true
+    screen.*.applicationCursor = false
+    screen.*.applicationKeypad = false
+    screen.*.insertMode = false
+    screen.*.newlineMode = false
+    screen.*.bracketedPaste = false
+    screen.*.reverseVideo = false
+    screen.*.focusEvents = false
+    screen.*.mouseMode = 0
+    screen.*.mouseEncoding = 0
+    screen.*.cursorStyle = 0
+    screen.*.charsets[0] = 66
+    screen.*.charsets[1] = 66
+    screen.*.charsetIndex = 0
+}
+
+// Everything but the size and the history back to the start (RIS).
+pub fn reset(screen: *Screen) -> void {
+    resetAttributes(screen)
+    resetModes(screen)
+    resetTabs(screen)
+    screen.*.onAlternate = false
+    screen.*.cursorRow = 0
+    screen.*.cursorColumn = 0
+    screen.*.pendingWrap = false
+    screen.*.scrollTop = 0
+    screen.*.scrollBottom = screen.*.rows - 1
+    screen.*.savedRow = 0
+    screen.*.savedColumn = 0
+    screen.*.savedForeground = DEFAULT
+    screen.*.savedBackground = DEFAULT
+    screen.*.savedFlags = 0
+    screen.*.savedForegroundIndex = DEFAULT_INDEX
+    screen.*.savedCharsetIndex = 0
+    screen.*.savedCharsets[0] = 66
+    screen.*.savedCharsets[1] = 66
+    screen.*.savedPendingWrap = false
+    screen.*.state = GROUND
+    screen.*.parameterCount = 0
+    screen.*.privateMarker = 0
+    screen.*.intermediate = 0
+    screen.*.oscLength = 0
+    screen.*.utf8Pending = 0
+    screen.*.utf8Remaining = 0
+    screen.*.lastPrinted = 32
+    screen.*.viewOffset = 0
+    clearCells(screen, screen.*.main, 0, screen.*.columns * screen.*.rows)
+    clearCells(screen, screen.*.alternate, 0, screen.*.columns * screen.*.rows)
+    screen.*.dirty = true
+}
+
+// A screen of `columns` x `rows` cells with `history_lines` lines of
+// history; false without memory.
+pub fn init(screen: *Screen, allocator: Allocator, columns: usize, rows: usize, history_lines: usize) -> bool {
+    const width = if columns < 1 { 1 } else if columns > MAX_COLUMNS { MAX_COLUMNS } else { columns }
+    const height = if rows < 1 { 1 } else if rows > MAX_ROWS { MAX_ROWS } else { rows }
+    screen.*.allocator = allocator
+    screen.*.columns = width
+    screen.*.rows = height
+    screen.*.capacity = width * height
+    const main = allocateCells(allocator, screen.*.capacity)
+    const alternate = allocateCells(allocator, screen.*.capacity)
+    if main == null || alternate == null { return false }
+    screen.*.main = main.?
+    screen.*.alternate = alternate.?
+    screen.*.historyLines = history_lines
+    screen.*.historyCount = 0
+    screen.*.historyStart = 0
+    screen.*.historyCapacity = history_lines * width
+    if history_lines > 0 {
+        const history = allocateCells(allocator, screen.*.historyCapacity)
+        if history == null { return false }
+        screen.*.history = history.?
+    }
+    screen.*.titleLength = 0
+    screen.*.titleChanged = false
+    screen.*.responseLength = 0
+    screen.*.bell = false
+    reset(screen)
+    return true
+}
+
+pub fn deinit(screen: *Screen) -> void {
+    freeCells(screen.*.allocator, screen.*.main, screen.*.capacity)
+    freeCells(screen.*.allocator, screen.*.alternate, screen.*.capacity)
+    if screen.*.historyLines > 0 { freeCells(screen.*.allocator, screen.*.history, screen.*.historyCapacity) }
+}
+
+// ---------------------------------------------------------------------------
+// Tabs
+
+fn setTab(screen: *Screen, column: usize) -> void {
+    if column < MAX_COLUMNS { screen.*.tabs[column / 8] = screen.*.tabs[column / 8] | (@intCast(u8, 1) << @intCast(u8, column % 8)) }
+}
+
+fn clearTab(screen: *Screen, column: usize) -> void {
+    if column < MAX_COLUMNS { screen.*.tabs[column / 8] = screen.*.tabs[column / 8] & (255 ^ (@intCast(u8, 1) << @intCast(u8, column % 8))) }
+}
+
+fn isTab(screen: *Screen, column: usize) -> bool {
+    return column < MAX_COLUMNS && (screen.*.tabs[column / 8] >> @intCast(u8, column % 8)) & 1 != 0
+}
+
+fn nextTab(screen: *Screen) -> void {
+    var column = screen.*.cursorColumn + 1
+    while column < screen.*.columns - 1 && !isTab(screen, column) { column += 1 }
+    if column > screen.*.columns - 1 { column = screen.*.columns - 1 }
+    screen.*.cursorColumn = column
+    screen.*.pendingWrap = false
+}
+
+fn previousTab(screen: *Screen) -> void {
+    var column = screen.*.cursorColumn
+    while column > 0 {
+        column -= 1
+        if isTab(screen, column) { break }
+    }
+    screen.*.cursorColumn = column
+    screen.*.pendingWrap = false
+}
+
+// ---------------------------------------------------------------------------
+// The history and scrolling
+
+// Keeps row `row` of the main screen as the newest line of history.
+fn pushHistory(screen: *Screen, row: usize) -> void {
+    if screen.*.historyLines == 0 { return }
+    var slot: usize = 0
+    if screen.*.historyCount < screen.*.historyLines {
+        slot = (screen.*.historyStart + screen.*.historyCount) % screen.*.historyLines
+        screen.*.historyCount += 1
+    } else {
+        slot = screen.*.historyStart
+        screen.*.historyStart = (screen.*.historyStart + 1) % screen.*.historyLines
+    }
+    var column: usize = 0
+    while column < screen.*.columns {
+        copyCell(cellAt(screen.*.history, slot * screen.*.columns + column), cellAt(screen.*.main, row * screen.*.columns + column))
+        column += 1
+    }
+}
+
+// Scrolls the lines `top` to `bottom` up by `count`, blank lines coming in
+// at the bottom; lines leaving the top of the main screen go into the
+// history.
+fn scrollUp(screen: *Screen, top: usize, bottom: usize, count: usize) -> void {
+    if top > bottom || bottom >= screen.*.rows { return }
+    const lines = bottom - top + 1
+    const moved = if count > lines { lines } else { count }
+    const cells = grid(screen)
+    const columns = screen.*.columns
+    if top == 0 && !screen.*.onAlternate {
+        var index: usize = 0
+        while index < moved {
+            pushHistory(screen, index)
+            index += 1
+        }
+    }
+    moveCells(cells, top * columns, (top + moved) * columns, (lines - moved) * columns)
+    clearCells(screen, cells, (bottom + 1 - moved) * columns, moved * columns)
+    screen.*.dirty = true
+}
+
+// Scrolls the lines `top` to `bottom` down by `count`, blank lines coming
+// in at the top.
+fn scrollDown(screen: *Screen, top: usize, bottom: usize, count: usize) -> void {
+    if top > bottom || bottom >= screen.*.rows { return }
+    const lines = bottom - top + 1
+    const moved = if count > lines { lines } else { count }
+    const cells = grid(screen)
+    const columns = screen.*.columns
+    moveCells(cells, (top + moved) * columns, top * columns, (lines - moved) * columns)
+    clearCells(screen, cells, top * columns, moved * columns)
+    screen.*.dirty = true
+}
+
+fn lineFeed(screen: *Screen) -> void {
+    if screen.*.cursorRow == screen.*.scrollBottom {
+        scrollUp(screen, screen.*.scrollTop, screen.*.scrollBottom, 1)
+    } else if screen.*.cursorRow < screen.*.rows - 1 {
+        screen.*.cursorRow += 1
+    }
+    screen.*.pendingWrap = false
+}
+
+fn reverseLineFeed(screen: *Screen) -> void {
+    if screen.*.cursorRow == screen.*.scrollTop {
+        scrollDown(screen, screen.*.scrollTop, screen.*.scrollBottom, 1)
+    } else if screen.*.cursorRow > 0 {
+        screen.*.cursorRow -= 1
+    }
+    screen.*.pendingWrap = false
+}
+
+fn carriageReturn(screen: *Screen) -> void {
+    screen.*.cursorColumn = 0
+    screen.*.pendingWrap = false
+}
+
+// ---------------------------------------------------------------------------
+// Printing
+
+// How many cells a code point takes: 0 for combining marks (and controls),
+// 2 for East Asian wide and full-width characters and emoji, else 1.
+pub fn width(codepoint: u32) -> usize {
+    if codepoint < 32 || (codepoint >= 127 && codepoint < 160) { return 0 }
+    if (codepoint >= 768 && codepoint <= 879) || (codepoint >= 1155 && codepoint <= 1161) || (codepoint >= 1425 && codepoint <= 1469) || (codepoint >= 1611 && codepoint <= 1631) || (codepoint >= 6832 && codepoint <= 6911) || (codepoint >= 7616 && codepoint <= 7679) || (codepoint >= 8203 && codepoint <= 8207) || (codepoint >= 8400 && codepoint <= 8447) || (codepoint >= 65024 && codepoint <= 65039) || (codepoint >= 65056 && codepoint <= 65071) || codepoint == 8205 { return 0 }
+    if (codepoint >= 4352 && codepoint <= 4447) || (codepoint >= 11904 && codepoint <= 12350) || (codepoint >= 12353 && codepoint <= 13311) || (codepoint >= 13312 && codepoint <= 19903) || (codepoint >= 19968 && codepoint <= 42191) || (codepoint >= 43360 && codepoint <= 43391) || (codepoint >= 44032 && codepoint <= 55203) || (codepoint >= 63744 && codepoint <= 64255) || (codepoint >= 65040 && codepoint <= 65049) || (codepoint >= 65072 && codepoint <= 65135) || (codepoint >= 65280 && codepoint <= 65376) || (codepoint >= 65504 && codepoint <= 65510) || (codepoint >= 127744 && codepoint <= 128767) || (codepoint >= 128992 && codepoint <= 129791) || (codepoint >= 131072 && codepoint <= 262141) { return 2 }
+    return 1
+}
+
+// The DEC special graphics set: the line-drawing characters at 0x5F..0x7E.
+fn specialGraphic(codepoint: u32) -> u32 {
+    if codepoint == 95 { return 32 }
+    if codepoint == 96 { return 9670 }
+    if codepoint == 97 { return 9618 }
+    if codepoint == 98 { return 9225 }
+    if codepoint == 99 { return 9228 }
+    if codepoint == 100 { return 9229 }
+    if codepoint == 101 { return 9226 }
+    if codepoint == 102 { return 176 }
+    if codepoint == 103 { return 177 }
+    if codepoint == 104 { return 9252 }
+    if codepoint == 105 { return 9227 }
+    if codepoint == 106 { return 9496 }
+    if codepoint == 107 { return 9488 }
+    if codepoint == 108 { return 9484 }
+    if codepoint == 109 { return 9492 }
+    if codepoint == 110 { return 9532 }
+    if codepoint == 111 { return 9146 }
+    if codepoint == 112 { return 9147 }
+    if codepoint == 113 { return 9472 }
+    if codepoint == 114 { return 9148 }
+    if codepoint == 115 { return 9149 }
+    if codepoint == 116 { return 9500 }
+    if codepoint == 117 { return 9508 }
+    if codepoint == 118 { return 9524 }
+    if codepoint == 119 { return 9516 }
+    if codepoint == 120 { return 9474 }
+    if codepoint == 121 { return 8804 }
+    if codepoint == 122 { return 8805 }
+    if codepoint == 123 { return 960 }
+    if codepoint == 124 { return 8800 }
+    if codepoint == 125 { return 163 }
+    if codepoint == 126 { return 183 }
+    return codepoint
+}
+
+// Writes a character at the cursor and moves on.
+fn print(screen: *Screen, given: u32) -> void {
+    var codepoint = given
+    if screen.*.charsets[screen.*.charsetIndex] == 48 && codepoint >= 95 && codepoint <= 126 { codepoint = specialGraphic(codepoint) }
+    const cells_wide = width(codepoint)
+    if cells_wide == 0 { return }
+    const columns = screen.*.columns
+    if screen.*.pendingWrap && screen.*.autowrap {
+        carriageReturn(screen)
+        lineFeed(screen)
+    }
+    if cells_wide == 2 && screen.*.cursorColumn + 1 >= columns {
+        if screen.*.autowrap {
+            carriageReturn(screen)
+            lineFeed(screen)
+        } else if columns >= 2 {
+            screen.*.cursorColumn = columns - 2
+        } else {
+            return
+        }
+    }
+    const cells = grid(screen)
+    const row_start = screen.*.cursorRow * columns
+    if screen.*.insertMode {
+        const at = screen.*.cursorColumn
+        if at + cells_wide < columns { moveCells(cells, row_start + at + cells_wide, row_start + at, columns - at - cells_wide) }
+    }
+    var flags = screen.*.flags
+    const cell = cellAt(cells, row_start + screen.*.cursorColumn)
+    // Over the left half of a wide character: its right half goes.
+    if cell.*.width == 0 && screen.*.cursorColumn > 0 {
+        const left = cellAt(cells, row_start + screen.*.cursorColumn - 1)
+        if left.*.width == 2 { blankCell(screen, left) }
+    }
+    setCell(cell, codepoint, screen.*.foreground, screen.*.background, flags, @intCast(u8, cells_wide))
+    if cells_wide == 2 {
+        const right = cellAt(cells, row_start + screen.*.cursorColumn + 1)
+        setCell(right, 0, screen.*.foreground, screen.*.background, flags, 0)
+    } else if screen.*.cursorColumn + 1 < columns {
+        // Over the right half of a wide character: a lone left half goes.
+        const next = cellAt(cells, row_start + screen.*.cursorColumn + 1)
+        if next.*.width == 0 { blankCell(screen, next) }
+    }
+    screen.*.lastPrinted = codepoint
+    if screen.*.cursorColumn + cells_wide >= columns {
+        screen.*.cursorColumn = columns - 1
+        screen.*.pendingWrap = screen.*.autowrap
+    } else {
+        screen.*.cursorColumn += cells_wide
+    }
+    screen.*.dirty = true
+}
+
+// ---------------------------------------------------------------------------
+// Editing
+
+fn clampCursor(screen: *Screen) -> void {
+    if screen.*.cursorRow >= screen.*.rows { screen.*.cursorRow = screen.*.rows - 1 }
+    if screen.*.cursorColumn >= screen.*.columns { screen.*.cursorColumn = screen.*.columns - 1 }
+    screen.*.pendingWrap = false
+}
+
+// The cursor to `row`, `column` (0-based), within the scrolling region in
+// origin mode.
+fn moveCursorTo(screen: *Screen, row: usize, column: usize) -> void {
+    var target_row = row
+    if screen.*.originMode {
+        target_row += screen.*.scrollTop
+        if target_row > screen.*.scrollBottom { target_row = screen.*.scrollBottom }
+    }
+    screen.*.cursorRow = target_row
+    screen.*.cursorColumn = column
+    clampCursor(screen)
+}
+
+fn cursorUp(screen: *Screen, count: usize) -> void {
+    const limit = if screen.*.cursorRow >= screen.*.scrollTop { screen.*.scrollTop } else { 0 }
+    screen.*.cursorRow = if screen.*.cursorRow >= limit + count { screen.*.cursorRow - count } else { limit }
+    screen.*.pendingWrap = false
+}
+
+fn cursorDown(screen: *Screen, count: usize) -> void {
+    const limit = if screen.*.cursorRow <= screen.*.scrollBottom { screen.*.scrollBottom } else { screen.*.rows - 1 }
+    screen.*.cursorRow = if screen.*.cursorRow + count <= limit { screen.*.cursorRow + count } else { limit }
+    screen.*.pendingWrap = false
+}
+
+fn cursorForward(screen: *Screen, count: usize) -> void {
+    screen.*.cursorColumn = if screen.*.cursorColumn + count < screen.*.columns { screen.*.cursorColumn + count } else { screen.*.columns - 1 }
+    screen.*.pendingWrap = false
+}
+
+fn cursorBack(screen: *Screen, count: usize) -> void {
+    screen.*.cursorColumn = if screen.*.cursorColumn >= count { screen.*.cursorColumn - count } else { 0 }
+    screen.*.pendingWrap = false
+}
+
+// ED: 0 from the cursor to the end, 1 from the start to the cursor, 2 all,
+// 3 all and the history.
+fn eraseInDisplay(screen: *Screen, mode: usize) -> void {
+    const cells = grid(screen)
+    const columns = screen.*.columns
+    const at = screen.*.cursorRow * columns + screen.*.cursorColumn
+    const total = columns * screen.*.rows
+    if mode == 0 {
+        clearCells(screen, cells, at, total - at)
+    } else if mode == 1 {
+        clearCells(screen, cells, 0, at + 1)
+    } else if mode == 2 || mode == 3 {
+        clearCells(screen, cells, 0, total)
+        if mode == 3 {
+            screen.*.historyCount = 0
+            screen.*.historyStart = 0
+            screen.*.viewOffset = 0
+        }
+    }
+    screen.*.pendingWrap = false
+    screen.*.dirty = true
+}
+
+// EL: 0 from the cursor to the end of the line, 1 from its start to the
+// cursor, 2 the line.
+fn eraseInLine(screen: *Screen, mode: usize) -> void {
+    const cells = grid(screen)
+    const columns = screen.*.columns
+    const row_start = screen.*.cursorRow * columns
+    if mode == 0 {
+        clearCells(screen, cells, row_start + screen.*.cursorColumn, columns - screen.*.cursorColumn)
+    } else if mode == 1 {
+        clearCells(screen, cells, row_start, screen.*.cursorColumn + 1)
+    } else if mode == 2 {
+        clearCells(screen, cells, row_start, columns)
+    }
+    screen.*.pendingWrap = false
+    screen.*.dirty = true
+}
+
+fn insertCharacters(screen: *Screen, count: usize) -> void {
+    const cells = grid(screen)
+    const columns = screen.*.columns
+    const at = screen.*.cursorColumn
+    const moved = if count > columns - at { columns - at } else { count }
+    const row_start = screen.*.cursorRow * columns
+    moveCells(cells, row_start + at + moved, row_start + at, columns - at - moved)
+    clearCells(screen, cells, row_start + at, moved)
+    screen.*.pendingWrap = false
+    screen.*.dirty = true
+}
+
+fn deleteCharacters(screen: *Screen, count: usize) -> void {
+    const cells = grid(screen)
+    const columns = screen.*.columns
+    const at = screen.*.cursorColumn
+    const moved = if count > columns - at { columns - at } else { count }
+    const row_start = screen.*.cursorRow * columns
+    moveCells(cells, row_start + at, row_start + at + moved, columns - at - moved)
+    clearCells(screen, cells, row_start + columns - moved, moved)
+    screen.*.pendingWrap = false
+    screen.*.dirty = true
+}
+
+fn eraseCharacters(screen: *Screen, count: usize) -> void {
+    const columns = screen.*.columns
+    const at = screen.*.cursorColumn
+    const erased = if count > columns - at { columns - at } else { count }
+    clearCells(screen, grid(screen), screen.*.cursorRow * columns + at, erased)
+    screen.*.pendingWrap = false
+    screen.*.dirty = true
+}
+
+// IL and DL work within the scrolling region, from the cursor's line.
+fn insertLines(screen: *Screen, count: usize) -> void {
+    if screen.*.cursorRow < screen.*.scrollTop || screen.*.cursorRow > screen.*.scrollBottom { return }
+    scrollDown(screen, screen.*.cursorRow, screen.*.scrollBottom, count)
+    screen.*.cursorColumn = 0
+    screen.*.pendingWrap = false
+}
+
+fn deleteLines(screen: *Screen, count: usize) -> void {
+    if screen.*.cursorRow < screen.*.scrollTop || screen.*.cursorRow > screen.*.scrollBottom { return }
+    // Deleted lines are not history: the cells move without scrollUp.
+    const lines = screen.*.scrollBottom - screen.*.cursorRow + 1
+    const moved = if count > lines { lines } else { count }
+    const columns = screen.*.columns
+    const cells = grid(screen)
+    moveCells(cells, screen.*.cursorRow * columns, (screen.*.cursorRow + moved) * columns, (lines - moved) * columns)
+    clearCells(screen, cells, (screen.*.scrollBottom + 1 - moved) * columns, moved * columns)
+    screen.*.cursorColumn = 0
+    screen.*.pendingWrap = false
+    screen.*.dirty = true
+}
+
+fn saveCursor(screen: *Screen) -> void {
+    screen.*.savedRow = screen.*.cursorRow
+    screen.*.savedColumn = screen.*.cursorColumn
+    screen.*.savedForeground = screen.*.foreground
+    screen.*.savedBackground = screen.*.background
+    screen.*.savedFlags = screen.*.flags
+    screen.*.savedForegroundIndex = screen.*.foregroundIndex
+    screen.*.savedCharsetIndex = screen.*.charsetIndex
+    screen.*.savedCharsets[0] = screen.*.charsets[0]
+    screen.*.savedCharsets[1] = screen.*.charsets[1]
+    screen.*.savedPendingWrap = screen.*.pendingWrap
+}
+
+fn restoreCursor(screen: *Screen) -> void {
+    screen.*.cursorRow = screen.*.savedRow
+    screen.*.cursorColumn = screen.*.savedColumn
+    screen.*.foreground = screen.*.savedForeground
+    screen.*.background = screen.*.savedBackground
+    screen.*.flags = screen.*.savedFlags
+    screen.*.foregroundIndex = screen.*.savedForegroundIndex
+    screen.*.charsetIndex = screen.*.savedCharsetIndex
+    screen.*.charsets[0] = screen.*.savedCharsets[0]
+    screen.*.charsets[1] = screen.*.savedCharsets[1]
+    clampCursor(screen)
+    screen.*.pendingWrap = screen.*.savedPendingWrap && screen.*.cursorColumn == screen.*.columns - 1
+}
+
+// The alternate screen on or off (its contents cleared on entering).
+fn useAlternate(screen: *Screen, on: bool) -> void {
+    if on == screen.*.onAlternate { return }
+    screen.*.onAlternate = on
+    if on { clearCells(screen, screen.*.alternate, 0, screen.*.columns * screen.*.rows) }
+    screen.*.viewOffset = 0
+    screen.*.pendingWrap = false
+    screen.*.dirty = true
+}
+
+// ---------------------------------------------------------------------------
+// Responses and the title
+
+fn respond(screen: *Screen, text: []const u8) -> void {
+    for byte in text {
+        if screen.*.responseLength < RESPONSE_CAPACITY {
+            screen.*.responses[screen.*.responseLength] = byte
+            screen.*.responseLength += 1
+        }
+    }
+}
+
+// ESC then `text` (a CSI reply).
+fn respondEscape(screen: *Screen, text: []const u8) -> void {
+    if screen.*.responseLength < RESPONSE_CAPACITY {
+        screen.*.responses[screen.*.responseLength] = 27
+        screen.*.responseLength += 1
+    }
+    respond(screen, text)
+}
+
+fn respondNumber(screen: *Screen, value: usize) -> void {
+    var digits: [20]u8 = undefined
+    var count: usize = 0
+    var rest = value
+    if rest == 0 {
+        digits[0] = 48
+        count = 1
+    }
+    while rest > 0 {
+        digits[count] = @intCast(u8, 48 + rest % 10)
+        rest /= 10
+        count += 1
+    }
+    while count > 0 {
+        count -= 1
+        if screen.*.responseLength < RESPONSE_CAPACITY {
+            screen.*.responses[screen.*.responseLength] = digits[count]
+            screen.*.responseLength += 1
+        }
+    }
+}
+
+// The bytes the program is owed (reports), moved out; their number.
+pub fn takeResponses(screen: *Screen, into: [*]u8, capacity: usize) -> usize {
+    var count: usize = 0
+    while count < screen.*.responseLength && count < capacity {
+        into[count] = screen.*.responses[count]
+        count += 1
+    }
+    screen.*.responseLength = 0
+    return count
+}
+
+pub fn titleText(screen: *const Screen) -> []const u8 {
+    var bytes: [*]const u8 = undefined
+    unsafe { bytes = @ptrCast([*]const u8, &screen.*.title) }
+    return bytes[0..screen.*.titleLength]
+}
+
+// Whether the title changed since the last call.
+pub fn takeTitleChange(screen: *Screen) -> bool {
+    const changed = screen.*.titleChanged
+    screen.*.titleChanged = false
+    return changed
+}
+
+pub fn takeBell(screen: *Screen) -> bool {
+    const rang = screen.*.bell
+    screen.*.bell = false
+    return rang
+}
+
+// Whether anything to draw changed since the last call.
+pub fn takeDirty(screen: *Screen) -> bool {
+    const changed = screen.*.dirty
+    screen.*.dirty = false
+    return changed
+}
+
+fn setTitle(screen: *Screen, text: []const u8) -> void {
+    screen.*.titleLength = 0
+    for byte in text {
+        if screen.*.titleLength < TITLE_CAPACITY {
+            screen.*.title[screen.*.titleLength] = byte
+            screen.*.titleLength += 1
+        }
+    }
+    screen.*.titleChanged = true
+}
+
+// ---------------------------------------------------------------------------
+// The parser
+
+fn beginCsi(screen: *Screen) -> void {
+    screen.*.state = CSI
+    screen.*.parameterCount = 0
+    screen.*.parameters[0] = 0
+    screen.*.privateMarker = 0
+    screen.*.intermediate = 0
+}
+
+// Parameter `index`, `fallback` when absent or 0.
+fn param(screen: *Screen, index: usize, fallback: usize) -> usize {
+    if index >= screen.*.parameterCount || screen.*.parameters[index] == 0 { return fallback }
+    return screen.*.parameters[index]
+}
+
+// Parameter `index` as given, `fallback` when absent (0 stays 0).
+fn paramRaw(screen: *Screen, index: usize, fallback: usize) -> usize {
+    if index >= screen.*.parameterCount { return fallback }
+    return screen.*.parameters[index]
+}
+
+// A C0 control, in any state.
+fn control(screen: *Screen, byte: u8) -> void {
+    if byte == 7 {
+        screen.*.bell = true
+    } else if byte == 8 {
+        cursorBack(screen, 1)
+    } else if byte == 9 {
+        nextTab(screen)
+    } else if byte == 10 || byte == 11 || byte == 12 {
+        lineFeed(screen)
+        if screen.*.newlineMode { carriageReturn(screen) }
+    } else if byte == 13 {
+        carriageReturn(screen)
+    } else if byte == 14 {
+        screen.*.charsetIndex = 1
+    } else if byte == 15 {
+        screen.*.charsetIndex = 0
+    }
+}
+
+fn ground(screen: *Screen, byte: u8) -> void {
+    if byte < 32 {
+        if byte == 27 {
+            screen.*.state = ESCAPE
+        } else {
+            control(screen, byte)
+        }
+        return
+    }
+    if byte < 128 {
+        if byte != 127 { print(screen, @intCast(u32, byte)) }
+        return
+    }
+    // UTF-8.
+    if screen.*.utf8Remaining > 0 {
+        if byte & 192 == 128 {
+            screen.*.utf8Pending = (screen.*.utf8Pending << 6) | @intCast(u32, byte & 63)
+            screen.*.utf8Remaining -= 1
+            if screen.*.utf8Remaining == 0 { print(screen, screen.*.utf8Pending) }
+            return
+        }
+        // A broken sequence: dropped, this byte starts over.
+        screen.*.utf8Remaining = 0
+    }
+    if byte & 224 == 192 {
+        screen.*.utf8Pending = @intCast(u32, byte & 31)
+        screen.*.utf8Remaining = 1
+    } else if byte & 240 == 224 {
+        screen.*.utf8Pending = @intCast(u32, byte & 15)
+        screen.*.utf8Remaining = 2
+    } else if byte & 248 == 240 {
+        screen.*.utf8Pending = @intCast(u32, byte & 7)
+        screen.*.utf8Remaining = 3
+    }
+}
+
+fn escape(screen: *Screen, byte: u8) -> void {
+    screen.*.state = GROUND
+    if byte == 91 {
+        beginCsi(screen)
+    } else if byte == 93 {
+        screen.*.state = OSC
+        screen.*.oscLength = 0
+    } else if byte == 80 || byte == 88 || byte == 94 || byte == 95 {
+        screen.*.state = STRING
+    } else if byte == 40 || byte == 41 {
+        screen.*.state = ESCAPE_CHARSET
+        screen.*.intermediate = byte
+    } else if byte == 35 {
+        screen.*.state = ESCAPE_HASH
+    } else if byte == 55 {
+        saveCursor(screen)
+    } else if byte == 56 {
+        restoreCursor(screen)
+    } else if byte == 68 {
+        lineFeed(screen)
+    } else if byte == 69 {
+        lineFeed(screen)
+        carriageReturn(screen)
+    } else if byte == 72 {
+        setTab(screen, screen.*.cursorColumn)
+    } else if byte == 77 {
+        reverseLineFeed(screen)
+    } else if byte == 90 {
+        respondEscape(screen, "[?6c")
+    } else if byte == 99 {
+        reset(screen)
+    } else if byte == 61 {
+        screen.*.applicationKeypad = true
+    } else if byte == 62 {
+        screen.*.applicationKeypad = false
+    } else if byte < 32 {
+        control(screen, byte)
+        screen.*.state = ESCAPE
+    }
+}
+
+// ESC ( or ESC ): G0 or G1 becomes the set named.
+fn escapeCharset(screen: *Screen, byte: u8) -> void {
+    screen.*.state = GROUND
+    const which: usize = if screen.*.intermediate == 41 { 1 } else { 0 }
+    if byte == 48 || byte == 66 {
+        screen.*.charsets[which] = byte
+    } else if byte >= 64 {
+        screen.*.charsets[which] = 66
+    }
+}
+
+// ESC # 8: the screen filled with E (an alignment test).
+fn escapeHash(screen: *Screen, byte: u8) -> void {
+    screen.*.state = GROUND
+    if byte == 56 {
+        const total = screen.*.columns * screen.*.rows
+        var index: usize = 0
+        while index < total {
+            setCell(cellAt(grid(screen), index), 69, DEFAULT, DEFAULT, 0, 1)
+            index += 1
+        }
+        screen.*.cursorRow = 0
+        screen.*.cursorColumn = 0
+        screen.*.scrollTop = 0
+        screen.*.scrollBottom = screen.*.rows - 1
+        screen.*.dirty = true
+    }
+}
+
+fn csi(screen: *Screen, byte: u8) -> void {
+    if byte >= 48 && byte <= 57 {
+        if screen.*.parameterCount == 0 { screen.*.parameterCount = 1 }
+        const slot = screen.*.parameterCount - 1
+        const value = screen.*.parameters[slot] * 10 + @intCast(usize, byte - 48)
+        screen.*.parameters[slot] = if value > 65535 { 65535 } else { value }
+    } else if byte == 59 || byte == 58 {
+        // A separator (':' between a colour's parts is taken as ';').
+        if screen.*.parameterCount == 0 { screen.*.parameterCount = 1 }
+        if screen.*.parameterCount < MAX_PARAMETERS {
+            screen.*.parameters[screen.*.parameterCount] = 0
+            screen.*.parameterCount += 1
+        } else {
+            screen.*.state = CSI_IGNORE
+        }
+    } else if byte >= 60 && byte <= 63 {
+        if screen.*.parameterCount == 0 && screen.*.privateMarker == 0 { screen.*.privateMarker = byte } else { screen.*.state = CSI_IGNORE }
+    } else if byte >= 32 && byte <= 47 {
+        screen.*.intermediate = byte
+    } else if byte >= 64 && byte <= 126 {
+        screen.*.state = GROUND
+        dispatchCsi(screen, byte)
+    } else if byte == 27 {
+        screen.*.state = ESCAPE
+    } else if byte == 24 || byte == 26 {
+        screen.*.state = GROUND
+    } else if byte < 32 {
+        control(screen, byte)
+    }
+}
+
+fn csiIgnore(screen: *Screen, byte: u8) -> void {
+    if byte >= 64 && byte <= 126 {
+        screen.*.state = GROUND
+    } else if byte == 27 {
+        screen.*.state = ESCAPE
+    } else if byte == 24 || byte == 26 {
+        screen.*.state = GROUND
+    }
+}
+
+fn osc(screen: *Screen, byte: u8) -> void {
+    if byte == 7 {
+        screen.*.state = GROUND
+        finishOsc(screen)
+    } else if byte == 27 {
+        screen.*.state = OSC_ESCAPE
+    } else if byte == 24 || byte == 26 {
+        screen.*.state = GROUND
+    } else if byte >= 32 || byte >= 128 {
+        if screen.*.oscLength < OSC_CAPACITY {
+            screen.*.oscBuffer[screen.*.oscLength] = byte
+            screen.*.oscLength += 1
+        }
+    }
+}
+
+fn oscEscape(screen: *Screen, byte: u8) -> void {
+    if byte == 92 {
+        screen.*.state = GROUND
+        finishOsc(screen)
+    } else {
+        // Not ST: an escape sequence of its own begins.
+        screen.*.state = ESCAPE
+        escape(screen, byte)
+    }
+}
+
+// OSC 0 and 2 set the title; the others are left alone.
+fn finishOsc(screen: *Screen) -> void {
+    var bytes: [*]const u8 = undefined
+    unsafe { bytes = @ptrCast([*]const u8, &screen.*.oscBuffer) }
+    const text = bytes[0..screen.*.oscLength]
+    var number: usize = 0
+    var at: usize = 0
+    while at < text.length && text[at] >= 48 && text[at] <= 57 {
+        number = number * 10 + @intCast(usize, text[at] - 48)
+        at += 1
+    }
+    if at >= text.length || text[at] != 59 { return }
+    at += 1
+    if number == 0 || number == 2 { setTitle(screen, text[at..text.length]) }
+}
+
+fn string(screen: *Screen, byte: u8) -> void {
+    if byte == 27 {
+        screen.*.state = STRING_ESCAPE
+    } else if byte == 24 || byte == 26 {
+        screen.*.state = GROUND
+    }
+}
+
+fn stringEscape(screen: *Screen, byte: u8) -> void {
+    if byte == 92 {
+        screen.*.state = GROUND
+    } else {
+        screen.*.state = ESCAPE
+        escape(screen, byte)
+    }
+}
+
+// One byte of the program's output.
+pub fn feedByte(screen: *Screen, byte: u8) -> void {
+    const state = screen.*.state
+    if state == GROUND {
+        ground(screen, byte)
+    } else if state == ESCAPE {
+        escape(screen, byte)
+    } else if state == ESCAPE_CHARSET {
+        escapeCharset(screen, byte)
+    } else if state == ESCAPE_HASH {
+        escapeHash(screen, byte)
+    } else if state == CSI {
+        csi(screen, byte)
+    } else if state == CSI_IGNORE {
+        csiIgnore(screen, byte)
+    } else if state == OSC {
+        osc(screen, byte)
+    } else if state == OSC_ESCAPE {
+        oscEscape(screen, byte)
+    } else if state == STRING {
+        string(screen, byte)
+    } else {
+        stringEscape(screen, byte)
+    }
+}
+
+pub fn feed(screen: *Screen, bytes: []const u8) -> void {
+    for byte in bytes { feedByte(screen, byte) }
+}
+
+// ---------------------------------------------------------------------------
+// CSI
+
+fn dispatchCsi(screen: *Screen, final: u8) -> void {
+    const private = screen.*.privateMarker
+    const intermediate = screen.*.intermediate
+    if private == 63 {
+        if final == 104 || final == 108 {
+            var index: usize = 0
+            while index < screen.*.parameterCount {
+                setPrivateMode(screen, screen.*.parameters[index], final == 104)
+                index += 1
+            }
+        } else if final == 99 {
+            respondEscape(screen, "[?6c")
+        } else if final == 110 {
+            // DECDSR: the keyboard is fine.
+            if param(screen, 0, 0) == 6 { cursorReport(screen) } else { respondEscape(screen, "[?27;1n") }
+        }
+        return
+    }
+    if private == 62 {
+        // Secondary device attributes: a VT100-class terminal, version 0.
+        if final == 99 { respondEscape(screen, "[>0;0;0c") }
+        return
+    }
+    if private != 0 { return }
+    if intermediate == 33 {
+        // DECSTR: a soft reset.
+        if final == 112 {
+            resetAttributes(screen)
+            resetModes(screen)
+            screen.*.scrollTop = 0
+            screen.*.scrollBottom = screen.*.rows - 1
+            screen.*.pendingWrap = false
+            screen.*.cursorVisible = true
+        }
+        return
+    }
+    if intermediate == 32 {
+        if final == 113 { screen.*.cursorStyle = @intCast(u8, param(screen, 0, 0) & 255) }
+        return
+    }
+    if intermediate != 0 { return }
+    if final == 64 {
+        insertCharacters(screen, param(screen, 0, 1))
+    } else if final == 65 {
+        cursorUp(screen, param(screen, 0, 1))
+    } else if final == 66 || final == 101 {
+        cursorDown(screen, param(screen, 0, 1))
+    } else if final == 67 || final == 97 {
+        cursorForward(screen, param(screen, 0, 1))
+    } else if final == 68 {
+        cursorBack(screen, param(screen, 0, 1))
+    } else if final == 69 {
+        cursorDown(screen, param(screen, 0, 1))
+        carriageReturn(screen)
+    } else if final == 70 {
+        cursorUp(screen, param(screen, 0, 1))
+        carriageReturn(screen)
+    } else if final == 71 || final == 96 {
+        screen.*.cursorColumn = param(screen, 0, 1) - 1
+        clampCursor(screen)
+    } else if final == 72 || final == 102 {
+        moveCursorTo(screen, param(screen, 0, 1) - 1, param(screen, 1, 1) - 1)
+    } else if final == 73 {
+        var count = param(screen, 0, 1)
+        while count > 0 {
+            nextTab(screen)
+            count -= 1
+        }
+    } else if final == 74 {
+        eraseInDisplay(screen, paramRaw(screen, 0, 0))
+    } else if final == 75 {
+        eraseInLine(screen, paramRaw(screen, 0, 0))
+    } else if final == 76 {
+        insertLines(screen, param(screen, 0, 1))
+    } else if final == 77 {
+        deleteLines(screen, param(screen, 0, 1))
+    } else if final == 80 {
+        deleteCharacters(screen, param(screen, 0, 1))
+    } else if final == 83 {
+        scrollUp(screen, screen.*.scrollTop, screen.*.scrollBottom, param(screen, 0, 1))
+    } else if final == 84 {
+        scrollDown(screen, screen.*.scrollTop, screen.*.scrollBottom, param(screen, 0, 1))
+    } else if final == 88 {
+        eraseCharacters(screen, param(screen, 0, 1))
+    } else if final == 90 {
+        var count = param(screen, 0, 1)
+        while count > 0 {
+            previousTab(screen)
+            count -= 1
+        }
+    } else if final == 98 {
+        var count = param(screen, 0, 1)
+        const repeated = screen.*.lastPrinted
+        while count > 0 {
+            print(screen, repeated)
+            count -= 1
+        }
+    } else if final == 99 {
+        respondEscape(screen, "[?6c")
+    } else if final == 100 {
+        screen.*.cursorRow = param(screen, 0, 1) - 1
+        if screen.*.originMode {
+            screen.*.cursorRow += screen.*.scrollTop
+            if screen.*.cursorRow > screen.*.scrollBottom { screen.*.cursorRow = screen.*.scrollBottom }
+        }
+        clampCursor(screen)
+    } else if final == 103 {
+        const mode = paramRaw(screen, 0, 0)
+        if mode == 0 {
+            clearTab(screen, screen.*.cursorColumn)
+        } else if mode == 3 {
+            var column: usize = 0
+            while column < MAX_COLUMNS {
+                clearTab(screen, column)
+                column += 1
+            }
+        }
+    } else if final == 104 || final == 108 {
+        var index: usize = 0
+        while index < screen.*.parameterCount {
+            setMode(screen, screen.*.parameters[index], final == 104)
+            index += 1
+        }
+    } else if final == 109 {
+        selectGraphics(screen)
+    } else if final == 110 {
+        const kind = param(screen, 0, 0)
+        if kind == 5 {
+            respondEscape(screen, "[0n")
+        } else if kind == 6 {
+            cursorReport(screen)
+        }
+    } else if final == 114 {
+        const top = param(screen, 0, 1) - 1
+        var bottom = param(screen, 1, screen.*.rows) - 1
+        if bottom >= screen.*.rows { bottom = screen.*.rows - 1 }
+        if top < bottom {
+            screen.*.scrollTop = top
+            screen.*.scrollBottom = bottom
+            moveCursorTo(screen, 0, 0)
+        }
+    } else if final == 115 {
+        saveCursor(screen)
+    } else if final == 116 {
+        windowOperation(screen)
+    } else if final == 117 {
+        restoreCursor(screen)
+    }
+}
+
+// CPR: the cursor's position (1-based; within the region in origin mode).
+fn cursorReport(screen: *Screen) -> void {
+    const row = if screen.*.originMode && screen.*.cursorRow >= screen.*.scrollTop { screen.*.cursorRow - screen.*.scrollTop } else { screen.*.cursorRow }
+    respondEscape(screen, "[")
+    respondNumber(screen, row + 1)
+    respond(screen, ";")
+    respondNumber(screen, screen.*.cursorColumn + 1)
+    respond(screen, "R")
+}
+
+// XTWINOPS: the size reports; the rest (moving, resizing the window) is
+// not for a program to do.
+fn windowOperation(screen: *Screen) -> void {
+    const operation = param(screen, 0, 0)
+    if operation == 18 {
+        respondEscape(screen, "[8;")
+        respondNumber(screen, screen.*.rows)
+        respond(screen, ";")
+        respondNumber(screen, screen.*.columns)
+        respond(screen, "t")
+    } else if operation == 14 {
+        respondEscape(screen, "[4;")
+        respondNumber(screen, screen.*.rows * 16)
+        respond(screen, ";")
+        respondNumber(screen, screen.*.columns * 8)
+        respond(screen, "t")
+    }
+}
+
+fn setMode(screen: *Screen, number: usize, on: bool) -> void {
+    if number == 4 {
+        screen.*.insertMode = on
+    } else if number == 20 {
+        screen.*.newlineMode = on
+    }
+}
+
+fn setPrivateMode(screen: *Screen, number: usize, on: bool) -> void {
+    if number == 1 {
+        screen.*.applicationCursor = on
+    } else if number == 5 {
+        if screen.*.reverseVideo != on { screen.*.dirty = true }
+        screen.*.reverseVideo = on
+    } else if number == 6 {
+        screen.*.originMode = on
+        moveCursorTo(screen, 0, 0)
+    } else if number == 7 {
+        screen.*.autowrap = on
+        screen.*.pendingWrap = false
+    } else if number == 25 {
+        if screen.*.cursorVisible != on { screen.*.dirty = true }
+        screen.*.cursorVisible = on
+    } else if number == 47 || number == 1047 {
+        useAlternate(screen, on)
+    } else if number == 1048 {
+        if on { saveCursor(screen) } else { restoreCursor(screen) }
+    } else if number == 1049 {
+        if on {
+            saveCursor(screen)
+            useAlternate(screen, true)
+        } else {
+            useAlternate(screen, false)
+            restoreCursor(screen)
+        }
+    } else if number == 9 || number == 1000 || number == 1002 || number == 1003 {
+        screen.*.mouseMode = if on { @intCast(u32, number) } else { 0 }
+    } else if number == 1006 || number == 1005 || number == 1015 {
+        screen.*.mouseEncoding = if on && number == 1006 { 1006 } else { 0 }
+    } else if number == 1004 {
+        screen.*.focusEvents = on
+    } else if number == 2004 {
+        screen.*.bracketedPaste = on
+    }
+}
+
+// SGR.
+fn selectGraphics(screen: *Screen) -> void {
+    if screen.*.parameterCount == 0 {
+        resetAttributes(screen)
+        return
+    }
+    var index: usize = 0
+    while index < screen.*.parameterCount {
+        const code = screen.*.parameters[index]
+        if code == 0 {
+            resetAttributes(screen)
+        } else if code == 1 {
+            screen.*.flags |= BOLD
+            if screen.*.foregroundIndex < 8 { screen.*.foreground = ansiColor(@intCast(usize, screen.*.foregroundIndex) + 8) }
+        } else if code == 2 {
+            screen.*.flags |= DIM
+        } else if code == 3 {
+            screen.*.flags |= ITALIC
+        } else if code == 4 || code == 21 {
+            screen.*.flags |= UNDERLINE
+        } else if code == 5 || code == 6 {
+            screen.*.flags |= BLINK
+        } else if code == 7 {
+            screen.*.flags |= INVERSE
+        } else if code == 8 {
+            screen.*.flags |= HIDDEN
+        } else if code == 9 {
+            screen.*.flags |= STRIKE
+        } else if code == 22 {
+            screen.*.flags &= ~(BOLD | DIM)
+            if screen.*.foregroundIndex < 8 { screen.*.foreground = ansiColor(@intCast(usize, screen.*.foregroundIndex)) }
+        } else if code == 23 {
+            screen.*.flags &= ~ITALIC
+        } else if code == 24 {
+            screen.*.flags &= ~UNDERLINE
+        } else if code == 25 {
+            screen.*.flags &= ~BLINK
+        } else if code == 27 {
+            screen.*.flags &= ~INVERSE
+        } else if code == 28 {
+            screen.*.flags &= ~HIDDEN
+        } else if code == 29 {
+            screen.*.flags &= ~STRIKE
+        } else if code >= 30 && code <= 37 {
+            setForegroundIndex(screen, code - 30)
+        } else if code == 38 || code == 48 {
+            index = extendedColor(screen, index, code == 38)
+        } else if code == 39 {
+            screen.*.foreground = DEFAULT
+            screen.*.foregroundIndex = DEFAULT_INDEX
+        } else if code >= 40 && code <= 47 {
+            screen.*.background = ansiColor(code - 40)
+        } else if code == 49 {
+            screen.*.background = DEFAULT
+        } else if code >= 90 && code <= 97 {
+            setForegroundIndex(screen, code - 90 + 8)
+        } else if code >= 100 && code <= 107 {
+            screen.*.background = ansiColor(code - 100 + 8)
+        }
+        index += 1
+    }
+}
+
+fn setForegroundIndex(screen: *Screen, color_index: usize) -> void {
+    screen.*.foregroundIndex = @intCast(u16, color_index)
+    var shown = color_index
+    if shown < 8 && screen.*.flags & BOLD != 0 { shown += 8 }
+    screen.*.foreground = ansiColor(shown)
+}
+
+// 38 or 48 followed by 5;INDEX or 2;RED;GREEN;BLUE; the index of the last
+// parameter used.
+fn extendedColor(screen: *Screen, at: usize, foreground: bool) -> usize {
+    const kind = paramRaw(screen, at + 1, 0)
+    var color = DEFAULT
+    var used = at
+    var index_value: u16 = DIRECT_INDEX
+    if kind == 5 {
+        const palette_index = paramRaw(screen, at + 2, 0)
+        color = paletteColor(if palette_index > 255 { 255 } else { palette_index })
+        if palette_index < 256 { index_value = @intCast(u16, palette_index) }
+        used = at + 2
+    } else if kind == 2 {
+        color = rgb(paramRaw(screen, at + 2, 0), paramRaw(screen, at + 3, 0), paramRaw(screen, at + 4, 0))
+        used = at + 4
+    } else {
+        return at + 1
+    }
+    if foreground {
+        screen.*.foreground = color
+        screen.*.foregroundIndex = index_value
+        if index_value < 8 && screen.*.flags & BOLD != 0 { screen.*.foreground = ansiColor(@intCast(usize, index_value) + 8) }
+    } else {
+        screen.*.background = color
+    }
+    return used
+}
+
+// ---------------------------------------------------------------------------
+// Size and view
+
+// A new size: what fits stays, from the top left; lines the cursor would
+// lose at the bottom go into the history instead. False when nothing
+// changed.
+pub fn resize(screen: *Screen, wanted_columns: usize, wanted_rows: usize) -> bool {
+    const columns = if wanted_columns < 1 { 1 } else if wanted_columns > MAX_COLUMNS { MAX_COLUMNS } else { wanted_columns }
+    const rows = if wanted_rows < 1 { 1 } else if wanted_rows > MAX_ROWS { MAX_ROWS } else { wanted_rows }
+    if columns == screen.*.columns && rows == screen.*.rows { return false }
+    const old_columns = screen.*.columns
+    const old_rows = screen.*.rows
+    // The main screen's cursor line stays on screen: lines above it scroll
+    // into the history when the screen gets shorter.
+    var dropped: usize = 0
+    if !screen.*.onAlternate && screen.*.cursorRow >= rows {
+        dropped = screen.*.cursorRow + 1 - rows
+        var index: usize = 0
+        while index < dropped {
+            pushHistory(screen, index)
+            index += 1
+        }
+    }
+    const capacity = columns * rows
+    const main = allocateCells(screen.*.allocator, capacity)
+    const alternate = allocateCells(screen.*.allocator, capacity)
+    if main == null || alternate == null { return false }
+    const background = screen.*.background
+    screen.*.background = DEFAULT
+    clearCells(screen, main.?, 0, capacity)
+    clearCells(screen, alternate.?, 0, capacity)
+    screen.*.background = background
+    const copied_columns = if columns < old_columns { columns } else { old_columns }
+    var row: usize = 0
+    while row + dropped < old_rows && row < rows {
+        var column: usize = 0
+        while column < copied_columns {
+            copyCell(cellAt(main.?, row * columns + column), cellAt(screen.*.main, (row + dropped) * old_columns + column))
+            copyCell(cellAt(alternate.?, row * columns + column), cellAt(screen.*.alternate, (row + dropped) * old_columns + column))
+            column += 1
+        }
+        row += 1
+    }
+    // The history lines in the new width.
+    if screen.*.historyLines > 0 {
+        const history = allocateCells(screen.*.allocator, screen.*.historyLines * columns)
+        if history == null { return false }
+        clearCells(screen, history.?, 0, screen.*.historyLines * columns)
+        var line: usize = 0
+        while line < screen.*.historyCount {
+            const from = (screen.*.historyStart + line) % screen.*.historyLines
+            var column: usize = 0
+            while column < copied_columns {
+                copyCell(cellAt(history.?, line * columns + column), cellAt(screen.*.history, from * old_columns + column))
+                column += 1
+            }
+            line += 1
+        }
+        freeCells(screen.*.allocator, screen.*.history, screen.*.historyCapacity)
+        screen.*.history = history.?
+        screen.*.historyCapacity = screen.*.historyLines * columns
+        screen.*.historyStart = 0
+    }
+    freeCells(screen.*.allocator, screen.*.main, screen.*.capacity)
+    freeCells(screen.*.allocator, screen.*.alternate, screen.*.capacity)
+    screen.*.main = main.?
+    screen.*.alternate = alternate.?
+    screen.*.capacity = capacity
+    screen.*.columns = columns
+    screen.*.rows = rows
+    screen.*.cursorRow = if screen.*.cursorRow >= dropped { screen.*.cursorRow - dropped } else { 0 }
+    screen.*.savedRow = if screen.*.savedRow >= dropped { screen.*.savedRow - dropped } else { 0 }
+    if screen.*.savedRow >= rows { screen.*.savedRow = rows - 1 }
+    if screen.*.savedColumn >= columns { screen.*.savedColumn = columns - 1 }
+    screen.*.scrollTop = 0
+    screen.*.scrollBottom = rows - 1
+    clampCursor(screen)
+    screen.*.viewOffset = 0
+    screen.*.dirty = true
+    return true
+}
+
+// Scrolls the view into the history (`delta` lines up when positive) or
+// back towards the live screen.
+pub fn scrollView(screen: *Screen, delta: isize) -> void {
+    if screen.*.onAlternate { return }
+    var offset = @intCast(isize, screen.*.viewOffset) + delta
+    if offset < 0 { offset = 0 }
+    if offset > @intCast(isize, screen.*.historyCount) { offset = @intCast(isize, screen.*.historyCount) }
+    if @intCast(usize, offset) != screen.*.viewOffset { screen.*.dirty = true }
+    screen.*.viewOffset = @intCast(usize, offset)
+}
+
+pub fn resetView(screen: *Screen) -> void {
+    if screen.*.viewOffset != 0 { screen.*.dirty = true }
+    screen.*.viewOffset = 0
+}
+
+// The cell shown at `row`, `column` of the view (history lines first when
+// the view is scrolled up, then the live screen).
+pub fn visibleCell(screen: *Screen, row: usize, column: usize) -> *Cell {
+    if screen.*.viewOffset > 0 && !screen.*.onAlternate && row < screen.*.viewOffset {
+        const line = screen.*.historyCount - screen.*.viewOffset + row
+        const slot = (screen.*.historyStart + line) % screen.*.historyLines
+        return cellAt(screen.*.history, slot * screen.*.columns + column)
+    }
+    const live_row = row - (if screen.*.onAlternate { 0 } else { screen.*.viewOffset })
+    return cellAt(grid(screen), live_row * screen.*.columns + column)
+}
+
+// Whether the cursor is to be drawn (visible, and the view is live).
+pub fn cursorShown(screen: *const Screen) -> bool {
+    return screen.*.cursorVisible && (screen.*.viewOffset == 0 || screen.*.onAlternate)
+}
+
+// A code point as UTF-8 (up to 4 bytes); the length.
+pub fn encodeUtf8(codepoint: u32, out: [*]u8) -> usize {
+    if codepoint < 128 {
+        out[0] = @intCast(u8, codepoint)
+        return 1
+    }
+    if codepoint < 2048 {
+        out[0] = @intCast(u8, 192 | (codepoint >> 6))
+        out[1] = @intCast(u8, 128 | (codepoint & 63))
+        return 2
+    }
+    if codepoint < 65536 {
+        out[0] = @intCast(u8, 224 | (codepoint >> 12))
+        out[1] = @intCast(u8, 128 | ((codepoint >> 6) & 63))
+        out[2] = @intCast(u8, 128 | (codepoint & 63))
+        return 3
+    }
+    out[0] = @intCast(u8, 240 | (codepoint >> 18))
+    out[1] = @intCast(u8, 128 | ((codepoint >> 12) & 63))
+    out[2] = @intCast(u8, 128 | ((codepoint >> 6) & 63))
+    out[3] = @intCast(u8, 128 | (codepoint & 63))
+    return 4
+}

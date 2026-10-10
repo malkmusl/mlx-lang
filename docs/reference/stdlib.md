@@ -119,6 +119,24 @@ CPU or the GPU, and widgets for any platform, see
 [User interfaces](ui.md)) are extensions for drawing text and building
 pixel user interfaces.
 
+`std.terminal` (`std/src/terminal.mlx`) is a terminal emulator's screen for
+any front end: `feed()` takes the bytes a program writes (UTF-8 with wide
+characters, the C0 controls, ECMA-48 cursor movement, erasing, inserting
+and deleting, scrolling regions, SGR with 16, 256 and direct colours and
+the attributes, the DEC modes for application cursor keys, autowrap,
+origin, the cursor, the alternate screen, bracketed paste and the mouse,
+the title, the DSR and DA reports), the cells come out through
+`visibleCell()` (with the history behind `scrollView()`), the replies the
+program is owed through `takeResponses()`. `std.terminal.keys` encodes a
+key (Linux key code, modifiers, the text it types and the text without
+Control and Alt) as xterm does; `std.terminal.pty` runs a program on a
+pseudo-terminal. `std.ui.terminal` draws a screen on a `std.ui` canvas with
+the monospaced font of `std.ui.text` and handles its keys and wheel, for
+`projects/desktop/terminal` and any app with a terminal pane. A
+`std.ui.host` app watches a descriptor (the pty) with `watchDescriptor()`
+and gets `EVENT_WATCH`; `plainTyped()` is the key's text without Control
+and Alt.
+
 `std.crash` (`std/src/crash.mlx`) is a program's crash report: `install()`
 sets a signal handler on a stack of its own that names the signal, the
 function and its callers (from the symbol table the compiler writes, see
