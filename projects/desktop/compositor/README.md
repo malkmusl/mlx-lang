@@ -19,7 +19,11 @@ nested|drm` decides).
   freestanding: compiled by std.xkb for the system's layout) and the key
   repeat settings.
 - Windows move by dragging their title bar (`xdg_toplevel.move`) or with
-  Alt+drag anywhere.
+  Alt+drag anywhere; dragged to an edge of the screen they snap to it
+  (Aero snap, see Snapping, workspaces and tiling).
+- Nine workspaces, and per workspace floating windows or scrollable
+  tiling as niri does it (columns on a strip wider than the screen); the
+  top bar shows both and switches them.
 - Windows resize by dragging their border (the cursor shows the
   direction; near a corner, the corner), with Alt+right-drag from the
   nearest corner, or from the client's own edges (`xdg_toplevel.resize`,
@@ -42,8 +46,15 @@ The screenshots are frames the scripted test host received, taken during
 | Alt+Enter | open a terminal (`--terminal`, default `mlx-terminal`) |
 | Alt+drag | move the window under the pointer |
 | Alt+right-drag | resize the window under the pointer from its nearest corner |
-| Alt+Tab | switch windows |
+| Alt+Tab | switch windows (of the workspace shown) |
 | Alt+F4 | close the focused window |
+| Super+Left, Super+Right | snap the window to that half; with tiling: focus the column on that side |
+| Super+Shift+Left, Super+Shift+Right | with tiling: move the column |
+| Super+R | with tiling: the column a third, half or two thirds wide |
+| Super+T | tiling on or off for the workspace shown |
+| Super+1 .. 9 | show that workspace |
+| Super+Shift+1 .. 9 | move the focused window to that workspace |
+| Super+wheel | with tiling: scroll the columns |
 | Alt+Shift+Q | quit |
 | Ctrl+Alt+F1 .. F12 | switch to that VT (freestanding) |
 | Ctrl+Alt+Backspace | quit (freestanding) |
@@ -219,7 +230,8 @@ the top edge, 30 pixels high with an exclusive zone, as the menu bar of
 macOS: maximized windows start below it and windows placed under it are
 moved down. It is translucent over a blur and shows a mark and the name
 of the active window's app on the left (its desktop entry's name, else
-its app id or title) and the date and time on the right ("So. 27. Sep.
+its app id or title), the workspaces in the middle (see Snapping,
+workspaces and tiling), and the date and time on the right ("So. 27. Sep.
 16:05" when `LC_ALL`, `LC_TIME` or `LANG` is German, else "Sun 27 Sep
 16:05"). The time zone comes from `$TZ` (a zone name looked up in
 `/usr/share/zoneinfo`, a file, or a POSIX rule such as
@@ -501,6 +513,9 @@ client-decorations = off
 corner-radius = 12
 # Moved windows wobble (with the Vulkan renderer).
 wobbly-windows = on
+# on: workspaces start with their windows tiled (scrolling columns); the
+# top bar and Super+T switch each workspace.
+tiling = off
 # The apps' language (de, en, or system: LC_ALL, LC_TIME, LANG); the
 # compositor leaves it to them.
 language = system
@@ -905,9 +920,62 @@ key-fullscreen = Super+F
 key-close = Alt+F4
 key-terminal = Alt+Return
 key-switch = Alt+Tab
+key-left = Super+Left
+key-right = Super+Right
+key-move-left = Super+Shift+Left
+key-move-right = Super+Shift+Right
+key-column-width = Super+R
+key-tiling = Super+T
 ```
 
-Alt+Shift+Q (quit) and Ctrl+Alt+F<n> (switch VT, freestanding) stay fixed.
+Alt+Shift+Q (quit), Super+1..9 and Super+Shift+1..9 (workspaces) and
+Ctrl+Alt+F<n> (switch VT, freestanding) stay fixed.
+
+### Snapping, workspaces and tiling
+
+**Aero snap.** A floating window dragged by its title bar (or with
+Alt+drag) to the left or right edge of the work area shows where it would
+go, the focus colour over that half of the screen, and takes that half
+when it is let go; dragged into a corner (within 48 pixels of it along an
+edge) it takes that quarter, dragged to the top edge it is maximized.
+Super+Left and Super+Right snap the focused window to a half. Dragging a
+snapped window away gives it back its size, under the pointer, as
+dragging a maximized one does. Both renderers draw the preview alike
+([`scene.mlx`](scene.mlx), [`vulkan.mlx`](vulkan.mlx)).
+
+**Workspaces** ([`workspaces.mlx`](workspaces.mlx)). Nine of them; a new
+window opens on the one shown, and only that one's windows are drawn and
+take the pointer. Super+1..9 shows a workspace, Super+Shift+1..9 moves
+the focused window there, and activating a window on another workspace
+(the dock, a foreign-toplevel client) shows its workspace. Alt+Tab goes
+through the windows of the workspace shown.
+
+**Scrollable tiling** ([`tiling.mlx`](tiling.mlx)), per workspace, as niri
+lays windows out: every window is a column on a strip that may be wider
+than the screen, the columns side by side with 8 pixel gaps, each as tall
+as the work area and half its width to begin with. A new window opens as
+the column after the focused one; the strip scrolls so that the focused
+column is in sight. Super+Left and Super+Right focus the neighbouring
+column, Super+Shift+Left and Super+Shift+Right move the focused column,
+Super+R makes it a third, half or two thirds of the width, maximize makes
+it as wide as the screen (and back), dragging its border sets its width,
+dragging its title bar past the middle of a neighbour swaps the two, and
+Super+wheel (or the wheel over the desktop) scrolls the strip. Turning
+tiling off puts every window back where it floated before; a minimized
+column leaves the strip until it comes back. `tiling = on` in the
+settings makes workspaces without windows start tiled.
+
+**The top bar** shows the workspaces in use as numbered buttons (up to
+the last with windows or the one shown, and one more; a dot under one
+with windows, the one shown lit; a click shows it) and, beside them, a
+two-part button for the workspace shown: floating (two overlapping
+windows) or tiling (two columns), the one in force lit, a click on the
+other switches. It hears the workspaces and sends its clicks over its
+channel (`MLX_TOPBAR_FD`, a socket pair): the compositor sends `W`, the
+workspace shown, the tiling workspaces as a 16-bit mask and the nine
+window counts whenever one of them changes; the bar sends `w` and a
+workspace to show one, or `t`, a workspace and 1 or 0 to turn its tiling
+on or off.
 
 ### Wobbly windows
 

@@ -28,7 +28,8 @@
 #   - then, with tools/wayland-drag-source as a file manager, drops a
 #     folder on the dock (it is pinned) and a file on the trash (it goes
 #     into it);
-#   - runs the top bar (mlx-topbar) with a terminal: the bar is along the
+#   - runs the top bar (mlx-topbar) with a terminal: the bar (with its
+#     workspace controls in the middle) is along the
 #     top and reserves it (the terminal moves below it, maximized it stays
 #     below), shows the active app and a fixed time in German, and the
 #     local times clock.mlx computes match python's zoneinfo;
@@ -618,11 +619,16 @@ header, size, depth, pixels = data.split(b'\n', 3)
 width, height = map(int, size.split())
 def at(x, y): return tuple(pixels[(y * width + x) * 3:(y * width + x) * 3 + 3])
 def lit(x0, x1): return sum(1 for x in range(x0, x1) for y in range(8, 22) if min(at(x, y)) > 200)
-# White text at the left (the app's name) and the right (the time), none
-# in the middle; the terminal's title bar starts below the bar.
+# White text at the left (the app's name) and the right (the time); in
+# the middle the workspace controls (workspace 1's button at 453..476 and
+# the floating half of the mode button at 515..542 lit, the tiling half
+# dim above its white glyph) and nothing around them; the terminal's
+# title bar starts below the bar.
 assert lit(40, 110) > 20, lit(40, 110)
 assert lit(890, 1010) > 40, lit(890, 1010)
-assert lit(400, 600) == 0, lit(400, 600)
+assert lit(455, 475) > 20 and lit(517, 541) > 20, (lit(455, 475), lit(517, 541))
+assert min(at(520, 7)) > 200 and min(at(566, 7)) <= 200, (at(520, 7), at(566, 7))
+assert lit(300, 440) == 0 and lit(600, 860) == 0, (lit(300, 440), lit(600, 860))
 assert min(at(300, 40)) > 80, at(300, 40)
 PY
     echo "ok   the top bar is along the top, reserves it, and shows the app and the time"

@@ -32,6 +32,16 @@
 #  10. with GTK 3 (through python3's ctypes, if installed): KDE's server
 #      decoration tells it the compositor decorates, so it asks for server
 #      side decoration and draws no title bar of its own.
+#  10c. Aero snap: a window dragged to the left edge snaps to that half
+#      (the translucent preview shows while it is dragged), Super+Right to
+#      the right half, dragging it away restores its size, the top edge
+#      maximizes.
+#  10d. workspaces and scrollable tiling with the top bar (mlx-topbar): its
+#      tiling half turns tiling on (the windows become columns), a second
+#      window opens as a column after the first, Super+R, Super+Left and
+#      Super+Shift+Right size, focus and move columns, the floating half
+#      turns it off again; Super+Shift+2 moves a window to workspace 2, the
+#      bar's numbers and Super+3 switch workspaces.
 #  11. mlx-settings records hotkeys: while it records, the compositor
 #      passes every key to it (keyboard-shortcuts-inhibit), Super+Up too;
 #      Backspace unbinds one; the compositor takes the new keys at once.
@@ -83,6 +93,11 @@ trap 'fusermount -u "$XDG_RUNTIME_DIR/doc" 2> /dev/null || true; rm -rf -- "$wor
 "$compiler" --quiet projects/desktop/compositor/main.mlx -o "$work/mlx-compositor"
 "$compiler" --quiet projects/desktop/terminal/main.mlx -o "$work/mlx-terminal"
 "$compiler" --quiet tools/wayland-test-host/main.mlx -o "$work/test-host"
+# The top bar is kept out of the compositor's directory: next to it, every
+# scenario would start it (and its bar would cover the title bars at the
+# top); the scenarios that want it name it with --topbar.
+mkdir -p "$work/bar"
+"$compiler" --quiet projects/desktop/topbar/main.mlx -o "$work/bar/mlx-topbar"
 xkbcli compile-keymap --layout us > "$work/us.xkb"
 
 run_scenario() {
@@ -422,6 +437,159 @@ def white(x0, y0):
 assert white(100, 100) > 10 and white(200, 150) == 0, (white(100, 100), white(200, 150))
 PY
 echo "ok   a pointer lock holds the cursor and relative motion reaches the client"
+
+# Scenario 10c: Aero snap. The terminal opens at (24, 24) and moves below
+# the top bar (its title bar at y 30..49). Dragged to the left edge, the
+# left half of the work area shows the preview (the focus colour, three
+# eighths over what is there) and the window snaps there when let go;
+# Super+Right puts it in the right half; dragging its title bar away
+# brings back its old size under the pointer; the top edge maximizes.
+cat > "$work/snap.script" <<SCRIPT
+wait 5000
+pointer 200 40
+press 272
+pointer 100 200
+pointer 0 300
+wait 300
+shot $work/snap-preview.ppm
+release 272
+wait 600
+down 125
+down 106
+up 106
+up 125
+wait 600
+pointer 700 40
+press 272
+pointer 600 200
+pointer 500 300
+wait 200
+release 272
+wait 600
+pointer 500 300
+press 272
+pointer 500 100
+pointer 500 30
+wait 200
+release 272
+wait 600
+close
+SCRIPT
+run_scenario snap "$work/snap.script" --no-fps --topbar "$work/bar/mlx-topbar" --terminal "$work/mlx-terminal" --run "$work/mlx-terminal"
+log="$work/snap-compositor.log"
+# (The work area: 1024x738 below the bar; its halves 512 wide.)
+grep -q "^snap: left " "$log" && grep -q "^snapped: 512x738 at 0,30" "$log" && grep -q "^window: 508x[0-9]* at 2,52" "$log" || { echo "dragging the window to the left edge did not snap it to the left half" >&2; cat "$log" >&2; exit 1; }
+grep -q "^snap: right " "$log" && grep -q "^snapped: 512x738 at 512,30" "$log" || { echo "Super+Right did not snap the window to the right half" >&2; cat "$log" >&2; exit 1; }
+[[ $(grep -c "^window: 652x396 " "$log") -ge 2 ]] || { echo "dragging a snapped window away did not bring back its size" >&2; cat "$log" >&2; exit 1; }
+grep -q "^maximize: " "$log" || { echo "dragging the window to the top edge did not maximize it" >&2; cat "$log" >&2; exit 1; }
+python3 - "$work/snap-preview.ppm" <<'PY'
+import sys
+data = open(sys.argv[1], 'rb').read()
+_, size, _, pixels = data.split(b'\n', 3)
+width, height = map(int, size.split())
+def rgb(x, y):
+    at = (y * width + x) * 3
+    return tuple(pixels[at:at + 3])
+# The left half is tinted blue, the right half is not, the edge at 512.
+left, right = rgb(300, 150), rgb(800, 150)
+assert left[2] - right[2] > 40 and left[0] - right[0] > 10, (left, right)
+assert rgb(508, 150)[2] - rgb(516, 150)[2] > 40, (rgb(508, 150), rgb(516, 150))
+PY
+echo "ok   Aero snap: the edges snap a dragged window (with a preview) to a half, a quarter or the whole work area; Super+Right too"
+
+# Scenario 10d: workspaces and scrollable tiling, with the top bar. The
+# bar's controls are centred: with workspace 1 shown and no other in use,
+# the buttons 1 and 2 at x 453..476 and 481..504, then the floating half
+# (515..542) and the tiling half (543..570) of the mode button; once
+# workspace 2 has a window the buttons 1 to 3 start at 439, 467 and 495
+# (the mode button at 529); on workspace 3 four buttons show, the first
+# at 425.
+cat > "$work/workspaces.script" <<SCRIPT
+wait 5000
+shot $work/bar-floating.ppm
+pointer 557 15
+press 272
+release 272
+wait 800
+shot $work/bar-tiling.ppm
+down 56
+down 28
+up 28
+up 56
+wait 2500
+down 125
+down 19
+up 19
+up 125
+wait 500
+down 125
+down 105
+up 105
+up 125
+wait 500
+down 125
+down 42
+down 106
+up 106
+up 42
+up 125
+wait 600
+pointer 529 15
+press 272
+release 272
+wait 600
+down 125
+down 42
+down 3
+up 3
+up 42
+up 125
+wait 600
+pointer 479 15
+press 272
+release 272
+wait 600
+down 125
+down 4
+up 4
+up 125
+wait 400
+pointer 437 15
+press 272
+release 272
+wait 600
+close
+SCRIPT
+run_scenario workspaces "$work/workspaces.script" --no-fps --topbar "$work/bar/mlx-topbar" --terminal "$work/mlx-terminal" --run "$work/mlx-terminal"
+log="$work/workspaces-compositor.log"
+expect_line() {
+    grep -q -- "$1" "$log" || { echo "workspaces: $2 (no '$1' in the log)" >&2; cat "$log" >&2; exit 1; }
+}
+expect_line "^tiling: on (workspace 1)" "the bar's tiling half did not turn tiling on"
+expect_line "^column: .* at 8 width 500" "the first window is not the first column"
+expect_line "^column: .* at 516 width 500" "the second window did not open as the column after the first"
+expect_line "^column width: 670 " "Super+R did not widen the column"
+expect_line "^column: .* at 686 width 500" "Super+Shift+Right did not move the column right"
+expect_line "^tiling: off (workspace 1)" "the bar's floating half did not turn tiling off"
+expect_line "^moved to workspace 2: " "Super+Shift+2 did not move the window"
+[[ $(grep -c "^workspace: " "$log") -ge 3 ]] && grep -q "^workspace: 3" "$log" || { echo "the bar's numbers and Super+3 did not switch workspaces" >&2; cat "$log" >&2; exit 1; }
+[[ "$(grep "^workspace: " "$log" | tail -1)" == "workspace: 1" ]] || { echo "the bar's 1 did not bring back workspace 1" >&2; cat "$log" >&2; exit 1; }
+python3 - "$work/bar-floating.ppm" "$work/bar-tiling.ppm" <<'PY'
+import sys
+def load(path):
+    data = open(path, 'rb').read()
+    _, size, _, pixels = data.split(b'\n', 3)
+    width, height = map(int, size.split())
+    return lambda x, y: tuple(pixels[(y * width + x) * 3:(y * width + x) * 3 + 3])
+floating, tiling = load(sys.argv[1]), load(sys.argv[2])
+def lit(pixel): return min(pixel) > 200
+# Workspace 1's button is lit in both; the lit half of the mode button
+# moves from floating to tiling.
+assert lit(floating(465, 7)) and lit(tiling(465, 7)), (floating(465, 7), tiling(465, 7))
+assert lit(floating(520, 7)) and not lit(floating(566, 7)), (floating(520, 7), floating(566, 7))
+assert lit(tiling(566, 7)) and not lit(tiling(520, 7)), (tiling(520, 7), tiling(566, 7))
+PY
+echo "ok   workspaces and scrollable tiling: the bar's buttons and the hotkeys switch, tile, size, focus and move"
 
 # Scenario 11: mlx-settings (its window at (24, 24); the categories in
 # its sidebar 28 pixels apart from y 44: General, Display, Sound, Apps,
