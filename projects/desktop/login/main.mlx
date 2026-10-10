@@ -21,27 +21,26 @@
 //                                       screen asks this); never starts
 //                                       anything
 //
-// What this file does NOT contain, and why: the two steps that need
-// root's power are left as the functions `authenticate` and
-// `startSession` below, each a stub that returns NOT_CONFIGURED with a
-// full description of how to fill it in. They read /etc/shadow and change
-// the process's user; writing that belongs to whoever runs this on their
-// own machine, not to this scaffold. Everything around them -- the bus,
-// the accounts, the greeter protocol, the failure delays -- is here and
-// works, so the daemon builds, owns its name and answers ListUsers today;
-// Login and Unlock answer with an error until the two functions are
-// filled in.
+// The two operations that need root are kept together below: reading the
+// password hash and starting a session after dropping root credentials.
 const std = @import("std")
 const dbus = @import("std.dbus")
 const crash = @import("std.crash")
 const crypt = @import("std.crypt")
+const sha2 = @import("std.sha2")
+const activation = @import("../ipc/activation.mlx")
 const users_module = @import("./users.mlx")
 
 const SYS_read: usize = 0
 const SYS_nanosleep: usize = 35
+const SYS_fork: usize = 57
 const SYS_rt_sigprocmask: usize = 14
 const SYS_signalfd4: usize = 289
 const SYS_getuid: usize = 102
+const SYS_setuid: usize = 105
+const SYS_setgid: usize = 106
+const SYS_setsid: usize = 112
+const SYS_setgroups: usize = 116
 
 const LOGIN_NAME: []const u8 = "org.mlx.Login"
 const LOGIN_PATH: []const u8 = "/org/mlx/Login"
@@ -61,7 +60,6 @@ fn fail(message: []const u8, failure: Failure) -> Failure!void {
 // What a login attempt comes to.
 const DENIED: u8 = 0
 const ALLOWED: u8 = 1
-const NOT_CONFIGURED: u8 = 2
 
 const Login = struct {
     client: dbus.Client
@@ -104,13 +102,7 @@ fn sleep(milliseconds: usize) -> void {
 }
 
 // ===========================================================================
-// THE TWO PRIVILEGED STEPS -- fill these in on your own machine.
-//
-// They are the only places that read a password hash or change the
-// process's user. The rest of mlx-login never touches either, so these
-// two functions are the whole of what a login needs that this scaffold
-// leaves out. Each returns NOT_CONFIGURED as it stands, which makes Login
-// and Unlock answer with org.mlx.Login.Error.NotConfigured.
+// THE TWO PRIVILEGED STEPS.
 // ===========================================================================
 
 // STEP 1 -- CHECK THE PASSWORD.
@@ -138,8 +130,31 @@ fn sleep(milliseconds: usize) -> void {
 // Keep the shadow buffer out of any log and never put the hash or the
 // password in a reply or an error message.
 fn authenticate(login: *Login, user: []const u8, password: []const u8) -> u8 {
-    // Leave this line until the body above is written.
-    return NOT_CONFIGURED
+    var shadow: [65536]u8 = undefined
+    var bytes: [*]u8 = undefined
+    var password_bytes: [*]u8 = undefined
+    unsafe {
+        bytes = @ptrCast([*]u8, &shadow)
+        password_bytes = @ptrCast([*]u8, password)
+    }
+    defer sha2.wipe(bytes, 65536)
+    defer sha2.wipe(password_bytes, password.length)
+    const filled = users_module.readDatabase("/etc/shadow", bytes, 65536)
+    if filled == 0 { return DENIED }
+    var start: usize = 0
+    while start < filled {
+        var end = start
+        while end < filled && bytes[end] != 10 { end += 1 }
+        if end > start + user.length && bytes[start + user.length] == 58 && same(bytes[start..start + user.length], user) {
+            const hash_start = start + user.length + 1
+            var hash_end = hash_start
+            while hash_end < end && bytes[hash_end] != 58 { hash_end += 1 }
+            if hash_end == hash_start || bytes[hash_start] == 33 || bytes[hash_start] == 42 { return DENIED }
+            return if crypt.verify(password, bytes[hash_start..hash_end]) { ALLOWED } else { DENIED }
+        }
+        start = end + 1
+    }
+    return DENIED
 }
 
 // STEP 2 -- START THE SESSION AS THE USER.
@@ -185,19 +200,85 @@ fn authenticate(login: *Login, user: []const u8, password: []const u8) -> u8 {
 // switching. A fuller mlx-login answers that interface too (TakeControl,
 // TakeDevice, SwitchTo); until then, run the session's compositor on a
 // VT it opens directly, as it does now without logind.
+fn environmentEntry(storage: *[2048]u8, used: usize, items: *[12][*]const u8, index: usize, key: []const u8, value: []const u8) -> usize {
+    var bytes: [*]u8 = undefined
+    unsafe {
+        bytes = @ptrCast([*]u8, storage)
+        items.*[index] = @ptrFromInt([*]const u8, @intFromPtr(bytes) + used)
+    }
+    var end = std.text.append(bytes, used, 2048, key)
+    end = std.text.append(bytes, end, 2048, value)
+    bytes[end] = 0
+    return end + 1
+}
+
+fn pointer(bytes: []const u8) -> [*]const u8 {
+    unsafe { return @ptrCast([*]const u8, bytes) }
+}
+
 fn startSession(login: *Login, index: usize, session: []const u8) -> u8 {
-    // Leave this line until the body above is written.
-    return NOT_CONFIGURED
+    const program = pointer(session)
+    if session.length == 0 || session.length >= 1024 || program[session.length] != 0 { return DENIED }
+    const user = users_module.userAt(usersOf(login), index)
+    const name = users_module.nameOf(user)
+    var groups: [users_module.MAX_GROUPS]u32 = undefined
+    var group_bytes: [*]u32 = undefined
+    unsafe { group_bytes = @ptrCast([*]u32, &groups) }
+    const group_count = users_module.groups(name, user.*.gid, group_bytes, users_module.MAX_GROUPS)
+    if group_count == 0 { return DENIED }
+
+    var runtime: [256]u8 = undefined
+    var runtime_bytes: [*]u8 = undefined
+    unsafe { runtime_bytes = @ptrCast([*]u8, &runtime) }
+    var runtime_length = std.text.append(runtime_bytes, 0, 256, "/run/mlx/user/")
+    runtime_length = std.text.appendUnsigned(runtime_bytes, runtime_length, 256, @intCast(usize, user.*.uid))
+    runtime[runtime_length] = 0
+    const mlx = std.fs.makeDirResult(pointer("/run/mlx"), 493)
+    const parent = std.fs.makeDirResult(pointer("/run/mlx/user"), 493)
+    const runtime_path = pointer(runtime_bytes[0..runtime_length])
+    const made = std.fs.makeDirResult(runtime_path, 448)
+    if !std.fs.chmod(runtime_path, 448) || !std.fs.changeOwner(runtime_path, @intCast(usize, user.*.uid), @intCast(usize, user.*.gid), false) { return DENIED }
+
+    var arguments: [2][*]const u8 = undefined
+    unsafe {
+        arguments[0] = program
+        arguments[1] = @ptrFromInt([*]const u8, 0)
+    }
+
+    var environment_storage: [2048]u8 = undefined
+    var environment: [12][*]const u8 = undefined
+    var used = environmentEntry(&environment_storage, 0, &environment, 0, "HOME=", users_module.homeOf(user))
+    used = environmentEntry(&environment_storage, used, &environment, 1, "USER=", name)
+    used = environmentEntry(&environment_storage, used, &environment, 2, "LOGNAME=", name)
+    used = environmentEntry(&environment_storage, used, &environment, 3, "SHELL=", users_module.shellOf(user))
+    used = environmentEntry(&environment_storage, used, &environment, 4, "PATH=", "/usr/local/bin:/usr/bin:/bin")
+    used = environmentEntry(&environment_storage, used, &environment, 5, "XDG_RUNTIME_DIR=", runtime_bytes[0..runtime_length])
+    used = environmentEntry(&environment_storage, used, &environment, 6, "XDG_SESSION_TYPE=", "wayland")
+    used = environmentEntry(&environment_storage, used, &environment, 7, "XDG_SEAT=", "seat0")
+    const inherited_vt = std.process.environmentFrom(login.*.environment, "XDG_VTNR")
+    var vt = if inherited_vt == null { std.string.fromSlice("1") } else { inherited_vt.? }
+    if vt.length > 16 { vt = std.string.fromSlice("1") }
+    used = environmentEntry(&environment_storage, used, &environment, 8, "XDG_VTNR=", std.string.asSlice(vt))
+    unsafe { environment[9] = @ptrFromInt([*]const u8, 0) }
+
+    const pid = std.linux.syscall0(SYS_fork)
+    if pid < 0 { return DENIED }
+    if pid == 0 {
+        if std.linux.syscall0(SYS_setsid) < 0 || std.linux.syscall2(SYS_setgroups, group_count, @intFromPtr(group_bytes)) < 0 || std.linux.syscall1(SYS_setgid, @intCast(usize, user.*.gid)) < 0 || std.linux.syscall1(SYS_setuid, @intCast(usize, user.*.uid)) < 0 || !std.fs.changeDirectory(pointer(users_module.homeOf(user))) {
+            std.linux.thread.exit(126)
+        }
+        unsafe { activation.execute(program, @ptrCast([*][*]const u8, &arguments), @ptrCast([*][*]const u8, &environment)) }
+        std.linux.thread.exit(127)
+    }
+    unsafe { std.mem.copy(@ptrCast([*]u8, &login.*.active), @ptrCast([*]const u8, name), name.length) }
+    login.*.activeLength = name.length
+    return ALLOWED
 }
 
 // ===========================================================================
 // The bus side: it never sees a password beyond handing it to
 // authenticate, and never a uid change beyond calling startSession.
 // ===========================================================================
-
-fn notConfigured(login: *Login, call: *const dbus.Header) -> void {
-    sendError(login, call, "org.mlx.Login.Error.NotConfigured", "mlx-login: the password check or the session start is not configured on this machine (projects/desktop/login/main.mlx: authenticate, startSession)")
-}
 
 fn sendError(login: *Login, call: *const dbus.Header, name: []const u8, message: []const u8) -> void {
     var header = dbus.newHeader(dbus.ERROR, 0)
@@ -279,10 +360,6 @@ fn handleLogin(login: *Login, call: *const dbus.Header, body: [*]const u8) -> vo
         return
     }
     const checked = authenticate(login, user, password)
-    if checked == NOT_CONFIGURED {
-        notConfigured(login, call)
-        return
-    }
     if checked != ALLOWED {
         sleep(FAILURE_DELAY_MS)
         say(login, "login: wrong password\n")
@@ -290,10 +367,6 @@ fn handleLogin(login: *Login, call: *const dbus.Header, body: [*]const u8) -> vo
         return
     }
     const started = startSession(login, index, session)
-    if started == NOT_CONFIGURED {
-        notConfigured(login, call)
-        return
-    }
     replyBool(login, call, started == ALLOWED)
 }
 
@@ -314,10 +387,6 @@ fn unlock(login: *Login, call: *const dbus.Header, body: [*]const u8) -> void {
         return
     }
     const checked = authenticate(login, user, password)
-    if checked == NOT_CONFIGURED {
-        notConfigured(login, call)
-        return
-    }
     if checked != ALLOWED { sleep(FAILURE_DELAY_MS) }
     replyBool(login, call, checked == ALLOWED)
 }
