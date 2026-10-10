@@ -13,7 +13,9 @@ projects/.../main.mlx -o ...`) and is checked by a script under `tools/`.
     clients (the dock, the application launcher, the top bar, the
     settings and the file manager); `tools/check_desktop_clients.sh`.
     The compositor's README describes them.
-  - [`terminal/`](desktop/terminal/README.md): the terminal emulator.
+  - [`terminal/`](desktop/terminal/README.md): the terminal emulator, a
+    window around `std.terminal` and `std.ui.terminal`;
+    `tools/check_terminal.sh`.
   - `shared/`: what the desktop's clients share: the drawing canvas (CPU
     and GPU), the layer-shell and window surface (`panel.mlx`), keyboard
     text, desktop entries and icons, places and the trash, thumbnails,
@@ -33,6 +35,9 @@ projects/.../main.mlx -o ...`) and is checked by a script under `tools/`.
 - [`init/`](init/README.md): mlx-init, PID 1 of MLX/Linux (mounts,
   services, supervision, the control socket, shutdown) and mlx-initctl;
   `tools/check_init.sh`.
+- [`shell/`](shell/README.md): mlx-sh, the POSIX shell of MLX/Linux with
+  a line editor (scripts as dash runs them, the shell of mlx-terminal and
+  mlx-console); `tools/check_shell.sh`.
 
 What the projects share beyond one project lives in `std` (`std.gpu`,
 `std.crash`, `std.timezone`, `std.ui`, `std.png`, `std.truetype`, ...).

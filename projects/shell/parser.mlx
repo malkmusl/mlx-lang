@@ -1,0 +1,1042 @@
+// The lexer and the parser of mlx-sh: the source becomes a tree of
+// state.Node records (lists, and-or chains, pipelines, simple commands with
+// their words and redirections, the compound commands, function
+// definitions). Words stay as written, quotes and all; expand.mlx takes
+// them apart when the command runs. Heredoc bodies are found after the
+// line's newline and attached to their redirections.
+//
+//     var parser: Parser = undefined
+//     const root = parse(&parser, shell, text)
+//     if parser.status == INCOMPLETE { ... read another line ... }
+//     if parser.status == SYNTAX { ... parser.message ... }
+const std = @import("std")
+const state = @import("./state.mlx")
+
+const Shell = state.Shell
+const Node = state.Node
+
+// Parse results.
+pub const OK: u8 = 0
+pub const INCOMPLETE: u8 = 1
+pub const SYNTAX: u8 = 2
+
+// Token kinds.
+const T_EOF: u8 = 0
+const T_NEWLINE: u8 = 1
+const T_WORD: u8 = 2
+const T_PIPE: u8 = 3
+const T_AND: u8 = 4
+const T_OR: u8 = 5
+const T_SEMI: u8 = 6
+const T_AMP: u8 = 7
+const T_LPAREN: u8 = 8
+const T_RPAREN: u8 = 9
+const T_LESS: u8 = 10
+const T_GREAT: u8 = 11
+const T_DGREAT: u8 = 12
+const T_DLESS: u8 = 13
+const T_DLESSDASH: u8 = 14
+const T_LESSAND: u8 = 15
+const T_GREATAND: u8 = 16
+const T_LESSGREAT: u8 = 17
+const T_CLOBBER: u8 = 18
+const T_DSEMI: u8 = 19
+const T_IONUMBER: u8 = 20
+const T_ANDGREAT: u8 = 21
+
+const MAX_HEREDOCS: usize = 16
+
+pub const Parser = struct {
+    shell: *Shell
+    // The source, as a slice of the shell's text arena, and where it
+    // starts there.
+    text: []const u8
+    base: usize
+    at: usize
+    // The current token.
+    kind: u8
+    start: usize
+    end: usize
+    // A word with quotes or escapes cannot be a reserved word.
+    plain: bool
+    peeked: bool
+    // Heredoc redirections waiting for their bodies (after the newline).
+    heredocs: [MAX_HEREDOCS]u32
+    heredocCount: usize
+    status: u8
+    message: []const u8
+    errorAt: usize
+}
+
+fn blank(byte: u8) -> bool { return byte == 32 || byte == 9 }
+
+fn operatorStart(byte: u8) -> bool {
+    return byte == 124 || byte == 38 || byte == 59 || byte == 40 || byte == 41 || byte == 60 || byte == 62
+}
+
+fn digit(byte: u8) -> bool { return byte >= 48 && byte <= 57 }
+
+fn byteAt(parser: *Parser, at: usize) -> u8 {
+    if at >= parser.*.text.length { return 0 }
+    return parser.*.text[at]
+}
+
+fn fail(parser: *Parser, message: []const u8) -> void {
+    if parser.*.status == OK {
+        parser.*.status = SYNTAX
+        parser.*.message = message
+        parser.*.errorAt = parser.*.start
+    }
+}
+
+fn incomplete(parser: *Parser) -> void {
+    if parser.*.status == OK { parser.*.status = INCOMPLETE }
+}
+
+// ---------------------------------------------------------------------------
+// The lexer
+
+// Skips to the end of a quoted or substituted part that began at `at`
+// (the opening byte there); the position after it, or the text's length
+// with `closed` false when it is not closed.
+fn skipQuoted(parser: *Parser, at: usize, closed: *bool) -> usize {
+    const text = parser.*.text
+    const opener = text[at]
+    var index = at + 1
+    closed.* = false
+    if opener == 39 {
+        while index < text.length {
+            if text[index] == 39 {
+                closed.* = true
+                return index + 1
+            }
+            index += 1
+        }
+        return index
+    }
+    if opener == 34 {
+        while index < text.length {
+            const byte = text[index]
+            if byte == 34 {
+                closed.* = true
+                return index + 1
+            }
+            if byte == 92 {
+                index += 2
+                continue
+            }
+            if byte == 36 && index + 1 < text.length && (text[index + 1] == 40 || text[index + 1] == 123) {
+                var inner = false
+                index = skipQuoted(parser, index + 1, &inner)
+                if !inner { return text.length }
+                continue
+            }
+            if byte == 96 {
+                var inner = false
+                index = skipQuoted(parser, index, &inner)
+                if !inner { return text.length }
+                continue
+            }
+            index += 1
+        }
+        return index
+    }
+    if opener == 96 {
+        while index < text.length {
+            if text[index] == 92 {
+                index += 2
+                continue
+            }
+            if text[index] == 96 {
+                closed.* = true
+                return index + 1
+            }
+            index += 1
+        }
+        return index
+    }
+    // $( ... ) or $(( ... )) or ${ ... }: nested parts respected.
+    const closer: u8 = if opener == 40 { 41 } else { 125 }
+    var depth: usize = 1
+    while index < text.length {
+        const byte = text[index]
+        if byte == 92 {
+            index += 2
+            continue
+        }
+        if byte == 39 || byte == 34 || byte == 96 {
+            var inner = false
+            index = skipQuoted(parser, index, &inner)
+            if !inner { return text.length }
+            continue
+        }
+        if byte == opener {
+            depth += 1
+        } else if byte == closer {
+            depth -= 1
+            if depth == 0 {
+                closed.* = true
+                return index + 1
+            }
+        }
+        index += 1
+    }
+    return index
+}
+
+// A word from `start`: its end. `plain` says it has no quotes or escapes.
+fn scanWord(parser: *Parser, start: usize, plain: *bool) -> usize {
+    const text = parser.*.text
+    var index = start
+    plain.* = true
+    while index < text.length {
+        const byte = text[index]
+        if blank(byte) || byte == 10 || operatorStart(byte) { break }
+        if byte == 92 {
+            plain.* = false
+            if index + 1 >= text.length {
+                incomplete(parser)
+                return text.length
+            }
+            // A backslash-newline joins the lines.
+            index += 2
+            continue
+        }
+        if byte == 39 || byte == 34 || byte == 96 {
+            plain.* = false
+            var closed = false
+            index = skipQuoted(parser, index, &closed)
+            if !closed {
+                incomplete(parser)
+                return text.length
+            }
+            continue
+        }
+        if byte == 36 && index + 1 < text.length && (text[index + 1] == 40 || text[index + 1] == 123) {
+            plain.* = false
+            var closed = false
+            index = skipQuoted(parser, index + 1, &closed)
+            if !closed {
+                incomplete(parser)
+                return text.length
+            }
+            continue
+        }
+        index += 1
+    }
+    return index
+}
+
+// Reads the heredoc bodies that follow a newline at `at`: the lines up to
+// each delimiter; the position after them.
+fn readHeredocs(parser: *Parser, at: usize) -> usize {
+    const shell = parser.*.shell
+    const text = parser.*.text
+    var index = at
+    var which: usize = 0
+    while which < parser.*.heredocCount {
+        const node = state.nodeAt(shell, parser.*.heredocs[which])
+        // The delimiter is the target word (quotes removed).
+        const target = state.nodeAt(shell, node.*.first)
+        var delimiter: [256]u8 = undefined
+        var delimiter_bytes: [*]u8 = undefined
+        unsafe { delimiter_bytes = @ptrCast([*]u8, &delimiter) }
+        var delimiter_length: usize = 0
+        var quoted = false
+        const raw = state.textOf(shell, target.*.text, target.*.length)
+        var raw_index: usize = 0
+        while raw_index < raw.length {
+            const byte = raw[raw_index]
+            if byte == 39 || byte == 34 {
+                quoted = true
+            } else if byte == 92 && raw_index + 1 < raw.length {
+                quoted = true
+                raw_index += 1
+                if delimiter_length < 256 {
+                    delimiter[delimiter_length] = raw[raw_index]
+                    delimiter_length += 1
+                }
+            } else if delimiter_length < 256 {
+                delimiter[delimiter_length] = byte
+                delimiter_length += 1
+            }
+            raw_index += 1
+        }
+        if quoted { node.*.flags |= state.NO_EXPAND }
+        const strip_tabs = node.*.flags & state.IN_WORDS != 0
+        const body_start = index
+        var body_end = index
+        var found = false
+        while index < text.length {
+            var line_end = index
+            while line_end < text.length && text[line_end] != 10 { line_end += 1 }
+            var line_start = index
+            if strip_tabs { while line_start < line_end && text[line_start] == 9 { line_start += 1 } }
+            if std.text.same(text[line_start..line_end], delimiter_bytes[0..delimiter_length]) {
+                found = true
+                body_end = index
+                index = if line_end < text.length { line_end + 1 } else { line_end }
+                break
+            }
+            index = if line_end < text.length { line_end + 1 } else { line_end }
+            body_end = index
+        }
+        if !found {
+            incomplete(parser)
+            return text.length
+        }
+        if strip_tabs {
+            // The body without its leading tabs, kept after the source.
+            var copy: [65536]u8 = undefined
+            var copy_bytes: [*]u8 = undefined
+            unsafe { copy_bytes = @ptrCast([*]u8, &copy) }
+            var copied: usize = 0
+            var line = body_start
+            while line < body_end {
+                var line_end = line
+                while line_end < body_end && text[line_end] != 10 { line_end += 1 }
+                var from = line
+                while from < line_end && text[from] == 9 { from += 1 }
+                while from <= line_end && from < body_end && copied < 65536 {
+                    copy[copied] = text[from]
+                    copied += 1
+                    from += 1
+                }
+                line = line_end + 1
+            }
+            const kept = state.appendText(shell, copy_bytes[0..copied])
+            if kept == state.TEXT_CAPACITY {
+                fail(parser, "heredoc too long")
+            } else {
+                node.*.text = @intCast(u32, kept)
+                node.*.length = @intCast(u32, copied)
+            }
+        } else {
+            node.*.text = @intCast(u32, parser.*.base + body_start)
+            node.*.length = @intCast(u32, body_end - body_start)
+        }
+        which += 1
+    }
+    parser.*.heredocCount = 0
+    return index
+}
+
+// The next token into the parser's current-token fields.
+fn lex(parser: *Parser) -> void {
+    const text = parser.*.text
+    var index = parser.*.at
+    // Blanks, backslash-newlines and comments.
+    var skipping = true
+    while skipping {
+        while index < text.length && blank(text[index]) { index += 1 }
+        if index + 1 < text.length && text[index] == 92 && text[index + 1] == 10 {
+            index += 2
+        } else if index < text.length && text[index] == 35 {
+            while index < text.length && text[index] != 10 { index += 1 }
+        } else {
+            skipping = false
+        }
+    }
+    parser.*.start = index
+    parser.*.plain = false
+    if index >= text.length {
+        parser.*.kind = T_EOF
+        parser.*.end = index
+        parser.*.at = index
+        if parser.*.heredocCount > 0 { incomplete(parser) }
+        return
+    }
+    const byte = text[index]
+    if byte == 10 {
+        parser.*.kind = T_NEWLINE
+        parser.*.end = index + 1
+        parser.*.at = index + 1
+        if parser.*.heredocCount > 0 { parser.*.at = readHeredocs(parser, index + 1) }
+        return
+    }
+    // IO_NUMBER: digits right before < or >.
+    if digit(byte) {
+        var end = index
+        while end < text.length && digit(text[end]) { end += 1 }
+        if end < text.length && (text[end] == 60 || text[end] == 62) {
+            parser.*.kind = T_IONUMBER
+            parser.*.end = end
+            parser.*.at = end
+            return
+        }
+    }
+    const next = byteAt(parser, index + 1)
+    var length: usize = 1
+    var kind: u8 = T_WORD
+    if byte == 124 {
+        kind = T_PIPE
+        if next == 124 {
+            kind = T_OR
+            length = 2
+        }
+    } else if byte == 38 {
+        kind = T_AMP
+        if next == 38 {
+            kind = T_AND
+            length = 2
+        } else if next == 62 {
+            kind = T_ANDGREAT
+            length = 2
+        }
+    } else if byte == 59 {
+        kind = T_SEMI
+        if next == 59 {
+            kind = T_DSEMI
+            length = 2
+        }
+    } else if byte == 40 {
+        kind = T_LPAREN
+    } else if byte == 41 {
+        kind = T_RPAREN
+    } else if byte == 60 {
+        kind = T_LESS
+        if next == 60 {
+            kind = T_DLESS
+            length = 2
+            if byteAt(parser, index + 2) == 45 {
+                kind = T_DLESSDASH
+                length = 3
+            }
+        } else if next == 38 {
+            kind = T_LESSAND
+            length = 2
+        } else if next == 62 {
+            kind = T_LESSGREAT
+            length = 2
+        }
+    } else if byte == 62 {
+        kind = T_GREAT
+        if next == 62 {
+            kind = T_DGREAT
+            length = 2
+        } else if next == 38 {
+            kind = T_GREATAND
+            length = 2
+        } else if next == 124 {
+            kind = T_CLOBBER
+            length = 2
+        }
+    }
+    if kind != T_WORD {
+        parser.*.kind = kind
+        parser.*.end = index + length
+        parser.*.at = index + length
+        return
+    }
+    var plain = false
+    const end = scanWord(parser, index, &plain)
+    parser.*.kind = T_WORD
+    parser.*.end = end
+    parser.*.at = end
+    parser.*.plain = plain
+}
+
+fn tokenText(parser: *Parser) -> []const u8 { return parser.*.text[parser.*.start..parser.*.end] }
+
+// The current token (lexed on first use after advance).
+fn current(parser: *Parser) -> u8 {
+    if !parser.*.peeked {
+        lex(parser)
+        parser.*.peeked = true
+    }
+    return parser.*.kind
+}
+
+fn advance(parser: *Parser) -> void {
+    const seen = current(parser)
+    parser.*.peeked = false
+}
+
+fn isReserved(parser: *Parser, word: []const u8) -> bool {
+    return current(parser) == T_WORD && parser.*.plain && std.text.same(tokenText(parser), word)
+}
+
+fn skipNewlines(parser: *Parser) -> void {
+    while current(parser) == T_NEWLINE { advance(parser) }
+}
+
+// A WORD node for the current token.
+fn wordNode(parser: *Parser) -> u32 {
+    const node = state.newNode(parser.*.shell, state.WORD)
+    if node == 0 {
+        fail(parser, "too many words")
+        return 0
+    }
+    const record = state.nodeAt(parser.*.shell, node)
+    record.*.text = @intCast(u32, parser.*.base + parser.*.start)
+    record.*.length = @intCast(u32, parser.*.end - parser.*.start)
+    return node
+}
+
+// ---------------------------------------------------------------------------
+// The parser
+
+fn isRedirectToken(kind: u8) -> bool {
+    return kind == T_LESS || kind == T_GREAT || kind == T_DGREAT || kind == T_DLESS || kind == T_DLESSDASH || kind == T_LESSAND || kind == T_GREATAND || kind == T_LESSGREAT || kind == T_CLOBBER || kind == T_IONUMBER || kind == T_ANDGREAT
+}
+
+// A redirection at the current token (an IO_NUMBER, or an operator).
+fn parseRedirect(parser: *Parser) -> u32 {
+    const shell = parser.*.shell
+    var fd: usize = 0
+    var has_fd = false
+    if current(parser) == T_IONUMBER {
+        const digits = tokenText(parser)
+        for byte in digits { fd = fd * 10 + @intCast(usize, byte - 48) }
+        has_fd = true
+        advance(parser)
+    }
+    const kind = current(parser)
+    var operator: u16 = 0
+    var default_fd: usize = 0
+    if kind == T_LESS {
+        operator = state.R_INPUT
+    } else if kind == T_GREAT {
+        operator = state.R_OUTPUT
+        default_fd = 1
+    } else if kind == T_DGREAT {
+        operator = state.R_APPEND
+        default_fd = 1
+    } else if kind == T_DLESS || kind == T_DLESSDASH {
+        operator = state.R_HEREDOC
+    } else if kind == T_LESSAND {
+        operator = state.R_DUP_INPUT
+    } else if kind == T_GREATAND {
+        operator = state.R_DUP_OUTPUT
+        default_fd = 1
+    } else if kind == T_LESSGREAT {
+        operator = state.R_READ_WRITE
+    } else if kind == T_CLOBBER {
+        operator = state.R_CLOBBER
+        default_fd = 1
+    } else if kind == T_ANDGREAT {
+        operator = state.R_BOTH
+        default_fd = 1
+    } else {
+        fail(parser, "a redirection operator was expected")
+        return 0
+    }
+    const strip = kind == T_DLESSDASH
+    advance(parser)
+    if current(parser) != T_WORD {
+        if current(parser) == T_EOF { incomplete(parser) } else { fail(parser, "a file name was expected after the redirection") }
+        return 0
+    }
+    const target = wordNode(parser)
+    advance(parser)
+    const node = state.newNode(shell, state.REDIRECT)
+    if node == 0 || target == 0 {
+        fail(parser, "too many nodes")
+        return 0
+    }
+    const record = state.nodeAt(shell, node)
+    record.*.number = @intCast(u16, (if has_fd { fd } else { default_fd }) & 255) | (operator << 8)
+    record.*.first = target
+    if strip { record.*.flags |= state.IN_WORDS }
+    if operator == state.R_HEREDOC {
+        if parser.*.heredocCount >= MAX_HEREDOCS {
+            fail(parser, "too many heredocs on one line")
+            return 0
+        }
+        parser.*.heredocs[parser.*.heredocCount] = node
+        parser.*.heredocCount += 1
+    }
+    return node
+}
+
+// NAME=... as the whole word (NAME a name).
+fn isAssignment(word: []const u8) -> bool {
+    if word.length == 0 { return false }
+    const first = word[0]
+    if !((first >= 65 && first <= 90) || (first >= 97 && first <= 122) || first == 95) { return false }
+    var index: usize = 1
+    while index < word.length {
+        const byte = word[index]
+        if byte == 61 { return true }
+        if !((byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122) || (byte >= 48 && byte <= 57) || byte == 95) { return false }
+        index += 1
+    }
+    return false
+}
+
+fn isReservedWord(text: []const u8) -> bool {
+    return std.text.same(text, "if") || std.text.same(text, "then") || std.text.same(text, "else") || std.text.same(text, "elif") || std.text.same(text, "fi") || std.text.same(text, "for") || std.text.same(text, "while") || std.text.same(text, "until") || std.text.same(text, "do") || std.text.same(text, "done") || std.text.same(text, "case") || std.text.same(text, "esac") || std.text.same(text, "in") || std.text.same(text, "{") || std.text.same(text, "}") || std.text.same(text, "!")
+}
+
+// A simple command: assignments, then the words, redirections anywhere.
+fn parseSimple(parser: *Parser) -> u32 {
+    const shell = parser.*.shell
+    const node = state.newNode(shell, state.SIMPLE)
+    if node == 0 {
+        fail(parser, "too many nodes")
+        return 0
+    }
+    var seen_command = false
+    var any = false
+    var going = true
+    while going && parser.*.status == OK {
+        const kind = current(parser)
+        if isRedirectToken(kind) {
+            state.addChild(shell, node, parseRedirect(parser))
+            any = true
+        } else if kind == T_WORD {
+            // A reserved word ends the command once it has words.
+            if any && parser.*.plain && isReservedWord(tokenText(parser)) && !seen_command {
+                going = false
+            } else {
+                const word = wordNode(parser)
+                if word == 0 { return 0 }
+                if !seen_command && isAssignment(tokenText(parser)) {
+                    state.nodeAt(shell, word).*.flags |= state.ASSIGNMENT
+                } else {
+                    seen_command = true
+                }
+                state.addChild(shell, node, word)
+                advance(parser)
+                any = true
+            }
+        } else {
+            going = false
+        }
+    }
+    return node
+}
+
+// Trailing redirections after a compound command.
+fn parseTrailingRedirects(parser: *Parser, node: u32) -> void {
+    while isRedirectToken(current(parser)) && parser.*.status == OK {
+        state.addChild(parser.*.shell, node, parseRedirect(parser))
+    }
+}
+
+// A list up to (not including) a reserved word that ends it, `)` or `}`;
+// a LIST node.
+fn parseCompoundList(parser: *Parser) -> u32 {
+    const shell = parser.*.shell
+    const list = state.newNode(shell, state.LIST)
+    if list == 0 {
+        fail(parser, "too many nodes")
+        return 0
+    }
+    skipNewlines(parser)
+    var going = true
+    while going && parser.*.status == OK {
+        const kind = current(parser)
+        if kind == T_EOF {
+            incomplete(parser)
+            return list
+        }
+        if kind == T_RPAREN || kind == T_DSEMI || (kind == T_WORD && parser.*.plain && endsList(tokenText(parser))) { return list }
+        const item = parseAndOr(parser)
+        if item == 0 { return list }
+        state.addChild(shell, list, item)
+        const separator = current(parser)
+        if separator == T_AMP {
+            state.nodeAt(shell, item).*.flags |= state.BACKGROUND
+            advance(parser)
+        } else if separator == T_SEMI || separator == T_NEWLINE {
+            advance(parser)
+        } else if separator == T_EOF {
+            incomplete(parser)
+            return list
+        } else if separator == T_RPAREN || separator == T_DSEMI || (separator == T_WORD && parser.*.plain && endsList(tokenText(parser))) {
+            return list
+        } else {
+            fail(parser, "unexpected token")
+            return list
+        }
+        skipNewlines(parser)
+    }
+    return list
+}
+
+fn endsList(text: []const u8) -> bool {
+    return std.text.same(text, "then") || std.text.same(text, "else") || std.text.same(text, "elif") || std.text.same(text, "fi") || std.text.same(text, "do") || std.text.same(text, "done") || std.text.same(text, "esac") || std.text.same(text, "}") || std.text.same(text, ";;")
+}
+
+fn expectReserved(parser: *Parser, word: []const u8, message: []const u8) -> bool {
+    skipNewlines(parser)
+    if isReserved(parser, word) {
+        advance(parser)
+        return true
+    }
+    if current(parser) == T_EOF { incomplete(parser) } else { fail(parser, message) }
+    return false
+}
+
+// if LIST then LIST (elif LIST then LIST)* (else LIST)? fi
+fn parseIf(parser: *Parser) -> u32 {
+    const shell = parser.*.shell
+    advance(parser)
+    const node = state.newNode(shell, state.IF)
+    if node == 0 { return 0 }
+    var going = true
+    while going && parser.*.status == OK {
+        const clause = state.newNode(shell, state.CLAUSE)
+        const condition = parseCompoundList(parser)
+        if !expectReserved(parser, "then", "'then' was expected") { return node }
+        const body = parseCompoundList(parser)
+        if clause == 0 { return 0 }
+        state.nodeAt(shell, clause).*.first = condition
+        state.nodeAt(shell, clause).*.extra = body
+        state.addChild(shell, node, clause)
+        skipNewlines(parser)
+        if isReserved(parser, "elif") {
+            advance(parser)
+        } else if isReserved(parser, "else") {
+            advance(parser)
+            const otherwise = state.newNode(shell, state.ELSE)
+            if otherwise == 0 { return 0 }
+            state.nodeAt(shell, otherwise).*.extra = parseCompoundList(parser)
+            state.addChild(shell, node, otherwise)
+            going = false
+        } else {
+            going = false
+        }
+    }
+    if !expectReserved(parser, "fi", "'fi' was expected") { return node }
+    parseTrailingRedirects(parser, node)
+    return node
+}
+
+// for NAME (in WORDS)? ;? do LIST done
+fn parseFor(parser: *Parser) -> u32 {
+    const shell = parser.*.shell
+    advance(parser)
+    const node = state.newNode(shell, state.FOR)
+    if node == 0 { return 0 }
+    if current(parser) != T_WORD {
+        if current(parser) == T_EOF { incomplete(parser) } else { fail(parser, "a variable name was expected after 'for'") }
+        return node
+    }
+    const record = state.nodeAt(shell, node)
+    record.*.text = @intCast(u32, parser.*.base + parser.*.start)
+    record.*.length = @intCast(u32, parser.*.end - parser.*.start)
+    advance(parser)
+    skipNewlines(parser)
+    if isReserved(parser, "in") {
+        advance(parser)
+        record.*.flags |= state.IN_WORDS
+        while current(parser) == T_WORD {
+            const word = wordNode(parser)
+            if word == 0 { return 0 }
+            state.addChild(shell, node, word)
+            advance(parser)
+        }
+    }
+    if current(parser) == T_SEMI { advance(parser) }
+    if !expectReserved(parser, "do", "'do' was expected") { return node }
+    const body = state.newNode(shell, state.BODY)
+    if body == 0 { return 0 }
+    state.nodeAt(shell, body).*.first = parseCompoundList(parser)
+    state.nodeAt(shell, node).*.extra = body
+    if !expectReserved(parser, "done", "'done' was expected") { return node }
+    parseTrailingRedirects(parser, node)
+    return node
+}
+
+// while LIST do LIST done, until LIST do LIST done
+fn parseWhile(parser: *Parser, kind: u8) -> u32 {
+    const shell = parser.*.shell
+    advance(parser)
+    const node = state.newNode(shell, kind)
+    if node == 0 { return 0 }
+    state.nodeAt(shell, node).*.first = parseCompoundList(parser)
+    if !expectReserved(parser, "do", "'do' was expected") { return node }
+    const body = state.newNode(shell, state.BODY)
+    if body == 0 { return 0 }
+    state.nodeAt(shell, body).*.first = parseCompoundList(parser)
+    state.nodeAt(shell, node).*.extra = body
+    if !expectReserved(parser, "done", "'done' was expected") { return node }
+    parseTrailingRedirects(parser, node)
+    return node
+}
+
+// case WORD in (PATTERN (| PATTERN)* ) LIST ;;)* esac
+fn parseCase(parser: *Parser) -> u32 {
+    const shell = parser.*.shell
+    advance(parser)
+    const node = state.newNode(shell, state.CASE)
+    if node == 0 { return 0 }
+    if current(parser) != T_WORD {
+        if current(parser) == T_EOF { incomplete(parser) } else { fail(parser, "a word was expected after 'case'") }
+        return node
+    }
+    const record = state.nodeAt(shell, node)
+    record.*.text = @intCast(u32, parser.*.base + parser.*.start)
+    record.*.length = @intCast(u32, parser.*.end - parser.*.start)
+    advance(parser)
+    if !expectReserved(parser, "in", "'in' was expected") { return node }
+    skipNewlines(parser)
+    while !isReserved(parser, "esac") && parser.*.status == OK {
+        if current(parser) == T_EOF {
+            incomplete(parser)
+            return node
+        }
+        const item = state.newNode(shell, state.ITEM)
+        if item == 0 { return 0 }
+        if current(parser) == T_LPAREN { advance(parser) }
+        var patterns = true
+        while patterns && parser.*.status == OK {
+            if current(parser) != T_WORD {
+                if current(parser) == T_EOF { incomplete(parser) } else { fail(parser, "a pattern was expected") }
+                return node
+            }
+            const pattern = wordNode(parser)
+            if pattern == 0 { return 0 }
+            state.addChild(shell, item, pattern)
+            advance(parser)
+            if current(parser) == T_PIPE { advance(parser) } else { patterns = false }
+        }
+        if current(parser) != T_RPAREN {
+            if current(parser) == T_EOF { incomplete(parser) } else { fail(parser, "')' was expected after the pattern") }
+            return node
+        }
+        advance(parser)
+        const body = state.newNode(shell, state.BODY)
+        if body == 0 { return 0 }
+        state.nodeAt(shell, body).*.first = parseCompoundList(parser)
+        state.nodeAt(shell, item).*.extra = body
+        state.addChild(shell, node, item)
+        skipNewlines(parser)
+        if current(parser) == T_DSEMI {
+            advance(parser)
+            skipNewlines(parser)
+        } else if !isReserved(parser, "esac") {
+            if current(parser) == T_EOF { incomplete(parser) } else { fail(parser, "';;' or 'esac' was expected") }
+            return node
+        }
+    }
+    if parser.*.status != OK { return node }
+    advance(parser)
+    parseTrailingRedirects(parser, node)
+    return node
+}
+
+// { LIST } and ( LIST )
+fn parseGroup(parser: *Parser, subshell: bool) -> u32 {
+    const shell = parser.*.shell
+    advance(parser)
+    const node = state.newNode(shell, if subshell { state.SUBSHELL } else { state.GROUP })
+    if node == 0 { return 0 }
+    state.nodeAt(shell, node).*.first = parseCompoundList(parser)
+    if parser.*.status != OK { return node }
+    if subshell {
+        if current(parser) != T_RPAREN {
+            if current(parser) == T_EOF { incomplete(parser) } else { fail(parser, "')' was expected") }
+            return node
+        }
+        advance(parser)
+    } else if !expectReserved(parser, "}", "'}' was expected") {
+        return node
+    }
+    parseTrailingRedirects(parser, node)
+    return node
+}
+
+// A command: a compound one, a function definition or a simple one.
+fn parseCommand(parser: *Parser) -> u32 {
+    const shell = parser.*.shell
+    const kind = current(parser)
+    if kind == T_LPAREN { return parseGroup(parser, true) }
+    if kind == T_WORD && parser.*.plain {
+        const word = tokenText(parser)
+        if std.text.same(word, "{") { return parseGroup(parser, false) }
+        if std.text.same(word, "if") { return parseIf(parser) }
+        if std.text.same(word, "for") { return parseFor(parser) }
+        if std.text.same(word, "while") { return parseWhile(parser, state.WHILE) }
+        if std.text.same(word, "until") { return parseWhile(parser, state.UNTIL) }
+        if std.text.same(word, "case") { return parseCase(parser) }
+        if std.text.same(word, "function") {
+            // function NAME { ... } (the Bourne way is NAME() below).
+            advance(parser)
+            return parseFunctionBody(parser)
+        }
+        if isReservedWord(word) {
+            fail(parser, "unexpected reserved word")
+            return 0
+        }
+        // NAME () compound: a function definition.
+        const name_start = parser.*.start
+        const name_end = parser.*.end
+        const after = parser.*.at
+        var probe = after
+        while probe < parser.*.text.length && blank(parser.*.text[probe]) { probe += 1 }
+        if probe + 1 < parser.*.text.length && parser.*.text[probe] == 40 {
+            var close = probe + 1
+            while close < parser.*.text.length && blank(parser.*.text[close]) { close += 1 }
+            if close < parser.*.text.length && parser.*.text[close] == 41 {
+                parser.*.at = close + 1
+                parser.*.peeked = false
+                return parseFunctionNamed(parser, name_start, name_end)
+            }
+        }
+    }
+    return parseSimple(parser)
+}
+
+// After `function`: NAME [()] compound.
+fn parseFunctionBody(parser: *Parser) -> u32 {
+    if current(parser) != T_WORD {
+        if current(parser) == T_EOF { incomplete(parser) } else { fail(parser, "a function name was expected") }
+        return 0
+    }
+    const name_start = parser.*.start
+    const name_end = parser.*.end
+    advance(parser)
+    if current(parser) == T_LPAREN {
+        advance(parser)
+        if current(parser) != T_RPAREN {
+            fail(parser, "')' was expected")
+            return 0
+        }
+        advance(parser)
+    }
+    return parseFunctionNamed(parser, name_start, name_end)
+}
+
+// The compound body of function NAME; the node keeps the body's source.
+fn parseFunctionNamed(parser: *Parser, name_start: usize, name_end: usize) -> u32 {
+    const shell = parser.*.shell
+    skipNewlines(parser)
+    const body_start = parser.*.start
+    const kind = current(parser)
+    var body: u32 = 0
+    if kind == T_LPAREN {
+        body = parseGroup(parser, true)
+    } else if kind == T_WORD && parser.*.plain && std.text.same(tokenText(parser), "{") {
+        body = parseGroup(parser, false)
+    } else if kind == T_EOF {
+        incomplete(parser)
+        return 0
+    } else {
+        fail(parser, "'{' was expected after the function name")
+        return 0
+    }
+    if parser.*.status != OK { return 0 }
+    const body_end = parser.*.at
+    const node = state.newNode(shell, state.FUNCTION)
+    if node == 0 { return 0 }
+    const record = state.nodeAt(shell, node)
+    record.*.text = @intCast(u32, parser.*.base + name_start)
+    record.*.length = @intCast(u32, name_end - name_start)
+    record.*.first = body
+    // The body's source, for the definition to keep.
+    record.*.extra = @intCast(u32, parser.*.base + body_start)
+    record.*.number = @intCast(u16, if body_end - body_start > 65535 { 65535 } else { body_end - body_start })
+    return node
+}
+
+// A pipeline: ! ? command (| NEWLINE* command)*
+fn parsePipeline(parser: *Parser) -> u32 {
+    const shell = parser.*.shell
+    const node = state.newNode(shell, state.PIPELINE)
+    if node == 0 {
+        fail(parser, "too many nodes")
+        return 0
+    }
+    if isReserved(parser, "!") {
+        state.nodeAt(shell, node).*.flags |= state.NEGATED
+        advance(parser)
+    }
+    var going = true
+    while going && parser.*.status == OK {
+        const kind = current(parser)
+        if kind == T_EOF || kind == T_NEWLINE || kind == T_SEMI || kind == T_AMP || kind == T_RPAREN || kind == T_AND || kind == T_OR || kind == T_DSEMI {
+            if state.nodeAt(shell, node).*.first == 0 {
+                if kind == T_EOF { incomplete(parser) } else { fail(parser, "a command was expected") }
+            }
+            return node
+        }
+        const command = parseCommand(parser)
+        if command == 0 { return node }
+        state.addChild(shell, node, command)
+        if current(parser) == T_PIPE {
+            advance(parser)
+            skipNewlines(parser)
+        } else {
+            going = false
+        }
+    }
+    return node
+}
+
+// pipeline ((&& | ||) NEWLINE* pipeline)*
+fn parseAndOr(parser: *Parser) -> u32 {
+    const shell = parser.*.shell
+    const node = state.newNode(shell, state.ANDOR)
+    if node == 0 {
+        fail(parser, "too many nodes")
+        return 0
+    }
+    var operator: u8 = 0
+    var going = true
+    while going && parser.*.status == OK {
+        const pipeline = parsePipeline(parser)
+        if pipeline == 0 { return node }
+        state.nodeAt(shell, pipeline).*.flags |= operator
+        state.addChild(shell, node, pipeline)
+        const kind = current(parser)
+        if kind == T_AND || kind == T_OR {
+            operator = if kind == T_AND { state.AND_BEFORE } else { state.OR_BEFORE }
+            advance(parser)
+            skipNewlines(parser)
+        } else {
+            going = false
+        }
+    }
+    return node
+}
+
+// The whole input: a LIST node, or 0 with the status set.
+pub fn parse(parser: *Parser, shell: *Shell, text: []const u8, base: usize) -> u32 {
+    parser.*.shell = shell
+    parser.*.text = text
+    parser.*.base = base
+    parser.*.at = 0
+    parser.*.peeked = false
+    parser.*.heredocCount = 0
+    parser.*.status = OK
+    parser.*.message = ""
+    parser.*.errorAt = 0
+    const list = state.newNode(shell, state.LIST)
+    if list == 0 {
+        fail(parser, "too many nodes")
+        return 0
+    }
+    skipNewlines(parser)
+    while current(parser) != T_EOF && parser.*.status == OK {
+        const item = parseAndOr(parser)
+        if item == 0 { break }
+        state.addChild(shell, list, item)
+        const separator = current(parser)
+        if separator == T_AMP {
+            state.nodeAt(shell, item).*.flags |= state.BACKGROUND
+            advance(parser)
+        } else if separator == T_SEMI || separator == T_NEWLINE {
+            advance(parser)
+        } else if separator != T_EOF {
+            fail(parser, "unexpected token")
+        }
+        skipNewlines(parser)
+    }
+    // An unfinished heredoc at the end of the input.
+    if parser.*.status == OK && parser.*.heredocCount > 0 { incomplete(parser) }
+    return list
+}
+
+// Where the error is, as a line number from 1.
+pub fn errorLine(parser: *Parser) -> usize {
+    var line: usize = 1
+    var index: usize = 0
+    while index < parser.*.errorAt && index < parser.*.text.length {
+        if parser.*.text[index] == 10 { line += 1 }
+        index += 1
+    }
+    return line
+}
