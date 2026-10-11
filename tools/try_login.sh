@@ -11,7 +11,8 @@
 #      compositor log (copied every two seconds, its directory goes with
 #      the greeter), the session's compositor log and launcher trace, the
 #      journal of mlx-login and mlx-ipcd, the processes with their groups
-#      while it ran, the device permissions
+#      while it ran, what each process of the session waits in, the device
+#      permissions
 #   5. switches back to the VT you were on and starts the display manager
 #      again if one ran before
 #
@@ -80,6 +81,30 @@ started=$(date +%s)
 vt_open=false
 say "try of mlx-login for $seconds s; user $user ($user_id), greeter account $greeter_uid:$greeter_gid"
 
+# What each process of the session waits in: its threads' system calls
+# (/proc/PID/task/*/syscall: the number, then the arguments), its
+# descriptors and the sockets they are. A session that shows nothing
+# tells here what it hangs on.
+waits() {
+    local name pid task fd
+    echo "== $(date +%T)"
+    for name in mlx-session loginctl localectl systemctl mlx-ipcd mlx-audiod mlx-compositor mlx-launcher mlx-dock mlx-topbar Xwayland; do
+        for pid in $(pgrep -u "$user" -x "$name"); do
+            echo "-- $name $pid: $(tr '\0' ' ' < "/proc/$pid/cmdline" 2> /dev/null)"
+            for task in /proc/"$pid"/task/*; do
+                echo "task ${task##*/} $(cat "$task/comm" 2> /dev/null): wchan $(cat "$task/wchan" 2> /dev/null), syscall $(cat "$task/syscall" 2> /dev/null)"
+            done
+            for fd in /proc/"$pid"/fd/*; do
+                echo "fd ${fd##*/} -> $(readlink "$fd" 2> /dev/null)"
+            done
+        done
+    done
+    echo "-- sockets"
+    ss -xap 2> /dev/null | grep -E 'mlx-|Xwayland|wayland-mlx|/run/mlx'
+    echo "-- /run/mlx/user/$user_id"
+    ls -la "/run/mlx/user/$user_id" 2> /dev/null
+}
+
 # What there was before.
 original_vt=$(fgconsole 2> /dev/null || echo 1)
 display_manager=$(systemctl is-active display-manager 2> /dev/null || true)
@@ -137,6 +162,7 @@ else
                     echo "== $(date +%T)"
                     ps -eo pid,ppid,user,group,cmd:72,supgrp | grep -E 'mlx-|gnome|PID' | grep -v grep
                 } >> "$out/processes.txt"
+                waits >> "$out/waits.txt" 2>&1
             fi
             tick=$((tick + 1))
             sleep 2
