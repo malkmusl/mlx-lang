@@ -1,0 +1,818 @@
+// Code generation for expressions: a stack machine on rax (xmm0 for
+// floating values) with operands pushed on the hardware stack. Every
+// integer in rax is kept canonical for its type (sign- or zero-extended
+// to 64 bits), so comparisons and divisions work on whole registers.
+// Calls follow the System V AMD64 ABI, structs by value included.
+const base = @import("./base.mlx")
+const names = @import("./names.mlx")
+const types = @import("./types.mlx")
+const ast = @import("./ast.mlx")
+const x86 = @import("./x86.mlx")
+const genstmt = @import("./genstmt.mlx")
+const program = @import("./program.mlx")
+
+// Words pushed on the stack by the expression being generated (a call
+// needs rsp 16-byte aligned).
+var depth: i64 = 0
+var labelCounter: u32 = 0
+
+pub fn resetDepth() -> void { depth = 0 }
+pub fn currentDepth() -> i64 { return depth }
+
+// A label for the code generator's own jumps (above the parser's).
+pub fn newLabel() -> u32 {
+    labelCounter += 1
+    return 1000000000 + labelCounter
+}
+
+fn pushRax() -> void {
+    x86.push(x86.RAX)
+    depth += 1
+}
+
+fn popTo(r: u8) -> void {
+    x86.pop(r)
+    depth -= 1
+}
+
+fn pushFloat() -> void {
+    x86.subtractStack(8)
+    x86.storeFloat(x86.RSP, 0, 0, true)
+    depth += 1
+}
+
+fn popFloat(x: u8) -> void {
+    x86.loadFloat(x, x86.RSP, 0, true)
+    x86.addStack(8)
+    depth -= 1
+}
+
+pub fn argumentRegister(index: i64) -> u8 {
+    if index == 0 { return x86.RDI }
+    if index == 1 { return x86.RSI }
+    if index == 2 { return x86.RDX }
+    if index == 3 { return x86.RCX }
+    if index == 4 { return x86.R8 }
+    return x86.R9
+}
+
+pub fn isFloat(ty: usize) -> bool {
+    const k = types.kind(ty)
+    return k == types.FLOAT || k == types.DOUBLE || k == types.LDOUBLE
+}
+
+pub fn isDouble(ty: usize) -> bool {
+    const k = types.kind(ty)
+    return k == types.DOUBLE || k == types.LDOUBLE
+}
+
+fn isStructLike(ty: usize) -> bool {
+    const k = types.kind(ty)
+    return k == types.STRUCT || k == types.UNION
+}
+
+// Whether every part of `ty` between `low` and `high` (bytes, `ty` at
+// `offset`) is floating: the eightbyte goes in an SSE register.
+pub fn hasFloat(ty: usize, low: i64, high: i64, offset: i64) -> bool {
+    const k = types.kind(ty)
+    if k == types.STRUCT || k == types.UNION {
+        var m = types.at(ty).*.members
+        while m != 0 {
+            if !hasFloat(types.member(m).*.ty, low, high, offset + types.member(m).*.offset) { return false }
+            m = types.member(m).*.next
+        }
+        return true
+    }
+    if k == types.ARRAY {
+        var index: i64 = 0
+        while index < types.at(ty).*.arrayLength {
+            if !hasFloat(types.baseOf(ty), low, high, offset + types.size(types.baseOf(ty)) * index) { return false }
+            index += 1
+        }
+        return true
+    }
+    return offset < low || high <= offset || k == types.FLOAT || k == types.DOUBLE
+}
+
+// Makes the integer in rax canonical for `ty`.
+fn canonical(ty: usize) -> void {
+    if !types.isInteger(ty) { return }
+    const s = types.size(ty)
+    if s < 8 { x86.extend(x86.RAX, @intCast(usize, s * 8), !types.isUnsigned(ty)) }
+}
+
+// rax = the address of the global object `o` (its definition in the
+// program, or the one the C library has).
+pub fn globalAddress(r: u8, o: usize) -> void {
+    const d = ast.obj(o).*.definition
+    if ast.obj(o).*.isFunction {
+        if d != 0 && ast.obj(d).*.isDefinition {
+            const symbol = ast.obj(d).*.symbol
+            x86.symbolAddress(r, base.nameAddress(symbol), base.nameOf(symbol).length)
+        } else {
+            x86.importAddress(r, base.nameAddress(ast.obj(o).*.name), base.nameOf(ast.obj(o).*.name).length)
+        }
+        return
+    }
+    if d != 0 && ast.obj(d).*.placed {
+        x86.dataAddress(r, ast.obj(d).*.dataOffset)
+        return
+    }
+    x86.importAddress(r, base.nameAddress(ast.obj(o).*.name), base.nameOf(ast.obj(o).*.name).length)
+}
+
+pub fn genAddress(n: usize) -> void {
+    const node = ast.node(n)
+    const k = node.*.kind
+    if k == ast.VAR {
+        const o = node.*.variable
+        if ast.obj(o).*.isLocal {
+            x86.leaFrame(x86.RAX, ast.obj(o).*.offset)
+        } else {
+            globalAddress(x86.RAX, o)
+        }
+        return
+    }
+    if k == ast.DEREF {
+        genExpression(node.*.lhs)
+        return
+    }
+    if k == ast.COMMA {
+        genExpression(node.*.lhs)
+        genAddress(node.*.rhs)
+        return
+    }
+    if k == ast.MEMBER {
+        genAddress(node.*.lhs)
+        const offset = types.member(node.*.member).*.offset
+        if offset != 0 { x86.immediate(0, x86.RAX, offset) }
+        return
+    }
+    if k == ast.FUNCALL && node.*.returnBuffer != 0 {
+        genExpression(n)
+        return
+    }
+    if (k == ast.ASSIGN || k == ast.COND || k == ast.STMT_EXPR) && isStructLike(node.*.ty) {
+        genExpression(n)
+        return
+    }
+    if k == ast.CAST && isStructLike(node.*.ty) {
+        genAddress(node.*.lhs)
+        return
+    }
+    ast.errorAt(n, "not an lvalue")
+}
+
+// Loads the value of type `ty` at the address in rax (an aggregate or a
+// function stays its address).
+fn load(ty: usize) -> void {
+    const k = types.kind(ty)
+    if k == types.ARRAY || k == types.STRUCT || k == types.UNION || k == types.FUNC || k == types.VOID { return }
+    if k == types.FLOAT {
+        x86.loadFloat(0, x86.RAX, 0, false)
+        return
+    }
+    if k == types.DOUBLE || k == types.LDOUBLE {
+        x86.loadFloat(0, x86.RAX, 0, true)
+        return
+    }
+    x86.load(x86.RAX, x86.RAX, 0, types.size(ty), !types.isUnsigned(ty) && k != types.BOOL)
+}
+
+// Copies `size` bytes from [rax] to [rdi].
+fn copyBytes(size: i64) -> void {
+    var at: i64 = 0
+    while at + 8 <= size {
+        x86.load(x86.R8, x86.RAX, at, 8, false)
+        x86.store(x86.RDI, at, x86.R8, 8)
+        at += 8
+    }
+    while at < size {
+        x86.load(x86.R8, x86.RAX, at, 1, false)
+        x86.store(x86.RDI, at, x86.R8, 1)
+        at += 1
+    }
+}
+
+// Stores rax (xmm0) at the address on the stack.
+fn store(ty: usize) -> void {
+    popTo(x86.RDI)
+    const k = types.kind(ty)
+    if k == types.STRUCT || k == types.UNION {
+        copyBytes(types.size(ty))
+        return
+    }
+    if k == types.FLOAT {
+        x86.storeFloat(x86.RDI, 0, 0, false)
+        return
+    }
+    if k == types.DOUBLE || k == types.LDOUBLE {
+        x86.storeFloat(x86.RDI, 0, 0, true)
+        return
+    }
+    x86.store(x86.RDI, 0, x86.RAX, types.size(ty))
+}
+
+// Sets the flags for "the value is zero" (equal).
+pub fn compareZero(ty: usize) -> void {
+    if isFloat(ty) {
+        x86.floatXor(1, 1)
+        x86.floatCompare(0, 1, isDouble(ty))
+        return
+    }
+    x86.testRegisters(x86.RAX, x86.RAX)
+}
+
+fn castFloatToBool(ty: usize) -> void {
+    compareZero(ty)
+    x86.setIf(x86.CC_NE, x86.RAX)
+    x86.setIf(x86.CC_P, x86.RCX)
+    x86.orRegisters(x86.RAX, x86.RCX)
+}
+
+// An unsigned 64-bit integer in rax to floating xmm0.
+fn unsignedToFloat(toDouble: bool) -> void {
+    const negative = newLabel()
+    const done = newLabel()
+    x86.testRegisters(x86.RAX, x86.RAX)
+    x86.jumpIf(x86.CC_S, negative)
+    x86.floatFromInteger(0, x86.RAX, toDouble)
+    x86.jump(done)
+    x86.defineLabel(negative)
+    // Halve (keeping the low bit for rounding), convert, double.
+    x86.move(x86.RDI, x86.RAX)
+    x86.moveImmediate(x86.RDX, 1)
+    x86.andRegisters(x86.RAX, x86.RDX)
+    x86.shiftImmediate(x86.RDI, 1, false, false)
+    x86.orRegisters(x86.RDI, x86.RAX)
+    x86.floatFromInteger(0, x86.RDI, toDouble)
+    x86.floatArithmetic(88, 0, 0, toDouble)
+    x86.defineLabel(done)
+}
+
+// Floating xmm0 to an unsigned 64-bit integer in rax.
+fn floatToUnsigned(fromDouble: bool) -> void {
+    x86.integerFromFloat(x86.RCX, 0, fromDouble)
+    x86.moveFloat(1, 0)
+    // 2^63 in the source's format.
+    x86.moveImmediate(x86.RAX, if fromDouble { 4890909195324358656 } else { 1593835520 })
+    x86.floatFromBits(0, x86.RAX)
+    x86.floatArithmetic(92, 1, 0, fromDouble)
+    x86.integerFromFloat(x86.RAX, 1, fromDouble)
+    x86.move(x86.RDX, x86.RCX)
+    x86.shiftImmediate(x86.RDX, 63, false, true)
+    x86.andRegisters(x86.RAX, x86.RDX)
+    x86.orRegisters(x86.RAX, x86.RCX)
+}
+
+pub fn cast(from: usize, to: usize) -> void {
+    const tk = types.kind(to)
+    if tk == types.VOID { return }
+    if tk == types.BOOL {
+        if isFloat(from) {
+            castFloatToBool(from)
+        } else {
+            compareZero(from)
+            x86.setIf(x86.CC_NE, x86.RAX)
+        }
+        return
+    }
+    const fromFloat = isFloat(from)
+    const toFloat = isFloat(to)
+    if !fromFloat && !toFloat {
+        if types.isInteger(to) && types.size(to) < 8 { x86.extend(x86.RAX, @intCast(usize, types.size(to) * 8), !types.isUnsigned(to)) }
+        return
+    }
+    if !fromFloat && toFloat {
+        if types.size(from) == 8 && types.isUnsigned(from) {
+            unsignedToFloat(isDouble(to))
+        } else {
+            x86.floatFromInteger(0, x86.RAX, isDouble(to))
+        }
+        return
+    }
+    if fromFloat && toFloat {
+        if isDouble(from) != isDouble(to) { x86.convertFloat(0, 0, isDouble(from)) }
+        return
+    }
+    if isStructLike(to) { return }
+    if types.size(to) == 8 && types.isUnsigned(to) {
+        floatToUnsigned(isDouble(from))
+        return
+    }
+    x86.integerFromFloat(x86.RAX, 0, isDouble(from))
+    if types.size(to) < 8 { x86.extend(x86.RAX, @intCast(usize, types.size(to) * 8), !types.isUnsigned(to)) }
+}
+
+// ---------------------------------------------------------------------------
+// Calls
+
+fn pushStruct(ty: usize) -> void {
+    const size = types.alignTo(types.size(ty), 8)
+    x86.subtractStack(size)
+    depth += size / 8
+    x86.move(x86.RDI, x86.RSP)
+    copyBytes(types.size(ty))
+}
+
+fn pushArgumentsFrom(argument: usize, stackPass: bool) -> void {
+    if argument == 0 { return }
+    pushArgumentsFrom(ast.node(argument).*.next, stackPass)
+    if ast.node(argument).*.passByStack != stackPass { return }
+    genExpression(argument)
+    const ty = ast.typeOf(argument)
+    if isStructLike(ty) {
+        pushStruct(ty)
+    } else if isFloat(ty) {
+        pushFloat()
+    } else {
+        pushRax()
+    }
+}
+
+// Evaluates the arguments onto the stack: those passed in memory first
+// (they stay), then those passed in registers (popped into them); the
+// number of words left on the stack.
+fn pushArguments(n: usize) -> i64 {
+    var stack: i64 = 0
+    var gp: i64 = 0
+    var fp: i64 = 0
+    const node = ast.node(n)
+    if node.*.returnBuffer != 0 && types.size(node.*.ty) > 16 { gp += 1 }
+    var argument = node.*.args
+    while argument != 0 {
+        const ty = ast.typeOf(argument)
+        if isStructLike(ty) {
+            const size = types.size(ty)
+            var inMemory = size > 16
+            if !inMemory {
+                const fp1: i64 = if hasFloat(ty, 0, 8, 0) { 1 } else { 0 }
+                const fp2: i64 = if size > 8 && hasFloat(ty, 8, 16, 0) { 1 } else { 0 }
+                const gp1: i64 = 1 - fp1
+                const gp2: i64 = if size > 8 { 1 - fp2 } else { 0 }
+                if fp + fp1 + fp2 <= 8 && gp + gp1 + gp2 <= 6 {
+                    fp += fp1 + fp2
+                    gp += gp1 + gp2
+                } else {
+                    inMemory = true
+                }
+            }
+            if inMemory {
+                ast.node(argument).*.passByStack = true
+                stack += types.alignTo(size, 8) / 8
+            }
+        } else if isFloat(ty) {
+            if fp >= 8 {
+                ast.node(argument).*.passByStack = true
+                stack += 1
+            }
+            fp += 1
+        } else {
+            if gp >= 6 {
+                ast.node(argument).*.passByStack = true
+                stack += 1
+            }
+            gp += 1
+        }
+        argument = ast.node(argument).*.next
+    }
+    if (depth + stack) % 2 == 1 {
+        x86.subtractStack(8)
+        depth += 1
+        stack += 1
+    }
+    pushArgumentsFrom(node.*.args, true)
+    pushArgumentsFrom(node.*.args, false)
+    if node.*.returnBuffer != 0 && types.size(node.*.ty) > 16 {
+        x86.leaFrame(x86.RAX, ast.obj(node.*.returnBuffer).*.offset)
+        pushRax()
+    }
+    return stack
+}
+
+// Stores a struct returned in rax/rdx and xmm0/xmm1 into its buffer.
+fn copyReturnBuffer(variable: usize) -> void {
+    const ty = ast.obj(variable).*.ty
+    const offset = ast.obj(variable).*.offset
+    const size = types.size(ty)
+    var gp: i64 = 0
+    var fp: u8 = 0
+    if hasFloat(ty, 0, 8, 0) {
+        x86.storeFloat(x86.RBP, offset, 0, size != 4)
+        fp += 1
+    } else {
+        var index: i64 = 0
+        while index < size && index < 8 {
+            x86.store(x86.RBP, offset + index, x86.RAX, 1)
+            x86.shiftImmediate(x86.RAX, 8, false, false)
+            index += 1
+        }
+        gp += 1
+    }
+    if size > 8 {
+        if hasFloat(ty, 8, 16, 0) {
+            x86.storeFloat(x86.RBP, offset + 8, fp, size != 12)
+        } else {
+            const r = if gp == 0 { x86.RAX } else { x86.RDX }
+            var index: i64 = 8
+            while index < size && index < 16 {
+                x86.store(x86.RBP, offset + index, r, 1)
+                x86.shiftImmediate(r, 8, false, false)
+                index += 1
+            }
+        }
+    }
+}
+
+fn genCall(n: usize) -> void {
+    const node = ast.node(n)
+    const callee = node.*.lhs
+    const direct = ast.kindOf(callee) == ast.VAR && types.kind(ast.typeOf(callee)) == types.FUNC
+    const stack = pushArguments(n)
+    if !direct {
+        genExpression(callee)
+        x86.move(x86.R10, x86.RAX)
+    }
+    var gp: i64 = 0
+    var fp: u8 = 0
+    if node.*.returnBuffer != 0 && types.size(node.*.ty) > 16 {
+        popTo(argumentRegister(gp))
+        gp += 1
+    }
+    var argument = node.*.args
+    while argument != 0 {
+        if !ast.node(argument).*.passByStack {
+            const ty = ast.typeOf(argument)
+            if isStructLike(ty) {
+                if hasFloat(ty, 0, 8, 0) {
+                    popFloat(fp)
+                    fp += 1
+                } else {
+                    popTo(argumentRegister(gp))
+                    gp += 1
+                }
+                if types.size(ty) > 8 {
+                    if hasFloat(ty, 8, 16, 0) {
+                        popFloat(fp)
+                        fp += 1
+                    } else {
+                        popTo(argumentRegister(gp))
+                        gp += 1
+                    }
+                }
+            } else if isFloat(ty) {
+                popFloat(fp)
+                fp += 1
+            } else {
+                popTo(argumentRegister(gp))
+                gp += 1
+            }
+        }
+        argument = ast.node(argument).*.next
+    }
+    if direct {
+        const o = ast.node(callee).*.variable
+        const d = ast.obj(o).*.definition
+        if d != 0 && ast.obj(d).*.isDefinition {
+            x86.moveImmediate(x86.RAX, @intCast(i64, fp))
+            const symbol = ast.obj(d).*.symbol
+            x86.callSymbol(base.nameAddress(symbol), base.nameOf(symbol).length)
+        } else {
+            const name = ast.obj(o).*.name
+            x86.callImport(base.nameAddress(name), base.nameOf(name).length, @intCast(u32, fp))
+        }
+    } else {
+        x86.moveImmediate(x86.RAX, @intCast(i64, fp))
+        x86.callRegister(x86.R10)
+    }
+    if stack > 0 { x86.addStack(stack * 8) }
+    depth -= stack
+    // Narrow results come back with their upper bits unspecified.
+    const rt = node.*.ty
+    if types.kind(rt) == types.BOOL {
+        x86.extend(x86.RAX, 8, false)
+    } else if types.isInteger(rt) && types.size(rt) < 8 {
+        x86.extend(x86.RAX, @intCast(usize, types.size(rt) * 8), !types.isUnsigned(rt))
+    }
+    if node.*.returnBuffer != 0 && types.size(rt) <= 16 {
+        copyReturnBuffer(node.*.returnBuffer)
+        x86.leaFrame(x86.RAX, ast.obj(node.*.returnBuffer).*.offset)
+    }
+}
+
+// va_arg: rax = the address of the next variadic argument of the type
+// `n` points to, taken from the register save area or the stack.
+fn genVaArg(n: usize) -> void {
+    genExpression(ast.node(n).*.lhs)
+    x86.move(x86.RCX, x86.RAX)
+    const ty = types.baseOf(ast.typeOf(n))
+    const overflow = newLabel()
+    const done = newLabel()
+    if isFloat(ty) {
+        x86.load(x86.RAX, x86.RCX, 4, 4, false)
+        x86.immediate(7, x86.RAX, 160)
+        x86.jumpIf(x86.CC_A, overflow)
+        x86.load(x86.RDX, x86.RCX, 16, 8, false)
+        x86.add(x86.RDX, x86.RAX)
+        x86.immediate(0, x86.RAX, 16)
+        x86.store(x86.RCX, 4, x86.RAX, 4)
+        x86.move(x86.RAX, x86.RDX)
+        x86.jump(done)
+    } else if !isStructLike(ty) {
+        x86.load(x86.RAX, x86.RCX, 0, 4, false)
+        x86.immediate(7, x86.RAX, 40)
+        x86.jumpIf(x86.CC_A, overflow)
+        x86.load(x86.RDX, x86.RCX, 16, 8, false)
+        x86.add(x86.RDX, x86.RAX)
+        x86.immediate(0, x86.RAX, 8)
+        x86.store(x86.RCX, 0, x86.RAX, 4)
+        x86.move(x86.RAX, x86.RDX)
+        x86.jump(done)
+    }
+    x86.defineLabel(overflow)
+    x86.load(x86.RAX, x86.RCX, 8, 8, false)
+    x86.leaOffset(x86.RDX, x86.RAX, types.alignTo(types.size(ty), 8))
+    x86.store(x86.RCX, 8, x86.RDX, 8)
+    x86.defineLabel(done)
+}
+
+// ---------------------------------------------------------------------------
+// Expressions
+
+fn genFloatBinary(n: usize) -> void {
+    const node = ast.node(n)
+    genExpression(node.*.rhs)
+    pushFloat()
+    genExpression(node.*.lhs)
+    popFloat(1)
+    const d = isDouble(ast.typeOf(node.*.lhs))
+    const k = node.*.kind
+    if k == ast.ADD {
+        x86.floatArithmetic(88, 0, 1, d)
+    } else if k == ast.SUB {
+        x86.floatArithmetic(92, 0, 1, d)
+    } else if k == ast.MUL {
+        x86.floatArithmetic(89, 0, 1, d)
+    } else if k == ast.DIV {
+        x86.floatArithmetic(94, 0, 1, d)
+    } else if k == ast.EQ {
+        x86.floatCompare(1, 0, d)
+        x86.setIf(x86.CC_E, x86.RAX)
+        x86.setIf(x86.CC_NP, x86.RDX)
+        x86.andRegisters(x86.RAX, x86.RDX)
+    } else if k == ast.NE {
+        x86.floatCompare(1, 0, d)
+        x86.setIf(x86.CC_NE, x86.RAX)
+        x86.setIf(x86.CC_P, x86.RDX)
+        x86.orRegisters(x86.RAX, x86.RDX)
+    } else if k == ast.LT {
+        x86.floatCompare(1, 0, d)
+        x86.setIf(x86.CC_A, x86.RAX)
+    } else if k == ast.LE {
+        x86.floatCompare(1, 0, d)
+        x86.setIf(x86.CC_AE, x86.RAX)
+    } else {
+        ast.errorAt(n, "invalid operands to a floating operation")
+    }
+}
+
+fn bitMask(width: i64) -> i64 {
+    if width >= 64 { return -1 }
+    return @bitCast(i64, (@bitCast(u64, one()) << @intCast(u6, width)) -% 1)
+}
+
+fn one() -> i64 { return 1 }
+
+fn genAssign(n: usize) -> void {
+    const node = ast.node(n)
+    const lhs = node.*.lhs
+    genAddress(lhs)
+    pushRax()
+    genExpression(node.*.rhs)
+    if ast.kindOf(lhs) == ast.MEMBER && types.member(ast.node(lhs).*.member).*.bitWidth > 0 {
+        // A bit-field: merge the value into its unit.
+        const m = ast.node(lhs).*.member
+        const width = types.member(m).*.bitWidth
+        const offset = types.member(m).*.bitOffset
+        const unit = types.member(m).*.ty
+        x86.move(x86.R8, x86.RAX)
+        x86.move(x86.RDI, x86.RAX)
+        x86.moveImmediate(x86.RDX, bitMask(width))
+        x86.andRegisters(x86.RDI, x86.RDX)
+        if offset > 0 { x86.shiftImmediate(x86.RDI, offset, true, false) }
+        x86.load(x86.RAX, x86.RSP, 0, 8, false)
+        x86.load(x86.RAX, x86.RAX, 0, types.size(unit), false)
+        const kept = ~(@bitCast(u64, bitMask(width)) << @intCast(u6, offset))
+        x86.moveImmediate(x86.R9, @bitCast(i64, kept))
+        x86.andRegisters(x86.RAX, x86.R9)
+        x86.orRegisters(x86.RAX, x86.RDI)
+        store(unit)
+        x86.move(x86.RAX, x86.R8)
+        return
+    }
+    store(node.*.ty)
+}
+
+fn genMemberValue(n: usize) -> void {
+    genAddress(n)
+    const m = ast.node(n).*.member
+    const width = types.member(m).*.bitWidth
+    if width <= 0 {
+        load(ast.typeOf(n))
+        return
+    }
+    const unit = types.member(m).*.ty
+    x86.load(x86.RAX, x86.RAX, 0, types.size(unit), false)
+    x86.shiftImmediate(x86.RAX, 64 - width - types.member(m).*.bitOffset, true, false)
+    x86.shiftImmediate(x86.RAX, 64 - width, false, !types.isUnsigned(unit))
+}
+
+pub fn genExpression(n: usize) -> void {
+    const node = ast.node(n)
+    const k = node.*.kind
+    if k == ast.NULL_EXPR { return }
+    if k == ast.NUM {
+        const ty = node.*.ty
+        if types.kind(ty) == types.FLOAT {
+            const single = @floatCast(f32, @bitCast(f64, @bitCast(u64, node.*.value)))
+            x86.moveImmediate(x86.RAX, @intCast(i64, @bitCast(u32, single)))
+            x86.floatFromBits(0, x86.RAX)
+        } else if isDouble(ty) {
+            x86.moveImmediate(x86.RAX, node.*.value)
+            x86.floatFromBits(0, x86.RAX)
+        } else {
+            x86.moveImmediate(x86.RAX, node.*.value)
+        }
+        return
+    }
+    if k == ast.NEG {
+        genExpression(node.*.lhs)
+        if isFloat(node.*.ty) {
+            if isDouble(node.*.ty) {
+                x86.moveImmediate(x86.RAX, -9223372036854775807 - 1)
+            } else {
+                x86.moveImmediate(x86.RAX, 2147483648)
+            }
+            x86.floatFromBits(1, x86.RAX)
+            x86.floatXor(0, 1)
+            return
+        }
+        x86.negate(x86.RAX)
+        canonical(node.*.ty)
+        return
+    }
+    if k == ast.VAR {
+        genAddress(n)
+        load(node.*.ty)
+        return
+    }
+    if k == ast.MEMBER {
+        genMemberValue(n)
+        return
+    }
+    if k == ast.DEREF {
+        genExpression(node.*.lhs)
+        load(node.*.ty)
+        return
+    }
+    if k == ast.ADDR {
+        genAddress(node.*.lhs)
+        return
+    }
+    if k == ast.ASSIGN {
+        genAssign(n)
+        return
+    }
+    if k == ast.STMT_EXPR {
+        var s = node.*.body
+        while s != 0 {
+            genstmt.genStatement(s)
+            s = ast.node(s).*.next
+        }
+        return
+    }
+    if k == ast.COMMA {
+        genExpression(node.*.lhs)
+        genExpression(node.*.rhs)
+        return
+    }
+    if k == ast.CAST {
+        genExpression(node.*.lhs)
+        cast(ast.typeOf(node.*.lhs), node.*.ty)
+        return
+    }
+    if k == ast.MEMZERO {
+        const o = node.*.variable
+        x86.leaFrame(x86.RDI, ast.obj(o).*.offset)
+        x86.moveImmediate(x86.RCX, types.size(ast.obj(o).*.ty))
+        x86.moveImmediate(x86.RAX, 0)
+        x86.repStoreBytes()
+        return
+    }
+    if k == ast.COND {
+        const otherwise = newLabel()
+        const done = newLabel()
+        genExpression(node.*.cond)
+        compareZero(ast.typeOf(node.*.cond))
+        x86.jumpIf(x86.CC_E, otherwise)
+        genExpression(node.*.then)
+        x86.jump(done)
+        x86.defineLabel(otherwise)
+        genExpression(node.*.els)
+        x86.defineLabel(done)
+        return
+    }
+    if k == ast.NOT {
+        genExpression(node.*.lhs)
+        compareZero(ast.typeOf(node.*.lhs))
+        x86.setIf(x86.CC_E, x86.RAX)
+        return
+    }
+    if k == ast.BITNOT {
+        genExpression(node.*.lhs)
+        x86.complement(x86.RAX)
+        canonical(node.*.ty)
+        return
+    }
+    if k == ast.LOGAND || k == ast.LOGOR {
+        const decided = newLabel()
+        const done = newLabel()
+        const stop: u8 = if k == ast.LOGAND { x86.CC_E } else { x86.CC_NE }
+        genExpression(node.*.lhs)
+        compareZero(ast.typeOf(node.*.lhs))
+        x86.jumpIf(stop, decided)
+        genExpression(node.*.rhs)
+        compareZero(ast.typeOf(node.*.rhs))
+        x86.jumpIf(stop, decided)
+        x86.moveImmediate(x86.RAX, if k == ast.LOGAND { 1 } else { 0 })
+        x86.jump(done)
+        x86.defineLabel(decided)
+        x86.moveImmediate(x86.RAX, if k == ast.LOGAND { 0 } else { 1 })
+        x86.defineLabel(done)
+        return
+    }
+    if k == ast.FUNCALL {
+        genCall(n)
+        return
+    }
+    if k == ast.VA_START {
+        const fn_obj = genstmt.currentFunction()
+        const area = ast.obj(fn_obj).*.vaArea
+        if area == 0 { ast.errorAt(n, "va_start used in a function with fixed arguments") }
+        genExpression(node.*.lhs)
+        x86.move(x86.RDI, x86.RAX)
+        x86.leaFrame(x86.RAX, ast.obj(area).*.offset)
+        copyBytes(24)
+        return
+    }
+    if k == ast.VA_ARG {
+        genVaArg(n)
+        return
+    }
+    // Binary operators.
+    if isFloat(ast.typeOf(node.*.lhs)) {
+        genFloatBinary(n)
+        return
+    }
+    genExpression(node.*.rhs)
+    pushRax()
+    genExpression(node.*.lhs)
+    popTo(x86.RDI)
+    const signed = !types.isUnsigned(ast.typeOf(node.*.lhs))
+    if k == ast.ADD {
+        x86.add(x86.RAX, x86.RDI)
+        canonical(node.*.ty)
+    } else if k == ast.SUB {
+        x86.sub(x86.RAX, x86.RDI)
+        canonical(node.*.ty)
+    } else if k == ast.MUL {
+        x86.multiply(x86.RAX, x86.RDI)
+        canonical(node.*.ty)
+    } else if k == ast.DIV || k == ast.MOD {
+        x86.divide(x86.RDI, signed)
+        if k == ast.MOD { x86.move(x86.RAX, x86.RDX) }
+        canonical(node.*.ty)
+    } else if k == ast.BITAND {
+        x86.andRegisters(x86.RAX, x86.RDI)
+    } else if k == ast.BITOR {
+        x86.orRegisters(x86.RAX, x86.RDI)
+    } else if k == ast.BITXOR {
+        x86.xorRegisters(x86.RAX, x86.RDI)
+    } else if k == ast.EQ || k == ast.NE || k == ast.LT || k == ast.LE {
+        x86.compare(x86.RAX, x86.RDI)
+        var condition: u8 = x86.CC_E
+        if k == ast.NE { condition = x86.CC_NE }
+        if k == ast.LT { condition = if signed { x86.CC_L } else { x86.CC_B } }
+        if k == ast.LE { condition = if signed { x86.CC_LE } else { x86.CC_BE } }
+        x86.setIf(condition, x86.RAX)
+    } else if k == ast.SHL {
+        x86.move(x86.RCX, x86.RDI)
+        x86.shiftByCl(x86.RAX, true, false)
+        canonical(node.*.ty)
+    } else if k == ast.SHR {
+        x86.move(x86.RCX, x86.RDI)
+        x86.shiftByCl(x86.RAX, false, signed)
+    } else {
+        ast.errorAt(n, "invalid expression")
+    }
+}
