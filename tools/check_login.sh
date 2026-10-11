@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Checks mlx-login (projects/desktop/login) against a private MLXIPC
 # system bus and private account files. It owns org.mlx.Login, lists the
-# synthetic login accounts, and accepts a private shadow source while
-# both privileged login steps remain explicitly unconfigured.
+# synthetic login accounts, authorizes login.session through MLXIPC and
+# checks passwords against a private shadow source.
 #
 # The daemon receives private passwd and shadow paths explicitly, and the
 # session step is still a stub, so it neither opens the defaults nor logs
@@ -40,8 +40,7 @@ trap cleanup EXIT
 "$compiler" --quiet projects/desktop/login/main.mlx -o "$work/mlx-login"
 
 # Private fixtures prove that both file options are accepted and that the
-# account list never comes from the host. Password behavior remains
-# NotConfigured until authorization and authentication land together.
+# account list never comes from the host.
 # Put the accounts beyond the old 64 KiB read boundary. The loader must
 # stream complete records rather than silently truncating a valid file.
 awk 'BEGIN { for (i = 0; i < 8000; i++) print "# padding" }' > "$work/passwd"
@@ -95,12 +94,44 @@ count=$(grep -o "('" <<< "$users" | wc -l)
 [[ "$count" == 3 ]] || { echo "FAIL ListUsers returned $count accounts instead of the three fixtures:" >&2; echo "$users" >&2; exit 1; }
 echo "ok   ListUsers names only the three accounts from the passwd fixture"
 
-# Login reaches the still-stubbed password check. Accepting the private
-# shadow path must not accidentally turn the scaffold into a login path.
-login_out=$(gdbus call --address "$address" --dest org.mlx.Login --object-path /org/mlx/Login \
-    --method org.mlx.Login.Login mlx-test x mlx-compositor 2>&1 || true)
-grep -q "org.mlx.Login.Error.NotConfigured" <<< "$login_out" || { echo "FAIL Login did not answer NotConfigured:" >&2; echo "$login_out" >&2; exit 1; }
-echo "ok   Login remains NotConfigured until authorization and authentication are implemented"
+# Permission is decided before mlx-login looks at an account or password.
+login_call() {
+    gdbus call --address "$address" --dest org.mlx.Login --object-path /org/mlx/Login \
+        --method org.mlx.Login.Login "$1" "$2" /bin/true 2>&1 || true
+}
+login_out=$(login_call mlx-test test-password)
+grep -q "org.freedesktop.DBus.Error.AccessDenied" <<< "$login_out" || { echo "FAIL Login handled a password without login.session:" >&2; echo "$login_out" >&2; exit 1; }
+echo "ok   Login requires login.session before checking a password"
+
+printf 'allow gdbus use login.session\n' > "$work/none.conf"
+sleep 0.3
+
+login_out=$(login_call mlx-missing test-password)
+grep -q "(false,)" <<< "$login_out" || { echo "FAIL Login did not refuse an unknown account:" >&2; echo "$login_out" >&2; exit 1; }
+echo "ok   Login refuses an unknown account"
+
+login_out=$(login_call mlx-locked test-password)
+grep -q "(false,)" <<< "$login_out" || { echo "FAIL Login did not refuse a locked account:" >&2; echo "$login_out" >&2; exit 1; }
+echo "ok   Login refuses a locked account"
+
+login_out=$(login_call mlx-empty "")
+grep -q "(false,)" <<< "$login_out" || { echo "FAIL Login did not refuse an empty password hash:" >&2; echo "$login_out" >&2; exit 1; }
+echo "ok   Login refuses an empty password hash"
+
+login_out=$(login_call mlx-test wrong-password)
+grep -q "(false,)" <<< "$login_out" || { echo "FAIL Login did not refuse a wrong password:" >&2; echo "$login_out" >&2; exit 1; }
+echo "ok   Login refuses a wrong password"
+
+mv "$work/shadow" "$work/shadow-away"
+login_out=$(login_call mlx-test test-password)
+mv "$work/shadow-away" "$work/shadow"
+grep -q "(false,)" <<< "$login_out" || { echo "FAIL Login did not fail closed when shadow was unavailable:" >&2; echo "$login_out" >&2; exit 1; }
+echo "ok   Login fails closed when the shadow source is unavailable"
+
+# A correct password reaches only the still-unconfigured session start.
+login_out=$(login_call mlx-test test-password)
+grep -q "org.mlx.Login.Error.NotConfigured" <<< "$login_out" || { echo "FAIL a correct password did not reach the session stub:" >&2; echo "$login_out" >&2; exit 1; }
+echo "ok   a correct password reaches the unconfigured session start"
 
 # Unlock with nobody on the seat is a plain no (it never reaches the
 # password check): the lock screen only unlocks the user who is logged in.
@@ -108,6 +139,13 @@ unlock_out=$(gdbus call --address "$address" --dest org.mlx.Login --object-path 
     --method org.mlx.Login.Unlock root x 2>&1 || true)
 grep -q "(false,)" <<< "$unlock_out" || { echo "FAIL Unlock on an empty seat was not refused:" >&2; echo "$unlock_out" >&2; exit 1; }
 echo "ok   Unlock refuses when nobody holds the seat"
+
+if grep -qE 'test-password|wrong-password|mlxlogintestsalt' "$work/login.log"; then
+    echo "FAIL mlx-login logged password material" >&2
+    cat "$work/login.log" >&2
+    exit 1
+fi
+echo "ok   mlx-login logs no password material"
 
 # The daemon is still alive (it did not crash on any call).
 kill -0 "$login_pid" 2> /dev/null || { echo "FAIL mlx-login ended during the check" >&2; cat "$work/login.log" >&2; exit 1; }

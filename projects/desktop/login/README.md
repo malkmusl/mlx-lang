@@ -37,31 +37,24 @@ for two seconds before the "no", to slow guessing.
 ## The two privileged steps
 
 Two steps need root's power, and they are the only ones that read a
-password hash or change the process's user. They are kept apart in
-`main.mlx` as the functions **`authenticate`** and **`startSession`**,
-each a stub that returns `NOT_CONFIGURED` with the full recipe in its
-comment. Everything else — the bus, the account list, the greeter
-protocol, the failure delay — is finished and runs: build `mlx-login`
-today and `ListUsers` answers, while `Login` and `Unlock` reply with
-`org.mlx.Login.Error.NotConfigured` until the two are filled in.
+password hash or change the process's user. Authentication is complete;
+the session start remains the next step, so a correct password currently
+reaches `org.mlx.Login.Error.NotConfigured` without starting a process.
 
 The pieces the two steps need are all in the tree already:
 
 - **`authenticate`** reads the configured shadow file (`/etc/shadow` by
-  default, root only) and calls
+  default, root only) without following a final symlink, validates that it
+  is a root-owned regular file not writable by group or others, and calls
   `std.crypt.verify(password, hash)` — [`std/src/crypt.mlx`](../../../std/src/crypt.mlx),
   which already does yescrypt (`$y$`, Ubuntu's default), `$6$` and `$5$`
-  in constant time. The stub's comment gives the field layout and the
-  locked-account cases.
+  in constant time. Empty, locked, malformed and unreadable records fail
+  closed; password and hash buffers are wiped on every path.
 - **`startSession`** forks, becomes a session leader, drops the
   supplementary groups, the gid and the uid in that order, builds the
   session's environment, and execve's the session. The stub's comment
   names each syscall and `projects/desktop/ipc/activation.mlx`'s
   `execute` for the PATH lookup.
-
-They are left to whoever runs this on their own machine because reading
-the shadow file and changing user are exactly the operations a system's
-owner should put in by hand, not inherit from a scaffold.
 
 ## The seat
 
@@ -77,5 +70,6 @@ as it does now when no logind is present.
 
 | File | What it does |
 | --- | --- |
-| `main.mlx` | the daemon: the bus, the three methods, the two marked stubs |
+| `main.mlx` | the daemon: the bus, authorization and the three methods |
+| `authentication.mlx` | bounded, fail-closed shadow parsing and password verification |
 | `users.mlx` | the login accounts, read from the configured passwd file |

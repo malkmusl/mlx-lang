@@ -21,20 +21,14 @@
 //                                       screen asks this); never starts
 //                                       anything
 //
-// What this file does NOT contain, and why: the two steps that need
-// root's power are left as the functions `authenticate` and
-// `startSession` below, each a stub that returns NOT_CONFIGURED with a
-// full description of how to fill it in. They read /etc/shadow and change
-// the process's user; writing that belongs to whoever runs this on their
-// own machine, not to this scaffold. Everything around them -- the bus,
-// the accounts, the greeter protocol, the failure delays -- is here and
-// works, so the daemon builds, owns its name and answers ListUsers today;
-// Login and Unlock answer with an error until the two functions are
-// filled in.
+// Login and Unlock first ask MLXIPC for login.session. Password hashes
+// are checked in authentication.mlx without libc and every copied
+// password is wiped. startSession below remains the one incomplete
+// privileged step until the next increment.
 const std = @import("std")
 const dbus = @import("std.dbus")
 const crash = @import("std.crash")
-const crypt = @import("std.crypt")
+const authentication = @import("./authentication.mlx")
 const users_module = @import("./users.mlx")
 
 const SYS_read: usize = 0
@@ -46,6 +40,10 @@ const SYS_getuid: usize = 102
 const LOGIN_NAME: []const u8 = "org.mlx.Login"
 const LOGIN_PATH: []const u8 = "/org/mlx/Login"
 const LOGIN_INTERFACE: []const u8 = "org.mlx.Login"
+const BUS_NAME: []const u8 = "org.freedesktop.DBus"
+const BUS_PATH: []const u8 = "/org/freedesktop/DBus"
+const IPC_PATH: []const u8 = "/org/mlx/IPC"
+const IPC_INTERFACE: []const u8 = "org.mlx.IPC"
 
 // How long a wrong password holds the answer back, to slow guessing
 // (milliseconds). The daemon sleeps this long before every "no".
@@ -63,12 +61,38 @@ const DENIED: u8 = 0
 const ALLOWED: u8 = 1
 const NOT_CONFIGURED: u8 = 2
 
+const LOGIN_CALL: u8 = 1
+const UNLOCK_CALL: u8 = 2
+const PENDING_MOST: usize = 8
+const PASSWORD_MOST: usize = 1024
+const SESSION_MOST: usize = 256
+const SENDER_MOST: usize = 128
+
+// A protected call waits here while MLXIPC decides login.session. Its
+// password is a bounded copy because the bus receive buffer may be reused
+// before Check answers; release wipes every byte on every outcome.
+const Pending = struct {
+    used: bool
+    check: u32
+    kind: u8
+    serial: u32
+    flags: u8
+    sender: [SENDER_MOST]u8
+    senderLength: usize
+    user: [users_module.NAME_MOST]u8
+    userLength: usize
+    password: [PASSWORD_MOST]u8
+    passwordLength: usize
+    session: [SESSION_MOST]u8
+    sessionLength: usize
+}
+
 const Login = struct {
     client: dbus.Client
     users: users_module.Users
     environment: [*][*]const u8
     // The command-line slice points into argv, which lives for the
-    // process. Authentication reads this path in the next privileged step.
+    // process. Authentication reads this path for every protected attempt.
     shadowPath: []const u8
     verbose: bool
     running: bool
@@ -76,6 +100,7 @@ const Login = struct {
     // password of this user only.
     active: [users_module.NAME_MOST]u8
     activeLength: usize
+    pending: [PENDING_MOST]Pending
 }
 
 fn clientOf(login: *Login) -> *dbus.Client {
@@ -84,6 +109,52 @@ fn clientOf(login: *Login) -> *dbus.Client {
 
 fn usersOf(login: *Login) -> *users_module.Users {
     unsafe { return @ptrCast(*users_module.Users, &login.*.users) }
+}
+
+fn pendingAt(login: *Login, index: usize) -> *Pending {
+    unsafe { return @ptrFromInt(*Pending, @intFromPtr(login) + @offsetOf(Login, "pending") + index * @sizeOf(Pending)) }
+}
+
+fn pendingBytes(pending: *Pending, offset: usize) -> [*]u8 {
+    unsafe { return @ptrFromInt([*]u8, @intFromPtr(pending) + offset) }
+}
+
+fn senderOf(pending: *Pending) -> []const u8 { return pendingBytes(pending, @offsetOf(Pending, "sender"))[0..pending.*.senderLength] }
+fn pendingUser(pending: *Pending) -> []const u8 { return pendingBytes(pending, @offsetOf(Pending, "user"))[0..pending.*.userLength] }
+fn pendingPassword(pending: *Pending) -> []const u8 { return pendingBytes(pending, @offsetOf(Pending, "password"))[0..pending.*.passwordLength] }
+fn pendingSession(pending: *Pending) -> []const u8 { return pendingBytes(pending, @offsetOf(Pending, "session"))[0..pending.*.sessionLength] }
+
+fn copyInto(target: [*]u8, capacity: usize, value: []const u8) -> usize {
+    var index: usize = 0
+    while index < value.length && index < capacity {
+        target[index] = value[index]
+        index += 1
+    }
+    return index
+}
+
+fn wipe(bytes: [*]u8, length: usize) -> void {
+    var index: usize = 0
+    while index < length {
+        bytes[index] = 0
+        index += 1
+    }
+}
+
+fn wipeSlice(value: []const u8) -> void {
+    var bytes: [*]u8 = undefined
+    unsafe { bytes = @ptrFromInt([*]u8, @intFromPtr(value)) }
+    wipe(bytes, value.length)
+}
+
+fn release(pending: *Pending) -> void {
+    wipe(pendingBytes(pending, @offsetOf(Pending, "user")), users_module.NAME_MOST)
+    wipe(pendingBytes(pending, @offsetOf(Pending, "password")), PASSWORD_MOST)
+    wipe(pendingBytes(pending, @offsetOf(Pending, "session")), SESSION_MOST)
+    pending.*.userLength = 0
+    pending.*.passwordLength = 0
+    pending.*.sessionLength = 0
+    pending.*.used = false
 }
 
 fn say(login: *Login, text: []const u8) -> void {
@@ -107,43 +178,20 @@ fn sleep(milliseconds: usize) -> void {
 }
 
 // ===========================================================================
-// THE TWO PRIVILEGED STEPS -- fill these in on your own machine.
+// THE TWO PRIVILEGED STEPS.
 //
 // They are the only places that read a password hash or change the
-// process's user. The rest of mlx-login never touches either, so these
-// two functions are the whole of what a login needs that this scaffold
-// leaves out. Each returns NOT_CONFIGURED as it stands, which makes Login
-// and Unlock answer with org.mlx.Login.Error.NotConfigured.
+// process's user. Authentication is complete; session start follows in
+// the next increment.
 // ===========================================================================
 
 // STEP 1 -- CHECK THE PASSWORD.
 //
-// Return ALLOWED when `password` is `user`'s password, DENIED when it is
-// not, and keep NOT_CONFIGURED until this is written.
-//
-// How to write it (no libc needed; everything is a std call):
-//
-//   1. Open login.*.shadowPath (default /etc/shadow) with
-//      std.linux.syscall3 SYS_open, O_RDONLY. Only root can read the
-//      production file. If the open fails, return DENIED.
-//   2. Read the file into a stack buffer (as users.mlx reads
-//      /etc/passwd) and find the line that starts with `user` followed
-//      by ':'. Its second colon-separated field is the stored hash.
-//   3. A field of "" means no password is set (depending on policy,
-//      refuse: return DENIED). A field starting with '!' or '*' is a
-//      locked account: return DENIED.
-//   4. Return `if crypt.verify(password, hash) { ALLOWED } else { DENIED }`.
-//      std.crypt.verify already handles $y$ (yescrypt, Ubuntu's default),
-//      $6$, $5$ and does the comparison in constant time.
-//   5. Wipe the buffer that held the hash and the password bytes
-//      afterwards (crypt.sha2.wipe, or a plain loop to 0): they are the
-//      secret.
-//
-// Keep the shadow buffer out of any log and never put the hash or the
-// password in a reply or an error message.
+// authentication.mlx opens the configured shadow file without following
+// a final symlink, verifies its ownership and mode, streams bounded
+// records, rejects empty/locked/unsupported hashes and wipes its buffer.
 fn authenticate(login: *Login, user: []const u8, password: []const u8) -> u8 {
-    // Leave this line until the body above is written.
-    return NOT_CONFIGURED
+    return if authentication.check(login.*.shadowPath, user, password) { ALLOWED } else { DENIED }
 }
 
 // STEP 2 -- START THE SESSION AS THE USER.
@@ -200,7 +248,7 @@ fn startSession(login: *Login, index: usize, session: []const u8) -> u8 {
 // ===========================================================================
 
 fn notConfigured(login: *Login, call: *const dbus.Header) -> void {
-    sendError(login, call, "org.mlx.Login.Error.NotConfigured", "mlx-login: the password check or the session start is not configured on this machine (projects/desktop/login/main.mlx: authenticate, startSession)")
+    sendError(login, call, "org.mlx.Login.Error.NotConfigured", "mlx-login: the session start is not configured on this machine (projects/desktop/login/main.mlx: startSession)")
 }
 
 fn sendError(login: *Login, call: *const dbus.Header, name: []const u8, message: []const u8) -> void {
@@ -265,49 +313,30 @@ fn listUsers(login: *Login, call: *const dbus.Header) -> void {
     std.page_allocator.init().free(memory.?, dbus.MAX_MESSAGE, 16)
 }
 
-// Login(user, password, session): check, then start.
-fn handleLogin(login: *Login, call: *const dbus.Header, body: [*]const u8) -> void {
-    var reading = dbus.reader(body, call.*.bodyLength, call.*.big)
-    const user = dbus.readString(&reading)
-    const password = dbus.readString(&reading)
-    const session = dbus.readString(&reading)
-    if reading.failed {
-        sendError(login, call, "org.freedesktop.DBus.Error.InvalidArgs", "Login takes (sss)")
-        return
-    }
-    const index = users_module.find(usersOf(login), user)
-    if index >= login.*.users.count {
-        sleep(FAILURE_DELAY_MS)
-        say(login, "login: no such account\n")
-        replyBool(login, call, false)
-        return
-    }
-    const checked = authenticate(login, user, password)
-    if checked == NOT_CONFIGURED {
-        notConfigured(login, call)
-        return
-    }
-    if checked != ALLOWED {
-        sleep(FAILURE_DELAY_MS)
-        say(login, "login: wrong password\n")
-        replyBool(login, call, false)
-        return
-    }
-    const started = startSession(login, index, session)
-    if started == NOT_CONFIGURED {
-        notConfigured(login, call)
-        return
-    }
-    replyBool(login, call, started == ALLOWED)
-}
-
-// Unlock(user, password): the lock screen, for the user who has the seat.
-fn unlock(login: *Login, call: *const dbus.Header, body: [*]const u8) -> void {
-    var reading = dbus.reader(body, call.*.bodyLength, call.*.big)
-    const user = dbus.readString(&reading)
-    const password = dbus.readString(&reading)
-    if reading.failed {
-        sendError(login, call, "org.freedesktop.DBus.Error.InvalidArgs", "Unlock takes (ss)")
+// Performs a call only after MLXIPC allowed login.session.
+fn perform(login: *Login, call: *const dbus.Header, pending: *Pending) -> void {
+    const user = pendingUser(pending)
+    if pending.*.kind == LOGIN_CALL {
+        const index = users_module.find(usersOf(login), user)
+        if index >= login.*.users.count {
+            sleep(FAILURE_DELAY_MS)
+            say(login, "login: credentials refused\n")
+            replyBool(login, call, false)
+            return
+        }
+        const checked = authenticate(login, user, pendingPassword(pending))
+        if checked != ALLOWED {
+            sleep(FAILURE_DELAY_MS)
+            say(login, "login: credentials refused\n")
+            replyBool(login, call, false)
+            return
+        }
+        const started = startSession(login, index, pendingSession(pending))
+        if started == NOT_CONFIGURED {
+            notConfigured(login, call)
+            return
+        }
+        replyBool(login, call, started == ALLOWED)
         return
     }
     var active: [*]const u8 = undefined
@@ -317,29 +346,102 @@ fn unlock(login: *Login, call: *const dbus.Header, body: [*]const u8) -> void {
         replyBool(login, call, false)
         return
     }
-    const checked = authenticate(login, user, password)
-    if checked == NOT_CONFIGURED {
-        notConfigured(login, call)
-        return
-    }
+    const checked = authenticate(login, user, pendingPassword(pending))
     if checked != ALLOWED { sleep(FAILURE_DELAY_MS) }
     replyBool(login, call, checked == ALLOWED)
+}
+
+// Asks MLXIPC about login.session. Arguments are copied before the Check
+// call and the password in the receive buffer is wiped immediately.
+fn askPermission(login: *Login, call: *const dbus.Header, body: [*]const u8, kind: u8) -> void {
+    const wanted = if kind == LOGIN_CALL { "sss" } else { "ss" }
+    if !same(call.*.signature, wanted) {
+        sendError(login, call, "org.freedesktop.DBus.Error.InvalidArgs", if kind == LOGIN_CALL { "Login takes (sss)" } else { "Unlock takes (ss)" })
+        return
+    }
+    var reading = dbus.reader(body, call.*.bodyLength, call.*.big)
+    const user = dbus.readString(&reading)
+    const password = dbus.readString(&reading)
+    var session: []const u8 = ""
+    if kind == LOGIN_CALL { session = dbus.readString(&reading) }
+    if reading.failed || user.length == 0 || user.length > users_module.NAME_MOST || password.length > PASSWORD_MOST || session.length > SESSION_MOST || call.*.sender.length == 0 || call.*.sender.length > SENDER_MOST {
+        wipeSlice(password)
+        sendError(login, call, "org.freedesktop.DBus.Error.InvalidArgs", if kind == LOGIN_CALL { "Login takes bounded (sss) values" } else { "Unlock takes bounded (ss) values" })
+        return
+    }
+    var slot: usize = 0
+    while slot < PENDING_MOST && pendingAt(login, slot).*.used { slot += 1 }
+    if slot == PENDING_MOST {
+        wipeSlice(password)
+        sendError(login, call, "org.mlx.Login.Error.Busy", "too many login requests wait for the bus")
+        return
+    }
+    const pending = pendingAt(login, slot)
+    pending.*.kind = kind
+    pending.*.serial = call.*.serial
+    pending.*.flags = call.*.flags
+    pending.*.senderLength = copyInto(pendingBytes(pending, @offsetOf(Pending, "sender")), SENDER_MOST, call.*.sender)
+    pending.*.userLength = copyInto(pendingBytes(pending, @offsetOf(Pending, "user")), users_module.NAME_MOST, user)
+    pending.*.passwordLength = copyInto(pendingBytes(pending, @offsetOf(Pending, "password")), PASSWORD_MOST, password)
+    pending.*.sessionLength = copyInto(pendingBytes(pending, @offsetOf(Pending, "session")), SESSION_MOST, session)
+    wipeSlice(password)
+    var message: [256]u8 = undefined
+    var writing: dbus.Writer = undefined
+    unsafe { dbus.begin(&writing, @ptrCast([*]u8, &message), 256, false) }
+    dbus.putString(&writing, senderOf(pending))
+    dbus.putString(&writing, "login.session")
+    pending.*.check = dbus.call(clientOf(login), BUS_NAME, IPC_PATH, IPC_INTERFACE, "Check", "ss", @ptrCast([*]const u8, &message), writing.length)
+    if pending.*.check == 0 {
+        release(pending)
+        sendError(login, call, "org.freedesktop.DBus.Error.AccessDenied", "the bus could not authorize login.session")
+        return
+    }
+    pending.*.used = true
+}
+
+fn permissionAnswered(login: *Login, reply: *const dbus.Header) -> bool {
+    var slot: usize = 0
+    while slot < PENDING_MOST {
+        const pending = pendingAt(login, slot)
+        if pending.*.used && pending.*.check == reply.*.replySerial {
+            var allowed = false
+            if reply.*.kind == dbus.METHOD_RETURN && same(reply.*.signature, "b") {
+                var reading = dbus.reader(dbus.bodyOf(clientOf(login), reply), reply.*.bodyLength, reply.*.big)
+                allowed = dbus.readBool(&reading) && !reading.failed
+            }
+            var call = dbus.newHeader(dbus.METHOD_CALL, pending.*.serial)
+            call.flags = pending.*.flags
+            call.sender = senderOf(pending)
+            if allowed {
+                perform(login, &call, pending)
+            } else {
+                sendError(login, &call, "org.freedesktop.DBus.Error.AccessDenied", "this app may not start or unlock a session (login.session)")
+                say(login, "login: login.session refused\n")
+            }
+            release(pending)
+            return true
+        }
+        slot += 1
+    }
+    return false
 }
 
 fn dispatch(login: *Login) -> void {
     var header: dbus.Header = undefined
     while dbus.next(clientOf(login), &header, 0) {
         const body = dbus.bodyOf(clientOf(login), &header)
-        if header.kind == dbus.METHOD_CALL && same(header.interface, LOGIN_INTERFACE) {
+        if header.kind == dbus.METHOD_CALL && same(header.path, LOGIN_PATH) && same(header.interface, LOGIN_INTERFACE) {
             if same(header.member, "ListUsers") {
                 listUsers(login, &header)
             } else if same(header.member, "Login") {
-                handleLogin(login, &header, body)
+                askPermission(login, &header, body, LOGIN_CALL)
             } else if same(header.member, "Unlock") {
-                unlock(login, &header, body)
+                askPermission(login, &header, body, UNLOCK_CALL)
             } else if header.flags & dbus.NO_REPLY_EXPECTED == 0 {
                 sendError(login, &header, "org.freedesktop.DBus.Error.UnknownMethod", "mlx-login: no such method")
             }
+        } else if (header.kind == dbus.METHOD_RETURN || header.kind == dbus.ERROR) && header.hasReplySerial {
+            const ignored = permissionAnswered(login, &header)
         }
     }
     if login.*.client.closed { login.*.running = false }
@@ -420,6 +522,11 @@ fn run(arguments: [][*]const u8) -> !void {
     login.*.verbose = verbose
     login.*.running = true
     login.*.activeLength = 0
+    var pendingIndex: usize = 0
+    while pendingIndex < PENDING_MOST {
+        release(pendingAt(login, pendingIndex))
+        pendingIndex += 1
+    }
     const ignored = users_module.load(usersOf(login), passwdPath)
     say(login, "login: read the configured account list\n")
     if !connectName(login) {
