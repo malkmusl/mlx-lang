@@ -540,6 +540,14 @@ memfd), once more copying each frame in, as on drivers that cannot import
 them, and once more with the first frame made to look missing from the
 buffer, after which the renderer must copy.
 
+Every device descriptor is made nonblocking when the compositor takes it
+([`device.mlx`](device.mlx)), whoever opened it: the event loop reads the
+card and the input devices until EAGAIN, systemd-logind hands them over
+nonblocking, and a session manager that does not would leave the
+compositor waiting in read(2) for a page flip after its first frame,
+deaf to clients and keys. `tools/check_compositor_device.sh` checks it
+with a blocking pipe in place of the card.
+
 ## Desktop session (GDM, SDDM)
 
 `install_compositor.sh` at the repository root builds the compositor and

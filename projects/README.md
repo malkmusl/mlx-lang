@@ -8,7 +8,8 @@ projects/.../main.mlx -o ...`) and is checked by a script under `tools/`.
   - [`compositor/`](desktop/compositor/README.md): the Wayland compositor
     (nested or on DRM/KMS, CPU or Vulkan composition, hot-reloadable
     shell and renderer); `tools/check_wayland_compositor.sh`,
-    `tools/check_compositor_drm.sh`, `tools/check_compositor_modules.sh`.
+    `tools/check_compositor_drm.sh`, `tools/check_compositor_device.sh`,
+    `tools/check_compositor_modules.sh`.
   - `dock/`, `launcher/`, `topbar/`, `settings/`, `files/`: the desktop's
     clients (the dock, the application launcher, the top bar, the
     settings and the file manager); `tools/check_desktop_clients.sh`.
