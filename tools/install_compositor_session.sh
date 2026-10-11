@@ -73,7 +73,7 @@
 #                     (default /usr/share/wayland-sessions)
 #   --destdir DIR     stage everything under DIR instead (packaging, tests)
 #   --compiler PATH   the Mlx compiler (default: mlx-out/bin/compiler/mlx4,
-#                     else zig-out/bin/mlx1, else built with `zig build mlx1`)
+#                     else zig-out/bin/mlx1, else made by tools/ensure_compiler.sh)
 #   --build-only      build into mlx-out/session and stop
 #   --uninstall       remove what an install put there (and restore the
 #                     sound servers when they were replaced)

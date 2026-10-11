@@ -20,7 +20,7 @@ Every chapter names the tests it draws on under a **Source tests** line so
 you can jump straight to the fixture and, if you want, run it yourself:
 
 ```sh
-zig build
+./mlx build mlx0          # the stage-0 compiler, with zig
 ./zig-out/bin/mlx0 tests/06_control_flow.mlx -o /tmp/out && /tmp/out; echo $?
 ```
 

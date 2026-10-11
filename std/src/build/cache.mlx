@@ -1,0 +1,370 @@
+// Whether a step's file is current, and the record that says so.
+//
+// Each step that was built has a manifest in mlx-out/build/cache (NAME
+// with '/' as '_', then .manifest):
+//
+//     mlx-build 1
+//     key 1f2e3d4c5b6a7980          what made it (kind, source, output,
+//                                    options, the compiler, the input
+//                                    trees' file lists)
+//     took 25123                     milliseconds the build took
+//     input SIZE SECONDS NANOSECONDS HASH PATH
+//
+// with one input line per file it read: for an Mlx step the modules the
+// compiler loaded (its --depfile), for a command its inputs and the files
+// of its input trees, for a copy its source. A step is current when its
+// output is there, the key is the same and every input is unchanged: the
+// same size and modification time, or, when those differ, the same
+// contents (a file saved again unchanged costs a hash, not a build). The
+// manifest goes before a step runs and is written after it succeeded, so
+// an interrupted or failed build is never taken for a current one.
+const std = @import("std")
+const graph = @import("./graph.mlx")
+
+const FNV_OFFSET: u64 = 14695981039346656037
+const FNV_PRIME: u64 = 1099511628211
+const VERSION_LINE: []const u8 = "mlx-build 1"
+
+pub fn hashBytes(hash: u64, bytes: []const u8) -> u64 {
+    var value = hash
+    for byte in bytes {
+        value = (value ^ @intCast(u64, byte)) *% FNV_PRIME
+    }
+    return value
+}
+
+fn hashNumber(hash: u64, number: usize) -> u64 {
+    var value = hash
+    var rest = number
+    var count: usize = 0
+    while count < 8 {
+        value = (value ^ @intCast(u64, rest & 255)) *% FNV_PRIME
+        rest = rest >> 8
+        count += 1
+    }
+    return value
+}
+
+// A file's size and modification time.
+pub const Identity = struct {
+    exists: bool
+    size: usize
+    seconds: usize
+    nanoseconds: usize
+}
+
+pub fn identity(b: *graph.Builder, path: []const u8) -> Identity {
+    var stat: std.fs.Stat = undefined
+    if std.fs.status(graph.cPath(b, path), &stat) != 0 {
+        return Identity.{ .exists = false, .size = 0, .seconds = 0, .nanoseconds = 0 }
+    }
+    return Identity.{ .exists = true, .size = @bitCast(usize, stat.size), .seconds = @bitCast(usize, stat.modifiedSeconds), .nanoseconds = @bitCast(usize, stat.modifiedNanoseconds) }
+}
+
+// Whether PATH is there (a dangling link counts).
+pub fn present(b: *graph.Builder, path: []const u8) -> bool {
+    var stat: std.fs.Stat = undefined
+    return std.fs.statusAt(graph.cPath(b, path), &stat, true) == 0
+}
+
+// The contents' hash; false when the file cannot be read.
+pub fn hashFile(b: *graph.Builder, path: []const u8, result: *u64) -> bool {
+    const file = std.fs.open(graph.cPath(b, path), std.fs.READ_ONLY, 0)
+    if !std.fs.isValid(file) { return false }
+    const buffer = graph.ioBytes(b)
+    var hash = FNV_OFFSET
+    var ok = true
+    while true {
+        const got = std.fs.read(file, buffer, graph.IO_BYTES)
+        if got < 0 { ok = false }
+        if got <= 0 { break }
+        hash = hashBytes(hash, buffer[0..@bitCast(usize, got)])
+    }
+    const closed = std.fs.close(file)
+    result.* = hash
+    return ok
+}
+
+// The compiler's contents (once a run): a new compiler rebuilds every Mlx
+// step.
+pub fn compilerHash(b: *graph.Builder) -> u64 {
+    if !b.*.compilerHashed {
+        var hash: u64 = 0
+        if !hashFile(b, b.*.compiler, &hash) { hash = 0 }
+        b.*.compilerHash = hash
+        b.*.compilerHashed = true
+    }
+    return b.*.compilerHash
+}
+
+// Reads PATH whole into the builder's file buffer; its length, or NONE.
+pub fn readWhole(b: *graph.Builder, path: []const u8) -> usize {
+    const file = std.fs.open(graph.cPath(b, path), std.fs.READ_ONLY, 0)
+    if !std.fs.isValid(file) { return graph.NONE }
+    const buffer = graph.fileBytes(b)
+    var total: usize = 0
+    var ok = true
+    while total < graph.FILE_BYTES - 1 {
+        unsafe {
+            const got = std.fs.read(file, @ptrFromInt([*]u8, @intFromPtr(buffer) + total), graph.FILE_BYTES - 1 - total)
+            if got < 0 { ok = false }
+            if got <= 0 { break }
+            total += @bitCast(usize, got)
+        }
+    }
+    const closed = std.fs.close(file)
+    if !ok || total >= graph.FILE_BYTES - 1 { return graph.NONE }
+    buffer[total] = 0
+    return total
+}
+
+pub fn manifestPath(b: *graph.Builder, item: *graph.Node) -> []const u8 {
+    return graph.joined(b, graph.joined(b, "mlx-out/build/cache/", graph.fileName(b, item.*.name)), ".manifest")
+}
+
+// The files of a command's input trees: their names make part of the key
+// (in any order), and they become input lines.
+const TreeState = struct {
+    listing: u64
+    files: [4096][]const u8
+    count: usize
+}
+
+// Adds every file under DIRECTORY ending in SUFFIX to STATE.
+fn walk(b: *graph.Builder, directory: []const u8, suffix: []const u8, state: *TreeState) -> void {
+    const handle = std.fs.open(graph.cPath(b, directory), std.fs.READ_ONLY | std.fs.DIRECTORY, 0)
+    if !std.fs.isValid(handle) { return }
+    var buffer: [8192]u8 = undefined
+    var bytes: [*]u8 = undefined
+    unsafe { bytes = @ptrCast([*]u8, &buffer) }
+    var reader = std.fs.entries(handle, bytes, 8192)
+    var entry: std.fs.Entry = undefined
+    // Names first, then the subdirectories: the reader's buffer is reused.
+    var subdirectories: [64][]const u8 = undefined
+    var subdirectoryCount: usize = 0
+    while std.fs.nextEntry(&reader, &entry) {
+        if std.fs.isDotName(entry.name) { continue }
+        var name: []const u8 = undefined
+        unsafe { name = entry.name.pointer[0..entry.name.length] }
+        const path = graph.joined(b, graph.joined(b, directory, "/"), name)
+        if entry.kind == std.fs.ENTRY_DIRECTORY {
+            if subdirectoryCount < 64 {
+                subdirectories[subdirectoryCount] = path
+                subdirectoryCount += 1
+            }
+        } else if name.length >= suffix.length && std.text.same(name[name.length - suffix.length..name.length], suffix) {
+            visitTreeFile(state, path)
+        }
+    }
+    const closed = std.fs.close(handle)
+    var index: usize = 0
+    while index < subdirectoryCount {
+        walk(b, subdirectories[index], suffix, state)
+        index += 1
+    }
+}
+
+fn visitTreeFile(state: *TreeState, path: []const u8) -> void {
+    // Summed, so the order the directory gave them in does not matter.
+    state.*.listing = state.*.listing +% hashBytes(FNV_OFFSET, path)
+    if state.*.count < 4096 {
+        state.*.files[state.*.count] = path
+        state.*.count += 1
+    }
+}
+
+fn treeState(b: *graph.Builder, item: *graph.Node, state: *TreeState) -> void {
+    state.*.listing = 0
+    state.*.count = 0
+    var tree: usize = 0
+    while tree < item.*.treeCount {
+        walk(b, item.*.trees[tree], item.*.treeSuffixes[tree], state)
+        tree += 1
+    }
+}
+
+// What made the step: a different key makes it again.
+fn key(b: *graph.Builder, item: *graph.Node, listing: u64) -> u64 {
+    var hash = hashNumber(FNV_OFFSET, @intCast(usize, item.*.kind))
+    hash = hashBytes(hash, item.*.source)
+    hash = hashBytes(hash, "\n")
+    hash = hashBytes(hash, item.*.output)
+    var index: usize = 0
+    while index < item.*.optionCount {
+        hash = hashBytes(hash, "\n")
+        hash = hashBytes(hash, item.*.options[index])
+        index += 1
+    }
+    if item.*.kind == graph.KIND_PROGRAM || item.*.kind == graph.KIND_SHARED || item.*.kind == graph.KIND_PLUGIN {
+        hash = hashNumber(hash, @bitCast(usize, compilerHash(b)))
+    }
+    return hashNumber(hash, @bitCast(usize, listing))
+}
+
+fn parseNumber(bytes: [*]const u8, at: *usize, end: usize, base: usize) -> usize {
+    var value: usize = 0
+    while at.* < end && bytes[at.*] != 32 {
+        const digit = std.text.hexValue(bytes[at.*])
+        value = value * base + @intCast(usize, digit)
+        at.* += 1
+    }
+    if at.* < end { at.* += 1 }
+    return value
+}
+
+fn startsAt(bytes: [*]const u8, at: usize, end: usize, word: []const u8) -> bool {
+    if at + word.length > end { return false }
+    return std.text.same(bytes[at..at + word.length], word)
+}
+
+// Whether ITEM's output is current. `took` gets the last build's time
+// (for starting long steps first) whatever the answer.
+pub fn isCurrent(b: *graph.Builder, item: *graph.Node) -> bool {
+    if item.*.kind == graph.KIND_GROUP { return true }
+    var output = item.*.output
+    if output.length == 0 { output = stampPath(b, item) }
+    if !present(b, output) { return false }
+    const length = readWhole(b, manifestPath(b, item))
+    if length == graph.NONE { return false }
+    const bytes = graph.fileBytes(b)
+    // Lines become C strings in place (each path is one).
+    var at: usize = 0
+    var lineStart: usize = 0
+    var lines: usize = 0
+    var recorded: u64 = 0
+    var keyed = false
+    var current = true
+    while at <= length && current {
+        if at == length || bytes[at] == 10 {
+            const end = at
+            bytes[at] = 0
+            if lines == 0 {
+                current = std.text.same(bytes[lineStart..end], VERSION_LINE)
+            } else if startsAt(bytes, lineStart, end, "key ") {
+                var cursor = lineStart + 4
+                recorded = @bitCast(u64, parseNumber(bytes, &cursor, end, 16))
+                keyed = true
+            } else if startsAt(bytes, lineStart, end, "took ") {
+                var cursor = lineStart + 5
+                item.*.took = parseNumber(bytes, &cursor, end, 10)
+            } else if startsAt(bytes, lineStart, end, "input ") {
+                var cursor = lineStart + 6
+                const size = parseNumber(bytes, &cursor, end, 10)
+                const seconds = parseNumber(bytes, &cursor, end, 10)
+                const nanoseconds = parseNumber(bytes, &cursor, end, 10)
+                const hash = @bitCast(u64, parseNumber(bytes, &cursor, end, 16))
+                const path = bytes[cursor..end]
+                const now = identity(b, path)
+                if !now.exists {
+                    current = false
+                } else if now.size != size || now.seconds != seconds || now.nanoseconds != nanoseconds {
+                    var contents: u64 = 0
+                    if !hashFile(b, path, &contents) || contents != hash { current = false }
+                }
+            } else if end > lineStart {
+                current = false
+            }
+            lines += 1
+            lineStart = at + 1
+        }
+        at += 1
+    }
+    if !current || !keyed { return false }
+    var state: TreeState = undefined
+    treeState(b, item, &state)
+    return recorded == key(b, item, state.listing)
+}
+
+pub fn stampPath(b: *graph.Builder, item: *graph.Node) -> []const u8 {
+    return graph.joined(b, "mlx-out/build/stamps/", graph.fileName(b, item.*.name))
+}
+
+// The manifest goes before ITEM runs.
+pub fn forget(b: *graph.Builder, item: *graph.Node) -> void {
+    const removed = std.fs.delete(graph.cPath(b, manifestPath(b, item)))
+}
+
+const Writer = struct {
+    bytes: [*]u8
+    length: usize
+    capacity: usize
+}
+
+fn put(writer: *Writer, text: []const u8) -> void {
+    writer.*.length = std.text.append(writer.*.bytes, writer.*.length, writer.*.capacity, text)
+}
+
+fn putNumber(writer: *Writer, value: usize) -> void {
+    writer.*.length = std.text.appendUnsigned(writer.*.bytes, writer.*.length, writer.*.capacity, value)
+}
+
+fn putHex(writer: *Writer, value: u64) -> void {
+    writer.*.length = std.text.appendHex(writer.*.bytes, writer.*.length, writer.*.capacity, @bitCast(usize, value))
+}
+
+// One input line for PATH; false when it cannot be read.
+fn putInput(b: *graph.Builder, writer: *Writer, path: []const u8) -> bool {
+    const now = identity(b, path)
+    var hash: u64 = 0
+    if !now.exists || !hashFile(b, path, &hash) { return false }
+    put(writer, "input ")
+    putNumber(writer, now.size)
+    put(writer, " ")
+    putNumber(writer, now.seconds)
+    put(writer, " ")
+    putNumber(writer, now.nanoseconds)
+    put(writer, " ")
+    putHex(writer, hash)
+    put(writer, " ")
+    put(writer, path)
+    put(writer, "\n")
+    return writer.*.length + 1 < writer.*.capacity
+}
+
+// Writes ITEM's manifest after it was built (TOOK milliseconds); false
+// when an input could not be read (then the step counts as not current).
+pub fn record(b: *graph.Builder, item: *graph.Node, took: usize) -> bool {
+    var state: TreeState = undefined
+    treeState(b, item, &state)
+    // The text goes after the depfile in the file buffer.
+    var depfileLength: usize = 0
+    if item.*.depfile.length != 0 {
+        depfileLength = readWhole(b, item.*.depfile)
+        if depfileLength == graph.NONE { return false }
+    }
+    const bytes = graph.fileBytes(b)
+    var writer: Writer = undefined
+    unsafe { writer = Writer.{ .bytes = @ptrFromInt([*]u8, @intFromPtr(bytes) + depfileLength + 1), .length = 0, .capacity = graph.FILE_BYTES - depfileLength - 1 } }
+    put(&writer, VERSION_LINE)
+    put(&writer, "\nkey ")
+    putHex(&writer, key(b, item, state.listing))
+    put(&writer, "\ntook ")
+    putNumber(&writer, took)
+    put(&writer, "\n")
+    var ok = true
+    var lineStart: usize = 0
+    var at: usize = 0
+    while at < depfileLength {
+        if bytes[at] == 10 {
+            if at > lineStart && !putInput(b, &writer, bytes[lineStart..at]) { ok = false }
+            lineStart = at + 1
+        }
+        at += 1
+    }
+    var index: usize = 0
+    while index < item.*.inputCount {
+        if !putInput(b, &writer, item.*.inputs[index]) { ok = false }
+        index += 1
+    }
+    index = 0
+    while index < state.count {
+        if !putInput(b, &writer, state.files[index]) { ok = false }
+        index += 1
+    }
+    if item.*.kind == graph.KIND_COPY && !putInput(b, &writer, item.*.source) { ok = false }
+    if !ok { return false }
+    const file = std.fs.open(graph.cPath(b, manifestPath(b, item)), std.fs.WRITE_ONLY | std.fs.CREATE | std.fs.TRUNCATE, 420)
+    if !std.fs.isValid(file) { return false }
+    const written = std.fs.writeAll(file, writer.bytes[0..writer.length])
+    return std.fs.close(file) && written
+}

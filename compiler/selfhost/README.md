@@ -82,7 +82,7 @@ dependencies of the compiler or self-hosting path.
 Build the self-hosted compiler with:
 
 ```sh
-zig build mlx1
+./mlx build mlx1                      # zig builds mlx0, mlx0 builds mlx1
 zig-out/bin/mlx1 tests/01_basic.mlx
 ```
 
@@ -93,6 +93,14 @@ bootstrap distinction is intentionally narrow: explicit eligible `inline`
 functions can expand at every level, O2 automatically expands only very small
 eligible functions, and O3 uses a larger cost budget. The remaining global
 optimization and register-allocation work is tracked separately.
+
+`--depfile=PATH` writes every module the compiler loaded, one path per line
+(as the loader named them, relative to the working directory), once the
+module graph is loaded: `mlx build` decides by these files whether an
+output is current. `mlx build [ARGS...]` (the first argument `build`) runs
+the `build.mlx` of the working directory
+([`driver/build_command.mlx`](driver/build_command.mlx),
+[`docs/reference/build-system.md`](../../docs/reference/build-system.md)).
 
 Progress reporting is enabled by default and records the duration of every
 pipeline step. A rejected compilation marks the active step as `failed`, reports

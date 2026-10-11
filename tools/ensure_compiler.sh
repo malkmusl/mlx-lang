@@ -6,7 +6,7 @@
 # compiler's fixed point (it builds the same binary from the same sources on
 # every machine, so a crash address from one machine finds its place on
 # another). When only the bootstrap-built zig-out/bin/mlx1 is there (or
-# nothing: then `zig build mlx1`), mlx4 is built from it in two stages
+# nothing: then zig builds mlx0, which builds it), mlx4 is built from it in two stages
 # (mlx1 builds the compiler, which builds itself). When mlx4 is older than
 # the compiler's sources and
 # lacks something they added since (each feature below has a probe), it is
@@ -292,6 +292,31 @@ stores_through_slice_addresses() {
     return $ok
 }
 
+# Whether $1 writes the files it read with --depfile (what `mlx build`
+# decides rebuilds by).
+writes_depfiles() {
+    local probe
+    probe=$(mktemp -d mlx-out/probe.XXXXXX)
+    local ok=1
+    if "$1" --quiet --depfile="$probe/deps" tests/support/discard.mlx > /dev/null 2>&1 \
+        && grep -qx 'tests/support/discard.mlx' "$probe/deps" 2> /dev/null; then
+        ok=0
+    fi
+    rm -rf -- "$probe"
+    return $ok
+}
+
+# Whether $1 has the build command (`mlx build`; outside a project it says
+# there is no build.mlx).
+runs_build() {
+    local probe compiler=$1 status=0
+    [[ "$compiler" == /* ]] || compiler="$repo_root/$compiler"
+    probe=$(mktemp -d mlx-out/probe.XXXXXX)
+    (cd "$probe" && "$compiler" build > /dev/null 2>&1) || status=$?
+    rm -rf -- "$probe"
+    [[ $status -eq 2 ]]
+}
+
 # The probes with what each one stands for.
 probes=(
     "writes_shared_objects|--shared objects"
@@ -312,6 +337,8 @@ probes=(
     "builds_mlxlibc|what mlxlibc needs (@frameAddress, signed loads through pointers, array initializers of module vars, --entry and --init)"
     "decodes_escapes|\\xHH escapes"
     "stores_through_slice_addresses|slices stored through their address keeping their length"
+    "writes_depfiles|--depfile"
+    "runs_build|the build command (mlx build)"
 )
 
 # What compiler $1 lacks, one feature per line (nothing when it has all).
@@ -361,16 +388,22 @@ rebuild_with() {
     return 0
 }
 
-# The bootstrap compiler zig-out/bin/mlx1 (built with zig when missing);
-# its path on stdout, or failure.
+# The bootstrap compiler zig-out/bin/mlx1 (built when missing: zig builds
+# mlx0 from compiler/bootstrap, mlx0 builds the self-hosted compiler; what
+# build.mlx's bootstrap group does too); its path on stdout, or failure.
 bootstrap_seed() {
     if [[ ! -x zig-out/bin/mlx1 ]]; then
-        if ! command -v zig > /dev/null; then
-            echo "ensure_compiler.sh: no bootstrap compiler (zig-out/bin/mlx1) and no zig to build one" >&2
-            return 1
+        if [[ ! -x zig-out/bin/mlx0 ]]; then
+            if ! command -v zig > /dev/null; then
+                echo "ensure_compiler.sh: no bootstrap compiler (zig-out/bin/mlx1) and no zig to build one" >&2
+                return 1
+            fi
+            echo "building the stage-0 compiler zig-out/bin/mlx0 with zig" >&2
+            mkdir -p zig-out/bin
+            zig build-exe compiler/bootstrap/main.zig --name mlx0 -femit-bin=zig-out/bin/mlx0 >&2 || return 1
         fi
-        echo "building the bootstrap compiler (zig build mlx1)" >&2
-        zig build mlx1 >&2
+        echo "building the bootstrap compiler zig-out/bin/mlx1 with mlx0" >&2
+        zig-out/bin/mlx0 compiler/selfhost/main.mlx -o zig-out/bin/mlx1 >&2 || return 1
     fi
     echo zig-out/bin/mlx1
 }
@@ -385,7 +418,7 @@ else
         echo "rebuilding $canonical from the current compiler sources: it lacks $(paste -sd '|' <<< "$missing" | sed 's/|/, /g')" >&2
         if ! rebuild_with "$canonical"; then
             echo "rebuilding $canonical from the bootstrap compiler instead" >&2
-            seed=$(bootstrap_seed) || { echo "ensure_compiler.sh: $canonical stays as it is; build the bootstrap compiler (zig build mlx1) and run again" >&2; exit 1; }
+            seed=$(bootstrap_seed) || { echo "ensure_compiler.sh: $canonical stays as it is; build the bootstrap compiler (./mlx build bootstrap, with zig) and run again" >&2; exit 1; }
             rebuild_with "$seed" || { echo "ensure_compiler.sh: $canonical stays as it is" >&2; exit 1; }
         fi
     fi

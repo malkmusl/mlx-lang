@@ -74,8 +74,10 @@ pub fn main(arguments: [][*]const u8) -> u8 {
 
 (`compiler/selfhost/main.mlx`)
 
-Every generation of the compiler is a normal Linux executable built with
-`zig build mlx1` and run directly: `zig-out/bin/mlx1 tests/01_basic.mlx`.
+Every generation of the compiler is a normal Linux executable: the
+bootstrap one built by `./mlx build mlx1` (zig builds mlx0, mlx0 builds
+it), the canonical `mlx-out/bin/compiler/mlx4` by `./mlx` itself, and run
+directly: `zig-out/bin/mlx1 tests/01_basic.mlx`.
 
 ## Module layout
 

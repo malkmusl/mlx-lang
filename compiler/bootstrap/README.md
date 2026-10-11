@@ -25,9 +25,10 @@ main.zig
 ## Language server
 
 mlx-lsp is the bootstrap Language Server Protocol implementation. Build it
-with the normal project build:
+with build.mlx's bootstrap group (zig builds it, again only when a Zig
+source changed):
 
-    zig build
+    ./mlx build mlx-lsp-zig
     ./zig-out/bin/mlx-lsp
 
 An editor starts the binary over stdio; do not run it through a terminal

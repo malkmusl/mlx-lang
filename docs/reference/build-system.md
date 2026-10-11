@@ -3,23 +3,24 @@
 **Normative source:** `spec/05-build/build-system.xml`, `spec/05-build/packages.xml`,
 `spec/05-build/targets.xml`
 
-**Cross-referenced implementation:** root `build.zig`, `projects/coreutils/build.sh`
+**Cross-referenced implementation:** root `build.mlx`, `std/src/build.mlx`
+(and `std/src/build/`), `compiler/selfhost/driver/build_command.mlx`, the
+root `mlx` script
 
 Mlx distinguishes two build systems, per the "Bootstrap chain" in the root
 `README.md`:
 
-- **Stage-0**: the Zig build (`build.zig`) that builds the bootstrap compiler
-  `mlx0` (and the language server) from the Zig sources in
-  `compiler/bootstrap/`. This is scaffolding only — "Zig is Stage-0 only. The
-  canonical compiler, standard library, normal Mlx programs and brixOS must
-  not depend on Zig."
-- **Canonical**: the `build.mlx`-driven, `mlx build`/`mlx run`/`mlx test`
-  system that `spec/05-build/build-system.xml` normatively specifies, meant
-  to be self-hosted once the compiler chain (`mlx1`, `mlx2`, ...) exists.
+- **Stage-0**: Zig builds the bootstrap compiler `mlx0` (and the Zig
+  language server) from `compiler/bootstrap/`. There is no `build.zig`
+  any more: `build.mlx`'s `bootstrap` group runs `zig build-exe` for them
+  (and `tools/ensure_compiler.sh` does the same on a machine without an
+  Mlx compiler). "Zig is Stage-0 only. The canonical compiler, standard
+  library, normal Mlx programs and brixOS must not depend on Zig."
+- **Canonical**: `build.mlx` run by `mlx build`, as
+  `spec/05-build/build-system.xml` specifies; `mlx run`, `mlx test`,
+  `mlx fmt` and `mlx check` are not there yet.
 
-This chapter documents the normative spec first, then says explicitly how
-much of it `build.zig` (Stage-0) currently reflects versus what remains
-aspirational for the canonical system.
+This chapter documents the normative spec first, then what is implemented.
 
 ## The normative build system
 
@@ -118,89 +119,119 @@ This is deliberately thin. It fixes four points and no more:
   something the source language's syntax encodes.
 
 No package manifest file format, field list, or example is specified
-anywhere in `spec/05-build/packages.xml`, and no `build.mlx` file exists yet
-anywhere in this repository (a repo-wide search finds none, and none of the
-example programs under `examples/` — `examples/hello/`,
-`projects/coreutils/`, `examples/wayland-client/`,
-`examples/wayland-server/` — includes one). This guide therefore does not
-show an example manifest: doing so would mean inventing a shape the spec
-does not define, which the project's own rule in `SPEC_INDEX.md` forbids
-("the implementation must never silently invent behavior").
+anywhere in `spec/05-build/packages.xml`. The implementation keeps to the
+spec's one firm point, that `build.mlx` is the configuration and not a
+separate data-only manifest: the project's name, version and description
+(what a Zig project keeps in `build.zig.zon`) come from a function in
+`build.mlx` itself, `pub fn package() -> Build.Package`. Package imports
+mapped to roots (`<Mapping>`) and the resolved source identity are not
+implemented: this repository has no packages from elsewhere.
 
-## Stage-0 (`build.zig`) versus the canonical system
+## The implementation: `mlx build`
 
-The root `build.zig` is Zig's own build-script format, not `build.mlx`, and
-it builds exactly two Zig executables plus one Mlx artifact:
-
-```zig
-const exe = b.addExecutable(.{
-    .name = "mlx0",
-    .root_module = b.createModule(.{
-        .root_source_file = b.path("compiler/bootstrap/main.zig"),
-        .target = target,
-        .optimize = optimize,
-        .strip = optimize != .Debug,
-    }),
-});
-b.installArtifact(exe);
-```
-
-(`build.zig`; this is the bootstrap compiler `mlx0`)
-
-It also builds `mlx-lsp` (the language server, from
-`compiler/bootstrap/lsp.zig`) and defines a `mlx1` build step that *runs*
-`mlx0` against the self-hosted compiler's entry point to produce `mlx1`:
-
-```zig
-const build_mlx1 = b.addRunArtifact(exe);
-// mlx0 resolves the self-hosted compiler's imports itself, so Zig cannot
-// infer those transitive inputs from main.mlx. Always rerun this cheap
-// bootstrap step to avoid installing a stale mlx1 from the build cache.
-build_mlx1.has_side_effects = true;
-build_mlx1.addFileArg(b.path("compiler/selfhost/main.mlx"));
-const mlx1_output = build_mlx1.addPrefixedOutputFileArg("-o", "mlx1");
-```
-
-(`build.zig`)
-
-The comment here is itself informative about the boundary between the two
-systems: Zig's build graph cannot see *into* `mlx0`'s own `@import`
-resolution for Mlx source files, so it cannot do proper incremental dependency
-tracking for `mlx1` — it always reruns that step. This is exactly the kind of
-concern a canonical `build.mlx`-based system (with its own `std.Build`-style
-APIs, per `BuildHostAccess` above) would need to own once Mlx builds itself.
-`build.zig` has a `test` step (running the Zig unit tests for
-`compiler/bootstrap/main.zig` and `compiler/bootstrap/lsp.zig`) and an `lsp`
-run step, but no `run`, `fmt`, or `check` step — so of the five canonical
-subcommands (`mlx build`, `mlx run`, `mlx test`, `mlx fmt`, `mlx check`),
-Stage-0 only has direct Zig-side analogues for `build` (`zig build`) and
-`test` (`zig build test`); `run`/`fmt`/`check` are not present in `build.zig`
-at all.
-
-Outside `build.zig`, `projects/coreutils/build.sh` shows how an Mlx program
-is actually compiled today — by invoking a compiler binary directly against
-a source file with `-o`, no `build.mlx` involved:
+### Running it
 
 ```sh
-"$compiler" \
-    "$repo_root/projects/coreutils/$utility/main.mlx" \
-    -o "$bin_dir/$utility"
+./mlx build                      # the default group (all, in this repository)
+./mlx build desktop login        # groups or single steps by name
+./mlx build --list               # the groups and steps
+./mlx build -j 8 --verbose       # eight jobs; name the current steps too
+./mlx build --dry-run            # what would be built
+./mlx build --force mlx-sh       # build it even when it is current
+./mlx build --keep-going         # go on after a step failed
+./mlx build --clean              # forget what was built
 ```
 
-(`projects/coreutils/build.sh`)
+`./mlx` (the root script) runs this checkout's compiler,
+`mlx-out/bin/compiler/mlx4`, after making it when it is missing or a file
+of `compiler/selfhost` or `std/bootstrap` changed (`tools/ensure_compiler.sh`:
+from an older `mlx4`, else from the bootstrap compiler, which needs zig).
+`mlx build ARGS` is a subcommand of the compiler
+(`compiler/selfhost/driver/build_command.mlx`): it writes
+`mlx-out/build/runner.mlx`, a main that imports `../../build.mlx` and
+`std.build`, compiles it once into `mlx-out/build/runner`, and runs that
+with the arguments. From then on the runner keeps itself current: when
+`build.mlx`, `std.build` or the compiler changed it compiles `build.mlx`
+again and runs the new runner.
 
-Summary of what's implemented versus aspirational:
+### `build.mlx`
+
+```mlx
+const Build = @import("std.build")
+
+pub fn package() -> Build.Package {
+    return Build.Package.{ .name = "hello", .version = "0.1.0", .description = "a greeting" }
+}
+
+pub fn build(b: *Build.Builder) -> void {
+    const all = Build.group(b, "all", "everything")
+    const hello = Build.program(b, "hello", "src/main.mlx")
+    Build.add(b, all, hello)
+    const so = Build.plugin(b, "libhello.so", "src/library.mlx")
+    Build.option(b, so, "--soname=libhello.so")
+    Build.add(b, all, so)
+    Build.byDefault(b, all)
+}
+```
+
+(`Build`, not `build`: the module and the function would have the same
+name.) The steps:
+
+| Function | Makes |
+| --- | --- |
+| `group(b, name, description)` | nothing: stands for what `add` puts in it |
+| `program(b, name, root)` | the Mlx program `mlx-out/bin/NAME` |
+| `sharedObject(b, name, root)` | `mlx-out/lib/NAME` (`--shared`) |
+| `plugin(b, name, root)` | `mlx-out/lib/NAME` (`--plugin`) |
+| `command(b, name, output, line)` | OUTPUT by a host command (words split at spaces, `"..."` keeps spaces); `""` for a command that only runs |
+| `link(b, name, target)` | the symbolic link `mlx-out/bin/NAME` |
+| `copy(b, name, source, output)` | OUTPUT, a copy of SOURCE with its mode |
+
+and what changes them: `option` (a compiler option), `output` (another
+place for the file), `input` and `inputTree` (the files a command reads),
+`dependOn` and `add` (order and membership), `byDefault`, `describe`,
+`step(b, name)` (a step declared before) and `concat` (a string made from
+two). Host I/O happens only through these (`<BuildHostAccess>`): `build()`
+declares, the runner does the work.
+
+### Only what is needed
+
+Each step that was built has a manifest in `mlx-out/build/cache`: a key
+(what made it: the kind, the root or command line, the output, the
+options, the compiler's contents, the names of the files in its input
+trees) and one line per file it read, with the file's size, modification
+time and a hash of its contents. For an Mlx step those files are the
+modules the compiler loaded, which it writes with `--depfile=PATH` (one
+path per line); for a command, its inputs and the files of its input
+trees. A step is current when its file is there, the key is the same and
+each input is unchanged: the same size and time, or, when those differ,
+the same contents, so a file saved again unchanged costs a hash and not a
+build. Editing `projects/desktop/shared/palette.mlx` rebuilds the seven
+programs that import it, and nothing else; a run with nothing to do takes
+a few hundredths of a second for this repository's 128 steps.
+
+The manifest goes before a step runs and is written after it succeeded; a
+step's file is made beside its place (`.building.NAME`) and moved there
+when it is complete, so an interrupted build is never taken for a current
+one, and a running program is never written over. A step whose dependency
+was built now is looked at again then (a command that reads another step's
+output).
+
+### Jobs
+
+Jobs run side by side, as many as there are processors unless `-j` says
+otherwise, the step whose last build took longest first. Each job's output
+goes to `mlx-out/build/logs/NAME.log`, shown when the step fails. After a
+failure no new job starts (the running ones finish) unless `--keep-going`.
+
+## What is implemented
 
 | Spec concept | Status |
 | --- | --- |
-| `mlx build`/`run`/`test`/`fmt`/`check` subcommands | Not implemented; `build.zig` only provides Zig-level `build`/`test` steps for Stage-0 |
-| `build.mlx` project configuration | Not implemented; no file of this name exists in the repository |
-| Target model (`arch os abi endian pointer_bits cpu_features`, `builtin` module) | Normative in `spec/05-build/targets.xml`; not exercised by `build.zig`, which uses Zig's own `standardTargetOptions`/`standardOptimizeOption` |
-| Sandboxed build-script host I/O (`std.Build` APIs only) | Applies to the canonical `build.mlx` system; `build.zig` is ordinary unsandboxed Zig build-script code, since Zig tooling is explicitly Stage-0-only |
-| Package identity/mapping/versioning rules | Normative in `spec/05-build/packages.xml`; no package manifest or resolver exists yet anywhere in the repository |
-| Direct compiler invocation (`compiler source.mlx -o output`) | The actual mechanism in use today, shown by `projects/coreutils/build.sh` |
-
-This gap is expected at this stage of the project: per the bootstrap chain,
-the canonical build/package system is downstream of `mlx1`/`mlx2` and the
-Stage-1 standard library, which themselves are still being built up through
-`build.zig`.
+| `build.mlx` project configuration | Implemented: root `build.mlx`, run by `mlx build` (`./mlx build`) |
+| `mlx build` | Implemented, with incremental builds and parallel jobs |
+| `mlx run`/`test`/`fmt`/`check` | Not implemented |
+| Target model (`arch os abi endian pointer_bits cpu_features`, `builtin` module) | Normative in `spec/05-build/targets.xml`; steps choose a target with the compiler's `--target=` option |
+| Build-script host I/O only through `std.Build` APIs | `build.mlx` declares through `std.build`; it is not sandboxed (it is an ordinary program that could call other modules) |
+| Package identity/mapping/versioning | `package()` gives name and version; no package imports or resolver |
+| Stage-0 | `build.mlx`'s `bootstrap` group (`mlx0`, the Zig `mlx-lsp`, `mlx1`) and `bootstrap-test` (the Zig unit tests); `build.zig` is gone |

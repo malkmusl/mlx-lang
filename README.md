@@ -21,6 +21,22 @@ Zig on Linux
 
 Zig is Stage-0 only. The canonical compiler, standard library, normal Mlx programs and brixOS must not depend on Zig.
 
+## Building
+
+```sh
+./mlx build                 # everything (only what is not current)
+./mlx build desktop         # one group; ./mlx build --list names them
+./mlx FILE.mlx -o OUT       # compile one program
+```
+
+`./mlx` makes this checkout's compiler (`mlx-out/bin/compiler/mlx4`) when
+it is missing or its sources changed, then runs it. `mlx build` runs
+[`build.mlx`](build.mlx), the project's manifest and build graph (in place
+of `build.zig` and `build.zig.zon`), with `std.build`: a step is built
+again only when a module it read, its options or the compiler changed, and
+the jobs run side by side. Programs go to `mlx-out/bin`, libraries to
+`mlx-out/lib`; see [`docs/reference/build-system.md`](docs/reference/build-system.md).
+
 ## Core rules
 
 - no hidden heap allocation, GC or implicit reference counting

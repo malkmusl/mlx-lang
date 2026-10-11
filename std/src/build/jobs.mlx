@@ -1,0 +1,279 @@
+// The jobs of a build: a step's process (the compiler or a host command)
+// started with vfork and execve, its output and errors into the step's log
+// (mlx-out/build/logs/NAME.log; shown when the step fails), and what a
+// step's end leaves: the output moved into place (it was made beside it as
+// OUTPUT.building, so a running program is never written over and an
+// interrupted build leaves no half file) and its manifest. Links and
+// copies need no process.
+const std = @import("std")
+const graph = @import("./graph.mlx")
+const cache = @import("./cache.mlx")
+
+const SYS_dup2: usize = 33
+const SYS_vfork: usize = 58
+const SYS_execve: usize = 59
+const SYS_exit: usize = 60
+const SYS_wait4: usize = 61
+const SYS_write: usize = 1
+const EINTR: isize = -4
+const ECHILD: isize = -10
+
+pub fn say(text: []const u8) -> void {
+    const ignored = std.fs.writeAll(std.fs.File.{ .descriptor = 2 }, text)
+}
+
+pub fn logPath(b: *graph.Builder, item: *graph.Node) -> []const u8 {
+    return graph.joined(b, graph.joined(b, "mlx-out/build/logs/", graph.fileName(b, item.*.name)), ".log")
+}
+
+// Where a step's file is made before it is moved into place: beside it,
+// its name behind ".building." (so it keeps its suffix: the compiler
+// makes an APK of an .apk output).
+pub fn buildingPath(b: *graph.Builder, item: *graph.Node) -> []const u8 {
+    const path = item.*.output
+    var slash = path.length
+    while slash > 0 && path[slash - 1] != 47 { slash -= 1 }
+    return graph.joined(b, graph.joined(b, path[0..slash], ".building."), path[slash..path.length])
+}
+
+// Makes the directories PATH's file goes in.
+fn makeParents(b: *graph.Builder, path: []const u8) -> void {
+    var at: usize = 1
+    while at < path.length {
+        if path[at] == 47 {
+            const made = std.fs.makeDirResult(graph.cPath(b, path[0..at]), 493)
+        }
+        at += 1
+    }
+}
+
+// A job's command line, kept as C strings in the builder.
+fn resetArguments(b: *graph.Builder) -> void {
+    b.*.argumentUsed = 0
+    unsafe { b.*.arguments[0] = @ptrFromInt([*]const u8, 0) }
+}
+
+fn pushArgument(b: *graph.Builder, count: *usize, value: []const u8) -> bool {
+    if count.* + 1 >= graph.MAX_ARGUMENTS || b.*.argumentUsed + value.length + 1 > graph.ARGUMENT_BYTES { return false }
+    var bytes: [*]u8 = undefined
+    unsafe { bytes = @ptrFromInt([*]u8, @intFromPtr(b) + @offsetOf(graph.Builder, "argumentText")) }
+    const start = b.*.argumentUsed
+    const end = std.text.append(bytes, start, graph.ARGUMENT_BYTES, value)
+    bytes[end] = 0
+    b.*.argumentUsed = end + 1
+    unsafe { b.*.arguments[count.*] = @ptrFromInt([*]const u8, @intFromPtr(bytes) + start) }
+    count.* += 1
+    unsafe { b.*.arguments[count.*] = @ptrFromInt([*]const u8, 0) }
+    return true
+}
+
+// The compiler's command line for an Mlx step.
+fn compileArguments(b: *graph.Builder, item: *graph.Node, output: []const u8, depfile: []const u8) -> bool {
+    resetArguments(b)
+    var count: usize = 0
+    var ok = pushArgument(b, &count, b.*.compiler) && pushArgument(b, &count, "--quiet")
+    if item.*.kind == graph.KIND_SHARED { ok = ok && pushArgument(b, &count, "--shared") }
+    if item.*.kind == graph.KIND_PLUGIN { ok = ok && pushArgument(b, &count, "--plugin") }
+    var index: usize = 0
+    while index < item.*.optionCount {
+        ok = ok && pushArgument(b, &count, item.*.options[index])
+        index += 1
+    }
+    ok = ok && pushArgument(b, &count, item.*.source) && pushArgument(b, &count, "-o") && pushArgument(b, &count, output)
+    return ok && pushArgument(b, &count, graph.joined(b, "--depfile=", depfile))
+}
+
+// The words of a command line: split at spaces, "double quotes" keep
+// spaces in a word.
+fn commandArguments(b: *graph.Builder, line: []const u8) -> bool {
+    resetArguments(b)
+    var count: usize = 0
+    var word: [4096]u8 = undefined
+    var word_bytes: [*]u8 = undefined
+    unsafe { word_bytes = @ptrCast([*]u8, &word) }
+    var at: usize = 0
+    while at < line.length {
+        while at < line.length && line[at] == 32 { at += 1 }
+        if at >= line.length { break }
+        var length: usize = 0
+        var quoted = false
+        while at < line.length && (quoted || line[at] != 32) {
+            if line[at] == 34 {
+                quoted = !quoted
+            } else if length < 4095 {
+                word_bytes[length] = line[at]
+                length += 1
+            }
+            at += 1
+        }
+        if !pushArgument(b, &count, word_bytes[0..length]) { return false }
+    }
+    if count == 0 { return false }
+    // The program along PATH when it has no slash.
+    const program = std.text.cString(b.*.arguments[0])
+    for byte in program {
+        if byte == 47 { return true }
+    }
+    const found = findProgram(b, program)
+    if found.length == 0 { return false }
+    // The found path is a C string in the graph's text.
+    unsafe { b.*.arguments[0] = @ptrCast([*]const u8, found) }
+    return true
+}
+
+// NAME along PATH ("" when it is not there).
+pub fn findProgram(b: *graph.Builder, name: []const u8) -> []const u8 {
+    const variable = std.process.environmentFrom(b.*.environment, "PATH")
+    var path: []const u8 = "/usr/local/bin:/usr/bin:/bin"
+    if variable != null { path = std.string.asSlice(variable.?) }
+    var start: usize = 0
+    while start <= path.length {
+        var end = start
+        while end < path.length && path[end] != 58 { end += 1 }
+        if end > start {
+            const candidate = graph.joined(b, graph.joined(b, path[start..end], "/"), name)
+            if std.fs.access(graph.cPath(b, candidate), std.fs.ACCESS_EXECUTE) { return candidate }
+        }
+        start = end + 1
+    }
+    return ""
+}
+
+// Starts the process of ITEM with the arguments made above, its output
+// and errors into its log; false when it could not start.
+fn spawn(b: *graph.Builder, item: *graph.Node) -> bool {
+    const log = std.fs.open(graph.cPath(b, logPath(b, item)), std.fs.WRITE_ONLY | std.fs.CREATE | std.fs.TRUNCATE, 420)
+    if !std.fs.isValid(log) { return false }
+    const descriptor = @bitCast(usize, log.descriptor)
+    var arguments: [*][*]const u8 = undefined
+    unsafe { arguments = @ptrFromInt([*][*]const u8, @intFromPtr(b) + @offsetOf(graph.Builder, "arguments")) }
+    const child = std.linux.syscall0(SYS_vfork)
+    if child == 0 {
+        const out = std.linux.syscall2(SYS_dup2, descriptor, 1)
+        const err = std.linux.syscall2(SYS_dup2, descriptor, 2)
+        const ran = std.linux.syscall3(SYS_execve, @intFromPtr(arguments[0]), @intFromPtr(arguments), @intFromPtr(b.*.environment))
+        const exited = std.linux.syscall1(SYS_exit, 127)
+    }
+    const closed = std.fs.close(log)
+    if child < 0 { return false }
+    item.*.pid = child
+    return true
+}
+
+// Starts ITEM's job; false when it could not (the step failed).
+pub fn start(b: *graph.Builder, item: *graph.Node) -> bool {
+    cache.forget(b, item)
+    item.*.started = std.time.milliseconds()
+    if item.*.output.length > 0 { makeParents(b, item.*.output) }
+    if item.*.kind == graph.KIND_COMMAND {
+        if !commandArguments(b, item.*.source) {
+            writeLog(b, item, "mlx build: the command line names no program found along PATH\n")
+            return false
+        }
+        return spawn(b, item)
+    }
+    const removed = std.fs.delete(graph.cPath(b, buildingPath(b, item)))
+    if !compileArguments(b, item, buildingPath(b, item), item.*.depfile) {
+        writeLog(b, item, "mlx build: the compiler's command line is too long\n")
+        return false
+    }
+    return spawn(b, item)
+}
+
+fn writeLog(b: *graph.Builder, item: *graph.Node, text: []const u8) -> void {
+    const log = std.fs.open(graph.cPath(b, logPath(b, item)), std.fs.WRITE_ONLY | std.fs.CREATE | std.fs.TRUNCATE, 420)
+    if !std.fs.isValid(log) { return }
+    const written = std.fs.writeAll(log, text)
+    const closed = std.fs.close(log)
+}
+
+// Waits for any job; its process id (0 when none is left) and status
+// (the exit code, or 128 + the signal).
+pub fn waitAny(status: *u8) -> isize {
+    var raw: u32 = 0
+    while true {
+        var minus_one: isize = -1
+        const waited = std.linux.syscall4(SYS_wait4, @bitCast(usize, minus_one), @intFromPtr(&raw), 0, 0)
+        if waited == EINTR { continue }
+        if waited <= 0 { return 0 }
+        if (raw & 127) != 0 {
+            status.* = @intCast(u8, 128 + (raw & 127))
+        } else {
+            status.* = @intCast(u8, (raw >> 8) & 255)
+        }
+        return waited
+    }
+    return 0
+}
+
+// What a finished job leaves: true when the step succeeded.
+pub fn finish(b: *graph.Builder, item: *graph.Node, status: u8) -> bool {
+    const took = std.time.milliseconds() - item.*.started
+    item.*.pid = 0
+    if status != 0 {
+        if item.*.kind != graph.KIND_COMMAND { const removed = std.fs.delete(graph.cPath(b, buildingPath(b, item))) }
+        return false
+    }
+    if item.*.kind == graph.KIND_COMMAND {
+        if item.*.output.length == 0 {
+            if !touch(b, cache.stampPath(b, item)) { return false }
+        } else if !cache.present(b, item.*.output) {
+            writeLog(b, item, "mlx build: the command finished without making its output\n")
+            return false
+        }
+    } else {
+        const building = graph.keep(b, buildingPath(b, item))
+        if !std.fs.rename(graph.cPath(b, building), graph.cPath(b, item.*.output)) { return false }
+    }
+    if !cache.record(b, item, took) { return false }
+    item.*.took = took
+    return true
+}
+
+fn touch(b: *graph.Builder, path: []const u8) -> bool {
+    const file = std.fs.open(graph.cPath(b, path), std.fs.WRITE_ONLY | std.fs.CREATE | std.fs.TRUNCATE, 420)
+    if !std.fs.isValid(file) { return false }
+    return std.fs.close(file)
+}
+
+// A link or a copy, made at once; true when it succeeded.
+pub fn makeInline(b: *graph.Builder, item: *graph.Node) -> bool {
+    cache.forget(b, item)
+    const started = std.time.milliseconds()
+    const output = graph.keep(b, item.*.output)
+    makeParents(b, output)
+    const removed = std.fs.delete(graph.cPath(b, output))
+    if item.*.kind == graph.KIND_LINK {
+        if !std.fs.symbolicLink(graph.cPath(b, item.*.source), graph.cPath(b, output)) { return false }
+    } else {
+        var stat: std.fs.Stat = undefined
+        if std.fs.status(graph.cPath(b, item.*.source), &stat) != 0 { return false }
+        const building = graph.keep(b, buildingPath(b, item))
+        const source = std.fs.open(graph.cPath(b, item.*.source), std.fs.READ_ONLY, 0)
+        if !std.fs.isValid(source) { return false }
+        const target = std.fs.open(graph.cPath(b, building), std.fs.WRITE_ONLY | std.fs.CREATE | std.fs.TRUNCATE, @intCast(usize, stat.mode & 4095))
+        var copied = std.fs.isValid(target) && std.fs.copy(source, target)
+        const closed_source = std.fs.close(source)
+        if std.fs.isValid(target) { copied = std.fs.close(target) && copied }
+        copied = copied && std.fs.chmod(graph.cPath(b, building), @intCast(usize, stat.mode & 4095))
+        if !copied || !std.fs.rename(graph.cPath(b, building), graph.cPath(b, output)) { return false }
+    }
+    return cache.record(b, item, std.time.milliseconds() - started)
+}
+
+// The last LINES lines of ITEM's log, to stderr.
+pub fn showLog(b: *graph.Builder, item: *graph.Node, lines: usize) -> void {
+    const length = cache.readWhole(b, logPath(b, item))
+    if length == graph.NONE || length == 0 { return }
+    const bytes = graph.fileBytes(b)
+    var from = length
+    var seen: usize = 0
+    if bytes[length - 1] == 10 { from = length - 1 }
+    while from > 0 && seen < lines {
+        from -= 1
+        if bytes[from] == 10 { seen += 1 }
+    }
+    if from > 0 { from += 1 }
+    say(bytes[from..length])
+    if bytes[length - 1] != 10 { say("\n") }
+}
