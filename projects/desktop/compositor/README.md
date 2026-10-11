@@ -313,6 +313,17 @@ after its timeout (five seconds; never for critical ones or a timeout of
 `-t MS`, `-A KEY=LABEL`, `-r ID`, `-p` prints the id, `-w` waits and
 prints the action chosen).
 
+The session's bus (mlx-ipcd, which mlx-session starts before the
+compositor) starts `mlx-notifyd`, the portal and the permission agent
+with its own environment. Once the compositor listens it tells the bus
+its `WAYLAND_DISPLAY` (and `DISPLAY`) for them
+(`UpdateActivationEnvironment`, as sway's
+`dbus-update-activation-environment` does): freestanding always, nested
+with `--session` (mlx-session inside cage or weston), never otherwise,
+so a compositor nested in another desktop leaves that desktop's
+services alone. Without it a service started on demand found no
+compositor and no bubble showed.
+
 What came is kept in `mlx-notifyd` for the control centre, which asks
 for it on MLXIPC as well: `org.mlx.Notifications` on the same object has
 `List()` (Do Not Disturb, how many are unread, the notifications newest
@@ -1219,7 +1230,8 @@ the output (`ext-image-capture-source-v1`, any `wl_output`) or a window,
 named by its handle in `ext-foreign-toplevel-list-v1` (every window, with
 an identifier that is never reused). A capture session tells the client
 the buffer size and the formats (ARGB8888 and XRGB8888 shared memory; no
-dma-bufs yet). The first frame is copied at once with full damage; each
+dma-bufs yet). The first frame is copied once a frame was presented
+after the session began, with full damage; each
 later one waits until the source changed and carries only what changed
 as damage, so a recorder gets a frame per change, not per request.
 
@@ -1233,7 +1245,18 @@ as damage, so a recorder gets a frame per change, not per request.
   stop at once.
 
 The compositor maps client memory read-only; it copies a frame through a
-writable mapping of its own for the moment of the copy.
+writable mapping of its own for the moment of the copy, a row at a time.
+
+With the Vulkan renderer the frame is in GPU memory; freestanding it is
+the dumb buffer the monitor scans out, in video memory, which the CPU
+reads only very slowly (uncached, across the bus): the compositor stood
+still while it read whole frames, and the desktop all but froze while
+OBS or a screen share ran. While a session captures
+the output, the renderer therefore copies what each frame changed into a
+host-cached buffer on the GPU as well (all of it the first time;
+`renderer: the output is captured: what frames change is copied into
+host memory` with `--verbose`), and capture reads from there. A new
+session's first frame waits for one frame composed that way.
 
 [`projects/desktop/capture`](../capture) is `mlx-capture` (installed with the
 session), its client: `client.mlx` holds the connection, the window list

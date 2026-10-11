@@ -64,7 +64,8 @@
 #      unlocks it, and the keys go to the terminal again.
 #  12. mlx-capture captures the screen and a window
 #      (ext-image-copy-capture-v1): the PNGs agree, and a later frame
-#      waits for damage.
+#      waits for damage; with lavapipe the Vulkan renderer's capture (the
+#      copy it keeps in host memory) has the same pixels.
 #  13. with Xwayland and xev: an X program's window shows, takes focus and
 #      gets keys (the compositor's own X window manager).
 #  14. mlx-settings' Sound and Display pages: on MLXIPC with MLX Audio
@@ -1066,6 +1067,55 @@ PY
 damage=$(grep "^frame 2: damage" "$work/capture.log" | sed 's/.* damage //')
 [[ -n "$damage" && "$damage" != "0,0 "* ]] || { echo "the second frame did not wait for a change, or carried full damage ($damage)" >&2; cat "$work/capture.log" >&2; exit 1; }
 echo "ok   screen and window capture (ext-image-copy-capture): PNGs agree, later frames wait for damage"
+
+# The same screen with the Vulkan renderer (lavapipe, when installed): the
+# capture reads the copy the renderer keeps in host memory while the
+# output is captured (never the output buffer itself: freestanding that is
+# video memory, which the CPU reads very slowly), and gets the CPU
+# renderer's pixels.
+lavapipe=/usr/share/vulkan/icd.d/lvp_icd.json
+if [[ $renderer == cpu && -f $lavapipe ]]; then
+    sed -e "s|capture-screen.png|capture-vulkan.png|; s|capture.log|capture-vulkan.log|g; s|capture-list.log|capture-vulkan-list.log|" "$work/capture.sh" > "$work/capture-vulkan.sh"
+    chmod +x "$work/capture-vulkan.sh"
+    VK_DRIVER_FILES=$lavapipe MLX_CANVAS=cpu run_scenario capture-vulkan "$work/capture.script" --no-fps --renderer vulkan --run "$work/mlx-settings" --run "$work/capture-vulkan.sh"
+    grep -q "^renderer: vulkan" "$work/capture-vulkan-compositor.log" && grep -q "^renderer: the output is captured: what frames change is copied into host memory$" "$work/capture-vulkan-compositor.log" \
+        || { echo "the Vulkan renderer kept no copy of the captured output in host memory" >&2; cat "$work/capture-vulkan-compositor.log" >&2; exit 1; }
+    [[ $(grep -c "^saved " "$work/capture-vulkan.log") -eq 3 ]] || { echo "mlx-capture did not save three captures with the Vulkan renderer" >&2; cat "$work/capture-vulkan.log" >&2; exit 1; }
+    python3 - "$work" <<'PY' || { echo "the Vulkan renderer's capture is not the CPU renderer's" >&2; exit 1; }
+import struct, sys, zlib
+def pixels(path):
+    data = open(path, 'rb').read()
+    at, idat = 8, b''
+    while at < len(data):
+        length, kind = struct.unpack('>I4s', data[at:at + 8])
+        if kind == b'IHDR': width, height = struct.unpack('>II', data[at + 8:at + 16])
+        if kind == b'IDAT': idat += data[at + 8:at + 8 + length]
+        at += 12 + length
+    return width, height, zlib.decompress(idat)
+def rows(path):
+    width, height, raw = pixels(path)
+    stride, out, previous = width * 3, [], bytearray(width * 3)
+    for y in range(height):
+        kind, line = raw[y * (stride + 1)], bytearray(raw[y * (stride + 1) + 1:(y + 1) * (stride + 1)])
+        for i in range(stride):
+            left = line[i - 3] if i >= 3 else 0
+            up, corner = previous[i], previous[i - 3] if i >= 3 else 0
+            if kind == 1: line[i] = (line[i] + left) & 255
+            elif kind == 2: line[i] = (line[i] + up) & 255
+            elif kind == 3: line[i] = (line[i] + (left + up) // 2) & 255
+            elif kind == 4:
+                p = left + up - corner
+                pa, pb, pc = abs(p - left), abs(p - up), abs(p - corner)
+                line[i] = (line[i] + (left if pa <= pb and pa <= pc else up if pb <= pc else corner)) & 255
+        out.append(bytes(line))
+        previous = line
+    return out
+cpu, vulkan = rows(sys.argv[1] + '/capture-screen.png'), rows(sys.argv[1] + '/capture-vulkan.png')
+different = sum(1 for a, b in zip(cpu, vulkan) for i in range(0, len(a), 3) if a[i:i + 3] != b[i:i + 3])
+assert len(cpu) == len(vulkan) and different == 0, different
+PY
+    echo "ok   with the Vulkan renderer the capture reads the renderer's copy in host memory and gets the same pixels"
+fi
 
 # Scenario 13: X programs through Xwayland (if Xwayland and xev are
 # installed): xev's window is paired with its wl_surface by the window

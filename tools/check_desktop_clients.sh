@@ -47,6 +47,9 @@
 #     top bar's control centre: dismissing and clearing them, the volume,
 #     Do Not Disturb, night light, the light look (the portal) and a
 #     screenshot;
+#   - starts mlx-notifyd from the bus (a service file) in a session run by
+#     mlx-ipcd, as mlx-session runs it: the compositor tells the bus its
+#     WAYLAND_DISPLAY, so the bubble shows on it;
 #   - joins a Wi-Fi network from the control centre's network list with
 #     fakenetd (tools/network-test) as mlx-netd on a system bus, and opens
 #     mlx-settings' Network page for one that needs a passphrase;
@@ -512,6 +515,49 @@ assert area(joined, 696, 300, 790, 318) != area(listed, 696, 300, 790, 318), "th
 assert area(joined, 970, 298, 992, 320) != area(listed, 970, 298, 992, 320), "no check"
 PY
     echo "ok   control centre: the network list joins an open network through mlx-netd (joining, joined) and opens the Network page for one that needs a passphrase"
+}
+
+# Notifications in a session as mlx-session starts it: the bus (mlx-ipcd)
+# runs the compositor and starts mlx-notifyd from a service file on the
+# first notification, with the bus's own environment, whose
+# WAYLAND_DISPLAY is not the compositor's (here the test host's; in a real
+# session none). The compositor (--session) tells the bus its
+# WAYLAND_DISPLAY (UpdateActivationEnvironment), so the bubble shows on
+# it.
+notify_activation() {
+    local runtime
+    runtime=$(mktemp -d)
+    mkdir -p "$work/na-config/mlx" "$work/na-home" "$work/na-services"
+    cat > "$work/na-services/org.freedesktop.Notifications.service" <<SERVICE
+[D-BUS Service]
+Name=org.freedesktop.Notifications
+Exec=$work/mlx-notifyd --verbose
+SERVICE
+    cat > "$work/na.sh" <<SCRIPT
+#!/bin/sh
+sleep 2
+"$work/mlx-notify" -a Test "Hallo" "Vom Bus gestartet" > "$work/na-notify.log" 2>&1
+exec "$work/mlx-terminal"
+SCRIPT
+    chmod +x "$work/na.sh"
+    printf 'wait 6000\nclose\n' > "$work/na.script"
+    XDG_RUNTIME_DIR=$runtime "$work/test-host" host-na "$work/us.xkb" "$work/na.script" > "$work/na-host.log" 2>&1 &
+    local host_pid=$!
+    for _ in $(seq 1 50); do [[ -S "$runtime/host-na" ]] && break; sleep 0.1; done
+    local status=0
+    env -i PATH="$PATH" HOME="$work/na-home" XDG_RUNTIME_DIR="$runtime" XDG_CONFIG_HOME="$work/na-config" XDG_DATA_HOME="$work/data" XDG_DATA_DIRS="$work/none" \
+        WAYLAND_DISPLAY=host-na MLX_CANVAS=cpu LANG=de_DE.UTF-8 \
+        timeout 60 "$work/mlx-ipcd" --address "$runtime/bus" --services "$work/na-services" --run \
+        "$work/mlx-compositor" --backend nested --session --verbose --no-fps --renderer cpu --socket nested-na \
+        --terminal "$work/mlx-terminal" --launcher none --dock none --topbar none --run "$work/na.sh" > "$work/na.log" 2>&1 || status=$?
+    wait "$host_pid" || fail "notifications: the test host failed" "$work/na-host.log"
+    rm -rf -- "$runtime"
+    local log="$work/na.log"
+    [[ $status -eq 0 ]] || fail "notifications: the session ended with status $status" "$log"
+    grep -q "^session bus: services it starts get WAYLAND_DISPLAY" "$log" || fail "notifications: the compositor did not tell the bus its WAYLAND_DISPLAY" "$log"
+    grep -q "^notifyd: notification 1 \"Hallo\"$" "$log" || fail "notifications: the bus did not start mlx-notifyd, or it did not take the notification" "$log"
+    grep -q "^layer: mlx-notifications " "$log" || fail "notifications: mlx-notifyd's bubble did not show on the compositor" "$log"
+    echo "ok   notifications: the bus starts mlx-notifyd on the first one, and its bubble shows on the compositor that runs the session"
 }
 
 files() {
@@ -1239,6 +1285,7 @@ topbar
 topbar_bus
 control_centre
 control_network
+notify_activation
 files cpu
 files gpu
 appearance

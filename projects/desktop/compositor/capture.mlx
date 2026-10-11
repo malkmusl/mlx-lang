@@ -6,9 +6,12 @@
 //
 // A capture session tells the client the size and the formats its buffers
 // must have (ARGB8888 or XRGB8888 shared memory); each frame it asks for is
-// copied when the source changed since its last one (the first at once),
-// with what changed as damage. The output's frames are the frames the
-// compositor presented (lastFrame, with the pointer drawn in); a window's
+// copied when the source changed since its last one (the first once a
+// frame was presented after the session began), with what changed as
+// damage. The output's frames are the frames the compositor presented
+// (lastFrame, with the pointer drawn in: with the Vulkan renderer the copy
+// it keeps in host memory while the output is captured, never the dumb
+// buffer in video memory, which the CPU reads far too slowly); a window's
 // are its own pixels and its subsurfaces', without the compositor's
 // frame, title bar or anything over it. A pointer cursor session never
 // sees the pointer: its capture sessions stop at once.
@@ -57,6 +60,10 @@ pub const Session = struct {
     serial: usize
     // Its frame (0: none).
     frame: usize
+    // Counted in compositor.captureOutputs (an output session not
+    // stopped), and the frames presented when it began.
+    counted: bool
+    since: usize
 }
 
 // An ext_image_copy_capture_frame_v1.
@@ -350,9 +357,17 @@ fn failFrame(frame: *Frame, reason: u32) -> void {
     wl.ext_image_copy_capture_frame_v1.Resource.fromObject(frame.*.object).sendFailed(reason)
 }
 
+// An output session no longer needs the renderer's copy.
+fn uncount(session: *Session) -> void {
+    if !session.*.counted { return }
+    session.*.counted = false
+    session.*.compositor.*.captureOutputs -= 1
+}
+
 fn stopSession(session: *Session) -> void {
     if session.*.stopped { return }
     session.*.stopped = true
+    uncount(session)
     wl.ext_image_copy_capture_session_v1.Resource.fromObject(session.*.object).sendStopped()
     if session.*.frame != 0 {
         const frame = frameAt(session.*.frame)
@@ -374,6 +389,8 @@ fn addSession(compositor: *Compositor, object: wl.server.Object, toplevel: bool,
     session.*.damage = ui.rect(0, 0, 0, 0)
     session.*.serial = 0
     session.*.frame = 0
+    session.*.counted = false
+    session.*.since = compositor.*.frames
     compositor.*.captureSessions = state.listAppend(compositor.*.captureSessions, @intFromPtr(memory))
     wl.server.setHandler(object, onSession, state.contextOf(memory))
     wl.server.setDestroyHandler(object, onSessionDestroyed, state.contextOf(memory))
@@ -409,6 +426,7 @@ pub fn onSessionDestroyed(context: *anyopaque, object: wl.server.Object) -> void
     const session = sessionAt(@intFromPtr(context))
     const compositor = session.*.compositor
     if session.*.frame != 0 { frameAt(session.*.frame).*.session = 0 }
+    uncount(session)
     compositor.*.captureSessions = state.listRemove(compositor.*.captureSessions, @intFromPtr(context))
     unsafe { state.release(compositor, @ptrCast([*]u8, context), @sizeOf(Session)) }
 }
@@ -453,6 +471,14 @@ pub fn onCaptureManager(context: *anyopaque, request: wl.server.Request) -> void
             return
         }
         sendConstraints(session)
+        if !toplevel {
+            // The renderer keeps a copy of each frame from now on (all of
+            // it the first time); a frame is composed (nothing changed),
+            // and the session's first copy waits for it.
+            session.*.counted = true
+            compositor.*.captureOutputs += 1
+            compositor.*.needsRedraw = true
+        }
         if compositor.*.verbose {
             state.say("capture: a session on ")
             state.say(if toplevel { "a window" } else { "the output" })
@@ -565,7 +591,7 @@ fn fulfil(frame: *Frame) -> void {
         serial = contentSerial(state.surfaceAt(session.*.surface), 0)
         if session.*.captured && serial == session.*.serial { return }
     } else {
-        if compositor.*.frames == 0 { return }
+        if compositor.*.frames == session.*.since { return }
         if session.*.captured && ui.isEmpty(session.*.damage) { return }
     }
     const address = shell.findBuffer(compositor, frame.*.buffer)
@@ -597,7 +623,7 @@ fn fulfil(frame: *Frame) -> void {
     } else {
         // What the client's buffer lacks, and what changed.
         const region = clip(scene.unionRect(damage, frame.*.clientDamage), width, height)
-        copyOutput(compositor, target, stride, region)
+        copyOutput(compositor, target, stride, region, buffer.*.format == SHM_ARGB8888)
     }
     view.release()
     // (Copied field by field before the session's damage is reset: see
@@ -619,28 +645,46 @@ fn fulfil(frame: *Frame) -> void {
     resource.sendReady()
 }
 
-// The output's last frame (BGRX rows) into the buffer, opaque.
-fn copyOutput(compositor: *Compositor, target: [*]u8, stride: usize, region: ui.Rect) -> void {
+// The output's last frame (BGRX rows) into the buffer, row by row (a
+// whole frame of a big monitor each time the screen is streamed: no pixel
+// by pixel); `opaque`: the alpha bytes are set (ARGB8888).
+fn copyOutput(compositor: *Compositor, target: [*]u8, stride: usize, region: ui.Rect, opaque: bool) -> void {
     if ui.isEmpty(region) { return }
-    var from: [*]const u32 = undefined
-    var to: [*]u32 = undefined
-    unsafe {
-        from = @ptrCast([*]const u32, compositor.*.lastFrame)
-        to = @ptrCast([*]u32, target)
-    }
-    const from_stride = compositor.*.lastFrameStride / 4
-    const to_stride = stride / 4
+    const from_stride = compositor.*.lastFrameStride
     var row = @intCast(usize, region.y)
     const bottom = @intCast(usize, region.y + region.height)
     const left = @intCast(usize, region.x)
-    const right = @intCast(usize, region.x + region.width)
+    const count = @intCast(usize, region.width)
     while row < bottom {
-        var column = left
-        while column < right {
-            to[row * to_stride + column] = from[row * from_stride + column] | 4278190080
-            column += 1
-        }
+        const to = @intFromPtr(target) + row * stride + left * 4
+        state.copyPixels(to, @intFromPtr(compositor.*.lastFrame) + row * from_stride + left * 4, count)
+        if opaque { setAlpha(to, count) }
         row += 1
+    }
+}
+
+// Alpha 255 for `count` pixels at `address` (two at a time).
+fn setAlpha(address: usize, count: usize) -> void {
+    var at = address
+    var left = count
+    var one: [*]u32 = undefined
+    if at % 8 != 0 && left > 0 {
+        unsafe { one = @ptrFromInt([*]u32, at) }
+        one[0] = one[0] | 4278190080
+        at += 4
+        left -= 1
+    }
+    var pairs: [*]u64 = undefined
+    unsafe { pairs = @ptrFromInt([*]u64, at) }
+    const pair_count = left / 2
+    var index: usize = 0
+    while index < pair_count {
+        pairs[index] = pairs[index] | 18374686483949813760
+        index += 1
+    }
+    if left % 2 != 0 {
+        unsafe { one = @ptrFromInt([*]u32, at + pair_count * 8) }
+        one[0] = one[0] | 4278190080
     }
 }
 
