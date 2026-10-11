@@ -201,6 +201,7 @@ NetworkManager and an `mlx-netd` that hangs, and the page must say so.
 tools/install_network.sh --destdir /tmp/stage --enable   # look first
 sudo tools/install_network.sh                             # install
 sudo tools/install_network.sh --enable                    # and switch over
+sudo tools/install_network.sh --disable                   # back, for now
 ```
 
 It builds `mlx-netd`, `mlx-net` and MLXIPC's `mlx-ipcd` into
@@ -215,8 +216,14 @@ the D-Bus policy an earlier install left is removed. Nothing is switched
 over unless `--enable` says so: then `mlx-ipcd.service` and
 `mlx-netd.service` are enabled and NetworkManager, systemd-networkd and
 wpa_supplicant are masked, the links `systemctl enable` and
-`systemctl mask` make; `systemctl unmask` and
-`systemctl enable NetworkManager` undo it. `--destdir DIR` stages it
+`systemctl mask` make, and what was at those places before is kept in
+`/var/lib/mlx/network-installer`. `--disable` undoes it: `mlx-netd` is
+no longer enabled, the three units are as they were (an install from
+before the kept state has its masks lifted), `mlx-ipcd` stays (mlx-login
+needs the bus), nothing is built or removed, and it says what to start
+again (`systemctl daemon-reload && systemctl stop mlx-netd.service &&
+systemctl start NetworkManager.service`); `--enable` switches over
+again. The script never calls systemctl itself. `--destdir DIR` stages it
 all under DIR instead (packaging, or a look before installing); without
 it the script has to run as root.
 
