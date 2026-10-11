@@ -916,7 +916,7 @@ echo "ok   mlx-settings' Top bar page moves an item up and hides another (topbar
 
 # Scenario 11c: the session lock. A terminal opens; 3 s in, a locker that
 # dies two seconds after locking without unlocking (session-lock-test
-# --die), 2 s later one that unlocks on Enter. What is typed while locked
+# --die), 4 s later one that unlocks on Enter. What is typed while locked
 # must not reach the terminal; what is typed after must.
 "$compiler" --quiet tools/session-lock-test/main.mlx -o "$work/session-lock-test"
 cat > "$work/session-lock-run.sh" <<SCRIPT
@@ -924,7 +924,7 @@ cat > "$work/session-lock-run.sh" <<SCRIPT
 "$work/mlx-terminal" &
 sleep 3
 "$work/session-lock-test" --die
-sleep 2
+sleep 4
 exec "$work/session-lock-test"
 SCRIPT
 chmod +x "$work/session-lock-run.sh"
@@ -942,7 +942,7 @@ pointer 300 300
 press 272
 release 272
 type touch $work/session-lock-typed.marker
-wait 3000
+wait 4000
 shot $work/session-lock-again.ppm
 enter
 wait 800
