@@ -240,7 +240,9 @@ the top edge, 30 pixels high with an exclusive zone, as the menu bar of
 macOS: maximized windows start below it and windows placed under it are
 moved down. It is translucent over a blur and shows a mark and the name
 of the active window's app on the left (its desktop entry's name, else
-its app id or title), the workspaces in the middle (see Snapping,
+its app id or title; a click on the mark opens the session menu: the
+settings, Lock Screen and Log Out, which asks first; see Locking and
+logging out), the workspaces in the middle (see Snapping,
 workspaces and tiling), and the date and time on the right ("So. 27. Sep.
 16:05" when `LC_ALL`, `LC_TIME` or `LANG` is German, else "Sun 27 Sep
 16:05"). The time zone comes from `$TZ` (a zone name looked up in
@@ -582,19 +584,22 @@ display-mode = auto
 # Night light: warmer colours, at once (Kelvin, 1000 to 6500).
 night-light = off
 night-light-temperature = 4000
+# The screen locker the lock hotkey and the top bar's session menu run.
+lock-command = swaylock
 ```
 
 [`projects/desktop/settings`](../settings/main.mlx) changes them, in a
 window with a sidebar of categories (std.ui.host, drawn at the screen's
-density): General (the dock hiding, the terminal's hotkey, where the file
-is), Display (the monitor, its mode and night light; see below), Sound
+density): General (the dock hiding, the terminal's and the lock's
+hotkeys, where the file is), Display (the monitor, its mode and night light; see below), Sound
 (MLX Audio's outputs, inputs, volumes and apps, and which apps may use
 the microphone; [`projects/desktop/audio`](../audio/README.md)), Apps
 (every app that asked for a permission, with Allow, Ask, Deny or the
 default for each; MLXIPC's ListPermissions and SetPermission,
 [`projects/desktop/ipc`](../ipc/README.md)), Window
 management (title bars, the counter, app decorations, wobbly windows, the
-window hotkeys), Appearance (colours for the focused and the other
+window hotkeys), Top bar (its items' order and which show; see the top
+bar), Appearance (colours for the focused and the other
 windows' borders, square, small, medium or large corners) and Language
 (German, English or the system's; the settings app follows at once, the
 other apps when they start). It writes the file whole and
@@ -920,8 +925,32 @@ version 1 (see Pointer lock), `ext_foreign_toplevel_list_v1`,
 `ext_output_image_capture_source_manager_v1`,
 `ext_foreign_toplevel_image_capture_source_manager_v1` and
 `ext_image_copy_capture_manager_v1` version 1 (see Screen capture),
-`xwayland_shell_v1` version 1 (to Xwayland alone; see X programs).
+`xwayland_shell_v1` version 1 (to Xwayland alone; see X programs),
+`ext_session_lock_manager_v1` version 1 (see Locking and logging out).
 Composition is done in software, or with Vulkan (`--renderer vulkan`).
+
+### Locking and logging out
+
+The session lock is ext-session-lock-v1 ([`lock.mlx`](lock.mlx)), the
+protocol swaylock and other screen lockers speak. Once a locker locks,
+nothing but its lock surface (over the whole output) is drawn or gets
+the pointer and the keyboard: windows, the dock, the top bar and the
+launcher are hidden, the hotkeys, Super and the swipes rest (Ctrl+Alt+F<n>
+still switches terminals when freestanding). The locker unlocks once its
+user has authenticated; the compositor itself knows nothing of
+passwords. A locker that goes without unlocking (it crashed, it was
+killed) leaves the session locked and the screen blank until a new
+locker locks and unlocks it; a second locker while one lives is refused
+(`finished`).
+
+The lock hotkey (`key-lock`, Super+L) and the top bar's session menu run
+the program `lock-command` names in the settings file (`swaylock` by
+default; a name on `PATH` or a path). The session menu's Log Out asks the
+compositor (on the bar's channel) to close every window; it ends once
+they have, or after four seconds, and the session with it.
+`std.ui.wayland.panel` has the client side (`openLock`, `unlock`) for a
+locker written in Mlx; [`tools/session-lock-test`](../../../tools/session-lock-test/main.mlx)
+is the stand-in the checks use (Enter unlocks: never one to use).
 
 ### GPU clients (OpenGL, Vulkan)
 
@@ -983,6 +1012,7 @@ key-move-left = Super+Shift+Left
 key-move-right = Super+Shift+Right
 key-column-width = Super+R
 key-tiling = Super+T
+key-lock = Super+L
 ```
 
 Alt+Shift+Q (quit), Super+1..9 and Super+Shift+1..9 (workspaces) and
@@ -1367,8 +1397,8 @@ finished`.
 - `shell.mlx`: the server side, with globals, surfaces, shared memory and
   xdg-shell. Its parts: `protocols.mlx` (layer shell, the window list for
   docks, decorations, blur regions), `windows.mlx` (focus, window states,
-  resizing, input delivery, mapping) and `launching.mlx` (launching
-  programs).
+  resizing, input delivery, mapping), `launching.mlx` (launching
+  programs) and `lock.mlx` (the session lock, logging out).
 - `dmabuf.mlx`: linux-dmabuf; each dma-buf becomes a one-buffer pool.
 - `data.mlx`: `wl_data_device_manager`, copy and paste and drag and drop
   between clients.

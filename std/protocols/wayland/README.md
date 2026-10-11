@@ -22,6 +22,7 @@ build inputs; applications only `@import("std.wayland")`.
 | `keyboard-shortcuts-inhibit-unstable-v1.xml` | wayland-protocols 1.49, `unstable/keyboard-shortcuts-inhibit/keyboard-shortcuts-inhibit-unstable-v1.xml` |
 | `xwayland-shell-v1.xml` | wayland-protocols 1.49, `staging/xwayland-shell/xwayland-shell-v1.xml` (Xwayland's windows to wl_surfaces) |
 | `pointer-gestures-unstable-v1.xml` | wayland-protocols 1.49, `unstable/pointer-gestures/pointer-gestures-unstable-v1.xml` (touchpad swipes, pinches and holds) |
+| `ext-session-lock-v1.xml` | wayland-protocols 1.49, `staging/ext-session-lock/ext-session-lock-v1.xml` (screen lockers such as swaylock) |
 
 The files are byte-for-byte copies of the upstream releases. `SOURCES`
 records each file's URL, release and SHA-256. Bootstrap tooling must preserve

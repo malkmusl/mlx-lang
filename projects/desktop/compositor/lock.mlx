@@ -1,0 +1,285 @@
+// The session lock (ext-session-lock-v1) and logging out.
+//
+// A screen locker (swaylock and the like) locks the session: from then on
+// only its lock surfaces are drawn and get the pointer and the keyboard,
+// every window and panel is hidden (scene.hidden), and the compositor's
+// hotkeys and gestures rest (windows.mlx). Each lock surface covers the
+// output. The locker unlocks with unlock_and_destroy once its user has
+// authenticated: the compositor knows nothing of passwords. A locker
+// that goes without unlocking (it crashed, it was killed) leaves the
+// session locked and the screen blank until a new locker locks and
+// unlocks it; a second locker while one lives is refused (finished).
+//
+// The top bar's session menu and the lock hotkey (Super+L) run the
+// program `lock-command` in compositor.conf names (swaylock by default).
+// Logging out (the session menu) asks every window to close, then ends
+// the compositor once they have, or after LOG_OUT_WAIT.
+const std = @import("std")
+const wl = @import("std.wayland")
+const state = @import("./state.mlx")
+const scene = @import("./scene.mlx")
+const shell = @import("./shell.mlx")
+const windows_module = @import("./windows.mlx")
+const launching_module = @import("./launching.mlx")
+
+const Compositor = state.Compositor
+const Surface = state.Surface
+
+// How long a log out waits for the windows to close (microseconds).
+const LOG_OUT_WAIT: usize = 4000000
+
+pub const DEFAULT_LOCK_COMMAND: []const u8 = "swaylock"
+
+// ---------------------------------------------------------------------------
+// Locking
+
+fn lockSession(compositor: *Compositor) -> void {
+    compositor.*.locked = true
+    compositor.*.superDown = false
+    launching_module.hidePreviews(compositor)
+    windows_module.endInteraction(compositor)
+    windows_module.focus(compositor, 0)
+    windows_module.refreshPointerFocus(compositor)
+    scene.damageAll(compositor)
+    if compositor.*.verbose { state.say("lock: locked\n") }
+}
+
+fn unlockSession(compositor: *Compositor) -> void {
+    compositor.*.locked = false
+    scene.damageAll(compositor)
+    windows_module.focusTopmost(compositor)
+    windows_module.refreshPointerFocus(compositor)
+    if compositor.*.verbose { state.say("lock: unlocked\n") }
+}
+
+// The first lock surface shown (0: none), for the keyboard.
+fn shownLockSurface(compositor: *Compositor) -> usize {
+    var index: usize = 0
+    while index < compositor.*.stack.length {
+        const address = state.listAt(compositor.*.stack, index)
+        if state.surfaceAt(address).*.role == state.ROLE_LOCK { return address }
+        index += 1
+    }
+    return 0
+}
+
+pub fn onLockManager(context: *anyopaque, request: wl.server.Request) -> void {
+    const compositor = state.compositorOf(context)
+    if request.opcode != wl.ext_session_lock_manager_v1.REQUEST_LOCK { return }
+    const decoded = wl.ext_session_lock_manager_v1.decodeRequest(request)
+    const lock = decoded.lock.id
+    if compositor.*.hasLock {
+        // One locker at a time: this one is told it did not lock.
+        lock.setHandler(onRefusedLock, context)
+        wl.ext_session_lock_v1.Resource.fromObject(lock.object).sendFinished()
+        if compositor.*.verbose { state.say("lock: refused (locked already)\n") }
+        return
+    }
+    compositor.*.hasLock = true
+    compositor.*.lockObject = lock.object
+    lock.setHandler(onLock, context)
+    lock.setDestroyHandler(onLockDestroyed, context)
+    // Everything else is hidden from the next frame on: the session counts
+    // as locked at once.
+    if !compositor.*.locked { lockSession(compositor) }
+    wl.ext_session_lock_v1.Resource.fromObject(lock.object).sendLocked()
+}
+
+// A lock that was refused: it may only be destroyed.
+pub fn onRefusedLock(context: *anyopaque, request: wl.server.Request) -> void {}
+
+pub fn onLock(context: *anyopaque, request: wl.server.Request) -> void {
+    const compositor = state.compositorOf(context)
+    const resource = wl.ext_session_lock_v1.Resource.fromObject(request.object)
+    const opcode = request.opcode
+    if opcode == wl.ext_session_lock_v1.REQUEST_DESTROY {
+        // Locked, only unlock_and_destroy may end it.
+        resource.postError(@intFromEnum(wl.ext_session_lock_v1.Error.invalid_destroy), "the session is locked: unlock_and_destroy ends the lock")
+    } else if opcode == wl.ext_session_lock_v1.REQUEST_UNLOCK_AND_DESTROY {
+        compositor.*.hasLock = false
+        unlockSession(compositor)
+    } else if opcode == wl.ext_session_lock_v1.REQUEST_GET_LOCK_SURFACE {
+        const decoded = wl.ext_session_lock_v1.decodeRequest(request)
+        const created = decoded.get_lock_surface
+        const address = state.findSurface(compositor, created.surface.object)
+        if address == 0 || state.surfaceAt(address).*.role != state.ROLE_NONE {
+            resource.postError(@intFromEnum(wl.ext_session_lock_v1.Error.role), "the surface has a role already")
+            return
+        }
+        // One output: one lock surface.
+        var index: usize = 0
+        while index < compositor.*.surfaces.length {
+            const other = state.surfaceAt(state.listAt(compositor.*.surfaces, index))
+            if other.*.role == state.ROLE_LOCK && state.sameClient(other.*.resource, request.object) {
+                resource.postError(@intFromEnum(wl.ext_session_lock_v1.Error.duplicate_output), "the output has a lock surface already")
+                return
+            }
+            index += 1
+        }
+        const surface = state.surfaceAt(address)
+        surface.*.role = state.ROLE_LOCK
+        surface.*.hasLockSurface = true
+        surface.*.lockSurface = created.id.object
+        surface.*.lockAcked = false
+        surface.*.lockWidth = @intCast(i32, compositor.*.width)
+        surface.*.lockHeight = @intCast(i32, compositor.*.height)
+        surface.*.x = 0
+        surface.*.y = 0
+        var surface_context: *anyopaque = undefined
+        unsafe { surface_context = @ptrCast(*anyopaque, surface) }
+        created.id.setHandler(onLockSurface, surface_context)
+        created.id.setDestroyHandler(onLockSurfaceDestroyed, surface_context)
+        wl.ext_session_lock_surface_v1.Resource.fromObject(created.id.object).sendConfigure(compositor.*.server.nextSerial(), @intCast(u32, surface.*.lockWidth), @intCast(u32, surface.*.lockHeight))
+    }
+}
+
+// The locker's lock went: unlocked (unlock_and_destroy) it is over; still
+// locked (the locker died) the session stays locked.
+pub fn onLockDestroyed(context: *anyopaque, object: wl.server.Object) -> void {
+    const compositor = state.compositorOf(context)
+    if !compositor.*.hasLock || !state.sameObject(compositor.*.lockObject, object) { return }
+    compositor.*.hasLock = false
+    if compositor.*.locked && compositor.*.verbose { state.say("lock: the locker went without unlocking; the session stays locked\n") }
+}
+
+pub fn onLockSurface(context: *anyopaque, request: wl.server.Request) -> void {
+    const surface = state.surfaceOf(context)
+    if request.opcode == wl.ext_session_lock_surface_v1.REQUEST_ACK_CONFIGURE { surface.*.lockAcked = true }
+}
+
+pub fn onLockSurfaceDestroyed(context: *anyopaque, object: wl.server.Object) -> void {
+    const surface = state.surfaceOf(context)
+    const compositor = surface.*.compositor
+    const had_keyboard = compositor.*.keyboardFocus == state.addressOfSurface(surface)
+    windows_module.unmap(surface)
+    surface.*.hasLockSurface = false
+    surface.*.role = state.ROLE_NONE
+    if had_keyboard { windows_module.focus(compositor, shownLockSurface(compositor)) }
+}
+
+// A lock surface's commit: shown over the whole output once it has a
+// buffer and acknowledged its configure; it takes the keyboard.
+pub fn lockCommitted(surface: *Surface) -> void {
+    if !surface.*.hasLockSurface || surface.*.mapped || !surface.*.hasContent { return }
+    const compositor = surface.*.compositor
+    if !surface.*.lockAcked {
+        wl.ext_session_lock_surface_v1.Resource.fromObject(surface.*.lockSurface).postError(@intFromEnum(wl.ext_session_lock_surface_v1.Error.commit_before_first_ack), "a buffer before the first configure was acknowledged")
+        return
+    }
+    const address = state.addressOfSurface(surface)
+    surface.*.mapped = true
+    surface.*.x = 0
+    surface.*.y = 0
+    compositor.*.stack = state.listAppend(compositor.*.stack, address)
+    scene.restack(compositor)
+    if compositor.*.verbose {
+        state.say("lock: surface ")
+        state.sayInteger(@intCast(i32, surface.*.pixelWidth))
+        state.say("x")
+        state.sayInteger(@intCast(i32, surface.*.pixelHeight))
+        state.say("\n")
+    }
+    if compositor.*.locked { windows_module.focus(compositor, address) }
+    windows_module.refreshPointerFocus(compositor)
+    scene.damageSurface(compositor, surface)
+}
+
+pub fn bindLockManager(context: *anyopaque, client: wl.server.Client, object: wl.server.Object, version: u32) -> void {
+    wl.ext_session_lock_manager_v1.Resource.fromObject(object).setHandler(onLockManager, context)
+}
+
+pub fn createGlobal(compositor: *Compositor) -> bool {
+    var memory: [*]u8 = undefined
+    unsafe { memory = @ptrCast([*]u8, compositor) }
+    return compositor.*.server.createGlobal(wl.Interface.ext_session_lock_manager_v1, 1, bindLockManager, state.contextOf(memory)) != 0
+}
+
+// Runs the locker (`lock-command`); not while the session is locked.
+pub fn runLocker(compositor: *Compositor) -> void {
+    if compositor.*.locked && compositor.*.hasLock { return }
+    if compositor.*.lockCommand[0] == 0 {
+        var index: usize = 0
+        for byte in DEFAULT_LOCK_COMMAND {
+            compositor.*.lockCommand[index] = byte
+            index += 1
+        }
+        compositor.*.lockCommand[index] = 0
+    }
+    var command: [*]const u8 = undefined
+    unsafe { command = @ptrCast([*]const u8, &compositor.*.lockCommand) }
+    launching_module.launch(compositor, command)
+}
+
+// ---------------------------------------------------------------------------
+// Logging out
+
+// Asks every window to close; the compositor ends once they have
+// (checkLogOut).
+pub fn logOut(compositor: *Compositor) -> void {
+    if compositor.*.loggingOut || compositor.*.locked { return }
+    compositor.*.loggingOut = true
+    compositor.*.logOutAt = state.microseconds()
+    if compositor.*.verbose { state.say("log out: closing the windows\n") }
+    var index: usize = 0
+    while index < compositor.*.surfaces.length {
+        const surface = state.surfaceAt(state.listAt(compositor.*.surfaces, index))
+        if surface.*.role == state.ROLE_TOPLEVEL && surface.*.mapped { windows_module.closeWindow(surface) }
+        index += 1
+    }
+}
+
+fn windowsLeft(compositor: *Compositor) -> usize {
+    var count: usize = 0
+    var index: usize = 0
+    while index < compositor.*.stack.length {
+        if state.surfaceAt(state.listAt(compositor.*.stack, index)).*.role == state.ROLE_TOPLEVEL { count += 1 }
+        index += 1
+    }
+    return count
+}
+
+// While logging out: the compositor ends once no window is left, or the
+// wait is over.
+pub fn checkLogOut(compositor: *Compositor) -> void {
+    if !compositor.*.loggingOut { return }
+    const left = windowsLeft(compositor)
+    if left > 0 && state.microseconds() - compositor.*.logOutAt < LOG_OUT_WAIT { return }
+    if compositor.*.verbose {
+        state.say("log out: ")
+        state.sayNumber(left)
+        state.say(" windows left; ending the session\n")
+    }
+    compositor.*.running = false
+}
+
+// ---------------------------------------------------------------------------
+// The handlers this file registers with the Wayland server, by name: when
+// the shell is loaded again (modules.mlx), each resource's handler is
+// replaced by the new code's function of the same name. Every function
+// passed to setHandler, setDestroyHandler, createGlobal or a client
+// handler here must be listed (tools/check_compositor_modules.py checks;
+// --fix rewrites this table).
+
+pub const HANDLER_COUNT: usize = 7
+
+pub fn handlerAddress(index: usize) -> usize {
+    if index == 0 { return @intFromPtr(bindLockManager) }
+    if index == 1 { return @intFromPtr(onLock) }
+    if index == 2 { return @intFromPtr(onLockDestroyed) }
+    if index == 3 { return @intFromPtr(onLockManager) }
+    if index == 4 { return @intFromPtr(onLockSurface) }
+    if index == 5 { return @intFromPtr(onLockSurfaceDestroyed) }
+    if index == 6 { return @intFromPtr(onRefusedLock) }
+    return 0
+}
+
+pub fn handlerName(index: usize) -> []const u8 {
+    if index == 0 { return "lock.bindLockManager" }
+    if index == 1 { return "lock.onLock" }
+    if index == 2 { return "lock.onLockDestroyed" }
+    if index == 3 { return "lock.onLockManager" }
+    if index == 4 { return "lock.onLockSurface" }
+    if index == 5 { return "lock.onLockSurfaceDestroyed" }
+    if index == 6 { return "lock.onRefusedLock" }
+    return ""
+}

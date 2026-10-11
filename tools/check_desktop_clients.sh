@@ -79,6 +79,7 @@ trap 'rm -rf -- "$work"' EXIT
 "$compiler" --quiet tools/wayland-drag-source/main.mlx -o "$work/drag-source"
 "$compiler" --quiet projects/desktop/topbar/main.mlx -o "$work/mlx-topbar"
 "$compiler" --quiet tools/topbar-test-services/main.mlx -o "$work/topbar-test-services"
+"$compiler" --quiet tools/session-lock-test/main.mlx -o "$work/session-lock-test"
 "$compiler" --quiet projects/desktop/ipc/main.mlx -o "$work/mlx-ipcd"
 "$compiler" --quiet projects/desktop/audio/main.mlx -o "$work/mlx-audiod"
 "$compiler" --quiet tools/clock-probe/main.mlx -o "$work/clock-probe"
@@ -761,6 +762,32 @@ press 272
 release 272
 wait 2500
 shot $work/bus-arranged.ppm
+pointer 25 15
+press 272
+release 272
+wait 600
+shot $work/bus-session.ppm
+pointer 100 144
+wait 200
+press 272
+release 272
+wait 2500
+shot $work/bus-locked.ppm
+enter
+wait 1000
+pointer 25 15
+press 272
+release 272
+wait 600
+pointer 100 180
+press 272
+release 272
+wait 600
+pointer 200 164
+wait 200
+press 272
+release 272
+wait 3000
 close
 SCRIPT
     XDG_RUNTIME_DIR=$runtime "$work/test-host" host-topbar-bus "$work/us.xkb" "$work/topbar-bus.script" > "$work/topbar-bus-host.log" 2>&1 &
@@ -778,6 +805,8 @@ SCRIPT
     # mlx-settings' Top bar page writes them): the clock first, the sound
     # hidden, the battery last.
     rm -f "$work/bar-config/mlx/topbar.conf"
+    # The session menu's lock runs the stand-in locker (Enter unlocks).
+    printf 'lock-command = %s\n' "$work/session-lock-test" > "$work/bar-config/mlx/compositor.conf"
     (for _ in $(seq 1 400); do grep -q "^topbar: popup calendar$" "$work/topbar-bus.log" 2> /dev/null && break; sleep 0.1; done
         sleep 1
         printf 'clock = on\nmedia = on\nsound = off\ntray = on\nbattery = on\n' > "$work/bar-config/mlx/topbar.conf") &
@@ -802,6 +831,9 @@ SCRIPT
         "^topbar: player org.mpris.MediaPlayer2.mlxtest paused \"Zweites Lied\" by Mlx Band$" "^topbar: menu of org.kde.StatusNotifierItem-[0-9]*-1/StatusNotifierItem with 3 entries$" \
         "^topbar: volume 50%$" "^topbar: muted$" "^topbar: volume 55%$" "^topbar: not muted$" "^topbar: popup battery$" "^topbar: popup calendar$"; do
         grep -q "$line" "$log" || fail "topbar on the bus: no \"$line\"" "$log"
+    done
+    for line in "^topbar: popup session$" "^topbar: lock$" "^lock: locked$" "^lock-test: unlocked$" "^lock: unlocked$" "^topbar: log out$" "^log out: 0 windows left; ending the session$"; do
+        grep -q "$line" "$log" || fail "topbar on the bus: the session menu: no \"$line\"" "$log"
     done
     [[ "$(tr '\n' ' ' < "$work/services.log")" == "registered PlayPause Paused Next Event 3 clicked Activate 769 30 " ]] || fail "topbar on the bus: the player and the item were not asked as they should: $(tr '\n' ' ' < "$work/services.log")" "$log"
     python3 - "$work" <<'PY' || fail "topbar on the bus: the bar or its popups do not look right" "$log"
@@ -846,8 +878,14 @@ arranged = load("bus-arranged")
 assert sum(1 for x in range(595, 710) for y in range(8, 22) if min(arranged(x, y)) > 180) > 40
 assert count(arranged, 920, 940, 5, 25, (40, 90, 230)) > 300, count(arranged, 920, 940, 5, 25, (40, 90, 230))
 assert count(arranged, 950, 1010, 9, 21, (255, 255, 255)) > 40
+# The session menu under the mark (8..278 x 36..206), then the lock over
+# everything.
+session = load("bus-session")
+assert near(session(150, 70), popup) and near(session(250, 120), popup), (session(150, 70), session(250, 120))
+locked = load("bus-locked")
+assert near(locked(10, 10), (30, 110, 90)) and near(locked(800, 600), (30, 110, 90)), (locked(10, 10), locked(800, 600))
 PY
-    echo "ok   the top bar on a session bus: what plays, a tray icon with its menu, the volume, the battery and the calendar; the items rearranged"
+    echo "ok   the top bar on a session bus: what plays, a tray icon with its menu, the volume, the battery and the calendar; the items rearranged; the session menu locks and logs out"
 }
 
 drops

@@ -58,6 +58,10 @@
 #      Backspace unbinds one; the compositor takes the new keys at once.
 #  11b. mlx-settings' Top bar page (opened by `mlx-settings topbar`): an
 #      item moves up a place and another is hidden; topbar.conf says so.
+#  11c. the session lock (ext-session-lock-v1, a stand-in locker): locked,
+#      only the lock surface shows and gets the keys; a locker that dies
+#      leaves the session locked and blank; the next one locks and
+#      unlocks it, and the keys go to the terminal again.
 #  12. mlx-capture captures the screen and a window
 #      (ext-image-copy-capture-v1): the PNGs agree, and a later frame
 #      waits for damage.
@@ -909,6 +913,74 @@ run_scenario topbar-page "$work/topbar-page.script" --no-fps --run "$work/topbar
 [[ "$(grep -v '^#' "$XDG_CONFIG_HOME/mlx/topbar.conf" 2> /dev/null | tr '\n' ' ')" == "media = on sound = on tray = on battery = off clock = on " ]] || { echo "mlx-settings' Top bar page did not write the items as clicked" >&2; cat "$XDG_CONFIG_HOME/mlx/topbar.conf" "$work/topbar-page-compositor.log" >&2; exit 1; }
 rm -f "$XDG_CONFIG_HOME/mlx/topbar.conf"
 echo "ok   mlx-settings' Top bar page moves an item up and hides another (topbar.conf)"
+
+# Scenario 11c: the session lock. A terminal opens; 3 s in, a locker that
+# dies two seconds after locking without unlocking (session-lock-test
+# --die), 2 s later one that unlocks on Enter. What is typed while locked
+# must not reach the terminal; what is typed after must.
+"$compiler" --quiet tools/session-lock-test/main.mlx -o "$work/session-lock-test"
+cat > "$work/session-lock-run.sh" <<SCRIPT
+#!/bin/sh
+"$work/mlx-terminal" &
+sleep 3
+"$work/session-lock-test" --die
+sleep 2
+exec "$work/session-lock-test"
+SCRIPT
+chmod +x "$work/session-lock-run.sh"
+rm -f "$work/session-lock-typed.marker" "$work/session-lock-after.marker"
+cat > "$work/session-lock.script" <<SCRIPT
+wait 2500
+shot $work/session-lock-before.ppm
+wait 2600
+shot $work/session-lock-locked.ppm
+type touch $work/session-lock-typed.marker
+enter
+wait 2500
+shot $work/session-lock-dead.ppm
+pointer 300 300
+press 272
+release 272
+type touch $work/session-lock-typed.marker
+wait 3000
+shot $work/session-lock-again.ppm
+enter
+wait 800
+pointer 300 300
+press 272
+release 272
+type touch $work/session-lock-after.marker
+enter
+wait 800
+shot $work/session-lock-after.ppm
+close
+SCRIPT
+run_scenario session-lock "$work/session-lock.script" --no-fps --run "$work/session-lock-run.sh"
+log="$work/session-lock-compositor.log"
+for line in "^lock: locked$" "^lock: the locker went without unlocking; the session stays locked$" "^lock-test: unlocked$" "^lock: unlocked$"; do
+    grep -q "$line" "$log" || { echo "session lock: no \"$line\"" >&2; cat "$log" >&2; exit 1; }
+done
+[[ ! -e "$work/session-lock-typed.marker" ]] || { echo "session lock: keys typed while locked reached the terminal" >&2; exit 1; }
+[[ -e "$work/session-lock-after.marker" ]] || { echo "session lock: the terminal got no keys after unlocking" >&2; cat "$log" >&2; exit 1; }
+python3 - "$work" <<'PY' || { echo "session lock: the screen does not look right" >&2; exit 1; }
+import sys
+work = sys.argv[1]
+def load(name):
+    data = open(f"{work}/session-lock-{name}.ppm", 'rb').read()
+    _, size, _, pixels = data.split(b'\n', 3)
+    width, height = map(int, size.split())
+    return lambda x, y: tuple(pixels[(y * width + x) * 3:(y * width + x) * 3 + 3])
+def near(pixel, want, slack=12): return all(abs(a - b) <= slack for a, b in zip(pixel, want))
+before, locked, dead, again, after = (load(name) for name in ("before", "locked", "dead", "again", "after"))
+teal = (30, 110, 90)
+# Locked: the lock surface over everything (the terminal's corner too).
+assert near(locked(100, 100), teal) and near(locked(10, 10), teal) and near(locked(1000, 750), teal), (locked(100, 100), locked(10, 10))
+# The locker gone: no window, only the background (the same as beside
+# the terminal before).
+assert not near(before(100, 100), before(900, 100)) and near(dead(100, 100), before(900, 100)), (before(100, 100), dead(100, 100), before(900, 100))
+assert near(again(100, 100), teal) and near(after(100, 100), before(100, 100)), (again(100, 100), after(100, 100))
+PY
+echo "ok   the session lock: only the locker shows and gets the keys; a dead locker leaves it locked; the next one unlocks"
 
 # Scenario 12: screen and window capture (ext-image-copy-capture-v1 with
 # ext-image-capture-source-v1 and ext-foreign-toplevel-list-v1), with
