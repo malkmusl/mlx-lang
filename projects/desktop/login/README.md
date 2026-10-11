@@ -9,23 +9,30 @@ logind, no libc.
 
 ```sh
 mlx4 projects/desktop/login/main.mlx -o mlx-login
-mlx-ipcd --system &                 # the system bus at /run/mlx/bus
-sudo mlx-login --verbose            # owns org.mlx.Login, waits
-tools/check_login.sh                # the end-to-end check
+mlx-ipcd --system &                          # the system bus at /run/mlx/bus
+sudo mlx-login --verbose                     # owns org.mlx.Login, waits
+sudo mlx-login --passwd FILE --shadow FILE   # isolated account databases
+tools/check_login.sh                         # the end-to-end check
 ```
+
+The default account-database paths are `/etc/passwd` and `/etc/shadow`.
+The options exist so installers and checks can stage private databases;
+they do not remove the root requirement. The check re-executes itself as
+root inside a user namespace and passes private fixture paths explicitly,
+so `mlx-login` does not open the host's account or password databases.
 
 ## The bus interface (`org.mlx.Login`, path `/org/mlx/Login`)
 
 | Method | What it does |
 | --- | --- |
-| `ListUsers() -> a(ssss)` | the login accounts of `/etc/passwd`: name, full name, home, shell |
+| `ListUsers() -> a(ssss)` | the login accounts of the configured passwd file: name, full name, home, shell |
 | `Login(s user, s password, s session) -> b` | checks the password, and on a match starts `session` as `user` |
 | `Unlock(s user, s password) -> b` | checks the password of the user who already holds the seat (the lock screen) |
 
-`ListUsers` reads `/etc/passwd`, which is world-readable and holds no
-secrets. The greeter shows that list, takes a password, and calls
-`Login`. A wrong password is held back for two seconds before the "no",
-to slow guessing.
+`ListUsers` reads the configured passwd file, `/etc/passwd` by default;
+that file is world-readable and holds no secrets. The greeter shows that
+list, takes a password, and calls `Login`. A wrong password is held back
+for two seconds before the "no", to slow guessing.
 
 ## The two privileged steps
 
@@ -40,7 +47,8 @@ today and `ListUsers` answers, while `Login` and `Unlock` reply with
 
 The pieces the two steps need are all in the tree already:
 
-- **`authenticate`** reads `/etc/shadow` (root only) and calls
+- **`authenticate`** reads the configured shadow file (`/etc/shadow` by
+  default, root only) and calls
   `std.crypt.verify(password, hash)` — [`std/src/crypt.mlx`](../../../std/src/crypt.mlx),
   which already does yescrypt (`$y$`, Ubuntu's default), `$6$` and `$5$`
   in constant time. The stub's comment gives the field layout and the
@@ -70,4 +78,4 @@ as it does now when no logind is present.
 | File | What it does |
 | --- | --- |
 | `main.mlx` | the daemon: the bus, the three methods, the two marked stubs |
-| `users.mlx` | the login accounts, read from `/etc/passwd` |
+| `users.mlx` | the login accounts, read from the configured passwd file |
