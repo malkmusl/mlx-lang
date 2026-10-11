@@ -560,14 +560,19 @@ connected connectors, the `video` and `input` groups (needed only without
 logind), the Vulkan drivers, the XKB data, and the last session log,
 whose `modeset failed`, `crashed:` or `killed by signal` lines it points
 out. It wraps `tools/install_compositor_session.sh`, which does the
-building and copying (`--prefix`, default `/usr/local` there; `--destdir`
+building and copying (`--prefix`, default `/usr` there too; `--destdir`
 stages for packaging; `--build-only` builds into `mlx-out/session`). The
-build uses the canonical compiler, `mlx-out/bin/compiler/mlx4`, and makes
-it first from the bootstrap-built `zig-out/bin/mlx1` when it is missing
-(`mlx1 -> mlx2 -> mlx3`, the self-hosted compiler's fixed point): that
-compiler builds the same binary from the same sources on every machine,
-so the checksum `--check` prints matches a build elsewhere, and a crash
-address from one machine finds its place in another's disassembly.
+programs come from `./mlx build desktop client-libraries`
+([`build.mlx`](../../../build.mlx)), which builds a program only when a
+module it reads changed, the jobs side by side: a reinstall with nothing
+changed builds nothing. It uses the canonical compiler,
+`mlx-out/bin/compiler/mlx4`, made first from the bootstrap-built
+`zig-out/bin/mlx1` when it is missing (`mlx1 -> mlx2 -> mlx3`, the
+self-hosted compiler's fixed point): that compiler builds the same binary
+from the same sources on every machine, so the checksum `--check` prints
+matches a build elsewhere, and a crash address from one machine finds its
+place in another's disassembly. `--compiler PATH` compiles everything with
+another compiler instead.
 
 It puts `mlx-compositor`, `mlx-terminal`, `mlx-session` and the other
 programs into `/usr/bin/mlx` (`PREFIX/bin/mlx`, `--prefix`, default

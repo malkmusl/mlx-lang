@@ -10,7 +10,8 @@
 #     --deb            also build a Debian package (DIR/mlx-capture-libs_*.deb)
 #                      that installs it where the package had its library
 #                      and replaces that package (apt install ./FILE.deb)
-#     --compiler PATH  the Mlx compiler (default: tools/ensure_compiler.sh)
+#     --compiler PATH  compile with this Mlx compiler (default: take it
+#                      from ./mlx build, only when it is not current)
 #
 # Builds, into DIR:
 #   libpipewire-0.3.so.0   PipeWire's client library (its soname, every
@@ -20,6 +21,7 @@ set -euo pipefail
 
 repo_root=$(cd "$(dirname "$0")/.." && pwd)
 cd "$repo_root"
+source tools/lib/mlx_build.sh
 
 out=mlx-out/libpipewire
 deb=0
@@ -34,10 +36,15 @@ while [[ $# -gt 0 ]]; do
     esac
     shift
 done
-[[ -n "$compiler" ]] || compiler=$(tools/ensure_compiler.sh)
 mkdir -p "$out"
 
-"$compiler" --quiet --plugin --soname=libpipewire-0.3.so.0 projects/desktop/libpipewire/libpipewire.mlx -o "$out/libpipewire-0.3.so.0"
+if [[ -n "$compiler" ]]; then
+    "$compiler" --quiet --plugin --soname=libpipewire-0.3.so.0 projects/desktop/libpipewire/libpipewire.mlx -o "$out/libpipewire-0.3.so.0"
+else
+    # build.mlx's step of the same name (client-libraries).
+    mlx_build libpipewire-0.3.so.0
+    [[ "$out" -ef mlx-out/lib ]] || cp mlx-out/lib/libpipewire-0.3.so.0 "$out/"
+fi
 echo "built $out/libpipewire-0.3.so.0"
 [[ $deb -eq 1 ]] || exit 0
 

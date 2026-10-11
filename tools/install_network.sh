@@ -32,6 +32,10 @@
 #
 #   tools/install_network.sh [--prefix DIR] [--destdir DIR] [--enable | --disable] [compiler]
 #
+# The programs come from ./mlx build (the network group, only what is not
+# current, built as the checkout's owner); a compiler named compiles them
+# with it instead.
+#
 # --destdir stages everything under DIR (for packaging, or to look before
 # installing). Without it this has to run as root. The installer never
 # calls systemctl itself; it says what to run.
@@ -40,6 +44,7 @@ set -euo pipefail
 repo_root=$(cd "$(dirname "$0")/.." && pwd)
 cd "$repo_root"
 source tools/lib/mlx_layout.sh
+source tools/lib/mlx_build.sh
 prefix=$mlx_default_prefix
 destdir=""
 enable=false
@@ -163,13 +168,18 @@ if $disable; then
     disable_network
     exit 0
 fi
-compiler=${compiler:-${MLX_COMPILER:-mlx-out/bin/compiler/mlx4}}
+compiler=${compiler:-${MLX_COMPILER:-}}
 
 build=$(mktemp -d)
 trap 'rm -rf -- "$build"' EXIT
-"$compiler" --quiet projects/network/main.mlx -o "$build/mlx-netd"
-"$compiler" --quiet projects/network/tool.mlx -o "$build/mlx-net"
-"$compiler" --quiet projects/desktop/ipc/main.mlx -o "$build/mlx-ipcd"
+if [[ -n "$compiler" ]]; then
+    "$compiler" --quiet projects/network/main.mlx -o "$build/mlx-netd"
+    "$compiler" --quiet projects/network/tool.mlx -o "$build/mlx-net"
+    "$compiler" --quiet projects/desktop/ipc/main.mlx -o "$build/mlx-ipcd"
+else
+    mlx_build network
+    cp mlx-out/bin/mlx-netd mlx-out/bin/mlx-net mlx-out/bin/mlx-ipcd "$build/"
+fi
 echo "built mlx-netd, mlx-net and mlx-ipcd"
 
 prefix=${prefix%/}

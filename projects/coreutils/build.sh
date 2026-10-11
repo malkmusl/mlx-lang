@@ -2,6 +2,11 @@
 set -euo pipefail
 
 repo_root=$(cd "$(dirname "$0")/../.." && pwd)
+# Without a compiler or a directory named: build.mlx's coreutils group,
+# which builds a utility only when it is not current.
+if [[ $# -eq 0 && -z "${MLX_COMPILER:-}" && -z "${MLX_COREUTILS_BIN_DIR:-}" ]]; then
+    exec "$repo_root/mlx" build coreutils
+fi
 bin_dir=${MLX_COREUTILS_BIN_DIR:-"$repo_root/mlx-out/bin/coreutils"}
 compiler=${MLX_COMPILER:-${1:-"$repo_root/mlx-out/bin/compiler/mlx4"}}
 utilities=(true false echo cat wc pwd mkdir rmdir basename dirname head tail tee yes sleep uname printenv env nproc link unlink touch truncate mkfifo sync cp mv rm ln chmod readlink realpath chown chgrp stat ls arch logname whoami seq tac nl fold uniq cut comm tr expr test "[" base64 base32 basenc md5sum sha1sum sha224sum sha256sum sha384sum sha512sum sum cksum b2sum expand unexpand paste shuf date sort join split fmt csplit pr)

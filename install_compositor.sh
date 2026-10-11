@@ -14,8 +14,8 @@
 #                   installation puts that directory on PATH)
 #   --sessions DIR  where GDM and SDDM read session entries
 #                   (default /usr/share/wayland-sessions)
-#   --compiler PATH the Mlx compiler (default: mlx-out/bin/compiler/mlx4,
-#                   else zig-out/bin/mlx1, else built with zig)
+#   --compiler PATH compile with this Mlx compiler (default: ./mlx build,
+#                   which builds only what is not current)
 #
 # Installing into system directories asks for sudo when not run as root.
 # The build and the copying are tools/install_compositor_session.sh's; this

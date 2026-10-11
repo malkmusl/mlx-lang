@@ -15,7 +15,10 @@
 # Usage: tools/install_login.sh [options] [compiler]
 #   --prefix DIR       programs go to DIR/bin/mlx (default /usr)
 #   --destdir DIR      stage every path below DIR; never calls systemctl
-#   --compiler PATH    Mlx compiler (a final positional path also works)
+#   --compiler PATH    compile with this Mlx compiler (a final positional
+#                      path also works) instead of taking the programs from
+#                      ./mlx build (the login group, only what is not
+#                      current, built as the checkout's owner)
 #   --enable           make mlx-login the display-manager.service and mask
 #                      the display manager that alias previously selected
 #   --disable          undo --enable from saved state; installed files stay
@@ -28,6 +31,7 @@ set -euo pipefail
 repo_root=$(cd "$(dirname "$0")/.." && pwd)
 cd "$repo_root"
 source tools/lib/mlx_layout.sh
+source tools/lib/mlx_build.sh
 
 prefix=$mlx_default_prefix
 destdir=""
@@ -219,7 +223,7 @@ if $disable; then
     exit 0
 fi
 
-compiler=${compiler:-${MLX_COMPILER:-mlx-out/bin/compiler/mlx4}}
+compiler=${compiler:-${MLX_COMPILER:-}}
 build=$(mktemp -d)
 cleanup() {
     local status=$?
@@ -229,9 +233,14 @@ cleanup() {
 }
 trap cleanup EXIT
 
-"$compiler" --quiet projects/desktop/login/main.mlx -o "$build/mlx-login"
-"$compiler" --quiet projects/desktop/greeter/main.mlx -o "$build/mlx-greeter"
-"$compiler" --quiet projects/desktop/lock/main.mlx -o "$build/mlx-lock"
+if [[ -n "$compiler" ]]; then
+    "$compiler" --quiet projects/desktop/login/main.mlx -o "$build/mlx-login"
+    "$compiler" --quiet projects/desktop/greeter/main.mlx -o "$build/mlx-greeter"
+    "$compiler" --quiet projects/desktop/lock/main.mlx -o "$build/mlx-lock"
+else
+    mlx_build login
+    cp mlx-out/bin/mlx-login mlx-out/bin/mlx-greeter mlx-out/bin/mlx-lock "$build/"
+fi
 echo "built mlx-login, mlx-greeter and mlx-lock"
 
 install -d "$destdir$bindir" "$system_dir" "$destdir/etc/mlx/init/services" "$destdir$docdir"

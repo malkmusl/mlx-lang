@@ -72,8 +72,9 @@
 #   --sessions DIR    the session entry's directory
 #                     (default /usr/share/wayland-sessions)
 #   --destdir DIR     stage everything under DIR instead (packaging, tests)
-#   --compiler PATH   the Mlx compiler (default: mlx-out/bin/compiler/mlx4,
-#                     else zig-out/bin/mlx1, else made by tools/ensure_compiler.sh)
+#   --compiler PATH   compile everything with this Mlx compiler (default:
+#                     take it from ./mlx build, which builds only what is
+#                     not current)
 #   --build-only      build into mlx-out/session and stop
 #   --uninstall       remove what an install put there (and restore the
 #                     sound servers when they were replaced)
@@ -111,6 +112,7 @@ set -euo pipefail
 repo_root=$(cd "$(dirname "$0")/.." && pwd)
 cd "$repo_root"
 source tools/lib/mlx_layout.sh
+source tools/lib/mlx_build.sh
 
 prefix=$mlx_default_prefix
 sessions=/usr/share/wayland-sessions
@@ -308,36 +310,47 @@ if [[ $uninstall -eq 1 ]]; then
     exit 0
 fi
 
-# The compiler: the canonical one (tools/ensure_compiler.sh builds or
-# updates mlx-out/bin/compiler/mlx4 when needed).
-[[ -n "$compiler" ]] || compiler=$(tools/ensure_compiler.sh)
-
-# Build.
-echo "building with $compiler"
-"$compiler" --quiet projects/desktop/compositor/main.mlx -o "$build/mlx-compositor"
-"$compiler" --quiet projects/desktop/terminal/main.mlx -o "$build/mlx-terminal"
-"$compiler" --quiet projects/shell/main.mlx -o "$build/mlx-sh"
-"$compiler" --quiet projects/console/main.mlx -o "$build/mlx-console"
-"$compiler" --quiet projects/desktop/dock/main.mlx -o "$build/mlx-dock"
-"$compiler" --quiet projects/desktop/topbar/main.mlx -o "$build/mlx-topbar"
-"$compiler" --quiet projects/desktop/launcher/main.mlx -o "$build/mlx-launcher"
-"$compiler" --quiet projects/desktop/settings/main.mlx -o "$build/mlx-settings"
-"$compiler" --quiet projects/desktop/files/main.mlx -o "$build/mlx-files"
-"$compiler" --quiet projects/observatory/main.mlx -o "$build/mlx-observatory"
-"$compiler" --quiet tools/profile/main.mlx -o "$build/mlx-profile"
-"$compiler" --quiet projects/desktop/capture/main.mlx -o "$build/mlx-capture"
-"$compiler" --quiet --plugin projects/desktop/capture/obs.mlx -o "$build/mlx-capture.so"
-"$compiler" --quiet projects/desktop/ipc/main.mlx -o "$build/mlx-ipcd"
-"$compiler" --quiet projects/desktop/ipc/tool.mlx -o "$build/mlx-ipc"
-"$compiler" --quiet projects/desktop/audio/main.mlx -o "$build/mlx-audiod"
-"$compiler" --quiet projects/desktop/audio/tool.mlx -o "$build/mlx-audio"
-"$compiler" --quiet projects/desktop/permissions/main.mlx -o "$build/mlx-permissions"
-"$compiler" --quiet projects/desktop/notifications/main.mlx -o "$build/mlx-notifyd"
-"$compiler" --quiet projects/desktop/notifications/notify.mlx -o "$build/mlx-notify"
+# The programs: from ./mlx build (only what is not current), or compiled
+# with the compiler named.
+compiler_args=()
+if [[ -n "$compiler" ]]; then
+    echo "building with $compiler"
+    "$compiler" --quiet projects/desktop/compositor/main.mlx -o "$build/mlx-compositor"
+    "$compiler" --quiet projects/desktop/terminal/main.mlx -o "$build/mlx-terminal"
+    "$compiler" --quiet projects/shell/main.mlx -o "$build/mlx-sh"
+    "$compiler" --quiet projects/console/main.mlx -o "$build/mlx-console"
+    "$compiler" --quiet projects/desktop/dock/main.mlx -o "$build/mlx-dock"
+    "$compiler" --quiet projects/desktop/topbar/main.mlx -o "$build/mlx-topbar"
+    "$compiler" --quiet projects/desktop/launcher/main.mlx -o "$build/mlx-launcher"
+    "$compiler" --quiet projects/desktop/settings/main.mlx -o "$build/mlx-settings"
+    "$compiler" --quiet projects/desktop/files/main.mlx -o "$build/mlx-files"
+    "$compiler" --quiet projects/observatory/main.mlx -o "$build/mlx-observatory"
+    "$compiler" --quiet tools/profile/main.mlx -o "$build/mlx-profile"
+    "$compiler" --quiet projects/desktop/capture/main.mlx -o "$build/mlx-capture"
+    "$compiler" --quiet --plugin projects/desktop/capture/obs.mlx -o "$build/mlx-capture.so"
+    "$compiler" --quiet projects/desktop/ipc/main.mlx -o "$build/mlx-ipcd"
+    "$compiler" --quiet projects/desktop/ipc/tool.mlx -o "$build/mlx-ipc"
+    "$compiler" --quiet projects/desktop/audio/main.mlx -o "$build/mlx-audiod"
+    "$compiler" --quiet projects/desktop/audio/tool.mlx -o "$build/mlx-audio"
+    "$compiler" --quiet projects/desktop/permissions/main.mlx -o "$build/mlx-permissions"
+    "$compiler" --quiet projects/desktop/notifications/main.mlx -o "$build/mlx-notifyd"
+    "$compiler" --quiet projects/desktop/notifications/notify.mlx -o "$build/mlx-notify"
+    compiler_args=(--compiler "$compiler")
+else
+    echo "building with ./mlx build (the desktop and client-libraries groups, only what is not current)"
+    mlx_build desktop client-libraries
+    for program in "${programs[@]}"; do
+        case $program in
+        mlx-session|mlx-codemap) ;;
+        *) cp "mlx-out/bin/$program" "$build/" ;;
+        esac
+    done
+    cp mlx-out/lib/mlx-capture.so "$build/"
+fi
 deb=()
 command -v dpkg-deb > /dev/null && deb=(--deb)
-tools/build_libpulse.sh --compiler "$compiler" --out "$build/libpulse" "${deb[@]}" > /dev/null
-tools/build_libpipewire.sh --compiler "$compiler" --out "$build/libpipewire" "${deb[@]}" > /dev/null
+tools/build_libpulse.sh "${compiler_args[@]}" --out "$build/libpulse" "${deb[@]}" > /dev/null
+tools/build_libpipewire.sh "${compiler_args[@]}" --out "$build/libpipewire" "${deb[@]}" > /dev/null
 sed "s|@BINDIR@|$bindir|g" projects/desktop/audio/org.mlx.Audio.service.in > "$build/org.mlx.Audio.service"
 sed "s|@BINDIR@|$bindir|g" projects/desktop/permissions/org.mlx.PermissionAgent.service.in > "$build/org.mlx.PermissionAgent.service"
 sed "s|@BINDIR@|$bindir|g" projects/desktop/capture/org.freedesktop.portal.Desktop.service.in > "$build/org.freedesktop.portal.Desktop.service"
@@ -380,7 +393,7 @@ mlx_note_old_layout "$destdir" "$bindir"
 # The shell and renderer modules, for the user running this (not when
 # staging a package).
 if [[ -z "$destdir" ]]; then
-    tools/build_compositor_modules.sh --compiler "$compiler"
+    tools/build_compositor_modules.sh "${compiler_args[@]}"
     # OBS's per-user plugin directory.
     obs_plugin="${XDG_CONFIG_HOME:-$HOME/.config}/obs-studio/plugins/mlx-capture/bin/64bit"
     mkdir -p "$obs_plugin"
