@@ -252,15 +252,25 @@ without it.
 
 Left of the time, from the right, the bar shows what it finds
 ([`projects/desktop/topbar`](../topbar/main.mlx)); each opens a popup
-under it on a click (a click on it again or anywhere else closes it):
+under it on a click (a click on it again or anywhere else closes it).
+The popups look like the dock's folder stacks (a header with a title and
+a button over a line, then their content) and come in sliding down and
+fading in. Everything on the bar moves rather than jumps: a widget that
+comes or goes fades while the others glide to their places, the light
+under the pointer fades in and out, the time slides to the next minute,
+a new track's title slides in over the old one, the volume and the
+charge glide to their new values, and the calendar's months slide past
+each other. The symbols are drawn smooth at their size by
+`std.ui.vector` (`desktop-shared/symbols.mlx`), alike on the CPU and the
+GPU.
 
 | Widget | Shows | Does |
 | --- | --- | --- |
-| Clock | the date and time | a calendar: today, the month with ISO week numbers and today lit; the arrows or the wheel turn the month, a click on its name goes back to today's |
+| Clock | the date and time | a calendar: today in its header (its button goes back to today's month), the month with ISO week numbers and today lit; the arrows or the wheel turn the month |
 | Battery | the charge of the batteries in `/sys/class/power_supply` (not a mouse's or a headset's), red under 15 %, a bolt while it charges | a popup: charging, full or on battery, and the time to full or to empty |
-| Volume | MLX Audio's output: a speaker with one to three waves, crossed out when muted | the wheel turns it by 5 %, a middle click mutes; the popup has the output's name, a slider and the mute switch |
+| Volume | MLX Audio's output: a speaker with one to three waves, crossed out when muted | the wheel turns it by 5 %, a middle click mutes; the popup has the output's volume (the speaker mutes), the outputs to choose (automatic or a sound card), and the apps MLX Audio knows as a grid of their icons, each with its own slider (a click on the icon mutes the app, the wheel turns it; a dot over the ones playing); its button opens mlx-settings' Sound page |
 | Tray | the StatusNotifierItems (the icons Qt, GTK's libappindicator, Electron and others show): `IconPixmap`, else `IconName` from the icon themes, else the title's first letter; a red dot when one needs attention | a left click is `Activate`, a middle click `SecondaryActivate`, a right click the item's menu (`com.canonical.dbusmenu`, as the bar's own popup) or `ContextMenu` |
-| Media | the MPRIS player that played last (`org.mpris.MediaPlayer2.*`): a play/pause button and "Title – Artist" | the button plays or pauses; the text opens the cover (a `file://` PNG), title, artist and album, where the track is (a click on the line goes there), and previous, play/pause and next; a click on the cover or the title raises the player |
+| Media | the MPRIS player that played last (`org.mpris.MediaPlayer2.*`): a play/pause button and "Title – Artist" | the button plays or pauses; the text opens the player's name (its button and a click on the cover raise the player), the cover (a `file://` PNG), title, artist and album, where the track is (a click on the line goes there), and previous, play/pause and next |
 
 The bar finds these on the session bus (`DBUS_SESSION_BUS_ADDRESS`, as
 MLXIPC gives the session) without waiting on it: it is the

@@ -114,7 +114,13 @@ the `paint` compute shader draws, the same pixels as the CPU
 `std.ui.text` loads a font (`loadText`, `loadMonoText`: the usual places
 on Linux desktops and on Android), `measure`s and `drawText`s.
 `std.ui.glyphs` has the small marks widgets use (check mark, arrows,
-chevron, cross, dot, magnifier, plus).
+chevron, cross, dot, magnifier, plus). `std.ui.vector` draws shapes
+smooth (anti-aliased) into an image: paths of lines and quadratic and
+cubic curves filled by their coverage (the signed-area accumulation
+`std.truetype` draws glyphs with), rectangles, rounded rectangles and
+their outlines, ellipses, rings, arcs and lines with round ends, painted
+in a colour (`paint`) or cut out (`erase`); the desktop's symbols are
+drawn with it once at their size and then drawn as images.
 
 ## Widgets
 

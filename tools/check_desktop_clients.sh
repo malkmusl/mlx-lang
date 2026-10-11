@@ -699,9 +699,9 @@ wait 400
 pointer 680 15
 press 272
 release 272
-wait 700
+wait 900
 shot $work/bus-media.ppm
-pointer 773 162
+pointer 779 210
 wait 100
 press 272
 release 272
@@ -709,13 +709,13 @@ wait 400
 pointer 769 15
 press 273
 release 273
-wait 700
+wait 900
 shot $work/bus-menu.ppm
 pointer 760 94
 wait 100
 press 272
 release 272
-wait 300
+wait 400
 pointer 769 15
 press 272
 release 272
@@ -723,17 +723,17 @@ wait 300
 pointer 800 15
 press 272
 release 272
-wait 700
+wait 900
 shot $work/bus-sound.ppm
-pointer 700 88
+pointer 700 104
 wait 100
 press 272
 wait 100
-pointer 791 88
+pointer 796 104
 wait 100
 release 272
 wait 300
-pointer 914 131
+pointer 651 105
 press 272
 release 272
 wait 300
@@ -743,18 +743,18 @@ wait 300
 pointer 852 15
 press 272
 release 272
-wait 700
+wait 900
 shot $work/bus-battery.ppm
 pointer 953 15
 press 272
 release 272
-wait 700
+wait 900
 shot $work/bus-calendar.ppm
-pointer 987 91
+pointer 987 101
 wait 100
 press 272
 release 272
-wait 500
+wait 700
 shot $work/bus-calendar-next.ppm
 close
 SCRIPT
@@ -799,30 +799,32 @@ def load(name):
     return lambda x, y: tuple(pixels[(y * width + x) * 3:(y * width + x) * 3 + 3])
 def near(pixel, want, slack=12): return all(abs(a - b) <= slack for a, b in zip(pixel, want))
 def count(at, x0, x1, y0, y1, want): return sum(1 for x in range(x0, x1) for y in range(y0, y1) if near(at(x, y), want))
-popup = (30, 37, 42)
+popup = (30, 33, 42)
 accent = (90, 160, 255)
 bar = load("bus-bar")
 # The tray's icon (the item's blue 32x32 pixmap made 20x20), the speaker
 # and the battery in white, the title's text.
 assert count(bar, 759, 779, 5, 25, (40, 90, 230)) > 300, count(bar, 759, 779, 5, 25, (40, 90, 230))
 assert count(bar, 790, 812, 7, 23, (255, 255, 255)) > 40
-assert count(bar, 823, 846, 9, 21, (255, 255, 255)) > 100
+assert count(bar, 823, 846, 9, 21, (255, 255, 255)) > 40
 assert sum(1 for x in range(620, 740) for y in range(8, 22) if min(bar(x, y)) > 180) > 40
 media = load("bus-media")
-# The popup (489..849 x 34..184) with its cover's tile (no art).
-assert near(media(800, 175), popup) and near(media(530, 80), (70, 76, 96)), (media(800, 175), media(530, 80))
+# The popup (479..859 x 36..), under its header, with its cover's tile (no
+# art).
+assert near(media(679, 84), popup) and near(media(519, 104), (58, 64, 82)), (media(679, 84), media(519, 104))
 menu = load("bus-menu")
 assert near(menu(690, 120), (30, 33, 42)), menu(690, 120)
 sound = load("bus-sound")
-assert near(sound(660, 50), popup) and near(sound(720, 88), accent), (sound(660, 50), sound(720, 88))
+# The sound popup (620..980): its background, the output's slider lit.
+assert near(sound(630, 140), popup) and near(sound(700, 106), accent), (sound(630, 140), sound(700, 106))
 battery = load("bus-battery")
 # 84 % of the line lit, the rest not.
-assert near(battery(800, 101), accent) and not near(battery(950, 101), accent), (battery(800, 101), battery(950, 101))
+assert near(battery(800, 143), accent) and not near(battery(950, 143), accent), (battery(800, 143), battery(950, 143))
 # The calendar shows today (27 September) lit; October has no today.
 before = load("bus-calendar")
 after = load("bus-calendar-next")
-assert count(before, 728, 1016, 138, 318, accent) > 100, count(before, 728, 1016, 138, 318, accent)
-assert count(after, 728, 1016, 138, 318, accent) == 0 and near(after(740, 300), popup)
+assert count(before, 728, 1016, 148, 328, accent) > 100, count(before, 728, 1016, 148, 328, accent)
+assert count(after, 728, 1016, 148, 328, accent) == 0 and near(after(740, 300), popup)
 PY
     echo "ok   the top bar on a session bus: what plays, a tray icon with its menu, the volume, the battery and the calendar"
 }
