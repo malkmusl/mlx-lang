@@ -14,7 +14,12 @@ answer too.
 mlx4 projects/network/main.mlx -o mlx-netd
 mlx4 projects/network/tool.mlx -o mlx-net
 tools/check_network.sh                   # the end-to-end check
+tools/check_wifi.sh                      # Wi-Fi crypto and WPA2 handshakes
 ```
+
+`tools/check_wifi.sh` checks the Wi-Fi crypto (`std.sha1`, `std.aes`)
+against published vectors and the WPA2 handshakes (`wpa.mlx`) against an
+access point's side in python, over a veth link.
 
 `tools/check_network.sh` runs in network namespaces of its own
 (`unshare -rn`), so the machine's network is not touched: two veth links,
@@ -112,6 +117,7 @@ eth1      ethernet  connected   10.8.0.5/24         via 10.8.0.1        dns 10.8
 | `main.mlx` | the daemon: options, the poll loop, signals |
 | `devices.mlx` | the links, their states, addresses, routes, `resolv.conf` |
 | `dhcp.mlx` | the DHCPv4 client of one link |
+| `wpa.mlx` | WPA2-Personal: the 4-way and group key handshakes (CCMP, PSK) |
 | `config.mlx` | `network.conf` |
 | `bus.mlx` | `org.mlx.Network` and the NetworkManager part |
 | `system.mlx` | sockets, poll, signals, files, addresses |
