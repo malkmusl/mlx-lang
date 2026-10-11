@@ -80,6 +80,14 @@ How the compiler itself works, normatively and concretely:
 - [`VULKAN.md`](VULKAN.md) — native Vulkan without a C loader, and the
   building blocks toward an Mlx Vulkan driver
 
+## Prompts
+
+Work orders for an outside assistant, to be pasted as they are:
+
+- [`prompts/login-and-init.md`](prompts/login-and-init.md) — finishing
+  the login (mlx-login, the greeter, the lock screen) and mlx-init (in
+  German)
+
 ## Keeping this documentation accurate
 
 A GitHub Actions workflow
