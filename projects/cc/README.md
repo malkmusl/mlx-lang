@@ -18,7 +18,8 @@ elsewhere.
     mlx-cc [-o OUT] [-E] [-I DIR] [-D NAME[=VALUE]] [-U NAME] [-lNAME] FILE.c...
 
 mlx-cc compiles whole programs: every `.c` file of the program is given
-at once, and the result is the executable (`-c` is refused). `-E` writes
+at once, each one a translation unit of its own (its own macros and
+scope), and the result is the executable (`-c` is refused). `-E` writes
 the preprocessed tokens instead. Options of other compilers that change
 nothing here (`-O2`, `-g`, `-Wall`, `-std=c11`, `-fPIC`, `-pthread` ...)
 are accepted silently. `-lm` adds `libm.so.6`, `-lNAME` `libNAME.so`;
@@ -96,3 +97,10 @@ against the output in `NAME.expected`, which gcc's build of the same
 program printed when the test was written: first on the system's C
 library, then on mlxlibc as loader and C library with no GNU code in the
 process.
+
+`tools/check_cc_projects.sh` builds real projects with it: zlib 1.3.1
+(its `test/example.c` passes, on glibc and on mlxlibc alone) and Lua
+5.4.7, whose official test suite (21 files in user mode: strings, math,
+coroutines, the garbage collector, errors, the debug library ...) passes
+as it does for gcc's build. The tarballs are downloaded, or taken from
+`--sources DIR`, and checked against their SHA-256 sums.

@@ -6,6 +6,7 @@ extern int shared;
 extern const char *message;
 int counter(void);
 int helper(int);
+void report(const char *);
 
 int a = 5;
 int *pa = &a;
@@ -51,5 +52,6 @@ int main(void) {
     printf("%d\n", helper(1));
     *pa = 6;
     printf("%d\n", a);
+    report("done");
     return 0;
 }

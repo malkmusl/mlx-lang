@@ -1,4 +1,9 @@
-/* The second file of globals.c's program. */
+/* The second file of globals.c's program. It includes what the first
+   file includes: each file starts with its own macros, so the headers'
+   guards do not hide them here. */
+#include <stdio.h>
+
+void report(const char *what) { printf("report: %s\n", what); }
 int shared = 41;
 const char *message = "from the other file";
 static int hidden = 1000;
