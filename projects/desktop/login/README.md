@@ -2,8 +2,9 @@
 
 The desktop's login service, in Mlx: the replacement for a display
 manager (SDDM, GDM) and for the part of systemd-logind that starts a
-user's session. It runs as root, owns `org.mlx.Login` on the MLXIPC
-system bus (`mlx-ipcd --system`), and the greeter (the compositor in
+user's session. It runs as root, owns `org.mlx.Login` and the compositor's
+small `org.freedesktop.login1` subset on the MLXIPC system bus
+(`mlx-ipcd --system`), and the greeter (the compositor in
 greeter mode, with `mlx-greeter`) asks it to log a person in. No PAM, no
 logind, no libc.
 
@@ -19,6 +20,10 @@ The default account-database paths are `/etc/passwd`, `/etc/shadow` and
 `/etc/group`; session runtime directories live below `/run/mlx/user`.
 The options exist so installers and checks can stage private databases;
 `--group FILE` and `--runtime-dir DIR` isolate the remaining session data.
+`--tty FILE` selects the VT control device (`/dev/tty0` by default; `none`
+is the explicit namespace-test backend). `--test-device-null` only adds
+`/dev/null` to the otherwise DRM/input-only device allowlist used by the
+namespace check.
 They do not remove the root requirement. The check re-executes itself as
 root inside a user namespace and passes private fixture paths explicitly,
 so `mlx-login` does not open the host's account databases.
@@ -63,9 +68,19 @@ A session's compositor gets the VT, the DRM card and the input devices
 the way it already asks for them: its logind client
 ([`projects/desktop/compositor/logind.mlx`](../compositor/logind.mlx))
 calls `org.freedesktop.login1` on the system bus for `TakeControl`,
-`TakeDevice` and VT switching. A fuller `mlx-login` answers that
-interface too; until then the session's compositor opens its VT directly,
-as it does now when no logind is present.
+`TakeDevice`, `ReleaseDevice`, `PauseDeviceComplete` and `SwitchTo`.
+`mlx-login` answers those calls for its one `seat0` session, passes
+character-device descriptors with `SCM_RIGHTS`, and sends `PauseDevice`
+before leaving the session VT. A small `VT_WAITACTIVE` child wakes the
+daemon when the kernel really returns to that VT; only then does it send
+`ResumeDevice` with fresh descriptors. Device requests are limited to
+Linux DRM and input majors. `TakeControl` is asynchronous and
+requires MLXIPC's `login.device` permission, which defaults only to
+`mlx-compositor`; a session generation prevents a delayed permission reply
+from crossing a logout/login boundary. `NameOwnerChanged` releases a
+controller that disconnected. A signalfd reaps both the VT watcher and the
+session without waiting for new bus traffic, releases the seat, and leaves
+it ready for a new greeter.
 
 ## Files
 
@@ -74,5 +89,6 @@ as it does now when no logind is present.
 | `main.mlx` | the daemon: the bus, authorization and the three methods |
 | `authentication.mlx` | bounded, fail-closed shadow parsing and password verification |
 | `groups.mlx` | the primary and supplementary groups for a session |
+| `login1.mlx` | one-seat compositor control, device descriptors and VT switching |
 | `session.mlx` | runtime directory, privilege drop, environment and exec |
 | `users.mlx` | the login accounts, read from the configured passwd file |

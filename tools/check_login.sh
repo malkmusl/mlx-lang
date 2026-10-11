@@ -43,6 +43,7 @@ trap cleanup EXIT
 
 "$compiler" --quiet projects/desktop/ipc/main.mlx -o "$work/mlx-ipcd"
 "$compiler" --quiet projects/desktop/login/main.mlx -o "$work/mlx-login"
+"$compiler" --quiet tools/login-test/logind-client.mlx -o "$work/login1-client"
 
 # Private fixtures prove that both file options are accepted and that the
 # account list never comes from the host.
@@ -70,12 +71,13 @@ chmod 600 "$work/shadow"
 cat > "$work/session.sh" <<SESSION
 #!/bin/sh
 {
+    printf 'pid=%s\n' "\$\$"
     printf 'uid=%s gid=%s groups=%s\n' "\$(id -u)" "\$(id -g)" "\$(id -G)"
     printf 'HOME=%s USER=%s LOGNAME=%s SHELL=%s\n' "\$HOME" "\$USER" "\$LOGNAME" "\$SHELL"
     printf 'XDG_RUNTIME_DIR=%s XDG_SESSION_TYPE=%s XDG_SEAT=%s XDG_VTNR=%s\n' "\$XDG_RUNTIME_DIR" "\$XDG_SESSION_TYPE" "\$XDG_SEAT" "\$XDG_VTNR"
 } > "$work/home/session.out"
 touch "$work/home/ready"
-sleep 4
+while [[ ! -e "$work/home/finish" ]]; do sleep 0.1; done
 SESSION
 chmod 755 "$work/session.sh"
 
@@ -87,7 +89,7 @@ bus_pid=$!
 for _ in $(seq 1 50); do [[ -S "$work/bus" ]] && break; sleep 0.1; done
 [[ -S "$work/bus" ]] || { echo "FAIL the system bus did not come up" >&2; cat "$work/bus.log" >&2; exit 1; }
 
-"$work/mlx-login" --verbose --passwd "$work/passwd" --shadow "$work/shadow" --group "$work/group" --runtime-dir "$work/runtime" > "$work/login.log" 2>&1 &
+"$work/mlx-login" --verbose --passwd "$work/passwd" --shadow "$work/shadow" --group "$work/group" --runtime-dir "$work/runtime" --tty none --test-device-null > "$work/login.log" 2>&1 &
 login_pid=$!
 # Wait until it owns the name.
 owned=""
@@ -126,7 +128,7 @@ login_out=$(login_call mlx-test test-password)
 grep -q "org.freedesktop.DBus.Error.AccessDenied" <<< "$login_out" || { echo "FAIL Login handled a password without login.session:" >&2; echo "$login_out" >&2; exit 1; }
 echo "ok   Login requires login.session before checking a password"
 
-printf 'allow gdbus use login.session\n' > "$work/none.conf"
+printf 'allow gdbus use login.session\nallow login1-client use login.device\n' > "$work/none.conf"
 sleep 0.3
 
 login_out=$(login_call mlx-missing test-password)
@@ -170,6 +172,31 @@ grep -q "XDG_RUNTIME_DIR=$work/runtime/1000 XDG_SESSION_TYPE=wayland XDG_SEAT=se
 [[ $(stat -c '%u:%g:%a' "$work/runtime/1000") == 1000:1000:700 ]] || { echo "FAIL the runtime directory has wrong ownership or mode" >&2; stat -c '%u:%g:%a' "$work/runtime/1000" >&2; exit 1; }
 echo "ok   Login starts a uid/gid-dropped session with groups, environment and private runtime directory"
 
+login1_owned=$(gdbus call --address "$address" --dest org.freedesktop.DBus --object-path /org/freedesktop/DBus \
+    --method org.freedesktop.DBus.NameHasOwner org.freedesktop.login1 2>&1)
+grep -q true <<< "$login1_owned" || { echo "FAIL mlx-login did not own org.freedesktop.login1" >&2; cat "$work/login.log" >&2; exit 1; }
+session_pid=$(sed -n 's/^pid=//p' "$work/home/session.out")
+session_path=$(gdbus call --address "$address" --dest org.freedesktop.login1 --object-path /org/freedesktop/login1 \
+    --method org.freedesktop.login1.Manager.GetSessionByPID "uint32 $session_pid" 2>&1 || true)
+grep -q '/org/freedesktop/login1/session/seat0' <<< "$session_path" || { echo "FAIL login1 did not resolve the active session" >&2; echo "$session_path" >&2; exit 1; }
+unauthorized_control=$(gdbus call --address "$address" --dest org.freedesktop.login1 --object-path /org/freedesktop/login1/session/seat0 \
+    --method org.freedesktop.login1.Session.TakeControl false 2>&1 || true)
+grep -q 'org.freedesktop.DBus.Error.AccessDenied' <<< "$unauthorized_control" || { echo "FAIL login1 granted device control without login.device" >&2; echo "$unauthorized_control" >&2; exit 1; }
+XDG_SESSION_ID=mlx XDG_SEAT=seat0 "$work/login1-client" abandon > "$work/login1-abandon.log" 2>&1 || {
+    echo "FAIL the first compositor could not take control" >&2
+    cat "$work/login1-abandon.log" >&2
+    exit 1
+}
+sleep 0.2
+XDG_SESSION_ID=mlx XDG_SEAT=seat0 "$work/login1-client" > "$work/login1-client.log" 2>&1 || {
+    echo "FAIL the compositor login1 client could not control the active session" >&2
+    cat "$work/login1-client.log" >&2
+    cat "$work/login.log" >&2
+    exit 1
+}
+grep -q 'login1 client passed' "$work/login1-client.log" || { echo "FAIL the login1 client did not finish" >&2; cat "$work/login1-client.log" >&2; exit 1; }
+echo "ok   login1 replaces a disconnected controller and provides devices, pause/resume and VT switching"
+
 unlock_out=$(gdbus call --address "$address" --dest org.mlx.Login --object-path /org/mlx/Login \
     --method org.mlx.Login.Unlock mlx-test test-password 2>&1 || true)
 grep -q "(true,)" <<< "$unlock_out" || { echo "FAIL Unlock refused the active user's password:" >&2; echo "$unlock_out" >&2; exit 1; }
@@ -180,7 +207,14 @@ unlock_out=$(gdbus call --address "$address" --dest org.mlx.Login --object-path 
 grep -q "(false,)" <<< "$unlock_out" || { echo "FAIL Unlock accepted a wrong password:" >&2; echo "$unlock_out" >&2; exit 1; }
 echo "ok   Unlock refuses a wrong password"
 
-sleep 3
+# No bus request wakes the daemon here. SIGCHLD itself must reap the
+# child and release the seat, or a greeter could never be restarted.
+touch "$work/home/finish"
+for _ in $(seq 1 70); do
+    grep -q 'session ended; the seat is free' "$work/login.log" && break
+    sleep 0.1
+done
+grep -q 'session ended; the seat is free' "$work/login.log" || { echo "FAIL SIGCHLD did not release the seat without bus traffic" >&2; cat "$work/login.log" >&2; exit 1; }
 unlock_out=$(gdbus call --address "$address" --dest org.mlx.Login --object-path /org/mlx/Login \
     --method org.mlx.Login.Unlock mlx-test test-password 2>&1 || true)
 grep -q "(false,)" <<< "$unlock_out" || { echo "FAIL the seat stayed occupied after the session ended:" >&2; echo "$unlock_out" >&2; exit 1; }

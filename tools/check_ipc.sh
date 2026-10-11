@@ -94,11 +94,14 @@ if command -v dbus-monitor > /dev/null; then
 fi
 
 # Starting or unlocking a login session is denied to ordinary apps by
-# default. A system policy may name another trusted greeter explicitly.
+# default, as is obtaining seat devices. A system policy may name other
+# trusted components explicitly.
 expect "login.session is denied by default" "(false,)" gdbus call --session --dest org.freedesktop.DBus --object-path /org/mlx/IPC --method org.mlx.IPC.CheckProcess "$$" login.session
-printf 'allow bash use login.session\n' > "$XDG_CONFIG_HOME/mlx/ipc.conf"
+expect "login.device is denied by default" "(false,)" gdbus call --session --dest org.freedesktop.DBus --object-path /org/mlx/IPC --method org.mlx.IPC.CheckProcess "$$" login.device
+printf 'allow bash use login.session\nallow bash use login.device\n' > "$XDG_CONFIG_HOME/mlx/ipc.conf"
 sleep 0.3
 expect "login.session can be delegated explicitly" "(true,)" gdbus call --session --dest org.freedesktop.DBus --object-path /org/mlx/IPC --method org.mlx.IPC.CheckProcess "$$" login.session
+expect "login.device can be delegated explicitly" "(true,)" gdbus call --session --dest org.freedesktop.DBus --object-path /org/mlx/IPC --method org.mlx.IPC.CheckProcess "$$" login.device
 : > "$XDG_CONFIG_HOME/mlx/ipc.conf"
 sleep 0.3
 
