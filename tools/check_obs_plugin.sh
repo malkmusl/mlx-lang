@@ -5,7 +5,11 @@
 # only source is "MLX Capture" on the screen, and records. The plugin must
 # load, connect to the compositor and hand OBS frames; the recording must
 # grow, and OBS's preview (in the host's screenshot) must show the screen,
-# OBS's own window included.
+# OBS's own window included. While it records, the source is switched to
+# mlx-settings' window and back twice, as in its properties
+# (tools/obs-test/control.py over obs-websocket): each target must hand
+# OBS frames, and OBS must never be handed an empty frame (it says
+# "Allocating 0 bytes"; newer versions end on it).
 #
 #   tools/check_obs_plugin.sh [compiler]
 #
@@ -38,6 +42,12 @@ cp "$work/mlx-capture.so" "$config/obs-studio/plugins/mlx-capture/bin/64bit/"
 cat > "$config/obs-studio/global.ini" <<INI
 [General]
 FirstRun=true
+[OBSWebSocket]
+FirstLoad=false
+ServerEnabled=true
+ServerPort=4466
+AlertsEnabled=false
+AuthRequired=false
 [Basic]
 Profile=mlx
 ProfileDir=mlx
@@ -74,6 +84,12 @@ export QT_QPA_PLATFORM=wayland
 exec obs --multi --disable-shutdown-check --disable-missing-files-check --collection mlx --profile mlx --scene Main --startrecording > "$work/obs.log" 2>&1
 SCRIPT
 chmod +x "$work/obs.sh"
+cat > "$work/switch.sh" <<SCRIPT
+#!/bin/sh
+sleep 12
+python3 "$repo_root/tools/obs-test/control.py" 4466 "MLX Screen" org.mlx.settings "" org.mlx.settings "" > "$work/control.log" 2>&1
+SCRIPT
+chmod +x "$work/switch.sh"
 cat > "$work/obs.script" <<SCRIPT
 wait 25000
 shot $work/obs.ppm
@@ -83,7 +99,7 @@ SCRIPT
 "$work/test-host" host-obs "$work/us.xkb" "$work/obs.script" > "$work/host.log" 2>&1 &
 host_pid=$!
 for _ in $(seq 1 50); do [[ -S "$XDG_RUNTIME_DIR/host-obs" ]] && break; sleep 0.1; done
-WAYLAND_DISPLAY=host-obs XDG_CONFIG_HOME="$work/config" timeout 90 "$work/mlx-compositor" --verbose --renderer cpu --socket nested-obs --no-fps --launcher none --dock none --topbar none --xwayland none --size 1600x1000 --run "$work/mlx-settings" --run "$work/obs.sh" > "$work/compositor.log" 2>&1 || true
+WAYLAND_DISPLAY=host-obs XDG_CONFIG_HOME="$work/config" timeout 90 "$work/mlx-compositor" --verbose --renderer cpu --socket nested-obs --no-fps --launcher none --dock none --topbar none --xwayland none --size 1600x1000 --run "$work/mlx-settings" --run "$work/obs.sh" --run "$work/switch.sh" > "$work/compositor.log" 2>&1 || true
 wait "$host_pid" || { echo "test host failed:" >&2; cat "$work/host.log" >&2; exit 1; }
 
 log=$(ls "$config"/obs-studio/logs/*.txt 2> /dev/null | head -1)
@@ -91,6 +107,10 @@ log=$(ls "$config"/obs-studio/logs/*.txt 2> /dev/null | head -1)
 for line in "\[mlx-capture\] loaded" "\[mlx-capture\] connected to the compositor" "\[mlx-capture\] first frame handed to OBS" "Recording Start"; do
     grep -q "$line" "$log" || { echo "OBS's log lacks \"$line\"" >&2; cat "$log" >&2; exit 1; }
 done
+[[ $(grep -c "^target .*: ok; list .*'org.mlx.settings'" "$work/control.log" 2> /dev/null) -eq 4 ]] || { echo "the source was not switched between the screen and the window" >&2; cat "$work/control.log" "$log" >&2; exit 1; }
+[[ $(grep -c "\[mlx-capture\] capturing the window org.mlx.settings" "$log") -eq 2 && $(grep -c "\[mlx-capture\] capturing the screen" "$log") -eq 3 ]] || { echo "the plugin did not start over on each target" >&2; cat "$log" >&2; exit 1; }
+[[ $(grep -c "\[mlx-capture\] first frame handed to OBS" "$log") -eq 5 ]] || { echo "not every target handed OBS frames" >&2; cat "$log" >&2; exit 1; }
+! grep -q "Allocating 0 bytes" "$log" || { echo "the plugin handed OBS an empty frame" >&2; cat "$log" >&2; exit 1; }
 recording=$(ls "$work"/obs/recordings/*.mkv 2> /dev/null | head -1)
 [[ -n "$recording" && $(stat -c %s "$recording") -gt 100000 ]] || { echo "OBS recorded nothing" >&2; ls -la "$work/obs/recordings" >&2; exit 1; }
 python3 - "$work/obs.ppm" <<'PY'
@@ -107,4 +127,4 @@ def at(x, y):
 blue = sum(1 for y in range(100, 500, 2) for x in range(300, 1000, 2) if at(x, y)[2] > 200 and at(x, y)[0] < 140)
 assert blue > 200, blue
 PY
-echo "ok   OBS loads mlx-capture's plugin, records the screen through it, and previews it"
+echo "ok   OBS loads mlx-capture's plugin, records the screen through it, previews it, and switches to a window and back while recording"

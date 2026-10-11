@@ -1309,7 +1309,13 @@ their own, on whichever of OBS's threads calls them. It calls libobs
 (`obs_register_source_s`, `obs_source_output_video`, ...) as `extern("c")`
 functions. The source is asynchronous: its connection lives on OBS's video
 thread, polled every frame without waiting, and each frame the compositor
-hands over (only when something changed) goes to OBS, which copies it. The
+hands over (only when something changed) goes to OBS, which copies it, at
+the size of the buffer it was copied into. Choosing another target starts
+over (OBS's log says `[mlx-capture] capturing the window APP_ID` or
+`capturing the screen`); a frame of the old target that came meanwhile
+goes with its buffers, so OBS is never handed one from freed memory or an
+empty one (OBS 30 warns "Allocating 0 bytes", newer versions end on it:
+picking a window in the properties crashed OBS). The
 installer puts it in `~/.config/obs-studio/plugins/mlx-capture/bin/64bit/`;
 by hand:
 
@@ -1320,8 +1326,10 @@ cp mlx-capture.so ~/.config/obs-studio/plugins/mlx-capture/bin/64bit/
 ```
 
 `tools/check_obs_plugin.sh` runs OBS (as a Wayland client of the nested
-compositor) with a scene of only that source, records, and checks the log,
-the recording and OBS's preview.
+compositor) with a scene of only that source, records, switches the
+source to a window and back twice while it records (obs-websocket,
+`tools/obs-test/control.py`), and checks the log, the recording and OBS's
+preview.
 
 ### Screen sharing (browsers, Discord, OBS)
 
