@@ -43,8 +43,10 @@ encoder and the ELF writer of the Mlx compiler
 linker are needed. Programs it builds link against `libc.so.6`, which
 is mlxlibc on our system and glibc elsewhere.
 
-State: steps 1 and 2 are done (`tools/check_cc.sh`); of step 4, zlib
-and Lua build and pass their own tests (`tools/check_cc_projects.sh`).
+State: steps 1 and 2 are done (`tools/check_cc.sh`); of step 3,
+`--dynamic-linker` (a program starts on mlxlibc by itself); of step 4,
+zlib and Lua build and pass their own tests
+(`tools/check_cc_projects.sh`).
 The gaps left are listed in `projects/cc/README.md`.
 
 1. **C subset, whole programs.** (done) The preprocessor (`#include`,

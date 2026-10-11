@@ -11,7 +11,8 @@
 #     the program gcc made of it did when the file was written;
 #   - the same programs run under mlxlibc as their dynamic loader and C
 #     library (`libmlxc.so.1 PROGRAM`, an empty environment): no GNU code
-#     between the C source and the running process.
+#     between the C source and the running process; and one built with
+#     --dynamic-linker naming mlxlibc starts on it by itself.
 #
 #   tools/check_cc.sh [compiler]
 set -euo pipefail
@@ -63,4 +64,12 @@ for name in "${programs[@]}"; do
     cmp -s "$tests/$name.expected" "$work/$name.mlxlibc" || fail "$name on mlxlibc prints otherwise (expected < > got): $(diff "$tests/$name.expected" "$work/$name.mlxlibc" | head -12)"
 done
 echo "ok   the ${#programs[@]} programs run alike on mlxlibc as loader and C library"
+
+# A program that names mlxlibc as its interpreter starts on it by itself.
+"$cc" --dynamic-linker "$lib" -o "$work/own" "$tests/libc.c" 2> "$work/own.cc" || fail "--dynamic-linker: $(head -3 "$work/own.cc")"
+status=0
+(cd "$work/run" && env -i timeout 20 "$work/own" arg > "$work/own.out" 2>&1) || status=$?
+echo "exit $status" >> "$work/own.out"
+cmp -s "$tests/libc.expected" "$work/own.out" || fail "the program with mlxlibc as interpreter prints otherwise: $(diff "$tests/libc.expected" "$work/own.out" | head -8)"
+echo "ok   --dynamic-linker: a program naming libmlxc.so.1 as its interpreter runs on its own"
 echo "check_cc.sh: all checks passed"

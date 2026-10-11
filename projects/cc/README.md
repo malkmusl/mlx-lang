@@ -14,8 +14,10 @@ elsewhere.
     MLX_CC_INCLUDE=projects/cc/include ./mlx-cc -o hello hello.c
     ./hello                                   # on the system's loader
     mlx-out/libc/libmlxc.so.1 ./hello         # on mlxlibc alone
+    ./mlx-cc --dynamic-linker /usr/lib/libmlxc.so.1 -o hello hello.c
 
-    mlx-cc [-o OUT] [-E] [-I DIR] [-D NAME[=VALUE]] [-U NAME] [-lNAME] FILE.c...
+    mlx-cc [-o OUT] [-E] [-I DIR] [-D NAME[=VALUE]] [-U NAME] [-lNAME]
+           [--dynamic-linker PATH] FILE.c...
 
 mlx-cc compiles whole programs: every `.c` file of the program is given
 at once, each one a translation unit of its own (its own macros and
@@ -23,7 +25,11 @@ scope), and the result is the executable (`-c` is refused). `-E` writes
 the preprocessed tokens instead. Options of other compilers that change
 nothing here (`-O2`, `-g`, `-Wall`, `-std=c11`, `-fPIC`, `-pthread` ...)
 are accepted silently. `-lm` adds `libm.so.6`, `-lNAME` `libNAME.so`;
-`-lpthread`, `-ldl` and `-lrt` are part of the C library.
+`-lpthread`, `-ldl` and `-lrt` are part of the C library. A program
+names the system's loader (`/lib64/ld-linux-x86-64.so.2`) as its
+interpreter; `--dynamic-linker PATH` (also `-Wl,--dynamic-linker=PATH`)
+names another, such as mlxlibc's `libmlxc.so.1`, so it starts on that
+alone.
 
 ## Headers
 
@@ -83,9 +89,6 @@ static locals, tentative definitions, several files per program.
   `goto`.
 - `va_arg` of a struct of 16 bytes or less reads it from the stack, where
   only larger ones are.
-- The programs name `/lib64/ld-linux-x86-64.so.2` as their interpreter
-  (the ELF writer's); on mlxlibc alone they are started through
-  `libmlxc.so.1 PROGRAM` until mlx-cc can name mlxlibc itself.
 - No optimization: the code is correct and slow.
 
 ## Check
