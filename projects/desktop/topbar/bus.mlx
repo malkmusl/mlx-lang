@@ -1,0 +1,516 @@
+// The bar on the session bus (std.dbus, MLXIPC or any D-Bus bus), without
+// waiting: calls go out and their replies come back, with the signals and
+// the calls made to the bar, when the connection is readable (the panel
+// watches it: watches[0]). Each call is remembered with what it was for
+// (PURPOSE_*) until its reply comes.
+//
+// On the bus the bar finds the MPRIS players (org.mpris.MediaPlayer2.*,
+// media.mlx), hears when MLX Audio comes and goes (org.mlx.Audio,
+// sound.mlx), and is the StatusNotifierWatcher (org.kde.StatusNotifierWatcher
+// on /StatusNotifierWatcher) that apps register their tray icons with
+// (tray.mlx); when another program already is, the bar is a host of that
+// one's items. With no bus it tries again every BUS_RETRY milliseconds.
+const std = @import("std")
+const dbus = @import("std.dbus")
+const state = @import("./state.mlx")
+const media = @import("./media.mlx")
+const tray = @import("./tray.mlx")
+const sound = @import("./sound.mlx")
+
+const Bar = state.Bar
+
+pub const PURPOSE_IGNORE: u32 = 0
+pub const PURPOSE_LIST_NAMES: u32 = 1
+pub const PURPOSE_PLAYER_OWNER: u32 = 2
+pub const PURPOSE_PLAYER_PROPERTIES: u32 = 3
+pub const PURPOSE_PLAYER_IDENTITY: u32 = 4
+pub const PURPOSE_PLAYER_POSITION: u32 = 5
+pub const PURPOSE_WATCHER_NAME: u32 = 6
+pub const PURPOSE_WATCHER_ITEMS: u32 = 7
+pub const PURPOSE_ITEM_OWNER: u32 = 8
+pub const PURPOSE_ITEM_PROPERTIES: u32 = 9
+pub const PURPOSE_MENU_LAYOUT: u32 = 10
+pub const PURPOSE_AUDIO_OWNER: u32 = 11
+
+const BUS: []const u8 = "org.freedesktop.DBus"
+const BUS_PATH: []const u8 = "/org/freedesktop/DBus"
+pub const WATCHER: []const u8 = "org.kde.StatusNotifierWatcher"
+pub const WATCHER_PATH: []const u8 = "/StatusNotifierWatcher"
+const PROPERTIES: []const u8 = "org.freedesktop.DBus.Properties"
+const BUS_RETRY: usize = 10000
+// The panel's watch for the connection (EVENT_WATCH's a is this).
+pub const WATCH: u32 = 1
+
+const INTROSPECTION: []const u8 = "<!DOCTYPE node PUBLIC \"-//freedesktop//DTD D-BUS Object Introspection 1.0//EN\" \"http://www.freedesktop.org/standards/dbus/1.0/introspect.dtd\">\n<node>\n <interface name=\"org.kde.StatusNotifierWatcher\">\n  <method name=\"RegisterStatusNotifierItem\"><arg name=\"service\" type=\"s\" direction=\"in\"/></method>\n  <method name=\"RegisterStatusNotifierHost\"><arg name=\"service\" type=\"s\" direction=\"in\"/></method>\n  <property name=\"RegisteredStatusNotifierItems\" type=\"as\" access=\"read\"/>\n  <property name=\"IsStatusNotifierHostRegistered\" type=\"b\" access=\"read\"/>\n  <property name=\"ProtocolVersion\" type=\"i\" access=\"read\"/>\n  <signal name=\"StatusNotifierItemRegistered\"><arg type=\"s\"/></signal>\n  <signal name=\"StatusNotifierItemUnregistered\"><arg type=\"s\"/></signal>\n  <signal name=\"StatusNotifierHostRegistered\"/>\n  <signal name=\"StatusNotifierHostUnregistered\"/>\n </interface>\n <interface name=\"org.freedesktop.DBus.Properties\">\n  <method name=\"Get\"><arg type=\"s\" direction=\"in\"/><arg type=\"s\" direction=\"in\"/><arg type=\"v\" direction=\"out\"/></method>\n  <method name=\"GetAll\"><arg type=\"s\" direction=\"in\"/><arg type=\"a{sv}\" direction=\"out\"/></method>\n </interface>\n <interface name=\"org.freedesktop.DBus.Introspectable\">\n  <method name=\"Introspect\"><arg type=\"s\" direction=\"out\"/></method>\n </interface>\n</node>\n"
+
+// ---------------------------------------------------------------------------
+// Reading values
+
+pub fn readerOf(bar: *Bar, header: *const dbus.Header) -> dbus.Reader {
+    return dbus.reader(dbus.bodyOf(state.clientOf(bar), header), header.*.bodyLength, header.*.big)
+}
+
+pub fn readU64(reading: *dbus.Reader) -> u64 {
+    dbus.alignTo(reading, 8)
+    const first = @intCast(u64, dbus.readU32(reading))
+    const second = @intCast(u64, dbus.readU32(reading))
+    return if reading.*.big { (first << 32) | second } else { (second << 32) | first }
+}
+
+// A value of type `signature` when it is a string or an object path (else
+// skipped: empty).
+pub fn valueString(reading: *dbus.Reader, signature: []const u8) -> []const u8 {
+    if state.same(signature, "s") || state.same(signature, "o") { return dbus.readString(reading) }
+    const skipped = dbus.skipValue(reading, signature, 0, 0)
+    return signature[0..0]
+}
+
+pub fn valueBool(reading: *dbus.Reader, signature: []const u8) -> bool {
+    if state.same(signature, "b") { return dbus.readBool(reading) }
+    const skipped = dbus.skipValue(reading, signature, 0, 0)
+    return false
+}
+
+// A number of any integer type (0 for others).
+pub fn valueNumber(reading: *dbus.Reader, signature: []const u8) -> i64 {
+    if state.same(signature, "x") || state.same(signature, "t") { return @bitCast(i64, readU64(reading)) }
+    if state.same(signature, "i") { return @intCast(i64, @bitCast(i32, dbus.readU32(reading))) }
+    if state.same(signature, "u") { return @intCast(i64, dbus.readU32(reading)) }
+    if state.same(signature, "y") { return @intCast(i64, dbus.readByte(reading)) }
+    const skipped = dbus.skipValue(reading, signature, 0, 0)
+    return 0
+}
+
+pub fn variantString(reading: *dbus.Reader) -> []const u8 { return valueString(reading, dbus.readSignature(reading)) }
+
+// Enters an array (its length, then its first element aligned to
+// `alignment`): where it ends.
+pub fn arrayEnd(reading: *dbus.Reader, alignment: usize) -> usize {
+    const length = @intCast(usize, dbus.readU32(reading))
+    dbus.alignTo(reading, alignment)
+    return reading.*.position + length
+}
+
+// ---------------------------------------------------------------------------
+// Sending
+
+fn client(bar: *Bar) -> *dbus.Client { return state.clientOf(bar) }
+
+// Remembers that the reply to `serial` is for `purpose` (about `slot`).
+fn expect(bar: *Bar, serial: u32, purpose: u32, slot: usize) -> void {
+    if serial == 0 || purpose == PURPOSE_IGNORE { return }
+    var index: usize = 0
+    while index < state.MAX_PENDING {
+        const pending = state.pendingAt(bar, index)
+        if pending.*.serial == 0 {
+            pending.*.serial = serial
+            pending.*.purpose = purpose
+            pending.*.slot = slot
+            return
+        }
+        index += 1
+    }
+}
+
+// A call with `length` bytes of body of `signature`, its reply for
+// `purpose`.
+pub fn call(bar: *Bar, destination: []const u8, path: []const u8, interface: []const u8, member: []const u8, signature: []const u8, body: [*]const u8, length: usize, purpose: u32, slot: usize) -> void {
+    if !bar.*.busUp { return }
+    const serial = dbus.call(client(bar), destination, path, interface, member, signature, body, length)
+    expect(bar, serial, purpose, slot)
+}
+
+// A call taking one string.
+pub fn callString(bar: *Bar, destination: []const u8, path: []const u8, interface: []const u8, member: []const u8, argument: []const u8, purpose: u32, slot: usize) -> void {
+    var body: [512]u8 = undefined
+    var bytes: [*]u8 = undefined
+    unsafe { bytes = @ptrCast([*]u8, &body) }
+    var writing: dbus.Writer = undefined
+    dbus.begin(&writing, bytes, 512, false)
+    dbus.putString(&writing, argument)
+    if writing.failed { return }
+    call(bar, destination, path, interface, member, "s", bytes, writing.length, purpose, slot)
+}
+
+// A call taking nothing.
+pub fn callEmpty(bar: *Bar, destination: []const u8, path: []const u8, interface: []const u8, member: []const u8, purpose: u32, slot: usize) -> void {
+    var nothing: [8]u8 = undefined
+    var bytes: [*]u8 = undefined
+    unsafe { bytes = @ptrCast([*]u8, &nothing) }
+    call(bar, destination, path, interface, member, "", bytes, 0, purpose, slot)
+}
+
+// org.freedesktop.DBus.Properties.Get(interface, property).
+pub fn getProperty(bar: *Bar, destination: []const u8, path: []const u8, interface: []const u8, property: []const u8, purpose: u32, slot: usize) -> void {
+    var body: [512]u8 = undefined
+    var bytes: [*]u8 = undefined
+    unsafe { bytes = @ptrCast([*]u8, &body) }
+    var writing: dbus.Writer = undefined
+    dbus.begin(&writing, bytes, 512, false)
+    dbus.putString(&writing, interface)
+    dbus.putString(&writing, property)
+    if writing.failed { return }
+    call(bar, destination, path, PROPERTIES, "Get", "ss", bytes, writing.length, purpose, slot)
+}
+
+pub fn getAll(bar: *Bar, destination: []const u8, path: []const u8, interface: []const u8, purpose: u32, slot: usize) -> void {
+    callString(bar, destination, path, PROPERTIES, "GetAll", interface, purpose, slot)
+}
+
+fn addMatch(bar: *Bar, rule: []const u8) -> void { callString(bar, BUS, BUS_PATH, BUS, "AddMatch", rule, PURPOSE_IGNORE, 0) }
+
+// The replies to `serial` (and anything for `slot` of `purpose`) are not
+// wanted any more: a player or an item went.
+pub fn forget(bar: *Bar, purpose: u32, slot: usize) -> void {
+    var index: usize = 0
+    while index < state.MAX_PENDING {
+        const pending = state.pendingAt(bar, index)
+        if pending.*.serial != 0 && pending.*.slot == slot && (pending.*.purpose == purpose || purpose == PURPOSE_IGNORE) { pending.*.serial = 0 }
+        index += 1
+    }
+}
+
+// A signal from the watcher (one string, or none).
+fn emit(bar: *Bar, member: []const u8, argument: []const u8, with_argument: bool) -> void {
+    if !bar.*.busUp { return }
+    var header = dbus.newHeader(dbus.SIGNAL, 0)
+    header.path = WATCHER_PATH
+    header.interface = WATCHER
+    header.member = member
+    var body: [512]u8 = undefined
+    var bytes: [*]u8 = undefined
+    unsafe { bytes = @ptrCast([*]u8, &body) }
+    var writing: dbus.Writer = undefined
+    dbus.begin(&writing, bytes, 512, false)
+    if with_argument {
+        header.signature = "s"
+        dbus.putString(&writing, argument)
+    }
+    var nothing: [1]isize = [1]isize{ 0 }
+    unsafe { const serial = dbus.send(client(bar), &header, bytes, writing.length, @ptrCast([*]const isize, &nothing), 0) }
+}
+
+pub fn itemRegistered(bar: *Bar, service: []const u8) -> void {
+    if bar.*.watcherOurs { emit(bar, "StatusNotifierItemRegistered", service, true) }
+}
+
+pub fn itemUnregistered(bar: *Bar, service: []const u8) -> void {
+    if bar.*.watcherOurs { emit(bar, "StatusNotifierItemUnregistered", service, true) }
+}
+
+// ---------------------------------------------------------------------------
+// Connecting
+
+// Connects when there is no connection and the last try is long enough
+// ago (on the bar's ticks).
+pub fn tick(bar: *Bar) -> void {
+    if bar.*.busUp { return }
+    const now = state.milliseconds()
+    if bar.*.busTried != 0 && now - bar.*.busTried < BUS_RETRY { return }
+    bar.*.busTried = now
+    connect(bar)
+}
+
+fn connect(bar: *Bar) -> void {
+    if !dbus.connectSession(client(bar), bar.*.allocator, bar.*.environment) { return }
+    bar.*.busUp = true
+    var index: usize = 0
+    while index < state.MAX_PENDING {
+        state.pendingAt(bar, index).*.serial = 0
+        index += 1
+    }
+    state.panelOf(bar).*.watches[0] = dbus.descriptorOfClient(client(bar))
+    state.say(bar, "topbar: on the session bus\n")
+    addMatch(bar, "type='signal',sender='org.freedesktop.DBus',interface='org.freedesktop.DBus',member='NameOwnerChanged'")
+    addMatch(bar, "type='signal',interface='org.freedesktop.DBus.Properties',member='PropertiesChanged',path='/org/mpris/MediaPlayer2'")
+    addMatch(bar, "type='signal',interface='org.mpris.MediaPlayer2.Player',member='Seeked'")
+    addMatch(bar, "type='signal',interface='org.kde.StatusNotifierItem'")
+    addMatch(bar, "type='signal',interface='org.kde.StatusNotifierWatcher'")
+    callEmpty(bar, BUS, BUS_PATH, BUS, "ListNames", PURPOSE_LIST_NAMES, 0)
+    callString(bar, BUS, BUS_PATH, BUS, "NameHasOwner", "org.mlx.Audio", PURPOSE_AUDIO_OWNER, 0)
+    // The watcher's name, unless someone has it (DO_NOT_QUEUE).
+    var body: [96]u8 = undefined
+    var bytes: [*]u8 = undefined
+    unsafe { bytes = @ptrCast([*]u8, &body) }
+    var writing: dbus.Writer = undefined
+    dbus.begin(&writing, bytes, 96, false)
+    dbus.putString(&writing, WATCHER)
+    dbus.putU32(&writing, 4)
+    call(bar, BUS, BUS_PATH, BUS, "RequestName", "su", bytes, writing.length, PURPOSE_WATCHER_NAME, 0)
+}
+
+// The bus went: what came from it goes too.
+fn lost(bar: *Bar) -> void {
+    bar.*.busUp = false
+    bar.*.watcherOurs = false
+    bar.*.hostRegistered = false
+    state.panelOf(bar).*.watches[0] = -1
+    dbus.disconnect(client(bar), bar.*.allocator)
+    media.clear(bar)
+    tray.clear(bar)
+    sound.ownerChanged(bar, false)
+    state.say(bar, "topbar: the session bus went\n")
+}
+
+// What came on the connection (the panel saw it readable).
+pub fn process(bar: *Bar) -> void {
+    if !bar.*.busUp { return }
+    var header: dbus.Header = undefined
+    while dbus.next(client(bar), &header, 0) {
+        if header.kind == dbus.METHOD_RETURN || header.kind == dbus.ERROR {
+            if header.hasReplySerial { replied(bar, &header) }
+        } else if header.kind == dbus.SIGNAL {
+            signal(bar, &header)
+        } else if header.kind == dbus.METHOD_CALL {
+            called(bar, &header)
+        }
+    }
+    if client(bar).*.closed { lost(bar) }
+}
+
+// ---------------------------------------------------------------------------
+// Replies
+
+fn replied(bar: *Bar, header: *const dbus.Header) -> void {
+    var index: usize = 0
+    while index < state.MAX_PENDING {
+        const pending = state.pendingAt(bar, index)
+        if pending.*.serial != 0 && pending.*.serial == header.*.replySerial {
+            const purpose = pending.*.purpose
+            const slot = pending.*.slot
+            pending.*.serial = 0
+            take(bar, purpose, slot, header)
+            return
+        }
+        index += 1
+    }
+}
+
+fn take(bar: *Bar, purpose: u32, slot: usize, header: *const dbus.Header) -> void {
+    const failed = header.*.kind == dbus.ERROR
+    var reading = readerOf(bar, header)
+    if purpose == PURPOSE_LIST_NAMES {
+        if failed { return }
+        const end = arrayEnd(&reading, 4)
+        while reading.position < end && !reading.failed {
+            const name = dbus.readString(&reading)
+            if state.startsWith(name, media.PREFIX) { media.appeared(bar, name, name[0..0]) }
+        }
+    } else if purpose == PURPOSE_AUDIO_OWNER {
+        if !failed { sound.ownerChanged(bar, dbus.readBool(&reading)) }
+    } else if purpose == PURPOSE_WATCHER_NAME {
+        // 1: ours (PRIMARY_OWNER), 4: already ours.
+        const answer = if failed { 0 } else { dbus.readU32(&reading) }
+        bar.*.watcherOurs = answer == 1 || answer == 4
+        if bar.*.watcherOurs {
+            state.say(bar, "topbar: the StatusNotifierWatcher\n")
+            bar.*.hostRegistered = true
+            emit(bar, "StatusNotifierHostRegistered", "", false)
+        } else {
+            // Another's: a host of its items.
+            state.say(bar, "topbar: a host of another StatusNotifierWatcher\n")
+            callString(bar, WATCHER, WATCHER_PATH, WATCHER, "RegisterStatusNotifierHost", dbus.uniqueName(client(bar)), PURPOSE_IGNORE, 0)
+            getProperty(bar, WATCHER, WATCHER_PATH, WATCHER, "RegisteredStatusNotifierItems", PURPOSE_WATCHER_ITEMS, 0)
+        }
+    } else if purpose == PURPOSE_WATCHER_ITEMS {
+        if failed { return }
+        const signature = dbus.readSignature(&reading)
+        if !state.same(signature, "as") { return }
+        const end = arrayEnd(&reading, 4)
+        while reading.position < end && !reading.failed {
+            const service = dbus.readString(&reading)
+            tray.registered(bar, service, service[0..0], false)
+        }
+    } else if purpose == PURPOSE_PLAYER_OWNER || purpose == PURPOSE_PLAYER_PROPERTIES || purpose == PURPOSE_PLAYER_IDENTITY || purpose == PURPOSE_PLAYER_POSITION {
+        if !failed { media.replied(bar, purpose, slot, &reading) }
+    } else if purpose == PURPOSE_ITEM_OWNER || purpose == PURPOSE_ITEM_PROPERTIES || purpose == PURPOSE_MENU_LAYOUT {
+        tray.replied(bar, purpose, slot, &reading, failed)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Signals
+
+fn signal(bar: *Bar, header: *const dbus.Header) -> void {
+    // Our own (the watcher's) come back too.
+    if state.same(header.*.sender, dbus.uniqueName(client(bar))) { return }
+    var reading = readerOf(bar, header)
+    const interface = header.*.interface
+    const member = header.*.member
+    if state.same(interface, BUS) && state.same(member, "NameOwnerChanged") {
+        const name = dbus.readString(&reading)
+        const old = dbus.readString(&reading)
+        const new = dbus.readString(&reading)
+        if reading.failed { return }
+        if state.startsWith(name, media.PREFIX) {
+            if new.length > 0 { media.appeared(bar, name, new) } else { media.vanished(bar, name) }
+        }
+        if state.same(name, "org.mlx.Audio") { sound.ownerChanged(bar, new.length > 0) }
+        if new.length == 0 && old.length > 0 { tray.vanished(bar, name) }
+        if state.same(name, WATCHER) && new.length == 0 && !bar.*.watcherOurs {
+            // The other watcher went: we take over (its items register again).
+            tray.clear(bar)
+            var body: [96]u8 = undefined
+            var bytes: [*]u8 = undefined
+            unsafe { bytes = @ptrCast([*]u8, &body) }
+            var writing: dbus.Writer = undefined
+            dbus.begin(&writing, bytes, 96, false)
+            dbus.putString(&writing, WATCHER)
+            dbus.putU32(&writing, 4)
+            call(bar, BUS, BUS_PATH, BUS, "RequestName", "su", bytes, writing.length, PURPOSE_WATCHER_NAME, 0)
+        }
+    } else if state.same(interface, PROPERTIES) && state.same(member, "PropertiesChanged") {
+        const changed = dbus.readString(&reading)
+        if state.same(changed, media.PLAYER) {
+            media.propertiesChanged(bar, header.*.sender, &reading)
+        } else if state.same(changed, tray.ITEM) {
+            tray.changed(bar, header.*.sender, header.*.path)
+        }
+    } else if state.same(interface, media.PLAYER) && state.same(member, "Seeked") {
+        media.seeked(bar, header.*.sender, @bitCast(i64, readU64(&reading)))
+    } else if state.same(interface, tray.ITEM) {
+        tray.changed(bar, header.*.sender, header.*.path)
+    } else if state.same(interface, WATCHER) && !bar.*.watcherOurs {
+        if state.same(member, "StatusNotifierItemRegistered") {
+            const service = dbus.readString(&reading)
+            if !reading.failed { tray.registered(bar, service, service[0..0], false) }
+        } else if state.same(member, "StatusNotifierItemUnregistered") {
+            const service = dbus.readString(&reading)
+            if !reading.failed { tray.unregistered(bar, service) }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Calls to the bar (the watcher's)
+
+fn replyEmpty(bar: *Bar, request: *const dbus.Header) -> void {
+    var nothing: [8]u8 = undefined
+    var bytes: [*]u8 = undefined
+    unsafe { bytes = @ptrCast([*]u8, &nothing) }
+    var descriptors: [1]isize = [1]isize{ 0 }
+    unsafe { const serial = dbus.reply(client(bar), request, "", bytes, 0, @ptrCast([*]const isize, &descriptors), 0) }
+}
+
+fn replyError(bar: *Bar, request: *const dbus.Header, name: []const u8, message: []const u8) -> void {
+    if request.*.flags & dbus.NO_REPLY_EXPECTED != 0 { return }
+    var header = dbus.newHeader(dbus.ERROR, 0)
+    header.replySerial = request.*.serial
+    header.hasReplySerial = true
+    header.destination = request.*.sender
+    header.errorName = name
+    header.signature = "s"
+    var body: [256]u8 = undefined
+    var bytes: [*]u8 = undefined
+    unsafe { bytes = @ptrCast([*]u8, &body) }
+    var writing: dbus.Writer = undefined
+    dbus.begin(&writing, bytes, 256, false)
+    dbus.putString(&writing, message)
+    var descriptors: [1]isize = [1]isize{ 0 }
+    unsafe { const serial = dbus.send(client(bar), &header, bytes, writing.length, @ptrCast([*]const isize, &descriptors), 0) }
+}
+
+// A property of the watcher's into `writing` as a variant; false when it
+// has none such.
+fn putWatcherProperty(bar: *Bar, writing: *dbus.Writer, name: []const u8) -> bool {
+    if state.same(name, "RegisteredStatusNotifierItems") {
+        dbus.putSignature(writing, "as")
+        const at = dbus.beginArray(writing, 4)
+        var index: usize = 0
+        while index < state.MAX_ITEMS {
+            const item = state.itemAt(bar, index)
+            if item.*.used { dbus.putString(writing, state.labelText(&item.*.service)) }
+            index += 1
+        }
+        dbus.endArray(writing, at, 4)
+        return true
+    }
+    if state.same(name, "IsStatusNotifierHostRegistered") {
+        dbus.putSignature(writing, "b")
+        dbus.putBool(writing, bar.*.hostRegistered)
+        return true
+    }
+    if state.same(name, "ProtocolVersion") {
+        dbus.putSignature(writing, "i")
+        dbus.putU32(writing, 0)
+        return true
+    }
+    return false
+}
+
+// A dictionary entry {sv} of a watcher's property.
+fn putEntry(bar: *Bar, writing: *dbus.Writer, name: []const u8) -> void {
+    dbus.pad(writing, 8)
+    dbus.putString(writing, name)
+    const put = putWatcherProperty(bar, writing, name)
+}
+
+fn called(bar: *Bar, request: *const dbus.Header) -> void {
+    var reading = readerOf(bar, request)
+    const interface = request.*.interface
+    const member = request.*.member
+    var descriptors: [1]isize = [1]isize{ 0 }
+    if state.same(interface, "org.freedesktop.DBus.Introspectable") && state.same(member, "Introspect") {
+        var body: [2048]u8 = undefined
+        var bytes: [*]u8 = undefined
+        unsafe { bytes = @ptrCast([*]u8, &body) }
+        var writing: dbus.Writer = undefined
+        dbus.begin(&writing, bytes, 2048, false)
+        dbus.putString(&writing, if state.same(request.*.path, WATCHER_PATH) { INTROSPECTION } else { "<node/>" })
+        unsafe { const serial = dbus.reply(client(bar), request, "s", bytes, writing.length, @ptrCast([*]const isize, &descriptors), 0) }
+        return
+    }
+    if state.same(interface, "org.freedesktop.DBus.Peer") && state.same(member, "Ping") {
+        replyEmpty(bar, request)
+        return
+    }
+    if !bar.*.watcherOurs || !state.same(request.*.path, WATCHER_PATH) {
+        replyError(bar, request, "org.freedesktop.DBus.Error.UnknownObject", "No such object")
+        return
+    }
+    if state.same(member, "RegisterStatusNotifierItem") {
+        const service = dbus.readString(&reading)
+        if reading.failed || service.length == 0 {
+            replyError(bar, request, "org.freedesktop.DBus.Error.InvalidArgs", "RegisterStatusNotifierItem takes (s)")
+            return
+        }
+        replyEmpty(bar, request)
+        tray.registered(bar, service, request.*.sender, true)
+        return
+    }
+    if state.same(member, "RegisterStatusNotifierHost") {
+        replyEmpty(bar, request)
+        if !bar.*.hostRegistered {
+            bar.*.hostRegistered = true
+            emit(bar, "StatusNotifierHostRegistered", "", false)
+        }
+        return
+    }
+    if state.same(interface, PROPERTIES) && (state.same(member, "Get") || state.same(member, "GetAll")) {
+        const asked_interface = dbus.readString(&reading)
+        var body: [4096]u8 = undefined
+        var bytes: [*]u8 = undefined
+        unsafe { bytes = @ptrCast([*]u8, &body) }
+        var writing: dbus.Writer = undefined
+        dbus.begin(&writing, bytes, 4096, false)
+        if state.same(member, "Get") {
+            const property = dbus.readString(&reading)
+            if reading.failed || !state.same(asked_interface, WATCHER) || !putWatcherProperty(bar, &writing, property) {
+                replyError(bar, request, "org.freedesktop.DBus.Error.UnknownProperty", "No such property")
+                return
+            }
+            unsafe { const serial = dbus.reply(client(bar), request, "v", bytes, writing.length, @ptrCast([*]const isize, &descriptors), 0) }
+            return
+        }
+        const at = dbus.beginArray(&writing, 8)
+        if state.same(asked_interface, WATCHER) {
+            putEntry(bar, &writing, "RegisteredStatusNotifierItems")
+            putEntry(bar, &writing, "IsStatusNotifierHostRegistered")
+            putEntry(bar, &writing, "ProtocolVersion")
+        }
+        dbus.endArray(&writing, at, 8)
+        unsafe { const serial = dbus.reply(client(bar), request, "a{sv}", bytes, writing.length, @ptrCast([*]const isize, &descriptors), 0) }
+        return
+    }
+    replyError(bar, request, "org.freedesktop.DBus.Error.UnknownMethod", "No such method")
+}

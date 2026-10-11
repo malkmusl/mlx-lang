@@ -33,6 +33,16 @@
 #     top and reserves it (the terminal moves below it, maximized it stays
 #     below), shows the active app and a fixed time in German, and the
 #     local times clock.mlx computes match python's zoneinfo;
+#   - runs the top bar again on a session bus (mlx-ipcd) with MLX Audio
+#     (mlx-audiod, no sound card), a music player and a tray icon
+#     (tools/topbar-test-services) and a battery (a made-up
+#     /sys/class/power_supply): the bar is the StatusNotifierWatcher and
+#     shows what plays, the icon, the volume and the charge; its play
+#     button pauses the player, the media popup's next button skips, the
+#     icon's menu (com.canonical.dbusmenu) sends the entry clicked and a
+#     left click Activate, the volume popup's slider, mute switch and the
+#     wheel change MLX Audio's volume, the battery popup tells the time
+#     left, and the calendar under the clock turns to the next month;
 #   - runs the file manager (mlx-files) on a home of its own: it shows the
 #     folders first, makes a folder (Ctrl+Shift+N) and names it, moves a
 #     picture into it by dragging, renames a file (F2), moves one to the
@@ -68,6 +78,9 @@ trap 'rm -rf -- "$work"' EXIT
 "$compiler" --quiet tools/wayland-test-host/main.mlx -o "$work/test-host"
 "$compiler" --quiet tools/wayland-drag-source/main.mlx -o "$work/drag-source"
 "$compiler" --quiet projects/desktop/topbar/main.mlx -o "$work/mlx-topbar"
+"$compiler" --quiet tools/topbar-test-services/main.mlx -o "$work/topbar-test-services"
+"$compiler" --quiet projects/desktop/ipc/main.mlx -o "$work/mlx-ipcd"
+"$compiler" --quiet projects/desktop/audio/main.mlx -o "$work/mlx-audiod"
 "$compiler" --quiet tools/clock-probe/main.mlx -o "$work/clock-probe"
 "$compiler" --quiet projects/desktop/files/main.mlx -o "$work/mlx-files"
 xkbcli compile-keymap --layout us > "$work/us.xkb"
@@ -601,7 +614,7 @@ SCRIPT
     local status=0
     env -i PATH="$PATH" HOME="$work/home" XDG_RUNTIME_DIR="$runtime" WAYLAND_DISPLAY=host-topbar \
         XDG_DATA_HOME="$work/data" XDG_DATA_DIRS="$work/none" XDG_CONFIG_HOME="$work/config" MLX_CANVAS=cpu \
-        LANG=de_DE.UTF-8 TZ="CET-1CEST,M3.5.0,M10.5.0/3" MLX_TOPBAR_TIME=1727445900 \
+        LANG=de_DE.UTF-8 TZ="CET-1CEST,M3.5.0,M10.5.0/3" MLX_TOPBAR_TIME=1727445900 MLX_TOPBAR_POWER="$work/none" \
         timeout 60 "$work/mlx-compositor" --verbose --no-fps --renderer cpu --socket nested-topbar \
         --terminal "$work/mlx-terminal" --launcher none --dock none --topbar "$work/mlx-topbar" --run "$work/mlx-terminal" > "$work/topbar.log" 2>&1 || status=$?
     wait "$host_pid" || fail "topbar: the test host failed" "$work/topbar-host.log"
@@ -658,8 +671,165 @@ PY
     fi
 }
 
+# The top bar on a session bus: see the header. The bar is laid out (its
+# verbose "widgets" line) as clock 891+125, battery 818+69, sound 786+28,
+# tray 756+26, media 595+149 at 1024 wide; the popups open centred under
+# their widget.
+topbar_bus() {
+    local runtime
+    runtime=$(mktemp -d)
+    mkdir -p "$work/power/BAT0" "$work/power/AC" "$work/power/mouse" "$work/bar-config/mlx" "$work/bar-home"
+    printf 'Battery\n' > "$work/power/BAT0/type"
+    printf 'Discharging\n' > "$work/power/BAT0/status"
+    printf '42000000\n' > "$work/power/BAT0/energy_now"
+    printf '50000000\n' > "$work/power/BAT0/energy_full"
+    printf '10500000\n' > "$work/power/BAT0/power_now"
+    printf 'Mains\n' > "$work/power/AC/type"
+    # A mouse's battery is not the computer's.
+    printf 'Battery\n' > "$work/power/mouse/type"
+    printf 'Device\n' > "$work/power/mouse/scope"
+    printf '5\n' > "$work/power/mouse/capacity"
+    cat > "$work/topbar-bus.script" <<SCRIPT
+wait 5000
+shot $work/bus-bar.ppm
+pointer 605 15
+press 272
+release 272
+wait 400
+pointer 680 15
+press 272
+release 272
+wait 700
+shot $work/bus-media.ppm
+pointer 773 162
+wait 100
+press 272
+release 272
+wait 400
+pointer 769 15
+press 273
+release 273
+wait 700
+shot $work/bus-menu.ppm
+pointer 760 94
+wait 100
+press 272
+release 272
+wait 300
+pointer 769 15
+press 272
+release 272
+wait 300
+pointer 800 15
+press 272
+release 272
+wait 700
+shot $work/bus-sound.ppm
+pointer 700 88
+wait 100
+press 272
+wait 100
+pointer 791 88
+wait 100
+release 272
+wait 300
+pointer 914 131
+press 272
+release 272
+wait 300
+pointer 800 15
+scroll -2560
+wait 300
+pointer 852 15
+press 272
+release 272
+wait 700
+shot $work/bus-battery.ppm
+pointer 953 15
+press 272
+release 272
+wait 700
+shot $work/bus-calendar.ppm
+pointer 987 91
+wait 100
+press 272
+release 272
+wait 500
+shot $work/bus-calendar-next.ppm
+close
+SCRIPT
+    XDG_RUNTIME_DIR=$runtime "$work/test-host" host-topbar-bus "$work/us.xkb" "$work/topbar-bus.script" > "$work/topbar-bus-host.log" 2>&1 &
+    local host_pid=$!
+    for _ in $(seq 1 50); do [[ -S "$runtime/host-topbar-bus" ]] && break; sleep 0.1; done
+    local bus=(env -i PATH="$PATH" HOME="$work/bar-home" XDG_RUNTIME_DIR="$runtime" XDG_CONFIG_HOME="$work/bar-config" DBUS_SESSION_BUS_ADDRESS="unix:path=$runtime/bus")
+    "${bus[@]}" "$work/mlx-ipcd" --address "$runtime/bus" > "$work/topbar-ipcd.log" 2>&1 &
+    local ipcd_pid=$!
+    for _ in $(seq 1 50); do [[ -S "$runtime/bus" ]] && break; sleep 0.1; done
+    "${bus[@]}" "$work/mlx-audiod" --output null --input none --no-pulse > "$work/topbar-audiod.log" 2>&1 &
+    local audiod_pid=$!
+    "${bus[@]}" "$work/topbar-test-services" "$work/services.log" > "$work/topbar-services.log" 2>&1 &
+    local services_pid=$!
+    local status=0
+    "${bus[@]}" WAYLAND_DISPLAY=host-topbar-bus XDG_DATA_HOME="$work/data" XDG_DATA_DIRS="$work/none" MLX_CANVAS=cpu \
+        LANG=de_DE.UTF-8 TZ="CET-1CEST,M3.5.0,M10.5.0/3" MLX_TOPBAR_TIME=1727445900 MLX_TOPBAR_POWER="$work/power" MLX_TOPBAR_VERBOSE=1 \
+        timeout 60 "$work/mlx-compositor" --verbose --no-fps --renderer cpu --socket nested-topbar-bus \
+        --terminal "$work/mlx-terminal" --launcher none --dock none --topbar "$work/mlx-topbar" --run "$work/mlx-terminal" > "$work/topbar-bus.log" 2>&1 || status=$?
+    wait "$host_pid" || fail "topbar on the bus: the test host failed" "$work/topbar-bus-host.log"
+    kill "$services_pid" "$audiod_pid" "$ipcd_pid" 2> /dev/null || true
+    wait "$services_pid" "$audiod_pid" "$ipcd_pid" 2> /dev/null || true
+    rm -rf -- "$runtime"
+    local log="$work/topbar-bus.log"
+    [[ $status -eq 0 ]] || fail "topbar on the bus: the compositor exited with status $status" "$log"
+    grep -q "^topbar: widgets clock 891+125 battery 818+69 sound 786+28 tray 756+26 media 595+149$" "$log" || fail "topbar on the bus: the widgets are not where the test clicks" "$log"
+    local line
+    for line in "^topbar: the StatusNotifierWatcher$" "^topbar: player org.mpris.MediaPlayer2.mlxtest playing \"Testlied\" by Mlx Band$" \
+        "^topbar: tray item org.kde.StatusNotifierItem-[0-9]*-1/StatusNotifierItem has an icon, a menu$" "^topbar: battery 84%$" "^topbar: MLX Audio$" \
+        "^topbar: player org.mpris.MediaPlayer2.mlxtest paused \"Zweites Lied\" by Mlx Band$" "^topbar: menu of org.kde.StatusNotifierItem-[0-9]*-1/StatusNotifierItem with 3 entries$" \
+        "^topbar: volume 50%$" "^topbar: muted$" "^topbar: volume 55%$" "^topbar: not muted$" "^topbar: popup battery$" "^topbar: popup calendar$"; do
+        grep -q "$line" "$log" || fail "topbar on the bus: no \"$line\"" "$log"
+    done
+    [[ "$(tr '\n' ' ' < "$work/services.log")" == "registered PlayPause Paused Next Event 3 clicked Activate 769 30 " ]] || fail "topbar on the bus: the player and the item were not asked as they should: $(tr '\n' ' ' < "$work/services.log")" "$log"
+    python3 - "$work" <<'PY' || fail "topbar on the bus: the bar or its popups do not look right" "$log"
+import sys
+work = sys.argv[1]
+def load(name):
+    data = open(f"{work}/{name}.ppm", 'rb').read()
+    _, size, _, pixels = data.split(b'\n', 3)
+    width, height = map(int, size.split())
+    return lambda x, y: tuple(pixels[(y * width + x) * 3:(y * width + x) * 3 + 3])
+def near(pixel, want, slack=12): return all(abs(a - b) <= slack for a, b in zip(pixel, want))
+def count(at, x0, x1, y0, y1, want): return sum(1 for x in range(x0, x1) for y in range(y0, y1) if near(at(x, y), want))
+popup = (30, 37, 42)
+accent = (90, 160, 255)
+bar = load("bus-bar")
+# The tray's icon (the item's blue 32x32 pixmap made 20x20), the speaker
+# and the battery in white, the title's text.
+assert count(bar, 759, 779, 5, 25, (40, 90, 230)) > 300, count(bar, 759, 779, 5, 25, (40, 90, 230))
+assert count(bar, 790, 812, 7, 23, (255, 255, 255)) > 40
+assert count(bar, 823, 846, 9, 21, (255, 255, 255)) > 100
+assert sum(1 for x in range(620, 740) for y in range(8, 22) if min(bar(x, y)) > 180) > 40
+media = load("bus-media")
+# The popup (489..849 x 34..184) with its cover's tile (no art).
+assert near(media(800, 175), popup) and near(media(530, 80), (70, 76, 96)), (media(800, 175), media(530, 80))
+menu = load("bus-menu")
+assert near(menu(690, 120), (30, 33, 42)), menu(690, 120)
+sound = load("bus-sound")
+assert near(sound(660, 50), popup) and near(sound(720, 88), accent), (sound(660, 50), sound(720, 88))
+battery = load("bus-battery")
+# 84 % of the line lit, the rest not.
+assert near(battery(800, 101), accent) and not near(battery(950, 101), accent), (battery(800, 101), battery(950, 101))
+# The calendar shows today (27 September) lit; October has no today.
+before = load("bus-calendar")
+after = load("bus-calendar-next")
+assert count(before, 728, 1016, 138, 318, accent) > 100, count(before, 728, 1016, 138, 318, accent)
+assert count(after, 728, 1016, 138, 318, accent) == 0 and near(after(740, 300), popup)
+PY
+    echo "ok   the top bar on a session bus: what plays, a tray icon with its menu, the volume, the battery and the calendar"
+}
+
 drops
 topbar
+topbar_bus
 files cpu
 files gpu
 zoom cpu

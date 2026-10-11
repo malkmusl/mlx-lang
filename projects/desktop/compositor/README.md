@@ -250,6 +250,28 @@ and their rules for the years after the table are read by
 `desktop-shared/clock.mlx`. `MLX_SESSION_TOPBAR=no` starts the session
 without it.
 
+Left of the time, from the right, the bar shows what it finds
+([`projects/desktop/topbar`](../topbar/main.mlx)); each opens a popup
+under it on a click (a click on it again or anywhere else closes it):
+
+| Widget | Shows | Does |
+| --- | --- | --- |
+| Clock | the date and time | a calendar: today, the month with ISO week numbers and today lit; the arrows or the wheel turn the month, a click on its name goes back to today's |
+| Battery | the charge of the batteries in `/sys/class/power_supply` (not a mouse's or a headset's), red under 15 %, a bolt while it charges | a popup: charging, full or on battery, and the time to full or to empty |
+| Volume | MLX Audio's output: a speaker with one to three waves, crossed out when muted | the wheel turns it by 5 %, a middle click mutes; the popup has the output's name, a slider and the mute switch |
+| Tray | the StatusNotifierItems (the icons Qt, GTK's libappindicator, Electron and others show): `IconPixmap`, else `IconName` from the icon themes, else the title's first letter; a red dot when one needs attention | a left click is `Activate`, a middle click `SecondaryActivate`, a right click the item's menu (`com.canonical.dbusmenu`, as the bar's own popup) or `ContextMenu` |
+| Media | the MPRIS player that played last (`org.mpris.MediaPlayer2.*`): a play/pause button and "Title – Artist" | the button plays or pauses; the text opens the cover (a `file://` PNG), title, artist and album, where the track is (a click on the line goes there), and previous, play/pause and next; a click on the cover or the title raises the player |
+
+The bar finds these on the session bus (`DBUS_SESSION_BUS_ADDRESS`, as
+MLXIPC gives the session) without waiting on it: it is the
+`org.kde.StatusNotifierWatcher` the apps register their items with, or a
+host of another program's watcher; the players, MLX Audio
+(`org.mlx.Audio`) and the items come and go with `NameOwnerChanged`, and
+their properties with `PropertiesChanged` and the items' `New*` signals.
+With no bus it tries again every ten seconds. MLXIPC lets sandboxed apps
+own a player's and a tray item's name and talk to the watcher by
+default.
+
 The file manager, [`projects/desktop/files`](../files/main.mlx) (Files in
 the launcher, pinned in the dock by default), is laid out like the Finder:
 a translucent sidebar with the home folder, the user's folders

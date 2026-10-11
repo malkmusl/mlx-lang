@@ -77,8 +77,11 @@ runs as the same user. MLXIPC's is per app, as in hyprtavern:
   names (its id and the names under it), talk to and see those, other
   connections of the same app, the portals (`org.freedesktop.portal.*`),
   `org.freedesktop.Notifications` and MLX Audio (`org.mlx.Audio`), and
-  use `audio.play`; it sees nothing else, not even the other connections'
-  unique names. Replies to calls an app made always come back; a reply
+  use `audio.play`; for the top bar it may also own an MPRIS player's
+  name (`org.mpris.MediaPlayer2.*`) and a tray item's
+  (`org.kde.StatusNotifierItem-*`) and talk to the tray's watcher
+  (`org.kde.StatusNotifierWatcher`). It sees nothing else, not even the
+  other connections' unique names. Replies to calls an app made always come back; a reply
   nobody asked for needs the rules.
 - The microphone (`audio.record`) and the sound of other apps
   (`audio.monitor`) are **asked** for every app, sandboxed or not: the
