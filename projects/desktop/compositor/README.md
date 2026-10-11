@@ -272,6 +272,16 @@ GPU.
 | Tray | the StatusNotifierItems (the icons Qt, GTK's libappindicator, Electron and others show): `IconPixmap`, else `IconName` from the icon themes, else the title's first letter; a red dot when one needs attention | a left click is `Activate`, a middle click `SecondaryActivate`, a right click the item's menu (`com.canonical.dbusmenu`, as the bar's own popup) or `ContextMenu` |
 | Media | the MPRIS player that played last (`org.mpris.MediaPlayer2.*`): a play/pause button and "Title – Artist" | the button plays or pauses; the text opens the player's name (its button and a click on the cover raise the player), the cover (a `file://` PNG), title, artist and album, where the track is (a click on the line goes there), and previous, play/pause and next |
 
+The order of these widgets and which are shown is the user's:
+mlx-settings' Top bar page (`mlx-settings topbar`) has a preview of the
+bar and a row per widget with a switch and arrows to move it a place
+left or right, and writes `~/.config/mlx/topbar.conf`
+(`$XDG_CONFIG_HOME/mlx/topbar.conf`, a line a widget from left to right:
+`clock = on`, `media = off`; `desktop-shared/topbar_items.mlx`). The bar
+takes a change within a second, the widgets gliding to their new places
+and a hidden one fading out; what plays always gets the room the others
+leave.
+
 The bar finds these on the session bus (`DBUS_SESSION_BUS_ADDRESS`, as
 MLXIPC gives the session) without waiting on it: it is the
 `org.kde.StatusNotifierWatcher` the apps register their items with, or a

@@ -56,6 +56,8 @@
 #  11. mlx-settings records hotkeys: while it records, the compositor
 #      passes every key to it (keyboard-shortcuts-inhibit), Super+Up too;
 #      Backspace unbinds one; the compositor takes the new keys at once.
+#  11b. mlx-settings' Top bar page (opened by `mlx-settings topbar`): an
+#      item moves up a place and another is hidden; topbar.conf says so.
 #  12. mlx-capture captures the screen and a window
 #      (ext-image-copy-capture-v1): the PNGs agree, and a later frame
 #      waits for damage.
@@ -880,6 +882,33 @@ done
 grep -q "^minimize: Settings" "$work/hotkeys-compositor.log" || { echo "the recorded Super+Up did not minimize" >&2; cat "$work/hotkeys-compositor.log" >&2; exit 1; }
 rm -f "$conf"
 echo "ok   mlx-settings records hotkeys (the compositor's too) and the compositor uses them at once"
+
+# Scenario 11b: mlx-settings' Top bar page, opened by its argument (the
+# rows' middles 50 pixels apart from y 229: what plays, the tray, the sound,
+# the battery, the clock; a row's up arrow at x 670). The sound moves up a
+# place, a click on the battery's row hides it.
+cat > "$work/topbar-page.sh" <<SCRIPT
+#!/bin/sh
+exec "$work/mlx-settings" topbar
+SCRIPT
+chmod +x "$work/topbar-page.sh"
+rm -f "$XDG_CONFIG_HOME/mlx/topbar.conf"
+cat > "$work/topbar-page.script" <<SCRIPT
+wait 2500
+pointer 670 329
+press 272
+release 272
+wait 600
+pointer 420 374
+press 272
+release 272
+wait 800
+close
+SCRIPT
+run_scenario topbar-page "$work/topbar-page.script" --no-fps --run "$work/topbar-page.sh"
+[[ "$(grep -v '^#' "$XDG_CONFIG_HOME/mlx/topbar.conf" 2> /dev/null | tr '\n' ' ')" == "media = on sound = on tray = on battery = off clock = on " ]] || { echo "mlx-settings' Top bar page did not write the items as clicked" >&2; cat "$XDG_CONFIG_HOME/mlx/topbar.conf" "$work/topbar-page-compositor.log" >&2; exit 1; }
+rm -f "$XDG_CONFIG_HOME/mlx/topbar.conf"
+echo "ok   mlx-settings' Top bar page moves an item up and hides another (topbar.conf)"
 
 # Scenario 12: screen and window capture (ext-image-copy-capture-v1 with
 # ext-image-capture-source-v1 and ext-foreign-toplevel-list-v1), with

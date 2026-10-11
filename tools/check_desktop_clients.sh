@@ -756,6 +756,11 @@ press 272
 release 272
 wait 700
 shot $work/bus-calendar-next.ppm
+pointer 300 15
+press 272
+release 272
+wait 2500
+shot $work/bus-arranged.ppm
 close
 SCRIPT
     XDG_RUNTIME_DIR=$runtime "$work/test-host" host-topbar-bus "$work/us.xkb" "$work/topbar-bus.script" > "$work/topbar-bus-host.log" 2>&1 &
@@ -769,18 +774,28 @@ SCRIPT
     local audiod_pid=$!
     "${bus[@]}" "$work/topbar-test-services" "$work/services.log" > "$work/topbar-services.log" 2>&1 &
     local services_pid=$!
+    # Once the calendar was shown, the items are arranged anew (as
+    # mlx-settings' Top bar page writes them): the clock first, the sound
+    # hidden, the battery last.
+    rm -f "$work/bar-config/mlx/topbar.conf"
+    (for _ in $(seq 1 400); do grep -q "^topbar: popup calendar$" "$work/topbar-bus.log" 2> /dev/null && break; sleep 0.1; done
+        sleep 1
+        printf 'clock = on\nmedia = on\nsound = off\ntray = on\nbattery = on\n' > "$work/bar-config/mlx/topbar.conf") &
+    local writer_pid=$!
     local status=0
     "${bus[@]}" WAYLAND_DISPLAY=host-topbar-bus XDG_DATA_HOME="$work/data" XDG_DATA_DIRS="$work/none" MLX_CANVAS=cpu \
         LANG=de_DE.UTF-8 TZ="CET-1CEST,M3.5.0,M10.5.0/3" MLX_TOPBAR_TIME=1727445900 MLX_TOPBAR_POWER="$work/power" MLX_TOPBAR_VERBOSE=1 \
         timeout 60 "$work/mlx-compositor" --verbose --no-fps --renderer cpu --socket nested-topbar-bus \
         --terminal "$work/mlx-terminal" --launcher none --dock none --topbar "$work/mlx-topbar" --run "$work/mlx-terminal" > "$work/topbar-bus.log" 2>&1 || status=$?
     wait "$host_pid" || fail "topbar on the bus: the test host failed" "$work/topbar-bus-host.log"
+    wait "$writer_pid" 2> /dev/null || true
     kill "$services_pid" "$audiod_pid" "$ipcd_pid" 2> /dev/null || true
     wait "$services_pid" "$audiod_pid" "$ipcd_pid" 2> /dev/null || true
     rm -rf -- "$runtime"
     local log="$work/topbar-bus.log"
     [[ $status -eq 0 ]] || fail "topbar on the bus: the compositor exited with status $status" "$log"
     grep -q "^topbar: widgets clock 891+125 battery 818+69 sound 786+28 tray 756+26 media 595+149$" "$log" || fail "topbar on the bus: the widgets are not where the test clicks" "$log"
+    grep -q "^topbar: widgets clock 589+125 battery 947+69 tray 917+26 media 726+179$" "$log" || fail "topbar on the bus: the bar did not take the items' new order" "$log"
     local line
     for line in "^topbar: the StatusNotifierWatcher$" "^topbar: player org.mpris.MediaPlayer2.mlxtest playing \"Testlied\" by Mlx Band$" \
         "^topbar: tray item org.kde.StatusNotifierItem-[0-9]*-1/StatusNotifierItem has an icon, a menu$" "^topbar: battery 84%$" "^topbar: MLX Audio$" \
@@ -825,8 +840,14 @@ before = load("bus-calendar")
 after = load("bus-calendar-next")
 assert count(before, 728, 1016, 148, 328, accent) > 100, count(before, 728, 1016, 148, 328, accent)
 assert count(after, 728, 1016, 148, 328, accent) == 0 and near(after(740, 300), popup)
+# Arranged anew: the time on the left of what plays, no speaker, the tray's
+# icon and the battery at the right edge.
+arranged = load("bus-arranged")
+assert sum(1 for x in range(595, 710) for y in range(8, 22) if min(arranged(x, y)) > 180) > 40
+assert count(arranged, 920, 940, 5, 25, (40, 90, 230)) > 300, count(arranged, 920, 940, 5, 25, (40, 90, 230))
+assert count(arranged, 950, 1010, 9, 21, (255, 255, 255)) > 40
 PY
-    echo "ok   the top bar on a session bus: what plays, a tray icon with its menu, the volume, the battery and the calendar"
+    echo "ok   the top bar on a session bus: what plays, a tray icon with its menu, the volume, the battery and the calendar; the items rearranged"
 }
 
 drops
