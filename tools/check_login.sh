@@ -4,9 +4,8 @@
 # synthetic login accounts, authorizes login.session through MLXIPC and
 # checks passwords against a private shadow source.
 #
-# The daemon receives private passwd and shadow paths explicitly, and the
-# session step is still a stub, so it neither opens the defaults nor logs
-# anybody in.
+# The daemon receives private account paths explicitly and starts only a
+# short fixture session after dropping privileges inside the namespace.
 #
 #   tools/check_login.sh [compiler]
 set -euo pipefail
@@ -19,14 +18,20 @@ command -v unshare > /dev/null || { echo "check_login.sh: needs unshare (util-li
 
 # Both the MLXIPC system bus and mlx-login use root credentials as a
 # security boundary. Keep those credentials inside a private user
-# namespace so this check never needs or exercises host root.
-read -r namespace_uid host_uid namespace_count < /proc/self/uid_map
-if [[ $namespace_uid != 0 || $namespace_count != 1 ]]; then
-    unshare --user --map-root-user true 2> /dev/null || { echo "check_login.sh: user namespaces are unavailable" >&2; exit 2; }
-    exec unshare --user --map-root-user -- "$0" "$compiler"
+# namespace so this check never needs or exercises host root. The second
+# mapping gives the session a real non-root uid and keeps setgroups usable.
+mapped_user=$(awk '$1 <= 1000 && 1000 < $1 + $3 { found = 1 } END { print found + 0 }' /proc/self/uid_map)
+setgroups_state=$(cat /proc/self/setgroups 2> /dev/null || true)
+if [[ $(id -u) != 0 || $mapped_user != 1 || $setgroups_state != allow ]]; then
+    unshare --user --map-root-user --map-users 1:100000:65535 --map-groups 1:100000:65535 true 2> /dev/null || {
+        echo "check_login.sh: user namespaces with subordinate uid/gid maps are unavailable" >&2
+        exit 2
+    }
+    exec unshare --user --map-root-user --map-users 1:100000:65535 --map-groups 1:100000:65535 -- "$0" "$compiler"
 fi
 
 work=$(mktemp -d)
+chmod 755 "$work"
 bus_pid=""
 login_pid=""
 cleanup() {
@@ -45,16 +50,34 @@ trap cleanup EXIT
 # stream complete records rather than silently truncating a valid file.
 awk 'BEGIN { for (i = 0; i < 8000; i++) print "# padding" }' > "$work/passwd"
 cat >> "$work/passwd" <<'PASSWD'
-mlx-test:x:1000:1000:MLX Test:/home/mlx-test:/bin/sh
+mlx-test:x:1000:1000:MLX Test:HOME_PLACEHOLDER:/bin/sh
 mlx-locked:x:1001:1001:MLX Locked:/home/mlx-locked:/bin/sh
 mlx-empty:x:1002:1002:MLX Empty:/home/mlx-empty:/bin/sh
 PASSWD
+mkdir "$work/home" "$work/runtime"
+chown 1000:1000 "$work/home"
+sed -i "s|HOME_PLACEHOLDER|$work/home|" "$work/passwd"
+cat > "$work/group" <<'GROUP'
+mlx-test:x:1000:mlx-test
+video:x:983:mlx-test
+GROUP
 cat > "$work/shadow" <<'SHADOW'
 mlx-test:$6$mlxlogintestsalt$/D8RVzVywVfzqDWu6Wm7IjBcNOG2nnjZYQF075LGH3qLA9EwBUX5j5nxpAnuoS7QeGMw1xLBsOI3j/1DSu65I0:20000:0:99999:7:::
 mlx-locked:!$6$mlxlogintestsalt$/D8RVzVywVfzqDWu6Wm7IjBcNOG2nnjZYQF075LGH3qLA9EwBUX5j5nxpAnuoS7QeGMw1xLBsOI3j/1DSu65I0:20000:0:99999:7:::
 mlx-empty::20000:0:99999:7:::
 SHADOW
 chmod 600 "$work/shadow"
+cat > "$work/session.sh" <<SESSION
+#!/bin/sh
+{
+    printf 'uid=%s gid=%s groups=%s\n' "\$(id -u)" "\$(id -g)" "\$(id -G)"
+    printf 'HOME=%s USER=%s LOGNAME=%s SHELL=%s\n' "\$HOME" "\$USER" "\$LOGNAME" "\$SHELL"
+    printf 'XDG_RUNTIME_DIR=%s XDG_SESSION_TYPE=%s XDG_SEAT=%s XDG_VTNR=%s\n' "\$XDG_RUNTIME_DIR" "\$XDG_SESSION_TYPE" "\$XDG_SEAT" "\$XDG_VTNR"
+} > "$work/home/session.out"
+touch "$work/home/ready"
+sleep 4
+SESSION
+chmod 755 "$work/session.sh"
 
 address="unix:path=$work/bus"
 export DBUS_SYSTEM_BUS_ADDRESS="$address"
@@ -64,7 +87,7 @@ bus_pid=$!
 for _ in $(seq 1 50); do [[ -S "$work/bus" ]] && break; sleep 0.1; done
 [[ -S "$work/bus" ]] || { echo "FAIL the system bus did not come up" >&2; cat "$work/bus.log" >&2; exit 1; }
 
-"$work/mlx-login" --verbose --passwd "$work/passwd" --shadow "$work/shadow" > "$work/login.log" 2>&1 &
+"$work/mlx-login" --verbose --passwd "$work/passwd" --shadow "$work/shadow" --group "$work/group" --runtime-dir "$work/runtime" > "$work/login.log" 2>&1 &
 login_pid=$!
 # Wait until it owns the name.
 owned=""
@@ -82,7 +105,7 @@ echo "ok   mlx-login owns org.mlx.Login on the system bus"
 # ListUsers comes only from the fixture passed with --passwd.
 users=$(gdbus call --address "$address" --dest org.mlx.Login --object-path /org/mlx/Login \
     --method org.mlx.Login.ListUsers 2>&1)
-grep -q "'mlx-test', 'MLX Test', '/home/mlx-test', '/bin/sh'" <<< "$users" || { echo "FAIL ListUsers did not name mlx-test:" >&2; echo "$users" >&2; exit 1; }
+grep -q "'mlx-test', 'MLX Test', '$work/home', '/bin/sh'" <<< "$users" || { echo "FAIL ListUsers did not name mlx-test:" >&2; echo "$users" >&2; exit 1; }
 grep -q "'mlx-locked', 'MLX Locked', '/home/mlx-locked', '/bin/sh'" <<< "$users" || { echo "FAIL ListUsers did not name mlx-locked:" >&2; echo "$users" >&2; exit 1; }
 grep -q "'mlx-empty', 'MLX Empty', '/home/mlx-empty', '/bin/sh'" <<< "$users" || { echo "FAIL ListUsers did not name mlx-empty:" >&2; echo "$users" >&2; exit 1; }
 if grep -q "'root'," <<< "$users"; then
@@ -97,7 +120,7 @@ echo "ok   ListUsers names only the three accounts from the passwd fixture"
 # Permission is decided before mlx-login looks at an account or password.
 login_call() {
     gdbus call --address "$address" --dest org.mlx.Login --object-path /org/mlx/Login \
-        --method org.mlx.Login.Login "$1" "$2" /bin/true 2>&1 || true
+        --method org.mlx.Login.Login "$1" "$2" "${3:-/bin/true}" 2>&1 || true
 }
 login_out=$(login_call mlx-test test-password)
 grep -q "org.freedesktop.DBus.Error.AccessDenied" <<< "$login_out" || { echo "FAIL Login handled a password without login.session:" >&2; echo "$login_out" >&2; exit 1; }
@@ -128,17 +151,40 @@ mv "$work/shadow-away" "$work/shadow"
 grep -q "(false,)" <<< "$login_out" || { echo "FAIL Login did not fail closed when shadow was unavailable:" >&2; echo "$login_out" >&2; exit 1; }
 echo "ok   Login fails closed when the shadow source is unavailable"
 
-# A correct password reaches only the still-unconfigured session start.
-login_out=$(login_call mlx-test test-password)
-grep -q "org.mlx.Login.Error.NotConfigured" <<< "$login_out" || { echo "FAIL a correct password did not reach the session stub:" >&2; echo "$login_out" >&2; exit 1; }
-echo "ok   a correct password reaches the unconfigured session start"
-
 # Unlock with nobody on the seat is a plain no (it never reaches the
 # password check): the lock screen only unlocks the user who is logged in.
 unlock_out=$(gdbus call --address "$address" --dest org.mlx.Login --object-path /org/mlx/Login \
-    --method org.mlx.Login.Unlock root x 2>&1 || true)
+    --method org.mlx.Login.Unlock mlx-test test-password 2>&1 || true)
 grep -q "(false,)" <<< "$unlock_out" || { echo "FAIL Unlock on an empty seat was not refused:" >&2; echo "$unlock_out" >&2; exit 1; }
 echo "ok   Unlock refuses when nobody holds the seat"
+
+# A correct password starts the fixture as uid/gid 1000 with only the
+# requested supplementary groups and a deliberately small environment.
+login_out=$(login_call mlx-test test-password "$work/session.sh")
+grep -q "(true,)" <<< "$login_out" || { echo "FAIL a correct password did not start the session:" >&2; echo "$login_out" >&2; cat "$work/login.log" >&2; exit 1; }
+for _ in $(seq 1 50); do [[ -e "$work/home/ready" ]] && break; sleep 0.1; done
+[[ -e "$work/home/ready" ]] || { echo "FAIL the session did not become ready" >&2; cat "$work/login.log" >&2; exit 1; }
+grep -q '^uid=1000 gid=1000 groups=.*983.*1000\|^uid=1000 gid=1000 groups=.*1000.*983' "$work/home/session.out" || { echo "FAIL the session kept the wrong ids or groups:" >&2; cat "$work/home/session.out" >&2; exit 1; }
+grep -q "HOME=$work/home USER=mlx-test LOGNAME=mlx-test SHELL=/bin/sh" "$work/home/session.out" || { echo "FAIL the session environment has wrong account values:" >&2; cat "$work/home/session.out" >&2; exit 1; }
+grep -q "XDG_RUNTIME_DIR=$work/runtime/1000 XDG_SESSION_TYPE=wayland XDG_SEAT=seat0 XDG_VTNR=1" "$work/home/session.out" || { echo "FAIL the session environment has wrong seat values:" >&2; cat "$work/home/session.out" >&2; exit 1; }
+[[ $(stat -c '%u:%g:%a' "$work/runtime/1000") == 1000:1000:700 ]] || { echo "FAIL the runtime directory has wrong ownership or mode" >&2; stat -c '%u:%g:%a' "$work/runtime/1000" >&2; exit 1; }
+echo "ok   Login starts a uid/gid-dropped session with groups, environment and private runtime directory"
+
+unlock_out=$(gdbus call --address "$address" --dest org.mlx.Login --object-path /org/mlx/Login \
+    --method org.mlx.Login.Unlock mlx-test test-password 2>&1 || true)
+grep -q "(true,)" <<< "$unlock_out" || { echo "FAIL Unlock refused the active user's password:" >&2; echo "$unlock_out" >&2; exit 1; }
+echo "ok   Unlock accepts the active user's password"
+
+unlock_out=$(gdbus call --address "$address" --dest org.mlx.Login --object-path /org/mlx/Login \
+    --method org.mlx.Login.Unlock mlx-test wrong-password 2>&1 || true)
+grep -q "(false,)" <<< "$unlock_out" || { echo "FAIL Unlock accepted a wrong password:" >&2; echo "$unlock_out" >&2; exit 1; }
+echo "ok   Unlock refuses a wrong password"
+
+sleep 3
+unlock_out=$(gdbus call --address "$address" --dest org.mlx.Login --object-path /org/mlx/Login \
+    --method org.mlx.Login.Unlock mlx-test test-password 2>&1 || true)
+grep -q "(false,)" <<< "$unlock_out" || { echo "FAIL the seat stayed occupied after the session ended:" >&2; echo "$unlock_out" >&2; exit 1; }
+echo "ok   the seat is released when the session ends"
 
 if grep -qE 'test-password|wrong-password|mlxlogintestsalt' "$work/login.log"; then
     echo "FAIL mlx-login logged password material" >&2

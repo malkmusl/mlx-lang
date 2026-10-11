@@ -15,11 +15,13 @@ sudo mlx-login --passwd FILE --shadow FILE   # isolated account databases
 tools/check_login.sh                         # the end-to-end check
 ```
 
-The default account-database paths are `/etc/passwd` and `/etc/shadow`.
+The default account-database paths are `/etc/passwd`, `/etc/shadow` and
+`/etc/group`; session runtime directories live below `/run/mlx/user`.
 The options exist so installers and checks can stage private databases;
-they do not remove the root requirement. The check re-executes itself as
+`--group FILE` and `--runtime-dir DIR` isolate the remaining session data.
+They do not remove the root requirement. The check re-executes itself as
 root inside a user namespace and passes private fixture paths explicitly,
-so `mlx-login` does not open the host's account or password databases.
+so `mlx-login` does not open the host's account databases.
 
 ## The bus interface (`org.mlx.Login`, path `/org/mlx/Login`)
 
@@ -36,10 +38,8 @@ for two seconds before the "no", to slow guessing.
 
 ## The two privileged steps
 
-Two steps need root's power, and they are the only ones that read a
-password hash or change the process's user. Authentication is complete;
-the session start remains the next step, so a correct password currently
-reaches `org.mlx.Login.Error.NotConfigured` without starting a process.
+Two small modules hold the only operations that need root's power: reading
+a password hash and changing the session process's identity.
 
 The pieces the two steps need are all in the tree already:
 
@@ -52,9 +52,10 @@ The pieces the two steps need are all in the tree already:
   closed; password and hash buffers are wiped on every path.
 - **`startSession`** forks, becomes a session leader, drops the
   supplementary groups, the gid and the uid in that order, builds the
-  session's environment, and execve's the session. The stub's comment
-  names each syscall and `projects/desktop/ipc/activation.mlx`'s
-  `execute` for the PATH lookup.
+  session's explicit environment, changes to its home and uses
+  `projects/desktop/ipc/activation.mlx`'s `execute` for the PATH lookup.
+  A close-on-exec pipe prevents a failed privilege drop or exec from being
+  reported as a successful login.
 
 ## The seat
 
@@ -72,4 +73,6 @@ as it does now when no logind is present.
 | --- | --- |
 | `main.mlx` | the daemon: the bus, authorization and the three methods |
 | `authentication.mlx` | bounded, fail-closed shadow parsing and password verification |
+| `groups.mlx` | the primary and supplementary groups for a session |
+| `session.mlx` | runtime directory, privilege drop, environment and exec |
 | `users.mlx` | the login accounts, read from the configured passwd file |

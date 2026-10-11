@@ -23,12 +23,13 @@
 //
 // Login and Unlock first ask MLXIPC for login.session. Password hashes
 // are checked in authentication.mlx without libc and every copied
-// password is wiped. startSession below remains the one incomplete
-// privileged step until the next increment.
+// password is wiped. session.mlx starts the process only after dropping
+// every root credential and reports exec failure to the parent.
 const std = @import("std")
 const dbus = @import("std.dbus")
 const crash = @import("std.crash")
 const authentication = @import("./authentication.mlx")
+const session_module = @import("./session.mlx")
 const users_module = @import("./users.mlx")
 
 const SYS_read: usize = 0
@@ -36,6 +37,7 @@ const SYS_nanosleep: usize = 35
 const SYS_rt_sigprocmask: usize = 14
 const SYS_signalfd4: usize = 289
 const SYS_getuid: usize = 102
+const SYS_wait4: usize = 61
 
 const LOGIN_NAME: []const u8 = "org.mlx.Login"
 const LOGIN_PATH: []const u8 = "/org/mlx/Login"
@@ -59,7 +61,6 @@ fn fail(message: []const u8, failure: Failure) -> Failure!void {
 // What a login attempt comes to.
 const DENIED: u8 = 0
 const ALLOWED: u8 = 1
-const NOT_CONFIGURED: u8 = 2
 
 const LOGIN_CALL: u8 = 1
 const UNLOCK_CALL: u8 = 2
@@ -94,12 +95,15 @@ const Login = struct {
     // The command-line slice points into argv, which lives for the
     // process. Authentication reads this path for every protected attempt.
     shadowPath: []const u8
+    groupPath: []const u8
+    runtimeRoot: []const u8
     verbose: bool
     running: bool
     // Who holds the seat now (empty: nobody logged in). Unlock checks the
     // password of this user only.
     active: [users_module.NAME_MOST]u8
     activeLength: usize
+    sessionPid: isize
     pending: [PENDING_MOST]Pending
 }
 
@@ -181,8 +185,7 @@ fn sleep(milliseconds: usize) -> void {
 // THE TWO PRIVILEGED STEPS.
 //
 // They are the only places that read a password hash or change the
-// process's user. Authentication is complete; session start follows in
-// the next increment.
+// process's user.
 // ===========================================================================
 
 // STEP 1 -- CHECK THE PASSWORD.
@@ -196,60 +199,28 @@ fn authenticate(login: *Login, user: []const u8, password: []const u8) -> u8 {
 
 // STEP 2 -- START THE SESSION AS THE USER.
 //
-// `index` is the account in login.*.users (already looked up).
-// `session` is the command the greeter asked to run (the compositor, or
-// what a .desktop session entry names). Return ALLOWED once the session
-// has been started, DENIED when it could not be, NOT_CONFIGURED until
-// written.
-//
-// How to write it:
-//
-//   1. fork (std.linux.syscall0 SYS_fork). The parent records the child
-//      as the seat's session (set login.*.active to the user's name) and
-//      returns ALLOWED; everything from here is the child.
-//   2. In the child, become a session leader: SYS_setsid (112).
-//   3. Drop to the user, GROUPS FIRST, then gid, then uid -- the order
-//      matters, since after setuid you may no longer change the others:
-//        - SYS_setgroups (116) with the user's supplementary groups (read
-//          them from /etc/group: the groups whose member list contains
-//          the name; the user's own gid too). Without this a logged-in
-//          user would keep root's groups.
-//        - SYS_setgid (106) with user.gid.
-//        - SYS_setuid (105) with user.uid.
-//      Check each return value; if any fails, _exit non-zero (do NOT go
-//      on as root).
-//   4. Build the environment for the session: HOME=user's home,
-//      USER and LOGNAME=name, SHELL=user's shell,
-//      PATH=/usr/local/bin:/usr/bin:/bin, XDG_RUNTIME_DIR=/run/mlx/user/<uid>
-//      (make that directory 0700 owned by the user before dropping
-//      privilege), XDG_SESSION_TYPE=wayland, and the seat variables the
-//      session wants (XDG_SEAT=seat0, XDG_VTNR of the VT the greeter was
-//      on). Keep it small and explicit; do not pass root's environment on.
-//   5. chdir to the user's home (SYS_chdir 80).
-//   6. execve `session` (projects/desktop/ipc/activation.mlx has `execute`,
-//      which looks a program up in PATH and execve's it -- reuse it).
-//      execve only returns on failure; then _exit non-zero.
-//
-// The seat (the VT, the DRM card, the input devices) is handed to the
-// session's compositor the way it already expects: the compositor's
-// logind client (projects/desktop/compositor/logind.mlx) asks
-// org.freedesktop.login1 on the system bus for the devices and VT
-// switching. A fuller mlx-login answers that interface too (TakeControl,
-// TakeDevice, SwitchTo); until then, run the session's compositor on a
-// VT it opens directly, as it does now without logind.
+// `index` is the account already looked up; `session` is one executable.
+// session.mlx loads supplementary groups, creates the private runtime
+// directory, forks, calls setsid, setgroups, setgid and setuid in that
+// order, builds an explicit environment, changes home and reuses MLXIPC's
+// PATH-aware exec helper. A close-on-exec pipe makes failures synchronous.
 fn startSession(login: *Login, index: usize, session: []const u8) -> u8 {
-    // Leave this line until the body above is written.
-    return NOT_CONFIGURED
+    if login.*.activeLength > 0 { return DENIED }
+    const user = users_module.userAt(usersOf(login), index)
+    const configured = std.process.environmentFrom(login.*.environment, "DBUS_SYSTEM_BUS_ADDRESS")
+    const address = if configured == null { "unix:path=/run/mlx/bus" } else { std.string.asSlice(configured.?) }
+    const pid = session_module.start(user, session, login.*.groupPath, login.*.runtimeRoot, address)
+    if pid < 0 { return DENIED }
+    login.*.activeLength = copyInto(@ptrCast([*]u8, &login.*.active), users_module.NAME_MOST, users_module.nameOf(user))
+    login.*.sessionPid = pid
+    say(login, "login: session started\n")
+    return ALLOWED
 }
 
 // ===========================================================================
 // The bus side: it never sees a password beyond handing it to
 // authenticate, and never a uid change beyond calling startSession.
 // ===========================================================================
-
-fn notConfigured(login: *Login, call: *const dbus.Header) -> void {
-    sendError(login, call, "org.mlx.Login.Error.NotConfigured", "mlx-login: the session start is not configured on this machine (projects/desktop/login/main.mlx: startSession)")
-}
 
 fn sendError(login: *Login, call: *const dbus.Header, name: []const u8, message: []const u8) -> void {
     var header = dbus.newHeader(dbus.ERROR, 0)
@@ -317,6 +288,10 @@ fn listUsers(login: *Login, call: *const dbus.Header) -> void {
 fn perform(login: *Login, call: *const dbus.Header, pending: *Pending) -> void {
     const user = pendingUser(pending)
     if pending.*.kind == LOGIN_CALL {
+        if login.*.activeLength > 0 {
+            replyBool(login, call, false)
+            return
+        }
         const index = users_module.find(usersOf(login), user)
         if index >= login.*.users.count {
             sleep(FAILURE_DELAY_MS)
@@ -332,10 +307,6 @@ fn perform(login: *Login, call: *const dbus.Header, pending: *Pending) -> void {
             return
         }
         const started = startSession(login, index, pendingSession(pending))
-        if started == NOT_CONFIGURED {
-            notConfigured(login, call)
-            return
-        }
         replyBool(login, call, started == ALLOWED)
         return
     }
@@ -349,6 +320,20 @@ fn perform(login: *Login, call: *const dbus.Header, pending: *Pending) -> void {
     const checked = authenticate(login, user, pendingPassword(pending))
     if checked != ALLOWED { sleep(FAILURE_DELAY_MS) }
     replyBool(login, call, checked == ALLOWED)
+}
+
+fn reapSession(login: *Login) -> void {
+    var status: usize = 0
+    var pid = std.linux.syscall4(SYS_wait4, 18446744073709551615, @intFromPtr(&status), 1, 0)
+    while pid > 0 {
+        if pid == login.*.sessionPid {
+            wipe(@ptrCast([*]u8, &login.*.active), users_module.NAME_MOST)
+            login.*.activeLength = 0
+            login.*.sessionPid = -1
+            say(login, "login: session ended; the seat is free\n")
+        }
+        pid = std.linux.syscall4(SYS_wait4, 18446744073709551615, @intFromPtr(&status), 1, 0)
+    }
 }
 
 // Asks MLXIPC about login.session. Arguments are copied before the Check
@@ -427,6 +412,7 @@ fn permissionAnswered(login: *Login, reply: *const dbus.Header) -> bool {
 }
 
 fn dispatch(login: *Login) -> void {
+    reapSession(login)
     var header: dbus.Header = undefined
     while dbus.next(clientOf(login), &header, 0) {
         const body = dbus.bodyOf(clientOf(login), &header)
@@ -479,7 +465,7 @@ fn connectName(login: *Login) -> bool {
     dbus.begin(&writing, requestBytes, 64, false)
     dbus.putString(&writing, LOGIN_NAME)
     dbus.putU32(&writing, 4)
-    const serial = dbus.call(clientOf(login), "org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus", "RequestName", "su", requestBytes, writing.length)
+    const serial = dbus.call(clientOf(login), BUS_NAME, BUS_PATH, BUS_NAME, "RequestName", "su", requestBytes, writing.length)
     var reply: dbus.Header = undefined
     if serial == 0 || !dbus.waitReply(clientOf(login), serial, &reply, 5000) { return false }
     return reply.kind == dbus.METHOD_RETURN
@@ -490,6 +476,8 @@ fn run(arguments: [][*]const u8) -> !void {
     var verbose = false
     var passwdPath: []const u8 = "/etc/passwd"
     var shadowPath: []const u8 = "/etc/shadow"
+    var groupPath: []const u8 = "/etc/group"
+    var runtimeRoot: []const u8 = "/run/mlx/user"
     var index: usize = 1
     const count = std.process.count(arguments)
     while index < count {
@@ -502,12 +490,18 @@ fn run(arguments: [][*]const u8) -> !void {
         } else if std.string.eql(argument, std.string.fromSlice("--shadow")) && index + 1 < count {
             index += 1
             shadowPath = std.string.asSlice(std.process.argument(arguments, index))
+        } else if std.string.eql(argument, std.string.fromSlice("--group")) && index + 1 < count {
+            index += 1
+            groupPath = std.string.asSlice(std.process.argument(arguments, index))
+        } else if std.string.eql(argument, std.string.fromSlice("--runtime-dir")) && index + 1 < count {
+            index += 1
+            runtimeRoot = std.string.asSlice(std.process.argument(arguments, index))
         } else {
-            try fail("usage: mlx-login [--verbose] [--passwd FILE] [--shadow FILE]", Failure.Usage)
+            try fail("usage: mlx-login [--verbose] [--passwd FILE] [--shadow FILE] [--group FILE] [--runtime-dir DIR]", Failure.Usage)
         }
         index += 1
     }
-    if passwdPath.length == 0 || passwdPath.length >= users_module.DATABASE_PATH_MOST || shadowPath.length == 0 || shadowPath.length >= users_module.DATABASE_PATH_MOST {
+    if passwdPath.length == 0 || passwdPath.length >= users_module.DATABASE_PATH_MOST || shadowPath.length == 0 || shadowPath.length >= users_module.DATABASE_PATH_MOST || groupPath.length == 0 || groupPath.length >= users_module.DATABASE_PATH_MOST || runtimeRoot.length == 0 || runtimeRoot.length >= users_module.DATABASE_PATH_MOST {
         try fail("mlx-login: account database path is empty or too long", Failure.Usage)
     }
     if std.linux.syscall0(SYS_getuid) != 0 {
@@ -519,9 +513,12 @@ fn run(arguments: [][*]const u8) -> !void {
     unsafe { login = @ptrCast(*Login, memory.?) }
     login.*.environment = std.process.environmentEntries(arguments)
     login.*.shadowPath = shadowPath
+    login.*.groupPath = groupPath
+    login.*.runtimeRoot = runtimeRoot
     login.*.verbose = verbose
     login.*.running = true
     login.*.activeLength = 0
+    login.*.sessionPid = -1
     var pendingIndex: usize = 0
     while pendingIndex < PENDING_MOST {
         release(pendingAt(login, pendingIndex))
