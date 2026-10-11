@@ -29,6 +29,7 @@ const std = @import("std")
 const dbus = @import("std.dbus")
 const crash = @import("std.crash")
 const authentication = @import("./authentication.mlx")
+const greeter_module = @import("./greeter.mlx")
 const login1 = @import("./login1.mlx")
 const session_module = @import("./session.mlx")
 const users_module = @import("./users.mlx")
@@ -54,7 +55,7 @@ const IPC_INTERFACE: []const u8 = "org.mlx.IPC"
 // (milliseconds). The daemon sleeps this long before every "no".
 const FAILURE_DELAY_MS: usize = 2000
 
-const Failure = error { Usage, NotRoot, NoBus, NoMemory, NoSignals }
+const Failure = error { Usage, NotRoot, NoBus, NoMemory, NoSignals, NoGreeter }
 
 fn fail(message: []const u8, failure: Failure) -> Failure!void {
     if message.length > 0 { const said = std.io.eprintln(message) }
@@ -108,6 +109,14 @@ const Login = struct {
     active: [users_module.NAME_MOST]u8
     activeLength: usize
     sessionPid: isize
+    // The compositor that owns the seat while no person is logged in.
+    // Empty commands disable lifecycle management (useful to isolated
+    // clients and checks that exercise only the bus API).
+    greeterCompositor: []const u8
+    greeterProgram: []const u8
+    greeterUid: u32
+    greeterGid: u32
+    greeterPid: isize
     pending: [PENDING_MOST]Pending
 }
 
@@ -189,6 +198,51 @@ fn sleep(milliseconds: usize) -> void {
     const slept = std.linux.syscall2(SYS_nanosleep, @intFromPtr(&spec), 0)
 }
 
+fn busAddress(login: *Login) -> []const u8 {
+    const configured = std.process.environmentFrom(login.*.environment, "DBUS_SYSTEM_BUS_ADDRESS")
+    return if configured == null { "unix:path=/run/mlx/bus" } else { std.string.asSlice(configured.?) }
+}
+
+fn greeterConfigured(login: *Login) -> bool { return login.*.greeterCompositor.length > 0 && login.*.greeterProgram.length > 0 }
+
+fn seatPid(login: *Login) -> isize {
+    if login.*.sessionPid > 0 { return login.*.sessionPid }
+    return login.*.greeterPid
+}
+
+fn startGreeter(login: *Login) -> bool {
+    if !greeterConfigured(login) || login.*.activeLength > 0 || login.*.greeterPid > 0 { return true }
+    var config = greeter_module.Config.{
+        .compositor = login.*.greeterCompositor,
+        .program = login.*.greeterProgram,
+        .runtimeRoot = login.*.runtimeRoot,
+        .busAddress = busAddress(login),
+        .environment = login.*.environment,
+        .busDescriptor = dbus.descriptorOfClient(clientOf(login)),
+        .uid = login.*.greeterUid,
+        .gid = login.*.greeterGid
+    }
+    const pid = greeter_module.start(&config)
+    if pid < 0 {
+        say(login, "login: greeter could not be started\n")
+        return false
+    }
+    login.*.greeterPid = pid
+    say(login, "login: greeter started\n")
+    return true
+}
+
+fn stopGreeter(login: *Login) -> void {
+    if login.*.greeterPid <= 0 { return }
+    const pid = login.*.greeterPid
+    login.*.greeterPid = -1
+    // Revoke the old compositor before the user's compositor can ask for
+    // control; waiting for NameOwnerChanged would leave a race here.
+    login1.sessionEnded(login1Of(login))
+    greeter_module.stop(pid)
+    say(login, "login: greeter stopped\n")
+}
+
 // ===========================================================================
 // THE TWO PRIVILEGED STEPS.
 //
@@ -215,9 +269,7 @@ fn authenticate(login: *Login, user: []const u8, password: []const u8) -> u8 {
 fn startSession(login: *Login, index: usize, session: []const u8) -> u8 {
     if login.*.activeLength > 0 { return DENIED }
     const user = users_module.userAt(usersOf(login), index)
-    const configured = std.process.environmentFrom(login.*.environment, "DBUS_SYSTEM_BUS_ADDRESS")
-    const address = if configured == null { "unix:path=/run/mlx/bus" } else { std.string.asSlice(configured.?) }
-    const pid = session_module.start(user, session, login.*.groupPath, login.*.runtimeRoot, address)
+    const pid = session_module.start(user, session, login.*.groupPath, login.*.runtimeRoot, busAddress(login))
     if pid < 0 { return DENIED }
     login.*.activeLength = copyInto(@ptrCast([*]u8, &login.*.active), users_module.NAME_MOST, users_module.nameOf(user))
     login.*.sessionPid = pid
@@ -314,7 +366,9 @@ fn perform(login: *Login, call: *const dbus.Header, pending: *Pending) -> void {
             replyBool(login, call, false)
             return
         }
+        stopGreeter(login)
         const started = startSession(login, index, pendingSession(pending))
+        if started != ALLOWED && !startGreeter(login) { login.*.running = false }
         replyBool(login, call, started == ALLOWED)
         return
     }
@@ -340,6 +394,15 @@ fn reapSession(login: *Login) -> void {
             login.*.sessionPid = -1
             login1.sessionEnded(login1Of(login))
             say(login, "login: session ended; the seat is free\n")
+            if !startGreeter(login) { login.*.running = false }
+        } else if pid == login.*.greeterPid {
+            login.*.greeterPid = -1
+            login1.sessionEnded(login1Of(login))
+            say(login, "login: greeter ended\n")
+            if login.*.activeLength == 0 {
+                sleep(500)
+                if !startGreeter(login) { login.*.running = false }
+            }
         } else {
             login1.childEnded(login1Of(login), clientOf(login), pid, status)
         }
@@ -437,7 +500,7 @@ fn dispatch(login: *Login) -> void {
             } else if header.flags & dbus.NO_REPLY_EXPECTED == 0 {
                 sendError(login, &header, "org.freedesktop.DBus.Error.UnknownMethod", "mlx-login: no such method")
             }
-        } else if header.kind == dbus.METHOD_CALL && login1.called(login1Of(login), clientOf(login), &header, body, login.*.sessionPid) {
+        } else if header.kind == dbus.METHOD_CALL && login1.called(login1Of(login), clientOf(login), &header, body, seatPid(login)) {
             // login1 answered it.
         } else if header.kind == dbus.SIGNAL && same(header.path, BUS_PATH) && same(header.interface, BUS_NAME) && same(header.member, "NameOwnerChanged") && same(header.signature, "sss") {
             var reading = dbus.reader(body, header.bodyLength, header.big)
@@ -447,7 +510,7 @@ fn dispatch(login: *Login) -> void {
             if !reading.failed { login1.nameChanged(login1Of(login), name, old, new) }
         } else if (header.kind == dbus.METHOD_RETURN || header.kind == dbus.ERROR) && header.hasReplySerial {
             const handled = permissionAnswered(login, &header)
-            if !handled { const ignored = login1.answered(login1Of(login), clientOf(login), &header, login.*.activeLength > 0) }
+            if !handled { const ignored = login1.answered(login1Of(login), clientOf(login), &header, seatPid(login) > 0) }
         }
     }
     if login.*.client.closed { login.*.running = false }
@@ -546,6 +609,22 @@ fn wait(login: *Login, signals: isize) -> void {
     if login.*.running && ready(entries[0]) { dispatch(login) }
 }
 
+fn parseId(text: []const u8, value: *u32) -> bool {
+    if text.length == 0 { return false }
+    var result: u32 = 0
+    var index: usize = 0
+    while index < text.length {
+        if text[index] < 48 || text[index] > 57 { return false }
+        const digit = @intCast(u32, text[index] - 48)
+        if result > 429496729 || result == 429496729 && digit > 5 { return false }
+        result = result * 10 + digit
+        index += 1
+    }
+    if result == 0 { return false }
+    value.* = result
+    return true
+}
+
 fn run(arguments: [][*]const u8) -> !void {
     const allocator = std.page_allocator.init()
     var verbose = false
@@ -555,6 +634,10 @@ fn run(arguments: [][*]const u8) -> !void {
     var runtimeRoot: []const u8 = "/run/mlx/user"
     var ttyPath: []const u8 = "/dev/tty0"
     var allowTestDevice = false
+    var greeterCompositor: []const u8 = ""
+    var greeterProgram: []const u8 = ""
+    var greeterUid: u32 = 65534
+    var greeterGid: u32 = 65534
     var index: usize = 1
     const count = std.process.count(arguments)
     while index < count {
@@ -578,12 +661,23 @@ fn run(arguments: [][*]const u8) -> !void {
             ttyPath = std.string.asSlice(std.process.argument(arguments, index))
         } else if std.string.eql(argument, std.string.fromSlice("--test-device-null")) {
             allowTestDevice = true
+        } else if std.string.eql(argument, std.string.fromSlice("--greeter")) && index + 2 < count {
+            index += 1
+            greeterCompositor = std.string.asSlice(std.process.argument(arguments, index))
+            index += 1
+            greeterProgram = std.string.asSlice(std.process.argument(arguments, index))
+        } else if std.string.eql(argument, std.string.fromSlice("--greeter-uid")) && index + 1 < count {
+            index += 1
+            if !parseId(std.string.asSlice(std.process.argument(arguments, index)), &greeterUid) { try fail("mlx-login: --greeter-uid needs a nonzero numeric uid", Failure.Usage) }
+        } else if std.string.eql(argument, std.string.fromSlice("--greeter-gid")) && index + 1 < count {
+            index += 1
+            if !parseId(std.string.asSlice(std.process.argument(arguments, index)), &greeterGid) { try fail("mlx-login: --greeter-gid needs a nonzero numeric gid", Failure.Usage) }
         } else {
-            try fail("usage: mlx-login [--verbose] [--passwd FILE] [--shadow FILE] [--group FILE] [--runtime-dir DIR] [--tty FILE|none] [--test-device-null]", Failure.Usage)
+            try fail("usage: mlx-login [--verbose] [--passwd FILE] [--shadow FILE] [--group FILE] [--runtime-dir DIR] [--tty FILE|none] [--test-device-null] [--greeter COMPOSITOR PROGRAM] [--greeter-uid UID] [--greeter-gid GID]", Failure.Usage)
         }
         index += 1
     }
-    if passwdPath.length == 0 || passwdPath.length >= users_module.DATABASE_PATH_MOST || shadowPath.length == 0 || shadowPath.length >= users_module.DATABASE_PATH_MOST || groupPath.length == 0 || groupPath.length >= users_module.DATABASE_PATH_MOST || runtimeRoot.length == 0 || runtimeRoot.length >= users_module.DATABASE_PATH_MOST || ttyPath.length == 0 || ttyPath.length >= users_module.DATABASE_PATH_MOST {
+    if passwdPath.length == 0 || passwdPath.length >= users_module.DATABASE_PATH_MOST || shadowPath.length == 0 || shadowPath.length >= users_module.DATABASE_PATH_MOST || groupPath.length == 0 || groupPath.length >= users_module.DATABASE_PATH_MOST || runtimeRoot.length == 0 || runtimeRoot.length >= users_module.DATABASE_PATH_MOST || ttyPath.length == 0 || ttyPath.length >= users_module.DATABASE_PATH_MOST || greeterCompositor.length >= users_module.DATABASE_PATH_MOST || greeterProgram.length >= users_module.DATABASE_PATH_MOST || (greeterCompositor.length == 0) != (greeterProgram.length == 0) {
         try fail("mlx-login: account database path is empty or too long", Failure.Usage)
     }
     if std.linux.syscall0(SYS_getuid) != 0 {
@@ -601,6 +695,11 @@ fn run(arguments: [][*]const u8) -> !void {
     login.*.running = true
     login.*.activeLength = 0
     login.*.sessionPid = -1
+    login.*.greeterCompositor = greeterCompositor
+    login.*.greeterProgram = greeterProgram
+    login.*.greeterUid = greeterUid
+    login.*.greeterGid = greeterGid
+    login.*.greeterPid = -1
     login1.init(login1Of(login), ttyPath, allowTestDevice)
     var pendingIndex: usize = 0
     while pendingIndex < PENDING_MOST {
@@ -615,8 +714,10 @@ fn run(arguments: [][*]const u8) -> !void {
         try fail("mlx-login: could not own org.mlx.Login on the system bus (is mlx-ipcd --system running?)", Failure.NoBus)
     }
     say(login, "login: org.mlx.Login and org.freedesktop.login1 on the system bus; waiting for the greeter\n")
+    if !startGreeter(login) { try fail("mlx-login: could not start the greeter compositor", Failure.NoGreeter) }
     dispatch(login)
     while login.*.running { wait(login, signals) }
+    stopGreeter(login)
     const closedSignals = std.linux.syscall1(SYS_close, @bitCast(usize, signals))
 }
 
