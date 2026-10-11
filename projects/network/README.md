@@ -205,7 +205,9 @@ sudo tools/install_network.sh --disable                   # back, for now
 ```
 
 It builds `mlx-netd`, `mlx-net` and MLXIPC's `mlx-ipcd` into
-`PREFIX/bin` (`--prefix`, default `/usr/local`) and installs
+`PREFIX/bin/mlx` (`--prefix`, default `/usr`: `/usr/bin/mlx`, which it
+puts on PATH, [`tools/lib/mlx_layout.sh`](../../tools/lib/mlx_layout.sh))
+and installs
 `/etc/mlx/network.conf` (an example, all commented out; an existing one
 stays), systemd units and mlx-init services for MLXIPC's system bus
 (`mlx-ipcd.service`, from `projects/desktop/ipc/examples`) and for

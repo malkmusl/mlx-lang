@@ -569,10 +569,17 @@ compiler builds the same binary from the same sources on every machine,
 so the checksum `--check` prints matches a build elsewhere, and a crash
 address from one machine finds its place in another's disassembly.
 
-It puts `mlx-compositor`, `mlx-terminal` and `mlx-session` into
-`/usr/local/bin` (`--prefix`) and `mlx-compositor.desktop` into
-`/usr/share/wayland-sessions` (`--sessions`), where both display managers
-look; `--destdir` stages everything for packaging, `--build-only` only
+It puts `mlx-compositor`, `mlx-terminal`, `mlx-session` and the other
+programs into `/usr/bin/mlx` (`PREFIX/bin/mlx`, `--prefix`, default
+`/usr`), a directory of their own that the installation puts on PATH
+after the system's directories (`/etc/profile.d/mlx.sh` for login shells,
+`/etc/environment.d/50-mlx.conf` for the user session,
+`/etc/systemd/system.conf.d/50-mlx-path.conf` for the system services:
+[`tools/lib/mlx_layout.sh`](../../../tools/lib/mlx_layout.sh)), and
+`mlx-compositor.desktop` into `/usr/share/wayland-sessions`
+(`--sessions`), where both display managers look; programs from installs
+before that layout (in `/usr/local/bin` or `/usr/bin`) are listed by
+`tools/remove_old_mlx_layout.sh` and removed with `--remove`; `--destdir` stages everything for packaging, `--build-only` only
 builds (into `mlx-out/session`). Then log out and pick "Mlx Compositor":
 in GDM with the gear button once your user is chosen, in SDDM in the
 session menu.

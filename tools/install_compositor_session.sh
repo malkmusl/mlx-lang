@@ -9,19 +9,22 @@
 # the XKB data (installed on any desktop). MLX_SESSION_HOST=cage|weston in
 # the session's environment runs it nested in one of those hosts instead.
 #
-# Installs:
-#   PREFIX/bin/mlx-compositor, PREFIX/bin/mlx-terminal, PREFIX/bin/mlx-sh, PREFIX/bin/mlx-console, PREFIX/bin/mlx-session,
-#   PREFIX/bin/mlx-dock, PREFIX/bin/mlx-topbar, PREFIX/bin/mlx-launcher,
-#   PREFIX/bin/mlx-settings, PREFIX/bin/mlx-files, PREFIX/bin/mlx-codemap,
-#                                     PREFIX/bin/mlx-profile, PREFIX/bin/mlx-capture,
-#                                     PREFIX/bin/mlx-ipcd, PREFIX/bin/mlx-ipc (MLXIPC,
-#                                     the session bus), PREFIX/bin/mlx-audiod,
-#                                     PREFIX/bin/mlx-audio (MLX Audio),
-#                                     PREFIX/bin/mlx-permissions (the
-#                                     permission agent and its dialog),
-#                                     PREFIX/bin/mlx-notifyd, PREFIX/bin/mlx-notify
-#                                     (the notifications, notify-send's
-#                                     like)
+# Installs (PREFIX is /usr unless --prefix says otherwise):
+#   PREFIX/bin/mlx/mlx-compositor, mlx-terminal, mlx-sh, mlx-console,
+#                                     mlx-session, mlx-dock, mlx-topbar,
+#                                     mlx-launcher, mlx-settings, mlx-files,
+#                                     mlx-observatory, mlx-codemap,
+#                                     mlx-profile, mlx-capture, mlx-ipcd,
+#                                     mlx-ipc (MLXIPC, the session bus),
+#                                     mlx-audiod, mlx-audio (MLX Audio),
+#                                     mlx-permissions (the permission agent
+#                                     and its dialog), mlx-notifyd,
+#                                     mlx-notify (the notifications,
+#                                     notify-send's like)
+#   PREFIX/bin/mlx on PATH: /etc/profile.d/mlx.sh,
+#                                     /etc/environment.d/50-mlx.conf,
+#                                     /etc/systemd/system.conf.d/50-mlx-path.conf
+#                                     (tools/lib/mlx_layout.sh)
 #   PREFIX/share/mlx/dbus-1/services/org.mlx.Audio.service,
 #                                     org.mlx.PermissionAgent.service,
 #                                     org.freedesktop.portal.Desktop.service,
@@ -65,7 +68,7 @@
 #   libpipewire-0.3-0 (libpipewire-0.3-0t64)
 #
 # Usage: tools/install_compositor_session.sh [options]
-#   --prefix DIR      programs go to DIR/bin (default /usr/local)
+#   --prefix DIR      programs go to DIR/bin/mlx (default /usr)
 #   --sessions DIR    the session entry's directory
 #                     (default /usr/share/wayland-sessions)
 #   --destdir DIR     stage everything under DIR instead (packaging, tests)
@@ -107,8 +110,9 @@ set -euo pipefail
 
 repo_root=$(cd "$(dirname "$0")/.." && pwd)
 cd "$repo_root"
+source tools/lib/mlx_layout.sh
 
-prefix=/usr/local
+prefix=$mlx_default_prefix
 sessions=/usr/share/wayland-sessions
 destdir=""
 compiler=""
@@ -144,7 +148,8 @@ if [[ $replace_libpipewire -eq 1 && -n "$destdir" ]]; then
     exit 2
 fi
 
-bindir="$prefix/bin"
+prefix=${prefix%/}
+bindir=$(mlx_bindir "$prefix")
 programs=(mlx-compositor mlx-terminal mlx-sh mlx-console mlx-session mlx-dock mlx-topbar mlx-launcher mlx-settings mlx-files mlx-observatory mlx-codemap mlx-profile mlx-capture mlx-ipcd mlx-ipc mlx-audiod mlx-audio mlx-permissions mlx-notifyd mlx-notify)
 applications="$prefix/share/applications"
 icons="$prefix/share/icons/hicolor/128x128/apps"
@@ -164,6 +169,14 @@ as_owner() {
     else
         sudo "$@"
     fi
+}
+
+# sudo when the target is not writable by us, else nothing (a RUNNER for
+# tools/lib/mlx_layout.sh).
+owner_runner() {
+    local probe=$1
+    while [[ ! -e "$probe" ]]; do probe=$(dirname "$probe"); done
+    [[ -w "$probe" ]] || echo sudo
 }
 
 # PipeWire's, WirePlumber's and PulseAudio's user units; what replacing
@@ -275,7 +288,8 @@ if [[ $uninstall -eq 1 ]]; then
     [[ -f "$destdir$sound_marker" ]] && restore_sound_servers
     for program in "${programs[@]}"; do
         path="$destdir$bindir/$program"
-        [[ -e "$path" ]] && as_owner "$path" rm -f -- "$path" && echo "removed $path"
+        # -L too: mlx-codemap links to mlx-observatory, removed before it.
+        [[ -e "$path" || -L "$path" ]] && as_owner "$destdir$bindir" rm -f -- "$path" && echo "removed $path"
     done
     path="$destdir$sessions/mlx-compositor.desktop"
     [[ -e "$path" ]] && as_owner "$path" rm -f -- "$path" && echo "removed $path"
@@ -290,6 +304,7 @@ if [[ $uninstall -eq 1 ]]; then
     for path in "$destdir$applications/mlx-settings.desktop" "$destdir$applications/org.mlx.files.desktop" "$destdir$applications/org.mlx.observatory.desktop" "$destdir$icons/org.mlx.files.png" "$destdir$icons/org.mlx.settings.png" "$destdir$icons/org.mlx.observatory.png" "$destdir$services/org.mlx.Audio.service" "$destdir$services/org.mlx.PermissionAgent.service" "$destdir$services/org.freedesktop.portal.Desktop.service" "$destdir$services/org.freedesktop.Notifications.service"; do
         [[ -e "$path" ]] && as_owner "$path" rm -f -- "$path" && echo "removed $path"
     done
+    mlx_remove_path_files "$destdir" "$bindir" "$(owner_runner "$destdir/etc")"
     exit 0
 fi
 
@@ -357,6 +372,8 @@ for program in "${programs[@]}"; do echo "installed $destdir$bindir/$program"; d
 echo "installed $destdir$sessions/mlx-compositor.desktop"
 echo "installed $destdir$audio_libs: ${audio_lib_files[*]}"
 echo "installed $destdir$capture_libs/libpipewire-0.3.so.0"
+mlx_install_path_files "$destdir" "$bindir" "$(owner_runner "$destdir/etc/profile.d")"
+mlx_note_old_layout "$destdir" "$bindir"
 [[ $replace_libpulse -eq 1 ]] && replace_libpulse
 [[ $replace_libpipewire -eq 1 ]] && replace_libpipewire
 [[ $replace_sound -eq 1 ]] && replace_sound_servers

@@ -37,7 +37,8 @@ control and stops that greeter; when the user session exits, a fresh one
 is started. `--greeter-uid` and `--greeter-gid` select another dedicated
 numeric identity when a system reserves one. The installed units enable
 this mode and expect `mlx-compositor` from the compositor installation in
-the same `PREFIX/bin`.
+the same `PREFIX/bin/mlx` (`/usr/bin/mlx` by default, on PATH after the
+installation: [`tools/lib/mlx_layout.sh`](../../../tools/lib/mlx_layout.sh)).
 
 ## Installation
 

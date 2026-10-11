@@ -2,15 +2,18 @@
 # Builds and installs the MLX display-manager pieces without changing the
 # active display manager unless --enable is present.
 #
-# Installs:
-#   PREFIX/bin/mlx-login, mlx-greeter and mlx-lock
+# Installs (PREFIX is /usr unless --prefix says otherwise):
+#   PREFIX/bin/mlx/mlx-login, mlx-greeter and mlx-lock
+#   PREFIX/bin/mlx on PATH: /etc/profile.d/mlx.sh, /etc/environment.d/50-mlx.conf,
+#                                  /etc/systemd/system.conf.d/50-mlx-path.conf
+#                                  (tools/lib/mlx_layout.sh)
 #   /etc/systemd/system/mlx-login.service
 #   /etc/mlx/init/services/mlx-ipcd.service, mlx-netd.service and
 #                                  mlx-login.service
 #   PREFIX/share/doc/mlx/login/README.md
 #
 # Usage: tools/install_login.sh [options] [compiler]
-#   --prefix DIR       programs go to DIR/bin (default /usr/local)
+#   --prefix DIR       programs go to DIR/bin/mlx (default /usr)
 #   --destdir DIR      stage every path below DIR; never calls systemctl
 #   --compiler PATH    Mlx compiler (a final positional path also works)
 #   --enable           make mlx-login the display-manager.service and mask
@@ -24,8 +27,9 @@ set -euo pipefail
 
 repo_root=$(cd "$(dirname "$0")/.." && pwd)
 cd "$repo_root"
+source tools/lib/mlx_layout.sh
 
-prefix=/usr/local
+prefix=$mlx_default_prefix
 destdir=""
 compiler=""
 enable=false
@@ -87,7 +91,7 @@ if [[ -z "$destdir" && $(id -u) -ne 0 ]]; then
     die "run it as root (or stage it with --destdir DIR)"
 fi
 
-bindir="${prefix%/}/bin"
+bindir=$(mlx_bindir "$prefix")
 docdir="${prefix%/}/share/doc/mlx/login"
 system_dir="$destdir/etc/systemd/system"
 wants_path="$system_dir/graphical.target.wants/mlx-login.service"
@@ -243,6 +247,8 @@ install -m 644 "$build/mlx-netd.init" "$destdir/etc/mlx/init/services/mlx-netd.s
 install -m 644 "$build/mlx-login.init" "$destdir/etc/mlx/init/services/mlx-login.service"
 install -m 644 projects/desktop/login/README.md "$destdir$docdir/README.md"
 echo "installed mlx-login, mlx-greeter, mlx-lock, the systemd unit and the mlx-init service set into ${destdir:-/}"
+mlx_install_path_files "$destdir" "$bindir"
+mlx_note_old_layout "$destdir" "$bindir"
 
 if $enable; then
     enable_login

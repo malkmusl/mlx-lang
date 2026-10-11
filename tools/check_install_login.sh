@@ -96,26 +96,27 @@ run_installer "$work/enable.log" --destdir "$stage" --prefix /opt/mlx --enable \
     --compiler "$fake_compiler"
 
 for program in mlx-login mlx-greeter mlx-lock; do
-    path="$stage/opt/mlx/bin/$program"
+    path="$stage/opt/mlx/bin/mlx/$program"
     [[ -x "$path" ]] || fail "$program was not installed executable"
     source_name=${program#mlx-}
     grep -q "projects/desktop/$source_name/main.mlx" "$path" || fail "$program came from the wrong Mlx source"
 done
-[[ "$(stat -c '%a' "$stage/opt/mlx/bin/mlx-login")" == 755 ]] || fail "installed programs are not mode 0755"
+[[ "$(stat -c '%a' "$stage/opt/mlx/bin/mlx/mlx-login")" == 755 ]] || fail "installed programs are not mode 0755"
 
 unit="$system/mlx-login.service"
 [[ -f "$unit" ]] || fail "mlx-login.service was not installed"
 grep -q '^Requires=mlx-ipcd.service$' "$unit" || fail "mlx-login.service does not require mlx-ipcd"
-grep -q '^ExecStart=/opt/mlx/bin/mlx-login --greeter /opt/mlx/bin/mlx-compositor /opt/mlx/bin/mlx-greeter$' "$unit" || fail "mlx-login.service has the wrong ExecStart"
+grep -q '^ExecStart=/opt/mlx/bin/mlx/mlx-login --greeter /opt/mlx/bin/mlx/mlx-compositor /opt/mlx/bin/mlx/mlx-greeter$' "$unit" || fail "mlx-login.service has the wrong ExecStart"
 grep -q '^Documentation=file:///opt/mlx/share/doc/mlx/login/README.md$' "$unit" || fail "mlx-login.service has the wrong documentation path"
 [[ "$(stat -c '%a' "$unit")" == 644 ]] || fail "mlx-login.service is not mode 0644"
 
 init_services="$stage/etc/mlx/init/services"
-grep -q '^exec = /opt/mlx/bin/mlx-ipcd --system$' "$init_services/mlx-ipcd.service" || fail "mlx-init IPC service was not rendered"
-grep -q '^exec = /opt/mlx/bin/mlx-netd$' "$init_services/mlx-netd.service" || fail "mlx-init network service was not rendered"
-grep -q '^exec = /opt/mlx/bin/mlx-login --greeter /opt/mlx/bin/mlx-compositor /opt/mlx/bin/mlx-greeter$' "$init_services/mlx-login.service" || fail "mlx-init login service was not rendered"
+grep -q '^exec = /opt/mlx/bin/mlx/mlx-ipcd --system$' "$init_services/mlx-ipcd.service" || fail "mlx-init IPC service was not rendered"
+grep -q '^exec = /opt/mlx/bin/mlx/mlx-netd$' "$init_services/mlx-netd.service" || fail "mlx-init network service was not rendered"
+grep -q '^exec = /opt/mlx/bin/mlx/mlx-login --greeter /opt/mlx/bin/mlx/mlx-compositor /opt/mlx/bin/mlx/mlx-greeter$' "$init_services/mlx-login.service" || fail "mlx-init login service was not rendered"
 grep -q '^after = mlx-ipcd mlx-netd$' "$init_services/mlx-login.service" || fail "mlx-init login ordering is wrong"
 [[ -f "$stage/opt/mlx/share/doc/mlx/login/README.md" ]] || fail "login README was not installed"
+grep -qx 'PATH=${PATH}:/opt/mlx/bin/mlx' "$stage/etc/environment.d/50-mlx.conf" && [[ -f "$stage/etc/profile.d/mlx.sh" ]] || fail "the programs' directory was not put on PATH"
 if grep -R -q '@BINDIR@\|@DOCDIR@' "$unit" "$init_services"; then
     fail "an installation placeholder remained in a staged service"
 fi
@@ -141,7 +142,7 @@ assert_link "$system/display-manager.service" /usr/lib/systemd/system/sddm.servi
 assert_link "$system/sddm.service" /usr/lib/systemd/system/sddm.service
 assert_link "$system/graphical.target.wants/mlx-login.service" /custom/preexisting-login.service
 [[ ! -e "$state" ]] || fail "saved enable state remained after disable"
-[[ -x "$stage/opt/mlx/bin/mlx-login" ]] || fail "disable removed installed programs"
+[[ -x "$stage/opt/mlx/bin/mlx/mlx-login" ]] || fail "disable removed installed programs"
 
 # A second disable is a no-op and must not remove anything it just restored.
 run_installer "$work/disable-again.log" --destdir "$stage" --disable
@@ -166,7 +167,7 @@ real_compiler=${1:-$(tools/ensure_compiler.sh)}
 real_stage="$work/real-root"
 run_installer "$work/real-install.log" --destdir "$real_stage" --compiler "$real_compiler"
 for program in mlx-login mlx-greeter mlx-lock; do
-    [[ -s "$real_stage/usr/local/bin/$program" && -x "$real_stage/usr/local/bin/$program" ]] || \
+    [[ -s "$real_stage/usr/bin/mlx/$program" && -x "$real_stage/usr/bin/mlx/$program" ]] || \
         fail "the real $program build was not staged executable"
 done
 

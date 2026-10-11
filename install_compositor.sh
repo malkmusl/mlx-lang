@@ -3,16 +3,15 @@
 # and the machine, and shows the session log: the one script to run when
 # the session does not come up.
 #
-#   ./install_compositor.sh              build, install into /usr/bin, check
+#   ./install_compositor.sh              build, install into /usr/bin/mlx, check
 #   ./install_compositor.sh --check      only check an installation and the
 #                                        machine (no build)
 #   ./install_compositor.sh --log        show the last session log
 #   ./install_compositor.sh --uninstall  remove the installation
 #
 # Options:
-#   --prefix DIR    programs go to DIR/bin (default /usr: /usr/bin, which
-#                   is on every PATH; tools/install_compositor_session.sh
-#                   defaults to /usr/local)
+#   --prefix DIR    programs go to DIR/bin/mlx (default /usr; the
+#                   installation puts that directory on PATH)
 #   --sessions DIR  where GDM and SDDM read session entries
 #                   (default /usr/share/wayland-sessions)
 #   --compiler PATH the Mlx compiler (default: mlx-out/bin/compiler/mlx4,
@@ -25,8 +24,9 @@ set -uo pipefail
 
 repo_root=$(cd "$(dirname "$0")" && pwd)
 cd "$repo_root"
+source tools/lib/mlx_layout.sh
 
-prefix=/usr
+prefix=$mlx_default_prefix
 sessions=/usr/share/wayland-sessions
 compiler=""
 mode=install
@@ -44,7 +44,8 @@ while [[ $# -gt 0 ]]; do
     shift
 done
 
-bindir="$prefix/bin"
+prefix=${prefix%/}
+bindir=$(mlx_bindir "$prefix")
 log_file="${MLX_SESSION_LOG:-${XDG_CONFIG_HOME:-$HOME/.config}/mlx/compositor.log}"
 problems=0
 
@@ -151,10 +152,10 @@ if [[ -n "$found" ]]; then
     if [[ "$found" == "$bindir/mlx-compositor" ]]; then
         ok "mlx-compositor is on PATH ($found)"
     else
-        note "PATH finds another mlx-compositor first: $found (the session uses $bindir/mlx-compositor); an earlier install: remove it with sudo rm $(dirname "$found")/mlx-{compositor,terminal,session,dock,launcher,settings}"
+        note "PATH finds another mlx-compositor first: $found (the session uses $bindir/mlx-compositor); an earlier install: tools/remove_old_mlx_layout.sh shows its files, with --remove (as root) it removes them"
     fi
 else
-    note "$bindir is not on this shell's PATH (the session does not need it: its entry uses absolute paths)"
+    note "$bindir is not on this shell's PATH yet: from the next login it is (/etc/profile.d/mlx.sh); the session does not need it"
 fi
 entry="$sessions/mlx-compositor.desktop"
 if [[ -f "$entry" ]]; then

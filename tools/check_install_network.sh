@@ -65,7 +65,9 @@ for unit in NetworkManager.service systemd-networkd.service wpa_supplicant.servi
 done
 assert_link "$system/multi-user.target.wants/mlx-netd.service" /etc/systemd/system/mlx-netd.service
 assert_link "$system/multi-user.target.wants/mlx-ipcd.service" /etc/systemd/system/mlx-ipcd.service
-[[ -x "$stage/usr/local/bin/mlx-netd" ]] || fail "mlx-netd was not installed"
+[[ -x "$stage/usr/bin/mlx/mlx-netd" ]] || fail "mlx-netd was not installed in /usr/bin/mlx"
+grep -q '^ExecStart=/usr/bin/mlx/mlx-netd' "$system/mlx-netd.service" || fail "mlx-netd.service does not start /usr/bin/mlx/mlx-netd"
+grep -qx 'PATH=${PATH}:/usr/bin/mlx' "$stage/etc/environment.d/50-mlx.conf" && [[ -f "$stage/etc/profile.d/mlx.sh" && -f "$stage/etc/systemd/system.conf.d/50-mlx-path.conf" ]] || fail "/usr/bin/mlx was not put on PATH"
 # A second --enable keeps the state of before the first.
 run_installer "$work/enable-again.log" --destdir "$stage" --enable "$fake_compiler"
 echo "ok   --enable masks the replaced services and keeps what was there"
@@ -80,7 +82,7 @@ assert_link "$system/multi-user.target.wants/mlx-ipcd.service" /etc/systemd/syst
 assert_link "$system/multi-user.target.wants/NetworkManager.service" /usr/lib/systemd/system/NetworkManager.service
 grep -q 'to start after daemon-reload: NetworkManager.service' "$work/disable.log" || fail "--disable did not name NetworkManager to start: $(cat "$work/disable.log")"
 assert_absent "$stage/var/lib/mlx/network-installer"
-[[ -x "$stage/usr/local/bin/mlx-netd" ]] || fail "--disable removed the installed program"
+[[ -x "$stage/usr/bin/mlx/mlx-netd" ]] || fail "--disable removed the installed program"
 run_installer "$work/disable-again.log" --destdir "$stage" --disable
 assert_link "$system/systemd-networkd.service" /dev/null
 grep -q 'was not enabled; nothing changed' "$work/disable-again.log" || fail "a second --disable changed something: $(cat "$work/disable-again.log")"

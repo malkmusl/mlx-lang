@@ -5,8 +5,11 @@
 # (/run/mlx/bus; no D-Bus). Nothing is switched over unless --enable says
 # so.
 #
-# Installs:
-#   PREFIX/bin/mlx-netd, PREFIX/bin/mlx-net, PREFIX/bin/mlx-ipcd
+# Installs (PREFIX is /usr unless --prefix says otherwise):
+#   PREFIX/bin/mlx/mlx-netd, mlx-net, mlx-ipcd
+#   PREFIX/bin/mlx on PATH: /etc/profile.d/mlx.sh, /etc/environment.d/50-mlx.conf,
+#                                     /etc/systemd/system.conf.d/50-mlx-path.conf
+#                                     (tools/lib/mlx_layout.sh)
 #   /etc/mlx/network.conf             (an example, all commented out; an
 #                                     existing one stays)
 #   /etc/systemd/system/mlx-ipcd.service (MLXIPC's system bus),
@@ -36,7 +39,8 @@ set -euo pipefail
 
 repo_root=$(cd "$(dirname "$0")/.." && pwd)
 cd "$repo_root"
-prefix=/usr/local
+source tools/lib/mlx_layout.sh
+prefix=$mlx_default_prefix
 destdir=""
 enable=false
 disable=false
@@ -47,7 +51,7 @@ while [[ $# -gt 0 ]]; do
         --destdir) destdir=$2; shift 2 ;;
         --enable) enable=true; shift ;;
         --disable) disable=true; shift ;;
-        -h|--help) sed -n '2,38p' "$0"; exit 0 ;;
+        -h|--help) sed -n '2,/^set -euo/p' "$0" | sed '$d; s/^# \{0,1\}//'; exit 0 ;;
         *) compiler=$1; shift ;;
     esac
 done
@@ -168,7 +172,8 @@ trap 'rm -rf -- "$build"' EXIT
 "$compiler" --quiet projects/desktop/ipc/main.mlx -o "$build/mlx-ipcd"
 echo "built mlx-netd, mlx-net and mlx-ipcd"
 
-bindir="$prefix/bin"
+prefix=${prefix%/}
+bindir=$(mlx_bindir "$prefix")
 install -d "$destdir$bindir" "$destdir/etc/mlx" "$destdir/etc/systemd/system" "$destdir/etc/mlx/init/services" "$destdir$prefix/share/doc/mlx/network"
 install -d -m 700 "$destdir/var/lib/mlx/network"
 install -m 755 "$build/mlx-netd" "$build/mlx-net" "$build/mlx-ipcd" "$destdir$bindir/"
@@ -185,6 +190,8 @@ install -m 644 "$build/mlx-netd.init" "$destdir/etc/mlx/init/services/mlx-netd.s
 install -m 644 "$build/mlx-ipcd.init" "$destdir/etc/mlx/init/services/mlx-ipcd.service"
 install -m 644 projects/network/README.md "$destdir$prefix/share/doc/mlx/network/README.md"
 echo "installed into ${destdir:-/}: $bindir/mlx-netd, $bindir/mlx-net, $bindir/mlx-ipcd, /etc/mlx/network.conf, the systemd units and mlx-init services of mlx-ipcd and mlx-netd"
+mlx_install_path_files "$destdir" "$bindir"
+mlx_note_old_layout "$destdir" "$bindir"
 
 if $enable; then
     # What --disable puts back, kept once (a second --enable keeps the
