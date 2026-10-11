@@ -1,0 +1,522 @@
+// The DHCPv4 client (RFC 2131, options from RFC 2132) of one link: it
+// asks for an address (DISCOVER, the first OFFER, REQUEST, ACK), keeps the
+// lease (REQUEST to its server at T1, to anyone at T2), and lets go of it
+// when it runs out or the server says no (NAK). It talks over a UDP socket
+// on port 68 bound to the link (system.udpOnLink) and asks the servers to
+// broadcast their answers, so it hears them before it has an address.
+//
+// The daemon calls readable when the socket has something and tick on
+// its timer; both say what happened (EVENT_*): a lease came, was renewed,
+// or is gone (the daemon then configures or unconfigures the link).
+const system = @import("./system.mlx")
+
+pub const EVENT_NONE: u32 = 0
+pub const EVENT_BOUND: u32 = 1
+pub const EVENT_RENEWED: u32 = 2
+pub const EVENT_LOST: u32 = 3
+
+pub const IDLE: u32 = 0
+pub const SELECTING: u32 = 1
+pub const REQUESTING: u32 = 2
+pub const BOUND: u32 = 3
+pub const RENEWING: u32 = 4
+pub const REBINDING: u32 = 5
+
+const DISCOVER: u8 = 1
+const OFFER: u8 = 2
+const REQUEST: u8 = 3
+const ACK: u8 = 5
+const NAK: u8 = 6
+const RELEASE: u8 = 7
+
+const SERVER_PORT: u16 = 67
+const CLIENT_PORT: u16 = 68
+const PACKET: usize = 576
+// Retransmission: from FIRST_WAIT doubling to LONGEST_WAIT milliseconds;
+// a REQUEST unanswered this often starts again with a DISCOVER.
+const FIRST_WAIT: usize = 2000
+const LONGEST_WAIT: usize = 32000
+const REQUEST_TRIES: u32 = 4
+const RENEW_WAIT: usize = 10000
+
+pub const Lease = struct {
+    address: [4]u8
+    prefix: u8
+    router: [4]u8
+    hasRouter: bool
+    // Up to three name servers, four bytes each.
+    dns: [12]u8
+    dnsCount: usize
+    domain: [64]u8
+    domainLength: usize
+    server: [4]u8
+    // Seconds: how long it holds, when to renew and rebind.
+    seconds: u32
+    renew: u32
+    rebind: u32
+}
+
+pub const Client = struct {
+    state: u32
+    socket: isize
+    name: [16]u8
+    nameLength: usize
+    mac: [6]u8
+    hostname: [64]u8
+    hostnameLength: usize
+    xid: u32
+    // What the chosen server offered.
+    offered: [4]u8
+    server: [4]u8
+    lease: Lease
+    // When to send again (milliseconds), how long the last wait was, how
+    // many times a REQUEST went unanswered.
+    sendAt: usize
+    wait: usize
+    tries: u32
+    // When the lease began (milliseconds).
+    boundAt: usize
+}
+
+fn nameOf(client: *Client) -> []const u8 {
+    var bytes: [*]const u8 = undefined
+    unsafe { bytes = @ptrFromInt([*]const u8, @intFromPtr(client) + @offsetOf(Client, "name")) }
+    return bytes[0..client.*.nameLength]
+}
+
+fn hostnameOf(client: *Client) -> []const u8 {
+    var bytes: [*]const u8 = undefined
+    unsafe { bytes = @ptrFromInt([*]const u8, @intFromPtr(client) + @offsetOf(Client, "hostname")) }
+    return bytes[0..client.*.hostnameLength]
+}
+
+// Name server `index` of the lease.
+pub fn dnsAt(lease: *const Lease, index: usize) -> [4]u8 {
+    return [4]u8{ lease.*.dns[index * 4], lease.*.dns[index * 4 + 1], lease.*.dns[index * 4 + 2], lease.*.dns[index * 4 + 3] }
+}
+
+pub fn domainOf(lease: *const Lease) -> []const u8 {
+    var bytes: [*]const u8 = undefined
+    unsafe { bytes = @ptrFromInt([*]const u8, @intFromPtr(lease) + @offsetOf(Lease, "domain")) }
+    return bytes[0..lease.*.domainLength]
+}
+
+pub fn init(client: *Client) -> void {
+    client.*.state = IDLE
+    client.*.socket = -1
+    client.*.nameLength = 0
+    client.*.hostnameLength = 0
+}
+
+// Starts asking for an address on link `name` (MAC `mac`), saying
+// `hostname` (may be empty); false when its socket could not be made.
+pub fn start(client: *Client, name: []const u8, mac: [6]u8, hostname: []const u8) -> bool {
+    stop(client)
+    var length: usize = 0
+    while length < name.length && length < 16 {
+        client.*.name[length] = name[length]
+        length += 1
+    }
+    client.*.nameLength = length
+    length = 0
+    while length < hostname.length && length < 64 {
+        client.*.hostname[length] = hostname[length]
+        length += 1
+    }
+    client.*.hostnameLength = length
+    client.*.mac = mac
+    client.*.socket = system.udpOnLink(name, CLIENT_PORT)
+    if client.*.socket < 0 { return false }
+    discover(client)
+    return true
+}
+
+// Stops (the socket goes; the lease is forgotten).
+pub fn stop(client: *Client) -> void {
+    system.close(client.*.socket)
+    client.*.socket = -1
+    client.*.state = IDLE
+}
+
+// Gives the lease back to its server (DHCPRELEASE), then stops.
+pub fn release(client: *Client) -> void {
+    if client.*.socket >= 0 && (client.*.state == BOUND || client.*.state == RENEWING || client.*.state == REBINDING) {
+        var packet: [576]u8 = undefined
+        var bytes: [*]u8 = undefined
+        unsafe { bytes = @ptrCast([*]u8, &packet) }
+        const length = build(client, bytes, RELEASE, client.*.lease.address, false)
+        const sent = system.sendTo(client.*.socket, bytes, length, client.*.lease.server, SERVER_PORT)
+    }
+    stop(client)
+}
+
+fn discover(client: *Client) -> void {
+    client.*.state = SELECTING
+    client.*.xid = system.random32()
+    client.*.wait = FIRST_WAIT
+    client.*.tries = 0
+    send(client)
+}
+
+// The next wait: doubled, at most LONGEST_WAIT, give or take a second.
+fn backOff(client: *Client) -> void {
+    client.*.wait = client.*.wait * 2
+    if client.*.wait > LONGEST_WAIT { client.*.wait = LONGEST_WAIT }
+}
+
+fn store32(bytes: [*]u8, at: usize, value: u32) -> void {
+    bytes[at] = @intCast(u8, value >> 24)
+    bytes[at + 1] = @intCast(u8, (value >> 16) & 255)
+    bytes[at + 2] = @intCast(u8, (value >> 8) & 255)
+    bytes[at + 3] = @intCast(u8, value & 255)
+}
+
+fn load32(bytes: [*]const u8, at: usize) -> u32 {
+    return (@intCast(u32, bytes[at]) << 24) | (@intCast(u32, bytes[at + 1]) << 16) | (@intCast(u32, bytes[at + 2]) << 8) | @intCast(u32, bytes[at + 3])
+}
+
+fn putAddress(bytes: [*]u8, at: usize, address: [4]u8) -> void {
+    var index: usize = 0
+    while index < 4 {
+        bytes[at + index] = address[index]
+        index += 1
+    }
+}
+
+// A message of `kind` into `bytes`, with ciaddr `own` (0.0.0.0 before a
+// lease); asking for `requested` from server `server` when `selecting`.
+// Its length.
+fn build(client: *Client, bytes: [*]u8, kind: u8, own: [4]u8, selecting: bool) -> usize {
+    var index: usize = 0
+    while index < PACKET {
+        bytes[index] = 0
+        index += 1
+    }
+    bytes[0] = 1
+    bytes[1] = 1
+    bytes[2] = 6
+    store32(bytes, 4, client.*.xid)
+    // Broadcast the answer: we may not have an address yet.
+    if own[0] == 0 { bytes[10] = 128 }
+    putAddress(bytes, 12, own)
+    index = 0
+    while index < 6 {
+        bytes[28 + index] = client.*.mac[index]
+        index += 1
+    }
+    // The magic cookie, then the options.
+    bytes[236] = 99
+    bytes[237] = 130
+    bytes[238] = 83
+    bytes[239] = 99
+    var at: usize = 240
+    bytes[at] = 53
+    bytes[at + 1] = 1
+    bytes[at + 2] = kind
+    at += 3
+    // Client identifier: hardware type 1 and the MAC.
+    bytes[at] = 61
+    bytes[at + 1] = 7
+    bytes[at + 2] = 1
+    index = 0
+    while index < 6 {
+        bytes[at + 3 + index] = client.*.mac[index]
+        index += 1
+    }
+    at += 9
+    if selecting {
+        bytes[at] = 50
+        bytes[at + 1] = 4
+        putAddress(bytes, at + 2, client.*.offered)
+        bytes[at + 6] = 54
+        bytes[at + 7] = 4
+        putAddress(bytes, at + 8, client.*.server)
+        at += 12
+    }
+    if kind == RELEASE {
+        bytes[at] = 54
+        bytes[at + 1] = 4
+        putAddress(bytes, at + 2, client.*.lease.server)
+        at += 6
+    }
+    if kind != RELEASE {
+        const hostname = hostnameOf(client)
+        if hostname.length > 0 {
+            bytes[at] = 12
+            bytes[at + 1] = @intCast(u8, hostname.length)
+            index = 0
+            while index < hostname.length {
+                bytes[at + 2 + index] = hostname[index]
+                index += 1
+            }
+            at += 2 + hostname.length
+        }
+        // What we want to know: mask, router, DNS, domain, lease, T1, T2.
+        bytes[at] = 55
+        bytes[at + 1] = 7
+        bytes[at + 2] = 1
+        bytes[at + 3] = 3
+        bytes[at + 4] = 6
+        bytes[at + 5] = 15
+        bytes[at + 6] = 51
+        bytes[at + 7] = 58
+        bytes[at + 8] = 59
+        at += 9
+        // The largest message we take.
+        bytes[at] = 57
+        bytes[at + 1] = 2
+        bytes[at + 2] = 2
+        bytes[at + 3] = 64
+        at += 4
+    }
+    bytes[at] = 255
+    at += 1
+    return if at < 300 { 300 } else { at }
+}
+
+// Sends what the state asks for, and when to again.
+fn send(client: *Client) -> void {
+    var packet: [576]u8 = undefined
+    var bytes: [*]u8 = undefined
+    unsafe { bytes = @ptrCast([*]u8, &packet) }
+    const nothing = [4]u8{ 0, 0, 0, 0 }
+    const everyone = [4]u8{ 255, 255, 255, 255 }
+    var length: usize = 0
+    var to = everyone
+    if client.*.state == SELECTING {
+        length = build(client, bytes, DISCOVER, nothing, false)
+    } else if client.*.state == REQUESTING {
+        length = build(client, bytes, REQUEST, nothing, true)
+    } else if client.*.state == RENEWING {
+        length = build(client, bytes, REQUEST, client.*.lease.address, false)
+        to = client.*.lease.server
+    } else if client.*.state == REBINDING {
+        length = build(client, bytes, REQUEST, client.*.lease.address, false)
+    } else {
+        return
+    }
+    const sent = system.sendTo(client.*.socket, bytes, length, to, SERVER_PORT)
+    const jitter = @intCast(usize, system.random32() % 1000)
+    const wait = if client.*.state == RENEWING || client.*.state == REBINDING { RENEW_WAIT } else { client.*.wait }
+    client.*.sendAt = system.milliseconds() + wait + jitter
+}
+
+// What an answer says.
+const Reply = struct {
+    kind: u8
+    yours: [4]u8
+    server: [4]u8
+    lease: Lease
+}
+
+fn parse(client: *Client, bytes: [*]const u8, length: usize, reply: *Reply) -> bool {
+    if length < 240 || bytes[0] != 2 || load32(bytes, 4) != client.*.xid { return false }
+    var index: usize = 0
+    while index < 6 {
+        if bytes[28 + index] != client.*.mac[index] { return false }
+        index += 1
+    }
+    if bytes[236] != 99 || bytes[237] != 130 || bytes[238] != 83 || bytes[239] != 99 { return false }
+    reply.*.kind = 0
+    index = 0
+    while index < 4 {
+        reply.*.yours[index] = bytes[16 + index]
+        reply.*.server[index] = 0
+        index += 1
+    }
+    var lease: *Lease = undefined
+    unsafe { lease = @ptrCast(*Lease, &reply.*.lease) }
+    lease.*.prefix = 24
+    lease.*.hasRouter = false
+    lease.*.dnsCount = 0
+    lease.*.domainLength = 0
+    lease.*.seconds = 3600
+    lease.*.renew = 0
+    lease.*.rebind = 0
+    var at: usize = 240
+    while at < length {
+        const code = bytes[at]
+        if code == 255 { break }
+        if code == 0 {
+            at += 1
+            continue
+        }
+        if at + 1 >= length { break }
+        const size = @intCast(usize, bytes[at + 1])
+        const data = at + 2
+        if data + size > length { break }
+        if code == 53 && size >= 1 { reply.*.kind = bytes[data] }
+        if code == 54 && size >= 4 {
+            var part: usize = 0
+            while part < 4 {
+                reply.*.server[part] = bytes[data + part]
+                part += 1
+            }
+        }
+        if code == 1 && size >= 4 {
+            // The mask's ones.
+            var ones: u8 = 0
+            var mask = load32(bytes, data)
+            while mask & 2147483648 != 0 {
+                ones += 1
+                mask = mask << 1
+            }
+            lease.*.prefix = ones
+        }
+        if code == 3 && size >= 4 {
+            var part: usize = 0
+            while part < 4 {
+                lease.*.router[part] = bytes[data + part]
+                part += 1
+            }
+            lease.*.hasRouter = true
+        }
+        if code == 6 {
+            var server: usize = 0
+            while server * 4 + 4 <= size && lease.*.dnsCount < 3 {
+                var part: usize = 0
+                while part < 4 {
+                    lease.*.dns[lease.*.dnsCount * 4 + part] = bytes[data + server * 4 + part]
+                    part += 1
+                }
+                lease.*.dnsCount += 1
+                server += 1
+            }
+        }
+        if code == 15 {
+            var part: usize = 0
+            while part < size && part < 64 && bytes[data + part] != 0 {
+                lease.*.domain[part] = bytes[data + part]
+                part += 1
+            }
+            lease.*.domainLength = part
+        }
+        if code == 51 && size >= 4 { lease.*.seconds = load32(bytes, data) }
+        if code == 58 && size >= 4 { lease.*.renew = load32(bytes, data) }
+        if code == 59 && size >= 4 { lease.*.rebind = load32(bytes, data) }
+        at = data + size
+    }
+    if lease.*.seconds < 10 { lease.*.seconds = 10 }
+    if lease.*.renew == 0 || lease.*.renew >= lease.*.seconds { lease.*.renew = lease.*.seconds / 2 }
+    if lease.*.rebind == 0 || lease.*.rebind >= lease.*.seconds || lease.*.rebind <= lease.*.renew { lease.*.rebind = lease.*.seconds * 7 / 8 }
+    lease.*.address = reply.*.yours
+    lease.*.server = reply.*.server
+    return reply.*.kind != 0
+}
+
+// The socket has something: what it meant (EVENT_*).
+pub fn readable(client: *Client, scratch: [*]u8, capacity: usize) -> u32 {
+    var event = EVENT_NONE
+    while client.*.socket >= 0 {
+        const count = system.receive(client.*.socket, scratch, capacity)
+        if count <= 0 { break }
+        var reply: Reply = undefined
+        if !parse(client, scratch, @intCast(usize, count), &reply) { continue }
+        const result = answer(client, &reply)
+        if result != EVENT_NONE { event = result }
+    }
+    return event
+}
+
+fn answer(client: *Client, reply: *Reply) -> u32 {
+    if client.*.state == SELECTING && reply.*.kind == OFFER {
+        client.*.offered = reply.*.yours
+        client.*.server = reply.*.server
+        client.*.state = REQUESTING
+        client.*.wait = FIRST_WAIT
+        client.*.tries = 0
+        say(client, "offered ", reply.*.yours)
+        send(client)
+        return EVENT_NONE
+    }
+    if client.*.state == REQUESTING || client.*.state == RENEWING || client.*.state == REBINDING {
+        if reply.*.kind == NAK {
+            say(client, "refused by ", reply.*.server)
+            const was_bound = client.*.state != REQUESTING
+            discover(client)
+            return if was_bound { EVENT_LOST } else { EVENT_NONE }
+        }
+        if reply.*.kind == ACK {
+            const renewed = client.*.state != REQUESTING
+            client.*.lease = reply.*.lease
+            if client.*.lease.server[0] == 0 { client.*.lease.server = client.*.server }
+            client.*.state = BOUND
+            client.*.boundAt = system.milliseconds()
+            client.*.sendAt = 0
+            say(client, if renewed { "renewed " } else { "bound " }, client.*.lease.address)
+            return if renewed { EVENT_RENEWED } else { EVENT_BOUND }
+        }
+    }
+    return EVENT_NONE
+}
+
+// The time passed: retransmissions, T1, T2, the lease running out.
+pub fn tick(client: *Client) -> u32 {
+    if client.*.state == IDLE { return EVENT_NONE }
+    const now = system.milliseconds()
+    if client.*.state == BOUND || client.*.state == RENEWING || client.*.state == REBINDING {
+        const held = now - client.*.boundAt
+        const lease = &client.*.lease
+        if held >= @intCast(usize, lease.*.seconds) * 1000 {
+            say(client, "lease ran out: ", lease.*.address)
+            discover(client)
+            return EVENT_LOST
+        }
+        if client.*.state == BOUND && held >= @intCast(usize, lease.*.renew) * 1000 {
+            client.*.state = RENEWING
+            client.*.xid = system.random32()
+            send(client)
+            return EVENT_NONE
+        }
+        if client.*.state == RENEWING && held >= @intCast(usize, lease.*.rebind) * 1000 {
+            client.*.state = REBINDING
+            send(client)
+            return EVENT_NONE
+        }
+    }
+    if client.*.sendAt != 0 && now >= client.*.sendAt {
+        if client.*.state == REQUESTING {
+            client.*.tries += 1
+            if client.*.tries >= REQUEST_TRIES {
+                discover(client)
+                return EVENT_NONE
+            }
+        }
+        if client.*.state == SELECTING || client.*.state == REQUESTING { backOff(client) }
+        send(client)
+    }
+    return EVENT_NONE
+}
+
+// Milliseconds until tick has something to do (at most `longest`).
+pub fn due(client: *Client, longest: usize) -> usize {
+    if client.*.state == IDLE { return longest }
+    const now = system.milliseconds()
+    var next = longest
+    if client.*.sendAt != 0 {
+        const wait = if client.*.sendAt > now { client.*.sendAt - now } else { 0 }
+        if wait < next { next = wait }
+    }
+    if client.*.state == BOUND || client.*.state == RENEWING || client.*.state == REBINDING {
+        const held = now - client.*.boundAt
+        var mark = @intCast(usize, client.*.lease.renew) * 1000
+        if client.*.state != BOUND { mark = @intCast(usize, client.*.lease.rebind) * 1000 }
+        if client.*.state == REBINDING { mark = @intCast(usize, client.*.lease.seconds) * 1000 }
+        const wait = if mark > held { mark - held } else { 0 }
+        if wait < next { next = wait }
+    }
+    return next
+}
+
+fn say(client: *Client, what: []const u8, address: [4]u8) -> void {
+    var line: [128]u8 = undefined
+    var bytes: [*]u8 = undefined
+    unsafe { bytes = @ptrCast([*]u8, &line) }
+    var length = system.put(bytes, 0, "netd: ")
+    length = system.put(bytes, length, nameOf(client))
+    length = system.put(bytes, length, ": dhcp ")
+    length = system.put(bytes, length, what)
+    length = system.putAddress(bytes, length, address)
+    length = system.put(bytes, length, "\n")
+    system.say(bytes[0..length])
+}

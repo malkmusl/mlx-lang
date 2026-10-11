@@ -18,6 +18,9 @@ server runtimes. `wayland/generated/` holds the modules materialized from
 name and are not re-exported from `std.mlx`.
 
 `json.mlx` (`std.json`) is the allocation-free JSON pull tokenizer.
+`netlink.mlx` (`std.netlink`) speaks netlink: route netlink (links, IPv4
+addresses, routes and their change groups) and generic netlink (families
+looked up by name, as nl80211).
 `sha2.mlx` (`std.sha2`) has SHA-256, SHA-512, HMAC-SHA256 and
 PBKDF2-HMAC-SHA256.
 

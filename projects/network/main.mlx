@@ -1,0 +1,160 @@
+// mlx-netd: the network of MLX/Linux, in place of NetworkManager, in Mlx
+// without libc. It follows the links through route netlink (std.netlink),
+// puts the cables and Wi-Fi cards up, and once one has a carrier
+// configures it: DHCPv4 (dhcp.mlx) or the static settings of
+// /etc/mlx/network.conf (config.mlx): its address, its default route and
+// its name servers, which it writes into resolv.conf (devices.mlx). It
+// answers on the system bus (bus.mlx: org.mlx.Network, and the part of
+// org.freedesktop.NetworkManager apps ask), which mlx-net (tool.mlx), the
+// top bar and mlx-settings use.
+//
+//     mlx4 projects/network/main.mlx -o mlx-netd
+//     tools/check_network.sh                  the end-to-end check (in
+//                                             network namespaces of its own)
+//
+// Options:
+//     --config FILE    the configuration (default /etc/mlx/network.conf)
+//     --resolv FILE    the resolver file it writes (default /etc/resolv.conf)
+//     --bus PATH       the system bus's socket (default
+//                      $DBUS_SYSTEM_BUS_ADDRESS, else
+//                      /run/dbus/system_bus_socket)
+//     --verbose        say what it does on stderr
+//
+// SIGHUP reads the configuration again; SIGTERM and SIGINT end it (the
+// links keep their addresses until their leases run out).
+const std = @import("std")
+const netlink = @import("std.netlink")
+const crash = @import("std.crash")
+const system = @import("./system.mlx")
+const config_module = @import("./config.mlx")
+const devices_module = @import("./devices.mlx")
+const bus = @import("./bus.mlx")
+
+const SCRATCH: usize = 65536
+const BUS_RETRY: usize = 10000
+const SIGHUP: u32 = 1
+
+const Failure = error { NoMemory, NoNetlink }
+
+fn fail(failure: Failure) -> Failure!void { return failure }
+
+fn cString(text: [*]const u8) -> []const u8 {
+    var length: usize = 0
+    while text[length] != 0 { length += 1 }
+    return text[0..length]
+}
+
+// What the events socket brought (links coming, changing, going).
+fn events(socket: *netlink.Socket, devices: *devices_module.Devices, scratch: [*]u8) -> bool {
+    var more = false
+    while true {
+        const count = netlink.receive(socket, scratch, SCRATCH, 0)
+        if count <= 0 { break }
+        more = true
+        var offset: usize = 0
+        var message: netlink.Message = undefined
+        while netlink.nextMessage(scratch, @intCast(usize, count), &offset, &message) {
+            if message.kind == netlink.RTM_NEWLINK { devices_module.linkChanged(devices, &message) }
+            if message.kind == netlink.RTM_DELLINK { devices_module.linkRemoved(devices, &message) }
+        }
+    }
+    return more
+}
+
+pub fn main(arguments: [][*]const u8) -> !void {
+    crash.install()
+    const allocator = std.page_allocator.init()
+    const environment = std.process.environmentEntries(arguments)
+    var config_path: []const u8 = "/etc/mlx/network.conf"
+    var resolv_path: []const u8 = "/etc/resolv.conf"
+    var bus_path: []const u8 = ""
+    var verbose = false
+    var index: usize = 1
+    while index < arguments.length {
+        const argument = cString(arguments[index])
+        const has_value = index + 1 < arguments.length
+        if system.same(argument, "--config") && has_value {
+            index += 1
+            config_path = cString(arguments[index])
+        } else if system.same(argument, "--resolv") && has_value {
+            index += 1
+            resolv_path = cString(arguments[index])
+        } else if system.same(argument, "--bus") && has_value {
+            index += 1
+            bus_path = cString(arguments[index])
+        } else if system.same(argument, "--verbose") {
+            verbose = true
+        } else {
+            system.say("usage: mlx-netd [--config FILE] [--resolv FILE] [--bus PATH] [--verbose]\n")
+            return
+        }
+        index += 1
+    }
+    const scratch_memory = allocator.alloc(SCRATCH, 16)
+    const config_memory = allocator.alloc(@sizeOf(config_module.Config), 16)
+    const devices_memory = allocator.alloc(@sizeOf(devices_module.Devices), 16)
+    const service_memory = allocator.alloc(@sizeOf(bus.Service), 16)
+    const out_memory = allocator.alloc(16384, 16)
+    if scratch_memory == null || config_memory == null || devices_memory == null || service_memory == null || out_memory == null { return fail(Failure.NoMemory) }
+    const scratch = scratch_memory.?
+    var config: *config_module.Config = undefined
+    var devices: *devices_module.Devices = undefined
+    var service: *bus.Service = undefined
+    unsafe {
+        config = @ptrCast(*config_module.Config, config_memory.?)
+        devices = @ptrCast(*devices_module.Devices, devices_memory.?)
+        service = @ptrCast(*bus.Service, service_memory.?)
+    }
+    config_module.load(config, config_path)
+    if !devices_module.init(devices, config, scratch, SCRATCH, resolv_path, verbose) { return fail(Failure.NoNetlink) }
+    var socket: netlink.Socket = undefined
+    if !netlink.open(&socket, netlink.ROUTE, netlink.GROUP_LINK) { return fail(Failure.NoNetlink) }
+    const signals = system.signals()
+    service.*.connected = false
+    service.*.out = out_memory.?
+    service.*.state = 0
+    service.*.verbose = verbose
+    const on_bus = bus.connect(service, allocator, environment, bus_path)
+    if !on_bus && verbose { system.say("netd: no system bus yet\n") }
+    // The links there are now.
+    const dumped = netlink.dumpLinks(&socket)
+    var poll: system.Poll = undefined
+    var slots: [16]usize = undefined
+    var slot_bytes: [*]usize = undefined
+    unsafe { slot_bytes = @ptrCast([*]usize, &slots) }
+    var running = true
+    while running {
+        system.pollClear(&poll)
+        const netlink_slot = system.pollAdd(&poll, socket.descriptor)
+        const signal_slot = system.pollAdd(&poll, signals)
+        const bus_slot = system.pollAdd(&poll, bus.descriptor(service))
+        devices_module.watch(devices, &poll, slot_bytes)
+        system.pollWait(&poll, devices_module.due(devices, 1000))
+        if system.pollReady(&poll, signal_slot) {
+            const caught = system.takeSignal(signals)
+            if caught == SIGHUP {
+                config_module.load(config, config_path)
+                devices_module.reconfigure(devices)
+                if verbose { system.say("netd: configuration read again\n") }
+            } else if caught != 0 {
+                running = false
+            }
+        }
+        if system.pollReady(&poll, netlink_slot) { const more = events(&socket, devices, scratch) }
+        devices_module.serve(devices, &poll, slot_bytes)
+        if system.pollReady(&poll, bus_slot) {
+            if bus.process(service, devices, allocator) == bus.ASK_RELOAD {
+                config_module.load(config, config_path)
+                devices_module.reconfigure(devices)
+                if verbose { system.say("netd: configuration read again\n") }
+            }
+        }
+        if !service.*.connected && system.milliseconds() - service.*.triedAt >= BUS_RETRY { const again = bus.connect(service, allocator, environment, bus_path) }
+        if devices.*.changed {
+            devices.*.changed = false
+            bus.changed(service, devices)
+        }
+    }
+    devices_module.finish(devices)
+    if verbose { system.say("netd: ending\n") }
+}

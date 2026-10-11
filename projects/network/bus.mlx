@@ -1,0 +1,341 @@
+// mlx-netd on the system bus (MLXIPC's system bus, or D-Bus's):
+//
+//   org.mlx.Network on /org/mlx/Network
+//     Devices() -> a(sssssas)   each link: name, kind (ethernet, wifi,
+//                               other), state (unmanaged, off, no-carrier,
+//                               connecting, connected), address
+//                               ("10.7.0.50/24" or ""), gateway (or ""),
+//                               name servers
+//     Up(s), Down(s)            switches a link on (configured again) or
+//                               off (unconfigured, put down)
+//     Reload()                  reads the configuration again
+//     Changed()                 (signal) a link changed
+//
+// and, while no NetworkManager has the name, the part of
+// org.freedesktop.NetworkManager apps ask to know whether they are
+// online: state() and CheckConnectivity() (and the State and
+// Connectivity properties), StateChanged(u).
+const std = @import("std")
+const dbus = @import("std.dbus")
+const system = @import("./system.mlx")
+const devices_module = @import("./devices.mlx")
+
+const Devices = devices_module.Devices
+
+pub const NAME: []const u8 = "org.mlx.Network"
+pub const PATH: []const u8 = "/org/mlx/Network"
+const NM: []const u8 = "org.freedesktop.NetworkManager"
+const NM_PATH: []const u8 = "/org/freedesktop/NetworkManager"
+const PROPERTIES: []const u8 = "org.freedesktop.DBus.Properties"
+const BUS: []const u8 = "org.freedesktop.DBus"
+const BUS_PATH: []const u8 = "/org/freedesktop/DBus"
+const SIZE: usize = 16384
+
+// NetworkManager's states and connectivity.
+const NM_STATE_DISCONNECTED: u32 = 20
+const NM_STATE_CONNECTING: u32 = 40
+const NM_STATE_CONNECTED_SITE: u32 = 60
+const NM_STATE_CONNECTED_GLOBAL: u32 = 70
+const NM_CONNECTIVITY_NONE: u32 = 1
+const NM_CONNECTIVITY_LIMITED: u32 = 3
+const NM_CONNECTIVITY_FULL: u32 = 4
+
+// What process asks the daemon to do.
+pub const ASK_NOTHING: u32 = 0
+pub const ASK_RELOAD: u32 = 1
+
+const INTROSPECTION: []const u8 = "<!DOCTYPE node PUBLIC \"-//freedesktop//DTD D-BUS Object Introspection 1.0//EN\" \"http://www.freedesktop.org/standards/dbus/1.0/introspect.dtd\">\n<node>\n <interface name=\"org.mlx.Network\">\n  <method name=\"Devices\"><arg type=\"a(sssssas)\" direction=\"out\"/></method>\n  <method name=\"Up\"><arg type=\"s\" direction=\"in\"/></method>\n  <method name=\"Down\"><arg type=\"s\" direction=\"in\"/></method>\n  <method name=\"Reload\"/>\n  <signal name=\"Changed\"/>\n </interface>\n</node>\n"
+
+pub const Service = struct {
+    client: dbus.Client
+    connected: bool
+    triedAt: usize
+    out: [*]u8
+    // The NetworkManager state last told.
+    state: u32
+    verbose: bool
+}
+
+fn clientOf(service: *Service) -> *dbus.Client {
+    unsafe { return @ptrCast(*dbus.Client, &service.*.client) }
+}
+
+fn nothing() -> [*]const isize {
+    var none: [1]isize = [1]isize{ 0 }
+    unsafe { return @ptrCast([*]const isize, &none) }
+}
+
+// The bus's socket: `given`, else DBUS_SYSTEM_BUS_ADDRESS's unix:path=,
+// else /run/dbus/system_bus_socket.
+fn socketPath(environment: [*][*]const u8, given: []const u8, into: [*]u8) -> []const u8 {
+    if given.length > 0 { return given }
+    var index: usize = 0
+    while @intFromPtr(environment[index]) != 0 {
+        const entry = environment[index]
+        var length: usize = 0
+        while entry[length] != 0 { length += 1 }
+        const text = entry[0..length]
+        if system.startsWith(text, "DBUS_SYSTEM_BUS_ADDRESS=unix:path=") {
+            var rest = text[34..length]
+            var stop: usize = 0
+            while stop < rest.length && rest[stop] != 44 { stop += 1 }
+            return rest[0..stop]
+        }
+        index += 1
+    }
+    return "/run/dbus/system_bus_socket"
+}
+
+// Connects and takes the names; false when there is no bus (or another
+// network service has org.mlx.Network).
+pub fn connect(service: *Service, allocator: std.allocator.Allocator, environment: [*][*]const u8, given: []const u8) -> bool {
+    service.*.triedAt = system.milliseconds()
+    var path_bytes: [256]u8 = undefined
+    var view: [*]u8 = undefined
+    unsafe { view = @ptrCast([*]u8, &path_bytes) }
+    const path = socketPath(environment, given, view)
+    const client = clientOf(service)
+    if !dbus.connectClient(client, allocator, path) { return false }
+    if !requestName(service, NAME) {
+        system.say("netd: another network service has org.mlx.Network\n")
+        dbus.disconnect(client, allocator)
+        return false
+    }
+    // NetworkManager's name only while no NetworkManager has it.
+    const nm = requestName(service, NM)
+    if service.*.verbose { system.say(if nm { "netd: on the system bus (also as org.freedesktop.NetworkManager)\n" } else { "netd: on the system bus\n" }) }
+    service.*.connected = true
+    return true
+}
+
+fn requestName(service: *Service, name: []const u8) -> bool {
+    var writing: dbus.Writer = undefined
+    dbus.begin(&writing, service.*.out, SIZE, false)
+    dbus.putString(&writing, name)
+    // DO_NOT_QUEUE.
+    dbus.putU32(&writing, 4)
+    const serial = dbus.call(clientOf(service), BUS, BUS_PATH, BUS, "RequestName", "su", service.*.out, writing.length)
+    var reply: dbus.Header = undefined
+    if serial == 0 || !dbus.waitReply(clientOf(service), serial, &reply, 5000) || reply.kind == dbus.ERROR { return false }
+    var reading = dbus.reader(dbus.bodyOf(clientOf(service), &reply), reply.bodyLength, reply.big)
+    const answer = dbus.readU32(&reading)
+    return answer == 1 || answer == 4
+}
+
+pub fn descriptor(service: *Service) -> isize { return if service.*.connected { dbus.descriptorOfClient(clientOf(service)) } else { -1 } }
+
+fn stateText(state: u32) -> []const u8 {
+    return match state { 0 => "unmanaged", 1 => "off", 2 => "no-carrier", 3 => "connecting", else => "connected" }
+}
+
+fn kindText(kind: u32) -> []const u8 {
+    return match kind { 1 => "ethernet", 2 => "wifi", 3 => "loopback", else => "other" }
+}
+
+// Devices() into `writing`.
+fn putDevices(devices: *Devices, writing: *dbus.Writer) -> void {
+    const list = dbus.beginArray(writing, 8)
+    var slot: usize = 0
+    while slot < devices_module.MAX {
+        const device = devices_module.at(devices, slot)
+        if device.*.used && device.*.kind != devices_module.KIND_LOOPBACK {
+            dbus.pad(writing, 8)
+            dbus.putString(writing, devices_module.nameOf(device))
+            dbus.putString(writing, kindText(device.*.kind))
+            dbus.putString(writing, stateText(device.*.state))
+            var text: [32]u8 = undefined
+            var bytes: [*]u8 = undefined
+            unsafe { bytes = @ptrCast([*]u8, &text) }
+            var length: usize = 0
+            if device.*.configured {
+                length = system.putAddress(bytes, 0, device.*.address)
+                length = system.put(bytes, length, "/")
+                length = system.putNumber(bytes, length, @intCast(u64, device.*.prefix))
+            }
+            dbus.putString(writing, bytes[0..length])
+            length = 0
+            if device.*.configured && device.*.hasGateway { length = system.putAddress(bytes, 0, device.*.gateway) }
+            dbus.putString(writing, bytes[0..length])
+            const servers = dbus.beginArray(writing, 4)
+            var server: usize = 0
+            while device.*.configured && server < device.*.dnsCount {
+                length = system.putAddress(bytes, 0, devices_module.dnsAt(device, server))
+                dbus.putString(writing, bytes[0..length])
+                server += 1
+            }
+            dbus.endArray(writing, servers, 4)
+        }
+        slot += 1
+    }
+    dbus.endArray(writing, list, 8)
+}
+
+fn nmState(devices: *Devices) -> u32 {
+    if devices_module.connected(devices, true) { return NM_STATE_CONNECTED_GLOBAL }
+    if devices_module.connected(devices, false) { return NM_STATE_CONNECTED_SITE }
+    if devices_module.connecting(devices) { return NM_STATE_CONNECTING }
+    return NM_STATE_DISCONNECTED
+}
+
+fn connectivity(devices: *Devices) -> u32 {
+    if devices_module.connected(devices, true) { return NM_CONNECTIVITY_FULL }
+    if devices_module.connected(devices, false) { return NM_CONNECTIVITY_LIMITED }
+    return NM_CONNECTIVITY_NONE
+}
+
+fn replyEmpty(service: *Service, request: *const dbus.Header) -> void {
+    if request.*.flags & dbus.NO_REPLY_EXPECTED != 0 { return }
+    const sent = dbus.reply(clientOf(service), request, "", service.*.out, 0, nothing(), 0)
+}
+
+fn refuse(service: *Service, request: *const dbus.Header, error_name: []const u8, text: []const u8) -> void {
+    if request.*.flags & dbus.NO_REPLY_EXPECTED != 0 { return }
+    var writing: dbus.Writer = undefined
+    dbus.begin(&writing, service.*.out, SIZE, false)
+    dbus.putString(&writing, text)
+    var header = dbus.newHeader(dbus.ERROR, 0)
+    header.errorName = error_name
+    header.replySerial = request.*.serial
+    header.hasReplySerial = true
+    header.destination = request.*.sender
+    header.signature = "s"
+    const sent = dbus.send(clientOf(service), &header, service.*.out, writing.length, nothing(), 0)
+}
+
+// A {sv} with a u32 or a bool.
+fn entryU32(writing: *dbus.Writer, key: []const u8, value: u32) -> void {
+    dbus.pad(writing, 8)
+    dbus.putString(writing, key)
+    dbus.putVariantU32(writing, value)
+}
+
+fn entryBool(writing: *dbus.Writer, key: []const u8, value: bool) -> void {
+    dbus.pad(writing, 8)
+    dbus.putString(writing, key)
+    dbus.putSignature(writing, "b")
+    dbus.putBool(writing, value)
+}
+
+fn called(service: *Service, devices: *Devices, request: *const dbus.Header) -> u32 {
+    const client = clientOf(service)
+    var reading = dbus.reader(dbus.bodyOf(client, request), request.*.bodyLength, request.*.big)
+    const member = request.*.member
+    const interface = request.*.interface
+    var writing: dbus.Writer = undefined
+    dbus.begin(&writing, service.*.out, SIZE, false)
+    if system.same(member, "Introspect") {
+        dbus.putString(&writing, if system.same(request.*.path, PATH) { INTROSPECTION } else { "<node/>" })
+        const sent = dbus.reply(client, request, "s", service.*.out, writing.length, nothing(), 0)
+        return ASK_NOTHING
+    }
+    if system.same(member, "Ping") {
+        replyEmpty(service, request)
+        return ASK_NOTHING
+    }
+    if system.same(request.*.path, NM_PATH) {
+        if system.same(interface, PROPERTIES) {
+            const asked = dbus.readString(&reading)
+            if system.same(member, "GetAll") {
+                const at = dbus.beginArray(&writing, 8)
+                if system.same(asked, NM) {
+                    entryU32(&writing, "State", nmState(devices))
+                    entryU32(&writing, "Connectivity", connectivity(devices))
+                    entryBool(&writing, "NetworkingEnabled", true)
+                    entryBool(&writing, "WirelessEnabled", true)
+                    entryBool(&writing, "WirelessHardwareEnabled", true)
+                }
+                dbus.endArray(&writing, at, 8)
+                const sent = dbus.reply(client, request, "a{sv}", service.*.out, writing.length, nothing(), 0)
+                return ASK_NOTHING
+            }
+            const property = dbus.readString(&reading)
+            if system.same(property, "State") {
+                dbus.putVariantU32(&writing, nmState(devices))
+            } else if system.same(property, "Connectivity") {
+                dbus.putVariantU32(&writing, connectivity(devices))
+            } else if system.same(property, "NetworkingEnabled") || system.same(property, "WirelessEnabled") || system.same(property, "WirelessHardwareEnabled") {
+                dbus.putSignature(&writing, "b")
+                dbus.putBool(&writing, true)
+            } else {
+                refuse(service, request, "org.freedesktop.DBus.Error.UnknownProperty", "mlx-netd has State, Connectivity and the Enabled ones")
+                return ASK_NOTHING
+            }
+            const sent = dbus.reply(client, request, "v", service.*.out, writing.length, nothing(), 0)
+            return ASK_NOTHING
+        }
+        if system.same(member, "state") || system.same(member, "CheckConnectivity") {
+            dbus.putU32(&writing, if system.same(member, "state") { nmState(devices) } else { connectivity(devices) })
+            const sent = dbus.reply(client, request, "u", service.*.out, writing.length, nothing(), 0)
+            return ASK_NOTHING
+        }
+        refuse(service, request, "org.freedesktop.DBus.Error.UnknownMethod", "mlx-netd answers state and CheckConnectivity")
+        return ASK_NOTHING
+    }
+    if !system.same(request.*.path, PATH) {
+        refuse(service, request, "org.freedesktop.DBus.Error.UnknownObject", "no such object")
+        return ASK_NOTHING
+    }
+    if system.same(member, "Devices") {
+        putDevices(devices, &writing)
+        const sent = dbus.reply(client, request, "a(sssssas)", service.*.out, writing.length, nothing(), 0)
+        return ASK_NOTHING
+    }
+    if system.same(member, "Up") || system.same(member, "Down") {
+        const name = dbus.readString(&reading)
+        if reading.failed || !devices_module.switchOn(devices, name, system.same(member, "Up")) {
+            refuse(service, request, "org.mlx.Network.Error.NoSuchLink", "no such managed link")
+            return ASK_NOTHING
+        }
+        replyEmpty(service, request)
+        return ASK_NOTHING
+    }
+    if system.same(member, "Reload") {
+        replyEmpty(service, request)
+        return ASK_RELOAD
+    }
+    refuse(service, request, "org.freedesktop.DBus.Error.UnknownMethod", "org.mlx.Network has Devices, Up, Down and Reload")
+    return ASK_NOTHING
+}
+
+// What came on the bus; what the daemon is to do (ASK_*).
+pub fn process(service: *Service, devices: *Devices, allocator: std.allocator.Allocator) -> u32 {
+    if !service.*.connected { return ASK_NOTHING }
+    var asked = ASK_NOTHING
+    var header: dbus.Header = undefined
+    while dbus.next(clientOf(service), &header, 0) {
+        if header.kind == dbus.METHOD_CALL {
+            const answer = called(service, devices, &header)
+            if answer != ASK_NOTHING { asked = answer }
+        }
+    }
+    if clientOf(service).*.closed {
+        service.*.connected = false
+        dbus.disconnect(clientOf(service), allocator)
+        system.say("netd: the system bus went\n")
+    }
+    return asked
+}
+
+fn signal(service: *Service, path: []const u8, interface: []const u8, member: []const u8, signature: []const u8, length: usize) -> void {
+    var header = dbus.newHeader(dbus.SIGNAL, 0)
+    header.path = path
+    header.interface = interface
+    header.member = member
+    header.signature = signature
+    const sent = dbus.send(clientOf(service), &header, service.*.out, length, nothing(), 0)
+}
+
+// The links changed: Changed(), and NetworkManager's StateChanged when
+// the state did.
+pub fn changed(service: *Service, devices: *Devices) -> void {
+    if !service.*.connected { return }
+    signal(service, PATH, NAME, "Changed", "", 0)
+    const state = nmState(devices)
+    if state != service.*.state {
+        service.*.state = state
+        var writing: dbus.Writer = undefined
+        dbus.begin(&writing, service.*.out, SIZE, false)
+        dbus.putU32(&writing, state)
+        signal(service, NM_PATH, NM, "StateChanged", "u", writing.length)
+    }
+}

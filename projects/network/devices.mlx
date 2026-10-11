@@ -1,0 +1,622 @@
+// The links mlx-netd looks after: each one route netlink reports (a cable
+// or Wi-Fi, not the loopback or what the configuration ignores) is put up,
+// and once it has a carrier it is configured (DHCP or the static
+// settings): its address, its default route (the metric orders them) and
+// its name servers, which go into resolv.conf with the others'. Without a
+// carrier, or switched off (Down), it is configured no more.
+const std = @import("std")
+const netlink = @import("std.netlink")
+const system = @import("./system.mlx")
+const config_module = @import("./config.mlx")
+const dhcp = @import("./dhcp.mlx")
+
+pub const MAX: usize = 16
+
+pub const KIND_ETHERNET: u32 = 1
+pub const KIND_WIRELESS: u32 = 2
+pub const KIND_LOOPBACK: u32 = 3
+pub const KIND_OTHER: u32 = 4
+
+pub const STATE_UNMANAGED: u32 = 0
+pub const STATE_OFF: u32 = 1
+pub const STATE_NO_CARRIER: u32 = 2
+pub const STATE_CONNECTING: u32 = 3
+pub const STATE_CONNECTED: u32 = 4
+
+const ARPHRD_ETHER: u16 = 1
+const ARPHRD_LOOPBACK: u16 = 772
+
+pub const Device = struct {
+    used: bool
+    index: u32
+    name: [16]u8
+    nameLength: usize
+    mac: [6]u8
+    kind: u32
+    flags: u32
+    carrier: bool
+    managed: bool
+    // The user's: off keeps it down (Down; Up undoes it).
+    off: bool
+    method: u32
+    state: u32
+    metric: u32
+    // What is on the link (configured by us).
+    configured: bool
+    address: [4]u8
+    prefix: u8
+    gateway: [4]u8
+    hasGateway: bool
+    dns: [12]u8
+    dnsCount: usize
+    domain: [64]u8
+    domainLength: usize
+    client: dhcp.Client
+}
+
+pub const Devices = struct {
+    items: [16]Device
+    // Route netlink for requests, and its scratch space.
+    requests: netlink.Socket
+    scratch: [*]u8
+    capacity: usize
+    config: *config_module.Config
+    resolvPath: [256]u8
+    resolvLength: usize
+    // Something changed (the bus tells it).
+    changed: bool
+    verbose: bool
+}
+
+pub fn at(devices: *Devices, slot: usize) -> *Device {
+    unsafe { return @ptrFromInt(*Device, @intFromPtr(devices) + @offsetOf(Devices, "items") + slot * @sizeOf(Device)) }
+}
+
+pub fn nameOf(device: *Device) -> []const u8 {
+    var bytes: [*]const u8 = undefined
+    unsafe { bytes = @ptrFromInt([*]const u8, @intFromPtr(device) + @offsetOf(Device, "name")) }
+    return bytes[0..device.*.nameLength]
+}
+
+pub fn domainOf(device: *Device) -> []const u8 {
+    var bytes: [*]const u8 = undefined
+    unsafe { bytes = @ptrFromInt([*]const u8, @intFromPtr(device) + @offsetOf(Device, "domain")) }
+    return bytes[0..device.*.domainLength]
+}
+
+pub fn dnsAt(device: *Device, index: usize) -> [4]u8 {
+    return [4]u8{ device.*.dns[index * 4], device.*.dns[index * 4 + 1], device.*.dns[index * 4 + 2], device.*.dns[index * 4 + 3] }
+}
+
+fn requestsOf(devices: *Devices) -> *netlink.Socket {
+    unsafe { return @ptrCast(*netlink.Socket, &devices.*.requests) }
+}
+
+fn clientOf(device: *Device) -> *dhcp.Client {
+    unsafe { return @ptrCast(*dhcp.Client, &device.*.client) }
+}
+
+fn resolvOf(devices: *Devices) -> []const u8 {
+    var bytes: [*]const u8 = undefined
+    unsafe { bytes = @ptrFromInt([*]const u8, @intFromPtr(devices) + @offsetOf(Devices, "resolvPath")) }
+    return bytes[0..devices.*.resolvLength]
+}
+
+pub fn init(devices: *Devices, config: *config_module.Config, scratch: [*]u8, capacity: usize, resolv: []const u8, verbose: bool) -> bool {
+    var slot: usize = 0
+    while slot < MAX {
+        at(devices, slot).*.used = false
+        slot += 1
+    }
+    devices.*.config = config
+    devices.*.scratch = scratch
+    devices.*.capacity = capacity
+    devices.*.changed = false
+    devices.*.verbose = verbose
+    var length: usize = 0
+    while length < resolv.length && length < 255 {
+        devices.*.resolvPath[length] = resolv[length]
+        length += 1
+    }
+    devices.*.resolvLength = length
+    return netlink.open(requestsOf(devices), netlink.ROUTE, 0)
+}
+
+// "netd: eth0: WHAT\n" (verbose).
+fn say(devices: *Devices, device: *Device, what: []const u8) -> void {
+    if !devices.*.verbose { return }
+    var line: [256]u8 = undefined
+    var bytes: [*]u8 = undefined
+    unsafe { bytes = @ptrCast([*]u8, &line) }
+    var length = system.put(bytes, 0, "netd: ")
+    length = system.put(bytes, length, nameOf(device))
+    length = system.put(bytes, length, ": ")
+    length = system.put(bytes, length, what)
+    length = system.put(bytes, length, "\n")
+    system.say(bytes[0..length])
+}
+
+fn sayAddress(devices: *Devices, device: *Device, what: []const u8, address: [4]u8, prefix: u8) -> void {
+    var text: [64]u8 = undefined
+    var bytes: [*]u8 = undefined
+    unsafe { bytes = @ptrCast([*]u8, &text) }
+    var length = system.put(bytes, 0, what)
+    length = system.putAddress(bytes, length, address)
+    if prefix > 0 {
+        length = system.put(bytes, length, "/")
+        length = system.putNumber(bytes, length, @intCast(u64, prefix))
+    }
+    say(devices, device, bytes[0..length])
+}
+
+fn find(devices: *Devices, index: u32) -> usize {
+    var slot: usize = 0
+    while slot < MAX {
+        if at(devices, slot).*.used && at(devices, slot).*.index == index { return slot }
+        slot += 1
+    }
+    return MAX
+}
+
+pub fn byName(devices: *Devices, name: []const u8) -> usize {
+    var slot: usize = 0
+    while slot < MAX {
+        if at(devices, slot).*.used && system.same(nameOf(at(devices, slot)), name) { return slot }
+        slot += 1
+    }
+    return MAX
+}
+
+fn setState(devices: *Devices, device: *Device, state: u32) -> void {
+    if device.*.state == state { return }
+    device.*.state = state
+    devices.*.changed = true
+    say(devices, device, match state { 0 => "unmanaged", 1 => "off", 2 => "no carrier", 3 => "connecting", else => "connected" })
+}
+
+// Whether link `name` is Wi-Fi (its sysfs entry has wireless/ or phy80211/).
+fn wireless(name: []const u8) -> bool {
+    var path: [96]u8 = undefined
+    var bytes: [*]u8 = undefined
+    unsafe { bytes = @ptrCast([*]u8, &path) }
+    var length = system.put(bytes, 0, "/sys/class/net/")
+    length = system.put(bytes, length, name)
+    const base = length
+    length = system.put(bytes, length, "/wireless/.")
+    bytes[length] = 0
+    var status: std.fs.Stat = undefined
+    unsafe {
+        if std.fs.status(@ptrCast([*]const u8, bytes), &status) == 0 { return true }
+    }
+    length = system.put(bytes, base, "/phy80211/.")
+    bytes[length] = 0
+    unsafe { return std.fs.status(@ptrCast([*]const u8, bytes), &status) == 0 }
+}
+
+// RTM_NEWLINK: a link came or changed.
+pub fn linkChanged(devices: *Devices, message: *const netlink.Message) -> void {
+    var link: netlink.Link = undefined
+    if !netlink.linkOf(message, &link) { return }
+    var slot = find(devices, link.index)
+    const fresh = slot == MAX
+    if fresh {
+        slot = 0
+        while slot < MAX && at(devices, slot).*.used { slot += 1 }
+        if slot == MAX { return }
+    }
+    const device = at(devices, slot)
+    var offset: usize = netlink.LINK_HEADER
+    var found: netlink.Attribute = undefined
+    var has_wireless = false
+    if fresh {
+        device.*.nameLength = 0
+        var index: usize = 0
+        while index < 6 {
+            device.*.mac[index] = 0
+            index += 1
+        }
+    }
+    while netlink.nextAttribute(message.*.payload, message.*.length, &offset, &found) {
+        if found.kind == netlink.IFLA_IFNAME {
+            const name = netlink.stringOf(&found)
+            var length: usize = 0
+            while length < name.length && length < 16 {
+                device.*.name[length] = name[length]
+                length += 1
+            }
+            device.*.nameLength = length
+        }
+        if found.kind == netlink.IFLA_ADDRESS && found.length == 6 {
+            var index: usize = 0
+            while index < 6 {
+                device.*.mac[index] = found.data[index]
+                index += 1
+            }
+        }
+        if found.kind == netlink.IFLA_WIRELESS { has_wireless = true }
+    }
+    const carrier_before = device.*.carrier
+    device.*.flags = link.flags
+    device.*.carrier = link.flags & netlink.IFF_LOWER_UP != 0
+    if fresh {
+        device.*.used = true
+        device.*.index = link.index
+        device.*.kind = if link.kind == ARPHRD_LOOPBACK { KIND_LOOPBACK } else if link.kind != ARPHRD_ETHER { KIND_OTHER } else if has_wireless || wireless(nameOf(device)) { KIND_WIRELESS } else { KIND_ETHERNET }
+        device.*.state = STATE_UNMANAGED
+        device.*.configured = false
+        device.*.off = false
+        dhcp.init(clientOf(device))
+        adopt(devices, device)
+        devices.*.changed = true
+        return
+    }
+    if device.*.managed && device.*.carrier != carrier_before { carrierChanged(devices, device) }
+}
+
+// A new link: managed or not, put up, configured if it has a carrier.
+fn adopt(devices: *Devices, device: *Device) -> void {
+    const config = devices.*.config
+    const name = nameOf(device)
+    device.*.managed = (device.*.kind == KIND_ETHERNET || device.*.kind == KIND_WIRELESS) && !config_module.ignored(config, name)
+    device.*.method = config_module.method(config, name)
+    device.*.metric = config_module.metric(config, name, if device.*.kind == KIND_WIRELESS { 600 } else { 100 })
+    if !device.*.managed {
+        say(devices, device, "unmanaged")
+        return
+    }
+    say(devices, device, if device.*.kind == KIND_WIRELESS { "managed (wifi)" } else { "managed (ethernet)" })
+    if device.*.method == config_module.METHOD_OFF {
+        device.*.off = true
+        setState(devices, device, STATE_OFF)
+        return
+    }
+    bringUp(devices, device)
+}
+
+fn bringUp(devices: *Devices, device: *Device) -> void {
+    if device.*.flags & netlink.IFF_UP == 0 {
+        const result = netlink.setLinkUp(requestsOf(devices), devices.*.scratch, devices.*.capacity, device.*.index, true)
+        if result != 0 { say(devices, device, "could not be put up") }
+    }
+    device.*.state = STATE_UNMANAGED
+    if device.*.carrier { carrierChanged(devices, device) } else { setState(devices, device, STATE_NO_CARRIER) }
+}
+
+fn carrierChanged(devices: *Devices, device: *Device) -> void {
+    if device.*.off { return }
+    if !device.*.carrier {
+        unconfigure(devices, device)
+        dhcp.stop(clientOf(device))
+        setState(devices, device, STATE_NO_CARRIER)
+        return
+    }
+    setState(devices, device, STATE_CONNECTING)
+    if device.*.method == config_module.METHOD_STATIC {
+        configureStatic(devices, device)
+        return
+    }
+    if !dhcp.start(clientOf(device), nameOf(device), device.*.mac, config_module.hostnameOf(devices.*.config)) { say(devices, device, "dhcp: no socket") }
+}
+
+// RTM_DELLINK: the link went.
+pub fn linkRemoved(devices: *Devices, message: *const netlink.Message) -> void {
+    var link: netlink.Link = undefined
+    if !netlink.linkOf(message, &link) { return }
+    const slot = find(devices, link.index)
+    if slot == MAX { return }
+    const device = at(devices, slot)
+    dhcp.stop(clientOf(device))
+    say(devices, device, "removed")
+    const had_dns = device.*.configured && device.*.dnsCount > 0
+    device.*.used = false
+    devices.*.changed = true
+    if had_dns { writeResolv(devices) }
+}
+
+// Puts what `device` has on the link: address, default route, DNS.
+fn configure(devices: *Devices, device: *Device, protocol: u8) -> void {
+    const result = netlink.changeAddress(requestsOf(devices), devices.*.scratch, devices.*.capacity, device.*.index, device.*.address, device.*.prefix, false)
+    if result != 0 {
+        say(devices, device, "the address could not be set")
+        return
+    }
+    sayAddress(devices, device, "address ", device.*.address, device.*.prefix)
+    if device.*.hasGateway {
+        const routed = netlink.changeDefaultRoute(requestsOf(devices), devices.*.scratch, devices.*.capacity, device.*.index, device.*.gateway, device.*.metric, protocol, false)
+        if routed == 0 { sayAddress(devices, device, "default route via ", device.*.gateway, 0) } else { say(devices, device, "the default route could not be set") }
+    }
+    device.*.configured = true
+    setState(devices, device, STATE_CONNECTED)
+    writeResolv(devices)
+}
+
+// Takes it away again.
+fn unconfigure(devices: *Devices, device: *Device) -> void {
+    if !device.*.configured { return }
+    device.*.configured = false
+    if device.*.hasGateway {
+        const routed = netlink.changeDefaultRoute(requestsOf(devices), devices.*.scratch, devices.*.capacity, device.*.index, device.*.gateway, device.*.metric, netlink.RTPROT_DHCP, true)
+    }
+    const removed = netlink.changeAddress(requestsOf(devices), devices.*.scratch, devices.*.capacity, device.*.index, device.*.address, device.*.prefix, true)
+    say(devices, device, "unconfigured")
+    devices.*.changed = true
+    writeResolv(devices)
+}
+
+fn configureStatic(devices: *Devices, device: *Device) -> void {
+    const config = devices.*.config
+    const name = nameOf(device)
+    var address: [4]u8 = [4]u8{ 0, 0, 0, 0 }
+    var prefix: u8 = 24
+    var address_bytes: [*]u8 = undefined
+    unsafe { address_bytes = @ptrCast([*]u8, &address) }
+    if !system.parseAddress(config_module.value(config, name, "address"), address_bytes, &prefix) {
+        say(devices, device, "static: no address")
+        return
+    }
+    if prefix == 32 && config_module.value(config, name, "address").length > 0 {
+        // "a.b.c.d" alone: a /24.
+        var slash = false
+        for byte in config_module.value(config, name, "address") { if byte == 47 { slash = true } }
+        if !slash { prefix = 24 }
+    }
+    device.*.address = address
+    device.*.prefix = prefix
+    var gateway_prefix: u8 = 32
+    var gateway: [4]u8 = [4]u8{ 0, 0, 0, 0 }
+    var gateway_bytes: [*]u8 = undefined
+    unsafe { gateway_bytes = @ptrCast([*]u8, &gateway) }
+    device.*.hasGateway = system.parseAddress(config_module.value(config, name, "gateway"), gateway_bytes, &gateway_prefix)
+    device.*.gateway = gateway
+    device.*.dnsCount = 0
+    const servers = config_module.value(config, name, "dns")
+    var start: usize = 0
+    while start < servers.length && device.*.dnsCount < 3 {
+        while start < servers.length && servers[start] == 32 { start += 1 }
+        var end = start
+        while end < servers.length && servers[end] != 32 { end += 1 }
+        var server: [4]u8 = [4]u8{ 0, 0, 0, 0 }
+        var server_prefix: u8 = 32
+        var server_bytes: [*]u8 = undefined
+        unsafe { server_bytes = @ptrCast([*]u8, &server) }
+        if end > start && system.parseAddress(servers[start..end], server_bytes, &server_prefix) {
+            var part: usize = 0
+            while part < 4 {
+                device.*.dns[device.*.dnsCount * 4 + part] = server[part]
+                part += 1
+            }
+            device.*.dnsCount += 1
+        }
+        start = end
+    }
+    device.*.domainLength = 0
+    configure(devices, device, netlink.RTPROT_STATIC)
+}
+
+// The DHCP client's lease into the device.
+fn takeLease(device: *Device) -> void {
+    const lease = &device.*.client.lease
+    device.*.address = lease.*.address
+    device.*.prefix = lease.*.prefix
+    device.*.gateway = lease.*.router
+    device.*.hasGateway = lease.*.hasRouter
+    device.*.dnsCount = lease.*.dnsCount
+    var index: usize = 0
+    while index < 12 {
+        device.*.dns[index] = lease.*.dns[index]
+        index += 1
+    }
+    const domain = dhcp.domainOf(lease)
+    index = 0
+    while index < domain.length && index < 64 {
+        device.*.domain[index] = domain[index]
+        index += 1
+    }
+    device.*.domainLength = index
+}
+
+fn sameAddress(first: [4]u8, second: [4]u8) -> bool { return first[0] == second[0] && first[1] == second[1] && first[2] == second[2] && first[3] == second[3] }
+
+// What a DHCP client said.
+fn dhcpEvent(devices: *Devices, device: *Device, event: u32) -> void {
+    if event == dhcp.EVENT_BOUND {
+        if device.*.configured { unconfigure(devices, device) }
+        takeLease(device)
+        configure(devices, device, netlink.RTPROT_DHCP)
+    } else if event == dhcp.EVENT_RENEWED {
+        const lease = &device.*.client.lease
+        if !sameAddress(lease.*.address, device.*.address) || lease.*.prefix != device.*.prefix {
+            unconfigure(devices, device)
+            takeLease(device)
+            configure(devices, device, netlink.RTPROT_DHCP)
+        } else {
+            takeLease(device)
+            writeResolv(devices)
+        }
+    } else if event == dhcp.EVENT_LOST {
+        unconfigure(devices, device)
+        setState(devices, device, STATE_CONNECTING)
+    }
+}
+
+// The DHCP sockets into `poll`; the slot of the first (they follow in
+// the devices' order).
+pub fn watch(devices: *Devices, poll: *system.Poll, slots: [*]usize) -> void {
+    var slot: usize = 0
+    while slot < MAX {
+        const device = at(devices, slot)
+        slots[slot] = 32
+        if device.*.used && device.*.client.socket >= 0 { slots[slot] = system.pollAdd(poll, device.*.client.socket) }
+        slot += 1
+    }
+}
+
+// After poll: what the DHCP sockets brought, and the timers.
+pub fn serve(devices: *Devices, poll: *system.Poll, slots: [*]usize) -> void {
+    var slot: usize = 0
+    while slot < MAX {
+        const device = at(devices, slot)
+        if device.*.used && device.*.managed {
+            if slots[slot] < 32 && system.pollReady(poll, slots[slot]) {
+                const event = dhcp.readable(clientOf(device), devices.*.scratch, devices.*.capacity)
+                if event != dhcp.EVENT_NONE { dhcpEvent(devices, device, event) }
+            }
+            const timed = dhcp.tick(clientOf(device))
+            if timed != dhcp.EVENT_NONE { dhcpEvent(devices, device, timed) }
+        }
+        slot += 1
+    }
+}
+
+// Milliseconds until a timer is due (at most `longest`).
+pub fn due(devices: *Devices, longest: usize) -> usize {
+    var next = longest
+    var slot: usize = 0
+    while slot < MAX {
+        const device = at(devices, slot)
+        if device.*.used { next = dhcp.due(clientOf(device), next) }
+        slot += 1
+    }
+    return next
+}
+
+// The user's Up and Down; false when there is no such managed link.
+pub fn switchOn(devices: *Devices, name: []const u8, on: bool) -> bool {
+    const slot = byName(devices, name)
+    if slot == MAX { return false }
+    const device = at(devices, slot)
+    if !device.*.managed { return false }
+    if on {
+        if !device.*.off { return true }
+        device.*.off = false
+        say(devices, device, "switched on")
+        bringUp(devices, device)
+        return true
+    }
+    if device.*.off { return true }
+    device.*.off = true
+    say(devices, device, "switched off")
+    dhcp.release(clientOf(device))
+    unconfigure(devices, device)
+    const down = netlink.setLinkUp(requestsOf(devices), devices.*.scratch, devices.*.capacity, device.*.index, false)
+    setState(devices, device, STATE_OFF)
+    return true
+}
+
+// The configuration was read again: links take their methods anew.
+pub fn reconfigure(devices: *Devices) -> void {
+    var slot: usize = 0
+    while slot < MAX {
+        const device = at(devices, slot)
+        if device.*.used && device.*.managed && !device.*.off {
+            const method = config_module.method(devices.*.config, nameOf(device))
+            if method != device.*.method || method == config_module.METHOD_STATIC {
+                dhcp.stop(clientOf(device))
+                unconfigure(devices, device)
+                device.*.method = method
+                if method == config_module.METHOD_OFF {
+                    device.*.off = true
+                    setState(devices, device, STATE_OFF)
+                } else {
+                    device.*.state = STATE_UNMANAGED
+                    if device.*.carrier { carrierChanged(devices, device) } else { setState(devices, device, STATE_NO_CARRIER) }
+                }
+            }
+        }
+        slot += 1
+    }
+}
+
+// Leaving: the leases are kept (the addresses stay until they run out).
+pub fn finish(devices: *Devices) -> void {
+    var slot: usize = 0
+    while slot < MAX {
+        const device = at(devices, slot)
+        if device.*.used { dhcp.stop(clientOf(device)) }
+        slot += 1
+    }
+}
+
+// Whether any link is connected, and with a default route.
+pub fn connected(devices: *Devices, routed: bool) -> bool {
+    var slot: usize = 0
+    while slot < MAX {
+        const device = at(devices, slot)
+        if device.*.used && device.*.state == STATE_CONNECTED && (!routed || device.*.hasGateway) { return true }
+        slot += 1
+    }
+    return false
+}
+
+pub fn connecting(devices: *Devices) -> bool {
+    var slot: usize = 0
+    while slot < MAX {
+        const device = at(devices, slot)
+        if device.*.used && device.*.state == STATE_CONNECTING { return true }
+        slot += 1
+    }
+    return false
+}
+
+// resolv.conf from the connected links' name servers (the lowest metric
+// first), rewritten whole.
+fn writeResolv(devices: *Devices) -> void {
+    var text: [1024]u8 = undefined
+    var bytes: [*]u8 = undefined
+    unsafe { bytes = @ptrCast([*]u8, &text) }
+    var length = system.put(bytes, 0, "# Written by mlx-netd: the connected links' name servers.\n")
+    var written: usize = 0
+    var done: [16]bool = [16]bool{ false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false }
+    // The search domain first: the one of the connected link with the
+    // lowest metric that has one.
+    var searched: usize = MAX
+    var slot: usize = 0
+    while slot < MAX {
+        const device = at(devices, slot)
+        if device.*.used && device.*.configured && device.*.domainLength > 0 {
+            if searched == MAX || device.*.metric < at(devices, searched).*.metric { searched = slot }
+        }
+        slot += 1
+    }
+    if searched != MAX {
+        length = system.put(bytes, length, "search ")
+        length = system.put(bytes, length, domainOf(at(devices, searched)))
+        length = system.put(bytes, length, "\n")
+    }
+    while written < 3 {
+        // The connected link with the lowest metric not taken yet.
+        var best: usize = MAX
+        slot = 0
+        while slot < MAX {
+            const device = at(devices, slot)
+            if device.*.used && device.*.configured && device.*.dnsCount > 0 && !done[slot] {
+                if best == MAX || device.*.metric < at(devices, best).*.metric { best = slot }
+            }
+            slot += 1
+        }
+        if best == MAX { break }
+        done[best] = true
+        const device = at(devices, best)
+        var server: usize = 0
+        while server < device.*.dnsCount && written < 3 {
+            length = system.put(bytes, length, "nameserver ")
+            length = system.putAddress(bytes, length, dnsAt(device, server))
+            length = system.put(bytes, length, "\n")
+            written += 1
+            server += 1
+        }
+    }
+    if !system.writeFile(resolvOf(devices), bytes[0..length]) {
+        if devices.*.verbose { system.say("netd: resolv.conf could not be written\n") }
+        return
+    }
+    if devices.*.verbose {
+        system.say("netd: resolv.conf with ")
+        var count: [4]u8 = undefined
+        var view: [*]u8 = undefined
+        unsafe { view = @ptrCast([*]u8, &count) }
+        const size = system.putNumber(view, 0, @intCast(u64, written))
+        system.say(view[0..size])
+        system.say(" name servers\n")
+    }
+}

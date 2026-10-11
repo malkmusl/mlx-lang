@@ -41,6 +41,10 @@ projects/.../main.mlx -o ...`) and is checked by a script under `tools/`.
 - [`console/`](console/README.md): mlx-console, the terminal on the Linux
   console without a compositor (framebuffer, evdev keyboards through the
   xkb keymap, the shell on a pty); `tools/check_console.sh`.
+- [`network/`](network/README.md): mlx-netd, the network daemon in place
+  of NetworkManager (links through route netlink, DHCPv4, static
+  settings, routes by metric, resolv.conf, the system bus) and mlx-net;
+  `tools/check_network.sh`.
 
 What the projects share beyond one project lives in `std` (`std.gpu`,
 `std.crash`, `std.timezone`, `std.ui`, `std.png`, `std.truetype`, ...).
