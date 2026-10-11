@@ -13,6 +13,7 @@ mlx4 projects/desktop/login/main.mlx -o mlx-login
 mlx-ipcd --system &                          # the system bus at /run/mlx/bus
 sudo mlx-login --verbose                     # owns org.mlx.Login, waits
 sudo mlx-login --passwd FILE --shadow FILE   # isolated account databases
+sudo mlx-login --greeter mlx-compositor mlx-greeter
 tools/check_login.sh                         # the end-to-end check
 ```
 
@@ -27,6 +28,41 @@ namespace check.
 They do not remove the root requirement. The check re-executes itself as
 root inside a user namespace and passes private fixture paths explicitly,
 so `mlx-login` does not open the host's account databases.
+
+`--greeter COMPOSITOR PROGRAM` makes the daemon own the display-manager
+lifecycle. With no user session it starts `COMPOSITOR --greeter PROGRAM`,
+drops that child to uid/gid 65534, and gives it a private mode-0700
+runtime/home directory. A successful login first revokes compositor
+control and stops that greeter; when the user session exits, a fresh one
+is started. `--greeter-uid` and `--greeter-gid` select another dedicated
+numeric identity when a system reserves one. The installed units enable
+this mode and expect `mlx-compositor` from the compositor installation in
+the same `PREFIX/bin`.
+
+## Installation
+
+`tools/install_login.sh` builds and installs `mlx-login`, `mlx-greeter`
+and `mlx-lock`, the `mlx-login.service` systemd unit, and an mlx-init boot
+set for `mlx-ipcd`, `mlx-netd` and `mlx-login`. Installation alone does
+not change the running display manager:
+
+```sh
+tools/install_login.sh --destdir "$PWD/stage" # inspect a package tree
+sudo tools/install_login.sh                    # install, do not enable
+sudo tools/install_login.sh --enable           # switch display managers
+sudo tools/install_login.sh --disable          # restore the prior one
+tools/check_install_login.sh                   # staging and rollback check
+```
+
+`--enable` makes `mlx-login.service` both the graphical target's service
+and the `display-manager.service` alias. Before doing that, it records the
+previous alias, the previous manager's local unit override or mask, and a
+pre-existing graphical-target link below
+`/var/lib/mlx/login-installer`. It then masks only the manager selected by
+the old alias. Repeating `--enable` keeps the first snapshot; `--disable`
+restores it exactly and is itself safe to repeat. With `--destdir`, all
+links and saved state remain inside the staged tree and no `systemctl`
+command is run.
 
 ## The bus interface (`org.mlx.Login`, path `/org/mlx/Login`)
 
@@ -88,7 +124,9 @@ it ready for a new greeter.
 | --- | --- |
 | `main.mlx` | the daemon: the bus, authorization and the three methods |
 | `authentication.mlx` | bounded, fail-closed shadow parsing and password verification |
+| `greeter.mlx` | unprivileged greeter-compositor process lifecycle |
 | `groups.mlx` | the primary and supplementary groups for a session |
 | `login1.mlx` | one-seat compositor control, device descriptors and VT switching |
 | `session.mlx` | runtime directory, privilege drop, environment and exec |
 | `users.mlx` | the login accounts, read from the configured passwd file |
+| `examples/` | systemd and mlx-init service templates used by the installer |
