@@ -30,10 +30,19 @@ bash -n tools/lib/mlx_layout.sh tools/remove_old_mlx_layout.sh
 source tools/lib/mlx_layout.sh
 [[ "$(mlx_bindir /usr)" == /usr/bin/mlx && "$(mlx_bindir /opt/mlx/)" == /opt/mlx/bin/mlx ]] || fail "mlx_bindir"
 
-# The PATH additions.
+# The PATH additions, in a root with sudo, login.defs and a PATH in
+# /etc/environment as Debian and Ubuntu have them (made up here: the
+# machine's own files are never read).
 stage="$work/path-root"
-install -d "$stage/etc/fish"
+install -d "$stage/etc/fish" "$stage/etc/sudoers.d"
+printf 'Defaults\tenv_reset\nDefaults\tsecure_path="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin"\n@includedir /etc/sudoers.d\n' > "$stage/etc/sudoers"
+printf '# login.defs\nMAIL_DIR\t/var/mail\nENV_SUPATH\tPATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\nENV_PATH\tPATH=/usr/local/bin:/usr/bin:/bin:/usr/local/games:/usr/games\n#ENV_PATH\tPATH=/commented\n' > "$stage/etc/login.defs"
+printf 'PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin"\nLANG=C.UTF-8\n' > "$stage/etc/environment"
+chmod 600 "$stage/etc/login.defs"
+cp -a "$stage/etc/login.defs" "$work/login.defs.before"
+cp -a "$stage/etc/environment" "$work/environment.before"
 mlx_install_path_files "$stage" /usr/bin/mlx > "$work/path.log"
+mlx_install_path_files "$stage" /usr/bin/mlx > "$work/path-again.log"
 profile="$stage/etc/profile.d/mlx.sh"
 [[ "$(stat -c '%a' "$profile")" == 644 ]] || fail "the profile script is not mode 0644"
 got=$(env -i PATH=/usr/bin:/bin sh -c ". '$profile'; . '$profile'; printf '%s' \"\$PATH\"")
@@ -45,10 +54,34 @@ grep -qx '\[Manager\]' "$stage/etc/systemd/system.conf.d/50-mlx-path.conf" && \
     grep -qx 'DefaultEnvironment="PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/bin/mlx"' "$stage/etc/systemd/system.conf.d/50-mlx-path.conf" || \
     fail "the system manager's PATH drop-in is wrong"
 grep -qx 'contains -- /usr/bin/mlx $PATH; or set -gx PATH $PATH /usr/bin/mlx' "$stage/etc/fish/conf.d/mlx.fish" || fail "fish's PATH line is wrong"
+sudo_file="$stage/etc/sudoers.d/50-mlx-path"
+if command -v visudo > /dev/null; then
+    grep -qx 'Defaults secure_path="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin:/usr/bin/mlx"' "$sudo_file" || fail "sudo's secure_path drop-in is wrong"
+    [[ "$(stat -c '%a' "$sudo_file")" == 440 ]] || fail "the sudoers drop-in is not mode 0440"
+    visudo -c -q -f "$sudo_file" || fail "visudo rejects the sudoers drop-in"
+    # sudoers without quotes (Fedora's way) and without a secure_path.
+    other="$work/other-root"
+    install -d "$other/etc/sudoers.d"
+    printf 'Defaults    secure_path = /sbin:/bin:/usr/sbin:/usr/bin\n' > "$other/etc/sudoers"
+    mlx_install_path_files "$other" /usr/bin/mlx > /dev/null
+    grep -qx 'Defaults secure_path="/sbin:/bin:/usr/sbin:/usr/bin:/usr/bin/mlx"' "$other/etc/sudoers.d/50-mlx-path" || fail "an unquoted secure_path was not kept"
+    : > "$other/etc/sudoers"
+    mlx_install_path_files "$other" /usr/bin/mlx > /dev/null
+    grep -qx 'Defaults secure_path="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin:/usr/bin/mlx"' "$other/etc/sudoers.d/50-mlx-path" || fail "without a secure_path the default was not taken"
+else
+    [[ ! -e "$sudo_file" ]] || fail "a sudoers drop-in was installed without visudo to check it"
+fi
+grep -qx $'ENV_SUPATH\tPATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/bin/mlx' "$stage/etc/login.defs" && \
+    grep -qx $'ENV_PATH\tPATH=/usr/local/bin:/usr/bin:/bin:/usr/local/games:/usr/games:/usr/bin/mlx' "$stage/etc/login.defs" && \
+    grep -qx $'#ENV_PATH\tPATH=/commented' "$stage/etc/login.defs" || { cat "$stage/etc/login.defs" >&2; fail "login.defs' PATH values are wrong"; }
+[[ "$(stat -c '%a' "$stage/etc/login.defs")" == 600 ]] || fail "login.defs lost its mode"
+grep -qx 'PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin:/usr/bin/mlx"' "$stage/etc/environment" && \
+    grep -qx 'LANG=C.UTF-8' "$stage/etc/environment" || { cat "$stage/etc/environment" >&2; fail "/etc/environment's PATH is wrong"; }
+if grep -q 'changed' "$work/path-again.log"; then fail "a second install changed the edited files again"; fi
 no_fish="$work/no-fish-root"
 mlx_install_path_files "$no_fish" /usr/bin/mlx > /dev/null
 [[ ! -e "$no_fish/etc/fish" ]] || fail "a fish setting was written without fish"
-echo "ok   PATH gets /usr/bin/mlx once, after the system's directories (login shells, user session, system services, fish)"
+echo "ok   PATH gets /usr/bin/mlx once, after the system's directories (login shells, user session, system services, sudo, su and console logins, PAM, fish)"
 
 # Removed only with the last program.
 install -d "$stage/usr/bin/mlx"
@@ -61,7 +94,9 @@ for path in "${mlx_path_files[@]}"; do
     [[ ! -e "$stage$path" ]] || fail "$path remained after the last program"
 done
 [[ ! -e "$stage/usr/bin/mlx" ]] || fail "the empty /usr/bin/mlx remained"
-echo "ok   the PATH additions go with the last program"
+cmp -s "$stage/etc/login.defs" "$work/login.defs.before" && cmp -s "$stage/etc/environment" "$work/environment.before" || fail "login.defs or /etc/environment differ from before the install"
+[[ "$(stat -c '%a' "$stage/etc/login.defs")" == 600 ]] || fail "login.defs lost its mode on removal"
+echo "ok   the PATH additions go with the last program, the edited files as they were"
 
 # A machine with the layouts before: the root installer's /usr/bin, the
 # other installers' /usr/local, partly reinstalled.

@@ -250,6 +250,13 @@ printf 'echo plain stdin\n' | timeout 10 "$sh" > "$work/mlx.out" 2>&1
 [[ "$(cat "$work/mlx.out")" == 'plain stdin' ]] || fail "a script from stdin" "$work/mlx.out"
 echo "ok   a script by shebang, from stdin, with -s"
 
+# /usr/bin/mlx is always on PATH: appended once to the environment's
+# (a console login's from /etc/login.defs lacks it), the default without one.
+[[ "$(env -i PATH=/usr/bin:/bin "$sh" -c 'echo "$PATH"')" == /usr/bin:/bin:/usr/bin/mlx ]] || fail "/usr/bin/mlx was not appended to PATH"
+[[ "$(env -i PATH=/usr/bin/mlx:/bin "$sh" -c 'echo "$PATH"')" == /usr/bin/mlx:/bin ]] || fail "/usr/bin/mlx was appended twice"
+[[ "$(env -i "$sh" -c 'echo "$PATH"')" == /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/bin/mlx ]] || fail "the default PATH lacks /usr/bin/mlx"
+echo "ok   /usr/bin/mlx is on PATH once, whatever PATH mlx-sh was given"
+
 # --- --parse.
 "$sh" --parse 'if [ -f x ]; then cat x | wc -l > n; fi; f() { echo "$@"; }' > "$work/parse.out" 2>&1
 for expected in '^list$' '^  andor$' '^      if$' 'word \[\[\]' 'word \[wc\]' 'redirect' '^      function \[f\]'; do

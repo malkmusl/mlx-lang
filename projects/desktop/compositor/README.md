@@ -572,9 +572,9 @@ address from one machine finds its place in another's disassembly.
 It puts `mlx-compositor`, `mlx-terminal`, `mlx-session` and the other
 programs into `/usr/bin/mlx` (`PREFIX/bin/mlx`, `--prefix`, default
 `/usr`), a directory of their own that the installation puts on PATH
-after the system's directories (`/etc/profile.d/mlx.sh` for login shells,
-`/etc/environment.d/50-mlx.conf` for the user session,
-`/etc/systemd/system.conf.d/50-mlx-path.conf` for the system services:
+after the system's directories wherever a PATH comes from: login shells,
+the user session, the system services, sudo, su and the console login,
+PAM sessions and fish (the files are listed in
 [`tools/lib/mlx_layout.sh`](../../../tools/lib/mlx_layout.sh)), and
 `mlx-compositor.desktop` into `/usr/share/wayland-sessions`
 (`--sessions`), where both display managers look; programs from installs
