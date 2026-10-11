@@ -48,11 +48,19 @@ dbus-send, gdbus, busctl and dbus-monitor are checked against it
 
 `mlx-ipcd --system` is the same bus as the system's: it listens at
 `/run/mlx/bus` (or `--address`) with the socket open to every user, root
-alone may own names, and the policy comes from `/etc/mlx/ipc.conf`.
-Programs reach it through `DBUS_SYSTEM_BUS_ADDRESS=unix:path=/run/mlx/bus`
-(the compositor's logind client reads that variable). It is where a
-display manager of the desktop's own would offer its login and seat
-services.
+alone may own names, the policy comes from `/etc/mlx/ipc.conf`, and it
+starts services only from `--services DIR` (the session's are not
+root's to start). Our programs look for it there by themselves:
+mlx-netd (`projects/network`) answers on it, and mlx-net, the top bar
+and mlx-settings ask it there; other programs reach it through
+`DBUS_SYSTEM_BUS_ADDRESS=unix:path=/run/mlx/bus` (the compositor's logind
+client reads that variable). `tools/install_network.sh` installs it as
+`mlx-ipcd.service` (systemd) and for mlx-init. It is where a display
+manager of the desktop's own would offer its login and seat services.
+
+Services that do something for an app ask the bus whether that app may
+(`org.mlx.IPC.Check`, below): MLX Audio for `audio.*`, mlx-netd for
+`network.control` (switching links, joining and forgetting networks).
 
 ## Permissions per app
 
@@ -68,7 +76,8 @@ runs as the same user. MLXIPC's is per app, as in hyprtavern:
   it talks to by any name that connection owns, as dbus-daemon's
   `send_destination` does.
 - And **use** a service's permission: `audio.play`, `audio.record`,
-  `audio.monitor`, `audio.control` (MLX Audio). Services ask the bus
+  `audio.monitor`, `audio.control` (MLX Audio), `network.control`
+  (mlx-netd, on the system bus). Services ask the bus
   (`org.mlx.IPC.Check(s app's connection, s permission) -> b`) before
   they do what it names, so the rules for every service are in one
   place.

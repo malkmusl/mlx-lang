@@ -15,6 +15,8 @@
 #     configured again when the carrier comes back;
 #   - mlx-net lists both links over the bus, switches eth0 off (the lease
 #     is released, the link put down) and on again;
+#   - changes are MLXIPC's permission network.control: with a rule
+#     denying it to mlx-net, switching eth1 off is refused;
 #   - org.freedesktop.NetworkManager answers state() with 70 (connected)
 #     when gdbus is there to ask;
 #   - without a Wi-Fi card the Wi-Fi calls answer so (tools/check_wifi.sh
@@ -78,7 +80,8 @@ eth1.gateway = 10.8.0.1
 eth1.dns = 10.8.0.53
 eth1.metric = 50
 CONF
-"$W/mlx-ipcd" --address "$W/bus" > "$W/ipcd.log" 2>&1 &
+: > "$W/ipc.conf"
+"$W/mlx-ipcd" --address "$W/bus" --policy "$W/ipc.conf" > "$W/ipcd.log" 2>&1 &
 IPCD=$!
 for _ in $(seq 1 50); do [ -S "$W/bus" ] && break; sleep 0.1; done
 sleep 0.3
@@ -106,6 +109,15 @@ snapshot on
 "$W/mlx-net" --bus "$W/bus" wifi > "$W/wifi.txt" 2>&1 || echo "failed" >> "$W/wifi.txt"
 "$W/mlx-net" --bus "$W/bus" scan > "$W/scan.txt" 2>&1 && echo "accepted" >> "$W/scan.txt" || true
 "$W/mlx-net" --bus "$W/bus" connect Nowhere "a passphrase" > "$W/connect.txt" 2>&1 && echo "accepted" >> "$W/connect.txt" || true
+# network.control taken from mlx-net (the bus reads its rules again
+# within a second), then given back.
+echo "deny mlx-net use network.control" > "$W/ipc.conf"
+sleep 1.5
+"$W/mlx-net" --bus "$W/bus" down eth1 > "$W/denied.txt" 2>&1 && echo "accepted" >> "$W/denied.txt" || true
+sleep 0.5
+snapshot denied
+: > "$W/ipc.conf"
+sleep 1.5
 # A server that refuses the renewal.
 kill "$SERVER"
 sleep 0.3
@@ -155,6 +167,10 @@ grep -q "^eth0 *ethernet *off" "$work/off-status.txt" && grep -q "eth0@.*state D
 grep -q "eth0 *inet 10.7.0.50/24" "$work/on-addresses.txt" || fail "eth0 switched on again got no address" "$log"
 grep -q "no such managed link" "$work/unknown.txt" && ! grep -q "accepted" "$work/unknown.txt" || fail "mlx-net down of an unknown link was not refused" "$work/unknown.txt"
 echo "ok   mlx-net switches eth0 off (the lease released, the link down) and on again"
+
+grep -q "may not change the network" "$work/denied.txt" && ! grep -q "accepted" "$work/denied.txt" || fail "mlx-net switched eth1 off without network.control" "$work/denied.txt"
+grep -q "eth1 *inet 10.8.0.5/24" "$work/denied-addresses.txt" || fail "eth1 went down though network.control was denied" "$log"
+echo "ok   changes need MLXIPC's network.control: denied to mlx-net, eth1 stays up"
 
 [[ ! -s "$work/wifi.txt" ]] || fail "mlx-net wifi lists networks without a Wi-Fi card" "$work/wifi.txt"
 grep -q "no Wi-Fi card" "$work/scan.txt" && ! grep -q "accepted" "$work/scan.txt" || fail "a scan without a Wi-Fi card was not refused" "$work/scan.txt"

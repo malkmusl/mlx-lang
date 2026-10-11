@@ -7,10 +7,11 @@ it: DHCPv4 or the static settings of its configuration. Wi-Fi cards are
 driven through nl80211: scans, joining open and WPA2-Personal networks
 with its own supplicant (no wpa_supplicant), saved networks. It sets the
 link's address and default route and writes the name servers of all
-links into `resolv.conf`. It answers on the system bus (MLXIPC's or
-D-Bus's), where `mlx-net`, the top bar and mlx-settings ask it, and
-where apps that ask NetworkManager whether they are online get an
-answer too.
+links into `resolv.conf`. It answers on MLXIPC's system bus
+(`mlx-ipcd --system`, `/run/mlx/bus`; no D-Bus), where `mlx-net`, the top
+bar and mlx-settings ask it, and where apps that ask NetworkManager
+whether they are online get an answer too. Who may change the network is
+MLXIPC's permission `network.control`.
 
 ```sh
 mlx4 projects/network/main.mlx -o mlx-netd
@@ -41,7 +42,7 @@ mlx-netd [--config FILE] [--resolv FILE] [--bus PATH] [--verbose]
 | --- | --- |
 | `--config FILE` | `/etc/mlx/network.conf` |
 | `--resolv FILE` | `/etc/resolv.conf` |
-| `--bus PATH` | `$DBUS_SYSTEM_BUS_ADDRESS`, else `/run/dbus/system_bus_socket` |
+| `--bus PATH` | `$DBUS_SYSTEM_BUS_ADDRESS`, else MLXIPC's system bus, `/run/mlx/bus` |
 | `--state DIR` | `/var/lib/mlx/network` (the saved Wi-Fi networks) |
 | `--verbose` | says what it does on stderr |
 
@@ -128,6 +129,23 @@ eth1.metric = 50
 | `Forget(s)` | forgets a saved network |
 | `Changed` | signal: a link or the networks changed |
 
+`Devices`, `Networks` and `Scan` are anyone's. The changes (`Up`, `Down`,
+`Reload`, `Connect`, `Disconnect`, `Forget`) are MLXIPC's permission
+`network.control`: `mlx-netd` asks the bus (`org.mlx.IPC.Check`) whether
+the app that called has it, and does the change only then (else
+`AccessDenied`). An unsandboxed app has it by default, a sandboxed one
+(Flatpak) does not; `/etc/mlx/ipc.conf` decides otherwise:
+
+```
+deny @all use network.control
+allow mlx-settings use network.control
+allow mlx-topbar use network.control
+allow mlx-net use network.control
+```
+
+On a bus without `org.mlx.IPC` (D-Bus, given with `--bus`) that bus's own
+policy decides.
+
 While no NetworkManager owns the name, `mlx-netd` is also
 `org.freedesktop.NetworkManager` at `/org/freedesktop/NetworkManager`
 with what apps ask to know whether they are online: `state()`,
@@ -155,14 +173,16 @@ or Disconnect and Forget once it is joined. A passphrase refused is said
 on its row and asked again.
 
 Without an answer from `mlx-netd` the page says why and what to run
-(`projects/desktop/settings/network_status.mlx`): no system bus, the
-bus's policy refusing the call, `mlx-netd` not installed or not switched
-on (with `tools/install_network.sh --enable` and the start), installed but
-stopped (the start, and the journal), running but kept off the bus by a
-missing policy (`systemctl reload dbus`), or on the bus and silent. It
-asks the bus whether NetworkManager has its name and says so, looks for
-the systemd unit (enabled or not), the mlx-init service and a running
-`mlx-netd`, and gives systemd's, mlx-init's or the plain command. Meanwhile
+(`projects/desktop/settings/network_status.mlx`): `mlx-netd` not
+installed or not switched on (with `tools/install_network.sh --enable`
+and the start), installed but MLXIPC's system bus not running (starting
+`mlx-ipcd`), stopped (the start, and the journal), running but not on
+MLXIPC's bus (an older `mlx-netd` on D-Bus, or not root: install and
+restart), a rule of `/etc/mlx/ipc.conf` refusing the call (the line that
+allows it), or on the bus and silent. It says when NetworkManager runs
+(its process), looks for the systemd unit (enabled or not), the mlx-init
+service and a running `mlx-netd`, and gives systemd's, mlx-init's or the
+plain command. Meanwhile
 it lists the links as the kernel has them (route netlink: their state and
 IPv4 address), read only.
 
@@ -183,18 +203,20 @@ sudo tools/install_network.sh                             # install
 sudo tools/install_network.sh --enable                    # and switch over
 ```
 
-It builds `mlx-netd` and `mlx-net` into `PREFIX/bin` (`--prefix`,
-default `/usr/local`) and installs `/etc/mlx/network.conf` (an example,
-all commented out; an existing one stays), a systemd unit and an mlx-init
-service for `mlx-netd`, D-Bus's policy for `org.mlx.Network` (root owns
-the names; everyone may read the links and networks and scan; the
-`netdev` group and the user at the console may change them) and
-`/var/lib/mlx/network` (mode 0700, the saved networks). The examples are
-in `examples/`. Nothing is switched over unless `--enable` says so: then
-`mlx-netd.service` is enabled (also as `dbus-org.freedesktop.NetworkManager`)
-and NetworkManager, systemd-networkd and wpa_supplicant are masked, the
-links `systemctl enable` and `systemctl mask` make; `systemctl unmask`
-and `systemctl enable NetworkManager` undo it. `--destdir DIR` stages it
+It builds `mlx-netd`, `mlx-net` and MLXIPC's `mlx-ipcd` into
+`PREFIX/bin` (`--prefix`, default `/usr/local`) and installs
+`/etc/mlx/network.conf` (an example, all commented out; an existing one
+stays), systemd units and mlx-init services for MLXIPC's system bus
+(`mlx-ipcd.service`, from `projects/desktop/ipc/examples`) and for
+`mlx-netd` (which needs it), and `/var/lib/mlx/network` (mode 0700, the
+saved networks). The examples are in `examples/`. D-Bus is not needed:
+dbus-daemon may run beside MLXIPC for the system's other services, and
+the D-Bus policy an earlier install left is removed. Nothing is switched
+over unless `--enable` says so: then `mlx-ipcd.service` and
+`mlx-netd.service` are enabled and NetworkManager, systemd-networkd and
+wpa_supplicant are masked, the links `systemctl enable` and
+`systemctl mask` make; `systemctl unmask` and
+`systemctl enable NetworkManager` undo it. `--destdir DIR` stages it
 all under DIR instead (packaging, or a look before installing); without
 it the script has to run as root.
 

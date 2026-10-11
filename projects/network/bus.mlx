@@ -1,4 +1,11 @@
-// mlx-netd on the system bus (MLXIPC's system bus, or D-Bus's):
+// mlx-netd on the system bus: MLXIPC's (mlx-ipcd --system, /run/mlx/bus),
+// where only root owns names. Changing the network (Up, Down, Reload,
+// Connect, Disconnect, Forget) is the permission network.control, which
+// mlx-netd asks the bus about for the app that called
+// (org.mlx.IPC.Check): an unsandboxed app has it unless
+// /etc/mlx/ipc.conf says otherwise, a sandboxed one does not. Asking what
+// there is (Devices, Networks) and Scan need no permission. On a bus
+// without org.mlx.IPC (D-Bus, with --bus) the bus's own policy decides.
 //
 //   org.mlx.Network on /org/mlx/Network
 //     Devices() -> a(ssssssas)  each link: name, kind (ethernet, wifi,
@@ -57,7 +64,34 @@ const NM_CONNECTIVITY_FULL: u32 = 4
 pub const ASK_NOTHING: u32 = 0
 pub const ASK_RELOAD: u32 = 1
 
+// The changes that need network.control, and how many may wait for the
+// bus's answer at once.
+const CHANGE_UP: u8 = 1
+const CHANGE_DOWN: u8 = 2
+const CHANGE_RELOAD: u8 = 3
+const CHANGE_CONNECT: u8 = 4
+const CHANGE_DISCONNECT: u8 = 5
+const CHANGE_FORGET: u8 = 6
+const PENDING: usize = 8
+
 const INTROSPECTION: []const u8 = "<!DOCTYPE node PUBLIC \"-//freedesktop//DTD D-BUS Object Introspection 1.0//EN\" \"http://www.freedesktop.org/standards/dbus/1.0/introspect.dtd\">\n<node>\n <interface name=\"org.mlx.Network\">\n  <method name=\"Devices\"><arg type=\"a(ssssssas)\" direction=\"out\"/></method>\n  <method name=\"Up\"><arg type=\"s\" direction=\"in\"/></method>\n  <method name=\"Down\"><arg type=\"s\" direction=\"in\"/></method>\n  <method name=\"Reload\"/>\n  <method name=\"Networks\"><arg type=\"a(suussbb)\" direction=\"out\"/></method>\n  <method name=\"Scan\"/>\n  <method name=\"Connect\"><arg type=\"s\" direction=\"in\"/><arg type=\"s\" direction=\"in\"/></method>\n  <method name=\"Disconnect\"/>\n  <method name=\"Forget\"><arg type=\"s\" direction=\"in\"/></method>\n  <signal name=\"Changed\"/>\n </interface>\n</node>\n"
+
+// A change waiting for the bus's word on network.control: the call (its
+// serial, flags and sender) and its arguments (a link's name or an SSID,
+// and a passphrase, wiped once the change is done or refused).
+pub const Pending = struct {
+    used: bool
+    check: u32
+    change: u8
+    serial: u32
+    flags: u8
+    sender: [64]u8
+    senderLength: usize
+    first: [64]u8
+    firstLength: usize
+    second: [64]u8
+    secondLength: usize
+}
 
 pub const Service = struct {
     client: dbus.Client
@@ -67,10 +101,44 @@ pub const Service = struct {
     // The NetworkManager state last told.
     state: u32
     verbose: bool
+    pending: [8]Pending
 }
 
 fn clientOf(service: *Service) -> *dbus.Client {
     unsafe { return @ptrCast(*dbus.Client, &service.*.client) }
+}
+
+fn pendingAt(service: *Service, index: usize) -> *Pending {
+    unsafe { return @ptrFromInt(*Pending, @intFromPtr(service) + @offsetOf(Service, "pending") + index * @sizeOf(Pending)) }
+}
+
+fn bytesOf(pending: *Pending, offset: usize) -> [*]u8 {
+    unsafe { return @ptrFromInt([*]u8, @intFromPtr(pending) + offset) }
+}
+
+fn senderOf(pending: *Pending) -> []const u8 { return bytesOf(pending, @offsetOf(Pending, "sender"))[0..pending.*.senderLength] }
+fn firstOf(pending: *Pending) -> []const u8 { return bytesOf(pending, @offsetOf(Pending, "first"))[0..pending.*.firstLength] }
+fn secondOf(pending: *Pending) -> []const u8 { return bytesOf(pending, @offsetOf(Pending, "second"))[0..pending.*.secondLength] }
+
+fn copyInto(target: [*]u8, capacity: usize, value: []const u8) -> usize {
+    var index: usize = 0
+    while index < value.length && index < capacity {
+        target[index] = value[index]
+        index += 1
+    }
+    return index
+}
+
+// Forgets a change, its passphrase wiped.
+fn release(pending: *Pending) -> void {
+    const second = bytesOf(pending, @offsetOf(Pending, "second"))
+    var index: usize = 0
+    while index < 64 {
+        second[index] = 0
+        index += 1
+    }
+    pending.*.secondLength = 0
+    pending.*.used = false
 }
 
 fn nothing() -> [*]const isize {
@@ -79,7 +147,7 @@ fn nothing() -> [*]const isize {
 }
 
 // The bus's socket: `given`, else DBUS_SYSTEM_BUS_ADDRESS's unix:path=,
-// else /run/dbus/system_bus_socket.
+// else MLXIPC's system bus, /run/mlx/bus.
 fn socketPath(environment: [*][*]const u8, given: []const u8, into: [*]u8) -> []const u8 {
     if given.length > 0 { return given }
     var index: usize = 0
@@ -96,12 +164,12 @@ fn socketPath(environment: [*][*]const u8, given: []const u8, into: [*]u8) -> []
         }
         index += 1
     }
-    return "/run/dbus/system_bus_socket"
+    return "/run/mlx/bus"
 }
 
 // Connects and takes the names; false when there is no bus, another
 // network service has org.mlx.Network, or the bus does not let it take
-// the name (D-Bus without its policy, org.mlx.Network.conf).
+// the name (on MLXIPC's system bus only root owns names).
 pub fn connect(service: *Service, allocator: std.allocator.Allocator, environment: [*][*]const u8, given: []const u8) -> bool {
     service.*.triedAt = system.milliseconds()
     var path_bytes: [256]u8 = undefined
@@ -109,11 +177,16 @@ pub fn connect(service: *Service, allocator: std.allocator.Allocator, environmen
     unsafe { view = @ptrCast([*]u8, &path_bytes) }
     const path = socketPath(environment, given, view)
     const client = clientOf(service)
+    var index: usize = 0
+    while index < PENDING {
+        release(pendingAt(service, index))
+        index += 1
+    }
     if !dbus.connectClient(client, allocator, path) { return false }
     const named = requestName(service, NAME)
     if named != NAME_TAKEN {
         if named == NAME_REFUSED {
-            system.say("netd: the system bus does not let it take org.mlx.Network (is /etc/dbus-1/system.d/org.mlx.Network.conf there, and the bus reloaded?)\n")
+            system.say("netd: the system bus does not let it take org.mlx.Network (on MLXIPC's only root owns names)\n")
         } else {
             system.say("netd: another network service has org.mlx.Network\n")
         }
@@ -370,49 +443,126 @@ fn called(service: *Service, devices: *Devices, request: *const dbus.Header) -> 
         replyEmpty(service, request)
         return ASK_NOTHING
     }
-    if system.same(member, "Connect") {
-        const ssid = dbus.readString(&reading)
-        const passphrase = dbus.readString(&reading)
-        if reading.failed {
-            refuse(service, request, "org.freedesktop.DBus.Error.InvalidArgs", "Connect takes an SSID and a passphrase")
+    const change = changeOf(member)
+    if change != 0 {
+        var first: []const u8 = ""
+        var second: []const u8 = ""
+        if change == CHANGE_UP || change == CHANGE_DOWN || change == CHANGE_CONNECT || change == CHANGE_FORGET { first = dbus.readString(&reading) }
+        if change == CHANGE_CONNECT { second = dbus.readString(&reading) }
+        if reading.failed || first.length > 64 || second.length > 64 {
+            refuse(service, request, "org.freedesktop.DBus.Error.InvalidArgs", if change == CHANGE_CONNECT { "Connect takes an SSID and a passphrase" } else { "it takes a link's name or an SSID" })
             return ASK_NOTHING
         }
-        const result = devices_module.wifiConnect(devices, ssid, passphrase)
+        ask(service, request, change, first, second)
+        return ASK_NOTHING
+    }
+    refuse(service, request, "org.freedesktop.DBus.Error.UnknownMethod", "org.mlx.Network has Devices, Up, Down, Reload, Networks, Scan, Connect, Disconnect and Forget")
+    return ASK_NOTHING
+}
+
+fn changeOf(member: []const u8) -> u8 {
+    if system.same(member, "Up") { return CHANGE_UP }
+    if system.same(member, "Down") { return CHANGE_DOWN }
+    if system.same(member, "Reload") { return CHANGE_RELOAD }
+    if system.same(member, "Connect") { return CHANGE_CONNECT }
+    if system.same(member, "Disconnect") { return CHANGE_DISCONNECT }
+    if system.same(member, "Forget") { return CHANGE_FORGET }
+    return 0
+}
+
+// Asks the bus whether the app behind the call may change the network
+// (org.mlx.IPC.Check: network.control); the change waits for the answer
+// (answered).
+fn ask(service: *Service, request: *const dbus.Header, change: u8, first: []const u8, second: []const u8) -> void {
+    var slot: usize = 0
+    while slot < PENDING && pendingAt(service, slot).*.used { slot += 1 }
+    if slot == PENDING || request.*.sender.length > 64 {
+        refuse(service, request, "org.mlx.Network.Error.Busy", "too many changes wait for the bus")
+        return
+    }
+    const pending = pendingAt(service, slot)
+    pending.*.change = change
+    pending.*.serial = request.*.serial
+    pending.*.flags = request.*.flags
+    pending.*.senderLength = copyInto(bytesOf(pending, @offsetOf(Pending, "sender")), 64, request.*.sender)
+    pending.*.firstLength = copyInto(bytesOf(pending, @offsetOf(Pending, "first")), 64, first)
+    pending.*.secondLength = copyInto(bytesOf(pending, @offsetOf(Pending, "second")), 64, second)
+    var writing: dbus.Writer = undefined
+    dbus.begin(&writing, service.*.out, SIZE, false)
+    dbus.putString(&writing, senderOf(pending))
+    dbus.putString(&writing, "network.control")
+    pending.*.check = dbus.call(clientOf(service), BUS, "/org/mlx/IPC", "org.mlx.IPC", "Check", "ss", service.*.out, writing.length)
+    if pending.*.check == 0 {
+        release(pending)
+        refuse(service, request, "org.freedesktop.DBus.Error.AccessDenied", "the bus could not be asked about network.control")
+        return
+    }
+    pending.*.used = true
+}
+
+// Does a change the bus allowed; what the daemon is to do (ASK_*).
+fn perform(service: *Service, devices: *Devices, request: *const dbus.Header, pending: *Pending) -> u32 {
+    const change = pending.*.change
+    if change == CHANGE_CONNECT {
+        const result = devices_module.wifiConnect(devices, firstOf(pending), secondOf(pending))
         if result != wifi_module.CONNECT_STARTED {
             refuse(service, request, match result { 1 => "org.mlx.Network.Error.NotFound", 2 => "org.mlx.Network.Error.Unsupported", 3 => "org.mlx.Network.Error.NeedsPassphrase", 4 => "org.mlx.Network.Error.BadPassphrase", else => "org.mlx.Network.Error.Failed" }, match result { 1 => "no such network in sight", 2 => "mlx-netd speaks open networks and WPA2-Personal only", 3 => "the network needs a passphrase", 4 => "a passphrase has 8 to 63 characters (or 64 hex digits)", else => "the card could not join" })
             return ASK_NOTHING
         }
-        replyEmpty(service, request)
-        return ASK_NOTHING
-    }
-    if system.same(member, "Disconnect") {
+    } else if change == CHANGE_DISCONNECT {
         devices_module.wifiDisconnect(devices)
-        replyEmpty(service, request)
-        return ASK_NOTHING
-    }
-    if system.same(member, "Forget") {
-        const ssid = dbus.readString(&reading)
-        if reading.failed || !devices_module.wifiForget(devices, ssid) {
+    } else if change == CHANGE_FORGET {
+        if !devices_module.wifiForget(devices, firstOf(pending)) {
             refuse(service, request, "org.mlx.Network.Error.NotFound", "no such saved network")
             return ASK_NOTHING
         }
-        replyEmpty(service, request)
-        return ASK_NOTHING
-    }
-    if system.same(member, "Up") || system.same(member, "Down") {
-        const name = dbus.readString(&reading)
-        if reading.failed || !devices_module.switchOn(devices, name, system.same(member, "Up")) {
+    } else if change == CHANGE_UP || change == CHANGE_DOWN {
+        if !devices_module.switchOn(devices, firstOf(pending), change == CHANGE_UP) {
             refuse(service, request, "org.mlx.Network.Error.NoSuchLink", "no such managed link")
             return ASK_NOTHING
         }
-        replyEmpty(service, request)
-        return ASK_NOTHING
     }
-    if system.same(member, "Reload") {
-        replyEmpty(service, request)
-        return ASK_RELOAD
+    replyEmpty(service, request)
+    return if change == CHANGE_RELOAD { ASK_RELOAD } else { ASK_NOTHING }
+}
+
+// Whether an error to Check says the bus has no org.mlx.IPC (D-Bus): its
+// own policy let the call through then.
+fn notMlxipc(reply: *const dbus.Header) -> bool {
+    const name = reply.*.errorName
+    return system.same(name, "org.freedesktop.DBus.Error.UnknownMethod") || system.same(name, "org.freedesktop.DBus.Error.UnknownInterface") || system.same(name, "org.freedesktop.DBus.Error.UnknownObject")
+}
+
+// The bus's answer about a change's network.control: the change is done,
+// or refused. What the daemon is to do (ASK_*).
+fn answered(service: *Service, devices: *Devices, reply: *const dbus.Header) -> u32 {
+    var slot: usize = 0
+    while slot < PENDING {
+        const pending = pendingAt(service, slot)
+        if pending.*.used && pending.*.check == reply.*.replySerial {
+            var allowed = false
+            if reply.*.kind == dbus.METHOD_RETURN {
+                var reading = dbus.reader(dbus.bodyOf(clientOf(service), reply), reply.*.bodyLength, reply.*.big)
+                const said = dbus.readBool(&reading)
+                allowed = said && !reading.failed
+            } else {
+                allowed = notMlxipc(reply)
+            }
+            var request = dbus.newHeader(dbus.METHOD_CALL, pending.*.serial)
+            request.flags = pending.*.flags
+            request.sender = senderOf(pending)
+            var asked = ASK_NOTHING
+            if allowed {
+                asked = perform(service, devices, &request, pending)
+            } else {
+                refuse(service, &request, "org.freedesktop.DBus.Error.AccessDenied", "this app may not change the network (network.control in /etc/mlx/ipc.conf)")
+                if service.*.verbose { system.say("netd: a change refused: the app may not use network.control\n") }
+            }
+            release(pending)
+            return asked
+        }
+        slot += 1
     }
-    refuse(service, request, "org.freedesktop.DBus.Error.UnknownMethod", "org.mlx.Network has Devices, Up, Down, Reload, Networks, Scan, Connect, Disconnect and Forget")
     return ASK_NOTHING
 }
 
@@ -422,10 +572,13 @@ pub fn process(service: *Service, devices: *Devices, allocator: std.allocator.Al
     var asked = ASK_NOTHING
     var header: dbus.Header = undefined
     while dbus.next(clientOf(service), &header, 0) {
+        var answer = ASK_NOTHING
         if header.kind == dbus.METHOD_CALL {
-            const answer = called(service, devices, &header)
-            if answer != ASK_NOTHING { asked = answer }
+            answer = called(service, devices, &header)
+        } else if (header.kind == dbus.METHOD_RETURN || header.kind == dbus.ERROR) && header.hasReplySerial {
+            answer = answered(service, devices, &header)
         }
+        if answer != ASK_NOTHING { asked = answer }
     }
     if clientOf(service).*.closed {
         service.*.connected = false

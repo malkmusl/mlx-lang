@@ -73,9 +73,9 @@
 #      the nested compositor tells its output in <socket>.display, and the
 #      Display page's night light switch reaches compositor.conf.
 #  14a. mlx-settings' Network page without mlx-netd: with a stand-in
-#      NetworkManager on the system bus it says NetworkManager runs the
-#      network and lists the kernel's links; with an mlx-netd that has its
-#      name but does not answer, it says that.
+#      NetworkManager running it says NetworkManager runs the network and
+#      lists the kernel's links; with an mlx-netd that has its name on the
+#      system bus but does not answer, it says that.
 #  14b. mlx-settings' Network page on a system bus with fakenetd
 #      (tools/network-test) as mlx-netd: a Wi-Fi network is joined (a
 #      wrong passphrase refused and asked again) and forgotten.
@@ -1235,9 +1235,10 @@ for _ in $(seq 1 50); do [[ -S "$XDG_RUNTIME_DIR/system" ]] && break; sleep 0.1;
 export DBUS_SYSTEM_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/system"
 
 # Scenario 14a: the Network page (opened by its argument) without mlx-netd,
-# first with fakenetd as NetworkManager (--as takes the name and answers
-# nothing), then also as an mlx-netd that does not answer. What the page
-# finds goes to stderr ("mlx-settings: network: ...").
+# first with fakenetd running as NetworkManager (the page knows it by its
+# process name; --as takes the name and answers nothing), then also as an
+# mlx-netd that does not answer. What the page finds goes to stderr
+# ("mlx-settings: network: ...").
 cat > "$work/network-page.sh" <<SCRIPT
 #!/bin/sh
 exec "$work/mlx-settings" network
@@ -1247,7 +1248,8 @@ cat > "$work/no-netd.script" <<SCRIPT
 wait 2500
 close
 SCRIPT
-"$work/fakenetd" --as org.freedesktop.NetworkManager > "$work/fake-manager.log" 2>&1 &
+cp "$work/fakenetd" "$work/NetworkManager"
+"$work/NetworkManager" --as org.freedesktop.NetworkManager > "$work/fake-manager.log" 2>&1 &
 manager_pid=$!
 for _ in $(seq 1 50); do grep -q "^fakenetd: ready" "$work/fake-manager.log" && break; sleep 0.1; done
 run_scenario no-netd "$work/no-netd.script" --no-fps --run "$work/network-page.sh"

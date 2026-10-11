@@ -44,7 +44,7 @@ projects/.../main.mlx -o ...`) and is checked by a script under `tools/`.
 - [`network/`](network/README.md): mlx-netd, the network daemon in place
   of NetworkManager (links through route netlink, DHCPv4, static
   settings, routes by metric, resolv.conf, Wi-Fi through nl80211 with its
-  own WPA2 supplicant, the system bus) and mlx-net; the top bar's network
+  own WPA2 supplicant, MLXIPC's system bus) and mlx-net; the top bar's network
   list and mlx-settings' Network page ask it; `tools/install_network.sh`;
   `tools/check_network.sh`, `tools/check_wifi.sh`.
 

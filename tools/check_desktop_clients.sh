@@ -1008,7 +1008,8 @@ SCRIPT
     XDG_RUNTIME_DIR=$runtime "$work/test-host" host-topbar-bus "$work/us.xkb" "$work/topbar-bus.script" > "$work/topbar-bus-host.log" 2>&1 &
     local host_pid=$!
     for _ in $(seq 1 50); do [[ -S "$runtime/host-topbar-bus" ]] && break; sleep 0.1; done
-    local bus=(env -i PATH="$PATH" HOME="$work/bar-home" XDG_RUNTIME_DIR="$runtime" XDG_CONFIG_HOME="$work/bar-config" DBUS_SESSION_BUS_ADDRESS="unix:path=$runtime/bus")
+    # XDG_DATA_DIRS: the bus starts none of the system's services.
+    local bus=(env -i PATH="$PATH" HOME="$work/bar-home" XDG_RUNTIME_DIR="$runtime" XDG_CONFIG_HOME="$work/bar-config" XDG_DATA_DIRS="$work/none" DBUS_SESSION_BUS_ADDRESS="unix:path=$runtime/bus")
     "${bus[@]}" "$work/mlx-ipcd" --address "$runtime/bus" > "$work/topbar-ipcd.log" 2>&1 &
     local ipcd_pid=$!
     for _ in $(seq 1 50); do [[ -S "$runtime/bus" ]] && break; sleep 0.1; done
@@ -1211,7 +1212,8 @@ SCRIPT
     local host_pid=$!
     for _ in $(seq 1 50); do [[ -S "$runtime/host-cc" ]] && break; sleep 0.1; done
     # No system bus (no mlx-netd): the network tile reads MLX_TOPBAR_NET.
-    local bus=(env -i PATH="$work:$PATH" HOME="$work/cc-home" XDG_RUNTIME_DIR="$runtime" XDG_CONFIG_HOME="$work/cc-config" DBUS_SESSION_BUS_ADDRESS="unix:path=$runtime/bus" DBUS_SYSTEM_BUS_ADDRESS="unix:path=$runtime/no-system-bus")
+    # XDG_DATA_DIRS: the bus starts none of the system's services.
+    local bus=(env -i PATH="$work:$PATH" HOME="$work/cc-home" XDG_RUNTIME_DIR="$runtime" XDG_CONFIG_HOME="$work/cc-config" XDG_DATA_DIRS="$work/none" DBUS_SESSION_BUS_ADDRESS="unix:path=$runtime/bus" DBUS_SYSTEM_BUS_ADDRESS="unix:path=$runtime/no-system-bus")
     "${bus[@]}" "$work/mlx-ipcd" --address "$runtime/bus" > "$work/cc-ipcd.log" 2>&1 &
     local ipcd_pid=$!
     for _ in $(seq 1 50); do [[ -S "$runtime/bus" ]] && break; sleep 0.1; done
