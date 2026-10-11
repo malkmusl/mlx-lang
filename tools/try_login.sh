@@ -77,6 +77,7 @@ greeter_uid=$(id -u mlx-greeter)
 greeter_gid=$(getent group mlx-greeter | cut -d: -f3)
 greeter_log=/run/mlx/user/greeter/.config/mlx/compositor.log
 started=$(date +%s)
+vt_open=false
 say "try of mlx-login for $seconds s; user $user ($user_id), greeter account $greeter_uid:$greeter_gid"
 
 # What there was before.
@@ -117,9 +118,12 @@ if [[ -n "$busy" ]]; then
     ps -o pid,user,cmd -p "$(echo "$busy" | tr ' ' ',' | sed 's/^,//')" >> "$log" 2>&1
 else
     systemctl is-active --quiet mlx-ipcd || { systemctl start mlx-ipcd; say "started mlx-ipcd"; }
-    # The test VT shows nothing of what is typed, and reads nothing.
-    stty -F "/dev/tty$test_vt" -echo 2> /dev/null
-    chvt "$test_vt"
+    # The test VT shows nothing of what is typed. The console resets a VT's
+    # settings when the last file on it closes, so `stty -F` alone would
+    # not last: this script keeps the VT open on descriptor 3 to the end.
+    exec 3<> "/dev/tty$test_vt" && vt_open=true
+    $vt_open && stty -echo <&3 2> /dev/null
+    timeout 10 chvt "$test_vt" || say "chvt $test_vt did not finish in 10 s"
     systemctl reset-failed mlx-login-test 2> /dev/null
     if systemd-run --quiet --collect --unit=mlx-login-test -p RuntimeMaxSec="$seconds" \
         "$bindir/mlx-login" --greeter-uid "$greeter_uid" --greeter-gid "$greeter_gid" \
@@ -131,7 +135,7 @@ else
             if (( tick % 5 == 0 )); then
                 {
                     echo "== $(date +%T)"
-                    ps -eo pid,ppid,user,group,supgrp,cmd | grep -E 'mlx-|gnome|PID' | grep -v grep
+                    ps -eo pid,ppid,user,group,cmd:72,supgrp | grep -E 'mlx-|gnome|PID' | grep -v grep
                 } >> "$out/processes.txt"
             fi
             tick=$((tick + 1))
@@ -141,21 +145,28 @@ else
     else
         say "mlx-login did not start"
     fi
-    # What the console got while the greeter had the keys: thrown away.
-    stty -F "/dev/tty$test_vt" -icanon min 0 time 0 2> /dev/null && cat "/dev/tty$test_vt" > /dev/null 2>&1
-    stty -F "/dev/tty$test_vt" sane 2> /dev/null
-    printf '\033c' > "/dev/tty$test_vt" 2> /dev/null
 fi
 
-# The logs.
+# The logs, first: nothing after this may lose them.
 journalctl --since "@$started" -u mlx-login-test -u mlx-ipcd --no-pager -o short-precise > "$out/journal-mlx.txt" 2>&1
 journalctl --since "@$started" --no-pager -o short-precise -p warning > "$out/journal-warnings.txt" 2>&1
 for file in compositor.log compositor.log.old; do
     [[ -f "$home/.config/mlx/$file" ]] && cp "$home/.config/mlx/$file" "$out/after-session-$file"
 done
 [[ -f "/tmp/mlx-session-$user_id.log" ]] && cp "/tmp/mlx-session-$user_id.log" "$out/session-launcher.log"
+say "saved the logs"
 
 # Back to where it was.
-chvt "$original_vt"
+timeout 10 chvt "$original_vt" || say "chvt $original_vt did not finish in 10 s"
 [[ "$display_manager" == active ]] && systemctl start display-manager && say "started the display manager again"
+
+# What the console got while the greeter had the keys: thrown away, so no
+# later reader of the VT sees it. The read has a time limit: a VT that
+# waits for a whole line would block it for ever.
+if $vt_open; then
+    stty -icanon min 0 time 0 <&3 2> /dev/null && timeout 2 cat <&3 > /dev/null 2>&1
+    stty sane <&3 2> /dev/null
+    printf '\033c' >&3 2> /dev/null
+    exec 3<&-
+fi
 say "done; the logs are in $out"
