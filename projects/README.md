@@ -32,6 +32,9 @@ projects/.../main.mlx -o ...`) and is checked by a script under `tools/`.
   `projects/coreutils/build.sh` and `test.sh`.
 - [`libc/`](libc/README.md): mlxlibc, the C library and dynamic loader in
   Mlx for legacy programs; `tools/check_mlxlibc.sh`.
+- [`cc/`](cc/README.md): mlx-cc, the C compiler in Mlx (preprocessor,
+  parser, x86_64 code and ELF written itself, its own headers);
+  `tools/check_cc.sh`.
 - [`init/`](init/README.md): mlx-init, PID 1 of MLX/Linux (mounts,
   services, supervision, the control socket, shutdown) and mlx-initctl;
   `tools/check_init.sh`.

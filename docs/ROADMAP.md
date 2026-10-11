@@ -18,7 +18,7 @@ repository does.
 | Language and compiler | Mlx, `mlx4` (self-hosted, x86_64 and aarch64, ELF, APK) | gcc for our own code | done; a few compiler gaps are recorded as tasks |
 | Standard library | `std` (system calls, files, formats, crypto, Wayland, Vulkan, UI) | glibc for our own code | done for what the programs use |
 | C library | mlxlibc (`projects/libc`): 830 C names and the dynamic loader | glibc, ld.so | runs glibc-linked programs; libm, iconv, `strtold` missing |
-| C compiler | mlx-cc (`projects/cc`) | gcc, as, ld for C programs | started on this branch |
+| C compiler | mlx-cc (`projects/cc`) | gcc, as, ld for C programs | whole programs of C11 build and run, on glibc and on mlxlibc alone; separate compilation is next |
 | Init | mlx-init (`projects/init`) | systemd as PID 1, sysvinit | supervises, mounts, shuts down; no users per service, no device events |
 | Shell | mlx-sh (`projects/shell`) | bash, dash | POSIX scripts, line editor |
 | Core utilities | `projects/coreutils` (about 70 programs) | GNU coreutils | the common ones; the rest of coreutils is open |
@@ -43,14 +43,17 @@ encoder and the ELF writer of the Mlx compiler
 linker are needed. Programs it builds link against `libc.so.6`, which
 is mlxlibc on our system and glibc elsewhere.
 
-1. **C subset, whole programs.** The preprocessor (`#include`,
+State: steps 1 and 2 are done (`tools/check_cc.sh`); the gaps left
+from them are listed in `projects/cc/README.md`.
+
+1. **C subset, whole programs.** (done) The preprocessor (`#include`,
    object-like and function-like macros with `#` and `##`, conditionals),
    integer types, pointers, arrays, structs, unions, enums, typedefs, all
    statements, all operators, function pointers, calls into the C library
    (variadic ones too), globals with initializers, several `.c` files
    compiled into one program, our own headers for mlxlibc
    (`projects/cc/include`). Check: test programs whose output is known.
-2. **The rest of C99/C11 for real code.** Floating point (`float`,
+2. **The rest of C99/C11 for real code.** (done) Floating point (`float`,
    `double`, SSE), structs passed and returned by value, variadic
    functions defined in C (`<stdarg.h>`), bit fields, compound literals,
    designated initializers, `static` locals, `_Alignof`, `_Static_assert`,
