@@ -154,12 +154,26 @@ switch each (`Up`, `Down`), the networks in sight (`Search again`:
 or Disconnect and Forget once it is joined. A passphrase refused is said
 on its row and asked again.
 
+Without an answer from `mlx-netd` the page says why and what to run
+(`projects/desktop/settings/network_status.mlx`): no system bus, the
+bus's policy refusing the call, `mlx-netd` not installed or not switched
+on (with `tools/install_network.sh --enable` and the start), installed but
+stopped (the start, and the journal), running but kept off the bus by a
+missing policy (`systemctl reload dbus`), or on the bus and silent. It
+asks the bus whether NetworkManager has its name and says so, looks for
+the systemd unit (enabled or not), the mlx-init service and a running
+`mlx-netd`, and gives systemd's, mlx-init's or the plain command. Meanwhile
+it lists the links as the kernel has them (route netlink: their state and
+IPv4 address), read only.
+
 Both are checked against `tools/network-test/fakenetd.mlx`, a stand-in
 for `mlx-netd` on a system bus of the check's own (a cable and four Wi-Fi
 networks; it says what it was asked, a passphrase only by its length):
 `tools/check_desktop_clients.sh` joins a network from the control centre,
 `tools/check_wayland_compositor.sh` joins one from the Network page with
-a wrong and then the right passphrase, and forgets it.
+a wrong and then the right passphrase, and forgets it. With `--as NAME`
+fakenetd only takes NAME and answers nothing: the same check has it play
+NetworkManager and an `mlx-netd` that hangs, and the page must say so.
 
 ## Installing
 

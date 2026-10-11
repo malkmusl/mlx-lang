@@ -72,6 +72,10 @@
 #      (started by the bus) it mutes the output and turns the volume down;
 #      the nested compositor tells its output in <socket>.display, and the
 #      Display page's night light switch reaches compositor.conf.
+#  14a. mlx-settings' Network page without mlx-netd: with a stand-in
+#      NetworkManager on the system bus it says NetworkManager runs the
+#      network and lists the kernel's links; with an mlx-netd that has its
+#      name but does not answer, it says that.
 #  14b. mlx-settings' Network page on a system bus with fakenetd
 #      (tools/network-test) as mlx-netd: a Wi-Fi network is joined (a
 #      wrong passphrase refused and asked again) and forgotten.
@@ -1229,6 +1233,34 @@ echo "ok   mlx-settings' Sound page controls MLX Audio (output off, volume $((vo
 system_pid=$!
 for _ in $(seq 1 50); do [[ -S "$XDG_RUNTIME_DIR/system" ]] && break; sleep 0.1; done
 export DBUS_SYSTEM_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/system"
+
+# Scenario 14a: the Network page (opened by its argument) without mlx-netd,
+# first with fakenetd as NetworkManager (--as takes the name and answers
+# nothing), then also as an mlx-netd that does not answer. What the page
+# finds goes to stderr ("mlx-settings: network: ...").
+cat > "$work/network-page.sh" <<SCRIPT
+#!/bin/sh
+exec "$work/mlx-settings" network
+SCRIPT
+chmod +x "$work/network-page.sh"
+cat > "$work/no-netd.script" <<SCRIPT
+wait 2500
+close
+SCRIPT
+"$work/fakenetd" --as org.freedesktop.NetworkManager > "$work/fake-manager.log" 2>&1 &
+manager_pid=$!
+for _ in $(seq 1 50); do grep -q "^fakenetd: ready" "$work/fake-manager.log" && break; sleep 0.1; done
+run_scenario no-netd "$work/no-netd.script" --no-fps --run "$work/network-page.sh"
+"$work/fakenetd" --as org.mlx.Network > "$work/fake-silent.log" 2>&1 &
+silent_pid=$!
+for _ in $(seq 1 50); do grep -q "^fakenetd: ready" "$work/fake-silent.log" && break; sleep 0.1; done
+run_scenario silent-netd "$work/no-netd.script" --no-fps --run "$work/network-page.sh"
+kill "$manager_pid" "$silent_pid" 2> /dev/null || true
+wait "$manager_pid" "$silent_pid" 2> /dev/null || true
+grep -q "^mlx-settings: network: mlx-netd .*; NetworkManager runs the network; the kernel's links:" "$work/no-netd-compositor.log" && ! grep -q "^mlx-settings: network: mlx-netd is on the system bus" "$work/no-netd-compositor.log" || { echo "the Network page did not say that NetworkManager runs the network" >&2; cat "$work/no-netd-compositor.log" >&2; exit 1; }
+grep -q "^mlx-settings: network: mlx-netd is on the system bus but did not answer; NetworkManager runs the network" "$work/silent-netd-compositor.log" || { echo "the Network page did not say that mlx-netd does not answer" >&2; cat "$work/silent-netd-compositor.log" >&2; exit 1; }
+echo "ok   mlx-settings' Network page without mlx-netd says why (NetworkManager runs the network; mlx-netd does not answer) and lists the kernel's links"
+
 "$work/fakenetd" > "$work/fakenetd.log" 2>&1 &
 netd_pid=$!
 for _ in $(seq 1 50); do grep -q "^fakenetd: ready" "$work/fakenetd.log" && break; sleep 0.1; done
