@@ -50,6 +50,9 @@
 #      column when they lift; Super+Ctrl+wheel (and Super+wheel on a
 #      floating workspace) and the wheel over the top bar switch
 #      workspaces.
+#  10g. three-finger swipes (zwp_pointer_gestures_v1 from the host): the
+#      strip follows the fingers and settles, up and down and sideways on
+#      a floating workspace pull the next workspace in or spring back.
 #  11. mlx-settings records hotkeys: while it records, the compositor
 #      passes every key to it (keyboard-shortcuts-inhibit), Super+Up too;
 #      Backspace unbinds one; the compositor takes the new keys at once.
@@ -731,6 +734,88 @@ assert 16 in swiped and 524 in swiped, ("the strip did not follow the fingers", 
 assert 8 in settled and 516 in settled and 16 not in settled, ("the strip did not settle on a column", settled)
 PY
 echo "ok   the wheel walks columns and switches workspaces, fingers drag the strip and it settles on a column"
+
+# Scenario 10g: three-finger swipes (the host's zwp_pointer_gestures_v1).
+# Three columns on a tiling workspace, the third focused (the view at 508):
+# fingers going right drag the strip 500 pixels back (the first column's
+# frame at x = 0), and when they lift it settles with the first column at
+# x = 8. Up 400 pixels pulls workspace 2 in from below (the windows on
+# their way up: nothing of them at y = 600) and lifting goes there; 100
+# pixels down and a rest spring back; sideways on that floating workspace
+# goes back to workspace 1.
+cat > "$work/gestures.script" <<SCRIPT
+wait 5000
+pointer 500 400
+down 125
+down 20
+up 20
+up 125
+wait 600
+down 56
+down 28
+up 28
+up 56
+wait 2500
+down 56
+down 28
+up 28
+up 56
+wait 2500
+gesture-begin 3
+gesture-move 100 0
+gesture-move 100 0
+gesture-move 100 0
+gesture-move 100 0
+gesture-move 100 0
+wait 300
+shot $work/strip-swiped.ppm
+gesture-end
+wait 800
+shot $work/strip-settled.ppm
+gesture-begin 3
+gesture-move 0 -100
+gesture-move 0 -100
+gesture-move 0 -100
+gesture-move 0 -100
+wait 300
+shot $work/vertical-mid.ppm
+gesture-end
+wait 1000
+gesture-begin 3
+gesture-move 0 100
+wait 300
+gesture-end
+wait 1000
+gesture-begin 3
+gesture-move 100 0
+gesture-move 100 0
+gesture-move 100 0
+gesture-move 100 0
+wait 300
+gesture-end
+wait 1000
+close
+SCRIPT
+run_scenario gestures "$work/gestures.script" --no-fps --topbar "$work/bar/mlx-topbar" --terminal "$work/mlx-terminal" --run "$work/mlx-terminal"
+log="$work/gestures-compositor.log"
+for line in "^settled on column 1: " "^swipe: workspaces up and down" "^swipe: to workspace 2" "^swipe: back from workspace 1" "^swipe: workspaces sideways" "^swipe: to workspace 1"; do
+    grep -q "$line" "$log" || { echo "the swipes did not log \"$line\"" >&2; cat "$log" >&2; exit 1; }
+done
+[[ "$(grep "^workspace: " "$log" | tr '\n' ' ')" == "workspace: 2 workspace: 1 " ]] || { echo "the swipes did not switch to workspace 2 and back to 1" >&2; cat "$log" >&2; exit 1; }
+python3 - "$work/strip-swiped.ppm" "$work/strip-settled.ppm" "$work/vertical-mid.ppm" <<'PY'
+import sys
+def frame_columns(path, row):
+    data = open(path, 'rb').read()
+    _, size, _, pixels = data.split(b'\n', 3)
+    width, height = map(int, size.split())
+    frame = ((0x5a, 0xa0, 0xff), (0x50, 0x50, 0x60))
+    return [x for x in range(width) if tuple(pixels[(row * width + x) * 3:(row * width + x) * 3 + 3]) in frame]
+swiped, settled = frame_columns(sys.argv[1], 300), frame_columns(sys.argv[2], 300)
+assert 0 in swiped and 508 in swiped, ("the strip did not follow three fingers", swiped)
+assert 8 in settled and 516 in settled, ("the strip did not settle on the first column", settled)
+assert frame_columns(sys.argv[3], 200) and not frame_columns(sys.argv[3], 600), "workspace 1 did not move up with the fingers"
+PY
+echo "ok   three-finger swipes drag the strip and settle, pull workspaces in up and down or sideways, and spring back"
 
 # Scenario 11: mlx-settings (its window at (24, 24); the categories in
 # its sidebar 28 pixels apart from y 44: General, Display, Sound, Apps,

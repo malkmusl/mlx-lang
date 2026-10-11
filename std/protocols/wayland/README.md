@@ -21,6 +21,7 @@ build inputs; applications only `@import("std.wayland")`.
 | `server-decoration.xml` | plasma-wayland-protocols c5ac4db8, `src/protocols/server-decoration.xml` (KDE's, which GTK 3 uses) |
 | `keyboard-shortcuts-inhibit-unstable-v1.xml` | wayland-protocols 1.49, `unstable/keyboard-shortcuts-inhibit/keyboard-shortcuts-inhibit-unstable-v1.xml` |
 | `xwayland-shell-v1.xml` | wayland-protocols 1.49, `staging/xwayland-shell/xwayland-shell-v1.xml` (Xwayland's windows to wl_surfaces) |
+| `pointer-gestures-unstable-v1.xml` | wayland-protocols 1.49, `unstable/pointer-gestures/pointer-gestures-unstable-v1.xml` (touchpad swipes, pinches and holds) |
 
 The files are byte-for-byte copies of the upstream releases. `SOURCES`
 records each file's URL, release and SHA-256. Bootstrap tooling must preserve

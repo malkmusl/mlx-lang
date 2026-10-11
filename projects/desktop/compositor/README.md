@@ -24,7 +24,8 @@ nested|drm` decides).
 - Nine workspaces, and per workspace floating windows or scrollable
   tiling as niri does it (columns on a strip wider than the screen); the
   top bar shows both and switches them. The wheel walks the columns and
-  the workspaces, fingers on a touchpad drag the strip.
+  the workspaces, fingers on a touchpad drag the strip, three-finger
+  swipes go through columns and workspaces as in niri.
 - Animated: windows glide where the compositor puts them, workspaces
   slide, new windows grow open, the snap preview grows out of the window
   (see Animations).
@@ -62,6 +63,8 @@ The screenshots are frames the scripted test host received, taken during
 | Super+Shift+wheel | with tiling: move the column |
 | Super+Ctrl+wheel | the workspace before or after |
 | Super+two fingers | with tiling: drag the strip; it settles on a column when they lift |
+| three fingers sideways | with tiling: drag the strip (it settles, further on after a flick); floating: the workspace before or after |
+| three fingers up or down | the workspace after or before, pulled in as the fingers go |
 | Alt+Shift+Q | quit |
 | Ctrl+Alt+F1 .. F12 | switch to that VT (freestanding) |
 | Ctrl+Alt+Backspace | quit (freestanding) |
@@ -338,8 +341,9 @@ compositor is the display server itself:
   a little acceleration and scroll 15 pixels a notch; touchpads move the
   pointer about 4 pixels per millimetre, scroll with two fingers up and
   down and sideways (the content follows the fingers; lifting them ends
-  the scroll, as `wl_pointer.axis_stop` tells clients), click (two
-  fingers: right click) and tap to click.
+  the scroll, as `wl_pointer.axis_stop` tells clients), swipe with three
+  (the compositor's own: strips and workspaces), click (two fingers: right
+  click) and tap to click.
 - **Keyboard** ([`xkb.mlx`](xkb.mlx)): `std.xkb` compiles the keymap from
   the XKB data (`/usr/share/X11/xkb`) for `XKB_DEFAULT_LAYOUT` (and
   `_VARIANT`, `_MODEL`, `_OPTIONS`; the session launcher sets them from the
@@ -978,7 +982,20 @@ when they lift it settles with the column nearest its left edge there,
 which takes the focus. Super+Shift+wheel moves the focused column, and
 Super+Ctrl+wheel goes to the workspace before or after (as Super+wheel
 does on a floating workspace; one switch per 150 ms, so a fast wheel does
-not race through all nine). Turning
+not race through all nine).
+
+**Three-finger swipes** ([`gestures.mlx`](gestures.mlx)), as niri has
+them, the content following the fingers: sideways on a tiling workspace
+the strip moves with them and settles on a column when they lift (further
+on when they flick it); up and down, and sideways on a floating
+workspace, the next or the previous workspace is pulled in as far as the
+fingers went, up and down from below or above, and when they lift it
+comes all the way (past a third of the screen, or flicked that way) or
+springs back. The first 16 pixels decide which way a swipe goes. Swipes
+come from the touchpad freestanding (three fingers on the pad) and, nested,
+from the host's `zwp_pointer_gestures_v1` (when it passes them on).
+
+Turning
 tiling off puts every window back where it floated before; a minimized
 column leaves the strip until it comes back. `tiling = on` in the
 settings makes workspaces without windows start tiled.
