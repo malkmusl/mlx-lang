@@ -269,6 +269,7 @@ GPU.
 | Widget | Shows | Does |
 | --- | --- | --- |
 | Clock | the date and time | a calendar: today in its header (its button goes back to today's month), the month with ISO week numbers and today lit; the arrows or the wheel turn the month |
+| Control centre | toggles; a dot while notifications are unread, a moon while Do Not Disturb is on | the control centre: tiles for the network (what is connected, `/sys/class/net`), Do Not Disturb, night light, dark mode, locking the screen and a screenshot; the volume; what plays (previous, play or pause, next); the notifications, newest first, each with its close button, and Clear all. Its button opens mlx-settings |
 | Battery | the charge of the batteries in `/sys/class/power_supply` (not a mouse's or a headset's), red under 15 %, a bolt while it charges | a popup: charging, full or on battery, and the time to full or to empty |
 | Volume | MLX Audio's output: a speaker with one to three waves, crossed out when muted | the wheel turns it by 5 %, a middle click mutes; the popup has the output's volume (the speaker mutes), the outputs to choose (automatic or a sound card), and the apps MLX Audio knows as a grid of their icons, each with its own slider (a click on the icon mutes the app, the wheel turns it; a dot over the ones playing); its button opens mlx-settings' Sound page |
 | Tray | the StatusNotifierItems (the icons Qt, GTK's libappindicator, Electron and others show): `IconPixmap`, else `IconName` from the icon themes, else the title's first letter; a red dot when one needs attention | a left click is `Activate`, a middle click `SecondaryActivate`, a right click the item's menu (`com.canonical.dbusmenu`, as the bar's own popup) or `ContextMenu` |
@@ -283,6 +284,57 @@ left or right, and writes `~/.config/mlx/topbar.conf`
 takes a change within a second, the widgets gliding to their new places
 and a hidden one fading out; what plays always gets the room the others
 leave.
+
+The tiles glow in the accent colour as they turn on. Do Not Disturb keeps
+the bubbles away (critical ones still come); night light is
+`night-light` in `compositor.conf`; dark mode is the look of the whole
+desktop (see Light and dark); the screenshot waits for the popup to go,
+saves the screen with `mlx-capture` into `~/Bilder` (`~/Pictures` on a
+system that is not German) and says so in a notification with the
+picture as its icon. A dismissed notification's neighbours glide up into
+its place before the popup shrinks; cleared ones fade out. The popups
+change their size in place (`xdg_popup.reposition`), not by opening
+anew.
+
+### Notifications
+
+`mlx-notifyd` ([`projects/desktop/notifications`](../notifications/main.mlx))
+is the desktop's notification server (`org.freedesktop.Notifications`,
+the Desktop Notifications Specification 1.2, on MLXIPC; its service file
+starts it on the first notification). Notifications show as bubbles at
+the top right under the bar: the app's icon (`app_icon` as a name or a
+path, the `image-data` hint, else its desktop entry's), its name, the
+summary and up to three lines of the body, the actions as buttons. A
+bubble slides in from the right while the others glide down; it goes
+after its timeout (five seconds; never for critical ones or a timeout of
+0; not while the pointer is on it), on its close button or on a click
+(the `default` action). `mlx-notify` sends one from the shell, as
+`notify-send` does (`-a APP`, `-i ICON`, `-u low|normal|critical`,
+`-t MS`, `-A KEY=LABEL`, `-r ID`, `-p` prints the id, `-w` waits and
+prints the action chosen).
+
+What came is kept in `mlx-notifyd` for the control centre, which asks
+for it on MLXIPC as well: `org.mlx.Notifications` on the same object has
+`List()` (Do Not Disturb, how many are unread, the notifications newest
+first) and says `Changed()` whenever that changes; the bar calls
+`SetDoNotDisturb(b)`, `Dismiss(u)`, `ClearHistory()` and `MarkRead()`
+(the list was looked at).
+
+### Light and dark
+
+The desktop is dark or light as one: the top bar, its popups and the
+notification bubbles take their colours from
+[`desktop-shared/palette.mlx`](../shared/palette.mlx) and glide from one
+look to the other. The look is `color-scheme` of
+`org.freedesktop.appearance`, kept by the portal (`mlx-capture --portal`,
+[`appearance.mlx`](../capture/appearance.mlx)) on MLXIPC as
+`org.freedesktop.portal.Settings` (version 2: `ReadAll`, `ReadOne`,
+`Read`, `SettingChanged`), which GTK (libadwaita), Qt and Firefox follow
+as on any desktop. The control centre's tile changes it with
+`org.mlx.Appearance.SetColorScheme(u)` (0 no preference, 1 dark, 2
+light) on the same object; the portal keeps it in
+`~/.config/mlx/appearance.conf` (`color-scheme = dark`, `light` or
+`default`; dark without it) and tells everyone with `SettingChanged`.
 
 The bar finds these on the session bus (`DBUS_SESSION_BUS_ADDRESS`, as
 MLXIPC gives the session) without waiting on it: it is the
@@ -1252,9 +1304,10 @@ both, without xdg-desktop-portal and without a PipeWire daemon:
   (`PREFIX/share/mlx/dbus-1/services`, which MLXIPC searches before the
   system's) when an app first asks: `CreateSession`, `SelectSources`
   (the screen, windows), `Start` and `OpenPipeWireRemote`, each answered
-  with a request object's `Response` as xdg-desktop-portal does. Only
-  ScreenCast: the portal's other interfaces (Settings, FileChooser, ...)
-  are refused, and apps fall back (GTK reads its settings elsewhere).
+  with a request object's `Response` as xdg-desktop-portal does. Besides
+  ScreenCast it serves Settings, the desktop's light or dark look (see
+  Light and dark); the portal's other interfaces (FileChooser, ...) are
+  refused, and apps fall back.
 - `Start` shows a picker ([`picker.mlx`](../capture/picker.mlx),
   `mlx-capture --pick`, in the permission agent's style): the whole
   screen or one of the windows the compositor lists, Share or Cancel (a

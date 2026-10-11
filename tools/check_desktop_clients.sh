@@ -43,6 +43,10 @@
 #     left click Activate, the volume popup's slider, mute switch and the
 #     wheel change MLX Audio's volume, the battery popup tells the time
 #     left, and the calendar under the clock turns to the next month;
+#   - shows notifications (mlx-notifyd, mlx-notify) as bubbles and in the
+#     top bar's control centre: dismissing and clearing them, the volume,
+#     Do Not Disturb, night light, the light look (the portal) and a
+#     screenshot;
 #   - runs the file manager (mlx-files) on a home of its own: it shows the
 #     folders first, makes a folder (Ctrl+Shift+N) and names it, moves a
 #     picture into it by dragging, renames a file (F2), moves one to the
@@ -82,6 +86,9 @@ trap 'rm -rf -- "$work"' EXIT
 "$compiler" --quiet tools/session-lock-test/main.mlx -o "$work/session-lock-test"
 "$compiler" --quiet projects/desktop/ipc/main.mlx -o "$work/mlx-ipcd"
 "$compiler" --quiet projects/desktop/audio/main.mlx -o "$work/mlx-audiod"
+"$compiler" --quiet projects/desktop/notifications/main.mlx -o "$work/mlx-notifyd"
+"$compiler" --quiet projects/desktop/notifications/notify.mlx -o "$work/mlx-notify"
+"$compiler" --quiet projects/desktop/capture/main.mlx -o "$work/mlx-capture"
 "$compiler" --quiet tools/clock-probe/main.mlx -o "$work/clock-probe"
 "$compiler" --quiet projects/desktop/files/main.mlx -o "$work/mlx-files"
 xkbcli compile-keymap --layout us > "$work/us.xkb"
@@ -672,6 +679,21 @@ PY
     fi
 }
 
+# A made-up /sys/class/power_supply in $work/power: a battery at 84 %
+# (1 h left), mains, and a mouse's battery (not the computer's).
+fake_power() {
+    mkdir -p "$work/power/BAT0" "$work/power/AC" "$work/power/mouse"
+    printf 'Battery\n' > "$work/power/BAT0/type"
+    printf 'Discharging\n' > "$work/power/BAT0/status"
+    printf '42000000\n' > "$work/power/BAT0/energy_now"
+    printf '50000000\n' > "$work/power/BAT0/energy_full"
+    printf '10500000\n' > "$work/power/BAT0/power_now"
+    printf 'Mains\n' > "$work/power/AC/type"
+    printf 'Battery\n' > "$work/power/mouse/type"
+    printf 'Device\n' > "$work/power/mouse/scope"
+    printf '5\n' > "$work/power/mouse/capacity"
+}
+
 # The top bar on a session bus: see the header. The bar is laid out (its
 # verbose "widgets" line) as clock 891+125, battery 818+69, sound 786+28,
 # tray 756+26, media 595+149 at 1024 wide; the popups open centred under
@@ -679,17 +701,8 @@ PY
 topbar_bus() {
     local runtime
     runtime=$(mktemp -d)
-    mkdir -p "$work/power/BAT0" "$work/power/AC" "$work/power/mouse" "$work/bar-config/mlx" "$work/bar-home"
-    printf 'Battery\n' > "$work/power/BAT0/type"
-    printf 'Discharging\n' > "$work/power/BAT0/status"
-    printf '42000000\n' > "$work/power/BAT0/energy_now"
-    printf '50000000\n' > "$work/power/BAT0/energy_full"
-    printf '10500000\n' > "$work/power/BAT0/power_now"
-    printf 'Mains\n' > "$work/power/AC/type"
-    # A mouse's battery is not the computer's.
-    printf 'Battery\n' > "$work/power/mouse/type"
-    printf 'Device\n' > "$work/power/mouse/scope"
-    printf '5\n' > "$work/power/mouse/capacity"
+    mkdir -p "$work/bar-config/mlx" "$work/bar-home"
+    fake_power
     cat > "$work/topbar-bus.script" <<SCRIPT
 wait 5000
 shot $work/bus-bar.ppm
@@ -801,15 +814,16 @@ SCRIPT
     local audiod_pid=$!
     "${bus[@]}" "$work/topbar-test-services" "$work/services.log" > "$work/topbar-services.log" 2>&1 &
     local services_pid=$!
-    # Once the calendar was shown, the items are arranged anew (as
-    # mlx-settings' Top bar page writes them): the clock first, the sound
-    # hidden, the battery last.
-    rm -f "$work/bar-config/mlx/topbar.conf"
+    # The control centre is hidden here (control_centre has it). Once the
+    # calendar was shown, the items are arranged anew (as mlx-settings' Top
+    # bar page writes them): the clock first, the sound hidden, the battery
+    # last.
+    printf 'control = off\n' > "$work/bar-config/mlx/topbar.conf"
     # The session menu's lock runs the stand-in locker (Enter unlocks).
     printf 'lock-command = %s\n' "$work/session-lock-test" > "$work/bar-config/mlx/compositor.conf"
     (for _ in $(seq 1 400); do grep -q "^topbar: popup calendar$" "$work/topbar-bus.log" 2> /dev/null && break; sleep 0.1; done
         sleep 1
-        printf 'clock = on\nmedia = on\nsound = off\ntray = on\nbattery = on\n' > "$work/bar-config/mlx/topbar.conf") &
+        printf 'clock = on\nmedia = on\nsound = off\ntray = on\nbattery = on\ncontrol = off\n' > "$work/bar-config/mlx/topbar.conf") &
     local writer_pid=$!
     local status=0
     "${bus[@]}" WAYLAND_DISPLAY=host-topbar-bus XDG_DATA_HOME="$work/data" XDG_DATA_DIRS="$work/none" MLX_CANVAS=cpu \
@@ -888,9 +902,185 @@ PY
     echo "ok   the top bar on a session bus: what plays, a tray icon with its menu, the volume, the battery and the calendar; the items rearranged; the session menu locks and logs out"
 }
 
+# Notifications and the control centre: mlx-notifyd shows a notification
+# with a default action as a bubble (a click on it answers mlx-notify -w),
+# then five that go after 1.5 s; the bar's control centre (859+28, its
+# popup 656..1016 x 36..) gets the list from mlx-notifyd on the bus and
+# shows it newest first, with a dot on the widget until it is opened. In
+# it: one is dismissed by its close button (the ones under it glide up),
+# the volume is dragged, Do Not Disturb and night light are turned on
+# (mlx-notifyd and compositor.conf hear of it), all are cleared, dark mode
+# is turned off (the portal, mlx-capture --portal, keeps the look and
+# tells it: the bar and the bubbles turn light), and the screenshot tile
+# saves the screen into ~/Bilder and says so in a notification (Do Not
+# Disturb turned off again first). The
+# network tile shows a made-up Wi-Fi interface (MLX_TOPBAR_NET).
+control_centre() {
+    local runtime
+    runtime=$(mktemp -d)
+    mkdir -p "$work/net/wlan0/wireless" "$work/net/eth0" "$work/net/lo" "$work/cc-config/mlx" "$work/cc-home"
+    fake_power
+    printf 'up\n' > "$work/net/wlan0/operstate"
+    printf 'down\n' > "$work/net/eth0/operstate"
+    printf 'unknown\n' > "$work/net/lo/operstate"
+    cat > "$work/cc.sh" <<SCRIPT
+#!/bin/sh
+"$work/mlx-notifyd" --verbose > "$work/notifyd.log" 2>&1 &
+sleep 1
+"$work/mlx-notify" -a Frage -A default=Öffnen -t 0 -w "Eine Frage" "Ein Klick beantwortet sie." > "$work/notify-action.log" &
+sleep 3
+"$work/mlx-notify" -a Firefox -i firefox -t 1500 "Download abgeschlossen" "bericht.pdf ist im Ordner Downloads." &
+sleep 0.3
+"$work/mlx-notify" -a Kalender -t 1500 "Team-Meeting in 10 Minuten" "Raum 4.12" &
+sleep 0.3
+"$work/mlx-notify" -a Mail -t 1500 "3 neue Nachrichten" "Von: Anna Schmidt" &
+sleep 0.3
+"$work/mlx-notify" -a Terminal -t 1500 "Build fertig" "312 Tests bestanden" &
+sleep 0.3
+"$work/mlx-notify" -a Updates -t 1500 "Updates verfügbar" "5 Pakete" &
+exec "$work/mlx-terminal"
+SCRIPT
+    chmod +x "$work/cc.sh"
+    cat > "$work/cc.script" <<SCRIPT
+wait 3000
+shot $work/cc-bubble.ppm
+pointer 760 80
+press 272
+release 272
+wait 8000
+shot $work/cc-bar.ppm
+pointer 873 15
+press 272
+release 272
+wait 900
+shot $work/cc-open.ppm
+pointer 900 440
+wait 300
+pointer 989 449
+wait 300
+press 272
+release 272
+wait 800
+pointer 850 308
+press 272
+pointer 880 308
+pointer 920 308
+release 272
+pointer 906 119
+press 272
+release 272
+wait 300
+pointer 736 183
+press 272
+release 272
+wait 600
+shot $work/cc-toggled.ppm
+pointer 956 352
+press 272
+release 272
+wait 1200
+shot $work/cc-cleared.ppm
+pointer 906 183
+press 272
+release 272
+wait 900
+shot $work/cc-light.ppm
+pointer 873 15
+press 272
+release 272
+wait 800
+shot $work/cc-closed.ppm
+pointer 873 15
+press 272
+release 272
+wait 900
+pointer 906 119
+press 272
+release 272
+wait 300
+pointer 906 247
+press 272
+release 272
+wait 3000
+shot $work/cc-shot.ppm
+close
+SCRIPT
+    XDG_RUNTIME_DIR=$runtime "$work/test-host" host-cc "$work/us.xkb" "$work/cc.script" > "$work/cc-host.log" 2>&1 &
+    local host_pid=$!
+    for _ in $(seq 1 50); do [[ -S "$runtime/host-cc" ]] && break; sleep 0.1; done
+    local bus=(env -i PATH="$work:$PATH" HOME="$work/cc-home" XDG_RUNTIME_DIR="$runtime" XDG_CONFIG_HOME="$work/cc-config" DBUS_SESSION_BUS_ADDRESS="unix:path=$runtime/bus")
+    "${bus[@]}" "$work/mlx-ipcd" --address "$runtime/bus" > "$work/cc-ipcd.log" 2>&1 &
+    local ipcd_pid=$!
+    for _ in $(seq 1 50); do [[ -S "$runtime/bus" ]] && break; sleep 0.1; done
+    "${bus[@]}" "$work/mlx-audiod" --output null --input none --no-pulse > "$work/cc-audiod.log" 2>&1 &
+    local audiod_pid=$!
+    "${bus[@]}" "$work/mlx-capture" --portal --verbose > "$work/cc-portal.log" 2>&1 &
+    local portal_pid=$!
+    local status=0
+    "${bus[@]}" WAYLAND_DISPLAY=host-cc XDG_DATA_HOME="$work/data" XDG_DATA_DIRS="$work/none" MLX_CANVAS=cpu \
+        LANG=de_DE.UTF-8 TZ="CET-1CEST,M3.5.0,M10.5.0/3" MLX_TOPBAR_TIME=1727445900 MLX_TOPBAR_POWER="$work/power" MLX_TOPBAR_NET="$work/net" MLX_TOPBAR_VERBOSE=1 \
+        timeout 60 "$work/mlx-compositor" --verbose --no-fps --renderer cpu --socket nested-cc \
+        --terminal "$work/mlx-terminal" --launcher none --dock none --topbar "$work/mlx-topbar" --run "$work/cc.sh" > "$work/cc.log" 2>&1 || status=$?
+    wait "$host_pid" || fail "control centre: the test host failed" "$work/cc-host.log"
+    kill "$portal_pid" "$audiod_pid" "$ipcd_pid" 2> /dev/null || true
+    wait "$portal_pid" "$audiod_pid" "$ipcd_pid" 2> /dev/null || true
+    rm -rf -- "$runtime"
+    local log="$work/cc.log"
+    [[ $status -eq 0 ]] || fail "control centre: the compositor exited with status $status" "$log"
+    grep -q "^topbar: widgets clock 891+125 battery 786+69 sound 754+28 control 859+28$" "$log" || fail "control centre: the widgets are not where the test clicks" "$log"
+    local line
+    for line in "^topbar: notifications 6, unread 6$" "^topbar: popup control$" "^topbar: dismissed Build fertig$" "^topbar: volume [0-9]*%$" \
+        "^topbar: do not disturb on$" "^topbar: do not disturb off$" "^topbar: night light on$" "^topbar: cleared the notifications$" "^topbar: look light$" "^topbar: screenshot $work/cc-home/Bilder/Bildschirmfoto 2024-09-27 16.05.00.png$"; do
+        grep -q "$line" "$log" || fail "control centre: no \"$line\"" "$log"
+    done
+    for line in "^notifyd: serving org.freedesktop.Notifications$" "^notifyd: notification 6 \"Updates verfügbar\"$" "^notifyd: do not disturb on$" "^notifyd: cleared$" "^notifyd: notification 7 \"Bildschirmfoto gespeichert\"$"; do
+        grep -q "$line" "$work/notifyd.log" || fail "control centre: mlx-notifyd said no \"$line\"" "$work/notifyd.log"
+    done
+    grep -q "^portal: color-scheme light$" "$work/cc-portal.log" || fail "control centre: the portal did not take the light look" "$work/cc-portal.log"
+    grep -qx "color-scheme = light" "$work/cc-config/mlx/appearance.conf" || fail "control centre: the look is not kept in appearance.conf" "$work/cc-portal.log"
+    [[ -s "$work/cc-home/Bilder/Bildschirmfoto 2024-09-27 16.05.00.png" ]] || fail "control centre: the screenshot was not saved" "$log"
+    [[ "$(cat "$work/notify-action.log")" == "default" ]] || fail "control centre: the click on the bubble did not answer mlx-notify -w ($(cat "$work/notify-action.log"))" "$work/notifyd.log"
+    grep -qx "night-light = on" "$work/cc-config/mlx/compositor.conf" || fail "control centre: night light did not reach compositor.conf" "$log"
+    python3 - "$work" <<'PY' || fail "control centre: the bubble, the widget or the popup do not look right" "$log"
+import sys
+work = sys.argv[1]
+def load(name):
+    data = open(f"{work}/{name}.ppm", 'rb').read()
+    _, size, _, pixels = data.split(b'\n', 3)
+    width, height = map(int, size.split())
+    return lambda x, y: tuple(pixels[(y * width + x) * 3:(y * width + x) * 3 + 3])
+def near(pixel, want, slack=12): return all(abs(a - b) <= slack for a, b in zip(pixel, want))
+def count(at, x0, x1, y0, y1, want): return sum(1 for x in range(x0, x1) for y in range(y0, y1) if near(at(x, y), want))
+popup = (30, 33, 42)
+light = (246, 246, 249)
+accent = (90, 160, 255)
+# The bubble at the top right, under the bar (dark), and after the light
+# look came (the screenshot's).
+assert near(load("cc-bubble")(1000, 60), popup), load("cc-bubble")(1000, 60)
+assert near(load("cc-shot")(1000, 60), light), load("cc-shot")(1000, 60)
+# The dot on the widget while they are unread; gone once looked at.
+bar = load("cc-bar")
+assert count(bar, 876, 888, 2, 14, accent) > 10, count(bar, 876, 888, 2, 14, accent)
+assert count(load("cc-closed"), 876, 888, 2, 14, accent) == 0
+# The popup down to its fourth notification and the "more" line.
+opened = load("cc-open")
+assert near(opened(1012, 600), popup), opened(1012, 600)
+# Do Not Disturb and night light glow in the accent colour.
+toggled = load("cc-toggled")
+assert count(toggled, 851, 883, 103, 135, accent) > 300 and count(toggled, 682, 714, 167, 199, accent) > 300, (count(toggled, 851, 883, 103, 135, accent), count(toggled, 682, 714, 167, 199, accent))
+# Cleared: the popup shrank to "Keine Mitteilungen".
+cleared = load("cc-cleared")
+assert near(cleared(700, 400), popup) and not near(cleared(700, 520), popup), (cleared(700, 400), cleared(700, 520))
+# Light: the popup's background.
+assert near(load("cc-light")(1005, 300), light), load("cc-light")(1005, 300)
+PY
+    echo "ok   notifications and the control centre: a bubble's click answers, the list on the bus, dismissing, the volume, Do Not Disturb, night light, clearing, the light look, a screenshot"
+}
+
 drops
 topbar
 topbar_bus
+control_centre
 files cpu
 files gpu
 zoom cpu

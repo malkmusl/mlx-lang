@@ -18,14 +18,18 @@
 #                                     the session bus), PREFIX/bin/mlx-audiod,
 #                                     PREFIX/bin/mlx-audio (MLX Audio),
 #                                     PREFIX/bin/mlx-permissions (the
-#                                     permission agent and its dialog)
+#                                     permission agent and its dialog),
+#                                     PREFIX/bin/mlx-notifyd, PREFIX/bin/mlx-notify
+#                                     (the notifications, notify-send's
+#                                     like)
 #   PREFIX/share/mlx/dbus-1/services/org.mlx.Audio.service,
 #                                     org.mlx.PermissionAgent.service,
-#                                     org.freedesktop.portal.Desktop.service
-#                                     (MLX Audio, the agent and the
+#                                     org.freedesktop.portal.Desktop.service,
+#                                     org.freedesktop.Notifications.service
+#                                     (MLX Audio, the agent, the
 #                                     screen-sharing portal, mlx-capture
-#                                     --portal, start on the first use, on
-#                                     MLXIPC only)
+#                                     --portal, and the notifications start
+#                                     on the first use, on MLXIPC only)
 #   PREFIX/share/applications/mlx-settings.desktop, org.mlx.files.desktop,
 #                                     org.mlx.observatory.desktop (the launcher
 #                                     lists them; MLX Observatory shows this
@@ -140,7 +144,7 @@ if [[ $replace_libpipewire -eq 1 && -n "$destdir" ]]; then
 fi
 
 bindir="$prefix/bin"
-programs=(mlx-compositor mlx-terminal mlx-sh mlx-console mlx-session mlx-dock mlx-topbar mlx-launcher mlx-settings mlx-files mlx-observatory mlx-codemap mlx-profile mlx-capture mlx-ipcd mlx-ipc mlx-audiod mlx-audio mlx-permissions)
+programs=(mlx-compositor mlx-terminal mlx-sh mlx-console mlx-session mlx-dock mlx-topbar mlx-launcher mlx-settings mlx-files mlx-observatory mlx-codemap mlx-profile mlx-capture mlx-ipcd mlx-ipc mlx-audiod mlx-audio mlx-permissions mlx-notifyd mlx-notify)
 applications="$prefix/share/applications"
 icons="$prefix/share/icons/hicolor/128x128/apps"
 services="$prefix/share/mlx/dbus-1/services"
@@ -282,7 +286,7 @@ if [[ $uninstall -eq 1 ]]; then
     path="$destdir$capture_libs/libpipewire-0.3.so.0"
     [[ -e "$path" ]] && as_owner "$path" rm -f -- "$path" && echo "removed $path"
     [[ -d "$destdir$capture_libs" ]] && as_owner "$destdir$capture_libs" rmdir --ignore-fail-on-non-empty -- "$destdir$capture_libs"
-    for path in "$destdir$applications/mlx-settings.desktop" "$destdir$applications/org.mlx.files.desktop" "$destdir$applications/org.mlx.observatory.desktop" "$destdir$icons/org.mlx.files.png" "$destdir$icons/org.mlx.observatory.png" "$destdir$services/org.mlx.Audio.service" "$destdir$services/org.mlx.PermissionAgent.service" "$destdir$services/org.freedesktop.portal.Desktop.service"; do
+    for path in "$destdir$applications/mlx-settings.desktop" "$destdir$applications/org.mlx.files.desktop" "$destdir$applications/org.mlx.observatory.desktop" "$destdir$icons/org.mlx.files.png" "$destdir$icons/org.mlx.observatory.png" "$destdir$services/org.mlx.Audio.service" "$destdir$services/org.mlx.PermissionAgent.service" "$destdir$services/org.freedesktop.portal.Desktop.service" "$destdir$services/org.freedesktop.Notifications.service"; do
         [[ -e "$path" ]] && as_owner "$path" rm -f -- "$path" && echo "removed $path"
     done
     exit 0
@@ -312,6 +316,8 @@ echo "building with $compiler"
 "$compiler" --quiet projects/desktop/audio/main.mlx -o "$build/mlx-audiod"
 "$compiler" --quiet projects/desktop/audio/tool.mlx -o "$build/mlx-audio"
 "$compiler" --quiet projects/desktop/permissions/main.mlx -o "$build/mlx-permissions"
+"$compiler" --quiet projects/desktop/notifications/main.mlx -o "$build/mlx-notifyd"
+"$compiler" --quiet projects/desktop/notifications/notify.mlx -o "$build/mlx-notify"
 deb=()
 command -v dpkg-deb > /dev/null && deb=(--deb)
 tools/build_libpulse.sh --compiler "$compiler" --out "$build/libpulse" "${deb[@]}" > /dev/null
@@ -319,18 +325,19 @@ tools/build_libpipewire.sh --compiler "$compiler" --out "$build/libpipewire" "${
 sed "s|@BINDIR@|$bindir|g" projects/desktop/audio/org.mlx.Audio.service.in > "$build/org.mlx.Audio.service"
 sed "s|@BINDIR@|$bindir|g" projects/desktop/permissions/org.mlx.PermissionAgent.service.in > "$build/org.mlx.PermissionAgent.service"
 sed "s|@BINDIR@|$bindir|g" projects/desktop/capture/org.freedesktop.portal.Desktop.service.in > "$build/org.freedesktop.portal.Desktop.service"
+sed "s|@BINDIR@|$bindir|g" projects/desktop/notifications/org.freedesktop.Notifications.service.in > "$build/org.freedesktop.Notifications.service"
 sed "s|@BINDIR@|$bindir|g" projects/desktop/settings/mlx-settings.desktop.in > "$build/mlx-settings.desktop"
 sed "s|@BINDIR@|$bindir|g" projects/desktop/files/org.mlx.files.desktop.in > "$build/org.mlx.files.desktop"
 sed "s|@BINDIR@|$bindir|g; s|@ROOT@|$repo_root|g" projects/observatory/org.mlx.observatory.desktop.in > "$build/org.mlx.observatory.desktop"
 sed "s|@BINDIR@|$bindir|g" projects/desktop/compositor/session/mlx-compositor.desktop.in > "$build/mlx-compositor.desktop"
-echo "built $build/mlx-compositor, mlx-terminal, mlx-sh, mlx-console, mlx-dock, mlx-topbar, mlx-launcher, mlx-settings, mlx-files, mlx-observatory, mlx-profile, mlx-capture and its OBS plugin, mlx-ipcd and mlx-ipc, mlx-audiod and mlx-audio, mlx-permissions"
+echo "built $build/mlx-compositor, mlx-terminal, mlx-sh, mlx-console, mlx-dock, mlx-topbar, mlx-launcher, mlx-settings, mlx-files, mlx-observatory, mlx-profile, mlx-capture and its OBS plugin, mlx-ipcd and mlx-ipc, mlx-audiod and mlx-audio, mlx-permissions, mlx-notifyd and mlx-notify"
 echo "built $build/libpulse: MLX Audio's libpulse, libpulse-simple, libpulse-mainloop-glib and ALSA plugin${deb:+, the package mlx-audio-libs}"
 echo "built $build/libpipewire: MLX Capture's libpipewire${deb:+, the package mlx-capture-libs}"
 [[ $build_only -eq 1 ]] && exit 0
 
 # Install.
 as_owner "$destdir$bindir" install -d "$destdir$bindir"
-as_owner "$destdir$bindir" install -m 755 "$build/mlx-compositor" "$build/mlx-terminal" "$build/mlx-sh" "$build/mlx-console" "$build/mlx-dock" "$build/mlx-topbar" "$build/mlx-launcher" "$build/mlx-settings" "$build/mlx-files" "$build/mlx-observatory" "$build/mlx-profile" "$build/mlx-capture" "$build/mlx-ipcd" "$build/mlx-ipc" "$build/mlx-audiod" "$build/mlx-audio" "$build/mlx-permissions" projects/desktop/compositor/session/mlx-session "$destdir$bindir/"
+as_owner "$destdir$bindir" install -m 755 "$build/mlx-compositor" "$build/mlx-terminal" "$build/mlx-sh" "$build/mlx-console" "$build/mlx-dock" "$build/mlx-topbar" "$build/mlx-launcher" "$build/mlx-settings" "$build/mlx-files" "$build/mlx-observatory" "$build/mlx-profile" "$build/mlx-capture" "$build/mlx-ipcd" "$build/mlx-ipc" "$build/mlx-audiod" "$build/mlx-audio" "$build/mlx-permissions" "$build/mlx-notifyd" "$build/mlx-notify" projects/desktop/compositor/session/mlx-session "$destdir$bindir/"
 # The command line of the code map under its own name (the same program).
 as_owner "$destdir$bindir" ln -sf mlx-observatory "$destdir$bindir/mlx-codemap"
 as_owner "$destdir$sessions" install -d "$destdir$sessions"
@@ -340,7 +347,7 @@ as_owner "$destdir$applications" install -m 644 "$build/mlx-settings.desktop" "$
 as_owner "$destdir$icons" install -d "$destdir$icons"
 as_owner "$destdir$icons" install -m 644 projects/desktop/files/org.mlx.files.png projects/observatory/org.mlx.observatory.png "$destdir$icons/"
 as_owner "$destdir$services" install -d "$destdir$services"
-as_owner "$destdir$services" install -m 644 "$build/org.mlx.Audio.service" "$build/org.mlx.PermissionAgent.service" "$build/org.freedesktop.portal.Desktop.service" "$destdir$services/"
+as_owner "$destdir$services" install -m 644 "$build/org.mlx.Audio.service" "$build/org.mlx.PermissionAgent.service" "$build/org.freedesktop.portal.Desktop.service" "$build/org.freedesktop.Notifications.service" "$destdir$services/"
 as_owner "$destdir$audio_libs" install -d "$destdir$audio_libs"
 as_owner "$destdir$audio_libs" install -m 644 "${audio_lib_files[@]/#/$build/libpulse/}" "$destdir$audio_libs/"
 as_owner "$destdir$capture_libs" install -d "$destdir$capture_libs"

@@ -889,8 +889,8 @@ echo "ok   mlx-settings records hotkeys (the compositor's too) and the composito
 
 # Scenario 11b: mlx-settings' Top bar page, opened by its argument (the
 # rows' middles 50 pixels apart from y 229: what plays, the tray, the sound,
-# the battery, the clock; a row's up arrow at x 670). The sound moves up a
-# place, a click on the battery's row hides it.
+# the battery, the control centre, the clock; a row's up arrow at x 670).
+# The sound moves up a place, a click on the battery's row hides it.
 cat > "$work/topbar-page.sh" <<SCRIPT
 #!/bin/sh
 exec "$work/mlx-settings" topbar
@@ -910,7 +910,7 @@ wait 800
 close
 SCRIPT
 run_scenario topbar-page "$work/topbar-page.script" --no-fps --run "$work/topbar-page.sh"
-[[ "$(grep -v '^#' "$XDG_CONFIG_HOME/mlx/topbar.conf" 2> /dev/null | tr '\n' ' ')" == "media = on sound = on tray = on battery = off clock = on " ]] || { echo "mlx-settings' Top bar page did not write the items as clicked" >&2; cat "$XDG_CONFIG_HOME/mlx/topbar.conf" "$work/topbar-page-compositor.log" >&2; exit 1; }
+[[ "$(grep -v '^#' "$XDG_CONFIG_HOME/mlx/topbar.conf" 2> /dev/null | tr '\n' ' ')" == "media = on sound = on tray = on battery = off control = on clock = on " ]] || { echo "mlx-settings' Top bar page did not write the items as clicked" >&2; cat "$XDG_CONFIG_HOME/mlx/topbar.conf" "$work/topbar-page-compositor.log" >&2; exit 1; }
 rm -f "$XDG_CONFIG_HOME/mlx/topbar.conf"
 echo "ok   mlx-settings' Top bar page moves an item up and hides another (topbar.conf)"
 

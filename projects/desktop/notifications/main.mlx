@@ -1,0 +1,1074 @@
+// mlx-notifyd: the desktop's notifications (org.freedesktop.Notifications,
+// the Desktop Notifications Specification 1.2, on the session bus) shown
+// as bubbles at the top right, under the top bar: the app's icon (the
+// app_icon path or name, the image-data hint, else the desktop entry's),
+// its name, the summary and up to three lines of the body, the actions as
+// buttons. A bubble slides in from the right, the others glide down to
+// make room; it goes after its timeout (five seconds by default, never
+// for critical ones or a timeout of 0, not while the pointer is on it),
+// on a click (the "default" action, if there is one) or its close button,
+// fading out. Do Not Disturb keeps all but critical ones from showing.
+// The bubbles are dark or light as the desktop's look (the portal's
+// color-scheme on MLXIPC: shared/palette.mlx), gliding when it changes.
+//
+// What came is kept for the top bar's control centre, on MLXIPC too:
+// org.mlx.Notifications on the same object has List() (shared/notices.mlx's
+// SIGNATURE) and says Changed() whenever the list or Do Not Disturb
+// changes; the bar calls SetDoNotDisturb(b), Dismiss(u) (from the list),
+// ClearHistory(), and MarkRead() when it is looked at.
+//
+//   mlx-notifyd [--verbose]
+//
+// MLXIPC starts it on the first call to org.freedesktop.Notifications
+// (a service file, as the session installer writes); it ends with the
+// bus, or when another server owns the name.
+const std = @import("std")
+const dbus = @import("std.dbus")
+const png = @import("std.png")
+const canvas_module = @import("std.ui.canvas")
+const text_module = @import("std.ui.text")
+const panel_module = @import("std.ui.wayland.panel")
+const apps_module = @import("../shared/apps.mlx")
+const notices_module = @import("../shared/notices.mlx")
+const symbols = @import("../shared/symbols.mlx")
+const anim = @import("../shared/anim.mlx")
+const palette = @import("../shared/palette.mlx")
+const clock = @import("../shared/clock.mlx")
+const timezone = @import("std.timezone")
+const crash = @import("std.crash")
+
+const Canvas = canvas_module.Canvas
+const Panel = panel_module.Panel
+const Text = text_module.Text
+const Notices = notices_module.Notices
+
+const NAME: []const u8 = "org.freedesktop.Notifications"
+const PATH: []const u8 = "/org/freedesktop/Notifications"
+const INTERFACE: []const u8 = "org.freedesktop.Notifications"
+const OWN: []const u8 = "org.mlx.Notifications"
+const BUS: []const u8 = "org.freedesktop.DBus"
+const BUS_PATH: []const u8 = "/org/freedesktop/DBus"
+const SIZE: usize = 65536
+
+// The bubbles: at most MAX at once (the oldest goes for a new one), WIDTH
+// wide, GAP apart, MARGIN from the right edge, TOP under the top bar.
+const MAX: usize = 5
+const WIDTH: i32 = 360
+const GAP: i32 = 10
+const MARGIN: i32 = 10
+const TOP: i32 = 40
+const PADDING: i32 = 14
+const ICON: i32 = 40
+const LINE: i32 = 18
+const LINES: usize = 3
+const ACTION_HEIGHT: i32 = 30
+const MAX_ACTIONS: usize = 3
+const CLOSE: i32 = 22
+// How long a bubble stays by default, comes and goes (milliseconds).
+const TIMEOUT: usize = 5000
+const COME: usize = 260
+const GO: usize = 200
+const MOVE: usize = 240
+
+// Why a notification closed (NotificationClosed's reason).
+const CLOSED_EXPIRED: u32 = 1
+const CLOSED_DISMISSED: u32 = 2
+const CLOSED_CALLED: u32 = 3
+
+const URGENCY_CRITICAL: u8 = 2
+
+const ACCENT: u32 = palette.ACCENT
+// The portal (mlx-capture --portal) and its look.
+const PORTAL: []const u8 = "org.freedesktop.portal.Desktop"
+const PORTAL_PATH: []const u8 = "/org/freedesktop/portal/desktop"
+const SETTINGS: []const u8 = "org.freedesktop.portal.Settings"
+const LOOK_CHANGE: usize = 450
+
+const Bubble = struct {
+    used: bool
+    id: u32
+    app: [48]u8
+    appLength: usize
+    summary: [96]u8
+    summaryLength: usize
+    body: [480]u8
+    bodyLength: usize
+    // The actions: keys and labels (the "default" one has no button).
+    actionKeys: [3][32]u8
+    actionKeyLengths: [3]usize
+    actionLabels: [3][40]u8
+    actionLabelLengths: [3]usize
+    actionCount: usize
+    hasDefault: bool
+    urgency: u8
+    // When it goes by itself (milliseconds; 0: it stays), and whether it
+    // is going (since goneAt).
+    expireAt: usize
+    going: bool
+    goneAt: usize
+    image: png.Image
+    hasImage: bool
+    // Its top (glides when others come or go), how much of it shows.
+    top: anim.Glide
+    shown: anim.Glide
+    height: i32
+}
+
+const Daemon = struct {
+    panel: Panel
+    client: dbus.Client
+    environment: [*][*]const u8
+    allocator: std.allocator.Allocator
+    verbose: bool
+    out: [*]u8
+    nextId: u32
+    bubbles: [5]Bubble
+    notices: Notices
+    apps: apps_module.Apps
+    symbols: symbols.Cache
+    text: Text
+    bold: Text
+    small: Text
+    german: bool
+    // Shown: the layer surface is up.
+    showing: bool
+    // The pointer: where, over which bubble (MAX: none), on what of it.
+    pointerX: i32
+    pointerY: i32
+    hover: usize
+    hoverPart: usize
+    // Asked for the name (the serial of RequestName), and got it.
+    nameSerial: u32
+    owner: bool
+    // The look: asked the portal (the serial of ReadOne), how light it is
+    // drawn (0 to palette.LIGHT, gliding), the colours of the drawing.
+    lookSerial: u32
+    theme: anim.Glide
+    colors: palette.Palette
+}
+
+const PART_BODY: usize = 0
+const PART_CLOSE: usize = 1
+const PART_ACTION: usize = 2
+
+fn daemonOf(context: *anyopaque) -> *Daemon {
+    unsafe { return @ptrCast(*Daemon, context) }
+}
+
+fn panelOf(daemon: *Daemon) -> *Panel {
+    unsafe { return @ptrCast(*Panel, &daemon.*.panel) }
+}
+
+fn clientOf(daemon: *Daemon) -> *dbus.Client {
+    unsafe { return @ptrCast(*dbus.Client, &daemon.*.client) }
+}
+
+fn noticesOf(daemon: *Daemon) -> *Notices {
+    unsafe { return @ptrCast(*Notices, &daemon.*.notices) }
+}
+
+fn appsOf(daemon: *Daemon) -> *apps_module.Apps {
+    unsafe { return @ptrCast(*apps_module.Apps, &daemon.*.apps) }
+}
+
+fn symbolsOf(daemon: *Daemon) -> *symbols.Cache {
+    unsafe { return @ptrCast(*symbols.Cache, &daemon.*.symbols) }
+}
+
+fn textOf(daemon: *Daemon) -> *Text {
+    unsafe { return @ptrCast(*Text, &daemon.*.text) }
+}
+
+fn boldOf(daemon: *Daemon) -> *Text {
+    unsafe { return @ptrCast(*Text, &daemon.*.bold) }
+}
+
+fn smallOf(daemon: *Daemon) -> *Text {
+    unsafe { return @ptrCast(*Text, &daemon.*.small) }
+}
+
+fn bubbleAt(daemon: *Daemon, index: usize) -> *Bubble {
+    unsafe { return @ptrFromInt(*Bubble, @intFromPtr(daemon) + @offsetOf(Daemon, "bubbles") + index * @sizeOf(Bubble)) }
+}
+
+fn bytesAt(bubble: *Bubble, offset: usize) -> [*]u8 {
+    unsafe { return @ptrFromInt([*]u8, @intFromPtr(bubble) + offset) }
+}
+
+fn appOf(bubble: *Bubble) -> []const u8 { return bytesAt(bubble, @offsetOf(Bubble, "app"))[0..bubble.*.appLength] }
+fn summaryOf(bubble: *Bubble) -> []const u8 { return bytesAt(bubble, @offsetOf(Bubble, "summary"))[0..bubble.*.summaryLength] }
+fn bodyOf(bubble: *Bubble) -> []const u8 { return bytesAt(bubble, @offsetOf(Bubble, "body"))[0..bubble.*.bodyLength] }
+fn actionKeyOf(bubble: *Bubble, index: usize) -> []const u8 { return bytesAt(bubble, @offsetOf(Bubble, "actionKeys") + index * 32)[0..bubble.*.actionKeyLengths[index]] }
+fn actionLabelOf(bubble: *Bubble, index: usize) -> []const u8 { return bytesAt(bubble, @offsetOf(Bubble, "actionLabels") + index * 40)[0..bubble.*.actionLabelLengths[index]] }
+
+fn topOf(bubble: *Bubble) -> *anim.Glide {
+    unsafe { return @ptrFromInt(*anim.Glide, @intFromPtr(bubble) + @offsetOf(Bubble, "top")) }
+}
+
+fn shownOf(bubble: *Bubble) -> *anim.Glide {
+    unsafe { return @ptrFromInt(*anim.Glide, @intFromPtr(bubble) + @offsetOf(Bubble, "shown")) }
+}
+
+fn imageOf(bubble: *Bubble) -> *png.Image {
+    unsafe { return @ptrFromInt(*png.Image, @intFromPtr(bubble) + @offsetOf(Bubble, "image")) }
+}
+
+// Copies `text` (cut at a character's start) into `capacity` bytes at
+// `into`; its length.
+fn copy(into: [*]u8, capacity: usize, text: []const u8) -> usize {
+    var length = if text.length < capacity { text.length } else { capacity }
+    while length > 0 && length < text.length && (text[length] & 192) == 128 { length -= 1 }
+    var index: usize = 0
+    while index < length {
+        into[index] = text[index]
+        index += 1
+    }
+    return length
+}
+
+fn say(daemon: *Daemon, text: []const u8) -> void {
+    if !daemon.*.verbose { return }
+    const written = std.io.writeAll(std.io.stderr(), text)
+}
+
+fn sayNumber(daemon: *Daemon, value: u32) -> void {
+    var digits: [12]u8 = undefined
+    var count: usize = 0
+    var rest = value
+    while rest > 0 || count == 0 {
+        digits[11 - count] = @intCast(u8, 48 + rest % 10)
+        rest = rest / 10
+        count += 1
+    }
+    var bytes: [*]const u8 = undefined
+    unsafe { bytes = @ptrCast([*]const u8, &digits) }
+    say(daemon, bytes[12 - count..12])
+}
+
+fn noDescriptors() -> [*]const isize {
+    var none: [*]const isize = undefined
+    unsafe { none = @ptrFromInt([*]const isize, 8) }
+    return none
+}
+
+// ---------------------------------------------------------------------------
+// The kept notifications
+
+// The list changed: org.mlx.Notifications.Changed() to whoever listens.
+fn listChanged(daemon: *Daemon) -> void {
+    var header = dbus.newHeader(dbus.SIGNAL, 0)
+    header.path = PATH
+    header.interface = OWN
+    header.member = "Changed"
+    const serial = dbus.send(clientOf(daemon), &header, daemon.*.out, 0, noDescriptors(), 0)
+}
+
+// ---------------------------------------------------------------------------
+// Signals
+
+fn signalClosed(daemon: *Daemon, id: u32, reason: u32) -> void {
+    var writing: dbus.Writer = undefined
+    dbus.begin(&writing, daemon.*.out, SIZE, false)
+    dbus.putU32(&writing, id)
+    dbus.putU32(&writing, reason)
+    var header = dbus.newHeader(dbus.SIGNAL, 0)
+    header.path = PATH
+    header.interface = INTERFACE
+    header.member = "NotificationClosed"
+    header.signature = "uu"
+    const serial = dbus.send(clientOf(daemon), &header, daemon.*.out, writing.length, noDescriptors(), 0)
+}
+
+fn signalAction(daemon: *Daemon, id: u32, key: []const u8) -> void {
+    var writing: dbus.Writer = undefined
+    dbus.begin(&writing, daemon.*.out, SIZE, false)
+    dbus.putU32(&writing, id)
+    dbus.putString(&writing, key)
+    var header = dbus.newHeader(dbus.SIGNAL, 0)
+    header.path = PATH
+    header.interface = INTERFACE
+    header.member = "ActionInvoked"
+    header.signature = "us"
+    const serial = dbus.send(clientOf(daemon), &header, daemon.*.out, writing.length, noDescriptors(), 0)
+}
+
+// ---------------------------------------------------------------------------
+// The bubbles
+
+fn bubbleHeight(daemon: *Daemon, bubble: *Bubble) -> i32 {
+    const lines = @intCast(i32, wrap(daemon, bodyOf(bubble), WIDTH - PADDING * 2 - ICON - 12))
+    var text_height = 20 + 20 + lines * LINE
+    if text_height < ICON { text_height = ICON }
+    var height = PADDING + text_height + PADDING
+    if bubble.*.actionCount > 0 { height += ACTION_HEIGHT + 8 }
+    return height
+}
+
+// Where each bubble goes: from the top, newest first; the layer surface
+// as tall as they need.
+fn arrange(daemon: *Daemon) -> void {
+    var y = TOP
+    var count: usize = 0
+    // Newest (the highest id) first.
+    var below: u32 = 4294967295
+    while true {
+        var next = MAX
+        var index: usize = 0
+        while index < MAX {
+            const bubble = bubbleAt(daemon, index)
+            if bubble.*.used && !bubble.*.going && bubble.*.id < below && (next == MAX || bubble.*.id > bubbleAt(daemon, next).*.id) { next = index }
+            index += 1
+        }
+        if next == MAX { break }
+        const bubble = bubbleAt(daemon, next)
+        anim.set(topOf(bubble), y, MOVE)
+        y += bubble.*.height + GAP
+        count += 1
+        below = bubble.*.id
+    }
+    var index: usize = 0
+    const panel = panelOf(daemon)
+    if count > 0 && !daemon.*.showing {
+        const shown = panel_module.showLayer(panel, "mlx-notifications", panel_module.LAYER_OVERLAY, panel_module.ANCHOR_TOP | panel_module.ANCHOR_RIGHT, @intCast(u32, WIDTH + MARGIN * 2), @intCast(u32, y + 40), 0, 0, panel_module.KEYBOARD_NONE)
+        daemon.*.showing = shown
+    } else if daemon.*.showing {
+        // Tall enough for the ones going too (they fade where they were).
+        var bottom = y + 40
+        while index < MAX {
+            const bubble = bubbleAt(daemon, index)
+            if bubble.*.used && bubble.*.going {
+                const end = anim.value(topOf(bubble)) + bubble.*.height + 8
+                if end > bottom { bottom = end }
+            }
+            index += 1
+        }
+        if @intCast(usize, bottom) > panel.*.height { panel_module.resize(panel, @intCast(u32, WIDTH + MARGIN * 2), @intCast(u32, bottom)) }
+    }
+    updateInput(daemon)
+    panel.*.dirty = true
+    fast(daemon)
+}
+
+// Only the bubbles take the pointer (the room around them lets it through).
+fn updateInput(daemon: *Daemon) -> void {
+    if !daemon.*.showing { return }
+    var rects: [20]i32 = undefined
+    var count: usize = 0
+    var index: usize = 0
+    while index < MAX {
+        const bubble = bubbleAt(daemon, index)
+        if bubble.*.used && !bubble.*.going {
+            rects[count * 4] = MARGIN
+            rects[count * 4 + 1] = topOf(bubble).*.to
+            rects[count * 4 + 2] = WIDTH
+            rects[count * 4 + 3] = bubble.*.height
+            count += 1
+        }
+        index += 1
+    }
+    unsafe { panel_module.setInput(panelOf(daemon), @ptrCast([*]const i32, &rects), count) }
+}
+
+fn fast(daemon: *Daemon) -> void {
+    const panel = panelOf(daemon)
+    panel.*.tickInterval = 16
+    panel.*.nextTick = 0
+}
+
+// A free slot (the oldest one shown goes for it when all are used).
+fn freeSlot(daemon: *Daemon) -> usize {
+    var index: usize = 0
+    while index < MAX {
+        if !bubbleAt(daemon, index).*.used { return index }
+        index += 1
+    }
+    var oldest: usize = 0
+    index = 1
+    while index < MAX {
+        if bubbleAt(daemon, index).*.id < bubbleAt(daemon, oldest).*.id { oldest = index }
+        index += 1
+    }
+    drop(daemon, oldest)
+    return oldest
+}
+
+fn drop(daemon: *Daemon, index: usize) -> void {
+    const bubble = bubbleAt(daemon, index)
+    if !bubble.*.used { return }
+    if bubble.*.hasImage { png.deinit(imageOf(bubble)) }
+    bubble.*.hasImage = false
+    bubble.*.used = false
+    if daemon.*.hover == index { daemon.*.hover = MAX }
+}
+
+fn bubbleOf(daemon: *Daemon, id: u32) -> usize {
+    var index: usize = 0
+    while index < MAX {
+        const bubble = bubbleAt(daemon, index)
+        if bubble.*.used && bubble.*.id == id { return index }
+        index += 1
+    }
+    return MAX
+}
+
+// The bubble goes (fading out where it is); the others close up.
+fn dismiss(daemon: *Daemon, index: usize, reason: u32) -> void {
+    const bubble = bubbleAt(daemon, index)
+    if !bubble.*.used || bubble.*.going { return }
+    bubble.*.going = true
+    bubble.*.goneAt = anim.now()
+    anim.set(shownOf(bubble), 0, GO)
+    signalClosed(daemon, bubble.*.id, reason)
+    say(daemon, "notifyd: closed ")
+    sayNumber(daemon, bubble.*.id)
+    say(daemon, "\n")
+    arrange(daemon)
+}
+
+// The icon: a PNG at `icon` (a path), else the app's (by desktop entry or
+// name), else none (the bell is drawn).
+fn loadIcon(daemon: *Daemon, bubble: *Bubble, icon: []const u8, entry: []const u8) -> void {
+    if bubble.*.hasImage { return }
+    if icon.length > 1 && icon[0] == 47 {
+        var path: apps_module.Path = undefined
+        apps_module.pathClear(&path)
+        apps_module.pathAdd(&path, icon)
+        var loaded: png.Image = undefined
+        if png.loadFile(&loaded, apps_module.pathEnd(&path), daemon.*.allocator) == png.Status.ok {
+            var scaled: png.Image = undefined
+            const status = png.scale(&scaled, &loaded, @intCast(usize, ICON), @intCast(usize, ICON), daemon.*.allocator)
+            png.deinit(&loaded)
+            if status == png.Status.ok {
+                imageOf(bubble).* = scaled
+                bubble.*.hasImage = true
+                return
+            }
+        }
+    }
+    const apps = appsOf(daemon)
+    var found = apps.*.count
+    if entry.length > 0 { found = apps_module.find(apps, entry) }
+    if found == apps.*.count && icon.length > 0 { found = apps_module.find(apps, icon) }
+    if found == apps.*.count && bubble.*.appLength > 0 { found = apps_module.find(apps, appOf(bubble)) }
+    if found == apps.*.count { return }
+    const app = apps_module.appAt(apps, found)
+    if !apps_module.loadIcon(apps, app, @intCast(usize, ICON)) { return }
+    const source = apps_module.imageOf(app)
+    var scaled: png.Image = undefined
+    if png.scale(&scaled, source, @intCast(usize, ICON), @intCast(usize, ICON), daemon.*.allocator) == png.Status.ok {
+        imageOf(bubble).* = scaled
+        bubble.*.hasImage = true
+    }
+}
+
+// The image-data hint ((iiibiiay): width, height, row stride, alpha,
+// bits per sample, channels, the pixels) as the bubble's icon.
+fn loadImageData(daemon: *Daemon, bubble: *Bubble, reading: *dbus.Reader) -> void {
+    dbus.alignTo(reading, 8)
+    const width = @intCast(usize, dbus.readU32(reading))
+    const height = @intCast(usize, dbus.readU32(reading))
+    const stride = @intCast(usize, dbus.readU32(reading))
+    const alpha = dbus.readBool(reading)
+    const bits = dbus.readU32(reading)
+    const channels = @intCast(usize, dbus.readU32(reading))
+    const length = @intCast(usize, dbus.readU32(reading))
+    const start = reading.*.position
+    if reading.*.failed || start + length > reading.*.length { return }
+    reading.*.position = start + length
+    if bubble.*.hasImage || bits != 8 || (channels != 3 && channels != 4) || width == 0 || height == 0 || width > 1024 || height > 1024 || stride * (height - 1) + width * channels > length { return }
+    const memory = daemon.*.allocator.alloc(width * height * 4, 16)
+    if memory == null { return }
+    var pixels: [*]u32 = undefined
+    unsafe { pixels = @ptrCast([*]u32, memory.?) }
+    var image = png.Image.{ .pixels = pixels, .width = width, .height = height, .allocator = daemon.*.allocator }
+    var y: usize = 0
+    while y < height {
+        var x: usize = 0
+        while x < width {
+            const at = start + y * stride + x * channels
+            const red = @intCast(u32, reading.*.bytes[at])
+            const green = @intCast(u32, reading.*.bytes[at + 1])
+            const blue = @intCast(u32, reading.*.bytes[at + 2])
+            const a = if alpha && channels == 4 { @intCast(u32, reading.*.bytes[at + 3]) } else { 255 }
+            // Premultiplied ARGB.
+            pixels[y * width + x] = (a << 24) | ((red * a / 255) << 16) | ((green * a / 255) << 8) | (blue * a / 255)
+            x += 1
+        }
+        y += 1
+    }
+    var scaled: png.Image = undefined
+    const status = png.scale(&scaled, &image, @intCast(usize, ICON), @intCast(usize, ICON), daemon.*.allocator)
+    png.deinit(&image)
+    if status == png.Status.ok {
+        imageOf(bubble).* = scaled
+        bubble.*.hasImage = true
+    }
+}
+
+// Notify(app_name, replaces_id, app_icon, summary, body, actions, hints,
+// expire_timeout) -> id.
+fn notify(daemon: *Daemon, request: *const dbus.Header) -> void {
+    const client = clientOf(daemon)
+    var reading = dbus.reader(dbus.bodyOf(client, request), request.*.bodyLength, request.*.big)
+    const app = dbus.readString(&reading)
+    const replaces = dbus.readU32(&reading)
+    const icon = dbus.readString(&reading)
+    const summary = dbus.readString(&reading)
+    const body = dbus.readString(&reading)
+    // A replaced one keeps its id and its place.
+    var id = replaces
+    var slot = if replaces != 0 { bubbleOf(daemon, replaces) } else { MAX }
+    if replaces == 0 || (slot == MAX && notices_module.find(noticesOf(daemon), replaces) == noticesOf(daemon).*.count) {
+        id = daemon.*.nextId
+        daemon.*.nextId += 1
+        slot = MAX
+    }
+    const fresh = slot == MAX
+    if fresh { slot = freeSlot(daemon) }
+    const bubble = bubbleAt(daemon, slot)
+    if !fresh && bubble.*.hasImage {
+        png.deinit(imageOf(bubble))
+        bubble.*.hasImage = false
+    }
+    bubble.*.id = id
+    bubble.*.appLength = copy(bytesAt(bubble, @offsetOf(Bubble, "app")), 48, app)
+    bubble.*.summaryLength = copy(bytesAt(bubble, @offsetOf(Bubble, "summary")), 96, summary)
+    bubble.*.bodyLength = copy(bytesAt(bubble, @offsetOf(Bubble, "body")), 480, body)
+    // The actions: key, label, key, label...
+    bubble.*.actionCount = 0
+    bubble.*.hasDefault = false
+    const actions = dbus.readU32(&reading)
+    const actions_end = reading.position + @intCast(usize, actions)
+    while reading.position < actions_end && !reading.failed {
+        const key = dbus.readString(&reading)
+        const label = dbus.readString(&reading)
+        if apps_module.sameText(key, "default") {
+            bubble.*.hasDefault = true
+        } else if bubble.*.actionCount < MAX_ACTIONS {
+            const at = bubble.*.actionCount
+            bubble.*.actionKeyLengths[at] = copy(bytesAt(bubble, @offsetOf(Bubble, "actionKeys") + at * 32), 32, key)
+            bubble.*.actionLabelLengths[at] = copy(bytesAt(bubble, @offsetOf(Bubble, "actionLabels") + at * 40), 40, label)
+            bubble.*.actionCount += 1
+        }
+    }
+    // The hints.
+    bubble.*.urgency = 1
+    var entry = icon[0..0]
+    var image_path = icon[0..0]
+    var transient = false
+    const hints = dbus.readU32(&reading)
+    dbus.alignTo(&reading, 8)
+    const hints_end = reading.position + @intCast(usize, hints)
+    while reading.position < hints_end && !reading.failed {
+        dbus.alignTo(&reading, 8)
+        const key = dbus.readString(&reading)
+        const signature = dbus.readSignature(&reading)
+        if apps_module.sameText(key, "urgency") && apps_module.sameText(signature, "y") {
+            bubble.*.urgency = dbus.readByte(&reading)
+        } else if apps_module.sameText(key, "desktop-entry") && apps_module.sameText(signature, "s") {
+            entry = dbus.readString(&reading)
+        } else if (apps_module.sameText(key, "image-path") || apps_module.sameText(key, "image_path")) && apps_module.sameText(signature, "s") {
+            image_path = dbus.readString(&reading)
+        } else if apps_module.sameText(key, "transient") && apps_module.sameText(signature, "b") {
+            transient = dbus.readBool(&reading)
+        } else if (apps_module.sameText(key, "image-data") || apps_module.sameText(key, "image_data") || apps_module.sameText(key, "icon_data")) && apps_module.sameText(signature, "(iiibiiay)") {
+            loadImageData(daemon, bubble, &reading)
+        } else {
+            const skipped = dbus.skipValue(&reading, signature, 0, 0)
+        }
+    }
+    const timeout = @bitCast(i32, dbus.readU32(&reading))
+    if image_path.length > 0 { loadIcon(daemon, bubble, image_path, entry) }
+    loadIcon(daemon, bubble, icon, entry)
+    // Reply first: the app waits for the id.
+    var writing: dbus.Writer = undefined
+    dbus.begin(&writing, daemon.*.out, SIZE, false)
+    dbus.putU32(&writing, id)
+    const serial = dbus.reply(client, request, "u", daemon.*.out, writing.length, noDescriptors(), 0)
+    // Kept for the control centre (not a transient one).
+    const notices = noticesOf(daemon)
+    if !transient {
+        const kept = notices_module.find(notices, id)
+        const fresh = kept >= notices.*.count
+        const notice = if fresh { notices_module.push(notices) } else { notices_module.at(notices, kept) }
+        if fresh { notices.*.unread += 1 }
+        notices_module.set(notice, id, timezone.now(), app, summary, body, if icon.length > 0 { icon } else { entry })
+        listChanged(daemon)
+    }
+    say(daemon, "notifyd: notification ")
+    sayNumber(daemon, id)
+    say(daemon, " \"")
+    say(daemon, summaryOf(bubble))
+    say(daemon, "\"")
+    if bubble.*.actionCount > 0 { say(daemon, " with actions") }
+    // Do Not Disturb: kept, not shown (unless critical).
+    if notices.*.dnd && bubble.*.urgency != URGENCY_CRITICAL {
+        say(daemon, " (not shown: do not disturb)\n")
+        if fresh { bubble.*.used = false }
+        return
+    }
+    say(daemon, "\n")
+    const now = anim.now()
+    const lasting = if timeout < 0 { TIMEOUT } else { @intCast(usize, timeout) }
+    bubble.*.expireAt = if bubble.*.urgency == URGENCY_CRITICAL || timeout == 0 { 0 } else { now + lasting }
+    bubble.*.going = false
+    bubble.*.height = bubbleHeight(daemon, bubble)
+    if fresh || !bubble.*.used {
+        bubble.*.used = true
+        anim.jump(topOf(bubble), TOP)
+        anim.jump(shownOf(bubble), 0)
+        anim.set(shownOf(bubble), 255, COME)
+    }
+    arrange(daemon)
+}
+
+// ---------------------------------------------------------------------------
+// Calls
+
+const INTROSPECTION: []const u8 = "<!DOCTYPE node PUBLIC \"-//freedesktop//DTD D-BUS Object Introspection 1.0//EN\" \"http://www.freedesktop.org/standards/dbus/1.0/introspect.dtd\">\n<node>\n <interface name=\"org.freedesktop.Notifications\">\n  <method name=\"GetCapabilities\"><arg type=\"as\" direction=\"out\"/></method>\n  <method name=\"Notify\"><arg type=\"s\" direction=\"in\"/><arg type=\"u\" direction=\"in\"/><arg type=\"s\" direction=\"in\"/><arg type=\"s\" direction=\"in\"/><arg type=\"s\" direction=\"in\"/><arg type=\"as\" direction=\"in\"/><arg type=\"a{sv}\" direction=\"in\"/><arg type=\"i\" direction=\"in\"/><arg type=\"u\" direction=\"out\"/></method>\n  <method name=\"CloseNotification\"><arg type=\"u\" direction=\"in\"/></method>\n  <method name=\"GetServerInformation\"><arg type=\"s\" direction=\"out\"/><arg type=\"s\" direction=\"out\"/><arg type=\"s\" direction=\"out\"/><arg type=\"s\" direction=\"out\"/></method>\n  <signal name=\"NotificationClosed\"><arg type=\"u\"/><arg type=\"u\"/></signal>\n  <signal name=\"ActionInvoked\"><arg type=\"u\"/><arg type=\"s\"/></signal>\n </interface>\n <interface name=\"org.mlx.Notifications\">\n  <method name=\"SetDoNotDisturb\"><arg type=\"b\" direction=\"in\"/></method>\n  <method name=\"Dismiss\"><arg type=\"u\" direction=\"in\"/></method>\n  <method name=\"ClearHistory\"/>\n  <method name=\"MarkRead\"/>\n  <method name=\"List\"><arg type=\"b\" direction=\"out\"/><arg type=\"u\" direction=\"out\"/><arg type=\"a(ussssx)\" direction=\"out\"/></method>\n  <signal name=\"Changed\"/>\n </interface>\n</node>\n"
+
+fn replyEmpty(daemon: *Daemon, request: *const dbus.Header) -> void {
+    const serial = dbus.reply(clientOf(daemon), request, "", daemon.*.out, 0, noDescriptors(), 0)
+}
+
+fn unknown(daemon: *Daemon, request: *const dbus.Header) -> void {
+    var header = dbus.newHeader(dbus.ERROR, 0)
+    header.replySerial = request.*.serial
+    header.hasReplySerial = true
+    header.destination = request.*.sender
+    header.errorName = "org.freedesktop.DBus.Error.UnknownMethod"
+    const serial = dbus.send(clientOf(daemon), &header, daemon.*.out, 0, noDescriptors(), 0)
+}
+
+fn called(daemon: *Daemon, request: *const dbus.Header) -> void {
+    const client = clientOf(daemon)
+    const interface = request.*.interface
+    const member = request.*.member
+    var reading = dbus.reader(dbus.bodyOf(client, request), request.*.bodyLength, request.*.big)
+    var writing: dbus.Writer = undefined
+    dbus.begin(&writing, daemon.*.out, SIZE, false)
+    if apps_module.sameText(member, "Notify") && (interface.length == 0 || apps_module.sameText(interface, INTERFACE)) {
+        notify(daemon, request)
+        return
+    }
+    if apps_module.sameText(member, "GetCapabilities") {
+        const at = dbus.beginArray(&writing, 4)
+        dbus.putString(&writing, "body")
+        dbus.putString(&writing, "actions")
+        dbus.putString(&writing, "icon-static")
+        dbus.putString(&writing, "persistence")
+        dbus.endArray(&writing, at, 4)
+        const serial = dbus.reply(client, request, "as", daemon.*.out, writing.length, noDescriptors(), 0)
+        return
+    }
+    if apps_module.sameText(member, "GetServerInformation") {
+        dbus.putString(&writing, "MLX Notifications")
+        dbus.putString(&writing, "Mlx")
+        dbus.putString(&writing, "1.0")
+        dbus.putString(&writing, "1.2")
+        const serial = dbus.reply(client, request, "ssss", daemon.*.out, writing.length, noDescriptors(), 0)
+        return
+    }
+    if apps_module.sameText(member, "CloseNotification") {
+        const id = dbus.readU32(&reading)
+        replyEmpty(daemon, request)
+        const index = bubbleOf(daemon, id)
+        if index < MAX { dismiss(daemon, index, CLOSED_CALLED) } else { signalClosed(daemon, id, CLOSED_CALLED) }
+        return
+    }
+    if apps_module.sameText(interface, OWN) {
+        const notices = noticesOf(daemon)
+        if apps_module.sameText(member, "SetDoNotDisturb") {
+            notices.*.dnd = dbus.readBool(&reading)
+            say(daemon, if notices.*.dnd { "notifyd: do not disturb on\n" } else { "notifyd: do not disturb off\n" })
+        } else if apps_module.sameText(member, "Dismiss") {
+            const id = dbus.readU32(&reading)
+            notices_module.remove(notices, notices_module.find(notices, id))
+        } else if apps_module.sameText(member, "ClearHistory") {
+            notices_module.clear(notices)
+            say(daemon, "notifyd: cleared\n")
+        } else if apps_module.sameText(member, "MarkRead") {
+            notices.*.unread = 0
+        } else if apps_module.sameText(member, "List") {
+            notices_module.put(&writing, notices)
+            const serial = dbus.reply(client, request, notices_module.SIGNATURE, daemon.*.out, writing.length, noDescriptors(), 0)
+            return
+        } else {
+            unknown(daemon, request)
+            return
+        }
+        replyEmpty(daemon, request)
+        listChanged(daemon)
+        return
+    }
+    if apps_module.sameText(member, "Introspect") {
+        dbus.putString(&writing, INTROSPECTION)
+        const serial = dbus.reply(client, request, "s", daemon.*.out, writing.length, noDescriptors(), 0)
+        return
+    }
+    if apps_module.sameText(member, "Ping") {
+        replyEmpty(daemon, request)
+        return
+    }
+    unknown(daemon, request)
+}
+
+fn themeOf(daemon: *Daemon) -> *anim.Glide {
+    unsafe { return @ptrCast(*anim.Glide, &daemon.*.theme) }
+}
+
+fn colorsOf(daemon: *Daemon) -> *palette.Palette {
+    unsafe { return @ptrCast(*palette.Palette, &daemon.*.colors) }
+}
+
+// The look is the scheme in the variant at `reading` (the portal's
+// answer: at once; a change: gliding).
+fn lookIs(daemon: *Daemon, reading: *dbus.Reader, at_once: bool) -> void {
+    if !apps_module.sameText(dbus.readSignature(reading), "u") { return }
+    const scheme = dbus.readU32(reading)
+    if reading.*.failed { return }
+    const target: i32 = if scheme == palette.SCHEME_LIGHT { palette.LIGHT } else { 0 }
+    if at_once { anim.jump(themeOf(daemon), target) } else { anim.set(themeOf(daemon), target, LOOK_CHANGE) }
+    const panel = panelOf(daemon)
+    panel.*.dirty = true
+    panel.*.tickInterval = 16
+    panel.*.nextTick = 0
+}
+
+fn process(daemon: *Daemon) -> void {
+    const client = clientOf(daemon)
+    var header: dbus.Header = undefined
+    while dbus.next(client, &header, 0) {
+        if header.kind == dbus.METHOD_CALL {
+            called(daemon, &header)
+        } else if header.kind == dbus.METHOD_RETURN && header.hasReplySerial && header.replySerial == daemon.*.lookSerial {
+            var reading = dbus.reader(dbus.bodyOf(client, &header), header.bodyLength, header.big)
+            lookIs(daemon, &reading, true)
+        } else if header.kind == dbus.SIGNAL && apps_module.sameText(header.interface, SETTINGS) && apps_module.sameText(header.member, "SettingChanged") {
+            var reading = dbus.reader(dbus.bodyOf(client, &header), header.bodyLength, header.big)
+            const namespace = dbus.readString(&reading)
+            const key = dbus.readString(&reading)
+            if apps_module.sameText(namespace, "org.freedesktop.appearance") && apps_module.sameText(key, "color-scheme") { lookIs(daemon, &reading, false) }
+        } else if header.kind == dbus.METHOD_RETURN && header.hasReplySerial && header.replySerial == daemon.*.nameSerial {
+            var reading = dbus.reader(dbus.bodyOf(client, &header), header.bodyLength, header.big)
+            const result = dbus.readU32(&reading)
+            // 1: the primary owner (4: already it).
+            daemon.*.owner = result == 1 || result == 4
+            if !daemon.*.owner {
+                say(daemon, "notifyd: another server has org.freedesktop.Notifications\n")
+                panelOf(daemon).*.running = false
+            } else {
+                say(daemon, "notifyd: serving org.freedesktop.Notifications\n")
+            }
+        }
+    }
+    if client.*.closed { panelOf(daemon).*.running = false }
+}
+
+// ---------------------------------------------------------------------------
+// Drawing
+
+// How many lines (at most LINES) `text` takes `width` wide, broken at
+// spaces (a word longer than a line is cut); drawBody draws them so.
+fn wrap(daemon: *Daemon, text: []const u8, width: i32) -> usize {
+    const font = smallOf(daemon)
+    var lines: usize = 0
+    var start: usize = 0
+    while start < text.length && lines < LINES {
+        start = lineEnd(font, text, start, width)
+        lines += 1
+        while start < text.length && text[start] == 32 { start += 1 }
+    }
+    return lines
+}
+
+// Where the line from `start` ends: the longest run that fits, at a space
+// (or as much of one long word as fits).
+fn lineEnd(font: *Text, text: []const u8, start: usize, width: i32) -> usize {
+    var fit = start
+    var end = start
+    while end < text.length {
+        var next = end + 1
+        while next < text.length && text[next] != 32 { next += 1 }
+        if text_module.measure(font, text[start..next]) > width { break }
+        fit = next
+        end = next
+    }
+    if fit == start {
+        fit = start + 1
+        while fit < text.length && text_module.measure(font, text[start..fit + 1]) <= width { fit += 1 }
+        while fit < text.length && (text[fit] & 192) == 128 { fit += 1 }
+    }
+    return fit
+}
+
+
+// The body's lines at (x, y).
+fn drawBody(daemon: *Daemon, canvas: *Canvas, text: []const u8, x: i32, y: i32, width: i32, color: u32) -> void {
+    const font = smallOf(daemon)
+    var lines: usize = 0
+    var start: usize = 0
+    while start < text.length && lines < LINES {
+        const fit = lineEnd(font, text, start, width)
+        const top = y + @intCast(i32, lines) * LINE
+        if lines + 1 == LINES && fit < text.length {
+            const ellipsis = "…"
+            var cut = fit
+            while cut > start && text_module.measure(font, text[start..cut]) + text_module.measure(font, ellipsis) > width { cut -= 1 }
+            while cut > start && (text[cut] & 192) == 128 { cut -= 1 }
+            text_module.drawText(canvas, font, text[start..cut], x, top, color, 0)
+            text_module.drawText(canvas, font, ellipsis, x + text_module.measure(font, text[start..cut]), top, color, 0)
+        } else {
+            text_module.drawText(canvas, font, text[start..fit], x, top, color, 0)
+        }
+        lines += 1
+        start = fit
+        while start < text.length && text[start] == 32 { start += 1 }
+    }
+}
+
+fn actionLeft(bubble: *Bubble, index: usize) -> i32 {
+    const room = WIDTH - PADDING * 2
+    const each = (room - 8 * (@intCast(i32, bubble.*.actionCount) - 1)) / @intCast(i32, bubble.*.actionCount)
+    return MARGIN + PADDING + @intCast(i32, index) * (each + 8)
+}
+
+fn actionWidth(bubble: *Bubble) -> i32 {
+    const room = WIDTH - PADDING * 2
+    return (room - 8 * (@intCast(i32, bubble.*.actionCount) - 1)) / @intCast(i32, bubble.*.actionCount)
+}
+
+fn drawBubble(daemon: *Daemon, canvas: *Canvas, index: usize) -> void {
+    const bubble = bubbleAt(daemon, index)
+    const shown = anim.value(shownOf(bubble))
+    if shown <= 0 { return }
+    const top = anim.value(topOf(bubble))
+    // Coming, it slides in from the right; going, it fades where it is.
+    const slide = if bubble.*.going { 0 } else { (255 - shown) * 60 / 255 }
+    const left = MARGIN + slide
+    canvas_module.setOpacity(canvas, @intCast(u32, shown))
+    const colors = colorsOf(daemon)
+    canvas_module.fillRoundedRect(canvas, left, top, WIDTH, bubble.*.height, 16, colors.*.popup)
+    canvas_module.strokeRoundedRect(canvas, left, top, WIDTH, bubble.*.height, 16, 1, colors.*.edge)
+    if bubble.*.urgency == URGENCY_CRITICAL { canvas_module.fillRoundedRect(canvas, left, top + 12, 3, bubble.*.height - 24, 1, canvas_module.color(255, 240, 90, 90)) }
+    // The icon.
+    const icon_x = left + PADDING
+    const icon_y = top + PADDING
+    if bubble.*.hasImage {
+        canvas_module.drawImage(canvas, imageOf(bubble), icon_x, icon_y, ICON, 255)
+    } else {
+        canvas_module.fillRoundedRect(canvas, icon_x, icon_y, ICON, ICON, 10, colors.*.panel)
+        palette.symbol(colors, symbolsOf(daemon), canvas, symbols.BELL, 0, icon_x + 9, icon_y + 9, ICON - 18)
+    }
+    const text_x = icon_x + ICON + 12
+    const room = WIDTH - PADDING * 2 - ICON - 12
+    text_module.drawText(canvas, smallOf(daemon), appOf(bubble), text_x, top + PADDING - 2, palette.ink(colors, 140), room - CLOSE)
+    text_module.drawText(canvas, boldOf(daemon), summaryOf(bubble), text_x, top + PADDING + 16, colors.*.ink, room)
+    drawBody(daemon, canvas, bodyOf(bubble), text_x, top + PADDING + 38, room, palette.ink(colors, 200))
+    // The close button, under the pointer.
+    if daemon.*.hover == index {
+        const close_x = left + WIDTH - CLOSE - 8
+        const lit = daemon.*.hoverPart == PART_CLOSE
+        canvas_module.fillRoundedRect(canvas, close_x, top + 8, CLOSE, CLOSE, CLOSE / 2, if lit { palette.ink(colors, 90) } else { colors.*.panel })
+        palette.symbol(colors, symbolsOf(daemon), canvas, symbols.CLOSE, 0, close_x + 3, top + 11, CLOSE - 6)
+    }
+    // The actions.
+    var action: usize = 0
+    while action < bubble.*.actionCount {
+        const x = actionLeft(bubble, action) + slide
+        const y = top + bubble.*.height - PADDING - ACTION_HEIGHT
+        const lit = daemon.*.hover == index && daemon.*.hoverPart == PART_ACTION + action
+        canvas_module.fillRoundedRect(canvas, x, y, actionWidth(bubble), ACTION_HEIGHT, 9, if lit { ACCENT } else { colors.*.panel })
+        const label = actionLabelOf(bubble, action)
+        const label_width = text_module.measure(textOf(daemon), label)
+        text_module.drawText(canvas, textOf(daemon), label, x + (actionWidth(bubble) - label_width) / 2, y + 6, if lit { palette.ON_ACCENT } else { colors.*.ink }, actionWidth(bubble) - 8)
+        action += 1
+    }
+    canvas_module.setOpacity(canvas, 255)
+}
+
+fn draw(context: *anyopaque, canvas: *Canvas) -> void {
+    const daemon = daemonOf(context)
+    daemon.*.colors = palette.at(anim.value(themeOf(daemon)))
+    canvas_module.clear(canvas, 0)
+    var index: usize = 0
+    while index < MAX {
+        if bubbleAt(daemon, index).*.used { drawBubble(daemon, canvas, index) }
+        index += 1
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The pointer and time
+
+// Which bubble (MAX: none) and which part of it is at (x, y).
+fn hit(daemon: *Daemon, x: i32, y: i32, part: *usize) -> usize {
+    var index: usize = 0
+    while index < MAX {
+        const bubble = bubbleAt(daemon, index)
+        if bubble.*.used && !bubble.*.going {
+            const top = topOf(bubble).*.to
+            if x >= MARGIN && x < MARGIN + WIDTH && y >= top && y < top + bubble.*.height {
+                part.* = PART_BODY
+                if x >= MARGIN + WIDTH - CLOSE - 8 && y < top + 8 + CLOSE { part.* = PART_CLOSE }
+                var action: usize = 0
+                while action < bubble.*.actionCount {
+                    const left = actionLeft(bubble, action)
+                    const action_top = top + bubble.*.height - PADDING - ACTION_HEIGHT
+                    if x >= left && x < left + actionWidth(bubble) && y >= action_top && y < action_top + ACTION_HEIGHT { part.* = PART_ACTION + action }
+                    action += 1
+                }
+                return index
+            }
+        }
+        index += 1
+    }
+    return MAX
+}
+
+fn moved(daemon: *Daemon, x: i32, y: i32) -> void {
+    daemon.*.pointerX = x
+    daemon.*.pointerY = y
+    var part: usize = PART_BODY
+    const over = if x < 0 { MAX } else { hit(daemon, x, y, &part) }
+    if over != daemon.*.hover || part != daemon.*.hoverPart {
+        daemon.*.hover = over
+        daemon.*.hoverPart = part
+        panelOf(daemon).*.dirty = true
+    }
+}
+
+fn clicked(daemon: *Daemon) -> void {
+    const index = daemon.*.hover
+    if index >= MAX { return }
+    const bubble = bubbleAt(daemon, index)
+    const part = daemon.*.hoverPart
+    if part >= PART_ACTION {
+        const key = actionKeyOf(bubble, part - PART_ACTION)
+        signalAction(daemon, bubble.*.id, key)
+        say(daemon, "notifyd: action ")
+        say(daemon, key)
+        say(daemon, "\n")
+    } else if part == PART_BODY && bubble.*.hasDefault {
+        signalAction(daemon, bubble.*.id, "default")
+        say(daemon, "notifyd: action default\n")
+    }
+    dismiss(daemon, index, CLOSED_DISMISSED)
+}
+
+// Every tick: what expired goes, what faded out is dropped, the surface
+// goes once nothing is left; ticks stay fast while something moves.
+fn tick(daemon: *Daemon) -> void {
+    const now = anim.now()
+    var moving = false
+    var left: usize = 0
+    var index: usize = 0
+    while index < MAX {
+        const bubble = bubbleAt(daemon, index)
+        if bubble.*.used {
+            if !bubble.*.going && bubble.*.expireAt != 0 && now >= bubble.*.expireAt {
+                // Not while the pointer rests on it.
+                if daemon.*.hover == index { bubble.*.expireAt = now + 1500 } else { dismiss(daemon, index, CLOSED_EXPIRED) }
+            }
+            if bubble.*.going && now - bubble.*.goneAt >= GO { drop(daemon, index) }
+        }
+        if bubble.*.used {
+            left += 1
+            if anim.moving(topOf(bubble)) || anim.moving(shownOf(bubble)) || anim.moving(themeOf(daemon)) { moving = true }
+        }
+        index += 1
+    }
+    const panel = panelOf(daemon)
+    if moving { panel.*.dirty = true }
+    panel.*.tickInterval = if moving { 16 } else { 250 }
+    if left == 0 && daemon.*.showing {
+        panel_module.hide(panel)
+        daemon.*.showing = false
+    }
+}
+
+fn onEvent(context: *anyopaque, kind: u32, a: u32, b: i32) -> void {
+    const daemon = daemonOf(context)
+    if kind == panel_module.EVENT_WATCH {
+        process(daemon)
+    } else if kind == panel_module.EVENT_TICK {
+        tick(daemon)
+    } else if kind == panel_module.EVENT_CONFIGURED {
+        panel_module.setMargins(panelOf(daemon), 0, 0, 0, 0)
+        updateInput(daemon)
+    } else if kind == panel_module.EVENT_MOTION {
+        moved(daemon, @bitCast(i32, a), b)
+    } else if kind == panel_module.EVENT_LEAVE {
+        moved(daemon, -1, -1)
+    } else if kind == panel_module.EVENT_BUTTON && b == 1 && a == 272 {
+        clicked(daemon)
+    }
+}
+
+const Failure = error { NoMemory, NoBus }
+
+fn fail(failure: Failure) -> Failure!void { return failure }
+
+pub fn main(arguments: [][*]const u8) -> !void {
+    crash.install()
+    const allocator = std.page_allocator.init()
+    const environment = std.process.environmentEntries(arguments)
+    const memory = allocator.alloc(@sizeOf(Daemon), 16)
+    const out = allocator.alloc(SIZE, 16)
+    if memory == null || out == null { return fail(Failure.NoMemory) }
+    var daemon: *Daemon = undefined
+    unsafe { daemon = @ptrCast(*Daemon, memory.?) }
+    daemon.*.out = out.?
+    daemon.*.environment = environment
+    daemon.*.allocator = allocator
+    daemon.*.verbose = arguments.length > 1 && arguments[1][0] == 45 && arguments[1][2] == 118
+    daemon.*.nextId = 1
+    daemon.*.showing = false
+    daemon.*.hover = MAX
+    daemon.*.hoverPart = PART_BODY
+    daemon.*.owner = false
+    var index: usize = 0
+    while index < MAX {
+        bubbleAt(daemon, index).*.used = false
+        bubbleAt(daemon, index).*.hasImage = false
+        index += 1
+    }
+    daemon.*.german = clock.systemGerman(environment)
+    notices_module.clear(noticesOf(daemon))
+    noticesOf(daemon).*.dnd = false
+    if !apps_module.init(appsOf(daemon), environment, allocator) { return fail(Failure.NoMemory) }
+    apps_module.scan(appsOf(daemon))
+    symbols.init(symbolsOf(daemon), allocator)
+    const loaded_text = text_module.loadText(textOf(daemon), 13, allocator)
+    const loaded_bold = text_module.loadText(boldOf(daemon), 14, allocator)
+    const loaded_small = text_module.loadText(smallOf(daemon), 12, allocator)
+    const client = clientOf(daemon)
+    if !dbus.connectSession(client, allocator, environment) { return fail(Failure.NoBus) }
+    // RequestName(NAME, DO_NOT_QUEUE).
+    var writing: dbus.Writer = undefined
+    dbus.begin(&writing, daemon.*.out, SIZE, false)
+    dbus.putString(&writing, NAME)
+    dbus.putU32(&writing, 4)
+    daemon.*.nameSerial = dbus.call(client, BUS, BUS_PATH, BUS, "RequestName", "su", daemon.*.out, writing.length)
+    // The look, and its changes.
+    anim.jump(themeOf(daemon), 0)
+    daemon.*.colors = palette.at(0)
+    dbus.begin(&writing, daemon.*.out, SIZE, false)
+    dbus.putString(&writing, "type='signal',interface='org.freedesktop.portal.Settings',member='SettingChanged'")
+    const matched = dbus.call(client, BUS, BUS_PATH, BUS, "AddMatch", "s", daemon.*.out, writing.length)
+    dbus.begin(&writing, daemon.*.out, SIZE, false)
+    dbus.putString(&writing, "org.freedesktop.appearance")
+    dbus.putString(&writing, "color-scheme")
+    daemon.*.lookSerial = dbus.call(client, PORTAL, PORTAL_PATH, SETTINGS, "ReadOne", "ss", daemon.*.out, writing.length)
+    const panel = panelOf(daemon)
+    panel.*.context = @ptrCast(*anyopaque, daemon)
+    panel.*.draw = draw
+    panel.*.event = onEvent
+    try panel_module.connect(panel, allocator, arguments, @intCast(u32, WIDTH + MARGIN * 2), 200, false)
+    panel.*.keepAlive = true
+    panel.*.watch = dbus.descriptorOfClient(client)
+    panel.*.tickInterval = 250
+    process(daemon)
+    try panel_module.run(panel)
+    panel_module.close(panel)
+}
