@@ -28,6 +28,10 @@ export XDG_CONFIG_HOME="$work/config"
 # Which apps asked for which permission (MLXIPC keeps it there).
 export XDG_STATE_HOME="$work/state"
 mkdir -p "$XDG_CONFIG_HOME/mlx" "$work/services"
+# MLXIPC asks every app before it records or listens to what plays; with no
+# permission agent here the answer would be no, so ipc.conf allows
+# mlx-capture both (as a user's answer, remembered, would).
+printf 'allow mlx-capture use audio.record\nallow mlx-capture use audio.monitor\n' > "$XDG_CONFIG_HOME/mlx/ipc.conf"
 bus_pid=
 cleanup() {
     [[ -n "$bus_pid" ]] && kill "$bus_pid" 2> /dev/null || true
