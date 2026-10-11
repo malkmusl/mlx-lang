@@ -42,6 +42,14 @@
 #      Super+Shift+Right size, focus and move columns, the floating half
 #      turns it off again; Super+Shift+2 moves a window to workspace 2, the
 #      bar's numbers and Super+3 switch workspaces.
+#  10e. animations (settings `animations = slow`, eight times slower, so a
+#      frame in the middle is caught): switching workspaces slides the
+#      window out, Super+Right glides it to the right half.
+#  10f. the wheel and the touchpad on a tiling workspace: Super+wheel walks
+#      the columns, Super and fingers drag the strip, which settles on a
+#      column when they lift; Super+Ctrl+wheel (and Super+wheel on a
+#      floating workspace) and the wheel over the top bar switch
+#      workspaces.
 #  11. mlx-settings records hotkeys: while it records, the compositor
 #      passes every key to it (keyboard-shortcuts-inhibit), Super+Up too;
 #      Backspace unbinds one; the compositor takes the new keys at once.
@@ -591,10 +599,143 @@ assert lit(tiling(566, 7)) and not lit(tiling(520, 7)), (tiling(520, 7), tiling(
 PY
 echo "ok   workspaces and scrollable tiling: the bar's buttons and the hotkeys switch, tile, size, focus and move"
 
+# Scenario 10e: animations, eight times slower (`animations = slow`). The
+# terminal rests at (24, 24): its frame's columns 22..23 and 676..677. Super+2
+# slides workspace 1 out to the left: 300 ms in, its right edge is on the
+# way (left of 600, not yet gone). Back on workspace 1, Super+Right snaps it
+# to the right half: 300 ms in, its left edge glides between where it was
+# and x = 511, where it rests in the end.
+printf 'animations = slow\n' > "$XDG_CONFIG_HOME/mlx/compositor.conf"
+cat > "$work/animations.script" <<SCRIPT
+wait 3000
+down 125
+down 3
+up 3
+up 125
+wait 300
+shot $work/slide-mid.ppm
+wait 3000
+down 125
+down 2
+up 2
+up 125
+wait 3000
+down 125
+down 106
+up 106
+up 125
+wait 300
+shot $work/glide-mid.ppm
+wait 3000
+shot $work/glide-end.ppm
+close
+SCRIPT
+run_scenario animations "$work/animations.script" --no-fps --terminal "$work/mlx-terminal" --run "$work/mlx-terminal"
+rm -f "$XDG_CONFIG_HOME/mlx/compositor.conf"
+grep -q "^settings: .*animations slow" "$work/animations-compositor.log" || { echo "the compositor did not read animations = slow" >&2; cat "$work/animations-compositor.log" >&2; exit 1; }
+grep -q "^snap: right " "$work/animations-compositor.log" || { echo "Super+Right did not snap the window" >&2; cat "$work/animations-compositor.log" >&2; exit 1; }
+python3 - "$work/slide-mid.ppm" "$work/glide-mid.ppm" "$work/glide-end.ppm" <<'PY'
+import sys
+def frame_columns(path, row):
+    data = open(path, 'rb').read()
+    _, size, _, pixels = data.split(b'\n', 3)
+    width, height = map(int, size.split())
+    frame = ((0x5a, 0xa0, 0xff), (0x50, 0x50, 0x60))
+    return [x for x in range(width) if tuple(pixels[(row * width + x) * 3:(row * width + x) * 3 + 3]) in frame]
+slide = frame_columns(sys.argv[1], 200)
+assert slide and 22 not in slide and max(slide) < 600, ("the window did not slide out", slide)
+glide = frame_columns(sys.argv[2], 200)
+assert glide and 40 < min(glide) < 500, ("the window did not glide to the right half", glide)
+end = frame_columns(sys.argv[3], 200)
+assert min(end) in (511, 512), ("the window did not end on the right half", end)
+PY
+echo "ok   animations: workspaces slide, snapped windows glide into place"
+
+# Scenario 10f: the wheel and the touchpad. Three terminals on a tiling
+# workspace (columns 500 wide from x = 8: the strip is 1516 wide, the third
+# column focused at its right end). Super+wheel up twice focuses the first
+# column (the strip glides back to the start: columns at 8 and 516); Super
+# and fingers drag the strip 500 pixels on (the second column's left edge
+# at 16); they lift and it settles with the second column at x = 8, which
+# takes the focus. Super+Ctrl+wheel goes to workspace 2, Super+wheel up on
+# that (floating) one back to 1, the wheel over the top bar to 2 again.
+cat > "$work/wheel.script" <<SCRIPT
+wait 5000
+pointer 500 400
+down 125
+down 20
+up 20
+up 125
+wait 600
+down 56
+down 28
+up 28
+up 56
+wait 2500
+down 56
+down 28
+up 28
+up 56
+wait 2500
+down 125
+scroll -2560
+up 125
+wait 600
+down 125
+scroll -2560
+up 125
+wait 800
+shot $work/wheel-first.ppm
+down 125
+swipe 25600
+swipe 25600
+swipe 25600
+swipe 25600
+swipe 25600
+up 125
+wait 300
+shot $work/wheel-swiped.ppm
+lift
+wait 800
+shot $work/wheel-settled.ppm
+down 125
+down 29
+scroll 2560
+up 29
+up 125
+wait 1000
+down 125
+scroll -2560
+up 125
+wait 1000
+pointer 500 15
+scroll 2560
+wait 1000
+close
+SCRIPT
+run_scenario wheel "$work/wheel.script" --no-fps --topbar "$work/bar/mlx-topbar" --terminal "$work/mlx-terminal" --run "$work/mlx-terminal"
+log="$work/wheel-compositor.log"
+grep -q "^settled on column 2: " "$log" || { echo "the strip did not settle on the second column when the fingers lifted" >&2; cat "$log" >&2; exit 1; }
+[[ "$(grep "^workspace: " "$log" | tr '\n' ' ')" == "workspace: 2 workspace: 1 workspace: 2 " ]] || { echo "Super+Ctrl+wheel, Super+wheel and the wheel over the bar did not switch workspaces 2, 1, 2" >&2; cat "$log" >&2; exit 1; }
+python3 - "$work/wheel-first.ppm" "$work/wheel-swiped.ppm" "$work/wheel-settled.ppm" <<'PY'
+import sys
+def frame_columns(path, row):
+    data = open(path, 'rb').read()
+    _, size, _, pixels = data.split(b'\n', 3)
+    width, height = map(int, size.split())
+    frame = ((0x5a, 0xa0, 0xff), (0x50, 0x50, 0x60))
+    return [x for x in range(width) if tuple(pixels[(row * width + x) * 3:(row * width + x) * 3 + 3]) in frame]
+first, swiped, settled = (frame_columns(path, 300) for path in sys.argv[1:4])
+assert 8 in first and 516 in first, ("Super+wheel did not bring the first column back", first)
+assert 16 in swiped and 524 in swiped, ("the strip did not follow the fingers", swiped)
+assert 8 in settled and 516 in settled and 16 not in settled, ("the strip did not settle on a column", settled)
+PY
+echo "ok   the wheel walks columns and switches workspaces, fingers drag the strip and it settles on a column"
+
 # Scenario 11: mlx-settings (its window at (24, 24); the categories in
 # its sidebar 28 pixels apart from y 44: General, Display, Sound, Apps,
 # Window management, Appearance, Language; on the Window management page the
-# hotkey rows 34 pixels apart from y 336, on the General page the
+# hotkey rows 34 pixels apart from y 436, on the General page the
 # terminal's at y 186). Maximize gets Super+Shift+M; minimize gets
 # Super+Up (the maximize hotkey: it must reach the window); the terminal
 # hotkey is cleared; then Super+Up minimizes.
@@ -606,7 +747,7 @@ pointer 124 194
 press 272
 release 272
 wait 300
-pointer 524 375
+pointer 524 475
 press 272
 release 272
 wait 300
@@ -617,7 +758,7 @@ up 50
 up 42
 up 125
 wait 300
-pointer 524 409
+pointer 524 509
 press 272
 release 272
 wait 300

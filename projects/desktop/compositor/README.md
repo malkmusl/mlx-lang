@@ -23,7 +23,11 @@ nested|drm` decides).
   (Aero snap, see Snapping, workspaces and tiling).
 - Nine workspaces, and per workspace floating windows or scrollable
   tiling as niri does it (columns on a strip wider than the screen); the
-  top bar shows both and switches them.
+  top bar shows both and switches them. The wheel walks the columns and
+  the workspaces, fingers on a touchpad drag the strip.
+- Animated: windows glide where the compositor puts them, workspaces
+  slide, new windows grow open, the snap preview grows out of the window
+  (see Animations).
 - Windows resize by dragging their border (the cursor shows the
   direction; near a corner, the corner), with Alt+right-drag from the
   nearest corner, or from the client's own edges (`xdg_toplevel.resize`,
@@ -54,7 +58,10 @@ The screenshots are frames the scripted test host received, taken during
 | Super+T | tiling on or off for the workspace shown |
 | Super+1 .. 9 | show that workspace |
 | Super+Shift+1 .. 9 | move the focused window to that workspace |
-| Super+wheel | with tiling: scroll the columns |
+| Super+wheel | with tiling: the column before or after (the strip glides along); floating: the workspace before or after |
+| Super+Shift+wheel | with tiling: move the column |
+| Super+Ctrl+wheel | the workspace before or after |
+| Super+two fingers | with tiling: drag the strip; it settles on a column when they lift |
 | Alt+Shift+Q | quit |
 | Ctrl+Alt+F1 .. F12 | switch to that VT (freestanding) |
 | Ctrl+Alt+Backspace | quit (freestanding) |
@@ -329,9 +336,10 @@ compositor is the display server itself:
 - **Input** ([`evdev.mlx`](evdev.mlx)): every keyboard, mouse and touchpad
   under `/dev/input`, and those plugged in later (inotify). Mice move with
   a little acceleration and scroll 15 pixels a notch; touchpads move the
-  pointer about 4 pixels per millimetre, scroll with two fingers (the
-  content follows the fingers), click (two fingers: right click) and tap
-  to click.
+  pointer about 4 pixels per millimetre, scroll with two fingers up and
+  down and sideways (the content follows the fingers; lifting them ends
+  the scroll, as `wl_pointer.axis_stop` tells clients), click (two
+  fingers: right click) and tap to click.
 - **Keyboard** ([`xkb.mlx`](xkb.mlx)): `std.xkb` compiles the keymap from
   the XKB data (`/usr/share/X11/xkb`) for `XKB_DEFAULT_LAYOUT` (and
   `_VARIANT`, `_MODEL`, `_OPTIONS`; the session launcher sets them from the
@@ -513,6 +521,9 @@ client-decorations = off
 corner-radius = 12
 # Moved windows wobble (with the Vulkan renderer).
 wobbly-windows = on
+# Windows glide into place and grow open, workspaces slide (on, off, or
+# slow: eight times slower, to watch).
+animations = on
 # on: workspaces start with their windows tiled (scrolling columns); the
 # top bar and Super+T switch each workspace.
 tiling = off
@@ -959,8 +970,15 @@ column is in sight. Super+Left and Super+Right focus the neighbouring
 column, Super+Shift+Left and Super+Shift+Right move the focused column,
 Super+R makes it a third, half or two thirds of the width, maximize makes
 it as wide as the screen (and back), dragging its border sets its width,
-dragging its title bar past the middle of a neighbour swaps the two, and
-Super+wheel (or the wheel over the desktop) scrolls the strip. Turning
+dragging its title bar past the middle of a neighbour swaps the two. The
+wheel with Super held (or over the desktop between the columns) walks the
+columns, a notch a column, and the strip glides along; fingers on a
+touchpad with Super (or over the desktop) drag the strip as they go, and
+when they lift it settles with the column nearest its left edge there,
+which takes the focus. Super+Shift+wheel moves the focused column, and
+Super+Ctrl+wheel goes to the workspace before or after (as Super+wheel
+does on a floating workspace; one switch per 150 ms, so a fast wheel does
+not race through all nine). Turning
 tiling off puts every window back where it floated before; a minimized
 column leaves the strip until it comes back. `tiling = on` in the
 settings makes workspaces without windows start tiled.
@@ -975,7 +993,34 @@ channel (`MLX_TOPBAR_FD`, a socket pair): the compositor sends `W`, the
 workspace shown, the tiling workspaces as a 16-bit mask and the nine
 window counts whenever one of them changes; the bar sends `w` and a
 workspace to show one, or `t`, a workspace and 1 or 0 to turn its tiling
-on or off.
+on or off. The lit button glides to the workspace shown and the lit part
+to the mode in force; the wheel over the bar goes to the workspace before
+or after.
+
+### Animations
+
+The compositor shows what it does to windows moving instead of jumping
+([`animation.mlx`](animation.mlx)), easing out (fast, then settling):
+
+- A window the compositor puts somewhere glides there in 220 ms: a
+  tiling column laid out, moved or scrolled to, a window snapped,
+  maximized or restored, tiling turned on or off. Input, both renderers
+  and Xwayland see it where it is drawn. A window the user drags goes
+  with the pointer, and while fingers drag a strip it follows them.
+- Switching workspaces slides the old one out and the new one in from
+  the side its number lies on (300 ms). Both renderers draw the two
+  workspaces' windows moved by their offset while they compose
+  (`scene.shiftWindows`); input and focus are on the new one at once. A
+  window moved to another workspace slides off towards it.
+- The snap preview grows out of the dragged window (or the last zone)
+  and fades in, eight steps of opacity (a Vulkan palette row each).
+- A new window grows open out of a slightly smaller rectangle and fades
+  in, as a folder opened from the dock's stack grows out of the stack.
+
+The shell steps them after every frame and damages what they cover, so
+frames come until they rest. `animations = off` makes it all instant;
+`animations = slow` makes it eight times slower, to watch (the checks use
+it to catch frames in the middle).
 
 ### Wobbly windows
 

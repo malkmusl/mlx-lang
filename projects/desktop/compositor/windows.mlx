@@ -16,6 +16,7 @@ const capture_module = @import("./capture.mlx")
 const xwm_module = @import("./xwm.mlx")
 const workspaces_module = @import("./workspaces.mlx")
 const tiling_module = @import("./tiling.mlx")
+const animation_module = @import("./animation.mlx")
 
 // ---------------------------------------------------------------------------
 // Focus and xdg configuration
@@ -107,8 +108,8 @@ pub fn stateRect(surface: *const shell.Surface) -> ui.Rect {
 fn saveRestore(surface: *shell.Surface) -> void {
     if surface.*.maximized || surface.*.fullscreen { return }
     surface.*.hasRestore = true
-    surface.*.restoreX = scene.windowX(surface)
-    surface.*.restoreY = scene.windowY(surface)
+    surface.*.restoreX = animation_module.restX(surface)
+    surface.*.restoreY = animation_module.restY(surface)
     surface.*.restoreWidth = scene.windowWidth(surface)
     surface.*.restoreHeight = scene.windowHeight(surface)
 }
@@ -128,7 +129,7 @@ pub fn moveWindowTo(surface: *shell.Surface, x: i32, y: i32) -> void {
 pub fn pinState(surface: *shell.Surface) -> void {
     if !surface.*.maximized && !surface.*.fullscreen { return }
     const target = stateRect(surface)
-    moveWindowTo(surface, target.x, target.y)
+    animation_module.glide(surface, target.x, target.y)
 }
 
 // After a state changed: the size and place it means, a configure, the
@@ -144,7 +145,7 @@ fn applyState(surface: *shell.Surface) -> void {
     } else if surface.*.hasRestore {
         surface.*.configuredWidth = surface.*.restoreWidth
         surface.*.configuredHeight = surface.*.restoreHeight
-        moveWindowTo(surface, surface.*.restoreX, surface.*.restoreY)
+        animation_module.glide(surface, surface.*.restoreX, surface.*.restoreY)
         surface.*.hasRestore = false
     }
     scene.restack(compositor)
@@ -258,6 +259,7 @@ pub fn startResize(compositor: *shell.Compositor, address: usize, edges: u32) ->
     if toplevel == 0 || edges == 0 { return }
     const surface = state.surfaceAt(toplevel)
     dismissPopups(compositor, 0)
+    animation_module.stop(surface)
     const width = scene.windowWidth(surface)
     const height = scene.windowHeight(surface)
     compositor.*.resizing = toplevel
@@ -440,8 +442,9 @@ pub fn endInteraction(compositor: *shell.Compositor) -> void {
         compositor.*.moving = 0
     }
     if compositor.*.snapZone != state.SNAP_NONE {
-        scene.damageRect(compositor, scene.snapRect(compositor, compositor.*.snapZone))
+        scene.damageRect(compositor, animation_module.snapBounds(compositor))
         compositor.*.snapZone = state.SNAP_NONE
+        compositor.*.snapStart = 0
     }
     endResize(compositor)
 }
@@ -468,7 +471,7 @@ pub fn snapTo(surface: *shell.Surface, zone: u8) -> void {
     const title = scene.titleHeight(surface)
     surface.*.configuredWidth = outer.width - 2 * frame
     surface.*.configuredHeight = outer.height - 2 * frame - title
-    moveWindowTo(surface, outer.x + frame, outer.y + frame + title)
+    animation_module.glide(surface, outer.x + frame, outer.y + frame + title)
     configureToplevel(surface)
     protocols_module.toplevelChanged(surface)
     scene.damageSurface(compositor, surface)
@@ -506,7 +509,9 @@ fn updateSnapZone(compositor: *shell.Compositor, x: i32, y: i32) -> void {
     var zone = state.SNAP_NONE
     if !dragged.*.tiled && !compositor.*.workspaceTiling[dragged.*.workspace] { zone = scene.snapZoneAt(compositor, x, y) }
     if zone == compositor.*.snapZone { return }
-    if compositor.*.snapZone != state.SNAP_NONE { scene.damageRect(compositor, scene.snapRect(compositor, compositor.*.snapZone)) }
+    if compositor.*.snapZone != state.SNAP_NONE { scene.damageRect(compositor, animation_module.snapBounds(compositor)) }
+    // The preview grows out of the window, or out of the last zone's.
+    if zone != state.SNAP_NONE { animation_module.snapFrom(compositor, dragged) }
     compositor.*.snapZone = zone
     if zone != state.SNAP_NONE { scene.damageRect(compositor, scene.snapRect(compositor, zone)) }
 }
@@ -676,6 +681,8 @@ pub fn startMove(compositor: *shell.Compositor, address: usize) -> void {
     if toplevel == 0 { return }
     compositor.*.moving = toplevel
     compositor.*.snapZone = state.SNAP_NONE
+    compositor.*.snapStart = 0
+    animation_module.stop(state.surfaceAt(toplevel))
     wobble.grab(compositor, state.surfaceAt(toplevel), compositor.*.pointerX, compositor.*.pointerY)
     if compositor.*.verbose {
         state.say("move: ")
@@ -772,9 +779,13 @@ pub fn pointerButton(compositor: *shell.Compositor, button: u32, pressed: bool) 
             // Let go at an edge: the window snaps there.
             if compositor.*.moving != 0 && compositor.*.snapZone != state.SNAP_NONE {
                 const zone = compositor.*.snapZone
-                scene.damageRect(compositor, scene.snapRect(compositor, zone))
+                const dragged = compositor.*.moving
+                scene.damageRect(compositor, animation_module.snapBounds(compositor))
                 compositor.*.snapZone = state.SNAP_NONE
-                snapTo(state.surfaceAt(compositor.*.moving), zone)
+                compositor.*.snapStart = 0
+                // Let go, it glides into the zone.
+                compositor.*.moving = 0
+                snapTo(state.surfaceAt(dragged), zone)
             }
             compositor.*.moving = 0
             endResize(compositor)
@@ -798,12 +809,38 @@ pub fn pointerButton(compositor: *shell.Compositor, button: u32, pressed: bool) 
     }
 }
 
+// The wheel and the touchpad. On a tiling workspace, with Super held or
+// over the desktop, a wheel's notches walk the columns (the strip glides
+// along) and fingers drag the strip (it settles on a column when they
+// lift: pointerAxisStop); Super+Shift moves the focused column instead.
+// Super+Ctrl, and Super on a floating workspace, switch workspaces.
+// Anything else goes to the window under the pointer.
 pub fn pointerAxis(compositor: *shell.Compositor, axis: u32, value: wl.Fixed) -> void {
-    // Super and the wheel (or the wheel over the desktop) scroll a tiling
-    // workspace's strip of columns.
-    if compositor.*.workspaceTiling[compositor.*.workspace] && (compositor.*.superDown || compositor.*.pointerFocus == 0) && compositor.*.moving == 0 {
-        if compositor.*.superDown { compositor.*.superUsed = true }
-        tiling_module.scroll(compositor, value.toInt() * 8)
+    const fingers = compositor.*.axisSource == state.AXIS_SOURCE_FINGER || compositor.*.axisSource == state.AXIS_SOURCE_CONTINUOUS
+    const tiling = compositor.*.workspaceTiling[compositor.*.workspace]
+    const free = compositor.*.moving == 0 && compositor.*.resizing == 0 && !compositor.*.dragging
+    if compositor.*.superDown && free {
+        compositor.*.superUsed = true
+        if compositor.*.control || !tiling {
+            const steps = wheelSteps(compositor, axis, value, fingers)
+            if steps != 0 { workspaces_module.step(compositor, steps) }
+            return
+        }
+        if compositor.*.shift {
+            const steps = wheelSteps(compositor, axis, value, fingers)
+            const focused = compositor.*.keyboardFocus
+            if steps != 0 && focused != 0 { tiling_module.moveColumn(compositor, state.surfaceAt(focused), steps > 0) }
+            return
+        }
+    }
+    if tiling && free && (compositor.*.superDown || compositor.*.pointerFocus == 0) {
+        if fingers {
+            compositor.*.fingerScrolling = true
+            tiling_module.scroll(compositor, value.toInt())
+        } else {
+            const steps = wheelSteps(compositor, axis, value, false)
+            if steps != 0 { tiling_module.focusNeighbour(compositor, steps > 0) }
+        }
         return
     }
     if compositor.*.pointerFocus == 0 { return }
@@ -812,7 +849,58 @@ pub fn pointerAxis(compositor: *shell.Compositor, axis: u32, value: wl.Fixed) ->
     while index < compositor.*.pointers.length {
         const pointer = shell.seatResourceAt(state.listAt(compositor.*.pointers, index))
         if state.sameClient(pointer.*.object, surface.*.resource) {
-            wl.wl_pointer.Resource.fromObject(pointer.*.object).sendAxis(compositor.*.time, axis, value)
+            const resource = wl.wl_pointer.Resource.fromObject(pointer.*.object)
+            // (Not sent to a pointer older than version 5.)
+            resource.sendAxisSource(compositor.*.axisSource)
+            resource.sendAxis(compositor.*.time, axis, value)
+            sendPointerFrame(pointer)
+        }
+        index += 1
+    }
+}
+
+// What a wheel notch is (and how far fingers go for a step), in 1/256
+// pixels: a notch is 15 pixels on most systems, 10 on some; a high
+// resolution wheel adds its fractions up to it.
+const WHEEL_NOTCH: i32 = 2560
+const FINGER_STEP: i32 = 12288
+
+// Adds the axis motion up; -1 or 1 when it makes a step back or on (down
+// and right are on), else 0. Turning round starts again.
+fn wheelSteps(compositor: *shell.Compositor, axis: u32, value: wl.Fixed, fingers: bool) -> i32 {
+    const index: usize = if axis == 0 { 0 } else { 1 }
+    var travel = compositor.*.wheelTravel[index]
+    if (travel > 0 && value.raw < 0) || (travel < 0 && value.raw > 0) { travel = 0 }
+    travel += value.raw
+    const step = if fingers { FINGER_STEP } else { WHEEL_NOTCH }
+    if travel >= step || travel <= 0 - step {
+        compositor.*.wheelTravel[index] = 0
+        return if travel > 0 { 1 } else { -1 }
+    }
+    compositor.*.wheelTravel[index] = travel
+    return 0
+}
+
+// Fingers lifted off the touchpad (wl_pointer.axis_stop): a strip they
+// dragged settles on a column; else the window under the pointer hears it
+// (kinetic scrolling ends).
+pub fn pointerAxisStop(compositor: *shell.Compositor, axis: u32) -> void {
+    compositor.*.wheelTravel[0] = 0
+    compositor.*.wheelTravel[1] = 0
+    if compositor.*.fingerScrolling {
+        compositor.*.fingerScrolling = false
+        tiling_module.settle(compositor)
+        return
+    }
+    if compositor.*.pointerFocus == 0 { return }
+    const surface = state.surfaceAt(compositor.*.pointerFocus)
+    var index: usize = 0
+    while index < compositor.*.pointers.length {
+        const pointer = shell.seatResourceAt(state.listAt(compositor.*.pointers, index))
+        if state.sameClient(pointer.*.object, surface.*.resource) {
+            const resource = wl.wl_pointer.Resource.fromObject(pointer.*.object)
+            resource.sendAxisSource(compositor.*.axisSource)
+            resource.sendAxisStop(compositor.*.time, axis)
             sendPointerFrame(pointer)
         }
         index += 1
@@ -1046,6 +1134,7 @@ pub fn frameDone(compositor: *shell.Compositor, time: u32) -> void {
     // Wobbling windows swing on, opening ones grow (and ask for the next
     // frame).
     wobble.advance(compositor)
+    animation_module.advance(compositor)
     launching_module.zoomStep(compositor)
     launching_module.dockStep(compositor, time)
     var index: usize = 0
@@ -1075,9 +1164,9 @@ fn sayGeometry(surface: *const shell.Surface) -> void {
     state.say("x")
     state.sayInteger(scene.windowHeight(surface))
     state.say(" at ")
-    state.sayInteger(scene.windowX(surface))
+    state.sayInteger(animation_module.restX(surface))
     state.say(",")
-    state.sayInteger(scene.windowY(surface))
+    state.sayInteger(animation_module.restY(surface))
     state.say("\n")
 }
 
@@ -1106,7 +1195,13 @@ fn map(surface: *shell.Surface) -> void {
         }
         protocols_module.toplevelMapped(compositor, address)
         launching_module.startZoom(compositor, surface)
-        if isWindow(surface) && compositor.*.workspaceTiling[surface.*.workspace] { tiling_module.add(compositor, surface) }
+        if isWindow(surface) && compositor.*.workspaceTiling[surface.*.workspace] {
+            tiling_module.add(compositor, surface)
+            // Its column is where it opens; the others make room.
+            animation_module.finish(surface)
+        }
+        // It grows open where it goes.
+        if isWindow(surface) { animation_module.open(compositor, surface) }
         if compositor.*.exclusiveLayer == 0 { focus(compositor, address) }
         if isWindow(surface) { workspaces_module.notifyTopbar(compositor) }
     }
@@ -1141,6 +1236,8 @@ pub fn unmap(surface: *shell.Surface) -> void {
     if !surface.*.mapped { return }
     scene.damageSurface(compositor, surface)
     surface.*.zooming = false
+    surface.*.gliding = false
+    surface.*.departStart = 0
     surface.*.mapped = false
     compositor.*.stack = state.listRemove(compositor.*.stack, address)
     if surface.*.role == state.ROLE_TOPLEVEL {
