@@ -93,6 +93,15 @@ if command -v dbus-monitor > /dev/null; then
     sleep 0.5
 fi
 
+# Starting or unlocking a login session is denied to ordinary apps by
+# default. A system policy may name another trusted greeter explicitly.
+expect "login.session is denied by default" "(false,)" gdbus call --session --dest org.freedesktop.DBus --object-path /org/mlx/IPC --method org.mlx.IPC.CheckProcess "$$" login.session
+printf 'allow bash use login.session\n' > "$XDG_CONFIG_HOME/mlx/ipc.conf"
+sleep 0.3
+expect "login.session can be delegated explicitly" "(true,)" gdbus call --session --dest org.freedesktop.DBus --object-path /org/mlx/IPC --method org.mlx.IPC.CheckProcess "$$" login.session
+: > "$XDG_CONFIG_HOME/mlx/ipc.conf"
+sleep 0.3
+
 # A service of ours, called by everyone.
 "$ipc" serve org.example.Echo > "$work/serve.log" 2>&1 &
 for _ in $(seq 1 50); do grep -q serving "$work/serve.log" 2> /dev/null && break; sleep 0.1; done
