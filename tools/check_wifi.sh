@@ -12,10 +12,16 @@
 #     handshake agree on the keys, a replayed group message is not
 #     answered, a forged message 3 is ignored, a message 3 with another
 #     RSN element than the beacon's is refused (no message 4), and a wrong
-#     passphrase shows as messages 1 without a message 3.
+#     passphrase shows as messages 1 without a message 3;
+#   - nl80211's scan results (projects/network/nl80211.mlx) from a dump in
+#     the kernel's layout (tools/network-test/scan_results.py): SSIDs,
+#     signals, what each network asks (open, WPA2, WPA3, 802.1X, WEP), one
+#     entry per SSID;
+#   - the saved networks (wifi.mlx): a file of mode 0600 in a folder of
+#     mode 0700 holding PMKs, never a passphrase.
 #
-# nl80211 itself (scan, connect, key installation) needs a card or
-# mac80211_hwsim and is not checked here.
+# Talking to a card (scan, connect, key installation over nl80211) needs
+# one, or mac80211_hwsim, and is not checked here.
 #
 #   tools/check_wifi.sh [compiler]
 set -euo pipefail
@@ -31,6 +37,8 @@ work=$(mktemp -d)
 trap 'rm -rf -- "$work"' EXIT
 "$compiler" --quiet tools/network-test/vectors.mlx -o "$work/vectors"
 "$compiler" --quiet tools/network-test/handshake.mlx -o "$work/handshake"
+"$compiler" --quiet tools/network-test/scanparse.mlx -o "$work/scanparse"
+"$compiler" --quiet tools/network-test/saved.mlx -o "$work/saved"
 
 fail() { echo "FAIL $1" >&2; [[ -f "${2:-}" ]] && cat "$2" >&2; exit 1; }
 
@@ -133,3 +141,34 @@ echo "ok   a message 3 whose RSN element is not the beacon's is refused (no keys
 
 grep -q "^gave up$" "$work/ap-normal:wrong.txt" && grep -q "^unanswered 3$" "$work/sta-normal:wrong.txt" && ! grep -q "^pairwise" "$work/sta-normal:wrong.txt" || fail "a wrong passphrase did not show as unanswered messages 1" "$work/sta-normal:wrong.txt"
 echo "ok   a wrong passphrase: the access point gives up, the station counts three messages 1 without a message 3"
+
+# Scan results.
+python3 tools/network-test/scan_results.py "$work/scan.bin" 77
+"$work/scanparse" "$work/scan.bin" 77 > "$work/scan.txt"
+cat > "$work/scan-wanted.txt" <<'WANTED'
+Home|-45|100|2437|wpa2|4|22|-|2
+Cafe|-60|80|5180|open|4|0|-|3
+Modern|-55|90|5200|wpa3|4|22|-|4
+Mixed|-65|70|2462|wpa2|4|26|-|5
+Office|-50|100|5240|enterprise|4|22|-|6
+Old|-80|40|2412|old|4|0|-|7
+Strict|-58|84|5745|wpa3|4|22|-|9
+Tkip|-75|50|2422|wpa2|2|26|-|10
+Joined|-72|56|2437|wpa2|4|22|joined|11
+done
+WANTED
+diff "$work/scan-wanted.txt" "$work/scan.txt" > "$work/scan-diff.txt" || fail "nl80211's scan results were not read as wanted" "$work/scan-diff.txt"
+echo "ok   scan results: one entry per SSID (the strongest or the joined access point), signals, open/WPA2/WPA3/802.1X/WEP, hidden ones left out"
+
+# Saved networks.
+state="$work/state/network"
+"$work/saved" "$state" save "Home Net" "correct horse battery"
+"$work/saved" "$state" save-open Cafe
+"$work/saved" "$state" save "Home Net" "another passphrase"
+[[ "$(stat -c %a "$state")" == 700 && "$(stat -c %a "$state/wifi")" == 600 ]] || fail "the saved networks are not for root's eyes only" "$state/wifi"
+! grep -q "passphrase" "$state/wifi" || fail "a passphrase was written" "$state/wifi"
+pmk=$(python3 -c "import hashlib; print(hashlib.pbkdf2_hmac('sha1', b'another passphrase', b'Home Net', 4096, 32).hex())")
+[[ "$("$work/saved" "$state" list)" == "Home Net $pmk"$'\n'"Cafe open" ]] || fail "the saved networks did not read back" "$state/wifi"
+"$work/saved" "$state" forget Cafe
+[[ "$("$work/saved" "$state" forget Cafe)" == "not saved" && "$("$work/saved" "$state" list)" == "Home Net $pmk" ]] || fail "forgetting a network did not" "$state/wifi"
+echo "ok   saved networks: PMKs in a file of mode 0600 (folder 0700), saved again replaces, forgotten ones go"

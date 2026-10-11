@@ -3,12 +3,16 @@
 // and once it has a carrier it is configured (DHCP or the static
 // settings): its address, its default route (the metric orders them) and
 // its name servers, which go into resolv.conf with the others'. Without a
-// carrier, or switched off (Down), it is configured no more.
+// carrier, or switched off (Down), it is configured no more. A Wi-Fi card
+// has a station (wifi.mlx) that joins a network first; the link is
+// configured once the station is ready (keys in, port open).
 const std = @import("std")
 const netlink = @import("std.netlink")
 const system = @import("./system.mlx")
 const config_module = @import("./config.mlx")
 const dhcp = @import("./dhcp.mlx")
+const nl80211 = @import("./nl80211.mlx")
+const wifi_module = @import("./wifi.mlx")
 
 pub const MAX: usize = 16
 
@@ -52,6 +56,7 @@ pub const Device = struct {
     domain: [64]u8
     domainLength: usize
     client: dhcp.Client
+    station: wifi_module.Station
 }
 
 pub const Devices = struct {
@@ -66,7 +71,17 @@ pub const Devices = struct {
     // Something changed (the bus tells it).
     changed: bool
     verbose: bool
+    // nl80211, when the kernel has it, and the saved Wi-Fi networks.
+    wifi: nl80211.Wifi
+    hasWifi: bool
+    saved: wifi_module.Saved
 }
+
+// The poll slots watch() hands to serve(): the DHCP sockets, the EAPOL
+// sockets, nl80211's events.
+pub const SLOTS: usize = 33
+const EAPOL_SLOTS: usize = 16
+const EVENTS_SLOT: usize = 32
 
 pub fn at(devices: *Devices, slot: usize) -> *Device {
     unsafe { return @ptrFromInt(*Device, @intFromPtr(devices) + @offsetOf(Devices, "items") + slot * @sizeOf(Device)) }
@@ -76,6 +91,12 @@ pub fn nameOf(device: *Device) -> []const u8 {
     var bytes: [*]const u8 = undefined
     unsafe { bytes = @ptrFromInt([*]const u8, @intFromPtr(device) + @offsetOf(Device, "name")) }
     return bytes[0..device.*.nameLength]
+}
+
+pub fn macOf(device: *Device) -> [*]const u8 {
+    var bytes: [*]const u8 = undefined
+    unsafe { bytes = @ptrFromInt([*]const u8, @intFromPtr(device) + @offsetOf(Device, "mac")) }
+    return bytes
 }
 
 pub fn domainOf(device: *Device) -> []const u8 {
@@ -96,13 +117,30 @@ fn clientOf(device: *Device) -> *dhcp.Client {
     unsafe { return @ptrCast(*dhcp.Client, &device.*.client) }
 }
 
+pub fn stationOf(device: *Device) -> *wifi_module.Station {
+    unsafe { return @ptrCast(*wifi_module.Station, &device.*.station) }
+}
+
+pub fn wifiOf(devices: *Devices) -> *nl80211.Wifi {
+    unsafe { return @ptrCast(*nl80211.Wifi, &devices.*.wifi) }
+}
+
+pub fn savedOf(devices: *Devices) -> *wifi_module.Saved {
+    unsafe { return @ptrCast(*wifi_module.Saved, &devices.*.saved) }
+}
+
+// Whether `device` is a Wi-Fi card mlx-netd drives (nl80211 is there).
+pub fn drivesWifi(devices: *Devices, device: *Device) -> bool {
+    return devices.*.hasWifi && device.*.kind == KIND_WIRELESS && device.*.managed
+}
+
 fn resolvOf(devices: *Devices) -> []const u8 {
     var bytes: [*]const u8 = undefined
     unsafe { bytes = @ptrFromInt([*]const u8, @intFromPtr(devices) + @offsetOf(Devices, "resolvPath")) }
     return bytes[0..devices.*.resolvLength]
 }
 
-pub fn init(devices: *Devices, config: *config_module.Config, scratch: [*]u8, capacity: usize, resolv: []const u8, verbose: bool) -> bool {
+pub fn init(devices: *Devices, config: *config_module.Config, scratch: [*]u8, capacity: usize, resolv: []const u8, state: []const u8, verbose: bool) -> bool {
     var slot: usize = 0
     while slot < MAX {
         at(devices, slot).*.used = false
@@ -119,7 +157,11 @@ pub fn init(devices: *Devices, config: *config_module.Config, scratch: [*]u8, ca
         length += 1
     }
     devices.*.resolvLength = length
-    return netlink.open(requestsOf(devices), netlink.ROUTE, 0)
+    if !netlink.open(requestsOf(devices), netlink.ROUTE, 0) { return false }
+    devices.*.hasWifi = nl80211.open(wifiOf(devices), scratch, capacity)
+    if verbose { system.say(if devices.*.hasWifi { "netd: nl80211 is there (Wi-Fi)\n" } else { "netd: no nl80211 in this kernel (no Wi-Fi)\n" }) }
+    wifi_module.loadSaved(savedOf(devices), state)
+    return true
 }
 
 // "netd: eth0: WHAT\n" (verbose).
@@ -241,11 +283,12 @@ pub fn linkChanged(devices: *Devices, message: *const netlink.Message) -> void {
     if fresh {
         device.*.used = true
         device.*.index = link.index
-        device.*.kind = if link.kind == ARPHRD_LOOPBACK { KIND_LOOPBACK } else if link.kind != ARPHRD_ETHER { KIND_OTHER } else if has_wireless || wireless(nameOf(device)) { KIND_WIRELESS } else { KIND_ETHERNET }
+        device.*.kind = if link.kind == ARPHRD_LOOPBACK { KIND_LOOPBACK } else if link.kind != ARPHRD_ETHER { KIND_OTHER } else if has_wireless || wireless(nameOf(device)) || nl80211.isStation(wifiOf(devices), link.index) { KIND_WIRELESS } else { KIND_ETHERNET }
         device.*.state = STATE_UNMANAGED
         device.*.configured = false
         device.*.off = false
         dhcp.init(clientOf(device))
+        wifi_module.init(stationOf(device))
         adopt(devices, device)
         devices.*.changed = true
         return
@@ -279,7 +322,16 @@ fn bringUp(devices: *Devices, device: *Device) -> void {
         if result != 0 { say(devices, device, "could not be put up") }
     }
     device.*.state = STATE_UNMANAGED
+    if drivesWifi(devices, device) { wifi_module.scan(wifiOf(devices), stationOf(device), device.*.index) }
     if device.*.carrier { carrierChanged(devices, device) } else { setState(devices, device, STATE_NO_CARRIER) }
+}
+
+// Whether a Wi-Fi card's station is still joining (the carrier comes with
+// the association, the port opens only after the handshake).
+fn joining(devices: *Devices, device: *Device) -> bool {
+    if !drivesWifi(devices, device) { return false }
+    const state = stationOf(device).*.state
+    return state == wifi_module.STATE_ASSOCIATING || state == wifi_module.STATE_HANDSHAKE
 }
 
 fn carrierChanged(devices: *Devices, device: *Device) -> void {
@@ -291,6 +343,13 @@ fn carrierChanged(devices: *Devices, device: *Device) -> void {
         return
     }
     setState(devices, device, STATE_CONNECTING)
+    if joining(devices, device) { return }
+    configureLink(devices, device)
+}
+
+// The carrier is there (and the Wi-Fi port open): DHCP or the static
+// settings.
+fn configureLink(devices: *Devices, device: *Device) -> void {
     if device.*.method == config_module.METHOD_STATIC {
         configureStatic(devices, device)
         return
@@ -306,6 +365,7 @@ pub fn linkRemoved(devices: *Devices, message: *const netlink.Message) -> void {
     if slot == MAX { return }
     const device = at(devices, slot)
     dhcp.stop(clientOf(device))
+    if drivesWifi(devices, device) { const left = wifi_module.disconnect(wifiOf(devices), stationOf(device), device.*.index) }
     say(devices, device, "removed")
     const had_dns = device.*.configured && device.*.dnsCount > 0
     device.*.used = false
@@ -439,20 +499,97 @@ fn dhcpEvent(devices: *Devices, device: *Device, event: u32) -> void {
     }
 }
 
-// The DHCP sockets into `poll`; the slot of the first (they follow in
-// the devices' order).
+// The DHCP and EAPOL sockets and nl80211's events into `poll`, their
+// slots into `slots` (SLOTS of them).
 pub fn watch(devices: *Devices, poll: *system.Poll, slots: [*]usize) -> void {
     var slot: usize = 0
     while slot < MAX {
         const device = at(devices, slot)
         slots[slot] = 32
+        slots[EAPOL_SLOTS + slot] = 32
         if device.*.used && device.*.client.socket >= 0 { slots[slot] = system.pollAdd(poll, device.*.client.socket) }
+        if device.*.used && drivesWifi(devices, device) && wifi_module.descriptor(stationOf(device)) >= 0 { slots[EAPOL_SLOTS + slot] = system.pollAdd(poll, wifi_module.descriptor(stationOf(device))) }
+        slot += 1
+    }
+    slots[EVENTS_SLOT] = if devices.*.hasWifi { system.pollAdd(poll, nl80211.descriptor(wifiOf(devices))) } else { 32 }
+}
+
+// What a station's step means for the link.
+fn wifiAction(devices: *Devices, device: *Device, action: u32) -> void {
+    if action == wifi_module.ACTION_NONE { return }
+    devices.*.changed = true
+    const station = stationOf(device)
+    if action == wifi_module.ACTION_READY {
+        say(devices, device, "joined the network")
+        if device.*.carrier {
+            setState(devices, device, STATE_CONNECTING)
+            configureLink(devices, device)
+        }
+        return
+    }
+    if action == wifi_module.ACTION_LOST {
+        say(devices, device, "left the network")
+        unconfigure(devices, device)
+        dhcp.stop(clientOf(device))
+        if !device.*.off { setState(devices, device, STATE_NO_CARRIER) }
+        return
+    }
+    if device.*.off { return }
+    if station.*.state == wifi_module.STATE_ASSOCIATING || station.*.state == wifi_module.STATE_HANDSHAKE {
+        setState(devices, device, STATE_CONNECTING)
+    } else if station.*.state == wifi_module.STATE_IDLE && device.*.state == STATE_CONNECTING && !device.*.configured {
+        setState(devices, device, STATE_NO_CARRIER)
+    }
+}
+
+// nl80211's events: scans done, connected, disconnected.
+fn wifiEvents(devices: *Devices) -> void {
+    const wifi = wifiOf(devices)
+    var socket: netlink.Socket = undefined
+    socket.descriptor = nl80211.descriptor(wifi)
+    // Events into a buffer of their own: what they start (a connect)
+    // uses the scratch space.
+    var received: [8192]u8 = undefined
+    var bytes: [*]u8 = undefined
+    unsafe { bytes = @ptrCast([*]u8, &received) }
+    while true {
+        const count = netlink.receive(&socket, bytes, 8192, 0)
+        if count <= 0 { break }
+        var offset: usize = 0
+        var message: netlink.Message = undefined
+        while netlink.nextMessage(bytes, @intCast(usize, count), &offset, &message) {
+            var happened: nl80211.Event = undefined
+            nl80211.eventOf(&message, &happened)
+            if happened.kind == nl80211.EVENT_NONE { continue }
+            const slot = find(devices, happened.index)
+            if slot == MAX { continue }
+            const device = at(devices, slot)
+            if !drivesWifi(devices, device) || device.*.off { continue }
+            if happened.kind == nl80211.EVENT_SCANNED || happened.kind == nl80211.EVENT_SCAN_ABORTED {
+                if happened.kind == nl80211.EVENT_SCAN_ABORTED { stationOf(device).*.scanning = false }
+                // The results are read once the events are taken.
+                stationOf(device).*.resultsWaiting = happened.kind == nl80211.EVENT_SCANNED
+                continue
+            }
+            if happened.kind == nl80211.EVENT_CONNECTED { say(devices, device, "associated") }
+            if happened.kind == nl80211.EVENT_DISCONNECTED { say(devices, device, "disassociated") }
+            wifiAction(devices, device, wifi_module.event(wifi, stationOf(device), device.*.index, macOf(device), savedOf(devices), &happened))
+        }
+    }
+    var slot: usize = 0
+    while slot < MAX {
+        const device = at(devices, slot)
+        if device.*.used && drivesWifi(devices, device) && stationOf(device).*.resultsWaiting {
+            stationOf(device).*.resultsWaiting = false
+            wifiAction(devices, device, wifi_module.scanned(wifi, stationOf(device), device.*.index, savedOf(devices)))
+        }
         slot += 1
     }
 }
 
 // After poll: what the DHCP sockets brought, and the timers.
 pub fn serve(devices: *Devices, poll: *system.Poll, slots: [*]usize) -> void {
+    if slots[EVENTS_SLOT] < 32 && system.pollReady(poll, slots[EVENTS_SLOT]) { wifiEvents(devices) }
     var slot: usize = 0
     while slot < MAX {
         const device = at(devices, slot)
@@ -463,6 +600,10 @@ pub fn serve(devices: *Devices, poll: *system.Poll, slots: [*]usize) -> void {
             }
             const timed = dhcp.tick(clientOf(device))
             if timed != dhcp.EVENT_NONE { dhcpEvent(devices, device, timed) }
+            if drivesWifi(devices, device) && !device.*.off {
+                if slots[EAPOL_SLOTS + slot] < 32 && system.pollReady(poll, slots[EAPOL_SLOTS + slot]) { wifiAction(devices, device, wifi_module.eapolReadable(wifiOf(devices), stationOf(device), device.*.index, savedOf(devices))) }
+                wifiAction(devices, device, wifi_module.tick(wifiOf(devices), stationOf(device), device.*.index, savedOf(devices)))
+            }
         }
         slot += 1
     }
@@ -475,6 +616,7 @@ pub fn due(devices: *Devices, longest: usize) -> usize {
     while slot < MAX {
         const device = at(devices, slot)
         if device.*.used { next = dhcp.due(clientOf(device), next) }
+        if device.*.used && drivesWifi(devices, device) && !device.*.off { next = wifi_module.due(stationOf(device), next) }
         slot += 1
     }
     return next
@@ -497,6 +639,7 @@ pub fn switchOn(devices: *Devices, name: []const u8, on: bool) -> bool {
     device.*.off = true
     say(devices, device, "switched off")
     dhcp.release(clientOf(device))
+    if drivesWifi(devices, device) { const left = wifi_module.disconnect(wifiOf(devices), stationOf(device), device.*.index) }
     unconfigure(devices, device)
     const down = netlink.setLinkUp(requestsOf(devices), devices.*.scratch, devices.*.capacity, device.*.index, false)
     setState(devices, device, STATE_OFF)
@@ -535,6 +678,65 @@ pub fn finish(devices: *Devices) -> void {
         if device.*.used { dhcp.stop(clientOf(device)) }
         slot += 1
     }
+}
+
+// The Wi-Fi cards scan; false when there is none.
+pub fn wifiScan(devices: *Devices) -> bool {
+    var any = false
+    var slot: usize = 0
+    while slot < MAX {
+        const device = at(devices, slot)
+        if device.*.used && drivesWifi(devices, device) && !device.*.off {
+            wifi_module.scan(wifiOf(devices), stationOf(device), device.*.index)
+            any = true
+        }
+        slot += 1
+    }
+    return any
+}
+
+// Joins network `ssid` with the card that sees it (wifi_module.CONNECT_*).
+pub fn wifiConnect(devices: *Devices, ssid: []const u8, passphrase: []const u8) -> u32 {
+    var result = wifi_module.CONNECT_NOT_FOUND
+    var slot: usize = 0
+    while slot < MAX {
+        const device = at(devices, slot)
+        if device.*.used && drivesWifi(devices, device) && !device.*.off {
+            result = wifi_module.connectTo(wifiOf(devices), stationOf(device), device.*.index, savedOf(devices), ssid, passphrase)
+            if result != wifi_module.CONNECT_NOT_FOUND {
+                if result == wifi_module.CONNECT_STARTED {
+                    say(devices, device, "joining a network")
+                    wifiAction(devices, device, wifi_module.ACTION_CHANGED)
+                }
+                return result
+            }
+        }
+        slot += 1
+    }
+    return result
+}
+
+pub fn wifiDisconnect(devices: *Devices) -> void {
+    var slot: usize = 0
+    while slot < MAX {
+        const device = at(devices, slot)
+        if device.*.used && drivesWifi(devices, device) { wifiAction(devices, device, wifi_module.disconnect(wifiOf(devices), stationOf(device), device.*.index)) }
+        slot += 1
+    }
+}
+
+// Forgets a saved network (and leaves it if joined); false when it was
+// not saved.
+pub fn wifiForget(devices: *Devices, ssid: []const u8) -> bool {
+    var slot: usize = 0
+    while slot < MAX {
+        const device = at(devices, slot)
+        if device.*.used && drivesWifi(devices, device) && system.same(wifi_module.ssidOf(stationOf(device)), ssid) { wifiAction(devices, device, wifi_module.disconnect(wifiOf(devices), stationOf(device), device.*.index)) }
+        slot += 1
+    }
+    const forgotten = wifi_module.forget(savedOf(devices), ssid)
+    if forgotten { devices.*.changed = true }
+    return forgotten
 }
 
 // Whether any link is connected, and with a default route.

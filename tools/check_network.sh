@@ -17,6 +17,8 @@
 #     is released, the link put down) and on again;
 #   - org.freedesktop.NetworkManager answers state() with 70 (connected)
 #     when gdbus is there to ask;
+#   - without a Wi-Fi card the Wi-Fi calls answer so (tools/check_wifi.sh
+#     checks the Wi-Fi part itself);
 #   - a server that refuses the renewal (NAK) sends it back to DISCOVER;
 #   - SIGHUP reads the configuration again: eth1 set to off goes down.
 #
@@ -100,6 +102,9 @@ snapshot off
 sleep 4
 snapshot on
 "$W/mlx-net" --bus "$W/bus" down eth9 > "$W/unknown.txt" 2>&1 && echo "accepted" >> "$W/unknown.txt" || true
+"$W/mlx-net" --bus "$W/bus" wifi > "$W/wifi.txt" 2>&1 || echo "failed" >> "$W/wifi.txt"
+"$W/mlx-net" --bus "$W/bus" scan > "$W/scan.txt" 2>&1 && echo "accepted" >> "$W/scan.txt" || true
+"$W/mlx-net" --bus "$W/bus" connect Nowhere "a passphrase" > "$W/connect.txt" 2>&1 && echo "accepted" >> "$W/connect.txt" || true
 # A server that refuses the renewal.
 kill "$SERVER"
 sleep 0.3
@@ -129,6 +134,7 @@ grep -q "^default via 10.8.0.1 dev eth1 proto static metric 50" "$work/bound-rou
 grep -q "^eth0 *ethernet *connected *10.7.0.50/24 *via 10.7.0.1 *dns 10.7.0.53 10.7.0.54$" "$work/bound-status.txt" || fail "mlx-net does not list eth0" "$work/bound-status.txt"
 grep -q "^eth1 *ethernet *connected *10.8.0.5/24 *via 10.8.0.1 *dns 10.8.0.53$" "$work/bound-status.txt" || fail "mlx-net does not list eth1" "$work/bound-status.txt"
 grep -q "^netd: on the system bus (also as org.freedesktop.NetworkManager)$" "$log" || fail "mlx-netd is not on the bus" "$log"
+grep -q "^netd: \(nl80211 is there (Wi-Fi)\|no nl80211 in this kernel (no Wi-Fi)\)$" "$log" || fail "mlx-netd did not say whether there is Wi-Fi" "$log"
 if [[ -f "$work/nm-state.txt" ]]; then
     grep -q "(uint32 70,)" "$work/nm-state.txt" || fail "NetworkManager's state() is not 70 (connected)" "$work/nm-state.txt"
 fi
@@ -148,6 +154,11 @@ grep -q "^eth0 *ethernet *off" "$work/off-status.txt" && grep -q "eth0@.*state D
 grep -q "eth0 *inet 10.7.0.50/24" "$work/on-addresses.txt" || fail "eth0 switched on again got no address" "$log"
 grep -q "no such managed link" "$work/unknown.txt" && ! grep -q "accepted" "$work/unknown.txt" || fail "mlx-net down of an unknown link was not refused" "$work/unknown.txt"
 echo "ok   mlx-net switches eth0 off (the lease released, the link down) and on again"
+
+[[ ! -s "$work/wifi.txt" ]] || fail "mlx-net wifi lists networks without a Wi-Fi card" "$work/wifi.txt"
+grep -q "no Wi-Fi card" "$work/scan.txt" && ! grep -q "accepted" "$work/scan.txt" || fail "a scan without a Wi-Fi card was not refused" "$work/scan.txt"
+grep -q "no such network in sight" "$work/connect.txt" && ! grep -q "accepted" "$work/connect.txt" || fail "joining a network nobody sees was not refused" "$work/connect.txt"
+echo "ok   without a Wi-Fi card: no networks, Scan and Connect refused with a reason"
 
 grep -q "^nak$" "$work/dhcpd-refusing.log" && grep -q "^netd: eth0: dhcp refused by 10.7.0.1$" "$log" || fail "a refused renewal was not taken" "$work/dhcpd-refusing.log"
 grep -q "^discover$" "$work/dhcpd-refusing.log" && grep -q "eth0 *inet 10.7.0.50/24" "$work/refused-addresses.txt" || fail "after the NAK eth0 did not ask again and get its address" "$log"
