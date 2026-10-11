@@ -101,7 +101,8 @@ WAYLAND_DISPLAY=wayland-mlx dbus-run-session nautilus
 Options: `--socket NAME`, `--size WxH`, `--fullscreen` (a fullscreen
 window at the monitor's resolution), `--renderer auto|vulkan|cpu` (default
 `auto`: Vulkan when a driver works, else the CPU), `--font PATH|none`,
-`--terminal PROGRAM`, `--launcher PROGRAM|none` (what Super starts),
+`--terminal PROGRAM`, `--greeter PROGRAM` (the restricted login-screen
+mode described below), `--launcher PROGRAM|none` (what Super starts),
 `--dock PROGRAM|none` (the dock, kept running), `--topbar PROGRAM|none`
 (the top bar, kept running), `--xwayland PROGRAM|none` (X programs, see
 X programs), `--run PROGRAM`
@@ -113,6 +114,24 @@ frame takes to compose and present).
 Each title bar shows the window's frames per second (the buffers it
 committed) and the desktop's (frames shown). Shown frames follow the
 monitor: at 60 Hz the desktop shows at most 60.
+
+## Greeter mode
+
+`--greeter PROGRAM` makes one compositor instance a login screen instead
+of a desktop session. It starts `PROGRAM` over a private `WAYLAND_SOCKET`
+connection adopted directly by the server. That connection, rather than a
+forgeable title or app id, identifies the trusted greeter client. Other
+clients may connect to the public display socket, but none of their
+surfaces are drawn, focused or hit-tested; keyboard and pointer input stay
+with the greeter and its popups.
+
+Greeter mode ignores `--run` programs and disables the terminal shortcut,
+launcher, dock, top bar, Xwayland, workspace hotkeys and touchpad
+workspace gestures. The only compositor shortcut left is
+Ctrl+Alt+F1..F12 on the freestanding backend, so recovery through another
+VT remains possible. When the greeter process exits, the compositor exits
+too and relinquishes DRM; the login service owns the larger lifecycle and
+starts a new greeter after a user session ends.
 
 ## Dock and launcher
 
@@ -657,7 +676,7 @@ display-mode = auto
 night-light = off
 night-light-temperature = 4000
 # The screen locker the lock hotkey and the top bar's session menu run.
-lock-command = swaylock
+lock-command = mlx-lock
 ```
 
 [`projects/desktop/settings`](../settings/main.mlx) changes them, in a
@@ -1016,7 +1035,7 @@ locker locks and unlocks it; a second locker while one lives is refused
 (`finished`).
 
 The lock hotkey (`key-lock`, Super+L) and the top bar's session menu run
-the program `lock-command` names in the settings file (`swaylock` by
+the program `lock-command` names in the settings file (`mlx-lock` by
 default; a name on `PATH` or a path). The session menu's Log Out asks the
 compositor (on the bar's channel) to close every window; it ends once
 they have, or after four seconds, and the session with it.
@@ -1506,6 +1525,9 @@ finished`.
 
 `tools/check_wayland_compositor.sh [compiler] [cpu|vulkan]` exercises all
 of this with scripted input (`tools/wayland-test-host`) on either renderer,
+including an untrusted second client beside the private greeter. Set
+`MLX_WAYLAND_GREETER_ONLY=1` for just that focused scenario. The full check
+continues
 with copy and paste between two clients (`wl-copy`, `wl-paste`) and a GTK 4
 window (`gtk4-widget-factory`) when those are installed;
 `tools/check_vulkan_wayland.sh` checks the Vulkan client in both renderers
