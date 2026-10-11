@@ -47,6 +47,9 @@
 #     top bar's control centre: dismissing and clearing them, the volume,
 #     Do Not Disturb, night light, the light look (the portal) and a
 #     screenshot;
+#   - joins a Wi-Fi network from the control centre's network list with
+#     fakenetd (tools/network-test) as mlx-netd on a system bus, and opens
+#     mlx-settings' Network page for one that needs a passphrase;
 #   - runs the file manager (mlx-files) on a home of its own: it shows the
 #     folders first, makes a folder (Ctrl+Shift+N) and names it, moves a
 #     picture into it by dragging, renames a file (F2), moves one to the
@@ -55,6 +58,8 @@
 #   - opens a folder from the dock's stack: the file manager's window
 #     grows out of the stack (the compositor's zoom), which goes as it
 #     comes.
+#   - switches the file manager from dark to light by appearance.conf
+#     (std.ui.appearance), and keeps it dark under MLX_COLOR_SCHEME=dark;
 # The window behind the launcher must show blurred through it, and the
 # screenshots must be the same with the CPU and the Vulkan renderer, and
 # with the apps drawing on the GPU (their standard) and on the CPU
@@ -90,6 +95,7 @@ trap 'rm -rf -- "$work"' EXIT
 "$compiler" --quiet projects/desktop/notifications/notify.mlx -o "$work/mlx-notify"
 "$compiler" --quiet projects/desktop/capture/main.mlx -o "$work/mlx-capture"
 "$compiler" --quiet tools/clock-probe/main.mlx -o "$work/clock-probe"
+"$compiler" --quiet tools/network-test/fakenetd.mlx -o "$work/fakenetd"
 "$compiler" --quiet projects/desktop/files/main.mlx -o "$work/mlx-files"
 xkbcli compile-keymap --layout us > "$work/us.xkb"
 
@@ -410,6 +416,104 @@ SCRIPT
 # The file manager (mlx-files) on a home of its own, its apps drawing on
 # $1 (cpu or gpu). Its window is at (24, 24), the icons' centres 118
 # pixels apart from x 296, the rows 104 apart from y 125.
+# The control centre's network list on mlx-netd: a system bus of its own
+# (mlx-ipcd --address) with tools/network-test's fakenetd in mlx-netd's
+# place (a cable, and a Wi-Fi card seeing Zuhause, Buero, Cafe Sonne and
+# Nachbar by signal; the list's rows at y 309 + 34 each under the
+# tiles). The network tile (736, 119) opens the list; Cafe Sonne (open)
+# is clicked: its row says it is joining, then it is joined (a check,
+# first in the list); Zuhause (WPA2, no passphrase saved; second now)
+# opens mlx-settings' Network page on it (a stand-in mlx-settings on the
+# PATH keeps its arguments).
+control_network() {
+    local runtime
+    runtime=$(mktemp -d)
+    mkdir -p "$work/ccn-config/mlx" "$work/ccn-home" "$work/ccn-bin"
+    printf '#!/bin/sh\necho "$@" > "%s/ccn-settings"\n' "$work" > "$work/ccn-bin/mlx-settings"
+    chmod +x "$work/ccn-bin/mlx-settings"
+    cat > "$work/ccn.script" <<SCRIPT
+wait 3000
+pointer 873 15
+press 272
+release 272
+wait 900
+pointer 736 119
+press 272
+release 272
+wait 900
+shot $work/ccn-list.ppm
+pointer 800 377
+wait 300
+press 272
+release 272
+wait 400
+shot $work/ccn-joining.ppm
+wait 2600
+shot $work/ccn-joined.ppm
+pointer 800 343
+wait 300
+press 272
+release 272
+wait 1500
+close
+SCRIPT
+    XDG_RUNTIME_DIR=$runtime "$work/test-host" host-ccn "$work/us.xkb" "$work/ccn.script" > "$work/ccn-host.log" 2>&1 &
+    local host_pid=$!
+    for _ in $(seq 1 50); do [[ -S "$runtime/host-ccn" ]] && break; sleep 0.1; done
+    # XDG_DATA_DIRS: the buses start no services of the system's (a
+    # desktop portal would be, asked for the look).
+    local bus=(env -i PATH="$work/ccn-bin:$PATH" HOME="$work/ccn-home" XDG_RUNTIME_DIR="$runtime" XDG_CONFIG_HOME="$work/ccn-config" XDG_DATA_HOME="$work/data" XDG_DATA_DIRS="$work/none"
+        DBUS_SESSION_BUS_ADDRESS="unix:path=$runtime/bus" DBUS_SYSTEM_BUS_ADDRESS="unix:path=$runtime/system")
+    "${bus[@]}" "$work/mlx-ipcd" --address "$runtime/bus" > "$work/ccn-ipcd.log" 2>&1 &
+    local ipcd_pid=$!
+    "${bus[@]}" "$work/mlx-ipcd" --address "$runtime/system" > "$work/ccn-system.log" 2>&1 &
+    local system_pid=$!
+    for _ in $(seq 1 50); do [[ -S "$runtime/bus" && -S "$runtime/system" ]] && break; sleep 0.1; done
+    "${bus[@]}" "$work/fakenetd" > "$work/ccn-netd.log" 2>&1 &
+    local netd_pid=$!
+    for _ in $(seq 1 50); do grep -q "^fakenetd: ready" "$work/ccn-netd.log" && break; sleep 0.1; done
+    local status=0
+    "${bus[@]}" WAYLAND_DISPLAY=host-ccn MLX_CANVAS=cpu \
+        LANG=de_DE.UTF-8 TZ="CET-1CEST,M3.5.0,M10.5.0/3" MLX_TOPBAR_TIME=1727445900 MLX_TOPBAR_VERBOSE=1 \
+        timeout 60 "$work/mlx-compositor" --verbose --no-fps --renderer cpu --socket nested-ccn \
+        --terminal "$work/mlx-terminal" --launcher none --dock none --topbar "$work/mlx-topbar" --run "$work/mlx-terminal" > "$work/ccn.log" 2>&1 || status=$?
+    wait "$host_pid" || fail "control centre network: the test host failed" "$work/ccn-host.log"
+    kill "$netd_pid" "$system_pid" "$ipcd_pid" 2> /dev/null || true
+    wait "$netd_pid" "$system_pid" "$ipcd_pid" 2> /dev/null || true
+    rm -rf -- "$runtime"
+    local log="$work/ccn.log"
+    [[ $status -eq 0 ]] || fail "control centre network: the compositor exited with status $status" "$log"
+    grep -q "^topbar: widgets clock 891+125 control 859+28$" "$log" || fail "control centre network: the widgets are not where the test clicks" "$log"
+    local line
+    for line in "^topbar: networks$" "^topbar: joining Cafe Sonne$" "^topbar: network settings$"; do
+        grep -q "$line" "$log" || fail "control centre network: no \"$line\"" "$log"
+    done
+    [[ "$(cat "$work/ccn-netd.log")" == "$(printf 'fakenetd: ready\nconnect Cafe Sonne (0 bytes)\njoined Cafe Sonne')" ]] || fail "control centre network: fakenetd was not asked to join Cafe Sonne" "$work/ccn-netd.log"
+    [[ "$(cat "$work/ccn-settings" 2> /dev/null)" == "network Zuhause" ]] || fail "control centre network: Zuhause did not open the Network page on it" "$log"
+    python3 - "$work" <<'PY' || fail "control centre network: the list does not show joining and joined" "$log"
+import sys
+work = sys.argv[1]
+def load(name):
+    data = open(f"{work}/{name}.ppm", 'rb').read()
+    header, size, depth, pixels = data.split(b'\n', 3)
+    width, height = map(int, size.split())
+    return lambda x, y: tuple(pixels[(y * width + x) * 3:(y * width + x) * 3 + 3])
+def area(shot, left, top, right, bottom):
+    return [shot(x, y) for y in range(top, bottom) for x in range(left, right)]
+listed, joining, joined = load("ccn-list"), load("ccn-joining"), load("ccn-joined")
+# The list: text in its first row (Zuhause) and its third (Cafe Sonne).
+assert max(max(p) for p in area(listed, 696, 300, 760, 318)) > 200, "no first row"
+assert max(max(p) for p in area(listed, 696, 368, 760, 386)) > 200, "no third row"
+# Joining: "Verbinde ..." on the right of the third row, where it had
+# nothing.
+assert area(joining, 900, 368, 990, 386) != area(listed, 900, 368, 990, 386), "no joining"
+# Joined: Cafe Sonne first, a check where Zuhause's lock was.
+assert area(joined, 696, 300, 790, 318) != area(listed, 696, 300, 790, 318), "the first row is not Cafe Sonne"
+assert area(joined, 970, 298, 992, 320) != area(listed, 970, 298, 992, 320), "no check"
+PY
+    echo "ok   control centre: the network list joins an open network through mlx-netd (joining, joined) and opens the Network page for one that needs a passphrase"
+}
+
 files() {
     local canvas=$1
     local runtime
@@ -538,6 +642,58 @@ PY
     fi
     [[ -d "$home/Documents/Inner" ]] || fail "files ($canvas): a double click did not open Documents" "$log"
     echo "ok   files ($canvas): folders first; makes, renames, moves, trashes, opens folders"
+}
+
+# Light and dark (std.ui.appearance): the file manager starts dark (no
+# appearance.conf), turns light when the file says so (as the Settings
+# portal writes it) without a restart, and MLX_COLOR_SCHEME=dark keeps it
+# dark whatever the file says.
+appearance() {
+    local base="$work/appearance"
+    rm -rf -- "$base"
+    mkdir -p "$base/home/Documents" "$base/config/mlx" "$base/fixed"
+    printf 'wait 3000\nshot %s/dark.ppm\nwait 2500\nshot %s/light.ppm\nclose\n' "$base" "$base" > "$base/switch.script"
+    printf 'wait 3000\nshot %s/fixed.ppm\nclose\n' "$base" > "$base/fixed.script"
+    local runtime run status
+    for run in switch fixed; do
+        runtime=$(mktemp -d)
+        XDG_RUNTIME_DIR=$runtime "$work/test-host" host-look "$work/us.xkb" "$base/$run.script" > "$base/$run-host.log" 2>&1 &
+        local host_pid=$!
+        for _ in $(seq 1 50); do [[ -S "$runtime/host-look" ]] && break; sleep 0.1; done
+        local scheme=()
+        if [[ $run == fixed ]]; then
+            printf 'color-scheme = light\n' > "$base/config/mlx/appearance.conf"
+            scheme=(MLX_COLOR_SCHEME=dark)
+        else
+            # The scheme turns light once the dark frame is kept.
+            ( for _ in $(seq 1 100); do [[ -s "$base/dark.ppm" ]] && break; sleep 0.1; done
+              printf 'color-scheme = light\n' > "$base/config/mlx/appearance.conf.new"
+              mv "$base/config/mlx/appearance.conf.new" "$base/config/mlx/appearance.conf" ) &
+        fi
+        status=0
+        env -i PATH="$PATH" HOME="$base/home" XDG_RUNTIME_DIR="$runtime" WAYLAND_DISPLAY=host-look XDG_CONFIG_HOME="$base/config" \
+            XDG_DATA_HOME="$base/data" MLX_CANVAS=cpu LANG=en_US.UTF-8 "${scheme[@]}" \
+            timeout 30 "$work/mlx-files" "$base/home" > "$base/$run.log" 2>&1 || status=$?
+        wait "$host_pid" || fail "appearance: the test host failed" "$base/$run-host.log"
+        wait
+        rm -rf -- "$runtime"
+        [[ $status -eq 0 ]] || fail "appearance: the file manager exited with status $status" "$base/$run.log"
+    done
+    python3 - "$base/dark.ppm" "$base/light.ppm" "$base/fixed.ppm" <<'PY' || fail "appearance: the file manager did not follow the light and dark scheme" "$base/switch.log"
+import sys
+def at(path, x, y):
+    data = open(path, 'rb').read()
+    header, size, depth, pixels = data.split(b'\n', 3)
+    width, height = map(int, size.split())
+    return tuple(pixels[(y * width + x) * 3:(y * width + x) * 3 + 3])
+# An empty part of the grid and of the sidebar.
+for x, y in ((700, 450), (40, 450)):
+    dark, light, fixed = (at(path, x, y) for path in sys.argv[1:4])
+    assert max(dark) < 90, ("dark", x, y, dark)
+    assert min(light) > 200, ("light", x, y, light)
+    assert fixed == dark, ("MLX_COLOR_SCHEME=dark", x, y, fixed, dark)
+PY
+    echo "ok   appearance: an app turns light when appearance.conf says so, MLX_COLOR_SCHEME fixes the scheme"
 }
 
 # The dock's stack opening in the file manager (mlx-files on the PATH):
@@ -1008,7 +1164,8 @@ SCRIPT
     XDG_RUNTIME_DIR=$runtime "$work/test-host" host-cc "$work/us.xkb" "$work/cc.script" > "$work/cc-host.log" 2>&1 &
     local host_pid=$!
     for _ in $(seq 1 50); do [[ -S "$runtime/host-cc" ]] && break; sleep 0.1; done
-    local bus=(env -i PATH="$work:$PATH" HOME="$work/cc-home" XDG_RUNTIME_DIR="$runtime" XDG_CONFIG_HOME="$work/cc-config" DBUS_SESSION_BUS_ADDRESS="unix:path=$runtime/bus")
+    # No system bus (no mlx-netd): the network tile reads MLX_TOPBAR_NET.
+    local bus=(env -i PATH="$work:$PATH" HOME="$work/cc-home" XDG_RUNTIME_DIR="$runtime" XDG_CONFIG_HOME="$work/cc-config" DBUS_SESSION_BUS_ADDRESS="unix:path=$runtime/bus" DBUS_SYSTEM_BUS_ADDRESS="unix:path=$runtime/no-system-bus")
     "${bus[@]}" "$work/mlx-ipcd" --address "$runtime/bus" > "$work/cc-ipcd.log" 2>&1 &
     local ipcd_pid=$!
     for _ in $(seq 1 50); do [[ -S "$runtime/bus" ]] && break; sleep 0.1; done
@@ -1081,8 +1238,10 @@ drops
 topbar
 topbar_bus
 control_centre
+control_network
 files cpu
 files gpu
+appearance
 zoom cpu
 zoom vulkan
 python3 - "$work/files-cpu/grid.ppm" "$work/files-gpu/grid.ppm" <<'PY' || fail "the file manager drawn on the GPU differs from the one drawn on the CPU" /dev/null

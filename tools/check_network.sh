@@ -66,7 +66,8 @@ inside ip addr add 10.7.0.1/24 dev peer0
 inside ip addr add 10.8.0.1/24 dev peer1
 inside ip link set peer0 up
 inside ip link set peer1 up
-inside python3 "$DHCPD" peer0 --lease 12 > "$W/dhcpd.log" 2>&1 &
+# nsenter itself (no function's subshell) so that $! is the server.
+nsenter -t "$NETWORK" -n python3 "$DHCPD" peer0 --lease 12 > "$W/dhcpd.log" 2>&1 &
 SERVER=$!
 cat > "$W/network.conf" <<CONF
 # The check's links.
@@ -108,7 +109,7 @@ snapshot on
 # A server that refuses the renewal.
 kill "$SERVER"
 sleep 0.3
-inside python3 "$DHCPD" peer0 --lease 12 --refuse-renew > "$W/dhcpd-refusing.log" 2>&1 &
+nsenter -t "$NETWORK" -n python3 "$DHCPD" peer0 --lease 12 --refuse-renew > "$W/dhcpd-refusing.log" 2>&1 &
 SERVER=$!
 sleep 9
 snapshot refused

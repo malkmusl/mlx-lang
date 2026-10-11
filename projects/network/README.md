@@ -135,6 +135,55 @@ with what apps ask to know whether they are online: `state()`,
 `NetworkingEnabled` properties and the `StateChanged(u)` signal (70 when
 a link with a default route is connected).
 
+## On the desktop
+
+The top bar's control centre (`projects/desktop/topbar`, network.mlx)
+asks `mlx-netd` when it opens and every second while it is open: its
+network tile shows what is connected (a cable before Wi-Fi, a network
+being joined), and with a Wi-Fi card it opens the list of networks under
+the tiles, the joined one first, then by signal, each with its bars, a
+lock or a check. A click joins an open or saved network on the spot
+(`Connect` with no passphrase; the row says it is joining, then shows the
+check); one that needs a passphrase, or is not supported, opens
+mlx-settings' Network page on it (`mlx-settings network SSID`).
+
+mlx-settings' Network page (`projects/desktop/settings/network.mlx`)
+shows the links with their addresses, routes and name servers and a
+switch each (`Up`, `Down`), the networks in sight (`Search again`:
+`Scan`), and for the one chosen its passphrase field (masked) and Join,
+or Disconnect and Forget once it is joined. A passphrase refused is said
+on its row and asked again.
+
+Both are checked against `tools/network-test/fakenetd.mlx`, a stand-in
+for `mlx-netd` on a system bus of the check's own (a cable and four Wi-Fi
+networks; it says what it was asked, a passphrase only by its length):
+`tools/check_desktop_clients.sh` joins a network from the control centre,
+`tools/check_wayland_compositor.sh` joins one from the Network page with
+a wrong and then the right passphrase, and forgets it.
+
+## Installing
+
+```sh
+tools/install_network.sh --destdir /tmp/stage --enable   # look first
+sudo tools/install_network.sh                             # install
+sudo tools/install_network.sh --enable                    # and switch over
+```
+
+It builds `mlx-netd` and `mlx-net` into `PREFIX/bin` (`--prefix`,
+default `/usr/local`) and installs `/etc/mlx/network.conf` (an example,
+all commented out; an existing one stays), a systemd unit and an mlx-init
+service for `mlx-netd`, D-Bus's policy for `org.mlx.Network` (root owns
+the names; everyone may read the links and networks and scan; the
+`netdev` group and the user at the console may change them) and
+`/var/lib/mlx/network` (mode 0700, the saved networks). The examples are
+in `examples/`. Nothing is switched over unless `--enable` says so: then
+`mlx-netd.service` is enabled (also as `dbus-org.freedesktop.NetworkManager`)
+and NetworkManager, systemd-networkd and wpa_supplicant are masked, the
+links `systemctl enable` and `systemctl mask` make; `systemctl unmask`
+and `systemctl enable NetworkManager` undo it. `--destdir DIR` stages it
+all under DIR instead (packaging, or a look before installing); without
+it the script has to run as root.
+
 ## mlx-net
 
 ```

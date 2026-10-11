@@ -163,7 +163,8 @@ the next frame.
 | `std.ui.lists` | list and side bar rows (lit, chosen, indent, note, room for an icon), `rowBackground` and `part` (a row the app fills, whose parts have ids of their own), `columnHeader` (a sortable column's title), a fold arrow, a divider |
 | `std.ui.tabs` | a tab bar: tabs with a cross that closes them, a dot for unsaved changes |
 | `std.ui.popup` | a popup's frame (it takes the pointer from what is under it), menu items and separators, tooltips, wrapped text |
-| `std.ui.theme` | colours and sizes: `dark()` (the desktop apps), `light()` |
+| `std.ui.theme` | colours and sizes: `dark()` (the desktop apps), `light()`, `at(lightness)` between them, `mix` |
+| `std.ui.appearance` | the desktop's colour scheme (`appearance.conf`, followed through inotify, gliding when switched): every panel keeps one, `std.ui.host.lightness` gives it |
 | `std.ui.keys` | keys as widgets take them: Linux input codes and modifier bits on every platform |
 | `std.ui.app` | what a platform gives a std.ui app: the events (pointer, buttons, wheel, keys, configured, closed, tick; drags and drops where there are any), `Draw` and `Handler`, and `feed` (a pointer event to the widgets) |
 | `std.ui.host` | the platform itself, one API for all: a Wayland window on Linux, a NativeActivity on Android (see Platforms) |

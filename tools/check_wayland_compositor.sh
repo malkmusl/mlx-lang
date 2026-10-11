@@ -71,6 +71,9 @@
 #      (started by the bus) it mutes the output and turns the volume down;
 #      the nested compositor tells its output in <socket>.display, and the
 #      Display page's night light switch reaches compositor.conf.
+#  14b. mlx-settings' Network page on a system bus with fakenetd
+#      (tools/network-test) as mlx-netd: a Wi-Fi network is joined (a
+#      wrong passphrase refused and asked again) and forgotten.
 #  15. the permission dialog (mlx-permissions, with bwrap): a sandboxed
 #      app records, MLXIPC starts the agent, its dialog opens; Remember and
 #      Allow are clicked: the app records and ipc.conf keeps the rule;
@@ -824,8 +827,8 @@ PY
 echo "ok   three-finger swipes drag the strip and settle, pull workspaces in up and down or sideways, and spring back"
 
 # Scenario 11: mlx-settings (its window at (24, 24); the categories in
-# its sidebar 28 pixels apart from y 44: General, Display, Sound, Apps,
-# Window management, Appearance, Language; on the Window management page the
+# its sidebar 28 pixels apart from y 44: General, Network, Display, Sound,
+# Apps, Window management, Top bar, Appearance, Language; on the Window management page the
 # hotkey rows 34 pixels apart from y 436, on the General page the
 # terminal's at y 186). Maximize gets Super+Shift+M; minimize gets
 # Super+Up (the maximize hotkey: it must reach the window); the terminal
@@ -834,7 +837,7 @@ echo "ok   three-finger swipes drag the strip and settle, pull workspaces in up 
 rm -f "$XDG_CONFIG_HOME/mlx/compositor.conf"
 cat > "$work/hotkeys.script" <<SCRIPT
 wait 2500
-pointer 124 194
+pointer 124 222
 press 272
 release 272
 wait 300
@@ -1117,7 +1120,7 @@ export DBUS_SESSION_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/bus"
 rm -f "$XDG_CONFIG_HOME/mlx/compositor.conf"
 cat > "$work/pages.script" <<SCRIPT
 wait 2500
-pointer 124 138
+pointer 124 166
 press 272
 release 272
 wait 1200
@@ -1133,7 +1136,7 @@ pointer 600 220
 wait 100
 release 272
 wait 600
-pointer 124 110
+pointer 124 138
 press 272
 release 272
 wait 800
@@ -1164,13 +1167,58 @@ grep -q "night light 4000 K" "$work/pages-compositor.log" || { echo "the composi
 rm -f "$XDG_CONFIG_HOME/mlx/compositor.conf"
 echo "ok   mlx-settings' Sound page controls MLX Audio (output off, volume $((volume * 100 / 65536))%); the Display page reads the output and writes night light"
 
+# Scenario 14b: mlx-settings' Network page (the category at y 110) on a
+# system bus of its own (mlx-ipcd --address) with tools/network-test's
+# fakenetd in mlx-netd's place: a cable and a Wi-Fi card that sees four
+# networks (Zuhause at y 354 needs a passphrase). Zuhause is chosen, a
+# wrong passphrase is typed (refused: the field asks again, empty), then
+# the right one (joined), then Forget (at (374, 393)). The passphrase
+# reaches fakenetd only as its length.
+"$compiler" --quiet tools/network-test/fakenetd.mlx -o "$work/fakenetd"
+"$work/mlx-ipcd" --address "$XDG_RUNTIME_DIR/system" > "$work/system-ipc.log" 2>&1 &
+system_pid=$!
+for _ in $(seq 1 50); do [[ -S "$XDG_RUNTIME_DIR/system" ]] && break; sleep 0.1; done
+export DBUS_SYSTEM_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/system"
+"$work/fakenetd" > "$work/fakenetd.log" 2>&1 &
+netd_pid=$!
+for _ in $(seq 1 50); do grep -q "^fakenetd: ready" "$work/fakenetd.log" && break; sleep 0.1; done
+cat > "$work/network.script" <<SCRIPT
+wait 2500
+pointer 124 110
+press 272
+release 272
+wait 1500
+pointer 400 354
+press 272
+release 272
+wait 800
+type wrong words
+enter
+wait 2000
+type correct horse battery
+enter
+wait 2500
+pointer 374 393
+press 272
+release 272
+wait 1500
+close
+SCRIPT
+run_scenario network "$work/network.script" --no-fps --run "$work/mlx-settings"
+kill "$netd_pid" "$system_pid" 2> /dev/null || true
+unset DBUS_SYSTEM_BUS_ADDRESS
+expected=$(printf 'fakenetd: ready\nconnect Zuhause (11 bytes)\nrefused Zuhause\nconnect Zuhause (21 bytes)\njoined Zuhause\nforget Zuhause')
+[[ "$(cat "$work/fakenetd.log")" == "$expected" ]] || { echo "mlx-settings' Network page did not join and forget Zuhause as asked" >&2; cat "$work/fakenetd.log" "$work/network-compositor.log" >&2; exit 1; }
+! grep -q "correct horse" "$work/fakenetd.log" "$work/network-compositor.log" || { echo "the passphrase was written out" >&2; exit 1; }
+echo "ok   mlx-settings' Network page joins a Wi-Fi network (a wrong passphrase is refused and asked again) and forgets it"
+
 # Scenario 15: the permission dialog (projects/desktop/permissions). A
 # sandboxed app (bwrap with a .flatpak-info) records; MLXIPC has to ask
 # (audio.record), starts mlx-permissions from its service file, and its
 # dialog opens on the compositor (at (24, 24); the question takes two
 # lines: "Remember this decision" at y 153, Allow at (422, 198)). Both are
 # clicked: the app records and ipc.conf keeps the answer. Then
-# mlx-settings' Apps page (the category at y 166) lists the app's
+# mlx-settings' Apps page (the category at y 194) lists the app's
 # microphone as allowed; Deny (at (662, 208)) is clicked: ipc.conf says
 # so.
 if command -v bwrap > /dev/null && bwrap --bind / / true 2> /dev/null; then
@@ -1214,7 +1262,7 @@ SCRIPT
     echo "ok   the permission dialog asks the user; Allow with Remember lets the app record and becomes a rule"
     cat > "$work/apps.script" <<SCRIPT
 wait 2500
-pointer 124 166
+pointer 124 194
 press 272
 release 272
 wait 1000

@@ -269,7 +269,7 @@ GPU.
 | Widget | Shows | Does |
 | --- | --- | --- |
 | Clock | the date and time | a calendar: today in its header (its button goes back to today's month), the month with ISO week numbers and today lit; the arrows or the wheel turn the month |
-| Control centre | toggles; a dot while notifications are unread, a moon while Do Not Disturb is on | the control centre: tiles for the network (what is connected, `/sys/class/net`), Do Not Disturb, night light, dark mode, locking the screen and a screenshot; the volume; what plays (previous, play or pause, next); the notifications, newest first, each with its close button, and Clear all. Its button opens mlx-settings |
+| Control centre | toggles; a dot while notifications are unread, a moon while Do Not Disturb is on | the control centre: tiles for the network (what is connected, from mlx-netd on the system bus, else `/sys/class/net`; with a Wi-Fi card it opens the networks in sight, a click joins one or opens mlx-settings' Network page), Do Not Disturb, night light, dark mode, locking the screen and a screenshot; the volume; what plays (previous, play or pause, next); the notifications, newest first, each with its close button, and Clear all. Its button opens mlx-settings |
 | Battery | the charge of the batteries in `/sys/class/power_supply` (not a mouse's or a headset's), red under 15 %, a bolt while it charges | a popup: charging, full or on battery, and the time to full or to empty |
 | Volume | MLX Audio's output: a speaker with one to three waves, crossed out when muted | the wheel turns it by 5 %, a middle click mutes; the popup has the output's volume (the speaker mutes), the outputs to choose (automatic or a sound card), and the apps MLX Audio knows as a grid of their icons, each with its own slider (a click on the icon mutes the app, the wheel turns it; a dot over the ones playing); its button opens mlx-settings' Sound page |
 | Tray | the StatusNotifierItems (the icons Qt, GTK's libappindicator, Electron and others show): `IconPixmap`, else `IconName` from the icon themes, else the title's first letter; a red dot when one needs attention | a left click is `Activate`, a middle click `SecondaryActivate`, a right click the item's menu (`com.canonical.dbusmenu`, as the bar's own popup) or `ContextMenu` |
@@ -322,10 +322,16 @@ first) and says `Changed()` whenever that changes; the bar calls
 
 ### Light and dark
 
-The desktop is dark or light as one: the top bar, its popups and the
-notification bubbles take their colours from
-[`desktop-shared/palette.mlx`](../shared/palette.mlx) and glide from one
-look to the other. The look is `color-scheme` of
+The desktop is dark or light as one, every app of it: the top bar, its
+popups and the notification bubbles, the dock, the launcher and their
+menus take their colours from
+[`desktop-shared/palette.mlx`](../shared/palette.mlx); mlx-settings,
+mlx-files, mlx-terminal, MLX Observatory (its map stays dark space), the
+permission dialog and the screen-sharing picker from `std.ui.theme.at`.
+All of them glide from one look to the other in 300 ms when it is
+switched (std.ui.appearance follows `appearance.conf` through inotify in
+every window and panel of std.ui.wayland.panel; `std.ui.host.lightness`
+gives an app how light to draw). The look is `color-scheme` of
 `org.freedesktop.appearance`, kept by the portal (`mlx-capture --portal`,
 [`appearance.mlx`](../capture/appearance.mlx)) on MLXIPC as
 `org.freedesktop.portal.Settings` (version 2: `ReadAll`, `ReadOne`,
@@ -335,6 +341,9 @@ as on any desktop. The control centre's tile changes it with
 light) on the same object; the portal keeps it in
 `~/.config/mlx/appearance.conf` (`color-scheme = dark`, `light` or
 `default`; dark without it) and tells everyone with `SettingChanged`.
+mlx-settings' Appearance page switches it too (Dark, Light). Without the
+portal the page writes the file itself; `MLX_COLOR_SCHEME=light` (or
+`dark`) in an app's environment fixes its look.
 
 The bar finds these on the session bus (`DBUS_SESSION_BUS_ADDRESS`, as
 MLXIPC gives the session) without waiting on it: it is the

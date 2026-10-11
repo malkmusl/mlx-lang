@@ -62,6 +62,10 @@ crash. `timezone.mlx` (`std.timezone`) gives local time from `$TZ` or
 `/etc/localtime` (TZif files and POSIX rules) and the civil calendar. See
 `docs/reference/stdlib.md`.
 
+`ui/appearance.mlx` (`std.ui.appearance`) follows the desktop's colour
+scheme (`~/.config/mlx/appearance.conf`) for every window and panel, and
+`ui/theme.mlx`'s `at` gives the look for it, gliding when it is switched.
+
 `ui.mlx` (`std.ui`) lays out rectangles; `ui/canvas.mlx`, `ui/text.mlx`,
 `ui/gpu_canvas.mlx` and `ui/gpu_upload.mlx` draw on the CPU or the GPU;
 `ui/view.mlx` with `ui/controls.mlx`, `ui/field.mlx`, `ui/scroll.mlx`,
