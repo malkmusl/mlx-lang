@@ -43,6 +43,8 @@ tools/install_compositor_session.sh --destdir "$work/root" --restore-sound-serve
 [[ ! -e "$work/root/etc/alsa/conf.d/99-zz-mlx-audio.conf" && ! -e "$work/root/etc/pulse/client.conf.d/50-mlx-audio.conf" ]] || { echo "--restore-sound-servers left the settings" >&2; cat "$work/restore.log" >&2; exit 1; }
 files_entry="$work/root/usr/local/share/applications/org.mlx.files.desktop"
 grep -qx "Exec=/usr/local/bin/mlx-files %U" "$files_entry" && [[ -f "$work/root/usr/local/share/icons/hicolor/128x128/apps/org.mlx.files.png" ]] || { echo "the file manager's entry or icon is missing" >&2; exit 1; }
+settings_entry="$work/root/usr/local/share/applications/mlx-settings.desktop"
+grep -qx "Icon=org.mlx.settings" "$settings_entry" && grep -qx "StartupWMClass=org.mlx.settings" "$settings_entry" && [[ -f "$work/root/usr/local/share/icons/hicolor/128x128/apps/org.mlx.settings.png" ]] || { echo "the settings' entry or icon is missing" >&2; exit 1; }
 observatory_entry="$work/root/usr/local/share/applications/org.mlx.observatory.desktop"
 grep -qx "Exec=/usr/local/bin/mlx-observatory $repo_root" "$observatory_entry" && [[ -f "$work/root/usr/local/share/icons/hicolor/128x128/apps/org.mlx.observatory.png" ]] || { echo "MLX Observatory's entry or icon is missing" >&2; exit 1; }
 echo "ok   staged install: programs in PREFIX/bin, MLX Audio's libraries in PREFIX/lib/mlx-audio, session entry in wayland-sessions; the sound servers replaced and restored"

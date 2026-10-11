@@ -35,6 +35,7 @@
 #                                     lists them; MLX Observatory shows this
 #                                     repository)
 #   PREFIX/share/icons/hicolor/128x128/apps/org.mlx.files.png,
+#                                     org.mlx.settings.png,
 #                                     org.mlx.observatory.png
 #   PREFIX/lib/mlx-audio/libpulse.so.0, libpulse-simple.so.0,
 #                                     libpulse-mainloop-glib.so.0,
@@ -286,7 +287,7 @@ if [[ $uninstall -eq 1 ]]; then
     path="$destdir$capture_libs/libpipewire-0.3.so.0"
     [[ -e "$path" ]] && as_owner "$path" rm -f -- "$path" && echo "removed $path"
     [[ -d "$destdir$capture_libs" ]] && as_owner "$destdir$capture_libs" rmdir --ignore-fail-on-non-empty -- "$destdir$capture_libs"
-    for path in "$destdir$applications/mlx-settings.desktop" "$destdir$applications/org.mlx.files.desktop" "$destdir$applications/org.mlx.observatory.desktop" "$destdir$icons/org.mlx.files.png" "$destdir$icons/org.mlx.observatory.png" "$destdir$services/org.mlx.Audio.service" "$destdir$services/org.mlx.PermissionAgent.service" "$destdir$services/org.freedesktop.portal.Desktop.service" "$destdir$services/org.freedesktop.Notifications.service"; do
+    for path in "$destdir$applications/mlx-settings.desktop" "$destdir$applications/org.mlx.files.desktop" "$destdir$applications/org.mlx.observatory.desktop" "$destdir$icons/org.mlx.files.png" "$destdir$icons/org.mlx.settings.png" "$destdir$icons/org.mlx.observatory.png" "$destdir$services/org.mlx.Audio.service" "$destdir$services/org.mlx.PermissionAgent.service" "$destdir$services/org.freedesktop.portal.Desktop.service" "$destdir$services/org.freedesktop.Notifications.service"; do
         [[ -e "$path" ]] && as_owner "$path" rm -f -- "$path" && echo "removed $path"
     done
     exit 0
@@ -345,7 +346,7 @@ as_owner "$destdir$sessions" install -m 644 "$build/mlx-compositor.desktop" "$de
 as_owner "$destdir$applications" install -d "$destdir$applications"
 as_owner "$destdir$applications" install -m 644 "$build/mlx-settings.desktop" "$build/org.mlx.files.desktop" "$build/org.mlx.observatory.desktop" "$destdir$applications/"
 as_owner "$destdir$icons" install -d "$destdir$icons"
-as_owner "$destdir$icons" install -m 644 projects/desktop/files/org.mlx.files.png projects/observatory/org.mlx.observatory.png "$destdir$icons/"
+as_owner "$destdir$icons" install -m 644 projects/desktop/files/org.mlx.files.png projects/desktop/settings/org.mlx.settings.png projects/observatory/org.mlx.observatory.png "$destdir$icons/"
 as_owner "$destdir$services" install -d "$destdir$services"
 as_owner "$destdir$services" install -m 644 "$build/org.mlx.Audio.service" "$build/org.mlx.PermissionAgent.service" "$build/org.freedesktop.portal.Desktop.service" "$build/org.freedesktop.Notifications.service" "$destdir$services/"
 as_owner "$destdir$audio_libs" install -d "$destdir$audio_libs"
