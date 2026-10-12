@@ -428,6 +428,22 @@ calls_methods_on_pointers() {
     return $ok
 }
 
+# Whether $1 resolves a struct's own name inside its body
+# (tests/334_aggregate_own_name_runtime.mlx exits 13); older compilers
+# stopped at "declaration type could not be resolved".
+names_aggregates_in_their_bodies() {
+    local probe
+    probe=$(mktemp -d mlx-out/probe.XXXXXX)
+    local ok=1
+    if "$1" --quiet tests/334_aggregate_own_name_runtime.mlx -o "$probe/probe" > /dev/null 2>&1; then
+        local status=0
+        "$probe/probe" > /dev/null 2>&1 || status=$?
+        [[ $status -eq 13 ]] && ok=0
+    fi
+    rm -rf -- "$probe"
+    return $ok
+}
+
 # Whether $1 rejects @ptrFromInt and @ptrCast outside unsafe (MLX-E7004,
 # tests/14_unsafe_ptr_builtin.mlx); older compilers took them anywhere.
 enforces_unsafe() {
@@ -561,6 +577,7 @@ probes=(
     "tests_equality_chains|conditions as jumps, equality chains as bit masks"
     "explains_call_mistakes|calls with the wrong argument count named (MLX-E4001)"
     "calls_methods_on_pointers|methods called on pointers and on addressable values"
+    "names_aggregates_in_their_bodies|a struct named inside its own body"
     "holds_large_programs|an arena with room for the largest programs"
     "writes_depfiles|--depfile"
     "runs_build|the build command (mlx build)"

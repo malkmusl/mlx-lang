@@ -126,7 +126,9 @@ pub fn main() u8 {
 ## Methods
 
 A struct can declare functions in its body. `Self` refers to the enclosing
-type. A method that takes `self` (by value or by pointer, `self: Self` /
+type, and so does the name its `const` gives it, for a field pointing to
+another of its kind too (`const Node = struct { next: ?*Node }`;
+`tests/334_aggregate_own_name_runtime.mlx`). A method that takes `self` (by value or by pointer, `self: Self` /
 `self: *Self`) is called on an instance with `.`; a function that doesn't
 take `self` is called on the type itself, like an associated/"static"
 function:
