@@ -250,28 +250,29 @@ each group are joined by magenta lines in space.
   first (amber). Each place is one more reason to add the feature
   ([`tools/codemap/workarounds.mlx`](../../tools/codemap/workarounds.mlx)):
 
-  | pattern | missing |
+  | pattern | missing, or what does it now |
   |---|---|
-  | `@ptrFromInt(... @intFromPtr(...) ...)` | pointer offsets (`p + n`), slicing a many-pointer |
-  | `@ptrCast([*]T, &array)` | `*[N]T` coercing to `[*]T` |
-  | `var x: T = undefined` then `unsafe { x = ... }` | unsafe expressions |
-  | `const ignored = call(...)`, never read | `_ = value` |
+  | `@ptrFromInt(... @intFromPtr(...) ...)` | now `p + n` on a `[*]T` (a struct pointer still goes through integers) |
+  | `@ptrCast([*]T, &array)` | now `&array` converts to `[*]T` (a struct's bytes still take the cast) |
+  | `var x: T = undefined` then `unsafe { x = ... }` | now `const x: T = unsafe { ... }` |
+  | `const ignored = call(...)`, never read | now `_ = value` |
   | `for byte in text { length += 1 }` | a slice's length in the bootstrap library |
   | `aggregates.mark`/`reset`, `turns` | freeing struct literals and structs returned by value |
-  | float literals with 12 decimals and more | folding float arithmetic right |
-  | `sqrt`, `sin`, `exp`, ... written in Mlx | math builtins |
+  | float literals with 12 decimals and more | now float literals fold, and `std.math` has pi and the like |
+  | `sqrt`, `sin`, `exp`, ... written in Mlx | now `std.math`, `@sqrt`, `@floor`, `@ceil`, `@trunc` |
   | comments: workaround, miscompilation, "does not yet", TODO, FIXME, HACK | what the comment names |
 
-  Two kinds can be rewritten away, now that the compiler does without
+  Three kinds can be rewritten away, now that the compiler does without
   them: dropped results (`const ignored = call(...)` becomes `_ =
-  call(...)`) and counted lengths (`for byte in text { length += 1 }`
-  becomes `length += text.length`)
+  call(...)`), counted lengths (`for byte in text { length += 1 }`
+  becomes `length += text.length`) and values set in unsafe (`var x: T =
+  undefined` with `unsafe { x = v }` becomes `const x: T = unsafe { v }`)
   ([`tools/codemap/rewrite.mlx`](../../tools/codemap/rewrite.mlx)). In the
   panel, *Rewrite ...* under the kind shows each line before and after;
   *Apply* writes them and reads the code again. It can only when the
   compiler (`$MLX_COMPILER`, else `mlx-out/bin/compiler/mlx4`, else
   `mlx4`) builds a program with what they need. On the command line:
-  `mlx-codemap rewrite dropped|counted [PATH] [--apply]`. Files under `compiler/`,
+  `mlx-codemap rewrite dropped|counted|unsafe [PATH] [--apply]`. Files under `compiler/`,
   `std/bootstrap/` (the bootstrap compiler builds them) and `tests/` are
   left as they are.
 

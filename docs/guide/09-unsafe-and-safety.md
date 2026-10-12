@@ -4,7 +4,8 @@
 `18_invalid_pointer_alignment.mlx`, `211_byte_mask_64_runtime.mlx`,
 `225_runtime_bounds_safety.mlx`, `226_runtime_bounds_in_range.mlx`,
 `227_runtime_slice_index_safety.mlx`, `228_runtime_slice_range_safety.mlx`,
-`231_optional_pointer_unwrap_safety.mlx`, `232_optional_pointer_unwrap_valid.mlx`
+`231_optional_pointer_unwrap_safety.mlx`, `232_optional_pointer_unwrap_valid.mlx`,
+`327_unsafe_expression_runtime.mlx`
 
 ## The `unsafe {}` boundary
 
@@ -34,6 +35,29 @@ pub fn main() usize {
 ```
 
 (`tests/17_unsafe_ptr_roundtrip.mlx`)
+
+Where a value is wanted, `unsafe { expression }` is that expression with
+unsafe operations allowed in it, and its value is the expression's, as the
+branches of an if-expression are. The permission covers that expression
+only, so a value made by an unsafe operation is declared where it is
+made:
+
+```mlx
+const Pair = struct { low: u32, high: u32 }
+
+pub fn main() -> u8 {
+    var word: u64 = 4294967298
+    const pair: *Pair = unsafe { @ptrCast(*Pair, &word) }
+    if pair.*.low != 2 || pair.*.high != 1 { return 1 }
+    const address = unsafe { @intFromPtr(&word) }
+    const back: *u64 = unsafe { @ptrFromInt(*u64, address) }
+    if back.* != 4294967298 { return 4 }
+    return 13
+}
+```
+
+(`tests/327_unsafe_expression_runtime.mlx`; a statement that begins with
+`unsafe` is the block form.)
 
 An invalid alignment value (not a power of two) is rejected even inside
 `unsafe {}` — the unsafe boundary opts into raw-pointer construction, not

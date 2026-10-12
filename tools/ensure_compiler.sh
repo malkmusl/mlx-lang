@@ -403,6 +403,21 @@ reports_unknown_names() {
     grep -q "MLX-E3001: unknown name" <<< "$output"
 }
 
+# Whether $1 takes `unsafe { expression }` where a value is wanted
+# (tests/327_unsafe_expression_runtime.mlx exits 13).
+has_unsafe_expressions() {
+    local probe
+    probe=$(mktemp -d mlx-out/probe.XXXXXX)
+    local ok=1
+    if "$1" --quiet tests/327_unsafe_expression_runtime.mlx -o "$probe/probe" > /dev/null 2>&1; then
+        local status=0
+        "$probe/probe" > /dev/null 2>&1 || status=$?
+        [[ $status -eq 13 ]] && ok=0
+    fi
+    rm -rf -- "$probe"
+    return $ok
+}
+
 # Whether $1 writes the files it read with --depfile (what `mlx build`
 # decides rebuilds by).
 writes_depfiles() {
@@ -455,6 +470,7 @@ probes=(
     "returns_wide_error_payloads|error union payloads of several words"
     "rounds_floats|@floor, @ceil and @trunc"
     "reports_unknown_names|unknown names reported (MLX-E3001)"
+    "has_unsafe_expressions|unsafe { expression }"
     "writes_depfiles|--depfile"
     "runs_build|the build command (mlx build)"
 )
