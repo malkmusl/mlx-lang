@@ -1126,6 +1126,9 @@ Neither surface has a runtime fixture: no file under `tests/` contains a
 `fn main() -> u8` return-code convention shown throughout this chapter (and
 `tests/run_error.sh` for compile-error fixtures, per
 [`docs/guide/README.md`](../guide/README.md)), not the `test` declaration or
-a `std.testing` module. This chapter does not describe an `expect*` API
+a `std.testing` module. Some library checks compare an Mlx program
+with a system reference instead: `tools/check_crypt.sh` feeds settings
+to `tests/support/crypt_hashes.mlx` and compares its hashes with
+crypt(3)'s. This chapter does not describe an `expect*` API
 surface beyond the four names `testing.xml` gives, since none of them is
 grounded in source or a runtime fixture.

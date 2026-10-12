@@ -132,6 +132,10 @@ fn overflowBanks(i0: u8, i1: u8, i2: u8, i3: u8, i4: u8, i5: u8, i6: u8, f0: f64
 
 (`tests/178_float_cast_abi_runtime.mlx`)
 
+`tests/312_float_arguments_runtime.mlx` mixes integer and float parameters
+past the sixth integer register, and takes `@intFromFloat(T, value)`
+without a declared result type.
+
 Normal-return floating values use `xmm0` (and `xmm1` for a second
 eightbyte), per `<NormalReturn><Floating first="xmm0" second="xmm1"/>`.
 

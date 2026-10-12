@@ -244,4 +244,12 @@ the CPU, and taps a switch row and a segment and drags over a row.
 `tests/264_ui_layout_runtime.mlx` covers the geometry, every alignment
 (including children that do not fit), bands, containers, stacks, a screen
 with safe insets and reserved top and bottom bars, and `fillRect`'s
-blending and clipping.
+blending and clipping. The Files app's parts have their own:
+`tests/288_filemanager_responsive_ui_runtime.mlx` holds its one layout
+for Wayland and Android to its breakpoints (a sidebar or rail on wide
+screens, a drawer on compact ones, Search and the sidebar toggle always
+reachable, density scaling sizes but not the breakpoint);
+`tests/289_canvas_mobile_buffer_runtime.mlx` draws into a padded
+RGBA_8888 buffer at its row stride, swapping red and blue only there and
+never writing the padding; `tests/285_filemanager_trash_runtime.mlx`
+makes the trash's folders under `XDG_DATA_HOME`.

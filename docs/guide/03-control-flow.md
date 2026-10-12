@@ -48,6 +48,10 @@ pub fn main() u8 {
 
 (`tests/51_if_expression_runtime.mlx` → 4)
 
+When the first branch is a bare literal, the if-expression has the other
+branch's type: `if c { 1 } else { size }` is a `usize`, so comparing it
+is unsigned (`tests/299_if_expression_type_runtime.mlx`).
+
 A non-`bool` condition (e.g. a bare integer) is rejected at compile time
 (`tests/48_non_bool_condition.mlx`).
 

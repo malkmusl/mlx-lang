@@ -557,7 +557,8 @@ comptime evaluator holds no value for (a float, a struct, array or tuple
 literal, slices in it) lowers to its initializer where it is used, in its
 own module and with bindings of its own, so a local of the using function
 does not stand in for a name of the constant's module
-(`lowerConstantInitializer`, `tests/310_module_constants_runtime.mlx`).
+(`lowerConstantInitializer`, `tests/310_module_constants_runtime.mlx`
+reading `tests/modules/310_constants.mlx`).
 `pair.1` has the tuple part's type, so a local made from it takes all its
 words (`tests/311_wide_tuple_runtime.mlx`). In a type position `[N]T` never
 starts a literal, so `[2][3]u16{ [3]u16{ ... }, ... }` is one literal of
