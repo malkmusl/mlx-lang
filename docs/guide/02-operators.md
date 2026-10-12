@@ -181,6 +181,17 @@ pointer), a returned value, a structure field, and the other operand of
 arithmetic or a comparison with an `f32`
 (`tests/267_f32_literal_runtime.mlx`).
 
+A float literal is the `f64` nearest to its decimal value, a tie going to
+the even one, as `strtod` reads it: `1.7976931348623157e308` is the
+largest `f64`, `5e-324` the smallest above zero, and digits past the
+seventeenth still decide where the value rounds. The compiler works the
+value out exactly: one rounded multiplication or division when the digits
+and the power of ten are both exact in an `f64`, else with big integers.
+`@floatFromInt` and `@intFromFloat` take a `u64` (or `usize`) as one from
+2^63 on too: the largest `u64` becomes `18446744073709551616.0`, and
+`@intFromFloat(u64, x)` of an `x` from 2^63 on keeps its value
+(`tests/317_float_large_runtime.mlx`, on x86_64 and AArch64).
+
 ## Bit-counting
 
 `@popCount(value)` counts the set bits in an integer, signed or unsigned:
