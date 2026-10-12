@@ -9,12 +9,20 @@
 // request), the splash steps aside, showing the console, and comes back
 // once it is answered: the splash itself never asks for one. Asked over the
 // protocol, it answers NAK.
+//
+// A card can go away under it (simpledrm, the firmware's framebuffer as a
+// card, is replaced when the GPU's driver loads): the splash then looks
+// for a card again every second. A plymouthd started from the initramfs
+// is asked to quit, leaving its picture, and the splash takes over. When
+// the system goes down, its argv[0] starts with "@", which systemd's
+// last killing spree spares, as it spares plymouthd.
 const std = @import("std")
 const png = @import("std.png")
 const paint = @import("./paint.mlx")
 const scene_module = @import("./scene.mlx")
 const state = @import("./state.mlx")
 const output_module = @import("./output.mlx")
+const kms_module = @import("../compositor/kms.mlx")
 const protocol = @import("./protocol.mlx")
 const options_module = @import("./options.mlx")
 const system = @import("./system.mlx")
@@ -56,11 +64,15 @@ const Daemon = struct {
     retain: bool
     // Clients waiting for quit's answer.
     quitWaiting: [16]bool
+    // The card went away; when to look for one again.
+    lost: bool
+    nextProbe: f64
 }
 
 fn now(daemon: *Daemon) -> f64 { return system.seconds() - daemon.*.started }
 
-pub fn run(options: *const Options, environment: [*][*]const u8) -> u8 {
+pub fn run(options: *const Options, arguments: [][*]const u8) -> u8 {
+    const environment = std.process.environmentEntries(arguments)
     const allocator = std.page_allocator.init()
     const daemon_memory = allocator.alloc(@sizeOf(Daemon), 16)
     const scene_memory = allocator.alloc(@sizeOf(Scene), 16)
@@ -85,6 +97,8 @@ pub fn run(options: *const Options, environment: [*][*]const u8) -> u8 {
     daemon.*.lastFrame = -1.0
     daemon.*.nextAskCheck = 0.0
     daemon.*.interval = 1.0 / paint.toFloat(options.*.fps)
+    daemon.*.lost = false
+    daemon.*.nextProbe = 0.0
     var index: usize = 0
     while index < protocol.MAX_CLIENTS {
         daemon.*.quitWaiting[index] = false
@@ -95,8 +109,14 @@ pub fn run(options: *const Options, environment: [*][*]const u8) -> u8 {
     // is not wanted.
     protocol.init(&daemon.*.server)
     if !protocol.listen(&daemon.*.server, options.*.socketName) {
-        system.sayAbout("the splash socket is taken: @", options.*.socketName)
-        return 1
+        if !takeOver(options.*.socketName) || !protocol.listen(&daemon.*.server, options.*.socketName) {
+            system.sayAbout("the splash socket is taken: @", options.*.socketName)
+            return 1
+        }
+    }
+    if options.*.mode != state.Mode.boot && arguments.length > 0 {
+        // Spared by systemd-shutdown's killing of what is left.
+        unsafe { @ptrFromInt([*]u8, @intFromPtr(arguments[0]))[0] = 64 }
     }
     output_module.init(&daemon.*.output, allocator)
     openOutput(daemon)
@@ -117,6 +137,35 @@ pub fn run(options: *const Options, environment: [*][*]const u8) -> u8 {
     while !daemon.*.quitting { step(daemon) }
     finish(daemon)
     return 0
+}
+
+// plymouthd (from the initramfs) holds the socket: it is asked to quit
+// leaving its picture on the screen, as a display manager would, and the
+// socket is free once it has. Anything else holding it is left alone.
+fn takeOver(name: []const u8) -> bool {
+    const descriptor = system.connectAbstract(name)
+    if descriptor < 0 { return false }
+    var holder: [32]u8 = undefined
+    const length = system.peerName(descriptor, &holder)
+    var holder_name: []const u8 = undefined
+    unsafe { holder_name = @ptrCast([*]const u8, &holder)[0..length] }
+    if !std.text.same(holder_name, "plymouthd") {
+        system.close(descriptor)
+        return false
+    }
+    system.say("taking over from plymouthd")
+    const reply = protocol.ask(descriptor, 81, "\x01")
+    system.close(descriptor)
+    if reply != protocol.ACK { return false }
+    var tries: usize = 0
+    while tries < 50 {
+        const still = system.connectAbstract(name)
+        if still < 0 { return true }
+        system.close(still)
+        system.sleepMilliseconds(100)
+        tries += 1
+    }
+    return false
 }
 
 // The screen: the card or framebuffer asked for, else the first that
@@ -151,6 +200,7 @@ fn step(daemon: *Daemon) -> void {
     const output = &daemon.*.output
     const time = now(daemon)
     if scene.*.mode == state.Mode.boot { scene_module.setProgress(scene, bootProgress(daemon, time)) }
+    if daemon.*.lost && time >= daemon.*.nextProbe { findCardAgain(daemon, time) }
     if time >= daemon.*.nextAskCheck {
         checkPrompts(daemon)
         daemon.*.nextAskCheck = time + 0.5
@@ -176,6 +226,62 @@ fn drawFrame(daemon: *Daemon, time: f64) -> void {
     const shown = output_module.show(&daemon.*.output, daemon.*.scene)
     daemon.*.frameCost = system.seconds() - begun
     daemon.*.lastFrame = time
+    if !shown { cardFailed(daemon, time) }
+}
+
+// A frame the card would not show: gone (ENODEV: its driver replaced) or
+// taken by another program (EACCES: no longer DRM master, as if
+// deactivated).
+fn cardFailed(daemon: *Daemon, time: f64) -> void {
+    const output = &daemon.*.output
+    if output.*.kind != output_module.Kind.kms { return }
+    const failure = kms_module.lastError(&output.*.card)
+    if failure == 13 {
+        output_module.deactivate(output)
+        return
+    }
+    if failure != 19 { return }
+    system.say("the card went away; looking for another")
+    output_module.close(output, false)
+    daemon.*.lost = true
+    daemon.*.drawing = daemon.*.options.*.hasSnapshot
+    daemon.*.nextProbe = time + 1.0
+}
+
+// Another card (the GPU's driver's, after simpledrm's went): the picture
+// made again at its size when that differs, with what it said.
+fn findCardAgain(daemon: *Daemon, time: f64) -> void {
+    daemon.*.nextProbe = time + 1.0
+    const output = &daemon.*.output
+    if daemon.*.options.*.cardDescriptor >= 0 || !output_module.findCard(output) { return }
+    daemon.*.lost = false
+    daemon.*.drawing = true
+    daemon.*.lastFrame = -1.0
+    const scene = daemon.*.scene
+    if output.*.width != scene.*.width || output.*.height != scene.*.height {
+        var status: [200]u8 = scene.*.status
+        var message: [200]u8 = scene.*.message
+        const status_length = scene.*.statusLength
+        const message_length = scene.*.messageLength
+        const progress = scene.*.progress
+        const show_progress = scene.*.showProgress
+        // The old picture's memory is not given back: this happens once a
+        // boot at most.
+        if !scene_module.init(scene, output.*.width, output.*.height, scene.*.mode, scene.*.allocator) {
+            system.say("out of memory for the picture at the new card's size")
+            output_module.close(output, false)
+            daemon.*.drawing = false
+            return
+        }
+        scene.*.status = status
+        scene.*.message = message
+        scene.*.statusLength = status_length
+        scene.*.messageLength = message_length
+        scene.*.progress = progress
+        scene.*.shownProgress = progress
+        scene.*.showProgress = show_progress
+    }
+    system.say("showing on the new card")
 }
 
 // Waits up to `timeout` milliseconds for a signal, a connection, a request

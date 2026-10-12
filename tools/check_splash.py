@@ -15,7 +15,11 @@
   coming back, deactivate and reactivate (DRM master given away and taken
   back, no flips in between), quit restoring the console, and quit
   --retain-splash leaving the last frame on the CRTC (DRM_IOCTL_MODE_CLOSEFB)
-  with the console not put back.
+  with the console not put back, and the card going away under it (the
+  splash says so and goes on answering; given a card's descriptor it
+  looks for no other);
+- a plymouthd holding the socket (a process of that name) asked to quit
+  retaining its picture, and the splash taking over.
 
 Usage: check_splash.py MLX_SPLASH MLX_SPLASHCTL WORKDIR
 """
@@ -185,6 +189,48 @@ class Harness:
         self.recorder.add(*call)
 
 
+def fake_plymouthd(name):
+    """A process called plymouthd on the socket, answering one request
+    (quit, as mlx-splash should send it) and ending."""
+    script = (
+        "import ctypes, socket, sys\n"
+        "ctypes.CDLL(None).prctl(15, b'plymouthd', 0, 0, 0)\n"
+        "s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\n"
+        "s.bind('\\0' + sys.argv[1]); s.listen(4)\n"
+        "print('listening', flush=True)\n"
+        "while True:\n"
+        "    c, _ = s.accept()\n"
+        "    data = c.recv(64)\n"
+        "    if not data:\n"
+        "        c.close(); continue\n"
+        "    print(data.hex(), flush=True)\n"
+        "    c.sendall(b'\\x06'); c.close()\n"
+        "    if data[:1] == b'Q':\n"
+        "        break\n"
+    )
+    return subprocess.Popen([sys.executable, "-c", script, name], stdout=subprocess.PIPE, text=True)
+
+
+def take_over():
+    name = f"/mlx-splash-plymouthd-{os.getpid()}"
+    holder = fake_plymouthd(name)
+    if holder.stdout.readline().strip() != "listening":
+        fail("the stand-in plymouthd did not start")
+    splash = start(name, "takeover", ["--output", "none"])
+    asked = holder.stdout.readline().strip()
+    if asked != "51020201" + "00":
+        fail(f"plymouthd was asked {asked!r}, not quit --retain-splash")
+    holder.wait(timeout=5)
+    wait_socket(name, splash)
+    if request(name, b"P") != ACK:
+        fail("the splash did not answer after taking over")
+    if ctl(name, "quit").returncode != 0 or splash.wait(timeout=10) != 0:
+        fail("the splash did not quit after taking over")
+    if "taking over from plymouthd" not in open(splash.log_path).read():
+        fail("the splash did not say it took over")
+    ok("plymouthd on the socket: asked to quit retaining its picture, the splash takes over")
+
+
 class SplashCard(fake.FakeCard):
     """The fake card with DRM_IOCTL_MODE_CLOSEFB (Linux 6.8): the
     framebuffer is the program's no more but stays on the CRTC."""
@@ -192,8 +238,13 @@ class SplashCard(fake.FakeCard):
     def __init__(self, harness):
         super().__init__(harness)
         self.retained = None
+        self.gone = False
 
     def ioctl(self, request, argument):
+        if self.gone:
+            # Unplugged (simpledrm when the GPU's driver takes over).
+            self.harness.record("drm", "gone", request)
+            return -19, argument, None
         if request == CLOSEFB:
             if len(argument) != 8:
                 fail(f"CLOSEFB with {len(argument)} argument bytes")
@@ -250,6 +301,34 @@ def look(frame, pitch, width, height):
     if lavender < 60:
         fail(f"only {lavender} lavender pixels where the letters are")
     return lavender
+
+
+def card_gone():
+    harness = Harness()
+    card = SplashCard(harness)
+    name = f"/mlx-splash-gone-{os.getpid()}"
+    descriptor = card.take()
+    splash = start(name, "gone", ["--card-fd", str(descriptor)], pass_fds=(descriptor,))
+    os.close(descriptor)
+    harness.memory = fake.Memory(splash.pid)
+    card.start()
+    harness.recorder.wait(lambda c: c[:2] == ("drm", "page_flip"), 10, "page flips")
+    card.gone = True
+    deadline = time.time() + 5
+    while "the card went away" not in open(splash.log_path).read():
+        if time.time() > deadline or splash.poll() is not None:
+            fail(f"the splash did not notice the card going: {open(splash.log_path).read()}")
+        time.sleep(0.05)
+    wait_socket(name, splash)
+    if request(name, b"P") != ACK:
+        fail("the splash stopped answering without its card")
+    time.sleep(1.5)
+    if "showing on the new card" in open(splash.log_path).read():
+        fail("given a card's descriptor, the splash looked for another")
+    if ctl(name, "quit").returncode != 0 or splash.wait(timeout=10) != 0:
+        fail("the splash did not quit without its card")
+    card.revoke()
+    ok("the card going away: said, answering on, no other card looked for (a descriptor was given)")
 
 
 def kms(retain):
@@ -330,5 +409,7 @@ def kms(retain):
 
 
 headless()
+take_over()
 kms(False)
 kms(True)
+card_gone()
