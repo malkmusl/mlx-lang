@@ -452,6 +452,14 @@ checks_literal_ranges() {
     grep -q "MLX-E4001: \`300\` does not fit in \`u8\` (0 to 255)" <<< "$output"
 }
 
+# Whether $1 says why a statement fails where it used to say only that its
+# function did (tests/338_statement_failures.mlx).
+explains_silent_failures() {
+    local output
+    output=$("$1" --quiet tests/338_statement_failures.mlx -o /dev/null 2>&1) || true
+    grep -q "MLX-E4001: \`break\` and \`continue\` belong in a loop" <<< "$output"
+}
+
 # Whether $1 rejects @ptrFromInt and @ptrCast outside unsafe (MLX-E7004,
 # tests/14_unsafe_ptr_builtin.mlx); older compilers took them anywhere.
 enforces_unsafe() {
@@ -586,6 +594,7 @@ probes=(
     "explains_call_mistakes|calls with the wrong argument count named (MLX-E4001)"
     "calls_methods_on_pointers|methods called on pointers and on addressable values"
     "checks_literal_ranges|integers checked against their type, mismatches named (MLX-E4001)"
+    "explains_silent_failures|failing defers, stray breaks and module declarations said at their place"
     "names_aggregates_in_their_bodies|a struct named inside its own body"
     "holds_large_programs|an arena with room for the largest programs"
     "writes_depfiles|--depfile"

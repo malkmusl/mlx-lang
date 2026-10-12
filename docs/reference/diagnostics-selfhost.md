@@ -166,6 +166,58 @@ tests/335_type_mismatches.mlx:33:11: error: MLX-E4001: invalid local declaration
 their types compiling: each type's least and greatest value through the
 same places, on x86_64 and aarch64.
 
+## `MLX-E4001` (`TypeMismatch`): failures that said nothing of their own
+
+A module-level declaration that did not resolve was said only as
+"declaration type could not be resolved" at the file's first line, and
+some statements failed their function with nothing but "semantic analysis
+failed in function". Each now says where and why: an enum without its
+backing integer type, a binding whose initializer does not type (with its
+unknown names), a parameter or return type that does not resolve
+(`tests/337_declaration_failures.mlx`):
+
+```text
+tests/337_declaration_failures.mlx:6:15: error: MLX-E4001: an enum names its backing integer type: `enum(u8) { ... }`
+tests/337_declaration_failures.mlx:6:7: error: MLX-E4001: declaration type could not be resolved
+tests/337_declaration_failures.mlx:7:19: error: MLX-E3001: unknown name `missing_limit`
+tests/337_declaration_failures.mlx:7:7: error: MLX-E4001: declaration type could not be resolved
+tests/337_declaration_failures.mlx:9:17: error: MLX-E4001: this type could not be resolved
+```
+
+and a deferred expression that does not type, an `errdefer` in a function
+returning no error union, a name declared twice in one scope, `break` or
+`continue` outside a loop, the value a `break` gives, and a match pattern
+that does not fit the value matched (`tests/338_statement_failures.mlx`):
+
+```mlx
+fn pick(shade: Shade) -> u8 {
+    match shade {
+        Shade.light => { return 1 }
+        Shade.blue => { return 2 }
+        else => { return 3 }
+    }
+}
+
+pub fn main() -> u8 {
+    defer noop(missing_value)
+    errdefer noop(1)
+    const value: u8 = 1
+    const value: u8 = 2
+    break
+    return value + pick(Shade.dark)
+}
+```
+
+```text
+tests/338_statement_failures.mlx:13:15: error: MLX-E4001: this pattern does not fit the value the match looks at
+tests/338_statement_failures.mlx:19:16: error: MLX-E3001: unknown name `missing_value`
+tests/338_statement_failures.mlx:19:5: error: MLX-E4001: deferred expression could not be resolved
+tests/338_statement_failures.mlx:20:5: error: MLX-E4001: `errdefer` in a function that returns no error union
+tests/338_statement_failures.mlx:22:11: error: MLX-E4001: this name is declared already in this scope
+tests/338_statement_failures.mlx:22:11: error: MLX-E4001: invalid local declaration
+tests/338_statement_failures.mlx:23:5: error: MLX-E4001: `break` and `continue` belong in a loop
+```
+
 ## `MLX-E7004` (`UnsafeOperationOutsideUnsafeBlock`): pointer casts outside unsafe
 
 `@ptrFromInt` and `@ptrCast` are allowed only inside an unsafe block or an
