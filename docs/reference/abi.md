@@ -11,6 +11,7 @@
 `117_multi_return_memory_runtime.mlx`, `46_error_union_abi_runtime.mlx`,
 `58_error_union_slice_abi_runtime.mlx`, `59_error_union_float_abi_runtime.mlx`,
 `61_error_union_memory_abi_runtime.mlx`, `62_error_union_multi_register_abi_runtime.mlx`,
+`323_error_union_payload_words_runtime.mlx`,
 `177_float_sse_runtime.mlx`, `178_float_cast_abi_runtime.mlx`,
 `186_threadlocal_abi_gap.mlx`, `198_direct_and_indirect_call_runtime.mlx`,
 `130_function_pointer_runtime.mlx`, `229_aggregate_field_assignment_runtime.mlx`
@@ -369,6 +370,11 @@ fn source() ![]const u8 {
 ```
 
 (`tests/58_error_union_slice_abi_runtime.mlx`)
+
+An optional slice and a tuple holding a slice take as many payload
+registers as they have words (`rdx` and on), and an `!f32` returns its
+payload as an f32 in `xmm0` even when the function returns a float
+literal (`tests/323_error_union_payload_words_runtime.mlx`).
 
 ...and for a float payload, which uses the float payload bank (`xmm0`) while
 `rax` still carries the error tag:

@@ -363,6 +363,21 @@ folds_float_literals() {
     return $ok
 }
 
+# Whether $1 returns every word of an error union's payload
+# (tests/323_error_union_payload_words_runtime.mlx exits 0); older
+# compilers returned the tag and one word, so a slice payload lost its
+# length and the test loops.
+returns_wide_error_payloads() {
+    local probe
+    probe=$(mktemp -d mlx-out/probe.XXXXXX)
+    local ok=1
+    if "$1" --quiet tests/323_error_union_payload_words_runtime.mlx -o "$probe/probe" > /dev/null 2>&1; then
+        timeout 5 "$probe/probe" > /dev/null 2>&1 && ok=0
+    fi
+    rm -rf -- "$probe"
+    return $ok
+}
+
 # Whether $1 writes the files it read with --depfile (what `mlx build`
 # decides rebuilds by).
 writes_depfiles() {
@@ -412,6 +427,7 @@ probes=(
     "steps_many_pointers|array pointers as many-item pointers, p + n"
     "reads_slice_pointers|a slice's .pointer"
     "folds_float_literals|arithmetic on float literals"
+    "returns_wide_error_payloads|error union payloads of several words"
     "writes_depfiles|--depfile"
     "runs_build|the build command (mlx build)"
 )
