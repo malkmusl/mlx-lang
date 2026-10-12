@@ -267,7 +267,19 @@ that are not a multiple of 8 copy exactly
 Where a copy lives depends on who owns it. Aggregate literals, `var` copies
 and assignment copies come from the aggregate arena (an `alloca` with a
 byte count), which is never freed, so a function can return such storage
-by address. A `const` local's copy is a region of the function's frame
+by address. Those whose address cannot outlive the function move into its
+frame instead (`ir/escape.mlx`, after the other LIR passes): one whose
+address is never returned, never stored outside the function's own
+memory, and only handed to callees whose parameter lets nothing out (the
+callee may read through it). A frame region is zeroed where the
+allocation runs, as the arena's memory is, unless a copy of the whole
+value fills it at once; one inside a loop moves only when its address is
+kept nowhere but its own binding, so no older pass's value is still
+reachable when the next pass reuses the bytes. The limits are 1 KiB an
+allocation and 8 KiB a frame (a thread may run on a small stack). A
+struct literal handed to a reading callee, or a `var` made in every pass
+of a loop, then no longer grows the arena
+(`tests/328_aggregates_in_frame_runtime.mlx`). A `const` local's copy is a region of the function's frame
 instead (the same `alloca` with `arg1 == 1`): the frame-size estimate adds
 its bytes, and nothing of it may be handed back by address. `return`
 therefore copies a value that may be, or lie inside, a `const` local's

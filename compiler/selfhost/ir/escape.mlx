@@ -1,0 +1,786 @@
+// Aggregates whose storage cannot outlive their function's frame, moved
+// from the aggregate arena into the frame.
+//
+// The arena is only ever bumped (an atomic add per value) and nothing in
+// it is freed, so every struct, array and tuple a function makes stays
+// until the process ends: a long-running loop fills it. An allocation
+// whose address (or an address made from it) is never returned, stored
+// outside its function, handed to code this pass cannot see, or let out
+// through a parameter that lets it out, is dead when its function returns
+// and may live in the frame instead.
+//
+// The analysis runs backwards over value flow: when a value escapes, so
+// does every value it was made from (a copy, a cast, a field address,
+// pointer arithmetic, a tuple's parts). Memory is tracked by what it
+// belongs to, an allocation or a parameter (the caller's memory): what is
+// stored into an allocation's memory escapes once that memory's contents
+// escape (a load from it whose value escapes, or the allocation itself
+// escaping); a store into a caller's memory, or into memory this pass
+// cannot name, lets the stored value escape. A local's 8-byte slot that
+// is only loaded and stored, and only ever holds addresses into one
+// allocation or parameter, passes that on to what is loaded from it.
+// A parameter escapes as the values its function makes from it do, and
+// its contents as the values read through it do; a call's argument
+// escapes with the callee's parameter (or only the memory it points to,
+// with the parameter's contents). The callees are solved first, and a
+// caller again whenever one of its callees' parameters changes.
+//
+// Two more limits keep the move from changing what a program sees. One
+// allocation becomes one region of the frame, the same bytes every time
+// the instruction runs, so an allocation inside a loop moves only when
+// its address is never stored anywhere (an older pass's value could
+// otherwise still be read after the next pass overwrote it), except into
+// its binding: a slot stored once, right after the allocation in the same
+// block, and loaded only after that store, always holds the newest
+// allocation, which the region then is. And the arena hands out zeroed
+// memory, so a moved region is zeroed where it is made, unless a copy of
+// the whole value fills it right away.
+const allocator_module = @import("../../../std/bootstrap/allocator.mlx")
+const lir = @import("./lir.mlx")
+
+pub const Result = struct {
+    regions: usize
+    bytes: usize
+}
+
+// The largest allocation moved, and the most a function's frame takes:
+// a thread may run on a small stack, and recursion multiplies the frame.
+const REGION_LIMIT: usize = 1024
+const FUNCTION_LIMIT: usize = 8192
+
+const ESCAPES: u8 = 1
+const CONTENTS: u8 = 2
+const STORED: u8 = 4
+const LOOP: u8 = 8
+// A slot used other than as a load's or a store's address.
+const SHARED: u8 = 16
+// A store that only binds an allocation to its slot (see above).
+const BINDING: u8 = 32
+// What the memory holds is stored elsewhere (a binding slot's allocation).
+const KEPT: u8 = 64
+// A slot's or a value's root not known yet (prepare).
+const UNSET: usize = 18446744073709551614
+
+const Analysis = struct {
+    ir: *lir.Lir
+    count: usize
+    flags: [*]u8
+    roots: [*]usize
+    symbolCount: usize
+    symbolFunctions: [*]usize
+    functionCount: usize
+    functionStarts: [*]usize
+    paramFirst: [*]usize
+    paramCount: [*]usize
+    paramGroups: [*]usize
+    params: [*]usize
+    // What a clean slot holds: addresses into one root, or NONE.
+    holds: [*]usize
+}
+
+pub fn run(ir: *lir.Lir, allocator: allocator_module.Allocator) -> Result {
+    var result = Result.{ .regions = 0, .bytes = 0 }
+    const count = lir.instCount(ir)
+    const symbol_count = lir.symbolCount(ir)
+    if count == 0 { return result }
+    const flag_memory = allocator.alloc(count, 8).?
+    const root_memory = allocator.alloc(count * 8, 8).?
+    const symbol_memory = allocator.alloc((symbol_count + 1) * 8, 8).?
+    const start_memory = allocator.alloc((count + 1) * 8, 8).?
+    const first_memory = allocator.alloc((count + 1) * 8, 8).?
+    const param_count_memory = allocator.alloc((count + 1) * 8, 8).?
+    const group_memory = allocator.alloc((count + 1) * 8, 8).?
+    const param_memory = allocator.alloc((count + 1) * 8, 8).?
+    const hold_memory = allocator.alloc(count * 8, 8).?
+    unsafe {
+        var analysis = Analysis.{
+            .ir = ir,
+            .count = count,
+            .flags = flag_memory,
+            .roots = @ptrCast([*]usize, root_memory),
+            .symbolCount = symbol_count,
+            .symbolFunctions = @ptrCast([*]usize, symbol_memory),
+            .functionCount = 0,
+            .functionStarts = @ptrCast([*]usize, start_memory),
+            .paramFirst = @ptrCast([*]usize, first_memory),
+            .paramCount = @ptrCast([*]usize, param_count_memory),
+            .paramGroups = @ptrCast([*]usize, group_memory),
+            .params = @ptrCast([*]usize, param_memory),
+            .holds = @ptrCast([*]usize, hold_memory),
+        }
+        prepare(&analysis)
+        markLoops(&analysis, allocator)
+        solve(&analysis, allocator)
+        result = move(&analysis)
+    }
+    allocator.free(flag_memory, count, 8)
+    allocator.free(root_memory, count * 8, 8)
+    allocator.free(symbol_memory, (symbol_count + 1) * 8, 8)
+    allocator.free(start_memory, (count + 1) * 8, 8)
+    allocator.free(first_memory, (count + 1) * 8, 8)
+    allocator.free(param_count_memory, (count + 1) * 8, 8)
+    allocator.free(group_memory, (count + 1) * 8, 8)
+    allocator.free(param_memory, (count + 1) * 8, 8)
+    allocator.free(hold_memory, count * 8, 8)
+    return result
+}
+
+fn isFunctionLabel(inst: lir.Inst) -> bool {
+    return inst.opcode == lir.Opcode.label && inst.arg0 != lir.NONE
+}
+
+fn functionEnd(a: *Analysis, function: usize) -> usize {
+    return if function + 1 < a.*.functionCount { a.*.functionStarts[function + 1] } else { a.*.count }
+}
+
+// The functions, their parameters (the words, in order; a parameter's
+// first word has its type, the further ones of a slice or tuple none),
+// and each value's allocation when it is one or an address into one.
+fn prepare(a: *Analysis) -> void {
+    var symbol: usize = 0
+    while symbol < a.*.symbolCount {
+        a.*.symbolFunctions[symbol] = lir.NONE
+        symbol += 1
+    }
+    var params: usize = 0
+    var index: usize = 0
+    while index < a.*.count {
+        a.*.flags[index] = 0
+        a.*.roots[index] = lir.NONE
+        const inst = lir.getInst(a.*.ir, index)
+        if isFunctionLabel(inst) {
+            const function = a.*.functionCount
+            a.*.functionStarts[function] = index
+            a.*.paramFirst[function] = params
+            a.*.paramCount[function] = 0
+            a.*.paramGroups[function] = 0
+            a.*.functionCount += 1
+            if inst.arg0 < a.*.symbolCount && a.*.symbolFunctions[inst.arg0] == lir.NONE { a.*.symbolFunctions[inst.arg0] = function }
+        } else if inst.opcode == lir.Opcode.param && a.*.functionCount > 0 {
+            const function = a.*.functionCount - 1
+            a.*.params[params] = index
+            params += 1
+            a.*.paramCount[function] += 1
+            if inst.typeId != lir.NONE { a.*.paramGroups[function] += 1 }
+        }
+        index += 1
+    }
+    markSharedSlots(a)
+    index = 0
+    while index < a.*.count {
+        a.*.holds[index] = UNSET
+        index += 1
+    }
+    // Roots go from unset to one root to none; once nothing changes, what
+    // is still unset (a slot never stored) is none, and the roots settle
+    // again with that.
+    while settleRoots(a, false) {}
+    while settleRoots(a, true) {}
+    markBindings(a)
+}
+
+// The stores that bind an allocation to its slot: the slot's one store,
+// of the allocation itself, in the allocation's block, with every load of
+// the slot after it. `holds` serves as each slot's store and is reset.
+fn markBindings(a: *Analysis) -> void {
+    var index: usize = 0
+    while index < a.*.count {
+        a.*.holds[index] = lir.NONE
+        index += 1
+    }
+    index = 0
+    while index < a.*.count {
+        const inst = lir.getInst(a.*.ir, index)
+        if inst.opcode == lir.Opcode.store && isSlot(a, inst.arg0) {
+            a.*.holds[inst.arg0] = if a.*.holds[inst.arg0] == lir.NONE { index } else { UNSET }
+        }
+        index += 1
+    }
+    // A slot stored twice is UNSET now; one load before its store undoes
+    // the binding too.
+    index = 0
+    while index < a.*.count {
+        const inst = lir.getInst(a.*.ir, index)
+        if inst.opcode == lir.Opcode.load && isSlot(a, inst.arg0) {
+            const store = a.*.holds[inst.arg0]
+            if store != lir.NONE && store != UNSET && store >= index { a.*.holds[inst.arg0] = UNSET }
+        }
+        index += 1
+    }
+    index = 0
+    while index < a.*.count {
+        const inst = lir.getInst(a.*.ir, index)
+        if inst.opcode == lir.Opcode.store && isSlot(a, inst.arg0) && a.*.flags[inst.arg0] & SHARED == 0 && a.*.holds[inst.arg0] == index && sameBlock(a, inst.arg1, index) {
+            a.*.flags[index] = a.*.flags[index] | BINDING
+        }
+        index += 1
+    }
+}
+
+// Whether `value` is an allocation that `use` follows in the same block.
+fn sameBlock(a: *Analysis, value: usize, use: usize) -> bool {
+    if value >= use || lir.getInst(a.*.ir, value).opcode != lir.Opcode.alloca { return false }
+    var index = value + 1
+    while index < use {
+        const op = lir.getInst(a.*.ir, index).opcode
+        if op == lir.Opcode.label || op == lir.Opcode.br || op == lir.Opcode.condbr || op == lir.Opcode.icmp_br || op == lir.Opcode.ret || op == lir.Opcode.ret_slice ||
+            op == lir.Opcode.ret_error || op == lir.Opcode.ret_error_union || op == lir.Opcode.unreachable_inst {
+            return false
+        }
+        index += 1
+    }
+    return true
+}
+
+fn isSlot(a: *Analysis, value: usize) -> bool {
+    if value == lir.NONE || value >= a.*.count { return false }
+    const inst = lir.getInst(a.*.ir, value)
+    return inst.opcode == lir.Opcode.alloca && inst.arg0 == lir.NONE
+}
+
+// A slot is shared when anything but a load or a store takes its address
+// (any value operand naming it counts; the fields that hold widths, block
+// numbers or symbols do not).
+fn markSharedSlots(a: *Analysis) -> void {
+    var index: usize = 0
+    while index < a.*.count {
+        const inst = lir.getInst(a.*.ir, index)
+        const op = inst.opcode
+        if op == lir.Opcode.load || op == lir.Opcode.atomic_load {
+            if op == lir.Opcode.atomic_load { share(a, inst.arg0) }
+        } else if op == lir.Opcode.store {
+            share(a, inst.arg1)
+        } else if op == lir.Opcode.icmp || op == lir.Opcode.fcmp {
+            share(a, inst.arg1)
+            share(a, inst.arg2)
+        } else if op == lir.Opcode.condbr || op == lir.Opcode.ret || op == lir.Opcode.ret_error || op == lir.Opcode.ret_error_union {
+            share(a, inst.arg0)
+        } else if op == lir.Opcode.direct_call {
+            shareExtras(a, inst.arg1, inst.arg2)
+        } else if op == lir.Opcode.call || op == lir.Opcode.syscall {
+            share(a, inst.arg0)
+            shareExtras(a, inst.arg1, inst.arg2)
+        } else if op == lir.Opcode.tuple_literal || op == lir.Opcode.clone_thread {
+            shareExtras(a, inst.arg0, inst.arg1)
+        } else if op == lir.Opcode.copy || op == lir.Opcode.cast || op == lir.Opcode.bitcast || op == lir.Opcode.aggregate_copy || op == lir.Opcode.addr ||
+            op == lir.Opcode.error_payload || op == lir.Opcode.error_payload_part || op == lir.Opcode.tuple_element || op == lir.Opcode.popcount ||
+            op == lir.Opcode.sqrt || op == lir.Opcode.round_float || op == lir.Opcode.error_test {
+            share(a, inst.arg0)
+        } else if op == lir.Opcode.ret_slice || op == lir.Opcode.add || op == lir.Opcode.sub || op == lir.Opcode.mul || op == lir.Opcode.div || op == lir.Opcode.rem ||
+            op == lir.Opcode.udiv || op == lir.Opcode.urem || op == lir.Opcode.bit_and || op == lir.Opcode.bit_or || op == lir.Opcode.bit_xor || op == lir.Opcode.shl ||
+            op == lir.Opcode.shr || op == lir.Opcode.gep || op == lir.Opcode.mem_copy || op == lir.Opcode.atomic_store || op == lir.Opcode.atomic_rmw || op == lir.Opcode.byte_mask_64 {
+            share(a, inst.arg0)
+            share(a, inst.arg1)
+        } else if op == lir.Opcode.cmpxchg {
+            share(a, inst.arg0)
+            share(a, inst.arg1)
+            share(a, inst.arg2)
+        } else if op != lir.Opcode.const_i && op != lir.Opcode.const_f && op != lir.Opcode.label && op != lir.Opcode.br && op != lir.Opcode.icmp_br &&
+            op != lir.Opcode.alloca && op != lir.Opcode.param && op != lir.Opcode.func_sym && op != lir.Opcode.global_address && op != lir.Opcode.string_literal &&
+            op != lir.Opcode.builtin_sym && op != lir.Opcode.dead && op != lir.Opcode.unreachable_inst && op != lir.Opcode.thread_pointer &&
+            op != lir.Opcode.frame_address && op != lir.Opcode.fence {
+            // An instruction this pass does not know: any field may be a value.
+            share(a, inst.arg0)
+            share(a, inst.arg1)
+            share(a, inst.arg2)
+        }
+        index += 1
+    }
+}
+
+fn share(a: *Analysis, value: usize) -> void {
+    if isSlot(a, value) { a.*.flags[value] = a.*.flags[value] | SHARED }
+}
+
+fn shareExtras(a: *Analysis, start: usize, length: usize) -> void {
+    var index: usize = 0
+    while index < length {
+        share(a, lir.getExtra(a.*.ir, start + index))
+        index += 1
+    }
+}
+
+fn merge(held: usize, root: usize) -> usize {
+    if root == UNSET { return held }
+    if held == UNSET || held == root { return root }
+    return lir.NONE
+}
+
+// One pass over every value's root; whether one changed. `final`: what
+// is unset counts as none.
+fn settleRoots(a: *Analysis, final: bool) -> bool {
+    var changed = false
+    var index: usize = 0
+    while index < a.*.count {
+        const inst = lir.getInst(a.*.ir, index)
+        var root = lir.NONE
+        if inst.opcode == lir.Opcode.alloca || inst.opcode == lir.Opcode.param {
+            root = index
+        } else if inst.opcode == lir.Opcode.copy || inst.opcode == lir.Opcode.cast || inst.opcode == lir.Opcode.bitcast || inst.opcode == lir.Opcode.aggregate_copy || inst.opcode == lir.Opcode.gep {
+            if inst.arg0 < a.*.count { root = a.*.roots[inst.arg0] }
+        } else if inst.opcode == lir.Opcode.load && isSlot(a, inst.arg0) && a.*.flags[inst.arg0] & SHARED == 0 {
+            root = a.*.holds[inst.arg0]
+        } else if inst.opcode == lir.Opcode.store && isSlot(a, inst.arg0) && a.*.flags[inst.arg0] & SHARED == 0 {
+            var stored = if inst.arg1 < a.*.count { a.*.roots[inst.arg1] } else { lir.NONE }
+            if final && stored == UNSET { stored = lir.NONE }
+            const held = merge(a.*.holds[inst.arg0], stored)
+            if held != a.*.holds[inst.arg0] {
+                a.*.holds[inst.arg0] = held
+                changed = true
+            }
+        }
+        if final && root == UNSET { root = lir.NONE }
+        if root != a.*.roots[index] {
+            a.*.roots[index] = root
+            changed = true
+        }
+        index += 1
+    }
+    if final {
+        index = 0
+        while index < a.*.count {
+            if a.*.holds[index] == UNSET { a.*.holds[index] = lir.NONE }
+            index += 1
+        }
+    }
+    return changed
+}
+
+// Instructions between a branch and the block it jumps back to are in a
+// loop.
+fn markLoops(a: *Analysis, allocator: allocator_module.Allocator) -> void {
+    var blocks: usize = 0
+    var index: usize = 0
+    while index < a.*.count {
+        const inst = lir.getInst(a.*.ir, index)
+        if inst.opcode == lir.Opcode.label && inst.arg0 == lir.NONE && inst.arg1 != lir.NONE && inst.arg1 + 1 > blocks { blocks = inst.arg1 + 1 }
+        index += 1
+    }
+    if blocks == 0 { return }
+    const memory = allocator.alloc(blocks * 8, 8).?
+    unsafe {
+        const labels = @ptrCast([*]usize, memory)
+        var block: usize = 0
+        while block < blocks {
+            labels[block] = lir.NONE
+            block += 1
+        }
+        index = 0
+        while index < a.*.count {
+            const inst = lir.getInst(a.*.ir, index)
+            if inst.opcode == lir.Opcode.label && inst.arg0 == lir.NONE && inst.arg1 < blocks { labels[inst.arg1] = index }
+            index += 1
+        }
+        index = 0
+        while index < a.*.count {
+            const inst = lir.getInst(a.*.ir, index)
+            if inst.opcode == lir.Opcode.br {
+                markLoop(a, labels, blocks, inst.arg0, index)
+            } else if inst.opcode == lir.Opcode.condbr || inst.opcode == lir.Opcode.icmp_br {
+                markLoop(a, labels, blocks, inst.arg1, index)
+                markLoop(a, labels, blocks, inst.arg2, index)
+            }
+            index += 1
+        }
+    }
+    allocator.free(memory, blocks * 8, 8)
+}
+
+fn markLoop(a: *Analysis, labels: [*]usize, blocks: usize, block: usize, branch: usize) -> void {
+    if block >= blocks { return }
+    const target = labels[block]
+    if target == lir.NONE || target >= branch { return }
+    var index = target
+    while index <= branch {
+        a.*.flags[index] = a.*.flags[index] | LOOP
+        index += 1
+    }
+}
+
+fn mark(a: *Analysis, value: usize, bit: u8) -> bool {
+    if value == lir.NONE || value >= a.*.count { return false }
+    if a.*.flags[value] & bit != 0 { return false }
+    a.*.flags[value] = a.*.flags[value] | bit
+    return true
+}
+
+fn has(a: *Analysis, value: usize, bit: u8) -> bool {
+    return value != lir.NONE && value < a.*.count && a.*.flags[value] & bit != 0
+}
+
+fn rootOf(a: *Analysis, address: usize) -> usize {
+    if address == lir.NONE || address >= a.*.count { return lir.NONE }
+    return a.*.roots[address]
+}
+
+// An allocation of this function (its memory is tracked); a parameter's
+// memory is the caller's.
+fn isLocal(a: *Analysis, root: usize) -> bool {
+    return root != lir.NONE && lir.getInst(a.*.ir, root).opcode == lir.Opcode.alloca
+}
+
+// Every function once, then again each caller of one whose parameters
+// changed, until nothing changes.
+fn solve(a: *Analysis, allocator: allocator_module.Allocator) -> void {
+    const functions = a.*.functionCount
+    if functions == 0 { return }
+    const queue_memory = allocator.alloc(functions * 8, 8).?
+    const queued_memory = allocator.alloc(functions, 8).?
+    const calls = countCalls(a)
+    const offset_memory = allocator.alloc((functions + 1) * 8, 8).?
+    const caller_memory = allocator.alloc((calls + 1) * 8, 8).?
+    unsafe {
+        const queue = @ptrCast([*]usize, queue_memory)
+        const queued = queued_memory
+        const offsets = @ptrCast([*]usize, offset_memory)
+        const callers = @ptrCast([*]usize, caller_memory)
+        indexCallers(a, offsets, callers)
+        // A ring of every function, the last first (callees tend to come
+        // before their callers).
+        var head: usize = 0
+        var length: usize = 0
+        var function = functions
+        while function > 0 {
+            function -= 1
+            queue[length] = function
+            queued[function] = 1
+            length += 1
+        }
+        while length > 0 {
+            const current = queue[head]
+            head = (head + 1) % functions
+            length -= 1
+            queued[current] = 0
+            if analyzeFunction(a, current) {
+                var caller = offsets[current]
+                while caller < offsets[current + 1] {
+                    const waiting = callers[caller]
+                    if queued[waiting] == 0 {
+                        queued[waiting] = 1
+                        queue[(head + length) % functions] = waiting
+                        length += 1
+                    }
+                    caller += 1
+                }
+            }
+        }
+    }
+    allocator.free(queue_memory, functions * 8, 8)
+    allocator.free(queued_memory, functions, 8)
+    allocator.free(offset_memory, (functions + 1) * 8, 8)
+    allocator.free(caller_memory, (calls + 1) * 8, 8)
+}
+
+fn calleeOf(a: *Analysis, inst: lir.Inst) -> usize {
+    if inst.opcode != lir.Opcode.direct_call || inst.arg0 >= a.*.symbolCount { return lir.NONE }
+    return a.*.symbolFunctions[inst.arg0]
+}
+
+fn countCalls(a: *Analysis) -> usize {
+    var calls: usize = 0
+    var index: usize = 0
+    while index < a.*.count {
+        if calleeOf(a, lir.getInst(a.*.ir, index)) != lir.NONE { calls += 1 }
+        index += 1
+    }
+    return calls
+}
+
+// Who calls each function: callers[offsets[f]..offsets[f + 1]].
+fn indexCallers(a: *Analysis, offsets: [*]usize, callers: [*]usize) -> void {
+    var function: usize = 0
+    while function <= a.*.functionCount {
+        offsets[function] = 0
+        function += 1
+    }
+    function = 0
+    while function < a.*.functionCount {
+        var index = a.*.functionStarts[function] + 1
+        const end = functionEnd(a, function)
+        while index < end {
+            const callee = calleeOf(a, lir.getInst(a.*.ir, index))
+            if callee != lir.NONE { offsets[callee + 1] += 1 }
+            index += 1
+        }
+        function += 1
+    }
+    function = 0
+    while function < a.*.functionCount {
+        offsets[function + 1] += offsets[function]
+        function += 1
+    }
+    function = 0
+    while function < a.*.functionCount {
+        var index = a.*.functionStarts[function] + 1
+        const end = functionEnd(a, function)
+        while index < end {
+            const callee = calleeOf(a, lir.getInst(a.*.ir, index))
+            if callee != lir.NONE {
+                callers[offsets[callee]] = function
+                offsets[callee] += 1
+            }
+            index += 1
+        }
+        function += 1
+    }
+    // The fill moved each start to the next one's; move them back.
+    function = a.*.functionCount
+    while function > 0 {
+        offsets[function] = offsets[function - 1]
+        function -= 1
+    }
+    offsets[0] = 0
+}
+
+// Propagates within one function until nothing changes; whether one of
+// its parameters began to escape.
+fn analyzeFunction(a: *Analysis, function: usize) -> bool {
+    const start = a.*.functionStarts[function] + 1
+    const end = functionEnd(a, function)
+    const before = escapingParams(a, function)
+    var changed = true
+    while changed {
+        changed = false
+        var index = end
+        while index > start {
+            index -= 1
+            if step(a, index) { changed = true }
+        }
+    }
+    return escapingParams(a, function) != before
+}
+
+fn escapingParams(a: *Analysis, function: usize) -> usize {
+    var escaping: usize = 0
+    var param: usize = 0
+    while param < a.*.paramCount[function] {
+        const flags = a.*.flags[a.*.params[a.*.paramFirst[function] + param]]
+        if flags & ESCAPES != 0 { escaping += 1 }
+        if flags & CONTENTS != 0 { escaping += 1 }
+        param += 1
+    }
+    return escaping
+}
+
+// One instruction's rules: from what is known about its value to what
+// its operands must be.
+fn step(a: *Analysis, index: usize) -> bool {
+    const inst = lir.getInst(a.*.ir, index)
+    const op = inst.opcode
+    const escapes = has(a, index, ESCAPES)
+    const stored = has(a, index, STORED)
+    if op == lir.Opcode.dead || op == lir.Opcode.label || op == lir.Opcode.br || op == lir.Opcode.condbr || op == lir.Opcode.icmp_br || op == lir.Opcode.icmp || op == lir.Opcode.fcmp ||
+        op == lir.Opcode.const_i || op == lir.Opcode.const_f || op == lir.Opcode.func_sym || op == lir.Opcode.global_address || op == lir.Opcode.string_literal || op == lir.Opcode.builtin_sym ||
+        op == lir.Opcode.unreachable_inst || op == lir.Opcode.thread_pointer || op == lir.Opcode.frame_address || op == lir.Opcode.fence || op == lir.Opcode.error_test || op == lir.Opcode.byte_mask_64 {
+        return false
+    }
+    if op == lir.Opcode.alloca || op == lir.Opcode.param { return escapes && mark(a, index, CONTENTS) }
+    if op == lir.Opcode.copy || op == lir.Opcode.cast || op == lir.Opcode.bitcast || op == lir.Opcode.aggregate_copy || op == lir.Opcode.addr || op == lir.Opcode.error_payload ||
+        op == lir.Opcode.error_payload_part || op == lir.Opcode.tuple_element || op == lir.Opcode.popcount || op == lir.Opcode.sqrt || op == lir.Opcode.round_float {
+        return derived(a, inst.arg0, escapes, stored)
+    }
+    if op == lir.Opcode.add || op == lir.Opcode.sub || op == lir.Opcode.mul || op == lir.Opcode.div || op == lir.Opcode.rem || op == lir.Opcode.udiv || op == lir.Opcode.urem ||
+        op == lir.Opcode.bit_and || op == lir.Opcode.bit_or || op == lir.Opcode.bit_xor || op == lir.Opcode.shl || op == lir.Opcode.shr || op == lir.Opcode.gep {
+        const first = derived(a, inst.arg0, escapes, stored)
+        const second = derived(a, inst.arg1, escapes, stored)
+        return first || second
+    }
+    if op == lir.Opcode.tuple_literal { return derivedExtras(a, inst.arg0, inst.arg1, escapes, stored) }
+    if op == lir.Opcode.load || op == lir.Opcode.atomic_load {
+        const from = loaded(a, inst.arg0, escapes)
+        const kept = stored && keptFrom(a, inst.arg0)
+        return from || kept
+    }
+    if op == lir.Opcode.store && has(a, index, BINDING) { return bound(a, inst.arg0, inst.arg1) }
+    if op == lir.Opcode.store || op == lir.Opcode.atomic_store { return storedInto(a, inst.arg0, inst.arg1) }
+    if op == lir.Opcode.atomic_rmw {
+        const into = storedInto(a, inst.arg0, inst.arg1)
+        const from = loaded(a, inst.arg0, escapes)
+        return into || from
+    }
+    if op == lir.Opcode.cmpxchg {
+        const into = storedInto(a, inst.arg0, inst.arg2)
+        const from = loaded(a, inst.arg0, escapes)
+        return into || from
+    }
+    if op == lir.Opcode.mem_copy { return copied(a, inst.arg0, inst.arg1) }
+    if op == lir.Opcode.direct_call { return callArguments(a, inst) }
+    if op == lir.Opcode.ret || op == lir.Opcode.ret_error || op == lir.Opcode.ret_error_union { return mark(a, inst.arg0, ESCAPES) }
+    if op == lir.Opcode.ret_slice {
+        const first = mark(a, inst.arg0, ESCAPES)
+        const second = mark(a, inst.arg1, ESCAPES)
+        return first || second
+    }
+    if op == lir.Opcode.call || op == lir.Opcode.syscall {
+        const callee = mark(a, inst.arg0, ESCAPES)
+        const arguments = escapeExtras(a, inst.arg1, inst.arg2)
+        return callee || arguments
+    }
+    if op == lir.Opcode.clone_thread { return escapeExtras(a, inst.arg0, inst.arg1) }
+    // Anything else lets every value it may read escape.
+    const first = mark(a, inst.arg0, ESCAPES)
+    const second = mark(a, inst.arg1, ESCAPES)
+    const third = mark(a, inst.arg2, ESCAPES)
+    return first || second || third
+}
+
+fn derived(a: *Analysis, operand: usize, escapes: bool, stored: bool) -> bool {
+    var changed = false
+    if escapes && mark(a, operand, ESCAPES) { changed = true }
+    if stored && mark(a, operand, STORED) { changed = true }
+    return changed
+}
+
+fn derivedExtras(a: *Analysis, start: usize, length: usize, escapes: bool, stored: bool) -> bool {
+    var changed = false
+    var index: usize = 0
+    while index < length {
+        if derived(a, lir.getExtra(a.*.ir, start + index), escapes, stored) { changed = true }
+        index += 1
+    }
+    return changed
+}
+
+fn escapeExtras(a: *Analysis, start: usize, length: usize) -> bool {
+    var changed = false
+    var index: usize = 0
+    while index < length {
+        if mark(a, lir.getExtra(a.*.ir, start + index), ESCAPES) { changed = true }
+        index += 1
+    }
+    return changed
+}
+
+// A value read through `address` escapes: so does the memory it was read
+// from (an allocation's contents, or whatever the address came from).
+fn loaded(a: *Analysis, address: usize, escapes: bool) -> bool {
+    if !escapes { return false }
+    const root = rootOf(a, address)
+    if root != lir.NONE { return mark(a, root, CONTENTS) }
+    return mark(a, address, ESCAPES)
+}
+
+// `value` written through `address`: it is stored, and it escapes with
+// the allocation's contents, or at once into a caller's memory or memory
+// not named here.
+fn storedInto(a: *Analysis, address: usize, value: usize) -> bool {
+    var changed = mark(a, value, STORED)
+    const root = rootOf(a, address)
+    if (!isLocal(a, root) || has(a, root, CONTENTS)) && mark(a, value, ESCAPES) { changed = true }
+    return changed
+}
+
+// A binding store: the allocation escapes with its slot's contents, and
+// is stored once what is loaded from the slot is stored elsewhere.
+fn bound(a: *Analysis, slot: usize, value: usize) -> bool {
+    const escapes = has(a, slot, CONTENTS) && mark(a, value, ESCAPES)
+    const kept = has(a, slot, KEPT) && mark(a, value, STORED)
+    return escapes || kept
+}
+
+// A value loaded through `address` is stored somewhere: so is what the
+// memory it came from holds (it matters for a binding slot, whose stores
+// do not count as stored by themselves; a value read through an address
+// of no known root was stored where it came from already).
+fn keptFrom(a: *Analysis, address: usize) -> bool {
+    const root = rootOf(a, address)
+    return root != lir.NONE && mark(a, root, KEPT)
+}
+
+// Bytes copied from `source` to `destination`: the source's contents
+// escape with the destination's.
+fn copied(a: *Analysis, destination: usize, source: usize) -> bool {
+    const target = rootOf(a, destination)
+    if isLocal(a, target) && !has(a, target, CONTENTS) { return false }
+    const origin = rootOf(a, source)
+    if origin != lir.NONE { return mark(a, origin, CONTENTS) }
+    return mark(a, source, ESCAPES)
+}
+
+// A call's argument escapes with the callee's parameter, or at once when
+// the callee is not here (imported) or its parameters do not line up.
+fn callArguments(a: *Analysis, inst: lir.Inst) -> bool {
+    const callee = calleeOf(a, inst)
+    const known = callee != lir.NONE && a.*.paramGroups[callee] == inst.arg2
+    var changed = false
+    var cursor: usize = 0
+    var end: usize = 0
+    if known {
+        cursor = a.*.paramFirst[callee]
+        end = cursor + a.*.paramCount[callee]
+    }
+    var argument: usize = 0
+    while argument < inst.arg2 {
+        var escapes = !known
+        var contents = false
+        if known {
+            // The parameter's words: its first, then those without a type.
+            escapes = has(a, a.*.params[cursor], ESCAPES)
+            contents = has(a, a.*.params[cursor], CONTENTS)
+            cursor += 1
+            while cursor < end && lir.getInst(a.*.ir, a.*.params[cursor]).typeId == lir.NONE {
+                if has(a, a.*.params[cursor], ESCAPES) { escapes = true }
+                if has(a, a.*.params[cursor], CONTENTS) { contents = true }
+                cursor += 1
+            }
+        }
+        const value = lir.getExtra(a.*.ir, inst.arg1 + argument)
+        if escapes {
+            if mark(a, value, ESCAPES) { changed = true }
+        } else if contents {
+            // What the callee reads through the argument escapes: the
+            // memory it points to, when that is known, else the argument.
+            const root = rootOf(a, value)
+            if root != lir.NONE {
+                if mark(a, root, CONTENTS) { changed = true }
+            } else if mark(a, value, ESCAPES) {
+                changed = true
+            }
+        }
+        argument += 1
+    }
+    return changed
+}
+
+// The allocations that stay in their function, moved into its frame
+// within the limits.
+fn move(a: *Analysis) -> Result {
+    var result = Result.{ .regions = 0, .bytes = 0 }
+    var function: usize = 0
+    while function < a.*.functionCount {
+        var taken: usize = 0
+        var index = a.*.functionStarts[function] + 1
+        const end = functionEnd(a, function)
+        while index < end {
+            var inst = lir.getInst(a.*.ir, index)
+            if inst.opcode == lir.Opcode.alloca && inst.arg0 != lir.NONE && inst.arg1 != 1 && inst.arg1 != 2 && inst.arg0 <= REGION_LIMIT && !has(a, index, ESCAPES) && !(has(a, index, LOOP) && has(a, index, STORED)) {
+                const aligned = (inst.arg0 + 7) & ~@intCast(usize, 7)
+                if taken + aligned <= FUNCTION_LIMIT {
+                    taken += aligned
+                    inst.arg1 = if filledAtOnce(a, index, inst.arg0) { 1 } else { 2 }
+                    lir.setInst(a.*.ir, index, inst)
+                    result.regions += 1
+                    result.bytes += aligned
+                }
+            }
+            index += 1
+        }
+        function += 1
+    }
+    return result
+}
+
+// Whether the next thing done after the allocation (constants aside) is
+// a copy of a whole value into it, so there is nothing to zero.
+fn filledAtOnce(a: *Analysis, allocation: usize, size: usize) -> bool {
+    var index = allocation + 1
+    while index < a.*.count {
+        const inst = lir.getInst(a.*.ir, index)
+        if inst.opcode != lir.Opcode.const_i && inst.opcode != lir.Opcode.dead {
+            return inst.opcode == lir.Opcode.mem_copy && inst.arg0 == allocation && inst.arg2 != lir.NONE && inst.arg2 >= size
+        }
+        index += 1
+    }
+    return false
+}
+

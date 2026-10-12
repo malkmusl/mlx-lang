@@ -426,6 +426,21 @@ has_unsafe_expressions() {
     return $ok
 }
 
+# Whether $1 keeps aggregates that stay in their function in its frame
+# (tests/328_aggregates_in_frame_runtime.mlx exits 13).
+keeps_aggregates_in_frame() {
+    local probe
+    probe=$(mktemp -d mlx-out/probe.XXXXXX)
+    local ok=1
+    if "$1" --quiet tests/328_aggregates_in_frame_runtime.mlx -o "$probe/probe" > /dev/null 2>&1; then
+        local status=0
+        "$probe/probe" > /dev/null 2>&1 || status=$?
+        [[ $status -eq 13 ]] && ok=0
+    fi
+    rm -rf -- "$probe"
+    return $ok
+}
+
 # Whether $1 writes the files it read with --depfile (what `mlx build`
 # decides rebuilds by).
 writes_depfiles() {
@@ -480,6 +495,7 @@ probes=(
     "reports_unknown_names|unknown names reported (MLX-E3001)"
     "has_unsafe_expressions|unsafe { expression }"
     "enforces_unsafe|pointer casts outside unsafe rejected (MLX-E7004)"
+    "keeps_aggregates_in_frame|aggregates that stay in their function kept in the frame"
     "writes_depfiles|--depfile"
     "runs_build|the build command (mlx build)"
 )
