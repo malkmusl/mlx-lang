@@ -30,9 +30,16 @@ HEAD*, with Commit) and a search field in the toolbar, and where you are
 in the status bar. There is nothing to read again by hand: files changed
 on disk (by Git, another editor or a save) are read again by themselves.
 
-At the top of the sidebar, *View* switches between the **Map** and the
-**Editor** (Ctrl+E); see [The editor](#the-editor) and
-[Build and commit](#build-and-commit).
+At the top of the sidebar, *Programs* is the explorer, as an IDE has
+one: the program shown (a click lists them all to choose from) and under
+it the files it is made of as a tree, folders first. A folder opens and
+closes with a click; a click on a file selects it: the map flies there,
+the editor opens it. With *All programs* the tree holds every file read;
+choosing a program opens the folders on the way to its main file, and a
+file selected elsewhere (a search, the map, the editor) opens the tree on
+the way to it ([`explorer.mlx`](explorer.mlx)). Below it, *View* switches
+between the **Map** and the **Editor** (Ctrl+E); see
+[The editor](#the-editor) and [Build and commit](#build-and-commit).
 
 ![A flight through this repository: the galaxy turns, a search finds
 drawSidebar, the camera flies to it and to its group, the spheres take
@@ -294,7 +301,7 @@ each group are joined by magenta lines in space.
   commits, complexity, copies and missing checks together
   ([`measures.mlx`](../../tools/codemap/measures.mlx)).
 - **Hot:** where the programs spend their time, from the profiles of
-  `mlx-profile`. With a built program chosen under Program, *Profile* in
+  `mlx-profile`. With a built program chosen under Programs, *Profile* in
   the panel runs it under `mlx-profile` (next to `mlx-codemap`, else on
   the `PATH`); when it ends, its profile is read. The GPU's profile
   (`MLX_GPU_PROFILE`, which `mlx-profile` sets) adds the time the GPU
@@ -306,14 +313,18 @@ each group are joined by magenta lines in space.
   `MLX_LEAK_CHECK=1` (std.leaks writes it about once a second; see
   [the standard library](../../docs/reference/stdlib.md)), lime green.
   The panel lists the programs that wrote their memory, running first (a
-  click shows one), and with a built program chosen under Program,
-  *Watch memory* runs it with the watch on. Then what it holds, what its
-  page blocks waste by size class (a bar each: the pages, what was asked
-  filled in), and its address space as a strip: each block as full as
-  its pages are (green nearly full, amber half, red mostly waste), gray
-  where other mappings lie between the blocks and empty where nothing
-  is mapped, with the holes counted and a fragmentation index (0: one
-  hole or none, near 1: many small ones). Below, the functions whose
+  click shows one), and with a built program chosen under Programs,
+  *Watch memory* runs it with the watch on. Then what it holds; how its
+  small blocks share the tiny pages (std.tinypage_allocator: blocks of
+  up to 2 KiB are runs of 64-byte tiny pages), as a strip of those pages
+  each filled as far as it is taken, the room above the fill where a
+  small block still fits; what its blocks waste by size class (a bar
+  each: the pages, what was asked filled in), and the address space of
+  its blocks of whole pages as a strip: each block as full as its pages
+  are (green nearly full, amber half, red mostly waste), gray where
+  other mappings lie between the blocks and empty where nothing is
+  mapped, with the holes counted and a fragmentation index (0: one hole
+  or none, near 1: many small ones). Below, the functions whose
   blocks hold the most, with their blocks, those since `leaks.mark`, kept
   ones and how many more than when first looked at (`+`, a leak's sign).
   It is read again each second while the panel is open
@@ -342,8 +353,9 @@ made of. Checks are programs of their own kind: the files under `tests/`,
 `check_*.mlx`, test blocks, and what the check scripts
 (`tools/check_*.sh`, `tests/run_*.sh`) build.
 
-The sidebar's *Program* list shows one program: what it does not reach is
-left out, and the camera flies to what is left.
+*Programs* at the top of the sidebar shows one program: what it does not
+reach is left out, the camera flies to what is left, and the explorer
+under it lists the program's files.
 
 Built programs are found by their symbol table
 ([`binaries.mlx`](../../tools/codemap/binaries.mlx)): beside the codemap
@@ -520,7 +532,7 @@ the whole code again, which it does when files change on disk.
 into `ROOT/mlx-out/bin/NAME` in the background: in the editor, the
 program whose `main` is the file shown, else the one chosen under
 Program, else the first program that reaches the file; in the map, the
-one chosen under Program. The status bar says how long it took; a failed
+one chosen under Programs. The status bar says how long it took; a failed
 build opens its first error in the editor. The new binary's machine code
 goes on the declarations at once.
 
@@ -576,6 +588,7 @@ The compiler for checks and Build is `$MLX_COMPILER`, else the root's
 | the bookmark, Ctrl+S (in the map) | keeps the query in the search as a view (codemap.views) |
 | Since ... (toolbar) | the base of Changed: not committed yet, or one of the last 15 commits |
 | a section's heading | folds it up or opens it (kept in `~/.config/mlx/observatory-sections`) |
+| a folder / a file in the explorer (Programs) | opens or closes it / selects the file (the map flies there, the editor opens it) |
 | Escape | close a list, clear the search, then the selection, then go up a group (in the editor: only the list and the search) |
 | Enter | fly to the selection |
 | Alt+Up | its group |
@@ -750,7 +763,8 @@ answers are `path:line:col: kind Qualified.name` lines.
 
 The pictures above are made by the app itself: `MLX_CODEMAP_DEMO` names a
 script it plays (search, select, open a finding, color by a measure,
-choose a program, fold a section, ...; see `runDemo` in
+choose a program, open a folder or a file in the explorer with
+`explore NAME`, fold a section, ...; see `runDemo` in
 [`main.mlx`](main.mlx)), and it writes the frames it shows into
 `MLX_CODEMAP_DEMO_OUT`. While a demo plays, flights go by its own clock:
 each recorded frame moves it on by the interval asked for, so a recording
@@ -777,9 +791,11 @@ committed).
    program that must still build and exit the same.
 3. Runs the app under `tools/wayland-test-host` on a small tree, first on
    lavapipe, then on the CPU. In each run it searches, selects, checks the
-   connections of what was selected, clicks a group and then its check box,
-   types a query into the search, keeps it with the bookmark, adds a word
-   with Filter and folds the Groups up and open again. It starts with
+   connections of what was selected, closes the folder the selection
+   opened in the explorer, clicks a group and then its check box, chooses
+   the program, types a query into the search, keeps it with the
+   bookmark, adds a word with Filter, folds the Groups up and open again
+   and selects the program's main file in the explorer. It starts with
    `--diff HEAD~1`, so Changed holds the function changed by the second
    commit.
    `MLX_CODEMAP_TRACE`

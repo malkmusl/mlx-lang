@@ -205,8 +205,12 @@ status=0
 [[ ! -s "$work/rewrite.txt" ]] || fail "no workaround should be left after the rewrites" "$work/rewrite.txt"
 echo "ok   the command line: rewrite dropped and counted (preview, --apply)"
 
-# The app: at 1180x760 the sidebar's group rows are 26 apart from y 106
-# (Alles, app, lib), under the view switch.
+# The app at 1180x760, its sidebar from the top: Programs (the row at y
+# 55, opened its choices 20 apart from y 78; under it the explorer's rows
+# 20 apart from y 78: app, lib), View, then the group rows 26 apart from
+# y 219 (Alles, app, lib) and Color by with Machine code at y 717.
+# Selecting greet opens lib in the explorer; a click on lib closes it
+# again, so the rows below are where they were.
 cat > "$work/app.script" <<SCRIPT
 wait 4000
 shot SHOTS/start.ppm
@@ -222,26 +226,30 @@ wait 300
 down 1
 up 1
 wait 1500
-pointer 60 145
+pointer 100 99
+press 272
+release 272
+wait 300
+pointer 60 245
 wait 200
 press 272
 release 272
 wait 4000
 shot SHOTS/group.ppm
-pointer 20 171
+pointer 20 271
 wait 200
 press 272
 release 272
 wait 1000
-pointer 100 674
+pointer 100 717
 press 272
 release 272
 wait 500
-pointer 100 229
+pointer 100 55
 press 272
 release 272
 wait 500
-pointer 100 272
+pointer 100 98
 press 272
 release 272
 wait 2000
@@ -260,13 +268,18 @@ pointer 700 67
 press 272
 release 272
 wait 800
-pointer 100 90
+pointer 100 211
 press 272
 release 272
 wait 300
 press 272
 release 272
 wait 300
+pointer 100 98
+press 272
+release 272
+wait 1000
+shot SHOTS/explorer.ppm
 close
 SCRIPT
 
@@ -319,6 +332,12 @@ run() {
     grep -q "^codemap: view saved Ansicht [0-9]*$" "$log" || fail "codemap ($name): the bookmark did not keep the query as a view" "$log"
     grep -q "^codemap: filter word " "$log" || fail "codemap ($name): the filter's first word was not added" "$log"
     grep -q "^codemap: section 0 folded$" "$log" && grep -q "^codemap: section 0 opened$" "$log" || fail "codemap ($name): the heading Groups did not fold up and open" "$log"
+    # The explorer: selecting greet opened lib, a click closes it; with
+    # the program app chosen the way to its main file is open, and a click
+    # on main.mlx selects the file.
+    grep -q "^codemap: explorer closed lib$" "$log" || fail "codemap ($name): the explorer's lib did not close with a click" "$log"
+    grep -q "^codemap: explorer file main.mlx$" "$log" && grep -q "^codemap: selected tree/app/main.mlx/$" "$log" \
+        || fail "codemap ($name): a click on main.mlx in the explorer did not select it" "$log"
     python3 - "$shots/start.ppm" "$shots/selected.ppm" <<'PY' || fail "codemap ($name): the view or the detail panel is not drawn" "$log"
 import sys
 def load(path):
