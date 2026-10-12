@@ -10,8 +10,9 @@
 # (mlx1 builds the compiler, which builds itself). When mlx4 is older than
 # the compiler's sources and
 # lacks something they added since (each feature below has a probe), it is
-# rebuilt in two stages (mlx4 builds the new compiler, which builds itself)
-# and installed once it has every feature; the message names what was
+# rebuilt in two stages (mlx4 builds the new compiler, which builds itself;
+# one or two more when that is not yet the fixed point) and installed once
+# it has every feature; the message names what was
 # missing. A rebuild that does not help (the old compiler cannot build the
 # sources, or the result still lacks a feature) falls back to the bootstrap
 # chain, and failing that leaves the old compiler in place and exits 1
@@ -292,6 +293,25 @@ stores_through_slice_addresses() {
     return $ok
 }
 
+# Whether tuples of more than three words come back from a call whole and
+# a part taken out of one keeps its type (tests/311_wide_tuple_runtime.mlx
+# exits 13); older compilers returned three words at most and lost a
+# slice's length taken out of a tuple. The same round of fixes typed field
+# addresses by their place, resolved module declarations in any order and
+# lowered module constants of floats and structs.
+returns_wide_tuples() {
+    local probe
+    probe=$(mktemp -d mlx-out/probe.XXXXXX)
+    local ok=1
+    if "$1" --quiet tests/311_wide_tuple_runtime.mlx -o "$probe/probe" > /dev/null 2>&1; then
+        local status=0
+        "$probe/probe" > /dev/null 2>&1 || status=$?
+        [[ $status -eq 13 ]] && ok=0
+    fi
+    rm -rf -- "$probe"
+    return $ok
+}
+
 # Whether $1 writes the files it read with --depfile (what `mlx build`
 # decides rebuilds by).
 writes_depfiles() {
@@ -337,6 +357,7 @@ probes=(
     "builds_mlxlibc|what mlxlibc needs (@frameAddress, signed loads through pointers, array initializers of module vars, --entry and --init)"
     "decodes_escapes|\\xHH escapes"
     "stores_through_slice_addresses|slices stored through their address keeping their length"
+    "returns_wide_tuples|tuples of more than three words"
     "writes_depfiles|--depfile"
     "runs_build|the build command (mlx build)"
 )
@@ -375,6 +396,23 @@ rebuild_with() {
         rm -f "$next" "$fixed"
         return 1
     fi
+    # A seed with a bug the new sources fixed builds a stage-1 compiler that
+    # still behaves the old way in that spot (a cast it got wrong, say), so
+    # stage 2 can differ from what stage 2 builds in turn. Up to two more
+    # stages then reach the fixed point: the compiler that builds itself
+    # byte for byte.
+    local again=$canonical.again extra
+    for extra in 3 4; do
+        if ! build_stage "$fixed" "$again" "stage $extra: the compiler builds itself again, for its fixed point"; then
+            rm -f "$again"
+            break
+        fi
+        if cmp -s "$fixed" "$again"; then
+            rm -f "$again"
+            break
+        fi
+        mv "$again" "$fixed"
+    done
     local still
     still=$(missing_features "$fixed")
     if [[ -n "$still" ]]; then

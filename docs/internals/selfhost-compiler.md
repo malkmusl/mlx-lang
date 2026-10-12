@@ -328,6 +328,22 @@ everywhere else in the compiler — there is no separate error-collection
 object; a sema function renders its own diagnostic immediately and returns
 an error count.
 
+Module-level declarations resolve in any order. `root` still walks the
+module top to bottom, but a constant or variable of the module that is
+needed before the walk reached it (a type declared further down, named in
+a field, a signature or another declaration's type) is analyzed then, in
+the module's scope (`analyzeAhead`), and `root` skips it later; one that is
+being analyzed already is part of a cycle and stays unresolved. Before an
+aggregate appends its first field, or a tuple or function type its first
+part, the names its member types use are analyzed ahead
+(`analyzeTypeAhead`), so a type analyzed in the middle cannot append its
+own fields between them (`tests/308_declaration_order_runtime.mlx`). A
+struct or union naming a field twice is rejected with `MLX-E3002`
+(`tests/313_duplicate_field.mlx`). `&place` is as writable as the place:
+`&value.field` of a variable, `&pointer.*.field` through a mutable pointer
+and `&array[i]` are `*T`, through a constant `*const T`
+(`tests/307_field_address_runtime.mlx`).
+
 ## Comptime evaluation (`sema/comptime/evaluate.mlx`)
 
 Comptime evaluation is a small recursive tree-walking evaluator over a
@@ -520,6 +536,26 @@ covering both an array field and a nested-struct field, both as a local and
 as a function return value, with a sibling field that gets a real value in
 the same literal to prove the fix doesn't over-skip.
 
+A `for` capture of a struct, union or array element is a copy in the
+frame (the address a `const` local of that type would hold), and one of
+a slice or another value of several words is stored a word per component
+(`tests/304_for_aggregate_capture_runtime.mlx`). A bare `return` in a
+`!void` function returns zero, as falling off its end does
+(`tests/305_bare_return_error_union_runtime.mlx`). `@bitCast` and
+`@intCast` to an integer of the other signedness and no greater width
+extend the register again as the new type does (a mask for unsigned, a
+shift pair for signed), so a later widening follows the new type
+(`tests/306_cast_signedness_runtime.mlx`). A module-level constant the
+comptime evaluator holds no value for (a float, a struct, array or tuple
+literal, slices in it) lowers to its initializer where it is used, in its
+own module and with bindings of its own, so a local of the using function
+does not stand in for a name of the constant's module
+(`lowerConstantInitializer`, `tests/310_module_constants_runtime.mlx`).
+`pair.1` has the tuple part's type, so a local made from it takes all its
+words (`tests/311_wide_tuple_runtime.mlx`). In a type position `[N]T` never
+starts a literal, so `[2][3]u16{ [3]u16{ ... }, ... }` is one literal of
+arrays (`tests/309_nested_array_literal_runtime.mlx`).
+
 ## x86_64 backend (`backend/x86_64/codegen.mlx`, `codegen/emitter.mlx`)
 
 `backend/x86_64/codegen.mlx`'s `Codegen` is a thin public facade (matching
@@ -686,6 +722,15 @@ with no awareness of aggregate sizes at all) to also account for the total
 concurrent aggregate-local footprint of a function, which this port did not
 attempt. No fix or regression test exists for this in the compiler itself
 yet.
+
+Between Mlx functions a value of several words comes back a word per
+register: `rax`, `rdx`, `rcx`, `r8`, `r9`, `r10`, `r11`, `rsi`, `rdi`
+(`state_module.returnRegister`, nine words; `x0` to `x7` on aarch64), and
+the caller stores them right after the call. The component table and the
+frame budget size themselves by the widest value of the program, a tuple
+built or a call's result (`maximumComponentCount`, `functionFrameSize`);
+before, three words came back and a fourth was lost
+(`tests/311_wide_tuple_runtime.mlx`).
 
 ## ELF64 object writer (`object/elf64.mlx`)
 

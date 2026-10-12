@@ -323,6 +323,12 @@ fn triple() -> (u64, u64, u64) {
 
 (`tests/117_multi_return_memory_runtime.mlx`)
 
+The self-hosted compiler returns a tuple between Mlx functions in
+registers instead, a word per register (`rax`, `rdx`, `rcx`, `r8`, `r9`,
+`r10`, `r11`, `rsi`, `rdi`; `x0` to `x7` on aarch64), so a tuple holding a
+slice and two integers comes back whole
+(`tests/311_wide_tuple_runtime.mlx`). Exported functions keep the C ABI.
+
 ## Error unions (`!T`) across the call boundary
 
 `ErrorUnionReturn` defines a dedicated transport shape for `!T`: the error

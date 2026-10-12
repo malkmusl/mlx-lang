@@ -1611,7 +1611,12 @@ fn lowerNodeHere(builder: *LirBuilder, node_index: usize) -> usize {
                 return lir.addInst(builder.*.lir, union_return)
             }
         }
-        return lir.addInst(builder.*.lir, lir.retInst(builder.*.currentReturnType, val))
+        // A bare `return` leaves nothing in the return register but what the
+        // last call put there, which a `!void` caller reads as an error;
+        // it returns zero, as falling off the end does.
+        var returned = val
+        if returned == lir.NONE && n.rhs == ast.NONE { returned = lir.addInst(builder.*.lir, lir.constI(builder.*.currentReturnType, 0)) }
+        return lir.addInst(builder.*.lir, lir.retInst(builder.*.currentReturnType, returned))
     }
     if n.tag == ast.Tag.block {
         return lowerBlock(builder, node_index)
@@ -2528,9 +2533,30 @@ fn lowerBuiltin(builder: *LirBuilder, node_index: usize) -> usize {
         // builtin's destination through contextual coercion.  The emitted LIR
         // value retains the actual source representation used by codegen.
         conversion.arg1 = lir.getInst(builder.*.lir, value).typeId
-        return lir.addInst(builder.*.lir, conversion)
+        const converted = lir.addInst(builder.*.lir, conversion)
+        if kind == builtins.Kind.intCast || kind == builtins.Kind.bitCast { return extendAsType(builder, converted, expressionType(builder, argument), result_type_id) }
+        return converted
     }
     return lir.NONE
+}
+
+// An integer narrower than 64 bits keeps the rest of its register as its
+// type extends it: zeros when unsigned, copies of the sign when signed.
+// A cast that changes the signedness without widening must extend again,
+// or a later widening carries the old rule over (-3 as an i32 bit-cast to
+// u32 and widened to u64 would stay 0xFFFF_FFFF_FFFF_FFFD).
+fn extendAsType(builder: *LirBuilder, value: usize, source_type_id: usize, result_type_id: usize) -> usize {
+    if source_type_id == 0 || result_type_id == 0 { return value }
+    const source_type = types_store.Store.get(builder.*.typeStore, source_type_id)
+    const result_type = types_store.Store.get(builder.*.typeStore, result_type_id)
+    if source_type.*.kind != types_store.Kind.integer || result_type.*.kind != types_store.Kind.integer { return value }
+    const bits = integerBitWidth(builder, result_type_id)
+    const result_signed = result_type.*.flags & types_store.FLAG_SIGNED != 0
+    if bits >= 64 || bits > integerBitWidth(builder, source_type_id) || result_signed == (source_type.*.flags & types_store.FLAG_SIGNED != 0) { return value }
+    if !result_signed { return maskInteger(builder, value, result_type_id) }
+    const shift = lir.addInst(builder.*.lir, lir.constI(lir.NONE, 64 - bits))
+    const raised = lir.addInst(builder.*.lir, lir.binary(lir.Opcode.shl, result_type_id, value, shift))
+    return lir.addInst(builder.*.lir, lir.binary(lir.Opcode.shr, result_type_id, raised, shift))
 }
 
 fn lowerFieldAddress(builder: *LirBuilder, node_index: usize) -> usize {
@@ -2602,13 +2628,19 @@ fn lowerSymbolValue(builder: *LirBuilder, symbol_index: usize, symbol: *symbol_m
         return lir.addInst(builder.*.lir, function_inst)
     }
     if isGlobalSymbol(symbol) { return lowerGlobalValue(builder, symbol_index, symbol) }
-    return lowerStringConstant(builder, symbol, module_id)
+    return lowerConstantInitializer(builder, symbol, module_id)
 }
 
-// A module-level `const NAME = "text"` used as a value lowers to its string
-// literal (emitted with the program's other literals).
-fn lowerStringConstant(builder: *LirBuilder, symbol: *symbol_module.Symbol, module_id: usize) -> usize {
+// A module-level constant the comptime evaluator has no value for lowers
+// to its initializer, in its own module, where it is used: a string to its
+// literal (emitted with the program's other literals), a float to its
+// constant, a struct, array or tuple literal (slices in it too) to a value
+// built there. The initializer gets bindings of its own while it is
+// lowered: a local of the using function must not stand in for a name of
+// the constant's module.
+fn lowerConstantInitializer(builder: *LirBuilder, symbol: *symbol_module.Symbol, module_id: usize) -> usize {
     if symbol.*.declaration == ast.NONE { return lir.NONE }
+    const type_id = symbol.*.typeId
     const previous_module = builder.*.currentModuleId
     if module_id != previous_module { switchToModule(builder, module_id) }
     var result = lir.NONE
@@ -2617,7 +2649,19 @@ fn lowerStringConstant(builder: *LirBuilder, symbol: *symbol_module.Symbol, modu
         const declaration = ast_store.Store.get(nodes, symbol.*.declaration)
         if declaration.tag == ast.Tag.constant_declaration && declaration.rhs != ast.NONE {
             const initializer = ast_store.Store.get(nodes, declaration.rhs)
-            if initializer.tag == ast.Tag.string_literal { result = lowerStringLiteral(builder, initializer.mainToken) }
+            if initializer.tag == ast.Tag.string_literal {
+                result = lowerStringLiteral(builder, initializer.mainToken)
+            } else if initializer.tag == ast.Tag.float_literal || initializer.tag == ast.Tag.unary_expression || initializer.tag == ast.Tag.binary_expression || initializer.tag == ast.Tag.aggregate_literal || initializer.tag == ast.Tag.array_literal || initializer.tag == ast.Tag.tuple_literal {
+                var own_bindings: vector.Vector = undefined
+                vector.Vector.initAt(&own_bindings, builder.*.allocator, @sizeOf(Binding), @alignOf(Binding), 4)
+                const saved_bindings = builder.*.bindings
+                const components_length = builder.*.bindingComponents.*.length
+                builder.*.bindings = &own_bindings
+                result = widenToType(builder, narrowFloat(builder, lowerNode(builder, declaration.rhs), type_id), type_id)
+                builder.*.bindings = saved_bindings
+                builder.*.bindingComponents.*.length = components_length
+                vector.Vector.deinit(own_bindings)
+            }
         }
     }
     if module_id != previous_module { switchToModule(builder, previous_module) }
@@ -2894,6 +2938,12 @@ fn expressionTypeUncached(builder: *LirBuilder, node_index: usize) -> usize {
         const metadata = fieldMetadata(builder, base_type, node.mainToken)
         if metadata.found { return metadata.typeId }
         const base = types_store.Store.get(builder.*.typeStore, base_type)
+        // `pair.1`: the tuple's part; a local made from it takes the part's
+        // words (a slice its two).
+        if base.*.kind == types_store.Kind.tuple && tokenKind(builder, node.mainToken) == lexer.Kind.integer {
+            const part = lowerIntValue(builder, node.mainToken)
+            if part < base.*.extraLength { return types_store.Store.extraAt(builder.*.typeStore, base.*.extraStart + part) }
+        }
         if base.*.kind == types_store.Kind.slice || base.*.kind == types_store.Kind.array { return types_store.Store.sizeInteger(builder.*.typeStore, false) }
         return 0
     }
@@ -4251,10 +4301,16 @@ fn lowerIterableFor(builder: *LirBuilder, node_index: usize) -> usize {
     lir.addInst(builder.*.lir, index_store)
 
     const capture = ast_store.Store.get(nodes, node.extra)
-    const capture_address = lir.addInst(builder.*.lir, lir.initInst(lir.Opcode.alloca, lir.NONE))
     var capture_type = element_type
     if capture.extra & 1 != 0 { capture_type = types_store.Store.pointer(builder.*.typeStore, element_type, false, false, false) }
-    pushBinding(builder, tokenPointer(builder, capture.mainToken), tokenLength(builder, capture.mainToken), capture_address, lir.NONE, lir.NONE, capture_type)
+    // A slice or another value of several words is stored a word per
+    // component, as a local of that type is.
+    const capture_name = tokenPointer(builder, capture.mainToken)
+    const capture_name_length = tokenLength(builder, capture.mainToken)
+    const capture_words = typeWordCount(builder, capture_type)
+    const capture_components = builder.*.bindingComponents.*.length
+    appendComponentStorage(builder, capture_name, capture_name_length, capture_words)
+    pushBindingComponents(builder, capture_name, capture_name_length, capture_components, capture_words, capture_type)
     if capture.endToken != ast.NONE {
         pushBinding(builder, tokenPointer(builder, capture.endToken), tokenLength(builder, capture.endToken), index_address, lir.NONE, lir.NONE, types_store.Store.sizeInteger(builder.*.typeStore, false))
     }
@@ -4287,18 +4343,31 @@ fn lowerIterableFor(builder: *LirBuilder, node_index: usize) -> usize {
     element_address_inst.arg2 = stride
     const element_address = lir.addInst(builder.*.lir, element_address_inst)
     var capture_value = element_address
-    if capture.extra & 1 == 0 {
-        var element_load = lir.initInst(lir.Opcode.load, element_type)
-        element_load.arg0 = element_address
-        element_load.arg1 = storageWidth(builder, element_type)
-        if isSignedIntegerType(builder, element_type) { element_load.arg2 = 1 }
-        capture_value = lir.addInst(builder.*.lir, element_load)
+    if capture.extra & 1 == 0 && aggregate_copy.isMemoryType(builder.*.typeStore, element_type) {
+        // A struct, union or array is held by its address, as a `const`
+        // local of that type is; loading it would hand the body its first
+        // word as that address. The copy keeps the capture a value when the
+        // body changes the element through the iterable.
+        capture_value = copyAggregate(builder, element_address, element_type, true)
+    } else if capture.extra & 1 == 0 {
+        capture_value = lowerMemoryValue(builder, element_address, element_type)
     }
-    var capture_store = lir.initInst(lir.Opcode.store, capture_type)
-    capture_store.arg0 = capture_address
-    capture_store.arg1 = capture_value
-    capture_store.arg2 = storageWidth(builder, capture_type)
-    lir.addInst(builder.*.lir, capture_store)
+    var capture_component: usize = 0
+    while capture_component < capture_words {
+        var component_value = capture_value
+        if capture_component > 0 {
+            var extract = lir.initInst(lir.Opcode.tuple_element, lir.NONE)
+            extract.arg0 = capture_value
+            extract.arg1 = capture_component
+            component_value = lir.addInst(builder.*.lir, extract)
+        }
+        var capture_store = lir.initInst(lir.Opcode.store, if capture_component == 0 { capture_type } else { lir.NONE })
+        capture_store.arg0 = bindingComponentAt(builder, capture_components + capture_component)
+        capture_store.arg1 = component_value
+        capture_store.arg2 = if capture_component == 0 { storageWidth(builder, capture_type) } else { 8 }
+        lir.addInst(builder.*.lir, capture_store)
+        capture_component += 1
+    }
 
     const result_address = lir.addInst(builder.*.lir, lir.initInst(lir.Opcode.alloca, lir.NONE))
     pushLoopTarget(builder, node.endToken, end_block, update_block, result_address)

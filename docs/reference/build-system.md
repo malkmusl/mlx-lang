@@ -145,7 +145,9 @@ implemented: this repository has no packages from elsewhere.
 `./mlx` (the root script) runs this checkout's compiler,
 `mlx-out/bin/compiler/mlx4`, after making it when it is missing or a file
 of `compiler/selfhost` or `std/bootstrap` changed (`tools/ensure_compiler.sh`:
-from an older `mlx4`, else from the bootstrap compiler, which needs zig).
+from an older `mlx4`, else from the bootstrap compiler, which needs zig; in
+two stages, and one or two more until the compiler builds itself byte for
+byte, when the older one still had a bug the new sources fixed).
 `mlx build ARGS` is a subcommand of the compiler
 (`compiler/selfhost/driver/build_command.mlx`): it writes
 `mlx-out/build/runner.mlx`, a main that imports `../../build.mlx` and
