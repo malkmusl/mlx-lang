@@ -456,6 +456,27 @@ returns_into_caller_storage() {
     return $ok
 }
 
+# Whether $1 tests a chain of equality comparisons as one bit mask (the
+# metric tests/330_conditions_runtime.mlx reports).
+tests_equality_chains() {
+    local probe output
+    probe=$(mktemp -d mlx-out/probe.XXXXXX)
+    output=$("$1" tests/330_conditions_runtime.mlx -o "$probe/probe" 2>&1) || true
+    rm -rf -- "$probe"
+    grep -q "equality chains tested as one bit mask: [1-9]" <<< "$output"
+}
+
+# Whether $1's arena has room for the largest programs here: 1 GiB of
+# address space (projects/observatory took 252 MiB of the former 256 MiB,
+# and the arena running full showed as a symbol never defined).
+holds_large_programs() {
+    local probe output
+    probe=$(mktemp -d mlx-out/probe.XXXXXX)
+    output=$("$1" tests/01_basic.mlx -o "$probe/probe" 2>&1) || true
+    rm -rf -- "$probe"
+    grep -q "compiler arena capacity: 1073741824" <<< "$output"
+}
+
 # Whether $1 writes the files it read with --depfile (what `mlx build`
 # decides rebuilds by).
 writes_depfiles() {
@@ -512,6 +533,8 @@ probes=(
     "enforces_unsafe|pointer casts outside unsafe rejected (MLX-E7004)"
     "keeps_aggregates_in_frame|aggregates that stay in their function kept in the frame"
     "returns_into_caller_storage|struct, union and array results in storage the caller provides"
+    "tests_equality_chains|conditions as jumps, equality chains as bit masks"
+    "holds_large_programs|an arena with room for the largest programs"
     "writes_depfiles|--depfile"
     "runs_build|the build command (mlx build)"
 )

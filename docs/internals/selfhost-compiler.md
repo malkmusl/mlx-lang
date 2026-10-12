@@ -120,8 +120,15 @@ when the bound is hit.
 
 `main.mlx` delegates everything to `driver/pipeline.mlx`'s `Pipeline.compile`,
 which runs inside one `unsafe` block and drives the whole compilation
-through an arena allocator (`arena_allocator.init(pages, 268435456)` — a
-256&nbsp;MiB arena) that is freed in one shot at the end:
+through an arena allocator (`arena_allocator.init(pages, 1073741824)` — a
+1&nbsp;GiB arena of address space, whose pages are touched only as it fills)
+that is freed in one shot at the end. `projects/observatory` takes 252&nbsp;MiB
+of it, which was all but the whole of the former 256&nbsp;MiB; a request the
+arena cannot hold ends the compile with "the compiler's arena is full"
+(status 9) instead of a null its caller would unwrap into a trap, or turn
+into a symbol never defined (`compilerAlloc` and `compilerRemap` wrap the
+arena's functions). The metric "compiler arena capacity" names the size,
+which `tools/ensure_compiler.sh` probes. The compile in outline:
 
 ```mlx
 pub const Pipeline = struct {
@@ -419,6 +426,18 @@ one opcode per variant. Every `Inst` is a fixed-size record — `opcode`,
 `flags`, `typeId`, and three generic operand slots `arg0`/`arg1`/`arg2` —
 stored in a flat growable vector exactly like AST nodes and types are, with
 `NONE` again used as the absent-operand sentinel.
+
+The condition of an `if` or a `while` lowers to jumps (`lowerBranch`):
+`&&` and `||` branch on their left side and reach the right one only when
+it decides, and `!` swaps the targets, instead of each operator storing a
+0 or 1 into a slot that is then loaded and tested (`lowerLogical`, still
+used where the result is a value). A chain `x == A || x == B || ...` of
+at least three comparisons of one local, field or dereferenced value of
+unsigned or enum type with constants below 128 becomes one test of the
+value's bit in a mask of the constants (`lowerMembership`, counted by the
+metric "equality chains tested as one bit mask"), as a condition and as a
+value; the compiler's own LIR shrank by 5 % and its run by 17 % with both
+(`tests/330_conditions_runtime.mlx`).
 
 `ir/lower.mlx` is the AST/sema-to-LIR translator. Its `LirBuilder` carries
 substantial per-function lowering state, including a `Binding` record per

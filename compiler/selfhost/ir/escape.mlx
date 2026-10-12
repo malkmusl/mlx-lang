@@ -36,6 +36,7 @@
 // memory, so a moved region is zeroed where it is made, unless a copy of
 // the whole value fills it right away.
 const allocator_module = @import("../../../std/bootstrap/allocator.mlx")
+const page_allocator = @import("../../../std/bootstrap/page_allocator.mlx")
 const lir = @import("./lir.mlx")
 
 pub const Result = struct {
@@ -126,7 +127,25 @@ const Analysis = struct {
     // asks for another pass (mark).
     cursor: usize
     again: bool
+    // The instructions of a few kinds, in order (prepare), so the passes
+    // that look at them alone do not walk the whole program: values with
+    // a root source, loads and stores of clean slots, branches, block
+    // labels, direct calls and arena allocations.
+    rooted: [*]usize
+    rootedCount: usize
+    slotOps: [*]usize
+    slotOpCount: usize
+    branches: [*]usize
+    branchCount: usize
+    blockLabels: [*]usize
+    blockLabelCount: usize
+    calls: [*]usize
+    callCount: usize
+    allocations: [*]usize
+    allocationCount: usize
 }
+
+const LISTS: usize = 6
 
 pub fn run(ir: *lir.Lir, allocator: allocator_module.Allocator) -> Result {
     var result = Result.{ .regions = 0, .bytes = 0, .slotMismatches = 0 }
@@ -145,6 +164,11 @@ pub fn run(ir: *lir.Lir, allocator: allocator_module.Allocator) -> Result {
     const kind_memory = allocator.alloc(count, 8).?
     const source_memory = allocator.alloc(count, 8).?
     const opcode_kind_memory = allocator.alloc(256, 8).?
+    // The lists are as long as the program and only live while this runs:
+    // from pages given back at the end, not from the compiler's arena,
+    // which keeps all it hands out.
+    const pages = page_allocator.init()
+    const list_memory = pages.alloc(LISTS * count * 8, 8).?
     const opcode_share_memory = allocator.alloc(256, 8).?
     unsafe {
         var analysis = Analysis.{
@@ -167,6 +191,18 @@ pub fn run(ir: *lir.Lir, allocator: allocator_module.Allocator) -> Result {
             .opcodeShares = opcode_share_memory,
             .cursor = 0,
             .again = false,
+            .rooted = @ptrCast([*]usize, list_memory),
+            .rootedCount = 0,
+            .slotOps = @ptrFromInt([*]usize, @intFromPtr(list_memory) + count * 8),
+            .slotOpCount = 0,
+            .branches = @ptrFromInt([*]usize, @intFromPtr(list_memory) + count * 16),
+            .branchCount = 0,
+            .blockLabels = @ptrFromInt([*]usize, @intFromPtr(list_memory) + count * 24),
+            .blockLabelCount = 0,
+            .calls = @ptrFromInt([*]usize, @intFromPtr(list_memory) + count * 32),
+            .callCount = 0,
+            .allocations = @ptrFromInt([*]usize, @intFromPtr(list_memory) + count * 40),
+            .allocationCount = 0,
         }
         prepare(&analysis)
         const mismatches = slotMismatches(&analysis)
@@ -187,12 +223,19 @@ pub fn run(ir: *lir.Lir, allocator: allocator_module.Allocator) -> Result {
     allocator.free(kind_memory, count, 8)
     allocator.free(source_memory, count, 8)
     allocator.free(opcode_kind_memory, 256, 8)
+    pages.free(list_memory, LISTS * count * 8, 8)
     allocator.free(opcode_share_memory, 256, 8)
     return result
 }
 
 fn isFunctionLabel(inst: *lir.Inst) -> bool {
     return inst.*.opcode == lir.Opcode.label && inst.*.arg0 != lir.NONE
+}
+
+// Whether instruction `index` is in a function's body: after the first
+// function's label (the lists hold what comes before it too).
+fn insideFunction(a: *Analysis, index: usize) -> bool {
+    return a.*.functionCount > 0 && a.*.functionStarts[0] < index
 }
 
 fn functionEnd(a: *Analysis, function: usize) -> usize {
@@ -221,6 +264,20 @@ fn prepare(a: *Analysis) -> void {
         a.*.holds[index] = UNSET
         const inst = lir.instAt(a.*.ir, index)
         a.*.kinds[index] = kindOf(a, inst)
+        const op = inst.*.opcode
+        if op == lir.Opcode.br || op == lir.Opcode.condbr || op == lir.Opcode.icmp_br {
+            a.*.branches[a.*.branchCount] = index
+            a.*.branchCount += 1
+        } else if op == lir.Opcode.direct_call {
+            a.*.calls[a.*.callCount] = index
+            a.*.callCount += 1
+        } else if op == lir.Opcode.alloca && inst.*.arg0 != lir.NONE {
+            a.*.allocations[a.*.allocationCount] = index
+            a.*.allocationCount += 1
+        } else if op == lir.Opcode.label && inst.*.arg0 == lir.NONE && inst.*.arg1 != lir.NONE {
+            a.*.blockLabels[a.*.blockLabelCount] = index
+            a.*.blockLabelCount += 1
+        }
         if isFunctionLabel(inst) {
             const function = a.*.functionCount
             a.*.functionStarts[function] = index
@@ -326,37 +383,40 @@ fn opcodeShares(op: lir.Opcode) -> u8 {
 // of the allocation itself, in the allocation's block, with every load of
 // the slot after it. `holds` serves as each slot's store and is reset.
 fn markBindings(a: *Analysis) -> void {
-    var index: usize = 0
-    while index < a.*.count {
-        a.*.holds[index] = lir.NONE
-        index += 1
+    var at: usize = 0
+    while at < a.*.slotOpCount {
+        a.*.holds[lir.instAt(a.*.ir, a.*.slotOps[at]).*.arg0] = lir.NONE
+        at += 1
     }
-    index = 0
-    while index < a.*.count {
+    at = 0
+    while at < a.*.slotOpCount {
+        const index = a.*.slotOps[at]
         const inst = lir.instAt(a.*.ir, index)
-        if inst.*.opcode == lir.Opcode.store && isSlot(a, inst.*.arg0) {
+        if inst.*.opcode == lir.Opcode.store {
             a.*.holds[inst.*.arg0] = if a.*.holds[inst.*.arg0] == lir.NONE { index } else { UNSET }
         }
-        index += 1
+        at += 1
     }
     // A slot stored twice is UNSET now; one load before its store undoes
     // the binding too.
-    index = 0
-    while index < a.*.count {
+    at = 0
+    while at < a.*.slotOpCount {
+        const index = a.*.slotOps[at]
         const inst = lir.instAt(a.*.ir, index)
-        if inst.*.opcode == lir.Opcode.load && isSlot(a, inst.*.arg0) {
+        if inst.*.opcode == lir.Opcode.load {
             const store = a.*.holds[inst.*.arg0]
             if store != lir.NONE && store != UNSET && store >= index { a.*.holds[inst.*.arg0] = UNSET }
         }
-        index += 1
+        at += 1
     }
-    index = 0
-    while index < a.*.count {
+    at = 0
+    while at < a.*.slotOpCount {
+        const index = a.*.slotOps[at]
         const inst = lir.instAt(a.*.ir, index)
-        if inst.*.opcode == lir.Opcode.store && isSlot(a, inst.*.arg0) && a.*.flags[inst.*.arg0] & SHARED == 0 && a.*.holds[inst.*.arg0] == index && sameBlock(a, inst.*.arg1, index) {
+        if inst.*.opcode == lir.Opcode.store && a.*.holds[inst.*.arg0] == index && sameBlock(a, inst.*.arg1, index) {
             a.*.flags[index] = a.*.flags[index] | BINDING
         }
-        index += 1
+        at += 1
     }
 }
 
@@ -426,6 +486,14 @@ fn markRootSources(a: *Analysis) -> void {
             source = FROM_SLOT_STORE
         }
         a.*.rootSources[index] = source
+        if source != FROM_NOTHING {
+            a.*.rooted[a.*.rootedCount] = index
+            a.*.rootedCount += 1
+        }
+        if source == FROM_SLOT_LOAD || source == FROM_SLOT_STORE {
+            a.*.slotOps[a.*.slotOpCount] = index
+            a.*.slotOpCount += 1
+        }
         index += 1
     }
 }
@@ -452,8 +520,10 @@ fn merge(held: usize, root: usize) -> usize {
 // is unset counts as none.
 fn settleRoots(a: *Analysis, final: bool) -> bool {
     var changed = false
-    var index: usize = 0
-    while index < a.*.count {
+    var at: usize = 0
+    while at < a.*.rootedCount {
+        const index = a.*.rooted[at]
+        at += 1
         const source = a.*.rootSources[index]
         if source != FROM_NOTHING {
             var root = lir.NONE
@@ -484,10 +554,9 @@ fn settleRoots(a: *Analysis, final: bool) -> bool {
                 changed = true
             }
         }
-        index += 1
     }
     if final {
-        index = 0
+        var index: usize = 0
         while index < a.*.count {
             if a.*.holds[index] == UNSET { a.*.holds[index] = lir.NONE }
             index += 1
@@ -500,11 +569,11 @@ fn settleRoots(a: *Analysis, final: bool) -> bool {
 // loop.
 fn markLoops(a: *Analysis, allocator: allocator_module.Allocator) -> void {
     var blocks: usize = 0
-    var index: usize = 0
-    while index < a.*.count {
-        const inst = lir.instAt(a.*.ir, index)
-        if inst.*.opcode == lir.Opcode.label && inst.*.arg0 == lir.NONE && inst.*.arg1 != lir.NONE && inst.*.arg1 + 1 > blocks { blocks = inst.*.arg1 + 1 }
-        index += 1
+    var at: usize = 0
+    while at < a.*.blockLabelCount {
+        const block = lir.instAt(a.*.ir, a.*.blockLabels[at]).*.arg1
+        if block + 1 > blocks { blocks = block + 1 }
+        at += 1
     }
     if blocks == 0 { return }
     const memory = allocator.alloc(blocks * 8, 8).?
@@ -515,22 +584,23 @@ fn markLoops(a: *Analysis, allocator: allocator_module.Allocator) -> void {
             labels[block] = lir.NONE
             block += 1
         }
-        index = 0
-        while index < a.*.count {
-            const inst = lir.instAt(a.*.ir, index)
-            if inst.*.opcode == lir.Opcode.label && inst.*.arg0 == lir.NONE && inst.*.arg1 < blocks { labels[inst.*.arg1] = index }
-            index += 1
+        at = 0
+        while at < a.*.blockLabelCount {
+            const index = a.*.blockLabels[at]
+            labels[lir.instAt(a.*.ir, index).*.arg1] = index
+            at += 1
         }
-        index = 0
-        while index < a.*.count {
+        at = 0
+        while at < a.*.branchCount {
+            const index = a.*.branches[at]
             const inst = lir.instAt(a.*.ir, index)
             if inst.*.opcode == lir.Opcode.br {
                 markLoop(a, labels, blocks, inst.*.arg0, index)
-            } else if inst.*.opcode == lir.Opcode.condbr || inst.*.opcode == lir.Opcode.icmp_br {
+            } else {
                 markLoop(a, labels, blocks, inst.*.arg1, index)
                 markLoop(a, labels, blocks, inst.*.arg2, index)
             }
-            index += 1
+            at += 1
         }
     }
     allocator.free(memory, blocks * 8, 8)
@@ -632,10 +702,10 @@ fn calleeOf(a: *Analysis, inst: *lir.Inst) -> usize {
 
 fn countCalls(a: *Analysis) -> usize {
     var calls: usize = 0
-    var index: usize = 0
-    while index < a.*.count {
-        if calleeOf(a, lir.instAt(a.*.ir, index)) != lir.NONE { calls += 1 }
-        index += 1
+    var at: usize = 0
+    while at < a.*.callCount {
+        if calleeOf(a, lir.instAt(a.*.ir, a.*.calls[at])) != lir.NONE { calls += 1 }
+        at += 1
     }
     return calls
 }
@@ -647,35 +717,35 @@ fn indexCallers(a: *Analysis, offsets: [*]usize, callers: [*]usize) -> void {
         offsets[function] = 0
         function += 1
     }
-    function = 0
-    while function < a.*.functionCount {
-        var index = a.*.functionStarts[function] + 1
-        const end = functionEnd(a, function)
-        while index < end {
+    // Only calls inside a function count (code before the first function
+    // label has no caller to record), in both loops alike.
+    var at: usize = 0
+    while at < a.*.callCount {
+        const index = a.*.calls[at]
+        at += 1
+        if insideFunction(a, index) {
             const callee = calleeOf(a, lir.instAt(a.*.ir, index))
             if callee != lir.NONE { offsets[callee + 1] += 1 }
-            index += 1
         }
-        function += 1
     }
     function = 0
     while function < a.*.functionCount {
         offsets[function + 1] += offsets[function]
         function += 1
     }
+    // The calls come in order, so the function holding each is found by
+    // moving on through the functions.
     function = 0
-    while function < a.*.functionCount {
-        var index = a.*.functionStarts[function] + 1
-        const end = functionEnd(a, function)
-        while index < end {
-            const callee = calleeOf(a, lir.instAt(a.*.ir, index))
-            if callee != lir.NONE {
-                callers[offsets[callee]] = function
-                offsets[callee] += 1
-            }
-            index += 1
+    at = 0
+    while at < a.*.callCount {
+        const index = a.*.calls[at]
+        at += 1
+        while function + 1 < a.*.functionCount && a.*.functionStarts[function + 1] < index { function += 1 }
+        const callee = calleeOf(a, lir.instAt(a.*.ir, index))
+        if callee != lir.NONE && insideFunction(a, index) {
+            callers[offsets[callee]] = function
+            offsets[callee] += 1
         }
-        function += 1
     }
     // The fill moved each start to the next one's; move them back.
     function = a.*.functionCount
@@ -914,24 +984,26 @@ fn callArguments(a: *Analysis, inst: *lir.Inst) -> bool {
 fn move(a: *Analysis) -> Result {
     var result = Result.{ .regions = 0, .bytes = 0, .slotMismatches = 0 }
     var function: usize = 0
-    while function < a.*.functionCount {
-        var taken: usize = 0
-        var index = a.*.functionStarts[function] + 1
-        const end = functionEnd(a, function)
-        while index < end {
-            const inst = lir.instAt(a.*.ir, index)
-            if inst.*.opcode == lir.Opcode.alloca && inst.*.arg0 != lir.NONE && inst.*.arg1 != 1 && inst.*.arg1 != 2 && inst.*.arg0 <= REGION_LIMIT && !has(a, index, ESCAPES) && !(has(a, index, LOOP) && has(a, index, STORED)) {
-                const aligned = (inst.*.arg0 + 7) & ~@intCast(usize, 7)
-                if taken + aligned <= FUNCTION_LIMIT {
-                    taken += aligned
-                    inst.*.arg1 = if filledAtOnce(a, index, inst.*.arg0) { 1 } else { 2 }
-                    result.regions += 1
-                    result.bytes += aligned
-                }
-            }
-            index += 1
+    var taken: usize = 0
+    var at: usize = 0
+    while at < a.*.allocationCount {
+        const index = a.*.allocations[at]
+        at += 1
+        // Each function's frame has its own budget.
+        while function + 1 < a.*.functionCount && a.*.functionStarts[function + 1] < index {
+            function += 1
+            taken = 0
         }
-        function += 1
+        const inst = lir.instAt(a.*.ir, index)
+        if insideFunction(a, index) && inst.*.arg1 != 1 && inst.*.arg1 != 2 && inst.*.arg0 <= REGION_LIMIT && !has(a, index, ESCAPES) && !(has(a, index, LOOP) && has(a, index, STORED)) {
+            const aligned = (inst.*.arg0 + 7) & ~@intCast(usize, 7)
+            if taken + aligned <= FUNCTION_LIMIT {
+                taken += aligned
+                inst.*.arg1 = if filledAtOnce(a, index, inst.*.arg0) { 1 } else { 2 }
+                result.regions += 1
+                result.bytes += aligned
+            }
+        }
     }
     return result
 }
@@ -960,15 +1032,15 @@ fn returnsIntoSlot(inst: *lir.Inst) -> bool {
 
 fn slotMismatches(a: *Analysis) -> usize {
     var mismatches: usize = 0
-    var index: usize = 0
-    while index < a.*.count {
-        const inst = lir.instAt(a.*.ir, index)
+    var at: usize = 0
+    while at < a.*.callCount {
+        const inst = lir.instAt(a.*.ir, a.*.calls[at])
+        at += 1
         const callee = calleeOf(a, inst)
         if callee != lir.NONE {
             const label = lir.instAt(a.*.ir, a.*.functionStarts[callee])
             if (inst.*.flags & lir.FLAG_RETURN_SLOT != 0) != (label.*.flags & lir.FLAG_RETURN_SLOT != 0) { mismatches += 1 }
         }
-        index += 1
     }
     return mismatches
 }

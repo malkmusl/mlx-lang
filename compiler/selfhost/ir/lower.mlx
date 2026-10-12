@@ -162,6 +162,8 @@ pub const LirBuilder = struct {
     firstUnsupportedLength: usize
     firstUnsupportedModule: usize
     inlinedCallCount: usize
+    // `x == A || x == B || ...` chains tested as one bit mask.
+    membershipTestCount: usize
     automaticallyInlinedCallCount: usize
     inlineMissCount: usize
     optimizationLevel: u8
@@ -250,6 +252,7 @@ pub fn init(
             .firstUnsupportedLength = 0,
             .firstUnsupportedModule = 0,
             .inlinedCallCount = 0,
+            .membershipTestCount = 0,
             .automaticallyInlinedCallCount = 0,
             .inlineMissCount = 0,
             .optimizationLevel = optimization_level,
@@ -873,6 +876,7 @@ pub fn firstUnsupportedInstructionLength(builder: *LirBuilder) -> usize { return
 pub fn firstUnsupportedModuleId(builder: *LirBuilder) -> usize { return builder.*.firstUnsupportedModule }
 
 pub fn inlinedCallCount(builder: *LirBuilder) -> usize { return builder.*.inlinedCallCount }
+pub fn membershipTestCount(builder: *LirBuilder) -> usize { return builder.*.membershipTestCount }
 
 pub fn automaticallyInlinedCallCount(builder: *LirBuilder) -> usize { return builder.*.automaticallyInlinedCallCount }
 
@@ -3571,6 +3575,41 @@ fn lowerPointerStep(builder: *LirBuilder, backwards: bool, pointer: usize, count
     return lir.addInst(builder.*.lir, address)
 }
 
+// Jumps to `true_block` or `false_block` as a condition holds: `&&`, `||`
+// and `!` become jumps between blocks (the right side only reached when it
+// decides), not a value stored, loaded and tested.
+fn lowerBranch(builder: *LirBuilder, node_index: usize, true_block: usize, false_block: usize) -> void {
+    const node = ast_store.Store.get(getNodes(builder), node_index)
+    if node.tag == ast.Tag.binary_expression {
+        const kind = tokenKind(builder, node.mainToken)
+        if kind == lexer.Kind.ampersand_ampersand || kind == lexer.Kind.pipe_pipe {
+            if kind == lexer.Kind.pipe_pipe {
+                const membership = lowerMembership(builder, node_index)
+                if membership != lir.NONE {
+                    lir.addInst(builder.*.lir, lir.condBranch(membership, true_block, false_block))
+                    return
+                }
+            }
+            const middle = builder.*.blockCounter
+            builder.*.blockCounter += 1
+            if kind == lexer.Kind.ampersand_ampersand {
+                lowerBranch(builder, node.lhs, middle, false_block)
+            } else {
+                lowerBranch(builder, node.lhs, true_block, middle)
+            }
+            lir.addInst(builder.*.lir, lir.blockLabelInst(middle))
+            lowerBranch(builder, node.rhs, true_block, false_block)
+            return
+        }
+    }
+    if node.tag == ast.Tag.unary_expression && tokenKind(builder, node.mainToken) == lexer.Kind.bang {
+        lowerBranch(builder, node.lhs, false_block, true_block)
+        return
+    }
+    const value = lowerNode(builder, node_index)
+    lir.addInst(builder.*.lir, lir.condBranch(value, true_block, false_block))
+}
+
 fn lowerLogical(builder: *LirBuilder, lhs_node: usize, rhs_node: usize, is_and: bool) -> usize {
     const result_address = lir.addInst(builder.*.lir, lir.initInst(lir.Opcode.alloca, lir.NONE))
     const lhs_value = lowerNode(builder, lhs_node)
@@ -3607,6 +3646,131 @@ fn lowerLogical(builder: *LirBuilder, lhs_node: usize, rhs_node: usize, is_and: 
     var result_load = lir.initInst(lir.Opcode.load, lir.NONE)
     result_load.arg0 = result_address
     return lir.addInst(builder.*.lir, result_load)
+}
+
+// The constants an `||` chain compares one value with, as bits (below
+// 128: `low` for 0..63, `high` for 64..127).
+const Membership = struct {
+    subject: usize
+    low: usize
+    high: usize
+    count: usize
+}
+
+// `x == A || x == B || ...`, one side-effect-free unsigned or enum value
+// against at least three constants below 128 (integers, enum members):
+// the bit for x in a mask of the constants, instead of a test, a branch
+// and a stored result for each `||`.
+fn lowerMembership(builder: *LirBuilder, node_index: usize) -> usize {
+    var set = Membership.{ .subject = ast.NONE, .low = 0, .high = 0, .count = 0 }
+    if !collectMembers(builder, node_index, &set) || set.count < 3 { return lir.NONE }
+    const subject_type_id = expressionType(builder, set.subject)
+    if subject_type_id == 0 || isSignedIntegerType(builder, subject_type_id) { return lir.NONE }
+    var subject_type = types_store.Store.get(builder.*.typeStore, subject_type_id)
+    if subject_type.*.kind == types_store.Kind.enum_type && subject_type.*.backing != types_store.NONE && subject_type.*.backing != subject_type_id {
+        subject_type = types_store.Store.get(builder.*.typeStore, subject_type.*.backing)
+    }
+    if subject_type.*.kind != types_store.Kind.integer { return lir.NONE }
+    const word = types_store.Store.sizeInteger(builder.*.typeStore, false)
+    var value = lowerNode(builder, set.subject)
+    if value == lir.NONE { return lir.NONE }
+    if subject_type.*.bits > 0 && subject_type.*.bits < 64 {
+        const width_mask = lir.addInst(builder.*.lir, lir.constI(word, (@intCast(usize, 1) << @intCast(u6, subject_type.*.bits)) - 1))
+        value = lir.addInst(builder.*.lir, lir.binary(lir.Opcode.bit_and, word, value, width_mask))
+    }
+    builder.*.membershipTestCount += 1
+    const one = lir.addInst(builder.*.lir, lir.constI(word, 1))
+    const word_bits = lir.addInst(builder.*.lir, lir.constI(word, 64))
+    const shift = lir.addInst(builder.*.lir, lir.binary(lir.Opcode.bit_and, word, value, lir.addInst(builder.*.lir, lir.constI(word, 63))))
+    var bit = memberBit(builder, word, set.low, shift, one, emitComparison(builder, lir.CmpPredicate.ult, value, word_bits))
+    if set.high != 0 {
+        const above = lir.addInst(builder.*.lir, lir.binary(lir.Opcode.sub, word, value, word_bits))
+        const in_high = emitComparison(builder, lir.CmpPredicate.ult, above, word_bits)
+        bit = lir.addInst(builder.*.lir, lir.binary(lir.Opcode.bit_or, word, bit, memberBit(builder, word, set.high, shift, one, in_high)))
+    }
+    return emitComparison(builder, lir.CmpPredicate.ne, bit, lir.addInst(builder.*.lir, lir.constI(word, 0)))
+}
+
+// (mask >> shift) & 1, kept only where `in_range` holds.
+fn memberBit(builder: *LirBuilder, word: usize, mask: usize, shift: usize, one: usize, in_range: usize) -> usize {
+    const shifted = lir.addInst(builder.*.lir, lir.binary(lir.Opcode.shr, word, lir.addInst(builder.*.lir, lir.constI(word, mask)), shift))
+    const bit = lir.addInst(builder.*.lir, lir.binary(lir.Opcode.bit_and, word, shifted, one))
+    return lir.addInst(builder.*.lir, lir.binary(lir.Opcode.bit_and, word, bit, in_range))
+}
+
+fn collectMembers(builder: *LirBuilder, node_index: usize, set: *Membership) -> bool {
+    if node_index == ast.NONE { return false }
+    const node = ast_store.Store.get(getNodes(builder), node_index)
+    if node.tag != ast.Tag.binary_expression { return false }
+    const kind = tokenKind(builder, node.mainToken)
+    if kind == lexer.Kind.pipe_pipe { return collectMembers(builder, node.lhs, set) && collectMembers(builder, node.rhs, set) }
+    if kind != lexer.Kind.equal_equal { return false }
+    var other = node.lhs
+    var constant = constantMember(builder, node.rhs)
+    if !constant.0 {
+        other = node.rhs
+        constant = constantMember(builder, node.lhs)
+    }
+    if !constant.0 || constant.1 >= 128 || !isPlainOperand(builder, other) { return false }
+    if set.*.subject == ast.NONE {
+        set.*.subject = other
+    } else if !sameOperand(builder, set.*.subject, other) {
+        return false
+    }
+    if constant.1 < 64 {
+        set.*.low = set.*.low | (@intCast(usize, 1) << @intCast(u6, constant.1))
+    } else {
+        set.*.high = set.*.high | (@intCast(usize, 1) << @intCast(u6, constant.1 - 64))
+    }
+    set.*.count += 1
+    return true
+}
+
+// An integer literal or a member of a named enum type, and its value.
+fn constantMember(builder: *LirBuilder, node_index: usize) -> (bool, usize) {
+    const node = ast_store.Store.get(getNodes(builder), node_index)
+    if node.tag == ast.Tag.integer_literal || node.tag == ast.Tag.character_literal {
+        const value = lowerComptimeValue(builder, node_index)
+        if value.kind == comptime_value.Kind.integer && value.integer >= 0 { return -> (true, @intCast(usize, value.integer)) }
+        return -> (false, 0)
+    }
+    if node.tag != ast.Tag.field_expression || node.lhs == ast.NONE { return -> (false, 0) }
+    const referenced = referencedSymbolIndex(builder, node.lhs)
+    if !referenced.0 { return -> (false, 0) }
+    const base = symbols_store.Store.get(builder.*.symbolStore, referenced.1)
+    if types_store.Store.get(builder.*.typeStore, base.*.typeId).*.kind != types_store.Kind.type_type || base.*.valueTypeId == 0 { return -> (false, 0) }
+    const reflected = types_store.Store.get(builder.*.typeStore, base.*.valueTypeId)
+    if reflected.*.kind != types_store.Kind.enum_type { return -> (false, 0) }
+    const field_pointer = tokenPointer(builder, node.mainToken)
+    const field_length = tokenLength(builder, node.mainToken)
+    var field_index: usize = 0
+    while field_index < reflected.*.extraLength {
+        const field = types_store.Store.fieldAt(builder.*.typeStore, reflected.*.extraStart + field_index)
+        if field.*.nameLength == field_length && mem.eql(field.*.namePointer, field_pointer, field_length) { return -> (true, field.*.offset) }
+        field_index += 1
+    }
+    return -> (false, 0)
+}
+
+// A local, a field of one or a value behind a pointer: reading it twice
+// or once is the same.
+fn isPlainOperand(builder: *LirBuilder, node_index: usize) -> bool {
+    if node_index == ast.NONE { return false }
+    const node = ast_store.Store.get(getNodes(builder), node_index)
+    if node.tag == ast.Tag.identifier { return findBinding(builder, tokenPointer(builder, node.mainToken), tokenLength(builder, node.mainToken)) != lir.NONE }
+    if node.tag == ast.Tag.field_expression { return isPlainOperand(builder, node.lhs) }
+    if node.tag == ast.Tag.unary_expression && tokenKind(builder, node.mainToken) == lexer.Kind.dot_asterisk { return isPlainOperand(builder, node.lhs) }
+    return false
+}
+
+fn sameOperand(builder: *LirBuilder, left_index: usize, right_index: usize) -> bool {
+    const left = ast_store.Store.get(getNodes(builder), left_index)
+    const right = ast_store.Store.get(getNodes(builder), right_index)
+    if left.tag != right.tag { return false }
+    const length = tokenLength(builder, left.mainToken)
+    if length != tokenLength(builder, right.mainToken) || !mem.eql(tokenPointer(builder, left.mainToken), tokenPointer(builder, right.mainToken), length) { return false }
+    if left.tag == ast.Tag.identifier { return true }
+    return sameOperand(builder, left.lhs, right.lhs)
 }
 
 fn implicitMethodReceiver(builder: *LirBuilder, callee_node_index: usize, referenced: (bool, usize)) -> usize {
@@ -3708,7 +3872,11 @@ fn lowerBinaryOp(builder: *LirBuilder, node_index: usize) -> usize {
         return result
     }
     if kind == lexer.Kind.ampersand_ampersand { return lowerLogical(builder, n.lhs, n.rhs, true) }
-    if kind == lexer.Kind.pipe_pipe { return lowerLogical(builder, n.lhs, n.rhs, false) }
+    if kind == lexer.Kind.pipe_pipe {
+        const membership = lowerMembership(builder, node_index)
+        if membership != lir.NONE { return membership }
+        return lowerLogical(builder, n.lhs, n.rhs, false)
+    }
 
     const lhs_lowered = lowerNode(builder, n.lhs)
     const rhs_lowered = lowerNode(builder, n.rhs)
@@ -4038,7 +4206,6 @@ fn lowerIf(builder: *LirBuilder, node_index: usize) -> usize {
         return lowerNode(builder, if condition_value.integer != 0 { n.rhs } else { n.extra })
     }
 
-    const cond = lowerNode(builder, n.lhs)
     const result_type_id = expressionType(builder, node_index)
     var has_secondary_result = false
     if result_type_id != 0 {
@@ -4057,7 +4224,7 @@ fn lowerIf(builder: *LirBuilder, node_index: usize) -> usize {
     const end_block = builder.*.blockCounter
     builder.*.blockCounter += 1
 
-    lir.addInst(builder.*.lir, lir.condBranch(cond, then_block, else_block))
+    lowerBranch(builder, n.lhs, then_block, else_block)
 
     // Then block
     lir.addInst(builder.*.lir, lir.blockLabelInst(then_block))
@@ -4330,8 +4497,7 @@ fn lowerWhile(builder: *LirBuilder, node_index: usize) -> usize {
 
     // Header
     lir.addInst(builder.*.lir, lir.blockLabelInst(header_block))
-    const cond = lowerNode(builder, n.lhs)
-    lir.addInst(builder.*.lir, lir.condBranch(cond, body_block, end_block))
+    lowerBranch(builder, n.lhs, body_block, end_block)
 
     // Body
     lir.addInst(builder.*.lir, lir.blockLabelInst(body_block))
