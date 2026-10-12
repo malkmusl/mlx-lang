@@ -157,6 +157,29 @@ desktop program, every coreutil and mlxlibc (for the programs its loader
 starts) install it. `std.wayland.crash.watch(display)`
 (`std/src/wayland/crash.mlx`) makes a Wayland client's failed connection
 such a failure (`tools/check_crash_report.sh` holds every client to it).
+The handler's own values come from the compiler's value arena too: when a
+program crashed because that arena is full, it takes room of its own and
+says so ("the values' arena is full").
+
+`std.diagnostics` (`std/src/diagnostics.mlx`) is the one closed interface
+the runtime's diagnostics write through, for the processor and the GPU
+(`Source.processor`, `Source.gpu`): `keepCrash(source, record)` appends a
+crash to `crashes.log` as a `crash` or `gpu-crash` line, `openProfile`,
+`profileLine` and `closeProfile` write a profile whose header names its
+source (to a `.part` file renamed into place), and `runtimeDirectory`,
+`programName` and `environmentValue` find where and for whom. `std.crash`,
+`mlx-profile` and `std.gpu.diagnostics` use it.
+
+`std.gpu.diagnostics` (`std/src/gpu/diagnostics.mlx`, used by `std.gpu`
+only) watches the GPU work a program records. After each pass a barrier
+and a fill write a breadcrumb (the frame and the passes done) into a
+buffer the host can read, and the functions that recorded the pass are
+kept. A frame not done in 5 s, or a lost device, is a GPU crash: said
+like a processor's crash, in the pass that failed with the functions that
+recorded it, and kept as a `gpu-crash` line. With `MLX_GPU_PROFILE` (`1`,
+or a directory) timestamp queries time each pass and the time goes on
+those functions, written as a profile with the source `gpu`
+(`tools/check_gpu_diagnostics.sh`, on lavapipe).
 
 `std.timezone` (`std/src/timezone.mlx`) gives local time: `load` reads the
 zone from `$TZ` (a zone name, a path or a POSIX rule) or `/etc/localtime`
@@ -418,9 +441,20 @@ leaks.mark()                    // what came before is the program's to keep
 defer leaks.finish()            // the blocks the loop kept, and the arena
 ```
 
-`MLX_LEAK_CHECK=1` reports on stderr, `MLX_LEAK_CHECK=/a/path` appends to
+It is part of the runtime: `std.crash.install()`, which every program
+calls first, calls `leaks.watch()`, so with `MLX_LEAK_CHECK` set any
+program is watched from its start. `MLX_LEAK_CHECK=1` reports on stderr,
+`MLX_LEAK_CHECK=/a/path` appends to
 that file (each line names the program and its process), `0` or nothing
-watches nothing. The report also says when the compiler's value arena
+watches nothing. While a watched program runs, its memory is written
+about once a second (from the main thread, as blocks come and go, and at
+each mark and report) to `$XDG_RUNTIME_DIR/mlx/memory/PROGRAM-PID.memory`:
+the totals, each place with its functions (as crashes name them), each
+block (address, bytes, place, since the mark or kept) and the program's
+mappings. `mlx-codemap memory [PROGRAM]` and Memory under Findings in MLX
+Observatory read it: what the page blocks waste by size class, the holes
+between them and how scattered they are, and the places that hold the
+most or grow. The report also says when the compiler's value arena
 grew by more than 64 KiB since the mark: a loop whose turns do not give
 their values back (`std.turns`) grows a program as a leak would (a loop on
 `std.turns` is not said). A block a program keeps on purpose until it

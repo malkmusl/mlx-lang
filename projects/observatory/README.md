@@ -296,7 +296,30 @@ each group are joined by magenta lines in space.
 - **Hot:** where the programs spend their time, from the profiles of
   `mlx-profile`. With a built program chosen under Program, *Profile* in
   the panel runs it under `mlx-profile` (next to `mlx-codemap`, else on
-  the `PATH`); when it ends, its profile is read.
+  the `PATH`); when it ends, its profile is read. The GPU's profile
+  (`MLX_GPU_PROFILE`, which `mlx-profile` sets) adds the time the GPU
+  spent on the work a function recorded: the panel, the editor's lens
+  and *Color by → GPU time* show it. A GPU crash (a hang, a lost device)
+  is kept and shown as the processor's crashes are, on the functions
+  that recorded the pass.
+- **Memory:** what a program holds while it runs with
+  `MLX_LEAK_CHECK=1` (std.leaks writes it about once a second; see
+  [the standard library](../../docs/reference/stdlib.md)), lime green.
+  The panel lists the programs that wrote their memory, running first (a
+  click shows one), and with a built program chosen under Program,
+  *Watch memory* runs it with the watch on. Then what it holds, what its
+  page blocks waste by size class (a bar each: the pages, what was asked
+  filled in), and its address space as a strip: each block as full as
+  its pages are (green nearly full, amber half, red mostly waste), gray
+  where other mappings lie between the blocks and empty where nothing
+  is mapped, with the holes counted and a fragmentation index (0: one
+  hole or none, near 1: many small ones). Below, the functions whose
+  blocks hold the most, with their blocks, those since `leaks.mark`, kept
+  ones and how many more than when first looked at (`+`, a leak's sign).
+  It is read again each second while the panel is open
+  ([`memory_view.mlx`](memory_view.mlx),
+  [`tools/codemap/memory.mlx`](../../tools/codemap/memory.mlx));
+  `mlx-codemap memory [PROGRAM]` prints the same.
 - **Changed:** declarations added and changed since a commit, mint
   green. The base is chosen in the toolbar (*Since HEAD*: what is not
   committed yet, or one of the last commits) or with `--diff REV`. The

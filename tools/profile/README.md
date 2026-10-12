@@ -41,16 +41,26 @@ It writes the profile to DIRECTORY, by default
 `PROGRAM-SECONDS.profile`:
 
 ```
-profile <TAB> program <TAB> seconds since 1970 <TAB> samples <TAB> interval in µs
+profile <TAB> program <TAB> seconds since 1970 <TAB> samples <TAB> interval in µs <TAB> processor | gpu
 self <TAB> total <TAB> function
 ```
+
+The program's GPU is profiled beside it: `mlx-profile` sets
+`MLX_GPU_PROFILE` for the program, and std.gpu (through
+`std.gpu.diagnostics`) times each pass with timestamp queries and puts
+the time on the functions that recorded the pass. That profile is written
+next to the processor's as `PROGRAM-gpu-SECONDS.profile`, its header
+ending in `gpu` and its times in µs. A program can be run with
+`MLX_GPU_PROFILE=1` (or a directory) without `mlx-profile` too. Both are
+written through `std.diagnostics`, as the crash reports are.
 
 [MLX Observatory](../../projects/observatory/README.md) reads the newest
 profile of each program. It shows them in two places: the *Hot* finding
 lists them, and *Color by → Run time* colors the galaxy by them. The
 codemap notices new profiles while it is open. `mlx-codemap hot` lists
-them too.
+them too, `mlx-codemap gpu` the GPU's.
 
 `tools/check_profile.sh` profiles `tests/support/profile_busy.mlx` and
 checks that the time goes to `spin`, and to `work` and `main` through
-it.
+it. `tools/check_gpu_diagnostics.sh` profiles the GPU of
+`tests/support/gpu_diagnostics_program.mlx` on lavapipe.

@@ -112,7 +112,13 @@ the source and what heredocs add to it (1 MiB), the parse tree as nodes
 (32768), the variables (512 KiB), the functions' bodies (256 KiB), the
 positional parameters, a work stack (8 MiB, with marks: expansions and
 argument vectors are built on it and released after the command), the
-history and the `local` saves.
+history and the `local` saves. The variables' arena is compacted when it
+fills, moving the names and values down in the order they lie in it.
+What the compiler's value arena takes for each turn of a `for`, `while`
+or `until` loop, each item of a script and each command at the prompt is
+given back after it (`std.turns`), so a long loop does not grow the
+shell; with `MLX_TURNS_POISON` set what is given back is overwritten,
+which `tools/check_shell.sh` runs with.
 
 - `sys.mlx`: the syscalls, termios, signals.
 - `state.mlx`: the `Shell`, the arenas, variables, functions,
