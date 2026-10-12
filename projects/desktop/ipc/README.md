@@ -55,7 +55,11 @@ mlx-netd (`projects/network`) answers on it, and mlx-net, the top bar
 and mlx-settings ask it there; other programs reach it through
 `DBUS_SYSTEM_BUS_ADDRESS=unix:path=/run/mlx/bus` (the compositor's logind
 client reads that variable). `tools/install_network.sh` installs it as
-`mlx-ipcd.service` (systemd) and for mlx-init. It is where a display
+`mlx-ipcd.service` (systemd) and for mlx-init. Under systemd it is a
+`Type=notify` service: it sends `READY=1` to `NOTIFY_SOCKET` once the
+socket takes connections, so mlx-netd and mlx-login, ordered after it,
+find the bus there (the variable is not passed on to the services it
+starts). It is where a display
 manager of the desktop's own would offer its login and seat services.
 
 Services that do something for an app ask the bus whether that app may

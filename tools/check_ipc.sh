@@ -16,7 +16,9 @@
 #   - a sandboxed app (bwrap with a .flatpak-info, as Flatpak runs apps)
 #     may own only its own names, talk to the portals but not to others
 #     until a rule allows it, and sees only what it may talk to;
-#   - --run: the bus ends with its program and passes on its exit status.
+#   - --run: the bus ends with its program and passes on its exit status;
+#   - under systemd (Type=notify) READY=1 goes to NOTIFY_SOCKET once the
+#     socket listens (tools/check_ipc_notify.py).
 #
 #   tools/check_ipc.sh [compiler]
 #
@@ -177,4 +179,7 @@ status=$?
 set -e
 [[ $status -eq 7 ]] || fail "--run: exit status $status (wanted 7)"
 echo "ok   --run: the program on the bus, its exit status"
+
+mkdir -p "$work/notify-empty"
+python3 -I tools/check_ipc_notify.py "$work/mlx-ipcd" "$work" "$work/notify-empty" || fail "no READY=1 for systemd"
 echo "all MLXIPC checks passed"

@@ -16,7 +16,7 @@
 #   /etc/systemd/system/mlx-netd.service (needs it)
 #   /etc/mlx/init/services/mlx-ipcd.service, mlx-netd.service (mlx-init)
 #   /var/lib/mlx/network/             (mode 0700: the saved Wi-Fi networks)
-#   PREFIX/share/doc/mlx/network/README.md
+#   PREFIX/share/doc/mlx/network/README.md, PREFIX/share/doc/mlx/ipc/README.md
 #   with --enable: mlx-ipcd.service and mlx-netd.service enabled,
 #   NetworkManager.service, systemd-networkd.service and
 #   wpa_supplicant.service masked (the symbolic links systemctl makes);
@@ -184,21 +184,22 @@ echo "built mlx-netd, mlx-net and mlx-ipcd"
 
 prefix=${prefix%/}
 bindir=$(mlx_bindir "$prefix")
-install -d "$destdir$bindir" "$destdir/etc/mlx" "$destdir/etc/systemd/system" "$destdir/etc/mlx/init/services" "$destdir$prefix/share/doc/mlx/network"
+install -d "$destdir$bindir" "$destdir/etc/mlx" "$destdir/etc/systemd/system" "$destdir/etc/mlx/init/services" "$destdir$prefix/share/doc/mlx/network" "$destdir$prefix/share/doc/mlx/ipc"
 install -d -m 700 "$destdir/var/lib/mlx/network"
 install -m 755 "$build/mlx-netd" "$build/mlx-net" "$build/mlx-ipcd" "$destdir$bindir/"
 if [[ ! -e "$destdir/etc/mlx/network.conf" ]]; then
     install -m 644 projects/network/examples/network.conf "$destdir/etc/mlx/network.conf"
 fi
-sed "s|@BINDIR@|$bindir|g" projects/network/examples/mlx-netd.service > "$build/mlx-netd.service"
+sed -e "s|@BINDIR@|$bindir|g" -e "s|@DOCDIR@|$prefix/share/doc/mlx/network|g" projects/network/examples/mlx-netd.service > "$build/mlx-netd.service"
 sed "s|@BINDIR@|$bindir|g" projects/network/examples/mlx-netd.init > "$build/mlx-netd.init"
-sed "s|@BINDIR@|$bindir|g" projects/desktop/ipc/examples/mlx-ipcd.service > "$build/mlx-ipcd.service"
+sed -e "s|@BINDIR@|$bindir|g" -e "s|@DOCDIR@|$prefix/share/doc/mlx/ipc|g" projects/desktop/ipc/examples/mlx-ipcd.service > "$build/mlx-ipcd.service"
 sed "s|@BINDIR@|$bindir|g" projects/desktop/ipc/examples/mlx-ipcd.init > "$build/mlx-ipcd.init"
 install -m 644 "$build/mlx-netd.service" "$destdir/etc/systemd/system/mlx-netd.service"
 install -m 644 "$build/mlx-ipcd.service" "$destdir/etc/systemd/system/mlx-ipcd.service"
 install -m 644 "$build/mlx-netd.init" "$destdir/etc/mlx/init/services/mlx-netd.service"
 install -m 644 "$build/mlx-ipcd.init" "$destdir/etc/mlx/init/services/mlx-ipcd.service"
 install -m 644 projects/network/README.md "$destdir$prefix/share/doc/mlx/network/README.md"
+install -m 644 projects/desktop/ipc/README.md "$destdir$prefix/share/doc/mlx/ipc/README.md"
 echo "installed into ${destdir:-/}: $bindir/mlx-netd, $bindir/mlx-net, $bindir/mlx-ipcd, /etc/mlx/network.conf, the systemd units and mlx-init services of mlx-ipcd and mlx-netd"
 mlx_install_path_files "$destdir" "$bindir"
 mlx_note_old_layout "$destdir" "$bindir"

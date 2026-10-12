@@ -67,6 +67,9 @@ assert_link "$system/multi-user.target.wants/mlx-netd.service" /etc/systemd/syst
 assert_link "$system/multi-user.target.wants/mlx-ipcd.service" /etc/systemd/system/mlx-ipcd.service
 [[ -x "$stage/usr/bin/mlx/mlx-netd" ]] || fail "mlx-netd was not installed in /usr/bin/mlx"
 grep -q '^ExecStart=/usr/bin/mlx/mlx-netd' "$system/mlx-netd.service" || fail "mlx-netd.service does not start /usr/bin/mlx/mlx-netd"
+grep -qx 'Type=notify' "$system/mlx-ipcd.service" || fail "mlx-ipcd.service does not wait for the bus's READY=1"
+grep -qx 'Documentation=file:///usr/share/doc/mlx/ipc/README.md' "$system/mlx-ipcd.service" && [[ -f "$stage/usr/share/doc/mlx/ipc/README.md" ]] || fail "mlx-ipcd.service does not point at its installed README"
+grep -qx 'Documentation=file:///usr/share/doc/mlx/network/README.md' "$system/mlx-netd.service" || fail "mlx-netd.service does not point at its installed README"
 grep -qx 'PATH=${PATH}:/usr/bin/mlx' "$stage/etc/environment.d/50-mlx.conf" && [[ -f "$stage/etc/profile.d/mlx.sh" && -f "$stage/etc/systemd/system.conf.d/50-mlx-path.conf" ]] || fail "/usr/bin/mlx was not put on PATH"
 # A second --enable keeps the state of before the first.
 run_installer "$work/enable-again.log" --destdir "$stage" --enable "$fake_compiler"
