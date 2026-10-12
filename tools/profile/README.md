@@ -8,10 +8,13 @@ function keeps. The compiler's symbol table names each function
 `path:line:name`; C libraries are named by their own symbols.
 
 ```
-mlx-profile [-o DIRECTORY] [--every MILLISECONDS] [--wall] PROGRAM [ARGUMENT...]
+mlx-profile [-o DIRECTORY] [--every MILLISECONDS] [--after MILLISECONDS] [--wall] PROGRAM [ARGUMENT...]
 ```
 
 - `--every`: how often to stop the program (default 5 ms).
+- `--after`: count only the stops from that many milliseconds after the
+  start on, to see where a program's frames go rather than its start
+  (`tools/measure/measure.py --profile-after`).
 - `--wall`: count the samples where the program waits in the kernel too.
   By default only samples where it runs count.
 - The main thread is sampled; the program's other threads run on. The
