@@ -444,6 +444,14 @@ names_aggregates_in_their_bodies() {
     return $ok
 }
 
+# Whether $1 rejects an integer written out that its type cannot hold
+# (tests/335_type_mismatches.mlx); older compilers kept its low bits.
+checks_literal_ranges() {
+    local output
+    output=$("$1" --quiet tests/335_type_mismatches.mlx -o /dev/null 2>&1) || true
+    grep -q "MLX-E4001: \`300\` does not fit in \`u8\` (0 to 255)" <<< "$output"
+}
+
 # Whether $1 rejects @ptrFromInt and @ptrCast outside unsafe (MLX-E7004,
 # tests/14_unsafe_ptr_builtin.mlx); older compilers took them anywhere.
 enforces_unsafe() {
@@ -577,6 +585,7 @@ probes=(
     "tests_equality_chains|conditions as jumps, equality chains as bit masks"
     "explains_call_mistakes|calls with the wrong argument count named (MLX-E4001)"
     "calls_methods_on_pointers|methods called on pointers and on addressable values"
+    "checks_literal_ranges|integers checked against their type, mismatches named (MLX-E4001)"
     "names_aggregates_in_their_bodies|a struct named inside its own body"
     "holds_large_programs|an arena with room for the largest programs"
     "writes_depfiles|--depfile"

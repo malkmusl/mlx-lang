@@ -73,6 +73,13 @@ The cast is range-checked at compile time when possible:
 (`tests/19_cast_out_of_range.mlx` — `@intCast(u8, 256)` is rejected with `MLX-E4002`
 because 256 does not fit in a `u8`)
 
+An integer written out needs no cast where its type holds it, and is
+rejected where it does not: `var small: u8 = 300` says "`300` does not fit
+in `u8` (0 to 255)", at a declaration, an assignment, an argument, a return
+and the fields and elements of literals alike, and `-1` fits no unsigned
+type (`tests/335_type_mismatches.mlx`; the edges that do fit are in
+`tests/336_literal_edges_runtime.mlx`).
+
 A function call's result can be bound with an explicit type and then narrowed
 explicitly:
 

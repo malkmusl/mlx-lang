@@ -91,6 +91,81 @@ tests/331_call_mistakes.mlx:30:19: error: MLX-E4001: `add` takes 1 argument, 2 g
 tests/331_call_mistakes.mlx:30:22: error: MLX-E4001: condition type could not be resolved
 ```
 
+## `MLX-E4001` (`TypeMismatch`): values that do not fit their place
+
+A comptime integer coerces only where its type holds it exactly
+(`spec/00-language/types.xml`, Conversions), and typing now asks so
+(`sema/literal_fit.mlx`): an integer written out (or a negated one) that
+does not fit an integer type, or the integer an optional or an error union
+holds, fails at a declaration, an assignment, an argument, a return and the
+fields and elements of literals, with its range. `var small: u8 = 300` used
+to compile, keep the low bits and trap on the next overflow check.
+
+A value of another type says what was expected and what was found
+(`sema/mismatch.mlx`, with the type written as source writes it by
+`sema/type_names.mlx`), and operands of types neither of which takes the
+other say they do not mix. An offset on a single-item pointer (`p + n`
+steps only a `[*]T`) and an array literal with another number of elements
+than its type name themselves. A declaration that writes its type out now
+fails when its initializer does not type at all: it used to pass, and the
+program ended at the backend with "unresolved backend symbol" and no
+place, or compiled with the stray bytes of an over-long array literal
+(`projects/coreutils/sha224sum` zeroed its 28-byte digests with 32
+elements; `std.xkb` and `projects/desktop/shared` stepped `*T` pointers by
+bytes, which lowering happened to do; both now @ptrCast to `[*]u8` first).
+`tests/335_type_mismatches.mlx`:
+
+```mlx
+pub fn main() -> u8 {
+    var index: usize = 2
+    var small: u8 = 300
+    const below: u32 = -1
+    small = index
+    const passed = take(index)
+    const point = Point.{ .x = 40000, .y = 0 }
+    const row = [3]u8{ 1, 2, 777 }
+    const flag: bool = 1
+    const sum = small + index
+    const digest: [4]u8 = [4]u8{ 0, 0, 0, 0, 0 }
+    const bytes: [*]const u8 = &index + 4
+    const later: u8 = undeclared
+    return small
+}
+```
+
+```text
+tests/335_type_mismatches.mlx:17:27: error: MLX-E4001: `256` does not fit in `u8` (0 to 255)
+tests/335_type_mismatches.mlx:17:20: error: MLX-E4001: return value does not match function type
+tests/335_type_mismatches.mlx:19:59: error: MLX-E4001: expected `?*const Point`, found `usize`
+tests/335_type_mismatches.mlx:19:52: error: MLX-E4001: return value does not match function type
+tests/335_type_mismatches.mlx:23:21: error: MLX-E4001: `300` does not fit in `u8` (0 to 255)
+tests/335_type_mismatches.mlx:23:9: error: MLX-E4001: invalid local declaration
+tests/335_type_mismatches.mlx:24:24: error: MLX-E4001: `-1` does not fit in `u32` (0 to 4294967295)
+tests/335_type_mismatches.mlx:24:11: error: MLX-E4001: invalid local declaration
+tests/335_type_mismatches.mlx:25:13: error: MLX-E4001: expected `u8`, found `usize`
+tests/335_type_mismatches.mlx:25:11: error: MLX-E4001: expression type could not be resolved
+tests/335_type_mismatches.mlx:26:25: error: MLX-E4001: expected `u64`, found `usize`
+tests/335_type_mismatches.mlx:26:11: error: MLX-E4001: invalid local declaration
+tests/335_type_mismatches.mlx:27:32: error: MLX-E4001: `40000` does not fit in `i16` (-32768 to 32767)
+tests/335_type_mismatches.mlx:27:11: error: MLX-E4001: invalid local declaration
+tests/335_type_mismatches.mlx:28:30: error: MLX-E4001: `777` does not fit in `u8` (0 to 255)
+tests/335_type_mismatches.mlx:28:11: error: MLX-E4001: invalid local declaration
+tests/335_type_mismatches.mlx:29:24: error: MLX-E4001: expected `bool`, found `comptime_int`
+tests/335_type_mismatches.mlx:29:11: error: MLX-E4001: invalid local declaration
+tests/335_type_mismatches.mlx:30:23: error: MLX-E4001: `u8` and `usize` do not mix
+tests/335_type_mismatches.mlx:30:11: error: MLX-E4001: invalid local declaration
+tests/335_type_mismatches.mlx:31:27: error: MLX-E4001: `[4]u8` takes 4 elements, 5 given
+tests/335_type_mismatches.mlx:31:11: error: MLX-E4001: invalid local declaration
+tests/335_type_mismatches.mlx:32:39: error: MLX-E4001: `+` and `-` step only a `[*]T`, not `*usize` (@ptrCast it to `[*]u8` to step by bytes)
+tests/335_type_mismatches.mlx:32:11: error: MLX-E4001: invalid local declaration
+tests/335_type_mismatches.mlx:33:23: error: MLX-E3001: unknown name `undeclared`
+tests/335_type_mismatches.mlx:33:11: error: MLX-E4001: invalid local declaration
+```
+
+`tests/336_literal_edges_runtime.mlx` keeps the values at the edges of
+their types compiling: each type's least and greatest value through the
+same places, on x86_64 and aarch64.
+
 ## `MLX-E7004` (`UnsafeOperationOutsideUnsafeBlock`): pointer casts outside unsafe
 
 `@ptrFromInt` and `@ptrCast` are allowed only inside an unsafe block or an
