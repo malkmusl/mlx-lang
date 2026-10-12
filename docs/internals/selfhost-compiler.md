@@ -108,7 +108,9 @@ implementation, split by responsibility:
 
 (`compiler/selfhost/README.md`)
 
-`ir/inline.mlx` recognizes safe direct-return inline candidates: explicit
+`ir/inline.mlx` recognizes safe direct-return inline candidates (a body
+that is one `return`, possibly inside an `unsafe` block; a type a builtin
+is given, as in `@ptrFromInt(*Inst, address)`, costs nothing): explicit
 `inline` is honored when eligible, `noinline` vetoes automatic expansion,
 and `-O2`/`-O3` progressively widen a cost-limited automatic-inlining
 budget, with bounded recursive expansion falling back to an ordinary call
@@ -408,8 +410,9 @@ backend-shaped instructions the spec doesn't name directly (`func_sym`,
 eliminated instructions, `aggregate_copy`, `mem_copy` for struct and array
 value copies (one instruction per copy, whatever the size; `lower.mlx`'s
 `copyAggregate` puts a `const` local's copy in the frame and a `var`'s in
-the arena, and `returnedValue` copies frame storage out before a `return`
-hands it back), and separate `udiv`/`urem` next
+the arena, and a `return` of a struct, union or array copies the value
+into storage its caller provides, `lowerSlotReturn`, see
+`docs/reference/abi.md`), and separate `udiv`/`urem` next
 to signed `div`/`rem`) and folds some of the spec's saturating/wrapping
 arithmetic variants down to flag bits on a smaller opcode set rather than
 one opcode per variant. Every `Inst` is a fixed-size record — `opcode`,
@@ -634,7 +637,15 @@ store or atomic through a pointer, or a `mem_copy`. A chain of float
 arithmetic then depends on registers instead of a store and a load per
 step: a float-only loop ran 1.7 times as fast
 (`tests/318_float_registers_runtime.mlx` covers the ways a held value must
-be forgotten). A single-word value that is used by exactly the LIR instruction
+be forgotten). A load or a store whose address is a word slot of the frame
+(an `alloca` without a byte count: a local the optimizer kept in memory)
+addresses the slot itself, `[rbp + offset]` (`State.frameAddress`),
+instead of first loading the slot's address from the value that holds it;
+the compiler's own machine code shrank by 6 % with it. Such a slot is
+written on more than one path, so the encoder's store-to-load forwarding
+(`previousStoreRegister`, a load right after a store of the same slot
+takes the stored register) stops at a label (`Encoder.forwardBarrier`):
+the store before a label need not be what reaches a load after it. A single-word value that is used by exactly the LIR instruction
 right after it skips that stack write as a peephole
 (`State.storeRaxResult`'s `canRetainNext`/`state.pendingRaxVreg` path):
 the value stays in `rax` only, on the assumption that its one consumer is

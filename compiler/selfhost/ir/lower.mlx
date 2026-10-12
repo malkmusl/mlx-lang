@@ -128,6 +128,15 @@ pub const LirBuilder = struct {
     // How many `const` locals of the function being lowered hold a copy in
     // its frame (only then may `return` have to copy out of the frame).
     frameStorageCount: usize
+    // The storage the caller gave for the result (lir.FLAG_RETURN_SLOT),
+    // or NONE. A `return` of a call hands that call this storage instead
+    // of copying its result over: `forwardCall` is the call's node (in
+    // module `forwardModule`) while its value is lowered, `forwardedCall`
+    // the node once the call took the storage.
+    returnSlot: usize
+    forwardCall: usize
+    forwardModule: usize
+    forwardedCall: usize
     bindings: *vector.Vector
     bindingComponents: *vector.Vector
     loopTargets: *vector.Vector
@@ -215,6 +224,10 @@ pub fn init(
             .paramCounter = 0,
             .currentReturnType = lir.NONE,
             .frameStorageCount = 0,
+            .returnSlot = lir.NONE,
+            .forwardCall = ast.NONE,
+            .forwardModule = 0,
+            .forwardedCall = ast.NONE,
             .bindings = bindings,
             .bindingComponents = binding_components,
             .loopTargets = loop_targets,
@@ -1487,15 +1500,27 @@ fn lowerFunction(builder: *LirBuilder, node_index: usize) -> usize {
     if types_store.Store.get(builder.*.typeStore, return_type).*.kind == types_store.Kind.type_type { return lir.NONE }
     const function_symbol = addFunctionSymbol(builder, symbol_index, name_ptr, name_len)
     lir.setSymbolSource(builder.*.lir, function_symbol, builder.*.currentModuleId, tokenStart(builder, n.mainToken))
-    lir.addInst(builder.*.lir, lir.labelInst(return_type, function_symbol))
+    const returns_in_memory = aggregate_copy.isMemoryType(builder.*.typeStore, return_type)
+    var label = lir.labelInst(return_type, function_symbol)
+    if returns_in_memory { label.flags = lir.FLAG_RETURN_SLOT }
+    lir.addInst(builder.*.lir, label)
     const bindings_len = builder.*.bindings.*.length
     const binding_components_len = builder.*.bindingComponents.*.length
     const cleanup_depth = builder.*.deferredNodes.*.length
     const saved_return_type = builder.*.currentReturnType
     const saved_frame_storage = builder.*.frameStorageCount
+    const saved_return_slot = builder.*.returnSlot
     builder.*.currentReturnType = return_type
     builder.*.frameStorageCount = 0
     builder.*.paramCounter = 0
+    builder.*.returnSlot = lir.NONE
+    if returns_in_memory {
+        var slot = lir.initInst(lir.Opcode.param, return_type)
+        slot.arg0 = 0
+        slot.flags = lir.FLAG_RETURN_SLOT
+        builder.*.returnSlot = lir.addInst(builder.*.lir, slot)
+        builder.*.paramCounter = 1
+    }
     bindFunctionParameters(builder, n.lhs, function_type)
     const track_recursion = symbol_index != lir.NONE
     if track_recursion { pushInlineSymbol(builder, symbol_index) }
@@ -1512,6 +1537,7 @@ fn lowerFunction(builder: *LirBuilder, node_index: usize) -> usize {
     builder.*.bindingComponents.*.length = binding_components_len
     builder.*.currentReturnType = saved_return_type
     builder.*.frameStorageCount = saved_frame_storage
+    builder.*.returnSlot = saved_return_slot
     return lir.NONE
 }
 
@@ -1580,6 +1606,9 @@ fn lowerNodeHere(builder: *LirBuilder, node_index: usize) -> usize {
     }
     if n.tag == ast.Tag.builtin_call {
         return lowerBuiltin(builder, node_index)
+    }
+    if n.tag == ast.Tag.return_statement && builder.*.returnSlot != lir.NONE && n.rhs != ast.NONE {
+        return lowerSlotReturn(builder, n.rhs)
     }
     if n.tag == ast.Tag.return_statement {
         const returned_type = returnValueType(builder, n.rhs)
@@ -3868,6 +3897,78 @@ fn tryExpandCall(builder: *LirBuilder, symbol_index: usize, generic_instance: us
     return InlineExpansion.{ .expanded = false, .value = lir.NONE }
 }
 
+// `return value` from a function given its caller's storage for the
+// result: the value is copied there, unless it is a call that wrote it
+// there itself, and the storage's address is returned.
+fn lowerSlotReturn(builder: *LirBuilder, value_node: usize) -> usize {
+    const saved_call = builder.*.forwardCall
+    const saved_module = builder.*.forwardModule
+    const saved_forwarded = builder.*.forwardedCall
+    builder.*.forwardCall = value_node
+    builder.*.forwardModule = builder.*.currentModuleId
+    builder.*.forwardedCall = ast.NONE
+    const value = lowerNode(builder, value_node)
+    const forwarded = builder.*.forwardedCall == value_node
+    builder.*.forwardCall = saved_call
+    builder.*.forwardModule = saved_module
+    builder.*.forwardedCall = saved_forwarded
+    // (`return undefined` leaves the storage as the caller made it.)
+    const undefined_value = ast_store.Store.get(getNodes(builder), value_node).tag == ast.Tag.undefined_literal
+    if value != lir.NONE && !forwarded && !undefined_value { aggregate_copy.emit(builder.*.lir, builder.*.typeStore, builder.*.returnSlot, value, builder.*.currentReturnType) }
+    emitDefersTo(builder, 0)
+    var result = lir.retInst(builder.*.currentReturnType, builder.*.returnSlot)
+    result.flags = lir.FLAG_RETURN_SLOT
+    return lir.addInst(builder.*.lir, result)
+}
+
+// A call whose result is a struct, union or array (`slot_type`) hands the
+// callee the storage for it as its first argument (lir.FLAG_RETURN_SLOT):
+// a new allocation, or the caller's own result storage when the call is
+// what the caller returns.
+fn callWithReturnSlot(builder: *LirBuilder, node_index: usize, slot_type: usize, arguments: CallArguments) -> CallArguments {
+    var slot = lir.NONE
+    if builder.*.returnSlot != lir.NONE && builder.*.forwardCall == node_index && builder.*.forwardModule == builder.*.currentModuleId && slot_type == builder.*.currentReturnType {
+        slot = builder.*.returnSlot
+        builder.*.forwardedCall = node_index
+    } else {
+        var size = types_store.Store.sizeOf(builder.*.typeStore, slot_type)
+        if size < 8 { size = 8 }
+        var allocation = lir.initInst(lir.Opcode.alloca, slot_type)
+        allocation.arg0 = size
+        slot = lir.addInst(builder.*.lir, allocation)
+    }
+    const start = builder.*.lir.*.extraData.*.length
+    lir.addExtra(builder.*.lir, slot)
+    var index: usize = 0
+    while index < arguments.count {
+        lir.addExtra(builder.*.lir, lir.getExtra(builder.*.lir, arguments.start + index))
+        index += 1
+    }
+    return CallArguments.{ .start = start, .count = arguments.count + 1 }
+}
+
+// A direct callee's result type as its declaration has it, which is what
+// lowerFunction decides by.
+fn declaredReturnType(builder: *LirBuilder, symbol_index: usize) -> usize {
+    const type_id = symbols_store.Store.get(builder.*.symbolStore, symbol_index).*.typeId
+    if type_id == 0 || types_store.Store.get(builder.*.typeStore, type_id).*.kind != types_store.Kind.function { return 0 }
+    return types_store.Store.get(builder.*.typeStore, type_id).*.lhs
+}
+
+// `slot_type`: the result type that decides whether the callee takes
+// storage for it (a direct callee's declared one; else the call's).
+fn addCall(builder: *LirBuilder, node_index: usize, return_type: usize, slot_type: usize, function: usize, symbol: usize, arguments: CallArguments) -> usize {
+    var passed = arguments
+    var flags: u8 = 0
+    if aggregate_copy.isMemoryType(builder.*.typeStore, slot_type) {
+        passed = callWithReturnSlot(builder, node_index, slot_type, arguments)
+        flags = lir.FLAG_RETURN_SLOT
+    }
+    var call = if function != lir.NONE { lir.callInst(return_type, function, passed.start, passed.count) } else { lir.directCallInst(return_type, symbol, passed.start, passed.count) }
+    call.flags = flags
+    return lir.addInst(builder.*.lir, call)
+}
+
 fn lowerCall(builder: *LirBuilder, node_index: usize) -> usize {
     const n = ast_store.Store.get(getNodes(builder), node_index)
     const referenced = referencedSymbolIndex(builder, n.lhs)
@@ -3891,7 +3992,7 @@ fn lowerCall(builder: *LirBuilder, node_index: usize) -> usize {
 
     const return_type_id = if generic_instance != lir.NONE { types_store.Store.get(builder.*.typeStore, genericInstanceAt(builder, generic_instance).*.functionTypeId).*.lhs } else { expressionType(builder, node_index) }
     if generic_instance != lir.NONE {
-        return lir.addInst(builder.*.lir, lir.directCallInst(return_type_id, genericInstanceAt(builder, generic_instance).*.symbolId, arguments.start, arguments.count))
+        return addCall(builder, node_index, return_type_id, return_type_id, lir.NONE, genericInstanceAt(builder, generic_instance).*.symbolId, arguments)
     }
     if referenced.0 {
         const symbol = symbols_store.Store.get(builder.*.symbolStore, referenced.1)
@@ -3903,11 +4004,13 @@ fn lowerCall(builder: *LirBuilder, node_index: usize) -> usize {
                 recordLinkage(builder, symbol_id, symbol)
                 if referenced.1 < builder.*.lirSymbolCapacity { builder.*.lirSymbolIds[referenced.1] = symbol_id }
             }
-            return lir.addInst(builder.*.lir, lir.directCallInst(return_type_id, symbol_id, arguments.start, arguments.count))
+            // Whether the callee takes storage for its result follows its
+            // declaration, as in lowerFunction, not the call's type.
+            return addCall(builder, node_index, return_type_id, declaredReturnType(builder, referenced.1), lir.NONE, symbol_id, arguments)
         }
     }
     const func_val = lowerNode(builder, n.lhs)
-    return lir.addInst(builder.*.lir, lir.callInst(return_type_id, func_val, arguments.start, arguments.count))
+    return addCall(builder, node_index, return_type_id, return_type_id, func_val, lir.NONE, arguments)
 }
 
 fn lowerBlock(builder: *LirBuilder, node_index: usize) -> usize {

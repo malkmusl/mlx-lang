@@ -441,6 +441,21 @@ keeps_aggregates_in_frame() {
     return $ok
 }
 
+# Whether $1 has callers provide the storage for struct, union and array
+# results (tests/329_return_storage_runtime.mlx exits 13).
+returns_into_caller_storage() {
+    local probe
+    probe=$(mktemp -d mlx-out/probe.XXXXXX)
+    local ok=1
+    if "$1" --quiet tests/329_return_storage_runtime.mlx -o "$probe/probe" > /dev/null 2>&1; then
+        local status=0
+        "$probe/probe" > /dev/null 2>&1 || status=$?
+        [[ $status -eq 13 ]] && ok=0
+    fi
+    rm -rf -- "$probe"
+    return $ok
+}
+
 # Whether $1 writes the files it read with --depfile (what `mlx build`
 # decides rebuilds by).
 writes_depfiles() {
@@ -496,6 +511,7 @@ probes=(
     "has_unsafe_expressions|unsafe { expression }"
     "enforces_unsafe|pointer casts outside unsafe rejected (MLX-E7004)"
     "keeps_aggregates_in_frame|aggregates that stay in their function kept in the frame"
+    "returns_into_caller_storage|struct, union and array results in storage the caller provides"
     "writes_depfiles|--depfile"
     "runs_build|the build command (mlx build)"
 )

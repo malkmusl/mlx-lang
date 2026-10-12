@@ -213,11 +213,14 @@ classified INTEGER/SSE/MEMORY recursively; anything larger than 16 bytes (or
 whose eightbytes can't be satisfied by available registers) is passed/returned
 via memory instead.
 
-A 16-byte struct of two `u64` fields fits the register path and returns in
-`rax`/`rdx`:
+A struct, union or array result does not take that register path yet:
+every one, the 16-byte struct of two `u64` fields below included, comes
+back through storage its caller provides (see the hidden return storage
+further down; `NormalReturn`'s registers for aggregates of at most 16
+bytes are an open deviation, SPEC_CONFLICTS.md):
 
 ```mlx
-// A 16-byte struct crosses the call boundary in rax/rdx.
+// Even a 16-byte struct comes back through caller-provided storage.
 const Pair = struct {
     first: u64
     second: u64
@@ -266,8 +269,8 @@ that are not a multiple of 8 copy exactly
 
 Where a copy lives depends on who owns it. Aggregate literals, `var` copies
 and assignment copies come from the aggregate arena (an `alloca` with a
-byte count), which is never freed, so a function can return such storage
-by address. Those whose address cannot outlive the function move into its
+byte count), which is never freed. Those whose address cannot outlive the
+function move into its
 frame instead (`ir/escape.mlx`, after the other LIR passes): one whose
 address is never returned, never stored outside the function's own
 memory, and only handed to callees whose parameter lets nothing out (the
@@ -281,15 +284,15 @@ struct literal handed to a reading callee, or a `var` made in every pass
 of a loop, then no longer grows the arena
 (`tests/328_aggregates_in_frame_runtime.mlx`). A `const` local's copy is a region of the function's frame
 instead (the same `alloca` with `arg1 == 1`): the frame-size estimate adds
-its bytes, and nothing of it may be handed back by address. `return`
-therefore copies a value that may be, or lie inside, a `const` local's
-frame storage into the arena first, including what a call given such a
-local returns (a callee may return its parameter's storage), and rebases a
-slice of an array held in one (`copy.bytes[0..2]`) onto an arena copy of
-the whole local (`tests/265_aggregate_value_copy_runtime.mlx`). It does so
-only in a function that has such a local, with the function's return type;
-a slice the local merely holds (a field of slice type) points elsewhere and
-comes back as it is (`tests/273_const_return_paths_runtime.mlx`).
+its bytes, and nothing of it may be handed back by address. A struct,
+union or array result is copied into its caller's storage anyway (below),
+but a returned slice of an array held in such a local
+(`copy.bytes[0..2]`) would point into the frame: `return` rebases it onto
+an arena copy of the whole local
+(`tests/265_aggregate_value_copy_runtime.mlx`). It does so only in a
+function that has such a local; a slice the local merely holds (a field of
+slice type) points elsewhere and comes back as it is
+(`tests/273_const_return_paths_runtime.mlx`).
 
 A 20-byte array exceeds the 16-byte register-return threshold, so it returns
 through caller-owned hidden memory instead:
@@ -307,7 +310,23 @@ Per `NormalReturn`'s rule for larger/MEMORY returns, this hidden-storage
 pointer is passed as the *first* integer argument (ahead of the callee's own
 declared parameters, per `ArgumentAssignment`'s "a hidden large-return
 pointer, when present, consumes rdi before user integer arguments"), and
-is returned unchanged in `rax`.
+is returned unchanged in `rax`. On aarch64 it is the first integer argument
+too (`x0`, not AAPCS64's `x8`), and comes back in `x0`.
+
+In LIR the storage is a `param` before the declared ones, marked
+`FLAG_RETURN_SLOT` like the function's label. Every `return` copies its
+value there, before the function's defers run (so a defer changing a local
+afterwards does not change what the caller gets), and hands back the
+storage's address. A `return` whose value is itself such a call passes
+the same storage on instead of copying. The caller makes the storage
+where the call is, an `alloca` of the result's size passed as the call's
+first argument, and the call's value is that storage's address: escape
+analysis keeps it in the caller's frame unless the result's address
+outlives the caller, so a struct returned and used by value costs no arena
+memory. Whether a function takes the storage follows its declared result,
+for direct, method, generic and indirect calls alike, and the optimizer
+checks that each direct call agrees with its callee
+(`tests/329_return_storage_runtime.mlx`).
 
 ## Multiple returns
 

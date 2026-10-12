@@ -41,6 +41,10 @@ const lir = @import("./lir.mlx")
 pub const Result = struct {
     regions: usize
     bytes: usize
+    // Direct calls passing storage for the result to a callee that takes
+    // none, or the other way round (a lowering bug: the callee would read
+    // its arguments one word off).
+    slotMismatches: usize
 }
 
 // The largest allocation moved, and the most a function's frame takes:
@@ -61,6 +65,41 @@ const KEPT: u8 = 64
 // A slot's or a value's root not known yet (prepare).
 const UNSET: usize = 18446744073709551614
 
+// What `step` does with an instruction (kindOf).
+const KIND_INERT: u8 = 0
+const KIND_ROOT: u8 = 1
+const KIND_UNARY: u8 = 2
+const KIND_BINARY: u8 = 3
+const KIND_TUPLE: u8 = 4
+const KIND_LOAD: u8 = 5
+const KIND_STORE: u8 = 6
+const KIND_RMW: u8 = 7
+const KIND_CMPXCHG: u8 = 8
+const KIND_MEM_COPY: u8 = 9
+const KIND_DIRECT_CALL: u8 = 10
+const KIND_RETURN: u8 = 11
+const KIND_RETURN_SLICE: u8 = 12
+const KIND_CALL: u8 = 13
+const KIND_CLONE: u8 = 14
+const KIND_UNKNOWN: u8 = 15
+// An opcode not classified yet.
+const KIND_UNSEEN: u8 = 255
+
+// The value operands of an opcode that share a slot (markSharedSlots).
+const SHARE_ARG0: u8 = 1
+const SHARE_ARG1: u8 = 2
+const SHARE_ARG2: u8 = 4
+const SHARE_EXTRAS_AT_ARG1: u8 = 8
+const SHARE_EXTRAS_AT_ARG0: u8 = 16
+
+// Where a value's root comes from (settleRoots).
+const FROM_NOTHING: u8 = 0
+const FROM_ITSELF: u8 = 1
+const FROM_ARG0: u8 = 2
+const FROM_RETURN_SLOT: u8 = 3
+const FROM_SLOT_LOAD: u8 = 4
+const FROM_SLOT_STORE: u8 = 5
+
 const Analysis = struct {
     ir: *lir.Lir
     count: usize
@@ -76,10 +115,21 @@ const Analysis = struct {
     params: [*]usize
     // What a clean slot holds: addresses into one root, or NONE.
     holds: [*]usize
+    // Each instruction's kind and root source, and per opcode its kind
+    // and shared operands: classified once, so the passes over the
+    // program do not test opcodes one by one.
+    kinds: [*]u8
+    rootSources: [*]u8
+    opcodeKinds: [*]u8
+    opcodeShares: [*]u8
+    // The instruction a function's pass is at, and whether what it marked
+    // asks for another pass (mark).
+    cursor: usize
+    again: bool
 }
 
 pub fn run(ir: *lir.Lir, allocator: allocator_module.Allocator) -> Result {
-    var result = Result.{ .regions = 0, .bytes = 0 }
+    var result = Result.{ .regions = 0, .bytes = 0, .slotMismatches = 0 }
     const count = lir.instCount(ir)
     const symbol_count = lir.symbolCount(ir)
     if count == 0 { return result }
@@ -92,6 +142,10 @@ pub fn run(ir: *lir.Lir, allocator: allocator_module.Allocator) -> Result {
     const group_memory = allocator.alloc((count + 1) * 8, 8).?
     const param_memory = allocator.alloc((count + 1) * 8, 8).?
     const hold_memory = allocator.alloc(count * 8, 8).?
+    const kind_memory = allocator.alloc(count, 8).?
+    const source_memory = allocator.alloc(count, 8).?
+    const opcode_kind_memory = allocator.alloc(256, 8).?
+    const opcode_share_memory = allocator.alloc(256, 8).?
     unsafe {
         var analysis = Analysis.{
             .ir = ir,
@@ -107,11 +161,19 @@ pub fn run(ir: *lir.Lir, allocator: allocator_module.Allocator) -> Result {
             .paramGroups = @ptrCast([*]usize, group_memory),
             .params = @ptrCast([*]usize, param_memory),
             .holds = @ptrCast([*]usize, hold_memory),
+            .kinds = kind_memory,
+            .rootSources = source_memory,
+            .opcodeKinds = opcode_kind_memory,
+            .opcodeShares = opcode_share_memory,
+            .cursor = 0,
+            .again = false,
         }
         prepare(&analysis)
+        const mismatches = slotMismatches(&analysis)
         markLoops(&analysis, allocator)
         solve(&analysis, allocator)
         result = move(&analysis)
+        result.slotMismatches = mismatches
     }
     allocator.free(flag_memory, count, 8)
     allocator.free(root_memory, count * 8, 8)
@@ -122,11 +184,15 @@ pub fn run(ir: *lir.Lir, allocator: allocator_module.Allocator) -> Result {
     allocator.free(group_memory, (count + 1) * 8, 8)
     allocator.free(param_memory, (count + 1) * 8, 8)
     allocator.free(hold_memory, count * 8, 8)
+    allocator.free(kind_memory, count, 8)
+    allocator.free(source_memory, count, 8)
+    allocator.free(opcode_kind_memory, 256, 8)
+    allocator.free(opcode_share_memory, 256, 8)
     return result
 }
 
-fn isFunctionLabel(inst: lir.Inst) -> bool {
-    return inst.opcode == lir.Opcode.label && inst.arg0 != lir.NONE
+fn isFunctionLabel(inst: *lir.Inst) -> bool {
+    return inst.*.opcode == lir.Opcode.label && inst.*.arg0 != lir.NONE
 }
 
 fn functionEnd(a: *Analysis, function: usize) -> usize {
@@ -142,12 +208,19 @@ fn prepare(a: *Analysis) -> void {
         a.*.symbolFunctions[symbol] = lir.NONE
         symbol += 1
     }
+    var code: usize = 0
+    while code < 256 {
+        a.*.opcodeKinds[code] = KIND_UNSEEN
+        code += 1
+    }
     var params: usize = 0
     var index: usize = 0
     while index < a.*.count {
         a.*.flags[index] = 0
         a.*.roots[index] = lir.NONE
-        const inst = lir.getInst(a.*.ir, index)
+        a.*.holds[index] = UNSET
+        const inst = lir.instAt(a.*.ir, index)
+        a.*.kinds[index] = kindOf(a, inst)
         if isFunctionLabel(inst) {
             const function = a.*.functionCount
             a.*.functionStarts[function] = index
@@ -155,28 +228,98 @@ fn prepare(a: *Analysis) -> void {
             a.*.paramCount[function] = 0
             a.*.paramGroups[function] = 0
             a.*.functionCount += 1
-            if inst.arg0 < a.*.symbolCount && a.*.symbolFunctions[inst.arg0] == lir.NONE { a.*.symbolFunctions[inst.arg0] = function }
-        } else if inst.opcode == lir.Opcode.param && a.*.functionCount > 0 {
+            if inst.*.arg0 < a.*.symbolCount && a.*.symbolFunctions[inst.*.arg0] == lir.NONE { a.*.symbolFunctions[inst.*.arg0] = function }
+        } else if inst.*.opcode == lir.Opcode.param && a.*.functionCount > 0 {
             const function = a.*.functionCount - 1
             a.*.params[params] = index
             params += 1
             a.*.paramCount[function] += 1
-            if inst.typeId != lir.NONE { a.*.paramGroups[function] += 1 }
+            if inst.*.typeId != lir.NONE { a.*.paramGroups[function] += 1 }
         }
         index += 1
     }
     markSharedSlots(a)
-    index = 0
-    while index < a.*.count {
-        a.*.holds[index] = UNSET
-        index += 1
-    }
+    markRootSources(a)
     // Roots go from unset to one root to none; once nothing changes, what
     // is still unset (a slot never stored) is none, and the roots settle
     // again with that.
     while settleRoots(a, false) {}
     while settleRoots(a, true) {}
     markBindings(a)
+}
+
+// An instruction's kind: its opcode's (worked out the first time the
+// opcode is met), except that handing back the caller's own storage for
+// the result does nothing here.
+fn kindOf(a: *Analysis, inst: *lir.Inst) -> u8 {
+    if inst.*.opcode == lir.Opcode.ret && inst.*.flags & lir.FLAG_RETURN_SLOT != 0 { return KIND_INERT }
+    const code = @intCast(usize, @intFromEnum(inst.*.opcode))
+    if a.*.opcodeKinds[code] == KIND_UNSEEN {
+        a.*.opcodeKinds[code] = opcodeKind(inst.*.opcode)
+        a.*.opcodeShares[code] = opcodeShares(inst.*.opcode)
+    }
+    return a.*.opcodeKinds[code]
+}
+
+fn opcodeKind(op: lir.Opcode) -> u8 {
+    if op == lir.Opcode.dead || op == lir.Opcode.label || op == lir.Opcode.br || op == lir.Opcode.condbr || op == lir.Opcode.icmp_br || op == lir.Opcode.icmp || op == lir.Opcode.fcmp ||
+        op == lir.Opcode.const_i || op == lir.Opcode.const_f || op == lir.Opcode.func_sym || op == lir.Opcode.global_address || op == lir.Opcode.string_literal || op == lir.Opcode.builtin_sym ||
+        op == lir.Opcode.unreachable_inst || op == lir.Opcode.thread_pointer || op == lir.Opcode.frame_address || op == lir.Opcode.fence || op == lir.Opcode.error_test || op == lir.Opcode.byte_mask_64 {
+        return KIND_INERT
+    }
+    if op == lir.Opcode.alloca || op == lir.Opcode.param { return KIND_ROOT }
+    if op == lir.Opcode.copy || op == lir.Opcode.cast || op == lir.Opcode.bitcast || op == lir.Opcode.aggregate_copy || op == lir.Opcode.addr || op == lir.Opcode.error_payload ||
+        op == lir.Opcode.error_payload_part || op == lir.Opcode.tuple_element || op == lir.Opcode.popcount || op == lir.Opcode.sqrt || op == lir.Opcode.round_float {
+        return KIND_UNARY
+    }
+    if op == lir.Opcode.add || op == lir.Opcode.sub || op == lir.Opcode.mul || op == lir.Opcode.div || op == lir.Opcode.rem || op == lir.Opcode.udiv || op == lir.Opcode.urem ||
+        op == lir.Opcode.bit_and || op == lir.Opcode.bit_or || op == lir.Opcode.bit_xor || op == lir.Opcode.shl || op == lir.Opcode.shr || op == lir.Opcode.gep {
+        return KIND_BINARY
+    }
+    if op == lir.Opcode.tuple_literal { return KIND_TUPLE }
+    if op == lir.Opcode.load || op == lir.Opcode.atomic_load { return KIND_LOAD }
+    if op == lir.Opcode.store || op == lir.Opcode.atomic_store { return KIND_STORE }
+    if op == lir.Opcode.atomic_rmw { return KIND_RMW }
+    if op == lir.Opcode.cmpxchg { return KIND_CMPXCHG }
+    if op == lir.Opcode.mem_copy { return KIND_MEM_COPY }
+    if op == lir.Opcode.direct_call { return KIND_DIRECT_CALL }
+    if op == lir.Opcode.ret || op == lir.Opcode.ret_error || op == lir.Opcode.ret_error_union { return KIND_RETURN }
+    if op == lir.Opcode.ret_slice { return KIND_RETURN_SLICE }
+    if op == lir.Opcode.call || op == lir.Opcode.syscall { return KIND_CALL }
+    if op == lir.Opcode.clone_thread { return KIND_CLONE }
+    return KIND_UNKNOWN
+}
+
+// The value operands of an opcode (any field may be one of an opcode not
+// known here); the fields that hold widths, block numbers or symbols are
+// not.
+fn opcodeShares(op: lir.Opcode) -> u8 {
+    if op == lir.Opcode.load { return 0 }
+    if op == lir.Opcode.atomic_load { return SHARE_ARG0 }
+    if op == lir.Opcode.store { return SHARE_ARG1 }
+    if op == lir.Opcode.icmp || op == lir.Opcode.fcmp { return SHARE_ARG1 | SHARE_ARG2 }
+    if op == lir.Opcode.condbr || op == lir.Opcode.ret || op == lir.Opcode.ret_error || op == lir.Opcode.ret_error_union { return SHARE_ARG0 }
+    if op == lir.Opcode.direct_call { return SHARE_EXTRAS_AT_ARG1 }
+    if op == lir.Opcode.call || op == lir.Opcode.syscall { return SHARE_ARG0 | SHARE_EXTRAS_AT_ARG1 }
+    if op == lir.Opcode.tuple_literal || op == lir.Opcode.clone_thread { return SHARE_EXTRAS_AT_ARG0 }
+    if op == lir.Opcode.copy || op == lir.Opcode.cast || op == lir.Opcode.bitcast || op == lir.Opcode.aggregate_copy || op == lir.Opcode.addr ||
+        op == lir.Opcode.error_payload || op == lir.Opcode.error_payload_part || op == lir.Opcode.tuple_element || op == lir.Opcode.popcount ||
+        op == lir.Opcode.sqrt || op == lir.Opcode.round_float || op == lir.Opcode.error_test {
+        return SHARE_ARG0
+    }
+    if op == lir.Opcode.ret_slice || op == lir.Opcode.add || op == lir.Opcode.sub || op == lir.Opcode.mul || op == lir.Opcode.div || op == lir.Opcode.rem ||
+        op == lir.Opcode.udiv || op == lir.Opcode.urem || op == lir.Opcode.bit_and || op == lir.Opcode.bit_or || op == lir.Opcode.bit_xor || op == lir.Opcode.shl ||
+        op == lir.Opcode.shr || op == lir.Opcode.gep || op == lir.Opcode.mem_copy || op == lir.Opcode.atomic_store || op == lir.Opcode.atomic_rmw || op == lir.Opcode.byte_mask_64 {
+        return SHARE_ARG0 | SHARE_ARG1
+    }
+    if op == lir.Opcode.cmpxchg { return SHARE_ARG0 | SHARE_ARG1 | SHARE_ARG2 }
+    if op == lir.Opcode.const_i || op == lir.Opcode.const_f || op == lir.Opcode.label || op == lir.Opcode.br || op == lir.Opcode.icmp_br ||
+        op == lir.Opcode.alloca || op == lir.Opcode.param || op == lir.Opcode.func_sym || op == lir.Opcode.global_address || op == lir.Opcode.string_literal ||
+        op == lir.Opcode.builtin_sym || op == lir.Opcode.dead || op == lir.Opcode.unreachable_inst || op == lir.Opcode.thread_pointer ||
+        op == lir.Opcode.frame_address || op == lir.Opcode.fence {
+        return 0
+    }
+    return SHARE_ARG0 | SHARE_ARG1 | SHARE_ARG2
 }
 
 // The stores that bind an allocation to its slot: the slot's one store,
@@ -190,9 +333,9 @@ fn markBindings(a: *Analysis) -> void {
     }
     index = 0
     while index < a.*.count {
-        const inst = lir.getInst(a.*.ir, index)
-        if inst.opcode == lir.Opcode.store && isSlot(a, inst.arg0) {
-            a.*.holds[inst.arg0] = if a.*.holds[inst.arg0] == lir.NONE { index } else { UNSET }
+        const inst = lir.instAt(a.*.ir, index)
+        if inst.*.opcode == lir.Opcode.store && isSlot(a, inst.*.arg0) {
+            a.*.holds[inst.*.arg0] = if a.*.holds[inst.*.arg0] == lir.NONE { index } else { UNSET }
         }
         index += 1
     }
@@ -200,29 +343,34 @@ fn markBindings(a: *Analysis) -> void {
     // the binding too.
     index = 0
     while index < a.*.count {
-        const inst = lir.getInst(a.*.ir, index)
-        if inst.opcode == lir.Opcode.load && isSlot(a, inst.arg0) {
-            const store = a.*.holds[inst.arg0]
-            if store != lir.NONE && store != UNSET && store >= index { a.*.holds[inst.arg0] = UNSET }
+        const inst = lir.instAt(a.*.ir, index)
+        if inst.*.opcode == lir.Opcode.load && isSlot(a, inst.*.arg0) {
+            const store = a.*.holds[inst.*.arg0]
+            if store != lir.NONE && store != UNSET && store >= index { a.*.holds[inst.*.arg0] = UNSET }
         }
         index += 1
     }
     index = 0
     while index < a.*.count {
-        const inst = lir.getInst(a.*.ir, index)
-        if inst.opcode == lir.Opcode.store && isSlot(a, inst.arg0) && a.*.flags[inst.arg0] & SHARED == 0 && a.*.holds[inst.arg0] == index && sameBlock(a, inst.arg1, index) {
+        const inst = lir.instAt(a.*.ir, index)
+        if inst.*.opcode == lir.Opcode.store && isSlot(a, inst.*.arg0) && a.*.flags[inst.*.arg0] & SHARED == 0 && a.*.holds[inst.*.arg0] == index && sameBlock(a, inst.*.arg1, index) {
             a.*.flags[index] = a.*.flags[index] | BINDING
         }
         index += 1
     }
 }
 
-// Whether `value` is an allocation that `use` follows in the same block.
+// Whether `value` is an allocation (or a call's result written into one)
+// that `use` follows in the same block.
 fn sameBlock(a: *Analysis, value: usize, use: usize) -> bool {
-    if value >= use || lir.getInst(a.*.ir, value).opcode != lir.Opcode.alloca { return false }
-    var index = value + 1
+    if value >= use { return false }
+    var allocation = value
+    const made = lir.instAt(a.*.ir, value)
+    if returnsIntoSlot(made) { allocation = lir.getExtra(a.*.ir, made.*.arg1) }
+    if allocation >= use || lir.instAt(a.*.ir, allocation).*.opcode != lir.Opcode.alloca { return false }
+    var index = allocation + 1
     while index < use {
-        const op = lir.getInst(a.*.ir, index).opcode
+        const op = lir.instAt(a.*.ir, index).*.opcode
         if op == lir.Opcode.label || op == lir.Opcode.br || op == lir.Opcode.condbr || op == lir.Opcode.icmp_br || op == lir.Opcode.ret || op == lir.Opcode.ret_slice ||
             op == lir.Opcode.ret_error || op == lir.Opcode.ret_error_union || op == lir.Opcode.unreachable_inst {
             return false
@@ -234,8 +382,8 @@ fn sameBlock(a: *Analysis, value: usize, use: usize) -> bool {
 
 fn isSlot(a: *Analysis, value: usize) -> bool {
     if value == lir.NONE || value >= a.*.count { return false }
-    const inst = lir.getInst(a.*.ir, value)
-    return inst.opcode == lir.Opcode.alloca && inst.arg0 == lir.NONE
+    const inst = lir.instAt(a.*.ir, value)
+    return inst.*.opcode == lir.Opcode.alloca && inst.*.arg0 == lir.NONE
 }
 
 // A slot is shared when anything but a load or a store takes its address
@@ -244,46 +392,40 @@ fn isSlot(a: *Analysis, value: usize) -> bool {
 fn markSharedSlots(a: *Analysis) -> void {
     var index: usize = 0
     while index < a.*.count {
-        const inst = lir.getInst(a.*.ir, index)
-        const op = inst.opcode
-        if op == lir.Opcode.load || op == lir.Opcode.atomic_load {
-            if op == lir.Opcode.atomic_load { share(a, inst.arg0) }
-        } else if op == lir.Opcode.store {
-            share(a, inst.arg1)
-        } else if op == lir.Opcode.icmp || op == lir.Opcode.fcmp {
-            share(a, inst.arg1)
-            share(a, inst.arg2)
-        } else if op == lir.Opcode.condbr || op == lir.Opcode.ret || op == lir.Opcode.ret_error || op == lir.Opcode.ret_error_union {
-            share(a, inst.arg0)
-        } else if op == lir.Opcode.direct_call {
-            shareExtras(a, inst.arg1, inst.arg2)
-        } else if op == lir.Opcode.call || op == lir.Opcode.syscall {
-            share(a, inst.arg0)
-            shareExtras(a, inst.arg1, inst.arg2)
-        } else if op == lir.Opcode.tuple_literal || op == lir.Opcode.clone_thread {
-            shareExtras(a, inst.arg0, inst.arg1)
-        } else if op == lir.Opcode.copy || op == lir.Opcode.cast || op == lir.Opcode.bitcast || op == lir.Opcode.aggregate_copy || op == lir.Opcode.addr ||
-            op == lir.Opcode.error_payload || op == lir.Opcode.error_payload_part || op == lir.Opcode.tuple_element || op == lir.Opcode.popcount ||
-            op == lir.Opcode.sqrt || op == lir.Opcode.round_float || op == lir.Opcode.error_test {
-            share(a, inst.arg0)
-        } else if op == lir.Opcode.ret_slice || op == lir.Opcode.add || op == lir.Opcode.sub || op == lir.Opcode.mul || op == lir.Opcode.div || op == lir.Opcode.rem ||
-            op == lir.Opcode.udiv || op == lir.Opcode.urem || op == lir.Opcode.bit_and || op == lir.Opcode.bit_or || op == lir.Opcode.bit_xor || op == lir.Opcode.shl ||
-            op == lir.Opcode.shr || op == lir.Opcode.gep || op == lir.Opcode.mem_copy || op == lir.Opcode.atomic_store || op == lir.Opcode.atomic_rmw || op == lir.Opcode.byte_mask_64 {
-            share(a, inst.arg0)
-            share(a, inst.arg1)
-        } else if op == lir.Opcode.cmpxchg {
-            share(a, inst.arg0)
-            share(a, inst.arg1)
-            share(a, inst.arg2)
-        } else if op != lir.Opcode.const_i && op != lir.Opcode.const_f && op != lir.Opcode.label && op != lir.Opcode.br && op != lir.Opcode.icmp_br &&
-            op != lir.Opcode.alloca && op != lir.Opcode.param && op != lir.Opcode.func_sym && op != lir.Opcode.global_address && op != lir.Opcode.string_literal &&
-            op != lir.Opcode.builtin_sym && op != lir.Opcode.dead && op != lir.Opcode.unreachable_inst && op != lir.Opcode.thread_pointer &&
-            op != lir.Opcode.frame_address && op != lir.Opcode.fence {
-            // An instruction this pass does not know: any field may be a value.
-            share(a, inst.arg0)
-            share(a, inst.arg1)
-            share(a, inst.arg2)
+        const inst = lir.instAt(a.*.ir, index)
+        const shares = a.*.opcodeShares[@intCast(usize, @intFromEnum(inst.*.opcode))]
+        if shares != 0 {
+            if shares & SHARE_ARG0 != 0 { share(a, inst.*.arg0) }
+            if shares & SHARE_ARG1 != 0 { share(a, inst.*.arg1) }
+            if shares & SHARE_ARG2 != 0 { share(a, inst.*.arg2) }
+            if shares & SHARE_EXTRAS_AT_ARG1 != 0 { shareExtras(a, inst.*.arg1, inst.*.arg2) }
+            if shares & SHARE_EXTRAS_AT_ARG0 != 0 { shareExtras(a, inst.*.arg0, inst.*.arg1) }
         }
+        index += 1
+    }
+}
+
+// Where each value's root comes from: itself (an allocation or a
+// parameter), the value it was made from, the storage a call was given for
+// its result, or a clean slot it is loaded from or stored into.
+fn markRootSources(a: *Analysis) -> void {
+    var index: usize = 0
+    while index < a.*.count {
+        const inst = lir.instAt(a.*.ir, index)
+        const op = inst.*.opcode
+        var source = FROM_NOTHING
+        if op == lir.Opcode.alloca || op == lir.Opcode.param {
+            source = FROM_ITSELF
+        } else if op == lir.Opcode.copy || op == lir.Opcode.cast || op == lir.Opcode.bitcast || op == lir.Opcode.aggregate_copy || op == lir.Opcode.gep {
+            source = FROM_ARG0
+        } else if returnsIntoSlot(inst) {
+            source = FROM_RETURN_SLOT
+        } else if op == lir.Opcode.load && isSlot(a, inst.*.arg0) && a.*.flags[inst.*.arg0] & SHARED == 0 {
+            source = FROM_SLOT_LOAD
+        } else if op == lir.Opcode.store && isSlot(a, inst.*.arg0) && a.*.flags[inst.*.arg0] & SHARED == 0 {
+            source = FROM_SLOT_STORE
+        }
+        a.*.rootSources[index] = source
         index += 1
     }
 }
@@ -312,27 +454,35 @@ fn settleRoots(a: *Analysis, final: bool) -> bool {
     var changed = false
     var index: usize = 0
     while index < a.*.count {
-        const inst = lir.getInst(a.*.ir, index)
-        var root = lir.NONE
-        if inst.opcode == lir.Opcode.alloca || inst.opcode == lir.Opcode.param {
-            root = index
-        } else if inst.opcode == lir.Opcode.copy || inst.opcode == lir.Opcode.cast || inst.opcode == lir.Opcode.bitcast || inst.opcode == lir.Opcode.aggregate_copy || inst.opcode == lir.Opcode.gep {
-            if inst.arg0 < a.*.count { root = a.*.roots[inst.arg0] }
-        } else if inst.opcode == lir.Opcode.load && isSlot(a, inst.arg0) && a.*.flags[inst.arg0] & SHARED == 0 {
-            root = a.*.holds[inst.arg0]
-        } else if inst.opcode == lir.Opcode.store && isSlot(a, inst.arg0) && a.*.flags[inst.arg0] & SHARED == 0 {
-            var stored = if inst.arg1 < a.*.count { a.*.roots[inst.arg1] } else { lir.NONE }
-            if final && stored == UNSET { stored = lir.NONE }
-            const held = merge(a.*.holds[inst.arg0], stored)
-            if held != a.*.holds[inst.arg0] {
-                a.*.holds[inst.arg0] = held
+        const source = a.*.rootSources[index]
+        if source != FROM_NOTHING {
+            var root = lir.NONE
+            if source == FROM_ITSELF {
+                root = index
+            } else {
+                const inst = lir.instAt(a.*.ir, index)
+                if source == FROM_ARG0 {
+                    if inst.*.arg0 < a.*.count { root = a.*.roots[inst.*.arg0] }
+                } else if source == FROM_RETURN_SLOT {
+                    const slot = lir.getExtra(a.*.ir, inst.*.arg1)
+                    if slot < a.*.count { root = a.*.roots[slot] }
+                } else if source == FROM_SLOT_LOAD {
+                    root = a.*.holds[inst.*.arg0]
+                } else {
+                    var stored = if inst.*.arg1 < a.*.count { a.*.roots[inst.*.arg1] } else { lir.NONE }
+                    if final && stored == UNSET { stored = lir.NONE }
+                    const held = merge(a.*.holds[inst.*.arg0], stored)
+                    if held != a.*.holds[inst.*.arg0] {
+                        a.*.holds[inst.*.arg0] = held
+                        changed = true
+                    }
+                }
+            }
+            if final && root == UNSET { root = lir.NONE }
+            if root != a.*.roots[index] {
+                a.*.roots[index] = root
                 changed = true
             }
-        }
-        if final && root == UNSET { root = lir.NONE }
-        if root != a.*.roots[index] {
-            a.*.roots[index] = root
-            changed = true
         }
         index += 1
     }
@@ -352,8 +502,8 @@ fn markLoops(a: *Analysis, allocator: allocator_module.Allocator) -> void {
     var blocks: usize = 0
     var index: usize = 0
     while index < a.*.count {
-        const inst = lir.getInst(a.*.ir, index)
-        if inst.opcode == lir.Opcode.label && inst.arg0 == lir.NONE && inst.arg1 != lir.NONE && inst.arg1 + 1 > blocks { blocks = inst.arg1 + 1 }
+        const inst = lir.instAt(a.*.ir, index)
+        if inst.*.opcode == lir.Opcode.label && inst.*.arg0 == lir.NONE && inst.*.arg1 != lir.NONE && inst.*.arg1 + 1 > blocks { blocks = inst.*.arg1 + 1 }
         index += 1
     }
     if blocks == 0 { return }
@@ -367,18 +517,18 @@ fn markLoops(a: *Analysis, allocator: allocator_module.Allocator) -> void {
         }
         index = 0
         while index < a.*.count {
-            const inst = lir.getInst(a.*.ir, index)
-            if inst.opcode == lir.Opcode.label && inst.arg0 == lir.NONE && inst.arg1 < blocks { labels[inst.arg1] = index }
+            const inst = lir.instAt(a.*.ir, index)
+            if inst.*.opcode == lir.Opcode.label && inst.*.arg0 == lir.NONE && inst.*.arg1 < blocks { labels[inst.*.arg1] = index }
             index += 1
         }
         index = 0
         while index < a.*.count {
-            const inst = lir.getInst(a.*.ir, index)
-            if inst.opcode == lir.Opcode.br {
-                markLoop(a, labels, blocks, inst.arg0, index)
-            } else if inst.opcode == lir.Opcode.condbr || inst.opcode == lir.Opcode.icmp_br {
-                markLoop(a, labels, blocks, inst.arg1, index)
-                markLoop(a, labels, blocks, inst.arg2, index)
+            const inst = lir.instAt(a.*.ir, index)
+            if inst.*.opcode == lir.Opcode.br {
+                markLoop(a, labels, blocks, inst.*.arg0, index)
+            } else if inst.*.opcode == lir.Opcode.condbr || inst.*.opcode == lir.Opcode.icmp_br {
+                markLoop(a, labels, blocks, inst.*.arg1, index)
+                markLoop(a, labels, blocks, inst.*.arg2, index)
             }
             index += 1
         }
@@ -397,14 +547,18 @@ fn markLoop(a: *Analysis, labels: [*]usize, blocks: usize, block: usize, branch:
     }
 }
 
-fn mark(a: *Analysis, value: usize, bit: u8) -> bool {
+inline fn mark(a: *Analysis, value: usize, bit: u8) -> bool {
     if value == lir.NONE || value >= a.*.count { return false }
     if a.*.flags[value] & bit != 0 { return false }
     a.*.flags[value] = a.*.flags[value] | bit
+    // The pass runs backwards, operands after their uses: a value it has
+    // passed already, or memory whose contents now escape or are kept
+    // (which the stores into it, anywhere, look at), needs another pass.
+    if value > a.*.cursor || bit == CONTENTS || bit == KEPT { a.*.again = true }
     return true
 }
 
-fn has(a: *Analysis, value: usize, bit: u8) -> bool {
+inline fn has(a: *Analysis, value: usize, bit: u8) -> bool {
     return value != lir.NONE && value < a.*.count && a.*.flags[value] & bit != 0
 }
 
@@ -416,7 +570,7 @@ fn rootOf(a: *Analysis, address: usize) -> usize {
 // An allocation of this function (its memory is tracked); a parameter's
 // memory is the caller's.
 fn isLocal(a: *Analysis, root: usize) -> bool {
-    return root != lir.NONE && lir.getInst(a.*.ir, root).opcode == lir.Opcode.alloca
+    return root != lir.NONE && lir.instAt(a.*.ir, root).*.opcode == lir.Opcode.alloca
 }
 
 // Every function once, then again each caller of one whose parameters
@@ -471,16 +625,16 @@ fn solve(a: *Analysis, allocator: allocator_module.Allocator) -> void {
     allocator.free(caller_memory, (calls + 1) * 8, 8)
 }
 
-fn calleeOf(a: *Analysis, inst: lir.Inst) -> usize {
-    if inst.opcode != lir.Opcode.direct_call || inst.arg0 >= a.*.symbolCount { return lir.NONE }
-    return a.*.symbolFunctions[inst.arg0]
+fn calleeOf(a: *Analysis, inst: *lir.Inst) -> usize {
+    if inst.*.opcode != lir.Opcode.direct_call || inst.*.arg0 >= a.*.symbolCount { return lir.NONE }
+    return a.*.symbolFunctions[inst.*.arg0]
 }
 
 fn countCalls(a: *Analysis) -> usize {
     var calls: usize = 0
     var index: usize = 0
     while index < a.*.count {
-        if calleeOf(a, lir.getInst(a.*.ir, index)) != lir.NONE { calls += 1 }
+        if calleeOf(a, lir.instAt(a.*.ir, index)) != lir.NONE { calls += 1 }
         index += 1
     }
     return calls
@@ -498,7 +652,7 @@ fn indexCallers(a: *Analysis, offsets: [*]usize, callers: [*]usize) -> void {
         var index = a.*.functionStarts[function] + 1
         const end = functionEnd(a, function)
         while index < end {
-            const callee = calleeOf(a, lir.getInst(a.*.ir, index))
+            const callee = calleeOf(a, lir.instAt(a.*.ir, index))
             if callee != lir.NONE { offsets[callee + 1] += 1 }
             index += 1
         }
@@ -514,7 +668,7 @@ fn indexCallers(a: *Analysis, offsets: [*]usize, callers: [*]usize) -> void {
         var index = a.*.functionStarts[function] + 1
         const end = functionEnd(a, function)
         while index < end {
-            const callee = calleeOf(a, lir.getInst(a.*.ir, index))
+            const callee = calleeOf(a, lir.instAt(a.*.ir, index))
             if callee != lir.NONE {
                 callers[offsets[callee]] = function
                 offsets[callee] += 1
@@ -538,13 +692,18 @@ fn analyzeFunction(a: *Analysis, function: usize) -> bool {
     const start = a.*.functionStarts[function] + 1
     const end = functionEnd(a, function)
     const before = escapingParams(a, function)
-    var changed = true
-    while changed {
-        changed = false
+    a.*.again = true
+    while a.*.again {
+        a.*.again = false
         var index = end
         while index > start {
             index -= 1
-            if step(a, index) { changed = true }
+            // (What step would skip, skipped without the call.)
+            const kind = a.*.kinds[index]
+            if kind != KIND_INERT && (kind > KIND_LOAD || a.*.flags[index] & (ESCAPES | STORED) != 0) {
+                a.*.cursor = index
+                if step(a, index) {}
+            }
         }
     }
     return escapingParams(a, function) != before
@@ -565,62 +724,70 @@ fn escapingParams(a: *Analysis, function: usize) -> usize {
 // One instruction's rules: from what is known about its value to what
 // its operands must be.
 fn step(a: *Analysis, index: usize) -> bool {
-    const inst = lir.getInst(a.*.ir, index)
-    const op = inst.opcode
-    const escapes = has(a, index, ESCAPES)
-    const stored = has(a, index, STORED)
-    if op == lir.Opcode.dead || op == lir.Opcode.label || op == lir.Opcode.br || op == lir.Opcode.condbr || op == lir.Opcode.icmp_br || op == lir.Opcode.icmp || op == lir.Opcode.fcmp ||
-        op == lir.Opcode.const_i || op == lir.Opcode.const_f || op == lir.Opcode.func_sym || op == lir.Opcode.global_address || op == lir.Opcode.string_literal || op == lir.Opcode.builtin_sym ||
-        op == lir.Opcode.unreachable_inst || op == lir.Opcode.thread_pointer || op == lir.Opcode.frame_address || op == lir.Opcode.fence || op == lir.Opcode.error_test || op == lir.Opcode.byte_mask_64 {
-        return false
-    }
-    if op == lir.Opcode.alloca || op == lir.Opcode.param { return escapes && mark(a, index, CONTENTS) }
-    if op == lir.Opcode.copy || op == lir.Opcode.cast || op == lir.Opcode.bitcast || op == lir.Opcode.aggregate_copy || op == lir.Opcode.addr || op == lir.Opcode.error_payload ||
-        op == lir.Opcode.error_payload_part || op == lir.Opcode.tuple_element || op == lir.Opcode.popcount || op == lir.Opcode.sqrt || op == lir.Opcode.round_float {
-        return derived(a, inst.arg0, escapes, stored)
-    }
-    if op == lir.Opcode.add || op == lir.Opcode.sub || op == lir.Opcode.mul || op == lir.Opcode.div || op == lir.Opcode.rem || op == lir.Opcode.udiv || op == lir.Opcode.urem ||
-        op == lir.Opcode.bit_and || op == lir.Opcode.bit_or || op == lir.Opcode.bit_xor || op == lir.Opcode.shl || op == lir.Opcode.shr || op == lir.Opcode.gep {
-        const first = derived(a, inst.arg0, escapes, stored)
-        const second = derived(a, inst.arg1, escapes, stored)
-        return first || second
-    }
-    if op == lir.Opcode.tuple_literal { return derivedExtras(a, inst.arg0, inst.arg1, escapes, stored) }
-    if op == lir.Opcode.load || op == lir.Opcode.atomic_load {
-        const from = loaded(a, inst.arg0, escapes)
-        const kept = stored && keptFrom(a, inst.arg0)
+    const kind = a.*.kinds[index]
+    if kind == KIND_INERT { return false }
+    const flags = a.*.flags[index]
+    const escapes = flags & ESCAPES != 0
+    const stored = flags & STORED != 0
+    // A value made from others passes on only what is known about it.
+    if kind <= KIND_LOAD && !escapes && !stored { return false }
+    const inst = lir.instAt(a.*.ir, index)
+    if kind == KIND_UNARY { return derived(a, inst.*.arg0, escapes, stored) }
+    if kind == KIND_LOAD {
+        const from = loaded(a, inst.*.arg0, escapes)
+        const kept = stored && keptFrom(a, inst.*.arg0)
         return from || kept
     }
-    if op == lir.Opcode.store && has(a, index, BINDING) { return bound(a, inst.arg0, inst.arg1) }
-    if op == lir.Opcode.store || op == lir.Opcode.atomic_store { return storedInto(a, inst.arg0, inst.arg1) }
-    if op == lir.Opcode.atomic_rmw {
-        const into = storedInto(a, inst.arg0, inst.arg1)
-        const from = loaded(a, inst.arg0, escapes)
-        return into || from
-    }
-    if op == lir.Opcode.cmpxchg {
-        const into = storedInto(a, inst.arg0, inst.arg2)
-        const from = loaded(a, inst.arg0, escapes)
-        return into || from
-    }
-    if op == lir.Opcode.mem_copy { return copied(a, inst.arg0, inst.arg1) }
-    if op == lir.Opcode.direct_call { return callArguments(a, inst) }
-    if op == lir.Opcode.ret || op == lir.Opcode.ret_error || op == lir.Opcode.ret_error_union { return mark(a, inst.arg0, ESCAPES) }
-    if op == lir.Opcode.ret_slice {
-        const first = mark(a, inst.arg0, ESCAPES)
-        const second = mark(a, inst.arg1, ESCAPES)
+    if kind == KIND_BINARY {
+        const first = derived(a, inst.*.arg0, escapes, stored)
+        const second = derived(a, inst.*.arg1, escapes, stored)
         return first || second
     }
-    if op == lir.Opcode.call || op == lir.Opcode.syscall {
-        const callee = mark(a, inst.arg0, ESCAPES)
-        const arguments = escapeExtras(a, inst.arg1, inst.arg2)
+    if kind == KIND_STORE {
+        if flags & BINDING != 0 { return bound(a, inst.*.arg0, inst.*.arg1) }
+        return storedInto(a, inst.*.arg0, inst.*.arg1)
+    }
+    if kind == KIND_ROOT { return escapes && mark(a, index, CONTENTS) }
+    if kind == KIND_MEM_COPY { return copied(a, inst.*.arg0, inst.*.arg1) }
+    if kind == KIND_DIRECT_CALL {
+        const arguments = callArguments(a, inst)
+        const slot = returnsIntoSlot(inst) && derived(a, lir.getExtra(a.*.ir, inst.*.arg1), escapes, stored)
+        return arguments || slot
+    }
+    if kind == KIND_TUPLE { return derivedExtras(a, inst.*.arg0, inst.*.arg1, escapes, stored) }
+    if kind == KIND_RETURN { return mark(a, inst.*.arg0, ESCAPES) }
+    if kind == KIND_RMW {
+        const into = storedInto(a, inst.*.arg0, inst.*.arg1)
+        const from = loaded(a, inst.*.arg0, escapes)
+        return into || from
+    }
+    if kind == KIND_CMPXCHG {
+        const into = storedInto(a, inst.*.arg0, inst.*.arg2)
+        const from = loaded(a, inst.*.arg0, escapes)
+        return into || from
+    }
+    if kind == KIND_RETURN_SLICE {
+        const first = mark(a, inst.*.arg0, ESCAPES)
+        const second = mark(a, inst.*.arg1, ESCAPES)
+        return first || second
+    }
+    if kind == KIND_CALL {
+        const callee = mark(a, inst.*.arg0, ESCAPES)
+        if returnsIntoSlot(inst) {
+            // A callee not known here still only fills the storage for
+            // its result and hands it back.
+            const arguments = escapeExtras(a, inst.*.arg1 + 1, inst.*.arg2 - 1)
+            const slot = derived(a, lir.getExtra(a.*.ir, inst.*.arg1), escapes, stored)
+            return callee || arguments || slot
+        }
+        const arguments = escapeExtras(a, inst.*.arg1, inst.*.arg2)
         return callee || arguments
     }
-    if op == lir.Opcode.clone_thread { return escapeExtras(a, inst.arg0, inst.arg1) }
+    if kind == KIND_CLONE { return escapeExtras(a, inst.*.arg0, inst.*.arg1) }
     // Anything else lets every value it may read escape.
-    const first = mark(a, inst.arg0, ESCAPES)
-    const second = mark(a, inst.arg1, ESCAPES)
-    const third = mark(a, inst.arg2, ESCAPES)
+    const first = mark(a, inst.*.arg0, ESCAPES)
+    const second = mark(a, inst.*.arg1, ESCAPES)
+    const third = mark(a, inst.*.arg2, ESCAPES)
     return first || second || third
 }
 
@@ -699,9 +866,9 @@ fn copied(a: *Analysis, destination: usize, source: usize) -> bool {
 
 // A call's argument escapes with the callee's parameter, or at once when
 // the callee is not here (imported) or its parameters do not line up.
-fn callArguments(a: *Analysis, inst: lir.Inst) -> bool {
+fn callArguments(a: *Analysis, inst: *lir.Inst) -> bool {
     const callee = calleeOf(a, inst)
-    const known = callee != lir.NONE && a.*.paramGroups[callee] == inst.arg2
+    const known = callee != lir.NONE && a.*.paramGroups[callee] == inst.*.arg2
     var changed = false
     var cursor: usize = 0
     var end: usize = 0
@@ -710,7 +877,7 @@ fn callArguments(a: *Analysis, inst: lir.Inst) -> bool {
         end = cursor + a.*.paramCount[callee]
     }
     var argument: usize = 0
-    while argument < inst.arg2 {
+    while argument < inst.*.arg2 {
         var escapes = !known
         var contents = false
         if known {
@@ -718,13 +885,13 @@ fn callArguments(a: *Analysis, inst: lir.Inst) -> bool {
             escapes = has(a, a.*.params[cursor], ESCAPES)
             contents = has(a, a.*.params[cursor], CONTENTS)
             cursor += 1
-            while cursor < end && lir.getInst(a.*.ir, a.*.params[cursor]).typeId == lir.NONE {
+            while cursor < end && lir.instAt(a.*.ir, a.*.params[cursor]).*.typeId == lir.NONE {
                 if has(a, a.*.params[cursor], ESCAPES) { escapes = true }
                 if has(a, a.*.params[cursor], CONTENTS) { contents = true }
                 cursor += 1
             }
         }
-        const value = lir.getExtra(a.*.ir, inst.arg1 + argument)
+        const value = lir.getExtra(a.*.ir, inst.*.arg1 + argument)
         if escapes {
             if mark(a, value, ESCAPES) { changed = true }
         } else if contents {
@@ -745,20 +912,19 @@ fn callArguments(a: *Analysis, inst: lir.Inst) -> bool {
 // The allocations that stay in their function, moved into its frame
 // within the limits.
 fn move(a: *Analysis) -> Result {
-    var result = Result.{ .regions = 0, .bytes = 0 }
+    var result = Result.{ .regions = 0, .bytes = 0, .slotMismatches = 0 }
     var function: usize = 0
     while function < a.*.functionCount {
         var taken: usize = 0
         var index = a.*.functionStarts[function] + 1
         const end = functionEnd(a, function)
         while index < end {
-            var inst = lir.getInst(a.*.ir, index)
-            if inst.opcode == lir.Opcode.alloca && inst.arg0 != lir.NONE && inst.arg1 != 1 && inst.arg1 != 2 && inst.arg0 <= REGION_LIMIT && !has(a, index, ESCAPES) && !(has(a, index, LOOP) && has(a, index, STORED)) {
-                const aligned = (inst.arg0 + 7) & ~@intCast(usize, 7)
+            const inst = lir.instAt(a.*.ir, index)
+            if inst.*.opcode == lir.Opcode.alloca && inst.*.arg0 != lir.NONE && inst.*.arg1 != 1 && inst.*.arg1 != 2 && inst.*.arg0 <= REGION_LIMIT && !has(a, index, ESCAPES) && !(has(a, index, LOOP) && has(a, index, STORED)) {
+                const aligned = (inst.*.arg0 + 7) & ~@intCast(usize, 7)
                 if taken + aligned <= FUNCTION_LIMIT {
                     taken += aligned
-                    inst.arg1 = if filledAtOnce(a, index, inst.arg0) { 1 } else { 2 }
-                    lir.setInst(a.*.ir, index, inst)
+                    inst.*.arg1 = if filledAtOnce(a, index, inst.*.arg0) { 1 } else { 2 }
                     result.regions += 1
                     result.bytes += aligned
                 }
@@ -775,12 +941,34 @@ fn move(a: *Analysis) -> Result {
 fn filledAtOnce(a: *Analysis, allocation: usize, size: usize) -> bool {
     var index = allocation + 1
     while index < a.*.count {
-        const inst = lir.getInst(a.*.ir, index)
-        if inst.opcode != lir.Opcode.const_i && inst.opcode != lir.Opcode.dead {
-            return inst.opcode == lir.Opcode.mem_copy && inst.arg0 == allocation && inst.arg2 != lir.NONE && inst.arg2 >= size
+        const inst = lir.instAt(a.*.ir, index)
+        if inst.*.opcode != lir.Opcode.const_i && inst.*.opcode != lir.Opcode.dead {
+            // A call given it for its result writes all of it.
+            if returnsIntoSlot(inst) { return lir.getExtra(a.*.ir, inst.*.arg1) == allocation }
+            return inst.*.opcode == lir.Opcode.mem_copy && inst.*.arg0 == allocation && inst.*.arg2 != lir.NONE && inst.*.arg2 >= size
         }
         index += 1
     }
     return false
 }
 
+// A call handing the callee storage for its result as its first argument
+// (lir.FLAG_RETURN_SLOT): its value is that storage's address.
+fn returnsIntoSlot(inst: *lir.Inst) -> bool {
+    return (inst.*.opcode == lir.Opcode.direct_call || inst.*.opcode == lir.Opcode.call) && inst.*.flags & lir.FLAG_RETURN_SLOT != 0 && inst.*.arg2 > 0
+}
+
+fn slotMismatches(a: *Analysis) -> usize {
+    var mismatches: usize = 0
+    var index: usize = 0
+    while index < a.*.count {
+        const inst = lir.instAt(a.*.ir, index)
+        const callee = calleeOf(a, inst)
+        if callee != lir.NONE {
+            const label = lir.instAt(a.*.ir, a.*.functionStarts[callee])
+            if (inst.*.flags & lir.FLAG_RETURN_SLOT != 0) != (label.*.flags & lir.FLAG_RETURN_SLOT != 0) { mismatches += 1 }
+        }
+        index += 1
+    }
+    return mismatches
+}
