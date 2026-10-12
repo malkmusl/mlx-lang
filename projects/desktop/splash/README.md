@@ -28,7 +28,7 @@ is no libc and no Plymouth library.
 mlx-splash [--mode boot|shutdown|reboot|updates] [--output auto|kms|fbdev|none]
            [--card PATH | --card-fd N] [--framebuffer PATH] [--tty PATH | --no-tty]
            [--socket NAME] [--duration-file PATH] [--ask-password-dir PATH]
-           [--pid-file PATH] [--snapshot PNG] [--size WxH] [--fps N]
+           [--pid-file PATH] [--snapshot PNG] [--size WxH] [--fps N] [--threads N]
 ```
 
 As a daemon (the units start it so) it takes the first card under
@@ -45,8 +45,14 @@ Without a daemon it draws pictures:
 ```
 mlx-splash --size 1920x1080 --png boot.png --at 4 --status "Starting network" --progress 60
 mlx-splash --size 1280x720 --frames DIR --count 90 --fps 30 --mode shutdown
+mlx-splash --size 800x450 --frames DIR --fps 25 --story   # a whole boot, start to quit
 mlx-splash --size 3840x2160 --bench 60          # set-up and frame times
 ```
+
+`--story` plays a boot as a script would tell it: units starting every
+0.3 s, the bar filling, the splash told to quit at 8.8 s and fading out
+(9.4 s of frames). `--threads N` draws with N threads (default: one for
+each processor).
 
 ## What it is told
 
@@ -128,33 +134,49 @@ not in the initramfs.
 
 Everything is measured in a sixteenth of the widest 16:9 box the screen
 holds, so the picture keeps its proportions at any size. The CPU draws
-it into memory, and the animated region is copied to the screen.
+it into memory, and what changed is copied to the screen.
 
 - The backdrop is drawn once: a dithered radial gradient, bokeh, stars,
   faint constellations.
 - Light is added in packed words: red and blue in one multiply, then a
   saturating add across the channels at once.
-- Each frame restores only the animated region from the backdrop.
+- The screen is cut into tiles of 32x32 pixels. A frame marks the tiles
+  it draws on; the next one restores only those from the backdrop, and
+  the screen's buffer takes only the tiles its last frame or this one
+  drew on (a frame draws on about a fifth of the screen).
 - Once they have come in (1.75 s), the parts that stand still are drawn
   into the backdrop: the dial and the letters' glow.
 - What remains per frame is what moves: the rings, their arcs and glints,
-  the atoms, dust and text. Halos are added two pixels at a time in one
-  64-bit word, and the far side of a ring has none. A 1920x1080 frame
-  takes about 10 ms, 1280x800 about 5 ms.
-- It draws 30 frames a second at most. A frame never comes sooner than
-  three times the last one's cost, so the splash uses a third of a
-  processor at most.
+  the atoms, dust and text. A frame is recorded first (its sparks, glows,
+  lines, the letters, text, the bar), then drawn in bands of 64 rows by
+  every processor, the longest bands first. Each band copies its tiles to
+  the screen's buffer as soon as it is drawn, while they are in the cache.
+- A halo is its colour at a weight in 256ths, so each sprite's glows are
+  made once per light and then added two pixels at a time in one 64-bit
+  word. Text is laid out once per line, not per frame. The far side of a
+  ring has no halo.
+- A frame, copied to the screen, takes on four cores: 3840x2160 about
+  8 ms, 2560x1440 about 5 ms, 1920x1080 about 4 ms (one core: 22, 12 and
+  8 ms); 4K runs at 60 frames a second on four cores.
+- It draws 60 frames a second at most, and spends half the time drawing
+  at most: a frame never comes sooner than twice the last one's cost. The
+  threads helping the first are niced, so a machine busy starting gets
+  fewer frames rather than a slower start.
+- Each turn of the loop gives back what it allocated (std.turns), so a
+  long boot does not grow the splash.
 
 | File | What |
 |---|---|
 | `paint.mlx` | the surface, packed colour arithmetic, sparks, glows, lines, copies |
 | `logo.mlx` | the MLX letters as shaded facets (std.ui.vector) and their glow |
 | `state.mlx` | the scene's data, shared by the drawing modules |
+| `bands.mlx` | sorting a recorded frame into bands, the threads drawing them, tiles back from the backdrop and out to the screen |
+| `captions.mlx` | lines of text laid out once and laid over each frame |
 | `backdrop.mlx` | the night, and baking the still parts into it |
 | `orbits.mlx` | turning rings, arcs, glints, the code graph's atoms, the dial, dust, stars |
 | `status.mlx` | the status in brackets, the message, the progress bar |
 | `scene.mlx` | setting up and running a frame |
-| `output.mlx` | KMS, fbdev or nothing; the terminal's graphics mode |
+| `output.mlx` | KMS, fbdev, memory (for `--bench`) or nothing; the terminal's graphics mode |
 | `protocol.mlx` | Plymouth's protocol, server and client |
 | `daemon.mlx` | the daemon's loop |
 | `handover.mlx` | ending the splash from the program taking the screen |

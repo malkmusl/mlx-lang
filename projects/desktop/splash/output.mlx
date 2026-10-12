@@ -6,9 +6,10 @@
 //
 // A frame is drawn in memory (scene.frame) and copied over: the dumb
 // buffers can be write-combined memory, slow to read, and drawing adds
-// light to what is there. Only the animated region is copied, except
-// after a frame that changed the whole screen, which each buffer then
-// takes whole once.
+// light to what is there. A buffer holding an earlier frame takes only the
+// tiles that frame or this one drew on (the rest is the backdrop in both),
+// or all of it when that frame is too old or the whole screen changed
+// since.
 const std = @import("std")
 const kms = @import("../compositor/kms.mlx")
 const device = @import("../compositor/device.mlx")
@@ -21,7 +22,10 @@ const Allocator = std.allocator.Allocator
 pub const Kind = enum(u8) {
     none,
     kms,
-    fbdev
+    fbdev,
+    // Two buffers in memory taking frames as a card's would (--bench
+    // times the copying too).
+    memory
 }
 
 pub const Output = struct {
@@ -37,8 +41,12 @@ pub const Output = struct {
     fbStart: usize
     fbPitch: usize
     fbSwap: bool
-    // Each KMS buffer still has to take a frame whole.
-    wholeOwed: [2]bool
+    // The frame each KMS buffer (or the framebuffer, the first) holds; 0:
+    // none known, it takes the next one whole.
+    held: [2]u64
+    // Kind.memory's buffers and the one taking the next frame.
+    memoryBuffers: [2]usize
+    memoryBack: usize
     // The card is given to someone else (deactivated) or the console shown
     // (hidden): nothing is drawn.
     released: bool
@@ -57,8 +65,8 @@ pub fn init(output: *Output, allocator: Allocator) -> void {
     output.*.width = 0
     output.*.height = 0
     output.*.fbDescriptor = -1
-    output.*.wholeOwed[0] = true
-    output.*.wholeOwed[1] = true
+    output.*.held[0] = 0
+    output.*.held[1] = 0
     output.*.released = false
     output.*.hidden = false
     output.*.allocator = allocator
@@ -82,6 +90,8 @@ pub fn openCard(output: *Output, descriptor: isize) -> bool {
     output.*.kind = Kind.kms
     output.*.width = output.*.card.width
     output.*.height = output.*.card.height
+    output.*.held[0] = 0
+    output.*.held[1] = 0
     return true
 }
 
@@ -169,6 +179,7 @@ pub fn openFramebuffer(output: *Output, path: [*]const u8) -> bool {
     output.*.fbPitch = pitch
     output.*.fbStart = @intCast(usize, device.load32(variable_bytes, 20)) * pitch + @intCast(usize, device.load32(variable_bytes, 16)) * 4
     output.*.fbSwap = device.load32(variable_bytes, 32) == 0
+    output.*.held[0] = 0
     return true
 }
 
@@ -177,6 +188,22 @@ pub fn openNone(output: *Output, width: usize, height: usize) -> void {
     output.*.kind = Kind.none
     output.*.width = width
     output.*.height = height
+}
+
+// Two buffers in memory of `width` x `height`; false without memory.
+pub fn openMemory(output: *Output, width: usize, height: usize) -> bool {
+    const first = output.*.allocator.alloc(width * height * 4, 4096)
+    const second = output.*.allocator.alloc(width * height * 4, 4096)
+    if first == null || second == null { return false }
+    output.*.kind = Kind.memory
+    output.*.width = width
+    output.*.height = height
+    output.*.memoryBuffers[0] = @intFromPtr(first.?)
+    output.*.memoryBuffers[1] = @intFromPtr(second.?)
+    output.*.memoryBack = 0
+    output.*.held[0] = 0
+    output.*.held[1] = 0
+    return true
 }
 
 // The card's descriptor to wait for flips on (-1: none).
@@ -199,53 +226,88 @@ pub fn readEvents(output: *Output) -> void {
     const flipped = kms.readEvents(&output.*.card, &milliseconds)
 }
 
-// The scene's frame onto the screen.
+// Where the scene's next frame goes: its bands copy what they drew into
+// the buffer the screen does not show now (the back buffer, the memory
+// buffer next in turn) or the framebuffer, while it is still in the cache.
+// Call before scene.draw, then show.
+pub fn aim(output: *Output, scene: *state.Scene) -> void {
+    scene.*.targetAddress = 0
+    if output.*.kind == Kind.none || !ready(output) { return }
+    scene.*.targetSwap = false
+    if output.*.kind == Kind.memory {
+        scene.*.targetAddress = output.*.memoryBuffers[output.*.memoryBack]
+        scene.*.targetPitch = output.*.width * 4
+        scene.*.targetHeld = output.*.held[output.*.memoryBack]
+    } else if output.*.kind == Kind.fbdev {
+        scene.*.targetAddress = output.*.fbAddress + output.*.fbStart
+        scene.*.targetPitch = output.*.fbPitch
+        scene.*.targetHeld = output.*.held[0]
+        scene.*.targetSwap = output.*.fbSwap
+    } else {
+        const back = kms.backIndex(&output.*.card)
+        scene.*.targetAddress = kms.backAddress(&output.*.card)
+        scene.*.targetPitch = kms.backPitch(&output.*.card)
+        scene.*.targetHeld = output.*.held[back]
+    }
+}
+
+// The scene's frame onto the screen: copied already when aimed at the
+// buffer it went to, else copied now.
 pub fn show(output: *Output, scene: *state.Scene) -> bool {
     if output.*.kind == Kind.none || !ready(output) { return true }
-    if scene.*.wholeChanged {
-        output.*.wholeOwed[0] = true
-        output.*.wholeOwed[1] = true
+    const copied = scene.*.targetAddress != 0
+    scene.*.targetAddress = 0
+    if output.*.kind == Kind.memory {
+        const back = output.*.memoryBack
+        if !copied { copyFrame(scene, output.*.memoryBuffers[back], output.*.width * 4, output.*.held[back], false) }
+        output.*.held[back] = scene.*.frameNumber
+        output.*.memoryBack = 1 - back
+        return true
     }
     if output.*.kind == Kind.fbdev {
-        copyFrame(scene, output.*.fbAddress + output.*.fbStart, output.*.fbPitch, scene.*.wholeChanged || output.*.wholeOwed[0], output.*.fbSwap)
-        output.*.wholeOwed[0] = false
+        if !copied { copyFrame(scene, output.*.fbAddress + output.*.fbStart, output.*.fbPitch, output.*.held[0], output.*.fbSwap) }
+        output.*.held[0] = scene.*.frameNumber
         return true
     }
     const back = kms.backIndex(&output.*.card)
-    copyFrame(scene, kms.backAddress(&output.*.card), kms.backPitch(&output.*.card), output.*.wholeOwed[back], false)
-    output.*.wholeOwed[back] = false
+    if !copied { copyFrame(scene, kms.backAddress(&output.*.card), kms.backPitch(&output.*.card), output.*.held[back], false) }
+    output.*.held[back] = scene.*.frameNumber
     var shown = false
     return kms.present(&output.*.card, &shown)
 }
 
-// The frame (or its region) into a buffer at `address`, rows `pitch` bytes
-// apart.
-fn copyFrame(scene: *state.Scene, address: usize, pitch: usize, whole: bool, swap: bool) -> void {
-    const left = if whole { 0 } else { scene.*.regionX }
-    const top = if whole { 0 } else { scene.*.regionY }
-    const width = if whole { scene.*.width } else { scene.*.regionWidth }
-    const height = if whole { scene.*.height } else { scene.*.regionHeight }
-    var row = top
-    while row < top + height {
-        const from = @intFromPtr(scene.*.frame.pixels) + (row * scene.*.frame.stride + left) * 4
-        const to = address + row * pitch + left * 4
-        if swap {
-            var source: [*]const u32 = undefined
-            var target: [*]u32 = undefined
-            unsafe {
-                source = @ptrFromInt([*]const u32, from)
-                target = @ptrFromInt([*]u32, to)
-            }
-            var column: usize = 0
-            while column < width {
-                const pixel = source[column]
-                target[column] = (pixel & 4278255360) | ((pixel & 255) << 16) | ((pixel >> 16) & 255)
+// The frame into a buffer at `address` (rows `pitch` bytes apart) that
+// holds frame `held`: what changed since, tile row by tile row, runs of
+// neighbouring tiles a copy each.
+fn copyFrame(scene: *state.Scene, address: usize, pitch: usize, held: u64, swap: bool) -> void {
+    const number = scene.*.frameNumber
+    const frame = &scene.*.frame
+    if held == 0 || held > number || number - held >= state.HISTORY || scene.*.wholeFrame > held {
+        paint.copyOut(frame, address, pitch, 0, 0, scene.*.width, scene.*.height, swap)
+        return
+    }
+    const current = state.marksOf(scene, number)
+    const old = state.marksOf(scene, held)
+    const tile = @intCast(usize, paint.TILE)
+    const columns = scene.*.tileColumns
+    var tile_row: usize = 0
+    while tile_row < scene.*.tileRows {
+        const top = tile_row * tile
+        const bottom = if top + tile > scene.*.height { scene.*.height } else { top + tile }
+        const base = tile_row * columns
+        var column: usize = 0
+        while column < columns {
+            if (current[base + column] | old[base + column]) == 0 {
                 column += 1
+            } else {
+                const first = column
+                while column < columns && (current[base + column] | old[base + column]) != 0 { column += 1 }
+                const left = first * tile
+                const right = if column * tile > scene.*.width { scene.*.width } else { column * tile }
+                paint.copyOut(frame, address, pitch, left, top, right - left, bottom - top, swap)
             }
-        } else {
-            paint.copyBytes(to, from, width * 4)
         }
-        row += 1
+        tile_row += 1
     }
 }
 
@@ -263,8 +325,8 @@ pub fn reactivate(output: *Output) -> void {
         const master = kms.setMaster(&output.*.card)
         kms.resume(&output.*.card)
     }
-    output.*.wholeOwed[0] = true
-    output.*.wholeOwed[1] = true
+    output.*.held[0] = 0
+    output.*.held[1] = 0
 }
 
 // The text console instead of the splash (a password asked for on it, or
@@ -282,8 +344,8 @@ pub fn unhide(output: *Output) -> void {
     if !output.*.hidden { return }
     output.*.hidden = false
     if output.*.kind == Kind.kms { kms.resume(&output.*.card) }
-    output.*.wholeOwed[0] = true
-    output.*.wholeOwed[1] = true
+    output.*.held[0] = 0
+    output.*.held[1] = 0
 }
 
 // Waits (a fifth of a second at most) for a flip in flight: until it is

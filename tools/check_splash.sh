@@ -24,7 +24,7 @@ fail() { echo "FAIL $1" >&2; exit 1; }
 mkdir "$work/frames"
 "$work/mlx-splash" --size 640x360 --frames "$work/frames" --count 3 --mode shutdown || fail "--frames"
 [[ -f "$work/frames/frame-0002.png" ]] || fail "--frames wrote no third frame"
-"$work/mlx-splash" --size 1280x720 --bench 5 | grep -q "^set up: [0-9]* ms, frame: [0-9]* us$" || fail "--bench"
+"$work/mlx-splash" --size 1280x720 --bench 5 | grep -q "^set up: [0-9]* ms, frame: [0-9]* us, [0-9]* threads$" || fail "--bench"
 echo "ok   pictures: --png, --frames, --bench"
 
 # The fake card (tools/fake_drm_session.py) is loaded with the compositor's
