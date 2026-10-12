@@ -617,7 +617,23 @@ Every LIR value (`vreg`) lives at a fixed stack offset assigned once by
 `State.allocateOp`, keyed by a per-function `slotEpoch` so vreg-index slots
 can be reused across functions without clearing the whole table between
 them (bumped once per function in `State.beginFunction`, not per basic
-block). A single-word value that is used by exactly the LIR instruction
+block).
+
+On x86_64 the encoder keeps float values in `xmm8`..`xmm15`, which nothing
+else uses, by the slot they were stored to or loaded from
+(`Encoder.xmmSlots`): a float result is still stored to its slot, and also
+copied into the next of those registers; a load of a slot one of them
+holds is a register move, and an arithmetic, comparison or `@sqrt`
+instruction takes its right operand straight from that register
+(`Arithmetic.floatOperand`). A slot belongs to one value and is written
+where that value is made, so an entry holds until a label (another way in:
+`defineSymbol`), a call (`emitCallRel`, `emitCallReg`, `emitImportCall`:
+the callee may use those registers), a store to an overlapping slot, a
+store or atomic through a pointer, or a `mem_copy`. A chain of float
+arithmetic then depends on registers instead of a store and a load per
+step: a float-only loop ran 1.7 times as fast
+(`tests/318_float_registers_runtime.mlx` covers the ways a held value must
+be forgotten). A single-word value that is used by exactly the LIR instruction
 right after it skips that stack write as a peephole
 (`State.storeRaxResult`'s `canRetainNext`/`state.pendingRaxVreg` path):
 the value stays in `rax` only, on the assumption that its one consumer is
