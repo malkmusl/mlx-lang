@@ -17,6 +17,11 @@ projects/.../main.mlx -o ...`) and is checked by a script under `tools/`.
   - [`terminal/`](desktop/terminal/README.md): the terminal emulator, a
     window around `std.terminal` and `std.ui.terminal`;
     `tools/check_terminal.sh`.
+  - [`splash/`](desktop/splash/README.md): mlx-splash, the boot splash
+    in place of Plymouth (the MLX letters with orbiting rings and the
+    Observatory's code graph, on KMS or the framebuffer, Plymouth's
+    protocol for systemd) and mlx-splashctl; `tools/install_splash.sh`;
+    `tools/check_splash.sh`.
   - `shared/`: what the desktop's clients share: the drawing canvas (CPU
     and GPU), the layer-shell and window surface (`panel.mlx`), keyboard
     text, desktop entries and icons, places and the trash, thumbnails,

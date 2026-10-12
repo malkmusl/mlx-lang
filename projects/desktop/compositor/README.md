@@ -11,7 +11,9 @@ A Wayland compositor written in Mlx with `std.wayland`. It runs either
 Either way it is a compositor in its own right: programs started with its
 `WAYLAND_DISPLAY` appear as windows inside it. It picks nested when it is
 started inside a Wayland session, freestanding otherwise (`--backend
-nested|drm` decides).
+nested|drm` decides). Freestanding, it first tells the boot splash
+(mlx-splash or plymouthd) to quit leaving its last frame, so the monitor
+goes from the splash to the desktop with no text console in between.
 
 - Keyboard and pointer go to the clients: the pointer to the window under
   it, a click focuses and raises a window, and keys go to the focused

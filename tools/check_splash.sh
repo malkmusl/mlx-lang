@@ -38,3 +38,23 @@ for candidate in python3 /usr/bin/python3 /usr/bin/python3.13 /usr/bin/python3.1
 done
 [[ -n "$python" ]] || { echo "check_splash.sh: needs Python with GObject introspection (python3-gi)" >&2; exit 2; }
 "$python" tools/check_splash.py "$work/mlx-splash" "$work/mlx-splashctl" "$work"
+
+# The installer, staged only (--destdir): units, the display manager's
+# drop-in, Plymouth masked with --enable and put back with --disable.
+stage="$work/stage"
+mkdir -p "$stage/etc/systemd/system"
+ln -s /usr/lib/systemd/system/gdm.service "$stage/etc/systemd/system/display-manager.service"
+echo "[Unit]" > "$stage/etc/systemd/system/plymouth-quit.service"
+tools/install_splash.sh --destdir "$stage" --enable "$compiler" > "$work/install.log" 2>&1 || { cat "$work/install.log" >&2; fail "install_splash.sh --enable"; }
+units="$stage/etc/systemd/system"
+for path in usr/bin/mlx/mlx-splash usr/bin/mlx/mlx-splashctl etc/systemd/system/mlx-splash.service \
+            etc/systemd/system/gdm.service.d/mlx-splash.conf etc/mlx/init/services/mlx-splash.service; do
+    [[ -e "$stage/$path" ]] || fail "the installer left out $path"
+done
+[[ $(readlink "$units/sysinit.target.wants/mlx-splash.service") == /etc/systemd/system/mlx-splash.service ]] || fail "mlx-splash.service not enabled"
+[[ $(readlink "$units/plymouth-start.service") == /dev/null && $(readlink "$units/plymouth-quit.service") == /dev/null ]] || fail "Plymouth's units not masked"
+grep -q "^ExecStartPre=-/usr/bin/mlx/mlx-splashctl quit --retain-splash$" "$units/gdm.service.d/mlx-splash.conf" || fail "the display manager's drop-in"
+tools/install_splash.sh --destdir "$stage" --disable > "$work/install.log" 2>&1 || fail "install_splash.sh --disable"
+[[ -f "$units/plymouth-quit.service" && ! -L "$units/plymouth-quit.service" && ! -e "$units/plymouth-start.service" ]] || fail "Plymouth's units not put back"
+[[ ! -e "$units/sysinit.target.wants/mlx-splash.service" ]] || fail "mlx-splash.service still enabled"
+echo "ok   the installer (staged): units, the display manager's drop-in, Plymouth masked and put back"
