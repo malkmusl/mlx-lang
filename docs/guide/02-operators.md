@@ -201,6 +201,36 @@ pub fn main() -> usize {
 
 (`tests/207_popcount_runtime.mlx`)
 
+## Square root
+
+`@sqrt(value)` is the square root of an `f64` or `f32`, correctly rounded,
+as one machine instruction (`sqrtsd`/`sqrtss` on x86_64, `FSQRT` on
+AArch64). The result has the operand's type; a float literal gives an
+`f64`. A negative operand gives NaN, and an integer operand is rejected
+(`MLX-E4001`):
+
+```mlx
+const Point = struct { x: f64, y: f64 }
+
+fn length(point: Point) -> f64 { return @sqrt(point.x * point.x + point.y * point.y) }
+
+pub fn main() -> usize {
+    const two: f64 = 2.0
+    if @bitCast(u64, @sqrt(two)) != 4609047870845172685 { return 1 }   // the double nearest to the root
+    if @sqrt(9.0) != 3.0 { return 3 }
+    const small: f32 = 2.0
+    const root: f32 = @sqrt(small)                                     // sqrtss
+    if @bitCast(u32, root) != 1068827891 { return 4 }
+    const side = Point.{ .x = 3.0, .y = 4.0 }
+    if length(side) != 5.0 { return 7 }
+    return 13
+}
+```
+
+(`tests/316_sqrt_runtime.mlx`, which also runs under the AArch64 emulator:
+`python3 tools/aarch64_linux_emulator.py` on a `--target=aarch64-linux`
+build.)
+
 A chain of arithmetic and bitwise operators combined with array indexing —
 the kind of expression that exercises the backend's immediate-operand and
 address-calculation paths — evaluates with ordinary operator precedence:
