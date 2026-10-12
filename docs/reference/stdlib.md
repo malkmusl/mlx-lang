@@ -168,7 +168,15 @@ crash to `crashes.log` as a `crash` or `gpu-crash` line, `openProfile`,
 `profileLine` and `closeProfile` write a profile whose header names its
 source (to a `.part` file renamed into place), and `runtimeDirectory`,
 `programName` and `environmentValue` find where and for whom. `std.crash`,
-`mlx-profile` and `std.gpu.diagnostics` use it.
+`mlx-profile` and `std.gpu.diagnostics` use it. It also keeps the GPU's
+memory for the memory snapshots: `gpuDevice`, `gpuHeap` and `gpuType`
+note the device a context opened (its name, how many allocations it
+allows, its heaps and memory types), `gpuAllocated` and `gpuFreed` each
+block of device memory (the bytes asked, the bytes the device took, the
+memory type, a kind: a buffer, exported, imported, host memory; and the
+functions that asked, along the frame pointers). `std.gpu` writes them,
+`std.leaks` reads them under `gpuLock`, in a mapping of its own made when
+the first context opens.
 
 `std.gpu.diagnostics` (`std/src/gpu/diagnostics.mlx`, used by `std.gpu`
 only) watches the GPU work a program records. After each pass a barrier
@@ -453,10 +461,18 @@ about once a second (from the main thread, as blocks come and go, and at
 each mark and report) to `$XDG_RUNTIME_DIR/mlx/memory/PROGRAM-PID.memory`:
 the totals, how full the tiny pages are, each place with its functions
 (as crashes name them), each block (address, bytes, place, since the mark
-or kept, what it takes in pages) and the program's mappings. `mlx-codemap memory [PROGRAM]` and Memory under Findings in MLX
+or kept, what it takes in pages) and the program's mappings; with a GPU
+context open also the GPU's memory: the device, its heaps and memory
+types, and each block of device memory `std.gpu` allocated with the bytes
+asked, the bytes the device took and its place (the functions that asked,
+`std.gpu`'s own left out). Every buffer is an allocation of its own, so
+what the GPU's memory wastes is what the device rounds up, and many small
+allocations against its limit. A loop calls `leaks.tick()` each turn (the
+panels of `std.ui.wayland.panel` do) for a snapshot when only the GPU's
+memory changed. `mlx-codemap memory [PROGRAM]` and Memory under Findings in MLX
 Observatory read it: what the page blocks waste by size class, the holes
-between them and how scattered they are, and the places that hold the
-most or grow. The report also says when the compiler's value arena
+between them and how scattered they are, what the GPU holds by heap and
+size class, and the places that hold the most or grow. The report also says when the compiler's value arena
 grew by more than 64 KiB since the mark: a loop whose turns do not give
 their values back (`std.turns`) grows a program as a leak would (a loop on
 `std.turns` is not said). A block a program keeps on purpose until it

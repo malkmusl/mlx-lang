@@ -534,7 +534,7 @@ runtime=$(mktemp -d)
 # A program's memory as std.leaks writes it: two places on the tree's
 # functions, three blocks with two holes between their mappings.
 mkdir -p "$runtime/mlx/memory"
-printf 'memory\tprogram\t4242\t1791800000\t12\t4\t3\t9000\t12288\t16384\t65536\t2048\nplace\t0\t2\t8000\t8192\t2\t0\tlib/helper.mlx:4:greet\t_start\nplace\t1\t1\t1000\t4096\t0\t0\tlib/extra.mlx:3:twice\t_start\nblock\t7f0000000000\t4000\t0\t1\nblock\t7f0000003000\t4000\t0\t1\nblock\t7f0000010000\t1000\t1\t0\nmap\t7f0000000000\t7f0000001000\trw-p\t\nmap\t7f0000003000\t7f0000004000\trw-p\t\nmap\t7f0000010000\t7f0000011000\trw-p\t\n' > "$runtime/mlx/memory/program-4242.memory"
+printf 'memory\tprogram\t4242\t1791800000\t12\t4\t3\t9000\t12288\t16384\t65536\t2048\nplace\t0\t2\t8000\t8192\t2\t0\tlib/helper.mlx:4:greet\t_start\nplace\t1\t1\t1000\t4096\t0\t0\tlib/extra.mlx:3:twice\t_start\nblock\t7f0000000000\t4000\t0\t1\nblock\t7f0000003000\t4000\t0\t1\nblock\t7f0000010000\t1000\t1\t0\nmap\t7f0000000000\t7f0000001000\trw-p\t\nmap\t7f0000003000\t7f0000004000\trw-p\t\nmap\t7f0000010000\t7f0000011000\trw-p\t\ngpu\tTest GPU\t4096\t2\t3\t1\ngpu-heap\t0\t268435456\t1\ngpu-heap\t1\t1073741824\t0\ngpu-type\t0\t0\t1\ngpu-type\t1\t1\t6\ngpu-place\t0\t2\t5000\t8192\tlib/helper.mlx:4:greet\t_start\ngpu-block\tabc0\t1000\t4096\t0\t0\t0\ngpu-block\tdef0\t4000\t4096\t1\t0\t0\n' > "$runtime/mlx/memory/program-4242.memory"
 XDG_RUNTIME_DIR=$runtime "$work/test-host" host-demo "$work/us.xkb" "$work/hold.script" > "$work/demo-host.log" 2>&1 &
 host_pid=$!
 for _ in $(seq 1 50); do [[ -S "$runtime/host-demo" ]] && break; sleep 0.1; done
@@ -549,7 +549,7 @@ rm -rf -- "$runtime"
 for picture in start query memory flight-000 flight-001 flight-002; do
     head -c 15 "$work/demo/$picture.ppm" 2> /dev/null | grep -q "^P6$" || fail "codemap (demo): $picture.ppm is missing" "$work/demo.log"
 done
-grep -q "^codemap: memory program pid 4242: 2 places, 2 on declarations, 3 blocks, 2 holes$" "$work/demo.log" || fail "codemap (demo): Memory did not read the program's memory" "$work/demo.log"
+grep -q "^codemap: memory program pid 4242: 2 places, 2 on declarations, 3 blocks, 2 holes, 2 GPU blocks in 1 places$" "$work/demo.log" || fail "codemap (demo): Memory did not read the program's memory (with its GPU's)" "$work/demo.log"
 grep -q "^codemap: query kind:fn calls:greet: 2 declarations$" "$work/demo.log" || fail "codemap (demo): the query step did not run" "$work/demo.log"
 cmp -s "$work/demo/flight-000.ppm" "$work/demo/flight-002.ppm" && fail "codemap (demo): the recorded flight does not move" "$work/demo.log"
 echo "ok   codemap (demo): a script played, its frames written"

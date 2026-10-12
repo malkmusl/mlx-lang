@@ -26,6 +26,11 @@
 //   milliseconds); std.gpu the GPU's (the time of the GPU work each function
 //   recorded, in microseconds, the interval 1).
 //
+// - GPU memory: std.gpu notes each block of device memory it allocates
+//   (with the functions that asked, its memory type and heap) and frees;
+//   std.leaks writes them into its memory snapshots beside the processor's
+//   blocks (GPU memory below).
+//
 // Nothing here allocates (the crash handler uses it): what it needs it
 // maps and gives back.
 const std = @import("std")
@@ -410,4 +415,203 @@ pub fn profilePath(file: *const ProfileFile) -> []const u8 {
     var path: [*]const u8 = undefined
     unsafe { path = @ptrCast([*]const u8, &file.*.path) }
     return path[0..file.*.pathLength]
+}
+
+// ---------------------------------------------------------------------------
+// GPU memory: the device memory std.gpu holds, noted as it allocates and
+// frees (std.gpu writes, std.leaks reads), in one mapping made when the
+// first GPU context opens:
+//
+//   words: lock, heaps, types, the device's allocation limit, slots used,
+//   blocks live, allocations, frees; the device's name at 128; heaps (size,
+//   flags) at 512; types (heap, flags) at 768; from 4096 a slot per block:
+//   handle (0: free), bytes asked, bytes allocated, type << 32 | kind, and
+//   the return addresses of the functions that asked.
+//
+// Every buffer std.gpu makes is an allocation of its own, so what the
+// device rounds up (and how many allocations there are against its limit)
+// is what a program's GPU memory wastes.
+
+pub const GPU_DEPTH: usize = 12
+pub const GPU_BLOCKS: usize = 4096
+pub const GPU_HEAPS: usize = 16
+pub const GPU_TYPES: usize = 32
+// What a block of device memory is: a buffer std.gpu made, one exported as
+// a dma-buf, another process's dma-buf (a buffer or an image), this
+// process's own memory.
+pub const GPU_BUFFER: usize = 0
+pub const GPU_EXPORT: usize = 1
+pub const GPU_IMPORT: usize = 2
+pub const GPU_HOST: usize = 3
+const GPU_SLOT_WORDS: usize = 4 + GPU_DEPTH
+const GPU_SLOTS_AT: usize = 4096
+const GPU_SIZE: usize = GPU_SLOTS_AT + GPU_BLOCKS * GPU_SLOT_WORDS * 8
+const GPU_HEAPS_AT: usize = 512
+const GPU_TYPES_AT: usize = 768
+
+// The mapping (0: no GPU context opened in this image).
+var gpuMemory: usize = 0
+
+pub const GpuBlock = struct {
+    handle: usize
+    asked: usize
+    size: usize
+    memoryType: usize
+    kind: usize
+    // GPU_DEPTH return addresses, 0 after the last.
+    frames: [*]const usize
+}
+
+fn gpuWords() -> [*]usize {
+    unsafe { return @ptrFromInt([*]usize, gpuMemory) }
+}
+
+pub fn gpuLock() -> void {
+    var word: *u32 = undefined
+    unsafe { word = @ptrFromInt(*u32, gpuMemory) }
+    const fast = @cmpxchgWeak(u32, word, 0, 1, acquire, monotonic)
+    if fast.0 { return }
+    while true {
+        const previous = @atomicRmw(u32, word, xchg, 2, acquire)
+        if previous == 0 { return }
+        const slept = std.linux.thread.futexWait(word, 2, 0, true)
+    }
+}
+
+pub fn gpuUnlock() -> void {
+    var word: *u32 = undefined
+    unsafe { word = @ptrFromInt(*u32, gpuMemory) }
+    const previous = @atomicRmw(u32, word, xchg, 0, release)
+    if previous == 2 { const woken = std.linux.thread.futexWake(word, 1, true) }
+}
+
+// The device a context opened: its name (zero-terminated), how many
+// allocations it allows at once, its heaps and memory types (gpuHeap,
+// gpuType). The first context makes the mapping.
+pub fn gpuDevice(name: [*]const u8, limit: usize, heaps: usize, types: usize) -> void {
+    if gpuMemory == 0 {
+        gpuMemory = mapped(GPU_SIZE)
+        if gpuMemory == 0 { return }
+    }
+    const words = gpuWords()
+    words[1] = if heaps < GPU_HEAPS { heaps } else { GPU_HEAPS }
+    words[2] = if types < GPU_TYPES { types } else { GPU_TYPES }
+    words[3] = limit
+    const text = bytesAt(gpuMemory + 128)
+    var at: usize = 0
+    while at < 255 && name[at] != 0 {
+        text[at] = name[at]
+        at += 1
+    }
+    text[at] = 0
+}
+
+pub fn gpuHeap(index: usize, size: usize, flags: usize) -> void {
+    if gpuMemory == 0 || index >= GPU_HEAPS { return }
+    const words = gpuWords()
+    words[GPU_HEAPS_AT / 8 + index * 2] = size
+    words[GPU_HEAPS_AT / 8 + index * 2 + 1] = flags
+}
+
+pub fn gpuType(index: usize, heap: usize, flags: usize) -> void {
+    if gpuMemory == 0 || index >= GPU_TYPES { return }
+    const words = gpuWords()
+    words[GPU_TYPES_AT / 8 + index * 2] = heap
+    words[GPU_TYPES_AT / 8 + index * 2 + 1] = flags
+}
+
+// A block of device memory allocated: `asked` bytes wanted, `size`
+// allocated, of memory type `memory_type`, a GPU_* kind; with the
+// functions that asked (std.gpu's own among them; readers leave those
+// out).
+pub fn gpuAllocated(handle: usize, asked: usize, size: usize, memory_type: usize, kind: usize) -> void {
+    if gpuMemory == 0 || handle == 0 { return }
+    const words = gpuWords()
+    gpuLock()
+    var slot: usize = 0
+    while slot < words[4] && words[GPU_SLOTS_AT / 8 + slot * GPU_SLOT_WORDS] != 0 { slot += 1 }
+    if slot < GPU_BLOCKS {
+        if slot == words[4] { words[4] += 1 }
+        const at = GPU_SLOTS_AT / 8 + slot * GPU_SLOT_WORDS
+        words[at] = handle
+        words[at + 1] = asked
+        words[at + 2] = size
+        words[at + 3] = (memory_type << 32) | kind
+        var frame = @frameAddress()
+        var count: usize = 0
+        while count < GPU_DEPTH && frame != 0 && frame & 7 == 0 {
+            var links: [*]const usize = undefined
+            unsafe { links = @ptrFromInt([*]const usize, frame) }
+            const back = links[1]
+            if back < 4096 { break }
+            words[at + 4 + count] = back
+            count += 1
+            const next = links[0]
+            if next <= frame || next - frame > 1048576 { break }
+            frame = next
+        }
+        while count < GPU_DEPTH {
+            words[at + 4 + count] = 0
+            count += 1
+        }
+        words[5] += 1
+    }
+    words[6] += 1
+    gpuUnlock()
+}
+
+pub fn gpuFreed(handle: usize) -> void {
+    if gpuMemory == 0 || handle == 0 { return }
+    const words = gpuWords()
+    gpuLock()
+    var slot: usize = 0
+    while slot < words[4] {
+        const at = GPU_SLOTS_AT / 8 + slot * GPU_SLOT_WORDS
+        if words[at] == handle {
+            words[at] = 0
+            words[5] -= 1
+            break
+        }
+        slot += 1
+    }
+    words[7] += 1
+    gpuUnlock()
+}
+
+// Reading (under gpuLock): whether a GPU context opened; the counts; the
+// heaps, types and blocks by index.
+pub fn gpuNoted() -> bool { return gpuMemory != 0 }
+
+// 0 heaps, 1 types, 2 the allocation limit, 3 slots used, 4 blocks live,
+// 5 allocations, 6 frees.
+pub fn gpuCount(which: usize) -> usize {
+    if gpuMemory == 0 || which > 6 { return 0 }
+    return gpuWords()[1 + which]
+}
+
+pub fn gpuDeviceName() -> []const u8 {
+    if gpuMemory == 0 { return "" }
+    const text = bytesAt(gpuMemory + 128)
+    var length: usize = 0
+    while length < 255 && text[length] != 0 { length += 1 }
+    return text[0..length]
+}
+
+pub fn gpuHeapSize(index: usize) -> usize { return gpuWords()[GPU_HEAPS_AT / 8 + index * 2] }
+pub fn gpuHeapFlags(index: usize) -> usize { return gpuWords()[GPU_HEAPS_AT / 8 + index * 2 + 1] }
+pub fn gpuTypeHeap(index: usize) -> usize { return gpuWords()[GPU_TYPES_AT / 8 + index * 2] }
+pub fn gpuTypeFlags(index: usize) -> usize { return gpuWords()[GPU_TYPES_AT / 8 + index * 2 + 1] }
+
+// The block in `slot` (below gpuCount(3)); false when the slot is free.
+pub fn gpuBlock(slot: usize, block: *GpuBlock) -> bool {
+    const words = gpuWords()
+    const at = GPU_SLOTS_AT / 8 + slot * GPU_SLOT_WORDS
+    if words[at] == 0 { return false }
+    block.*.handle = words[at]
+    block.*.asked = words[at + 1]
+    block.*.size = words[at + 2]
+    block.*.memoryType = words[at + 3] >> 32
+    block.*.kind = words[at + 3] & 4294967295
+    unsafe { block.*.frames = @ptrFromInt([*]const usize, gpuMemory + (at + 4) * 8) }
+    return true
 }

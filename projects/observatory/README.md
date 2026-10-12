@@ -324,9 +324,14 @@ each group are joined by magenta lines in space.
   are (green nearly full, amber half, red mostly waste), gray where
   other mappings lie between the blocks and empty where nothing is
   mapped, with the holes counted and a fragmentation index (0: one hole
-  or none, near 1: many small ones). Below, the functions whose
-  blocks hold the most, with their blocks, those since `leaks.mark`, kept
-  ones and how many more than when first looked at (`+`, a leak's sign).
+  or none, near 1: many small ones). With a GPU context open, the GPU's
+  memory in sky blue: the device, its allocations against the limit,
+  what was asked and what the device took, each heap as a bar (what the
+  blocks take of it) and the size classes (what the device rounds up).
+  Below, the functions whose blocks hold the most, the GPU's memory
+  counted in ("GPU 24 MiB"), with their blocks, those since
+  `leaks.mark`, kept ones and how many more than when first looked at
+  (`+`, a leak's sign).
   It is read again each second while the panel is open
   ([`memory_view.mlx`](memory_view.mlx),
   [`tools/codemap/memory.mlx`](../../tools/codemap/memory.mlx));

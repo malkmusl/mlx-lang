@@ -2,6 +2,8 @@
 # The GPU's crashes and profile (std.gpu.diagnostics through
 # std.diagnostics) on lavapipe, with tests/support/gpu_diagnostics_program.mlx:
 #
+#   - with MLX_LEAK_CHECK the memory snapshot holds the GPU's blocks of
+#     device memory with the functions that asked;
 #   - with MLX_GPU_PROFILE the GPU time goes on the functions that recorded
 #     the work (heavy far above light), as PROGRAM-gpu-SECONDS.profile;
 #   - mlx-profile profiles the processor and has the GPU profiled beside it;
@@ -63,6 +65,24 @@ grep -q "^program: crashed: GPU hang (a frame did not finish in 5 s), in pass 2 
 grep -q "^  from tests/support/gpu_diagnostics_program.mlx:[0-9]*:stuck" "$work/hang.err" || fail "the hang does not name stuck, which recorded the pass" "$work/hang.err"
 grep -q "^gpu-crash	[0-9]*	program	GPU hang .*	.*:stuck+" "$work/state/mlx/crashes.log" || fail "no gpu-crash line kept" "$work/state/mlx/crashes.log"
 echo "ok   a GPU hang: said in the pass that hung, with the functions that recorded it, and kept as a gpu-crash"
+
+# GPU memory in the memory snapshot: the blocks of device memory with the
+# functions that asked (smallBuffers' eight, one freed again, and
+# largeBuffer's), and the codemap's memory command reads them.
+runtime="$work/runtime"
+mkdir -p "$runtime"
+XDG_RUNTIME_DIR="$runtime" MLX_LEAK_CHECK="$work/leaks.txt" "$work/program" memory || fail "the memory run ended with $?"
+snapshot=$(ls "$runtime"/mlx/memory/program-*.memory 2>/dev/null | head -1)
+[[ -n "$snapshot" ]] || fail "no memory snapshot written"
+grep -q "^gpu	.*	[0-9]*	[0-9]*	[0-9]*	1$" "$snapshot" || fail "the snapshot does not say the GPU (one free)" "$snapshot"
+grep -q "^gpu-heap	0	[0-9]*	[0-9]*$" "$snapshot" || fail "the snapshot has no GPU heap" "$snapshot"
+grep -q "^gpu-place	[0-9]*	7	700	[0-9]*	tests/support/gpu_diagnostics_program.mlx:[0-9]*:smallBuffers	tests/support/gpu_diagnostics_program.mlx:[0-9]*:memory	" "$snapshot" || fail "the seven small buffers are not on smallBuffers" "$snapshot"
+grep -q "^gpu-place	[0-9]*	1	1048576	[0-9]*	tests/support/gpu_diagnostics_program.mlx:[0-9]*:largeBuffer	" "$snapshot" || fail "the large buffer is not on largeBuffer" "$snapshot"
+[[ $(grep -c "^gpu-block	" "$snapshot") -eq 10 ]] || fail "the snapshot should hold 10 GPU blocks (the breadcrumb, main's, 7 small, 1 large)" "$snapshot"
+XDG_RUNTIME_DIR="$runtime" "$work/mlx-codemap" memory program tests/support > "$work/memory.txt"
+grep -q "^  gpu .*: 10 allocations" "$work/memory.txt" || fail "mlx-codemap memory does not say the GPU's allocations" "$work/memory.txt"
+grep -q "^    700 B in 7 blocks tests/support/gpu_diagnostics_program.mlx:[0-9]*:[0-9]*: function smallBuffers$" "$work/memory.txt" || fail "mlx-codemap memory does not put the small buffers on smallBuffers" "$work/memory.txt"
+echo "ok   GPU memory: each block of device memory in the snapshot with the functions that asked, read by mlx-codemap memory"
 
 # The codemap reads both.
 "$work/mlx-codemap" gpu tests/support > "$work/gpu.txt"

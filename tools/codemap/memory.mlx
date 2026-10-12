@@ -12,6 +12,12 @@
 // hole / all of them). The tiny line says how full the tiny pages are.
 // Snapshots written before the tiny pages give no block its mapped size:
 // whole pages are taken for them.
+//
+// With a GPU context open the snapshot also holds the GPU's memory: the
+// device, its heaps, each block of device memory with what was asked and
+// what the device took, grouped by the functions that asked. Each buffer
+// is an allocation of its own, so what the GPU's memory wastes is what
+// the device rounds up, and many small allocations against its limit.
 // Places that hold more blocks than when the process was first looked at
 // grow while the program runs: what a leak looks like.
 //
@@ -31,6 +37,16 @@ pub const MAX_SNAPSHOTS: usize = 256
 pub const MAX_PLACES: usize = 4096
 pub const MAX_BLOCKS: usize = 65536
 pub const MAX_MAPS: usize = 8192
+pub const MAX_GPU_PLACES: usize = 512
+pub const MAX_GPU_BLOCKS: usize = 4096
+pub const GPU_HEAPS: usize = 16
+pub const GPU_TYPES: usize = 32
+// The GPU's size classes: below 64 KiB, 1 MiB, 16 MiB, and larger.
+pub const GPU_CLASSES: usize = 4
+// A heap on the device itself (VK_MEMORY_HEAP_DEVICE_LOCAL_BIT), a memory
+// type the processor can map (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT).
+pub const HEAP_DEVICE: u64 = 1
+pub const TYPE_HOST_VISIBLE: u64 = 2
 const MAX_TEXT: usize = 16777216
 // The size classes: below 256 bytes, 4 KiB, 64 KiB, 1 MiB, and larger.
 pub const CLASSES: usize = 5
@@ -106,6 +122,44 @@ pub const Memory = struct {
     beforeCount: usize
     beforeHash: [*]u64
     beforeBlocks: [*]u64
+    // The GPU's memory (gpu: a GPU context was open): the device (its name
+    // in the text), how many allocations it allows, blocks live,
+    // allocations and frees; its heaps (bytes, flags, and what the blocks
+    // take of each); per memory type its heap and flags; places (blocks,
+    // bytes asked, allocated, functions in the text); blocks (asked,
+    // allocated, type, kind, place); the size classes.
+    gpu: bool
+    gpuNameStart: u32
+    gpuNameEnd: u32
+    gpuLimit: u64
+    gpuLive: u64
+    gpuAllocations: u64
+    gpuFrees: u64
+    gpuHeapCount: usize
+    gpuHeapSize: [16]u64
+    gpuHeapFlags: [16]u64
+    gpuHeapUsed: [16]u64
+    gpuHeapBlocks: [16]u64
+    gpuTypeCount: usize
+    gpuTypeHeap: [32]u64
+    gpuTypeFlags: [32]u64
+    gpuPlaceCount: usize
+    gpuPlaceBlocks: [*]u64
+    gpuPlaceAsked: [*]u64
+    gpuPlaceSize: [*]u64
+    gpuPlaceStart: [*]u32
+    gpuPlaceEnd: [*]u32
+    gpuBlockCount: usize
+    gpuBlockAsked: [*]u64
+    gpuBlockSize: [*]u64
+    gpuBlockType: [*]u32
+    gpuBlockKind: [*]u8
+    gpuBlockPlace: [*]u32
+    gpuAsked: u64
+    gpuSize: u64
+    gpuClassBlocks: [4]u64
+    gpuClassAsked: [4]u64
+    gpuClassSize: [4]u64
 }
 
 pub fn init(memory: *Memory, allocator: Allocator) -> void {
@@ -141,6 +195,19 @@ pub fn init(memory: *Memory, allocator: Allocator) -> void {
     memory.*.beforeCount = 0
     memory.*.beforeHash = longs(allocator, MAX_PLACES)
     memory.*.beforeBlocks = longs(allocator, MAX_PLACES)
+    memory.*.gpu = false
+    memory.*.gpuPlaceCount = 0
+    memory.*.gpuPlaceBlocks = longs(allocator, MAX_GPU_PLACES)
+    memory.*.gpuPlaceAsked = longs(allocator, MAX_GPU_PLACES)
+    memory.*.gpuPlaceSize = longs(allocator, MAX_GPU_PLACES)
+    memory.*.gpuPlaceStart = allocator.words(MAX_GPU_PLACES)
+    memory.*.gpuPlaceEnd = allocator.words(MAX_GPU_PLACES)
+    memory.*.gpuBlockCount = 0
+    memory.*.gpuBlockAsked = longs(allocator, MAX_GPU_BLOCKS)
+    memory.*.gpuBlockSize = longs(allocator, MAX_GPU_BLOCKS)
+    memory.*.gpuBlockType = allocator.words(MAX_GPU_BLOCKS)
+    memory.*.gpuBlockKind = allocator.alloc(MAX_GPU_BLOCKS, 16).?
+    memory.*.gpuBlockPlace = allocator.words(MAX_GPU_BLOCKS)
 }
 
 fn longs(allocator: Allocator, count: usize) -> [*]u64 {
@@ -167,6 +234,12 @@ pub fn placeFunction(memory: *Memory, place: usize) -> []const u8 {
 // The declaration of a place's first function in `index`, or NONE.
 pub fn placeDeclaration(memory: *Memory, index: *Index, place: usize) -> u32 {
     const function = placeFunction(memory, place)
+    if function.length == 0 { return NONE }
+    return crashes_module.declarationOf(index, function)
+}
+
+pub fn gpuPlaceDeclaration(memory: *Memory, index: *Index, place: usize) -> u32 {
+    const function = gpuPlaceFunction(memory, place)
     if function.length == 0 { return NONE }
     return crashes_module.declarationOf(index, function)
 }
@@ -401,6 +474,7 @@ pub fn load(memory: *Memory, which: usize) -> bool {
     memory.*.textLength = length
     parse(memory)
     analyze(memory)
+    analyzeGpu(memory)
     // Another process: what it holds now is what later reads grow from.
     if memory.*.pid[which] != memory.*.beforePid {
         rememberPlaces(memory, memory.*.pid[which])
@@ -419,12 +493,19 @@ fn parse(memory: *Memory) -> void {
     memory.*.tinyBlocks = 0
     memory.*.tinyBytes = 0
     memory.*.tinyEmpty = 0
+    memory.*.gpu = false
+    memory.*.gpuHeapCount = 0
+    memory.*.gpuTypeCount = 0
+    memory.*.gpuPlaceCount = 0
+    memory.*.gpuBlockCount = 0
     var start: usize = 0
     while start < text.length {
         var end = start
         while end < text.length && text[end] != 10 { end += 1 }
         const line = text[start..end]
-        if line.length > 7 && index_module.sameBytes(line[0..7], "memory\t") {
+        if line.length > 4 && index_module.sameBytes(line[0..3], "gpu") && (line[3] == 9 || line[3] == 45) {
+            parseGpu(memory, line, start, end)
+        } else if line.length > 7 && index_module.sameBytes(line[0..7], "memory\t") {
             parseHeader(memory, line)
         } else if line.length > 5 && index_module.sameBytes(line[0..5], "tiny\t") {
             var at: usize = 5
@@ -478,6 +559,144 @@ fn parse(memory: *Memory) -> void {
             memory.*.mapCount += 1
         }
         start = end + 1
+    }
+}
+
+// The GPU's lines (see std/src/leaks.mlx): gpu, gpu-heap, gpu-type,
+// gpu-place, gpu-block; `start` and `end` are the line's in the text.
+fn parseGpu(memory: *Memory, line: []const u8, start: usize, end: usize) -> void {
+    if line[3] == 9 {
+        // gpu, the device's name, then the numbers.
+        var at: usize = 4
+        while at < line.length && line[at] != 9 { at += 1 }
+        memory.*.gpu = true
+        memory.*.gpuNameStart = @intCast(u32, start + 4)
+        memory.*.gpuNameEnd = @intCast(u32, start + at)
+        at += 1
+        memory.*.gpuLimit = parseNumber(line, &at)
+        at += 1
+        memory.*.gpuLive = parseNumber(line, &at)
+        at += 1
+        memory.*.gpuAllocations = parseNumber(line, &at)
+        at += 1
+        memory.*.gpuFrees = parseNumber(line, &at)
+        return
+    }
+    if line.length > 9 && index_module.sameBytes(line[0..9], "gpu-heap\t") {
+        var at: usize = 9
+        const heap = @intCast(usize, parseNumber(line, &at))
+        if heap != memory.*.gpuHeapCount || heap >= GPU_HEAPS { return }
+        at += 1
+        memory.*.gpuHeapSize[heap] = parseNumber(line, &at)
+        at += 1
+        memory.*.gpuHeapFlags[heap] = parseNumber(line, &at)
+        memory.*.gpuHeapCount += 1
+    } else if line.length > 9 && index_module.sameBytes(line[0..9], "gpu-type\t") {
+        var at: usize = 9
+        const kind = @intCast(usize, parseNumber(line, &at))
+        if kind != memory.*.gpuTypeCount || kind >= GPU_TYPES { return }
+        at += 1
+        memory.*.gpuTypeHeap[kind] = parseNumber(line, &at)
+        at += 1
+        memory.*.gpuTypeFlags[kind] = parseNumber(line, &at)
+        memory.*.gpuTypeCount += 1
+    } else if line.length > 10 && index_module.sameBytes(line[0..10], "gpu-place\t") {
+        var at: usize = 10
+        const place = @intCast(usize, parseNumber(line, &at))
+        if place != memory.*.gpuPlaceCount || place >= MAX_GPU_PLACES { return }
+        at += 1
+        memory.*.gpuPlaceBlocks[place] = parseNumber(line, &at)
+        at += 1
+        memory.*.gpuPlaceAsked[place] = parseNumber(line, &at)
+        at += 1
+        memory.*.gpuPlaceSize[place] = parseNumber(line, &at)
+        at += 1
+        const functions = if at < line.length { at } else { line.length }
+        memory.*.gpuPlaceStart[place] = @intCast(u32, start + functions)
+        memory.*.gpuPlaceEnd[place] = @intCast(u32, end)
+        memory.*.gpuPlaceCount += 1
+    } else if line.length > 10 && index_module.sameBytes(line[0..10], "gpu-block\t") && memory.*.gpuBlockCount < MAX_GPU_BLOCKS {
+        var at: usize = 10
+        const block = memory.*.gpuBlockCount
+        const handle = parseHex(line, &at)
+        at += 1
+        memory.*.gpuBlockAsked[block] = parseNumber(line, &at)
+        at += 1
+        memory.*.gpuBlockSize[block] = parseNumber(line, &at)
+        at += 1
+        memory.*.gpuBlockType[block] = @intCast(u32, parseNumber(line, &at) & 4294967295)
+        at += 1
+        memory.*.gpuBlockKind[block] = @intCast(u8, parseNumber(line, &at) & 255)
+        at += 1
+        memory.*.gpuBlockPlace[block] = @intCast(u32, parseNumber(line, &at) & 4294967295)
+        memory.*.gpuBlockCount += 1
+    }
+}
+
+pub fn gpuName(memory: *const Memory) -> []const u8 {
+    if !memory.*.gpu { return "" }
+    return memory.*.text[@intCast(usize, memory.*.gpuNameStart)..@intCast(usize, memory.*.gpuNameEnd)]
+}
+
+pub fn gpuPlaceFunctions(memory: *Memory, place: usize) -> []const u8 {
+    return memory.*.text[@intCast(usize, memory.*.gpuPlaceStart[place])..@intCast(usize, memory.*.gpuPlaceEnd[place])]
+}
+
+// The first function of a GPU place (the one that asked).
+pub fn gpuPlaceFunction(memory: *Memory, place: usize) -> []const u8 {
+    const functions = gpuPlaceFunctions(memory, place)
+    var end: usize = 0
+    while end < functions.length && functions[end] != 9 { end += 1 }
+    return functions[0..end]
+}
+
+pub fn gpuClassOf(size: u64) -> usize {
+    if size < 65536 { return 0 }
+    if size < 1048576 { return 1 }
+    if size < 16777216 { return 2 }
+    return 3
+}
+
+// What the device took beyond what was asked.
+pub fn gpuWasted(memory: *const Memory) -> u64 {
+    return if memory.*.gpuSize > memory.*.gpuAsked { memory.*.gpuSize - memory.*.gpuAsked } else { 0 }
+}
+
+// The GPU's blocks by heap and size class.
+fn analyzeGpu(memory: *Memory) -> void {
+    var heap: usize = 0
+    while heap < GPU_HEAPS {
+        memory.*.gpuHeapUsed[heap] = 0
+        memory.*.gpuHeapBlocks[heap] = 0
+        heap += 1
+    }
+    var class: usize = 0
+    while class < GPU_CLASSES {
+        memory.*.gpuClassBlocks[class] = 0
+        memory.*.gpuClassAsked[class] = 0
+        memory.*.gpuClassSize[class] = 0
+        class += 1
+    }
+    memory.*.gpuAsked = 0
+    memory.*.gpuSize = 0
+    var block: usize = 0
+    while block < memory.*.gpuBlockCount {
+        const size = memory.*.gpuBlockSize[block]
+        const kind = @intCast(usize, memory.*.gpuBlockType[block])
+        if kind < memory.*.gpuTypeCount {
+            const on = @intCast(usize, memory.*.gpuTypeHeap[kind])
+            if on < GPU_HEAPS {
+                memory.*.gpuHeapUsed[on] += size
+                memory.*.gpuHeapBlocks[on] += 1
+            }
+        }
+        const at = gpuClassOf(size)
+        memory.*.gpuClassBlocks[at] += 1
+        memory.*.gpuClassAsked[at] += memory.*.gpuBlockAsked[block]
+        memory.*.gpuClassSize[at] += size
+        memory.*.gpuAsked += memory.*.gpuBlockAsked[block]
+        memory.*.gpuSize += size
+        block += 1
     }
 }
 
