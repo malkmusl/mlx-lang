@@ -137,31 +137,26 @@ Two differences from `tool/`, both load-bearing:
   bignum, and `uN`/`iN` wider than 64 bits doesn't actually work yet — see
   below), using binary long division rather than Knuth's algorithm for
   simplicity. Combined with a genuinely severe compiler bug found while
-  building it (below), 2048-bit keys aren't practical here yet; 1024-bit
+  building it (below, fixed since), 2048-bit keys weren't practical; 1024-bit
   completes reliably in well under a minute. Every operation was verified
   against Python's arbitrary-precision `int` before being ported.
-- **Every module works around real self-hosted-compiler bugs**, most of
-  them newly found by this port, all written up in
-  [`docs/internals/selfhost-compiler.md`](../../docs/internals/selfhost-compiler.md):
-  a fixed array of slices silently corrupts on write (`axml.mlx`'s
-  `StringPool`, `zip.mlx`'s `EntryList` both use parallel `usize` arrays
-  instead); a module-level `const` of non-integer/boolean type miscompiles
-  into a bogus link error instead of a diagnostic (every such constant here
-  is a zero-argument function instead); taking the address of a struct
-  *field* (`&x.field`) doesn't resolve at all, at any nesting depth
-  (`bignum.mlx`'s signed-value helper and `jar_sign.mlx`'s RSA keypair both
-  thread plain values instead of bundling into a struct); and, most
-  severely, a local struct/array variable declared with `undefined` is
-  `alloca`'d from a single fixed 256 MiB arena that is **never reclaimed**,
-  so any loop that declares one eventually exhausts it and crashes — this
-  is the real reason RSA-2048 isn't practical yet, independent of how fast
-  the arithmetic itself is. One bug (a struct/array field written with
-  `undefined` inside an aggregate literal dereferencing a bogus address)
-  was small and clear enough to actually fix, with a regression test; the
-  rest are documented as known gaps and worked around here, matching this
-  repository's existing practice for the handful of gaps found before this
-  port (see the same doc's `uN`/`iN`-above-64-bits entry, itself the reason
-  `bignum.mlx` uses u64 limbs instead of a wider native integer type).
+- **Every module was written around self-hosted-compiler bugs**, most of
+  them newly found by this port and written up in
+  [`docs/internals/selfhost-compiler.md`](../../docs/internals/selfhost-compiler.md).
+  Most are fixed since: arrays of slices and module-level constants of
+  slice and array types work (`axml.mlx` and `jar_sign.mlx` keep their
+  namespace URI, attribute ids and OIDs as constants again, and `asn1.mlx`
+  joins a slice of parts as the Zig version does;
+  `tests/333_module_slices_runtime.mlx`), `&x.field` resolves at any depth,
+  and a local struct or array that stays in its function lives in the
+  stack frame instead of the never-reclaimed aggregate arena, so a loop
+  declaring one no longer exhausts it (`tests/328_aggregates_in_frame_runtime.mlx`).
+  `StringPool` and `EntryList` keep their parallel `usize` arrays, and
+  values are still threaded where a struct would bundle them. One bug (a
+  struct/array field written with `undefined` inside an aggregate literal
+  dereferencing a bogus address) was fixed during the port with a
+  regression test; `bignum.mlx` uses u64 limbs because `uN`/`iN` wider
+  than 64 bits still do not work (the same doc's entry).
 
 This satisfies item 3 of "Where this goes next" below in spirit — the
 pipeline is now expressible in ordinary mlx source, not just a bespoke Zig

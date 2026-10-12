@@ -478,52 +478,15 @@ canonicalization pipeline on a hand-built six-instruction LIR sequence: an
 instructions are marked `dead` and excluded from the `instructionsAfter`
 count.
 
-**Known gap: a module-level `const` of non-integer/non-boolean type
-miscompiles into a bogus "unresolved backend symbol" instead of a proper
-diagnostic.** `sema/comptime/value.mlx`'s `Kind` enum only has
-`integer`/`boolean`/`type_value`/`null_value` variants — there is no
-representation for a comptime string, slice, or array. `ir/lower.mlx`'s
-`lowerSymbolValue` (the function that decides how to lower a reference to a
-resolved symbol) handles the `integer`/`boolean` comptime tags and function
-symbols (`FLAG_FUNCTION`) explicitly, then falls through to `return
-lir.NONE` for anything else — which is exactly what happens for, say, a
-top-level `const ANDROID_NS_URI: []const u8 = "..."` or a top-level `const
-IDS: [9]u32 = [9]u32{...}`. The caller (the general identifier-lowering
-path around line 2489) only uses that `lowerSymbolValue` result if it isn't
-`NONE`; when it is, the code falls all the way through to a "might be a
-forward-reference function; add as symbol" fallback that unconditionally
-treats the identifier as an as-yet-undefined function, emitting a
-`lir.addModuleSymbol` reference (named `.m<module>.<NAME>`) and a
-`func_sym` LIR instruction for it. No function body with that name is ever
-lowered to satisfy the reference, so it reaches the backend as a fixup with
-no matching label, and `encoder.applyFixups` fails at the "resolve backend
-symbols" pipeline step with `MLX-E3004: unresolved backend symbol` — a
-diagnostic that (per `driver/pipeline.mlx:206`) carries no source location,
-so the actual cause (a harmless-looking top-level string or array constant
-declared possibly hundreds of lines from where it's used) is easy to miss.
-`driver/reporter.mlx:171`'s `Reporter.unresolvedSymbol` does print the
-bogus symbol name (e.g. `.m0.SHORT_STR`) to stderr, but only when `mlx1` is
-invoked with `--trace`/`--verbose` — without that flag the error is
-reported with zero identifying information at all. Reproduced with a
-minimal two-line repro (`const S: []const u8 = "hi"` at module scope,
-referenced as `S.length` inside `main`) that fails the same way regardless
-of string length or of whether the const is referenced once or multiple
-times; a *local* (function-scope) `const` of the same type, or the string
-literal used directly, both lower correctly, which is what makes this a
-gap in top-level/module-scope constant handling specifically rather than in
-slice/string lowering in general. Found and worked around (not fixed) while
-porting `experiments/android-aarch64-bluescreen/tool/axml.zig` to
-`experiments/android-aarch64-bluescreen/mlx/axml.mlx`: every top-level
-`const` of a type other than a plain integer/boolean was rewritten as a
-zero-argument function returning the value (`androidNsUri()`) or an
-indexing function (`androidAttrId(i)`) instead — see the comments at
-`experiments/android-aarch64-bluescreen/mlx/axml.mlx`'s `androidNsUri` and
-`androidAttrId`. No regression test or fix exists for this in the compiler
-itself yet; a real fix would need `sema/comptime/value.mlx`'s `Kind` to gain
-a representation for these types (or, short of that, at minimum
-`lowerSymbolValue` should report a proper location-carrying diagnostic
-instead of silently falling through to the forward-function-reference path
-when a resolved, non-function symbol can't be lowered).
+**Fixed: a module-level `const` of a slice, array or struct type.** Such a
+constant once lowered as a forward reference to a function nothing defined
+and failed with "unresolved backend symbol" and no location, which the
+Android experiment's port (`experiments/android-aarch64-bluescreen/mlx/`)
+worked around by turning every such constant into a function and by
+avoiding arrays of slices. Module-level constants of these types lower to
+their data now: `tests/333_module_slices_runtime.mlx` reads a string, an
+array of strings and an array of structs holding strings from functions,
+copies and indexes them, on x86_64 and aarch64.
 
 **Fixed: `undefined` initializing a memory-typed field inside an aggregate
 literal dereferenced address 0 and crashed.** `lowerNode`'s
