@@ -394,6 +394,15 @@ rounds_floats() {
     return $ok
 }
 
+# Whether $1 names an unknown name (MLX-E3001) where a statement fails
+# (tests/326_unknown_name.mlx); older compilers gave only the statement's
+# own type error.
+reports_unknown_names() {
+    local output
+    output=$("$1" --quiet tests/326_unknown_name.mlx -o /dev/null 2>&1) || true
+    grep -q "MLX-E3001: unknown name" <<< "$output"
+}
+
 # Whether $1 writes the files it read with --depfile (what `mlx build`
 # decides rebuilds by).
 writes_depfiles() {
@@ -445,6 +454,7 @@ probes=(
     "folds_float_literals|arithmetic on float literals"
     "returns_wide_error_payloads|error union payloads of several words"
     "rounds_floats|@floor, @ceil and @trunc"
+    "reports_unknown_names|unknown names reported (MLX-E3001)"
     "writes_depfiles|--depfile"
     "runs_build|the build command (mlx build)"
 )

@@ -18,6 +18,39 @@ guide already has a fixture for — `tests/100_union_explicit_tag_mismatch.mlx`
 `tests/102_error_set_mismatch.mlx` and `tests/103_error_set_duplicate.mlx`
 (covered under Errors) are skipped here for that reason.
 
+## `MLX-E3001` (`UnknownIdentifier`): names nothing declares
+
+Typing an expression stays quiet about a name it cannot find, because
+generic call inference probes names that need not exist. So the statement
+that fails (a local declaration, a `return`, an expression statement)
+looks through its expression for names no scope declares and reports each
+one at its use before its own `MLX-E4001`, with the closest name in scope
+as help; an unknown builtin is reported the same way. A name whose own
+declaration failed is not reported again where it is used.
+`tests/326_unknown_name.mlx`:
+
+```mlx
+fn half(value: f64) -> f64 { return halve(value) }
+
+pub fn main() -> u8 {
+    const total: u32 = 3
+    const more = totl + 1
+    return @intCast(u8, more)
+}
+```
+
+```text
+tests/326_unknown_name.mlx:6:37: error: MLX-E3001: unknown name `halve`
+tests/326_unknown_name.mlx:6:30: error: MLX-E4001: return value does not match function type
+...
+tests/326_unknown_name.mlx:10:18: error: MLX-E3001: unknown name `totl`
+tests/326_unknown_name.mlx:10:18: help: did you mean `total`?
+tests/326_unknown_name.mlx:10:11: error: MLX-E4001: invalid local declaration
+```
+
+`tests/12_unknown_builtin.mlx` gets ``unknown builtin `print` ``, the code the
+bootstrap compiler gives it too.
+
 ## `MLX-E4001` (`TypeMismatch`): tuple return arity
 
 The guide's table cites `tests/09_type_errors.mlx` for `MLX-E4001`, but a
