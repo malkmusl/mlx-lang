@@ -9,7 +9,8 @@
 `97_tagged_union_runtime.mlx`, `98_nonexhaustive_enum_requires_else.mlx`,
 `99_enum_duplicate_value.mlx`, `100_union_explicit_tag_mismatch.mlx`,
 `104_optional_pointer_null_runtime.mlx`, `174_aggregate_functions_runtime.mlx`,
-`176_pointer_struct_fields_runtime.mlx`, `212_aggregate_index_runtime.mlx`
+`176_pointer_struct_fields_runtime.mlx`, `212_aggregate_index_runtime.mlx`,
+`319_array_pointer_runtime.mlx`, `320_array_pointer_const_mismatch.mlx`
 
 ## Structs
 
@@ -427,6 +428,38 @@ A single-item pointer converts implicitly to `*anyopaque`, C's `void *`
 extension chains such as Vulkan's `pNext` need
 (`info.pNext = &external`). Going back takes an explicit `@ptrCast`.
 (`tests/259_anyopaque_coercion_runtime.mlx`)
+
+A pointer to an array, `*[N]T`, converts implicitly to a many-item pointer
+to its elements, `[*]T`: the same address, the length left behind. So
+`&buffer` goes straight to a `[*]u8` parameter, field, binding or return
+value, with no `unsafe` and no `@ptrCast`. A `*const [N]T` (the address of
+a constant array) converts only to `[*]const T`
+(`tests/320_array_pointer_const_mismatch.mlx` is rejected for that).
+
+A many-item pointer steps by whole elements: `p + n` and `p - n` are the
+addresses of `p[n]` and `p[-n]`, `p += n` and `p -= n` move `p`, `n` any
+integer. Only `[*]T` steps; a single-item pointer and `n + p` do not:
+
+```mlx
+fn steppedBack(end: [*]u32, count: u32) -> [*]u32 {
+    return end - count
+}
+
+pub fn main() -> u8 {
+    var words: [6]u32 = [6]u32{ 1, 2, 3, 4, 5, 6 }
+    var cursor: [*]u32 = &words      // *[6]u32 to [*]u32
+    const third = cursor + 2         // &words[2]
+    if third[0] != 3 { return 5 }
+    cursor += 4
+    if cursor[1] != 6 { return 6 }
+    const start: [*]u32 = &words
+    if steppedBack(start + 5, 2)[0] != 4 { return 8 }
+    return 13
+}
+```
+
+(`tests/319_array_pointer_runtime.mlx`, which also steps through structs
+with padding and runs under the AArch64 emulator)
 
 ## Vectors
 

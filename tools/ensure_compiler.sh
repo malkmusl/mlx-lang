@@ -312,6 +312,24 @@ returns_wide_tuples() {
     return $ok
 }
 
+# Whether $1 takes a pointer to an array as a many-item pointer and steps
+# a many-item pointer by elements (tests/319_array_pointer_runtime.mlx
+# exits 13); std and the programs write `&buffer` and `p + n` for what
+# took an unsafe @ptrCast before. The compiler's own sources and
+# std/bootstrap do not use them, so an older compiler still builds them.
+steps_many_pointers() {
+    local probe
+    probe=$(mktemp -d mlx-out/probe.XXXXXX)
+    local ok=1
+    if "$1" --quiet tests/319_array_pointer_runtime.mlx -o "$probe/probe" > /dev/null 2>&1; then
+        local status=0
+        "$probe/probe" > /dev/null 2>&1 || status=$?
+        [[ $status -eq 13 ]] && ok=0
+    fi
+    rm -rf -- "$probe"
+    return $ok
+}
+
 # Whether $1 writes the files it read with --depfile (what `mlx build`
 # decides rebuilds by).
 writes_depfiles() {
@@ -358,6 +376,7 @@ probes=(
     "decodes_escapes|\\xHH escapes"
     "stores_through_slice_addresses|slices stored through their address keeping their length"
     "returns_wide_tuples|tuples of more than three words"
+    "steps_many_pointers|array pointers as many-item pointers, p + n"
     "writes_depfiles|--depfile"
     "runs_build|the build command (mlx build)"
 )
