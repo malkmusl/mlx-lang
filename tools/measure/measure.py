@@ -25,6 +25,8 @@ after its start on (its frames, not its start).
 The longest pause is the longest time between the end of one frame and
 the start of the next: where a program did something else than drawing
 for long (MLX Observatory reading the code base after its first frame).
+A program that draws only when something changes pauses while nothing
+does too (the dock, the terminal): there it is time waited, not worked.
 
 It prints a table (Markdown) and writes it with the numbers as JSON into
 the output directory (measure.md, measure.json), so two runs can be laid

@@ -196,7 +196,9 @@ like a processor's crash, in the pass that failed with the functions that
 recorded it, and kept as a `gpu-crash` line. With `MLX_GPU_PROFILE` (`1`,
 or a directory) timestamp queries time each pass and the time goes on
 those functions, written as a profile with the source `gpu`
-(`tools/check_gpu_diagnostics.sh`, on lavapipe). With `MLX_FRAMES` each
+(`tools/check_gpu_diagnostics.sh`, on lavapipe, with
+`tests/support/gpu_diagnostics_program.mlx`: a pass that faults, timed
+passes, small and large buffers, slow frames). With `MLX_FRAMES` each
 frame's command buffer gets a timestamp at its start and its end, and the
 GPU's time goes on the frame the program was drawing when it began.
 
@@ -464,7 +466,8 @@ defer leaks.finish()            // the blocks the loop kept, and the arena
 
 It is part of the runtime: `std.crash.install()`, which every program
 calls first, calls `leaks.watch()`, so with `MLX_LEAK_CHECK` set any
-program is watched from its start. `MLX_LEAK_CHECK=1` reports on stderr,
+program is watched from its start (`tests/support/leaks_program.mlx`, in
+`tests/run_debug_allocator.sh`). `MLX_LEAK_CHECK=1` reports on stderr,
 `MLX_LEAK_CHECK=/a/path` appends to
 that file (each line names the program and its process), `0` or nothing
 watches nothing. While a watched program runs, its memory is written
