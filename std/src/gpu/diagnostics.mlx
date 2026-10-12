@@ -18,6 +18,10 @@
 //   theirs with what they called, as a processor profile puts samples. The
 //   profile is written every two seconds while the program runs and when
 //   the context closes, as PROGRAM-gpu-SECONDS.profile in microseconds.
+//
+// - Frames: with MLX_FRAMES (std.diagnostics' frames) each frame's work
+//   gets a timestamp at its start and its end, and the GPU's time goes on
+//   the frame the program was drawing when it began.
 const std = @import("std")
 const vk = @import("std.vulkan")
 const crash = @import("std.crash")
@@ -85,6 +89,11 @@ pub const State = struct {
     nameUsed: usize
     message: [*]u8
     reported: bool
+    // Frames: two timestamps a frame, and the frame (std.diagnostics') the
+    // work belongs to.
+    frameTiming: bool
+    frameQueries: vk.QueryPool
+    frameSerial: usize
 }
 
 fn stateOf(context: *const Context) -> *State {
@@ -125,6 +134,8 @@ pub fn open(context: *Context) -> void {
     state.*.nameCount = 0
     state.*.nameUsed = 0
     state.*.changed = false
+    state.*.frameTiming = false
+    state.*.frameSerial = 0
     state.*.hasMarker = gpu.createBuffer(context, &state.*.marker, 16, false)
     if state.*.hasMarker {
         var word: [*]u32 = undefined
@@ -132,6 +143,16 @@ pub fn open(context: *Context) -> void {
         word[0] = 0
     }
     context.*.diagnostics = memory
+    if diagnostics.framesOn() && timestamps(context, state) {
+        var frame_info = vk.QueryPoolCreateInfo.init()
+        frame_info.queryType = vk.QueryType.timestamp
+        frame_info.queryCount = 2
+        var frame_pool: vk.QueryPool = 0
+        if vk.createQueryPool(context.*.commands, context.*.device, &frame_info, null, &frame_pool) == vk.Result.success {
+            state.*.frameQueries = frame_pool
+            state.*.frameTiming = true
+        }
+    }
     var directory: [*]u8 = undefined
     unsafe { directory = @ptrCast([*]u8, &state.*.directory) }
     const asked = diagnostics.environmentValue("MLX_GPU_PROFILE", directory, 1000)
@@ -140,18 +161,19 @@ pub fn open(context: *Context) -> void {
     startProfile(context, state)
 }
 
-fn startProfile(context: *Context, state: *State) -> void {
-    // Timestamps on the queue, and how long a tick is.
+// Whether the queue has timestamps; the bits they have and how long a
+// tick is.
+fn timestamps(context: *Context, state: *State) -> bool {
     var count: u32 = 0
     vk.getPhysicalDeviceQueueFamilyProperties(context.*.instanceCommands, context.*.physical, &count, null)
-    if count == 0 || count > 64 { return }
+    if count == 0 || count > 64 { return false }
     const families_memory = allocate(context, @intCast(usize, count) * @sizeOf(vk.QueueFamilyProperties))
-    if families_memory == 0 { return }
+    if families_memory == 0 { return false }
     var families: [*]vk.QueueFamilyProperties = undefined
     unsafe { families = @ptrFromInt([*]vk.QueueFamilyProperties, families_memory) }
     vk.getPhysicalDeviceQueueFamilyProperties(context.*.instanceCommands, context.*.physical, &count, families)
     const bits = families[context.*.family].timestampValidBits
-    if bits == 0 { return }
+    if bits == 0 { return false }
     var mask: u64 = 0
     var bit: u32 = 0
     while bit < bits && bit < 64 {
@@ -163,6 +185,12 @@ fn startProfile(context: *Context, state: *State) -> void {
     vk.getPhysicalDeviceProperties(context.*.instanceCommands, context.*.physical, &properties)
     const scaled: i64 = @intFromFloat(i64, properties.limits.timestampPeriod * 1024.0)
     state.*.period = if scaled > 0 { @bitCast(u64, scaled) } else { 1024 }
+    return true
+}
+
+fn startProfile(context: *Context, state: *State) -> void {
+    // Timestamps on the queue, and how long a tick is.
+    if !timestamps(context, state) { return }
     var info = vk.QueryPoolCreateInfo.init()
     info.queryType = vk.QueryType.timestamp
     info.queryCount = @intCast(u32, PASSES * 2)
@@ -214,6 +242,19 @@ pub fn beginFrame(context: *Context) -> void {
     state.*.serial = (state.*.serial + 1) & 65535
     state.*.passes = 0
     if state.*.profiling { vk.cmdResetQueryPool(context.*.commands, context.*.commandBuffer, state.*.queryPool, 0, @intCast(u32, PASSES * 2)) }
+    if state.*.frameTiming {
+        state.*.frameSerial = diagnostics.frameCurrent()
+        vk.cmdResetQueryPool(context.*.commands, context.*.commandBuffer, state.*.frameQueries, 0, 2)
+        vk.cmdWriteTimestamp(context.*.commands, context.*.commandBuffer, vk.PIPELINE_STAGE_TOP_OF_PIPE_BIT, state.*.frameQueries, 0)
+    }
+}
+
+// The frame's work is all recorded (gpu.submitFrame, before the command
+// buffer ends): its end time.
+pub fn endFrame(context: *Context) -> void {
+    if context.*.diagnostics == 0 { return }
+    const state = stateOf(context)
+    if state.*.frameTiming { vk.cmdWriteTimestamp(context.*.commands, context.*.commandBuffer, vk.PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, state.*.frameQueries, 1) }
 }
 
 // A pass begins: who recorded it, and its start time. Called straight from
@@ -269,6 +310,14 @@ pub fn passEnd(context: *Context) -> void {
 pub fn frameDone(context: *Context) -> void {
     if context.*.diagnostics == 0 { return }
     const state = stateOf(context)
+    if state.*.frameTiming {
+        var stamps: [2]u64 = [2]u64{ 0, 0 }
+        const read = vk.getQueryPoolResults(context.*.commands, context.*.device, state.*.frameQueries, 0, 2, 16, @ptrCast(*anyopaque, &stamps), 8, vk.QUERY_RESULT_64_BIT)
+        if read == vk.Result.success {
+            const ticks = ((stamps[1] & state.*.validMask) - (stamps[0] & state.*.validMask)) & state.*.validMask
+            diagnostics.frameGpu(state.*.frameSerial, @intCast(usize, ticks * state.*.period / 1024))
+        }
+    }
     if !state.*.profiling || state.*.passes == 0 { return }
     const count = state.*.passes
     const got = vk.getQueryPoolResults(context.*.commands, context.*.device, state.*.queryPool, 0, @intCast(u32, count * 2), count * 16, @ptrCast(*anyopaque, state.*.results), 8, vk.QUERY_RESULT_64_BIT)

@@ -54,6 +54,15 @@ ending in `gpu` and its times in µs. A program can be run with
 `MLX_GPU_PROFILE=1` (or a directory) without `mlx-profile` too. Both are
 written through `std.diagnostics`, as the crash reports are.
 
+`mlx-profile` also sets `MLX_FRAMES=1`: the frames the program draws
+(the panels of std.ui mark them) are written as a timeline,
+`$XDG_RUNTIME_DIR/mlx/frames/PROGRAM-PID.frames`, each frame with the
+processor's and the GPU's time on it (two timestamps on the queue a
+frame) and how long the program took from its start to its first frame.
+*Hot* in MLX Observatory draws it, `mlx-codemap frames [PROGRAM]` prints
+the usual frame, the frames over a 60 Hz frame's 16.7 ms, the spikes
+(four times the usual frame, and 4 ms at least) and the slowest.
+
 [MLX Observatory](../../projects/observatory/README.md) reads the newest
 profile of each program. It shows them in two places: the *Hot* finding
 lists them, and *Color by → Run time* colors the galaxy by them. The

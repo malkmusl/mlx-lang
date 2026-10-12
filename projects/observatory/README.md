@@ -308,13 +308,22 @@ each group are joined by magenta lines in space.
   spent on the work a function recorded: the panel, the editor's lens
   and *Color by → GPU time* show it. A GPU crash (a hang, a lost device)
   is kept and shown as the processor's crashes are, on the functions
-  that recorded the pass.
+  that recorded the pass. Above the functions, the frame timeline of the
+  program chosen (else the newest): the frames it drew while it ran with
+  `MLX_FRAMES=1` (which *Profile* and *Watch memory* set), how long it
+  took to its first frame, its usual frame, a chart of the frames (a
+  column each, the processor's time yellow and the GPU's blue, a line at
+  a 60 Hz frame, red marks over the spikes), the frames over 16.7 ms and
+  the slowest ([`frames_view.mlx`](frames_view.mlx),
+  [`tools/codemap/frames.mlx`](../../tools/codemap/frames.mlx));
+  `mlx-codemap frames [PROGRAM]` prints the same.
 - **Memory:** what a program holds while it runs with
   `MLX_LEAK_CHECK=1` (std.leaks writes it about once a second; see
   [the standard library](../../docs/reference/stdlib.md)), lime green.
   The panel lists the programs that wrote their memory, running first (a
   click shows one), and with a built program chosen under Programs,
-  *Watch memory* runs it with the watch on. Then what it holds; how its
+  *Watch memory* runs it with the watch on (and its frames recorded).
+  Then what it holds; how its
   small blocks share the tiny pages (std.tinypage_allocator: blocks of
   up to 2 KiB are runs of 64-byte tiny pages), as a strip of those pages
   each filled as far as it is taken, the room above the fill where a

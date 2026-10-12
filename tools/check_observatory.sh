@@ -392,6 +392,9 @@ escape
 finding memory
 settle
 shot memory
+finding hot
+settle
+shot hot
 finding none
 select lib/helper.mlx/greet
 record flight 3 100
@@ -535,6 +538,10 @@ runtime=$(mktemp -d)
 # functions, three blocks with two holes between their mappings.
 mkdir -p "$runtime/mlx/memory"
 printf 'memory\tprogram\t4242\t1791800000\t12\t4\t3\t9000\t12288\t16384\t65536\t2048\nplace\t0\t2\t8000\t8192\t2\t0\tlib/helper.mlx:4:greet\t_start\nplace\t1\t1\t1000\t4096\t0\t0\tlib/extra.mlx:3:twice\t_start\nblock\t7f0000000000\t4000\t0\t1\nblock\t7f0000003000\t4000\t0\t1\nblock\t7f0000010000\t1000\t1\t0\nmap\t7f0000000000\t7f0000001000\trw-p\t\nmap\t7f0000003000\t7f0000004000\trw-p\t\nmap\t7f0000010000\t7f0000011000\trw-p\t\ngpu\tTest GPU\t4096\t2\t3\t1\ngpu-heap\t0\t268435456\t1\ngpu-heap\t1\t1073741824\t0\ngpu-type\t0\t0\t1\ngpu-type\t1\t1\t6\ngpu-place\t0\t2\t5000\t8192\tlib/helper.mlx:4:greet\t_start\ngpu-block\tabc0\t1000\t4096\t0\t0\t0\ngpu-block\tdef0\t4000\t4096\t1\t0\t0\n' > "$runtime/mlx/memory/program-4242.memory"
+# Its frames as std.diagnostics writes them: ten, the fifth a spike, two
+# over a 60 Hz frame.
+mkdir -p "$runtime/mlx/frames"
+printf 'frames\tprogram\t4242\t1791800000\t10\t250000\nframe\t1\t0\t2000\t1000\nframe\t2\t16000\t2100\t900\nframe\t3\t32000\t1900\t1100\nframe\t4\t48000\t2000\t1000\nframe\t5\t64000\t30000\t1000\nframe\t6\t96000\t2000\t20000\nframe\t7\t112000\t2200\t1000\nframe\t8\t128000\t1800\t1000\nframe\t9\t144000\t2000\t1200\nframe\t10\t160000\t2000\t1000\n' > "$runtime/mlx/frames/program-4242.frames"
 XDG_RUNTIME_DIR=$runtime "$work/test-host" host-demo "$work/us.xkb" "$work/hold.script" > "$work/demo-host.log" 2>&1 &
 host_pid=$!
 for _ in $(seq 1 50); do [[ -S "$runtime/host-demo" ]] && break; sleep 0.1; done
@@ -546,10 +553,11 @@ kill "$host_pid" 2> /dev/null || true
 wait "$host_pid" 2> /dev/null || true
 rm -rf -- "$runtime"
 [[ $status -eq 0 ]] || fail "codemap (demo): the app exited with status $status" "$work/demo.log"
-for picture in start query memory flight-000 flight-001 flight-002; do
+for picture in start query memory hot flight-000 flight-001 flight-002; do
     head -c 15 "$work/demo/$picture.ppm" 2> /dev/null | grep -q "^P6$" || fail "codemap (demo): $picture.ppm is missing" "$work/demo.log"
 done
 grep -q "^codemap: memory program pid 4242: 2 places, 2 on declarations, 3 blocks, 2 holes, 2 GPU blocks in 1 places$" "$work/demo.log" || fail "codemap (demo): Memory did not read the program's memory (with its GPU's)" "$work/demo.log"
+grep -q "^codemap: frames program pid 4242: 10 frames, 2 spikes, 2 over budget$" "$work/demo.log" || fail "codemap (demo): Hot did not read the program's frames" "$work/demo.log"
 grep -q "^codemap: query kind:fn calls:greet: 2 declarations$" "$work/demo.log" || fail "codemap (demo): the query step did not run" "$work/demo.log"
 cmp -s "$work/demo/flight-000.ppm" "$work/demo/flight-002.ppm" && fail "codemap (demo): the recorded flight does not move" "$work/demo.log"
 echo "ok   codemap (demo): a script played, its frames written"

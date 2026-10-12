@@ -176,7 +176,16 @@ block of device memory (the bytes asked, the bytes the device took, the
 memory type, a kind: a buffer, exported, imported, host memory; and the
 functions that asked, along the frame pointers). `std.gpu` writes them,
 `std.leaks` reads them under `gpuLock`, in a mapping of its own made when
-the first context opens.
+the first context opens. With `MLX_FRAMES` set (and not `0`) it keeps a
+program's frames: `frameBegin` and `frameEnd` around each frame drawn
+(the panels of `std.ui.wayland.panel` call them) note the processor's
+time, `frameGpu` adds the GPU's (std.gpu, below), and the last 1024 are
+written about once a second (and at the tenth frame) to
+`$XDG_RUNTIME_DIR/mlx/frames/PROGRAM-PID.frames`: a header with the
+frames drawn and the µs from the process's start to the end of its first
+frame, then a line per frame (serial, start, processor and GPU µs).
+`framesFlush` writes them now. `mlx-codemap frames` and *Hot* in MLX
+Observatory read them.
 
 `std.gpu.diagnostics` (`std/src/gpu/diagnostics.mlx`, used by `std.gpu`
 only) watches the GPU work a program records. After each pass a barrier
@@ -187,7 +196,9 @@ like a processor's crash, in the pass that failed with the functions that
 recorded it, and kept as a `gpu-crash` line. With `MLX_GPU_PROFILE` (`1`,
 or a directory) timestamp queries time each pass and the time goes on
 those functions, written as a profile with the source `gpu`
-(`tools/check_gpu_diagnostics.sh`, on lavapipe).
+(`tools/check_gpu_diagnostics.sh`, on lavapipe). With `MLX_FRAMES` each
+frame's command buffer gets a timestamp at its start and its end, and the
+GPU's time goes on the frame the program was drawing when it began.
 
 `std.timezone` (`std/src/timezone.mlx`) gives local time: `load` reads the
 zone from `$TZ` (a zone name, a path or a POSIX rule) or `/etc/localtime`

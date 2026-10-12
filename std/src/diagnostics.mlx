@@ -31,6 +31,10 @@
 //   std.leaks writes them into its memory snapshots beside the processor's
 //   blocks (GPU memory below).
 //
+// - Frames: with MLX_FRAMES set (and not 0), the frames a program draws,
+//   each with how long the processor and the GPU worked on it, and how
+//   long the program took to its first frame (Frames below).
+//
 // Nothing here allocates (the crash handler uses it): what it needs it
 // maps and gives back.
 const std = @import("std")
@@ -43,6 +47,9 @@ const SYS_munmap: usize = 11
 const SYS_rename: usize = 82
 const SYS_mkdir: usize = 83
 const SYS_clock_gettime: usize = 228
+const SYS_getpid: usize = 39
+const CLOCK_MONOTONIC: usize = 1
+const CLOCK_BOOTTIME: usize = 7
 const O_WRONLY_CREAT_APPEND: usize = 1089
 const O_WRONLY_CREAT_TRUNC: usize = 577
 
@@ -614,4 +621,195 @@ pub fn gpuBlock(slot: usize, block: *GpuBlock) -> bool {
     block.*.kind = words[at + 3] & 4294967295
     unsafe { block.*.frames = @ptrFromInt([*]const usize, gpuMemory + (at + 4) * 8) }
     return true
+}
+
+// ---------------------------------------------------------------------------
+// Frames: with MLX_FRAMES set (and not 0), each frame a program draws
+// between frameBegin and frameEnd (the panels of std.ui call them) with the
+// time the processor took and, noted later by std.gpu from timestamps on
+// the queue, the GPU's; the last FRAMES kept, written about once a second
+// (and at the program's tenth frame, for the start) to
+// $XDG_RUNTIME_DIR/mlx/frames/PROGRAM-PID.frames:
+//
+//     frames <TAB> program <TAB> pid <TAB> seconds since 1970 <TAB> frames drawn <TAB> µs from the process's start to its first frame drawn
+//     frame <TAB> serial <TAB> start µs (from the first frame) <TAB> processor µs <TAB> GPU µs (0: none)
+//     ...
+//
+// MLX Observatory (Hot) and `mlx-codemap frames` read it: the timeline, the
+// frames over budget, and how long the start took. From the main thread.
+
+pub const FRAMES: usize = 1024
+const FRAME_WORDS: usize = 4
+const FRAMES_TEXT: usize = 65536
+
+// 0: MLX_FRAMES not looked at yet, 1: on, 2: off.
+var framesState: usize = 0
+var framesMemory: usize = 0
+var frameCount: usize = 0
+var frameStarted: usize = 0
+var frameFirst: usize = 0
+var framesWritten: usize = 0
+var framesStartup: usize = 0
+var framesPath: [4096]u8 = undefined
+var framesPathLength: usize = 0
+
+fn monotonicAt(clock: usize) -> usize {
+    var time: [2]usize = [2]usize{ 0, 0 }
+    const got = std.linux.syscall2(SYS_clock_gettime, clock, @intFromPtr(&time))
+    return time[0] * 1000000000 + time[1]
+}
+
+fn frameWords() -> [*]usize {
+    unsafe { return @ptrFromInt([*]usize, framesMemory) }
+}
+
+// Whether frames are recorded (MLX_FRAMES set, and not 0).
+pub fn framesOn() -> bool {
+    if framesState == 0 {
+        framesState = 2
+        var value: [8]u8 = undefined
+        const length = environmentValue("MLX_FRAMES", @ptrCast([*]u8, &value), 8)
+        if length == 0 || (length == 1 && value[0] == 48) { return false }
+        var path: [*]u8 = undefined
+        unsafe { path = @ptrCast([*]u8, &framesPath) }
+        var at = runtimeDirectory(path, "frames")
+        if at == 0 || at > 400 { return false }
+        put(path, &at, "/")
+        var name: [128]u8 = undefined
+        const name_length = programName(@ptrCast([*]u8, &name), 128)
+        putBytes(path, &at, @ptrCast([*]const u8, &name), name_length)
+        put(path, &at, "-")
+        putNumber(path, &at, @bitCast(usize, std.linux.syscall0(SYS_getpid)))
+        put(path, &at, ".frames")
+        path[at] = 0
+        framesPathLength = at
+        framesMemory = mapped(FRAMES * FRAME_WORDS * 8 + FRAMES_TEXT)
+        if framesMemory == 0 { return false }
+        framesState = 1
+    }
+    return framesState == 1
+}
+
+// A frame begins: its serial (from 1).
+pub fn frameBegin() -> usize {
+    if !framesOn() { return 0 }
+    frameStarted = monotonicAt(CLOCK_MONOTONIC)
+    if frameCount == 0 { frameFirst = frameStarted }
+    frameCount += 1
+    const words = frameWords()
+    const at = (frameCount % FRAMES) * FRAME_WORDS
+    words[at] = frameCount
+    words[at + 1] = frameStarted - frameFirst
+    words[at + 2] = 0
+    words[at + 3] = 0
+    return frameCount
+}
+
+// The frame drawn: the processor's time on it; the frames written when a
+// second went by.
+pub fn frameEnd() -> void {
+    if framesState != 1 || frameCount == 0 { return }
+    const words = frameWords()
+    const at = (frameCount % FRAMES) * FRAME_WORDS
+    words[at + 2] = monotonicAt(CLOCK_MONOTONIC) - frameStarted
+    if frameCount == 1 { framesStartup = sinceStart() }
+    const seconds = now()
+    if frameCount == 10 || seconds >= framesWritten + 1 {
+        framesWritten = seconds
+        writeFrames()
+    }
+}
+
+// The frame being drawn (0: none, or frames are not recorded), for std.gpu
+// to put the GPU's time on.
+pub fn frameCurrent() -> usize {
+    if framesState != 1 { return 0 }
+    return frameCount
+}
+
+// The GPU's time on frame `serial`, added (a frame may submit more than
+// once).
+pub fn frameGpu(serial: usize, nanoseconds: usize) -> void {
+    if framesState != 1 || serial == 0 || serial > frameCount || frameCount - serial >= FRAMES { return }
+    const words = frameWords()
+    const at = (serial % FRAMES) * FRAME_WORDS
+    if words[at] == serial { words[at + 3] += nanoseconds }
+}
+
+// Nanoseconds since the process started (/proc/self/stat's start time, in
+// clock ticks of 10 ms, against the boot clock).
+fn sinceStart() -> usize {
+    var text: [512]u8 = undefined
+    const file = std.linux.syscall3(SYS_open, @intFromPtr(@ptrCast([*]const u8, "/proc/self/stat")), 0, 0)
+    if file < 0 { return 0 }
+    const got = std.linux.syscall3(0, @bitCast(usize, file), @intFromPtr(&text), 511)
+    const closed = std.linux.syscall1(SYS_close, @bitCast(usize, file))
+    if got <= 0 { return 0 }
+    const length = @bitCast(usize, got)
+    // After the name's closing parenthesis: state is field 3, start time 22.
+    var at = length
+    while at > 0 && text[at - 1] != 41 { at -= 1 }
+    var field: usize = 2
+    while at < length && field < 22 {
+        if text[at] == 32 { field += 1 }
+        at += 1
+    }
+    var ticks: usize = 0
+    while at < length && text[at] >= 48 && text[at] <= 57 {
+        ticks = ticks * 10 + @intCast(usize, text[at] - 48)
+        at += 1
+    }
+    const started = ticks * 10000000
+    const boot = monotonicAt(CLOCK_BOOTTIME)
+    return if boot > started { boot - started } else { 0 }
+}
+
+fn writeFrames() -> void {
+    const out = bytesAt(framesMemory + FRAMES * FRAME_WORDS * 8)
+    var length: usize = 0
+    put(out, &length, "frames\t")
+    var name: [128]u8 = undefined
+    putBytes(out, &length, @ptrCast([*]const u8, &name), programName(@ptrCast([*]u8, &name), 128))
+    put(out, &length, "\t")
+    putNumber(out, &length, @bitCast(usize, std.linux.syscall0(SYS_getpid)))
+    put(out, &length, "\t")
+    putNumber(out, &length, now())
+    put(out, &length, "\t")
+    putNumber(out, &length, frameCount)
+    put(out, &length, "\t")
+    putNumber(out, &length, framesStartup / 1000)
+    put(out, &length, "\n")
+    const words = frameWords()
+    var serial = if frameCount > FRAMES - 1 { frameCount - (FRAMES - 1) } else { 1 }
+    while serial <= frameCount && length + 96 < FRAMES_TEXT {
+        const at = (serial % FRAMES) * FRAME_WORDS
+        if words[at] == serial {
+            put(out, &length, "frame\t")
+            putNumber(out, &length, serial)
+            put(out, &length, "\t")
+            putNumber(out, &length, words[at + 1] / 1000)
+            put(out, &length, "\t")
+            putNumber(out, &length, words[at + 2] / 1000)
+            put(out, &length, "\t")
+            putNumber(out, &length, words[at + 3] / 1000)
+            put(out, &length, "\n")
+        }
+        serial += 1
+    }
+    var path: [*]u8 = undefined
+    unsafe { path = @ptrCast([*]u8, &framesPath) }
+    var part = framesPathLength + 1
+    putBytes(path, &part, path, framesPathLength)
+    put(path, &part, ".part")
+    path[part] = 0
+    const file = std.linux.syscall3(SYS_open, @intFromPtr(path) + framesPathLength + 1, O_WRONLY_CREAT_TRUNC, 420)
+    if file < 0 { return }
+    const wrote = std.linux.syscall3(SYS_write, @bitCast(usize, file), @intFromPtr(out), length)
+    const closed = std.linux.syscall1(SYS_close, @bitCast(usize, file))
+    const renamed = std.linux.syscall2(SYS_rename, @intFromPtr(path) + framesPathLength + 1, @intFromPtr(path))
+}
+
+// Writes the frames now (a program about to end).
+pub fn framesFlush() -> void {
+    if framesState == 1 && frameCount > 0 { writeFrames() }
 }

@@ -4,6 +4,8 @@
 #
 #   - with MLX_LEAK_CHECK the memory snapshot holds the GPU's blocks of
 #     device memory with the functions that asked;
+#   - with MLX_FRAMES the frame timeline holds the processor's and the
+#     GPU's time on each frame;
 #   - with MLX_GPU_PROFILE the GPU time goes on the functions that recorded
 #     the work (heavy far above light), as PROGRAM-gpu-SECONDS.profile;
 #   - mlx-profile profiles the processor and has the GPU profiled beside it;
@@ -83,6 +85,26 @@ XDG_RUNTIME_DIR="$runtime" "$work/mlx-codemap" memory program tests/support > "$
 grep -q "^  gpu .*: 10 allocations" "$work/memory.txt" || fail "mlx-codemap memory does not say the GPU's allocations" "$work/memory.txt"
 grep -q "^    700 B in 7 blocks tests/support/gpu_diagnostics_program.mlx:[0-9]*:[0-9]*: function smallBuffers$" "$work/memory.txt" || fail "mlx-codemap memory does not put the small buffers on smallBuffers" "$work/memory.txt"
 echo "ok   GPU memory: each block of device memory in the snapshot with the functions that asked, read by mlx-codemap memory"
+
+# The frame timeline: thirty frames, every tenth with a long dispatch, the
+# processor's and the GPU's time on each (timestamps on the queue), and
+# mlx-codemap frames lists the three long ones as spikes (lavapipe's first
+# frames can be one too: it compiles the shader then).
+XDG_RUNTIME_DIR="$runtime" MLX_FRAMES=1 "$work/program" frames || fail "the frames run ended with $?"
+timeline=$(ls "$runtime"/mlx/frames/program-*.frames 2>/dev/null | head -1)
+[[ -n "$timeline" ]] || fail "no frame timeline written"
+grep -q "^frames	program	[0-9]*	[0-9]*	30	[1-9][0-9]*$" "$timeline" || fail "the timeline's header should say 30 frames and the time to the first" "$timeline"
+[[ $(grep -c "^frame	" "$timeline") -eq 30 ]] || fail "the timeline should hold 30 frames" "$timeline"
+awk -F'\t' '$1 == "frame" && $2 == 10 { exit !($5 > 0 && $4 > 0) }' "$timeline" || fail "frame 10 has no processor or GPU time" "$timeline"
+heavy_gpu=$(awk -F'\t' '$1 == "frame" && $2 == 10 { print $5 }' "$timeline")
+light_gpu=$(awk -F'\t' '$1 == "frame" && $2 == 11 { print $5 }' "$timeline")
+[[ "$heavy_gpu" -gt $((light_gpu * 3)) ]] || fail "the GPU time of the long frame ($heavy_gpu µs) is not far above a short one's ($light_gpu µs)" "$timeline"
+XDG_RUNTIME_DIR="$runtime" "$work/mlx-codemap" frames program > "$work/frames.txt"
+grep -q "^  30 frames kept: [0-9]* over 16.7 ms (60 Hz), [0-9]* spikes$" "$work/frames.txt" || fail "mlx-codemap frames does not count the frames" "$work/frames.txt"
+for long_frame in 10 20 30; do
+    grep -q "^    frame $long_frame at .* (spike)$" "$work/frames.txt" || fail "mlx-codemap frames should list frame $long_frame as a spike" "$work/frames.txt"
+done
+echo "ok   frames: the processor's and the GPU's time on each frame, the spikes found by mlx-codemap frames"
 
 # The codemap reads both.
 "$work/mlx-codemap" gpu tests/support > "$work/gpu.txt"
