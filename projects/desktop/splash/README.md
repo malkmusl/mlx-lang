@@ -2,11 +2,14 @@
 
 The boot splash of the MLX system, in place of Plymouth: the MLX letters
 in a night of indigo while the system starts, powers off or restarts.
-Three rings of light orbit the letters, tilted in depth so they pass
-behind them and in front, with bright arcs running round them. The code
-graph of the Observatory rides the rings, its modules as nodes in the
-icon's colours (orange, green, purple, cyan, yellow), linked into
-triangles and labelled as its map labels them. A dial of ticks with two
+It is an atom of MLX. Three rings of light orbit the letters, tilted in
+depth so they pass behind them and in front. Their planes swing and rock
+(30 degrees either way, once in 12 to 17 s), and bright arcs run round
+them. The code graph of the Observatory rides the rings, its modules as
+atoms in the icon's colours (orange, green, purple, cyan, yellow): a
+glowing core, three electron orbits turning round it and an electron
+racing on each. They are linked into triangles and labelled as the
+Observatory's map labels them. A dial of ticks with two
 thick violet arcs sits behind the letters, and dust drifts out. Under the
 letters, what is starting stands in corner brackets over a cyan progress
 bar.
@@ -132,12 +135,12 @@ it into memory, and the animated region is copied to the screen.
 - Light is added in packed words: red and blue in one multiply, then a
   saturating add across the channels at once.
 - Each frame restores only the animated region from the backdrop.
-- Once everything has come in (1.75 s), the parts that stand still are
-  drawn into the backdrop: the rings without their arcs, the dial, and
-  the letters' glow. The rings' light in front of the letters is kept as
-  a list and added back after them.
-- What remains per frame is what moves. A 1920x1080 frame takes about
-  6 ms, 1280x800 about 2.5 ms.
+- Once they have come in (1.75 s), the parts that stand still are drawn
+  into the backdrop: the dial and the letters' glow.
+- What remains per frame is what moves: the rings, their arcs and glints,
+  the atoms, dust and text. Halos are added two pixels at a time in one
+  64-bit word, and the far side of a ring has none. A 1920x1080 frame
+  takes about 10 ms, 1280x800 about 5 ms.
 - It draws 30 frames a second at most. A frame never comes sooner than
   three times the last one's cost, so the splash uses a third of a
   processor at most.
@@ -148,7 +151,7 @@ it into memory, and the animated region is copied to the screen.
 | `logo.mlx` | the MLX letters as shaded facets (std.ui.vector) and their glow |
 | `state.mlx` | the scene's data, shared by the drawing modules |
 | `backdrop.mlx` | the night, and baking the still parts into it |
-| `orbits.mlx` | rings, arcs, glints, the code graph, the dial, dust, stars |
+| `orbits.mlx` | turning rings, arcs, glints, the code graph's atoms, the dial, dust, stars |
 | `status.mlx` | the status in brackets, the message, the progress bar |
 | `scene.mlx` | setting up and running a frame |
 | `output.mlx` | KMS, fbdev or nothing; the terminal's graphics mode |
