@@ -1,0 +1,543 @@
+// Why the Network page has no mlx-netd, and what the kernel says
+// meanwhile. mlx-netd answers on MLXIPC's system bus (mlx-ipcd --system,
+// /run/mlx/bus). When org.mlx.Network does not answer, the page asks the
+// bus whether anyone has the name (NameHasOwner), looks for a running
+// mlx-netd and NetworkManager (/proc/*/comm), for mlx-netd's systemd unit
+// (and whether it is enabled) or mlx-init service, and says what is wrong
+// and what to run.
+// The links come from route netlink meanwhile (a dump of the links and of
+// their IPv4 addresses, which needs no privilege), read only: whoever runs
+// the network keeps them. What it found goes to stderr once each time it
+// changes ("mlx-settings: network: ...").
+const std = @import("std")
+const dbus = @import("std.dbus")
+const netlink = @import("std.netlink")
+const ui = @import("std.ui")
+const view = @import("std.ui.view")
+const canvas_module = @import("std.ui.canvas")
+const controls = @import("std.ui.controls")
+const popup = @import("std.ui.popup")
+const page_module = @import("./page.mlx")
+
+const Page = page_module.Page
+
+pub const MAX_LINKS: usize = 8
+
+// Why mlx-netd does not answer.
+pub const WHY_ANSWERED: u32 = 0
+// mlx-netd is installed, but no system bus (mlx-ipcd) at its socket.
+pub const WHY_NO_BUS: u32 = 1
+// The bus refused the call (a rule of /etc/mlx/ipc.conf).
+pub const WHY_DENIED: u32 = 2
+// Neither its systemd unit nor its mlx-init service is there.
+pub const WHY_NOT_INSTALLED: u32 = 3
+// Its unit is there but not enabled (systemd).
+pub const WHY_NOT_ENABLED: u32 = 4
+// Installed (and enabled), not running.
+pub const WHY_STOPPED: u32 = 5
+// Running, but nobody has org.mlx.Network on this bus: an older mlx-netd
+// on D-Bus's bus, or one not run as root.
+pub const WHY_UNREGISTERED: u32 = 6
+// It has the name and did not answer in time.
+pub const WHY_SILENT: u32 = 7
+
+const BUS: []const u8 = "org.freedesktop.DBus"
+const BUS_PATH: []const u8 = "/org/freedesktop/DBus"
+const NETD: []const u8 = "org.mlx.Network"
+pub const ACCESS_DENIED: []const u8 = "org.freedesktop.DBus.Error.AccessDenied"
+
+const SYS_read: usize = 0
+const SYS_open: usize = 2
+const SYS_close: usize = 3
+const SYS_access: usize = 21
+const SYS_getdents64: usize = 217
+const O_DIRECTORY: usize = 65536
+const O_CLOEXEC: usize = 524288
+
+// A link as the kernel has it.
+pub const Link = struct {
+    name: [16]u8
+    nameLength: usize
+    index: u32
+    wifi: bool
+    up: bool
+    carrier: bool
+    // Its first IPv4 address with its prefix ("192.168.1.20/24").
+    address: [20]u8
+    addressLength: usize
+}
+
+pub const Status = struct {
+    why: u32
+    // NetworkManager runs (it has the network then).
+    manager: bool
+    // mlx-netd's unit or mlx-init service is there, and enabled (systemd).
+    installed: bool
+    enabled: bool
+    // systemd runs the machine, or mlx-init does (/run/mlx/init): the
+    // commands are theirs.
+    systemd: bool
+    initd: bool
+    // What stderr was told last.
+    told: u32
+    toldManager: bool
+    links: [8]Link
+    linkCount: usize
+}
+
+// ---------------------------------------------------------------------------
+// Field access
+
+fn bytesAt(base: usize, offset: usize) -> [*]u8 {
+    unsafe { return @ptrFromInt([*]u8, base + offset) }
+}
+
+fn linkAt(status: *Status, index: usize) -> *Link {
+    unsafe { return @ptrFromInt(*Link, @intFromPtr(status) + @offsetOf(Status, "links") + index * @sizeOf(Link)) }
+}
+
+fn nameOf(link: *Link) -> []const u8 { return bytesAt(@intFromPtr(link), @offsetOf(Link, "name"))[0..link.*.nameLength] }
+
+fn addressOf(link: *Link) -> []const u8 { return bytesAt(@intFromPtr(link), @offsetOf(Link, "address"))[0..link.*.addressLength] }
+
+fn same(first: []const u8, second: []const u8) -> bool {
+    if first.length != second.length { return false }
+    var index: usize = 0
+    while index < first.length {
+        if first[index] != second[index] { return false }
+        index += 1
+    }
+    return true
+}
+
+fn startsWith(value: []const u8, start: []const u8) -> bool {
+    return value.length >= start.length && same(value[0..start.length], start)
+}
+
+fn copyInto(target: [*]u8, capacity: usize, value: []const u8) -> usize {
+    var index: usize = 0
+    while index < value.length && index < capacity {
+        target[index] = value[index]
+        index += 1
+    }
+    return index
+}
+
+fn putNumber(target: [*]u8, at: usize, value: u32) -> usize {
+    var reversed: [12]u8 = undefined
+    var count: usize = 0
+    var rest = value
+    while true {
+        reversed[count] = @intCast(u8, 48 + rest % 10)
+        count += 1
+        rest = rest / 10
+        if rest == 0 { break }
+    }
+    var length = at
+    while count > 0 {
+        count -= 1
+        target[length] = reversed[count]
+        length += 1
+    }
+    return length
+}
+
+pub fn init(status: *Status) -> void {
+    status.*.why = WHY_ANSWERED
+    status.*.manager = false
+    status.*.installed = false
+    status.*.enabled = false
+    status.*.systemd = false
+    status.*.initd = false
+    status.*.told = WHY_ANSWERED
+    status.*.toldManager = false
+    status.*.linkCount = 0
+}
+
+// ---------------------------------------------------------------------------
+// What is there
+
+// Whether `path` is there.
+fn exists(path: []const u8) -> bool {
+    var buffer: [128]u8 = undefined
+    var bytes: [*]u8 = undefined
+    unsafe { bytes = @ptrCast([*]u8, &buffer) }
+    const length = copyInto(bytes, 127, path)
+    buffer[length] = 0
+    return std.linux.syscall2(SYS_access, @intFromPtr(bytes), 0) == 0
+}
+
+// Whether a process named `wanted` runs (/proc/PID/comm).
+fn running(wanted: []const u8) -> bool {
+    const directory = std.linux.syscall3(SYS_open, @intFromPtr("/proc"), O_DIRECTORY | O_CLOEXEC, 0)
+    if directory < 0 { return false }
+    var found = false
+    var buffer: [4096]u8 = undefined
+    var bytes: [*]const u8 = undefined
+    unsafe { bytes = @ptrCast([*]const u8, &buffer) }
+    while !found {
+        const count = std.linux.syscall3(SYS_getdents64, @bitCast(usize, directory), @intFromPtr(&buffer), 4096)
+        if count <= 0 { break }
+        var at: usize = 0
+        while at < @intCast(usize, count) && !found {
+            const record = @intCast(usize, buffer[at + 16]) | (@intCast(usize, buffer[at + 17]) << 8)
+            if record == 0 { break }
+            var end = at + 19
+            while end < at + record && buffer[end] != 0 { end += 1 }
+            const name = bytes[at + 19..end]
+            if name.length > 0 && name[0] >= 48 && name[0] <= 57 && named(name, wanted) { found = true }
+            at += record
+        }
+    }
+    const closed = std.linux.syscall1(SYS_close, @bitCast(usize, directory))
+    return found
+}
+
+// Whether process `pid`'s name (its comm) is `wanted`.
+fn named(pid: []const u8, wanted: []const u8) -> bool {
+    var path: [40]u8 = undefined
+    var path_bytes: [*]u8 = undefined
+    unsafe { path_bytes = @ptrCast([*]u8, &path) }
+    var length = copyInto(path_bytes, 6, "/proc/")
+    length += copyInto(bytesAt(@intFromPtr(path_bytes), length), 20, pid)
+    length += copyInto(bytesAt(@intFromPtr(path_bytes), length), 5, "/comm")
+    path[length] = 0
+    const descriptor = std.linux.syscall3(SYS_open, @intFromPtr(path_bytes), O_CLOEXEC, 0)
+    if descriptor < 0 { return false }
+    var comm: [32]u8 = undefined
+    var comm_bytes: [*]const u8 = undefined
+    unsafe { comm_bytes = @ptrCast([*]const u8, &comm) }
+    const count = std.linux.syscall3(SYS_read, @bitCast(usize, descriptor), @intFromPtr(&comm), 32)
+    const closed = std.linux.syscall1(SYS_close, @bitCast(usize, descriptor))
+    if count <= 0 { return false }
+    var size = @intCast(usize, count)
+    while size > 0 && comm[size - 1] == 10 { size -= 1 }
+    return same(comm_bytes[0..size], wanted)
+}
+
+// Whether the bus has an owner for `name`.
+fn owned(client: *dbus.Client, name: []const u8) -> bool {
+    var memory: [96]u8 = undefined
+    var bytes: [*]u8 = undefined
+    unsafe { bytes = @ptrCast([*]u8, &memory) }
+    var writing: dbus.Writer = undefined
+    dbus.begin(&writing, bytes, 96, false)
+    dbus.putString(&writing, name)
+    const serial = dbus.call(client, BUS, BUS_PATH, BUS, "NameHasOwner", "s", bytes, writing.length)
+    var reply: dbus.Header = undefined
+    if serial == 0 || !dbus.waitReply(client, serial, &reply, 1000) || reply.kind == dbus.ERROR { return false }
+    var reading = dbus.reader(dbus.bodyOf(client, &reply), reply.bodyLength, reply.big)
+    return dbus.readBool(&reading)
+}
+
+// ---------------------------------------------------------------------------
+// Why
+
+// mlx-netd answered.
+pub fn answered(status: *Status) -> void {
+    status.*.why = WHY_ANSWERED
+    tell(status)
+}
+
+// What runs the machine, and what of mlx-netd is there.
+fn look(status: *Status) -> void {
+    status.*.systemd = exists("/run/systemd/system")
+    status.*.initd = exists("/run/mlx/init")
+    status.*.manager = running("NetworkManager")
+    status.*.installed = exists("/etc/systemd/system/mlx-netd.service") || exists("/etc/mlx/init/services/mlx-netd.service")
+    status.*.enabled = !status.*.systemd || exists("/etc/systemd/system/multi-user.target.wants/mlx-netd.service")
+}
+
+// Why, when mlx-netd is not on the bus and not running.
+fn notThere(status: *Status) -> u32 {
+    if !status.*.installed { return WHY_NOT_INSTALLED }
+    if !status.*.enabled { return WHY_NOT_ENABLED }
+    return WHY_STOPPED
+}
+
+// There is no system bus at its socket: mlx-ipcd does not run (the
+// installer brings it along with mlx-netd).
+pub fn noBus(status: *Status) -> void {
+    look(status)
+    status.*.why = if status.*.installed { WHY_NO_BUS } else { WHY_NOT_INSTALLED }
+    readLinks(status)
+    tell(status)
+}
+
+// The call to mlx-netd failed on `client`: `denied` when the bus refused
+// it (a rule of /etc/mlx/ipc.conf).
+pub fn diagnose(status: *Status, client: *dbus.Client, denied: bool) -> void {
+    look(status)
+    if denied {
+        status.*.why = WHY_DENIED
+    } else if owned(client, NETD) {
+        status.*.why = WHY_SILENT
+    } else if running("mlx-netd") {
+        status.*.why = WHY_UNREGISTERED
+    } else {
+        status.*.why = notThere(status)
+    }
+    readLinks(status)
+    tell(status)
+}
+
+fn whyText(why: u32) -> []const u8 {
+    return match why {
+        1 => "no system bus (mlx-ipcd)",
+        2 => "the system bus refused the call",
+        3 => "mlx-netd is not installed",
+        4 => "mlx-netd is installed but not enabled",
+        5 => "mlx-netd is installed but not running",
+        6 => "mlx-netd runs but is not on MLXIPC's system bus",
+        7 => "mlx-netd is on the system bus but did not answer",
+        else => "mlx-netd answers",
+    }
+}
+
+// Says what was found on stderr when it changed.
+fn tell(status: *Status) -> void {
+    if status.*.why == status.*.told && status.*.manager == status.*.toldManager { return }
+    status.*.told = status.*.why
+    status.*.toldManager = status.*.manager
+    const said = std.io.eprint("mlx-settings: network: ")
+    const why = std.io.eprint(whyText(status.*.why))
+    if status.*.why != WHY_ANSWERED {
+        const manager = std.io.eprint(if status.*.manager { "; NetworkManager runs the network" } else { "; no NetworkManager" })
+        const links = std.io.eprint("; the kernel's links:")
+        var index: usize = 0
+        while index < status.*.linkCount {
+            const space = std.io.eprint(" ")
+            const name = std.io.eprint(nameOf(linkAt(status, index)))
+            index += 1
+        }
+    }
+    const done = std.io.eprint("\n")
+}
+
+// ---------------------------------------------------------------------------
+// The kernel's links
+
+// Whether /sys/class/net/NAME/ENTRY is there.
+fn hasEntry(name: []const u8, entry: []const u8) -> bool {
+    var path: [64]u8 = undefined
+    var bytes: [*]u8 = undefined
+    unsafe { bytes = @ptrCast([*]u8, &path) }
+    var length = copyInto(bytes, 15, "/sys/class/net/")
+    length += copyInto(bytesAt(@intFromPtr(bytes), length), 16, name)
+    length += copyInto(bytesAt(@intFromPtr(bytes), length), 1, "/")
+    length += copyInto(bytesAt(@intFromPtr(bytes), length), 12, entry)
+    return exists(bytes[0..length])
+}
+
+// The links mlx-netd would leave alone too (its default `ignore`), and
+// the kernel's traffic shaping links.
+fn ignored(name: []const u8) -> bool {
+    return startsWith(name, "ifb") || startsWith(name, "docker") || startsWith(name, "veth") || startsWith(name, "virbr") || startsWith(name, "br-") || startsWith(name, "vnet") || startsWith(name, "tap") || startsWith(name, "tun")
+}
+
+fn linkMessage(status: *Status, message: *const netlink.Message) -> void {
+    var header: netlink.Link = undefined
+    if !netlink.linkOf(message, &header) || header.flags & netlink.IFF_LOOPBACK != 0 { return }
+    if status.*.linkCount >= MAX_LINKS { return }
+    var offset: usize = netlink.LINK_HEADER
+    var found: netlink.Attribute = undefined
+    while netlink.nextAttribute(message.*.payload, message.*.length, &offset, &found) {
+        if found.kind == netlink.IFLA_IFNAME {
+            const name = netlink.stringOf(&found)
+            if name.length == 0 || name.length > 15 || ignored(name) { return }
+            const link = linkAt(status, status.*.linkCount)
+            link.*.nameLength = copyInto(bytesAt(@intFromPtr(link), @offsetOf(Link, "name")), 16, name)
+            link.*.index = header.index
+            link.*.up = header.flags & netlink.IFF_UP != 0
+            link.*.carrier = header.flags & netlink.IFF_LOWER_UP != 0
+            link.*.wifi = hasEntry(name, "wireless") || hasEntry(name, "phy80211")
+            link.*.addressLength = 0
+            status.*.linkCount += 1
+            return
+        }
+    }
+}
+
+fn addressMessage(status: *Status, message: *const netlink.Message) -> void {
+    if message.*.length < netlink.ADDRESS_HEADER { return }
+    const prefix = message.*.payload[1]
+    const scope = message.*.payload[3]
+    const index = netlink.load32(message.*.payload, 4)
+    if scope != netlink.RT_SCOPE_UNIVERSE { return }
+    var slot: usize = 0
+    while slot < status.*.linkCount && linkAt(status, slot).*.index != index { slot += 1 }
+    if slot == status.*.linkCount || linkAt(status, slot).*.addressLength > 0 { return }
+    const link = linkAt(status, slot)
+    var offset: usize = netlink.ADDRESS_HEADER
+    var found: netlink.Attribute = undefined
+    while netlink.nextAttribute(message.*.payload, message.*.length, &offset, &found) {
+        if (found.kind == netlink.IFA_LOCAL || found.kind == netlink.IFA_ADDRESS) && found.length == 4 {
+            const into = bytesAt(@intFromPtr(link), @offsetOf(Link, "address"))
+            var length: usize = 0
+            var part: usize = 0
+            while part < 4 {
+                if part > 0 {
+                    into[length] = 46
+                    length += 1
+                }
+                length = putNumber(into, length, @intCast(u32, found.data[part]))
+                part += 1
+            }
+            into[length] = 47
+            length = putNumber(into, length + 1, @intCast(u32, prefix))
+            link.*.addressLength = length
+            return
+        }
+    }
+}
+
+// Reads a dump's answers up to NLMSG_DONE: links or addresses.
+fn readDump(status: *Status, socket: *netlink.Socket, addresses: bool) -> void {
+    var scratch: [16384]u8 = undefined
+    var bytes: [*]u8 = undefined
+    unsafe { bytes = @ptrCast([*]u8, &scratch) }
+    var rounds: usize = 0
+    while rounds < 64 {
+        rounds += 1
+        const count = netlink.receive(socket, bytes, 16384, 500)
+        if count <= 0 { return }
+        var offset: usize = 0
+        var message: netlink.Message = undefined
+        while netlink.nextMessage(bytes, @intCast(usize, count), &offset, &message) {
+            if message.kind == netlink.NLMSG_DONE || message.kind == netlink.NLMSG_ERROR { return }
+            if !addresses && message.kind == netlink.RTM_NEWLINK { linkMessage(status, &message) }
+            if addresses && message.kind == netlink.RTM_NEWADDR { addressMessage(status, &message) }
+        }
+    }
+}
+
+// The links and their addresses again.
+fn readLinks(status: *Status) -> void {
+    status.*.linkCount = 0
+    var socket: netlink.Socket = undefined
+    if !netlink.open(&socket, netlink.ROUTE, 0) { return }
+    if netlink.dumpLinks(&socket) { readDump(status, &socket, false) }
+    if netlink.dumpAddresses(&socket) { readDump(status, &socket, true) }
+    netlink.close(&socket)
+}
+
+// ---------------------------------------------------------------------------
+// The page
+
+// `text` wrapped in body text; the y after it.
+fn paragraph(page: *const Page, y: i32, text: []const u8) -> i32 {
+    const line = page_module.px(page, 20)
+    const lines = popup.wrapped(page.*.ui, page.*.body, text, page.*.left, y + page_module.px(page, 4), page.*.width, line, 6, page.*.theme.*.text)
+    return y + page_module.px(page, 4) + @intCast(i32, lines) * line + page_module.px(page, 4)
+}
+
+// A command to run, in a box; the y after it.
+fn command(page: *const Page, y: i32, text: []const u8) -> i32 {
+    const s = page.*.scale
+    const height = page_module.px(page, 30)
+    canvas_module.fillRoundedRect(view.canvasOf(page.*.ui), page.*.left, y + 4 * s, page.*.width, height, 6 * s, page.*.theme.*.field)
+    controls.label(page.*.ui, page.*.small, text, page.*.left + 10 * s, controls.textTop(page.*.small, y + 4 * s, height), page.*.theme.*.text, page.*.width - 20 * s)
+    return y + height + 8 * s
+}
+
+// What starts mlx-netd and the bus once they are set up: systemd's or
+// mlx-init's way, else by hand.
+fn startCommand(page: *const Page, status: *const Status, y: i32) -> i32 {
+    if status.*.systemd { return command(page, y, "sudo systemctl daemon-reload && sudo systemctl start mlx-netd") }
+    if status.*.initd { return command(page, y, "sudo mlx-initctl reload") }
+    const bus = command(page, y, "sudo /usr/bin/mlx/mlx-ipcd --system &")
+    return command(page, bus, "sudo /usr/bin/mlx/mlx-netd")
+}
+
+fn install(page: *const Page, status: *const Status, top: i32) -> i32 {
+    var y = paragraph(page, top, page_module.say(page, "To install it from this repository, with MLXIPC's system bus (mlx-ipcd), and switch over:", "Aus diesem Repository installieren, mit dem Systembus von MLXIPC (mlx-ipcd), und umstellen:"))
+    y = command(page, y, "sudo tools/install_network.sh --enable")
+    y = startCommand(page, status, y)
+    if status.*.manager && status.*.systemd {
+        y = page_module.note(page, y, page_module.say(page, "Starting mlx-netd stops NetworkManager (its unit conflicts with it).", "Der Start von mlx-netd beendet NetworkManager (seine Unit schließt ihn aus)."))
+    }
+    return y
+}
+
+// Why mlx-netd does not answer and what to do; the y after it.
+fn why(status: *Status, page: *const Page, top: i32, bus: []const u8) -> i32 {
+    var y = top
+    const manager = status.*.manager
+    if status.*.why == WHY_NO_BUS {
+        var line: [256]u8 = undefined
+        var bytes: [*]u8 = undefined
+        unsafe { bytes = @ptrCast([*]u8, &line) }
+        var length = copyInto(bytes, 60, page_module.say(page, "MLXIPC's system bus (mlx-ipcd) does not answer at ", "Der Systembus von MLXIPC (mlx-ipcd) antwortet nicht unter "))
+        length += copyInto(bytesAt(@intFromPtr(bytes), length), 120, bus)
+        length += copyInto(bytesAt(@intFromPtr(bytes), length), 70, page_module.say(page, ", so mlx-netd cannot be asked. Start it:", ", also lässt sich mlx-netd nicht fragen. Starten:"))
+        y = paragraph(page, y, bytes[0..length])
+        if status.*.systemd { return command(page, y, "sudo systemctl start mlx-ipcd") }
+        if status.*.initd { return command(page, y, "sudo mlx-initctl start mlx-ipcd") }
+        return command(page, y, "sudo /usr/bin/mlx/mlx-ipcd --system &")
+    }
+    if status.*.why == WHY_DENIED {
+        y = paragraph(page, y, page_module.say(page, "MLXIPC's system bus does not let this app talk to mlx-netd: a rule of /etc/mlx/ipc.conf forbids it. This line there allows it:", "Der Systembus von MLXIPC lässt diese App nicht mit mlx-netd sprechen: eine Regel in /etc/mlx/ipc.conf verbietet es. Diese Zeile dort erlaubt es:"))
+        return command(page, y, "allow mlx-settings talk org.mlx.Network")
+    }
+    if status.*.why == WHY_NOT_INSTALLED {
+        y = paragraph(page, y, if manager { page_module.say(page, "mlx-netd is not installed; NetworkManager runs the network.", "mlx-netd ist nicht installiert; NetworkManager kümmert sich um das Netz.") } else { page_module.say(page, "mlx-netd is not installed, and nothing else runs the network.", "mlx-netd ist nicht installiert, und auch sonst kümmert sich niemand um das Netz.") })
+        return install(page, status, y)
+    }
+    if status.*.why == WHY_NOT_ENABLED {
+        y = paragraph(page, y, if manager { page_module.say(page, "mlx-netd is installed but not switched on; NetworkManager runs the network.", "mlx-netd ist installiert, aber nicht eingeschaltet; NetworkManager kümmert sich um das Netz.") } else { page_module.say(page, "mlx-netd is installed but not switched on.", "mlx-netd ist installiert, aber nicht eingeschaltet.") })
+        return install(page, status, y)
+    }
+    if status.*.why == WHY_STOPPED {
+        y = paragraph(page, y, page_module.say(page, "mlx-netd is set up but does not run. Start it; if it ends again, its log says why:", "mlx-netd ist eingerichtet, läuft aber nicht. Starte es; endet es wieder, steht der Grund in seinem Protokoll:"))
+        if status.*.systemd {
+            y = command(page, y, "sudo systemctl start mlx-netd")
+            return command(page, y, "journalctl -b -u mlx-netd")
+        }
+        if status.*.initd { return command(page, y, "sudo mlx-initctl start mlx-netd") }
+        return command(page, y, "sudo /usr/bin/mlx/mlx-netd --verbose")
+    }
+    if status.*.why == WHY_UNREGISTERED {
+        y = paragraph(page, y, page_module.say(page, "mlx-netd runs, but not on MLXIPC's system bus: an older mlx-netd still talks to D-Bus, or it does not run as root (only root owns names there). Install it again and restart it:", "mlx-netd läuft, aber nicht am Systembus von MLXIPC: ein älteres mlx-netd spricht noch D-Bus, oder es läuft nicht als root (dort nimmt nur root Namen). Neu installieren und neu starten:"))
+        y = command(page, y, "sudo tools/install_network.sh --enable")
+        if status.*.systemd { return command(page, y, "sudo systemctl daemon-reload && sudo systemctl restart mlx-ipcd mlx-netd") }
+        if status.*.initd { return command(page, y, "sudo mlx-initctl restart mlx-netd") }
+        return y
+    }
+    y = paragraph(page, y, page_module.say(page, "mlx-netd is on the system bus but did not answer within two seconds. The page asks again every second.", "mlx-netd ist am Systembus, hat aber nicht binnen zwei Sekunden geantwortet. Die Seite fragt jede Sekunde wieder."))
+    if status.*.systemd { y = command(page, y, "journalctl -b -u mlx-netd") }
+    return y
+}
+
+// The page without mlx-netd: why, what to do, and the kernel's links.
+pub fn draw(status: *Status, page: *const Page, top: i32, bus: []const u8) -> i32 {
+    var y = why(status, page, top, bus)
+    y = page_module.section(page, y, page_module.say(page, "Connections, as the kernel has them", "Verbindungen laut Kernel"))
+    if status.*.linkCount == 0 { return page_module.note(page, y, page_module.say(page, "No links.", "Keine Verbindungen.")) }
+    var index: usize = 0
+    while index < status.*.linkCount {
+        const link = linkAt(status, index)
+        var label: [40]u8 = undefined
+        var label_bytes: [*]u8 = undefined
+        unsafe { label_bytes = @ptrCast([*]u8, &label) }
+        var length = copyInto(label_bytes, 16, nameOf(link))
+        length += copyInto(bytesAt(@intFromPtr(label_bytes), length), 4, " · ")
+        length += copyInto(bytesAt(@intFromPtr(label_bytes), length), 12, if link.*.wifi { page_module.say(page, "Wi-Fi", "WLAN") } else { page_module.say(page, "Cable", "Kabel") })
+        var value: [64]u8 = undefined
+        var value_bytes: [*]u8 = undefined
+        unsafe { value_bytes = @ptrCast([*]u8, &value) }
+        var state: []const u8 = page_module.say(page, "Off", "Aus")
+        if link.*.up && link.*.carrier {
+            state = page_module.say(page, "Connected", "Verbunden")
+        } else if link.*.up {
+            state = if link.*.wifi { page_module.say(page, "Not connected", "Nicht verbunden") } else { page_module.say(page, "No cable", "Kein Kabel") }
+        }
+        var value_length = copyInto(value_bytes, 20, state)
+        if link.*.addressLength > 0 {
+            value_length += copyInto(bytesAt(@intFromPtr(value_bytes), value_length), 4, " · ")
+            value_length += copyInto(bytesAt(@intFromPtr(value_bytes), value_length), 20, addressOf(link))
+        }
+        y = page_module.infoRow(page, y, label_bytes[0..length], value_bytes[0..value_length])
+        index += 1
+    }
+    return y
+}

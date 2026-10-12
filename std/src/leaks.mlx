@@ -1,0 +1,738 @@
+// std.leaks: leak checks for a whole program, as Zig's DebugAllocator gives
+// the programs that use it, without passing another allocator around.
+// With MLX_LEAK_CHECK=1 in the environment, watch() has the page allocator
+// tell a debug allocator (std.debug_allocator) every block it maps and
+// unmaps, with the functions that asked; report() says the blocks still
+// out, grouped by where they were allocated and named by std.crash, the
+// largest first. Double frees and blocks freed with the wrong length are
+// said as they happen (and not unmapped twice).
+//
+// After mark(), report() says only the blocks allocated since: in a
+// program that runs a loop, mark before the loop's first turn, and what
+// the report says is what the loop took and did not give back. It also
+// says how much the compiler's value arena grew since the mark: a loop
+// whose turns do not give their values back (std.turns) grows the program
+// as a leak would.
+//
+//     leaks.watch()                   first thing in main
+//     ...setting up...
+//     leaks.mark()                    before the loop
+//     ...the loop...
+//     const leaked = leaks.report()   at the end
+//
+// A block a program keeps on purpose until it ends (a cache's, state it
+// replaces as it changes) is left out of the reports with keep().
+//
+// MLX_LEAK_CHECK=/a/path appends the reports to that file instead of
+// stderr (checks that keep no program's stderr, several programs at once:
+// each line names the program and its process). Without MLX_LEAK_CHECK
+// each of these is nothing and costs nothing.
+//
+// It is part of the runtime: std.crash's install, which every program of
+// MLX calls first, calls watch(), so with MLX_LEAK_CHECK a program is
+// watched from its start without asking. While it runs, the program's
+// memory is written about once a second (from the main thread, as blocks
+// come and go, and at each mark and report) to
+// $XDG_RUNTIME_DIR/mlx/memory/PROGRAM-PID.memory, which MLX Observatory
+// and `mlx-codemap memory` read (how full the pages are, where the blocks
+// came from, which places grow):
+//
+//     memory <TAB> program <TAB> pid <TAB> seconds <TAB> allocations <TAB> frees <TAB> blocks <TAB> bytes <TAB> mapped <TAB> peak <TAB> values <TAB> resident KiB
+//     tiny <TAB> pages <TAB> blocks <TAB> bytes <TAB> empty pages
+//     place <TAB> index <TAB> blocks <TAB> bytes <TAB> mapped <TAB> since the mark <TAB> kept <TAB> function <TAB> function ...
+//     block <TAB> address (hex) <TAB> bytes <TAB> place <TAB> 0 | 1 since the mark | 2 kept <TAB> mapped
+//     map <TAB> start (hex) <TAB> end (hex) <TAB> permissions <TAB> path
+//
+// and with a GPU context open (std.gpu notes its device memory through
+// std.diagnostics):
+//
+//     gpu <TAB> device <TAB> allocation limit <TAB> blocks <TAB> allocations <TAB> frees
+//     gpu-heap <TAB> index <TAB> bytes <TAB> flags (1: on the device)
+//     gpu-type <TAB> index <TAB> heap <TAB> property flags
+//     gpu-place <TAB> index <TAB> blocks <TAB> bytes asked <TAB> bytes allocated <TAB> function ...
+//     gpu-block <TAB> handle (hex) <TAB> bytes asked <TAB> bytes allocated <TAB> type <TAB> kind <TAB> place
+//
+// (kind: 0 a buffer, 1 exported as a dma-buf, 2 another process's
+// dma-buf, 3 this process's memory).
+//
+// The functions are named as crashes name them (path:line:function), the
+// allocators' own left out. `mapped` is what a block takes: its tiny pages
+// for a small one (std.tinypage_allocator, 64 bytes each), whole pages for
+// the others, so what a block wastes is `mapped` - `bytes`; the tiny line
+// says how full the tiny pages are.
+const std = @import("std")
+const crash = @import("std.crash")
+const turns = @import("std.turns")
+const diagnostics = @import("std.diagnostics")
+
+const debug = std.debug_allocator
+
+var state: debug.DebugAllocator = undefined
+var watching: bool = false
+// The value arena (0: not found) and its fill at the mark; the turns
+// std.turns had released then.
+var arena: usize = 0
+var arenaMark: usize = 0
+var releasedMark: usize = 0
+
+// Watches the page allocator when MLX_LEAK_CHECK is set (and not 0); true
+// when it does.
+pub fn watch() -> bool {
+    if watching { return true }
+    var path: [256]u8 = undefined
+    const wanted_as = wanted(@ptrCast([*]u8, &path))
+    if wanted_as == 0 { return false }
+    start()
+    if wanted_as == 2 {
+        // O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC
+        const file = std.linux.syscall3(2, @intFromPtr(&path), 525377, 420)
+        if file >= 0 { state.output = @bitCast(usize, file) }
+    }
+    return true
+}
+
+// Watches it whatever the environment says (tests).
+pub fn watchAlways() -> void {
+    if !watching { start() }
+}
+
+fn start() -> void {
+    debug.init(&state, std.page_allocator.init())
+    state.describe = crash.describeReturn
+    mainFrame = @frameAddress()
+    prepareSnapshots()
+    if buffers != 0 { state.after = afterNote }
+    debug.watchPages(&state)
+    watching = true
+    arena = turns.locate()
+    arenaMark = if arena != 0 { turns.fillWord(arena).* } else { 0 }
+    releasedMark = turns.released()
+}
+
+// Whether MLX_LEAK_CHECK is in /proc/self/environ: 0 when not (or 0), 1
+// for stderr, 2 for a path (into `path`, NUL-ended).
+fn wanted(path: [*]u8) -> usize {
+    const SYS_open: usize = 2
+    const SYS_read: usize = 0
+    const SYS_close: usize = 3
+    const file = std.linux.syscall3(SYS_open, @intFromPtr(@ptrCast([*]const u8, "/proc/self/environ")), 0, 0)
+    if file < 0 { return 0 }
+    var buffer: [8192]u8 = undefined
+    var bytes: [*]u8 = undefined
+    unsafe { bytes = @ptrCast([*]u8, &buffer) }
+    const name = "MLX_LEAK_CHECK="
+    var found: usize = 0
+    var searching = true
+    // Entries are NUL-separated; one crossing a read's end is read again
+    // whole from where it began.
+    var carried: usize = 0
+    while searching {
+        const count = std.linux.syscall3(SYS_read, @bitCast(usize, file), @intFromPtr(bytes) + carried, 8192 - carried)
+        if count <= 0 { break }
+        const total = carried + @bitCast(usize, count)
+        var entry: usize = 0
+        var at: usize = 0
+        while at < total {
+            if bytes[at] == 0 {
+                if at - entry > name.length && std.text.same(bytes[entry..entry + name.length], name) {
+                    searching = false
+                    const value = entry + name.length
+                    if bytes[value] == 47 && at - value < 255 {
+                        var copied: usize = 0
+                        while value + copied < at {
+                            path[copied] = bytes[value + copied]
+                            copied += 1
+                        }
+                        path[copied] = 0
+                        found = 2
+                    } else if !(at - value == 1 && bytes[value] == 48) {
+                        found = 1
+                    }
+                }
+                entry = at + 1
+            }
+            at += 1
+        }
+        carried = total - entry
+        var move: usize = 0
+        while move < carried {
+            bytes[move] = bytes[entry + move]
+            move += 1
+        }
+        if carried == 8192 { carried = 0 }
+    }
+    const closed = std.linux.syscall1(SYS_close, @bitCast(usize, file))
+    return found
+}
+
+// From now on report() says only what is allocated after this.
+pub fn mark() -> void {
+    if !watching { return }
+    debug.mark(&state)
+    arenaMark = if arena != 0 { turns.fillWord(arena).* } else { 0 }
+    releasedMark = turns.released()
+    snapshot()
+}
+
+// A block meant to stay until the program ends (a cache's, state replaced
+// as it changes): reports leave it out. `memory` is what the allocator
+// gave.
+pub fn keep(memory: [*]u8) -> void {
+    if !watching { return }
+    debug.keep(&state, @intFromPtr(memory))
+}
+
+// Says the blocks still out (after the mark) and the arena's growth; the
+// number of blocks out (0 when not watching).
+pub fn report() -> usize {
+    if !watching { return 0 }
+    snapshot()
+    const blocks = debug.report(&state)
+    // A loop on std.turns gives each turn's values back: the fill is then
+    // only what its last turn made.
+    if arena != 0 && turns.released() == releasedMark {
+        const fill = turns.fillWord(arena).*
+        if fill > arenaMark + 65536 { debug.sayLine(&state, "values (the compiler's arena) grew by ", (fill - arenaMark) / 1024, " KiB since the mark: a loop without std.turns keeps every turn's values") }
+    }
+    return blocks
+}
+
+// report() for a defer at the end of a loop.
+pub fn finish() -> void {
+    const ignored = report()
+}
+
+// The blocks out now (after the mark) and the bad frees seen, for checks.
+pub fn liveCount() -> usize {
+    if !watching { return 0 }
+    return debug.liveCount(&state)
+}
+
+pub fn problemCount() -> usize {
+    if !watching { return 0 }
+    return debug.problemCount(&state)
+}
+
+// ---------------------------------------------------------------------------
+// Snapshots
+
+const SNAPSHOT_EVERY: usize = 1
+// Blocks noted between looks at the clock.
+const CHECK_EVERY: usize = 32
+const DEPTH: usize = 12
+const PLACES: usize = 4096
+const PLACE_SLOTS: usize = 8192
+const MAX_BLOCK_LINES: usize = 65536
+const NAME_SLOTS: usize = 16384
+const NAME_TEXT: usize = 1048576
+// One mapping: the header and places, the block lines, /proc/self/maps,
+// the tables, the names.
+const OUT_SIZE: usize = 4194304
+const BLOCKS_AT: usize = 4194304
+const BLOCKS_SIZE: usize = 4194304
+const MAPS_AT: usize = 8388608
+const MAPS_SIZE: usize = 1048576
+const TABLES_AT: usize = 9437184
+const SLOTS_AT: usize = 0
+const STACKS_AT: usize = 32768
+const COUNTS_AT: usize = STACKS_AT + PLACES * DEPTH * 8
+const NAMES_AT: usize = TABLES_AT + COUNTS_AT + PLACES * 8 * 5
+const NAME_VALUES_AT: usize = NAMES_AT + NAME_SLOTS * 8
+const NAME_TEXT_AT: usize = NAME_VALUES_AT + NAME_SLOTS * 8
+const BUFFERS_SIZE: usize = NAME_TEXT_AT + NAME_TEXT
+
+var buffers: usize = 0
+var snapshotPath: [700]u8 = undefined
+var snapshotLength: usize = 0
+var lastSnapshot: usize = 0
+var events: usize = 0
+var mainFrame: usize = 0
+var nameUsed: usize = 0
+// The GPU's allocations and frees at the last snapshot.
+var gpuChanges: usize = 0
+
+fn bytes(address: usize) -> [*]u8 {
+    unsafe { return @ptrFromInt([*]u8, address) }
+}
+
+fn words(address: usize) -> [*]usize {
+    unsafe { return @ptrFromInt([*]usize, address) }
+}
+
+fn halves(address: usize) -> [*]u32 {
+    unsafe { return @ptrFromInt([*]u32, address) }
+}
+
+// The snapshot's path, and the memory to make it in.
+fn prepareSnapshots() -> void {
+    var path: [*]u8 = undefined
+    unsafe { path = @ptrCast([*]u8, &snapshotPath) }
+    var length = diagnostics.runtimeDirectory(path, "memory")
+    if length == 0 || length > 400 { return }
+    diagnostics.put(path, &length, "/")
+    var name: [128]u8 = undefined
+    var name_bytes: [*]u8 = undefined
+    unsafe { name_bytes = @ptrCast([*]u8, &name) }
+    const name_length = diagnostics.programName(name_bytes, 128)
+    diagnostics.putBytes(path, &length, name_bytes, name_length)
+    diagnostics.put(path, &length, "-")
+    diagnostics.putNumber(path, &length, @bitCast(usize, std.linux.syscall0(39)))
+    diagnostics.put(path, &length, ".memory")
+    path[length] = 0
+    snapshotLength = length
+    const mapping = std.linux.syscall6(9, 0, BUFFERS_SIZE, 3, 34, 18446744073709551615, 0)
+    if mapping < 0 { return }
+    buffers = @bitCast(usize, mapping)
+    const keys = words(buffers + NAMES_AT)
+    var slot: usize = 0
+    while slot < NAME_SLOTS {
+        keys[slot] = 0
+        slot += 1
+    }
+}
+
+// For a loop's turn (the panels call it): a snapshot when the GPU's memory
+// changed and a second went by (the processor's blocks have afterNote).
+// From the main thread.
+pub fn tick() -> void {
+    if !watching || buffers == 0 { return }
+    if diagnostics.gpuCount(5) + diagnostics.gpuCount(6) == gpuChanges { return }
+    if diagnostics.now() < lastSnapshot + SNAPSHOT_EVERY { return }
+    snapshot()
+}
+
+// After each block noted: a snapshot when a second went by, from the main
+// thread (the others share its value arena).
+fn afterNote(watched: usize) -> void {
+    events += 1
+    if events % CHECK_EVERY != 0 { return }
+    const frame = @frameAddress()
+    if frame + 67108864 < mainFrame || frame > mainFrame + 67108864 { return }
+    if diagnostics.now() < lastSnapshot + SNAPSHOT_EVERY { return }
+    snapshot()
+}
+
+fn putHex(into: [*]u8, length: *usize, value: usize) -> void {
+    var shift: usize = 60
+    var started = false
+    while true {
+        const digit = (value >> shift) & 15
+        if digit != 0 || started || shift == 0 {
+            into[length.*] = @intCast(u8, if digit < 10 { 48 + digit } else { 87 + digit })
+            length.* += 1
+            started = true
+        }
+        if shift == 0 { break }
+        shift -= 4
+    }
+}
+
+fn stackHash(frames: [*]const usize) -> usize {
+    var value: usize = 1469598103934665603
+    var at: usize = 0
+    while at < DEPTH {
+        value = (value ^ frames[at]) *% 1099511628211
+        at += 1
+    }
+    return value
+}
+
+// The name (path:line:function) of the function a return address is in,
+// as its start and length in the names' text (length 0: none, or an
+// allocator's own).
+fn nameOf(address: usize, start: *usize) -> usize {
+    const keys = words(buffers + NAMES_AT)
+    const values = words(buffers + NAME_VALUES_AT)
+    const text = bytes(buffers + NAME_TEXT_AT)
+    const mask = NAME_SLOTS - 1
+    var slot = (address >> 3) & mask
+    while keys[slot] != 0 {
+        if keys[slot] == address {
+            start.* = values[slot] >> 16
+            return values[slot] & 65535
+        }
+        slot = (slot + 1) & mask
+    }
+    var length: usize = 0
+    if nameUsed + 8192 < NAME_TEXT {
+        var described: usize = 0
+        crash.describeReturn(address, bytes(buffers + NAME_TEXT_AT + nameUsed), &described)
+        while length < described && text[nameUsed + length] != 43 && text[nameUsed + length] != 32 { length += 1 }
+        // The allocators' own frames are no news, nor std.gpu's.
+        var at: usize = 0
+        while at + 14 <= length {
+            if std.text.same(text[nameUsed + at..nameUsed + at + 14], "allocator.mlx:") { length = 0 }
+            at += 1
+        }
+        at = 0
+        while at + 13 <= length {
+            if std.text.same(text[nameUsed + at..nameUsed + at + 13], "/src/gpu.mlx:") { length = 0 }
+            at += 1
+        }
+    }
+    start.* = nameUsed
+    keys[slot] = address
+    values[slot] = (nameUsed << 16) | length
+    nameUsed += length
+    return length
+}
+
+// Writes the program's memory as it is now (see the top).
+fn snapshot() -> void {
+    if !watching || buffers == 0 || snapshotLength == 0 { return }
+    lastSnapshot = diagnostics.now()
+    const out = bytes(buffers)
+    const blocks_out = bytes(buffers + BLOCKS_AT)
+    const tables = buffers + TABLES_AT
+    const slots = halves(tables + SLOTS_AT)
+    const stacks = words(tables + STACKS_AT)
+    const counts = words(tables + COUNTS_AT)
+    const sizes = words(tables + COUNTS_AT + PLACES * 8)
+    const pages = words(tables + COUNTS_AT + PLACES * 16)
+    const fresh = words(tables + COUNTS_AT + PLACES * 24)
+    const kept = words(tables + COUNTS_AT + PLACES * 32)
+    var slot: usize = 0
+    while slot < PLACE_SLOTS {
+        slots[slot] = 0
+        slot += 1
+    }
+    var place_count: usize = 0
+    var blocks_length: usize = 0
+    var block_lines: usize = 0
+    var live_blocks: usize = 0
+    var live_bytes: usize = 0
+    var mapped_bytes: usize = 0
+    debug.lock(&state)
+    var index: usize = 0
+    while index < state.recordCount {
+        const record = &state.records[index]
+        if debug.isLive(record) {
+            var frames: [*]const usize = undefined
+            unsafe { frames = @ptrCast([*]const usize, &record.*.allocated) }
+            // Its place: the blocks allocated along the same functions.
+            var at = stackHash(frames) & (PLACE_SLOTS - 1)
+            var place = PLACES
+            while slots[at] != 0 && place == PLACES {
+                const candidate = @intCast(usize, slots[at]) - 1
+                var same = true
+                var depth: usize = 0
+                while depth < DEPTH {
+                    if stacks[candidate * DEPTH + depth] != frames[depth] { same = false }
+                    depth += 1
+                }
+                if same { place = candidate } else { at = (at + 1) & (PLACE_SLOTS - 1) }
+            }
+            if place == PLACES && place_count < PLACES {
+                place = place_count
+                place_count += 1
+                slots[at] = @intCast(u32, place + 1)
+                var depth: usize = 0
+                while depth < DEPTH {
+                    stacks[place * DEPTH + depth] = frames[depth]
+                    depth += 1
+                }
+                counts[place] = 0
+                sizes[place] = 0
+                pages[place] = 0
+                fresh[place] = 0
+                kept[place] = 0
+            }
+            if place == PLACES { place = PLACES - 1 }
+            const whole = std.page_allocator.footprint(record.*.address, record.*.length)
+            counts[place] += 1
+            sizes[place] += record.*.length
+            pages[place] += whole
+            var flag: usize = 0
+            if record.*.serial == 0 {
+                flag = 2
+            } else if debug.isNew(&state, record) {
+                flag = 1
+            }
+            if flag == 1 { fresh[place] += 1 }
+            if flag == 2 { kept[place] += 1 }
+            live_blocks += 1
+            live_bytes += record.*.length
+            mapped_bytes += whole
+            if block_lines < MAX_BLOCK_LINES && blocks_length + 96 < BLOCKS_SIZE {
+                diagnostics.put(blocks_out, &blocks_length, "block\t")
+                putHex(blocks_out, &blocks_length, record.*.address)
+                diagnostics.put(blocks_out, &blocks_length, "\t")
+                diagnostics.putNumber(blocks_out, &blocks_length, record.*.length)
+                diagnostics.put(blocks_out, &blocks_length, "\t")
+                diagnostics.putNumber(blocks_out, &blocks_length, place)
+                diagnostics.put(blocks_out, &blocks_length, "\t")
+                diagnostics.putNumber(blocks_out, &blocks_length, flag)
+                diagnostics.put(blocks_out, &blocks_length, "\t")
+                diagnostics.putNumber(blocks_out, &blocks_length, whole)
+                diagnostics.put(blocks_out, &blocks_length, "\n")
+                block_lines += 1
+            }
+        }
+        index += 1
+    }
+    const allocations = state.allocations
+    const frees = state.frees
+    const peak = state.peakBytes
+    debug.unlock(&state)
+
+    // The header.
+    var length: usize = 0
+    diagnostics.put(out, &length, "memory\t")
+    var name: [128]u8 = undefined
+    var name_bytes: [*]u8 = undefined
+    unsafe { name_bytes = @ptrCast([*]u8, &name) }
+    diagnostics.putBytes(out, &length, name_bytes, diagnostics.programName(name_bytes, 128))
+    diagnostics.put(out, &length, "\t")
+    diagnostics.putNumber(out, &length, @bitCast(usize, std.linux.syscall0(39)))
+    const numbers: [9]usize = [9]usize{ lastSnapshot, allocations, frees, live_blocks, live_bytes, mapped_bytes, peak, turns.used(arena), residentKiB() }
+    for number in numbers {
+        diagnostics.put(out, &length, "\t")
+        diagnostics.putNumber(out, &length, number)
+    }
+    diagnostics.put(out, &length, "\n")
+    // How full the tiny pages are.
+    var usage: std.tinypage_allocator.Usage = undefined
+    std.tinypage_allocator.usage(&usage)
+    diagnostics.put(out, &length, "tiny")
+    const tiny_numbers: [4]usize = [4]usize{ usage.pages, usage.blocks, usage.bytes, usage.empty }
+    for number in tiny_numbers {
+        diagnostics.put(out, &length, "\t")
+        diagnostics.putNumber(out, &length, number)
+    }
+    diagnostics.put(out, &length, "\n")
+    // The places, their functions named.
+    var place: usize = 0
+    while place < place_count && length + 16384 < OUT_SIZE {
+        diagnostics.put(out, &length, "place\t")
+        diagnostics.putNumber(out, &length, place)
+        const values: [5]usize = [5]usize{ counts[place], sizes[place], pages[place], fresh[place], kept[place] }
+        for value in values {
+            diagnostics.put(out, &length, "\t")
+            diagnostics.putNumber(out, &length, value)
+        }
+        var depth: usize = 0
+        while depth < DEPTH && stacks[place * DEPTH + depth] != 0 {
+            var start: usize = 0
+            const named = nameOf(stacks[place * DEPTH + depth], &start)
+            if named > 0 {
+                diagnostics.put(out, &length, "\t")
+                diagnostics.putBytes(out, &length, bytes(buffers + NAME_TEXT_AT + start), named)
+            }
+            depth += 1
+        }
+        diagnostics.put(out, &length, "\n")
+        place += 1
+    }
+    if diagnostics.gpuNoted() && length + 65536 < OUT_SIZE { length = gpuLines(out, length, blocks_out, &blocks_length) }
+    writeSnapshot(out, length, blocks_out, blocks_length)
+}
+
+// The functions of a GPU place, named.
+fn putFunctions(out: [*]u8, length: *usize, frames: [*]const usize) -> void {
+    var depth: usize = 0
+    while depth < diagnostics.GPU_DEPTH && frames[depth] != 0 {
+        var start: usize = 0
+        const named = nameOf(frames[depth], &start)
+        if named > 0 {
+            diagnostics.put(out, length, "\t")
+            diagnostics.putBytes(out, length, bytes(buffers + NAME_TEXT_AT + start), named)
+        }
+        depth += 1
+    }
+}
+
+// The GPU's memory (see the top): the device, its heaps and memory types,
+// its blocks grouped into places by the functions that asked.
+const GPU_PLACES: usize = 512
+
+fn gpuLines(out: [*]u8, at: usize, blocks_out: [*]u8, blocks_length: *usize) -> usize {
+    var length = at
+    var place_first: [512]usize = undefined
+    var place_blocks: [512]usize = undefined
+    var place_asked: [512]usize = undefined
+    var place_size: [512]usize = undefined
+    var place_count: usize = 0
+    var block: diagnostics.GpuBlock = undefined
+    var other: diagnostics.GpuBlock = undefined
+    diagnostics.gpuLock()
+    diagnostics.put(out, &length, "gpu\t")
+    diagnostics.put(out, &length, diagnostics.gpuDeviceName())
+    var which: usize = 2
+    while which < 7 {
+        if which != 3 {
+            diagnostics.put(out, &length, "\t")
+            diagnostics.putNumber(out, &length, diagnostics.gpuCount(which))
+        }
+        which += 1
+    }
+    diagnostics.put(out, &length, "\n")
+    var index: usize = 0
+    while index < diagnostics.gpuCount(0) {
+        diagnostics.put(out, &length, "gpu-heap\t")
+        diagnostics.putNumber(out, &length, index)
+        diagnostics.put(out, &length, "\t")
+        diagnostics.putNumber(out, &length, diagnostics.gpuHeapSize(index))
+        diagnostics.put(out, &length, "\t")
+        diagnostics.putNumber(out, &length, diagnostics.gpuHeapFlags(index))
+        diagnostics.put(out, &length, "\n")
+        index += 1
+    }
+    index = 0
+    while index < diagnostics.gpuCount(1) {
+        diagnostics.put(out, &length, "gpu-type\t")
+        diagnostics.putNumber(out, &length, index)
+        diagnostics.put(out, &length, "\t")
+        diagnostics.putNumber(out, &length, diagnostics.gpuTypeHeap(index))
+        diagnostics.put(out, &length, "\t")
+        diagnostics.putNumber(out, &length, diagnostics.gpuTypeFlags(index))
+        diagnostics.put(out, &length, "\n")
+        index += 1
+    }
+    // The blocks, each with the place of the first block asked for along
+    // the same functions.
+    var slot: usize = 0
+    while slot < diagnostics.gpuCount(3) {
+        if diagnostics.gpuBlock(slot, &block) {
+            var place: usize = 0
+            while place < place_count {
+                const found = diagnostics.gpuBlock(place_first[place], &other)
+                var same = true
+                var depth: usize = 0
+                while depth < diagnostics.GPU_DEPTH {
+                    if other.frames[depth] != block.frames[depth] { same = false }
+                    depth += 1
+                }
+                if same { break }
+                place += 1
+            }
+            if place == place_count && place_count < GPU_PLACES {
+                place_first[place] = slot
+                place_blocks[place] = 0
+                place_asked[place] = 0
+                place_size[place] = 0
+                place_count += 1
+            }
+            if place == GPU_PLACES { place = GPU_PLACES - 1 }
+            place_blocks[place] += 1
+            place_asked[place] += block.asked
+            place_size[place] += block.size
+            if blocks_length.* + 128 < BLOCKS_SIZE {
+                diagnostics.put(blocks_out, blocks_length, "gpu-block\t")
+                putHex(blocks_out, blocks_length, block.handle)
+                const values: [5]usize = [5]usize{ block.asked, block.size, block.memoryType, block.kind, place }
+                for value in values {
+                    diagnostics.put(blocks_out, blocks_length, "\t")
+                    diagnostics.putNumber(blocks_out, blocks_length, value)
+                }
+                diagnostics.put(blocks_out, blocks_length, "\n")
+            }
+        }
+        slot += 1
+    }
+    var place: usize = 0
+    while place < place_count && length + 4096 < OUT_SIZE {
+        diagnostics.put(out, &length, "gpu-place\t")
+        diagnostics.putNumber(out, &length, place)
+        const values: [3]usize = [3]usize{ place_blocks[place], place_asked[place], place_size[place] }
+        for value in values {
+            diagnostics.put(out, &length, "\t")
+            diagnostics.putNumber(out, &length, value)
+        }
+        const found = diagnostics.gpuBlock(place_first[place], &block)
+        putFunctions(out, &length, block.frames)
+        diagnostics.put(out, &length, "\n")
+        place += 1
+    }
+    gpuChanges = diagnostics.gpuCount(5) + diagnostics.gpuCount(6)
+    diagnostics.gpuUnlock()
+    return length
+}
+
+fn residentKiB() -> usize {
+    var text: [128]u8 = undefined
+    const file = std.linux.syscall3(2, @intFromPtr(@ptrCast([*]const u8, "/proc/self/statm")), 0, 0)
+    if file < 0 { return 0 }
+    const got = std.linux.syscall3(0, @bitCast(usize, file), @intFromPtr(&text), 127)
+    const closed = std.linux.syscall1(3, @bitCast(usize, file))
+    if got <= 0 { return 0 }
+    // size, then resident (pages).
+    var at: usize = 0
+    while at < @bitCast(usize, got) && text[at] != 32 { at += 1 }
+    at += 1
+    var pages: usize = 0
+    while at < @bitCast(usize, got) && text[at] >= 48 && text[at] <= 57 {
+        pages = pages * 10 + @intCast(usize, text[at] - 48)
+        at += 1
+    }
+    return pages * 4
+}
+
+// PATH.part: the header and places, the blocks, the mappings; then renamed
+// into place.
+fn writeSnapshot(out: [*]u8, length: usize, blocks_out: [*]u8, blocks_length: usize) -> void {
+    var path: [*]u8 = undefined
+    unsafe { path = @ptrCast([*]u8, &snapshotPath) }
+    var part = snapshotLength + 1
+    diagnostics.putBytes(path, &part, path, snapshotLength)
+    diagnostics.put(path, &part, ".part")
+    path[part] = 0
+    const file = std.linux.syscall3(2, @intFromPtr(path) + snapshotLength + 1, 577, 420)
+    if file < 0 { return }
+    const descriptor = @bitCast(usize, file)
+    var wrote = std.linux.syscall3(1, descriptor, @intFromPtr(out), length)
+    wrote = std.linux.syscall3(1, descriptor, @intFromPtr(blocks_out), blocks_length)
+    // The mappings, as map lines.
+    const maps = bytes(buffers + MAPS_AT)
+    const maps_file = std.linux.syscall3(2, @intFromPtr(@ptrCast([*]const u8, "/proc/self/maps")), 0, 0)
+    if maps_file >= 0 {
+        var got: usize = 0
+        while got < MAPS_SIZE / 2 {
+            const count = std.linux.syscall3(0, @bitCast(usize, maps_file), @intFromPtr(maps) + got, MAPS_SIZE / 2 - got)
+            if count <= 0 { break }
+            got += @bitCast(usize, count)
+        }
+        const closed = std.linux.syscall1(3, @bitCast(usize, maps_file))
+        const lines = bytes(buffers + MAPS_AT + MAPS_SIZE / 2)
+        var lines_length: usize = 0
+        var start: usize = 0
+        while start < got && lines_length + 4200 < MAPS_SIZE / 2 {
+            var end = start
+            while end < got && maps[end] != 10 { end += 1 }
+            // lo-hi perms offset device inode path
+            diagnostics.put(lines, &lines_length, "map\t")
+            var field: usize = 0
+            var at = start
+            while at < end && field < 2 {
+                if maps[at] == 45 && field == 0 {
+                    lines[lines_length] = 9
+                    lines_length += 1
+                } else if maps[at] == 32 {
+                    field += 1
+                    lines[lines_length] = 9
+                    lines_length += 1
+                } else {
+                    lines[lines_length] = maps[at]
+                    lines_length += 1
+                }
+                at += 1
+            }
+            // The permissions ended the second field; then skip offset,
+            // device and inode to the path.
+            var skipped: usize = 0
+            while at < end && skipped < 3 {
+                while at < end && maps[at] != 32 { at += 1 }
+                while at < end && maps[at] == 32 { at += 1 }
+                skipped += 1
+            }
+            diagnostics.putBytes(lines, &lines_length, bytes(@intFromPtr(maps) + at), end - at)
+            diagnostics.put(lines, &lines_length, "\n")
+            start = end + 1
+        }
+        wrote = std.linux.syscall3(1, descriptor, @intFromPtr(lines), lines_length)
+    }
+    const closed_file = std.linux.syscall1(3, descriptor)
+    const renamed = std.linux.syscall2(82, @intFromPtr(path) + snapshotLength + 1, @intFromPtr(path))
+}
+
+// Writes a snapshot now (tests; a program about to end).
+pub fn writeNow() -> void { snapshot() }

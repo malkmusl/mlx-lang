@@ -1,0 +1,298 @@
+// The keyboards: every /dev/input/eventN with letters and a space bar,
+// read without waiting (new ones are noticed on a rescan), or for tests
+// one file of struct input_event records (--keyboard FILE, a FIFO). Keys
+// go through the xkb keymap (--layout, else XKB_DEFAULT_*, compiled with
+// std.xkb.compile) by way of std.ui.wayland.keyboard's text logic, so the
+// console types what the layout says: Ctrl+C on any layout, AltGr's third
+// level, Caps Lock.
+const std = @import("std")
+const sys = @import("./sys.mlx")
+const xkb = @import("std.xkb")
+const xkb_compile = @import("std.xkb.compile")
+const keysym = @import("std.xkb.keysym")
+const keyboard_module = @import("std.ui.wayland.keyboard")
+const ui_keys = @import("std.ui.keys")
+
+const Allocator = std.allocator.Allocator
+
+pub const MAX_DEVICES: usize = 16
+const EV_KEY: u16 = 1
+const KEY_A: usize = 30
+const KEY_SPACE: usize = 57
+
+pub const Input = struct {
+    descriptors: [MAX_DEVICES]isize
+    numbers: [MAX_DEVICES]u32
+    count: usize
+    // One file of events instead of the devices.
+    fixed: bool
+    keyboard: keyboard_module.Keyboard
+    names: keysym.Names
+    keymap: usize
+    hasKeymap: bool
+    // The last pressed key's text, and its text without Ctrl and Alt.
+    text: [8]u8
+    textLength: usize
+    plain: [8]u8
+    plainLength: usize
+    buffer: [1536]u8
+    allocator: Allocator
+}
+
+// A key event of a device: an evdev code, down or up, or the kernel's
+// auto-repeat of a held key.
+pub const Key = struct {
+    code: u32
+    pressed: bool
+    repeat: bool
+}
+
+fn keyboardOf(input: *Input) -> *keyboard_module.Keyboard {
+    unsafe { return @ptrCast(*keyboard_module.Keyboard, &input.*.keyboard) }
+}
+
+fn namesOf(input: *Input) -> *keysym.Names {
+    unsafe { return @ptrCast(*keysym.Names, &input.*.names) }
+}
+
+pub fn init(input: *Input, allocator: Allocator) -> void {
+    input.*.count = 0
+    input.*.fixed = false
+    input.*.keymap = 0
+    input.*.hasKeymap = false
+    input.*.textLength = 0
+    input.*.plainLength = 0
+    input.*.allocator = allocator
+    keyboard_module.init(keyboardOf(input), allocator)
+}
+
+// The keymap: `layout` (with `variant`, `model`, `options`) when given,
+// else the XKB_DEFAULT_* variables (us without them). False, with the
+// compiler's word on stderr, when the XKB data is missing: keys then
+// follow a US layout with Shift and Caps Lock.
+pub fn loadKeymap(input: *Input, environment: [*][*]const u8, layout: []const u8, variant: []const u8, model: []const u8, options: []const u8) -> bool {
+    if !keysym.init(namesOf(input), input.*.allocator) {
+        sys.say("no keysym names; keys follow a US layout")
+        return false
+    }
+    const keymap = xkb.create(input.*.allocator, namesOf(input))
+    var compiler: xkb_compile.Compiler = undefined
+    xkb_compile.init(&compiler, input.*.allocator, namesOf(input), environment)
+    var compiled = false
+    if layout.length > 0 {
+        compiled = xkb_compile.fromNames(&compiler, keymap, "", model, layout, variant, options)
+    } else {
+        compiled = xkb_compile.fromEnvironment(&compiler, keymap, environment)
+    }
+    if !compiled {
+        sys.sayAbout("no xkb keymap, keys follow a US layout: ", xkb_compile.message(&compiler))
+        return false
+    }
+    input.*.keymap = @intFromPtr(keymap)
+    input.*.hasKeymap = true
+    keyboard_module.useKeymap(keyboardOf(input), keymap)
+    return true
+}
+
+// One file of events instead of the devices (opened for writing too, so a
+// FIFO stays readable while no writer is there).
+pub fn useFile(input: *Input, path: [*]const u8) -> bool {
+    const descriptor = sys.open(path, sys.O_RDWR | sys.O_NONBLOCK | sys.O_CLOEXEC, 0)
+    if descriptor < 0 {
+        sys.sayAbout("cannot open the keyboard file ", std.text.cString(path))
+        return false
+    }
+    input.*.descriptors[0] = descriptor
+    input.*.numbers[0] = 0
+    input.*.count = 1
+    input.*.fixed = true
+    return true
+}
+
+fn known(input: *Input, number: u32) -> bool {
+    var index: usize = 0
+    while index < input.*.count {
+        if input.*.numbers[index] == number { return true }
+        index += 1
+    }
+    return false
+}
+
+fn hasBit(bits: [*]const u8, bit: usize) -> bool {
+    return (bits[bit / 8] >> @intCast(u8, bit % 8)) & 1 != 0
+}
+
+// EVIOCGBIT(kind, size): _IOC(_IOC_READ, 'E', 0x20 + kind, size).
+fn bitsRequest(kind: usize, size: usize) -> usize { return 2147483648 + size * 65536 + 17664 + 32 + kind }
+
+// Opens /dev/input/NAME when it is a keyboard (EV_KEY with letters and a
+// space bar); a mouse or a power button is left alone.
+fn tryOpen(input: *Input, name: []const u8, number: u32) -> void {
+    var path: [64]u8 = undefined
+    var path_bytes: [*]u8 = undefined
+    unsafe { path_bytes = @ptrCast([*]u8, &path) }
+    var length = std.text.append(path_bytes, 0, 63, "/dev/input/")
+    length = std.text.append(path_bytes, length, 63, name)
+    path[length] = 0
+    const descriptor = sys.open(path_bytes, sys.O_RDONLY | sys.O_NONBLOCK | sys.O_CLOEXEC, 0)
+    if descriptor < 0 { return }
+    var bits: [96]u8 = undefined
+    var bits_bytes: [*]u8 = undefined
+    unsafe { bits_bytes = @ptrCast([*]u8, &bits) }
+    sys.zero(bits_bytes, 96)
+    var keyboard = false
+    if sys.ioctlBytes(descriptor, bitsRequest(0, 8), bits_bytes) >= 0 && hasBit(bits_bytes, 1) {
+        sys.zero(bits_bytes, 96)
+        if sys.ioctlBytes(descriptor, bitsRequest(1, 96), bits_bytes) >= 0 {
+            keyboard = hasBit(bits_bytes, KEY_A) && hasBit(bits_bytes, KEY_SPACE)
+        }
+    }
+    if !keyboard {
+        sys.close(descriptor)
+        return
+    }
+    input.*.descriptors[input.*.count] = descriptor
+    input.*.numbers[input.*.count] = number
+    input.*.count += 1
+}
+
+// Opens the keyboards among /dev/input/eventN not open yet; how many
+// devices are open now.
+pub fn scan(input: *Input) -> usize {
+    if input.*.fixed { return input.*.count }
+    var directory_path: [*]const u8 = undefined
+    unsafe { directory_path = @ptrCast([*]const u8, "/dev/input") }
+    const directory = sys.open(directory_path, sys.O_RDONLY | sys.O_DIRECTORY | sys.O_CLOEXEC, 0)
+    if directory < 0 { return input.*.count }
+    var entries: [4096]u8 = undefined
+    var bytes: [*]u8 = undefined
+    unsafe { bytes = @ptrCast([*]u8, &entries) }
+    var more = true
+    while more {
+        const got = sys.getdents(directory, bytes, 4096)
+        if got <= 0 {
+            more = false
+        } else {
+            // struct linux_dirent64: d_ino (8), d_off (8), d_reclen (2),
+            // d_type (1), then the name.
+            var at: usize = 0
+            while at + 19 < @bitCast(usize, got) {
+                const record_length = @intCast(usize, sys.load16(bytes, at + 16))
+                if record_length == 0 { break }
+                var name_pointer: [*]const u8 = undefined
+                unsafe { name_pointer = @ptrFromInt([*]const u8, @intFromPtr(bytes) + at + 19) }
+                const name = std.text.cString(name_pointer)
+                if name.length > 5 && std.text.same(name[0..5], "event") {
+                    var number: u32 = 0
+                    var numeric = true
+                    for byte in name[5..name.length] {
+                        if byte < 48 || byte > 57 { numeric = false } else { number = number * 10 + @intCast(u32, byte - 48) }
+                    }
+                    if numeric && !known(input, number) && input.*.count < MAX_DEVICES { tryOpen(input, name, number) }
+                }
+                at += record_length
+            }
+        }
+    }
+    sys.close(directory)
+    return input.*.count
+}
+
+pub fn descriptor(input: *Input, index: usize) -> isize { return input.*.descriptors[index] }
+
+fn drop(input: *Input, index: usize) -> void {
+    sys.close(input.*.descriptors[index])
+    var at = index
+    while at + 1 < input.*.count {
+        input.*.descriptors[at] = input.*.descriptors[at + 1]
+        input.*.numbers[at] = input.*.numbers[at + 1]
+        at += 1
+    }
+    input.*.count -= 1
+}
+
+// Reads device `index`: up to `capacity` keys into `keys`; -1 when the
+// device is gone (closed and dropped), else how many keys came.
+pub fn read(input: *Input, index: usize, keys: [*]Key, capacity: usize) -> isize {
+    var bytes: [*]u8 = undefined
+    unsafe { bytes = @ptrCast([*]u8, &input.*.buffer) }
+    var count: usize = 0
+    while count < capacity {
+        const got = sys.read(input.*.descriptors[index], bytes, 1536)
+        if got == sys.EAGAIN || got == sys.EINTR { return @intCast(isize, count) }
+        if got <= 0 {
+            drop(input, index)
+            return -1
+        }
+        // struct input_event: time (16), type (2), code (2), value (4).
+        var at: usize = 0
+        while at + 24 <= @bitCast(usize, got) {
+            const kind = sys.load16(bytes, at + 16)
+            const code = sys.load16(bytes, at + 18)
+            const value = sys.loadInt(bytes, at + 20)
+            if kind == EV_KEY && code < 256 && count < capacity {
+                keys[count].code = @intCast(u32, code)
+                keys[count].pressed = value != 0
+                keys[count].repeat = value == 2
+                count += 1
+            }
+            at += 24
+        }
+        if @bitCast(usize, got) < 1536 { return @intCast(isize, count) }
+    }
+    return @intCast(isize, count)
+}
+
+// A key went down, up or repeats: the keymap's state follows (not for a
+// repeat), and for a press the text the key types now and the text it
+// types without Ctrl and Alt are kept (textOf, plainTextOf).
+pub fn press(input: *Input, code: u32, pressed: bool, repeat: bool) -> void {
+    const keyboard = keyboardOf(input)
+    if !repeat { keyboard_module.press(keyboard, code, pressed) }
+    input.*.textLength = 0
+    input.*.plainLength = 0
+    if !pressed { return }
+    var text_bytes: [*]u8 = undefined
+    var plain_bytes: [*]u8 = undefined
+    unsafe {
+        text_bytes = @ptrCast([*]u8, &input.*.text)
+        plain_bytes = @ptrCast([*]u8, &input.*.plain)
+    }
+    input.*.textLength = keyboard_module.text(keyboard, code, text_bytes)
+    input.*.plainLength = keyboard_module.plainText(keyboard, code, plain_bytes)
+}
+
+pub fn textOf(input: *Input) -> []const u8 {
+    var bytes: [*]const u8 = undefined
+    unsafe { bytes = @ptrCast([*]const u8, &input.*.text) }
+    return bytes[0..input.*.textLength]
+}
+
+pub fn plainTextOf(input: *Input) -> []const u8 {
+    var bytes: [*]const u8 = undefined
+    unsafe { bytes = @ptrCast([*]const u8, &input.*.plain) }
+    return bytes[0..input.*.plainLength]
+}
+
+// The modifiers held (std.ui.keys), as std.ui.host reports them: not Ctrl
+// and Alt while the key types its third level.
+pub fn modifiers(input: *Input) -> u32 {
+    const keyboard = keyboardOf(input)
+    const held = keyboard.*.depressed
+    var result: u32 = 0
+    if held & xkb.SHIFT != 0 { result |= ui_keys.SHIFT }
+    if held & xkb.CONTROL != 0 { result |= ui_keys.CONTROL }
+    if held & keyboard.*.altMask != 0 { result |= ui_keys.ALT }
+    if held & xkb.MOD4 != 0 { result |= ui_keys.SUPER }
+    if keyboard.*.levelThree && input.*.textLength > 0 { result &= ~(ui_keys.CONTROL | ui_keys.ALT) }
+    return result
+}
+
+pub fn close(input: *Input) -> void {
+    var index: usize = 0
+    while index < input.*.count {
+        sys.close(input.*.descriptors[index])
+        index += 1
+    }
+    input.*.count = 0
+}

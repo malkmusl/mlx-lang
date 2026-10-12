@@ -82,9 +82,12 @@ Build all utilities with the self-hosted compiler:
 ./projects/coreutils/benchmark.sh
 ```
 
-The build script defaults to the converged self-hosted compiler at
-`mlx-out/bin/compiler/mlx4` and writes the utilities to
-`mlx-out/bin/coreutils`. It never invokes the bootstrap compiler.
+The build script runs `./mlx build coreutils` (build.mlx's coreutils
+group), which builds a utility only when a module it reads changed, with
+the converged self-hosted compiler `mlx-out/bin/compiler/mlx4`, into
+`mlx-out/bin/coreutils`. Given a compiler (an argument or `MLX_COMPILER`)
+or another directory (`MLX_COREUTILS_BIN_DIR`) it compiles every utility
+with that compiler instead. It never invokes the bootstrap compiler.
 The benchmark creates a 128 MiB text workload when no fixture is supplied and
 compares every hot path directly with the installed GNU utility.
 

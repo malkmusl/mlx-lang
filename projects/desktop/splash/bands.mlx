@@ -1,0 +1,411 @@
+// A frame drawn in bands by several threads: what the scene recorded is
+// sorted by the rows it reaches into bands of BAND_ROWS rows, and each
+// band is drawn on its own, clipped to its rows, by whichever thread takes
+// it next: the caller and the crew, up to seven more (a 4K frame on four
+// cores in about a third of the time). Light adds up the same in any
+// order, and what is laid over (the letters, text) keeps its place in a
+// band's list, so a band looks as if drawn whole.
+//
+// A band first puts back from the backdrop the tiles the last frame drew
+// on in it, and marks the tiles this frame draws on: the next frame puts
+// back only those, the output copies only those.
+const std = @import("std")
+const paint = @import("./paint.mlx")
+const state = @import("./state.mlx")
+const logo_module = @import("./logo.mlx")
+const status_module = @import("./status.mlx")
+const captions = @import("./captions.mlx")
+
+const linux = std.linux
+const thread = std.linux.thread
+const Allocator = std.allocator.Allocator
+const Scene = state.Scene
+const Crew = state.Crew
+const Surface = paint.Surface
+
+const BAND_ROWS = state.BAND_ROWS
+// A crew thread's stack (only touched as far as it is used).
+const STACK_SIZE: usize = 1048576
+const MAX_THREADS: usize = 7
+const LOW_HALF: u64 = 4294967295
+// Commands a band's list has room for at first (it grows).
+const FIRST_ROOM: usize = 2048
+
+// The bands' lists and surfaces, for a scene of its size; false without
+// memory.
+pub fn prepare(scene: *Scene) -> bool {
+    const count = (scene.*.height + BAND_ROWS - 1) / BAND_ROWS
+    scene.*.bandCount = count
+    const allocator = scene.*.allocator
+    const lists = allocator.alloc(count * 8, 8)
+    const counts = allocator.alloc(count * 4, 4)
+    const rooms = allocator.alloc(count * 4, 4)
+    const costs = allocator.alloc(count * 8, 8)
+    const order = allocator.alloc(count * 4, 4)
+    const surfaces = allocator.alloc(count * @sizeOf(Surface), 16)
+    if lists == null || counts == null || rooms == null || costs == null || order == null || surfaces == null { return false }
+    unsafe {
+        scene.*.bandLists = @ptrCast([*]usize, lists.?)
+        scene.*.bandCounts = @ptrCast([*]u32, counts.?)
+        scene.*.bandRooms = @ptrCast([*]u32, rooms.?)
+        scene.*.bandCosts = @ptrCast([*]u64, costs.?)
+        scene.*.bandOrder = @ptrCast([*]u32, order.?)
+        scene.*.bandSurfaces = @ptrCast([*]Surface, surfaces.?)
+    }
+    var band: usize = 0
+    while band < count {
+        const list = allocator.alloc(FIRST_ROOM * 4, 4)
+        if list == null { return false }
+        scene.*.bandLists[band] = @intFromPtr(list.?)
+        scene.*.bandRooms[band] = @intCast(u32, FIRST_ROOM)
+        scene.*.bandCounts[band] = 0
+        band += 1
+    }
+    return paint.initRecording(&scene.*.recording, allocator)
+}
+
+// ---------------------------------------------------------------------------
+// The crew
+
+// Starts `threads` threads (as many as there is memory and leave for);
+// they wait until a frame is drawn.
+pub fn start(crew: *Crew, threads: usize, allocator: Allocator) -> void {
+    crew.*.threads = 0
+    crew.*.generation = 0
+    crew.*.next = 0
+    crew.*.remaining = 0
+    crew.*.bands = 0
+    crew.*.scene = 0
+    const wanted = if threads > MAX_THREADS { MAX_THREADS } else { threads }
+    while crew.*.threads < wanted {
+        const stack = allocator.alloc(STACK_SIZE, 4096)
+        if stack == null { return }
+        const top = @intFromPtr(stack.?) + STACK_SIZE
+        const started = @spawnThread(thread.THREAD_CLONE_FLAGS, top, 0, 0, 0, worker, @intFromPtr(crew))
+        if started <= 0 {
+            allocator.free(stack.?, STACK_SIZE, 4096)
+            return
+        }
+        crew.*.threads += 1
+    }
+}
+
+// The threads to start when not told: one for each processor besides the
+// caller's.
+pub fn defaultThreads() -> usize {
+    const processors = linux.system.availableProcessorCount()
+    return if processors > 1 { processors - 1 } else { 0 }
+}
+
+fn worker(argument: usize) -> usize {
+    var crew: *Crew = undefined
+    unsafe { crew = @ptrFromInt(*Crew, argument) }
+    // Signals are the caller's to take (the daemon reads them from a
+    // signalfd): one delivered here would end the program untidily.
+    var all: u64 = 18446744073709551615
+    const blocked = linux.syscall4(14, 0, @intFromPtr(&all), 0, 8)
+    // The boot's own work comes first (nice 10, this thread alone): a band
+    // a busy machine does not get to, the caller draws.
+    const niced = linux.syscall3(141, 0, 0, 10)
+    var seen: u32 = 0
+    while true {
+        var generation = @atomicLoad(u32, &crew.*.generation, acquire)
+        while generation == seen {
+            const waited = thread.futexWait(&crew.*.generation, seen, 0, true)
+            generation = @atomicLoad(u32, &crew.*.generation, acquire)
+        }
+        seen = generation
+        work(crew, generation)
+    }
+    return 0
+}
+
+// Takes the frame's bands one at a time until none is left. A thread that
+// woke late for a frame already done finds the next one's generation in
+// `next` and takes nothing.
+fn work(crew: *Crew, generation: u32) -> void {
+    while true {
+        const taken = @atomicLoad(u64, &crew.*.next, acquire)
+        if (taken >> 32) != @intCast(u64, generation) || (taken & LOW_HALF) >= @intCast(u64, crew.*.bands) { return }
+        const swapped = @cmpxchgWeak(u64, &crew.*.next, taken, taken + 1, acq_rel, acquire)
+        if swapped.0 {
+            var scene: *Scene = undefined
+            unsafe { scene = @ptrFromInt(*Scene, crew.*.scene) }
+            drawBand(scene, @intCast(usize, scene.*.bandOrder[@intCast(usize, taken & LOW_HALF)]))
+            const left = @atomicRmw(u32, &crew.*.remaining, sub, 1, acq_rel)
+            if left == 1 { const woken = thread.futexWake(&crew.*.remaining, 1, true) }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// A frame
+
+// Draws what the scene recorded (scene.drawWhole and drawBrightness say
+// how) into its frame, in bands, with the crew.
+pub fn draw(scene: *Scene) -> void {
+    sort(scene)
+    const crew = scene.*.crew
+    if crew.*.threads == 0 {
+        var band: usize = 0
+        while band < scene.*.bandCount {
+            drawBand(scene, band)
+            band += 1
+        }
+        return
+    }
+    crew.*.scene = @intFromPtr(scene)
+    crew.*.bands = @intCast(u32, scene.*.bandCount)
+    const generation = crew.*.generation + 1
+    @atomicStore(u32, &crew.*.remaining, @intCast(u32, scene.*.bandCount), release)
+    @atomicStore(u64, &crew.*.next, @intCast(u64, generation) << 32, release)
+    @atomicStore(u32, &crew.*.generation, generation, release)
+    const woken = thread.futexWake(&crew.*.generation, 2147483647, true)
+    work(crew, generation)
+    while true {
+        const left = @atomicLoad(u32, &crew.*.remaining, acquire)
+        if left == 0 { break }
+        const waited = thread.futexWait(&crew.*.remaining, left, 0, true)
+    }
+}
+
+// The bands a command's rows fall in.
+fn firstBand(scene: *Scene, command: *const paint.Command) -> usize {
+    return if command.*.top < 0 { 0 } else { @intCast(usize, command.*.top) / BAND_ROWS }
+}
+
+fn lastBand(scene: *Scene, command: *const paint.Command) -> usize {
+    const last = scene.*.bandCount - 1
+    if command.*.bottom < 0 { return 0 }
+    const band = @intCast(usize, command.*.bottom) / BAND_ROWS
+    return if band > last { last } else { band }
+}
+
+// Each band's commands in the order they were recorded, what drawing
+// them takes, and the order the bands are taken in: the longest first, so
+// no thread is left with a long one at the end.
+fn sort(scene: *Scene) -> void {
+    const count = scene.*.bandCount
+    var band: usize = 0
+    while band < count {
+        scene.*.bandCounts[band] = 0
+        scene.*.bandCosts[band] = 0
+        band += 1
+    }
+    const commands = scene.*.recording.commands
+    var index: usize = 0
+    while index < scene.*.recording.count {
+        const command = &commands[index]
+        const cost = costOf(scene, command)
+        band = firstBand(scene, command)
+        const last = lastBand(scene, command)
+        while band <= last {
+            if scene.*.bandCounts[band] < scene.*.bandRooms[band] || grow(scene, band) {
+                var list: [*]u32 = undefined
+                unsafe { list = @ptrFromInt([*]u32, scene.*.bandLists[band]) }
+                list[scene.*.bandCounts[band]] = @intCast(u32, index)
+                scene.*.bandCounts[band] += 1
+                scene.*.bandCosts[band] += cost
+            }
+            band += 1
+        }
+        index += 1
+    }
+    // Insertion sort: a few dozen bands.
+    band = 0
+    while band < count {
+        var at = band
+        while at > 0 && scene.*.bandCosts[scene.*.bandOrder[at - 1]] < scene.*.bandCosts[band] {
+            scene.*.bandOrder[at] = scene.*.bandOrder[at - 1]
+            at -= 1
+        }
+        scene.*.bandOrder[at] = @intCast(u32, band)
+        band += 1
+    }
+}
+
+// Twice the room in a band's list; false without memory (the command is
+// left out of that band).
+fn grow(scene: *Scene, band: usize) -> bool {
+    const room = @intCast(usize, scene.*.bandRooms[band])
+    const memory = scene.*.allocator.alloc(room * 8, 4)
+    if memory == null { return false }
+    paint.copyBytes(@intFromPtr(memory.?), scene.*.bandLists[band], room * 4)
+    var old: [*]u8 = undefined
+    unsafe { old = @ptrFromInt([*]u8, scene.*.bandLists[band]) }
+    scene.*.allocator.free(old, room * 4, 4)
+    scene.*.bandLists[band] = @intFromPtr(memory.?)
+    scene.*.bandRooms[band] = @intCast(u32, room * 2)
+    return true
+}
+
+// About how many pixels a command touches in a band.
+fn costOf(scene: *Scene, command: *const paint.Command) -> u64 {
+    const kind = command.*.kind
+    if kind == paint.SPARK { return 4 }
+    if kind == paint.GLOW {
+        var sprite: *const paint.Sprite = undefined
+        unsafe { sprite = @ptrFromInt(*const paint.Sprite, command.*.item) }
+        return @intCast(u64, sprite.*.size * sprite.*.size)
+    }
+    if kind == paint.LINE { return 64 }
+    if kind == state.LETTERS || kind == state.LOGO_GLOW { return @intCast(u64, scene.*.logo.width * BAND_ROWS / 2) }
+    if kind == state.BAR { return @intCast(u64, scene.*.barColumns * scene.*.barRows * 2) }
+    return @intCast(u64, scene.*.captions[command.*.item].width * 32)
+}
+
+// One band: the backdrop back where the last frame drew (or all of it),
+// the band's commands clipped to its rows within the region, then dimmed
+// while fading.
+fn drawBand(scene: *Scene, band: usize) -> void {
+    const top = band * BAND_ROWS
+    const bottom = if top + BAND_ROWS > scene.*.height { scene.*.height } else { top + BAND_ROWS }
+    const columns = scene.*.tileColumns
+    const first_tile_row = top >> @intCast(usize, paint.TILE_SHIFT)
+    const end_tile_row = (bottom + @intCast(usize, paint.TILE) - 1) >> @intCast(usize, paint.TILE_SHIFT)
+    const current = state.marksOf(scene, scene.*.frameNumber)
+    if scene.*.drawWhole {
+        paint.copyRect(&scene.*.frame, &scene.*.backdrop, 0, top, scene.*.width, bottom - top)
+        var at = first_tile_row * columns
+        while at < end_tile_row * columns {
+            current[at] = 1
+            at += 1
+        }
+    } else {
+        const previous = state.marksOf(scene, scene.*.frameNumber - 1)
+        var tile_row = first_tile_row
+        while tile_row < end_tile_row {
+            restoreRow(scene, previous, tile_row, top, bottom)
+            var at = tile_row * columns
+            while at < (tile_row + 1) * columns {
+                current[at] = 0
+                at += 1
+            }
+            tile_row += 1
+        }
+    }
+
+    const surface = &scene.*.bandSurfaces[band]
+    surface.*.pixels = scene.*.frame.pixels
+    surface.*.width = scene.*.width
+    surface.*.height = scene.*.height
+    surface.*.stride = scene.*.frame.stride
+    const region_top = @intCast(i64, scene.*.regionY)
+    const region_bottom = @intCast(i64, scene.*.regionY + scene.*.regionHeight)
+    surface.*.clipLeft = @intCast(i64, scene.*.regionX)
+    surface.*.clipRight = @intCast(i64, scene.*.regionX + scene.*.regionWidth)
+    surface.*.clipTop = if @intCast(i64, top) > region_top { @intCast(i64, top) } else { region_top }
+    surface.*.clipBottom = if @intCast(i64, bottom) < region_bottom { @intCast(i64, bottom) } else { region_bottom }
+    surface.*.marks = current
+    surface.*.tileColumns = columns
+    surface.*.marking = true
+    surface.*.recording = 0
+    if surface.*.clipTop < surface.*.clipBottom {
+        var list: [*]u32 = undefined
+        unsafe { list = @ptrFromInt([*]u32, scene.*.bandLists[band]) }
+        var item: u32 = 0
+        while item < scene.*.bandCounts[band] {
+            run(scene, surface, &scene.*.recording.commands[list[item]])
+            item += 1
+        }
+    }
+    if scene.*.drawBrightness < 1.0 { fade(scene, top, bottom) }
+    if scene.*.targetAddress != 0 { copyBand(scene, current, top, bottom) }
+}
+
+// The band's rows into the target buffer (output.aim) while they are
+// still in the cache: the tiles this frame or the buffer's drew on, runs
+// of neighbouring tiles a copy each, or all of them.
+fn copyBand(scene: *Scene, current: [*]u8, top: usize, bottom: usize) -> void {
+    const frame = &scene.*.frame
+    if scene.*.targetWhole {
+        paint.copyOut(frame, scene.*.targetAddress, scene.*.targetPitch, 0, top, scene.*.width, bottom - top, scene.*.targetSwap)
+        return
+    }
+    const old = state.marksOf(scene, scene.*.targetHeld)
+    const columns = scene.*.tileColumns
+    const tile = @intCast(usize, paint.TILE)
+    var tile_row = top / tile
+    while tile_row * tile < bottom {
+        const row_top = tile_row * tile
+        const row_bottom = if row_top + tile > bottom { bottom } else { row_top + tile }
+        const base = tile_row * columns
+        var column: usize = 0
+        while column < columns {
+            if (current[base + column] | old[base + column]) == 0 {
+                column += 1
+            } else {
+                const first = column
+                while column < columns && (current[base + column] | old[base + column]) != 0 { column += 1 }
+                const left = first * tile
+                const right = if column * tile > scene.*.width { scene.*.width } else { column * tile }
+                paint.copyOut(frame, scene.*.targetAddress, scene.*.targetPitch, left, row_top, right - left, row_bottom - row_top, scene.*.targetSwap)
+            }
+        }
+        tile_row += 1
+    }
+}
+
+// The tiles of one row the last frame drew on, from the backdrop: runs of
+// neighbouring tiles a copy each.
+fn restoreRow(scene: *Scene, previous: [*]u8, tile_row: usize, top: usize, bottom: usize) -> void {
+    const columns = scene.*.tileColumns
+    const tile = @intCast(usize, paint.TILE)
+    const row_top = tile_row * tile
+    const row_bottom = if row_top + tile > bottom { bottom } else { row_top + tile }
+    const base = tile_row * columns
+    var column: usize = 0
+    while column < columns {
+        if previous[base + column] == 0 {
+            column += 1
+        } else {
+            const first = column
+            while column < columns && previous[base + column] != 0 { column += 1 }
+            const left = first * tile
+            const right = if column * tile > scene.*.width { scene.*.width } else { column * tile }
+            paint.copyRect(&scene.*.frame, &scene.*.backdrop, left, row_top, right - left, row_bottom - row_top)
+        }
+    }
+}
+
+// One recorded command, drawn on a band's surface.
+fn run(scene: *Scene, surface: *Surface, command: *const paint.Command) -> void {
+    const kind = command.*.kind
+    if kind == paint.SPARK {
+        paint.spark(surface, command.*.x, command.*.y, command.*.colour, command.*.strength)
+    } else if kind == paint.GLOW {
+        var sprite: *const paint.Sprite = undefined
+        unsafe { sprite = @ptrFromInt(*const paint.Sprite, command.*.item) }
+        if command.*.tint != 0 {
+            paint.glowTinted(surface, sprite, command.*.tint, command.*.x, command.*.y)
+        } else {
+            paint.glow(surface, sprite, command.*.x, command.*.y, command.*.colour, command.*.strength)
+        }
+    } else if kind == paint.LINE {
+        paint.line(surface, command.*.x, command.*.y, command.*.x1, command.*.y1, command.*.colour, command.*.strength)
+    } else if kind == state.LETTERS {
+        logo_module.drawLetters(surface, &scene.*.logo, scene.*.logoX, scene.*.logoY, command.*.strength)
+    } else if kind == state.LOGO_GLOW {
+        logo_module.addGlow(surface, &scene.*.logo, scene.*.logoX, scene.*.logoY, command.*.colour)
+    } else if kind == state.BAR {
+        status_module.drawBar(scene, surface, command.*.x, command.*.strength)
+    } else if kind == state.TEXT {
+        captions.blit(surface, &scene.*.captions[command.*.item], paint.toInt(command.*.x), paint.toInt(command.*.y), command.*.colour)
+    }
+}
+
+// Rows `top` to `bottom` of the frame at drawBrightness.
+fn fade(scene: *Scene, top: usize, bottom: usize) -> void {
+    const k = paint.weight(scene.*.drawBrightness)
+    const pixels = scene.*.frame.pixels
+    var row = top
+    while row < bottom {
+        var at = row * scene.*.frame.stride
+        const end = at + scene.*.width
+        while at < end {
+            pixels[at] = paint.OPAQUE | paint.scale(pixels[at], k)
+            at += 1
+        }
+        row += 1
+    }
+}

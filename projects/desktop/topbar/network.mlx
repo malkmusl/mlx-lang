@@ -1,0 +1,243 @@
+// The control centre's network: mlx-netd (projects/network) on the system
+// bus, asked when the popup opens and every second while it is open
+// (Devices, Networks), with blocking calls (the bus is local and mlx-netd
+// answers at once). Without mlx-netd the tile reads /sys/class/net as
+// before (control.mlx).
+//
+// The network tile opens a list under the tiles: the Wi-Fi networks in
+// sight (the joined one first), each with its signal, a lock when it
+// needs a passphrase and a check when it is joined; a click joins an open
+// or saved one (Connect), and opens mlx-settings' Network page with the
+// network chosen when it needs a passphrase first (or is not supported);
+// the last row opens the Network page itself.
+const std = @import("std")
+const dbus = @import("std.dbus")
+const state = @import("./state.mlx")
+const apps_module = @import("../shared/apps.mlx")
+
+const Bar = state.Bar
+
+const NAME: []const u8 = "org.mlx.Network"
+const PATH: []const u8 = "/org/mlx/Network"
+// How long a call may take (milliseconds).
+const WAIT: isize = 300
+
+pub const SECURITY_OPEN: u32 = 0
+pub const SECURITY_WPA2: u32 = 1
+pub const SECURITY_OTHER: u32 = 2
+
+// What control.mlx's tile shows (the same values as its NET_*).
+const NET_NONE: u32 = 0
+const NET_WIRED: u32 = 1
+const NET_WIRELESS: u32 = 2
+
+fn clientOf(bar: *Bar) -> *dbus.Client {
+    unsafe { return @ptrFromInt(*dbus.Client, bar.*.netClient) }
+}
+
+pub fn init(bar: *Bar) -> void {
+    bar.*.netClient = 0
+    bar.*.netKnown = false
+    bar.*.netConnecting = false
+    state.labelClear(&bar.*.netJoining)
+    bar.*.hasWifi = false
+    bar.*.wifiCount = 0
+    bar.*.netListOpen = false
+    bar.*.netListAt = 0
+    bar.*.netClosingAt = 0
+}
+
+// The system bus's socket: DBUS_SYSTEM_BUS_ADDRESS's unix:path=, else
+// MLXIPC's system bus, /run/mlx/bus.
+fn busPath(bar: *Bar) -> []const u8 {
+    const value = apps_module.environmentValue(bar.*.environment, "DBUS_SYSTEM_BUS_ADDRESS")
+    if @intFromPtr(value) != 0 {
+        var length: usize = 0
+        while value[length] != 0 { length += 1 }
+        const address = value[0..length]
+        if length > 10 && state.same(address[0..10], "unix:path=") {
+            var stop: usize = 10
+            while stop < length && address[stop] != 44 { stop += 1 }
+            return address[10..stop]
+        }
+    }
+    return "/run/mlx/bus"
+}
+
+fn disconnect(bar: *Bar) -> void {
+    if bar.*.netClient == 0 { return }
+    dbus.disconnect(clientOf(bar), bar.*.allocator)
+    var memory: [*]u8 = undefined
+    unsafe { memory = @ptrFromInt([*]u8, bar.*.netClient) }
+    bar.*.allocator.free(memory, @sizeOf(dbus.Client), 16)
+    bar.*.netClient = 0
+}
+
+fn connect(bar: *Bar) -> bool {
+    if bar.*.netClient != 0 && !clientOf(bar).*.closed { return true }
+    disconnect(bar)
+    const memory = bar.*.allocator.alloc(@sizeOf(dbus.Client), 16)
+    if memory == null { return false }
+    bar.*.netClient = @intFromPtr(memory.?)
+    if !dbus.connectClient(clientOf(bar), bar.*.allocator, busPath(bar)) {
+        bar.*.allocator.free(memory.?, @sizeOf(dbus.Client), 16)
+        bar.*.netClient = 0
+        return false
+    }
+    return true
+}
+
+fn noBody() -> [*]const u8 {
+    unsafe { return @ptrCast([*]const u8, "") }
+}
+
+// A call and its reply; false when none came (or an error did).
+fn call(bar: *Bar, member: []const u8, signature: []const u8, body: [*]const u8, length: usize, reply: *dbus.Header) -> bool {
+    const client = clientOf(bar)
+    const serial = dbus.call(client, NAME, PATH, NAME, member, signature, body, length)
+    if serial == 0 || !dbus.waitReply(client, serial, reply, WAIT) { return false }
+    return reply.*.kind != dbus.ERROR
+}
+
+// Asks mlx-netd what is connected and what it sees; false when it does
+// not answer (control.mlx reads /sys/class/net then).
+pub fn refresh(bar: *Bar) -> bool {
+    if !connect(bar) {
+        bar.*.netKnown = false
+        return false
+    }
+    var reply: dbus.Header = undefined
+    if !call(bar, "Devices", "", noBody(), 0, &reply) {
+        bar.*.netKnown = false
+        disconnect(bar)
+        return false
+    }
+    bar.*.netKnown = true
+    const client = clientOf(bar)
+    var reading = dbus.reader(dbus.bodyOf(client, &reply), reply.bodyLength, reply.big)
+    // What the tile shows: a connected cable before Wi-Fi, then a Wi-Fi
+    // network being joined (the list shows that one joining either way).
+    bar.*.netKind = NET_NONE
+    bar.*.netConnecting = false
+    state.labelClear(&bar.*.netJoining)
+    bar.*.hasWifi = false
+    state.labelClear(&bar.*.netName)
+    var length = @intCast(usize, dbus.readU32(&reading))
+    dbus.alignTo(&reading, 8)
+    var end = reading.position + length
+    while reading.position < end && !reading.failed {
+        dbus.alignTo(&reading, 8)
+        const name = dbus.readString(&reading)
+        const kind = dbus.readString(&reading)
+        const link_state = dbus.readString(&reading)
+        const address = dbus.readString(&reading)
+        const gateway = dbus.readString(&reading)
+        const network = dbus.readString(&reading)
+        const servers = @intCast(usize, dbus.readU32(&reading))
+        reading.position += servers
+        if reading.failed { break }
+        const wifi = state.same(kind, "wifi")
+        if wifi && !state.same(link_state, "off") { bar.*.hasWifi = true }
+        if state.same(link_state, "connected") {
+            if !wifi && bar.*.netKind != NET_WIRED {
+                bar.*.netKind = NET_WIRED
+                state.labelSet(&bar.*.netName, name)
+            } else if wifi && bar.*.netKind == NET_NONE {
+                bar.*.netKind = NET_WIRELESS
+                state.labelSet(&bar.*.netName, network)
+            }
+        } else if wifi && state.same(link_state, "connecting") {
+            bar.*.netConnecting = true
+            state.labelSet(&bar.*.netJoining, network)
+        }
+    }
+    bar.*.wifiCount = 0
+    if !bar.*.hasWifi || !call(bar, "Networks", "", noBody(), 0, &reply) { return true }
+    reading = dbus.reader(dbus.bodyOf(client, &reply), reply.bodyLength, reply.big)
+    length = @intCast(usize, dbus.readU32(&reading))
+    dbus.alignTo(&reading, 8)
+    end = reading.position + length
+    while reading.position < end && !reading.failed {
+        dbus.alignTo(&reading, 8)
+        const ssid = dbus.readString(&reading)
+        const signal = dbus.readU32(&reading)
+        const frequency = dbus.readU32(&reading)
+        const security = dbus.readString(&reading)
+        const problem = dbus.readString(&reading)
+        const saved = dbus.readBool(&reading)
+        const connected = dbus.readBool(&reading)
+        if reading.failed { break }
+        // The joined one first, then by signal; six at most.
+        var at = bar.*.wifiCount
+        while at > 0 && !state.wifiAt(bar, at - 1).*.connected && (connected || state.wifiAt(bar, at - 1).*.signal < signal) { at -= 1 }
+        if at >= 6 { continue }
+        var move = if bar.*.wifiCount < 6 { bar.*.wifiCount } else { 5 }
+        while move > at {
+            state.wifiAt(bar, move).* = state.wifiAt(bar, move - 1).*
+            move -= 1
+        }
+        const row = state.wifiAt(bar, at)
+        state.labelSet(&row.*.ssid, ssid)
+        row.*.signal = signal
+        row.*.security = if state.same(security, "open") { SECURITY_OPEN } else if state.same(security, "wpa2") { SECURITY_WPA2 } else { SECURITY_OTHER }
+        row.*.saved = saved
+        row.*.connected = connected
+        row.*.refused = state.same(problem, "passphrase")
+        row.*.joining = bar.*.netConnecting && state.same(ssid, state.labelText(&bar.*.netJoining))
+        if bar.*.wifiCount < 6 { bar.*.wifiCount += 1 }
+    }
+    return true
+}
+
+// mlx-settings' Network page, with network `ssid` chosen (none: "").
+pub fn openSettings(bar: *Bar, ssid: []const u8) -> void {
+    var command: state.Label = undefined
+    state.labelSet(&command, "mlx-settings network")
+    if ssid.length > 0 {
+        // The SSID quoted for the shell (' as '\'').
+        state.labelAdd(&command, " '")
+        for byte in ssid {
+            if byte == 39 { state.labelAdd(&command, "'\\''") } else {
+                var one: [1]u8 = [1]u8{ byte }
+                var view: [*]const u8 = undefined
+                unsafe { view = @ptrCast([*]const u8, &one) }
+                state.labelAdd(&command, view[0..1])
+            }
+        }
+        state.labelAdd(&command, "'")
+    }
+    apps_module.runScript(state.labelText(&command), bar.*.environment)
+    state.say(bar, "topbar: network settings\n")
+}
+
+// A row of the list was clicked: true when the popup is to close (the
+// settings opened).
+pub fn choose(bar: *Bar, index: usize) -> bool {
+    if index >= bar.*.wifiCount { return false }
+    const row = state.wifiAt(bar, index)
+    if row.*.connected { return false }
+    const ssid = state.labelText(&row.*.ssid)
+    const ready = row.*.security == SECURITY_OPEN || (row.*.security == SECURITY_WPA2 && row.*.saved && !row.*.refused)
+    if !ready || !connect(bar) {
+        openSettings(bar, ssid)
+        return true
+    }
+    var memory: [320]u8 = undefined
+    var bytes: [*]u8 = undefined
+    unsafe { bytes = @ptrCast([*]u8, &memory) }
+    var writing: dbus.Writer = undefined
+    dbus.begin(&writing, bytes, 320, false)
+    dbus.putString(&writing, ssid)
+    dbus.putString(&writing, "")
+    var reply: dbus.Header = undefined
+    if !call(bar, "Connect", "ss", bytes, writing.length, &reply) {
+        openSettings(bar, ssid)
+        return true
+    }
+    state.say(bar, "topbar: joining ")
+    state.say(bar, ssid)
+    state.say(bar, "\n")
+    row.*.joining = true
+    const asked = refresh(bar)
+    return false
+}

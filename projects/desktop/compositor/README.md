@@ -11,7 +11,9 @@ A Wayland compositor written in Mlx with `std.wayland`. It runs either
 Either way it is a compositor in its own right: programs started with its
 `WAYLAND_DISPLAY` appear as windows inside it. It picks nested when it is
 started inside a Wayland session, freestanding otherwise (`--backend
-nested|drm` decides).
+nested|drm` decides). Freestanding, it first tells the boot splash
+(mlx-splash or plymouthd) to quit leaving its last frame, so the monitor
+goes from the splash to the desktop with no text console in between.
 
 - Keyboard and pointer go to the clients: the pointer to the window under
   it, a click focuses and raises a window, and keys go to the focused
@@ -19,7 +21,16 @@ nested|drm` decides).
   freestanding: compiled by std.xkb for the system's layout) and the key
   repeat settings.
 - Windows move by dragging their title bar (`xdg_toplevel.move`) or with
-  Alt+drag anywhere.
+  Alt+drag anywhere; dragged to an edge of the screen they snap to it
+  (Aero snap, see Snapping, workspaces and tiling).
+- Nine workspaces, and per workspace floating windows or scrollable
+  tiling as niri does it (columns on a strip wider than the screen); the
+  top bar shows both and switches them. The wheel walks the columns and
+  the workspaces, fingers on a touchpad drag the strip, three-finger
+  swipes go through columns and workspaces as in niri.
+- Animated: windows glide where the compositor puts them, workspaces
+  slide, new windows grow open, the snap preview grows out of the window
+  (see Animations).
 - Windows resize by dragging their border (the cursor shows the
   direction; near a corner, the corner), with Alt+right-drag from the
   nearest corner, or from the client's own edges (`xdg_toplevel.resize`,
@@ -42,8 +53,20 @@ The screenshots are frames the scripted test host received, taken during
 | Alt+Enter | open a terminal (`--terminal`, default `mlx-terminal`) |
 | Alt+drag | move the window under the pointer |
 | Alt+right-drag | resize the window under the pointer from its nearest corner |
-| Alt+Tab | switch windows |
+| Alt+Tab | switch windows (of the workspace shown) |
 | Alt+F4 | close the focused window |
+| Super+Left, Super+Right | snap the window to that half; with tiling: focus the column on that side |
+| Super+Shift+Left, Super+Shift+Right | with tiling: move the column |
+| Super+R | with tiling: the column a third, half or two thirds wide |
+| Super+T | tiling on or off for the workspace shown |
+| Super+1 .. 9 | show that workspace |
+| Super+Shift+1 .. 9 | move the focused window to that workspace |
+| Super+wheel | with tiling: the column before or after (the strip glides along); floating: the workspace before or after |
+| Super+Shift+wheel | with tiling: move the column |
+| Super+Ctrl+wheel | the workspace before or after |
+| Super+two fingers | with tiling: drag the strip; it settles on a column when they lift |
+| three fingers sideways | with tiling: drag the strip (it settles, further on after a flick); floating: the workspace before or after |
+| three fingers up or down | the workspace after or before, pulled in as the fingers go |
 | Alt+Shift+Q | quit |
 | Ctrl+Alt+F1 .. F12 | switch to that VT (freestanding) |
 | Ctrl+Alt+Backspace | quit (freestanding) |
@@ -80,7 +103,8 @@ WAYLAND_DISPLAY=wayland-mlx dbus-run-session nautilus
 Options: `--socket NAME`, `--size WxH`, `--fullscreen` (a fullscreen
 window at the monitor's resolution), `--renderer auto|vulkan|cpu` (default
 `auto`: Vulkan when a driver works, else the CPU), `--font PATH|none`,
-`--terminal PROGRAM`, `--launcher PROGRAM|none` (what Super starts),
+`--terminal PROGRAM`, `--greeter PROGRAM` (the restricted login-screen
+mode described below), `--launcher PROGRAM|none` (what Super starts),
 `--dock PROGRAM|none` (the dock, kept running), `--topbar PROGRAM|none`
 (the top bar, kept running), `--xwayland PROGRAM|none` (X programs, see
 X programs), `--run PROGRAM`
@@ -92,6 +116,24 @@ frame takes to compose and present).
 Each title bar shows the window's frames per second (the buffers it
 committed) and the desktop's (frames shown). Shown frames follow the
 monitor: at 60 Hz the desktop shows at most 60.
+
+## Greeter mode
+
+`--greeter PROGRAM` makes one compositor instance a login screen instead
+of a desktop session. It starts `PROGRAM` over a private `WAYLAND_SOCKET`
+connection adopted directly by the server. That connection, rather than a
+forgeable title or app id, identifies the trusted greeter client. Other
+clients may connect to the public display socket, but none of their
+surfaces are drawn, focused or hit-tested; keyboard and pointer input stay
+with the greeter and its popups.
+
+Greeter mode ignores `--run` programs and disables the terminal shortcut,
+launcher, dock, top bar, Xwayland, workspace hotkeys and touchpad
+workspace gestures. The only compositor shortcut left is
+Ctrl+Alt+F1..F12 on the freestanding backend, so recovery through another
+VT remains possible. When the greeter process exits, the compositor exits
+too and relinquishes DRM; the login service owns the larger lifecycle and
+starts a new greeter after a user session ends.
 
 ## Dock and launcher
 
@@ -219,7 +261,10 @@ the top edge, 30 pixels high with an exclusive zone, as the menu bar of
 macOS: maximized windows start below it and windows placed under it are
 moved down. It is translucent over a blur and shows a mark and the name
 of the active window's app on the left (its desktop entry's name, else
-its app id or title) and the date and time on the right ("So. 27. Sep.
+its app id or title; a click on the mark opens the session menu: the
+settings, Lock Screen and Log Out, which asks first; see Locking and
+logging out), the workspaces in the middle (see Snapping,
+workspaces and tiling), and the date and time on the right ("So. 27. Sep.
 16:05" when `LC_ALL`, `LC_TIME` or `LANG` is German, else "Sun 27 Sep
 16:05"). The time zone comes from `$TZ` (a zone name looked up in
 `/usr/share/zoneinfo`, a file, or a POSIX rule such as
@@ -227,6 +272,120 @@ its app id or title) and the date and time on the right ("So. 27. Sep.
 and their rules for the years after the table are read by
 `desktop-shared/clock.mlx`. `MLX_SESSION_TOPBAR=no` starts the session
 without it.
+
+Left of the time, from the right, the bar shows what it finds
+([`projects/desktop/topbar`](../topbar/main.mlx)); each opens a popup
+under it on a click (a click on it again or anywhere else closes it).
+The popups look like the dock's folder stacks (a header with a title and
+a button over a line, then their content) and come in sliding down and
+fading in. Everything on the bar moves rather than jumps: a widget that
+comes or goes fades while the others glide to their places, the light
+under the pointer fades in and out, the time slides to the next minute,
+a new track's title slides in over the old one, the volume and the
+charge glide to their new values, and the calendar's months slide past
+each other. The symbols are drawn smooth at their size by
+`std.ui.vector` (`desktop-shared/symbols.mlx`), alike on the CPU and the
+GPU.
+
+| Widget | Shows | Does |
+| --- | --- | --- |
+| Clock | the date and time | a calendar: today in its header (its button goes back to today's month), the month with ISO week numbers and today lit; the arrows or the wheel turn the month |
+| Control centre | toggles; a dot while notifications are unread, a moon while Do Not Disturb is on | the control centre: tiles for the network (what is connected, from mlx-netd on the system bus, else `/sys/class/net`; with a Wi-Fi card it opens the networks in sight, a click joins one or opens mlx-settings' Network page), Do Not Disturb, night light, dark mode, locking the screen and a screenshot; the volume; what plays (previous, play or pause, next); the notifications, newest first, each with its close button, and Clear all. Its button opens mlx-settings |
+| Battery | the charge of the batteries in `/sys/class/power_supply` (not a mouse's or a headset's), red under 15 %, a bolt while it charges | a popup: charging, full or on battery, and the time to full or to empty |
+| Volume | MLX Audio's output: a speaker with one to three waves, crossed out when muted | the wheel turns it by 5 %, a middle click mutes; the popup has the output's volume (the speaker mutes), the outputs to choose (automatic or a sound card), and the apps MLX Audio knows as a grid of their icons, each with its own slider (a click on the icon mutes the app, the wheel turns it; a dot over the ones playing); its button opens mlx-settings' Sound page |
+| Tray | the StatusNotifierItems (the icons Qt, GTK's libappindicator, Electron and others show): `IconPixmap`, else `IconName` from the icon themes, else the title's first letter; a red dot when one needs attention | a left click is `Activate`, a middle click `SecondaryActivate`, a right click the item's menu (`com.canonical.dbusmenu`, as the bar's own popup) or `ContextMenu` |
+| Media | the MPRIS player that played last (`org.mpris.MediaPlayer2.*`): a play/pause button and "Title – Artist" | the button plays or pauses; the text opens the player's name (its button and a click on the cover raise the player), the cover (a `file://` PNG), title, artist and album, where the track is (a click on the line goes there), and previous, play/pause and next |
+
+The order of these widgets and which are shown is the user's:
+mlx-settings' Top bar page (`mlx-settings topbar`) has a preview of the
+bar and a row per widget with a switch and arrows to move it a place
+left or right, and writes `~/.config/mlx/topbar.conf`
+(`$XDG_CONFIG_HOME/mlx/topbar.conf`, a line a widget from left to right:
+`clock = on`, `media = off`; `desktop-shared/topbar_items.mlx`). The bar
+takes a change within a second, the widgets gliding to their new places
+and a hidden one fading out; what plays always gets the room the others
+leave.
+
+The tiles glow in the accent colour as they turn on. Do Not Disturb keeps
+the bubbles away (critical ones still come); night light is
+`night-light` in `compositor.conf`; dark mode is the look of the whole
+desktop (see Light and dark); the screenshot waits for the popup to go,
+saves the screen with `mlx-capture` into `~/Bilder` (`~/Pictures` on a
+system that is not German) and says so in a notification with the
+picture as its icon. A dismissed notification's neighbours glide up into
+its place before the popup shrinks; cleared ones fade out. The popups
+change their size in place (`xdg_popup.reposition`), not by opening
+anew.
+
+### Notifications
+
+`mlx-notifyd` ([`projects/desktop/notifications`](../notifications/main.mlx))
+is the desktop's notification server (`org.freedesktop.Notifications`,
+the Desktop Notifications Specification 1.2, on MLXIPC; its service file
+starts it on the first notification). Notifications show as bubbles at
+the top right under the bar: the app's icon (`app_icon` as a name or a
+path, the `image-data` hint, else its desktop entry's), its name, the
+summary and up to three lines of the body, the actions as buttons. A
+bubble slides in from the right while the others glide down; it goes
+after its timeout (five seconds; never for critical ones or a timeout of
+0; not while the pointer is on it), on its close button or on a click
+(the `default` action). `mlx-notify` sends one from the shell, as
+`notify-send` does (`-a APP`, `-i ICON`, `-u low|normal|critical`,
+`-t MS`, `-A KEY=LABEL`, `-r ID`, `-p` prints the id, `-w` waits and
+prints the action chosen).
+
+The session's bus (mlx-ipcd, which mlx-session starts before the
+compositor) starts `mlx-notifyd`, the portal and the permission agent
+with its own environment. Once the compositor listens it tells the bus
+its `WAYLAND_DISPLAY` (and `DISPLAY`) for them
+(`UpdateActivationEnvironment`, as sway's
+`dbus-update-activation-environment` does): freestanding always, nested
+with `--session` (mlx-session inside cage or weston), never otherwise,
+so a compositor nested in another desktop leaves that desktop's
+services alone. Without it a service started on demand found no
+compositor and no bubble showed.
+
+What came is kept in `mlx-notifyd` for the control centre, which asks
+for it on MLXIPC as well: `org.mlx.Notifications` on the same object has
+`List()` (Do Not Disturb, how many are unread, the notifications newest
+first) and says `Changed()` whenever that changes; the bar calls
+`SetDoNotDisturb(b)`, `Dismiss(u)`, `ClearHistory()` and `MarkRead()`
+(the list was looked at).
+
+### Light and dark
+
+The desktop is dark or light as one, every app of it: the top bar, its
+popups and the notification bubbles, the dock, the launcher and their
+menus take their colours from
+[`desktop-shared/palette.mlx`](../shared/palette.mlx); mlx-settings,
+mlx-files, mlx-terminal, MLX Observatory (its map stays dark space), the
+permission dialog and the screen-sharing picker from `std.ui.theme.at`.
+All of them glide from one look to the other in 300 ms when it is
+switched (std.ui.appearance follows `appearance.conf` through inotify in
+every window and panel of std.ui.wayland.panel; `std.ui.host.lightness`
+gives an app how light to draw). The look is `color-scheme` of
+`org.freedesktop.appearance`, kept by the portal (`mlx-capture --portal`,
+[`appearance.mlx`](../capture/appearance.mlx)) on MLXIPC as
+`org.freedesktop.portal.Settings` (version 2: `ReadAll`, `ReadOne`,
+`Read`, `SettingChanged`), which GTK (libadwaita), Qt and Firefox follow
+as on any desktop. The control centre's tile changes it with
+`org.mlx.Appearance.SetColorScheme(u)` (0 no preference, 1 dark, 2
+light) on the same object; the portal keeps it in
+`~/.config/mlx/appearance.conf` (`color-scheme = dark`, `light` or
+`default`; dark without it) and tells everyone with `SettingChanged`.
+mlx-settings' Appearance page switches it too (Dark, Light). Without the
+portal the page writes the file itself; `MLX_COLOR_SCHEME=light` (or
+`dark`) in an app's environment fixes its look.
+
+The bar finds these on the session bus (`DBUS_SESSION_BUS_ADDRESS`, as
+MLXIPC gives the session) without waiting on it: it is the
+`org.kde.StatusNotifierWatcher` the apps register their items with, or a
+host of another program's watcher; the players, MLX Audio
+(`org.mlx.Audio`) and the items come and go with `NameOwnerChanged`, and
+their properties with `PropertiesChanged` and the items' `New*` signals.
+With no bus it tries again every ten seconds. MLXIPC lets sandboxed apps
+own a player's and a tray item's name and talk to the watcher by
+default.
 
 The file manager, [`projects/desktop/files`](../files/main.mlx) (Files in
 the launcher, pinned in the dock by default), is laid out like the Finder:
@@ -317,9 +476,11 @@ compositor is the display server itself:
 - **Input** ([`evdev.mlx`](evdev.mlx)): every keyboard, mouse and touchpad
   under `/dev/input`, and those plugged in later (inotify). Mice move with
   a little acceleration and scroll 15 pixels a notch; touchpads move the
-  pointer about 4 pixels per millimetre, scroll with two fingers (the
-  content follows the fingers), click (two fingers: right click) and tap
-  to click.
+  pointer about 4 pixels per millimetre, scroll with two fingers up and
+  down and sideways (the content follows the fingers; lifting them ends
+  the scroll, as `wl_pointer.axis_stop` tells clients), swipe with three
+  (the compositor's own: strips and workspaces), click (two fingers: right
+  click) and tap to click.
 - **Keyboard** ([`xkb.mlx`](xkb.mlx)): `std.xkb` compiles the keymap from
   the XKB data (`/usr/share/X11/xkb`) for `XKB_DEFAULT_LAYOUT` (and
   `_VARIANT`, `_MODEL`, `_OPTIONS`; the session launcher sets them from the
@@ -381,6 +542,14 @@ memfd), once more copying each frame in, as on drivers that cannot import
 them, and once more with the first frame made to look missing from the
 buffer, after which the renderer must copy.
 
+Every device descriptor is made nonblocking when the compositor takes it
+([`device.mlx`](device.mlx)), whoever opened it: the event loop reads the
+card and the input devices until EAGAIN, systemd-logind hands them over
+nonblocking, and a session manager that does not would leave the
+compositor waiting in read(2) for a page flip after its first frame,
+deaf to clients and keys. `tools/check_compositor_device.sh` checks it
+with a blocking pipe in place of the card.
+
 ## Desktop session (GDM, SDDM)
 
 `install_compositor.sh` at the repository root builds the compositor and
@@ -401,19 +570,31 @@ connected connectors, the `video` and `input` groups (needed only without
 logind), the Vulkan drivers, the XKB data, and the last session log,
 whose `modeset failed`, `crashed:` or `killed by signal` lines it points
 out. It wraps `tools/install_compositor_session.sh`, which does the
-building and copying (`--prefix`, default `/usr/local` there; `--destdir`
+building and copying (`--prefix`, default `/usr` there too; `--destdir`
 stages for packaging; `--build-only` builds into `mlx-out/session`). The
-build uses the canonical compiler, `mlx-out/bin/compiler/mlx4`, and makes
-it first from the bootstrap-built `zig-out/bin/mlx1` when it is missing
-(`mlx1 -> mlx2 -> mlx3`, the self-hosted compiler's fixed point): that
-compiler builds the same binary from the same sources on every machine,
-so the checksum `--check` prints matches a build elsewhere, and a crash
-address from one machine finds its place in another's disassembly.
+programs come from `./mlx build desktop client-libraries`
+([`build.mlx`](../../../build.mlx)), which builds a program only when a
+module it reads changed, the jobs side by side: a reinstall with nothing
+changed builds nothing. It uses the canonical compiler,
+`mlx-out/bin/compiler/mlx4`, made first from the bootstrap-built
+`zig-out/bin/mlx1` when it is missing (`mlx1 -> mlx2 -> mlx3`, the
+self-hosted compiler's fixed point): that compiler builds the same binary
+from the same sources on every machine, so the checksum `--check` prints
+matches a build elsewhere, and a crash address from one machine finds its
+place in another's disassembly. `--compiler PATH` compiles everything with
+another compiler instead.
 
-It puts `mlx-compositor`, `mlx-terminal` and `mlx-session` into
-`/usr/local/bin` (`--prefix`) and `mlx-compositor.desktop` into
-`/usr/share/wayland-sessions` (`--sessions`), where both display managers
-look; `--destdir` stages everything for packaging, `--build-only` only
+It puts `mlx-compositor`, `mlx-terminal`, `mlx-session` and the other
+programs into `/usr/bin/mlx` (`PREFIX/bin/mlx`, `--prefix`, default
+`/usr`), a directory of their own that the installation puts on PATH
+after the system's directories wherever a PATH comes from: login shells,
+the user session, the system services, sudo, su and the console login,
+PAM sessions and fish (the files are listed in
+[`tools/lib/mlx_layout.sh`](../../../tools/lib/mlx_layout.sh)), and
+`mlx-compositor.desktop` into `/usr/share/wayland-sessions`
+(`--sessions`), where both display managers look; programs from installs
+before that layout (in `/usr/local/bin` or `/usr/bin`) are listed by
+`tools/remove_old_mlx_layout.sh` and removed with `--remove`; `--destdir` stages everything for packaging, `--build-only` only
 builds (into `mlx-out/session`). Then log out and pick "Mlx Compositor":
 in GDM with the gear button once your user is chosen, in SDDM in the
 session menu.
@@ -501,6 +682,12 @@ client-decorations = off
 corner-radius = 12
 # Moved windows wobble (with the Vulkan renderer).
 wobbly-windows = on
+# Windows glide into place and grow open, workspaces slide (on, off, or
+# slow: eight times slower, to watch).
+animations = on
+# on: workspaces start with their windows tiled (scrolling columns); the
+# top bar and Super+T switch each workspace.
+tiling = off
 # The apps' language (de, en, or system: LC_ALL, LC_TIME, LANG); the
 # compositor leaves it to them.
 language = system
@@ -510,19 +697,22 @@ display-mode = auto
 # Night light: warmer colours, at once (Kelvin, 1000 to 6500).
 night-light = off
 night-light-temperature = 4000
+# The screen locker the lock hotkey and the top bar's session menu run.
+lock-command = mlx-lock
 ```
 
 [`projects/desktop/settings`](../settings/main.mlx) changes them, in a
 window with a sidebar of categories (std.ui.host, drawn at the screen's
-density): General (the dock hiding, the terminal's hotkey, where the file
-is), Display (the monitor, its mode and night light; see below), Sound
+density): General (the dock hiding, the terminal's and the lock's
+hotkeys, where the file is), Display (the monitor, its mode and night light; see below), Sound
 (MLX Audio's outputs, inputs, volumes and apps, and which apps may use
 the microphone; [`projects/desktop/audio`](../audio/README.md)), Apps
 (every app that asked for a permission, with Allow, Ask, Deny or the
 default for each; MLXIPC's ListPermissions and SetPermission,
 [`projects/desktop/ipc`](../ipc/README.md)), Window
 management (title bars, the counter, app decorations, wobbly windows, the
-window hotkeys), Appearance (colours for the focused and the other
+window hotkeys), Top bar (its items' order and which show; see the top
+bar), Appearance (colours for the focused and the other
 windows' borders, square, small, medium or large corners) and Language
 (German, English or the system's; the settings app follows at once, the
 other apps when they start). It writes the file whole and
@@ -848,8 +1038,32 @@ version 1 (see Pointer lock), `ext_foreign_toplevel_list_v1`,
 `ext_output_image_capture_source_manager_v1`,
 `ext_foreign_toplevel_image_capture_source_manager_v1` and
 `ext_image_copy_capture_manager_v1` version 1 (see Screen capture),
-`xwayland_shell_v1` version 1 (to Xwayland alone; see X programs).
+`xwayland_shell_v1` version 1 (to Xwayland alone; see X programs),
+`ext_session_lock_manager_v1` version 1 (see Locking and logging out).
 Composition is done in software, or with Vulkan (`--renderer vulkan`).
+
+### Locking and logging out
+
+The session lock is ext-session-lock-v1 ([`lock.mlx`](lock.mlx)), the
+protocol swaylock and other screen lockers speak. Once a locker locks,
+nothing but its lock surface (over the whole output) is drawn or gets
+the pointer and the keyboard: windows, the dock, the top bar and the
+launcher are hidden, the hotkeys, Super and the swipes rest (Ctrl+Alt+F<n>
+still switches terminals when freestanding). The locker unlocks once its
+user has authenticated; the compositor itself knows nothing of
+passwords. A locker that goes without unlocking (it crashed, it was
+killed) leaves the session locked and the screen blank until a new
+locker locks and unlocks it; a second locker while one lives is refused
+(`finished`).
+
+The lock hotkey (`key-lock`, Super+L) and the top bar's session menu run
+the program `lock-command` names in the settings file (`mlx-lock` by
+default; a name on `PATH` or a path). The session menu's Log Out asks the
+compositor (on the bar's channel) to close every window; it ends once
+they have, or after four seconds, and the session with it.
+`std.ui.wayland.panel` has the client side (`openLock`, `unlock`) for a
+locker written in Mlx; [`tools/session-lock-test`](../../../tools/session-lock-test/main.mlx)
+is the stand-in the checks use (Enter unlocks: never one to use).
 
 ### GPU clients (OpenGL, Vulkan)
 
@@ -905,9 +1119,110 @@ key-fullscreen = Super+F
 key-close = Alt+F4
 key-terminal = Alt+Return
 key-switch = Alt+Tab
+key-left = Super+Left
+key-right = Super+Right
+key-move-left = Super+Shift+Left
+key-move-right = Super+Shift+Right
+key-column-width = Super+R
+key-tiling = Super+T
+key-lock = Super+L
 ```
 
-Alt+Shift+Q (quit) and Ctrl+Alt+F<n> (switch VT, freestanding) stay fixed.
+Alt+Shift+Q (quit), Super+1..9 and Super+Shift+1..9 (workspaces) and
+Ctrl+Alt+F<n> (switch VT, freestanding) stay fixed.
+
+### Snapping, workspaces and tiling
+
+**Aero snap.** A floating window dragged by its title bar (or with
+Alt+drag) to the left or right edge of the work area shows where it would
+go, the focus colour over that half of the screen, and takes that half
+when it is let go; dragged into a corner (within 48 pixels of it along an
+edge) it takes that quarter, dragged to the top edge it is maximized.
+Super+Left and Super+Right snap the focused window to a half. Dragging a
+snapped window away gives it back its size, under the pointer, as
+dragging a maximized one does. Both renderers draw the preview alike
+([`scene.mlx`](scene.mlx), [`vulkan.mlx`](vulkan.mlx)).
+
+**Workspaces** ([`workspaces.mlx`](workspaces.mlx)). Nine of them; a new
+window opens on the one shown, and only that one's windows are drawn and
+take the pointer. Super+1..9 shows a workspace, Super+Shift+1..9 moves
+the focused window there, and activating a window on another workspace
+(the dock, a foreign-toplevel client) shows its workspace. Alt+Tab goes
+through the windows of the workspace shown.
+
+**Scrollable tiling** ([`tiling.mlx`](tiling.mlx)), per workspace, as niri
+lays windows out: every window is a column on a strip that may be wider
+than the screen, the columns side by side with 8 pixel gaps, each as tall
+as the work area and half its width to begin with. A new window opens as
+the column after the focused one; the strip scrolls so that the focused
+column is in sight. Super+Left and Super+Right focus the neighbouring
+column, Super+Shift+Left and Super+Shift+Right move the focused column,
+Super+R makes it a third, half or two thirds of the width, maximize makes
+it as wide as the screen (and back), dragging its border sets its width,
+dragging its title bar past the middle of a neighbour swaps the two. The
+wheel with Super held (or over the desktop between the columns) walks the
+columns, a notch a column, and the strip glides along; fingers on a
+touchpad with Super (or over the desktop) drag the strip as they go, and
+when they lift it settles with the column nearest its left edge there,
+which takes the focus. Super+Shift+wheel moves the focused column, and
+Super+Ctrl+wheel goes to the workspace before or after (as Super+wheel
+does on a floating workspace; one switch per 150 ms, so a fast wheel does
+not race through all nine).
+
+**Three-finger swipes** ([`gestures.mlx`](gestures.mlx)), as niri has
+them, the content following the fingers: sideways on a tiling workspace
+the strip moves with them and settles on a column when they lift (further
+on when they flick it); up and down, and sideways on a floating
+workspace, the next or the previous workspace is pulled in as far as the
+fingers went, up and down from below or above, and when they lift it
+comes all the way (past a third of the screen, or flicked that way) or
+springs back. The first 16 pixels decide which way a swipe goes. Swipes
+come from the touchpad freestanding (three fingers on the pad) and, nested,
+from the host's `zwp_pointer_gestures_v1` (when it passes them on).
+
+Turning
+tiling off puts every window back where it floated before; a minimized
+column leaves the strip until it comes back. `tiling = on` in the
+settings makes workspaces without windows start tiled.
+
+**The top bar** shows the workspaces in use as numbered buttons (up to
+the last with windows or the one shown, and one more; a dot under one
+with windows, the one shown lit; a click shows it) and, beside them, a
+two-part button for the workspace shown: floating (two overlapping
+windows) or tiling (two columns), the one in force lit, a click on the
+other switches. It hears the workspaces and sends its clicks over its
+channel (`MLX_TOPBAR_FD`, a socket pair): the compositor sends `W`, the
+workspace shown, the tiling workspaces as a 16-bit mask and the nine
+window counts whenever one of them changes; the bar sends `w` and a
+workspace to show one, or `t`, a workspace and 1 or 0 to turn its tiling
+on or off. The lit button glides to the workspace shown and the lit part
+to the mode in force; the wheel over the bar goes to the workspace before
+or after.
+
+### Animations
+
+The compositor shows what it does to windows moving instead of jumping
+([`animation.mlx`](animation.mlx)), easing out (fast, then settling):
+
+- A window the compositor puts somewhere glides there in 220 ms: a
+  tiling column laid out, moved or scrolled to, a window snapped,
+  maximized or restored, tiling turned on or off. Input, both renderers
+  and Xwayland see it where it is drawn. A window the user drags goes
+  with the pointer, and while fingers drag a strip it follows them.
+- Switching workspaces slides the old one out and the new one in from
+  the side its number lies on (300 ms). Both renderers draw the two
+  workspaces' windows moved by their offset while they compose
+  (`scene.shiftWindows`); input and focus are on the new one at once. A
+  window moved to another workspace slides off towards it.
+- The snap preview grows out of the dragged window (or the last zone)
+  and fades in, eight steps of opacity (a Vulkan palette row each).
+- A new window grows open out of a slightly smaller rectangle and fades
+  in, as a folder opened from the dock's stack grows out of the stack.
+
+The shell steps them after every frame and damages what they cover, so
+frames come until they rest. `animations = off` makes it all instant;
+`animations = slow` makes it eight times slower, to watch (the checks use
+it to catch frames in the middle).
 
 ### Wobbly windows
 
@@ -956,7 +1271,8 @@ the output (`ext-image-capture-source-v1`, any `wl_output`) or a window,
 named by its handle in `ext-foreign-toplevel-list-v1` (every window, with
 an identifier that is never reused). A capture session tells the client
 the buffer size and the formats (ARGB8888 and XRGB8888 shared memory; no
-dma-bufs yet). The first frame is copied at once with full damage; each
+dma-bufs yet). The first frame is copied once a frame was presented
+after the session began, with full damage; each
 later one waits until the source changed and carries only what changed
 as damage, so a recorder gets a frame per change, not per request.
 
@@ -970,7 +1286,18 @@ as damage, so a recorder gets a frame per change, not per request.
   stop at once.
 
 The compositor maps client memory read-only; it copies a frame through a
-writable mapping of its own for the moment of the copy.
+writable mapping of its own for the moment of the copy, a row at a time.
+
+With the Vulkan renderer the frame is in GPU memory; freestanding it is
+the dumb buffer the monitor scans out, in video memory, which the CPU
+reads only very slowly (uncached, across the bus): the compositor stood
+still while it read whole frames, and the desktop all but froze while
+OBS or a screen share ran. While a session captures
+the output, the renderer therefore copies what each frame changed into a
+host-cached buffer on the GPU as well (all of it the first time;
+`renderer: the output is captured: what frames change is copied into
+host memory` with `--verbose`), and capture reads from there. A new
+session's first frame waits for one frame composed that way.
 
 [`projects/desktop/capture`](../capture) is `mlx-capture` (installed with the
 session), its client: `client.mlx` holds the connection, the window list
@@ -1023,7 +1350,13 @@ their own, on whichever of OBS's threads calls them. It calls libobs
 (`obs_register_source_s`, `obs_source_output_video`, ...) as `extern("c")`
 functions. The source is asynchronous: its connection lives on OBS's video
 thread, polled every frame without waiting, and each frame the compositor
-hands over (only when something changed) goes to OBS, which copies it. The
+hands over (only when something changed) goes to OBS, which copies it, at
+the size of the buffer it was copied into. Choosing another target starts
+over (OBS's log says `[mlx-capture] capturing the window APP_ID` or
+`capturing the screen`); a frame of the old target that came meanwhile
+goes with its buffers, so OBS is never handed one from freed memory or an
+empty one (OBS 30 warns "Allocating 0 bytes", newer versions end on it:
+picking a window in the properties crashed OBS). The
 installer puts it in `~/.config/obs-studio/plugins/mlx-capture/bin/64bit/`;
 by hand:
 
@@ -1034,8 +1367,10 @@ cp mlx-capture.so ~/.config/obs-studio/plugins/mlx-capture/bin/64bit/
 ```
 
 `tools/check_obs_plugin.sh` runs OBS (as a Wayland client of the nested
-compositor) with a scene of only that source, records, and checks the log,
-the recording and OBS's preview.
+compositor) with a scene of only that source, records, switches the
+source to a window and back twice while it records (obs-websocket,
+`tools/obs-test/control.py`), and checks the log, the recording and OBS's
+preview.
 
 ### Screen sharing (browsers, Discord, OBS)
 
@@ -1050,9 +1385,10 @@ both, without xdg-desktop-portal and without a PipeWire daemon:
   (`PREFIX/share/mlx/dbus-1/services`, which MLXIPC searches before the
   system's) when an app first asks: `CreateSession`, `SelectSources`
   (the screen, windows), `Start` and `OpenPipeWireRemote`, each answered
-  with a request object's `Response` as xdg-desktop-portal does. Only
-  ScreenCast: the portal's other interfaces (Settings, FileChooser, ...)
-  are refused, and apps fall back (GTK reads its settings elsewhere).
+  with a request object's `Response` as xdg-desktop-portal does. Besides
+  ScreenCast it serves Settings, the desktop's light or dark look (see
+  Light and dark); the portal's other interfaces (FileChooser, ...) are
+  refused, and apps fall back.
 - `Start` shows a picker ([`picker.mlx`](../capture/picker.mlx),
   `mlx-capture --pick`, in the permission agent's style): the whole
   screen or one of the windows the compositor lists, Share or Cancel (a
@@ -1195,8 +1531,8 @@ finished`.
 - `shell.mlx`: the server side, with globals, surfaces, shared memory and
   xdg-shell. Its parts: `protocols.mlx` (layer shell, the window list for
   docks, decorations, blur regions), `windows.mlx` (focus, window states,
-  resizing, input delivery, mapping) and `launching.mlx` (launching
-  programs).
+  resizing, input delivery, mapping), `launching.mlx` (launching
+  programs) and `lock.mlx` (the session lock, logging out).
 - `dmabuf.mlx`: linux-dmabuf; each dma-buf becomes a one-buffer pool.
 - `data.mlx`: `wl_data_device_manager`, copy and paste and drag and drop
   between clients.
@@ -1211,6 +1547,9 @@ finished`.
 
 `tools/check_wayland_compositor.sh [compiler] [cpu|vulkan]` exercises all
 of this with scripted input (`tools/wayland-test-host`) on either renderer,
+including an untrusted second client beside the private greeter. Set
+`MLX_WAYLAND_GREETER_ONLY=1` for just that focused scenario. The full check
+continues
 with copy and paste between two clients (`wl-copy`, `wl-paste`) and a GTK 4
 window (`gtk4-widget-factory`) when those are installed;
 `tools/check_vulkan_wayland.sh` checks the Vulkan client in both renderers

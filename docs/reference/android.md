@@ -11,8 +11,7 @@
 ## Building an Android app
 
 ```sh
-zig build mlx1
-zig-out/bin/mlx1 examples/android/gestures.mlx -o gestures.apk \
+./mlx examples/android/gestures.mlx -o gestures.apk \
     --target=aarch64-android \
     --android-package=dev.mlxlang.gestures --android-label="Mlx Gestures"
 adb install -r gestures.apk

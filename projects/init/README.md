@@ -16,9 +16,10 @@ tools/check_init.sh                      # the end-to-end check
 ```
 
 As the system's init: install it as `/sbin/init` (or boot with
-`init=/usr/bin/mlx-init`), the services into `/etc/mlx/init/services/`,
+`init=/usr/bin/mlx/mlx-init`, the MLX programs' directory), the services into `/etc/mlx/init/services/`,
 the mounts into `/etc/mlx/init/mounts`; `examples/` holds a start
-(the MLXIPC system bus, a shell on the console, a oneshot).
+(the MLXIPC system bus, the Mlx console with mlx-sh on the framebuffer, a
+oneshot).
 
 ## What happens at boot
 
@@ -45,10 +46,11 @@ the mounts into `/etc/mlx/init/mounts`; `examples/` holds a start
 
 ```
 description = MLXIPC system bus
-exec = /usr/bin/mlx-ipcd --system        # the command line; double quotes
+exec = /usr/bin/mlx/mlx-ipcd --system    # the command line; double quotes
                                          # keep spaces in an argument; a
                                          # program without a slash is looked
-                                         # up along the standard PATH
+                                         # up along the standard PATH and
+                                         # /usr/bin/mlx
 after = mounts hostname                  # start once these run (a oneshot:
                                          # finished)
 ready = /run/mlx/bus                     # running once this path exists

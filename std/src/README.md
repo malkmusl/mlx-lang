@@ -18,8 +18,14 @@ server runtimes. `wayland/generated/` holds the modules materialized from
 name and are not re-exported from `std.mlx`.
 
 `json.mlx` (`std.json`) is the allocation-free JSON pull tokenizer.
+`netlink.mlx` (`std.netlink`) speaks netlink: route netlink (links, IPv4
+addresses, routes and their change groups) and generic netlink (families
+looked up by name, as nl80211).
 `sha2.mlx` (`std.sha2`) has SHA-256, SHA-512, HMAC-SHA256 and
 PBKDF2-HMAC-SHA256.
+`sha1.mlx` (`std.sha1`) has SHA-1, HMAC-SHA1 and PBKDF2-HMAC-SHA1, and
+`aes.mlx` (`std.aes`) AES-128 on blocks and the RFC 3394 key wrap: what
+WPA2 needs (`tools/check_wifi.sh`).
 
 `crypt.mlx` (`std.crypt`) checks a password against the hashes of
 `/etc/shadow`, as crypt(3) writes them: `crypt/yescrypt.mlx` for the
@@ -55,6 +61,10 @@ callers from the compiler's symbol table) and keeps it in
 crash. `timezone.mlx` (`std.timezone`) gives local time from `$TZ` or
 `/etc/localtime` (TZif files and POSIX rules) and the civil calendar. See
 `docs/reference/stdlib.md`.
+
+`ui/appearance.mlx` (`std.ui.appearance`) follows the desktop's colour
+scheme (`~/.config/mlx/appearance.conf`) for every window and panel, and
+`ui/theme.mlx`'s `at` gives the look for it, gliding when it is switched.
 
 `ui.mlx` (`std.ui`) lays out rectangles; `ui/canvas.mlx`, `ui/text.mlx`,
 `ui/gpu_canvas.mlx` and `ui/gpu_upload.mlx` draw on the CPU or the GPU;

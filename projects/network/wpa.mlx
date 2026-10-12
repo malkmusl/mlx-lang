@@ -1,0 +1,560 @@
+// WPA2-Personal for mlx-netd: the supplicant's side of the 4-way
+// handshake and the group key handshake (IEEE 802.11-2020, 12.7), with
+// CCMP and the PSK AKM (00-0F-AC:2), the keys under key descriptor
+// version 2 (HMAC-SHA1-128 MICs, the key data wrapped with AES, RFC 3394).
+//
+// It is the protocol alone: EAPOL-Key frames come in (what follows the
+// Ethernet header), the replies go out in the caller's buffer, and the
+// keys to install are left in the Supplicant with a flag saying so. The
+// caller (wifi.mlx) moves the frames over the link (AF_PACKET) and puts
+// the keys into the card (nl80211).
+//
+//     pmkOf(passphrase, ssid, pmk)              the PSK of a passphrase
+//     start(supplicant, pmk, own, peer, ie, ap_ie)
+//     const length = receive(supplicant, frame, frame_length, reply)
+//     (send `length` bytes of `reply` if not 0, then look at
+//      installPairwise / installGroup / failure)
+//
+// WPA3 (SAE), PMF-only networks, TKIP and 802.1X (Enterprise) are not
+// here: start() is only called for networks offering CCMP with the PSK
+// AKM, which wifi.mlx picks from the beacon's RSN element.
+const sha1 = @import("std.sha1")
+const aes = @import("std.aes")
+const system = @import("./system.mlx")
+
+pub const PMK_LENGTH: usize = 32
+// KCK (the MIC key), KEK (the key data's key), TK (CCMP's key).
+pub const PTK_LENGTH: usize = 48
+pub const KCK: usize = 0
+pub const KEK: usize = 16
+pub const TK: usize = 32
+pub const TK_LENGTH: usize = 16
+pub const NONCE_LENGTH: usize = 32
+pub const IE_MOST: usize = 64
+pub const GTK_MOST: usize = 32
+// What a reply may need: the EAPOL-Key header and our RSN element.
+pub const FRAME_MOST: usize = 512
+
+// The EAPOL-Key frame (after the 4 bytes of the EAPOL header).
+const EAPOL_KEY: u8 = 3
+const DESCRIPTOR_RSN: u8 = 2
+const HEADER: usize = 99
+const AT_INFO: usize = 5
+const AT_KEY_LENGTH: usize = 7
+const AT_REPLAY: usize = 9
+const AT_NONCE: usize = 17
+const AT_RSC: usize = 65
+const AT_MIC: usize = 81
+const AT_DATA_LENGTH: usize = 97
+
+// Key information bits.
+const INFO_VERSION: u32 = 7
+const VERSION_AES: u32 = 2
+const INFO_PAIRWISE: u32 = 8
+const INFO_INSTALL: u32 = 64
+const INFO_ACK: u32 = 128
+const INFO_MIC: u32 = 256
+const INFO_SECURE: u32 = 512
+const INFO_ENCRYPTED: u32 = 4096
+
+// Why a handshake was given up.
+pub const FAILURE_NONE: u32 = 0
+// Message 3's RSN element is not the beacon's (a downgrade, or a broken
+// access point).
+pub const FAILURE_ELEMENT: u32 = 1
+// Message 3's key data could not be unwrapped or carried no group key.
+pub const FAILURE_KEY_DATA: u32 = 2
+
+pub const Supplicant = struct {
+    pmk: [32]u8
+    ptk: [48]u8
+    // The PTK of the message 1 being answered, until message 3 proves it.
+    pending: [48]u8
+    own: [6]u8
+    peer: [6]u8
+    ie: [64]u8
+    ieLength: usize
+    apIe: [64]u8
+    apIeLength: usize
+    anonce: [32]u8
+    snonce: [32]u8
+    freshNonce: bool
+    replay: [8]u8
+    replayed: bool
+    answered: bool
+    hasPtk: bool
+    gtk: [32]u8
+    gtkLength: usize
+    gtkIndex: u32
+    rsc: [8]u8
+    // Set by receive() for the caller, which clears them.
+    installPairwise: bool
+    installGroup: bool
+    failure: u32
+    // Messages 1 answered without a message 3 coming: a wrong passphrase
+    // makes the access point send message 1 again and again.
+    unanswered: u32
+}
+
+fn load16(bytes: [*]const u8, at: usize) -> u32 {
+    return (@intCast(u32, bytes[at]) << 8) | @intCast(u32, bytes[at + 1])
+}
+
+fn store16(bytes: [*]u8, at: usize, value: u32) -> void {
+    bytes[at] = @intCast(u8, (value >> 8) & 255)
+    bytes[at + 1] = @intCast(u8, value & 255)
+}
+
+// The bytes `offset` past `bytes`.
+fn past(bytes: [*]const u8, offset: usize) -> [*]u8 {
+    var moved: [*]u8 = undefined
+    unsafe { moved = @ptrFromInt([*]u8, @intFromPtr(bytes) + offset) }
+    return moved
+}
+
+fn copy(into: [*]u8, from: [*]const u8, length: usize) -> void {
+    var index: usize = 0
+    while index < length {
+        into[index] = from[index]
+        index += 1
+    }
+}
+
+fn zero(into: [*]u8, length: usize) -> void {
+    var index: usize = 0
+    while index < length {
+        into[index] = 0
+        index += 1
+    }
+}
+
+// -1, 0 or 1 as `a` sorts before, with or after `b` (bytes, unsigned).
+fn order(a: [*]const u8, b: [*]const u8, length: usize) -> i32 {
+    var index: usize = 0
+    while index < length {
+        if a[index] < b[index] { return -1 }
+        if a[index] > b[index] { return 1 }
+        index += 1
+    }
+    return 0
+}
+
+fn equal(a: [*]const u8, b: [*]const u8, length: usize) -> bool {
+    var difference: u8 = 0
+    var index: usize = 0
+    while index < length {
+        difference = difference | (a[index] ^ b[index])
+        index += 1
+    }
+    return difference == 0
+}
+
+fn bytesOf(field: *[32]u8) -> [*]u8 {
+    var bytes: [*]u8 = undefined
+    unsafe { bytes = @ptrCast([*]u8, field) }
+    return bytes
+}
+
+fn pmkBytes(supplicant: *Supplicant) -> [*]u8 {
+    var bytes: [*]u8 = undefined
+    unsafe { bytes = @ptrCast([*]u8, &supplicant.*.pmk) }
+    return bytes
+}
+
+fn ptkBytes(supplicant: *Supplicant) -> [*]u8 {
+    var bytes: [*]u8 = undefined
+    unsafe { bytes = @ptrCast([*]u8, &supplicant.*.ptk) }
+    return bytes
+}
+
+fn pendingBytes(supplicant: *Supplicant) -> [*]u8 {
+    var bytes: [*]u8 = undefined
+    unsafe { bytes = @ptrCast([*]u8, &supplicant.*.pending) }
+    return bytes
+}
+
+fn ownBytes(supplicant: *Supplicant) -> [*]u8 {
+    var bytes: [*]u8 = undefined
+    unsafe { bytes = @ptrCast([*]u8, &supplicant.*.own) }
+    return bytes
+}
+
+fn peerBytes(supplicant: *Supplicant) -> [*]u8 {
+    var bytes: [*]u8 = undefined
+    unsafe { bytes = @ptrCast([*]u8, &supplicant.*.peer) }
+    return bytes
+}
+
+fn ieBytes(supplicant: *Supplicant) -> [*]u8 {
+    var bytes: [*]u8 = undefined
+    unsafe { bytes = @ptrCast([*]u8, &supplicant.*.ie) }
+    return bytes
+}
+
+fn apIeBytes(supplicant: *Supplicant) -> [*]u8 {
+    var bytes: [*]u8 = undefined
+    unsafe { bytes = @ptrCast([*]u8, &supplicant.*.apIe) }
+    return bytes
+}
+
+fn anonceBytes(supplicant: *Supplicant) -> [*]u8 {
+    var bytes: [*]u8 = undefined
+    unsafe { bytes = @ptrCast([*]u8, &supplicant.*.anonce) }
+    return bytes
+}
+
+fn snonceBytes(supplicant: *Supplicant) -> [*]u8 {
+    var bytes: [*]u8 = undefined
+    unsafe { bytes = @ptrCast([*]u8, &supplicant.*.snonce) }
+    return bytes
+}
+
+fn replayBytes(supplicant: *Supplicant) -> [*]u8 {
+    var bytes: [*]u8 = undefined
+    unsafe { bytes = @ptrCast([*]u8, &supplicant.*.replay) }
+    return bytes
+}
+
+pub fn gtkBytes(supplicant: *Supplicant) -> [*]u8 {
+    var bytes: [*]u8 = undefined
+    unsafe { bytes = @ptrCast([*]u8, &supplicant.*.gtk) }
+    return bytes
+}
+
+pub fn rscBytes(supplicant: *Supplicant) -> [*]u8 {
+    var bytes: [*]u8 = undefined
+    unsafe { bytes = @ptrCast([*]u8, &supplicant.*.rsc) }
+    return bytes
+}
+
+// The TK to install once installPairwise is set.
+pub fn temporalKey(supplicant: *Supplicant) -> [*]u8 {
+    return past(ptkBytes(supplicant), TK)
+}
+
+// The 802.11 PRF (12.7.1.2): HMAC-SHA1 of label, 0, data and a counter,
+// as many times as `length` bytes take.
+pub fn prf(key: []const u8, label: []const u8, data: []const u8, out: [*]u8, length: usize) -> void {
+    var keyed: sha1.Hmac = undefined
+    sha1.hmacInit(&keyed, key)
+    var running: sha1.Hmac = undefined
+    var separator: [1]u8 = [1]u8{ 0 }
+    var counter: [1]u8 = [1]u8{ 0 }
+    var separatorBytes: [*]u8 = undefined
+    var counterBytes: [*]u8 = undefined
+    unsafe {
+        separatorBytes = @ptrCast([*]u8, &separator)
+        counterBytes = @ptrCast([*]u8, &counter)
+    }
+    var digest: [20]u8 = undefined
+    var done: usize = 0
+    while done < length {
+        sha1.hmacCopy(&running, &keyed)
+        sha1.hmacUpdate(&running, label)
+        sha1.hmacUpdate(&running, separatorBytes[0..1])
+        sha1.hmacUpdate(&running, data)
+        sha1.hmacUpdate(&running, counterBytes[0..1])
+        sha1.hmacFinal(&running, &digest)
+        var index: usize = 0
+        while index < 20 && done < length {
+            out[done] = digest[index]
+            done += 1
+            index += 1
+        }
+        counter[0] = counter[0] + 1
+    }
+    var digestBytes: [*]u8 = undefined
+    unsafe { digestBytes = @ptrCast([*]u8, &digest) }
+    zero(digestBytes, 20)
+    sha1.hmacWipe(&keyed)
+    sha1.hmacWipe(&running)
+}
+
+// The PMK of a passphrase (8 to 63 characters) for a network: PBKDF2 of
+// it with the SSID as salt, 4096 rounds.
+pub fn pmkOf(passphrase: []const u8, ssid: []const u8, pmk: [*]u8) -> void {
+    sha1.pbkdf2Sha1(passphrase, ssid, 4096, pmk, PMK_LENGTH)
+}
+
+// The PTK from the PMK, both addresses and both nonces (12.7.1.3):
+// PRF-384(PMK, "Pairwise key expansion", Min(AA,SPA) || Max(AA,SPA) ||
+// Min(ANonce,SNonce) || Max(ANonce,SNonce)).
+pub fn ptkOf(pmk: [*]const u8, aa: [*]const u8, spa: [*]const u8, anonce: [*]const u8, snonce: [*]const u8, ptk: [*]u8) -> void {
+    var data: [76]u8 = undefined
+    var bytes: [*]u8 = undefined
+    unsafe { bytes = @ptrCast([*]u8, &data) }
+    if order(aa, spa, 6) < 0 {
+        copy(bytes, aa, 6)
+        copy(past(bytes, 6), spa, 6)
+    } else {
+        copy(bytes, spa, 6)
+        copy(past(bytes, 6), aa, 6)
+    }
+    if order(anonce, snonce, NONCE_LENGTH) < 0 {
+        copy(past(bytes, 12), anonce, NONCE_LENGTH)
+        copy(past(bytes, 44), snonce, NONCE_LENGTH)
+    } else {
+        copy(past(bytes, 12), snonce, NONCE_LENGTH)
+        copy(past(bytes, 44), anonce, NONCE_LENGTH)
+    }
+    prf(pmk[0..PMK_LENGTH], "Pairwise key expansion", bytes[0..76], ptk, PTK_LENGTH)
+}
+
+fn freshSnonce(supplicant: *Supplicant) -> void {
+    const nonce = snonceBytes(supplicant)
+    var index: usize = 0
+    while index < NONCE_LENGTH {
+        const word = system.random32()
+        nonce[index] = @intCast(u8, word & 255)
+        nonce[index + 1] = @intCast(u8, (word >> 8) & 255)
+        nonce[index + 2] = @intCast(u8, (word >> 16) & 255)
+        nonce[index + 3] = @intCast(u8, (word >> 24) & 255)
+        index += 4
+    }
+    supplicant.*.freshNonce = false
+}
+
+// A handshake with `peer` (the access point) about to start: our address,
+// our RSN element (as the association request carried it) and the access
+// point's (as its beacon or probe response did; length 0 when unknown).
+pub fn start(supplicant: *Supplicant, pmk: [*]const u8, own: [*]const u8, peer: [*]const u8, ie: [*]const u8, ie_length: usize, ap_ie: [*]const u8, ap_ie_length: usize) -> void {
+    copy(pmkBytes(supplicant), pmk, PMK_LENGTH)
+    copy(ownBytes(supplicant), own, 6)
+    copy(peerBytes(supplicant), peer, 6)
+    supplicant.*.ieLength = if ie_length > IE_MOST { IE_MOST } else { ie_length }
+    copy(ieBytes(supplicant), ie, supplicant.*.ieLength)
+    supplicant.*.apIeLength = if ap_ie_length > IE_MOST { IE_MOST } else { ap_ie_length }
+    copy(apIeBytes(supplicant), ap_ie, supplicant.*.apIeLength)
+    zero(ptkBytes(supplicant), PTK_LENGTH)
+    zero(pendingBytes(supplicant), PTK_LENGTH)
+    zero(replayBytes(supplicant), 8)
+    supplicant.*.replayed = false
+    supplicant.*.answered = false
+    supplicant.*.hasPtk = false
+    supplicant.*.gtkLength = 0
+    supplicant.*.gtkIndex = 0
+    supplicant.*.installPairwise = false
+    supplicant.*.installGroup = false
+    supplicant.*.failure = FAILURE_NONE
+    supplicant.*.unanswered = 0
+    freshSnonce(supplicant)
+}
+
+// Forgets the keys (the link went away).
+pub fn stop(supplicant: *Supplicant) -> void {
+    zero(pmkBytes(supplicant), PMK_LENGTH)
+    zero(ptkBytes(supplicant), PTK_LENGTH)
+    zero(pendingBytes(supplicant), PTK_LENGTH)
+    zero(gtkBytes(supplicant), GTK_MOST)
+    supplicant.*.hasPtk = false
+    supplicant.*.answered = false
+    supplicant.*.gtkLength = 0
+}
+
+// The MIC of the frame in `frame` (its MIC field zeroed) under `kck`.
+fn micOf(kck: [*]const u8, frame: [*]const u8, length: usize, mic: [*]u8) -> void {
+    var digest: [20]u8 = undefined
+    sha1.hmacSha1(kck[0..16], frame[0..length], &digest)
+    var index: usize = 0
+    while index < 16 {
+        mic[index] = digest[index]
+        index += 1
+    }
+}
+
+// Whether the MIC of the received frame is right under `kck`.
+fn micGood(kck: [*]const u8, frame: [*]const u8, length: usize) -> bool {
+    var copied: [512]u8 = undefined
+    var bytes: [*]u8 = undefined
+    unsafe { bytes = @ptrCast([*]u8, &copied) }
+    if length > FRAME_MOST { return false }
+    copy(bytes, frame, length)
+    zero(past(bytes, AT_MIC), 16)
+    var mic: [16]u8 = undefined
+    var micBytes: [*]u8 = undefined
+    unsafe { micBytes = @ptrCast([*]u8, &mic) }
+    micOf(kck, bytes, length, micBytes)
+    return equal(micBytes, past(frame, AT_MIC), 16)
+}
+
+// Whether `counter` comes after the last replay counter taken.
+fn newer(supplicant: *Supplicant, counter: [*]const u8) -> bool {
+    if !supplicant.*.replayed { return true }
+    return order(counter, replayBytes(supplicant), 8) > 0
+}
+
+// A reply: the EAPOL-Key header with `info`, the replay counter of the
+// frame answered, `nonce` (or zeros), the key data, and its MIC under
+// `kck`. Its length.
+fn reply(out: [*]u8, info: u32, replay: [*]const u8, nonce: [*]const u8, has_nonce: bool, data: [*]const u8, data_length: usize, kck: [*]const u8) -> usize {
+    const length = HEADER + data_length
+    zero(out, length)
+    out[0] = 1
+    out[1] = EAPOL_KEY
+    store16(out, 2, @intCast(u32, length - 4))
+    out[4] = DESCRIPTOR_RSN
+    store16(out, AT_INFO, info)
+    store16(out, AT_KEY_LENGTH, 0)
+    copy(past(out, AT_REPLAY), replay, 8)
+    if has_nonce { copy(past(out, AT_NONCE), nonce, NONCE_LENGTH) }
+    store16(out, AT_DATA_LENGTH, @intCast(u32, data_length))
+    copy(past(out, HEADER), data, data_length)
+    var mic: [16]u8 = undefined
+    var micBytes: [*]u8 = undefined
+    unsafe { micBytes = @ptrCast([*]u8, &mic) }
+    micOf(kck, out, length, micBytes)
+    copy(past(out, AT_MIC), micBytes, 16)
+    return length
+}
+
+// The key data of a frame, unwrapped into `into` with the KEK; its length
+// (0: it could not be).
+fn keyData(kek: [*]const u8, frame: [*]const u8, data_length: usize, into: [*]u8) -> usize {
+    if data_length < 24 || data_length % 8 != 0 || data_length > 256 { return 0 }
+    if !aes.unwrap(kek, past(frame, HEADER), data_length, into) { return 0 }
+    return data_length - 8
+}
+
+// The elements of the key data: the RSN element (its place and length in
+// `rsn`/`rsn_length`) and the GTK KDE (into the supplicant). False when
+// there is no GTK.
+fn takeElements(supplicant: *Supplicant, data: [*]const u8, length: usize, rsn: *usize, rsn_length: *usize) -> bool {
+    var at: usize = 0
+    var found = false
+    rsn.* = 0
+    rsn_length.* = 0
+    while at + 2 <= length {
+        const kind = data[at]
+        const size = @intCast(usize, data[at + 1])
+        // 0xdd with nothing after it is the padding.
+        if kind == 221 && size == 0 { break }
+        if at + 2 + size > length { break }
+        if kind == 48 && rsn_length.* == 0 {
+            rsn.* = at
+            rsn_length.* = size + 2
+        }
+        // GTK KDE: 00-0F-AC, type 1, key id (bits 0-1), reserved, the key.
+        if kind == 221 && size >= 6 + 16 && data[at + 2] == 0 && data[at + 3] == 15 && data[at + 4] == 172 && data[at + 5] == 1 {
+            const keyLength = size - 6
+            if keyLength <= GTK_MOST {
+                supplicant.*.gtkIndex = @intCast(u32, data[at + 6] & 3)
+                supplicant.*.gtkLength = keyLength
+                copy(gtkBytes(supplicant), past(data, at + 8), keyLength)
+                found = true
+            }
+        }
+        at += 2 + size
+    }
+    return found
+}
+
+// One EAPOL frame from the access point (from the EAPOL header on). The
+// reply goes into `out` (room for FRAME_MOST bytes); its length, 0 when
+// there is none.
+pub fn receive(supplicant: *Supplicant, frame: [*]const u8, length: usize, out: [*]u8) -> usize {
+    if length < HEADER || length > FRAME_MOST { return 0 }
+    if frame[1] != EAPOL_KEY || frame[4] != DESCRIPTOR_RSN { return 0 }
+    const body = @intCast(usize, load16(frame, 2))
+    if 4 + body > length || 4 + body < HEADER { return 0 }
+    const size = 4 + body
+    const data_length = @intCast(usize, load16(frame, AT_DATA_LENGTH))
+    if HEADER + data_length > size { return 0 }
+    const info = load16(frame, AT_INFO)
+    if (info & INFO_VERSION) != VERSION_AES { return 0 }
+    const pairwise = (info & INFO_PAIRWISE) != 0
+    const ack = (info & INFO_ACK) != 0
+    const has_mic = (info & INFO_MIC) != 0
+    if !ack { return 0 }
+    const counter = past(frame, AT_REPLAY)
+    if pairwise && !has_mic {
+        // Message 1: the ANonce. The PTK it makes waits for message 3.
+        if supplicant.*.freshNonce { freshSnonce(supplicant) }
+        copy(anonceBytes(supplicant), past(frame, AT_NONCE), NONCE_LENGTH)
+        ptkOf(pmkBytes(supplicant), peerBytes(supplicant), ownBytes(supplicant), anonceBytes(supplicant), snonceBytes(supplicant), pendingBytes(supplicant))
+        supplicant.*.answered = true
+        supplicant.*.unanswered += 1
+        return reply(out, VERSION_AES | INFO_PAIRWISE | INFO_MIC, counter, snonceBytes(supplicant), true, ieBytes(supplicant), supplicant.*.ieLength, past(pendingBytes(supplicant), KCK))
+    }
+    if pairwise && has_mic && (info & INFO_INSTALL) != 0 {
+        // Message 3: proves the PTK, carries the GTK.
+        if !supplicant.*.answered { return 0 }
+        if !equal(past(frame, AT_NONCE), anonceBytes(supplicant), NONCE_LENGTH) { return 0 }
+        if !newer(supplicant, counter) { return 0 }
+        if !micGood(past(pendingBytes(supplicant), KCK), frame, size) { return 0 }
+        if (info & INFO_ENCRYPTED) == 0 {
+            supplicant.*.failure = FAILURE_KEY_DATA
+            return 0
+        }
+        var data: [256]u8 = undefined
+        var dataBytes: [*]u8 = undefined
+        unsafe { dataBytes = @ptrCast([*]u8, &data) }
+        const plain = keyData(past(pendingBytes(supplicant), KEK), frame, data_length, dataBytes)
+        var rsn: usize = 0
+        var rsn_length: usize = 0
+        if plain == 0 || !takeElements(supplicant, dataBytes, plain, &rsn, &rsn_length) {
+            zero(dataBytes, 256)
+            supplicant.*.failure = FAILURE_KEY_DATA
+            return 0
+        }
+        if supplicant.*.apIeLength > 0 && (rsn_length != supplicant.*.apIeLength || !equal(past(dataBytes, rsn), apIeBytes(supplicant), rsn_length)) {
+            zero(dataBytes, 256)
+            supplicant.*.failure = FAILURE_ELEMENT
+            return 0
+        }
+        zero(dataBytes, 256)
+        copy(ptkBytes(supplicant), pendingBytes(supplicant), PTK_LENGTH)
+        zero(pendingBytes(supplicant), PTK_LENGTH)
+        copy(replayBytes(supplicant), counter, 8)
+        copy(rscBytes(supplicant), past(frame, AT_RSC), 8)
+        supplicant.*.replayed = true
+        supplicant.*.answered = false
+        supplicant.*.hasPtk = true
+        supplicant.*.installPairwise = true
+        supplicant.*.installGroup = true
+        supplicant.*.freshNonce = true
+        supplicant.*.unanswered = 0
+        var none: [1]u8 = [1]u8{ 0 }
+        var noneBytes: [*]u8 = undefined
+        unsafe { noneBytes = @ptrCast([*]u8, &none) }
+        return reply(out, VERSION_AES | INFO_PAIRWISE | INFO_MIC | INFO_SECURE, counter, noneBytes, false, noneBytes, 0, past(ptkBytes(supplicant), KCK))
+    }
+    if !pairwise && has_mic && (info & INFO_SECURE) != 0 {
+        // Group message 1: a new GTK.
+        if !supplicant.*.hasPtk { return 0 }
+        if !newer(supplicant, counter) { return 0 }
+        if !micGood(past(ptkBytes(supplicant), KCK), frame, size) { return 0 }
+        var data: [256]u8 = undefined
+        var dataBytes: [*]u8 = undefined
+        unsafe { dataBytes = @ptrCast([*]u8, &data) }
+        const plain = if (info & INFO_ENCRYPTED) != 0 { keyData(past(ptkBytes(supplicant), KEK), frame, data_length, dataBytes) } else { 0 }
+        var rsn: usize = 0
+        var rsn_length: usize = 0
+        if plain == 0 || !takeElements(supplicant, dataBytes, plain, &rsn, &rsn_length) {
+            zero(dataBytes, 256)
+            supplicant.*.failure = FAILURE_KEY_DATA
+            return 0
+        }
+        zero(dataBytes, 256)
+        copy(replayBytes(supplicant), counter, 8)
+        copy(rscBytes(supplicant), past(frame, AT_RSC), 8)
+        supplicant.*.replayed = true
+        supplicant.*.installGroup = true
+        var none: [1]u8 = [1]u8{ 0 }
+        var noneBytes: [*]u8 = undefined
+        unsafe { noneBytes = @ptrCast([*]u8, &none) }
+        return reply(out, VERSION_AES | INFO_MIC | INFO_SECURE, counter, noneBytes, false, noneBytes, 0, past(ptkBytes(supplicant), KCK))
+    }
+    return 0
+}
+
+// Our RSN element for a network: version 1, the group cipher the access
+// point named (CCMP or TKIP), CCMP as pairwise cipher, the PSK AKM, no
+// capabilities (no PMF). Its length (20).
+pub fn ownElement(group_cipher: u8, out: [*]u8) -> usize {
+    var element: [20]u8 = [20]u8{ 48, 18, 1, 0, 0, 15, 172, 4, 1, 0, 0, 15, 172, 4, 1, 0, 0, 15, 172, 2 }
+    element[7] = group_cipher
+    var bytes: [*]const u8 = undefined
+    unsafe { bytes = @ptrCast([*]const u8, &element) }
+    copy(out, bytes, 20)
+    return 20
+}

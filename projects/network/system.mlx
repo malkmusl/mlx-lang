@@ -1,0 +1,410 @@
+// What mlx-netd needs from Linux beyond std.netlink: UDP sockets bound to
+// one link, poll, the time, random numbers, signals as a descriptor, and
+// files written whole (renamed into place).
+const std = @import("std")
+
+const SYS_read: usize = 0
+const SYS_write: usize = 1
+const SYS_open: usize = 2
+const SYS_close: usize = 3
+const SYS_poll: usize = 7
+const SYS_rt_sigprocmask: usize = 14
+const SYS_socket: usize = 41
+const SYS_sendto: usize = 44
+const SYS_recvfrom: usize = 45
+const SYS_bind: usize = 49
+const SYS_setsockopt: usize = 54
+const SYS_rename: usize = 82
+const SYS_mkdir: usize = 83
+const SYS_unlink: usize = 87
+const SYS_getrandom: usize = 318
+const SYS_signalfd4: usize = 289
+
+const AF_INET: usize = 2
+const SOCK_DGRAM: usize = 2
+const SOCK_NONBLOCK: usize = 2048
+const SOCK_CLOEXEC: usize = 524288
+const SOL_SOCKET: usize = 1
+const SO_REUSEADDR: usize = 2
+const SO_BROADCAST: usize = 6
+const SO_BINDTODEVICE: usize = 25
+const MSG_DONTWAIT: usize = 64
+const O_WRONLY_CREATE_TRUNCATE: usize = 577
+const O_RDONLY: usize = 0
+const O_EXCL: usize = 128
+const EINTR: isize = -4
+
+pub const POLLIN: u16 = 1
+
+pub fn milliseconds() -> usize { return std.time.milliseconds() }
+
+// Random bytes into `into` (falls back to the clock).
+pub fn random32() -> u32 {
+    var value: u32 = 0
+    const got = std.linux.syscall3(SYS_getrandom, @intFromPtr(&value), 4, 0)
+    if got != 4 { value = @intCast(u32, milliseconds() & 4294967295) *% 2654435761 }
+    return value
+}
+
+pub fn close(descriptor: isize) -> void {
+    if descriptor >= 0 { const closed = std.linux.syscall1(SYS_close, @bitCast(usize, descriptor)) }
+}
+
+// sockaddr_in for `address`:`port`.
+const SocketAddress = struct {
+    family: u16
+    port: u16
+    address: [4]u8
+    zero: [8]u8
+}
+
+fn socketAddress(address: [4]u8, port: u16) -> SocketAddress {
+    return SocketAddress.{ .family = @intCast(u16, AF_INET), .port = (port >> 8) | ((port & 255) << 8), .address = address, .zero = [8]u8{ 0, 0, 0, 0, 0, 0, 0, 0 } }
+}
+
+// A UDP socket on port `port` of every address, sending and hearing on
+// link `name` only, allowed to broadcast; -1 when it could not be made.
+pub fn udpOnLink(name: []const u8, port: u16) -> isize {
+    const descriptor = std.linux.syscall3(SYS_socket, AF_INET, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0)
+    if descriptor < 0 { return -1 }
+    var one: u32 = 1
+    const reused = std.linux.syscall5(SYS_setsockopt, @bitCast(usize, descriptor), SOL_SOCKET, SO_REUSEADDR, @intFromPtr(&one), 4)
+    const broadcast = std.linux.syscall5(SYS_setsockopt, @bitCast(usize, descriptor), SOL_SOCKET, SO_BROADCAST, @intFromPtr(&one), 4)
+    var device: [17]u8 = undefined
+    var length: usize = 0
+    while length < name.length && length < 16 {
+        device[length] = name[length]
+        length += 1
+    }
+    device[length] = 0
+    if std.linux.syscall5(SYS_setsockopt, @bitCast(usize, descriptor), SOL_SOCKET, SO_BINDTODEVICE, @intFromPtr(&device), length + 1) < 0 {
+        close(descriptor)
+        return -1
+    }
+    var any = socketAddress([4]u8{ 0, 0, 0, 0 }, port)
+    if std.linux.syscall3(SYS_bind, @bitCast(usize, descriptor), @intFromPtr(&any), 16) < 0 {
+        close(descriptor)
+        return -1
+    }
+    return descriptor
+}
+
+// Sends `length` bytes to `address`:`port`; false when it could not.
+pub fn sendTo(descriptor: isize, bytes: [*]const u8, length: usize, address: [4]u8, port: u16) -> bool {
+    var to = socketAddress(address, port)
+    while true {
+        const sent = std.linux.syscall6(SYS_sendto, @bitCast(usize, descriptor), @intFromPtr(bytes), length, MSG_DONTWAIT, @intFromPtr(&to), 16)
+        if sent == EINTR { continue }
+        return sent == @intCast(isize, length)
+    }
+    return false
+}
+
+// One datagram into `into` without waiting; its length (0: none waiting).
+pub fn receive(descriptor: isize, into: [*]u8, capacity: usize) -> isize {
+    while true {
+        const count = std.linux.syscall6(SYS_recvfrom, @bitCast(usize, descriptor), @intFromPtr(into), capacity, MSG_DONTWAIT, 0, 0)
+        if count == EINTR { continue }
+        if count < 0 { return 0 }
+        return count
+    }
+    return 0
+}
+
+// EAPOL over a link (AF_PACKET datagrams of type 0x888E, the link header
+// left to the kernel): what WPA's handshakes travel in.
+const AF_PACKET: usize = 17
+const ETH_P_PAE: u32 = 34958
+
+// sockaddr_ll for link `index`, to `address` (6 bytes, or none).
+fn linkAddress(into: [*]u8, index: u32, address: [*]const u8, has_address: bool) -> void {
+    var at: usize = 0
+    while at < 20 {
+        into[at] = 0
+        at += 1
+    }
+    into[0] = @intCast(u8, AF_PACKET)
+    // The protocol in network order.
+    into[2] = @intCast(u8, ETH_P_PAE >> 8)
+    into[3] = @intCast(u8, ETH_P_PAE & 255)
+    into[4] = @intCast(u8, index & 255)
+    into[5] = @intCast(u8, (index >> 8) & 255)
+    into[6] = @intCast(u8, (index >> 16) & 255)
+    into[7] = @intCast(u8, (index >> 24) & 255)
+    if has_address {
+        into[11] = 6
+        at = 0
+        while at < 6 {
+            into[12 + at] = address[at]
+            at += 1
+        }
+    }
+}
+
+// A socket for the EAPOL frames of link `index`; -1 when it could not be
+// made (it takes CAP_NET_RAW).
+pub fn eapolOpen(index: u32) -> isize {
+    const protocol = @intCast(usize, ((ETH_P_PAE & 255) << 8) | (ETH_P_PAE >> 8))
+    const descriptor = std.linux.syscall3(SYS_socket, AF_PACKET, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, protocol)
+    if descriptor < 0 { return -1 }
+    var address: [20]u8 = undefined
+    var bytes: [*]u8 = undefined
+    unsafe { bytes = @ptrCast([*]u8, &address) }
+    linkAddress(bytes, index, bytes, false)
+    if std.linux.syscall3(SYS_bind, @bitCast(usize, descriptor), @intFromPtr(&address), 20) < 0 {
+        close(descriptor)
+        return -1
+    }
+    return descriptor
+}
+
+// Sends an EAPOL frame to `to` (6 bytes) on link `index`.
+pub fn eapolSend(descriptor: isize, index: u32, to: [*]const u8, bytes: [*]const u8, length: usize) -> bool {
+    var address: [20]u8 = undefined
+    var addressBytes: [*]u8 = undefined
+    unsafe { addressBytes = @ptrCast([*]u8, &address) }
+    linkAddress(addressBytes, index, to, true)
+    while true {
+        const sent = std.linux.syscall6(SYS_sendto, @bitCast(usize, descriptor), @intFromPtr(bytes), length, MSG_DONTWAIT, @intFromPtr(&address), 20)
+        if sent == EINTR { continue }
+        return sent == @intCast(isize, length)
+    }
+    return false
+}
+
+// One EAPOL frame into `into` without waiting, its sender into `from` (6
+// bytes); its length (0: none waiting).
+pub fn eapolReceive(descriptor: isize, into: [*]u8, capacity: usize, from: [*]u8) -> isize {
+    var address: [20]u8 = undefined
+    var size: u32 = 20
+    while true {
+        const count = std.linux.syscall6(SYS_recvfrom, @bitCast(usize, descriptor), @intFromPtr(into), capacity, MSG_DONTWAIT, @intFromPtr(&address), @intFromPtr(&size))
+        if count == EINTR { continue }
+        if count < 0 { return 0 }
+        var at: usize = 0
+        while at < 6 {
+            from[at] = address[12 + at]
+            at += 1
+        }
+        return count
+    }
+    return 0
+}
+
+// pollfd entries: descriptor (4), events (2), revents (2).
+pub const Poll = struct {
+    entries: [32]u64
+    count: usize
+}
+
+pub fn pollClear(poll: *Poll) -> void { poll.*.count = 0 }
+
+// Watches `descriptor` for reading; its slot.
+pub fn pollAdd(poll: *Poll, descriptor: isize) -> usize {
+    const slot = poll.*.count
+    if slot >= 32 || descriptor < 0 { return 32 }
+    poll.*.entries[slot] = @intCast(u64, @bitCast(u32, @intCast(i32, descriptor))) | (@intCast(u64, POLLIN) << 32)
+    poll.*.count += 1
+    return slot
+}
+
+// Waits up to `timeout` milliseconds.
+pub fn pollWait(poll: *Poll, timeout: usize) -> void {
+    const waited = std.linux.syscall3(SYS_poll, @intFromPtr(&poll.*.entries), poll.*.count, timeout)
+}
+
+// Whether slot `slot` can be read.
+pub fn pollReady(poll: *Poll, slot: usize) -> bool {
+    if slot >= poll.*.count { return false }
+    return (poll.*.entries[slot] >> 48) & 25 != 0
+}
+
+// SIGTERM, SIGINT and SIGHUP as a descriptor (blocked otherwise).
+pub fn signals() -> isize {
+    // Bits 1 (SIGHUP), 2 (SIGINT), 15 (SIGTERM), counted from 1.
+    var mask: u64 = (1 << 0) | (1 << 1) | (1 << 14)
+    const blocked = std.linux.syscall4(SYS_rt_sigprocmask, 0, @intFromPtr(&mask), 0, 8)
+    return std.linux.syscall4(SYS_signalfd4, @bitCast(usize, @intCast(isize, -1)), @intFromPtr(&mask), 8, SOCK_NONBLOCK | SOCK_CLOEXEC)
+}
+
+// The signal waiting on `descriptor` (0: none).
+pub fn takeSignal(descriptor: isize) -> u32 {
+    var info: [128]u8 = undefined
+    const count = std.linux.syscall3(SYS_read, @bitCast(usize, descriptor), @intFromPtr(&info), 128)
+    if count < 128 { return 0 }
+    return @intCast(u32, info[0]) | (@intCast(u32, info[1]) << 8)
+}
+
+// Writes `text` to `path` whole: into PATH.new, renamed over PATH.
+pub fn writeFile(path: []const u8, text: []const u8) -> bool { return writeFileMode(path, text, 420) }
+
+// The same with the file's mode (0600: for root's eyes only); the
+// temporary file is made anew, so it never had another mode.
+pub fn writeFileMode(path: []const u8, text: []const u8, mode: usize) -> bool {
+    var temporary: [512]u8 = undefined
+    var final: [512]u8 = undefined
+    if path.length + 5 >= 512 { return false }
+    var index: usize = 0
+    while index < path.length {
+        temporary[index] = path[index]
+        final[index] = path[index]
+        index += 1
+    }
+    final[index] = 0
+    temporary[index] = 46
+    temporary[index + 1] = 110
+    temporary[index + 2] = 101
+    temporary[index + 3] = 119
+    temporary[index + 4] = 0
+    const unlinked = std.linux.syscall1(SYS_unlink, @intFromPtr(&temporary))
+    const descriptor = std.linux.syscall3(SYS_open, @intFromPtr(&temporary), O_WRONLY_CREATE_TRUNCATE | O_EXCL, mode)
+    if descriptor < 0 { return false }
+    var done: usize = 0
+    var bytes: [*]const u8 = undefined
+    unsafe { bytes = @ptrCast([*]const u8, text) }
+    while done < text.length {
+        const wrote = std.linux.syscall3(SYS_write, @bitCast(usize, descriptor), @intFromPtr(bytes) + done, text.length - done)
+        if wrote <= 0 { break }
+        done += @intCast(usize, wrote)
+    }
+    close(descriptor)
+    if done < text.length { return false }
+    return std.linux.syscall2(SYS_rename, @intFromPtr(&temporary), @intFromPtr(&final)) == 0
+}
+
+// Makes folder `path` (and the ones above it) with `mode` where missing.
+pub fn makeFolders(path: []const u8, mode: usize) -> void {
+    var name: [512]u8 = undefined
+    if path.length >= 511 { return }
+    var index: usize = 0
+    while index < path.length {
+        name[index] = path[index]
+        index += 1
+    }
+    name[path.length] = 0
+    index = 1
+    while index <= path.length {
+        if index == path.length || name[index] == 47 {
+            const kept = name[index]
+            name[index] = 0
+            const made = std.linux.syscall2(SYS_mkdir, @intFromPtr(&name), mode)
+            name[index] = kept
+        }
+        index += 1
+    }
+}
+
+// Reads `path` into `into` (at most `capacity` bytes); its length (0:
+// none, or empty).
+pub fn readFile(path: []const u8, into: [*]u8, capacity: usize) -> usize {
+    var name: [512]u8 = undefined
+    if path.length >= 512 { return 0 }
+    var index: usize = 0
+    while index < path.length {
+        name[index] = path[index]
+        index += 1
+    }
+    name[index] = 0
+    const descriptor = std.linux.syscall3(SYS_open, @intFromPtr(&name), O_RDONLY, 0)
+    if descriptor < 0 { return 0 }
+    var length: usize = 0
+    while length < capacity {
+        const count = std.linux.syscall3(SYS_read, @bitCast(usize, descriptor), @intFromPtr(into) + length, capacity - length)
+        if count <= 0 { break }
+        length += @intCast(usize, count)
+    }
+    close(descriptor)
+    return length
+}
+
+pub fn say(text: []const u8) -> void { const ignored = std.io.writeAll(std.io.stderr(), text) }
+
+// "10.7.0.2" into `out` (16 bytes); its length.
+pub fn putAddress(out: [*]u8, at: usize, address: [4]u8) -> usize {
+    var length = at
+    var part: usize = 0
+    while part < 4 {
+        if part > 0 {
+            out[length] = 46
+            length += 1
+        }
+        length = putNumber(out, length, @intCast(u64, address[part]))
+        part += 1
+    }
+    return length
+}
+
+pub fn putNumber(out: [*]u8, at: usize, value: u64) -> usize {
+    var digits: [20]u8 = undefined
+    var count: usize = 0
+    var rest = value
+    while rest > 0 || count == 0 {
+        digits[count] = @intCast(u8, 48 + rest % 10)
+        rest = rest / 10
+        count += 1
+    }
+    var length = at
+    while count > 0 {
+        count -= 1
+        out[length] = digits[count]
+        length += 1
+    }
+    return length
+}
+
+pub fn put(out: [*]u8, at: usize, text: []const u8) -> usize {
+    var length = at
+    for byte in text {
+        out[length] = byte
+        length += 1
+    }
+    return length
+}
+
+pub fn same(first: []const u8, second: []const u8) -> bool {
+    if first.length != second.length { return false }
+    var index: usize = 0
+    while index < first.length {
+        if first[index] != second[index] { return false }
+        index += 1
+    }
+    return true
+}
+
+pub fn startsWith(text: []const u8, prefix: []const u8) -> bool { return text.length >= prefix.length && same(text[0..prefix.length], prefix) }
+
+// "10.7.0.2" (or "10.7.0.2/24") into `address` (and `prefix`); false when
+// it is not one.
+pub fn parseAddress(text: []const u8, address: [*]u8, prefix: *u8) -> bool {
+    var part: usize = 0
+    var value: u32 = 0
+    var digits: usize = 0
+    var index: usize = 0
+    prefix.* = 32
+    while index <= text.length {
+        const byte: u8 = if index < text.length { text[index] } else { 0 }
+        if byte >= 48 && byte <= 57 {
+            value = value * 10 + @intCast(u32, byte - 48)
+            digits += 1
+            if value > 255 && part < 4 { return false }
+        } else if byte == 46 || byte == 47 || byte == 0 {
+            if digits == 0 { return false }
+            if part < 4 {
+                address[part] = @intCast(u8, value)
+            } else {
+                if value > 32 { return false }
+                prefix.* = @intCast(u8, value)
+            }
+            part += 1
+            value = 0
+            digits = 0
+            if byte == 0 { break }
+            if byte == 46 && part >= 4 { return false }
+            if byte == 47 && part != 4 { return false }
+        } else {
+            return false
+        }
+        index += 1
+    }
+    return part == 4 || part == 5
+}

@@ -25,7 +25,8 @@ settings ask for: its preferred size at 50 Hz instead of 60; the output
 told in $XDG_RUNTIME_DIR/wayland-drm.display for mlx-settings; night light
 at 3000 K in the CRTC's gamma table, the console's table kept), the Mlx
 terminal maps and gets typed into from the keyboard, the
-mouse and the touchpad move the cursor, a mouse plugged in later works,
+mouse and the touchpad move the cursor, three fingers swipe to workspace 2
+and back, a mouse plugged in later works,
 night light follows the settings file (2000 K), a VT switch (Ctrl+Alt+F2)
 pauses and resumes everything (night light set again), and Alt+Shift+Q
 quits with the CRTC and its gamma table restored and every device given
@@ -80,7 +81,7 @@ EV_SYN, EV_KEY, EV_REL, EV_ABS = 0, 1, 2, 3
 REL_X, REL_Y, REL_WHEEL = 0, 1, 8
 ABS_X, ABS_Y = 0, 1
 BTN_LEFT, BTN_RIGHT, BTN_MIDDLE = 272, 273, 274
-BTN_TOOL_FINGER, BTN_TOUCH, BTN_TOOL_DOUBLETAP = 325, 330, 333
+BTN_TOOL_FINGER, BTN_TOUCH, BTN_TOOL_DOUBLETAP, BTN_TOOL_TRIPLETAP = 325, 330, 333, 334
 KEY_LEFTSHIFT, KEY_LEFTCTRL, KEY_LEFTALT, KEY_F2, KEY_Q, KEY_ENTER = 42, 29, 56, 60, 16, 28
 
 # The monitor: connector 42 (eDP, connected) with a preferred 1000x700 mode
@@ -441,7 +442,7 @@ class FakeInput(DeviceServer):
             elif self.kind == "mouse":
                 argument[:] = bits(BTN_LEFT, BTN_RIGHT, BTN_MIDDLE, size=size)
             else:
-                argument[:] = bits(BTN_LEFT, BTN_TOOL_FINGER, BTN_TOUCH, BTN_TOOL_DOUBLETAP, size=size)
+                argument[:] = bits(BTN_LEFT, BTN_TOOL_FINGER, BTN_TOUCH, BTN_TOOL_DOUBLETAP, BTN_TOOL_TRIPLETAP, size=size)
             return size, argument, None
         if number == 0x22:
             argument[:] = bits(REL_X, REL_Y, REL_WHEEL, size=size) if self.kind == "mouse" else bytearray(size)
@@ -861,6 +862,24 @@ def main():
         x += 40
         harness.cursor_at(x, y)
         print("ok   mouse (with acceleration) and touchpad (10 mm = 40 px) move the cursor")
+
+        # Three fingers swiping up bring workspace 2 (266 px of the 700 the
+        # screen is high, and a flick); down again workspace 1.
+        def swipe(dy):
+            pad.events((EV_KEY, BTN_TOOL_TRIPLETAP, 1), (EV_KEY, BTN_TOUCH, 1), (EV_ABS, ABS_X, 1000),
+                       (EV_ABS, ABS_Y, 3000), (EV_SYN, 0, 0))
+            for step in range(1, 21):
+                time.sleep(0.02)
+                pad.events((EV_ABS, ABS_Y, 3000 + dy * step), (EV_SYN, 0, 0))
+            pad.events((EV_KEY, BTN_TOUCH, 0), (EV_KEY, BTN_TOOL_TRIPLETAP, 0), (EV_SYN, 0, 0))
+        swipe(-100)
+        harness.wait_log("swipe: to workspace 2", 5, "a three-finger swipe up to workspace 2")
+        harness.wait_log("workspace: 2", 5, "workspace 2")
+        time.sleep(0.5)
+        swipe(100)
+        harness.wait_log("swipe: to workspace 1", 5, "a three-finger swipe down to workspace 1")
+        time.sleep(0.5)
+        print("ok   three fingers swipe the workspaces up and down")
 
         # A mouse plugged in now.
         second = harness.add_input(3, "mouse", "Plugged Mouse", create_node=True)

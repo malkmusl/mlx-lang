@@ -1,0 +1,367 @@
+// std.tinypage_allocator: small blocks on tiny pages. A page of 4 KiB is
+// split into 64 tiny pages of 64 bytes; a block takes a run of them in one
+// page, the first run that fits, so a small block squeezes in between the
+// others where one went before, and gives them back when it is freed. Two
+// bitmaps per page say what is taken: the tiny pages in use, and where
+// each block starts. A free needs no length (one given a wrong length still
+// frees the block it names, and a block freed twice is seen and left be).
+//
+// The pages lie in one region at a fixed address that every image of the
+// process shares (the program, the shared objects and plugins it loads):
+// the first that needs it maps it, the others find it there. So a block
+// taken in one image can be freed in another, and whether an address is a
+// tiny block is a range check. std.page_allocator puts every block of up to
+// LIMIT bytes here; larger ones, and every one when the region cannot be
+// had (a kernel without MAP_FIXED_NOREPLACE, an address space too small),
+// get whole pages as before. Blocks come zeroed, as fresh pages do.
+//
+// A page left empty keeps its memory while few are (a block freed and taken
+// again costs no system call); past KEEP_EMPTY of them, an emptied page's
+// memory goes back to the kernel (MADV_DONTNEED) and comes back zeroed when
+// the page is used again.
+const linux = @import("./os/linux.mlx")
+const mem = @import("./mem.mlx")
+
+const PAGE: usize = 4096
+pub const TINY: usize = 64
+const TINIES: usize = 64
+// The largest block taken here (and the largest alignment honoured).
+pub const LIMIT: usize = 2048
+// At most 4 GiB of tiny pages.
+const PAGES: usize = 1048576
+const GROUP: usize = 64
+const ALL: usize = 18446744073709551615
+
+// The region: a header page, the tables, then the pages.
+//   header words: magic, lock, frontier (pages handed out), committed
+//   (pages writable), empty pages kept, the page used last, live blocks,
+//   live bytes (in tiny pages)
+//   used, starts: a word per page; largest: the longest free run of each
+//   page; kept: per page 1 when it is an empty page kept, 2 when its memory
+//   went back; groups: the longest free run of each 64 pages.
+pub const BASE: usize = 35184372088832
+const MAGIC: usize = 6076838957425043529
+const USED_AT: usize = 4096
+const STARTS_AT: usize = USED_AT + PAGES * 8
+const LARGEST_AT: usize = STARTS_AT + PAGES * 8
+const KEPT_AT: usize = LARGEST_AT + PAGES
+const GROUPS_AT: usize = KEPT_AT + PAGES
+const TABLES: usize = 20971520
+pub const DATA: usize = BASE + TABLES
+pub const END: usize = DATA + PAGES * PAGE
+const COMMIT_STEP: usize = 256
+const KEEP_EMPTY: usize = 64
+
+const MAGIC_WORD: usize = 0
+const LOCK_WORD: usize = 1
+const FRONTIER: usize = 2
+const COMMITTED: usize = 3
+const EMPTY_KEPT: usize = 4
+const LAST: usize = 5
+const BLOCKS: usize = 6
+const BYTES: usize = 7
+
+// MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED_NOREPLACE
+const MAP_FLAGS: usize = 1064994
+const EEXIST: isize = -17
+const SYS_mprotect: usize = 10
+const SYS_madvise: usize = 28
+const MADV_DONTNEED: usize = 4
+
+// This image's view of the region: 0 not looked for yet, 1 there, 2 not
+// to be had.
+var region: usize = 0
+
+fn words(address: usize) -> [*]usize {
+    unsafe { return @ptrFromInt([*]usize, address) }
+}
+
+fn bytes(address: usize) -> [*]u8 {
+    unsafe { return @ptrFromInt([*]u8, address) }
+}
+
+fn header() -> [*]usize { return words(BASE) }
+
+// Maps the region, or finds it mapped by another image of the process.
+fn attach() -> bool {
+    if region == 1 { return true }
+    if region == 2 { return false }
+    const tables = linux.syscall6(linux.SYS_mmap, BASE, TABLES, 3, MAP_FLAGS, ALL, 0)
+    if tables == @bitCast(isize, BASE) {
+        const pages = linux.syscall6(linux.SYS_mmap, DATA, PAGES * PAGE, 0, MAP_FLAGS, ALL, 0)
+        if pages != @bitCast(isize, DATA) {
+            if pages >= 0 { const dropped = linux.syscall2(linux.SYS_munmap, @bitCast(usize, pages), PAGES * PAGE) }
+            const released = linux.syscall2(linux.SYS_munmap, BASE, TABLES)
+            region = 2
+            return false
+        }
+        var magic: *usize = undefined
+        unsafe { magic = @ptrFromInt(*usize, BASE) }
+        @atomicStore(usize, magic, MAGIC, release)
+        region = 1
+        return true
+    }
+    if tables >= 0 {
+        // The kernel took the address as a hint only: not the region.
+        const released = linux.syscall2(linux.SYS_munmap, @bitCast(usize, tables), TABLES)
+        region = 2
+        return false
+    }
+    if tables == EEXIST {
+        // Another image's: ready once its magic is written.
+        var magic: *usize = undefined
+        unsafe { magic = @ptrFromInt(*usize, BASE) }
+        var tries: usize = 0
+        while tries < 100000 {
+            if @atomicLoad(usize, magic, acquire) == MAGIC {
+                region = 1
+                return true
+            }
+            const yielded = linux.syscall0(24)
+            tries += 1
+        }
+    }
+    region = 2
+    return false
+}
+
+fn lockWord() -> *u32 {
+    unsafe { return @ptrFromInt(*u32, BASE + LOCK_WORD * 8) }
+}
+
+fn acquire() -> void {
+    const word = lockWord()
+    const fast = @cmpxchgWeak(u32, word, 0, 1, acquire, monotonic)
+    if fast.0 { return }
+    while true {
+        const previous = @atomicRmw(u32, word, xchg, 2, acquire)
+        if previous == 0 { return }
+        const slept = linux.thread.futexWait(word, 2, 0, true)
+    }
+}
+
+fn release() -> void {
+    const word = lockWord()
+    const previous = @atomicRmw(u32, word, xchg, 0, release)
+    if previous == 2 { const woken = linux.thread.futexWake(word, 1, true) }
+}
+
+fn used() -> [*]usize { return words(BASE + USED_AT) }
+fn starts() -> [*]usize { return words(BASE + STARTS_AT) }
+fn largest() -> [*]u8 { return bytes(BASE + LARGEST_AT) }
+fn kept() -> [*]u8 { return bytes(BASE + KEPT_AT) }
+fn groups() -> [*]u8 { return bytes(BASE + GROUPS_AT) }
+
+// `count` tiny pages from `at` as bits.
+fn run(at: usize, count: usize) -> usize {
+    if count >= TINIES { return ALL }
+    return ((@intCast(usize, 1) << count) - 1) << at
+}
+
+// The longest run of free tiny pages in a page's bitmap.
+fn longestFree(bits: usize) -> u8 {
+    var best: usize = 0
+    var current: usize = 0
+    var bit: usize = 0
+    while bit < TINIES {
+        if (bits >> bit) & 1 == 0 {
+            current += 1
+            if current > best { best = current }
+        } else {
+            current = 0
+        }
+        bit += 1
+    }
+    return @intCast(u8, best)
+}
+
+// Where `count` free tiny pages start in `page`, at a multiple of `step`
+// (TINIES: nowhere).
+fn freeRun(page: usize, count: usize, step: usize) -> usize {
+    if @intCast(usize, largest()[page]) < count { return TINIES }
+    const bits = used()[page]
+    var at: usize = 0
+    while at + count <= TINIES {
+        if bits & run(at, count) == 0 { return at }
+        at += step
+    }
+    return TINIES
+}
+
+fn refreshGroup(group: usize) -> void {
+    const frontier = header()[FRONTIER]
+    var best: u8 = 0
+    var page = group * GROUP
+    while page < (group + 1) * GROUP && page < frontier {
+        if largest()[page] > best { best = largest()[page] }
+        page += 1
+    }
+    groups()[group] = best
+}
+
+// The first page with `count` free tiny pages at a multiple of `step`
+// (PAGES: none); its run in `at`.
+fn findPage(count: usize, step: usize, at: *usize) -> usize {
+    const frontier = header()[FRONTIER]
+    var group: usize = 0
+    while group * GROUP < frontier {
+        if @intCast(usize, groups()[group]) >= count {
+            var page = group * GROUP
+            while page < (group + 1) * GROUP && page < frontier {
+                const found = freeRun(page, count, step)
+                if found < TINIES {
+                    at.* = found
+                    return page
+                }
+                page += 1
+            }
+        }
+        group += 1
+    }
+    return PAGES
+}
+
+// A page past the last one handed out (writable a megabyte at a time);
+// PAGES when the region is full.
+fn freshPage() -> usize {
+    const head = header()
+    const page = head[FRONTIER]
+    if page >= PAGES { return PAGES }
+    if page >= head[COMMITTED] {
+        const step = if PAGES - head[COMMITTED] < COMMIT_STEP { PAGES - head[COMMITTED] } else { COMMIT_STEP }
+        if linux.syscall3(SYS_mprotect, DATA + head[COMMITTED] * PAGE, step * PAGE, 3) != 0 { return PAGES }
+        head[COMMITTED] += step
+    }
+    head[FRONTIER] = page + 1
+    used()[page] = 0
+    starts()[page] = 0
+    largest()[page] = @intCast(u8, TINIES)
+    kept()[page] = 0
+    groups()[page / GROUP] = @intCast(u8, TINIES)
+    return page
+}
+
+// Takes `count` tiny pages at `at` in `page` for a block.
+fn take(page: usize, at: usize, count: usize) -> void {
+    const head = header()
+    if used()[page] == 0 && kept()[page] == 1 { head[EMPTY_KEPT] -= 1 }
+    kept()[page] = 0
+    used()[page] = used()[page] | run(at, count)
+    starts()[page] = starts()[page] | (@intCast(usize, 1) << at)
+    largest()[page] = longestFree(used()[page])
+    refreshGroup(page / GROUP)
+    head[LAST] = page
+    head[BLOCKS] += 1
+    head[BYTES] += count * TINY
+}
+
+// A block of `length` bytes aligned to `alignment`, zeroed; 0 when it is
+// not one for tiny pages (too large, an alignment of a page) or there is
+// no room.
+pub fn alloc(length: usize, alignment: usize) -> usize {
+    const aligned_to = if alignment == 0 { 1 } else { alignment }
+    if length == 0 || length > LIMIT || aligned_to > LIMIT || aligned_to & (aligned_to - 1) != 0 { return 0 }
+    if !attach() { return 0 }
+    const count = (length + TINY - 1) / TINY
+    const step = if aligned_to > TINY { aligned_to / TINY } else { 1 }
+    acquire()
+    const head = header()
+    var at: usize = TINIES
+    var page = PAGES
+    // The page used last, then the first with room, then a new one.
+    if head[LAST] < head[FRONTIER] {
+        at = freeRun(head[LAST], count, step)
+        if at < TINIES { page = head[LAST] }
+    }
+    if page == PAGES { page = findPage(count, step, &at) }
+    if page == PAGES {
+        page = freshPage()
+        at = 0
+    }
+    if page == PAGES {
+        release()
+        return 0
+    }
+    take(page, at, count)
+    release()
+    const address = DATA + page * PAGE + at * TINY
+    mem.zero(bytes(address), count * TINY)
+    return address
+}
+
+// Whether `address` lies in the tiny pages (and so must not be unmapped).
+pub fn owns(address: usize) -> bool {
+    return address >= DATA && address < END && attach()
+}
+
+// Frees the block at `address`; false when it is not in the tiny pages.
+// A block freed twice, or an address inside a block, is left be.
+pub fn free(address: usize) -> bool {
+    if !owns(address) { return false }
+    const offset = address - DATA
+    if offset % TINY != 0 { return true }
+    const page = offset / PAGE
+    const at = (offset % PAGE) / TINY
+    acquire()
+    const head = header()
+    if page >= head[FRONTIER] || (starts()[page] >> at) & 1 == 0 {
+        release()
+        return true
+    }
+    // The block runs on to the next start or the first free tiny page.
+    var count: usize = 1
+    while at + count < TINIES && (used()[page] >> (at + count)) & 1 == 1 && (starts()[page] >> (at + count)) & 1 == 0 { count += 1 }
+    used()[page] = used()[page] & ~run(at, count)
+    starts()[page] = starts()[page] & ~(@intCast(usize, 1) << at)
+    head[BLOCKS] -= 1
+    head[BYTES] -= count * TINY
+    if used()[page] == 0 {
+        if head[EMPTY_KEPT] < KEEP_EMPTY {
+            kept()[page] = 1
+            head[EMPTY_KEPT] += 1
+        } else {
+            kept()[page] = 2
+            const advised = linux.syscall3(SYS_madvise, DATA + page * PAGE, PAGE, MADV_DONTNEED)
+        }
+    }
+    largest()[page] = longestFree(used()[page])
+    refreshGroup(page / GROUP)
+    release()
+    return true
+}
+
+// What a block of `length` bytes at `address` takes: tiny pages in the
+// region, whole pages elsewhere.
+pub fn footprint(address: usize, length: usize) -> usize {
+    if address >= DATA && address < END { return (length + TINY - 1) / TINY * TINY }
+    return (length + PAGE - 1) / PAGE * PAGE
+}
+
+// How the tiny pages are used, for diagnostics: pages handed out, live
+// blocks, the bytes their tiny pages hold, and empty pages (0s when the
+// region is not there).
+pub const Usage = struct {
+    pages: usize
+    blocks: usize
+    bytes: usize
+    empty: usize
+}
+
+pub fn usage(into: *Usage) -> void {
+    into.*.pages = 0
+    into.*.blocks = 0
+    into.*.bytes = 0
+    into.*.empty = 0
+    if region != 1 { return }
+    acquire()
+    const head = header()
+    into.*.pages = head[FRONTIER]
+    into.*.blocks = head[BLOCKS]
+    into.*.bytes = head[BYTES]
+    var page: usize = 0
+    while page < head[FRONTIER] {
+        if used()[page] == 0 { into.*.empty += 1 }
+        page += 1
+    }
+    release()
+}

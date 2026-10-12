@@ -67,6 +67,15 @@ pub const Renderer = struct {
     readback: *gpu.Buffer
     copyTo: [2]usize
     copyPitch: [2]usize
+    // While the output is captured (compositor.captureOutputs): each
+    // slot's frame in host memory as well (the slots' layout; `readback`
+    // when that is it already), kept by copying what each frame changed
+    // (all of it the first time: captureSynced); captureLayout is the
+    // layout it was made for (stride, height, the two offsets).
+    capture: *gpu.Buffer
+    captureSynced: [2]bool
+    captureLayout: [4]u32
+    captureFailed: bool
     // Freestanding: the slots are the dumb buffers imported as dma-bufs,
     // and whether a frame the GPU rendered has been seen in one of them
     // through its mapping (verifyOutput).
@@ -133,6 +142,10 @@ pub const Renderer = struct {
     blurSlot: u32
 }
 
+// The palette's rows: the focus colour, the frame colour, the previews'
+// panel, then the snap preview at each opacity (scene.SNAP_LEVELS).
+const SNAP_ROW: u32 = 3
+const PALETTE_ROWS: u32 = 11
 const BLUR_SLOTS: u32 = 64
 // Bent windows a frame, and the words of each one's control points (16 x
 // offsets, 16 y offsets).
@@ -167,6 +180,11 @@ fn fillStatic(compositor: *Compositor, renderer: *Renderer) -> void {
         pixels[index] = compositor.*.focusColor
         pixels[palette_width + index] = compositor.*.frameColor
         pixels[palette_width * 2 + index] = scene.PREVIEW_COLOR
+        var level: u32 = 0
+        while level < scene.SNAP_LEVELS {
+            pixels[palette_width * @intCast(usize, SNAP_ROW + level) + index] = scene.snapPreviewColor(compositor, level)
+            level += 1
+        }
         index += 1
     }
     const box = @intCast(usize, scene.CURSOR_SIZE)
@@ -220,6 +238,7 @@ pub fn open(compositor: *Compositor, arguments: [][*]const u8, output: ?*kms.Out
         renderer.*.targets[0] = @ptrFromInt(*gpu.Buffer, record(compositor, @sizeOf(gpu.Buffer)))
         renderer.*.targets[1] = @ptrFromInt(*gpu.Buffer, record(compositor, @sizeOf(gpu.Buffer)))
         renderer.*.readback = @ptrFromInt(*gpu.Buffer, record(compositor, @sizeOf(gpu.Buffer)))
+        renderer.*.capture = @ptrFromInt(*gpu.Buffer, record(compositor, @sizeOf(gpu.Buffer)))
         renderer.*.background = @ptrFromInt(*gpu.Buffer, record(compositor, @sizeOf(gpu.Buffer)))
         renderer.*.palette = @ptrFromInt(*gpu.Buffer, record(compositor, @sizeOf(gpu.Buffer)))
         renderer.*.arrow = @ptrFromInt(*gpu.Buffer, record(compositor, @sizeOf(gpu.Buffer)))
@@ -238,6 +257,10 @@ pub fn open(compositor: *Compositor, arguments: [][*]const u8, output: ?*kms.Out
     renderer.*.failed = false
     renderer.*.copyOutput = false
     clearBuffer(renderer.*.readback)
+    clearBuffer(renderer.*.capture)
+    renderer.*.captureSynced[0] = false
+    renderer.*.captureSynced[1] = false
+    renderer.*.captureFailed = false
     renderer.*.importedDumb = false
     renderer.*.scanout = false
     renderer.*.verified = false
@@ -277,7 +300,8 @@ pub fn open(compositor: *Compositor, arguments: [][*]const u8, output: ?*kms.Out
         return false
     }
 
-    // The background, the palette rows long enough for any frame edge, and
+    // The background, the palette rows (focus, frame, previews, the snap
+    // preview at each of its opacities) long enough for any frame edge, and
     // the cursors, one CURSOR_SIZE box each, one below the other; filled by
     // fillStatic (again when a new renderer is loaded: reloaded).
     const width = compositor.*.width
@@ -285,7 +309,7 @@ pub fn open(compositor: *Compositor, arguments: [][*]const u8, output: ?*kms.Out
     if !gpu.createUploadBuffer(context, renderer.*.background, @intCast(u64, width * height * 4)) { return false }
     const longest = if width > height { width } else { height }
     renderer.*.paletteWidth = @intCast(u32, longest + 8)
-    if !gpu.createUploadBuffer(context, renderer.*.palette, @intCast(u64, (longest + 8) * 3 * 4)) { return false }
+    if !gpu.createUploadBuffer(context, renderer.*.palette, @intCast(u64, (longest + 8) * 4 * @intCast(usize, PALETTE_ROWS))) { return false }
     const box = @intCast(usize, scene.CURSOR_SIZE)
     if !gpu.createUploadBuffer(context, renderer.*.arrow, @intCast(u64, box * box * @intCast(usize, scene.CURSOR_KINDS) * 4)) { return false }
     fillStatic(compositor, renderer)
@@ -780,6 +804,24 @@ fn fill(compositor: *Compositor, renderer: *Renderer, x: i32, y: i32, width: i32
     blit(compositor, renderer, renderer.*.palette.*.buffer, row * renderer.*.paletteWidth, 0, clipped, height, x, y, true)
 }
 
+// A palette row blended over the frame by its alpha (the snap preview).
+fn fillTranslucent(compositor: *Compositor, renderer: *Renderer, x: i32, y: i32, width: i32, height: i32, row: u32) -> void {
+    const longest = @intCast(i32, renderer.*.paletteWidth)
+    const clipped = if width > longest { longest } else { width }
+    blit(compositor, renderer, renderer.*.palette.*.buffer, row * renderer.*.paletteWidth, 0, clipped, height, x, y, false)
+}
+
+// Where the dragged window would snap (scene.snapShape), as scene.mlx
+// draws it.
+fn drawSnapPreview(compositor: *Compositor, renderer: *Renderer) -> void {
+    if !scene.snapPreviewShown(compositor) || renderer.*.failed { return }
+    const shape = scene.snapShape(compositor)
+    renderer.*.maskFlags = shaders.FLAG_CLIP_CORNERS
+    renderer.*.maskA = shape
+    fillTranslucent(compositor, renderer, shape.x, shape.y, shape.width, shape.height, SNAP_ROW + scene.snapPreviewLevel(compositor))
+    renderer.*.maskFlags = 0
+}
+
 // The frame and title bar (rounded, scene.outerShape) as scene.mlx draws
 // them: the same four pieces, each pixel at the frame's coverage
 // (FLAG_RING), then the title.
@@ -1055,6 +1097,40 @@ fn drawPreviews(compositor: *Compositor, renderer: *Renderer) -> void {
     }
 }
 
+// The capture buffer for the slots' layout (made again when that
+// changed: what it held is then stale); false when there is none.
+fn captureBuffer(compositor: *Compositor, renderer: *Renderer) -> bool {
+    const layout = [4]u32{ renderer.*.stride, @intCast(u32, compositor.*.height), renderer.*.targetOffsets[0], renderer.*.targetOffsets[1] }
+    var same = renderer.*.capture.*.address != 0
+    var index: usize = 0
+    while index < 4 {
+        if renderer.*.captureLayout[index] != layout[index] { same = false }
+        index += 1
+    }
+    if same { return true }
+    renderer.*.captureSynced[0] = false
+    renderer.*.captureSynced[1] = false
+    if renderer.*.captureFailed { return false }
+    gpu.destroyBuffer(renderer.*.context, renderer.*.capture)
+    clearBuffer(renderer.*.capture)
+    const last = if layout[2] > layout[3] { layout[2] } else { layout[3] }
+    const words = @intCast(u64, last) + @intCast(u64, layout[0]) * @intCast(u64, layout[1])
+    if !gpu.createReadbackBuffer(renderer.*.context, renderer.*.capture, words * 4) {
+        gpu.destroyBuffer(renderer.*.context, renderer.*.capture)
+        clearBuffer(renderer.*.capture)
+        renderer.*.captureFailed = true
+        state.say("renderer: no host memory for screen capture; capture reads the output itself (slow)\n")
+        return false
+    }
+    index = 0
+    while index < 4 {
+        renderer.*.captureLayout[index] = layout[index]
+        index += 1
+    }
+    if compositor.*.verbose { state.say("renderer: the output is captured: what frames change is copied into host memory\n") }
+    return true
+}
+
 // Composes the whole output into frame slot `slot` (0 or 1: nested, the
 // host window's first or second buffer; freestanding, the dumb buffer) and
 // waits for it; false when Vulkan failed.
@@ -1079,12 +1155,14 @@ pub fn compose(compositor: *Compositor, slot: usize) -> bool {
     const width = @intCast(i32, compositor.*.width)
     const height = @intCast(i32, compositor.*.height)
     blit(compositor, renderer, renderer.*.background.*.buffer, 0, @intCast(u32, compositor.*.width), width, height, 0, 0, true)
+    // Windows sliding (animation.mlx) are drawn where the slide has them.
+    scene.shiftWindows(compositor, 1)
     var index: usize = 0
     while index < compositor.*.stack.length {
         const address = state.listAt(compositor.*.stack, index)
         const surface = state.surfaceAt(address)
-        if scene.hidden(address) {
-            // Minimized.
+        if !scene.shown(address) {
+            // Minimized, or on another workspace.
         } else if surface.*.role == state.ROLE_TOPLEVEL {
             const focused = address == compositor.*.keyboardFocus
             if surface.*.zooming && drawZoomed(compositor, renderer, address, focused) {
@@ -1097,6 +1175,8 @@ pub fn compose(compositor: *Compositor, slot: usize) -> bool {
         }
         index += 1
     }
+    scene.shiftWindows(compositor, -1)
+    drawSnapPreview(compositor, renderer)
     drawPreviews(compositor, renderer)
     // What a drag carries, at the pointer.
     if compositor.*.dragging && compositor.*.dragIcon != 0 {
@@ -1121,8 +1201,29 @@ pub fn compose(compositor: *Compositor, slot: usize) -> bool {
     if renderer.*.copyOutput && !ui.isEmpty(area) {
         gpu.copyBlock(context, renderer.*.target, renderer.*.readback.*.buffer, @intCast(u64, renderer.*.offset), @intCast(u64, renderer.*.stride), @intCast(u64, area.x), @intCast(u64, area.y), @intCast(u64, area.width), @intCast(u64, area.height))
     }
+    // Captured: what changed into host memory too (the readback buffer is
+    // that already), all of it the first time.
+    compositor.*.captureFrame = 0
+    var capture_base: usize = 0
+    if compositor.*.captureOutputs == 0 {
+        renderer.*.captureSynced[0] = false
+        renderer.*.captureSynced[1] = false
+    } else if renderer.*.copyOutput {
+        capture_base = renderer.*.readback.*.address
+    } else if captureBuffer(compositor, renderer) {
+        const changed = if renderer.*.captureSynced[slot] { area } else { scene.outputRect(compositor) }
+        if !ui.isEmpty(changed) {
+            gpu.copyBlock(context, renderer.*.target, renderer.*.capture.*.buffer, @intCast(u64, renderer.*.offset), @intCast(u64, renderer.*.stride), @intCast(u64, changed.x), @intCast(u64, changed.y), @intCast(u64, changed.width), @intCast(u64, changed.height))
+        }
+        renderer.*.captureSynced[slot] = true
+        capture_base = renderer.*.capture.*.address
+    }
     const submitted = state.microseconds()
     if !gpu.submit(context) { return false }
+    if capture_base != 0 {
+        compositor.*.captureFrame = capture_base + @intCast(usize, renderer.*.offset) * 4
+        compositor.*.captureFrameStride = @intCast(usize, renderer.*.stride) * 4
+    }
     const copying = state.microseconds()
     compositor.*.gpuMicros += copying - submitted
     if renderer.*.copyOutput {

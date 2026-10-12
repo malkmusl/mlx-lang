@@ -135,18 +135,70 @@ the monospaced font of `std.ui.text` and handles its keys and wheel, for
 `projects/desktop/terminal` and any app with a terminal pane. A
 `std.ui.host` app watches a descriptor (the pty) with `watchDescriptor()`
 and gets `EVENT_WATCH`; `plainTyped()` is the key's text without Control
-and Alt.
+and Alt. Without a compositor the same screen and drawing run on the
+Linux framebuffer (`projects/console`, mlx-console): `std.ui.text`'s
+`loadFontFile()` takes a font by path, and `std.ui.wayland.keyboard`
+reads keys from evdev with a keymap of the program's own through
+`useKeymap()` and `press()`. The emulation is checked by
+`tests/301_terminal_core_runtime.mlx`, the drawing and the pty by
+`tests/support/terminal_render.mlx` and `tests/support/terminal_pty.mlx`
+(`tools/check_terminal.sh`), the console's picture against
+`tests/support/console_expected.mlx` (`tools/check_console.sh`).
 
 `std.crash` (`std/src/crash.mlx`) is a program's crash report: `install()`
 sets a signal handler on a stack of its own that names the signal, the
 function and its callers (from the symbol table the compiler writes, see
-[formats](formats.md)) and keeps the crash in
+[formats](formats.md); a frame in a module loaded from a memfd, as the
+compositor's shell module is, is named through `/proc/self/fd`) and keeps
+the crash in
 `$XDG_STATE_HOME/mlx/crashes.log`; `fail(reason)` ends the program the same
 way for a failure it cannot go on after. The report goes to stderr. Every
 desktop program, every coreutil and mlxlibc (for the programs its loader
 starts) install it. `std.wayland.crash.watch(display)`
 (`std/src/wayland/crash.mlx`) makes a Wayland client's failed connection
 such a failure (`tools/check_crash_report.sh` holds every client to it).
+The handler's own values come from the compiler's value arena too: when a
+program crashed because that arena is full, it takes room of its own and
+says so ("the values' arena is full").
+
+`std.diagnostics` (`std/src/diagnostics.mlx`) is the one closed interface
+the runtime's diagnostics write through, for the processor and the GPU
+(`Source.processor`, `Source.gpu`): `keepCrash(source, record)` appends a
+crash to `crashes.log` as a `crash` or `gpu-crash` line, `openProfile`,
+`profileLine` and `closeProfile` write a profile whose header names its
+source (to a `.part` file renamed into place), and `runtimeDirectory`,
+`programName` and `environmentValue` find where and for whom. `std.crash`,
+`mlx-profile` and `std.gpu.diagnostics` use it. It also keeps the GPU's
+memory for the memory snapshots: `gpuDevice`, `gpuHeap` and `gpuType`
+note the device a context opened (its name, how many allocations it
+allows, its heaps and memory types), `gpuAllocated` and `gpuFreed` each
+block of device memory (the bytes asked, the bytes the device took, the
+memory type, a kind: a buffer, exported, imported, host memory; and the
+functions that asked, along the frame pointers). `std.gpu` writes them,
+`std.leaks` reads them under `gpuLock`, in a mapping of its own made when
+the first context opens. With `MLX_FRAMES` set (and not `0`) it keeps a
+program's frames: `frameBegin` and `frameEnd` around each frame drawn
+(the panels of `std.ui.wayland.panel` call them) note the processor's
+time, `frameGpu` adds the GPU's (std.gpu, below), and the last 1024 are
+written about once a second (and at the tenth frame) to
+`$XDG_RUNTIME_DIR/mlx/frames/PROGRAM-PID.frames`: a header with the
+frames drawn and the µs from the process's start to the end of its first
+frame, then a line per frame (serial, start, processor and GPU µs).
+`framesFlush` writes them now. `mlx-codemap frames` and *Hot* in MLX
+Observatory read them.
+
+`std.gpu.diagnostics` (`std/src/gpu/diagnostics.mlx`, used by `std.gpu`
+only) watches the GPU work a program records. After each pass a barrier
+and a fill write a breadcrumb (the frame and the passes done) into a
+buffer the host can read, and the functions that recorded the pass are
+kept. A frame not done in 5 s, or a lost device, is a GPU crash: said
+like a processor's crash, in the pass that failed with the functions that
+recorded it, and kept as a `gpu-crash` line. With `MLX_GPU_PROFILE` (`1`,
+or a directory) timestamp queries time each pass and the time goes on
+those functions, written as a profile with the source `gpu`
+(`tools/check_gpu_diagnostics.sh`, on lavapipe). With `MLX_FRAMES` each
+frame's command buffer gets a timestamp at its start and its end, and the
+GPU's time goes on the frame the program was drawing when it began.
 
 `std.timezone` (`std/src/timezone.mlx`) gives local time: `load` reads the
 zone from `$TZ` (a zone name, a path or a POSIX rule) or `/etc/localtime`
@@ -284,12 +336,15 @@ both ways and reads it back with `loadFile`.
 
 **Normative source:** `spec/04-stdlib/mem.xml`
 **Implementation:** `std/bootstrap/allocator.mlx`, `page_allocator.mlx`,
-`arena_allocator.mlx`, `fixed_buffer_allocator.mlx`,
-`general_purpose_allocator.mlx`, `mem.mlx`
+`tinypage_allocator.mlx`, `arena_allocator.mlx`,
+`fixed_buffer_allocator.mlx`, `general_purpose_allocator.mlx`,
+`debug_allocator.mlx`, `mem.mlx`; `std/src/leaks.mlx`
 **Source tests:** `120_bootstrap_mem_runtime.mlx`,
 `131_bootstrap_allocator_runtime.mlx`, `132_page_allocator_runtime.mlx`,
 `137_bootstrap_arena_allocators_runtime.mlx`,
-`296_general_purpose_allocator_runtime.mlx`
+`296_general_purpose_allocator_runtime.mlx`,
+`314_debug_allocator_runtime.mlx`, `315_tinypage_runtime.mlx`
+(`tests/run_debug_allocator.sh`)
 
 `spec/04-stdlib/mem.xml` specifies an `Allocator` with `alloc`/`resize`/`free`
 operations, four allocator kinds (`PageAllocator`, `ArenaAllocator`,
@@ -322,8 +377,11 @@ pub const Allocator = struct {
 (`std/bootstrap/allocator.mlx`)
 
 All four spec'd allocators are implemented: `page_allocator.mlx` (backed
-directly by `mmap`/`munmap` via `std.os.linux`), `arena_allocator.mlx`
-(bump-allocates out of one page-allocated block, with `reset`/`deinit`),
+directly by `mmap`/`munmap` via `std.os.linux`, small blocks on tiny
+pages, below), `arena_allocator.mlx`
+(bump-allocates out of one page-allocated block, with `reset`/`deinit`;
+as Zig's, its last block grows and shrinks in place, so a list growing at
+the arena's end is not copied and what it gives back is used again),
 `fixed_buffer_allocator.mlx` (bump-allocates over a caller-owned buffer,
 with `reset`), and `general_purpose_allocator.mlx`, the heap for blocks of
 any size freed in any order, for every thread of a process at once:
@@ -351,6 +409,142 @@ slept on through the kernel when contended, covers the lists.
 `296_general_purpose_allocator_runtime.mlx` exercises every class, the
 alignments, resizing, deinit and four threads allocating and freeing
 through one heap. mlxlibc's `malloc`/`free`/`realloc` sit on it.
+
+### Leak checks: `std.debug_allocator` and `std.leaks`
+
+`std.debug_allocator` is Zig's `DebugAllocator` (the `GeneralPurposeAllocator`
+of older Zig with its safety checks): it wraps any allocator and keeps each
+block it hands out with the functions that asked for it (12 return
+addresses along the frame pointers every Mlx function keeps). What goes
+wrong is said on stderr with where it happened:
+
+- a **leak**: a block not freed by `deinit` (or `report`), the blocks of one
+  place said once with their count and bytes, the largest places first;
+- a **double free**: with where the block was allocated, first freed and
+  freed again; the second free is not passed on;
+- an **invalid free**: an address it never handed out (not passed on);
+- a **wrong size**: a block freed with another length or alignment than it
+  was allocated with (freed with the right ones).
+
+Freed memory is overwritten with `0xAA` first (as Zig's `undefined`), so a
+block used after it went shows; the last 4096 frees are remembered to tell
+a double free from an invalid one. Its own tables are mappings of their
+own, one futex lock covers them.
+
+```mlx
+var checked: std.debug_allocator.DebugAllocator = undefined
+std.debug_allocator.init(&checked, std.page_allocator.init())
+checked.describe = crash.describeReturn       // names: path:line:function
+const allocator = std.debug_allocator.interface(&checked)
+...
+const leaked = std.debug_allocator.deinit(&checked)   // 0: none (Zig's .ok)
+```
+
+```
+mlx-files[4211]: leak: 3 blocks, 12288 bytes
+  allocated at projects/desktop/files/icons.mlx:88:load+0x4c at projects/desktop/files/icons.mlx:91
+  from projects/desktop/files/main.mlx:310:redraw+0x2f3 at projects/desktop/files/main.mlx:322
+mlx-files[4211]: 3 blocks leaked (12288 bytes) from 1 place; 940 allocations, 937 frees, 2097152 bytes out at most
+```
+
+Most programs take `std.page_allocator.init()` wherever they need memory
+instead of passing one allocator around. `watchPages(state)` has the page
+allocator tell a debug allocator every block it maps and unmaps (through
+two function pointers, so the compiler, which takes its pages there too,
+does not depend on it); the pages stay what they were, fresh zeroed
+mappings, and frees of pages mapped before the watch go through unsaid.
+`std.leaks` does that for a whole program when `MLX_LEAK_CHECK` is set:
+
+```mlx
+const watched = leaks.watch()   // first thing, or right before the loop
+leaks.mark()                    // what came before is the program's to keep
+...the loop...
+defer leaks.finish()            // the blocks the loop kept, and the arena
+```
+
+It is part of the runtime: `std.crash.install()`, which every program
+calls first, calls `leaks.watch()`, so with `MLX_LEAK_CHECK` set any
+program is watched from its start. `MLX_LEAK_CHECK=1` reports on stderr,
+`MLX_LEAK_CHECK=/a/path` appends to
+that file (each line names the program and its process), `0` or nothing
+watches nothing. While a watched program runs, its memory is written
+about once a second (from the main thread, as blocks come and go, and at
+each mark and report) to `$XDG_RUNTIME_DIR/mlx/memory/PROGRAM-PID.memory`:
+the totals, how full the tiny pages are, each place with its functions
+(as crashes name them), each block (address, bytes, place, since the mark
+or kept, what it takes in pages) and the program's mappings; with a GPU
+context open also the GPU's memory: the device, its heaps and memory
+types, and each block of device memory `std.gpu` allocated with the bytes
+asked, the bytes the device took and its place (the functions that asked,
+`std.gpu`'s own left out). Every buffer is an allocation of its own, so
+what the GPU's memory wastes is what the device rounds up, and many small
+allocations against its limit. A loop calls `leaks.tick()` each turn (the
+panels of `std.ui.wayland.panel` do) for a snapshot when only the GPU's
+memory changed. `mlx-codemap memory [PROGRAM]` and Memory under Findings in MLX
+Observatory read it: what the page blocks waste by size class, the holes
+between them and how scattered they are, what the GPU holds by heap and
+size class, and the places that hold the most or grow. The report also says when the compiler's value arena
+grew by more than 64 KiB since the mark: a loop whose turns do not give
+their values back (`std.turns`) grows a program as a leak would (a loop on
+`std.turns` is not said). A block a program keeps on purpose until it
+ends, a cache's or state it replaces as it changes, is left out of the
+reports with `leaks.keep(memory)` (`std.debug_allocator.keep`): the
+symbols of the top bar and its popups, a terminal's grids. The
+loops of `std.ui.wayland.panel` (the dock, launcher, top bar, files,
+settings, terminal, notifications, the Observatory), the compositor,
+mlx-ipcd, mlx-audiod, mlx-netd, mlx-console and mlx-splash call these.
+The compositor's modules are images of their own with their own page
+allocator, and are not watched.
+
+#### Tiny pages: `std.tinypage_allocator`
+
+Most programs take `std.page_allocator.init()` for every block, and a
+mapping of its own for a block of 40 bytes takes a page of 4 KiB: 99% of
+it wasted, and a mapping more for the kernel to keep. So the page
+allocator puts every block of up to 2 KiB (`LIMIT`) on tiny pages: a page
+is split into 64 tiny pages of 64 bytes, and a block takes a run of them
+in one page, the first run that fits. A small block so squeezes in where
+one went before, between the blocks still there, and gives its tiny
+pages back when it is freed. Two bitmaps per page say what is taken (the
+tiny pages in use, and where each block starts), a byte per page its
+longest free run and one per 64 pages theirs, so a search skips full
+pages without looking at their bits. A free needs no length: one freed
+with a wrong length still frees the block it names, and one freed twice
+is seen and left be. Blocks come zeroed, as fresh pages do; alignments
+up to 2 KiB are honoured, larger blocks and page alignments get whole
+pages as before.
+
+The pages lie in one region at a fixed address (`BASE`,
+0x200000000000), reserved with `MAP_FIXED_NOREPLACE` and made writable a
+megabyte at a time, which every image of a process shares: the program,
+its shared objects and plugins. The first that needs the region maps it,
+the others find it there (a header with a magic word and a futex lock),
+so a block taken in one image can be freed in another, and whether an
+address is a tiny block is a range check. When the region cannot be had
+(a kernel without `MAP_FIXED_NOREPLACE`, a small address space) every
+block gets whole pages. Empty pages keep their memory while there are
+few (64); past that, an emptied page's memory goes back to the kernel
+(`MADV_DONTNEED`).
+
+```mlx
+const pages = std.page_allocator.init()
+const name = pages.alloc(40, 8).?      // 64 bytes of a shared page
+pages.free(name, 40, 8)                // the run is free for the next one
+var usage: std.tinypage_allocator.Usage = undefined
+std.tinypage_allocator.usage(&usage)   // pages, blocks, bytes, empty pages
+```
+
+`std.page_allocator.footprint(address, length)` says what a block takes
+from the address space: its tiny pages or its whole pages. The debug
+allocator's watch still sees every block, and std.leaks' snapshots give
+each block its footprint and say how full the tiny pages are (Memory in
+MLX Observatory draws them as a strip of pages, each filled as far as it
+is taken). In MLX Observatory reading this repository, the blocks below
+4 KiB took 24 KiB of pages instead of 84 KiB (10% wasted instead of
+74%), those below 256 bytes 640 bytes instead of 20 KiB.
+`315_tinypage_runtime.mlx` takes and frees blocks of every size,
+squeezes one into a freed run between two others, frees with a wrong
+length and twice, and has four threads take and free at once.
 
 A runtime fixture exercises fixed-buffer alignment/reset and arena
 alignment/reset/deinit together:

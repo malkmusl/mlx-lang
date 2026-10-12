@@ -48,11 +48,23 @@ dbus-send, gdbus, busctl and dbus-monitor are checked against it
 
 `mlx-ipcd --system` is the same bus as the system's: it listens at
 `/run/mlx/bus` (or `--address`) with the socket open to every user, root
-alone may own names, and the policy comes from `/etc/mlx/ipc.conf`.
-Programs reach it through `DBUS_SYSTEM_BUS_ADDRESS=unix:path=/run/mlx/bus`
-(the compositor's logind client reads that variable). It is where a
-display manager of the desktop's own would offer its login and seat
-services.
+alone may own names, the policy comes from `/etc/mlx/ipc.conf`, and it
+starts services only from `--services DIR` (the session's are not
+root's to start). Our programs look for it there by themselves:
+mlx-netd (`projects/network`) answers on it, and mlx-net, the top bar
+and mlx-settings ask it there; other programs reach it through
+`DBUS_SYSTEM_BUS_ADDRESS=unix:path=/run/mlx/bus` (the compositor's logind
+client reads that variable). `tools/install_network.sh` installs it as
+`mlx-ipcd.service` (systemd) and for mlx-init. Under systemd it is a
+`Type=notify` service: it sends `READY=1` to `NOTIFY_SOCKET` once the
+socket takes connections, so mlx-netd and mlx-login, ordered after it,
+find the bus there (the variable is not passed on to the services it
+starts). It is where a display
+manager of the desktop's own would offer its login and seat services.
+
+Services that do something for an app ask the bus whether that app may
+(`org.mlx.IPC.Check`, below): MLX Audio for `audio.*`, mlx-netd for
+`network.control` (switching links, joining and forgetting networks).
 
 ## Permissions per app
 
@@ -68,7 +80,8 @@ runs as the same user. MLXIPC's is per app, as in hyprtavern:
   it talks to by any name that connection owns, as dbus-daemon's
   `send_destination` does.
 - And **use** a service's permission: `audio.play`, `audio.record`,
-  `audio.monitor`, `audio.control` (MLX Audio). Services ask the bus
+  `audio.monitor`, `audio.control` (MLX Audio), `network.control`
+  (mlx-netd, on the system bus). Services ask the bus
   (`org.mlx.IPC.Check(s app's connection, s permission) -> b`) before
   they do what it names, so the rules for every service are in one
   place.
@@ -77,8 +90,11 @@ runs as the same user. MLXIPC's is per app, as in hyprtavern:
   names (its id and the names under it), talk to and see those, other
   connections of the same app, the portals (`org.freedesktop.portal.*`),
   `org.freedesktop.Notifications` and MLX Audio (`org.mlx.Audio`), and
-  use `audio.play`; it sees nothing else, not even the other connections'
-  unique names. Replies to calls an app made always come back; a reply
+  use `audio.play`; for the top bar it may also own an MPRIS player's
+  name (`org.mpris.MediaPlayer2.*`) and a tray item's
+  (`org.kde.StatusNotifierItem-*`) and talk to the tray's watcher
+  (`org.kde.StatusNotifierWatcher`). It sees nothing else, not even the
+  other connections' unique names. Replies to calls an app made always come back; a reply
   nobody asked for needs the rules.
 - The microphone (`audio.record`) and the sound of other apps
   (`audio.monitor`) are **asked** for every app, sandboxed or not: the

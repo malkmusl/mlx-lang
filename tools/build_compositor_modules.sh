@@ -7,7 +7,8 @@
 #     --dir DIR        where to put them (default: $MLX_COMPOSITOR_MODULES,
 #                      else ~/.local/lib/mlx-compositor, which the session
 #                      watches)
-#     --compiler PATH  the Mlx compiler (default: tools/ensure_compiler.sh)
+#     --compiler PATH  compile with this Mlx compiler (default: ./mlx build,
+#                      which builds a module only when it is not current)
 #     --watch          build again whenever a source file changes
 #
 # Without shell or render, both are built. Each file is written next to its
@@ -18,6 +19,7 @@ set -euo pipefail
 
 repo_root=$(cd "$(dirname "$0")/.." && pwd)
 cd "$repo_root"
+source tools/lib/mlx_build.sh
 
 directory=${MLX_COMPOSITOR_MODULES:-$HOME/.local/lib/mlx-compositor}
 compiler=""
@@ -35,11 +37,33 @@ while [[ $# -gt 0 ]]; do
     shift
 done
 [[ ${#kinds[@]} -eq 0 ]] && kinds=(shell render)
-[[ -n "$compiler" ]] || compiler=$(tools/ensure_compiler.sh)
 mkdir -p "$directory"
 
+# Puts a built module in place, renamed over the old one; a module that
+# did not change stays (the compositor would load it again for nothing).
+place() {
+    local built=$1 target=$2
+    if [[ -f "$target" ]] && cmp -s "$built" "$target"; then
+        echo "current $target"
+        return 0
+    fi
+    cp "$built" "$target.next" && mv "$target.next" "$target" && echo "built $target"
+}
+
 build() {
-    local kind status=0
+    local kind status=0 steps=()
+    if [[ -z "$compiler" ]]; then
+        # build.mlx's steps libmlx-shell.so and libmlx-render.so.
+        for kind in "${kinds[@]}"; do steps+=("libmlx-$kind.so"); done
+        if ! mlx_build "${steps[@]}"; then
+            echo "build_compositor_modules.sh: a module did not build; the compositor keeps what it runs" >&2
+            return 1
+        fi
+        for kind in "${kinds[@]}"; do
+            place "mlx-out/lib/libmlx-$kind.so" "$directory/libmlx-$kind.so" || status=1
+        done
+        return $status
+    fi
     for kind in "${kinds[@]}"; do
         local target="$directory/libmlx-$kind.so"
         if "$compiler" --quiet --shared "projects/desktop/compositor/${kind}_module.mlx" -o "$target.next"; then

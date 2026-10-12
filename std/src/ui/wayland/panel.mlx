@@ -6,7 +6,9 @@
 // (ext-background-effect-v1, when the compositor offers it), for a dock
 // the compositor's windows (wlr-foreign-toplevel-management), popup menus
 // (openMenu: an xdg_popup drawn on the CPU) and drag and drop (startDrag,
-// acceptDrops: wl_data_device).
+// acceptDrops: wl_data_device). It can be an ordinary window instead
+// (openWindow), or a screen locker's lock surface (openLock:
+// ext-session-lock-v1; unlock ends the lock).
 //
 // The client gives a context and two functions: `draw(context, canvas)`
 // paints the whole surface, and `event(context, kind, a, b)` gets EVENT_*
@@ -22,12 +24,15 @@ const gpu = @import("std.gpu")
 const vk = @import("std.vulkan")
 const keyboard_module = @import("./keyboard.mlx")
 const turns_module = @import("std.turns")
+const leaks = @import("std.leaks")
+const diagnostics = @import("std.diagnostics")
 const crash = @import("std.crash")
 const wayland_crash = @import("std.wayland.crash")
 const panel_input_module = @import("./panel_input.mlx")
 const panel_frames_module = @import("./panel_frames.mlx")
 const panel_menu_module = @import("./panel_menu.mlx")
 const panel_drag_module = @import("./panel_drag.mlx")
+const appearance_module = @import("std.ui.appearance")
 
 const Allocator = std.allocator.Allocator
 pub const Canvas = canvas_module.Canvas
@@ -45,8 +50,12 @@ pub const EVENT_KEY: u32 = ui_app.EVENT_KEY
 pub const EVENT_WINDOWS: u32 = 5
 pub const EVENT_CONFIGURED: u32 = ui_app.EVENT_CONFIGURED
 pub const EVENT_CLOSED: u32 = ui_app.EVENT_CLOSED
-// `watch` (a descriptor of the client's) can be read.
+// `watch` (a descriptor of the client's) can be read: `a` is 0 for it,
+// 1 + i for watches[i].
 pub const EVENT_WATCH: u32 = 8
+pub const MAX_WATCHES: usize = 3
+// The colour scheme's descriptor among run's handles.
+const APPEARANCE: u32 = 100
 // Every `tickInterval` milliseconds (when it is not 0).
 pub const EVENT_TICK: u32 = ui_app.EVENT_TICK
 // The open menu (openMenu): the pointer on it (a = x, b = y, menu pixels),
@@ -68,6 +77,11 @@ pub const EVENT_DRAG_END: u32 = ui_app.EVENT_DRAG_END
 // The keyboard went to another surface (keys held now are released
 // elsewhere).
 pub const EVENT_KEYBOARD_LEAVE: u32 = ui_app.EVENT_KEYBOARD_LEAVE
+// openLock: the session is locked (the compositor shows nothing but the
+// lock surface), or the lock was refused or ended (another locker holds
+// the session; the panel stops running).
+pub const EVENT_LOCKED: u32 = 20
+pub const EVENT_LOCK_FINISHED: u32 = 21
 
 // Where a menu opens against its anchor rectangle (xdg_positioner anchor
 // and gravity).
@@ -140,6 +154,17 @@ pub const Panel = struct {
     // A window (openWindow) instead of a layer surface: its xdg_surface and
     // xdg_toplevel, and the size the compositor asked for (0: ours).
     isWindow: bool
+    // A lock surface (openLock) instead: the lock manager, the first
+    // output, the session lock and the lock surface, and whether the
+    // session is locked.
+    isLock: bool
+    lockManager: wl.ext_session_lock_manager_v1.Proxy
+    hasLockManager: bool
+    output: wl.wl_output.Proxy
+    hasOutput: bool
+    sessionLock: wl.ext_session_lock_v1.Proxy
+    lockSurface: wl.ext_session_lock_surface_v1.Proxy
+    locked: bool
     xdgSurface: wl.xdg_surface.Proxy
     toplevel: wl.xdg_toplevel.Proxy
     wantedWidth: i32
@@ -208,11 +233,16 @@ pub const Panel = struct {
     // hide asked for, done after the events at hand.
     keepAlive: bool
     hideRequested: bool
-    // Another descriptor run waits on (EVENT_WATCH), or -1.
+    // Another descriptor run waits on (EVENT_WATCH), or -1; and more of
+    // them (-1 where unused).
     watch: isize
+    watches: [3]isize
     // EVENT_TICK every so many milliseconds (0: none), and when the next is.
     tickInterval: usize
     nextTick: usize
+    // The desktop's colour scheme (std.ui.appearance): a switch redraws
+    // the surface and its menu every frame while it glides.
+    appearance: appearance_module.Watch
     // Key repeat.
     repeatRate: i32
     repeatDelay: i32
@@ -233,21 +263,30 @@ pub const Panel = struct {
     // The last pointer button press (popups and drags name its serial).
     buttonSerial: u32
     // A popup menu (openMenu): its surface, xdg_surface and xdg_popup, its
-    // one buffer (drawn on the CPU by menuDraw), and whether the pointer
-    // is on it.
+    // two buffers (drawn on the CPU by menuDraw, into one the compositor
+    // does not hold: menuBusy), and whether the pointer is on it. After a
+    // resizeMenu the buffers of the size before are kept (menuOld) until
+    // one of the new size is shown.
     menuOpen: bool
     menuSurface: wl.wl_surface.Proxy
     menuXdgSurface: wl.xdg_surface.Proxy
     menuPopup: wl.xdg_popup.Proxy
     menuMemory: wl.SharedMemory
     menuPool: wl.wl_shm_pool.Proxy
-    menuBuffer: wl.wl_buffer.Proxy
+    menuBuffers: [2]wl.wl_buffer.Proxy
+    menuBusy: [2]bool
     menuWidth: usize
     menuHeight: usize
     menuConfigured: bool
     menuDirty: bool
     menuDraw: Draw
     pointerOnMenu: bool
+    menuOld: bool
+    menuOldMemory: wl.SharedMemory
+    menuOldPool: wl.wl_shm_pool.Proxy
+    menuOldBuffers: [2]wl.wl_buffer.Proxy
+    // The xdg_wm_base version bound (3 and up can move and resize a popup).
+    wmBaseVersion: u32
     // Drag and drop: the data device; a drag this client started (its
     // source, MIME type and data, and its icon); the MIME type it takes in
     // drops (none: length 0), the offer made last and whether it has that
@@ -370,7 +409,8 @@ fn onRegistry(context: *anyopaque, event: wl.client.Event) -> void {
         panel.*.dmabuf.setHandler(onDmabuf, context)
         panel.*.hasDmabuf = true
     } else if isNamed(global.interface, "xdg_wm_base") {
-        panel.*.wmBase = wl.xdg_wm_base.Proxy.fromObject(registry.bind(global.name, wl.Interface.xdg_wm_base, smaller(global.version, 2)))
+        panel.*.wmBaseVersion = smaller(global.version, 3)
+        panel.*.wmBase = wl.xdg_wm_base.Proxy.fromObject(registry.bind(global.name, wl.Interface.xdg_wm_base, panel.*.wmBaseVersion))
         panel.*.wmBase.setHandler(onWmBase, context)
         panel.*.hasWmBase = true
     } else if isNamed(global.interface, "zwlr_foreign_toplevel_manager_v1") && panel.*.wantWindows {
@@ -380,6 +420,12 @@ fn onRegistry(context: *anyopaque, event: wl.client.Event) -> void {
     } else if isNamed(global.interface, "wl_data_device_manager") {
         panel.*.dataManager = wl.wl_data_device_manager.Proxy.fromObject(registry.bind(global.name, wl.Interface.wl_data_device_manager, smaller(global.version, 3)))
         panel.*.hasDataManager = true
+    } else if isNamed(global.interface, "ext_session_lock_manager_v1") {
+        panel.*.lockManager = wl.ext_session_lock_manager_v1.Proxy.fromObject(registry.bind(global.name, wl.Interface.ext_session_lock_manager_v1, 1))
+        panel.*.hasLockManager = true
+    } else if isNamed(global.interface, "wl_output") && !panel.*.hasOutput {
+        panel.*.output = wl.wl_output.Proxy.fromObject(registry.bind(global.name, wl.Interface.wl_output, 1))
+        panel.*.hasOutput = true
     } else if isNamed(global.interface, "zwp_keyboard_shortcuts_inhibit_manager_v1") {
         panel.*.inhibitManager = wl.zwp_keyboard_shortcuts_inhibit_manager_v1.Proxy.fromObject(registry.bind(global.name, wl.Interface.zwp_keyboard_shortcuts_inhibit_manager_v1, 1))
         panel.*.hasInhibitManager = true
@@ -480,12 +526,13 @@ fn onFrame(context: *anyopaque, event: wl.client.Event) -> void {
     panelOf(context).*.framePending = false
 }
 
-const Failure = error { NoCompositor, NoLayerShell, NoWindows, NoMemory }
+const Failure = error { NoCompositor, NoLayerShell, NoWindows, NoLock, NoMemory }
 
 fn noCompositor() -> Failure!void { return Failure.NoCompositor }
 fn noLayerShell() -> Failure!void { return Failure.NoLayerShell }
 fn noMemory() -> Failure!void { return Failure.NoMemory }
 fn noWindows() -> Failure!void { return Failure.NoWindows }
+fn noLock() -> Failure!void { return Failure.NoLock }
 
 // Connects and asks for a layer surface `namespace` in `layer`, anchored at
 // `anchor` (state.ANCHOR_* bits), `width` x `height` (0: stretched between
@@ -537,7 +584,7 @@ pub fn hide(panel: *Panel) -> void {
 // loaded stay.
 fn hideNow(panel: *Panel) -> void {
     panel.*.hideRequested = false
-    if !panel.*.hasSurface || panel.*.isWindow { return }
+    if !panel.*.hasSurface || panel.*.isWindow || panel.*.isLock { return }
     if panel.*.hasEffect {
         panel.*.effect.destroy()
         panel.*.hasEffect = false
@@ -574,8 +621,65 @@ pub fn openWindow(panel: *Panel, allocator: Allocator, arguments: [][*]const u8,
     try display.roundtrip()
 }
 
+// Connects, locks the session (ext-session-lock-v1) and makes the lock
+// surface over the first output; it is drawn once the compositor
+// configured it (its size is the output's). EVENT_LOCKED says the session
+// is locked, EVENT_LOCK_FINISHED that the lock was refused (the panel then
+// stops). unlock ends the lock.
+pub fn openLock(panel: *Panel, allocator: Allocator, arguments: [][*]const u8) -> !void {
+    try connect(panel, allocator, arguments, 1, 1, false)
+    if !panel.*.hasLockManager || !panel.*.hasOutput { return noLock() }
+    panel.*.isLock = true
+    panel.*.width = 0
+    panel.*.height = 0
+    panel.*.configured = false
+    panel.*.dirty = true
+    panel.*.sessionLock = panel.*.lockManager.lock()
+    panel.*.sessionLock.setHandler(onSessionLock, contextOf(panel))
+    panel.*.surface = panel.*.compositor.createSurface()
+    panel.*.lockSurface = panel.*.sessionLock.getLockSurface(panel.*.surface, panel.*.output)
+    panel.*.lockSurface.setHandler(onLockSurface, contextOf(panel))
+    panel.*.hasSurface = true
+    try panel.*.display.roundtrip()
+}
+
+// Unlocks the session and stops the panel (the lock surface goes with
+// the connection).
+pub fn unlock(panel: *Panel) -> void {
+    if !panel.*.isLock || !panel.*.locked { return }
+    panel.*.lockSurface.destroy()
+    panel.*.sessionLock.unlockAndDestroy()
+    panel.*.locked = false
+    panel.*.running = false
+}
+
+fn onSessionLock(context: *anyopaque, event: wl.client.Event) -> void {
+    const panel = panelOf(context)
+    if event.opcode == wl.ext_session_lock_v1.EVENT_LOCKED {
+        panel.*.locked = true
+        panel.*.event(panel.*.context, EVENT_LOCKED, 0, 0)
+    } else if event.opcode == wl.ext_session_lock_v1.EVENT_FINISHED {
+        panel.*.locked = false
+        panel.*.running = false
+        panel.*.event(panel.*.context, EVENT_LOCK_FINISHED, 0, 0)
+    }
+}
+
+fn onLockSurface(context: *anyopaque, event: wl.client.Event) -> void {
+    const panel = panelOf(context)
+    const decoded = wl.ext_session_lock_surface_v1.decodeEvent(event)
+    if event.opcode != wl.ext_session_lock_surface_v1.EVENT_CONFIGURE { return }
+    const configure = decoded.configure
+    panel.*.lockSurface.ackConfigure(configure.serial)
+    panel.*.width = @intCast(usize, configure.width)
+    panel.*.height = @intCast(usize, configure.height)
+    panel.*.configured = true
+    panel.*.dirty = true
+    panel.*.event(panel.*.context, EVENT_CONFIGURED, @intCast(u32, panel.*.width), @intCast(i32, panel.*.height))
+}
+
 // The connection, its globals and the panel's state (a surface comes with
-// showLayer or openWindow). Drawing goes to the GPU when Vulkan works
+// showLayer, openWindow or openLock). Drawing goes to the GPU when Vulkan works
 // (MLX_CANVAS=cpu keeps it on the CPU; `arguments` is the program's, for
 // finding the Vulkan driver).
 pub fn connect(panel: *Panel, allocator: Allocator, arguments: [][*]const u8, width: u32, height: u32, windows: bool) -> !void {
@@ -590,11 +694,21 @@ pub fn connect(panel: *Panel, allocator: Allocator, arguments: [][*]const u8, wi
     panel.*.keepAlive = false
     panel.*.hideRequested = false
     panel.*.watch = -1
+    var watch: usize = 0
+    while watch < MAX_WATCHES {
+        panel.*.watches[watch] = -1
+        watch += 1
+    }
     panel.*.hasSizeRule = false
     panel.*.tickInterval = 0
     panel.*.nextTick = 0
+    appearance_module.init(appearanceOf(panel), std.process.environmentEntries(arguments))
     panel.*.hasWmBase = false
     panel.*.isWindow = false
+    panel.*.isLock = false
+    panel.*.hasLockManager = false
+    panel.*.hasOutput = false
+    panel.*.locked = false
     panel.*.wantedWidth = 0
     panel.*.wantedHeight = 0
     panel.*.hasCompositor = false
@@ -608,6 +722,8 @@ pub fn connect(panel: *Panel, allocator: Allocator, arguments: [][*]const u8, wi
     panel.*.shortcutsInhibited = false
     panel.*.buttonSerial = 0
     panel.*.menuOpen = false
+    panel.*.menuOld = false
+    panel.*.wmBaseVersion = 0
     panel.*.pointerOnMenu = false
     panel.*.hasDataManager = false
     panel.*.hasDataDevice = false
@@ -723,8 +839,10 @@ pub fn framesName(panel: *const Panel) -> []const u8 {
     return "cpu"
 }
 
-// Asks for another size (the compositor configures it).
+// Asks for another size (the compositor configures it; a lock surface
+// keeps the output's).
 pub fn resize(panel: *Panel, width: u32, height: u32) -> void {
+    if panel.*.isLock { return }
     panel.*.width = @intCast(usize, width)
     panel.*.height = @intCast(usize, height)
     if !panel.*.hasSurface { return }
@@ -737,8 +855,24 @@ pub fn resize(panel: *Panel, width: u32, height: u32) -> void {
     panel.*.surface.commit()
 }
 
+// Asks the compositor to show a window fullscreen (or not any more); its
+// configure brings the output's size, which the next frame is drawn at.
+// Only for windows (openWindow).
+pub fn setFullscreen(panel: *Panel, on: bool) -> void {
+    if !panel.*.isWindow || !panel.*.hasSurface { return }
+    if on { panel.*.toplevel.setFullscreen(null) } else { panel.*.toplevel.unsetFullscreen() }
+}
+
+// The layer surface's distance from the edges it is anchored to, each its
+// own (showLayer gives all four the same).
+pub fn setMargins(panel: *Panel, top: i32, right: i32, bottom: i32, left: i32) -> void {
+    if !panel.*.hasSurface || panel.*.isWindow || panel.*.isLock { return }
+    panel.*.layerSurface.setMargin(top, right, bottom, left)
+    panel.*.surface.commit()
+}
+
 pub fn setExclusiveZone(panel: *Panel, zone: i32) -> void {
-    if !panel.*.hasSurface || panel.*.isWindow { return }
+    if !panel.*.hasSurface || panel.*.isWindow || panel.*.isLock { return }
     panel.*.layerSurface.setExclusiveZone(zone)
 }
 
@@ -892,6 +1026,10 @@ fn redraw(panel: *Panel) -> void {
     // Before drawing: a draw may ask for the next frame (a std.ui widget
     // took what changed).
     panel.*.dirty = false
+    // MLX_FRAMES: the frame's time on the processor (and std.gpu's on the
+    // GPU) for the frame timeline.
+    const ignored = diagnostics.frameBegin()
+    defer diagnostics.frameEnd()
     if panel.*.frames == FRAMES_CPU {
         var pixels: [*]u32 = undefined
         unsafe { pixels = @ptrFromInt([*]u32, panel.*.memory.address + slot * panel.*.slotBytes) }
@@ -936,17 +1074,46 @@ fn redraw(panel: *Panel) -> void {
     panel.*.surface.commit()
 }
 
+pub fn appearanceOf(panel: *Panel) -> *appearance_module.Watch {
+    unsafe { return @ptrCast(*appearance_module.Watch, &panel.*.appearance) }
+}
+
+// How light the desktop is drawn now: 0 (dark) to
+// appearance_module.LIGHT, gliding after a switch (std.ui.theme.at).
+pub fn lightness(panel: *Panel) -> i32 { return appearance_module.value(appearanceOf(panel)) }
+
+// The scheme switched, or still gliding: the surface and its menu again.
+fn followAppearance(panel: *Panel, readable: bool) -> void {
+    const watch = appearanceOf(panel)
+    var changed = false
+    if readable || appearance_module.descriptor(watch) < 0 { changed = appearance_module.check(watch) }
+    if changed || appearance_module.moving(watch) {
+        panel.*.dirty = true
+        panel.*.menuDirty = true
+    }
+}
+
 // Runs until the client stops the panel (running = false) or the
 // compositor closes it or goes away.
 pub fn run(panel: *Panel) -> !void {
     const display = panel.*.display
-    var handles: [2]wl.Handle = undefined
+    var handles: [6]wl.Handle = undefined
     handles[0] = wl.Handle.fromDescriptor(display.descriptor())
-    var ready: [2]bool = [2]bool{ false, false }
+    var ready: [6]bool = [6]bool{ false, false, false, false, false, false }
+    // Which watch each handle past the first is (0: watch, 1 + i:
+    // watches[i], APPEARANCE: the colour scheme's).
+    var which: [6]u32 = [6]u32{ 0, 0, 0, 0, 0, 0 }
     var turns: turns_module.Turns = undefined
     turns_module.begin(&turns, true, false)
+    // MLX_LEAK_CHECK: what the loop takes and keeps is said when it ends.
+    const watched = leaks.watch()
+    leaks.mark()
+    defer leaks.finish()
+    // MLX_FRAMES: the last frames written too when the loop ends.
+    defer diagnostics.framesFlush()
     while panel.*.running && display.running() {
         turns_module.turn(&turns)
+        leaks.tick()
         if panel.*.hideRequested { hideNow(panel) }
         redraw(panel)
         panel_menu_module.redrawMenu(panel)
@@ -962,16 +1129,46 @@ pub fn run(panel: *Panel) -> !void {
             const until = if panel.*.nextTick > now { @intCast(isize, panel.*.nextTick - now) } else { 0 }
             if timeout < 0 || until < timeout { timeout = until }
         }
+        timeout = appearance_module.due(appearanceOf(panel), timeout)
         var watched: usize = 1
         if panel.*.watch >= 0 {
-            handles[1] = wl.Handle.fromDescriptor(panel.*.watch)
-            watched = 2
+            handles[watched] = wl.Handle.fromDescriptor(panel.*.watch)
+            which[watched] = 0
+            watched += 1
         }
-        ready[1] = false
+        var more: usize = 0
+        while more < MAX_WATCHES {
+            if panel.*.watches[more] >= 0 {
+                handles[watched] = wl.Handle.fromDescriptor(panel.*.watches[more])
+                which[watched] = @intCast(u32, more + 1)
+                watched += 1
+            }
+            more += 1
+        }
+        if appearance_module.descriptor(appearanceOf(panel)) >= 0 {
+            handles[watched] = wl.Handle.fromDescriptor(appearance_module.descriptor(appearanceOf(panel)))
+            which[watched] = APPEARANCE
+            watched += 1
+        }
+        var clear: usize = 0
+        while clear < 6 {
+            ready[clear] = false
+            clear += 1
+        }
         var count: isize = 0
         unsafe { count = wl.transport.waitAny(@ptrCast([*]const wl.Handle, &handles), watched, @ptrCast([*]bool, &ready), timeout) }
         if ready[0] { try display.dispatch() }
-        if watched == 2 && ready[1] { panel.*.event(panel.*.context, EVENT_WATCH, 0, 0) }
+        var handle: usize = 1
+        var scheme = false
+        while handle < watched {
+            if ready[handle] && which[handle] == APPEARANCE {
+                scheme = true
+            } else if ready[handle] {
+                panel.*.event(panel.*.context, EVENT_WATCH, which[handle], 0)
+            }
+            handle += 1
+        }
+        followAppearance(panel, scheme)
         if panel.*.tickInterval > 0 && milliseconds() >= panel.*.nextTick {
             panel.*.nextTick = milliseconds() + panel.*.tickInterval
             panel.*.event(panel.*.context, EVENT_TICK, 0, 0)
@@ -993,7 +1190,8 @@ pub fn close(panel: *Panel) -> void {
         if panel.*.isWindow {
             panel.*.toplevel.destroy()
             panel.*.xdgSurface.destroy()
-        } else {
+        } else if !panel.*.isLock {
+            // (A lock still held stays: the session remains locked.)
             panel.*.layerSurface.destroy()
         }
         panel.*.surface.destroy()

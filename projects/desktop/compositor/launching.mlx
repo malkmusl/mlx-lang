@@ -8,6 +8,11 @@ const shell = @import("./shell.mlx")
 const protocols_module = @import("./protocols.mlx")
 const xwayland_module = @import("./xwayland.mlx")
 const xwm_module = @import("./xwm.mlx")
+const workspaces_module = @import("./workspaces.mlx")
+const lock_module = @import("./lock.mlx")
+
+const SOCK_STREAM_CLOEXEC: usize = 524289
+const SYS_kill: usize = 62
 
 // ---------------------------------------------------------------------------
 // Launching clients
@@ -82,10 +87,61 @@ pub fn tellLauncher(compositor: *shell.Compositor, command: u8) -> bool {
 // The helpers that stay running, started with the compositor: the launcher
 // (hidden until Super) and the dock.
 pub fn startHelpers(compositor: *shell.Compositor) -> void {
+    if compositor.*.greeterMode {
+        startGreeter(compositor)
+        return
+    }
     xwayland_module.start(compositor)
     startLauncher(compositor, false)
     startDock(compositor)
     startTopbar(compositor)
+}
+
+// Starts the greeter on a socket pair adopted directly by the Wayland
+// server.  Remembering that exact client, rather than trusting an app id or
+// whichever client happens to connect first, keeps the public display socket
+// from becoming an input path around the login screen.
+fn startGreeter(compositor: *shell.Compositor) -> void {
+    if compositor.*.greeterPid >= 0 || @intFromPtr(compositor.*.greeterProgram) == 0 { return }
+    var wayland: [2]i32 = [2]i32{ -1, -1 }
+    if std.linux.syscall4(shell.SYS_socketpair, 1, SOCK_STREAM_CLOEXEC, 0, @intFromPtr(&wayland)) != 0 {
+        state.say("greeter: cannot create its Wayland connection\n")
+        compositor.*.running = false
+        return
+    }
+    if compositor.*.verbose {
+        state.say("greeter: launch: ")
+        var length: usize = 0
+        while compositor.*.greeterProgram[length] != 0 { length += 1 }
+        const shown = std.io.writeAllBytes(std.io.stdout(), compositor.*.greeterProgram, length)
+        state.say("\n")
+    }
+    const child = std.linux.syscall0(shell.SYS_fork)
+    if child == 0 {
+        const ours = @intCast(usize, wayland[0])
+        const theirs = @intCast(usize, wayland[1])
+        const closed = std.linux.syscall1(shell.SYS_close, ours)
+        const kept = std.linux.syscall3(shell.SYS_fcntl, theirs, shell.F_SETFD, 0)
+        execute(compositor.*.greeterProgram, helperEnvironment(compositor, "WAYLAND_SOCKET=", theirs, false))
+        const exited = std.linux.syscall1(shell.SYS_exit_group, 127)
+    }
+    const closed = std.linux.syscall1(shell.SYS_close, @intCast(usize, wayland[1]))
+    if child < 0 {
+        const closed_ours = std.linux.syscall1(shell.SYS_close, @intCast(usize, wayland[0]))
+        state.say("greeter: cannot start\n")
+        compositor.*.running = false
+        return
+    }
+    compositor.*.greeterPid = child
+    var client: wl.server.Client = undefined
+    if !compositor.*.server.adoptClient(wl.Handle.fromDescriptor(@intCast(isize, wayland[0])), &client) {
+        const closed_ours = std.linux.syscall1(shell.SYS_close, @intCast(usize, wayland[0]))
+        const killed = std.linux.syscall2(SYS_kill, @bitCast(usize, child), 9)
+        state.say("greeter: cannot add its Wayland connection\n")
+        compositor.*.running = false
+        return
+    }
+    compositor.*.greeterClient = @intFromPtr(client.state)
 }
 
 // Starts the top bar to stay running, with its socket pair as MLX_TOPBAR_FD
@@ -96,6 +152,8 @@ fn startTopbar(compositor: *shell.Compositor) -> void {
     compositor.*.topbarChannel = startHelper(compositor, compositor.*.topbar, "MLX_TOPBAR_FD=", false, &pid)
     compositor.*.topbarPid = pid
     compositor.*.topbarStartedAt = @intCast(u32, (state.microseconds() / 1000) & 4294967295)
+    // The workspaces as they are (the socket keeps it until the bar reads).
+    workspaces_module.notifyTopbar(compositor)
 }
 
 // Starts the launcher to stay running: with one end of a socket pair as
@@ -206,6 +264,7 @@ fn closeChannel(channel: isize) -> void {
 pub fn helperMessages(compositor: *shell.Compositor) -> void {
     // The X window manager's connection (it reads without waiting).
     xwm_module.dispatch(compositor)
+    topbarMessages(compositor)
     if compositor.*.dockChannel < 0 { return }
     var bytes: [64]u8 = undefined
     const count = std.linux.syscall3(0, @bitCast(usize, compositor.*.dockChannel), @intFromPtr(&bytes), 64)
@@ -257,6 +316,24 @@ pub fn helperMessages(compositor: *shell.Compositor) -> void {
             index += 1
         }
     }
+}
+
+// What the top bar sent (workspaces.mlx says what): a workspace to show, a
+// workspace's tiling to turn on or off. The end of the channel is the bar
+// going (reapChildren starts it again).
+fn topbarMessages(compositor: *shell.Compositor) -> void {
+    if compositor.*.topbarChannel < 0 { return }
+    var bytes: [64]u8 = undefined
+    const count = std.linux.syscall3(0, @bitCast(usize, compositor.*.topbarChannel), @intFromPtr(&bytes), 64)
+    if count == 0 || (count < 0 && count != -11) {
+        closeChannel(compositor.*.topbarChannel)
+        compositor.*.topbarChannel = -1
+        return
+    }
+    if count < 0 { return }
+    var pointer: [*]const u8 = undefined
+    unsafe { pointer = @ptrCast([*]const u8, &bytes) }
+    workspaces_module.topbarMessages(compositor, pointer, @intCast(usize, count))
 }
 
 // ---------------------------------------------------------------------------
@@ -312,7 +389,7 @@ pub fn startZoom(compositor: *shell.Compositor, surface: *shell.Surface) -> void
     const now = state.microseconds()
     const fresh = now < compositor.*.zoomUntil
     compositor.*.zoomUntil = 0
-    if !fresh { return }
+    if !fresh || !compositor.*.animations { return }
     surface.*.zooming = true
     surface.*.zoomX = compositor.*.zoomX
     surface.*.zoomY = compositor.*.zoomY
@@ -350,7 +427,7 @@ pub fn zoomStep(compositor: *shell.Compositor) -> void {
         index += 1
         if !surface.*.zooming { continue }
         scene.damageSurface(compositor, surface)
-        if state.microseconds() - surface.*.zoomStart >= scene.ZOOM_MICROS {
+        if state.microseconds() - surface.*.zoomStart >= scene.ZOOM_MICROS * compositor.*.animationScale {
             surface.*.zooming = false
             scene.damageSurface(compositor, surface)
         }
@@ -544,11 +621,19 @@ pub fn previewContentChanged(compositor: *shell.Compositor, address: usize) -> v
 // launcher on the next Super; the dock at once, three times at most when
 // it keeps ending within five seconds).
 pub fn reapChildren(compositor: *shell.Compositor) -> void {
+    // (Every turn of the loop: a log out under way ends here.)
+    lock_module.checkLogOut(compositor)
     var status: [4]u8 = [4]u8{ 0, 0, 0, 0 }
     while true {
         const pid = std.linux.syscall4(shell.SYS_wait4, 18446744073709551615, @intFromPtr(&status), 1, 0)
         if pid <= 0 { return }
         xwayland_module.reaped(compositor, pid)
+        if pid == compositor.*.greeterPid {
+            compositor.*.greeterPid = -1
+            compositor.*.greeterClient = 0
+            compositor.*.running = false
+            if compositor.*.verbose { state.say("greeter: it ended; stopping the greeter compositor\n") }
+        }
         if pid == compositor.*.launcherPid {
             compositor.*.launcherPid = -1
             closeChannel(compositor.*.launcherChannel)

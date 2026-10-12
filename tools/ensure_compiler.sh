@@ -6,16 +6,18 @@
 # compiler's fixed point (it builds the same binary from the same sources on
 # every machine, so a crash address from one machine finds its place on
 # another). When only the bootstrap-built zig-out/bin/mlx1 is there (or
-# nothing: then `zig build mlx1`), the chain mlx1 -> mlx2 -> mlx3 is built
-# and mlx3 kept as mlx4. When mlx4 is older than the compiler's sources and
-# lacks what they added since (it cannot write --shared objects, or writes
-# no symbol table, or knows no `_ = value`, or loses a slice's length when
-# it is assigned again, or stores a match's arms at their own widths, or
-# loads a signed if/match result unsigned, knows no --symbol-version,
-# gives an array whose length is a named constant no size, or makes no
-# data symbol of an export const), it builds them twice (mlx4 -> new mlx
-# -> mlx4 again).
-# Messages go to stderr.
+# nothing: then zig builds mlx0, which builds it), mlx4 is built from it in two stages
+# (mlx1 builds the compiler, which builds itself). When mlx4 is older than
+# the compiler's sources and
+# lacks something they added since (each feature below has a probe), it is
+# rebuilt in two stages (mlx4 builds the new compiler, which builds itself;
+# one or two more when that is not yet the fixed point) and installed once
+# it has every feature; the message names what was
+# missing. A rebuild that does not help (the old compiler cannot build the
+# sources, or the result still lacks a feature) falls back to the bootstrap
+# chain, and failing that leaves the old compiler in place and exits 1
+# with the reason, so a check does not rebuild on every run in silence.
+# Progress and messages go to stderr; stdout is the path alone.
 #
 #   compiler=$(tools/ensure_compiler.sh)
 set -euo pipefail
@@ -23,11 +25,17 @@ set -euo pipefail
 repo_root=$(cd "$(dirname "$0")/.." && pwd)
 cd "$repo_root"
 mkdir -p mlx-out/bin/compiler
+canonical=mlx-out/bin/compiler/mlx4
+
+# The probes: each returns 0 when the compiler ($1) has the feature. They
+# build and run small programs in a directory under mlx-out (a /tmp mounted
+# noexec would fail every one of them, and the compiler would be rebuilt
+# on every run).
 
 # Whether $1 writes shared objects (ET_DYN) with --shared.
 writes_shared_objects() {
     local probe
-    probe=$(mktemp -d)
+    probe=$(mktemp -d mlx-out/probe.XXXXXX)
     local ok=1
     if "$1" --quiet --shared tests/support/shared_object_library.mlx -o "$probe/probe.so" > /dev/null 2>&1 \
         && [[ "$(od -An -tx1 -j16 -N2 "$probe/probe.so" | tr -d ' ')" == "0300" ]]; then
@@ -41,7 +49,7 @@ writes_shared_objects() {
 # crash reports of the desktop programs read.
 writes_symbol_tables() {
     local probe
-    probe=$(mktemp -d)
+    probe=$(mktemp -d mlx-out/probe.XXXXXX)
     local ok=1
     if "$1" --quiet tests/support/crash_report.mlx -o "$probe/probe" > /dev/null 2>&1 \
         && grep -q 'crash_report.mlx:[0-9]*:middle' "$probe/probe"; then
@@ -61,7 +69,7 @@ accepts_discards() {
 # into parts need it).
 orders_import_cycles() {
     local probe
-    probe=$(mktemp -d)
+    probe=$(mktemp -d mlx-out/probe.XXXXXX)
     local ok=1
     if "$1" --quiet tests/275_import_cycle_order_runtime.mlx -o "$probe/probe" > /dev/null 2>&1; then
         ok=0
@@ -75,7 +83,7 @@ orders_import_cycles() {
 # 256 MiB, too little for the compiler to build the largest programs.
 has_large_arena() {
     local probe
-    probe=$(mktemp -d)
+    probe=$(mktemp -d mlx-out/probe.XXXXXX)
     local ok=1
     if "$1" --quiet tests/281_arena_capacity_runtime.mlx -o "$probe/probe" > /dev/null 2>&1; then
         local status=0
@@ -91,7 +99,7 @@ has_large_arena() {
 # stored a narrower arm's value in part and loaded the whole slot.
 keeps_match_widths() {
     local probe
-    probe=$(mktemp -d)
+    probe=$(mktemp -d mlx-out/probe.XXXXXX)
     local ok=1
     if "$1" --quiet tests/282_match_result_width_runtime.mlx -o "$probe/probe" > /dev/null 2>&1; then
         local status=0
@@ -108,7 +116,7 @@ keeps_match_widths() {
 # it as an unsigned word, so a negative i32 came back large and positive.
 extends_signed_results() {
     local probe
-    probe=$(mktemp -d)
+    probe=$(mktemp -d mlx-out/probe.XXXXXX)
     local ok=1
     if "$1" --quiet tests/293_signed_result_runtime.mlx -o "$probe/probe" > /dev/null 2>&1; then
         local status=0
@@ -123,7 +131,7 @@ extends_signed_results() {
 # (--soname, --symbol-version; projects/desktop/libpulse needs them).
 writes_symbol_versions() {
     local probe
-    probe=$(mktemp -d)
+    probe=$(mktemp -d mlx-out/probe.XXXXXX)
     local ok=1
     if "$1" --quiet --plugin --soname=libmlxprobe.so.1 --symbol-version=MLXPROBE_1 tests/support/plugin_library.mlx -o "$probe/probe.so" > /dev/null 2>&1 \
         && grep -qa MLXPROBE_1 "$probe/probe.so" && grep -qa libmlxprobe.so.1 "$probe/probe.so"; then
@@ -139,7 +147,7 @@ writes_symbol_versions() {
 # no size, so writing into it went over the frame.
 resolves_named_array_lengths() {
     local probe
-    probe=$(mktemp -d)
+    probe=$(mktemp -d mlx-out/probe.XXXXXX)
     local ok=1
     if "$1" --quiet tests/294_array_length_constant_runtime.mlx -o "$probe/probe" > /dev/null 2>&1; then
         local status=0
@@ -155,7 +163,7 @@ resolves_named_array_lengths() {
 # exits 13); older compilers stored the pointer only.
 keeps_slice_lengths() {
     local probe
-    probe=$(mktemp -d)
+    probe=$(mktemp -d mlx-out/probe.XXXXXX)
     local ok=1
     if "$1" --quiet tests/274_slice_assignment_runtime.mlx -o "$probe/probe" > /dev/null 2>&1; then
         local status=0
@@ -172,7 +180,7 @@ keeps_slice_lengths() {
 exports_data() {
     command -v python3 > /dev/null || return 0
     local probe
-    probe=$(mktemp -d)
+    probe=$(mktemp -d mlx-out/probe.XXXXXX)
     local ok=1
     if "$1" --quiet --plugin tests/support/plugin_library.mlx -o "$probe/probe.so" > /dev/null 2>&1 \
         && python3 -c 'import ctypes, sys; sys.exit(0 if ctypes.c_uint32.in_dll(ctypes.CDLL(sys.argv[1]), "mlx_plugin_level").value == 7 else 1)' "$probe/probe.so" > /dev/null 2>&1; then
@@ -187,7 +195,7 @@ exports_data() {
 # lock use.
 lowers_atomics() {
     local probe
-    probe=$(mktemp -d)
+    probe=$(mktemp -d mlx-out/probe.XXXXXX)
     printf 'pub fn main() -> u8 {\n    var word: u32 = 1\n    if @atomicRmw(u32, &word, add, 2, seq_cst) != 1 || word != 3 { return 1 }\n    return 0\n}\n' > "$probe/probe.mlx"
     local ok=1
     if "$1" --quiet "$probe/probe.mlx" -o "$probe/probe" > /dev/null 2>&1 && "$probe/probe"; then ok=0; fi
@@ -199,7 +207,7 @@ lowers_atomics() {
 # image's data area), which mlxlibc and every stateful library need.
 lowers_globals() {
     local probe
-    probe=$(mktemp -d)
+    probe=$(mktemp -d mlx-out/probe.XXXXXX)
     printf 'var counter: u32 = 5\n\nfn bump() -> u32 {\n    counter += 1\n    return counter\n}\n\npub fn main() -> u8 {\n    if bump() != 6 || counter != 6 { return 1 }\n    return 0\n}\n' > "$probe/probe.mlx"
     local ok=1
     if "$1" --quiet "$probe/probe.mlx" -o "$probe/probe" > /dev/null 2>&1 && "$probe/probe"; then ok=0; fi
@@ -211,7 +219,7 @@ lowers_globals() {
 # run on stack arenas (--plugin --stack-arena --no-libc), what mlxlibc is.
 builds_freestanding_plugins() {
     local probe
-    probe=$(mktemp -d)
+    probe=$(mktemp -d mlx-out/probe.XXXXXX)
     printf 'const Pair = struct { a: i64, b: i64 }\n\nfn pair(v: i64) -> Pair { return Pair.{ .a = v, .b = v } }\n\nexport fn probe_twice(v: i64) -> i64 {\n    const made = pair(v)\n    return made.a + made.b\n}\n' > "$probe/probe.mlx"
     local ok=1
     # (An older compiler takes the options and still names libc.so.6.)
@@ -224,7 +232,7 @@ builds_freestanding_plugins() {
 # <Threads>): @threadPointer and @spawnThread, which mlxlibc's threads need.
 lowers_thread_builtins() {
     local probe
-    probe=$(mktemp -d)
+    probe=$(mktemp -d mlx-out/probe.XXXXXX)
     printf 'fn entry(argument: usize) -> usize { return argument }\n\npub fn main() -> u8 {\n    var stack: [512]usize = undefined\n    const started = @spawnThread(0, @intFromPtr(&stack), 0, 0, 0, entry, 1)\n    if started == 1 || @threadPointer() == 1 { return 1 }\n    return 0\n}\n' > "$probe/probe.mlx"
     local ok=1
     if "$1" --quiet "$probe/probe.mlx" -o "$probe/probe" > /dev/null 2>&1; then ok=0; fi
@@ -237,7 +245,7 @@ lowers_thread_builtins() {
 # initializer, and a plugin with --entry and --init that runs as a program.
 builds_mlxlibc() {
     local probe
-    probe=$(mktemp -d)
+    probe=$(mktemp -d mlx-out/probe.XXXXXX)
     printf 'var table: [3]u16 = [3]u16{ 7, 8, 9 }\n\nfn load(address: usize) -> i32 {\n    unsafe { return @ptrFromInt(*i32, address).* }\n}\n\npub fn main() -> u8 {\n    var value: i32 = -1\n    if load(@intFromPtr(&value)) >= 0 { return 1 }\n    if table[2] != 9 { return 2 }\n    if @frameAddress() <= @intFromPtr(&value) { return 3 }\n    return 0\n}\n' > "$probe/probe.mlx"
     printf 'extern("syscall") fn syscall1(number: usize, a1: usize) -> isize {}\n\nexport fn start() -> void {\n    const exited = syscall1(231, 7)\n}\n\nexport fn init() -> void {}\n' > "$probe/entry.mlx"
     local ok=1
@@ -251,25 +259,206 @@ builds_mlxlibc() {
     return $ok
 }
 
-if [[ ! -x mlx-out/bin/compiler/mlx4 ]]; then
+# Whether $1 decodes \xHH and \u{H..H} in string and character literals
+# (tests/302_string_escapes_runtime.mlx exits 13); older compilers took
+# "\x1b" as the bytes 'x', '1', 'b', and std.terminal needs ESC.
+decodes_escapes() {
+    local probe
+    probe=$(mktemp -d mlx-out/probe.XXXXXX)
+    local ok=1
+    if "$1" --quiet tests/302_string_escapes_runtime.mlx -o "$probe/probe" > /dev/null 2>&1; then
+        local status=0
+        "$probe/probe" > /dev/null 2>&1 || status=$?
+        [[ $status -eq 13 ]] && ok=0
+    fi
+    rm -rf -- "$probe"
+    return $ok
+}
+
+# Whether a slice stored through its address (`into.* = text` in a callee,
+# `&local` passed on) keeps its length when the local reads it again
+# (tests/303_slice_address_runtime.mlx exits 13); older compilers kept
+# the words of such a local apart, so the store reached the pointer only,
+# and loaded one word of a slice through a pointer.
+stores_through_slice_addresses() {
+    local probe
+    probe=$(mktemp -d mlx-out/probe.XXXXXX)
+    local ok=1
+    if "$1" --quiet tests/303_slice_address_runtime.mlx -o "$probe/probe" > /dev/null 2>&1; then
+        local status=0
+        "$probe/probe" > /dev/null 2>&1 || status=$?
+        [[ $status -eq 13 ]] && ok=0
+    fi
+    rm -rf -- "$probe"
+    return $ok
+}
+
+# Whether tuples of more than three words come back from a call whole and
+# a part taken out of one keeps its type (tests/311_wide_tuple_runtime.mlx
+# exits 13); older compilers returned three words at most and lost a
+# slice's length taken out of a tuple. The same round of fixes typed field
+# addresses by their place, resolved module declarations in any order and
+# lowered module constants of floats and structs.
+returns_wide_tuples() {
+    local probe
+    probe=$(mktemp -d mlx-out/probe.XXXXXX)
+    local ok=1
+    if "$1" --quiet tests/311_wide_tuple_runtime.mlx -o "$probe/probe" > /dev/null 2>&1; then
+        local status=0
+        "$probe/probe" > /dev/null 2>&1 || status=$?
+        [[ $status -eq 13 ]] && ok=0
+    fi
+    rm -rf -- "$probe"
+    return $ok
+}
+
+# Whether $1 writes the files it read with --depfile (what `mlx build`
+# decides rebuilds by).
+writes_depfiles() {
+    local probe
+    probe=$(mktemp -d mlx-out/probe.XXXXXX)
+    local ok=1
+    if "$1" --quiet --depfile="$probe/deps" tests/support/discard.mlx > /dev/null 2>&1 \
+        && grep -qx 'tests/support/discard.mlx' "$probe/deps" 2> /dev/null; then
+        ok=0
+    fi
+    rm -rf -- "$probe"
+    return $ok
+}
+
+# Whether $1 has the build command (`mlx build`; outside a project it says
+# there is no build.mlx).
+runs_build() {
+    local probe compiler=$1 status=0
+    [[ "$compiler" == /* ]] || compiler="$repo_root/$compiler"
+    probe=$(mktemp -d mlx-out/probe.XXXXXX)
+    (cd "$probe" && "$compiler" build > /dev/null 2>&1) || status=$?
+    rm -rf -- "$probe"
+    [[ $status -eq 2 ]]
+}
+
+# The probes with what each one stands for.
+probes=(
+    "writes_shared_objects|--shared objects"
+    "writes_symbol_tables|symbol tables"
+    "accepts_discards|\`_ = value\`"
+    "keeps_slice_lengths|slice lengths kept on assignment"
+    "orders_import_cycles|import cycles broken in order"
+    "has_large_arena|the 1 GiB arena"
+    "keeps_match_widths|match values stored at their width"
+    "extends_signed_results|signed results sign-extended"
+    "writes_symbol_versions|symbol versions"
+    "resolves_named_array_lengths|array lengths from named constants"
+    "exports_data|data symbols for export const"
+    "lowers_atomics|the atomic builtins"
+    "lowers_globals|module-level var globals"
+    "builds_freestanding_plugins|plugins without libc on stack arenas"
+    "lowers_thread_builtins|the thread builtins"
+    "builds_mlxlibc|what mlxlibc needs (@frameAddress, signed loads through pointers, array initializers of module vars, --entry and --init)"
+    "decodes_escapes|\\xHH escapes"
+    "stores_through_slice_addresses|slices stored through their address keeping their length"
+    "returns_wide_tuples|tuples of more than three words"
+    "writes_depfiles|--depfile"
+    "runs_build|the build command (mlx build)"
+)
+
+# What compiler $1 lacks, one feature per line (nothing when it has all).
+missing_features() {
+    local compiler=$1 entry probe what
+    for entry in "${probes[@]}"; do
+        probe=${entry%%|*}
+        what=${entry#*|}
+        "$probe" "$compiler" || echo "$what"
+    done
+}
+
+# Builds the compiler from the current sources with $1 into $2, saying $3.
+build_stage() {
+    echo "  $3" >&2
+    "$1" --quiet compiler/selfhost/main.mlx -o "$2"
+}
+
+# The compiler rebuilt from the current sources by $1 in two stages (it
+# builds the new compiler, which builds itself), installed as the canonical
+# one when it has every feature. Fails with the old compiler untouched when
+# a stage fails or the result still lacks something.
+rebuild_with() {
+    local seed=$1
+    local next=$canonical.next fixed=$canonical.fixed
+    rm -f "$next" "$fixed"
+    if ! build_stage "$seed" "$next" "stage 1 of 2: $seed builds the compiler from the current sources"; then
+        echo "ensure_compiler.sh: $seed cannot build the current compiler sources" >&2
+        rm -f "$next"
+        return 1
+    fi
+    if ! build_stage "$next" "$fixed" "stage 2 of 2: the new compiler builds itself"; then
+        echo "ensure_compiler.sh: the compiler $seed built cannot build the sources again" >&2
+        rm -f "$next" "$fixed"
+        return 1
+    fi
+    # A seed with a bug the new sources fixed builds a stage-1 compiler that
+    # still behaves the old way in that spot (a cast it got wrong, say), so
+    # stage 2 can differ from what stage 2 builds in turn. Up to two more
+    # stages then reach the fixed point: the compiler that builds itself
+    # byte for byte.
+    local again=$canonical.again extra
+    for extra in 3 4; do
+        if ! build_stage "$fixed" "$again" "stage $extra: the compiler builds itself again, for its fixed point"; then
+            rm -f "$again"
+            break
+        fi
+        if cmp -s "$fixed" "$again"; then
+            rm -f "$again"
+            break
+        fi
+        mv "$again" "$fixed"
+    done
+    local still
+    still=$(missing_features "$fixed")
+    if [[ -n "$still" ]]; then
+        echo "ensure_compiler.sh: the compiler rebuilt by $seed still lacks:" >&2
+        sed 's/^/    /' <<< "$still" >&2
+        rm -f "$next" "$fixed"
+        return 1
+    fi
+    mv "$fixed" "$canonical"
+    rm -f "$next"
+    return 0
+}
+
+# The bootstrap compiler zig-out/bin/mlx1 (built when missing: zig builds
+# mlx0 from compiler/bootstrap, mlx0 builds the self-hosted compiler; what
+# build.mlx's bootstrap group does too); its path on stdout, or failure.
+bootstrap_seed() {
     if [[ ! -x zig-out/bin/mlx1 ]]; then
-        if command -v zig > /dev/null; then
-            echo "building the Mlx compiler (zig build mlx1)" >&2
-            zig build mlx1 >&2
-        else
-            echo "ensure_compiler.sh: no Mlx compiler; build one (zig build mlx1)" >&2
-            exit 1
+        if [[ ! -x zig-out/bin/mlx0 ]]; then
+            if ! command -v zig > /dev/null; then
+                echo "ensure_compiler.sh: no bootstrap compiler (zig-out/bin/mlx1) and no zig to build one" >&2
+                return 1
+            fi
+            echo "building the stage-0 compiler zig-out/bin/mlx0 with zig" >&2
+            mkdir -p zig-out/bin
+            zig build-exe compiler/bootstrap/main.zig --name mlx0 -femit-bin=zig-out/bin/mlx0 >&2 || return 1
+        fi
+        echo "building the bootstrap compiler zig-out/bin/mlx1 with mlx0" >&2
+        zig-out/bin/mlx0 compiler/selfhost/main.mlx -o zig-out/bin/mlx1 >&2 || return 1
+    fi
+    echo zig-out/bin/mlx1
+}
+
+if [[ ! -x $canonical ]]; then
+    seed=$(bootstrap_seed) || exit 1
+    echo "building the canonical compiler $canonical from $seed" >&2
+    rebuild_with "$seed" || exit 1
+else
+    missing=$(missing_features "$canonical")
+    if [[ -n "$missing" ]]; then
+        echo "rebuilding $canonical from the current compiler sources: it lacks $(paste -sd '|' <<< "$missing" | sed 's/|/, /g')" >&2
+        if ! rebuild_with "$canonical"; then
+            echo "rebuilding $canonical from the bootstrap compiler instead" >&2
+            seed=$(bootstrap_seed) || { echo "ensure_compiler.sh: $canonical stays as it is; build the bootstrap compiler (./mlx build bootstrap, with zig) and run again" >&2; exit 1; }
+            rebuild_with "$seed" || { echo "ensure_compiler.sh: $canonical stays as it is" >&2; exit 1; }
         fi
     fi
-    echo "building the canonical compiler (mlx1 -> mlx2 -> mlx3, kept as mlx-out/bin/compiler/mlx4)" >&2
-    zig-out/bin/mlx1 --quiet compiler/selfhost/main.mlx -o mlx-out/bin/compiler/mlx2
-    mlx-out/bin/compiler/mlx2 --quiet compiler/selfhost/main.mlx -o mlx-out/bin/compiler/mlx3
-    cp mlx-out/bin/compiler/mlx3 mlx-out/bin/compiler/mlx4
-elif ! writes_shared_objects mlx-out/bin/compiler/mlx4 || ! writes_symbol_tables mlx-out/bin/compiler/mlx4 || ! accepts_discards mlx-out/bin/compiler/mlx4 || ! keeps_slice_lengths mlx-out/bin/compiler/mlx4 || ! orders_import_cycles mlx-out/bin/compiler/mlx4 || ! has_large_arena mlx-out/bin/compiler/mlx4 || ! keeps_match_widths mlx-out/bin/compiler/mlx4 || ! extends_signed_results mlx-out/bin/compiler/mlx4 || ! writes_symbol_versions mlx-out/bin/compiler/mlx4 || ! resolves_named_array_lengths mlx-out/bin/compiler/mlx4 || ! exports_data mlx-out/bin/compiler/mlx4 || ! lowers_atomics mlx-out/bin/compiler/mlx4 || ! lowers_globals mlx-out/bin/compiler/mlx4 || ! builds_freestanding_plugins mlx-out/bin/compiler/mlx4 || ! lowers_thread_builtins mlx-out/bin/compiler/mlx4 || ! builds_mlxlibc mlx-out/bin/compiler/mlx4; then
-    echo "rebuilding mlx-out/bin/compiler/mlx4 from the current compiler sources (it lacks --shared objects, symbol tables, \`_ = value\`, slice lengths kept on assignment, import cycles broken in order, the 1 GiB arena, match values stored at their width, signed results sign-extended, symbol versions, array lengths from named constants, data symbols for export const, the atomic builtins, module-level var globals, plugins without libc on stack arenas, the thread builtins or what mlxlibc needs: @frameAddress, signed loads through pointers, array initializers of module vars, --entry and --init for plugins)" >&2
-    mlx-out/bin/compiler/mlx4 --quiet compiler/selfhost/main.mlx -o mlx-out/bin/compiler/mlx4.next
-    mlx-out/bin/compiler/mlx4.next --quiet compiler/selfhost/main.mlx -o mlx-out/bin/compiler/mlx4.fixed
-    mv mlx-out/bin/compiler/mlx4.fixed mlx-out/bin/compiler/mlx4
-    rm -f mlx-out/bin/compiler/mlx4.next
 fi
-echo mlx-out/bin/compiler/mlx4
+echo "$canonical"

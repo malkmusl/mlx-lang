@@ -1,0 +1,214 @@
+// Starts one login session without libc. Setup is reported through a
+// close-on-exec pipe: the parent calls it started only after execve closed
+// the pipe, while every privilege-drop failure is reported and exits.
+const std = @import("std")
+const activation = @import("../ipc/activation.mlx")
+const groups_module = @import("./groups.mlx")
+const users_module = @import("./users.mlx")
+
+const SYS_read: usize = 0
+const SYS_write: usize = 1
+const SYS_close: usize = 3
+const SYS_fork: usize = 57
+const SYS_wait4: usize = 61
+const SYS_chdir: usize = 80
+const SYS_chmod: usize = 90
+const SYS_chown: usize = 92
+const SYS_setuid: usize = 105
+const SYS_setgid: usize = 106
+const SYS_setsid: usize = 112
+const SYS_setgroups: usize = 116
+const SYS_exit_group: usize = 231
+const SYS_pipe2: usize = 293
+const SYS_rt_sigprocmask: usize = 14
+const O_CLOEXEC: usize = 524288
+const EINTR: isize = -4
+const DIRECTORY: u32 = 16384
+const FILE_KIND: u32 = 61440
+const GROUP_OR_OTHER_WRITABLE: u32 = 18
+const PATH_MOST: usize = 512
+const GROUP_MOST: usize = 32
+const ENVIRONMENT_MOST: usize = 4096
+const ENVIRONMENT_ENTRIES: usize = 12
+
+fn copyInto(target: [*]u8, capacity: usize, value: []const u8) -> usize {
+    var index: usize = 0
+    while index < value.length && index < capacity {
+        target[index] = value[index]
+        index += 1
+    }
+    return index
+}
+
+fn addNumber(target: [*]u8, at: usize, value: u32) -> usize {
+    var digits: [16]u8 = undefined
+    var count: usize = 0
+    var left = value
+    if left == 0 {
+        target[at] = 48
+        return at + 1
+    }
+    while left > 0 {
+        digits[count] = @intCast(u8, left % 10) + 48
+        count += 1
+        left = left / 10
+    }
+    var written = at
+    while count > 0 {
+        count -= 1
+        target[written] = digits[count]
+        written += 1
+    }
+    return written
+}
+
+fn cString(target: [*]u8, capacity: usize, value: []const u8) -> bool {
+    if value.length == 0 || value.length + 1 > capacity { return false }
+    var index: usize = 0
+    while index < value.length {
+        if value[index] == 0 { return false }
+        target[index] = value[index]
+        index += 1
+    }
+    target[index] = 0
+    return true
+}
+
+fn directory(path: [*]u8, owner: u32, writable: bool) -> bool {
+    var status: std.fs.Stat = undefined
+    if std.fs.statusAt(path, &status, true) != 0 || status.mode & FILE_KIND != DIRECTORY { return false }
+    if !writable && (status.user != owner || status.mode & GROUP_OR_OTHER_WRITABLE != 0) { return false }
+    return true
+}
+
+// Creates ROOT/UID under a trusted, root-owned base and returns its text.
+fn runtimeDirectory(root: []const u8, uid: u32, gid: u32, path: [*]u8, length: *usize) -> bool {
+    if root.length == 0 || root.length + 16 >= PATH_MOST || !cString(path, PATH_MOST, root) { return false }
+    const ignored = std.linux.syscall2(83, @intFromPtr(path), 493)
+    if !directory(path, 0, false) { return false }
+    var at = root.length
+    if at > 0 && path[at - 1] != 47 {
+        path[at] = 47
+        at += 1
+    }
+    at = addNumber(path, at, uid)
+    path[at] = 0
+    const made = std.linux.syscall2(83, @intFromPtr(path), 448)
+    if !directory(path, uid, true) && made != 0 { return false }
+    if std.linux.syscall2(SYS_chmod, @intFromPtr(path), 448) != 0 { return false }
+    if std.linux.syscall3(SYS_chown, @intFromPtr(path), @intCast(usize, uid), @intCast(usize, gid)) != 0 { return false }
+    if !directory(path, uid, false) { return false }
+    length.* = at
+    return true
+}
+
+fn entry(storage: [*]u8, used: *usize, entries: [*][*]const u8, count: *usize, key: []const u8, value: []const u8) -> bool {
+    if count.* >= ENVIRONMENT_ENTRIES || used.* + key.length + value.length + 1 > ENVIRONMENT_MOST { return false }
+    unsafe { entries[count.*] = @ptrFromInt([*]const u8, @intFromPtr(storage) + used.*) }
+    used.* += copyInto(@ptrFromInt([*]u8, @intFromPtr(storage) + used.*), ENVIRONMENT_MOST - used.*, key)
+    used.* += copyInto(@ptrFromInt([*]u8, @intFromPtr(storage) + used.*), ENVIRONMENT_MOST - used.*, value)
+    storage[used.*] = 0
+    used.* += 1
+    count.* += 1
+    return true
+}
+
+fn childFailed(descriptor: isize) -> void {
+    var byte: [1]u8 = [1]u8{ 1 }
+    var written = std.linux.syscall3(SYS_write, @bitCast(usize, descriptor), @intFromPtr(&byte), 1)
+    while written == EINTR { written = std.linux.syscall3(SYS_write, @bitCast(usize, descriptor), @intFromPtr(&byte), 1) }
+    const exited = std.linux.syscall1(SYS_exit_group, 127)
+}
+
+fn child(user: *users_module.User, program: [*]u8, home: [*]u8, runtime: []const u8, busAddress: []const u8, groups: [*]u32, groupCount: usize, report: isize) -> void {
+    // The daemon blocks CHLD/TERM/INT for its signalfd. They belong to
+    // the new session again after fork.
+    var none: usize = 0
+    if std.linux.syscall4(SYS_rt_sigprocmask, 2, @intFromPtr(&none), 0, 8) != 0 { childFailed(report) }
+    if std.linux.syscall0(SYS_setsid) < 0 { childFailed(report) }
+    if std.linux.syscall2(SYS_setgroups, groupCount, @intFromPtr(groups)) != 0 { childFailed(report) }
+    if std.linux.syscall1(SYS_setgid, @intCast(usize, user.*.gid)) != 0 { childFailed(report) }
+    if std.linux.syscall1(SYS_setuid, @intCast(usize, user.*.uid)) != 0 { childFailed(report) }
+    if std.linux.syscall1(SYS_chdir, @intFromPtr(home)) != 0 { childFailed(report) }
+
+    var storage: [ENVIRONMENT_MOST]u8 = undefined
+    var storageBytes: [*]u8 = undefined
+    unsafe { storageBytes = @ptrCast([*]u8, &storage) }
+    var environment: [ENVIRONMENT_ENTRIES + 1][*]const u8 = undefined
+    var environmentEntries: [*][*]const u8 = undefined
+    unsafe { environmentEntries = @ptrCast([*][*]const u8, &environment) }
+    var used: usize = 0
+    var count: usize = 0
+    const name = users_module.nameOf(user)
+    const ok = entry(storageBytes, &used, environmentEntries, &count, "HOME=", users_module.homeOf(user)) &&
+        entry(storageBytes, &used, environmentEntries, &count, "USER=", name) &&
+        entry(storageBytes, &used, environmentEntries, &count, "LOGNAME=", name) &&
+        entry(storageBytes, &used, environmentEntries, &count, "SHELL=", users_module.shellOf(user)) &&
+        entry(storageBytes, &used, environmentEntries, &count, "PATH=", "/usr/local/bin:/usr/bin:/bin:/usr/bin/mlx") &&
+        entry(storageBytes, &used, environmentEntries, &count, "XDG_RUNTIME_DIR=", runtime) &&
+        entry(storageBytes, &used, environmentEntries, &count, "XDG_SESSION_TYPE=", "wayland") &&
+        entry(storageBytes, &used, environmentEntries, &count, "XDG_SESSION_ID=", "mlx") &&
+        entry(storageBytes, &used, environmentEntries, &count, "XDG_SEAT=", "seat0") &&
+        entry(storageBytes, &used, environmentEntries, &count, "XDG_VTNR=", "1") &&
+        entry(storageBytes, &used, environmentEntries, &count, "DBUS_SYSTEM_BUS_ADDRESS=", busAddress)
+    if !ok { childFailed(report) }
+    unsafe { environmentEntries[count] = @ptrFromInt([*]const u8, 0) }
+    var arguments: [2][*]const u8 = undefined
+    unsafe {
+        arguments[0] = @ptrCast([*]const u8, program)
+        arguments[1] = @ptrFromInt([*]const u8, 0)
+        activation.execute(arguments[0], @ptrCast([*][*]const u8, &arguments), environmentEntries)
+    }
+    childFailed(report)
+}
+
+// Starts `program` as `user`; its positive pid, or -1 after any setup or
+// exec failure. `program` is one executable, never a shell command.
+pub fn start(user: *users_module.User, programText: []const u8, groupPath: []const u8, runtimeRoot: []const u8, busAddress: []const u8) -> isize {
+    if programText.length == 0 || programText.length > 255 { return -1 }
+    var index: usize = 0
+    while index < programText.length {
+        if programText[index] == 0 || programText[index] == 32 || programText[index] == 9 || programText[index] == 10 { return -1 }
+        index += 1
+    }
+    var groups: [GROUP_MOST]u32 = undefined
+    var groupBytes: [*]u32 = undefined
+    unsafe { groupBytes = @ptrCast([*]u32, &groups) }
+    var groupCount: usize = 0
+    if !groups_module.load(groupPath, users_module.nameOf(user), user.*.gid, groupBytes, &groupCount, GROUP_MOST) { return -1 }
+    var runtime: [PATH_MOST]u8 = undefined
+    var runtimeBytes: [*]u8 = undefined
+    unsafe { runtimeBytes = @ptrCast([*]u8, &runtime) }
+    var runtimeLength: usize = 0
+    if !runtimeDirectory(runtimeRoot, user.*.uid, user.*.gid, runtimeBytes, &runtimeLength) { return -1 }
+    var program: [256]u8 = undefined
+    var programBytes: [*]u8 = undefined
+    unsafe { programBytes = @ptrCast([*]u8, &program) }
+    if !cString(programBytes, 256, programText) { return -1 }
+    var home: [users_module.PATH_MOST + 1]u8 = undefined
+    var homeBytes: [*]u8 = undefined
+    unsafe { homeBytes = @ptrCast([*]u8, &home) }
+    if !cString(homeBytes, users_module.PATH_MOST + 1, users_module.homeOf(user)) { return -1 }
+    var descriptors: [2]i32 = undefined
+    if std.linux.syscall2(SYS_pipe2, @intFromPtr(&descriptors), O_CLOEXEC) != 0 { return -1 }
+    const reader = @intCast(isize, descriptors[0])
+    const writer = @intCast(isize, descriptors[1])
+    const pid = std.linux.syscall0(SYS_fork)
+    if pid == 0 {
+        const ignored = std.linux.syscall1(SYS_close, @bitCast(usize, reader))
+        child(user, programBytes, homeBytes, runtimeBytes[0..runtimeLength], busAddress, groupBytes, groupCount, writer)
+    }
+    const ignoredWriter = std.linux.syscall1(SYS_close, @bitCast(usize, writer))
+    if pid < 0 {
+        const ignoredReader = std.linux.syscall1(SYS_close, @bitCast(usize, reader))
+        return -1
+    }
+    var problem: [1]u8 = undefined
+    var got = std.linux.syscall3(SYS_read, @bitCast(usize, reader), @intFromPtr(&problem), 1)
+    while got == EINTR { got = std.linux.syscall3(SYS_read, @bitCast(usize, reader), @intFromPtr(&problem), 1) }
+    const ignoredReader = std.linux.syscall1(SYS_close, @bitCast(usize, reader))
+    if got == 0 { return pid }
+    var status: usize = 0
+    const ignoredWait = std.linux.syscall4(SYS_wait4, @bitCast(usize, pid), @intFromPtr(&status), 0, 0)
+    return -1
+}

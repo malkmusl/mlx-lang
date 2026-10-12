@@ -10,8 +10,8 @@ TMP_DIR=$(mktemp -d)
 OUT_PATH="$TMP_DIR/out"
 trap 'rm -rf -- "$TMP_DIR"' EXIT
 
-echo "Building compiler..."
-zig build
+echo "Building the stage-0 compiler (zig-out/bin/mlx0, with zig; only when its sources changed)..."
+./mlx build mlx0
 
 echo "Compiling $MLX_FILE to ELF..."
 ./zig-out/bin/mlx0 "$MLX_FILE" "-o$OUT_PATH"

@@ -1,0 +1,815 @@
+// std.diagnostics: what a program keeps about itself when it crashes and
+// where its time goes, from the processor and from the GPU, through one
+// interface that knows these two sources and no other (Source). Every
+// reader (MLX Observatory, mlx-codemap) takes both alike:
+//
+// - Crashes: a line each in $XDG_STATE_HOME/mlx/crashes.log
+//   (~/.local/state/mlx/crashes.log):
+//
+//       crash <TAB> seconds since 1970 <TAB> program <TAB> reason <TAB> frame <TAB> frame ...
+//       gpu-crash <TAB> ...
+//
+//   A processor crash's frames are where it stopped and the functions that
+//   called it; a GPU crash's are the functions that recorded the work the
+//   GPU was running when it failed. std.crash keeps the first, std.gpu the
+//   second.
+//
+// - Profiles: a file each in $XDG_STATE_HOME/mlx/profiles,
+//   PROGRAM-SECONDS.profile and PROGRAM-gpu-SECONDS.profile:
+//
+//       profile <TAB> program <TAB> seconds since 1970 <TAB> samples <TAB> interval in µs <TAB> processor|gpu
+//       self <TAB> total <TAB> path:line:function
+//       ...
+//
+//   in samples of the interval: in the function itself, and with what it
+//   called. mlx-profile writes the processor's (a sample every few
+//   milliseconds); std.gpu the GPU's (the time of the GPU work each function
+//   recorded, in microseconds, the interval 1).
+//
+// - GPU memory: std.gpu notes each block of device memory it allocates
+//   (with the functions that asked, its memory type and heap) and frees;
+//   std.leaks writes them into its memory snapshots beside the processor's
+//   blocks (GPU memory below).
+//
+// - Frames: with MLX_FRAMES set (and not 0), the frames a program draws,
+//   each with how long the processor and the GPU worked on it, and how
+//   long the program took to its first frame (Frames below).
+//
+// Nothing here allocates (the crash handler uses it): what it needs it
+// maps and gives back.
+const std = @import("std")
+
+const SYS_write: usize = 1
+const SYS_open: usize = 2
+const SYS_close: usize = 3
+const SYS_mmap: usize = 9
+const SYS_munmap: usize = 11
+const SYS_rename: usize = 82
+const SYS_mkdir: usize = 83
+const SYS_clock_gettime: usize = 228
+const SYS_getpid: usize = 39
+const CLOCK_MONOTONIC: usize = 1
+const CLOCK_BOOTTIME: usize = 7
+const O_WRONLY_CREAT_APPEND: usize = 1089
+const O_WRONLY_CREAT_TRUNC: usize = 577
+
+pub const Source = enum(u8) {
+    processor,
+    gpu,
+}
+
+// The tag a crash line starts with.
+pub fn crashTag(source: Source) -> []const u8 {
+    return match source {
+        .processor => "crash",
+        .gpu => "gpu-crash",
+    }
+}
+
+// The last field of a profile's first line.
+pub fn sourceName(source: Source) -> []const u8 {
+    return match source {
+        .processor => "processor",
+        .gpu => "gpu",
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Text without allocating
+
+pub fn put(into: [*]u8, length: *usize, text: []const u8) -> void {
+    for byte in text {
+        into[length.*] = byte
+        length.* += 1
+    }
+}
+
+pub fn putBytes(into: [*]u8, length: *usize, bytes: [*]const u8, count: usize) -> void {
+    var index: usize = 0
+    while index < count {
+        into[length.*] = bytes[index]
+        length.* += 1
+        index += 1
+    }
+}
+
+pub fn putNumber(into: [*]u8, length: *usize, value: usize) -> void {
+    if value >= 10 { putNumber(into, length, value / 10) }
+    into[length.*] = @intCast(u8, 48 + value % 10)
+    length.* += 1
+}
+
+pub fn now() -> usize {
+    var time: [2]usize = [2]usize{ 0, 0 }
+    const clock = std.linux.syscall2(SYS_clock_gettime, 0, @intFromPtr(&time))
+    return time[0]
+}
+
+fn mapped(size: usize) -> usize {
+    const result = std.linux.syscall6(SYS_mmap, 0, size, 3, 34, 18446744073709551615, 0)
+    if result < 0 { return 0 }
+    return @bitCast(usize, result)
+}
+
+fn unmapped(address: usize, size: usize) -> void {
+    const done = std.linux.syscall2(SYS_munmap, address, size)
+}
+
+fn bytesAt(address: usize) -> [*]u8 {
+    unsafe { return @ptrFromInt([*]u8, address) }
+}
+
+fn makeDirectory(path: [*]u8, length: usize) -> void {
+    path[length] = 0
+    const made = std.linux.syscall2(SYS_mkdir, @intFromPtr(path), 493)
+}
+
+// Where the value of NAME= starts in the environment (`environ`, the
+// NUL-separated text of /proc/self/environ), or 0.
+fn variable(environ: [*]const u8, length: usize, prefix: []const u8) -> usize {
+    var entry: usize = 0
+    while entry < length {
+        var matched = true
+        var offset: usize = 0
+        for byte in prefix {
+            if entry + offset >= length || environ[entry + offset] != byte { matched = false }
+            offset += 1
+        }
+        if matched { return entry + offset }
+        while entry < length && environ[entry] != 0 { entry += 1 }
+        entry += 1
+    }
+    return 0
+}
+
+const ENVIRON_SIZE: usize = 258048
+
+fn readEnvironment(into: [*]u8) -> usize {
+    const file = std.linux.syscall3(SYS_open, @intFromPtr(@ptrCast([*]const u8, "/proc/self/environ")), 0, 0)
+    if file < 0 { return 0 }
+    var total: usize = 0
+    while total < ENVIRON_SIZE {
+        const count = std.linux.syscall3(0, @bitCast(usize, file), @intFromPtr(into) + total, ENVIRON_SIZE - total)
+        if count <= 0 { break }
+        total += @bitCast(usize, count)
+    }
+    const closed = std.linux.syscall1(SYS_close, @bitCast(usize, file))
+    return total
+}
+
+// $XDG_STATE_HOME/mlx/SUBDIRECTORY, else $HOME/.local/state/mlx/
+// SUBDIRECTORY (an empty one: the mlx directory itself), made where it is
+// missing, into `path` (4096 bytes); its length, 0 when there is neither.
+// `scratch` holds ENVIRON_SIZE bytes.
+fn stateDirectory(scratch: [*]u8, path: [*]u8, subdirectory: []const u8) -> usize {
+    const environ_length = readEnvironment(scratch)
+    var length: usize = 0
+    const state = variable(scratch, environ_length, "XDG_STATE_HOME=")
+    var from: usize = 0
+    if state != 0 && state < environ_length && scratch[state] == 47 {
+        from = state
+    } else {
+        const home = variable(scratch, environ_length, "HOME=")
+        if home == 0 || home >= environ_length || scratch[home] != 47 { return 0 }
+        from = home
+    }
+    while from + length < environ_length && scratch[from + length] != 0 && length < 3000 {
+        path[length] = scratch[from + length]
+        length += 1
+    }
+    if from != state {
+        put(path, &length, "/.local")
+        makeDirectory(path, length)
+        put(path, &length, "/state")
+    }
+    makeDirectory(path, length)
+    put(path, &length, "/mlx")
+    makeDirectory(path, length)
+    if subdirectory.length > 0 {
+        put(path, &length, "/")
+        put(path, &length, subdirectory)
+        makeDirectory(path, length)
+    }
+    return length
+}
+
+// The value of the environment variable NAME into `into` (at most
+// `capacity` bytes, NUL-ended); its length, 0 when it is not set.
+pub fn environmentValue(name: []const u8, into: [*]u8, capacity: usize) -> usize {
+    const scratch_address = mapped(ENVIRON_SIZE + 256)
+    if scratch_address == 0 { return 0 }
+    const scratch = bytesAt(scratch_address)
+    const environ_length = readEnvironment(scratch)
+    // NAME= in the scratch's tail.
+    const prefix = bytesAt(scratch_address + ENVIRON_SIZE)
+    var prefix_length: usize = 0
+    if name.length < 250 {
+        put(prefix, &prefix_length, name)
+        put(prefix, &prefix_length, "=")
+    }
+    const from = variable(scratch, environ_length, prefix[0..prefix_length])
+    var length: usize = 0
+    if from != 0 && prefix_length > 0 {
+        while from + length < environ_length && scratch[from + length] != 0 && length + 1 < capacity {
+            into[length] = scratch[from + length]
+            length += 1
+        }
+    }
+    into[length] = 0
+    unmapped(scratch_address, ENVIRON_SIZE + 256)
+    return length
+}
+
+// The program's file name (of /proc/self/exe) into `into`; its length.
+pub fn programName(into: [*]u8, capacity: usize) -> usize {
+    var path: [4096]u8 = undefined
+    const got = std.linux.syscall3(89, @intFromPtr(@ptrCast([*]const u8, "/proc/self/exe")), @intFromPtr(&path), 4096)
+    if got <= 0 { return processName(into, capacity) }
+    const length = @bitCast(usize, got)
+    var start: usize = 0
+    var at: usize = 0
+    while at < length {
+        if path[at] == 47 { start = at + 1 }
+        at += 1
+    }
+    var count: usize = 0
+    while start + count < length && count < capacity {
+        into[count] = path[start + count]
+        count += 1
+    }
+    return count
+}
+
+// The process's name (/proc/self/comm, what crash lines carry) into
+// `into`; its length.
+pub fn processName(into: [*]u8, capacity: usize) -> usize {
+    const file = std.linux.syscall3(SYS_open, @intFromPtr(@ptrCast([*]const u8, "/proc/self/comm")), 0, 0)
+    if file < 0 { return 0 }
+    const count = std.linux.syscall3(0, @bitCast(usize, file), @intFromPtr(into), capacity)
+    const closed = std.linux.syscall1(SYS_close, @bitCast(usize, file))
+    if count <= 0 { return 0 }
+    var length = @bitCast(usize, count)
+    if into[length - 1] == 10 { length -= 1 }
+    return length
+}
+
+// $XDG_RUNTIME_DIR/mlx/SUBDIRECTORY (what lives while the session does:
+// std.leaks' memory snapshots), else the state directory's; made where
+// missing, into `path` (4096 bytes); its length, 0 when there is neither.
+pub fn runtimeDirectory(path: [*]u8, subdirectory: []const u8) -> usize {
+    const scratch_address = mapped(ENVIRON_SIZE)
+    if scratch_address == 0 { return 0 }
+    const scratch = bytesAt(scratch_address)
+    const environ_length = readEnvironment(scratch)
+    const runtime = variable(scratch, environ_length, "XDG_RUNTIME_DIR=")
+    var length: usize = 0
+    if runtime != 0 && runtime < environ_length && scratch[runtime] == 47 {
+        while runtime + length < environ_length && scratch[runtime + length] != 0 && length < 3000 {
+            path[length] = scratch[runtime + length]
+            length += 1
+        }
+        put(path, &length, "/mlx")
+        makeDirectory(path, length)
+        put(path, &length, "/")
+        put(path, &length, subdirectory)
+        makeDirectory(path, length)
+    } else {
+        length = stateDirectory(scratch, path, subdirectory)
+    }
+    unmapped(scratch_address, ENVIRON_SIZE)
+    return length
+}
+
+// ---------------------------------------------------------------------------
+// Crashes
+
+const CRASH_SCRATCH: usize = 524288
+const CRASH_PATH_AT: usize = 262144
+const CRASH_LINE_AT: usize = 266240
+// The record's longest (the rest of the line is cut).
+pub const MAX_RECORD: usize = 258000
+
+// Keeps a crash: "TAG <TAB> seconds <TAB> record" as a line of
+// crashes.log, where the record is program <TAB> reason <TAB> frame ...
+pub fn keepCrash(source: Source, record: [*]const u8, record_length: usize) -> void {
+    const scratch_address = mapped(CRASH_SCRATCH)
+    if scratch_address == 0 { return }
+    const scratch = bytesAt(scratch_address)
+    const path = bytesAt(scratch_address + CRASH_PATH_AT)
+    var path_length = stateDirectory(scratch, path, "")
+    if path_length > 0 {
+        put(path, &path_length, "/crashes.log")
+        path[path_length] = 0
+        const file = std.linux.syscall3(SYS_open, @intFromPtr(path), O_WRONLY_CREAT_APPEND, 420)
+        if file >= 0 {
+            const line = bytesAt(scratch_address + CRASH_LINE_AT)
+            var line_length: usize = 0
+            put(line, &line_length, crashTag(source))
+            put(line, &line_length, "\t")
+            putNumber(line, &line_length, now())
+            put(line, &line_length, "\t")
+            putBytes(line, &line_length, record, if record_length < MAX_RECORD { record_length } else { MAX_RECORD })
+            put(line, &line_length, "\n")
+            // One write: lines of crashes at once stay whole.
+            const wrote = std.linux.syscall3(SYS_write, @bitCast(usize, file), @intFromPtr(line), line_length)
+            const closed = std.linux.syscall1(SYS_close, @bitCast(usize, file))
+        }
+    }
+    unmapped(scratch_address, CRASH_SCRATCH)
+}
+
+// ---------------------------------------------------------------------------
+// Profiles
+
+// A profile being written: openProfile, a profileLine per function,
+// closeProfile. It is written beside its place and renamed into it at the
+// end, so a reader never sees half of it (std.gpu writes its own again and
+// again while the program runs).
+pub const ProfileFile = struct {
+    descriptor: isize
+    // The file's path, then (past pathLength + 1) the one written first.
+    path: [4096]u8
+    pathLength: usize
+    line: [8192]u8
+}
+
+// Opens DIRECTORY/PROGRAM-SECONDS.profile (PROGRAM-gpu-SECONDS.profile
+// for the GPU; an empty DIRECTORY is the state directory's profiles,
+// made where missing) and writes the first line. False when it cannot.
+pub fn openProfile(file: *ProfileFile, source: Source, directory: []const u8, program: []const u8, seconds: usize, samples: usize, interval: usize) -> bool {
+    file.*.descriptor = -1
+    var path: [*]u8 = undefined
+    unsafe { path = @ptrCast([*]u8, &file.*.path) }
+    var length: usize = 0
+    if directory.length > 0 {
+        // The directory and those it is in.
+        put(path, &length, directory)
+        var at: usize = 1
+        while at < length {
+            if path[at] == 47 {
+                makeDirectory(path, at)
+                path[at] = 47
+            }
+            at += 1
+        }
+        makeDirectory(path, length)
+    } else {
+        const scratch_address = mapped(ENVIRON_SIZE)
+        if scratch_address == 0 { return false }
+        length = stateDirectory(bytesAt(scratch_address), path, "profiles")
+        unmapped(scratch_address, ENVIRON_SIZE)
+        if length == 0 { return false }
+    }
+    put(path, &length, "/")
+    put(path, &length, program)
+    if source == Source.gpu { put(path, &length, "-gpu") }
+    put(path, &length, "-")
+    putNumber(path, &length, seconds)
+    put(path, &length, ".profile")
+    path[length] = 0
+    file.*.pathLength = length
+    // The one written first: PATH.part.
+    var part = length + 1
+    putBytes(path, &part, path, length)
+    put(path, &part, ".part")
+    path[part] = 0
+    const descriptor = std.linux.syscall3(SYS_open, @intFromPtr(path) + length + 1, O_WRONLY_CREAT_TRUNC, 420)
+    if descriptor < 0 { return false }
+    file.*.descriptor = descriptor
+    var line: [*]u8 = undefined
+    unsafe { line = @ptrCast([*]u8, &file.*.line) }
+    var at: usize = 0
+    put(line, &at, "profile\t")
+    put(line, &at, program)
+    put(line, &at, "\t")
+    putNumber(line, &at, seconds)
+    put(line, &at, "\t")
+    putNumber(line, &at, samples)
+    put(line, &at, "\t")
+    putNumber(line, &at, interval)
+    put(line, &at, "\t")
+    put(line, &at, sourceName(source))
+    put(line, &at, "\n")
+    const wrote = std.linux.syscall3(SYS_write, @bitCast(usize, descriptor), @intFromPtr(line), at)
+    return true
+}
+
+// A function's line: samples in it, and with what it called.
+pub fn profileLine(file: *ProfileFile, self: usize, total: usize, name: []const u8) -> void {
+    if file.*.descriptor < 0 { return }
+    var line: [*]u8 = undefined
+    unsafe { line = @ptrCast([*]u8, &file.*.line) }
+    var at: usize = 0
+    putNumber(line, &at, self)
+    put(line, &at, "\t")
+    putNumber(line, &at, total)
+    put(line, &at, "\t")
+    putBytes(line, &at, @ptrCast([*]const u8, name), if name.length < 8000 { name.length } else { 8000 })
+    put(line, &at, "\n")
+    const wrote = std.linux.syscall3(SYS_write, @bitCast(usize, file.*.descriptor), @intFromPtr(line), at)
+}
+
+// Closes the file and puts it in its place.
+pub fn closeProfile(file: *ProfileFile) -> void {
+    if file.*.descriptor < 0 { return }
+    const closed = std.linux.syscall1(SYS_close, @bitCast(usize, file.*.descriptor))
+    file.*.descriptor = -1
+    const path = @intFromPtr(&file.*.path)
+    const renamed = std.linux.syscall2(SYS_rename, path + file.*.pathLength + 1, path)
+}
+
+pub fn profilePath(file: *const ProfileFile) -> []const u8 {
+    var path: [*]const u8 = undefined
+    unsafe { path = @ptrCast([*]const u8, &file.*.path) }
+    return path[0..file.*.pathLength]
+}
+
+// ---------------------------------------------------------------------------
+// GPU memory: the device memory std.gpu holds, noted as it allocates and
+// frees (std.gpu writes, std.leaks reads), in one mapping made when the
+// first GPU context opens:
+//
+//   words: lock, heaps, types, the device's allocation limit, slots used,
+//   blocks live, allocations, frees; the device's name at 128; heaps (size,
+//   flags) at 512; types (heap, flags) at 768; from 4096 a slot per block:
+//   handle (0: free), bytes asked, bytes allocated, type << 32 | kind, and
+//   the return addresses of the functions that asked.
+//
+// Every buffer std.gpu makes is an allocation of its own, so what the
+// device rounds up (and how many allocations there are against its limit)
+// is what a program's GPU memory wastes.
+
+pub const GPU_DEPTH: usize = 12
+pub const GPU_BLOCKS: usize = 4096
+pub const GPU_HEAPS: usize = 16
+pub const GPU_TYPES: usize = 32
+// What a block of device memory is: a buffer std.gpu made, one exported as
+// a dma-buf, another process's dma-buf (a buffer or an image), this
+// process's own memory.
+pub const GPU_BUFFER: usize = 0
+pub const GPU_EXPORT: usize = 1
+pub const GPU_IMPORT: usize = 2
+pub const GPU_HOST: usize = 3
+const GPU_SLOT_WORDS: usize = 4 + GPU_DEPTH
+const GPU_SLOTS_AT: usize = 4096
+const GPU_SIZE: usize = GPU_SLOTS_AT + GPU_BLOCKS * GPU_SLOT_WORDS * 8
+const GPU_HEAPS_AT: usize = 512
+const GPU_TYPES_AT: usize = 768
+
+// The mapping (0: no GPU context opened in this image).
+var gpuMemory: usize = 0
+
+pub const GpuBlock = struct {
+    handle: usize
+    asked: usize
+    size: usize
+    memoryType: usize
+    kind: usize
+    // GPU_DEPTH return addresses, 0 after the last.
+    frames: [*]const usize
+}
+
+fn gpuWords() -> [*]usize {
+    unsafe { return @ptrFromInt([*]usize, gpuMemory) }
+}
+
+pub fn gpuLock() -> void {
+    var word: *u32 = undefined
+    unsafe { word = @ptrFromInt(*u32, gpuMemory) }
+    const fast = @cmpxchgWeak(u32, word, 0, 1, acquire, monotonic)
+    if fast.0 { return }
+    while true {
+        const previous = @atomicRmw(u32, word, xchg, 2, acquire)
+        if previous == 0 { return }
+        const slept = std.linux.thread.futexWait(word, 2, 0, true)
+    }
+}
+
+pub fn gpuUnlock() -> void {
+    var word: *u32 = undefined
+    unsafe { word = @ptrFromInt(*u32, gpuMemory) }
+    const previous = @atomicRmw(u32, word, xchg, 0, release)
+    if previous == 2 { const woken = std.linux.thread.futexWake(word, 1, true) }
+}
+
+// The device a context opened: its name (zero-terminated), how many
+// allocations it allows at once, its heaps and memory types (gpuHeap,
+// gpuType). The first context makes the mapping.
+pub fn gpuDevice(name: [*]const u8, limit: usize, heaps: usize, types: usize) -> void {
+    if gpuMemory == 0 {
+        gpuMemory = mapped(GPU_SIZE)
+        if gpuMemory == 0 { return }
+    }
+    const words = gpuWords()
+    words[1] = if heaps < GPU_HEAPS { heaps } else { GPU_HEAPS }
+    words[2] = if types < GPU_TYPES { types } else { GPU_TYPES }
+    words[3] = limit
+    const text = bytesAt(gpuMemory + 128)
+    var at: usize = 0
+    while at < 255 && name[at] != 0 {
+        text[at] = name[at]
+        at += 1
+    }
+    text[at] = 0
+}
+
+pub fn gpuHeap(index: usize, size: usize, flags: usize) -> void {
+    if gpuMemory == 0 || index >= GPU_HEAPS { return }
+    const words = gpuWords()
+    words[GPU_HEAPS_AT / 8 + index * 2] = size
+    words[GPU_HEAPS_AT / 8 + index * 2 + 1] = flags
+}
+
+pub fn gpuType(index: usize, heap: usize, flags: usize) -> void {
+    if gpuMemory == 0 || index >= GPU_TYPES { return }
+    const words = gpuWords()
+    words[GPU_TYPES_AT / 8 + index * 2] = heap
+    words[GPU_TYPES_AT / 8 + index * 2 + 1] = flags
+}
+
+// A block of device memory allocated: `asked` bytes wanted, `size`
+// allocated, of memory type `memory_type`, a GPU_* kind; with the
+// functions that asked (std.gpu's own among them; readers leave those
+// out).
+pub fn gpuAllocated(handle: usize, asked: usize, size: usize, memory_type: usize, kind: usize) -> void {
+    if gpuMemory == 0 || handle == 0 { return }
+    const words = gpuWords()
+    gpuLock()
+    var slot: usize = 0
+    while slot < words[4] && words[GPU_SLOTS_AT / 8 + slot * GPU_SLOT_WORDS] != 0 { slot += 1 }
+    if slot < GPU_BLOCKS {
+        if slot == words[4] { words[4] += 1 }
+        const at = GPU_SLOTS_AT / 8 + slot * GPU_SLOT_WORDS
+        words[at] = handle
+        words[at + 1] = asked
+        words[at + 2] = size
+        words[at + 3] = (memory_type << 32) | kind
+        var frame = @frameAddress()
+        var count: usize = 0
+        while count < GPU_DEPTH && frame != 0 && frame & 7 == 0 {
+            var links: [*]const usize = undefined
+            unsafe { links = @ptrFromInt([*]const usize, frame) }
+            const back = links[1]
+            if back < 4096 { break }
+            words[at + 4 + count] = back
+            count += 1
+            const next = links[0]
+            if next <= frame || next - frame > 1048576 { break }
+            frame = next
+        }
+        while count < GPU_DEPTH {
+            words[at + 4 + count] = 0
+            count += 1
+        }
+        words[5] += 1
+    }
+    words[6] += 1
+    gpuUnlock()
+}
+
+pub fn gpuFreed(handle: usize) -> void {
+    if gpuMemory == 0 || handle == 0 { return }
+    const words = gpuWords()
+    gpuLock()
+    var slot: usize = 0
+    while slot < words[4] {
+        const at = GPU_SLOTS_AT / 8 + slot * GPU_SLOT_WORDS
+        if words[at] == handle {
+            words[at] = 0
+            words[5] -= 1
+            break
+        }
+        slot += 1
+    }
+    words[7] += 1
+    gpuUnlock()
+}
+
+// Reading (under gpuLock): whether a GPU context opened; the counts; the
+// heaps, types and blocks by index.
+pub fn gpuNoted() -> bool { return gpuMemory != 0 }
+
+// 0 heaps, 1 types, 2 the allocation limit, 3 slots used, 4 blocks live,
+// 5 allocations, 6 frees.
+pub fn gpuCount(which: usize) -> usize {
+    if gpuMemory == 0 || which > 6 { return 0 }
+    return gpuWords()[1 + which]
+}
+
+pub fn gpuDeviceName() -> []const u8 {
+    if gpuMemory == 0 { return "" }
+    const text = bytesAt(gpuMemory + 128)
+    var length: usize = 0
+    while length < 255 && text[length] != 0 { length += 1 }
+    return text[0..length]
+}
+
+pub fn gpuHeapSize(index: usize) -> usize { return gpuWords()[GPU_HEAPS_AT / 8 + index * 2] }
+pub fn gpuHeapFlags(index: usize) -> usize { return gpuWords()[GPU_HEAPS_AT / 8 + index * 2 + 1] }
+pub fn gpuTypeHeap(index: usize) -> usize { return gpuWords()[GPU_TYPES_AT / 8 + index * 2] }
+pub fn gpuTypeFlags(index: usize) -> usize { return gpuWords()[GPU_TYPES_AT / 8 + index * 2 + 1] }
+
+// The block in `slot` (below gpuCount(3)); false when the slot is free.
+pub fn gpuBlock(slot: usize, block: *GpuBlock) -> bool {
+    const words = gpuWords()
+    const at = GPU_SLOTS_AT / 8 + slot * GPU_SLOT_WORDS
+    if words[at] == 0 { return false }
+    block.*.handle = words[at]
+    block.*.asked = words[at + 1]
+    block.*.size = words[at + 2]
+    block.*.memoryType = words[at + 3] >> 32
+    block.*.kind = words[at + 3] & 4294967295
+    unsafe { block.*.frames = @ptrFromInt([*]const usize, gpuMemory + (at + 4) * 8) }
+    return true
+}
+
+// ---------------------------------------------------------------------------
+// Frames: with MLX_FRAMES set (and not 0), each frame a program draws
+// between frameBegin and frameEnd (the panels of std.ui call them) with the
+// time the processor took and, noted later by std.gpu from timestamps on
+// the queue, the GPU's; the last FRAMES kept, written about once a second
+// (and at the program's tenth frame, for the start) to
+// $XDG_RUNTIME_DIR/mlx/frames/PROGRAM-PID.frames:
+//
+//     frames <TAB> program <TAB> pid <TAB> seconds since 1970 <TAB> frames drawn <TAB> µs from the process's start to its first frame drawn
+//     frame <TAB> serial <TAB> start µs (from the first frame) <TAB> processor µs <TAB> GPU µs (0: none)
+//     ...
+//
+// MLX Observatory (Hot) and `mlx-codemap frames` read it: the timeline, the
+// frames over budget, and how long the start took. From the main thread.
+
+pub const FRAMES: usize = 1024
+const FRAME_WORDS: usize = 4
+const FRAMES_TEXT: usize = 65536
+
+// 0: MLX_FRAMES not looked at yet, 1: on, 2: off.
+var framesState: usize = 0
+var framesMemory: usize = 0
+var frameCount: usize = 0
+var frameStarted: usize = 0
+var frameFirst: usize = 0
+var framesWritten: usize = 0
+var framesStartup: usize = 0
+var framesPath: [4096]u8 = undefined
+var framesPathLength: usize = 0
+
+fn monotonicAt(clock: usize) -> usize {
+    var time: [2]usize = [2]usize{ 0, 0 }
+    const got = std.linux.syscall2(SYS_clock_gettime, clock, @intFromPtr(&time))
+    return time[0] * 1000000000 + time[1]
+}
+
+fn frameWords() -> [*]usize {
+    unsafe { return @ptrFromInt([*]usize, framesMemory) }
+}
+
+// Whether frames are recorded (MLX_FRAMES set, and not 0).
+pub fn framesOn() -> bool {
+    if framesState == 0 {
+        framesState = 2
+        var value: [8]u8 = undefined
+        const length = environmentValue("MLX_FRAMES", @ptrCast([*]u8, &value), 8)
+        if length == 0 || (length == 1 && value[0] == 48) { return false }
+        var path: [*]u8 = undefined
+        unsafe { path = @ptrCast([*]u8, &framesPath) }
+        var at = runtimeDirectory(path, "frames")
+        if at == 0 || at > 400 { return false }
+        put(path, &at, "/")
+        var name: [128]u8 = undefined
+        const name_length = programName(@ptrCast([*]u8, &name), 128)
+        putBytes(path, &at, @ptrCast([*]const u8, &name), name_length)
+        put(path, &at, "-")
+        putNumber(path, &at, @bitCast(usize, std.linux.syscall0(SYS_getpid)))
+        put(path, &at, ".frames")
+        path[at] = 0
+        framesPathLength = at
+        framesMemory = mapped(FRAMES * FRAME_WORDS * 8 + FRAMES_TEXT)
+        if framesMemory == 0 { return false }
+        framesState = 1
+    }
+    return framesState == 1
+}
+
+// A frame begins: its serial (from 1).
+pub fn frameBegin() -> usize {
+    if !framesOn() { return 0 }
+    frameStarted = monotonicAt(CLOCK_MONOTONIC)
+    if frameCount == 0 { frameFirst = frameStarted }
+    frameCount += 1
+    const words = frameWords()
+    const at = (frameCount % FRAMES) * FRAME_WORDS
+    words[at] = frameCount
+    words[at + 1] = frameStarted - frameFirst
+    words[at + 2] = 0
+    words[at + 3] = 0
+    return frameCount
+}
+
+// The frame drawn: the processor's time on it; the frames written when a
+// second went by.
+pub fn frameEnd() -> void {
+    if framesState != 1 || frameCount == 0 { return }
+    const words = frameWords()
+    const at = (frameCount % FRAMES) * FRAME_WORDS
+    words[at + 2] = monotonicAt(CLOCK_MONOTONIC) - frameStarted
+    if frameCount == 1 { framesStartup = sinceStart() }
+    const seconds = now()
+    if frameCount == 10 || seconds >= framesWritten + 1 {
+        framesWritten = seconds
+        writeFrames()
+    }
+}
+
+// The frame being drawn (0: none, or frames are not recorded), for std.gpu
+// to put the GPU's time on.
+pub fn frameCurrent() -> usize {
+    if framesState != 1 { return 0 }
+    return frameCount
+}
+
+// The GPU's time on frame `serial`, added (a frame may submit more than
+// once).
+pub fn frameGpu(serial: usize, nanoseconds: usize) -> void {
+    if framesState != 1 || serial == 0 || serial > frameCount || frameCount - serial >= FRAMES { return }
+    const words = frameWords()
+    const at = (serial % FRAMES) * FRAME_WORDS
+    if words[at] == serial { words[at + 3] += nanoseconds }
+}
+
+// Nanoseconds since the process started (/proc/self/stat's start time, in
+// clock ticks of 10 ms, against the boot clock).
+fn sinceStart() -> usize {
+    var text: [512]u8 = undefined
+    const file = std.linux.syscall3(SYS_open, @intFromPtr(@ptrCast([*]const u8, "/proc/self/stat")), 0, 0)
+    if file < 0 { return 0 }
+    const got = std.linux.syscall3(0, @bitCast(usize, file), @intFromPtr(&text), 511)
+    const closed = std.linux.syscall1(SYS_close, @bitCast(usize, file))
+    if got <= 0 { return 0 }
+    const length = @bitCast(usize, got)
+    // After the name's closing parenthesis: state is field 3, start time 22.
+    var at = length
+    while at > 0 && text[at - 1] != 41 { at -= 1 }
+    var field: usize = 2
+    while at < length && field < 22 {
+        if text[at] == 32 { field += 1 }
+        at += 1
+    }
+    var ticks: usize = 0
+    while at < length && text[at] >= 48 && text[at] <= 57 {
+        ticks = ticks * 10 + @intCast(usize, text[at] - 48)
+        at += 1
+    }
+    const started = ticks * 10000000
+    const boot = monotonicAt(CLOCK_BOOTTIME)
+    return if boot > started { boot - started } else { 0 }
+}
+
+fn writeFrames() -> void {
+    const out = bytesAt(framesMemory + FRAMES * FRAME_WORDS * 8)
+    var length: usize = 0
+    put(out, &length, "frames\t")
+    var name: [128]u8 = undefined
+    putBytes(out, &length, @ptrCast([*]const u8, &name), programName(@ptrCast([*]u8, &name), 128))
+    put(out, &length, "\t")
+    putNumber(out, &length, @bitCast(usize, std.linux.syscall0(SYS_getpid)))
+    put(out, &length, "\t")
+    putNumber(out, &length, now())
+    put(out, &length, "\t")
+    putNumber(out, &length, frameCount)
+    put(out, &length, "\t")
+    putNumber(out, &length, framesStartup / 1000)
+    put(out, &length, "\n")
+    const words = frameWords()
+    var serial = if frameCount > FRAMES - 1 { frameCount - (FRAMES - 1) } else { 1 }
+    while serial <= frameCount && length + 96 < FRAMES_TEXT {
+        const at = (serial % FRAMES) * FRAME_WORDS
+        if words[at] == serial {
+            put(out, &length, "frame\t")
+            putNumber(out, &length, serial)
+            put(out, &length, "\t")
+            putNumber(out, &length, words[at + 1] / 1000)
+            put(out, &length, "\t")
+            putNumber(out, &length, words[at + 2] / 1000)
+            put(out, &length, "\t")
+            putNumber(out, &length, words[at + 3] / 1000)
+            put(out, &length, "\n")
+        }
+        serial += 1
+    }
+    var path: [*]u8 = undefined
+    unsafe { path = @ptrCast([*]u8, &framesPath) }
+    var part = framesPathLength + 1
+    putBytes(path, &part, path, framesPathLength)
+    put(path, &part, ".part")
+    path[part] = 0
+    const file = std.linux.syscall3(SYS_open, @intFromPtr(path) + framesPathLength + 1, O_WRONLY_CREAT_TRUNC, 420)
+    if file < 0 { return }
+    const wrote = std.linux.syscall3(SYS_write, @bitCast(usize, file), @intFromPtr(out), length)
+    const closed = std.linux.syscall1(SYS_close, @bitCast(usize, file))
+    const renamed = std.linux.syscall2(SYS_rename, @intFromPtr(path) + framesPathLength + 1, @intFromPtr(path))
+}
+
+// Writes the frames now (a program about to end).
+pub fn framesFlush() -> void {
+    if framesState == 1 && frameCount > 0 { writeFrames() }
+}

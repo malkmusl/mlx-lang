@@ -28,10 +28,31 @@
 #   - then, with tools/wayland-drag-source as a file manager, drops a
 #     folder on the dock (it is pinned) and a file on the trash (it goes
 #     into it);
-#   - runs the top bar (mlx-topbar) with a terminal: the bar is along the
+#   - runs the top bar (mlx-topbar) with a terminal: the bar (with its
+#     workspace controls in the middle) is along the
 #     top and reserves it (the terminal moves below it, maximized it stays
 #     below), shows the active app and a fixed time in German, and the
 #     local times clock.mlx computes match python's zoneinfo;
+#   - runs the top bar again on a session bus (mlx-ipcd) with MLX Audio
+#     (mlx-audiod, no sound card), a music player and a tray icon
+#     (tools/topbar-test-services) and a battery (a made-up
+#     /sys/class/power_supply): the bar is the StatusNotifierWatcher and
+#     shows what plays, the icon, the volume and the charge; its play
+#     button pauses the player, the media popup's next button skips, the
+#     icon's menu (com.canonical.dbusmenu) sends the entry clicked and a
+#     left click Activate, the volume popup's slider, mute switch and the
+#     wheel change MLX Audio's volume, the battery popup tells the time
+#     left, and the calendar under the clock turns to the next month;
+#   - shows notifications (mlx-notifyd, mlx-notify) as bubbles and in the
+#     top bar's control centre: dismissing and clearing them, the volume,
+#     Do Not Disturb, night light, the light look (the portal) and a
+#     screenshot;
+#   - starts mlx-notifyd from the bus (a service file) in a session run by
+#     mlx-ipcd, as mlx-session runs it: the compositor tells the bus its
+#     WAYLAND_DISPLAY, so the bubble shows on it;
+#   - joins a Wi-Fi network from the control centre's network list with
+#     fakenetd (tools/network-test) as mlx-netd on a system bus, and opens
+#     mlx-settings' Network page for one that needs a passphrase;
 #   - runs the file manager (mlx-files) on a home of its own: it shows the
 #     folders first, makes a folder (Ctrl+Shift+N) and names it, moves a
 #     picture into it by dragging, renames a file (F2), moves one to the
@@ -40,6 +61,8 @@
 #   - opens a folder from the dock's stack: the file manager's window
 #     grows out of the stack (the compositor's zoom), which goes as it
 #     comes.
+#   - switches the file manager from dark to light by appearance.conf
+#     (std.ui.appearance), and keeps it dark under MLX_COLOR_SCHEME=dark;
 # The window behind the launcher must show blurred through it, and the
 # screenshots must be the same with the CPU and the Vulkan renderer, and
 # with the apps drawing on the GPU (their standard) and on the CPU
@@ -67,7 +90,15 @@ trap 'rm -rf -- "$work"' EXIT
 "$compiler" --quiet tools/wayland-test-host/main.mlx -o "$work/test-host"
 "$compiler" --quiet tools/wayland-drag-source/main.mlx -o "$work/drag-source"
 "$compiler" --quiet projects/desktop/topbar/main.mlx -o "$work/mlx-topbar"
+"$compiler" --quiet tools/topbar-test-services/main.mlx -o "$work/topbar-test-services"
+"$compiler" --quiet tools/session-lock-test/main.mlx -o "$work/session-lock-test"
+"$compiler" --quiet projects/desktop/ipc/main.mlx -o "$work/mlx-ipcd"
+"$compiler" --quiet projects/desktop/audio/main.mlx -o "$work/mlx-audiod"
+"$compiler" --quiet projects/desktop/notifications/main.mlx -o "$work/mlx-notifyd"
+"$compiler" --quiet projects/desktop/notifications/notify.mlx -o "$work/mlx-notify"
+"$compiler" --quiet projects/desktop/capture/main.mlx -o "$work/mlx-capture"
 "$compiler" --quiet tools/clock-probe/main.mlx -o "$work/clock-probe"
+"$compiler" --quiet tools/network-test/fakenetd.mlx -o "$work/fakenetd"
 "$compiler" --quiet projects/desktop/files/main.mlx -o "$work/mlx-files"
 xkbcli compile-keymap --layout us > "$work/us.xkb"
 
@@ -230,7 +261,7 @@ run() {
     local status=0
     env -i PATH="$PATH" HOME="$work/home" XDG_RUNTIME_DIR="$runtime" WAYLAND_DISPLAY=host-desktop \
         XDG_DATA_HOME="$work/data" XDG_DATA_DIRS="$work/none" XDG_CONFIG_HOME="$work/config" VK_DRIVER_FILES="$manifest" MLX_CANVAS="${2:-}" \
-        timeout 60 "$work/mlx-compositor" --verbose --no-fps --renderer "$renderer" --socket nested-desktop \
+        MLX_COMPOSITOR_LOG_KEYS=1 timeout 60 "$work/mlx-compositor" --verbose --no-fps --renderer "$renderer" --socket nested-desktop \
         --terminal "$work/mlx-terminal" --launcher "$work/mlx-launcher" --dock "$work/mlx-dock" --topbar none \
         --run "$work/mlx-terminal" --run "$work/mlx-terminal" > "$work/$name.log" 2>&1 || status=$?
     wait "$host_pid" || fail "$renderer: the test host failed" "$work/$name-host.log"
@@ -388,6 +419,147 @@ SCRIPT
 # The file manager (mlx-files) on a home of its own, its apps drawing on
 # $1 (cpu or gpu). Its window is at (24, 24), the icons' centres 118
 # pixels apart from x 296, the rows 104 apart from y 125.
+# The control centre's network list on mlx-netd: a system bus of its own
+# (mlx-ipcd --address) with tools/network-test's fakenetd in mlx-netd's
+# place (a cable, and a Wi-Fi card seeing Zuhause, Buero, Cafe Sonne and
+# Nachbar by signal; the list's rows at y 309 + 34 each under the
+# tiles). The network tile (736, 119) opens the list; Cafe Sonne (open)
+# is clicked: its row says it is joining, then it is joined (a check,
+# first in the list); Zuhause (WPA2, no passphrase saved; second now)
+# opens mlx-settings' Network page on it (a stand-in mlx-settings on the
+# PATH keeps its arguments).
+control_network() {
+    local runtime
+    runtime=$(mktemp -d)
+    mkdir -p "$work/ccn-config/mlx" "$work/ccn-home" "$work/ccn-bin"
+    printf '#!/bin/sh\necho "$@" > "%s/ccn-settings"\n' "$work" > "$work/ccn-bin/mlx-settings"
+    chmod +x "$work/ccn-bin/mlx-settings"
+    cat > "$work/ccn.script" <<SCRIPT
+wait 3000
+pointer 873 15
+press 272
+release 272
+wait 900
+pointer 736 119
+press 272
+release 272
+wait 900
+shot $work/ccn-list.ppm
+pointer 800 377
+wait 300
+press 272
+release 272
+wait 400
+shot $work/ccn-joining.ppm
+wait 2600
+shot $work/ccn-joined.ppm
+pointer 800 343
+wait 300
+press 272
+release 272
+wait 1500
+close
+SCRIPT
+    XDG_RUNTIME_DIR=$runtime "$work/test-host" host-ccn "$work/us.xkb" "$work/ccn.script" > "$work/ccn-host.log" 2>&1 &
+    local host_pid=$!
+    for _ in $(seq 1 50); do [[ -S "$runtime/host-ccn" ]] && break; sleep 0.1; done
+    # XDG_DATA_DIRS: the buses start no services of the system's (a
+    # desktop portal would be, asked for the look).
+    local bus=(env -i PATH="$work/ccn-bin:$PATH" HOME="$work/ccn-home" XDG_RUNTIME_DIR="$runtime" XDG_CONFIG_HOME="$work/ccn-config" XDG_DATA_HOME="$work/data" XDG_DATA_DIRS="$work/none"
+        DBUS_SESSION_BUS_ADDRESS="unix:path=$runtime/bus" DBUS_SYSTEM_BUS_ADDRESS="unix:path=$runtime/system")
+    "${bus[@]}" "$work/mlx-ipcd" --address "$runtime/bus" > "$work/ccn-ipcd.log" 2>&1 &
+    local ipcd_pid=$!
+    "${bus[@]}" "$work/mlx-ipcd" --address "$runtime/system" > "$work/ccn-system.log" 2>&1 &
+    local system_pid=$!
+    for _ in $(seq 1 50); do [[ -S "$runtime/bus" && -S "$runtime/system" ]] && break; sleep 0.1; done
+    "${bus[@]}" "$work/fakenetd" > "$work/ccn-netd.log" 2>&1 &
+    local netd_pid=$!
+    for _ in $(seq 1 50); do grep -q "^fakenetd: ready" "$work/ccn-netd.log" && break; sleep 0.1; done
+    local status=0
+    "${bus[@]}" WAYLAND_DISPLAY=host-ccn MLX_CANVAS=cpu \
+        LANG=de_DE.UTF-8 TZ="CET-1CEST,M3.5.0,M10.5.0/3" MLX_TOPBAR_TIME=1727445900 MLX_TOPBAR_VERBOSE=1 \
+        timeout 60 "$work/mlx-compositor" --verbose --no-fps --renderer cpu --socket nested-ccn \
+        --terminal "$work/mlx-terminal" --launcher none --dock none --topbar "$work/mlx-topbar" --run "$work/mlx-terminal" > "$work/ccn.log" 2>&1 || status=$?
+    wait "$host_pid" || fail "control centre network: the test host failed" "$work/ccn-host.log"
+    kill "$netd_pid" "$system_pid" "$ipcd_pid" 2> /dev/null || true
+    wait "$netd_pid" "$system_pid" "$ipcd_pid" 2> /dev/null || true
+    rm -rf -- "$runtime"
+    local log="$work/ccn.log"
+    [[ $status -eq 0 ]] || fail "control centre network: the compositor exited with status $status" "$log"
+    grep -q "^topbar: widgets clock 891+125 control 859+28$" "$log" || fail "control centre network: the widgets are not where the test clicks" "$log"
+    local line
+    for line in "^topbar: networks$" "^topbar: joining Cafe Sonne$" "^topbar: network settings$"; do
+        grep -q "$line" "$log" || fail "control centre network: no \"$line\"" "$log"
+    done
+    [[ "$(cat "$work/ccn-netd.log")" == "$(printf 'fakenetd: ready\nconnect Cafe Sonne (0 bytes)\njoined Cafe Sonne')" ]] || fail "control centre network: fakenetd was not asked to join Cafe Sonne" "$work/ccn-netd.log"
+    [[ "$(cat "$work/ccn-settings" 2> /dev/null)" == "network Zuhause" ]] || fail "control centre network: Zuhause did not open the Network page on it" "$log"
+    python3 - "$work" <<'PY' || fail "control centre network: the list does not show joining and joined" "$log"
+import sys
+work = sys.argv[1]
+def load(name):
+    data = open(f"{work}/{name}.ppm", 'rb').read()
+    header, size, depth, pixels = data.split(b'\n', 3)
+    width, height = map(int, size.split())
+    return lambda x, y: tuple(pixels[(y * width + x) * 3:(y * width + x) * 3 + 3])
+def area(shot, left, top, right, bottom):
+    return [shot(x, y) for y in range(top, bottom) for x in range(left, right)]
+listed, joining, joined = load("ccn-list"), load("ccn-joining"), load("ccn-joined")
+# The list: text in its first row (Zuhause) and its third (Cafe Sonne).
+assert max(max(p) for p in area(listed, 696, 300, 760, 318)) > 200, "no first row"
+assert max(max(p) for p in area(listed, 696, 368, 760, 386)) > 200, "no third row"
+# Joining: "Verbinde ..." on the right of the third row, where it had
+# nothing.
+assert area(joining, 900, 368, 990, 386) != area(listed, 900, 368, 990, 386), "no joining"
+# Joined: Cafe Sonne first, a check where Zuhause's lock was.
+assert area(joined, 696, 300, 790, 318) != area(listed, 696, 300, 790, 318), "the first row is not Cafe Sonne"
+assert area(joined, 970, 298, 992, 320) != area(listed, 970, 298, 992, 320), "no check"
+PY
+    echo "ok   control centre: the network list joins an open network through mlx-netd (joining, joined) and opens the Network page for one that needs a passphrase"
+}
+
+# Notifications in a session as mlx-session starts it: the bus (mlx-ipcd)
+# runs the compositor and starts mlx-notifyd from a service file on the
+# first notification, with the bus's own environment, whose
+# WAYLAND_DISPLAY is not the compositor's (here the test host's; in a real
+# session none). The compositor (--session) tells the bus its
+# WAYLAND_DISPLAY (UpdateActivationEnvironment), so the bubble shows on
+# it.
+notify_activation() {
+    local runtime
+    runtime=$(mktemp -d)
+    mkdir -p "$work/na-config/mlx" "$work/na-home" "$work/na-services"
+    cat > "$work/na-services/org.freedesktop.Notifications.service" <<SERVICE
+[D-BUS Service]
+Name=org.freedesktop.Notifications
+Exec=$work/mlx-notifyd --verbose
+SERVICE
+    cat > "$work/na.sh" <<SCRIPT
+#!/bin/sh
+sleep 2
+"$work/mlx-notify" -a Test "Hallo" "Vom Bus gestartet" > "$work/na-notify.log" 2>&1
+exec "$work/mlx-terminal"
+SCRIPT
+    chmod +x "$work/na.sh"
+    printf 'wait 6000\nclose\n' > "$work/na.script"
+    XDG_RUNTIME_DIR=$runtime "$work/test-host" host-na "$work/us.xkb" "$work/na.script" > "$work/na-host.log" 2>&1 &
+    local host_pid=$!
+    for _ in $(seq 1 50); do [[ -S "$runtime/host-na" ]] && break; sleep 0.1; done
+    local status=0
+    env -i PATH="$PATH" HOME="$work/na-home" XDG_RUNTIME_DIR="$runtime" XDG_CONFIG_HOME="$work/na-config" XDG_DATA_HOME="$work/data" XDG_DATA_DIRS="$work/none" \
+        WAYLAND_DISPLAY=host-na MLX_CANVAS=cpu LANG=de_DE.UTF-8 \
+        timeout 60 "$work/mlx-ipcd" --address "$runtime/bus" --services "$work/na-services" --run \
+        "$work/mlx-compositor" --backend nested --session --verbose --no-fps --renderer cpu --socket nested-na \
+        --terminal "$work/mlx-terminal" --launcher none --dock none --topbar none --run "$work/na.sh" > "$work/na.log" 2>&1 || status=$?
+    wait "$host_pid" || fail "notifications: the test host failed" "$work/na-host.log"
+    rm -rf -- "$runtime"
+    local log="$work/na.log"
+    [[ $status -eq 0 ]] || fail "notifications: the session ended with status $status" "$log"
+    grep -q "^session bus: services it starts get WAYLAND_DISPLAY" "$log" || fail "notifications: the compositor did not tell the bus its WAYLAND_DISPLAY" "$log"
+    grep -q "^notifyd: notification 1 \"Hallo\"$" "$log" || fail "notifications: the bus did not start mlx-notifyd, or it did not take the notification" "$log"
+    grep -q "^layer: mlx-notifications " "$log" || fail "notifications: mlx-notifyd's bubble did not show on the compositor" "$log"
+    echo "ok   notifications: the bus starts mlx-notifyd on the first one, and its bubble shows on the compositor that runs the session"
+}
+
 files() {
     local canvas=$1
     local runtime
@@ -518,6 +690,58 @@ PY
     echo "ok   files ($canvas): folders first; makes, renames, moves, trashes, opens folders"
 }
 
+# Light and dark (std.ui.appearance): the file manager starts dark (no
+# appearance.conf), turns light when the file says so (as the Settings
+# portal writes it) without a restart, and MLX_COLOR_SCHEME=dark keeps it
+# dark whatever the file says.
+appearance() {
+    local base="$work/appearance"
+    rm -rf -- "$base"
+    mkdir -p "$base/home/Documents" "$base/config/mlx" "$base/fixed"
+    printf 'wait 3000\nshot %s/dark.ppm\nwait 2500\nshot %s/light.ppm\nclose\n' "$base" "$base" > "$base/switch.script"
+    printf 'wait 3000\nshot %s/fixed.ppm\nclose\n' "$base" > "$base/fixed.script"
+    local runtime run status
+    for run in switch fixed; do
+        runtime=$(mktemp -d)
+        XDG_RUNTIME_DIR=$runtime "$work/test-host" host-look "$work/us.xkb" "$base/$run.script" > "$base/$run-host.log" 2>&1 &
+        local host_pid=$!
+        for _ in $(seq 1 50); do [[ -S "$runtime/host-look" ]] && break; sleep 0.1; done
+        local scheme=()
+        if [[ $run == fixed ]]; then
+            printf 'color-scheme = light\n' > "$base/config/mlx/appearance.conf"
+            scheme=(MLX_COLOR_SCHEME=dark)
+        else
+            # The scheme turns light once the dark frame is kept.
+            ( for _ in $(seq 1 100); do [[ -s "$base/dark.ppm" ]] && break; sleep 0.1; done
+              printf 'color-scheme = light\n' > "$base/config/mlx/appearance.conf.new"
+              mv "$base/config/mlx/appearance.conf.new" "$base/config/mlx/appearance.conf" ) &
+        fi
+        status=0
+        env -i PATH="$PATH" HOME="$base/home" XDG_RUNTIME_DIR="$runtime" WAYLAND_DISPLAY=host-look XDG_CONFIG_HOME="$base/config" \
+            XDG_DATA_HOME="$base/data" MLX_CANVAS=cpu LANG=en_US.UTF-8 "${scheme[@]}" \
+            timeout 30 "$work/mlx-files" "$base/home" > "$base/$run.log" 2>&1 || status=$?
+        wait "$host_pid" || fail "appearance: the test host failed" "$base/$run-host.log"
+        wait
+        rm -rf -- "$runtime"
+        [[ $status -eq 0 ]] || fail "appearance: the file manager exited with status $status" "$base/$run.log"
+    done
+    python3 - "$base/dark.ppm" "$base/light.ppm" "$base/fixed.ppm" <<'PY' || fail "appearance: the file manager did not follow the light and dark scheme" "$base/switch.log"
+import sys
+def at(path, x, y):
+    data = open(path, 'rb').read()
+    header, size, depth, pixels = data.split(b'\n', 3)
+    width, height = map(int, size.split())
+    return tuple(pixels[(y * width + x) * 3:(y * width + x) * 3 + 3])
+# An empty part of the grid and of the sidebar.
+for x, y in ((700, 450), (40, 450)):
+    dark, light, fixed = (at(path, x, y) for path in sys.argv[1:4])
+    assert max(dark) < 90, ("dark", x, y, dark)
+    assert min(light) > 200, ("light", x, y, light)
+    assert fixed == dark, ("MLX_COLOR_SCHEME=dark", x, y, fixed, dark)
+PY
+    echo "ok   appearance: an app turns light when appearance.conf says so, MLX_COLOR_SCHEME fixes the scheme"
+}
+
 # The dock's stack opening in the file manager (mlx-files on the PATH):
 # the window grows out of the stack, the stack goes. The dock holds the
 # terminal and the Downloads folder (at x 548); its stack of ten entries
@@ -600,7 +824,7 @@ SCRIPT
     local status=0
     env -i PATH="$PATH" HOME="$work/home" XDG_RUNTIME_DIR="$runtime" WAYLAND_DISPLAY=host-topbar \
         XDG_DATA_HOME="$work/data" XDG_DATA_DIRS="$work/none" XDG_CONFIG_HOME="$work/config" MLX_CANVAS=cpu \
-        LANG=de_DE.UTF-8 TZ="CET-1CEST,M3.5.0,M10.5.0/3" MLX_TOPBAR_TIME=1727445900 \
+        LANG=de_DE.UTF-8 TZ="CET-1CEST,M3.5.0,M10.5.0/3" MLX_TOPBAR_TIME=1727445900 MLX_TOPBAR_POWER="$work/none" \
         timeout 60 "$work/mlx-compositor" --verbose --no-fps --renderer cpu --socket nested-topbar \
         --terminal "$work/mlx-terminal" --launcher none --dock none --topbar "$work/mlx-topbar" --run "$work/mlx-terminal" > "$work/topbar.log" 2>&1 || status=$?
     wait "$host_pid" || fail "topbar: the test host failed" "$work/topbar-host.log"
@@ -618,11 +842,16 @@ header, size, depth, pixels = data.split(b'\n', 3)
 width, height = map(int, size.split())
 def at(x, y): return tuple(pixels[(y * width + x) * 3:(y * width + x) * 3 + 3])
 def lit(x0, x1): return sum(1 for x in range(x0, x1) for y in range(8, 22) if min(at(x, y)) > 200)
-# White text at the left (the app's name) and the right (the time), none
-# in the middle; the terminal's title bar starts below the bar.
+# White text at the left (the app's name) and the right (the time); in
+# the middle the workspace controls (workspace 1's button at 453..476 and
+# the floating half of the mode button at 515..542 lit, the tiling half
+# dim above its white glyph) and nothing around them; the terminal's
+# title bar starts below the bar.
 assert lit(40, 110) > 20, lit(40, 110)
 assert lit(890, 1010) > 40, lit(890, 1010)
-assert lit(400, 600) == 0, lit(400, 600)
+assert lit(455, 475) > 20 and lit(517, 541) > 20, (lit(455, 475), lit(517, 541))
+assert min(at(520, 7)) > 200 and min(at(566, 7)) <= 200, (at(520, 7), at(566, 7))
+assert lit(300, 440) == 0 and lit(600, 860) == 0, (lit(300, 440), lit(600, 860))
 assert min(at(300, 40)) > 80, at(300, 40)
 PY
     echo "ok   the top bar is along the top, reserves it, and shows the app and the time"
@@ -652,10 +881,416 @@ PY
     fi
 }
 
+# A made-up /sys/class/power_supply in $work/power: a battery at 84 %
+# (1 h left), mains, and a mouse's battery (not the computer's).
+fake_power() {
+    mkdir -p "$work/power/BAT0" "$work/power/AC" "$work/power/mouse"
+    printf 'Battery\n' > "$work/power/BAT0/type"
+    printf 'Discharging\n' > "$work/power/BAT0/status"
+    printf '42000000\n' > "$work/power/BAT0/energy_now"
+    printf '50000000\n' > "$work/power/BAT0/energy_full"
+    printf '10500000\n' > "$work/power/BAT0/power_now"
+    printf 'Mains\n' > "$work/power/AC/type"
+    printf 'Battery\n' > "$work/power/mouse/type"
+    printf 'Device\n' > "$work/power/mouse/scope"
+    printf '5\n' > "$work/power/mouse/capacity"
+}
+
+# The top bar on a session bus: see the header. The bar is laid out (its
+# verbose "widgets" line) as clock 891+125, battery 818+69, sound 786+28,
+# tray 756+26, media 595+149 at 1024 wide; the popups open centred under
+# their widget.
+topbar_bus() {
+    local runtime
+    runtime=$(mktemp -d)
+    mkdir -p "$work/bar-config/mlx" "$work/bar-home"
+    fake_power
+    cat > "$work/topbar-bus.script" <<SCRIPT
+wait 5000
+shot $work/bus-bar.ppm
+pointer 605 15
+press 272
+release 272
+wait 400
+pointer 680 15
+press 272
+release 272
+wait 900
+shot $work/bus-media.ppm
+pointer 779 210
+wait 100
+press 272
+release 272
+wait 400
+pointer 769 15
+press 273
+release 273
+wait 900
+shot $work/bus-menu.ppm
+pointer 760 94
+wait 100
+press 272
+release 272
+wait 400
+pointer 769 15
+press 272
+release 272
+wait 300
+pointer 800 15
+press 272
+release 272
+wait 900
+shot $work/bus-sound.ppm
+pointer 700 104
+wait 100
+press 272
+wait 100
+pointer 796 104
+wait 100
+release 272
+wait 300
+pointer 651 105
+press 272
+release 272
+wait 300
+pointer 800 15
+scroll -2560
+wait 300
+pointer 852 15
+press 272
+release 272
+wait 900
+shot $work/bus-battery.ppm
+pointer 953 15
+press 272
+release 272
+wait 900
+shot $work/bus-calendar.ppm
+pointer 987 101
+wait 100
+press 272
+release 272
+wait 700
+shot $work/bus-calendar-next.ppm
+pointer 300 15
+press 272
+release 272
+wait 2500
+shot $work/bus-arranged.ppm
+pointer 25 15
+press 272
+release 272
+wait 600
+shot $work/bus-session.ppm
+pointer 100 144
+wait 200
+press 272
+release 272
+wait 2500
+shot $work/bus-locked.ppm
+enter
+wait 1000
+pointer 25 15
+press 272
+release 272
+wait 600
+pointer 100 180
+press 272
+release 272
+wait 600
+pointer 200 164
+wait 200
+press 272
+release 272
+wait 3000
+close
+SCRIPT
+    XDG_RUNTIME_DIR=$runtime "$work/test-host" host-topbar-bus "$work/us.xkb" "$work/topbar-bus.script" > "$work/topbar-bus-host.log" 2>&1 &
+    local host_pid=$!
+    for _ in $(seq 1 50); do [[ -S "$runtime/host-topbar-bus" ]] && break; sleep 0.1; done
+    # XDG_DATA_DIRS: the bus starts none of the system's services.
+    local bus=(env -i PATH="$PATH" HOME="$work/bar-home" XDG_RUNTIME_DIR="$runtime" XDG_CONFIG_HOME="$work/bar-config" XDG_DATA_DIRS="$work/none" DBUS_SESSION_BUS_ADDRESS="unix:path=$runtime/bus")
+    "${bus[@]}" "$work/mlx-ipcd" --address "$runtime/bus" > "$work/topbar-ipcd.log" 2>&1 &
+    local ipcd_pid=$!
+    for _ in $(seq 1 50); do [[ -S "$runtime/bus" ]] && break; sleep 0.1; done
+    "${bus[@]}" "$work/mlx-audiod" --output null --input none --no-pulse > "$work/topbar-audiod.log" 2>&1 &
+    local audiod_pid=$!
+    "${bus[@]}" "$work/topbar-test-services" "$work/services.log" > "$work/topbar-services.log" 2>&1 &
+    local services_pid=$!
+    # The control centre is hidden here (control_centre has it). Once the
+    # calendar was shown, the items are arranged anew (as mlx-settings' Top
+    # bar page writes them): the clock first, the sound hidden, the battery
+    # last.
+    printf 'control = off\n' > "$work/bar-config/mlx/topbar.conf"
+    # The session menu's lock runs the stand-in locker (Enter unlocks).
+    printf 'lock-command = %s\n' "$work/session-lock-test" > "$work/bar-config/mlx/compositor.conf"
+    (for _ in $(seq 1 400); do grep -q "^topbar: popup calendar$" "$work/topbar-bus.log" 2> /dev/null && break; sleep 0.1; done
+        sleep 1
+        printf 'clock = on\nmedia = on\nsound = off\ntray = on\nbattery = on\ncontrol = off\n' > "$work/bar-config/mlx/topbar.conf") &
+    local writer_pid=$!
+    local status=0
+    "${bus[@]}" WAYLAND_DISPLAY=host-topbar-bus XDG_DATA_HOME="$work/data" XDG_DATA_DIRS="$work/none" MLX_CANVAS=cpu \
+        LANG=de_DE.UTF-8 TZ="CET-1CEST,M3.5.0,M10.5.0/3" MLX_TOPBAR_TIME=1727445900 MLX_TOPBAR_POWER="$work/power" MLX_TOPBAR_VERBOSE=1 \
+        timeout 60 "$work/mlx-compositor" --verbose --no-fps --renderer cpu --socket nested-topbar-bus \
+        --terminal "$work/mlx-terminal" --launcher none --dock none --topbar "$work/mlx-topbar" --run "$work/mlx-terminal" > "$work/topbar-bus.log" 2>&1 || status=$?
+    wait "$host_pid" || fail "topbar on the bus: the test host failed" "$work/topbar-bus-host.log"
+    wait "$writer_pid" 2> /dev/null || true
+    kill "$services_pid" "$audiod_pid" "$ipcd_pid" 2> /dev/null || true
+    wait "$services_pid" "$audiod_pid" "$ipcd_pid" 2> /dev/null || true
+    rm -rf -- "$runtime"
+    local log="$work/topbar-bus.log"
+    [[ $status -eq 0 ]] || fail "topbar on the bus: the compositor exited with status $status" "$log"
+    grep -q "^topbar: widgets clock 891+125 battery 818+69 sound 786+28 tray 756+26 media 595+149$" "$log" || fail "topbar on the bus: the widgets are not where the test clicks" "$log"
+    grep -q "^topbar: widgets clock 589+125 battery 947+69 tray 917+26 media 726+179$" "$log" || fail "topbar on the bus: the bar did not take the items' new order" "$log"
+    local line
+    for line in "^topbar: the StatusNotifierWatcher$" "^topbar: player org.mpris.MediaPlayer2.mlxtest playing \"Testlied\" by Mlx Band$" \
+        "^topbar: tray item org.kde.StatusNotifierItem-[0-9]*-1/StatusNotifierItem has an icon, a menu$" "^topbar: battery 84%$" "^topbar: MLX Audio$" \
+        "^topbar: player org.mpris.MediaPlayer2.mlxtest paused \"Zweites Lied\" by Mlx Band$" "^topbar: menu of org.kde.StatusNotifierItem-[0-9]*-1/StatusNotifierItem with 3 entries$" \
+        "^topbar: volume 50%$" "^topbar: muted$" "^topbar: volume 55%$" "^topbar: not muted$" "^topbar: popup battery$" "^topbar: popup calendar$"; do
+        grep -q "$line" "$log" || fail "topbar on the bus: no \"$line\"" "$log"
+    done
+    for line in "^topbar: popup session$" "^topbar: lock$" "^lock: locked$" "^lock-test: unlocked$" "^lock: unlocked$" "^topbar: log out$" "^log out: 0 windows left; ending the session$"; do
+        grep -q "$line" "$log" || fail "topbar on the bus: the session menu: no \"$line\"" "$log"
+    done
+    [[ "$(tr '\n' ' ' < "$work/services.log")" == "registered PlayPause Paused Next Event 3 clicked Activate 769 30 " ]] || fail "topbar on the bus: the player and the item were not asked as they should: $(tr '\n' ' ' < "$work/services.log")" "$log"
+    python3 - "$work" <<'PY' || fail "topbar on the bus: the bar or its popups do not look right" "$log"
+import sys
+work = sys.argv[1]
+def load(name):
+    data = open(f"{work}/{name}.ppm", 'rb').read()
+    _, size, _, pixels = data.split(b'\n', 3)
+    width, height = map(int, size.split())
+    return lambda x, y: tuple(pixels[(y * width + x) * 3:(y * width + x) * 3 + 3])
+def near(pixel, want, slack=12): return all(abs(a - b) <= slack for a, b in zip(pixel, want))
+def count(at, x0, x1, y0, y1, want): return sum(1 for x in range(x0, x1) for y in range(y0, y1) if near(at(x, y), want))
+popup = (30, 33, 42)
+accent = (90, 160, 255)
+bar = load("bus-bar")
+# The tray's icon (the item's blue 32x32 pixmap made 20x20), the speaker
+# and the battery in white, the title's text.
+assert count(bar, 759, 779, 5, 25, (40, 90, 230)) > 300, count(bar, 759, 779, 5, 25, (40, 90, 230))
+assert count(bar, 790, 812, 7, 23, (255, 255, 255)) > 40
+assert count(bar, 823, 846, 9, 21, (255, 255, 255)) > 40
+assert sum(1 for x in range(620, 740) for y in range(8, 22) if min(bar(x, y)) > 180) > 40
+media = load("bus-media")
+# The popup (479..859 x 36..), under its header, with its cover's tile (no
+# art).
+assert near(media(679, 84), popup) and near(media(519, 104), (58, 64, 82)), (media(679, 84), media(519, 104))
+menu = load("bus-menu")
+assert near(menu(690, 120), (30, 33, 42)), menu(690, 120)
+sound = load("bus-sound")
+# The sound popup (620..980): its background, the output's slider lit.
+assert near(sound(630, 140), popup) and near(sound(700, 106), accent), (sound(630, 140), sound(700, 106))
+battery = load("bus-battery")
+# 84 % of the line lit, the rest not.
+assert near(battery(800, 143), accent) and not near(battery(950, 143), accent), (battery(800, 143), battery(950, 143))
+# The calendar shows today (27 September) lit; October has no today.
+before = load("bus-calendar")
+after = load("bus-calendar-next")
+assert count(before, 728, 1016, 148, 328, accent) > 100, count(before, 728, 1016, 148, 328, accent)
+assert count(after, 728, 1016, 148, 328, accent) == 0 and near(after(740, 300), popup)
+# Arranged anew: the time on the left of what plays, no speaker, the tray's
+# icon and the battery at the right edge.
+arranged = load("bus-arranged")
+assert sum(1 for x in range(595, 710) for y in range(8, 22) if min(arranged(x, y)) > 180) > 40
+assert count(arranged, 920, 940, 5, 25, (40, 90, 230)) > 300, count(arranged, 920, 940, 5, 25, (40, 90, 230))
+assert count(arranged, 950, 1010, 9, 21, (255, 255, 255)) > 40
+# The session menu under the mark (8..278 x 36..206), then the lock over
+# everything.
+session = load("bus-session")
+assert near(session(150, 70), popup) and near(session(250, 120), popup), (session(150, 70), session(250, 120))
+locked = load("bus-locked")
+assert near(locked(10, 10), (30, 110, 90)) and near(locked(800, 600), (30, 110, 90)), (locked(10, 10), locked(800, 600))
+PY
+    echo "ok   the top bar on a session bus: what plays, a tray icon with its menu, the volume, the battery and the calendar; the items rearranged; the session menu locks and logs out"
+}
+
+# Notifications and the control centre: mlx-notifyd shows a notification
+# with a default action as a bubble (a click on it answers mlx-notify -w),
+# then five that go after 1.5 s; the bar's control centre (859+28, its
+# popup 656..1016 x 36..) gets the list from mlx-notifyd on the bus and
+# shows it newest first, with a dot on the widget until it is opened. In
+# it: one is dismissed by its close button (the ones under it glide up),
+# the volume is dragged, Do Not Disturb and night light are turned on
+# (mlx-notifyd and compositor.conf hear of it), all are cleared, dark mode
+# is turned off (the portal, mlx-capture --portal, keeps the look and
+# tells it: the bar and the bubbles turn light), and the screenshot tile
+# saves the screen into ~/Bilder and says so in a notification (Do Not
+# Disturb turned off again first). The
+# network tile shows a made-up Wi-Fi interface (MLX_TOPBAR_NET).
+control_centre() {
+    local runtime
+    runtime=$(mktemp -d)
+    mkdir -p "$work/net/wlan0/wireless" "$work/net/eth0" "$work/net/lo" "$work/cc-config/mlx" "$work/cc-home"
+    fake_power
+    printf 'up\n' > "$work/net/wlan0/operstate"
+    printf 'down\n' > "$work/net/eth0/operstate"
+    printf 'unknown\n' > "$work/net/lo/operstate"
+    cat > "$work/cc.sh" <<SCRIPT
+#!/bin/sh
+"$work/mlx-notifyd" --verbose > "$work/notifyd.log" 2>&1 &
+sleep 1
+"$work/mlx-notify" -a Frage -A default=Öffnen -t 0 -w "Eine Frage" "Ein Klick beantwortet sie." > "$work/notify-action.log" &
+sleep 3
+"$work/mlx-notify" -a Firefox -i firefox -t 1500 "Download abgeschlossen" "bericht.pdf ist im Ordner Downloads." &
+sleep 0.3
+"$work/mlx-notify" -a Kalender -t 1500 "Team-Meeting in 10 Minuten" "Raum 4.12" &
+sleep 0.3
+"$work/mlx-notify" -a Mail -t 1500 "3 neue Nachrichten" "Von: Anna Schmidt" &
+sleep 0.3
+"$work/mlx-notify" -a Terminal -t 1500 "Build fertig" "312 Tests bestanden" &
+sleep 0.3
+"$work/mlx-notify" -a Updates -t 1500 "Updates verfügbar" "5 Pakete" &
+exec "$work/mlx-terminal"
+SCRIPT
+    chmod +x "$work/cc.sh"
+    cat > "$work/cc.script" <<SCRIPT
+wait 3000
+shot $work/cc-bubble.ppm
+pointer 760 80
+press 272
+release 272
+wait 8000
+shot $work/cc-bar.ppm
+pointer 873 15
+press 272
+release 272
+wait 900
+shot $work/cc-open.ppm
+pointer 900 440
+wait 300
+pointer 989 449
+wait 300
+press 272
+release 272
+wait 800
+pointer 850 308
+press 272
+pointer 880 308
+pointer 920 308
+release 272
+pointer 906 119
+press 272
+release 272
+wait 300
+pointer 736 183
+press 272
+release 272
+wait 600
+shot $work/cc-toggled.ppm
+pointer 956 352
+press 272
+release 272
+wait 1200
+shot $work/cc-cleared.ppm
+pointer 906 183
+press 272
+release 272
+wait 900
+shot $work/cc-light.ppm
+pointer 873 15
+press 272
+release 272
+wait 800
+shot $work/cc-closed.ppm
+pointer 873 15
+press 272
+release 272
+wait 900
+pointer 906 119
+press 272
+release 272
+wait 300
+pointer 906 247
+press 272
+release 272
+wait 3000
+shot $work/cc-shot.ppm
+close
+SCRIPT
+    XDG_RUNTIME_DIR=$runtime "$work/test-host" host-cc "$work/us.xkb" "$work/cc.script" > "$work/cc-host.log" 2>&1 &
+    local host_pid=$!
+    for _ in $(seq 1 50); do [[ -S "$runtime/host-cc" ]] && break; sleep 0.1; done
+    # No system bus (no mlx-netd): the network tile reads MLX_TOPBAR_NET.
+    # XDG_DATA_DIRS: the bus starts none of the system's services.
+    local bus=(env -i PATH="$work:$PATH" HOME="$work/cc-home" XDG_RUNTIME_DIR="$runtime" XDG_CONFIG_HOME="$work/cc-config" XDG_DATA_DIRS="$work/none" DBUS_SESSION_BUS_ADDRESS="unix:path=$runtime/bus" DBUS_SYSTEM_BUS_ADDRESS="unix:path=$runtime/no-system-bus")
+    "${bus[@]}" "$work/mlx-ipcd" --address "$runtime/bus" > "$work/cc-ipcd.log" 2>&1 &
+    local ipcd_pid=$!
+    for _ in $(seq 1 50); do [[ -S "$runtime/bus" ]] && break; sleep 0.1; done
+    "${bus[@]}" "$work/mlx-audiod" --output null --input none --no-pulse > "$work/cc-audiod.log" 2>&1 &
+    local audiod_pid=$!
+    "${bus[@]}" "$work/mlx-capture" --portal --verbose > "$work/cc-portal.log" 2>&1 &
+    local portal_pid=$!
+    local status=0
+    "${bus[@]}" WAYLAND_DISPLAY=host-cc XDG_DATA_HOME="$work/data" XDG_DATA_DIRS="$work/none" MLX_CANVAS=cpu \
+        LANG=de_DE.UTF-8 TZ="CET-1CEST,M3.5.0,M10.5.0/3" MLX_TOPBAR_TIME=1727445900 MLX_TOPBAR_POWER="$work/power" MLX_TOPBAR_NET="$work/net" MLX_TOPBAR_VERBOSE=1 \
+        timeout 60 "$work/mlx-compositor" --verbose --no-fps --renderer cpu --socket nested-cc \
+        --terminal "$work/mlx-terminal" --launcher none --dock none --topbar "$work/mlx-topbar" --run "$work/cc.sh" > "$work/cc.log" 2>&1 || status=$?
+    wait "$host_pid" || fail "control centre: the test host failed" "$work/cc-host.log"
+    kill "$portal_pid" "$audiod_pid" "$ipcd_pid" 2> /dev/null || true
+    wait "$portal_pid" "$audiod_pid" "$ipcd_pid" 2> /dev/null || true
+    rm -rf -- "$runtime"
+    local log="$work/cc.log"
+    [[ $status -eq 0 ]] || fail "control centre: the compositor exited with status $status" "$log"
+    grep -q "^topbar: widgets clock 891+125 battery 786+69 sound 754+28 control 859+28$" "$log" || fail "control centre: the widgets are not where the test clicks" "$log"
+    local line
+    for line in "^topbar: notifications 6, unread 6$" "^topbar: popup control$" "^topbar: dismissed Build fertig$" "^topbar: volume [0-9]*%$" \
+        "^topbar: do not disturb on$" "^topbar: do not disturb off$" "^topbar: night light on$" "^topbar: cleared the notifications$" "^topbar: look light$" "^topbar: screenshot $work/cc-home/Bilder/Bildschirmfoto 2024-09-27 16.05.00.png$"; do
+        grep -q "$line" "$log" || fail "control centre: no \"$line\"" "$log"
+    done
+    for line in "^notifyd: serving org.freedesktop.Notifications$" "^notifyd: notification 6 \"Updates verfügbar\"$" "^notifyd: do not disturb on$" "^notifyd: cleared$" "^notifyd: notification 7 \"Bildschirmfoto gespeichert\"$"; do
+        grep -q "$line" "$work/notifyd.log" || fail "control centre: mlx-notifyd said no \"$line\"" "$work/notifyd.log"
+    done
+    grep -q "^portal: color-scheme light$" "$work/cc-portal.log" || fail "control centre: the portal did not take the light look" "$work/cc-portal.log"
+    grep -qx "color-scheme = light" "$work/cc-config/mlx/appearance.conf" || fail "control centre: the look is not kept in appearance.conf" "$work/cc-portal.log"
+    [[ -s "$work/cc-home/Bilder/Bildschirmfoto 2024-09-27 16.05.00.png" ]] || fail "control centre: the screenshot was not saved" "$log"
+    [[ "$(cat "$work/notify-action.log")" == "default" ]] || fail "control centre: the click on the bubble did not answer mlx-notify -w ($(cat "$work/notify-action.log"))" "$work/notifyd.log"
+    grep -qx "night-light = on" "$work/cc-config/mlx/compositor.conf" || fail "control centre: night light did not reach compositor.conf" "$log"
+    python3 - "$work" <<'PY' || fail "control centre: the bubble, the widget or the popup do not look right" "$log"
+import sys
+work = sys.argv[1]
+def load(name):
+    data = open(f"{work}/{name}.ppm", 'rb').read()
+    _, size, _, pixels = data.split(b'\n', 3)
+    width, height = map(int, size.split())
+    return lambda x, y: tuple(pixels[(y * width + x) * 3:(y * width + x) * 3 + 3])
+def near(pixel, want, slack=12): return all(abs(a - b) <= slack for a, b in zip(pixel, want))
+def count(at, x0, x1, y0, y1, want): return sum(1 for x in range(x0, x1) for y in range(y0, y1) if near(at(x, y), want))
+popup = (30, 33, 42)
+light = (246, 246, 249)
+accent = (90, 160, 255)
+# The bubble at the top right, under the bar (dark), and after the light
+# look came (the screenshot's).
+assert near(load("cc-bubble")(1000, 60), popup), load("cc-bubble")(1000, 60)
+assert near(load("cc-shot")(1000, 60), light), load("cc-shot")(1000, 60)
+# The dot on the widget while they are unread; gone once looked at.
+bar = load("cc-bar")
+assert count(bar, 876, 888, 2, 14, accent) > 10, count(bar, 876, 888, 2, 14, accent)
+assert count(load("cc-closed"), 876, 888, 2, 14, accent) == 0
+# The popup down to its fourth notification and the "more" line.
+opened = load("cc-open")
+assert near(opened(1012, 600), popup), opened(1012, 600)
+# Do Not Disturb and night light glow in the accent colour.
+toggled = load("cc-toggled")
+assert count(toggled, 851, 883, 103, 135, accent) > 300 and count(toggled, 682, 714, 167, 199, accent) > 300, (count(toggled, 851, 883, 103, 135, accent), count(toggled, 682, 714, 167, 199, accent))
+# Cleared: the popup shrank to "Keine Mitteilungen".
+cleared = load("cc-cleared")
+assert near(cleared(700, 400), popup) and not near(cleared(700, 520), popup), (cleared(700, 400), cleared(700, 520))
+# Light: the popup's background.
+assert near(load("cc-light")(1005, 300), light), load("cc-light")(1005, 300)
+PY
+    echo "ok   notifications and the control centre: a bubble's click answers, the list on the bus, dismissing, the volume, Do Not Disturb, night light, clearing, the light look, a screenshot"
+}
+
 drops
 topbar
+topbar_bus
+control_centre
+control_network
+notify_activation
 files cpu
 files gpu
+appearance
 zoom cpu
 zoom vulkan
 python3 - "$work/files-cpu/grid.ppm" "$work/files-gpu/grid.ppm" <<'PY' || fail "the file manager drawn on the GPU differs from the one drawn on the CPU" /dev/null

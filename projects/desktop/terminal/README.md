@@ -38,5 +38,6 @@ emulation is `std/src/terminal.mlx` (the screen), `std/src/terminal/keys.mlx`
 (keys to bytes) and `std/src/terminal/pty.mlx` (the pseudo-terminal); the
 drawing is `std/src/ui/terminal.mlx`, usable as a pane in any `std.ui`
 app. It is the default terminal of `projects/desktop/compositor`
-(Alt+Enter). Not yet: selecting text and the clipboard, mouse reporting
+(Alt+Enter); `projects/console` (mlx-console) is the same terminal on the
+Linux framebuffer without a compositor. Not yet: selecting text and the clipboard, mouse reporting
 to programs, blinking.

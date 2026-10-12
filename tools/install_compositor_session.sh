@@ -9,28 +9,36 @@
 # the XKB data (installed on any desktop). MLX_SESSION_HOST=cage|weston in
 # the session's environment runs it nested in one of those hosts instead.
 #
-# Installs:
-#   PREFIX/bin/mlx-compositor, PREFIX/bin/mlx-terminal, PREFIX/bin/mlx-sh, PREFIX/bin/mlx-session,
-#   PREFIX/bin/mlx-dock, PREFIX/bin/mlx-topbar, PREFIX/bin/mlx-launcher,
-#   PREFIX/bin/mlx-settings, PREFIX/bin/mlx-files, PREFIX/bin/mlx-codemap,
-#                                     PREFIX/bin/mlx-profile, PREFIX/bin/mlx-capture,
-#                                     PREFIX/bin/mlx-ipcd, PREFIX/bin/mlx-ipc (MLXIPC,
-#                                     the session bus), PREFIX/bin/mlx-audiod,
-#                                     PREFIX/bin/mlx-audio (MLX Audio),
-#                                     PREFIX/bin/mlx-permissions (the
-#                                     permission agent and its dialog)
+# Installs (PREFIX is /usr unless --prefix says otherwise):
+#   PREFIX/bin/mlx/mlx-compositor, mlx-terminal, mlx-sh, mlx-console,
+#                                     mlx-session, mlx-dock, mlx-topbar,
+#                                     mlx-launcher, mlx-settings, mlx-files,
+#                                     mlx-observatory, mlx-codemap,
+#                                     mlx-profile, mlx-capture, mlx-ipcd,
+#                                     mlx-ipc (MLXIPC, the session bus),
+#                                     mlx-audiod, mlx-audio (MLX Audio),
+#                                     mlx-permissions (the permission agent
+#                                     and its dialog), mlx-notifyd,
+#                                     mlx-notify (the notifications,
+#                                     notify-send's like)
+#   PREFIX/bin/mlx on PATH: /etc/profile.d/mlx.sh,
+#                                     /etc/environment.d/50-mlx.conf,
+#                                     /etc/systemd/system.conf.d/50-mlx-path.conf
+#                                     (tools/lib/mlx_layout.sh)
 #   PREFIX/share/mlx/dbus-1/services/org.mlx.Audio.service,
 #                                     org.mlx.PermissionAgent.service,
-#                                     org.freedesktop.portal.Desktop.service
-#                                     (MLX Audio, the agent and the
+#                                     org.freedesktop.portal.Desktop.service,
+#                                     org.freedesktop.Notifications.service
+#                                     (MLX Audio, the agent, the
 #                                     screen-sharing portal, mlx-capture
-#                                     --portal, start on the first use, on
-#                                     MLXIPC only)
+#                                     --portal, and the notifications start
+#                                     on the first use, on MLXIPC only)
 #   PREFIX/share/applications/mlx-settings.desktop, org.mlx.files.desktop,
 #                                     org.mlx.observatory.desktop (the launcher
 #                                     lists them; MLX Observatory shows this
 #                                     repository)
 #   PREFIX/share/icons/hicolor/128x128/apps/org.mlx.files.png,
+#                                     org.mlx.settings.png,
 #                                     org.mlx.observatory.png
 #   PREFIX/lib/mlx-audio/libpulse.so.0, libpulse-simple.so.0,
 #                                     libpulse-mainloop-glib.so.0,
@@ -60,12 +68,13 @@
 #   libpipewire-0.3-0 (libpipewire-0.3-0t64)
 #
 # Usage: tools/install_compositor_session.sh [options]
-#   --prefix DIR      programs go to DIR/bin (default /usr/local)
+#   --prefix DIR      programs go to DIR/bin/mlx (default /usr)
 #   --sessions DIR    the session entry's directory
 #                     (default /usr/share/wayland-sessions)
 #   --destdir DIR     stage everything under DIR instead (packaging, tests)
-#   --compiler PATH   the Mlx compiler (default: mlx-out/bin/compiler/mlx4,
-#                     else zig-out/bin/mlx1, else built with `zig build mlx1`)
+#   --compiler PATH   compile everything with this Mlx compiler (default:
+#                     take it from ./mlx build, which builds only what is
+#                     not current)
 #   --build-only      build into mlx-out/session and stop
 #   --uninstall       remove what an install put there (and restore the
 #                     sound servers when they were replaced)
@@ -102,8 +111,10 @@ set -euo pipefail
 
 repo_root=$(cd "$(dirname "$0")/.." && pwd)
 cd "$repo_root"
+source tools/lib/mlx_layout.sh
+source tools/lib/mlx_build.sh
 
-prefix=/usr/local
+prefix=$mlx_default_prefix
 sessions=/usr/share/wayland-sessions
 destdir=""
 compiler=""
@@ -139,8 +150,9 @@ if [[ $replace_libpipewire -eq 1 && -n "$destdir" ]]; then
     exit 2
 fi
 
-bindir="$prefix/bin"
-programs=(mlx-compositor mlx-terminal mlx-sh mlx-session mlx-dock mlx-topbar mlx-launcher mlx-settings mlx-files mlx-observatory mlx-codemap mlx-profile mlx-capture mlx-ipcd mlx-ipc mlx-audiod mlx-audio mlx-permissions)
+prefix=${prefix%/}
+bindir=$(mlx_bindir "$prefix")
+programs=(mlx-compositor mlx-terminal mlx-sh mlx-console mlx-session mlx-dock mlx-topbar mlx-launcher mlx-settings mlx-files mlx-observatory mlx-codemap mlx-profile mlx-capture mlx-ipcd mlx-ipc mlx-audiod mlx-audio mlx-permissions mlx-notifyd mlx-notify)
 applications="$prefix/share/applications"
 icons="$prefix/share/icons/hicolor/128x128/apps"
 services="$prefix/share/mlx/dbus-1/services"
@@ -159,6 +171,14 @@ as_owner() {
     else
         sudo "$@"
     fi
+}
+
+# sudo when the target is not writable by us, else nothing (a RUNNER for
+# tools/lib/mlx_layout.sh).
+owner_runner() {
+    local probe=$1
+    while [[ ! -e "$probe" ]]; do probe=$(dirname "$probe"); done
+    [[ -w "$probe" ]] || echo sudo
 }
 
 # PipeWire's, WirePlumber's and PulseAudio's user units; what replacing
@@ -270,7 +290,8 @@ if [[ $uninstall -eq 1 ]]; then
     [[ -f "$destdir$sound_marker" ]] && restore_sound_servers
     for program in "${programs[@]}"; do
         path="$destdir$bindir/$program"
-        [[ -e "$path" ]] && as_owner "$path" rm -f -- "$path" && echo "removed $path"
+        # -L too: mlx-codemap links to mlx-observatory, removed before it.
+        [[ -e "$path" || -L "$path" ]] && as_owner "$destdir$bindir" rm -f -- "$path" && echo "removed $path"
     done
     path="$destdir$sessions/mlx-compositor.desktop"
     [[ -e "$path" ]] && as_owner "$path" rm -f -- "$path" && echo "removed $path"
@@ -282,54 +303,70 @@ if [[ $uninstall -eq 1 ]]; then
     path="$destdir$capture_libs/libpipewire-0.3.so.0"
     [[ -e "$path" ]] && as_owner "$path" rm -f -- "$path" && echo "removed $path"
     [[ -d "$destdir$capture_libs" ]] && as_owner "$destdir$capture_libs" rmdir --ignore-fail-on-non-empty -- "$destdir$capture_libs"
-    for path in "$destdir$applications/mlx-settings.desktop" "$destdir$applications/org.mlx.files.desktop" "$destdir$applications/org.mlx.observatory.desktop" "$destdir$icons/org.mlx.files.png" "$destdir$icons/org.mlx.observatory.png" "$destdir$services/org.mlx.Audio.service" "$destdir$services/org.mlx.PermissionAgent.service" "$destdir$services/org.freedesktop.portal.Desktop.service"; do
+    for path in "$destdir$applications/mlx-settings.desktop" "$destdir$applications/org.mlx.files.desktop" "$destdir$applications/org.mlx.observatory.desktop" "$destdir$icons/org.mlx.files.png" "$destdir$icons/org.mlx.settings.png" "$destdir$icons/org.mlx.observatory.png" "$destdir$services/org.mlx.Audio.service" "$destdir$services/org.mlx.PermissionAgent.service" "$destdir$services/org.freedesktop.portal.Desktop.service" "$destdir$services/org.freedesktop.Notifications.service"; do
         [[ -e "$path" ]] && as_owner "$path" rm -f -- "$path" && echo "removed $path"
     done
+    mlx_remove_path_files "$destdir" "$bindir" "$(owner_runner "$destdir/etc")"
     exit 0
 fi
 
-# The compiler: the canonical one (tools/ensure_compiler.sh builds or
-# updates mlx-out/bin/compiler/mlx4 when needed).
-[[ -n "$compiler" ]] || compiler=$(tools/ensure_compiler.sh)
-
-# Build.
-echo "building with $compiler"
-"$compiler" --quiet projects/desktop/compositor/main.mlx -o "$build/mlx-compositor"
-"$compiler" --quiet projects/desktop/terminal/main.mlx -o "$build/mlx-terminal"
-"$compiler" --quiet projects/shell/main.mlx -o "$build/mlx-sh"
-"$compiler" --quiet projects/desktop/dock/main.mlx -o "$build/mlx-dock"
-"$compiler" --quiet projects/desktop/topbar/main.mlx -o "$build/mlx-topbar"
-"$compiler" --quiet projects/desktop/launcher/main.mlx -o "$build/mlx-launcher"
-"$compiler" --quiet projects/desktop/settings/main.mlx -o "$build/mlx-settings"
-"$compiler" --quiet projects/desktop/files/main.mlx -o "$build/mlx-files"
-"$compiler" --quiet projects/observatory/main.mlx -o "$build/mlx-observatory"
-"$compiler" --quiet tools/profile/main.mlx -o "$build/mlx-profile"
-"$compiler" --quiet projects/desktop/capture/main.mlx -o "$build/mlx-capture"
-"$compiler" --quiet --plugin projects/desktop/capture/obs.mlx -o "$build/mlx-capture.so"
-"$compiler" --quiet projects/desktop/ipc/main.mlx -o "$build/mlx-ipcd"
-"$compiler" --quiet projects/desktop/ipc/tool.mlx -o "$build/mlx-ipc"
-"$compiler" --quiet projects/desktop/audio/main.mlx -o "$build/mlx-audiod"
-"$compiler" --quiet projects/desktop/audio/tool.mlx -o "$build/mlx-audio"
-"$compiler" --quiet projects/desktop/permissions/main.mlx -o "$build/mlx-permissions"
+# The programs: from ./mlx build (only what is not current), or compiled
+# with the compiler named.
+compiler_args=()
+if [[ -n "$compiler" ]]; then
+    echo "building with $compiler"
+    "$compiler" --quiet projects/desktop/compositor/main.mlx -o "$build/mlx-compositor"
+    "$compiler" --quiet projects/desktop/terminal/main.mlx -o "$build/mlx-terminal"
+    "$compiler" --quiet projects/shell/main.mlx -o "$build/mlx-sh"
+    "$compiler" --quiet projects/console/main.mlx -o "$build/mlx-console"
+    "$compiler" --quiet projects/desktop/dock/main.mlx -o "$build/mlx-dock"
+    "$compiler" --quiet projects/desktop/topbar/main.mlx -o "$build/mlx-topbar"
+    "$compiler" --quiet projects/desktop/launcher/main.mlx -o "$build/mlx-launcher"
+    "$compiler" --quiet projects/desktop/settings/main.mlx -o "$build/mlx-settings"
+    "$compiler" --quiet projects/desktop/files/main.mlx -o "$build/mlx-files"
+    "$compiler" --quiet projects/observatory/main.mlx -o "$build/mlx-observatory"
+    "$compiler" --quiet tools/profile/main.mlx -o "$build/mlx-profile"
+    "$compiler" --quiet projects/desktop/capture/main.mlx -o "$build/mlx-capture"
+    "$compiler" --quiet --plugin projects/desktop/capture/obs.mlx -o "$build/mlx-capture.so"
+    "$compiler" --quiet projects/desktop/ipc/main.mlx -o "$build/mlx-ipcd"
+    "$compiler" --quiet projects/desktop/ipc/tool.mlx -o "$build/mlx-ipc"
+    "$compiler" --quiet projects/desktop/audio/main.mlx -o "$build/mlx-audiod"
+    "$compiler" --quiet projects/desktop/audio/tool.mlx -o "$build/mlx-audio"
+    "$compiler" --quiet projects/desktop/permissions/main.mlx -o "$build/mlx-permissions"
+    "$compiler" --quiet projects/desktop/notifications/main.mlx -o "$build/mlx-notifyd"
+    "$compiler" --quiet projects/desktop/notifications/notify.mlx -o "$build/mlx-notify"
+    compiler_args=(--compiler "$compiler")
+else
+    echo "building with ./mlx build (the desktop and client-libraries groups, only what is not current)"
+    mlx_build desktop client-libraries
+    for program in "${programs[@]}"; do
+        case $program in
+        mlx-session|mlx-codemap) ;;
+        *) cp "mlx-out/bin/$program" "$build/" ;;
+        esac
+    done
+    cp mlx-out/lib/mlx-capture.so "$build/"
+fi
 deb=()
 command -v dpkg-deb > /dev/null && deb=(--deb)
-tools/build_libpulse.sh --compiler "$compiler" --out "$build/libpulse" "${deb[@]}" > /dev/null
-tools/build_libpipewire.sh --compiler "$compiler" --out "$build/libpipewire" "${deb[@]}" > /dev/null
+tools/build_libpulse.sh "${compiler_args[@]}" --out "$build/libpulse" "${deb[@]}" > /dev/null
+tools/build_libpipewire.sh "${compiler_args[@]}" --out "$build/libpipewire" "${deb[@]}" > /dev/null
 sed "s|@BINDIR@|$bindir|g" projects/desktop/audio/org.mlx.Audio.service.in > "$build/org.mlx.Audio.service"
 sed "s|@BINDIR@|$bindir|g" projects/desktop/permissions/org.mlx.PermissionAgent.service.in > "$build/org.mlx.PermissionAgent.service"
 sed "s|@BINDIR@|$bindir|g" projects/desktop/capture/org.freedesktop.portal.Desktop.service.in > "$build/org.freedesktop.portal.Desktop.service"
+sed "s|@BINDIR@|$bindir|g" projects/desktop/notifications/org.freedesktop.Notifications.service.in > "$build/org.freedesktop.Notifications.service"
 sed "s|@BINDIR@|$bindir|g" projects/desktop/settings/mlx-settings.desktop.in > "$build/mlx-settings.desktop"
 sed "s|@BINDIR@|$bindir|g" projects/desktop/files/org.mlx.files.desktop.in > "$build/org.mlx.files.desktop"
 sed "s|@BINDIR@|$bindir|g; s|@ROOT@|$repo_root|g" projects/observatory/org.mlx.observatory.desktop.in > "$build/org.mlx.observatory.desktop"
 sed "s|@BINDIR@|$bindir|g" projects/desktop/compositor/session/mlx-compositor.desktop.in > "$build/mlx-compositor.desktop"
-echo "built $build/mlx-compositor, mlx-terminal, mlx-sh, mlx-dock, mlx-topbar, mlx-launcher, mlx-settings, mlx-files, mlx-observatory, mlx-profile, mlx-capture and its OBS plugin, mlx-ipcd and mlx-ipc, mlx-audiod and mlx-audio, mlx-permissions"
+echo "built $build/mlx-compositor, mlx-terminal, mlx-sh, mlx-console, mlx-dock, mlx-topbar, mlx-launcher, mlx-settings, mlx-files, mlx-observatory, mlx-profile, mlx-capture and its OBS plugin, mlx-ipcd and mlx-ipc, mlx-audiod and mlx-audio, mlx-permissions, mlx-notifyd and mlx-notify"
 echo "built $build/libpulse: MLX Audio's libpulse, libpulse-simple, libpulse-mainloop-glib and ALSA plugin${deb:+, the package mlx-audio-libs}"
 echo "built $build/libpipewire: MLX Capture's libpipewire${deb:+, the package mlx-capture-libs}"
 [[ $build_only -eq 1 ]] && exit 0
 
 # Install.
 as_owner "$destdir$bindir" install -d "$destdir$bindir"
-as_owner "$destdir$bindir" install -m 755 "$build/mlx-compositor" "$build/mlx-terminal" "$build/mlx-sh" "$build/mlx-dock" "$build/mlx-topbar" "$build/mlx-launcher" "$build/mlx-settings" "$build/mlx-files" "$build/mlx-observatory" "$build/mlx-profile" "$build/mlx-capture" "$build/mlx-ipcd" "$build/mlx-ipc" "$build/mlx-audiod" "$build/mlx-audio" "$build/mlx-permissions" projects/desktop/compositor/session/mlx-session "$destdir$bindir/"
+as_owner "$destdir$bindir" install -m 755 "$build/mlx-compositor" "$build/mlx-terminal" "$build/mlx-sh" "$build/mlx-console" "$build/mlx-dock" "$build/mlx-topbar" "$build/mlx-launcher" "$build/mlx-settings" "$build/mlx-files" "$build/mlx-observatory" "$build/mlx-profile" "$build/mlx-capture" "$build/mlx-ipcd" "$build/mlx-ipc" "$build/mlx-audiod" "$build/mlx-audio" "$build/mlx-permissions" "$build/mlx-notifyd" "$build/mlx-notify" projects/desktop/compositor/session/mlx-session "$destdir$bindir/"
 # The command line of the code map under its own name (the same program).
 as_owner "$destdir$bindir" ln -sf mlx-observatory "$destdir$bindir/mlx-codemap"
 as_owner "$destdir$sessions" install -d "$destdir$sessions"
@@ -337,9 +374,9 @@ as_owner "$destdir$sessions" install -m 644 "$build/mlx-compositor.desktop" "$de
 as_owner "$destdir$applications" install -d "$destdir$applications"
 as_owner "$destdir$applications" install -m 644 "$build/mlx-settings.desktop" "$build/org.mlx.files.desktop" "$build/org.mlx.observatory.desktop" "$destdir$applications/"
 as_owner "$destdir$icons" install -d "$destdir$icons"
-as_owner "$destdir$icons" install -m 644 projects/desktop/files/org.mlx.files.png projects/observatory/org.mlx.observatory.png "$destdir$icons/"
+as_owner "$destdir$icons" install -m 644 projects/desktop/files/org.mlx.files.png projects/desktop/settings/org.mlx.settings.png projects/observatory/org.mlx.observatory.png "$destdir$icons/"
 as_owner "$destdir$services" install -d "$destdir$services"
-as_owner "$destdir$services" install -m 644 "$build/org.mlx.Audio.service" "$build/org.mlx.PermissionAgent.service" "$build/org.freedesktop.portal.Desktop.service" "$destdir$services/"
+as_owner "$destdir$services" install -m 644 "$build/org.mlx.Audio.service" "$build/org.mlx.PermissionAgent.service" "$build/org.freedesktop.portal.Desktop.service" "$build/org.freedesktop.Notifications.service" "$destdir$services/"
 as_owner "$destdir$audio_libs" install -d "$destdir$audio_libs"
 as_owner "$destdir$audio_libs" install -m 644 "${audio_lib_files[@]/#/$build/libpulse/}" "$destdir$audio_libs/"
 as_owner "$destdir$capture_libs" install -d "$destdir$capture_libs"
@@ -348,13 +385,15 @@ for program in "${programs[@]}"; do echo "installed $destdir$bindir/$program"; d
 echo "installed $destdir$sessions/mlx-compositor.desktop"
 echo "installed $destdir$audio_libs: ${audio_lib_files[*]}"
 echo "installed $destdir$capture_libs/libpipewire-0.3.so.0"
+mlx_install_path_files "$destdir" "$bindir" "$(owner_runner "$destdir/etc/profile.d")"
+mlx_note_old_layout "$destdir" "$bindir"
 [[ $replace_libpulse -eq 1 ]] && replace_libpulse
 [[ $replace_libpipewire -eq 1 ]] && replace_libpipewire
 [[ $replace_sound -eq 1 ]] && replace_sound_servers
 # The shell and renderer modules, for the user running this (not when
 # staging a package).
 if [[ -z "$destdir" ]]; then
-    tools/build_compositor_modules.sh --compiler "$compiler"
+    tools/build_compositor_modules.sh "${compiler_args[@]}"
     # OBS's per-user plugin directory.
     obs_plugin="${XDG_CONFIG_HOME:-$HOME/.config}/obs-studio/plugins/mlx-capture/bin/64bit"
     mkdir -p "$obs_plugin"

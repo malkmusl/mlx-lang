@@ -21,6 +21,22 @@ Zig on Linux
 
 Zig is Stage-0 only. The canonical compiler, standard library, normal Mlx programs and brixOS must not depend on Zig.
 
+## Building
+
+```sh
+./mlx build                 # everything (only what is not current)
+./mlx build desktop         # one group; ./mlx build --list names them
+./mlx FILE.mlx -o OUT       # compile one program
+```
+
+`./mlx` makes this checkout's compiler (`mlx-out/bin/compiler/mlx4`) when
+it is missing or its sources changed, then runs it. `mlx build` runs
+[`build.mlx`](build.mlx), the project's manifest and build graph (in place
+of `build.zig` and `build.zig.zon`), with `std.build`: a step is built
+again only when a module it read, its options or the compiler changed, and
+the jobs run side by side. Programs go to `mlx-out/bin`, libraries to
+`mlx-out/lib`; see [`docs/reference/build-system.md`](docs/reference/build-system.md).
+
 ## Core rules
 
 - no hidden heap allocation, GC or implicit reference counting
@@ -51,8 +67,9 @@ Read `AGENT_IMPLEMENTATION.md` and `SPEC_INDEX.md` before implementation.
   extensions: Wayland, Vulkan and `std.gpu`, SPIR-V, fonts, UI, ...).
 - `projects/`: programs written in Mlx: the desktop (a Wayland
   compositor and its clients), MLX Observatory, coreutils, mlxlibc (the
-  C library, `projects/libc`), mlx-init (PID 1, `projects/init`) and
-  mlx-sh (the shell, `projects/shell`).
+  C library, `projects/libc`), mlx-init (PID 1, `projects/init`), mlx-sh
+  (the shell, `projects/shell`) and mlx-console (the terminal on the
+  framebuffer, `projects/console`).
 - `examples/`: small programs that show one thing each.
 - `tools/`: check scripts and developer tools (codemap, mlx-lsp,
   mlx-profile, the Wayland test host).

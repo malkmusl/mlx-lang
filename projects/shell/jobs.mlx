@@ -1,0 +1,457 @@
+// Jobs: background commands (`&`) and foreground commands the terminal
+// stopped (Ctrl-Z), each in a process group of its own when job control
+// is on (an interactive shell on a terminal, `set -m`), the terminal's
+// foreground group handed to the job that runs in front and back to the
+// shell after, what `jobs`, `fg`, `bg`, `wait` and `kill %n` work on,
+// and the "[n]+ Done" lines before a prompt.
+const std = @import("std")
+const sys = @import("./sys.mlx")
+const state = @import("./state.mlx")
+const traps = @import("./traps.mlx")
+
+const Shell = state.Shell
+const Job = state.Job
+
+// Job control for an interactive shell on a terminal: the terminal's
+// descriptor kept above the ones redirections use, the shell's group made
+// the terminal's foreground group, and the signals of the terminal's job
+// control ignored by the shell itself. False when stdin is no terminal.
+pub fn setup(shell: *Shell) -> bool {
+    if shell.*.jobControl { return true }
+    if !sys.isTerminal(0) { return false }
+    if shell.*.terminal < 0 {
+        const tty = sys.duplicateAbove(0, 10)
+        if tty < 0 { return false }
+        shell.*.terminal = tty
+    }
+    shell.*.shellGroup = sys.processGroup()
+    if sys.terminalGroup(shell.*.terminal) != shell.*.shellGroup {
+        // Started inside another shell's job: a group of its own.
+        const own = sys.setProcessGroup(0, 0)
+        shell.*.shellGroup = sys.getPid()
+        const taken = sys.setTerminalGroup(shell.*.terminal, shell.*.shellGroup)
+    }
+    sys.setSignal(sys.SIGTSTP, 1)
+    sys.setSignal(sys.SIGTTIN, 1)
+    sys.setSignal(sys.SIGTTOU, 1)
+    shell.*.jobControl = true
+    return true
+}
+
+// `set +m`: the shell's processes run in its own group again.
+pub fn teardown(shell: *Shell) -> void {
+    if !shell.*.jobControl { return }
+    sys.setSignal(sys.SIGTSTP, 0)
+    sys.setSignal(sys.SIGTTIN, 0)
+    sys.setSignal(sys.SIGTTOU, 0)
+    shell.*.jobControl = false
+}
+
+// In a child just forked: it is no interactive shell, it joins process
+// group `group` (0: a new one of its own) and takes the terminal when it
+// runs in front, the signals the shell ignored for job control go back
+// to their defaults, a background child without job control ignores INT
+// and QUIT, and the traps are reset. The job table stays as it was, so
+// `jobs | cat` lists the jobs (none of them is a child of the child, and
+// update() finds that out without harm).
+pub fn enterChild(shell: *Shell, group: isize, foreground: bool) -> void {
+    const was_interactive = shell.*.interactive
+    shell.*.interactive = false
+    if shell.*.jobControl {
+        const own = if group == 0 { sys.getPid() } else { group }
+        const placed = sys.setProcessGroup(0, own)
+        if foreground { const taken = sys.setTerminalGroup(shell.*.terminal, own) }
+        sys.setSignal(sys.SIGTSTP, 0)
+        sys.setSignal(sys.SIGTTIN, 0)
+        sys.setSignal(sys.SIGTTOU, 0)
+        if was_interactive {
+            sys.setSignal(sys.SIGINT, 0)
+            sys.setSignal(sys.SIGQUIT, 0)
+        }
+        shell.*.jobControl = false
+    } else if !foreground {
+        sys.setSignal(sys.SIGINT, 1)
+        sys.setSignal(sys.SIGQUIT, 1)
+    }
+    traps.resetInChild(shell)
+}
+
+// In the parent right after the fork of a job's process: puts it in its
+// group too (whichever of parent and child comes first), so that the next
+// process of a pipeline can join that group.
+pub fn placeChild(shell: *Shell, pid: isize, group: isize) -> void {
+    if !shell.*.jobControl { return }
+    const placed = sys.setProcessGroup(pid, if group == 0 { pid } else { group })
+}
+
+// The terminal back to the shell after a foreground job.
+fn takeTerminal(shell: *Shell) -> void {
+    if shell.*.jobControl { const back = sys.setTerminalGroup(shell.*.terminal, shell.*.shellGroup) }
+}
+
+// Adds a job; its number (the slot plus one), 0 when the table is full.
+pub fn add(shell: *Shell, pid: isize, group: isize, text: []const u8, job_state: u8) -> usize {
+    var slot = shell.*.jobCount
+    var index: usize = 0
+    while index < shell.*.jobCount {
+        if state.jobAt(shell, index).*.pid == 0 && slot == shell.*.jobCount { slot = index }
+        index += 1
+    }
+    if slot == shell.*.jobCount {
+        if slot >= state.MAX_JOBS { return 0 }
+        shell.*.jobCount += 1
+    }
+    const job = state.jobAt(shell, slot)
+    job.*.pid = pid
+    job.*.group = group
+    job.*.state = job_state
+    job.*.reported = false
+    job.*.status = 0
+    job.*.text = @intCast(u32, state.keepJobText(shell, text))
+    job.*.textLength = @intCast(u32, state.keptJobLength(text))
+    shell.*.currentJob = slot + 1
+    return slot + 1
+}
+
+pub fn forget(shell: *Shell, slot: usize) -> void {
+    state.jobAt(shell, slot).*.pid = 0
+    if shell.*.currentJob == slot + 1 { shell.*.currentJob = 0 }
+    while shell.*.jobCount > 0 && state.jobAt(shell, shell.*.jobCount - 1).*.pid == 0 { shell.*.jobCount -= 1 }
+}
+
+// The slot of the job with process `pid`, or MAX_JOBS.
+pub fn slotOfPid(shell: *Shell, pid: isize) -> usize {
+    var index: usize = 0
+    while index < shell.*.jobCount {
+        if state.jobAt(shell, index).*.pid == pid { return index }
+        index += 1
+    }
+    return state.MAX_JOBS
+}
+
+// The current job's slot (the most recent one, else the first), or
+// MAX_JOBS without jobs.
+fn currentSlot(shell: *Shell) -> usize {
+    if shell.*.currentJob > 0 && shell.*.currentJob <= shell.*.jobCount && state.jobAt(shell, shell.*.currentJob - 1).*.pid != 0 { return shell.*.currentJob - 1 }
+    var index: usize = shell.*.jobCount
+    while index > 0 {
+        if state.jobAt(shell, index - 1).*.pid != 0 { return index - 1 }
+        index -= 1
+    }
+    return state.MAX_JOBS
+}
+
+// The slot a job specification means: %N, %% or %+ (the current job), %-
+// (the one before it), %TEXT (a command starting so), %?TEXT (one
+// containing it), or a process id; MAX_JOBS when none.
+pub fn find(shell: *Shell, spec: []const u8) -> usize {
+    if spec.length == 0 { return currentSlot(shell) }
+    if spec[0] != 37 {
+        var pid: isize = 0
+        for byte in spec {
+            if byte < 48 || byte > 57 { return state.MAX_JOBS }
+            pid = pid * 10 + @intCast(isize, byte - 48)
+        }
+        return slotOfPid(shell, pid)
+    }
+    const rest = spec[1..spec.length]
+    if rest.length == 0 || std.text.same(rest, "%") || std.text.same(rest, "+") { return currentSlot(shell) }
+    if std.text.same(rest, "-") {
+        const current = currentSlot(shell)
+        var index: usize = shell.*.jobCount
+        while index > 0 {
+            if index - 1 != current && state.jobAt(shell, index - 1).*.pid != 0 { return index - 1 }
+            index -= 1
+        }
+        return current
+    }
+    if rest[0] >= 48 && rest[0] <= 57 {
+        var number: usize = 0
+        for byte in rest {
+            if byte < 48 || byte > 57 { return state.MAX_JOBS }
+            number = number * 10 + @intCast(usize, byte - 48)
+        }
+        if number == 0 || number > shell.*.jobCount || state.jobAt(shell, number - 1).*.pid == 0 { return state.MAX_JOBS }
+        return number - 1
+    }
+    var index: usize = 0
+    while index < shell.*.jobCount {
+        const job = state.jobAt(shell, index)
+        if job.*.pid != 0 {
+            const text = state.jobText(shell, job)
+            if rest[0] == 63 {
+                if contains(text, rest[1..rest.length]) { return index }
+            } else if std.text.startsWith(text, rest) {
+                return index
+            }
+        }
+        index += 1
+    }
+    return state.MAX_JOBS
+}
+
+fn contains(text: []const u8, part: []const u8) -> bool {
+    if part.length == 0 { return true }
+    var start: usize = 0
+    while start + part.length <= text.length {
+        if std.text.same(text[start..start + part.length], part) { return true }
+        start += 1
+    }
+    return false
+}
+
+// "[N]+ WHAT  TEXT" on `descriptor` (2 for what happens between
+// commands, 1 for `jobs`), with a newline first when `fresh_line` (the
+// cursor was in a command's output).
+fn announce(shell: *Shell, slot: usize, what: []const u8, descriptor: isize, fresh_line: bool) -> void {
+    const job = state.jobAt(shell, slot)
+    var line: [4200]u8 = undefined
+    var bytes: [*]u8 = undefined
+    unsafe { bytes = @ptrCast([*]u8, &line) }
+    var length: usize = 0
+    if fresh_line { length = std.text.append(bytes, length, 4200, "\n") }
+    length = std.text.append(bytes, length, 4200, "[")
+    length = std.text.appendUnsigned(bytes, length, 4200, slot + 1)
+    length = std.text.append(bytes, length, 4200, if shell.*.currentJob == slot + 1 { "]+ " } else { "]  " })
+    length = std.text.append(bytes, length, 4200, what)
+    length = std.text.append(bytes, length, 4200, "  ")
+    length = std.text.append(bytes, length, 4200, state.jobText(shell, job))
+    length = std.text.append(bytes, length, 4200, "\n")
+    const wrote = sys.write(descriptor, bytes, length)
+}
+
+// What a finished job is reported as.
+fn doneWord(status: usize, into: [*]u8, capacity: usize) -> usize {
+    if status == 0 { return std.text.append(into, 0, capacity, "Done") }
+    var length = std.text.append(into, 0, capacity, "Done(")
+    length = std.text.appendUnsigned(into, length, capacity, status)
+    return std.text.append(into, length, capacity, ")")
+}
+
+// Waits for the job in `slot` in front: its status, or 128 plus the
+// signal that stopped it (the job then stays, stopped). The terminal
+// comes back to the shell after. The job is forgotten when it ended.
+pub fn waitJob(shell: *Shell, slot: usize) -> usize {
+    const job = state.jobAt(shell, slot)
+    var raw: usize = 0
+    var status: usize = 0
+    const flags = if shell.*.jobControl { sys.WUNTRACED } else { 0 }
+    const waited = sys.waitWith(job.*.pid, &raw, flags)
+    if waited == job.*.pid && sys.stopped(raw) && shell.*.jobControl {
+        job.*.state = state.JOB_STOPPED
+        job.*.reported = true
+        shell.*.currentJob = slot + 1
+        takeTerminal(shell)
+        announce(shell, slot, "Stopped", 2, true)
+        return 128 + sys.stopSignal(raw)
+    }
+    takeTerminal(shell)
+    status = if waited == job.*.pid { sys.exitStatus(raw) } else { job.*.status }
+    forget(shell, slot)
+    return status
+}
+
+// Waits for the foreground process `pid` (of group `group`, running
+// `text`): its status, or 128 plus the stop signal when the terminal
+// stopped it, which makes it a job.
+pub fn waitForeground(shell: *Shell, pid: isize, group: isize, text: []const u8) -> usize {
+    if !shell.*.jobControl {
+        var raw: usize = 0
+        const waited = sys.wait(pid, &raw, false)
+        return sys.exitStatus(raw)
+    }
+    const number = add(shell, pid, group, text, state.JOB_RUNNING)
+    if number == 0 {
+        var raw: usize = 0
+        const waited = sys.wait(pid, &raw, false)
+        takeTerminal(shell)
+        return sys.exitStatus(raw)
+    }
+    return waitJob(shell, number - 1)
+}
+
+// Waits for the processes of a foreground pipeline (the last one's
+// status): when the terminal stops them, the pipeline becomes a stopped
+// job on its last process.
+pub fn waitPipeline(shell: *Shell, pids: [*]const isize, count: usize, group: isize, text: []const u8) -> usize {
+    var status: usize = 0
+    var stopped = false
+    var index: usize = 0
+    while index < count {
+        var raw: usize = 0
+        const flags = if shell.*.jobControl { sys.WUNTRACED } else { 0 }
+        const waited = sys.waitWith(pids[index], &raw, flags)
+        const last = index + 1 == count
+        if waited == pids[index] && sys.stopped(raw) {
+            stopped = true
+            if last { status = 128 + sys.stopSignal(raw) }
+        } else if last {
+            status = sys.exitStatus(raw)
+        }
+        index += 1
+    }
+    if stopped && shell.*.jobControl {
+        const number = add(shell, pids[count - 1], group, text, state.JOB_STOPPED)
+        if number > 0 {
+            state.jobAt(shell, number - 1).*.reported = true
+            takeTerminal(shell)
+            announce(shell, number - 1, "Stopped", 2, true)
+            return status
+        }
+    }
+    takeTerminal(shell)
+    return status
+}
+
+// Takes what changed among the shell's children without waiting: jobs
+// that ended, stopped or went on change state.
+pub fn update(shell: *Shell) -> void {
+    var rounds: usize = 0
+    while rounds < 256 {
+        var raw: usize = 0
+        const pid = sys.waitWith(-1, &raw, sys.WNOHANG | sys.WUNTRACED | sys.WCONTINUED)
+        if pid <= 0 { return }
+        const slot = slotOfPid(shell, pid)
+        if slot != state.MAX_JOBS {
+            const job = state.jobAt(shell, slot)
+            if sys.stopped(raw) {
+                job.*.state = state.JOB_STOPPED
+                job.*.reported = false
+                shell.*.currentJob = slot + 1
+            } else if sys.continued(raw) {
+                job.*.state = state.JOB_RUNNING
+            } else {
+                job.*.state = state.JOB_DONE
+                job.*.status = sys.exitStatus(raw)
+                job.*.reported = false
+            }
+        }
+        rounds += 1
+    }
+}
+
+// Says what changed since the last report (an interactive shell, on
+// stderr): "[n]+ Done  text", "[n]+ Stopped  text"; the finished jobs
+// are forgotten.
+pub fn report(shell: *Shell) -> void {
+    var index: usize = 0
+    while index < shell.*.jobCount {
+        const job = state.jobAt(shell, index)
+        if job.*.pid != 0 {
+            if job.*.state == state.JOB_DONE {
+                if shell.*.interactive && !job.*.reported {
+                    var word: [32]u8 = undefined
+                    var word_bytes: [*]u8 = undefined
+                    unsafe { word_bytes = @ptrCast([*]u8, &word) }
+                    const length = doneWord(job.*.status, word_bytes, 32)
+                    announce(shell, index, word_bytes[0..length], 2, false)
+                }
+                forget(shell, index)
+            } else if job.*.state == state.JOB_STOPPED && !job.*.reported {
+                if shell.*.interactive { announce(shell, index, "Stopped", 2, false) }
+                job.*.reported = true
+            }
+        }
+        index += 1
+    }
+}
+
+// `jobs`: every job, on stdout; with `pids_only` the process ids alone,
+// with `long` the id before the state. Finished jobs are forgotten after.
+pub fn list(shell: *Shell, long: bool, pids_only: bool, only: usize) -> void {
+    var index: usize = 0
+    while index < shell.*.jobCount {
+        const job = state.jobAt(shell, index)
+        if job.*.pid != 0 && (only == state.MAX_JOBS || only == index) {
+            if pids_only {
+                var line: [32]u8 = undefined
+                var bytes: [*]u8 = undefined
+                unsafe { bytes = @ptrCast([*]u8, &line) }
+                var length = std.text.appendUnsigned(bytes, 0, 32, @intCast(usize, job.*.pid))
+                length = std.text.append(bytes, length, 32, "\n")
+                const wrote = sys.write(1, bytes, length)
+            } else {
+                var what: [48]u8 = undefined
+                var what_bytes: [*]u8 = undefined
+                unsafe { what_bytes = @ptrCast([*]u8, &what) }
+                var length: usize = 0
+                if long {
+                    length = std.text.appendUnsigned(what_bytes, 0, 48, @intCast(usize, job.*.pid))
+                    length = std.text.append(what_bytes, length, 48, " ")
+                }
+                if job.*.state == state.JOB_RUNNING {
+                    length = std.text.append(what_bytes, length, 48, "Running")
+                } else if job.*.state == state.JOB_STOPPED {
+                    length = std.text.append(what_bytes, length, 48, "Stopped")
+                } else {
+                    var word: [32]u8 = undefined
+                    var word_bytes: [*]u8 = undefined
+                    unsafe { word_bytes = @ptrCast([*]u8, &word) }
+                    const word_length = doneWord(job.*.status, word_bytes, 32)
+                    length = std.text.append(what_bytes, length, 48, word_bytes[0..word_length])
+                }
+                announce(shell, index, what_bytes[0..length], 1, false)
+            }
+            if job.*.state == state.JOB_DONE { forget(shell, index) }
+        }
+        index += 1
+    }
+}
+
+// `fg`: the job in `slot` in front again (continued, with the terminal);
+// its status. `bg`: continued in the background; 0.
+pub fn continueJob(shell: *Shell, slot: usize, foreground: bool) -> usize {
+    const job = state.jobAt(shell, slot)
+    if job.*.state == state.JOB_DONE {
+        const status = job.*.status
+        forget(shell, slot)
+        return status
+    }
+    shell.*.currentJob = slot + 1
+    if foreground {
+        const text = state.jobText(shell, job)
+        const shown = sys.writeAll(1, text)
+        const line = sys.writeAll(1, "\n")
+        const given = sys.setTerminalGroup(shell.*.terminal, job.*.group)
+        if job.*.state == state.JOB_STOPPED { const woken = sys.kill(0 - job.*.group, sys.SIGCONT) }
+        job.*.state = state.JOB_RUNNING
+        return waitJob(shell, slot)
+    }
+    if job.*.state == state.JOB_STOPPED { const woken = sys.kill(0 - job.*.group, sys.SIGCONT) }
+    job.*.state = state.JOB_RUNNING
+    job.*.reported = true
+    var line: [4200]u8 = undefined
+    var bytes: [*]u8 = undefined
+    unsafe { bytes = @ptrCast([*]u8, &line) }
+    var length = std.text.append(bytes, 0, 4200, "[")
+    length = std.text.appendUnsigned(bytes, length, 4200, slot + 1)
+    length = std.text.append(bytes, length, 4200, "]+ ")
+    length = std.text.append(bytes, length, 4200, state.jobText(shell, job))
+    length = std.text.append(bytes, length, 4200, " &\n")
+    const wrote = sys.write(1, bytes, length)
+    return 0
+}
+
+pub fn hasStopped(shell: *Shell) -> bool {
+    var index: usize = 0
+    while index < shell.*.jobCount {
+        const job = state.jobAt(shell, index)
+        if job.*.pid != 0 && job.*.state == state.JOB_STOPPED { return true }
+        index += 1
+    }
+    return false
+}
+
+// Whether the job in `slot` has finished (its state updated first).
+pub fn isDone(shell: *Shell, slot: usize) -> bool {
+    const job = state.jobAt(shell, slot)
+    return job.*.pid == 0 || job.*.state == state.JOB_DONE
+}
+
+// The target of a signal for the job in `slot`: its whole group with job
+// control, else its process.
+pub fn signalTarget(shell: *Shell, slot: usize) -> isize {
+    const job = state.jobAt(shell, slot)
+    if shell.*.jobControl && job.*.group > 0 { return 0 - job.*.group }
+    return job.*.pid
+}

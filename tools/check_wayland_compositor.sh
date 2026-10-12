@@ -32,18 +32,53 @@
 #  10. with GTK 3 (through python3's ctypes, if installed): KDE's server
 #      decoration tells it the compositor decorates, so it asks for server
 #      side decoration and draws no title bar of its own.
+#  10c. Aero snap: a window dragged to the left edge snaps to that half
+#      (the translucent preview shows while it is dragged), Super+Right to
+#      the right half, dragging it away restores its size, the top edge
+#      maximizes.
+#  10d. workspaces and scrollable tiling with the top bar (mlx-topbar): its
+#      tiling half turns tiling on (the windows become columns), a second
+#      window opens as a column after the first, Super+R, Super+Left and
+#      Super+Shift+Right size, focus and move columns, the floating half
+#      turns it off again; Super+Shift+2 moves a window to workspace 2, the
+#      bar's numbers and Super+3 switch workspaces.
+#  10e. animations (settings `animations = slow`, eight times slower, so a
+#      frame in the middle is caught): switching workspaces slides the
+#      window out, Super+Right glides it to the right half.
+#  10f. the wheel and the touchpad on a tiling workspace: Super+wheel walks
+#      the columns, Super and fingers drag the strip, which settles on a
+#      column when they lift; Super+Ctrl+wheel (and Super+wheel on a
+#      floating workspace) and the wheel over the top bar switch
+#      workspaces.
+#  10g. three-finger swipes (zwp_pointer_gestures_v1 from the host): the
+#      strip follows the fingers and settles, up and down and sideways on
+#      a floating workspace pull the next workspace in or spring back.
 #  11. mlx-settings records hotkeys: while it records, the compositor
 #      passes every key to it (keyboard-shortcuts-inhibit), Super+Up too;
 #      Backspace unbinds one; the compositor takes the new keys at once.
+#  11b. mlx-settings' Top bar page (opened by `mlx-settings topbar`): an
+#      item moves up a place and another is hidden; topbar.conf says so.
+#  11c. the session lock (ext-session-lock-v1, a stand-in locker): locked,
+#      only the lock surface shows and gets the keys; a locker that dies
+#      leaves the session locked and blank; the next one locks and
+#      unlocks it, and the keys go to the terminal again.
 #  12. mlx-capture captures the screen and a window
 #      (ext-image-copy-capture-v1): the PNGs agree, and a later frame
-#      waits for damage.
+#      waits for damage; with lavapipe the Vulkan renderer's capture (the
+#      copy it keeps in host memory) has the same pixels.
 #  13. with Xwayland and xev: an X program's window shows, takes focus and
 #      gets keys (the compositor's own X window manager).
 #  14. mlx-settings' Sound and Display pages: on MLXIPC with MLX Audio
 #      (started by the bus) it mutes the output and turns the volume down;
 #      the nested compositor tells its output in <socket>.display, and the
 #      Display page's night light switch reaches compositor.conf.
+#  14a. mlx-settings' Network page without mlx-netd: with a stand-in
+#      NetworkManager running it says NetworkManager runs the network and
+#      lists the kernel's links; with an mlx-netd that has its name on the
+#      system bus but does not answer, it says that.
+#  14b. mlx-settings' Network page on a system bus with fakenetd
+#      (tools/network-test) as mlx-netd: a Wi-Fi network is joined (a
+#      wrong passphrase refused and asked again) and forgotten.
 #  15. the permission dialog (mlx-permissions, with bwrap): a sandboxed
 #      app records, MLXIPC starts the agent, its dialog opens; Remember and
 #      Allow are clicked: the app records and ipc.conf keeps the rule;
@@ -83,6 +118,11 @@ trap 'fusermount -u "$XDG_RUNTIME_DIR/doc" 2> /dev/null || true; rm -rf -- "$wor
 "$compiler" --quiet projects/desktop/compositor/main.mlx -o "$work/mlx-compositor"
 "$compiler" --quiet projects/desktop/terminal/main.mlx -o "$work/mlx-terminal"
 "$compiler" --quiet tools/wayland-test-host/main.mlx -o "$work/test-host"
+# The top bar is kept out of the compositor's directory: next to it, every
+# scenario would start it (and its bar would cover the title bars at the
+# top); the scenarios that want it name it with --topbar.
+mkdir -p "$work/bar"
+"$compiler" --quiet projects/desktop/topbar/main.mlx -o "$work/bar/mlx-topbar"
 xkbcli compile-keymap --layout us > "$work/us.xkb"
 
 run_scenario() {
@@ -95,9 +135,55 @@ run_scenario() {
     wait "$host_pid" || { echo "test host failed ($name):" >&2; cat "$work/$name-host.log" >&2; exit 1; }
 }
 
-# Scenario 1: Mlx terminals.
+# Greeter mode has one trusted client connection of its own.  A second
+# client can still connect to the public socket (the socket must remain a
+# normal Wayland display), but it must neither become visible nor take the
+# keyboard.  The wrapper gives the terminal shells different directories so
+# the typed `pwd` says which one received the command.
+mkdir -p "$work/greeter-dir" "$work/attacker-dir"
+cat > "$work/greeter-wrapper" <<SCRIPT
+#!/bin/sh
+(
+    sleep 1
+    unset WAYLAND_SOCKET
+    cd "$work/attacker-dir" || exit 1
+    exec "$work/mlx-terminal"
+) &
+cd "$work/greeter-dir" || exit 1
+exec "$work/mlx-terminal"
+SCRIPT
+chmod +x "$work/greeter-wrapper"
+cat > "$work/blocked-helper" <<SCRIPT
+#!/bin/sh
+echo started >> "$work/greeter-blocked.marker"
+SCRIPT
+chmod +x "$work/blocked-helper"
+cat > "$work/greeter.script" <<SCRIPT
+wait 2500
+pointer 200 200
+press 272
+release 272
+wait 300
+type pwd > $work/greeter-input.marker
+enter
+wait 500
+down 56
+down 28
+up 28
+up 56
+wait 500
+close
+SCRIPT
+run_scenario greeter "$work/greeter.script" --greeter "$work/greeter-wrapper" --run "$work/blocked-helper" --terminal "$work/blocked-helper" --launcher "$work/blocked-helper" --dock "$work/blocked-helper" --topbar "$work/blocked-helper" --xwayland "$work/blocked-helper"
+[[ "$(cat "$work/greeter-input.marker" 2> /dev/null)" == "$work/greeter-dir" ]] || { echo "a non-greeter surface received input in greeter mode" >&2; cat "$work/greeter-compositor.log" >&2; exit 1; }
+[[ ! -e "$work/greeter-blocked.marker" ]] || { echo "an ordinary program or desktop helper started in greeter mode" >&2; cat "$work/greeter-compositor.log" >&2; exit 1; }
+echo "ok   greeter mode starts only its trusted client and gives only it input"
+if [[ ${MLX_WAYLAND_GREETER_ONLY:-0} == 1 ]]; then exit 0; fi
+
+# Scenario 1: Mlx terminals (the terminal's title follows its shell once
+# bash names it, so the log lines are matched by their kind alone).
 cat > "$work/terminal.script" <<SCRIPT
-wait 1500
+wait 2500
 pointer 200 200
 press 272
 release 272
@@ -138,7 +224,7 @@ run_scenario terminal "$work/terminal.script" --terminal "$work/mlx-terminal" --
 echo "ok   keys typed on the host reached the shell in the Mlx terminal"
 [[ $(grep -c "^map: Mlx Terminal" "$work/terminal-compositor.log") -eq 2 ]] || { echo "Alt+Enter did not open a second terminal" >&2; exit 1; }
 echo "ok   Alt+Enter launched a second terminal"
-grep -q "^move: Mlx Terminal" "$work/terminal-compositor.log" || { echo "Alt+drag did not start a move" >&2; exit 1; }
+grep -q "^move: " "$work/terminal-compositor.log" || { echo "Alt+drag did not start a move" >&2; exit 1; }
 [[ "$(cat "$work/second.marker" 2> /dev/null)" == "moved" ]] || { echo "keyboard input did not reach the second terminal" >&2; exit 1; }
 # The second window starts at (64, 56); dragging by (+120, +80) puts its
 # focus frame's left edge at x = 182..183, from y = 136 down.
@@ -172,7 +258,7 @@ shot $work/title.ppm
 close
 SCRIPT
 run_scenario title "$work/title.script" --terminal "$work/mlx-terminal" --run "$work/mlx-terminal"
-grep -q "^move: Mlx Terminal" "$work/title-compositor.log" || { echo "dragging the title bar did not move the window" >&2; cat "$work/title-compositor.log" >&2; exit 1; }
+grep -q "^move: " "$work/title-compositor.log" || { echo "dragging the title bar did not move the window" >&2; cat "$work/title-compositor.log" >&2; exit 1; }
 # The window starts at (24, 24) and moves by (+100, +100): its frame's left
 # edge is at x = 122, its title bar spans y = 102..121 (rounded above
 # y = 116).
@@ -327,6 +413,45 @@ for x, y in ((40, 40), (170, 90), (100, 140), (60, 90)):
 PY
 echo "ok   a subsurface is drawn at its offset in its window"
 
+# Scenario 5b: the pointer over a subsurface that its client then destroys
+# (--subsurface-gone destroys it on the first pointer enter). A subsurface
+# is never "mapped", so the compositor once kept its pointer focus on the
+# freed surface and crashed in sameClient on the next motion.
+cat > "$work/subsurface-gone.sh" <<SCRIPT
+#!/bin/sh
+exec "$work/hello-wayland" --subsurface-gone > "$work/subsurface-gone-client.log" 2>&1
+SCRIPT
+chmod +x "$work/subsurface-gone.sh"
+cat > "$work/subsurface-gone.script" <<SCRIPT
+wait 1500
+pointer 100 90
+wait 600
+pointer 110 95
+pointer 120 100
+pointer 60 60
+pointer 100 90
+wait 400
+shot $work/subsurface-gone.ppm
+close
+SCRIPT
+run_scenario subsurface-gone "$work/subsurface-gone.script" --run "$work/subsurface-gone.sh"
+grep -q "subsurface destroyed on pointer enter" "$work/subsurface-gone-client.log" || { echo "the client did not destroy its subsurface:" >&2; cat "$work/subsurface-gone-client.log" >&2; exit 1; }
+grep -q "crash" "$work/subsurface-gone-compositor.log" && { echo "the compositor crashed after the subsurface went:" >&2; cat "$work/subsurface-gone-compositor.log" >&2; exit 1; }
+python3 - "$work/subsurface-gone.ppm" <<'PY'
+import sys
+data = open(sys.argv[1], 'rb').read()
+header, rest = data.split(b'\n', 1)
+size, rest = rest.split(b'\n', 1)
+_, pixels = rest.split(b'\n', 1)
+width, height = map(int, size.split())
+def rgb(x, y):
+    offset = (y * width + x) * 3
+    return tuple(pixels[offset:offset + 3])
+for x, y in ((64, 54), (100, 90), (163, 133)):
+    assert rgb(x, y) != (0, 255, 0), ("the subsurface is still drawn", x, y)
+PY
+echo "ok   the pointer moves on after the subsurface under it is destroyed"
+
 # Scenario 8: xdg-decoration. The client asks for client-side decorations;
 # the compositor answers server side (its default), client side once the
 # settings file says client-decorations = on, server side again after off.
@@ -383,10 +508,378 @@ assert white(100, 100) > 10 and white(200, 150) == 0, (white(100, 100), white(20
 PY
 echo "ok   a pointer lock holds the cursor and relative motion reaches the client"
 
+# Scenario 10c: Aero snap. The terminal opens at (24, 24) and moves below
+# the top bar (its title bar at y 30..49). Dragged to the left edge, the
+# left half of the work area shows the preview (the focus colour, three
+# eighths over what is there) and the window snaps there when let go;
+# Super+Right puts it in the right half; dragging its title bar away
+# brings back its old size under the pointer; the top edge maximizes.
+cat > "$work/snap.script" <<SCRIPT
+wait 5000
+pointer 200 40
+press 272
+pointer 100 200
+pointer 0 300
+wait 300
+shot $work/snap-preview.ppm
+release 272
+wait 600
+down 125
+down 106
+up 106
+up 125
+wait 600
+pointer 700 40
+press 272
+pointer 600 200
+pointer 500 300
+wait 200
+release 272
+wait 600
+pointer 500 300
+press 272
+pointer 500 100
+pointer 500 30
+wait 200
+release 272
+wait 600
+close
+SCRIPT
+run_scenario snap "$work/snap.script" --no-fps --topbar "$work/bar/mlx-topbar" --terminal "$work/mlx-terminal" --run "$work/mlx-terminal"
+log="$work/snap-compositor.log"
+# (The work area: 1024x738 below the bar; its halves 512 wide.)
+grep -q "^snap: left " "$log" && grep -q "^snapped: 512x738 at 0,30" "$log" && grep -q "^window: 508x[0-9]* at 2,52" "$log" || { echo "dragging the window to the left edge did not snap it to the left half" >&2; cat "$log" >&2; exit 1; }
+grep -q "^snap: right " "$log" && grep -q "^snapped: 512x738 at 512,30" "$log" || { echo "Super+Right did not snap the window to the right half" >&2; cat "$log" >&2; exit 1; }
+[[ $(grep -c "^window: 652x396 " "$log") -ge 2 ]] || { echo "dragging a snapped window away did not bring back its size" >&2; cat "$log" >&2; exit 1; }
+grep -q "^maximize: " "$log" || { echo "dragging the window to the top edge did not maximize it" >&2; cat "$log" >&2; exit 1; }
+python3 - "$work/snap-preview.ppm" <<'PY'
+import sys
+data = open(sys.argv[1], 'rb').read()
+_, size, _, pixels = data.split(b'\n', 3)
+width, height = map(int, size.split())
+def rgb(x, y):
+    at = (y * width + x) * 3
+    return tuple(pixels[at:at + 3])
+# The left half is tinted blue, the right half is not, the edge at 512.
+left, right = rgb(300, 150), rgb(800, 150)
+assert left[2] - right[2] > 40 and left[0] - right[0] > 10, (left, right)
+assert rgb(508, 150)[2] - rgb(516, 150)[2] > 40, (rgb(508, 150), rgb(516, 150))
+PY
+echo "ok   Aero snap: the edges snap a dragged window (with a preview) to a half, a quarter or the whole work area; Super+Right too"
+
+# Scenario 10d: workspaces and scrollable tiling, with the top bar. The
+# bar's controls are centred: with workspace 1 shown and no other in use,
+# the buttons 1 and 2 at x 453..476 and 481..504, then the floating half
+# (515..542) and the tiling half (543..570) of the mode button; once
+# workspace 2 has a window the buttons 1 to 3 start at 439, 467 and 495
+# (the mode button at 529); on workspace 3 four buttons show, the first
+# at 425.
+cat > "$work/workspaces.script" <<SCRIPT
+wait 5000
+shot $work/bar-floating.ppm
+pointer 557 15
+press 272
+release 272
+wait 800
+shot $work/bar-tiling.ppm
+down 56
+down 28
+up 28
+up 56
+wait 2500
+down 125
+down 19
+up 19
+up 125
+wait 500
+down 125
+down 105
+up 105
+up 125
+wait 500
+down 125
+down 42
+down 106
+up 106
+up 42
+up 125
+wait 600
+pointer 529 15
+press 272
+release 272
+wait 600
+down 125
+down 42
+down 3
+up 3
+up 42
+up 125
+wait 600
+pointer 479 15
+press 272
+release 272
+wait 600
+down 125
+down 4
+up 4
+up 125
+wait 400
+pointer 437 15
+press 272
+release 272
+wait 600
+close
+SCRIPT
+run_scenario workspaces "$work/workspaces.script" --no-fps --topbar "$work/bar/mlx-topbar" --terminal "$work/mlx-terminal" --run "$work/mlx-terminal"
+log="$work/workspaces-compositor.log"
+expect_line() {
+    grep -q -- "$1" "$log" || { echo "workspaces: $2 (no '$1' in the log)" >&2; cat "$log" >&2; exit 1; }
+}
+expect_line "^tiling: on (workspace 1)" "the bar's tiling half did not turn tiling on"
+expect_line "^column: .* at 8 width 500" "the first window is not the first column"
+expect_line "^column: .* at 516 width 500" "the second window did not open as the column after the first"
+expect_line "^column width: 670 " "Super+R did not widen the column"
+expect_line "^column: .* at 686 width 500" "Super+Shift+Right did not move the column right"
+expect_line "^tiling: off (workspace 1)" "the bar's floating half did not turn tiling off"
+expect_line "^moved to workspace 2: " "Super+Shift+2 did not move the window"
+[[ $(grep -c "^workspace: " "$log") -ge 3 ]] && grep -q "^workspace: 3" "$log" || { echo "the bar's numbers and Super+3 did not switch workspaces" >&2; cat "$log" >&2; exit 1; }
+[[ "$(grep "^workspace: " "$log" | tail -1)" == "workspace: 1" ]] || { echo "the bar's 1 did not bring back workspace 1" >&2; cat "$log" >&2; exit 1; }
+python3 - "$work/bar-floating.ppm" "$work/bar-tiling.ppm" <<'PY'
+import sys
+def load(path):
+    data = open(path, 'rb').read()
+    _, size, _, pixels = data.split(b'\n', 3)
+    width, height = map(int, size.split())
+    return lambda x, y: tuple(pixels[(y * width + x) * 3:(y * width + x) * 3 + 3])
+floating, tiling = load(sys.argv[1]), load(sys.argv[2])
+def lit(pixel): return min(pixel) > 200
+# Workspace 1's button is lit in both; the lit half of the mode button
+# moves from floating to tiling.
+assert lit(floating(465, 7)) and lit(tiling(465, 7)), (floating(465, 7), tiling(465, 7))
+assert lit(floating(520, 7)) and not lit(floating(566, 7)), (floating(520, 7), floating(566, 7))
+assert lit(tiling(566, 7)) and not lit(tiling(520, 7)), (tiling(520, 7), tiling(566, 7))
+PY
+echo "ok   workspaces and scrollable tiling: the bar's buttons and the hotkeys switch, tile, size, focus and move"
+
+# Scenario 10e: animations, eight times slower (`animations = slow`). The
+# terminal rests at (24, 24): its frame's columns 22..23 and 676..677. Super+2
+# slides workspace 1 out to the left: 300 ms in, its right edge is on the
+# way (left of 600, not yet gone). Back on workspace 1, Super+Right snaps it
+# to the right half: 300 ms in, its left edge glides between where it was
+# and x = 511, where it rests in the end.
+printf 'animations = slow\n' > "$XDG_CONFIG_HOME/mlx/compositor.conf"
+cat > "$work/animations.script" <<SCRIPT
+wait 3000
+down 125
+down 3
+up 3
+up 125
+wait 300
+shot $work/slide-mid.ppm
+wait 3000
+down 125
+down 2
+up 2
+up 125
+wait 3000
+down 125
+down 106
+up 106
+up 125
+wait 300
+shot $work/glide-mid.ppm
+wait 3000
+shot $work/glide-end.ppm
+close
+SCRIPT
+run_scenario animations "$work/animations.script" --no-fps --terminal "$work/mlx-terminal" --run "$work/mlx-terminal"
+rm -f "$XDG_CONFIG_HOME/mlx/compositor.conf"
+grep -q "^settings: .*animations slow" "$work/animations-compositor.log" || { echo "the compositor did not read animations = slow" >&2; cat "$work/animations-compositor.log" >&2; exit 1; }
+grep -q "^snap: right " "$work/animations-compositor.log" || { echo "Super+Right did not snap the window" >&2; cat "$work/animations-compositor.log" >&2; exit 1; }
+python3 - "$work/slide-mid.ppm" "$work/glide-mid.ppm" "$work/glide-end.ppm" <<'PY'
+import sys
+def frame_columns(path, row):
+    data = open(path, 'rb').read()
+    _, size, _, pixels = data.split(b'\n', 3)
+    width, height = map(int, size.split())
+    frame = ((0x5a, 0xa0, 0xff), (0x50, 0x50, 0x60))
+    return [x for x in range(width) if tuple(pixels[(row * width + x) * 3:(row * width + x) * 3 + 3]) in frame]
+slide = frame_columns(sys.argv[1], 200)
+assert slide and 22 not in slide and max(slide) < 600, ("the window did not slide out", slide)
+glide = frame_columns(sys.argv[2], 200)
+assert glide and 40 < min(glide) < 500, ("the window did not glide to the right half", glide)
+end = frame_columns(sys.argv[3], 200)
+assert min(end) in (511, 512), ("the window did not end on the right half", end)
+PY
+echo "ok   animations: workspaces slide, snapped windows glide into place"
+
+# Scenario 10f: the wheel and the touchpad. Three terminals on a tiling
+# workspace (columns 500 wide from x = 8: the strip is 1516 wide, the third
+# column focused at its right end). Super+wheel up twice focuses the first
+# column (the strip glides back to the start: columns at 8 and 516); Super
+# and fingers drag the strip 500 pixels on (the second column's left edge
+# at 16); they lift and it settles with the second column at x = 8, which
+# takes the focus. Super+Ctrl+wheel goes to workspace 2, Super+wheel up on
+# that (floating) one back to 1, the wheel over the top bar to 2 again.
+cat > "$work/wheel.script" <<SCRIPT
+wait 5000
+pointer 500 400
+down 125
+down 20
+up 20
+up 125
+wait 600
+down 56
+down 28
+up 28
+up 56
+wait 2500
+down 56
+down 28
+up 28
+up 56
+wait 2500
+down 125
+scroll -2560
+up 125
+wait 600
+down 125
+scroll -2560
+up 125
+wait 800
+shot $work/wheel-first.ppm
+down 125
+swipe 25600
+swipe 25600
+swipe 25600
+swipe 25600
+swipe 25600
+up 125
+wait 300
+shot $work/wheel-swiped.ppm
+lift
+wait 800
+shot $work/wheel-settled.ppm
+down 125
+down 29
+scroll 2560
+up 29
+up 125
+wait 1000
+down 125
+scroll -2560
+up 125
+wait 1000
+pointer 500 15
+scroll 2560
+wait 1000
+close
+SCRIPT
+run_scenario wheel "$work/wheel.script" --no-fps --topbar "$work/bar/mlx-topbar" --terminal "$work/mlx-terminal" --run "$work/mlx-terminal"
+log="$work/wheel-compositor.log"
+grep -q "^settled on column 2: " "$log" || { echo "the strip did not settle on the second column when the fingers lifted" >&2; cat "$log" >&2; exit 1; }
+[[ "$(grep "^workspace: " "$log" | tr '\n' ' ')" == "workspace: 2 workspace: 1 workspace: 2 " ]] || { echo "Super+Ctrl+wheel, Super+wheel and the wheel over the bar did not switch workspaces 2, 1, 2" >&2; cat "$log" >&2; exit 1; }
+python3 - "$work/wheel-first.ppm" "$work/wheel-swiped.ppm" "$work/wheel-settled.ppm" <<'PY'
+import sys
+def frame_columns(path, row):
+    data = open(path, 'rb').read()
+    _, size, _, pixels = data.split(b'\n', 3)
+    width, height = map(int, size.split())
+    frame = ((0x5a, 0xa0, 0xff), (0x50, 0x50, 0x60))
+    return [x for x in range(width) if tuple(pixels[(row * width + x) * 3:(row * width + x) * 3 + 3]) in frame]
+first, swiped, settled = (frame_columns(path, 300) for path in sys.argv[1:4])
+assert 8 in first and 516 in first, ("Super+wheel did not bring the first column back", first)
+assert 16 in swiped and 524 in swiped, ("the strip did not follow the fingers", swiped)
+assert 8 in settled and 516 in settled and 16 not in settled, ("the strip did not settle on a column", settled)
+PY
+echo "ok   the wheel walks columns and switches workspaces, fingers drag the strip and it settles on a column"
+
+# Scenario 10g: three-finger swipes (the host's zwp_pointer_gestures_v1).
+# Three columns on a tiling workspace, the third focused (the view at 508):
+# fingers going right drag the strip 500 pixels back (the first column's
+# frame at x = 0), and when they lift it settles with the first column at
+# x = 8. Up 400 pixels pulls workspace 2 in from below (the windows on
+# their way up: nothing of them at y = 600) and lifting goes there; 100
+# pixels down and a rest spring back; sideways on that floating workspace
+# goes back to workspace 1.
+cat > "$work/gestures.script" <<SCRIPT
+wait 5000
+pointer 500 400
+down 125
+down 20
+up 20
+up 125
+wait 600
+down 56
+down 28
+up 28
+up 56
+wait 2500
+down 56
+down 28
+up 28
+up 56
+wait 2500
+gesture-begin 3
+gesture-move 100 0
+gesture-move 100 0
+gesture-move 100 0
+gesture-move 100 0
+gesture-move 100 0
+wait 300
+shot $work/strip-swiped.ppm
+gesture-end
+wait 800
+shot $work/strip-settled.ppm
+gesture-begin 3
+gesture-move 0 -100
+gesture-move 0 -100
+gesture-move 0 -100
+gesture-move 0 -100
+wait 300
+shot $work/vertical-mid.ppm
+gesture-end
+wait 1000
+gesture-begin 3
+gesture-move 0 100
+wait 300
+gesture-end
+wait 1000
+gesture-begin 3
+gesture-move 100 0
+gesture-move 100 0
+gesture-move 100 0
+gesture-move 100 0
+wait 300
+gesture-end
+wait 1000
+close
+SCRIPT
+run_scenario gestures "$work/gestures.script" --no-fps --topbar "$work/bar/mlx-topbar" --terminal "$work/mlx-terminal" --run "$work/mlx-terminal"
+log="$work/gestures-compositor.log"
+for line in "^settled on column 1: " "^swipe: workspaces up and down" "^swipe: to workspace 2" "^swipe: back from workspace 1" "^swipe: workspaces sideways" "^swipe: to workspace 1"; do
+    grep -q "$line" "$log" || { echo "the swipes did not log \"$line\"" >&2; cat "$log" >&2; exit 1; }
+done
+[[ "$(grep "^workspace: " "$log" | tr '\n' ' ')" == "workspace: 2 workspace: 1 " ]] || { echo "the swipes did not switch to workspace 2 and back to 1" >&2; cat "$log" >&2; exit 1; }
+python3 - "$work/strip-swiped.ppm" "$work/strip-settled.ppm" "$work/vertical-mid.ppm" <<'PY'
+import sys
+def frame_columns(path, row):
+    data = open(path, 'rb').read()
+    _, size, _, pixels = data.split(b'\n', 3)
+    width, height = map(int, size.split())
+    frame = ((0x5a, 0xa0, 0xff), (0x50, 0x50, 0x60))
+    return [x for x in range(width) if tuple(pixels[(row * width + x) * 3:(row * width + x) * 3 + 3]) in frame]
+swiped, settled = frame_columns(sys.argv[1], 300), frame_columns(sys.argv[2], 300)
+assert 0 in swiped and 508 in swiped, ("the strip did not follow three fingers", swiped)
+assert 8 in settled and 516 in settled, ("the strip did not settle on the first column", settled)
+assert frame_columns(sys.argv[3], 200) and not frame_columns(sys.argv[3], 600), "workspace 1 did not move up with the fingers"
+PY
+echo "ok   three-finger swipes drag the strip and settle, pull workspaces in up and down or sideways, and spring back"
+
 # Scenario 11: mlx-settings (its window at (24, 24); the categories in
-# its sidebar 28 pixels apart from y 44: General, Display, Sound, Apps,
-# Window management, Appearance, Language; on the Window management page the
-# hotkey rows 34 pixels apart from y 336, on the General page the
+# its sidebar 28 pixels apart from y 44: General, Network, Display, Sound,
+# Apps, Window management, Top bar, Appearance, Language; on the Window management page the
+# hotkey rows 34 pixels apart from y 436, on the General page the
 # terminal's at y 186). Maximize gets Super+Shift+M; minimize gets
 # Super+Up (the maximize hotkey: it must reach the window); the terminal
 # hotkey is cleared; then Super+Up minimizes.
@@ -394,11 +887,11 @@ echo "ok   a pointer lock holds the cursor and relative motion reaches the clien
 rm -f "$XDG_CONFIG_HOME/mlx/compositor.conf"
 cat > "$work/hotkeys.script" <<SCRIPT
 wait 2500
-pointer 124 194
+pointer 124 222
 press 272
 release 272
 wait 300
-pointer 524 375
+pointer 524 475
 press 272
 release 272
 wait 300
@@ -409,7 +902,7 @@ up 50
 up 42
 up 125
 wait 300
-pointer 524 409
+pointer 524 509
 press 272
 release 272
 wait 300
@@ -446,6 +939,101 @@ done
 grep -q "^minimize: Settings" "$work/hotkeys-compositor.log" || { echo "the recorded Super+Up did not minimize" >&2; cat "$work/hotkeys-compositor.log" >&2; exit 1; }
 rm -f "$conf"
 echo "ok   mlx-settings records hotkeys (the compositor's too) and the compositor uses them at once"
+
+# Scenario 11b: mlx-settings' Top bar page, opened by its argument (the
+# rows' middles 50 pixels apart from y 229: what plays, the tray, the sound,
+# the battery, the control centre, the clock; a row's up arrow at x 670).
+# The sound moves up a place, a click on the battery's row hides it.
+cat > "$work/topbar-page.sh" <<SCRIPT
+#!/bin/sh
+exec "$work/mlx-settings" topbar
+SCRIPT
+chmod +x "$work/topbar-page.sh"
+rm -f "$XDG_CONFIG_HOME/mlx/topbar.conf"
+cat > "$work/topbar-page.script" <<SCRIPT
+wait 2500
+pointer 670 329
+press 272
+release 272
+wait 600
+pointer 420 374
+press 272
+release 272
+wait 800
+close
+SCRIPT
+run_scenario topbar-page "$work/topbar-page.script" --no-fps --run "$work/topbar-page.sh"
+[[ "$(grep -v '^#' "$XDG_CONFIG_HOME/mlx/topbar.conf" 2> /dev/null | tr '\n' ' ')" == "media = on sound = on tray = on battery = off control = on clock = on " ]] || { echo "mlx-settings' Top bar page did not write the items as clicked" >&2; cat "$XDG_CONFIG_HOME/mlx/topbar.conf" "$work/topbar-page-compositor.log" >&2; exit 1; }
+rm -f "$XDG_CONFIG_HOME/mlx/topbar.conf"
+echo "ok   mlx-settings' Top bar page moves an item up and hides another (topbar.conf)"
+
+# Scenario 11c: the session lock. A terminal opens; 3 s in, a locker that
+# dies two seconds after locking without unlocking (session-lock-test
+# --die), 4 s later one that unlocks on Enter. What is typed while locked
+# must not reach the terminal; what is typed after must.
+"$compiler" --quiet tools/session-lock-test/main.mlx -o "$work/session-lock-test"
+cat > "$work/session-lock-run.sh" <<SCRIPT
+#!/bin/sh
+"$work/mlx-terminal" &
+sleep 3
+"$work/session-lock-test" --die
+sleep 4
+exec "$work/session-lock-test"
+SCRIPT
+chmod +x "$work/session-lock-run.sh"
+rm -f "$work/session-lock-typed.marker" "$work/session-lock-after.marker"
+cat > "$work/session-lock.script" <<SCRIPT
+wait 2500
+shot $work/session-lock-before.ppm
+wait 2600
+shot $work/session-lock-locked.ppm
+type touch $work/session-lock-typed.marker
+enter
+wait 2500
+shot $work/session-lock-dead.ppm
+pointer 300 300
+press 272
+release 272
+type touch $work/session-lock-typed.marker
+wait 4000
+shot $work/session-lock-again.ppm
+enter
+wait 800
+pointer 300 300
+press 272
+release 272
+type touch $work/session-lock-after.marker
+enter
+wait 800
+shot $work/session-lock-after.ppm
+close
+SCRIPT
+run_scenario session-lock "$work/session-lock.script" --no-fps --run "$work/session-lock-run.sh"
+log="$work/session-lock-compositor.log"
+for line in "^lock: locked$" "^lock: the locker went without unlocking; the session stays locked$" "^lock-test: unlocked$" "^lock: unlocked$"; do
+    grep -q "$line" "$log" || { echo "session lock: no \"$line\"" >&2; cat "$log" >&2; exit 1; }
+done
+[[ ! -e "$work/session-lock-typed.marker" ]] || { echo "session lock: keys typed while locked reached the terminal" >&2; exit 1; }
+[[ -e "$work/session-lock-after.marker" ]] || { echo "session lock: the terminal got no keys after unlocking" >&2; cat "$log" >&2; exit 1; }
+python3 - "$work" <<'PY' || { echo "session lock: the screen does not look right" >&2; exit 1; }
+import sys
+work = sys.argv[1]
+def load(name):
+    data = open(f"{work}/session-lock-{name}.ppm", 'rb').read()
+    _, size, _, pixels = data.split(b'\n', 3)
+    width, height = map(int, size.split())
+    return lambda x, y: tuple(pixels[(y * width + x) * 3:(y * width + x) * 3 + 3])
+def near(pixel, want, slack=12): return all(abs(a - b) <= slack for a, b in zip(pixel, want))
+before, locked, dead, again, after = (load(name) for name in ("before", "locked", "dead", "again", "after"))
+teal = (30, 110, 90)
+# Locked: the lock surface over everything (the terminal's corner too).
+assert near(locked(100, 100), teal) and near(locked(10, 10), teal) and near(locked(1000, 750), teal), (locked(100, 100), locked(10, 10))
+# The locker gone: no window, only the background (the same as beside
+# the terminal before).
+assert not near(before(100, 100), before(900, 100)) and near(dead(100, 100), before(900, 100)), (before(100, 100), dead(100, 100), before(900, 100))
+assert near(again(100, 100), teal) and near(after(100, 100), before(100, 100)), (again(100, 100), after(100, 100))
+PY
+echo "ok   the session lock: only the locker shows and gets the keys; a dead locker leaves it locked; the next one unlocks"
 
 # Scenario 12: screen and window capture (ext-image-copy-capture-v1 with
 # ext-image-capture-source-v1 and ext-foreign-toplevel-list-v1), with
@@ -529,6 +1117,55 @@ damage=$(grep "^frame 2: damage" "$work/capture.log" | sed 's/.* damage //')
 [[ -n "$damage" && "$damage" != "0,0 "* ]] || { echo "the second frame did not wait for a change, or carried full damage ($damage)" >&2; cat "$work/capture.log" >&2; exit 1; }
 echo "ok   screen and window capture (ext-image-copy-capture): PNGs agree, later frames wait for damage"
 
+# The same screen with the Vulkan renderer (lavapipe, when installed): the
+# capture reads the copy the renderer keeps in host memory while the
+# output is captured (never the output buffer itself: freestanding that is
+# video memory, which the CPU reads very slowly), and gets the CPU
+# renderer's pixels.
+lavapipe=/usr/share/vulkan/icd.d/lvp_icd.json
+if [[ $renderer == cpu && -f $lavapipe ]]; then
+    sed -e "s|capture-screen.png|capture-vulkan.png|; s|capture.log|capture-vulkan.log|g; s|capture-list.log|capture-vulkan-list.log|" "$work/capture.sh" > "$work/capture-vulkan.sh"
+    chmod +x "$work/capture-vulkan.sh"
+    VK_DRIVER_FILES=$lavapipe MLX_CANVAS=cpu run_scenario capture-vulkan "$work/capture.script" --no-fps --renderer vulkan --run "$work/mlx-settings" --run "$work/capture-vulkan.sh"
+    grep -q "^renderer: vulkan" "$work/capture-vulkan-compositor.log" && grep -q "^renderer: the output is captured: what frames change is copied into host memory$" "$work/capture-vulkan-compositor.log" \
+        || { echo "the Vulkan renderer kept no copy of the captured output in host memory" >&2; cat "$work/capture-vulkan-compositor.log" >&2; exit 1; }
+    [[ $(grep -c "^saved " "$work/capture-vulkan.log") -eq 3 ]] || { echo "mlx-capture did not save three captures with the Vulkan renderer" >&2; cat "$work/capture-vulkan.log" >&2; exit 1; }
+    python3 - "$work" <<'PY' || { echo "the Vulkan renderer's capture is not the CPU renderer's" >&2; exit 1; }
+import struct, sys, zlib
+def pixels(path):
+    data = open(path, 'rb').read()
+    at, idat = 8, b''
+    while at < len(data):
+        length, kind = struct.unpack('>I4s', data[at:at + 8])
+        if kind == b'IHDR': width, height = struct.unpack('>II', data[at + 8:at + 16])
+        if kind == b'IDAT': idat += data[at + 8:at + 8 + length]
+        at += 12 + length
+    return width, height, zlib.decompress(idat)
+def rows(path):
+    width, height, raw = pixels(path)
+    stride, out, previous = width * 3, [], bytearray(width * 3)
+    for y in range(height):
+        kind, line = raw[y * (stride + 1)], bytearray(raw[y * (stride + 1) + 1:(y + 1) * (stride + 1)])
+        for i in range(stride):
+            left = line[i - 3] if i >= 3 else 0
+            up, corner = previous[i], previous[i - 3] if i >= 3 else 0
+            if kind == 1: line[i] = (line[i] + left) & 255
+            elif kind == 2: line[i] = (line[i] + up) & 255
+            elif kind == 3: line[i] = (line[i] + (left + up) // 2) & 255
+            elif kind == 4:
+                p = left + up - corner
+                pa, pb, pc = abs(p - left), abs(p - up), abs(p - corner)
+                line[i] = (line[i] + (left if pa <= pb and pa <= pc else up if pb <= pc else corner)) & 255
+        out.append(bytes(line))
+        previous = line
+    return out
+cpu, vulkan = rows(sys.argv[1] + '/capture-screen.png'), rows(sys.argv[1] + '/capture-vulkan.png')
+different = sum(1 for a, b in zip(cpu, vulkan) for i in range(0, len(a), 3) if a[i:i + 3] != b[i:i + 3])
+assert len(cpu) == len(vulkan) and different == 0, different
+PY
+    echo "ok   with the Vulkan renderer the capture reads the renderer's copy in host memory and gets the same pixels"
+fi
+
 # Scenario 13: X programs through Xwayland (if Xwayland and xev are
 # installed): xev's window is paired with its wl_surface by the window
 # manager (projects/desktop/compositor/xwm.mlx), mapped with its title,
@@ -582,7 +1219,7 @@ export DBUS_SESSION_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/bus"
 rm -f "$XDG_CONFIG_HOME/mlx/compositor.conf"
 cat > "$work/pages.script" <<SCRIPT
 wait 2500
-pointer 124 138
+pointer 124 166
 press 272
 release 272
 wait 1200
@@ -598,7 +1235,7 @@ pointer 600 220
 wait 100
 release 272
 wait 600
-pointer 124 110
+pointer 124 138
 press 272
 release 272
 wait 800
@@ -629,13 +1266,88 @@ grep -q "night light 4000 K" "$work/pages-compositor.log" || { echo "the composi
 rm -f "$XDG_CONFIG_HOME/mlx/compositor.conf"
 echo "ok   mlx-settings' Sound page controls MLX Audio (output off, volume $((volume * 100 / 65536))%); the Display page reads the output and writes night light"
 
+# Scenario 14b: mlx-settings' Network page (the category at y 110) on a
+# system bus of its own (mlx-ipcd --address) with tools/network-test's
+# fakenetd in mlx-netd's place: a cable and a Wi-Fi card that sees four
+# networks (Zuhause at y 354 needs a passphrase). Zuhause is chosen, a
+# wrong passphrase is typed (refused: the field asks again, empty), then
+# the right one (joined), then Forget (at (374, 393)). The passphrase
+# reaches fakenetd only as its length.
+"$compiler" --quiet tools/network-test/fakenetd.mlx -o "$work/fakenetd"
+"$work/mlx-ipcd" --address "$XDG_RUNTIME_DIR/system" > "$work/system-ipc.log" 2>&1 &
+system_pid=$!
+for _ in $(seq 1 50); do [[ -S "$XDG_RUNTIME_DIR/system" ]] && break; sleep 0.1; done
+export DBUS_SYSTEM_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/system"
+
+# Scenario 14a: the Network page (opened by its argument) without mlx-netd,
+# first with fakenetd running as NetworkManager (the page knows it by its
+# process name; --as takes the name and answers nothing), then also as an
+# mlx-netd that does not answer. What the page finds goes to stderr
+# ("mlx-settings: network: ...").
+cat > "$work/network-page.sh" <<SCRIPT
+#!/bin/sh
+exec "$work/mlx-settings" network
+SCRIPT
+chmod +x "$work/network-page.sh"
+cat > "$work/no-netd.script" <<SCRIPT
+wait 2500
+close
+SCRIPT
+cp "$work/fakenetd" "$work/NetworkManager"
+"$work/NetworkManager" --as org.freedesktop.NetworkManager > "$work/fake-manager.log" 2>&1 &
+manager_pid=$!
+for _ in $(seq 1 50); do grep -q "^fakenetd: ready" "$work/fake-manager.log" && break; sleep 0.1; done
+run_scenario no-netd "$work/no-netd.script" --no-fps --run "$work/network-page.sh"
+"$work/fakenetd" --as org.mlx.Network > "$work/fake-silent.log" 2>&1 &
+silent_pid=$!
+for _ in $(seq 1 50); do grep -q "^fakenetd: ready" "$work/fake-silent.log" && break; sleep 0.1; done
+run_scenario silent-netd "$work/no-netd.script" --no-fps --run "$work/network-page.sh"
+kill "$manager_pid" "$silent_pid" 2> /dev/null || true
+wait "$manager_pid" "$silent_pid" 2> /dev/null || true
+grep -q "^mlx-settings: network: mlx-netd .*; NetworkManager runs the network; the kernel's links:" "$work/no-netd-compositor.log" && ! grep -q "^mlx-settings: network: mlx-netd is on the system bus" "$work/no-netd-compositor.log" || { echo "the Network page did not say that NetworkManager runs the network" >&2; cat "$work/no-netd-compositor.log" >&2; exit 1; }
+grep -q "^mlx-settings: network: mlx-netd is on the system bus but did not answer; NetworkManager runs the network" "$work/silent-netd-compositor.log" || { echo "the Network page did not say that mlx-netd does not answer" >&2; cat "$work/silent-netd-compositor.log" >&2; exit 1; }
+echo "ok   mlx-settings' Network page without mlx-netd says why (NetworkManager runs the network; mlx-netd does not answer) and lists the kernel's links"
+
+"$work/fakenetd" > "$work/fakenetd.log" 2>&1 &
+netd_pid=$!
+for _ in $(seq 1 50); do grep -q "^fakenetd: ready" "$work/fakenetd.log" && break; sleep 0.1; done
+cat > "$work/network.script" <<SCRIPT
+wait 2500
+pointer 124 110
+press 272
+release 272
+wait 1500
+pointer 400 354
+press 272
+release 272
+wait 800
+type wrong words
+enter
+wait 2000
+type correct horse battery
+enter
+wait 2500
+pointer 374 393
+press 272
+release 272
+wait 1500
+close
+SCRIPT
+run_scenario network "$work/network.script" --no-fps --run "$work/mlx-settings"
+kill "$netd_pid" "$system_pid" 2> /dev/null || true
+unset DBUS_SYSTEM_BUS_ADDRESS
+expected=$(printf 'fakenetd: ready\nconnect Zuhause (11 bytes)\nrefused Zuhause\nconnect Zuhause (21 bytes)\njoined Zuhause\nforget Zuhause')
+[[ "$(cat "$work/fakenetd.log")" == "$expected" ]] || { echo "mlx-settings' Network page did not join and forget Zuhause as asked" >&2; cat "$work/fakenetd.log" "$work/network-compositor.log" >&2; exit 1; }
+! grep -q "correct horse" "$work/fakenetd.log" "$work/network-compositor.log" || { echo "the passphrase was written out" >&2; exit 1; }
+echo "ok   mlx-settings' Network page joins a Wi-Fi network (a wrong passphrase is refused and asked again) and forgets it"
+
 # Scenario 15: the permission dialog (projects/desktop/permissions). A
 # sandboxed app (bwrap with a .flatpak-info) records; MLXIPC has to ask
 # (audio.record), starts mlx-permissions from its service file, and its
 # dialog opens on the compositor (at (24, 24); the question takes two
 # lines: "Remember this decision" at y 153, Allow at (422, 198)). Both are
 # clicked: the app records and ipc.conf keeps the answer. Then
-# mlx-settings' Apps page (the category at y 166) lists the app's
+# mlx-settings' Apps page (the category at y 194) lists the app's
 # microphone as allowed; Deny (at (662, 208)) is clicked: ipc.conf says
 # so.
 if command -v bwrap > /dev/null && bwrap --bind / / true 2> /dev/null; then
@@ -679,7 +1391,7 @@ SCRIPT
     echo "ok   the permission dialog asks the user; Allow with Remember lets the app record and becomes a rule"
     cat > "$work/apps.script" <<SCRIPT
 wait 2500
-pointer 124 166
+pointer 124 194
 press 272
 release 272
 wait 1000
@@ -758,13 +1470,30 @@ fi
 # Scenario 7: a GTK 4 application (GTK 4 needs wl_data_device_manager to
 # use a Wayland display at all), if available.
 if command -v gtk4-widget-factory > /dev/null && command -v dbus-run-session > /dev/null; then
+    # A session bus that activates no service: GTK still asks the portals
+    # (org.freedesktop.portal.Desktop) for its settings, and where they are
+    # installed but no desktop runs them, their activation can take longer
+    # than this scenario waits, or mount the document portal under
+    # XDG_RUNTIME_DIR; on this bus the name is unknown at once and GTK
+    # goes on without it.
+    cat > "$work/session.conf" <<'CONF'
+<!DOCTYPE busconfig PUBLIC "-//freedesktop//DTD D-Bus Bus Configuration 1.0//EN" "http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">
+<busconfig>
+  <type>session</type>
+  <listen>unix:tmpdir=/tmp</listen>
+  <policy context="default">
+    <allow send_destination="*" eavesdrop="true"/>
+    <allow eavesdrop="true"/>
+    <allow own="*"/>
+  </policy>
+</busconfig>
+CONF
     cat > "$work/gtk4.sh" <<SCRIPT
 #!/bin/sh
 unset DISPLAY
-# No portals: they would mount the document portal under XDG_RUNTIME_DIR.
-# No accessibility bus either: both can take seconds to start (or time out)
-# where the desktop's services are installed but not running.
-GDK_DEBUG=no-portals GTK_A11Y=none NO_AT_BRIDGE=1 exec dbus-run-session gtk4-widget-factory
+# No portals, no accessibility bus: both can take seconds to start (or
+# time out) where the desktop's services are installed but not running.
+GDK_DEBUG=no-portals GTK_A11Y=none NO_AT_BRIDGE=1 exec dbus-run-session --config-file="$work/session.conf" gtk4-widget-factory
 SCRIPT
     chmod +x "$work/gtk4.sh"
     printf 'wait 12000\nclose\n' > "$work/gtk4.script"

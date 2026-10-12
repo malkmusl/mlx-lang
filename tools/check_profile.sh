@@ -29,7 +29,7 @@ grep -q "% with calls, 0% itself: tests/support/profile_busy.mlx:14:work$" "$wor
 echo "ok   mlx-profile names spin, and work and main through it"
 
 profile=$(ls "$work"/state/mlx/profiles/busy-*.profile)
-head -1 "$profile" | grep -q "^profile	busy	[0-9]*	[0-9]*	2000$" || fail "the profile's header is wrong" "$profile"
+head -1 "$profile" | grep -q "^profile	busy	[0-9]*	[0-9]*	2000	processor$" || fail "the profile's header is wrong" "$profile"
 grep -q "^[0-9]*	[0-9]*	tests/support/profile_busy.mlx:4:spin$" "$profile" || fail "the profile does not list spin" "$profile"
 echo "ok   the profile is written"
 

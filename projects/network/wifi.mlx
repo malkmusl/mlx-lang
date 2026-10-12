@@ -1,0 +1,629 @@
+// A Wi-Fi card's station in mlx-netd: it scans (every 30 s while not
+// connected, every 2 min while it is, and when asked), joins the
+// strongest saved network in sight, runs the WPA2 handshake (wpa.mlx)
+// over the link's EAPOL socket, puts the keys into the card and opens the
+// port; then devices.mlx configures the link like a cable (DHCP or the
+// static settings). The saved networks live in one file only root reads
+// (saved()): each SSID with its PMK, never the passphrase.
+//
+// The steps report to devices.mlx with ACTION_*: READY (keys in, port
+// open), LOST (it is not connected any more), CHANGED (the list or the
+// state changed: the bus says so).
+const nl80211 = @import("./nl80211.mlx")
+const wpa = @import("./wpa.mlx")
+const system = @import("./system.mlx")
+
+pub const STATE_IDLE: u32 = 0
+pub const STATE_ASSOCIATING: u32 = 1
+pub const STATE_HANDSHAKE: u32 = 2
+pub const STATE_READY: u32 = 3
+
+pub const ACTION_NONE: u32 = 0
+pub const ACTION_READY: u32 = 1
+pub const ACTION_LOST: u32 = 2
+pub const ACTION_CHANGED: u32 = 3
+
+// Why the last attempt failed (the bus tells it).
+pub const PROBLEM_NONE: u32 = 0
+pub const PROBLEM_PASSPHRASE: u32 = 1
+pub const PROBLEM_UNSUPPORTED: u32 = 2
+pub const PROBLEM_FAILED: u32 = 3
+
+// What connectTo() answers.
+pub const CONNECT_STARTED: u32 = 0
+pub const CONNECT_NOT_FOUND: u32 = 1
+pub const CONNECT_UNSUPPORTED: u32 = 2
+pub const CONNECT_NEEDS_PASSPHRASE: u32 = 3
+pub const CONNECT_BAD_PASSPHRASE: u32 = 4
+pub const CONNECT_FAILED: u32 = 5
+
+const SCAN_IDLE: usize = 30000
+const SCAN_CONNECTED: usize = 120000
+const ASSOCIATE_MOST: usize = 15000
+const HANDSHAKE_MOST: usize = 10000
+const RETRY: usize = 5000
+const SAVED_MOST: usize = 32
+
+pub const Known = struct {
+    ssid: [32]u8
+    ssidLength: usize
+    pmk: [32]u8
+    open: bool
+    // The last attempt was refused for its passphrase: not joined by
+    // itself again until a new one is given.
+    refused: bool
+}
+
+pub const Saved = struct {
+    items: [32]Known
+    count: usize
+    path: [256]u8
+    pathLength: usize
+}
+
+pub const Station = struct {
+    state: u32
+    networks: nl80211.Networks
+    scanning: bool
+    scanAt: usize
+    // A scan finished; its results are read after the events.
+    resultsWaiting: bool
+    // The network joined, or being joined.
+    target: nl80211.Network
+    hasTarget: bool
+    pmk: [32]u8
+    // The PMK came with Connect: saved once the handshake proves it.
+    fresh: bool
+    element: [24]u8
+    elementLength: usize
+    eapol: isize
+    supplicant: wpa.Supplicant
+    since: usize
+    // Connect asked for another network while this one was up.
+    next: nl80211.Network
+    hasNext: bool
+    nextPmk: [32]u8
+    nextFresh: bool
+    problem: u32
+    problemSsid: [32]u8
+    problemLength: usize
+}
+
+// ---------------------------------------------------------------------------
+// Field access (an address inside a struct is reached through these)
+
+pub fn networksOf(station: *Station) -> *nl80211.Networks {
+    unsafe { return @ptrCast(*nl80211.Networks, &station.*.networks) }
+}
+
+pub fn targetOf(station: *Station) -> *nl80211.Network {
+    unsafe { return @ptrCast(*nl80211.Network, &station.*.target) }
+}
+
+fn nextOf(station: *Station) -> *nl80211.Network {
+    unsafe { return @ptrCast(*nl80211.Network, &station.*.next) }
+}
+
+fn supplicantOf(station: *Station) -> *wpa.Supplicant {
+    unsafe { return @ptrCast(*wpa.Supplicant, &station.*.supplicant) }
+}
+
+fn bytesAt(base: usize, offset: usize) -> [*]u8 {
+    var bytes: [*]u8 = undefined
+    unsafe { bytes = @ptrFromInt([*]u8, base + offset) }
+    return bytes
+}
+
+fn pmkOf(station: *Station) -> [*]u8 { return bytesAt(@intFromPtr(station), @offsetOf(Station, "pmk")) }
+
+fn nextPmkOf(station: *Station) -> [*]u8 { return bytesAt(@intFromPtr(station), @offsetOf(Station, "nextPmk")) }
+
+fn elementOf(station: *Station) -> [*]u8 { return bytesAt(@intFromPtr(station), @offsetOf(Station, "element")) }
+
+pub fn knownAt(saved: *Saved, slot: usize) -> *Known {
+    unsafe { return @ptrFromInt(*Known, @intFromPtr(saved) + @offsetOf(Saved, "items") + slot * @sizeOf(Known)) }
+}
+
+fn knownSsid(known: *Known) -> []const u8 {
+    return bytesAt(@intFromPtr(known), @offsetOf(Known, "ssid"))[0..known.*.ssidLength]
+}
+
+fn knownPmk(known: *Known) -> [*]u8 { return bytesAt(@intFromPtr(known), @offsetOf(Known, "pmk")) }
+
+fn savedPath(saved: *Saved) -> []const u8 {
+    return bytesAt(@intFromPtr(saved), @offsetOf(Saved, "path"))[0..saved.*.pathLength]
+}
+
+pub fn problemSsidOf(station: *Station) -> []const u8 {
+    return bytesAt(@intFromPtr(station), @offsetOf(Station, "problemSsid"))[0..station.*.problemLength]
+}
+
+fn copy(into: [*]u8, from: [*]const u8, length: usize) -> void {
+    var index: usize = 0
+    while index < length {
+        into[index] = from[index]
+        index += 1
+    }
+}
+
+fn copyText(into: [*]u8, from: []const u8) -> void {
+    var index: usize = 0
+    while index < from.length {
+        into[index] = from[index]
+        index += 1
+    }
+}
+
+fn wipe(into: [*]u8, length: usize) -> void {
+    var index: usize = 0
+    while index < length {
+        into[index] = 0
+        index += 1
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Saved networks: DIR/wifi, a line per network, "SSID-HEX PMK-HEX" or
+// "SSID-HEX open", mode 0600 in a folder of mode 0700.
+
+fn nibble(c: u8) -> u8 {
+    if c >= 48 && c <= 57 { return c - 48 }
+    if c >= 97 && c <= 102 { return c - 87 }
+    if c >= 65 && c <= 70 { return c - 55 }
+    return 255
+}
+
+// Hex into bytes; the count, or `capacity + 1` when it is not hex.
+fn unhex(text: []const u8, into: [*]u8, capacity: usize) -> usize {
+    if text.length % 2 != 0 || text.length / 2 > capacity { return capacity + 1 }
+    var index: usize = 0
+    while index < text.length / 2 {
+        const high = nibble(text[index * 2])
+        const low = nibble(text[index * 2 + 1])
+        if high == 255 || low == 255 { return capacity + 1 }
+        into[index] = (high << 4) | low
+        index += 1
+    }
+    return text.length / 2
+}
+
+fn putHex(out: [*]u8, at: usize, bytes: [*]const u8, length: usize) -> usize {
+    const digits = "0123456789abcdef"
+    var index: usize = 0
+    while index < length {
+        out[at + index * 2] = digits[@intCast(usize, bytes[index] >> 4)]
+        out[at + index * 2 + 1] = digits[@intCast(usize, bytes[index] & 15)]
+        index += 1
+    }
+    return at + length * 2
+}
+
+// Reads the saved networks of folder `folder`.
+pub fn loadSaved(saved: *Saved, folder: []const u8) -> void {
+    saved.*.count = 0
+    var length = system.put(bytesAt(@intFromPtr(saved), @offsetOf(Saved, "path")), 0, folder[0..(if folder.length > 240 { 240 } else { folder.length })])
+    length = system.put(bytesAt(@intFromPtr(saved), @offsetOf(Saved, "path")), length, "/wifi")
+    saved.*.pathLength = length
+    var text: [4096]u8 = undefined
+    var bytes: [*]u8 = undefined
+    unsafe { bytes = @ptrCast([*]u8, &text) }
+    const size = system.readFile(savedPath(saved), bytes, 4096)
+    var start: usize = 0
+    while start < size && saved.*.count < SAVED_MOST {
+        var end = start
+        while end < size && bytes[end] != 10 { end += 1 }
+        var space = start
+        while space < end && bytes[space] != 32 { space += 1 }
+        if space < end {
+            const known = knownAt(saved, saved.*.count)
+            const ssid_length = unhex(bytes[start..space], bytesAt(@intFromPtr(known), @offsetOf(Known, "ssid")), 32)
+            const rest = bytes[space + 1 .. end]
+            known.*.open = system.same(rest, "open")
+            known.*.refused = false
+            const pmk_length = if known.*.open { 32 } else { unhex(rest, knownPmk(known), 32) }
+            if ssid_length >= 1 && ssid_length <= 32 && pmk_length == 32 {
+                known.*.ssidLength = ssid_length
+                saved.*.count += 1
+            }
+        }
+        start = end + 1
+    }
+    wipe(bytes, 4096)
+}
+
+fn store(saved: *Saved) -> bool {
+    var text: [4096]u8 = undefined
+    var bytes: [*]u8 = undefined
+    unsafe { bytes = @ptrCast([*]u8, &text) }
+    var length: usize = 0
+    var slot: usize = 0
+    while slot < saved.*.count {
+        const known = knownAt(saved, slot)
+        length = putHex(bytes, length, bytesAt(@intFromPtr(known), @offsetOf(Known, "ssid")), known.*.ssidLength)
+        length = system.put(bytes, length, " ")
+        if known.*.open { length = system.put(bytes, length, "open") } else { length = putHex(bytes, length, knownPmk(known), 32) }
+        length = system.put(bytes, length, "\n")
+        slot += 1
+    }
+    // The folder (0700) first.
+    const path = savedPath(saved)
+    var folder_end = path.length
+    while folder_end > 0 && path[folder_end - 1] != 47 { folder_end -= 1 }
+    if folder_end > 1 { system.makeFolders(path[0 .. folder_end - 1], 448) }
+    const written = system.writeFileMode(path, bytes[0..length], 384)
+    wipe(bytes, 4096)
+    return written
+}
+
+pub fn findSaved(saved: *Saved, ssid: []const u8) -> usize {
+    var slot: usize = 0
+    while slot < saved.*.count {
+        if system.same(knownSsid(knownAt(saved, slot)), ssid) { return slot }
+        slot += 1
+    }
+    return SAVED_MOST
+}
+
+pub fn remember(saved: *Saved, ssid: []const u8, pmk: [*]const u8, open: bool) -> void {
+    var slot = findSaved(saved, ssid)
+    if slot == SAVED_MOST {
+        if saved.*.count >= SAVED_MOST { return }
+        slot = saved.*.count
+        saved.*.count += 1
+    }
+    const known = knownAt(saved, slot)
+    copyText(bytesAt(@intFromPtr(known), @offsetOf(Known, "ssid")), ssid)
+    known.*.ssidLength = ssid.length
+    known.*.open = open
+    known.*.refused = false
+    if open { wipe(knownPmk(known), 32) } else { copy(knownPmk(known), pmk, 32) }
+    const stored = store(saved)
+}
+
+// Forgets a network; false when it was not saved.
+pub fn forget(saved: *Saved, ssid: []const u8) -> bool {
+    const slot = findSaved(saved, ssid)
+    if slot == SAVED_MOST { return false }
+    var index = slot
+    while index + 1 < saved.*.count {
+        knownAt(saved, index).* = knownAt(saved, index + 1).*
+        index += 1
+    }
+    saved.*.count -= 1
+    wipe(knownPmk(knownAt(saved, saved.*.count)), 32)
+    const stored = store(saved)
+    return true
+}
+
+// ---------------------------------------------------------------------------
+// The station
+
+pub fn init(station: *Station) -> void {
+    station.*.state = STATE_IDLE
+    networksOf(station).*.count = 0
+    station.*.scanning = false
+    station.*.scanAt = 0
+    station.*.resultsWaiting = false
+    station.*.hasTarget = false
+    station.*.hasNext = false
+    station.*.fresh = false
+    station.*.eapol = -1
+    station.*.since = 0
+    station.*.problem = PROBLEM_NONE
+    station.*.problemLength = 0
+}
+
+pub fn ssidOf(station: *Station) -> []const u8 {
+    if !station.*.hasTarget || station.*.state == STATE_IDLE { return "" }
+    return nl80211.ssidOf(targetOf(station))
+}
+
+fn setProblem(station: *Station, problem: u32) -> void {
+    station.*.problem = problem
+    const ssid = nl80211.ssidOf(targetOf(station))
+    copyText(bytesAt(@intFromPtr(station), @offsetOf(Station, "problemSsid")), ssid)
+    station.*.problemLength = ssid.length
+}
+
+pub fn scan(wifi: *nl80211.Wifi, station: *Station, index: u32) -> void {
+    const result = nl80211.triggerScan(wifi, index)
+    // -16: one runs already; its results come all the same.
+    station.*.scanning = result == 0 || result == -16
+    station.*.scanAt = system.milliseconds() + (if station.*.state == STATE_READY { SCAN_CONNECTED } else { SCAN_IDLE })
+}
+
+// The best saved network in sight that was not refused (open or PSK).
+fn bestSaved(station: *Station, saved: *Saved) -> usize {
+    const networks = networksOf(station)
+    var best: usize = nl80211.NETWORKS
+    var slot: usize = 0
+    while slot < networks.*.count {
+        const network = nl80211.at(networks, slot)
+        const known_slot = findSaved(saved, nl80211.ssidOf(network))
+        if known_slot != SAVED_MOST && !knownAt(saved, known_slot).*.refused {
+            const known = knownAt(saved, known_slot)
+            const usable = (known.*.open && network.*.security == nl80211.SECURITY_OPEN) || (!known.*.open && network.*.security == nl80211.SECURITY_PSK)
+            if usable && (best == nl80211.NETWORKS || network.*.signal > nl80211.at(networks, best).*.signal) { best = slot }
+        }
+        slot += 1
+    }
+    return best
+}
+
+// Joins `network` with `pmk` (ignored when open).
+fn join(wifi: *nl80211.Wifi, station: *Station, index: u32, network: *nl80211.Network, pmk: [*]const u8, fresh: bool) -> bool {
+    targetOf(station).* = network.*
+    station.*.hasTarget = true
+    station.*.fresh = fresh
+    copy(pmkOf(station), pmk, 32)
+    station.*.elementLength = 0
+    if network.*.security == nl80211.SECURITY_PSK {
+        station.*.elementLength = wpa.ownElement(network.*.groupCipher, elementOf(station))
+        // The socket first: message 1 may follow the association at once.
+        if station.*.eapol < 0 { station.*.eapol = system.eapolOpen(index) }
+        if station.*.eapol < 0 {
+            setProblem(station, PROBLEM_FAILED)
+            return false
+        }
+    }
+    station.*.state = STATE_ASSOCIATING
+    station.*.since = system.milliseconds()
+    station.*.problem = PROBLEM_NONE
+    if nl80211.connect(wifi, index, targetOf(station), elementOf(station), station.*.elementLength) != 0 {
+        leave(station)
+        setProblem(station, PROBLEM_FAILED)
+        return false
+    }
+    return true
+}
+
+// Back to idle: the handshake's keys and socket dropped.
+fn leave(station: *Station) -> void {
+    station.*.state = STATE_IDLE
+    wpa.stop(supplicantOf(station))
+    system.close(station.*.eapol)
+    station.*.eapol = -1
+}
+
+// A scan finished: the list taken, a saved network joined if idle.
+pub fn scanned(wifi: *nl80211.Wifi, station: *Station, index: u32, saved: *Saved) -> u32 {
+    station.*.scanning = false
+    const taken = nl80211.results(wifi, index, networksOf(station))
+    if station.*.state == STATE_IDLE && !station.*.hasNext {
+        const best = bestSaved(station, saved)
+        if best != nl80211.NETWORKS {
+            const network = nl80211.at(networksOf(station), best)
+            const known = knownAt(saved, findSaved(saved, nl80211.ssidOf(network)))
+            const joined = join(wifi, station, index, network, knownPmk(known), false)
+        }
+    }
+    return ACTION_CHANGED
+}
+
+// What the user's Connect asks: `passphrase` may be empty for an open or
+// a saved network.
+pub fn connectTo(wifi: *nl80211.Wifi, station: *Station, index: u32, saved: *Saved, ssid: []const u8, passphrase: []const u8) -> u32 {
+    const networks = networksOf(station)
+    var slot: usize = 0
+    while slot < networks.*.count && !system.same(nl80211.ssidOf(nl80211.at(networks, slot)), ssid) { slot += 1 }
+    if slot == networks.*.count { return CONNECT_NOT_FOUND }
+    const network = nl80211.at(networks, slot)
+    if network.*.security != nl80211.SECURITY_OPEN && network.*.security != nl80211.SECURITY_PSK { return CONNECT_UNSUPPORTED }
+    var pmk: [32]u8 = undefined
+    var pmk_bytes: [*]u8 = undefined
+    unsafe { pmk_bytes = @ptrCast([*]u8, &pmk) }
+    wipe(pmk_bytes, 32)
+    var fresh = false
+    if network.*.security == nl80211.SECURITY_PSK {
+        if passphrase.length == 64 && unhex(passphrase, pmk_bytes, 32) == 32 {
+            fresh = true
+        } else if passphrase.length >= 8 && passphrase.length <= 63 {
+            wpa.pmkOf(passphrase, ssid, pmk_bytes)
+            fresh = true
+        } else if passphrase.length > 0 {
+            return CONNECT_BAD_PASSPHRASE
+        } else {
+            const known_slot = findSaved(saved, ssid)
+            if known_slot == SAVED_MOST || knownAt(saved, known_slot).*.open { return CONNECT_NEEDS_PASSPHRASE }
+            copy(pmk_bytes, knownPmk(knownAt(saved, known_slot)), 32)
+        }
+    } else {
+        fresh = findSaved(saved, ssid) == SAVED_MOST
+    }
+    if station.*.state != STATE_IDLE {
+        // The current one goes first; its DISCONNECT event joins this one.
+        nextOf(station).* = network.*
+        copy(nextPmkOf(station), pmk_bytes, 32)
+        station.*.nextFresh = fresh
+        station.*.hasNext = true
+        wipe(pmk_bytes, 32)
+        const left = nl80211.disconnect(wifi, index)
+        if left != 0 {
+            leave(station)
+            return joinNext(wifi, station, index)
+        }
+        return CONNECT_STARTED
+    }
+    const joined = join(wifi, station, index, network, pmk_bytes, fresh)
+    wipe(pmk_bytes, 32)
+    return if joined { CONNECT_STARTED } else { CONNECT_FAILED }
+}
+
+fn joinNext(wifi: *nl80211.Wifi, station: *Station, index: u32) -> u32 {
+    station.*.hasNext = false
+    const joined = join(wifi, station, index, nextOf(station), nextPmkOf(station), station.*.nextFresh)
+    wipe(nextPmkOf(station), 32)
+    return if joined { CONNECT_STARTED } else { CONNECT_FAILED }
+}
+
+// The user's Disconnect (or Down): leaves the network, joins nothing by
+// itself until asked or until the next start.
+pub fn disconnect(wifi: *nl80211.Wifi, station: *Station, index: u32) -> u32 {
+    station.*.hasNext = false
+    if station.*.state == STATE_IDLE { return ACTION_NONE }
+    const was_ready = station.*.state == STATE_READY
+    const left = nl80211.disconnect(wifi, index)
+    leave(station)
+    station.*.hasTarget = false
+    return if was_ready { ACTION_LOST } else { ACTION_CHANGED }
+}
+
+// The card's CONNECT and DISCONNECT events.
+pub fn event(wifi: *nl80211.Wifi, station: *Station, index: u32, own: [*]const u8, saved: *Saved, happened: *nl80211.Event) -> u32 {
+    if happened.*.kind == nl80211.EVENT_CONNECTED && station.*.state == STATE_ASSOCIATING {
+        const target = targetOf(station)
+        if target.*.security == nl80211.SECURITY_OPEN {
+            station.*.state = STATE_READY
+            if station.*.fresh {
+                remember(saved, nl80211.ssidOf(target), pmkOf(station), true)
+                station.*.fresh = false
+            }
+            return ACTION_READY
+        }
+        wpa.start(supplicantOf(station), pmkOf(station), own, nl80211.bssidOf(target), elementOf(station), station.*.elementLength, nl80211.rsnOf(target), target.*.rsnLength)
+        station.*.state = STATE_HANDSHAKE
+        station.*.since = system.milliseconds()
+        return ACTION_CHANGED
+    }
+    if happened.*.kind == nl80211.EVENT_CONNECT_FAILED && station.*.state == STATE_ASSOCIATING {
+        leave(station)
+        setProblem(station, PROBLEM_FAILED)
+        if station.*.hasNext { const next = joinNext(wifi, station, index) }
+        return ACTION_CHANGED
+    }
+    if happened.*.kind == nl80211.EVENT_DISCONNECTED {
+        const was = station.*.state
+        // 15: the 4-way handshake timed out, 2: authentication no longer
+        // valid, 23: 802.1X authentication failed: what a wrong
+        // passphrase looks like from here.
+        if was == STATE_HANDSHAKE && (happened.*.reason == 15 || happened.*.reason == 2 || happened.*.reason == 23) { refuse(station, saved) }
+        leave(station)
+        if station.*.hasNext {
+            const next = joinNext(wifi, station, index)
+        } else {
+            // Try again soon (a saved network, or a better one).
+            station.*.scanAt = system.milliseconds() + RETRY
+        }
+        return if was == STATE_READY { ACTION_LOST } else { ACTION_CHANGED }
+    }
+    return ACTION_NONE
+}
+
+// The passphrase did not work: the network is not joined by itself again.
+fn refuse(station: *Station, saved: *Saved) -> void {
+    setProblem(station, PROBLEM_PASSPHRASE)
+    const slot = findSaved(saved, nl80211.ssidOf(targetOf(station)))
+    if slot != SAVED_MOST && !station.*.fresh { knownAt(saved, slot).*.refused = true }
+}
+
+pub fn descriptor(station: *Station) -> isize { return station.*.eapol }
+
+// What the EAPOL socket brought: the handshake's messages.
+pub fn eapolReadable(wifi: *nl80211.Wifi, station: *Station, index: u32, saved: *Saved) -> u32 {
+    var frame: [600]u8 = undefined
+    var answer: [512]u8 = undefined
+    var from: [6]u8 = undefined
+    var frame_bytes: [*]u8 = undefined
+    var answer_bytes: [*]u8 = undefined
+    var from_bytes: [*]u8 = undefined
+    unsafe {
+        frame_bytes = @ptrCast([*]u8, &frame)
+        answer_bytes = @ptrCast([*]u8, &answer)
+        from_bytes = @ptrCast([*]u8, &from)
+    }
+    var action = ACTION_NONE
+    const target = targetOf(station)
+    const supplicant = supplicantOf(station)
+    while station.*.eapol >= 0 {
+        const count = system.eapolReceive(station.*.eapol, frame_bytes, 600, from_bytes)
+        if count <= 0 { break }
+        if station.*.state != STATE_HANDSHAKE && station.*.state != STATE_READY { continue }
+        var index_byte: usize = 0
+        var known = true
+        while index_byte < 6 {
+            if from[index_byte] != target.*.bssid[index_byte] { known = false }
+            index_byte += 1
+        }
+        if !known { continue }
+        const length = wpa.receive(supplicant, frame_bytes, @intCast(usize, count), answer_bytes)
+        if length > 0 { const sent = system.eapolSend(station.*.eapol, index, nl80211.bssidOf(target), answer_bytes, length) }
+        wipe(answer_bytes, 512)
+        if supplicant.*.installPairwise {
+            supplicant.*.installPairwise = false
+            const pairwise = nl80211.newKey(wifi, index, wpa.temporalKey(supplicant), wpa.TK_LENGTH, 0, nl80211.CIPHER_CCMP, true, nl80211.bssidOf(target), wpa.rscBytes(supplicant))
+            if pairwise != 0 { system.say("netd: the pairwise key could not be installed\n") }
+        }
+        if supplicant.*.installGroup {
+            supplicant.*.installGroup = false
+            const cipher = if target.*.groupCipher == 2 { nl80211.CIPHER_TKIP } else { nl80211.CIPHER_CCMP }
+            const group = nl80211.newKey(wifi, index, wpa.gtkBytes(supplicant), supplicant.*.gtkLength, @intCast(u8, supplicant.*.gtkIndex), cipher, false, nl80211.bssidOf(target), wpa.rscBytes(supplicant))
+            if group != 0 { system.say("netd: the group key could not be installed\n") }
+            if station.*.state == STATE_HANDSHAKE {
+                const opened = nl80211.authorize(wifi, index, nl80211.bssidOf(target))
+                station.*.state = STATE_READY
+                station.*.problem = PROBLEM_NONE
+                if station.*.fresh {
+                    remember(saved, nl80211.ssidOf(target), pmkOf(station), false)
+                    station.*.fresh = false
+                }
+                station.*.scanAt = system.milliseconds() + SCAN_CONNECTED
+                action = ACTION_READY
+            }
+        }
+        if supplicant.*.failure != wpa.FAILURE_NONE {
+            supplicant.*.failure = wpa.FAILURE_NONE
+            setProblem(station, PROBLEM_FAILED)
+            const left = disconnect(wifi, station, index)
+            return ACTION_CHANGED
+        }
+        if supplicant.*.unanswered >= 3 && station.*.state == STATE_HANDSHAKE {
+            refuse(station, saved)
+            const left = disconnect(wifi, station, index)
+            return ACTION_CHANGED
+        }
+    }
+    return action
+}
+
+// The timers: a scan due, an association or a handshake taking too long.
+pub fn tick(wifi: *nl80211.Wifi, station: *Station, index: u32, saved: *Saved) -> u32 {
+    const now = system.milliseconds()
+    if station.*.state == STATE_ASSOCIATING && now - station.*.since > ASSOCIATE_MOST {
+        const left = nl80211.disconnect(wifi, index)
+        leave(station)
+        setProblem(station, PROBLEM_FAILED)
+        station.*.scanAt = now + RETRY
+        return ACTION_CHANGED
+    }
+    if station.*.state == STATE_HANDSHAKE && now - station.*.since > HANDSHAKE_MOST {
+        if supplicantOf(station).*.unanswered > 0 { refuse(station, saved) } else { setProblem(station, PROBLEM_FAILED) }
+        const left = nl80211.disconnect(wifi, index)
+        leave(station)
+        station.*.scanAt = now + RETRY
+        return ACTION_CHANGED
+    }
+    if !station.*.scanning && now >= station.*.scanAt { scan(wifi, station, index) }
+    return ACTION_NONE
+}
+
+// Milliseconds until tick() has something to do (at most `longest`).
+pub fn due(station: *Station, longest: usize) -> usize {
+    const now = system.milliseconds()
+    var next = longest
+    if !station.*.scanning {
+        const wait = if station.*.scanAt > now { station.*.scanAt - now } else { 0 }
+        if wait < next { next = wait }
+    }
+    if station.*.state == STATE_ASSOCIATING || station.*.state == STATE_HANDSHAKE {
+        if 1000 < next { next = 1000 }
+    }
+    return next
+}
+
+pub fn securityName(security: u32) -> []const u8 {
+    return match security { 0 => "open", 1 => "wpa2", 2 => "wpa3", 3 => "enterprise", else => "old" }
+}
+
+pub fn problemName(problem: u32) -> []const u8 {
+    return match problem { 0 => "", 1 => "passphrase", 2 => "unsupported", else => "failed" }
+}

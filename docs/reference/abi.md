@@ -188,6 +188,18 @@ none) and an optional slice was one word, so its length was lost on the way
 generated Wayland requests (`wl_data_offer.accept`) are such optional
 slices.
 
+A local of several words (a slice, an optional slice, an error union)
+normally lives in one frame slot per word, which the optimizer forwards
+and promotes to registers. When the module takes the local's address
+(`&value`), its words share one block of the frame, pointer first and
+length 8 bytes after it, so a store through that address (`into.* = text`
+in a callee, `pointer.* = text` through a local pointer) changes every
+word the local reads back; and `pointer.*` of a pointer to such a type
+loads every word, so `into.*.length` is the length. Before, the words
+were kept apart and the store reached the pointer alone, while the load
+took one word (`tests/303_slice_address_runtime.mlx`, run by
+`tests/run_literals.sh`).
+
 ## Aggregate (struct/array) argument and return classification
 
 `AggregateClassification` in `mlxcc-x86_64.xml` fixes the size threshold:
@@ -310,6 +322,12 @@ fn triple() -> (u64, u64, u64) {
 ```
 
 (`tests/117_multi_return_memory_runtime.mlx`)
+
+The self-hosted compiler returns a tuple between Mlx functions in
+registers instead, a word per register (`rax`, `rdx`, `rcx`, `r8`, `r9`,
+`r10`, `r11`, `rsi`, `rdi`; `x0` to `x7` on aarch64), so a tuple holding a
+slice and two integers comes back whole
+(`tests/311_wide_tuple_runtime.mlx`). Exported functions keep the C ABI.
 
 ## Error unions (`!T`) across the call boundary
 

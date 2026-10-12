@@ -8,7 +8,8 @@ projects/.../main.mlx -o ...`) and is checked by a script under `tools/`.
   - [`compositor/`](desktop/compositor/README.md): the Wayland compositor
     (nested or on DRM/KMS, CPU or Vulkan composition, hot-reloadable
     shell and renderer); `tools/check_wayland_compositor.sh`,
-    `tools/check_compositor_drm.sh`, `tools/check_compositor_modules.sh`.
+    `tools/check_compositor_drm.sh`, `tools/check_compositor_device.sh`,
+    `tools/check_compositor_modules.sh`.
   - `dock/`, `launcher/`, `topbar/`, `settings/`, `files/`: the desktop's
     clients (the dock, the application launcher, the top bar, the
     settings and the file manager); `tools/check_desktop_clients.sh`.
@@ -16,6 +17,11 @@ projects/.../main.mlx -o ...`) and is checked by a script under `tools/`.
   - [`terminal/`](desktop/terminal/README.md): the terminal emulator, a
     window around `std.terminal` and `std.ui.terminal`;
     `tools/check_terminal.sh`.
+  - [`splash/`](desktop/splash/README.md): mlx-splash, the boot splash
+    in place of Plymouth (the MLX letters with orbiting rings and the
+    Observatory's code graph, on KMS or the framebuffer, Plymouth's
+    protocol for systemd) and mlx-splashctl; `tools/install_splash.sh`;
+    `tools/check_splash.sh`.
   - `shared/`: what the desktop's clients share: the drawing canvas (CPU
     and GPU), the layer-shell and window surface (`panel.mlx`), keyboard
     text, desktop entries and icons, places and the trash, thumbnails,
@@ -38,6 +44,15 @@ projects/.../main.mlx -o ...`) and is checked by a script under `tools/`.
 - [`shell/`](shell/README.md): mlx-sh, the POSIX shell of MLX/Linux with
   a line editor (scripts as dash runs them, the shell of mlx-terminal and
   mlx-console); `tools/check_shell.sh`.
+- [`console/`](console/README.md): mlx-console, the terminal on the Linux
+  console without a compositor (framebuffer, evdev keyboards through the
+  xkb keymap, the shell on a pty); `tools/check_console.sh`.
+- [`network/`](network/README.md): mlx-netd, the network daemon in place
+  of NetworkManager (links through route netlink, DHCPv4, static
+  settings, routes by metric, resolv.conf, Wi-Fi through nl80211 with its
+  own WPA2 supplicant, MLXIPC's system bus) and mlx-net; the top bar's network
+  list and mlx-settings' Network page ask it; `tools/install_network.sh`;
+  `tools/check_network.sh`, `tools/check_wifi.sh`.
 
 What the projects share beyond one project lives in `std` (`std.gpu`,
 `std.crash`, `std.timezone`, `std.ui`, `std.png`, `std.truetype`, ...).

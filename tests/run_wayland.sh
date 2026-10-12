@@ -17,7 +17,7 @@ if [[ -z "$compiler" ]]; then
     done
 fi
 if [[ -z "$compiler" || ! -x "$compiler" ]]; then
-    echo "run_wayland.sh: no Mlx compiler found (build mlx1 with 'zig build mlx1')" >&2
+    echo "run_wayland.sh: no Mlx compiler found (./mlx makes one)" >&2
     exit 1
 fi
 

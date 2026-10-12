@@ -45,6 +45,8 @@ const T_IONUMBER: u8 = 20
 const T_ANDGREAT: u8 = 21
 
 const MAX_HEREDOCS: usize = 16
+// Aliases inside aliases: how deep.
+const MAX_ALIAS_DEPTH: usize = 4
 
 pub const Parser = struct {
     shell: *Shell
@@ -60,9 +62,23 @@ pub const Parser = struct {
     // A word with quotes or escapes cannot be a reserved word.
     plain: bool
     peeked: bool
+    // Where the last token taken ended (for the source span of a command).
+    lastEnd: usize
     // Heredoc redirections waiting for their bodies (after the newline).
     heredocs: [MAX_HEREDOCS]u32
     heredocCount: usize
+    // Alias substitution: the text of an alias is lexed in place of its
+    // name, and the source it interrupted waits here (its offset in the
+    // text arena, its length, where lexing stopped, which alias, and
+    // whether the value ended with a blank, which makes the next word a
+    // candidate for an alias too).
+    sourceDepth: usize
+    savedBase: [MAX_ALIAS_DEPTH]u32
+    savedLength: [MAX_ALIAS_DEPTH]u32
+    savedAt: [MAX_ALIAS_DEPTH]u32
+    savedAlias: [MAX_ALIAS_DEPTH]u32
+    savedChain: [MAX_ALIAS_DEPTH]bool
+    aliasChain: bool
     status: u8
     message: []const u8
     errorAt: usize
@@ -340,6 +356,12 @@ fn lex(parser: *Parser) -> void {
     parser.*.start = index
     parser.*.plain = false
     if index >= text.length {
+        if parser.*.sourceDepth > 0 {
+            // The alias text is done: back to the source it stood in.
+            popSource(parser)
+            lex(parser)
+            return
+        }
         parser.*.kind = T_EOF
         parser.*.end = index
         parser.*.at = index
@@ -449,7 +471,71 @@ fn current(parser: *Parser) -> u8 {
 
 fn advance(parser: *Parser) -> void {
     const seen = current(parser)
+    parser.*.lastEnd = parser.*.base + parser.*.end
     parser.*.peeked = false
+}
+
+// The source span from `start` (an offset in the text arena) to the end
+// of the last token taken, kept on `node` (a command's text, for jobs).
+fn markSpan(parser: *Parser, node: u32, start: usize) -> void {
+    if node == 0 { return }
+    const record = state.nodeAt(parser.*.shell, node)
+    record.*.text = @intCast(u32, start)
+    record.*.length = if parser.*.lastEnd > start { @intCast(u32, parser.*.lastEnd - start) } else { 0 }
+}
+
+// ---------------------------------------------------------------------------
+// Aliases
+
+// Lexes the value of alias `slot` in place of the current word (the
+// alias's name): the current source waits until the value is used up.
+fn pushSource(parser: *Parser, slot: usize) -> bool {
+    const shell = parser.*.shell
+    if parser.*.sourceDepth >= MAX_ALIAS_DEPTH { return false }
+    const value = state.aliasValue(shell, state.aliasAt(shell, slot))
+    const at = state.appendText(shell, value)
+    if at == state.TEXT_CAPACITY { return false }
+    const depth = parser.*.sourceDepth
+    parser.*.savedBase[depth] = @intCast(u32, parser.*.base)
+    parser.*.savedLength[depth] = @intCast(u32, parser.*.text.length)
+    parser.*.savedAt[depth] = @intCast(u32, parser.*.at)
+    parser.*.savedAlias[depth] = @intCast(u32, slot)
+    parser.*.savedChain[depth] = value.length > 0 && blank(value[value.length - 1])
+    parser.*.sourceDepth = depth + 1
+    parser.*.text = state.textOf(shell, @intCast(u32, at), @intCast(u32, value.length))
+    parser.*.base = at
+    parser.*.at = 0
+    parser.*.peeked = false
+    return true
+}
+
+fn popSource(parser: *Parser) -> void {
+    const depth = parser.*.sourceDepth - 1
+    parser.*.sourceDepth = depth
+    parser.*.text = state.textOf(parser.*.shell, parser.*.savedBase[depth], parser.*.savedLength[depth])
+    parser.*.base = @intCast(usize, parser.*.savedBase[depth])
+    parser.*.at = @intCast(usize, parser.*.savedAt[depth])
+    parser.*.aliasChain = parser.*.savedChain[depth]
+}
+
+// Whether an alias with this slot is being lexed already (its own name
+// inside its value stands for the command, not the alias again).
+fn aliasActive(parser: *Parser, slot: usize) -> bool {
+    var depth: usize = 0
+    while depth < parser.*.sourceDepth {
+        if @intCast(usize, parser.*.savedAlias[depth]) == slot { return true }
+        depth += 1
+    }
+    return false
+}
+
+// The current word is in command position: when it names an alias, its
+// value takes its place and true comes back (the caller lexes again).
+fn tryAlias(parser: *Parser) -> bool {
+    if current(parser) != T_WORD || !parser.*.plain { return false }
+    const slot = state.findAlias(parser.*.shell, tokenText(parser))
+    if slot == state.MAX_ALIASES || aliasActive(parser, slot) { return false }
+    return pushSource(parser, slot)
 }
 
 fn isReserved(parser: *Parser, word: []const u8) -> bool {
@@ -576,6 +662,8 @@ fn parseSimple(parser: *Parser) -> u32 {
         fail(parser, "too many nodes")
         return 0
     }
+    const first = current(parser)
+    const span_start = parser.*.base + parser.*.start
     var seen_command = false
     var any = false
     var going = true
@@ -589,6 +677,11 @@ fn parseSimple(parser: *Parser) -> u32 {
             if any && parser.*.plain && isReservedWord(tokenText(parser)) && !seen_command {
                 going = false
             } else {
+                // The command word (or the word after an alias whose value
+                // ended with a blank) may be an alias.
+                const chain = parser.*.aliasChain
+                parser.*.aliasChain = false
+                if (!seen_command || chain) && parser.*.plain && !isAssignment(tokenText(parser)) && tryAlias(parser) { continue }
                 const word = wordNode(parser)
                 if word == 0 { return 0 }
                 if !seen_command && isAssignment(tokenText(parser)) {
@@ -604,6 +697,7 @@ fn parseSimple(parser: *Parser) -> u32 {
             going = false
         }
     }
+    markSpan(parser, node, span_start)
     return node
 }
 
@@ -844,6 +938,10 @@ fn parseCommand(parser: *Parser) -> u32 {
     const shell = parser.*.shell
     const kind = current(parser)
     if kind == T_LPAREN { return parseGroup(parser, true) }
+    if kind == T_WORD && parser.*.plain && !isReservedWord(tokenText(parser)) && tryAlias(parser) {
+        parser.*.aliasChain = false
+        return parseCommand(parser)
+    }
     if kind == T_WORD && parser.*.plain {
         const word = tokenText(parser)
         if std.text.same(word, "{") { return parseGroup(parser, false) }
@@ -940,6 +1038,8 @@ fn parsePipeline(parser: *Parser) -> u32 {
         fail(parser, "too many nodes")
         return 0
     }
+    const first = current(parser)
+    const span_start = parser.*.base + parser.*.start
     if isReserved(parser, "!") {
         state.nodeAt(shell, node).*.flags |= state.NEGATED
         advance(parser)
@@ -951,6 +1051,7 @@ fn parsePipeline(parser: *Parser) -> u32 {
             if state.nodeAt(shell, node).*.first == 0 {
                 if kind == T_EOF { incomplete(parser) } else { fail(parser, "a command was expected") }
             }
+            markSpan(parser, node, span_start)
             return node
         }
         const command = parseCommand(parser)
@@ -963,6 +1064,7 @@ fn parsePipeline(parser: *Parser) -> u32 {
             going = false
         }
     }
+    markSpan(parser, node, span_start)
     return node
 }
 
@@ -974,6 +1076,8 @@ fn parseAndOr(parser: *Parser) -> u32 {
         fail(parser, "too many nodes")
         return 0
     }
+    const first = current(parser)
+    const span_start = parser.*.base + parser.*.start
     var operator: u8 = 0
     var going = true
     while going && parser.*.status == OK {
@@ -990,42 +1094,68 @@ fn parseAndOr(parser: *Parser) -> u32 {
             going = false
         }
     }
+    markSpan(parser, node, span_start)
     return node
 }
 
-// The whole input: a LIST node, or 0 with the status set.
-pub fn parse(parser: *Parser, shell: *Shell, text: []const u8, base: usize) -> u32 {
+// Ready to parse `text` (a slice of the shell's text arena starting at
+// `base` there) item by item with parseItem.
+pub fn begin(parser: *Parser, shell: *Shell, text: []const u8, base: usize) -> void {
     parser.*.shell = shell
     parser.*.text = text
     parser.*.base = base
     parser.*.at = 0
     parser.*.peeked = false
+    parser.*.lastEnd = base
     parser.*.heredocCount = 0
+    parser.*.sourceDepth = 0
+    parser.*.aliasChain = false
     parser.*.status = OK
     parser.*.message = ""
     parser.*.errorAt = 0
+}
+
+// The next item of the input (an and-or list, BACKGROUND when `&`
+// followed it), or 0 at the end or on an error (the status says which).
+// Running each item before parsing the next, as dash does, lets an
+// `alias` apply to the lines after it.
+pub fn parseItem(parser: *Parser) -> u32 {
+    const shell = parser.*.shell
+    skipNewlines(parser)
+    if parser.*.status != OK { return 0 }
+    if current(parser) == T_EOF {
+        // An unfinished heredoc at the end of the input.
+        if parser.*.heredocCount > 0 { incomplete(parser) }
+        return 0
+    }
+    const item = parseAndOr(parser)
+    if item == 0 || parser.*.status != OK { return 0 }
+    const separator = current(parser)
+    if separator == T_AMP {
+        state.nodeAt(shell, item).*.flags |= state.BACKGROUND
+        advance(parser)
+    } else if separator == T_SEMI || separator == T_NEWLINE {
+        advance(parser)
+    } else if separator != T_EOF {
+        fail(parser, "unexpected token")
+        return 0
+    }
+    return item
+}
+
+// The whole input: a LIST node, or 0 with the status set.
+pub fn parse(parser: *Parser, shell: *Shell, text: []const u8, base: usize) -> u32 {
+    begin(parser, shell, text, base)
     const list = state.newNode(shell, state.LIST)
     if list == 0 {
         fail(parser, "too many nodes")
         return 0
     }
-    skipNewlines(parser)
-    while current(parser) != T_EOF && parser.*.status == OK {
-        const item = parseAndOr(parser)
-        if item == 0 { break }
+    var item = parseItem(parser)
+    while item != 0 {
         state.addChild(shell, list, item)
-        const separator = current(parser)
-        if separator == T_AMP {
-            state.nodeAt(shell, item).*.flags |= state.BACKGROUND
-            advance(parser)
-        } else if separator == T_SEMI || separator == T_NEWLINE {
-            advance(parser)
-        } else if separator != T_EOF {
-            fail(parser, "unexpected token")
-        }
-        skipNewlines(parser)
+        item = parseItem(parser)
     }
-    // An unfinished heredoc at the end of the input.
     if parser.*.status == OK && parser.*.heredocCount > 0 { incomplete(parser) }
     return list
 }

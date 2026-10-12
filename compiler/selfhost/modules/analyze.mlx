@@ -108,57 +108,159 @@ pub fn prepare(loader: *Loader, types: *TypeStore, symbols: *SymbolStore) -> usi
     return errors
 }
 
-fn dependenciesReady(loader: *Loader, module_id: usize, analyzed: [*]u8) -> bool {
+// The imports among the modules as lists: for each module the modules it
+// imports (`out`) and those importing it (`in`), one entry per import, so
+// the walks below take each import once instead of looking through all
+// of them for every module.
+const Graph = struct {
+    outStart: [*]usize
+    outTargets: [*]usize
+    inStart: [*]usize
+    inOwners: [*]usize
+    edges: usize
+}
+
+fn words(allocator: loader_module.Allocator, count: usize) -> [*]usize {
+    var result: [*]usize = undefined
+    unsafe { result = @ptrCast([*]usize, allocator.alloc(count * 8 + 8, 8).?) }
+    var index: usize = 0
+    while index <= count {
+        result[index] = 0
+        index += 1
+    }
+    return result
+}
+
+fn freeWords(allocator: loader_module.Allocator, memory: [*]usize, count: usize) -> void {
+    unsafe { allocator.free(@ptrCast([*]u8, memory), count * 8 + 8, 8) }
+}
+
+fn buildGraph(loader: *Loader, count: usize, graph: *Graph) -> void {
+    const allocator: loader_module.Allocator = loader_module.Loader.allocatorFor(loader)
+    graph.*.outStart = words(allocator, count + 1)
+    graph.*.inStart = words(allocator, count + 1)
+    var edges: usize = 0
     var import_index: usize = 0
     while import_index < loader.*.store.*.importLength {
         const edge = store_module.Store.importAt(loader.*.store, import_index)
-        if edge.*.owner == module_id && edge.*.target < loader_module.Loader.moduleCount(loader) {
-            const dependency = loader_module.Loader.moduleAt(loader, edge.*.target)
-            if dependency.*.state == model.State.loaded && dependency.*.sourceAddress != 0 && analyzed[edge.*.target] == 0 { return false }
+        if edge.*.owner < count && edge.*.target < count {
+            graph.*.outStart[edge.*.owner + 1] += 1
+            graph.*.inStart[edge.*.target + 1] += 1
+            edges += 1
         }
         import_index += 1
     }
+    var module_index: usize = 0
+    while module_index < count {
+        graph.*.outStart[module_index + 1] += graph.*.outStart[module_index]
+        graph.*.inStart[module_index + 1] += graph.*.inStart[module_index]
+        module_index += 1
+    }
+    graph.*.edges = edges
+    graph.*.outTargets = words(allocator, edges)
+    graph.*.inOwners = words(allocator, edges)
+    const out_fill = words(allocator, count)
+    const in_fill = words(allocator, count)
+    // In the order of the imports, as the walks over them went.
+    import_index = 0
+    while import_index < loader.*.store.*.importLength {
+        const edge = store_module.Store.importAt(loader.*.store, import_index)
+        if edge.*.owner < count && edge.*.target < count {
+            graph.*.outTargets[graph.*.outStart[edge.*.owner] + out_fill[edge.*.owner]] = edge.*.target
+            out_fill[edge.*.owner] += 1
+            graph.*.inOwners[graph.*.inStart[edge.*.target] + in_fill[edge.*.target]] = edge.*.owner
+            in_fill[edge.*.target] += 1
+        }
+        import_index += 1
+    }
+    freeWords(allocator, out_fill, count)
+    freeWords(allocator, in_fill, count)
+}
+
+fn freeGraph(loader: *Loader, count: usize, graph: *Graph) -> void {
+    const allocator: loader_module.Allocator = loader_module.Loader.allocatorFor(loader)
+    freeWords(allocator, graph.*.outStart, count + 1)
+    freeWords(allocator, graph.*.inStart, count + 1)
+    freeWords(allocator, graph.*.outTargets, graph.*.edges)
+    freeWords(allocator, graph.*.inOwners, graph.*.edges)
+}
+
+fn dependenciesReady(loader: *Loader, graph: *Graph, module_id: usize, analyzed: [*]u8) -> bool {
+    var at = graph.*.outStart[module_id]
+    while at < graph.*.outStart[module_id + 1] {
+        const target = graph.*.outTargets[at]
+        const dependency = loader_module.Loader.moduleAt(loader, target)
+        if dependency.*.state == model.State.loaded && dependency.*.sourceAddress != 0 && analyzed[target] == 0 { return false }
+        at += 1
+    }
     return true
 }
 
-// Whether `to` is reached from `from` along the imports of modules not
-// analyzed yet (`seen`: scratch, count bytes).
-fn reaches(loader: *Loader, analyzed: [*]u8, count: usize, from: usize, to: usize, seen: [*]u8, stack: [*]usize) -> bool {
-    mem.zero(seen, count)
-    var depth: usize = 1
-    stack[0] = from
-    seen[from] = 1
-    while depth > 0 {
-        depth -= 1
-        const current = stack[depth]
-        var import_index: usize = 0
-        while import_index < loader.*.store.*.importLength {
-            const edge = store_module.Store.importAt(loader.*.store, import_index)
-            if edge.*.owner == current && edge.*.target < count && analyzed[edge.*.target] == 0 {
-                if edge.*.target == to { return true }
-                if seen[edge.*.target] == 0 {
-                    seen[edge.*.target] = 1
-                    stack[depth] = edge.*.target
-                    depth += 1
+// The strongly connected components of the modules not analyzed yet
+// (through their imports of each other): `component` for each, and how
+// many (Tarjan's algorithm, its recursion kept in `calls`).
+fn components(graph: *Graph, analyzed: [*]u8, count: usize, component: [*]usize, order: [*]usize, low: [*]usize, position: [*]usize, stack: [*]usize, calls: [*]usize, on_stack: [*]u8) -> usize {
+    var module_index: usize = 0
+    while module_index < count {
+        order[module_index] = 0
+        on_stack[module_index] = 0
+        module_index += 1
+    }
+    var next: usize = 1
+    var found: usize = 0
+    var stacked: usize = 0
+    var root: usize = 0
+    while root < count {
+        if analyzed[root] == 0 && order[root] == 0 {
+            var depth: usize = 1
+            calls[0] = root
+            order[root] = next
+            low[root] = next
+            next += 1
+            position[root] = graph.*.outStart[root]
+            stack[stacked] = root
+            stacked += 1
+            on_stack[root] = 1
+            while depth > 0 {
+                const current = calls[depth - 1]
+                if position[current] < graph.*.outStart[current + 1] {
+                    const target = graph.*.outTargets[position[current]]
+                    position[current] += 1
+                    if analyzed[target] == 0 {
+                        if order[target] == 0 {
+                            order[target] = next
+                            low[target] = next
+                            next += 1
+                            position[target] = graph.*.outStart[target]
+                            stack[stacked] = target
+                            stacked += 1
+                            on_stack[target] = 1
+                            calls[depth] = target
+                            depth += 1
+                        } else if on_stack[target] == 1 && order[target] < low[current] {
+                            low[current] = order[target]
+                        }
+                    }
+                } else {
+                    depth -= 1
+                    if depth > 0 && low[current] < low[calls[depth - 1]] { low[calls[depth - 1]] = low[current] }
+                    if low[current] == order[current] {
+                        var done = false
+                        while !done {
+                            stacked -= 1
+                            const member = stack[stacked]
+                            on_stack[member] = 0
+                            component[member] = found
+                            if member == current { done = true }
+                        }
+                        found += 1
+                    }
                 }
             }
-            import_index += 1
         }
+        root += 1
     }
-    return false
-}
-
-// Whether every module `module_id` reaches (not analyzed yet) reaches it
-// back: its cycle waits for no other cycle.
-fn cycleIsLast(loader: *Loader, analyzed: [*]u8, count: usize, module_id: usize, seen: [*]u8, stack: [*]usize) -> bool {
-    var other: usize = 0
-    while other < count {
-        if other != module_id && analyzed[other] == 0 && reaches(loader, analyzed, count, module_id, other, seen, stack) {
-            if !reaches(loader, analyzed, count, other, module_id, seen, stack) { return false }
-        }
-        other += 1
-    }
-    return true
+    return found
 }
 
 // Where to break an import cycle: among the modules not analyzed yet that
@@ -166,28 +268,61 @@ fn cycleIsLast(loader: *Loader, analyzed: [*]u8, count: usize, module_id: usize,
 // module the others build on: a program's main file and its parts, a
 // library and the files it was split into); the first loaded on a tie.
 // A module that only waits for a cycle is never picked (its declarations
-// need the cycle's), nor one whose cycle waits for another cycle.
-fn cycleEntry(loader: *Loader, analyzed: [*]u8, count: usize) -> usize {
+// need the cycle's), nor one whose cycle waits for another cycle: the
+// cycles are the strongly connected components, and a cycle waits for
+// no other when no import leads out of its component.
+fn cycleEntry(loader: *Loader, graph: *Graph, analyzed: [*]u8, count: usize) -> usize {
     const allocator: loader_module.Allocator = loader_module.Loader.allocatorFor(loader)
-    const seen = allocator.alloc(count, 1).?
-    var stack: [*]usize = undefined
-    unsafe { stack = @ptrCast([*]usize, allocator.alloc(count * 8 + 8, 8).?) }
-    var best = count
-    var best_importers: usize = 0
-    var fallback = count
+    const component = words(allocator, count)
+    const order = words(allocator, count)
+    const low = words(allocator, count)
+    const position = words(allocator, count)
+    const stack = words(allocator, count)
+    const calls = words(allocator, count)
+    const sizes = words(allocator, count)
+    const on_stack = allocator.alloc(count + 1, 1).?
+    const leaving = allocator.alloc(count + 1, 1).?
+    const found = components(graph, analyzed, count, component, order, low, position, stack, calls, on_stack)
+    var index: usize = 0
+    while index < found {
+        sizes[index] = 0
+        leaving[index] = 0
+        index += 1
+    }
     var module_index: usize = 0
     while module_index < count {
         if analyzed[module_index] == 0 {
+            sizes[component[module_index]] += 1
+            var at = graph.*.outStart[module_index]
+            while at < graph.*.outStart[module_index + 1] {
+                const target = graph.*.outTargets[at]
+                if analyzed[target] == 0 && component[target] != component[module_index] { leaving[component[module_index]] = 1 }
+                at += 1
+            }
+        }
+        module_index += 1
+    }
+    var best = count
+    var best_importers: usize = 0
+    var fallback = count
+    module_index = 0
+    while module_index < count {
+        if analyzed[module_index] == 0 {
             if fallback == count { fallback = module_index }
-            if reaches(loader, analyzed, count, module_index, module_index, seen, stack) && cycleIsLast(loader, analyzed, count, module_index, seen, stack) {
+            const own = component[module_index]
+            var on_cycle = sizes[own] > 1
+            var at = graph.*.outStart[module_index]
+            while at < graph.*.outStart[module_index + 1] {
+                if graph.*.outTargets[at] == module_index { on_cycle = true }
+                at += 1
+            }
+            if on_cycle && leaving[own] == 0 {
                 var importers: usize = 0
-                var import_index: usize = 0
-                while import_index < loader.*.store.*.importLength {
-                    const edge = store_module.Store.importAt(loader.*.store, import_index)
-                    if edge.*.target == module_index && edge.*.owner != module_index && edge.*.owner < count && analyzed[edge.*.owner] == 0 {
-                        if reaches(loader, analyzed, count, module_index, edge.*.owner, seen, stack) { importers += 1 }
-                    }
-                    import_index += 1
+                at = graph.*.inStart[module_index]
+                while at < graph.*.inStart[module_index + 1] {
+                    const owner = graph.*.inOwners[at]
+                    if owner != module_index && analyzed[owner] == 0 && component[owner] == own { importers += 1 }
+                    at += 1
                 }
                 if best == count || importers > best_importers {
                     best = module_index
@@ -197,8 +332,15 @@ fn cycleEntry(loader: *Loader, analyzed: [*]u8, count: usize) -> usize {
         }
         module_index += 1
     }
-    allocator.free(seen, count, 1)
-    unsafe { allocator.free(@ptrCast([*]u8, stack), count * 8 + 8, 8) }
+    freeWords(allocator, component, count)
+    freeWords(allocator, order, count)
+    freeWords(allocator, low, count)
+    freeWords(allocator, position, count)
+    freeWords(allocator, stack, count)
+    freeWords(allocator, calls, count)
+    freeWords(allocator, sizes, count)
+    allocator.free(on_stack, count + 1, 1)
+    allocator.free(leaving, count + 1, 1)
     return if best != count { best } else { fallback }
 }
 
@@ -241,12 +383,14 @@ pub fn declarations(loader: *Loader, types: *TypeStore, symbols: *SymbolStore) -
         module_index += 1
     }
 
+    var graph: Graph = undefined
+    buildGraph(loader, count, &graph)
     var errors: usize = 0
     while remaining > 0 {
         var made_progress = false
         module_index = 0
         while module_index < count {
-            if analyzed[module_index] == 0 && dependenciesReady(loader, module_index, analyzed) {
+            if analyzed[module_index] == 0 && dependenciesReady(loader, &graph, module_index, analyzed) {
                 errors += analyzeOneDeclarationModule(loader, loader_module.Loader.moduleAt(loader, module_index), types, symbols)
                 analyzed[module_index] = 1
                 remaining -= 1
@@ -261,13 +405,14 @@ pub fn declarations(loader: *Loader, types: *TypeStore, symbols: *SymbolStore) -
             // waiting import: the one the others build on (a program's
             // main file and its parts, a library and the files it was split
             // into), whatever order the modules were loaded in.
-            const entry = cycleEntry(loader, analyzed, count)
+            const entry = cycleEntry(loader, &graph, analyzed, count)
             errors += analyzeOneDeclarationModule(loader, loader_module.Loader.moduleAt(loader, entry), types, symbols)
             analyzed[entry] = 1
             remaining -= 1
             made_progress = true
         }
     }
+    freeGraph(loader, count, &graph)
     allocator.free(analyzed, count, 1)
     return errors
 }

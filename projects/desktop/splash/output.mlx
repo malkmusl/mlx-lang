@@ -1,0 +1,404 @@
+// Where the splash is shown: the monitor through KMS (the compositor's
+// kms.mlx: two dumb buffers, page flips), the Linux framebuffer when there
+// is no KMS card, or nowhere (a run that only writes PNG frames and
+// speaks the protocol, for tests). And the virtual terminal under it, put
+// into graphics mode so the kernel's console does not draw over it.
+//
+// A frame is drawn in memory (scene.frame) and copied over: the dumb
+// buffers can be write-combined memory, slow to read, and drawing adds
+// light to what is there. A buffer holding an earlier frame takes only the
+// tiles that frame or this one drew on (the rest is the backdrop in both),
+// or all of it when that frame is too old or the whole screen changed
+// since.
+const std = @import("std")
+const kms = @import("../compositor/kms.mlx")
+const device = @import("../compositor/device.mlx")
+const paint = @import("./paint.mlx")
+const state = @import("./state.mlx")
+const system = @import("./system.mlx")
+
+const Allocator = std.allocator.Allocator
+
+pub const Kind = enum(u8) {
+    none,
+    kms,
+    fbdev,
+    // Two buffers in memory taking frames as a card's would (--bench
+    // times the copying too).
+    memory
+}
+
+pub const Output = struct {
+    kind: Kind
+    width: usize
+    height: usize
+    card: kms.Output
+    // The framebuffer device: its mapping, the visible part's start, its
+    // row length in bytes, red in the low byte.
+    fbDescriptor: isize
+    fbAddress: usize
+    fbMapped: usize
+    fbStart: usize
+    fbPitch: usize
+    fbSwap: bool
+    // The frame each KMS buffer (or the framebuffer, the first) holds; 0:
+    // none known, it takes the next one whole.
+    held: [2]u64
+    // Kind.memory's buffers and the one taking the next frame.
+    memoryBuffers: [2]usize
+    memoryBack: usize
+    // The card is given to someone else (deactivated) or the console shown
+    // (hidden): nothing is drawn.
+    released: bool
+    hidden: bool
+    allocator: Allocator
+}
+
+const KDSETMODE: usize = 19258
+const KD_TEXT: usize = 0
+const KD_GRAPHICS: usize = 1
+const FBIOGET_VSCREENINFO: usize = 17920
+const FBIOGET_FSCREENINFO: usize = 17922
+
+pub fn init(output: *Output, allocator: Allocator) -> void {
+    output.*.kind = Kind.none
+    output.*.width = 0
+    output.*.height = 0
+    output.*.fbDescriptor = -1
+    output.*.held[0] = 0
+    output.*.held[1] = 0
+    output.*.released = false
+    output.*.hidden = false
+    output.*.allocator = allocator
+}
+
+// The KMS card on `descriptor` (owned from now on); false when it has no
+// connected monitor or cannot show dumb buffers.
+pub fn openCard(output: *Output, descriptor: isize) -> bool {
+    // The console's mode is most likely 60 Hz; a faster one would be set
+    // only to be changed again by the display manager.
+    output.*.card.maxRefresh = 60
+    output.*.card.wantWidth = 0
+    output.*.card.wantHeight = 0
+    output.*.card.wantHertz = 0
+    if !kms.open(&output.*.card, descriptor, output.*.allocator) {
+        // Not kms.close: what it would put back on the CRTC may not have
+        // been read yet.
+        device.deinit(&output.*.card.card, output.*.allocator)
+        return false
+    }
+    output.*.kind = Kind.kms
+    output.*.width = output.*.card.width
+    output.*.height = output.*.card.height
+    output.*.held[0] = 0
+    output.*.held[1] = 0
+    return true
+}
+
+// The first of /dev/dri/card0..7 with a connected monitor.
+pub fn findCard(output: *Output) -> bool {
+    var number: u8 = 0
+    while number < 8 {
+        var path: [24]u8 = undefined
+        var length: usize = 0
+        for byte in "/dev/dri/card" {
+            path[length] = byte
+            length += 1
+        }
+        path[length] = 48 + number
+        path[length + 1] = 0
+        var path_pointer: [*]const u8 = undefined
+        unsafe { path_pointer = @ptrCast([*]const u8, &path) }
+        const descriptor = system.open(path_pointer, system.O_RDWR | system.O_NOCTTY | system.O_NONBLOCK)
+        if descriptor >= 0 {
+            var probe: kms.Output = undefined
+            probe.maxRefresh = 60
+            probe.wantWidth = 0
+            probe.wantHeight = 0
+            probe.wantHertz = 0
+            if kms.probe(&probe, descriptor, output.*.allocator) {
+                const again = system.open(path_pointer, system.O_RDWR | system.O_NOCTTY | system.O_NONBLOCK)
+                if again >= 0 && openCard(output, again) { return true }
+            }
+        }
+        number += 1
+    }
+    return false
+}
+
+// The framebuffer device at `path` (32 bits per pixel only).
+pub fn openFramebuffer(output: *Output, path: [*]const u8) -> bool {
+    const descriptor = system.open(path, system.O_RDWR)
+    if descriptor < 0 { return false }
+    var fixed: [128]u8 = undefined
+    var variable: [192]u8 = undefined
+    var index: usize = 0
+    while index < 128 {
+        fixed[index] = 0
+        index += 1
+    }
+    index = 0
+    while index < 192 {
+        variable[index] = 0
+        index += 1
+    }
+    var fixed_bytes: [*]u8 = undefined
+    var variable_bytes: [*]u8 = undefined
+    unsafe {
+        fixed_bytes = @ptrCast([*]u8, &fixed)
+        variable_bytes = @ptrCast([*]u8, &variable)
+    }
+    if system.ioctl(descriptor, FBIOGET_FSCREENINFO, @intFromPtr(fixed_bytes)) < 0 || system.ioctl(descriptor, FBIOGET_VSCREENINFO, @intFromPtr(variable_bytes)) < 0 {
+        system.close(descriptor)
+        return false
+    }
+    // struct fb_var_screeninfo: xres, yres, xres_virtual, yres_virtual,
+    // xoffset, yoffset, bits_per_pixel, grayscale, red (offset, ...).
+    // struct fb_fix_screeninfo: id[16], smem_start, smem_len (24), ...,
+    // line_length (48).
+    const bits = device.load32(variable_bytes, 24)
+    if bits != 32 {
+        system.close(descriptor)
+        return false
+    }
+    const width = @intCast(usize, device.load32(variable_bytes, 0))
+    const height = @intCast(usize, device.load32(variable_bytes, 4))
+    const pitch = @intCast(usize, device.load32(fixed_bytes, 48))
+    const mapped = @intCast(usize, device.load32(fixed_bytes, 24))
+    const address = system.mmap(mapped, descriptor)
+    if address == 0 || width == 0 || height == 0 {
+        system.close(descriptor)
+        return false
+    }
+    output.*.kind = Kind.fbdev
+    output.*.width = width
+    output.*.height = height
+    output.*.fbDescriptor = descriptor
+    output.*.fbAddress = address
+    output.*.fbMapped = mapped
+    output.*.fbPitch = pitch
+    output.*.fbStart = @intCast(usize, device.load32(variable_bytes, 20)) * pitch + @intCast(usize, device.load32(variable_bytes, 16)) * 4
+    output.*.fbSwap = device.load32(variable_bytes, 32) == 0
+    output.*.held[0] = 0
+    return true
+}
+
+// No screen: frames are only drawn (for PNGs and tests).
+pub fn openNone(output: *Output, width: usize, height: usize) -> void {
+    output.*.kind = Kind.none
+    output.*.width = width
+    output.*.height = height
+}
+
+// Two buffers in memory of `width` x `height`; false without memory.
+pub fn openMemory(output: *Output, width: usize, height: usize) -> bool {
+    const first = output.*.allocator.alloc(width * height * 4, 4096)
+    const second = output.*.allocator.alloc(width * height * 4, 4096)
+    if first == null || second == null { return false }
+    output.*.kind = Kind.memory
+    output.*.width = width
+    output.*.height = height
+    output.*.memoryBuffers[0] = @intFromPtr(first.?)
+    output.*.memoryBuffers[1] = @intFromPtr(second.?)
+    output.*.memoryBack = 0
+    output.*.held[0] = 0
+    output.*.held[1] = 0
+    return true
+}
+
+// The card's descriptor to wait for flips on (-1: none).
+pub fn descriptor(output: *const Output) -> isize {
+    if output.*.kind == Kind.kms { return kms.descriptor(&output.*.card) }
+    return -1
+}
+
+// Whether a frame can be shown now (no flip outstanding, not hidden).
+pub fn ready(output: *const Output) -> bool {
+    if output.*.released || output.*.hidden { return false }
+    if output.*.kind == Kind.kms { return !output.*.card.flipPending }
+    return true
+}
+
+// The card's events: a flip done.
+pub fn readEvents(output: *Output) -> void {
+    if output.*.kind != Kind.kms { return }
+    var milliseconds: u32 = 0
+    const flipped = kms.readEvents(&output.*.card, &milliseconds)
+}
+
+// Where the scene's next frame goes: its bands copy what they drew into
+// the buffer the screen does not show now (the back buffer, the memory
+// buffer next in turn) or the framebuffer, while it is still in the cache.
+// Call before scene.draw, then show.
+pub fn aim(output: *Output, scene: *state.Scene) -> void {
+    scene.*.targetAddress = 0
+    if output.*.kind == Kind.none || !ready(output) { return }
+    scene.*.targetSwap = false
+    if output.*.kind == Kind.memory {
+        scene.*.targetAddress = output.*.memoryBuffers[output.*.memoryBack]
+        scene.*.targetPitch = output.*.width * 4
+        scene.*.targetHeld = output.*.held[output.*.memoryBack]
+    } else if output.*.kind == Kind.fbdev {
+        scene.*.targetAddress = output.*.fbAddress + output.*.fbStart
+        scene.*.targetPitch = output.*.fbPitch
+        scene.*.targetHeld = output.*.held[0]
+        scene.*.targetSwap = output.*.fbSwap
+    } else {
+        const back = kms.backIndex(&output.*.card)
+        scene.*.targetAddress = kms.backAddress(&output.*.card)
+        scene.*.targetPitch = kms.backPitch(&output.*.card)
+        scene.*.targetHeld = output.*.held[back]
+    }
+}
+
+// The scene's frame onto the screen: copied already when aimed at the
+// buffer it went to, else copied now.
+pub fn show(output: *Output, scene: *state.Scene) -> bool {
+    if output.*.kind == Kind.none || !ready(output) { return true }
+    const copied = scene.*.targetAddress != 0
+    scene.*.targetAddress = 0
+    if output.*.kind == Kind.memory {
+        const back = output.*.memoryBack
+        if !copied { copyFrame(scene, output.*.memoryBuffers[back], output.*.width * 4, output.*.held[back], false) }
+        output.*.held[back] = scene.*.frameNumber
+        output.*.memoryBack = 1 - back
+        return true
+    }
+    if output.*.kind == Kind.fbdev {
+        if !copied { copyFrame(scene, output.*.fbAddress + output.*.fbStart, output.*.fbPitch, output.*.held[0], output.*.fbSwap) }
+        output.*.held[0] = scene.*.frameNumber
+        return true
+    }
+    const back = kms.backIndex(&output.*.card)
+    if !copied { copyFrame(scene, kms.backAddress(&output.*.card), kms.backPitch(&output.*.card), output.*.held[back], false) }
+    output.*.held[back] = scene.*.frameNumber
+    var shown = false
+    return kms.present(&output.*.card, &shown)
+}
+
+// The frame into a buffer at `address` (rows `pitch` bytes apart) that
+// holds frame `held`: what changed since, tile row by tile row, runs of
+// neighbouring tiles a copy each.
+fn copyFrame(scene: *state.Scene, address: usize, pitch: usize, held: u64, swap: bool) -> void {
+    const number = scene.*.frameNumber
+    const frame = &scene.*.frame
+    if held == 0 || held > number || number - held >= state.HISTORY || scene.*.wholeFrame > held {
+        paint.copyOut(frame, address, pitch, 0, 0, scene.*.width, scene.*.height, swap)
+        return
+    }
+    const current = state.marksOf(scene, number)
+    const old = state.marksOf(scene, held)
+    const tile = @intCast(usize, paint.TILE)
+    const columns = scene.*.tileColumns
+    var tile_row: usize = 0
+    while tile_row < scene.*.tileRows {
+        const top = tile_row * tile
+        const bottom = if top + tile > scene.*.height { scene.*.height } else { top + tile }
+        const base = tile_row * columns
+        var column: usize = 0
+        while column < columns {
+            if (current[base + column] | old[base + column]) == 0 {
+                column += 1
+            } else {
+                const first = column
+                while column < columns && (current[base + column] | old[base + column]) != 0 { column += 1 }
+                const left = first * tile
+                const right = if column * tile > scene.*.width { scene.*.width } else { column * tile }
+                paint.copyOut(frame, address, pitch, left, top, right - left, bottom - top, swap)
+            }
+        }
+        tile_row += 1
+    }
+}
+
+// Gives the card to someone else (the display manager, while we wait to
+// be told to quit); nothing is drawn until reactivate.
+pub fn deactivate(output: *Output) -> void {
+    output.*.released = true
+    if output.*.kind == Kind.kms { kms.dropMaster(&output.*.card) }
+}
+
+pub fn reactivate(output: *Output) -> void {
+    if !output.*.released { return }
+    output.*.released = false
+    if output.*.kind == Kind.kms {
+        const master = kms.setMaster(&output.*.card)
+        kms.resume(&output.*.card)
+    }
+    output.*.held[0] = 0
+    output.*.held[1] = 0
+}
+
+// The text console instead of the splash (a password asked for on it, or
+// hide-splash), and back.
+pub fn hide(output: *Output) -> void {
+    if output.*.hidden { return }
+    output.*.hidden = true
+    if output.*.kind == Kind.kms && !output.*.released {
+        settle(output)
+        const restored = kms.showSaved(&output.*.card)
+    }
+}
+
+pub fn unhide(output: *Output) -> void {
+    if !output.*.hidden { return }
+    output.*.hidden = false
+    if output.*.kind == Kind.kms { kms.resume(&output.*.card) }
+    output.*.held[0] = 0
+    output.*.held[1] = 0
+}
+
+// Waits (a fifth of a second at most) for a flip in flight: until it is
+// done the buffer it leaves is still on screen, and removing that one
+// would turn the CRTC off.
+fn settle(output: *Output) -> void {
+    var entries: [8]u8 = undefined
+    var bytes: [*]u8 = undefined
+    unsafe { bytes = @ptrCast([*]u8, &entries) }
+    var tries: usize = 0
+    while output.*.card.flipPending && tries < 20 {
+        system.pollSet(bytes, 0, kms.descriptor(&output.*.card), system.POLLIN)
+        if system.poll(bytes, 1, 10) > 0 { readEvents(output) }
+        tries += 1
+    }
+}
+
+// Done: the console back, or (`retain`) the last frame left on screen for
+// the display manager.
+pub fn close(output: *Output, retain: bool) -> void {
+    if output.*.kind == Kind.kms {
+        settle(output)
+        if retain && !output.*.hidden {
+            kms.closeRetaining(&output.*.card, output.*.allocator)
+        } else {
+            kms.close(&output.*.card, output.*.allocator)
+        }
+    } else if output.*.kind == Kind.fbdev {
+        system.munmap(output.*.fbAddress, output.*.fbMapped)
+        system.close(output.*.fbDescriptor)
+    }
+    output.*.kind = Kind.none
+}
+
+// ---------------------------------------------------------------------------
+// The virtual terminal
+
+// Opens the terminal at `path` and puts it into graphics mode (the
+// console stops drawing on it); -1 when it cannot be opened.
+pub fn takeTerminal(path: [*]const u8) -> isize {
+    const terminal = system.open(path, system.O_RDWR | system.O_NOCTTY)
+    if terminal < 0 { return -1 }
+    const set = system.ioctl(terminal, KDSETMODE, KD_GRAPHICS)
+    return terminal
+}
+
+// Text mode again (the console draws; a prompt on it can be seen).
+pub fn textMode(terminal: isize) -> void {
+    if terminal < 0 { return }
+    const set = system.ioctl(terminal, KDSETMODE, KD_TEXT)
+}
+
+pub fn graphicsMode(terminal: isize) -> void {
+    if terminal < 0 { return }
+    const set = system.ioctl(terminal, KDSETMODE, KD_GRAPHICS)
+}

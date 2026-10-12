@@ -99,7 +99,7 @@ up 28
 up 56
 wait 1500
 shot $work/changed.ppm
-wait 3000
+wait 5000
 close
 SCRIPT
 
@@ -110,7 +110,10 @@ WAYLAND_DISPLAY=host-modules timeout 60 "$work/mlx-compositor" --verbose --rende
     --modules "$work/modules" --terminal "$work/mlx-terminal" --run "$work/mlx-terminal" > "$work/compositor.log" 2>&1 &
 compositor_pid=$!
 # While the terminal runs: the changed modules, then (after the screenshot)
-# a shell for another layout.
+# a shell for another layout. The compositor looks at the files twice a
+# second and loads one once it stayed the same for half a second, waking
+# at least once a second: the session goes on for 4.5 seconds after the
+# last one, room for that.
 sleep 3.5
 install_module "$work/changed-modules/libmlx-render.so"
 install_module "$work/changed-modules/libmlx-shell.so"
