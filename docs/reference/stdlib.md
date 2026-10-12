@@ -295,11 +295,13 @@ both ways and reads it back with `loadFile`.
 **Normative source:** `spec/04-stdlib/mem.xml`
 **Implementation:** `std/bootstrap/allocator.mlx`, `page_allocator.mlx`,
 `arena_allocator.mlx`, `fixed_buffer_allocator.mlx`,
-`general_purpose_allocator.mlx`, `mem.mlx`
+`general_purpose_allocator.mlx`, `debug_allocator.mlx`, `mem.mlx`;
+`std/src/leaks.mlx`
 **Source tests:** `120_bootstrap_mem_runtime.mlx`,
 `131_bootstrap_allocator_runtime.mlx`, `132_page_allocator_runtime.mlx`,
 `137_bootstrap_arena_allocators_runtime.mlx`,
-`296_general_purpose_allocator_runtime.mlx`
+`296_general_purpose_allocator_runtime.mlx`,
+`314_debug_allocator_runtime.mlx` (`tests/run_debug_allocator.sh`)
 
 `spec/04-stdlib/mem.xml` specifies an `Allocator` with `alloc`/`resize`/`free`
 operations, four allocator kinds (`PageAllocator`, `ArenaAllocator`,
@@ -333,7 +335,9 @@ pub const Allocator = struct {
 
 All four spec'd allocators are implemented: `page_allocator.mlx` (backed
 directly by `mmap`/`munmap` via `std.os.linux`), `arena_allocator.mlx`
-(bump-allocates out of one page-allocated block, with `reset`/`deinit`),
+(bump-allocates out of one page-allocated block, with `reset`/`deinit`;
+as Zig's, its last block grows and shrinks in place, so a list growing at
+the arena's end is not copied and what it gives back is used again),
 `fixed_buffer_allocator.mlx` (bump-allocates over a caller-owned buffer,
 with `reset`), and `general_purpose_allocator.mlx`, the heap for blocks of
 any size freed in any order, for every thread of a process at once:
@@ -361,6 +365,73 @@ slept on through the kernel when contended, covers the lists.
 `296_general_purpose_allocator_runtime.mlx` exercises every class, the
 alignments, resizing, deinit and four threads allocating and freeing
 through one heap. mlxlibc's `malloc`/`free`/`realloc` sit on it.
+
+### Leak checks: `std.debug_allocator` and `std.leaks`
+
+`std.debug_allocator` is Zig's `DebugAllocator` (the `GeneralPurposeAllocator`
+of older Zig with its safety checks): it wraps any allocator and keeps each
+block it hands out with the functions that asked for it (12 return
+addresses along the frame pointers every Mlx function keeps). What goes
+wrong is said on stderr with where it happened:
+
+- a **leak**: a block not freed by `deinit` (or `report`), the blocks of one
+  place said once with their count and bytes, the largest places first;
+- a **double free**: with where the block was allocated, first freed and
+  freed again; the second free is not passed on;
+- an **invalid free**: an address it never handed out (not passed on);
+- a **wrong size**: a block freed with another length or alignment than it
+  was allocated with (freed with the right ones).
+
+Freed memory is overwritten with `0xAA` first (as Zig's `undefined`), so a
+block used after it went shows; the last 4096 frees are remembered to tell
+a double free from an invalid one. Its own tables are mappings of their
+own, one futex lock covers them.
+
+```mlx
+var checked: std.debug_allocator.DebugAllocator = undefined
+std.debug_allocator.init(&checked, std.page_allocator.init())
+checked.describe = crash.describeReturn       // names: path:line:function
+const allocator = std.debug_allocator.interface(&checked)
+...
+const leaked = std.debug_allocator.deinit(&checked)   // 0: none (Zig's .ok)
+```
+
+```
+mlx-files[4211]: leak: 3 blocks, 12288 bytes
+  allocated at projects/desktop/files/icons.mlx:88:load+0x4c at projects/desktop/files/icons.mlx:91
+  from projects/desktop/files/main.mlx:310:redraw+0x2f3 at projects/desktop/files/main.mlx:322
+mlx-files[4211]: 3 blocks leaked (12288 bytes) from 1 place; 940 allocations, 937 frees, 2097152 bytes out at most
+```
+
+Most programs take `std.page_allocator.init()` wherever they need memory
+instead of passing one allocator around. `watchPages(state)` has the page
+allocator tell a debug allocator every block it maps and unmaps (through
+two function pointers, so the compiler, which takes its pages there too,
+does not depend on it); the pages stay what they were, fresh zeroed
+mappings, and frees of pages mapped before the watch go through unsaid.
+`std.leaks` does that for a whole program when `MLX_LEAK_CHECK` is set:
+
+```mlx
+const watched = leaks.watch()   // first thing, or right before the loop
+leaks.mark()                    // what came before is the program's to keep
+...the loop...
+defer leaks.finish()            // the blocks the loop kept, and the arena
+```
+
+`MLX_LEAK_CHECK=1` reports on stderr, `MLX_LEAK_CHECK=/a/path` appends to
+that file (each line names the program and its process), `0` or nothing
+watches nothing. The report also says when the compiler's value arena
+grew by more than 64 KiB since the mark: a loop whose turns do not give
+their values back (`std.turns`) grows a program as a leak would (a loop on
+`std.turns` is not said). A block a program keeps on purpose until it
+ends, a cache's or state it replaces as it changes, is left out of the
+reports with `leaks.keep(memory)` (`std.debug_allocator.keep`): the
+symbols of the top bar and its popups, a terminal's grids. The
+loops of `std.ui.wayland.panel` (the dock, launcher, top bar, files,
+settings, terminal, notifications, the Observatory), the compositor,
+mlx-ipcd, mlx-audiod, mlx-netd, mlx-console and mlx-splash call these.
+The compositor's modules are images of their own with their own page
+allocator, and are not watched.
 
 A runtime fixture exercises fixed-buffer alignment/reset and arena
 alignment/reset/deinit together:

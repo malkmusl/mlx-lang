@@ -20,14 +20,21 @@ mlx-profile [-o DIRECTORY] [--every MILLISECONDS] [--wall] PROGRAM [ARGUMENT...]
   every thread, and a program waiting on a thread of its own (a Vulkan
   driver's) would stand still.
 
-At the end it prints the functions most of the time went to:
+At the end it prints the functions most of the time went to, then what the
+program took as its main thread ended: processor time of every thread
+(the samples see the main one) and memory at most and at the end:
 
 ```
 mlx-profile: 512 samples (38 more while it waited)
   100% with calls, 0% itself: tools/codemap/main.mlx:1388:run
   57% with calls, 3% itself: tools/codemap/index.mlx:469:parseFile
   39% with calls, 0% itself: compiler/selfhost/parser/syntax.mlx:371:parseSource
+mlx-profile: 2870 ms of processor time (330 ms in the kernel), every thread; memory 470 MiB at most, 311 MiB at the end
 ```
+
+For memory kept by mistake, `MLX_LEAK_CHECK` (std.leaks, see
+[the standard library](../../docs/reference/stdlib.md)) says which blocks a
+program's loop kept and where they were allocated.
 
 It writes the profile to DIRECTORY, by default
 `$XDG_STATE_HOME/mlx/profiles` (`~/.local/state/mlx/profiles`), as

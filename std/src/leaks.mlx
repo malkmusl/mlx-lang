@@ -1,0 +1,175 @@
+// std.leaks: leak checks for a whole program, as Zig's DebugAllocator gives
+// the programs that use it, without passing another allocator around.
+// With MLX_LEAK_CHECK=1 in the environment, watch() has the page allocator
+// tell a debug allocator (std.debug_allocator) every block it maps and
+// unmaps, with the functions that asked; report() says the blocks still
+// out, grouped by where they were allocated and named by std.crash, the
+// largest first. Double frees and blocks freed with the wrong length are
+// said as they happen (and not unmapped twice).
+//
+// After mark(), report() says only the blocks allocated since: in a
+// program that runs a loop, mark before the loop's first turn, and what
+// the report says is what the loop took and did not give back. It also
+// says how much the compiler's value arena grew since the mark: a loop
+// whose turns do not give their values back (std.turns) grows the program
+// as a leak would.
+//
+//     leaks.watch()                   first thing in main
+//     ...setting up...
+//     leaks.mark()                    before the loop
+//     ...the loop...
+//     const leaked = leaks.report()   at the end
+//
+// A block a program keeps on purpose until it ends (a cache's, state it
+// replaces as it changes) is left out of the reports with keep().
+//
+// MLX_LEAK_CHECK=/a/path appends the reports to that file instead of
+// stderr (checks that keep no program's stderr, several programs at once:
+// each line names the program and its process). Without MLX_LEAK_CHECK
+// each of these is nothing and costs nothing.
+const std = @import("std")
+const crash = @import("std.crash")
+const turns = @import("std.turns")
+
+const debug = std.debug_allocator
+
+var state: debug.DebugAllocator = undefined
+var watching: bool = false
+// The value arena (0: not found) and its fill at the mark; the turns
+// std.turns had released then.
+var arena: usize = 0
+var arenaMark: usize = 0
+var releasedMark: usize = 0
+
+// Watches the page allocator when MLX_LEAK_CHECK is set (and not 0); true
+// when it does.
+pub fn watch() -> bool {
+    if watching { return true }
+    var path: [256]u8 = undefined
+    const wanted_as = wanted(@ptrCast([*]u8, &path))
+    if wanted_as == 0 { return false }
+    start()
+    if wanted_as == 2 {
+        // O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC
+        const file = std.linux.syscall3(2, @intFromPtr(&path), 525377, 420)
+        if file >= 0 { state.output = @bitCast(usize, file) }
+    }
+    return true
+}
+
+// Watches it whatever the environment says (tests).
+pub fn watchAlways() -> void {
+    if !watching { start() }
+}
+
+fn start() -> void {
+    debug.init(&state, std.page_allocator.init())
+    state.describe = crash.describeReturn
+    debug.watchPages(&state)
+    watching = true
+    arena = turns.locate()
+    arenaMark = if arena != 0 { turns.fillWord(arena).* } else { 0 }
+    releasedMark = turns.released()
+}
+
+// Whether MLX_LEAK_CHECK is in /proc/self/environ: 0 when not (or 0), 1
+// for stderr, 2 for a path (into `path`, NUL-ended).
+fn wanted(path: [*]u8) -> usize {
+    const SYS_open: usize = 2
+    const SYS_read: usize = 0
+    const SYS_close: usize = 3
+    const file = std.linux.syscall3(SYS_open, @intFromPtr(@ptrCast([*]const u8, "/proc/self/environ")), 0, 0)
+    if file < 0 { return 0 }
+    var buffer: [8192]u8 = undefined
+    var bytes: [*]u8 = undefined
+    unsafe { bytes = @ptrCast([*]u8, &buffer) }
+    const name = "MLX_LEAK_CHECK="
+    var found: usize = 0
+    var searching = true
+    // Entries are NUL-separated; one crossing a read's end is read again
+    // whole from where it began.
+    var carried: usize = 0
+    while searching {
+        const count = std.linux.syscall3(SYS_read, @bitCast(usize, file), @intFromPtr(bytes) + carried, 8192 - carried)
+        if count <= 0 { break }
+        const total = carried + @bitCast(usize, count)
+        var entry: usize = 0
+        var at: usize = 0
+        while at < total {
+            if bytes[at] == 0 {
+                if at - entry > name.length && std.text.same(bytes[entry..entry + name.length], name) {
+                    searching = false
+                    const value = entry + name.length
+                    if bytes[value] == 47 && at - value < 255 {
+                        var copied: usize = 0
+                        while value + copied < at {
+                            path[copied] = bytes[value + copied]
+                            copied += 1
+                        }
+                        path[copied] = 0
+                        found = 2
+                    } else if !(at - value == 1 && bytes[value] == 48) {
+                        found = 1
+                    }
+                }
+                entry = at + 1
+            }
+            at += 1
+        }
+        carried = total - entry
+        var move: usize = 0
+        while move < carried {
+            bytes[move] = bytes[entry + move]
+            move += 1
+        }
+        if carried == 8192 { carried = 0 }
+    }
+    const closed = std.linux.syscall1(SYS_close, @bitCast(usize, file))
+    return found
+}
+
+// From now on report() says only what is allocated after this.
+pub fn mark() -> void {
+    if !watching { return }
+    debug.mark(&state)
+    arenaMark = if arena != 0 { turns.fillWord(arena).* } else { 0 }
+    releasedMark = turns.released()
+}
+
+// A block meant to stay until the program ends (a cache's, state replaced
+// as it changes): reports leave it out. `memory` is what the allocator
+// gave.
+pub fn keep(memory: [*]u8) -> void {
+    if !watching { return }
+    debug.keep(&state, @intFromPtr(memory))
+}
+
+// Says the blocks still out (after the mark) and the arena's growth; the
+// number of blocks out (0 when not watching).
+pub fn report() -> usize {
+    if !watching { return 0 }
+    const blocks = debug.report(&state)
+    // A loop on std.turns gives each turn's values back: the fill is then
+    // only what its last turn made.
+    if arena != 0 && turns.released() == releasedMark {
+        const fill = turns.fillWord(arena).*
+        if fill > arenaMark + 65536 { debug.sayLine(&state, "values (the compiler's arena) grew by ", (fill - arenaMark) / 1024, " KiB since the mark: a loop without std.turns keeps every turn's values") }
+    }
+    return blocks
+}
+
+// report() for a defer at the end of a loop.
+pub fn finish() -> void {
+    const ignored = report()
+}
+
+// The blocks out now (after the mark) and the bad frees seen, for checks.
+pub fn liveCount() -> usize {
+    if !watching { return 0 }
+    return debug.liveCount(&state)
+}
+
+pub fn problemCount() -> usize {
+    if !watching { return 0 }
+    return debug.problemCount(&state)
+}

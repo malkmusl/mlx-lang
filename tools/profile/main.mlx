@@ -42,9 +42,13 @@ const PTRACE_SETOPTIONS: usize = 16896
 const PTRACE_SEIZE: usize = 16902
 const PTRACE_INTERRUPT: usize = 16903
 const PTRACE_O_TRACEEXEC: usize = 16
+const PTRACE_O_TRACEEXIT: usize = 64
 const PTRACE_O_EXITKILL: usize = 1048576
 const PTRACE_EVENT_EXEC: usize = 4
+const PTRACE_EVENT_EXIT: usize = 6
 const PTRACE_EVENT_STOP: usize = 128
+// Clock ticks a second in /proc/PID/stat (USER_HZ).
+const TICKS: usize = 100
 const SIGSTOP: usize = 19
 const SIGCONT: usize = 18
 const WUNTRACED: usize = 2
@@ -93,6 +97,14 @@ const Profiler = struct {
     samples: usize
     round: u32
     text: [*]u8
+    // What the program took, read as its main thread ends: its memory at
+    // most and at the end (KiB), its processor time in and out of the
+    // kernel, every thread's (ticks); whether it was read.
+    peakKiB: usize
+    endKiB: usize
+    userTicks: usize
+    systemTicks: usize
+    endNoted: bool
 }
 
 fn say(text: []const u8) -> void {
@@ -511,6 +523,99 @@ fn sample(profiler: *Profiler) -> void {
 }
 
 // Whether the program is running (R in /proc/PID/stat), not waiting.
+// /proc/PID/`file` of the program into `into` (NUL-ended); its length.
+fn procPath(profiler: *Profiler, file: []const u8, into: [*]u8) -> usize {
+    var length: usize = 0
+    for byte in "/proc/" {
+        into[length] = byte
+        length += 1
+    }
+    var digits: [24]u8 = undefined
+    var count: usize = 0
+    var rest = profiler.*.child
+    while rest > 0 || count == 0 {
+        digits[count] = @intCast(u8, 48 + rest % 10)
+        rest /= 10
+        count += 1
+    }
+    while count > 0 {
+        count -= 1
+        into[length] = digits[count]
+        length += 1
+    }
+    for byte in file {
+        into[length] = byte
+        length += 1
+    }
+    into[length] = 0
+    return length
+}
+
+// Reads /proc/PID/`file` into the profiler's text buffer; its length.
+fn readProc(profiler: *Profiler, file: []const u8) -> usize {
+    var path: [64]u8 = undefined
+    var bytes: [*]u8 = undefined
+    unsafe { bytes = @ptrCast([*]u8, &path) }
+    const length = procPath(profiler, file, bytes)
+    const opened = std.linux.syscall3(SYS_open, @intFromPtr(bytes), 0, 0)
+    if opened < 0 { return 0 }
+    const got = std.linux.syscall3(SYS_read, @bitCast(usize, opened), @intFromPtr(profiler.*.text), 8191)
+    const closed = std.linux.syscall1(SYS_close, @bitCast(usize, opened))
+    return if got <= 0 { 0 } else { @bitCast(usize, got) }
+}
+
+// The number after `label` in /proc/PID/status (in kB for the Vm lines).
+fn statusValue(text: [*]const u8, length: usize, label: []const u8) -> usize {
+    var at: usize = 0
+    while at + label.length < length {
+        var same_label = at == 0 || text[at - 1] == 10
+        var index: usize = 0
+        while same_label && index < label.length {
+            if text[at + index] != label[index] { same_label = false }
+            index += 1
+        }
+        if same_label {
+            var value: usize = 0
+            var digit = at + label.length
+            while digit < length && (text[digit] == 32 || text[digit] == 9) { digit += 1 }
+            while digit < length && text[digit] >= 48 && text[digit] <= 57 {
+                value = value * 10 + @intCast(usize, text[digit] - 48)
+                digit += 1
+            }
+            return value
+        }
+        at += 1
+    }
+    return 0
+}
+
+// What the program took, read while its main thread ends (its memory is
+// still there then, and every thread's times are counted in its stat).
+fn noteEnd(profiler: *Profiler) -> void {
+    var length = readProc(profiler, "/status")
+    profiler.*.peakKiB = statusValue(profiler.*.text, length, "VmHWM:")
+    profiler.*.endKiB = statusValue(profiler.*.text, length, "VmRSS:")
+    length = readProc(profiler, "/stat")
+    // After "pid (name) ": state is field 3; utime and stime are 14 and 15.
+    var at = length
+    while at > 0 && profiler.*.text[at - 1] != 41 { at -= 1 }
+    var field: usize = 2
+    var value: usize = 0
+    while at < length {
+        const byte = profiler.*.text[at]
+        if byte == 32 {
+            if field == 14 { profiler.*.userTicks = value }
+            if field == 15 { profiler.*.systemTicks = value }
+            field += 1
+            value = 0
+        } else if byte >= 48 && byte <= 57 {
+            value = value * 10 + @intCast(usize, byte - 48)
+        }
+        at += 1
+    }
+    profiler.*.endNoted = true
+}
+
 fn running(profiler: *Profiler) -> bool {
     var path: [64]u8 = undefined
     var bytes: [*]u8 = undefined
@@ -569,6 +674,7 @@ fn waitFor(profiler: *Profiler, event: usize) -> usize {
         const signal = (value >> 8) & 255
         const stop_event = (value >> 16) & 255
         if stop_event == event && (event != PTRACE_EVENT_STOP || signal == SIGTRAP) { return 1 }
+        if stop_event == PTRACE_EVENT_EXIT && !profiler.*.endNoted { noteEnd(profiler) }
         // A stop of the whole program or another event: on; a signal: on
         // to the program.
         const passed_signal = if stop_event != 0 { 0 } else { signal }
@@ -799,7 +905,12 @@ pub fn main(arguments: [][*]const u8) -> u8 {
     profiler.*.child = @bitCast(usize, child)
     var first_status: [1]u32 = [1]u32{ 0 }
     const first_wait = std.linux.syscall4(SYS_wait4, profiler.*.child, @intFromPtr(&first_status), WUNTRACED, 0)
-    const seized = std.linux.syscall4(SYS_ptrace, PTRACE_SEIZE, profiler.*.child, 0, PTRACE_O_EXITKILL | PTRACE_O_TRACEEXEC)
+    profiler.*.endNoted = false
+    profiler.*.peakKiB = 0
+    profiler.*.endKiB = 0
+    profiler.*.userTicks = 0
+    profiler.*.systemTicks = 0
+    const seized = std.linux.syscall4(SYS_ptrace, PTRACE_SEIZE, profiler.*.child, 0, PTRACE_O_EXITKILL | PTRACE_O_TRACEEXEC | PTRACE_O_TRACEEXIT)
     const woken = std.linux.syscall2(SYS_kill, profiler.*.child, SIGCONT)
     // It stops at the exec.
     if first_wait < 0 || seized != 0 || waitFor(profiler, PTRACE_EVENT_EXEC) != 1 {
@@ -850,6 +961,20 @@ pub fn main(arguments: [][*]const u8) -> u8 {
         say(profiler.*.names[start..start + @intCast(usize, profiler.*.nameLength[function])])
         say("\n")
         shown += 1
+    }
+    if profiler.*.endNoted {
+        // Processor time of every thread (the samples see the main one),
+        // and memory: at most and at the end.
+        const ticks = profiler.*.userTicks + profiler.*.systemTicks
+        say("mlx-profile: ")
+        sayNumber(ticks * 1000 / TICKS)
+        say(" ms of processor time (")
+        sayNumber(profiler.*.systemTicks * 1000 / TICKS)
+        say(" ms in the kernel), every thread; memory ")
+        sayNumber(profiler.*.peakKiB / 1024)
+        say(" MiB at most, ")
+        sayNumber(profiler.*.endKiB / 1024)
+        say(" MiB at the end\n")
     }
     writeProfile(profiler, if has_directory { std.text.cString(directory) } else { "" }, environment, program, interval, order)
     return 0
