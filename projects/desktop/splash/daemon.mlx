@@ -1,0 +1,451 @@
+// The boot splash daemon: the picture on the screen while the system
+// starts or stops, told what is happening over the Plymouth protocol.
+//
+// It draws at most 30 frames a second and never more than a third of one
+// processor (a frame waits three times as long as the last one took to
+// draw). At boot the bar estimates progress from how long the last boot
+// took (the duration file, written when told to quit). When a password is
+// asked for on the console (systemd's ask-password directory holds a
+// request), the splash steps aside, showing the console, and comes back
+// once it is answered: the splash itself never asks for one. Asked over the
+// protocol, it answers NAK.
+const std = @import("std")
+const png = @import("std.png")
+const paint = @import("./paint.mlx")
+const scene_module = @import("./scene.mlx")
+const state = @import("./state.mlx")
+const output_module = @import("./output.mlx")
+const protocol = @import("./protocol.mlx")
+const options_module = @import("./options.mlx")
+const system = @import("./system.mlx")
+
+const Scene = scene_module.Scene
+const Options = options_module.Options
+const Allocator = std.allocator.Allocator
+
+// A boot's length when none was recorded yet (seconds).
+const DEFAULT_BOOT: f64 = 20.0
+// How long the picture fades out when told to quit (seconds).
+const FADE: f64 = 0.35
+
+const Daemon = struct {
+    scene: *Scene
+    output: output_module.Output
+    server: protocol.Server
+    terminal: isize
+    signals: isize
+    options: *const Options
+    started: f64
+    // When the last frame was drawn and what it cost (seconds).
+    lastFrame: f64
+    frameCost: f64
+    interval: f64
+    // Frames are drawn at all (not on a machine without a screen, unless
+    // a snapshot is wanted).
+    drawing: bool
+    // The last boot's length; the progress pause.
+    expected: f64
+    paused: bool
+    pausedAt: f64
+    pausedFor: f64
+    // A password is asked on the console; hide-splash was asked for.
+    asking: bool
+    hiddenByRequest: bool
+    nextAskCheck: f64
+    quitting: bool
+    retain: bool
+    // Clients waiting for quit's answer.
+    quitWaiting: [16]bool
+}
+
+fn now(daemon: *Daemon) -> f64 { return system.seconds() - daemon.*.started }
+
+pub fn run(options: *const Options, environment: [*][*]const u8) -> u8 {
+    const allocator = std.page_allocator.init()
+    const daemon_memory = allocator.alloc(@sizeOf(Daemon), 16)
+    const scene_memory = allocator.alloc(@sizeOf(Scene), 16)
+    if daemon_memory == null || scene_memory == null {
+        system.say("out of memory")
+        return 1
+    }
+    var daemon: *Daemon = undefined
+    unsafe {
+        daemon = @ptrCast(*Daemon, daemon_memory.?)
+        daemon.*.scene = @ptrCast(*Scene, scene_memory.?)
+    }
+    daemon.*.options = options
+    daemon.*.terminal = -1
+    daemon.*.paused = false
+    daemon.*.pausedFor = 0.0
+    daemon.*.asking = false
+    daemon.*.hiddenByRequest = false
+    daemon.*.quitting = false
+    daemon.*.retain = false
+    daemon.*.frameCost = 0.0
+    daemon.*.lastFrame = -1.0
+    daemon.*.nextAskCheck = 0.0
+    daemon.*.interval = 1.0 / paint.toFloat(options.*.fps)
+    var index: usize = 0
+    while index < protocol.MAX_CLIENTS {
+        daemon.*.quitWaiting[index] = false
+        index += 1
+    }
+
+    // The socket first: if another splash (or plymouthd) has it, this one
+    // is not wanted.
+    protocol.init(&daemon.*.server)
+    if !protocol.listen(&daemon.*.server, options.*.socketName) {
+        system.sayAbout("the splash socket is taken: @", options.*.socketName)
+        return 1
+    }
+    output_module.init(&daemon.*.output, allocator)
+    openOutput(daemon)
+    const output = &daemon.*.output
+    daemon.*.drawing = output.*.kind != output_module.Kind.none || options.*.hasSnapshot
+    if output.*.kind == output_module.Kind.none { output_module.openNone(output, options.*.width, options.*.height) }
+    if !scene_module.init(daemon.*.scene, output.*.width, output.*.height, options.*.mode, allocator) {
+        system.say("out of memory for the picture")
+        return 1
+    }
+    if options.*.useTerminal && output.*.kind != output_module.Kind.none { daemon.*.terminal = output_module.takeTerminal(options.*.terminalPath) }
+    daemon.*.signals = system.signalDescriptor()
+    daemon.*.expected = lastBoot(options)
+    if options.*.hasPidPath { writePid(options.*.pidPath) }
+    notifyReady(environment)
+    daemon.*.started = system.seconds()
+
+    while !daemon.*.quitting { step(daemon) }
+    finish(daemon)
+    return 0
+}
+
+// The screen: the card or framebuffer asked for, else the first that
+// works (a KMS card, then /dev/fb0), else none.
+fn openOutput(daemon: *Daemon) -> void {
+    const options = daemon.*.options
+    const output = &daemon.*.output
+    const choice = options.*.output
+    if choice == options_module.OutputChoice.none { return }
+    if choice != options_module.OutputChoice.fbdev {
+        if options.*.cardDescriptor >= 0 {
+            if output_module.openCard(output, options.*.cardDescriptor) { return }
+        } else if options.*.hasCardPath {
+            const descriptor = system.open(options.*.cardPath, system.O_RDWR | system.O_NOCTTY | system.O_NONBLOCK)
+            if descriptor >= 0 && output_module.openCard(output, descriptor) { return }
+        } else if output_module.findCard(output) {
+            return
+        }
+        if choice == options_module.OutputChoice.kms {
+            system.say("no KMS card with a connected monitor")
+            return
+        }
+    }
+    if output_module.openFramebuffer(output, options.*.framebufferPath) { return }
+    system.say("no screen to draw on (no KMS card, no 32-bit framebuffer); answering requests only")
+}
+
+// One turn: the progress, the console's prompts, a frame when one is due,
+// then waiting for what comes next.
+fn step(daemon: *Daemon) -> void {
+    const scene = daemon.*.scene
+    const output = &daemon.*.output
+    const time = now(daemon)
+    if scene.*.mode == state.Mode.boot { scene_module.setProgress(scene, bootProgress(daemon, time)) }
+    if time >= daemon.*.nextAskCheck {
+        checkPrompts(daemon)
+        daemon.*.nextAskCheck = time + 0.5
+    }
+    var wait: f64 = 0.5
+    if daemon.*.drawing && output_module.ready(output) {
+        const gap = paint.clamp(3.0 * daemon.*.frameCost, daemon.*.interval, 1.0)
+        const due = daemon.*.lastFrame + gap
+        if daemon.*.lastFrame < 0.0 || time >= due {
+            drawFrame(daemon, time)
+            wait = gap
+        } else {
+            wait = due - time
+        }
+    }
+    if wait > daemon.*.nextAskCheck - time { wait = paint.clamp(daemon.*.nextAskCheck - time, 0.0, 0.5) }
+    waitEvents(daemon, @intCast(isize, paint.toInt(wait * 1000.0)) + 1)
+}
+
+fn drawFrame(daemon: *Daemon, time: f64) -> void {
+    const begun = system.seconds()
+    scene_module.draw(daemon.*.scene, time)
+    const shown = output_module.show(&daemon.*.output, daemon.*.scene)
+    daemon.*.frameCost = system.seconds() - begun
+    daemon.*.lastFrame = time
+}
+
+// Waits up to `timeout` milliseconds for a signal, a connection, a request
+// or the card's flip, and handles what came.
+fn waitEvents(daemon: *Daemon, timeout: isize) -> void {
+    var entries: [160]u8 = undefined
+    var bytes: [*]u8 = undefined
+    unsafe { bytes = @ptrCast([*]u8, &entries) }
+    system.pollSet(bytes, 0, daemon.*.signals, system.POLLIN)
+    system.pollSet(bytes, 1, daemon.*.server.listener, system.POLLIN)
+    system.pollSet(bytes, 2, output_module.descriptor(&daemon.*.output), system.POLLIN)
+    var count: usize = 3
+    var index: usize = 0
+    while index < protocol.MAX_CLIENTS {
+        system.pollSet(bytes, count, daemon.*.server.clients[index].descriptor, system.POLLIN)
+        count += 1
+        index += 1
+    }
+    const ready = system.poll(bytes, count, timeout)
+    if ready <= 0 { return }
+    if system.pollResult(bytes, 0) != 0 {
+        // SIGTERM, SIGINT, SIGHUP: quit, the console back.
+        var information: [128]u8 = undefined
+        unsafe { const got = system.read(daemon.*.signals, @ptrCast([*]u8, &information), 128) }
+        daemon.*.quitting = true
+    }
+    if system.pollResult(bytes, 2) != 0 { output_module.readEvents(&daemon.*.output) }
+    if system.pollResult(bytes, 1) != 0 { protocol.acceptAll(&daemon.*.server) }
+    index = 0
+    while index < protocol.MAX_CLIENTS {
+        if system.pollResult(bytes, 3 + index) != 0 && daemon.*.server.clients[index].descriptor >= 0 {
+            if protocol.receive(&daemon.*.server, index) {
+                var request: protocol.Request = undefined
+                while protocol.next(&daemon.*.server, index, &request) { handle(daemon, index, &request) }
+            }
+        }
+        index += 1
+    }
+}
+
+// One request (see protocol.mlx for how they come).
+fn handle(daemon: *Daemon, index: usize, request: *const protocol.Request) -> void {
+    const server = &daemon.*.server
+    const scene = daemon.*.scene
+    if !request.*.fromRoot {
+        protocol.answer(server, index, protocol.NAK)
+        return
+    }
+    const argument = protocol.argumentOf(request)
+    const command = request.*.command
+    var reply = protocol.ACK
+    if command == 85 {
+        // U: the unit systemd is starting or stopping.
+        scene_module.setUnit(scene, argument)
+    } else if command == 67 {
+        // C: change-mode.
+        var mode = scene.*.mode
+        if options_module.parseMode(argument, &mode) { scene_module.setMode(scene, mode) }
+    } else if command == 117 {
+        // u: system-update, a percentage.
+        var percent: usize = 0
+        if options_module.parseNumber(argument, &percent) && percent <= 100 {
+            scene_module.setProgress(scene, paint.toFloat(percent) / 100.0)
+            scene.*.showProgress = true
+        }
+    } else if command == 81 {
+        // Q: quit (its argument's first byte set: retain the splash). The
+        // answer comes when done.
+        daemon.*.retain = daemon.*.retain || (argument.length > 0 && argument[0] != 0)
+        daemon.*.quitWaiting[index] = true
+        daemon.*.quitting = true
+        return
+    } else if command == 68 {
+        // D: deactivate, the card to someone else.
+        output_module.deactivate(&daemon.*.output)
+    } else if command == 114 {
+        // r: reactivate.
+        output_module.reactivate(&daemon.*.output)
+        daemon.*.lastFrame = -1.0
+    } else if command == 77 {
+        // M: show a message.
+        scene_module.setMessage(scene, argument)
+    } else if command == 109 {
+        // m: hide that message.
+        scene_module.hideMessage(scene, argument)
+    } else if command == 65 {
+        // A: pause the progress.
+        if !daemon.*.paused {
+            daemon.*.paused = true
+            daemon.*.pausedAt = now(daemon)
+        }
+    } else if command == 97 {
+        // a: unpause it.
+        if daemon.*.paused {
+            daemon.*.paused = false
+            daemon.*.pausedFor += now(daemon) - daemon.*.pausedAt
+        }
+    } else if command == 36 {
+        // $: show the splash.
+        daemon.*.hiddenByRequest = false
+        reveal(daemon)
+    } else if command == 72 {
+        // H: hide it, the console instead.
+        daemon.*.hiddenByRequest = true
+        conceal(daemon)
+    } else if command == 86 {
+        // V: whether there is a terminal under the splash.
+        if daemon.*.terminal < 0 { reply = protocol.NAK }
+    } else if command == 80 || command == 83 || command == 82 || command == 108 || command == 33 {
+        // P (ping), S (system initialized), R (new root), l (reload),
+        // ! (an error to show): nothing to do but say so.
+    } else {
+        // Passwords, questions and keystrokes are not taken here (the
+        // console's own agent asks), nor anything unknown.
+        reply = protocol.NAK
+    }
+    protocol.answer(server, index, reply)
+}
+
+// The console instead of the picture, and back (unless something else
+// still wants the console).
+fn conceal(daemon: *Daemon) -> void {
+    output_module.hide(&daemon.*.output)
+    output_module.textMode(daemon.*.terminal)
+}
+
+fn reveal(daemon: *Daemon) -> void {
+    if daemon.*.asking || daemon.*.hiddenByRequest { return }
+    output_module.graphicsMode(daemon.*.terminal)
+    output_module.unhide(&daemon.*.output)
+    daemon.*.lastFrame = -1.0
+}
+
+// A password asked for on the console: its prompt must be seen.
+fn checkPrompts(daemon: *Daemon) -> void {
+    const asking = system.hasEntry(daemon.*.options.*.askDirectory, "ask.")
+    if asking && !daemon.*.asking {
+        daemon.*.asking = true
+        conceal(daemon)
+    } else if !asking && daemon.*.asking {
+        daemon.*.asking = false
+        reveal(daemon)
+    }
+}
+
+// The bar at boot: the time so far against the last boot's, most of the
+// way in that time, then creeping on toward the end.
+fn bootProgress(daemon: *Daemon, time: f64) -> f64 {
+    const elapsed = (if daemon.*.paused { daemon.*.pausedAt } else { time }) - daemon.*.pausedFor
+    const fraction = elapsed / daemon.*.expected
+    if fraction < 1.0 { return 0.9 * fraction }
+    return 0.9 + 0.09 * (1.0 - 1.0 / fraction)
+}
+
+// Quitting: a snapshot when asked, the bar filled and the picture faded
+// out (unless it is to stay for the display manager), the screen and the
+// console given back, the boot's length kept, and the answer to whoever
+// asked.
+fn finish(daemon: *Daemon) -> void {
+    const scene = daemon.*.scene
+    const output = &daemon.*.output
+    const options = daemon.*.options
+    const time = now(daemon)
+    // The last frame as it was, before fading.
+    if options.*.hasSnapshot {
+        if !png.saveFile(options.*.snapshotPath, scene.*.frame.pixels, scene.*.width, scene.*.height, scene.*.frame.stride, false, std.page_allocator.init()) { system.say("the snapshot could not be written") }
+    }
+    if !daemon.*.retain && daemon.*.drawing && !output.*.hidden && !output.*.released {
+        scene_module.setProgress(scene, 1.0)
+        const begun = system.seconds()
+        var faded = false
+        while !faded {
+            const elapsed = system.seconds() - begun
+            faded = elapsed >= FADE
+            if output_module.ready(output) {
+                scene_module.setBrightness(scene, if faded { 0.0 } else { 1.0 - elapsed / FADE })
+                drawFrame(daemon, time + elapsed)
+            }
+            waitEvents(daemon, 16)
+        }
+    }
+    output_module.close(output, daemon.*.retain)
+    if !daemon.*.retain { output_module.textMode(daemon.*.terminal) }
+    system.close(daemon.*.terminal)
+    if scene.*.mode == state.Mode.boot { keepBoot(options, time) }
+    var index: usize = 0
+    while index < protocol.MAX_CLIENTS {
+        if daemon.*.quitWaiting[index] { protocol.answer(&daemon.*.server, index, protocol.ACK) }
+        index += 1
+    }
+    protocol.closeAll(&daemon.*.server)
+}
+
+// ---------------------------------------------------------------------------
+// The boot's length
+
+fn lastBoot(options: *const Options) -> f64 {
+    var buffer: [32]u8 = undefined
+    var bytes: [*]u8 = undefined
+    unsafe { bytes = @ptrCast([*]u8, &buffer) }
+    const length = system.readFile(options.*.durationPath, bytes, 32)
+    if length <= 0 { return DEFAULT_BOOT }
+    var seconds: f64 = 0.0
+    if !options_module.parseDecimal(bytes[0..@bitCast(usize, length)], &seconds) || seconds < 1.0 || seconds > 600.0 { return DEFAULT_BOOT }
+    return seconds
+}
+
+// The seconds with two decimals and a newline.
+fn keepBoot(options: *const Options, seconds: f64) -> void {
+    if seconds < 1.0 { return }
+    const hundredths = @intCast(usize, paint.round(seconds * 100.0))
+    var text: [32]u8 = undefined
+    var length = writeNumber(&text, 0, hundredths / 100)
+    text[length] = 46
+    text[length + 1] = @intCast(u8, 48 + (hundredths / 10) % 10)
+    text[length + 2] = @intCast(u8, 48 + hundredths % 10)
+    text[length + 3] = 10
+    var slice: []const u8 = undefined
+    unsafe { slice = @ptrCast([*]const u8, &text)[0..length + 4] }
+    if !system.replaceFile(options.*.durationPath, slice) { system.sayAbout("the boot's length could not be kept in ", system.cString(options.*.durationPath)) }
+}
+
+fn writeNumber(into: *[32]u8, at: usize, value: usize) -> usize {
+    var digits: [20]u8 = undefined
+    var count: usize = 0
+    var rest = value
+    while true {
+        digits[count] = @intCast(u8, 48 + rest % 10)
+        count += 1
+        rest = rest / 10
+        if rest == 0 { break }
+    }
+    var length = at
+    while count > 0 {
+        count -= 1
+        into.*[length] = digits[count]
+        length += 1
+    }
+    return length
+}
+
+fn writePid(path: [*]const u8) -> void {
+    var text: [32]u8 = undefined
+    const pid = @bitCast(usize, std.linux.syscall0(system.SYS_getpid))
+    const length = writeNumber(&text, 0, pid)
+    text[length] = 10
+    var slice: []const u8 = undefined
+    unsafe { slice = @ptrCast([*]const u8, &text)[0..length + 1] }
+    if !system.replaceFile(path, slice) { system.sayAbout("the pid file could not be written: ", system.cString(path)) }
+}
+
+// Under systemd (Type=notify): ready once the socket listens, so the units
+// ordered after this one can talk to it.
+fn notifyReady(environment: [*][*]const u8) -> void {
+    const named = std.process.environmentFrom(environment, "NOTIFY_SOCKET")
+    if named == null { return }
+    const path = std.string.asSlice(named.?)
+    if path.length == 0 || path.length > 107 { return }
+    var address: [110]u8 = undefined
+    address[0] = 1
+    address[1] = 0
+    var index: usize = 0
+    while index < path.length {
+        address[2 + index] = path[index]
+        index += 1
+    }
+    if address[2] == 64 { address[2] = 0 }
+    // AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC; MSG_NOSIGNAL.
+    const socket = std.linux.syscall3(system.SYS_socket, 1, 524290, 0)
+    if socket < 0 { return }
+    const sent = std.linux.syscall6(system.SYS_sendto, @bitCast(usize, socket), @intFromPtr("READY=1"), 7, 16384, @intFromPtr(&address), 2 + path.length)
+    system.close(socket)
+}
