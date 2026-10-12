@@ -10,7 +10,9 @@
 #   - the line editor through a pty: cursor keys, Ctrl-A/K, history recall,
 #     completion, Ctrl-C, Ctrl-D, the history file;
 #   - job control through a pty: Ctrl-Z, jobs, bg, fg, kill %n, wait %n,
-#     and traps, aliases and set -u in an interactive session.
+#     and traps, aliases and set -u in an interactive session;
+#   - a long loop does not grow the shell (its turns give their values
+#     back), and everything above runs with what they give back poisoned.
 #
 #   tools/check_shell.sh [compiler]
 set -euo pipefail
@@ -32,6 +34,9 @@ grep -q mlxCompositorCrashed "$sh" || fail "mlx-sh has no crash handler"
 command -v dash > /dev/null || fail "dash is needed for the comparison"
 export HOME=$work/home
 mkdir -p "$HOME"
+# The values each loop turn, item and command gives back are overwritten:
+# one kept past its turn shows as a wrong result.
+export MLX_TURNS_POISON=1
 cd "$work"
 printf 'one\ntwo\n' > two.txt
 touch alpha.txt beta.txt gamma.md
@@ -93,6 +98,9 @@ echo "a=$a b=$b"; echo "x  y" | { read l; echo "<$l>"; }'
     'trap "echo bye" EXIT; echo main'
     'echo done; exit 7'
     'x=$(printf "%s" "$(seq 1 3000 | tr -d "\n")"); echo ${#x}'
+    # Enough values set again to compact the variables' arena while a
+    # later variable's name lies before an earlier one's newest value.
+    'x=; n=0; while test $n -lt 1200; do x="${x}abc"; n=$((n+1)); done; echo $n ${#x}'
     'echo one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen'
     'echo ~ | grep -c /; echo "~"; echo ~/x | grep -c home'
     'echo $(( 2 ** 3 )) 2>/dev/null || echo no-power'
@@ -373,8 +381,9 @@ log += send(b"fg\r", 0.8)
 log += send(b"\x03", 0.8)                # Ctrl-C ends it
 log += send(b"echo after-int=$?\r", 0.6)
 log += send(b"sleep 30 &\r", 0.6)
-log += send(b"kill %1\r", 0.6)
-log += send(b"wait %1; echo waited=$?\r", 0.8)
+# One line: at a prompt between them the job may already be reported done
+# (and forgotten, as bash does), which would make wait %1 a race.
+log += send(b"kill %1; wait %1; echo waited=$?\r", 0.8)
 log += send(b"jobs; echo jobs-done\r", 0.6)
 log += send(b"trap 'echo trapped' USR1; kill -USR1 $$\r", 0.8)
 log += send(b"alias hi='echo hello'\r", 0.5)
@@ -398,5 +407,13 @@ for expected in '^\[1\]+ Stopped  sleep 30' '^status=148' '^\[1\]+ sleep 30 &' '
     grep -q -- "$expected" <<< "$plain" || fail "job control: no '$expected' in the session" "$work/jobs.log"
 done
 echo "ok   job control on a pty: Ctrl-Z, jobs, bg, fg, Ctrl-C, kill %n, wait %n; traps, aliases and set -u in a session"
+
+# --- A long loop: its turns give their values back, so the shell stays
+# small (it grew by about 17 KiB a turn and failed after some 60000).
+resident() { "$sh" -c "i=0; while test \$i -lt $1; do i=\$((i+1)); x=\"\$x\$i\"; done; for w in a b c; do :; done; grep VmRSS /proc/\$\$/status" | awk '{ print $2 }'; }
+small=$(resident 200)
+large=$(resident 20000)
+[[ -n "$small" && -n "$large" && $large -lt $((small + 4096)) ]] || fail "a loop of 20000 turns grew the shell from $small KiB to $large KiB"
+echo "ok   a loop of 20000 turns: $large KiB resident (200 turns: $small KiB)"
 
 echo PASS
