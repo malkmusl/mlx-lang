@@ -316,7 +316,14 @@ parameters (none / a parameter's own type / a `comptime T: type` parameter
 aggregate type that declares it — the comment notes this is "keeping
 ownership on the declaration symbol" rather than pretending methods are
 runtime struct fields, i.e. methods are resolved statically through the
-symbol table, not stored as function-pointer fields.
+symbol table, not stored as function-pointer fields. The symbol store
+keeps them in two hash indexes: by owner and name (`methodBuckets`), and
+by name alone (`nameBuckets`, `firstNamed`/`nextNamed`) for the lookups
+that compare owners by kind and declaration rather than by type id
+(`aggregateMethodIndex` in lowering, `aggregateMethodCompatible` in
+sema). Both take the lowest matching symbol, as the linear scans over
+every symbol they replace did, so the output is the same; compiling the
+compositor went from 16 s to 2 s with them.
 
 `sema/declarations.mlx` resolves top-level bindings and function signatures
 before any function body is analyzed (so mutually recursive top-level
