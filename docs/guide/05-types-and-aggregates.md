@@ -10,7 +10,8 @@
 `99_enum_duplicate_value.mlx`, `100_union_explicit_tag_mismatch.mlx`,
 `104_optional_pointer_null_runtime.mlx`, `174_aggregate_functions_runtime.mlx`,
 `176_pointer_struct_fields_runtime.mlx`, `212_aggregate_index_runtime.mlx`,
-`319_array_pointer_runtime.mlx`, `320_array_pointer_const_mismatch.mlx`
+`319_array_pointer_runtime.mlx`, `320_array_pointer_const_mismatch.mlx`,
+`321_slice_pointer_runtime.mlx`
 
 ## Structs
 
@@ -334,6 +335,27 @@ pub fn main() u8 {
 ```
 
 (`tests/65_index_slice_runtime.mlx`)
+
+A slice has two fields: `.length`, a `usize`, and `.pointer`, its first
+word, a many-item pointer to the elements (`[*]T`, or `[*]const T` for a
+`[]const T`). `.pointer` is how a slice reaches a function that takes a
+`[*]const u8`, with no `unsafe` cast:
+
+```mlx
+fn first(bytes: [*]const u8) -> u8 {
+    return bytes[0]
+}
+
+pub fn main() -> u8 {
+    const text: []const u8 = "hello"
+    if first(text.pointer) != 104 { return 1 }
+    const tail = text[2..]
+    if tail.pointer[0] != 108 { return 2 }
+    return 13
+}
+```
+
+(`tests/321_slice_pointer_runtime.mlx`)
 
 ```mlx
 noinline fn readAt(index: usize) -> u8 {

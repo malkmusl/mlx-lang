@@ -330,6 +330,22 @@ steps_many_pointers() {
     return $ok
 }
 
+# Whether $1 gives a slice's first word as `.pointer`, a [*]T
+# (tests/321_slice_pointer_runtime.mlx exits 13); std and the programs
+# pass `text.pointer` where they cast the slice before.
+reads_slice_pointers() {
+    local probe
+    probe=$(mktemp -d mlx-out/probe.XXXXXX)
+    local ok=1
+    if "$1" --quiet tests/321_slice_pointer_runtime.mlx -o "$probe/probe" > /dev/null 2>&1; then
+        local status=0
+        "$probe/probe" > /dev/null 2>&1 || status=$?
+        [[ $status -eq 13 ]] && ok=0
+    fi
+    rm -rf -- "$probe"
+    return $ok
+}
+
 # Whether $1 writes the files it read with --depfile (what `mlx build`
 # decides rebuilds by).
 writes_depfiles() {
@@ -377,6 +393,7 @@ probes=(
     "stores_through_slice_addresses|slices stored through their address keeping their length"
     "returns_wide_tuples|tuples of more than three words"
     "steps_many_pointers|array pointers as many-item pointers, p + n"
+    "reads_slice_pointers|a slice's .pointer"
     "writes_depfiles|--depfile"
     "runs_build|the build command (mlx build)"
 )
