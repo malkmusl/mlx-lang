@@ -378,6 +378,22 @@ returns_wide_error_payloads() {
     return $ok
 }
 
+# Whether $1 has @floor, @ceil and @trunc
+# (tests/324_float_rounding_runtime.mlx exits 13); std.math rounds with
+# them.
+rounds_floats() {
+    local probe
+    probe=$(mktemp -d mlx-out/probe.XXXXXX)
+    local ok=1
+    if "$1" --quiet tests/324_float_rounding_runtime.mlx -o "$probe/probe" > /dev/null 2>&1; then
+        local status=0
+        "$probe/probe" > /dev/null 2>&1 || status=$?
+        [[ $status -eq 13 ]] && ok=0
+    fi
+    rm -rf -- "$probe"
+    return $ok
+}
+
 # Whether $1 writes the files it read with --depfile (what `mlx build`
 # decides rebuilds by).
 writes_depfiles() {
@@ -428,6 +444,7 @@ probes=(
     "reads_slice_pointers|a slice's .pointer"
     "folds_float_literals|arithmetic on float literals"
     "returns_wide_error_payloads|error union payloads of several words"
+    "rounds_floats|@floor, @ceil and @trunc"
     "writes_depfiles|--depfile"
     "runs_build|the build command (mlx build)"
 )

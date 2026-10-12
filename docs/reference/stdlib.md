@@ -813,6 +813,45 @@ pub fn main() -> u8 {
 
 (`tests/161_standard_io_runtime.mlx`)
 
+## math (`std.math`)
+
+**Implementation:** `std/src/math.mlx`
+**Source tests:** `325_standard_math_runtime.mlx`, `324_float_rounding_runtime.mlx`
+
+Floating-point math in Mlx on the doubles' bits, without libm. Import it as
+`@import("std.math")`; it imports nothing itself, so a `--plugin` library
+can use it too.
+
+- Constants: `pi`, `tau`, `e`, `ln2`, `ln10`, `sqrt2` (`f64`), and
+  `infinity()`, `negativeInfinity()`, `nan()`, `isNan(x)`, `abs(x)`.
+- Whole numbers: `floor`, `ceil`, `trunc` are the builtins `@floor`,
+  `@ceil`, `@trunc` (one instruction); `round(x)` rounds halves away from
+  zero. The square root is `@sqrt`.
+- `sin(x)`, `cos(x)`: argument reduction by pi/2 in three parts, then
+  fdlibm's minimax kernels; within an ulp of the exact value for |x| up to
+  about 2^20 pi, 0 past 2^52 (NaN for the infinities and NaN).
+- `exp(x)`, `ln(x)`, `log2(x)`, `log10(x)`: fdlibm's reductions and
+  polynomials, within an ulp; `log2` and `log10` take the exponent exactly,
+  so whole powers of two and of ten come out exact. `ln` of 0 is minus
+  infinity, of a negative number NaN; `exp` overflows to infinity past
+  709.78 and underflows to 0 below -745.13.
+- `pow(x, y)` for `x > 0` (`exp(y ln x)`: a few ulps for results up to
+  about 2^50), `cbrt(x)` for any sign.
+
+```mlx
+const math = @import("std.math")
+
+pub fn main() -> u8 {
+    if @bitCast(u64, math.sin(1.0)) != 4605754516372524270 { return 1 }   // the correctly rounded sin(1)
+    if math.log10(1000.0) != 3.0 || math.log2(1024.0) != 10.0 { return 6 }
+    if math.round(-2.5) != -3.0 { return 8 }
+    if !math.isNan(math.ln(-1.0)) { return 9 }
+    return 13
+}
+```
+
+(`tests/325_standard_math_runtime.mlx`)
+
 ## fmt
 
 **Normative source:** `spec/04-stdlib/fmt.xml`
