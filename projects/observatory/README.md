@@ -676,16 +676,19 @@ of popping up.
   resolves each name to what it declares. For the whole repository (700
   files, 64,000 declarations, 340,000 uses) that takes about 1.5 seconds.
 - [`graph.mlx`](graph.mlx) makes the tree of nodes (folders, files,
-  declarations, members) and lays it out:
+  declarations, members), works out a node's connections and ranks search
+  matches. [`layout.mlx`](layout.mlx) lays the tree out:
   - a folder's children are packed close, the biggest first, each where the
     whole stays smallest without touching the others;
-  - a file's declarations sit on a sphere around it.
+  - a file's declarations sit on a sphere around it;
+  - then the uses pull for 36 rounds, springs holding each node near where
+    it was packed.
 
-  It also works out a node's connections and ranks search matches.
+  For the whole repository (47,000 nodes) that takes about a second.
 - [`main.mlx`](main.mlx) holds the app's state and its frame loop; its
   parts each take one area: [`map_view.mlx`](map_view.mlx) projects the
-  nodes with an orbit camera ([`math3d.mlx`](math3d.mlx): sqrt, sin, cos,
-  ln and exp, written out), makes the frame's primitives and places labels
+  nodes with an orbit camera ([`math3d.mlx`](math3d.mlx): sin, cos, ln
+  and exp written out, the square root `@sqrt`), makes the frame's primitives and places labels
   so none covers another; [`navigation.mlx`](navigation.mlx) (reading,
   selecting, searching), [`input.mlx`](input.mlx), [`drawing.mlx`](drawing.mlx)
   and [`detail.mlx`](detail.mlx) (the panels), [`tabs.mlx`](tabs.mlx),
