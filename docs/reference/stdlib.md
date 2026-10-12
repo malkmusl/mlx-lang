@@ -317,14 +317,15 @@ both ways and reads it back with `loadFile`.
 
 **Normative source:** `spec/04-stdlib/mem.xml`
 **Implementation:** `std/bootstrap/allocator.mlx`, `page_allocator.mlx`,
-`arena_allocator.mlx`, `fixed_buffer_allocator.mlx`,
-`general_purpose_allocator.mlx`, `debug_allocator.mlx`, `mem.mlx`;
-`std/src/leaks.mlx`
+`tinypage_allocator.mlx`, `arena_allocator.mlx`,
+`fixed_buffer_allocator.mlx`, `general_purpose_allocator.mlx`,
+`debug_allocator.mlx`, `mem.mlx`; `std/src/leaks.mlx`
 **Source tests:** `120_bootstrap_mem_runtime.mlx`,
 `131_bootstrap_allocator_runtime.mlx`, `132_page_allocator_runtime.mlx`,
 `137_bootstrap_arena_allocators_runtime.mlx`,
 `296_general_purpose_allocator_runtime.mlx`,
-`314_debug_allocator_runtime.mlx` (`tests/run_debug_allocator.sh`)
+`314_debug_allocator_runtime.mlx`, `315_tinypage_runtime.mlx`
+(`tests/run_debug_allocator.sh`)
 
 `spec/04-stdlib/mem.xml` specifies an `Allocator` with `alloc`/`resize`/`free`
 operations, four allocator kinds (`PageAllocator`, `ArenaAllocator`,
@@ -357,7 +358,8 @@ pub const Allocator = struct {
 (`std/bootstrap/allocator.mlx`)
 
 All four spec'd allocators are implemented: `page_allocator.mlx` (backed
-directly by `mmap`/`munmap` via `std.os.linux`), `arena_allocator.mlx`
+directly by `mmap`/`munmap` via `std.os.linux`, small blocks on tiny
+pages, below), `arena_allocator.mlx`
 (bump-allocates out of one page-allocated block, with `reset`/`deinit`;
 as Zig's, its last block grows and shrinks in place, so a list growing at
 the arena's end is not copied and what it gives back is used again),
@@ -449,9 +451,9 @@ that file (each line names the program and its process), `0` or nothing
 watches nothing. While a watched program runs, its memory is written
 about once a second (from the main thread, as blocks come and go, and at
 each mark and report) to `$XDG_RUNTIME_DIR/mlx/memory/PROGRAM-PID.memory`:
-the totals, each place with its functions (as crashes name them), each
-block (address, bytes, place, since the mark or kept) and the program's
-mappings. `mlx-codemap memory [PROGRAM]` and Memory under Findings in MLX
+the totals, how full the tiny pages are, each place with its functions
+(as crashes name them), each block (address, bytes, place, since the mark
+or kept, what it takes in pages) and the program's mappings. `mlx-codemap memory [PROGRAM]` and Memory under Findings in MLX
 Observatory read it: what the page blocks waste by size class, the holes
 between them and how scattered they are, and the places that hold the
 most or grow. The report also says when the compiler's value arena
@@ -466,6 +468,56 @@ settings, terminal, notifications, the Observatory), the compositor,
 mlx-ipcd, mlx-audiod, mlx-netd, mlx-console and mlx-splash call these.
 The compositor's modules are images of their own with their own page
 allocator, and are not watched.
+
+#### Tiny pages: `std.tinypage_allocator`
+
+Most programs take `std.page_allocator.init()` for every block, and a
+mapping of its own for a block of 40 bytes takes a page of 4 KiB: 99% of
+it wasted, and a mapping more for the kernel to keep. So the page
+allocator puts every block of up to 2 KiB (`LIMIT`) on tiny pages: a page
+is split into 64 tiny pages of 64 bytes, and a block takes a run of them
+in one page, the first run that fits. A small block so squeezes in where
+one went before, between the blocks still there, and gives its tiny
+pages back when it is freed. Two bitmaps per page say what is taken (the
+tiny pages in use, and where each block starts), a byte per page its
+longest free run and one per 64 pages theirs, so a search skips full
+pages without looking at their bits. A free needs no length: one freed
+with a wrong length still frees the block it names, and one freed twice
+is seen and left be. Blocks come zeroed, as fresh pages do; alignments
+up to 2 KiB are honoured, larger blocks and page alignments get whole
+pages as before.
+
+The pages lie in one region at a fixed address (`BASE`,
+0x200000000000), reserved with `MAP_FIXED_NOREPLACE` and made writable a
+megabyte at a time, which every image of a process shares: the program,
+its shared objects and plugins. The first that needs the region maps it,
+the others find it there (a header with a magic word and a futex lock),
+so a block taken in one image can be freed in another, and whether an
+address is a tiny block is a range check. When the region cannot be had
+(a kernel without `MAP_FIXED_NOREPLACE`, a small address space) every
+block gets whole pages. Empty pages keep their memory while there are
+few (64); past that, an emptied page's memory goes back to the kernel
+(`MADV_DONTNEED`).
+
+```mlx
+const pages = std.page_allocator.init()
+const name = pages.alloc(40, 8).?      // 64 bytes of a shared page
+pages.free(name, 40, 8)                // the run is free for the next one
+var usage: std.tinypage_allocator.Usage = undefined
+std.tinypage_allocator.usage(&usage)   // pages, blocks, bytes, empty pages
+```
+
+`std.page_allocator.footprint(address, length)` says what a block takes
+from the address space: its tiny pages or its whole pages. The debug
+allocator's watch still sees every block, and std.leaks' snapshots give
+each block its footprint and say how full the tiny pages are (Memory in
+MLX Observatory draws them as a strip of pages, each filled as far as it
+is taken). In MLX Observatory reading this repository, the blocks below
+4 KiB took 24 KiB of pages instead of 84 KiB (10% wasted instead of
+74%), those below 256 bytes 640 bytes instead of 20 KiB.
+`315_tinypage_runtime.mlx` takes and frees blocks of every size,
+squeezes one into a freed run between two others, frees with a wrong
+length and twice, and has four threads take and free at once.
 
 A runtime fixture exercises fixed-buffer alignment/reset and arena
 alignment/reset/deinit together:

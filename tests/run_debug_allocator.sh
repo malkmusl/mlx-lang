@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# std.debug_allocator and std.leaks with the self-hosted compiler:
+# std.tinypage_allocator, std.debug_allocator and std.leaks with the
+# self-hosted compiler: tests/315_tinypage_runtime.mlx runs (small blocks
+# of the page allocator on tiny pages, four threads at once);
 # tests/314_debug_allocator_runtime.mlx runs (a double free, an invalid
 # free, a wrong length, a leak, poison, a resize; then the page allocator
 # watched, a block kept on purpose), and its reports name the functions;
@@ -25,6 +27,15 @@ fail() {
     echo "FAIL $1"
     failures=$((failures + 1))
 }
+
+"$compiler" --quiet tests/315_tinypage_runtime.mlx -o "$work/tiny"
+status=0
+"$work/tiny" > "$work/tiny.out" 2>&1 || status=$?
+if [[ $status -eq 13 ]]; then
+    echo "ok   315_tinypage_runtime: small blocks on tiny pages, apart, zeroed, squeezed into holes, freed by address, aligned; four threads"
+else
+    fail "315_tinypage_runtime exited $status"
+fi
 
 "$compiler" --quiet tests/314_debug_allocator_runtime.mlx -o "$work/debug"
 status=0
@@ -68,6 +79,7 @@ fi
 snapshot=$(ls "$XDG_RUNTIME_DIR"/mlx/memory/program-*.memory 2>/dev/null | head -1)
 if [[ -n "$snapshot" ]] && head -1 "$snapshot" | grep -q "^memory	program	[0-9]*	[0-9]*	11	6	5	24576	24576	28672	[0-9]*	[0-9]*$"; then
     echo "ok   the runtime writes the memory: allocations, frees, blocks, bytes, pages, peak"
+    grep -q "^tiny	[0-9]*	[0-9]*	[0-9]*	[0-9]*$" "$snapshot" && echo "ok   and how full the tiny pages are" || fail "no tiny line in the snapshot"
 else
     fail "no memory snapshot, or its totals are wrong: $(head -1 "$snapshot" 2>/dev/null)"
 fi
