@@ -3,9 +3,11 @@
 # tests/314_debug_allocator_runtime.mlx runs (a double free, an invalid
 # free, a wrong length, a leak, poison, a resize; then the page allocator
 # watched, a block kept on purpose), and its reports name the functions;
-# tests/support/leaks_program.mlx says the blocks its loop kept and the
-# arena's growth with MLX_LEAK_CHECK=1 (no growth on std.turns), and
-# nothing without it.
+# tests/support/leaks_program.mlx, watched from crash.install as every
+# program is, says the blocks its loop kept and the arena's growth with
+# MLX_LEAK_CHECK=1 (no growth on std.turns), and nothing without it; its
+# memory is written to $XDG_RUNTIME_DIR/mlx/memory, which
+# `mlx-codemap memory` reads.
 #
 #   tests/run_debug_allocator.sh [compiler]
 set -euo pipefail
@@ -15,6 +17,9 @@ cd "$repo_root"
 compiler=${1:-${MLX_COMPILER:-mlx-out/bin/compiler/mlx4}}
 work=$(mktemp -d)
 trap 'rm -rf -- "$work"' EXIT
+# The memory snapshots go here, not to the session's runtime directory.
+export XDG_RUNTIME_DIR=$work/run
+mkdir -p "$XDG_RUNTIME_DIR"
 failures=0
 fail() {
     echo "FAIL $1"
@@ -47,7 +52,7 @@ status=0
 MLX_LEAK_CHECK=1 "$work/program" 2> "$work/program.err" || status=$?
 if [[ $status -eq 3 ]]; then echo "ok   MLX_LEAK_CHECK=1: the loop's three kept blocks counted, the set-up's not"; else fail "MLX_LEAK_CHECK=1: the report counted $status blocks, not 3"; cat "$work/program.err"; fi
 expect "$work/program.err" "leak: 3 blocks, 12288 bytes" "they are said as one place"
-expect "$work/program.err" "allocated at tests/support/leaks_program.mlx:18:turn" "named by the function that allocated them"
+expect "$work/program.err" "allocated at tests/support/leaks_program.mlx:21:turn" "named by the function that allocated them"
 if grep -q "8192 bytes" "$work/program.err"; then fail "the block kept on purpose (leaks.keep) is said"; else echo "ok   a block kept on purpose (leaks.keep) is left out"; fi
 expect "$work/program.err" "values (the compiler's arena) grew by" "a loop without std.turns: the arena's growth is said"
 status=0
@@ -57,9 +62,33 @@ if [[ $status -eq 3 ]] && ! grep -q "arena) grew" "$work/turns.err"; then
 else
     fail "a loop on std.turns: exit $status, said: $(head -c 300 "$work/turns.err")"
 fi
+
+# The memory as the runtime wrote it (at the mark and the report): the
+# totals, the places with their functions, the blocks, the mappings.
+snapshot=$(ls "$XDG_RUNTIME_DIR"/mlx/memory/program-*.memory 2>/dev/null | head -1)
+if [[ -n "$snapshot" ]] && head -1 "$snapshot" | grep -q "^memory	program	[0-9]*	[0-9]*	11	6	5	24576	24576	28672	[0-9]*	[0-9]*$"; then
+    echo "ok   the runtime writes the memory: allocations, frees, blocks, bytes, pages, peak"
+else
+    fail "no memory snapshot, or its totals are wrong: $(head -1 "$snapshot" 2>/dev/null)"
+fi
+if [[ -n "$snapshot" ]] && grep -q "^place	[0-9]*	3	12288	12288	3	0	tests/support/leaks_program.mlx:21:turn	tests/support/leaks_program.mlx:[0-9]*:main" "$snapshot" \
+    && grep -q "^place	[0-9]*	1	8192	8192	0	1	tests/support/leaks_program.mlx:21:turn	" "$snapshot" \
+    && [[ $(grep -c "^block	" "$snapshot") -eq 5 ]] && grep -q "^map	[0-9a-f]*	[0-9a-f]*	r" "$snapshot"; then
+    echo "ok   with its places (since the mark, kept), named, its blocks and its mappings"
+else
+    fail "the snapshot's places, blocks or mappings: $(head -c 600 "$snapshot" 2>/dev/null)"
+fi
+"$compiler" --quiet tools/codemap/main.mlx -o "$work/mlx-codemap"
+"$work/mlx-codemap" memory program > "$work/memory.txt" 2>&1 || true
+expect "$work/memory.txt" "ended): 5 blocks, 24 KiB asked, 24 KiB in pages (0% wasted)" "mlx-codemap memory: the program's headline"
+expect "$work/memory.txt" "12 KiB in 3 blocks tests/support/leaks_program.mlx:21:4: function turn (3 since the mark)" "mlx-codemap memory: the loop's place, since the mark"
+expect "$work/memory.txt" "8192 B in 1 block tests/support/leaks_program.mlx:21:4: function turn (kept)" "mlx-codemap memory: the block kept on purpose"
+expect "$work/memory.txt" "fragmentation 0." "mlx-codemap memory: the address space and its fragmentation"
+
 status=0
+rm -rf -- "${XDG_RUNTIME_DIR:?}/mlx"
 "$work/program" 2> "$work/quiet.err" || status=$?
-if [[ $status -eq 0 && ! -s "$work/quiet.err" ]]; then echo "ok   without MLX_LEAK_CHECK nothing is watched or said"; else fail "without MLX_LEAK_CHECK: exit $status, said: $(head -c 200 "$work/quiet.err")"; fi
+if [[ $status -eq 0 && ! -s "$work/quiet.err" && ! -e "$XDG_RUNTIME_DIR/mlx/memory" ]]; then echo "ok   without MLX_LEAK_CHECK nothing is watched, said or written"; else fail "without MLX_LEAK_CHECK: exit $status, said: $(head -c 200 "$work/quiet.err")"; fi
 status=0
 MLX_LEAK_CHECK="$work/leaks.log" "$work/program" 2> "$work/file.err" || status=$?
 if [[ $status -eq 3 && ! -s "$work/file.err" ]] && grep -q "^program\[[0-9]*\]: leak: 3 blocks" "$work/leaks.log"; then
