@@ -81,6 +81,14 @@ started=$(date +%s)
 vt_open=false
 say "try of mlx-login for $seconds s; user $user ($user_id), greeter account $greeter_uid:$greeter_gid"
 
+# A compositor log without its "key CODE -> WINDOW" lines: older
+# compositors wrote every key pressed into the log (with --verbose, as
+# mlx-session and mlx-login run them), what was typed into the greeter
+# among it.
+copy_log() {
+    grep -v '^key [0-9]' "$1" > "$2"
+}
+
 # What each process of the session waits in: its threads' system calls
 # (/proc/PID/task/*/syscall: the number, then the arguments), its
 # descriptors and the sockets they are. A session that shows nothing
@@ -110,7 +118,7 @@ original_vt=$(fgconsole 2> /dev/null || echo 1)
 display_manager=$(systemctl is-active display-manager 2> /dev/null || true)
 say "VT $original_vt, display-manager.service $display_manager"
 for file in compositor.log compositor.log.old; do
-    [[ -f "$home/.config/mlx/$file" ]] && cp "$home/.config/mlx/$file" "$out/before-session-$file"
+    [[ -f "$home/.config/mlx/$file" ]] && copy_log "$home/.config/mlx/$file" "$out/before-session-$file"
 done
 id "$user" > "$out/id.txt" 2>&1
 {
@@ -156,7 +164,7 @@ else
         say "mlx-login runs (mlx-login-test.service)"
         tick=0
         while systemctl is-active --quiet mlx-login-test; do
-            [[ -f "$greeter_log" ]] && cp -f "$greeter_log" "$out/greeter-compositor.log"
+            [[ -f "$greeter_log" ]] && copy_log "$greeter_log" "$out/greeter-compositor.log"
             if (( tick % 5 == 0 )); then
                 {
                     echo "== $(date +%T)"
@@ -177,7 +185,7 @@ fi
 journalctl --since "@$started" -u mlx-login-test -u mlx-ipcd --no-pager -o short-precise > "$out/journal-mlx.txt" 2>&1
 journalctl --since "@$started" --no-pager -o short-precise -p warning > "$out/journal-warnings.txt" 2>&1
 for file in compositor.log compositor.log.old; do
-    [[ -f "$home/.config/mlx/$file" ]] && cp "$home/.config/mlx/$file" "$out/after-session-$file"
+    [[ -f "$home/.config/mlx/$file" ]] && copy_log "$home/.config/mlx/$file" "$out/after-session-$file"
 done
 [[ -f "/tmp/mlx-session-$user_id.log" ]] && cp "/tmp/mlx-session-$user_id.log" "$out/session-launcher.log"
 say "saved the logs"
