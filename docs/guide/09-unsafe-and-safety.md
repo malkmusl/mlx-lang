@@ -59,6 +59,15 @@ pub fn main() -> u8 {
 (`tests/327_unsafe_expression_runtime.mlx`; a statement that begins with
 `unsafe` is the block form.)
 
+The boundary is lexical: an `unsafe` followed by a brace covers everything
+up to the matching brace, and the compiler checks it on each module's
+tokens before typing anything, so every `@ptrFromInt` and `@ptrCast`
+outside one is reported once, at the cast. A cast that only changes a
+pointer's static type is often not needed at all, and then it needs no
+`unsafe` either: `&lock` of a `u32` already is a `*u32`, any `*T` goes
+where a `*anyopaque` is wanted, a `*[N]T` where a `[*]T` is, and a string
+or a slice gives its address as `.pointer`.
+
 An invalid alignment value (not a power of two) is rejected even inside
 `unsafe {}` — the unsafe boundary opts into raw-pointer construction, not
 into malformed types:

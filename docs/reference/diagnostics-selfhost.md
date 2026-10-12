@@ -51,6 +51,23 @@ tests/326_unknown_name.mlx:10:11: error: MLX-E4001: invalid local declaration
 `tests/12_unknown_builtin.mlx` gets ``unknown builtin `print` ``, the code the
 bootstrap compiler gives it too.
 
+## `MLX-E7004` (`UnsafeOperationOutsideUnsafeBlock`): pointer casts outside unsafe
+
+`@ptrFromInt` and `@ptrCast` are allowed only inside an unsafe block or an
+`unsafe { expression }` (`spec/00-language/unsafe.xml`). Unsafe is a
+lexical boundary, so the compiler checks it on each module's tokens before
+it types anything: an `unsafe` followed by a brace covers everything up to
+the matching brace, and each cast outside one is reported at the cast,
+once, whatever typing does with the expression afterwards.
+`tests/14_unsafe_ptr_builtin.mlx`:
+
+```text
+tests/14_unsafe_ptr_builtin.mlx:3:17: error: MLX-E7004: `@ptrFromInt` outside unsafe: an address made from an integer has no provenance, so it needs an unsafe block or `unsafe { expression }`
+```
+
+[Unsafe and safety](../guide/09-unsafe-and-safety.md) lists the casts that
+are not needed in the first place.
+
 ## `MLX-E4001` (`TypeMismatch`): tuple return arity
 
 The guide's table cites `tests/09_type_errors.mlx` for `MLX-E4001`, but a

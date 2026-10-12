@@ -403,6 +403,14 @@ reports_unknown_names() {
     grep -q "MLX-E3001: unknown name" <<< "$output"
 }
 
+# Whether $1 rejects @ptrFromInt and @ptrCast outside unsafe (MLX-E7004,
+# tests/14_unsafe_ptr_builtin.mlx); older compilers took them anywhere.
+enforces_unsafe() {
+    local output
+    output=$("$1" --quiet tests/14_unsafe_ptr_builtin.mlx -o /dev/null 2>&1) || true
+    grep -q "MLX-E7004: \`@ptrFromInt\` outside unsafe" <<< "$output"
+}
+
 # Whether $1 takes `unsafe { expression }` where a value is wanted
 # (tests/327_unsafe_expression_runtime.mlx exits 13).
 has_unsafe_expressions() {
@@ -471,6 +479,7 @@ probes=(
     "rounds_floats|@floor, @ceil and @trunc"
     "reports_unknown_names|unknown names reported (MLX-E3001)"
     "has_unsafe_expressions|unsafe { expression }"
+    "enforces_unsafe|pointer casts outside unsafe rejected (MLX-E7004)"
     "writes_depfiles|--depfile"
     "runs_build|the build command (mlx build)"
 )
