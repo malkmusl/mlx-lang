@@ -201,7 +201,8 @@ The app asks the platform through the host: `redraw`, `setTick`,
 logical pixel), `typed` and `modifiers` (the current key), `wheelPixels`,
 `showKeyboard`/`hideKeyboard`, `home` (where its files are),
 `environmentValue`, `log`; what only a desktop has (`setTitle`,
-`setBlur`, `acceptDrops`, `startDrag`) does nothing on a phone.
+`setBlur`, `setFullscreen` after `open`, `acceptDrops`, `startDrag`)
+does nothing on a phone.
 
 | Platform | Drawn by | Input |
 | --- | --- | --- |
