@@ -346,6 +346,23 @@ reads_slice_pointers() {
     return $ok
 }
 
+# Whether $1 works out arithmetic on float literals alone as floats
+# (tests/322_float_literal_arithmetic_runtime.mlx exits 13); older
+# compilers added and divided the literals' bit patterns as integers,
+# so `1.0 / 255.0` came out 0.
+folds_float_literals() {
+    local probe
+    probe=$(mktemp -d mlx-out/probe.XXXXXX)
+    local ok=1
+    if "$1" --quiet tests/322_float_literal_arithmetic_runtime.mlx -o "$probe/probe" > /dev/null 2>&1; then
+        local status=0
+        "$probe/probe" > /dev/null 2>&1 || status=$?
+        [[ $status -eq 13 ]] && ok=0
+    fi
+    rm -rf -- "$probe"
+    return $ok
+}
+
 # Whether $1 writes the files it read with --depfile (what `mlx build`
 # decides rebuilds by).
 writes_depfiles() {
@@ -394,6 +411,7 @@ probes=(
     "returns_wide_tuples|tuples of more than three words"
     "steps_many_pointers|array pointers as many-item pointers, p + n"
     "reads_slice_pointers|a slice's .pointer"
+    "folds_float_literals|arithmetic on float literals"
     "writes_depfiles|--depfile"
     "runs_build|the build command (mlx build)"
 )

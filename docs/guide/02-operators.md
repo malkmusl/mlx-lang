@@ -8,7 +8,7 @@
 `94_wrapping_shift_count_runtime.mlx`, `113_signed_integer_runtime.mlx`,
 `114_unsigned_comparison_runtime.mlx`, `183_float_exponent_runtime.mlx`,
 `184_signed_right_shift_runtime.mlx`, `203_immediate_alu_gep_runtime.mlx`,
-`207_popcount_runtime.mlx`
+`207_popcount_runtime.mlx`, `322_float_literal_arithmetic_runtime.mlx`
 
 ## Arithmetic, division and remainder
 
@@ -191,6 +191,14 @@ and the power of ten are both exact in an `f64`, else with big integers.
 2^63 on too: the largest `u64` becomes `18446744073709551616.0`, and
 `@intFromFloat(u64, x)` of an `x` from 2^63 on keeps its value
 (`tests/317_float_large_runtime.mlx`, on x86_64 and AArch64).
+
+Arithmetic on float literals alone is float arithmetic, worked out in
+`f64` and narrowed when the result is an `f32`: `const SCALE: f64 = 1.0 /
+255.0` is the `f64` nearest to 1/255, `const HALF: f32 = 1.0 / 2.0` is
+0.5, `0.1 + 0.2` is `0.30000000000000004` as in any IEEE double
+arithmetic. So a constant can be written as the fraction it is instead of
+its digits (`tests/322_float_literal_arithmetic_runtime.mlx`, on x86_64
+and AArch64).
 
 ## Bit-counting
 
