@@ -51,6 +51,46 @@ tests/326_unknown_name.mlx:10:11: error: MLX-E4001: invalid local declaration
 `tests/12_unknown_builtin.mlx` gets ``unknown builtin `print` ``, the code the
 bootstrap compiler gives it too.
 
+## `MLX-E4001` (`TypeMismatch`): calls that do not fit, conditions that do not type
+
+Typing a call stays just as quiet when its arguments do not fit the
+function, so a failing statement also looks through its calls
+(`sema/call_errors.mlx`) and says, before its own message, which one takes
+another number of arguments (counting what a method call passes besides
+its receiver), which method changes a receiver that is a constant, and
+which takes its receiver by value while the call gives it a pointer. The
+condition of an `if` or a `while`, what a `for` goes over and the value a
+`match` looks at are reported the same way at their own place, where the
+statement used to fail with no message of its own.
+`tests/331_call_mistakes.mlx`:
+
+```mlx
+pub fn main() -> u8 {
+    const doubled = scale(2)
+    const fixed = Counter.{ .total = 1 }
+    fixed.add(1)
+    var counter = Counter.{ .total = 2 }
+    const pointer = &counter
+    const seen = pointer.value()
+    if scale(1, 2, 3) != 6 { return 1 }
+    while counter.add(1, 2) { return 2 }
+    return 0
+}
+```
+
+```text
+tests/331_call_mistakes.mlx:23:21: error: MLX-E4001: `scale` takes 2 arguments, 1 given
+tests/331_call_mistakes.mlx:23:11: error: MLX-E4001: invalid local declaration
+tests/331_call_mistakes.mlx:25:11: error: MLX-E4001: `add` changes its receiver, which is a constant here
+tests/331_call_mistakes.mlx:25:14: error: MLX-E4001: expression type could not be resolved
+tests/331_call_mistakes.mlx:28:26: error: MLX-E4001: `value` takes its receiver by value: call it on what the pointer points to (`.*`)
+tests/331_call_mistakes.mlx:28:11: error: MLX-E4001: invalid local declaration
+tests/331_call_mistakes.mlx:29:8: error: MLX-E4001: `scale` takes 2 arguments, 3 given
+tests/331_call_mistakes.mlx:29:23: error: MLX-E4001: condition type could not be resolved
+tests/331_call_mistakes.mlx:30:19: error: MLX-E4001: `add` takes 1 argument, 2 given
+tests/331_call_mistakes.mlx:30:22: error: MLX-E4001: condition type could not be resolved
+```
+
 ## `MLX-E7004` (`UnsafeOperationOutsideUnsafeBlock`): pointer casts outside unsafe
 
 `@ptrFromInt` and `@ptrCast` are allowed only inside an unsafe block or an

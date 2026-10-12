@@ -403,6 +403,31 @@ reports_unknown_names() {
     grep -q "MLX-E3001: unknown name" <<< "$output"
 }
 
+# Whether $1 says which call takes another number of arguments where a
+# statement fails (tests/331_call_mistakes.mlx); older compilers gave only
+# the statement's own type error.
+explains_call_mistakes() {
+    local output
+    output=$("$1" --quiet tests/331_call_mistakes.mlx -o /dev/null 2>&1) || true
+    grep -q "MLX-E4001: \`scale\` takes 2 arguments, 1 given" <<< "$output"
+}
+
+# Whether $1 calls methods on pointers and takes the address of a value for
+# a method taking a pointer (tests/332_method_receivers_runtime.mlx exits
+# 13).
+calls_methods_on_pointers() {
+    local probe
+    probe=$(mktemp -d mlx-out/probe.XXXXXX)
+    local ok=1
+    if "$1" --quiet tests/332_method_receivers_runtime.mlx -o "$probe/probe" > /dev/null 2>&1; then
+        local status=0
+        "$probe/probe" > /dev/null 2>&1 || status=$?
+        [[ $status -eq 13 ]] && ok=0
+    fi
+    rm -rf -- "$probe"
+    return $ok
+}
+
 # Whether $1 rejects @ptrFromInt and @ptrCast outside unsafe (MLX-E7004,
 # tests/14_unsafe_ptr_builtin.mlx); older compilers took them anywhere.
 enforces_unsafe() {
@@ -534,6 +559,8 @@ probes=(
     "keeps_aggregates_in_frame|aggregates that stay in their function kept in the frame"
     "returns_into_caller_storage|struct, union and array results in storage the caller provides"
     "tests_equality_chains|conditions as jumps, equality chains as bit masks"
+    "explains_call_mistakes|calls with the wrong argument count named (MLX-E4001)"
+    "calls_methods_on_pointers|methods called on pointers and on addressable values"
     "holds_large_programs|an arena with room for the largest programs"
     "writes_depfiles|--depfile"
     "runs_build|the build command (mlx build)"

@@ -196,6 +196,16 @@ pub fn main() -> u8 {
 
 (`tests/176_pointer_struct_fields_runtime.mlx`)
 
+The call can also be written on the instance: `value.method(args)` is
+`Type.method(value, args)`, and a method taking `*Self` gets the address of
+an addressable value (a `var` local, a field of one, an array element), so
+`local.set(7)` is `Box.set(&local, 7)`. A pointer calls the methods of
+what it points to, `allocated.set(8)` included; a method taking `Self` by
+value is called on what the pointer points to, `allocated.*.get()`. A
+`const` instance cannot call a method taking `*Self`, as `&` of it gives a
+`*const Self`; one taking `*const Self` is fine
+(`tests/332_method_receivers_runtime.mlx`).
+
 ## Enums
 
 An enum declares a mandatory backing integer type. Tags default to
