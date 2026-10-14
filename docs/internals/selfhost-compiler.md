@@ -108,7 +108,9 @@ implementation, split by responsibility:
 
 (`compiler/selfhost/README.md`)
 
-`ir/inline.mlx` recognizes safe direct-return inline candidates: explicit
+`ir/inline.mlx` recognizes safe direct-return inline candidates (a body
+that is one `return`, possibly inside an `unsafe` block; a type a builtin
+is given, as in `@ptrFromInt(*Inst, address)`, costs nothing): explicit
 `inline` is honored when eligible, `noinline` vetoes automatic expansion,
 and `-O2`/`-O3` progressively widen a cost-limited automatic-inlining
 budget, with bounded recursive expansion falling back to an ordinary call
@@ -118,8 +120,15 @@ when the bound is hit.
 
 `main.mlx` delegates everything to `driver/pipeline.mlx`'s `Pipeline.compile`,
 which runs inside one `unsafe` block and drives the whole compilation
-through an arena allocator (`arena_allocator.init(pages, 268435456)` — a
-256&nbsp;MiB arena) that is freed in one shot at the end:
+through an arena allocator (`arena_allocator.init(pages, 1073741824)` — a
+1&nbsp;GiB arena of address space, whose pages are touched only as it fills)
+that is freed in one shot at the end. `projects/observatory` takes 252&nbsp;MiB
+of it, which was all but the whole of the former 256&nbsp;MiB; a request the
+arena cannot hold ends the compile with "the compiler's arena is full"
+(status 9) instead of a null its caller would unwrap into a trap, or turn
+into a symbol never defined (`compilerAlloc` and `compilerRemap` wrap the
+arena's functions). The metric "compiler arena capacity" names the size,
+which `tools/ensure_compiler.sh` probes. The compile in outline:
 
 ```mlx
 pub const Pipeline = struct {
@@ -408,14 +417,27 @@ backend-shaped instructions the spec doesn't name directly (`func_sym`,
 eliminated instructions, `aggregate_copy`, `mem_copy` for struct and array
 value copies (one instruction per copy, whatever the size; `lower.mlx`'s
 `copyAggregate` puts a `const` local's copy in the frame and a `var`'s in
-the arena, and `returnedValue` copies frame storage out before a `return`
-hands it back), and separate `udiv`/`urem` next
+the arena, and a `return` of a struct, union or array copies the value
+into storage its caller provides, `lowerSlotReturn`, see
+`docs/reference/abi.md`), and separate `udiv`/`urem` next
 to signed `div`/`rem`) and folds some of the spec's saturating/wrapping
 arithmetic variants down to flag bits on a smaller opcode set rather than
 one opcode per variant. Every `Inst` is a fixed-size record — `opcode`,
 `flags`, `typeId`, and three generic operand slots `arg0`/`arg1`/`arg2` —
 stored in a flat growable vector exactly like AST nodes and types are, with
 `NONE` again used as the absent-operand sentinel.
+
+The condition of an `if` or a `while` lowers to jumps (`lowerBranch`):
+`&&` and `||` branch on their left side and reach the right one only when
+it decides, and `!` swaps the targets, instead of each operator storing a
+0 or 1 into a slot that is then loaded and tested (`lowerLogical`, still
+used where the result is a value). A chain `x == A || x == B || ...` of
+at least three comparisons of one local, field or dereferenced value of
+unsigned or enum type with constants below 128 becomes one test of the
+value's bit in a mask of the constants (`lowerMembership`, counted by the
+metric "equality chains tested as one bit mask"), as a condition and as a
+value; the compiler's own LIR shrank by 5 % and its run by 17 % with both
+(`tests/330_conditions_runtime.mlx`).
 
 `ir/lower.mlx` is the AST/sema-to-LIR translator. Its `LirBuilder` carries
 substantial per-function lowering state, including a `Binding` record per
@@ -435,13 +457,18 @@ the README describes ("mandatory LIR canonicalization, constant and branch
 folding, local load forwarding, stack-slot promotion and dead-code
 elimination"). It runs a fixed sequence — function-level dead-code
 elimination (`function_dce.mlx`), constant folding, local-load forwarding,
-copy propagation, a second constant-folding pass (to catch constants
+single-store promotion (`single_store.mlx`: a local one store writes and
+nothing else touches is read as the stored value wherever that store
+dominates the load, after `dominance.mlx` builds the blocks and their
+dominator tree, so a `const` binding in a loop body read in later blocks
+of the pass needs no frame slot), copy propagation, a second
+constant-folding pass (to catch constants
 exposed by the first), post-terminator dead-code elimination
 (`control_flow_dce.mlx`), comparison-branch fusion, stack-slot promotion,
 and generic dead-instruction elimination — and returns a `Result` record
 whose fields are exactly the counters the driver reports as metrics
 (`constantsFolded`, `branchesSimplified`, `comparisonBranchesFused`,
-`loadsForwarded`, `copiesPropagated`, `localsPromoted`,
+`loadsForwarded`, `singleStoreLoads`, `copiesPropagated`, `localsPromoted`,
 `storesEliminated`, `functionsEliminated`, ...). `optimize.run` is called
 unconditionally from the pipeline regardless of `-O` level — the
 optimization-level distinction in this compiler lives in the inliner
@@ -456,52 +483,15 @@ canonicalization pipeline on a hand-built six-instruction LIR sequence: an
 instructions are marked `dead` and excluded from the `instructionsAfter`
 count.
 
-**Known gap: a module-level `const` of non-integer/non-boolean type
-miscompiles into a bogus "unresolved backend symbol" instead of a proper
-diagnostic.** `sema/comptime/value.mlx`'s `Kind` enum only has
-`integer`/`boolean`/`type_value`/`null_value` variants — there is no
-representation for a comptime string, slice, or array. `ir/lower.mlx`'s
-`lowerSymbolValue` (the function that decides how to lower a reference to a
-resolved symbol) handles the `integer`/`boolean` comptime tags and function
-symbols (`FLAG_FUNCTION`) explicitly, then falls through to `return
-lir.NONE` for anything else — which is exactly what happens for, say, a
-top-level `const ANDROID_NS_URI: []const u8 = "..."` or a top-level `const
-IDS: [9]u32 = [9]u32{...}`. The caller (the general identifier-lowering
-path around line 2489) only uses that `lowerSymbolValue` result if it isn't
-`NONE`; when it is, the code falls all the way through to a "might be a
-forward-reference function; add as symbol" fallback that unconditionally
-treats the identifier as an as-yet-undefined function, emitting a
-`lir.addModuleSymbol` reference (named `.m<module>.<NAME>`) and a
-`func_sym` LIR instruction for it. No function body with that name is ever
-lowered to satisfy the reference, so it reaches the backend as a fixup with
-no matching label, and `encoder.applyFixups` fails at the "resolve backend
-symbols" pipeline step with `MLX-E3004: unresolved backend symbol` — a
-diagnostic that (per `driver/pipeline.mlx:206`) carries no source location,
-so the actual cause (a harmless-looking top-level string or array constant
-declared possibly hundreds of lines from where it's used) is easy to miss.
-`driver/reporter.mlx:171`'s `Reporter.unresolvedSymbol` does print the
-bogus symbol name (e.g. `.m0.SHORT_STR`) to stderr, but only when `mlx1` is
-invoked with `--trace`/`--verbose` — without that flag the error is
-reported with zero identifying information at all. Reproduced with a
-minimal two-line repro (`const S: []const u8 = "hi"` at module scope,
-referenced as `S.length` inside `main`) that fails the same way regardless
-of string length or of whether the const is referenced once or multiple
-times; a *local* (function-scope) `const` of the same type, or the string
-literal used directly, both lower correctly, which is what makes this a
-gap in top-level/module-scope constant handling specifically rather than in
-slice/string lowering in general. Found and worked around (not fixed) while
-porting `experiments/android-aarch64-bluescreen/tool/axml.zig` to
-`experiments/android-aarch64-bluescreen/mlx/axml.mlx`: every top-level
-`const` of a type other than a plain integer/boolean was rewritten as a
-zero-argument function returning the value (`androidNsUri()`) or an
-indexing function (`androidAttrId(i)`) instead — see the comments at
-`experiments/android-aarch64-bluescreen/mlx/axml.mlx`'s `androidNsUri` and
-`androidAttrId`. No regression test or fix exists for this in the compiler
-itself yet; a real fix would need `sema/comptime/value.mlx`'s `Kind` to gain
-a representation for these types (or, short of that, at minimum
-`lowerSymbolValue` should report a proper location-carrying diagnostic
-instead of silently falling through to the forward-function-reference path
-when a resolved, non-function symbol can't be lowered).
+**Fixed: a module-level `const` of a slice, array or struct type.** Such a
+constant once lowered as a forward reference to a function nothing defined
+and failed with "unresolved backend symbol" and no location, which the
+Android experiment's port (`experiments/android-aarch64-bluescreen/mlx/`)
+worked around by turning every such constant into a function and by
+avoiding arrays of slices. Module-level constants of these types lower to
+their data now: `tests/333_module_slices_runtime.mlx` reads a string, an
+array of strings and an array of structs holding strings from functions,
+copies and indexes them, on x86_64 and aarch64.
 
 **Fixed: `undefined` initializing a memory-typed field inside an aggregate
 literal dereferenced address 0 and crashed.** `lowerNode`'s
@@ -557,7 +547,8 @@ comptime evaluator holds no value for (a float, a struct, array or tuple
 literal, slices in it) lowers to its initializer where it is used, in its
 own module and with bindings of its own, so a local of the using function
 does not stand in for a name of the constant's module
-(`lowerConstantInitializer`, `tests/310_module_constants_runtime.mlx`).
+(`lowerConstantInitializer`, `tests/310_module_constants_runtime.mlx`
+reading `tests/modules/310_constants.mlx`).
 `pair.1` has the tuple part's type, so a local made from it takes all its
 words (`tests/311_wide_tuple_runtime.mlx`). In a type position `[N]T` never
 starts a literal, so `[2][3]u16{ [3]u16{ ... }, ... }` is one literal of
@@ -633,7 +624,15 @@ store or atomic through a pointer, or a `mem_copy`. A chain of float
 arithmetic then depends on registers instead of a store and a load per
 step: a float-only loop ran 1.7 times as fast
 (`tests/318_float_registers_runtime.mlx` covers the ways a held value must
-be forgotten). A single-word value that is used by exactly the LIR instruction
+be forgotten). A load or a store whose address is a word slot of the frame
+(an `alloca` without a byte count: a local the optimizer kept in memory)
+addresses the slot itself, `[rbp + offset]` (`State.frameAddress`),
+instead of first loading the slot's address from the value that holds it;
+the compiler's own machine code shrank by 6 % with it. Such a slot is
+written on more than one path, so the encoder's store-to-load forwarding
+(`previousStoreRegister`, a load right after a store of the same slot
+takes the stored register) stops at a label (`Encoder.forwardBarrier`):
+the store before a label need not be what reaches a load after it. A single-word value that is used by exactly the LIR instruction
 right after it skips that stack write as a peephole
 (`State.storeRaxResult`'s `canRetainNext`/`state.pendingRaxVreg` path):
 the value stays in `rax` only, on the assumption that its one consumer is
@@ -685,66 +684,80 @@ raw opcode bytes (`encoder.emit1(state.*.enc, 0x48) ...`) — reading argc off
 the stack, computing argv, calling `main`, and exiting via the `syscall`
 instruction with the return value in `rdi` and syscall number 60 (`exit`) in
 `rax`. Before that, `emitAggregateArena` issues an `mmap` syscall (syscall
-number 9, `PROT_READ|PROT_WRITE`, `MAP_PRIVATE|MAP_ANONYMOUS`) to reserve a
-256&nbsp;MiB (`268435464`-byte) arena at program startup for aggregate
-allocations, with two pointers (`r14`, `r15`) tracking the arena's base and
+number 9, `PROT_READ|PROT_WRITE`, `MAP_PRIVATE|MAP_ANONYMOUS|MAP_NORESERVE`)
+to reserve a 1&nbsp;GiB (`1073741832`-byte) arena of address space at
+program startup for aggregate allocations (pages are only taken as they are
+touched; `tests/281_arena_capacity_runtime.mlx`), with two pointers (`r14`, `r15`) tracking the arena's base and
 current bump-allocation cursor across the whole program's execution — the
 generated executable does its own bump-pointer heap management rather than
 depending on any libc allocator. This is a direct, concrete instance of the
 x86_64 spec's "Direct machine-code byte emission. No external assembler is
 required" (`spec/02-compiler/x86_64.xml`).
 
-**Known gap, severe: every `var x: T = undefined` for a struct/union/array
-`T` permanently consumes space from that same 256&nbsp;MiB arena, for the
-life of the whole process, no matter how short-lived or tightly-scoped the
-variable is — a loop that declares one is a hard, silent crash waiting to
-happen.** `codegen/memory.mlx`'s `emitAlloca` has two paths: a sized
-allocation (`instruction.arg0 != NONE`, which is what every aggregate-typed
-local literal is lowered to, in both `lowerBindingInitializer`'s `undefined`
-case and `lowerAggregateLiteral`) always calls `emitArenaAllocation`, an
-atomic-XADD bump of the arena cursor (`r14`) checked against the arena limit
-(`r15`) with `emitTrap` on overflow; an unsized allocation instead reserves a
-plain function-frame-relative slot via `state.*.nextStackSlot`, exactly like
-an ordinary scalar local, correctly reused across every dynamic execution of
-that instruction (loop iterations, repeated calls) because it's a
-compile-time-fixed offset, not a runtime-growing cursor. Nothing routes
-aggregate locals through the second, correctly-scoped path — every one goes
-through the arena, and the arena is bumped **every time the `alloca`
-instruction executes at runtime**, not once per place it appears in the
-source. A loop (directly, or one call away — the same declaration site
-inside a function called repeatedly from a loop counts too) that declares
-such a local exhausts the arena and hits the trap after
-roughly `268435464 / sizeof(T)` dynamic executions — confirmed with a
-minimal repro, `while i < 2000000 { var x: SomeStruct = undefined; ... }`
-for a 328-byte struct crashes (`SIGILL`, the `emitTrap`) at ~800,000
-iterations (~262&nbsp;MB, matching the arena size); hoisting the identical
-declaration above the loop and reusing the variable removes the ceiling
-entirely (2,000,000 iterations, no crash, since the `alloca` then executes
-once). This was found and worked around (not fixed) porting
-`experiments/android-aarch64-bluescreen/tool/bignum.zig` to
-`experiments/android-aarch64-bluescreen/mlx/bignum.mlx`: an RSA keygen's
-inner loops (long division, modular exponentiation, the extended Euclidean
-algorithm) each declare a handful of `BigUint` (328-byte struct) locals per
-iteration by the most natural way to write them, and real key sizes run
-those loops enough times to exhaust the arena within seconds. The general
-shape of the workaround, applied throughout `bignum.mlx`: hoist every
-loop-body `var x: T = undefined` to above its loop and reuse it by
-overwriting through the existing pointer-based mutator functions (safe
-because a limb-by-limb/field-by-field write never depends on a stale
-previous value once every field is rewritten); where a function on a hot
-path (called repeatedly from a loop, not just looping itself) needs its own
-scratch aggregate, thread it in from the caller as an extra out-parameter
-instead of declaring it locally (see `mulToScratch`/`biMulScratch` next to
-the plain `mulTo`, which just supplies a fresh scratch buffer for
-occasional/cold-path use). A real fix would extend the existing
-correctly-scoped `nextStackSlot` path to sized allocations too — the
-mechanism already exists and already reuses slots correctly across dynamic
-executions for scalars — but doing that safely needs `functionFrameSize`
-(`codegen/state.mlx`, currently `(instruction_count * 24 + 271)` rounded up,
-with no awareness of aggregate sizes at all) to also account for the total
-concurrent aggregate-local footprint of a function, which this port did not
-attempt. No fix or regression test exists for this in the compiler itself
-yet.
+**Fixed: aggregate locals made on every pass of a loop.** Every `var x: T =
+undefined` and aggregate literal of a struct, union or array type used to
+take space from the aggregate arena each time it ran, never given back, so
+a loop declaring one (or calling a function that does) exhausted the arena,
+then 256&nbsp;MiB, and hit `emitTrap`: `while i < 2000000 { var x:
+SomeStruct = undefined; ... }` for a 328-byte struct crashed at about
+800,000 passes. The Android experiment's `bignum.mlx` worked around it by
+hoisting its loop locals and threading scratch values through
+out-parameters (`mulToScratch`/`biMulScratch`), which also capped its RSA
+key size. Aggregates whose address stays in their function now live in its
+frame (`ir/escape.mlx`, `tests/328_aggregates_in_frame_runtime.mlx`); a
+pointer passed to a function that only reads or fills it stays, so the same
+loop runs its 2,000,000 passes in about 10&nbsp;MB. What does leave the
+function, a value stored into a global or one an older pass's pointer still
+reads, keeps going to the arena.
+
+**Locals in callee-saved registers** (`ir/registers.mlx`). A local's
+8-byte slot that is used only as the address of whole-word loads and
+stores (never handed on, stored, compared or offset) is a variable the
+backend may hold in a register. Each function gives its most used such
+slots, a use inside a loop counting eight times per loop around it, one
+of three registers each, marked on the slot's `alloca`
+(`lir.registerHome`); the x86_64 backend keeps them in rbx, r12 and r13,
+saved in four words at the bottom of the frame's budget in the prologue
+and restored on return, so a load is `mov rax, rbx` and a store moves the
+value into the register. Callees keep these registers as the ABI asks, so
+the locals live through calls. The compiler builds itself with 3,602
+locals held so (`locals kept in registers`); a nested loop of 300 million
+passes runs about 5% faster, the rest of its time still going to the
+frame slot every intermediate value takes
+(`tests/339_register_locals_runtime.mlx`). The aarch64 backend keeps them
+in x19, x20 and x21, which AAPCS64 callees keep as well: the frame grows
+by four words, the prologue stores the registers it uses at the bottom of
+the frame, every return loads them back before `mov sp, x29`
+(`encoder.emitSaveRegisters`, `emitEpilogue`), a load stores the register
+into the result's slot and a store loads the value straight into it.
+
+**Values kept out of the frame** (x86_64, `codegen/state.mlx`). An
+integer constant that fits in 32 bits is not written to a frame slot
+where it is made: a reader takes it as an immediate (`cmp rbx, 1000`,
+`add rax, 1`), and a read through the slot writes it there first. A
+whole-word load of a local kept in a register is left out as well: its
+readers take the register itself (`xor rax, rbx`, `mov [rbp-16], r12`).
+That holds while the register keeps the loaded value, so before a store
+into the register, and before the load's block ends (a label, a branch or
+a return), a load that an instruction further on still reads goes to its
+slot (`ir/operands.mlx` finds each value's last reader). `x = x + y`
+with x in a register, when the store is the sum's only reader, becomes one
+instruction on the register (`add rbx, 1`, `Arithmetic.emitInPlace`).
+The compiler keeps 49,875 values out of the frame when it builds itself
+and updates 643 locals in place (`backend values kept out of the frame`,
+`backend locals updated in place`); it compiles itself with 16% fewer
+instructions (4.73 to 3.97 billion) into a binary 15% smaller, and the
+nested loop of 300 million passes runs in 0.10 s instead of 0.75 s
+(`tests/341_values_out_of_frame_runtime.mlx` covers a local read after it
+changed, across blocks and through calls).
+
+**Field accesses with a displacement** (x86_64, `Memory.emitGep`). A
+`gep` whose index is a constant and whose only reader is the load or
+store right after it is not computed: that access takes the offset as its
+displacement (`mov rax, [rbx + 0x18]`, `mov [rcx + 8], rax`), and a frame
+slot narrower than a word is read and written in place (`movzx rax, byte
+[rbp - 0x88]`). With single-store promotion this brought the compiler's
+own build to 3.08 billion instructions and its binary to 1.45 MB.
 
 Between Mlx functions a value of several words comes back a word per
 register: `rax`, `rdx`, `rcx`, `r8`, `r9`, `r10`, `r11`, `rsi`, `rdi`

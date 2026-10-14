@@ -126,7 +126,9 @@ pub fn main() u8 {
 ## Methods
 
 A struct can declare functions in its body. `Self` refers to the enclosing
-type. A method that takes `self` (by value or by pointer, `self: Self` /
+type, and so does the name its `const` gives it, for a field pointing to
+another of its kind too (`const Node = struct { next: ?*Node }`;
+`tests/334_aggregate_own_name_runtime.mlx`). A method that takes `self` (by value or by pointer, `self: Self` /
 `self: *Self`) is called on an instance with `.`; a function that doesn't
 take `self` is called on the type itself, like an associated/"static"
 function:
@@ -195,6 +197,16 @@ pub fn main() -> u8 {
 ```
 
 (`tests/176_pointer_struct_fields_runtime.mlx`)
+
+The call can also be written on the instance: `value.method(args)` is
+`Type.method(value, args)`, and a method taking `*Self` gets the address of
+an addressable value (a `var` local, a field of one, an array element), so
+`local.set(7)` is `Box.set(&local, 7)`. A pointer calls the methods of
+what it points to, `allocated.set(8)` included; a method taking `Self` by
+value is called on what the pointer points to, `allocated.*.get()`. A
+`const` instance cannot call a method taking `*Self`, as `&` of it gives a
+`*const Self`; one taking `*const Self` is fine
+(`tests/332_method_receivers_runtime.mlx`).
 
 ## Enums
 
@@ -323,7 +335,8 @@ A fixed-size array literal is `[_]T{...}` (size inferred) or `[N]T{...}`
 value known at compile time, not only a number written out: a named
 constant, another module's constant, an expression over them
 (`[room.ROOM * 2 + 8]u8`); `tests/294_array_length_constant_runtime.mlx`
-covers those. A slice, `[]T`, is a pointer+length
+covers those, with the other module's constant in
+`tests/support/array_room.mlx`. A slice, `[]T`, is a pointer+length
 view and supports Python-style range indexing:
 
 ```mlx

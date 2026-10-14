@@ -8,7 +8,8 @@
 `94_wrapping_shift_count_runtime.mlx`, `113_signed_integer_runtime.mlx`,
 `114_unsigned_comparison_runtime.mlx`, `183_float_exponent_runtime.mlx`,
 `184_signed_right_shift_runtime.mlx`, `203_immediate_alu_gep_runtime.mlx`,
-`207_popcount_runtime.mlx`, `322_float_literal_arithmetic_runtime.mlx`
+`207_popcount_runtime.mlx`, `322_float_literal_arithmetic_runtime.mlx`,
+`324_float_rounding_runtime.mlx`
 
 ## Arithmetic, division and remainder
 
@@ -274,6 +275,31 @@ pub fn main() -> u8 {
 (`tests/203_immediate_alu_gep_runtime.mlx`; see
 [docs/internals/selfhost-compiler.md](../internals/selfhost-compiler.md) for
 how the self-hosted x86_64 backend generates code for expressions like this)
+
+## Rounding to whole numbers
+
+`@floor(value)`, `@ceil(value)` and `@trunc(value)` round an `f64` or `f32`
+down, up or toward zero, exactly, in one instruction each (`roundsd` and
+`roundss` on x86_64, which takes SSE4.1 as `@popCount` takes POPCNT;
+`FRINTM`, `FRINTP` and `FRINTZ` on AArch64). The result has the
+operand's type, a float literal gives an `f64`, and an integer operand is
+rejected. Values past 2^52 are whole already and come back unchanged, as
+do the infinities and NaN; a zero result keeps the operand's sign:
+
+```mlx
+pub fn main() -> u8 {
+    const x: f64 = -2.5
+    if @floor(x) != -3.0 || @ceil(x) != -2.0 || @trunc(x) != -2.0 { return 1 }
+    if @bitCast(u64, @ceil(-0.25)) != 9223372036854775808 { return 2 }   // -0.0
+    const half: f32 = 1.5
+    const down: f32 = @floor(half)                                      // roundss
+    if down != 1.0 { return 3 }
+    return 13
+}
+```
+
+(`tests/324_float_rounding_runtime.mlx`; `std.math.round` rounds halves
+away from zero on top of `@trunc`.)
 
 ## Logical operators and short-circuit evaluation
 

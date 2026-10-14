@@ -82,6 +82,10 @@ pub const Encoder = struct {
     cachedRaxLoadCount: usize
     memoryOperandCount: usize
     raxStackSlot: i32
+    // Where the code after the last label begins: a store before it may
+    // not be what a load after it reads (another way in), so loads do not
+    // take their value from it (previousStoreRegister).
+    forwardBarrier: usize
     // Float values kept in xmm8..xmm15 by the frame slot they were stored
     // to or loaded from (0: none) and their width: a load of a slot one of
     // them holds is a register move, not a trip through memory. Every slot
@@ -128,6 +132,7 @@ pub fn init(allocator: allocator_module.Allocator) -> Encoder {
             .cachedRaxLoadCount = 0,
             .memoryOperandCount = 0,
             .raxStackSlot = 0,
+            .forwardBarrier = 0,
             .xmmSlots = [8]i32{ 0, 0, 0, 0, 0, 0, 0, 0 },
             .xmmBits = [8]usize{ 0, 0, 0, 0, 0, 0, 0, 0 },
             .xmmNext = 0,
@@ -249,6 +254,7 @@ pub fn patch32(enc: *Encoder, offset: usize, value: i32) -> void {
 
 pub fn defineSymbol(enc: *Encoder, name_ptr: [*]const u8, name_len: usize) -> void {
     enc.*.raxStackSlot = 0
+    enc.*.forwardBarrier = enc.*.buf.*.length
     forgetXmm(enc)
     const entry = SymbolEntry.{
         .namePointer = name_ptr,
@@ -479,7 +485,7 @@ fn previousStoreRegister(enc: *Encoder, rbp_offset: i32) -> usize {
     const is_short = disp >= -128 && disp <= 127
     const size: usize = if is_short { 4 } else { 7 }
     const length = enc.*.buf.*.length
-    if length < size { return 16 }
+    if length < size || length - size < enc.*.forwardBarrier { return 16 }
     const start = length - size
     const bytes = enc.*.buf.*.items
     if bytes[start + 1] != 0x89 { return 16 }
@@ -519,6 +525,18 @@ pub fn emitMovRegMem(enc: *Encoder, dst: target.Register, rbp_offset: i32) -> vo
         emitImm32(enc, disp)
     }
     if dst == target.Register.rax { enc.*.raxStackSlot = rbp_offset }
+}
+
+// mov qword [rbp + offset], imm32 (sign-extended).
+pub fn emitMovMemImm32(enc: *Encoder, rbp_offset: i32, imm: i32) -> void {
+    forgetXmmSlot(enc, rbp_offset)
+    const disp = 0 - rbp_offset
+    const is_short = disp >= -128 && disp <= 127
+    const mod: u8 = if is_short { 1 } else { 2 }
+    emit3(enc, target.encodeRex(true, false, false, false), 0xC7, target.encodeModRm(mod, 0, target.lo3(target.Register.rbp)))
+    if is_short { emit1(enc, @bitCast(u8, @intCast(i8, disp))) } else { emitImm32(enc, disp) }
+    emitImm32(enc, imm)
+    if enc.*.raxStackSlot == rbp_offset { enc.*.raxStackSlot = 0 }
 }
 
 pub fn emitMovMemReg(enc: *Encoder, rbp_offset: i32, src: target.Register) -> void {
@@ -648,6 +666,18 @@ pub fn emitFloatBinary(enc: *Encoder, opcode: u8, dst_xmm: usize, src_xmm: usize
     emit1(enc, target.encodeModRm(3, @intCast(u8, dst_xmm & 7), @intCast(u8, src_xmm & 7)))
 }
 
+// roundsd/roundss (SSE4.1): `src_xmm` rounded to a whole number into
+// `dst_xmm`; `mode` 1 down, 2 up, 3 toward zero (bit 3 keeps the inexact
+// result from being reported).
+pub fn emitRoundFloat(enc: *Encoder, dst_xmm: usize, src_xmm: usize, bits: usize, mode: usize) -> void {
+    emit1(enc, 0x66)
+    if dst_xmm >= 8 || src_xmm >= 8 { emit1(enc, target.encodeRex(false, dst_xmm >= 8, false, src_xmm >= 8)) }
+    emit1(enc, 0x0F)
+    emit2(enc, 0x3A, if bits == 32 { 0x0A } else { 0x0B })
+    emit1(enc, target.encodeModRm(3, @intCast(u8, dst_xmm & 7), @intCast(u8, src_xmm & 7)))
+    emit1(enc, @intCast(u8, 8 | mode))
+}
+
 pub fn emitFloatCompare(enc: *Encoder, lhs_xmm: usize, rhs_xmm: usize, bits: usize) -> void {
     if bits == 64 { emit1(enc, 0x66) }
     if lhs_xmm >= 8 || rhs_xmm >= 8 { emit1(enc, target.encodeRex(false, lhs_xmm >= 8, false, rhs_xmm >= 8)) }
@@ -750,6 +780,41 @@ pub fn emitLoadPointerSigned(enc: *Encoder, dst: target.Register, pointer: targe
         return
     }
     emitLoadPointer(enc, dst, pointer, width)
+}
+
+// The modrm byte (with a SIB byte for an rsp or r12 base) and the
+// displacement of [base + disp].
+fn emitBaseDisplacement(enc: *Encoder, reg_field: u8, base: target.Register, disp: i32) -> void {
+    const is_short = disp >= -128 && disp <= 127
+    const mod: u8 = if is_short { 1 } else { 2 }
+    emit1(enc, target.encodeModRm(mod, reg_field, target.lo3(base)))
+    if target.lo3(base) == 4 { emit1(enc, 0x24) }
+    if is_short { emit1(enc, @bitCast(u8, @intCast(i8, disp))) } else { emitImm32(enc, disp) }
+}
+
+// dst = the `width` bytes at [base + disp], zero- or sign-extended.
+pub fn emitLoadDisplaced(enc: *Encoder, dst: target.Register, base: target.Register, disp: i32, width: usize, signed: bool) -> void {
+    if dst == target.Register.rax { enc.*.raxStackSlot = 0 }
+    if width == 1 || width == 2 {
+        var opcode: u8 = if width == 1 { 0xB6 } else { 0xB7 }
+        if signed { opcode = opcode + 8 }
+        emit3(enc, target.encodeRex(true, target.needsRex(dst), false, target.needsRex(base)), 0x0F, opcode)
+    } else if width == 4 && signed {
+        emit2(enc, target.encodeRex(true, target.needsRex(dst), false, target.needsRex(base)), 0x63)
+    } else {
+        emit2(enc, target.encodeRex(width >= 8, target.needsRex(dst), false, target.needsRex(base)), 0x8B)
+    }
+    emitBaseDisplacement(enc, target.lo3(dst), base, disp)
+}
+
+// The low `width` bytes of src to [base + disp].
+pub fn emitStoreDisplaced(enc: *Encoder, base: target.Register, disp: i32, src: target.Register, width: usize) -> void {
+    enc.*.raxStackSlot = 0
+    // The pointer may be to a slot of the frame.
+    forgetXmm(enc)
+    if width == 2 { emit1(enc, 0x66) }
+    emit2(enc, target.encodeRex(width >= 8, target.needsRex(src), false, target.needsRex(base)), if width == 1 { 0x88 } else { 0x89 })
+    emitBaseDisplacement(enc, target.lo3(src), base, disp)
 }
 
 pub fn emitStorePointer(enc: *Encoder, pointer: target.Register, src: target.Register, width: usize) -> void {

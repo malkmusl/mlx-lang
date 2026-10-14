@@ -18,6 +18,223 @@ guide already has a fixture for — `tests/100_union_explicit_tag_mismatch.mlx`
 `tests/102_error_set_mismatch.mlx` and `tests/103_error_set_duplicate.mlx`
 (covered under Errors) are skipped here for that reason.
 
+## `MLX-E3001` (`UnknownIdentifier`): names nothing declares
+
+Typing an expression stays quiet about a name it cannot find, because
+generic call inference probes names that need not exist. So the statement
+that fails (a local declaration, a `return`, an expression statement)
+looks through its expression for names no scope declares and reports each
+one at its use before its own `MLX-E4001`, with the closest name in scope
+as help; an unknown builtin is reported the same way. A name whose own
+declaration failed is not reported again where it is used.
+`tests/326_unknown_name.mlx`:
+
+```mlx
+fn half(value: f64) -> f64 { return halve(value) }
+
+pub fn main() -> u8 {
+    const total: u32 = 3
+    const more = totl + 1
+    return @intCast(u8, more)
+}
+```
+
+```text
+tests/326_unknown_name.mlx:6:37: error: MLX-E3001: unknown name `halve`
+tests/326_unknown_name.mlx:6:30: error: MLX-E4001: return value does not match function type
+...
+tests/326_unknown_name.mlx:10:18: error: MLX-E3001: unknown name `totl`
+tests/326_unknown_name.mlx:10:18: help: did you mean `total`?
+tests/326_unknown_name.mlx:10:11: error: MLX-E4001: invalid local declaration
+```
+
+`tests/12_unknown_builtin.mlx` gets ``unknown builtin `print` ``, the code the
+bootstrap compiler gives it too.
+
+## `MLX-E4001` (`TypeMismatch`): calls that do not fit, conditions that do not type
+
+Typing a call stays just as quiet when its arguments do not fit the
+function, so a failing statement also looks through its calls
+(`sema/call_errors.mlx`) and says, before its own message, which one takes
+another number of arguments (counting what a method call passes besides
+its receiver), which method changes a receiver that is a constant, and
+which takes its receiver by value while the call gives it a pointer. The
+condition of an `if` or a `while`, what a `for` goes over and the value a
+`match` looks at are reported the same way at their own place, where the
+statement used to fail with no message of its own.
+`tests/331_call_mistakes.mlx`:
+
+```mlx
+pub fn main() -> u8 {
+    const doubled = scale(2)
+    const fixed = Counter.{ .total = 1 }
+    fixed.add(1)
+    var counter = Counter.{ .total = 2 }
+    const pointer = &counter
+    const seen = pointer.value()
+    if scale(1, 2, 3) != 6 { return 1 }
+    while counter.add(1, 2) { return 2 }
+    return 0
+}
+```
+
+```text
+tests/331_call_mistakes.mlx:23:21: error: MLX-E4001: `scale` takes 2 arguments, 1 given
+tests/331_call_mistakes.mlx:23:11: error: MLX-E4001: invalid local declaration
+tests/331_call_mistakes.mlx:25:11: error: MLX-E4001: `add` changes its receiver, which is a constant here
+tests/331_call_mistakes.mlx:25:14: error: MLX-E4001: expression type could not be resolved
+tests/331_call_mistakes.mlx:28:26: error: MLX-E4001: `value` takes its receiver by value: call it on what the pointer points to (`.*`)
+tests/331_call_mistakes.mlx:28:11: error: MLX-E4001: invalid local declaration
+tests/331_call_mistakes.mlx:29:8: error: MLX-E4001: `scale` takes 2 arguments, 3 given
+tests/331_call_mistakes.mlx:29:23: error: MLX-E4001: condition type could not be resolved
+tests/331_call_mistakes.mlx:30:19: error: MLX-E4001: `add` takes 1 argument, 2 given
+tests/331_call_mistakes.mlx:30:22: error: MLX-E4001: condition type could not be resolved
+```
+
+## `MLX-E4001` (`TypeMismatch`): values that do not fit their place
+
+A comptime integer coerces only where its type holds it exactly
+(`spec/00-language/types.xml`, Conversions), and typing now asks so
+(`sema/literal_fit.mlx`): an integer written out (or a negated one) that
+does not fit an integer type, or the integer an optional or an error union
+holds, fails at a declaration, an assignment, an argument, a return and the
+fields and elements of literals, with its range. `var small: u8 = 300` used
+to compile, keep the low bits and trap on the next overflow check.
+
+A value of another type says what was expected and what was found
+(`sema/mismatch.mlx`, with the type written as source writes it by
+`sema/type_names.mlx`), and operands of types neither of which takes the
+other say they do not mix. An offset on a single-item pointer (`p + n`
+steps only a `[*]T`) and an array literal with another number of elements
+than its type name themselves. A declaration that writes its type out now
+fails when its initializer does not type at all: it used to pass, and the
+program ended at the backend with "unresolved backend symbol" and no
+place, or compiled with the stray bytes of an over-long array literal
+(`projects/coreutils/sha224sum` zeroed its 28-byte digests with 32
+elements; `std.xkb` and `projects/desktop/shared` stepped `*T` pointers by
+bytes, which lowering happened to do; both now @ptrCast to `[*]u8` first).
+`tests/335_type_mismatches.mlx`:
+
+```mlx
+pub fn main() -> u8 {
+    var index: usize = 2
+    var small: u8 = 300
+    const below: u32 = -1
+    small = index
+    const passed = take(index)
+    const point = Point.{ .x = 40000, .y = 0 }
+    const row = [3]u8{ 1, 2, 777 }
+    const flag: bool = 1
+    const sum = small + index
+    const digest: [4]u8 = [4]u8{ 0, 0, 0, 0, 0 }
+    const bytes: [*]const u8 = &index + 4
+    const later: u8 = undeclared
+    return small
+}
+```
+
+```text
+tests/335_type_mismatches.mlx:17:27: error: MLX-E4001: `256` does not fit in `u8` (0 to 255)
+tests/335_type_mismatches.mlx:17:20: error: MLX-E4001: return value does not match function type
+tests/335_type_mismatches.mlx:19:59: error: MLX-E4001: expected `?*const Point`, found `usize`
+tests/335_type_mismatches.mlx:19:52: error: MLX-E4001: return value does not match function type
+tests/335_type_mismatches.mlx:23:21: error: MLX-E4001: `300` does not fit in `u8` (0 to 255)
+tests/335_type_mismatches.mlx:23:9: error: MLX-E4001: invalid local declaration
+tests/335_type_mismatches.mlx:24:24: error: MLX-E4001: `-1` does not fit in `u32` (0 to 4294967295)
+tests/335_type_mismatches.mlx:24:11: error: MLX-E4001: invalid local declaration
+tests/335_type_mismatches.mlx:25:13: error: MLX-E4001: expected `u8`, found `usize`
+tests/335_type_mismatches.mlx:25:11: error: MLX-E4001: expression type could not be resolved
+tests/335_type_mismatches.mlx:26:25: error: MLX-E4001: expected `u64`, found `usize`
+tests/335_type_mismatches.mlx:26:11: error: MLX-E4001: invalid local declaration
+tests/335_type_mismatches.mlx:27:32: error: MLX-E4001: `40000` does not fit in `i16` (-32768 to 32767)
+tests/335_type_mismatches.mlx:27:11: error: MLX-E4001: invalid local declaration
+tests/335_type_mismatches.mlx:28:30: error: MLX-E4001: `777` does not fit in `u8` (0 to 255)
+tests/335_type_mismatches.mlx:28:11: error: MLX-E4001: invalid local declaration
+tests/335_type_mismatches.mlx:29:24: error: MLX-E4001: expected `bool`, found `comptime_int`
+tests/335_type_mismatches.mlx:29:11: error: MLX-E4001: invalid local declaration
+tests/335_type_mismatches.mlx:30:23: error: MLX-E4001: `u8` and `usize` do not mix
+tests/335_type_mismatches.mlx:30:11: error: MLX-E4001: invalid local declaration
+tests/335_type_mismatches.mlx:31:27: error: MLX-E4001: `[4]u8` takes 4 elements, 5 given
+tests/335_type_mismatches.mlx:31:11: error: MLX-E4001: invalid local declaration
+tests/335_type_mismatches.mlx:32:39: error: MLX-E4001: `+` and `-` step only a `[*]T`, not `*usize` (@ptrCast it to `[*]u8` to step by bytes)
+tests/335_type_mismatches.mlx:32:11: error: MLX-E4001: invalid local declaration
+tests/335_type_mismatches.mlx:33:23: error: MLX-E3001: unknown name `undeclared`
+tests/335_type_mismatches.mlx:33:11: error: MLX-E4001: invalid local declaration
+```
+
+`tests/336_literal_edges_runtime.mlx` keeps the values at the edges of
+their types compiling: each type's least and greatest value through the
+same places, on x86_64 and aarch64.
+
+## `MLX-E4001` (`TypeMismatch`): failures that said nothing of their own
+
+A module-level declaration that did not resolve was said only as
+"declaration type could not be resolved" at the file's first line, and
+some statements failed their function with nothing but "semantic analysis
+failed in function". Each now says where and why: an enum without its
+backing integer type, a binding whose initializer does not type (with its
+unknown names), a parameter or return type that does not resolve
+(`tests/337_declaration_failures.mlx`):
+
+```text
+tests/337_declaration_failures.mlx:6:15: error: MLX-E4001: an enum names its backing integer type: `enum(u8) { ... }`
+tests/337_declaration_failures.mlx:6:7: error: MLX-E4001: declaration type could not be resolved
+tests/337_declaration_failures.mlx:7:19: error: MLX-E3001: unknown name `missing_limit`
+tests/337_declaration_failures.mlx:7:7: error: MLX-E4001: declaration type could not be resolved
+tests/337_declaration_failures.mlx:9:17: error: MLX-E4001: this type could not be resolved
+```
+
+and a deferred expression that does not type, an `errdefer` in a function
+returning no error union, a name declared twice in one scope, `break` or
+`continue` outside a loop, the value a `break` gives, and a match pattern
+that does not fit the value matched (`tests/338_statement_failures.mlx`):
+
+```mlx
+fn pick(shade: Shade) -> u8 {
+    match shade {
+        Shade.light => { return 1 }
+        Shade.blue => { return 2 }
+        else => { return 3 }
+    }
+}
+
+pub fn main() -> u8 {
+    defer noop(missing_value)
+    errdefer noop(1)
+    const value: u8 = 1
+    const value: u8 = 2
+    break
+    return value + pick(Shade.dark)
+}
+```
+
+```text
+tests/338_statement_failures.mlx:13:15: error: MLX-E4001: this pattern does not fit the value the match looks at
+tests/338_statement_failures.mlx:19:16: error: MLX-E3001: unknown name `missing_value`
+tests/338_statement_failures.mlx:19:5: error: MLX-E4001: deferred expression could not be resolved
+tests/338_statement_failures.mlx:20:5: error: MLX-E4001: `errdefer` in a function that returns no error union
+tests/338_statement_failures.mlx:22:11: error: MLX-E4001: this name is declared already in this scope
+tests/338_statement_failures.mlx:22:11: error: MLX-E4001: invalid local declaration
+tests/338_statement_failures.mlx:23:5: error: MLX-E4001: `break` and `continue` belong in a loop
+```
+
+## `MLX-E7004` (`UnsafeOperationOutsideUnsafeBlock`): pointer casts outside unsafe
+
+`@ptrFromInt` and `@ptrCast` are allowed only inside an unsafe block or an
+`unsafe { expression }` (`spec/00-language/unsafe.xml`). Unsafe is a
+lexical boundary, so the compiler checks it on each module's tokens before
+it types anything: an `unsafe` followed by a brace covers everything up to
+the matching brace, and each cast outside one is reported at the cast,
+once, whatever typing does with the expression afterwards.
+`tests/14_unsafe_ptr_builtin.mlx`:
+
+```text
+tests/14_unsafe_ptr_builtin.mlx:3:17: error: MLX-E7004: `@ptrFromInt` outside unsafe: an address made from an integer has no provenance, so it needs an unsafe block or `unsafe { expression }`
+```
+
+[Unsafe and safety](../guide/09-unsafe-and-safety.md) lists the casts that
+are not needed in the first place.
+
 ## `MLX-E4001` (`TypeMismatch`): tuple return arity
 
 The guide's table cites `tests/09_type_errors.mlx` for `MLX-E4001`, but a

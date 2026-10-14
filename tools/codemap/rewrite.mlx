@@ -4,13 +4,20 @@
 //   - dropped: `const ignored = call(...)` (a local nothing reads) becomes
 //     `_ = call(...)`;
 //   - counted: `for byte in text { length += 1 }` becomes
-//     `length += text.length`.
+//     `length += text.length`;
+//   - unsafe: `var NAME: T = undefined` with `unsafe { NAME = VALUE }` on
+//     the next line becomes `const NAME: T = unsafe { VALUE }` (`var` when
+//     T is no pointer, or the rest of the block assigns NAME or takes its
+//     address).
 //
-// The other kinds wait for the compiler (pointer offsets, *[N]T to [*]T,
-// unsafe expressions, float folding, math builtins). Files under compiler/
-// and std/bootstrap/ are left as they are: the bootstrap compiler (zig
-// build mlx1) builds them and knows neither. So are the ones under tests/
-// (what they check is how they are written).
+// Pointer offsets (p + n) and *[N]T to [*]T are in the compiler now; the
+// places left of those kinds are the ones that do not type that way (a
+// struct read as bytes), so they are not rewritten here. Float constants
+// and math written out went to std.math and @floor, @ceil, @trunc by
+// hand; unsafe expressions still wait for the compiler. Files under
+// compiler/ and std/bootstrap/ are left as they are: the bootstrap
+// compiler (zig build mlx1) builds them and knows neither. So are the
+// ones under tests/ (what they check is how they are written).
 //
 //     var edits: rewrite_module.Edits = undefined
 //     rewrite_module.init(&edits, allocator)
@@ -58,7 +65,7 @@ pub fn init(edits: *Edits, allocator: Allocator) -> void {
 // Whether the pattern can be rewritten (by this tool; the compiler must
 // accept the result too).
 pub fn rewritable(pattern: u8) -> bool {
-    return pattern == workarounds_module.DROPPED || pattern == workarounds_module.COUNTED
+    return pattern == workarounds_module.DROPPED || pattern == workarounds_module.COUNTED || pattern == workarounds_module.UNSAFE_SET
 }
 
 // The pattern a word names (dropped, counted, ...); 255: none.
@@ -126,6 +133,7 @@ pub fn plan(edits: *Edits, workarounds: *workarounds_module.Workarounds, index: 
                 const offset = @intCast(usize, workarounds.*.offset[place])
                 if pattern == workarounds_module.DROPPED { planDropped(edits, file, source, offset) }
                 if pattern == workarounds_module.COUNTED { planCounted(edits, file, source, offset) }
+                if pattern == workarounds_module.UNSAFE_SET { planUnsafe(edits, file, source, offset) }
             }
         }
         place += 1
@@ -176,6 +184,92 @@ fn planCounted(edits: *Edits, file: u32, source: []const u8, offset: usize) -> v
     if !simple { addText(edits, ")") }
     addText(edits, ".length")
     closeEdit(edits)
+}
+
+fn isNameByte(byte: u8) -> bool {
+    return (byte >= 97 && byte <= 122) || (byte >= 65 && byte <= 90) || (byte >= 48 && byte <= 57) || byte == 95
+}
+
+fn isBlank(byte: u8) -> bool { return byte == 32 || byte == 9 }
+
+// `var NAME: T = undefined` (at `offset`) and `unsafe { NAME = VALUE }` on
+// the next line: one declaration with an unsafe expression.
+fn planUnsafe(edits: *Edits, file: u32, source: []const u8, offset: usize) -> void {
+    const name_start = offset + 4
+    var name_end = name_start
+    while name_end < source.length && isNameByte(source[name_end]) { name_end += 1 }
+    var line_end = name_end
+    while line_end < source.length && source[line_end] != 10 { line_end += 1 }
+    if line_end < name_end + 12 || !index_module.sameBytes(source[line_end - 12..line_end], " = undefined") { return }
+    const head_end = line_end - 12
+    const name = source[name_start..name_end]
+    // The next line: `unsafe { NAME = VALUE }` and nothing else.
+    var statement = line_end + 1
+    while statement < source.length && isBlank(source[statement]) { statement += 1 }
+    var statement_end = statement
+    while statement_end < source.length && source[statement_end] != 10 { statement_end += 1 }
+    var close = statement_end
+    while close > statement && isBlank(source[close - 1]) { close -= 1 }
+    const value_start = statement + 9 + name.length + 3
+    if value_start + 2 > close || !startsWith(source[statement..close], "unsafe { ") { return }
+    if !index_module.sameBytes(source[statement + 9..statement + 9 + name.length], name) || !index_module.sameBytes(source[statement + 9 + name.length..value_start], " = ") { return }
+    if !index_module.sameBytes(source[close - 2..close], " }") { return }
+    const value = source[value_start..close - 2]
+    // One expression: its braces balance and it opens no block of its own.
+    var depth: isize = 0
+    for byte in value {
+        if byte == 123 { depth += 1 }
+        if byte == 125 {
+            depth -= 1
+            if depth < 0 { return }
+        }
+    }
+    if depth != 0 { return }
+    const keyword = if pointerType(source[name_end..head_end]) && !changedLater(source, statement_end, name) { "const" } else { "var" }
+    addEdit(edits, file, offset, statement_end)
+    addText(edits, keyword)
+    addText(edits, source[offset + 3..head_end])
+    addText(edits, " = unsafe { ")
+    addText(edits, value)
+    addText(edits, " }")
+    closeEdit(edits)
+}
+
+// Whether the declared type (": T" after the name) is a pointer.
+fn pointerType(annotation: []const u8) -> bool {
+    if annotation.length < 3 || annotation[0] != 58 { return false }
+    const type_text = annotation[2..annotation.length]
+    return startsWith(type_text, "*") || startsWith(type_text, "[*]") || startsWith(type_text, "?*") || startsWith(type_text, "?[*]")
+}
+
+// Whether the rest of the block from `from` assigns `name` or takes its
+// address.
+fn changedLater(source: []const u8, from: usize, name: []const u8) -> bool {
+    var depth: usize = 0
+    var at = from
+    while at < source.length {
+        const byte = source[at]
+        if byte == 123 { depth += 1 }
+        if byte == 125 {
+            if depth == 0 { return false }
+            depth -= 1
+        }
+        if byte == name[0] && at + name.length <= source.length && index_module.sameBytes(source[at..at + name.length], name) && (at == 0 || (!isNameByte(source[at - 1]) && source[at - 1] != 46)) && (at + name.length >= source.length || !isNameByte(source[at + name.length])) {
+            var before = at
+            while before > 0 && isBlank(source[before - 1]) { before -= 1 }
+            if before > 0 && source[before - 1] == 38 { return true }
+            var after = at + name.length
+            while after < source.length && isBlank(source[after]) { after += 1 }
+            if after + 1 < source.length {
+                const next = source[after]
+                if next == 61 && source[after + 1] != 61 { return true }
+                if (next == 43 || next == 45 || next == 42 || next == 47 || next == 37 || next == 124 || next == 38 || next == 94) && source[after + 1] == 61 { return true }
+                if (next == 60 || next == 62) && after + 2 < source.length && source[after + 1] == next && source[after + 2] == 61 { return true }
+            }
+        }
+        at += 1
+    }
+    return false
 }
 
 // Writes the edited files; how many.
@@ -235,6 +329,7 @@ fn writeBytes(handle: std.fs.File, text: []const u8) -> bool {
 // with it (empty: nothing new).
 fn probeProgram(pattern: u8) -> []const u8 {
     if pattern == workarounds_module.DROPPED { return "fn three() -> usize { return 3 }\npub fn main() -> u8 {\n    _ = three()\n    return 0\n}\n" }
+    if pattern == workarounds_module.UNSAFE_SET { return "pub fn main() -> u8 {\n    var x: u64 = 7\n    const p: *u64 = unsafe { @ptrFromInt(*u64, @intFromPtr(&x)) }\n    return @intCast(u8, p.* - 7)\n}\n" }
     return ""
 }
 
