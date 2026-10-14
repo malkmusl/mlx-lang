@@ -194,9 +194,12 @@ through the caller's buffer; a global object is constructed when the
 program starts (`__mlxcc_init_unit`). Names are mangled as the Itanium
 ABI says (`_ZN8geometry4areaEii`, `_ZN1SC1Ei`, `_ZNK6Matrix2atEii`),
 so objects of several files link by name. `tests/cpp/*.cpp` run as g++
-runs them (`tools/check_cpp.sh`).
+runs them (`tools/check_cpp.sh`, on glibc and on mlxlibc).
 
-Not there yet: templates, exceptions (`try`, `throw` are refused),
+C's `getline` and `std::getline` both apply where `using namespace std`
+is in force: the functions a using-directive brings in join the
+overloads of a name. Not there yet: templates, exceptions (`try`,
+`throw` are refused),
 multiple inheritance, a polymorphic class over a base without a vtable,
 conversion operators (`operator bool`), lambdas, range `for`, `auto`
 deduction, `constexpr` functions, destruction of globals at exit, local
@@ -204,9 +207,13 @@ classes with member functions, user-defined `operator new` (the
 built-in `new` calls `_Znwm`, which mlxlibcpp provides). The mangled
 names leave out `const` (`PKc` is `Pc`) and the ABI's substitutions
 (`S_`), so a name with a const or a repeated parameter type differs
-from g++'s; constructors have only their `C1` symbol. There is no C++
-standard library yet (`projects/libcpp` is next: `<new>` is the first
-header, under `include/c++`).
+from g++'s; constructors have only their `C1` symbol; `long long` and
+`signed char` are `long` and `char`, not types of their own. The C++
+standard library is mlxlibcpp (`projects/libcpp`: `<string>`,
+`<iostream>`, `<new>`, the `c*` headers, under `include/c++`), linked
+into every C++ program by itself as `libmlxcpp.a` from `$MLX_CC_LIB`,
+`lib/` next to the compiler or `/usr/local/lib/mlx-cc/lib`
+(`-nostdlib++` leaves it out), together with the math library.
 
 ## Gaps
 
