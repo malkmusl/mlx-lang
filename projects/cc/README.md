@@ -241,7 +241,19 @@ rest deduced, an integer parameter deduced through a class template's
 instance), member functions of local classes (read apart from their
 function), a nested class is a type of its class's scope, a null
 pointer constant (`0`) fits any pointer parameter, `(void(0))` and the
-other functional casts in parentheses. `tests/cpp/interp.cpp`
+other functional casts in parentheses. Partial specializations
+(`struct Kind<T *>`, `Same<A, A>`, `Describe<Box<T, N>, N>`, `Box<T,
+0>`), the most specific pattern chosen (a const, a pointer, a
+reference, a class template's instance or a value around a parameter
+each count), explicit specializations declared before they are
+defined, alias templates (`template <class T> using Vec =
+vector<T>;`), class templates declared only (an alias or a pointer to
+an instance before the definition completes it), template parameters
+without names or typed by an earlier one (`template <typename Key,
+typename, Key last>`), parameter packs in declarations
+(`template <class... Args> R f(Args &&...);`: declared only, not yet
+callable), inline namespaces, `defined` made by a macro in `#if`.
+`tests/cpp/interp.cpp`
 is a small interpreter (lexer, recursive descent parser, virtual nodes,
 maps of variables and functions) that runs as g++ builds it;
 `tests/cpp/library.cpp` is what tinyxml2 asked of the compiler:
@@ -254,7 +266,7 @@ runs them (`tools/check_cpp.sh`, on glibc and on mlxlibc).
 C's `getline` and `std::getline` both apply where `using namespace std`
 is in force: the functions a using-directive brings in join the
 overloads of a name. Not there yet:
-partial specializations, variadic templates,
+variadic templates (packs are parsed in declarations only),
 generic lambdas (`auto` parameters), a lambda converting to a function
 pointer, init-captures, alias templates (`template <class T> using`),
 dependent qualified names in a function template's signature, rvalue

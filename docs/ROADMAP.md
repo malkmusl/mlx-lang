@@ -132,7 +132,9 @@ in by itself), and templates with `<vector>`, `<map>`, `<set>`,
 `<utility>` and `<algorithm>` over them, lambdas, explicit
 specializations, member templates, const as part of a type, `<memory>`,
 and a small interpreter (`tests/cpp/interp.cpp`) as the larger test;
-tinyxml2 builds and passes its 528 tests. The target is WPEWebKit
+tinyxml2 builds and passes its 528 tests; partial specializations,
+alias templates and the declaration forms of `wtf/Forward.h` are read.
+The target is WPEWebKit
 (a browser engine of our own is out of reach; a C and C++ compiler of
 our own over mlxlibc and mlxlibcpp keeps the whole stack ours), so the
 next steps are what its base library WTF needs: variadic templates,
