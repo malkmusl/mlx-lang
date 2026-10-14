@@ -63,6 +63,10 @@ fn main() u8 {
 
 (`tests/09_type_errors.mlx` — rejected with `MLX-E4001`)
 
+`usize` and `u64` (and `isize` and `i64`) have one width on every target
+Mlx builds for, so each takes the other without a cast
+(`tests/340_platform_integers_runtime.mlx`).
+
 Narrowing an integer requires an explicit cast such as `@intCast(T, value)`.
 The cast is range-checked at compile time when possible:
 

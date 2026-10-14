@@ -476,6 +476,21 @@ keeps_locals_in_registers() {
     return $ok
 }
 
+# Whether $1 lets usize and u64 take each other
+# (tests/340_platform_integers_runtime.mlx exits 13).
+mixes_platform_integers() {
+    local probe
+    probe=$(mktemp -d mlx-out/probe.XXXXXX)
+    local ok=1
+    if "$1" --quiet tests/340_platform_integers_runtime.mlx -o "$probe/probe" > /dev/null 2>&1; then
+        local status=0
+        "$probe/probe" > /dev/null 2>&1 || status=$?
+        [[ $status -eq 13 ]] && ok=0
+    fi
+    rm -rf -- "$probe"
+    return $ok
+}
+
 # Whether $1 rejects @ptrFromInt and @ptrCast outside unsafe (MLX-E7004,
 # tests/14_unsafe_ptr_builtin.mlx); older compilers took them anywhere.
 enforces_unsafe() {
@@ -612,6 +627,7 @@ probes=(
     "checks_literal_ranges|integers checked against their type, mismatches named (MLX-E4001)"
     "explains_silent_failures|failing defers, stray breaks and module declarations said at their place"
     "keeps_locals_in_registers|locals kept in callee-saved registers"
+    "mixes_platform_integers|usize and u64 taking each other"
     "names_aggregates_in_their_bodies|a struct named inside its own body"
     "holds_large_programs|an arena with room for the largest programs"
     "writes_depfiles|--depfile"
