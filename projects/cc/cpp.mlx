@@ -41,6 +41,8 @@ const initializer = @import("./initializer.mlx")
 const mangle = @import("./mangle.mlx")
 const program = @import("./program.mlx")
 const standard = @import("./standard.mlx")
+const stmt = @import("./stmt.mlx")
+const template = @import("./template.mlx")
 
 pub const Class = struct {
     ty: usize
@@ -66,6 +68,9 @@ pub const Class = struct {
     hasVirtual: bool
     vtable: usize
     complete: bool
+    // The conversion operators (`operator bool()`): cells of (function,
+    // target type, next).
+    conversions: usize
 }
 
 fn at(c: usize) -> *Class {
@@ -105,6 +110,16 @@ var classDepth: u32 = 0
 var anonymousCount: u32 = 0
 var overrideName: u32 = 0
 var finalName: u32 = 0
+// The target type of the conversion operator whose name was read last.
+var conversionType: usize = 0
+
+// The conversion operator's target type, taken once after its name
+// (decl.declarator makes it the function's result).
+pub fn takeConversionType() -> usize {
+    const ty = conversionType
+    conversionType = 0
+    return ty
+}
 // The allocation functions, declared on first use.
 var newFunction: usize = 0
 var newArrayFunction: usize = 0
@@ -1044,13 +1059,35 @@ pub fn memberFunction(classTy: usize, fnType: usize, nameToken: usize, name: u32
     }
     if isCtor && at(c).*.constructors == 0 { at(c).*.constructors = o }
     if isDtor { at(c).*.destructor = o }
+    const text = base.nameOf(name)
+    if text.length > 9 && base.same(text[0..9], "operator@") {
+        const conversion = base.alloc(24)
+        base.putWord(conversion, o)
+        base.putWord(conversion + 8, types.baseOf(fnType))
+        base.putWord(conversion + 16, at(c).*.conversions)
+        at(c).*.conversions = conversion
+    }
     if cursor.is(names.P_LBRACE) || (isCtor && cursor.is(names.P_COLON)) {
         obj.*.isWeak = true
         obj.*.isInline = true
-        deferBody(o, classTy)
+        if template.instantiating() && !obj.*.isVirtual {
+            // A class template's instance: the body waits for a call.
+            pendBody(o, classTy)
+        } else {
+            deferBody(o, classTy)
+        }
         return true
     }
     return false
+}
+
+// Keeps a member function's body (at the cursor: `{`, or a
+// constructor's `:`) for when the function is first called, and passes
+// it.
+pub fn pendBody(fnObj: usize, classTy: usize) -> void {
+    ast.obj(fnObj).*.pendingBody = cursor.save()
+    ast.obj(fnObj).*.pendingClass = classTy
+    skipBody()
 }
 
 // The member function among `first`'s overloads whose parameters are
@@ -1134,6 +1171,12 @@ fn deferBody(fnObj: usize, classTy: usize) -> void {
     base.putWord(c + 16, classTy)
     if deferred == 0 { deferred = c } else { base.putWord(deferredTail + 24, c) }
     deferredTail = c
+    skipBody()
+}
+
+// Passes a function body here, with a constructor's initializer list
+// before it.
+fn skipBody() -> void {
     if cursor.is(names.P_COLON) {
         // The initializer list, to the body's `{` (a `{` right after a
         // name is a brace initializer, skipped).
@@ -1264,7 +1307,16 @@ pub fn completeClass(ty: usize) -> void {
     const c = info(ty)
     at(c).*.complete = true
     scope.leaveNamespace()
-    if at(c).*.hasVirtual { makeVtable(c) }
+    if at(c).*.hasVirtual {
+        // The vtable needs every virtual function defined (one that
+        // overrides without saying `virtual` may be pending).
+        var s = at(c).*.virtuals
+        while s != 0 {
+            template.ensureDefined(state.cellNode(s))
+            s = state.cellNext(s)
+        }
+        makeVtable(c)
+    }
     classDepth -= 1
     if classDepth == 0 { readDeferred() }
 }
@@ -1620,6 +1672,112 @@ pub fn globalObject(o: usize, token: usize) -> void {
 }
 
 // ---------------------------------------------------------------------------
+// The range-based for
+
+// Whether `for (` is followed by `T x :` (a range-based for).
+pub fn startsRangeFor() -> bool {
+    if !decl.isTypename(cursor.peek()) { return false }
+    const saved = cursor.save()
+    const attr = decl.newAttr()
+    const baseType = decl.declspec(attr)
+    const found = decl.declarator(baseType)
+    const result = found.1 != 0 && cursor.is(names.P_COLON)
+    cursor.restore(saved)
+    return result
+}
+
+// `for (T x : range) body`, after `for (`, the FOR node `n` made with
+// its labels and the for's scope entered: the range is kept by its
+// address, the loop runs from its begin() to its end() (or over an
+// array), and each round makes x from *iterator. The statement.
+pub fn rangeFor(n: usize, token: usize) -> usize {
+    const attr = decl.newAttr()
+    const baseType = decl.declspec(attr)
+    const found = decl.declarator(baseType)
+    const nameToken = found.1
+    cursor.expect(names.P_COLON)
+    var range = expr.expression()
+    cursor.expect(names.P_RPAREN)
+    typing.addType(range)
+    const rangeTy = ast.typeOf(range)
+    // The range by its address (a temporary is kept for the loop).
+    if !typing.isLvalue(range) && isClassType(rangeTy) {
+        const held = newTemp(rangeTy, token)
+        const made = construct(addressOf(variable(held, token), token), rangeTy, argumentList(consumed(range), 0), 1, token)
+        if hasDestructor(rangeTy) { state.pushCleanup(held) }
+        range = ast.binary(ast.COMMA, made, variable(held, token), token)
+        ast.node(range).*.ty = rangeTy
+    }
+    const holder = newTemp(types.pointerTo(rangeTy), token)
+    const keep = typed(ast.binary(ast.ASSIGN, variable(holder, token), addressOf(range, token), token))
+    var first: usize = 0
+    var last: usize = 0
+    if types.kind(rangeTy) == types.ARRAY {
+        const element = types.baseOf(rangeTy)
+        first = typing.cast(variable(holder, token), types.pointerTo(element))
+        last = typed(expr.newAdd(typing.cast(variable(holder, token), types.pointerTo(element)), number(types.at(rangeTy).*.arrayLength, types.longOf(), token), token))
+    } else {
+        const object = deref(variable(holder, token), token)
+        const beginFn = findMethod(rangeTy, base.intern("begin"))
+        const endFn = findMethod(rangeTy, base.intern("end"))
+        if beginFn == 0 || endFn == 0 { tokens.errorAt(token, "the range has no begin() and end()") }
+        first = expr.buildCall(methodNode(beginFn, addressOf(object, token), token), 0, 0, token)
+        last = expr.buildCall(methodNode(endFn, addressOf(object, token), token), 0, 0, token)
+    }
+    typing.addType(first)
+    const iteratorTy = ast.typeOf(first)
+    const it = newTemp(iteratorTy, token)
+    const stop = newTemp(iteratorTy, token)
+    const init = ast.make(ast.BLOCK, token)
+    appendStatement(init, ast.unary(ast.EXPR_STMT, keep, token))
+    appendStatement(init, ast.unary(ast.EXPR_STMT, typed(ast.binary(ast.ASSIGN, variable(it, token), first, token)), token))
+    appendStatement(init, ast.unary(ast.EXPR_STMT, typed(ast.binary(ast.ASSIGN, variable(stop, token), last, token)), token))
+    ast.node(n).*.init = init
+    var differs = binaryOperator("!=", variable(it, token), variable(stop, token), token)
+    if differs == 0 { differs = typed(ast.binary(ast.NE, variable(it, token), variable(stop, token), token)) }
+    ast.node(n).*.cond = differs
+    var step = unaryOperator("++", variable(it, token), false, token)
+    if step == 0 { step = expr.toAssign(expr.newAdd(variable(it, token), number(1, types.intOf(), token), token)) }
+    typing.addType(step)
+    ast.node(n).*.inc = step
+    // The body: x from *it, then the statement, then x unmade.
+    var current = unaryOperator("*", variable(it, token), false, token)
+    if current == 0 { current = deref(variable(it, token), token) }
+    typing.addType(current)
+    var elementTy = found.0
+    if decl.attrAt(attr).*.isAuto && !decl.attrAt(attr).*.hasType {
+        var inferred = ast.typeOf(current)
+        if types.kind(inferred) == types.ARRAY { inferred = types.pointerTo(types.baseOf(inferred)) }
+        elementTy = if types.isReference(found.0) { types.referenceTo(inferred) } else { inferred }
+    }
+    scope.enter()
+    const height = state.cleanupCount()
+    state.setLoopCleanups(height)
+    const local = decl.newLocal(tokens.name(nameToken), elementTy, nameToken)
+    const body = ast.make(ast.BLOCK, token)
+    var made: usize = 0
+    if types.isReference(elementTy) {
+        const target = ast.variableNode(local, token)
+        ast.node(target).*.ty = elementTy
+        made = ast.binary(ast.ASSIGN, target, typing.toReference(current, elementTy), token)
+        ast.node(made).*.ty = elementTy
+    } else if isObjectType(elementTy) {
+        made = construct(addressOf(variable(local, token), token), elementTy, argumentList(current, 0), 1, token)
+        if hasDestructor(elementTy) { state.pushCleanup(local) }
+    } else {
+        made = typed(ast.binary(ast.ASSIGN, variable(local, token), current, token))
+    }
+    appendStatement(body, statementOf(flushTemporaries(made, false, token), token))
+    const statement = stmt.statement()
+    typing.addType(statement)
+    appendStatement(body, statement)
+    appendStatement(body, leaveScope(height, token))
+    scope.leave()
+    ast.node(n).*.then = body
+    return n
+}
+
+// ---------------------------------------------------------------------------
 // Member access in expressions
 
 // A name used in a member function that is a member of the class (or
@@ -1718,6 +1876,46 @@ pub fn withUsingOverloads(first: usize, name: u32) -> usize {
     return first
 }
 
+// The conversion operator of the class (or a base) to `target`: the
+// one to that type, else one to an arithmetic type or a pointer when
+// `target` is one; 0 for none.
+pub fn conversionTo(classTy: usize, target: usize) -> usize {
+    var c = info(classTy)
+    var fallback: usize = 0
+    while c != 0 {
+        var cell = at(c).*.conversions
+        while cell != 0 {
+            const to = base.getWord(cell + 8)
+            if types.compatible(to, target) { return base.getWord(cell) }
+            if fallback == 0 && ((types.isScalar(to) && types.isScalar(target)) || (types.kind(to) == types.BOOL && types.isNumeric(target))) { fallback = base.getWord(cell) }
+            cell = base.getWord(cell + 16)
+        }
+        c = info(at(c).*.baseClass)
+    }
+    return fallback
+}
+
+// `value` of a class converted to the non-class `target` through its
+// conversion operator; 0 when it has none that fits.
+pub fn convertFrom(value: usize, target: usize) -> usize {
+    typing.addType(value)
+    const ty = ast.typeOf(value)
+    if !isClassType(ty) || isClassType(types.referenced(target)) { return 0 }
+    const o = conversionTo(ty, target)
+    if o == 0 { return 0 }
+    return expr.buildCall(methodNode(o, addressOf(value, ast.tokenOf(value)), ast.tokenOf(value)), 0, 0, ast.tokenOf(value))
+}
+
+// A condition: a class value is converted to bool (operator bool, or
+// another conversion operator).
+pub fn toCondition(e: usize) -> usize {
+    typing.addType(e)
+    if !isClassType(ast.typeOf(e)) { return e }
+    const converted = convertFrom(e, types.boolOf())
+    if converted == 0 { tokens.errorAt(ast.tokenOf(e), "the class has no conversion to bool") }
+    return converted
+}
+
 // `obj->name` where obj is a class: `obj.operator->()->name`.
 pub fn arrowOperator(object: usize, token: usize) -> usize {
     const call = unaryOperator("->", object, false, token)
@@ -1803,20 +2001,39 @@ pub fn binaryOperator(op: []const u8, lhs: usize, rhs: usize, token: usize) -> u
     const rt = ast.typeOf(rhs)
     if !isClassType(lt) && !isClassType(rt) { return 0 }
     const name = operatorFunction(op)
+    // `a << b`, `a >> b`, `a = b`, `a op= b` evaluate a before b (C++17):
+    // an object a is taken by its address first (arguments are
+    // evaluated last to first).
+    var sequenced = base.same(op, "<<") || base.same(op, ">>") || base.same(op, "=")
+    if op.length >= 2 && op[op.length - 1] == 61 && !base.same(op, "==") && !base.same(op, "!=") && !base.same(op, "<=") && !base.same(op, ">=") { sequenced = true }
+    var left = lhs
+    var before: usize = 0
+    if sequenced && typing.isLvalue(lhs) {
+        const holder = newTemp(types.pointerTo(lt), token)
+        before = typed(ast.binary(ast.ASSIGN, variable(holder, token), addressOf(lhs, token), token))
+        left = deref(variable(holder, token), token)
+    }
+    var call: usize = 0
     if isClassType(lt) {
         const m = findMethod(lt, name)
         if m != 0 {
-            const address = addressOf(lhs, token)
+            const address = addressOf(left, token)
             const full = argumentList(address, rhs)
             const chosen = bestOf(m, 0, full, 2)
-            if chosen != 0 { return expr.buildCall(methodNode(m, address, token), argumentList(rhs, 0), 1, token) }
+            if chosen != 0 { call = expr.buildCall(methodNode(m, address, token), argumentList(rhs, 0), 1, token) }
         }
     }
-    const free = freeFunctions(name, lhs, rhs)
-    const full = argumentList(lhs, rhs)
-    const chosen = bestOf(free.0, free.1, full, 2)
-    if chosen != 0 { return expr.buildCall(methodNode(chosen, 0, token), full, 2, token) }
-    return 0
+    if call == 0 {
+        const free = freeFunctions(name, lhs, rhs)
+        const full = argumentList(left, rhs)
+        const chosen = bestOf(free.0, free.1, full, 2)
+        if chosen != 0 { call = expr.buildCall(methodNode(chosen, 0, token), full, 2, token) }
+    }
+    if call == 0 || before == 0 { return call }
+    typing.addType(call)
+    const n = ast.binary(ast.COMMA, before, call, token)
+    ast.node(n).*.ty = ast.typeOf(call)
+    return n
 }
 
 // `op operand` or `operand op` (postfix: the int argument 0) with a
@@ -1935,7 +2152,10 @@ pub fn operatorNameToken() -> usize {
         text = tokens.text(cursor.peek())
         cursor.advance()
     } else {
-        cursor.fail("conversion operators are not supported yet")
+        // A conversion operator, named by its target type's code.
+        const ty = decl.pointersOnly(decl.declspec(0))
+        conversionType = ty
+        text = base.join("@", mangle.typeCode(ty))
     }
     const t = tokens.copy(start)
     tokens.at(t).*.kind = tokens.IDENT

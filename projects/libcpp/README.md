@@ -44,6 +44,13 @@ driver for linking C++ objects. The headers are the compiler's, under
   `end`, `data`, `size`, `capacity`, `empty`, `reserve`, `resize`,
   `assign`, `insert`, `erase`, `clear`, `swap`, `==`, `!=`; elements are
   constructed and destroyed as C++ asks, through placement new.
+- `<map>` and `<set>`: `std::map<K, V>` and `std::set<K>` as sorted
+  vectors (binary search, insertion in place: an insertion or erasure
+  moves what follows, so iterators do not survive them) with `[]`, `at`,
+  `find`, `count`, `insert` (a pair of iterator and bool), `erase`,
+  `lower_bound`, `upper_bound`, `begin`, `end`, `size`, `empty`,
+  `clear`, `swap`; iterators are pointers to the pairs or keys, and the
+  keys compare with `<` (no comparator parameter).
 - `<utility>`: `std::pair`, `make_pair`, the comparisons, `std::swap`.
 - `<algorithm>`: `min`, `max`, `fill`, `count`, `find`, `reverse`,
   `copy`, `equal`, `sort`, `unique`; `<numeric>`: `accumulate`. They
@@ -55,10 +62,10 @@ driver for linking C++ objects. The headers are the compiler's, under
 
 ## Not there
 
-`<map>`, `<set>`, `<list>`, `<memory>`, `<functional>`, iterators that
-are not pointers, lambdas as predicates (`sort` with a comparison);
-exceptions (`std::string::at` out of range aborts); conversion to bool of
-a stream (`while (cin >> x)`: test `cin.fail()` instead); formatting
+`<list>`, `<deque>`, `<memory>`, `<functional>`, `<sstream>`,
+iterators that are not pointers, lambdas as predicates (`sort` with a
+comparison), a map or set as a tree (large ones insert slowly);
+exceptions (`std::string::at` out of range aborts); formatting
 flags beyond the precision (`setw`, `hex`, `fixed`); file and string
 streams; wide strings; `std::abs(long long)` and the other `long long`
 overloads (`long long` is `long` to mlx-cc).
@@ -66,5 +73,6 @@ overloads (`long long` is `long` to mlx-cc).
 ## Check
 
 `tools/check_cpp.sh` builds the library and runs `projects/cc/tests/cpp`
-(`stdlib.cpp` uses it, reading `stdlib.stdin`; `containers.cpp` its
-templates) against the output of g++'s builds, on glibc and on mlxlibc.
+(`stdlib.cpp` uses it, reading `stdlib.stdin`; `containers.cpp` and
+`maps.cpp` its templates) against the output of g++'s builds, on glibc
+and on mlxlibc.
