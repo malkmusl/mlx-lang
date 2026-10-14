@@ -271,7 +271,17 @@ recursion, static member functions); `static constexpr` data members
 and `constexpr` variables are constants; variable templates
 (`template <class T> constexpr bool v = ...;`, with explicit
 specializations); `if constexpr` reads the branch taken only;
-`noexcept(e)` is true.
+`noexcept(e)` is true. Rvalue references: `T &&` is a type of its
+own (mangled `O`), binding rvalues only (temporaries, call results,
+values, objects named through `static_cast<T &&>` or `std::move`)
+and before `const T &` does, so move constructors and move
+assignments are chosen for them; a forwarding reference (`T &&` with
+T a parameter) deduces a reference from an lvalue (references
+collapse), so `std::forward<T>(x)` passes the category on; a
+non-const reference does not bind a const object; a dependent member
+type in a signature (`typename remove_reference<T>::type &&`) is
+resolved in the instance; `decltype(e)`, `sizeof e` and `noexcept(e)`
+evaluate nothing, so `declval<T>()` (declared only) works in them.
 `tests/cpp/interp.cpp`
 is a small interpreter (lexer, recursive descent parser, virtual nodes,
 maps of variables and functions) that runs as g++ builds it;
@@ -289,9 +299,7 @@ a pack of a base list (`struct X : Bases...`), a pack in a lambda's
 captures,
 generic lambdas (`auto` parameters), a lambda converting to a function
 pointer, init-captures, alias templates (`template <class T> using`),
-dependent qualified names in a function template's signature, rvalue
-references as a type of their own (`T &&` is `T &`, `std::move` the
-identity), exceptions (`try`, `throw` are refused),
+exceptions (`try`, `throw` are refused),
 multiple inheritance, a polymorphic class over a base without a vtable,
 `constexpr` over classes, pointers or floating-point values,
 `consteval`, destruction of globals at exit, a diagnosis

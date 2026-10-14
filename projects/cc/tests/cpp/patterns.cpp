@@ -45,6 +45,18 @@ template <class T, class E> using Expected = std::experimental::expected<T, E>;
 template <typename T> T twice(T x);
 template <typename T> T twice(T x) { return x + x; }
 
+// A virtual function's body is read as its instance completes: the
+// instance it names (`Pool<N>::clear()`) is the one being read.
+class PoolBase { public: virtual ~PoolBase() {} virtual int itemSize() const = 0; };
+template <int N> class Pool : public PoolBase {
+public:
+    Pool() : count(0) {}
+    ~Pool() { Pool<N>::clear(); }
+    void clear() { count = 0; printf("clear %d\n", N); }
+    virtual int itemSize() const { return N; }
+    int count;
+};
+
 int main() {
     int n = 1;
     int &r = n;
@@ -72,5 +84,10 @@ int main() {
     x.e = 'e';
     printf("%d %d %c %d %d\n", e.k, x.v, x.e, std::experimental::level(), std::experimental::fundamentals_v3::level());
     printf("%d %g\n", twice(21), twice(1.25));
+    {
+        Pool<12> pool;
+        pool.count = 3;
+        printf("%d %d\n", pool.itemSize(), pool.count);
+    }
     return 0;
 }
