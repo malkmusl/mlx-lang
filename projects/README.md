@@ -39,8 +39,8 @@ projects/.../main.mlx -o ...`) and is checked by a script under `tools/`.
 - [`libc/`](libc/README.md): mlxlibc, the C library, libm and dynamic
   loader in Mlx for legacy programs; `tools/check_mlxlibc.sh`.
 - [`libcpp/`](libcpp/README.md): mlxlibcpp, the C++ standard library for
-  mlx-cc (`std::string`, `<iostream>`, new and delete, the `c*` headers);
-  `tools/check_cpp.sh`.
+  mlx-cc (`std::string`, `<iostream>`, `<vector>`, `<algorithm>`, new and
+  delete, the `c*` headers); `tools/check_cpp.sh`.
 - [`cc/`](cc/README.md): mlx-cc, the C compiler in Mlx (C89 to C23 and
   the GNU variants, preprocessor, parser, x86_64 code and ELF written
   itself, its own headers); `tools/check_cc.sh`, and

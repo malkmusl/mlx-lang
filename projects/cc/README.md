@@ -191,15 +191,29 @@ references to a derived class convert to its base), virtual functions
 (`_ZTV...`, weak) whose pointer is the object's first word. A returned
 local is moved out, not copied; a class returned by value comes back
 through the caller's buffer; a global object is constructed when the
-program starts (`__mlxcc_init_unit`). Names are mangled as the Itanium
+program starts (`__mlxcc_init_unit`). Templates (`template.mlx`): class
+templates with type and integer parameters (`vector<int>`,
+`Box<double, 2>`, nested `List<List<int> >`, the `>>` closing two),
+their members defined inside or outside the class, function templates
+deduced from the arguments or given them (`max<double>(a, b)`),
+overloaded templates, templates in namespaces. A template is kept as
+its tokens and read again per instance, with its parameters bound as
+typedefs under the instance's prefix (`std::vector<i>`); an instance
+made inside a function belongs to the file (the function's state and
+scopes are put aside meanwhile); instances are weak, like inline
+functions, and named by the arguments' codes (`_Z3maxIiEii`). Names are mangled as the Itanium
 ABI says (`_ZN8geometry4areaEii`, `_ZN1SC1Ei`, `_ZNK6Matrix2atEii`),
 so objects of several files link by name. `tests/cpp/*.cpp` run as g++
 runs them (`tools/check_cpp.sh`, on glibc and on mlxlibc).
 
 C's `getline` and `std::getline` both apply where `using namespace std`
 is in force: the functions a using-directive brings in join the
-overloads of a name. Not there yet: templates, exceptions (`try`,
-`throw` are refused),
+overloads of a name. Not there yet: default template arguments,
+specializations, member templates, variadic templates, deduction
+through a class template (`f(const vector<T> &)`: give the arguments),
+dependent qualified names in a function template's signature, a
+function and a function template of one name as overloads of each
+other, exceptions (`try`, `throw` are refused),
 multiple inheritance, a polymorphic class over a base without a vtable,
 conversion operators (`operator bool`), lambdas, range `for`, `auto`
 deduction, `constexpr` functions, destruction of globals at exit, local
@@ -210,7 +224,8 @@ names leave out `const` (`PKc` is `Pc`) and the ABI's substitutions
 from g++'s; constructors have only their `C1` symbol; `long long` and
 `signed char` are `long` and `char`, not types of their own. The C++
 standard library is mlxlibcpp (`projects/libcpp`: `<string>`,
-`<iostream>`, `<new>`, the `c*` headers, under `include/c++`), linked
+`<iostream>`, `<vector>`, `<utility>`, `<algorithm>`, `<numeric>`,
+`<new>`, the `c*` headers, under `include/c++`), linked
 into every C++ program by itself as `libmlxcpp.a` from `$MLX_CC_LIB`,
 `lib/` next to the compiler or `/usr/local/lib/mlx-cc/lib`
 (`-nostdlib++` leaves it out), together with the math library.

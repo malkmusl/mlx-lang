@@ -1,6 +1,7 @@
 // std::string (include/c++/string): a NUL-ended buffer of `room` bytes
 // holding `count` chars, grown by doubling.
 #include <string>
+#include <utility>
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -290,7 +291,6 @@ bool operator<(const string &a, const string &b) { return a.compare(b) < 0; }
 bool operator<=(const string &a, const string &b) { return a.compare(b) <= 0; }
 bool operator>(const string &a, const string &b) { return a.compare(b) > 0; }
 bool operator>=(const string &a, const string &b) { return a.compare(b) >= 0; }
-void swap(string &a, string &b) { a.swap(b); }
 
 static string formatted(const char *format, double value) {
     char buffer[64];

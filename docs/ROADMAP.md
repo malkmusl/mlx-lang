@@ -128,8 +128,9 @@ delete, single inheritance and virtual functions are there (steps 1 and
 2), with tests run against g++ (`tools/check_cpp.sh`), and the first
 slice of a C++ standard library of our own (`projects/libcpp`:
 `std::string`, `<iostream>`, new and delete, the `c*` headers, linked
-in by itself). Next: templates, then containers and `<algorithm>` in
-mlxlibcpp, then what Mesa needs. The other way stays open: a Vulkan
+in by itself), and templates with `<vector>`, `<utility>` and
+`<algorithm>` over them. Next: specializations and default template
+arguments, `<map>` and the other containers, then what Mesa needs. The other way stays open: a Vulkan
 driver for one GPU family in Mlx (`docs/VULKAN.md` has the first steps)
 takes Mesa out of the picture for that hardware.
 

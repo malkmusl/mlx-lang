@@ -2,8 +2,8 @@
 
 The C++ standard library for mlx-cc (`projects/cc`, "C++"), written in
 the C++ mlx-cc reads, over the C library (mlxlibc on MLX/Linux, glibc
-elsewhere). It is small and grows with the compiler: no templates yet,
-so no containers; what is here is what programs use first.
+elsewhere). It is small and grows with the compiler: what is here is
+what programs use first.
 
     tools/build_mlxlibcpp.sh                  # mlx-out/libcpp/libmlxcpp.a
     MLX_CC_LIB=mlx-out/libcpp mlx-cc -o hello hello.cpp
@@ -39,6 +39,15 @@ driver for linking C++ objects. The headers are the compiler's, under
   string, `eof`, `fail`, `good`, `clear`. The stream objects are plain
   aggregates over stdio's streams, so a program's own globals may use
   them in their constructors.
+- `<vector>`: `std::vector<T>` (a doubling array; pointers as iterators)
+  with `push_back`, `pop_back`, `[]`, `at`, `front`, `back`, `begin`,
+  `end`, `data`, `size`, `capacity`, `empty`, `reserve`, `resize`,
+  `assign`, `insert`, `erase`, `clear`, `swap`, `==`, `!=`; elements are
+  constructed and destroyed as C++ asks, through placement new.
+- `<utility>`: `std::pair`, `make_pair`, the comparisons, `std::swap`.
+- `<algorithm>`: `min`, `max`, `fill`, `count`, `find`, `reverse`,
+  `copy`, `equal`, `sort`, `unique`; `<numeric>`: `accumulate`. They
+  take pointers (a vector's, a string's, an array's) as iterators.
 - The C headers in `std`: `<cstdio>`, `<cstdlib>` (with `std::abs` for
   int, long, and in `<cmath>` double and float), `<cstring>`,
   `<cctype>`, `<cmath>`, `<cstddef>`, `<cstdint>`, `<cstdarg>`,
@@ -46,7 +55,8 @@ driver for linking C++ objects. The headers are the compiler's, under
 
 ## Not there
 
-Templates and so `<vector>`, `<map>`, `<algorithm>`, `<memory>`;
+`<map>`, `<set>`, `<list>`, `<memory>`, `<functional>`, iterators that
+are not pointers, lambdas as predicates (`sort` with a comparison);
 exceptions (`std::string::at` out of range aborts); conversion to bool of
 a stream (`while (cin >> x)`: test `cin.fail()` instead); formatting
 flags beyond the precision (`setw`, `hex`, `fixed`); file and string
@@ -56,5 +66,5 @@ overloads (`long long` is `long` to mlx-cc).
 ## Check
 
 `tools/check_cpp.sh` builds the library and runs `projects/cc/tests/cpp`
-(`stdlib.cpp` uses it, reading `stdlib.stdin`) against the output of
-g++'s builds, on glibc and on mlxlibc.
+(`stdlib.cpp` uses it, reading `stdlib.stdin`; `containers.cpp` its
+templates) against the output of g++'s builds, on glibc and on mlxlibc.
