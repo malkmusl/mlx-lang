@@ -212,7 +212,16 @@ and the left operand of `<<`, `>>` and assignments evaluated before the
 right one, as C++17 says; the temporaries of a branch of `&&`, `||` or
 `?:` live and die within it. A function and a function template of one
 name are overloads of each other (`<string>`'s `operator==` next to
-`<vector>`'s template), a function winning a tie. `tests/cpp/interp.cpp`
+`<vector>`'s template), a function winning a tie. Explicit
+specializations (`template <> struct X<bool> {...}`, `template <> R
+f<int>(...)`, or `template <> R f(double)` with the arguments deduced)
+are read as the instance they name. Lambdas (`lambda.mlx`): `[](int
+x) { ... }` is an object of a closure class the compiler makes, whose
+`operator()` is the body; captures by copy are members made from the
+variables, by reference are reference members, `this` is captured as a
+pointer (the enclosing class's members resolve through it), `[=]` and
+`[&]` capture what the body uses; the result type is the `-> R` given
+or the first return's; an empty class has size 1. `tests/cpp/interp.cpp`
 is a small interpreter (lexer, recursive descent parser, virtual nodes,
 maps of variables and functions) that runs as g++ builds it. Names are mangled as the Itanium
 ABI says (`_ZN8geometry4areaEii`, `_ZN1SC1Ei`, `_ZNK6Matrix2atEii`),
@@ -222,12 +231,14 @@ runs them (`tools/check_cpp.sh`, on glibc and on mlxlibc).
 C's `getline` and `std::getline` both apply where `using namespace std`
 is in force: the functions a using-directive brings in join the
 overloads of a name. Not there yet:
-specializations, member templates, variadic templates, deduction
+partial specializations, member templates, variadic templates,
+generic lambdas (`auto` parameters), a lambda converting to a function
+pointer, init-captures, deduction
 through a class template (`f(const vector<T> &)`: give the arguments),
 dependent qualified names in a function template's signature,
 exceptions (`try`, `throw` are refused),
 multiple inheritance, a polymorphic class over a base without a vtable,
-conversion operators (`operator bool`), lambdas, `constexpr` functions, destruction of globals at exit, local
+conversion operators (`operator bool`), `constexpr` functions, destruction of globals at exit, local
 classes with member functions, user-defined `operator new` (the
 built-in `new` calls `_Znwm`, which mlxlibcpp provides). The mangled
 names leave out `const` (`PKc` is `Pc`) and the ABI's substitutions

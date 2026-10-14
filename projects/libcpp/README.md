@@ -54,8 +54,10 @@ driver for linking C++ objects. The headers are the compiler's, under
   keys compare with `<` (no comparator parameter).
 - `<utility>`: `std::pair`, `make_pair`, the comparisons, `std::swap`.
 - `<algorithm>`: `min`, `max`, `fill`, `count`, `find`, `reverse`,
-  `copy`, `equal`, `sort`, `unique`; `<numeric>`: `accumulate`. They
-  take pointers (a vector's, a string's, an array's) as iterators.
+  `copy`, `equal`, `sort` (with or without a comparison), `unique`,
+  `find_if`, `count_if`, `for_each`, `transform`, `remove_if` (with
+  lambdas as predicates); `<numeric>`: `accumulate`. They take pointers
+  (a vector's, a string's, an array's) as iterators.
 - The C headers in `std`: `<cstdio>`, `<cstdlib>` (with `std::abs` for
   int, long, and in `<cmath>` double and float), `<cstring>`,
   `<cctype>`, `<cmath>`, `<cstddef>`, `<cstdint>`, `<cstdarg>`,
@@ -64,8 +66,8 @@ driver for linking C++ objects. The headers are the compiler's, under
 ## Not there
 
 `<list>`, `<deque>`, `<memory>`, `<functional>`, `<sstream>`,
-iterators that are not pointers, lambdas as predicates (`sort` with a
-comparison), a map or set as a tree (large ones insert slowly);
+iterators that are not pointers, a map or set as a tree (large ones
+insert slowly);
 exceptions (`std::string::at` out of range aborts); formatting
 flags beyond the precision (`setw`, `hex`, `fixed`); file and string
 streams; wide strings; `std::abs(long long)` and the other `long long`

@@ -129,8 +129,10 @@ delete, single inheritance and virtual functions are there (steps 1 and
 slice of a C++ standard library of our own (`projects/libcpp`:
 `std::string`, `<iostream>`, new and delete, the `c*` headers, linked
 in by itself), and templates with `<vector>`, `<map>`, `<set>`,
-`<utility>` and `<algorithm>` over them. Next: specializations,
-lambdas, a real C++ program as the test, then what Mesa needs. The other way stays open: a Vulkan
+`<utility>` and `<algorithm>` over them, lambdas, explicit
+specializations, and a small interpreter (`tests/cpp/interp.cpp`) as
+the larger test. Next: partial specializations and member templates,
+`<memory>` and `<functional>`, then what Mesa needs. The other way stays open: a Vulkan
 driver for one GPU family in Mlx (`docs/VULKAN.md` has the first steps)
 takes Mesa out of the picture for that hardware.
 
