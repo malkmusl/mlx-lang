@@ -29,10 +29,15 @@ keywords = [
     "asm", "__typeof__", "typeof", "__signed__", "__builtin_va_list",
     "__builtin_va_start", "__builtin_va_end", "__builtin_va_arg", "__builtin_va_copy",
     "__builtin_offsetof", "__alignof__", "__thread",
+    # C23's spellings (keywords from -std=c23 on; literal.mlx maps the
+    # alternate ones to the C11 keywords above).
+    "bool", "true", "false", "nullptr", "static_assert", "alignas", "alignof",
+    "thread_local", "typeof_unqual", "constexpr",
 ]
 directives = [
     "include", "include_next", "define", "undef", "if", "ifdef", "ifndef", "elif",
-    "else", "endif", "error", "warning", "pragma", "line", "defined", "__VA_ARGS__",
+    "elifdef", "elifndef", "else", "endif", "error", "warning", "pragma", "line",
+    "defined", "__VA_ARGS__",
     "once", "__FILE__", "__LINE__", "__COUNTER__", "__DATE__", "__TIME__",
     "__has_include", "__has_include_next", "__BASE_FILE__", "__VA_OPT__", "main",
     "_start", "exit", "__mlxcc_init",
@@ -46,6 +51,8 @@ OVERRIDES = {
     "__has_include": "HAS_INCLUDE", "__has_include_next": "HAS_INCLUDE_NEXT",
     "__BASE_FILE__": "BASE_FILE", "__VA_OPT__": "VA_OPT",
     "__mlxcc_init": "MLXCC_INIT", "_start": "START",
+    "bool": "C23_BOOL", "static_assert": "C23_STATIC_ASSERT", "alignas": "C23_ALIGNAS",
+    "alignof": "C23_ALIGNOF", "thread_local": "C23_THREAD_LOCAL",
 }
 
 def const_name(word):
