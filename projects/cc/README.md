@@ -262,7 +262,16 @@ the rest of the arguments (`Tuple<T, Rest...>`), fold expressions
 for `&&`, `||` and `,`). An expansion is read once per element of
 the pack, the pack's names standing for that element each time; an
 instance's pack parameter becomes a parameter per element (`args#0`,
-`args#1`), known together as the pack.
+`args#1`), known together as the pack. `constexpr` functions
+(`interp.mlx`): a call with constant arguments in a constant
+expression (`static_assert`, an array's size, a template argument) is
+computed by walking the function's body (integers only: locals,
+`if`, loops, `switch`, `break`, `continue`, compound assignments,
+recursion, static member functions); `static constexpr` data members
+and `constexpr` variables are constants; variable templates
+(`template <class T> constexpr bool v = ...;`, with explicit
+specializations); `if constexpr` reads the branch taken only;
+`noexcept(e)` is true.
 `tests/cpp/interp.cpp`
 is a small interpreter (lexer, recursive descent parser, virtual nodes,
 maps of variables and functions) that runs as g++ builds it;
@@ -284,7 +293,8 @@ dependent qualified names in a function template's signature, rvalue
 references as a type of their own (`T &&` is `T &`, `std::move` the
 identity), exceptions (`try`, `throw` are refused),
 multiple inheritance, a polymorphic class over a base without a vtable,
-`constexpr` functions, destruction of globals at exit, a diagnosis
+`constexpr` over classes, pointers or floating-point values,
+`consteval`, destruction of globals at exit, a diagnosis
 of writing through const (`const int x; x = 2` and `mutable` pass:
 const chooses overloads and member functions only), a local class's member
 functions naming the function's locals or the class itself,
