@@ -45,6 +45,13 @@ driver for linking C++ objects. The headers are the compiler's, under
   `end`, `data`, `size`, `capacity`, `empty`, `reserve`, `resize`,
   `assign`, `insert`, `erase`, `clear`, `swap`, `==`, `!=`; elements are
   constructed and destroyed as C++ asks, through placement new.
+- `<sstream>`: `std::ostringstream` (`stringstream` too) with the `<<`
+  of ostream into a string and `str()`, `std::istringstream` with `>>`
+  for the built-in types and strings and `getline`.
+- `<memory>`: `std::unique_ptr` (a copy takes the pointer over, as a
+  move would), `std::shared_ptr` (counted owners), `make_unique` and
+  `make_shared` for up to two constructor arguments. `std::move` (in
+  `<utility>`) is the identity: mlx-cc does not tell `&&` from `&`.
 - `<map>` and `<set>`: `std::map<K, V>` and `std::set<K>` as sorted
   vectors (binary search, insertion in place: an insertion or erasure
   moves what follows, so iterators do not survive them) with `[]`, `at`,
@@ -65,9 +72,8 @@ driver for linking C++ objects. The headers are the compiler's, under
 
 ## Not there
 
-`<list>`, `<deque>`, `<memory>`, `<functional>`, `<sstream>`,
-iterators that are not pointers, a map or set as a tree (large ones
-insert slowly);
+`<list>`, `<deque>`, `<functional>`, file streams, iterators that are
+not pointers, a map or set as a tree (large ones insert slowly);
 exceptions (`std::string::at` out of range aborts); formatting
 flags beyond the precision (`setw`, `hex`, `fixed`); file and string
 streams; wide strings; `std::abs(long long)` and the other `long long`
@@ -77,5 +83,6 @@ overloads (`long long` is `long` to mlx-cc).
 
 `tools/check_cpp.sh` builds the library and runs `projects/cc/tests/cpp`
 (`stdlib.cpp` uses it, reading `stdlib.stdin`; `containers.cpp` and
-`maps.cpp` its templates; `interp.cpp` all of it together) against the
+`maps.cpp` its templates; `misc.cpp` the streams into strings and the
+smart pointers; `interp.cpp` all of it together) against the
 output of g++'s builds, on glibc and on mlxlibc.

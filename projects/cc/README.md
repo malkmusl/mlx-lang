@@ -221,7 +221,14 @@ x) { ... }` is an object of a closure class the compiler makes, whose
 variables, by reference are reference members, `this` is captured as a
 pointer (the enclosing class's members resolve through it), `[=]` and
 `[&]` capture what the body uses; the result type is the `-> R` given
-or the first return's; an empty class has size 1. `tests/cpp/interp.cpp`
+or the first return's; an empty class has size 1. Also: delegating
+constructors (`Point() : Point(0, 0) {}`), static locals of a class
+type made the first time their declaration runs (`static Point p(7)`),
+`using T = type;`, explicit template arguments for some of a function
+template's parameters with the rest deduced from the call
+(`make_shared<Resource>(name)`), deduction through a class template's
+instance (`f(const vector<T> &)` from a `vector<int>`), a cast to a
+reference type (`const_cast<T &>(x)`) yielding the object. `tests/cpp/interp.cpp`
 is a small interpreter (lexer, recursive descent parser, virtual nodes,
 maps of variables and functions) that runs as g++ builds it. Names are mangled as the Itanium
 ABI says (`_ZN8geometry4areaEii`, `_ZN1SC1Ei`, `_ZNK6Matrix2atEii`),
@@ -233,10 +240,10 @@ is in force: the functions a using-directive brings in join the
 overloads of a name. Not there yet:
 partial specializations, member templates, variadic templates,
 generic lambdas (`auto` parameters), a lambda converting to a function
-pointer, init-captures, deduction
-through a class template (`f(const vector<T> &)`: give the arguments),
-dependent qualified names in a function template's signature,
-exceptions (`try`, `throw` are refused),
+pointer, init-captures, alias templates (`template <class T> using`),
+dependent qualified names in a function template's signature, rvalue
+references as a type of their own (`T &&` is `T &`, `std::move` the
+identity), exceptions (`try`, `throw` are refused),
 multiple inheritance, a polymorphic class over a base without a vtable,
 conversion operators (`operator bool`), `constexpr` functions, destruction of globals at exit, local
 classes with member functions, user-defined `operator new` (the
@@ -246,8 +253,9 @@ names leave out `const` (`PKc` is `Pc`) and the ABI's substitutions
 from g++'s; constructors have only their `C1` symbol; `long long` and
 `signed char` are `long` and `char`, not types of their own. The C++
 standard library is mlxlibcpp (`projects/libcpp`: `<string>`,
-`<iostream>`, `<vector>`, `<map>`, `<set>`, `<utility>`, `<algorithm>`,
-`<numeric>`, `<new>`, the `c*` headers, under `include/c++`), linked
+`<iostream>`, `<sstream>`, `<vector>`, `<map>`, `<set>`, `<memory>`,
+`<utility>`, `<algorithm>`, `<numeric>`, `<new>`, the `c*` headers,
+under `include/c++`), linked
 into every C++ program by itself as `libmlxcpp.a` from `$MLX_CC_LIB`,
 `lib/` next to the compiler or `/usr/local/lib/mlx-cc/lib`
 (`-nostdlib++` leaves it out), together with the math library.
