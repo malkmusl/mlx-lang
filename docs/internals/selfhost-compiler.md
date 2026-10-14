@@ -719,8 +719,12 @@ the locals live through calls. The compiler builds itself with 3,602
 locals held so (`locals kept in registers`); a nested loop of 300 million
 passes runs about 5% faster, the rest of its time still going to the
 frame slot every intermediate value takes
-(`tests/339_register_locals_runtime.mlx`). The aarch64 backend does not
-look at the mark yet and keeps such slots in the frame.
+(`tests/339_register_locals_runtime.mlx`). The aarch64 backend keeps them
+in x19, x20 and x21, which AAPCS64 callees keep as well: the frame grows
+by four words, the prologue stores the registers it uses at the bottom of
+the frame, every return loads them back before `mov sp, x29`
+(`encoder.emitSaveRegisters`, `emitEpilogue`), a load stores the register
+into the result's slot and a store loads the value straight into it.
 
 Between Mlx functions a value of several words comes back a word per
 register: `rax`, `rdx`, `rcx`, `r8`, `r9`, `r10`, `r11`, `rsi`, `rdi`
