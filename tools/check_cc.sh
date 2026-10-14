@@ -15,7 +15,8 @@
 #     (tests/standards.c prints __STDC_VERSION__, __STRICT_ANSI__,
 #     `linux` and `unix`);
 #   - the same programs run under mlxlibc as their dynamic loader and C
-#     library (`libmlxc.so.1 PROGRAM`, an empty environment): no GNU code
+#     library (`libmlxc.so.1 PROGRAM`, an empty environment but for the
+#     path to the libm built next to it): no GNU code
 #     between the C source and the running process; and one built with
 #     --dynamic-linker naming mlxlibc starts on it by itself.
 #
@@ -93,7 +94,7 @@ tools/build_mlxlibc.sh --compiler "$compiler" --out "$work/lib" > /dev/null
 lib="$work/lib/libmlxc.so.1"
 for name in "${programs[@]}"; do
     status=0
-    (cd "$work/run" && env -i timeout 20 "$lib" "$work/$name" arg > "$work/$name.mlxlibc" 2>&1) || status=$?
+    (cd "$work/run" && env -i LD_LIBRARY_PATH="$work/lib" timeout 20 "$lib" "$work/$name" arg > "$work/$name.mlxlibc" 2>&1) || status=$?
     echo "exit $status" >> "$work/$name.mlxlibc"
     cmp -s "$tests/$name.expected" "$work/$name.mlxlibc" || fail "$name on mlxlibc prints otherwise (expected < > got): $(diff "$tests/$name.expected" "$work/$name.mlxlibc" | head -12)"
 done
@@ -102,7 +103,7 @@ echo "ok   the ${#programs[@]} programs run alike on mlxlibc as loader and C lib
 # A program that names mlxlibc as its interpreter starts on it by itself.
 "$cc" --dynamic-linker "$lib" -o "$work/own" "$tests/libc.c" 2> "$work/own.cc" || fail "--dynamic-linker: $(head -3 "$work/own.cc")"
 status=0
-(cd "$work/run" && env -i timeout 20 "$work/own" arg > "$work/own.out" 2>&1) || status=$?
+(cd "$work/run" && env -i LD_LIBRARY_PATH="$work/lib" timeout 20 "$work/own" arg > "$work/own.out" 2>&1) || status=$?
 echo "exit $status" >> "$work/own.out"
 cmp -s "$tests/libc.expected" "$work/own.out" || fail "the program with mlxlibc as interpreter prints otherwise: $(diff "$tests/libc.expected" "$work/own.out" | head -8)"
 echo "ok   --dynamic-linker: a program naming libmlxc.so.1 as its interpreter runs on its own"
