@@ -507,6 +507,23 @@ keeps_values_out_of_the_frame() {
     return $ok
 }
 
+# Whether $1 reads locals stored once as the stored value where the store
+# dominates the load (ir/single_store.mlx), and the program still runs
+# right.
+promotes_single_stores() {
+    local probe output
+    probe=$(mktemp -d mlx-out/probe.XXXXXX)
+    local ok=1
+    output=$("$1" tests/342_single_store_runtime.mlx -o "$probe/probe" 2>&1) || true
+    if grep -q "loads of locals stored once: [1-9]" <<< "$output"; then
+        local status=0
+        "$probe/probe" > /dev/null 2>&1 || status=$?
+        [[ $status -eq 13 ]] && ok=0
+    fi
+    rm -rf -- "$probe"
+    return $ok
+}
+
 # Whether $1 rejects @ptrFromInt and @ptrCast outside unsafe (MLX-E7004,
 # tests/14_unsafe_ptr_builtin.mlx); older compilers took them anywhere.
 enforces_unsafe() {
@@ -645,6 +662,7 @@ probes=(
     "keeps_locals_in_registers|locals kept in callee-saved registers"
     "mixes_platform_integers|usize and u64 taking each other"
     "keeps_values_out_of_the_frame|constants and register loads kept out of the frame"
+    "promotes_single_stores|locals stored once read as their value"
     "names_aggregates_in_their_bodies|a struct named inside its own body"
     "holds_large_programs|an arena with room for the largest programs"
     "writes_depfiles|--depfile"
