@@ -105,6 +105,7 @@ implementation, split by responsibility:
 | — | `driver/` — CLI options, progress/trace reporting, frontend analysis, lowering, backend orchestration, cleanup (`main.mlx` is the thin entry point) |
 | — | `ir/inline.mlx`, `ir/optimize.mlx` — the inliner and mandatory LIR canonicalization/optimization passes |
 | — | `backend/x86_64/codegen/` — mutable backend state, label/memory/arithmetic/value/call/control-flow instruction emission, faced by `backend/x86_64/codegen.mlx` |
+| — | `object/` — the ELF writers (`elf64.mlx`, `elf64_dynamic.mlx`, `elf64_aarch64.mlx`, `symbol_table.mlx`), and for separate compilation the relocatable object model and `ET_REL` reader/writer (`relocatable.mlx`), `ar` archives (`archive.mlx`) and the linker (`link.mlx`) |
 
 (`compiler/selfhost/README.md`)
 
@@ -750,6 +751,46 @@ a static, non-PIE executable layout. This is the pipeline's stage 11
 (`ObjectWriter`) and stage 12 (`IntegratedLink`) collapsed into one
 self-contained function, consistent with the spec's `IntegratedLink` stage
 existing at all — there is no separate `ld` invocation.
+
+## Relocatable objects, archives and the linker (`object/relocatable.mlx`, `object/archive.mlx`, `object/link.mlx`)
+
+For separate compilation (mlx-cc's `-c`, roadmap phase 1 step 3) the
+compiler has an object model and a linker of its own, next to the
+executable writers. `relocatable.mlx` holds an object as its sections
+(code, initialized data, zero data and the init functions: `.text`,
+`.data`, `.bss`, `.init_array`), its symbols (a name with a binding,
+local, global or weak, and a kind, defined at an offset of a section or
+undefined) and its relocations (the x86_64 ABI's `R_X86_64_64`, `PC32`,
+`PLT32` and the `GOTPCREL` family), writes the standard ELF64 `ET_REL`
+file from them and reads one back, gcc's included (the allocated
+sections kept by kind, `.eh_frame` and the notes dropped, a common
+symbol given zero data of its own). `archive.mlx` reads and writes `ar`
+archives as GNU ar makes them, long names through the `//` member;
+`projects/cc/ar.mlx` is `mlx-ar` on top of it.
+
+`link.mlx` takes objects and archives (a member is included once a
+symbol it defines is needed, until nothing more is), resolves the global
+symbols (a strong definition over a weak one, two strong ones an
+error), and places everything into one encoder: `_start` first, then
+every object's code (16-byte aligned), the data sections as entries of
+the data area. A relative reference to a function or variable of the
+program is patched to its distance (to data through the encoder's
+`data_rel32` fixups, which `elf64_dynamic` resolves once the data area
+is placed); one to a name no object defines is an import: a call goes
+to a stub (`jmp [rip + GOT slot]`) and a `lea` of its address becomes a
+`mov` from the slot; a GOT-relative reference to a name of the program
+reads a word of the data area. The addresses held by data (`R_X86_64_64`)
+and those words are written at start by `__mlxcc_init`, which the linker
+generates and which then calls the objects' `.init_array` functions;
+`_start` calls it before `main(argc, argv, envp)` and exits with main's
+result. The program is then `elf64_dynamic`'s, with the libraries and
+the interpreter the caller names. The encoder gained `appendBytes`,
+`defineSymbolAt`, `addFixupAt`, `addDataFixupAt`, `byteAt` and `setByte`
+for this. `tools/check_link.sh` checks the round trip of an object and
+an archive and links two gcc `-fPIE` objects (one from an archive
+`mlx-ar` made) into a program that runs as gcc's link of them does;
+absolute 32-bit relocations (objects built without `-fPIE`) and copy
+relocations are reported, not linked.
 
 ## Diagnostics (`diagnostic.mlx`)
 

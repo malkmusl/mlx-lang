@@ -18,7 +18,7 @@ repository does.
 | Language and compiler | Mlx, `mlx4` (self-hosted, x86_64 and aarch64, ELF, APK) | gcc for our own code | done; a few compiler gaps are recorded as tasks |
 | Standard library | `std` (system calls, files, formats, crypto, Wayland, Vulkan, UI) | glibc for our own code | done for what the programs use |
 | C library | mlxlibc (`projects/libc`): 830 C names, libm and the dynamic loader | glibc, ld.so, libm | runs glibc-linked programs; `libm.so.6` in Mlx with the long double functions as x87 code; `strtold` to 64 bits; iconv missing |
-| C compiler | mlx-cc (`projects/cc`) | gcc, as, ld for C programs | whole programs of C89 to C23 (`-std=`, `_BitInt`, `#embed`, x87 `long double`) build and run, on glibc and on mlxlibc alone; zlib, Lua and SQLite pass their tests; separate compilation is next |
+| C compiler | mlx-cc (`projects/cc`) | gcc, as, ld for C programs | programs of C89 to C23 (`-std=`, `_BitInt`, `#embed`, x87 `long double`) build and run, on glibc and on mlxlibc alone; `-c` objects, `mlx-ar` archives and the compiler's own linker (gcc's objects link too); zlib, Lua and SQLite pass their tests; shared objects are next |
 | Init | mlx-init (`projects/init`) | systemd as PID 1, sysvinit | supervises, mounts, shuts down; no users per service, no device events |
 | Shell | mlx-sh (`projects/shell`) | bash, dash | POSIX scripts, line editor |
 | Core utilities | `projects/coreutils` (about 70 programs) | GNU coreutils | the common ones; the rest of coreutils is open |
@@ -64,11 +64,15 @@ mlxlibc with its own libm. The gaps left are listed in
    designated initializers, `static` locals, `_Alignof`, `_Static_assert`,
    `inline`, wide characters. Check: a C test suite of our own, then
    suites of well-known small compilers' tests that we may use.
-3. **Separate compilation.** Relocatable ELF objects (`-c`), an archiver
-   (`mlx-ar`) and a linker (`mlx-ld`): static linking of `.o` and `.a`,
-   shared objects (`-shared`, `-fPIC`), `--dynamic-linker` set to mlxlibc
-   so a program starts on it without glibc's loader. Check: programs built
-   from several objects and libraries, run under mlxlibc alone.
+3. **Separate compilation.** (done but for shared objects) Relocatable
+   ELF objects (`-c`), an archiver (`mlx-ar`) and the linker, the
+   compiler's own (`compiler/selfhost/object/link.mlx`, which links
+   gcc's `-fPIE` objects as well): static linking of `.o` and `.a`,
+   `--dynamic-linker` set to mlxlibc so a program starts on it without
+   glibc's loader. Open: shared objects (`-shared`, `-fPIC`). Check:
+   `tools/check_cc.sh` (the test programs from objects and archives,
+   under mlxlibc alone), `tools/check_cc_projects.sh` (Lua from
+   objects), `tools/check_link.sh`.
 4. **Real projects.** What C programs actually use: the GNU extensions
    that are everywhere (`__attribute__`, `__builtin_*`, statement
    expressions, `typeof`), and `asm` for the few that need it. Targets in

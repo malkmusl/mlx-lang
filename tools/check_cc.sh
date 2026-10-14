@@ -18,7 +18,11 @@
 #     library (`libmlxc.so.1 PROGRAM`, an empty environment but for the
 #     path to the libm built next to it): no GNU code
 #     between the C source and the running process; and one built with
-#     --dynamic-linker naming mlxlibc starts on it by itself.
+#     --dynamic-linker naming mlxlibc starts on it by itself;
+#   - separate compilation: every program again from objects (-c, one
+#     per .c file; the second file through an archive mlx-ar made, found
+#     by -L and -l) linked by mlx-cc, printing the same on glibc and on
+#     mlxlibc.
 #
 #   tools/check_cc.sh [compiler]
 set -euo pipefail
@@ -33,7 +37,8 @@ fail() { echo "FAIL $1" >&2; exit 1; }
 "$compiler" --quiet projects/cc/main.mlx -o "$work/mlx-cc" || fail "mlx-cc does not build"
 cp -r projects/cc/include "$work/include"
 cc="$work/mlx-cc"
-echo "ok   mlx-cc builds ($(stat -c %s "$cc") bytes)"
+"$compiler" --quiet projects/cc/ar.mlx -o "$work/mlx-ar" || fail "mlx-ar does not build"
+echo "ok   mlx-cc builds ($(stat -c %s "$cc") bytes), and mlx-ar"
 
 tests=projects/cc/tests
 (cd "$tests" && "$cc" -E preprocess.c) > "$work/preprocess.out" 2> "$work/preprocess.err" || fail "-E: $(head -3 "$work/preprocess.err")"
@@ -107,4 +112,29 @@ status=0
 echo "exit $status" >> "$work/own.out"
 cmp -s "$tests/libc.expected" "$work/own.out" || fail "the program with mlxlibc as interpreter prints otherwise: $(diff "$tests/libc.expected" "$work/own.out" | head -8)"
 echo "ok   --dynamic-linker: a program naming libmlxc.so.1 as its interpreter runs on its own"
+
+# Separate compilation: the programs from objects and archives.
+mkdir -p "$work/sep"
+for name in "${programs[@]}"; do
+    flags=()
+    [[ -f "$tests/$name.flags" ]] && read -r -a flags < "$tests/$name.flags"
+    (cd "$work/sep" && "$cc" "${flags[@]}" -I "$repo_root/$tests" -c "$repo_root/$tests/$name.c") 2> "$work/sep/$name.cc" || fail "-c $name: $(head -5 "$work/sep/$name.cc")"
+    inputs=("$work/sep/$name.o")
+    if [[ -f "$tests/${name}2.c" ]]; then
+        (cd "$work/sep" && "$cc" "${flags[@]}" -I "$repo_root/$tests" -c "$repo_root/$tests/${name}2.c") 2>> "$work/sep/$name.cc" || fail "-c ${name}2: $(head -5 "$work/sep/$name.cc")"
+        "$work/mlx-ar" rcs "$work/sep/lib$name.a" "$work/sep/${name}2.o" || fail "mlx-ar: $name"
+        inputs+=("-L$work/sep" "-l$name")
+    fi
+    "$cc" "${flags[@]}" -o "$work/sep/$name" "${inputs[@]}" 2>> "$work/sep/$name.cc" || fail "linking $name: $(head -5 "$work/sep/$name.cc")"
+    [[ ! -s "$work/sep/$name.cc" ]] || fail "$name from objects: the compiler said: $(head -5 "$work/sep/$name.cc")"
+    status=0
+    (cd "$work/run" && timeout 20 "$work/sep/$name" arg > "$work/sep/$name.out" 2>&1) || status=$?
+    echo "exit $status" >> "$work/sep/$name.out"
+    cmp -s "$tests/$name.expected" "$work/sep/$name.out" || fail "$name from objects prints otherwise (expected < > got): $(diff "$tests/$name.expected" "$work/sep/$name.out" | head -12)"
+    status=0
+    (cd "$work/run" && env -i LD_LIBRARY_PATH="$work/lib" timeout 20 "$lib" "$work/sep/$name" arg > "$work/sep/$name.mlxlibc" 2>&1) || status=$?
+    echo "exit $status" >> "$work/sep/$name.mlxlibc"
+    cmp -s "$tests/$name.expected" "$work/sep/$name.mlxlibc" || fail "$name from objects on mlxlibc prints otherwise: $(diff "$tests/$name.expected" "$work/sep/$name.mlxlibc" | head -12)"
+done
+echo "ok   -c, mlx-ar, -L and -l: the ${#programs[@]} programs built from objects and archives run alike, on glibc and on mlxlibc"
 echo "check_cc.sh: all checks passed"

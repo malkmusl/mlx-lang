@@ -2,32 +2,43 @@
 
 A C compiler written in Mlx, for MLX/Linux without GNU (see
 [docs/ROADMAP.md](../../docs/ROADMAP.md), phase 1). It reads C from C89
-to C23 (`-std=`, GNU variants included), preprocesses it, and writes an
-x86_64 ELF program itself through the Mlx compiler's own encoder and
-object writer
-(`compiler/selfhost/backend/x86_64/encoder.mlx`,
-`compiler/selfhost/object/elf64_dynamic.mlx`): there is no assembler and
-no linker in between. The programs call the C library through
-`libc.so.6`, which is mlxlibc (`projects/libc`) on MLX/Linux and glibc
-elsewhere.
+to C23 (`-std=`, GNU variants included), preprocesses it, and writes
+x86_64 ELF itself through the Mlx compiler's own encoder, object writer
+and linker (`compiler/selfhost/backend/x86_64/encoder.mlx`,
+`compiler/selfhost/object/relocatable.mlx`, `link.mlx`,
+`elf64_dynamic.mlx`): there is no assembler and no GNU linker in
+between. The programs call the C library through `libc.so.6`, which is
+mlxlibc (`projects/libc`) on MLX/Linux and glibc elsewhere.
 
     mlx-out/bin/compiler/mlx4 projects/cc/main.mlx -o mlx-cc
     MLX_CC_INCLUDE=projects/cc/include ./mlx-cc -o hello hello.c
     ./hello                                   # on the system's loader
     mlx-out/libc/libmlxc.so.1 ./hello         # on mlxlibc alone
     ./mlx-cc --dynamic-linker /usr/lib/libmlxc.so.1 -o hello hello.c
+    ./mlx-cc -c lib1.c lib2.c                 # lib1.o, lib2.o
+    ./mlx-ar rcs libmine.a lib1.o lib2.o
+    ./mlx-cc -o hello hello.c -L. -lmine      # or hello.o libmine.a
 
-    mlx-cc [-o OUT] [-std=VARIANT] [-E] [-I DIR] [-D NAME[=VALUE]] [-U NAME]
-           [-lNAME] [--dynamic-linker PATH] FILE.c...
+    mlx-cc [-o OUT] [-std=VARIANT] [-E] [-c] [-I DIR] [-D NAME[=VALUE]] [-U NAME]
+           [-L DIR] [-lNAME] [--dynamic-linker PATH] FILE.c... [FILE.o...] [LIB.a...]
+    mlx-ar rcs LIB.a FILE.o...  |  mlx-ar t LIB.a  |  mlx-ar x LIB.a
 
-mlx-cc compiles whole programs: every `.c` file of the program is given
-at once, each one a translation unit of its own (its own macros and
-scope), and the result is the executable (`-c` is refused). `-E` writes
+The `.c` files given together are compiled as one, each a translation
+unit of its own (its own macros and scope), their names linked by name,
+into one relocatable object. With `-c` the object is written (`FILE.o`
+in the working directory, or `-o`'s name for a single file); otherwise
+it is linked with the `.o` and `.a` files given (an archive's members
+as the program needs them) into the executable. The objects are
+ordinary ELF relocatable files and the archives `ar`'s: `mlx-ar`
+(`ar.mlx`) makes and lists them, GNU `ar` reads them, and objects an
+ordinary C compiler made with `-fPIE` link too, in either direction
+(`tools/check_link.sh`). `-lNAME` takes `libNAME.a` from a `-L`
+directory when there is one, else the shared `libNAME.so`; `-lm` is
+`libm.so.6` (glibc's, or the one built next to mlxlibc) and
+`-lpthread`, `-ldl` and `-lrt` are part of the C library. `-E` writes
 the preprocessed tokens instead. Options of other compilers that change
 nothing here (`-O2`, `-g`, `-Wall`, `-fPIC`, `-pthread` ...) are
-accepted silently. `-lm` adds `libm.so.6` (glibc's, or the one built
-next to mlxlibc), `-lNAME` `libNAME.so`; `-lpthread`, `-ldl` and `-lrt`
-are part of the C library.
+accepted silently.
 
 ## The C variants
 
@@ -115,7 +126,7 @@ in `/usr/local/lib/mlx-cc/include`.
 | Types and syntax tree | `types.mlx`, `ast.mlx` |
 | Parser | `cursor.mlx`, `state.mlx`, `scope.mlx`, `decl.mlx`, `initializer.mlx`, `expr.mlx`, `stmt.mlx`, `typing.mlx`, `eval.mlx` |
 | Code | `x86.mlx` (instructions), `gen.mlx` (expressions, calls), `genstmt.mlx` (statements, functions) |
-| Program | `program.mlx` (linking by name, data area, `_start`, ELF) |
+| Object and program | `program.mlx` (linking by name, data area, the relocatable object; the program through `compiler/selfhost/object/link.mlx`), `ar.mlx` (mlx-ar) |
 | The C variant | `standard.mlx` (`-std=`: the macros, the keywords) |
 | Driver | `main.mlx` |
 
@@ -123,12 +134,18 @@ The code generator is a stack machine on rax (xmm0 for floating values),
 with every integer kept canonical for its type in the whole register.
 Calls follow the System V AMD64 ABI, structs passed and returned by value
 included, and variadic functions set up the ABI's register save area so a
-`va_list` can go on to `vprintf`. Globals live in the writable data area
-of the image; the addresses they hold are written at start-up by
-`__mlxcc_init`, which `_start` calls before `main(argc, argv, envp)`.
-A name with external linkage that no file defines is taken from the
-libraries (functions and variables such as `stdout` alike, through the
-GOT); static functions nothing refers to are left out.
+`va_list` can go on to `vprintf`. Globals live in the object's `.data`;
+a name of another object is a relocation of the standard kinds
+(`R_X86_64_PLT32` for a call, `PC32` for an address, `64` for one held
+by data), and a unit's long double and wide integer initializers that
+are not constants are computed by a function of its own listed in
+`.init_array`. The linker (`compiler/selfhost/object/link.mlx`) resolves
+the references between the objects, makes a stub and a GOT slot for
+every name no object defines (the libraries' functions and variables
+such as `stdout` alike), and makes `_start` and `__mlxcc_init`, which
+writes the addresses held by data and runs the init functions before
+`main(argc, argv, envp)`. Static functions nothing refers to are left
+out.
 
 ## What is there
 
@@ -146,8 +163,9 @@ static locals, tentative definitions, several files per program.
 
 ## Gaps
 
-- No separate compilation yet: no `.o`, no archives, no shared objects
-  (roadmap phase 1 step 3).
+- No shared objects yet (`-shared`, roadmap phase 1 step 3); objects
+  built without `-fPIE` by other compilers (absolute 32-bit addresses,
+  copy relocations) are refused with a message.
 - On mlxlibc, `printf("%Lf")` prints a long double exactly within
   double's exponent range and as the nearest double (infinity, zero)
   beyond it; `strtold` reads the full 64-bit significand and the `sinl`

@@ -93,6 +93,25 @@ for name in strings math sort nextvar pm utf8 tpack vararg closure calls constru
 done
 echo "ok   Lua 5.4.7: the interpreter, and ${#passed[@]} files of the official test suite pass"
 
+# Lua again from objects: each file with -c, the library an archive of
+# mlx-ar's, the interpreter linked against it with -L and -l.
+"$compiler" --quiet projects/cc/ar.mlx -o "$work/mlx-ar" || fail "mlx-ar does not build"
+mkdir -p "$work/lua-objects"
+lobjects=()
+for source in "${lfiles[@]}"; do
+    name=$(basename "$source" .c)
+    (cd "$work/lua-objects" && "$cc" -c -DLUA_USE_POSIX "$source") 2>> "$work/lua-objects.cc" || fail "Lua -c $name: $(head -5 "$work/lua-objects.cc")"
+    [[ $name == lua ]] || lobjects+=("$work/lua-objects/$name.o")
+done
+"$work/mlx-ar" rcs "$work/lua-objects/liblua.a" "${lobjects[@]}" || fail "mlx-ar: liblua.a"
+"$cc" -o "$work/lua-linked" "$work/lua-objects/lua.o" -L"$work/lua-objects" -llua -lm 2>> "$work/lua-objects.cc" || fail "Lua does not link from objects: $(head -5 "$work/lua-objects.cc")"
+answer=$("$work/lua-linked" -e 'print(("%d %.3f %s"):format(6 * 7, math.pi, ("ok"):upper()))')
+[[ "$answer" == "42 3.142 OK" ]] || fail "Lua from objects answered: $answer"
+for name in strings math closure; do
+    (cd "$suite" && timeout 300 "$work/lua-linked" -e "_U=true" "$name.lua" > "$work/lua-linked-$name.log" 2>&1) || fail "Lua from objects, test $name.lua: $(tail -5 "$work/lua-linked-$name.log")"
+done
+echo "ok   Lua from ${#lobjects[@]} objects and an archive of mlx-ar's (-c, -L, -l): the interpreter and 3 test files pass"
+
 # SQLite: the amalgamation and the shell, single-threaded and thread-safe.
 sqlite=$(ls -d "$work"/src-sqlite/*/)
 script=$repo_root/projects/cc/tests/sqlite.sql
