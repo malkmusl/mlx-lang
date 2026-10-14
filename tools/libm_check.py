@@ -119,10 +119,44 @@ for name, tolerance in [("sin", 2), ("cos", 2), ("tan", 4), ("exp", 2), ("log", 
                         ("cosh", 4), ("tanh", 4), ("asinh", 4), ("acosh", 4), ("atanh", 4),
                         ("exp2", 4), ("expm1", 4), ("log1p", 4), ("cbrt", 4)]:
     for x in INPUTS:
-        # The reduction of huge arguments to sin, cos and tan is not there (libm.mlx).
-        if name in ("sin", "cos", "tan") and abs(x) > 1e6 and not math.isinf(x):
-            continue
         compare(name, [D], [x], tolerance)
+# Huge arguments to sin, cos and tan: the reduction with the bits of 2/pi.
+for name, tolerance in [("sin", 2), ("cos", 2), ("tan", 4)]:
+    for x in [1e10, 1e15, 1e22, 1e300, 2.0 ** 52, 2.0 ** 53, 2.0 ** 60 + 0.5, 1647099.0, 1647100.5, 1e7, 3e6,
+              -1e10, 1.7976931348623157e308, 1e100, 123456789012345.0, 9e18]:
+        compare(name, [D], [x], tolerance)
+# erf and erfc (a series in double-double, a continued fraction), gamma
+# (Lanczos: within 1e-13 relative, and near lgamma's zeros absolute).
+for name, tolerance in [("erf", 8), ("erfc", 8)]:
+    for x in [0.0, -0.0, 0.1, 0.5, 1.0, 1.5, 2.0, 2.4, 2.5, 2.6, 3.0, 4.0, 5.0, 6.0, 7.0, 10.0, 20.0, 26.0, 27.0, 28.0,
+              -0.3, -2.0, -4.0, -7.0, 1e-5, 1e-10, 1e-300, float("inf"), float("-inf"), float("nan")]:
+        compare(name, [D], [x], tolerance)
+
+
+def compare_loose(name, x, relative, absolute):
+    global failures, checked
+    a = call(ours, name, D, [D], [x])
+    b = call(theirs, name, D, [D], [x])
+    checked += 1
+    if math.isnan(a) and math.isnan(b):
+        return
+    if math.isinf(a) or math.isinf(b) or math.isnan(a) or math.isnan(b):
+        ok = a == b
+    else:
+        ok = abs(a - b) <= relative * abs(b) or abs(a - b) <= absolute
+    if not ok:
+        failures += 1
+        if failures <= 40:
+            print(f"FAIL {name}({x!r}): ours {a!r}, system {b!r}")
+
+
+for x in [0.5, 1.0, 2.0, 3.0, 4.0, 5.0, 10.0, 20.0, 22.0, 23.0, 25.0, 26.0, 30.0, 100.0, 170.0, 171.5, 172.0, 0.1,
+          1.5, 2.5, 7.75, -0.5, -1.5, -2.5, -7.75, 1e-5, -1e-5, 1e-300, 0.0, -0.0, -1.0, -2.0, float("inf"),
+          float("-inf"), float("nan")]:
+    compare_loose("tgamma", x, 1e-13, 0.0)
+for x in [0.5, 1.0, 2.0, 3.0, 10.0, 20.0, 25.0, 26.0, 100.0, 1000.0, 1e6, 1e10, 1e300, 0.1, 1.5, 2.1, 0.9, 7.75,
+          -0.5, -1.5, -2.5, -7.75, 1e-5, -1e-5, 3e-300, 0.0, -1.0, float("inf"), float("-inf"), float("nan")]:
+    compare_loose("lgamma", x, 1e-13, 1e-13)
 for x in INPUTS:
     for y in [0.0, 1.0, 2.0, 3.0, -1.0, -2.0, 0.5, 10.0, -0.5, 1.5, 0.3, 100.0, float("inf"), float("-inf"), float("nan")]:
         # Whole exponents within an ulp; fractional ones are e^(y ln x) (libm.mlx).
