@@ -161,6 +161,53 @@ statement and operator, GNU case ranges and statement expressions,
 `_Static_assert`, `_Alignas`, `_Alignof`, `__func__`, variadic functions,
 static locals, tentative definitions, several files per program.
 
+## C++
+
+A `.cpp` (`.cc`, `.cxx`, `.C`, `-x c++`) file is read as C++ (`-std=c++11`
+to `c++23` and `gnu++11` to `gnu++23`, gnu++17 by default, `__cplusplus`
+set accordingly), with the C features of C23 under it and the system C
+headers wrapped in `extern "C"` automatically. What is there
+(`cpp.mlx`, `mangle.mlx`, and the C++ paths of `decl.mlx`, `expr.mlx`,
+`stmt.mlx`): namespaces (nested, aliases, `using`, qualified names),
+references, function overloading chosen by conversion rank, default
+arguments, `bool`, `enum class`, `wchar_t` and the character types,
+`extern "C"`, inline functions as weak symbols, `static_cast` and the
+other casts, and classes: member functions with `this` (defined in the
+class, read after it, or outside it as `T::f`), `const` members as
+overloads of their own, constructors (initializer lists, member default
+initializers, default arguments, converting constructors used
+implicitly, the implicit default and copy constructors member by
+member), destructors called when a scope ends (also on `return`,
+`break` and `continue`), for temporaries at the end of their
+expression, for parameters passed by value, by `delete` and
+`delete[]`, static data members and static member functions, nested
+classes, enums and typedefs of a class, friends (declared in the class,
+defined there too), operator functions as members or free functions
+(argument-dependent lookup for the latter: `operator<<` of a stream's
+namespace), `new`, `new[]`, placement new, `T(args)` temporaries,
+single inheritance with the base as the first member (pointers and
+references to a derived class convert to its base), virtual functions
+(pure ones too, `override`), virtual destructors, through a vtable
+(`_ZTV...`, weak) whose pointer is the object's first word. A returned
+local is moved out, not copied; a class returned by value comes back
+through the caller's buffer; a global object is constructed when the
+program starts (`__mlxcc_init_unit`). Names are mangled as the Itanium
+ABI says (`_ZN8geometry4areaEii`, `_ZN1SC1Ei`, `_ZNK6Matrix2atEii`),
+so objects of several files link by name. `tests/cpp/*.cpp` run as g++
+runs them (`tools/check_cpp.sh`).
+
+Not there yet: templates, exceptions (`try`, `throw` are refused),
+multiple inheritance, a polymorphic class over a base without a vtable,
+conversion operators (`operator bool`), lambdas, range `for`, `auto`
+deduction, `constexpr` functions, destruction of globals at exit, local
+classes with member functions, user-defined `operator new` (the
+built-in `new` calls `_Znwm`, which mlxlibcpp provides). The mangled
+names leave out `const` (`PKc` is `Pc`) and the ABI's substitutions
+(`S_`), so a name with a const or a repeated parameter type differs
+from g++'s; constructors have only their `C1` symbol. There is no C++
+standard library yet (`projects/libcpp` is next: `<new>` is the first
+header, under `include/c++`).
+
 ## Gaps
 
 - No shared objects yet (`-shared`, roadmap phase 1 step 3); objects

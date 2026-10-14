@@ -1,0 +1,1980 @@
+// C++ classes: member functions with their hidden `this`, constructors
+// and destructors (called where an object is made and where its scope
+// ends), member initializers, static members, operator functions,
+// temporaries destroyed at the end of their expression, new and delete,
+// single inheritance (the base class is the first member) and virtual
+// functions called through a vtable whose pointer is the object's first
+// word. The parser (decl.mlx, expr.mlx, stmt.mlx) calls in here at the
+// points where C++ differs from C.
+//
+// What a class knows (Class, hung on its Type): its qualified name,
+// which is the prefix its members are bound under in the scope (`S::f`),
+// its base, its constructors and destructor, its member functions and
+// the slots of the virtual ones. Member function bodies written in the
+// class are read after the class is complete (their tokens are skipped
+// and come back to).
+//
+// Objects of a class with a destructor are kept on a cleanup stack while
+// their scope is read: leaving the scope, returning, breaking and
+// continuing destroy them. A temporary (a constructor call in an
+// expression, a call returning such a class) is destroyed at the end of
+// the full expression, unless it is moved into a new object (an
+// initializer, a returned value, an argument passed by value): then the
+// new object owns it. An argument passed by value is destroyed by the
+// function that received it.
+//
+// Not here: multiple inheritance, a polymorphic class over a base
+// without a vtable (the base must be first), conversion operators,
+// exceptions, templates, destruction of globals at exit.
+const base = @import("./base.mlx")
+const names = @import("./names.mlx")
+const tokens = @import("./tokens.mlx")
+const types = @import("./types.mlx")
+const ast = @import("./ast.mlx")
+const scope = @import("./scope.mlx")
+const cursor = @import("./cursor.mlx")
+const state = @import("./state.mlx")
+const typing = @import("./typing.mlx")
+const expr = @import("./expr.mlx")
+const decl = @import("./decl.mlx")
+const initializer = @import("./initializer.mlx")
+const mangle = @import("./mangle.mlx")
+const program = @import("./program.mlx")
+const standard = @import("./standard.mlx")
+
+pub const Class = struct {
+    ty: usize
+    // The qualified name (the members' prefix) and the plain one.
+    prefix: u32
+    name: u32
+    baseClass: usize
+    // The first constructor (the others follow by nextOverload) and the
+    // destructor; `= default` for the default and the copy constructor.
+    constructors: usize
+    destructor: usize
+    defaultedDefault: bool
+    defaultedCopy: bool
+    // The member functions in order (cells of object and next).
+    methods: usize
+    methodsTail: usize
+    // The virtual functions by slot (cells), their number, the vtable.
+    virtuals: usize
+    virtualCount: i64
+    hasVirtual: bool
+    vtable: usize
+    complete: bool
+}
+
+fn at(c: usize) -> *Class {
+    unsafe { return @ptrFromInt(*Class, c) }
+}
+
+// The class of a type, 0 for a type that is no class.
+pub fn info(ty: usize) -> usize {
+    if ty == 0 { return 0 }
+    const k = types.kind(ty)
+    if k != types.STRUCT && k != types.UNION { return 0 }
+    return types.at(ty).*.info
+}
+
+pub fn isClassType(ty: usize) -> bool { return info(ty) != 0 }
+
+// Class types by their prefix.
+var classByPrefix: usize = 0
+// The member function bodies to read after their class: cells of four
+// words (function, first token, class type, next).
+var deferred: usize = 0
+var deferredTail: usize = 0
+var classDepth: u32 = 0
+var anonymousCount: u32 = 0
+var overrideName: u32 = 0
+var finalName: u32 = 0
+// The allocation functions, declared on first use.
+var newFunction: usize = 0
+var newArrayFunction: usize = 0
+var deleteFunction: usize = 0
+var deleteArrayFunction: usize = 0
+
+pub fn init() -> void {
+    classByPrefix = base.alloc(base.MAX_NAMES * 8)
+    overrideName = base.intern("override")
+    finalName = base.intern("final")
+}
+
+// The next translation unit.
+pub fn reset() -> void {
+    deferred = 0
+    deferredTail = 0
+    classDepth = 0
+    newFunction = 0
+    newArrayFunction = 0
+    deleteFunction = 0
+    deleteArrayFunction = 0
+}
+
+// The class whose members have the qualified `prefix`, 0 for none.
+pub fn classWithPrefix(prefix: u32) -> usize {
+    return base.getWord(classByPrefix + @intCast(usize, prefix) * 8)
+}
+
+fn cell(first: usize, next: usize) -> usize {
+    const c = base.alloc(16)
+    base.putWord(c, first)
+    base.putWord(c + 8, next)
+    return c
+}
+
+// ---------------------------------------------------------------------------
+// Expression helpers
+
+fn typed(n: usize) -> usize {
+    typing.addType(n)
+    return n
+}
+
+fn addressOf(e: usize, token: usize) -> usize {
+    return typed(ast.unary(ast.ADDR, e, token))
+}
+
+fn deref(e: usize, token: usize) -> usize {
+    return typed(ast.unary(ast.DEREF, e, token))
+}
+
+fn number(value: i64, ty: usize, token: usize) -> usize {
+    const n = ast.number(value, token)
+    ast.node(n).*.ty = ty
+    return n
+}
+
+fn nothing(token: usize) -> usize {
+    return ast.make(ast.NULL_EXPR, token)
+}
+
+fn isNothing(n: usize) -> bool {
+    return n == 0 || ast.kindOf(n) == ast.NULL_EXPR
+}
+
+// `a, b` with the void type (either may be nothing).
+fn sequence(a: usize, b: usize, token: usize) -> usize {
+    if isNothing(a) { return b }
+    if isNothing(b) { return a }
+    typing.addType(a)
+    typing.addType(b)
+    const n = ast.binary(ast.COMMA, a, b, token)
+    ast.node(n).*.ty = types.voidOf()
+    return n
+}
+
+fn statementOf(e: usize, token: usize) -> usize {
+    if isNothing(e) { return 0 }
+    typing.addType(e)
+    return ast.unary(ast.EXPR_STMT, e, token)
+}
+
+// A block of statements, built in order.
+fn appendStatement(block: usize, s: usize) -> void {
+    if s == 0 { return }
+    const b = ast.node(block)
+    if b.*.body == 0 {
+        b.*.body = s
+    } else {
+        var last = b.*.body
+        while ast.node(last).*.next != 0 { last = ast.node(last).*.next }
+        ast.node(last).*.next = s
+    }
+}
+
+fn newTemp(ty: usize, token: usize) -> usize {
+    return typing.temporaryOf(ty, token)
+}
+
+fn variable(o: usize, token: usize) -> usize {
+    return typed(ast.variableNode(o, token))
+}
+
+// A member function as a callee: `address` the object's address (0: the
+// current `this`).
+fn methodNode(o: usize, address: usize, token: usize) -> usize {
+    const n = ast.variableNode(o, token)
+    ast.node(n).*.lhs = address
+    ast.obj(o).*.isReferenced = true
+    return n
+}
+
+// The address of the member `m` of the object at `address`.
+fn memberAddress(address: usize, m: usize, token: usize) -> usize {
+    const n = ast.unary(ast.MEMBER, deref(address, token), token)
+    ast.node(n).*.member = m
+    return addressOf(n, token)
+}
+
+// The address of element `index` of the array at `address`.
+fn elementAddress(address: usize, element: usize, index: usize, token: usize) -> usize {
+    return typed(expr.newAdd(typing.cast(address, types.pointerTo(element)), index, token))
+}
+
+// `for (i = 0; i < limit; i++)` with its body to be set: the loop and
+// the index variable.
+fn countedLoop(limit: usize, token: usize) -> (usize, usize) {
+    const i = newTemp(types.longOf(), token)
+    const n = ast.make(ast.FOR, token)
+    ast.node(n).*.init = ast.unary(ast.EXPR_STMT, typed(ast.binary(ast.ASSIGN, variable(i, token), number(0, types.longOf(), token), token)), token)
+    ast.node(n).*.cond = typed(ast.binary(ast.LT, variable(i, token), limit, token))
+    ast.node(n).*.inc = typed(ast.binary(ast.ASSIGN, variable(i, token), typed(ast.binary(ast.ADD, variable(i, token), number(1, types.longOf(), token), token)), token))
+    ast.node(n).*.breakLabel = state.newLabel()
+    ast.node(n).*.continueLabel = state.newLabel()
+    return -> (n, i)
+}
+
+// `for (i = limit; i > 0; i--)` with its body to be set, which reads
+// element i - 1: the loop and the index variable (objects are destroyed
+// in the reverse order of their making).
+fn countedLoopDown(limit: usize, token: usize) -> (usize, usize) {
+    const i = newTemp(types.longOf(), token)
+    const n = ast.make(ast.FOR, token)
+    ast.node(n).*.init = ast.unary(ast.EXPR_STMT, typed(ast.binary(ast.ASSIGN, variable(i, token), limit, token)), token)
+    ast.node(n).*.cond = typed(ast.binary(ast.LT, number(0, types.longOf(), token), variable(i, token), token))
+    ast.node(n).*.inc = typed(ast.binary(ast.ASSIGN, variable(i, token), typed(ast.binary(ast.SUB, variable(i, token), number(1, types.longOf(), token), token)), token))
+    ast.node(n).*.breakLabel = state.newLabel()
+    ast.node(n).*.continueLabel = state.newLabel()
+    return -> (n, i)
+}
+
+fn lastIndex(i: usize, token: usize) -> usize {
+    return typed(ast.binary(ast.SUB, variable(i, token), number(1, types.longOf(), token), token))
+}
+
+// A statement as an expression of type void.
+fn statementExpression(s: usize, token: usize) -> usize {
+    const n = ast.make(ast.STMT_EXPR, token)
+    ast.node(n).*.body = s
+    ast.node(n).*.ty = types.voidOf()
+    return n
+}
+
+// An array of `count` arguments.
+fn argumentList(first: usize, second: usize) -> usize {
+    const a = base.alloc(16)
+    base.putWord(a, first)
+    base.putWord(a + 8, second)
+    return a
+}
+
+fn argumentsWith(first: usize, args: usize, count: usize) -> usize {
+    const a = base.alloc((count + 1) * 8)
+    base.putWord(a, first)
+    var index: usize = 0
+    while index < count {
+        base.putWord(a + (index + 1) * 8, base.getWord(args + index * 8))
+        index += 1
+    }
+    return a
+}
+
+// ---------------------------------------------------------------------------
+// What a class needs
+
+// Whether the class `derived` has `b` as its base, directly or further up.
+pub fn isBaseOf(b: usize, derived: usize) -> bool {
+    const target = info(b)
+    if target == 0 { return false }
+    var c = info(derived)
+    while c != 0 {
+        if c == target { return true }
+        c = info(at(c).*.baseClass)
+    }
+    return false
+}
+
+// Whether making an object of the type takes code (a constructor, a
+// member with one or a default initializer, a vtable pointer).
+pub fn needsConstruction(ty: usize) -> bool {
+    if types.kind(ty) == types.ARRAY { return needsConstruction(types.baseOf(ty)) }
+    const c = info(ty)
+    if c == 0 { return false }
+    if at(c).*.constructors != 0 || at(c).*.hasVirtual { return true }
+    var m = types.at(ty).*.members
+    while m != 0 {
+        if types.member(m).*.init != 0 || needsConstruction(types.member(m).*.ty) { return true }
+        m = types.member(m).*.next
+    }
+    return false
+}
+
+pub fn hasDestructor(ty: usize) -> bool {
+    if types.kind(ty) == types.ARRAY { return hasDestructor(types.baseOf(ty)) }
+    const c = info(ty)
+    if c == 0 { return false }
+    if at(c).*.destructor != 0 { return true }
+    var m = types.at(ty).*.members
+    while m != 0 {
+        if hasDestructor(types.member(m).*.ty) { return true }
+        m = types.member(m).*.next
+    }
+    return false
+}
+
+// Whether copying an object of the type is more than copying its bytes
+// (it or a member has constructors).
+pub fn needsSpecialCopy(ty: usize) -> bool {
+    if types.kind(ty) == types.ARRAY { return needsSpecialCopy(types.baseOf(ty)) }
+    const c = info(ty)
+    if c == 0 { return false }
+    if at(c).*.constructors != 0 { return true }
+    var m = types.at(ty).*.members
+    while m != 0 {
+        if needsSpecialCopy(types.member(m).*.ty) { return true }
+        m = types.member(m).*.next
+    }
+    return false
+}
+
+// Whether a local or global of the type is made and unmade here rather
+// than by C's initializers.
+pub fn isObjectType(ty: usize) -> bool {
+    return isClassType(if types.kind(ty) == types.ARRAY { types.baseOf(ty) } else { ty }) && (needsConstruction(ty) || hasDestructor(ty) || needsSpecialCopy(ty))
+}
+
+fn sameClass(first: usize, second: usize) -> bool {
+    return info(first) != 0 && info(first) == info(second)
+}
+
+// Whether a value of type `from` converts to the class `ty` through a
+// constructor taking one argument (the copy constructor aside).
+pub fn convertible(from: usize, ty: usize) -> bool {
+    const c = info(ty)
+    if c == 0 { return false }
+    var ctor = at(c).*.constructors
+    while ctor != 0 {
+        const thisParam = types.at(ast.obj(ctor).*.ty).*.params
+        if thisParam != 0 {
+            const p = types.param(thisParam).*.next
+            if p != 0 && (types.param(p).*.next == 0 || types.param(types.param(p).*.next).*.defaultValue != 0) {
+                const target = types.referenced(types.param(p).*.ty)
+                if !sameClass(target, ty) && expr.conversionRank(from, types.param(p).*.ty) > 0 { return true }
+            }
+        }
+        ctor = ast.obj(ctor).*.nextOverload
+    }
+    return false
+}
+
+// `value` as a value of the class `ty`: converted through a constructor
+// when it is of another type.
+pub fn convertValue(value: usize, ty: usize) -> usize {
+    typing.addType(value)
+    const target = types.referenced(ty)
+    if !isClassType(target) { return value }
+    const from = ast.typeOf(value)
+    if sameClass(from, target) || isBaseOf(target, from) { return value }
+    const args = argumentList(value, 0)
+    return temporaryObject(target, args, 1, ast.tokenOf(value))
+}
+
+// ---------------------------------------------------------------------------
+// Making and unmaking objects
+
+// The member named `name` of the class or its bases that is a function
+// or a static member: its object, 0 for none.
+pub fn memberOf(classTy: usize, name: u32) -> usize {
+    var c = info(classTy)
+    while c != 0 {
+        const binding = scope.findQualified(at(c).*.prefix, name, false)
+        if binding != 0 && scope.at(binding).*.kind == scope.VARIABLE { return scope.at(binding).*.obj }
+        c = info(at(c).*.baseClass)
+    }
+    return 0
+}
+
+fn findMethod(classTy: usize, name: u32) -> usize {
+    const o = memberOf(classTy, name)
+    if o != 0 && ast.obj(o).*.isFunction { return o }
+    return 0
+}
+
+// The current member function's `this`.
+pub fn thisPointer(token: usize) -> usize {
+    const binding = scope.find(names.K_THIS)
+    if binding == 0 || scope.at(binding).*.kind != scope.VARIABLE { tokens.errorAt(token, "'this' outside a member function") }
+    return variable(scope.at(binding).*.obj, token)
+}
+
+// `*(void ***)address = vtable`.
+fn setVptr(address: usize, c: usize, token: usize) -> usize {
+    const vt = at(c).*.vtable
+    if vt == 0 { return nothing(token) }
+    ast.obj(vt).*.isReferenced = true
+    const slotType = types.pointerTo(types.pointerTo(types.voidOf()))
+    const target = deref(typing.cast(address, types.pointerTo(slotType)), token)
+    return typed(ast.binary(ast.ASSIGN, target, typing.cast(variable(vt, token), slotType), token))
+}
+
+// The default initializer of a member (`int x = 0;` in the class), read
+// where it is used.
+fn memberInitializer(m: usize) -> usize {
+    const saved = cursor.save()
+    cursor.restore(types.member(m).*.init)
+    var e: usize = 0
+    if cursor.consume(names.P_LBRACE) {
+        // `int x{0};` or `= {0}`: one value.
+        e = expr.assign()
+        cursor.expect(names.P_RBRACE)
+    } else {
+        e = expr.assign()
+    }
+    cursor.restore(saved)
+    return e
+}
+
+// Makes the object of type `ty` at `address` from `args`: the expression
+// (nothing when no code is needed).
+pub fn construct(address: usize, ty: usize, args: usize, count: usize, token: usize) -> usize {
+    const k = types.kind(ty)
+    if k == types.ARRAY {
+        const element = types.baseOf(ty)
+        if count == 1 {
+            // A copy of an array (a member of a copied object): element
+            // by element.
+            const source = base.getWord(args)
+            typing.addType(source)
+            if !types.compatible(ast.typeOf(source), ty) { tokens.errorAt(token, "an array cannot be constructed from arguments") }
+            const loop = countedLoop(number(types.at(ty).*.arrayLength, types.longOf(), token), token)
+            const from = deref(elementAddress(addressOf(source, token), element, variable(loop.1, token), token), token)
+            ast.node(loop.0).*.then = ast.unary(ast.EXPR_STMT, construct(elementAddress(address, element, variable(loop.1, token), token), element, argumentList(from, 0), 1, token), token)
+            return statementExpression(loop.0, token)
+        }
+        if count != 0 { tokens.errorAt(token, "an array cannot be constructed from arguments") }
+        if !needsConstruction(element) { return nothing(token) }
+        const loop = countedLoop(number(types.at(ty).*.arrayLength, types.longOf(), token), token)
+        ast.node(loop.0).*.then = ast.unary(ast.EXPR_STMT, construct(elementAddress(address, element, variable(loop.1, token), token), element, 0, 0, token), token)
+        return statementExpression(loop.0, token)
+    }
+    const c = info(ty)
+    if c != 0 && at(c).*.constructors != 0 {
+        const full = argumentsWith(address, args, count)
+        if expr.bestOverload(at(c).*.constructors, full, count + 1) != 0 {
+            const callee = methodNode(at(c).*.constructors, address, token)
+            ast.node(callee).*.value = 1
+            return expr.buildCall(callee, args, count, token)
+        }
+        // No constructor takes the arguments: the default and the copy
+        // constructor the class has implicitly (or `= default`) are made
+        // member by member below.
+        var memberwise = false
+        if count == 0 && at(c).*.defaultedDefault { memberwise = true }
+        if count == 1 {
+            typing.addType(base.getWord(args))
+            if sameClass(ast.typeOf(base.getWord(args)), ty) { memberwise = true }
+        }
+        if !memberwise { tokens.errorAt(token, "no matching constructor") }
+    }
+    if k == types.STRUCT || k == types.UNION {
+        if count == 0 { return defaultConstruct(address, ty, token) }
+        if count == 1 {
+            const value = base.getWord(args)
+            typing.addType(value)
+            if sameClass(ast.typeOf(value), ty) || info(ty) == 0 { return copyConstruct(address, ty, value, token) }
+            if convertible(ast.typeOf(value), ty) { return copyConstruct(address, ty, convertValue(value, ty), token) }
+        }
+        tokens.errorAt(token, "no matching constructor")
+    }
+    // A scalar or a reference: its value (`x()` in an initializer list
+    // makes it zero).
+    const target = deref(address, token)
+    if count == 0 {
+        if types.isReference(ty) { tokens.errorAt(token, "a reference member needs an initializer") }
+        return typed(ast.binary(ast.ASSIGN, target, number(0, types.intOf(), token), token))
+    }
+    if count == 1 { return typed(ast.binary(ast.ASSIGN, target, base.getWord(args), token)) }
+    tokens.errorAt(token, "too many initializers")
+    return 0
+}
+
+// Makes the object without arguments: its base, its vtable pointer, its
+// members with constructors or default initializers.
+fn defaultConstruct(address: usize, ty: usize, token: usize) -> usize {
+    const c = info(ty)
+    var n = nothing(token)
+    if c != 0 && at(c).*.hasVirtual && at(c).*.baseClass == 0 { n = setVptr(address, c, token) }
+    var m = types.at(ty).*.members
+    while m != 0 {
+        const mt = types.member(m).*.ty
+        const where = memberAddress(address, m, token)
+        if types.member(m).*.isBase {
+            n = sequence(n, construct(where, mt, 0, 0, token), token)
+            if at(c).*.hasVirtual { n = sequence(n, setVptr(address, c, token), token) }
+        } else if types.member(m).*.init != 0 {
+            n = sequence(n, construct(where, mt, argumentList(memberInitializer(m), 0), 1, token), token)
+        } else if needsConstruction(mt) {
+            n = sequence(n, construct(where, mt, 0, 0, token), token)
+        }
+        m = types.member(m).*.next
+    }
+    return n
+}
+
+// Whether a member of the class is more than its bytes to copy.
+fn membersNeedSpecialCopy(ty: usize) -> bool {
+    var m = types.at(ty).*.members
+    while m != 0 {
+        if needsSpecialCopy(types.member(m).*.ty) { return true }
+        m = types.member(m).*.next
+    }
+    return false
+}
+
+// Makes the object as a copy of `source` (an object of its type) when
+// the class has no copy constructor: the bytes, or member by member
+// when a member has constructors.
+fn copyConstruct(address: usize, ty: usize, source: usize, token: usize) -> usize {
+    typing.addType(source)
+    if !membersNeedSpecialCopy(ty) {
+        // The bytes; a temporary source is moved.
+        const moved = markMoved(source)
+        return typed(ast.binary(ast.ASSIGN, deref(address, token), source, token))
+    }
+    // The source by its address, taken once.
+    const ptr = newTemp(types.pointerTo(ty), token)
+    var n = typed(ast.binary(ast.ASSIGN, variable(ptr, token), addressOf(source, token), token))
+    var m = types.at(ty).*.members
+    while m != 0 {
+        const mt = types.member(m).*.ty
+        const part = ast.unary(ast.MEMBER, deref(variable(ptr, token), token), token)
+        ast.node(part).*.member = m
+        typing.addType(part)
+        n = sequence(n, construct(memberAddress(address, m, token), mt, argumentList(part, 0), 1, token), token)
+        m = types.member(m).*.next
+    }
+    return n
+}
+
+// Unmakes the object of type `ty` at `address`: its destructor (called
+// through the vtable unless `direct`), else its members' in reverse.
+pub fn destroy(address: usize, ty: usize, direct: bool, token: usize) -> usize {
+    const k = types.kind(ty)
+    if k == types.ARRAY {
+        const element = types.baseOf(ty)
+        if !hasDestructor(element) { return nothing(token) }
+        const loop = countedLoopDown(number(types.at(ty).*.arrayLength, types.longOf(), token), token)
+        ast.node(loop.0).*.then = ast.unary(ast.EXPR_STMT, destroy(elementAddress(address, element, lastIndex(loop.1, token), token), element, true, token), token)
+        return statementExpression(loop.0, token)
+    }
+    const c = info(ty)
+    if c == 0 { return nothing(token) }
+    if at(c).*.destructor != 0 {
+        const callee = methodNode(at(c).*.destructor, address, token)
+        if direct { ast.node(callee).*.value = 1 }
+        return expr.buildCall(callee, 0, 0, token)
+    }
+    // The members, last first.
+    var count: usize = 0
+    var m = types.at(ty).*.members
+    while m != 0 {
+        count += 1
+        m = types.member(m).*.next
+    }
+    const list = base.alloc(count * 8 + 8)
+    var index: usize = 0
+    m = types.at(ty).*.members
+    while m != 0 {
+        base.putWord(list + index * 8, m)
+        index += 1
+        m = types.member(m).*.next
+    }
+    var n = nothing(token)
+    while index > 0 {
+        index -= 1
+        const member = base.getWord(list + index * 8)
+        if hasDestructor(types.member(member).*.ty) {
+            n = sequence(n, destroy(memberAddress(address, member, token), types.member(member).*.ty, true, token), token)
+        }
+    }
+    return n
+}
+
+// A temporary object of type `ty` made from `args`: destroyed at the end
+// of the expression unless moved on.
+pub fn temporaryObject(ty: usize, args: usize, count: usize, token: usize) -> usize {
+    const tmp = newTemp(ty, token)
+    const init = construct(addressOf(variable(tmp, token), token), ty, args, count, token)
+    if hasDestructor(ty) { state.addTemporary(tmp) }
+    const result = variable(tmp, token)
+    if isNothing(init) { return result }
+    const n = ast.binary(ast.COMMA, init, result, token)
+    ast.node(n).*.ty = ty
+    return n
+}
+
+// `T(args)`: a temporary of a class, a conversion of a scalar.
+pub fn functionalCast(ty: usize, args: usize, count: usize, token: usize) -> usize {
+    if isClassType(ty) { return temporaryObject(ty, args, count, token) }
+    if count == 0 { return typing.cast(number(0, types.intOf(), token), ty) }
+    if count > 1 { tokens.errorAt(token, "too many arguments for a conversion") }
+    return typing.cast(base.getWord(args), ty)
+}
+
+// A class value about to be moved into a new object: a temporary is not
+// destroyed any more (the new object owns it); an object that cannot be
+// copied by its bytes is copied into a temporary first.
+// Marks the temporary `value` is (a call's result, a constructed
+// temporary) as moved on: not destroyed at the end of the expression.
+// False when it is no temporary.
+fn markMoved(value: usize) -> bool {
+    const k = ast.kindOf(value)
+    if k == ast.FUNCALL && ast.node(value).*.returnBuffer != 0 {
+        ast.obj(ast.node(value).*.returnBuffer).*.noDestroy = true
+        return true
+    }
+    var holder = value
+    if k == ast.COMMA { holder = ast.node(value).*.rhs }
+    if ast.kindOf(holder) == ast.VAR && state.isPendingTemporary(ast.node(holder).*.variable) {
+        ast.obj(ast.node(holder).*.variable).*.noDestroy = true
+        return true
+    }
+    return false
+}
+
+pub fn consumed(value: usize) -> usize {
+    typing.addType(value)
+    const ty = ast.typeOf(value)
+    if !isClassType(ty) { return value }
+    if markMoved(value) { return value }
+    if needsSpecialCopy(ty) && typing.isLvalue(value) {
+        const token = ast.tokenOf(value)
+        const tmp = newTemp(ty, token)
+        const init = construct(addressOf(variable(tmp, token), token), ty, argumentList(value, 0), 1, token)
+        const n = ast.binary(ast.COMMA, init, variable(tmp, token), token)
+        ast.node(n).*.ty = ty
+        return n
+    }
+    return value
+}
+
+// A call made: its result, when a class with a destructor, is a
+// temporary.
+pub fn noteCall(n: usize) -> void {
+    const buffer = ast.node(n).*.returnBuffer
+    if buffer != 0 && hasDestructor(ast.typeOf(n)) { state.addTemporary(buffer) }
+}
+
+// The destruction of the temporaries made so far (the ones not moved
+// on), as a statement; 0 when there is none.
+pub fn flushStatement(token: usize) -> usize {
+    const e = destroyTemporaries(token)
+    return statementOf(e, token)
+}
+
+fn destroyTemporaries(token: usize) -> usize {
+    var c = state.takeTemporaries()
+    var n = nothing(token)
+    while c != 0 {
+        const o = state.cellNode(c)
+        if !ast.obj(o).*.noDestroy {
+            n = sequence(n, destroy(addressOf(variable(o, token), token), ast.obj(o).*.ty, true, token), token)
+        }
+        c = state.cellNext(c)
+    }
+    return n
+}
+
+// The expression `e`, a full one, followed by the destruction of its
+// temporaries; its value kept when `keepValue`.
+pub fn flushTemporaries(e: usize, keepValue: bool, token: usize) -> usize {
+    const destroys = destroyTemporaries(token)
+    if isNothing(destroys) { return e }
+    if e == 0 { return destroys }
+    typing.addType(e)
+    const ty = ast.typeOf(e)
+    if !keepValue || types.kind(ty) == types.VOID { return sequence(e, destroys, token) }
+    const tmp = newTemp(ty, token)
+    const saved = typed(ast.binary(ast.ASSIGN, variable(tmp, token), e, token))
+    const n = ast.binary(ast.COMMA, sequence(saved, destroys, token), variable(tmp, token), token)
+    ast.node(n).*.ty = ty
+    return n
+}
+
+// ---------------------------------------------------------------------------
+// Scopes
+
+// The destruction of the objects on the cleanup stack above `height`,
+// innermost first, as a block; 0 when there is none.
+pub fn destroyFrom(height: usize, token: usize) -> usize {
+    return destroyAbove(height, 0, token)
+}
+
+// The same, leaving out the object `skip` (one moved out by a return).
+fn destroyAbove(height: usize, skip: usize, token: usize) -> usize {
+    var index = state.cleanupCount()
+    if index <= height { return 0 }
+    const block = ast.make(ast.BLOCK, token)
+    while index > height {
+        index -= 1
+        const o = state.cleanupAt(index)
+        if o == skip { continue }
+        appendStatement(block, statementOf(destroy(addressOf(variable(o, token), token), ast.obj(o).*.ty, true, token), token))
+    }
+    if ast.node(block).*.body == 0 { return 0 }
+    return block
+}
+
+// Leaves a scope: the destruction of its objects (0 for none), which are
+// popped.
+pub fn leaveScope(height: usize, token: usize) -> usize {
+    const s = destroyFrom(height, token)
+    state.popCleanups(height)
+    return s
+}
+
+// A break or continue (the JUMP `n`) destroys the objects of the scopes
+// it leaves.
+pub fn jumpStatement(n: usize) -> usize {
+    const s = destroyFrom(state.loopCleanups(), ast.tokenOf(n))
+    if s == 0 { return n }
+    appendStatement(s, n)
+    return s
+}
+
+// A class value about to be returned: a local of the function (on the
+// cleanup stack) is moved out, its destruction left out of the return;
+// anything else is consumed (copied when an object, moved when a
+// temporary).
+var movedOut: usize = 0
+
+pub fn returnValue(value: usize, ty: usize) -> usize {
+    const converted = convertValue(value, ty)
+    movedOut = 0
+    if ast.kindOf(converted) == ast.VAR {
+        const o = ast.node(converted).*.variable
+        var index = state.cleanupCount()
+        while index > 0 {
+            index -= 1
+            if state.cleanupAt(index) == o {
+                movedOut = o
+                return converted
+            }
+        }
+    }
+    return consumed(converted)
+}
+
+// A return (the RETURN `n`, its value read): the value is kept, the
+// temporaries and every object of the function are destroyed, then the
+// function returns.
+pub fn returnStatement(n: usize) -> usize {
+    const token = ast.tokenOf(n)
+    const value = ast.node(n).*.lhs
+    const skip = movedOut
+    movedOut = 0
+    if state.cleanupCount() == 0 && !state.hasTemporaries() { return n }
+    const block = ast.make(ast.BLOCK, token)
+    if value != 0 {
+        typing.addType(value)
+        var ty = ast.typeOf(value)
+        if types.kind(ty) != types.VOID {
+            // A reference result is an address.
+            const isRef = types.isReference(ty)
+            if isRef {
+                ty = types.pointerTo(types.baseOf(ty))
+                ast.node(value).*.ty = ty
+            }
+            const tmp = newTemp(ty, token)
+            appendStatement(block, ast.unary(ast.EXPR_STMT, typed(ast.binary(ast.ASSIGN, variable(tmp, token), value, token)), token))
+            const kept = variable(tmp, token)
+            if isRef { ast.node(kept).*.ty = ast.typeOf(value) }
+            ast.node(n).*.lhs = kept
+        } else {
+            appendStatement(block, ast.unary(ast.EXPR_STMT, value, token))
+            ast.node(n).*.lhs = 0
+        }
+    }
+    appendStatement(block, flushStatement(token))
+    appendStatement(block, destroyAbove(0, skip, token))
+    appendStatement(block, n)
+    return block
+}
+
+// ---------------------------------------------------------------------------
+// Declaring a class
+
+// A class's body begins (its tag `tag`, 0 for none): the class is set
+// up, its base clause read, its scope entered.
+pub fn beginClass(ty: usize, tag: u32, token: usize) -> void {
+    const c = base.alloc(@sizeOf(Class))
+    at(c).*.ty = ty
+    var name = tag
+    if name == 0 {
+        anonymousCount += 1
+        name = base.intern(base.join("__anon", base.decimal(@intCast(u64, anonymousCount))))
+        types.at(ty).*.name = scope.qualify(scope.currentNamespace(), name)
+    }
+    at(c).*.name = name
+    at(c).*.prefix = types.at(ty).*.name
+    types.at(ty).*.info = c
+    base.putWord(classByPrefix + @intCast(usize, at(c).*.prefix) * 8, ty)
+    // The class's name names its scope (`S::f`).
+    if tag != 0 {
+        const known = scope.findHere(tag)
+        if known == 0 || scope.at(known).*.kind != scope.NAMESPACE { const bound = scope.bindNamespace(tag, at(c).*.prefix) }
+    }
+    if cursor.consume(names.P_COLON) {
+        while true {
+            while cursor.consume(names.K_PUBLIC) || cursor.consume(names.K_PRIVATE) || cursor.consume(names.K_PROTECTED) || cursor.consume(names.K_VIRTUAL) {}
+            const start = cursor.peek()
+            const b = decl.declspec(0)
+            if info(b) == 0 || types.at(b).*.incomplete { tokens.errorAt(start, "the base is not a complete class") }
+            if at(c).*.baseClass != 0 { tokens.errorAt(start, "multiple inheritance is not supported") }
+            at(c).*.baseClass = b
+            if !cursor.consume(names.P_COMMA) { break }
+        }
+    }
+    classDepth += 1
+    scope.enterPrefix(at(c).*.prefix)
+}
+
+// The base class as the class's first member, 0 when there is none.
+pub fn baseMember(ty: usize, token: usize) -> usize {
+    const c = info(ty)
+    if c == 0 || at(c).*.baseClass == 0 { return 0 }
+    const m = types.newMember(at(c).*.baseClass, 0, token)
+    types.member(m).*.isBase = true
+    return m
+}
+
+// A member declaration that is not a data member: an access specifier,
+// a constructor, a destructor, a friend, a using-declaration. True when
+// one was read.
+pub fn specialMember(ty: usize) -> bool {
+    const c = info(ty)
+    if cursor.is(names.K_PUBLIC) || cursor.is(names.K_PRIVATE) || cursor.is(names.K_PROTECTED) {
+        cursor.advance()
+        cursor.expect(names.P_COLON)
+        return true
+    }
+    if cursor.consume(names.K_FRIEND) {
+        friendDeclaration(ty)
+        return true
+    }
+    if cursor.consume(names.K_USING) {
+        while !cursor.consume(names.P_SEMI) {
+            if cursor.isEof() { cursor.fail("unterminated using-declaration") }
+            cursor.advance()
+        }
+        return true
+    }
+    if cursor.is(names.K_TEMPLATE) { cursor.fail("templates are not supported yet") }
+    // A constructor `S(`, `explicit S(`, `inline S(`; a destructor `~S(`,
+    // `virtual ~S(`.
+    const start = cursor.save()
+    var isVirtual = false
+    while cursor.is(names.K_EXPLICIT) || cursor.is(names.K_INLINE) || cursor.is(names.K_VIRTUAL) || cursor.is(names.K_CONSTEXPR) {
+        if cursor.is(names.K_VIRTUAL) { isVirtual = true }
+        cursor.advance()
+    }
+    if cursor.isIdent() && tokens.name(cursor.peek()) == at(c).*.name && cursor.isToken(cursor.peekNext(), names.P_LPAREN) {
+        const token = cursor.peek()
+        cursor.advance()
+        cursor.advance()
+        const fnType = decl.functionParameters(types.voidOf())
+        const hadBody = memberFunction(ty, fnType, token, at(c).*.name, false, false, true, false)
+        if !hadBody { cursor.expect(names.P_SEMI) }
+        return true
+    }
+    if cursor.consume(names.P_TILDE) {
+        const token = cursor.expectIdent()
+        if tokens.name(token) != at(c).*.name { tokens.errorAt(token, "the destructor's name is not the class's") }
+        cursor.expect(names.P_LPAREN)
+        const fnType = decl.functionParameters(types.voidOf())
+        const name = base.intern(base.join("~", base.nameOf(at(c).*.name)))
+        const hadBody = memberFunction(ty, fnType, token, name, false, isVirtual, false, true)
+        if !hadBody { cursor.expect(names.P_SEMI) }
+        return true
+    }
+    cursor.restore(start)
+    return false
+}
+
+// `friend class X;` is nothing; `friend f(...)` declares f in the
+// namespace around the class (its body, if any, read after the class).
+fn friendDeclaration(ty: usize) -> void {
+    if cursor.is(names.K_CLASS) || cursor.is(names.K_STRUCT) {
+        cursor.advance()
+        const ignored = cursor.expectIdent()
+        cursor.expect(names.P_SEMI)
+        return
+    }
+    const c = info(ty)
+    scope.leaveNamespace()
+    const attr = decl.newAttr()
+    const baseType = decl.declspec(attr)
+    const found = decl.declarator(baseType)
+    if found.1 == 0 || types.kind(found.0) != types.FUNC { cursor.fail("expected a friend function") }
+    const fnObj = decl.declareFunction(found.0, found.1, attr)
+    if ast.obj(fnObj).*.token == 0 { ast.obj(fnObj).*.token = found.1 }
+    if cursor.is(names.P_LBRACE) {
+        // Its body sees the class's names.
+        ast.obj(fnObj).*.isWeak = true
+        ast.obj(fnObj).*.isInline = true
+        deferBody(fnObj, ty)
+    } else {
+        cursor.expect(names.P_SEMI)
+    }
+    scope.enterPrefix(at(c).*.prefix)
+}
+
+// The function type with `this` (a pointer to the class) first.
+fn withThis(classTy: usize, fnType: usize) -> usize {
+    const t = types.functionReturning(types.baseOf(fnType))
+    types.at(t).*.variadic = types.at(fnType).*.variadic
+    types.at(t).*.constMethod = types.at(fnType).*.constMethod
+    const p = types.newParam(types.pointerTo(classTy), names.K_THIS, 0)
+    types.param(p).*.next = types.at(fnType).*.params
+    types.at(t).*.params = p
+    return t
+}
+
+// The qualifiers after a member function's parameters: const, volatile,
+// &, &&, noexcept, throw(), override, final, attributes. Whether const
+// was among them.
+pub fn trailingQualifiers() -> bool {
+    var isConst = false
+    while true {
+        if cursor.consume(names.K_CONST) {
+            isConst = true
+        } else if cursor.consume(names.K_VOLATILE) || cursor.consume(names.P_AMP) || cursor.consume(names.P_ANDAND) {
+        } else if cursor.consume(names.K_NOEXCEPT) {
+            if cursor.is(names.P_LPAREN) { decl.skipParentheses() }
+        } else if cursor.consume(names.K_THROW) {
+            decl.skipParentheses()
+        } else if cursor.isIdent() && (tokens.name(cursor.peek()) == overrideName || tokens.name(cursor.peek()) == finalName) {
+            cursor.advance()
+        } else if cursor.is(names.K_GNU2_ATTRIBUTE) {
+            const ignored = decl.attributes()
+        } else {
+            return isConst
+        }
+    }
+    return isConst
+}
+
+// Declares the member function `name` of the class with type `fnType`
+// (without `this`), reading what follows its parameters: qualifiers,
+// `= 0`, `= default`, `= delete`, or a body (skipped, read after the
+// class). True when a body was there.
+pub fn memberFunction(classTy: usize, fnType: usize, nameToken: usize, name: u32, isStatic: bool, isVirtual: bool, isCtor: bool, isDtor: bool) -> bool {
+    if state.currentFunction() != 0 { tokens.errorAt(nameToken, "member functions of a local class are not supported") }
+    const c = info(classTy)
+    if trailingQualifiers() { types.at(fnType).*.constMethod = true }
+    var isPure = false
+    var defaulted = false
+    var deleted = false
+    if cursor.consume(names.P_ASSIGN) {
+        if cursor.consume(names.K_DEFAULT) {
+            defaulted = true
+        } else if cursor.consume(names.K_DELETE) {
+            deleted = true
+        } else {
+            const zero = cursor.peek()
+            if tokens.kind(zero) != tokens.INTEGER || tokens.at(zero).*.value != 0 { cursor.fail("expected 0, default or delete") }
+            cursor.advance()
+            isPure = true
+        }
+    }
+    if defaulted || deleted {
+        if isCtor && defaulted {
+            if types.at(fnType).*.params == 0 { at(c).*.defaultedDefault = true } else { at(c).*.defaultedCopy = true }
+        }
+        return false
+    }
+    const symbol = mangle.functionSymbol(at(c).*.prefix, name, fnType, base.nameOf(at(c).*.name))
+    if isStatic { types.at(fnType).*.constMethod = false }
+    const ty = if isStatic { fnType } else { withThis(classTy, fnType) }
+    var o: usize = 0
+    const binding = scope.findQualified(at(c).*.prefix, name, false)
+    if binding != 0 && scope.at(binding).*.kind == scope.VARIABLE && ast.obj(scope.at(binding).*.obj).*.isFunction {
+        var candidate = scope.at(binding).*.obj
+        while true {
+            if decl.sameSignature(ast.obj(candidate).*.ty, ty) {
+                o = candidate
+                break
+            }
+            if ast.obj(candidate).*.nextOverload == 0 {
+                o = newMethod(classTy, name, nameToken, ty, symbol)
+                ast.obj(candidate).*.nextOverload = o
+                break
+            }
+            candidate = ast.obj(candidate).*.nextOverload
+        }
+    } else {
+        o = newMethod(classTy, name, nameToken, ty, symbol)
+        const bound = scope.bindVariable(name, o)
+    }
+    const obj = ast.obj(o)
+    obj.*.isStaticMember = isStatic
+    obj.*.isConstructor = isCtor
+    obj.*.isDestructor = isDtor
+    if isVirtual { obj.*.isVirtual = true }
+    if isPure {
+        obj.*.isVirtual = true
+        obj.*.isPure = true
+    }
+    if isCtor && at(c).*.constructors == 0 { at(c).*.constructors = o }
+    if isDtor { at(c).*.destructor = o }
+    if cursor.is(names.P_LBRACE) || (isCtor && cursor.is(names.P_COLON)) {
+        obj.*.isWeak = true
+        obj.*.isInline = true
+        deferBody(o, classTy)
+        return true
+    }
+    return false
+}
+
+// The member function among `first`'s overloads whose parameters are
+// `fnType`'s (without `this`): for `void S::f(int) { }`; 0 for none.
+pub fn matchMember(first: usize, fnType: usize) -> usize {
+    const withThisType = withThis(ast.obj(first).*.classType, fnType)
+    var candidate = first
+    while candidate != 0 {
+        const ty = ast.obj(candidate).*.ty
+        if ast.obj(candidate).*.isStaticMember {
+            if decl.sameSignature(ty, fnType) { return candidate }
+        } else if decl.sameSignature(ty, withThisType) {
+            return candidate
+        }
+        candidate = ast.obj(candidate).*.nextOverload
+    }
+    return 0
+}
+
+fn newMethod(classTy: usize, name: u32, token: usize, ty: usize, symbol: u32) -> usize {
+    const c = info(classTy)
+    const o = ast.newObj(name, ty, token)
+    const obj = ast.obj(o)
+    obj.*.isFunction = true
+    obj.*.classType = classTy
+    obj.*.linkName = symbol
+    obj.*.symbol = symbol
+    state.addGlobal(o)
+    const m = cell(o, 0)
+    if at(c).*.methods == 0 { at(c).*.methods = m } else { base.putWord(at(c).*.methodsTail + 8, m) }
+    at(c).*.methodsTail = m
+    return o
+}
+
+// A static data member: a global of the class's scope, defined here
+// when it has an initializer (`static int S::count` elsewhere else).
+pub fn staticMember(classTy: usize, ty: usize, nameToken: usize, attr: usize) -> void {
+    const c = info(classTy)
+    const name = tokens.name(nameToken)
+    if decl.attrAt(attr).*.isConstexpr && cursor.is(names.P_ASSIGN) && decl.constexprConstant(ty, nameToken) { return }
+    const o = ast.newObj(name, ty, nameToken)
+    const obj = ast.obj(o)
+    obj.*.linkName = mangle.variableSymbol(at(c).*.prefix, name)
+    obj.*.symbol = obj.*.linkName
+    obj.*.alignment = types.alignOf(ty)
+    state.addGlobal(o)
+    const bound = scope.bindVariable(name, o)
+    if cursor.consume(names.P_ASSIGN) {
+        initializer.globalInitializer(o)
+        obj.*.isDefinition = true
+        obj.*.isWeak = true
+    }
+}
+
+// A data member's default initializer `= expr` or `{expr}`: kept as its
+// tokens, read in each constructor.
+pub fn memberInitializerTokens(m: usize) -> void {
+    if cursor.consume(names.P_ASSIGN) {
+        types.member(m).*.init = cursor.peek()
+    } else if cursor.is(names.P_LBRACE) {
+        types.member(m).*.init = cursor.peek()
+    } else {
+        return
+    }
+    // To the `,` or `;` ending the declarator.
+    var level: u32 = 0
+    while true {
+        if cursor.isEof() { cursor.fail("unterminated member initializer") }
+        if level == 0 && (cursor.is(names.P_COMMA) || cursor.is(names.P_SEMI)) { return }
+        if cursor.is(names.P_LPAREN) || cursor.is(names.P_LBRACKET) || cursor.is(names.P_LBRACE) { level += 1 }
+        if cursor.is(names.P_RPAREN) || cursor.is(names.P_RBRACKET) || cursor.is(names.P_RBRACE) { level -= 1 }
+        cursor.advance()
+    }
+}
+
+// Remembers a function body to read after the class, and passes it.
+fn deferBody(fnObj: usize, classTy: usize) -> void {
+    const c = base.alloc(32)
+    base.putWord(c, fnObj)
+    base.putWord(c + 8, cursor.save())
+    base.putWord(c + 16, classTy)
+    if deferred == 0 { deferred = c } else { base.putWord(deferredTail + 24, c) }
+    deferredTail = c
+    if cursor.is(names.P_COLON) {
+        // The initializer list, to the body's `{` (a `{` right after a
+        // name is a brace initializer, skipped).
+        var level: u32 = 0
+        while true {
+            if cursor.isEof() { cursor.fail("unterminated constructor") }
+            if level == 0 && cursor.is(names.P_LBRACE) { break }
+            if level == 0 && cursor.isIdent() && cursor.isToken(cursor.peekNext(), names.P_LBRACE) {
+                cursor.advance()
+                skipBraces()
+                continue
+            }
+            if cursor.is(names.P_LPAREN) || cursor.is(names.P_LBRACE) { level += 1 }
+            if cursor.is(names.P_RPAREN) || cursor.is(names.P_RBRACE) { level -= 1 }
+            cursor.advance()
+        }
+    }
+    skipBraces()
+}
+
+fn skipBraces() -> void {
+    cursor.expect(names.P_LBRACE)
+    var level: u32 = 1
+    while level > 0 {
+        if cursor.isEof() { cursor.fail("unterminated function body") }
+        if cursor.is(names.P_LBRACE) { level += 1 }
+        if cursor.is(names.P_RBRACE) { level -= 1 }
+        cursor.advance()
+    }
+}
+
+// The members are read: the vtable pointer is added when the class has
+// virtual functions of its own (a polymorphic base has one already).
+pub fn finishMembers(ty: usize) -> void {
+    const c = info(ty)
+    buildVirtuals(c)
+    if !at(c).*.hasVirtual { return }
+    const b = at(c).*.baseClass
+    if b != 0 {
+        if !at(info(b)).*.hasVirtual { tokens.errorAt(cursor.peek(), "a class with virtual functions over a base without any is not supported") }
+        return
+    }
+    const vptr = types.newMember(types.pointerTo(types.pointerTo(types.voidOf())), 0, cursor.peek())
+    types.member(vptr).*.next = types.at(ty).*.members
+    types.at(ty).*.members = vptr
+    var index: i64 = 0
+    var m = vptr
+    while m != 0 {
+        types.member(m).*.index = index
+        index += 1
+        m = types.member(m).*.next
+    }
+}
+
+// Whether two member function types take the same parameters after
+// `this`.
+fn sameParameters(first: usize, second: usize) -> bool {
+    var p = types.at(first).*.params
+    var q = types.at(second).*.params
+    if p != 0 { p = types.param(p).*.next }
+    if q != 0 { q = types.param(q).*.next }
+    while p != 0 && q != 0 {
+        if !types.compatible(types.param(p).*.ty, types.param(q).*.ty) { return false }
+        p = types.param(p).*.next
+        q = types.param(q).*.next
+    }
+    return p == 0 && q == 0
+}
+
+// The virtual functions by slot: the base's, overridden where a member
+// function has the same name and parameters, then the new ones.
+fn buildVirtuals(c: usize) -> void {
+    var head: usize = 0
+    var tail: usize = 0
+    var count: i64 = 0
+    const b = at(c).*.baseClass
+    if b != 0 {
+        var inherited = at(info(b)).*.virtuals
+        while inherited != 0 {
+            const copy = cell(state.cellNode(inherited), 0)
+            if head == 0 { head = copy } else { base.putWord(tail + 8, copy) }
+            tail = copy
+            count += 1
+            inherited = state.cellNext(inherited)
+        }
+    }
+    var m = at(c).*.methods
+    while m != 0 {
+        const o = state.cellNode(m)
+        const obj = ast.obj(o)
+        var slot: usize = 0
+        var index: i64 = 0
+        var s = head
+        while s != 0 {
+            const known = ast.obj(state.cellNode(s))
+            if known.*.name == obj.*.name && sameParameters(known.*.ty, obj.*.ty) {
+                slot = s
+                break
+            }
+            if obj.*.isDestructor && known.*.isDestructor {
+                slot = s
+                break
+            }
+            index += 1
+            s = state.cellNext(s)
+        }
+        if slot != 0 {
+            base.putWord(slot, o)
+            obj.*.isVirtual = true
+            obj.*.slot = index
+        } else if obj.*.isVirtual {
+            const made = cell(o, 0)
+            if head == 0 { head = made } else { base.putWord(tail + 8, made) }
+            tail = made
+            obj.*.slot = count
+            count += 1
+        }
+        m = state.cellNext(m)
+    }
+    at(c).*.virtuals = head
+    at(c).*.virtualCount = count
+    at(c).*.hasVirtual = count > 0
+}
+
+// The class is laid out: its vtable is made and its member function
+// bodies are read (once the outermost class is done).
+pub fn completeClass(ty: usize) -> void {
+    const c = info(ty)
+    at(c).*.complete = true
+    scope.leaveNamespace()
+    if at(c).*.hasVirtual { makeVtable(c) }
+    classDepth -= 1
+    if classDepth == 0 { readDeferred() }
+}
+
+// The vtable: a global array of the virtual functions' addresses, named
+// _ZTV<class>, weak (every file that sees the class has one).
+fn makeVtable(c: usize) -> void {
+    const count = at(c).*.virtualCount
+    const o = ast.newObj(mangle.vtableSymbol(at(c).*.prefix), types.arrayOf(types.pointerTo(types.voidOf()), count), 0)
+    const obj = ast.obj(o)
+    obj.*.linkName = obj.*.name
+    obj.*.symbol = obj.*.name
+    obj.*.isDefinition = true
+    obj.*.isWeak = true
+    obj.*.alignment = 8
+    obj.*.initData = base.alloc(@intCast(usize, count) * 8)
+    var head: usize = 0
+    var index: i64 = 0
+    var s = at(c).*.virtuals
+    while s != 0 {
+        const fnObj = state.cellNode(s)
+        if !ast.obj(fnObj).*.isPure {
+            ast.obj(fnObj).*.isReferenced = true
+            const r = base.alloc(@sizeOf(ast.Relocation))
+            ast.relocation(r).*.offset = index * 8
+            ast.relocation(r).*.target = fnObj
+            ast.relocation(r).*.next = head
+            head = r
+        }
+        index += 1
+        s = state.cellNext(s)
+    }
+    obj.*.relocations = head
+    state.addGlobal(o)
+    at(c).*.vtable = o
+}
+
+fn readDeferred() -> void {
+    const saved = cursor.save()
+    var c = deferred
+    deferred = 0
+    deferredTail = 0
+    while c != 0 {
+        cursor.restore(base.getWord(c + 8))
+        decl.defineFunction(base.getWord(c), base.getWord(c + 16))
+        c = base.getWord(c + 24)
+    }
+    cursor.restore(saved)
+}
+
+// ---------------------------------------------------------------------------
+// Constructor and destructor bodies
+
+// The arguments `(a, b)` or `{a, b}` after their opener: the array and
+// the count.
+pub fn readArguments(closer: u32) -> (usize, usize) {
+    const MAX_ARGS: usize = 256
+    const given = base.alloc(MAX_ARGS * 8)
+    var count: usize = 0
+    while !cursor.consume(closer) {
+        if count > 0 { cursor.expect(names.P_COMMA) }
+        if count >= MAX_ARGS { cursor.fail("too many arguments") }
+        const argument = expr.assign()
+        typing.addType(argument)
+        base.putWord(given + count * 8, argument)
+        count += 1
+    }
+    return -> (given, count)
+}
+
+// A constructor's start, before its `{`: the initializer list is read,
+// and the base, the vtable pointer and the members are made in order;
+// a block of statements (0 for none).
+pub fn constructorPrologue(fnObj: usize) -> usize {
+    const classTy = ast.obj(fnObj).*.classType
+    const c = info(classTy)
+    const token = cursor.peek()
+    const self = thisPointer(token)
+    // The initializers given: cells of (member or 0 for the base, args,
+    // count, next).
+    var inits: usize = 0
+    if cursor.consume(names.P_COLON) {
+        while true {
+            const read = decl.qualifier()
+            const nameToken = cursor.expectIdent()
+            const name = tokens.name(nameToken)
+            var m: usize = 0
+            var isBase = false
+            if at(c).*.baseClass != 0 && (name == at(info(at(c).*.baseClass)).*.name || decl.isTypename(nameToken)) {
+                isBase = true
+            } else {
+                m = expr.findMember(classTy, name)
+                if m == 0 || types.member(m).*.name != name { tokens.errorAt(nameToken, "no such member") }
+            }
+            if !cursor.is(names.P_LPAREN) && !cursor.is(names.P_LBRACE) { cursor.fail("expected '(' or '{'") }
+            const closer: u32 = if cursor.is(names.P_LPAREN) { names.P_RPAREN } else { names.P_RBRACE }
+            cursor.advance()
+            const args = readArguments(closer)
+            const entry = base.alloc(32)
+            base.putWord(entry, m)
+            base.putWord(entry + 8, args.0)
+            base.putWord(entry + 16, args.1)
+            base.putWord(entry + 24, inits)
+            inits = entry
+            if !cursor.consume(names.P_COMMA) { break }
+        }
+    }
+    var n = nothing(token)
+    if at(c).*.hasVirtual && at(c).*.baseClass == 0 { n = setVptr(self, c, token) }
+    var m = types.at(classTy).*.members
+    while m != 0 {
+        const mt = types.member(m).*.ty
+        const where = memberAddress(self, m, token)
+        var given = inits
+        while given != 0 && base.getWord(given) != m { given = base.getWord(given + 24) }
+        if types.member(m).*.isBase {
+            // The base's initializer is the entry without a member.
+            given = inits
+            while given != 0 && base.getWord(given) != 0 { given = base.getWord(given + 24) }
+            if given != 0 {
+                n = sequence(n, construct(where, mt, base.getWord(given + 8), base.getWord(given + 16), token), token)
+            } else {
+                n = sequence(n, construct(where, mt, 0, 0, token), token)
+            }
+            if at(c).*.hasVirtual { n = sequence(n, setVptr(self, c, token), token) }
+        } else if types.member(m).*.name == 0 && !isClassType(mt) {
+            // The vtable pointer.
+        } else if given != 0 {
+            n = sequence(n, construct(where, mt, base.getWord(given + 8), base.getWord(given + 16), token), token)
+        } else if types.member(m).*.init != 0 {
+            n = sequence(n, construct(where, mt, argumentList(memberInitializer(m), 0), 1, token), token)
+        } else if needsConstruction(mt) {
+            n = sequence(n, construct(where, mt, 0, 0, token), token)
+        }
+        m = types.member(m).*.next
+    }
+    const s = statementOf(flushTemporaries(n, false, token), token)
+    if s == 0 { return 0 }
+    const block = ast.make(ast.BLOCK, token)
+    ast.node(block).*.body = s
+    return block
+}
+
+// A destructor's end: the members with destructors are destroyed, last
+// first, then the base; a block (0 for none).
+pub fn destructorEpilogue(fnObj: usize, token: usize) -> usize {
+    const classTy = ast.obj(fnObj).*.classType
+    const self = thisPointer(token)
+    var count: usize = 0
+    var m = types.at(classTy).*.members
+    while m != 0 {
+        count += 1
+        m = types.member(m).*.next
+    }
+    const list = base.alloc(count * 8 + 8)
+    var index: usize = 0
+    m = types.at(classTy).*.members
+    while m != 0 {
+        base.putWord(list + index * 8, m)
+        index += 1
+        m = types.member(m).*.next
+    }
+    var n = nothing(token)
+    while index > 0 {
+        index -= 1
+        const member = base.getWord(list + index * 8)
+        if hasDestructor(types.member(member).*.ty) {
+            n = sequence(n, destroy(memberAddress(self, member, token), types.member(member).*.ty, true, token), token)
+        }
+    }
+    const s = statementOf(n, token)
+    if s == 0 { return 0 }
+    const block = ast.make(ast.BLOCK, token)
+    ast.node(block).*.body = s
+    return block
+}
+
+// The body of a function with what C++ adds around it: the constructor's
+// prologue, the destructor's epilogue, the destruction of the parameters
+// passed by value.
+pub fn functionBody(fnObj: usize, prologue: usize, body: usize, token: usize) -> usize {
+    var epilogue: usize = 0
+    if ast.obj(fnObj).*.isDestructor { epilogue = destructorEpilogue(fnObj, token) }
+    const cleanups = leaveScope(0, token)
+    if prologue == 0 && epilogue == 0 && cleanups == 0 { return body }
+    const block = ast.make(ast.BLOCK, token)
+    appendStatement(block, prologue)
+    appendStatement(block, body)
+    appendStatement(block, epilogue)
+    appendStatement(block, cleanups)
+    return block
+}
+
+// ---------------------------------------------------------------------------
+// Objects declared
+
+// A local of a class type, after its declarator: its initializer `(args)`,
+// `= value`, `{...}` or none makes it; the statement (0 for none). The
+// local is put on the cleanup stack when it has a destructor.
+pub fn localObject(local: usize, token: usize) -> usize {
+    const ty = ast.obj(local).*.ty
+    const address = addressOf(variable(local, token), token)
+    var init: usize = 0
+    if cursor.consume(names.P_LPAREN) {
+        const args = readArguments(names.P_RPAREN)
+        init = construct(address, ty, args.0, args.1, token)
+    } else if cursor.is(names.P_LBRACE) || (cursor.is(names.P_ASSIGN) && cursor.isToken(cursor.peekNext(), names.P_LBRACE)) {
+        const ignored = cursor.consume(names.P_ASSIGN)
+        if hasConstructors(ty) {
+            cursor.advance()
+            const args = readArguments(names.P_RBRACE)
+            init = construct(address, ty, args.0, args.1, token)
+        } else {
+            // An aggregate: C's initializer, then the members that need
+            // making (the vtable pointer, members with constructors).
+            init = sequence(initializer.localInitializer(local), defaultConstructAggregate(address, ty, token), token)
+        }
+    } else if cursor.consume(names.P_ASSIGN) {
+        init = initializeFrom(local, address, ty, expr.assign(), token)
+    } else {
+        init = construct(address, ty, 0, 0, token)
+    }
+    if hasDestructor(ty) { state.pushCleanup(local) }
+    return statementOf(flushTemporaries(init, false, token), token)
+}
+
+fn hasConstructors(ty: usize) -> bool {
+    const c = info(ty)
+    return c != 0 && at(c).*.constructors != 0
+}
+
+// After a brace initializer of an aggregate: what the bytes given do not
+// cover.
+fn defaultConstructAggregate(address: usize, ty: usize, token: usize) -> usize {
+    if types.kind(ty) == types.ARRAY { return nothing(token) }
+    const c = info(ty)
+    if c == 0 || !at(c).*.hasVirtual { return nothing(token) }
+    return setVptr(address, c, token)
+}
+
+// `T x = value`: the value moved in when it is a temporary of the type
+// (a call's result is written to x directly), copied when an object,
+// converted through a constructor otherwise.
+fn initializeFrom(local: usize, address: usize, ty: usize, value: usize, token: usize) -> usize {
+    typing.addType(value)
+    const vt = ast.typeOf(value)
+    if sameClass(vt, ty) && ast.kindOf(value) == ast.FUNCALL && ast.node(value).*.returnBuffer != 0 {
+        ast.obj(ast.node(value).*.returnBuffer).*.noDestroy = true
+        ast.node(value).*.returnBuffer = local
+        return value
+    }
+    return construct(address, ty, argumentList(value, 0), 1, token)
+}
+
+// A global of a class type, after its declarator: made when the program
+// starts.
+pub fn globalObject(o: usize, token: usize) -> void {
+    const ty = ast.obj(o).*.ty
+    ast.obj(o).*.isDefinition = true
+    ast.obj(o).*.isTentative = false
+    if ast.obj(o).*.initData == 0 {
+        // Zero bytes to start from.
+        const size = types.size(ty)
+        ast.obj(o).*.initData = base.alloc(@intCast(usize, if size > 0 { size } else { 1 }))
+    }
+    const address = addressOf(variable(o, token), token)
+    var init: usize = 0
+    if cursor.consume(names.P_LPAREN) {
+        const args = readArguments(names.P_RPAREN)
+        init = construct(address, ty, args.0, args.1, token)
+    } else if cursor.consume(names.P_LBRACE) {
+        if !hasConstructors(ty) { tokens.errorAt(token, "a brace initializer of a global object is not supported") }
+        const args = readArguments(names.P_RBRACE)
+        init = construct(address, ty, args.0, args.1, token)
+    } else if cursor.consume(names.P_ASSIGN) {
+        if cursor.is(names.P_LBRACE) { tokens.errorAt(token, "a brace initializer of a global object is not supported") }
+        const value = expr.assign()
+        init = construct(address, ty, argumentList(value, 0), 1, token)
+    } else {
+        init = construct(address, ty, 0, 0, token)
+    }
+    init = flushTemporaries(init, false, token)
+    if !isNothing(init) {
+        typing.addType(init)
+        program.addGlobalInit(init)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Member access in expressions
+
+// A name used in a member function that is a member of the class (or
+// its bases): `this->name`, or the member function or static member;
+// 0 when it is no member.
+pub fn memberAccess(nameToken: usize) -> usize {
+    const classTy = state.currentClass()
+    if classTy == 0 { return 0 }
+    const binding = scope.find(names.K_THIS)
+    const name = tokens.name(nameToken)
+    const o = memberOf(classTy, name)
+    if o != 0 {
+        if ast.obj(o).*.isFunction {
+            if binding == 0 || ast.obj(o).*.isStaticMember { return methodNode(o, 0, nameToken) }
+            return methodNode(o, thisPointer(nameToken), nameToken)
+        }
+        ast.obj(o).*.isReferenced = true
+        return expr.variableValue(o, nameToken)
+    }
+    if binding == 0 { return 0 }
+    if expr.findMember(classTy, name) == 0 { return 0 }
+    return expr.structReference(deref(thisPointer(nameToken), nameToken), nameToken)
+}
+
+// `object.name` where name is no data member: the member function (the
+// callee, with the object's address) or the static member; 0 for none.
+pub fn memberReference(object: usize, nameToken: usize) -> usize {
+    typing.addType(object)
+    const o = memberOf(ast.typeOf(object), tokens.name(nameToken))
+    if o == 0 { return 0 }
+    if ast.obj(o).*.isFunction {
+        if ast.obj(o).*.isStaticMember { return methodNode(o, 0, nameToken) }
+        return methodNode(o, addressOf(object, nameToken), nameToken)
+    }
+    ast.obj(o).*.isReferenced = true
+    return expr.variableValue(o, nameToken)
+}
+
+// `p->~T()` or `obj.~T()`, at the `~`: the destructor of the object at
+// `address`, called.
+pub fn explicitDestructor(address: usize, token: usize) -> usize {
+    cursor.expect(names.P_TILDE)
+    const name = cursor.expectIdent()
+    cursor.expect(names.P_LPAREN)
+    cursor.expect(names.P_RPAREN)
+    typing.addType(address)
+    const ty = types.baseOf(ast.typeOf(address))
+    const c = info(ty)
+    if c == 0 || at(c).*.name != tokens.name(name) { tokens.errorAt(name, "not the destructor of this class") }
+    const call = destroy(address, ty, false, token)
+    if isNothing(call) { return typing.cast(number(0, types.intOf(), token), types.voidOf()) }
+    return call
+}
+
+// `obj->name` where obj is a class: `obj.operator->()->name`.
+pub fn arrowOperator(object: usize, token: usize) -> usize {
+    const call = unaryOperator("->", object, false, token)
+    if call == 0 { tokens.errorAt(token, "no operator-> for this class") }
+    return call
+}
+
+// The callee of a virtual call: the function in the object's vtable at
+// the method's slot. `args` holds `this` first; it is evaluated once,
+// into a temporary the callee reads.
+pub fn virtualCallee(method: usize, args: usize, token: usize) -> usize {
+    const self = base.getWord(args)
+    typing.addType(self)
+    const tmp = newTemp(ast.typeOf(self), token)
+    const kept = ast.binary(ast.COMMA, typed(ast.binary(ast.ASSIGN, variable(tmp, token), self, token)), variable(tmp, token), token)
+    ast.node(kept).*.ty = ast.typeOf(self)
+    base.putWord(args, kept)
+    const fnPointer = types.pointerTo(ast.obj(method).*.ty)
+    const table = deref(typing.cast(variable(tmp, token), types.pointerTo(types.pointerTo(fnPointer))), token)
+    const slot = typed(expr.newAdd(table, number(ast.obj(method).*.slot, types.longOf(), token), token))
+    return deref(slot, token)
+}
+
+// ---------------------------------------------------------------------------
+// Operators
+
+fn operatorFunction(op: []const u8) -> u32 {
+    return base.intern(base.join("operator", op))
+}
+
+// The best of the functions in the chains `first` and `second` (either
+// may be 0) for the arguments; 0 when none fits.
+fn bestOf(first: usize, second: usize, args: usize, count: usize) -> usize {
+    var best: usize = 0
+    var bestScore: i64 = -1
+    var chain = first
+    var pass: u32 = 0
+    while pass < 2 {
+        var candidate = chain
+        while candidate != 0 {
+            const score = expr.overloadScore(candidate, args, count)
+            if score > bestScore {
+                best = candidate
+                bestScore = score
+            }
+            candidate = ast.obj(candidate).*.nextOverload
+        }
+        chain = second
+        pass += 1
+    }
+    return best
+}
+
+// The free functions named `name` seen from here and from the
+// namespaces of the class arguments (argument-dependent lookup).
+fn freeFunctions(name: u32, lhs: usize, rhs: usize) -> (usize, usize) {
+    var first: usize = 0
+    const binding = scope.find(name)
+    if binding != 0 && scope.at(binding).*.kind == scope.VARIABLE && ast.obj(scope.at(binding).*.obj).*.isFunction { first = scope.at(binding).*.obj }
+    var second: usize = 0
+    var side: u32 = 0
+    while side < 2 && second == 0 {
+        const operand = if side == 0 { lhs } else { rhs }
+        side += 1
+        if operand == 0 { continue }
+        const c = info(ast.typeOf(operand))
+        if c == 0 { continue }
+        const ns = scope.parentOf(at(c).*.prefix)
+        const found = scope.findQualified(ns, name, false)
+        if found != 0 && scope.at(found).*.kind == scope.VARIABLE && ast.obj(scope.at(found).*.obj).*.isFunction && scope.at(found).*.obj != first {
+            second = scope.at(found).*.obj
+        }
+    }
+    return -> (first, second)
+}
+
+// `lhs op rhs` with a class operand: the call of the operator function
+// (a member of lhs's class, or a free one), 0 when there is none.
+pub fn binaryOperator(op: []const u8, lhs: usize, rhs: usize, token: usize) -> usize {
+    typing.addType(lhs)
+    typing.addType(rhs)
+    const lt = ast.typeOf(lhs)
+    const rt = ast.typeOf(rhs)
+    if !isClassType(lt) && !isClassType(rt) { return 0 }
+    const name = operatorFunction(op)
+    if isClassType(lt) {
+        const m = findMethod(lt, name)
+        if m != 0 {
+            const address = addressOf(lhs, token)
+            const full = argumentList(address, rhs)
+            const chosen = bestOf(m, 0, full, 2)
+            if chosen != 0 { return expr.buildCall(methodNode(m, address, token), argumentList(rhs, 0), 1, token) }
+        }
+    }
+    const free = freeFunctions(name, lhs, rhs)
+    const full = argumentList(lhs, rhs)
+    const chosen = bestOf(free.0, free.1, full, 2)
+    if chosen != 0 { return expr.buildCall(methodNode(chosen, 0, token), full, 2, token) }
+    return 0
+}
+
+// `op operand` or `operand op` (postfix: the int argument 0) with a
+// class operand; 0 when there is no operator function.
+pub fn unaryOperator(op: []const u8, operand: usize, isPostfix: bool, token: usize) -> usize {
+    typing.addType(operand)
+    const ty = ast.typeOf(operand)
+    if !isClassType(ty) { return 0 }
+    const name = operatorFunction(op)
+    const zero = number(0, types.intOf(), token)
+    const m = findMethod(ty, name)
+    if m != 0 {
+        const address = addressOf(operand, token)
+        const full = if isPostfix { argumentList(address, zero) } else { argumentList(address, 0) }
+        const count: usize = if isPostfix { 2 } else { 1 }
+        if bestOf(m, 0, full, count) != 0 {
+            return expr.buildCall(methodNode(m, address, token), argumentList(zero, 0), count - 1, token)
+        }
+    }
+    const free = freeFunctions(name, operand, 0)
+    const full = if isPostfix { argumentList(operand, zero) } else { argumentList(operand, 0) }
+    const count: usize = if isPostfix { 2 } else { 1 }
+    const chosen = bestOf(free.0, free.1, full, count)
+    if chosen != 0 { return expr.buildCall(methodNode(chosen, 0, token), full, count, token) }
+    return 0
+}
+
+// `object(args)`: operator().
+pub fn callOperator(object: usize, args: usize, count: usize, token: usize) -> usize {
+    typing.addType(object)
+    const m = findMethod(ast.typeOf(object), operatorFunction("()"))
+    if m == 0 { tokens.errorAt(token, "the object is not callable") }
+    return expr.buildCall(methodNode(m, addressOf(object, token), token), args, count, token)
+}
+
+// `object[index]`: operator[]; 0 when the class has none.
+pub fn indexOperator(object: usize, index: usize, token: usize) -> usize {
+    typing.addType(object)
+    const m = findMethod(ast.typeOf(object), operatorFunction("[]"))
+    if m == 0 { return 0 }
+    return expr.buildCall(methodNode(m, addressOf(object, token), token), argumentList(index, 0), 1, token)
+}
+
+// `lhs = rhs` with a class lhs: operator=, else the members one by one
+// when one has an operator= or constructors, else 0 (the bytes).
+pub fn assignOperator(lhs: usize, rhs: usize, token: usize) -> usize {
+    typing.addType(lhs)
+    typing.addType(rhs)
+    const ty = ast.typeOf(lhs)
+    if !isClassType(ty) { return 0 }
+    const m = findMethod(ty, operatorFunction("="))
+    if m != 0 {
+        const address = addressOf(lhs, token)
+        if bestOf(m, 0, argumentList(address, rhs), 2) != 0 {
+            return expr.buildCall(methodNode(m, address, token), argumentList(rhs, 0), 1, token)
+        }
+    }
+    if !needsSpecialCopy(ty) { return 0 }
+    if !sameClass(ast.typeOf(rhs), ty) {
+        if !convertible(ast.typeOf(rhs), ty) { tokens.errorAt(token, "no operator= for these operands") }
+        return assignOperator(lhs, convertValue(rhs, ty), token)
+    }
+    // Member by member, the source by its address.
+    const ptr = newTemp(types.pointerTo(ty), token)
+    const target = newTemp(types.pointerTo(ty), token)
+    var n = sequence(typed(ast.binary(ast.ASSIGN, variable(ptr, token), addressOf(rhs, token), token)), typed(ast.binary(ast.ASSIGN, variable(target, token), addressOf(lhs, token), token)), token)
+    var member = types.at(ty).*.members
+    while member != 0 {
+        const to = ast.unary(ast.MEMBER, deref(variable(target, token), token), token)
+        ast.node(to).*.member = member
+        const from = ast.unary(ast.MEMBER, deref(variable(ptr, token), token), token)
+        ast.node(from).*.member = member
+        typing.addType(to)
+        typing.addType(from)
+        var e = assignOperator(to, from, token)
+        if e == 0 { e = typed(ast.binary(ast.ASSIGN, to, from, token)) }
+        n = sequence(n, e, token)
+        member = types.member(member).*.next
+    }
+    const result = deref(variable(target, token), token)
+    const whole = ast.binary(ast.COMMA, n, result, token)
+    ast.node(whole).*.ty = ty
+    return whole
+}
+
+// `lhs op= rhs` with a class operand: operator op=; 0 for none.
+pub fn compoundAssign(op: []const u8, lhs: usize, rhs: usize, token: usize) -> usize {
+    return binaryOperator(op, lhs, rhs, token)
+}
+
+// `operator` and the operator after it, as an identifier token named
+// `operator+` and the like.
+pub fn operatorNameToken() -> usize {
+    const start = cursor.peek()
+    cursor.advance()
+    var text: []const u8 = ""
+    if cursor.consume(names.P_LPAREN) {
+        cursor.expect(names.P_RPAREN)
+        text = "()"
+    } else if cursor.consume(names.P_LBRACKET) {
+        cursor.expect(names.P_RBRACKET)
+        text = "[]"
+    } else if cursor.consume(names.K_NEW) {
+        text = "new"
+        if cursor.consume(names.P_LBRACKET) {
+            cursor.expect(names.P_RBRACKET)
+            text = "new[]"
+        }
+    } else if cursor.consume(names.K_DELETE) {
+        text = "delete"
+        if cursor.consume(names.P_LBRACKET) {
+            cursor.expect(names.P_RBRACKET)
+            text = "delete[]"
+        }
+    } else if tokens.kind(cursor.peek()) == tokens.PUNCT {
+        text = tokens.text(cursor.peek())
+        cursor.advance()
+    } else {
+        cursor.fail("conversion operators are not supported yet")
+    }
+    const t = tokens.copy(start)
+    tokens.at(t).*.kind = tokens.IDENT
+    tokens.at(t).*.name = base.intern(base.join("operator", text))
+    return t
+}
+
+// ---------------------------------------------------------------------------
+// new and delete
+
+// An allocation function the program may not have declared: declared
+// here by its mangled name, with C++ linkage.
+fn runtimeFunction(text: []const u8, symbol: []const u8, parameter: usize, result: usize) -> usize {
+    const fnType = types.functionReturning(result)
+    types.at(fnType).*.params = types.newParam(parameter, 0, 0)
+    const o = ast.newObj(base.intern(text), fnType, 0)
+    const obj = ast.obj(o)
+    obj.*.isFunction = true
+    obj.*.linkName = base.intern(symbol)
+    obj.*.symbol = obj.*.linkName
+    obj.*.isReferenced = true
+    state.addGlobal(o)
+    return o
+}
+
+fn allocator(isArray: bool) -> usize {
+    const voidPointer = types.pointerTo(types.voidOf())
+    if isArray {
+        if newArrayFunction == 0 { newArrayFunction = runtimeFunction("operator new[]", "_Znam", types.ulongOf(), voidPointer) }
+        return newArrayFunction
+    }
+    if newFunction == 0 { newFunction = runtimeFunction("operator new", "_Znwm", types.ulongOf(), voidPointer) }
+    return newFunction
+}
+
+fn deallocator(isArray: bool) -> usize {
+    const voidPointer = types.pointerTo(types.voidOf())
+    if isArray {
+        if deleteArrayFunction == 0 { deleteArrayFunction = runtimeFunction("operator delete[]", "_ZdaPv", voidPointer, types.voidOf()) }
+        return deleteArrayFunction
+    }
+    if deleteFunction == 0 { deleteFunction = runtimeFunction("operator delete", "_ZdlPv", voidPointer, types.voidOf()) }
+    return deleteFunction
+}
+
+fn callRuntime(fnObj: usize, argument: usize, token: usize) -> usize {
+    return expr.buildCall(methodNode(fnObj, 0, token), argumentList(argument, 0), 1, token)
+}
+
+// `new T`, `new T(args)`, `new T{args}`, `new T[n]`, `new (where) T(args)`,
+// after `new`.
+pub fn newExpression(token: usize) -> usize {
+    var placement: usize = 0
+    if cursor.is(names.P_LPAREN) && !decl.isTypename(cursor.peekNext()) {
+        cursor.advance()
+        placement = expr.assign()
+        cursor.expect(names.P_RPAREN)
+    }
+    var ty: usize = 0
+    if cursor.consume(names.P_LPAREN) {
+        ty = decl.typeName()
+        cursor.expect(names.P_RPAREN)
+    } else {
+        ty = decl.pointersOnly(decl.declspec(0))
+    }
+    var count: usize = 0
+    if cursor.consume(names.P_LBRACKET) {
+        count = expr.expression()
+        cursor.expect(names.P_RBRACKET)
+        while cursor.consume(names.P_LBRACKET) {
+            // `new T[n][m]`: elements of array type.
+            const length = expr.expression()
+            typing.addType(length)
+            if ast.kindOf(length) != ast.NUM { tokens.errorAt(token, "the inner dimensions must be constant") }
+            ty = types.arrayOf(ty, ast.node(length).*.value)
+            cursor.expect(names.P_RBRACKET)
+        }
+    }
+    var argList: usize = 0
+    var argCount: usize = 0
+    if cursor.is(names.P_LPAREN) || cursor.is(names.P_LBRACE) {
+        const closer: u32 = if cursor.is(names.P_LPAREN) { names.P_RPAREN } else { names.P_RBRACE }
+        cursor.advance()
+        const read = readArguments(closer)
+        argList = read.0
+        argCount = read.1
+    }
+    const ptrType = types.pointerTo(ty)
+    const result = newTemp(ptrType, token)
+    if placement != 0 {
+        const placed = typed(ast.binary(ast.ASSIGN, variable(result, token), typing.cast(placement, ptrType), token))
+        const made = construct(variable(result, token), ty, argList, argCount, token)
+        const n = ast.binary(ast.COMMA, sequence(placed, made, token), variable(result, token), token)
+        ast.node(n).*.ty = ptrType
+        return n
+    }
+    if count == 0 {
+        const size = number(types.size(ty), types.ulongOf(), token)
+        const allocated = typed(ast.binary(ast.ASSIGN, variable(result, token), typing.cast(callRuntime(allocator(false), size, token), ptrType), token))
+        const made = construct(variable(result, token), ty, argList, argCount, token)
+        const n = ast.binary(ast.COMMA, sequence(allocated, made, token), variable(result, token), token)
+        ast.node(n).*.ty = ptrType
+        return n
+    }
+    // An array: its element count before it when the elements have
+    // destructors (delete[] reads it).
+    if argCount != 0 { tokens.errorAt(token, "an array cannot be constructed from arguments") }
+    const block = ast.make(ast.BLOCK, token)
+    const n = newTemp(types.longOf(), token)
+    appendStatement(block, ast.unary(ast.EXPR_STMT, typed(ast.binary(ast.ASSIGN, variable(n, token), count, token)), token))
+    const elementSize = number(types.size(ty), types.longOf(), token)
+    var bytes = typed(ast.binary(ast.MUL, variable(n, token), elementSize, token))
+    const cookie = hasDestructor(ty)
+    if cookie { bytes = typed(ast.binary(ast.ADD, bytes, number(8, types.longOf(), token), token)) }
+    const charPointer = types.pointerTo(types.charOf())
+    const raw = newTemp(charPointer, token)
+    appendStatement(block, ast.unary(ast.EXPR_STMT, typed(ast.binary(ast.ASSIGN, variable(raw, token), typing.cast(callRuntime(allocator(true), typing.cast(bytes, types.ulongOf()), token), charPointer), token)), token))
+    if cookie {
+        const header = deref(typing.cast(variable(raw, token), types.pointerTo(types.longOf())), token)
+        appendStatement(block, ast.unary(ast.EXPR_STMT, typed(ast.binary(ast.ASSIGN, header, variable(n, token), token)), token))
+        appendStatement(block, ast.unary(ast.EXPR_STMT, typed(ast.binary(ast.ASSIGN, variable(result, token), typing.cast(expr.newAdd(variable(raw, token), number(8, types.longOf(), token), token), ptrType), token)), token))
+    } else {
+        appendStatement(block, ast.unary(ast.EXPR_STMT, typed(ast.binary(ast.ASSIGN, variable(result, token), typing.cast(variable(raw, token), ptrType), token)), token))
+    }
+    if needsConstruction(ty) {
+        const loop = countedLoop(variable(n, token), token)
+        ast.node(loop.0).*.then = ast.unary(ast.EXPR_STMT, construct(typed(expr.newAdd(variable(result, token), variable(loop.1, token), token)), ty, 0, 0, token), token)
+        appendStatement(block, loop.0)
+    }
+    appendStatement(block, ast.unary(ast.EXPR_STMT, variable(result, token), token))
+    const e = ast.make(ast.STMT_EXPR, token)
+    ast.node(e).*.body = ast.node(block).*.body
+    ast.node(e).*.ty = ptrType
+    return e
+}
+
+// `delete p`, `delete[] p`, after `delete`.
+pub fn deleteExpression(token: usize) -> usize {
+    var isArray = false
+    if cursor.consume(names.P_LBRACKET) {
+        cursor.expect(names.P_RBRACKET)
+        isArray = true
+    }
+    const p = expr.castExpression()
+    typing.addType(p)
+    const pt = ast.typeOf(p)
+    if types.kind(pt) != types.PTR { tokens.errorAt(token, "delete of a non-pointer") }
+    const ty = types.baseOf(pt)
+    const voidPointer = types.pointerTo(types.voidOf())
+    const tmp = newTemp(pt, token)
+    const block = ast.make(ast.BLOCK, token)
+    appendStatement(block, ast.unary(ast.EXPR_STMT, typed(ast.binary(ast.ASSIGN, variable(tmp, token), p, token)), token))
+    const guard = ast.make(ast.IF, token)
+    ast.node(guard).*.cond = variable(tmp, token)
+    const then = ast.make(ast.BLOCK, token)
+    if !isArray {
+        if hasDestructor(ty) { appendStatement(then, ast.unary(ast.EXPR_STMT, destroy(variable(tmp, token), ty, false, token), token)) }
+        appendStatement(then, ast.unary(ast.EXPR_STMT, callRuntime(deallocator(false), typing.cast(variable(tmp, token), voidPointer), token), token))
+    } else if hasDestructor(ty) {
+        const charPointer = types.pointerTo(types.charOf())
+        const start = typed(expr.newSub(typing.cast(variable(tmp, token), charPointer), number(8, types.longOf(), token), token))
+        const count = deref(typing.cast(start, types.pointerTo(types.longOf())), token)
+        const loop = countedLoopDown(count, token)
+        ast.node(loop.0).*.then = ast.unary(ast.EXPR_STMT, destroy(typed(expr.newAdd(variable(tmp, token), lastIndex(loop.1, token), token)), ty, true, token), token)
+        appendStatement(then, loop.0)
+        const again = typed(expr.newSub(typing.cast(variable(tmp, token), charPointer), number(8, types.longOf(), token), token))
+        appendStatement(then, ast.unary(ast.EXPR_STMT, callRuntime(deallocator(true), typing.cast(again, voidPointer), token), token))
+    } else {
+        appendStatement(then, ast.unary(ast.EXPR_STMT, callRuntime(deallocator(true), typing.cast(variable(tmp, token), voidPointer), token), token))
+    }
+    ast.node(guard).*.then = then
+    appendStatement(block, guard)
+    const e = ast.make(ast.STMT_EXPR, token)
+    ast.node(e).*.body = ast.node(block).*.body
+    ast.node(e).*.ty = types.voidOf()
+    return e
+}

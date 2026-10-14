@@ -121,10 +121,16 @@ mlxlibc with its own libm. The gaps left are listed in
 
 ## Phase 6: C++ and the drivers
 
-GPU drivers (Mesa) and some desktop programs are C++. Either mlx-cc
-grows a C++ front end, or we write what we need in Mlx: a Vulkan driver
-for one GPU family in Mlx (`docs/VULKAN.md` has the first steps) takes
-Mesa out of the picture for that hardware.
+GPU drivers (Mesa) and some desktop programs are C++. mlx-cc grows a
+C++ front end (`projects/cc/README.md`, "C++"): namespaces, references,
+overloading, classes with constructors, destructors, operators, new and
+delete, single inheritance and virtual functions are there (steps 1 and
+2), with tests run against g++ (`tools/check_cpp.sh`). Next: a C++
+standard library of our own (`projects/libcpp`: `<iostream>`,
+`std::string`, then containers), templates, and what Mesa needs. The
+other way stays open: a Vulkan driver for one GPU family in Mlx
+(`docs/VULKAN.md` has the first steps) takes Mesa out of the picture
+for that hardware.
 
 ## Phase 7: boot and bootstrap
 

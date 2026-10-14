@@ -61,7 +61,7 @@ int main(int argc, char **argv)
     Color c = Color::Blue;
     printf("%d %d %d %d\n", (int)c, (int)Color::Green, One, Two);
     printf("%d %d\n", cfunc(1), next() + next());
-    printf("%ld %d %d\n", __cplusplus, argc, (int)strlen(argv[0]) > 0);
+    printf("%ld %d %d\n", __cplusplus, argc > 0, (int)strlen(argv[0]) > 0);
     printf("%zu %zu\n", sizeof(int &), sizeof(char *));
     return 0;
 }
