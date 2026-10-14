@@ -650,29 +650,35 @@ shapes directly (and asserts the fix), and `tests/170_standard_fmt_any_struct_ru
 crashed (`SIGSEGV`) before the fix, via `std.io.printFmt`'s single-argument
 recursive `anytype`-tuple lookup.
 
-**Known gap: `uN`/`iN` wider than 64 bits are not actually multi-word.**
-`operators.xml` normatively allows `uN`/`iN` up to 4096 bits (see
-`spec/00-language/operators.xml`'s `ArbitraryWidth`), but nothing in the
-current pipeline represents or computes on a width above the native 64-bit
-register: `ir/lower.mlx`'s `typeWordCount` — the function that decides how
-many stack-slot components a value needs — returns `1` for every integer
-type, `u128`/`u256`/`u4096` included, only special-casing `slice`,
-`error_union`, and `tuple`. `backend/x86_64/codegen/arithmetic.mlx`
-matches: every arithmetic opcode (`emitSimple`/`emitNumeric` for
-add/sub/mul/bitwise, `emitDivision`, `emitShift`) emits exactly one native
-64-bit instruction, with no width-based branching or carry/borrow chain
-across additional words at all. In effect a `uN`/`iN` value with N > 64 is
-silently truncated to its low 64 bits everywhere at runtime — comptime
-constant folding (`sema/comptime/`) is unaffected and does compute the
-full-width value, which is why a *literal* wide-integer expression can
-look correct while the identical computation over runtime values (e.g.
-behind a function call the optimizer can't fold through) silently loses
-everything above bit 63. This is a real, reproducible gap (confirmed with
-runtime — non-comptime-folded — `u128` left-shift-by-64 and division, both
-wrong), not a small bug: closing it needs multi-word type layout, N/64-word
-LIR lowering with real carry propagation for add/sub, a genuine
-multiplication algorithm, long division, and cross-word shifts, for every
-arithmetic operator. No fix or regression test exists for this yet.
+**Fixed (to 128 bits): `uN`/`iN` wider than 64 bits as two words.**
+`operators.xml` allows `uN`/`iN` up to 4096 bits (its `ArbitraryWidth`),
+and until this fix nothing in the pipeline represented a width above the
+64-bit register: `typeWordCount` returned 1 for every integer type and
+every arithmetic opcode emitted one native instruction, so a runtime
+`u128` value silently lost everything above bit 63 (a `u128` left shift by
+64, a product above 2^64, a division: all wrong, while a literal
+expression folded at comptime looked right). Now `ir/lower.mlx`'s
+`typeWordCount` (and the backends' `wordsOf`) give an integer of N bits
+(N + 63) / 64 words, so a `u128` flows through locals, parameters,
+results, struct fields, arrays and pointers like a two-word tuple (the low
+word first), and `ir/lowering/wide.mlx` expands every operation on one
+into word-sized LIR before the backends see it: add and sub with the
+carry from an unsigned comparison, mul with the high half of the
+low-word product from 32-bit halves, the shifts across the words chosen
+by masks (no branches), the comparisons from the high words with the low
+ones at a tie, `/` and `%` bit by bit in a loop (signed ones through the
+magnitudes, truncated toward zero as C does), `-`, `~` and `!`, and the
+conversions: a one-word value widens by the sign of its type (an untyped
+literal by the target's), `@intCast` to a narrower integer takes the low
+word and makes it canonical, a width under 128 (`u100`) keeps its top
+word canonical after every operation. `tests/341_wide_integers_runtime.mlx`
+(run by `tests/run_wide_integers.sh`) checks all of it. Still open: widths
+above 128 bits (three words and more: they flow as words but every
+operator on them is reported as unsupported), the saturating (`+|`) and
+the combined shift operators on wide values, `match` on a wide value,
+`@floatFromInt`/`@intFromFloat` with one, constants wider than 64 bits
+(sema's comptime integers are one word), and overflow traps in
+`-O0`-safe builds (wide arithmetic wraps).
 
 `emitStartStub` hand-encodes the process entry point (`_start`) directly as
 raw opcode bytes (`encoder.emit1(state.*.enc, 0x48) ...`) — reading argc off

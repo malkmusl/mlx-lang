@@ -56,11 +56,19 @@ enumerators, with their type), `enum E : unsigned char` with a fixed
 underlying type, empty initializers `{}`, unnamed parameters in
 definitions, labels before declarations and at the end of a block,
 `#elifdef` and `#elifndef`, `nullptr_t` and `unreachable()` in
-`stddef.h`, `_BitInt(N)` for N up to 64 (the smallest standard size that
-holds it, canonical to N bits in registers, no promotion, `wb` and `uwb`
-constants, `BITINT_MAXWIDTH`), `#embed` with `limit`, `prefix`, `suffix`
-and `if_empty` and `__has_embed`. Not there: `_BitInt` wider than 64
-bits, `constexpr` objects of other types than integers as constants.
+`stddef.h`, `_BitInt(N)` for N up to `BITINT_MAXWIDTH` (4096: up to 64
+the smallest standard size that holds it, canonical to N bits in
+registers; above 64 limbs of 64 bits in memory, aligned to 8 as the
+x86_64 ABI lays them out, computed through a C runtime,
+`include/__mlxcc_wide.c`, that is compiled into every program using
+such a type: every operator, the conversions to and from the other
+integers and the floating types, `wb` and `uwb` constants of any width,
+wide parameters and results, in registers up to 128 bits and in memory
+beyond, globals with constant or computed initializers; no promotion),
+`#embed` with `limit`, `prefix`, `suffix` and `if_empty` and
+`__has_embed`. Not there: `switch` on a `_BitInt` wider than 64 bits
+(its low 64 bits decide), `constexpr` objects of other types than
+integers as constants.
 
 ## long double
 
@@ -142,8 +150,9 @@ static locals, tentative definitions, several files per program.
   (roadmap phase 1 step 3).
 - On mlxlibc, `printf("%Lf")` prints a long double exactly within
   double's exponent range and as the nearest double (infinity, zero)
-  beyond it, and `strtold` reads with `strtod`'s precision; the `sinl`
-  family is glibc's only.
+  beyond it; `strtold` reads the full 64-bit significand and the `sinl`
+  family is x87 code of mlxlibc's own (`tests/ldouble_math.c` compares
+  both C libraries with gcc's output).
 - No variable-length arrays, `_Atomic` operations, `_Thread_local`
   (declared, but a plain global), `_Complex`, inline `asm`, computed
   `goto`.

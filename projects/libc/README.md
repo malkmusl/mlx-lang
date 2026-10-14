@@ -18,7 +18,7 @@ gcc program.c -L mlx-out/libc -lmlxc -Wl,-rpath,$PWD/mlx-out/libc  # next to gli
 | Library | What it is | Built from |
 | --- | --- | --- |
 | `libmlxc.so.1` (`libmlxc.so`) | 830 exported C names: memory, strings, ctype, stdlib, errno, environment, process, time, the system call wrappers, signals, stdio (glibc's FILE layout, `popen`/`pclose`), the printf and scanf families, pthread with thread-local storage, getopt, dirent, err/warn/error, syslog, locale stubs, dlfcn; and the dynamic loader behind `__mlx_start` | `libc.mlx` |
-| `libm.so.6` (`libm.so`) | the math functions of `<math.h>`: `std.math`'s sine, cosine (huge arguments reduced with the bits of 2/pi), e^x, logarithms and cube root, with the arc tangent, the inverse and hyperbolic functions, powers (whole exponents to an ulp in double-double arithmetic), `fmod` and `remainder` exact, the rounding functions, `frexp`/`ldexp`, `hypot`, `nextafter`, `erf`/`erfc` (a series in double-double, a continued fraction), `tgamma`/`lgamma` (Lanczos and a rising product), the classification, and the `f` variants; `tools/libm_check.py` compares it with glibc's libm call by call. Not yet: the Bessel functions, errno, the `l` (long double) variants | `libm.mlx` |
+| `libm.so.6` (`libm.so`) | the math functions of `<math.h>`: `std.math`'s sine, cosine (huge arguments reduced with the bits of 2/pi), e^x, logarithms and cube root, with the arc tangent, the inverse and hyperbolic functions, powers (whole exponents to an ulp in double-double arithmetic), `fmod` and `remainder` exact, the rounding functions, `frexp`/`ldexp`, `hypot`, `nextafter`, `erf`/`erfc` (a series in double-double, a continued fraction), `tgamma`/`lgamma` (Lanczos and a rising product), the classification, and the `f` variants; `tools/libm_check.py` compares it with glibc's libm call by call; the 41 `l` (long double) variants (`sinl` to `lgammal`) are x87 code of their own, `tools/libc/x87_long.s`, generated into `x87_long.mlx` by `tools/libc/gen_x87.py` and bound by the loader from a page of its own. Not yet: the Bessel functions, errno | `libm.mlx`, `x87_long.mlx` |
 
 It is a `--plugin` shared object on a stack arena with no C library under
 it, with an entry point and an initializer (`mlx4 --plugin --stack-arena
@@ -111,7 +111,9 @@ interpreter, so the kernel enters it directly. It runs programs three ways:
   code assumes; `__tls_get_addr`; a thread that started before a dlopen
   gets the new module's image on first use), RELRO, constructors and
   destructors, `setjmp`/`longjmp` and `strtold` (which returns on the x87
-  stack: it loads what `strtod` read) as machine code in a page of their own,
+  stack the 64-bit significand `stdlib.mlx` reads with `extended.mlx`,
+  decimal and hexadecimal, rounded as glibc rounds) as machine code in a
+  page of their own, the long double functions of libm in another,
   and the names glibc gives twice (`__environ`, `__progname`, `error`).
 - **`start.mlx`**: `__mlx_start`, the entry: the main thread's control
   block and thread pointer (the stack protector's guard at `fs:0x28`), the
