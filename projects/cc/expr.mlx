@@ -774,18 +774,255 @@ fn functionCall(callee: usize, token: usize) -> usize {
     // The arguments, read first.
     const MAX_ARGS: usize = 256
     const given = base.alloc(MAX_ARGS * 8)
-    var count: usize = 0
-    var first = true
-    while !cursor.consume(names.P_RPAREN) {
-        if !first { cursor.expect(names.P_COMMA) }
-        first = false
-        if count >= MAX_ARGS { cursor.fail("too many arguments") }
-        const argument = assign()
-        typing.addType(argument)
-        base.putWord(given + count * 8, argument)
-        count += 1
-    }
+    const count = argumentList(names.P_RPAREN, given, MAX_ARGS)
     return buildCall(callee, given, count, token)
+}
+
+// Whether the parenthesis at the cursor holds a fold expression: a
+// `...` of its own level (`(args + ...)`, `(... && f(args))`,
+// `(x + ... + args)`), not a sizeof's.
+fn foldAhead() -> bool {
+    var t = cursor.peekNext()
+    var level: i64 = 0
+    var previous: usize = 0
+    while !tokens.isEof(t) {
+        if tokens.is(t, names.P_LPAREN) || tokens.is(t, names.P_LBRACKET) || tokens.is(t, names.P_LBRACE) {
+            level += 1
+        } else if tokens.is(t, names.P_RPAREN) || tokens.is(t, names.P_RBRACKET) || tokens.is(t, names.P_RBRACE) {
+            if level == 0 { return false }
+            level -= 1
+        } else if tokens.is(t, names.P_ELLIPSIS) && level == 0 {
+            return previous == 0 || !tokens.is(previous, names.K_SIZEOF)
+        } else if tokens.is(t, names.P_SEMI) {
+            return false
+        }
+        previous = t
+        t = tokens.next(t)
+    }
+    return false
+}
+
+// A fold expression at its `(`: the pack's elements, read once each
+// (as argumentList does), joined by the operator from the left
+// (`(... op E)`, `(I op ... op E)`) or the right (`(E op ...)`,
+// `(E op ... op I)`).
+fn foldExpression(open: usize) -> usize {
+    cursor.advance()
+    const first = cursor.peek()
+    // The `...`, the operator before it and the token after it.
+    var ellipsis: usize = 0
+    var before: usize = 0
+    var t = first
+    var level: i64 = 0
+    var previous: usize = 0
+    while ellipsis == 0 {
+        if tokens.is(t, names.P_LPAREN) || tokens.is(t, names.P_LBRACKET) || tokens.is(t, names.P_LBRACE) { level += 1 }
+        if tokens.is(t, names.P_RPAREN) || tokens.is(t, names.P_RBRACKET) || tokens.is(t, names.P_RBRACE) { level -= 1 }
+        if tokens.is(t, names.P_ELLIPSIS) && level == 0 {
+            ellipsis = t
+            before = previous
+        }
+        previous = t
+        t = tokens.next(t)
+    }
+    const after = tokens.next(ellipsis)
+    const elements = base.alloc(256 * 8)
+    var count: usize = 0
+    var result: usize = 0
+    var op: usize = 0
+    if before == 0 {
+        // `(... op E)`: E the pack, folded from the left.
+        op = after
+        cursor.restore(tokens.next(op))
+        count = packElements(elements, 256)
+        cursor.expect(names.P_RPAREN)
+        if count == 0 { return emptyFold(op) }
+        result = base.getWord(elements)
+        var index: usize = 1
+        while index < count {
+            result = foldStep(op, result, base.getWord(elements + index * 8))
+            index += 1
+        }
+        return result
+    }
+    op = before
+    // The left side, up to the operator (made to end the expression).
+    const savedName = tokens.at(op).*.name
+    tokens.at(op).*.name = names.P_RPAREN
+    cursor.restore(first)
+    const seen = scope.packSeen
+    scope.packSeen = 0
+    const leftStart = cursor.save()
+    var left = assign()
+    const leftIsPack = scope.packSeen != 0
+    if leftIsPack {
+        cursor.restore(leftStart)
+        count = packElements(elements, 256)
+    }
+    scope.packSeen = seen
+    cursor.expect(names.P_RPAREN)
+    tokens.at(op).*.name = savedName
+    if tokens.is(after, names.P_RPAREN) {
+        // `(E op ...)`: folded from the right.
+        if !leftIsPack { tokens.errorAt(first, "a fold needs a parameter pack") }
+        cursor.restore(tokens.next(after))
+        if count == 0 { return emptyFold(op) }
+        result = base.getWord(elements + (count - 1) * 8)
+        var index = count - 1
+        while index > 0 {
+            index -= 1
+            result = foldStep(op, base.getWord(elements + index * 8), result)
+        }
+        return result
+    }
+    if tokens.name(after) != savedName { tokens.errorAt(after, "the fold's operators differ") }
+    cursor.restore(tokens.next(after))
+    if leftIsPack {
+        // `(E op ... op I)`: I then the elements, from the right.
+        result = assign()
+        cursor.expect(names.P_RPAREN)
+        var index = count
+        while index > 0 {
+            index -= 1
+            result = foldStep(op, base.getWord(elements + index * 8), result)
+        }
+        return result
+    }
+    // `(I op ... op E)`: I then the elements, from the left.
+    result = left
+    count = packElements(elements, 256)
+    cursor.expect(names.P_RPAREN)
+    var index: usize = 0
+    while index < count {
+        result = foldStep(op, result, base.getWord(elements + index * 8))
+        index += 1
+    }
+    return result
+}
+
+// The elements of the pack expression at the cursor (ending at `)`,
+// left there), into `elements`: their number.
+fn packElements(elements: usize, most: usize) -> usize {
+    const start = cursor.save()
+    const seen = scope.packSeen
+    scope.packSeen = 0
+    const temporaries = state.takeTemporaries()
+    state.setTemporaries(temporaries)
+    var node = assign()
+    const holder = scope.packSeen
+    scope.packSeen = seen
+    if holder == 0 { tokens.errorAt(start, "a fold needs a parameter pack") }
+    const n = types.packCount(holder)
+    if n == 0 {
+        state.setTemporaries(temporaries)
+        return 0
+    }
+    typing.addType(node)
+    base.putWord(elements, node)
+    var index: i64 = 1
+    while index < n {
+        if @intCast(usize, index) >= most { cursor.fail("too many elements in a fold") }
+        scope.packIndex = index
+        cursor.restore(start)
+        node = assign()
+        scope.packIndex = -1
+        typing.addType(node)
+        base.putWord(elements + @intCast(usize, index) * 8, node)
+        index += 1
+    }
+    return @intCast(usize, n)
+}
+
+// A fold of no elements: true for &&, false for ||, nothing for `,`.
+fn emptyFold(op: usize) -> usize {
+    if tokens.is(op, names.P_ANDAND) || tokens.is(op, names.P_OROR) {
+        const n = ast.number(if tokens.is(op, names.P_ANDAND) { 1 } else { 0 }, op)
+        ast.node(n).*.ty = types.boolOf()
+        return n
+    }
+    if tokens.is(op, names.P_COMMA) { return typing.cast(ast.number(0, op), types.voidOf()) }
+    tokens.errorAt(op, "a fold of nothing needs &&, || or ,")
+    return 0
+}
+
+// `lhs op rhs` for the fold's operator token.
+fn foldStep(op: usize, lhs: usize, rhs: usize) -> usize {
+    const name = tokens.name(op)
+    if name == names.P_PLUS { return added(true, lhs, rhs, op) }
+    if name == names.P_MINUS { return added(false, lhs, rhs, op) }
+    if name == names.P_STAR { return binaryNode(ast.MUL, "*", lhs, rhs, op) }
+    if name == names.P_SLASH { return binaryNode(ast.DIV, "/", lhs, rhs, op) }
+    if name == names.P_PERCENT { return binaryNode(ast.MOD, "%", lhs, rhs, op) }
+    if name == names.P_AMP { return binaryNode(ast.BITAND, "&", lhs, rhs, op) }
+    if name == names.P_PIPE { return binaryNode(ast.BITOR, "|", lhs, rhs, op) }
+    if name == names.P_CARET { return binaryNode(ast.BITXOR, "^", lhs, rhs, op) }
+    if name == names.P_SHL { return binaryNode(ast.SHL, "<<", lhs, rhs, op) }
+    if name == names.P_SHR { return binaryNode(ast.SHR, ">>", lhs, rhs, op) }
+    if name == names.P_ANDAND { return binaryNode(ast.LOGAND, "&&", lhs, rhs, op) }
+    if name == names.P_OROR { return binaryNode(ast.LOGOR, "||", lhs, rhs, op) }
+    if name == names.P_EQ { return binaryNode(ast.EQ, "==", lhs, rhs, op) }
+    if name == names.P_NE { return binaryNode(ast.NE, "!=", lhs, rhs, op) }
+    if name == names.P_LT { return binaryNode(ast.LT, "<", lhs, rhs, op) }
+    if name == names.P_LE { return binaryNode(ast.LE, "<=", lhs, rhs, op) }
+    if name == names.P_GT { return swapped(ast.LT, ">", lhs, rhs, op) }
+    if name == names.P_GE { return swapped(ast.LE, ">=", lhs, rhs, op) }
+    if name == names.P_COMMA { return ast.binary(ast.COMMA, lhs, rhs, op) }
+    tokens.errorAt(op, "this operator does not fold")
+    return 0
+}
+
+// The arguments up to `closer` (consumed) into `given`: their number.
+// C++: an argument followed by `...` is a pack expansion, read once per
+// element of the pack it names (`f(args...)`, `g(h(args))...`): the
+// first reading notes the pack (scope.packSeen) and stands for its
+// first element, the others are read again with scope.packIndex set.
+pub fn argumentList(closer: u32, given: usize, maxArgs: usize) -> usize {
+    var count: usize = 0
+    while !cursor.consume(closer) {
+        if count > 0 { cursor.expect(names.P_COMMA) }
+        if count >= maxArgs { cursor.fail("too many arguments") }
+        const start = cursor.save()
+        const outerSeen = scope.packSeen
+        scope.packSeen = 0
+        const temporaries = state.takeTemporaries()
+        state.setTemporaries(temporaries)
+        var argument = assign()
+        if standard.cpp && cursor.is(names.P_ELLIPSIS) && scope.packIndex < 0 {
+            const holder = scope.packSeen
+            if holder == 0 { cursor.fail("nothing to expand with ...") }
+            const n = types.packCount(holder)
+            if n == 0 {
+                // Nothing: the reading is dropped.
+                state.setTemporaries(temporaries)
+            } else {
+                typing.addType(argument)
+                base.putWord(given + count * 8, argument)
+                count += 1
+                var index: i64 = 1
+                while index < n {
+                    if count >= maxArgs { cursor.fail("too many arguments") }
+                    scope.packIndex = index
+                    cursor.restore(start)
+                    argument = assign()
+                    scope.packIndex = -1
+                    typing.addType(argument)
+                    base.putWord(given + count * 8, argument)
+                    count += 1
+                    index += 1
+                }
+            }
+            cursor.expect(names.P_ELLIPSIS)
+            scope.packSeen = outerSeen
+        } else {
+            // A pack named here may be expanded by an enclosing
+            // expression (`g(f(args))...`): noted on.
+            typing.addType(argument)
+            base.putWord(given + count * 8, argument)
+            count += 1
+            if scope.packSeen == 0 { scope.packSeen = outerSeen }
+        }
+    }
+    return count
 }
 
 // The call of `callee` with the `count` arguments in `given`. In C++
@@ -977,6 +1214,7 @@ fn primary() -> usize {
         cursor.expect(names.P_RPAREN)
         return n
     }
+    if standard.cpp && cursor.is(names.P_LPAREN) && foldAhead() { return foldExpression(token) }
     if cursor.consume(names.P_LPAREN) {
         const outer = inTemplateArguments
         inTemplateArguments = false
@@ -986,6 +1224,15 @@ fn primary() -> usize {
         return n
     }
     if cursor.consume(names.K_SIZEOF) {
+        if standard.cpp && cursor.consume(names.P_ELLIPSIS) {
+            // `sizeof...(Args)`: the number of elements of the pack.
+            cursor.expect(names.P_LPAREN)
+            const packName = cursor.expectIdent()
+            cursor.expect(names.P_RPAREN)
+            const binding = scope.find(tokens.name(packName))
+            if binding == 0 || scope.at(binding).*.kind != scope.PACK { tokens.errorAt(packName, "not a parameter pack") }
+            return ulongNumber(types.packCount(scope.at(binding).*.obj), token)
+        }
         if cursor.is(names.P_LPAREN) && decl.isTypename(cursor.peekNext()) {
             const start = cursor.save()
             cursor.advance()
@@ -1135,6 +1382,21 @@ fn primary() -> usize {
                 return variableValue(instance, nameToken)
             }
             return cpp.callableFor(binding, nameToken)
+        }
+        if binding != 0 && scope.at(binding).*.kind == scope.PACK && scope.at(binding).*.ty == 0 {
+            // A pack of parameters (`args`): the element being expanded,
+            // or the first (noted, for the expansion to come).
+            const holder = scope.at(binding).*.obj
+            var index = scope.packIndex
+            if index < 0 {
+                scope.packSeen = holder
+                index = 0
+            }
+            if types.packCount(holder) == 0 { return ast.number(0, token) }
+            const element = types.packVariableAt(holder, index)
+            if element == 0 { tokens.errorAt(nameToken, "the pack has no such element") }
+            ast.obj(element).*.isReferenced = true
+            return variableValue(element, nameToken)
         }
         if binding != 0 {
             const b = scope.at(binding)

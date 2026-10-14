@@ -250,9 +250,19 @@ defined, alias templates (`template <class T> using Vec =
 vector<T>;`), class templates declared only (an alias or a pointer to
 an instance before the definition completes it), template parameters
 without names or typed by an earlier one (`template <typename Key,
-typename, Key last>`), parameter packs in declarations
-(`template <class... Args> R f(Args &&...);`: declared only, not yet
-callable), inline namespaces, `defined` made by a macro in `#if`.
+typename, Key last>`), inline namespaces, `defined` made by a macro
+in `#if`. Variadic templates: parameter packs of function and class
+templates (`template <class... Args> int count(Args... args)`,
+`Tuple<Ts...>`), `sizeof...`, a pack expanded in a call's arguments
+(`f(args...)`, `g(h(args))...`, `forward<Args>(args)...`), in an
+initializer list (`{ args... }`, `{ 0, (f(args), 0)... }`) and in
+template arguments (`Pair<Args...>`), a partial specialization taking
+the rest of the arguments (`Tuple<T, Rest...>`), fold expressions
+(`(args + ...)`, `(... && f(args))`, `(x + ... + args)`, empty ones
+for `&&`, `||` and `,`). An expansion is read once per element of
+the pack, the pack's names standing for that element each time; an
+instance's pack parameter becomes a parameter per element (`args#0`,
+`args#1`), known together as the pack.
 `tests/cpp/interp.cpp`
 is a small interpreter (lexer, recursive descent parser, virtual nodes,
 maps of variables and functions) that runs as g++ builds it;
@@ -266,7 +276,8 @@ runs them (`tools/check_cpp.sh`, on glibc and on mlxlibc).
 C's `getline` and `std::getline` both apply where `using namespace std`
 is in force: the functions a using-directive brings in join the
 overloads of a name. Not there yet:
-variadic templates (packs are parsed in declarations only),
+a pack of a base list (`struct X : Bases...`), a pack in a lambda's
+captures,
 generic lambdas (`auto` parameters), a lambda converting to a function
 pointer, init-captures, alias templates (`template <class T> using`),
 dependent qualified names in a function template's signature, rvalue

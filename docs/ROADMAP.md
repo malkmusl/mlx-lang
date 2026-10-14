@@ -133,12 +133,13 @@ in by itself), and templates with `<vector>`, `<map>`, `<set>`,
 specializations, member templates, const as part of a type, `<memory>`,
 and a small interpreter (`tests/cpp/interp.cpp`) as the larger test;
 tinyxml2 builds and passes its 528 tests; partial specializations,
-alias templates and the declaration forms of `wtf/Forward.h` are read.
+alias templates, variadic templates with fold expressions, and the
+declaration forms of `wtf/Forward.h` are read.
 The target is WPEWebKit
 (a browser engine of our own is out of reach; a C and C++ compiler of
 our own over mlxlibc and mlxlibcpp keeps the whole stack ours), so the
-next steps are what its base library WTF needs: variadic templates,
-partial specializations, `constexpr` functions, rvalue references and
+next steps are what its base library WTF needs: `constexpr`
+functions, rvalue references and
 move semantics, `<type_traits>`, `if constexpr`, `static_assert`
 everywhere, atomics and threads; then what Mesa needs. The other way stays open: a Vulkan
 driver for one GPU family in Mlx (`docs/VULKAN.md` has the first steps)
