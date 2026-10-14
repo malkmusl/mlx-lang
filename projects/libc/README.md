@@ -17,7 +17,8 @@ gcc program.c -L mlx-out/libc -lmlxc -Wl,-rpath,$PWD/mlx-out/libc  # next to gli
 
 | Library | What it is | Built from |
 | --- | --- | --- |
-| `libmlxc.so.1` (`libmlxc.so`) | 830 exported C names: memory, strings, ctype, stdlib, errno, environment, process, time, the system call wrappers, signals, stdio (glibc's FILE layout), the printf and scanf families, pthread with thread-local storage, getopt, dirent, err/warn/error, syslog, locale stubs, dlfcn; and the dynamic loader behind `__mlx_start` | `libc.mlx` |
+| `libmlxc.so.1` (`libmlxc.so`) | 830 exported C names: memory, strings, ctype, stdlib, errno, environment, process, time, the system call wrappers, signals, stdio (glibc's FILE layout, `popen`/`pclose`), the printf and scanf families, pthread with thread-local storage, getopt, dirent, err/warn/error, syslog, locale stubs, dlfcn; and the dynamic loader behind `__mlx_start` | `libc.mlx` |
+| `libm.so.6` (`libm.so`) | the math functions of `<math.h>`: `std.math`'s sine, cosine, e^x, logarithms and cube root, with the arc tangent, the inverse and hyperbolic functions, powers (whole exponents to an ulp in double-double arithmetic), `fmod` and `remainder` exact, the rounding functions, `frexp`/`ldexp`, `hypot`, `nextafter`, the classification, and the `f` variants; `tools/libm_check.py` compares it with glibc's libm call by call. Not yet: `erf`, `lgamma`, `tgamma`, errno, the reduction of huge arguments to `sin` and `cos` | `libm.mlx` |
 
 It is a `--plugin` shared object on a stack arena with no C library under
 it, with an entry point and an initializer (`mlx4 --plugin --stack-arena
@@ -77,7 +78,8 @@ interpreter, so the kernel enters it directly. It runs programs three ways:
   addresses; `fopen` .. `fclose`, `fgets`, `getline`, `fread`/`fwrite`,
   `fseek`/`ftell`, `ungetc` into the buffer, the printf and scanf families
   with their `__isoc99_`, `__isoc23_` and `_chk` names, `perror`,
-  `tmpfile`, glibc's `stdio_ext.h` (`__fpending`, `__freading`, ...).
+  `tmpfile`, `popen`/`pclose` (`/bin/sh -c`, the child waited for by its
+  stream), glibc's `stdio_ext.h` (`__fpending`, `__freading`, ...).
 - **`unistd.mlx`**, **`misc.mlx`**: the system call wrappers (`open`,
   `read`, `write`, `stat`, `mmap`, `ioctl`, `poll`, `epoll`, sockets,
   `fork`/`exec`/`wait`, ...), `getopt`/`getopt_long`, `dirent`, `uname`,

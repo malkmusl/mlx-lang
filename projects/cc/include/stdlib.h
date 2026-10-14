@@ -18,7 +18,10 @@ int posix_memalign(void **, size_t, size_t);
 _Noreturn void exit(int);
 _Noreturn void _Exit(int);
 _Noreturn void abort(void);
-int atexit(void (*)(void));
+/* glibc's libc.so.6 has no atexit of its own (it is __cxa_atexit under
+   a static wrapper); mlxlibc has both. */
+int __cxa_atexit(void (*)(void *), void *, void *);
+static __inline__ int atexit(void (*__function)(void)) { return __cxa_atexit((void (*)(void *))__function, (void *)0, (void *)0); }
 int at_quick_exit(void (*)(void));
 _Noreturn void quick_exit(int);
 int atoi(const char *);

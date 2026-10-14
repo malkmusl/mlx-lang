@@ -17,8 +17,8 @@ repository does.
 | --- | --- | --- | --- |
 | Language and compiler | Mlx, `mlx4` (self-hosted, x86_64 and aarch64, ELF, APK) | gcc for our own code | done; a few compiler gaps are recorded as tasks |
 | Standard library | `std` (system calls, files, formats, crypto, Wayland, Vulkan, UI) | glibc for our own code | done for what the programs use |
-| C library | mlxlibc (`projects/libc`): 830 C names and the dynamic loader | glibc, ld.so | runs glibc-linked programs; libm, iconv, `strtold` missing |
-| C compiler | mlx-cc (`projects/cc`) | gcc, as, ld for C programs | whole programs of C11 build and run, on glibc and on mlxlibc alone; separate compilation is next |
+| C library | mlxlibc (`projects/libc`): 830 C names, libm and the dynamic loader | glibc, ld.so, libm | runs glibc-linked programs; `libm.so.6` in Mlx; iconv, `strtold` missing |
+| C compiler | mlx-cc (`projects/cc`) | gcc, as, ld for C programs | whole programs of C89 to C23 (`-std=`) build and run, on glibc and on mlxlibc alone; zlib, Lua and SQLite pass their tests; separate compilation is next |
 | Init | mlx-init (`projects/init`) | systemd as PID 1, sysvinit | supervises, mounts, shuts down; no users per service, no device events |
 | Shell | mlx-sh (`projects/shell`) | bash, dash | POSIX scripts, line editor |
 | Core utilities | `projects/coreutils` (about 70 programs) | GNU coreutils | the common ones; the rest of coreutils is open |
@@ -43,11 +43,13 @@ encoder and the ELF writer of the Mlx compiler
 linker are needed. Programs it builds link against `libc.so.6`, which
 is mlxlibc on our system and glibc elsewhere.
 
-State: steps 1 and 2 are done (`tools/check_cc.sh`); of step 3,
-`--dynamic-linker` (a program starts on mlxlibc by itself); of step 4,
-zlib and Lua build and pass their own tests
-(`tools/check_cc_projects.sh`).
-The gaps left are listed in `projects/cc/README.md`.
+State: steps 1 and 2 are done (`tools/check_cc.sh`), and the C variants
+from C89 to C23 with GNU's (`-std=`, C23's keywords, attributes, `auto`,
+`constexpr`, fixed enum types); of step 3, `--dynamic-linker` (a program
+starts on mlxlibc by itself); of step 4, zlib, Lua and SQLite build and
+pass their own tests (`tools/check_cc_projects.sh`), on glibc and on
+mlxlibc with its own libm. The gaps left are listed in
+`projects/cc/README.md`.
 
 1. **C subset, whole programs.** (done) The preprocessor (`#include`,
    object-like and function-like macros with `#` and `##`, conditionals),
@@ -77,8 +79,10 @@ The gaps left are listed in `projects/cc/README.md`.
 
 ## Phase 2: the C library, complete
 
-1. libm (the math functions in Mlx), `iconv`, `strtold` (a way to return
-   x87 values), locales as far as programs ask, wide character functions.
+1. libm (done as far as Lua and SQLite ask: `projects/libc/libm.mlx`;
+   `erf`, the gamma functions and the reduction of huge arguments are
+   open), `iconv`, `strtold` (a way to return x87 values), locales as far
+   as programs ask, wide character functions.
 2. Static linking: `libmlxc.a` from mlx-cc's archiver.
 3. Run what the system needs from C: Mesa's Vulkan drivers and Xwayland
    on mlxlibc instead of glibc (they also need a C++ runtime: see Phase 6).

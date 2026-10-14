@@ -1,0 +1,28 @@
+.mode list
+CREATE TABLE people(id INTEGER PRIMARY KEY, name TEXT NOT NULL, born INTEGER, height REAL);
+INSERT INTO people(name, born, height) VALUES ('Ada', 1815, 1.62), ('Alan', 1912, 1.78), ('Grace', 1906, 1.70), ('Linus', 1969, 1.77), ('Dennis', 1941, 1.75);
+CREATE TABLE langs(id INTEGER PRIMARY KEY, person INTEGER REFERENCES people(id), name TEXT, year INTEGER);
+INSERT INTO langs(person, name, year) VALUES (2, 'Turing machine', 1936), (3, 'COBOL', 1959), (4, 'Linux', 1991), (5, 'C', 1972), (5, 'Unix', 1969);
+SELECT name, born, printf('%.2f', height) FROM people ORDER BY born;
+SELECT count(*), min(born), max(born), round(avg(height), 3), sum(born) FROM people;
+SELECT p.name, group_concat(l.name, ', ') FROM people p JOIN langs l ON l.person = p.id GROUP BY p.id ORDER BY p.name;
+SELECT name, year, row_number() OVER (ORDER BY year) AS n, sum(year) OVER (ORDER BY year ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) FROM langs ORDER BY year;
+WITH RECURSIVE fib(n, a, b) AS (SELECT 1, 0, 1 UNION ALL SELECT n + 1, b, a + b FROM fib WHERE n < 30) SELECT n, a FROM fib WHERE n IN (10, 20, 30);
+SELECT upper(name), length(name), substr(name, 2, 2), instr(name, 'n'), replace(name, 'a', '@'), hex(name), quote(name) FROM people WHERE born > 1900 ORDER BY id;
+SELECT typeof(1), typeof(1.5), typeof('x'), typeof(NULL), typeof(x'0102'), 7 / 2, 7 % 3, 7.0 / 2, 1 << 40, -9223372036854775807 - 1, 0x7fffffff;
+SELECT json_object('name', name, 'born', born) FROM people WHERE id = 1;
+SELECT json_extract('{"a": [1, 2, {"b": 3.5}]}', '$.a[2].b'), json_array_length('[1,2,3]'), json_valid('{');
+SELECT date('2024-02-28', '+1 day'), datetime('2000-01-01 12:00:00', '+90 minutes'), strftime('%Y-%j', '2024-12-31'), julianday('2000-01-01');
+SELECT abs(-3), round(2.5), round(3.14159, 2), 1e300 * 10, 1e-300 * 1e5, 123456789012345678, 0.1 + 0.2 = 0.3, 1.0 / 3;
+SELECT name FROM people WHERE name LIKE 'A%' OR name GLOB '*s' ORDER BY name DESC;
+SELECT total(height) FILTER (WHERE born < 1950), CAST(height * 100 AS INTEGER), CAST('12abc' AS INTEGER), CAST(3.9 AS INTEGER) FROM people ORDER BY id LIMIT 2;
+UPDATE people SET height = height + 0.01 WHERE id = 1;
+DELETE FROM langs WHERE year < 1950;
+SELECT changes(), (SELECT count(*) FROM langs), (SELECT height FROM people WHERE id = 1);
+CREATE INDEX langs_year ON langs(year);
+EXPLAIN QUERY PLAN SELECT * FROM langs WHERE year = 1972;
+BEGIN; INSERT INTO people(name, born) VALUES ('Nobody', 2000); ROLLBACK;
+SELECT count(*) FROM people;
+SELECT sqlite_version() LIKE '3.46.%', length(randomblob(16)), zeroblob(4), unicode('€'), char(72, 105), lower('ÄÖÜ'), 'a' || 'b' || 1;
+PRAGMA integrity_check;
+SELECT name FROM sqlite_master ORDER BY name;
