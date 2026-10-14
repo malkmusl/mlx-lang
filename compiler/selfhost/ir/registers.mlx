@@ -1,0 +1,190 @@
+// Locals kept in callee-saved registers instead of the frame.
+//
+// A local's 8-byte slot is reached by a memory load or store at every
+// read and write, a loop's counter on every pass. A slot whose address is
+// used for nothing but whole-word loads and stores (never handed on,
+// stored, compared or offset: escape.opcodeShares says which operands take
+// an address) is a variable the backend may hold in a register. Each
+// function gives its most used such slots, a use inside a loop counting
+// LOOP_WEIGHT times per loop around it, one of REGISTERS registers each
+// (x86_64: rbx, r12, r13), marked on the slot's alloca (flag bits 4 and
+// 5; lir.registerHome reads them). Callees keep these
+// registers as the ABI asks, so a local held in one lives through calls;
+// the backend saves the ones a function uses in its prologue and restores
+// them on return. A backend that does not look keeps such slots in the
+// frame as before.
+const allocator_module = @import("../../../std/bootstrap/allocator.mlx")
+const lir = @import("./lir.mlx")
+const escape = @import("./escape.mlx")
+
+pub const REGISTERS: usize = 3
+const LOOP_WEIGHT: usize = 8
+const WEIGHT_LIMIT: usize = 1073741824
+
+// How many slots were given a register.
+pub fn run(ir: *lir.Lir, allocator: allocator_module.Allocator) -> usize {
+    const count = lir.instCount(ir)
+    if count == 0 { return 0 }
+    const weight_memory = allocator.alloc(count * 8, 8)
+    const score_memory = allocator.alloc(count * 8, 8)
+    if weight_memory == null || score_memory == null { return 0 }
+    var weights: [*]usize = undefined
+    var scores: [*]usize = undefined
+    unsafe {
+        weights = @ptrCast([*]usize, weight_memory.?)
+        scores = @ptrCast([*]usize, score_memory.?)
+    }
+    var index: usize = 0
+    while index < count {
+        weights[index] = 1
+        scores[index] = 0
+        index += 1
+    }
+    weighLoops(ir, allocator, weights, count)
+    scoreSlots(ir, weights, scores, count)
+    const given = assign(ir, scores, count)
+    allocator.free(weight_memory.?, count * 8, 8)
+    allocator.free(score_memory.?, count * 8, 8)
+    return given
+}
+
+fn isSlot(ir: *lir.Lir, value: usize, count: usize) -> bool {
+    if value == lir.NONE || value >= count { return false }
+    const inst = lir.instAt(ir, value)
+    return inst.*.opcode == lir.Opcode.alloca && inst.*.arg0 == lir.NONE
+}
+
+fn isFunctionLabel(inst: *lir.Inst) -> bool {
+    return inst.*.opcode == lir.Opcode.label && inst.*.arg0 != lir.NONE
+}
+
+// A use of a slot other than as a whole-word load's or store's address
+// keeps it in the frame (its score becomes NONE).
+fn block(ir: *lir.Lir, scores: [*]usize, value: usize, count: usize) -> void {
+    if isSlot(ir, value, count) { scores[value] = lir.NONE }
+}
+
+fn blockExtras(ir: *lir.Lir, scores: [*]usize, start: usize, length: usize, count: usize) -> void {
+    var at: usize = 0
+    while at < length {
+        block(ir, scores, lir.getExtra(ir, start + at), count)
+        at += 1
+    }
+}
+
+fn score(scores: [*]usize, slot: usize, weight: usize) -> void {
+    if scores[slot] == lir.NONE { return }
+    scores[slot] = scores[slot] + weight
+}
+
+fn scoreSlots(ir: *lir.Lir, weights: [*]usize, scores: [*]usize, count: usize) -> void {
+    var index: usize = 0
+    while index < count {
+        const inst = lir.instAt(ir, index)
+        const op = inst.*.opcode
+        if op == lir.Opcode.load && isSlot(ir, inst.*.arg0, count) {
+            if inst.*.arg1 != lir.NONE && inst.*.arg1 != 8 { block(ir, scores, inst.*.arg0, count) } else { score(scores, inst.*.arg0, weights[index]) }
+        } else if op == lir.Opcode.store && isSlot(ir, inst.*.arg0, count) {
+            if inst.*.arg2 != lir.NONE && inst.*.arg2 != 8 { block(ir, scores, inst.*.arg0, count) } else { score(scores, inst.*.arg0, weights[index]) }
+        }
+        // A fused comparison's operands sit on the comparison it replaced.
+        if op == lir.Opcode.icmp_br && inst.*.arg0 != lir.NONE && inst.*.arg0 < count {
+            const comparison = lir.instAt(ir, inst.*.arg0)
+            block(ir, scores, comparison.*.arg1, count)
+            block(ir, scores, comparison.*.arg2, count)
+        }
+        const shares = escape.opcodeShares(op)
+        if shares & escape.SHARE_ARG0 != 0 { block(ir, scores, inst.*.arg0, count) }
+        if shares & escape.SHARE_ARG1 != 0 { block(ir, scores, inst.*.arg1, count) }
+        if shares & escape.SHARE_ARG2 != 0 { block(ir, scores, inst.*.arg2, count) }
+        if shares & escape.SHARE_EXTRAS_AT_ARG1 != 0 { blockExtras(ir, scores, inst.*.arg1, inst.*.arg2, count) }
+        if shares & escape.SHARE_EXTRAS_AT_ARG0 != 0 { blockExtras(ir, scores, inst.*.arg0, inst.*.arg1, count) }
+        index += 1
+    }
+}
+
+// Every instruction between a block's label and a branch back to it
+// weighs LOOP_WEIGHT times more.
+fn weighLoops(ir: *lir.Lir, allocator: allocator_module.Allocator, weights: [*]usize, count: usize) -> void {
+    var blocks: usize = 0
+    var index: usize = 0
+    while index < count {
+        const inst = lir.instAt(ir, index)
+        if inst.*.opcode == lir.Opcode.label && inst.*.arg0 == lir.NONE && inst.*.arg1 != lir.NONE && inst.*.arg1 + 1 > blocks { blocks = inst.*.arg1 + 1 }
+        index += 1
+    }
+    if blocks == 0 { return }
+    const memory = allocator.alloc(blocks * 8, 8)
+    if memory == null { return }
+    var labels: [*]usize = undefined
+    unsafe { labels = @ptrCast([*]usize, memory.?) }
+    var at: usize = 0
+    while at < blocks {
+        labels[at] = lir.NONE
+        at += 1
+    }
+    index = 0
+    while index < count {
+        const inst = lir.instAt(ir, index)
+        if inst.*.opcode == lir.Opcode.label && inst.*.arg0 == lir.NONE && inst.*.arg1 != lir.NONE { labels[inst.*.arg1] = index }
+        index += 1
+    }
+    index = 0
+    while index < count {
+        const inst = lir.instAt(ir, index)
+        if inst.*.opcode == lir.Opcode.br {
+            weighLoop(labels, blocks, weights, inst.*.arg0, index)
+        } else if inst.*.opcode == lir.Opcode.condbr || inst.*.opcode == lir.Opcode.icmp_br {
+            weighLoop(labels, blocks, weights, inst.*.arg1, index)
+            weighLoop(labels, blocks, weights, inst.*.arg2, index)
+        }
+        index += 1
+    }
+    allocator.free(memory.?, blocks * 8, 8)
+}
+
+fn weighLoop(labels: [*]usize, blocks: usize, weights: [*]usize, target_block: usize, branch: usize) -> void {
+    if target_block >= blocks { return }
+    const target = labels[target_block]
+    if target == lir.NONE || target >= branch { return }
+    var index = target
+    while index <= branch {
+        if weights[index] < WEIGHT_LIMIT { weights[index] = weights[index] * LOOP_WEIGHT }
+        index += 1
+    }
+}
+
+// In each function, the REGISTERS best scored slots (used at least twice)
+// get a register each.
+fn assign(ir: *lir.Lir, scores: [*]usize, count: usize) -> usize {
+    var given: usize = 0
+    var start: usize = 0
+    while start < count {
+        if !isFunctionLabel(lir.instAt(ir, start)) {
+            start += 1
+            continue
+        }
+        var end = start + 1
+        while end < count && !isFunctionLabel(lir.instAt(ir, end)) { end += 1 }
+        var register: usize = 1
+        while register <= REGISTERS {
+            var best: usize = lir.NONE
+            var best_score: usize = 1
+            var index = start + 1
+            while index < end {
+                if isSlot(ir, index, count) && scores[index] != lir.NONE && scores[index] > best_score && lir.registerHome(ir, index) == 0 {
+                    best = index
+                    best_score = scores[index]
+                }
+                index += 1
+            }
+            if best == lir.NONE { break }
+            const slot = lir.instAt(ir, best)
+            slot.*.flags = slot.*.flags | @intCast(u8, register * 16)
+            given += 1
+            register += 1
+        }
+        start = end
+    }
+    return given
+}

@@ -705,6 +705,23 @@ loop runs its 2,000,000 passes in about 10&nbsp;MB. What does leave the
 function, a value stored into a global or one an older pass's pointer still
 reads, keeps going to the arena.
 
+**Locals in callee-saved registers** (`ir/registers.mlx`). A local's
+8-byte slot that is used only as the address of whole-word loads and
+stores (never handed on, stored, compared or offset) is a variable the
+backend may hold in a register. Each function gives its most used such
+slots, a use inside a loop counting eight times per loop around it, one
+of three registers each, marked on the slot's `alloca`
+(`lir.registerHome`); the x86_64 backend keeps them in rbx, r12 and r13,
+saved in four words at the bottom of the frame's budget in the prologue
+and restored on return, so a load is `mov rax, rbx` and a store moves the
+value into the register. Callees keep these registers as the ABI asks, so
+the locals live through calls. The compiler builds itself with 3,602
+locals held so (`locals kept in registers`); a nested loop of 300 million
+passes runs about 5% faster, the rest of its time still going to the
+frame slot every intermediate value takes
+(`tests/339_register_locals_runtime.mlx`). The aarch64 backend does not
+look at the mark yet and keeps such slots in the frame.
+
 Between Mlx functions a value of several words comes back a word per
 register: `rax`, `rdx`, `rcx`, `r8`, `r9`, `r10`, `r11`, `rsi`, `rdi`
 (`state_module.returnRegister`, nine words; `x0` to `x7` on aarch64), and
