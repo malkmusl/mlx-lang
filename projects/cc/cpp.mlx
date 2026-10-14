@@ -675,9 +675,20 @@ pub fn consumed(value: usize) -> usize {
     const ty = ast.typeOf(value)
     if !isClassType(ty) { return value }
     if markMoved(value) { return value }
-    // An object (or `c ? a : b` of two objects) is copied.
+    // An object (or `c ? a : b` of two objects) is copied; `c ? a : b`
+    // of an object and a temporary has each branch consumed.
     var isObject = typing.isLvalue(value)
-    if ast.kindOf(value) == ast.COND && typing.isLvalue(ast.node(value).*.then) && typing.isLvalue(ast.node(value).*.els) { isObject = true }
+    const k = ast.kindOf(value)
+    if k == ast.COND {
+        const bothObjects = typing.isLvalue(ast.node(value).*.then) && typing.isLvalue(ast.node(value).*.els)
+        if bothObjects {
+            isObject = true
+        } else {
+            ast.node(value).*.then = consumed(ast.node(value).*.then)
+            ast.node(value).*.els = consumed(ast.node(value).*.els)
+            return value
+        }
+    }
     if needsSpecialCopy(ty) && isObject {
         const token = ast.tokenOf(value)
         const tmp = newTemp(ty, token)
@@ -716,9 +727,28 @@ fn destroyTemporaries(token: usize) -> usize {
     return n
 }
 
+// A class value kept past a flush (a branch's result): the temporary
+// holding it, to be destroyed by the expression around; 0 for none.
+var keptTemporary: usize = 0
+
+pub fn takeKeptTemporary() -> usize {
+    const o = keptTemporary
+    keptTemporary = 0
+    return o
+}
+
 // The expression `e`, a full one, followed by the destruction of its
-// temporaries; its value kept when `keepValue`.
+// temporaries; its value kept when `keepValue` (a class value is moved
+// into a temporary of the expression around: takeKeptTemporary).
 pub fn flushTemporaries(e: usize, keepValue: bool, token: usize) -> usize {
+    keptTemporary = 0
+    if keepValue && e != 0 {
+        typing.addType(e)
+        if isClassType(ast.typeOf(e)) {
+            // Moved out before its own temporaries go.
+            const moved = markMoved(e)
+        }
+    }
     const destroys = destroyTemporaries(token)
     if isNothing(destroys) { return e }
     if e == 0 { return destroys }
@@ -726,6 +756,7 @@ pub fn flushTemporaries(e: usize, keepValue: bool, token: usize) -> usize {
     const ty = ast.typeOf(e)
     if !keepValue || types.kind(ty) == types.VOID { return sequence(e, destroys, token) }
     const tmp = newTemp(ty, token)
+    if isClassType(ty) && hasDestructor(ty) { keptTemporary = tmp }
     const saved = typed(ast.binary(ast.ASSIGN, variable(tmp, token), e, token))
     const n = ast.binary(ast.COMMA, sequence(saved, destroys, token), variable(tmp, token), token)
     ast.node(n).*.ty = ty
@@ -1839,41 +1870,83 @@ pub fn explicitDestructor(address: usize, token: usize) -> usize {
     return call
 }
 
-// The function `first` found by its unqualified name, with the
-// functions of that name the using-directives in force bring in
-// (`using namespace std` next to C's getline: std::getline is a
-// candidate too) added to its overloads.
-pub fn withUsingOverloads(first: usize, name: u32) -> usize {
-    var d = scope.currentDepth() + 1
-    while d > 0 {
-        d -= 1
-        var c = scope.usingsAt(d)
-        while c != 0 {
-            const binding = scope.findQualified(@intCast(u32, base.getWord(c)), name, false)
-            if binding != 0 && scope.at(binding).*.kind == scope.VARIABLE && ast.obj(scope.at(binding).*.obj).*.isFunction {
-                var candidate = scope.at(binding).*.obj
-                while candidate != 0 {
-                    // Appended unless already among them.
-                    var known = first
-                    var last: usize = 0
-                    var present = false
-                    while known != 0 {
-                        if known == candidate { present = true }
-                        last = known
-                        known = ast.obj(known).*.nextOverload
-                    }
-                    const next = ast.obj(candidate).*.nextOverload
-                    if !present {
-                        ast.obj(candidate).*.nextOverload = 0
-                        ast.obj(last).*.nextOverload = candidate
-                    }
-                    candidate = next
-                }
-            }
-            c = base.getWord(c + 8)
+// The functions and the function template bound under one name in one
+// scope (the binding's and the ones it hides there: a function and a
+// template of the same name are overloads of each other): the chain's
+// first function, and the template's record; either 0.
+fn boundFunctions(binding: usize) -> (usize, usize) {
+    var functions: usize = 0
+    var record: usize = 0
+    var b = binding
+    while b != 0 && scope.at(b).*.depth == scope.at(binding).*.depth && scope.at(b).*.name == scope.at(binding).*.name {
+        const kind = scope.at(b).*.kind
+        if kind == scope.VARIABLE && functions == 0 && ast.obj(scope.at(b).*.obj).*.isFunction { functions = scope.at(b).*.obj }
+        if kind == scope.TEMPLATE && record == 0 && template.isFunctionTemplate(b) { record = scope.at(b).*.obj }
+        b = scope.at(b).*.hidden
+    }
+    return -> (functions, record)
+}
+
+// Appends the chain `candidates` to the overloads of `first` (those
+// not among them yet); the chain's first.
+fn appendOverloads(first: usize, candidates: usize) -> usize {
+    if first == 0 { return candidates }
+    var candidate = candidates
+    while candidate != 0 {
+        var known = first
+        var last: usize = 0
+        var present = false
+        while known != 0 {
+            if known == candidate { present = true }
+            last = known
+            known = ast.obj(known).*.nextOverload
         }
+        const next = ast.obj(candidate).*.nextOverload
+        if !present {
+            ast.obj(candidate).*.nextOverload = 0
+            ast.obj(last).*.nextOverload = candidate
+        }
+        candidate = next
     }
     return first
+}
+
+// What a call by the unqualified `name`, found as `binding`, may call:
+// the functions of that name in the binding's scope and those the
+// using-directives in force bring in (`using namespace std` next to
+// C's getline: std::getline is a candidate too), and a function
+// template of that name, whose instances the arguments choose. The
+// callee node: the template's placeholder with the functions as its
+// overloads, else the first function.
+pub fn callableFor(binding: usize, nameToken: usize) -> usize {
+    const name = tokens.name(nameToken)
+    const found = boundFunctions(binding)
+    var functions = found.0
+    var record = found.1
+    if scope.at(binding).*.depth == 0 {
+        var d = scope.currentDepth() + 1
+        while d > 0 {
+            d -= 1
+            var c = scope.usingsAt(d)
+            while c != 0 {
+                const other = scope.findQualified(@intCast(u32, base.getWord(c)), name, false)
+                if other != 0 {
+                    const more = boundFunctions(other)
+                    functions = appendOverloads(functions, more.0)
+                    if record == 0 { record = more.1 }
+                }
+                c = base.getWord(c + 8)
+            }
+        }
+    }
+    if record != 0 {
+        const o = template.placeholderFor(record)
+        ast.obj(o).*.nextOverload = functions
+        return ast.variableNode(o, nameToken)
+    }
+    if functions == 0 { return 0 }
+    ast.obj(functions).*.isReferenced = true
+    return expr.variableValue(functions, nameToken)
 }
 
 // The conversion operator of the class (or a base) to `target`: the
@@ -1949,11 +2022,15 @@ fn operatorFunction(op: []const u8) -> u32 {
 // The best of the functions in the chains `first` and `second` (either
 // may be 0) for the arguments; 0 when none fits.
 fn bestOf(first: usize, second: usize, args: usize, count: usize) -> usize {
+    return bestOfThree(first, second, 0, args, count)
+}
+
+fn bestOfThree(first: usize, second: usize, third: usize, args: usize, count: usize) -> usize {
     var best: usize = 0
     var bestScore: i64 = -1
     var chain = first
     var pass: u32 = 0
-    while pass < 2 {
+    while pass < 3 {
         var candidate = chain
         while candidate != 0 {
             const score = expr.overloadScore(candidate, args, count)
@@ -1963,18 +2040,28 @@ fn bestOf(first: usize, second: usize, args: usize, count: usize) -> usize {
             }
             candidate = ast.obj(candidate).*.nextOverload
         }
-        chain = second
+        chain = if pass == 0 { second } else { third }
         pass += 1
     }
     return best
 }
 
 // The free functions named `name` seen from here and from the
-// namespaces of the class arguments (argument-dependent lookup).
+// namespaces of the class arguments (argument-dependent lookup), and
+// the instance a function template of that name makes for the
+// arguments (0 for none): three chains for bestOfThree.
+var templateInstance: usize = 0
+
 fn freeFunctions(name: u32, lhs: usize, rhs: usize) -> (usize, usize) {
     var first: usize = 0
+    var record: usize = 0
+    templateInstance = 0
     const binding = scope.find(name)
-    if binding != 0 && scope.at(binding).*.kind == scope.VARIABLE && ast.obj(scope.at(binding).*.obj).*.isFunction { first = scope.at(binding).*.obj }
+    if binding != 0 {
+        const found = boundFunctions(binding)
+        first = found.0
+        record = found.1
+    }
     var second: usize = 0
     var side: u32 = 0
     while side < 2 && second == 0 {
@@ -1985,9 +2072,15 @@ fn freeFunctions(name: u32, lhs: usize, rhs: usize) -> (usize, usize) {
         if c == 0 { continue }
         const ns = scope.parentOf(at(c).*.prefix)
         const found = scope.findQualified(ns, name, false)
-        if found != 0 && scope.at(found).*.kind == scope.VARIABLE && ast.obj(scope.at(found).*.obj).*.isFunction && scope.at(found).*.obj != first {
-            second = scope.at(found).*.obj
+        if found != 0 {
+            const more = boundFunctions(found)
+            if more.0 != first { second = more.0 }
+            if record == 0 { record = more.1 }
         }
+    }
+    if record != 0 {
+        const args = if rhs != 0 { argumentList(lhs, rhs) } else { argumentList(lhs, 0) }
+        templateInstance = template.callInstance(record, args, if rhs != 0 { 2 } else { 1 })
     }
     return -> (first, second)
 }
@@ -2026,7 +2119,7 @@ pub fn binaryOperator(op: []const u8, lhs: usize, rhs: usize, token: usize) -> u
     if call == 0 {
         const free = freeFunctions(name, lhs, rhs)
         const full = argumentList(left, rhs)
-        const chosen = bestOf(free.0, free.1, full, 2)
+        const chosen = bestOfThree(free.0, free.1, templateInstance, full, 2)
         if chosen != 0 { call = expr.buildCall(methodNode(chosen, 0, token), full, 2, token) }
     }
     if call == 0 || before == 0 { return call }
@@ -2056,7 +2149,7 @@ pub fn unaryOperator(op: []const u8, operand: usize, isPostfix: bool, token: usi
     const free = freeFunctions(name, operand, 0)
     const full = if isPostfix { argumentList(operand, zero) } else { argumentList(operand, 0) }
     const count: usize = if isPostfix { 2 } else { 1 }
-    const chosen = bestOf(free.0, free.1, full, count)
+    const chosen = bestOfThree(free.0, free.1, templateInstance, full, count)
     if chosen != 0 { return expr.buildCall(methodNode(chosen, 0, token), full, count, token) }
     return 0
 }

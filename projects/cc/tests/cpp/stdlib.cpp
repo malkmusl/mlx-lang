@@ -86,9 +86,7 @@ int main() {
     getline(cin, line);
     cout << "line [" << line << "]" << endl;
     int count = 0;
-    while (true) {
-        getline(cin, line);
-        if (cin.fail()) break;
+    while (getline(cin, line)) {
         count++;
         cout << count << ": " << line << endl;
     }

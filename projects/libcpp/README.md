@@ -36,7 +36,8 @@ driver for linking C++ objects. The headers are the compiler's, under
   `ends`, `write`, `put`; `cin` with `>>` for the built-in types, C
   strings and `std::string` (a whitespace-separated word), `get`,
   `peek`, `ignore`, `getline` into a buffer, `std::getline` into a
-  string, `eof`, `fail`, `good`, `clear`. The stream objects are plain
+  string, `eof`, `fail`, `good`, `clear`, and a conversion to bool
+  (`while (cin >> x)`, `while (getline(cin, line))`). The stream objects are plain
   aggregates over stdio's streams, so a program's own globals may use
   them in their constructors.
 - `<vector>`: `std::vector<T>` (a doubling array; pointers as iterators)
@@ -74,5 +75,5 @@ overloads (`long long` is `long` to mlx-cc).
 
 `tools/check_cpp.sh` builds the library and runs `projects/cc/tests/cpp`
 (`stdlib.cpp` uses it, reading `stdlib.stdin`; `containers.cpp` and
-`maps.cpp` its templates) against the output of g++'s builds, on glibc
-and on mlxlibc.
+`maps.cpp` its templates; `interp.cpp` all of it together) against the
+output of g++'s builds, on glibc and on mlxlibc.

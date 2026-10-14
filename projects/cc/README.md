@@ -209,7 +209,12 @@ template parameters may have defaults. Also: conversion operators
 arguments), the range-based `for` over arrays and anything with
 `begin()` and `end()`, `auto` (with `&` and `*`) from the initializer,
 and the left operand of `<<`, `>>` and assignments evaluated before the
-right one, as C++17 says. Names are mangled as the Itanium
+right one, as C++17 says; the temporaries of a branch of `&&`, `||` or
+`?:` live and die within it. A function and a function template of one
+name are overloads of each other (`<string>`'s `operator==` next to
+`<vector>`'s template), a function winning a tie. `tests/cpp/interp.cpp`
+is a small interpreter (lexer, recursive descent parser, virtual nodes,
+maps of variables and functions) that runs as g++ builds it. Names are mangled as the Itanium
 ABI says (`_ZN8geometry4areaEii`, `_ZN1SC1Ei`, `_ZNK6Matrix2atEii`),
 so objects of several files link by name. `tests/cpp/*.cpp` run as g++
 runs them (`tools/check_cpp.sh`, on glibc and on mlxlibc).
@@ -219,9 +224,8 @@ is in force: the functions a using-directive brings in join the
 overloads of a name. Not there yet:
 specializations, member templates, variadic templates, deduction
 through a class template (`f(const vector<T> &)`: give the arguments),
-dependent qualified names in a function template's signature, a
-function and a function template of one name as overloads of each
-other, exceptions (`try`, `throw` are refused),
+dependent qualified names in a function template's signature,
+exceptions (`try`, `throw` are refused),
 multiple inheritance, a polymorphic class over a base without a vtable,
 conversion operators (`operator bool`), lambdas, `constexpr` functions, destruction of globals at exit, local
 classes with member functions, user-defined `operator new` (the
