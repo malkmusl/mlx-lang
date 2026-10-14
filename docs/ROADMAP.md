@@ -130,9 +130,15 @@ slice of a C++ standard library of our own (`projects/libcpp`:
 `std::string`, `<iostream>`, new and delete, the `c*` headers, linked
 in by itself), and templates with `<vector>`, `<map>`, `<set>`,
 `<utility>` and `<algorithm>` over them, lambdas, explicit
-specializations, and a small interpreter (`tests/cpp/interp.cpp`) as
-the larger test. Next: partial specializations and member templates,
-`<memory>` and `<functional>`, then what Mesa needs. The other way stays open: a Vulkan
+specializations, member templates, const as part of a type, `<memory>`,
+and a small interpreter (`tests/cpp/interp.cpp`) as the larger test;
+tinyxml2 builds and passes its 528 tests. The target is WPEWebKit
+(a browser engine of our own is out of reach; a C and C++ compiler of
+our own over mlxlibc and mlxlibcpp keeps the whole stack ours), so the
+next steps are what its base library WTF needs: variadic templates,
+partial specializations, `constexpr` functions, rvalue references and
+move semantics, `<type_traits>`, `if constexpr`, `static_assert`
+everywhere, atomics and threads; then what Mesa needs. The other way stays open: a Vulkan
 driver for one GPU family in Mlx (`docs/VULKAN.md` has the first steps)
 takes Mesa out of the picture for that hardware.
 

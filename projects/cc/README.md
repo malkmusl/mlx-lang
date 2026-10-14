@@ -228,9 +228,25 @@ type made the first time their declaration runs (`static Point p(7)`),
 template's parameters with the rest deduced from the call
 (`make_shared<Resource>(name)`), deduction through a class template's
 instance (`f(const vector<T> &)` from a `vector<int>`), a cast to a
-reference type (`const_cast<T &>(x)`) yielding the object. `tests/cpp/interp.cpp`
+reference type (`const_cast<T &>(x)`) yielding the object. `const` is
+part of a type (`const char *` and `char *` are two overloads, a const
+object or reference calls the const member functions only, an
+enumerator is of its enum, nothing converts to an enum by itself, a
+const-qualified class is a twin of the class kept up to date with it),
+a const integer global or local with an initializer is a constant
+expression (`static const int N = 4; char buf[N]`). Member templates
+(`template <class T> T *make(Pool<N> &)`, declared in the class and
+defined inside or after it, called as `obj.make<Node>(pool)` with the
+rest deduced, an integer parameter deduced through a class template's
+instance), member functions of local classes (read apart from their
+function), a nested class is a type of its class's scope, a null
+pointer constant (`0`) fits any pointer parameter, `(void(0))` and the
+other functional casts in parentheses. `tests/cpp/interp.cpp`
 is a small interpreter (lexer, recursive descent parser, virtual nodes,
-maps of variables and functions) that runs as g++ builds it. Names are mangled as the Itanium
+maps of variables and functions) that runs as g++ builds it;
+`tests/cpp/library.cpp` is what tinyxml2 asked of the compiler:
+tinyxml2 (its library and `xmltest.cpp`, 5900 lines) builds with
+mlx-cc and its 528 tests pass with the output of g++'s build. Names are mangled as the Itanium
 ABI says (`_ZN8geometry4areaEii`, `_ZN1SC1Ei`, `_ZNK6Matrix2atEii`),
 so objects of several files link by name. `tests/cpp/*.cpp` run as g++
 runs them (`tools/check_cpp.sh`, on glibc and on mlxlibc).
@@ -238,19 +254,21 @@ runs them (`tools/check_cpp.sh`, on glibc and on mlxlibc).
 C's `getline` and `std::getline` both apply where `using namespace std`
 is in force: the functions a using-directive brings in join the
 overloads of a name. Not there yet:
-partial specializations, member templates, variadic templates,
+partial specializations, variadic templates,
 generic lambdas (`auto` parameters), a lambda converting to a function
 pointer, init-captures, alias templates (`template <class T> using`),
 dependent qualified names in a function template's signature, rvalue
 references as a type of their own (`T &&` is `T &`, `std::move` the
 identity), exceptions (`try`, `throw` are refused),
 multiple inheritance, a polymorphic class over a base without a vtable,
-conversion operators (`operator bool`), `constexpr` functions, destruction of globals at exit, local
-classes with member functions, user-defined `operator new` (the
-built-in `new` calls `_Znwm`, which mlxlibcpp provides). The mangled
-names leave out `const` (`PKc` is `Pc`) and the ABI's substitutions
-(`S_`), so a name with a const or a repeated parameter type differs
-from g++'s; constructors have only their `C1` symbol; `long long` and
+`constexpr` functions, destruction of globals at exit, a diagnosis
+of writing through const (`const int x; x = 2` and `mutable` pass:
+const chooses overloads and member functions only), a local class's member
+functions naming the function's locals or the class itself,
+user-defined `operator new` (the built-in `new` calls `_Znwm`, which
+mlxlibcpp provides). The mangled names leave out the ABI's
+substitutions (`S_`), so a name with a repeated parameter type
+differs from g++'s; constructors have only their `C1` symbol; `long long` and
 `signed char` are `long` and `char`, not types of their own. The C++
 standard library is mlxlibcpp (`projects/libcpp`: `<string>`,
 `<iostream>`, `<sstream>`, `<vector>`, `<map>`, `<set>`, `<memory>`,
