@@ -3,8 +3,8 @@
 # (std/src/crash.mlx) end to end, on tests/support/crash_report.mlx:
 #   - the compiler names every function path:line:name in the symbol table,
 #     and its line table says the line of each address;
-#   - a failed runtime check, a bad store, a stack overflow, an abort and a
-#     failure (crash.fail) each say the
+#   - a failed runtime check, a bad store, a stack overflow, an abort, a
+#     failure (crash.fail) and a full value arena each say the
 #     function they happened in and the functions that called it;
 #   - each crash is kept as a line in $XDG_STATE_HOME/mlx/crashes.log;
 #   - every Wayland client watches its connection (std.wayland.crash.watch).
@@ -62,9 +62,16 @@ grep -q '^crashy: failed: the compositor ended the connection (a test)$' "$work/
 grep -q '^  at tests/support/crash_report.mlx:[0-9]*:main+0x' "$work/fail.out" || fail "the failure does not name main" "$work/fail.out"
 echo "ok   a failure the program cannot go on after (crash.fail) is reported with its callers"
 
+# The handler's own values come from the value arena too: when the program
+# filled it, the handler takes room of its own and says so.
+run values 132
+grep -q "^crashy: crashed: illegal instruction (the values' arena is full" "$work/values.out" || fail "a full value arena is not said" "$work/values.out"
+grep -q '^  at tests/support/crash_report.mlx:[0-9]*:hoard+0x' "$work/values.out" || fail "the full arena does not name hoard" "$work/values.out"
+echo "ok   a full value arena is said, in the function that asked for more"
+
 log="$work/state/mlx/crashes.log"
 [[ -f "$log" ]] || fail "no crashes.log"
-[[ $(wc -l < "$log") -eq 5 ]] || fail "crashes.log does not hold five crashes" "$log"
+[[ $(wc -l < "$log") -eq 6 ]] || fail "crashes.log does not hold six crashes" "$log"
 awk -F'\t' '$1 != "crash" || $2 !~ /^[0-9]+$/ || $3 != "crashy" || NF < 5 { bad = 1 } END { exit bad }' "$log" || fail "crashes.log lines are not crash/time/program/reason/frames" "$log"
 grep -q "	tests/support/crash_report.mlx:12:middle+0x[0-9a-f]* at tests/support/crash_report.mlx:9	" "$log" || fail "the kept crash has no frames" "$log"
 echo "ok   every crash is kept in \$XDG_STATE_HOME/mlx/crashes.log"

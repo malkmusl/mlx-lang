@@ -9,7 +9,9 @@
 `97_tagged_union_runtime.mlx`, `98_nonexhaustive_enum_requires_else.mlx`,
 `99_enum_duplicate_value.mlx`, `100_union_explicit_tag_mismatch.mlx`,
 `104_optional_pointer_null_runtime.mlx`, `174_aggregate_functions_runtime.mlx`,
-`176_pointer_struct_fields_runtime.mlx`, `212_aggregate_index_runtime.mlx`
+`176_pointer_struct_fields_runtime.mlx`, `212_aggregate_index_runtime.mlx`,
+`319_array_pointer_runtime.mlx`, `320_array_pointer_const_mismatch.mlx`,
+`321_slice_pointer_runtime.mlx`
 
 ## Structs
 
@@ -124,7 +126,9 @@ pub fn main() u8 {
 ## Methods
 
 A struct can declare functions in its body. `Self` refers to the enclosing
-type. A method that takes `self` (by value or by pointer, `self: Self` /
+type, and so does the name its `const` gives it, for a field pointing to
+another of its kind too (`const Node = struct { next: ?*Node }`;
+`tests/334_aggregate_own_name_runtime.mlx`). A method that takes `self` (by value or by pointer, `self: Self` /
 `self: *Self`) is called on an instance with `.`; a function that doesn't
 take `self` is called on the type itself, like an associated/"static"
 function:
@@ -193,6 +197,16 @@ pub fn main() -> u8 {
 ```
 
 (`tests/176_pointer_struct_fields_runtime.mlx`)
+
+The call can also be written on the instance: `value.method(args)` is
+`Type.method(value, args)`, and a method taking `*Self` gets the address of
+an addressable value (a `var` local, a field of one, an array element), so
+`local.set(7)` is `Box.set(&local, 7)`. A pointer calls the methods of
+what it points to, `allocated.set(8)` included; a method taking `Self` by
+value is called on what the pointer points to, `allocated.*.get()`. A
+`const` instance cannot call a method taking `*Self`, as `&` of it gives a
+`*const Self`; one taking `*const Self` is fine
+(`tests/332_method_receivers_runtime.mlx`).
 
 ## Enums
 
@@ -321,7 +335,8 @@ A fixed-size array literal is `[_]T{...}` (size inferred) or `[N]T{...}`
 value known at compile time, not only a number written out: a named
 constant, another module's constant, an expression over them
 (`[room.ROOM * 2 + 8]u8`); `tests/294_array_length_constant_runtime.mlx`
-covers those. A slice, `[]T`, is a pointer+length
+covers those, with the other module's constant in
+`tests/support/array_room.mlx`. A slice, `[]T`, is a pointer+length
 view and supports Python-style range indexing:
 
 ```mlx
@@ -333,6 +348,27 @@ pub fn main() u8 {
 ```
 
 (`tests/65_index_slice_runtime.mlx`)
+
+A slice has two fields: `.length`, a `usize`, and `.pointer`, its first
+word, a many-item pointer to the elements (`[*]T`, or `[*]const T` for a
+`[]const T`). `.pointer` is how a slice reaches a function that takes a
+`[*]const u8`, with no `unsafe` cast:
+
+```mlx
+fn first(bytes: [*]const u8) -> u8 {
+    return bytes[0]
+}
+
+pub fn main() -> u8 {
+    const text: []const u8 = "hello"
+    if first(text.pointer) != 104 { return 1 }
+    const tail = text[2..]
+    if tail.pointer[0] != 108 { return 2 }
+    return 13
+}
+```
+
+(`tests/321_slice_pointer_runtime.mlx`)
 
 ```mlx
 noinline fn readAt(index: usize) -> u8 {
@@ -427,6 +463,38 @@ A single-item pointer converts implicitly to `*anyopaque`, C's `void *`
 extension chains such as Vulkan's `pNext` need
 (`info.pNext = &external`). Going back takes an explicit `@ptrCast`.
 (`tests/259_anyopaque_coercion_runtime.mlx`)
+
+A pointer to an array, `*[N]T`, converts implicitly to a many-item pointer
+to its elements, `[*]T`: the same address, the length left behind. So
+`&buffer` goes straight to a `[*]u8` parameter, field, binding or return
+value, with no `unsafe` and no `@ptrCast`. A `*const [N]T` (the address of
+a constant array) converts only to `[*]const T`
+(`tests/320_array_pointer_const_mismatch.mlx` is rejected for that).
+
+A many-item pointer steps by whole elements: `p + n` and `p - n` are the
+addresses of `p[n]` and `p[-n]`, `p += n` and `p -= n` move `p`, `n` any
+integer. Only `[*]T` steps; a single-item pointer and `n + p` do not:
+
+```mlx
+fn steppedBack(end: [*]u32, count: u32) -> [*]u32 {
+    return end - count
+}
+
+pub fn main() -> u8 {
+    var words: [6]u32 = [6]u32{ 1, 2, 3, 4, 5, 6 }
+    var cursor: [*]u32 = &words      // *[6]u32 to [*]u32
+    const third = cursor + 2         // &words[2]
+    if third[0] != 3 { return 5 }
+    cursor += 4
+    if cursor[1] != 6 { return 6 }
+    const start: [*]u32 = &words
+    if steppedBack(start + 5, 2)[0] != 4 { return 8 }
+    return 13
+}
+```
+
+(`tests/319_array_pointer_runtime.mlx`, which also steps through structs
+with padding and runs under the AArch64 emulator)
 
 ## Vectors
 

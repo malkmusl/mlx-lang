@@ -13,6 +13,8 @@ pub const TEXT_CAPACITY: usize = 1048576
 pub const MAX_NODES: usize = 32768
 pub const VARIABLE_CAPACITY: usize = 524288
 pub const MAX_VARIABLES: usize = 2048
+// The variables' hash index: twice as many slots, a power of two.
+const VARIABLE_SLOTS: usize = 4096
 pub const FUNCTION_CAPACITY: usize = 262144
 pub const MAX_FUNCTIONS: usize = 256
 pub const WORK_CAPACITY: usize = 8388608
@@ -85,6 +87,9 @@ pub const Node = struct {
 pub const Variable = struct {
     name: u32
     nameLength: u32
+    // The name's hash (nameHash): a lookup compares names only when it
+    // matches.
+    hash: u32
     value: u32
     valueLength: u32
     exported: bool
@@ -153,6 +158,12 @@ pub const Shell = struct {
     nodeCount: usize
     variables: [MAX_VARIABLES]Variable
     variableCount: usize
+    // By the names' hashes, open addressing: 1 + a variable's index, 0
+    // free. Entries are only added (a variable unset, or its slot taken by
+    // another name, leaves a stale one a lookup steps over); the index is
+    // built again when it fills up.
+    variableIndex: [VARIABLE_SLOTS]u16
+    variableIndexed: usize
     variableBytes: [VARIABLE_CAPACITY]u8
     variableLength: usize
     functions: [MAX_FUNCTIONS]Function
@@ -239,6 +250,10 @@ pub const Shell = struct {
     // The current working directory, for the prompt and pwd.
     workingDirectory: [4096]u8
     workingDirectoryLength: usize
+    // Loops give the values of each turn back (std.turns); with
+    // MLX_TURNS_POISON set they are overwritten too (checks: a value
+    // wrongly kept past its turn shows).
+    poisonTurns: bool
 }
 
 // ---------------------------------------------------------------------------
@@ -247,13 +262,13 @@ pub const Shell = struct {
 pub fn create(allocator: Allocator) -> ?*Shell {
     const memory = allocator.alloc(@sizeOf(Shell), 16)
     if memory == null { return null }
-    var shell: *Shell = undefined
-    unsafe { shell = @ptrCast(*Shell, memory.?) }
+    const shell: *Shell = unsafe { @ptrCast(*Shell, memory.?) }
     shell.*.allocator = allocator
     shell.*.textLength = 0
     shell.*.nodeCount = 1
     shell.*.variableCount = 0
     shell.*.variableLength = 0
+    clearVariableIndex(shell)
     shell.*.functionCount = 0
     shell.*.functionLength = 0
     shell.*.workLength = 0
@@ -304,6 +319,7 @@ pub fn create(allocator: Allocator) -> ?*Shell {
     shell.*.localLength = 0
     shell.*.conditionDepth = 0
     shell.*.workingDirectoryLength = 0
+    shell.*.poisonTurns = false
     const root = nodeAt(shell, 0)
     root.*.kind = NONE
     root.*.first = 0
@@ -312,8 +328,7 @@ pub fn create(allocator: Allocator) -> ?*Shell {
 }
 
 pub fn textBytes(shell: *Shell) -> [*]u8 {
-    var pointer: [*]u8 = undefined
-    unsafe { pointer = @ptrCast([*]u8, &shell.*.text) }
+    const pointer: [*]u8 = &shell.*.text
     return pointer
 }
 
@@ -384,8 +399,7 @@ pub fn wordText(shell: *Shell, node: u32) -> []const u8 {
 // The work stack
 
 pub fn workBytes(shell: *Shell) -> [*]u8 {
-    var pointer: [*]u8 = undefined
-    unsafe { pointer = @ptrCast([*]u8, &shell.*.work) }
+    const pointer: [*]u8 = &shell.*.work
     return pointer
 }
 
@@ -402,21 +416,18 @@ pub fn workAlloc(shell: *Shell, count: usize) -> ?[*]u8 {
 }
 
 pub fn offset(bytes: [*]u8, by: usize) -> [*]u8 {
-    var result: [*]u8 = undefined
-    unsafe { result = @ptrFromInt([*]u8, @intFromPtr(bytes) + by) }
+    const result: [*]u8 = bytes + by
     return result
 }
 
 // The pointer array from its `by`-th item on.
 pub fn constOffsetItems(items: [*][*]const u8, by: usize) -> [*][*]const u8 {
-    var result: [*][*]const u8 = undefined
-    unsafe { result = @ptrFromInt([*][*]const u8, @intFromPtr(items) + by * 8) }
+    const result: [*][*]const u8 = unsafe { @ptrFromInt([*][*]const u8, @intFromPtr(items) + by * 8) }
     return result
 }
 
 pub fn constOffset(bytes: [*]const u8, by: usize) -> [*]const u8 {
-    var result: [*]const u8 = undefined
-    unsafe { result = @ptrFromInt([*]const u8, @intFromPtr(bytes) + by) }
+    const result: [*]const u8 = bytes + by
     return result
 }
 
@@ -461,14 +472,12 @@ pub fn workString(shell: *Shell, text: []const u8) -> ?[*]u8 {
 // Variables
 
 fn variableBytes(shell: *Shell) -> [*]u8 {
-    var pointer: [*]u8 = undefined
-    unsafe { pointer = @ptrCast([*]u8, &shell.*.variableBytes) }
+    const pointer: [*]u8 = &shell.*.variableBytes
     return pointer
 }
 
 pub fn variableAt(shell: *Shell, index: usize) -> *Variable {
-    var pointer: *Variable = undefined
-    unsafe { pointer = @ptrCast(*Variable, &shell.*.variables[index]) }
+    const pointer: *Variable = unsafe { @ptrCast(*Variable, &shell.*.variables[index]) }
     return pointer
 }
 
@@ -482,14 +491,52 @@ pub fn variableValue(shell: *Shell, variable: *Variable) -> []const u8 {
     return bytes[variable.*.value..variable.*.value + variable.*.valueLength]
 }
 
+// FNV-1a of a name.
+fn nameHash(name: []const u8) -> u32 {
+    var hash: u32 = 2166136261
+    for byte in name { hash = (hash ^ @intCast(u32, byte)) *% 16777619 }
+    return hash
+}
+
 pub fn findVariable(shell: *Shell, name: []const u8) -> ?*Variable {
-    var index: usize = 0
-    while index < shell.*.variableCount {
-        const variable = variableAt(shell, index)
-        if variable.*.used && std.text.same(variableName(shell, variable), name) { return variable }
-        index += 1
+    const hash = nameHash(name)
+    var slot = @intCast(usize, hash) & (VARIABLE_SLOTS - 1)
+    while shell.*.variableIndex[slot] != 0 {
+        const variable = variableAt(shell, @intCast(usize, shell.*.variableIndex[slot]) - 1)
+        if variable.*.used && variable.*.hash == hash && @intCast(usize, variable.*.nameLength) == name.length && std.text.same(variableName(shell, variable), name) { return variable }
+        slot = (slot + 1) & (VARIABLE_SLOTS - 1)
     }
     return null
+}
+
+fn clearVariableIndex(shell: *Shell) -> void {
+    var slot: usize = 0
+    while slot < VARIABLE_SLOTS {
+        shell.*.variableIndex[slot] = 0
+        slot += 1
+    }
+    shell.*.variableIndexed = 0
+}
+
+// Indexes the variable at `index` under its hash; the index built again
+// from the live variables when it is three quarters full.
+fn indexVariable(shell: *Shell, index: usize) -> void {
+    if shell.*.variableIndexed + 1 > VARIABLE_SLOTS * 3 / 4 {
+        clearVariableIndex(shell)
+        var live: usize = 0
+        while live < shell.*.variableCount {
+            if live != index && variableAt(shell, live).*.used { placeInIndex(shell, live) }
+            live += 1
+        }
+    }
+    placeInIndex(shell, index)
+}
+
+fn placeInIndex(shell: *Shell, index: usize) -> void {
+    var slot = @intCast(usize, variableAt(shell, index).*.hash) & (VARIABLE_SLOTS - 1)
+    while shell.*.variableIndex[slot] != 0 { slot = (slot + 1) & (VARIABLE_SLOTS - 1) }
+    shell.*.variableIndex[slot] = @intCast(u16, index + 1)
+    shell.*.variableIndexed += 1
 }
 
 pub fn getVariable(shell: *Shell, name: []const u8) -> ?[]const u8 {
@@ -514,34 +561,63 @@ fn keepBytes(shell: *Shell, text: []const u8) -> usize {
     return at
 }
 
-// Rewrites the arena with the live variables' names and values only.
+// Rewrites the arena with the live variables' names and values only. The
+// pieces move down in the order they lie in the arena, not the variables'
+// order: a variable set again has its value at the end while the names
+// and values of later variables lie before it, and moving it first would
+// write over them before they moved.
 fn compact(shell: *Shell) -> void {
     const bytes = variableBytes(shell)
     var used: usize = 0
-    var index: usize = 0
-    while index < shell.*.variableCount {
-        const variable = variableAt(shell, index)
-        if variable.*.used {
-            const name_length = @intCast(usize, variable.*.nameLength)
-            const value_length = @intCast(usize, variable.*.valueLength)
-            const name_at = @intCast(usize, variable.*.name)
-            const value_at = @intCast(usize, variable.*.value)
-            var at: usize = 0
-            while at < name_length {
-                bytes[used + at] = bytes[name_at + at]
-                at += 1
+    var moved: usize = 0
+    var any_moved = false
+    while true {
+        // The piece lying first after the last one moved (pieces already
+        // moved lie at or before it, so they are not taken again).
+        var found = false
+        var lowest: usize = 0
+        var lowest_variable: usize = 0
+        var lowest_is_name = false
+        var index: usize = 0
+        while index < shell.*.variableCount {
+            const variable = variableAt(shell, index)
+            if variable.*.used {
+                const name_at = @intCast(usize, variable.*.name)
+                if variable.*.nameLength > 0 && (!any_moved || name_at > moved) && (!found || name_at < lowest) {
+                    found = true
+                    lowest = name_at
+                    lowest_variable = index
+                    lowest_is_name = true
+                }
+                const value_at = @intCast(usize, variable.*.value)
+                if variable.*.valueLength > 0 && (!any_moved || value_at > moved) && (!found || value_at < lowest) {
+                    found = true
+                    lowest = value_at
+                    lowest_variable = index
+                    lowest_is_name = false
+                }
             }
-            variable.*.name = @intCast(u32, used)
-            used += name_length
-            at = 0
-            while at < value_length {
-                bytes[used + at] = bytes[value_at + at]
-                at += 1
-            }
-            variable.*.value = @intCast(u32, used)
-            used += value_length
+            index += 1
         }
-        index += 1
+        if !found { break }
+        const variable = variableAt(shell, lowest_variable)
+        const length = @intCast(usize, if lowest_is_name { variable.*.nameLength } else { variable.*.valueLength })
+        var at: usize = 0
+        while at < length {
+            bytes[used + at] = bytes[lowest + at]
+            at += 1
+        }
+        if lowest_is_name { variable.*.name = @intCast(u32, used) } else { variable.*.value = @intCast(u32, used) }
+        used += length
+        moved = lowest
+        any_moved = true
+    }
+    // Empty values point anywhere; keep them inside the arena.
+    var slot: usize = 0
+    while slot < shell.*.variableCount {
+        const variable = variableAt(shell, slot)
+        if variable.*.used && variable.*.valueLength == 0 { variable.*.value = 0 }
+        slot += 1
     }
     shell.*.variableLength = used
 }
@@ -576,16 +652,26 @@ pub fn setVariable(shell: *Shell, name: []const u8, value: []const u8, exported:
         shell.*.variableCount += 1
     }
     const name_at = keepBytes(shell, name)
-    const value_at = keepBytes(shell, value)
-    if name_at == VARIABLE_CAPACITY || value_at == VARIABLE_CAPACITY { return false }
+    if name_at == VARIABLE_CAPACITY { return false }
+    // The variable is live before its value is kept: keeping the value may
+    // compact the arena, which moves the name only when it is a live one.
     const variable = variableAt(shell, slot)
     variable.*.name = @intCast(u32, name_at)
     variable.*.nameLength = @intCast(u32, name.length)
-    variable.*.value = @intCast(u32, value_at)
-    variable.*.valueLength = @intCast(u32, value.length)
+    variable.*.hash = nameHash(name)
+    indexVariable(shell, slot)
+    variable.*.value = 0
+    variable.*.valueLength = 0
     variable.*.exported = exported
     variable.*.readonly = false
     variable.*.used = true
+    const value_at = keepBytes(shell, value)
+    if value_at == VARIABLE_CAPACITY {
+        variable.*.used = false
+        return false
+    }
+    variable.*.value = @intCast(u32, value_at)
+    variable.*.valueLength = @intCast(u32, value.length)
     return true
 }
 
@@ -604,7 +690,7 @@ pub fn exportVariable(shell: *Shell, name: []const u8) -> void {
         found.?.*.exported = true
         return
     }
-    const set = setVariable(shell, name, "", true)
+    _ = setVariable(shell, name, "", true)
 }
 
 // Takes the process environment in as exported variables.
@@ -615,7 +701,7 @@ pub fn importEnvironment(shell: *Shell, entries: [*][*]const u8) -> void {
         var equals: usize = 0
         while equals < entry.length && entry[equals] != 61 { equals += 1 }
         if equals > 0 && equals < entry.length {
-            const set = setVariable(shell, entry[0..equals], entry[equals + 1..entry.length], true)
+            _ = setVariable(shell, entry[0..equals], entry[equals + 1..entry.length], true)
         }
         index += 1
     }
@@ -633,8 +719,7 @@ pub fn buildEnvironment(shell: *Shell) -> ?[*][*]const u8 {
     }
     const memory = workAlloc(shell, (count + 1) * 8)
     if memory == null { return null }
-    var items: [*][*]const u8 = undefined
-    unsafe { items = @ptrCast([*][*]const u8, memory.?) }
+    const items: [*][*]const u8 = unsafe { @ptrCast([*][*]const u8, memory.?) }
     var used: usize = 0
     index = 0
     while index < shell.*.variableCount {
@@ -662,14 +747,12 @@ pub fn buildEnvironment(shell: *Shell) -> ?[*][*]const u8 {
 // Functions
 
 fn functionBytes(shell: *Shell) -> [*]u8 {
-    var pointer: [*]u8 = undefined
-    unsafe { pointer = @ptrCast([*]u8, &shell.*.functionBytes) }
+    const pointer: [*]u8 = &shell.*.functionBytes
     return pointer
 }
 
 pub fn functionAt(shell: *Shell, index: usize) -> *Function {
-    var pointer: *Function = undefined
-    unsafe { pointer = @ptrCast(*Function, &shell.*.functions[index]) }
+    const pointer: *Function = unsafe { @ptrCast(*Function, &shell.*.functions[index]) }
     return pointer
 }
 
@@ -753,8 +836,7 @@ pub fn keptText(shell: *Shell, at: usize, length: usize) -> []const u8 {
 // Aliases (their names and values in the function arena)
 
 pub fn aliasAt(shell: *Shell, index: usize) -> *Alias {
-    var pointer: *Alias = undefined
-    unsafe { pointer = @ptrCast(*Alias, &shell.*.aliases[index]) }
+    const pointer: *Alias = unsafe { @ptrCast(*Alias, &shell.*.aliases[index]) }
     return pointer
 }
 
@@ -817,14 +899,12 @@ pub fn undefineAlias(shell: *Shell, name: []const u8) -> bool {
 // Jobs' command texts (the job arena, compacted when full)
 
 fn jobBytesOf(shell: *Shell) -> [*]u8 {
-    var pointer: [*]u8 = undefined
-    unsafe { pointer = @ptrCast([*]u8, &shell.*.jobBytes) }
+    const pointer: [*]u8 = &shell.*.jobBytes
     return pointer
 }
 
 pub fn jobAt(shell: *Shell, index: usize) -> *Job {
-    var pointer: *Job = undefined
-    unsafe { pointer = @ptrCast(*Job, &shell.*.jobs[index]) }
+    const pointer: *Job = unsafe { @ptrCast(*Job, &shell.*.jobs[index]) }
     return pointer
 }
 
@@ -880,8 +960,7 @@ pub fn keptJobLength(text: []const u8) -> usize {
 // Positional parameters
 
 fn positionalBytes(shell: *Shell) -> [*]u8 {
-    var pointer: [*]u8 = undefined
-    unsafe { pointer = @ptrCast([*]u8, &shell.*.positionalBytes) }
+    const pointer: [*]u8 = &shell.*.positionalBytes
     return pointer
 }
 
@@ -947,14 +1026,12 @@ pub fn clearPositional(shell: *Shell) -> void {
 }
 
 pub fn scriptName(shell: *Shell) -> []const u8 {
-    var bytes: [*]const u8 = undefined
-    unsafe { bytes = @ptrCast([*]const u8, &shell.*.scriptName) }
+    const bytes: [*]const u8 = &shell.*.scriptName
     return bytes[0..shell.*.scriptNameLength]
 }
 
 pub fn setScriptName(shell: *Shell, name: []const u8) -> void {
-    var bytes: [*]u8 = undefined
-    unsafe { bytes = @ptrCast([*]u8, &shell.*.scriptName) }
+    const bytes: [*]u8 = &shell.*.scriptName
     shell.*.scriptNameLength = std.text.append(bytes, 0, NAME_CAPACITY, name)
 }
 
@@ -962,47 +1039,43 @@ pub fn setScriptName(shell: *Shell, name: []const u8) -> void {
 // Messages
 
 pub fn say(text: []const u8) -> void {
-    const wrote = sys.writeAll(2, text)
+    _ = sys.writeAll(2, text)
 }
 
 // "mlx-sh: FIRST SECOND\n" on stderr.
 pub fn complain(first: []const u8, second: []const u8) -> void {
     var line: [1024]u8 = undefined
-    var bytes: [*]u8 = undefined
-    unsafe { bytes = @ptrCast([*]u8, &line) }
+    const bytes: [*]u8 = &line
     var length = std.text.append(bytes, 0, 1024, "mlx-sh: ")
     length = std.text.append(bytes, length, 1024, first)
     length = std.text.append(bytes, length, 1024, second)
     length = std.text.append(bytes, length, 1024, "\n")
-    const wrote = sys.write(2, bytes, length)
+    _ = sys.write(2, bytes, length)
 }
 
 // "mlx-sh: FIRST SECOND: THIRD\n".
 pub fn complainAbout(first: []const u8, second: []const u8, third: []const u8) -> void {
     var line: [1024]u8 = undefined
-    var bytes: [*]u8 = undefined
-    unsafe { bytes = @ptrCast([*]u8, &line) }
+    const bytes: [*]u8 = &line
     var length = std.text.append(bytes, 0, 1024, "mlx-sh: ")
     length = std.text.append(bytes, length, 1024, first)
     length = std.text.append(bytes, length, 1024, second)
     length = std.text.append(bytes, length, 1024, ": ")
     length = std.text.append(bytes, length, 1024, third)
     length = std.text.append(bytes, length, 1024, "\n")
-    const wrote = sys.write(2, bytes, length)
+    _ = sys.write(2, bytes, length)
 }
 
 // ---------------------------------------------------------------------------
 // Locals
 
 fn localBytes(shell: *Shell) -> [*]u8 {
-    var pointer: [*]u8 = undefined
-    unsafe { pointer = @ptrCast([*]u8, &shell.*.localBytes) }
+    const pointer: [*]u8 = &shell.*.localBytes
     return pointer
 }
 
 fn localAt(shell: *Shell, index: usize) -> *Local {
-    var pointer: *Local = undefined
-    unsafe { pointer = @ptrCast(*Local, &shell.*.locals[index]) }
+    const pointer: *Local = unsafe { @ptrCast(*Local, &shell.*.locals[index]) }
     return pointer
 }
 
@@ -1057,11 +1130,11 @@ pub fn restoreLocals(shell: *Shell, depth: usize) -> void {
             const value = bytes[value_at..value_at + @intCast(usize, local.*.valueLength)]
             const found = findVariable(shell, name)
             if found != null { found.?.*.readonly = false }
-            const set = setVariable(shell, name, value, local.*.exported)
+            _ = setVariable(shell, name, value, local.*.exported)
             const again = findVariable(shell, name)
             if again != null { again.?.*.exported = local.*.exported }
         } else {
-            const unset = unsetVariable(shell, name)
+            _ = unsetVariable(shell, name)
         }
         shell.*.localCount -= 1
         shell.*.localLength = name_at
@@ -1070,13 +1143,11 @@ pub fn restoreLocals(shell: *Shell, depth: usize) -> void {
 
 // The working directory, read from the kernel once per change.
 pub fn workingDirectory(shell: *Shell) -> []const u8 {
-    var bytes: [*]const u8 = undefined
-    unsafe { bytes = @ptrCast([*]const u8, &shell.*.workingDirectory) }
+    const bytes: [*]const u8 = &shell.*.workingDirectory
     return bytes[0..shell.*.workingDirectoryLength]
 }
 
 pub fn refreshWorkingDirectory(shell: *Shell) -> void {
-    var bytes: [*]u8 = undefined
-    unsafe { bytes = @ptrCast([*]u8, &shell.*.workingDirectory) }
+    const bytes: [*]u8 = &shell.*.workingDirectory
     shell.*.workingDirectoryLength = sys.workingDirectory(bytes, 4096)
 }

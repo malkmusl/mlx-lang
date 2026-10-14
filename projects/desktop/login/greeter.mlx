@@ -1,0 +1,235 @@
+// Starts the compositor that owns the login screen. It is a child of
+// mlx-login so SIGCHLD describes both relevant lifecycles. The child
+// drops to an unprivileged numeric uid/gid before exec and receives only
+// the environment needed by a Wayland compositor and mlx-greeter.
+const std = @import("std")
+const activation = @import("../ipc/activation.mlx")
+
+const SYS_read: usize = 0
+const SYS_write: usize = 1
+const SYS_close: usize = 3
+const SYS_fork: usize = 57
+const SYS_wait4: usize = 61
+const SYS_kill: usize = 62
+const SYS_chdir: usize = 80
+const SYS_chmod: usize = 90
+const SYS_chown: usize = 92
+const SYS_setuid: usize = 105
+const SYS_setgid: usize = 106
+const SYS_setsid: usize = 112
+const SYS_setgroups: usize = 116
+const SYS_nanosleep: usize = 35
+const SYS_exit_group: usize = 231
+const SYS_pipe2: usize = 293
+const SYS_rt_sigprocmask: usize = 14
+const O_CLOEXEC: usize = 524288
+const EINTR: isize = -4
+const PATH_MOST: usize = 512
+const ENVIRONMENT_MOST: usize = 4096
+const ENVIRONMENT_ENTRIES: usize = 24
+
+pub const Config = struct {
+    compositor: []const u8
+    program: []const u8
+    runtimeRoot: []const u8
+    busAddress: []const u8
+    environment: [*][*]const u8
+    busDescriptor: isize
+    uid: u32
+    gid: u32
+}
+
+fn copy(target: [*]u8, capacity: usize, value: []const u8) -> usize {
+    var index: usize = 0
+    while index < value.length && index < capacity {
+        target[index] = value[index]
+        index += 1
+    }
+    return index
+}
+
+fn cString(target: [*]u8, capacity: usize, value: []const u8) -> bool {
+    if value.length == 0 || value.length + 1 > capacity { return false }
+    var index: usize = 0
+    while index < value.length {
+        if value[index] == 0 { return false }
+        target[index] = value[index]
+        index += 1
+    }
+    target[index] = 0
+    return true
+}
+
+fn addPath(path: [*]u8, root: []const u8) -> usize {
+    if root.length == 0 || root.length + 10 >= PATH_MOST { return 0 }
+    var length = copy(path, PATH_MOST - 1, root)
+    if path[length - 1] != 47 {
+        path[length] = 47
+        length += 1
+    }
+    length += copy(@ptrFromInt([*]u8, @intFromPtr(path) + length), PATH_MOST - length - 1, "greeter")
+    path[length] = 0
+    return length
+}
+
+// Creates ROOT/greeter as the only writable home/runtime of the greeter.
+fn runtime(config: *const Config, path: [*]u8, length: *usize) -> bool {
+    var root: [PATH_MOST]u8 = undefined
+    var rootBytes: [*]u8 = undefined
+    unsafe { rootBytes = @ptrCast([*]u8, &root) }
+    if !cString(rootBytes, PATH_MOST, config.*.runtimeRoot) { return false }
+    const madeRoot = std.linux.syscall2(83, @intFromPtr(rootBytes), 493)
+    var status: std.fs.Stat = undefined
+    if std.fs.statusAt(rootBytes, &status, true) != 0 || status.user != 0 || status.mode & 61440 != 16384 || status.mode & 18 != 0 { return false }
+    const used = addPath(path, config.*.runtimeRoot)
+    if used == 0 { return false }
+    const made = std.linux.syscall2(83, @intFromPtr(path), 448)
+    if made != 0 && std.fs.statusAt(path, &status, true) != 0 { return false }
+    if std.linux.syscall2(SYS_chmod, @intFromPtr(path), 448) != 0 { return false }
+    if std.linux.syscall3(SYS_chown, @intFromPtr(path), @intCast(usize, config.*.uid), @intCast(usize, config.*.gid)) != 0 { return false }
+    if std.fs.statusAt(path, &status, true) != 0 || status.user != config.*.uid || status.group != config.*.gid || status.mode & 61440 != 16384 || status.mode & 63 != 0 { return false }
+    length.* = used
+    return true
+}
+
+fn entry(storage: [*]u8, used: *usize, entries: [*][*]const u8, count: *usize, key: []const u8, value: []const u8) -> bool {
+    if count.* >= ENVIRONMENT_ENTRIES || used.* + key.length + value.length + 1 > ENVIRONMENT_MOST { return false }
+    unsafe { entries[count.*] = @ptrFromInt([*]const u8, @intFromPtr(storage) + used.*) }
+    used.* += copy(@ptrFromInt([*]u8, @intFromPtr(storage) + used.*), ENVIRONMENT_MOST - used.*, key)
+    used.* += copy(@ptrFromInt([*]u8, @intFromPtr(storage) + used.*), ENVIRONMENT_MOST - used.*, value)
+    storage[used.*] = 0
+    used.* += 1
+    count.* += 1
+    return true
+}
+
+fn inherited(config: *const Config, storage: [*]u8, used: *usize, entries: [*][*]const u8, count: *usize, name: []const u8) -> bool {
+    const found = std.process.environmentFrom(config.*.environment, name)
+    if found == null || found.?.length == 0 { return true }
+    var key: [64]u8 = undefined
+    var keyBytes: [*]u8 = undefined
+    unsafe { keyBytes = @ptrCast([*]u8, &key) }
+    var length = copy(keyBytes, 62, name)
+    key[length] = 61
+    length += 1
+    return entry(storage, used, entries, count, keyBytes[0..length], std.string.asSlice(found.?))
+}
+
+fn childFailed(report: isize) -> void {
+    var byte: [1]u8 = [1]u8{ 1 }
+    var written = std.linux.syscall3(SYS_write, @bitCast(usize, report), @intFromPtr(&byte), 1)
+    while written == EINTR { written = std.linux.syscall3(SYS_write, @bitCast(usize, report), @intFromPtr(&byte), 1) }
+    const exited = std.linux.syscall1(SYS_exit_group, 127)
+}
+
+fn child(config: *const Config, compositor: [*]u8, program: [*]u8, directory: [*]u8, directoryLength: usize, report: isize) -> void {
+    const closedBus = std.linux.syscall1(SYS_close, @bitCast(usize, config.*.busDescriptor))
+    var none: usize = 0
+    if std.linux.syscall4(SYS_rt_sigprocmask, 2, @intFromPtr(&none), 0, 8) != 0 { childFailed(report) }
+    if std.linux.syscall0(SYS_setsid) < 0 { childFailed(report) }
+    if std.linux.syscall2(SYS_setgroups, 0, 0) != 0 { childFailed(report) }
+    if std.linux.syscall1(SYS_setgid, @intCast(usize, config.*.gid)) != 0 { childFailed(report) }
+    if std.linux.syscall1(SYS_setuid, @intCast(usize, config.*.uid)) != 0 { childFailed(report) }
+    if std.linux.syscall1(SYS_chdir, @intFromPtr(directory)) != 0 { childFailed(report) }
+
+    var storage: [ENVIRONMENT_MOST]u8 = undefined
+    var storageBytes: [*]u8 = undefined
+    unsafe { storageBytes = @ptrCast([*]u8, &storage) }
+    var environment: [ENVIRONMENT_ENTRIES + 1][*]const u8 = undefined
+    var environmentEntries: [*][*]const u8 = undefined
+    unsafe { environmentEntries = @ptrCast([*][*]const u8, &environment) }
+    var used: usize = 0
+    var count: usize = 0
+    var ok = entry(storageBytes, &used, environmentEntries, &count, "HOME=", directory[0..directoryLength]) &&
+        entry(storageBytes, &used, environmentEntries, &count, "USER=", "mlx-greeter") &&
+        entry(storageBytes, &used, environmentEntries, &count, "LOGNAME=", "mlx-greeter") &&
+        entry(storageBytes, &used, environmentEntries, &count, "PATH=", "/usr/local/bin:/usr/bin:/bin:/usr/bin/mlx") &&
+        entry(storageBytes, &used, environmentEntries, &count, "XDG_RUNTIME_DIR=", directory[0..directoryLength]) &&
+        entry(storageBytes, &used, environmentEntries, &count, "XDG_SESSION_TYPE=", "wayland") &&
+        entry(storageBytes, &used, environmentEntries, &count, "XDG_SESSION_ID=", "mlx-greeter") &&
+        entry(storageBytes, &used, environmentEntries, &count, "XDG_SEAT=", "seat0") &&
+        entry(storageBytes, &used, environmentEntries, &count, "XDG_VTNR=", "1") &&
+        entry(storageBytes, &used, environmentEntries, &count, "DBUS_SYSTEM_BUS_ADDRESS=", config.*.busAddress)
+    ok = ok && inherited(config, storageBytes, &used, environmentEntries, &count, "LANG")
+    ok = ok && inherited(config, storageBytes, &used, environmentEntries, &count, "LC_ALL")
+    ok = ok && inherited(config, storageBytes, &used, environmentEntries, &count, "LC_MESSAGES")
+    ok = ok && inherited(config, storageBytes, &used, environmentEntries, &count, "XDG_DATA_HOME")
+    ok = ok && inherited(config, storageBytes, &used, environmentEntries, &count, "XDG_DATA_DIRS")
+    ok = ok && inherited(config, storageBytes, &used, environmentEntries, &count, "MLX_COLOR_SCHEME")
+    ok = ok && inherited(config, storageBytes, &used, environmentEntries, &count, "XKB_DEFAULT_LAYOUT")
+    ok = ok && inherited(config, storageBytes, &used, environmentEntries, &count, "XKB_DEFAULT_VARIANT")
+    ok = ok && inherited(config, storageBytes, &used, environmentEntries, &count, "XKB_DEFAULT_MODEL")
+    ok = ok && inherited(config, storageBytes, &used, environmentEntries, &count, "XKB_DEFAULT_OPTIONS")
+    if !ok { childFailed(report) }
+    unsafe { environmentEntries[count] = @ptrFromInt([*]const u8, 0) }
+    var arguments: [4][*]const u8 = undefined
+    unsafe {
+        arguments[0] = @ptrCast([*]const u8, compositor)
+        arguments[1] = @ptrCast([*]const u8, "--greeter")
+        arguments[2] = @ptrCast([*]const u8, program)
+        arguments[3] = @ptrFromInt([*]const u8, 0)
+        activation.execute(arguments[0], @ptrCast([*][*]const u8, &arguments), environmentEntries)
+    }
+    childFailed(report)
+}
+
+// Starts COMPOSITOR --greeter PROGRAM after the privilege drop. A
+// positive pid means exec succeeded; -1 includes every setup failure.
+pub fn start(config: *const Config) -> isize {
+    if config.*.uid == 0 || config.*.gid == 0 || config.*.compositor.length == 0 || config.*.program.length == 0 { return -1 }
+    var compositor: [PATH_MOST]u8 = undefined
+    var compositorBytes: [*]u8 = undefined
+    var program: [PATH_MOST]u8 = undefined
+    var programBytes: [*]u8 = undefined
+    var directory: [PATH_MOST]u8 = undefined
+    var directoryBytes: [*]u8 = undefined
+    unsafe {
+        compositorBytes = @ptrCast([*]u8, &compositor)
+        programBytes = @ptrCast([*]u8, &program)
+        directoryBytes = @ptrCast([*]u8, &directory)
+    }
+    if !cString(compositorBytes, PATH_MOST, config.*.compositor) || !cString(programBytes, PATH_MOST, config.*.program) { return -1 }
+    var directoryLength: usize = 0
+    if !runtime(config, directoryBytes, &directoryLength) { return -1 }
+    var descriptors: [2]i32 = undefined
+    if std.linux.syscall2(SYS_pipe2, @intFromPtr(&descriptors), O_CLOEXEC) != 0 { return -1 }
+    const reader = @intCast(isize, descriptors[0])
+    const writer = @intCast(isize, descriptors[1])
+    const pid = std.linux.syscall0(SYS_fork)
+    if pid == 0 {
+        const closedReader = std.linux.syscall1(SYS_close, @bitCast(usize, reader))
+        child(config, compositorBytes, programBytes, directoryBytes, directoryLength, writer)
+    }
+    const closedWriter = std.linux.syscall1(SYS_close, @bitCast(usize, writer))
+    if pid < 0 {
+        const closedReader = std.linux.syscall1(SYS_close, @bitCast(usize, reader))
+        return -1
+    }
+    var problem: [1]u8 = undefined
+    var got = std.linux.syscall3(SYS_read, @bitCast(usize, reader), @intFromPtr(&problem), 1)
+    while got == EINTR { got = std.linux.syscall3(SYS_read, @bitCast(usize, reader), @intFromPtr(&problem), 1) }
+    const closedReader = std.linux.syscall1(SYS_close, @bitCast(usize, reader))
+    if got == 0 { return pid }
+    var status: usize = 0
+    const waited = std.linux.syscall4(SYS_wait4, @bitCast(usize, pid), @intFromPtr(&status), 0, 0)
+    return -1
+}
+
+// Lets the compositor cleanly restore the VT and devices, then uses KILL
+// only if it ignored TERM for roughly two seconds.
+pub fn stop(pid: isize) -> void {
+    if pid <= 0 { return }
+    const terminated = std.linux.syscall2(SYS_kill, @bitCast(usize, pid), 15)
+    var attempts: usize = 0
+    var status: usize = 0
+    while attempts < 20 {
+        var waited = std.linux.syscall4(SYS_wait4, @bitCast(usize, pid), @intFromPtr(&status), 1, 0)
+        if waited == pid || waited < 0 && waited != EINTR { return }
+        var delay: [2]usize = [2]usize{ 0, 100000000 }
+        const slept = std.linux.syscall2(SYS_nanosleep, @intFromPtr(&delay), 0)
+        attempts += 1
+    }
+    const killed = std.linux.syscall2(SYS_kill, @bitCast(usize, pid), 9)
+    var waited = std.linux.syscall4(SYS_wait4, @bitCast(usize, pid), @intFromPtr(&status), 0, 0)
+    while waited == EINTR { waited = std.linux.syscall4(SYS_wait4, @bitCast(usize, pid), @intFromPtr(&status), 0, 0) }
+}

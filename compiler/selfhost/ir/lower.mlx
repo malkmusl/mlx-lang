@@ -5,6 +5,7 @@ const mem = @import("../../../std/bootstrap/mem.mlx")
 const lir = @import("./lir.mlx")
 const inline_module = @import("./inline.mlx")
 const aggregate_copy = @import("./lowering/aggregate_copy.mlx")
+const decimal = @import("./lowering/decimal.mlx")
 const ast = @import("../ast/node.mlx")
 const ast_store = @import("../ast/store.mlx")
 const lexer = @import("../lexer.mlx")
@@ -127,6 +128,15 @@ pub const LirBuilder = struct {
     // How many `const` locals of the function being lowered hold a copy in
     // its frame (only then may `return` have to copy out of the frame).
     frameStorageCount: usize
+    // The storage the caller gave for the result (lir.FLAG_RETURN_SLOT),
+    // or NONE. A `return` of a call hands that call this storage instead
+    // of copying its result over: `forwardCall` is the call's node (in
+    // module `forwardModule`) while its value is lowered, `forwardedCall`
+    // the node once the call took the storage.
+    returnSlot: usize
+    forwardCall: usize
+    forwardModule: usize
+    forwardedCall: usize
     bindings: *vector.Vector
     bindingComponents: *vector.Vector
     loopTargets: *vector.Vector
@@ -152,6 +162,8 @@ pub const LirBuilder = struct {
     firstUnsupportedLength: usize
     firstUnsupportedModule: usize
     inlinedCallCount: usize
+    // `x == A || x == B || ...` chains tested as one bit mask.
+    membershipTestCount: usize
     automaticallyInlinedCallCount: usize
     inlineMissCount: usize
     optimizationLevel: u8
@@ -214,6 +226,10 @@ pub fn init(
             .paramCounter = 0,
             .currentReturnType = lir.NONE,
             .frameStorageCount = 0,
+            .returnSlot = lir.NONE,
+            .forwardCall = ast.NONE,
+            .forwardModule = 0,
+            .forwardedCall = ast.NONE,
             .bindings = bindings,
             .bindingComponents = binding_components,
             .loopTargets = loop_targets,
@@ -236,6 +252,7 @@ pub fn init(
             .firstUnsupportedLength = 0,
             .firstUnsupportedModule = 0,
             .inlinedCallCount = 0,
+            .membershipTestCount = 0,
             .automaticallyInlinedCallCount = 0,
             .inlineMissCount = 0,
             .optimizationLevel = optimization_level,
@@ -859,6 +876,7 @@ pub fn firstUnsupportedInstructionLength(builder: *LirBuilder) -> usize { return
 pub fn firstUnsupportedModuleId(builder: *LirBuilder) -> usize { return builder.*.firstUnsupportedModule }
 
 pub fn inlinedCallCount(builder: *LirBuilder) -> usize { return builder.*.inlinedCallCount }
+pub fn membershipTestCount(builder: *LirBuilder) -> usize { return builder.*.membershipTestCount }
 
 pub fn automaticallyInlinedCallCount(builder: *LirBuilder) -> usize { return builder.*.automaticallyInlinedCallCount }
 
@@ -1318,7 +1336,9 @@ fn isMainName(pointer: [*]const u8, length: usize) -> bool {
 fn typeWordCount(builder: *LirBuilder, type_id: usize) -> usize {
     if type_id == 0 { return 1 }
     const value = types_store.Store.get(builder.*.typeStore, type_id)
-    if value.*.kind == types_store.Kind.slice || value.*.kind == types_store.Kind.error_union { return 2 }
+    if value.*.kind == types_store.Kind.slice { return 2 }
+    // An error union is its tag and then the payload's words.
+    if value.*.kind == types_store.Kind.error_union { return 1 + typeWordCount(builder, value.*.rhs) }
     // An optional slice is the slice (null: pointer 0, length 0).
     if isOptionalSlice(builder, type_id) { return 2 }
     if value.*.kind == types_store.Kind.tuple {
@@ -1484,15 +1504,27 @@ fn lowerFunction(builder: *LirBuilder, node_index: usize) -> usize {
     if types_store.Store.get(builder.*.typeStore, return_type).*.kind == types_store.Kind.type_type { return lir.NONE }
     const function_symbol = addFunctionSymbol(builder, symbol_index, name_ptr, name_len)
     lir.setSymbolSource(builder.*.lir, function_symbol, builder.*.currentModuleId, tokenStart(builder, n.mainToken))
-    lir.addInst(builder.*.lir, lir.labelInst(return_type, function_symbol))
+    const returns_in_memory = aggregate_copy.isMemoryType(builder.*.typeStore, return_type)
+    var label = lir.labelInst(return_type, function_symbol)
+    if returns_in_memory { label.flags = lir.FLAG_RETURN_SLOT }
+    lir.addInst(builder.*.lir, label)
     const bindings_len = builder.*.bindings.*.length
     const binding_components_len = builder.*.bindingComponents.*.length
     const cleanup_depth = builder.*.deferredNodes.*.length
     const saved_return_type = builder.*.currentReturnType
     const saved_frame_storage = builder.*.frameStorageCount
+    const saved_return_slot = builder.*.returnSlot
     builder.*.currentReturnType = return_type
     builder.*.frameStorageCount = 0
     builder.*.paramCounter = 0
+    builder.*.returnSlot = lir.NONE
+    if returns_in_memory {
+        var slot = lir.initInst(lir.Opcode.param, return_type)
+        slot.arg0 = 0
+        slot.flags = lir.FLAG_RETURN_SLOT
+        builder.*.returnSlot = lir.addInst(builder.*.lir, slot)
+        builder.*.paramCounter = 1
+    }
     bindFunctionParameters(builder, n.lhs, function_type)
     const track_recursion = symbol_index != lir.NONE
     if track_recursion { pushInlineSymbol(builder, symbol_index) }
@@ -1509,6 +1541,7 @@ fn lowerFunction(builder: *LirBuilder, node_index: usize) -> usize {
     builder.*.bindingComponents.*.length = binding_components_len
     builder.*.currentReturnType = saved_return_type
     builder.*.frameStorageCount = saved_frame_storage
+    builder.*.returnSlot = saved_return_slot
     return lir.NONE
 }
 
@@ -1578,8 +1611,12 @@ fn lowerNodeHere(builder: *LirBuilder, node_index: usize) -> usize {
     if n.tag == ast.Tag.builtin_call {
         return lowerBuiltin(builder, node_index)
     }
+    if n.tag == ast.Tag.return_statement && builder.*.returnSlot != lir.NONE && n.rhs != ast.NONE {
+        return lowerSlotReturn(builder, n.rhs)
+    }
     if n.tag == ast.Tag.return_statement {
-        const val = returnedValue(builder, n.rhs, widenToType(builder, narrowFloat(builder, lowerNode(builder, n.rhs), builder.*.currentReturnType), builder.*.currentReturnType))
+        const returned_type = returnValueType(builder, n.rhs)
+        const val = returnedValue(builder, n.rhs, widenToType(builder, narrowFloat(builder, lowerNode(builder, n.rhs), returned_type), returned_type))
         emitDefersTo(builder, 0)
         if builder.*.currentReturnType != lir.NONE {
             const return_type = types_store.Store.get(builder.*.typeStore, builder.*.currentReturnType)
@@ -1598,20 +1635,42 @@ fn lowerNodeHere(builder: *LirBuilder, node_index: usize) -> usize {
                         return lir.addInst(builder.*.lir, union_return)
                     }
                 }
-                const extra_start = builder.*.lir.*.extraData.*.length
+                // The union is the tag 0 and then every word of the
+                // payload (a slice's length too).
+                const payload_words = typeWordCount(builder, return_type.*.rhs)
                 const success = lir.addInst(builder.*.lir, lir.constI(lir.NONE, 0))
+                var words: [8]usize = undefined
+                var word: usize = 1
+                while word < payload_words && word < 8 {
+                    var extract = lir.initInst(lir.Opcode.tuple_element, lir.NONE)
+                    extract.arg0 = val
+                    extract.arg1 = word
+                    words[word] = lir.addInst(builder.*.lir, extract)
+                    word += 1
+                }
+                const extra_start = builder.*.lir.*.extraData.*.length
                 lir.addExtra(builder.*.lir, success)
                 lir.addExtra(builder.*.lir, val)
+                word = 1
+                while word < payload_words && word < 8 {
+                    lir.addExtra(builder.*.lir, words[word])
+                    word += 1
+                }
                 var result = lir.initInst(lir.Opcode.tuple_literal, builder.*.currentReturnType)
                 result.arg0 = extra_start
-                result.arg1 = 2
+                result.arg1 = 1 + word
                 const union_value = lir.addInst(builder.*.lir, result)
                 var union_return = lir.initInst(lir.Opcode.ret_error_union, builder.*.currentReturnType)
                 union_return.arg0 = union_value
                 return lir.addInst(builder.*.lir, union_return)
             }
         }
-        return lir.addInst(builder.*.lir, lir.retInst(builder.*.currentReturnType, val))
+        // A bare `return` leaves nothing in the return register but what the
+        // last call put there, which a `!void` caller reads as an error;
+        // it returns zero, as falling off the end does.
+        var returned = val
+        if returned == lir.NONE && n.rhs == ast.NONE { returned = lir.addInst(builder.*.lir, lir.constI(builder.*.currentReturnType, 0)) }
+        return lir.addInst(builder.*.lir, lir.retInst(builder.*.currentReturnType, returned))
     }
     if n.tag == ast.Tag.block {
         return lowerBlock(builder, node_index)
@@ -1663,7 +1722,7 @@ fn lowerNodeHere(builder: *LirBuilder, node_index: usize) -> usize {
         }
         return lowerLocalBinding(builder, node_index)
     }
-    if n.tag == ast.Tag.unsafe_block {
+    if n.tag == ast.Tag.unsafe_block || n.tag == ast.Tag.unsafe_expression {
         return lowerNode(builder, n.lhs)
     }
     if n.tag == ast.Tag.comptime_block {
@@ -1749,19 +1808,35 @@ fn characterValue(pointer: [*]const u8, length: usize) -> usize {
 }
 
 fn lowerFloatLiteral(builder: *LirBuilder, main_token: usize) -> usize {
-    const pointer = tokenPointer(builder, main_token)
-    const length = tokenLength(builder, main_token)
-    const value = parseFloatLiteral(pointer, length)
-    return lir.addInst(builder.*.lir, lir.constI(types_store.Store.float(builder.*.typeStore, 64), @bitCast(usize, value)))
+    const bits = decimal.parse(tokenPointer(builder, main_token), tokenLength(builder, main_token))
+    return lir.addInst(builder.*.lir, lir.constI(types_store.Store.float(builder.*.typeStore, 64), @intCast(usize, bits)))
 }
 
 // Float literals are lowered as f64. Where one meets an f32 (a binding,
 // parameter, field, return value or the other operand) it is narrowed like
 // `@floatCast`; otherwise the f32 would read the low half of the f64 bits.
+// The type a `return` converts its value to: in a function returning an
+// error union, a value that is neither an error nor a union is the
+// payload (an f64 literal narrows to an `!f32`'s f32).
+fn returnValueType(builder: *LirBuilder, value_node: usize) -> usize {
+    const return_type = builder.*.currentReturnType
+    if return_type == lir.NONE || return_type == 0 || value_node == ast.NONE { return return_type }
+    const union_type = types_store.Store.get(builder.*.typeStore, return_type)
+    if union_type.*.kind != types_store.Kind.error_union { return return_type }
+    const value_type = expressionType(builder, value_node)
+    if value_type == 0 { return return_type }
+    const value_kind = types_store.Store.get(builder.*.typeStore, value_type).*.kind
+    if value_kind == types_store.Kind.error_set || value_kind == types_store.Kind.error_union { return return_type }
+    return union_type.*.rhs
+}
+
 fn narrowFloat(builder: *LirBuilder, value: usize, type_id: usize) -> usize {
     if value == lir.NONE || !isFloatType(builder, type_id, 32) { return value }
     const source = lir.getInst(builder.*.lir, value).typeId
-    if !isFloatType(builder, source, 64) { return value }
+    // Arithmetic on float literals alone is worked out in f64 (comptime
+    // float), so it narrows like an f64.
+    const comptime_float = source != 0 && source < builder.*.typeStore.*.types.*.length && types_store.Store.get(builder.*.typeStore, source).*.kind == types_store.Kind.comptime_float_type
+    if !isFloatType(builder, source, 64) && !comptime_float { return value }
     var conversion = lir.initInst(lir.Opcode.cast, type_id)
     conversion.arg0 = value
     conversion.arg1 = source
@@ -1777,51 +1852,6 @@ fn isFloatType(builder: *LirBuilder, type_id: usize, bits: usize) -> bool {
 fn valueType(builder: *LirBuilder, value: usize) -> usize {
     if value == lir.NONE { return 0 }
     return lir.getInst(builder.*.lir, value).typeId
-}
-
-fn parseFloatLiteral(pointer: [*]const u8, length: usize) -> f64 {
-    var value: f64 = 0.0
-    var fractional = false
-    var fractional_digits: usize = 0
-    var index: usize = 0
-    while index < length && pointer[index] != 101 && pointer[index] != 69 {
-        const byte = pointer[index]
-        if byte == 46 {
-            fractional = true
-        } else if byte >= 48 && byte <= 57 {
-            value = value * 10.0 + @floatFromInt(f64, @intCast(usize, byte) - 48)
-            if fractional { fractional_digits += 1 }
-        }
-        index += 1
-    }
-    var decimal_exponent: isize = 0 - @intCast(isize, fractional_digits)
-    if index < length {
-        index += 1
-        var negative = false
-        if index < length && (pointer[index] == 43 || pointer[index] == 45) {
-            negative = pointer[index] == 45
-            index += 1
-        }
-        var explicit_exponent: usize = 0
-        while index < length {
-            const byte = pointer[index]
-            if byte >= 48 && byte <= 57 && explicit_exponent < 4096 {
-                explicit_exponent = explicit_exponent * 10 + @intCast(usize, byte) - 48
-                if explicit_exponent > 4096 { explicit_exponent = 4096 }
-            }
-            index += 1
-        }
-        if negative { decimal_exponent -= @intCast(isize, explicit_exponent) } else { decimal_exponent += @intCast(isize, explicit_exponent) }
-    }
-    while decimal_exponent > 0 {
-        value *= 10.0
-        decimal_exponent -= 1
-    }
-    while decimal_exponent < 0 {
-        value /= 10.0
-        decimal_exponent += 1
-    }
-    return value
 }
 
 fn lowerBoolLiteral(builder: *LirBuilder, main_token: usize) -> usize {
@@ -2498,6 +2528,21 @@ fn lowerBuiltin(builder: *LirBuilder, node_index: usize) -> usize {
         instruction.arg1 = operand_type.*.bits
         return lir.addInst(builder.*.lir, instruction)
     }
+    if kind == builtins.Kind.sqrt {
+        const value = lowerNode(builder, argument)
+        if value == lir.NONE { return lir.NONE }
+        var instruction = lir.initInst(lir.Opcode.sqrt, expressionType(builder, node_index))
+        instruction.arg0 = value
+        return lir.addInst(builder.*.lir, instruction)
+    }
+    if kind == builtins.Kind.floor || kind == builtins.Kind.ceil || kind == builtins.Kind.trunc {
+        const value = lowerNode(builder, argument)
+        if value == lir.NONE { return lir.NONE }
+        var instruction = lir.initInst(lir.Opcode.round_float, expressionType(builder, node_index))
+        instruction.arg0 = value
+        instruction.arg1 = if kind == builtins.Kind.floor { 1 } else if kind == builtins.Kind.ceil { 2 } else { 3 }
+        return lir.addInst(builder.*.lir, instruction)
+    }
     if kind == builtins.Kind.byteMask64 {
         const needle_node = ast_store.Store.get(getNodes(builder), argument).next
         if needle_node == ast.NONE { return lir.NONE }
@@ -2528,9 +2573,30 @@ fn lowerBuiltin(builder: *LirBuilder, node_index: usize) -> usize {
         // builtin's destination through contextual coercion.  The emitted LIR
         // value retains the actual source representation used by codegen.
         conversion.arg1 = lir.getInst(builder.*.lir, value).typeId
-        return lir.addInst(builder.*.lir, conversion)
+        const converted = lir.addInst(builder.*.lir, conversion)
+        if kind == builtins.Kind.intCast || kind == builtins.Kind.bitCast { return extendAsType(builder, converted, expressionType(builder, argument), result_type_id) }
+        return converted
     }
     return lir.NONE
+}
+
+// An integer narrower than 64 bits keeps the rest of its register as its
+// type extends it: zeros when unsigned, copies of the sign when signed.
+// A cast that changes the signedness without widening must extend again,
+// or a later widening carries the old rule over (-3 as an i32 bit-cast to
+// u32 and widened to u64 would stay 0xFFFF_FFFF_FFFF_FFFD).
+fn extendAsType(builder: *LirBuilder, value: usize, source_type_id: usize, result_type_id: usize) -> usize {
+    if source_type_id == 0 || result_type_id == 0 { return value }
+    const source_type = types_store.Store.get(builder.*.typeStore, source_type_id)
+    const result_type = types_store.Store.get(builder.*.typeStore, result_type_id)
+    if source_type.*.kind != types_store.Kind.integer || result_type.*.kind != types_store.Kind.integer { return value }
+    const bits = integerBitWidth(builder, result_type_id)
+    const result_signed = result_type.*.flags & types_store.FLAG_SIGNED != 0
+    if bits >= 64 || bits > integerBitWidth(builder, source_type_id) || result_signed == (source_type.*.flags & types_store.FLAG_SIGNED != 0) { return value }
+    if !result_signed { return maskInteger(builder, value, result_type_id) }
+    const shift = lir.addInst(builder.*.lir, lir.constI(lir.NONE, 64 - bits))
+    const raised = lir.addInst(builder.*.lir, lir.binary(lir.Opcode.shl, result_type_id, value, shift))
+    return lir.addInst(builder.*.lir, lir.binary(lir.Opcode.shr, result_type_id, raised, shift))
 }
 
 fn lowerFieldAddress(builder: *LirBuilder, node_index: usize) -> usize {
@@ -2602,13 +2668,19 @@ fn lowerSymbolValue(builder: *LirBuilder, symbol_index: usize, symbol: *symbol_m
         return lir.addInst(builder.*.lir, function_inst)
     }
     if isGlobalSymbol(symbol) { return lowerGlobalValue(builder, symbol_index, symbol) }
-    return lowerStringConstant(builder, symbol, module_id)
+    return lowerConstantInitializer(builder, symbol, module_id)
 }
 
-// A module-level `const NAME = "text"` used as a value lowers to its string
-// literal (emitted with the program's other literals).
-fn lowerStringConstant(builder: *LirBuilder, symbol: *symbol_module.Symbol, module_id: usize) -> usize {
+// A module-level constant the comptime evaluator has no value for lowers
+// to its initializer, in its own module, where it is used: a string to its
+// literal (emitted with the program's other literals), a float to its
+// constant, a struct, array or tuple literal (slices in it too) to a value
+// built there. The initializer gets bindings of its own while it is
+// lowered: a local of the using function must not stand in for a name of
+// the constant's module.
+fn lowerConstantInitializer(builder: *LirBuilder, symbol: *symbol_module.Symbol, module_id: usize) -> usize {
     if symbol.*.declaration == ast.NONE { return lir.NONE }
+    const type_id = symbol.*.typeId
     const previous_module = builder.*.currentModuleId
     if module_id != previous_module { switchToModule(builder, module_id) }
     var result = lir.NONE
@@ -2617,7 +2689,19 @@ fn lowerStringConstant(builder: *LirBuilder, symbol: *symbol_module.Symbol, modu
         const declaration = ast_store.Store.get(nodes, symbol.*.declaration)
         if declaration.tag == ast.Tag.constant_declaration && declaration.rhs != ast.NONE {
             const initializer = ast_store.Store.get(nodes, declaration.rhs)
-            if initializer.tag == ast.Tag.string_literal { result = lowerStringLiteral(builder, initializer.mainToken) }
+            if initializer.tag == ast.Tag.string_literal {
+                result = lowerStringLiteral(builder, initializer.mainToken)
+            } else if initializer.tag == ast.Tag.float_literal || initializer.tag == ast.Tag.unary_expression || initializer.tag == ast.Tag.binary_expression || initializer.tag == ast.Tag.aggregate_literal || initializer.tag == ast.Tag.array_literal || initializer.tag == ast.Tag.tuple_literal {
+                var own_bindings: vector.Vector = undefined
+                vector.Vector.initAt(&own_bindings, builder.*.allocator, @sizeOf(Binding), @alignOf(Binding), 4)
+                const saved_bindings = builder.*.bindings
+                const components_length = builder.*.bindingComponents.*.length
+                builder.*.bindings = &own_bindings
+                result = widenToType(builder, narrowFloat(builder, lowerNode(builder, declaration.rhs), type_id), type_id)
+                builder.*.bindings = saved_bindings
+                builder.*.bindingComponents.*.length = components_length
+                vector.Vector.deinit(own_bindings)
+            }
         }
     }
     if module_id != previous_module { switchToModule(builder, previous_module) }
@@ -2695,17 +2779,22 @@ fn aggregateMethodIndex(builder: *LirBuilder, owner_type: usize, pointer: [*]con
     const found = symbols_store.Store.aggregateMethod(builder.*.symbolStore, owner_type, pointer, length)
     if found.0 { return found.1 }
     if owner_type == 0 { return lir.NONE }
+    // A method of an equal owner with another type id: among the methods
+    // of that name (the store's index by name), the first declared.
     const owner = types_store.Store.get(builder.*.typeStore, owner_type)
-    var index: usize = 0
-    while index < builder.*.symbolStore.*.length {
-        const candidate = symbols_store.Store.get(builder.*.symbolStore, index)
-        if candidate.*.ownerTypeId != 0 && candidate.*.nameLength == length && mem.eql(candidate.*.namePointer, pointer, length) {
+    const store = builder.*.symbolStore
+    var best = lir.NONE
+    var slot = symbols_store.Store.firstNamed(store, pointer, length)
+    while symbols_store.Store.namedAt(store, slot) != 0 {
+        const index = symbols_store.Store.namedAt(store, slot) - 1
+        const candidate = symbols_store.Store.get(store, index)
+        if (best == lir.NONE || index < best) && candidate.*.nameLength == length && mem.eql(candidate.*.namePointer, pointer, length) {
             const candidate_owner = types_store.Store.get(builder.*.typeStore, candidate.*.ownerTypeId)
-            if candidate_owner.*.kind == owner.*.kind && candidate_owner.*.bits == owner.*.bits { return index }
+            if candidate_owner.*.kind == owner.*.kind && candidate_owner.*.bits == owner.*.bits { best = index }
         }
-        index += 1
+        slot = symbols_store.Store.nextNamed(store, slot)
     }
-    return lir.NONE
+    return best
 }
 
 fn aggregateTypeFromPrefix(builder: *LirBuilder, node_index: usize) -> usize {
@@ -2768,6 +2857,7 @@ fn expressionTypeUncached(builder: *LirBuilder, node_index: usize) -> usize {
     if node_index == ast.NONE { return 0 }
     const nodes = getNodes(builder)
     const node = ast_store.Store.get(nodes, node_index)
+    if node.tag == ast.Tag.unsafe_expression { return expressionType(builder, node.lhs) }
     if node.tag == ast.Tag.identifier || node.tag == ast.Tag.named_type {
         const pointer = tokenPointer(builder, node.mainToken)
         const length = tokenLength(builder, node.mainToken)
@@ -2824,6 +2914,12 @@ fn expressionTypeUncached(builder: *LirBuilder, node_index: usize) -> usize {
         const kind = builtins.lookup(builder.*.sourcePointer[0..builder.*.sourceLength], getTokens(builder).*, node.mainToken)
         if kind == builtins.Kind.typeOf || kind == builtins.Kind.childType || kind == builtins.Kind.fieldType || kind == builtins.Kind.typeInfo || kind == builtins.Kind.decl {
             return types_store.Store.primitive(builder.*.typeStore, types_store.Kind.type_type)
+        }
+        if kind == builtins.Kind.sqrt || kind == builtins.Kind.floor || kind == builtins.Kind.ceil || kind == builtins.Kind.trunc {
+            const operand_type = expressionType(builder, node.lhs)
+            if operand_type == 0 { return 0 }
+            if types_store.Store.get(builder.*.typeStore, operand_type).*.kind == types_store.Kind.comptime_float_type { return types_store.Store.float(builder.*.typeStore, 64) }
+            return operand_type
         }
         if kind == builtins.Kind.fieldName { return types_store.Store.slice(builder.*.typeStore, types_store.Store.integer(builder.*.typeStore, false, 8), true) }
         if kind == builtins.Kind.ptrCast || kind == builtins.Kind.ptrFromInt || kind == builtins.Kind.intCast || kind == builtins.Kind.bitCast || kind == builtins.Kind.enumFromInt || kind == builtins.Kind.floatCast || kind == builtins.Kind.floatFromInt || kind == builtins.Kind.intFromFloat || kind == builtins.Kind.alignCast {
@@ -2894,6 +2990,17 @@ fn expressionTypeUncached(builder: *LirBuilder, node_index: usize) -> usize {
         const metadata = fieldMetadata(builder, base_type, node.mainToken)
         if metadata.found { return metadata.typeId }
         const base = types_store.Store.get(builder.*.typeStore, base_type)
+        // `pair.1`: the tuple's part; a local made from it takes the part's
+        // words (a slice its two).
+        if base.*.kind == types_store.Kind.tuple && tokenKind(builder, node.mainToken) == lexer.Kind.integer {
+            const part = lowerIntValue(builder, node.mainToken)
+            if part < base.*.extraLength { return types_store.Store.extraAt(builder.*.typeStore, base.*.extraStart + part) }
+        }
+        if base.*.kind == types_store.Kind.slice && isSlicePointerField(builder, node.mainToken) {
+            const element = base.*.lhs
+            const constant = base.*.flags & types_store.FLAG_CONSTANT != 0
+            return types_store.Store.pointer(builder.*.typeStore, element, constant, false, true)
+        }
         if base.*.kind == types_store.Kind.slice || base.*.kind == types_store.Kind.array { return types_store.Store.sizeInteger(builder.*.typeStore, false) }
         return 0
     }
@@ -2904,6 +3011,10 @@ fn expressionTypeUncached(builder: *LirBuilder, node_index: usize) -> usize {
         const operand = types_store.Store.get(builder.*.typeStore, operand_type)
         if kind == lexer.Kind.dot_asterisk && (operand.*.kind == types_store.Kind.pointer || operand.*.kind == types_store.Kind.many_pointer) { return operand.*.lhs }
         if kind == lexer.Kind.dot_question && operand.*.kind == types_store.Kind.optional { return operand.*.lhs }
+        // `try value` is the payload: a binding made from it (a struct, an
+        // array, a slice) has the payload's type and words, not the error
+        // union's two.
+        if kind == lexer.Kind.keyword_try && operand.*.kind == types_store.Kind.error_union { return operand.*.rhs }
         if kind == lexer.Kind.ampersand { return types_store.Store.pointer(builder.*.typeStore, operand_type, false, false, false) }
         return operand_type
     }
@@ -2923,6 +3034,10 @@ fn expressionTypeUncached(builder: *LirBuilder, node_index: usize) -> usize {
     }
     if node.tag == ast.Tag.boolean_literal { return types_store.Store.primitive(builder.*.typeStore, types_store.Kind.bool_type) }
     if node.tag == ast.Tag.integer_literal || node.tag == ast.Tag.character_literal { return types_store.Store.primitive(builder.*.typeStore, types_store.Kind.comptime_int_type) }
+    // A float literal is a comptime float: arithmetic on two of them is
+    // float arithmetic (it was untyped, and the backend added the bit
+    // patterns as integers: 1.0 / 255.0 came out 0).
+    if node.tag == ast.Tag.float_literal { return types_store.Store.primitive(builder.*.typeStore, types_store.Kind.comptime_float_type) }
     if node.tag == ast.Tag.string_literal || node.tag == ast.Tag.byte_string_literal {
         return types_store.Store.slice(builder.*.typeStore, types_store.Store.integer(builder.*.typeStore, false, 8), true)
     }
@@ -2980,6 +3095,13 @@ fn isSignedIntegerType(builder: *LirBuilder, type_id: usize) -> bool {
     // enum(i32) read back equal to their constants.
     if value.*.kind == types_store.Kind.enum_type && value.*.backing != types_store.NONE && value.*.backing != type_id { return isSignedIntegerType(builder, value.*.backing) }
     return value.*.kind == types_store.Kind.integer && value.*.flags & types_store.FLAG_SIGNED != 0
+}
+
+// Whether the field named at `field_token` is a slice's `pointer` (any
+// other field of a slice is its `length`; sema allows those two).
+fn isSlicePointerField(builder: *LirBuilder, field_token: usize) -> bool {
+    if tokenLength(builder, field_token) != 7 { return false }
+    unsafe { return mem.eql(tokenPointer(builder, field_token), @ptrCast([*]const u8, "pointer"), 7) }
 }
 
 fn lowerField(builder: *LirBuilder, node_index: usize) -> usize {
@@ -3094,6 +3216,12 @@ fn lowerField(builder: *LirBuilder, node_index: usize) -> usize {
     const base_type_id = expressionType(builder, node.lhs)
     if base_type_id != 0 {
         const base_type = types_store.Store.get(builder.*.typeStore, base_type_id)
+        if base_type.*.kind == types_store.Kind.slice && isSlicePointerField(builder, node.mainToken) {
+            var pointer = lir.initInst(lir.Opcode.tuple_element, expressionType(builder, node_index))
+            pointer.arg0 = lowerNode(builder, node.lhs)
+            pointer.arg1 = 0
+            return lir.addInst(builder.*.lir, pointer)
+        }
         if base_type.*.kind == types_store.Kind.slice || base_type.*.kind == types_store.Kind.array {
             const base_value = lowerNode(builder, node.lhs)
             var length_value: usize = 0
@@ -3416,6 +3544,9 @@ fn lowerShiftOperator(builder: *LirBuilder, kind: lexer.Kind, lhs: usize, rhs: u
 
 fn lowerValueOperator(builder: *LirBuilder, kind: lexer.Kind, lhs: usize, rhs: usize, type_id: usize) -> usize {
     if isShiftOperator(kind) { return lowerShiftOperator(builder, kind, lhs, rhs, type_id) }
+    if (kind == lexer.Kind.plus || kind == lexer.Kind.minus) && type_id != 0 && types_store.Store.get(builder.*.typeStore, type_id).*.kind == types_store.Kind.many_pointer {
+        return lowerPointerStep(builder, kind == lexer.Kind.minus, lhs, rhs, type_id)
+    }
     var opcode = lir.Opcode.add
     if kind == lexer.Kind.minus || kind == lexer.Kind.minus_percent || kind == lexer.Kind.minus_pipe { opcode = lir.Opcode.sub }
     if kind == lexer.Kind.asterisk || kind == lexer.Kind.asterisk_percent || kind == lexer.Kind.asterisk_pipe { opcode = lir.Opcode.mul }
@@ -3425,6 +3556,58 @@ fn lowerValueOperator(builder: *LirBuilder, kind: lexer.Kind, lhs: usize, rhs: u
     if kind == lexer.Kind.pipe { opcode = lir.Opcode.bit_or }
     if kind == lexer.Kind.caret { opcode = lir.Opcode.bit_xor }
     return emitArithmeticPolicy(builder, kind, opcode, lhs, rhs, type_id)
+}
+
+// A many-item pointer moved by `count` elements: the address of element
+// `count` (or `-count`), as indexing works it out.
+fn lowerPointerStep(builder: *LirBuilder, backwards: bool, pointer: usize, count: usize, type_id: usize) -> usize {
+    var stride = types_store.Store.sizeOf(builder.*.typeStore, types_store.Store.get(builder.*.typeStore, type_id).*.lhs)
+    if stride == 0 { stride = 1 }
+    var index = count
+    if backwards {
+        const zero = lir.addInst(builder.*.lir, lir.constI(lir.NONE, 0))
+        index = lir.addInst(builder.*.lir, lir.binary(lir.Opcode.sub, lir.NONE, zero, count))
+    }
+    var address = lir.initInst(lir.Opcode.gep, type_id)
+    address.arg0 = pointer
+    address.arg1 = index
+    address.arg2 = stride
+    return lir.addInst(builder.*.lir, address)
+}
+
+// Jumps to `true_block` or `false_block` as a condition holds: `&&`, `||`
+// and `!` become jumps between blocks (the right side only reached when it
+// decides), not a value stored, loaded and tested.
+fn lowerBranch(builder: *LirBuilder, node_index: usize, true_block: usize, false_block: usize) -> void {
+    const node = ast_store.Store.get(getNodes(builder), node_index)
+    if node.tag == ast.Tag.binary_expression {
+        const kind = tokenKind(builder, node.mainToken)
+        if kind == lexer.Kind.ampersand_ampersand || kind == lexer.Kind.pipe_pipe {
+            if kind == lexer.Kind.pipe_pipe {
+                const membership = lowerMembership(builder, node_index)
+                if membership != lir.NONE {
+                    lir.addInst(builder.*.lir, lir.condBranch(membership, true_block, false_block))
+                    return
+                }
+            }
+            const middle = builder.*.blockCounter
+            builder.*.blockCounter += 1
+            if kind == lexer.Kind.ampersand_ampersand {
+                lowerBranch(builder, node.lhs, middle, false_block)
+            } else {
+                lowerBranch(builder, node.lhs, true_block, middle)
+            }
+            lir.addInst(builder.*.lir, lir.blockLabelInst(middle))
+            lowerBranch(builder, node.rhs, true_block, false_block)
+            return
+        }
+    }
+    if node.tag == ast.Tag.unary_expression && tokenKind(builder, node.mainToken) == lexer.Kind.bang {
+        lowerBranch(builder, node.lhs, false_block, true_block)
+        return
+    }
+    const value = lowerNode(builder, node_index)
+    lir.addInst(builder.*.lir, lir.condBranch(value, true_block, false_block))
 }
 
 fn lowerLogical(builder: *LirBuilder, lhs_node: usize, rhs_node: usize, is_and: bool) -> usize {
@@ -3463,6 +3646,131 @@ fn lowerLogical(builder: *LirBuilder, lhs_node: usize, rhs_node: usize, is_and: 
     var result_load = lir.initInst(lir.Opcode.load, lir.NONE)
     result_load.arg0 = result_address
     return lir.addInst(builder.*.lir, result_load)
+}
+
+// The constants an `||` chain compares one value with, as bits (below
+// 128: `low` for 0..63, `high` for 64..127).
+const Membership = struct {
+    subject: usize
+    low: usize
+    high: usize
+    count: usize
+}
+
+// `x == A || x == B || ...`, one side-effect-free unsigned or enum value
+// against at least three constants below 128 (integers, enum members):
+// the bit for x in a mask of the constants, instead of a test, a branch
+// and a stored result for each `||`.
+fn lowerMembership(builder: *LirBuilder, node_index: usize) -> usize {
+    var set = Membership.{ .subject = ast.NONE, .low = 0, .high = 0, .count = 0 }
+    if !collectMembers(builder, node_index, &set) || set.count < 3 { return lir.NONE }
+    const subject_type_id = expressionType(builder, set.subject)
+    if subject_type_id == 0 || isSignedIntegerType(builder, subject_type_id) { return lir.NONE }
+    var subject_type = types_store.Store.get(builder.*.typeStore, subject_type_id)
+    if subject_type.*.kind == types_store.Kind.enum_type && subject_type.*.backing != types_store.NONE && subject_type.*.backing != subject_type_id {
+        subject_type = types_store.Store.get(builder.*.typeStore, subject_type.*.backing)
+    }
+    if subject_type.*.kind != types_store.Kind.integer { return lir.NONE }
+    const word = types_store.Store.sizeInteger(builder.*.typeStore, false)
+    var value = lowerNode(builder, set.subject)
+    if value == lir.NONE { return lir.NONE }
+    if subject_type.*.bits > 0 && subject_type.*.bits < 64 {
+        const width_mask = lir.addInst(builder.*.lir, lir.constI(word, (@intCast(usize, 1) << @intCast(u6, subject_type.*.bits)) - 1))
+        value = lir.addInst(builder.*.lir, lir.binary(lir.Opcode.bit_and, word, value, width_mask))
+    }
+    builder.*.membershipTestCount += 1
+    const one = lir.addInst(builder.*.lir, lir.constI(word, 1))
+    const word_bits = lir.addInst(builder.*.lir, lir.constI(word, 64))
+    const shift = lir.addInst(builder.*.lir, lir.binary(lir.Opcode.bit_and, word, value, lir.addInst(builder.*.lir, lir.constI(word, 63))))
+    var bit = memberBit(builder, word, set.low, shift, one, emitComparison(builder, lir.CmpPredicate.ult, value, word_bits))
+    if set.high != 0 {
+        const above = lir.addInst(builder.*.lir, lir.binary(lir.Opcode.sub, word, value, word_bits))
+        const in_high = emitComparison(builder, lir.CmpPredicate.ult, above, word_bits)
+        bit = lir.addInst(builder.*.lir, lir.binary(lir.Opcode.bit_or, word, bit, memberBit(builder, word, set.high, shift, one, in_high)))
+    }
+    return emitComparison(builder, lir.CmpPredicate.ne, bit, lir.addInst(builder.*.lir, lir.constI(word, 0)))
+}
+
+// (mask >> shift) & 1, kept only where `in_range` holds.
+fn memberBit(builder: *LirBuilder, word: usize, mask: usize, shift: usize, one: usize, in_range: usize) -> usize {
+    const shifted = lir.addInst(builder.*.lir, lir.binary(lir.Opcode.shr, word, lir.addInst(builder.*.lir, lir.constI(word, mask)), shift))
+    const bit = lir.addInst(builder.*.lir, lir.binary(lir.Opcode.bit_and, word, shifted, one))
+    return lir.addInst(builder.*.lir, lir.binary(lir.Opcode.bit_and, word, bit, in_range))
+}
+
+fn collectMembers(builder: *LirBuilder, node_index: usize, set: *Membership) -> bool {
+    if node_index == ast.NONE { return false }
+    const node = ast_store.Store.get(getNodes(builder), node_index)
+    if node.tag != ast.Tag.binary_expression { return false }
+    const kind = tokenKind(builder, node.mainToken)
+    if kind == lexer.Kind.pipe_pipe { return collectMembers(builder, node.lhs, set) && collectMembers(builder, node.rhs, set) }
+    if kind != lexer.Kind.equal_equal { return false }
+    var other = node.lhs
+    var constant = constantMember(builder, node.rhs)
+    if !constant.0 {
+        other = node.rhs
+        constant = constantMember(builder, node.lhs)
+    }
+    if !constant.0 || constant.1 >= 128 || !isPlainOperand(builder, other) { return false }
+    if set.*.subject == ast.NONE {
+        set.*.subject = other
+    } else if !sameOperand(builder, set.*.subject, other) {
+        return false
+    }
+    if constant.1 < 64 {
+        set.*.low = set.*.low | (@intCast(usize, 1) << @intCast(u6, constant.1))
+    } else {
+        set.*.high = set.*.high | (@intCast(usize, 1) << @intCast(u6, constant.1 - 64))
+    }
+    set.*.count += 1
+    return true
+}
+
+// An integer literal or a member of a named enum type, and its value.
+fn constantMember(builder: *LirBuilder, node_index: usize) -> (bool, usize) {
+    const node = ast_store.Store.get(getNodes(builder), node_index)
+    if node.tag == ast.Tag.integer_literal || node.tag == ast.Tag.character_literal {
+        const value = lowerComptimeValue(builder, node_index)
+        if value.kind == comptime_value.Kind.integer && value.integer >= 0 { return -> (true, @intCast(usize, value.integer)) }
+        return -> (false, 0)
+    }
+    if node.tag != ast.Tag.field_expression || node.lhs == ast.NONE { return -> (false, 0) }
+    const referenced = referencedSymbolIndex(builder, node.lhs)
+    if !referenced.0 { return -> (false, 0) }
+    const base = symbols_store.Store.get(builder.*.symbolStore, referenced.1)
+    if types_store.Store.get(builder.*.typeStore, base.*.typeId).*.kind != types_store.Kind.type_type || base.*.valueTypeId == 0 { return -> (false, 0) }
+    const reflected = types_store.Store.get(builder.*.typeStore, base.*.valueTypeId)
+    if reflected.*.kind != types_store.Kind.enum_type { return -> (false, 0) }
+    const field_pointer = tokenPointer(builder, node.mainToken)
+    const field_length = tokenLength(builder, node.mainToken)
+    var field_index: usize = 0
+    while field_index < reflected.*.extraLength {
+        const field = types_store.Store.fieldAt(builder.*.typeStore, reflected.*.extraStart + field_index)
+        if field.*.nameLength == field_length && mem.eql(field.*.namePointer, field_pointer, field_length) { return -> (true, field.*.offset) }
+        field_index += 1
+    }
+    return -> (false, 0)
+}
+
+// A local, a field of one or a value behind a pointer: reading it twice
+// or once is the same.
+fn isPlainOperand(builder: *LirBuilder, node_index: usize) -> bool {
+    if node_index == ast.NONE { return false }
+    const node = ast_store.Store.get(getNodes(builder), node_index)
+    if node.tag == ast.Tag.identifier { return findBinding(builder, tokenPointer(builder, node.mainToken), tokenLength(builder, node.mainToken)) != lir.NONE }
+    if node.tag == ast.Tag.field_expression { return isPlainOperand(builder, node.lhs) }
+    if node.tag == ast.Tag.unary_expression && tokenKind(builder, node.mainToken) == lexer.Kind.dot_asterisk { return isPlainOperand(builder, node.lhs) }
+    return false
+}
+
+fn sameOperand(builder: *LirBuilder, left_index: usize, right_index: usize) -> bool {
+    const left = ast_store.Store.get(getNodes(builder), left_index)
+    const right = ast_store.Store.get(getNodes(builder), right_index)
+    if left.tag != right.tag { return false }
+    const length = tokenLength(builder, left.mainToken)
+    if length != tokenLength(builder, right.mainToken) || !mem.eql(tokenPointer(builder, left.mainToken), tokenPointer(builder, right.mainToken), length) { return false }
+    if left.tag == ast.Tag.identifier { return true }
+    return sameOperand(builder, left.lhs, right.lhs)
 }
 
 fn implicitMethodReceiver(builder: *LirBuilder, callee_node_index: usize, referenced: (bool, usize)) -> usize {
@@ -3564,7 +3872,11 @@ fn lowerBinaryOp(builder: *LirBuilder, node_index: usize) -> usize {
         return result
     }
     if kind == lexer.Kind.ampersand_ampersand { return lowerLogical(builder, n.lhs, n.rhs, true) }
-    if kind == lexer.Kind.pipe_pipe { return lowerLogical(builder, n.lhs, n.rhs, false) }
+    if kind == lexer.Kind.pipe_pipe {
+        const membership = lowerMembership(builder, node_index)
+        if membership != lir.NONE { return membership }
+        return lowerLogical(builder, n.lhs, n.rhs, false)
+    }
 
     const lhs_lowered = lowerNode(builder, n.lhs)
     const rhs_lowered = lowerNode(builder, n.rhs)
@@ -3693,15 +4005,23 @@ fn lowerCallArguments(builder: *LirBuilder, node: ast.Node, generic_instance: us
         reserved += 1
     }
     var argument_count: usize = 0
+    var callee_type: usize = 0
+    if generic_instance == lir.NONE {
+        callee_type = expressionType(builder, node.lhs)
+        if callee_type == 0 {
+            // `pointer.method`, which has no type as a field.
+            const referenced = referencedSymbolIndex(builder, node.lhs)
+            if referenced.0 { callee_type = symbols_store.Store.get(builder.*.symbolStore, referenced.1).*.typeId }
+        }
+    }
     if receiver != ast.NONE {
-        lir.setExtra(builder.*.lir, args_start, lowerNode(builder, receiver))
+        lir.setExtra(builder.*.lir, args_start, lowerReceiver(builder, callee_type, receiver))
         argument_count = 1
     }
     // The callee's parameter types, when its type lists every argument.
     var parameters_start: usize = 0
     var parameters_known = false
     if generic_instance == lir.NONE {
-        const callee_type = expressionType(builder, node.lhs)
         if callee_type != 0 && callee_type < builder.*.typeStore.*.types.*.length {
             const function_type = types_store.Store.get(builder.*.typeStore, callee_type)
             parameters_known = function_type.*.kind == types_store.Kind.function && function_type.*.extraLength == node.extra + implicit_count
@@ -3725,6 +4045,21 @@ fn lowerCallArguments(builder: *LirBuilder, node: ast.Node, generic_instance: us
         source_argument_index += 1
     }
     return CallArguments.{ .start = args_start, .count = argument_count }
+}
+
+// A method's receiver: the value, or its address when the method takes a
+// pointer and the value is none (`counter.add(1)` on a local counter).
+fn lowerReceiver(builder: *LirBuilder, callee_type: usize, receiver: usize) -> usize {
+    const receiver_type = expressionType(builder, receiver)
+    if callee_type != 0 && receiver_type != 0 {
+        const function_type = types_store.Store.get(builder.*.typeStore, callee_type)
+        if function_type.*.kind == types_store.Kind.function && function_type.*.extraLength > 0 {
+            const parameter_kind = types_store.Store.get(builder.*.typeStore, types_store.Store.extraAt(builder.*.typeStore, function_type.*.extraStart)).*.kind
+            const receiver_kind = types_store.Store.get(builder.*.typeStore, receiver_type).*.kind
+            if parameter_kind == types_store.Kind.pointer && receiver_kind != types_store.Kind.pointer { return lowerAddressOf(builder, receiver) }
+        }
+    }
+    return lowerNode(builder, receiver)
 }
 
 fn tryExpandCall(builder: *LirBuilder, symbol_index: usize, generic_instance: usize, arguments: CallArguments) -> InlineExpansion {
@@ -3753,6 +4088,78 @@ fn tryExpandCall(builder: *LirBuilder, symbol_index: usize, generic_instance: us
     return InlineExpansion.{ .expanded = false, .value = lir.NONE }
 }
 
+// `return value` from a function given its caller's storage for the
+// result: the value is copied there, unless it is a call that wrote it
+// there itself, and the storage's address is returned.
+fn lowerSlotReturn(builder: *LirBuilder, value_node: usize) -> usize {
+    const saved_call = builder.*.forwardCall
+    const saved_module = builder.*.forwardModule
+    const saved_forwarded = builder.*.forwardedCall
+    builder.*.forwardCall = value_node
+    builder.*.forwardModule = builder.*.currentModuleId
+    builder.*.forwardedCall = ast.NONE
+    const value = lowerNode(builder, value_node)
+    const forwarded = builder.*.forwardedCall == value_node
+    builder.*.forwardCall = saved_call
+    builder.*.forwardModule = saved_module
+    builder.*.forwardedCall = saved_forwarded
+    // (`return undefined` leaves the storage as the caller made it.)
+    const undefined_value = ast_store.Store.get(getNodes(builder), value_node).tag == ast.Tag.undefined_literal
+    if value != lir.NONE && !forwarded && !undefined_value { aggregate_copy.emit(builder.*.lir, builder.*.typeStore, builder.*.returnSlot, value, builder.*.currentReturnType) }
+    emitDefersTo(builder, 0)
+    var result = lir.retInst(builder.*.currentReturnType, builder.*.returnSlot)
+    result.flags = lir.FLAG_RETURN_SLOT
+    return lir.addInst(builder.*.lir, result)
+}
+
+// A call whose result is a struct, union or array (`slot_type`) hands the
+// callee the storage for it as its first argument (lir.FLAG_RETURN_SLOT):
+// a new allocation, or the caller's own result storage when the call is
+// what the caller returns.
+fn callWithReturnSlot(builder: *LirBuilder, node_index: usize, slot_type: usize, arguments: CallArguments) -> CallArguments {
+    var slot = lir.NONE
+    if builder.*.returnSlot != lir.NONE && builder.*.forwardCall == node_index && builder.*.forwardModule == builder.*.currentModuleId && slot_type == builder.*.currentReturnType {
+        slot = builder.*.returnSlot
+        builder.*.forwardedCall = node_index
+    } else {
+        var size = types_store.Store.sizeOf(builder.*.typeStore, slot_type)
+        if size < 8 { size = 8 }
+        var allocation = lir.initInst(lir.Opcode.alloca, slot_type)
+        allocation.arg0 = size
+        slot = lir.addInst(builder.*.lir, allocation)
+    }
+    const start = builder.*.lir.*.extraData.*.length
+    lir.addExtra(builder.*.lir, slot)
+    var index: usize = 0
+    while index < arguments.count {
+        lir.addExtra(builder.*.lir, lir.getExtra(builder.*.lir, arguments.start + index))
+        index += 1
+    }
+    return CallArguments.{ .start = start, .count = arguments.count + 1 }
+}
+
+// A direct callee's result type as its declaration has it, which is what
+// lowerFunction decides by.
+fn declaredReturnType(builder: *LirBuilder, symbol_index: usize) -> usize {
+    const type_id = symbols_store.Store.get(builder.*.symbolStore, symbol_index).*.typeId
+    if type_id == 0 || types_store.Store.get(builder.*.typeStore, type_id).*.kind != types_store.Kind.function { return 0 }
+    return types_store.Store.get(builder.*.typeStore, type_id).*.lhs
+}
+
+// `slot_type`: the result type that decides whether the callee takes
+// storage for it (a direct callee's declared one; else the call's).
+fn addCall(builder: *LirBuilder, node_index: usize, return_type: usize, slot_type: usize, function: usize, symbol: usize, arguments: CallArguments) -> usize {
+    var passed = arguments
+    var flags: u8 = 0
+    if aggregate_copy.isMemoryType(builder.*.typeStore, slot_type) {
+        passed = callWithReturnSlot(builder, node_index, slot_type, arguments)
+        flags = lir.FLAG_RETURN_SLOT
+    }
+    var call = if function != lir.NONE { lir.callInst(return_type, function, passed.start, passed.count) } else { lir.directCallInst(return_type, symbol, passed.start, passed.count) }
+    call.flags = flags
+    return lir.addInst(builder.*.lir, call)
+}
+
 fn lowerCall(builder: *LirBuilder, node_index: usize) -> usize {
     const n = ast_store.Store.get(getNodes(builder), node_index)
     const referenced = referencedSymbolIndex(builder, n.lhs)
@@ -3776,7 +4183,7 @@ fn lowerCall(builder: *LirBuilder, node_index: usize) -> usize {
 
     const return_type_id = if generic_instance != lir.NONE { types_store.Store.get(builder.*.typeStore, genericInstanceAt(builder, generic_instance).*.functionTypeId).*.lhs } else { expressionType(builder, node_index) }
     if generic_instance != lir.NONE {
-        return lir.addInst(builder.*.lir, lir.directCallInst(return_type_id, genericInstanceAt(builder, generic_instance).*.symbolId, arguments.start, arguments.count))
+        return addCall(builder, node_index, return_type_id, return_type_id, lir.NONE, genericInstanceAt(builder, generic_instance).*.symbolId, arguments)
     }
     if referenced.0 {
         const symbol = symbols_store.Store.get(builder.*.symbolStore, referenced.1)
@@ -3788,11 +4195,13 @@ fn lowerCall(builder: *LirBuilder, node_index: usize) -> usize {
                 recordLinkage(builder, symbol_id, symbol)
                 if referenced.1 < builder.*.lirSymbolCapacity { builder.*.lirSymbolIds[referenced.1] = symbol_id }
             }
-            return lir.addInst(builder.*.lir, lir.directCallInst(return_type_id, symbol_id, arguments.start, arguments.count))
+            // Whether the callee takes storage for its result follows its
+            // declaration, as in lowerFunction, not the call's type.
+            return addCall(builder, node_index, return_type_id, declaredReturnType(builder, referenced.1), lir.NONE, symbol_id, arguments)
         }
     }
     const func_val = lowerNode(builder, n.lhs)
-    return lir.addInst(builder.*.lir, lir.callInst(return_type_id, func_val, arguments.start, arguments.count))
+    return addCall(builder, node_index, return_type_id, return_type_id, func_val, lir.NONE, arguments)
 }
 
 fn lowerBlock(builder: *LirBuilder, node_index: usize) -> usize {
@@ -3820,7 +4229,6 @@ fn lowerIf(builder: *LirBuilder, node_index: usize) -> usize {
         return lowerNode(builder, if condition_value.integer != 0 { n.rhs } else { n.extra })
     }
 
-    const cond = lowerNode(builder, n.lhs)
     const result_type_id = expressionType(builder, node_index)
     var has_secondary_result = false
     if result_type_id != 0 {
@@ -3839,7 +4247,7 @@ fn lowerIf(builder: *LirBuilder, node_index: usize) -> usize {
     const end_block = builder.*.blockCounter
     builder.*.blockCounter += 1
 
-    lir.addInst(builder.*.lir, lir.condBranch(cond, then_block, else_block))
+    lowerBranch(builder, n.lhs, then_block, else_block)
 
     // Then block
     lir.addInst(builder.*.lir, lir.blockLabelInst(then_block))
@@ -4112,8 +4520,7 @@ fn lowerWhile(builder: *LirBuilder, node_index: usize) -> usize {
 
     // Header
     lir.addInst(builder.*.lir, lir.blockLabelInst(header_block))
-    const cond = lowerNode(builder, n.lhs)
-    lir.addInst(builder.*.lir, lir.condBranch(cond, body_block, end_block))
+    lowerBranch(builder, n.lhs, body_block, end_block)
 
     // Body
     lir.addInst(builder.*.lir, lir.blockLabelInst(body_block))
@@ -4251,10 +4658,16 @@ fn lowerIterableFor(builder: *LirBuilder, node_index: usize) -> usize {
     lir.addInst(builder.*.lir, index_store)
 
     const capture = ast_store.Store.get(nodes, node.extra)
-    const capture_address = lir.addInst(builder.*.lir, lir.initInst(lir.Opcode.alloca, lir.NONE))
     var capture_type = element_type
     if capture.extra & 1 != 0 { capture_type = types_store.Store.pointer(builder.*.typeStore, element_type, false, false, false) }
-    pushBinding(builder, tokenPointer(builder, capture.mainToken), tokenLength(builder, capture.mainToken), capture_address, lir.NONE, lir.NONE, capture_type)
+    // A slice or another value of several words is stored a word per
+    // component, as a local of that type is.
+    const capture_name = tokenPointer(builder, capture.mainToken)
+    const capture_name_length = tokenLength(builder, capture.mainToken)
+    const capture_words = typeWordCount(builder, capture_type)
+    const capture_components = builder.*.bindingComponents.*.length
+    appendComponentStorage(builder, capture_name, capture_name_length, capture_words)
+    pushBindingComponents(builder, capture_name, capture_name_length, capture_components, capture_words, capture_type)
     if capture.endToken != ast.NONE {
         pushBinding(builder, tokenPointer(builder, capture.endToken), tokenLength(builder, capture.endToken), index_address, lir.NONE, lir.NONE, types_store.Store.sizeInteger(builder.*.typeStore, false))
     }
@@ -4287,18 +4700,31 @@ fn lowerIterableFor(builder: *LirBuilder, node_index: usize) -> usize {
     element_address_inst.arg2 = stride
     const element_address = lir.addInst(builder.*.lir, element_address_inst)
     var capture_value = element_address
-    if capture.extra & 1 == 0 {
-        var element_load = lir.initInst(lir.Opcode.load, element_type)
-        element_load.arg0 = element_address
-        element_load.arg1 = storageWidth(builder, element_type)
-        if isSignedIntegerType(builder, element_type) { element_load.arg2 = 1 }
-        capture_value = lir.addInst(builder.*.lir, element_load)
+    if capture.extra & 1 == 0 && aggregate_copy.isMemoryType(builder.*.typeStore, element_type) {
+        // A struct, union or array is held by its address, as a `const`
+        // local of that type is; loading it would hand the body its first
+        // word as that address. The copy keeps the capture a value when the
+        // body changes the element through the iterable.
+        capture_value = copyAggregate(builder, element_address, element_type, true)
+    } else if capture.extra & 1 == 0 {
+        capture_value = lowerMemoryValue(builder, element_address, element_type)
     }
-    var capture_store = lir.initInst(lir.Opcode.store, capture_type)
-    capture_store.arg0 = capture_address
-    capture_store.arg1 = capture_value
-    capture_store.arg2 = storageWidth(builder, capture_type)
-    lir.addInst(builder.*.lir, capture_store)
+    var capture_component: usize = 0
+    while capture_component < capture_words {
+        var component_value = capture_value
+        if capture_component > 0 {
+            var extract = lir.initInst(lir.Opcode.tuple_element, lir.NONE)
+            extract.arg0 = capture_value
+            extract.arg1 = capture_component
+            component_value = lir.addInst(builder.*.lir, extract)
+        }
+        var capture_store = lir.initInst(lir.Opcode.store, if capture_component == 0 { capture_type } else { lir.NONE })
+        capture_store.arg0 = bindingComponentAt(builder, capture_components + capture_component)
+        capture_store.arg1 = component_value
+        capture_store.arg2 = if capture_component == 0 { storageWidth(builder, capture_type) } else { 8 }
+        lir.addInst(builder.*.lir, capture_store)
+        capture_component += 1
+    }
 
     const result_address = lir.addInst(builder.*.lir, lir.initInst(lir.Opcode.alloca, lir.NONE))
     pushLoopTarget(builder, node.endToken, end_block, update_block, result_address)

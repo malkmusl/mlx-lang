@@ -1,0 +1,209 @@
+// The Plymouth protocol, so systemd and the plymouth tool's requests
+// reach the splash unchanged: a stream socket at the abstract address
+// "/org/freedesktop/plymouthd"; each request a command byte and a NUL, or
+// a command byte, 2, a length byte (the argument's bytes with its NUL)
+// and the argument; each answer a byte (ACK 6, NAK 21) or, for questions,
+// 2, a 32-bit length and the answer. Only root's requests are carried out
+// (SO_PEERCRED); others are answered NAK. A connection may carry many
+// requests; systemd sends its unit updates and hangs up without reading
+// the answer.
+const std = @import("std")
+const dbus = @import("std.dbus")
+const system = @import("./system.mlx")
+
+pub const SOCKET_NAME = "/org/freedesktop/plymouthd"
+pub const MAX_CLIENTS: usize = 16
+const BUFFER_SIZE: usize = 1024
+
+pub const ACK: u8 = 6
+pub const NAK: u8 = 21
+
+pub const Client = struct {
+    descriptor: isize
+    fromRoot: bool
+    buffer: [1024]u8
+    length: usize
+}
+
+pub const Server = struct {
+    listener: isize
+    clients: [16]Client
+}
+
+pub const Request = struct {
+    command: u8
+    hasArgument: bool
+    // The argument without its NUL.
+    argument: [256]u8
+    argumentLength: usize
+    fromRoot: bool
+}
+
+pub fn init(server: *Server) -> void {
+    server.*.listener = -1
+    var index: usize = 0
+    while index < MAX_CLIENTS {
+        server.*.clients[index].descriptor = -1
+        index += 1
+    }
+}
+
+// Listens at `name`; false when another splash (or plymouthd) has it.
+pub fn listen(server: *Server, name: []const u8) -> bool {
+    server.*.listener = system.listenAbstract(name)
+    return server.*.listener >= 0
+}
+
+// Takes the connections waiting; one past the last place is closed again.
+pub fn acceptAll(server: *Server) -> void {
+    while true {
+        const descriptor = system.accept(server.*.listener)
+        if descriptor < 0 { return }
+        var placed = false
+        var index: usize = 0
+        while index < MAX_CLIENTS && !placed {
+            const client = &server.*.clients[index]
+            if client.*.descriptor < 0 {
+                client.*.descriptor = descriptor
+                client.*.length = 0
+                var pid: u32 = 0
+                var uid: u32 = 1
+                var gid: u32 = 0
+                client.*.fromRoot = dbus.peerCredentials(descriptor, &pid, &uid, &gid) && uid == 0
+                placed = true
+            }
+            index += 1
+        }
+        if !placed { system.close(descriptor) }
+    }
+}
+
+pub fn drop(server: *Server, index: usize) -> void {
+    const client = &server.*.clients[index]
+    system.close(client.*.descriptor)
+    client.*.descriptor = -1
+    client.*.length = 0
+}
+
+// Reads what client `index` sent; false when it hung up (it is dropped).
+pub fn receive(server: *Server, index: usize) -> bool {
+    const client = &server.*.clients[index]
+    while client.*.length < BUFFER_SIZE {
+        const rest: [*]u8 = unsafe { @ptrFromInt([*]u8, @intFromPtr(&client.*.buffer) + client.*.length) }
+        const got = system.read(client.*.descriptor, rest, BUFFER_SIZE - client.*.length)
+        if got == system.EINTR { continue }
+        if got == system.EAGAIN { return true }
+        if got <= 0 {
+            drop(server, index)
+            return false
+        }
+        client.*.length += @bitCast(usize, got)
+    }
+    return true
+}
+
+// The next whole request client `index` sent, taken out of its buffer;
+// false when there is none yet. A malformed one drops the client.
+pub fn next(server: *Server, index: usize, request: *Request) -> bool {
+    const client = &server.*.clients[index]
+    if client.*.descriptor < 0 || client.*.length < 2 { return false }
+    var used: usize = 2
+    request.*.command = client.*.buffer[0]
+    request.*.hasArgument = false
+    request.*.argumentLength = 0
+    request.*.fromRoot = client.*.fromRoot
+    if client.*.buffer[1] == 2 {
+        if client.*.length < 3 { return false }
+        const size = @intCast(usize, client.*.buffer[2])
+        if size == 0 {
+            drop(server, index)
+            return false
+        }
+        if client.*.length < 3 + size { return false }
+        if client.*.buffer[2 + size] != 0 {
+            drop(server, index)
+            return false
+        }
+        var at: usize = 0
+        while at + 1 < size {
+            request.*.argument[at] = client.*.buffer[3 + at]
+            at += 1
+        }
+        request.*.argumentLength = size - 1
+        request.*.hasArgument = true
+        used = 3 + size
+    } else if client.*.buffer[1] != 0 {
+        drop(server, index)
+        return false
+    }
+    const rest = client.*.length - used
+    var move: usize = 0
+    while move < rest {
+        client.*.buffer[move] = client.*.buffer[used + move]
+        move += 1
+    }
+    client.*.length = rest
+    return true
+}
+
+// The answer byte to client `index` (a reader that hung up is no error).
+pub fn answer(server: *Server, index: usize, byte: u8) -> void {
+    const client = &server.*.clients[index]
+    if client.*.descriptor < 0 { return }
+    var bytes: [1]u8 = [1]u8{ byte }
+    var slice: []const u8 = unsafe { @ptrCast([*]const u8, &bytes)[0..1] }
+    _ = system.send(client.*.descriptor, slice)
+}
+
+// The argument as text.
+pub fn argumentOf(request: *const Request) -> []const u8 {
+    var slice: []const u8 = unsafe { @ptrCast([*]const u8, &request.*.argument)[0..request.*.argumentLength] }
+    return slice
+}
+
+pub fn closeAll(server: *Server) -> void {
+    var index: usize = 0
+    while index < MAX_CLIENTS {
+        if server.*.clients[index].descriptor >= 0 { drop(server, index) }
+        index += 1
+    }
+    system.close(server.*.listener)
+    server.*.listener = -1
+}
+
+// ---------------------------------------------------------------------------
+// The client side (mlx-splashctl)
+
+// Sends `command` (with `argument` when given) on `descriptor` and waits
+// for the answer byte; 0 when the connection ended first.
+pub fn ask(descriptor: isize, command: u8, argument: ?[]const u8) -> u8 {
+    var request: [300]u8 = undefined
+    request[0] = command
+    var length: usize = 2
+    if argument == null {
+        request[1] = 0
+    } else {
+        const text = argument.?
+        if text.length > 254 { return 0 }
+        request[1] = 2
+        request[2] = @intCast(u8, text.length + 1)
+        var index: usize = 0
+        while index < text.length {
+            request[3 + index] = text[index]
+            index += 1
+        }
+        request[3 + text.length] = 0
+        length = 4 + text.length
+    }
+    var slice: []const u8 = unsafe { @ptrCast([*]const u8, &request)[0..length] }
+    if !system.writeAll(descriptor, slice) { return 0 }
+    var reply: [1]u8 = undefined
+    while true {
+        const bytes: [*]u8 = &reply
+        const got = system.read(descriptor, bytes, 1)
+        if got == system.EINTR { continue }
+        if got <= 0 { return 0 }
+        return reply[0]
+    }
+    return 0
+}

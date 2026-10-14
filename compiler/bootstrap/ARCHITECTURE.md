@@ -118,8 +118,7 @@ The minimum structural-change verification is:
 
 ```sh
 zig fmt compiler/bootstrap
-zig build
-zig build test --summary all
+./mlx build bootstrap bootstrap-test
 ```
 
 Changes to lowering or code generation also compile and execute representative

@@ -99,7 +99,7 @@ pub fn main() -> void {
 (`tests/144_bootstrap_void_main_runtime.mlx`)
 
 The self-hosted compiler also takes `_ = value`: the value is worked out and
-dropped, with no name left over. The bootstrap compiler (`zig build mlx1`)
+dropped, with no name left over. The bootstrap compiler (`./mlx build mlx1`)
 does not, so `compiler/` and `std/bootstrap/` keep binding a name:
 
 ```mlx

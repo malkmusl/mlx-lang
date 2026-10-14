@@ -16,7 +16,9 @@
 #   - a sandboxed app (bwrap with a .flatpak-info, as Flatpak runs apps)
 #     may own only its own names, talk to the portals but not to others
 #     until a rule allows it, and sees only what it may talk to;
-#   - --run: the bus ends with its program and passes on its exit status.
+#   - --run: the bus ends with its program and passes on its exit status;
+#   - under systemd (Type=notify) READY=1 goes to NOTIFY_SOCKET once the
+#     socket listens (tools/check_ipc_notify.py).
 #
 #   tools/check_ipc.sh [compiler]
 #
@@ -93,6 +95,18 @@ if command -v dbus-monitor > /dev/null; then
     sleep 0.5
 fi
 
+# Starting or unlocking a login session is denied to ordinary apps by
+# default, as is obtaining seat devices. A system policy may name other
+# trusted components explicitly.
+expect "login.session is denied by default" "(false,)" gdbus call --session --dest org.freedesktop.DBus --object-path /org/mlx/IPC --method org.mlx.IPC.CheckProcess "$$" login.session
+expect "login.device is denied by default" "(false,)" gdbus call --session --dest org.freedesktop.DBus --object-path /org/mlx/IPC --method org.mlx.IPC.CheckProcess "$$" login.device
+printf 'allow bash use login.session\nallow bash use login.device\n' > "$XDG_CONFIG_HOME/mlx/ipc.conf"
+sleep 0.3
+expect "login.session can be delegated explicitly" "(true,)" gdbus call --session --dest org.freedesktop.DBus --object-path /org/mlx/IPC --method org.mlx.IPC.CheckProcess "$$" login.session
+expect "login.device can be delegated explicitly" "(true,)" gdbus call --session --dest org.freedesktop.DBus --object-path /org/mlx/IPC --method org.mlx.IPC.CheckProcess "$$" login.device
+: > "$XDG_CONFIG_HOME/mlx/ipc.conf"
+sleep 0.3
+
 # A service of ours, called by everyone.
 "$ipc" serve org.example.Echo > "$work/serve.log" 2>&1 &
 for _ in $(seq 1 50); do grep -q serving "$work/serve.log" 2> /dev/null && break; sleep 0.1; done
@@ -165,4 +179,7 @@ status=$?
 set -e
 [[ $status -eq 7 ]] || fail "--run: exit status $status (wanted 7)"
 echo "ok   --run: the program on the bus, its exit status"
+
+mkdir -p "$work/notify-empty"
+python3 -I tools/check_ipc_notify.py "$work/mlx-ipcd" "$work" "$work/notify-empty" || fail "no READY=1 for systemd"
 echo "all MLXIPC checks passed"

@@ -1,0 +1,867 @@
+// The debug allocator (Zig's DebugAllocator): an allocator that keeps each
+// block it hands out with the functions that asked for it, so that what
+// goes wrong with memory is said with where it happened:
+//
+// - a leak: a block not given back by the end (deinit, or report);
+// - a double free: a block given back twice, with where it was allocated,
+//   first freed and freed again;
+// - an invalid free: an address it never handed out;
+// - a wrong size: a block given back with another length or alignment
+//   than it was allocated with (the interface carries both into free).
+//
+// It wraps any allocator (init, interface, deinit as Zig's), or it watches
+// the page allocator itself (watchPages): every page_allocator.init() in
+// the program is seen then, without the program passing an allocator
+// around, and the pages stay what they were (fresh zeroed mappings).
+// Watched, a frame more (the page allocator's hook) is in each stack; the
+// allocators' own frames are left out when the report names them.
+//
+// The functions are the return addresses along the frame pointers every
+// Mlx function keeps, STACK_DEPTH of them. Naming them (path:line:name) is
+// std.crash's, given as `describe` (std.leaks gives it); without it they
+// are shown as addresses. Freed blocks are kept a while (FREED_KEPT) to
+// tell a double free from an invalid one. Its own tables are mappings of
+// their own, outside what it watches; one lock (a futex word) covers them.
+const allocator_module = @import("./allocator.mlx")
+const linux = @import("./os/linux.mlx")
+const mem = @import("./mem.mlx")
+const page_allocator = @import("./page_allocator.mlx")
+
+pub const Allocator = allocator_module.Allocator
+
+// Names a return address (path:line:name+0xOFFSET) into `out`.
+pub const Describe = fn(address: usize, out: [*]u8, length: *usize) -> void
+// Called after a block was noted handed out or given back, outside the
+// lock, with the state's address (std.leaks writes its snapshots from
+// there).
+pub const After = fn(state: usize) -> void
+
+pub const STACK_DEPTH: usize = 12
+// Frees remembered after the block went (to tell a double free).
+pub const FREED_KEPT: usize = 4096
+const UNUSED: usize = 0
+const LIVE: usize = 1
+const FREED: usize = 2
+// Freed memory is overwritten with this (as Zig's undefined), so a block
+// used after it went shows.
+const POISON: u8 = 170
+const PAGE: usize = 4096
+// A report's text, built before it is written.
+const TEXT_SIZE: usize = 65536
+// The places a report tells apart, and says at most.
+const PLACES_KEPT: usize = 8192
+const PLACES_SAID: usize = 40
+
+pub const Record = struct {
+    address: usize
+    length: usize
+    alignment: usize
+    state: usize
+    // The allocation's number (counting from 1), the report that last
+    // said it, the ring slot it was freed into.
+    serial: usize
+    reported: usize
+    ringSlot: usize
+    // Return addresses, innermost first (0: no more).
+    allocated: [12]usize
+    freed: [12]usize
+}
+
+pub const DebugAllocator = struct {
+    child: Allocator
+    // Watching the page allocator (no child): frees of addresses mapped
+    // before it started are let through.
+    watching: bool
+    lock: u32
+    // Open addressing on the address: record index + 1 (0: empty).
+    slots: [*]u32
+    slotCapacity: usize
+    used: usize
+    records: [*]Record
+    recordCapacity: usize
+    recordCount: usize
+    // Unused records, linked through their `address` (index + 1; 0: none).
+    unusedRecords: usize
+    // The last FREED_KEPT frees (record index + 1).
+    ring: [*]u32
+    ringNext: usize
+    // What it saw.
+    allocations: usize
+    frees: usize
+    liveBytes: usize
+    peakBytes: usize
+    problems: usize
+    // Reports so far, and the allocation number a report starts after.
+    reports: usize
+    markSerial: usize
+    poison: bool
+    describe: ?Describe
+    after: ?After
+    // Where reports go (2: stderr).
+    output: usize
+}
+
+pub fn init(state: *DebugAllocator, child: Allocator) -> void {
+    state.*.child = child
+    state.*.watching = false
+    state.*.lock = 0
+    state.*.slotCapacity = 0
+    state.*.used = 0
+    state.*.recordCapacity = 0
+    state.*.recordCount = 0
+    state.*.unusedRecords = 0
+    state.*.ringNext = 0
+    state.*.allocations = 0
+    state.*.frees = 0
+    state.*.liveBytes = 0
+    state.*.peakBytes = 0
+    state.*.problems = 0
+    state.*.reports = 0
+    state.*.markSerial = 0
+    state.*.poison = true
+    state.*.describe = null
+    state.*.after = null
+    state.*.output = 2
+    const ring = mapped(FREED_KEPT * 4)
+    unsafe { state.*.ring = @ptrFromInt([*]u32, ring) }
+    unsafe { if ring != 0 { mem.set(@ptrFromInt([*]u8, ring), 0, FREED_KEPT * 4) } }
+}
+
+// ---------------------------------------------------------------------------
+// Its own memory: mappings, outside what it watches.
+
+fn mapped(length: usize) -> usize {
+    const result = linux.syscall6(linux.SYS_mmap, 0, (length + PAGE - 1) / PAGE * PAGE, 3, 34, 18446744073709551615, 0)
+    return if result < 0 { 0 } else { @bitCast(usize, result) }
+}
+
+fn unmapped(address: usize, length: usize) -> void {
+    const ignored = linux.syscall2(linux.SYS_munmap, address, (length + PAGE - 1) / PAGE * PAGE)
+}
+
+// The lock: 0 free, 1 taken, 2 taken with waiters.
+fn acquire(state: *DebugAllocator) -> void {
+    const word = &state.*.lock
+    const fast = @cmpxchgWeak(u32, word, 0, 1, acquire, monotonic)
+    if fast.0 { return }
+    while true {
+        const previous = @atomicRmw(u32, word, xchg, 2, acquire)
+        if previous == 0 { return }
+        const slept = linux.thread.futexWait(word, 2, 0, true)
+    }
+}
+
+fn release(state: *DebugAllocator) -> void {
+    const word = &state.*.lock
+    const previous = @atomicRmw(u32, word, xchg, 0, release)
+    if previous == 2 { const woken = linux.thread.futexWake(word, 1, true) }
+}
+
+// The tables held still, for reading them (records, recordCount) from
+// outside: what std.leaks' snapshots do.
+pub fn lock(state: *DebugAllocator) -> void { acquire(state) }
+
+pub fn unlock(state: *DebugAllocator) -> void { release(state) }
+
+pub fn isLive(record: *const Record) -> bool { return record.*.state == LIVE }
+
+// Allocated after the mark (and not kept on purpose: keep).
+pub fn isNew(state: *const DebugAllocator, record: *const Record) -> bool { return record.*.serial > state.*.markSerial }
+
+// ---------------------------------------------------------------------------
+// The table
+
+fn hash(address: usize, capacity: usize) -> usize {
+    return (((address >> 4) *% 11400714819323198485) >> 40) & (capacity - 1)
+}
+
+// The slot holding `address`, or the capacity when there is none.
+fn find(state: *DebugAllocator, address: usize) -> usize {
+    if state.*.slotCapacity == 0 { return 0 }
+    const mask = state.*.slotCapacity - 1
+    var slot = hash(address, state.*.slotCapacity)
+    while state.*.slots[slot] != 0 {
+        if state.*.records[@intCast(usize, state.*.slots[slot]) - 1].address == address { return slot }
+        slot = (slot + 1) & mask
+    }
+    return state.*.slotCapacity
+}
+
+fn place(state: *DebugAllocator, index: usize) -> void {
+    const mask = state.*.slotCapacity - 1
+    var slot = hash(state.*.records[index].address, state.*.slotCapacity)
+    while state.*.slots[slot] != 0 { slot = (slot + 1) & mask }
+    state.*.slots[slot] = @intCast(u32, index + 1)
+    state.*.used += 1
+}
+
+// Room for one more entry: the table twice as large past half full, the
+// records twice as many when all are taken. False without memory.
+fn makeRoom(state: *DebugAllocator) -> bool {
+    if (state.*.used + 1) * 2 > state.*.slotCapacity {
+        const capacity = if state.*.slotCapacity == 0 { 4096 } else { state.*.slotCapacity * 2 }
+        const slots = mapped(capacity * 4)
+        if slots == 0 { return false }
+        const old = @intFromPtr(state.*.slots)
+        const old_capacity = state.*.slotCapacity
+        unsafe { state.*.slots = @ptrFromInt([*]u32, slots) }
+        state.*.slotCapacity = capacity
+        state.*.used = 0
+        if old_capacity > 0 {
+            var old_slots: [*]u32 = undefined
+            unsafe { old_slots = @ptrFromInt([*]u32, old) }
+            var at: usize = 0
+            while at < old_capacity {
+                if old_slots[at] != 0 { place(state, @intCast(usize, old_slots[at]) - 1) }
+                at += 1
+            }
+            unmapped(old, old_capacity * 4)
+        }
+    }
+    if state.*.unusedRecords == 0 && state.*.recordCount == state.*.recordCapacity {
+        const capacity = if state.*.recordCapacity == 0 { 2048 } else { state.*.recordCapacity * 2 }
+        const records = mapped(capacity * @sizeOf(Record))
+        if records == 0 { return false }
+        if state.*.recordCapacity > 0 {
+            unsafe { mem.copy(@ptrFromInt([*]u8, records), @ptrCast([*]u8, state.*.records), state.*.recordCount * @sizeOf(Record)) }
+            unmapped(@intFromPtr(state.*.records), state.*.recordCapacity * @sizeOf(Record))
+        }
+        unsafe { state.*.records = @ptrFromInt([*]Record, records) }
+        state.*.recordCapacity = capacity
+    }
+    return true
+}
+
+fn newRecord(state: *DebugAllocator) -> usize {
+    if state.*.unusedRecords != 0 {
+        const index = state.*.unusedRecords - 1
+        state.*.unusedRecords = state.*.records[index].address
+        return index
+    }
+    const index = state.*.recordCount
+    state.*.recordCount += 1
+    return index
+}
+
+// Takes the entry at `slot` out, moving the ones after it back so that
+// every entry stays reachable from its hash.
+fn removeAt(state: *DebugAllocator, slot: usize) -> void {
+    const mask = state.*.slotCapacity - 1
+    const index = @intCast(usize, state.*.slots[slot]) - 1
+    var hole = slot
+    var next = (slot + 1) & mask
+    while state.*.slots[next] != 0 {
+        const home = hash(state.*.records[@intCast(usize, state.*.slots[next]) - 1].address, state.*.slotCapacity)
+        if ((next - home) & mask) >= ((next - hole) & mask) {
+            state.*.slots[hole] = state.*.slots[next]
+            hole = next
+        }
+        next = (next + 1) & mask
+    }
+    state.*.slots[hole] = 0
+    state.*.used -= 1
+    state.*.records[index].state = UNUSED
+    state.*.records[index].address = state.*.unusedRecords
+    state.*.unusedRecords = index + 1
+}
+
+// The return addresses above the caller of the caller (the functions that
+// asked), along the frame pointers; a chain that leaves the stack or turns
+// back ends there.
+fn capture(into: [*]usize) -> void {
+    var frame = @frameAddress()
+    var count: usize = 0
+    var skipped: usize = 0
+    while count < STACK_DEPTH && frame != 0 && frame & 7 == 0 {
+        var words: [*]const usize = undefined
+        unsafe { words = @ptrFromInt([*]const usize, frame) }
+        const back = words[1]
+        if back < 4096 { break }
+        // capture's own return and the note's are no news.
+        if skipped < 2 {
+            skipped += 1
+        } else {
+            into[count] = back
+            count += 1
+        }
+        const next = words[0]
+        if next <= frame || next - frame > 1048576 { break }
+        frame = next
+    }
+    while count < STACK_DEPTH {
+        into[count] = 0
+        count += 1
+    }
+}
+
+// ---------------------------------------------------------------------------
+// What happens to a block
+
+// A block handed out: kept with where it was asked for.
+pub fn noteAlloc(state: *DebugAllocator, address: usize, length: usize, alignment: usize) -> void {
+    acquire(state)
+    state.*.allocations += 1
+    state.*.liveBytes += length
+    if state.*.liveBytes > state.*.peakBytes { state.*.peakBytes = state.*.liveBytes }
+    const slot = find(state, address)
+    var index: usize = 0
+    if slot < state.*.slotCapacity {
+        // An address freed before and handed out again.
+        index = @intCast(usize, state.*.slots[slot]) - 1
+    } else {
+        if !makeRoom(state) {
+            release(state)
+            return
+        }
+        index = newRecord(state)
+        state.*.records[index].address = address
+        place(state, index)
+    }
+    const record = &state.*.records[index]
+    record.*.length = length
+    record.*.alignment = alignment
+    record.*.state = LIVE
+    record.*.serial = state.*.allocations
+    record.*.reported = 0
+    record.*.ringSlot = FREED_KEPT
+    unsafe { capture(@ptrCast([*]usize, &record.*.allocated)) }
+    release(state)
+}
+
+// A block given back. The length to give back to the child (the one it
+// was allocated with), or 0 when it must not be: a double free or an
+// address never handed out (said on stderr). Watching the page allocator,
+// an address mapped before the watch began goes back as it is.
+pub fn noteFree(state: *DebugAllocator, address: usize, length: usize, alignment: usize) -> usize {
+    acquire(state)
+    const slot = find(state, address)
+    if slot >= state.*.slotCapacity {
+        if state.*.watching {
+            release(state)
+            return length
+        }
+        state.*.problems += 1
+        release(state)
+        var here: [12]usize = undefined
+        unsafe { capture(@ptrCast([*]usize, &here)) }
+        unsafe { say(state, "invalid free: ", address, length, @ptrCast([*]const usize, &here), "freed at ", null, "", null, "") }
+        return 0
+    }
+    const index = @intCast(usize, state.*.slots[slot]) - 1
+    const record = &state.*.records[index]
+    if record.*.state == FREED {
+        state.*.problems += 1
+        // The stacks copied out while the table cannot move.
+        var allocated: [12]usize = undefined
+        var freed: [12]usize = undefined
+        var again: [12]usize = undefined
+        unsafe { copyFrames(@ptrCast([*]usize, &allocated), @ptrCast([*]const usize, &record.*.allocated)) }
+        unsafe { copyFrames(@ptrCast([*]usize, &freed), @ptrCast([*]const usize, &record.*.freed)) }
+        const freed_length = record.*.length
+        unsafe { capture(@ptrCast([*]usize, &again)) }
+        release(state)
+        unsafe { say(state, "double free: ", address, freed_length, @ptrCast([*]const usize, &allocated), "allocated at ", @ptrCast([*]const usize, &freed), "first freed at ", @ptrCast([*]const usize, &again), "freed again at ") }
+        return 0
+    }
+    const allocated_length = record.*.length
+    const wrong = allocated_length != length || record.*.alignment != alignment
+    state.*.frees += 1
+    state.*.liveBytes -= allocated_length
+    record.*.state = FREED
+    unsafe { capture(@ptrCast([*]usize, &record.*.freed)) }
+    // Kept in the ring; the oldest kept goes.
+    const evicted = state.*.ring[state.*.ringNext]
+    if evicted != 0 {
+        const old = @intCast(usize, evicted) - 1
+        if state.*.records[old].state == FREED && state.*.records[old].ringSlot == state.*.ringNext {
+            const old_slot = find(state, state.*.records[old].address)
+            if old_slot < state.*.slotCapacity { removeAt(state, old_slot) }
+        }
+    }
+    state.*.ring[state.*.ringNext] = @intCast(u32, index + 1)
+    record.*.ringSlot = state.*.ringNext
+    state.*.ringNext = (state.*.ringNext + 1) % FREED_KEPT
+    if !wrong {
+        release(state)
+        return allocated_length
+    }
+    state.*.problems += 1
+    var allocated: [12]usize = undefined
+    var freed: [12]usize = undefined
+    unsafe { copyFrames(@ptrCast([*]usize, &allocated), @ptrCast([*]const usize, &record.*.allocated)) }
+    unsafe { copyFrames(@ptrCast([*]usize, &freed), @ptrCast([*]const usize, &record.*.freed)) }
+    release(state)
+    unsafe { say(state, "freed with another length or alignment than allocated: ", address, allocated_length, @ptrCast([*]const usize, &allocated), "allocated at ", @ptrCast([*]const usize, &freed), "freed at ", null, "") }
+    return allocated_length
+}
+
+// The stack of place `index` in a report's copy of them.
+fn framesAt(base: usize, index: usize) -> [*]usize {
+    unsafe { return @ptrFromInt([*]usize, base + index * STACK_DEPTH * 8) }
+}
+
+fn copyFrames(into: [*]usize, from: [*]const usize) -> void {
+    var at: usize = 0
+    while at < STACK_DEPTH {
+        into[at] = from[at]
+        at += 1
+    }
+}
+
+// A block that grew or shrank in place.
+pub fn noteResize(state: *DebugAllocator, address: usize, new_length: usize) -> void {
+    acquire(state)
+    const slot = find(state, address)
+    if slot < state.*.slotCapacity {
+        const record = &state.*.records[@intCast(usize, state.*.slots[slot]) - 1]
+        if record.*.state == LIVE {
+            state.*.liveBytes = state.*.liveBytes - record.*.length + new_length
+            if state.*.liveBytes > state.*.peakBytes { state.*.peakBytes = state.*.liveBytes }
+            record.*.length = new_length
+        }
+    }
+    release(state)
+}
+
+// A block meant to stay until the program ends (a cache's, the program's
+// state that is replaced as it changes): reports leave it out as they
+// leave out what came before the mark. Freed and handed out again, it is
+// followed as any other.
+pub fn keep(state: *DebugAllocator, address: usize) -> void {
+    acquire(state)
+    const slot = find(state, address)
+    if slot < state.*.slotCapacity {
+        const record = &state.*.records[@intCast(usize, state.*.slots[slot]) - 1]
+        if record.*.state == LIVE { record.*.serial = 0 }
+    }
+    release(state)
+}
+
+// ---------------------------------------------------------------------------
+// Watching the page allocator
+
+// The debug allocator the page allocator tells (0: none).
+var pageWatcher: usize = 0
+
+fn watchedAlloc(address: usize, length: usize, alignment: usize) -> void {
+    if pageWatcher == 0 { return }
+    const state = stateAt(pageWatcher)
+    noteAlloc(state, address, length, alignment)
+    if state.*.after != null { state.*.after.?(pageWatcher) }
+}
+
+fn watchedFree(address: usize, length: usize, alignment: usize) -> usize {
+    if pageWatcher == 0 { return length }
+    const state = stateAt(pageWatcher)
+    const freed = noteFree(state, address, length, alignment)
+    if state.*.after != null { state.*.after.?(pageWatcher) }
+    return freed
+}
+
+fn stateAt(address: usize) -> *DebugAllocator {
+    unsafe { return @ptrFromInt(*DebugAllocator, address) }
+}
+
+// Every page block of the program from now on, wherever it took a page
+// allocator, kept in `state` (made with init; its child is not used).
+// Frees of blocks mapped before go through unsaid.
+pub fn watchPages(state: *DebugAllocator) -> void {
+    state.*.watching = true
+    pageWatcher = @intFromPtr(state)
+    page_allocator.watch(watchedAlloc, watchedFree)
+}
+
+pub fn unwatchPages() -> void {
+    page_allocator.unwatch()
+    pageWatcher = 0
+}
+
+// ---------------------------------------------------------------------------
+// The allocator interface over a child
+
+fn stateOf(context: *anyopaque) -> *DebugAllocator {
+    unsafe { return @ptrCast(*DebugAllocator, context) }
+}
+
+fn debugAlloc(context: *anyopaque, length: usize, alignment: usize) -> ?[*]u8 {
+    const state = stateOf(context)
+    const block = state.*.child.rawAlloc(length, alignment)
+    if block != null { noteAlloc(state, @intFromPtr(block.?), length, alignment) }
+    return block
+}
+
+fn debugResize(context: *anyopaque, memory: [*]u8, length: usize, alignment: usize, new_length: usize) -> bool {
+    const state = stateOf(context)
+    if !state.*.child.rawResize(memory, length, alignment, new_length) { return false }
+    noteResize(state, @intFromPtr(memory), new_length)
+    return true
+}
+
+fn debugRemap(context: *anyopaque, memory: [*]u8, length: usize, alignment: usize, new_length: usize) -> ?[*]u8 {
+    if debugResize(context, memory, length, alignment, new_length) { return memory }
+    const replacement = debugAlloc(context, new_length, alignment)
+    if replacement == null { return null }
+    mem.copy(replacement.?, memory, if length < new_length { length } else { new_length })
+    debugFree(context, memory, length, alignment)
+    return replacement
+}
+
+fn debugFree(context: *anyopaque, memory: [*]u8, length: usize, alignment: usize) -> void {
+    const state = stateOf(context)
+    const allocated = noteFree(state, @intFromPtr(memory), length, alignment)
+    if allocated == 0 { return }
+    if state.*.poison { mem.set(memory, POISON, allocated) }
+    state.*.child.rawFree(memory, allocated, alignment)
+}
+
+pub fn interface(state: *DebugAllocator) -> Allocator {
+    unsafe {
+        return Allocator.{
+            .context = @ptrCast(*anyopaque, state),
+            .allocFn = debugAlloc,
+            .resizeFn = debugResize,
+            .remapFn = debugRemap,
+            .freeFn = debugFree,
+        }
+    }
+}
+
+// Says the blocks still out as leaks and gives its tables back; the number
+// of blocks leaked (0: none, Zig's .ok).
+pub fn deinit(state: *DebugAllocator) -> usize {
+    state.*.markSerial = 0
+    const leaked = report(state)
+    if state.*.slotCapacity > 0 { unmapped(@intFromPtr(state.*.slots), state.*.slotCapacity * 4) }
+    if state.*.recordCapacity > 0 { unmapped(@intFromPtr(state.*.records), state.*.recordCapacity * @sizeOf(Record)) }
+    unmapped(@intFromPtr(state.*.ring), FREED_KEPT * 4)
+    state.*.slotCapacity = 0
+    state.*.recordCapacity = 0
+    state.*.recordCount = 0
+    state.*.used = 0
+    state.*.unusedRecords = 0
+    return leaked
+}
+
+// ---------------------------------------------------------------------------
+// Counting and saying
+
+// From now on a report says only the blocks allocated after this.
+pub fn mark(state: *DebugAllocator) -> void {
+    acquire(state)
+    state.*.markSerial = state.*.allocations
+    release(state)
+}
+
+// The blocks out now (allocated after the mark).
+pub fn liveCount(state: *DebugAllocator) -> usize {
+    acquire(state)
+    var count: usize = 0
+    var index: usize = 0
+    while index < state.*.recordCount {
+        const record = &state.*.records[index]
+        if record.*.state == LIVE && record.*.serial > state.*.markSerial { count += 1 }
+        index += 1
+    }
+    release(state)
+    return count
+}
+
+pub fn problemCount(state: *DebugAllocator) -> usize { return state.*.problems }
+
+fn sameFrames(a: *const Record, b: *const Record) -> bool {
+    var at: usize = 0
+    while at < STACK_DEPTH {
+        if a.*.allocated[at] != b.*.allocated[at] { return false }
+        at += 1
+    }
+    return true
+}
+
+// Says each place blocks still out were allocated at (after the mark),
+// once with how many and how large, the largest first (PLACES_SAID of
+// them); then what it counted. The number of blocks out.
+pub fn report(state: *DebugAllocator) -> usize {
+    const places_memory = mapped(PLACES_KEPT * 24)
+    const frames_memory = mapped(PLACES_SAID * STACK_DEPTH * 8)
+    if places_memory == 0 || frames_memory == 0 { return 0 }
+    var places: [*]usize = undefined
+    unsafe { places = @ptrFromInt([*]usize, places_memory) }
+    acquire(state)
+    state.*.reports += 1
+    const generation = state.*.reports
+    var blocks: usize = 0
+    var bytes: usize = 0
+    var place_count: usize = 0
+    // Each place once: its first block found, then the others like it.
+    var index: usize = 0
+    while index < state.*.recordCount {
+        const record = &state.*.records[index]
+        if record.*.state == LIVE && record.*.serial > state.*.markSerial && record.*.reported != generation {
+            var total: usize = 0
+            var count: usize = 0
+            var other = index
+            while other < state.*.recordCount {
+                const candidate = &state.*.records[other]
+                if candidate.*.state == LIVE && candidate.*.serial > state.*.markSerial && candidate.*.reported != generation && sameFrames(record, candidate) {
+                    candidate.*.reported = generation
+                    total += candidate.*.length
+                    count += 1
+                }
+                other += 1
+            }
+            blocks += count
+            bytes += total
+            if place_count < PLACES_KEPT {
+                places[place_count * 3] = index
+                places[place_count * 3 + 1] = count
+                places[place_count * 3 + 2] = total
+            }
+            place_count += 1
+        }
+        index += 1
+    }
+    // The largest places' stacks, copied out while the table cannot move.
+    const kept = if place_count < PLACES_KEPT { place_count } else { PLACES_KEPT }
+    var counts: [40]usize = undefined
+    var sizes: [40]usize = undefined
+    var chosen: usize = 0
+    while chosen < PLACES_SAID && chosen < kept {
+        var best = kept
+        var at: usize = 0
+        while at < kept {
+            if places[at * 3 + 1] != 0 && (best == kept || places[at * 3 + 2] > places[best * 3 + 2]) { best = at }
+            at += 1
+        }
+        if best == kept { break }
+        unsafe { copyFrames(framesAt(frames_memory, chosen), @ptrCast([*]const usize, &state.*.records[places[best * 3]].allocated)) }
+        counts[chosen] = places[best * 3 + 1]
+        sizes[chosen] = places[best * 3 + 2]
+        places[best * 3 + 1] = 0
+        chosen += 1
+    }
+    const allocations = state.*.allocations
+    const frees = state.*.frees
+    const peak = state.*.peakBytes
+    const problems = state.*.problems
+    release(state)
+    var at: usize = 0
+    while at < chosen {
+        sayLeak(state, counts[at], sizes[at], framesAt(frames_memory, at))
+        at += 1
+    }
+    sayTotals(state, blocks, bytes, place_count, allocations, frees, peak, problems)
+    unmapped(places_memory, PLACES_KEPT * 24)
+    unmapped(frames_memory, PLACES_SAID * STACK_DEPTH * 8)
+    return blocks
+}
+
+// ---------------------------------------------------------------------------
+// The text
+
+fn put(text: [*]u8, length: *usize, words: []const u8) -> void {
+    var at: usize = 0
+    while at < words.length && length.* < TEXT_SIZE - 1 {
+        text[length.*] = words[at]
+        length.* += 1
+        at += 1
+    }
+}
+
+fn putNumber(text: [*]u8, length: *usize, value: usize) -> void {
+    var digits: [24]u8 = undefined
+    var count: usize = 0
+    var rest = value
+    while true {
+        digits[count] = @intCast(u8, 48 + rest % 10)
+        count += 1
+        rest = rest / 10
+        if rest == 0 { break }
+    }
+    while count > 0 && length.* < TEXT_SIZE - 1 {
+        count -= 1
+        text[length.*] = digits[count]
+        length.* += 1
+    }
+}
+
+fn putHex(text: [*]u8, length: *usize, value: usize) -> void {
+    put(text, length, "0x")
+    var shift: usize = 64
+    var started = false
+    while shift > 0 {
+        shift -= 4
+        const digit = (value >> @intCast(u6, shift)) & 15
+        if digit != 0 || started || shift == 0 {
+            started = true
+            if length.* < TEXT_SIZE - 1 {
+                text[length.*] = @intCast(u8, if digit < 10 { 48 + digit } else { 87 + digit })
+                length.* += 1
+            }
+        }
+    }
+}
+
+// The program's name (/proc/self/comm) and ": ".
+fn putName(text: [*]u8, length: *usize) -> void {
+    var file: isize = -1
+    unsafe { file = linux.syscall2(linux.SYS_open, @intFromPtr(@ptrCast([*]const u8, "/proc/self/comm")), 0) }
+    if file >= 0 {
+        var name: [32]u8 = undefined
+        const count = linux.syscall3(linux.SYS_read, @bitCast(usize, file), @intFromPtr(&name), 32)
+        const closed = linux.syscall1(linux.SYS_close, @bitCast(usize, file))
+        var at: usize = 0
+        while count > 0 && at < @bitCast(usize, count) && name[at] != 10 && length.* < TEXT_SIZE - 1 {
+            text[length.*] = name[at]
+            length.* += 1
+            at += 1
+        }
+    } else {
+        put(text, length, "mlx")
+    }
+    put(text, length, "[")
+    putNumber(text, length, @bitCast(usize, linux.syscall0(39)))
+    put(text, length, "]: ")
+}
+
+// The functions of a stack, one a line, the first after `first`; the
+// allocators' own frames left out when they can be named.
+fn putFrames(state: *DebugAllocator, text: [*]u8, length: *usize, frames: [*]const usize, first: []const u8) -> void {
+    var shown: usize = 0
+    var at: usize = 0
+    while at < STACK_DEPTH && frames[at] != 0 {
+        const start = length.*
+        put(text, length, if shown == 0 { "  " } else { "  from " })
+        if shown == 0 { put(text, length, first) }
+        const named = length.*
+        if state.*.describe != null {
+            state.*.describe.?(frames[at], text, length)
+        } else {
+            putHex(text, length, frames[at])
+        }
+        if isAllocator(text, named, length.*) {
+            length.* = start
+        } else {
+            put(text, length, "\n")
+            shown += 1
+        }
+        at += 1
+    }
+}
+
+// Whether a named frame is an allocator's own (a file ending in
+// "allocator.mlx").
+fn isAllocator(text: [*]u8, from: usize, to: usize) -> bool {
+    const needle = "allocator.mlx:"
+    var at = from
+    while at + needle.length <= to {
+        var same = true
+        var index: usize = 0
+        while index < needle.length {
+            if text[at + index] != needle[index] {
+                same = false
+                break
+            }
+            index += 1
+        }
+        if same { return true }
+        at += 1
+    }
+    return false
+}
+
+fn write(state: *DebugAllocator, text: [*]u8, length: usize) -> void {
+    var done: usize = 0
+    while done < length {
+        const count = linux.syscall3(linux.SYS_write, state.*.output, @intFromPtr(text) + done, length - done)
+        if count <= 0 { return }
+        done += @bitCast(usize, count)
+    }
+}
+
+// A problem with a block: what, where, and up to three stacks.
+fn say(state: *DebugAllocator, what: []const u8, address: usize, length: usize, first: ?[*]const usize, first_name: []const u8, second: ?[*]const usize, second_name: []const u8, third: ?[*]const usize, third_name: []const u8) -> void {
+    const memory = mapped(TEXT_SIZE)
+    if memory == 0 { return }
+    var text: [*]u8 = undefined
+    unsafe { text = @ptrFromInt([*]u8, memory) }
+    var used: usize = 0
+    putName(text, &used)
+    put(text, &used, what)
+    putNumber(text, &used, length)
+    put(text, &used, " bytes at ")
+    putHex(text, &used, address)
+    put(text, &used, "\n")
+    if first != null { putFrames(state, text, &used, first.?, first_name) }
+    if second != null { putFrames(state, text, &used, second.?, second_name) }
+    if third != null { putFrames(state, text, &used, third.?, third_name) }
+    write(state, text, used)
+    unmapped(memory, TEXT_SIZE)
+}
+
+fn sayLeak(state: *DebugAllocator, count: usize, bytes: usize, frames: [*]const usize) -> void {
+    const memory = mapped(TEXT_SIZE)
+    if memory == 0 { return }
+    var text: [*]u8 = undefined
+    unsafe { text = @ptrFromInt([*]u8, memory) }
+    var used: usize = 0
+    putName(text, &used)
+    put(text, &used, "leak: ")
+    putNumber(text, &used, count)
+    put(text, &used, if count == 1 { " block, " } else { " blocks, " })
+    putNumber(text, &used, bytes)
+    put(text, &used, " bytes\n")
+    putFrames(state, text, &used, frames, "allocated at ")
+    write(state, text, used)
+    unmapped(memory, TEXT_SIZE)
+}
+
+fn sayTotals(state: *DebugAllocator, blocks: usize, bytes: usize, places: usize, allocations: usize, frees: usize, peak: usize, problems: usize) -> void {
+    const memory = mapped(TEXT_SIZE)
+    if memory == 0 { return }
+    var text: [*]u8 = undefined
+    unsafe { text = @ptrFromInt([*]u8, memory) }
+    var used: usize = 0
+    putName(text, &used)
+    if blocks == 0 {
+        put(text, &used, "no leaks")
+    } else {
+        putNumber(text, &used, blocks)
+        put(text, &used, if blocks == 1 { " block leaked (" } else { " blocks leaked (" })
+        putNumber(text, &used, bytes)
+        put(text, &used, " bytes) from ")
+        putNumber(text, &used, places)
+        put(text, &used, if places == 1 { " place" } else { " places" })
+        if places > PLACES_SAID { put(text, &used, ", the largest 40 said") }
+    }
+    put(text, &used, "; ")
+    putNumber(text, &used, allocations)
+    put(text, &used, if allocations == 1 { " allocation, " } else { " allocations, " })
+    putNumber(text, &used, frees)
+    put(text, &used, if frees == 1 { " free, " } else { " frees, " })
+    putNumber(text, &used, peak)
+    put(text, &used, " bytes out at most")
+    if problems > 0 {
+        put(text, &used, "; ")
+        putNumber(text, &used, problems)
+        put(text, &used, if problems == 1 { " bad free" } else { " bad frees" })
+    }
+    put(text, &used, "\n")
+    write(state, text, used)
+    unmapped(memory, TEXT_SIZE)
+}
+
+// One line of the program's own: `before` NUMBER `after`.
+pub fn sayLine(state: *DebugAllocator, before: []const u8, number: usize, after: []const u8) -> void {
+    const memory = mapped(TEXT_SIZE)
+    if memory == 0 { return }
+    var text: [*]u8 = undefined
+    unsafe { text = @ptrFromInt([*]u8, memory) }
+    var used: usize = 0
+    putName(text, &used)
+    put(text, &used, before)
+    putNumber(text, &used, number)
+    put(text, &used, after)
+    put(text, &used, "\n")
+    write(state, text, used)
+    unmapped(memory, TEXT_SIZE)
+}

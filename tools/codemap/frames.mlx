@@ -1,0 +1,317 @@
+// The programs' frame timelines, as std.diagnostics writes them while they
+// run with MLX_FRAMES ($XDG_RUNTIME_DIR/mlx/frames/PROGRAM-PID.frames,
+// about once a second; see std/src/diagnostics.mlx for the lines): which
+// programs have one, and of one of them its frames: when each began, how
+// long the processor and the GPU worked on it, the frames over the budget
+// of a 60 Hz display, the spikes (far above the usual frame), and how long
+// the program took from its start to its first frame.
+//
+// A frame's work is the longer of its processor's and its GPU's time: the
+// GPU runs a frame while the processor goes on, so the slower of the two
+// sets the pace.
+//
+//     var frames: frames_module.Frames = undefined
+//     frames_module.init(&frames, allocator)
+//     frames_module.list(&frames, environment)      the timelines there
+//     frames_module.load(&frames, which)            one of them, analyzed
+const std = @import("std")
+const index_module = @import("./index.mlx")
+const memory_module = @import("./memory.mlx")
+
+pub const Allocator = std.allocator.Allocator
+
+pub const MAX_TIMELINES: usize = 128
+pub const MAX_FRAMES: usize = 1024
+const MAX_TEXT: usize = 65536
+// A frame of a 60 Hz display, in µs.
+pub const BUDGET: u64 = 16667
+// A spike: a frame this many times the median's work, and at least 4 ms
+// (a quarter of a 60 Hz frame: below that a frame's jitter is no news).
+const SPIKE_TIMES: u64 = 4
+const SPIKE_LEAST: u64 = 4000
+
+pub const Frames = struct {
+    allocator: Allocator
+    directory: [*]u8
+    directoryLength: usize
+    // The timelines found: name (in names), pid, time, running.
+    count: usize
+    nameStart: [128]u32
+    nameEnd: [128]u32
+    pid: [128]u64
+    time: [128]u64
+    running: [128]bool
+    names: [*]u8
+    namesUsed: usize
+    // The one loaded (count: none): frames drawn, µs to the first.
+    loaded: usize
+    text: [*]u8
+    drawn: u64
+    startup: u64
+    // Its frames, oldest first: serial, start (µs from the first frame),
+    // processor and GPU µs.
+    frameCount: usize
+    serial: [*]u64
+    start: [*]u64
+    processor: [*]u64
+    gpu: [*]u64
+    // What they come to (µs): the median, 95th percentile and the most of
+    // the work, the processor's and the GPU's; frames over the budget,
+    // spikes, the slowest frame (its index).
+    medianWork: u64
+    p95Work: u64
+    mostWork: u64
+    medianProcessor: u64
+    p95Processor: u64
+    medianGpu: u64
+    p95Gpu: u64
+    overBudget: usize
+    spikes: usize
+    slowest: usize
+    scratch: [*]u64
+}
+
+fn longs(allocator: Allocator, count: usize) -> [*]u64 {
+    unsafe { return @ptrCast([*]u64, allocator.alloc(count * 8 + 8, 16).?) }
+}
+
+pub fn init(frames: *Frames, allocator: Allocator) -> void {
+    frames.*.allocator = allocator
+    frames.*.directory = allocator.alloc(4096, 16).?
+    frames.*.directoryLength = 0
+    frames.*.count = 0
+    frames.*.names = allocator.alloc(MAX_TIMELINES * 128, 16).?
+    frames.*.namesUsed = 0
+    frames.*.loaded = 0
+    frames.*.text = allocator.alloc(MAX_TEXT + 1, 16).?
+    frames.*.frameCount = 0
+    frames.*.serial = longs(allocator, MAX_FRAMES)
+    frames.*.start = longs(allocator, MAX_FRAMES)
+    frames.*.processor = longs(allocator, MAX_FRAMES)
+    frames.*.gpu = longs(allocator, MAX_FRAMES)
+    frames.*.scratch = longs(allocator, MAX_FRAMES)
+}
+
+pub fn nameOf(frames: *Frames, which: usize) -> []const u8 {
+    return frames.*.names[@intCast(usize, frames.*.nameStart[which])..@intCast(usize, frames.*.nameEnd[which])]
+}
+
+// Finds the timelines (NAME-PID.frames).
+pub fn list(frames: *Frames, environment: [*][*]const u8) -> void {
+    frames.*.count = 0
+    frames.*.namesUsed = 0
+    frames.*.loaded = 0
+    frames.*.directoryLength = memory_module.directoryOf(environment, frames.*.directory, "frames")
+    if frames.*.directoryLength == 0 { return }
+    const context: *anyopaque = unsafe { @ptrCast(*anyopaque, frames) }
+    memory_module.eachStem(frames.*.directory, ".frames", addStem, context)
+    frames.*.loaded = frames.*.count
+}
+
+fn addStem(context: *anyopaque, stem: []const u8) -> void {
+    const frames: *Frames = unsafe { @ptrCast(*Frames, context) }
+    if frames.*.count >= MAX_TIMELINES || frames.*.namesUsed + stem.length > MAX_TIMELINES * 128 { return }
+    var name_end: usize = 0
+    const pid = memory_module.splitStem(stem, &name_end)
+    if pid == 0 { return }
+    const which = frames.*.count
+    frames.*.nameStart[which] = @intCast(u32, frames.*.namesUsed)
+    for byte in stem[0..name_end] {
+        frames.*.names[frames.*.namesUsed] = byte
+        frames.*.namesUsed += 1
+    }
+    frames.*.nameEnd[which] = @intCast(u32, frames.*.namesUsed)
+    frames.*.pid[which] = pid
+    frames.*.running[which] = memory_module.runs(pid)
+    frames.*.count += 1
+    frames.*.time[which] = headerField(frames, which, 3)
+}
+
+// The path of timeline `which` into `into` (4096 bytes); its length.
+fn pathOf(frames: *Frames, which: usize, into: [*]u8) -> usize {
+    var length: usize = 0
+    while length < frames.*.directoryLength {
+        into[length] = frames.*.directory[length]
+        length += 1
+    }
+    length = memory_module.append(into, length, "/")
+    length = memory_module.append(into, length, nameOf(frames, which))
+    length = memory_module.append(into, length, "-")
+    length = memory_module.appendNumber(into, length, frames.*.pid[which])
+    length = memory_module.append(into, length, ".frames")
+    into[length] = 0
+    return length
+}
+
+// A number of the header (frames, program, pid, then the numbers: 3 the
+// time).
+fn headerField(frames: *Frames, which: usize, wanted: usize) -> u64 {
+    var path: [4096]u8 = undefined
+    const path_bytes: [*]u8 = &path
+    _ = pathOf(frames, which, path_bytes)
+    const file = std.fs.open(path_bytes, 0, 0)
+    if !std.fs.isValid(file) { return 0 }
+    var head: [256]u8 = undefined
+    const head_bytes: [*]u8 = &head
+    const got = std.fs.read(file, head_bytes, 256)
+    _ = std.fs.close(file)
+    if got <= 0 { return 0 }
+    const text = head_bytes[0..@intCast(usize, got)]
+    var field: usize = 0
+    var at: usize = 0
+    while at < text.length && field < wanted {
+        if text[at] == 9 { field += 1 }
+        at += 1
+    }
+    return memory_module.parseNumber(text, &at)
+}
+
+// The newest timeline of the program `name`, else of any (running first);
+// the count: none.
+pub fn newestOf(frames: *Frames, name: []const u8) -> usize {
+    var best = frames.*.count
+    var which: usize = 0
+    while which < frames.*.count {
+        const fits = name.length == 0 || index_module.sameBytes(nameOf(frames, which), name)
+        if fits && (best == frames.*.count || (frames.*.running[which] && !frames.*.running[best]) || (frames.*.running[which] == frames.*.running[best] && frames.*.time[which] > frames.*.time[best])) { best = which }
+        which += 1
+    }
+    return best
+}
+
+// Reads timeline `which` and works out what it comes to; false when it
+// cannot be read.
+pub fn load(frames: *Frames, which: usize) -> bool {
+    frames.*.loaded = frames.*.count
+    if which >= frames.*.count { return false }
+    var path: [4096]u8 = undefined
+    const path_bytes: [*]u8 = &path
+    _ = pathOf(frames, which, path_bytes)
+    const file = std.fs.open(path_bytes, 0, 0)
+    if !std.fs.isValid(file) { return false }
+    var length: usize = 0
+    while length < MAX_TEXT {
+        const chunk: [*]u8 = frames.*.text + length
+        const got = std.fs.read(file, chunk, MAX_TEXT - length)
+        if got <= 0 { break }
+        length += @intCast(usize, got)
+    }
+    _ = std.fs.close(file)
+    frames.*.loaded = which
+    parse(frames, frames.*.text[0..length])
+    analyze(frames)
+    return true
+}
+
+fn parse(frames: *Frames, text: []const u8) -> void {
+    frames.*.frameCount = 0
+    frames.*.drawn = 0
+    frames.*.startup = 0
+    var start: usize = 0
+    while start < text.length {
+        var end = start
+        while end < text.length && text[end] != 10 { end += 1 }
+        const line = text[start..end]
+        if line.length > 6 && index_module.sameBytes(line[0..6], "frame\t") && frames.*.frameCount < MAX_FRAMES {
+            var at: usize = 6
+            const frame = frames.*.frameCount
+            frames.*.serial[frame] = memory_module.parseNumber(line, &at)
+            at += 1
+            frames.*.start[frame] = memory_module.parseNumber(line, &at)
+            at += 1
+            frames.*.processor[frame] = memory_module.parseNumber(line, &at)
+            at += 1
+            frames.*.gpu[frame] = memory_module.parseNumber(line, &at)
+            frames.*.frameCount += 1
+        } else if line.length > 7 && index_module.sameBytes(line[0..7], "frames\t") {
+            // frames, program, pid, seconds, then drawn and the start.
+            var field: usize = 0
+            var at: usize = 0
+            while at < line.length && field < 4 {
+                if line[at] == 9 { field += 1 }
+                at += 1
+            }
+            frames.*.drawn = memory_module.parseNumber(line, &at)
+            at += 1
+            frames.*.startup = memory_module.parseNumber(line, &at)
+        }
+        start = end + 1
+    }
+}
+
+// A frame's work: the longer of the processor's and the GPU's time.
+pub fn work(frames: *const Frames, frame: usize) -> u64 {
+    const processor = frames.*.processor[frame]
+    const gpu = frames.*.gpu[frame]
+    return if gpu > processor { gpu } else { processor }
+}
+
+// A frame far above the usual one.
+pub fn spike(frames: *const Frames, frame: usize) -> bool {
+    const time = work(frames, frame)
+    return time > frames.*.medianWork * SPIKE_TIMES && time >= SPIKE_LEAST
+}
+
+// The value at `share` percent of `count` values in the scratch, sorted.
+fn percentile(frames: *Frames, count: usize, share: usize) -> u64 {
+    if count == 0 { return 0 }
+    std.mem.sortU64(frames.*.scratch, count)
+    var at = count * share / 100
+    if at >= count { at = count - 1 }
+    return frames.*.scratch[at]
+}
+
+fn analyze(frames: *Frames) -> void {
+    const count = frames.*.frameCount
+    var frame: usize = 0
+    while frame < count {
+        frames.*.scratch[frame] = work(frames, frame)
+        frame += 1
+    }
+    frames.*.medianWork = percentile(frames, count, 50)
+    frames.*.p95Work = percentile(frames, count, 95)
+    frames.*.mostWork = if count > 0 { frames.*.scratch[count - 1] } else { 0 }
+    frame = 0
+    while frame < count {
+        frames.*.scratch[frame] = frames.*.processor[frame]
+        frame += 1
+    }
+    frames.*.medianProcessor = percentile(frames, count, 50)
+    frames.*.p95Processor = percentile(frames, count, 95)
+    frame = 0
+    while frame < count {
+        frames.*.scratch[frame] = frames.*.gpu[frame]
+        frame += 1
+    }
+    frames.*.medianGpu = percentile(frames, count, 50)
+    frames.*.p95Gpu = percentile(frames, count, 95)
+    frames.*.overBudget = 0
+    frames.*.spikes = 0
+    frames.*.slowest = 0
+    frame = 0
+    while frame < count {
+        if work(frames, frame) > BUDGET { frames.*.overBudget += 1 }
+        if spike(frames, frame) { frames.*.spikes += 1 }
+        if work(frames, frame) > work(frames, frames.*.slowest) { frames.*.slowest = frame }
+        frame += 1
+    }
+}
+
+// The frames ranked by work, slowest first, into `order` (at most
+// `capacity`); how many.
+pub fn ranked(frames: *Frames, order: [*]u32, capacity: usize) -> usize {
+    const count = frames.*.frameCount
+    var frame: usize = 0
+    while frame < count {
+        // The work above, the index below: one key, sorted ascending.
+        frames.*.scratch[frame] = (work(frames, frame) << 16) | frame
+        frame += 1
+    }
+    std.mem.sortU64(frames.*.scratch, count)
+    var taken: usize = 0
+    while taken < capacity && taken < count {
+        order[taken] = @intCast(u32, frames.*.scratch[count - 1 - taken] & 65535)
+        taken += 1
+    }
+    return taken
+}

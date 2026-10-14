@@ -58,10 +58,17 @@ class Client:
             payload = self.read(length)
             if first & 15 == 1: return json.loads(payload)
     def request(self, kind, data, number):
-        self.send({'op': 6, 'd': {'requestType': kind, 'requestId': str(number), 'requestData': data}})
-        while True:
-            message = self.receive()
-            if message['op'] == 7 and message['d']['requestId'] == str(number): return message['d']
+        # OBS answers 207 (not ready) while it still starts up, which takes
+        # longer on a busy machine: asked again a second later, for half a
+        # minute at most.
+        for _ in range(30):
+            self.send({'op': 6, 'd': {'requestType': kind, 'requestId': str(number), 'requestData': data}})
+            while True:
+                message = self.receive()
+                if message['op'] == 7 and message['d']['requestId'] == str(number): break
+            if message['d']['requestStatus'].get('code') != 207: return message['d']
+            time.sleep(1)
+        return message['d']
 
 port, source, targets = int(sys.argv[1]), sys.argv[2], sys.argv[3:]
 client = Client(port)

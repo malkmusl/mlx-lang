@@ -82,6 +82,20 @@ pub const Encoder = struct {
     cachedRaxLoadCount: usize
     memoryOperandCount: usize
     raxStackSlot: i32
+    // Where the code after the last label begins: a store before it may
+    // not be what a load after it reads (another way in), so loads do not
+    // take their value from it (previousStoreRegister).
+    forwardBarrier: usize
+    // Float values kept in xmm8..xmm15 by the frame slot they were stored
+    // to or loaded from (0: none) and their width: a load of a slot one of
+    // them holds is a register move, not a trip through memory. Every slot
+    // belongs to one value of the function and is written where that value
+    // is made, so they hold until a label (another way in), a call (it
+    // takes xmm8..xmm15 for its own) or a store to the slot.
+    xmmSlots: [8]i32
+    xmmBits: [8]usize
+    xmmNext: usize
+    cachedXmmLoadCount: usize
     allocator: allocator_module.Allocator
 }
 
@@ -118,6 +132,11 @@ pub fn init(allocator: allocator_module.Allocator) -> Encoder {
             .cachedRaxLoadCount = 0,
             .memoryOperandCount = 0,
             .raxStackSlot = 0,
+            .forwardBarrier = 0,
+            .xmmSlots = [8]i32{ 0, 0, 0, 0, 0, 0, 0, 0 },
+            .xmmBits = [8]usize{ 0, 0, 0, 0, 0, 0, 0, 0 },
+            .xmmNext = 0,
+            .cachedXmmLoadCount = 0,
             .allocator = allocator,
         }
     }
@@ -235,6 +254,8 @@ pub fn patch32(enc: *Encoder, offset: usize, value: i32) -> void {
 
 pub fn defineSymbol(enc: *Encoder, name_ptr: [*]const u8, name_len: usize) -> void {
     enc.*.raxStackSlot = 0
+    enc.*.forwardBarrier = enc.*.buf.*.length
+    forgetXmm(enc)
     const entry = SymbolEntry.{
         .namePointer = name_ptr,
         .nameLength = name_len,
@@ -464,7 +485,7 @@ fn previousStoreRegister(enc: *Encoder, rbp_offset: i32) -> usize {
     const is_short = disp >= -128 && disp <= 127
     const size: usize = if is_short { 4 } else { 7 }
     const length = enc.*.buf.*.length
-    if length < size { return 16 }
+    if length < size || length - size < enc.*.forwardBarrier { return 16 }
     const start = length - size
     const bytes = enc.*.buf.*.items
     if bytes[start + 1] != 0x89 { return 16 }
@@ -507,6 +528,7 @@ pub fn emitMovRegMem(enc: *Encoder, dst: target.Register, rbp_offset: i32) -> vo
 }
 
 pub fn emitMovMemReg(enc: *Encoder, rbp_offset: i32, src: target.Register) -> void {
+    forgetXmmSlot(enc, rbp_offset)
     const disp = 0 - rbp_offset
     const is_short = disp >= -128 && disp <= 127
     const mod: u8 = if is_short { 1 } else { 2 }
@@ -539,7 +561,68 @@ pub fn emitMovGpXmm(enc: *Encoder, dst: target.Register, xmm: usize, bits: usize
     emit1(enc, target.encodeModRm(3, @intCast(u8, xmm & 7), target.lo3(dst)))
 }
 
+// ---------------------------------------------------------------------------
+// Floats held in xmm8..xmm15 (see Encoder.xmmSlots)
+
+// Nothing held any more: a label, a call, a copy through memory.
+pub fn forgetXmm(enc: *Encoder) -> void {
+    var at: usize = 0
+    while at < 8 {
+        enc.*.xmmSlots[at] = 0
+        at += 1
+    }
+}
+
+// A store to the 8 bytes at rbp_offset: what overlaps them is gone.
+fn forgetXmmSlot(enc: *Encoder, rbp_offset: i32) -> void {
+    var at: usize = 0
+    while at < 8 {
+        const held = enc.*.xmmSlots[at]
+        if held != 0 && held - rbp_offset < 8 && rbp_offset - held < 8 { enc.*.xmmSlots[at] = 0 }
+        at += 1
+    }
+}
+
+// The register (8..15) holding the slot as a float of `bits`, else 16.
+pub fn heldXmm(enc: *Encoder, rbp_offset: i32, bits: usize) -> usize {
+    var at: usize = 0
+    while at < 8 {
+        if enc.*.xmmSlots[at] == rbp_offset && enc.*.xmmBits[at] == bits { return at + 8 }
+        at += 1
+    }
+    return 16
+}
+
+// The slot's value, now in `xmm`, kept in the next of xmm8..xmm15 too.
+fn holdXmm(enc: *Encoder, rbp_offset: i32, xmm: usize, bits: usize) -> void {
+    const at = enc.*.xmmNext
+    enc.*.xmmNext = (at + 1) % 8
+    emitMovXmmXmm(enc, at + 8, xmm)
+    enc.*.xmmSlots[at] = rbp_offset
+    enc.*.xmmBits[at] = bits
+}
+
+// movaps dst, src (the whole register: a float of either width).
+pub fn emitMovXmmXmm(enc: *Encoder, dst: usize, src: usize) -> void {
+    if dst >= 8 || src >= 8 { emit1(enc, target.encodeRex(false, dst >= 8, false, src >= 8)) }
+    emit2(enc, 0x0F, 0x28)
+    emit1(enc, target.encodeModRm(3, @intCast(u8, dst & 7), @intCast(u8, src & 7)))
+}
+
+pub fn cachedXmmLoads(enc: *Encoder) -> usize { return enc.*.cachedXmmLoadCount }
+
 pub fn emitMovXmmMem(enc: *Encoder, xmm: usize, rbp_offset: i32, bits: usize) -> void {
+    const held = heldXmm(enc, rbp_offset, bits)
+    if held < 16 {
+        enc.*.cachedXmmLoadCount += 1
+        if held != xmm { emitMovXmmXmm(enc, xmm, held) }
+        return
+    }
+    emitMovXmmMemUncached(enc, xmm, rbp_offset, bits)
+    if xmm < 8 { holdXmm(enc, rbp_offset, xmm, bits) }
+}
+
+fn emitMovXmmMemUncached(enc: *Encoder, xmm: usize, rbp_offset: i32, bits: usize) -> void {
     emit1(enc, if bits == 32 { 0xF3 } else { 0xF2 })
     if xmm >= 8 { emit1(enc, target.encodeRex(false, true, false, false)) }
     const disp = 0 - rbp_offset
@@ -552,6 +635,7 @@ pub fn emitMovXmmMem(enc: *Encoder, xmm: usize, rbp_offset: i32, bits: usize) ->
 
 pub fn emitMovMemXmm(enc: *Encoder, rbp_offset: i32, xmm: usize, bits: usize) -> void {
     if enc.*.raxStackSlot == rbp_offset { enc.*.raxStackSlot = 0 }
+    forgetXmmSlot(enc, rbp_offset)
     emit1(enc, if bits == 32 { 0xF3 } else { 0xF2 })
     if xmm >= 8 { emit1(enc, target.encodeRex(false, true, false, false)) }
     const disp = 0 - rbp_offset
@@ -560,6 +644,7 @@ pub fn emitMovMemXmm(enc: *Encoder, rbp_offset: i32, xmm: usize, bits: usize) ->
     emit2(enc, 0x0F, 0x11)
     emit1(enc, target.encodeModRm(mod, @intCast(u8, xmm & 7), target.lo3(target.Register.rbp)))
     if is_short { emit1(enc, @bitCast(u8, @intCast(i8, disp))) } else { emitImm32(enc, disp) }
+    if xmm < 8 { holdXmm(enc, rbp_offset, xmm, bits) }
 }
 
 pub fn emitFloatBinary(enc: *Encoder, opcode: u8, dst_xmm: usize, src_xmm: usize, bits: usize) -> void {
@@ -567,6 +652,18 @@ pub fn emitFloatBinary(enc: *Encoder, opcode: u8, dst_xmm: usize, src_xmm: usize
     if dst_xmm >= 8 || src_xmm >= 8 { emit1(enc, target.encodeRex(false, dst_xmm >= 8, false, src_xmm >= 8)) }
     emit2(enc, 0x0F, opcode)
     emit1(enc, target.encodeModRm(3, @intCast(u8, dst_xmm & 7), @intCast(u8, src_xmm & 7)))
+}
+
+// roundsd/roundss (SSE4.1): `src_xmm` rounded to a whole number into
+// `dst_xmm`; `mode` 1 down, 2 up, 3 toward zero (bit 3 keeps the inexact
+// result from being reported).
+pub fn emitRoundFloat(enc: *Encoder, dst_xmm: usize, src_xmm: usize, bits: usize, mode: usize) -> void {
+    emit1(enc, 0x66)
+    if dst_xmm >= 8 || src_xmm >= 8 { emit1(enc, target.encodeRex(false, dst_xmm >= 8, false, src_xmm >= 8)) }
+    emit1(enc, 0x0F)
+    emit2(enc, 0x3A, if bits == 32 { 0x0A } else { 0x0B })
+    emit1(enc, target.encodeModRm(3, @intCast(u8, dst_xmm & 7), @intCast(u8, src_xmm & 7)))
+    emit1(enc, @intCast(u8, 8 | mode))
 }
 
 pub fn emitFloatCompare(enc: *Encoder, lhs_xmm: usize, rhs_xmm: usize, bits: usize) -> void {
@@ -589,6 +686,59 @@ pub fn emitFloatToInt(enc: *Encoder, dst: target.Register, src_xmm: usize, float
     emit1(enc, target.encodeRex(true, target.needsRex(dst), false, src_xmm >= 8))
     emit2(enc, 0x0F, 0x2C)
     emit1(enc, target.encodeModRm(3, target.lo3(dst), @intCast(u8, src_xmm & 7)))
+}
+
+// xmm0 = the u64 in rax as a float. Below 2^63 cvtsi2sd takes it as it is;
+// from 2^63 on, half of it (its lowest bit kept in, so it still rounds
+// right) is converted and doubled. Uses rcx; rax is changed.
+pub fn emitUnsignedToFloat(enc: *Encoder, float_bits: usize) -> void {
+    enc.*.raxStackSlot = 0
+    const prefix: u8 = if float_bits == 32 { 0xF3 } else { 0xF2 }
+    emit3(enc, 0x48, 0x85, 0xC0)
+    emit2(enc, 0x78, 0x07)
+    emit1(enc, prefix)
+    emit4(enc, 0x48, 0x0F, 0x2A, 0xC0)
+    emit2(enc, 0xEB, 0x16)
+    emit3(enc, 0x48, 0x89, 0xC1)
+    emit3(enc, 0x48, 0xD1, 0xE9)
+    emit4(enc, 0x48, 0x83, 0xE0, 0x01)
+    emit3(enc, 0x48, 0x09, 0xC1)
+    emit1(enc, prefix)
+    emit4(enc, 0x48, 0x0F, 0x2A, 0xC1)
+    emit1(enc, prefix)
+    emit3(enc, 0x0F, 0x58, 0xC0)
+}
+
+// rax = the float in xmm0 as a u64. Below 2^63 cvttsd2si takes it as it is;
+// from 2^63 on, 2^63 is taken off first and its bit set again after. Uses
+// rcx and xmm1.
+pub fn emitFloatToUnsigned(enc: *Encoder, float_bits: usize) -> void {
+    enc.*.raxStackSlot = 0
+    if float_bits == 32 {
+        // ecx = 2^63 as an f32, into xmm1; ucomiss.
+        emit1(enc, 0xB9)
+        emitImm32(enc, 1593835520)
+        emit4(enc, 0x66, 0x0F, 0x6E, 0xC9)
+        emit3(enc, 0x0F, 0x2E, 0xC1)
+    } else {
+        // rcx = 2^63 as an f64, into xmm1; ucomisd.
+        emit2(enc, 0x48, 0xB9)
+        emitImm64(enc, 4890909195324358656)
+        emit1(enc, 0x66)
+        emit4(enc, 0x48, 0x0F, 0x6E, 0xC9)
+        emit4(enc, 0x66, 0x0F, 0x2E, 0xC1)
+    }
+    const prefix: u8 = if float_bits == 32 { 0xF3 } else { 0xF2 }
+    emit2(enc, 0x73, 0x07)
+    emit1(enc, prefix)
+    emit4(enc, 0x48, 0x0F, 0x2C, 0xC0)
+    emit2(enc, 0xEB, 0x0E)
+    emit1(enc, prefix)
+    emit3(enc, 0x0F, 0x5C, 0xC1)
+    emit1(enc, prefix)
+    emit4(enc, 0x48, 0x0F, 0x2C, 0xC0)
+    emit1(enc, 0x48)
+    emit4(enc, 0x0F, 0xBA, 0xF8, 0x3F)
 }
 
 pub fn emitFloatConvert(enc: *Encoder, dst_xmm: usize, src_xmm: usize, source_bits: usize) -> void {
@@ -622,6 +772,8 @@ pub fn emitLoadPointerSigned(enc: *Encoder, dst: target.Register, pointer: targe
 
 pub fn emitStorePointer(enc: *Encoder, pointer: target.Register, src: target.Register, width: usize) -> void {
     enc.*.raxStackSlot = 0
+    // The pointer may be to a slot of the frame.
+    forgetXmm(enc)
     const rex = target.encodeRex(width >= 8, target.needsRex(src), false, target.needsRex(pointer))
     const opcode: u8 = if width == 1 { 0x88 } else { 0x89 }
     const mod_rm = target.encodeModRm(0, target.lo3(src), target.lo3(pointer))
@@ -789,6 +941,7 @@ pub fn emitXorMem(enc: *Encoder, dst: target.Register, rbp_offset: i32) -> void 
 
 pub fn emitAtomicXaddPointer(enc: *Encoder, pointer: target.Register, value: target.Register) -> void {
     if value == target.Register.rax { enc.*.raxStackSlot = 0 }
+    forgetXmm(enc)
     emit1(enc, 0xF0)
     emit1(enc, target.encodeRex(true, target.needsRex(value), false, target.needsRex(pointer)))
     emit2(enc, 0x0F, 0xC1)
@@ -811,6 +964,7 @@ fn emitWidthPrefix(enc: *Encoder, width: usize) -> void {
 // old value.
 pub fn emitXchgPointer(enc: *Encoder, pointer: target.Register, reg: target.Register, width: usize) -> void {
     if reg == target.Register.rax { enc.*.raxStackSlot = 0 }
+    forgetXmm(enc)
     emitWidthPrefix(enc, width)
     emit3(enc, widthRex(width, reg, pointer), if width == 1 { 0x86 } else { 0x87 }, target.encodeModRm(0, target.lo3(reg), target.lo3(pointer)))
 }
@@ -818,6 +972,7 @@ pub fn emitXchgPointer(enc: *Encoder, pointer: target.Register, reg: target.Regi
 // lock xadd [pointer], reg: the memory takes the sum, reg the old value.
 pub fn emitLockXaddPointer(enc: *Encoder, pointer: target.Register, reg: target.Register, width: usize) -> void {
     if reg == target.Register.rax { enc.*.raxStackSlot = 0 }
+    forgetXmm(enc)
     emit1(enc, 0xF0)
     emitWidthPrefix(enc, width)
     emit4(enc, widthRex(width, reg, pointer), 0x0F, if width == 1 { 0xC0 } else { 0xC1 }, target.encodeModRm(0, target.lo3(reg), target.lo3(pointer)))
@@ -827,6 +982,7 @@ pub fn emitLockXaddPointer(enc: *Encoder, pointer: target.Register, reg: target.
 // reg's, else rax takes the memory's; ZF says which.
 pub fn emitLockCmpxchgPointer(enc: *Encoder, pointer: target.Register, reg: target.Register, width: usize) -> void {
     enc.*.raxStackSlot = 0
+    forgetXmm(enc)
     emit1(enc, 0xF0)
     emitWidthPrefix(enc, width)
     emit4(enc, widthRex(width, reg, pointer), 0x0F, if width == 1 { 0xB0 } else { 0xB1 }, target.encodeModRm(0, target.lo3(reg), target.lo3(pointer)))
@@ -937,6 +1093,7 @@ pub fn emitCallRel(enc: *Encoder, target_ptr: [*]const u8, target_len: usize) ->
     emit1(enc, 0xE8)
     addFixup(enc, FixupKind.call_rel32, target_ptr, target_len)
     enc.*.raxStackSlot = 0
+    forgetXmm(enc)
 }
 
 pub fn emitCallReg(enc: *Encoder, reg: target.Register) -> void {
@@ -946,6 +1103,7 @@ pub fn emitCallReg(enc: *Encoder, reg: target.Register) -> void {
         emit2(enc, 0xFF, target.encodeModRm(3, 2, target.lo3(reg)))
     }
     enc.*.raxStackSlot = 0
+    forgetXmm(enc)
 }
 
 pub fn emitRet(enc: *Encoder) -> void {
@@ -1162,6 +1320,7 @@ pub fn emitImportCall(enc: *Encoder, name_ptr: [*]const u8, name_len: usize, vec
     emit2(enc, 0xFF, 0x15)
     addGotFixup(enc, name_ptr, name_len)
     enc.*.raxStackSlot = 0
+    forgetXmm(enc)
 }
 
 // mov dst, qword [rip + GOT slot]: the address of an imported function.

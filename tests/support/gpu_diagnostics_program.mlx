@@ -1,0 +1,180 @@
+// std.gpu.diagnostics on a real driver (tools/check_gpu_diagnostics.sh:
+// lavapipe). `profile`: twenty frames, each with one long dispatch
+// recorded by heavy and two short ones by light, then the context closes
+// (with MLX_GPU_PROFILE the profile puts most of the time on heavy). `hang`:
+// a dispatch recorded by fine, then one by stuck that never ends; the
+// frame is not done in five seconds, which is a GPU crash in pass 2
+// recorded by stuck. `memory` (with MLX_LEAK_CHECK): eight small buffers
+// made by smallBuffers, one freed again, and a large one by largeBuffer,
+// then a memory snapshot. `frames` (with MLX_FRAMES): thirty frames as a
+// program draws them, a dispatch five times heavy's on every tenth, the
+// frame timeline written at the end. Exits 0, or 3 after the hang was seen (10
+// and more: a step failed).
+const std = @import("std")
+const vk = @import("std.vulkan")
+const loader = @import("std.vulkan.loader")
+const gpu = @import("std.gpu")
+const spv = @import("std.spirv.core")
+const builder = @import("std.spirv.builder")
+const compute = @import("std.spirv.compute")
+const leaks = @import("std.leaks")
+const diagnostics = @import("std.diagnostics")
+
+// One invocation that turns buffer word 0 over `count` times (push word
+// 0), or, with `hang`, adds to it until word 1 is 12345 (it never is).
+fn buildLoop(allocator: std.allocator.Allocator, hang: bool, result: *[*]u32) -> usize {
+    var b: builder.Builder = undefined
+    builder.init(&b, allocator, spv.version(1, 3))
+    var kernel: compute.Kernel = undefined
+    compute.declare(&b, &kernel, 1, 1, false)
+    const function_pointer = builder.typePointer(&b, spv.StorageClass.function, kernel.uint)
+    const main = builder.function(&b, kernel.voidType, spv.FUNCTION_CONTROL_NONE, kernel.functionType)
+    const entry = builder.label(&b)
+    const counter = builder.localVariable(&b, function_pointer)
+    builder.store(&b, counter, kernel.zero)
+    const count = compute.pushWord(&b, &kernel, 0)
+    const header = builder.newId(&b)
+    const condition = builder.newId(&b)
+    const body = builder.newId(&b)
+    const next = builder.newId(&b)
+    const end = builder.newId(&b)
+    builder.branch(&b, header)
+    const header_label = builder.labelWith(&b, header)
+    builder.loopMerge(&b, end, next)
+    builder.branch(&b, condition)
+    const condition_label = builder.labelWith(&b, condition)
+    const index = builder.load(&b, kernel.uint, counter)
+    const more = if hang {
+        builder.binary(&b, spv.Op.iNotEqual, kernel.boolean, compute.load(&b, &kernel, kernel.buffers[0], compute.constant(&b, &kernel, 1)), compute.constant(&b, &kernel, 12345))
+    } else {
+        builder.binary(&b, spv.Op.uLessThan, kernel.boolean, index, count)
+    }
+    builder.branchConditional(&b, more, body, end)
+    const body_label = builder.labelWith(&b, body)
+    const word = compute.element(&b, &kernel, kernel.buffers[0], kernel.zero)
+    const value = builder.load(&b, kernel.uint, word)
+    const scaled = builder.binary(&b, spv.Op.iMul, kernel.uint, value, compute.constant(&b, &kernel, 1664525))
+    builder.store(&b, word, builder.binary(&b, spv.Op.iAdd, kernel.uint, scaled, compute.constant(&b, &kernel, 1013904223)))
+    builder.branch(&b, next)
+    const next_label = builder.labelWith(&b, next)
+    builder.store(&b, counter, builder.binary(&b, spv.Op.iAdd, kernel.uint, index, compute.constant(&b, &kernel, 1)))
+    builder.branch(&b, header)
+    const end_label = builder.labelWith(&b, end)
+    builder.returnVoid(&b)
+    builder.functionEnd(&b)
+    compute.finish(&b, &kernel, main, 1, 1)
+    const words = builder.wordCount(&b)
+    const memory = allocator.alloc(words * 4, 4)
+    if memory == null { return 0 }
+    unsafe { result.* = @ptrCast([*]u32, memory.?) }
+    builder.writeWords(&b, result.*)
+    builder.deinit(&b)
+    return words
+}
+
+fn run(context: *gpu.Context, kernel: *const gpu.Kernel, buffer: *const gpu.Buffer, count: u32) -> bool {
+    var push: [1]u32 = [1]u32{ count }
+    var buffers: [1]vk.Buffer = [1]vk.Buffer{ buffer.*.buffer }
+    unsafe { return gpu.dispatch(context, kernel, @ptrCast([*]const vk.Buffer, &buffers), @ptrCast(*const anyopaque, &push), 1, 1) }
+}
+
+fn heavy(context: *gpu.Context, kernel: *const gpu.Kernel, buffer: *const gpu.Buffer) -> bool {
+    return run(context, kernel, buffer, 400000)
+}
+
+fn slow(context: *gpu.Context, kernel: *const gpu.Kernel, buffer: *const gpu.Buffer) -> bool {
+    return run(context, kernel, buffer, 2000000)
+}
+
+fn light(context: *gpu.Context, kernel: *const gpu.Kernel, buffer: *const gpu.Buffer) -> bool {
+    return run(context, kernel, buffer, 1000)
+}
+
+fn fine(context: *gpu.Context, kernel: *const gpu.Kernel, buffer: *const gpu.Buffer) -> bool {
+    return run(context, kernel, buffer, 10)
+}
+
+fn stuck(context: *gpu.Context, kernel: *const gpu.Kernel, buffer: *const gpu.Buffer) -> bool {
+    return run(context, kernel, buffer, 0)
+}
+
+// Small buffers: each a device allocation of its own, rounded up by it.
+fn smallBuffers(context: *gpu.Context, buffers: [*]gpu.Buffer) -> bool {
+    var index: usize = 0
+    while index < 8 {
+        if !gpu.createBuffer(context, &buffers[index], 100, false) { return false }
+        index += 1
+    }
+    return true
+}
+
+fn largeBuffer(context: *gpu.Context, buffer: *gpu.Buffer) -> bool {
+    return gpu.createDeviceBuffer(context, buffer, 1048576)
+}
+
+fn memory(context: *gpu.Context) -> u8 {
+    const watched = leaks.watch()
+    var small: [8]gpu.Buffer = undefined
+    var large: gpu.Buffer = undefined
+    var buffers: [*]gpu.Buffer = undefined
+    unsafe { buffers = @ptrCast([*]gpu.Buffer, &small) }
+    if !smallBuffers(context, buffers) || !largeBuffer(context, &large) { return 17 }
+    gpu.destroyBuffer(context, &buffers[3])
+    leaks.writeNow()
+    return 0
+}
+
+fn frames(context: *gpu.Context, kernel: *const gpu.Kernel, buffer: *const gpu.Buffer) -> u8 {
+    var frame: usize = 0
+    while frame < 30 {
+        const ignored = diagnostics.frameBegin()
+        if !gpu.begin(context) { return 18 }
+        const done = if frame % 10 == 9 { slow(context, kernel, buffer) } else { light(context, kernel, buffer) }
+        if !done || !gpu.submit(context) { return 19 }
+        diagnostics.frameEnd()
+        frame += 1
+    }
+    diagnostics.framesFlush()
+    return 0
+}
+
+pub fn main(arguments: [][*]const u8) -> u8 {
+    if arguments.length < 2 { return 2 }
+    const hang = std.text.same(std.text.cString(arguments[1]), "hang")
+    const allocator = std.page_allocator.init()
+    var driver: loader.Driver = undefined
+    if loader.openFirstDriver(&driver, arguments, allocator) != loader.Status.ok { return 10 }
+    var options = gpu.defaultOptions("diagnostics".pointer)
+    var context: gpu.Context = undefined
+    const opened = gpu.open(&context, driver, &options, allocator)
+    if opened != gpu.Status.ok { return 20 + @intFromEnum(opened) }
+    var code: [*]u32 = undefined
+    const words = buildLoop(allocator, false, &code)
+    var loop: gpu.Kernel = undefined
+    if words == 0 || !gpu.createKernel(&context, &loop, code, words, 1, 1) { return 12 }
+    var buffer: gpu.Buffer = undefined
+    if !gpu.createBuffer(&context, &buffer, 64, false) { return 13 }
+    if std.text.same(std.text.cString(arguments[1]), "memory") { return memory(&context) }
+    if std.text.same(std.text.cString(arguments[1]), "frames") { return frames(&context, &loop, &buffer) }
+    if hang {
+        var hang_code: [*]u32 = undefined
+        const hang_words = buildLoop(allocator, true, &hang_code)
+        var endless: gpu.Kernel = undefined
+        if hang_words == 0 || !gpu.createKernel(&context, &endless, hang_code, hang_words, 1, 1) { return 1 }
+        if !gpu.begin(&context) { return 1 }
+        if !fine(&context, &loop, &buffer) || !stuck(&context, &endless, &buffer) { return 1 }
+        if gpu.submit(&context) { return 1 }
+        // The GPU is still in the endless loop: leave without waiting.
+        const exited = std.linux.syscall1(231, 3)
+        return 3
+    }
+    var frame: usize = 0
+    while frame < 20 {
+        if !gpu.begin(&context) { return 14 }
+        if !heavy(&context, &loop, &buffer) || !light(&context, &loop, &buffer) || !light(&context, &loop, &buffer) { return 15 }
+        if !gpu.submit(&context) { return 16 }
+        frame += 1
+    }
+    gpu.close(&context)
+    return 0
+}

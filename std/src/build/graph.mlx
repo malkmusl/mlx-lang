@@ -1,0 +1,393 @@
+// The build graph a build.mlx declares (std.build re-exports what a
+// build.mlx uses). A step makes one file: an Mlx program, shared object
+// or plugin compiled from its root module, the output of a host command, a
+// symbolic link or a copy; a group makes nothing and stands for the steps
+// added to it. Steps name the steps they need (dependOn, add); `mlx build
+// NAME` builds NAME and what it needs, every step only when it is not
+// current (std/src/build/cache.mlx).
+//
+// The graph lives in one mapping: fixed tables, and the strings it makes
+// (output paths) in a text area of its own. A declaration it cannot take
+// (a name used twice, a table full) is recorded and reported before
+// anything is built.
+const std = @import("std")
+
+pub const MAX_NODES: usize = 512
+pub const MAX_OPTIONS: usize = 16
+pub const MAX_INPUTS: usize = 16
+pub const MAX_TREES: usize = 4
+pub const MAX_DEPENDENCIES: usize = 128
+pub const TEXT_BYTES: usize = 1048576
+// Whole files read at once: manifests and depfiles.
+pub const FILE_BYTES: usize = 4194304
+pub const IO_BYTES: usize = 65536
+pub const PATH_BYTES: usize = 4096
+pub const MAX_ARGUMENTS: usize = 96
+pub const ARGUMENT_BYTES: usize = 32768
+pub const MAX_REQUESTED: usize = 64
+pub const NONE: usize = 18446744073709551615
+
+pub const KIND_GROUP: u8 = 0
+pub const KIND_PROGRAM: u8 = 1
+pub const KIND_SHARED: u8 = 2
+pub const KIND_PLUGIN: u8 = 3
+pub const KIND_COMMAND: u8 = 4
+pub const KIND_LINK: u8 = 5
+pub const KIND_COPY: u8 = 6
+
+pub const STATE_WAITING: u8 = 0
+pub const STATE_RUNNING: u8 = 1
+pub const STATE_DONE: u8 = 2
+pub const STATE_FAILED: u8 = 3
+pub const STATE_SKIPPED: u8 = 4
+
+// What build.mlx's package() says about the project (what build.zig.zon
+// held): its name, version and a line about it.
+pub const Package = struct {
+    name: []const u8
+    version: []const u8
+    description: []const u8
+}
+
+// A step of the graph, as build.mlx holds it.
+pub const Step = struct {
+    index: usize
+}
+
+pub const Node = struct {
+    kind: u8
+    name: []const u8
+    description: []const u8
+    // The root module, the command line, the link target or the copied
+    // file.
+    source: []const u8
+    // The file the step makes ("" for a group, and for a command that only
+    // runs: then a stamp in mlx-out/build/stamps stands for it).
+    output: []const u8
+    depfile: []const u8
+    options: [16][]const u8
+    optionCount: usize
+    inputs: [16][]const u8
+    inputCount: usize
+    trees: [4][]const u8
+    treeSuffixes: [4][]const u8
+    treeCount: usize
+    dependencies: [128]usize
+    dependencyCount: usize
+    // The run: wanted by the steps asked for, its state, whether it was
+    // made now (not current), its job, and how long the last build took.
+    wanted: bool
+    state: u8
+    // Looked at (cache.isCurrent) and found not current.
+    checked: bool
+    stale: bool
+    rebuilt: bool
+    pid: isize
+    started: usize
+    took: usize
+}
+
+pub const Builder = struct {
+    package: Package
+    nodes: [512]Node
+    nodeCount: usize
+    defaultNode: usize
+    // The first declaration the graph could not take.
+    problem: []const u8
+    problemName: []const u8
+    text: [1048576]u8
+    textUsed: usize
+    // The run's settings, from the command line.
+    compiler: []const u8
+    compilerHash: u64
+    compilerHashed: bool
+    environment: [*][*]const u8
+    jobs: usize
+    force: bool
+    dryRun: bool
+    verbose: bool
+    keepGoing: bool
+    requested: [64][]const u8
+    requestedCount: usize
+    // The runner itself (mlx-out/build/runner), kept current like a step.
+    runner: Node
+    // Buffers: whole files, file contents to hash, paths as C strings, a
+    // job's command line.
+    file: [4194304]u8
+    io: [65536]u8
+    paths: [4][4096]u8
+    pathTurn: usize
+    arguments: [96][*]const u8
+    argumentText: [32768]u8
+    argumentUsed: usize
+}
+
+// A builder in a mapping of its own (zeroed); null without memory.
+pub fn create() -> ?*Builder {
+    const allocator = std.page_allocator.init()
+    const memory = allocator.alloc(@sizeOf(Builder), 16)
+    if memory == null { return null }
+    const b: *Builder = unsafe { @ptrCast(*Builder, memory.?) }
+    b.*.nodeCount = 0
+    b.*.defaultNode = NONE
+    b.*.problem = ""
+    b.*.problemName = ""
+    b.*.textUsed = 0
+    b.*.compiler = "mlx-out/bin/compiler/mlx4"
+    b.*.compilerHashed = false
+    b.*.jobs = 0
+    b.*.force = false
+    b.*.dryRun = false
+    b.*.verbose = false
+    b.*.keepGoing = false
+    b.*.requestedCount = 0
+    b.*.pathTurn = 0
+    b.*.argumentUsed = 0
+    b.*.package = Package.{ .name = "", .version = "", .description = "" }
+    return b
+}
+
+fn textBytes(b: *Builder) -> [*]u8 {
+    unsafe { return @ptrFromInt([*]u8, @intFromPtr(b) + @offsetOf(Builder, "text")) }
+}
+
+// `value` copied into the builder's text (with a NUL after it, so it is a
+// C string too).
+pub fn keep(b: *Builder, value: []const u8) -> []const u8 {
+    return joined(b, value, "")
+}
+
+// `left` and `right` one after the other, kept in the builder's text.
+pub fn joined(b: *Builder, left: []const u8, right: []const u8) -> []const u8 {
+    if b.*.textUsed + left.length + right.length + 1 > TEXT_BYTES {
+        fail(b, "the build graph's text is full", left)
+        return ""
+    }
+    const bytes = textBytes(b)
+    const start = b.*.textUsed
+    var length = std.text.append(bytes, start, TEXT_BYTES, left)
+    length = std.text.append(bytes, length, TEXT_BYTES, right)
+    bytes[length] = 0
+    b.*.textUsed = length + 1
+    return bytes[start..length]
+}
+
+// Records the first declaration problem (reported before anything runs).
+pub fn fail(b: *Builder, message: []const u8, name: []const u8) -> void {
+    if b.*.problem.length != 0 { return }
+    b.*.problem = message
+    b.*.problemName = name
+}
+
+pub fn node(b: *Builder, index: usize) -> *Node {
+    unsafe { return @ptrFromInt(*Node, @intFromPtr(b) + @offsetOf(Builder, "nodes") + index * @sizeOf(Node)) }
+}
+
+// The step called `name`, or NONE.
+pub fn find(b: *Builder, name: []const u8) -> usize {
+    var index: usize = 0
+    while index < b.*.nodeCount {
+        if std.text.same(node(b, index).*.name, name) { return index }
+        index += 1
+    }
+    return NONE
+}
+
+// A file name for a step's own files (logs, manifests): its name with
+// every '/' as '_'.
+pub fn fileName(b: *Builder, name: []const u8) -> []const u8 {
+    const kept = keep(b, name)
+    if kept.length == 0 { return kept }
+    const bytes = textBytes(b)
+    const start = b.*.textUsed - kept.length - 1
+    var index: usize = 0
+    while index < kept.length {
+        if bytes[start + index] == 47 { bytes[start + index] = 95 }
+        index += 1
+    }
+    return kept
+}
+
+pub fn initNode(item: *Node, kind: u8, name: []const u8, source: []const u8, output: []const u8) -> void {
+    item.*.kind = kind
+    item.*.name = name
+    item.*.description = ""
+    item.*.source = source
+    item.*.output = output
+    item.*.depfile = ""
+    item.*.optionCount = 0
+    item.*.inputCount = 0
+    item.*.treeCount = 0
+    item.*.dependencyCount = 0
+    item.*.wanted = false
+    item.*.state = STATE_WAITING
+    item.*.checked = false
+    item.*.stale = false
+    item.*.rebuilt = false
+    item.*.pid = 0
+    item.*.started = 0
+    item.*.took = 0
+}
+
+fn add(b: *Builder, kind: u8, name: []const u8, source: []const u8, output: []const u8) -> Step {
+    if name.length == 0 {
+        fail(b, "a step needs a name", name)
+        return Step.{ .index = 0 }
+    }
+    if find(b, name) != NONE {
+        fail(b, "two steps have the same name", name)
+        return Step.{ .index = find(b, name) }
+    }
+    if b.*.nodeCount >= MAX_NODES {
+        fail(b, "too many steps", name)
+        return Step.{ .index = 0 }
+    }
+    const index = b.*.nodeCount
+    b.*.nodeCount += 1
+    const item = node(b, index)
+    initNode(item, kind, name, source, output)
+    if kind == KIND_PROGRAM || kind == KIND_SHARED || kind == KIND_PLUGIN {
+        item.*.depfile = joined(b, joined(b, "mlx-out/build/cache/", fileName(b, name)), ".d")
+    }
+    return Step.{ .index = index }
+}
+
+fn valid(b: *Builder, step: Step) -> bool {
+    return step.index < b.*.nodeCount
+}
+
+// A group: `mlx build NAME` builds what was added to it.
+pub fn group(b: *Builder, name: []const u8, description: []const u8) -> Step {
+    const step = add(b, KIND_GROUP, name, "", "")
+    if valid(b, step) { node(b, step.index).*.description = description }
+    return step
+}
+
+// The Mlx program NAME (mlx-out/bin/NAME) from its root module.
+pub fn program(b: *Builder, name: []const u8, root: []const u8) -> Step {
+    return add(b, KIND_PROGRAM, name, root, joined(b, "mlx-out/bin/", name))
+}
+
+// The shared object NAME (mlx-out/lib/NAME, --shared): Mlx programs load
+// it with dlopen.
+pub fn sharedObject(b: *Builder, name: []const u8, root: []const u8) -> Step {
+    return add(b, KIND_SHARED, name, root, joined(b, "mlx-out/lib/", name))
+}
+
+// The plugin NAME (mlx-out/lib/NAME, --plugin): a shared object for
+// programs that are not Mlx.
+pub fn plugin(b: *Builder, name: []const u8, root: []const u8) -> Step {
+    return add(b, KIND_PLUGIN, name, root, joined(b, "mlx-out/lib/", name))
+}
+
+// The host command LINE (words split at spaces; "double quotes" keep a
+// word together), run in the project's directory, making OUTPUT ("" when
+// it only runs). It runs again when LINE, an input or a file of an input
+// tree changed, or OUTPUT is gone.
+pub fn command(b: *Builder, name: []const u8, output: []const u8, line: []const u8) -> Step {
+    return add(b, KIND_COMMAND, name, line, output)
+}
+
+// The symbolic link mlx-out/bin/NAME to TARGET.
+pub fn link(b: *Builder, name: []const u8, target: []const u8) -> Step {
+    return add(b, KIND_LINK, name, target, joined(b, "mlx-out/bin/", name))
+}
+
+// OUTPUT as a copy of SOURCE (with its mode).
+pub fn copy(b: *Builder, name: []const u8, source: []const u8, output: []const u8) -> Step {
+    return add(b, KIND_COPY, name, source, output)
+}
+
+// The step's file at PATH instead of its usual place.
+pub fn output(b: *Builder, step: Step, path: []const u8) -> void {
+    if valid(b, step) { node(b, step.index).*.output = path }
+}
+
+// A line for `mlx build --list`.
+pub fn describe(b: *Builder, step: Step, description: []const u8) -> void {
+    if valid(b, step) { node(b, step.index).*.description = description }
+}
+
+// A compiler option (--soname=..., --library NAME as two options, ...).
+pub fn option(b: *Builder, step: Step, flag: []const u8) -> void {
+    if !valid(b, step) { return }
+    const item = node(b, step.index)
+    if item.*.optionCount >= MAX_OPTIONS {
+        fail(b, "too many options", item.*.name)
+        return
+    }
+    item.*.options[item.*.optionCount] = flag
+    item.*.optionCount += 1
+}
+
+// A file a command reads (an Mlx step finds its own inputs).
+pub fn input(b: *Builder, step: Step, path: []const u8) -> void {
+    if !valid(b, step) { return }
+    const item = node(b, step.index)
+    if item.*.inputCount >= MAX_INPUTS {
+        fail(b, "too many inputs", item.*.name)
+        return
+    }
+    item.*.inputs[item.*.inputCount] = path
+    item.*.inputCount += 1
+}
+
+// Every file under DIRECTORY whose name ends in SUFFIX ("" for all) is an
+// input of a command; a file added or removed there counts as a change.
+pub fn inputTree(b: *Builder, step: Step, directory: []const u8, suffix: []const u8) -> void {
+    if !valid(b, step) { return }
+    const item = node(b, step.index)
+    if item.*.treeCount >= MAX_TREES {
+        fail(b, "too many input trees", item.*.name)
+        return
+    }
+    item.*.trees[item.*.treeCount] = directory
+    item.*.treeSuffixes[item.*.treeCount] = suffix
+    item.*.treeCount += 1
+}
+
+// STEP runs after OTHER, and only when OTHER was built.
+pub fn dependOn(b: *Builder, step: Step, other: Step) -> void {
+    if !valid(b, step) || !valid(b, other) { return }
+    const item = node(b, step.index)
+    if item.*.dependencyCount >= MAX_DEPENDENCIES {
+        fail(b, "too many dependencies", item.*.name)
+        return
+    }
+    item.*.dependencies[item.*.dependencyCount] = other.index
+    item.*.dependencyCount += 1
+}
+
+// STEP becomes part of GROUP.
+pub fn addTo(b: *Builder, group_step: Step, step: Step) -> void {
+    dependOn(b, group_step, step)
+}
+
+// What `mlx build` builds without a step named.
+pub fn byDefault(b: *Builder, step: Step) -> void {
+    if valid(b, step) { b.*.defaultNode = step.index }
+}
+
+// PATH as a C string, in one of four turns of buffers (a path stays valid
+// until four more were made).
+pub fn cPath(b: *Builder, path: []const u8) -> [*]const u8 {
+    const turn = b.*.pathTurn & 3
+    b.*.pathTurn += 1
+    const bytes: [*]u8 = unsafe { @ptrFromInt([*]u8, @intFromPtr(b) + @offsetOf(Builder, "paths") + turn * PATH_BYTES) }
+    const length = std.text.append(bytes, 0, PATH_BYTES - 1, path)
+    bytes[length] = 0
+    unsafe { return @ptrCast([*]const u8, bytes) }
+}
+
+// The runner's own step (mlx-out/build/runner from build.mlx).
+pub fn runnerNode(b: *Builder) -> *Node {
+    unsafe { return @ptrFromInt(*Node, @intFromPtr(b) + @offsetOf(Builder, "runner")) }
+}
+
+pub fn fileBytes(b: *Builder) -> [*]u8 {
+    unsafe { return @ptrFromInt([*]u8, @intFromPtr(b) + @offsetOf(Builder, "file")) }
+}
+
+pub fn ioBytes(b: *Builder) -> [*]u8 {
+    unsafe { return @ptrFromInt([*]u8, @intFromPtr(b) + @offsetOf(Builder, "io")) }
+}

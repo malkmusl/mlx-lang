@@ -11,7 +11,9 @@ A Wayland compositor written in Mlx with `std.wayland`. It runs either
 Either way it is a compositor in its own right: programs started with its
 `WAYLAND_DISPLAY` appear as windows inside it. It picks nested when it is
 started inside a Wayland session, freestanding otherwise (`--backend
-nested|drm` decides).
+nested|drm` decides). Freestanding, it first tells the boot splash
+(mlx-splash or plymouthd) to quit leaving its last frame, so the monitor
+goes from the splash to the desktop with no text console in between.
 
 - Keyboard and pointer go to the clients: the pointer to the window under
   it, a click focuses and raises a window, and keys go to the focused
@@ -101,7 +103,8 @@ WAYLAND_DISPLAY=wayland-mlx dbus-run-session nautilus
 Options: `--socket NAME`, `--size WxH`, `--fullscreen` (a fullscreen
 window at the monitor's resolution), `--renderer auto|vulkan|cpu` (default
 `auto`: Vulkan when a driver works, else the CPU), `--font PATH|none`,
-`--terminal PROGRAM`, `--launcher PROGRAM|none` (what Super starts),
+`--terminal PROGRAM`, `--greeter PROGRAM` (the restricted login-screen
+mode described below), `--launcher PROGRAM|none` (what Super starts),
 `--dock PROGRAM|none` (the dock, kept running), `--topbar PROGRAM|none`
 (the top bar, kept running), `--xwayland PROGRAM|none` (X programs, see
 X programs), `--run PROGRAM`
@@ -113,6 +116,24 @@ frame takes to compose and present).
 Each title bar shows the window's frames per second (the buffers it
 committed) and the desktop's (frames shown). Shown frames follow the
 monitor: at 60 Hz the desktop shows at most 60.
+
+## Greeter mode
+
+`--greeter PROGRAM` makes one compositor instance a login screen instead
+of a desktop session. It starts `PROGRAM` over a private `WAYLAND_SOCKET`
+connection adopted directly by the server. That connection, rather than a
+forgeable title or app id, identifies the trusted greeter client. Other
+clients may connect to the public display socket, but none of their
+surfaces are drawn, focused or hit-tested; keyboard and pointer input stay
+with the greeter and its popups.
+
+Greeter mode ignores `--run` programs and disables the terminal shortcut,
+launcher, dock, top bar, Xwayland, workspace hotkeys and touchpad
+workspace gestures. The only compositor shortcut left is
+Ctrl+Alt+F1..F12 on the freestanding backend, so recovery through another
+VT remains possible. When the greeter process exits, the compositor exits
+too and relinquishes DRM; the login service owns the larger lifecycle and
+starts a new greeter after a user session ends.
 
 ## Dock and launcher
 
@@ -521,6 +542,14 @@ memfd), once more copying each frame in, as on drivers that cannot import
 them, and once more with the first frame made to look missing from the
 buffer, after which the renderer must copy.
 
+Every device descriptor is made nonblocking when the compositor takes it
+([`device.mlx`](device.mlx)), whoever opened it: the event loop reads the
+card and the input devices until EAGAIN, systemd-logind hands them over
+nonblocking, and a session manager that does not would leave the
+compositor waiting in read(2) for a page flip after its first frame,
+deaf to clients and keys. `tools/check_compositor_device.sh` checks it
+with a blocking pipe in place of the card.
+
 ## Desktop session (GDM, SDDM)
 
 `install_compositor.sh` at the repository root builds the compositor and
@@ -541,19 +570,31 @@ connected connectors, the `video` and `input` groups (needed only without
 logind), the Vulkan drivers, the XKB data, and the last session log,
 whose `modeset failed`, `crashed:` or `killed by signal` lines it points
 out. It wraps `tools/install_compositor_session.sh`, which does the
-building and copying (`--prefix`, default `/usr/local` there; `--destdir`
+building and copying (`--prefix`, default `/usr` there too; `--destdir`
 stages for packaging; `--build-only` builds into `mlx-out/session`). The
-build uses the canonical compiler, `mlx-out/bin/compiler/mlx4`, and makes
-it first from the bootstrap-built `zig-out/bin/mlx1` when it is missing
-(`mlx1 -> mlx2 -> mlx3`, the self-hosted compiler's fixed point): that
-compiler builds the same binary from the same sources on every machine,
-so the checksum `--check` prints matches a build elsewhere, and a crash
-address from one machine finds its place in another's disassembly.
+programs come from `./mlx build desktop client-libraries`
+([`build.mlx`](../../../build.mlx)), which builds a program only when a
+module it reads changed, the jobs side by side: a reinstall with nothing
+changed builds nothing. It uses the canonical compiler,
+`mlx-out/bin/compiler/mlx4`, made first from the bootstrap-built
+`zig-out/bin/mlx1` when it is missing (`mlx1 -> mlx2 -> mlx3`, the
+self-hosted compiler's fixed point): that compiler builds the same binary
+from the same sources on every machine, so the checksum `--check` prints
+matches a build elsewhere, and a crash address from one machine finds its
+place in another's disassembly. `--compiler PATH` compiles everything with
+another compiler instead.
 
-It puts `mlx-compositor`, `mlx-terminal` and `mlx-session` into
-`/usr/local/bin` (`--prefix`) and `mlx-compositor.desktop` into
-`/usr/share/wayland-sessions` (`--sessions`), where both display managers
-look; `--destdir` stages everything for packaging, `--build-only` only
+It puts `mlx-compositor`, `mlx-terminal`, `mlx-session` and the other
+programs into `/usr/bin/mlx` (`PREFIX/bin/mlx`, `--prefix`, default
+`/usr`), a directory of their own that the installation puts on PATH
+after the system's directories wherever a PATH comes from: login shells,
+the user session, the system services, sudo, su and the console login,
+PAM sessions and fish (the files are listed in
+[`tools/lib/mlx_layout.sh`](../../../tools/lib/mlx_layout.sh)), and
+`mlx-compositor.desktop` into `/usr/share/wayland-sessions`
+(`--sessions`), where both display managers look; programs from installs
+before that layout (in `/usr/local/bin` or `/usr/bin`) are listed by
+`tools/remove_old_mlx_layout.sh` and removed with `--remove`; `--destdir` stages everything for packaging, `--build-only` only
 builds (into `mlx-out/session`). Then log out and pick "Mlx Compositor":
 in GDM with the gear button once your user is chosen, in SDDM in the
 session menu.
@@ -657,7 +698,7 @@ display-mode = auto
 night-light = off
 night-light-temperature = 4000
 # The screen locker the lock hotkey and the top bar's session menu run.
-lock-command = swaylock
+lock-command = mlx-lock
 ```
 
 [`projects/desktop/settings`](../settings/main.mlx) changes them, in a
@@ -1016,7 +1057,7 @@ locker locks and unlocks it; a second locker while one lives is refused
 (`finished`).
 
 The lock hotkey (`key-lock`, Super+L) and the top bar's session menu run
-the program `lock-command` names in the settings file (`swaylock` by
+the program `lock-command` names in the settings file (`mlx-lock` by
 default; a name on `PATH` or a path). The session menu's Log Out asks the
 compositor (on the bar's channel) to close every window; it ends once
 they have, or after four seconds, and the session with it.
@@ -1506,6 +1547,9 @@ finished`.
 
 `tools/check_wayland_compositor.sh [compiler] [cpu|vulkan]` exercises all
 of this with scripted input (`tools/wayland-test-host`) on either renderer,
+including an untrusted second client beside the private greeter. Set
+`MLX_WAYLAND_GREETER_ONLY=1` for just that focused scenario. The full check
+continues
 with copy and paste between two clients (`wl-copy`, `wl-paste`) and a GTK 4
 window (`gtk4-widget-factory`) when those are installed;
 `tools/check_vulkan_wayland.sh` checks the Vulkan client in both renderers

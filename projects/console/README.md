@@ -38,7 +38,9 @@ the console back into text mode.
   `FBIOGET_FSCREENINFO` (32 bits per pixel; red in the third or the first
   byte) and mapped; the terminal is drawn on an ARGB canvas of the
   screen's size and copied over row by row whenever the screen changed.
-  A file framebuffer is the same without the device.
+  A file framebuffer is the same without the device. Before the device
+  is taken, the boot splash (mlx-splash or plymouthd) is told to quit,
+  giving the console back (`projects/desktop/splash/handover.mlx`).
 - `input.mlx`: every `/dev/input/eventN` whose capabilities include
   letters and a space bar is a keyboard (mice and buttons are left
   alone); they are read without blocking, and `/dev/input` is looked at

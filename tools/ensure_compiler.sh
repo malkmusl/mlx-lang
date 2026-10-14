@@ -6,12 +6,13 @@
 # compiler's fixed point (it builds the same binary from the same sources on
 # every machine, so a crash address from one machine finds its place on
 # another). When only the bootstrap-built zig-out/bin/mlx1 is there (or
-# nothing: then `zig build mlx1`), mlx4 is built from it in two stages
+# nothing: then zig builds mlx0, which builds it), mlx4 is built from it in two stages
 # (mlx1 builds the compiler, which builds itself). When mlx4 is older than
 # the compiler's sources and
 # lacks something they added since (each feature below has a probe), it is
-# rebuilt in two stages (mlx4 builds the new compiler, which builds itself)
-# and installed once it has every feature; the message names what was
+# rebuilt in two stages (mlx4 builds the new compiler, which builds itself;
+# one or two more when that is not yet the fixed point) and installed once
+# it has every feature; the message names what was
 # missing. A rebuild that does not help (the old compiler cannot build the
 # sources, or the result still lacks a feature) falls back to the bootstrap
 # chain, and failing that leaves the old compiler in place and exits 1
@@ -292,6 +293,303 @@ stores_through_slice_addresses() {
     return $ok
 }
 
+# Whether tuples of more than three words come back from a call whole and
+# a part taken out of one keeps its type (tests/311_wide_tuple_runtime.mlx
+# exits 13); older compilers returned three words at most and lost a
+# slice's length taken out of a tuple. The same round of fixes typed field
+# addresses by their place, resolved module declarations in any order and
+# lowered module constants of floats and structs.
+returns_wide_tuples() {
+    local probe
+    probe=$(mktemp -d mlx-out/probe.XXXXXX)
+    local ok=1
+    if "$1" --quiet tests/311_wide_tuple_runtime.mlx -o "$probe/probe" > /dev/null 2>&1; then
+        local status=0
+        "$probe/probe" > /dev/null 2>&1 || status=$?
+        [[ $status -eq 13 ]] && ok=0
+    fi
+    rm -rf -- "$probe"
+    return $ok
+}
+
+# Whether $1 takes a pointer to an array as a many-item pointer and steps
+# a many-item pointer by elements (tests/319_array_pointer_runtime.mlx
+# exits 13); std and the programs write `&buffer` and `p + n` for what
+# took an unsafe @ptrCast before. The compiler's own sources and
+# std/bootstrap do not use them, so an older compiler still builds them.
+steps_many_pointers() {
+    local probe
+    probe=$(mktemp -d mlx-out/probe.XXXXXX)
+    local ok=1
+    if "$1" --quiet tests/319_array_pointer_runtime.mlx -o "$probe/probe" > /dev/null 2>&1; then
+        local status=0
+        "$probe/probe" > /dev/null 2>&1 || status=$?
+        [[ $status -eq 13 ]] && ok=0
+    fi
+    rm -rf -- "$probe"
+    return $ok
+}
+
+# Whether $1 gives a slice's first word as `.pointer`, a [*]T
+# (tests/321_slice_pointer_runtime.mlx exits 13); std and the programs
+# pass `text.pointer` where they cast the slice before.
+reads_slice_pointers() {
+    local probe
+    probe=$(mktemp -d mlx-out/probe.XXXXXX)
+    local ok=1
+    if "$1" --quiet tests/321_slice_pointer_runtime.mlx -o "$probe/probe" > /dev/null 2>&1; then
+        local status=0
+        "$probe/probe" > /dev/null 2>&1 || status=$?
+        [[ $status -eq 13 ]] && ok=0
+    fi
+    rm -rf -- "$probe"
+    return $ok
+}
+
+# Whether $1 works out arithmetic on float literals alone as floats
+# (tests/322_float_literal_arithmetic_runtime.mlx exits 13); older
+# compilers added and divided the literals' bit patterns as integers,
+# so `1.0 / 255.0` came out 0.
+folds_float_literals() {
+    local probe
+    probe=$(mktemp -d mlx-out/probe.XXXXXX)
+    local ok=1
+    if "$1" --quiet tests/322_float_literal_arithmetic_runtime.mlx -o "$probe/probe" > /dev/null 2>&1; then
+        local status=0
+        "$probe/probe" > /dev/null 2>&1 || status=$?
+        [[ $status -eq 13 ]] && ok=0
+    fi
+    rm -rf -- "$probe"
+    return $ok
+}
+
+# Whether $1 returns every word of an error union's payload
+# (tests/323_error_union_payload_words_runtime.mlx exits 0); older
+# compilers returned the tag and one word, so a slice payload lost its
+# length and the test loops.
+returns_wide_error_payloads() {
+    local probe
+    probe=$(mktemp -d mlx-out/probe.XXXXXX)
+    local ok=1
+    if "$1" --quiet tests/323_error_union_payload_words_runtime.mlx -o "$probe/probe" > /dev/null 2>&1; then
+        timeout 5 "$probe/probe" > /dev/null 2>&1 && ok=0
+    fi
+    rm -rf -- "$probe"
+    return $ok
+}
+
+# Whether $1 has @floor, @ceil and @trunc
+# (tests/324_float_rounding_runtime.mlx exits 13); std.math rounds with
+# them.
+rounds_floats() {
+    local probe
+    probe=$(mktemp -d mlx-out/probe.XXXXXX)
+    local ok=1
+    if "$1" --quiet tests/324_float_rounding_runtime.mlx -o "$probe/probe" > /dev/null 2>&1; then
+        local status=0
+        "$probe/probe" > /dev/null 2>&1 || status=$?
+        [[ $status -eq 13 ]] && ok=0
+    fi
+    rm -rf -- "$probe"
+    return $ok
+}
+
+# Whether $1 names an unknown name (MLX-E3001) where a statement fails
+# (tests/326_unknown_name.mlx); older compilers gave only the statement's
+# own type error.
+reports_unknown_names() {
+    local output
+    output=$("$1" --quiet tests/326_unknown_name.mlx -o /dev/null 2>&1) || true
+    grep -q "MLX-E3001: unknown name" <<< "$output"
+}
+
+# Whether $1 says which call takes another number of arguments where a
+# statement fails (tests/331_call_mistakes.mlx); older compilers gave only
+# the statement's own type error.
+explains_call_mistakes() {
+    local output
+    output=$("$1" --quiet tests/331_call_mistakes.mlx -o /dev/null 2>&1) || true
+    grep -q "MLX-E4001: \`scale\` takes 2 arguments, 1 given" <<< "$output"
+}
+
+# Whether $1 calls methods on pointers and takes the address of a value for
+# a method taking a pointer (tests/332_method_receivers_runtime.mlx exits
+# 13).
+calls_methods_on_pointers() {
+    local probe
+    probe=$(mktemp -d mlx-out/probe.XXXXXX)
+    local ok=1
+    if "$1" --quiet tests/332_method_receivers_runtime.mlx -o "$probe/probe" > /dev/null 2>&1; then
+        local status=0
+        "$probe/probe" > /dev/null 2>&1 || status=$?
+        [[ $status -eq 13 ]] && ok=0
+    fi
+    rm -rf -- "$probe"
+    return $ok
+}
+
+# Whether $1 resolves a struct's own name inside its body
+# (tests/334_aggregate_own_name_runtime.mlx exits 13); older compilers
+# stopped at "declaration type could not be resolved".
+names_aggregates_in_their_bodies() {
+    local probe
+    probe=$(mktemp -d mlx-out/probe.XXXXXX)
+    local ok=1
+    if "$1" --quiet tests/334_aggregate_own_name_runtime.mlx -o "$probe/probe" > /dev/null 2>&1; then
+        local status=0
+        "$probe/probe" > /dev/null 2>&1 || status=$?
+        [[ $status -eq 13 ]] && ok=0
+    fi
+    rm -rf -- "$probe"
+    return $ok
+}
+
+# Whether $1 rejects an integer written out that its type cannot hold
+# (tests/335_type_mismatches.mlx); older compilers kept its low bits.
+checks_literal_ranges() {
+    local output
+    output=$("$1" --quiet tests/335_type_mismatches.mlx -o /dev/null 2>&1) || true
+    grep -q "MLX-E4001: \`300\` does not fit in \`u8\` (0 to 255)" <<< "$output"
+}
+
+# Whether $1 says why a statement fails where it used to say only that its
+# function did (tests/338_statement_failures.mlx).
+explains_silent_failures() {
+    local output
+    output=$("$1" --quiet tests/338_statement_failures.mlx -o /dev/null 2>&1) || true
+    grep -q "MLX-E4001: \`break\` and \`continue\` belong in a loop" <<< "$output"
+}
+
+# Whether $1 keeps locals in callee-saved registers
+# (tests/339_register_locals_runtime.mlx exits 13 and reports some).
+keeps_locals_in_registers() {
+    local probe output
+    probe=$(mktemp -d mlx-out/probe.XXXXXX)
+    local ok=1
+    output=$("$1" tests/339_register_locals_runtime.mlx -o "$probe/probe" 2>&1) || true
+    if grep -q "locals kept in registers: [1-9]" <<< "$output"; then
+        local status=0
+        "$probe/probe" > /dev/null 2>&1 || status=$?
+        [[ $status -eq 13 ]] && ok=0
+    fi
+    rm -rf -- "$probe"
+    return $ok
+}
+
+# Whether $1 lets usize and u64 take each other
+# (tests/340_platform_integers_runtime.mlx exits 13).
+mixes_platform_integers() {
+    local probe
+    probe=$(mktemp -d mlx-out/probe.XXXXXX)
+    local ok=1
+    if "$1" --quiet tests/340_platform_integers_runtime.mlx -o "$probe/probe" > /dev/null 2>&1; then
+        local status=0
+        "$probe/probe" > /dev/null 2>&1 || status=$?
+        [[ $status -eq 13 ]] && ok=0
+    fi
+    rm -rf -- "$probe"
+    return $ok
+}
+
+# Whether $1 rejects @ptrFromInt and @ptrCast outside unsafe (MLX-E7004,
+# tests/14_unsafe_ptr_builtin.mlx); older compilers took them anywhere.
+enforces_unsafe() {
+    local output
+    output=$("$1" --quiet tests/14_unsafe_ptr_builtin.mlx -o /dev/null 2>&1) || true
+    grep -q "MLX-E7004: \`@ptrFromInt\` outside unsafe" <<< "$output"
+}
+
+# Whether $1 takes `unsafe { expression }` where a value is wanted
+# (tests/327_unsafe_expression_runtime.mlx exits 13).
+has_unsafe_expressions() {
+    local probe
+    probe=$(mktemp -d mlx-out/probe.XXXXXX)
+    local ok=1
+    if "$1" --quiet tests/327_unsafe_expression_runtime.mlx -o "$probe/probe" > /dev/null 2>&1; then
+        local status=0
+        "$probe/probe" > /dev/null 2>&1 || status=$?
+        [[ $status -eq 13 ]] && ok=0
+    fi
+    rm -rf -- "$probe"
+    return $ok
+}
+
+# Whether $1 keeps aggregates that stay in their function in its frame
+# (tests/328_aggregates_in_frame_runtime.mlx exits 13).
+keeps_aggregates_in_frame() {
+    local probe
+    probe=$(mktemp -d mlx-out/probe.XXXXXX)
+    local ok=1
+    if "$1" --quiet tests/328_aggregates_in_frame_runtime.mlx -o "$probe/probe" > /dev/null 2>&1; then
+        local status=0
+        "$probe/probe" > /dev/null 2>&1 || status=$?
+        [[ $status -eq 13 ]] && ok=0
+    fi
+    rm -rf -- "$probe"
+    return $ok
+}
+
+# Whether $1 has callers provide the storage for struct, union and array
+# results (tests/329_return_storage_runtime.mlx exits 13).
+returns_into_caller_storage() {
+    local probe
+    probe=$(mktemp -d mlx-out/probe.XXXXXX)
+    local ok=1
+    if "$1" --quiet tests/329_return_storage_runtime.mlx -o "$probe/probe" > /dev/null 2>&1; then
+        local status=0
+        "$probe/probe" > /dev/null 2>&1 || status=$?
+        [[ $status -eq 13 ]] && ok=0
+    fi
+    rm -rf -- "$probe"
+    return $ok
+}
+
+# Whether $1 tests a chain of equality comparisons as one bit mask (the
+# metric tests/330_conditions_runtime.mlx reports).
+tests_equality_chains() {
+    local probe output
+    probe=$(mktemp -d mlx-out/probe.XXXXXX)
+    output=$("$1" tests/330_conditions_runtime.mlx -o "$probe/probe" 2>&1) || true
+    rm -rf -- "$probe"
+    grep -q "equality chains tested as one bit mask: [1-9]" <<< "$output"
+}
+
+# Whether $1's arena has room for the largest programs here: 1 GiB of
+# address space (projects/observatory took 252 MiB of the former 256 MiB,
+# and the arena running full showed as a symbol never defined).
+holds_large_programs() {
+    local probe output
+    probe=$(mktemp -d mlx-out/probe.XXXXXX)
+    output=$("$1" tests/01_basic.mlx -o "$probe/probe" 2>&1) || true
+    rm -rf -- "$probe"
+    grep -q "compiler arena capacity: 1073741824" <<< "$output"
+}
+
+# Whether $1 writes the files it read with --depfile (what `mlx build`
+# decides rebuilds by).
+writes_depfiles() {
+    local probe
+    probe=$(mktemp -d mlx-out/probe.XXXXXX)
+    local ok=1
+    if "$1" --quiet --depfile="$probe/deps" tests/support/discard.mlx > /dev/null 2>&1 \
+        && grep -qx 'tests/support/discard.mlx' "$probe/deps" 2> /dev/null; then
+        ok=0
+    fi
+    rm -rf -- "$probe"
+    return $ok
+}
+
+# Whether $1 has the build command (`mlx build`; outside a project it says
+# there is no build.mlx).
+runs_build() {
+    local probe compiler=$1 status=0
+    [[ "$compiler" == /* ]] || compiler="$repo_root/$compiler"
+    probe=$(mktemp -d mlx-out/probe.XXXXXX)
+    (cd "$probe" && "$compiler" build > /dev/null 2>&1) || status=$?
+    rm -rf -- "$probe"
+    [[ $status -eq 2 ]]
+}
+
 # The probes with what each one stands for.
 probes=(
     "writes_shared_objects|--shared objects"
@@ -312,6 +610,28 @@ probes=(
     "builds_mlxlibc|what mlxlibc needs (@frameAddress, signed loads through pointers, array initializers of module vars, --entry and --init)"
     "decodes_escapes|\\xHH escapes"
     "stores_through_slice_addresses|slices stored through their address keeping their length"
+    "returns_wide_tuples|tuples of more than three words"
+    "steps_many_pointers|array pointers as many-item pointers, p + n"
+    "reads_slice_pointers|a slice's .pointer"
+    "folds_float_literals|arithmetic on float literals"
+    "returns_wide_error_payloads|error union payloads of several words"
+    "rounds_floats|@floor, @ceil and @trunc"
+    "reports_unknown_names|unknown names reported (MLX-E3001)"
+    "has_unsafe_expressions|unsafe { expression }"
+    "enforces_unsafe|pointer casts outside unsafe rejected (MLX-E7004)"
+    "keeps_aggregates_in_frame|aggregates that stay in their function kept in the frame"
+    "returns_into_caller_storage|struct, union and array results in storage the caller provides"
+    "tests_equality_chains|conditions as jumps, equality chains as bit masks"
+    "explains_call_mistakes|calls with the wrong argument count named (MLX-E4001)"
+    "calls_methods_on_pointers|methods called on pointers and on addressable values"
+    "checks_literal_ranges|integers checked against their type, mismatches named (MLX-E4001)"
+    "explains_silent_failures|failing defers, stray breaks and module declarations said at their place"
+    "keeps_locals_in_registers|locals kept in callee-saved registers"
+    "mixes_platform_integers|usize and u64 taking each other"
+    "names_aggregates_in_their_bodies|a struct named inside its own body"
+    "holds_large_programs|an arena with room for the largest programs"
+    "writes_depfiles|--depfile"
+    "runs_build|the build command (mlx build)"
 )
 
 # What compiler $1 lacks, one feature per line (nothing when it has all).
@@ -348,6 +668,23 @@ rebuild_with() {
         rm -f "$next" "$fixed"
         return 1
     fi
+    # A seed with a bug the new sources fixed builds a stage-1 compiler that
+    # still behaves the old way in that spot (a cast it got wrong, say), so
+    # stage 2 can differ from what stage 2 builds in turn. Up to two more
+    # stages then reach the fixed point: the compiler that builds itself
+    # byte for byte.
+    local again=$canonical.again extra
+    for extra in 3 4; do
+        if ! build_stage "$fixed" "$again" "stage $extra: the compiler builds itself again, for its fixed point"; then
+            rm -f "$again"
+            break
+        fi
+        if cmp -s "$fixed" "$again"; then
+            rm -f "$again"
+            break
+        fi
+        mv "$again" "$fixed"
+    done
     local still
     still=$(missing_features "$fixed")
     if [[ -n "$still" ]]; then
@@ -361,16 +698,22 @@ rebuild_with() {
     return 0
 }
 
-# The bootstrap compiler zig-out/bin/mlx1 (built with zig when missing);
-# its path on stdout, or failure.
+# The bootstrap compiler zig-out/bin/mlx1 (built when missing: zig builds
+# mlx0 from compiler/bootstrap, mlx0 builds the self-hosted compiler; what
+# build.mlx's bootstrap group does too); its path on stdout, or failure.
 bootstrap_seed() {
     if [[ ! -x zig-out/bin/mlx1 ]]; then
-        if ! command -v zig > /dev/null; then
-            echo "ensure_compiler.sh: no bootstrap compiler (zig-out/bin/mlx1) and no zig to build one" >&2
-            return 1
+        if [[ ! -x zig-out/bin/mlx0 ]]; then
+            if ! command -v zig > /dev/null; then
+                echo "ensure_compiler.sh: no bootstrap compiler (zig-out/bin/mlx1) and no zig to build one" >&2
+                return 1
+            fi
+            echo "building the stage-0 compiler zig-out/bin/mlx0 with zig" >&2
+            mkdir -p zig-out/bin
+            zig build-exe compiler/bootstrap/main.zig --name mlx0 -femit-bin=zig-out/bin/mlx0 >&2 || return 1
         fi
-        echo "building the bootstrap compiler (zig build mlx1)" >&2
-        zig build mlx1 >&2
+        echo "building the bootstrap compiler zig-out/bin/mlx1 with mlx0" >&2
+        zig-out/bin/mlx0 compiler/selfhost/main.mlx -o zig-out/bin/mlx1 >&2 || return 1
     fi
     echo zig-out/bin/mlx1
 }
@@ -385,7 +728,7 @@ else
         echo "rebuilding $canonical from the current compiler sources: it lacks $(paste -sd '|' <<< "$missing" | sed 's/|/, /g')" >&2
         if ! rebuild_with "$canonical"; then
             echo "rebuilding $canonical from the bootstrap compiler instead" >&2
-            seed=$(bootstrap_seed) || { echo "ensure_compiler.sh: $canonical stays as it is; build the bootstrap compiler (zig build mlx1) and run again" >&2; exit 1; }
+            seed=$(bootstrap_seed) || { echo "ensure_compiler.sh: $canonical stays as it is; build the bootstrap compiler (./mlx build bootstrap, with zig) and run again" >&2; exit 1; }
             rebuild_with "$seed" || { echo "ensure_compiler.sh: $canonical stays as it is" >&2; exit 1; }
         fi
     fi

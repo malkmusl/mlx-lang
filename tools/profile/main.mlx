@@ -5,19 +5,26 @@
 // are in, as the compiler writes them (path:line:function), and C
 // libraries by their own symbols.
 //
-//   mlx-profile [-o DIRECTORY] [--every MILLISECONDS] [--wall] PROGRAM [ARGUMENT...]
+//   mlx-profile [-o DIRECTORY] [--every MILLISECONDS] [--after MILLISECONDS] [--wall] PROGRAM [ARGUMENT...]
 //
 // Only samples where the program runs count (not where it waits in the
 // kernel); --wall counts all. At the end it prints the functions the most
 // time went to and writes the profile to DIRECTORY (default:
 // $XDG_STATE_HOME/mlx/profiles, else ~/.local/state/mlx/profiles) as
-// PROGRAM-SECONDS.profile, which MLX Observatory and `mlx-codemap hot` read:
+// PROGRAM-SECONDS.profile (std.diagnostics), which MLX Observatory and
+// `mlx-codemap hot` read:
 //
-//     profile <TAB> program <TAB> seconds since 1970 <TAB> samples <TAB> interval in µs
+//     profile <TAB> program <TAB> seconds since 1970 <TAB> samples <TAB> interval in µs <TAB> processor
 //     self <TAB> total <TAB> function
+//
+// The program's GPU work is profiled too: MLX_GPU_PROFILE in its
+// environment has std.gpu write PROGRAM-gpu-SECONDS.profile beside it. And
+// MLX_FRAMES has its frames written as a timeline (std.diagnostics), the
+// processor's and the GPU's time on each.
 //
 // The main thread is sampled; the program's other threads run on.
 const std = @import("std")
+const diagnostics = @import("std.diagnostics")
 
 const SYS_read: usize = 0
 const SYS_write: usize = 1
@@ -32,9 +39,7 @@ const SYS_getpid: usize = 39
 const SYS_exit: usize = 60
 const SYS_wait4: usize = 61
 const SYS_kill: usize = 62
-const SYS_mkdir: usize = 83
 const SYS_ptrace: usize = 101
-const SYS_clock_gettime: usize = 228
 const SYS_process_vm_readv: usize = 310
 const PTRACE_CONT: usize = 7
 const PTRACE_GETREGS: usize = 12
@@ -42,9 +47,13 @@ const PTRACE_SETOPTIONS: usize = 16896
 const PTRACE_SEIZE: usize = 16902
 const PTRACE_INTERRUPT: usize = 16903
 const PTRACE_O_TRACEEXEC: usize = 16
+const PTRACE_O_TRACEEXIT: usize = 64
 const PTRACE_O_EXITKILL: usize = 1048576
 const PTRACE_EVENT_EXEC: usize = 4
+const PTRACE_EVENT_EXIT: usize = 6
 const PTRACE_EVENT_STOP: usize = 128
+// Clock ticks a second in /proc/PID/stat (USER_HZ).
+const TICKS: usize = 100
 const SIGSTOP: usize = 19
 const SIGCONT: usize = 18
 const WUNTRACED: usize = 2
@@ -93,14 +102,22 @@ const Profiler = struct {
     samples: usize
     round: u32
     text: [*]u8
+    // What the program took, read as its main thread ends: its memory at
+    // most and at the end (KiB), its processor time in and out of the
+    // kernel, every thread's (ticks); whether it was read.
+    peakKiB: usize
+    endKiB: usize
+    userTicks: usize
+    systemTicks: usize
+    endNoted: bool
 }
 
 fn say(text: []const u8) -> void {
-    const written = std.io.writeAll(std.io.stdout(), text)
+    _ = std.io.writeAll(std.io.stdout(), text)
 }
 
 fn sayError(text: []const u8) -> void {
-    const written = std.io.writeAll(std.io.stderr(), text)
+    _ = std.io.writeAll(std.io.stderr(), text)
 }
 
 fn sayNumber(value: usize) -> void {
@@ -145,14 +162,12 @@ fn allocate(size: usize) -> usize {
 }
 
 fn words(count: usize) -> [*]u32 {
-    var result: [*]u32 = undefined
-    unsafe { result = @ptrFromInt([*]u32, allocate(count * 4 + 4)) }
+    const result: [*]u32 = unsafe { @ptrFromInt([*]u32, allocate(count * 4 + 4)) }
     return result
 }
 
 fn bytesAt(address: usize) -> [*]const u8 {
-    var result: [*]const u8 = undefined
-    unsafe { result = @ptrFromInt([*]const u8, address) }
+    const result: [*]const u8 = unsafe { @ptrFromInt([*]const u8, address) }
     return result
 }
 
@@ -171,7 +186,7 @@ fn read64(image: usize, at: usize) -> usize { return read32(image, at) | (read32
 // The function called `name` (made when new).
 fn functionOf(profiler: *Profiler, name: [*]const u8, length: usize) -> u32 {
     const hash = hashBytes(name, length)
-    var slot = @intCast(usize, hash % @intCast(u64, FUNCTION_SLOTS))
+    var slot = hash % FUNCTION_SLOTS
     while true {
         const held = profiler.*.slots[slot]
         if held == 0 { break }
@@ -205,8 +220,7 @@ fn hexValue(byte: u8) -> usize { return @intCast(usize, std.text.hexValue(byte))
 
 fn readMaps(profiler: *Profiler) -> void {
     var path: [64]u8 = undefined
-    var bytes: [*]u8 = undefined
-    unsafe { bytes = @ptrCast([*]u8, &path) }
+    const bytes: [*]u8 = &path
     var length: usize = 0
     for byte in "/proc/" {
         bytes[length] = byte
@@ -238,7 +252,7 @@ fn readMaps(profiler: *Profiler) -> void {
         if got <= 0 { break }
         profiler.*.mapsLength += @bitCast(usize, got)
     }
-    const closed = std.linux.syscall1(SYS_close, @bitCast(usize, file))
+    _ = std.linux.syscall1(SYS_close, @bitCast(usize, file))
 }
 
 // Names `address` (a return address one byte back) into the profiler's
@@ -326,8 +340,7 @@ fn writeHex(into: [*]u8, at: usize, value: usize) -> usize {
 // The image of the file at maps[from..to] (mapped in once).
 fn imageOf(profiler: *Profiler, from: usize, to: usize, size: *usize) -> usize {
     var path: [4096]u8 = undefined
-    var bytes: [*]u8 = undefined
-    unsafe { bytes = @ptrCast([*]u8, &path) }
+    const bytes: [*]u8 = &path
     var length: usize = 0
     while from + length < to && length < 4000 {
         bytes[length] = profiler.*.maps[from + length]
@@ -356,7 +369,7 @@ fn imageOf(profiler: *Profiler, from: usize, to: usize, size: *usize) -> usize {
                 image_size = @bitCast(usize, end)
             }
         }
-        const closed = std.linux.syscall1(SYS_close, @bitCast(usize, handle))
+        _ = std.linux.syscall1(SYS_close, @bitCast(usize, handle))
     }
     profiler.*.fileKeys[profiler.*.fileCount] = key
     profiler.*.fileImages[profiler.*.fileCount] = image
@@ -439,8 +452,8 @@ fn nameInSymbols(profiler: *Profiler, image: usize, size: usize, symbols: usize,
 // The function `address` is in (NONE-like 4294967295: unknown), named
 // once per address.
 fn functionAt(profiler: *Profiler, address: usize) -> u32 {
-    const key = @intCast(u64, address)
-    var slot = @intCast(usize, (key *% 11400714819323198485) >> 46) % ADDRESS_SLOTS
+    const key = address
+    var slot = ((key *% 11400714819323198485) >> 46) % ADDRESS_SLOTS
     while true {
         if profiler.*.addressKeys[slot] == 0 { break }
         if profiler.*.addressKeys[slot] == key { return profiler.*.addressValues[slot] }
@@ -453,8 +466,7 @@ fn functionAt(profiler: *Profiler, address: usize) -> u32 {
         length = describe(profiler, address)
     }
     if length == 0 { length = writeHex(profiler.*.text, 0, address) }
-    var text: [*]const u8 = undefined
-    unsafe { text = @ptrCast([*]const u8, profiler.*.text) }
+    const text: [*]const u8 = unsafe { @ptrCast([*]const u8, profiler.*.text) }
     const function = functionOf(profiler, text, length)
     profiler.*.addressKeys[slot] = key
     profiler.*.addressValues[slot] = function
@@ -480,24 +492,23 @@ fn sample(profiler: *Profiler) -> void {
     profiler.*.frameCount = 0
     profiler.*.frames[0] = registers[16]
     profiler.*.frameCount = 1
-    var frame = @intCast(usize, registers[4])
-    const stack = @intCast(usize, registers[19])
+    var frame = registers[4]
+    const stack = registers[19]
     var pair: [2]u64 = [2]u64{ 0, 0 }
-    var pair_words: [*]u64 = undefined
-    unsafe { pair_words = @ptrCast([*]u64, &pair) }
+    const pair_words: [*]u64 = &pair
     while profiler.*.frameCount < MAX_FRAMES && frame >= stack && frame < stack + 67108864 && frame & 7 == 0 {
         if !readWords(profiler, frame, pair_words, 2) { break }
         if pair[1] < 4096 { break }
         profiler.*.frames[profiler.*.frameCount] = pair[1] - 1
         profiler.*.frameCount += 1
-        if @intCast(usize, pair[0]) <= frame { break }
-        frame = @intCast(usize, pair[0])
+        if pair[0] <= frame { break }
+        frame = pair[0]
     }
     // Self: the first; total: every function once.
     profiler.*.round += 1
     var at: usize = 0
     while at < profiler.*.frameCount {
-        const function = functionAt(profiler, @intCast(usize, profiler.*.frames[at]))
+        const function = functionAt(profiler, profiler.*.frames[at])
         if function != 4294967295 {
             if at == 0 { profiler.*.selfSamples[function] += 1 }
             if profiler.*.marks[function] != profiler.*.round {
@@ -511,10 +522,101 @@ fn sample(profiler: *Profiler) -> void {
 }
 
 // Whether the program is running (R in /proc/PID/stat), not waiting.
+// /proc/PID/`file` of the program into `into` (NUL-ended); its length.
+fn procPath(profiler: *Profiler, file: []const u8, into: [*]u8) -> usize {
+    var length: usize = 0
+    for byte in "/proc/" {
+        into[length] = byte
+        length += 1
+    }
+    var digits: [24]u8 = undefined
+    var count: usize = 0
+    var rest = profiler.*.child
+    while rest > 0 || count == 0 {
+        digits[count] = @intCast(u8, 48 + rest % 10)
+        rest /= 10
+        count += 1
+    }
+    while count > 0 {
+        count -= 1
+        into[length] = digits[count]
+        length += 1
+    }
+    for byte in file {
+        into[length] = byte
+        length += 1
+    }
+    into[length] = 0
+    return length
+}
+
+// Reads /proc/PID/`file` into the profiler's text buffer; its length.
+fn readProc(profiler: *Profiler, file: []const u8) -> usize {
+    var path: [64]u8 = undefined
+    const bytes: [*]u8 = &path
+    _ = procPath(profiler, file, bytes)
+    const opened = std.linux.syscall3(SYS_open, @intFromPtr(bytes), 0, 0)
+    if opened < 0 { return 0 }
+    const got = std.linux.syscall3(SYS_read, @bitCast(usize, opened), @intFromPtr(profiler.*.text), 8191)
+    _ = std.linux.syscall1(SYS_close, @bitCast(usize, opened))
+    return if got <= 0 { 0 } else { @bitCast(usize, got) }
+}
+
+// The number after `label` in /proc/PID/status (in kB for the Vm lines).
+fn statusValue(text: [*]const u8, length: usize, label: []const u8) -> usize {
+    var at: usize = 0
+    while at + label.length < length {
+        var same_label = at == 0 || text[at - 1] == 10
+        var index: usize = 0
+        while same_label && index < label.length {
+            if text[at + index] != label[index] { same_label = false }
+            index += 1
+        }
+        if same_label {
+            var value: usize = 0
+            var digit = at + label.length
+            while digit < length && (text[digit] == 32 || text[digit] == 9) { digit += 1 }
+            while digit < length && text[digit] >= 48 && text[digit] <= 57 {
+                value = value * 10 + @intCast(usize, text[digit] - 48)
+                digit += 1
+            }
+            return value
+        }
+        at += 1
+    }
+    return 0
+}
+
+// What the program took, read while its main thread ends (its memory is
+// still there then, and every thread's times are counted in its stat).
+fn noteEnd(profiler: *Profiler) -> void {
+    var length = readProc(profiler, "/status")
+    profiler.*.peakKiB = statusValue(profiler.*.text, length, "VmHWM:")
+    profiler.*.endKiB = statusValue(profiler.*.text, length, "VmRSS:")
+    length = readProc(profiler, "/stat")
+    // After "pid (name) ": state is field 3; utime and stime are 14 and 15.
+    var at = length
+    while at > 0 && profiler.*.text[at - 1] != 41 { at -= 1 }
+    var field: usize = 2
+    var value: usize = 0
+    while at < length {
+        const byte = profiler.*.text[at]
+        if byte == 32 {
+            if field == 14 { profiler.*.userTicks = value }
+            if field == 15 { profiler.*.systemTicks = value }
+            field += 1
+            value = 0
+        } else if byte >= 48 && byte <= 57 {
+            value = value * 10 + @intCast(usize, byte - 48)
+        }
+        at += 1
+    }
+    profiler.*.endNoted = true
+}
+
 fn running(profiler: *Profiler) -> bool {
     var path: [64]u8 = undefined
-    var bytes: [*]u8 = undefined
-    unsafe { bytes = @ptrCast([*]u8, &path) }
+    const bytes: [*]u8 = &path
     var length: usize = 0
     for byte in "/proc/" {
         bytes[length] = byte
@@ -542,7 +644,7 @@ fn running(profiler: *Profiler) -> bool {
     if file < 0 { return false }
     var stat: [512]u8 = undefined
     const got = std.linux.syscall3(SYS_read, @bitCast(usize, file), @intFromPtr(&stat), 512)
-    const closed = std.linux.syscall1(SYS_close, @bitCast(usize, file))
+    _ = std.linux.syscall1(SYS_close, @bitCast(usize, file))
     if got <= 0 { return false }
     // After "pid (name) ": the state; the name may hold spaces.
     var at = @bitCast(usize, got)
@@ -569,10 +671,11 @@ fn waitFor(profiler: *Profiler, event: usize) -> usize {
         const signal = (value >> 8) & 255
         const stop_event = (value >> 16) & 255
         if stop_event == event && (event != PTRACE_EVENT_STOP || signal == SIGTRAP) { return 1 }
+        if stop_event == PTRACE_EVENT_EXIT && !profiler.*.endNoted { noteEnd(profiler) }
         // A stop of the whole program or another event: on; a signal: on
         // to the program.
         const passed_signal = if stop_event != 0 { 0 } else { signal }
-        const passed = std.linux.syscall4(SYS_ptrace, PTRACE_CONT, profiler.*.child, 0, passed_signal)
+        _ = std.linux.syscall4(SYS_ptrace, PTRACE_CONT, profiler.*.child, 0, passed_signal)
     }
     return 2
 }
@@ -629,9 +732,39 @@ fn variable(environment: [*][*]const u8, name: []const u8) -> []const u8 {
     return ""
 }
 
-fn makeDirectory(path: [*]u8, length: usize) -> void {
-    path[length] = 0
-    const made = std.linux.syscall2(SYS_mkdir, @intFromPtr(path), 493)
+// The environment with MLX_GPU_PROFILE=WHERE added (unless it is there):
+// the program's GPU work is profiled too, into the same directory
+// (std.gpu; 1 is the default one); and MLX_FRAMES=1 (unless set), its
+// frame timeline.
+fn withGpuProfile(environment: [*][*]const u8, where: [*]const u8) -> [*]const [*]const u8 {
+    if variable(environment, "MLX_GPU_PROFILE").length > 0 { return unsafe { @ptrCast([*]const [*]const u8, environment) } }
+    var count: usize = 0
+    while @intFromPtr(environment[count]) != 0 { count += 1 }
+    const entry_memory = allocate(4200)
+    const table_memory = allocate((count + 3) * 8)
+    if entry_memory == 0 || table_memory == 0 { return unsafe { @ptrCast([*]const [*]const u8, environment) } }
+    var entry: [*]u8 = undefined
+    var table: [*][*]const u8 = undefined
+    unsafe {
+        entry = @ptrFromInt([*]u8, entry_memory)
+        table = @ptrFromInt([*][*]const u8, table_memory)
+    }
+    var length = append(entry, 0, "MLX_GPU_PROFILE=")
+    length = append(entry, length, std.text.cString(where))
+    entry[length] = 0
+    var index: usize = 0
+    while index < count {
+        table[index] = environment[index]
+        index += 1
+    }
+    table[count] = entry
+    var end = count + 1
+    if variable(environment, "MLX_FRAMES").length == 0 {
+        table[end] = "MLX_FRAMES=1".pointer
+        end += 1
+    }
+    unsafe { table[end] = @ptrFromInt([*]const u8, 0) }
+    return unsafe { @ptrCast([*]const [*]const u8, table) }
 }
 
 // The functions by total samples, most first (indexes into `order`).
@@ -649,96 +782,34 @@ fn rank(profiler: *Profiler, order: [*]u32) -> void {
     }
 }
 
-fn writeProfile(profiler: *Profiler, directory: []const u8, environment: [*][*]const u8, program: []const u8, interval: usize, order: [*]u32) -> void {
-    var path: [4096]u8 = undefined
-    var bytes: [*]u8 = undefined
-    unsafe { bytes = @ptrCast([*]u8, &path) }
-    var length: usize = 0
-    if directory.length > 0 {
-        // The directory and those it is in.
-        length = append(bytes, 0, directory)
-        var at: usize = 1
-        while at < length {
-            if bytes[at] == 47 {
-                makeDirectory(bytes, at)
-                bytes[at] = 47
-            }
-            at += 1
-        }
-        makeDirectory(bytes, length)
-    } else {
-        const state = variable(environment, "XDG_STATE_HOME")
-        if state.length > 0 && state[0] == 47 {
-            length = append(bytes, 0, state)
-        } else {
-            const home = variable(environment, "HOME")
-            if home.length == 0 { return }
-            length = append(bytes, 0, home)
-            length = append(bytes, length, "/.local")
-            makeDirectory(bytes, length)
-            length = append(bytes, length, "/state")
-        }
-        makeDirectory(bytes, length)
-        length = append(bytes, length, "/mlx")
-        makeDirectory(bytes, length)
-        length = append(bytes, length, "/profiles")
-        makeDirectory(bytes, length)
-    }
-    var time: [2]usize = [2]usize{ 0, 0 }
-    const clock = std.linux.syscall2(SYS_clock_gettime, 0, @intFromPtr(&time))
-    length = append(bytes, length, "/")
-    length = append(bytes, length, program)
-    length = append(bytes, length, "-")
-    length = appendNumber(bytes, length, time[0])
-    length = append(bytes, length, ".profile")
-    bytes[length] = 0
-    const file = std.linux.syscall3(SYS_open, @intFromPtr(bytes), 577, 420)
-    if file < 0 {
-        sayError("mlx-profile: cannot write ")
-        sayError(bytes[0..length])
-        sayError("\n")
+fn writeProfile(profiler: *Profiler, directory: []const u8, program: []const u8, interval: usize, order: [*]u32) -> void {
+    var file: diagnostics.ProfileFile = undefined
+    if !diagnostics.openProfile(&file, diagnostics.Source.processor, directory, program, diagnostics.now(), profiler.*.samples, interval * 1000) {
+        sayError("mlx-profile: cannot write the profile\n")
         return
     }
-    var line: [8192]u8 = undefined
-    var line_bytes: [*]u8 = undefined
-    unsafe { line_bytes = @ptrCast([*]u8, &line) }
-    var at = append(line_bytes, 0, "profile\t")
-    at = append(line_bytes, at, program)
-    at = append(line_bytes, at, "\t")
-    at = appendNumber(line_bytes, at, time[0])
-    at = append(line_bytes, at, "\t")
-    at = appendNumber(line_bytes, at, profiler.*.samples)
-    at = append(line_bytes, at, "\t")
-    at = appendNumber(line_bytes, at, interval * 1000)
-    at = append(line_bytes, at, "\n")
-    var wrote = std.linux.syscall3(SYS_write, @bitCast(usize, file), @intFromPtr(line_bytes), at)
     var index: usize = 0
     while index < profiler.*.count {
         const function = @intCast(usize, order[index])
-        at = appendNumber(line_bytes, 0, @intCast(usize, profiler.*.selfSamples[function]))
-        at = append(line_bytes, at, "\t")
-        at = appendNumber(line_bytes, at, @intCast(usize, profiler.*.totalSamples[function]))
-        at = append(line_bytes, at, "\t")
         const start = @intCast(usize, profiler.*.nameStart[function])
-        at = append(line_bytes, at, profiler.*.names[start..start + @intCast(usize, profiler.*.nameLength[function])])
-        at = append(line_bytes, at, "\n")
-        wrote = std.linux.syscall3(SYS_write, @bitCast(usize, file), @intFromPtr(line_bytes), at)
+        diagnostics.profileLine(&file, @intCast(usize, profiler.*.selfSamples[function]), @intCast(usize, profiler.*.totalSamples[function]), profiler.*.names[start..start + @intCast(usize, profiler.*.nameLength[function])])
         index += 1
     }
-    const closed = std.linux.syscall1(SYS_close, @bitCast(usize, file))
+    diagnostics.closeProfile(&file)
     say("mlx-profile: wrote ")
-    say(bytes[0..length])
+    say(diagnostics.profilePath(&file))
     say("\n")
 }
 
 fn usage() -> void {
-    sayError("usage: mlx-profile [-o DIRECTORY] [--every MILLISECONDS] [--wall] PROGRAM [ARGUMENT...]\n")
+    sayError("usage: mlx-profile [-o DIRECTORY] [--every MILLISECONDS] [--after MILLISECONDS] [--wall] PROGRAM [ARGUMENT...]\n")
 }
 
 pub fn main(arguments: [][*]const u8) -> u8 {
     const environment = std.process.environmentEntries(arguments)
     var first: usize = 1
     var interval: usize = 5
+    var after: usize = 0
     var wall = false
     var directory: [*]const u8 = undefined
     var has_directory = false
@@ -755,6 +826,11 @@ pub fn main(arguments: [][*]const u8) -> u8 {
             }
             if interval == 0 { interval = 1 }
             first += 2
+        } else if same(argument, "--after") && first + 1 < arguments.length {
+            for byte in std.text.cString(arguments[first + 1]) {
+                if byte >= 48 && byte <= 57 { after = after * 10 + @intCast(usize, byte - 48) }
+            }
+            first += 2
         } else if same(argument, "--wall") {
             wall = true
             first += 1
@@ -768,8 +844,7 @@ pub fn main(arguments: [][*]const u8) -> u8 {
     }
     const profiler_memory = allocate(@sizeOf(Profiler))
     if profiler_memory == 0 { return 1 }
-    var profiler: *Profiler = undefined
-    unsafe { profiler = @ptrFromInt(*Profiler, profiler_memory) }
+    const profiler: *Profiler = unsafe { @ptrFromInt(*Profiler, profiler_memory) }
     unsafe {
         profiler.*.names = @ptrFromInt([*]u8, allocate(NAMES_SIZE))
         profiler.*.maps = @ptrFromInt([*]u8, allocate(MAPS_SIZE))
@@ -788,19 +863,23 @@ pub fn main(arguments: [][*]const u8) -> u8 {
     const child = std.linux.syscall0(SYS_fork)
     if child == 0 {
         const self = std.linux.syscall0(SYS_getpid)
-        const stopped_self = std.linux.syscall2(SYS_kill, @bitCast(usize, self), SIGSTOP)
-        var program_arguments: [*]const [*]const u8 = undefined
-        unsafe { program_arguments = @ptrFromInt([*]const [*]const u8, @intFromPtr(@ptrCast([*]const [*]const u8, arguments)) + first * 8) }
-        const ran = std.linux.syscall3(SYS_execve, @intFromPtr(arguments[first]), @intFromPtr(program_arguments), @intFromPtr(environment))
+        _ = std.linux.syscall2(SYS_kill, @bitCast(usize, self), SIGSTOP)
+        const program_arguments: [*]const [*]const u8 = unsafe { @ptrFromInt([*]const [*]const u8, @intFromPtr(@ptrCast([*]const [*]const u8, arguments)) + first * 8) }
+        _ = std.linux.syscall3(SYS_execve, @intFromPtr(arguments[first]), @intFromPtr(program_arguments), @intFromPtr(withGpuProfile(environment, if has_directory { directory } else { "1".pointer })))
         sayError("mlx-profile: cannot run the program\n")
-        const exited = std.linux.syscall1(SYS_exit, 127)
+        _ = std.linux.syscall1(SYS_exit, 127)
     }
     if child < 0 { return 1 }
     profiler.*.child = @bitCast(usize, child)
     var first_status: [1]u32 = [1]u32{ 0 }
     const first_wait = std.linux.syscall4(SYS_wait4, profiler.*.child, @intFromPtr(&first_status), WUNTRACED, 0)
-    const seized = std.linux.syscall4(SYS_ptrace, PTRACE_SEIZE, profiler.*.child, 0, PTRACE_O_EXITKILL | PTRACE_O_TRACEEXEC)
-    const woken = std.linux.syscall2(SYS_kill, profiler.*.child, SIGCONT)
+    profiler.*.endNoted = false
+    profiler.*.peakKiB = 0
+    profiler.*.endKiB = 0
+    profiler.*.userTicks = 0
+    profiler.*.systemTicks = 0
+    const seized = std.linux.syscall4(SYS_ptrace, PTRACE_SEIZE, profiler.*.child, 0, PTRACE_O_EXITKILL | PTRACE_O_TRACEEXEC | PTRACE_O_TRACEEXIT)
+    _ = std.linux.syscall2(SYS_kill, profiler.*.child, SIGCONT)
     // It stops at the exec.
     if first_wait < 0 || seized != 0 || waitFor(profiler, PTRACE_EVENT_EXEC) != 1 {
         sayError("mlx-profile: the program did not start\n")
@@ -809,14 +888,18 @@ pub fn main(arguments: [][*]const u8) -> u8 {
     readMaps(profiler)
     var sleep: [2]usize = [2]usize{ interval / 1000, (interval % 1000) * 1000000 }
     var skipped: usize = 0
+    // With --after, the stops before then are not counted (to see a
+    // program's frames rather than its start).
+    const counted_from = std.time.milliseconds() + after
     while true {
         const resumed = std.linux.syscall4(SYS_ptrace, PTRACE_CONT, profiler.*.child, 0, 0)
         if resumed != 0 { break }
-        const slept = std.linux.syscall2(SYS_nanosleep, @intFromPtr(&sleep), 0)
+        _ = std.linux.syscall2(SYS_nanosleep, @intFromPtr(&sleep), 0)
         const was_running = wall || running(profiler)
         const stopped = std.linux.syscall4(SYS_ptrace, PTRACE_INTERRUPT, profiler.*.child, 0, 0)
         if stopped != 0 { break }
         if waitFor(profiler, PTRACE_EVENT_STOP) != 1 { break }
+        if std.time.milliseconds() < counted_from { continue }
         if was_running { sample(profiler) } else { skipped += 1 }
     }
     // The program's name: its file's.
@@ -851,6 +934,20 @@ pub fn main(arguments: [][*]const u8) -> u8 {
         say("\n")
         shown += 1
     }
-    writeProfile(profiler, if has_directory { std.text.cString(directory) } else { "" }, environment, program, interval, order)
+    if profiler.*.endNoted {
+        // Processor time of every thread (the samples see the main one),
+        // and memory: at most and at the end.
+        const ticks = profiler.*.userTicks + profiler.*.systemTicks
+        say("mlx-profile: ")
+        sayNumber(ticks * 1000 / TICKS)
+        say(" ms of processor time (")
+        sayNumber(profiler.*.systemTicks * 1000 / TICKS)
+        say(" ms in the kernel), every thread; memory ")
+        sayNumber(profiler.*.peakKiB / 1024)
+        say(" MiB at most, ")
+        sayNumber(profiler.*.endKiB / 1024)
+        say(" MiB at the end\n")
+    }
+    writeProfile(profiler, if has_directory { std.text.cString(directory) } else { "" }, program, interval, order)
     return 0
 }
