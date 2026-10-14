@@ -17,6 +17,8 @@ puncts = [
     ("MINUS", "-"), ("STAR", "*"), ("SLASH", "/"), ("PERCENT", "%"), ("AMP", "&"),
     ("PIPE", "|"), ("CARET", "^"), ("TILDE", "~"), ("BANG", "!"), ("QUESTION", "?"),
     ("COLON", ":"), ("ASSIGN", "="), ("LT", "<"), ("GT", ">"), ("HASH", "#"),
+    # C++'s own.
+    ("SCOPE", "::"), ("ARROW_STAR", "->*"), ("DOT_STAR", ".*"),
 ]
 keywords = [
     "auto", "break", "case", "char", "const", "continue", "default", "do", "double",
@@ -33,7 +35,15 @@ keywords = [
     # alternate ones to the C11 keywords above).
     "bool", "true", "false", "nullptr", "static_assert", "alignas", "alignof",
     "thread_local", "typeof_unqual", "constexpr", "_BitInt",
+    # C++'s keywords (from K_CLASS to K_TYPEID; keywords in C++ only).
+    "class", "namespace", "using", "new", "delete", "this", "operator",
+    "template", "typename", "public", "private", "protected", "virtual",
+    "explicit", "friend", "mutable", "throw", "try", "catch", "const_cast",
+    "static_cast", "reinterpret_cast", "dynamic_cast", "wchar_t", "char16_t",
+    "char32_t", "decltype", "noexcept", "export", "typeid",
 ]
+FIRST_CPP = "class"
+LAST_CPP = "typeid"
 directives = [
     "include", "include_next", "define", "undef", "if", "ifdef", "ifndef", "elif",
     "elifdef", "elifndef", "else", "endif", "error", "warning", "pragma", "line",
@@ -96,6 +106,8 @@ out.append(f"pub const FIRST_PUNCT: u32 = 1")
 out.append(f"pub const LAST_PUNCT: u32 = {len(puncts)}")
 out.append(f"pub const FIRST_KEYWORD: u32 = {len(puncts) + 1}")
 out.append(f"pub const LAST_KEYWORD: u32 = {len(puncts) + len(keywords)}")
+out.append(f"pub const FIRST_CPP: u32 = {len(puncts) + 1 + keywords.index(FIRST_CPP)}")
+out.append(f"pub const LAST_CPP: u32 = {len(puncts) + 1 + keywords.index(LAST_CPP)}")
 out.append("")
 out.append("fn fixed(text: []const u8, id: u32) -> void {")
 out.append("    if base.intern(text) != id { base.fatal(\"the fixed names are out of order\") }")
