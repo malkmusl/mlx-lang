@@ -56,8 +56,30 @@ enumerators, with their type), `enum E : unsigned char` with a fixed
 underlying type, empty initializers `{}`, unnamed parameters in
 definitions, labels before declarations and at the end of a block,
 `#elifdef` and `#elifndef`, `nullptr_t` and `unreachable()` in
-`stddef.h`. Not there: `_BitInt`, `#embed`, `constexpr` objects of other
-types than integers as constants. A program
+`stddef.h`, `_BitInt(N)` for N up to 64 (the smallest standard size that
+holds it, canonical to N bits in registers, no promotion, `wb` and `uwb`
+constants, `BITINT_MAXWIDTH`), `#embed` with `limit`, `prefix`, `suffix`
+and `if_empty` and `__has_embed`. Not there: `_BitInt` wider than 64
+bits, `constexpr` objects of other types than integers as constants.
+
+## long double
+
+`long double` is the x87 extended format, 80 bits in 16 as on gcc: a
+value lives on the x87 stack while an expression holds it (`fld` and
+`fstp` to memory, `faddp` and the like between two, `fucomip` for the
+comparisons, `fild` and `fisttp` for the conversions, with 2^63 and 2^64
+added or taken for the unsigned ones), is passed in memory and returned
+in `st0` as the ABI says (`va_arg` reads it from the stack, 16-byte
+aligned), and a struct holding one goes in memory too. A constant's
+digits are turned into the format by the compiler itself
+(`extended.mlx`: 256-bit integer arithmetic, then rounding to 64 bits;
+double constants come from the same conversion, which keeps DBL_MAX
+finite), and a global's initializer that is not a constant alone (`1.0L
+/ 3.0L`) is computed by `__mlxcc_init` when the program starts.
+`float.h` has the real limits (`LDBL_MANT_DIG` 64, `LDBL_MAX`
+1.19e4932L). `tests/ldouble.c` compares all of it with gcc, and SQLite's
+conversion of doubles to text, which computes in `long double`, now
+rounds as gcc's build does. A program
 names the system's loader (`/lib64/ld-linux-x86-64.so.2`) as its
 interpreter; `--dynamic-linker PATH` (also `-Wl,--dynamic-linker=PATH`)
 names another, such as mlxlibc's `libmlxc.so.1`, so it starts on that
@@ -81,7 +103,7 @@ in `/usr/local/lib/mlx-cc/include`.
 | --- | --- |
 | Memory, names, files, messages | `base.mlx` (one arena, interned names) |
 | Preprocessor | `lexer.mlx`, `tokens.mlx`, `macros.mlx`, `ppexpr.mlx`, `paths.mlx`, `preprocess.mlx` |
-| Constants and strings | `literal.mlx` |
+| Constants and strings | `literal.mlx`, `extended.mlx` (long double constants) |
 | Types and syntax tree | `types.mlx`, `ast.mlx` |
 | Parser | `cursor.mlx`, `state.mlx`, `scope.mlx`, `decl.mlx`, `initializer.mlx`, `expr.mlx`, `stmt.mlx`, `typing.mlx`, `eval.mlx` |
 | Code | `x86.mlx` (instructions), `gen.mlx` (expressions, calls), `genstmt.mlx` (statements, functions) |
@@ -118,11 +140,10 @@ static locals, tentative definitions, several files per program.
 
 - No separate compilation yet: no `.o`, no archives, no shared objects
   (roadmap phase 1 step 3).
-- `long double` is `double` (no x87 code): functions of the C library
-  that take or return `long double` (`strtold`, `printf("%Lf")`) do not
-  match, and a program that computes in `long double` (SQLite's
-  conversion of doubles to text, where its own check finds the type no
-  wider than `double`) rounds otherwise in the last digits.
+- On mlxlibc, `printf("%Lf")` prints a long double exactly within
+  double's exponent range and as the nearest double (infinity, zero)
+  beyond it, and `strtold` reads with `strtod`'s precision; the `sinl`
+  family is glibc's only.
 - No variable-length arrays, `_Atomic` operations, `_Thread_local`
   (declared, but a plain global), `_Complex`, inline `asm`, computed
   `goto`.
@@ -135,9 +156,11 @@ static locals, tentative definitions, several files per program.
 `tools/check_cc.sh` builds mlx-cc, preprocesses the C11 standard's
 macro examples (`tests/preprocess.c`), and compiles and runs every
 program in `tests/` (with its second file `NAME2.c` when there is one,
-and the options of `NAME.flags`: `c23.c` with `-std=c23`, `c89.c` with
-`-std=c89`) against the output in `NAME.expected`, which gcc's build of
-the same program printed when the test was written: first on the
+and the options of `NAME.flags`: `c23.c`, `embed.c` and `bitint.c` with
+`-std=c23`, `c89.c` with `-std=c89`; `ldouble.c` for the x87 long double)
+against the output in `NAME.expected`, which gcc's build of the same
+program printed when the test was written (clang's for `bitint.c`, gcc
+13 having no `_BitInt`; `embed.c`'s follows from the standard): first on the
 system's C library, then on mlxlibc as loader and C library with no GNU
 code in the process. `tests/standards.c`, compiled with every variant,
 prints what each predefines.

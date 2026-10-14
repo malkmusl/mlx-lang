@@ -1,8 +1,11 @@
 // Code generation for expressions: a stack machine on rax (xmm0 for
-// floating values) with operands pushed on the hardware stack. Every
-// integer in rax is kept canonical for its type (sign- or zero-extended
-// to 64 bits), so comparisons and divisions work on whole registers.
-// Calls follow the System V AMD64 ABI, structs by value included.
+// floating values, the x87 top st0 for long doubles) with operands
+// pushed on the hardware stack. Every integer in rax is kept canonical
+// for its type (sign- or zero-extended to 64 bits), so comparisons and
+// divisions work on whole registers. A long double value is on the x87
+// stack exactly as long as an expression holds it: whatever drops one
+// pops it. Calls follow the System V AMD64 ABI, structs by value and
+// long doubles (in memory, 16-byte aligned, returned in st0) included.
 const base = @import("./base.mlx")
 const names = @import("./names.mlx")
 const types = @import("./types.mlx")
@@ -10,6 +13,7 @@ const ast = @import("./ast.mlx")
 const x86 = @import("./x86.mlx")
 const genstmt = @import("./genstmt.mlx")
 const program = @import("./program.mlx")
+const extended = @import("./extended.mlx")
 
 // Words pushed on the stack by the expression being generated (a call
 // needs rsp 16-byte aligned).
@@ -47,6 +51,27 @@ fn popFloat(x: u8) -> void {
     depth -= 1
 }
 
+// st0 to the stack (16 bytes) and back.
+fn pushExtended() -> void {
+    x86.subtractStack(16)
+    x86.fstpExtended(x86.RSP, 0)
+    depth += 2
+}
+
+fn popExtended() -> void {
+    x86.fldExtended(x86.RSP, 0)
+    x86.addStack(16)
+    depth -= 2
+}
+
+pub fn isLongDouble(ty: usize) -> bool { return types.kind(ty) == types.LDOUBLE }
+
+// Drops the value of an expression of type `ty` (a long double is on the
+// x87 stack and must come off).
+pub fn discard(ty: usize) -> void {
+    if isLongDouble(ty) { x86.fstpTop() }
+}
+
 pub fn argumentRegister(index: i64) -> u8 {
     if index == 0 { return x86.RDI }
     if index == 1 { return x86.RSI }
@@ -62,8 +87,7 @@ pub fn isFloat(ty: usize) -> bool {
 }
 
 pub fn isDouble(ty: usize) -> bool {
-    const k = types.kind(ty)
-    return k == types.DOUBLE || k == types.LDOUBLE
+    return types.kind(ty) == types.DOUBLE
 }
 
 fn isStructLike(ty: usize) -> bool {
@@ -94,11 +118,12 @@ pub fn hasFloat(ty: usize, low: i64, high: i64, offset: i64) -> bool {
     return offset < low || high <= offset || k == types.FLOAT || k == types.DOUBLE
 }
 
-// Makes the integer in rax canonical for `ty`.
+// Makes the integer in rax canonical for `ty` (its width's bits
+// sign- or zero-extended; a _BitInt's width need not be a size's).
 fn canonical(ty: usize) -> void {
     if !types.isInteger(ty) { return }
-    const s = types.size(ty)
-    if s < 8 { x86.extend(x86.RAX, @intCast(usize, s * 8), !types.isUnsigned(ty)) }
+    const w = types.width(ty)
+    if w < 64 { x86.extendBits(x86.RAX, @intCast(usize, w), !types.isUnsigned(ty)) }
 }
 
 // rax = the address of the global object `o` (its definition in the
@@ -139,6 +164,7 @@ pub fn genAddress(n: usize) -> void {
     }
     if k == ast.COMMA {
         genExpression(node.*.lhs)
+        discard(ast.typeOf(node.*.lhs))
         genAddress(node.*.rhs)
         return
     }
@@ -172,11 +198,17 @@ fn load(ty: usize) -> void {
         x86.loadFloat(0, x86.RAX, 0, false)
         return
     }
-    if k == types.DOUBLE || k == types.LDOUBLE {
+    if k == types.DOUBLE {
         x86.loadFloat(0, x86.RAX, 0, true)
         return
     }
+    if k == types.LDOUBLE {
+        x86.fldExtended(x86.RAX, 0)
+        return
+    }
     x86.load(x86.RAX, x86.RAX, 0, types.size(ty), !types.isUnsigned(ty) && k != types.BOOL)
+    // A _BitInt's padding bits in memory are unspecified.
+    if types.isBitPrecise(ty) { canonical(ty) }
 }
 
 // Copies `size` bytes from [rax] to [rdi].
@@ -206,8 +238,14 @@ fn store(ty: usize) -> void {
         x86.storeFloat(x86.RDI, 0, 0, false)
         return
     }
-    if k == types.DOUBLE || k == types.LDOUBLE {
+    if k == types.DOUBLE {
         x86.storeFloat(x86.RDI, 0, 0, true)
+        return
+    }
+    if k == types.LDOUBLE {
+        // The value stays on the x87 stack as the assignment's.
+        x86.fldTop()
+        x86.fstpExtended(x86.RDI, 0)
         return
     }
     x86.store(x86.RDI, 0, x86.RAX, types.size(ty))
@@ -215,6 +253,13 @@ fn store(ty: usize) -> void {
 
 // Sets the flags for "the value is zero" (equal).
 pub fn compareZero(ty: usize) -> void {
+    if isLongDouble(ty) {
+        // 0 compared with the value, both popped.
+        x86.fldz()
+        x86.fucomip()
+        x86.fstpTop()
+        return
+    }
     if isFloat(ty) {
         x86.floatXor(1, 1)
         x86.floatCompare(0, 1, isDouble(ty))
@@ -265,9 +310,78 @@ fn floatToUnsigned(fromDouble: bool) -> void {
     x86.orRegisters(x86.RAX, x86.RCX)
 }
 
+// Conversions to and from long double, through the stack (8 bytes).
+fn castLongDouble(from: usize, to: usize) -> void {
+    const fromLong = isLongDouble(from)
+    const toLong = isLongDouble(to)
+    if fromLong && toLong { return }
+    if toLong {
+        x86.subtractStack(8)
+        if isFloat(from) {
+            x86.storeFloat(x86.RSP, 0, 0, isDouble(from))
+            if isDouble(from) { x86.fldDouble(x86.RSP, 0) } else { x86.fldSingle(x86.RSP, 0) }
+        } else {
+            x86.store(x86.RSP, 0, x86.RAX, 8)
+            x86.fildQuad(x86.RSP, 0)
+            if types.size(from) == 8 && types.isUnsigned(from) {
+                // Above 2^63 the integer read as signed is 2^64 short.
+                const done = newLabel()
+                x86.testRegisters(x86.RAX, x86.RAX)
+                x86.jumpIf(x86.CC_NS, done)
+                x86.moveImmediate(x86.RAX, 4895412794951729152)
+                x86.store(x86.RSP, 0, x86.RAX, 8)
+                x86.faddDouble(x86.RSP, 0)
+                x86.defineLabel(done)
+            }
+        }
+        x86.addStack(8)
+        return
+    }
+    if isFloat(to) {
+        x86.subtractStack(8)
+        if isDouble(to) { x86.fstpDouble(x86.RSP, 0) } else { x86.fstpSingle(x86.RSP, 0) }
+        x86.loadFloat(0, x86.RSP, 0, isDouble(to))
+        x86.addStack(8)
+        return
+    }
+    if isStructLike(to) {
+        x86.fstpTop()
+        return
+    }
+    x86.subtractStack(8)
+    if types.size(to) == 8 && types.isUnsigned(to) {
+        // From 2^63 on: convert the value less 2^63, then set the bit.
+        const plain = newLabel()
+        const done = newLabel()
+        x86.moveImmediate(x86.RAX, 4890909195324358656)
+        x86.store(x86.RSP, 0, x86.RAX, 8)
+        x86.fldDouble(x86.RSP, 0)
+        x86.fucomip()
+        x86.jumpIf(x86.CC_A, plain)
+        x86.fsubDouble(x86.RSP, 0)
+        x86.fisttpQuad(x86.RSP, 0)
+        x86.load(x86.RAX, x86.RSP, 0, 8, false)
+        x86.moveImmediate(x86.RDX, -9223372036854775807 - 1)
+        x86.orRegisters(x86.RAX, x86.RDX)
+        x86.jump(done)
+        x86.defineLabel(plain)
+        x86.fisttpQuad(x86.RSP, 0)
+        x86.load(x86.RAX, x86.RSP, 0, 8, false)
+        x86.defineLabel(done)
+    } else {
+        x86.fisttpQuad(x86.RSP, 0)
+        x86.load(x86.RAX, x86.RSP, 0, 8, false)
+    }
+    x86.addStack(8)
+    canonical(to)
+}
+
 pub fn cast(from: usize, to: usize) -> void {
     const tk = types.kind(to)
-    if tk == types.VOID { return }
+    if tk == types.VOID {
+        discard(from)
+        return
+    }
     if tk == types.BOOL {
         if isFloat(from) {
             castFloatToBool(from)
@@ -277,10 +391,14 @@ pub fn cast(from: usize, to: usize) -> void {
         }
         return
     }
+    if isLongDouble(from) || isLongDouble(to) {
+        castLongDouble(from, to)
+        return
+    }
     const fromFloat = isFloat(from)
     const toFloat = isFloat(to)
     if !fromFloat && !toFloat {
-        if types.isInteger(to) && types.size(to) < 8 { x86.extend(x86.RAX, @intCast(usize, types.size(to) * 8), !types.isUnsigned(to)) }
+        canonical(to)
         return
     }
     if !fromFloat && toFloat {
@@ -301,7 +419,7 @@ pub fn cast(from: usize, to: usize) -> void {
         return
     }
     x86.integerFromFloat(x86.RAX, 0, isDouble(from))
-    if types.size(to) < 8 { x86.extend(x86.RAX, @intCast(usize, types.size(to) * 8), !types.isUnsigned(to)) }
+    canonical(to)
 }
 
 // ---------------------------------------------------------------------------
@@ -315,14 +433,30 @@ fn pushStruct(ty: usize) -> void {
     copyBytes(types.size(ty))
 }
 
+// Where the next argument passed in memory ends (its offset from the
+// stack pointer at the call plus its size): the gap before it is left
+// for alignment.
+var stackCursor: i64 = 0
+
 fn pushArgumentsFrom(argument: usize, stackPass: bool) -> void {
     if argument == 0 { return }
     pushArgumentsFrom(ast.node(argument).*.next, stackPass)
     if ast.node(argument).*.passByStack != stackPass { return }
-    genExpression(argument)
     const ty = ast.typeOf(argument)
+    if stackPass {
+        const end = ast.node(argument).*.stackOffset + types.alignTo(types.size(ty), 8)
+        const gap = stackCursor - end
+        if gap > 0 {
+            x86.subtractStack(gap)
+            depth += gap / 8
+        }
+        stackCursor = ast.node(argument).*.stackOffset
+    }
+    genExpression(argument)
     if isStructLike(ty) {
         pushStruct(ty)
+    } else if isLongDouble(ty) {
+        pushExtended()
     } else if isFloat(ty) {
         pushFloat()
     } else {
@@ -334,18 +468,19 @@ fn pushArgumentsFrom(argument: usize, stackPass: bool) -> void {
 // (they stay), then those passed in registers (popped into them); the
 // number of words left on the stack.
 fn pushArguments(n: usize) -> i64 {
-    var stack: i64 = 0
+    var memory: i64 = 0
     var gp: i64 = 0
     var fp: i64 = 0
     const node = ast.node(n)
-    if node.*.returnBuffer != 0 && types.size(node.*.ty) > 16 { gp += 1 }
+    if node.*.returnBuffer != 0 && types.inMemory(node.*.ty) { gp += 1 }
     var argument = node.*.args
     while argument != 0 {
         const ty = ast.typeOf(argument)
+        var byStack = false
         if isStructLike(ty) {
             const size = types.size(ty)
-            var inMemory = size > 16
-            if !inMemory {
+            byStack = types.inMemory(ty)
+            if !byStack {
                 const fp1: i64 = if hasFloat(ty, 0, 8, 0) { 1 } else { 0 }
                 const fp2: i64 = if size > 8 && hasFloat(ty, 8, 16, 0) { 1 } else { 0 }
                 const gp1: i64 = 1 - fp1
@@ -354,36 +489,40 @@ fn pushArguments(n: usize) -> i64 {
                     fp += fp1 + fp2
                     gp += gp1 + gp2
                 } else {
-                    inMemory = true
+                    byStack = true
                 }
             }
-            if inMemory {
-                ast.node(argument).*.passByStack = true
-                stack += types.alignTo(size, 8) / 8
-            }
+        } else if isLongDouble(ty) {
+            byStack = true
         } else if isFloat(ty) {
-            if fp >= 8 {
-                ast.node(argument).*.passByStack = true
-                stack += 1
-            }
+            if fp >= 8 { byStack = true }
             fp += 1
         } else {
-            if gp >= 6 {
-                ast.node(argument).*.passByStack = true
-                stack += 1
-            }
+            if gp >= 6 { byStack = true }
             gp += 1
+        }
+        if byStack {
+            // In memory, in order, each at its alignment (a long double
+            // and a 16-byte aligned struct at 16).
+            ast.node(argument).*.passByStack = true
+            var alignment = types.alignOf(ty)
+            if alignment < 8 { alignment = 8 }
+            memory = types.alignTo(memory, alignment)
+            ast.node(argument).*.stackOffset = memory
+            memory += types.alignTo(types.size(ty), 8)
         }
         argument = ast.node(argument).*.next
     }
+    var stack = memory / 8
     if (depth + stack) % 2 == 1 {
         x86.subtractStack(8)
         depth += 1
         stack += 1
     }
+    stackCursor = memory
     pushArgumentsFrom(node.*.args, true)
     pushArgumentsFrom(node.*.args, false)
-    if node.*.returnBuffer != 0 && types.size(node.*.ty) > 16 {
+    if node.*.returnBuffer != 0 && types.inMemory(node.*.ty) {
         x86.leaFrame(x86.RAX, ast.obj(node.*.returnBuffer).*.offset)
         pushRax()
     }
@@ -435,7 +574,7 @@ fn genCall(n: usize) -> void {
     }
     var gp: i64 = 0
     var fp: u8 = 0
-    if node.*.returnBuffer != 0 && types.size(node.*.ty) > 16 {
+    if node.*.returnBuffer != 0 && types.inMemory(node.*.ty) {
         popTo(argumentRegister(gp))
         gp += 1
     }
@@ -491,10 +630,10 @@ fn genCall(n: usize) -> void {
     const rt = node.*.ty
     if types.kind(rt) == types.BOOL {
         x86.extend(x86.RAX, 8, false)
-    } else if types.isInteger(rt) && types.size(rt) < 8 {
-        x86.extend(x86.RAX, @intCast(usize, types.size(rt) * 8), !types.isUnsigned(rt))
+    } else if types.isInteger(rt) {
+        canonical(rt)
     }
-    if node.*.returnBuffer != 0 && types.size(rt) <= 16 {
+    if node.*.returnBuffer != 0 && !types.inMemory(rt) {
         copyReturnBuffer(node.*.returnBuffer)
         x86.leaFrame(x86.RAX, ast.obj(node.*.returnBuffer).*.offset)
     }
@@ -508,6 +647,15 @@ fn genVaArg(n: usize) -> void {
     const ty = types.baseOf(ast.typeOf(n))
     const overflow = newLabel()
     const done = newLabel()
+    if isLongDouble(ty) {
+        // Always on the stack, 16-byte aligned.
+        x86.load(x86.RAX, x86.RCX, 8, 8, false)
+        x86.immediate(0, x86.RAX, 15)
+        x86.immediate(4, x86.RAX, -16)
+        x86.leaOffset(x86.RDX, x86.RAX, 16)
+        x86.store(x86.RCX, 8, x86.RDX, 8)
+        return
+    }
     if isFloat(ty) {
         x86.load(x86.RAX, x86.RCX, 4, 4, false)
         x86.immediate(7, x86.RAX, 160)
@@ -538,6 +686,46 @@ fn genVaArg(n: usize) -> void {
 
 // ---------------------------------------------------------------------------
 // Expressions
+
+// A binary operation on long doubles: st0 the right operand, st1 the
+// left, and the result (or the flags) from them.
+fn genLongDoubleBinary(n: usize) -> void {
+    const node = ast.node(n)
+    genExpression(node.*.rhs)
+    pushExtended()
+    genExpression(node.*.lhs)
+    popExtended()
+    const k = node.*.kind
+    if k == ast.ADD {
+        x86.faddp()
+    } else if k == ast.SUB {
+        x86.fsubp()
+    } else if k == ast.MUL {
+        x86.fmulp()
+    } else if k == ast.DIV {
+        x86.fdivp()
+    } else if k == ast.EQ || k == ast.NE || k == ast.LT || k == ast.LE {
+        // The right operand compared with the left: as the SSE path's
+        // ucomisd xmm1 (right), xmm0 (left).
+        x86.fucomip()
+        x86.fstpTop()
+        if k == ast.EQ {
+            x86.setIf(x86.CC_E, x86.RAX)
+            x86.setIf(x86.CC_NP, x86.RDX)
+            x86.andRegisters(x86.RAX, x86.RDX)
+        } else if k == ast.NE {
+            x86.setIf(x86.CC_NE, x86.RAX)
+            x86.setIf(x86.CC_P, x86.RDX)
+            x86.orRegisters(x86.RAX, x86.RDX)
+        } else if k == ast.LT {
+            x86.setIf(x86.CC_A, x86.RAX)
+        } else {
+            x86.setIf(x86.CC_AE, x86.RAX)
+        }
+    } else {
+        ast.errorAt(n, "invalid operands to a floating operation")
+    }
+}
 
 fn genFloatBinary(n: usize) -> void {
     const node = ast.node(n)
@@ -633,6 +821,20 @@ pub fn genExpression(n: usize) -> void {
     if k == ast.NULL_EXPR { return }
     if k == ast.NUM {
         const ty = node.*.ty
+        if isLongDouble(ty) {
+            // The 80 bits (the constant's own, or the double's widened)
+            // in the data area, pushed from there.
+            var payload = node.*.extra
+            if payload == 0 {
+                payload = base.alloc(extended.SIZE)
+                const widened = extended.fromDouble(@bitCast(u64, node.*.value))
+                extended.store(payload, widened.0, widened.1)
+            }
+            const offset = x86.reserve(extended.SIZE, 16, payload, extended.SIZE)
+            x86.dataAddress(x86.RAX, offset)
+            x86.fldExtended(x86.RAX, 0)
+            return
+        }
         if types.kind(ty) == types.FLOAT {
             const single = @floatCast(f32, @bitCast(f64, @bitCast(u64, node.*.value)))
             x86.moveImmediate(x86.RAX, @intCast(i64, @bitCast(u32, single)))
@@ -647,6 +849,10 @@ pub fn genExpression(n: usize) -> void {
     }
     if k == ast.NEG {
         genExpression(node.*.lhs)
+        if isLongDouble(node.*.ty) {
+            x86.fchs()
+            return
+        }
         if isFloat(node.*.ty) {
             if isDouble(node.*.ty) {
                 x86.moveImmediate(x86.RAX, -9223372036854775807 - 1)
@@ -684,15 +890,21 @@ pub fn genExpression(n: usize) -> void {
         return
     }
     if k == ast.STMT_EXPR {
+        // The last statement's expression is the value: not dropped.
         var s = node.*.body
         while s != 0 {
-            genstmt.genStatement(s)
+            if ast.node(s).*.next == 0 && ast.node(s).*.kind == ast.EXPR_STMT {
+                genExpression(ast.node(s).*.lhs)
+            } else {
+                genstmt.genStatement(s)
+            }
             s = ast.node(s).*.next
         }
         return
     }
     if k == ast.COMMA {
         genExpression(node.*.lhs)
+        discard(ast.typeOf(node.*.lhs))
         genExpression(node.*.rhs)
         return
     }
@@ -770,6 +982,10 @@ pub fn genExpression(n: usize) -> void {
         return
     }
     // Binary operators.
+    if isLongDouble(ast.typeOf(node.*.lhs)) {
+        genLongDoubleBinary(n)
+        return
+    }
     if isFloat(ast.typeOf(node.*.lhs)) {
         genFloatBinary(n)
         return

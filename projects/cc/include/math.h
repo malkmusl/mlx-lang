@@ -144,20 +144,32 @@ float erfcf(float);
 float lgammaf(float);
 float tgammaf(float);
 float nanf(const char *);
-/* long double is double here (projects/cc/README.md): these are the
-   double functions under their names. */
-#define sinl(x) sin(x)
-#define cosl(x) cos(x)
-#define tanl(x) tan(x)
-#define expl(x) exp(x)
-#define logl(x) log(x)
-#define powl(x, y) pow(x, y)
-#define sqrtl(x) sqrt(x)
-#define fabsl(x) fabs(x)
-#define floorl(x) floor(x)
-#define ceill(x) ceil(x)
-#define fmodl(x, y) fmod(x, y)
-#define ldexpl(x, e) ldexp(x, e)
-#define frexpl(x, e) frexp(x, e)
-#define modfl(x, p) modf(x, (double *)(p))
+/* The long double functions are libm's (glibc's; mlxlibc's libm has none yet). */
+long double sinl(long double);
+long double cosl(long double);
+long double tanl(long double);
+long double asinl(long double);
+long double acosl(long double);
+long double atanl(long double);
+long double atan2l(long double, long double);
+long double expl(long double);
+long double logl(long double);
+long double log10l(long double);
+long double log2l(long double);
+long double powl(long double, long double);
+long double sqrtl(long double);
+long double cbrtl(long double);
+long double fabsl(long double);
+long double floorl(long double);
+long double ceill(long double);
+long double truncl(long double);
+long double roundl(long double);
+long double fmodl(long double, long double);
+long double ldexpl(long double, int);
+long double frexpl(long double, int *);
+long double modfl(long double, long double *);
+long double hypotl(long double, long double);
+long double fminl(long double, long double);
+long double fmaxl(long double, long double);
+long double copysignl(long double, long double);
 #endif

@@ -34,6 +34,7 @@ long long strtoll(const char *, char **, int);
 unsigned long long strtoull(const char *, char **, int);
 double strtod(const char *, char **);
 float strtof(const char *, char **);
+long double strtold(const char *, char **);
 char *getenv(const char *);
 char *secure_getenv(const char *);
 int setenv(const char *, const char *, int);

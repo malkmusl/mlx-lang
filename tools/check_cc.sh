@@ -10,6 +10,7 @@
 #     as -std=c23) compiles, and runs printing what NAME.expected says
 #     (stdout and stderr, then the exit status), as the program gcc made
 #     of it did when the file was written;
+#     (the tests directory is an include directory, for #embed <...>);
 #   - -std=: each variant from c89 to gnu23 predefines what gcc does
 #     (tests/standards.c prints __STDC_VERSION__, __STRICT_ANSI__,
 #     `linux` and `unix`);
@@ -51,7 +52,7 @@ for name in "${programs[@]}"; do
     [[ -f "$tests/${name}2.c" ]] && files+=("$tests/${name}2.c")
     flags=()
     [[ -f "$tests/$name.flags" ]] && read -r -a flags < "$tests/$name.flags"
-    "$cc" "${flags[@]}" -o "$work/$name" "${files[@]}" 2> "$work/$name.cc" || fail "$name does not compile: $(head -5 "$work/$name.cc")"
+    "$cc" "${flags[@]}" -I "$tests" -o "$work/$name" "${files[@]}" 2> "$work/$name.cc" || fail "$name does not compile: $(head -5 "$work/$name.cc")"
     [[ ! -s "$work/$name.cc" ]] || fail "$name: the compiler said: $(head -5 "$work/$name.cc")"
     status=0
     (cd "$work/run" && timeout 20 "$work/$name" arg > "$work/$name.out" 2>&1) || status=$?

@@ -13,7 +13,7 @@ SELECT typeof(1), typeof(1.5), typeof('x'), typeof(NULL), typeof(x'0102'), 7 / 2
 SELECT json_object('name', name, 'born', born) FROM people WHERE id = 1;
 SELECT json_extract('{"a": [1, 2, {"b": 3.5}]}', '$.a[2].b'), json_array_length('[1,2,3]'), json_valid('{');
 SELECT date('2024-02-28', '+1 day'), datetime('2000-01-01 12:00:00', '+90 minutes'), strftime('%Y-%j', '2024-12-31'), julianday('2000-01-01');
-SELECT abs(-3), round(2.5), round(3.14159, 2), 1e300 * 10, 1e-300 * 1e5, 123456789012345678, 0.1 + 0.2 = 0.3, 1.0 / 3;
+SELECT abs(-3), round(2.5), round(3.14159, 2), 1e300 * 10, 1e-300 / 1e10, 123456789012345678, 0.1 + 0.2 = 0.3, 1.0 / 3;
 SELECT name FROM people WHERE name LIKE 'A%' OR name GLOB '*s' ORDER BY name DESC;
 SELECT total(height) FILTER (WHERE born < 1950), CAST(height * 100 AS INTEGER), CAST('12abc' AS INTEGER), CAST(3.9 AS INTEGER) FROM people ORDER BY id LIMIT 2;
 UPDATE people SET height = height + 0.01 WHERE id = 1;
