@@ -282,6 +282,30 @@ non-const reference does not bind a const object; a dependent member
 type in a signature (`typename remove_reference<T>::type &&`) is
 resolved in the instance; `decltype(e)`, `sizeof e` and `noexcept(e)`
 evaluate nothing, so `declval<T>()` (declared only) works in them.
+The type trait builtins (`__is_class`, `__is_base_of`,
+`__is_constructible`, `__is_same`, `__underlying_type` and the rest)
+are what `<type_traits>` is written with; a name that does not exist
+for an instance's arguments (`enable_if<false, int>::type`, a member
+a requires expression names) makes the candidate not viable, not an
+error (SFINAE); concepts (`concept C = ...`, `requires` clauses after
+the parameters or after the function's parameters, `requires`
+expressions, constrained parameters `template <std::integral T>`) are
+constraints evaluated per instance; a pattern over a pack
+(`decay<Ts>::type...`, `(Is * 2)...`) expands in template arguments
+too; a template given some arguments and deducing the rest
+(`make_shared<T>(args...)`); member class templates (`template <class
+F> struct Held` inside a class, as `std::function` keeps its callable);
+a partial specialization over a function type (`function<R(Args...)>`).
+The atomic builtins (`__atomic_load_n`, `__atomic_fetch_add`,
+`__atomic_compare_exchange_n`, the `__sync_*` family, `atomics.mlx`)
+are locked x86 instructions (`xadd`, `xchg`, `cmpxchg`, `mfence`) on
+integers and pointers of 1 to 8 bytes, in C and C++ alike
+(`tests/atomics.c`): `<atomic>` and `<mutex>` (over mlxlibc's pthreads)
+are written with them. `tests/cpp/headers.cpp` runs `<concepts>`,
+`<bit>`, `<array>`, `<span>`, `<tuple>`, `<optional>`, `<iterator>`,
+`<functional>`, `<atomic>`, `<mutex>`, `<expected>` and `<memory>`
+(`unique_ptr` with a deleter, variadic `make_unique` and
+`make_shared`) as g++ -std=c++23 does.
 `tests/cpp/interp.cpp`
 is a small interpreter (lexer, recursive descent parser, virtual nodes,
 maps of variables and functions) that runs as g++ builds it;
@@ -298,7 +322,9 @@ overloads of a name. Not there yet:
 a pack of a base list (`struct X : Bases...`), a pack in a lambda's
 captures,
 generic lambdas (`auto` parameters), a lambda converting to a function
-pointer, init-captures, alias templates (`template <class T> using`),
+pointer, init-captures, class template argument deduction
+(`std::pair p(1, 2)`, `std::lock_guard lock(m)`: the arguments must be
+written), `<=>`, structured bindings, template template parameters,
 exceptions (`try`, `throw` are refused),
 multiple inheritance, a polymorphic class over a base without a vtable,
 `constexpr` over classes, pointers or floating-point values,
@@ -313,8 +339,11 @@ differs from g++'s; constructors have only their `C1` symbol; `long long` and
 `signed char` are `long` and `char`, not types of their own. The C++
 standard library is mlxlibcpp (`projects/libcpp`: `<string>`,
 `<iostream>`, `<sstream>`, `<vector>`, `<map>`, `<set>`, `<memory>`,
-`<utility>`, `<algorithm>`, `<numeric>`, `<new>`, the `c*` headers,
-under `include/c++`), linked
+`<utility>`, `<algorithm>`, `<numeric>`, `<new>`, `<type_traits>`,
+`<concepts>`, `<initializer_list>`, `<limits>`, `<bit>`, `<array>`,
+`<span>`, `<tuple>`, `<optional>`, `<expected>`, `<iterator>`,
+`<functional>`, `<atomic>`, `<mutex>`, the `c*` headers, and `<compare>`
+and `<ranges>` as stubs, under `include/c++`), linked
 into every C++ program by itself as `libmlxcpp.a` from `$MLX_CC_LIB`,
 `lib/` next to the compiler or `/usr/local/lib/mlx-cc/lib`
 (`-nostdlib++` leaves it out), together with the math library.
@@ -329,9 +358,9 @@ into every C++ program by itself as `libmlxcpp.a` from `$MLX_CC_LIB`,
   beyond it; `strtold` reads the full 64-bit significand and the `sinl`
   family is x87 code of mlxlibc's own (`tests/ldouble_math.c` compares
   both C libraries with gcc's output).
-- No variable-length arrays, `_Atomic` operations, `_Thread_local`
-  (declared, but a plain global), `_Complex`, inline `asm`, computed
-  `goto`.
+- No variable-length arrays, `_Atomic` qualifier (the `__atomic_*` and
+  `__sync_*` builtins are there), `_Thread_local` (declared, but a
+  plain global), `_Complex`, inline `asm`, computed `goto`.
 - `va_arg` of a struct of 16 bytes or less reads it from the stack, where
   only larger ones are.
 - No optimization: the code is correct and slow.

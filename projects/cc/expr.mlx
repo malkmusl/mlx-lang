@@ -19,6 +19,7 @@ const standard = @import("./standard.mlx")
 const cpp = @import("./cpp.mlx")
 const template = @import("./template.mlx")
 const lambda = @import("./lambda.mlx")
+const atomics = @import("./atomics.mlx")
 
 // C++: in a template argument list a `>` (and `>>`) ends the argument
 // rather than comparing (template.mlx sets it; parentheses lift it).
@@ -66,7 +67,10 @@ pub fn conversionRank(from: usize, to: usize) -> i64 {
     }
     const fk = types.kind(from)
     const tk = types.kind(target)
-    if types.isReference(to) && !types.compatible(from, target) {
+    // An array binds to a const (or rvalue) reference to a pointer
+    // through a temporary, as a pointer conversion below.
+    const arrayToPointer = (fk == types.ARRAY || fk == types.FUNC) && tk == types.PTR && (types.isConst(target) || types.isRvalueReference(to))
+    if types.isReference(to) && !types.compatible(from, target) && !arrayToPointer {
         // A reference binds to the same type (a const one to a temporary
         // of a convertible one).
         if types.isNumeric(from) && types.isNumeric(target) { return 1 }
@@ -154,8 +158,11 @@ fn scoreFrom(fnType: usize, first: usize, args: usize, count: usize, onConst: bo
         // A null pointer constant (`0`) is a pointer of any type.
         if rank == 0 && standard.cpp && types.kind(types.param(p).*.ty) == types.PTR && isNullConstant(arg) { rank = 1 }
         if standard.cpp && types.isRvalueReference(types.param(p).*.ty) {
-            // `T &&` binds rvalues only, and before `const T &` does.
-            if !isRvalueArgument(arg) { return -1 }
+            // `T &&` binds rvalues only (a converted value, as an array
+            // to a pointer, is a temporary), and before `const T &` does.
+            const target = types.referenced(types.param(p).*.ty)
+            const converted = !types.compatible(ast.typeOf(arg), target) && !cpp.isClassType(ast.typeOf(arg)) && !cpp.isClassType(target)
+            if !isRvalueArgument(arg) && !converted { return -1 }
             if rank > 0 { rank += 1 }
         }
         if rank == 0 { return -1 }
@@ -281,6 +288,7 @@ fn binaryNode(kind: u8, op: []const u8, lhs: usize, rhs: usize, token: usize) ->
         if call != 0 { return call }
         if kind == ast.LOGAND || kind == ast.LOGOR { return ast.binary(kind, cpp.toCondition(lhs), cpp.toCondition(rhs), token) }
         if cpp.isClassType(ast.typeOf(lhs)) || cpp.isClassType(ast.typeOf(rhs)) {
+            if decl.sfinae { return softFailure(token) }
             tokens.errorAt(token, base.join(base.join("no operator", op), " for these operands"))
         }
     }
@@ -577,8 +585,9 @@ pub fn castExpression() -> usize {
         const start = cursor.save()
         cursor.advance()
         const ty = decl.typeName()
-        if standard.cpp && !cursor.is(names.P_RPAREN) {
-            // `(T(x))`, `(T{x})`: a parenthesized functional cast.
+        if standard.cpp && (!cursor.is(names.P_RPAREN) || types.kind(ty) == types.FUNC) {
+            // `(T(x))`, `(T{x})`, `(T())`: a parenthesized functional
+            // cast (a cast to a function type is none).
             cursor.restore(start)
             return unary()
         }
@@ -689,10 +698,21 @@ pub fn findMember(ty: usize, name: u32) -> usize {
     return 0
 }
 
+// SFINAE: an expression that cannot be read (in a requires
+// expression, a constraint, an instance's signature) marks the
+// candidate as not viable and stands as 0.
+fn softFailure(token: usize) -> usize {
+    decl.sfinaeFailed = true
+    return ast.number(0, token)
+}
+
 pub fn structReference(operand: usize, nameToken: usize) -> usize {
     typing.addType(operand)
     var ty = ast.typeOf(operand)
-    if types.kind(ty) != types.STRUCT && types.kind(ty) != types.UNION { tokens.errorAt(nameToken, "not a struct nor a union") }
+    if types.kind(ty) != types.STRUCT && types.kind(ty) != types.UNION {
+        if decl.sfinae { return softFailure(nameToken) }
+        tokens.errorAt(nameToken, "not a struct nor a union")
+    }
     if types.at(ty).*.incomplete { tokens.errorAt(nameToken, "incomplete struct or union") }
     var n = operand
     while true {
@@ -702,6 +722,7 @@ pub fn structReference(operand: usize, nameToken: usize) -> usize {
             const member = cpp.memberReference(operand, nameToken)
             if member != 0 { return member }
         }
+        if m == 0 && decl.sfinae { return softFailure(nameToken) }
         if m == 0 { tokens.errorAt(nameToken, "no such member") }
         n = ast.unary(ast.MEMBER, n, nameToken)
         ast.node(n).*.member = m
@@ -732,8 +753,8 @@ fn startsFunctionalCast() -> bool {
     if !standard.cpp { return false }
     const start = cursor.save()
     cursor.advance()
-    decl.typeName()
-    const result = !cursor.is(names.P_RPAREN)
+    const ty = decl.typeName()
+    const result = !cursor.is(names.P_RPAREN) || types.kind(ty) == types.FUNC
     cursor.restore(start)
     return result
 }
@@ -887,6 +908,89 @@ fn typeTrait(token: usize) -> usize {
         tokens.errorAt(token, base.join("unknown type trait ", text))
     }
     const n = ast.number(if result { 1 } else { 0 }, token)
+    ast.node(n).*.ty = types.boolOf()
+    return n
+}
+
+// A constraint (a requires clause or a concept's expression) at the
+// cursor: its value (0 or 1), read with decl.sfinae on by the caller.
+pub fn constraintValue() -> i64 {
+    const n = logicalOr()
+    if decl.sfinaeFailed { return 0 }
+    if !eval.isConstant(n) { return 0 }
+    return if eval.evaluate(n) != 0 { 1 } else { 0 }
+}
+
+// `requires (T t) { t.f(); typename T::type; { t.g() } -> C<int>; }`
+// at `requires`: true when every requirement is met (an expression
+// that reads, a type that exists), false otherwise; read with the
+// soft errors of decl.sfinae.
+fn requiresExpression(token: usize) -> usize {
+    cursor.expect(names.K_REQUIRES)
+    const outerSfinae = decl.sfinae
+    const outerFailed = decl.sfinaeFailed
+    decl.sfinae = true
+    decl.sfinaeFailed = false
+    scope.enter()
+    if cursor.consume(names.P_LPAREN) {
+        // The parameters: locals of their types.
+        while !cursor.consume(names.P_RPAREN) {
+            const attr = decl.newAttr()
+            const baseType = decl.declspec(attr)
+            const found = decl.declarator(baseType)
+            if found.1 != 0 {
+                var ty = found.0
+                const o = ast.newObj(tokens.name(found.1), ty, found.1)
+                ast.obj(o).*.isLocal = true
+                const bound = scope.bindVariable(tokens.name(found.1), o)
+            }
+            if !cursor.consume(names.P_COMMA) {
+                cursor.expect(names.P_RPAREN)
+                break
+            }
+        }
+    }
+    cursor.expect(names.P_LBRACE)
+    unevaluated += 1
+    while !cursor.consume(names.P_RBRACE) {
+        if cursor.isEof() { cursor.fail("unterminated requires expression") }
+        if cursor.consume(names.K_TYPENAME) {
+            // A type that must exist.
+            if decl.isTypename(cursor.peek()) {
+                const ignored = decl.typeName()
+            } else {
+                decl.sfinaeFailed = true
+                while !cursor.is(names.P_SEMI) && !cursor.isEof() { cursor.advance() }
+            }
+            cursor.expect(names.P_SEMI)
+        } else if cursor.consume(names.P_LBRACE) {
+            // `{ e } -> C;` or `{ e } noexcept;`: e must read.
+            const e = expression()
+            typing.addType(e)
+            cursor.expect(names.P_RBRACE)
+            const ignored = cursor.consume(names.K_NOEXCEPT)
+            if cursor.consume(names.P_ARROW) {
+                // The type constraint: passed over (its concept is
+                // taken to hold).
+                while !cursor.is(names.P_SEMI) && !cursor.isEof() { cursor.advance() }
+            }
+            cursor.expect(names.P_SEMI)
+        } else if cursor.is(names.K_REQUIRES) {
+            const inner = requiresExpression(cursor.peek())
+            if ast.node(inner).*.value == 0 { decl.sfinaeFailed = true }
+            cursor.expect(names.P_SEMI)
+        } else {
+            const e = expression()
+            typing.addType(e)
+            cursor.expect(names.P_SEMI)
+        }
+    }
+    unevaluated -= 1
+    scope.leave()
+    const met = !decl.sfinaeFailed
+    decl.sfinae = outerSfinae
+    decl.sfinaeFailed = outerFailed
+    const n = ast.number(if met { 1 } else { 0 }, token)
     ast.node(n).*.ty = types.boolOf()
     return n
 }
@@ -1099,15 +1203,45 @@ pub fn argumentList(closer: u32, given: usize, maxArgs: usize) -> usize {
         scope.packSeen = 0
         const temporaries = state.takeTemporaries()
         state.setTemporaries(temporaries)
+        // An expansion's first reading may name what an empty pack
+        // has not (`forward<Args>(args)...` with no element): read
+        // softly, and again for its errors when the pack has elements.
+        const expands = standard.cpp && scope.packIndex < 0 && expansionAhead(closer)
+        const outerSfinae = decl.sfinae
+        const outerFailed = decl.sfinaeFailed
+        if expands {
+            decl.sfinae = true
+            decl.sfinaeFailed = false
+        }
         var argument = assign()
+        const softFailed = expands && decl.sfinaeFailed
+        if expands {
+            decl.sfinae = outerSfinae
+            decl.sfinaeFailed = outerFailed
+        }
         if standard.cpp && cursor.is(names.P_ELLIPSIS) && scope.packIndex < 0 {
             const holder = scope.packSeen
+            if holder == 0 && decl.sfinae {
+                // `forward<Args>(args)...` in a template's pattern: not
+                // an expression yet.
+                decl.sfinaeFailed = true
+                cursor.expect(names.P_ELLIPSIS)
+                scope.packSeen = outerSeen
+                state.setTemporaries(temporaries)
+                continue
+            }
             if holder == 0 { cursor.fail("nothing to expand with ...") }
             const n = types.packCount(holder)
             if n == 0 {
                 // Nothing: the reading is dropped.
                 state.setTemporaries(temporaries)
             } else {
+                if softFailed {
+                    // Its errors are real: read again to report them.
+                    cursor.restore(start)
+                    state.setTemporaries(temporaries)
+                    argument = assign()
+                }
                 typing.addType(argument)
                 base.putWord(given + count * 8, argument)
                 count += 1
@@ -1138,6 +1272,24 @@ pub fn argumentList(closer: u32, given: usize, maxArgs: usize) -> usize {
     return count
 }
 
+// Whether the argument at the cursor ends with `...` (before the `,`
+// or `closer` at its level).
+fn expansionAhead(closer: u32) -> bool {
+    var t = cursor.peek()
+    var level: i64 = 0
+    var previous: usize = 0
+    while !tokens.isEof(t) {
+        if level == 0 && (tokens.is(t, names.P_COMMA) || tokens.is(t, closer)) { break }
+        if tokens.is(t, names.P_SEMI) || tokens.is(t, names.P_LBRACE) { return false }
+        if tokens.is(t, names.P_LPAREN) || tokens.is(t, names.P_LBRACKET) { level += 1 }
+        if tokens.is(t, names.P_RPAREN) || tokens.is(t, names.P_RBRACKET) { level -= 1 }
+        if level < 0 { break }
+        previous = t
+        t = tokens.next(t)
+    }
+    return previous != 0 && tokens.is(previous, names.P_ELLIPSIS)
+}
+
 // The call of `callee` with the `count` arguments in `given`. In C++
 // a member function's callee carries its object's address (lhs; the
 // current `this` when none), passed first; the arguments choose among
@@ -1157,6 +1309,7 @@ pub fn buildCall(callee: usize, givenArgs: usize, givenCount: usize, token: usiz
     if types.kind(fnType) == types.PTR && types.kind(types.baseOf(fnType)) == types.FUNC { fnType = types.baseOf(fnType) }
     if types.kind(fnType) != types.FUNC {
         if standard.cpp && cpp.isClassType(fnType) { return cpp.callOperator(callee, givenArgs, givenCount, token) }
+        if decl.sfinae { return softFailure(token) }
         tokens.errorAt(token, "not a function")
     }
     var given = givenArgs
@@ -1172,6 +1325,7 @@ pub fn buildCall(callee: usize, givenArgs: usize, givenCount: usize, token: usiz
         var score: i64 = if instance != 0 { argumentScore(instance, givenArgs, givenCount) } else { -1 }
         const plain = bestOverload(holder.*.nextOverload, givenArgs, givenCount)
         if plain != 0 && overloadScore(plain, givenArgs, givenCount) >= score { chosen = plain }
+        if chosen == 0 && decl.sfinae { return softFailure(token) }
         if chosen == 0 { tokens.errorAt(token, "no function template instance takes these arguments") }
         ast.node(callee).*.variable = chosen
         ast.node(callee).*.ty = ast.obj(chosen).*.ty
@@ -1238,6 +1392,7 @@ pub fn buildCall(callee: usize, givenArgs: usize, givenCount: usize, token: usiz
         if head == 0 { head = argument } else { ast.node(tail).*.next = argument }
         tail = argument
     }
+    if p != 0 && decl.sfinae { return softFailure(token) }
     if p != 0 { tokens.errorAt(token, "too few arguments") }
     const n = ast.make(ast.FUNCALL, token)
     ast.node(n).*.lhs = call
@@ -1408,6 +1563,7 @@ fn primary() -> usize {
             return castTo(operand, ty)
         }
         if cursor.is(names.K_TYPEID) { tokens.errorAt(token, "typeid is not supported") }
+        if cursor.is(names.K_REQUIRES) { return requiresExpression(token) }
         if cursor.consume(names.K_NOEXCEPT) {
             // `noexcept(e)`: true (nothing throws here).
             cursor.expect(names.P_LPAREN)
@@ -1472,6 +1628,9 @@ fn primary() -> usize {
     }
     if standard.cpp && kind == tokens.IDENT && isTypeTrait(tokens.name(token)) && cursor.isToken(cursor.peekNext(), names.P_LPAREN) {
         return typeTrait(token)
+    }
+    if kind == tokens.IDENT && cursor.isToken(cursor.peekNext(), names.P_LPAREN) && atomics.isBuiltin(tokens.name(token)) && scope.find(tokens.name(token)) == 0 {
+        return atomics.builtin(token)
     }
     if kind == tokens.IDENT || (standard.cpp && (cursor.is(names.P_SCOPE) || cursor.is(names.K_OPERATOR))) {
         var binding: usize = 0

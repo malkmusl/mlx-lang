@@ -135,13 +135,21 @@ and a small interpreter (`tests/cpp/interp.cpp`) as the larger test;
 tinyxml2 builds and passes its 528 tests; partial specializations,
 alias templates, variadic templates with fold expressions, `constexpr`
 functions and `if constexpr`, rvalue references with move semantics,
-and the declaration forms of `wtf/Forward.h` are read.
+the declaration forms of `wtf/Forward.h`, the type trait builtins with
+`<type_traits>`, SFINAE, concepts and requires clauses, the atomic
+builtins with `<atomic>` and `<mutex>`, and the standard headers WTF
+includes (`<concepts>`, `<bit>`, `<span>`, `<array>`, `<tuple>`,
+`<optional>`, `<expected>`, `<functional>`, `<iterator>`) are read and
+run as g++'s builds do.
 The target is WPEWebKit
 (a browser engine of our own is out of reach; a C and C++ compiler of
 our own over mlxlibc and mlxlibcpp keeps the whole stack ours), so the
-next steps are what its base library WTF needs: `<type_traits>` and
-the other standard headers it includes, concepts, atomics and threads;
-then what Mesa needs. The other way stays open: a Vulkan
+next steps are what its base library WTF needs: `wtf/Vector.h`,
+`RefPtr.h`, `HashMap.h` and `text/WTFString.h` compiling (class
+template argument deduction, `<=>`, structured bindings, threads among
+what they will ask); then what Mesa needs. Once WPEWebKit builds, the
+compilers join the standard Mlx distribution with the headers as
+builtins, and `importC` in Mlx (C and C++ code as Mlx code) follows. The other way stays open: a Vulkan
 driver for one GPU family in Mlx (`docs/VULKAN.md` has the first steps)
 takes Mesa out of the picture for that hardware.
 
