@@ -500,6 +500,10 @@ pub fn needsSpecialCopy(ty: usize) -> bool {
     const c = info(ty)
     if c == 0 { return false }
     if at(c).*.constructors != 0 { return true }
+    // (An operator= of its own: assigned through it, member by member
+    // in the classes around it.)
+    const assign = scope.findQualified(at(c).*.prefix, operatorFunction("="), false)
+    if assign != 0 && scope.at(assign).*.kind == scope.VARIABLE && ast.obj(scope.at(assign).*.obj).*.isFunction { return true }
     var m = types.at(ty).*.members
     while m != 0 {
         if needsSpecialCopy(types.member(m).*.ty) { return true }
@@ -798,6 +802,10 @@ pub fn convertible(from: usize, ty: usize) -> bool {
         if instance != 0 { found = true }
     }
     userConversion = false
+    // Through a constructor the class inherits (`using Base::Base;`:
+    // PackedPtr<T> from a T *).
+    const inherited = at(c).*.inheritedFrom
+    if !found && inherited != 0 && !sameClass(from, inherited) && !isBaseOf(inherited, from) { found = convertible(from, inherited) }
     return found
 }
 var userConversion = false
@@ -873,6 +881,39 @@ fn memberTemplateOf(classTy: usize, name: u32) -> usize {
         cell = base.getWord(cell + 8)
     }
     return 0
+}
+
+// The member function `name` the arguments fit best when the class
+// declares none of its own and two or more of its bases do (brought
+// together by using-declarations); 0 otherwise.
+fn methodAcrossBases(classTy: usize, name: u32, args: usize, count: usize) -> usize {
+    const top = info(types.unqualified(types.referenced(classTy)))
+    if top == 0 || memberTemplateOf(classTy, name) != 0 { return 0 }
+    const own = scope.findQualified(at(top).*.prefix, name, false)
+    if own != 0 && scope.at(own).*.kind == scope.VARIABLE { return 0 }
+    var best: usize = 0
+    var bestScore: i64 = -1
+    var providers: u32 = 0
+    var cell = base.getWord(classAndBases(top) + 8)
+    while cell != 0 {
+        const c = base.getWord(cell)
+        const b = scope.findQualified(at(c).*.prefix, name, false)
+        if b != 0 && scope.at(b).*.kind == scope.VARIABLE && ast.obj(scope.at(b).*.obj).*.isFunction {
+            providers += 1
+            var o = scope.at(b).*.obj
+            while o != 0 {
+                const score = expr.argumentScore(o, args, count)
+                if score > bestScore {
+                    best = o
+                    bestScore = score
+                }
+                o = ast.obj(o).*.nextOverload
+            }
+        }
+        cell = base.getWord(cell + 8)
+    }
+    if providers < 2 { return 0 }
+    return best
 }
 
 fn findMethod(classTy: usize, name: u32) -> usize {
@@ -2023,10 +2064,14 @@ pub fn specialMember(ty: usize) -> bool {
         }
         cursor.advance()
         if last != 0 && beforeScope != 0 && tokens.name(last) == tokens.name(beforeScope) {
+            // (`using Base = AlignedPtr<T>; using Base::Base;`: the base
+            // through its alias.)
+            const aliased = scope.typedefOf(tokens.name(beforeScope))
             var b = at(c).*.bases
             while b != 0 {
                 const bt = base.getWord(b)
                 if info(bt) != 0 && at(info(bt)).*.written == tokens.name(last) { at(c).*.inheritedFrom = bt }
+                if info(bt) != 0 && aliased != 0 && sameClass(aliased, bt) { at(c).*.inheritedFrom = bt }
                 b = base.getWord(b + 8)
             }
         }
@@ -2537,9 +2582,22 @@ fn newMethod(classTy: usize, name: u32, token: usize, ty: usize, symbol: u32) ->
 
 // A static data member: a global of the class's scope, defined here
 // when it has an initializer (`static int S::count` elsewhere else).
-pub fn staticMember(classTy: usize, ty: usize, nameToken: usize, attr: usize) -> void {
+pub fn staticMember(classTy: usize, declared: usize, nameToken: usize, attr: usize) -> void {
     const c = info(classTy)
     const name = tokens.name(nameToken)
+    var ty = declared
+    if types.isAutoResult(types.unqualified(ty)) && (cursor.is(names.P_ASSIGN) || cursor.is(names.P_LBRACE)) {
+        // `static constexpr auto found_info = info;`: the initializer's
+        // type (read once for it).
+        const start = cursor.save()
+        cursor.advance()
+        const e = expr.assign()
+        typing.addType(e)
+        ty = types.unqualified(types.referenced(ast.typeOf(e)))
+        if types.kind(ty) == types.ARRAY { ty = types.pointerTo(types.baseOf(ty)) }
+        if types.kind(ty) == types.FUNC { ty = types.pointerTo(ty) }
+        cursor.restore(start)
+    }
     if decl.attrAt(attr).*.isConstexpr && cursor.is(names.P_ASSIGN) && decl.constexprConstant(ty, nameToken) { return }
     if decl.attrAt(attr).*.isConstexpr && cursor.is(names.P_LBRACE) && decl.constexprBracedConstant(ty, nameToken) { return }
     const o = ast.newObj(name, ty, nameToken)
@@ -2950,6 +3008,9 @@ pub fn readArguments(closer: u32) -> (usize, usize) {
     return -> (given, count)
 }
 
+// (An initializer entry's count: the node made for an array member.)
+const ARRAY_MADE: usize = 0xFFFFFFFF
+
 // A constructor's start, before its `{`: the initializer list is read,
 // and the base, the vtable pointer and the members are made in order;
 // a block of statements (0 for none).
@@ -3003,6 +3064,20 @@ pub fn constructorPrologue(fnObj: usize) -> usize {
                 if m == 0 || (types.member(m).*.name != name && inner == 0) { tokens.errorAt(nameToken, "no such member") }
             }
             if !cursor.is(names.P_LPAREN) && !cursor.is(names.P_LBRACE) { cursor.fail("expected '(' or '{'") }
+            if m != 0 && inner == 0 && cursor.is(names.P_LBRACE) && types.kind(types.member(m).*.ty) == types.ARRAY {
+                // `fast_bits { 0 }`, `instances { }`: an array member's
+                // braces (the elements left out zero), made here.
+                const made = braceInitializer(memberAddress(self, m, token), types.member(m).*.ty, token)
+                const entry = base.alloc(40)
+                base.putWord(entry, m)
+                base.putWord(entry + 8, made)
+                base.putWord(entry + 16, ARRAY_MADE)
+                base.putWord(entry + 24, inits)
+                base.putWord(entry + 32, 0)
+                inits = entry
+                if !cursor.consume(names.P_COMMA) { break }
+                continue
+            }
             const closer: u32 = if cursor.is(names.P_LPAREN) { names.P_RPAREN } else { names.P_RBRACE }
             cursor.advance()
             const args = readArguments(closer)
@@ -3052,6 +3127,8 @@ pub fn constructorPrologue(fnObj: usize) -> usize {
             }
         } else if types.member(m).*.name == 0 && !isClassType(mt) {
             // The vtable pointer.
+        } else if given != 0 && base.getWord(given + 16) == ARRAY_MADE {
+            n = sequence(n, base.getWord(given + 8), token)
         } else if given != 0 {
             n = sequence(n, construct(where, mt, base.getWord(given + 8), base.getWord(given + 16), token), token)
         } else if types.member(m).*.init != 0 {
@@ -3283,6 +3360,33 @@ fn packedElement(address: usize, ty: usize, index: i64, token: usize) -> (usize,
     return -> (n, made)
 }
 
+// Whether the next element in braces (after its comma unless it is the
+// `first`) designates a member other than `m` (`.payload = 0u`): `m` is
+// left out.
+fn designatesOther(m: usize, first: bool) -> bool {
+    var t = cursor.peek()
+    if !first && tokens.is(t, names.P_COMMA) { t = tokens.next(t) }
+    if !tokens.is(t, names.P_DOT) || tokens.kind(tokens.next(t)) != tokens.IDENT { return false }
+    return tokens.name(tokens.next(t)) != types.member(m).*.name
+}
+
+// Whether the braces at the cursor (after the `{`) hold a pack
+// expansion at their own level.
+fn bracesExpandPack() -> bool {
+    var t = cursor.peek()
+    var level: i64 = 0
+    while !tokens.isEof(t) {
+        if tokens.is(t, names.P_LPAREN) || tokens.is(t, names.P_LBRACKET) || tokens.is(t, names.P_LBRACE) { level += 1 }
+        if tokens.is(t, names.P_RPAREN) || tokens.is(t, names.P_RBRACKET) || tokens.is(t, names.P_RBRACE) {
+            if level == 0 { return false }
+            level -= 1
+        }
+        if level == 0 && tokens.is(t, names.P_ELLIPSIS) { return true }
+        t = tokens.next(t)
+    }
+    return false
+}
+
 fn braceInitializer(address: usize, ty: usize, token: usize) -> usize {
     cursor.expect(names.P_LBRACE)
     const k = types.kind(ty)
@@ -3327,6 +3431,12 @@ fn braceInitializer(address: usize, ty: usize, token: usize) -> usize {
         const args = readArguments(names.P_RBRACE)
         return construct(address, ty, args.0, args.1, token)
     }
+    if (k == types.STRUCT || k == types.UNION) && standard.cpp && bracesExpandPack() {
+        // `IT it { args... }`: the members from the pack's elements (none
+        // for an empty one).
+        const args = readArguments(names.P_RBRACE)
+        return construct(address, ty, args.0, args.1, token)
+    }
     if k == types.STRUCT || k == types.UNION {
         const c = info(ty)
         if c != 0 && at(c).*.hasVirtual { n = setVptr(address, c, token) }
@@ -3335,7 +3445,7 @@ fn braceInitializer(address: usize, ty: usize, token: usize) -> usize {
         while m != 0 {
             const mt = types.member(m).*.ty
             const where = memberAddress(address, m, token)
-            if types.member(m).*.isBase || (types.member(m).*.name == 0 && types.kind(mt) == types.PTR) || cursor.isEnd() {
+            if types.member(m).*.isBase || (types.member(m).*.name == 0 && types.kind(mt) == types.PTR) || cursor.isEnd() || designatesOther(m, first) {
                 // A base, the vtable pointer, or a member the braces leave
                 // out.
                 if !types.member(m).*.isBase && types.member(m).*.name == 0 && types.kind(mt) == types.PTR {
@@ -3350,6 +3460,12 @@ fn braceInitializer(address: usize, ty: usize, token: usize) -> usize {
             } else {
                 if !first { cursor.expect(names.P_COMMA) }
                 first = false
+                // C++20's `.member = value` (the members in order).
+                if cursor.is(names.P_DOT) && tokens.kind(cursor.peekNext()) == tokens.IDENT {
+                    cursor.advance()
+                    cursor.advance()
+                    const ignored = cursor.consume(names.P_ASSIGN)
+                }
                 if cursor.is(names.P_LBRACE) {
                     n = sequence(n, braceInitializer(where, mt, token), token)
                 } else if types.kind(mt) == types.ARRAY && types.at(mt).*.arrayLength > 0 {
@@ -4291,7 +4407,9 @@ pub fn callableFor(binding: usize, nameToken: usize) -> usize {
     const found = boundFunctions(binding)
     var functions = found.0
     var record = found.1
-    if scope.at(binding).*.depth == 0 {
+    // (A class's member found: the class scope hides the namespaces'.)
+    const isMember = functions != 0 && ast.obj(functions).*.classType != 0
+    if scope.at(binding).*.depth == 0 && !isMember {
         var d = scope.currentDepth() + 1
         while d > 0 {
             d -= 1
@@ -4639,6 +4757,10 @@ pub fn callOperator(object: usize, args: usize, count: usize, token: usize) -> u
         }
         tokens.errorAt(token, "the object is not callable")
     }
+    // (`using A::operator(); using B::operator();` of an overload set
+    // made of lambdas: the best of all the bases'.)
+    const across = methodAcrossBases(ty, name, args, count)
+    if across != 0 { return expr.buildCall(methodNode(across, addressOf(object, token), token), args, count, token) }
     return expr.buildCall(memberCalleeNamed(ty, name, m, addressOf(object, token), token), args, count, token)
 }
 
@@ -4721,7 +4843,9 @@ pub fn assignOperator(lhs: usize, rhs: usize, token: usize) -> usize {
         if !convertible(ast.typeOf(rhs), ty) { tokens.errorAt(token, "no operator= for these operands") }
         return assignOperator(lhs, convertValue(rhs, ty), token)
     }
-    // Member by member, the source by its address.
+    // Member by member, the source by its address (an rvalue's members
+    // moved: `operator=(T &&) = default`).
+    const moving = expr.isRvalueArgument(rhs)
     const ptr = newTemp(types.pointerTo(ty), token)
     const target = newTemp(types.pointerTo(ty), token)
     var n = sequence(typed(ast.binary(ast.ASSIGN, variable(ptr, token), addressOf(rhs, token), token)), typed(ast.binary(ast.ASSIGN, variable(target, token), addressOf(lhs, token), token)), token)
@@ -4733,8 +4857,26 @@ pub fn assignOperator(lhs: usize, rhs: usize, token: usize) -> usize {
         ast.node(from).*.member = member
         typing.addType(to)
         typing.addType(from)
-        var e = assignOperator(to, from, token)
-        if e == 0 { e = typed(ast.binary(ast.ASSIGN, to, from, token)) }
+        if moving && !types.isReference(types.member(member).*.ty) { ast.node(from).*.xvalue = true }
+        const mt = types.member(member).*.ty
+        var e: usize = 0
+        if types.kind(mt) == types.ARRAY && types.at(mt).*.arrayLength > 0 {
+            // An array member: element by element.
+            const element = types.baseOf(mt)
+            const loop = countedLoop(number(types.at(mt).*.arrayLength, types.longOf(), token), token)
+            const toElement = deref(elementAddress(addressOf(to, token), element, variable(loop.1, token), token), token)
+            const fromElement = deref(elementAddress(addressOf(from, token), element, variable(loop.1, token), token), token)
+            if moving { ast.node(fromElement).*.xvalue = true }
+            var each = assignOperator(toElement, fromElement, token)
+            if each == 0 { each = typed(ast.binary(ast.ASSIGN, toElement, fromElement, token)) }
+            ast.node(loop.0).*.then = ast.unary(ast.EXPR_STMT, each, token)
+            e = statementExpression(loop.0, token)
+        } else if types.kind(mt) != types.ARRAY {
+            e = assignOperator(to, from, token)
+            if e == 0 { e = typed(ast.binary(ast.ASSIGN, to, from, token)) }
+        } else {
+            e = nothing(token)
+        }
         n = sequence(n, e, token)
         member = types.member(member).*.next
     }
