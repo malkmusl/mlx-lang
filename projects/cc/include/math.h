@@ -22,16 +22,47 @@
 #define FP_ZERO 2
 #define FP_SUBNORMAL 3
 #define FP_NORMAL 4
-#define fpclassify(x) (sizeof(x) == sizeof(float) ? __fpclassifyf(x) : __fpclassify(x))
 int __fpclassify(double);
 int __fpclassifyf(float);
+int __signbit(double);
+int __signbitf(float);
+#ifndef __cplusplus
+#define fpclassify(x) (sizeof(x) == sizeof(float) ? __fpclassifyf(x) : __fpclassify(x))
 #define isnormal(x) (fpclassify(x) == FP_NORMAL)
 #define isnan(x) ((x) != (x))
 #define isinf(x) (!isnan(x) && isnan((x) - (x)))
 #define isfinite(x) (!isnan((x) - (x)))
 #define signbit(x) (sizeof(x) == sizeof(float) ? __signbitf(x) : __signbit(x))
-int __signbit(double);
-int __signbitf(float);
+#else
+/* C++: the classification macros are functions (std::isnan(x) has to
+   stay a call), one per floating type. */
+extern "C++" {
+inline int fpclassify(float x) { return __fpclassifyf(x); }
+inline int fpclassify(double x) { return __fpclassify(x); }
+inline int fpclassify(long double x) { return x != x ? FP_NAN : __fpclassify((double)x); }
+inline bool isnan(float x) { return x != x; }
+inline bool isnan(double x) { return x != x; }
+inline bool isnan(long double x) { return x != x; }
+inline bool isinf(float x) { return x == x && (x - x) != (x - x); }
+inline bool isinf(double x) { return x == x && (x - x) != (x - x); }
+inline bool isinf(long double x) { return x == x && (x - x) != (x - x); }
+inline bool isfinite(float x) { return (x - x) == (x - x); }
+inline bool isfinite(double x) { return (x - x) == (x - x); }
+inline bool isfinite(long double x) { return (x - x) == (x - x); }
+inline bool isnormal(float x) { return __fpclassifyf(x) == FP_NORMAL; }
+inline bool isnormal(double x) { return __fpclassify(x) == FP_NORMAL; }
+inline bool isnormal(long double x) { return fpclassify(x) == FP_NORMAL; }
+inline bool signbit(float x) { return __signbitf(x) != 0; }
+inline bool signbit(double x) { return __signbit(x) != 0; }
+inline bool signbit(long double x) { return __signbit((double)x) != 0; }
+inline bool isunordered(double a, double b) { return a != a || b != b; }
+inline bool isgreater(double a, double b) { return !isunordered(a, b) && a > b; }
+inline bool isgreaterequal(double a, double b) { return !isunordered(a, b) && a >= b; }
+inline bool isless(double a, double b) { return !isunordered(a, b) && a < b; }
+inline bool islessequal(double a, double b) { return !isunordered(a, b) && a <= b; }
+inline bool islessgreater(double a, double b) { return !isunordered(a, b) && a != b; }
+}
+#endif
 double sin(double);
 double cos(double);
 double tan(double);

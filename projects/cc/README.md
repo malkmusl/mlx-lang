@@ -373,7 +373,96 @@ argument is told apart by its tokens (`enable_if<!C>` is not
 a `T &` parameter; a constructor template's brace initializers
 (`: value{ true }`) are passed over with it; a trailing return type
 names the expanded parameter pack (`-> decltype(f(as...))`)
-(`tests/cpp/members.cpp`).
+(`tests/cpp/members.cpp`). Pointers to members (`int P::*`, `int
+(P::*)(int) const`, `&P::x`, `&P::f`, `obj.*pm`, `p->*pm`, calls
+through them, `R T::*` deduced in templates; a data member's pointer
+is its offset plus one, a member function's its address, so a virtual
+one is called as the class's own; `tests/cpp/memberptrs.cpp`). The
+detection idiom (`struct has_size<T, void_t<decltype(declval<T>()
+.size())>>`): a partial specialization's arguments that deduction
+passes over are read again with the parameters deduced and must name
+what was given (`tests/cpp/detection.cpp`); in a pattern a dependent
+`decltype(...)` and a trailing return type are known per instance
+only, so nothing is instantiated for them early. `auto` parameters
+make abbreviated function templates (`int twice(auto x)`, `const
+std::invocable<> auto &f`, `auto... xs`, in classes too: the
+parameters are invented, the constraint dropped) and generic lambdas
+(their `operator()` a member template, capturing what their body names
+of the function's locals); `T x{a, b}` and `T x = {a, b}` call an
+`initializer_list` constructor (`std::vector` has one, and one from an
+iterator range); member alias templates, deleted function templates
+(left out of overloads), `[[nodiscard]]` after a template header,
+brace-initialized variable templates and `T::member` in a template's
+signature are read (`tests/cpp/generic.cpp`). A lambda may have
+template parameters of its own (`[]<size_t... N>(index_sequence<N...>)
+{...}`); the rewrites behind `auto` parameters work on copies of the
+tokens, so a template or concept holding them is read again as it was
+written. A plain unqualified call that names nothing visible looks in
+the namespaces of its arguments' classes and enums (`is_lt(ordering)`
+is std's), and an operator in both operands' namespaces; an `auto`
+global's initializer is read once (a lambda there is one closure);
+`<ranges>` has `views::transform` and `views::reverse`, called or
+piped (`tests/cpp/views.cpp`). Structured bindings (`auto [y, m, d] =
+f();`, `auto &[k, v] : map`, `const auto &[a, b]`) bind each name as a
+reference to a part of a hidden variable: an aggregate's data member,
+`std::get<i>` of a `std::tuple` or `std::array`, an array's element
+(copied element by element when bound by value). `return {a, b};`,
+`x = {a, b}` and nested braces in an initializer list (`{ {1, 2}, {3,
+4} }`) make the type wanted from the braces, and an array member takes
+its elements without braces of its own (brace elision, SIMDe's vector
+unions; `tests/cpp/bindings.cpp`). The forms WTF's headers use
+(`tests/cpp/wtfforms.cpp`): `class X final`, `class [[nodiscard]] X`,
+`consteval` (compiled as constexpr) and `if consteval` (the run-time
+branch), `constinit`, a constructor delegating to a defaulted one,
+`X<U>::template f<T>()` and `x.template f<T>()`, friend classes named
+with a qualifier or a template header, a parameter pack used in a
+lambda (each element captured as a member of its own), constrained
+`Concept auto` parameters (the concept kept as the invented
+parameter's constraint), an explicit template header with `auto`
+parameters too, a function template declared before its definition
+(its instances wait for the body), an explicit specialization whose
+parameter only the result names, `f<int>(...)` where functions named
+f were declared after the template, a global whose value is no
+constant (`int g = f();`, computed when the program starts), function
+pointers as template arguments (`template <void (*f)(T *)>`, the
+function bound by the parameter's name), class template argument
+deduction through deduction guides (`Locker(Lock &) -> Locker<Lock>;`
+becomes a hidden function whose result the declaration's initializer
+picks), defaulted comparisons (`bool operator==(const X &) const =
+default;`, a friend `operator<=>` that brings `==` with it: member by
+member, bases first, `std::partial_ordering` over floating members),
+nested namespace definitions (`namespace A::B { }`), placement new with
+several arguments (the class's operator new, else the global one; a
+class's operator new and delete are static), a constrained partial
+specialization naming itself in its body, and a class assigned from
+another type through any of its constructors (`span<T>` to `span<const
+T>`). `<string_view>` (with `std::char_traits` and `""sv`; `std::string`
+converts to a view and is made from one), and `<cmath>` with float,
+long double and integer overloads and the classification functions as
+calls (`std::isnan`; in C++ `math.h` declares them as functions, not
+macros; `tests/cpp/cmath.cpp`). `extern "C++" { }` gives C++ linkage
+back inside a C header, and a C function of another signature is
+overloaded rather than redeclared. `__attribute__((weak))` and C++17
+`inline` variables are weak symbols. `_Pragma("...")` is read and left
+without effect, as an unknown `#pragma` is; `__builtin_sqrt`,
+`__builtin_roundevenf` and the other math builtins call libm (roundeven
+as rint); GCC's `__ATOMIC_*` orders are predefined; `vector_size`
+(GCC's vector types) is refused rather than ignored. A braced list is
+an argument too (`f({a, b})`: overloads take it as a conversion to a
+class, or to a scalar when it has one element at most; a template
+deduces nothing from it; the parameter's type is made from it once the
+function is chosen); `T{a, {b}}` makes a class as `T x{a, {b}}` does;
+class template argument deduction works in expressions (`std::span {
+first, last }`) and the standard headers declare their guides (`span`,
+`pair`, `array`, `tuple`, `optional`); `decltype(auto)` is deduced as
+`auto`; an argument for a parameter whose type was given explicitly
+converts to it (`f<unsigned char>('A')`); `is_integral` and
+`make_signed`/`make_unsigned` know every integer and character type
+and enums; a static member template keeps `static` when defined
+outside its class (next to an overload of its name); what braces leave
+out of a C++ aggregate is zero (`T x { }`, `int a[4]{9}`), and a
+default member initializer may be any braced list
+(`tests/cpp/deduction.cpp`).
 The atomic builtins (`__atomic_load_n`, `__atomic_fetch_add`,
 `__atomic_compare_exchange_n`, the `__sync_*` family, `atomics.mlx`)
 are locked x86 instructions (`xadd`, `xchg`, `cmpxchg`, `mfence`) on
@@ -398,23 +487,24 @@ C's `getline` and `std::getline` both apply where `using namespace std`
 is in force: the functions a using-directive brings in join the
 overloads of a name. Not there yet:
 a pack of a base list (`struct X : Bases...`), a pack in a lambda's
-captures,
-generic lambdas (`auto` parameters), a lambda converting to a function
-pointer, init-captures, inline assembly with operands, constant
+explicit captures,
+a lambda converting to a function pointer, init-captures, a generic
+lambda capturing `this` implicitly, a lambda called in a constant
+expression (a concept holding one is false), constant
 evaluation of `<=>`, friend functions of a class template made only
 when used (they are made with the instance), class template argument
-deduction
-(`std::pair p(1, 2)`, `std::lock_guard lock(m)`: the arguments must be
-written), structured bindings,
+deduction from constructors alone (without a deduction guide the
+arguments must be written), structured bindings in an `if` or `switch`
+condition, multiple inheritance (one base per class),
 exceptions (`try`, `throw` are refused),
-multiple inheritance, a polymorphic class over a base without a vtable,
+a polymorphic class over a base without a vtable,
 `constexpr` over classes, pointers or floating-point values,
-`consteval`, destruction of globals at exit, a diagnosis
+destruction of globals at exit, a diagnosis
 of writing through const (`const int x; x = 2` and `mutable` pass:
 const chooses overloads and member functions only), a local class's member
 functions naming the function's locals or the class itself,
-user-defined `operator new` (the built-in `new` calls `_Znwm`, which
-mlxlibcpp provides). The mangled names leave out the ABI's
+a replaced or class-specific `operator new` for `new T` without
+placement arguments (it calls `_Znwm`, which mlxlibcpp provides). The mangled names leave out the ABI's
 substitutions (`S_`), so a name with a repeated parameter type
 differs from g++'s; constructors have only their `C1` symbol. Programs are linked to
 glibc without symbol versions, so a symbol glibc keeps in two
@@ -449,7 +539,10 @@ into every C++ program by itself as `libmlxcpp.a` from `$MLX_CC_LIB`,
   both C libraries with gcc's output).
 - No variable-length arrays, `_Atomic` qualifier (the `__atomic_*` and
   `__sync_*` builtins are there), `_Thread_local` (declared, but a
-  plain global), `_Complex`, inline `asm`, computed `goto`.
+  plain global), `_Complex`, computed `goto`, GCC vector types. Inline
+  `asm` is the instructions `builtins.mlx` knows: the fences, `pause`,
+  `int3`, `ud2`, `nop`, and with register operands (`"=a"`, `"+b"`,
+  `"r"`, `"0"`) `cpuid`, `rdtsc` and `movq %%rsp, %0`.
 - `va_arg` of a struct of 16 bytes or less reads it from the stack, where
   only larger ones are.
 - No optimization: the code is correct and slow.

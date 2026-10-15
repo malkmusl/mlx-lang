@@ -1,6 +1,7 @@
 // GCC's builtins: the bit builtins (clz, ctz, popcount, bswap, ffs on
 // every width, zero included), asm statements of one instruction (a
-// compiler fence, pause, nop), and the builtins that are plain C
+// compiler fence, pause, nop) and with register operands (cpuid,
+// rdtsc, reading the stack pointer), and the builtins that are plain C
 // (memcpy, expect, isnan, inf, object_size).
 #include <stdio.h>
 #include <string.h>
@@ -29,5 +30,22 @@ int main(void) {
     __asm__("nop");
     __asm__ __volatile__("mfence");
     printf("asm ok\n");
+    long a = 0, b, c, d;
+    asm volatile("cpuid" : "+a"(a), "=b"(b), "=c"(c), "=d"(d) : : "memory");
+    char vendor[13];
+    memcpy(vendor, &b, 4);
+    memcpy(vendor + 4, &d, 4);
+    memcpy(vendor + 8, &c, 4);
+    vendor[12] = 0;
+    unsigned leaf = 1, eax, ebx, ecx, edx;
+    __asm__("cpuid" : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx) : "0"(leaf), "2"(0));
+    printf("cpuid %d %d %d\n", a > 0, (int)strlen(vendor), eax != 0);
+    unsigned lo, hi, lo2, hi2;
+    asm volatile("rdtsc" : "=a"(lo), "=d"(hi));
+    asm volatile("rdtsc" : "=a"(lo2), "=d"(hi2));
+    printf("rdtsc %d\n", (((unsigned long long)hi2 << 32) | lo2) >= (((unsigned long long)hi << 32) | lo));
+    void *sp = 0;
+    __asm__ volatile("movq %%rsp, %0" : "=r"(sp) ::);
+    printf("sp %d\n", (char *)&sp - (char *)sp < 4096 && (char *)&sp - (char *)sp > -4096);
     return 0;
 }

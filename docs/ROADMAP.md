@@ -154,8 +154,14 @@ headers), and `HashMap.h`, `Int128.h`, `MathExtras.h`, `Seconds.h`,
 g++'s builds in `tests/cpp/threads.cpp` and `filesystem.cpp`), and
 the language gaps they showed are closed one by one (member aliases,
 inline namespaces, generic callables, SFINAE through alias
-templates). Every WTF source now stops at pointers to members
-(`R T::*pmf`, mpark's variant and `RunLoop` timers), which come next.
+templates). Pointers to members, structured bindings, class template
+argument deduction, defaulted comparisons, `<string_view>`, a full
+`<cmath>`, function pointers as template arguments, inline `asm` with
+register operands (`cpuid`) and the C++17/20 forms WTF's headers use
+followed: 40 of WTF's 174 `.cpp` files compile (`BitVector.cpp` among
+them), with one WebKit patch (`projects/cc/webkit/`: SIMDe's portable
+paths without SSE2). Multiple inheritance (`StringImpl`, `WorkQueue`,
+the weak-pointer mixins) is next.
 The target is WPEWebKit
 (a browser engine of our own is out of reach; a C and C++ compiler of
 our own over mlxlibc and mlxlibcpp keeps the whole stack ours), so the
