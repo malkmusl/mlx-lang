@@ -329,7 +329,17 @@ specializations, mangled `x`, `a`, `w`, `Ds`, `Di`); a class template
 named in a typedef or an alias (`using X = T<A>;`) is not instantiated
 until something needs it whole (an object, a member, its size, pointer
 arithmetic, a qualified name), as C++ says; `__PRETTY_FUNCTION__`,
-`__VA_OPT__` and GNU's `, ## __VA_ARGS__` are there.
+`__VA_OPT__` and GNU's `, ## __VA_ARGS__` are there. User-defined
+literals (`3_s`, `1.5_s`, `"text"_s`: a call of `operator""_s` with the
+integer as unsigned long long, the floating value as long double, a
+string with its length; `tests/cpp/literals.cpp`); `a != b` and
+`b == a` rewritten from `operator==` (C++20); `__int128` and its
+typedefs as `_BitInt(128)`; default template arguments of function
+templates (`class = enable_if_t<...>`) taken in deduction, as SFINAE;
+member operator templates (`template <class U> T &operator=(U &&)`);
+friend functions read in their class (its own name is its instance
+there); `if (T *p = f())`; `std::variant` in `<variant>`
+(`tests/cpp/variant.cpp`).
 The atomic builtins (`__atomic_load_n`, `__atomic_fetch_add`,
 `__atomic_compare_exchange_n`, the `__sync_*` family, `atomics.mlx`)
 are locked x86 instructions (`xadd`, `xchg`, `cmpxchg`, `mfence`) on
@@ -356,9 +366,10 @@ overloads of a name. Not there yet:
 a pack of a base list (`struct X : Bases...`), a pack in a lambda's
 captures,
 generic lambdas (`auto` parameters), a lambda converting to a function
-pointer, init-captures, inline assembly with operands, `!=` rewritten
-from `==` (C++20), constant evaluation of `<=>`, class template
-argument deduction
+pointer, init-captures, inline assembly with operands, constant
+evaluation of `<=>`, friend functions of a class template made only
+when used (they are made with the instance), class template argument
+deduction
 (`std::pair p(1, 2)`, `std::lock_guard lock(m)`: the arguments must be
 written), `<=>`, structured bindings, template template parameters,
 exceptions (`try`, `throw` are refused),
@@ -379,7 +390,7 @@ standard library is mlxlibcpp (`projects/libcpp`: `<string>`,
 `<concepts>`, `<initializer_list>`, `<limits>`, `<bit>`, `<array>`,
 `<span>`, `<tuple>`, `<optional>`, `<expected>`, `<iterator>`,
 `<functional>`, `<atomic>`, `<mutex>`, `<exception>`, `<iosfwd>`,
-`<numbers>`, the `c*` headers, `<ranges>` with the range concepts and
+`<numbers>`, `<variant>`, the `c*` headers, `<ranges>` with the range concepts and
 the whole-range algorithms, and `<compare>` as a stub, under
 `include/c++`), linked
 into every C++ program by itself as `libmlxcpp.a` from `$MLX_CC_LIB`,

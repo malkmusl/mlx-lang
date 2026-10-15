@@ -146,7 +146,9 @@ do. Of WTF's headers `Assertions.h`, `StdLibExtras.h`, `Vector.h`,
 `RefPtr.h`, `Ref.h`, `HashSet.h`, `Deque.h`, `Function.h`, `Lock.h`,
 `WeakPtr.h`, `ThreadSafeRefCounted.h`, `URL.h` and `text/WTFString.h`,
 `text/StringBuilder.h`, `text/AtomString.h` compile (against ICU's
-headers); `HashMap.h` waits on `Int128.h` (`!=` rewritten from `==`).
+headers), and `HashMap.h`, `Int128.h`, `MathExtras.h`, `Seconds.h`,
+`WallTime.h`, `text/StringImpl.h` and `text/StringView.h` with them
+(user-defined literals, `__int128`). Next: WTF's `.cpp` files.
 The target is WPEWebKit
 (a browser engine of our own is out of reach; a C and C++ compiler of
 our own over mlxlibc and mlxlibcpp keeps the whole stack ours), so the
