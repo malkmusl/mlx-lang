@@ -538,7 +538,23 @@ members (`template <size_t length> C(const char (&)[length])` beside a
 `base::member` of a base by its typedef; const and non-const member
 template overloads (mangled `_ZNK`, chosen by the object's constness);
 `&N` of a constexpr variable; a class template's instance named before
-its only partial specialization was defined. 92 of WTF's 174 `.cpp`
+its only partial specialization was defined. Polymorphic bases after
+the first (`tests/cpp/polybases.cpp`): the vtable is ours, its first
+word the offset from the subobject to the whole object, then per slot
+the function and the adjustment of `this` it takes; a class has a
+secondary vtable for each polymorphic subobject not at offset 0, whose
+slots hold the class's final overriders, so a call through any base
+reaches the override and `delete` through any base frees the whole
+object; a polymorphic base goes first in the layout, and a class with
+virtual functions over bases without any has its own vtable pointer
+first. Constructors and destructors defaulted outside the class, and a
+class template's friend functions made when used, followed; then
+init-captures (`[f = std::move(f), &r = x, n{3}]`, a member made from
+its initializer, `tests/cpp/lambdas2.cpp`), the implicit move
+constructor moving the members of an rvalue, a base's scoped enum
+named in a constructor's initializer (`Type::Serial`), C++20's
+destroying `operator delete` (and a class's own `operator delete`
+used by `delete`), `p->T::~T()`. 92 of WTF's 174 `.cpp`
 files compile.
 The atomic builtins (`__atomic_load_n`, `__atomic_fetch_add`,
 `__atomic_compare_exchange_n`, the `__sync_*` family, `atomics.mlx`)
@@ -563,19 +579,16 @@ runs them (`tools/check_cpp.sh`, on glibc and on mlxlibc).
 C's `getline` and `std::getline` both apply where `using namespace std`
 is in force: the functions a using-directive brings in join the
 overloads of a name. Not there yet:
-a pack in a lambda's explicit captures,
-a lambda converting to a function pointer, init-captures, a generic
+a pack in a lambda's explicit captures, a generic
 lambda capturing `this` implicitly, a lambda with captures in a
 constant expression, constant
-evaluation of `<=>`, friend functions of a class template made only
-when used (they are made with the instance), structured bindings in an
-`if` or `switch` condition, a polymorphic base after the first
-(virtual calls through it would need thunks), virtual bases, a data
+evaluation of `<=>`, structured bindings in an
+`if` or `switch` condition, virtual bases, `dynamic_cast` and
+`typeid`, a data
 member of the class named in a declaration inside it (`auto get() ->
 decltype(x)`; in a member template's signature it is seen), overloads
 of a name joined across bases by `using B::f...;`,
 exceptions (`try`, `throw` are refused),
-a polymorphic class over a base without a vtable,
 `constexpr` over classes, pointers or floating-point values,
 destruction of globals at exit, a diagnosis
 of writing through const (`const int x; x = 2` and `mutable` pass:
