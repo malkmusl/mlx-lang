@@ -167,9 +167,11 @@ pack expansions in base lists and braced lists, inherited
 constructors, surrogate calls, `decltype`'s value categories, implicit
 deduction guides, SFINAE through `void_t` (class and variable
 templates), narrowing in braced conversions and constexpr lambdas;
-`Variant` builds and runs, and `Assertions.cpp` compiles to the end of
-`text/StringImpl.h`. Errors inside templates name the instances that
-led there.
+`Variant` builds and runs, and `Assertions.cpp` compiles whole (GCC's
+overflow builtins, constexpr calls returning references, the copy
+deduction candidate, forwarding references in packs, overloaded member
+templates defined outside their class). Errors inside templates name
+the instances that led there.
 The target is WPEWebKit
 (a browser engine of our own is out of reach; a C and C++ compiler of
 our own over mlxlibc and mlxlibcpp keeps the whole stack ours), so the

@@ -47,5 +47,16 @@ int main(void) {
     void *sp = 0;
     __asm__ volatile("movq %%rsp, %0" : "=r"(sp) ::);
     printf("sp %d\n", (char *)&sp - (char *)sp < 4096 && (char *)&sp - (char *)sp > -4096);
+    // The overflow builtins: the exact result, kept as the target's type.
+    unsigned long ur;
+    int ir;
+    long lr;
+    unsigned uu;
+    int o1 = __builtin_mul_overflow(0xffffffffffffffffUL, 2UL, &ur);
+    int o2 = __builtin_add_overflow(2147483647, 1, &ir);
+    int o3 = __builtin_sub_overflow(0u, 1u, &uu);
+    int o4 = __builtin_mul_overflow(-9223372036854775807L - 1, -1L, &lr);
+    int o5 = __builtin_add_overflow(-5, 3, &ir);
+    printf("overflow %d %lu %d %d %u %d %d %d\n", o1, ur, o2, o3, uu, o4, o5, ir);
     return 0;
 }

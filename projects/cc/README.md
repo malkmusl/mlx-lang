@@ -491,7 +491,25 @@ complete yet is made when something needs it whole, and a function's
 body is not made for a call in an unevaluated operand
 (`tests/cpp/deduce2.cpp`, `sfinae.cpp`, `packs2.cpp`, `classes2.cpp`).
 An error inside a template instance names the instances being read and
-where each was needed.
+where each was needed. WTF's `Assertions.cpp` compiles with what came
+next (`tests/cpp/wtfforms2.cpp`, `wtfforms3.cpp`): GCC's
+`__builtin_add_overflow`, `sub` and `mul` (computed exactly in a
+130-bit integer); a member's default argument read when a call needs
+it (it may name members declared later); a class nested in a class or
+a class template defined outside it (`template <..> class Outer::Inner
+{...}`); a constexpr function reading a string literal, taking a
+constant by `const T &` or returning a reference (`std::max(a, b)` in
+a constant); `{vs...}` in braces; base classes' enumerators and member
+types; `x.f<N>()`; `static_assert` as a statement (`else
+static_assert(...);`); `[[maybe_unused]]` on a parameter; `using
+N::Class;` naming the class; `T(x).f();` and `M<T>(new (p) T);` as
+expressions; the copy deduction candidate (`RefPtr r = makeRef();`
+deduces `RefPtr`'s own arguments); a non-const `T &` binding no
+temporary; forwarding references in packs (`Args &&...` keeps lvalues as
+`T &`; `is_rvalue_reference<T &>` is false); overloaded member templates
+of a class template each defined outside; and a constrained function
+template declared only (`template <signed_integral S> S f(S, S);`)
+kept apart from another constraint's definition.
 The atomic builtins (`__atomic_load_n`, `__atomic_fetch_add`,
 `__atomic_compare_exchange_n`, the `__sync_*` family, `atomics.mlx`)
 are locked x86 instructions (`xadd`, `xchg`, `cmpxchg`, `mfence`) on
