@@ -58,7 +58,7 @@ pub fn conversionRank(from: usize, to: usize) -> i64 {
         } else if !types.isScalar(plain) || count > 1 {
             return 0
         }
-        if element != 0 && (cpp.narrows(element, elementTarget, cpp.bracedConstant(from)) || conversionRank(element, elementTarget) == 0) { return 0 }
+        if element != 0 && ((count == 1 && cpp.narrows(element, elementTarget, cpp.bracedConstant(from))) || conversionRank(element, elementTarget) == 0) { return 0 }
         return 2
     }
     if types.compatible(from, target) {
@@ -822,6 +822,34 @@ pub fn isRvalueArgument(n: usize) -> bool {
     return !typing.isLvalue(n)
 }
 
+// The global holding the value of the constant `binding` (a constexpr
+// integer variable, kept as its value), made once.
+var constantObjects: usize = 0
+fn constantObject(binding: usize, token: usize) -> usize {
+    var c = constantObjects
+    while c != 0 {
+        if base.getWord(c) == binding { return base.getWord(c + 8) }
+        c = base.getWord(c + 16)
+    }
+    const ty = types.constOf(scope.at(binding).*.ty)
+    const o = decl.newAnonymousGlobal(ty, token)
+    const size = types.size(ty)
+    const data = base.alloc(@intCast(usize, if size > 0 { size } else { 1 }))
+    var i: i64 = 0
+    const value = @bitCast(u64, scope.at(binding).*.value)
+    while i < size {
+        base.put8(data + @intCast(usize, i), @intCast(u8, (value >> @intCast(u6, i * 8)) & 255))
+        i += 1
+    }
+    ast.obj(o).*.initData = data
+    const cell = base.alloc(24)
+    base.putWord(cell, binding)
+    base.putWord(cell + 8, o)
+    base.putWord(cell + 16, constantObjects)
+    constantObjects = cell
+    return o
+}
+
 // Expressions being read for their type only (decltype, sizeof,
 // noexcept): nothing in them is called.
 pub var unevaluated: u32 = 0
@@ -845,10 +873,19 @@ fn unary() -> usize {
             const pm = cpp.memberPointerConstant()
             if pm != 0 { return pm }
         }
+        const operandToken = cursor.peek()
         const operand = castExpression()
         typing.addType(operand)
         if ast.kindOf(operand) == ast.MEMBER && types.member(ast.node(operand).*.member).*.bitWidth != 0 {
             tokens.errorAt(token, "cannot take the address of a bit-field")
+        }
+        // `&empty` of `static constexpr char8_t empty = 0;` (kept as its
+        // value): a constant object holding it.
+        if standard.cpp && ast.kindOf(operand) == ast.NUM && tokens.kind(operandToken) == tokens.IDENT {
+            const binding = scope.find(tokens.name(operandToken))
+            if binding != 0 && scope.at(binding).*.kind == scope.ENUM_CONSTANT && types.kind(scope.at(binding).*.ty) != types.ENUM {
+                return ast.unary(ast.ADDR, ast.variableNode(constantObject(binding, token), token), token)
+            }
         }
         return ast.unary(ast.ADDR, operand, token)
     }
@@ -904,6 +941,27 @@ pub fn findMember(ty: usize, name: u32) -> usize {
     return 0
 }
 
+// Whether `binding` (a namespace scope's) is bound under a prefix inside
+// the current member function's class (a member template's own
+// parameter, `template <size_t length> C(const char (&)[length])`
+// beside a member `length()`): it comes before the class's members.
+fn boundInsideClass(binding: usize) -> bool {
+    if binding == 0 { return false }
+    const classTy = state.currentClass()
+    if classTy == 0 { return false }
+    const classPrefix = types.at(classTy).*.name
+    const own = scope.parentOf(scope.at(binding).*.name)
+    if own == 0 || own == classPrefix { return false }
+    var p = scope.parentOf(own)
+    var steps: u32 = 0
+    while p != 0 && steps < 64 {
+        if p == classPrefix { return true }
+        p = scope.parentOf(p)
+        steps += 1
+    }
+    return false
+}
+
 // SFINAE: an expression that cannot be read (in a requires
 // expression, a constraint, an instance's signature) marks the
 // candidate as not viable and stands as 0.
@@ -920,7 +978,10 @@ pub fn structReference(operand: usize, nameToken: usize) -> usize {
         if decl.sfinae { return softFailure(nameToken) }
         tokens.errorAt(nameToken, "not a struct nor a union")
     }
-    if types.at(ty).*.incomplete { tokens.errorAt(nameToken, "incomplete struct or union") }
+    if types.at(ty).*.incomplete {
+        if decl.sfinae { return softFailure(nameToken) }
+        tokens.errorAt(nameToken, "incomplete struct or union")
+    }
     var n = operand
     while true {
         const m = findMember(ty, tokens.name(nameToken))
@@ -1568,7 +1629,18 @@ pub fn buildCall(callee: usize, givenArgs: usize, givenCount: usize, token: usiz
         // function of the name (its overloads) when that fits better
         // (or as well: a function wins over a template).
         const holder = ast.obj(ast.node(callee).*.variable)
+        // (A member template called on a const object: its const
+        // overloads only.)
+        const object = ast.node(callee).*.lhs
+        const outerConst = template.objectConstness
+        template.objectConstness = 0
+        if object != 0 {
+            typing.addType(object)
+            const ot = ast.typeOf(object)
+            if types.kind(ot) == types.PTR { template.objectConstness = if types.isConst(types.baseOf(ot)) { 2 } else { 1 } }
+        }
         const instance = template.callInstance(holder.*.template, givenArgs, givenCount, holder.*.templateArgs)
+        template.objectConstness = outerConst
         var chosen = instance
         var score: i64 = if instance != 0 { argumentScore(instance, givenArgs, givenCount) } else { -1 }
         // A member function's object is not among the arguments.
@@ -1984,11 +2056,17 @@ fn primary() -> usize {
             nameToken = if cursor.is(names.K_OPERATOR) { cpp.operatorNameToken() } else { cursor.expectIdent() }
             binding = scope.findQualified(read.0, tokens.name(nameToken), false)
             if binding == 0 { binding = cpp.findInherited(read.0, tokens.name(nameToken), false) }
-            if binding == 0 && unevaluated > 0 && cpp.classWithPrefix(read.0) != 0 && findMember(cpp.classWithPrefix(read.0), tokens.name(nameToken)) != 0 {
+            if binding == 0 && cpp.classWithPrefix(read.0) != 0 && findMember(cpp.classWithPrefix(read.0), tokens.name(nameToken)) != 0 {
                 // `sizeof(C::member)`: a data member named by its class
-                // where nothing is evaluated.
+                // where nothing is evaluated; `base::s` in a member
+                // function: this object's (as a base's).
                 const classTy = cpp.classWithPrefix(read.0)
-                return structReference(cpp.nullObject(classTy, nameToken), nameToken)
+                const thisBinding = scope.find(names.K_THIS)
+                if thisBinding != 0 && scope.at(thisBinding).*.kind == scope.VARIABLE && unevaluated == 0 {
+                    const self = cpp.thisPointer(nameToken)
+                    return structReference(ast.unary(ast.DEREF, typing.cast(self, types.pointerTo(classTy)), nameToken), nameToken)
+                }
+                if unevaluated > 0 { return structReference(cpp.nullObject(classTy, nameToken), nameToken) }
             }
             if binding == 0 && decl.sfinae {
                 // Not there: the instance being read is not viable.
@@ -2004,7 +2082,7 @@ fn primary() -> usize {
             cursor.advance()
             binding = scope.find(tokens.name(token))
         }
-        if standard.cpp && (binding == 0 || scope.at(binding).*.depth == 0) && nameToken == token {
+        if standard.cpp && (binding == 0 || scope.at(binding).*.depth == 0) && nameToken == token && !boundInsideClass(binding) {
             // In a member function the class's members come before the
             // names of the namespaces around; in a lambda the function's
             // locals and the enclosing class's members are captured.

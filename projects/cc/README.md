@@ -525,6 +525,21 @@ underlying_type<E>::type c = ...`); a free template's defaults kept
 from its declaration; `x.f<T>(...)` beside a plain `f`; and at most
 one user-defined conversion in an implicit conversion (a copy
 constructor takes no value that would need its own class made).
+`tests/cpp/wtfforms5.cpp` adds: a lambda without captures converting
+to a pointer to a function (a static invoker read from its tokens); a
+constructor template in an implicit conversion (not an `explicit`
+one); a member template's own parameters found before its class's
+members (`template <size_t length> C(const char (&)[length])` beside a
+`length()`); `T (&&)[N]` and `initializer_list<T>` deduced from braces
+(`toArray<uint16_t>({...})`, `std::max({3, 8, 2})`); `std::to_array`,
+`lower_bound`, `binary_search`, `is_sorted`, `min_element`, `any_of`,
+`copy_n`, `rotate`, `clamp` and the like, and `std::ranges::sort`,
+`find`, `count`, `all_of`, ...; `static T x { ... }` of an aggregate;
+`base::member` of a base by its typedef; const and non-const member
+template overloads (mangled `_ZNK`, chosen by the object's constness);
+`&N` of a constexpr variable; a class template's instance named before
+its only partial specialization was defined. 92 of WTF's 174 `.cpp`
+files compile.
 The atomic builtins (`__atomic_load_n`, `__atomic_fetch_add`,
 `__atomic_compare_exchange_n`, the `__sync_*` family, `atomics.mlx`)
 are locked x86 instructions (`xadd`, `xchg`, `cmpxchg`, `mfence`) on
