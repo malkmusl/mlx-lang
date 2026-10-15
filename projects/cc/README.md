@@ -295,7 +295,28 @@ constraints evaluated per instance; a pattern over a pack
 too; a template given some arguments and deducing the rest
 (`make_shared<T>(args...)`); member class templates (`template <class
 F> struct Held` inside a class, as `std::function` keeps its callable);
-a partial specialization over a function type (`function<R(Args...)>`).
+a partial specialization over a function type (`function<R(Args...)>`);
+template template parameters (`template <template <class...> class L,
+class... Ts> struct Count<L<Ts...>>`, `Apply<Box, int>`, deduced from
+instances in function templates and partial specializations,
+`tests/cpp/ttparams.cpp`); function templates of one name whose
+parameters differ in kind (`f<size_t N>` and `f<typename T>`); `using
+enum E;`. C++ files are compiled with `__GNUC__` defined (13.2: WebKit
+and bmalloc insist on a GCC-compatible compiler; C files are not, Lua
+would take it as a licence for computed goto), with `__attribute` as
+`__attribute__`, and with GCC's builtins: the bit builtins
+(`__builtin_clz`, `ctz`, `popcount`, `bswap`, `ffs`, `builtins.mlx`,
+as bsr, bsf, popcnt and bswap instructions, constant-folded in
+constexpr code), `asm` statements of one operand-less instruction
+(`asm volatile("" ::: "memory")` as a compiler fence, `pause`, `int3`,
+`nop`, the fences, `ud2`: `__builtin_trap`), and the builtins that are
+plain C as predefined macros (`__builtin_memcpy`, `__builtin_expect`,
+`__builtin_isnan`, `__builtin_inf`, `__builtin_constant_p` as 0, ...;
+`tests/builtins.c` against gcc). `<emmintrin.h>` (and `xmmintrin.h`,
+`smmintrin.h`, `immintrin.h`, `x86intrin.h`) gives the few SSE
+intrinsics programs use for scalar conversions (`_mm_cvttsd_si64`,
+`_mm_set_sd`, the 128-bit loads and stores, `_mm_pause`) as plain
+functions over a 16-byte struct.
 The atomic builtins (`__atomic_load_n`, `__atomic_fetch_add`,
 `__atomic_compare_exchange_n`, the `__sync_*` family, `atomics.mlx`)
 are locked x86 instructions (`xadd`, `xchg`, `cmpxchg`, `mfence`) on
@@ -322,7 +343,11 @@ overloads of a name. Not there yet:
 a pack of a base list (`struct X : Bases...`), a pack in a lambda's
 captures,
 generic lambdas (`auto` parameters), a lambda converting to a function
-pointer, init-captures, class template argument deduction
+pointer, init-captures, `long long` as a type of its own (it is `long`,
+so `f(long)` and `f(long long)` are one function), a class template
+named in a typedef without being instantiated (`using X = T<A>;`
+instantiates `T<A>` at once), inline assembly with operands, class
+template argument deduction
 (`std::pair p(1, 2)`, `std::lock_guard lock(m)`: the arguments must be
 written), `<=>`, structured bindings, template template parameters,
 exceptions (`try`, `throw` are refused),
@@ -342,8 +367,10 @@ standard library is mlxlibcpp (`projects/libcpp`: `<string>`,
 `<utility>`, `<algorithm>`, `<numeric>`, `<new>`, `<type_traits>`,
 `<concepts>`, `<initializer_list>`, `<limits>`, `<bit>`, `<array>`,
 `<span>`, `<tuple>`, `<optional>`, `<expected>`, `<iterator>`,
-`<functional>`, `<atomic>`, `<mutex>`, the `c*` headers, and `<compare>`
-and `<ranges>` as stubs, under `include/c++`), linked
+`<functional>`, `<atomic>`, `<mutex>`, `<exception>`, `<iosfwd>`,
+`<numbers>`, the `c*` headers, `<ranges>` with the range concepts and
+the whole-range algorithms, and `<compare>` as a stub, under
+`include/c++`), linked
 into every C++ program by itself as `libmlxcpp.a` from `$MLX_CC_LIB`,
 `lib/` next to the compiler or `/usr/local/lib/mlx-cc/lib`
 (`-nostdlib++` leaves it out), together with the math library.

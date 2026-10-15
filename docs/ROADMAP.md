@@ -137,10 +137,14 @@ alias templates, variadic templates with fold expressions, `constexpr`
 functions and `if constexpr`, rvalue references with move semantics,
 the declaration forms of `wtf/Forward.h`, the type trait builtins with
 `<type_traits>`, SFINAE, concepts and requires clauses, the atomic
-builtins with `<atomic>` and `<mutex>`, and the standard headers WTF
-includes (`<concepts>`, `<bit>`, `<span>`, `<array>`, `<tuple>`,
-`<optional>`, `<expected>`, `<functional>`, `<iterator>`) are read and
-run as g++'s builds do.
+builtins with `<atomic>` and `<mutex>`, template template parameters,
+GCC's bit builtins and operand-less `asm` statements, and the standard
+headers WTF includes (`<concepts>`, `<bit>`, `<span>`, `<array>`,
+`<tuple>`, `<optional>`, `<expected>`, `<functional>`, `<iterator>`,
+`<ranges>`) are read and run as g++'s builds do; `wtf/Assertions.h`
+and `wtf/TypeTraits.h` compile, `wtf/StdLibExtras.h` is being worked
+through (Brigand's metaprogramming asks for class templates named
+without being instantiated and `long long` as a type of its own).
 The target is WPEWebKit
 (a browser engine of our own is out of reach; a C and C++ compiler of
 our own over mlxlibc and mlxlibcpp keeps the whole stack ours), so the
