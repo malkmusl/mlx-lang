@@ -58,4 +58,8 @@ int creat(const char *, mode_t);
 int fcntl(int, int, ...);
 int posix_fadvise(int, off_t, off_t, int);
 int posix_fallocate(int, off_t, off_t);
+int fallocate(int, int, off_t, off_t);
+#define FALLOC_FL_KEEP_SIZE 0x01
+#define FALLOC_FL_PUNCH_HOLE 0x02
+#define FALLOC_FL_ZERO_RANGE 0x10
 #endif

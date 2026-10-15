@@ -69,6 +69,8 @@ int fsync(int);
 int isatty(int);
 char *ttyname(int);
 long sysconf(int);
+// A system call by its number (<sys/syscall.h>).
+long syscall(long, ...);
 int gethostname(char *, size_t);
 int getpagesize(void);
 #endif
