@@ -509,7 +509,22 @@ temporary; forwarding references in packs (`Args &&...` keeps lvalues as
 `T &`; `is_rvalue_reference<T &>` is false); overloaded member templates
 of a class template each defined outside; and a constrained function
 template declared only (`template <signed_integral S> S f(S, S);`)
-kept apart from another constraint's definition.
+kept apart from another constraint's definition. Then
+(`tests/cpp/wtfforms4.cpp`): `typename X::template Alias<...>`; an
+explicit specialization declared before a use (`template <> struct
+DefaultHash<P>;`) waits for its definition; a class made while a
+template's signature is read has its value arguments known; `Alias::E`
+of a scoped enum's alias; braced default arguments (`Spec = { }`);
+`unique_ptr<T[]>` and `make_unique<T[]>(n)`; a lambda expression is an
+rvalue; overloaded member templates told apart by their parameters'
+kinds and shapes; `const T *` deduced from a pointer to non-const and
+`R (*)(Args...)` from a function's name (also as a constexpr argument);
+a base's member types in qualified names (`V::ValueTraits::TraitType`);
+a non-type template parameter of a dependent type (`typename
+underlying_type<E>::type c = ...`); a free template's defaults kept
+from its declaration; `x.f<T>(...)` beside a plain `f`; and at most
+one user-defined conversion in an implicit conversion (a copy
+constructor takes no value that would need its own class made).
 The atomic builtins (`__atomic_load_n`, `__atomic_fetch_add`,
 `__atomic_compare_exchange_n`, the `__sync_*` family, `atomics.mlx`)
 are locked x86 instructions (`xadd`, `xchg`, `cmpxchg`, `mfence`) on
