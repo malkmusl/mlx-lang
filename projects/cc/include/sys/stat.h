@@ -53,6 +53,40 @@ int stat(const char *, struct stat *);
 int fstat(int, struct stat *);
 int lstat(const char *, struct stat *);
 int fstatat(int, const char *, struct stat *, int);
+/* Linux's statx: the file's status, the birth time too. */
+struct statx_timestamp { long long tv_sec; unsigned int tv_nsec; int __reserved; };
+struct statx {
+    unsigned int stx_mask;
+    unsigned int stx_blksize;
+    unsigned long long stx_attributes;
+    unsigned int stx_nlink;
+    unsigned int stx_uid;
+    unsigned int stx_gid;
+    unsigned short stx_mode;
+    unsigned short __spare0[1];
+    unsigned long long stx_ino;
+    unsigned long long stx_size;
+    unsigned long long stx_blocks;
+    unsigned long long stx_attributes_mask;
+    struct statx_timestamp stx_atime, stx_btime, stx_ctime, stx_mtime;
+    unsigned int stx_rdev_major, stx_rdev_minor, stx_dev_major, stx_dev_minor;
+    unsigned long long __spare2[14];
+};
+#define STATX_TYPE 0x1U
+#define STATX_MODE 0x2U
+#define STATX_NLINK 0x4U
+#define STATX_UID 0x8U
+#define STATX_GID 0x10U
+#define STATX_ATIME 0x20U
+#define STATX_MTIME 0x40U
+#define STATX_CTIME 0x80U
+#define STATX_INO 0x100U
+#define STATX_SIZE 0x200U
+#define STATX_BLOCKS 0x400U
+#define STATX_BASIC_STATS 0x7ffU
+#define STATX_BTIME 0x800U
+#define STATX_ALL 0xfffU
+int statx(int, const char *, int, unsigned int, struct statx *);
 int chmod(const char *, mode_t);
 int fchmod(int, mode_t);
 int mkdir(const char *, mode_t);
