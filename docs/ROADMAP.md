@@ -141,10 +141,12 @@ builtins with `<atomic>` and `<mutex>`, template template parameters,
 GCC's bit builtins and operand-less `asm` statements, and the standard
 headers WTF includes (`<concepts>`, `<bit>`, `<span>`, `<array>`,
 `<tuple>`, `<optional>`, `<expected>`, `<functional>`, `<iterator>`,
-`<ranges>`) are read and run as g++'s builds do; `wtf/Assertions.h`
-and `wtf/TypeTraits.h` compile, `wtf/StdLibExtras.h` is being worked
-through (Brigand's metaprogramming asks for class templates named
-without being instantiated and `long long` as a type of its own).
+`<ranges>`, `<compare>` with `<=>`) are read and run as g++'s builds
+do. Of WTF's headers `Assertions.h`, `StdLibExtras.h`, `Vector.h`,
+`RefPtr.h`, `Ref.h`, `HashSet.h`, `Deque.h`, `Function.h`, `Lock.h`,
+`WeakPtr.h`, `ThreadSafeRefCounted.h`, `URL.h` and `text/WTFString.h`,
+`text/StringBuilder.h`, `text/AtomString.h` compile (against ICU's
+headers); `HashMap.h` waits on `Int128.h` (`!=` rewritten from `==`).
 The target is WPEWebKit
 (a browser engine of our own is out of reach; a C and C++ compiler of
 our own over mlxlibc and mlxlibcpp keeps the whole stack ours), so the

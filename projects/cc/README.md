@@ -316,7 +316,20 @@ plain C as predefined macros (`__builtin_memcpy`, `__builtin_expect`,
 `smmintrin.h`, `immintrin.h`, `x86intrin.h`) gives the few SSE
 intrinsics programs use for scalar conversions (`_mm_cvttsd_si64`,
 `_mm_set_sd`, the 128-bit loads and stores, `_mm_pause`) as plain
-functions over a 16-byte struct.
+functions over a 16-byte struct. C++20's three-way comparison `<=>`
+(`tests/cpp/compare.cpp`) gives a class's operator function or, between
+numbers and pointers, a `std::strong_ordering` (`partial_ordering` for
+floating point) from `<compare>`; `a < b` of a class with only
+`operator<=>` is rewritten to `(a <=> b) < 0`. `if (init; cond)` and
+`switch (init; cond)` take an init statement; `T{a, b}` of an
+aggregate sets its members in order (also as a local or a global, and
+`int x{5}`, `long z{}` for scalars); `long long`, `signed char`,
+`wchar_t`, `char16_t` and `char32_t` are types of their own (overloads,
+specializations, mangled `x`, `a`, `w`, `Ds`, `Di`); a class template
+named in a typedef or an alias (`using X = T<A>;`) is not instantiated
+until something needs it whole (an object, a member, its size, pointer
+arithmetic, a qualified name), as C++ says; `__PRETTY_FUNCTION__`,
+`__VA_OPT__` and GNU's `, ## __VA_ARGS__` are there.
 The atomic builtins (`__atomic_load_n`, `__atomic_fetch_add`,
 `__atomic_compare_exchange_n`, the `__sync_*` family, `atomics.mlx`)
 are locked x86 instructions (`xadd`, `xchg`, `cmpxchg`, `mfence`) on
@@ -343,11 +356,9 @@ overloads of a name. Not there yet:
 a pack of a base list (`struct X : Bases...`), a pack in a lambda's
 captures,
 generic lambdas (`auto` parameters), a lambda converting to a function
-pointer, init-captures, `long long` as a type of its own (it is `long`,
-so `f(long)` and `f(long long)` are one function), a class template
-named in a typedef without being instantiated (`using X = T<A>;`
-instantiates `T<A>` at once), inline assembly with operands, class
-template argument deduction
+pointer, init-captures, inline assembly with operands, `!=` rewritten
+from `==` (C++20), constant evaluation of `<=>`, class template
+argument deduction
 (`std::pair p(1, 2)`, `std::lock_guard lock(m)`: the arguments must be
 written), `<=>`, structured bindings, template template parameters,
 exceptions (`try`, `throw` are refused),
