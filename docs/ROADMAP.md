@@ -161,7 +161,15 @@ register operands (`cpuid`) and the C++17/20 forms WTF's headers use
 followed: 40 of WTF's 174 `.cpp` files compile (`BitVector.cpp` among
 them), with one WebKit patch (`projects/cc/webkit/`: SIMDe's portable
 paths without SSE2). Multiple inheritance (`StringImpl`, `WorkQueue`,
-the weak-pointer mixins) is next.
+the weak-pointer mixins, with the empty base optimization) followed,
+and with it what WTF's `Variant` (mpark's variant) and `Expected` ask:
+pack expansions in base lists and braced lists, inherited
+constructors, surrogate calls, `decltype`'s value categories, implicit
+deduction guides, SFINAE through `void_t` (class and variable
+templates), narrowing in braced conversions and constexpr lambdas;
+`Variant` builds and runs, and `Assertions.cpp` compiles to the end of
+`text/StringImpl.h`. Errors inside templates name the instances that
+led there.
 The target is WPEWebKit
 (a browser engine of our own is out of reach; a C and C++ compiler of
 our own over mlxlibc and mlxlibcpp keeps the whole stack ours), so the

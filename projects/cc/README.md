@@ -463,6 +463,35 @@ outside its class (next to an overload of its name); what braces leave
 out of a C++ aggregate is zero (`T x { }`, `int a[4]{9}`), and a
 default member initializer may be any braced list
 (`tests/cpp/deduction.cpp`).
+A class may have several bases (`struct S : A, B`): each is a member of
+its own, an empty one takes no room (the empty base optimization), a
+pointer or reference converts to any base and back (`static_cast`,
+null kept null); the first base may be polymorphic, a later one may not
+(refused with a message). A base list expands packs (`struct X :
+leaf<Is, Ts>...`), `using Base::Base;` inherits the constructors, and an
+object of a class with conversion operators to pointers to functions is
+called through the one the arguments fit best (a surrogate call:
+mpark's `variant`, WTF's `Variant`, chooses its alternative so).
+Class template argument deduction takes the implicit guides of the
+constructors too (`R r{s}`, `Pair p(1, 2.5)`, with the defaults of the
+parameters not deduced). `decltype` gives an lvalue `T&`, an xvalue
+`T&&`, a name its declared type, `decltype(auto)` keeps a returned
+reference, and `decltype(x)::member` names a member. SFINAE covers
+`void_t<decltype(...)>` in partial specializations (of class and
+variable templates), `typename U::rep` with `U` not a class, `sizeof` of
+an incomplete type, a call of an object that is not callable;
+`is_invocable` and `invoke_result` are SFINAE-friendly, and a braced
+element that narrows (`{double}` for `int`, a pointer for `bool`) does
+not convert. A lambda without captures is constexpr; a member
+template's partial specialization, an alias with a pack of its class, a
+member template declared in its class and defined outside with an
+`auto` parameter, and an explicit specialization `template <> R
+C::f<X>()` are read; a class template whose argument is a class not
+complete yet is made when something needs it whole, and a function's
+body is not made for a call in an unevaluated operand
+(`tests/cpp/deduce2.cpp`, `sfinae.cpp`, `packs2.cpp`, `classes2.cpp`).
+An error inside a template instance names the instances being read and
+where each was needed.
 The atomic builtins (`__atomic_load_n`, `__atomic_fetch_add`,
 `__atomic_compare_exchange_n`, the `__sync_*` family, `atomics.mlx`)
 are locked x86 instructions (`xadd`, `xchg`, `cmpxchg`, `mfence`) on
@@ -486,16 +515,17 @@ runs them (`tools/check_cpp.sh`, on glibc and on mlxlibc).
 C's `getline` and `std::getline` both apply where `using namespace std`
 is in force: the functions a using-directive brings in join the
 overloads of a name. Not there yet:
-a pack of a base list (`struct X : Bases...`), a pack in a lambda's
-explicit captures,
+a pack in a lambda's explicit captures,
 a lambda converting to a function pointer, init-captures, a generic
-lambda capturing `this` implicitly, a lambda called in a constant
-expression (a concept holding one is false), constant
+lambda capturing `this` implicitly, a lambda with captures in a
+constant expression, constant
 evaluation of `<=>`, friend functions of a class template made only
-when used (they are made with the instance), class template argument
-deduction from constructors alone (without a deduction guide the
-arguments must be written), structured bindings in an `if` or `switch`
-condition, multiple inheritance (one base per class),
+when used (they are made with the instance), structured bindings in an
+`if` or `switch` condition, a polymorphic base after the first
+(virtual calls through it would need thunks), virtual bases, a data
+member of the class named in a declaration inside it (`auto get() ->
+decltype(x)`; in a member template's signature it is seen), overloads
+of a name joined across bases by `using B::f...;`,
 exceptions (`try`, `throw` are refused),
 a polymorphic class over a base without a vtable,
 `constexpr` over classes, pointers or floating-point values,
