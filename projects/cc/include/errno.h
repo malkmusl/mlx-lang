@@ -53,4 +53,12 @@ int *__errno_location(void);
 #define ECONNREFUSED 111
 #define ETIMEDOUT 110
 #define EINPROGRESS 115
+#define EAFNOSUPPORT 97
+#define EADDRNOTAVAIL 99
+#define ECONNABORTED 103
+#define ECONNRESET 104
+#define ENOBUFS 105
+#define EISCONN 106
+#define ENOTCONN 107
+#define EALREADY 114
 #endif

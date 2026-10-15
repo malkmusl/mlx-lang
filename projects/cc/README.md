@@ -338,8 +338,42 @@ typedefs as `_BitInt(128)`; default template arguments of function
 templates (`class = enable_if_t<...>`) taken in deduction, as SFINAE;
 member operator templates (`template <class U> T &operator=(U &&)`);
 friend functions read in their class (its own name is its instance
-there); `if (T *p = f())`; `std::variant` in `<variant>`
-(`tests/cpp/variant.cpp`).
+there); `if (T *p = f())` and `while (T *p = f())`; `std::variant`
+in `<variant>` (`tests/cpp/variant.cpp`). Overloads gather from every
+place a name may come from: a member function template and plain
+member functions of one name are chosen among together, a qualified
+call (`std::to_chars(...)`) weighs the namespace's templates too, and
+an operator of a nested class (`thread::id`) is found in the
+namespace around its class; of two templates fitting as well, the
+more specialized one wins (`duration(const duration<R, P> &)` over
+`duration(const R &)`). An object of a class is copied by a copy
+constructor or member by member, never by a constructor template or
+through its own conversion operator; a conversion operator may return
+a reference (`operator const path &()`) and converts a class to
+another class; a function binds to a reference to a function; a
+range-based `for` takes `begin(x)` and `end(x)` of the class's
+namespace too and keeps class iterators as objects (copied and
+destroyed as such); `::name` reaches the global past a local of the
+name, and a function hides a struct of its name (`::stat(...)`);
+`char8_t` is a type of its own (mangled `Du`), and `u8""`, `u""`,
+`U""` and `L""` are arrays of `char8_t` (C++20), `char16_t`,
+`char32_t` and `wchar_t`, as their character constants are
+(`tests/cpp/overloads.cpp`). The C headers under `include/sys` are
+`extern "C"` as those above them are. A class's member aliases (`using
+T = type;` in the class) are typedefs of its scope; an inline
+namespace's names are its parent's from its opening brace (`lib::f`
+inside `lib`'s inline namespace); a member `operator()` template makes
+an object callable (a generic callable); a function template's
+candidate instances are read whole only once chosen, so a
+`static_assert` in an overload not taken stays silent; an alias
+template whose arguments make it name nothing (`enable_if_t<false>`)
+fails the candidate without being remembered, and a dependent value
+argument is told apart by its tokens (`enable_if<!C>` is not
+`enable_if<C>`); an explicit reference argument (`f<int &>(x)`) fits
+a `T &` parameter; a constructor template's brace initializers
+(`: value{ true }`) are passed over with it; a trailing return type
+names the expanded parameter pack (`-> decltype(f(as...))`)
+(`tests/cpp/members.cpp`).
 The atomic builtins (`__atomic_load_n`, `__atomic_fetch_add`,
 `__atomic_compare_exchange_n`, the `__sync_*` family, `atomics.mlx`)
 are locked x86 instructions (`xadd`, `xchg`, `cmpxchg`, `mfence`) on
@@ -371,7 +405,7 @@ evaluation of `<=>`, friend functions of a class template made only
 when used (they are made with the instance), class template argument
 deduction
 (`std::pair p(1, 2)`, `std::lock_guard lock(m)`: the arguments must be
-written), `<=>`, structured bindings, template template parameters,
+written), structured bindings,
 exceptions (`try`, `throw` are refused),
 multiple inheritance, a polymorphic class over a base without a vtable,
 `constexpr` over classes, pointers or floating-point values,
@@ -382,15 +416,21 @@ functions naming the function's locals or the class itself,
 user-defined `operator new` (the built-in `new` calls `_Znwm`, which
 mlxlibcpp provides). The mangled names leave out the ABI's
 substitutions (`S_`), so a name with a repeated parameter type
-differs from g++'s; constructors have only their `C1` symbol; `long long` and
-`signed char` are `long` and `char`, not types of their own. The C++
+differs from g++'s; constructors have only their `C1` symbol. Programs are linked to
+glibc without symbol versions, so a symbol glibc keeps in two
+versions binds the older one (`realpath` refusing a null buffer).
+The C++
 standard library is mlxlibcpp (`projects/libcpp`: `<string>`,
 `<iostream>`, `<sstream>`, `<vector>`, `<map>`, `<set>`, `<memory>`,
 `<utility>`, `<algorithm>`, `<numeric>`, `<new>`, `<type_traits>`,
 `<concepts>`, `<initializer_list>`, `<limits>`, `<bit>`, `<array>`,
 `<span>`, `<tuple>`, `<optional>`, `<expected>`, `<iterator>`,
 `<functional>`, `<atomic>`, `<mutex>`, `<exception>`, `<iosfwd>`,
-`<numbers>`, `<variant>`, the `c*` headers, `<ranges>` with the range concepts and
+`<numbers>`, `<variant>`, `<charconv>`, `<system_error>`, `<ratio>`,
+`<chrono>`, `<thread>`, `<condition_variable>`, `<iomanip>`,
+`<version>`, `<filesystem>` (over POSIX calls, with `std::u8string`
+in `<string>`; `tests/cpp/filesystem.cpp`, `tests/cpp/threads.cpp`),
+the `c*` headers, `<ranges>` with the range concepts and
 the whole-range algorithms, and `<compare>` as a stub, under
 `include/c++`), linked
 into every C++ program by itself as `libmlxcpp.a` from `$MLX_CC_LIB`,

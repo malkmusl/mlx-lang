@@ -58,4 +58,8 @@ int fchmod(int, mode_t);
 int mkdir(const char *, mode_t);
 mode_t umask(mode_t);
 int mkfifo(const char *, mode_t);
+#define UTIME_NOW ((1l << 30) - 1l)
+#define UTIME_OMIT ((1l << 30) - 2l)
+int utimensat(int, const char *, const struct timespec *, int);
+int futimens(int, const struct timespec *);
 #endif

@@ -8,9 +8,9 @@
 
 namespace std {
 
-ostream cout = { 1, 6, false };
-ostream cerr = { 2, 6, false };
-ostream clog = { 2, 6, false };
+ostream cout = { 1, 6, false, 0, 0, 0, 0 };
+ostream cerr = { 2, 6, false, 0, 0, 0, 0 };
+ostream clog = { 2, 6, false, 0, 0, 0, 0 };
 istream cin = { 0, false, false };
 
 static FILE *fileOf(int which) {
@@ -20,63 +20,126 @@ static FILE *fileOf(int which) {
 }
 
 ostream &ostream::write(const char *bytes, size_t count) {
+    if (sink) {
+        sink->append(bytes, count);
+        return *this;
+    }
     if (fwrite(bytes, 1, count, fileOf(which)) != count) failed = true;
     return *this;
 }
 
 ostream &ostream::put(char c) {
+    if (sink) {
+        sink->push_back(c);
+        return *this;
+    }
     if (fputc(c, fileOf(which)) < 0) failed = true;
     return *this;
 }
 
 ostream &ostream::flush() {
-    fflush(fileOf(which));
+    if (!sink) fflush(fileOf(which));
     return *this;
 }
 
-ostream &ostream::operator<<(const char *text) { return write(text, strlen(text)); }
-
-ostream &ostream::operator<<(char c) { return put(c); }
-
-ostream &ostream::operator<<(bool value) { return put(value ? '1' : '0'); }
-
-ostream &ostream::operator<<(int value) {
-    char buffer[32];
-    int n = snprintf(buffer, sizeof buffer, "%d", value);
-    return write(buffer, n);
+ostream &ostream::padded(const char *text, size_t count, size_t prefix) {
+    long width = fieldWidth;
+    fieldWidth = 0;
+    if (width <= 0 || (size_t)width <= count) return write(text, count);
+    size_t pad = (size_t)width - count;
+    char c = fill();
+    unsigned adjust = format & ios_base::adjustfield;
+    if (adjust == ios_base::left) {
+        write(text, count);
+        for (size_t i = 0; i < pad; i++) put(c);
+        return *this;
+    }
+    if (adjust == ios_base::internal) {
+        write(text, prefix);
+        for (size_t i = 0; i < pad; i++) put(c);
+        return write(text + prefix, count - prefix);
+    }
+    for (size_t i = 0; i < pad; i++) put(c);
+    return write(text, count);
 }
 
-ostream &ostream::operator<<(unsigned value) {
-    char buffer[32];
-    int n = snprintf(buffer, sizeof buffer, "%u", value);
-    return write(buffer, n);
+ostream &ostream::operator<<(const char *text) { return padded(text, strlen(text), 0); }
+
+ostream &ostream::operator<<(char c) { return padded(&c, 1, 0); }
+
+ostream &ostream::operator<<(bool value) {
+    if (format & ios_base::boolalpha) return value ? padded("true", 4, 0) : padded("false", 5, 0);
+    return padded(value ? "1" : "0", 1, 0);
+}
+
+// An integer as the flags say: its base (with 0x or 0 for showbase), the
+// letters' case, a + for showpos.
+static size_t formatInteger(char *out, unsigned long magnitude, bool negative, unsigned format, size_t *prefix) {
+    unsigned base = format & ios_base::basefield;
+    unsigned radix = base == ios_base::hex ? 16 : base == ios_base::oct ? 8 : 10;
+    const char *digitsOf = (format & ios_base::uppercase) ? "0123456789ABCDEF" : "0123456789abcdef";
+    char reversed[80];
+    size_t n = 0;
+    do {
+        reversed[n++] = digitsOf[magnitude % radix];
+        magnitude /= radix;
+    } while (magnitude != 0);
+    size_t at = 0;
+    if (negative) out[at++] = '-';
+    else if (radix == 10 && (format & ios_base::showpos)) out[at++] = '+';
+    if ((format & ios_base::showbase) && radix == 16 && !(n == 1 && reversed[0] == '0')) {
+        out[at++] = '0';
+        out[at++] = (format & ios_base::uppercase) ? 'X' : 'x';
+    }
+    if ((format & ios_base::showbase) && radix == 8 && reversed[n - 1] != '0') out[at++] = '0';
+    *prefix = at;
+    while (n > 0) out[at++] = reversed[--n];
+    return at;
 }
 
 ostream &ostream::operator<<(long value) {
-    char buffer[32];
-    int n = snprintf(buffer, sizeof buffer, "%ld", value);
-    return write(buffer, n);
+    char buffer[96];
+    size_t prefix = 0;
+    unsigned base = format & ios_base::basefield;
+    bool negative = value < 0 && base != ios_base::hex && base != ios_base::oct;
+    unsigned long magnitude = negative ? 0UL - (unsigned long)value : (unsigned long)value;
+    size_t n = formatInteger(buffer, magnitude, negative, format, &prefix);
+    return padded(buffer, n, prefix);
 }
 
 ostream &ostream::operator<<(unsigned long value) {
-    char buffer[32];
-    int n = snprintf(buffer, sizeof buffer, "%lu", value);
-    return write(buffer, n);
+    char buffer[96];
+    size_t prefix = 0;
+    size_t n = formatInteger(buffer, value, false, format, &prefix);
+    return padded(buffer, n, prefix);
 }
 
 ostream &ostream::operator<<(double value) {
+    char spec[16];
+    size_t at = 0;
+    spec[at++] = '%';
+    if (format & ios_base::showpos) spec[at++] = '+';
+    if (format & ios_base::showpoint) spec[at++] = '#';
+    spec[at++] = '.';
+    spec[at++] = '*';
+    unsigned floating = format & ios_base::floatfield;
+    char conversion = floating == ios_base::fixed ? 'f' : floating == ios_base::scientific ? 'e' : floating == ios_base::floatfield ? 'a' : 'g';
+    if (format & ios_base::uppercase) conversion = (char)toupper(conversion);
+    spec[at++] = conversion;
+    spec[at] = 0;
     char buffer[400];
-    int n = snprintf(buffer, sizeof buffer, "%.*g", digits, value);
-    return write(buffer, n);
+    int n = snprintf(buffer, sizeof buffer, spec, digits, value);
+    size_t prefix = (buffer[0] == '-' || buffer[0] == '+') ? 1 : 0;
+    return padded(buffer, (size_t)n, prefix);
 }
 
 ostream &ostream::operator<<(const void *pointer) {
     char buffer[32];
     int n = snprintf(buffer, sizeof buffer, "%p", pointer);
-    return write(buffer, n);
+    return padded(buffer, (size_t)n, 0);
 }
 
-ostream &operator<<(ostream &out, const string &text) { return out.write(text.data(), text.size()); }
+ostream &operator<<(ostream &out, const string &text) { return out.padded(text.data(), text.size(), 0); }
 
 ostream &endl(ostream &out) {
     out.put('\n');

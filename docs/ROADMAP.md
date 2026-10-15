@@ -148,7 +148,14 @@ do. Of WTF's headers `Assertions.h`, `StdLibExtras.h`, `Vector.h`,
 `text/StringBuilder.h`, `text/AtomString.h` compile (against ICU's
 headers), and `HashMap.h`, `Int128.h`, `MathExtras.h`, `Seconds.h`,
 `WallTime.h`, `text/StringImpl.h` and `text/StringView.h` with them
-(user-defined literals, `__int128`). Next: WTF's `.cpp` files.
+(user-defined literals, `__int128`). WTF's `.cpp` files are next:
+`<charconv>`, `<system_error>`, `<chrono>`, `<thread>`,
+`<condition_variable>` and `<filesystem>` are there for them (run as
+g++'s builds in `tests/cpp/threads.cpp` and `filesystem.cpp`), and
+the language gaps they showed are closed one by one (member aliases,
+inline namespaces, generic callables, SFINAE through alias
+templates). Every WTF source now stops at pointers to members
+(`R T::*pmf`, mpark's variant and `RunLoop` timers), which come next.
 The target is WPEWebKit
 (a browser engine of our own is out of reach; a C and C++ compiler of
 our own over mlxlibc and mlxlibcpp keeps the whole stack ours), so the

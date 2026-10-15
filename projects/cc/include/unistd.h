@@ -13,6 +13,7 @@
 #define SEEK_END 2
 #define _SC_PAGESIZE 30
 #define _SC_PAGE_SIZE _SC_PAGESIZE
+#define _SC_NPROCESSORS_CONF 83
 #define _SC_NPROCESSORS_ONLN 84
 #define _SC_CLK_TCK 2
 #define _SC_OPEN_MAX 4
