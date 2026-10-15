@@ -309,9 +309,9 @@ them relocated against the code: Lua's interpreter dispatches so,
 `__attribute__`, and with GCC's builtins: the bit builtins
 (`__builtin_clz`, `ctz`, `popcount`, `bswap`, `ffs`, `builtins.mlx`,
 as bsr, bsf, popcnt and bswap instructions, constant-folded in
-constexpr code), `asm` statements of one operand-less instruction
-(`asm volatile("" ::: "memory")` as a compiler fence, `pause`, `int3`,
-`nop`, the fences, `ud2`: `__builtin_trap`), and the builtins that are
+constexpr code), `asm` statements (`asm volatile("" ::: "memory")` as
+a compiler fence; any other text assembled by `asm.mlx`, below), and the
+builtins that are
 plain C as predefined macros (`__builtin_memcpy`, `__builtin_expect`,
 `__builtin_isnan`, `__builtin_inf`, `__builtin_constant_p` as 0, ...;
 `tests/builtins.c` against gcc). `<emmintrin.h>` (and `xmmintrin.h`,
@@ -587,6 +587,23 @@ name (`int3` with the crash reason in `r11`); Valgrind's client request
 answer when not run under Valgrind); default arguments given by a
 declaration before the definition; `<linux/futex.h>`, and
 `<string.h>` bringing `<strings.h>` as glibc's does.
+Inline assembly is assembled by mlx-cc itself (`asm.mlx`, an assembler
+of AT&T x86-64 text): the operands are given registers by their
+constraints (`a`, `b`, `c`, `d`, `S`, `D`, or any free one of rax to
+r10 for `r`, `q`, `g`, `rm`), memory operands (`m`) are addressed
+through a register, constants (`i`, `n`) are put in as `$value`, and
+`%0`, `%[name]`, the size modifiers (`%q0`, `%k[x]`, `%w0`, `%b0`,
+`%h0`, `%c0`), `%%` and `%=` are replaced before the text is
+assembled; the inputs are loaded from memory before the instructions
+and the outputs stored after (the callee-saved registers the text
+clobbers kept around it). The assembler knows the integer, string, bit,
+SSE and fence instructions with every addressing form, local labels
+(`1:` with `1b` and `1f`, and named ones) for the jumps inside the
+text, and the data directives (`tests/inlineasm.c` against gcc's build;
+`tests/asmencoding.c` prints each instruction's bytes, which are GNU
+as's). JavaScriptCore's copy loops for the garbage collector
+(`movups` through `xmm0`-`xmm3` with local labels), `rep stosq`, `divq`
+and the register saves of its stack scan are written so.
 The atomic builtins (`__atomic_load_n`, `__atomic_fetch_add`,
 `__atomic_compare_exchange_n`, the `__sync_*` family, `atomics.mlx`)
 are locked x86 instructions (`xadd`, `xchg`, `cmpxchg`, `mfence`) on
@@ -662,9 +679,9 @@ into every C++ program by itself as `libmlxcpp.a` from `$MLX_CC_LIB`,
 - No variable-length arrays, `_Atomic` qualifier (the `__atomic_*` and
   `__sync_*` builtins are there), `_Thread_local` (declared, but a
   plain global), `_Complex`, GCC vector types. Inline
-  `asm` is the instructions `builtins.mlx` knows: the fences, `pause`,
-  `int3`, `ud2`, `nop`, and with register operands (`"=a"`, `"+b"`,
-  `"r"`, `"0"`) `cpuid`, `rdtsc` and `movq %%rsp, %0`.
+  `asm` has no floating-point register operands (`x`, `t`), no jumps
+  out of its text (`asm goto`, a call of a symbol) and no other
+  sections; the x87 and AVX instructions are not assembled.
 - `va_arg` of a struct of 16 bytes or less reads it from the stack, where
   only larger ones are.
 - No optimization: the code is correct and slow.
