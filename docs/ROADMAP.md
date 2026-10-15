@@ -171,7 +171,12 @@ templates), narrowing in braced conversions and constexpr lambdas;
 overflow builtins, constexpr calls returning references, the copy
 deduction candidate, forwarding references in packs, overloaded member
 templates defined outside their class). Errors inside templates name
-the instances that led there.
+the instances that led there. The rest of WTF followed: all 174 of its
+`.cpp` files compile with mlx-cc (FastMalloc and Threading with
+bmalloc's libpas headers among them), the forms each step asked for
+kept as `tests/cpp/wtfforms*.cpp`, with two WebKit patches in
+`projects/cc/webkit/`. Next in the JavaScriptCore-only build are
+bmalloc's own sources (libpas, mostly C), then JavaScriptCore.
 The target is WPEWebKit
 (a browser engine of our own is out of reach; a C and C++ compiler of
 our own over mlxlibc and mlxlibcpp keeps the whole stack ours), so the

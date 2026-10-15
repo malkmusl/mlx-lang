@@ -301,9 +301,11 @@ class... Ts> struct Count<L<Ts...>>`, `Apply<Box, int>`, deduced from
 instances in function templates and partial specializations,
 `tests/cpp/ttparams.cpp`); function templates of one name whose
 parameters differ in kind (`f<size_t N>` and `f<typename T>`); `using
-enum E;`. C++ files are compiled with `__GNUC__` defined (13.2: WebKit
-and bmalloc insist on a GCC-compatible compiler; C files are not, Lua
-would take it as a licence for computed goto), with `__attribute` as
+enum E;`. Files are compiled with `__GNUC__` defined (13.2: WebKit,
+bmalloc and libpas insist on a GCC-compatible compiler), with GNU C's
+labels as values (`&&label` a `void *`, `goto *p`, static tables of
+them relocated against the code: Lua's interpreter dispatches so,
+`tests/labelvalues.c`), with `__attribute` as
 `__attribute__`, and with GCC's builtins: the bit builtins
 (`__builtin_clz`, `ctz`, `popcount`, `bswap`, `ffs`, `builtins.mlx`,
 as bsr, bsf, popcnt and bswap instructions, constant-folded in
@@ -556,6 +558,23 @@ named in a constructor's initializer (`Type::Serial`), C++20's
 destroying `operator delete` (and a class's own `operator delete`
 used by `delete`), `p->T::~T()`. 92 of WTF's 174 `.cpp`
 files compile.
+The rest of WTF followed, all 174 of its `.cpp` files compiling
+(`tests/cpp/wtfforms*.cpp` hold the forms each step asked for, run
+against g++'s results): `std::nullptr_t` a type of its own; lambdas in
+lambdas capturing the outer one's captures; operator functions on
+enums; `auto &` results; overload sets of lambdas (`using
+A::operator()` across bases); implicit and defaulted assignment member
+by member (moving from rvalues); class template argument deduction for
+globals; designated initializers; partial specializations constrained
+by `requires` and concepts with nested requirements; friend function
+templates defined in their class; instances nested in their own
+template named lazily (FastBitVector's `operator~`); `tuple_cat`,
+`not_fn`, `<unordered_map>`, `<unordered_set>`, `midpoint`; bmalloc's
+headers (libpas: empty `asm` with operands as an optimization barrier,
+16-byte atomics through `cmpxchg16b`, and a second WebKit patch for
+its x86 double-free check, `projects/cc/webkit/`). The last one was a
+conversion operator named in an expression (`p.operator int*()`)
+whose result type a later declaration's `operator[]` took as its own.
 The atomic builtins (`__atomic_load_n`, `__atomic_fetch_add`,
 `__atomic_compare_exchange_n`, the `__sync_*` family, `atomics.mlx`)
 are locked x86 instructions (`xadd`, `xchg`, `cmpxchg`, `mfence`) on
@@ -630,7 +649,7 @@ into every C++ program by itself as `libmlxcpp.a` from `$MLX_CC_LIB`,
   both C libraries with gcc's output).
 - No variable-length arrays, `_Atomic` qualifier (the `__atomic_*` and
   `__sync_*` builtins are there), `_Thread_local` (declared, but a
-  plain global), `_Complex`, computed `goto`, GCC vector types. Inline
+  plain global), `_Complex`, GCC vector types. Inline
   `asm` is the instructions `builtins.mlx` knows: the fences, `pause`,
   `int3`, `ud2`, `nop`, and with register operands (`"=a"`, `"+b"`,
   `"r"`, `"0"`) `cpuid`, `rdtsc` and `movq %%rsp, %0`.

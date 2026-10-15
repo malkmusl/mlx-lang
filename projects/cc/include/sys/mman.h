@@ -16,6 +16,9 @@
 void *mmap(void *, size_t, int, int, int, off_t);
 int munmap(void *, size_t);
 int mprotect(void *, size_t, int);
+#define MREMAP_MAYMOVE 1
+#define MREMAP_FIXED 2
+void *mremap(void *, size_t, size_t, int, ...);
 #define MADV_NORMAL 0
 #define MADV_RANDOM 1
 #define MADV_SEQUENTIAL 2
