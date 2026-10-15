@@ -36,4 +36,9 @@ char *strpbrk(const char *, const char *);
 char *strerror(int);
 int strerror_r(int, char *, size_t);
 char *strsignal(int);
+/* As glibc's: strcasecmp and the rest of <strings.h> too, outside
+   strict C. */
+#if !defined(__STRICT_ANSI__) || defined(__cplusplus) || defined(_GNU_SOURCE) || defined(_DEFAULT_SOURCE)
+#include <strings.h>
+#endif
 #endif

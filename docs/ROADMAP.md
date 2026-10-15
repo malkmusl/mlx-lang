@@ -175,8 +175,11 @@ the instances that led there. The rest of WTF followed: all 174 of its
 `.cpp` files compile with mlx-cc (FastMalloc and Threading with
 bmalloc's libpas headers among them), the forms each step asked for
 kept as `tests/cpp/wtfforms*.cpp`, with two WebKit patches in
-`projects/cc/webkit/`. Next in the JavaScriptCore-only build are
-bmalloc's own sources (libpas, mostly C), then JavaScriptCore.
+`projects/cc/webkit/`. bmalloc followed: all 168 of its sources
+(157 of them libpas's C) compile, which took GNU C's labels as values,
+compound literals as static initializers, the typed overflow builtins
+and Valgrind's client request. Next in the JavaScriptCore-only build is
+JavaScriptCore itself, then linking and running `jsc`.
 The target is WPEWebKit
 (a browser engine of our own is out of reach; a C and C++ compiler of
 our own over mlxlibc and mlxlibcpp keeps the whole stack ours), so the

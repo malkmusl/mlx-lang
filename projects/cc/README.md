@@ -575,6 +575,18 @@ headers (libpas: empty `asm` with operands as an optimization barrier,
 its x86 double-free check, `projects/cc/webkit/`). The last one was a
 conversion operator named in an expression (`p.operator int*()`)
 whose result type a later declaration's `operator[]` took as its own.
+Then all 168 of bmalloc's sources, 157 of them libpas's C
+(`tests/gnuforms.c`, its expected output clang's, which libpas is
+usually built with): compound literals initializing static objects
+(`pas_lock x = PAS_LOCK_INITIALIZER;`) and their members read in
+constant expressions (a heap configuration macro naming another's
+fields, `(CONFIG).config_ptr` in a table); the typed overflow builtins
+(`__builtin_usubll_overflow`); an instruction given inputs it does not
+name (`int3` with the crash reason in `r11`); Valgrind's client request
+(`rolq` by 3, 13, 61 and 51, then `xchgq %rbx,%rbx`: the default
+answer when not run under Valgrind); default arguments given by a
+declaration before the definition; `<linux/futex.h>`, and
+`<string.h>` bringing `<strings.h>` as glibc's does.
 The atomic builtins (`__atomic_load_n`, `__atomic_fetch_add`,
 `__atomic_compare_exchange_n`, the `__sync_*` family, `atomics.mlx`)
 are locked x86 instructions (`xadd`, `xchg`, `cmpxchg`, `mfence`) on
