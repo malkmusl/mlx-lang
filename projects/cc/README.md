@@ -604,6 +604,21 @@ text, and the data directives (`tests/inlineasm.c` against gcc's build;
 as's). JavaScriptCore's copy loops for the garbage collector
 (`movups` through `xmm0`-`xmm3` with local labels), `rep stosq`, `divq`
 and the register saves of its stack scan are written so.
+JavaScriptCore came next (its build without JIT): its first unified
+source compiles, and the rest is worked through from a pass over all
+its 204 compile units, each form it asked for kept in
+`tests/cpp/wtfforms16.cpp` to `wtfforms20.cpp`: copy elision (an
+object initialized from a `T(args)` temporary of its class is made from
+the arguments), functions as `template <auto f>` arguments
+(`decltype(f)` their pointer type), members defined outside a partial
+specialization, `template <> template <bool B> R C<X>::f` for one
+instance, overloaded function templates told apart by a
+specialization's parameters, class-type non-type parameters declared,
+`new (arena) T` through the class's `operator new`, `if (constexpr T x
+= e)`, empty braces to an `initializer_list` constructor, the
+constant evaluator's opaque global addresses (`a.size()` of a
+constexpr `std::array` in `static_assert`) and floating comparisons,
+and inline assembly (above).
 The atomic builtins (`__atomic_load_n`, `__atomic_fetch_add`,
 `__atomic_compare_exchange_n`, the `__sync_*` family, `atomics.mlx`)
 are locked x86 instructions (`xadd`, `xchg`, `cmpxchg`, `mfence`) on

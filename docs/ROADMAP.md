@@ -178,8 +178,18 @@ kept as `tests/cpp/wtfforms*.cpp`, with two WebKit patches in
 `projects/cc/webkit/`. bmalloc followed: all 168 of its sources
 (157 of them libpas's C) compile, which took GNU C's labels as values,
 compound literals as static initializers, the typed overflow builtins
-and Valgrind's client request. Next in the JavaScriptCore-only build is
-JavaScriptCore itself, then linking and running `jsc`.
+and Valgrind's client request. JavaScriptCore is under way (its build
+without JIT, the C loop interpreter): its first unified source,
+`UnifiedSource-API-1.cpp`, compiles, and a full pass over its 204
+compile units is worked through error by error. It took an inline
+assembler (`projects/cc/asm.mlx`, AT&T x86-64 text for `asm` with
+operands), guaranteed copy elision of temporaries, functions as
+`template <auto f>` arguments, the forms of partial specializations'
+members and per-instance member templates, and more of the library
+(`move_iterator`, `mem_fn`, the uninitialized algorithms, `unique_ptr`
+deleters, `optional`'s ordering). Each JavaScriptCore unit needs some
+6 GB in mlx-cc, which bounds how many compile at once. Then come
+linking and running `jsc`.
 The target is WPEWebKit
 (a browser engine of our own is out of reach; a C and C++ compiler of
 our own over mlxlibc and mlxlibcpp keeps the whole stack ours), so the
