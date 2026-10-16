@@ -33,6 +33,7 @@ void *mremap(void *, size_t, size_t, int, ...);
 #define MADV_DONTDUMP 16
 #define MADV_DODUMP 17
 int madvise(void *, size_t, int);
+int mincore(void *, size_t, unsigned char *);
 #define MS_ASYNC 1
 #define MS_INVALIDATE 2
 #define MS_SYNC 4
