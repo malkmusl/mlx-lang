@@ -1473,6 +1473,20 @@ wire protocol without libc or libxcb):
   windows.
 - Override-redirect windows (menus, drop-downs, tooltips) show where X puts
   them, above the windows, without a frame or the keyboard.
+- The clipboard is one for both ([`xwm_selection.mlx`](xwm_selection.mlx)).
+  When a Wayland client sets the selection, a window of the window
+  manager's owns `CLIPBOARD` and answers X programs: `TARGETS` from the
+  selection's types (interned as atoms; `UTF8_STRING`, `TEXT` and `STRING`
+  stand for `text/plain`), any other target read from the Wayland source
+  through a pipe the event loop watches and put on the requestor's
+  property (appended in parts past a request's size). When an X program
+  takes `CLIPBOARD` (XFixes tells), its `TARGETS` and their names are
+  read and an X source with the types Wayland clients know (text as
+  `text/plain;charset=utf-8` and `text/plain`, and the MIME types)
+  becomes the selection; a Wayland client reading it gets the conversion
+  written into its pipe, the property read in parts, or `INCR` part by
+  part. Copied files cross as `text/uri-list` and
+  `x-special/gnome-copied-files` like any type.
 
 `--xwayland PROGRAM` names another X server, `--xwayland none` runs none.
 The log (`--verbose`) says what happens:

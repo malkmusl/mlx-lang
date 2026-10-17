@@ -31,6 +31,11 @@
 #   - drops a file on a pinned folder (it is copied in), opens its stack,
 #     drags an entry onto a folder in the stack (it moves in) and another
 #     out of the stack into the file manager (it is copied there);
+#   - copies files in the file manager (Ctrl+A, Ctrl+C): wl-paste and an X
+#     program (tools/x11-clipboard-test on Xwayland) get them as GNOME's
+#     list and as URIs; files wl-copy put up are pasted (Ctrl+V); a text
+#     goes from wl-copy to the X program and back from it to wl-paste
+#     (when wl-clipboard is installed);
 #   - runs the top bar (mlx-topbar) with a terminal: the bar (with its
 #     workspace controls in the middle) is along the
 #     top and reserves it (the terminal moves below it, maximized it stays
@@ -103,6 +108,7 @@ trap 'rm -rf -- "$work"' EXIT
 "$compiler" --quiet tools/clock-probe/main.mlx -o "$work/clock-probe"
 "$compiler" --quiet tools/network-test/fakenetd.mlx -o "$work/fakenetd"
 "$compiler" --quiet projects/desktop/files/main.mlx -o "$work/mlx-files"
+"$compiler" --quiet tools/x11-clipboard-test/main.mlx -o "$work/x11-clipboard-test"
 xkbcli compile-keymap --layout us > "$work/us.xkb"
 
 # The apps: only these (no system directories), one with an icon.
@@ -513,6 +519,91 @@ SCRIPT
     echo "ok   an entry dragged onto a folder in the dock's stack moves into it"
     grep -q "^drag: dropped on Dst" "$work/stack-out.log" && [[ -e "$home/Dst/b.txt" && -e "$home/Downloads/b.txt" ]] || fail "stacks: an entry dragged out of the stack was not copied into the file manager's folder ($(ls "$home/Dst" | tr '\n' ' '))" "$work/stack-out.log"
     echo "ok   an entry dragged out of the dock's stack is copied where the file manager shows"
+}
+
+# The clipboard: the file manager's copies for Wayland and X programs,
+# its pastes from them, and text both ways between wl-copy/wl-paste and
+# an X program (the X window manager keeps CLIPBOARD and the Wayland
+# selection one). stack_run's home and configuration; Xwayland when it is
+# there.
+clipboard() {
+    if ! command -v wl-copy > /dev/null || ! command -v wl-paste > /dev/null; then
+        echo "skip clipboard: wl-clipboard is not installed"
+        return
+    fi
+    local home="$work/stacks/home" out="$work/clip-out"
+    mkdir -p "$home/Src/Folder" "$home/Paste" "$out"
+    echo alpha > "$home/Src/a.txt"
+    echo gamma > "$home/Other/c d.txt"
+    # Ctrl+A, Ctrl+C in the file manager, then the others read.
+    cat > "$work/clip-copy.script" <<SCRIPT
+wait 3000
+down 29
+down 30
+up 30
+down 46
+up 46
+up 29
+wait 6000
+close
+SCRIPT
+    cat > "$work/clip-readers.sh" <<SCRIPT
+#!/bin/sh
+sleep 4
+timeout 5 wl-paste -n -t x-special/gnome-copied-files > "$out/gnome" 2>&1
+timeout 5 "$work/x11-clipboard-test" read text/uri-list > "$out/x-uris" 2> "$out/x-uris.err"
+SCRIPT
+    chmod +x "$work/clip-readers.sh"
+    cat > "$work/clip-files.sh" <<SCRIPT
+#!/bin/sh
+"$work/clip-readers.sh" &
+exec "$work/mlx-files" "$home/Src"
+SCRIPT
+    chmod +x "$work/clip-files.sh"
+    stack_run clip-copy "$work/clip-files.sh"
+    [[ "$(cat "$out/gnome")" == "$(printf 'copy\nfile://%s/Src/Folder\nfile://%s/Src/a.txt' "$home" "$home")" ]] || fail "clipboard: wl-paste did not get the copied files as GNOME's list ($(cat "$out/gnome"))" "$work/clip-copy.log"
+    [[ "$(cat "$out/x-uris")" == "$(printf 'file://%s/Src/Folder\r\nfile://%s/Src/a.txt\r' "$home" "$home")" ]] || fail "clipboard: the X program did not get the copied files as URIs ($(cat "$out/x-uris" "$out/x-uris.err"))" "$work/clip-copy.log"
+    echo "ok   files copied in the file manager reach wl-paste (GNOME's list) and an X program (URIs)"
+    # wl-copy's URI list pasted with Ctrl+V (after a click on the window).
+    cat > "$work/clip-paste.script" <<SCRIPT
+wait 4500
+pointer 500 300
+press 272
+release 272
+wait 300
+down 29
+down 47
+up 47
+up 29
+wait 2000
+close
+SCRIPT
+    cat > "$work/clip-paster.sh" <<SCRIPT
+#!/bin/sh
+(sleep 2; printf 'file://%s\r\n' "$home/Other/c%20d.txt" | wl-copy -t text/uri-list) &
+exec "$work/mlx-files" "$home/Paste"
+SCRIPT
+    chmod +x "$work/clip-paster.sh"
+    stack_run clip-paste "$work/clip-paster.sh"
+    [[ -e "$home/Paste/c d.txt" && -e "$home/Other/c d.txt" ]] || fail "clipboard: Ctrl+V did not paste the file wl-copy put up ($(ls "$home/Paste" | tr '\n' ' '))" "$work/clip-paste.log"
+    echo "ok   Ctrl+V in the file manager pastes files another program copied"
+    # Text from Wayland to X and from X to Wayland.
+    printf 'wait 12000\nclose\n' > "$work/clip-text.script"
+    cat > "$work/clip-words.sh" <<SCRIPT
+#!/bin/sh
+sleep 1
+printf 'hello from wayland' | wl-copy
+sleep 2
+"$work/x11-clipboard-test" read UTF8_STRING > "$out/x-text" 2> "$out/x-text.err"
+"$work/x11-clipboard-test" own 'hello from x11' > /dev/null 2> "$out/own.err" &
+sleep 2
+timeout 5 wl-paste -n > "$out/wl-text" 2>&1
+SCRIPT
+    chmod +x "$work/clip-words.sh"
+    stack_run clip-text "$work/clip-words.sh"
+    [[ "$(cat "$out/x-text")" == "hello from wayland" ]] || fail "clipboard: the X program did not read wl-copy's text ($(cat "$out/x-text" "$out/x-text.err"))" "$work/clip-text.log"
+    [[ "$(cat "$out/wl-text")" == "hello from x11" ]] || fail "clipboard: wl-paste did not read the X program's text ($(cat "$out/wl-text" "$out/own.err"))" "$work/clip-text.log"
+    echo "ok   text goes from wl-copy to an X program and from an X program to wl-paste"
 }
 
 # The top bar with a terminal, at a fixed time (2024-09-27 14:05 UTC, 16:05
@@ -1385,6 +1476,7 @@ PY
 
 drops
 stacks
+clipboard
 topbar
 topbar_bus
 control_centre

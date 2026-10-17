@@ -246,7 +246,11 @@ stream socket, without libc or libxcb: the connection setup, the requests
 a window manager sends (InternAtom, CreateWindow, ChangeWindowAttributes,
 MapWindow, ConfigureWindow, ChangeProperty, GetProperty, SendEvent,
 SetInputFocus, SetSelectionOwner, KillClient, QueryExtension and
-Composite's RedirectSubwindows) and the messages it reads back. It never
+Composite's RedirectSubwindows), the selection requests (ConvertSelection,
+SetSelectionOwner at a given time, GetProperty in parts
+with delete, DeleteProperty, ChangeProperty of any size in appended parts,
+GetAtomName, SelectionNotify, XFixes' SelectSelectionInput) and the
+messages it reads back. It never
 waits for the server: `fill` reads what arrived, `take` hands out one
 complete message (the setup's answer, a reply, an error or an event) at a
 time, and requests with a reply return their sequence number. The
