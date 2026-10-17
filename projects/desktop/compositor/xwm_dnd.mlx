@@ -12,9 +12,23 @@
 // goes, and XdndDrop on release when its last status accepted. Its
 // status is the Wayland source's (a type taken or none, the action), and
 // its XdndFinished ends the Wayland drag (dnd_finished).
+//
+// An X program's drag (it took XdndSelection, XFixes tells): its types
+// are read (XdndTypeList, else those its XdndEnter names). While its
+// button is held the X window keeps the pointer (an implicit grab: motion
+// goes on to Xwayland outside the window), so the program goes on
+// dragging. Off X windows a proxy window over the whole screen (input
+// only, XdndAware) is mapped on top: the program sends it XDND, and the
+// compositor drags an X source (data.mlx) over the Wayland surfaces. Each
+// XdndPosition is answered with the Wayland target's acceptance; XdndDrop
+// drops there (the target reads XdndSelection through
+// xwm_selection.mlx), and the target's finish is the program's
+// XdndFinished. Over X windows again the proxy is unmapped and X windows
+// take the drag among themselves.
 const std = @import("std")
 const x11 = @import("std.x11")
 const state = @import("./state.mlx")
+const scene = @import("./scene.mlx")
 const data_module = @import("./data.mlx")
 const xwm_module = @import("./xwm.mlx")
 const xwm_selection = @import("./xwm_selection.mlx")
@@ -32,7 +46,8 @@ const A_TYPE_LIST: usize = 7
 const A_COPY: usize = 8
 const A_MOVE: usize = 9
 const A_ASK: usize = 10
-const ATOMS: usize = 11
+const A_UTF8_STRING: usize = 11
+const ATOMS: usize = 12
 
 fn atomText(index: usize) -> []const u8 {
     if index == A_AWARE { return "XdndAware" }
@@ -45,17 +60,21 @@ fn atomText(index: usize) -> []const u8 {
     if index == A_TYPE_LIST { return "XdndTypeList" }
     if index == A_COPY { return "XdndActionCopy" }
     if index == A_MOVE { return "XdndActionMove" }
+    if index == A_UTF8_STRING { return "UTF8_STRING" }
     return "XdndActionAsk"
 }
 
 // The version spoken (the target's, when lower).
 const VERSION: u32 = 5
 const NO_SEQUENCE: u32 = 65536
+// An X program's types kept, and room for their names.
+const X_TYPES: usize = 8
+const X_NAMES: usize = 512
 
 pub const Dnd = struct {
     compositor: *Compositor
     connection: *x11.Connection
-    atoms: [11]u32
+    atoms: [12]u32
     atomSequence: u32
     atomsLeft: usize
     // The X window a Wayland drag is over (0: none) and its surface; its
@@ -76,6 +95,31 @@ pub const Dnd = struct {
     // (0: none) and the window.
     finishing: usize
     finishTarget: u32
+    // An X program's drag: the window owning XdndSelection (0: none) and
+    // whether its drag may still leave X windows (until the buttons are
+    // up); the window its messages come from; its types (atoms and their
+    // names: a length byte and the name each, at xNameAt) and the replies
+    // awaited for them; the proxy window (0: not made yet; whether
+    // mapped); the X source dragged over Wayland surfaces (0: none), the
+    // action asked for (an atom), and whether it was dropped and awaits
+    // the Wayland target's finish.
+    xOwner: u32
+    xActive: bool
+    xFrom: u32
+    xAtoms: [8]u32
+    xNameSequences: [8]u32
+    xNameAt: [8]usize
+    xCount: usize
+    xNamesLeft: usize
+    xNames: [512]u8
+    xNamesLength: usize
+    xTypesSequence: u32
+    xEntered: bool
+    proxy: u32
+    proxyMapped: bool
+    xSource: usize
+    xAction: u32
+    xDropped: bool
 }
 
 fn dndOf(compositor: *Compositor) -> *Dnd {
@@ -98,6 +142,16 @@ pub fn start(compositor: *Compositor, connection: *x11.Connection) -> void {
     dnd.*.waiting = false
     dnd.*.accepted = false
     dnd.*.finishing = 0
+    dnd.*.xOwner = 0
+    dnd.*.xActive = false
+    dnd.*.xCount = 0
+    dnd.*.xNamesLeft = 0
+    dnd.*.xTypesSequence = NO_SEQUENCE
+    dnd.*.xEntered = false
+    dnd.*.proxy = 0
+    dnd.*.proxyMapped = false
+    dnd.*.xSource = 0
+    dnd.*.xDropped = false
     dnd.*.atomsLeft = ATOMS
     var index: usize = 0
     while index < ATOMS {
@@ -109,6 +163,9 @@ pub fn start(compositor: *Compositor, connection: *x11.Connection) -> void {
 
 pub fn stop(compositor: *Compositor) -> void {
     if compositor.*.xdnd == 0 { return }
+    const source = dndOf(compositor).*.xSource
+    dndOf(compositor).*.xSource = 0
+    if source != 0 { data_module.dropXSource(compositor, source) }
     unsafe { state.release(compositor, @ptrCast([*]u8, dndOf(compositor)), @sizeOf(Dnd)) }
     compositor.*.xdnd = 0
 }
@@ -126,7 +183,11 @@ fn forget(dnd: *Dnd) -> void {
 }
 
 fn send(dnd: *Dnd, window: u32, kind: usize, first: u32, second: u32, third: u32, fourth: u32) -> void {
-    var values: [5]u32 = [5]u32{ xwm_selection.windowOf(dnd.*.compositor), first, second, third, fourth }
+    sendFrom(dnd, xwm_selection.windowOf(dnd.*.compositor), window, kind, first, second, third, fourth)
+}
+
+fn sendFrom(dnd: *Dnd, from: u32, window: u32, kind: usize, first: u32, second: u32, third: u32, fourth: u32) -> void {
+    var values: [5]u32 = [5]u32{ from, first, second, third, fourth }
     x11.sendClientMessage5(dnd.*.connection, window, dnd.*.atoms[kind], &values)
 }
 
@@ -251,6 +312,20 @@ pub fn reply(compositor: *Compositor, sequence: u32, data: [*]const u8) -> bool 
             return true
         }
     }
+    if sequence == dnd.*.xTypesSequence {
+        dnd.*.xTypesSequence = NO_SEQUENCE
+        if x11.propertyFormat(data) == 32 { askNames(dnd, x11.propertyValue(data), x11.propertyBytes(data) / 4) }
+        return true
+    }
+    var index: usize = 0
+    while index < dnd.*.xCount && dnd.*.xNamesLeft > 0 {
+        if dnd.*.xNameSequences[index] == sequence {
+            dnd.*.xNameSequences[index] = NO_SEQUENCE
+            nameRead(dnd, index, x11.atomName(data))
+            return true
+        }
+        index += 1
+    }
     if sequence != dnd.*.awareSequence { return false }
     dnd.*.awareSequence = NO_SEQUENCE
     // XdndAware: the version the window speaks (from 3 on).
@@ -270,7 +345,12 @@ pub fn reply(compositor: *Compositor, sequence: u32, data: [*]const u8) -> bool 
 pub fn event(compositor: *Compositor, kind: u8, data: [*]const u8) -> bool {
     if compositor.*.xdnd == 0 || kind != x11.CLIENT_MESSAGE { return false }
     const dnd = dndOf(compositor)
-    if dnd.*.atomsLeft > 0 || x11.get32(data, 4) != xwm_selection.windowOf(compositor) { return false }
+    if dnd.*.atomsLeft > 0 { return false }
+    if dnd.*.proxy != 0 && x11.get32(data, 4) == dnd.*.proxy {
+        proxyMessage(dnd, data)
+        return true
+    }
+    if x11.get32(data, 4) != xwm_selection.windowOf(compositor) { return false }
     const message = x11.get32(data, 8)
     const from = x11.get32(data, 12)
     if message == dnd.*.atoms[A_STATUS] {
@@ -295,4 +375,265 @@ pub fn event(compositor: *Compositor, kind: u8, data: [*]const u8) -> bool {
         return true
     }
     return false
+}
+
+// ---------------------------------------------------------------------------
+// An X program's drag, onto Wayland surfaces
+
+// XdndSelection has a new owner (NONE: nobody, or the window manager): an
+// X program's drag begins (its types are read), or the last one is gone.
+pub fn ownerChanged(compositor: *Compositor, owner: u32) -> void {
+    if compositor.*.xdnd == 0 { return }
+    const dnd = dndOf(compositor)
+    if dnd.*.xDropped && owner != x11.NONE { return }
+    endXDrag(dnd)
+    if owner == x11.NONE || dnd.*.atomsLeft > 0 { return }
+    dnd.*.xOwner = owner
+    dnd.*.xActive = compositor.*.buttonsDown > 0
+    dnd.*.xFrom = owner
+    dnd.*.xTypesSequence = x11.getProperty(dnd.*.connection, owner, dnd.*.atoms[A_TYPE_LIST], x11.ATOM_ATOM, @intCast(u32, X_TYPES))
+}
+
+// The names of the drag's types are asked for (`count` atoms at `atoms`).
+fn askNames(dnd: *Dnd, atoms: [*]const u8, count: usize) -> void {
+    if dnd.*.xCount > 0 { return }
+    dnd.*.xNamesLength = 0
+    var index: usize = 0
+    while index < count && dnd.*.xCount < X_TYPES {
+        const atom = x11.get32(atoms, index * 4)
+        if atom != x11.NONE {
+            dnd.*.xAtoms[dnd.*.xCount] = atom
+            dnd.*.xNameAt[dnd.*.xCount] = X_NAMES
+            dnd.*.xNameSequences[dnd.*.xCount] = x11.getAtomName(dnd.*.connection, atom)
+            dnd.*.xCount += 1
+        }
+        index += 1
+    }
+    dnd.*.xNamesLeft = dnd.*.xCount
+}
+
+fn nameRead(dnd: *Dnd, index: usize, name: []const u8) -> void {
+    if name.length < 256 && dnd.*.xNamesLength + 1 + name.length <= X_NAMES {
+        const at = dnd.*.xNamesLength
+        dnd.*.xNames[at] = @intCast(u8, name.length)
+        var byte: usize = 0
+        while byte < name.length {
+            dnd.*.xNames[at + 1 + byte] = name[byte]
+            byte += 1
+        }
+        dnd.*.xNameAt[index] = at
+        dnd.*.xNamesLength += 1 + name.length
+    }
+    dnd.*.xNamesLeft -= 1
+    // Its XdndEnter came before the names: the drag goes on now.
+    if dnd.*.xNamesLeft == 0 && dnd.*.xEntered { startWaylandDrag(dnd) }
+}
+
+fn nameAt(dnd: *Dnd, index: usize) -> []const u8 {
+    const at = dnd.*.xNameAt[index]
+    if at >= X_NAMES { return "" }
+    const length = @intCast(usize, dnd.*.xNames[at])
+    return dnd.*.xNames[at + 1..at + 1 + length]
+}
+
+fn hasSlash(name: []const u8) -> bool {
+    for byte in name {
+        if byte == 47 { return true }
+    }
+    return false
+}
+
+fn isText(name: []const u8) -> bool {
+    return std.text.same(name, "UTF8_STRING") || std.text.same(name, "TEXT") || std.text.same(name, "STRING")
+}
+
+// The proxy over the whole screen, on top (made the first time), or gone.
+fn showProxy(dnd: *Dnd, shown: bool) -> void {
+    if shown == dnd.*.proxyMapped { return }
+    const connection = dnd.*.connection
+    if shown && dnd.*.proxy == 0 {
+        dnd.*.proxy = x11.generateId(connection)
+        x11.createInputWindow(connection, dnd.*.proxy, connection.*.root)
+        x11.changeProperty32(connection, dnd.*.proxy, dnd.*.atoms[A_AWARE], x11.ATOM_ATOM, VERSION)
+    }
+    if dnd.*.proxy == 0 { return }
+    if shown {
+        const compositor = dnd.*.compositor
+        var values: [5]u32 = [5]u32{ 0, 0, @intCast(u32, compositor.*.width), @intCast(u32, compositor.*.height), x11.STACK_ABOVE }
+        x11.configureWindow(connection, dnd.*.proxy, x11.CONFIG_X | x11.CONFIG_Y | x11.CONFIG_WIDTH | x11.CONFIG_HEIGHT | x11.CONFIG_STACK_MODE, &values, 5)
+        x11.mapWindow(connection, dnd.*.proxy)
+    } else {
+        x11.unmapWindow(connection, dnd.*.proxy)
+    }
+    dnd.*.proxyMapped = shown
+}
+
+// The pointer moved: true while an X program's drag holds it (its button
+// held, pressed on an X window): the X window keeps the pointer, and the
+// proxy shows while the pointer is off X windows.
+pub fn pointerMoved(compositor: *Compositor) -> bool {
+    if compositor.*.xdnd == 0 { return false }
+    const dnd = dndOf(compositor)
+    if !dnd.*.xActive { return false }
+    if compositor.*.buttonsDown == 0 || !isX(compositor, compositor.*.pointerFocus) {
+        // Let go over X windows: theirs alone, and the Wayland drag (if
+        // it began) is over. Over the proxy the program's XdndDrop or
+        // XdndLeave ends it.
+        if !dnd.*.proxyMapped && !dnd.*.xDropped {
+            endXDrag(dnd)
+            return false
+        }
+        if dnd.*.xSource == 0 { dnd.*.xActive = false }
+        showProxy(dnd, false)
+        return false
+    }
+    showProxy(dnd, !isX(compositor, scene.surfaceAtPoint(compositor, compositor.*.pointerX, compositor.*.pointerY)))
+    return true
+}
+
+// Whether the drag runs as the X source's (the buttons go to Xwayland,
+// whose program drops it).
+pub fn xDragging(compositor: *Compositor) -> bool {
+    if compositor.*.xdnd == 0 { return false }
+    const dnd = dndOf(compositor)
+    return dnd.*.xSource != 0 && compositor.*.dragging && compositor.*.dragSource == dnd.*.xSource
+}
+
+// Whether `address` is the X program's drag source (data.mlx).
+pub fn isDragSource(compositor: *Compositor, address: usize) -> bool {
+    return compositor.*.xdnd != 0 && address != 0 && dndOf(compositor).*.xSource == address
+}
+
+// The Wayland drag of the X program's types begins (its types known and
+// its XdndEnter in).
+fn startWaylandDrag(dnd: *Dnd) -> void {
+    const compositor = dnd.*.compositor
+    if dnd.*.xSource != 0 || dnd.*.xNamesLeft > 0 || compositor.*.dragging { return }
+    const source = data_module.newXSource(compositor)
+    var text = false
+    var index: usize = 0
+    while index < dnd.*.xCount {
+        const name = nameAt(dnd, index)
+        if isText(name) {
+            text = true
+        } else if hasSlash(name) {
+            data_module.addXSourceType(source, name)
+        }
+        index += 1
+    }
+    if text {
+        data_module.addXSourceType(source, "text/plain;charset=utf-8")
+        data_module.addXSourceType(source, "text/plain")
+    }
+    if data_module.typesOf(source).length == 0 {
+        data_module.dropXSource(compositor, source)
+        return
+    }
+    dnd.*.xSource = source
+    data_module.setXSourceActions(source, actionsOf(dnd))
+    data_module.startXDrag(compositor, source)
+}
+
+// The Wayland actions for the action the program asks for: copy always,
+// move or ask too when asked.
+fn actionsOf(dnd: *Dnd) -> u32 {
+    if dnd.*.xAction == dnd.*.atoms[A_MOVE] { return 3 }
+    if dnd.*.xAction == dnd.*.atoms[A_ASK] { return 5 }
+    return 1
+}
+
+// The XDND action atom for a Wayland action.
+fn xdndAction(dnd: *Dnd, action: u32) -> u32 {
+    if action == 2 { return dnd.*.atoms[A_MOVE] }
+    if action == 4 { return dnd.*.atoms[A_ASK] }
+    if action == 0 { return x11.NONE }
+    return dnd.*.atoms[A_COPY]
+}
+
+// A message from the program to the proxy.
+fn proxyMessage(dnd: *Dnd, data: [*]const u8) -> void {
+    const compositor = dnd.*.compositor
+    const message = x11.get32(data, 8)
+    const from = x11.get32(data, 12)
+    if message == dnd.*.atoms[A_ENTER] {
+        dnd.*.xFrom = from
+        dnd.*.xEntered = true
+        // The types it names when it has no XdndTypeList.
+        if dnd.*.xCount == 0 && dnd.*.xTypesSequence == NO_SEQUENCE { askNames(dnd, data + 20, 3) }
+        if compositor.*.verbose { state.say("xdnd: an X program's drag left its windows\n") }
+        startWaylandDrag(dnd)
+        return
+    }
+    if message == dnd.*.atoms[A_POSITION] {
+        dnd.*.xFrom = from
+        const asked = x11.get32(data, 28)
+        if asked != dnd.*.xAction {
+            dnd.*.xAction = asked
+            if dnd.*.xSource != 0 { data_module.setXSourceActions(dnd.*.xSource, actionsOf(dnd)) }
+        }
+        // Positions keep coming (bit 1), the target's acceptance answers.
+        const action = data_module.xDragAction(compositor)
+        sendFrom(dnd, dnd.*.proxy, from, A_STATUS, (if action != 0 { 1 } else { 0 }) | 2, 0, 0, xdndAction(dnd, action))
+        return
+    }
+    if message == dnd.*.atoms[A_LEAVE] {
+        // Back over X windows (the button still held), or let go where
+        // nothing took it.
+        if compositor.*.buttonsDown > 0 { return }
+        endXDrag(dnd)
+        return
+    }
+    if message == dnd.*.atoms[A_DROP] {
+        if data_module.xDrop(compositor) {
+            dnd.*.xDropped = true
+            return
+        }
+        sendFrom(dnd, dnd.*.proxy, from, A_FINISHED, 0, x11.NONE, 0, 0)
+        endXDrag(dnd)
+    }
+}
+
+// The Wayland target finished reading what the program dropped
+// (data.mlx), with `action`.
+pub fn waylandFinished(compositor: *Compositor, action: u32) -> void {
+    if compositor.*.xdnd == 0 { return }
+    const dnd = dndOf(compositor)
+    if !dnd.*.xDropped { return }
+    sendFrom(dnd, dnd.*.proxy, dnd.*.xFrom, A_FINISHED, 1, xdndAction(dnd, action), 0, 0)
+    if compositor.*.verbose { state.say("xdnd: the X program's drop was taken\n") }
+    endXDrag(dnd)
+}
+
+// A Wayland client reads the program's drag as `mime` into `descriptor`
+// (ours to close).
+pub fn receive(compositor: *Compositor, mime: []const u8, descriptor: isize) -> void {
+    const dnd = dndOf(compositor)
+    var target = x11.NONE
+    var index: usize = 0
+    while index < dnd.*.xCount {
+        const name = nameAt(dnd, index)
+        if std.text.same(name, mime) { target = dnd.*.xAtoms[index] }
+        if isText(name) && target == x11.NONE && (std.text.same(mime, "text/plain;charset=utf-8") || std.text.same(mime, "text/plain")) { target = dnd.*.xAtoms[index] }
+        index += 1
+    }
+    xwm_selection.receiveDrag(compositor, target, descriptor)
+}
+
+// The program's drag is over: the proxy goes, and the X source (a
+// Wayland drag of it still running ends, nothing dropped).
+fn endXDrag(dnd: *Dnd) -> void {
+    showProxy(dnd, false)
+    const compositor = dnd.*.compositor
+    const source = dnd.*.xSource
+    dnd.*.xSource = 0
+    if source != 0 && compositor.*.dragging && compositor.*.dragSource == source && compositor.*.verbose { state.say("drag: ended by the X program\n") }
+    if source != 0 { data_module.dropXSource(compositor, source) }
+    dnd.*.xOwner = 0
+    dnd.*.xActive = false
+    dnd.*.xCount = 0
+    dnd.*.xNamesLeft = 0
+    dnd.*.xTypesSequence = NO_SEQUENCE
+    dnd.*.xEntered = false
+    dnd.*.xAction = 0
+    dnd.*.xDropped = false
 }

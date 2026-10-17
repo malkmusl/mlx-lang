@@ -1550,6 +1550,22 @@ wire protocol without libc or libxcb):
   takes no drops; released there, the drag is cancelled.
   `tools/x11-dnd-test target` is such an X window for the checks (`xdnd`
   in `tools/check_desktop_clients.sh`).
+- From X to Wayland: an X program taking `XdndSelection` (XFixes tells)
+  begins a drag; its types are read (`XdndTypeList`, else those its
+  `XdndEnter` names). While its button is held the X window keeps the
+  pointer, as an X server's implicit grab would: motion goes on to
+  Xwayland outside the window, so the program keeps dragging. Off X
+  windows the window manager maps a proxy over the whole screen (input
+  only, `XdndAware`, on top), the program sends it XDND, and the
+  compositor drags an X source over the Wayland surfaces (`drag: started
+  from an X program`). Each `XdndPosition` is answered with the Wayland
+  target's acceptance; `XdndDrop` drops there, the target reads
+  `XdndSelection` like an X `CLIPBOARD` (in parts, or `INCR`), and its
+  finish is the program's `XdndFinished`. Over X windows again the proxy
+  is unmapped and X windows take the drag among themselves; let go there,
+  or where nothing takes it, the Wayland drag ends (`drag: ended by the X
+  program`). `tools/x11-dnd-test source URI` drags like this
+  (`xdnd_from_x` in the checks).
 
 `--xwayland PROGRAM` names another X server, `--xwayland none` runs none.
 The log (`--verbose`) says what happens:

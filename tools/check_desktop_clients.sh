@@ -694,6 +694,109 @@ SCRIPT
     fi
 }
 
+# Drag and drop from X to Wayland: tools/x11-dnd-test source drags a file
+# by XDND from its window (64,56) while the file manager (24,24) shows
+# another folder. Off its window the compositor's proxy takes the drag and
+# drags it over the file manager, which copies the file in; dragged out
+# and back onto tools/x11-dnd-test target's window (104,88) it goes from
+# X to X, and the Wayland drag ends: a click after it reaches the file
+# manager (the drag source's window, which came last, has the keyboard
+# once the X windows end with their drop); let go over the empty desktop,
+# nothing takes it.
+xdnd_from_x() {
+    if ! command -v Xwayland > /dev/null; then
+        echo "skip xdnd from x: Xwayland is not installed"
+        return
+    fi
+    local home="$work/stacks/home" out="$work/xdnd-out"
+    mkdir -p "$home/XSrc" "$home/XDst" "$out"
+    echo from-x > "$home/XSrc/x.txt"
+    cat > "$work/xdnd-x-clients.sh" <<SCRIPT
+#!/bin/sh
+"$work/mlx-files" "$home/XDst" &
+sleep 2
+exec "$work/x11-dnd-test" source "file://$home/XSrc/x.txt" > /dev/null 2> "$out/x-source.err"
+SCRIPT
+    chmod +x "$work/xdnd-x-clients.sh"
+    cat > "$work/xdnd-x.script" <<SCRIPT
+wait 5000
+pointer 150 150
+wait 200
+press 272
+wait 100
+pointer 160 160
+wait 100
+pointer 200 200
+wait 100
+pointer 450 300
+wait 200
+pointer 600 320
+wait 300
+pointer 610 330
+wait 400
+release 272
+wait 2000
+close
+SCRIPT
+    stack_run xdnd-x "/bin/sh $work/xdnd-x-clients.sh"
+    local log="$work/xdnd-x.log"
+    [[ "$(grep "^drag: \|^xdnd: " "$log" | tr '\n' ',')" == "xdnd: an X program's drag left its windows,drag: started from an X program,drag: dropped on XDst,xdnd: the X program's drop was taken,drag: finished," ]] || fail "xdnd from x: the X program's drag did not go over the file manager ($(grep "^drag: \|^xdnd: " "$log" | tr '\n' ' '))" "$log"
+    grep -q "^x11-dnd-test: finished, taken" "$out/x-source.err" && [[ -f "$home/XDst/x.txt" ]] || fail "xdnd from x: the file dragged from the X program was not copied in ($(cat "$out/x-source.err"))" "$log"
+    echo "ok   an X program's drag goes on over a Wayland window, which takes the file; the program hears it was taken"
+    cat > "$work/xdnd-back-clients.sh" <<SCRIPT
+#!/bin/sh
+"$work/mlx-files" "$home/XDst" &
+sleep 2
+"$work/x11-dnd-test" source file:///tmp/y.txt > /dev/null 2> "$out/back-source.err" &
+sleep 1
+"$work/x11-dnd-test" target > "$out/back-dropped" 2> "$out/back-target.err" &
+sleep 1
+exec "$work/drag-source" file:///tmp/unused
+SCRIPT
+    chmod +x "$work/xdnd-back-clients.sh"
+    # X Drop overlaps X Drag, which a press raises: (390,270) is X Drop's.
+    cat > "$work/xdnd-back.script" <<SCRIPT
+wait 5000
+pointer 80 70
+wait 200
+press 272
+wait 100
+pointer 85 75
+wait 100
+pointer 300 400
+wait 100
+pointer 500 450
+wait 200
+pointer 700 500
+wait 300
+pointer 390 270
+wait 300
+pointer 392 275
+wait 400
+release 272
+wait 500
+pointer 600 400
+wait 300
+pointer 610 410
+wait 300
+press 272
+release 272
+wait 800
+close
+SCRIPT
+    stack_run xdnd-back "/bin/sh $work/xdnd-back-clients.sh"
+    log="$work/xdnd-back.log"
+    [[ "$(cat "$out/back-dropped")" == "file:///tmp/y.txt" ]] || fail "xdnd from x: dragged over Wayland and back, the X window did not get the drop ($(cat "$out/back-target.err"))" "$log"
+    grep -q "^drag: ended by the X program" "$log" || fail "xdnd from x: the Wayland drag did not end when the X program dropped on an X window" "$log"
+    sed -n '/^drag: ended by the X program/,/^client disconnected/p' "$log" | grep -q "^focus: XDst" || fail "xdnd from x: after the drag a click did not reach the file manager" "$log"
+    echo "ok   dragged out over Wayland and back, X windows take it among themselves and the pointer is the clients' again"
+    sed 's/^pointer 600 320$/pointer 1000 700/; s/^pointer 610 330$/pointer 1005 705/' "$work/xdnd-x.script" > "$work/xdnd-desk.script"
+    sed 's/x-source.err/desk-source.err/; s/XSrc\/x.txt/XSrc\/none.txt/' "$work/xdnd-x-clients.sh" > "$work/xdnd-desk-clients.sh"
+    stack_run xdnd-desk "/bin/sh $work/xdnd-desk-clients.sh"
+    grep -q "^x11-dnd-test: let go where nothing takes it" "$out/desk-source.err" && grep -q "^drag: ended by the X program" "$work/xdnd-desk.log" || fail "xdnd from x: let go over the desktop, the drag did not end untaken ($(cat "$out/desk-source.err"))" "$work/xdnd-desk.log"
+    echo "ok   an X program's drag let go over the empty desktop ends untaken"
+}
+
 # The dock out of the way of windows (dock-autohide = smart): the drag
 # source's window maximized (Super+Up) covers the dock, restored it does
 # not. stack_run's home; its configuration with the setting, taken away
@@ -2070,6 +2173,7 @@ drops
 stacks
 clipboard
 xdnd
+xdnd_from_x
 smart_dock
 dock_workspaces
 dock_hover
