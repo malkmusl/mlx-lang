@@ -1,4 +1,4 @@
-// Lambdas in a generic lambda's instance (PropertyTable's withIndexVector / forEachProperty): the class's members and member templates through the closures' captured this
+// Lambdas in a generic lambda's instance (PropertyTable's withIndexVector / forEachProperty): the class's members and member templates through the closures' captured this; explicit captures of the outer closure's captures
 #include <stdio.h>
 #include <stdint.h>
 #include <utility>
@@ -43,8 +43,22 @@ struct T {
 int run() { T t; printf("%ld %ld %ld %ld %ld %ld\n", t.a(), t.b(), t.c(), t.d(), t.e(), t.f()); return 0; }
 }
 
+namespace p_lam7 {
+struct T {
+    long base = 1000;
+    template<typename X> long tm(X x) { return base + x; }
+    template<typename F> void each(F&& f) const { for (long i = 1; i <= 2; i++) f(i); }
+    long three() { long s = 0; long k = 5; [&](auto v) { each([&](auto a) { each([&](auto b) { s += tm(a * b) + v + k; }); }); }(10); return s; }
+    long byValue() { long k = 7; long s = 0; [=, &s](auto v) { each([=, &s](auto a) { s += a + v + k + base; }); }(1); return s; }
+    long explicitThis() { long s = 0; [this, &s](auto v) { each([this, &s, v](auto a) { s += this->base + a + v; }); }(1); return s; }
+    long mixed() { long s = 0; auto f = [&](auto v) { return [&, v](long w) { return tm(v + w); }; }; s = f(3)(4); return s; }
+};
+int run() { T t; printf("%ld %ld %ld %ld\n", t.three(), t.byValue(), t.explicitThis(), t.mixed()); return 0; }
+}
+
 int main() {
     p_lam4::run();
     p_lam5::run();
+    p_lam7::run();
     return 0;
 }
