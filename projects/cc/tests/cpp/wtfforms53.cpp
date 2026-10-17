@@ -1,6 +1,7 @@
-// c ? classValue : pointer (and the other way round): the pointer converted to the class by its constructor (JSValue from a GetterSetter *)
+// c ? classValue : other (and the other way round): the other side made into the class by its constructor (JSValue from a GetterSetter *, std::string from a literal); one result destroyed by the expression
 #include <stdio.h>
 #include <stdint.h>
+#include <string>
 
 namespace p_condcls {
 struct Cell { int x; };
@@ -25,7 +26,29 @@ int run() {
 }
 }
 
+namespace p_cond2 {
+struct V { long b; V() : b(0) {} V(int i) : b(100 + i) {} V(const char *) : b(7) {} };
+struct Base { int x = 1; virtual ~Base() {} }; struct Der : Base { int y = 2; };
+static int dtors;
+struct R { int v; R(int x) : v(x) {} R(const R &o) : v(o.v) {} ~R() { dtors++; } };
+int run() {
+    bool t = true, f = false;
+    V a = t ? V() : 5;
+    V b = f ? 5 : V();
+    V c = t ? "x" : V(3);
+    Der d; Base bb;
+    Base &r = t ? static_cast<Base &>(d) : bb;
+    std::string s = t ? std::string("yes") : "no";
+    std::string s2 = f ? "yes" : std::string("no");
+    R rr = t ? R(1) : R(2);
+    R r2 = f ? 9 : R(3);
+    printf("%ld %ld %ld %d %s %s %d %d\n", a.b, b.b, c.b, r.x, s.c_str(), s2.c_str(), rr.v, r2.v);
+    return 0;
+}
+}
+
 int main() {
     p_condcls::run();
+    p_cond2::run();
     return 0;
 }
