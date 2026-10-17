@@ -139,7 +139,11 @@ a name of another object is a relocation of the standard kinds
 (`R_X86_64_PLT32` for a call, `PC32` for an address, `64` for one held
 by data), and a unit's long double and wide integer initializers that
 are not constants are computed by a function of its own listed in
-`.init_array`. The linker (`compiler/selfhost/object/link.mlx`) resolves
+`.init_array`. Thread-local variables (`_Thread_local`, `thread_local`,
+`__thread`) live in `.tdata`, reached from the thread pointer
+(`mov %fs:0` and `R_X86_64_TPOFF32`); the linker lays them out as the
+program's TLS image (`PT_TLS`), which the dynamic loader copies for
+each thread (`tests/threadlocal.c`). The linker (`compiler/selfhost/object/link.mlx`) resolves
 the references between the objects, makes a stub and a GOT slot for
 every name no object defines (the libraries' functions and variables
 such as `stdout` alike), and makes `_start` and `__mlxcc_init`, which
@@ -692,8 +696,10 @@ into every C++ program by itself as `libmlxcpp.a` from `$MLX_CC_LIB`,
   family is x87 code of mlxlibc's own (`tests/ldouble_math.c` compares
   both C libraries with gcc's output).
 - No variable-length arrays, `_Atomic` qualifier (the `__atomic_*` and
-  `__sync_*` builtins are there), `_Thread_local` (declared, but a
-  plain global), `_Complex`, GCC vector types. Inline
+  `__sync_*` builtins are there), `_Complex`, GCC vector types. A
+  thread-local variable is the program's own (local exec): one in a
+  shared library, or a C++ `thread_local` object constructed per
+  thread, is not supported (the main thread's is constructed at start). Inline
   `asm` has no floating-point register operands (`x`, `t`), no jumps
   out of its text (`asm goto`, a call of a symbol) and no other
   sections; the x87 and AVX instructions are not assembled.
