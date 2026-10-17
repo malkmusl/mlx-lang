@@ -340,7 +340,7 @@ literals (`3_s`, `1.5_s`, `"text"_s`: a call of `operator""_s` with the
 integer as unsigned long long, the floating value as long double, a
 string with its length; `tests/cpp/literals.cpp`); `a != b` and
 `b == a` rewritten from `operator==` (C++20); `__int128` and its
-typedefs as `_BitInt(128)`; default template arguments of function
+typedefs as `_BitInt(128)` aligned to 16 (GCC's); default template arguments of function
 templates (`class = enable_if_t<...>`) taken in deduction, as SFINAE;
 member operator templates (`template <class U> T &operator=(U &&)`);
 friend functions read in their class (its own name is its instance
