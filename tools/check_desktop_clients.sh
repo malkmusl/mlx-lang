@@ -47,6 +47,9 @@
 #     a paste goes) and types two dropped files as quoted paths; a line
 #     selected there is the primary selection (wl-paste --primary), a
 #     middle click pastes it and wl-copy --primary's;
+#   - offers xdg-output (the output's size and name), idle-inhibit and
+#     xdg-activation (tokens only for the program with the keyboard, used
+#     once) to tools/wayland-extras-test;
 #   - with dock-workspaces = on, groups the apps that run by workspace
 #     after the pinned ones (a window moved to workspace 2, one on 1, the
 #     pinned terminal's moved to 3 makes no group) and a click on the app
@@ -112,6 +115,7 @@ trap 'rm -rf -- "$work"' EXIT
 "$compiler" --quiet projects/desktop/launcher/main.mlx -o "$work/mlx-launcher"
 "$compiler" --quiet tools/wayland-test-host/main.mlx -o "$work/test-host"
 "$compiler" --quiet tools/wayland-drag-source/main.mlx -o "$work/drag-source"
+"$compiler" --quiet tools/wayland-extras-test/main.mlx -o "$work/extras-test"
 "$compiler" --quiet projects/desktop/topbar/main.mlx -o "$work/mlx-topbar"
 "$compiler" --quiet tools/topbar-test-services/main.mlx -o "$work/topbar-test-services"
 "$compiler" --quiet tools/session-lock-test/main.mlx -o "$work/session-lock-test"
@@ -913,6 +917,38 @@ SCRIPT
     printf '%s\n' 'hello world' 'hello world' 'from wl-copy' > "$work/primary-expected.txt"
     cmp -s "$work/primary-expected.txt" "$work/primary-typed.txt" || fail "terminal: a middle click did not paste the primary selection ($(tr '\n' '|' < "$work/primary-typed.txt"))" "$log"
     echo "ok   a selection in the terminal is the primary selection, a middle click pastes it and wl-copy --primary's"
+}
+
+# xdg-output, idle-inhibit and xdg-activation (extras.mlx): three windows
+# of tools/wayland-extras-test read the output's size and name and hold
+# an idle inhibitor for a second; the source (with the keyboard) hands a
+# token to the target, which comes forward with it once (the second time
+# is refused); the thief, without the keyboard after a click elsewhere,
+# gets a token that is refused.
+extras() {
+    cat > "$work/extras.script" <<SCRIPT
+wait 7000
+pointer 30 130
+press 272
+release 272
+wait 6000
+close
+SCRIPT
+    cat > "$work/extras-clients.sh" <<SCRIPT
+#!/bin/sh
+"$work/extras-test" target "$work/extras-token.txt" &
+sleep 2
+"$work/extras-test" source "$work/extras-token.txt" &
+sleep 4
+exec "$work/extras-test" thief
+SCRIPT
+    stack_run extras "/bin/sh $work/extras-clients.sh"
+    local log="$work/extras.log"
+    [[ "$(grep -c "^extras: output 1024x768 MLX-1$" "$log")" == 3 ]] || fail "extras: xdg-output did not give the output's size and name" "$log"
+    grep -q "^idle inhibit: on" "$log" && grep -q "^idle inhibit: off" "$log" || fail "extras: the idle inhibitor was not seen to hold and end" "$log"
+    [[ "$(grep "^activation: \|^extras: token written" "$log" | tr '\n' ',')" == "extras: token written,activation: Extras Target,activation: refused,activation: refused," ]] || fail "extras: activation tokens were not honoured once and only for the focused program ($(grep "^activation\|^extras: token" "$log" | tr '\n' ' '))" "$log"
+    echo "ok   xdg-output gives the output's logical size and name, an idle inhibitor holds while its surface shows"
+    echo "ok   an xdg-activation token from the focused program brings a window forward once; one asked for without the keyboard is refused"
 }
 
 # The top bar with a terminal, at a fixed time (2024-09-27 14:05 UTC, 16:05
@@ -1790,6 +1826,7 @@ smart_dock
 dock_workspaces
 terminal_clipboard
 terminal_primary
+extras
 topbar
 topbar_bus
 control_centre

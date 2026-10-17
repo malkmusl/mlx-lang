@@ -1059,7 +1059,18 @@ version 1 (see Pointer lock), `ext_foreign_toplevel_list_v1`,
 `ext_foreign_toplevel_image_capture_source_manager_v1` and
 `ext_image_copy_capture_manager_v1` version 1 (see Screen capture),
 `xwayland_shell_v1` version 1 (to Xwayland alone; see X programs),
-`ext_session_lock_manager_v1` version 1 (see Locking and logging out).
+`ext_session_lock_manager_v1` version 1 (see Locking and logging out),
+`zwp_primary_selection_device_manager_v1` version 1 (see Copy and paste),
+`zxdg_output_manager_v1` version 3 (the output's logical position, size
+and name), `zwp_idle_inhibit_manager_v1` version 1 (a surface keeps the
+screen on while it is mapped: `idle inhibit: on` and `off` in the log)
+and `xdg_activation_v1` version 1 ([`extras.mlx`](extras.mlx)). An
+activation token is good only when the program asking for it had the
+keyboard (or is a part of the desktop in a layer: the dock, the
+launcher), for ten seconds and once, so a program cannot take the focus
+by itself; a window it names comes forward (to its workspace,
+`activation: TITLE`), any other use is `activation: refused`. A greeter
+compositor offers none of these.
 Composition is done in software, or with Vulkan (`--renderer vulkan`).
 
 ### Locking and logging out
