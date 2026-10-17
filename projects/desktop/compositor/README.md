@@ -1530,6 +1530,11 @@ refuses a display without it): the selection is the data source a client
 set last, the focused client receives it as a data offer (when it gains
 focus and when the selection changes), and reading an offer passes the
 reader's pipe to the source's client, which writes the data into it.
+The primary selection (`zwp_primary_selection_device_manager_v1`,
+[`primary.mlx`](primary.mlx)), the text last selected that a middle click
+pastes, goes the same way beside it; only the client with the keyboard
+can set it (`--verbose`: `primary selection: set`). A greeter compositor
+does not offer it.
 
 Drag and drop goes the same way. A client starts a drag while a button is
 held; until the buttons are up the pointer is the drag's (clients get no

@@ -44,7 +44,9 @@
 #     leaves it, one a row taller hides it;
 #   - in the terminal, copies a triple-clicked line and pastes it back
 #     (bracketed), exchanges text with wl-copy and wl-paste (an escape in
-#     a paste goes) and types two dropped files as quoted paths;
+#     a paste goes) and types two dropped files as quoted paths; a line
+#     selected there is the primary selection (wl-paste --primary), a
+#     middle click pastes it and wl-copy --primary's;
 #   - with dock-workspaces = on, groups the apps that run by workspace
 #     after the pinned ones (a window moved to workspace 2, one on 1, the
 #     pinned terminal's moved to 3 makes no group) and a click on the app
@@ -857,6 +859,60 @@ SCRIPT
     echo "ok   the terminal copies a triple-clicked line and pastes it back, bracketed"
     echo "ok   the terminal pastes from wl-copy without the escape in it, and wl-paste reads its selection"
     echo "ok   files dropped on the terminal come as quoted paths"
+}
+
+# The primary selection (zwp_primary_selection): a line selected in the
+# terminal with a triple click is it (wl-paste --primary reads it), a
+# middle click pastes it, and one wl-copy --primary set.
+terminal_primary() {
+    if ! command -v wl-copy > /dev/null || ! command -v wl-paste > /dev/null; then
+        echo "skip terminal primary selection: wl-clipboard is not installed"
+        return
+    fi
+    cat > "$work/primary-clients.sh" <<SCRIPT
+#!/bin/sh
+"$work/mlx-terminal" /bin/sh -c 'stty -echo; cat -v | tee "$work/primary-typed.txt"' &
+sleep 5
+wl-paste --primary -n > "$work/primary-pasted.txt"
+sleep 1
+printf 'from wl-copy' | wl-copy --primary
+wait
+SCRIPT
+    cat > "$work/terminal-primary.script" <<SCRIPT
+wait 2500
+type hello world
+enter
+wait 1000
+pointer 40 38
+wait 100
+press 272
+release 272
+wait 50
+press 272
+release 272
+wait 50
+press 272
+release 272
+wait 300
+press 274
+release 274
+wait 300
+enter
+wait 3000
+pointer 400 300
+press 274
+release 274
+wait 300
+enter
+wait 1000
+close
+SCRIPT
+    stack_run terminal-primary "/bin/sh $work/primary-clients.sh"
+    local log="$work/terminal-primary.log"
+    [[ "$(cat "$work/primary-pasted.txt" 2> /dev/null)" == "hello world" ]] || fail "terminal: wl-paste --primary did not read the line selected ($(cat "$work/primary-pasted.txt" 2> /dev/null))" "$log"
+    printf '%s\n' 'hello world' 'hello world' 'from wl-copy' > "$work/primary-expected.txt"
+    cmp -s "$work/primary-expected.txt" "$work/primary-typed.txt" || fail "terminal: a middle click did not paste the primary selection ($(tr '\n' '|' < "$work/primary-typed.txt"))" "$log"
+    echo "ok   a selection in the terminal is the primary selection, a middle click pastes it and wl-copy --primary's"
 }
 
 # The top bar with a terminal, at a fixed time (2024-09-27 14:05 UTC, 16:05
@@ -1733,6 +1789,7 @@ clipboard
 smart_dock
 dock_workspaces
 terminal_clipboard
+terminal_primary
 topbar
 topbar_bus
 control_centre

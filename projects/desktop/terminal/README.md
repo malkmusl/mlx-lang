@@ -38,6 +38,8 @@ tools/check_terminal.sh              # the emulation, the drawing, the pty
   history. Ctrl+Shift+C or Ctrl+Insert copies it to the clipboard (blanks
   at line ends dropped, a line the program wrapped kept as one);
   Ctrl+Shift+V or Shift+Insert pastes, from any Wayland or X program.
+  What is selected is also the primary selection, which a middle click
+  pastes here and in other Wayland programs.
 - Pastes are filtered: escape and the other control characters go, so a
   pasted text cannot end bracketed paste early, move the cursor or change
   the terminal's state; line ends become carriage returns. What the
@@ -61,4 +63,4 @@ app. It is the default terminal of `projects/desktop/compositor`
 Linux framebuffer without a compositor. The pointer, the selection's text,
 the paste filter and dropped paths are `std/src/ui/terminal_input.mlx`
 (`tests/support/terminal_input.mlx` tests them). Not yet: the primary
-selection (middle click), blinking.
+selection to and from X programs, blinking.

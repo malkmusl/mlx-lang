@@ -216,7 +216,12 @@ empties it. On Linux this is `wl_data_device`'s selection
 so there an app's own copy is all there is. mlx-files puts copied files
 up as `x-special/gnome-copied-files`, `text/uri-list` (with
 `application/x-kde-cutselection` for a cut) and the paths as text, and
-pastes any of these from other apps.
+pastes any of these from other apps. The primary selection, the text last
+selected that a middle click pastes, is `setPrimary(text)` and
+`readPrimary()` (`std.ui.wayland.panel_primary` on
+`zwp_primary_selection_device_v1`, offered as UTF-8 text; nothing on a
+phone): mlx-terminal sets it to what is selected and pastes it on a
+middle click.
 
 | Platform | Drawn by | Input |
 | --- | --- | --- |
