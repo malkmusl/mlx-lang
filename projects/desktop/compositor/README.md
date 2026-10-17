@@ -1129,8 +1129,14 @@ parent. `wp_tearing_control_manager_v1` and `wp_content_type_manager_v1`
 version 1 ([`hints.mlx`](hints.mlx)) take what a client says of its
 surface: that a game's frames may tear (`tearing: async TITLE`; frames
 are still shown at the vertical blank, which the protocol allows) and
-whether it shows a photo, a video or a game (`content: video TITLE`). A
-greeter compositor offers none of these.
+whether it shows a photo, a video or a game (`content: video TITLE`).
+`ext_idle_notifier_v1` version 2 ([`idle.mlx`](idle.mlx), ext-idle-notify)
+tells swayidle and screen lockers when the seat has had no input for the
+time they asked (`idle: idled`) and when input comes again (`idle:
+resumed`); a notification made with `get_idle_notification` waits while
+a mapped surface inhibits idling, one made with
+`get_input_idle_notification` looks at input alone. A greeter compositor
+offers none of these.
 Composition is done in software, or with Vulkan (`--renderer vulkan`).
 
 ### Locking and logging out
@@ -1687,7 +1693,8 @@ finished`.
   `viewport.mlx` (viewporter, fractional-scale, single-pixel-buffer),
   `presentation.mlx` (presentation feedback), `data_control.mlx`
   (clipboard tools), `dialogs.mlx` (windows of windows, modal dialogs),
-  `hints.mlx` (tearing and content-type hints),
+  `hints.mlx` (tearing and content-type hints), `idle.mlx` (idle
+  notifications),
   `launching.mlx` (launching programs) and `lock.mlx` (the session lock,
   logging out).
 - `dmabuf.mlx`: linux-dmabuf; each dma-buf becomes a one-buffer pool.

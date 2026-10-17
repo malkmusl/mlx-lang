@@ -1336,6 +1336,20 @@ PY
         grep -q "^viewport-test: error $expected$" "$work/viewport-$mode.log" || fail "dialogs: the $mode case did not end the client with error $expected" "$work/viewport-$mode.log"
     done
     echo "ok   a window named its own parent and a second dialog object of one window end the client"
+    # Idle notifications (idle.mlx): told idled 800 ms after the last
+    # input, resumed when the pointer moves, idled again; the one heeding
+    # idle inhibitors stays quiet while the window holds one.
+    local want
+    for mode in idle idlefree; do
+        printf 'wait 2500\npointer 100 60\nwait 1500\nclose\n' > "$work/viewport-$mode.script"
+        solo_run "viewport-$mode" cpu "$work/viewport-test $mode"
+        log="$work/viewport-$mode.log"
+        want="input idled,input resumed,input idled"
+        [[ $(grep "^viewport-test: input " "$log" | sed 's/^viewport-test: //' | paste -sd, -) == "$want" ]] || fail "idle ($mode): input idle notifications came wrong" "$log"
+        [[ $mode == idlefree ]] && want="held idled,held resumed,held idled" || want=""
+        [[ $(grep "^viewport-test: held " "$log" | sed 's/^viewport-test: //' | paste -sd, -) == "$want" ]] || fail "idle ($mode): the notification heeding inhibitors came wrong" "$log"
+    done
+    echo "ok   idle notifications: idled after the timeout without input, resumed by input; an idle inhibitor holds off those heeding it"
 }
 
 # Clipboard tools (data_control.mlx): wl-copy and wl-paste, which speak
