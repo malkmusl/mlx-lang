@@ -66,6 +66,15 @@
 // (the bus does that for every message between a native and a D-Bus
 // connection; a D-Bus body larger than MAX_MESSAGE after padding cannot
 // be carried).
+//
+// What is read is checked as dbus-daemon checks D-Bus (std.dbus's
+// validators): a header's fields are well-formed names and paths, each
+// field comes once, strings are UTF-8 without NUL, object paths and
+// signatures are well formed, booleans are 0 or 1, a variant holds one
+// complete type, a descriptor index names one of the message's
+// descriptors, and nothing nests deeper than MAX_DEPTH. `parse` refuses a
+// header that is not, `validMessage` a body, and the conversions refuse
+// both; the bus drops a connection that sent one.
 const allocator_module = @import("../bootstrap/allocator.mlx")
 const transport = @import("./wayland/transport/linux.mlx")
 const linux = @import("../bootstrap/os/linux.mlx")
@@ -134,6 +143,11 @@ fn empty() -> []const u8 {
 
 fn advanceConst(bytes: [*]const u8, count: usize) -> [*]const u8 { return bytes + count }
 
+// An empty body (what a message without arguments is sent with).
+pub fn nothingBody() -> [*]const u8 {
+    unsafe { return @ptrCast([*]const u8, "") }
+}
+
 pub fn same(first: []const u8, second: []const u8) -> bool {
     if first.length != second.length { return false }
     var index: usize = 0
@@ -157,57 +171,17 @@ pub fn fixedSize(code: u8) -> usize {
     return 0
 }
 
-fn isBasic(code: u8) -> bool {
-    return fixedSize(code) > 0 || code == 115 || code == 111 || code == 103
-}
-
 // The end of the complete type at signature[at], checked: 0 when it is
-// not well formed (a type too deep, an empty struct, a dictionary entry
-// outside an array or with a key that is not basic, an unknown code).
-pub fn typeEnd(signature: []const u8, at: usize, depth: usize) -> usize {
-    if depth > MAX_DEPTH || at >= signature.length { return 0 }
-    const code = signature[at]
-    if isBasic(code) || code == 118 { return at + 1 }
-    if code == 97 {
-        if at + 1 >= signature.length { return 0 }
-        if signature[at + 1] == 123 { return dictionaryEnd(signature, at + 1, depth + 1) }
-        return typeEnd(signature, at + 1, depth + 1)
-    }
-    if code == 40 {
-        var position = at + 1
-        if position >= signature.length || signature[position] == 41 { return 0 }
-        while position < signature.length && signature[position] != 41 {
-            position = typeEnd(signature, position, depth + 1)
-            if position == 0 { return 0 }
-        }
-        if position >= signature.length { return 0 }
-        return position + 1
-    }
-    return 0
-}
-
-fn dictionaryEnd(signature: []const u8, at: usize, depth: usize) -> usize {
-    if at + 1 >= signature.length || !isBasic(signature[at + 1]) { return 0 }
-    const value_end = typeEnd(signature, at + 2, depth + 1)
-    if value_end == 0 || value_end >= signature.length || signature[value_end] != 125 { return 0 }
-    return value_end + 1
-}
+// not well formed (std.dbus's rules: a type too deep, an empty struct, a
+// dictionary entry outside an array or with a key that is not basic, an
+// unknown code).
+pub fn typeEnd(signature: []const u8, at: usize, depth: usize) -> usize { return dbus.completeTypeEnd(signature, at, depth) }
 
 // Whether `signature` is a sequence of well-formed complete types.
-pub fn validSignature(signature: []const u8) -> bool {
-    if signature.length > 255 { return false }
-    var position: usize = 0
-    while position < signature.length {
-        position = typeEnd(signature, position, 0)
-        if position == 0 { return false }
-    }
-    return true
-}
+pub fn validSignature(signature: []const u8) -> bool { return dbus.validSignature(signature) }
 
 // Whether `signature` is exactly one complete type (what a variant holds).
-pub fn singleType(signature: []const u8) -> bool {
-    return signature.length > 0 && typeEnd(signature, 0, 0) == signature.length
-}
+pub fn singleType(signature: []const u8) -> bool { return dbus.singleType(signature) }
 
 // ---------------------------------------------------------------------------
 // Reading values
@@ -348,6 +322,68 @@ pub fn skipValue(reading: *Reader, signature: []const u8, at: usize, depth: usiz
         reading.*.failed = true
     }
     return !reading.*.failed
+}
+
+// One value of the type at signature[at..], read and checked: strings
+// UTF-8 without NUL, paths and signatures well formed, booleans 0 or 1,
+// variants of one complete type, descriptor indexes below `descriptors`.
+fn validValue(reading: *Reader, signature: []const u8, at: usize, depth: usize, descriptors: usize) -> bool {
+    if depth > MAX_DEPTH || at >= signature.length { return false }
+    const code = signature[at]
+    if code == 98 {
+        _ = readBool(reading)
+    } else if code == 104 {
+        if @intCast(usize, readU32(reading)) >= descriptors { return false }
+    } else if fixedSize(code) > 0 {
+        if has(reading, fixedSize(code)) { reading.*.position += fixedSize(code) }
+    } else if code == 115 {
+        if !dbus.validUtf8(readString(reading)) { return false }
+    } else if code == 111 {
+        if !dbus.validPath(readString(reading)) { return false }
+    } else if code == 103 {
+        if !validSignature(readSignature(reading)) { return false }
+    } else if code == 118 {
+        const inner = readSignature(reading)
+        if reading.*.failed || !singleType(inner) { return false }
+        return validValue(reading, inner, 0, depth + 1, descriptors)
+    } else if code == 97 {
+        var count = readArray(reading)
+        while count > 0 && !reading.*.failed {
+            if !validValue(reading, signature, at + 1, depth + 1, descriptors) { return false }
+            count -= 1
+        }
+    } else if code == 40 || code == 123 {
+        var position = at + 1
+        const close: u8 = if code == 40 { 41 } else { 125 }
+        while position < signature.length && signature[position] != close {
+            if !validValue(reading, signature, position, depth + 1, descriptors) { return false }
+            position = typeEnd(signature, position, depth + 1)
+            if position == 0 { return false }
+        }
+        if position >= signature.length { return false }
+    } else {
+        return false
+    }
+    return !reading.*.failed
+}
+
+// Whether `body` (`length` bytes, sent with `descriptors` descriptors)
+// holds exactly the values `signature` says, every one of them valid.
+pub fn validBody(signature: []const u8, body: [*]const u8, length: usize, descriptors: usize) -> bool {
+    if !validSignature(signature) { return false }
+    var reading = reader(body, length)
+    var position: usize = 0
+    while position < signature.length {
+        if !validValue(&reading, signature, position, 0, descriptors) { return false }
+        position = typeEnd(signature, position, 0)
+    }
+    return reading.position == length && !reading.failed
+}
+
+// Whether a parsed message's body (at `body`) is valid: what `parse` is
+// to the header. `next` refuses a message that is not.
+pub fn validMessage(message: *const Message, body: [*]const u8) -> bool {
+    return validBody(message.*.signature, body, message.*.bodyLength, message.*.descriptors)
 }
 
 // ---------------------------------------------------------------------------
@@ -507,6 +543,7 @@ pub fn parse(bytes: [*]const u8, size: usize, message: *Message) -> bool {
     message.*.replySerial = load32(bytes, 12)
     const fields_length = @intCast(usize, load16(bytes, 16))
     if message.*.kind == 0 || message.*.kind > 4 || message.*.serial == 0 || message.*.descriptors > MAX_DESCRIPTORS { return false }
+    if load16(bytes, 18) != 0 { return false }
     if HEADER + fields_length > size { return false }
     message.*.path = empty()
     message.*.interface = empty()
@@ -517,14 +554,21 @@ pub fn parse(bytes: [*]const u8, size: usize, message: *Message) -> bool {
     message.*.signature = empty()
     var position = HEADER
     const end = HEADER + fields_length
+    // Each field once (a bit per code).
+    var seen: u32 = 0
     while position < end {
         if position + 3 > end { return false }
         const code = bytes[position]
         const length = @intCast(usize, load16(bytes, position + 1))
         position += 3
-        if position + length > end { return false }
+        if position + length > end || length == 0 { return false }
         const value = bytes[position..position + length]
         position += length
+        if code < 32 {
+            const bit = @intCast(u32, 1) << @intCast(u32, code)
+            if seen & bit != 0 { return false }
+            seen |= bit
+        }
         if code == FIELD_PATH { message.*.path = value }
         if code == FIELD_INTERFACE { message.*.interface = value }
         if code == FIELD_MEMBER { message.*.member = value }
@@ -537,6 +581,12 @@ pub fn parse(bytes: [*]const u8, size: usize, message: *Message) -> bool {
     message.*.bodyLength = size - end
     message.*.size = size
     if !validSignature(message.*.signature) { return false }
+    if message.*.path.length > 0 && !dbus.validPath(message.*.path) { return false }
+    if message.*.interface.length > 0 && !dbus.validInterface(message.*.interface) { return false }
+    if message.*.member.length > 0 && !dbus.validMember(message.*.member) { return false }
+    if message.*.errorName.length > 0 && !dbus.validInterface(message.*.errorName) { return false }
+    if message.*.destination.length > 0 && !dbus.validBusName(message.*.destination) { return false }
+    if message.*.sender.length > 0 && !dbus.validBusName(message.*.sender) { return false }
     if message.*.kind == CALL && (message.*.path.length == 0 || message.*.member.length == 0) { return false }
     if message.*.kind == SIGNAL && (message.*.path.length == 0 || message.*.member.length == 0 || message.*.interface.length == 0) { return false }
     if message.*.kind == ERROR && (message.*.errorName.length == 0 || message.*.replySerial == 0) { return false }
@@ -651,8 +701,10 @@ fn copyFixedToNative(reading: *dbus.Reader, writing: *Writer, count: usize) -> v
     reading.*.position += count
 }
 
-// One value of the type at signature[at..], D-Bus to native.
-fn valueToNative(reading: *dbus.Reader, writing: *Writer, signature: []const u8, at: usize, depth: usize) -> bool {
+// One value of the type at signature[at..], D-Bus to native, checked as
+// std.dbus.validBody checks it (strings UTF-8, paths and signatures well
+// formed, booleans 0 or 1, descriptor indexes below `descriptors`).
+fn valueToNative(reading: *dbus.Reader, writing: *Writer, signature: []const u8, at: usize, depth: usize, descriptors: usize) -> bool {
     if depth > MAX_DEPTH || at >= signature.length { return false }
     const code = signature[at]
     if code == 121 {
@@ -663,21 +715,31 @@ fn valueToNative(reading: *dbus.Reader, writing: *Writer, signature: []const u8,
         putBool(writing, value == 1)
     } else if code == 110 || code == 113 {
         copyFixedToNative(reading, writing, 2)
-    } else if code == 105 || code == 117 || code == 104 {
+    } else if code == 105 || code == 117 {
         copyFixedToNative(reading, writing, 4)
+    } else if code == 104 {
+        const index = dbus.readU32(reading)
+        if @intCast(usize, index) >= descriptors { return false }
+        putU32(writing, index)
     } else if code == 120 || code == 116 || code == 100 {
         copyFixedToNative(reading, writing, 8)
-    } else if code == 115 || code == 111 {
-        putString(writing, dbus.readString(reading))
+    } else if code == 115 {
+        const text = dbus.readString(reading)
+        if !dbus.terminated(reading) || !dbus.validUtf8(text) { return false }
+        putString(writing, text)
+    } else if code == 111 {
+        const text = dbus.readString(reading)
+        if !dbus.terminated(reading) || !dbus.validPath(text) { return false }
+        putString(writing, text)
     } else if code == 103 {
         const text = dbus.readSignature(reading)
-        if !validSignature(text) { return false }
+        if !dbus.terminated(reading) || !validSignature(text) { return false }
         putSignature(writing, text)
     } else if code == 118 {
         const inner = dbus.readSignature(reading)
-        if reading.*.failed || !singleType(inner) { return false }
+        if !dbus.terminated(reading) || !singleType(inner) { return false }
         putSignature(writing, inner)
-        return valueToNative(reading, writing, inner, 0, depth + 1)
+        return valueToNative(reading, writing, inner, 0, depth + 1, descriptors)
     } else if code == 97 {
         const length = @intCast(usize, dbus.readU32(reading))
         if at + 1 >= signature.length { return false }
@@ -687,7 +749,7 @@ fn valueToNative(reading: *dbus.Reader, writing: *Writer, signature: []const u8,
         const count_at = beginArray(writing)
         var count: usize = 0
         while reading.*.position < end {
-            if !valueToNative(reading, writing, signature, at + 1, depth + 1) { return false }
+            if !valueToNative(reading, writing, signature, at + 1, depth + 1, descriptors) { return false }
             count += 1
         }
         if reading.*.position != end { return false }
@@ -697,7 +759,7 @@ fn valueToNative(reading: *dbus.Reader, writing: *Writer, signature: []const u8,
         var position = at + 1
         const close: u8 = if code == 40 { 41 } else { 125 }
         while position < signature.length && signature[position] != close {
-            if !valueToNative(reading, writing, signature, position, depth + 1) { return false }
+            if !valueToNative(reading, writing, signature, position, depth + 1, descriptors) { return false }
             position = typeEnd(signature, position, depth + 1)
             if position == 0 { return false }
         }
@@ -709,13 +771,14 @@ fn valueToNative(reading: *dbus.Reader, writing: *Writer, signature: []const u8,
 }
 
 // Converts a D-Bus body of `signature` (`length` bytes, `big`-endian or
-// not) to the native format; false when it is malformed or does not fit.
-pub fn bodyToNative(signature: []const u8, body: [*]const u8, length: usize, big: bool, writing: *Writer) -> bool {
+// not, sent with `descriptors` descriptors) to the native format; false
+// when it is malformed, holds an invalid value or does not fit.
+pub fn bodyToNative(signature: []const u8, body: [*]const u8, length: usize, big: bool, descriptors: usize, writing: *Writer) -> bool {
     if !validSignature(signature) { return false }
     var reading = dbus.reader(body, length, big)
     var position: usize = 0
     while position < signature.length {
-        if !valueToNative(&reading, writing, signature, position, 0) { return false }
+        if !valueToNative(&reading, writing, signature, position, 0, descriptors) { return false }
         position = typeEnd(signature, position, 0)
     }
     return reading.position == length && !reading.failed && !writing.*.failed
@@ -730,8 +793,9 @@ fn copyFixedToDBus(reading: *Reader, writing: *dbus.Writer, count: usize) -> voi
     reading.*.position += count
 }
 
-// One value of the type at signature[at..], native to D-Bus.
-fn valueToDBus(reading: *Reader, writing: *dbus.Writer, signature: []const u8, at: usize, depth: usize) -> bool {
+// One value of the type at signature[at..], native to D-Bus, checked as
+// valueToNative checks.
+fn valueToDBus(reading: *Reader, writing: *dbus.Writer, signature: []const u8, at: usize, depth: usize, descriptors: usize) -> bool {
     if depth > MAX_DEPTH || at >= signature.length { return false }
     const code = signature[at]
     if code == 121 {
@@ -740,12 +804,22 @@ fn valueToDBus(reading: *Reader, writing: *dbus.Writer, signature: []const u8, a
         dbus.putBool(writing, readBool(reading))
     } else if code == 110 || code == 113 {
         copyFixedToDBus(reading, writing, 2)
-    } else if code == 105 || code == 117 || code == 104 {
+    } else if code == 105 || code == 117 {
         copyFixedToDBus(reading, writing, 4)
+    } else if code == 104 {
+        const index = readU32(reading)
+        if @intCast(usize, index) >= descriptors { return false }
+        dbus.putU32(writing, index)
     } else if code == 120 || code == 116 || code == 100 {
         copyFixedToDBus(reading, writing, 8)
-    } else if code == 115 || code == 111 {
-        dbus.putString(writing, readString(reading))
+    } else if code == 115 {
+        const text = readString(reading)
+        if !dbus.validUtf8(text) { return false }
+        dbus.putString(writing, text)
+    } else if code == 111 {
+        const text = readString(reading)
+        if !dbus.validPath(text) { return false }
+        dbus.putString(writing, text)
     } else if code == 103 {
         const text = readSignature(reading)
         if !validSignature(text) { return false }
@@ -754,14 +828,14 @@ fn valueToDBus(reading: *Reader, writing: *dbus.Writer, signature: []const u8, a
         const inner = readSignature(reading)
         if reading.*.failed || !singleType(inner) { return false }
         dbus.putSignature(writing, inner)
-        return valueToDBus(reading, writing, inner, 0, depth + 1)
+        return valueToDBus(reading, writing, inner, 0, depth + 1, descriptors)
     } else if code == 97 {
         var count = readArray(reading)
         if reading.*.failed || at + 1 >= signature.length { return false }
         const alignment = dbus.alignmentOf(signature[at + 1])
         const length_at = dbus.beginArray(writing, alignment)
         while count > 0 {
-            if !valueToDBus(reading, writing, signature, at + 1, depth + 1) { return false }
+            if !valueToDBus(reading, writing, signature, at + 1, depth + 1, descriptors) { return false }
             count -= 1
         }
         dbus.endArray(writing, length_at, alignment)
@@ -770,7 +844,7 @@ fn valueToDBus(reading: *Reader, writing: *dbus.Writer, signature: []const u8, a
         var position = at + 1
         const close: u8 = if code == 40 { 41 } else { 125 }
         while position < signature.length && signature[position] != close {
-            if !valueToDBus(reading, writing, signature, position, depth + 1) { return false }
+            if !valueToDBus(reading, writing, signature, position, depth + 1, descriptors) { return false }
             position = typeEnd(signature, position, depth + 1)
             if position == 0 { return false }
         }
@@ -781,14 +855,15 @@ fn valueToDBus(reading: *Reader, writing: *dbus.Writer, signature: []const u8, a
     return !reading.*.failed && !writing.*.failed
 }
 
-// Converts a native body of `signature` to D-Bus marshalling
-// (little-endian); false when it is malformed or does not fit.
-pub fn bodyToDBus(signature: []const u8, body: [*]const u8, length: usize, writing: *dbus.Writer) -> bool {
+// Converts a native body of `signature` (sent with `descriptors`
+// descriptors) to D-Bus marshalling (little-endian); false when it is
+// malformed, holds an invalid value or does not fit.
+pub fn bodyToDBus(signature: []const u8, body: [*]const u8, length: usize, descriptors: usize, writing: *dbus.Writer) -> bool {
     if !validSignature(signature) { return false }
     var reading = reader(body, length)
     var position: usize = 0
     while position < signature.length {
-        if !valueToDBus(&reading, writing, signature, position, 0) { return false }
+        if !valueToDBus(&reading, writing, signature, position, 0, descriptors) { return false }
         position = typeEnd(signature, position, 0)
     }
     return reading.position == length && !reading.failed && !writing.*.failed
@@ -813,7 +888,7 @@ pub fn fromDBus(header: *const dbus.Header, sender: []const u8, body: [*]const u
     const start = writing.*.length
     write(writing, &message, sender, body, 0)
     if writing.*.failed { return false }
-    if !bodyToNative(header.*.signature, body, header.*.bodyLength, header.*.big, writing) { return false }
+    if !bodyToNative(header.*.signature, body, header.*.bodyLength, header.*.big, message.descriptors, writing) { return false }
     const size = writing.*.length - start
     if size > MAX_MESSAGE {
         writing.*.failed = true
@@ -830,7 +905,7 @@ pub fn fromDBus(header: *const dbus.Header, sender: []const u8, body: [*]const u
 pub fn toDBus(message: *const Message, sender: []const u8, body: [*]const u8, scratch: [*]u8, writing: *dbus.Writer) -> bool {
     var converted: dbus.Writer = undefined
     dbus.begin(&converted, scratch, MAX_MESSAGE, false)
-    if !bodyToDBus(message.*.signature, body, message.*.bodyLength, &converted) { return false }
+    if !bodyToDBus(message.*.signature, body, message.*.bodyLength, message.*.descriptors, &converted) { return false }
     var header = dbus.newHeader(message.*.kind, message.*.serial)
     header.flags = message.*.flags
     header.bodyLength = converted.length
@@ -1066,7 +1141,12 @@ pub fn next(client: *Client, message: *Message, timeout: isize) -> bool {
         const size = messageSize(bytes, available)
         if size > MAX_MESSAGE { return false }
         if size > 0 && available >= size {
-            if !parse(bytes, size, message) { return false }
+            // A malformed message ends the connection's use: nothing
+            // behind it can be trusted.
+            if !parse(bytes, size, message) || !validMessage(message, advanceConst(bytes, message.*.bodyStart)) {
+                client.*.closed = true
+                return false
+            }
             client.*.pendingSize = size
             client.*.pendingCount = message.*.descriptors
             if client.*.pendingCount > transport.bufferedHandles(connection) { client.*.pendingCount = transport.bufferedHandles(connection) }

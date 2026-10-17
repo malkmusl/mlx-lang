@@ -234,6 +234,43 @@ speaks, `mlx` or `dbus`, for a program that would rather talk natively
 past the bus: over a direct channel two native programs speak the format
 with no bus between (`std.ipc`'s `attach` on the channel's descriptor).
 
+## What the bus refuses
+
+A receiver given an invalid message drops its connection (libdbus does),
+so the bus refuses them at the sender, in either format, as dbus-daemon
+does, and drops the connection that sent one (`std.dbus`'s validators,
+which `std.ipc` shares; `tools/check_ipc_hostile.py` sends each case):
+
+- a header field that is not what it must be: a path without its slash
+  or with an empty element, a member with a space or a leading digit, an
+  interface, error or bus name of one element or with an empty one, a
+  field twice, an empty field, a signature that is not well formed, a
+  call with a reply serial, a reply without one, a serial of zero, the
+  reserved word of the native header not zero;
+- a body that is not what its signature says: a string that is not UTF-8
+  or holds a NUL, an object path that is none, a boolean other than 0 or
+  1, a variant of more than one type, a descriptor index past the
+  message's descriptors, an array past the body, bytes left over or
+  missing, D-Bus padding that is not zero, anything nested deeper than 32;
+- framing: a message larger than 65536 bytes or smaller than its header,
+  a native message that cannot be carried to D-Bus form, a first byte that
+  is neither NUL nor the preamble, a preamble of a version not spoken, a
+  first message that is not Hello, more descriptors than a message has.
+
+And against a program that takes without giving: a connection that has
+not said Hello after `--auth-timeout` seconds (30 by default) is dropped;
+descriptors that arrive without a message claiming them drop their
+sender; on the system bus a user other than root holds at most 128
+connections, and a sandboxed app at most 32 on any bus; a connection
+that does not read what it is sent is dropped once its queue is full.
+What a message says about its sender is never believed: the bus writes
+the sender itself.
+
+`tests/343_ipc_wire_runtime.mlx` also runs thousands of mutated messages
+of either format through the parsers, validators and conversions: every
+one is read or refused without harm, and every accepted one is carried to
+the other format and back whole.
+
 ## mlx-ipc
 
 ```

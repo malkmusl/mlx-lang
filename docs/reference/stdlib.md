@@ -281,11 +281,22 @@ or a whole message between the two formats without loss (the bus does
 that for every message between a native and a D-Bus connection), and a
 client with `std.dbus`'s client API (`connectSession`, `call`, `signal`,
 `reply`, `replyError`, `next`, `waitReply`; `attach` for a direct
-channel). `tests/343_ipc_wire_runtime.mlx` writes and reads every kind
-of value, frames, parses and refuses messages, and carries a D-Bus body
-to the native format and back byte for byte; `tools/check_ipc.sh` runs
-`mlx-ipc --native` against the bus next to dbus-send, gdbus and
-dbus-monitor. The format is described in `projects/desktop/ipc/README.md`.
+channel). Both formats are
+checked as dbus-daemon checks D-Bus: `std.dbus`'s `validUtf8`,
+`validPath`, `validMember`, `validInterface`, `validBusName`,
+`validSignature`, `validBody` and `validMessage` (and `std.ipc`'s
+`parse` and `validMessage`) refuse malformed names, strings that are not
+UTF-8, booleans other than 0 or 1, descriptor indexes past a message's,
+arrays past the body, padding that is not zero and anything nested too
+deep, so a receiver never sees what would make it drop its connection.
+`tests/343_ipc_wire_runtime.mlx` writes and reads every kind of value,
+frames, parses and refuses messages, carries a D-Bus body to the native
+format and back byte for byte, checks what the validators refuse, and
+runs thousands of mutated messages of either format through parsers,
+validators and conversions; `tools/check_ipc.sh` runs `mlx-ipc --native`
+against the bus next to dbus-send, gdbus and dbus-monitor, and
+`tools/check_ipc_hostile.py` sends what each validator refuses. The
+format is described in `projects/desktop/ipc/README.md`.
 
 `std.audio` (`std/src/audio.mlx`) is MLX Audio's protocol and client:
 `connect` finds the sound server on the session bus and gets a direct

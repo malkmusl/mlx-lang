@@ -14,6 +14,10 @@
 #     service and serves a name that dbus-send, gdbus and mlx-ipc call;
 #     two native programs get a direct channel; dbus-monitor sees a
 #     native signal; GetProtocol says what each connection speaks;
+#   - hostile clients (tools/check_ipc_hostile.py): invalid names, paths,
+#     strings, booleans, descriptor indexes, signatures and framing in
+#     either format drop the sender and nobody else; a connection that
+#     does not say Hello within --auth-timeout is dropped;
 #   - a call to an unowned name starts its service from a .service file
 #     (activation) and is answered once the service owns it;
 #   - the policy (ipc.conf, read again when it changes): deny rules,
@@ -81,7 +85,7 @@ Name=org.example.Started
 Exec=$ipc serve org.example.Started
 SERVICE
 
-"$work/mlx-ipcd" --verbose --services "$work/services" > "$work/bus.log" 2>&1 &
+"$work/mlx-ipcd" --verbose --auth-timeout 2 --services "$work/services" > "$work/bus.log" 2>&1 &
 bus_pid=$!
 for _ in $(seq 1 50); do [[ -S "$XDG_RUNTIME_DIR/bus" ]] && break; sleep 0.1; done
 [[ -S "$XDG_RUNTIME_DIR/bus" ]] || fail "the bus does not listen"
@@ -150,6 +154,9 @@ expect "native: apps" "mlx-ipc" "$ipc" --native apps
 expect "native: a signal" "sent org.mlx.Echo.Said" "$ipc" --native emit "signal nativ"
 expect "GetProtocol is introspected" "GetProtocol" gdbus introspect --session --dest org.freedesktop.DBus --object-path /org/freedesktop/DBus
 grep -q "is mlx-ipc (mlx)" "$work/bus.log" || fail "the bus did not log a native connection"
+python3 -I tools/check_ipc_hostile.py "$XDG_RUNTIME_DIR/bus" 2 || fail "a hostile client was not dropped"
+expect "the bus serves on after the hostile clients" "nach dem Sturm" "$ipc" --native call org.example.Echo "nach dem Sturm"
+grep -q "did not say Hello in time" "$work/bus.log" || fail "no connection was dropped for its missing Hello"
 if command -v dbus-monitor > /dev/null; then
     sleep 0.3
     grep -q "member=Echo" "$work/monitor.txt" || fail "dbus-monitor saw no Echo: $(cat "$work/monitor.txt")"

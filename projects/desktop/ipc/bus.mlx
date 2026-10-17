@@ -31,6 +31,13 @@ pub const RUNNING: u8 = 3
 
 
 pub const MAX_EXPECTED: usize = 4096
+// Connections one user may hold on the system bus (root: any number), and
+// one sandboxed app on any bus: one program cannot take every slot.
+pub const MAX_PER_USER: usize = 128
+pub const MAX_PER_SANDBOXED_APP: usize = 32
+// Descriptors that may wait in a connection's input without a message
+// that claims them (a message takes at most 28).
+pub const MAX_STRAY_HANDLES: usize = 28
 
 
 pub fn clientAt(address: usize) -> *state.Client {
@@ -131,6 +138,7 @@ pub fn accepted(bus: *state.Bus, descriptor: isize) -> void {
     client.*.watchingOutput = false
     client.*.monitor = false
     client.*.native = false
+    client.*.connectedAt = std.time.milliseconds()
     client.*.pid = 0
     client.*.uid = 4294967295
     client.*.gid = 0
@@ -147,9 +155,61 @@ pub fn accepted(bus: *state.Bus, descriptor: isize) -> void {
         return
     }
     policy_module.identify(policy_module.identityOf(client), client.*.pid)
+    if !admitted(bus, client) {
+        say(bus, "ipc: a connection over its user's or app's limit; refused\n")
+        dbus.close(connectionOf(client))
+        bus.*.allocator.free(memory.?, @sizeOf(state.Client), 16)
+        return
+    }
     bus.*.clients[bus.*.clientCount] = @intFromPtr(memory.?)
     bus.*.clientCount += 1
     _ = dbus.watch(bus.*.eventLoop, descriptor, @intFromPtr(memory.?), false)
+}
+
+// Whether `client` (not yet counted) may stay: under its user's limit on
+// the system bus (root excepted) and, sandboxed, under its app's.
+fn admitted(bus: *state.Bus, client: *state.Client) -> bool {
+    var same_user: usize = 0
+    var same_app: usize = 0
+    const app = policy_module.appOf(policy_module.identityOf(client))
+    var index: usize = 0
+    while index < bus.*.clientCount {
+        const other = clientAt(bus.*.clients[index])
+        if other.*.uid == client.*.uid { same_user += 1 }
+        if other.*.identity.sandboxed && same(policy_module.appOf(policy_module.identityOf(other)), app) { same_app += 1 }
+        index += 1
+    }
+    if bus.*.system && client.*.uid != 0 && same_user >= MAX_PER_USER { return false }
+    if client.*.identity.sandboxed && same_app >= MAX_PER_SANDBOXED_APP { return false }
+    return true
+}
+
+// Whether a connection is still connecting (authenticating, or without
+// its Hello yet): then tick runs.
+pub fn connecting(bus: *state.Bus) -> bool {
+    var index: usize = 0
+    while index < bus.*.clientCount {
+        const client = clientAt(bus.*.clients[index])
+        if !client.*.dead && (client.*.state != RUNNING || !client.*.hello) { return true }
+        index += 1
+    }
+    return false
+}
+
+// Drops the connections that took longer than authTimeout to say Hello:
+// a connection that never does would hold its slot and buffers for good.
+pub fn tick(bus: *state.Bus) -> void {
+    if bus.*.authTimeout == 0 { return }
+    const now = std.time.milliseconds()
+    var index: usize = 0
+    while index < bus.*.clientCount {
+        const client = clientAt(bus.*.clients[index])
+        if !client.*.dead && (client.*.state != RUNNING || !client.*.hello) && now - client.*.connectedAt > bus.*.authTimeout {
+            say(bus, "ipc: a connection did not say Hello in time; dropped\n")
+            client.*.dead = true
+        }
+        index += 1
+    }
 }
 
 // Leaves the bus: its names go (to whoever waits), its matches go, others
@@ -1004,22 +1064,30 @@ pub fn readable(bus: *state.Bus, client: *state.Client) -> void {
     if client.*.state != RUNNING { authenticate(bus, client) }
     while client.*.state == RUNNING && !client.*.dead {
         if client.*.native {
-            if !readNative(bus, client) { return }
+            if !readNative(bus, client) { break }
             continue
         }
         const available = dbus.buffered(connectionOf(client))
         const bytes = dbus.input(connectionOf(client))
         const size = dbus.messageSize(bytes, available)
-        if size == 0 { return }
+        if size == 0 { break }
         if size > dbus.MAX_MESSAGE {
             say(bus, "ipc: a message too large; client dropped\n")
             client.*.dead = true
             return
         }
-        if available < size { return }
+        if available < size { break }
         var header: dbus.Header = undefined
         if !dbus.parseHeader(bytes, size, &header) {
             say(bus, "ipc: a malformed message; client dropped\n")
+            client.*.dead = true
+            return
+        }
+        // What a D-Bus receiver would refuse (and drop its connection
+        // over) is refused here: invalid names and paths, strings that
+        // are not UTF-8, descriptor indexes past the message's.
+        if !dbus.validMessage(&header, bytes + header.bodyStart) {
+            say(bus, "ipc: a message D-Bus would refuse; client dropped\n")
             client.*.dead = true
             return
         }
@@ -1037,6 +1105,12 @@ pub fn readable(bus: *state.Bus, client: *state.Client) -> void {
         }
         dispatch(bus, client, bytes, &header, &descriptors, count)
         dbus.consume(connectionOf(client), size, count)
+    }
+    // Descriptors that came without a message claiming them would be
+    // held for good.
+    if !client.*.dead && dbus.bufferedHandles(connectionOf(client)) > MAX_STRAY_HANDLES {
+        say(bus, "ipc: descriptors without a message; client dropped\n")
+        client.*.dead = true
     }
 }
 
