@@ -23,6 +23,11 @@ build inputs; applications only `@import("std.wayland")`.
 | `xwayland-shell-v1.xml` | wayland-protocols 1.49, `staging/xwayland-shell/xwayland-shell-v1.xml` (Xwayland's windows to wl_surfaces) |
 | `pointer-gestures-unstable-v1.xml` | wayland-protocols 1.49, `unstable/pointer-gestures/pointer-gestures-unstable-v1.xml` (touchpad swipes, pinches and holds) |
 | `ext-session-lock-v1.xml` | wayland-protocols 1.49, `staging/ext-session-lock/ext-session-lock-v1.xml` (screen lockers such as swaylock) |
+| `primary-selection-unstable-v1.xml` | wayland-protocols 1.49, `unstable/primary-selection/primary-selection-unstable-v1.xml` (the selection a middle click pastes) |
+| `viewporter.xml` | wayland-protocols 1.49, `stable/viewporter/viewporter.xml` (a buffer cropped and scaled to a surface size: video players, browsers) |
+| `xdg-output-unstable-v1.xml` | wayland-protocols 1.49, `unstable/xdg-output/xdg-output-unstable-v1.xml` (outputs' logical size and name) |
+| `idle-inhibit-unstable-v1.xml` | wayland-protocols 1.49, `unstable/idle-inhibit/idle-inhibit-unstable-v1.xml` (a video keeps the screen on) |
+| `xdg-activation-v1.xml` | wayland-protocols 1.49, `staging/xdg-activation/xdg-activation-v1.xml` (a program passing the focus to another one it starts) |
 
 The files are byte-for-byte copies of the upstream releases. `SOURCES`
 records each file's URL, release and SHA-256. Bootstrap tooling must preserve
