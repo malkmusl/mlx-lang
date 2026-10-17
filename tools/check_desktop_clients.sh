@@ -1285,6 +1285,126 @@ PY
     echo "ok   files ($canvas): folders first; makes, renames, moves, trashes, opens folders"
 }
 
+# The file manager's other drop targets: a.txt dragged onto Documents in
+# the sidebar moves there, b.txt onto the sidebar's Trash goes to the
+# trash; in Work/Sub, c.txt dragged onto "Work" in the path moves up
+# there. Then, with the drag source's window over it (it comes once those
+# drags are done), the folder Work is
+# dropped onto Work/Sub shown: a folder copied into itself would never
+# end, so it is refused and said.
+files_targets() {
+    local base="$work/files-targets" runtime status=0
+    rm -rf -- "$base"
+    mkdir -p "$base/home/Documents" "$base/home/Downloads" "$base/home/Work/Sub" "$base/data" "$base/config"
+    echo a > "$base/home/a.txt"
+    echo b > "$base/home/b.txt"
+    echo c > "$base/home/Work/Sub/c.txt"
+    cat > "$base/drops.sh" <<SCRIPT
+#!/bin/sh
+"$work/mlx-files" &
+sleep 14
+exec "$work/drag-source" "file://$base/home/Work"
+SCRIPT
+    chmod +x "$base/drops.sh"
+    # The grid: Documents, Downloads, Work, a.txt, b.txt at x 296, 414,
+    # 533, 650, 768; the sidebar's Documents at y 108, Trash at 222; the
+    # path's "Work" at x 300 in the status bar.
+    cat > "$base/drops.script" <<SCRIPT
+wait 3000
+pointer 650 125
+wait 200
+press 272
+wait 100
+pointer 640 125
+wait 100
+pointer 300 110
+wait 100
+pointer 100 108
+wait 500
+release 272
+wait 1500
+pointer 650 125
+wait 200
+press 272
+wait 100
+pointer 640 125
+wait 100
+pointer 300 200
+wait 100
+pointer 82 222
+wait 500
+release 272
+wait 1500
+pointer 533 125
+press 272
+release 272
+wait 100
+press 272
+release 272
+wait 1500
+pointer 296 125
+press 272
+release 272
+wait 100
+press 272
+release 272
+wait 1500
+pointer 296 125
+wait 200
+press 272
+wait 100
+pointer 290 135
+wait 100
+pointer 300 500
+wait 100
+pointer 300 587
+wait 500
+release 272
+wait 4000
+pointer 164 150
+wait 200
+press 272
+wait 100
+pointer 200 160
+wait 100
+pointer 500 300
+wait 100
+pointer 600 320
+wait 500
+release 272
+wait 1500
+shot $base/refused.ppm
+close
+SCRIPT
+    runtime=$(mktemp -d)
+    XDG_RUNTIME_DIR=$runtime "$work/test-host" host-targets "$work/us.xkb" "$base/drops.script" > "$base/host.log" 2>&1 &
+    local host_pid=$!
+    for _ in $(seq 1 50); do [[ -S "$runtime/host-targets" ]] && break; sleep 0.1; done
+    env -i PATH="$PATH" HOME="$base/home" XDG_RUNTIME_DIR="$runtime" WAYLAND_DISPLAY=host-targets \
+        XDG_DATA_HOME="$base/data" XDG_DATA_DIRS="$work/none" XDG_CONFIG_HOME="$base/config" MLX_CANVAS=cpu LANG=en_US.UTF-8 TZ=UTC \
+        timeout 90 "$work/mlx-compositor" --verbose --no-fps --renderer cpu --socket nested-targets \
+        --launcher none --dock none --topbar none --run "$base/drops.sh" > "$base/drops.log" 2>&1 || status=$?
+    wait "$host_pid" || fail "files targets: the test host failed" "$base/host.log"
+    rm -rf -- "$runtime"
+    local log="$base/drops.log"
+    [[ $status -eq 0 ]] || fail "files targets: the compositor exited with status $status" "$log"
+    [[ -f "$base/home/Documents/a.txt" && ! -e "$base/home/a.txt" ]] || fail "files targets: a file dropped on Documents in the sidebar did not move there" "$log"
+    [[ -f "$base/data/Trash/files/b.txt" && -f "$base/data/Trash/info/b.txt.trashinfo" && ! -e "$base/home/b.txt" ]] || fail "files targets: a file dropped on the sidebar's Trash did not go to the trash" "$log"
+    [[ -f "$base/home/Work/c.txt" && ! -e "$base/home/Work/Sub/c.txt" ]] || fail "files targets: a file dropped on a part of the path did not move up there" "$log"
+    [[ "$(grep -c "^drag: dropped on" "$log")" == 4 ]] || fail "files targets: not every drag was dropped on the file manager" "$log"
+    [[ ! -e "$base/home/Work/Sub/Work" ]] || fail "files targets: a folder dropped into its own subfolder was copied into itself" "$log"
+    python3 - "$base/refused.ppm" <<'PY' || fail "files targets: the refused copy was not said in the status bar" "$log"
+import sys
+data = open(sys.argv[1], 'rb').read()
+header, size, depth, pixels = data.split(b'\n', 3)
+width, height = map(int, size.split())
+def at(x, y): return tuple(pixels[(y * width + x) * 3:(y * width + x) * 3 + 3])
+# The note's orange text on the right of the status bar.
+assert any(at(x, y)[0] > 200 and at(x, y)[2] < 120 for x in range(780, 950) for y in range(580, 594)), "no note"
+PY
+    echo "ok   files: drops onto the sidebar's places, its Trash and the path; a folder is not copied into itself"
+}
+
 # Light and dark (std.ui.appearance): the file manager starts dark (no
 # appearance.conf), turns light when the file says so (as the Settings
 # portal writes it) without a restart, and MLX_COLOR_SCHEME=dark keeps it
@@ -1893,6 +2013,7 @@ control_network
 notify_activation
 files cpu
 files gpu
+files_targets
 appearance
 zoom cpu
 zoom vulkan

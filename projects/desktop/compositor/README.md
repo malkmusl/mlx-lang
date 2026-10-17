@@ -434,13 +434,17 @@ people count ("Project 2" before "Project 10"). A click selects (Ctrl
 adds, Shift a range, a rectangle dragged over empty space selects what it
 touches), a double click or Enter opens (a file with `xdg-open`). F2
 renames (the name before its extension selected), Ctrl+Shift+N makes a
-folder, Delete moves to the trash (`gio trash`), Ctrl+C, Ctrl+X and
+folder, Delete moves to the trash (its own, in the freedesktop layout), Ctrl+C, Ctrl+X and
 Ctrl+V copy, cut and paste within it, Ctrl+F searches, Ctrl+H shows hidden
 files, Backspace or Alt+Left goes back, Alt+Up to the parent; typing jumps
 to a name. The right-click menu offers these, "Add to Dock" for a folder,
 "Open in Terminal", and in the trash "Put Back" and "Delete Immediately".
 Files dragged out go as `text/uri-list` (onto the dock's trash, into
-another folder); files dropped in are copied, its own moved. It reads a
+another folder); files dropped in are copied, its own moved: onto a
+folder, a place in the sidebar or a part of the path in the status bar
+they go into it (outlined while the drag is over it), onto the sidebar's
+Trash into the trash. A folder is never copied into itself or a folder
+inside it (that copy would never end; the status bar says so). It reads a
 folder again within a second when it changes, and its labels and dates
 follow the locale. `mlx-files PATH`, `file://` URIs and `trash:///` open
 it where asked; the dock opens its folders and the trash in it when it is
