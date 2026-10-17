@@ -35,6 +35,13 @@ build inputs; applications only `@import("std.wayland")`.
 | `single-pixel-buffer-v1.xml` | wayland-protocols 1.49, `staging/single-pixel-buffer/single-pixel-buffer-v1.xml` (a one-colour buffer, scaled with a viewport) |
 | `presentation-time.xml` | wayland-protocols 1.49, `stable/presentation-time/presentation-time.xml` (when a frame reached the screen: video players, browsers) |
 | `wlr-data-control-unstable-v1.xml` | wlr-protocols bf4fc79a, `unstable/wlr-data-control-unstable-v1.xml` (ext-data-control's forerunner, which wl-clipboard 2.2 speaks) |
+| `xdg-dialog-v1.xml` | wayland-protocols 1.49, `staging/xdg-dialog/xdg-dialog-v1.xml` (modal dialogs: a dialog asks to be kept over its parent) |
+| `tearing-control-v1.xml` | wayland-protocols 1.49, `staging/tearing-control/tearing-control-v1.xml` (a game asking to show frames without waiting for vsync) |
+| `content-type-v1.xml` | wayland-protocols 1.49, `staging/content-type/content-type-v1.xml` (what a surface shows: photo, video, game) |
+| `ext-idle-notify-v1.xml` | wayland-protocols 1.49, `staging/ext-idle-notify/ext-idle-notify-v1.xml` (idle notifications: swayidle and screen lockers) |
+| `xdg-foreign-unstable-v2.xml` | wayland-protocols 1.49, `unstable/xdg-foreign/xdg-foreign-unstable-v2.xml` (a window of one program as the parent of another's: portal dialogs) |
+| `alpha-modifier-v1.xml` | wayland-protocols 1.49, `staging/alpha-modifier/alpha-modifier-v1.xml` (a surface drawn translucent as a whole) |
+| `xdg-toplevel-icon-v1.xml` | wayland-protocols 1.49, `staging/xdg-toplevel-icon/xdg-toplevel-icon-v1.xml` (a window's own icon) |
 
 The files are byte-for-byte copies of the upstream releases. `SOURCES`
 records each file's URL, release and SHA-256. Bootstrap tooling must preserve
