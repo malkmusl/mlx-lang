@@ -50,6 +50,12 @@
 #   - offers xdg-output (the output's size and name), idle-inhibit and
 #     xdg-activation (tokens only for the program with the keyboard, used
 #     once) to tools/wayland-extras-test;
+#   - crops and scales a buffer through a viewport (and a one-pixel
+#     buffer stretched under it) alike on the CPU and on the GPU, sizes
+#     the surface anew without a new buffer, says preferred scale 120
+#     (fractional-scale), and ends a client whose crop leaves the buffer,
+#     is a fraction of a pixel with no size, or that asks for a second
+#     viewport (tools/wayland-viewport-test);
 #   - with dock-workspaces = on, groups the apps that run by workspace
 #     after the pinned ones (a window moved to workspace 2, one on 1, the
 #     pinned terminal's moved to 3 makes no group) and a click on the app
@@ -116,6 +122,7 @@ trap 'rm -rf -- "$work"' EXIT
 "$compiler" --quiet tools/wayland-test-host/main.mlx -o "$work/test-host"
 "$compiler" --quiet tools/wayland-drag-source/main.mlx -o "$work/drag-source"
 "$compiler" --quiet tools/wayland-extras-test/main.mlx -o "$work/extras-test"
+"$compiler" --quiet tools/wayland-viewport-test/main.mlx -o "$work/viewport-test"
 "$compiler" --quiet projects/desktop/topbar/main.mlx -o "$work/mlx-topbar"
 "$compiler" --quiet tools/topbar-test-services/main.mlx -o "$work/topbar-test-services"
 "$compiler" --quiet tools/session-lock-test/main.mlx -o "$work/session-lock-test"
@@ -1166,6 +1173,82 @@ SCRIPT
     echo "ok   a selection in the terminal is the primary selection, a middle click pastes it and wl-copy --primary's"
 }
 
+# A window of tools/wayland-viewport-test in a compositor of its own
+# drawing on $2 (cpu or vulkan), the test client run with $3; it is at
+# (24, 24), and $name.script drives the host.
+viewport_run() {
+    local name=$1 renderer=$2 mode=$3 runtime status=0
+    runtime=$(mktemp -d)
+    printf '#!/bin/sh\nexec %s %s\n' "$work/viewport-test" "$mode" > "$work/$name-client.sh"
+    chmod +x "$work/$name-client.sh"
+    XDG_RUNTIME_DIR=$runtime "$work/test-host" "host-$name" "$work/us.xkb" "$work/$name.script" > "$work/$name-host.log" 2>&1 &
+    local host_pid=$!
+    for _ in $(seq 1 50); do [[ -S "$runtime/host-$name" ]] && break; sleep 0.1; done
+    env -i PATH="$PATH" HOME="$work/home" XDG_RUNTIME_DIR="$runtime" WAYLAND_DISPLAY="host-$name" \
+        XDG_DATA_HOME="$work/data" XDG_DATA_DIRS="$work/none" XDG_CONFIG_HOME="$work/viewport-config" VK_DRIVER_FILES="$manifest" \
+        timeout 60 "$work/mlx-compositor" --verbose --no-fps --renderer "$renderer" --socket "nested-$name" \
+        --launcher none --dock none --topbar none --run "$work/$name-client.sh" > "$work/$name.log" 2>&1 || status=$?
+    wait "$host_pid" || fail "$name: the test host failed" "$work/$name-host.log"
+    rm -rf -- "$runtime"
+    [[ $status -eq 0 ]] || fail "$name: the compositor exited with status $status" "$work/$name.log"
+    ! grep -q "crashed" "$work/$name.log" || fail "$name: a client crashed" "$work/$name.log"
+}
+
+# Viewports (viewport.mlx, buffers.mlx): the test window's 40 x 30
+# checkerboard cropped to two squares (cyan and grey) scaled to 160 x 80,
+# a one-pixel orange buffer stretched to 160 x 16 below it; the same
+# pixels on the CPU and on the GPU, and again once the window's surface
+# is sized 80 x 40 with the same buffer. Crops outside the buffer or of a
+# fraction of a pixel with no size, and a second viewport, end the client.
+viewports() {
+    mkdir -p "$work/viewport-config/mlx"
+    local renderer mode
+    for renderer in cpu vulkan; do
+        for mode in scale resize; do
+            printf 'wait 2500\nshot %s\nclose\n' "$work/viewport-$mode-$renderer.ppm" > "$work/viewport-$mode-$renderer.script"
+            viewport_run "viewport-$mode-$renderer" "$renderer" "$mode"
+            grep -q "^viewport-test: preferred scale 120$" "$work/viewport-$mode-$renderer.log" || fail "viewports: fractional-scale did not say 120" "$work/viewport-$mode-$renderer.log"
+        done
+        grep -q "^window: 80x40 at 24,24" "$work/viewport-resize-$renderer.log" || fail "viewports ($renderer): a new size without a new buffer did not size the window" "$work/viewport-resize-$renderer.log"
+    done
+    python3 - "$work" <<'PY' || fail "viewports: the cropped and scaled buffers do not look right" "$work/viewport-scale-cpu.log"
+import sys
+def load(path):
+    data = open(path, 'rb').read()
+    header, size, depth, pixels = data.split(b'\n', 3)
+    return tuple(map(int, size.split())), pixels
+work = sys.argv[1]
+for mode in ("scale", "resize"):
+    (width, height), cpu = load(f"{work}/viewport-{mode}-cpu.ppm")
+    _, gpu = load(f"{work}/viewport-{mode}-vulkan.ppm")
+    assert cpu == gpu, f"{mode}: the CPU and the GPU differ"
+    def at(x, y): return tuple(cpu[(y * width + x) * 3:(y * width + x) * 3 + 3])
+    side = 80 if mode == "scale" else 40
+    # The squares end where the scale puts their edge, the bar under the
+    # 160 x 80 the window had at first (it stays, a subsurface at 0, 80).
+    assert at(24 + side // 2, 24 + side // 2) == (0, 255, 255), (mode, at(24 + side // 2, 24 + side // 2))
+    assert at(24 + side - 1, 30) == (0, 255, 255), (mode, at(24 + side - 1, 30))
+    assert at(24 + side, 30) == (128, 128, 128), (mode, at(24 + side, 30))
+    assert at(24 + side * 2 - 13, 30) == (128, 128, 128), (mode, at(24 + side * 2 - 13, 30))
+    assert at(24 + 80, 24 + 80 + 8) == (255, 128, 0), (mode, at(104, 112))
+    assert at(24 + 159, 24 + 80 + 15) == (255, 128, 0), (mode, at(183, 119))
+PY
+    echo "ok   a viewport crops and scales a buffer, and stretches a one-pixel buffer, alike on the CPU and the GPU; preferred scale 120"
+    echo "ok   a viewport sizes the surface anew without a new buffer"
+    local expected
+    for mode in outside fraction twice; do
+        printf 'wait 2000\nclose\n' > "$work/viewport-$mode.script"
+        viewport_run "viewport-$mode" cpu "$mode"
+        case $mode in
+            outside) expected=2 ;;
+            fraction) expected=1 ;;
+            twice) expected=0 ;;
+        esac
+        grep -q "^viewport-test: error $expected$" "$work/viewport-$mode.log" || fail "viewports: the $mode case did not end the client with error $expected" "$work/viewport-$mode.log"
+    done
+    echo "ok   a crop outside the buffer, one of a fraction of a pixel with no size and a second viewport end the client"
+}
+
 # xdg-output, idle-inhibit and xdg-activation (extras.mlx): three windows
 # of tools/wayland-extras-test read the output's size and name and hold
 # an idle inhibitor for a second; the source (with the keyboard) hands a
@@ -2197,6 +2280,7 @@ dock_hover
 terminal_clipboard
 terminal_primary
 extras
+viewports
 topbar
 topbar_bus
 control_centre

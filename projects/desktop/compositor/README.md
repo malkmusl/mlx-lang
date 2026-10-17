@@ -1087,8 +1087,24 @@ activation token is good only when the program asking for it had the
 keyboard (or is a part of the desktop in a layer: the dock, the
 launcher), for ten seconds and once, so a program cannot take the focus
 by itself; a window it names comes forward (to its workspace,
-`activation: TITLE`), any other use is `activation: refused`. A greeter
-compositor offers none of these.
+`activation: TITLE`), any other use is `activation: refused`.
+`wp_viewporter`, `wp_fractional_scale_manager_v1` and
+`wp_single_pixel_buffer_manager_v1` version 1
+([`viewport.mlx`](viewport.mlx)) size surfaces apart from their buffers:
+a viewport crops a surface's buffer (`viewport: crop WxH at X,Y`) and
+scales it to a size (`viewport: size WxH`), applied with the next commit
+([`buffers.mlx`](buffers.mlx)), also without a new buffer; the preferred
+scale is always 120 (the output's scale is 1), so GTK 4, Qt and Firefox
+draw at 1 and size their surfaces through a viewport; a one-pixel buffer
+is an shm buffer in the compositor's own memory, for a viewport to
+stretch. Both renderers scale alike, each pixel the mean of 4x4 samples
+over the part of the crop it covers (on the CPU into the surface's
+pixels when it commits, on the GPU by the shrink shader into a copy of
+the surface's), so a scaled video or a game drawn at a lower resolution
+looks the same on either. A crop reaching outside the buffer, one of a
+fraction of a pixel without a size and a second viewport for a surface
+end the client, as the protocol says. A greeter compositor offers none
+of these.
 Composition is done in software, or with Vulkan (`--renderer vulkan`).
 
 ### Locking and logging out
@@ -1631,8 +1647,11 @@ finished`.
 - `shell.mlx`: the server side, with globals, surfaces, shared memory and
   xdg-shell. Its parts: `protocols.mlx` (layer shell, the window list for
   docks, decorations, blur regions), `windows.mlx` (focus, window states,
-  resizing, input delivery, mapping), `launching.mlx` (launching
-  programs) and `lock.mlx` (the session lock, logging out).
+  resizing, input delivery, mapping), `buffers.mlx` (what a commit does
+  with the buffer: copied or held, cropped and scaled by a viewport),
+  `viewport.mlx` (viewporter, fractional-scale, single-pixel-buffer),
+  `launching.mlx` (launching programs) and `lock.mlx` (the session lock,
+  logging out).
 - `dmabuf.mlx`: linux-dmabuf; each dma-buf becomes a one-buffer pool.
 - `data.mlx`: `wl_data_device_manager`, copy and paste and drag and drop
   between clients.
