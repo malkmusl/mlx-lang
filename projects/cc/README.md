@@ -20,7 +20,8 @@ mlxlibc (`projects/libc`) on MLX/Linux and glibc elsewhere.
     ./mlx-cc -o hello hello.c -L. -lmine      # or hello.o libmine.a
 
     mlx-cc [-o OUT] [-std=VARIANT] [-E] [-c] [-I DIR] [-D NAME[=VALUE]] [-U NAME]
-           [-L DIR] [-lNAME] [--dynamic-linker PATH] FILE.c... [FILE.o...] [LIB.a...]
+           [-L DIR] [-lNAME] [--dynamic-linker PATH] [-MD|-MMD] [-MF DEP] [-MT TARGET]
+           FILE.c... [FILE.o...] [LIB.a...]
     mlx-ar rcs LIB.a FILE.o...  |  mlx-ar t LIB.a  |  mlx-ar x LIB.a
 
 The `.c` files given together are compiled as one, each a translation
@@ -36,7 +37,10 @@ ordinary C compiler made with `-fPIE` link too, in either direction
 directory when there is one, else the shared `libNAME.so`; `-lm` is
 `libm.so.6` (glibc's, or the one built next to mlxlibc) and
 `-lpthread`, `-ldl` and `-lrt` are part of the C library. `-E` writes
-the preprocessed tokens instead. Options of other compilers that change
+the preprocessed tokens instead. `-MD` (or `-MMD`) writes make's rule of
+the source and every file it included and embedded, at `-MF`'s path
+(else the output's with `.d`) naming `-MT`'s target (else the output):
+what `mlx build` reads to rebuild an object when a header changed. Options of other compilers that change
 nothing here (`-O2`, `-g`, `-Wall`, `-fPIC`, `-pthread` ...) are
 accepted silently.
 
