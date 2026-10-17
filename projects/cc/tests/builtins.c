@@ -58,5 +58,7 @@ int main(void) {
     int o4 = __builtin_mul_overflow(-9223372036854775807L - 1, -1L, &lr);
     int o5 = __builtin_add_overflow(-5, 3, &ir);
     printf("overflow %d %lu %d %d %u %d %d %d\n", o1, ur, o2, o3, uu, o4, o5, ir);
+    double negativeZero = -0.0;
+    printf("fabs %g %g %d\n", __builtin_fabs(-2.5), (double)__builtin_fabsf(-0.5f), 1.0 / __builtin_fabs(negativeZero) > 0);
     return 0;
 }
