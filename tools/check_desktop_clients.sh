@@ -36,6 +36,9 @@
 #     list and as URIs; files wl-copy put up are pasted (Ctrl+V); a text
 #     goes from wl-copy to the X program and back from it to wl-paste
 #     (when wl-clipboard is installed);
+#   - with dock-autohide = smart, keeps the dock while a small window is
+#     elsewhere, hides it while the window is maximized over it, and
+#     brings it back once the window is restored;
 #   - runs the top bar (mlx-topbar) with a terminal: the bar (with its
 #     workspace controls in the middle) is along the
 #     top and reserves it (the terminal moves below it, maximized it stays
@@ -604,6 +607,40 @@ SCRIPT
     [[ "$(cat "$out/x-text")" == "hello from wayland" ]] || fail "clipboard: the X program did not read wl-copy's text ($(cat "$out/x-text" "$out/x-text.err"))" "$work/clip-text.log"
     [[ "$(cat "$out/wl-text")" == "hello from x11" ]] || fail "clipboard: wl-paste did not read the X program's text ($(cat "$out/wl-text" "$out/own.err"))" "$work/clip-text.log"
     echo "ok   text goes from wl-copy to an X program and from an X program to wl-paste"
+}
+
+# The dock out of the way of windows (dock-autohide = smart): the drag
+# source's window maximized (Super+Up) covers the dock, restored it does
+# not. stack_run's home; its configuration with the setting, taken away
+# after.
+smart_dock() {
+    printf 'dock-autohide = smart\n' > "$work/stacks/config/mlx/compositor.conf"
+    cat > "$work/smart-dock.script" <<SCRIPT
+wait 3000
+pointer 100 100
+wait 200
+press 272
+release 272
+wait 1500
+down 125
+down 103
+up 103
+up 125
+wait 2500
+down 125
+down 103
+up 103
+up 125
+wait 2500
+close
+SCRIPT
+    stack_run smart-dock "$work/drag-source file:///nothing"
+    rm -f -- "$work/stacks/config/mlx/compositor.conf"
+    local log="$work/smart-dock.log"
+    grep -q "dock autohide smart" "$log" || fail "smart dock: the compositor did not take dock-autohide = smart" "$log"
+    # Hidden only after the window was maximized, back after it was not.
+    [[ "$(grep -o "^maximize: \|^dock: hidden\|^restore: \|^dock: nothing in its way" "$log" | tr '\n' ',')" == "maximize: ,dock: hidden,restore: ,dock: nothing in its way," ]] || fail "smart dock: the dock did not hide only while the maximized window covered it ($(grep "^maximize\|^restore\|^dock:" "$log" | tr '\n' ' '))" "$log"
+    echo "ok   dock-autohide = smart hides the dock only while a window is in its way"
 }
 
 # The top bar with a terminal, at a fixed time (2024-09-27 14:05 UTC, 16:05
@@ -1477,6 +1514,7 @@ PY
 drops
 stacks
 clipboard
+smart_dock
 topbar
 topbar_bus
 control_centre

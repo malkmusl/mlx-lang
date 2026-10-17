@@ -249,11 +249,15 @@ crash, it says where first (`mlx-dock: crashed: ...` and the functions,
 in the compositor's log), as the compositor does, and keeps the crash
 for MLX Observatory.
 
-With `dock-autohide = on` (mlx-settings: "Auto-hide dock") the dock
+With `dock-autohide = on` (mlx-settings: "Always hide") the dock
 reserves no space, so maximized windows reach the bottom edge. It slides
 out of sight once the pointer has been away from it for 0.6 seconds and
 back up when the pointer touches the output's bottom edge; it stays while
-its previews show or a button is held.
+its previews show or a button is held. With `dock-autohide = smart`
+("Hide when a window is in the way") it does the same, but only goes
+while a window of the workspace shown (its frame and title bar) overlaps
+the dock's bar, and comes back by itself once no window does (`dock:
+nothing in its way` in the log).
 
 The top bar (`mlx-topbar`, `--topbar PROGRAM|none`, started and kept
 running like the dock over `MLX_TOPBAR_FD`) sits in the top layer along
