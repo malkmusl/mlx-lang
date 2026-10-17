@@ -34,6 +34,7 @@ build inputs; applications only `@import("std.wayland")`.
 | `ext-data-control-v1.xml` | wayland-protocols 1.49, `staging/ext-data-control/ext-data-control-v1.xml` (clipboard tools such as wl-copy and clipboard managers) |
 | `single-pixel-buffer-v1.xml` | wayland-protocols 1.49, `staging/single-pixel-buffer/single-pixel-buffer-v1.xml` (a one-colour buffer, scaled with a viewport) |
 | `presentation-time.xml` | wayland-protocols 1.49, `stable/presentation-time/presentation-time.xml` (when a frame reached the screen: video players, browsers) |
+| `wlr-data-control-unstable-v1.xml` | wlr-protocols bf4fc79a, `unstable/wlr-data-control-unstable-v1.xml` (ext-data-control's forerunner, which wl-clipboard 2.2 speaks) |
 
 The files are byte-for-byte copies of the upstream releases. `SOURCES`
 records each file's URL, release and SHA-256. Bootstrap tooling must preserve
