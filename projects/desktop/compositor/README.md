@@ -1536,6 +1536,20 @@ wire protocol without libc or libxcb):
   written into its pipe, the property read in parts, or `INCR` part by
   part. Copied files cross as `text/uri-list` and
   `x-special/gnome-copied-files` like any type.
+- Drag and drop from Wayland to X goes by XDND version 5
+  ([`xwm_dnd.mlx`](xwm_dnd.mlx)): a Wayland drag over an X window is not
+  offered as data, the compositor is its XDND source instead. The
+  clipboard's window owns `XdndSelection` with the drag's types (served
+  like `CLIPBOARD`), the window under the pointer is asked for
+  `XdndAware` and, from version 3, gets `XdndEnter` (the types, more than
+  three in `XdndTypeList`), `XdndPosition` for each motion (the next once
+  its `XdndStatus` came), `XdndLeave` when the pointer goes and
+  `XdndDrop` on release when its last status took a type. Its status is
+  the Wayland source's (a type taken, copy or move), and its
+  `XdndFinished` ends the Wayland drag. A window without `XdndAware`
+  takes no drops; released there, the drag is cancelled.
+  `tools/x11-dnd-test target` is such an X window for the checks (`xdnd`
+  in `tools/check_desktop_clients.sh`).
 
 `--xwayland PROGRAM` names another X server, `--xwayland none` runs none.
 The log (`--verbose`) says what happens:

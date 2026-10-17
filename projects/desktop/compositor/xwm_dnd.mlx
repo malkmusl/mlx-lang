@@ -1,0 +1,298 @@
+// Drag and drop between Wayland and X clients (part of the X window
+// manager, xwm.mlx), by XDND version 5
+// (https://www.freedesktop.org/wiki/Specifications/XDND/).
+//
+// A Wayland drag over an X window: the compositor is the XDND source. The
+// clipboard's window owns XdndSelection with the drag's types for as long
+// as the drag may be read (xwm_selection.mlx serves its conversions as it
+// does CLIPBOARD's). Entering an X window asks for its XdndAware; one that
+// has it (version 3 or later) gets XdndEnter with the types (more than
+// three: XdndTypeList on the source window), an XdndPosition for each
+// motion (the next once its XdndStatus came), XdndLeave when the pointer
+// goes, and XdndDrop on release when its last status accepted. Its
+// status is the Wayland source's (a type taken or none, the action), and
+// its XdndFinished ends the Wayland drag (dnd_finished).
+const std = @import("std")
+const x11 = @import("std.x11")
+const state = @import("./state.mlx")
+const data_module = @import("./data.mlx")
+const xwm_module = @import("./xwm.mlx")
+const xwm_selection = @import("./xwm_selection.mlx")
+
+const Compositor = state.Compositor
+
+const A_AWARE: usize = 0
+const A_ENTER: usize = 1
+const A_POSITION: usize = 2
+const A_STATUS: usize = 3
+const A_LEAVE: usize = 4
+const A_DROP: usize = 5
+const A_FINISHED: usize = 6
+const A_TYPE_LIST: usize = 7
+const A_COPY: usize = 8
+const A_MOVE: usize = 9
+const A_ASK: usize = 10
+const ATOMS: usize = 11
+
+fn atomText(index: usize) -> []const u8 {
+    if index == A_AWARE { return "XdndAware" }
+    if index == A_ENTER { return "XdndEnter" }
+    if index == A_POSITION { return "XdndPosition" }
+    if index == A_STATUS { return "XdndStatus" }
+    if index == A_LEAVE { return "XdndLeave" }
+    if index == A_DROP { return "XdndDrop" }
+    if index == A_FINISHED { return "XdndFinished" }
+    if index == A_TYPE_LIST { return "XdndTypeList" }
+    if index == A_COPY { return "XdndActionCopy" }
+    if index == A_MOVE { return "XdndActionMove" }
+    return "XdndActionAsk"
+}
+
+// The version spoken (the target's, when lower).
+const VERSION: u32 = 5
+const NO_SEQUENCE: u32 = 65536
+
+pub const Dnd = struct {
+    compositor: *Compositor
+    connection: *x11.Connection
+    atoms: [11]u32
+    atomSequence: u32
+    atomsLeft: usize
+    // The X window a Wayland drag is over (0: none) and its surface; its
+    // XdndAware asked (the reply's sequence); the version both speak (0:
+    // it takes no drops); whether XdndEnter went; whether a position
+    // awaits its status, and whether the pointer moved since; its last
+    // status: a type taken, the action (an atom).
+    target: u32
+    surface: usize
+    awareSequence: u32
+    version: u32
+    entered: bool
+    waiting: bool
+    moved: bool
+    accepted: bool
+    action: u32
+    // Dropped on an X window: the Wayland source awaiting its XdndFinished
+    // (0: none) and the window.
+    finishing: usize
+    finishTarget: u32
+}
+
+fn dndOf(compositor: *Compositor) -> *Dnd {
+    unsafe { return @ptrFromInt(*Dnd, compositor.*.xdnd) }
+}
+
+// Starts with the window manager (its atoms asked for now).
+pub fn start(compositor: *Compositor, connection: *x11.Connection) -> void {
+    if compositor.*.xdnd != 0 { return }
+    const memory = state.allocate(compositor, @sizeOf(Dnd))
+    compositor.*.xdnd = @intFromPtr(memory)
+    const dnd = dndOf(compositor)
+    dnd.*.compositor = compositor
+    dnd.*.connection = connection
+    dnd.*.target = 0
+    dnd.*.surface = 0
+    dnd.*.awareSequence = NO_SEQUENCE
+    dnd.*.version = 0
+    dnd.*.entered = false
+    dnd.*.waiting = false
+    dnd.*.accepted = false
+    dnd.*.finishing = 0
+    dnd.*.atomsLeft = ATOMS
+    var index: usize = 0
+    while index < ATOMS {
+        const sequence = x11.internAtom(connection, atomText(index))
+        if index == 0 { dnd.*.atomSequence = sequence }
+        index += 1
+    }
+}
+
+pub fn stop(compositor: *Compositor) -> void {
+    if compositor.*.xdnd == 0 { return }
+    unsafe { state.release(compositor, @ptrCast([*]u8, dndOf(compositor)), @sizeOf(Dnd)) }
+    compositor.*.xdnd = 0
+}
+
+fn forget(dnd: *Dnd) -> void {
+    dnd.*.target = 0
+    dnd.*.surface = 0
+    dnd.*.awareSequence = NO_SEQUENCE
+    dnd.*.version = 0
+    dnd.*.entered = false
+    dnd.*.waiting = false
+    dnd.*.moved = false
+    dnd.*.accepted = false
+    dnd.*.action = 0
+}
+
+fn send(dnd: *Dnd, window: u32, kind: usize, first: u32, second: u32, third: u32, fourth: u32) -> void {
+    var values: [5]u32 = [5]u32{ xwm_selection.windowOf(dnd.*.compositor), first, second, third, fourth }
+    x11.sendClientMessage5(dnd.*.connection, window, dnd.*.atoms[kind], &values)
+}
+
+// The action asked for: copy when the Wayland source offers it, else move,
+// else ask.
+fn wantedAction(dnd: *Dnd) -> u32 {
+    const actions = data_module.dragActions(dnd.*.compositor)
+    if actions & 2 != 0 && actions & 1 == 0 { return dnd.*.atoms[A_MOVE] }
+    if actions & 4 != 0 && actions & 3 == 0 { return dnd.*.atoms[A_ASK] }
+    return dnd.*.atoms[A_COPY]
+}
+
+// XDND's action as Wayland's (copy 1, move 2, ask 4; none 0).
+fn waylandAction(dnd: *Dnd, action: u32) -> u32 {
+    if action == dnd.*.atoms[A_MOVE] { return 2 }
+    if action == dnd.*.atoms[A_ASK] { return 4 }
+    if action == x11.NONE { return 0 }
+    return 1
+}
+
+fn sendPosition(dnd: *Dnd) -> void {
+    if !dnd.*.entered { return }
+    if dnd.*.waiting {
+        dnd.*.moved = true
+        return
+    }
+    const compositor = dnd.*.compositor
+    var x = compositor.*.pointerX
+    var y = compositor.*.pointerY
+    if x < 0 { x = 0 }
+    if y < 0 { y = 0 }
+    send(dnd, dnd.*.target, A_POSITION, 0, (@bitCast(u32, x) << 16) | @bitCast(u32, y), x11.CURRENT_TIME, wantedAction(dnd))
+    dnd.*.waiting = true
+    dnd.*.moved = false
+}
+
+// XdndEnter, once the window takes drops and the types have their atoms.
+fn sendEnter(dnd: *Dnd) -> void {
+    const compositor = dnd.*.compositor
+    if dnd.*.entered || dnd.*.version == 0 || !xwm_selection.dragReady(compositor) { return }
+    var types: [32]u32 = [32]u32{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }
+    const count = xwm_selection.dragTypes(compositor, &types)
+    if count == 0 { return }
+    if count > 3 {
+        unsafe { x11.changeProperty(dnd.*.connection, xwm_selection.windowOf(compositor), dnd.*.atoms[A_TYPE_LIST], x11.ATOM_ATOM, 32, @ptrCast([*]const u8, &types), count) }
+    }
+    send(dnd, dnd.*.target, A_ENTER, (dnd.*.version << 24) | (if count > 3 { 1 } else { 0 }), types[0], types[1], types[2])
+    dnd.*.entered = true
+    dnd.*.waiting = false
+    dnd.*.accepted = false
+    if compositor.*.verbose { state.say("xdnd: entered an X window\n") }
+    sendPosition(dnd)
+}
+
+// Whether the surface at `address` is an X window's.
+pub fn isX(compositor: *Compositor, address: usize) -> bool {
+    return compositor.*.xdnd != 0 && address != 0 && xwm_module.windowIdOf(state.surfaceAt(address)) != 0
+}
+
+// A Wayland drag came over the X window of the surface at `address`.
+pub fn enter(compositor: *Compositor, address: usize) -> void {
+    if compositor.*.xdnd == 0 { return }
+    const dnd = dndOf(compositor)
+    leave(compositor)
+    const window = xwm_module.windowIdOf(state.surfaceAt(address))
+    if window == 0 || dnd.*.atomsLeft > 0 || xwm_selection.dragSource(compositor) == 0 { return }
+    dnd.*.target = window
+    dnd.*.surface = address
+    dnd.*.awareSequence = x11.getProperty(dnd.*.connection, window, dnd.*.atoms[A_AWARE], x11.ATOM_ANY, 1)
+}
+
+// The pointer moved over it.
+pub fn motion(compositor: *Compositor) -> void {
+    if compositor.*.xdnd == 0 { return }
+    const dnd = dndOf(compositor)
+    if dnd.*.target == 0 || dnd.*.version == 0 { return }
+    if dnd.*.entered { sendPosition(dnd) } else { sendEnter(dnd) }
+}
+
+// It left the window (or the drag was cancelled over it).
+pub fn leave(compositor: *Compositor) -> void {
+    if compositor.*.xdnd == 0 { return }
+    const dnd = dndOf(compositor)
+    if dnd.*.target != 0 && dnd.*.entered { send(dnd, dnd.*.target, A_LEAVE, 0, 0, 0, 0) }
+    forget(dnd)
+}
+
+// Released over it: XdndDrop when its last status took a type (true),
+// else nothing (the drag is cancelled, which leaves it).
+pub fn drop(compositor: *Compositor) -> bool {
+    if compositor.*.xdnd == 0 { return false }
+    const dnd = dndOf(compositor)
+    if dnd.*.target == 0 || !dnd.*.entered || !dnd.*.accepted { return false }
+    send(dnd, dnd.*.target, A_DROP, 0, x11.CURRENT_TIME, 0, 0)
+    dnd.*.finishing = compositor.*.dragSource
+    dnd.*.finishTarget = dnd.*.target
+    forget(dnd)
+    return true
+}
+
+// The surface at `address` went: no longer the drag's.
+pub fn surfaceGone(compositor: *Compositor, address: usize) -> void {
+    if compositor.*.xdnd == 0 { return }
+    if dndOf(compositor).*.surface == address { forget(dndOf(compositor)) }
+}
+
+// The Wayland source at `address` went: nobody to tell it finished.
+pub fn sourceGone(compositor: *Compositor, address: usize) -> void {
+    if compositor.*.xdnd == 0 { return }
+    if dndOf(compositor).*.finishing == address { dndOf(compositor).*.finishing = 0 }
+}
+
+// A reply for XDND: true when it was one.
+pub fn reply(compositor: *Compositor, sequence: u32, data: [*]const u8) -> bool {
+    if compositor.*.xdnd == 0 { return false }
+    const dnd = dndOf(compositor)
+    if dnd.*.atomsLeft > 0 {
+        const index = @intCast(usize, (sequence -% dnd.*.atomSequence) & 65535)
+        if index < ATOMS {
+            dnd.*.atoms[index] = x11.atomOf(data)
+            dnd.*.atomsLeft -= 1
+            return true
+        }
+    }
+    if sequence != dnd.*.awareSequence { return false }
+    dnd.*.awareSequence = NO_SEQUENCE
+    // XdndAware: the version the window speaks (from 3 on).
+    if x11.propertyFormat(data) == 32 && x11.propertyBytes(data) >= 4 {
+        const version = x11.get32(x11.propertyValue(data), 0)
+        if version >= 3 { dnd.*.version = if version < VERSION { version } else { VERSION } }
+    }
+    if dnd.*.version == 0 {
+        if compositor.*.verbose { state.say("xdnd: the X window takes no drops\n") }
+        return true
+    }
+    sendEnter(dnd)
+    return true
+}
+
+// A ClientMessage for XDND (to the source window): true when it was one.
+pub fn event(compositor: *Compositor, kind: u8, data: [*]const u8) -> bool {
+    if compositor.*.xdnd == 0 || kind != x11.CLIENT_MESSAGE { return false }
+    const dnd = dndOf(compositor)
+    if dnd.*.atomsLeft > 0 || x11.get32(data, 4) != xwm_selection.windowOf(compositor) { return false }
+    const message = x11.get32(data, 8)
+    const from = x11.get32(data, 12)
+    if message == dnd.*.atoms[A_STATUS] {
+        if from != dnd.*.target || !dnd.*.entered { return true }
+        const accepted = x11.get32(data, 16) & 1 != 0
+        const action = if dnd.*.version >= 2 { x11.get32(data, 28) } else { dnd.*.atoms[A_COPY] }
+        if accepted != dnd.*.accepted && compositor.*.verbose { state.say(if accepted { "xdnd: the X window takes it\n" } else { "xdnd: the X window does not take it\n" }) }
+        dnd.*.accepted = accepted
+        dnd.*.action = action
+        dnd.*.waiting = false
+        data_module.xStatus(compositor, accepted, if accepted { waylandAction(dnd, action) } else { 0 })
+        if dnd.*.moved { sendPosition(dnd) }
+        return true
+    }
+    if message == dnd.*.atoms[A_FINISHED] {
+        if dnd.*.finishing == 0 || from != dnd.*.finishTarget { return true }
+        const source = dnd.*.finishing
+        dnd.*.finishing = 0
+        data_module.xFinished(compositor, source)
+        xwm_selection.dragEnded(compositor)
+        if compositor.*.verbose { state.say("xdnd: the X window finished\n") }
+        return true
+    }
+    return false
+}

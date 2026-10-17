@@ -128,6 +128,7 @@ trap 'rm -rf -- "$work"' EXIT
 "$compiler" --quiet tools/network-test/fakenetd.mlx -o "$work/fakenetd"
 "$compiler" --quiet projects/desktop/files/main.mlx -o "$work/mlx-files"
 "$compiler" --quiet tools/x11-clipboard-test/main.mlx -o "$work/x11-clipboard-test"
+"$compiler" --quiet tools/x11-dnd-test/main.mlx -o "$work/x11-dnd-test"
 xkbcli compile-keymap --layout us > "$work/us.xkb"
 
 # The apps: only these (no system directories), one with an icon.
@@ -623,6 +624,74 @@ SCRIPT
     [[ "$(cat "$out/x-text")" == "hello from wayland" ]] || fail "clipboard: the X program did not read wl-copy's text ($(cat "$out/x-text" "$out/x-text.err"))" "$work/clip-text.log"
     [[ "$(cat "$out/wl-text")" == "hello from x11" ]] || fail "clipboard: wl-paste did not read the X program's text ($(cat "$out/wl-text" "$out/own.err"))" "$work/clip-text.log"
     echo "ok   text goes from wl-copy to an X program and from an X program to wl-paste"
+}
+
+# Drag and drop from Wayland to X (the window manager's xwm_dnd.mlx): the
+# drag source's window (24,24) and tools/x11-dnd-test's (an X window
+# taking text/uri-list by XDND, at 64,56). The first drag goes over the X
+# window and away (it gets XdndLeave), the second is dropped on it: it
+# reads XdndSelection as the drag source's second list and finishes. A
+# drag over xev's window, which takes no drops, is cancelled.
+xdnd() {
+    if ! command -v Xwayland > /dev/null; then
+        echo "skip xdnd: Xwayland is not installed"
+        return
+    fi
+    local out="$work/xdnd-out"
+    mkdir -p "$out"
+    cat > "$work/xdnd-clients.sh" <<SCRIPT
+#!/bin/sh
+"$work/drag-source" file:///tmp/a.txt file:///tmp/b.txt &
+sleep 1
+exec "$work/x11-dnd-test" target > "$out/dropped" 2> "$out/target.err"
+SCRIPT
+    chmod +x "$work/xdnd-clients.sh"
+    cat > "$work/xdnd.script" <<SCRIPT
+wait 5000
+pointer 40 40
+wait 200
+press 272
+wait 100
+pointer 50 50
+wait 100
+pointer 250 200
+wait 300
+pointer 600 500
+wait 300
+release 272
+wait 800
+pointer 40 40
+wait 200
+press 272
+wait 100
+pointer 50 50
+wait 100
+pointer 250 200
+wait 300
+release 272
+wait 1500
+close
+SCRIPT
+    stack_run xdnd "/bin/sh $work/xdnd-clients.sh"
+    local log="$work/xdnd.log"
+    grep -q "^window: 200x160 at 24,24" "$log" && grep -q "^window: 300x200 at 64,56" "$log" || fail "xdnd: the windows are not where the script expects them" "$log"
+    [[ "$(grep "^drag: \|^xdnd: " "$log" | tr '\n' ',')" == "drag: started,xdnd: entered an X window,xdnd: the X window takes it,drag: cancelled,drag: started,xdnd: entered an X window,xdnd: the X window takes it,drag: dropped on X Drop,drag: finished,xdnd: the X window finished," ]] || fail "xdnd: the drags over the X window did not go by XDND ($(grep "^drag: \|^xdnd: " "$log" | tr '\n' ' '))" "$log"
+    grep -q "^x11-dnd-test: leave" "$out/target.err" || fail "xdnd: the X window was not left" "$out/target.err"
+    [[ "$(cat "$out/dropped")" == "$(printf 'file:///tmp/b.txt\r')" ]] || fail "xdnd: the X window did not get the dropped files ($(cat "$out/dropped" "$out/target.err"))" "$log"
+    echo "ok   a Wayland drag over an X window goes by XDND: left, then dropped, read and finished"
+    if command -v xev > /dev/null; then
+        cat > "$work/xdnd-xev.sh" <<SCRIPT
+#!/bin/sh
+"$work/drag-source" file:///tmp/a.txt &
+sleep 1
+exec xev -geometry 300x200
+SCRIPT
+        chmod +x "$work/xdnd-xev.sh"
+        sed '/^wait 800$/,/^release 272$/d' "$work/xdnd.script" > "$work/xdnd-none.script"
+        stack_run xdnd-none "/bin/sh $work/xdnd-xev.sh"
+        [[ "$(grep "^drag: \|^xdnd: " "$work/xdnd-none.log" | tr '\n' ',')" == "drag: started,xdnd: the X window takes no drops,drag: cancelled," ]] || fail "xdnd: a drag over an X window without XdndAware was not cancelled ($(grep "^drag: \|^xdnd: " "$work/xdnd-none.log" | tr '\n' ' '))" "$work/xdnd-none.log"
+        echo "ok   a drag over an X window that takes no drops is cancelled"
+    fi
 }
 
 # The dock out of the way of windows (dock-autohide = smart): the drag
@@ -2000,6 +2069,7 @@ PY
 drops
 stacks
 clipboard
+xdnd
 smart_dock
 dock_workspaces
 dock_hover
