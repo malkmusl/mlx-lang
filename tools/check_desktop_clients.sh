@@ -624,6 +624,23 @@ SCRIPT
     [[ "$(cat "$out/x-text")" == "hello from wayland" ]] || fail "clipboard: the X program did not read wl-copy's text ($(cat "$out/x-text" "$out/x-text.err"))" "$work/clip-text.log"
     [[ "$(cat "$out/wl-text")" == "hello from x11" ]] || fail "clipboard: wl-paste did not read the X program's text ($(cat "$out/wl-text" "$out/own.err"))" "$work/clip-text.log"
     echo "ok   text goes from wl-copy to an X program and from an X program to wl-paste"
+    # The primary selection and PRIMARY likewise.
+    printf 'wait 10000\nclose\n' > "$work/clip-primary.script"
+    cat > "$work/clip-primary-clients.sh" <<SCRIPT
+#!/bin/sh
+sleep 1
+printf 'hello primary' | wl-copy --primary
+sleep 2
+"$work/x11-clipboard-test" read UTF8_STRING primary > "$out/x-primary" 2> "$out/x-primary.err"
+"$work/x11-clipboard-test" own 'primary from x11' primary > /dev/null 2> "$out/own-primary.err" &
+sleep 2
+timeout 5 wl-paste --primary -n > "$out/wl-primary" 2>&1
+SCRIPT
+    chmod +x "$work/clip-primary-clients.sh"
+    stack_run clip-primary "$work/clip-primary-clients.sh"
+    [[ "$(cat "$out/x-primary")" == "hello primary" ]] || fail "clipboard: the X program did not read the primary selection as PRIMARY ($(cat "$out/x-primary" "$out/x-primary.err"))" "$work/clip-primary.log"
+    [[ "$(cat "$out/wl-primary")" == "primary from x11" ]] || fail "clipboard: wl-paste --primary did not read the X program's PRIMARY ($(cat "$out/wl-primary" "$out/own-primary.err"))" "$work/clip-primary.log"
+    echo "ok   the primary selection goes to X programs as PRIMARY and back"
 }
 
 # Drag and drop from Wayland to X (the window manager's xwm_dnd.mlx): the

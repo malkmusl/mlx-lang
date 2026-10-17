@@ -1535,7 +1535,9 @@ wire protocol without libc or libxcb):
   becomes the selection; a Wayland client reading it gets the conversion
   written into its pipe, the property read in parts, or `INCR` part by
   part. Copied files cross as `text/uri-list` and
-  `x-special/gnome-copied-files` like any type.
+  `x-special/gnome-copied-files` like any type. The primary selection and
+  X's `PRIMARY` are kept one the same way (a middle click pastes what was
+  last selected in either), apart from the clipboard.
 - Drag and drop from Wayland to X goes by XDND version 5
   ([`xwm_dnd.mlx`](xwm_dnd.mlx)): a Wayland drag over an X window is not
   offered as data, the compositor is its XDND source instead. The

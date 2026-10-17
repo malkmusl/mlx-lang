@@ -5,10 +5,18 @@
 // when it gains the focus and whenever the selection changes, and reading
 // an offer has the source's client write the data into the reader's pipe.
 // A greeter compositor does not offer it (shell_table.mlx).
+//
+// X programs share it as PRIMARY (xwm_selection.mlx): an X program's
+// selection comes as an X source (no client of ours: the window manager
+// converts it), and every change is told to the X side.
 
 const std = @import("std")
 const wl = @import("std.wayland")
 const state = @import("./state.mlx")
+const xwm_selection = @import("./xwm_selection.mlx")
+
+const SYS_fcntl: usize = 72
+const F_DUPFD_CLOEXEC: usize = 1030
 
 const Compositor = state.Compositor
 
@@ -20,6 +28,8 @@ pub const Source = struct {
     resource: wl.server.Object
     mimes: [*]u8
     mimeBytes: usize
+    // An X program's PRIMARY (resource: none; xwm_selection reads it).
+    x: bool
 }
 
 pub const Device = struct {
@@ -114,12 +124,13 @@ fn setSelection(compositor: *Compositor, address: usize) -> void {
     const old = compositor.*.primarySelection
     if old == address { return }
     // The replaced source learns that it is no longer the selection.
-    if old != 0 { wl.zwp_primary_selection_source_v1.Resource.fromObject(sourceAt(old).*.resource).sendCancelled() }
+    if old != 0 && !sourceAt(old).*.x { wl.zwp_primary_selection_source_v1.Resource.fromObject(sourceAt(old).*.resource).sendCancelled() }
     compositor.*.primarySelection = address
     if compositor.*.verbose {
         if address == 0 { state.say("primary selection: cleared\n") } else { state.say("primary selection: set\n") }
     }
     offerToFocus(compositor)
+    xwm_selection.primaryChanged(compositor)
 }
 
 // ---------------------------------------------------------------------------
@@ -130,10 +141,16 @@ fn onOffer(context: *anyopaque, request: wl.server.Request) -> void {
     if request.opcode != wl.zwp_primary_selection_offer_v1.REQUEST_RECEIVE { return }
     const receive = wl.zwp_primary_selection_offer_v1.decodeRequest(request).receive
     // The source's client writes into the pipe (sendSend passes a copy);
-    // the reader sees end of file once the writer closes it.
+    // the reader sees end of file once the writer closes it. An X
+    // program's is converted into a copy of the pipe.
     if offer.*.source != 0 {
         const mime = receive.mime_type
-        wl.zwp_primary_selection_source_v1.Resource.fromObject(sourceAt(offer.*.source).*.resource).sendSend(mime.pointer[0..mime.length], receive.fd)
+        if sourceAt(offer.*.source).*.x {
+            const copy = std.linux.syscall3(SYS_fcntl, @bitCast(usize, receive.fd.descriptor), F_DUPFD_CLOEXEC, 0)
+            if copy >= 0 { xwm_selection.receivePrimary(offer.*.compositor, mime.pointer[0..mime.length], copy) }
+        } else {
+            wl.zwp_primary_selection_source_v1.Resource.fromObject(sourceAt(offer.*.source).*.resource).sendSend(mime.pointer[0..mime.length], receive.fd)
+        }
     }
     receive.fd.close()
 }
@@ -152,20 +169,16 @@ fn onSource(context: *anyopaque, request: wl.server.Request) -> void {
     const source = sourceAt(recordOf(context))
     if request.opcode != wl.zwp_primary_selection_source_v1.REQUEST_OFFER { return }
     const mime = wl.zwp_primary_selection_source_v1.decodeRequest(request).offer.mime_type
-    if mime.length == 0 || mime.length > 255 || source.*.mimeBytes + 1 + mime.length > MIME_BYTES { return }
-    source.*.mimes[source.*.mimeBytes] = @intCast(u8, mime.length)
-    var index: usize = 0
-    while index < mime.length {
-        source.*.mimes[source.*.mimeBytes + 1 + index] = mime.pointer[index]
-        index += 1
-    }
-    source.*.mimeBytes += 1 + mime.length
+    addType(source, mime.pointer[0..mime.length])
+}
+
+fn onSourceDestroyed(context: *anyopaque, object: wl.server.Object) -> void {
+    forgetSource(recordOf(context))
 }
 
 // A source gone: its offers read nothing more, and a selection of it
 // ends.
-fn onSourceDestroyed(context: *anyopaque, object: wl.server.Object) -> void {
-    const address = recordOf(context)
+fn forgetSource(address: usize) -> void {
     const source = sourceAt(address)
     const compositor = source.*.compositor
     compositor.*.primarySources = state.listRemove(compositor.*.primarySources, address)
@@ -178,9 +191,85 @@ fn onSourceDestroyed(context: *anyopaque, object: wl.server.Object) -> void {
     if compositor.*.primarySelection == address {
         compositor.*.primarySelection = 0
         offerToFocus(compositor)
+        if !source.*.x { xwm_selection.primaryChanged(compositor) }
     }
     state.release(compositor, source.*.mimes, MIME_BYTES)
     unsafe { state.release(compositor, @ptrFromInt([*]u8, address), @sizeOf(Source)) }
+}
+
+fn newSource(compositor: *Compositor) -> usize {
+    const memory = state.allocate(compositor, @sizeOf(Source))
+    const address = @intFromPtr(memory)
+    const source = sourceAt(address)
+    source.*.compositor = compositor
+    source.*.mimes = state.allocate(compositor, MIME_BYTES)
+    source.*.mimeBytes = 0
+    source.*.x = false
+    compositor.*.primarySources = state.listAppend(compositor.*.primarySources, address)
+    return address
+}
+
+fn addType(source: *Source, mime: []const u8) -> void {
+    if mime.length == 0 || mime.length > 255 || source.*.mimeBytes + 1 + mime.length > MIME_BYTES { return }
+    source.*.mimes[source.*.mimeBytes] = @intCast(u8, mime.length)
+    var index: usize = 0
+    while index < mime.length {
+        source.*.mimes[source.*.mimeBytes + 1 + index] = mime[index]
+        index += 1
+    }
+    source.*.mimeBytes += 1 + mime.length
+}
+
+// ---------------------------------------------------------------------------
+// X sources (xwm_selection.mlx)
+
+// A source standing for an X program's PRIMARY (its types added with
+// addXSourceType); 0 without the primary selection.
+pub fn newXSource(compositor: *Compositor) -> usize {
+    if !compositor.*.hasPrimarySelection { return 0 }
+    const address = newSource(compositor)
+    // No client's: an id no object has.
+    sourceAt(address).*.resource.id = 0
+    sourceAt(address).*.x = true
+    return address
+}
+
+pub fn addXSourceType(address: usize, mime: []const u8) -> void {
+    if address == 0 { return }
+    const source = sourceAt(address)
+    var at: usize = 0
+    while at < source.*.mimeBytes {
+        const length = @intCast(usize, source.*.mimes[at])
+        if std.text.same(source.*.mimes[at + 1..at + 1 + length], mime) { return }
+        at += 1 + length
+    }
+    addType(source, mime)
+}
+
+pub fn setXSelection(compositor: *Compositor, address: usize) -> void {
+    if address != 0 { setSelection(compositor, address) }
+}
+
+pub fn dropXSource(compositor: *Compositor, address: usize) -> void {
+    if address != 0 { forgetSource(address) }
+}
+
+// A source's types: a length byte and the type each.
+pub fn typesOf(address: usize) -> []const u8 {
+    if address == 0 { return "" }
+    return sourceAt(address).*.mimes[0..sourceAt(address).*.mimeBytes]
+}
+
+// Whether the source at `address` is an X program's.
+pub fn isX(address: usize) -> bool {
+    return address != 0 && sourceAt(address).*.x
+}
+
+// Asks a client's source to write its data as `mime` into `descriptor`
+// (a pipe's end; the caller closes its own).
+pub fn sendFromSource(compositor: *Compositor, address: usize, mime: []const u8, descriptor: isize) -> void {
+    if address == 0 || sourceAt(address).*.x || !state.listContains(compositor.*.primarySources, address) { return }
+    wl.zwp_primary_selection_source_v1.Resource.fromObject(sourceAt(address).*.resource).sendSend(mime, wl.server.Handle.fromDescriptor(descriptor))
 }
 
 // ---------------------------------------------------------------------------
@@ -213,14 +302,8 @@ fn onManager(context: *anyopaque, request: wl.server.Request) -> void {
     const decoded = wl.zwp_primary_selection_device_manager_v1.decodeRequest(request)
     if request.opcode == wl.zwp_primary_selection_device_manager_v1.REQUEST_CREATE_SOURCE {
         const resource = decoded.create_source.id
-        const memory = state.allocate(compositor, @sizeOf(Source))
-        const address = @intFromPtr(memory)
-        const source = sourceAt(address)
-        source.*.compositor = compositor
-        source.*.resource = resource.object
-        source.*.mimes = state.allocate(compositor, MIME_BYTES)
-        source.*.mimeBytes = 0
-        compositor.*.primarySources = state.listAppend(compositor.*.primarySources, address)
+        const address = newSource(compositor)
+        sourceAt(address).*.resource = resource.object
         resource.setHandler(onSource, contextAt(address))
         resource.setDestroyHandler(onSourceDestroyed, contextAt(address))
     } else if request.opcode == wl.zwp_primary_selection_device_manager_v1.REQUEST_GET_DEVICE {
