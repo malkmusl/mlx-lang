@@ -28,6 +28,12 @@ build inputs; applications only `@import("std.wayland")`.
 | `xdg-output-unstable-v1.xml` | wayland-protocols 1.49, `unstable/xdg-output/xdg-output-unstable-v1.xml` (outputs' logical size and name) |
 | `idle-inhibit-unstable-v1.xml` | wayland-protocols 1.49, `unstable/idle-inhibit/idle-inhibit-unstable-v1.xml` (a video keeps the screen on) |
 | `xdg-activation-v1.xml` | wayland-protocols 1.49, `staging/xdg-activation/xdg-activation-v1.xml` (a program passing the focus to another one it starts) |
+| `fractional-scale-v1.xml` | wayland-protocols 1.49, `staging/fractional-scale/fractional-scale-v1.xml` (the scale a surface should be drawn at, in 120ths) |
+| `tablet-v2.xml` | wayland-protocols 1.49, `stable/tablet/tablet-v2.xml` (drawing tablets; cursor-shape names its tools) |
+| `cursor-shape-v1.xml` | wayland-protocols 1.49, `staging/cursor-shape/cursor-shape-v1.xml` (a cursor by name instead of a surface) |
+| `ext-data-control-v1.xml` | wayland-protocols 1.49, `staging/ext-data-control/ext-data-control-v1.xml` (clipboard tools such as wl-copy and clipboard managers) |
+| `single-pixel-buffer-v1.xml` | wayland-protocols 1.49, `staging/single-pixel-buffer/single-pixel-buffer-v1.xml` (a one-colour buffer, scaled with a viewport) |
+| `presentation-time.xml` | wayland-protocols 1.49, `stable/presentation-time/presentation-time.xml` (when a frame reached the screen: video players, browsers) |
 
 The files are byte-for-byte copies of the upstream releases. `SOURCES`
 records each file's URL, release and SHA-256. Bootstrap tooling must preserve
