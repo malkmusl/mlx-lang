@@ -24,6 +24,7 @@
 #include <unicode/uidna.h>
 #include <unicode/uset.h>
 #include <unicode/ucol.h>
+#include <unicode/ucal.h>
 
 int main(void)
 {

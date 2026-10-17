@@ -6,7 +6,10 @@
 #     mlx-out/include/mlx-unicode/unicode/*.h of the API's Mlx modules
 #     (projects/unicode/api);
 #   - the tables in the tree (tables.mlx, api/ugenerated.mlx) are what
-#     the generator makes of the UCD (projects/unicode/ucd) now;
+#     the generator makes of the UCD (projects/unicode/ucd) now, and
+#     timezones.mlx what tz-generate makes of the IANA database (tz/);
+#   - tests/zones.mlx: every zone's offsets, 1850 to 2100, against the
+#     files zic made of the same database, where the system has them;
 #   - tests/api.mlx: the API modules compile as Mlx, and the macros, run
 #     as the Mlx they are written in, read UTF-8 and UTF-16 right;
 #   - tests/macros.c, compiled as C and as C++ by mlx-cc: every header
@@ -17,7 +20,8 @@
 #                              and line break tests of the UCD
 #       tests/collation.c      every line of the Collation Algorithm's
 #                              tests (non-ignorable and shifted) in order
-#       tests/properties.c, tests/strings.c  print what NAME.expected says
+#       tests/properties.c, tests/strings.c, tests/calendar.c  print what
+#                              NAME.expected says
 #
 #   tools/check_unicode.sh
 set -euo pipefail
@@ -37,6 +41,18 @@ mlx-out/bin/unicode-generate projects/unicode/ucd "$work/tables" || fail "unicod
 cmp -s "$work/tables/tables.mlx" projects/unicode/tables.mlx || fail "projects/unicode/tables.mlx is not what the generator makes"
 cmp -s "$work/tables/api/ugenerated.mlx" projects/unicode/api/ugenerated.mlx || fail "api/ugenerated.mlx is not what the generator makes"
 echo "ok   the tables are what the generator makes of the UCD"
+
+mlx-out/bin/tz-generate projects/unicode/tz "$work/timezones.mlx" || fail "tz-generate"
+cmp -s "$work/timezones.mlx" projects/unicode/timezones.mlx || fail "projects/unicode/timezones.mlx is not what tz-generate makes"
+echo "ok   the time zones are what tz-generate makes of the IANA database"
+
+./mlx --quiet projects/unicode/tests/zones.mlx -o "$work/zones" || fail "tests/zones.mlx does not build"
+if [ -d /usr/share/zoneinfo ]; then
+    "$work/zones" > "$work/zones.out" || { cat "$work/zones.out"; fail "the zones against zic's files"; }
+    echo "ok   $(cat "$work/zones.out")"
+else
+    echo "skip the zones against zic's files: no /usr/share/zoneinfo here"
+fi
 
 ./mlx --quiet projects/unicode/tests/api.mlx -o "$work/api" || fail "the API modules do not compile as Mlx"
 "$work/api" || fail "tests/api.mlx exits $?"
@@ -63,7 +79,7 @@ cc projects/unicode/tests/collation.c -o "$work/collation" || fail "tests/collat
 run "$work/collation" > "$work/collation.out" || { cat "$work/collation.out"; fail "the collation tests"; }
 while read -r line; do echo "ok   $line"; done < "$work/collation.out"
 
-for test in properties strings; do
+for test in properties strings calendar; do
     cc "projects/unicode/tests/$test.c" -o "$work/$test" || fail "tests/$test.c does not build"
     run "$work/$test" > "$work/$test.out" || fail "tests/$test.c fails"
     diff -u "projects/unicode/tests/$test.expected" "$work/$test.out" || fail "tests/$test.c prints otherwise"
