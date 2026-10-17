@@ -269,6 +269,24 @@ for the next one (its body at `bodyOf`, its descriptors at
 `tools/check_ipc.sh` runs both against dbus-send, gdbus, busctl and
 dbus-monitor.
 
+`std.ipc` (`std/src/ipc.mlx`) is MLXIPC's native wire format, what Mlx
+programs speak to the bus and to each other over direct channels, next
+to D-Bus on the same socket: the preamble that opens a connection (and
+tells it from a D-Bus one by its first byte), messages of a 20-byte
+little-endian header, fields and a body without padding (`Reader`,
+`Writer`, `messageSize`, `parse`, `write`), the D-Bus signature alphabet
+for its values (so a signature means the same on both sides of the bus),
+`bodyToNative`/`bodyToDBus` and `fromDBus`/`toDBus`, which carry a body
+or a whole message between the two formats without loss (the bus does
+that for every message between a native and a D-Bus connection), and a
+client with `std.dbus`'s client API (`connectSession`, `call`, `signal`,
+`reply`, `replyError`, `next`, `waitReply`; `attach` for a direct
+channel). `tests/343_ipc_wire_runtime.mlx` writes and reads every kind
+of value, frames, parses and refuses messages, and carries a D-Bus body
+to the native format and back byte for byte; `tools/check_ipc.sh` runs
+`mlx-ipc --native` against the bus next to dbus-send, gdbus and
+dbus-monitor. The format is described in `projects/desktop/ipc/README.md`.
+
 `std.audio` (`std/src/audio.mlx`) is MLX Audio's protocol and client:
 `connect` finds the sound server on the session bus and gets a direct
 MLXIPC channel to it (starting it when needed), `openStream` opens a

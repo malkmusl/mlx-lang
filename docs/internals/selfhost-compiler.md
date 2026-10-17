@@ -756,7 +756,7 @@ and updates 643 locals in place (`backend values kept out of the frame`,
 instructions (4.73 to 3.97 billion) into a binary 15% smaller, and the
 nested loop of 300 million passes runs in 0.10 s instead of 0.75 s
 (`tests/341_values_out_of_frame_runtime.mlx` covers a local read after it
-changed, across blocks and through calls).
+changed, across blocks and through calls). `tests/342_single_store_runtime.mlx` covers locals stored once (`ir/single_store.mlx`): a load the store dominates reads the stored value directly, a load it does not dominate still reads the local.
 
 **Field accesses with a displacement** (x86_64, `Memory.emitGep`). A
 `gep` whose index is a constant and whose only reader is the load or

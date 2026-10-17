@@ -5,6 +5,7 @@
 // starts services by name.
 const std = @import("std")
 const dbus = @import("std.dbus")
+const ipc = @import("std.ipc")
 const state = @import("./state.mlx")
 const policy_module = @import("./policy.mlx")
 const driver = @import("./driver.mlx")
@@ -129,6 +130,7 @@ pub fn accepted(bus: *state.Bus, descriptor: isize) -> void {
     client.*.dead = false
     client.*.watchingOutput = false
     client.*.monitor = false
+    client.*.native = false
     client.*.pid = 0
     client.*.uid = 4294967295
     client.*.gid = 0
@@ -591,16 +593,32 @@ fn duplicate(descriptor: isize) -> isize {
 
 // Writes `header` with `sender` and `body` into the scratch area and queues
 // it to `client` (copies of the descriptors when `share`).
+// A native client gets it in the native format (std.ipc) instead.
 pub fn deliver(bus: *state.Bus, client: *state.Client, header: *const dbus.Header, sender: []const u8, body: [*]const u8, descriptors: [*]const isize, count: usize, share: bool) -> void {
-    var writing: dbus.Writer = undefined
-    dbus.begin(&writing, bus.*.scratch, dbus.MAX_MESSAGE, header.*.big)
-    dbus.writeMessage(&writing, header, sender, body)
-    if writing.failed {
-        if !share { closeAll(descriptors, count) }
-        return
+    var bytes: [*]const u8 = undefined
+    var length: usize = 0
+    if client.*.native {
+        var native: ipc.Writer = undefined
+        ipc.begin(&native, bus.*.outbound, ipc.MAX_MESSAGE)
+        if !ipc.fromDBus(header, sender, body, &native) {
+            if !share { closeAll(descriptors, count) }
+            return
+        }
+        bytes = native.bytes
+        length = native.length
+    } else {
+        var writing: dbus.Writer = undefined
+        dbus.begin(&writing, bus.*.scratch, dbus.MAX_MESSAGE, header.*.big)
+        dbus.writeMessage(&writing, header, sender, body)
+        if writing.failed {
+            if !share { closeAll(descriptors, count) }
+            return
+        }
+        bytes = writing.bytes
+        length = writing.length
     }
     if !share {
-        queueTo(bus, client, writing.bytes, writing.length, descriptors, count)
+        queueTo(bus, client, bytes, length, descriptors, count)
         return
     }
     var copies: [28]isize = undefined
@@ -609,7 +627,7 @@ pub fn deliver(bus: *state.Bus, client: *state.Client, header: *const dbus.Heade
         copies[index] = duplicate(descriptors[index])
         index += 1
     }
-    queueTo(bus, client, writing.bytes, writing.length, &copies, count)
+    queueTo(bus, client, bytes, length, &copies, count)
 }
 
 // Whether `client` has a rule that takes `header` (sent by `sender`).
@@ -839,6 +857,29 @@ fn authLine(bus: *state.Bus, client: *state.Client, line: []const u8) -> void {
     }
 }
 
+// A native client's preamble (std.ipc): the version and the flags it
+// asks for, answered with ours; the connection runs from then on (the
+// socket's credentials are its authentication, as EXTERNAL's are).
+fn preamble(bus: *state.Bus, client: *state.Client, bytes: [*]const u8, available: usize) -> void {
+    var version: u8 = 0
+    var flags: u8 = 0
+    const seen = ipc.readPreamble(bytes, available, &version, &flags)
+    if seen == 0 { return }
+    if seen < 0 || version != ipc.VERSION {
+        say(bus, "ipc: a preamble of a version not spoken; client dropped\n")
+        client.*.dead = true
+        return
+    }
+    client.*.native = true
+    client.*.unixFds = flags & ipc.UNIX_FDS != 0
+    client.*.state = RUNNING
+    var ours: [8]u8 = undefined
+    const pointer: [*]u8 = &ours
+    ipc.writePreamble(pointer, if client.*.unixFds { ipc.UNIX_FDS } else { 0 })
+    answer(bus, client, pointer[0..ipc.PREAMBLE])
+    dbus.consume(connectionOf(client), ipc.PREAMBLE, 0)
+}
+
 // Authentication: the NUL byte, then lines until BEGIN (what follows
 // BEGIN is messages).
 fn authenticate(bus: *state.Bus, client: *state.Client) -> void {
@@ -847,6 +888,12 @@ fn authenticate(bus: *state.Bus, client: *state.Client) -> void {
         if available == 0 { return }
         const bytes = dbus.input(connectionOf(client))
         if !client.*.sawNul {
+            // A native client (std.ipc) starts with its preamble, a D-Bus
+            // one with a NUL byte.
+            if ipc.startsPreamble(bytes, available) {
+                preamble(bus, client, bytes, available)
+                return
+            }
             if bytes[0] != 0 {
                 client.*.dead = true
                 return
@@ -956,6 +1003,10 @@ pub fn readable(bus: *state.Bus, client: *state.Client) -> void {
     }
     if client.*.state != RUNNING { authenticate(bus, client) }
     while client.*.state == RUNNING && !client.*.dead {
+        if client.*.native {
+            if !readNative(bus, client) { return }
+            continue
+        }
         const available = dbus.buffered(connectionOf(client))
         const bytes = dbus.input(connectionOf(client))
         const size = dbus.messageSize(bytes, available)
@@ -987,6 +1038,55 @@ pub fn readable(bus: *state.Bus, client: *state.Client) -> void {
         dispatch(bus, client, bytes, &header, &descriptors, count)
         dbus.consume(connectionOf(client), size, count)
     }
+}
+
+// One native message (std.ipc) from `client`, when a whole one is there:
+// carried to D-Bus form (the bus routes D-Bus messages; deliver carries
+// what goes to a native connection back) and dispatched. False when
+// there is nothing more to take now.
+fn readNative(bus: *state.Bus, client: *state.Client) -> bool {
+    const connection = connectionOf(client)
+    const available = dbus.buffered(connection)
+    const bytes = dbus.input(connection)
+    const size = ipc.messageSize(bytes, available)
+    if size == 0 { return false }
+    if size > ipc.MAX_MESSAGE {
+        say(bus, "ipc: a message too large; client dropped\n")
+        client.*.dead = true
+        return false
+    }
+    if available < size { return false }
+    var message: ipc.Message = undefined
+    if !ipc.parse(bytes, size, &message) {
+        say(bus, "ipc: a malformed message; client dropped\n")
+        client.*.dead = true
+        return false
+    }
+    const count = message.descriptors
+    if count > 28 || count > dbus.bufferedHandles(connection) {
+        client.*.dead = true
+        return false
+    }
+    var descriptors: [28]isize = undefined
+    const queued = dbus.handles(connection)
+    var index: usize = 0
+    while index < count {
+        descriptors[index] = queued[index]
+        index += 1
+    }
+    const body: [*]const u8 = bytes + message.bodyStart
+    var writing: dbus.Writer = undefined
+    dbus.begin(&writing, bus.*.inbound, dbus.MAX_MESSAGE, false)
+    const none: [*]const u8 = unsafe { @ptrCast([*]const u8, "") }
+    var header: dbus.Header = undefined
+    if !ipc.toDBus(&message, none[0..0], body, bus.*.outbound, &writing) || !dbus.parseHeader(bus.*.inbound, writing.length, &header) {
+        say(bus, "ipc: a message that cannot be carried to D-Bus form; client dropped\n")
+        client.*.dead = true
+        return false
+    }
+    dispatch(bus, client, bus.*.inbound, &header, &descriptors, count)
+    dbus.consume(connection, size, count)
+    return true
 }
 
 // Sends what is queued to every client; drops the ones that went.
