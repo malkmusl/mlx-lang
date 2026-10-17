@@ -318,7 +318,8 @@ a compiler fence; any other text assembled by `asm.mlx`, below), and the
 builtins that are
 plain C as predefined macros (`__builtin_memcpy`, `__builtin_expect`,
 `__builtin_isnan`, `__builtin_inf`, `__builtin_constant_p` as 0, ...;
-`tests/builtins.c` against gcc). `<emmintrin.h>` (and `xmmintrin.h`,
+`tests/builtins.c` against gcc; `__builtin_frame_address(n)` and
+`__builtin_return_address(n)` walk the rbp chain every function keeps). `<emmintrin.h>` (and `xmmintrin.h`,
 `smmintrin.h`, `immintrin.h`, `x86intrin.h`) gives the few SSE
 intrinsics programs use for scalar conversions (`_mm_cvttsd_si64`,
 `_mm_set_sd`, the 128-bit loads and stores, `_mm_pause`) as plain
