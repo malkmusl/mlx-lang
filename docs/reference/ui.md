@@ -204,6 +204,20 @@ logical pixel), `typed` and `modifiers` (the current key), `wheelPixels`,
 `setBlur`, `setFullscreen` after `open`, `acceptDrops`, `startDrag`)
 does nothing on a phone.
 
+The system clipboard goes through the host too. An app sets it with
+`beginClipboard`, one `addClipboard(mime, data)` for each type other apps
+may ask for, then `publishClipboard`; the host keeps the bytes and serves
+them whenever another app reads. `clipboardHas(mime)` and
+`readClipboard(mime)` see whichever app set it last (on Linux another
+client's bytes come through a pipe, a second at most per part),
+`clipboardIsOurs` says whether that was this app, and `clearClipboard`
+empties it. On Linux this is `wl_data_device`'s selection
+(`std.ui.wayland.panel_clipboard`); a phone has no system clipboard yet,
+so there an app's own copy is all there is. mlx-files puts copied files
+up as `x-special/gnome-copied-files`, `text/uri-list` (with
+`application/x-kde-cutselection` for a cut) and the paths as text, and
+pastes any of these from other apps.
+
 | Platform | Drawn by | Input |
 | --- | --- | --- |
 | Linux (`std.ui.wayland.panel`) | the GPU (linux-dmabuf or shared memory) or the CPU | pointer, wheel, keyboard (`std.xkb`), drag and drop |
