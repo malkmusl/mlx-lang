@@ -42,6 +42,10 @@
 #     bottom edge brings the hidden dock up and drops on its trash; an X
 #     window (xev) whose frame ends on the row above the dock's bar
 #     leaves it, one a row taller hides it;
+#   - with dock-workspaces = on, groups the apps that run by workspace
+#     after the pinned ones (a window moved to workspace 2, one on 1, the
+#     pinned terminal's moved to 3 makes no group) and a click on the app
+#     of workspace 2's group brings that workspace;
 #   - runs the top bar (mlx-topbar) with a terminal: the bar (with its
 #     workspace controls in the middle) is along the
 #     top and reserves it (the terminal moves below it, maximized it stays
@@ -692,6 +696,60 @@ SCRIPT
     [[ "$(grep -o "^maximize: \|^dock: hidden\|^restore: \|^dock: nothing in its way" "$log" | tr '\n' ',')" == "maximize: ,dock: hidden,restore: ,dock: nothing in its way," ]] || fail "smart dock: the dock did not hide only while the maximized window covered it ($(grep "^maximize\|^restore\|^dock:" "$log" | tr '\n' ' '))" "$log"
     echo "ok   dock-autohide = smart hides the dock only while a window is in its way"
     echo "ok   a file dragged to the bottom edge brings the hidden dock up and drops on its trash"
+}
+
+# dock-workspaces: a window moved to workspace 2 and one left on 1 make a
+# group each after the pinned terminal, which keeps its window moved to
+# workspace 3 (no group 3); a click on the group 2 app brings workspace 2.
+dock_workspaces() {
+    mkdir -p "$work/stacks/home/Downloads" "$work/stacks/config/mlx" "$work/stacks/data"
+    printf 'terminal\n' > "$work/stacks/config/mlx/dock"
+    printf '~/Downloads\n' > "$work/stacks/config/mlx/dock-folders"
+    printf 'dock-workspaces = on\n' > "$work/stacks/config/mlx/compositor.conf"
+    cat > "$work/workspace-clients.sh" <<SCRIPT
+#!/bin/sh
+"$work/drag-source" file:///first &
+sleep 3
+"$work/mlx-terminal" &
+sleep 3
+exec "$work/drag-source" file:///second
+SCRIPT
+    # Super+Shift+2, then Super+Shift+3; the dock's items are then the
+    # apps button, the terminal, group 1, group 2, Downloads and the
+    # trash: group 2's app rests at x 549 on a 1024-wide output.
+    cat > "$work/dock-workspaces.script" <<SCRIPT
+wait 2000
+pointer 300 300
+down 125
+down 42
+down 3
+up 3
+up 42
+up 125
+wait 2500
+down 125
+down 42
+down 4
+up 4
+up 42
+up 125
+wait 3000
+pointer 540 728
+wait 200
+pointer 549 728
+wait 300
+press 272
+release 272
+wait 1500
+close
+SCRIPT
+    stack_run dock-workspaces "/bin/sh $work/workspace-clients.sh"
+    rm -f -- "$work/stacks/config/mlx/compositor.conf"
+    local log="$work/dock-workspaces.log"
+    grep -q "dock workspaces on" "$log" || fail "dock workspaces: the compositor did not take dock-workspaces = on" "$log"
+    [[ "$(grep "^mlx-dock: by workspace: [0-9]\|^workspace: " "$log" | tr '\n' ',')" == "mlx-dock: by workspace: 1, 1 shown,mlx-dock: by workspace: 2, 1 shown,mlx-dock: by workspace: 1 2, 1 shown,workspace: 2,mlx-dock: by workspace: 1 2, 2 shown," ]] || fail "dock workspaces: the dock did not group the apps by workspace ($(grep "^mlx-dock: by\|^workspace: \|^moved" "$log" | tr '\n' ' '))" "$log"
+    echo "ok   dock-workspaces = on groups the apps that run by workspace after the pinned ones"
+    echo "ok   a click on an app of another workspace's group brings that workspace"
 }
 
 # The top bar with a terminal, at a fixed time (2024-09-27 14:05 UTC, 16:05
@@ -1566,6 +1624,7 @@ drops
 stacks
 clipboard
 smart_dock
+dock_workspaces
 topbar
 topbar_bus
 control_centre
