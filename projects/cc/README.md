@@ -228,6 +228,10 @@ pointer (the enclosing class's members resolve through it), `[=]` and
 or the first return's; an empty class has size 1. Also: delegating
 constructors (`Point() : Point(0, 0) {}`), static locals of a class
 type made the first time their declaration runs (`static Point p(7)`),
+once whatever the threads (a guard libmlxcpp's `__mlxcc_guard_acquire`
+takes), and one object for the program when the function is inline or
+a template's (weak `_ZZ<function>E<name>` symbols, the code reaching
+them and inline variables by name; `tests/cpp/shared`),
 `using T = type;`, explicit template arguments for some of a function
 template's parameters with the rest deduced from the call
 (`make_shared<Resource>(name)`), deduction through a class template's

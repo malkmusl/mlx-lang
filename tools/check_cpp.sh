@@ -59,6 +59,15 @@ run stdlib "$work/stdlib_sep" "$work/stdlib_sep.out"
 cmp -s "$tests/stdlib.expected" "$work/stdlib_sep.out" || fail "stdlib from an object prints otherwise"
 echo "ok   a C++ object links with the library and runs"
 
+# Statics of inline functions and templates, and inline variables: one
+# object for the program across separately compiled files.
+"$cc" -c -o "$work/shared_a.o" "$tests/shared/a.cpp" 2> "$work/shared.err" || fail "-c of shared/a.cpp: $(head -3 "$work/shared.err")"
+"$cc" -c -o "$work/shared_b.o" "$tests/shared/b.cpp" 2>> "$work/shared.err" || fail "-c of shared/b.cpp: $(head -3 "$work/shared.err")"
+"$cc" -x c++ -o "$work/shared" "$work/shared_a.o" "$work/shared_b.o" 2>> "$work/shared.err" || fail "linking shared: $(head -3 "$work/shared.err")"
+"$work/shared" > "$work/shared.out" || fail "shared exits with $?"
+cmp -s "$tests/shared/expected" "$work/shared.out" || fail "shared prints otherwise (expected < > got): $(diff "$tests/shared/expected" "$work/shared.out" | head -6)"
+echo "ok   the statics of inline functions are one object across files"
+
 # The same programs on mlxlibc alone.
 tools/build_mlxlibc.sh --compiler "$compiler" --out "$work/lib" > /dev/null
 lib="$work/lib/libmlxc.so.1"
