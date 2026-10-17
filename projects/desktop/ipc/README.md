@@ -271,6 +271,37 @@ of either format through the parsers, validators and conversions: every
 one is read or refused without harm, and every accepted one is carried to
 the other format and back whole.
 
+## What it costs
+
+`mlx-ipc bench NAME COUNT [BYTES]` and `mlx-ipc --native bench` make
+COUNT Echo round trips, `mlx-ipc --native chbench` the same over a direct
+channel. On the machine this was written on (a virtual one of four
+processors), one round trip:
+
+| message | native to native | D-Bus to D-Bus | native to D-Bus | direct channel |
+| --- | --- | --- | --- | --- |
+| 5 bytes | 90 µs | 85 µs | 80 µs | 39 µs |
+| 4 KiB | 99 µs | 93 µs | 104 µs | 44 µs |
+| 32 KiB | 237 µs | 179 µs | 237 µs | 111 µs |
+
+A round trip through the bus is four hops, each a wake-up of another
+process, and the bus's own work is about 2% of it (`mlx-profile` on
+mlx-ipcd: the rest is sendmsg, recvmsg and epoll_wait). So a small
+message costs what the kernel costs, in either format, and the way to
+go faster is fewer hops: a direct channel takes two, half the time. A
+large message costs its copies: they are made a word at a time, and a
+string is checked for UTF-8 eight bytes at a time, which made 32 KiB
+messages four to six times faster than they were. The bus keeps the
+turn's work small: a native message to a native receiver is passed on as
+it came (not carried through D-Bus form and back), only the connections
+with something to send are looked at when a turn ends, and a connection's
+event names its slot, so nothing in the bus grows with the number of
+connections per message.
+
+(A blocking recvmsg in place of poll and recvmsg was tried for the
+clients and measured 7 µs slower per round trip here; the two calls
+stay.)
+
 ## mlx-ipc
 
 ```
@@ -284,10 +315,15 @@ mlx-ipc permissions        what apps asked for: app, permission, decision
 mlx-ipc permit APP PERMISSION allow|deny|ask|default
                            a rule for it in ipc.conf (default: none)
 mlx-ipc protocol NAME      what NAME's owner speaks: mlx or dbus
+mlx-ipc bench NAME COUNT [BYTES]
+                           COUNT Echo round trips to NAME, each of a string
+                           of BYTES (5): how long one took
 mlx-ipc --native COMMAND   on the native wire format: names, apps,
                            protocol NAME, serve NAME, call NAME TEXT,
                            connect NAME (prints the first native message's
-                           string), emit TEXT (the signal org.mlx.Echo.Said)
+                           string), emit TEXT (the signal org.mlx.Echo.Said),
+                           bench NAME COUNT [BYTES], chbench NAME COUNT [BYTES]
+                           (the round trips over a direct channel)
 ```
 
 ## Modules
@@ -306,8 +342,11 @@ mlx-ipc --native COMMAND   on the native wire format: names, apps,
 
 ## Next
 
-- The native wire format between two native connections passed through
-  as it is, without the D-Bus form in between; interfaces declared in Mlx
+- A native message to a native receiver is passed on as it came, but is
+  still carried to D-Bus form on arrival for the routing (the policy, the
+  monitors, the bus's own methods); carrying it only when a D-Bus
+  receiver or a monitor needs it would save two copies and a check per
+  large message. Interfaces declared in Mlx
   (typed messages as hyprwire's) with their signatures and the reading and
   writing of their arguments generated from the declaration.
 - polkit: the same agent asks for the system's actions (README of

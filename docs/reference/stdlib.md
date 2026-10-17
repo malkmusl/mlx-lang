@@ -296,7 +296,9 @@ runs thousands of mutated messages of either format through parsers,
 validators and conversions; `tools/check_ipc.sh` runs `mlx-ipc --native`
 against the bus next to dbus-send, gdbus and dbus-monitor, and
 `tools/check_ipc_hostile.py` sends what each validator refuses. The
-format is described in `projects/desktop/ipc/README.md`.
+format, and what a round trip costs (about 85 µs through the bus for a
+small message in either format, about 40 µs over a direct channel;
+`mlx-ipc bench`), is described in `projects/desktop/ipc/README.md`.
 
 `std.audio` (`std/src/audio.mlx`) is MLX Audio's protocol and client:
 `connect` finds the sound server on the session bus and gets a direct
