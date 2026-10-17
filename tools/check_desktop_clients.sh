@@ -761,6 +761,64 @@ SCRIPT
     echo "ok   a click on an app of another workspace's group brings that workspace"
 }
 
+# Previews on hover (the dock's hover.mlx): two terminals, the pointer
+# resting on the dock's terminal brings their previews over its icon; on
+# the apps button they go, they stay while the pointer goes up onto them
+# and go when it leaves both; a click on the icon brings the next window
+# forward and none come back while the pointer stays; Escape closes them.
+# The dock: the apps button, the terminal, Downloads and the trash, the
+# terminal resting at x 474 on a 1024-wide output.
+dock_hover() {
+    mkdir -p "$work/stacks/home/Downloads" "$work/stacks/config/mlx" "$work/stacks/data"
+    printf 'terminal\n' > "$work/stacks/config/mlx/dock"
+    printf '~/Downloads\n' > "$work/stacks/config/mlx/dock-folders"
+    cat > "$work/hover-clients.sh" <<SCRIPT
+#!/bin/sh
+"$work/mlx-terminal" &
+sleep 1
+exec "$work/mlx-terminal"
+SCRIPT
+    cat > "$work/dock-hover.script" <<SCRIPT
+wait 4500
+pointer 474 735
+wait 300
+pointer 475 735
+wait 1000
+pointer 416 735
+wait 300
+pointer 474 735
+wait 1000
+pointer 474 690
+wait 100
+pointer 474 600
+wait 300
+pointer 100 100
+wait 300
+pointer 474 735
+wait 1000
+press 272
+release 272
+wait 1500
+pointer 416 735
+wait 100
+pointer 474 735
+wait 1000
+down 1
+up 1
+wait 500
+close
+SCRIPT
+    stack_run dock-hover "/bin/sh $work/hover-clients.sh"
+    local log="$work/dock-hover.log" seen
+    # The windows' first focus aside, focus comes from the click alone. The
+    # panel is centred on the icon (which grows under the pointer) and
+    # clears it.
+    seen=$(grep "^previews\|^focus: " "$log" | sed 's/^previews: 2 windows, panel 516x206 at 21[0-9],458$/shown/; s/^previews closed$/closed/; s/^focus: .*/focus/' | tr '\n' ',' | sed 's/^\(focus,\)*//')
+    [[ "$seen" == "shown,closed,shown,closed,shown,closed,focus,shown,closed," ]] || fail "dock hover: the previews did not come and go with the pointer, or the click brought no window forward ($seen)" "$log"
+    echo "ok   resting on a dock icon shows its windows' previews over it; they follow the pointer and go when it leaves"
+    echo "ok   a click on the icon under them brings the next window forward; Escape closes them"
+}
+
 # The terminal's clipboard and drops (std.ui.terminal_input), with cat -v
 # behind bracketed paste writing what it gets to a file: a line typed and
 # selected with a triple click is copied (Ctrl+Shift+C) and pasted back
@@ -1824,6 +1882,7 @@ stacks
 clipboard
 smart_dock
 dock_workspaces
+dock_hover
 terminal_clipboard
 terminal_primary
 extras

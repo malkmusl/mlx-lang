@@ -207,6 +207,20 @@ click on one brings its window forward (a minimized one comes back), a
 click anywhere else, Escape or a second click on the icon closes them.
 The thumbnails follow their windows as they draw.
 
+Resting the pointer on the icon of an app that runs (600 ms) brings the
+same panel up over that icon, one window or several (the dock's
+`hover.mlx`; message `h`: the handles' object ids and the icon's middle
+on the dock). The panel sits 20 pixels higher than the clicked one so the
+grown icon stays clear. While it shows, the pointer on another icon swaps
+in that app's windows at once and an icon without windows takes it away.
+It stays while the pointer is on it, on the dock's bar or in between, and
+closes when the pointer leaves all three; then the compositor tells the
+dock (message `v`), which waits on another icon before asking again. A
+click on the icon brings the app's next window forward and closes the
+panel (the compositor leaves that click to the dock), a right click opens
+the menu in its place. `dock_hover` in `tools/check_desktop_clients.sh`
+plays this through.
+
 A right click on a dock icon opens its menu (an xdg_popup on the dock's
 layer surface): the app's own actions from its desktop entry (Firefox's
 "New Window" and "New Private Window"; an app without any gets "New
