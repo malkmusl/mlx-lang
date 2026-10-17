@@ -880,7 +880,8 @@ echo "ok   three-finger swipes drag the strip and settle, pull workspaces in up 
 # its sidebar 28 pixels apart from y 44: General, Network, Display, Sound,
 # Apps, Window management, Top bar, Appearance, Language; on the Window management page the
 # hotkey rows 34 pixels apart from y 436, on the General page the
-# terminal's at y 186). Maximize gets Super+Shift+M; minimize gets
+# terminal's at y 375, under the dock's three choices and its workspace
+# switch). Maximize gets Super+Shift+M; minimize gets
 # Super+Up (the maximize hotkey: it must reach the window); the terminal
 # hotkey is cleared; then Super+Up minimizes.
 "$compiler" --quiet projects/desktop/settings/main.mlx -o "$work/mlx-settings"
@@ -915,7 +916,7 @@ pointer 124 82
 press 272
 release 272
 wait 300
-pointer 524 225
+pointer 524 375
 press 272
 release 272
 wait 300
