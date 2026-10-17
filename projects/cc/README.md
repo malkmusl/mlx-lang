@@ -382,8 +382,10 @@ names the expanded parameter pack (`-> decltype(f(as...))`)
 (`tests/cpp/members.cpp`). Pointers to members (`int P::*`, `int
 (P::*)(int) const`, `&P::x`, `&P::f`, `obj.*pm`, `p->*pm`, calls
 through them, `R T::*` deduced in templates; a data member's pointer
-is its offset plus one, a member function's its address, so a virtual
-one is called as the class's own; `tests/cpp/memberptrs.cpp`). The
+is its offset plus one, a member function's its address (functions
+start at 16), a virtual one's its vtable entry's offset plus one, odd,
+called through the object's vtable as Itanium has it;
+`tests/cpp/memberptrs.cpp`, `tests/cpp/wtfforms48.cpp`). The
 detection idiom (`struct has_size<T, void_t<decltype(declval<T>()
 .size())>>`): a partial specialization's arguments that deduction
 passes over are read again with the parameters deduced and must name
