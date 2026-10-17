@@ -39,7 +39,9 @@
 #   - with dock-autohide = smart, keeps the dock while a small window is
 #     elsewhere, hides it while the window is maximized over it, and
 #     brings it back once the window is restored; a file dragged to the
-#     bottom edge brings the hidden dock up and drops on its trash;
+#     bottom edge brings the hidden dock up and drops on its trash; an X
+#     window (xev) whose frame ends on the row above the dock's bar
+#     leaves it, one a row taller hides it;
 #   - runs the top bar (mlx-topbar) with a terminal: the bar (with its
 #     workspace controls in the middle) is along the
 #     top and reserves it (the terminal moves below it, maximized it stays
@@ -668,6 +670,20 @@ wait 1500
 close
 SCRIPT
     stack_run smart-drop "$work/drag-source file://$work/stacks/home/Other/edge.txt"
+    # The edge exactly: placed at (24, 24) under a 20-pixel title bar with
+    # 2-pixel frames, a window 666 high ends on row 695, the bar starts
+    # on row 696.
+    if command -v xev > /dev/null && command -v Xwayland > /dev/null; then
+        printf 'wait 5000\nclose\n' > "$work/smart-edge-666.script"
+        printf 'wait 5000\nclose\n' > "$work/smart-edge-667.script"
+        stack_run smart-edge-666 "xev -geometry 420x666"
+        stack_run smart-edge-667 "xev -geometry 420x667"
+        ! grep -q "^dock: hidden" "$work/smart-edge-666.log" || fail "smart dock: a window ending just above the dock's bar hid it" "$work/smart-edge-666.log"
+        grep -q "^dock: hidden" "$work/smart-edge-667.log" || fail "smart dock: a window reaching a row into the dock's bar did not hide it" "$work/smart-edge-667.log"
+        echo "ok   a window ending above the dock's bar leaves it, one a row into it hides it"
+    else
+        echo "skip smart dock edge: xev or Xwayland is not installed"
+    fi
     rm -f -- "$work/stacks/config/mlx/compositor.conf"
     [[ "$(grep -o "^dock: hidden\|^drag: started\|^dock: shown\|^mlx-dock: moved to the trash" "$work/smart-drop.log" | tr '\n' ',')" == "dock: hidden,drag: started,dock: shown,mlx-dock: moved to the trash," ]] || fail "smart dock: a drag to the bottom edge did not bring the hidden dock up to drop on ($(grep "^dock:\|^drag:\|^mlx-dock: moved" "$work/smart-drop.log" | tr '\n' ' '))" "$work/smart-drop.log"
     local log="$work/smart-dock.log"
