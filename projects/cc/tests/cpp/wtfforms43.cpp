@@ -1,4 +1,4 @@
-// Enum bit-fields read back zero-extended when no enumerator is negative (as GCC has it)
+// Enum bit-fields: zero-extended when the enum has no fixed type and no negative enumerator, as GCC reads them; sign-extended for enum class and enum E : int
 #include <stdio.h>
 
 namespace p_ebf43 {
@@ -15,7 +15,21 @@ int run() {
 }
 }
 
+namespace p_ebf2 {
+enum class C { A, B };
+enum F : int { FA, FB };
+enum class U : unsigned { UA, UB };
+struct S { C c : 1; F f : 1; U u : 1; };
+int run() {
+    S s{};
+    s.c = C::B; s.f = FB; s.u = U::UB;
+    printf("%d %d %d %d\n", (int)s.c, (int)s.f, (int)s.u, s.c == C::B);
+    return 0;
+}
+}
+
 int main() {
     p_ebf43::run();
+    p_ebf2::run();
     return 0;
 }
