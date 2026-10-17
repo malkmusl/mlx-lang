@@ -55,7 +55,8 @@
 #     the surface anew without a new buffer, says preferred scale 120
 #     (fractional-scale), and ends a client whose crop leaves the buffer,
 #     is a fraction of a pixel with no size, or that asks for a second
-#     viewport (tools/wayland-viewport-test);
+#     viewport (tools/wayland-viewport-test); draws the text cursor a
+#     client names (cursor-shape) alike on the CPU and the GPU;
 #   - with dock-workspaces = on, groups the apps that run by workspace
 #     after the pinned ones (a window moved to workspace 2, one on 1, the
 #     pinned terminal's moved to 3 makes no group) and a click on the app
@@ -1247,6 +1248,38 @@ PY
         grep -q "^viewport-test: error $expected$" "$work/viewport-$mode.log" || fail "viewports: the $mode case did not end the client with error $expected" "$work/viewport-$mode.log"
     done
     echo "ok   a crop outside the buffer, one of a fraction of a pixel with no size and a second viewport end the client"
+    # cursor-shape: the window names the text cursor when the pointer
+    # comes in (at 100, 60, over the cyan square); outside it the arrow.
+    for renderer in cpu vulkan; do
+        printf 'wait 2000\npointer 100 60\nwait 600\nshot %s\npointer 600 400\nwait 600\nshot %s\nclose\n' "$work/cursor-in-$renderer.ppm" "$work/cursor-out-$renderer.ppm" > "$work/viewport-cursor-$renderer.script"
+        viewport_run "viewport-cursor-$renderer" "$renderer" cursor
+        grep -q "^cursor shape: 9$" "$work/viewport-cursor-$renderer.log" || fail "cursor-shape ($renderer): the text cursor was not taken" "$work/viewport-cursor-$renderer.log"
+    done
+    python3 - "$work" <<'PY' || fail "cursor-shape: the cursors do not look right" "$work/viewport-cursor-cpu.log"
+import sys
+def load(path):
+    data = open(path, 'rb').read()
+    header, size, depth, pixels = data.split(b'\n', 3)
+    return tuple(map(int, size.split())), pixels
+work = sys.argv[1]
+for where in ("in", "out"):
+    (width, height), cpu = load(f"{work}/cursor-{where}-cpu.ppm")
+    _, gpu = load(f"{work}/cursor-{where}-vulkan.ppm")
+    assert cpu == gpu, f"{where}: the CPU and the GPU differ"
+    def at(x, y): return tuple(cpu[(y * width + x) * 3:(y * width + x) * 3 + 3])
+    if where == "in":
+        # The I-beam's stem at the pointer, a serif above, the square
+        # beside it.
+        assert at(100, 60) == (255, 255, 255), at(100, 60)
+        assert at(98, 54) == (255, 255, 255), at(98, 54)
+        assert at(97, 60) == (0, 255, 255), at(97, 60)
+    else:
+        assert at(601, 405) == (255, 255, 255), at(601, 405)
+PY
+    printf 'wait 2000\npointer 100 60\nwait 600\nclose\n' > "$work/viewport-badshape.script"
+    viewport_run viewport-badshape cpu badshape
+    grep -q "^viewport-test: error 1$" "$work/viewport-badshape.log" || fail "cursor-shape: a shape there is not did not end the client" "$work/viewport-badshape.log"
+    echo "ok   a client names the text cursor (cursor-shape), drawn alike on the CPU and the GPU; a shape there is not ends it"
 }
 
 # xdg-output, idle-inhibit and xdg-activation (extras.mlx): three windows

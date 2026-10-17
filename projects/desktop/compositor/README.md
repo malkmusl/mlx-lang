@@ -1103,8 +1103,14 @@ pixels when it commits, on the GPU by the shrink shader into a copy of
 the surface's), so a scaled video or a game drawn at a lower resolution
 looks the same on either. A crop reaching outside the buffer, one of a
 fraction of a pixel without a size and a second viewport for a surface
-end the client, as the protocol says. A greeter compositor offers none
-of these.
+end the client, as the protocol says. `wp_cursor_shape_manager_v1`
+version 2 ([`pointer.mlx`](pointer.mlx)) lets a client name its cursor
+instead of drawing one: while it has the pointer the compositor draws the
+closest of its own ([`cursors.mlx`](cursors.mlx): the arrow, an I-beam,
+a pointing hand, the resize and move arrows, a crosshair, a no-entry sign
+and an hourglass, the same pixels on either renderer), for the latest
+enter as with `wl_pointer.set_cursor` (`cursor shape: N`); a shape there
+is not ends the client. A greeter compositor offers none of these.
 Composition is done in software, or with Vulkan (`--renderer vulkan`).
 
 ### Locking and logging out
@@ -1660,6 +1666,7 @@ finished`.
 - `vulkan.mlx`: the Vulkan renderer.
 - `scene.mlx`: stacking (layers and windows), hit-testing, title bars,
   damage tracking, blur and software composition.
+- `cursors.mlx`: the cursors the compositor draws itself.
 - `state.mlx`: shared records and list helpers.
 - `settings.mlx`: the settings file; `display.mlx`: the output told for
   mlx-settings, and night light.
