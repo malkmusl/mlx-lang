@@ -56,7 +56,8 @@
 #     (fractional-scale), and ends a client whose crop leaves the buffer,
 #     is a fraction of a pixel with no size, or that asks for a second
 #     viewport (tools/wayland-viewport-test); draws the text cursor a
-#     client names (cursor-shape) alike on the CPU and the GPU;
+#     client names (cursor-shape) alike on the CPU and the GPU; says when
+#     content was presented or discarded (presentation-time);
 #   - lets wl-copy and wl-paste set and read both selections without a
 #     window (data-control), an X program on either side;
 #   - with dock-workspaces = on, groups the apps that run by workspace
@@ -1282,6 +1283,15 @@ PY
     solo_run viewport-badshape cpu "$work/viewport-test badshape"
     grep -q "^viewport-test: error 1$" "$work/viewport-badshape.log" || fail "cursor-shape: a shape there is not did not end the client" "$work/viewport-badshape.log"
     echo "ok   a client names the text cursor (cursor-shape), drawn alike on the CPU and the GPU; a shape there is not ends it"
+    # presentation-time: two commits before a frame, the first's content
+    # never shown.
+    printf 'wait 2500\nclose\n' > "$work/viewport-presentation.script"
+    solo_run viewport-presentation cpu "$work/viewport-test presentation"
+    local log="$work/viewport-presentation.log"
+    grep -q "^viewport-test: clock 1$" "$log" || fail "presentation: the clock is not CLOCK_MONOTONIC" "$log"
+    grep -q "^viewport-test: feedback 1 discarded$" "$log" || fail "presentation: content replaced before a frame was not discarded" "$log"
+    grep -q "^viewport-test: feedback 2 presented (refresh 16666666 ns)$" "$log" || fail "presentation: the shown content was not presented with the refresh period" "$log"
+    echo "ok   presentation feedback: content replaced unseen is discarded, the shown content presented on the monotonic clock"
 }
 
 # Clipboard tools (data_control.mlx): wl-copy and wl-paste, which speak

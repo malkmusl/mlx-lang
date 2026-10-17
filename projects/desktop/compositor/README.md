@@ -1110,7 +1110,13 @@ closest of its own ([`cursors.mlx`](cursors.mlx): the arrow, an I-beam,
 a pointing hand, the resize and move arrows, a crosshair, a no-entry sign
 and an hourglass, the same pixels on either renderer), for the latest
 enter as with `wl_pointer.set_cursor` (`cursor shape: N`); a shape there
-is not ends the client. A greeter compositor offers none of these.
+is not ends the client. `wp_presentation` version 1
+([`presentation.mlx`](presentation.mlx)) tells a client when a commit's
+content reached the screen: presented with the time on the monotonic
+clock, the output's refresh period and the frame's number (vsync when
+the frame came from a DRM page flip), or discarded when another commit
+replaced it before a frame showed it or the surface showed nothing. A
+greeter compositor offers none of these.
 Composition is done in software, or with Vulkan (`--renderer vulkan`).
 
 ### Locking and logging out
@@ -1665,6 +1671,8 @@ finished`.
   resizing, input delivery, mapping), `buffers.mlx` (what a commit does
   with the buffer: copied or held, cropped and scaled by a viewport),
   `viewport.mlx` (viewporter, fractional-scale, single-pixel-buffer),
+  `presentation.mlx` (presentation feedback), `data_control.mlx`
+  (clipboard tools),
   `launching.mlx` (launching programs) and `lock.mlx` (the session lock,
   logging out).
 - `dmabuf.mlx`: linux-dmabuf; each dma-buf becomes a one-buffer pool.
