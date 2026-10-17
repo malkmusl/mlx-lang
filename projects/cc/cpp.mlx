@@ -1930,6 +1930,41 @@ fn markMoved(value: usize) -> bool {
     return false
 }
 
+// Whether a class passed by value goes by its address (the Itanium
+// ABI's invisible reference): one that cannot move by its bytes (a copy
+// or move constructor, a destructor or virtual functions of its own).
+pub fn passesIndirectly(ty: usize) -> bool {
+    if types.kind(ty) != types.STRUCT && types.kind(ty) != types.UNION { return false }
+    if !isClassType(ty) { return false }
+    const ignored = completeIfNeeded(ty)
+    return !isTriviallyCopyable(ty)
+}
+
+// The argument (already consumed) for a parameter of class `ty` passed
+// by its address: the address of the object made for the call, which
+// the callee destroys (a temporary, a call's result, else a copy).
+pub fn indirectArgument(value: usize, ty: usize, token: usize) -> usize {
+    typing.addType(value)
+    const pointer = types.pointerTo(ty)
+    const k = ast.kindOf(value)
+    var n: usize = 0
+    if k == ast.FUNCALL && ast.node(value).*.returnBuffer != 0 {
+        const buffer = ast.node(value).*.returnBuffer
+        ast.obj(buffer).*.noDestroy = true
+        n = ast.binary(ast.COMMA, value, addressOf(variable(buffer, token), token), token)
+    } else if k == ast.COMMA && ast.kindOf(ast.node(value).*.rhs) == ast.VAR && ast.obj(ast.node(ast.node(value).*.rhs).*.variable).*.name == 0 {
+        n = ast.binary(ast.COMMA, ast.node(value).*.lhs, addressOf(ast.node(value).*.rhs, token), token)
+    } else if k == ast.VAR && ast.obj(ast.node(value).*.variable).*.name == 0 && ast.obj(ast.node(value).*.variable).*.isLocal {
+        n = addressOf(value, token)
+    } else {
+        const tmp = newTemp(ty, token)
+        const init = construct(addressOf(variable(tmp, token), token), ty, argumentList(value, 0), 1, token)
+        n = ast.binary(ast.COMMA, init, addressOf(variable(tmp, token), token), token)
+    }
+    ast.node(n).*.ty = pointer
+    return n
+}
+
 pub fn consumed(value: usize) -> usize {
     typing.addType(value)
     const ty = ast.typeOf(value)
@@ -2136,7 +2171,7 @@ pub fn jumpStatement(n: usize) -> usize {
 // cleanup stack) is moved out, its destruction left out of the return;
 // anything else is consumed (copied when an object, moved when a
 // temporary).
-var movedOut: usize = 0
+pub var movedOut: usize = 0
 
 pub fn returnValue(value: usize, ty: usize) -> usize {
     // `return arr;` of a local of another class (`Ref<Array>` for a
@@ -2155,8 +2190,16 @@ pub fn returnValue(value: usize, ty: usize) -> usize {
         while index > 0 {
             index -= 1
             if state.cleanupAt(index) == o {
-                movedOut = o
-                return converted
+                // A local with a destructor: its bytes taken over (not
+                // destroyed) when they may move; else moved out by its
+                // move constructor (an object pointing into itself, a
+                // Vector's inline buffer) and destroyed as any local.
+                if isTriviallyCopyable(ast.obj(o).*.ty) || !ast.obj(o).*.isLocal || !types.inMemory(ty) {
+                    movedOut = o
+                    return converted
+                }
+                if !types.isReference(ast.obj(o).*.ty) && !types.isConst(ast.obj(o).*.ty) { ast.node(converted).*.xvalue = true }
+                break
             }
         }
     }
@@ -2185,6 +2228,89 @@ fn elideIntoResult(value: usize) -> void {
         const tmp = ast.node(ast.node(value).*.rhs).*.variable
         // (An unnamed temporary of the function's: the object made.)
         if ast.obj(tmp).*.name == 0 && ast.obj(tmp).*.isLocal && !ast.obj(tmp).*.isStatic { ast.obj(tmp).*.storedAt = hidden }
+    }
+}
+
+// Named return value optimization: `return local;` of a class that
+// cannot move by its bytes, the result in the caller's buffer. Each such
+// return is made both ways, chosen when the function ends (an IF on a
+// constant set then): the local made right in the buffer when every
+// return of the function returns it, else moved out of it.
+// Cells of (function, local, constant, next); and the functions some
+// other return of rules out: cells of (function, next).
+var nrvoChoices: usize = 0
+var nrvoBlocked: usize = 0
+
+// The local `return value;` may make in place: 0 for none.
+pub fn nrvoCandidate(value: usize, rt: usize) -> usize {
+    const f = state.currentFunction()
+    if f == 0 || ast.kindOf(value) != ast.VAR || !isClassType(rt) || !types.inMemory(rt) || isTriviallyCopyable(rt) { return 0 }
+    const o = ast.node(value).*.variable
+    if !ast.obj(o).*.isLocal || ast.obj(o).*.isStatic || ast.obj(o).*.storedAt != 0 || types.isReference(ast.obj(o).*.ty) { return 0 }
+    if !sameClass(types.unqualified(ast.obj(o).*.ty), types.unqualified(rt)) || types.size(ast.obj(o).*.ty) != types.size(rt) { return 0 }
+    if ast.obj(f).*.params == 0 { return 0 }
+    const hidden = base.getWord(ast.obj(f).*.params)
+    if ast.obj(hidden).*.name != 0 || types.kind(ast.obj(hidden).*.ty) != types.PTR { return 0 }
+    // (Not a parameter.)
+    var cell = ast.obj(f).*.params
+    while cell != 0 {
+        if base.getWord(cell) == o { return 0 }
+        cell = base.getWord(cell + 8)
+    }
+    return o
+}
+
+// Another kind of return in the function being read: no NRVO there.
+pub fn blockNrvo() -> void {
+    const f = state.currentFunction()
+    if f == 0 { return }
+    const cell = base.alloc(16)
+    base.putWord(cell, f)
+    base.putWord(cell + 8, nrvoBlocked)
+    nrvoBlocked = cell
+}
+
+// `return local;` made both ways: in place (`inPlace`) or moved out
+// (`moved`); the statement.
+pub fn nrvoChoice(local: usize, inPlace: usize, moved: usize, token: usize) -> usize {
+    const flag = number(0, types.intOf(), token)
+    const n = ast.make(ast.IF, token)
+    ast.node(n).*.cond = flag
+    ast.node(n).*.then = inPlace
+    ast.node(n).*.els = moved
+    const cell = base.alloc(32)
+    base.putWord(cell, state.currentFunction())
+    base.putWord(cell + 8, local)
+    base.putWord(cell + 16, flag)
+    base.putWord(cell + 24, nrvoChoices)
+    nrvoChoices = cell
+    return n
+}
+
+// The function `f` read: its returns of a local made in place when they
+// all return the same one.
+pub fn resolveNrvo(f: usize) -> void {
+    var blocked = false
+    var cell = nrvoBlocked
+    while cell != 0 {
+        if base.getWord(cell) == f { blocked = true }
+        cell = base.getWord(cell + 8)
+    }
+    var local: usize = 0
+    cell = nrvoChoices
+    while cell != 0 {
+        if base.getWord(cell) == f {
+            if local == 0 { local = base.getWord(cell + 8) }
+            if base.getWord(cell + 8) != local { blocked = true }
+        }
+        cell = base.getWord(cell + 24)
+    }
+    if local == 0 { return }
+    if !blocked { ast.obj(local).*.storedAt = base.getWord(ast.obj(f).*.params) }
+    cell = nrvoChoices
+    while cell != 0 {
+        if base.getWord(cell) == f { ast.node(base.getWord(cell + 16)).*.value = if blocked { 0 } else { 1 } }
+        cell = base.getWord(cell + 24)
     }
 }
 

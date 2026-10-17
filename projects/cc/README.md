@@ -231,7 +231,12 @@ type made the first time their declaration runs (`static Point p(7)`),
 once whatever the threads (a guard libmlxcpp's `__mlxcc_guard_acquire`
 takes), and one object for the program when the function is inline or
 a template's (weak `_ZZ<function>E<name>` symbols, the code reaching
-them and inline variables by name; `tests/cpp/shared`),
+them and inline variables by name; `tests/cpp/shared`), a class that
+cannot move by its bytes (a copy or move constructor, a destructor of
+its own) passed by value by its address, as the Itanium ABI passes it,
+and a local returned made right in the caller's buffer when every
+return returns it (else moved out by its move constructor;
+`tests/cpp/wtfforms64.cpp`),
 `using T = type;`, explicit template arguments for some of a function
 template's parameters with the rest deduced from the call
 (`make_shared<Resource>(name)`), deduction through a class template's
