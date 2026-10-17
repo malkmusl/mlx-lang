@@ -750,3 +750,18 @@ gcc's build printed (`tests/sqlite.expected`), on glibc and on mlxlibc
 alone with the `libm.so.6` built next to it. The tarballs are
 downloaded, or taken from `--sources DIR`, and checked against their
 SHA-256 sums.
+
+## C headers made of Mlx: mlx-cheaders
+
+A library written in Mlx for C and C++ programs (projects/unicode) declares
+its interface once, in Mlx modules, and `mlx-cheaders OUT MODULE.mlx...`
+(projects/cc/cheaders.mlx) writes the headers C includes. It reads the
+modules with the Mlx compiler's own parser. Enums, structures (all
+declared first, so that one may point to another), function types (a
+value of one is a pointer in C), aliases, constants and `extern("c")`
+functions become their C forms. A `pub fn` named in capitals becomes a
+macro: of an expression when its body is one `return`, else of
+statements, with its `*T` parameters the lvalues it writes and its
+locals named apart. Other `pub fn`s become static inline functions. The
+Mlx of the macros is real: it compiles and runs as Mlx, and
+projects/unicode/tests/api.mlx tests it so.

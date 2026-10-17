@@ -4,9 +4,16 @@ Unicode for the C and C++ programs built here, in Mlx, with the C API of
 ICU. WebKit (projects/webkit) and the others include `<unicode/...>` as
 they would ICU's headers. They link `libmlxunicode.so` in place of ICU.
 No ICU code or data is used: the library is this repository's own, and
-its tables come from the Unicode Character Database alone.
+its tables come from the Unicode data alone (the Character Database, the
+Collation Algorithm's table, the IDNA mapping table).
 
-    ./mlx build unicode        unicode-generate, the tables, the library
+The interface is written once, in Mlx: the modules of `api/` declare the
+types, constants and functions C sees, and the macros (`U8_NEXT`,
+`U16_APPEND`...) are Mlx functions there. `mlx-cheaders` (projects/cc)
+makes the C headers of them into `mlx-out/include/mlx-unicode/unicode/`;
+there are no headers written by hand.
+
+    ./mlx build unicode        unicode-generate, the tables, the library, the headers
     tools/check_unicode.sh     builds it and runs the conformance tests
 
 ## Parts
@@ -14,15 +21,18 @@ its tables come from the Unicode Character Database alone.
 | File | What |
 |---|---|
 | `ucd/` | The Unicode Character Database 16.0.0 (the files used, and the conformance tests) |
-| `generate.mlx` | `unicode-generate UCD OUT`: writes `tables.mlx` and `include/unicode/ugenerated.h` |
+| `generate.mlx` | `unicode-generate UCD OUT`: writes `tables.mlx` and `api/ugenerated.mlx` |
 | `tables.mlx` | Two tries (property records and case records) and sorted lists (decompositions, compositions, full case mappings and foldings, script extensions, blocks, numeric values) |
-| `include/unicode/` | The C headers: ICU's names and API level (74), our own text |
+| `api/` | The interface in Mlx, a module per header (ICU's names and API level, 74); `ugenerated.mlx` (scripts, blocks) is made by `generate.mlx` |
+| `uca/`, `idna/` | The Unicode Collation Algorithm's table (DUCET) and its tests; the IDNA mapping table and its tests |
 | `unicode.mlx` | The library's root (`--plugin --stack-arena`) |
 | `properties.mlx` | `uchar.h`, `uscript.h`: every binary and enumerated property, names of properties and values, classification, simple case mappings |
 | `casing.mlx` | Full case mapping (SpecialCasing.txt with its conditions: Final_Sigma, Turkish/Azerbaijani, Lithuanian) and case folding |
 | `strings.mlx` | `ustring.h`: lengths, copies, comparisons (code unit, code point, case-insensitive), UTF-8 and UTF-32 conversion |
 | `normalize.mlx` | `unorm2.h`: NFC, NFD, NFKC, NFKD, NFKC_Casefold |
 | `breaks.mlx` | `ubrk.h`, `utext.h`: grapheme clusters, words, sentences (UAX #29) and lines (UAX #14, with the `lb` and `lw` locale keywords) |
+| `collation.mlx` | `ucol.h`, `uiter.h`: the Unicode Collation Algorithm with DUCET (contractions, discontiguous ones too, implicit weights, the attributes: strength, alternate shifted, case first and case level, French, numeric) |
+| `enumeration.mlx` | `uenum.h` |
 
 ## Conformance
 

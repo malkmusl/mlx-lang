@@ -444,6 +444,22 @@ names_aggregates_in_their_bodies() {
     return $ok
 }
 
+# Whether $1 resolves types that name each other through pointers
+# (tests/342_mutually_recursive_types_runtime.mlx exits 42); older
+# compilers could not resolve the first while the second was worked out.
+resolves_recursive_types() {
+    local probe
+    probe=$(mktemp -d mlx-out/probe.XXXXXX)
+    local ok=1
+    if "$1" --quiet tests/342_mutually_recursive_types_runtime.mlx -o "$probe/probe" > /dev/null 2>&1; then
+        local status=0
+        "$probe/probe" > /dev/null 2>&1 || status=$?
+        [[ $status -eq 42 ]] && ok=0
+    fi
+    rm -rf -- "$probe"
+    return $ok
+}
+
 # Whether $1 rejects an integer written out that its type cannot hold
 # (tests/335_type_mismatches.mlx); older compilers kept its low bits.
 checks_literal_ranges() {
@@ -629,6 +645,7 @@ probes=(
     "keeps_locals_in_registers|locals kept in callee-saved registers"
     "mixes_platform_integers|usize and u64 taking each other"
     "names_aggregates_in_their_bodies|a struct named inside its own body"
+    "resolves_recursive_types|types naming each other through pointers"
     "holds_large_programs|an arena with room for the largest programs"
     "writes_depfiles|--depfile"
     "runs_build|the build command (mlx build)"
