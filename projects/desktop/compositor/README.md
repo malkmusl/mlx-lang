@@ -1619,6 +1619,15 @@ pastes, goes the same way beside it; only the client with the keyboard
 can set it (`--verbose`: `primary selection: set`). A greeter compositor
 does not offer it.
 
+Clipboard tools without a window (wl-copy and wl-paste, clipboard
+managers) read and set both through `ext_data_control_manager_v1`
+version 1 and its forerunner `zwlr_data_control_manager_v1` version 2
+([`data_control.mlx`](data_control.mlx); wl-clipboard 2.2 speaks the
+latter): a tool's device hears every change of either selection, with an
+offer it reads like a client's, and its source set as a selection is read
+by windows and X programs alike (`data control: selection set`). A
+source is set once. A greeter compositor does not offer it.
+
 Drag and drop goes the same way. A client starts a drag while a button is
 held; until the buttons are up the pointer is the drag's (clients get no
 pointer events), the drag's icon surface follows the pointer, and the

@@ -1446,9 +1446,12 @@ else
     echo "skip GTK 3 is not installed"
 fi
 
-# Scenario 6: copy and paste between two clients through the compositor's
-# wl_data_device_manager, with wl-clipboard (if available): wl-copy sets
-# the selection, wl-paste (another client) reads it through a pipe.
+# Scenario 6: copy and paste between two clients through the compositor,
+# with wl-clipboard (if available): wl-copy sets the selection, wl-paste
+# (another client) reads it through a pipe. wl-clipboard takes the
+# data-control protocol where it is offered (data_control.mlx); the data
+# device between windows is check_desktop_clients.sh's (mlx-terminal,
+# mlx-files).
 if command -v wl-copy > /dev/null && command -v wl-paste > /dev/null; then
     cat > "$work/clipboard.sh" <<SCRIPT
 #!/bin/sh

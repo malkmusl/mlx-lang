@@ -8,12 +8,14 @@
 //
 // X programs share it as PRIMARY (xwm_selection.mlx): an X program's
 // selection comes as an X source (no client of ours: the window manager
-// converts it), and every change is told to the X side.
+// converts it), and every change is told to the X side. Clipboard tools
+// see and set it through ext-data-control (data_control.mlx).
 
 const std = @import("std")
 const wl = @import("std.wayland")
 const state = @import("./state.mlx")
 const xwm_selection = @import("./xwm_selection.mlx")
+const data_control = @import("./data_control.mlx")
 
 const SYS_fcntl: usize = 72
 const F_DUPFD_CLOEXEC: usize = 1030
@@ -30,6 +32,8 @@ pub const Source = struct {
     mimeBytes: usize
     // An X program's PRIMARY (resource: none; xwm_selection reads it).
     x: bool
+    // A clipboard tool's (resource: its ext_data_control_source_v1).
+    control: bool
 }
 
 pub const Device = struct {
@@ -120,17 +124,38 @@ pub fn offerToFocus(compositor: *Compositor) -> void {
     }
 }
 
+// A source's client hears it is no longer the selection.
+fn cancelSource(source: *Source) -> void {
+    if source.*.x { return }
+    if source.*.control {
+        wl.ext_data_control_source_v1.Resource.fromObject(source.*.resource).sendCancelled()
+    } else {
+        wl.zwp_primary_selection_source_v1.Resource.fromObject(source.*.resource).sendCancelled()
+    }
+}
+
+// Asks a source's client to write its data as `mime` into `fd` (it gets
+// a copy).
+fn askSource(source: *Source, mime: []const u8, fd: wl.server.Handle) -> void {
+    if source.*.control {
+        wl.ext_data_control_source_v1.Resource.fromObject(source.*.resource).sendSend(mime, fd)
+    } else {
+        wl.zwp_primary_selection_source_v1.Resource.fromObject(source.*.resource).sendSend(mime, fd)
+    }
+}
+
 fn setSelection(compositor: *Compositor, address: usize) -> void {
     const old = compositor.*.primarySelection
     if old == address { return }
     // The replaced source learns that it is no longer the selection.
-    if old != 0 && !sourceAt(old).*.x { wl.zwp_primary_selection_source_v1.Resource.fromObject(sourceAt(old).*.resource).sendCancelled() }
+    if old != 0 { cancelSource(sourceAt(old)) }
     compositor.*.primarySelection = address
     if compositor.*.verbose {
         if address == 0 { state.say("primary selection: cleared\n") } else { state.say("primary selection: set\n") }
     }
     offerToFocus(compositor)
     xwm_selection.primaryChanged(compositor)
+    data_control.primaryChanged(compositor)
 }
 
 // ---------------------------------------------------------------------------
@@ -140,19 +165,23 @@ fn onOffer(context: *anyopaque, request: wl.server.Request) -> void {
     const offer = offerAt(recordOf(context))
     if request.opcode != wl.zwp_primary_selection_offer_v1.REQUEST_RECEIVE { return }
     const receive = wl.zwp_primary_selection_offer_v1.decodeRequest(request).receive
-    // The source's client writes into the pipe (sendSend passes a copy);
-    // the reader sees end of file once the writer closes it. An X
-    // program's is converted into a copy of the pipe.
-    if offer.*.source != 0 {
-        const mime = receive.mime_type
-        if sourceAt(offer.*.source).*.x {
-            const copy = std.linux.syscall3(SYS_fcntl, @bitCast(usize, receive.fd.descriptor), F_DUPFD_CLOEXEC, 0)
-            if copy >= 0 { xwm_selection.receivePrimary(offer.*.compositor, mime.pointer[0..mime.length], copy) }
-        } else {
-            wl.zwp_primary_selection_source_v1.Resource.fromObject(sourceAt(offer.*.source).*.resource).sendSend(mime.pointer[0..mime.length], receive.fd)
-        }
-    }
+    const mime = receive.mime_type
+    receiveFrom(offer.*.compositor, offer.*.source, mime.pointer[0..mime.length], receive.fd)
     receive.fd.close()
+}
+
+// An offer of the source at `address` read as `mime` into `fd` (the
+// caller closes its own): the source's client writes into the pipe
+// (sendSend passes a copy) and the reader sees end of file once the
+// writer closes it. An X program's is converted into a copy of the pipe.
+fn receiveFrom(compositor: *Compositor, address: usize, mime: []const u8, fd: wl.server.Handle) -> void {
+    if address == 0 { return }
+    if sourceAt(address).*.x {
+        const copy = std.linux.syscall3(SYS_fcntl, @bitCast(usize, fd.descriptor), F_DUPFD_CLOEXEC, 0)
+        if copy >= 0 { xwm_selection.receivePrimary(compositor, mime, copy) }
+    } else {
+        askSource(sourceAt(address), mime, fd)
+    }
 }
 
 fn onOfferDestroyed(context: *anyopaque, object: wl.server.Object) -> void {
@@ -192,6 +221,7 @@ fn forgetSource(address: usize) -> void {
         compositor.*.primarySelection = 0
         offerToFocus(compositor)
         if !source.*.x { xwm_selection.primaryChanged(compositor) }
+        data_control.primaryChanged(compositor)
     }
     state.release(compositor, source.*.mimes, MIME_BYTES)
     unsafe { state.release(compositor, @ptrFromInt([*]u8, address), @sizeOf(Source)) }
@@ -205,6 +235,7 @@ fn newSource(compositor: *Compositor) -> usize {
     source.*.mimes = state.allocate(compositor, MIME_BYTES)
     source.*.mimeBytes = 0
     source.*.x = false
+    source.*.control = false
     compositor.*.primarySources = state.listAppend(compositor.*.primarySources, address)
     return address
 }
@@ -269,7 +300,57 @@ pub fn isX(address: usize) -> bool {
 // (a pipe's end; the caller closes its own).
 pub fn sendFromSource(compositor: *Compositor, address: usize, mime: []const u8, descriptor: isize) -> void {
     if address == 0 || sourceAt(address).*.x || !state.listContains(compositor.*.primarySources, address) { return }
-    wl.zwp_primary_selection_source_v1.Resource.fromObject(sourceAt(address).*.resource).sendSend(mime, wl.server.Handle.fromDescriptor(descriptor))
+    askSource(sourceAt(address), mime, wl.server.Handle.fromDescriptor(descriptor))
+}
+
+// ---------------------------------------------------------------------------
+// Clipboard tools (data_control.mlx)
+
+// A clipboard tool's source made the primary selection, with `types`
+// (data.typesOf's form); 0 without the primary selection.
+pub fn setControlSource(compositor: *Compositor, resource: wl.server.Object, types: []const u8) -> usize {
+    if !compositor.*.hasPrimarySelection { return 0 }
+    const address = newSource(compositor)
+    const source = sourceAt(address)
+    source.*.resource = resource
+    source.*.control = true
+    var at: usize = 0
+    while at < types.length {
+        const length = @intCast(usize, types[at])
+        addType(source, types[at + 1..at + 1 + length])
+        at += 1 + length
+    }
+    setSelection(compositor, address)
+    return address
+}
+
+// No primary selection, from a clipboard tool.
+pub fn clearFromControl(compositor: *Compositor) -> void {
+    if compositor.*.hasPrimarySelection { setSelection(compositor, 0) }
+}
+
+pub fn dropControlSource(address: usize) -> void {
+    if address != 0 { forgetSource(address) }
+}
+
+// An offer of the primary selection for a clipboard tool's `resource`.
+pub fn newControlOffer(compositor: *Compositor, resource: wl.server.Object) -> usize {
+    const address = @intFromPtr(state.allocate(compositor, @sizeOf(Offer)))
+    offerAt(address).*.compositor = compositor
+    offerAt(address).*.resource = resource
+    offerAt(address).*.source = compositor.*.primarySelection
+    compositor.*.primaryOffers = state.listAppend(compositor.*.primaryOffers, address)
+    return address
+}
+
+pub fn controlReceive(address: usize, mime: []const u8, fd: wl.server.Handle) -> void {
+    receiveFrom(offerAt(address).*.compositor, offerAt(address).*.source, mime, fd)
+}
+
+pub fn dropControlOffer(address: usize) -> void {
+    const compositor = offerAt(address).*.compositor
+    compositor.*.primaryOffers = state.listRemove(compositor.*.primaryOffers, address)
+    unsafe { state.release(compositor, @ptrFromInt([*]u8, address), @sizeOf(Offer)) }
 }
 
 // ---------------------------------------------------------------------------
