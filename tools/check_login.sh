@@ -159,6 +159,17 @@ echo "ok   Login requires login.session before checking a password"
 printf 'allow gdbus use login.session\nallow login1-client use login.device\n' > "$work/none.conf"
 sleep 0.3
 
+# The unprivileged greeter compositor uses its distinct session id before a
+# user session exists. It must receive devices through mlx-login's login1
+# bridge instead of depending on systemd/udev ACLs that mlx-init does not run.
+XDG_SESSION_ID=mlx-greeter XDG_SEAT=seat0 "$work/login1-client" > "$work/greeter-login1.log" 2>&1 || {
+    echo "FAIL the greeter compositor could not control the login seat" >&2
+    cat "$work/greeter-login1.log" "$work/login.log" >&2
+    exit 1
+}
+grep -q 'login1 client passed' "$work/greeter-login1.log" || { echo "FAIL greeter login1 client did not finish" >&2; cat "$work/greeter-login1.log" >&2; exit 1; }
+echo "ok   the greeter session receives devices through mlx-login login1"
+
 login_out=$(login_call mlx-missing test-password)
 grep -q "(false,)" <<< "$login_out" || { echo "FAIL Login did not refuse an unknown account:" >&2; echo "$login_out" >&2; exit 1; }
 echo "ok   Login refuses an unknown account"

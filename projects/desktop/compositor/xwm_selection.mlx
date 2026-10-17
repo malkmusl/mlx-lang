@@ -1,0 +1,787 @@
+// The clipboard between X and Wayland clients (part of the X window
+// manager, xwm.mlx): X's CLIPBOARD and the Wayland selection are kept
+// one.
+//
+// A Wayland client's selection: a window of the window manager's owns
+// CLIPBOARD, the selection's types interned as atoms (UTF8_STRING, TEXT
+// and STRING stand for text/plain). An X client converting it gets
+// TARGETS from those atoms; any other target is read from the Wayland
+// source through a pipe (the compositor's loop watches its end, see
+// transferWatches) and put on the requestor's property, then
+// SelectionNotify.
+//
+// An X client owning CLIPBOARD (XFixes tells): its TARGETS are asked for,
+// their names looked up, and an X source (data.mlx) with those types
+// becomes the Wayland selection. A Wayland client reading it gets the
+// conversion: ConvertSelection onto the window's property, which is read
+// in parts (deleted at the end) into the reader's pipe; an INCR transfer
+// goes on with each new value until an empty one.
+const std = @import("std")
+const x11 = @import("std.x11")
+const state = @import("./state.mlx")
+const data_module = @import("./data.mlx")
+
+const Compositor = state.Compositor
+
+const SYS_read: usize = 0
+const SYS_write: usize = 1
+const SYS_close: usize = 3
+const SYS_poll: usize = 7
+const SYS_rt_sigprocmask: usize = 14
+const SYS_fcntl: usize = 72
+const SYS_rt_sigtimedwait: usize = 128
+const SYS_pipe2: usize = 293
+const O_NONBLOCK: usize = 2048
+const O_CLOEXEC: usize = 524288
+const F_SETFL: usize = 4
+const F_DUPFD_CLOEXEC: usize = 1030
+const EAGAIN: isize = -11
+// SIGPIPE (13) in a signal set.
+const PIPE_SIGNAL: usize = 4096
+
+// The atoms the clipboard asks for.
+const A_CLIPBOARD: usize = 0
+const A_TARGETS: usize = 1
+const A_TIMESTAMP: usize = 2
+const A_INCR: usize = 3
+const A_TEXT: usize = 4
+const A_UTF8_STRING: usize = 5
+const A_PROPERTY: usize = 6
+const ATOMS: usize = 7
+
+fn atomText(index: usize) -> []const u8 {
+    if index == A_CLIPBOARD { return "CLIPBOARD" }
+    if index == A_TARGETS { return "TARGETS" }
+    if index == A_TIMESTAMP { return "TIMESTAMP" }
+    if index == A_INCR { return "INCR" }
+    if index == A_TEXT { return "TEXT" }
+    if index == A_UTF8_STRING { return "UTF8_STRING" }
+    return "_MLX_SELECTION"
+}
+
+// No reply awaited (sequence numbers are 16 bits).
+const NO_SEQUENCE: u32 = 65536
+// Types kept of a selection, and room for an X owner's type names.
+const TYPES: usize = 24
+const NAMES: usize = 2048
+// Wayland sources read for X requestors at a time, and X conversions
+// waiting for Wayland readers.
+const READS: usize = 4
+const WRITES: usize = 8
+// A property read in parts of this many 32-bit units.
+const PART_LONGS: u32 = 8000
+// The most a read from a Wayland source takes.
+const READ_LIMIT: usize = 67108864
+// A Wayland reader that lets a part of the data wait longer than this is
+// given up on (the compositor must not hang on it).
+const WRITE_WAIT: usize = 1000
+
+// A Wayland source read for an X requestor: the pipe's end (-1: a free
+// slot), where the data goes and what has come.
+const Read = struct {
+    descriptor: isize
+    requestor: u32
+    property: u32
+    target: u32
+    time: u32
+    data: [*]u8
+    length: usize
+    capacity: usize
+}
+
+// An X conversion for a Wayland reader: its pipe, the target, and the
+// state of the property read (an INCR transfer, the next part's offset).
+const Write = struct {
+    descriptor: isize
+    target: u32
+    incr: bool
+    offset: u32
+}
+
+pub const Clipboard = struct {
+    compositor: *Compositor
+    connection: *x11.Connection
+    // The window that owns CLIPBOARD and receives conversions.
+    window: u32
+    atoms: [7]u32
+    atomSequence: u32
+    atomsLeft: usize
+    xfixesSequence: u32
+    xfixes: u8
+    xfixesEvent: u8
+    ready: bool
+    // The Wayland selection X sees (a data.mlx source; 0: none), whether
+    // the window owns CLIPBOARD for it, and its types' atoms (in the
+    // source's order; 0 until interned).
+    served: usize
+    owned: bool
+    typeAtoms: [24]u32
+    typeSequences: [24]u32
+    typeCount: usize
+    // An X owner's selection: the TARGETS read (its reply's sequence),
+    // its atoms and their names (a length byte and the name each, at
+    // xNameAt), and the X source made of them (0: none).
+    targetsSequence: u32
+    xAtoms: [24]u32
+    xNameSequences: [24]u32
+    xNameAt: [24]usize
+    xCount: usize
+    xNamesLeft: usize
+    xNames: [2048]u8
+    xNamesLength: usize
+    xSource: usize
+    // Conversions for Wayland readers, in line (the first is under way;
+    // its property read awaits the reply partSequence).
+    writes: [8]Write
+    writeCount: usize
+    partSequence: u32
+    reads: [4]Read
+}
+
+fn clipboardOf(compositor: *Compositor) -> *Clipboard {
+    unsafe { return @ptrFromInt(*Clipboard, compositor.*.clipboard) }
+}
+
+fn closeDescriptor(descriptor: isize) -> void {
+    if descriptor >= 0 { _ = std.linux.syscall1(SYS_close, @bitCast(usize, descriptor)) }
+}
+
+// ---------------------------------------------------------------------------
+// Starting and stopping
+
+// Starts once the window manager is (its connection set up).
+pub fn start(compositor: *Compositor, connection: *x11.Connection) -> void {
+    if compositor.*.clipboard != 0 { return }
+    const memory = state.allocate(compositor, @sizeOf(Clipboard))
+    compositor.*.clipboard = @intFromPtr(memory)
+    const clipboard = clipboardOf(compositor)
+    clipboard.*.compositor = compositor
+    clipboard.*.connection = connection
+    clipboard.*.ready = false
+    clipboard.*.xfixes = 0
+    clipboard.*.served = 0
+    clipboard.*.owned = false
+    clipboard.*.typeCount = 0
+    clipboard.*.targetsSequence = NO_SEQUENCE
+    clipboard.*.xCount = 0
+    clipboard.*.xNamesLeft = 0
+    clipboard.*.xSource = 0
+    clipboard.*.writeCount = 0
+    clipboard.*.partSequence = NO_SEQUENCE
+    var index: usize = 0
+    while index < READS {
+        clipboard.*.reads[index].descriptor = -1
+        index += 1
+    }
+    clipboard.*.window = x11.generateId(connection)
+    x11.createInputWindow(connection, clipboard.*.window, connection.*.root)
+    x11.selectInput(connection, clipboard.*.window, x11.MASK_PROPERTY_CHANGE)
+    clipboard.*.atomsLeft = ATOMS
+    index = 0
+    while index < ATOMS {
+        const sequence = x11.internAtom(connection, atomText(index))
+        if index == 0 { clipboard.*.atomSequence = sequence }
+        index += 1
+    }
+    clipboard.*.xfixesSequence = x11.queryExtension(connection, "XFIXES")
+}
+
+// Xwayland went: what was under way ends, and an X selection with it.
+pub fn stop(compositor: *Compositor) -> void {
+    if compositor.*.clipboard == 0 { return }
+    const clipboard = clipboardOf(compositor)
+    var index: usize = 0
+    while index < READS {
+        endRead(clipboard, index)
+        index += 1
+    }
+    while clipboard.*.writeCount > 0 { endWrite(clipboard) }
+    const source = clipboard.*.xSource
+    clipboard.*.xSource = 0
+    if source != 0 { data_module.dropXSource(compositor, source) }
+    unsafe { state.release(compositor, @ptrCast([*]u8, clipboard), @sizeOf(Clipboard)) }
+    compositor.*.clipboard = 0
+}
+
+fn startWhenReady(clipboard: *Clipboard) -> void {
+    if clipboard.*.ready || clipboard.*.atomsLeft > 0 || clipboard.*.xfixesSequence != NO_SEQUENCE { return }
+    clipboard.*.ready = true
+    if clipboard.*.xfixes != 0 {
+        _ = x11.xfixesQueryVersion(clipboard.*.connection, clipboard.*.xfixes)
+        x11.xfixesSelectSelectionInput(clipboard.*.connection, clipboard.*.xfixes, clipboard.*.window, clipboard.*.atoms[A_CLIPBOARD], x11.XFIXES_SELECTION_ALL)
+    } else {
+        state.say("xwm: no XFixes: X programs' copies stay theirs\n")
+    }
+    // A Wayland selection made before.
+    selectionChanged(clipboard.*.compositor)
+}
+
+// ---------------------------------------------------------------------------
+// The Wayland selection, served to X
+
+fn typesOf(clipboard: *Clipboard) -> []const u8 { return data_module.typesOf(clipboard.*.served) }
+
+// The served selection's type `name`, if it has it (its index), else TYPES.
+fn typeIndex(clipboard: *Clipboard, name: []const u8) -> usize {
+    const types = typesOf(clipboard)
+    var at: usize = 0
+    var index: usize = 0
+    while at < types.length && index < clipboard.*.typeCount {
+        const length = @intCast(usize, types[at])
+        if std.text.same(types[at + 1..at + 1 + length], name) { return index }
+        at += 1 + length
+        index += 1
+    }
+    return TYPES
+}
+
+fn typeAt(clipboard: *Clipboard, wanted: usize) -> []const u8 {
+    const types = typesOf(clipboard)
+    var at: usize = 0
+    var index: usize = 0
+    while at < types.length {
+        const length = @intCast(usize, types[at])
+        if index == wanted { return types[at + 1..at + 1 + length] }
+        at += 1 + length
+        index += 1
+    }
+    return ""
+}
+
+// The plain text type the served selection has, or "".
+fn textType(clipboard: *Clipboard) -> []const u8 {
+    if typeIndex(clipboard, "text/plain;charset=utf-8") < TYPES { return "text/plain;charset=utf-8" }
+    if typeIndex(clipboard, "text/plain") < TYPES { return "text/plain" }
+    if typeIndex(clipboard, "UTF8_STRING") < TYPES { return "UTF8_STRING" }
+    if typeIndex(clipboard, "STRING") < TYPES { return "STRING" }
+    return ""
+}
+
+// The Wayland selection changed (data.mlx): X sees it from now on, or
+// no longer.
+pub fn selectionChanged(compositor: *Compositor) -> void {
+    if compositor.*.clipboard == 0 { return }
+    const clipboard = clipboardOf(compositor)
+    const selection = compositor.*.selection
+    if selection != 0 && selection == clipboard.*.xSource { return }
+    // An X selection replaced by a Wayland client's goes.
+    if clipboard.*.xSource != 0 {
+        const source = clipboard.*.xSource
+        clipboard.*.xSource = 0
+        data_module.dropXSource(compositor, source)
+    }
+    if !clipboard.*.ready { return }
+    const connection = clipboard.*.connection
+    clipboard.*.served = selection
+    clipboard.*.typeCount = 0
+    if selection == 0 {
+        if clipboard.*.owned { x11.setSelectionOwnerAt(connection, x11.NONE, clipboard.*.atoms[A_CLIPBOARD], x11.CURRENT_TIME) }
+        clipboard.*.owned = false
+        return
+    }
+    const types = typesOf(clipboard)
+    var at: usize = 0
+    while at < types.length && clipboard.*.typeCount < TYPES {
+        const length = @intCast(usize, types[at])
+        clipboard.*.typeAtoms[clipboard.*.typeCount] = 0
+        clipboard.*.typeSequences[clipboard.*.typeCount] = x11.internAtom(connection, types[at + 1..at + 1 + length])
+        clipboard.*.typeCount += 1
+        at += 1 + length
+    }
+    x11.setSelectionOwnerAt(connection, clipboard.*.window, clipboard.*.atoms[A_CLIPBOARD], x11.CURRENT_TIME)
+    clipboard.*.owned = true
+    if compositor.*.verbose { state.say("xwm: CLIPBOARD from a Wayland client\n") }
+}
+
+// What an X client asked for as `target`: the Wayland type to read, or "".
+fn typeForTarget(clipboard: *Clipboard, target: u32) -> []const u8 {
+    if target == clipboard.*.atoms[A_UTF8_STRING] || target == clipboard.*.atoms[A_TEXT] || target == x11.ATOM_STRING { return textType(clipboard) }
+    var index: usize = 0
+    while index < clipboard.*.typeCount {
+        if clipboard.*.typeAtoms[index] == target { return typeAt(clipboard, index) }
+        index += 1
+    }
+    return ""
+}
+
+fn refuse(clipboard: *Clipboard, requestor: u32, selection: u32, target: u32, time: u32) -> void {
+    x11.sendSelectionNotify(clipboard.*.connection, requestor, selection, target, x11.NONE, time)
+}
+
+// SelectionRequest: an X client converts the Wayland selection.
+fn requested(clipboard: *Clipboard, event: [*]const u8) -> void {
+    const connection = clipboard.*.connection
+    const time = x11.get32(event, 4)
+    const requestor = x11.get32(event, 12)
+    const selection = x11.get32(event, 16)
+    const target = x11.get32(event, 20)
+    var property = x11.get32(event, 24)
+    // Clients from before ICCCM name no property: the target is.
+    if property == x11.NONE { property = target }
+    if !clipboard.*.owned || clipboard.*.served == 0 || selection != clipboard.*.atoms[A_CLIPBOARD] {
+        refuse(clipboard, requestor, selection, target, time)
+        return
+    }
+    if target == clipboard.*.atoms[A_TARGETS] {
+        var list: [32]u32 = undefined
+        var count: usize = 0
+        list[count] = clipboard.*.atoms[A_TARGETS]
+        list[count + 1] = clipboard.*.atoms[A_TIMESTAMP]
+        count += 2
+        if textType(clipboard).length > 0 {
+            list[count] = clipboard.*.atoms[A_UTF8_STRING]
+            list[count + 1] = clipboard.*.atoms[A_TEXT]
+            list[count + 2] = x11.ATOM_STRING
+            count += 3
+        }
+        var index: usize = 0
+        while index < clipboard.*.typeCount && count < 32 {
+            // Each atom once (a source may list text under several names).
+            const atom = clipboard.*.typeAtoms[index]
+            var seen = atom == 0
+            var before: usize = 0
+            while before < count {
+                if list[before] == atom { seen = true }
+                before += 1
+            }
+            if !seen {
+                list[count] = atom
+                count += 1
+            }
+            index += 1
+        }
+        unsafe { x11.changeProperty(connection, requestor, property, x11.ATOM_ATOM, 32, @ptrCast([*]const u8, &list), count) }
+        x11.sendSelectionNotify(connection, requestor, selection, target, property, time)
+        return
+    }
+    if target == clipboard.*.atoms[A_TIMESTAMP] {
+        x11.changeProperty32(connection, requestor, property, x11.ATOM_INTEGER, 0)
+        x11.sendSelectionNotify(connection, requestor, selection, target, property, time)
+        return
+    }
+    const name = typeForTarget(clipboard, target)
+    var slot: usize = 0
+    while slot < READS && clipboard.*.reads[slot].descriptor >= 0 { slot += 1 }
+    if name.length == 0 || slot == READS {
+        refuse(clipboard, requestor, selection, target, time)
+        return
+    }
+    // The source's client writes into a pipe; the loop watches our end.
+    var descriptors: [2]i32 = [2]i32{ -1, -1 }
+    if std.linux.syscall2(SYS_pipe2, @intFromPtr(&descriptors), O_CLOEXEC) != 0 {
+        refuse(clipboard, requestor, selection, target, time)
+        return
+    }
+    const reader = @intCast(isize, descriptors[0])
+    const writer = @intCast(isize, descriptors[1])
+    _ = std.linux.syscall3(SYS_fcntl, @bitCast(usize, reader), F_SETFL, O_NONBLOCK)
+    data_module.sendFromSource(clipboard.*.compositor, clipboard.*.served, name, writer)
+    closeDescriptor(writer)
+    const read = &clipboard.*.reads[slot]
+    read.*.descriptor = reader
+    read.*.requestor = requestor
+    read.*.property = property
+    read.*.target = target
+    read.*.time = time
+    read.*.length = 0
+    read.*.capacity = 0
+    watch(clipboard)
+}
+
+// The pipes the compositor's loop watches for us.
+fn watch(clipboard: *Clipboard) -> void {
+    var index: usize = 0
+    while index < READS {
+        clipboard.*.compositor.*.transferWatches[index] = clipboard.*.reads[index].descriptor
+        index += 1
+    }
+}
+
+fn endRead(clipboard: *Clipboard, slot: usize) -> void {
+    const read = &clipboard.*.reads[slot]
+    if read.*.descriptor < 0 { return }
+    closeDescriptor(read.*.descriptor)
+    read.*.descriptor = -1
+    if read.*.capacity > 0 { state.release(clipboard.*.compositor, read.*.data, read.*.capacity) }
+    read.*.capacity = 0
+    watch(clipboard)
+}
+
+// Room for `extra` more bytes in a read's buffer; false past the limit.
+fn reserve(clipboard: *Clipboard, read: *Read, extra: usize) -> bool {
+    const wanted = read.*.length + extra
+    if wanted <= read.*.capacity { return true }
+    if wanted > READ_LIMIT { return false }
+    var size = if read.*.capacity == 0 { 16384 } else { read.*.capacity }
+    while size < wanted { size = size * 2 }
+    const memory = state.allocate(clipboard.*.compositor, size)
+    var index: usize = 0
+    while index < read.*.length {
+        memory[index] = read.*.data[index]
+        index += 1
+    }
+    if read.*.capacity > 0 { state.release(clipboard.*.compositor, read.*.data, read.*.capacity) }
+    read.*.data = memory
+    read.*.capacity = size
+    return true
+}
+
+// The sources' pipes: what came is taken in; a source done (end of file)
+// is put on the requestor's property and the requestor told.
+pub fn pump(compositor: *Compositor) -> void {
+    if compositor.*.clipboard == 0 { return }
+    const clipboard = clipboardOf(compositor)
+    var slot: usize = 0
+    while slot < READS {
+        const read = &clipboard.*.reads[slot]
+        var finished = false
+        var failed = false
+        while read.*.descriptor >= 0 && !finished && !failed {
+            if !reserve(clipboard, read, 65536) {
+                failed = true
+            } else {
+                const count = std.linux.syscall3(SYS_read, @bitCast(usize, read.*.descriptor), @intFromPtr(read.*.data) + read.*.length, 65536)
+                if count == EAGAIN { break }
+                if count == 0 { finished = true }
+                if count < 0 { failed = true }
+                if count > 0 { read.*.length += @intCast(usize, count) }
+            }
+        }
+        if finished {
+            const connection = clipboard.*.connection
+            // Text as UTF8_STRING (or the type asked for), else the
+            // target is the property's type.
+            const kind = if read.*.target == clipboard.*.atoms[A_TEXT] { clipboard.*.atoms[A_UTF8_STRING] } else { read.*.target }
+            x11.changePropertyBytes(connection, read.*.requestor, read.*.property, kind, read.*.data[0..read.*.length], false)
+            x11.sendSelectionNotify(connection, read.*.requestor, clipboard.*.atoms[A_CLIPBOARD], read.*.target, read.*.property, read.*.time)
+            endRead(clipboard, slot)
+        } else if failed {
+            refuse(clipboard, read.*.requestor, clipboard.*.atoms[A_CLIPBOARD], read.*.target, read.*.time)
+            endRead(clipboard, slot)
+        }
+        slot += 1
+    }
+}
+
+// ---------------------------------------------------------------------------
+// An X client's selection, served to Wayland
+
+fn nameAt(clipboard: *Clipboard, index: usize) -> []const u8 {
+    const at = clipboard.*.xNameAt[index]
+    if at >= NAMES { return "" }
+    const length = @intCast(usize, clipboard.*.xNames[at])
+    return clipboard.*.xNames[at + 1..at + 1 + length]
+}
+
+// The X owner's atom named `name`, or NONE.
+fn xAtomNamed(clipboard: *Clipboard, name: []const u8) -> u32 {
+    var index: usize = 0
+    while index < clipboard.*.xCount {
+        if std.text.same(nameAt(clipboard, index), name) { return clipboard.*.xAtoms[index] }
+        index += 1
+    }
+    return x11.NONE
+}
+
+// A new owner of CLIPBOARD (XFixes): an X client's is asked for its
+// TARGETS; none (the owner went) ends the X source.
+fn ownerChanged(clipboard: *Clipboard, event: [*]const u8) -> void {
+    const owner = x11.get32(event, 8)
+    const selection = x11.get32(event, 12)
+    const time = x11.get32(event, 16)
+    if selection != clipboard.*.atoms[A_CLIPBOARD] || owner == clipboard.*.window { return }
+    clipboard.*.owned = false
+    clipboard.*.served = 0
+    if owner == x11.NONE {
+        const source = clipboard.*.xSource
+        clipboard.*.xSource = 0
+        if source != 0 { data_module.dropXSource(clipboard.*.compositor, source) }
+        return
+    }
+    x11.convertSelection(clipboard.*.connection, clipboard.*.window, clipboard.*.atoms[A_CLIPBOARD], clipboard.*.atoms[A_TARGETS], clipboard.*.atoms[A_PROPERTY], time)
+}
+
+// The TARGETS are in: each one's name is asked for.
+fn targetsRead(clipboard: *Clipboard, reply: [*]const u8) -> void {
+    clipboard.*.xCount = 0
+    clipboard.*.xNamesLength = 0
+    if x11.propertyFormat(reply) != 32 { return }
+    const count = x11.propertyBytes(reply) / 4
+    const value = x11.propertyValue(reply)
+    var index: usize = 0
+    while index < count && clipboard.*.xCount < TYPES {
+        const atom = x11.get32(value, index * 4)
+        clipboard.*.xAtoms[clipboard.*.xCount] = atom
+        clipboard.*.xNameAt[clipboard.*.xCount] = NAMES
+        clipboard.*.xNameSequences[clipboard.*.xCount] = x11.getAtomName(clipboard.*.connection, atom)
+        clipboard.*.xCount += 1
+        index += 1
+    }
+    clipboard.*.xNamesLeft = clipboard.*.xCount
+}
+
+fn nameRead(clipboard: *Clipboard, index: usize, reply: [*]const u8) -> void {
+    const name = x11.atomName(reply)
+    if name.length < 256 && clipboard.*.xNamesLength + 1 + name.length <= NAMES {
+        const at = clipboard.*.xNamesLength
+        clipboard.*.xNames[at] = @intCast(u8, name.length)
+        var byte: usize = 0
+        while byte < name.length {
+            clipboard.*.xNames[at + 1 + byte] = name[byte]
+            byte += 1
+        }
+        clipboard.*.xNameAt[index] = at
+        clipboard.*.xNamesLength += 1 + name.length
+    }
+    clipboard.*.xNamesLeft -= 1
+    if clipboard.*.xNamesLeft == 0 { offerX(clipboard) }
+}
+
+// MIME types have a slash (atoms for X programs alone have none).
+fn hasSlash(name: []const u8) -> bool {
+    for byte in name {
+        if byte == 47 { return true }
+    }
+    return false
+}
+
+// The names are in: an X source with the types Wayland clients know
+// (text as text/plain, and the MIME types) becomes the selection.
+fn offerX(clipboard: *Clipboard) -> void {
+    const compositor = clipboard.*.compositor
+    const old = clipboard.*.xSource
+    const source = data_module.newXSource(compositor)
+    var text = false
+    var index: usize = 0
+    while index < clipboard.*.xCount {
+        const name = nameAt(clipboard, index)
+        if std.text.same(name, "UTF8_STRING") || std.text.same(name, "TEXT") || std.text.same(name, "STRING") {
+            text = true
+        } else if hasSlash(name) {
+            data_module.addXSourceType(source, name)
+        }
+        index += 1
+    }
+    if text {
+        data_module.addXSourceType(source, "text/plain;charset=utf-8")
+        data_module.addXSourceType(source, "text/plain")
+    }
+    if data_module.typesOf(source).length == 0 {
+        data_module.dropXSource(compositor, source)
+        return
+    }
+    clipboard.*.xSource = source
+    data_module.setXSelection(compositor, source)
+    if old != 0 { data_module.dropXSource(compositor, old) }
+    if compositor.*.verbose { state.say("xwm: CLIPBOARD from an X client\n") }
+}
+
+// A Wayland client reads the X selection as `mime` into `descriptor` (a
+// copy of its pipe, ours to close): the conversion waits its turn.
+pub fn receive(compositor: *Compositor, mime: []const u8, descriptor: isize) -> void {
+    if compositor.*.clipboard == 0 {
+        closeDescriptor(descriptor)
+        return
+    }
+    const clipboard = clipboardOf(compositor)
+    var target = x11.NONE
+    if std.text.same(mime, "text/plain;charset=utf-8") || std.text.same(mime, "text/plain") {
+        target = xAtomNamed(clipboard, "UTF8_STRING")
+        if target == x11.NONE { target = xAtomNamed(clipboard, "STRING") }
+        if target == x11.NONE { target = xAtomNamed(clipboard, "TEXT") }
+    } else {
+        target = xAtomNamed(clipboard, mime)
+    }
+    if target == x11.NONE || clipboard.*.writeCount == WRITES {
+        closeDescriptor(descriptor)
+        return
+    }
+    const write = &clipboard.*.writes[clipboard.*.writeCount]
+    write.*.descriptor = descriptor
+    write.*.target = target
+    write.*.incr = false
+    write.*.offset = 0
+    clipboard.*.writeCount += 1
+    if clipboard.*.writeCount == 1 { startWrite(clipboard) }
+}
+
+fn startWrite(clipboard: *Clipboard) -> void {
+    if clipboard.*.writeCount == 0 { return }
+    x11.convertSelection(clipboard.*.connection, clipboard.*.window, clipboard.*.atoms[A_CLIPBOARD], clipboard.*.writes[0].target, clipboard.*.atoms[A_PROPERTY], x11.CURRENT_TIME)
+}
+
+// The first conversion is done (or failed): its pipe closes, the next
+// one starts.
+fn endWrite(clipboard: *Clipboard) -> void {
+    if clipboard.*.writeCount == 0 { return }
+    closeDescriptor(clipboard.*.writes[0].descriptor)
+    var index: usize = 1
+    while index < clipboard.*.writeCount {
+        clipboard.*.writes[index - 1] = clipboard.*.writes[index]
+        index += 1
+    }
+    clipboard.*.writeCount -= 1
+    clipboard.*.partSequence = NO_SEQUENCE
+    startWrite(clipboard)
+}
+
+// Writes `data` into a Wayland reader's pipe, waiting a second at most
+// for room each time. A reader gone raises SIGPIPE, which would end the
+// compositor: it stays blocked while writing and is taken back after.
+fn writeOut(descriptor: isize, data: []const u8) -> bool {
+    var blocked: usize = PIPE_SIGNAL
+    var previous: usize = 0
+    _ = std.linux.syscall4(SYS_rt_sigprocmask, 0, @intFromPtr(&blocked), @intFromPtr(&previous), 8)
+    var poll: [2]i32 = [2]i32{ @intCast(i32, descriptor), 4 }
+    var at: usize = 0
+    var ok = true
+    while at < data.length && ok {
+        if std.linux.syscall3(SYS_poll, @intFromPtr(&poll), 1, WRITE_WAIT) <= 0 {
+            ok = false
+        } else {
+            var count = data.length - at
+            if count > 4096 { count = 4096 }
+            const written = std.linux.syscall3(SYS_write, @bitCast(usize, descriptor), @intFromPtr(data.pointer) + at, count)
+            if written <= 0 { ok = false } else { at += @intCast(usize, written) }
+        }
+    }
+    if previous & PIPE_SIGNAL == 0 {
+        var now: [2]usize = [2]usize{ 0, 0 }
+        _ = std.linux.syscall4(SYS_rt_sigtimedwait, @intFromPtr(&blocked), 0, @intFromPtr(&now), 8)
+        _ = std.linux.syscall4(SYS_rt_sigprocmask, 2, @intFromPtr(&previous), 0, 8)
+    }
+    return ok
+}
+
+fn askPart(clipboard: *Clipboard) -> void {
+    const write = &clipboard.*.writes[0]
+    clipboard.*.partSequence = x11.getPropertyPart(clipboard.*.connection, clipboard.*.window, clipboard.*.atoms[A_PROPERTY], x11.ATOM_ANY, write.*.offset, PART_LONGS, true)
+}
+
+// SelectionNotify: a conversion asked for is in the property (or failed).
+fn converted(clipboard: *Clipboard, event: [*]const u8) -> void {
+    const target = x11.get32(event, 16)
+    const property = x11.get32(event, 20)
+    if target == clipboard.*.atoms[A_TARGETS] {
+        if property != x11.NONE { clipboard.*.targetsSequence = x11.getPropertyPart(clipboard.*.connection, clipboard.*.window, property, x11.ATOM_ANY, 0, 1024, true) }
+        return
+    }
+    if clipboard.*.writeCount == 0 || clipboard.*.writes[0].target != target { return }
+    if property == x11.NONE {
+        endWrite(clipboard)
+        return
+    }
+    askPart(clipboard)
+}
+
+// A part of the property: into the reader's pipe; more after it, the
+// next new value of an INCR transfer, or the end.
+fn partRead(clipboard: *Clipboard, reply: [*]const u8) -> void {
+    clipboard.*.partSequence = NO_SEQUENCE
+    if clipboard.*.writeCount == 0 { return }
+    const write = &clipboard.*.writes[0]
+    const bytes = x11.propertyBytes(reply)
+    if x11.propertyType(reply) == clipboard.*.atoms[A_INCR] {
+        // Deleted by the read: the owner sends the first part now.
+        write.*.incr = true
+        return
+    }
+    if write.*.incr && bytes == 0 {
+        endWrite(clipboard)
+        return
+    }
+    if bytes > 0 && !writeOut(write.*.descriptor, x11.propertyValue(reply)[0..bytes]) {
+        endWrite(clipboard)
+        return
+    }
+    if write.*.incr { return }
+    if x11.propertyAfter(reply) > 0 {
+        write.*.offset += @intCast(u32, bytes / 4)
+        askPart(clipboard)
+        return
+    }
+    endWrite(clipboard)
+}
+
+// ---------------------------------------------------------------------------
+// From the window manager's connection
+
+// A reply for the clipboard: true when it was one.
+pub fn reply(compositor: *Compositor, sequence: u32, data: [*]const u8) -> bool {
+    if compositor.*.clipboard == 0 { return false }
+    const clipboard = clipboardOf(compositor)
+    if sequence == clipboard.*.xfixesSequence {
+        clipboard.*.xfixesSequence = NO_SEQUENCE
+        if x11.extensionPresent(data) {
+            clipboard.*.xfixes = x11.extensionOpcode(data)
+            clipboard.*.xfixesEvent = x11.extensionFirstEvent(data)
+        }
+        startWhenReady(clipboard)
+        return true
+    }
+    if clipboard.*.atomsLeft > 0 {
+        const index = @intCast(usize, (sequence -% clipboard.*.atomSequence) & 65535)
+        if index < ATOMS {
+            clipboard.*.atoms[index] = x11.atomOf(data)
+            clipboard.*.atomsLeft -= 1
+            startWhenReady(clipboard)
+            return true
+        }
+    }
+    if sequence == clipboard.*.partSequence {
+        partRead(clipboard, data)
+        return true
+    }
+    if sequence == clipboard.*.targetsSequence {
+        clipboard.*.targetsSequence = NO_SEQUENCE
+        targetsRead(clipboard, data)
+        return true
+    }
+    var index: usize = 0
+    while index < clipboard.*.typeCount {
+        if clipboard.*.typeSequences[index] == sequence && clipboard.*.typeAtoms[index] == 0 {
+            clipboard.*.typeAtoms[index] = x11.atomOf(data)
+            clipboard.*.typeSequences[index] = NO_SEQUENCE
+            return true
+        }
+        index += 1
+    }
+    index = 0
+    while index < clipboard.*.xCount && clipboard.*.xNamesLeft > 0 {
+        if clipboard.*.xNameSequences[index] == sequence {
+            clipboard.*.xNameSequences[index] = NO_SEQUENCE
+            nameRead(clipboard, index, data)
+            return true
+        }
+        index += 1
+    }
+    return false
+}
+
+// An event for the clipboard: true when it was one.
+pub fn event(compositor: *Compositor, kind: u8, data: [*]const u8) -> bool {
+    if compositor.*.clipboard == 0 { return false }
+    const clipboard = clipboardOf(compositor)
+    if kind == x11.SELECTION_REQUEST && x11.get32(data, 8) == clipboard.*.window {
+        requested(clipboard, data)
+        return true
+    }
+    if kind == x11.SELECTION_NOTIFY && x11.get32(data, 8) == clipboard.*.window {
+        converted(clipboard, data)
+        return true
+    }
+    if kind == x11.SELECTION_CLEAR && x11.get32(data, 8) == clipboard.*.window {
+        clipboard.*.owned = false
+        return true
+    }
+    if kind == x11.PROPERTY_NOTIFY && x11.get32(data, 4) == clipboard.*.window {
+        // An INCR transfer's next part (a new value: state 0).
+        if data[16] == 0 && x11.get32(data, 8) == clipboard.*.atoms[A_PROPERTY] && clipboard.*.writeCount > 0 && clipboard.*.writes[0].incr && clipboard.*.partSequence == NO_SEQUENCE { askPart(clipboard) }
+        return true
+    }
+    if clipboard.*.xfixes != 0 && kind == clipboard.*.xfixesEvent {
+        ownerChanged(clipboard, data)
+        return true
+    }
+    return false
+}

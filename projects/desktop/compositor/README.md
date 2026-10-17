@@ -249,11 +249,17 @@ crash, it says where first (`mlx-dock: crashed: ...` and the functions,
 in the compositor's log), as the compositor does, and keeps the crash
 for MLX Observatory.
 
-With `dock-autohide = on` (mlx-settings: "Auto-hide dock") the dock
+With `dock-autohide = on` (mlx-settings: "Always hide") the dock
 reserves no space, so maximized windows reach the bottom edge. It slides
 out of sight once the pointer has been away from it for 0.6 seconds and
-back up when the pointer touches the output's bottom edge; it stays while
-its previews show or a button is held.
+back up when the pointer touches the output's bottom edge (a drag too,
+so files can be dropped on it); it stays while its previews show, its
+menu or a folder's stack is open, or a button is held. With
+`dock-autohide = smart`
+("Hide when a window is in the way") it does the same, but only goes
+while a window of the workspace shown (its frame and title bar) overlaps
+the dock's bar, and comes back by itself once no window does (`dock:
+nothing in its way` in the log).
 
 The top bar (`mlx-topbar`, `--topbar PROGRAM|none`, started and kept
 running like the dock over `MLX_TOPBAR_FD`) sits in the top layer along
@@ -1473,6 +1479,20 @@ wire protocol without libc or libxcb):
   windows.
 - Override-redirect windows (menus, drop-downs, tooltips) show where X puts
   them, above the windows, without a frame or the keyboard.
+- The clipboard is one for both ([`xwm_selection.mlx`](xwm_selection.mlx)).
+  When a Wayland client sets the selection, a window of the window
+  manager's owns `CLIPBOARD` and answers X programs: `TARGETS` from the
+  selection's types (interned as atoms; `UTF8_STRING`, `TEXT` and `STRING`
+  stand for `text/plain`), any other target read from the Wayland source
+  through a pipe the event loop watches and put on the requestor's
+  property (appended in parts past a request's size). When an X program
+  takes `CLIPBOARD` (XFixes tells), its `TARGETS` and their names are
+  read and an X source with the types Wayland clients know (text as
+  `text/plain;charset=utf-8` and `text/plain`, and the MIME types)
+  becomes the selection; a Wayland client reading it gets the conversion
+  written into its pipe, the property read in parts, or `INCR` part by
+  part. Copied files cross as `text/uri-list` and
+  `x-special/gnome-copied-files` like any type.
 
 `--xwayland PROGRAM` names another X server, `--xwayland none` runs none.
 The log (`--verbose`) says what happens:

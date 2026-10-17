@@ -1,12 +1,13 @@
 // mlx-init: the init of MLX/Linux, PID 1, written in Mlx without libc. As
 // PID 1 it mounts /proc, /sys, /dev (with pts and shm) and /run, mounts
-// what the mounts file lists, sets the hostname, and starts the services
-// defined in the services directory (config.mlx says how), in their order.
+// what the mounts file lists, sets the hostname, applies coldplug device
+// permissions, watches kernel uevents, and starts the services defined in
+// the services directory (config.mlx says how), in their order.
 // Then it supervises them (supervise.mlx): ended ones are started again
 // after a pause that grows while they keep failing, orphans are reaped,
 // and requests come in over the control socket (control.mlx), from
 // mlx-initctl: status, start, stop, restart, reload, poweroff, reboot,
-// halt. The shutdown (power.mlx) stops the services in the reverse order,
+// halt. The shutdown (power.mlx) stops dependents before their dependencies,
 // kills what is left, syncs, unmounts, and hands over to the kernel.
 //
 //     mlx4 projects/init/main.mlx -o mlx-init
@@ -19,10 +20,14 @@
 //
 // Options:
 //     --services DIR    the NAME.service files (default /etc/mlx/init/services)
-//     --mounts FILE     the mounts file (default /etc/mlx/init/mounts)
+//     --mounts FILE     fstab (default /etc/fstab)
+//     --fsck PROGRAM    checker for nonzero fstab passes (default
+//                       /sbin/fsck; `none` disables checking)
 //     --hostname FILE   the hostname (default /etc/hostname; PID 1 only)
 //     --control PATH    the control socket (default /run/mlx/init)
-//     --log DIR         the services' logs, DIR/NAME.log (default /run/mlx/log)
+//     --log DIR         persistent logs, DIR/NAME.log (default /var/log/mlx)
+//     --runtime-log DIR early fallback logs (default /run/mlx/log)
+//     --log-size BYTES  rotate at this size (default 1048576, four backups)
 //     --verbose         say every start, stop, ready and reaping
 //
 // Signals: SIGCHLD reaps, SIGHUP reads the services again, SIGINT
@@ -37,14 +42,26 @@ const supervise = @import("./supervise.mlx")
 const mounts = @import("./mounts.mlx")
 const control = @import("./control.mlx")
 const power = @import("./power.mlx")
+const devices = @import("./devices.mlx")
 
 const State = config.State
 
 fn named(text: std.string.String, name: []const u8) -> bool { return std.string.eql(text, std.string.fromSlice(name)) }
 
 fn usage() -> u8 {
-    _ = std.io.eprintln("usage: mlx-init [--services DIR] [--mounts FILE] [--hostname FILE] [--control PATH] [--log DIR] [--verbose]")
+    _ = std.io.eprintln("usage: mlx-init [--services DIR] [--mounts FILE] [--fsck PROGRAM|none] [--hostname FILE] [--control PATH] [--log DIR] [--runtime-log DIR] [--log-size BYTES] [--verbose]")
     return 2
+}
+
+fn positiveNumber(text: std.string.String) -> usize {
+    const value = std.string.asSlice(text)
+    if value.length == 0 { return 0 }
+    var result: usize = 0
+    for byte in value {
+        if byte < 48 || byte > 57 { return 0 }
+        result = result * 10 + @intCast(usize, byte - 48)
+    }
+    return result
 }
 
 // The directory holding `path`, made (with its parent) when missing.
@@ -97,7 +114,7 @@ fn onSignal(state: *State, signal: usize) -> void {
     }
 }
 
-fn serve(state: *State) -> void {
+fn serve(state: *State, device_manager: *devices.Manager) -> void {
     var events: [linux.EVENT_SIZE * linux.MAX_EVENTS]u8 = undefined
     const events_pointer: [*]u8 = &events
     // What the loop keeps was made before the turns' mark; each turn
@@ -118,6 +135,8 @@ fn serve(state: *State) -> void {
                     onSignal(state, signal)
                     signal = linux.readSignal(state.*.signals)
                 }
+            } else if token == devices.EVENTS {
+                const changed = devices.readable(device_manager)
             } else if control.isClient(token) {
                 control.readable(state, token)
             }
@@ -141,11 +160,25 @@ pub fn main(arguments: [][*]const u8) -> u8 {
     state.*.verbose = false
     state.*.running = true
     state.*.action = config.ACTION_NONE
+    state.*.listener = -1
+    state.*.signals = -1
+    state.*.eventLoop = -1
+    var clientIndex: usize = 0
+    while clientIndex < config.MAX_CLIENTS {
+        var client: *config.ControlClient = undefined
+        unsafe { client = @ptrCast(*config.ControlClient, &state.*.clients[clientIndex]) }
+        client.*.used = false
+        client.*.descriptor = -1
+        clientIndex += 1
+    }
     config.setServicesDirectory(state, "/etc/mlx/init/services")
-    config.setMountsFile(state, "/etc/mlx/init/mounts")
+    config.setMountsFile(state, "/etc/fstab")
     config.setHostnameFile(state, "/etc/hostname")
     config.setControlPath(state, "/run/mlx/init")
-    config.setLogDirectory(state, "/run/mlx/log")
+    config.setLogDirectory(state, "/var/log/mlx")
+    config.setRuntimeLogDirectory(state, "/run/mlx/log")
+    state.*.logRotateSize = 1048576
+    var fsckProgram: []const u8 = "/sbin/fsck"
     const argument_count = std.process.count(arguments)
     var index: usize = 1
     while index < argument_count {
@@ -159,6 +192,10 @@ pub fn main(arguments: [][*]const u8) -> u8 {
         } else if named(option, "--mounts") && has_value {
             config.setMountsFile(state, std.string.asSlice(std.process.argument(arguments, index + 1)))
             index += 1
+        } else if named(option, "--fsck") && has_value {
+            fsckProgram = std.string.asSlice(std.process.argument(arguments, index + 1))
+            if fsckProgram.length == 0 { return usage() }
+            index += 1
         } else if named(option, "--hostname") && has_value {
             config.setHostnameFile(state, std.string.asSlice(std.process.argument(arguments, index + 1)))
             index += 1
@@ -168,12 +205,21 @@ pub fn main(arguments: [][*]const u8) -> u8 {
         } else if named(option, "--log") && has_value {
             config.setLogDirectory(state, std.string.asSlice(std.process.argument(arguments, index + 1)))
             index += 1
+        } else if named(option, "--runtime-log") && has_value {
+            config.setRuntimeLogDirectory(state, std.string.asSlice(std.process.argument(arguments, index + 1)))
+            index += 1
+        } else if named(option, "--log-size") && has_value {
+            state.*.logRotateSize = positiveNumber(std.process.argument(arguments, index + 1))
+            if state.*.logRotateSize == 0 { return usage() }
+            index += 1
         } else {
             return usage()
         }
         index += 1
     }
     state.*.pid1 = linux.getPid() == 1
+    var device_manager: devices.Manager = undefined
+    devices.initialize(&device_manager, "/dev", "/etc/group")
     if state.*.pid1 {
         config.say("MLX/Linux init starting")
         _ = std.linux.syscall1(linux.SYS_umask, 18)
@@ -183,8 +229,25 @@ pub fn main(arguments: [][*]const u8) -> u8 {
         _ = linux.reboot(linux.REBOOT_CAD_OFF)
         setHostname(state)
     }
-    mounts.fromFile(state)
+    if state.*.pid1 {
+        if !mounts.checkFileSystems(state, fsckProgram) {
+            // A failed check must never be followed by mounts or services.
+            // Use the normal shutdown path so already mounted file systems
+            // are synced and made read-only before the machine halts.
+            config.say("boot stopped after a file-system check failure")
+            state.*.action = config.ACTION_HALT
+            power.shutdown(state)
+            return 1
+        }
+        mounts.fromFile(state)
+        if !devices.openEvents(&device_manager) {
+            config.say("could not listen for kernel device events")
+        }
+        const changed = devices.coldplug(&device_manager, "/sys")
+        if state.*.verbose { config.sayWith("device permissions applied during coldplug: ", "", true, changed) }
+    }
     makeDirectories(config.logDirectory(state))
+    makeDirectories(config.runtimeLogDirectory(state))
     makeParent(config.controlPath(state))
     // The signals come through a descriptor, blocked otherwise (the
     // children unblock them before they run their programs).
@@ -197,11 +260,16 @@ pub fn main(arguments: [][*]const u8) -> u8 {
         return 1
     }
     _ = linux.watch(state.*.eventLoop, state.*.signals, control.SIGNALS)
+    if devices.descriptor(&device_manager) >= 0 && !linux.watch(state.*.eventLoop, devices.descriptor(&device_manager), devices.EVENTS) {
+        config.say("could not watch kernel device events")
+        devices.close(&device_manager)
+    }
     if !control.listen(state) { config.sayWith("could not listen at ", config.controlPath(state), false, 0) }
     const defined = config.load(state)
     config.sayWith("services defined: ", "", true, defined)
     supervise.tick(state)
-    serve(state)
+    serve(state, &device_manager)
+    devices.close(&device_manager)
     power.shutdown(state)
     return 0
 }

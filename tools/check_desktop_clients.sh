@@ -28,6 +28,20 @@
 #   - then, with tools/wayland-drag-source as a file manager, drops a
 #     folder on the dock (it is pinned) and a file on the trash (it goes
 #     into it);
+#   - drops a file on a pinned folder (it is copied in), opens its stack,
+#     drags an entry onto a folder in the stack (it moves in) and another
+#     out of the stack into the file manager (it is copied there);
+#   - copies files in the file manager (Ctrl+A, Ctrl+C): wl-paste and an X
+#     program (tools/x11-clipboard-test on Xwayland) get them as GNOME's
+#     list and as URIs; files wl-copy put up are pasted (Ctrl+V); a text
+#     goes from wl-copy to the X program and back from it to wl-paste
+#     (when wl-clipboard is installed);
+#   - with dock-autohide = smart, keeps the dock while a small window is
+#     elsewhere, hides it while the window is maximized over it, and
+#     brings it back once the window is restored; a file dragged to the
+#     bottom edge brings the hidden dock up and drops on its trash; an X
+#     window (xev) whose frame ends on the row above the dock's bar
+#     leaves it, one a row taller hides it;
 #   - runs the top bar (mlx-topbar) with a terminal: the bar (with its
 #     workspace controls in the middle) is along the
 #     top and reserves it (the terminal moves below it, maximized it stays
@@ -100,6 +114,7 @@ trap 'rm -rf -- "$work"' EXIT
 "$compiler" --quiet tools/clock-probe/main.mlx -o "$work/clock-probe"
 "$compiler" --quiet tools/network-test/fakenetd.mlx -o "$work/fakenetd"
 "$compiler" --quiet projects/desktop/files/main.mlx -o "$work/mlx-files"
+"$compiler" --quiet tools/x11-clipboard-test/main.mlx -o "$work/x11-clipboard-test"
 xkbcli compile-keymap --layout us > "$work/us.xkb"
 
 # The apps: only these (no system directories), one with an icon.
@@ -412,6 +427,271 @@ SCRIPT
         [[ -e "$work/data/Trash/files/junk.txt" && ! -e "$work/home/junk.txt" ]] || fail "drops: gio trash did not move the file into the trash" "$work/drops.log"
         echo "ok   gio trash moved the file into \$XDG_DATA_HOME/Trash"
     fi
+}
+
+# The dock's stacks with drags: a home and a configuration of their own
+# (the terminal pinned, ~/Downloads the folder), one app running, so the
+# folder is at x 585 and the stack's cells are 92 pixels apart from x 399
+# at y 625.
+stack_run() {
+    local name=$1 client=$2 runtime status=0
+    runtime=$(mktemp -d)
+    printf '#!/bin/sh\nexec %s\n' "$client" > "$work/$name.sh"
+    chmod +x "$work/$name.sh"
+    XDG_RUNTIME_DIR=$runtime "$work/test-host" "host-$name" "$work/us.xkb" "$work/$name.script" > "$work/$name-host.log" 2>&1 &
+    local host_pid=$!
+    for _ in $(seq 1 50); do [[ -S "$runtime/host-$name" ]] && break; sleep 0.1; done
+    env -i PATH="$PATH" HOME="$work/stacks/home" XDG_RUNTIME_DIR="$runtime" WAYLAND_DISPLAY="host-$name" \
+        XDG_DATA_HOME="$work/stacks/data" XDG_DATA_DIRS="$work/none" XDG_CONFIG_HOME="$work/stacks/config" MLX_CANVAS=cpu \
+        timeout 60 "$work/mlx-compositor" --verbose --no-fps --renderer cpu --socket "nested-$name" \
+        --terminal "$work/mlx-terminal" --launcher none --dock "$work/mlx-dock" --topbar none --run "$work/$name.sh" > "$work/$name.log" 2>&1 || status=$?
+    wait "$host_pid" || fail "$name: the test host failed" "$work/$name-host.log"
+    rm -rf -- "$runtime"
+    [[ $status -eq 0 ]] || fail "$name: the compositor exited with status $status" "$work/$name.log"
+    ! grep -q "crashed" "$work/$name.log" || fail "$name: a client crashed" "$work/$name.log"
+}
+
+stacks() {
+    local home="$work/stacks/home"
+    mkdir -p "$home/Downloads/Sub" "$home/Other" "$home/Dst" "$work/stacks/config/mlx" "$work/stacks/data"
+    echo a > "$home/Downloads/a.txt"
+    echo b > "$home/Downloads/b.txt"
+    echo x > "$home/Other/x.txt"
+    touch -d '2024-03-01 10:00' "$home/Downloads/b.txt"
+    touch -d '2024-03-02 10:00' "$home/Downloads/Sub"
+    touch -d '2024-03-03 10:00' "$home/Downloads/a.txt"
+    printf 'terminal\n' > "$work/stacks/config/mlx/dock"
+    printf '~/Downloads\n' > "$work/stacks/config/mlx/dock-folders"
+    # x.txt from the drag source onto the folder.
+    cat > "$work/stack-in.script" <<SCRIPT
+wait 3000
+pointer 100 100
+wait 300
+press 272
+wait 100
+pointer 110 110
+wait 100
+pointer 300 400
+wait 100
+pointer 580 715
+wait 300
+pointer 585 728
+wait 800
+release 272
+wait 1500
+close
+SCRIPT
+    stack_run stack-in "$work/drag-source file://$home/Other/x.txt"
+    grep -q "^mlx-dock: dropped into $home/Downloads" "$work/stack-in.log" && [[ -e "$home/Downloads/x.txt" && -e "$home/Other/x.txt" ]] || fail "stacks: a file dropped on a pinned folder was not copied into it" "$work/stack-in.log"
+    echo "ok   a file dropped on a pinned folder in the dock is copied into it"
+    # Newest first: x.txt, a.txt, Sub, b.txt. a.txt onto Sub, then (the
+    # stack read again: Sub, x.txt, b.txt) b.txt into the file manager.
+    touch -d '2024-03-04 10:00' "$home/Downloads/x.txt"
+    cat > "$work/stack-out.script" <<SCRIPT
+wait 3500
+pointer 585 728
+wait 300
+press 272
+release 272
+wait 1500
+pointer 492 625
+wait 300
+press 272
+wait 100
+pointer 482 625
+wait 100
+pointer 584 625
+wait 100
+pointer 584 625
+wait 600
+release 272
+wait 1500
+pointer 583 625
+wait 300
+press 272
+wait 100
+pointer 570 615
+wait 100
+pointer 400 400
+wait 100
+pointer 300 300
+wait 600
+release 272
+wait 1500
+close
+SCRIPT
+    stack_run stack-out "$work/mlx-files $home/Dst"
+    [[ -e "$home/Downloads/Sub/a.txt" && ! -e "$home/Downloads/a.txt" ]] || fail "stacks: an entry dragged onto a folder in the stack did not move into it ($(ls "$home/Downloads" | tr '\n' ' '))" "$work/stack-out.log"
+    echo "ok   an entry dragged onto a folder in the dock's stack moves into it"
+    grep -q "^drag: dropped on Dst" "$work/stack-out.log" && [[ -e "$home/Dst/b.txt" && -e "$home/Downloads/b.txt" ]] || fail "stacks: an entry dragged out of the stack was not copied into the file manager's folder ($(ls "$home/Dst" | tr '\n' ' '))" "$work/stack-out.log"
+    echo "ok   an entry dragged out of the dock's stack is copied where the file manager shows"
+}
+
+# The clipboard: the file manager's copies for Wayland and X programs,
+# its pastes from them, and text both ways between wl-copy/wl-paste and
+# an X program (the X window manager keeps CLIPBOARD and the Wayland
+# selection one). stack_run's home and configuration; Xwayland when it is
+# there.
+clipboard() {
+    if ! command -v wl-copy > /dev/null || ! command -v wl-paste > /dev/null; then
+        echo "skip clipboard: wl-clipboard is not installed"
+        return
+    fi
+    local home="$work/stacks/home" out="$work/clip-out"
+    mkdir -p "$home/Src/Folder" "$home/Paste" "$out"
+    echo alpha > "$home/Src/a.txt"
+    echo gamma > "$home/Other/c d.txt"
+    # Ctrl+A, Ctrl+C in the file manager, then the others read.
+    cat > "$work/clip-copy.script" <<SCRIPT
+wait 3000
+down 29
+down 30
+up 30
+down 46
+up 46
+up 29
+wait 6000
+close
+SCRIPT
+    cat > "$work/clip-readers.sh" <<SCRIPT
+#!/bin/sh
+sleep 4
+timeout 5 wl-paste -n -t x-special/gnome-copied-files > "$out/gnome" 2>&1
+timeout 5 "$work/x11-clipboard-test" read text/uri-list > "$out/x-uris" 2> "$out/x-uris.err"
+SCRIPT
+    chmod +x "$work/clip-readers.sh"
+    cat > "$work/clip-files.sh" <<SCRIPT
+#!/bin/sh
+"$work/clip-readers.sh" &
+exec "$work/mlx-files" "$home/Src"
+SCRIPT
+    chmod +x "$work/clip-files.sh"
+    stack_run clip-copy "$work/clip-files.sh"
+    [[ "$(cat "$out/gnome")" == "$(printf 'copy\nfile://%s/Src/Folder\nfile://%s/Src/a.txt' "$home" "$home")" ]] || fail "clipboard: wl-paste did not get the copied files as GNOME's list ($(cat "$out/gnome"))" "$work/clip-copy.log"
+    [[ "$(cat "$out/x-uris")" == "$(printf 'file://%s/Src/Folder\r\nfile://%s/Src/a.txt\r' "$home" "$home")" ]] || fail "clipboard: the X program did not get the copied files as URIs ($(cat "$out/x-uris" "$out/x-uris.err"))" "$work/clip-copy.log"
+    echo "ok   files copied in the file manager reach wl-paste (GNOME's list) and an X program (URIs)"
+    # wl-copy's URI list pasted with Ctrl+V (after a click on the window).
+    cat > "$work/clip-paste.script" <<SCRIPT
+wait 4500
+pointer 500 300
+press 272
+release 272
+wait 300
+down 29
+down 47
+up 47
+up 29
+wait 2000
+close
+SCRIPT
+    cat > "$work/clip-paster.sh" <<SCRIPT
+#!/bin/sh
+(sleep 2; printf 'file://%s\r\n' "$home/Other/c%20d.txt" | wl-copy -t text/uri-list) &
+exec "$work/mlx-files" "$home/Paste"
+SCRIPT
+    chmod +x "$work/clip-paster.sh"
+    stack_run clip-paste "$work/clip-paster.sh"
+    [[ -e "$home/Paste/c d.txt" && -e "$home/Other/c d.txt" ]] || fail "clipboard: Ctrl+V did not paste the file wl-copy put up ($(ls "$home/Paste" | tr '\n' ' '))" "$work/clip-paste.log"
+    echo "ok   Ctrl+V in the file manager pastes files another program copied"
+    # Text from Wayland to X and from X to Wayland.
+    printf 'wait 12000\nclose\n' > "$work/clip-text.script"
+    cat > "$work/clip-words.sh" <<SCRIPT
+#!/bin/sh
+sleep 1
+printf 'hello from wayland' | wl-copy
+sleep 2
+"$work/x11-clipboard-test" read UTF8_STRING > "$out/x-text" 2> "$out/x-text.err"
+"$work/x11-clipboard-test" own 'hello from x11' > /dev/null 2> "$out/own.err" &
+sleep 2
+timeout 5 wl-paste -n > "$out/wl-text" 2>&1
+SCRIPT
+    chmod +x "$work/clip-words.sh"
+    stack_run clip-text "$work/clip-words.sh"
+    [[ "$(cat "$out/x-text")" == "hello from wayland" ]] || fail "clipboard: the X program did not read wl-copy's text ($(cat "$out/x-text" "$out/x-text.err"))" "$work/clip-text.log"
+    [[ "$(cat "$out/wl-text")" == "hello from x11" ]] || fail "clipboard: wl-paste did not read the X program's text ($(cat "$out/wl-text" "$out/own.err"))" "$work/clip-text.log"
+    echo "ok   text goes from wl-copy to an X program and from an X program to wl-paste"
+}
+
+# The dock out of the way of windows (dock-autohide = smart): the drag
+# source's window maximized (Super+Up) covers the dock, restored it does
+# not. stack_run's home; its configuration with the setting, taken away
+# after.
+smart_dock() {
+    printf 'dock-autohide = smart\n' > "$work/stacks/config/mlx/compositor.conf"
+    cat > "$work/smart-dock.script" <<SCRIPT
+wait 3000
+pointer 100 100
+wait 200
+press 272
+release 272
+wait 1500
+down 125
+down 103
+up 103
+up 125
+wait 2500
+down 125
+down 103
+up 103
+up 125
+wait 2500
+close
+SCRIPT
+    stack_run smart-dock "$work/drag-source file:///nothing"
+    # Hidden under the maximized window, a drag to the bottom edge brings
+    # it up, and the file goes onto its trash.
+    echo junk > "$work/stacks/home/Other/edge.txt"
+    cat > "$work/smart-drop.script" <<SCRIPT
+wait 3000
+pointer 100 100
+wait 200
+press 272
+release 272
+wait 800
+down 125
+down 103
+up 103
+up 125
+wait 1500
+pointer 500 400
+wait 200
+press 272
+wait 100
+pointer 510 410
+wait 100
+pointer 520 600
+wait 100
+pointer 525 767
+wait 1500
+pointer 640 760
+wait 500
+release 272
+wait 1500
+close
+SCRIPT
+    stack_run smart-drop "$work/drag-source file://$work/stacks/home/Other/edge.txt"
+    # The edge exactly: placed at (24, 24) under a 20-pixel title bar with
+    # 2-pixel frames, a window 666 high ends on row 695, the bar starts
+    # on row 696.
+    if command -v xev > /dev/null && command -v Xwayland > /dev/null; then
+        printf 'wait 5000\nclose\n' > "$work/smart-edge-666.script"
+        printf 'wait 5000\nclose\n' > "$work/smart-edge-667.script"
+        stack_run smart-edge-666 "xev -geometry 420x666"
+        stack_run smart-edge-667 "xev -geometry 420x667"
+        ! grep -q "^dock: hidden" "$work/smart-edge-666.log" || fail "smart dock: a window ending just above the dock's bar hid it" "$work/smart-edge-666.log"
+        grep -q "^dock: hidden" "$work/smart-edge-667.log" || fail "smart dock: a window reaching a row into the dock's bar did not hide it" "$work/smart-edge-667.log"
+        echo "ok   a window ending above the dock's bar leaves it, one a row into it hides it"
+    else
+        echo "skip smart dock edge: xev or Xwayland is not installed"
+    fi
+    rm -f -- "$work/stacks/config/mlx/compositor.conf"
+    [[ "$(grep -o "^dock: hidden\|^drag: started\|^dock: shown\|^mlx-dock: moved to the trash" "$work/smart-drop.log" | tr '\n' ',')" == "dock: hidden,drag: started,dock: shown,mlx-dock: moved to the trash," ]] || fail "smart dock: a drag to the bottom edge did not bring the hidden dock up to drop on ($(grep "^dock:\|^drag:\|^mlx-dock: moved" "$work/smart-drop.log" | tr '\n' ' '))" "$work/smart-drop.log"
+    local log="$work/smart-dock.log"
+    grep -q "dock autohide smart" "$log" || fail "smart dock: the compositor did not take dock-autohide = smart" "$log"
+    # Hidden only after the window was maximized, back after it was not.
+    [[ "$(grep -o "^maximize: \|^dock: hidden\|^restore: \|^dock: nothing in its way" "$log" | tr '\n' ',')" == "maximize: ,dock: hidden,restore: ,dock: nothing in its way," ]] || fail "smart dock: the dock did not hide only while the maximized window covered it ($(grep "^maximize\|^restore\|^dock:" "$log" | tr '\n' ' '))" "$log"
+    echo "ok   dock-autohide = smart hides the dock only while a window is in its way"
+    echo "ok   a file dragged to the bottom edge brings the hidden dock up and drops on its trash"
 }
 
 # The top bar with a terminal, at a fixed time (2024-09-27 14:05 UTC, 16:05
@@ -1283,6 +1563,9 @@ PY
 }
 
 drops
+stacks
+clipboard
+smart_dock
 topbar
 topbar_bus
 control_centre

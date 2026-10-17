@@ -5,6 +5,8 @@
 const std = @import("std")
 const linux = @import("./linux.mlx")
 const config = @import("./config.mlx")
+const accounts = @import("./accounts.mlx")
+const logs = @import("./logs.mlx")
 
 const Service = config.Service
 const State = config.State
@@ -14,13 +16,28 @@ const MAX_DELAY: usize = 30000
 // A service that ran this long before it ended starts again after the
 // first delay, not a longer one.
 const STABLE_RUN: usize = 60000
-// How often a service's ready path is looked for.
+// How often a service's ready path or socket is looked for.
 const READY_POLL: usize = 100
 const MAX_ARGUMENTS: usize = 64
 const MAX_ENVIRONMENT: usize = 48
 // /usr/bin/mlx: the MLX programs (tools/lib/mlx_layout.sh), after the
 // distribution's own.
 const SEARCH_PATH: []const u8 = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/bin/mlx"
+
+const RunIdentity = struct {
+    account: accounts.User
+    group: u32
+    hasUser: bool
+    hasGroup: bool
+    valid: bool
+}
+
+const ChildSetup = struct {
+    identity: RunIdentity
+    log: [*]const u8
+    logLength: usize
+    output: isize
+}
 
 fn now() -> usize { return std.time.milliseconds() }
 
@@ -93,12 +110,17 @@ fn addEntry(storage: [*]u8, capacity: usize, used: usize, items: [*][*]const u8,
     return at + 1
 }
 
-// The service's environment: PATH, HOME, TERM, where the init listens,
-// then its own `env` entries.
-fn buildEnvironment(state: *State, service: *Service, storage: [*]u8, capacity: usize, items: [*][*]const u8) -> usize {
+// The service's environment: PATH, its account, TERM, where the init
+// listens, then its own `env` entries.
+fn buildEnvironment(state: *State, service: *Service, storage: [*]u8, capacity: usize, items: [*][*]const u8, identity: *const RunIdentity) -> usize {
     var count: usize = 0
     var used = addEntry(storage, capacity, 0, items, &count, "PATH=", SEARCH_PATH)
-    used = addEntry(storage, capacity, used, items, &count, "HOME=", "/")
+    const home = if identity.*.hasUser && identity.*.account.homeLength > 0 { accounts.homeOf(&identity.*.account) } else { "/" }
+    used = addEntry(storage, capacity, used, items, &count, "HOME=", home)
+    if identity.*.hasUser {
+        used = addEntry(storage, capacity, used, items, &count, "USER=", config.user(service))
+        used = addEntry(storage, capacity, used, items, &count, "LOGNAME=", config.user(service))
+    }
     used = addEntry(storage, capacity, used, items, &count, "TERM=", "linux")
     used = addEntry(storage, capacity, used, items, &count, "MLX_INIT_CONTROL=", config.controlPath(state))
     const own = config.environment(service)
@@ -111,6 +133,46 @@ fn buildEnvironment(state: *State, service: *Service, storage: [*]u8, capacity: 
     }
     unsafe { items[count] = @ptrFromInt([*]const u8, 0) }
     return count
+}
+
+fn identityFor(service: *Service) -> RunIdentity {
+    const hasUser = config.user(service).length > 0
+    const hasGroup = config.group(service).length > 0
+    var account = accounts.User.{ .identifier = linux.effectiveUser(), .group = linux.effectiveGroup(), .home = undefined, .homeLength = 0, .valid = true }
+    if hasUser {
+        account = accounts.user(config.user(service))
+        if !account.valid { return RunIdentity.{ .account = account, .group = 0, .hasUser = true, .hasGroup = hasGroup, .valid = false } }
+    }
+    var group = account.group
+    if hasGroup {
+        const requested = accounts.group(config.group(service))
+        if !requested.valid { return RunIdentity.{ .account = account, .group = 0, .hasUser = hasUser, .hasGroup = true, .valid = false } }
+        group = requested.identifier
+    }
+    const currentUser = linux.effectiveUser()
+    const currentGroup = linux.effectiveGroup()
+    const targetUser = if hasUser { account.identifier } else { currentUser }
+    // A non-root init may keep its own identity, but must never silently run
+    // a service under the wrong account when setuid/setgid cannot work.
+    const permitted = currentUser == 0 || (targetUser == currentUser && group == currentGroup)
+    return RunIdentity.{ .account = account, .group = group, .hasUser = hasUser, .hasGroup = hasGroup, .valid = permitted }
+}
+
+fn applyIdentity(service: *Service, identity: *const RunIdentity) -> bool {
+    if !identity.*.hasUser && !identity.*.hasGroup { return true }
+    if linux.effectiveUser() == 0 && !linux.clearGroups() {
+        config.sayAbout(service, "could not clear supplementary groups", false, 0)
+        return false
+    }
+    if !linux.setGroup(identity.*.group) {
+        config.sayAbout(service, "could not set its group", false, 0)
+        return false
+    }
+    if identity.*.hasUser && !linux.setUser(identity.*.account.identifier) {
+        config.sayAbout(service, "could not set its user", false, 0)
+        return false
+    }
+    return true
 }
 
 // execve the program, looked up along SEARCH_PATH when it has no slash.
@@ -156,7 +218,7 @@ fn logPath(state: *State, service: *Service, into: [*]u8, capacity: usize) -> us
 
 // The child's side: a session of its own, stdio on its terminal or its
 // log, then the program.
-fn child(state: *State, service: *Service, arguments: [*][*]const u8, environment: [*][*]const u8, log: []const u8) -> void {
+fn child(state: *State, service: *Service, arguments: [*][*]const u8, environment: [*][*]const u8, setup: *const ChildSetup) -> void {
     linux.unblockAllSignals()
     _ = linux.setSession()
     const terminal_path = config.stdio(service)
@@ -169,19 +231,20 @@ fn child(state: *State, service: *Service, arguments: [*][*]const u8, environmen
             _ = linux.dup2(terminal, 2)
             if terminal > 2 { linux.close(terminal) }
         }
-    } else if !std.text.same(log, "console") {
+    } else if !std.text.same(setup.*.log[0..setup.*.logLength], "console") {
         const input = linux.open("/dev/null", linux.O_RDONLY, 0)
         if input >= 0 {
             _ = linux.dup2(input, 0)
             if input > 2 { linux.close(input) }
         }
-        const output = linux.open(log, linux.O_WRONLY | linux.O_CREAT | linux.O_APPEND, 420)
+        const output = if setup.*.output >= 0 { setup.*.output } else { linux.open(setup.*.log[0..setup.*.logLength], linux.O_WRONLY | linux.O_CREAT | linux.O_APPEND, 420) }
         if output >= 0 {
             _ = linux.dup2(output, 1)
             _ = linux.dup2(output, 2)
             if output > 2 { linux.close(output) }
         }
     }
+    if !applyIdentity(service, &setup.*.identity) { linux.exit(126) }
     execute(arguments[0], arguments, environment)
     config.sayAbout(service, "cannot run its program", false, 0)
     linux.exit(127)
@@ -211,19 +274,31 @@ fn spawn(state: *State, service: *Service, at: usize) -> void {
         service.*.state = config.STOPPED
         return
     }
-    _ = buildEnvironment(state, service, environment_bytes, 2048, environment_pointer)
+    var identity = identityFor(service)
+    if !identity.valid {
+        config.sayAbout(service, "has an unknown or unavailable user/group and is not started", false, 0)
+        service.*.wanted = false
+        service.*.state = config.STOPPED
+        return
+    }
+    _ = buildEnvironment(state, service, environment_bytes, 2048, environment_pointer, &identity)
     var log: [config.PATH_CAPACITY + config.NAME_CAPACITY + 8]u8 = undefined
     const log_bytes: [*]u8 = &log
     const log_length = logPath(state, service, log_bytes, config.PATH_CAPACITY + config.NAME_CAPACITY + 8)
+    const relay = logs.start(state, service)
+    service.*.loggerPid = relay.pid
+    var setup = ChildSetup.{ .identity = identity, .log = log_bytes, .logLength = log_length, .output = relay.writer }
     const pid = linux.fork()
     if pid < 0 {
+        if relay.writer >= 0 { linux.close(relay.writer) }
         config.sayAbout(service, "could not be started (fork failed), trying again later", false, 0)
         service.*.delay = if service.*.delay == 0 { FIRST_DELAY } else { service.*.delay }
         service.*.restartAt = at + service.*.delay
         service.*.state = config.RESTARTING
         return
     }
-    if pid == 0 { child(state, service, items_pointer, environment_pointer, log_bytes[0..log_length]) }
+    if pid == 0 { child(state, service, items_pointer, environment_pointer, &setup) }
+    if relay.writer >= 0 { linux.close(relay.writer) }
     service.*.pid = pid
     service.*.startedAt = at
     service.*.killed = false
@@ -238,6 +313,16 @@ fn byPid(state: *State, pid: isize) -> ?*Service {
     while index < state.*.count {
         const service = config.serviceAt(state, index)
         if service.*.pid == pid { return service }
+        index += 1
+    }
+    return null
+}
+
+fn byLoggerPid(state: *State, pid: isize) -> ?*Service {
+    var index: usize = 0
+    while index < state.*.count {
+        const service = config.serviceAt(state, index)
+        if service.*.loggerPid == pid { return service }
         index += 1
     }
     return null
@@ -292,7 +377,12 @@ pub fn reapAll(state: *State) -> void {
         } else {
             const found = byPid(state, pid)
             if found == null {
-                if state.*.verbose { config.sayWith("reaped a process of nobody's, pid ", "", true, @intCast(usize, pid)) }
+                const logger = byLoggerPid(state, pid)
+                if logger != null {
+                    logger.?.*.loggerPid = 0
+                } else if state.*.verbose {
+                    config.sayWith("reaped a process of nobody's, pid ", "", true, @intCast(usize, pid))
+                }
             } else {
                 ended(state, found.?, linux.exitStatus(raw), at)
             }
@@ -306,6 +396,23 @@ fn terminate(service: *Service, at: usize) -> void {
     service.*.state = config.STOPPING
     service.*.stoppingSince = at
     service.*.killed = false
+}
+
+// A plain readiness value keeps the original path-exists contract. A
+// `socket:` value requires a successful Unix stream connection, so a stale
+// socket inode or an unrelated file cannot release dependent services.
+fn ready(service: *Service) -> bool {
+    const specification = config.ready(service)
+    const prefix: []const u8 = "socket:"
+    if specification.length >= prefix.length && std.text.same(specification[0..prefix.length], prefix) {
+        const path = std.text.trimmed(specification[prefix.length..specification.length])
+        if path.length == 0 || path.length > 107 { return false }
+        const connection = linux.tryConnect(path)
+        if connection < 0 { return false }
+        linux.close(connection)
+        return true
+    }
+    return linux.exists(specification)
 }
 
 // Moves every service along: stops what is not wanted, kills what did not
@@ -333,7 +440,7 @@ pub fn tick(state: *State) -> void {
                 } else if service.*.state == config.WAITING || service.*.state == config.RESTARTING {
                     service.*.state = config.STOPPED
                 }
-            } else if service.*.state == config.STOPPED || service.*.state == config.WAITING || (service.*.state == config.RESTARTING && at >= service.*.restartAt) {
+            } else if service.*.loggerPid == 0 && (service.*.state == config.STOPPED || service.*.state == config.WAITING || (service.*.state == config.RESTARTING && at >= service.*.restartAt)) {
                 if dependenciesMet(state, service) {
                     spawn(state, service, at)
                     changed = true
@@ -341,14 +448,14 @@ pub fn tick(state: *State) -> void {
                     service.*.state = config.WAITING
                 }
             } else if service.*.state == config.STARTING && !service.*.oneshot {
-                if service.*.readyLength == 0 || linux.exists(config.ready(service)) {
+                if service.*.readyLength == 0 || ready(service) {
                     service.*.state = config.RUNNING
                     changed = true
                     if state.*.verbose { config.sayAbout(service, "ready", false, 0) }
                 } else if at - service.*.startedAt >= service.*.readyTimeout {
                     service.*.state = config.RUNNING
                     changed = true
-                    config.sayAbout(service, "not ready in time (its ready path did not appear), taken as running", false, 0)
+                    config.sayAbout(service, "not ready in time (its ready path or socket did not answer), taken as running", false, 0)
                 }
             }
             index += 1
@@ -409,43 +516,119 @@ pub fn requestRestart(state: *State, service: *Service) -> void {
 pub fn anyRunning(state: *State) -> bool {
     var index: usize = 0
     while index < state.*.count {
-        if config.serviceAt(state, index).*.pid > 0 { return true }
+        const service = config.serviceAt(state, index)
+        if service.*.pid > 0 || service.*.loggerPid > 0 { return true }
         index += 1
     }
     return false
 }
 
-// Stops every service for the shutdown: SIGTERM to each in the reverse
-// order of their starts, then waits for them (SIGKILL to those past their
-// stop-timeout), at most a minute in all.
+fn namesDependency(service: *Service, wanted: []const u8) -> bool {
+    const list = config.after(service)
+    var start: usize = 0
+    while start < list.length {
+        while start < list.length && list[start] == 32 { start += 1 }
+        var end = start
+        while end < list.length && list[end] != 32 { end += 1 }
+        if end > start && std.text.same(list[start..end], wanted) { return true }
+        start = end
+    }
+    return false
+}
+
+// A dependency stays up while any service that declared `after` it is still
+// alive. This is based on the declared graph, not incidental fork order.
+fn hasRunningDependent(state: *State, dependency: *Service) -> bool {
+    var index: usize = 0
+    while index < state.*.count {
+        const candidate = config.serviceAt(state, index)
+        if candidate.*.pid > 0 && namesDependency(candidate, config.name(dependency)) { return true }
+        index += 1
+    }
+    return false
+}
+
+fn stopDeadline(service: *Service) -> void {
+    if service.*.pid <= 0 || service.*.state != config.STOPPING || service.*.killed { return }
+    if now() - service.*.stoppingSince >= service.*.stopTimeout {
+        const sent = linux.kill(0 - service.*.pid, linux.SIGKILL)
+        service.*.killed = true
+        config.sayAbout(service, "did not stop in time, killed", false, 0)
+    }
+}
+
+// Stops every service for shutdown in dependency phases. A service is sent
+// SIGTERM only after all live services that name it in `after` have exited;
+// each selected service is reaped before its dependency is considered.
 pub fn stopAll(state: *State) -> void {
     const began = now()
     var index: usize = 0
     while index < state.*.count {
-        config.serviceAt(state, index).*.wanted = false
+        const service = config.serviceAt(state, index)
+        service.*.wanted = false
+        if service.*.pid == 0 && (service.*.state == config.WAITING || service.*.state == config.RESTARTING) { service.*.state = config.STOPPED }
         index += 1
     }
-    // The most recently started first.
-    var remaining = true
-    while remaining {
-        remaining = false
+    while anyRunning(state) && now() - began < 60000 {
         var latest: usize = 0
-        var pick: usize = 0
+        var pick: ?*Service = null
         index = 0
         while index < state.*.count {
             const service = config.serviceAt(state, index)
-            if service.*.pid > 0 && service.*.state != config.STOPPING && service.*.order >= latest {
+            if service.*.pid > 0 && !hasRunningDependent(state, service) && service.*.order >= latest {
                 latest = service.*.order
-                pick = index
-                remaining = true
+                pick = service
             }
             index += 1
         }
-        if remaining { terminate(config.serviceAt(state, pick), began) }
+        // A dependency cycle has no leaf. Break it deterministically by
+        // stopping the most recently started member, then continue normally.
+        if pick == null {
+            index = 0
+            while index < state.*.count {
+                const service = config.serviceAt(state, index)
+                if service.*.pid > 0 && service.*.order >= latest {
+                    latest = service.*.order
+                    pick = service
+                }
+                index += 1
+            }
+            if pick == null {
+                // Only relays are left; let them drain their pipes before
+                // the init exits and loses the last log records.
+                linux.sleepMilliseconds(50)
+                reapAll(state)
+                continue
+            }
+            config.say("dependency cycle while stopping services; breaking it by start order")
+        }
+        const selected = pick.?
+        if selected.*.state != config.STOPPING { terminate(selected, now()) }
+        while selected.*.pid > 0 && now() - began < 60000 {
+            stopDeadline(selected)
+            linux.sleepMilliseconds(50)
+            reapAll(state)
+        }
+        while selected.*.loggerPid > 0 && now() - began < 60000 {
+            linux.sleepMilliseconds(50)
+            reapAll(state)
+        }
     }
-    while anyRunning(state) && now() - began < 60000 {
-        linux.sleepMilliseconds(50)
-        reapAll(state)
-        tick(state)
+    // The minute-wide bound is a last-resort safety valve. Do not leave
+    // service groups behind when mlx-init itself is not PID 1.
+    if anyRunning(state) {
+        index = 0
+        while index < state.*.count {
+            const service = config.serviceAt(state, index)
+            if service.*.pid > 0 { const sent = linux.kill(0 - service.*.pid, linux.SIGKILL) }
+            if service.*.loggerPid > 0 { const sentLogger = linux.kill(service.*.loggerPid, linux.SIGKILL) }
+            index += 1
+        }
+        var waited: usize = 0
+        while anyRunning(state) && waited < 2000 {
+            linux.sleepMilliseconds(50)
+            reapAll(state)
+            waited += 50
+        }
     }
 }

@@ -458,13 +458,18 @@ the README describes ("mandatory LIR canonicalization, constant and branch
 folding, local load forwarding, stack-slot promotion and dead-code
 elimination"). It runs a fixed sequence — function-level dead-code
 elimination (`function_dce.mlx`), constant folding, local-load forwarding,
-copy propagation, a second constant-folding pass (to catch constants
+single-store promotion (`single_store.mlx`: a local one store writes and
+nothing else touches is read as the stored value wherever that store
+dominates the load, after `dominance.mlx` builds the blocks and their
+dominator tree, so a `const` binding in a loop body read in later blocks
+of the pass needs no frame slot), copy propagation, a second
+constant-folding pass (to catch constants
 exposed by the first), post-terminator dead-code elimination
 (`control_flow_dce.mlx`), comparison-branch fusion, stack-slot promotion,
 and generic dead-instruction elimination — and returns a `Result` record
 whose fields are exactly the counters the driver reports as metrics
 (`constantsFolded`, `branchesSimplified`, `comparisonBranchesFused`,
-`loadsForwarded`, `copiesPropagated`, `localsPromoted`,
+`loadsForwarded`, `singleStoreLoads`, `copiesPropagated`, `localsPromoted`,
 `storesEliminated`, `functionsEliminated`, ...). `optimize.run` is called
 unconditionally from the pipeline regardless of `-O` level — the
 optimization-level distinction in this compiler lives in the inliner
@@ -726,8 +731,40 @@ the locals live through calls. The compiler builds itself with 3,602
 locals held so (`locals kept in registers`); a nested loop of 300 million
 passes runs about 5% faster, the rest of its time still going to the
 frame slot every intermediate value takes
-(`tests/339_register_locals_runtime.mlx`). The aarch64 backend does not
-look at the mark yet and keeps such slots in the frame.
+(`tests/339_register_locals_runtime.mlx`). The aarch64 backend keeps them
+in x19, x20 and x21, which AAPCS64 callees keep as well: the frame grows
+by four words, the prologue stores the registers it uses at the bottom of
+the frame, every return loads them back before `mov sp, x29`
+(`encoder.emitSaveRegisters`, `emitEpilogue`), a load stores the register
+into the result's slot and a store loads the value straight into it.
+
+**Values kept out of the frame** (x86_64, `codegen/state.mlx`). An
+integer constant that fits in 32 bits is not written to a frame slot
+where it is made: a reader takes it as an immediate (`cmp rbx, 1000`,
+`add rax, 1`), and a read through the slot writes it there first. A
+whole-word load of a local kept in a register is left out as well: its
+readers take the register itself (`xor rax, rbx`, `mov [rbp-16], r12`).
+That holds while the register keeps the loaded value, so before a store
+into the register, and before the load's block ends (a label, a branch or
+a return), a load that an instruction further on still reads goes to its
+slot (`ir/operands.mlx` finds each value's last reader). `x = x + y`
+with x in a register, when the store is the sum's only reader, becomes one
+instruction on the register (`add rbx, 1`, `Arithmetic.emitInPlace`).
+The compiler keeps 49,875 values out of the frame when it builds itself
+and updates 643 locals in place (`backend values kept out of the frame`,
+`backend locals updated in place`); it compiles itself with 16% fewer
+instructions (4.73 to 3.97 billion) into a binary 15% smaller, and the
+nested loop of 300 million passes runs in 0.10 s instead of 0.75 s
+(`tests/341_values_out_of_frame_runtime.mlx` covers a local read after it
+changed, across blocks and through calls).
+
+**Field accesses with a displacement** (x86_64, `Memory.emitGep`). A
+`gep` whose index is a constant and whose only reader is the load or
+store right after it is not computed: that access takes the offset as its
+displacement (`mov rax, [rbx + 0x18]`, `mov [rcx + 8], rax`), and a frame
+slot narrower than a word is read and written in place (`movzx rax, byte
+[rbp - 0x88]`). With single-store promotion this brought the compiler's
+own build to 3.08 billion instructions and its binary to 1.45 MB.
 
 Between Mlx functions a value of several words comes back a word per
 register: `rax`, `rdx`, `rcx`, `r8`, `r9`, `r10`, `r11`, `rsi`, `rdi`

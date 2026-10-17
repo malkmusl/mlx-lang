@@ -22,7 +22,7 @@ pub const Memory = struct {
             lir_module.Opcode.addr => { Self.emitAddress(state, index, instruction) },
             lir_module.Opcode.alloca => { Self.emitAlloca(state, index, instruction) },
             lir_module.Opcode.gep => { Self.emitGep(state, index, instruction) },
-            lir_module.Opcode.store => { Self.emitStore(state, instruction) },
+            lir_module.Opcode.store => { Self.emitStore(state, index, instruction) },
             lir_module.Opcode.load => { Self.emitLoad(state, index, instruction) },
             lir_module.Opcode.copy => { Self.emitCopy(state, index, instruction) },
             lir_module.Opcode.cast => { Self.emitCast(state, index, instruction) },
@@ -43,7 +43,9 @@ pub const Memory = struct {
     }
 
     fn emitConstant(state: *state_module.State, index: usize, instruction: lir_module.Inst) -> void {
-        state_module.State.storeImmediateResult(state, index, @bitCast(i64, @intCast(u64, instruction.arg0)))
+        const value = @bitCast(i64, @intCast(u64, instruction.arg0))
+        if state_module.State.deferConstant(state, index, value) { return }
+        state_module.State.storeImmediateResult(state, index, value)
     }
 
     fn emitAddress(state: *state_module.State, index: usize, instruction: lir_module.Inst) -> void {
@@ -165,7 +167,23 @@ pub const Memory = struct {
         state_module.State.storeRaxResult(state, index)
     }
 
+    // base + index * arg2. With a constant index the offset is an
+    // immediate, and a load or store right after that is the only reader
+    // takes it as its displacement ([base + offset]).
     fn emitGep(state: *state_module.State, index: usize, instruction: lir_module.Inst) -> void {
+        const offset = Self.constantOffset(state, instruction)
+        if offset.0 {
+            if Self.addressesNext(state, index) {
+                state.*.fusedGep = index
+                state.*.fusedOffset = offset.1
+                state.*.fusedAddressCount += 1
+                return
+            }
+            state_module.State.loadOp(state, target.Register.rax, instruction.arg0)
+            if offset.1 != 0 { encoder.emitAluImm(state.*.enc, target.Register.rax, offset.1, 0, 0x05) }
+            state_module.State.storeRaxResult(state, index)
+            return
+        }
         state_module.State.loadOp(state, target.Register.rcx, instruction.arg1)
         state_module.State.loadOp(state, target.Register.rax, instruction.arg0)
         if instruction.arg2 == 0 {
@@ -180,9 +198,50 @@ pub const Memory = struct {
         state_module.State.storeRaxResult(state, index)
     }
 
-    fn emitStore(state: *state_module.State, instruction: lir_module.Inst) -> void {
+    fn constantOffset(state: *state_module.State, instruction: lir_module.Inst) -> (bool, i32) {
+        if instruction.arg2 == 0 { return -> (true, 0) }
+        const value = state_module.State.constantValue(state, instruction.arg1)
+        if !value.0 || instruction.arg2 > 2147483647 { return -> (false, 0) }
+        const offset = value.1 * @intCast(i64, instruction.arg2)
+        if offset < -2147483648 || offset > 2147483647 { return -> (false, 0) }
+        return -> (true, @intCast(i32, offset))
+    }
+
+    // Whether the instruction after the gep at `index` is a load from it
+    // or a store into it, and reads it last.
+    fn addressesNext(state: *state_module.State, index: usize) -> bool {
+        if index + 1 >= lir_module.instCount(state.*.lir) || state.*.lastUse[index] != index + 1 { return false }
+        const next = lir_module.getInst(state.*.lir, index + 1)
+        if next.opcode == lir_module.Opcode.load { return next.arg0 == index }
+        return next.opcode == lir_module.Opcode.store && next.arg0 == index && next.arg1 != index
+    }
+
+    // The register holding a fused gep's base: the base's own register
+    // when it is a lazy load of a local, else `scratch` loaded with it.
+    fn fusedBase(state: *state_module.State, scratch: target.Register) -> target.Register {
+        const gep = lir_module.getInst(state.*.lir, state.*.fusedGep)
+        const held = state_module.State.lazyRegister(state, gep.arg0)
+        if held.0 { return held.1 }
+        state_module.State.loadOp(state, scratch, gep.arg0)
+        return scratch
+    }
+
+    fn emitStore(state: *state_module.State, index: usize, instruction: lir_module.Inst) -> void {
+        if state.*.storeDone == index { return }
+        if instruction.arg0 == state.*.fusedGep && instruction.arg0 != lir_module.NONE {
+            const width = if instruction.arg2 == lir_module.NONE { 8 } else { instruction.arg2 }
+            const base = Self.fusedBase(state, target.Register.rcx)
+            var source = target.Register.rax
+            const held = state_module.State.lazyRegister(state, instruction.arg1)
+            if held.0 { source = held.1 } else { state_module.State.loadOp(state, target.Register.rax, instruction.arg1) }
+            encoder.emitStoreDisplaced(state.*.enc, base, state.*.fusedOffset, source, width)
+            state.*.fusedGep = lir_module.NONE
+            return
+        }
         const home = lir_module.registerHome(state.*.lir, instruction.arg0)
         if home != 0 {
+            // Loads of the old value read later take it to their slots.
+            state_module.State.spillLazy(state, index, home)
             state_module.State.loadOp(state, state_module.State.homeRegister(home), instruction.arg1)
             return
         }
@@ -192,13 +251,23 @@ pub const Memory = struct {
             state_module.State.dropPending(state, instruction.arg0)
             const width = if instruction.arg2 == lir_module.NONE { 8 } else { instruction.arg2 }
             if width == 8 {
+                const held = state_module.State.lazyRegister(state, instruction.arg1)
+                if held.0 {
+                    encoder.emitMovMemReg(state.*.enc, frame.1, held.1)
+                    return
+                }
+                const immediate = state_module.State.takeImmediate32(state, instruction.arg1)
+                if immediate.0 {
+                    encoder.emitMovMemImm32(state.*.enc, frame.1, immediate.1)
+                    return
+                }
                 state_module.State.loadOp(state, target.Register.rax, instruction.arg1)
                 encoder.emitMovMemReg(state.*.enc, frame.1, target.Register.rax)
                 return
             }
+            // A narrower store: mov byte [rbp + slot], al and so on.
             state_module.State.loadOp(state, target.Register.rax, instruction.arg1)
-            encoder.emitLeaRegMem(state.*.enc, target.Register.rcx, frame.1)
-            encoder.emitStorePointer(state.*.enc, target.Register.rcx, target.Register.rax, width)
+            encoder.emitStoreDisplaced(state.*.enc, target.Register.rbp, 0 - frame.1, target.Register.rax, width)
             return
         }
         state_module.State.loadOp(state, target.Register.rcx, instruction.arg0)
@@ -207,8 +276,18 @@ pub const Memory = struct {
     }
 
     fn emitLoad(state: *state_module.State, index: usize, instruction: lir_module.Inst) -> void {
+        if instruction.arg0 == state.*.fusedGep && instruction.arg0 != lir_module.NONE {
+            const width = if instruction.arg1 == lir_module.NONE { 8 } else { instruction.arg1 }
+            const base = Self.fusedBase(state, target.Register.rax)
+            encoder.emitLoadDisplaced(state.*.enc, target.Register.rax, base, state.*.fusedOffset, width, instruction.arg2 == 1)
+            state.*.fusedGep = lir_module.NONE
+            state_module.State.storeRaxResult(state, index)
+            return
+        }
         const home = lir_module.registerHome(state.*.lir, instruction.arg0)
         if home != 0 {
+            // Read from the register where it is used, if that can wait.
+            if state_module.State.deferRegisterLoad(state, index) { return }
             encoder.emitMovRegReg(state.*.enc, target.Register.rax, state_module.State.homeRegister(home))
             state_module.State.storeRaxResult(state, index)
             return
@@ -223,8 +302,11 @@ pub const Memory = struct {
             return
         }
         if frame.0 {
+            // A narrower load: movzx rax, byte [rbp + slot] and so on.
             state_module.State.dropPending(state, instruction.arg0)
-            encoder.emitLeaRegMem(state.*.enc, target.Register.rax, frame.1)
+            encoder.emitLoadDisplaced(state.*.enc, target.Register.rax, target.Register.rbp, 0 - frame.1, width, instruction.arg2 == 1)
+            state_module.State.storeRaxResult(state, index)
+            return
         } else {
             state_module.State.loadOp(state, target.Register.rax, instruction.arg0)
         }
