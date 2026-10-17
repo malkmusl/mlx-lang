@@ -1115,7 +1115,21 @@ is not ends the client. `wp_presentation` version 1
 content reached the screen: presented with the time on the monotonic
 clock, the output's refresh period and the frame's number (vsync when
 the frame came from a DRM page flip), or discarded when another commit
-replaced it before a frame showed it or the surface showed nothing. A
+replaced it before a frame showed it or the surface showed nothing.
+
+A window may belong to another (`xdg_toplevel.set_parent`,
+[`dialogs.mlx`](dialogs.mlx)): such a dialog opens centred over its
+parent, on the parent's workspace and outside the tiling, and comes up
+with it whenever the parent is focused. `xdg_wm_dialog_v1` version 1
+(xdg-dialog) makes one modal (`dialog: modal TITLE`): focusing the parent,
+by a click, the dock or a hotkey, gives the keyboard to the dialog, as
+GNOME does. A window cannot be its own parent or its dialog's
+(`invalid_parent`); when a parent goes, its dialogs belong to its own
+parent. `wp_tearing_control_manager_v1` and `wp_content_type_manager_v1`
+version 1 ([`hints.mlx`](hints.mlx)) take what a client says of its
+surface: that a game's frames may tear (`tearing: async TITLE`; frames
+are still shown at the vertical blank, which the protocol allows) and
+whether it shows a photo, a video or a game (`content: video TITLE`). A
 greeter compositor offers none of these.
 Composition is done in software, or with Vulkan (`--renderer vulkan`).
 
@@ -1672,7 +1686,8 @@ finished`.
   with the buffer: copied or held, cropped and scaled by a viewport),
   `viewport.mlx` (viewporter, fractional-scale, single-pixel-buffer),
   `presentation.mlx` (presentation feedback), `data_control.mlx`
-  (clipboard tools),
+  (clipboard tools), `dialogs.mlx` (windows of windows, modal dialogs),
+  `hints.mlx` (tearing and content-type hints),
   `launching.mlx` (launching programs) and `lock.mlx` (the session lock,
   logging out).
 - `dmabuf.mlx`: linux-dmabuf; each dma-buf becomes a one-buffer pool.

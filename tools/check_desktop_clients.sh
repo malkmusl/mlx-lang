@@ -1292,6 +1292,50 @@ PY
     grep -q "^viewport-test: feedback 1 discarded$" "$log" || fail "presentation: content replaced before a frame was not discarded" "$log"
     grep -q "^viewport-test: feedback 2 presented (refresh 16666666 ns)$" "$log" || fail "presentation: the shown content was not presented with the refresh period" "$log"
     echo "ok   presentation feedback: content replaced unseen is discarded, the shown content presented on the monotonic clock"
+    # Dialogs (dialogs.mlx): the window's modal 120 x 60 dialog opens
+    # centred over its 160 x 80 (at 44, 34), takes the keyboard and keeps
+    # it when the window is clicked beside it, and stays above it; alike
+    # on the CPU and the GPU. The window's hints (hints.mlx) are logged.
+    for renderer in cpu vulkan; do
+        printf 'wait 2500\nshot %s\npointer 30 100\npress 272\nrelease 272\nwait 600\nshot %s\nclose\n' "$work/dialog-open-$renderer.ppm" "$work/dialog-clicked-$renderer.ppm" > "$work/viewport-dialog-$renderer.script"
+        solo_run "viewport-dialog-$renderer" "$renderer" "$work/viewport-test dialog"
+        log="$work/viewport-dialog-$renderer.log"
+        grep -q "^dialog: modal Viewport Dialog$" "$log" || fail "dialogs ($renderer): the dialog was not made modal" "$log"
+        grep -q "^window: 120x60 at 44,34$" "$log" || fail "dialogs ($renderer): the dialog did not open centred over its window" "$log"
+        [[ $(grep "^focus: " "$log" | tail -1) == "focus: Viewport Dialog" ]] || fail "dialogs ($renderer): clicking the window took the keyboard from its modal dialog" "$log"
+        grep -q "^content: video Viewport Test$" "$log" || fail "hints ($renderer): the content type was not taken" "$log"
+        grep -q "^tearing: async Viewport Test$" "$log" || fail "hints ($renderer): the tearing hint was not taken" "$log"
+    done
+    python3 - "$work" <<'PY' || fail "dialogs: the dialog does not look right" "$work/viewport-dialog-cpu.log"
+import sys
+def load(path):
+    data = open(path, 'rb').read()
+    header, size, depth, pixels = data.split(b'\n', 3)
+    return tuple(map(int, size.split())), pixels
+work = sys.argv[1]
+for when in ("open", "clicked"):
+    (width, height), cpu = load(f"{work}/dialog-{when}-cpu.ppm")
+    _, gpu = load(f"{work}/dialog-{when}-vulkan.ppm")
+    assert cpu == gpu, f"{when}: the CPU and the GPU differ"
+    def at(x, y): return tuple(cpu[(y * width + x) * 3:(y * width + x) * 3 + 3])
+    # The dialog's orange-red over the window's cyan, the window still
+    # beside it, the dialog's frame in the focus colour.
+    assert at(104, 64) == (255, 68, 0), (when, at(104, 64))
+    assert at(30, 60) == (0, 255, 255), (when, at(30, 60))
+    assert at(43, 50) == (90, 160, 255), (when, at(43, 50))
+PY
+    echo "ok   a modal dialog opens centred over its window, keeps the keyboard when the window is clicked and stays above it, alike on the CPU and the GPU"
+    echo "ok   the content-type and tearing-control hints are taken"
+    for mode in selfparent twodialogs; do
+        printf 'wait 2000\nclose\n' > "$work/viewport-$mode.script"
+        solo_run "viewport-$mode" cpu "$work/viewport-test $mode"
+        case $mode in
+            selfparent) expected=1 ;;
+            twodialogs) expected=0 ;;
+        esac
+        grep -q "^viewport-test: error $expected$" "$work/viewport-$mode.log" || fail "dialogs: the $mode case did not end the client with error $expected" "$work/viewport-$mode.log"
+    done
+    echo "ok   a window named its own parent and a second dialog object of one window end the client"
 }
 
 # Clipboard tools (data_control.mlx): wl-copy and wl-paste, which speak
