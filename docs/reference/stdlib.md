@@ -132,7 +132,16 @@ key (Linux key code, modifiers, the text it types and the text without
 Control and Alt) as xterm does; `std.terminal.pty` runs a program on a
 pseudo-terminal. `std.ui.terminal` draws a screen on a `std.ui` canvas with
 the monospaced font of `std.ui.text` and handles its keys and wheel, for
-`projects/desktop/terminal` and any app with a terminal pane. A
+`projects/desktop/terminal` and any app with a terminal pane, and draws
+its selection (`selectionRange()`; lines counted from the history's
+oldest through `lineCell()`). `std.ui.terminal_input` makes the
+selection from the pointer (`press()`, `motion()`, `release()`: cells,
+words, lines, Shift to extend; `follow()` after output keeps it on its
+lines), gives its text (`selectedText()`), reports the pointer to
+programs that asked (X10 or SGR, `wheel()` sends arrows on the alternate
+screen), filters pastes (`filterPaste()`: no escape or other controls,
+line ends as CR; `pasteBegin()`/`pasteEnd()` for bracketed paste) and
+quotes dropped files' paths for a shell (`quotedPaths()`). A
 `std.ui.host` app watches a descriptor (the pty) with `watchDescriptor()`
 and gets `EVENT_WATCH`; `plainTyped()` is the key's text without Control
 and Alt. Without a compositor the same screen and drawing run on the

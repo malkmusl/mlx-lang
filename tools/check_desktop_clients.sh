@@ -42,6 +42,9 @@
 #     bottom edge brings the hidden dock up and drops on its trash; an X
 #     window (xev) whose frame ends on the row above the dock's bar
 #     leaves it, one a row taller hides it;
+#   - in the terminal, copies a triple-clicked line and pastes it back
+#     (bracketed), exchanges text with wl-copy and wl-paste (an escape in
+#     a paste goes) and types two dropped files as quoted paths;
 #   - with dock-workspaces = on, groups the apps that run by workspace
 #     after the pinned ones (a window moved to workspace 2, one on 1, the
 #     pinned terminal's moved to 3 makes no group) and a click on the app
@@ -750,6 +753,110 @@ SCRIPT
     [[ "$(grep "^mlx-dock: by workspace: [0-9]\|^workspace: " "$log" | tr '\n' ',')" == "mlx-dock: by workspace: 1, 1 shown,mlx-dock: by workspace: 2, 1 shown,mlx-dock: by workspace: 1 2, 1 shown,workspace: 2,mlx-dock: by workspace: 1 2, 2 shown," ]] || fail "dock workspaces: the dock did not group the apps by workspace ($(grep "^mlx-dock: by\|^workspace: \|^moved" "$log" | tr '\n' ' '))" "$log"
     echo "ok   dock-workspaces = on groups the apps that run by workspace after the pinned ones"
     echo "ok   a click on an app of another workspace's group brings that workspace"
+}
+
+# The terminal's clipboard and drops (std.ui.terminal_input), with cat -v
+# behind bracketed paste writing what it gets to a file: a line typed and
+# selected with a triple click is copied (Ctrl+Shift+C) and pasted back
+# (Ctrl+Shift+V), wl-paste reads it, a text wl-copy put up with an escape
+# in it is pasted without the escape, and two files dropped from the drag
+# source come as quoted paths.
+terminal_clipboard() {
+    if ! command -v wl-copy > /dev/null || ! command -v wl-paste > /dev/null; then
+        echo "skip terminal clipboard: wl-clipboard is not installed"
+        return
+    fi
+    cat > "$work/terminal-clients.sh" <<SCRIPT
+#!/bin/sh
+"$work/mlx-terminal" /bin/sh -c 'printf "\\033[?2004h"; stty -echo; cat -v | tee "$work/terminal-typed.txt"' &
+sleep 6
+wl-paste -n > "$work/terminal-pasted.txt"
+sleep 1
+printf 'via\\033[201~ wl-copy' | wl-copy
+sleep 2
+exec "$work/drag-source" 'file:///tmp/a%20b.txt\\nfile:///tmp/it%27s'
+SCRIPT
+    cat > "$work/terminal-clip.script" <<SCRIPT
+wait 2500
+type hello world
+enter
+wait 1000
+pointer 40 38
+wait 100
+press 272
+release 272
+wait 50
+press 272
+release 272
+wait 50
+press 272
+release 272
+wait 300
+down 29
+down 42
+mods 5
+down 46
+up 46
+mods 0
+up 42
+up 29
+wait 500
+down 29
+down 42
+mods 5
+down 47
+up 47
+mods 0
+up 42
+up 29
+wait 300
+enter
+wait 3500
+pointer 400 300
+press 272
+release 272
+wait 300
+down 29
+down 42
+mods 5
+down 47
+up 47
+mods 0
+up 42
+up 29
+wait 300
+enter
+wait 2500
+pointer 150 130
+wait 200
+press 272
+wait 100
+pointer 160 140
+wait 100
+pointer 300 250
+wait 100
+pointer 500 300
+wait 300
+pointer 505 305
+wait 500
+release 272
+wait 1000
+pointer 500 350
+press 272
+release 272
+wait 300
+enter
+wait 1000
+close
+SCRIPT
+    stack_run terminal-clip "/bin/sh $work/terminal-clients.sh"
+    local log="$work/terminal-clip.log"
+    [[ "$(cat "$work/terminal-pasted.txt" 2> /dev/null)" == "hello world" ]] || fail "terminal: wl-paste did not read the selection copied with Ctrl+Shift+C ($(cat "$work/terminal-pasted.txt" 2> /dev/null))" "$log"
+    printf '%s\n' 'hello world' '^[[200~hello world^[[201~' '^[[200~via[201~ wl-copy^[[201~' "^[[200~'/tmp/a b.txt' '/tmp/it'\\''s' ^[[201~" > "$work/terminal-expected.txt"
+    cmp -s "$work/terminal-expected.txt" "$work/terminal-typed.txt" || fail "terminal: the pastes and the drop did not come as expected ($(tr '\n' '|' < "$work/terminal-typed.txt"))" "$log"
+    echo "ok   the terminal copies a triple-clicked line and pastes it back, bracketed"
+    echo "ok   the terminal pastes from wl-copy without the escape in it, and wl-paste reads its selection"
+    echo "ok   files dropped on the terminal come as quoted paths"
 }
 
 # The top bar with a terminal, at a fixed time (2024-09-27 14:05 UTC, 16:05
@@ -1625,6 +1732,7 @@ stacks
 clipboard
 smart_dock
 dock_workspaces
+terminal_clipboard
 topbar
 topbar_bus
 control_centre
