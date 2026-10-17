@@ -28,6 +28,9 @@
 #   - then, with tools/wayland-drag-source as a file manager, drops a
 #     folder on the dock (it is pinned) and a file on the trash (it goes
 #     into it);
+#   - drops a file on a pinned folder (it is copied in), opens its stack,
+#     drags an entry onto a folder in the stack (it moves in) and another
+#     out of the stack into the file manager (it is copied there);
 #   - runs the top bar (mlx-topbar) with a terminal: the bar (with its
 #     workspace controls in the middle) is along the
 #     top and reserves it (the terminal moves below it, maximized it stays
@@ -412,6 +415,104 @@ SCRIPT
         [[ -e "$work/data/Trash/files/junk.txt" && ! -e "$work/home/junk.txt" ]] || fail "drops: gio trash did not move the file into the trash" "$work/drops.log"
         echo "ok   gio trash moved the file into \$XDG_DATA_HOME/Trash"
     fi
+}
+
+# The dock's stacks with drags: a home and a configuration of their own
+# (the terminal pinned, ~/Downloads the folder), one app running, so the
+# folder is at x 585 and the stack's cells are 92 pixels apart from x 399
+# at y 625.
+stack_run() {
+    local name=$1 client=$2 runtime status=0
+    runtime=$(mktemp -d)
+    printf '#!/bin/sh\nexec %s\n' "$client" > "$work/$name.sh"
+    chmod +x "$work/$name.sh"
+    XDG_RUNTIME_DIR=$runtime "$work/test-host" "host-$name" "$work/us.xkb" "$work/$name.script" > "$work/$name-host.log" 2>&1 &
+    local host_pid=$!
+    for _ in $(seq 1 50); do [[ -S "$runtime/host-$name" ]] && break; sleep 0.1; done
+    env -i PATH="$PATH" HOME="$work/stacks/home" XDG_RUNTIME_DIR="$runtime" WAYLAND_DISPLAY="host-$name" \
+        XDG_DATA_HOME="$work/stacks/data" XDG_DATA_DIRS="$work/none" XDG_CONFIG_HOME="$work/stacks/config" MLX_CANVAS=cpu \
+        timeout 60 "$work/mlx-compositor" --verbose --no-fps --renderer cpu --socket "nested-$name" \
+        --terminal "$work/mlx-terminal" --launcher none --dock "$work/mlx-dock" --topbar none --run "$work/$name.sh" > "$work/$name.log" 2>&1 || status=$?
+    wait "$host_pid" || fail "$name: the test host failed" "$work/$name-host.log"
+    rm -rf -- "$runtime"
+    [[ $status -eq 0 ]] || fail "$name: the compositor exited with status $status" "$work/$name.log"
+    ! grep -q "crashed" "$work/$name.log" || fail "$name: a client crashed" "$work/$name.log"
+}
+
+stacks() {
+    local home="$work/stacks/home"
+    mkdir -p "$home/Downloads/Sub" "$home/Other" "$home/Dst" "$work/stacks/config/mlx" "$work/stacks/data"
+    echo a > "$home/Downloads/a.txt"
+    echo b > "$home/Downloads/b.txt"
+    echo x > "$home/Other/x.txt"
+    touch -d '2024-03-01 10:00' "$home/Downloads/b.txt"
+    touch -d '2024-03-02 10:00' "$home/Downloads/Sub"
+    touch -d '2024-03-03 10:00' "$home/Downloads/a.txt"
+    printf 'terminal\n' > "$work/stacks/config/mlx/dock"
+    printf '~/Downloads\n' > "$work/stacks/config/mlx/dock-folders"
+    # x.txt from the drag source onto the folder.
+    cat > "$work/stack-in.script" <<SCRIPT
+wait 3000
+pointer 100 100
+wait 300
+press 272
+wait 100
+pointer 110 110
+wait 100
+pointer 300 400
+wait 100
+pointer 580 715
+wait 300
+pointer 585 728
+wait 800
+release 272
+wait 1500
+close
+SCRIPT
+    stack_run stack-in "$work/drag-source file://$home/Other/x.txt"
+    grep -q "^mlx-dock: dropped into $home/Downloads" "$work/stack-in.log" && [[ -e "$home/Downloads/x.txt" && -e "$home/Other/x.txt" ]] || fail "stacks: a file dropped on a pinned folder was not copied into it" "$work/stack-in.log"
+    echo "ok   a file dropped on a pinned folder in the dock is copied into it"
+    # Newest first: x.txt, a.txt, Sub, b.txt. a.txt onto Sub, then (the
+    # stack read again: Sub, x.txt, b.txt) b.txt into the file manager.
+    touch -d '2024-03-04 10:00' "$home/Downloads/x.txt"
+    cat > "$work/stack-out.script" <<SCRIPT
+wait 3500
+pointer 585 728
+wait 300
+press 272
+release 272
+wait 1500
+pointer 492 625
+wait 300
+press 272
+wait 100
+pointer 482 625
+wait 100
+pointer 584 625
+wait 100
+pointer 584 625
+wait 600
+release 272
+wait 1500
+pointer 583 625
+wait 300
+press 272
+wait 100
+pointer 570 615
+wait 100
+pointer 400 400
+wait 100
+pointer 300 300
+wait 600
+release 272
+wait 1500
+close
+SCRIPT
+    stack_run stack-out "$work/mlx-files $home/Dst"
+    [[ -e "$home/Downloads/Sub/a.txt" && ! -e "$home/Downloads/a.txt" ]] || fail "stacks: an entry dragged onto a folder in the stack did not move into it ($(ls "$home/Downloads" | tr '\n' ' '))" "$work/stack-out.log"
+    echo "ok   an entry dragged onto a folder in the dock's stack moves into it"
+    grep -q "^drag: dropped on Dst" "$work/stack-out.log" && [[ -e "$home/Dst/b.txt" && -e "$home/Downloads/b.txt" ]] || fail "stacks: an entry dragged out of the stack was not copied into the file manager's folder ($(ls "$home/Dst" | tr '\n' ' '))" "$work/stack-out.log"
+    echo "ok   an entry dragged out of the dock's stack is copied where the file manager shows"
 }
 
 # The top bar with a terminal, at a fixed time (2024-09-27 14:05 UTC, 16:05
@@ -1283,6 +1384,7 @@ PY
 }
 
 drops
+stacks
 topbar
 topbar_bus
 control_centre
