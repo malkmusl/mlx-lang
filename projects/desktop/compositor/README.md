@@ -261,6 +261,20 @@ while a window of the workspace shown (its frame and title bar) overlaps
 the dock's bar, and comes back by itself once no window does (`dock:
 nothing in its way` in the log).
 
+With `dock-workspaces = on` (mlx-settings: General, Dock, "Group by
+workspace"; off by default) the dock groups the apps that run by the
+workspace their windows are on: after the pinned apps, which stay as
+they are, comes a group per workspace with windows, the first workspace
+first, each behind a separator that carries the workspace's number like
+the top bar's buttons (the one shown lit). An app with windows on two
+workspaces is in both groups; a click on it brings its window on that
+workspace (and so that workspace), its previews and "Close" take only
+those windows. The foreign-toplevel protocol says nothing of
+workspaces, so the compositor tells the dock on its socket pair: `w`,
+whether to group, the workspace shown, a count and per window the
+dock's handle object id (u32) and its workspace (u8), sent whenever any
+of it changed.
+
 The top bar (`mlx-topbar`, `--topbar PROGRAM|none`, started and kept
 running like the dock over `MLX_TOPBAR_FD`) sits in the top layer along
 the top edge, 30 pixels high with an exclusive zone, as the menu bar of
