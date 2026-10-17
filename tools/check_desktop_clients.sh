@@ -38,7 +38,8 @@
 #     (when wl-clipboard is installed);
 #   - with dock-autohide = smart, keeps the dock while a small window is
 #     elsewhere, hides it while the window is maximized over it, and
-#     brings it back once the window is restored;
+#     brings it back once the window is restored; a file dragged to the
+#     bottom edge brings the hidden dock up and drops on its trash;
 #   - runs the top bar (mlx-topbar) with a terminal: the bar (with its
 #     workspace controls in the middle) is along the
 #     top and reserves it (the terminal moves below it, maximized it stays
@@ -635,12 +636,46 @@ wait 2500
 close
 SCRIPT
     stack_run smart-dock "$work/drag-source file:///nothing"
+    # Hidden under the maximized window, a drag to the bottom edge brings
+    # it up, and the file goes onto its trash.
+    echo junk > "$work/stacks/home/Other/edge.txt"
+    cat > "$work/smart-drop.script" <<SCRIPT
+wait 3000
+pointer 100 100
+wait 200
+press 272
+release 272
+wait 800
+down 125
+down 103
+up 103
+up 125
+wait 1500
+pointer 500 400
+wait 200
+press 272
+wait 100
+pointer 510 410
+wait 100
+pointer 520 600
+wait 100
+pointer 525 767
+wait 1500
+pointer 640 760
+wait 500
+release 272
+wait 1500
+close
+SCRIPT
+    stack_run smart-drop "$work/drag-source file://$work/stacks/home/Other/edge.txt"
     rm -f -- "$work/stacks/config/mlx/compositor.conf"
+    [[ "$(grep -o "^dock: hidden\|^drag: started\|^dock: shown\|^mlx-dock: moved to the trash" "$work/smart-drop.log" | tr '\n' ',')" == "dock: hidden,drag: started,dock: shown,mlx-dock: moved to the trash," ]] || fail "smart dock: a drag to the bottom edge did not bring the hidden dock up to drop on ($(grep "^dock:\|^drag:\|^mlx-dock: moved" "$work/smart-drop.log" | tr '\n' ' '))" "$work/smart-drop.log"
     local log="$work/smart-dock.log"
     grep -q "dock autohide smart" "$log" || fail "smart dock: the compositor did not take dock-autohide = smart" "$log"
     # Hidden only after the window was maximized, back after it was not.
     [[ "$(grep -o "^maximize: \|^dock: hidden\|^restore: \|^dock: nothing in its way" "$log" | tr '\n' ',')" == "maximize: ,dock: hidden,restore: ,dock: nothing in its way," ]] || fail "smart dock: the dock did not hide only while the maximized window covered it ($(grep "^maximize\|^restore\|^dock:" "$log" | tr '\n' ' '))" "$log"
     echo "ok   dock-autohide = smart hides the dock only while a window is in its way"
+    echo "ok   a file dragged to the bottom edge brings the hidden dock up and drops on its trash"
 }
 
 # The top bar with a terminal, at a fixed time (2024-09-27 14:05 UTC, 16:05

@@ -252,8 +252,10 @@ for MLX Observatory.
 With `dock-autohide = on` (mlx-settings: "Always hide") the dock
 reserves no space, so maximized windows reach the bottom edge. It slides
 out of sight once the pointer has been away from it for 0.6 seconds and
-back up when the pointer touches the output's bottom edge; it stays while
-its previews show or a button is held. With `dock-autohide = smart`
+back up when the pointer touches the output's bottom edge (a drag too,
+so files can be dropped on it); it stays while its previews show, its
+menu or a folder's stack is open, or a button is held. With
+`dock-autohide = smart`
 ("Hide when a window is in the way") it does the same, but only goes
 while a window of the workspace shown (its frame and title bar) overlaps
 the dock's bar, and comes back by itself once no window does (`dock:
