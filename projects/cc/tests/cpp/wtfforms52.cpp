@@ -1,4 +1,4 @@
-// Overloads alike but for derived-to-base conversions: the nearer base wins (AtomString(UniquedStringImpl *) over AtomString(StringImpl *) for a SymbolImpl *)
+// Overloads alike but for derived-to-base conversions: the nearer base wins (AtomString(UniquedStringImpl *) over AtomString(StringImpl *) for a SymbolImpl *), a base pointer over void *; promotions, conversions, templates
 #include <stdio.h>
 
 namespace p_derivrank {
@@ -46,8 +46,31 @@ int run() {
 }
 }
 
+namespace p_ovl {
+struct Base2 {}; struct Derived2 : Base2 {};
+static int a(long) { return 1; } static int a(double) { return 2; }
+static int b(void *) { return 1; } static int b(bool) { return 2; }
+static int c(Base2 *) { return 1; } static int c(void *) { return 2; }
+static int d(int &) { return 1; } static int d(const int &) { return 2; }
+static int e(const char *) { return 1; } static int e(bool) { return 2; }
+template <class T> static int f(T) { return 1; } static int f(int) { return 2; }
+template <class T> static int g(T) { return 1; } template <class T> static int g(T *) { return 2; }
+static int h(int) { return 1; } static int h(long) { return 2; }
+static int i(char) { return 1; } static int i(int) { return 2; }
+static int j(float) { return 1; } static int j(double) { return 2; }
+static int k(const Base2 &) { return 1; } static int k(const void *) { return 2; }
+static int l(Base2 &) { return 1; } static int l(Derived2 &) { return 2; }
+static int m(unsigned) { return 1; } static int m(long long) { return 2; }
+int run() {
+    int x = 0; const int cx = 0; Derived2 dd; int arr[2]; short s = 1; float fl = 1;
+    printf("%d %d %d %d%d %d %d %d %d %d %d %d %d %d %d\n", a(1.0f), b(&x), c(&dd), d(x), d(cx), e("s"), f(1), g(&x), h(s), i('c'), j(fl), k(dd), l(dd), m(5u), b(arr));
+    return 0;
+}
+}
+
 int main() {
     p_derivrank::run();
     p_atomstr::run();
+    p_ovl::run();
     return 0;
 }
