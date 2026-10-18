@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Writes projects/libc/x87_long.mlx from tools/libc/x87_long.s: the bytes
+"""Writes compiler/libc/x87_long.mlx from tools/libc/x87_long.s: the bytes
 of the long double functions (assembled with GNU as, position
 independent: nothing in them refers outside) and the names with their
 offsets and sizes, for mlxlibc's loader to put in a page and bind.
 
-    python3 tools/libc/gen_x87.py > projects/libc/x87_long.mlx
+    python3 tools/libc/gen_x87.py > compiler/libc/x87_long.mlx
 """
 import os
 import subprocess

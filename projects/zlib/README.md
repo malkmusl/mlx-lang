@@ -14,7 +14,7 @@ programs.
 The interface is written once, in Mlx: the modules of `api/` declare the
 types, constants, functions and macros C sees (`deflateInit`,
 `inflateInit2`, the `Z_` constants, `z_stream`, and zconf.h's `FAR`,
-`OF`, `z_const`...). `mlx-cheaders` (projects/cc) makes the C headers of
+`OF`, `z_const`...). `mlx-cheaders` (compiler/cc) makes the C headers of
 them into `mlx-out/include/mlx-zlib/`; there are no headers written by
 hand.
 

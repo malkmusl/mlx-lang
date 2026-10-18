@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# mlx-glib, GLib, GObject and GIO with GLib's C API in Mlx (projects/glib):
+# mlx-glib, GLib, GObject and GIO with GLib's C API in Mlx (compiler/capi/glib):
 #
 #   - `./mlx build glib` builds the library (libmlxglib.so) and the
 #     headers: mlx-cheaders makes mlx-out/include/mlx-glib/**/*.h of the
-#     API's Mlx modules (projects/glib/api);
+#     API's Mlx modules (compiler/capi/glib/api);
 #   - every function the headers declare is in the library;
 #   - the headers in C and C++: glib.h, glib-object.h, glib-unix.h,
 #     glib/gstdio.h, gio/gio.h and gobject/gvaluecollector.h together;
@@ -44,7 +44,7 @@ library=mlx-out/lib/libmlxglib.so
 echo "ok   ./mlx build glib"
 
 # Every `pub extern("c") fn` of the API modules is defined by the library.
-grep -ho 'pub extern("c") fn [A-Za-z0-9_]*' projects/glib/api/*.mlx | awk '{print $4}' | sort -u > "$work/declared"
+grep -ho 'pub extern("c") fn [A-Za-z0-9_]*' compiler/capi/glib/api/*.mlx | awk '{print $4}' | sort -u > "$work/declared"
 nm -D --defined-only "$library" | awk '{print $NF}' | sort -u > "$work/defined"
 comm -23 "$work/declared" "$work/defined" > "$work/missing"
 [ ! -s "$work/missing" ] || { cat "$work/missing"; fail "functions the headers declare are not in the library"; }
@@ -63,11 +63,11 @@ echo "ok   the headers together in C and C++"
 
 mkdir -p "$work/run"
 for test in strings mainloop variant uri gobject system gio collect options network; do
-    cc "projects/glib/tests/$test.c" -o "$work/$test" "$library" || fail "tests/$test.c does not build"
+    cc "compiler/capi/glib/tests/$test.c" -o "$work/$test" "$library" || fail "tests/$test.c does not build"
     status=0
     (cd "$work/run" && run "$work/$test") > "$work/$test.out" 2> "$work/$test.err" || status=$?
     echo "exit $status" >> "$work/$test.out"
-    diff -u "projects/glib/tests/$test.expected" "$work/$test.out" || { cat "$work/$test.err"; fail "tests/$test.c prints otherwise"; }
+    diff -u "compiler/capi/glib/tests/$test.expected" "$work/$test.out" || { cat "$work/$test.err"; fail "tests/$test.c prints otherwise"; }
     echo "ok   tests/$test.c"
 done
 
@@ -84,7 +84,7 @@ else
     {
         echo '#ifndef CMAKECONFIG_H'
         echo '#define CMAKECONFIG_H'
-        sed 's/^/#define /' projects/glib/tests/wtf/wpe-config.txt
+        sed 's/^/#define /' compiler/capi/glib/tests/wtf/wpe-config.txt
         echo '#endif'
     } > "$work/config/cmakeconfig.h"
     wtf=$webkit/Source/WTF
@@ -105,7 +105,7 @@ else
             head -20 "$object.log" >&2
             failed=1
         fi
-    done < projects/glib/tests/wtf/files.txt
+    done < compiler/capi/glib/tests/wtf/files.txt
     [ "$failed" = 0 ] || fail "WTF's GLib sources do not all compile"
 fi
 

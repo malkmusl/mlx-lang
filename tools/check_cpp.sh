@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Checks mlx-cc's C++ and mlxlibcpp: builds the compiler and the C++
 # library (tools/build_mlxlibcpp.sh), then compiles and runs every
-# program in projects/cc/tests/cpp (NAME.cpp, with the options of
+# program in compiler/cc/tests/cpp (NAME.cpp, with the options of
 # NAME.flags and the input of NAME.stdin when there are any) against the
 # output in NAME.expected, which g++ -std=c++17's build of the same
 # program printed when the test was written: first on the system's C
@@ -18,13 +18,13 @@ trap 'rm -rf "$work"' EXIT
 fail() { echo "FAIL $1"; exit 1; }
 
 tools/build_mlxlibcpp.sh --compiler "$compiler" --out "$work/libcpp" > "$work/libcpp.log" 2>&1 || fail "mlxlibcpp does not build: $(tail -5 "$work/libcpp.log")"
-cp -r projects/cc/include "$work/include"
+cp -r compiler/cc/include "$work/include"
 cc="$work/libcpp/mlx-cc"
 export MLX_CC_INCLUDE="$work/include"
 export MLX_CC_LIB="$work/libcpp"
 echo "ok   mlx-cc and mlxlibcpp build ($("$work/libcpp/mlx-ar" t "$work/libcpp/libmlxcpp.a" | tr '\n' ' '))"
 
-tests=projects/cc/tests/cpp
+tests=compiler/cc/tests/cpp
 programs=()
 mkdir -p "$work/run"
 run() { # NAME EXECUTABLE OUTPUT [LOADER]

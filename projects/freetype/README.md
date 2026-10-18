@@ -11,7 +11,7 @@ FreeType computes, to the bit: outlines, metrics, advances, renderings.
 The interface is written once, in Mlx: the modules of `api/` declare the
 types, constants, macros (`FT_LOAD_TARGET_`, `FT_IS_SCALABLE`...) and
 functions C sees, a module per FreeType header, with FreeType's names
-and the layout of its structures. `mlx-cheaders` (projects/cc) makes the
+and the layout of its structures. `mlx-cheaders` (compiler/cc) makes the
 C headers of them into `mlx-out/include/mlx-freetype/` (`ft2build.h`,
 `freetype/*.h`, `freetype/config/*.h`); there are no headers written by
 hand.

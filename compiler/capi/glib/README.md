@@ -11,7 +11,7 @@ behaviour and checked against what GLib prints for the same programs.
 The interface is written once, in Mlx: the modules of `api/` declare the
 types, constants, functions and macros C sees (`G_OBJECT`, `g_new`,
 `g_signal_connect`, `G_VALUE_INIT`... are Mlx functions and constants
-there). `mlx-cheaders` (projects/cc) makes the C headers of them into
+there). `mlx-cheaders` (compiler/cc) makes the C headers of them into
 `mlx-out/include/mlx-glib/`; there are no headers written by hand.
 
     ./mlx build glib           the library and its headers

@@ -15,7 +15,7 @@ with `Source/`), by default /home/user/csrc/wpe/wpewebkit-2.54.1.
 Two of WebKit's ports are built, by the same steps from a description
 of each (`Port` in build.mlx): JSCOnly (JavaScriptCore alone, the
 generic event loop) and WPE, whose lower layers stand on GLib, GObject
-and GIO, here mlx-glib (projects/glib).
+and GIO, here mlx-glib (compiler/capi/glib).
 
     ./mlx build webkit-bmalloc        bmalloc and libpas (libbmalloc.a)
     ./mlx build webkit-wtf            WTF, the JSCOnly port, on mlx-unicode (libWTF.a)

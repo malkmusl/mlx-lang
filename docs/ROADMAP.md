@@ -17,8 +17,8 @@ repository does.
 | --- | --- | --- | --- |
 | Language and compiler | Mlx, `mlx4` (self-hosted, x86_64 and aarch64, ELF, APK) | gcc for our own code | done; a few compiler gaps are recorded as tasks |
 | Standard library | `std` (system calls, files, formats, crypto, Wayland, Vulkan, UI) | glibc for our own code | done for what the programs use |
-| C library | mlxlibc (`projects/libc`): 830 C names, libm and the dynamic loader | glibc, ld.so, libm | runs glibc-linked programs; `libm.so.6` in Mlx with the long double functions as x87 code; `strtold` to 64 bits; iconv missing |
-| C compiler | mlx-cc (`projects/cc`) | gcc, as, ld for C programs | programs of C89 to C23 (`-std=`, `_BitInt`, `#embed`, x87 `long double`) build and run, on glibc and on mlxlibc alone; `-c` objects, `mlx-ar` archives and the compiler's own linker (gcc's objects link too); zlib, Lua and SQLite pass their tests; shared objects are next |
+| C library | mlxlibc (`compiler/libc`): 830 C names, libm and the dynamic loader | glibc, ld.so, libm | runs glibc-linked programs; `libm.so.6` in Mlx with the long double functions as x87 code; `strtold` to 64 bits; iconv missing |
+| C compiler | mlx-cc (`compiler/cc`) | gcc, as, ld for C programs | programs of C89 to C23 (`-std=`, `_BitInt`, `#embed`, x87 `long double`) build and run, on glibc and on mlxlibc alone; `-c` objects, `mlx-ar` archives and the compiler's own linker (gcc's objects link too); zlib, Lua and SQLite pass their tests; shared objects are next |
 | Init | mlx-init (`projects/init`) | systemd as PID 1, sysvinit | supervises, mounts, shuts down; no users per service, no device events |
 | Shell | mlx-sh (`projects/shell`) | bash, dash | POSIX scripts, line editor |
 | Core utilities | `projects/coreutils` (about 70 programs) | GNU coreutils | the common ones; the rest of coreutils is open |
@@ -49,7 +49,7 @@ from C89 to C23 with GNU's (`-std=`, C23's keywords, attributes, `auto`,
 starts on mlxlibc by itself); of step 4, zlib, Lua and SQLite build and
 pass their own tests (`tools/check_cc_projects.sh`), on glibc and on
 mlxlibc with its own libm. The gaps left are listed in
-`projects/cc/README.md`.
+`compiler/cc/README.md`.
 
 1. **C subset, whole programs.** (done) The preprocessor (`#include`,
    object-like and function-like macros with `#` and `##`, conditionals),
@@ -57,7 +57,7 @@ mlxlibc with its own libm. The gaps left are listed in
    statements, all operators, function pointers, calls into the C library
    (variadic ones too), globals with initializers, several `.c` files
    compiled into one program, our own headers for mlxlibc
-   (`projects/cc/include`). Check: test programs whose output is known.
+   (`compiler/cc/include`). Check: test programs whose output is known.
 2. **The rest of C99/C11 for real code.** (done) Floating point (`float`,
    `double`, SSE), structs passed and returned by value, variadic
    functions defined in C (`<stdarg.h>`), bit fields, compound literals,
@@ -83,7 +83,7 @@ mlxlibc with its own libm. The gaps left are listed in
 
 ## Phase 2: the C library, complete
 
-1. libm (done: `projects/libc/libm.mlx`, from the elementary functions
+1. libm (done: `compiler/libc/libm.mlx`, from the elementary functions
    to `erf` and the gamma functions, and the long double variants as x87
    code in `x87_long.mlx`; the Bessel functions are open), `strtold` to
    64 bits (done), `iconv`, locales as far as programs ask, wide
@@ -122,11 +122,11 @@ mlxlibc with its own libm. The gaps left are listed in
 ## Phase 6: C++ and the drivers
 
 GPU drivers (Mesa) and some desktop programs are C++. mlx-cc grows a
-C++ front end (`projects/cc/README.md`, "C++"): namespaces, references,
+C++ front end (`compiler/cc/README.md`, "C++"): namespaces, references,
 overloading, classes with constructors, destructors, operators, new and
 delete, single inheritance and virtual functions are there (steps 1 and
 2), with tests run against g++ (`tools/check_cpp.sh`), and the first
-slice of a C++ standard library of our own (`projects/libcpp`:
+slice of a C++ standard library of our own (`compiler/libcpp`:
 `std::string`, `<iostream>`, new and delete, the `c*` headers, linked
 in by itself), and templates with `<vector>`, `<map>`, `<set>`,
 `<utility>` and `<algorithm>` over them, lambdas, explicit
@@ -159,7 +159,7 @@ argument deduction, defaulted comparisons, `<string_view>`, a full
 `<cmath>`, function pointers as template arguments, inline `asm` with
 register operands (`cpuid`) and the C++17/20 forms WTF's headers use
 followed: 40 of WTF's 174 `.cpp` files compile (`BitVector.cpp` among
-them), with one WebKit patch (`projects/cc/webkit/`: SIMDe's portable
+them), with one WebKit patch (`compiler/cc/webkit/`: SIMDe's portable
 paths without SSE2). Multiple inheritance (`StringImpl`, `WorkQueue`,
 the weak-pointer mixins, with the empty base optimization) followed,
 and with it what WTF's `Variant` (mpark's variant) and `Expected` ask:
@@ -175,14 +175,14 @@ the instances that led there. The rest of WTF followed: all 174 of its
 `.cpp` files compile with mlx-cc (FastMalloc and Threading with
 bmalloc's libpas headers among them), the forms each step asked for
 kept as `tests/cpp/wtfforms*.cpp`, with two WebKit patches in
-`projects/cc/webkit/`. bmalloc followed: all 168 of its sources
+`compiler/cc/webkit/`. bmalloc followed: all 168 of its sources
 (157 of them libpas's C) compile, which took GNU C's labels as values,
 compound literals as static initializers, the typed overflow builtins
 and Valgrind's client request. JavaScriptCore is under way (its build
 without JIT, the C loop interpreter): its first unified source,
 `UnifiedSource-API-1.cpp`, compiles, and a full pass over its 204
 compile units is worked through error by error. It took an inline
-assembler (`projects/cc/asm.mlx`, AT&T x86-64 text for `asm` with
+assembler (`compiler/cc/asm.mlx`, AT&T x86-64 text for `asm` with
 operands), guaranteed copy elision of temporaries, functions as
 `template <auto f>` arguments, the forms of partial specializations'
 members and per-instance member templates, and more of the library
