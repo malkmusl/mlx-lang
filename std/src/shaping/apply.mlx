@@ -1,0 +1,1513 @@
+// Applying GSUB and GPOS lookups to a buffer (HarfBuzz's
+// hb-ot-layout-gsubgpos.hh, the GSUB and GPOS subtables of OT/Layout and
+// the application loop of hb-ot-layout.cc): the apply context with its two
+// skipping iterators (one for the input, one for the context), matching of
+// input, backtrack and lookahead sequences, ligation, recursion into nested
+// lookups, the eight GSUB and nine GPOS subtable types, and the attachment
+// offsets GPOS leaves to be propagated at the end.
+//
+// A lookup's table (`t` of the context) is GSUB or GPOS of the face, or a
+// table made in memory (the Arabic fallback shaper's); its values are read
+// in place. The match positions of each nesting level live in one block of
+// the context, so nothing here makes aggregates per glyph.
+const m = @import("./memory.mlx")
+const common = @import("./common.mlx")
+const font = @import("./font.mlx")
+const buffer = @import("./buffer.mlx")
+const layout = @import("./layout.mlx")
+const p = @import("./props.mlx")
+
+const GlyphInfo = buffer.GlyphInfo
+const GlyphPosition = buffer.GlyphPosition
+
+pub const MAX_NESTING: u32 = 64
+pub const MAX_CONTEXT: u32 = 64
+
+// What a matching function compares a glyph with.
+pub const MATCH_NONE: u32 = 0
+pub const MATCH_GLYPH: u32 = 1
+pub const MATCH_CLASS: u32 = 2
+pub const MATCH_COVERAGE: u32 = 3
+pub const MATCH_ALWAYS: u32 = 4
+
+const MAY_NO: u32 = 0
+const MAY_YES: u32 = 1
+const MAY_MAYBE: u32 = 2
+
+const ITER_MATCH: u32 = 0
+const ITER_NOT_MATCH: u32 = 1
+const ITER_SKIP: u32 = 2
+
+pub const ATTACH_TYPE_MARK: u32 = 1
+pub const ATTACH_TYPE_CURSIVE: u32 = 2
+
+pub const Iter = struct {
+    idx: u32
+    end: u32
+    lookupProps: u32
+    mask: u32
+    ignoreZwnj: bool
+    ignoreZwj: bool
+    perSyllable: bool
+    syllable: u32
+    matchKind: u32
+    matchData: usize
+    // The table offset of the value the next glyph is matched against (0:
+    // none).
+    glyphData: usize
+}
+
+pub const Apply = struct {
+    tableIndex: u32
+    font: usize
+    face: usize
+    buf: usize
+    t: m.Table
+    gdef: m.Table
+    varStore: usize
+    direction: u32
+    lookupMask: u32
+    lookupIndex: u32
+    lookupProps: u32
+    nestingLeft: u32
+    hasGlyphClasses: bool
+    autoZwnj: bool
+    autoZwj: bool
+    perSyllable: bool
+    random: bool
+    randomState: u32
+    lastBase: i32
+    lastBaseUntil: u32
+    // The match positions, MAX_CONTEXT words for each nesting level.
+    positions: usize
+    input: Iter
+    context: Iter
+}
+
+fn bb(c: *Apply) -> *buffer.Buffer { return buffer.buf(c.*.buf) }
+
+// Sets up the context for applying the lookups of table `tableIndex` (0:
+// GSUB, 1: GPOS) of the font's face to the buffer.
+pub fn init(c: *Apply, tableIndex: u32, f: usize, b: usize) -> void {
+    c.*.tableIndex = tableIndex
+    c.*.font = f
+    c.*.face = font.font(f).*.face
+    c.*.buf = b
+    layout.gsubgpos(c.*.face, tableIndex, &c.*.t)
+    layout.gdefView(c.*.face, &c.*.gdef)
+    c.*.varStore = layout.gdefVarStore(&c.*.gdef)
+    c.*.direction = buffer.buf(b).*.direction
+    c.*.lookupMask = 1
+    c.*.lookupIndex = 0xFFFFFFFF
+    c.*.lookupProps = 0
+    c.*.nestingLeft = MAX_NESTING
+    c.*.hasGlyphClasses = layout.gdefHasGlyphClasses(&c.*.gdef)
+    c.*.autoZwnj = true
+    c.*.autoZwj = true
+    c.*.perSyllable = false
+    c.*.random = false
+    c.*.randomState = 1
+    c.*.lastBase = -1
+    c.*.lastBaseUntil = 0
+    c.*.positions = m.alloc(@intCast(usize, MAX_NESTING + 1) * @intCast(usize, MAX_CONTEXT) * 4)
+    initIters(c)
+}
+
+pub fn fini(c: *Apply) -> void {
+    m.release(c.*.positions)
+    c.*.positions = 0
+}
+
+// The match positions of the current nesting level.
+fn positionsHere(c: *Apply) -> usize {
+    return c.*.positions + @intCast(usize, MAX_NESTING - c.*.nestingLeft) * @intCast(usize, MAX_CONTEXT) * 4
+}
+
+fn posAt(positions: usize, i: u32) -> u32 { return m.get32(positions + @intCast(usize, i) * 4) }
+fn setPosAt(positions: usize, i: u32, v: u32) -> void { m.put32(positions + @intCast(usize, i) * 4, v) }
+
+fn iterInit(c: *Apply, it: *Iter, contextMatch: bool) -> void {
+    it.*.idx = 0
+    it.*.end = bb(c).*.len
+    it.*.glyphData = 0
+    it.*.matchKind = MATCH_NONE
+    it.*.matchData = 0
+    it.*.lookupProps = c.*.lookupProps
+    it.*.ignoreZwnj = c.*.tableIndex == 1 || (contextMatch && c.*.autoZwnj)
+    it.*.ignoreZwj = contextMatch || c.*.autoZwj
+    it.*.mask = if contextMatch { 0xFFFFFFFF } else { c.*.lookupMask }
+    it.*.perSyllable = c.*.tableIndex == 0 && c.*.perSyllable
+    it.*.syllable = 0
+}
+
+pub fn initIters(c: *Apply) -> void {
+    iterInit(c, &c.*.input, false)
+    iterInit(c, &c.*.context, true)
+}
+
+pub fn setLookupMask(c: *Apply, mask: u32) -> void {
+    c.*.lookupMask = mask
+    c.*.lastBase = -1
+    c.*.lastBaseUntil = 0
+}
+
+pub fn setLookupProps(c: *Apply, props: u32) -> void {
+    c.*.lookupProps = props
+    initIters(c)
+}
+
+fn iterReset(c: *Apply, it: *Iter, start: u32) -> void {
+    it.*.idx = start
+    it.*.end = bb(c).*.len
+    const s = if start == bb(c).*.idx { p.syllable(buffer.cur(bb(c))) } else { 0 }
+    it.*.syllable = if it.*.perSyllable { s } else { 0 }
+}
+
+fn setMatch(it: *Iter, kind: u32, data: usize, glyphData: usize) -> void {
+    it.*.matchKind = kind
+    it.*.matchData = data
+    it.*.glyphData = glyphData
+}
+
+fn matchPropertiesMark(c: *Apply, glyph: u32, glyphProps: u32, matchProps: u32) -> bool {
+    if (matchProps & layout.FLAG_USE_MARK_FILTERING_SET) != 0 { return layout.markSetCovers(&c.*.gdef, matchProps >> 16, glyph) }
+    if (matchProps & layout.FLAG_MARK_ATTACHMENT_TYPE) != 0 { return (matchProps & layout.FLAG_MARK_ATTACHMENT_TYPE) == (glyphProps & layout.FLAG_MARK_ATTACHMENT_TYPE) }
+    return true
+}
+
+pub fn checkGlyphProperty(c: *Apply, g: *GlyphInfo, matchProps: u32) -> bool {
+    const gp = p.glyphProps(g)
+    if (gp & matchProps & layout.FLAG_IGNORE_FLAGS) != 0 { return false }
+    if (gp & p.PROPS_MARK) != 0 { return matchPropertiesMark(c, g.*.codepoint, gp, matchProps) }
+    return true
+}
+
+// Whether glyph `g` matches `value` the way `kind` compares.
+fn matches(c: *Apply, kind: u32, data: usize, g: *GlyphInfo, value: u32) -> bool {
+    if kind == MATCH_GLYPH { return g.*.codepoint == value }
+    if kind == MATCH_CLASS { return layout.classOf(&c.*.t, data, g.*.codepoint) == value }
+    if kind == MATCH_COVERAGE {
+        if value == 0 { return false }
+        return layout.coverage(&c.*.t, data + @intCast(usize, value), g.*.codepoint) != layout.NOT_COVERED
+    }
+    return true
+}
+
+fn mayMatch(c: *Apply, it: *Iter, g: *GlyphInfo) -> u32 {
+    if (g.*.mask & it.*.mask) == 0 || (it.*.syllable != 0 && it.*.syllable != p.syllable(g)) { return MAY_NO }
+    if it.*.matchKind != MATCH_NONE {
+        const value = if it.*.glyphData != 0 { m.u16at(&c.*.t, it.*.glyphData) } else { 0 }
+        return if matches(c, it.*.matchKind, it.*.matchData, g, value) { MAY_YES } else { MAY_NO }
+    }
+    return MAY_MAYBE
+}
+
+fn maySkip(c: *Apply, it: *Iter, g: *GlyphInfo) -> u32 {
+    if !checkGlyphProperty(c, g, it.*.lookupProps) { return MAY_YES }
+    if p.isDefaultIgnorableAndNotHidden(g) && (it.*.ignoreZwnj || !p.isZwnj(g)) && (it.*.ignoreZwj || !p.isZwj(g)) { return MAY_MAYBE }
+    return MAY_NO
+}
+
+fn iterMatch(c: *Apply, it: *Iter, g: *GlyphInfo) -> u32 {
+    const skip = maySkip(c, it, g)
+    if skip == MAY_YES { return ITER_SKIP }
+    const mm = mayMatch(c, it, g)
+    if mm == MAY_YES || (mm == MAY_MAYBE && skip == MAY_NO) { return ITER_MATCH }
+    if skip == MAY_NO { return ITER_NOT_MATCH }
+    return ITER_SKIP
+}
+
+fn iterNext(c: *Apply, it: *Iter, unsafeTo: *u32) -> bool {
+    const stop = @intCast(i64, it.*.end) - 1
+    while @intCast(i64, it.*.idx) < stop {
+        it.*.idx += 1
+        const r = iterMatch(c, it, buffer.info(bb(c), it.*.idx))
+        if r == ITER_MATCH {
+            if it.*.glyphData != 0 { it.*.glyphData += 2 }
+            return true
+        }
+        if r == ITER_NOT_MATCH {
+            unsafeTo.* = it.*.idx + 1
+            return false
+        }
+    }
+    unsafeTo.* = it.*.end
+    return false
+}
+
+fn iterPrev(c: *Apply, it: *Iter, unsafeFrom: *u32) -> bool {
+    while it.*.idx > 0 {
+        it.*.idx -= 1
+        const r = iterMatch(c, it, buffer.outInfo(bb(c), it.*.idx))
+        if r == ITER_MATCH {
+            if it.*.glyphData != 0 { it.*.glyphData += 2 }
+            return true
+        }
+        if r == ITER_NOT_MATCH {
+            unsafeFrom.* = (if it.*.idx > 1 { it.*.idx } else { 1 }) - 1
+            return false
+        }
+    }
+    unsafeFrom.* = 0
+    return false
+}
+
+// ---------------------------------------------------------------------------
+// Glyph classes of substituted glyphs
+
+fn setGlyphClass(c: *Apply, glyph: u32, classGuess: u32, ligature: bool, component: bool) -> void {
+    const cur = buffer.cur(bb(c))
+    var props = p.glyphProps(cur) | p.PROPS_SUBSTITUTED
+    if ligature {
+        props |= p.PROPS_LIGATED
+        props &= ~p.PROPS_MULTIPLIED
+    }
+    if component { props |= p.PROPS_MULTIPLIED }
+    if c.*.hasGlyphClasses {
+        props &= p.PROPS_PRESERVE
+        p.setGlyphProps(cur, props | layout.glyphProps(&c.*.gdef, glyph))
+    } else if classGuess != 0 {
+        props &= p.PROPS_PRESERVE
+        p.setGlyphProps(cur, props | classGuess)
+    } else {
+        p.setGlyphProps(cur, props)
+    }
+}
+
+pub fn replaceGlyph(c: *Apply, glyph: u32) -> void {
+    setGlyphClass(c, glyph, 0, false, false)
+    _ = buffer.replaceGlyph(bb(c), glyph)
+}
+
+fn replaceGlyphInplace(c: *Apply, glyph: u32) -> void {
+    setGlyphClass(c, glyph, 0, false, false)
+    buffer.cur(bb(c)).*.codepoint = glyph
+}
+
+fn replaceGlyphWithLigature(c: *Apply, glyph: u32, classGuess: u32) -> void {
+    setGlyphClass(c, glyph, classGuess, true, false)
+    _ = buffer.replaceGlyph(bb(c), glyph)
+}
+
+fn outputGlyphForComponent(c: *Apply, glyph: u32, classGuess: u32) -> void {
+    setGlyphClass(c, glyph, classGuess, false, true)
+    _ = buffer.outputGlyph(bb(c), glyph)
+}
+
+// ---------------------------------------------------------------------------
+// Matching sequences
+
+// Matches the `count - 1` glyphs after the current one against the values
+// at `input`; their positions (the current one first) in `positions`.
+fn matchInput(c: *Apply, count: u32, input: usize, kind: u32, data: usize, endPosition: *u32, positions: usize, totalComponentCount: *u32) -> bool {
+    if count > MAX_CONTEXT { return false }
+    const b = bb(c)
+    const it = &c.*.input
+    iterReset(c, it, b.*.idx)
+    setMatch(it, kind, data, input)
+    var total: u32 = 0
+    const firstLigId = p.ligId(buffer.cur(b))
+    const firstLigComp = p.ligComp(buffer.cur(b))
+    // 0: not checked, 1: may not skip, 2: may skip.
+    var ligbase: u32 = 0
+    var i: u32 = 1
+    while i < count {
+        var unsafeTo: u32 = 0
+        if !iterNext(c, it, &unsafeTo) {
+            endPosition.* = unsafeTo
+            return false
+        }
+        setPosAt(positions, i, it.*.idx)
+        const g = buffer.info(b, it.*.idx)
+        const thisLigId = p.ligId(g)
+        const thisLigComp = p.ligComp(g)
+        if firstLigId != 0 && firstLigComp != 0 {
+            if firstLigId != thisLigId || firstLigComp != thisLigComp {
+                if ligbase == 0 {
+                    var found = false
+                    var j = b.*.outLen
+                    while j > 0 && p.ligId(buffer.outInfo(b, j - 1)) == firstLigId {
+                        if p.ligComp(buffer.outInfo(b, j - 1)) == 0 {
+                            j -= 1
+                            found = true
+                            break
+                        }
+                        j -= 1
+                    }
+                    if found && maySkip(c, it, buffer.outInfo(b, j)) == MAY_YES {
+                        ligbase = 2
+                    } else {
+                        ligbase = 1
+                    }
+                }
+                if ligbase == 1 { return false }
+            }
+        } else {
+            if thisLigId != 0 && thisLigComp != 0 && thisLigId != firstLigId { return false }
+        }
+        total += p.ligNumComps(g)
+        i += 1
+    }
+    endPosition.* = it.*.idx + 1
+    total += p.ligNumComps(buffer.cur(b))
+    totalComponentCount.* = total
+    setPosAt(positions, 0, b.*.idx)
+    return true
+}
+
+fn ligateInput(c: *Apply, count: u32, positions: usize, matchEnd: u32, ligGlyph: u32, totalComponentCount: u32) -> void {
+    const b = bb(c)
+    buffer.mergeClusters(b, b.*.idx, matchEnd)
+    var isBaseLigature = p.isBaseGlyph(buffer.info(b, posAt(positions, 0)))
+    var isMarkLigature = p.isMark(buffer.info(b, posAt(positions, 0)))
+    var i: u32 = 1
+    while i < count {
+        if !p.isMark(buffer.info(b, posAt(positions, i))) {
+            isBaseLigature = false
+            isMarkLigature = false
+            break
+        }
+        i += 1
+    }
+    const isLigature = !isBaseLigature && !isMarkLigature
+    const klass = if isLigature { p.PROPS_LIGATURE } else { 0 }
+    const ligId = if isLigature { p.allocateLigId(b) } else { 0 }
+    var lastLigId = p.ligId(buffer.cur(b))
+    var lastNumComponents = p.ligNumComps(buffer.cur(b))
+    var componentsSoFar = lastNumComponents
+    if isLigature {
+        p.setLigPropsForLigature(buffer.cur(b), ligId, totalComponentCount)
+        if p.generalCategory(buffer.cur(b)) == 12 { p.setGeneralCategory(buffer.cur(b), 7) }
+    }
+    replaceGlyphWithLigature(c, ligGlyph, klass)
+    i = 1
+    while i < count {
+        while b.*.idx < posAt(positions, i) && b.*.successful != 0 {
+            if isLigature {
+                var thisComp = p.ligComp(buffer.cur(b))
+                if thisComp == 0 { thisComp = lastNumComponents }
+                const newLigComp = componentsSoFar - lastNumComponents + (if thisComp < lastNumComponents { thisComp } else { lastNumComponents })
+                p.setLigPropsForMark(buffer.cur(b), ligId, newLigComp)
+            }
+            _ = buffer.nextGlyph(b)
+        }
+        lastLigId = p.ligId(buffer.cur(b))
+        lastNumComponents = p.ligNumComps(buffer.cur(b))
+        componentsSoFar += lastNumComponents
+        // Skip the base glyph.
+        b.*.idx += 1
+        i += 1
+    }
+    if !isMarkLigature && lastLigId != 0 {
+        var k = b.*.idx
+        while k < b.*.len {
+            const g = buffer.info(b, k)
+            if lastLigId != p.ligId(g) { break }
+            const thisComp = p.ligComp(g)
+            if thisComp == 0 { break }
+            const newLigComp = componentsSoFar - lastNumComponents + (if thisComp < lastNumComponents { thisComp } else { lastNumComponents })
+            p.setLigPropsForMark(g, ligId, newLigComp)
+            k += 1
+        }
+    }
+}
+
+fn matchBacktrack(c: *Apply, count: u32, backtrack: usize, kind: u32, data: usize, matchStart: *u32) -> bool {
+    const it = &c.*.context
+    iterReset(c, it, buffer.backtrackLen(bb(c)))
+    setMatch(it, kind, data, backtrack)
+    var i: u32 = 0
+    while i < count {
+        var unsafeFrom: u32 = 0
+        if !iterPrev(c, it, &unsafeFrom) {
+            matchStart.* = unsafeFrom
+            return false
+        }
+        i += 1
+    }
+    matchStart.* = it.*.idx
+    return true
+}
+
+fn matchLookahead(c: *Apply, count: u32, lookahead: usize, kind: u32, data: usize, startIndex: u32, endIndex: *u32) -> bool {
+    const it = &c.*.context
+    iterReset(c, it, startIndex - 1)
+    setMatch(it, kind, data, lookahead)
+    var i: u32 = 0
+    while i < count {
+        var unsafeTo: u32 = 0
+        if !iterNext(c, it, &unsafeTo) {
+            endIndex.* = unsafeTo
+            return false
+        }
+        i += 1
+    }
+    endIndex.* = it.*.idx + 1
+    return true
+}
+
+// Applies the nested lookups of the records at `records` (4 bytes each) to
+// the matched positions.
+fn applyLookupRecords(c: *Apply, count_: u32, positions: usize, lookupCount: u32, records: usize, matchEnd: u32) -> void {
+    const b = bb(c)
+    var count = count_
+    var end: i64 = 0
+    {
+        const bl = buffer.backtrackLen(b)
+        end = @intCast(i64, bl) + @intCast(i64, matchEnd) - @intCast(i64, b.*.idx)
+        const delta = @intCast(i64, bl) - @intCast(i64, b.*.idx)
+        var j: u32 = 0
+        while j < count {
+            setPosAt(positions, j, @intCast(u32, @intCast(i64, posAt(positions, j)) + delta))
+            j += 1
+        }
+    }
+    var i: u32 = 0
+    while i < lookupCount && b.*.successful != 0 {
+        const idx = m.u16at(&c.*.t, records + @intCast(usize, i) * 4)
+        const lookupIndex = m.u16at(&c.*.t, records + @intCast(usize, i) * 4 + 2)
+        i += 1
+        if idx >= count { continue }
+        const origLen = buffer.backtrackLen(b) + buffer.lookaheadLen(b)
+        if posAt(positions, idx) >= origLen { continue }
+        if !buffer.moveTo(b, posAt(positions, idx)) { break }
+        if b.*.maxOps <= 0 { break }
+        if !recurse(c, lookupIndex) { continue }
+        const newLen = buffer.backtrackLen(b) + buffer.lookaheadLen(b)
+        var delta = @intCast(i64, newLen) - @intCast(i64, origLen)
+        if delta == 0 { continue }
+        end += delta
+        if end < @intCast(i64, posAt(positions, idx)) {
+            delta += @intCast(i64, posAt(positions, idx)) - end
+            end = @intCast(i64, posAt(positions, idx))
+        }
+        var next = @intCast(i64, idx) + 1
+        if delta > 0 {
+            if delta + @intCast(i64, count) > @intCast(i64, MAX_CONTEXT) { break }
+        } else {
+            const floor = next - @intCast(i64, count)
+            if delta < floor { delta = floor }
+            next -= delta
+        }
+        // Shift the positions from `next` by `delta`.
+        const moved = @intCast(i64, count) - next
+        if moved > 0 {
+            m.copy(positions + @intCast(usize, next + delta) * 4, positions + @intCast(usize, next) * 4, @intCast(usize, moved) * 4)
+        }
+        next += delta
+        count = @intCast(u32, @intCast(i64, count) + delta)
+        var j = @intCast(u32, idx) + 1
+        while @intCast(i64, j) < next {
+            setPosAt(positions, j, posAt(positions, j - 1) + 1)
+            j += 1
+        }
+        var k = @intCast(u32, next)
+        while k < count {
+            setPosAt(positions, k, @intCast(u32, @intCast(i64, posAt(positions, k)) + delta))
+            k += 1
+        }
+    }
+    _ = buffer.moveTo(b, @intCast(u32, end))
+}
+
+// ---------------------------------------------------------------------------
+// Contexts
+
+fn contextApply(c: *Apply, inputCount: u32, input: usize, kind: u32, data: usize, lookupCount: u32, records: usize) -> bool {
+    const b = bb(c)
+    const positions = positionsHere(c)
+    var matchEnd: u32 = 0
+    var total: u32 = 0
+    if matchInput(c, inputCount, input, kind, data, &matchEnd, positions, &total) {
+        buffer.unsafeToBreak(b, b.*.idx, matchEnd)
+        applyLookupRecords(c, inputCount, positions, lookupCount, records, matchEnd)
+        return true
+    }
+    buffer.unsafeToConcat(b, b.*.idx, matchEnd)
+    return false
+}
+
+fn chainContextApply(c: *Apply, backtrackCount: u32, backtrack: usize, inputCount: u32, input: usize, lookaheadCount: u32, lookahead: usize, kinds: u32, data0: usize, data1: usize, data2: usize, lookupCount: u32, records: usize) -> bool {
+    const b = bb(c)
+    const positions = positionsHere(c)
+    var endIndex = b.*.idx
+    var matchEnd: u32 = 0
+    var total: u32 = 0
+    const kind = kinds
+    var ok = matchInput(c, inputCount, input, kind, data1, &matchEnd, positions, &total)
+    if ok {
+        endIndex = matchEnd
+        ok = matchLookahead(c, lookaheadCount, lookahead, kind, data2, matchEnd, &endIndex)
+    }
+    if !ok {
+        buffer.unsafeToConcat(b, b.*.idx, endIndex)
+        return false
+    }
+    var startIndex = b.*.outLen
+    if !matchBacktrack(c, backtrackCount, backtrack, kind, data0, &startIndex) {
+        buffer.unsafeToConcatFromOutbuffer(b, startIndex, endIndex)
+        return false
+    }
+    buffer.unsafeToBreakFromOutbuffer(b, startIndex, endIndex)
+    applyLookupRecords(c, inputCount, positions, lookupCount, records, matchEnd)
+    return true
+}
+
+// A rule set of format 1 or 2 (rules of input values then lookup records).
+fn ruleSetApply(c: *Apply, rs: usize, kind: u32, data: usize) -> bool {
+    const t = &c.*.t
+    if rs == 0 { return false }
+    const n = @intCast(usize, m.u16at(t, rs))
+    var i: usize = 0
+    while i < n {
+        const r = layout.sub16(t, rs, 2 + i * 2)
+        if r != 0 {
+            const inputCount = m.u16at(t, r)
+            const lookupCount = m.u16at(t, r + 2)
+            const inputLen = if inputCount > 0 { inputCount - 1 } else { 0 }
+            if contextApply(c, inputCount, r + 4, kind, data, lookupCount, r + 4 + @intCast(usize, inputLen) * 2) { return true }
+        }
+        i += 1
+    }
+    return false
+}
+
+fn chainRuleSetApply(c: *Apply, rs: usize, kind: u32, d0: usize, d1: usize, d2: usize) -> bool {
+    const t = &c.*.t
+    if rs == 0 { return false }
+    const n = @intCast(usize, m.u16at(t, rs))
+    var i: usize = 0
+    while i < n {
+        const r = layout.sub16(t, rs, 2 + i * 2)
+        if r != 0 {
+            const backtrackCount = m.u16at(t, r)
+            const inputAt = r + 2 + @intCast(usize, backtrackCount) * 2
+            const inputCount = m.u16at(t, inputAt)
+            const inputLen = if inputCount > 0 { inputCount - 1 } else { 0 }
+            const lookaheadAt = inputAt + 2 + @intCast(usize, inputLen) * 2
+            const lookaheadCount = m.u16at(t, lookaheadAt)
+            const lookupAt = lookaheadAt + 2 + @intCast(usize, lookaheadCount) * 2
+            const lookupCount = m.u16at(t, lookupAt)
+            if chainContextApply(c, backtrackCount, r + 2, inputCount, inputAt + 2, lookaheadCount, lookaheadAt + 2, kind, d0, d1, d2, lookupCount, lookupAt + 2) { return true }
+        }
+        i += 1
+    }
+    return false
+}
+
+fn contextSubtable(c: *Apply, st: usize) -> bool {
+    const t = &c.*.t
+    const b = bb(c)
+    const g = buffer.cur(b).*.codepoint
+    const format = m.u16at(t, st)
+    if format == 1 {
+        const index = layout.coverage(t, layout.sub16(t, st, 2), g)
+        if index == layout.NOT_COVERED { return false }
+        if index >= m.u16at(t, st + 4) { return false }
+        return ruleSetApply(c, layout.sub16(t, st, 6 + @intCast(usize, index) * 2), MATCH_GLYPH, 0)
+    }
+    if format == 2 {
+        const index = layout.coverage(t, layout.sub16(t, st, 2), g)
+        if index == layout.NOT_COVERED { return false }
+        const classDef = layout.sub16(t, st, 4)
+        const klass = layout.classOf(t, classDef, g)
+        if klass >= m.u16at(t, st + 6) { return false }
+        return ruleSetApply(c, layout.sub16(t, st, 8 + @intCast(usize, klass) * 2), MATCH_CLASS, classDef)
+    }
+    if format == 3 {
+        const glyphCount = m.u16at(t, st + 2)
+        const lookupCount = m.u16at(t, st + 4)
+        if glyphCount == 0 { return false }
+        const index = layout.coverage(t, layout.sub16(t, st, 6), g)
+        if index == layout.NOT_COVERED { return false }
+        return contextApply(c, glyphCount, st + 8, MATCH_COVERAGE, st, lookupCount, st + 6 + @intCast(usize, glyphCount) * 2)
+    }
+    return false
+}
+
+fn chainContextSubtable(c: *Apply, st: usize) -> bool {
+    const t = &c.*.t
+    const b = bb(c)
+    const g = buffer.cur(b).*.codepoint
+    const format = m.u16at(t, st)
+    if format == 1 {
+        const index = layout.coverage(t, layout.sub16(t, st, 2), g)
+        if index == layout.NOT_COVERED { return false }
+        if index >= m.u16at(t, st + 4) { return false }
+        return chainRuleSetApply(c, layout.sub16(t, st, 6 + @intCast(usize, index) * 2), MATCH_GLYPH, 0, 0, 0)
+    }
+    if format == 2 {
+        const index = layout.coverage(t, layout.sub16(t, st, 2), g)
+        if index == layout.NOT_COVERED { return false }
+        const backtrackDef = layout.sub16(t, st, 4)
+        const inputDef = layout.sub16(t, st, 6)
+        const lookaheadDef = layout.sub16(t, st, 8)
+        const klass = layout.classOf(t, inputDef, g)
+        if klass >= m.u16at(t, st + 10) { return false }
+        return chainRuleSetApply(c, layout.sub16(t, st, 12 + @intCast(usize, klass) * 2), MATCH_CLASS, backtrackDef, inputDef, lookaheadDef)
+    }
+    if format == 3 {
+        const backtrackCount = m.u16at(t, st + 2)
+        const inputAt = st + 4 + @intCast(usize, backtrackCount) * 2
+        const inputCount = m.u16at(t, inputAt)
+        if inputCount == 0 { return false }
+        const index = layout.coverage(t, layout.sub16(t, st, inputAt + 2 - st), g)
+        if index == layout.NOT_COVERED { return false }
+        const lookaheadAt = inputAt + 2 + @intCast(usize, inputCount) * 2
+        const lookaheadCount = m.u16at(t, lookaheadAt)
+        const lookupAt = lookaheadAt + 2 + @intCast(usize, lookaheadCount) * 2
+        const lookupCount = m.u16at(t, lookupAt)
+        return chainContextApply(c, backtrackCount, st + 4, inputCount, inputAt + 4, lookaheadCount, lookaheadAt + 2, MATCH_COVERAGE, st, st, st, lookupCount, lookupAt + 2)
+    }
+    return false
+}
+
+// ---------------------------------------------------------------------------
+// GSUB
+
+fn singleSubst(c: *Apply, st: usize) -> bool {
+    const t = &c.*.t
+    const b = bb(c)
+    var g = buffer.cur(b).*.codepoint
+    const format = m.u16at(t, st)
+    const index = layout.coverage(t, layout.sub16(t, st, 2), g)
+    if index == layout.NOT_COVERED { return false }
+    if format == 1 {
+        g = (g +% m.u16at(t, st + 4)) & 0xFFFF
+        replaceGlyph(c, g)
+        return true
+    }
+    if format == 2 {
+        if index >= m.u16at(t, st + 4) { return false }
+        replaceGlyph(c, m.u16at(t, st + 6 + @intCast(usize, index) * 2))
+        return true
+    }
+    return false
+}
+
+fn multipleSubst(c: *Apply, st: usize) -> bool {
+    const t = &c.*.t
+    const b = bb(c)
+    if m.u16at(t, st) != 1 { return false }
+    const index = layout.coverage(t, layout.sub16(t, st, 2), buffer.cur(b).*.codepoint)
+    if index == layout.NOT_COVERED { return false }
+    if index >= m.u16at(t, st + 4) { return false }
+    const seq = layout.sub16(t, st, 6 + @intCast(usize, index) * 2)
+    const count = layout.u16of(t, seq, 0)
+    if count == 1 {
+        replaceGlyph(c, m.u16at(t, seq + 2))
+        return true
+    }
+    if count == 0 {
+        buffer.deleteGlyph(b)
+        return true
+    }
+    const klass = if p.isLigature(buffer.cur(b)) { p.PROPS_BASE_GLYPH } else { 0 }
+    const ligId = p.ligId(buffer.cur(b))
+    var i: u32 = 0
+    while i < count {
+        if ligId == 0 { p.setLigPropsForComponent(buffer.cur(b), i) }
+        outputGlyphForComponent(c, m.u16at(t, seq + 2 + @intCast(usize, i) * 2), klass)
+        i += 1
+    }
+    buffer.skipGlyph(b)
+    return true
+}
+
+fn alternateSubst(c: *Apply, st: usize) -> bool {
+    const t = &c.*.t
+    const b = bb(c)
+    if m.u16at(t, st) != 1 { return false }
+    const index = layout.coverage(t, layout.sub16(t, st, 2), buffer.cur(b).*.codepoint)
+    if index == layout.NOT_COVERED { return false }
+    if index >= m.u16at(t, st + 4) { return false }
+    const altSet = layout.sub16(t, st, 6 + @intCast(usize, index) * 2)
+    const count = layout.u16of(t, altSet, 0)
+    if count == 0 { return false }
+    const glyphMask = buffer.cur(b).*.mask
+    const lookupMask = c.*.lookupMask
+    var shift: u32 = 0
+    while shift < 32 && ((lookupMask >> @intCast(u5, shift)) & 1) == 0 { shift += 1 }
+    var altIndex = if shift < 32 { (lookupMask & glyphMask) >> @intCast(u5, shift) } else { 0 }
+    if altIndex == 255 && c.*.random {
+        buffer.unsafeToBreak(b, 0, b.*.len)
+        c.*.randomState = (c.*.randomState *% 48271) % 2147483647
+        altIndex = c.*.randomState % count + 1
+    }
+    if altIndex > count || altIndex == 0 { return false }
+    replaceGlyph(c, m.u16at(t, altSet + 2 + @intCast(usize, altIndex - 1) * 2))
+    return true
+}
+
+fn ligatureApply(c: *Apply, lig: usize) -> bool {
+    const t = &c.*.t
+    const b = bb(c)
+    const ligGlyph = m.u16at(t, lig)
+    const count = m.u16at(t, lig + 2)
+    if count == 0 { return false }
+    if count == 1 {
+        replaceGlyph(c, ligGlyph)
+        return true
+    }
+    const positions = positionsHere(c)
+    var matchEnd: u32 = 0
+    var total: u32 = 0
+    if !matchInput(c, count, lig + 4, MATCH_GLYPH, 0, &matchEnd, positions, &total) {
+        buffer.unsafeToConcat(b, b.*.idx, matchEnd)
+        return false
+    }
+    ligateInput(c, count, positions, matchEnd, ligGlyph, total)
+    return true
+}
+
+fn ligatureSubst(c: *Apply, st: usize) -> bool {
+    const t = &c.*.t
+    const b = bb(c)
+    if m.u16at(t, st) != 1 { return false }
+    const index = layout.coverage(t, layout.sub16(t, st, 2), buffer.cur(b).*.codepoint)
+    if index == layout.NOT_COVERED { return false }
+    if index >= m.u16at(t, st + 4) { return false }
+    const ligSet = layout.sub16(t, st, 6 + @intCast(usize, index) * 2)
+    const n = @intCast(usize, layout.u16of(t, ligSet, 0))
+    var i: usize = 0
+    while i < n {
+        const lig = layout.sub16(t, ligSet, 2 + i * 2)
+        if lig != 0 && ligatureApply(c, lig) { return true }
+        i += 1
+    }
+    return false
+}
+
+fn reverseChainSubst(c: *Apply, st: usize) -> bool {
+    const t = &c.*.t
+    const b = bb(c)
+    if m.u16at(t, st) != 1 { return false }
+    const index = layout.coverage(t, layout.sub16(t, st, 2), buffer.cur(b).*.codepoint)
+    if index == layout.NOT_COVERED { return false }
+    if c.*.nestingLeft != MAX_NESTING { return false }
+    const backtrackCount = m.u16at(t, st + 4)
+    const lookaheadAt = st + 6 + @intCast(usize, backtrackCount) * 2
+    const lookaheadCount = m.u16at(t, lookaheadAt)
+    const substAt = lookaheadAt + 2 + @intCast(usize, lookaheadCount) * 2
+    const substCount = m.u16at(t, substAt)
+    if index >= substCount { return false }
+    var startIndex: u32 = 0
+    var endIndex: u32 = 0
+    if matchBacktrack(c, backtrackCount, st + 6, MATCH_COVERAGE, st, &startIndex) && matchLookahead(c, lookaheadCount, lookaheadAt + 2, MATCH_COVERAGE, st, b.*.idx + 1, &endIndex) {
+        buffer.unsafeToBreakFromOutbuffer(b, startIndex, endIndex)
+        replaceGlyphInplace(c, m.u16at(t, substAt + 2 + @intCast(usize, index) * 2))
+        return true
+    }
+    buffer.unsafeToConcatFromOutbuffer(b, startIndex, endIndex)
+    return false
+}
+
+// ---------------------------------------------------------------------------
+// GPOS
+
+fn popcount(v_: u32) -> u32 {
+    var v = v_
+    var n: u32 = 0
+    while v != 0 {
+        n += v & 1
+        v >>= 1
+    }
+    return n
+}
+
+// Applies the value record at `values` (of `format`, its device offsets
+// from `base`) to the position `pos`; whether any of its values is set.
+fn applyValue(c: *Apply, format: u32, base: usize, values_: usize, pos: *GlyphPosition) -> bool {
+    var ret = false
+    if format == 0 { return false }
+    const t = &c.*.t
+    const f = c.*.font
+    const horizontal = common.isHorizontal(c.*.direction)
+    var values = values_
+    if (format & 0x0001) != 0 {
+        const v = m.i16at(t, values)
+        if v != 0 { ret = true }
+        pos.*.xOffset +%= font.emScaleX(f, v)
+        values += 2
+    }
+    if (format & 0x0002) != 0 {
+        const v = m.i16at(t, values)
+        if v != 0 { ret = true }
+        pos.*.yOffset +%= font.emScaleY(f, v)
+        values += 2
+    }
+    if (format & 0x0004) != 0 {
+        if horizontal {
+            const v = m.i16at(t, values)
+            if v != 0 { ret = true }
+            pos.*.xAdvance +%= font.emScaleX(f, v)
+        }
+        values += 2
+    }
+    if (format & 0x0008) != 0 {
+        if !horizontal {
+            const v = m.i16at(t, values)
+            if v != 0 { ret = true }
+            pos.*.yAdvance -%= font.emScaleY(f, v)
+        }
+        values += 2
+    }
+    if (format & 0x00F0) == 0 { return ret }
+    const fo = font.font(f)
+    const useX = fo.*.xPpem != 0 || fo.*.numCoords != 0
+    const useY = fo.*.yPpem != 0 || fo.*.numCoords != 0
+    if !useX && !useY { return ret }
+    if (format & 0x0010) != 0 {
+        if useX {
+            const off = m.u16at(t, values)
+            if off != 0 { ret = true }
+            pos.*.xOffset +%= layout.deviceDelta(t, if off == 0 { 0 } else { base + @intCast(usize, off) }, f, true, &c.*.gdef, c.*.varStore)
+        }
+        values += 2
+    }
+    if (format & 0x0020) != 0 {
+        if useY {
+            const off = m.u16at(t, values)
+            if off != 0 { ret = true }
+            pos.*.yOffset +%= layout.deviceDelta(t, if off == 0 { 0 } else { base + @intCast(usize, off) }, f, false, &c.*.gdef, c.*.varStore)
+        }
+        values += 2
+    }
+    if (format & 0x0040) != 0 {
+        if horizontal && useX {
+            const off = m.u16at(t, values)
+            if off != 0 { ret = true }
+            pos.*.xAdvance +%= layout.deviceDelta(t, if off == 0 { 0 } else { base + @intCast(usize, off) }, f, true, &c.*.gdef, c.*.varStore)
+        }
+        values += 2
+    }
+    if (format & 0x0080) != 0 {
+        if !horizontal && useY {
+            const off = m.u16at(t, values)
+            if off != 0 { ret = true }
+            pos.*.yAdvance -%= layout.deviceDelta(t, if off == 0 { 0 } else { base + @intCast(usize, off) }, f, false, &c.*.gdef, c.*.varStore)
+        }
+        values += 2
+    }
+    return ret
+}
+
+fn singlePos(c: *Apply, st: usize) -> bool {
+    const t = &c.*.t
+    const b = bb(c)
+    const format = m.u16at(t, st)
+    const index = layout.coverage(t, layout.sub16(t, st, 2), buffer.cur(b).*.codepoint)
+    if index == layout.NOT_COVERED { return false }
+    const valueFormat = m.u16at(t, st + 4)
+    if format == 1 {
+        _ = applyValue(c, valueFormat, st, st + 6, buffer.curPos(b))
+        b.*.idx += 1
+        return true
+    }
+    if format == 2 {
+        if index >= m.u16at(t, st + 6) { return false }
+        _ = applyValue(c, valueFormat, st, st + 8 + @intCast(usize, index * popcount(valueFormat)) * 2, buffer.curPos(b))
+        b.*.idx += 1
+        return true
+    }
+    return false
+}
+
+fn pairSetApply(c: *Apply, ps: usize, format1: u32, format2: u32, pos: u32) -> bool {
+    const t = &c.*.t
+    const b = bb(c)
+    const len1 = popcount(format1)
+    const len2 = popcount(format2)
+    const recordSize = @intCast(usize, 1 + len1 + len2) * 2
+    const count = layout.u16of(t, ps, 0)
+    const second = buffer.info(b, pos).*.codepoint
+    var lo: i32 = 0
+    var hi: i32 = @intCast(i32, count) - 1
+    var record: usize = 0
+    while lo <= hi {
+        const mid = @intCast(i32, (@intCast(u32, lo) + @intCast(u32, hi)) / 2)
+        const r = ps + 2 + @intCast(usize, mid) * recordSize
+        const g = m.u16at(t, r)
+        if second < g {
+            hi = mid - 1
+        } else if second > g {
+            lo = mid + 1
+        } else {
+            record = r
+            break
+        }
+    }
+    if record != 0 {
+        const appliedFirst = len1 != 0 && applyValue(c, format1, ps, record + 2, buffer.curPos(b))
+        const appliedSecond = len2 != 0 && applyValue(c, format2, ps, record + 2 + @intCast(usize, len1) * 2, buffer.pos(b, pos))
+        if appliedFirst || appliedSecond { buffer.unsafeToBreak(b, b.*.idx, pos + 1) }
+        var next = pos
+        if len2 != 0 {
+            next += 1
+            buffer.unsafeToBreak(b, b.*.idx, next + 1)
+        }
+        b.*.idx = next
+        return true
+    }
+    buffer.unsafeToConcat(b, b.*.idx, pos + 1)
+    return false
+}
+
+fn pairPos(c: *Apply, st: usize) -> bool {
+    const t = &c.*.t
+    const b = bb(c)
+    const format = m.u16at(t, st)
+    const index = layout.coverage(t, layout.sub16(t, st, 2), buffer.cur(b).*.codepoint)
+    if index == layout.NOT_COVERED { return false }
+    const format1 = m.u16at(t, st + 4)
+    const format2 = m.u16at(t, st + 6)
+    const it = &c.*.input
+    it.*.idx = b.*.idx
+    var unsafeTo: u32 = 0
+    if !iterNext(c, it, &unsafeTo) {
+        buffer.unsafeToConcat(b, b.*.idx, unsafeTo)
+        return false
+    }
+    if format == 1 {
+        if index >= m.u16at(t, st + 8) { return false }
+        return pairSetApply(c, layout.sub16(t, st, 10 + @intCast(usize, index) * 2), format1, format2, it.*.idx)
+    }
+    if format != 2 { return false }
+    const second = it.*.idx
+    const klass2 = layout.classOf(t, layout.sub16(t, st, 10), buffer.info(b, second).*.codepoint)
+    if klass2 == 0 {
+        buffer.unsafeToConcat(b, b.*.idx, second + 1)
+        return false
+    }
+    const klass1 = layout.classOf(t, layout.sub16(t, st, 8), buffer.cur(b).*.codepoint)
+    const class1Count = m.u16at(t, st + 12)
+    const class2Count = m.u16at(t, st + 14)
+    if klass1 >= class1Count || klass2 >= class2Count {
+        buffer.unsafeToConcat(b, b.*.idx, second + 1)
+        return false
+    }
+    const len1 = popcount(format1)
+    const len2 = popcount(format2)
+    const v = st + 16 + @intCast(usize, (len1 + len2) * (klass1 * class2Count + klass2)) * 2
+    const appliedFirst = len1 != 0 && applyValue(c, format1, st, v, buffer.curPos(b))
+    const appliedSecond = len2 != 0 && applyValue(c, format2, st, v + @intCast(usize, len1) * 2, buffer.pos(b, second))
+    if appliedFirst || appliedSecond {
+        buffer.unsafeToBreak(b, b.*.idx, second + 1)
+    } else {
+        buffer.unsafeToConcat(b, b.*.idx, second + 1)
+    }
+    var next = second
+    if len2 != 0 {
+        next += 1
+        buffer.unsafeToBreak(b, b.*.idx, next + 1)
+    }
+    b.*.idx = next
+    return true
+}
+
+// The anchor at `anchor` for `glyph`: x and y in the font's units, as floats.
+fn getAnchor(c: *Apply, anchor: usize, glyph: u32, x: *f32, y: *f32) -> void {
+    const t = &c.*.t
+    const f = c.*.font
+    const fo = font.font(f)
+    x.* = 0.0
+    y.* = 0.0
+    if anchor == 0 { return }
+    const format = m.u16at(t, anchor)
+    const xc = m.i16at(t, anchor + 2)
+    const yc = m.i16at(t, anchor + 4)
+    if format == 1 {
+        x.* = font.emFscaleX(f, xc)
+        y.* = font.emFscaleY(f, yc)
+    } else if format == 2 {
+        var cx: i32 = 0
+        var cy: i32 = 0
+        const ok = (fo.*.xPpem != 0 || fo.*.yPpem != 0) && font.getGlyphContourPointForOrigin(f, glyph, m.u16at(t, anchor + 6), common.DIRECTION_LTR, &cx, &cy)
+        x.* = if ok && fo.*.xPpem != 0 { @floatFromInt(f32, cx) } else { font.emFscaleX(f, xc) }
+        y.* = if ok && fo.*.yPpem != 0 { @floatFromInt(f32, cy) } else { font.emFscaleY(f, yc) }
+    } else if format == 3 {
+        x.* = font.emFscaleX(f, xc)
+        y.* = font.emFscaleY(f, yc)
+        if fo.*.xPpem != 0 || fo.*.numCoords != 0 {
+            x.* += @floatFromInt(f32, layout.deviceDelta(t, layout.sub16(t, anchor, 6), f, true, &c.*.gdef, c.*.varStore))
+        }
+        if fo.*.yPpem != 0 || fo.*.numCoords != 0 {
+            y.* += @floatFromInt(f32, layout.deviceDelta(t, layout.sub16(t, anchor, 8), f, false, &c.*.gdef, c.*.varStore))
+        }
+    }
+}
+
+fn reverseCursiveMinorOffset(b: *buffer.Buffer, i: u32, direction: u32, newParent: u32) -> void {
+    const pi = buffer.pos(b, i)
+    const chain = p.attachChain(pi)
+    const kind = p.attachType(pi)
+    if chain == 0 || (kind & ATTACH_TYPE_CURSIVE) == 0 { return }
+    p.setAttachChain(pi, 0)
+    const j = @intCast(u32, @intCast(i64, i) + @intCast(i64, chain))
+    if j == newParent { return }
+    reverseCursiveMinorOffset(b, j, direction, newParent)
+    const pj = buffer.pos(b, j)
+    if common.isHorizontal(direction) {
+        pj.*.yOffset = 0 -% pi.*.yOffset
+    } else {
+        pj.*.xOffset = 0 -% pi.*.xOffset
+    }
+    p.setAttachChain(pj, 0 - chain)
+    p.setAttachType(pj, kind)
+}
+
+fn cursivePos(c: *Apply, st: usize) -> bool {
+    const t = &c.*.t
+    const b = bb(c)
+    if m.u16at(t, st) != 1 { return false }
+    const cov = layout.sub16(t, st, 2)
+    const count = m.u16at(t, st + 4)
+    const thisIndex = layout.coverage(t, cov, buffer.cur(b).*.codepoint)
+    if thisIndex == layout.NOT_COVERED || thisIndex >= count { return false }
+    const entry = layout.sub16(t, st, 6 + @intCast(usize, thisIndex) * 4)
+    if entry == 0 { return false }
+    const it = &c.*.input
+    it.*.idx = b.*.idx
+    var unsafeFrom: u32 = 0
+    if !iterPrev(c, it, &unsafeFrom) {
+        buffer.unsafeToConcatFromOutbuffer(b, unsafeFrom, b.*.idx + 1)
+        return false
+    }
+    const prevIndex = layout.coverage(t, cov, buffer.info(b, it.*.idx).*.codepoint)
+    const exit = if prevIndex == layout.NOT_COVERED || prevIndex >= count { 0 } else { layout.sub16(t, st, 6 + @intCast(usize, prevIndex) * 4 + 2) }
+    if exit == 0 {
+        buffer.unsafeToConcatFromOutbuffer(b, it.*.idx, b.*.idx + 1)
+        return false
+    }
+    const i = it.*.idx
+    const j = b.*.idx
+    buffer.unsafeToBreak(b, i, j + 1)
+    var exitX: f32 = 0.0
+    var exitY: f32 = 0.0
+    var entryX: f32 = 0.0
+    var entryY: f32 = 0.0
+    getAnchor(c, exit, buffer.info(b, i).*.codepoint, &exitX, &exitY)
+    getAnchor(c, entry, buffer.info(b, j).*.codepoint, &entryX, &entryY)
+    const pi = buffer.pos(b, i)
+    const pj = buffer.pos(b, j)
+    const dir = c.*.direction
+    if dir == common.DIRECTION_LTR {
+        pi.*.xAdvance = m.intOf(m.roundf(exitX)) +% pi.*.xOffset
+        const d = m.intOf(m.roundf(entryX)) +% pj.*.xOffset
+        pj.*.xAdvance -%= d
+        pj.*.xOffset -%= d
+    } else if dir == common.DIRECTION_RTL {
+        const d = m.intOf(m.roundf(exitX)) +% pi.*.xOffset
+        pi.*.xAdvance -%= d
+        pi.*.xOffset -%= d
+        pj.*.xAdvance = m.intOf(m.roundf(entryX)) +% pj.*.xOffset
+    } else if dir == common.DIRECTION_TTB {
+        pi.*.yAdvance = m.intOf(m.roundf(exitY)) +% pi.*.yOffset
+        const d = m.intOf(m.roundf(entryY)) +% pj.*.yOffset
+        pj.*.yAdvance -%= d
+        pj.*.yOffset -%= d
+    } else if dir == common.DIRECTION_BTT {
+        const d = m.intOf(m.roundf(exitY)) +% pi.*.yOffset
+        pi.*.yAdvance -%= d
+        pi.*.yOffset -%= d
+        pj.*.yAdvance = m.intOf(m.roundf(entryY))
+    }
+    var child = i
+    var parent = j
+    var xOffset = m.intOf(m.roundf(entryX - exitX))
+    var yOffset = m.intOf(m.roundf(entryY - exitY))
+    if (c.*.lookupProps & layout.FLAG_RIGHT_TO_LEFT) == 0 {
+        child = j
+        parent = i
+        xOffset = 0 -% xOffset
+        yOffset = 0 -% yOffset
+    }
+    reverseCursiveMinorOffset(b, child, dir, parent)
+    const pc = buffer.pos(b, child)
+    const pp = buffer.pos(b, parent)
+    p.setAttachType(pc, ATTACH_TYPE_CURSIVE)
+    p.setAttachChain(pc, @intCast(i32, parent) - @intCast(i32, child))
+    b.*.scratchFlags |= buffer.SCRATCH_HAS_GPOS_ATTACHMENT
+    if common.isHorizontal(dir) {
+        pc.*.yOffset = yOffset
+    } else {
+        pc.*.xOffset = xOffset
+    }
+    if p.attachChain(pp) == 0 - p.attachChain(pc) {
+        p.setAttachChain(pp, 0)
+        if common.isHorizontal(dir) {
+            pp.*.yOffset = 0
+        } else {
+            pp.*.xOffset = 0
+        }
+    }
+    b.*.idx += 1
+    return true
+}
+
+// Attaches the current mark (record `markIndex` of the mark array) to the
+// glyph at `glyphPos`, by the anchor of row `glyphIndex` of the matrix at
+// `anchors` (`classCount` columns).
+fn markArrayApply(c: *Apply, markArray: usize, markIndex: u32, glyphIndex: u32, anchors: usize, classCount: u32, glyphPos: u32) -> bool {
+    const t = &c.*.t
+    const b = bb(c)
+    if markArray == 0 || markIndex >= m.u16at(t, markArray) { return false }
+    const record = markArray + 2 + @intCast(usize, markIndex) * 4
+    const markClass = m.u16at(t, record)
+    const markAnchor = layout.sub16(t, markArray, 2 + @intCast(usize, markIndex) * 4 + 2)
+    // The base's anchor for the mark's class.
+    if anchors == 0 { return false }
+    const rows = m.u16at(t, anchors)
+    if glyphIndex >= rows || markClass >= classCount { return false }
+    const off = m.u16at(t, anchors + 2 + @intCast(usize, glyphIndex * classCount + markClass) * 2)
+    if off == 0 { return false }
+    const glyphAnchor = anchors + @intCast(usize, off)
+    buffer.unsafeToBreak(b, glyphPos, b.*.idx + 1)
+    var markX: f32 = 0.0
+    var markY: f32 = 0.0
+    var baseX: f32 = 0.0
+    var baseY: f32 = 0.0
+    getAnchor(c, markAnchor, buffer.cur(b).*.codepoint, &markX, &markY)
+    getAnchor(c, glyphAnchor, buffer.info(b, glyphPos).*.codepoint, &baseX, &baseY)
+    const o = buffer.curPos(b)
+    o.*.xOffset = m.intOf(m.roundf(baseX - markX))
+    o.*.yOffset = m.intOf(m.roundf(baseY - markY))
+    p.setAttachType(o, ATTACH_TYPE_MARK)
+    p.setAttachChain(o, @intCast(i32, glyphPos) - @intCast(i32, b.*.idx))
+    b.*.scratchFlags |= buffer.SCRATCH_HAS_GPOS_ATTACHMENT
+    b.*.idx += 1
+    return true
+}
+
+// Whether the base at `idx` is the first of a multiple substitution's
+// glyphs (or otherwise fit to take marks).
+fn acceptBase(b: *buffer.Buffer, idx: u32) -> bool {
+    const g = buffer.info(b, idx)
+    if !p.multiplied(g) || p.ligComp(g) == 0 || idx == 0 { return true }
+    const before = buffer.info(b, idx - 1)
+    return p.isMark(before) || !p.multiplied(before) || p.ligId(g) != p.ligId(before) || p.ligComp(g) != p.ligComp(before) + 1
+}
+
+// Finds the last base before the current glyph (the glyphs `skip`
+// treats as bases); -1 if none.
+fn findLastBase(c: *Apply, baseCoverage: usize, checkAccept: bool) -> i32 {
+    const b = bb(c)
+    const it = &c.*.input
+    it.*.lookupProps = 0x0008
+    if c.*.lastBaseUntil > b.*.idx {
+        c.*.lastBaseUntil = 0
+        c.*.lastBase = -1
+    }
+    var j = b.*.idx
+    while j > c.*.lastBaseUntil {
+        var r = iterMatch(c, it, buffer.info(b, j - 1))
+        if r == ITER_MATCH && checkAccept {
+            if !acceptBase(b, j - 1) && layout.coverage(&c.*.t, baseCoverage, buffer.info(b, j - 1).*.codepoint) == layout.NOT_COVERED { r = ITER_SKIP }
+        }
+        if r == ITER_MATCH {
+            c.*.lastBase = @intCast(i32, j) - 1
+            break
+        }
+        j -= 1
+    }
+    c.*.lastBaseUntil = b.*.idx
+    return c.*.lastBase
+}
+
+fn markBasePos(c: *Apply, st: usize) -> bool {
+    const t = &c.*.t
+    const b = bb(c)
+    if m.u16at(t, st) != 1 { return false }
+    const markIndex = layout.coverage(t, layout.sub16(t, st, 2), buffer.cur(b).*.codepoint)
+    if markIndex == layout.NOT_COVERED { return false }
+    const baseCoverage = layout.sub16(t, st, 4)
+    const last = findLastBase(c, baseCoverage, true)
+    if last == -1 {
+        buffer.unsafeToConcatFromOutbuffer(b, 0, b.*.idx + 1)
+        return false
+    }
+    const idx = @intCast(u32, last)
+    const baseIndex = layout.coverage(t, baseCoverage, buffer.info(b, idx).*.codepoint)
+    if baseIndex == layout.NOT_COVERED {
+        buffer.unsafeToConcatFromOutbuffer(b, idx, b.*.idx + 1)
+        return false
+    }
+    return markArrayApply(c, layout.sub16(t, st, 8), markIndex, baseIndex, layout.sub16(t, st, 10), m.u16at(t, st + 6), idx)
+}
+
+fn markLigPos(c: *Apply, st: usize) -> bool {
+    const t = &c.*.t
+    const b = bb(c)
+    if m.u16at(t, st) != 1 { return false }
+    const markIndex = layout.coverage(t, layout.sub16(t, st, 2), buffer.cur(b).*.codepoint)
+    if markIndex == layout.NOT_COVERED { return false }
+    const last = findLastBase(c, 0, false)
+    if last == -1 {
+        buffer.unsafeToConcatFromOutbuffer(b, 0, b.*.idx + 1)
+        return false
+    }
+    const idx = @intCast(u32, last)
+    const ligIndex = layout.coverage(t, layout.sub16(t, st, 4), buffer.info(b, idx).*.codepoint)
+    if ligIndex == layout.NOT_COVERED {
+        buffer.unsafeToConcatFromOutbuffer(b, idx, b.*.idx + 1)
+        return false
+    }
+    const ligArray = layout.sub16(t, st, 10)
+    const ligAttach = if ligArray != 0 && ligIndex < m.u16at(t, ligArray) { layout.sub16(t, ligArray, 2 + @intCast(usize, ligIndex) * 2) } else { 0 }
+    const compCount = layout.u16of(t, ligAttach, 0)
+    if compCount == 0 {
+        buffer.unsafeToConcatFromOutbuffer(b, idx, b.*.idx + 1)
+        return false
+    }
+    const ligId = p.ligId(buffer.info(b, idx))
+    const markId = p.ligId(buffer.cur(b))
+    const markComp = p.ligComp(buffer.cur(b))
+    var compIndex: u32 = 0
+    if ligId != 0 && ligId == markId && markComp > 0 {
+        compIndex = (if compCount < markComp { compCount } else { markComp }) - 1
+    } else {
+        compIndex = compCount - 1
+    }
+    return markArrayApply(c, layout.sub16(t, st, 8), markIndex, compIndex, ligAttach, m.u16at(t, st + 6), idx)
+}
+
+fn markMarkPos(c: *Apply, st: usize) -> bool {
+    const t = &c.*.t
+    const b = bb(c)
+    if m.u16at(t, st) != 1 { return false }
+    const mark1Index = layout.coverage(t, layout.sub16(t, st, 2), buffer.cur(b).*.codepoint)
+    if mark1Index == layout.NOT_COVERED { return false }
+    const it = &c.*.input
+    it.*.idx = b.*.idx
+    it.*.lookupProps = c.*.lookupProps & ~layout.FLAG_IGNORE_FLAGS
+    var unsafeFrom: u32 = 0
+    if !iterPrev(c, it, &unsafeFrom) {
+        buffer.unsafeToConcatFromOutbuffer(b, unsafeFrom, b.*.idx + 1)
+        return false
+    }
+    const j = it.*.idx
+    if !p.isMark(buffer.info(b, j)) {
+        buffer.unsafeToConcatFromOutbuffer(b, j, b.*.idx + 1)
+        return false
+    }
+    const id1 = p.ligId(buffer.cur(b))
+    const id2 = p.ligId(buffer.info(b, j))
+    const comp1 = p.ligComp(buffer.cur(b))
+    const comp2 = p.ligComp(buffer.info(b, j))
+    var good = false
+    if id1 == id2 {
+        if id1 == 0 || comp1 == comp2 { good = true }
+    } else {
+        if (id1 > 0 && comp1 == 0) || (id2 > 0 && comp2 == 0) { good = true }
+    }
+    if !good {
+        buffer.unsafeToConcatFromOutbuffer(b, j, b.*.idx + 1)
+        return false
+    }
+    const mark2Index = layout.coverage(t, layout.sub16(t, st, 4), buffer.info(b, j).*.codepoint)
+    if mark2Index == layout.NOT_COVERED {
+        buffer.unsafeToConcatFromOutbuffer(b, j, b.*.idx + 1)
+        return false
+    }
+    return markArrayApply(c, layout.sub16(t, st, 8), mark1Index, mark2Index, layout.sub16(t, st, 10), m.u16at(t, st + 6), j)
+}
+
+// ---------------------------------------------------------------------------
+// Lookups
+
+// Applies the subtable at `st` of lookup type `kind` at the current glyph.
+fn applySubtable(c: *Apply, kind: u32, st: usize) -> bool {
+    if st == 0 { return false }
+    const t = &c.*.t
+    if c.*.tableIndex == 0 {
+        if kind == 1 { return singleSubst(c, st) }
+        if kind == 2 { return multipleSubst(c, st) }
+        if kind == 3 { return alternateSubst(c, st) }
+        if kind == 4 { return ligatureSubst(c, st) }
+        if kind == 5 { return contextSubtable(c, st) }
+        if kind == 6 { return chainContextSubtable(c, st) }
+        if kind == 7 {
+            if m.u16at(t, st) != 1 { return false }
+            const extKind = m.u16at(t, st + 2)
+            if extKind == 7 { return false }
+            return applySubtable(c, extKind, layout.sub32(t, st, 4))
+        }
+        if kind == 8 { return reverseChainSubst(c, st) }
+        return false
+    }
+    if kind == 1 { return singlePos(c, st) }
+    if kind == 2 { return pairPos(c, st) }
+    if kind == 3 { return cursivePos(c, st) }
+    if kind == 4 { return markBasePos(c, st) }
+    if kind == 5 { return markLigPos(c, st) }
+    if kind == 6 { return markMarkPos(c, st) }
+    if kind == 7 { return contextSubtable(c, st) }
+    if kind == 8 { return chainContextSubtable(c, st) }
+    if kind == 9 {
+        if m.u16at(t, st) != 1 { return false }
+        const extKind = m.u16at(t, st + 2)
+        if extKind == 9 { return false }
+        return applySubtable(c, extKind, layout.sub32(t, st, 4))
+    }
+    return false
+}
+
+// Tries the subtables of the lookup at `l` at the current glyph.
+pub fn applyLookupHere(c: *Apply, l: usize) -> bool {
+    const t = &c.*.t
+    const kind = layout.lookupType(t, l)
+    const n = layout.subtableCount(t, l)
+    var i: u32 = 0
+    while i < n {
+        if applySubtable(c, kind, layout.subtable(t, l, i)) { return true }
+        i += 1
+    }
+    return false
+}
+
+fn recurse(c: *Apply, lookupIndex: u32) -> bool {
+    const b = bb(c)
+    if c.*.nestingLeft == 0 {
+        b.*.shapingFailed = 1
+        return false
+    }
+    const ops = b.*.maxOps
+    b.*.maxOps = ops -% 1
+    if ops <= 0 {
+        b.*.shapingFailed = 1
+        return false
+    }
+    c.*.nestingLeft -= 1
+    const l = layout.lookup(&c.*.t, lookupIndex)
+    const savedProps = c.*.lookupProps
+    const savedIndex = c.*.lookupIndex
+    c.*.lookupIndex = lookupIndex
+    setLookupProps(c, layout.lookupProps(&c.*.t, l))
+    var ret = false
+    if l != 0 { ret = applyLookupHere(c, l) }
+    c.*.lookupIndex = savedIndex
+    setLookupProps(c, savedProps)
+    c.*.nestingLeft += 1
+    return ret
+}
+
+// Whether the lookup at `l` (of GSUB) goes backward (reverse chaining).
+pub fn isReverse(t: *m.Table, l: usize) -> bool {
+    const kind = layout.lookupType(t, l)
+    if kind == 7 {
+        const st = layout.subtable(t, l, 0)
+        if st == 0 { return false }
+        return m.u16at(t, st + 2) == 8
+    }
+    return kind == 8
+}
+
+// Applies the lookup at `l` (whose props the context's are set to) to the
+// whole buffer (HarfBuzz's apply_string).
+pub fn applyString(c: *Apply, l: usize) -> bool {
+    const b = bb(c)
+    if b.*.len == 0 || c.*.lookupMask == 0 { return false }
+    const t = &c.*.t
+    setLookupProps(c, layout.lookupProps(t, l))
+    var ret = false
+    if c.*.tableIndex == 1 || !isReverse(t, l) {
+        if c.*.tableIndex == 0 { buffer.clearOutput(b) }
+        b.*.idx = 0
+        while b.*.idx < b.*.len && b.*.successful != 0 {
+            var applied = false
+            const cur = buffer.cur(b)
+            if (cur.*.mask & c.*.lookupMask) != 0 && checkGlyphProperty(c, cur, c.*.lookupProps) {
+                applied = applyLookupHere(c, l)
+            }
+            if applied {
+                ret = true
+            } else {
+                _ = buffer.nextGlyph(b)
+            }
+        }
+        if c.*.tableIndex == 0 { _ = buffer.sync(b) }
+    } else {
+        b.*.idx = b.*.len - 1
+        while true {
+            const cur = buffer.cur(b)
+            if (cur.*.mask & c.*.lookupMask) != 0 && checkGlyphProperty(c, cur, c.*.lookupProps) {
+                if applyLookupHere(c, l) { ret = true }
+            }
+            if b.*.idx == 0 { break }
+            b.*.idx -= 1
+        }
+    }
+    return ret
+}
+
+// ---------------------------------------------------------------------------
+// GPOS's start and finish
+
+pub fn positionStart(b: *buffer.Buffer) -> void {
+    var i: u32 = 0
+    while i < b.*.len {
+        const q = buffer.pos(b, i)
+        p.setAttachChain(q, 0)
+        p.setAttachType(q, 0)
+        i += 1
+    }
+}
+
+fn propagateAttachmentOffsets(b: *buffer.Buffer, i: u32, direction: u32, nesting: u32) -> void {
+    const pi = buffer.pos(b, i)
+    const chain = p.attachChain(pi)
+    const kind = p.attachType(pi)
+    if chain == 0 { return }
+    p.setAttachChain(pi, 0)
+    const j64 = @intCast(i64, i) + @intCast(i64, chain)
+    if j64 < 0 || j64 >= @intCast(i64, b.*.len) { return }
+    const j = @intCast(u32, j64)
+    if nesting == 0 { return }
+    propagateAttachmentOffsets(b, j, direction, nesting - 1)
+    const pj = buffer.pos(b, j)
+    if (kind & ATTACH_TYPE_CURSIVE) != 0 {
+        if common.isHorizontal(direction) {
+            pi.*.yOffset +%= pj.*.yOffset
+        } else {
+            pi.*.xOffset +%= pj.*.xOffset
+        }
+    } else {
+        pi.*.xOffset +%= pj.*.xOffset
+        pi.*.yOffset +%= pj.*.yOffset
+        if common.isForward(direction) {
+            var k = j
+            while k < i {
+                pi.*.xOffset -%= buffer.pos(b, k).*.xAdvance
+                pi.*.yOffset -%= buffer.pos(b, k).*.yAdvance
+                k += 1
+            }
+        } else {
+            var k = j + 1
+            while k < i + 1 {
+                pi.*.xOffset +%= buffer.pos(b, k).*.xAdvance
+                pi.*.yOffset +%= buffer.pos(b, k).*.yAdvance
+                k += 1
+            }
+        }
+    }
+}
+
+pub fn positionFinishOffsets(f: usize, b: *buffer.Buffer) -> void {
+    const direction = b.*.direction
+    if (b.*.scratchFlags & buffer.SCRATCH_HAS_GPOS_ATTACHMENT) != 0 {
+        var i: u32 = 0
+        while i < b.*.len {
+            propagateAttachmentOffsets(b, i, direction, MAX_NESTING)
+            i += 1
+        }
+    }
+    const fo = font.font(f)
+    if fo.*.slant != 0.0 {
+        var i: u32 = 0
+        while i < b.*.len {
+            const q = buffer.pos(b, i)
+            if q.*.yOffset != 0 { q.*.xOffset +%= m.intOf(m.roundf(fo.*.slantXy * @floatFromInt(f32, q.*.yOffset))) }
+            i += 1
+        }
+    }
+}
