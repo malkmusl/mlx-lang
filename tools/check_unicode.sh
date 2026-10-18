@@ -20,6 +20,7 @@
 #                              and line break tests of the UCD
 #       tests/collation.c      every line of the Collation Algorithm's
 #                              tests (non-ignorable and shifted) in order
+#       tests/idna.c           every line of IdnaTestV2.txt (UTS #46)
 #       tests/properties.c, tests/strings.c, tests/calendar.c  print what
 #                              NAME.expected says
 #
@@ -78,6 +79,10 @@ while read -r line; do echo "ok   $line"; done < "$work/breaks.out"
 cc projects/unicode/tests/collation.c -o "$work/collation" || fail "tests/collation.c does not build"
 run "$work/collation" > "$work/collation.out" || { cat "$work/collation.out"; fail "the collation tests"; }
 while read -r line; do echo "ok   $line"; done < "$work/collation.out"
+
+cc projects/unicode/tests/idna.c -o "$work/idna" || fail "tests/idna.c does not build"
+run "$work/idna" > "$work/idna.out" || { cat "$work/idna.out"; fail "IdnaTestV2.txt"; }
+echo "ok   $(cat "$work/idna.out")"
 
 for test in properties strings calendar; do
     cc "projects/unicode/tests/$test.c" -o "$work/$test" || fail "tests/$test.c does not build"

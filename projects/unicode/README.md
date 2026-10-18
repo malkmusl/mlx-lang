@@ -38,6 +38,7 @@ there are no headers written by hand.
 | `calendar.mlx` | `ucal.h`: the Gregorian calendar (Julian before its change, 1582 or as set), fields resolved as ICU resolves them, `add`, `roll`, limits, differences, times a transition skips or repeats; zone IDs (canonical, IANA, custom `GMT+hh:mm`), the host's and the default zone, enumerations of zones |
 | `zones.mlx` | The time zones at run time: an ID's zone, the offsets at a moment, the transitions |
 | `locale.mlx` | The default locale (from the environment), a locale's language, region (its own, `rg`, or the likely one) and keywords, the region's week (CLDR's week data) |
+| `idna.mlx` | `uidna.h`: UTS #46 (mapping, NFC, the validity criteria, bidi, CONTEXTJ and CONTEXTO), Punycode, ToASCII and ToUnicode of names and labels, UTF-16 and UTF-8 |
 | `enumeration.mlx` | `uenum.h` |
 
 ## Conformance
@@ -54,6 +55,8 @@ from C programs compiled by mlx-cc:
 - the time zones: every zone's offsets from 1850 to 2100, on both sides
   of every transition, against the files zic made of the same database
   (where the system has them): no difference
+- IdnaTestV2.txt: 19167 of 19167 conversions (toUnicode, toAsciiN,
+  toAsciiT of 6389 lines)
 - the calendar: tests/calendar.c against what ICU gives (calendar.expected)
 
 ## Not yet here
@@ -68,7 +71,6 @@ from C programs compiled by mlx-cc:
   - formatting for `Intl` (`udat`, `unum`, `unumf`, `uplrules`, `ulistfmt`, `ureldatefmt`), which needs locale data;
   - locales (`uloc`);
   - bidi (`ubidi`);
-  - IDNA (`uidna`, UTS #46);
   - legacy charset conversion and detection (`ucnv`, `ucsdet`);
   - sets (`uset`).
   They come next, in Mlx, from the Unicode and CLDR data.
