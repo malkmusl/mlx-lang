@@ -15,6 +15,10 @@ cd "$repo_root"
 compiler=${1:-$(tools/ensure_compiler.sh)}
 command -v gdbus > /dev/null || { echo "check_login.sh: needs gdbus (glib2.0-bin)" >&2; exit 2; }
 command -v unshare > /dev/null || { echo "check_login.sh: needs unshare (util-linux)" >&2; exit 2; }
+# The login1 bridge hands out seat devices through /dev/char/MAJOR:MINOR
+# (the test takes 1:3, /dev/null); a container's minimal /dev has no
+# /dev/char, and the check cannot run there.
+[[ -e /dev/char/1:3 ]] || { echo "check_login.sh: needs /dev/char/1:3 (devtmpfs's device links; a minimal /dev has none)" >&2; exit 2; }
 
 # Both the MLXIPC system bus and mlx-login use root credentials as a
 # security boundary. Keep those credentials inside a private user

@@ -15,7 +15,11 @@ fail() { echo "FAIL $1" >&2; exit 1; }
 "$compiler" --quiet tools/init-devices-test/main.mlx -o "$work/init-devices-test"
 echo "ok   mlx-init device helper builds"
 
+# The fixture's groups: the caller's, unless that is root's (gid 0, which
+# the device module reads as "no such group", as it would be for video,
+# input and audio); root may hand devices to any group.
 gid=$(id -g)
+[[ "$gid" == 0 ]] && gid=1000
 cat > "$work/group" <<GROUPS
 video:x:$gid:
 input:x:$gid:
