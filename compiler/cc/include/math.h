@@ -127,6 +127,7 @@ double lgamma(double);
 double tgamma(double);
 double logb(double);
 int ilogb(double);
+static inline int ilogbf(float x) { return ilogb((double)x); }
 long long llrint(double);
 long long llround(double);
 double scalbln(double, long);
