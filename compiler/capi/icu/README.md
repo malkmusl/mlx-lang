@@ -39,6 +39,7 @@ hand.
 | `idna.mlx` | `uidna.h` (std.unicode.idna) |
 | `charsets.mlx` | `ucsdet.h` (std.unicode.charsets) |
 | `bidi.mlx` | `ubidi.h` (std.unicode.bidi) |
+| `search.mlx` | `usearch.h` (std.unicode.search, over std.unicode.collation and breaks) |
 | `enumeration.mlx` | `uenum.h` (std.unicode.enumeration) |
 | `localeid.mlx`, `displaynames.mlx`, `bundles.mlx` | `uloc.h` (std.unicode.locale); `uldnames.h` and `uloc_getDisplay*` (std.unicode.locale.displaynames); `ures.h` over cldr.dat (std.unicode.locale.bundles) |
 | `calendar.mlx`, `timezonenames.mlx` | `ucal.h` (std.unicode.calendar); the names of zones (std.unicode.format.date.zonenames) |
@@ -94,6 +95,17 @@ from C programs compiled by mlx-cc:
   level of a line of one direction), and also ICU's way of resolving the
   brackets and the numbers of a paragraph after the first in text without
   explicit controls (by the level of the paragraph before it)
+- string search: tests/search.c, as WebKit's find in page uses it (one
+  searcher of `<locale>@collation=search`, secondary strength and the
+  pattern's base letters as wildcards for any case, tertiary and exact
+  comparison else) and with every strength and element comparison,
+  overlap, offsets, first/last, following/preceding, the matched text,
+  an ignorable pattern, the errors, over texts of case, accents
+  (precomposed and combining), expansions (ß, æ, ﬁ), contractions (Danish
+  "aa"), ignorables, Hangul, Arabic and Hebrew, and 1500 random searches
+  (forwards: ICU 74's backward search leaves out, in some of them, a
+  first match made of an expansion, and takes ignorables after a match
+  into it), prints what ICU 74 prints (search.expected)
 - IdnaTestV2.txt: 19169 of 19169 conversions (toUnicode, toAsciiN,
   toAsciiT of 6389 lines, and UTF-8)
 - locale IDs and tags: tests/locales.c against ICU's results
@@ -127,7 +139,7 @@ from C programs compiled by mlx-cc:
   Chinese and Japanese runs): ICU finds those by dictionary; here they
   break by the UAX #29 and UAX #14 rules alone.
 - What WebKit uses beyond these:
-  - searching by collation (`usearch`); the sets of a collator
+  - the sets of a collator
     (`ucol_getTailoredSet`, `ucol_getContractionsAndExpansions`);
   - Windows' zone IDs; parsing leap months and cyclic years of the
     Chinese calendars;
@@ -136,6 +148,10 @@ from C programs compiled by mlx-cc:
     statistics of their languages);
   - sets (`uset`).
   They come next, in Mlx, from the Unicode and CLDR data.
+- Of `usearch.h`: canonical matching (`USEARCH_CANONICAL_MATCH`, kept
+  but not applied, as it takes no part in ICU 74 either); a match goes on
+  over at most two clusters that do not match while looking for a
+  contraction that would.
 - Of `ubidi.h`: the reordering modes other than the default and the
   inverse algorithm (kept, not applied), the options that insert marks
   (`UBIDI_OPTION_INSERT_MARKS`, `UBIDI_INSERT_LRM_FOR_NUMERIC`) and

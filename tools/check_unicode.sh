@@ -40,6 +40,9 @@
 #       tests/bidirandom.c     random texts of every bidi class through
 #                              ubidi.h: levels, runs, maps, reordered
 #                              text, lines, as ICU 74 reports them
+#       tests/search.c         usearch.h: string search by collation as
+#                              WebKit's find uses it, every attribute,
+#                              random texts, as ICU 74 finds them
 #       tests/calendars.c      the calendars other than the Gregorian:
 #                              their fields over three thousand years,
 #                              add, roll, limits, as ICU 74 has them
@@ -136,7 +139,7 @@ cc $tests/idna.c -o "$work/idna" || fail "tests/idna.c does not build"
 run "$work/idna" > "$work/idna.out" || { cat "$work/idna.out"; fail "IdnaTestV2.txt"; }
 echo "ok   $(cat "$work/idna.out")"
 
-for test in properties strings calendar calendars charsets locales bundles lists displaynames dates calendarformats zonenames numbers units tailoring bidirandom; do
+for test in properties strings calendar calendars charsets locales bundles lists displaynames dates calendarformats zonenames numbers units tailoring bidirandom search; do
     cc "$tests/$test.c" -o "$work/$test" || fail "tests/$test.c does not build"
     run "$work/$test" > "$work/$test.out" || fail "tests/$test.c fails"
     diff -u "$tests/$test.expected" "$work/$test.out" || fail "tests/$test.c prints otherwise"

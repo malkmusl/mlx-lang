@@ -47,6 +47,7 @@
 #include <unicode/unumsys.h>
 #include <unicode/ures.h>
 #include <unicode/ubidi.h>
+#include <unicode/usearch.h>
 
 int main(void)
 {
