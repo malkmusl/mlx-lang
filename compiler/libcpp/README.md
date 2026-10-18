@@ -1,6 +1,6 @@
 # mlxlibcpp
 
-The C++ standard library for mlx-cc (`projects/cc`, "C++"), written in
+The C++ standard library for mlx-cc (`compiler/cc`, "C++"), written in
 the C++ mlx-cc reads, over the C library (mlxlibc on MLX/Linux, glibc
 elsewhere). It is small and grows with the compiler: what is here is
 what programs use first.
@@ -14,7 +14,7 @@ mlx-cc links `libmlxcpp.a` into every C++ program by itself (from
 library with it. Objects linked on their own are C++ with `-x c++`
 (`mlx-cc -x c++ -o prog a.o b.o`) or with `-lmlxcpp`, as `g++` is the
 driver for linking C++ objects. The headers are the compiler's, under
-`projects/cc/include/c++`.
+`compiler/cc/include/c++`.
 
 ## What is there
 
@@ -81,7 +81,7 @@ overloads (`long long` is `long` to mlx-cc).
 
 ## Check
 
-`tools/check_cpp.sh` builds the library and runs `projects/cc/tests/cpp`
+`tools/check_cpp.sh` builds the library and runs `compiler/cc/tests/cpp`
 (`stdlib.cpp` uses it, reading `stdlib.stdin`; `containers.cpp` and
 `maps.cpp` its templates; `misc.cpp` the streams into strings and the
 smart pointers; `interp.cpp` all of it together) against the

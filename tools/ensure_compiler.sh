@@ -240,7 +240,7 @@ lowers_thread_builtins() {
     return $ok
 }
 
-# What mlxlibc (projects/libc) needs: @frameAddress, a narrow signed value
+# What mlxlibc (compiler/libc) needs: @frameAddress, a narrow signed value
 # read through a pointer kept signed, a module var with an array
 # initializer, and a plugin with --entry and --init that runs as a program.
 builds_mlxlibc() {

@@ -766,7 +766,7 @@ file from them and reads one back, gcc's included (the allocated
 sections kept by kind, `.eh_frame` and the notes dropped, a common
 symbol given zero data of its own). `archive.mlx` reads and writes `ar`
 archives as GNU ar makes them, long names through the `//` member;
-`projects/cc/ar.mlx` is `mlx-ar` on top of it.
+`compiler/cc/ar.mlx` is `mlx-ar` on top of it.
 
 `link.mlx` takes objects and archives (a member is included once a
 symbol it defines is needed, until nothing more is), resolves the global

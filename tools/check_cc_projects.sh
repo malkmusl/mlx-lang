@@ -9,7 +9,7 @@
 #     `_U=true`) file by file;
 #   - SQLite 3.46.1: the library (the amalgamation) and its shell, in the
 #     single-threaded and in the default thread-safe configuration
-#     (pthread.h, dlfcn.h); the shell runs projects/cc/tests/sqlite.sql
+#     (pthread.h, dlfcn.h); the shell runs compiler/cc/tests/sqlite.sql
 #     and prints what gcc's build of it printed (sqlite.expected), on the
 #     system's C library and on mlxlibc alone.
 #
@@ -54,8 +54,8 @@ fetch lua.tar.gz https://www.lua.org/ftp/lua-5.4.7.tar.gz 9fbf5e28ef86c69858f6d3
 fetch luatests.tar.gz https://www.lua.org/tests/lua-5.4.7-tests.tar.gz 8a4898ffe4c7613c8009327a0722db7a41ef861d526c77c5b46114e59ebf811e
 fetch sqlite.tar.gz https://www.sqlite.org/2024/sqlite-autoconf-3460100.tar.gz 67d3fe6d268e6eaddcae3727fce58fcc8e9c53869bdd07a0c61e38ddf2965071
 
-"$compiler" --quiet projects/cc/main.mlx -o "$work/mlx-cc" || fail "mlx-cc does not build"
-cp -r projects/cc/include "$work/include"
+"$compiler" --quiet compiler/cc/main.mlx -o "$work/mlx-cc" || fail "mlx-cc does not build"
+cp -r compiler/cc/include "$work/include"
 cc="$work/mlx-cc"
 tools/build_mlxlibc.sh --compiler "$compiler" --out "$work/lib" > /dev/null
 lib="$work/lib/libmlxc.so.1"
@@ -95,7 +95,7 @@ echo "ok   Lua 5.4.7: the interpreter, and ${#passed[@]} files of the official t
 
 # Lua again from objects: each file with -c, the library an archive of
 # mlx-ar's, the interpreter linked against it with -L and -l.
-"$compiler" --quiet projects/cc/ar.mlx -o "$work/mlx-ar" || fail "mlx-ar does not build"
+"$compiler" --quiet compiler/cc/ar.mlx -o "$work/mlx-ar" || fail "mlx-ar does not build"
 mkdir -p "$work/lua-objects"
 lobjects=()
 for source in "${lfiles[@]}"; do
@@ -114,8 +114,8 @@ echo "ok   Lua from ${#lobjects[@]} objects and an archive of mlx-ar's (-c, -L, 
 
 # SQLite: the amalgamation and the shell, single-threaded and thread-safe.
 sqlite=$(ls -d "$work"/src-sqlite/*/)
-script=$repo_root/projects/cc/tests/sqlite.sql
-expected=$repo_root/projects/cc/tests/sqlite.expected
+script=$repo_root/compiler/cc/tests/sqlite.sql
+expected=$repo_root/compiler/cc/tests/sqlite.expected
 "$cc" -o "$work/sqlite3" -DSQLITE_THREADSAFE=0 -DSQLITE_OMIT_LOAD_EXTENSION -DSQLITE_DQS=0 "$sqlite/sqlite3.c" "$sqlite/shell.c" -lm 2> "$work/sqlite.cc" || fail "SQLite does not compile: $(head -5 "$work/sqlite.cc")"
 [[ ! -s "$work/sqlite.cc" ]] || fail "SQLite: the compiler said: $(head -5 "$work/sqlite.cc")"
 "$cc" -o "$work/sqlite3-threads" -DSQLITE_DQS=0 -DSQLITE_ENABLE_MATH_FUNCTIONS "$sqlite/sqlite3.c" "$sqlite/shell.c" -lm -lpthread -ldl 2> "$work/sqlite-threads.cc" || fail "SQLite (thread-safe) does not compile: $(head -5 "$work/sqlite-threads.cc")"

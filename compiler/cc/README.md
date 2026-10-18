@@ -8,10 +8,10 @@ and linker (`compiler/selfhost/backend/x86_64/encoder.mlx`,
 `compiler/selfhost/object/relocatable.mlx`, `link.mlx`,
 `elf64_dynamic.mlx`): there is no assembler and no GNU linker in
 between. The programs call the C library through `libc.so.6`, which is
-mlxlibc (`projects/libc`) on MLX/Linux and glibc elsewhere.
+mlxlibc (`compiler/libc`) on MLX/Linux and glibc elsewhere.
 
-    mlx-out/bin/compiler/mlx4 projects/cc/main.mlx -o mlx-cc
-    MLX_CC_INCLUDE=projects/cc/include ./mlx-cc -o hello hello.c
+    mlx-out/bin/compiler/mlx4 compiler/cc/main.mlx -o mlx-cc
+    MLX_CC_INCLUDE=compiler/cc/include ./mlx-cc -o hello hello.c
     ./hello                                   # on the system's loader
     mlx-out/libc/libmlxc.so.1 ./hello         # on mlxlibc alone
     ./mlx-cc --dynamic-linker /usr/lib/libmlxc.so.1 -o hello hello.c
@@ -592,7 +592,7 @@ template named lazily (FastBitVector's `operator~`); `tuple_cat`,
 `not_fn`, `<unordered_map>`, `<unordered_set>`, `midpoint`; bmalloc's
 headers (libpas: empty `asm` with operands as an optimization barrier,
 16-byte atomics through `cmpxchg16b`, and a second WebKit patch for
-its x86 double-free check, `projects/cc/webkit/`). The last one was a
+its x86 double-free check, `compiler/cc/webkit/`). The last one was a
 conversion operator named in an expression (`p.operator int*()`)
 whose result type a later declaration's `operator[]` took as its own.
 Then all 168 of bmalloc's sources, 157 of them libpas's C
@@ -684,7 +684,7 @@ differs from g++'s; constructors have only their `C1` symbol. Programs are linke
 glibc without symbol versions, so a symbol glibc keeps in two
 versions binds the older one (`realpath` refusing a null buffer).
 The C++
-standard library is mlxlibcpp (`projects/libcpp`: `<string>`,
+standard library is mlxlibcpp (`compiler/libcpp`: `<string>`,
 `<iostream>`, `<sstream>`, `<vector>`, `<map>`, `<set>`, `<memory>`,
 `<utility>`, `<algorithm>`, `<numeric>`, `<new>`, `<type_traits>`,
 `<concepts>`, `<initializer_list>`, `<limits>`, `<bit>`, `<array>`,
@@ -755,7 +755,7 @@ SHA-256 sums.
 
 A library written in Mlx for C and C++ programs (projects/unicode) declares
 its interface once, in Mlx modules, and `mlx-cheaders OUT MODULE.mlx...`
-(projects/cc/cheaders.mlx) writes the headers C includes. It reads the
+(compiler/cc/cheaders.mlx) writes the headers C includes. It reads the
 modules with the Mlx compiler's own parser. Enums, structures (all
 declared first, so that one may point to another), function types (a
 value of one is a pointer in C), aliases, constants and `extern("c")`

@@ -10,7 +10,7 @@ from the IANA time zone database and its locale data from CLDR.
 
 The interface is written once, in Mlx: the modules of `api/` declare the
 types, constants and functions C sees, and the macros (`U8_NEXT`,
-`U16_APPEND`...) are Mlx functions there. `mlx-cheaders` (projects/cc)
+`U16_APPEND`...) are Mlx functions there. `mlx-cheaders` (compiler/cc)
 makes the C headers of them into `mlx-out/include/mlx-unicode/unicode/`;
 there are no headers written by hand.
 
