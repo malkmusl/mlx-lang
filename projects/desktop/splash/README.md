@@ -20,7 +20,10 @@ It speaks Plymouth's protocol, so systemd tells it what starts as it
 would tell plymouthd, and `mlx-splashctl` (or the `plymouth` tool) talks
 to it. Everything is Mlx on the kernel's interfaces: KMS through the
 compositor's `kms.mlx`, the Linux framebuffer, the Plymouth socket. There
-is no libc and no Plymouth library.
+is no libc and no Plymouth library. Rendering is deliberately CPU-to-KMS:
+it needs no Vulkan context, Mesa userspace or render node during early
+boot. The initramfs loads the KMS driver and the splash writes dumb
+buffers directly.
 
 ## Running it
 
@@ -90,6 +93,9 @@ mlx-splashctl update TEXT | change-mode MODE | system-update PERCENT
 mlx-splashctl pause-progress | unpause-progress | has-active-vt
 ```
 
+`mlx-splashctl absent` is the inverse probe used by the real-root unit:
+it succeeds only when an initramfs splash is not already listening.
+
 The `plymouth` tool's spellings work too (`--quit`, `--ping`, `--wait`,
 `--update=TEXT`, `display-message --text=TEXT`, `change-mode --shutdown`,
 `system-update --progress=N`).
@@ -107,13 +113,21 @@ plymouthd:
 - without a display manager, `mlx-splash-quit.service` before the login
   prompt on the first terminal.
 
-A plymouthd started from the initramfs holds the socket when the splash
-starts. It is asked to quit with `--retain-splash`, and the splash takes
-over. When its card goes away (simpledrm is unplugged as the GPU's driver
-loads), the splash looks for a card again every second. It makes the
-picture again at the new size, with what it said. In shutdown and reboot
-mode its `argv[0]` starts with `@`, which systemd-shutdown's last
-killing spares, as it spares plymouthd.
+The same mlx-splash process starts in the initramfs and stays through
+switch-root. The classic mkinitcpio runscript and the systemd initrd unit
+send it a `newroot` request once `/sysroot` is mounted; it chroots there
+before the switch, so the initramfs can be released and the boot-duration
+file and ask-password directory refer to the real root. The mlx-init
+service is a disabled fallback, and the real-root systemd unit uses the
+abstract socket as a condition, so neither starts a duplicate.
+
+The daemon may start before any DRM card exists. It keeps answering and
+probes once a second. It does the same when simpledrm disappears as the
+GPU's driver loads, then makes the picture again at the new card's size
+with the current status. A stray plymouthd on the compatible socket can
+still be taken over during migration, but Plymouth is not part of the
+normal boot. In shutdown and reboot mode its `argv[0]` starts with `@`,
+which systemd-shutdown's last killing spares.
 
 ## Installing
 
@@ -123,12 +137,35 @@ tools/install_splash.sh [--prefix DIR] [--destdir DIR] [--enable | --disable]
 
 It installs `mlx-splash` and `mlx-splashctl`, the units `mlx-splash`
 (boot, in `sysinit.target`), `mlx-splash-quit`, `mlx-splash-poweroff`,
-`mlx-splash-reboot`, the display manager's drop-in, and the mlx-init
-service. `--enable` enables them and masks Plymouth's units, keeping what
-was there; `--disable` puts it back. `mlx.splash=0`, `plymouth.enable=0`
-or `nosplash` on the kernel's command line keeps the splash away. The
-splash shows from the real root, after udev has found the cards; it is
-not in the initramfs.
+`mlx-splash-reboot`, the display manager's drop-in, the disabled mlx-init
+fallback, and mkinitcpio's `install/mlx-splash` and `hooks/mlx-splash`.
+`--enable` enables the real-root and shutdown integration and masks
+Plymouth's units, keeping what was there; `--disable` puts those units
+back.
+
+Replace `plymouth` with `mlx-splash` after `kms` in
+`/etc/mkinitcpio.conf`, then rebuild the images:
+
+```sh
+# classic initramfs
+HOOKS=(base udev autodetect microcode kms mlx-splash modconf block keyboard keymap consolefont filesystems fsck)
+
+# or a systemd initramfs
+HOOKS=(base systemd autodetect microcode kms mlx-splash modconf block keyboard sd-vconsole filesystems)
+
+sudo mkinitcpio -P
+```
+
+`kms` includes the early DRM modules and firmware; putting the splash
+after it makes the card available as early as the driver permits. A GPU
+that must be present before autodetection can also be named in `MODULES`
+(for example `MODULES=(amdgpu)`). The classic hook starts a runscript;
+when the `systemd` hook is present, it installs the boot and switch-root
+units instead.
+
+`mlx.splash=0` or `nosplash` on the kernel command line keeps the splash
+away. `plymouth.enable=0` only controls Plymouth and intentionally does
+not disable its replacement.
 
 ## How it draws
 
@@ -197,6 +234,11 @@ or terminals. It covers:
   - mlx-splashctl's commands, quit answered when done, the boot's length
     kept;
 - taking over from a stand-in plymouthd;
+- the initramfs new-root handoff in a disposable user namespace, including
+  persistent state written below the real root;
+- classic and systemd mkinitcpio hook installation, dependency copying,
+  target links, and both real-root duplicate guards;
+- booting before a KMS node exists and probing a card that appears later;
 - an emulated KMS card (`tools/fake_drm_session.py`):
   - the mode set and page flips, the frame's pixels;
   - stepping aside for a password and coming back;
@@ -207,6 +249,5 @@ or terminals. It covers:
 
 ## Not yet
 
-- No splash in the initramfs: the real root starts it.
 - mlx-init starts it at boot only, not at shutdown.
 - No themes: the picture is the MLX one.

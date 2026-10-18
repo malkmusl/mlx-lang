@@ -21,8 +21,17 @@ name and are not re-exported from `std.mlx`.
 `netlink.mlx` (`std.netlink`) speaks netlink: route netlink (links, IPv4
 addresses, routes and their change groups) and generic netlink (families
 looked up by name, as nl80211).
-`sha2.mlx` (`std.sha2`) has SHA-256, SHA-512, HMAC-SHA256 and
-PBKDF2-HMAC-SHA256.
+`sha2.mlx` (`std.sha2`) has SHA-224, SHA-256, SHA-384, SHA-512,
+HMAC-SHA256 and PBKDF2-HMAC-SHA256.
+`base64.mlx` (`std.base64`) has RFC 4648's base64, base64url, base32,
+base32hex and base16, in one call or in pieces, and lower-case hex.
+`md5.mlx` (`std.md5`) has MD5 and `blake2.mlx` (`std.blake2`) BLAKE2b,
+keyed or not, of any digest length up to 64 bytes.
+`random.mlx` (`std.random`) has the kernel's random bytes (getrandom)
+and seeded generators: xoshiro256** and, by name, xorshift64*.
+`terminal/tty.mlx` (`std.terminal.tty`) is the terminal a program runs
+on: whether a descriptor is one, its size, raw mode and the foreground
+process group.
 `sha1.mlx` (`std.sha1`) has SHA-1, HMAC-SHA1 and PBKDF2-HMAC-SHA1, and
 `aes.mlx` (`std.aes`) AES-128 on blocks and the RFC 3394 key wrap: what
 WPA2 needs (`tools/check_wifi.sh`).
@@ -46,9 +55,11 @@ queue, dma-buf and host-memory sharing), with `gpu/shaders.mlx`
 (`std.gpu.shaders`), `gpu/text.mlx` (`std.gpu.text`) and
 `gpu/swapchain.mlx` (`std.gpu.swapchain`). See `docs/reference/vulkan.md`.
 
-`truetype.mlx` (`std.truetype`) reads TrueType fonts, rasterizes glyphs
-with anti-aliasing, packs them into an atlas and lays out text; see
-`docs/reference/truetype.md`.
+`truetype.mlx` (`std.truetype`) and `truetype/` are the font engine:
+TrueType and OpenType (CFF, CFF2) fonts, variable and color fonts, read
+and rendered as FreeType 2.13 does it; its `Font`, `Atlas` and `Run` lay
+out and draw lines of text. FreeType's C API (`compiler/capi/freetype`)
+is a layer over it; see `docs/reference/truetype.md`.
 
 `ui.mlx` (`std.ui`) has layout building blocks for pixel user interfaces:
 rectangles, insets, alignment, containers, stacks and reserved bars; see
@@ -61,6 +72,21 @@ callers from the compiler's symbol table) and keeps it in
 crash. `timezone.mlx` (`std.timezone`) gives local time from `$TZ` or
 `/etc/localtime` (TZif files and POSIX rules) and the civil calendar. See
 `docs/reference/stdlib.md`.
+
+`unicode.mlx` (`std.unicode`) with `unicode/` is Unicode and CLDR's
+locale data in Mlx: `std.unicode.utf` (UTF-8 and UTF-16, no tables),
+`.properties`, `.casing`, `.normalize`, `.breaks`, `.collation` (with
+`collation/`), `.idna`, `.charsets`, `.locale` (with `locale/`),
+`.calendar` (with `calendar/`) and `.format` (`format/`: number, plural,
+date, list, reltime), each with a native API (UTF-8 slices, allocators,
+`unicode.Error`) beside ICU's functions, which `compiler/capi/icu` exports
+to C as `libmlxunicode.so`. `timezone/database.mlx`
+(`std.timezone.database`) is the IANA time zone database built in
+(`timezone/tzdata.mlx`). Their tables (`unicode/tables.mlx`,
+`unicode/locale/data.mlx`, `unicode/collation/rules.mlx`,
+`timezone/tzdata.mlx`) are generated from `std/registry/unicode` and
+`std/registry/tz` by the generators there (`./mlx build unicode`); do not
+edit them by hand. See `docs/reference/unicode.md`.
 
 `ui/appearance.mlx` (`std.ui.appearance`) follows the desktop's colour
 scheme (`~/.config/mlx/appearance.conf`) for every window and panel, and

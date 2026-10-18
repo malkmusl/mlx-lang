@@ -3,8 +3,8 @@
 WPE WebKit and the libraries it needs, built with this repository's own
 toolchain alone: `./mlx build` (build.mlx, std.build) declares the steps,
 mlx-cc compiles every C and C++ file, mlx-ar makes the archives, the
-Mlx compiler's linker links, mlxlibcpp and mlx-unicode (projects/unicode,
-ICU's C API in Mlx) are the libraries WebKit runs on. What WebKit's
+Mlx compiler's linker links, mlxlibcpp and mlx-unicode (compiler/capi/icu,
+ICU's C API over std.unicode) are the libraries WebKit runs on. What WebKit's
 CMake build makes with Perl, Python, Ruby and gperf is made here by
 programs written in Mlx (generators/), and their output is that of
 WebKit's own generators to the byte.
@@ -163,5 +163,6 @@ and libANGLE.a and libGLESv2.a are made. Four include `<zlib.h>`
 (MemoryProgramCache.cpp, Program.cpp, angletypes.cpp and
 third_party/zlib/google/compression_utils_portable.cc use zlib's deflate
 and inflate streams): theirs are mlx-zlib's headers
-(mlx-out/include/mlx-zlib, made by the step zlib-headers, projects/zlib),
-and the program linking ANGLE links mlx-out/lib/libmlxz.so.
+(mlx-out/include/mlx-zlib, made by the step zlib-headers;
+compiler/capi/zlib, over std.flate), and the program linking ANGLE
+links mlx-out/lib/libmlxz.so.

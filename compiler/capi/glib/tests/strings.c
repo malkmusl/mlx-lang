@@ -1,5 +1,5 @@
-/* mlx-glib's strings, string arrays, GString, UTF-8, Base64, quarks,
-   errors and paths, printed; strings.expected is what GLib 2.80 prints
+/* mlx-glib's strings, string arrays, GString, UTF-8, Base64, checksums,
+   quarks, errors and paths, printed; strings.expected is what GLib 2.80 prints
    for the same program. */
 #include <glib.h>
 #include <glib/gprintf.h>
@@ -104,6 +104,33 @@ int main(void)
     guchar *decoded = g_base64_decode("SGVsbG8sIEdMaWIh", &decoded_len);
     printf("base64 decoded %zu '%.*s'\n", (size_t)decoded_len, (int)decoded_len, decoded);
     g_free(decoded);
+    show("base64 one", g_base64_encode((const guchar *)"a", 1));
+    show("base64 two", g_base64_encode((const guchar *)"ab", 2));
+    decoded = g_base64_decode("YW Jj\nZA==", &decoded_len);
+    printf("base64 decoded spaced %zu '%.*s'\n", (size_t)decoded_len, (int)decoded_len, decoded);
+    g_free(decoded);
+    char inplace[] = "Zm9vYmFy";
+    decoded = g_base64_decode_inplace(inplace, &decoded_len);
+    printf("base64 decoded in place %zu '%.*s'\n", (size_t)decoded_len, (int)decoded_len, decoded);
+
+    show("md5", g_compute_checksum_for_string(G_CHECKSUM_MD5, "abc", -1));
+    show("sha1", g_compute_checksum_for_string(G_CHECKSUM_SHA1, "abc", -1));
+    show("sha256", g_compute_checksum_for_string(G_CHECKSUM_SHA256, "abc", -1));
+    show("sha384", g_compute_checksum_for_string(G_CHECKSUM_SHA384, "abc", -1));
+    show("sha512", g_compute_checksum_for_string(G_CHECKSUM_SHA512, "abc", -1));
+    GChecksum *checksum = g_checksum_new(G_CHECKSUM_MD5);
+    g_checksum_update(checksum, (const guchar *)"message ", -1);
+    GChecksum *copied = g_checksum_copy(checksum);
+    g_checksum_update(checksum, (const guchar *)"digest", -1);
+    g_checksum_update(copied, (const guchar *)"digest", 6);
+    printf("md5 in parts '%s' copy '%s'\n", g_checksum_get_string(checksum), g_checksum_get_string(copied));
+    guint8 digest[64];
+    gsize digest_len = sizeof digest;
+    g_checksum_get_digest(copied, digest, &digest_len);
+    printf("md5 digest %zu %02x%02x..%02x\n", (size_t)digest_len, digest[0], digest[1], digest[15]);
+    g_checksum_free(checksum);
+    g_checksum_free(copied);
+    printf("sha384 length %zd\n", (ssize_t)g_checksum_type_get_length(G_CHECKSUM_SHA384));
 
     GQuark q = g_quark_from_string("my-quark");
     printf("quark %d same %d string '%s' try %d\n", q != 0, q == g_quark_from_static_string("my-quark"), g_quark_to_string(q), g_quark_try_string("never-made") == 0);

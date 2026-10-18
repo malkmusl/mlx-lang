@@ -113,7 +113,7 @@ and `std.gpu.swapchain` (`std/src/gpu.mlx`, `std/src/gpu/`) are Stage-1
 extensions of the same kind; see [Vulkan, SPIR-V and JSON](vulkan.md)
 (`tests/248_json_runtime.mlx` covers `std.json`).
 
-`std.truetype` (`std/src/truetype.mlx`, see [TrueType fonts](truetype.md))
+`std.truetype` (`std/src/truetype.mlx` and `std/src/truetype/`, see [Fonts](truetype.md))
 and `std.ui` (`std/src/ui.mlx` and `std/src/ui/`: layout, a canvas on the
 CPU or the GPU, and widgets for any platform, see
 [User interfaces](ui.md)) are extensions for drawing text and building
@@ -205,11 +205,17 @@ GPU's time goes on the frame the program was drawing when it began.
 `std.timezone` (`std/src/timezone.mlx`) gives local time: `load` reads the
 zone from `$TZ` (a zone name, a path or a POSIX rule) or `/etc/localtime`
 (TZif, RFC 8536, with the POSIX rule past its last transition),
-`offsetAt` gives the offset from UTC at a moment, `civil` and
+`loadSetting` takes such a setting itself, `offsetAt` gives the offset
+from UTC at a moment and `abbreviationAt` the zone's name for it
+("CEST"; `tests/358_timezone_names_runtime.mlx`), `civil` and
 `daysFromCivil` convert between seconds and the proleptic Gregorian
 calendar (`tests/279_timezone_runtime.mlx`).
 `std.process.environmentFrom(entries, name)` looks a name up in any
-NUL-terminated environment list, which `load` uses.
+NUL-terminated environment list, which `load` uses. `std.timezone.database`
+is the whole IANA database built in, by zone ID, reckoned with the same
+civil calendar; `std.unicode` is Unicode and CLDR's locale data
+(collation, normalization, IDNA, calendars, formatting): see
+[Unicode and locales](unicode.md).
 
 `std.xkb` (`std/src/xkb.mlx`, with `std/src/xkb/`) is XKB without
 libxkbcommon, behaving as libxkbcommon 1.6 does. `std.xkb.parse` reads
@@ -329,10 +335,66 @@ file that is not a PNG, finds a truncated one corrupt, and checks
 `saveFile(path, pixels, width, height, stride, alpha, allocator)` writes
 premultiplied ARGB words (rows `stride` words apart) as an 8-bit RGBA PNG,
 or RGB with `alpha` false, and returns whether it was written: each row
-with the filter that leaves the smallest differences, deflated with fixed
-Huffman codes and LZ77 matches over a 32 KiB window. `mlx-capture`
+with the filter that leaves the smallest differences, compressed by
+`std.flate` (zlib's level 6), the chunk CRCs by `std.crc`. `mlx-capture`
 saves captures with it. `tests/292_png_encode_runtime.mlx` writes an image
 both ways and reads it back with `loadFile`.
+
+`std.flate` (`std/src/flate.mlx`, its parts in `std/src/flate/`) is the
+repository's one DEFLATE implementation: raw deflate data (RFC 1951), zlib
+streams (RFC 1950) and gzip members (RFC 1952), compressed and
+decompressed. The compressor is zlib's (1.3.1) step for step, every level
+(0 stored, 1 to 3 fast, 4 to 9 lazy matching) and strategy, so its bytes
+are zlib's; the decompressor is zlib's state machine, taking input and
+output in pieces of any size and checking the check values.
+
+```mlx
+const flate = @import("std.flate")
+
+// All at once, into the caller's buffer (0: did not fit, or damaged):
+const room = flate.compressBound(length, flate.Format.zlib)
+const made = flate.compress(data, length, output, room, 6, flate.Format.zlib, allocator)
+const size = flate.decompress(input, count, buffer, capacity, flate.Format.gzip)
+
+// All at once, into an allocator's memory, growing as needed:
+var result: flate.Buffer = undefined
+if flate.decompressAlloc(allocator, input, count, flate.Format.detect, &result) == flate.Status.done {
+    // result.bytes[0..result.length]
+    flate.freeBuffer(allocator, &result)
+}
+
+// In pieces:
+var deflater: flate.Deflater = undefined
+if flate.deflaterInit(&deflater, allocator, flate.options(9, flate.Format.gzip)) == flate.Status.ok {
+    var progress: flate.Progress = undefined
+    const status = flate.deflaterRun(&deflater, piece, pieceLength, out, 4096, flate.Flush.finish, &progress)
+    // progress.consumed taken, progress.produced written; again until Status.done
+    flate.deflaterEnd(&deflater)
+}
+```
+
+`Format` is `raw`, `zlib`, `gzip` or `detect` (decompression: zlib or
+gzip, as the header says); `Status` is `ok`, `done`, `needDictionary`,
+`damaged`, `noMemory`, `stuck` (no progress without more input or room)
+or `misuse`; `Flush` and `Strategy` are zlib's flushes and strategies, and
+`options(level, format)` gives a compressor's `Options` with zlib's
+defaults for the rest (a 32 KiB window, memory level 8). The deflater
+also takes a dictionary, a gzip `Header`, new parameters on the way and
+`deflaterBound`; the inflater a dictionary and a place for the gzip
+header it reads, and `message(&inflater.stream)` words what was wrong
+("incorrect header check"...). `decompress` needs no allocator (its state
+is 8 KiB of stack). `inflate` (raw data), `gunzip` and `gzipSize` are the
+earlier one-call forms. The engine itself (`std.flate.deflate`,
+`std.flate.inflate`, on a `Stream` with zlib's return codes) is what the
+zlib C API, `compiler/capi/zlib` (`libmlxz.so`, `<zlib.h>` for C and C++
+programs), is made of. `tests/343_flate_runtime.mlx` checks zlib's bytes,
+round trips in every format and in pieces, and damaged data.
+
+`std.crc` (`std/src/crc.mlx`) has the check values: `crc32(crc, data,
+length)` (the CRC-32 of gzip, zlib, PNG and ZIP, 0 to start),
+`adler32(adler, data, length)` (1 to start), `crc32Join` and `adler32Join`
+(the value of two pieces put together), and `cksum(data, length)` with
+`cksumUpdate` and `cksumFinish` (the CRC of POSIX cksum).
 
 ## Core: allocators
 
@@ -568,13 +630,15 @@ const arena_interface = bootstrap.arena_allocator.interface(&arena)
 
 `std/bootstrap/mem.mlx` implements the raw memory ops (`copy`,
 `copyBackwards`, `set`, `zero`, `eql`, all over `[*]u8`/length pairs, 8-byte
-unrolled) plus little-endian read/write helpers specialized to 16/32/64 bits
-(`readU16Little`, `readU32Little`, `readU64Little`,
-`writeU16Little`/`writeU32Little`/`writeU64Little`). This covers the
-`MemoryOps` half of `mem.xml` but is narrower than its `EndianHelpers`
-surface: there is no generic `readInt`/`writeInt`, `byteSwap`, or
+unrolled) plus little- and big-endian read/write helpers specialized to
+16/32/64 bits (`readU16Little`, `readU32Little`, `readU64Little`,
+`writeU16Little`/`writeU32Little`/`writeU64Little`, and the network-order
+`readU16Big`/`readU32Big`/`readU64Big`, `writeU16Big`/`writeU32Big`/
+`writeU64Big`). This covers the `MemoryOps` half of `mem.xml` but is
+narrower than its `EndianHelpers` surface: there is no generic
+`readInt`/`writeInt`, `byteSwap`, or
 `nativeToLittle`/`nativeToBig`/`littleToNative`/`bigToNative` — only the
-concrete little-endian read/write pairs above. `132_page_allocator_runtime.mlx`
+concrete read/write pairs above. `132_page_allocator_runtime.mlx`
 and `131_bootstrap_allocator_runtime.mlx` exercise the page allocator and a
 custom `fakeAlloc` plugged into the `Allocator` interface directly;
 `120_bootstrap_mem_runtime.mlx` exercises `copy`/`set`/`eql` over fixed byte
@@ -662,7 +726,8 @@ specialized over.
 **Source tests:** `134_bootstrap_fs_runtime.mlx`,
 `142_bootstrap_process_arguments_runtime.mlx`,
 `204_process_environment_runtime.mlx`, `205_bootstrap_fs_status_runtime.mlx`,
-`139_bootstrap_elf_file_runtime.mlx`, `277_fs_entries_runtime.mlx`
+`139_bootstrap_elf_file_runtime.mlx`, `277_fs_entries_runtime.mlx`,
+`353_fs_whole_files_runtime.mlx` (run by `tests/run_std_modules.sh`)
 
 `fs.xml` names a portable filesystem API (`open create read write seek stat
 iterateDirectory makeDir delete rename`) "over std.os/std.posix backends,"
@@ -689,6 +754,30 @@ while std.fs.nextEntry(&reader, &entry) {
     ...
 }
 if reader.failed { ... }
+```
+
+Whole files, by path, the way a program reads a setting or a /proc value
+and writes a cache (`tests/353_fs_whole_files_runtime.mlx`):
+`readFile(path, into, capacity)` reads all of a file or its first
+`capacity` bytes and returns how many (0 when it could not be opened;
+`readFileResult` returns -1 then), `readFileAlloc(path, allocator)` reads
+one of any length into an `ArrayList` (null when it could not be opened),
+`writeFile(path, bytes, length, mode)` writes one (made or emptied first),
+and `replaceFile(path, bytes, length, mode)` writes one whole or not at
+all: into `PATH.new`, made anew with `mode`, then renamed over `PATH`.
+`makeDirectories(path, mode)` is `mkdir -p` (for a slice),
+`makeParents(path, mode)` makes the folders a file goes in, `isDirectory`
+follows links, and `executablePath(into, capacity)` is /proc/self/exe's
+target, NUL-terminated. The desktop's settings files, the coreutils'
+operands, mlx-init, mlx-netd, mlx-sh, the generators under std/registry
+and the compiler's own output use them.
+
+```mlx
+var line: [256]u8 = undefined
+const bytes: [*]u8 = &line
+const length = std.fs.readFile("/proc/sys/kernel/hostname".pointer, bytes, 256)
+// `path` a slice, `c_path` the same path NUL-terminated.
+if !std.fs.makeParents(path, 493) || !std.fs.replaceFile(c_path, text.pointer, text.length, 420) { ... }
 ```
 
 A round-trip open/write/seek/read/close/delete over `/tmp`:
@@ -816,7 +905,8 @@ pub fn main() -> u8 {
 ## math (`std.math`)
 
 **Implementation:** `std/src/math.mlx`
-**Source tests:** `325_standard_math_runtime.mlx`, `324_float_rounding_runtime.mlx`
+**Source tests:** `325_standard_math_runtime.mlx`, `324_float_rounding_runtime.mlx`,
+`350_math_helpers_runtime.mlx`
 
 Floating-point math in Mlx on the doubles' bits, without libm. Import it as
 `@import("std.math")`; it imports nothing itself, so a `--plugin` library
@@ -826,7 +916,16 @@ can use it too.
   `infinity()`, `negativeInfinity()`, `nan()`, `isNan(x)`, `abs(x)`.
 - Whole numbers: `floor`, `ceil`, `trunc` are the builtins `@floor`,
   `@ceil`, `@trunc` (one instruction); `round(x)` rounds halves away from
-  zero. The square root is `@sqrt`.
+  zero.
+- `min(a, b)`, `max(a, b)`, `clamp(x, low, high)` and `absolute(x)` on
+  `f64`, and `minOf`, `maxOf`, `clampOf`, `absoluteOf` for any number type
+  named first (`math.minOf(u32, version, 4)`); an `anytype` parameter
+  would take a literal's type from the literal, so the type is given.
+  `sqrt(x)` is `@sqrt` but 0 from 0 down (NaN stays NaN), what lengths
+  want; `smoothstep(from, to, x)` is 0 up to `from`, 1 from `to` on and
+  3t² − 2t³ between. The splash, MLX Observatory, `std.ui.vector`, the
+  compositor and the Android runtime use these instead of copies of
+  their own.
 - `sin(x)`, `cos(x)`: argument reduction by pi/2 in three parts, then
   fdlibm's minimax kernels; within an ulp of the exact value for |x| up to
   about 2^20 pi, 0 past 2^52 (NaN for the infinities and NaN).
@@ -851,6 +950,213 @@ pub fn main() -> u8 {
 ```
 
 (`tests/325_standard_math_runtime.mlx`)
+
+## Encodings (`std.base64`)
+
+**Implementation:** `std/src/base64.mlx`
+**Source tests:** `347_base64_runtime.mlx` (run by `tests/run_std_modules.sh`)
+
+The encodings of RFC 4648 — `Encoding.base64`, `base64url`, `base32`,
+`base32hex` and `base16` — without allocating: the caller sizes the
+output with `encodedLength(encoding, length, padded)` and
+`decodedLength(encoding, length)`. `encode(encoding, bytes, out, padded)`
+and `decode(encoding, text, out, ignoreGarbage)` work in one call; an
+`Encoder` (`encoderInit`, `encodeUpdate`, `encodeFinal`) and a `Decoder`
+(`decoderInit`, `decodeUpdate`) take the data in pieces and keep the bits
+of an unfinished symbol or byte between them. Decoding skips line breaks,
+spaces and tabs, stops at the padding, and refuses (or, with
+`ignoreGarbage`, skips) bytes outside the alphabet. `hexEncode` writes
+lower-case hex, the way digests are printed, and `hexDecode` reads hex
+of either case. The coreutils `base64`, `base32` and `basenc` and GLib's
+`g_base64_*` (`compiler/capi/glib/strings.mlx`) use it.
+
+```mlx
+const base64 = @import("std.base64")
+
+pub fn main() -> u8 {
+    var out: [8]u8 = undefined
+    const bytes: [*]u8 = &out
+    const count = base64.encode(base64.Encoding.base64, "foo", bytes, true)   // "Zm9v"
+    const back = base64.decode(base64.Encoding.base64, bytes[0..count], bytes, false)
+    return if back.ok && back.length == 3 { 13 } else { 1 }
+}
+```
+
+## Digests (`std.md5`, `std.blake2`, `std.sha1`, `std.sha2`)
+
+**Implementation:** `std/src/md5.mlx`, `std/src/blake2.mlx`,
+`std/src/sha1.mlx`, `std/src/sha2.mlx`
+**Source tests:** `348_md5_blake2_runtime.mlx`, `349_sha2_runtime.mlx`
+(run by `tests/run_std_modules.sh`); `tools/check_wifi.sh` for SHA-1's
+HMAC and PBKDF2
+
+Each digest has a state that takes the message in pieces (`…Init`,
+`…Update`, `…Final`, which wipes the state) and a one-call function;
+`std.base64.hexEncode` prints a digest the way the `…sum` tools do.
+
+- `std.md5`: `Md5`, `md5Init`, `md5Update`, `md5Final(&state, *[16]u8)`,
+  `md5(bytes, *[16]u8)` and `md5Hex(bytes, *[32]u8)` (RFC 1321; for the
+  formats that still use it, not for security). md5sum, the thumbnail
+  cache's file names (`projects/desktop/shared/thumbs.mlx`) and GLib's
+  `GChecksum` use it.
+- `std.blake2`: BLAKE2b (RFC 7693) with digests of 1 to 64 bytes, keyed
+  with up to 64 bytes or not: `Blake2b`, `blake2bInit(&state, length,
+  key)`, `blake2bUpdate`, `blake2bFinal(&state, out)`, `blake2b(bytes,
+  *[64]u8)` (512 bits, unkeyed, what b2sum prints) and
+  `blake2bWith(bytes, key, out, length)`.
+- `std.sha1`: SHA-1, HMAC-SHA1 and PBKDF2-HMAC-SHA1 (what WPA2 needs).
+- `std.sha2`: SHA-256 and SHA-512 (`Sha256`, `Sha512`, `sha256Init`,
+  `sha256Update`, `sha256Final`, `sha256`, and the same for 512), SHA-224
+  and SHA-384 on the same states from their own initial words
+  (`sha224Init` and `sha224Final(&state, *[28]u8)` on a `Sha256`,
+  `sha384Init` and `sha384Final(&state, *[48]u8)` on a `Sha512`;
+  `sha224`, `sha384` in one call), HMAC-SHA256 and PBKDF2-HMAC-SHA256.
+
+```mlx
+const md5 = @import("std.md5")
+const blake2 = @import("std.blake2")
+
+pub fn main() -> u8 {
+    var text: [32]u8 = undefined
+    md5.md5Hex("abc", &text)                  // 900150983cd24fb0d6963f7d28e17f72
+    var digest: [64]u8 = undefined
+    blake2.blake2b("abc", &digest)            // ba80a53f...
+    return if text[0] == 57 && digest[0] == 186 { 13 } else { 1 }
+}
+```
+
+## Random numbers (`std.random`)
+
+**Implementation:** `std/src/random.mlx`
+**Source tests:** `351_random_runtime.mlx` (run by `tests/run_std_modules.sh`)
+
+- From the kernel (getrandom(2)): `fill(into, length)` (false only on a
+  kernel without getrandom), `random64()` and `random32()` (mixed from the
+  monotonic clock if the kernel gives nothing, so they never fail), and
+  `getrandom(into, length, flags)` as the kernel answers it. Keys,
+  nonces and ids come from these: mlx-netd's DHCP transaction ids and
+  WPA nonces, MLXIPC's bus id, libpipewire's `pw_getrandom`/`pw_random`
+  and shuf without `--random-source`.
+- Seeded, for numbers that repeat with their seed: `Xoshiro256`
+  (xoshiro256**, its 256-bit state filled from the seed by splitmix64)
+  with `seed(&g, value)`, `seedFromKernel(&g)`, `next(&g)`,
+  `below(&g, bound)` (unbiased) and `unit(&g)` (a double in [0, 1));
+  `splitmix64(&state)` itself; and `Xorshift64Star` (Marsaglia's
+  xorshift64*) with `xorshift64StarNext` and `xorshift64StarUnit`, the
+  sequence the boot splash draws its stars from. None of these is for
+  secrets.
+
+```mlx
+const random = @import("std.random")
+
+pub fn main() -> u8 {
+    var generator: random.Xoshiro256 = undefined
+    random.seed(&generator, 42)
+    const roll = random.below(&generator, 6)       // 0 to 5, the same for seed 42
+    var key: [16]u8 = undefined
+    if !random.fill(&key, 16) { return 1 }
+    return if roll < 6 { 13 } else { 2 }
+}
+```
+
+## Terminals (`std.terminal.tty`)
+
+**Implementation:** `std/src/terminal/tty.mlx`
+**Source tests:** `352_terminal_tty_runtime.mlx` (run by `tests/run_std_modules.sh`)
+
+The terminal a program runs on, on Linux: `isTerminal(descriptor)`;
+`windowSize(descriptor, &size)`, `columns(descriptor)` and
+`rows(descriptor)` (0 when unknown); the modes as a `Termios`
+(`getAttributes`, `setAttributes`) and `makeRaw(&cooked, &raw)` for a line
+editor (no echo, no canonical input, no signals from keys, no CR
+translation or flow control, reads of one byte); and job control:
+`foregroundGroup`, `setForegroundGroup`, `setProcessGroup` and
+`processGroup`. mlx-sh's line editor and job control and ls's column
+width use it; the test runs it on a pseudo-terminal of its own.
+
+## Base directories (`std.xdg`)
+
+**Implementation:** `std/src/xdg.mlx`
+**Source tests:** `354_xdg_runtime.mlx` (run by `tests/run_std_modules.sh`)
+
+Where a program keeps its files, by the XDG Base Directory
+Specification, from an environment list (`[*][*]const u8`, the program's
+or a child's). `home(environment, kind, into, capacity)` writes the
+user's directory of `kind` — `CONFIG` (`$XDG_CONFIG_HOME`, else
+`~/.config`), `DATA` (`~/.local/share`), `CACHE` (`~/.cache`) or `STATE`
+(`~/.local/state`) — NUL-terminated and returns its length, 0 when there
+is no home or it does not fit; `path(environment, kind, rest, into,
+capacity)` is the same with `rest` after it, all of it or nothing.
+`runtimeDirectory` is `$XDG_RUNTIME_DIR`; `dataDirectories` and
+`configDirectories` are the system's colon-separated lists (with the
+specification's defaults), walked by `nextDirectory(list, &at,
+&directory)`. As the specification asks, an empty or relative variable is
+ignored, and so is a `$HOME` that is not absolute. The desktop's settings
+and caches (the audio server, the compositor, the settings app, the dock's
+pins, the clock, the top bar, the trash, the thumbnails, MLXIPC's policy,
+service files and prompts, the greeter's sessions), std.ui's appearance,
+std.xkb, std.vulkan's loader and the code map use it.
+
+```mlx
+const xdg = @import("std.xdg")
+
+var path: [512]u8 = undefined
+const bytes: [*]u8 = &path
+const length = xdg.path(environment, xdg.CONFIG, "/mlx/audio.conf", bytes, 512)
+if length == 0 { ... }                          // no home, or too long
+```
+
+## Accounts and groups (`std.passwd`)
+
+**Implementation:** `std/src/passwd.mlx`
+**Source tests:** `355_passwd_runtime.mlx` (run by `tests/run_std_modules.sh`)
+
+The accounts of /etc/passwd (`User`: `name`, `password`, `id`, `group`,
+`gecos`, `home`, `shell`) and the groups of /etc/group (`Group`: `name`,
+`password`, `id`, `members`), their fields slices of the file's text.
+`parseUser` and `parseGroup` read one line (false for a line with too
+few or too many fields or a number that is not one); `findUserNamed`,
+`findUserById`, `findGroupNamed` and `findGroupById` search a file's text;
+`userById`, `userNamed`, `groupById` and `groupNamed` read the file into
+the caller's buffer first. Nothing allocates. chown, chgrp and ls (the
+coreutils), libpulse's user name and home and libpipewire's user name use
+it.
+
+## Settings files (`std.conf`)
+
+**Implementation:** `std/src/conf.mlx`
+**Source tests:** `356_conf_runtime.mlx` (run by `tests/run_std_modules.sh`)
+
+The "key = value" files the desktop and its services keep: blanks around
+keys and values, `#` comment lines, `[Group]` lines. `parseLine(line,
+&entry)` says what a line is (`BLANK`, `ENTRY`, `GROUP` or `OTHER`, a line
+without `=`); `lines(text)` and `next(&lines, &entry)` walk a file's
+entries, each with the group it is in; `find(text, key)` is the first
+value of a key; `parseSwitch(value, &on)` reads on/off, yes/no, true/false
+and 1/0.
+
+```mlx
+const conf = @import("std.conf")
+
+var lines = conf.lines(text)
+var entry: conf.Entry = undefined
+while conf.next(&lines, &entry) {
+    if std.text.same(entry.key, "volume") { ... entry.value ... }
+}
+```
+
+## Patterns (`std.glob`)
+
+**Implementation:** `std/src/glob.mlx`
+**Source tests:** `357_glob_runtime.mlx` (run by `tests/run_std_modules.sh`)
+
+The shell's patterns, as fnmatch has them: `*`, `?` and sets (`[a-z]`,
+`[!...]` or `[^...]`, a `]` first a member, a `[` without its `]` itself),
+over whole byte strings. `matches(pattern, text)` takes a backslash as
+making the next byte stand for itself; `matchesQuoted(pattern, literal,
+text)` takes the bytes a shell quoted instead (`literal[i] & 1`). mlx-sh's
+pathname expansion, `case` and `${...#...}`, and ls's `--ignore` and
+`--hide` use it.
 
 ## fmt
 

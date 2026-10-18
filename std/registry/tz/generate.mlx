@@ -1,0 +1,973 @@
+// The time zones of std.timezone.database, made from the IANA time zone
+// database (std/registry/tz: tzdata.zi, the database in the form zic reads,
+// and zone.tab, the zones of each country):
+//
+//     tz-generate TZ-DIRECTORY OUTPUT-FILE
+//
+// writes OUTPUT-FILE (std/src/timezone/tzdata.mlx): every zone ID
+// (zones and links, sorted), the zone each names, its country, and for
+// each zone its transitions, worked out from the rules as zic does: the
+// moments its standard offset or its daylight saving changes, each with
+// the two after it, through 2037 (or the last year a rule names); past
+// them, the rules in force at the end ("max" rules) give the transitions
+// of later years. `./mlx build unicode-zones` runs it on this checkout.
+const std = @import("std")
+
+const SYS_mmap: usize = 9
+const SYS_exit_group: usize = 231
+
+// The years done one by one: through LAST_YEAR at least.
+const LAST_YEAR: i64 = 2037
+const MAX_YEAR: i64 = 999999
+const MIN_YEAR: i64 = -999999
+
+// Times of day: on the wall clock, in standard time, in universal time.
+const WALL: i64 = 0
+const STANDARD: i64 = 1
+const UNIVERSAL: i64 = 2
+
+// Days: a day of the month, the last WEEKDAY, WEEKDAY on or after DAY,
+// WEEKDAY on or before DAY.
+const DAY_NUMBER: i64 = 0
+const DAY_LAST: i64 = 1
+const DAY_AFTER: i64 = 2
+const DAY_BEFORE: i64 = 3
+
+// Zone lines' rules: none, a fixed amount saved, rules by name.
+const RULES_NONE: i64 = 0
+const RULES_FIXED: i64 = 1
+const RULES_NAMED: i64 = 2
+
+// ---------------------------------------------------------------------------
+// Memory: an arena, reserved and never freed (the run is short).
+
+var arenaNext: usize = 0
+var arenaEnd: usize = 0
+
+fn alloc(size: usize) -> usize {
+    if arenaNext == 0 {
+        const reserved = std.linux.syscall6(SYS_mmap, 0, 4294967296, 3, 16418, @bitCast(usize, @intCast(isize, -1)), 0)
+        if reserved < 0 { fail("no memory") }
+        arenaNext = @bitCast(usize, reserved)
+        arenaEnd = arenaNext + 4294967296
+    }
+    const at = (arenaNext + 15) / 16 * 16
+    if at + size > arenaEnd { fail("out of memory") }
+    arenaNext = at + size
+    return at
+}
+
+fn put8(address: usize, value: u8) -> void { unsafe { @ptrFromInt(*u8, address).* = value } }
+fn get8(address: usize) -> u8 { unsafe { return @ptrFromInt(*u8, address).* } }
+
+fn bytes(address: usize, length: usize) -> []const u8 {
+    var view: [*]const u8 = undefined
+    unsafe { view = @ptrFromInt([*]const u8, address) }
+    return view[0..length]
+}
+
+fn say(text: []const u8) -> void {
+    const ignored = std.io.writeAll(std.io.stderr(), text)
+}
+
+fn fail(message: []const u8) -> void {
+    say("tz-generate: ")
+    say(message)
+    say("\n")
+    const ignored = std.linux.syscall1(SYS_exit_group, 1)
+}
+
+fn same(first: []const u8, second: []const u8) -> bool {
+    if first.length != second.length { return false }
+    var index: usize = 0
+    while index < first.length {
+        if first[index] != second[index] { return false }
+        index += 1
+    }
+    return true
+}
+
+fn lower(byte: u8) -> u8 { return if byte >= 65 && byte <= 90 { byte + 32 } else { byte } }
+
+// Whether `word` begins `name`, letters compared without case.
+fn abbreviates(word: []const u8, name: []const u8) -> bool {
+    if word.length == 0 || word.length > name.length { return false }
+    var index: usize = 0
+    while index < word.length {
+        if lower(word[index]) != lower(name[index]) { return false }
+        index += 1
+    }
+    return true
+}
+
+// Byte order, for sorting the IDs.
+fn before(first: []const u8, second: []const u8) -> bool {
+    var index: usize = 0
+    while index < first.length && index < second.length {
+        if first[index] != second[index] { return first[index] < second[index] }
+        index += 1
+    }
+    return first.length < second.length
+}
+
+fn join(first: []const u8, second: []const u8) -> []const u8 {
+    const at = alloc(first.length + second.length + 1)
+    var index: usize = 0
+    while index < first.length {
+        put8(at + index, first[index])
+        index += 1
+    }
+    index = 0
+    while index < second.length {
+        put8(at + first.length + index, second[index])
+        index += 1
+    }
+    return bytes(at, first.length + second.length)
+}
+
+fn readWhole(path: []const u8) -> []const u8 {
+    const capacity: usize = 16777216
+    const data = alloc(capacity)
+    const length = std.fs.readFileResult(join(path, "").pointer, unsafe { @ptrFromInt([*]u8, data) }, capacity)
+    if length < 0 { fail(join("cannot read ", path)) }
+    return bytes(data, @bitCast(usize, length))
+}
+
+fn writeWhole(path: []const u8, text: []const u8) -> void {
+    if !std.fs.writeFile(join(path, "").pointer, text.pointer, text.length, 420) { fail(join("cannot write ", path)) }
+}
+
+// ---------------------------------------------------------------------------
+// Output: text built up in one buffer.
+
+const OUT_SIZE: usize = 67108864
+var outBase: usize = 0
+var outTop: usize = 0
+
+fn out(text: []const u8) -> void {
+    if outBase == 0 { outBase = alloc(OUT_SIZE) }
+    if outTop + text.length > OUT_SIZE { fail("the output is too large") }
+    var index: usize = 0
+    while index < text.length {
+        put8(outBase + outTop + index, text[index])
+        index += 1
+    }
+    outTop += text.length
+}
+
+fn outNumber(value: i64) -> void {
+    var digits: [24]u8 = undefined
+    var count: usize = 0
+    var rest: u64 = if value < 0 { @intCast(u64, -value) } else { @intCast(u64, value) }
+    while true {
+        digits[23 - count] = @intCast(u8, 48 + rest % 10)
+        count += 1
+        rest = rest / 10
+        if rest == 0 { break }
+    }
+    if value < 0 { out("-") }
+    var view: [*]const u8 = undefined
+    unsafe { view = @ptrCast([*]const u8, &digits) }
+    out(view[24 - count..24])
+}
+
+// `pub var NAME: [count]KIND = [count]KIND{ ... }` of `values`.
+fn outArray(name: []const u8, kind: []const u8, values: [*]i64, count: usize) -> void {
+    out("pub var ")
+    out(name)
+    out(": [")
+    outNumber(@intCast(i64, count))
+    out("]")
+    out(kind)
+    out(" = [")
+    outNumber(@intCast(i64, count))
+    out("]")
+    out(kind)
+    out("{")
+    var index: usize = 0
+    while index < count {
+        if index % 12 == 0 { out("\n    ") } else { out(" ") }
+        outNumber(values[index])
+        out(",")
+        index += 1
+    }
+    out("\n}\n\n")
+}
+
+fn numbers(count: usize) -> [*]i64 {
+    unsafe { return @ptrFromInt([*]i64, alloc(count * 8 + 8)) }
+}
+
+// ---------------------------------------------------------------------------
+// The calendar (proleptic Gregorian, as zic counts).
+
+fn floorDivide(value: i64, divisor: i64) -> i64 {
+    const quotient = value / divisor
+    return if value % divisor != 0 && (value < 0) != (divisor < 0) { quotient - 1 } else { quotient }
+}
+
+fn isLeap(year: i64) -> bool { return (year % 4 == 0 && year % 100 != 0) || year % 400 == 0 }
+
+fn monthLength(year: i64, month: i64) -> i64 {
+    if month == 2 { return if isLeap(year) { 29 } else { 28 } }
+    if month == 4 || month == 6 || month == 9 || month == 11 { return 30 }
+    return 31
+}
+
+fn daysFromCivil(year: i64, month: i64, day: i64) -> i64 {
+    const y = if month <= 2 { year - 1 } else { year }
+    const era = floorDivide(y, 400)
+    const yearOfEra = y - era * 400
+    const shifted = if month > 2 { month - 3 } else { month + 9 }
+    const dayOfYear = (153 * shifted + 2) / 5 + day - 1
+    return era * 146097 + yearOfEra * 365 + yearOfEra / 4 - yearOfEra / 100 + dayOfYear - 719468
+}
+
+fn weekday(days: i64) -> i64 {
+    const value = (days + 4) % 7
+    return if value < 0 { value + 7 } else { value }
+}
+
+// ---------------------------------------------------------------------------
+// The database: rules, zones (their lines), links.
+
+const Rule = struct {
+    name: []const u8
+    from: i64
+    to: i64
+    month: i64
+    dayKind: i64
+    day: i64
+    weekday: i64
+    at: i64
+    atType: i64
+    save: i64
+    // While a zone is worked out: whether it is still to be done in the
+    // year, and its moment then (local, by its own kind of time).
+    todo: bool
+    moment: i64
+}
+
+const Line = struct {
+    stdoff: i64
+    rulesKind: i64
+    save: i64
+    rules: []const u8
+    hasUntil: bool
+    until: Rule
+}
+
+const Zone = struct {
+    name: []const u8
+    firstLine: usize
+    lineCount: usize
+}
+
+const Identifier = struct {
+    name: []const u8
+    // The zone's name, for a link.
+    target: []const u8
+    zone: usize
+    region: i64
+}
+
+var rules: [*]Rule = undefined
+var ruleCount: usize = 0
+var lines: [*]Line = undefined
+var lineCount: usize = 0
+var zones: [*]Zone = undefined
+var zoneCount: usize = 0
+var ids: [*]Identifier = undefined
+var idCount: usize = 0
+// The version line's text (a global holds no slice: its address and
+// length).
+var versionAddress: usize = 0
+var versionLength: usize = 0
+
+// The fields of a line of text, split at blanks.
+var lineAddress: usize = 0
+var fieldStarts: [16]usize = undefined
+var fieldLengths: [16]usize = undefined
+var fieldCount: usize = 0
+
+fn split(line: []const u8) -> void {
+    lineAddress = @intFromPtr(line.pointer)
+    fieldCount = 0
+    var index: usize = 0
+    while index < line.length && fieldCount < 16 {
+        while index < line.length && (line[index] == 32 || line[index] == 9) { index += 1 }
+        if index >= line.length || line[index] == 35 { break }
+        const start = index
+        while index < line.length && line[index] != 32 && line[index] != 9 { index += 1 }
+        fieldStarts[fieldCount] = start
+        fieldLengths[fieldCount] = index - start
+        fieldCount += 1
+    }
+}
+
+fn field(index: usize) -> []const u8 { return bytes(lineAddress + fieldStarts[index], fieldLengths[index]) }
+
+fn isDigit(byte: u8) -> bool { return byte >= 48 && byte <= 57 }
+
+fn integer(text: []const u8) -> i64 {
+    var sign: i64 = 1
+    var index: usize = 0
+    if text.length > 0 && text[0] == 45 {
+        sign = -1
+        index = 1
+    }
+    var value: i64 = 0
+    while index < text.length && isDigit(text[index]) {
+        value = value * 10 + @intCast(i64, text[index] - 48)
+        index += 1
+    }
+    return sign * value
+}
+
+// [-]h[:mm[:ss]] in seconds, and its kind (the letter after it).
+var timeKind: i64 = WALL
+
+fn clock(text: []const u8) -> i64 {
+    timeKind = WALL
+    if text.length == 0 || same(text, "-") { return 0 }
+    var sign: i64 = 1
+    var index: usize = 0
+    if text[0] == 45 {
+        sign = -1
+        index = 1
+    }
+    var parts: [3]i64 = [3]i64{ 0, 0, 0 }
+    var part: usize = 0
+    while index < text.length {
+        const byte = text[index]
+        if isDigit(byte) {
+            parts[part] = parts[part] * 10 + @intCast(i64, byte - 48)
+        } else if byte == 58 {
+            if part < 2 { part += 1 }
+        } else if byte == 46 {
+            // Fractions of a second: zic rounds them; none are used.
+            while index + 1 < text.length && isDigit(text[index + 1]) { index += 1 }
+        } else {
+            const letter = lower(byte)
+            if letter == 115 { timeKind = STANDARD }
+            if letter == 117 || letter == 103 || letter == 122 { timeKind = UNIVERSAL }
+            if letter == 119 { timeKind = WALL }
+        }
+        index += 1
+    }
+    return sign * (parts[0] * 3600 + parts[1] * 60 + parts[2])
+}
+
+const MONTHS: [12][]const u8 = [12][]const u8{ "January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December" }
+const WEEKDAYS: [7][]const u8 = [7][]const u8{ "Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday" }
+
+fn monthOf(word: []const u8) -> i64 {
+    const names = MONTHS
+    var index: usize = 0
+    while index < 12 {
+        if abbreviates(word, names[index]) { return @intCast(i64, index + 1) }
+        index += 1
+    }
+    fail(join("not a month: ", word))
+    return 1
+}
+
+fn weekdayOf(word: []const u8) -> i64 {
+    const names = WEEKDAYS
+    var index: usize = 0
+    while index < 7 {
+        if abbreviates(word, names[index]) { return @intCast(i64, index) }
+        index += 1
+    }
+    fail(join("not a day of the week: ", word))
+    return 0
+}
+
+// A day: `5`, `lastSun`, `Sun>=8`, `Sun<=25`.
+fn dayOf(text: []const u8, rule: *Rule) -> void {
+    rule.*.dayKind = DAY_NUMBER
+    rule.*.day = 1
+    rule.*.weekday = 0
+    if text.length == 0 { return }
+    if isDigit(text[0]) {
+        rule.*.day = integer(text)
+        return
+    }
+    if text.length > 4 && abbreviates(text[0..4], "last") {
+        rule.*.dayKind = DAY_LAST
+        rule.*.weekday = weekdayOf(text[4..text.length])
+        return
+    }
+    var index: usize = 0
+    while index + 1 < text.length {
+        if (text[index] == 62 || text[index] == 60) && text[index + 1] == 61 {
+            rule.*.dayKind = if text[index] == 62 { DAY_AFTER } else { DAY_BEFORE }
+            rule.*.weekday = weekdayOf(text[0..index])
+            rule.*.day = integer(text[index + 2..text.length])
+            return
+        }
+        index += 1
+    }
+    fail(join("not a day: ", text))
+}
+
+// The moment of `rule` in `year`: seconds since 1970 as if its time
+// were universal (zic's rpytime).
+fn moment(rule: *const Rule, year: i64) -> i64 {
+    var days: i64 = 0
+    const month = rule.*.month
+    if rule.*.dayKind == DAY_NUMBER {
+        days = daysFromCivil(year, month, rule.*.day)
+    } else if rule.*.dayKind == DAY_LAST {
+        days = daysFromCivil(year, month, monthLength(year, month))
+        while weekday(days) != rule.*.weekday { days -= 1 }
+    } else if rule.*.dayKind == DAY_AFTER {
+        days = daysFromCivil(year, month, rule.*.day)
+        while weekday(days) != rule.*.weekday { days += 1 }
+    } else {
+        days = daysFromCivil(year, month, rule.*.day)
+        while weekday(days) != rule.*.weekday { days -= 1 }
+    }
+    return days * 86400 + rule.*.at
+}
+
+fn year(text: []const u8, otherwise: i64) -> i64 {
+    if abbreviates(text, "only") && text.length >= 1 && lower(text[0]) == 111 { return otherwise }
+    if text.length >= 2 && abbreviates(text, "maximum") { return MAX_YEAR }
+    if text.length >= 2 && abbreviates(text, "minimum") { return MIN_YEAR }
+    return integer(text)
+}
+
+fn readRule() -> void {
+    // R NAME FROM TO - IN ON AT SAVE LETTER
+    if fieldCount < 9 { fail("a rule without its fields") }
+    var rule = &rules[ruleCount]
+    rule.*.name = field(1)
+    rule.*.from = year(field(2), 0)
+    rule.*.to = year(field(3), rule.*.from)
+    rule.*.month = monthOf(field(5))
+    dayOf(field(6), rule)
+    rule.*.at = clock(field(7))
+    rule.*.atType = timeKind
+    rule.*.save = clock(field(8))
+    ruleCount += 1
+}
+
+// A zone line's fields from `first` on: STDOFF RULES FORMAT [UNTIL].
+fn readLine(first: usize) -> void {
+    if fieldCount < first + 3 { fail("a zone line without its fields") }
+    var line = &lines[lineCount]
+    line.*.stdoff = clock(field(first))
+    const named = field(first + 1)
+    line.*.rules = named
+    line.*.save = 0
+    if same(named, "-") {
+        line.*.rulesKind = RULES_NONE
+    } else if isDigit(named[0]) || (named.length > 1 && named[0] == 45 && isDigit(named[1])) {
+        line.*.rulesKind = RULES_FIXED
+        line.*.save = clock(named)
+    } else {
+        line.*.rulesKind = RULES_NAMED
+    }
+    line.*.hasUntil = fieldCount > first + 3
+    if line.*.hasUntil {
+        var until = &line.*.until
+        until.*.from = integer(field(first + 3))
+        until.*.to = until.*.from
+        until.*.month = if fieldCount > first + 4 { monthOf(field(first + 4)) } else { 1 }
+        if fieldCount > first + 5 { dayOf(field(first + 5), until) } else { dayOf("", until) }
+        until.*.at = if fieldCount > first + 6 { clock(field(first + 6)) } else { 0 }
+        until.*.atType = if fieldCount > first + 6 { timeKind } else { WALL }
+        until.*.save = 0
+    }
+    zones[zoneCount - 1].lineCount += 1
+    lineCount += 1
+}
+
+fn readDatabase(text: []const u8) -> void {
+    unsafe {
+        rules = @ptrFromInt([*]Rule, alloc(4096 * @sizeOf(Rule)))
+        lines = @ptrFromInt([*]Line, alloc(4096 * @sizeOf(Line)))
+        zones = @ptrFromInt([*]Zone, alloc(1024 * @sizeOf(Zone)))
+        ids = @ptrFromInt([*]Identifier, alloc(2048 * @sizeOf(Identifier)))
+    }
+    var at: usize = 0
+    var inZone = false
+    while at < text.length {
+        const start = at
+        while at < text.length && text[at] != 10 { at += 1 }
+        const line = text[start..at]
+        at += 1
+        if line.length > 10 && same(line[0..10], "# version ") {
+            versionAddress = @intFromPtr(line.pointer) + 10
+            versionLength = line.length - 10
+            continue
+        }
+        split(line)
+        if fieldCount == 0 { continue }
+        const kind = field(0)
+        if same(kind, "R") {
+            inZone = false
+            if ruleCount >= 4096 { fail("too many rules") }
+            readRule()
+        } else if same(kind, "Z") {
+            if zoneCount >= 1024 || idCount >= 2048 { fail("too many zones") }
+            zones[zoneCount] = Zone.{ .name = field(1), .firstLine = lineCount, .lineCount = 0 }
+            ids[idCount] = Identifier.{ .name = field(1), .target = field(1), .zone = zoneCount, .region = 0 }
+            zoneCount += 1
+            idCount += 1
+            inZone = true
+            if lineCount >= 4096 { fail("too many zone lines") }
+            readLine(2)
+        } else if same(kind, "L") {
+            inZone = false
+            if idCount >= 2048 { fail("too many links") }
+            ids[idCount] = Identifier.{ .name = field(2), .target = field(1), .zone = 0, .region = 0 }
+            idCount += 1
+        } else if inZone {
+            if lineCount >= 4096 { fail("too many zone lines") }
+            readLine(0)
+        } else {
+            fail(join("a line of tzdata.zi not understood: ", line))
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Transitions, as zic works them out (its outzone): the zone's lines in
+// turn, the rules of a line year by year in the order they take effect.
+
+var times: [*]i64 = undefined
+var raws: [*]i64 = undefined
+var saves: [*]i64 = undefined
+var transitionCount: usize = 0
+var zoneTimes: [*]i64 = undefined
+var zoneRaws: [*]i64 = undefined
+var zoneSaves: [*]i64 = undefined
+var zoneTransitionCount: usize = 0
+
+fn add(time: i64, raw: i64, save: i64) -> void {
+    if zoneTransitionCount >= 65536 { fail("too many transitions in a zone") }
+    zoneTimes[zoneTransitionCount] = time
+    zoneRaws[zoneTransitionCount] = raw
+    zoneSaves[zoneTransitionCount] = save
+    zoneTransitionCount += 1
+}
+
+// The last year a line's rules are done one by one.
+fn lastYear(name: []const u8) -> i64 {
+    var last = LAST_YEAR
+    var index: usize = 0
+    while index < ruleCount {
+        if same(rules[index].name, name) && rules[index].to != MAX_YEAR && rules[index].to > last { last = rules[index].to }
+        index += 1
+    }
+    return last
+}
+
+fn firstYear(name: []const u8) -> i64 {
+    var first = MAX_YEAR
+    var index: usize = 0
+    while index < ruleCount {
+        if same(rules[index].name, name) && rules[index].from < first { first = rules[index].from }
+        index += 1
+    }
+    return first
+}
+
+// A moment by its kind of time, in universal time.
+fn universal(local: i64, kind: i64, stdoff: i64, save: i64) -> i64 {
+    if kind == UNIVERSAL { return local }
+    if kind == STANDARD { return local - stdoff }
+    return local - stdoff - save
+}
+
+var initialRaw: i64 = 0
+var initialSave: i64 = 0
+var finalYear: i64 = 0
+var finalRaw: i64 = 0
+// The last line, when its rules go on ("max"); NO_LINE otherwise.
+const NO_LINE: usize = 999999
+var finalLine: usize = NO_LINE
+
+fn compile(zone: *const Zone) -> void {
+    zoneTransitionCount = 0
+    finalYear = 0
+    finalLine = NO_LINE
+    var initialSet = false
+    var starttime: i64 = 0
+    var index: usize = 0
+    while index < zone.*.lineCount {
+        // Each line begins guessing nothing saved, as zic does.
+        var save: i64 = 0
+        const line = &lines[zone.*.firstLine + index]
+        var usestart = index > 0
+        const useuntil = index + 1 < zone.*.lineCount
+        const stdoff = line.*.stdoff
+        var startoff = stdoff
+        var startKnown = false
+        if line.*.rulesKind != RULES_NAMED {
+            save = line.*.save
+            if usestart {
+                add(starttime, stdoff, save)
+                usestart = false
+            } else if !initialSet {
+                initialRaw = stdoff
+                initialSave = save
+                initialSet = true
+            }
+        } else {
+            const name = line.*.rules
+            const last = lastYear(name)
+            if !useuntil {
+                finalYear = last + 1
+                finalRaw = stdoff
+                finalLine = zone.*.firstLine + index
+            }
+            var y = firstYear(name)
+            if y == MAX_YEAR { fail(join("no rules named ", name)) }
+            while y <= last {
+                if useuntil && y > line.*.until.from { break }
+                var r: usize = 0
+                while r < ruleCount {
+                    var rule = &rules[r]
+                    rule.*.todo = same(rule.*.name, name) && y >= rule.*.from && y <= rule.*.to
+                    if rule.*.todo { rule.*.moment = moment(rule, y) }
+                    r += 1
+                }
+                while true {
+                    var untiltime: i64 = 0
+                    if useuntil { untiltime = universal(moment(&line.*.until, line.*.until.from), line.*.until.atType, stdoff, save) }
+                    // The rule to do that takes effect first.
+                    var chosen: usize = ruleCount
+                    var ktime: i64 = 0
+                    r = 0
+                    while r < ruleCount {
+                        if rules[r].todo {
+                            const jtime = universal(rules[r].moment, rules[r].atType, stdoff, save)
+                            if chosen == ruleCount || jtime < ktime {
+                                chosen = r
+                                ktime = jtime
+                            }
+                        }
+                        r += 1
+                    }
+                    if chosen == ruleCount { break }
+                    var rule = &rules[chosen]
+                    rule.*.todo = false
+                    if useuntil && ktime >= untiltime {
+                        if !startKnown && stdoff + rule.*.save == startoff { startKnown = true }
+                        break
+                    }
+                    save = rule.*.save
+                    if usestart && ktime == starttime { usestart = false }
+                    if usestart {
+                        if ktime < starttime {
+                            startoff = stdoff + save
+                            startKnown = true
+                            continue
+                        }
+                        if !startKnown && startoff == stdoff + save { startKnown = true }
+                    }
+                    if !initialSet && save == 0 {
+                        initialRaw = stdoff
+                        initialSave = 0
+                        initialSet = true
+                    }
+                    add(ktime, stdoff, rule.*.save)
+                }
+                y += 1
+            }
+        }
+        if usestart { add(starttime, stdoff, startoff - stdoff) }
+        if useuntil { starttime = universal(moment(&line.*.until, line.*.until.from), line.*.until.atType, stdoff, save) }
+        index += 1
+    }
+    if !initialSet {
+        initialRaw = lines[zone.*.firstLine].stdoff
+        initialSave = 0
+    }
+}
+
+// The zone's transitions sorted (stably), merged as zic merges them and
+// those changing nothing dropped, appended to the table.
+fn keep() -> void {
+    // Insertion sort: they come nearly in order.
+    var index: usize = 1
+    while index < zoneTransitionCount {
+        const time = zoneTimes[index]
+        const raw = zoneRaws[index]
+        const save = zoneSaves[index]
+        var place = index
+        while place > 0 && zoneTimes[place - 1] > time {
+            zoneTimes[place] = zoneTimes[place - 1]
+            zoneRaws[place] = zoneRaws[place - 1]
+            zoneSaves[place] = zoneSaves[place - 1]
+            place -= 1
+        }
+        zoneTimes[place] = time
+        zoneRaws[place] = raw
+        zoneSaves[place] = save
+        index += 1
+    }
+    // zic's optimization: a transition whose local time is not later
+    // than the one before it (each by the offset before it) replaces
+    // that one, or undoes it when it returns to what was before.
+    var kept: usize = 0
+    index = 0
+    while index < zoneTransitionCount {
+        if kept > 0 {
+            const raw2 = if kept == 1 { initialRaw } else { zoneRaws[kept - 2] }
+            const save2 = if kept == 1 { initialSave } else { zoneSaves[kept - 2] }
+            const previous = zoneRaws[kept - 1] + zoneSaves[kept - 1]
+            if zoneTimes[index] + previous <= zoneTimes[kept - 1] + raw2 + save2 {
+                if zoneRaws[index] == raw2 && zoneSaves[index] == save2 {
+                    kept -= 1
+                } else {
+                    zoneRaws[kept - 1] = zoneRaws[index]
+                    zoneSaves[kept - 1] = zoneSaves[index]
+                }
+                index += 1
+                continue
+            }
+        }
+        zoneTimes[kept] = zoneTimes[index]
+        zoneRaws[kept] = zoneRaws[index]
+        zoneSaves[kept] = zoneSaves[index]
+        kept += 1
+        index += 1
+    }
+    // Those changing nothing dropped.
+    var raw = initialRaw
+    var save = initialSave
+    index = 0
+    while index < kept {
+        if zoneRaws[index] != raw || zoneSaves[index] != save {
+            raw = zoneRaws[index]
+            save = zoneSaves[index]
+            times[transitionCount] = zoneTimes[index]
+            raws[transitionCount] = raw
+            saves[transitionCount] = save
+            transitionCount += 1
+        }
+        index += 1
+    }
+}
+
+// ---------------------------------------------------------------------------
+// zone.tab: CODE COORDINATES ZONE [COMMENT]
+
+fn readCountries(text: []const u8) -> void {
+    var at: usize = 0
+    while at < text.length {
+        const start = at
+        while at < text.length && text[at] != 10 { at += 1 }
+        const line = text[start..at]
+        at += 1
+        if line.length == 0 || line[0] == 35 { continue }
+        var tab = 0
+        var index: usize = 0
+        var zoneStart: usize = 0
+        var zoneEnd = line.length
+        while index < line.length {
+            if line[index] == 9 {
+                tab += 1
+                if tab == 2 { zoneStart = index + 1 }
+                if tab == 3 {
+                    zoneEnd = index
+                    break
+                }
+            }
+            index += 1
+        }
+        if line.length < 2 || tab < 2 { continue }
+        const region = (@intCast(i64, line[0]) << 8) | @intCast(i64, line[1])
+        const name = line[zoneStart..zoneEnd]
+        var id: usize = 0
+        while id < idCount {
+            if same(ids[id].name, name) { ids[id].region = region }
+            id += 1
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+
+fn generate(directory: []const u8, output: []const u8) -> void {
+    readDatabase(readWhole(join(directory, "/tzdata.zi")))
+    // The IDs sorted, each naming its zone.
+    var index: usize = 1
+    while index < idCount {
+        const id = ids[index]
+        var place = index
+        while place > 0 && before(id.name, ids[place - 1].name) {
+            ids[place] = ids[place - 1]
+            place -= 1
+        }
+        ids[place] = id
+        index += 1
+    }
+    index = 0
+    while index < idCount {
+        var found = false
+        var z: usize = 0
+        while z < zoneCount {
+            if same(zones[z].name, ids[index].target) {
+                ids[index].zone = z
+                found = true
+                break
+            }
+            z += 1
+        }
+        if !found { fail(join("a link to no zone: ", ids[index].name)) }
+        index += 1
+    }
+    readCountries(readWhole(join(directory, "/zone.tab")))
+    // A link without a country of its own has its zone's.
+    index = 0
+    while index < idCount {
+        if ids[index].region == 0 {
+            var other: usize = 0
+            while other < idCount {
+                if same(ids[other].name, ids[index].target) {
+                    ids[index].region = ids[other].region
+                    break
+                }
+                other += 1
+            }
+        }
+        index += 1
+    }
+
+    times = numbers(262144)
+    raws = numbers(262144)
+    saves = numbers(262144)
+    zoneTimes = numbers(65536)
+    zoneRaws = numbers(65536)
+    zoneSaves = numbers(65536)
+    const firsts = numbers(zoneCount + 1)
+    const initialRaws = numbers(zoneCount)
+    const initialSaves = numbers(zoneCount)
+    const finalYears = numbers(zoneCount)
+    const finalRaws = numbers(zoneCount)
+    const finalFirsts = numbers(zoneCount + 1)
+    const finalMonths = numbers(4096)
+    const finalDayKinds = numbers(4096)
+    const finalDays = numbers(4096)
+    const finalWeekdays = numbers(4096)
+    const finalAts = numbers(4096)
+    const finalAtTypes = numbers(4096)
+    const finalSaves = numbers(4096)
+    var finalCount: usize = 0
+    var z: usize = 0
+    while z < zoneCount {
+        if transitionCount > 200000 { fail("too many transitions") }
+        firsts[z] = @intCast(i64, transitionCount)
+        compile(&zones[z])
+        keep()
+        initialRaws[z] = initialRaw
+        initialSaves[z] = initialSave
+        finalFirsts[z] = @intCast(i64, finalCount)
+        finalYears[z] = 0
+        finalRaws[z] = 0
+        if finalLine != NO_LINE {
+            const finalName = lines[finalLine].rules
+            var r: usize = 0
+            while r < ruleCount {
+                const rule = rules[r]
+                if same(rule.name, finalName) && rule.to == MAX_YEAR {
+                    finalMonths[finalCount] = rule.month
+                    finalDayKinds[finalCount] = rule.dayKind
+                    finalDays[finalCount] = rule.day
+                    finalWeekdays[finalCount] = rule.weekday
+                    finalAts[finalCount] = rule.at
+                    finalAtTypes[finalCount] = rule.atType
+                    finalSaves[finalCount] = rule.save
+                    finalCount += 1
+                }
+                r += 1
+            }
+            if finalCount > @intCast(usize, finalFirsts[z]) {
+                finalYears[z] = finalYear
+                finalRaws[z] = finalRaw
+            }
+        }
+        z += 1
+    }
+    firsts[zoneCount] = @intCast(i64, transitionCount)
+    finalFirsts[zoneCount] = @intCast(i64, finalCount)
+
+    out("// The time zones of std.timezone.database: made by tz-generate\n")
+    out("// (std/registry/tz/generate.mlx) from the IANA time zone database\n")
+    out("// (std/registry/tz/tzdata.zi, zone.tab); do not\n")
+    out("// edit. Times are seconds since 1970 (UTC), offsets seconds.\n\n")
+    out("pub const VERSION: []const u8 = \"")
+    out(bytes(versionAddress, versionLength))
+    out("\"\n\n")
+    out("pub const ID_COUNT: usize = ")
+    outNumber(@intCast(i64, idCount))
+    out("\n\n// The IDs, sorted, each ended by a newline.\npub const IDS: []const u8 = \"")
+    const starts = numbers(idCount + 1)
+    const idZones = numbers(idCount)
+    const regions = numbers(idCount)
+    const canonical = numbers(idCount)
+    var offset: usize = 0
+    index = 0
+    while index < idCount {
+        starts[index] = @intCast(i64, offset)
+        out(ids[index].name)
+        out("\\n")
+        offset += ids[index].name.length + 1
+        idZones[index] = @intCast(i64, ids[index].zone)
+        regions[index] = ids[index].region
+        canonical[index] = if same(ids[index].name, ids[index].target) { 1 } else { 0 }
+        index += 1
+    }
+    starts[idCount] = @intCast(i64, offset)
+    out("\"\n\n")
+    out("pub const ZONE_COUNT: usize = ")
+    outNumber(@intCast(i64, zoneCount))
+    out("\n\n// Where each ID begins in IDS.\n")
+    outArray("ID_STARTS", "u32", starts, idCount + 1)
+    out("// The zone each ID names; whether it is the zone's own name; its\n// country (two letters, the first in the high byte), 0 for none.\n")
+    outArray("ID_ZONES", "u16", idZones, idCount)
+    outArray("ID_CANONICAL", "u8", canonical, idCount)
+    outArray("ID_REGIONS", "u16", regions, idCount)
+    out("// Each zone's transitions: TRANSITION_* from ZONE_FIRSTS[zone] to\n// ZONE_FIRSTS[zone + 1]; before them the zone's initial offsets.\n")
+    outArray("ZONE_FIRSTS", "u32", firsts, zoneCount + 1)
+    outArray("ZONE_INITIAL_RAWS", "i32", initialRaws, zoneCount)
+    outArray("ZONE_INITIAL_SAVES", "i32", initialSaves, zoneCount)
+    out("// From the year ZONE_FINAL_YEARS[zone] (0: none) the standard offset\n// ZONE_FINAL_RAWS[zone] and the rules FINAL_* from ZONE_FINAL_FIRSTS[zone]:\n// month, day (kind: 0 the day, 1 the last weekday, 2 weekday on or after\n// day, 3 on or before), time (kind: 0 wall clock, 1 standard, 2 UTC),\n// saved.\n")
+    outArray("ZONE_FINAL_YEARS", "i32", finalYears, zoneCount)
+    outArray("ZONE_FINAL_RAWS", "i32", finalRaws, zoneCount)
+    outArray("ZONE_FINAL_FIRSTS", "u16", finalFirsts, zoneCount + 1)
+    outArray("FINAL_MONTHS", "u8", finalMonths, finalCount)
+    outArray("FINAL_DAY_KINDS", "u8", finalDayKinds, finalCount)
+    outArray("FINAL_DAYS", "u8", finalDays, finalCount)
+    outArray("FINAL_WEEKDAYS", "u8", finalWeekdays, finalCount)
+    outArray("FINAL_ATS", "i32", finalAts, finalCount)
+    outArray("FINAL_AT_KINDS", "u8", finalAtTypes, finalCount)
+    outArray("FINAL_SAVES", "i32", finalSaves, finalCount)
+    out("pub const TRANSITION_COUNT: usize = ")
+    outNumber(@intCast(i64, transitionCount))
+    out("\n\n")
+    outArray("TRANSITION_TIMES", "i64", times, transitionCount)
+    outArray("TRANSITION_RAWS", "i32", raws, transitionCount)
+    outArray("TRANSITION_SAVES", "i32", saves, transitionCount)
+    writeWhole(output, bytes(outBase, outTop))
+}
+
+fn cString(pointer: [*]const u8) -> []const u8 {
+    var length: usize = 0
+    while pointer[length] != 0 { length += 1 }
+    return pointer[0..length]
+}
+
+pub fn main(arguments: [][*]const u8) -> u8 {
+    if arguments.length != 3 {
+        say("usage: tz-generate TZ-DIRECTORY OUTPUT-FILE\n")
+        return 2
+    }
+    generate(cString(arguments[1]), cString(arguments[2]))
+    return 0
+}
