@@ -20,10 +20,12 @@ count=$(ls "$made"/*.lut.h | wc -l)
 
 if [ -n "${JSC_REFERENCE:-}" ]; then
     compared=0
-    for file in "$made"/*; do
-        name=$(basename "$file")
+    # Every file made (the bundles in unified-sources/ too), but the
+    # forwarding headers, which WebKit's build makes as links.
+    for file in $(cd "$made" && find . -type f -not -path "./Headers/*" -not -path "./PrivateHeaders/*" | sed 's|^\./||' | sort); do
+        name=$file
         [ -f "$JSC_REFERENCE/$name" ] || fail "$name: not in $JSC_REFERENCE"
-        cmp -s "$file" "$JSC_REFERENCE/$name" || fail "$name differs from $JSC_REFERENCE/$name"
+        cmp -s "$made/$file" "$JSC_REFERENCE/$name" || fail "$name differs from $JSC_REFERENCE/$name"
         compared=$((compared + 1))
     done
     echo "check_webkit_generators: $compared files the same as WebKit's generators make them"
