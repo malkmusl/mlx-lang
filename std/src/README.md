@@ -29,6 +29,9 @@ base32hex and base16, in one call or in pieces, and lower-case hex.
 keyed or not, of any digest length up to 64 bytes.
 `random.mlx` (`std.random`) has the kernel's random bytes (getrandom)
 and seeded generators: xoshiro256** and, by name, xorshift64*.
+`terminal/tty.mlx` (`std.terminal.tty`) is the terminal a program runs
+on: whether a descriptor is one, its size, raw mode and the foreground
+process group.
 `sha1.mlx` (`std.sha1`) has SHA-1, HMAC-SHA1 and PBKDF2-HMAC-SHA1, and
 `aes.mlx` (`std.aes`) AES-128 on blocks and the RFC 3394 key wrap: what
 WPA2 needs (`tools/check_wifi.sh`).

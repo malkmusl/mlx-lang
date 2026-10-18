@@ -970,6 +970,21 @@ pub fn main() -> u8 {
 }
 ```
 
+## Terminals (`std.terminal.tty`)
+
+**Implementation:** `std/src/terminal/tty.mlx`
+**Source tests:** `348_terminal_tty_runtime.mlx` (run by `tests/run_std_modules.sh`)
+
+The terminal a program runs on, on Linux: `isTerminal(descriptor)`;
+`windowSize(descriptor, &size)`, `columns(descriptor)` and
+`rows(descriptor)` (0 when unknown); the modes as a `Termios`
+(`getAttributes`, `setAttributes`) and `makeRaw(&cooked, &raw)` for a line
+editor (no echo, no canonical input, no signals from keys, no CR
+translation or flow control, reads of one byte); and job control:
+`foregroundGroup`, `setForegroundGroup`, `setProcessGroup` and
+`processGroup`. mlx-sh's line editor and job control and ls's column
+width use it; the test runs it on a pseudo-terminal of its own.
+
 ## fmt
 
 **Normative source:** `spec/04-stdlib/fmt.xml`
