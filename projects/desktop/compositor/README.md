@@ -1125,7 +1125,14 @@ with it whenever the parent is focused. `xdg_wm_dialog_v1` version 1
 by a click, the dock or a hotkey, gives the keyboard to the dialog, as
 GNOME does. A window cannot be its own parent or its dialog's
 (`invalid_parent`); when a parent goes, its dialogs belong to its own
-parent. `wp_tearing_control_manager_v1` and `wp_content_type_manager_v1`
+parent. `zxdg_exporter_v2` and `zxdg_importer_v2` version 1
+([`foreign.mlx`](foreign.mlx), xdg-foreign) do the same across programs:
+one exports its window and gets a handle (32 random hex digits), another
+given it (a portal's file chooser, a sandboxed program's dialog) imports
+it and makes a window of its own that window's dialog (`foreign: TITLE
+over TITLE`); a handle there is not is destroyed at once, and when the
+exported window goes, so do its imports.
+`wp_tearing_control_manager_v1` and `wp_content_type_manager_v1`
 version 1 ([`hints.mlx`](hints.mlx)) take what a client says of its
 surface: that a game's frames may tear (`tearing: async TITLE`; frames
 are still shown at the vertical blank, which the protocol allows) and
@@ -1694,7 +1701,7 @@ finished`.
   `presentation.mlx` (presentation feedback), `data_control.mlx`
   (clipboard tools), `dialogs.mlx` (windows of windows, modal dialogs),
   `hints.mlx` (tearing and content-type hints), `idle.mlx` (idle
-  notifications),
+  notifications), `foreign.mlx` (windows parented across programs),
   `launching.mlx` (launching programs) and `lock.mlx` (the session lock,
   logging out).
 - `dmabuf.mlx`: linux-dmabuf; each dma-buf becomes a one-buffer pool.
@@ -1719,3 +1726,8 @@ with copy and paste between two clients (`wl-copy`, `wl-paste`) and a GTK 4
 window (`gtk4-widget-factory`) when those are installed;
 `tools/check_vulkan_wayland.sh` checks the Vulkan client in both renderers
 over `wl_shm` and linux-dmabuf, pixel by pixel.
+`tools/check_wayland_protocols.sh [compiler]` runs one client each against
+the smaller protocols (viewports, cursor shapes, presentation feedback,
+dialogs and xdg-foreign, the tearing and content-type hints, idle
+notifications, data-control), on both renderers where pixels are
+compared.

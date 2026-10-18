@@ -18,7 +18,7 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent / "projects" / "desktop" / "compositor"
-FILES = ["shell.mlx", "protocols.mlx", "data.mlx", "dmabuf.mlx", "pointer.mlx", "capture.mlx", "xwayland.mlx", "lock.mlx", "primary.mlx", "extras.mlx", "viewport.mlx", "data_control.mlx", "presentation.mlx", "dialogs.mlx", "hints.mlx", "idle.mlx"]
+FILES = ["shell.mlx", "protocols.mlx", "data.mlx", "dmabuf.mlx", "pointer.mlx", "capture.mlx", "xwayland.mlx", "lock.mlx", "primary.mlx", "extras.mlx", "viewport.mlx", "data_control.mlx", "presentation.mlx", "dialogs.mlx", "hints.mlx", "idle.mlx", "foreign.mlx"]
 
 
 def registered(text):
