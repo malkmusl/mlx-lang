@@ -2,6 +2,7 @@
    errors and paths, printed; strings.expected is what GLib 2.80 prints
    for the same program. */
 #include <glib.h>
+#include <glib/gprintf.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -147,5 +148,14 @@ int main(void)
     g_set_prgname("strings-test");
     printf("prgname %s\n", g_get_prgname());
     printf("monotonic %d\n", g_get_monotonic_time() > 0);
+    {
+        char buffer[64];
+        int written = g_sprintf(buffer, "%s-%05.1f-%x", "gprintf", 3.14159, 255);
+        g_printf("g_sprintf %d '%s'\n", written, buffer);
+        g_fprintf(stdout, "g_fprintf %ld %c\n", 1234567890123L, 'z');
+        int length = g_snprintf(buffer, 4, "%d", 123456);
+        printf("g_snprintf %d '%s'\n", length, buffer);
+        fflush(stdout);
+    }
     return 0;
 }
