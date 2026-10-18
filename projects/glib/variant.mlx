@@ -1,0 +1,2469 @@
+// GVariant (gvariant.h, gvarianttype.h): typed values in GVariant's
+// serialization format.
+//
+// A GVariantType is its type string (GLib's own representation): "i",
+// "as", "(sv)", "a{sv}" and so on, not necessarily ended by a NUL where
+// it is a part of a longer one.
+//
+// A value is always kept serialized: a record of its type string (a
+// copy of its own), the GBytes holding its data, where its data starts
+// in them and its size, its references and whether the first of them
+// is floating. A child of a container is a record over a range of the
+// container's data, holding a reference to the same GBytes; a container
+// made of children copies their data into its own. The format is GLib's:
+// fixed-size values at their alignment, strings ended by a NUL, arrays
+// and tuples of variable-sized items ended by a table of framing offsets
+// (the smallest width that fits the container), a variant its child's
+// data then a NUL then the child's type string, a maybe empty or its
+// child's data (and a NUL after a variable-sized one). Data from outside
+// (g_variant_new_from_data) is read with every offset checked: what does
+// not hold together reads as the type's default value, as in GLib.
+//
+// g_variant_new and g_variant_get read GLib's format strings: basic type
+// characters, "&s", "@T", "*", "?", "r", "v", arrays of a builder or an
+// iterator, the "^as" family of C arrays, maybes and tuples. GLib's text
+// form is printed (g_variant_print) but not parsed.
+const m = @import("./memory.mlx")
+const threads = @import("./threads.mlx")
+const messages = @import("./messages.mlx")
+const varargs = @import("./varargs.mlx")
+const arrays = @import("./arrays.mlx")
+const strings = @import("./strings.mlx")
+const errors = @import("./errors.mlx")
+
+// ---------------------------------------------------------------------------
+// Type strings
+
+fn isBasic(c: u8) -> bool {
+    return c == 'b' || c == 'y' || c == 'n' || c == 'q' || c == 'i' || c == 'u' || c == 'x' || c == 't' || c == 'h' || c == 'd' || c == 's' || c == 'o' || c == 'g'
+}
+
+fn isClose(c: u8) -> bool { return c == ')' || c == '}' }
+
+// The end of the one complete type string at `t`, 0 when there is none.
+pub fn typeEnd(t: usize) -> usize {
+    const c = m.get8(t)
+    if isBasic(c) || c == 'v' || c == '*' || c == '?' || c == 'r' { return t + 1 }
+    if c == 'a' || c == 'm' { return typeEnd(t + 1) }
+    if c == '(' {
+        var p = t + 1
+        while m.get8(p) != ')' {
+            const e = typeEnd(p)
+            if e == 0 { return 0 }
+            p = e
+        }
+        return p + 1
+    }
+    if c == '{' {
+        const k = m.get8(t + 1)
+        if !(isBasic(k) || k == '?') { return 0 }
+        const e = typeEnd(t + 2)
+        if e == 0 || m.get8(e) != '}' { return 0 }
+        return e + 1
+    }
+    return 0
+}
+
+fn typeLength(t: usize) -> usize { return typeEnd(t) - t }
+
+fn isDefinite(t: usize) -> bool {
+    const end = typeEnd(t)
+    var p = t
+    while p < end {
+        const c = m.get8(p)
+        if c == '*' || c == '?' || c == 'r' { return false }
+        p += 1
+    }
+    return true
+}
+
+fn alignUp(n: usize, mask: usize) -> usize { return (n + mask) - ((n + mask) & mask) }
+
+// The alignment of a definite type's values, as a mask (0, 1, 3 or 7).
+fn alignOf(t: usize) -> usize {
+    const c = m.get8(t)
+    if c == 'n' || c == 'q' { return 1 }
+    if c == 'i' || c == 'u' || c == 'h' { return 3 }
+    if c == 'x' || c == 't' || c == 'd' || c == 'v' { return 7 }
+    if c == 'a' || c == 'm' { return alignOf(t + 1) }
+    if c == '(' || c == '{' {
+        var a: usize = 0
+        var p = t + 1
+        while !isClose(m.get8(p)) {
+            const x = alignOf(p)
+            if x > a { a = x }
+            p = typeEnd(p)
+        }
+        return a
+    }
+    return 0
+}
+
+// The size of a definite type's values when they all have the same, 0
+// when they vary.
+fn fixedSize(t: usize) -> usize {
+    const c = m.get8(t)
+    if c == 'b' || c == 'y' { return 1 }
+    if c == 'n' || c == 'q' { return 2 }
+    if c == 'i' || c == 'u' || c == 'h' { return 4 }
+    if c == 'x' || c == 't' || c == 'd' { return 8 }
+    if c == '(' || c == '{' {
+        var offset: usize = 0
+        var p = t + 1
+        while !isClose(m.get8(p)) {
+            offset = alignUp(offset, alignOf(p))
+            const s = fixedSize(p)
+            if s == 0 { return 0 }
+            offset += s
+            p = typeEnd(p)
+        }
+        if offset == 0 { return 1 }
+        return alignUp(offset, alignOf(t))
+    }
+    return 0
+}
+
+// Whether `t` is `wider` or one of the types it stands for (GLib's
+// g_variant_type_is_subtype_of).
+fn isSubtype(t: usize, wider: usize) -> bool {
+    var p = wider
+    const end = typeEnd(wider)
+    var q = t
+    while p < end {
+        const sc = m.get8(p)
+        p += 1
+        if sc == m.get8(q) {
+            q += 1
+        } else if m.get8(q) == ')' {
+            return false
+        } else {
+            if sc == 'r' {
+                if m.get8(q) != '(' { return false }
+            } else if sc == '?' {
+                if !isBasic(m.get8(q)) { return false }
+            } else if sc != '*' {
+                return false
+            }
+            q = typeEnd(q)
+        }
+    }
+    return true
+}
+
+fn sameType(a: usize, b: usize) -> bool {
+    const n = typeLength(a)
+    if n != typeLength(b) { return false }
+    var i: usize = 0
+    while i < n {
+        if m.get8(a + i) != m.get8(b + i) { return false }
+        i += 1
+    }
+    return true
+}
+
+// A NUL-ended copy of the type at `t`.
+fn dupType(t: usize) -> usize { return m.dupBytes(t, typeLength(t)) }
+
+fn itemCount(t: usize) -> usize {
+    var n: usize = 0
+    var p = t + 1
+    while !isClose(m.get8(p)) {
+        n += 1
+        p = typeEnd(p)
+    }
+    return n
+}
+
+export fn g_variant_type_string_scan(text: usize, limit: usize, endptr: usize) -> i32 {
+    const end = typeEnd(text)
+    if end == 0 || (limit != 0 && end > limit) { return 0 }
+    if endptr != 0 { m.putWord(endptr, end) }
+    return 1
+}
+
+export fn g_variant_type_string_is_valid(text: usize) -> i32 {
+    const end = typeEnd(text)
+    return if end != 0 && m.get8(end) == 0 { 1 } else { 0 }
+}
+
+export fn g_variant_type_free(t: usize) -> void { m.release(t) }
+export fn g_variant_type_copy(t: usize) -> usize { return dupType(t) }
+
+export fn g_variant_type_new(text: usize) -> usize {
+    if g_variant_type_string_is_valid(text) == 0 {
+        messages.critical("g_variant_type_new: assertion 'g_variant_type_string_is_valid (type_string)' failed")
+        return 0
+    }
+    return m.dup(text)
+}
+
+export fn g_variant_type_get_string_length(t: usize) -> usize { return typeLength(t) }
+export fn g_variant_type_peek_string(t: usize) -> usize { return t }
+export fn g_variant_type_dup_string(t: usize) -> usize { return dupType(t) }
+export fn g_variant_type_is_definite(t: usize) -> i32 { return if isDefinite(t) { 1 } else { 0 } }
+
+export fn g_variant_type_is_container(t: usize) -> i32 {
+    const c = m.get8(t)
+    return if c == 'a' || c == 'm' || c == 'r' || c == '(' || c == '{' || c == 'v' { 1 } else { 0 }
+}
+
+export fn g_variant_type_is_basic(t: usize) -> i32 {
+    const c = m.get8(t)
+    return if isBasic(c) || c == '?' { 1 } else { 0 }
+}
+
+export fn g_variant_type_is_maybe(t: usize) -> i32 { return if m.get8(t) == 'm' { 1 } else { 0 } }
+export fn g_variant_type_is_array(t: usize) -> i32 { return if m.get8(t) == 'a' { 1 } else { 0 } }
+export fn g_variant_type_is_tuple(t: usize) -> i32 { return if m.get8(t) == '(' || m.get8(t) == 'r' { 1 } else { 0 } }
+export fn g_variant_type_is_dict_entry(t: usize) -> i32 { return if m.get8(t) == '{' { 1 } else { 0 } }
+export fn g_variant_type_is_variant(t: usize) -> i32 { return if m.get8(t) == 'v' { 1 } else { 0 } }
+
+export fn g_variant_type_hash(t: usize) -> u32 {
+    var h: u32 = 0
+    const n = typeLength(t)
+    var i: usize = 0
+    while i < n {
+        h = (h << 5) -% h +% @intCast(u32, m.get8(t + i))
+        i += 1
+    }
+    return h
+}
+
+export fn g_variant_type_equal(a: usize, b: usize) -> i32 { return if sameType(a, b) { 1 } else { 0 } }
+export fn g_variant_type_is_subtype_of(t: usize, wider: usize) -> i32 { return if isSubtype(t, wider) { 1 } else { 0 } }
+export fn g_variant_type_element(t: usize) -> usize { return t + 1 }
+
+export fn g_variant_type_first(t: usize) -> usize {
+    if isClose(m.get8(t + 1)) { return 0 }
+    return t + 1
+}
+
+export fn g_variant_type_next(t: usize) -> usize {
+    const after = typeEnd(t)
+    if isClose(m.get8(after)) { return 0 }
+    return after
+}
+
+export fn g_variant_type_n_items(t: usize) -> usize { return itemCount(t) }
+export fn g_variant_type_key(t: usize) -> usize { return t + 1 }
+export fn g_variant_type_value(t: usize) -> usize { return typeEnd(t + 1) }
+
+fn wrapType(prefix: u8, element: usize) -> usize {
+    var out = m.text()
+    m.pushByte(&out, prefix)
+    m.pushBytes(&out, element, typeLength(element))
+    return m.finish(&out)
+}
+
+export fn g_variant_type_new_array(element: usize) -> usize { return wrapType('a', element) }
+export fn g_variant_type_new_maybe(element: usize) -> usize { return wrapType('m', element) }
+
+export fn g_variant_type_new_tuple(items: usize, length: i32) -> usize {
+    var out = m.text()
+    m.pushByte(&out, '(')
+    var i: usize = 0
+    while i < @intCast(usize, length) {
+        const item = m.getWord(items + i * 8)
+        m.pushBytes(&out, item, typeLength(item))
+        i += 1
+    }
+    m.pushByte(&out, ')')
+    return m.finish(&out)
+}
+
+export fn g_variant_type_new_dict_entry(key: usize, value: usize) -> usize {
+    var out = m.text()
+    m.pushByte(&out, '{')
+    m.pushBytes(&out, key, typeLength(key))
+    m.pushBytes(&out, value, typeLength(value))
+    m.pushByte(&out, '}')
+    return m.finish(&out)
+}
+
+// ---------------------------------------------------------------------------
+// Framing offsets
+
+fn offsetSizeFor(size: usize) -> usize {
+    if size == 0 { return 0 }
+    if size <= 0xff { return 1 }
+    if size <= 0xffff { return 2 }
+    if size <= 0xffffffff { return 4 }
+    return 8
+}
+
+// The width of the offsets of a container of `body` bytes and `count`
+// offsets.
+fn offsetSizeOf(body: usize, count: usize) -> usize {
+    if body + count <= 0xff { return 1 }
+    if body + 2 * count <= 0xffff { return 2 }
+    if body + 4 * count <= 0xffffffff { return 4 }
+    return 8
+}
+
+fn readOffset(address: usize, size: usize) -> usize {
+    var value: usize = 0
+    var i: usize = 0
+    while i < size {
+        value = value | (@intCast(usize, m.get8(address + i)) << @intCast(u6, i * 8))
+        i += 1
+    }
+    return value
+}
+
+fn writeOffset(out: *m.Text, value: usize, size: usize) -> void {
+    var i: usize = 0
+    while i < size {
+        m.pushByte(out, @intCast(u8, (value >> @intCast(u6, i * 8)) & 0xff))
+        i += 1
+    }
+}
+
+fn pad(out: *m.Text, mask: usize) -> void {
+    while (out.*.length & mask) != 0 { m.pushByte(out, 0) }
+}
+
+// ---------------------------------------------------------------------------
+// Values
+
+const V_TYPE: usize = 0
+const V_BYTES: usize = 8
+const V_DATA: usize = 16
+const V_SIZE: usize = 24
+const V_REFS: usize = 32
+const V_FLOATING: usize = 36
+const V_ZEROED: usize = 40
+const V_RECORD: usize = 48
+
+fn typeOf(v: usize) -> usize { return m.getWord(v + V_TYPE) }
+fn dataOf(v: usize) -> usize { return m.getWord(v + V_DATA) }
+fn sizeOf(v: usize) -> usize { return m.getWord(v + V_SIZE) }
+fn classOf(v: usize) -> u8 { return m.get8(typeOf(v)) }
+
+// A value of the type at `t` over `size` bytes at `data` in `bytes`
+// (whose reference it takes over).
+fn newValue(t: usize, bytes: usize, data: usize, size: usize, floating: bool) -> usize {
+    const v = m.alloc(V_RECORD)
+    m.putWord(v + V_TYPE, dupType(t))
+    m.putWord(v + V_BYTES, bytes)
+    m.putWord(v + V_DATA, data)
+    m.putWord(v + V_SIZE, size)
+    m.put32(v + V_REFS, 1)
+    m.put32(v + V_FLOATING, if floating { 1 } else { 0 })
+    return v
+}
+
+// A floating value of the type at `t` whose data are `out`'s.
+fn fromText(t: usize, out: *m.Text) -> usize {
+    const bytes = arrays.newBytes(out.*.address, out.*.length, arrays.freeFunction(), out.*.address)
+    return newValue(t, bytes, out.*.address, out.*.length, true)
+}
+
+fn fromBytes(t: usize, data: usize, size: usize) -> usize {
+    var out = m.text()
+    m.pushBytes(&out, data, size)
+    return fromText(t, &out)
+}
+
+pub fn ref(v: usize) -> usize {
+    threads.refInc(v + V_REFS)
+    return v
+}
+
+pub fn unref(v: usize) -> void {
+    if v == 0 { return }
+    if threads.refDec(v + V_REFS) {
+        arrays.bytesUnref(m.getWord(v + V_BYTES))
+        m.release(typeOf(v))
+        m.release(v)
+    }
+}
+
+pub fn refSink(v: usize) -> usize {
+    if m.get32(v + V_FLOATING) != 0 {
+        m.put32(v + V_FLOATING, 0)
+        return v
+    }
+    return ref(v)
+}
+
+// Children handed to a container: floating ones are consumed.
+fn consume(v: usize) -> void { unref(refSink(v)) }
+
+export fn g_variant_ref(v: usize) -> usize { return ref(v) }
+export fn g_variant_unref(v: usize) -> void { unref(v) }
+export fn g_variant_ref_sink(v: usize) -> usize { return refSink(v) }
+export fn g_variant_is_floating(v: usize) -> i32 { return @bitCast(i32, m.get32(v + V_FLOATING)) }
+
+export fn g_variant_take_ref(v: usize) -> usize {
+    m.put32(v + V_FLOATING, 0)
+    return v
+}
+
+export fn g_variant_get_type(v: usize) -> usize { return typeOf(v) }
+export fn g_variant_get_type_string(v: usize) -> usize { return typeOf(v) }
+export fn g_variant_is_of_type(v: usize, t: usize) -> i32 { return if isSubtype(typeOf(v), t) { 1 } else { 0 } }
+export fn g_variant_is_container(v: usize) -> i32 { return g_variant_type_is_container(typeOf(v)) }
+export fn g_variant_classify(v: usize) -> i32 { return @intCast(i32, classOf(v)) }
+
+// ---------------------------------------------------------------------------
+// Children
+
+const Range = struct {
+    kind: usize
+    start: usize
+    end: usize
+    ok: bool
+    owned: bool
+}
+
+fn badRange(kind: usize) -> Range { return Range.{ .kind = kind, .start = 0, .end = 0, .ok = false, .owned = false } }
+
+fn countChildren(t: usize, data: usize, size: usize) -> usize {
+    const c = m.get8(t)
+    if c == 'v' { return 1 }
+    if c == 'm' {
+        const f = fixedSize(t + 1)
+        if f != 0 { return if size == f { 1 } else { 0 } }
+        return if size == 0 { 0 } else { 1 }
+    }
+    if c == 'a' {
+        const f = fixedSize(t + 1)
+        if f != 0 { return if size % f == 0 { size / f } else { 0 } }
+        if size == 0 { return 0 }
+        const os = offsetSizeFor(size)
+        const last = readOffset(data + size - os, os)
+        if last > size { return 0 }
+        const table = size - last
+        if table % os != 0 { return 0 }
+        return table / os
+    }
+    if c == '(' || c == '{' { return itemCount(t) }
+    return 0
+}
+
+// Where child `index` of the container of type `t` over `size` bytes at
+// `data` lies, and its type.
+fn childRange(t: usize, data: usize, size: usize, index: usize) -> Range {
+    const c = m.get8(t)
+    if c == 'v' {
+        var p = size
+        var found = false
+        while p > 0 {
+            p -= 1
+            if m.get8(data + p) == 0 {
+                found = true
+                break
+            }
+        }
+        const unit = m.literal("()")
+        if !found { return badRange(unit) }
+        const kind = m.dupBytes(data + p + 1, size - p - 1)
+        const end = typeEnd(kind)
+        if end == 0 || m.get8(end) != 0 || !isDefinite(kind) {
+            m.release(kind)
+            return badRange(unit)
+        }
+        return Range.{ .kind = kind, .start = 0, .end = p, .ok = true, .owned = true }
+    }
+    if c == 'm' {
+        if fixedSize(t + 1) != 0 { return Range.{ .kind = t + 1, .start = 0, .end = size, .ok = true, .owned = false } }
+        if size == 0 || m.get8(data + size - 1) != 0 { return badRange(t + 1) }
+        return Range.{ .kind = t + 1, .start = 0, .end = size - 1, .ok = true, .owned = false }
+    }
+    if c == 'a' {
+        const f = fixedSize(t + 1)
+        if f != 0 { return Range.{ .kind = t + 1, .start = index * f, .end = index * f + f, .ok = true, .owned = false } }
+        const os = offsetSizeFor(size)
+        const last = readOffset(data + size - os, os)
+        const end = readOffset(data + last + index * os, os)
+        var start: usize = 0
+        if index > 0 { start = alignUp(readOffset(data + last + (index - 1) * os, os), alignOf(t + 1)) }
+        if start > end || end > last { return badRange(t + 1) }
+        return Range.{ .kind = t + 1, .start = start, .end = end, .ok = true, .owned = false }
+    }
+    // A tuple or a dict entry.
+    const whole = fixedSize(t)
+    if whole != 0 && size != whole { return badRange(childType(t, index)) }
+    const os = offsetSizeFor(size)
+    var framing: usize = 0
+    var previous: usize = 0
+    var p = t + 1
+    var i: usize = 0
+    while !isClose(m.get8(p)) {
+        const after = typeEnd(p)
+        const start = alignUp(previous, alignOf(p))
+        const f = fixedSize(p)
+        var end: usize = 0
+        if f != 0 {
+            end = start + f
+        } else if isClose(m.get8(after)) {
+            if framing * os > size { return badRange(p) }
+            end = size - framing * os
+        } else {
+            framing += 1
+            if framing * os > size { return badRange(p) }
+            end = readOffset(data + size - framing * os, os)
+        }
+        if i == index {
+            if start > end || end > size { return badRange(p) }
+            return Range.{ .kind = p, .start = start, .end = end, .ok = true, .owned = false }
+        }
+        previous = end
+        p = after
+        i += 1
+    }
+    return badRange(m.literal("()"))
+}
+
+fn childType(t: usize, index: usize) -> usize {
+    var p = t + 1
+    var i: usize = 0
+    while i < index {
+        p = typeEnd(p)
+        i += 1
+    }
+    return p
+}
+
+// The default value of a definite type (what data that does not hold
+// together reads as).
+fn defaultValue(t: usize) -> usize {
+    var out = m.text()
+    defaultData(t, &out)
+    return fromText(t, &out)
+}
+
+fn defaultData(t: usize, out: *m.Text) -> void {
+    const c = m.get8(t)
+    const f = fixedSize(t)
+    if f != 0 {
+        var i: usize = 0
+        while i < f {
+            m.pushByte(out, 0)
+            i += 1
+        }
+        return
+    }
+    if c == 's' || c == 'g' {
+        m.pushByte(out, 0)
+    } else if c == 'o' {
+        m.pushByte(out, '/')
+        m.pushByte(out, 0)
+    } else if c == 'v' {
+        m.pushByte(out, 0)
+        m.pushByte(out, 0)
+        m.pushText(out, "()")
+    } else if c == '(' || c == '{' {
+        var kids = m.words()
+        var p = t + 1
+        while !isClose(m.get8(p)) {
+            m.pushWord(&kids, defaultValue(p))
+            p = typeEnd(p)
+        }
+        var made = serialize(t, kids.address, kids.length)
+        m.pushBytes(out, made.address, made.length)
+        m.dispose(&made)
+        var i: usize = 0
+        while i < kids.length {
+            unref(m.wordAt(&kids, i))
+            i += 1
+        }
+        m.disposeWords(&kids)
+    }
+}
+
+pub fn childValue(v: usize, index: usize) -> usize {
+    const r = childRange(typeOf(v), dataOf(v), sizeOf(v), index)
+    var result: usize = 0
+    if !r.ok {
+        result = defaultValue(r.kind)
+    } else {
+        const f = fixedSize(r.kind)
+        if f != 0 && r.end - r.start != f {
+            result = defaultValue(r.kind)
+        } else {
+            result = newValue(r.kind, arrays.bytesRef(m.getWord(v + V_BYTES)), dataOf(v) + r.start, r.end - r.start, false)
+        }
+    }
+    m.put32(result + V_FLOATING, 0)
+    if r.owned { m.release(r.kind) }
+    return result
+}
+
+pub fn childCount(v: usize) -> usize { return countChildren(typeOf(v), dataOf(v), sizeOf(v)) }
+
+export fn g_variant_n_children(v: usize) -> usize { return childCount(v) }
+
+export fn g_variant_get_child_value(v: usize, index: usize) -> usize {
+    if index >= childCount(v) {
+        messages.critical("g_variant_get_child_value: assertion 'index_ < g_variant_n_children (value)' failed")
+        return 0
+    }
+    return childValue(v, index)
+}
+
+export fn g_variant_get_maybe(v: usize) -> usize {
+    if childCount(v) == 0 { return 0 }
+    return childValue(v, 0)
+}
+
+export fn g_variant_get_variant(v: usize) -> usize { return childValue(v, 0) }
+
+// ---------------------------------------------------------------------------
+// Containers
+
+// The data of a container of the definite type `t` made of `n` values
+// at `children`.
+fn serialize(t: usize, children: usize, n: usize) -> m.Text {
+    var out = m.text()
+    const c = m.get8(t)
+    if c == 'v' {
+        const child = m.getWord(children)
+        m.pushBytes(&out, dataOf(child), sizeOf(child))
+        m.pushByte(&out, 0)
+        m.pushC(&out, typeOf(child))
+    } else if c == 'm' {
+        if n == 1 {
+            const child = m.getWord(children)
+            m.pushBytes(&out, dataOf(child), sizeOf(child))
+            if fixedSize(t + 1) == 0 { m.pushByte(&out, 0) }
+        }
+    } else if c == 'a' {
+        const element = t + 1
+        const f = fixedSize(element)
+        const a = alignOf(element)
+        var ends = m.words()
+        var i: usize = 0
+        while i < n {
+            const child = m.getWord(children + i * 8)
+            if f == 0 { pad(&out, a) }
+            m.pushBytes(&out, dataOf(child), sizeOf(child))
+            if f == 0 { m.pushWord(&ends, out.length) }
+            i += 1
+        }
+        if f == 0 && n > 0 {
+            const os = offsetSizeOf(out.length, n)
+            i = 0
+            while i < n {
+                writeOffset(&out, m.wordAt(&ends, i), os)
+                i += 1
+            }
+        }
+        m.disposeWords(&ends)
+    } else {
+        var ends = m.words()
+        var p = t + 1
+        var i: usize = 0
+        while i < n {
+            const child = m.getWord(children + i * 8)
+            const after = typeEnd(p)
+            pad(&out, alignOf(p))
+            m.pushBytes(&out, dataOf(child), sizeOf(child))
+            if fixedSize(p) == 0 && !isClose(m.get8(after)) { m.pushWord(&ends, out.length) }
+            p = after
+            i += 1
+        }
+        const whole = fixedSize(t)
+        if whole != 0 {
+            while out.length < whole { m.pushByte(&out, 0) }
+        } else if ends.length > 0 {
+            const os = offsetSizeOf(out.length, ends.length)
+            var k = ends.length
+            while k > 0 {
+                k -= 1
+                writeOffset(&out, m.wordAt(&ends, k), os)
+            }
+        }
+        m.disposeWords(&ends)
+    }
+    return out
+}
+
+// A container of type `t` (a NUL-ended string the caller keeps) of `n`
+// children at `children`, which it consumes.
+fn container(t: usize, children: usize, n: usize) -> usize {
+    var i: usize = 0
+    while i < n {
+        _ = refSink(m.getWord(children + i * 8))
+        i += 1
+    }
+    var out = serialize(t, children, n)
+    const v = fromText(t, &out)
+    i = 0
+    while i < n {
+        unref(m.getWord(children + i * 8))
+        i += 1
+    }
+    return v
+}
+
+fn criticalText(t: *m.Text) -> void {
+    messages.log(m.literal("GLib"), messages.LEVEL_CRITICAL, t.*.address)
+    m.dispose(t)
+}
+
+fn assertion(function: []const u8, expression: []const u8) -> void {
+    var t = m.text()
+    m.pushText(&t, function)
+    m.pushText(&t, ": assertion '")
+    m.pushText(&t, expression)
+    m.pushText(&t, "' failed")
+    criticalText(&t)
+}
+
+pub fn newArray(childType_: usize, children: usize, n: usize) -> usize {
+    var element = childType_
+    if element == 0 {
+        if n == 0 {
+            assertion("g_variant_new_array", "child_type != NULL || n_children > 0")
+            return 0
+        }
+        element = typeOf(m.getWord(children))
+    }
+    var i: usize = 0
+    while i < n {
+        if !sameType(typeOf(m.getWord(children + i * 8)), element) {
+            assertion("g_variant_new_array", "g_variant_is_of_type (children[i], child_type)")
+            return 0
+        }
+        i += 1
+    }
+    const t = wrapType('a', element)
+    const v = container(t, children, n)
+    m.release(t)
+    return v
+}
+
+pub fn newTuple(children: usize, n: usize) -> usize {
+    var out = m.text()
+    m.pushByte(&out, '(')
+    var i: usize = 0
+    while i < n {
+        m.pushC(&out, typeOf(m.getWord(children + i * 8)))
+        i += 1
+    }
+    m.pushByte(&out, ')')
+    const v = container(out.address, children, n)
+    m.dispose(&out)
+    return v
+}
+
+pub fn newDictEntry(key: usize, value: usize) -> usize {
+    if !isBasic(classOf(key)) {
+        assertion("g_variant_new_dict_entry", "g_variant_is_of_type (key, G_VARIANT_TYPE_BASIC)")
+        return 0
+    }
+    const pair = m.alloc(16)
+    m.putWord(pair, key)
+    m.putWord(pair + 8, value)
+    const t = g_variant_type_new_dict_entry(typeOf(key), typeOf(value))
+    const v = container(t, pair, 2)
+    m.release(t)
+    m.release(pair)
+    return v
+}
+
+pub fn newMaybe(childType_: usize, child: usize) -> usize {
+    const element = if child != 0 { typeOf(child) } else { childType_ }
+    if element == 0 {
+        assertion("g_variant_new_maybe", "child_type != NULL || child != NULL")
+        return 0
+    }
+    const t = wrapType('m', element)
+    const cell = m.alloc(8)
+    m.putWord(cell, child)
+    const v = container(t, cell, if child != 0 { 1 } else { 0 })
+    m.release(cell)
+    m.release(t)
+    return v
+}
+
+pub fn newVariant(child: usize) -> usize {
+    const cell = m.alloc(8)
+    m.putWord(cell, child)
+    const v = container(m.literal("v"), cell, 1)
+    m.release(cell)
+    return v
+}
+
+export fn g_variant_new_array(child_type: usize, children: usize, n: usize) -> usize { return newArray(child_type, children, n) }
+export fn g_variant_new_tuple(children: usize, n: usize) -> usize { return newTuple(children, n) }
+export fn g_variant_new_dict_entry(key: usize, value: usize) -> usize { return newDictEntry(key, value) }
+export fn g_variant_new_maybe(child_type: usize, child: usize) -> usize { return newMaybe(child_type, child) }
+export fn g_variant_new_variant(child: usize) -> usize { return newVariant(child) }
+
+// ---------------------------------------------------------------------------
+// Basic values
+
+fn fixedValue(t: []const u8, value: u64, size: usize) -> usize {
+    var out = m.text()
+    var i: usize = 0
+    while i < size {
+        m.pushByte(&out, @intCast(u8, (value >> @intCast(u6, i * 8)) & 0xff))
+        i += 1
+    }
+    return fromText(m.literal(t), &out)
+}
+
+export fn g_variant_new_boolean(value: i32) -> usize { return fixedValue("b", if value != 0 { 1 } else { 0 }, 1) }
+export fn g_variant_new_byte(value: u8) -> usize { return fixedValue("y", @intCast(u64, value), 1) }
+export fn g_variant_new_int16(value: i16) -> usize { return fixedValue("n", @intCast(u64, @bitCast(u16, value)), 2) }
+export fn g_variant_new_uint16(value: u16) -> usize { return fixedValue("q", @intCast(u64, value), 2) }
+export fn g_variant_new_int32(value: i32) -> usize { return fixedValue("i", @intCast(u64, @bitCast(u32, value)), 4) }
+export fn g_variant_new_uint32(value: u32) -> usize { return fixedValue("u", @intCast(u64, value), 4) }
+export fn g_variant_new_int64(value: i64) -> usize { return fixedValue("x", @bitCast(u64, value), 8) }
+export fn g_variant_new_uint64(value: u64) -> usize { return fixedValue("t", value, 8) }
+export fn g_variant_new_handle(value: i32) -> usize { return fixedValue("h", @intCast(u64, @bitCast(u32, value)), 4) }
+export fn g_variant_new_double(value: f64) -> usize { return fixedValue("d", @bitCast(u64, value), 8) }
+
+fn stringValue(t: []const u8, text: usize) -> usize { return fromBytes(m.literal(t), text, m.cLength(text) + 1) }
+
+pub fn newString(text: usize) -> usize {
+    if text == 0 {
+        assertion("g_variant_new_string", "string != NULL")
+        return 0
+    }
+    if !strings.validate(text, -1, 0) {
+        assertion("g_variant_new_string", "g_utf8_validate (string, -1, NULL)")
+        return 0
+    }
+    return stringValue("s", text)
+}
+
+export fn g_variant_new_string(text: usize) -> usize { return newString(text) }
+
+export fn g_variant_new_take_string(text: usize) -> usize {
+    const v = newString(text)
+    m.release(text)
+    return v
+}
+
+export fn g_variant_new_printf(format: usize, a1: usize, a2: usize, a3: usize, a4: usize, a5: usize, x0: f64, x1: f64, x2: f64, x3: f64, x4: f64, x5: f64, x6: f64, x7: f64) -> usize {
+    var call: varargs.CallList = undefined
+    var words: [6]usize = [6]usize{ format, a1, a2, a3, a4, a5 }
+    var doubles: [8]f64 = [8]f64{ x0, x1, x2, x3, x4, x5, x6, x7 }
+    const list = varargs.start(&call, 1, @frameAddress(), @intFromPtr(&words), @intFromPtr(&doubles))
+    const text = varargs.formatted(format, list)
+    const v = newString(text)
+    m.release(text)
+    return v
+}
+
+// GLib's object paths: "/" or "/" separated runs of [A-Za-z0-9_].
+pub fn isObjectPath(text: usize) -> bool {
+    if m.get8(text) != '/' { return false }
+    if m.get8(text + 1) == 0 { return true }
+    var p = text + 1
+    var run: usize = 0
+    while m.get8(p) != 0 {
+        const c = m.get8(p)
+        if c == '/' {
+            if run == 0 { return false }
+            run = 0
+        } else if m.isAlnum(c) || c == '_' {
+            run += 1
+        } else {
+            return false
+        }
+        p += 1
+    }
+    return run > 0
+}
+
+// D-Bus signatures: definite types of D-Bus's characters, one after
+// another.
+pub fn isSignature(text: usize) -> bool {
+    var p = text
+    while m.get8(p) != 0 {
+        const c = m.get8(p)
+        if !(isBasic(c) || c == 'v' || c == 'a' || c == '(' || c == ')' || c == '{' || c == '}') { return false }
+        p += 1
+    }
+    p = text
+    while m.get8(p) != 0 {
+        const end = typeEnd(p)
+        if end == 0 { return false }
+        p = end
+    }
+    return true
+}
+
+export fn g_variant_is_object_path(text: usize) -> i32 { return if isObjectPath(text) { 1 } else { 0 } }
+export fn g_variant_is_signature(text: usize) -> i32 { return if isSignature(text) { 1 } else { 0 } }
+
+pub fn newObjectPath(text: usize) -> usize {
+    if !isObjectPath(text) {
+        assertion("g_variant_new_object_path", "g_variant_is_object_path (object_path)")
+        return 0
+    }
+    return stringValue("o", text)
+}
+
+pub fn newSignature(text: usize) -> usize {
+    if !isSignature(text) {
+        assertion("g_variant_new_signature", "g_variant_is_signature (signature)")
+        return 0
+    }
+    return stringValue("g", text)
+}
+
+export fn g_variant_new_object_path(text: usize) -> usize { return newObjectPath(text) }
+export fn g_variant_new_signature(text: usize) -> usize { return newSignature(text) }
+
+fn stringArray(t: []const u8, strv: usize, length: i64, maker: u8) -> usize {
+    var n: usize = 0
+    if length < 0 {
+        while m.getWord(strv + n * 8) != 0 { n += 1 }
+    } else {
+        n = @intCast(usize, length)
+    }
+    var kids = m.words()
+    var i: usize = 0
+    while i < n {
+        const text = m.getWord(strv + i * 8)
+        var kid: usize = 0
+        if maker == 's' {
+            kid = newString(text)
+        } else if maker == 'o' {
+            kid = newObjectPath(text)
+        } else {
+            kid = bytestring(text)
+        }
+        m.pushWord(&kids, kid)
+        i += 1
+    }
+    const v = newArray(m.literal(t), kids.address, n)
+    m.disposeWords(&kids)
+    return v
+}
+
+pub fn bytestring(text: usize) -> usize { return fromBytes(m.literal("ay"), text, m.cLength(text) + 1) }
+
+export fn g_variant_new_strv(strv: usize, length: i64) -> usize { return stringArray("s", strv, length, 's') }
+export fn g_variant_new_objv(strv: usize, length: i64) -> usize { return stringArray("o", strv, length, 'o') }
+export fn g_variant_new_bytestring(text: usize) -> usize { return bytestring(text) }
+export fn g_variant_new_bytestring_array(strv: usize, length: i64) -> usize { return stringArray("ay", strv, length, 'y') }
+
+export fn g_variant_new_fixed_array(element_type: usize, elements: usize, n: usize, element_size: usize) -> usize {
+    const f = fixedSize(element_type)
+    if f == 0 || f != element_size {
+        assertion("g_variant_new_fixed_array", "element_size == fixed_element_size")
+        return 0
+    }
+    const t = wrapType('a', element_type)
+    const v = fromBytes(t, elements, n * element_size)
+    m.release(t)
+    return v
+}
+
+// The getters: a value of another type is a critical and reads as 0.
+fn checkClass(v: usize, c: u8, function: []const u8, expression: []const u8) -> bool {
+    if v != 0 && classOf(v) == c && m.get8(typeOf(v) + 1) == 0 { return true }
+    assertion(function, expression)
+    return false
+}
+
+fn fixedData(v: usize, size: usize) -> usize {
+    if sizeOf(v) != size { return 0 }
+    return dataOf(v)
+}
+
+fn read8(v: usize) -> u8 {
+    const d = fixedData(v, 1)
+    return if d == 0 { 0 } else { m.get8(d) }
+}
+
+fn read16(v: usize) -> u16 {
+    const d = fixedData(v, 2)
+    return if d == 0 { 0 } else { m.get16(d) }
+}
+
+fn read32(v: usize) -> u32 {
+    const d = fixedData(v, 4)
+    return if d == 0 { 0 } else { m.get32(d) }
+}
+
+fn read64(v: usize) -> u64 {
+    const d = fixedData(v, 8)
+    return if d == 0 { 0 } else { m.get64(d) }
+}
+
+export fn g_variant_get_boolean(v: usize) -> i32 {
+    if !checkClass(v, 'b', "g_variant_get_boolean", "g_variant_is_of_type (value, G_VARIANT_TYPE_BOOLEAN)") { return 0 }
+    return if read8(v) != 0 { 1 } else { 0 }
+}
+
+export fn g_variant_get_byte(v: usize) -> u8 {
+    if !checkClass(v, 'y', "g_variant_get_byte", "g_variant_is_of_type (value, G_VARIANT_TYPE_BYTE)") { return 0 }
+    return read8(v)
+}
+
+export fn g_variant_get_int16(v: usize) -> i16 {
+    if !checkClass(v, 'n', "g_variant_get_int16", "g_variant_is_of_type (value, G_VARIANT_TYPE_INT16)") { return 0 }
+    return @bitCast(i16, read16(v))
+}
+
+export fn g_variant_get_uint16(v: usize) -> u16 {
+    if !checkClass(v, 'q', "g_variant_get_uint16", "g_variant_is_of_type (value, G_VARIANT_TYPE_UINT16)") { return 0 }
+    return read16(v)
+}
+
+export fn g_variant_get_int32(v: usize) -> i32 {
+    if !checkClass(v, 'i', "g_variant_get_int32", "g_variant_is_of_type (value, G_VARIANT_TYPE_INT32)") { return 0 }
+    return @bitCast(i32, read32(v))
+}
+
+export fn g_variant_get_uint32(v: usize) -> u32 {
+    if !checkClass(v, 'u', "g_variant_get_uint32", "g_variant_is_of_type (value, G_VARIANT_TYPE_UINT32)") { return 0 }
+    return read32(v)
+}
+
+export fn g_variant_get_int64(v: usize) -> i64 {
+    if !checkClass(v, 'x', "g_variant_get_int64", "g_variant_is_of_type (value, G_VARIANT_TYPE_INT64)") { return 0 }
+    return @bitCast(i64, read64(v))
+}
+
+export fn g_variant_get_uint64(v: usize) -> u64 {
+    if !checkClass(v, 't', "g_variant_get_uint64", "g_variant_is_of_type (value, G_VARIANT_TYPE_UINT64)") { return 0 }
+    return read64(v)
+}
+
+export fn g_variant_get_handle(v: usize) -> i32 {
+    if !checkClass(v, 'h', "g_variant_get_handle", "g_variant_is_of_type (value, G_VARIANT_TYPE_HANDLE)") { return 0 }
+    return @bitCast(i32, read32(v))
+}
+
+export fn g_variant_get_double(v: usize) -> f64 {
+    if !checkClass(v, 'd', "g_variant_get_double", "g_variant_is_of_type (value, G_VARIANT_TYPE_DOUBLE)") { return 0.0 }
+    return @bitCast(f64, read64(v))
+}
+
+// The text of a string-like value: its data when they are a proper one
+// (ended by its only NUL, valid for its type), else the type's default.
+pub fn stringOf(v: usize) -> usize {
+    const c = classOf(v)
+    const size = sizeOf(v)
+    const data = dataOf(v)
+    var good = size > 0 && m.get8(data + size - 1) == 0 && m.cLength(data) == size - 1
+    if good {
+        if c == 's' {
+            good = strings.validate(data, -1, 0)
+        } else if c == 'o' {
+            good = isObjectPath(data)
+        } else if c == 'g' {
+            good = isSignature(data)
+        }
+    }
+    if good { return data }
+    return if c == 'o' { m.literal("/") } else { m.literal("") }
+}
+
+fn isStringLike(v: usize) -> bool {
+    const c = classOf(v)
+    return c == 's' || c == 'o' || c == 'g'
+}
+
+export fn g_variant_get_string(v: usize, length: usize) -> usize {
+    if !isStringLike(v) {
+        assertion("g_variant_get_string", "g_variant_is_of_type (value, G_VARIANT_TYPE_STRING) || g_variant_is_of_type (value, G_VARIANT_TYPE_OBJECT_PATH) || g_variant_is_of_type (value, G_VARIANT_TYPE_SIGNATURE)")
+        return 0
+    }
+    const text = stringOf(v)
+    if length != 0 { m.putWord(length, m.cLength(text)) }
+    return text
+}
+
+export fn g_variant_dup_string(v: usize, length: usize) -> usize {
+    const text = g_variant_get_string(v, length)
+    return if text == 0 { 0 } else { m.dup(text) }
+}
+
+// The strings of an array of string-like values: an array of `n` + 1
+// words (the last NULL) to free with g_free, whose texts are the values'
+// own (`copy` false) or copies (an array for g_strfreev).
+fn stringsOf(v: usize, length: usize, copy: bool, bytestrings: bool) -> usize {
+    const n = childCount(v)
+    const result = m.alloc((n + 1) * 8)
+    var i: usize = 0
+    while i < n {
+        const kid = childValue(v, i)
+        var text: usize = 0
+        if bytestrings {
+            text = bytestringOf(kid)
+        } else {
+            text = stringOf(kid)
+        }
+        // The text lies in the array's data, which outlive the child.
+        m.putWord(result + i * 8, if copy { m.dup(text) } else { text })
+        unref(kid)
+        i += 1
+    }
+    if length != 0 { m.putWord(length, n) }
+    return result
+}
+
+fn checkStrings(v: usize, function: []const u8) -> bool {
+    const t = typeOf(v)
+    if m.get8(t) == 'a' && (m.get8(t + 1) == 's' || m.get8(t + 1) == 'o' || m.get8(t + 1) == 'g') && m.get8(t + 2) == 0 { return true }
+    assertion(function, "g_variant_is_of_type (value, G_VARIANT_TYPE_STRING_ARRAY)")
+    return false
+}
+
+export fn g_variant_get_strv(v: usize, length: usize) -> usize {
+    if !checkStrings(v, "g_variant_get_strv") { return 0 }
+    return stringsOf(v, length, false, false)
+}
+
+export fn g_variant_dup_strv(v: usize, length: usize) -> usize {
+    if !checkStrings(v, "g_variant_dup_strv") { return 0 }
+    return stringsOf(v, length, true, false)
+}
+
+export fn g_variant_get_objv(v: usize, length: usize) -> usize {
+    if !checkStrings(v, "g_variant_get_objv") { return 0 }
+    return stringsOf(v, length, false, false)
+}
+
+export fn g_variant_dup_objv(v: usize, length: usize) -> usize {
+    if !checkStrings(v, "g_variant_dup_objv") { return 0 }
+    return stringsOf(v, length, true, false)
+}
+
+pub fn bytestringOf(v: usize) -> usize {
+    const size = sizeOf(v)
+    if size > 0 && m.get8(dataOf(v) + size - 1) == 0 { return dataOf(v) }
+    return m.literal("")
+}
+
+export fn g_variant_get_bytestring(v: usize) -> usize { return bytestringOf(v) }
+
+export fn g_variant_dup_bytestring(v: usize, length: usize) -> usize {
+    const text = bytestringOf(v)
+    const n = m.cLength(text)
+    if length != 0 { m.putWord(length, n) }
+    return m.dupBytes(text, n)
+}
+
+export fn g_variant_get_bytestring_array(v: usize, length: usize) -> usize { return stringsOf(v, length, false, true) }
+export fn g_variant_dup_bytestring_array(v: usize, length: usize) -> usize { return stringsOf(v, length, true, true) }
+
+export fn g_variant_get_fixed_array(v: usize, n_elements: usize, element_size: usize) -> usize {
+    const t = typeOf(v)
+    const f = if m.get8(t) == 'a' { fixedSize(t + 1) } else { 0 }
+    if f == 0 || f != element_size {
+        assertion("g_variant_get_fixed_array", "fixed_element_size == element_size")
+        return 0
+    }
+    const n = if sizeOf(v) % f == 0 { sizeOf(v) / f } else { 0 }
+    m.putWord(n_elements, n)
+    return if n == 0 { 0 } else { dataOf(v) }
+}
+
+// ---------------------------------------------------------------------------
+// Data
+
+export fn g_variant_get_size(v: usize) -> usize { return sizeOf(v) }
+export fn g_variant_get_data(v: usize) -> usize { return if sizeOf(v) == 0 || m.get32(v + V_ZEROED) != 0 { 0 } else { dataOf(v) } }
+
+export fn g_variant_get_data_as_bytes(v: usize) -> usize {
+    const bytes = m.getWord(v + V_BYTES)
+    if dataOf(v) == arrays.bytesData(bytes) && sizeOf(v) == arrays.bytesSize(bytes) { return arrays.bytesRef(bytes) }
+    return arrays.newBytes(dataOf(v), sizeOf(v), arrays.bytesUnrefFunction(), arrays.bytesRef(bytes))
+}
+
+export fn g_variant_store(v: usize, data: usize) -> void { m.copy(data, dataOf(v), sizeOf(v)) }
+
+// Data of the wrong size for a fixed-size type read as zeros, which
+// GLib's g_variant_get_data does not show (NULL).
+fn outsideValue(t: usize, bytes: usize) -> usize {
+    const f = fixedSize(t)
+    if f != 0 && arrays.bytesSize(bytes) != f {
+        arrays.bytesUnref(bytes)
+        const v = defaultValue(t)
+        m.put32(v + V_ZEROED, 1)
+        return v
+    }
+    return newValue(t, bytes, arrays.bytesData(bytes), arrays.bytesSize(bytes), true)
+}
+
+export fn g_variant_new_from_bytes(t: usize, bytes: usize, trusted: i32) -> usize { return outsideValue(t, arrays.bytesRef(bytes)) }
+
+export fn g_variant_new_from_data(t: usize, data: usize, size: usize, trusted: i32, notify: usize, user_data: usize) -> usize {
+    return outsideValue(t, arrays.newBytes(data, size, notify, user_data))
+}
+
+// The value made again from its children (or for a basic value from what
+// it reads as): the normal form of its data.
+fn normalForm(v: usize) -> usize {
+    const t = typeOf(v)
+    const c = m.get8(t)
+    if c == 'a' || c == 'm' || c == '(' || c == '{' || c == 'v' {
+        const n = childCount(v)
+        var kids = m.words()
+        var i: usize = 0
+        while i < n {
+            const kid = childValue(v, i)
+            m.pushWord(&kids, normalForm(kid))
+            unref(kid)
+            i += 1
+        }
+        var out = serialize(t, kids.address, n)
+        i = 0
+        while i < n {
+            unref(m.wordAt(&kids, i))
+            i += 1
+        }
+        m.disposeWords(&kids)
+        const made = fromText(t, &out)
+        m.put32(made + V_FLOATING, 0)
+        return made
+    }
+    var made: usize = 0
+    const f = fixedSize(t)
+    if f != 0 {
+        if sizeOf(v) == f {
+            made = fromBytes(t, dataOf(v), f)
+        } else {
+            made = defaultValue(t)
+        }
+    } else {
+        const text = stringOf(v)
+        made = fromBytes(t, text, m.cLength(text) + 1)
+    }
+    m.put32(made + V_FLOATING, 0)
+    return made
+}
+
+fn sameData(a: usize, b: usize) -> bool {
+    if sizeOf(a) != sizeOf(b) { return false }
+    var i: usize = 0
+    while i < sizeOf(a) {
+        if m.get8(dataOf(a) + i) != m.get8(dataOf(b) + i) { return false }
+        i += 1
+    }
+    return true
+}
+
+export fn g_variant_get_normal_form(v: usize) -> usize { return normalForm(v) }
+
+export fn g_variant_is_normal_form(v: usize) -> i32 {
+    const normal = normalForm(v)
+    const same = sameData(v, normal)
+    unref(normal)
+    return if same { 1 } else { 0 }
+}
+
+// Every number of the value's type in `data` turned around, framing
+// offsets (always little endian) left as they are.
+fn swapData(t: usize, data: usize, size: usize) -> void {
+    const c = m.get8(t)
+    const f = fixedSize(t)
+    if c == 'n' || c == 'q' || c == 'i' || c == 'u' || c == 'h' || c == 'x' || c == 't' || c == 'd' {
+        if size != f { return }
+        var i: usize = 0
+        while i < f / 2 {
+            const x = m.get8(data + i)
+            m.put8(data + i, m.get8(data + f - 1 - i))
+            m.put8(data + f - 1 - i, x)
+            i += 1
+        }
+        return
+    }
+    if c == 'a' || c == 'm' || c == '(' || c == '{' || c == 'v' {
+        const n = countChildren(t, data, size)
+        var i: usize = 0
+        while i < n {
+            const r = childRange(t, data, size, i)
+            if r.ok { swapData(r.kind, data + r.start, r.end - r.start) }
+            if r.owned { m.release(r.kind) }
+            i += 1
+        }
+    }
+}
+
+export fn g_variant_byteswap(v: usize) -> usize {
+    const normal = normalForm(v)
+    if alignOf(typeOf(v)) == 0 { return normal }
+    const copy = fromBytes(typeOf(v), dataOf(normal), sizeOf(normal))
+    unref(normal)
+    swapData(typeOf(copy), dataOf(copy), sizeOf(copy))
+    m.put32(copy + V_FLOATING, 0)
+    return copy
+}
+
+// ---------------------------------------------------------------------------
+// Comparing
+
+export fn g_variant_hash(value: usize) -> u32 {
+    const c = classOf(value)
+    if c == 's' || c == 'o' || c == 'g' { return errors.hashBytes(stringOf(value)) }
+    if c == 'b' || c == 'y' { return @intCast(u32, read8(value)) }
+    if c == 'n' || c == 'q' { return @intCast(u32, read16(value)) }
+    if c == 'i' || c == 'u' || c == 'h' { return read32(value) }
+    if c == 'x' || c == 't' || c == 'd' {
+        const x = read64(value)
+        return @intCast(u32, x & 0xffffffff) +% @intCast(u32, x >> 32)
+    }
+    assertion("g_variant_hash", "!g_variant_is_container (value)")
+    return 0
+}
+
+export fn g_variant_equal(one: usize, two: usize) -> i32 {
+    if !sameType(typeOf(one), typeOf(two)) { return 0 }
+    const a = normalForm(one)
+    const b = normalForm(two)
+    const same = sameData(a, b)
+    unref(a)
+    unref(b)
+    return if same { 1 } else { 0 }
+}
+
+fn order(less: bool, greater: bool) -> i32 {
+    if less { return -1 }
+    if greater { return 1 }
+    return 0
+}
+
+export fn g_variant_compare(one: usize, two: usize) -> i32 {
+    const c = classOf(one)
+    if c == 'b' || c == 'y' { return order(read8(one) < read8(two), read8(one) > read8(two)) }
+    if c == 'n' {
+        const a = @bitCast(i16, read16(one))
+        const b = @bitCast(i16, read16(two))
+        return order(a < b, a > b)
+    }
+    if c == 'q' { return order(read16(one) < read16(two), read16(one) > read16(two)) }
+    if c == 'i' || c == 'h' {
+        const a = @bitCast(i32, read32(one))
+        const b = @bitCast(i32, read32(two))
+        return order(a < b, a > b)
+    }
+    if c == 'u' { return order(read32(one) < read32(two), read32(one) > read32(two)) }
+    if c == 'x' {
+        const a = @bitCast(i64, read64(one))
+        const b = @bitCast(i64, read64(two))
+        return order(a < b, a > b)
+    }
+    if c == 't' { return order(read64(one) < read64(two), read64(one) > read64(two)) }
+    if c == 'd' {
+        const a = @bitCast(f64, read64(one))
+        const b = @bitCast(f64, read64(two))
+        return order(a < b, a > b)
+    }
+    if c == 's' || c == 'o' || c == 'g' { return m.cCompare(stringOf(one), stringOf(two)) }
+    assertion("g_variant_compare", "g_variant_is_of_type (a, G_VARIANT_TYPE_BASIC)")
+    return 0
+}
+
+// ---------------------------------------------------------------------------
+// Printing (GLib's text form)
+
+extern("c") fn snprintf(buffer: usize, size: usize, format: usize, value: f64) -> i32
+
+fn isPrintable(c: u32) -> bool {
+    if c < 0x20 || (c >= 0x7f && c < 0xa0) { return false }
+    if c == 0x2028 || c == 0x2029 || c == 0xfeff || (c >= 0x200b && c <= 0x200f) { return false }
+    if c >= 0xd800 && c <= 0xdfff { return false }
+    if c >= 0xe000 && c <= 0xf8ff { return false }
+    if c >= 0xfff0 && c <= 0xffff { return c == 0xfffd }
+    return c <= 0x10ffff
+}
+
+fn hexDigits(out: *m.Text, value: u32, count: usize) -> void {
+    const digits = "0123456789abcdef"
+    var k = count
+    while k > 0 {
+        k -= 1
+        m.pushByte(out, digits[@intCast(usize, (value >> @intCast(u5, k * 4)) & 15)])
+    }
+}
+
+fn printString(out: *m.Text, text: usize) -> void {
+    var quote: u8 = 39
+    var p = text
+    while m.get8(p) != 0 {
+        if m.get8(p) == 39 { quote = 34 }
+        p += 1
+    }
+    m.pushByte(out, quote)
+    p = text
+    while m.get8(p) != 0 {
+        const c = strings.decodeUtf8(p)
+        if c == @intCast(u32, quote) || c == 92 { m.pushByte(out, 92) }
+        if isPrintable(c) {
+            m.pushBytes(out, p, strings.skipLength(m.get8(p)))
+        } else {
+            m.pushByte(out, 92)
+            if c == 7 {
+                m.pushByte(out, 'a')
+            } else if c == 8 {
+                m.pushByte(out, 'b')
+            } else if c == 12 {
+                m.pushByte(out, 'f')
+            } else if c == 10 {
+                m.pushByte(out, 'n')
+            } else if c == 13 {
+                m.pushByte(out, 'r')
+            } else if c == 9 {
+                m.pushByte(out, 't')
+            } else if c == 11 {
+                m.pushByte(out, 'v')
+            } else if c < 0x10000 {
+                m.pushByte(out, 'u')
+                hexDigits(out, c, 4)
+            } else {
+                m.pushByte(out, 'U')
+                hexDigits(out, c, 8)
+            }
+        }
+        p += strings.skipLength(m.get8(p))
+    }
+    m.pushByte(out, quote)
+}
+
+fn annotation(out: *m.Text, v: usize) -> void {
+    m.pushByte(out, '@')
+    m.pushC(out, typeOf(v))
+    m.pushByte(out, ' ')
+}
+
+pub fn printInto(v: usize, out: *m.Text, annotate: bool) -> void {
+    const t = typeOf(v)
+    const c = m.get8(t)
+    if c == 'm' {
+        if annotate { annotation(out, v) }
+        if childCount(v) == 0 {
+            m.pushText(out, "nothing")
+            return
+        }
+        var depth: usize = 0
+        var base = t
+        while m.get8(base) == 'm' {
+            depth += 1
+            base += 1
+        }
+        var element = ref(v)
+        var i: usize = 0
+        while i < depth && element != 0 {
+            var next: usize = 0
+            if childCount(element) > 0 { next = childValue(element, 0) }
+            unref(element)
+            element = next
+            i += 1
+        }
+        if element == 0 {
+            while i > 1 {
+                m.pushText(out, "just ")
+                i -= 1
+            }
+            m.pushText(out, "nothing")
+        } else {
+            printInto(element, out, false)
+            unref(element)
+        }
+        return
+    }
+    if c == 'a' {
+        const n = childCount(v)
+        if m.get8(t + 1) == 'y' {
+            const size = sizeOf(v)
+            const data = dataOf(v)
+            var i: usize = 0
+            while i < size && m.get8(data + i) != 0 { i += 1 }
+            if size > 0 && i == size - 1 {
+                const escaped = strings.escape(data, 0)
+                var hasQuote = false
+                var p = data
+                while m.get8(p) != 0 {
+                    if m.get8(p) == 39 { hasQuote = true }
+                    p += 1
+                }
+                m.pushByte(out, 'b')
+                m.pushByte(out, if hasQuote { 34 } else { 39 })
+                m.pushC(out, escaped)
+                m.pushByte(out, if hasQuote { 34 } else { 39 })
+                m.release(escaped)
+                return
+            }
+        }
+        if n == 0 {
+            if annotate { annotation(out, v) }
+            m.pushText(out, if m.get8(t + 1) == '{' { "{}" } else { "[]" })
+            return
+        }
+        var typed = annotate
+        if m.get8(t + 1) == '{' {
+            m.pushByte(out, '{')
+            var i: usize = 0
+            while i < n {
+                if i > 0 { m.pushText(out, ", ") }
+                const entry = childValue(v, i)
+                const key = childValue(entry, 0)
+                const value = childValue(entry, 1)
+                unref(entry)
+                printInto(key, out, typed)
+                m.pushText(out, ": ")
+                printInto(value, out, typed)
+                unref(key)
+                unref(value)
+                typed = false
+                i += 1
+            }
+            m.pushByte(out, '}')
+        } else {
+            m.pushByte(out, '[')
+            var i: usize = 0
+            while i < n {
+                if i > 0 { m.pushText(out, ", ") }
+                const element = childValue(v, i)
+                printInto(element, out, typed)
+                unref(element)
+                typed = false
+                i += 1
+            }
+            m.pushByte(out, ']')
+        }
+        return
+    }
+    if c == '(' {
+        const n = childCount(v)
+        m.pushByte(out, '(')
+        var i: usize = 0
+        while i < n {
+            const element = childValue(v, i)
+            printInto(element, out, annotate)
+            unref(element)
+            if n == 1 {
+                m.pushByte(out, ',')
+            } else if i + 1 < n {
+                m.pushText(out, ", ")
+            }
+            i += 1
+        }
+        m.pushByte(out, ')')
+        return
+    }
+    if c == '{' {
+        m.pushByte(out, '{')
+        const key = childValue(v, 0)
+        printInto(key, out, annotate)
+        unref(key)
+        m.pushText(out, ", ")
+        const value = childValue(v, 1)
+        printInto(value, out, annotate)
+        unref(value)
+        m.pushByte(out, '}')
+        return
+    }
+    if c == 'v' {
+        const child = childValue(v, 0)
+        m.pushByte(out, '<')
+        printInto(child, out, true)
+        m.pushByte(out, '>')
+        unref(child)
+        return
+    }
+    if c == 'b' {
+        m.pushText(out, if read8(v) != 0 { "true" } else { "false" })
+    } else if c == 'y' {
+        if annotate { m.pushText(out, "byte ") }
+        m.pushText(out, "0x")
+        m.pushHex(out, read8(v))
+    } else if c == 'n' {
+        if annotate { m.pushText(out, "int16 ") }
+        m.pushSigned(out, @intCast(i64, @bitCast(i16, read16(v))))
+    } else if c == 'q' {
+        if annotate { m.pushText(out, "uint16 ") }
+        m.pushDecimal(out, @intCast(u64, read16(v)))
+    } else if c == 'i' {
+        m.pushSigned(out, @intCast(i64, @bitCast(i32, read32(v))))
+    } else if c == 'u' {
+        if annotate { m.pushText(out, "uint32 ") }
+        m.pushDecimal(out, @intCast(u64, read32(v)))
+    } else if c == 'x' {
+        if annotate { m.pushText(out, "int64 ") }
+        m.pushSigned(out, @bitCast(i64, read64(v)))
+    } else if c == 't' {
+        if annotate { m.pushText(out, "uint64 ") }
+        m.pushDecimal(out, read64(v))
+    } else if c == 'h' {
+        if annotate { m.pushText(out, "handle ") }
+        m.pushSigned(out, @intCast(i64, @bitCast(i32, read32(v))))
+    } else if c == 'd' {
+        const buffer = m.alloc(64)
+        _ = snprintf(buffer, 64, m.literal("%.17g"), @bitCast(f64, read64(v)))
+        m.pushC(out, buffer)
+        var marked = false
+        var p = buffer
+        while m.get8(p) != 0 {
+            const x = m.get8(p)
+            if x == '.' || x == 'e' || x == 'n' || x == 'N' { marked = true }
+            p += 1
+        }
+        if !marked { m.pushText(out, ".0") }
+        m.release(buffer)
+    } else if c == 's' {
+        printString(out, stringOf(v))
+    } else if c == 'o' || c == 'g' {
+        if annotate { m.pushText(out, if c == 'o' { "objectpath " } else { "signature " }) }
+        m.pushByte(out, 39)
+        m.pushC(out, stringOf(v))
+        m.pushByte(out, 39)
+    }
+}
+
+export fn g_variant_print(v: usize, type_annotate: i32) -> usize {
+    var out = m.text()
+    printInto(v, &out, type_annotate != 0)
+    return m.finish(&out)
+}
+
+export fn g_variant_print_string(v: usize, text: usize, type_annotate: i32) -> usize {
+    var out = m.text()
+    printInto(v, &out, type_annotate != 0)
+    var s = text
+    if s == 0 { s = strings.newString(out.length) }
+    _ = strings.stringAppend(s, if out.address == 0 { m.literal("") } else { out.address }, out.length)
+    m.dispose(&out)
+    return s
+}
+
+// ---------------------------------------------------------------------------
+// Format strings
+
+fn isPointerFormat(c: u8) -> bool {
+    return c == 'a' || c == 's' || c == 'o' || c == 'g' || c == '^' || c == '@' || c == '*' || c == '?' || c == 'r' || c == 'v' || c == '&'
+}
+
+fn startsWith(f: usize, text: []const u8) -> bool {
+    var i: usize = 0
+    while i < text.length {
+        if m.get8(f + i) != text[i] { return false }
+        i += 1
+    }
+    return true
+}
+
+// The end of the one format string element at `f`, 0 when there is none.
+pub fn formatEnd(f: usize) -> usize {
+    const c = m.get8(f)
+    if isBasic(c) || c == 'v' || c == '*' || c == '?' || c == 'r' { return f + 1 }
+    if c == '@' { return typeEnd(f + 1) }
+    if c == '&' {
+        const k = m.get8(f + 1)
+        return if k == 's' || k == 'o' || k == 'g' { f + 2 } else { 0 }
+    }
+    if c == '^' {
+        if startsWith(f, "^a&ay") { return f + 5 }
+        if startsWith(f, "^a&s") || startsWith(f, "^a&o") || startsWith(f, "^&ay") || startsWith(f, "^aay") { return f + 4 }
+        if startsWith(f, "^as") || startsWith(f, "^ao") || startsWith(f, "^ay") { return f + 3 }
+        return 0
+    }
+    if c == 'a' { return typeEnd(f) }
+    if c == 'm' {
+        const e = formatEnd(f + 1)
+        return e
+    }
+    if c == '(' {
+        var p = f + 1
+        while m.get8(p) != ')' {
+            const e = formatEnd(p)
+            if e == 0 { return 0 }
+            p = e
+        }
+        return p + 1
+    }
+    if c == '{' {
+        const k = formatEnd(f + 1)
+        if k == 0 { return 0 }
+        const e = formatEnd(k)
+        if e == 0 || m.get8(e) != '}' { return 0 }
+        return e + 1
+    }
+    return 0
+}
+
+// The type a format string element stands for (a NUL-ended string to
+// free): its characters but '@', '&' and '^'.
+fn formatType(f: usize, end: usize) -> usize {
+    var out = m.text()
+    var p = f
+    while p < end {
+        const c = m.get8(p)
+        if c != '@' && c != '&' && c != '^' { m.pushByte(&out, c) }
+        p += 1
+    }
+    return m.finish(&out)
+}
+
+// A value made of the arguments of `list` the format element at
+// `cursor.*` takes (moving past it).
+fn newFormat(cursor: *usize, list: usize) -> usize {
+    const f = cursor.*
+    const c = m.get8(f)
+    if c == '(' || c == '{' {
+        cursor.* = f + 1
+        var kids = m.words()
+        while !isClose(m.get8(cursor.*)) { m.pushWord(&kids, newFormat(cursor, list)) }
+        cursor.* += 1
+        var v: usize = 0
+        if c == '(' {
+            v = newTuple(kids.address, kids.length)
+        } else {
+            v = newDictEntry(m.wordAt(&kids, 0), m.wordAt(&kids, 1))
+        }
+        m.disposeWords(&kids)
+        return v
+    }
+    if c == 'm' {
+        const inner = f + 1
+        const end = formatEnd(inner)
+        cursor.* = inner
+        var child: usize = 0
+        if isPointerFormat(m.get8(inner)) {
+            const p = varargs.nextPointer(list)
+            if p != 0 {
+                child = newPointer(cursor, p)
+            } else {
+                cursor.* = end
+            }
+        } else {
+            if varargs.nextInt(list) != 0 {
+                child = newFormat(cursor, list)
+            } else {
+                skipFormat(cursor, list)
+            }
+        }
+        if child != 0 { return newMaybe(0, child) }
+        const t = formatType(inner, end)
+        const v = newMaybe(t, 0)
+        m.release(t)
+        return v
+    }
+    if isPointerFormat(c) { return newPointer(cursor, varargs.nextPointer(list)) }
+    cursor.* = f + 1
+    if c == 'd' { return g_variant_new_double(varargs.nextDouble(list)) }
+    const w = varargs.nextWord(list)
+    if c == 'b' { return g_variant_new_boolean(if (w & 0xffffffff) != 0 { 1 } else { 0 }) }
+    if c == 'y' { return fixedValue("y", w & 0xff, 1) }
+    if c == 'n' { return fixedValue("n", w & 0xffff, 2) }
+    if c == 'q' { return fixedValue("q", w & 0xffff, 2) }
+    if c == 'i' { return fixedValue("i", w & 0xffffffff, 4) }
+    if c == 'u' { return fixedValue("u", w & 0xffffffff, 4) }
+    if c == 'h' { return fixedValue("h", w & 0xffffffff, 4) }
+    if c == 'x' { return fixedValue("x", w, 8) }
+    return fixedValue("t", w, 8)
+}
+
+fn newPointer(cursor: *usize, p: usize) -> usize {
+    const f = cursor.*
+    const end = formatEnd(f)
+    cursor.* = end
+    const c = m.get8(f)
+    if c == 's' || (c == '&' && m.get8(f + 1) == 's') { return newString(p) }
+    if c == 'o' || (c == '&' && m.get8(f + 1) == 'o') { return newObjectPath(p) }
+    if c == 'g' || (c == '&' && m.get8(f + 1) == 'g') { return newSignature(p) }
+    if c == 'v' { return newVariant(p) }
+    if c == 'a' {
+        if p != 0 { return builderEnd(p) }
+        const t = formatType(f, end)
+        const v = newArray(t + 1, 0, 0)
+        m.release(t)
+        return v
+    }
+    if c == '^' {
+        if startsWith(f, "^as") || startsWith(f, "^a&s") { return g_variant_new_strv(p, -1) }
+        if startsWith(f, "^ao") || startsWith(f, "^a&o") { return g_variant_new_objv(p, -1) }
+        if startsWith(f, "^ay") || startsWith(f, "^&ay") { return bytestring(p) }
+        return g_variant_new_bytestring_array(p, -1)
+    }
+    // '@', '*', '?', 'r': the value itself.
+    return p
+}
+
+// Moves past a format element and the arguments it would take.
+fn skipFormat(cursor: *usize, list: usize) -> void {
+    const f = cursor.*
+    const c = m.get8(f)
+    if c == '(' || c == '{' {
+        cursor.* = f + 1
+        while !isClose(m.get8(cursor.*)) { skipFormat(cursor, list) }
+        cursor.* += 1
+        return
+    }
+    if c == 'm' {
+        cursor.* = f + 1
+        if isPointerFormat(m.get8(f + 1)) {
+            _ = varargs.nextPointer(list)
+            cursor.* = formatEnd(f + 1)
+        } else {
+            _ = varargs.nextWord(list)
+            skipFormat(cursor, list)
+        }
+        return
+    }
+    if isPointerFormat(c) {
+        _ = varargs.nextPointer(list)
+        cursor.* = formatEnd(f)
+        return
+    }
+    if c == 'd' {
+        _ = varargs.nextDouble(list)
+    } else {
+        _ = varargs.nextWord(list)
+    }
+    cursor.* = f + 1
+}
+
+// Stores what `value` holds through the pointers of `list` the format
+// element at `cursor.*` takes; with no value (an iterator's end, a
+// maybe's nothing), zeros and NULLs. `freeOld`: what the pointers hold
+// is freed first (g_variant_iter_loop's later rounds).
+fn getFormat(value: usize, cursor: *usize, list: usize, freeOld: bool) -> void {
+    const f = cursor.*
+    const c = m.get8(f)
+    if c == '(' || c == '{' {
+        cursor.* = f + 1
+        var i: usize = 0
+        while !isClose(m.get8(cursor.*)) {
+            const child = if value != 0 { childValue(value, i) } else { 0 }
+            getFormat(child, cursor, list, freeOld)
+            unref(child)
+            i += 1
+        }
+        cursor.* += 1
+        return
+    }
+    if c == 'm' {
+        cursor.* = f + 1
+        var child: usize = 0
+        if value != 0 && childCount(value) > 0 { child = childValue(value, 0) }
+        if !isPointerFormat(m.get8(f + 1)) {
+            const flag = varargs.nextPointer(list)
+            if flag != 0 { m.putI32(flag, if child != 0 { 1 } else { 0 }) }
+        }
+        getFormat(child, cursor, list, freeOld)
+        unref(child)
+        return
+    }
+    if isPointerFormat(c) {
+        const end = formatEnd(f)
+        cursor.* = end
+        const target = varargs.nextPointer(list)
+        if target == 0 { return }
+        if freeOld && m.getWord(target) != 0 { freePointer(f, m.getWord(target)) }
+        m.putWord(target, if value == 0 { 0 } else { pointerValue(f, value) })
+        return
+    }
+    cursor.* = f + 1
+    const target = varargs.nextPointer(list)
+    if target == 0 { return }
+    if c == 'b' {
+        m.putI32(target, if value != 0 && read8(value) != 0 { 1 } else { 0 })
+    } else if c == 'y' {
+        m.put8(target, if value != 0 { read8(value) } else { 0 })
+    } else if c == 'n' || c == 'q' {
+        m.put16(target, if value != 0 { read16(value) } else { 0 })
+    } else if c == 'i' || c == 'u' || c == 'h' {
+        m.put32(target, if value != 0 { read32(value) } else { 0 })
+    } else {
+        m.put64(target, if value != 0 { read64(value) } else { 0 })
+    }
+}
+
+fn pointerValue(f: usize, value: usize) -> usize {
+    const c = m.get8(f)
+    if c == 's' || c == 'o' || c == 'g' { return m.dup(stringOf(value)) }
+    if c == '&' { return stringOf(value) }
+    if c == 'v' { return childValue(value, 0) }
+    if c == 'a' { return iterNew(value) }
+    if c == '^' {
+        if startsWith(f, "^as") || startsWith(f, "^ao") { return stringsOf(value, 0, true, false) }
+        if startsWith(f, "^a&s") || startsWith(f, "^a&o") { return stringsOf(value, 0, false, false) }
+        if startsWith(f, "^ay") { return m.dup(bytestringOf(value)) }
+        if startsWith(f, "^&ay") { return bytestringOf(value) }
+        if startsWith(f, "^aay") { return stringsOf(value, 0, true, true) }
+        return stringsOf(value, 0, false, true)
+    }
+    return ref(value)
+}
+
+fn freePointer(f: usize, p: usize) -> void {
+    const c = m.get8(f)
+    if c == 's' || c == 'o' || c == 'g' {
+        m.release(p)
+    } else if c == '&' {
+        return
+    } else if c == 'a' {
+        iterFree(p)
+    } else if c == '^' {
+        if startsWith(f, "^as") || startsWith(f, "^ao") || startsWith(f, "^aay") {
+            strings.freeStrv(p)
+        } else if !startsWith(f, "^&ay") {
+            m.release(p)
+        }
+    } else {
+        unref(p)
+    }
+}
+
+fn formatMatches(value: usize, format: usize) -> bool {
+    const end = formatEnd(format)
+    if end == 0 { return false }
+    const t = formatType(format, end)
+    const matches = isSubtype(typeOf(value), t)
+    m.release(t)
+    return matches
+}
+
+fn typeMismatch(function: []const u8, format: usize, value: usize) -> void {
+    var t = m.text()
+    m.pushText(&t, function)
+    m.pushText(&t, ": the GVariant format string '")
+    m.pushC(&t, format)
+    m.pushText(&t, "' has a type of '")
+    const end = formatEnd(format)
+    if end != 0 {
+        const ft = formatType(format, end)
+        m.pushC(&t, ft)
+        m.release(ft)
+    }
+    m.pushText(&t, "' but the given value has a type of '")
+    m.pushC(&t, typeOf(value))
+    m.pushText(&t, "'")
+    criticalText(&t)
+}
+
+pub fn newFromList(format: usize, endptr: usize, list: usize) -> usize {
+    var cursor = format
+    const end = formatEnd(format)
+    if end == 0 || (endptr == 0 && m.get8(end) != 0) {
+        assertion("g_variant_new_va", "valid_format_string (format_string, !endptr, NULL)")
+        return 0
+    }
+    const v = newFormat(&cursor, list)
+    if endptr != 0 { m.putWord(endptr, cursor) }
+    return v
+}
+
+pub fn getFromList(value: usize, format: usize, endptr: usize, list: usize, freeOld: bool) -> void {
+    var cursor = format
+    getFormat(value, &cursor, list, freeOld)
+    if endptr != 0 { m.putWord(endptr, cursor) }
+}
+
+fn getChecked(function: []const u8, value: usize, format: usize, list: usize) -> void {
+    if !formatMatches(value, format) {
+        typeMismatch(function, format, value)
+        return
+    }
+    getFromList(value, format, 0, list, false)
+}
+
+export fn g_variant_new(format: usize, a1: usize, a2: usize, a3: usize, a4: usize, a5: usize, x0: f64, x1: f64, x2: f64, x3: f64, x4: f64, x5: f64, x6: f64, x7: f64) -> usize {
+    var call: varargs.CallList = undefined
+    var words: [6]usize = [6]usize{ format, a1, a2, a3, a4, a5 }
+    var doubles: [8]f64 = [8]f64{ x0, x1, x2, x3, x4, x5, x6, x7 }
+    const list = varargs.start(&call, 1, @frameAddress(), @intFromPtr(&words), @intFromPtr(&doubles))
+    return newFromList(format, 0, list)
+}
+
+export fn g_variant_new_va(format: usize, endptr: usize, app: usize) -> usize { return newFromList(format, endptr, app) }
+
+export fn g_variant_get(value: usize, format: usize, a2: usize, a3: usize, a4: usize, a5: usize, x0: f64, x1: f64, x2: f64, x3: f64, x4: f64, x5: f64, x6: f64, x7: f64) -> void {
+    var call: varargs.CallList = undefined
+    var words: [6]usize = [6]usize{ value, format, a2, a3, a4, a5 }
+    var doubles: [8]f64 = [8]f64{ x0, x1, x2, x3, x4, x5, x6, x7 }
+    const list = varargs.start(&call, 2, @frameAddress(), @intFromPtr(&words), @intFromPtr(&doubles))
+    getChecked("g_variant_get", value, format, list)
+}
+
+export fn g_variant_get_va(value: usize, format: usize, endptr: usize, app: usize) -> void { getFromList(value, format, endptr, app, false) }
+
+export fn g_variant_check_format_string(value: usize, format: usize, copy_only: i32) -> i32 {
+    if copy_only != 0 {
+        var p = format
+        while m.get8(p) != 0 {
+            if m.get8(p) == '&' { return 0 }
+            p += 1
+        }
+    }
+    return if formatMatches(value, format) { 1 } else { 0 }
+}
+
+export fn g_variant_get_child(value: usize, index: usize, format: usize, a3: usize, a4: usize, a5: usize, x0: f64, x1: f64, x2: f64, x3: f64, x4: f64, x5: f64, x6: f64, x7: f64) -> void {
+    var call: varargs.CallList = undefined
+    var words: [6]usize = [6]usize{ value, index, format, a3, a4, a5 }
+    var doubles: [8]f64 = [8]f64{ x0, x1, x2, x3, x4, x5, x6, x7 }
+    const list = varargs.start(&call, 3, @frameAddress(), @intFromPtr(&words), @intFromPtr(&doubles))
+    const child = g_variant_get_child_value(value, index)
+    if child == 0 { return }
+    getChecked("g_variant_get_child", child, format, list)
+    unref(child)
+}
+
+// ---------------------------------------------------------------------------
+// Dictionaries (arrays of dict entries keyed by strings)
+
+pub fn lookupValue(dictionary: usize, key: usize, expected: usize) -> usize {
+    const t = typeOf(dictionary)
+    if !(m.get8(t) == 'a' && m.get8(t + 1) == '{' && (m.get8(t + 2) == 's' || m.get8(t + 2) == 'o')) {
+        assertion("g_variant_lookup_value", "g_variant_is_of_type (dictionary, G_VARIANT_TYPE (\"a{s*}\")) || g_variant_is_of_type (dictionary, G_VARIANT_TYPE (\"a{o*}\"))")
+        return 0
+    }
+    const n = childCount(dictionary)
+    var i: usize = 0
+    var found: usize = 0
+    while i < n {
+        const entry = childValue(dictionary, i)
+        const entryKey = childValue(entry, 0)
+        const matches = m.cEqual(stringOf(entryKey), key)
+        unref(entryKey)
+        if matches {
+            found = entry
+            break
+        }
+        unref(entry)
+        i += 1
+    }
+    if found == 0 { return 0 }
+    var value = childValue(found, 1)
+    unref(found)
+    if classOf(value) == 'v' {
+        const inner = childValue(value, 0)
+        unref(value)
+        value = inner
+        if expected != 0 && !isSubtype(typeOf(value), expected) {
+            unref(value)
+            return 0
+        }
+    }
+    if expected != 0 && !isSubtype(typeOf(value), expected) {
+        assertion("g_variant_lookup_value", "expected_type == NULL || value == NULL || g_variant_is_of_type (value, expected_type)")
+        unref(value)
+        return 0
+    }
+    return value
+}
+
+export fn g_variant_lookup_value(dictionary: usize, key: usize, expected_type: usize) -> usize { return lookupValue(dictionary, key, expected_type) }
+
+export fn g_variant_lookup(dictionary: usize, key: usize, format: usize, a3: usize, a4: usize, a5: usize, x0: f64, x1: f64, x2: f64, x3: f64, x4: f64, x5: f64, x6: f64, x7: f64) -> i32 {
+    var call: varargs.CallList = undefined
+    var words: [6]usize = [6]usize{ dictionary, key, format, a3, a4, a5 }
+    var doubles: [8]f64 = [8]f64{ x0, x1, x2, x3, x4, x5, x6, x7 }
+    const list = varargs.start(&call, 3, @frameAddress(), @intFromPtr(&words), @intFromPtr(&doubles))
+    const end = formatEnd(format)
+    if end == 0 { return 0 }
+    const t = formatType(format, end)
+    const value = lookupValue(dictionary, key, t)
+    m.release(t)
+    if value == 0 { return 0 }
+    getFromList(value, format, 0, list, false)
+    unref(value)
+    return 1
+}
+
+// ---------------------------------------------------------------------------
+// Iterators: the value (words 0), the number of children (1), the next
+// one's index (2), a mark of an initialized iterator (3), whether it is
+// on the heap and holds a reference (4).
+
+const ITER_MARK: usize = 0x4d4c5856495445
+const ITER_SIZE: usize = 128
+
+pub fn iterInit(iter: usize, value: usize) -> usize {
+    m.putWord(iter, value)
+    m.putWord(iter + 8, childCount(value))
+    m.putWord(iter + 16, 0)
+    m.putWord(iter + 24, ITER_MARK)
+    m.putWord(iter + 32, 0)
+    return m.getWord(iter + 8)
+}
+
+pub fn iterNew(value: usize) -> usize {
+    const iter = m.alloc(ITER_SIZE)
+    _ = iterInit(iter, ref(value))
+    m.putWord(iter + 32, 1)
+    return iter
+}
+
+pub fn iterFree(iter: usize) -> void {
+    if m.getWord(iter + 32) != 0 { unref(m.getWord(iter)) }
+    m.release(iter)
+}
+
+pub fn iterNextValue(iter: usize) -> usize {
+    const i = m.getWord(iter + 16)
+    if i >= m.getWord(iter + 8) { return 0 }
+    m.putWord(iter + 16, i + 1)
+    return childValue(m.getWord(iter), i)
+}
+
+export fn g_variant_iter_new(value: usize) -> usize { return iterNew(value) }
+export fn g_variant_iter_init(iter: usize, value: usize) -> usize { return iterInit(iter, value) }
+
+export fn g_variant_iter_copy(iter: usize) -> usize {
+    const copy = iterNew(m.getWord(iter))
+    m.putWord(copy + 16, m.getWord(iter + 16))
+    return copy
+}
+
+export fn g_variant_iter_n_children(iter: usize) -> usize { return m.getWord(iter + 8) }
+export fn g_variant_iter_free(iter: usize) -> void { iterFree(iter) }
+export fn g_variant_iter_next_value(iter: usize) -> usize { return iterNextValue(iter) }
+
+export fn g_variant_iter_next(iter: usize, format: usize, a2: usize, a3: usize, a4: usize, a5: usize, x0: f64, x1: f64, x2: f64, x3: f64, x4: f64, x5: f64, x6: f64, x7: f64) -> i32 {
+    var call: varargs.CallList = undefined
+    var words: [6]usize = [6]usize{ iter, format, a2, a3, a4, a5 }
+    var doubles: [8]f64 = [8]f64{ x0, x1, x2, x3, x4, x5, x6, x7 }
+    const list = varargs.start(&call, 2, @frameAddress(), @intFromPtr(&words), @intFromPtr(&doubles))
+    const value = iterNextValue(iter)
+    if value == 0 { return 0 }
+    getFromList(value, format, 0, list, false)
+    unref(value)
+    return 1
+}
+
+export fn g_variant_iter_loop(iter: usize, format: usize, a2: usize, a3: usize, a4: usize, a5: usize, x0: f64, x1: f64, x2: f64, x3: f64, x4: f64, x5: f64, x6: f64, x7: f64) -> i32 {
+    var call: varargs.CallList = undefined
+    var words: [6]usize = [6]usize{ iter, format, a2, a3, a4, a5 }
+    var doubles: [8]f64 = [8]f64{ x0, x1, x2, x3, x4, x5, x6, x7 }
+    const list = varargs.start(&call, 2, @frameAddress(), @intFromPtr(&words), @intFromPtr(&doubles))
+    // The first round finds the pointers as the caller left them; later
+    // ones free what the round before stored.
+    const first = m.getWord(iter + 16) == 0
+    const value = iterNextValue(iter)
+    getFromList(value, format, 0, list, !first)
+    unref(value)
+    return if value != 0 { 1 } else { 0 }
+}
+
+// ---------------------------------------------------------------------------
+// Builders: words 0 the innermost open container's record (its type, its
+// children, the record of the container it is in), word 1 a mark, word 2
+// the references of one made by g_variant_builder_new.
+
+const BUILDER_MARK: usize = 0x4d4c58564255494c
+const R_TYPE: usize = 0
+const R_KIDS: usize = 8
+const R_PARENT: usize = 32
+const R_SIZE: usize = 40
+
+fn kidsOf(r: usize) -> *m.Words { unsafe { return @ptrFromInt(*m.Words, r + R_KIDS) } }
+
+fn newRecord(t: usize, parent: usize) -> usize {
+    const r = m.alloc(R_SIZE)
+    m.putWord(r + R_TYPE, dupType(t))
+    m.putWord(r + R_PARENT, parent)
+    return r
+}
+
+fn freeRecord(r: usize) -> void {
+    const kids = kidsOf(r)
+    var i: usize = 0
+    while i < kids.*.length {
+        unref(m.wordAt(kids, i))
+        i += 1
+    }
+    m.disposeWords(kids)
+    m.release(m.getWord(r + R_TYPE))
+    m.release(r)
+}
+
+// The container a record's children make (the record is freed).
+fn endRecord(r: usize) -> usize {
+    const t = m.getWord(r + R_TYPE)
+    const kids = kidsOf(r)
+    const n = kids.*.length
+    const c = m.get8(t)
+    var v: usize = 0
+    if c == 'a' {
+        var element = t + 1
+        if !isDefinite(element) {
+            if n == 0 {
+                assertion("g_variant_builder_end", "!GVSB(builder)->uniform_item_types || GVSB(builder)->prev_item_type != NULL || g_variant_type_is_definite (GVSB(builder)->type)")
+                freeRecord(r)
+                return 0
+            }
+            element = typeOf(m.wordAt(kids, 0))
+        }
+        v = newArray(element, kids.*.address, n)
+    } else if c == 'm' {
+        v = newMaybe(if isDefinite(t + 1) { t + 1 } else { 0 }, if n > 0 { m.wordAt(kids, 0) } else { 0 })
+    } else if c == '{' {
+        if n != 2 {
+            assertion("g_variant_builder_end", "GVSB(builder)->offset >= GVSB(builder)->min_items")
+            freeRecord(r)
+            return 0
+        }
+        v = newDictEntry(m.wordAt(kids, 0), m.wordAt(kids, 1))
+    } else if c == 'v' {
+        v = newVariant(m.wordAt(kids, 0))
+    } else {
+        v = newTuple(kids.*.address, n)
+    }
+    // The children went into the container.
+    m.disposeWords(kids)
+    m.release(t)
+    m.release(r)
+    return v
+}
+
+pub fn builderInit(builder: usize, t: usize) -> void {
+    m.zero(builder, 128)
+    m.putWord(builder, newRecord(t, 0))
+    m.putWord(builder + 8, BUILDER_MARK)
+}
+
+pub fn builderClear(builder: usize) -> void {
+    if m.getWord(builder + 8) != BUILDER_MARK { return }
+    var r = m.getWord(builder)
+    while r != 0 {
+        const parent = m.getWord(r + R_PARENT)
+        freeRecord(r)
+        r = parent
+    }
+    m.putWord(builder, 0)
+    m.putWord(builder + 8, 0)
+}
+
+pub fn builderEnd(builder: usize) -> usize {
+    const r = m.getWord(builder)
+    if m.getWord(builder + 8) != BUILDER_MARK || r == 0 {
+        assertion("g_variant_builder_end", "is_valid_builder (builder)")
+        return 0
+    }
+    if m.getWord(r + R_PARENT) != 0 {
+        assertion("g_variant_builder_end", "!GVSB(builder)->parent")
+        return 0
+    }
+    m.putWord(builder, 0)
+    m.putWord(builder + 8, 0)
+    return endRecord(r)
+}
+
+pub fn builderAddValue(builder: usize, value: usize) -> void {
+    const r = m.getWord(builder)
+    if r == 0 || value == 0 { return }
+    m.pushWord(kidsOf(r), refSink(value))
+}
+
+export fn g_variant_builder_new(t: usize) -> usize {
+    const builder = m.alloc(128)
+    builderInit(builder, t)
+    m.put32(builder + 16, 1)
+    return builder
+}
+
+export fn g_variant_builder_ref(builder: usize) -> usize {
+    threads.refInc(builder + 16)
+    return builder
+}
+
+export fn g_variant_builder_unref(builder: usize) -> void {
+    if threads.refDec(builder + 16) {
+        builderClear(builder)
+        m.release(builder)
+    }
+}
+
+export fn g_variant_builder_init(builder: usize, t: usize) -> void { builderInit(builder, t) }
+export fn g_variant_builder_init_static(builder: usize, t: usize) -> void { builderInit(builder, t) }
+export fn g_variant_builder_end(builder: usize) -> usize { return builderEnd(builder) }
+export fn g_variant_builder_clear(builder: usize) -> void { builderClear(builder) }
+
+export fn g_variant_builder_open(builder: usize, t: usize) -> void {
+    m.putWord(builder, newRecord(t, m.getWord(builder)))
+}
+
+export fn g_variant_builder_close(builder: usize) -> void {
+    const r = m.getWord(builder)
+    const parent = m.getWord(r + R_PARENT)
+    if parent == 0 {
+        assertion("g_variant_builder_close", "GVSB(builder)->parent != NULL")
+        return
+    }
+    m.putWord(builder, parent)
+    builderAddValue(builder, endRecord(r))
+}
+
+export fn g_variant_builder_add_value(builder: usize, value: usize) -> void { builderAddValue(builder, value) }
+
+export fn g_variant_builder_add(builder: usize, format: usize, a2: usize, a3: usize, a4: usize, a5: usize, x0: f64, x1: f64, x2: f64, x3: f64, x4: f64, x5: f64, x6: f64, x7: f64) -> void {
+    var call: varargs.CallList = undefined
+    var words: [6]usize = [6]usize{ builder, format, a2, a3, a4, a5 }
+    var doubles: [8]f64 = [8]f64{ x0, x1, x2, x3, x4, x5, x6, x7 }
+    const list = varargs.start(&call, 2, @frameAddress(), @intFromPtr(&words), @intFromPtr(&doubles))
+    builderAddValue(builder, newFromList(format, 0, list))
+}
+
+// ---------------------------------------------------------------------------
+// GVariantDict: words 0 the record (its keys and values, in the order
+// they were first inserted), 1 a mark, 2 the references of one made by
+// g_variant_dict_new.
+
+const DICT_MARK: usize = 0x4d4c585644494354
+const D_KEYS: usize = 0
+const D_VALUES: usize = 24
+const D_SIZE: usize = 48
+
+fn dictKeys(d: usize) -> *m.Words { unsafe { return @ptrFromInt(*m.Words, m.getWord(d) + D_KEYS) } }
+fn dictValues(d: usize) -> *m.Words { unsafe { return @ptrFromInt(*m.Words, m.getWord(d) + D_VALUES) } }
+
+fn dictFind(d: usize, key: usize) -> isize {
+    const keys = dictKeys(d)
+    var i: usize = 0
+    while i < keys.*.length {
+        if m.cEqual(m.wordAt(keys, i), key) { return @intCast(isize, i) }
+        i += 1
+    }
+    return -1
+}
+
+fn dictInsert(d: usize, key: usize, value: usize) -> void {
+    const sunk = refSink(value)
+    const at = dictFind(d, key)
+    if at >= 0 {
+        const values = dictValues(d)
+        const slot = values.*.address + @intCast(usize, at) * 8
+        unref(m.getWord(slot))
+        m.putWord(slot, sunk)
+        return
+    }
+    m.pushWord(dictKeys(d), m.dup(key))
+    m.pushWord(dictValues(d), sunk)
+}
+
+fn dictInit(d: usize, from: usize) -> void {
+    m.zero(d, 128)
+    m.putWord(d, m.alloc(D_SIZE))
+    m.putWord(d + 8, DICT_MARK)
+    if from == 0 { return }
+    const n = childCount(from)
+    var i: usize = 0
+    while i < n {
+        const entry = childValue(from, i)
+        const key = childValue(entry, 0)
+        const value = childValue(entry, 1)
+        const inner = childValue(value, 0)
+        dictInsert(d, stringOf(key), inner)
+        unref(inner)
+        unref(value)
+        unref(key)
+        unref(entry)
+        i += 1
+    }
+}
+
+fn dictClear(d: usize) -> void {
+    if m.getWord(d + 8) != DICT_MARK { return }
+    const keys = dictKeys(d)
+    const values = dictValues(d)
+    var i: usize = 0
+    while i < keys.*.length {
+        m.release(m.wordAt(keys, i))
+        unref(m.wordAt(values, i))
+        i += 1
+    }
+    m.disposeWords(keys)
+    m.disposeWords(values)
+    m.release(m.getWord(d))
+    m.putWord(d, 0)
+    m.putWord(d + 8, 0)
+}
+
+fn dictLookup(d: usize, key: usize, expected: usize) -> usize {
+    const at = dictFind(d, key)
+    if at < 0 { return 0 }
+    const value = m.wordAt(dictValues(d), @intCast(usize, at))
+    if expected != 0 && !isSubtype(typeOf(value), expected) { return 0 }
+    return ref(value)
+}
+
+export fn g_variant_dict_new(from_asv: usize) -> usize {
+    const d = m.alloc(128)
+    dictInit(d, from_asv)
+    m.put32(d + 16, 1)
+    return d
+}
+
+export fn g_variant_dict_init(d: usize, from_asv: usize) -> void { dictInit(d, from_asv) }
+export fn g_variant_dict_lookup_value(d: usize, key: usize, expected_type: usize) -> usize { return dictLookup(d, key, expected_type) }
+export fn g_variant_dict_contains(d: usize, key: usize) -> i32 { return if dictFind(d, key) >= 0 { 1 } else { 0 } }
+export fn g_variant_dict_insert_value(d: usize, key: usize, value: usize) -> void { dictInsert(d, key, value) }
+
+export fn g_variant_dict_remove(d: usize, key: usize) -> i32 {
+    const at = dictFind(d, key)
+    if at < 0 { return 0 }
+    const keys = dictKeys(d)
+    const values = dictValues(d)
+    const index = @intCast(usize, at)
+    m.release(m.wordAt(keys, index))
+    unref(m.wordAt(values, index))
+    var i = index
+    while i + 1 < keys.*.length {
+        m.putWord(keys.*.address + i * 8, m.wordAt(keys, i + 1))
+        m.putWord(values.*.address + i * 8, m.wordAt(values, i + 1))
+        i += 1
+    }
+    keys.*.length -= 1
+    values.*.length -= 1
+    return 1
+}
+
+export fn g_variant_dict_clear(d: usize) -> void { dictClear(d) }
+
+export fn g_variant_dict_end(d: usize) -> usize {
+    const keys = dictKeys(d)
+    const values = dictValues(d)
+    var entries = m.words()
+    var i: usize = 0
+    while i < keys.*.length {
+        const key = newString(m.wordAt(keys, i))
+        const boxed = newVariant(ref(m.wordAt(values, i)))
+        m.pushWord(&entries, newDictEntry(key, boxed))
+        i += 1
+    }
+    const v = newArray(m.literal("{sv}"), entries.address, entries.length)
+    m.disposeWords(&entries)
+    dictClear(d)
+    dictInit(d, 0)
+    return v
+}
+
+export fn g_variant_dict_ref(d: usize) -> usize {
+    threads.refInc(d + 16)
+    return d
+}
+
+export fn g_variant_dict_unref(d: usize) -> void {
+    if threads.refDec(d + 16) {
+        dictClear(d)
+        m.release(d)
+    }
+}
+
+export fn g_variant_dict_lookup(d: usize, key: usize, format: usize, a3: usize, a4: usize, a5: usize, x0: f64, x1: f64, x2: f64, x3: f64, x4: f64, x5: f64, x6: f64, x7: f64) -> i32 {
+    var call: varargs.CallList = undefined
+    var words: [6]usize = [6]usize{ d, key, format, a3, a4, a5 }
+    var doubles: [8]f64 = [8]f64{ x0, x1, x2, x3, x4, x5, x6, x7 }
+    const list = varargs.start(&call, 3, @frameAddress(), @intFromPtr(&words), @intFromPtr(&doubles))
+    const end = formatEnd(format)
+    if end == 0 { return 0 }
+    const t = formatType(format, end)
+    const value = dictLookup(d, key, t)
+    m.release(t)
+    if value == 0 { return 0 }
+    getFromList(value, format, 0, list, false)
+    unref(value)
+    return 1
+}
+
+export fn g_variant_dict_insert(d: usize, key: usize, format: usize, a3: usize, a4: usize, a5: usize, x0: f64, x1: f64, x2: f64, x3: f64, x4: f64, x5: f64, x6: f64, x7: f64) -> void {
+    var call: varargs.CallList = undefined
+    var words: [6]usize = [6]usize{ d, key, format, a3, a4, a5 }
+    var doubles: [8]f64 = [8]f64{ x0, x1, x2, x3, x4, x5, x6, x7 }
+    const list = varargs.start(&call, 3, @frameAddress(), @intFromPtr(&words), @intFromPtr(&doubles))
+    dictInsert(d, key, newFromList(format, 0, list))
+}
