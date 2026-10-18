@@ -883,6 +883,42 @@ pub fn main() -> u8 {
 }
 ```
 
+## Digests (`std.md5`, `std.blake2`, `std.sha1`, `std.sha2`)
+
+**Implementation:** `std/src/md5.mlx`, `std/src/blake2.mlx`,
+`std/src/sha1.mlx`, `std/src/sha2.mlx`
+**Source tests:** `344_md5_blake2_runtime.mlx` (run by
+`tests/run_std_modules.sh`); `tools/check_wifi.sh` for SHA-1's HMAC and
+PBKDF2
+
+Each digest has a state that takes the message in pieces (`…Init`,
+`…Update`, `…Final`, which wipes the state) and a one-call function;
+`std.base64.hexEncode` prints a digest the way the `…sum` tools do.
+
+- `std.md5`: `Md5`, `md5Init`, `md5Update`, `md5Final(&state, *[16]u8)`,
+  `md5(bytes, *[16]u8)` and `md5Hex(bytes, *[32]u8)` (RFC 1321; for the
+  formats that still use it, not for security). md5sum, the thumbnail
+  cache's file names (`projects/desktop/shared/thumbs.mlx`) and GLib's
+  `GChecksum` use it.
+- `std.blake2`: BLAKE2b (RFC 7693) with digests of 1 to 64 bytes, keyed
+  with up to 64 bytes or not: `Blake2b`, `blake2bInit(&state, length,
+  key)`, `blake2bUpdate`, `blake2bFinal(&state, out)`, `blake2b(bytes,
+  *[64]u8)` (512 bits, unkeyed, what b2sum prints) and
+  `blake2bWith(bytes, key, out, length)`.
+
+```mlx
+const md5 = @import("std.md5")
+const blake2 = @import("std.blake2")
+
+pub fn main() -> u8 {
+    var text: [32]u8 = undefined
+    md5.md5Hex("abc", &text)                  // 900150983cd24fb0d6963f7d28e17f72
+    var digest: [64]u8 = undefined
+    blake2.blake2b("abc", &digest)            // ba80a53f...
+    return if text[0] == 57 && digest[0] == 186 { 13 } else { 1 }
+}
+```
+
 ## fmt
 
 **Normative source:** `spec/04-stdlib/fmt.xml`

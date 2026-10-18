@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # The small standard modules with the self-hosted compiler, each against
 # its standard's own test vectors:
-#   tests/343_base64_runtime.mlx   std.base64 (RFC 4648 section 10)
+#   tests/343_base64_runtime.mlx        std.base64 (RFC 4648 section 10)
+#   tests/344_md5_blake2_runtime.mlx    std.md5 (RFC 1321 A.5) and
+#                                       std.blake2 (RFC 7693, the KAT)
 #
 #   tests/run_std_modules.sh [compiler]
 set -euo pipefail
@@ -30,6 +32,7 @@ run() {
     fi
 }
 run 343_base64_runtime "base64, base64url, base32, base32hex, base16 and hex"
+run 344_md5_blake2_runtime "MD5 and BLAKE2b, plain, keyed and in pieces"
 
 if [[ $failures -ne 0 ]]; then
     echo "$failures standard module checks failed"

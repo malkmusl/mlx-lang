@@ -25,6 +25,8 @@ looked up by name, as nl80211).
 PBKDF2-HMAC-SHA256.
 `base64.mlx` (`std.base64`) has RFC 4648's base64, base64url, base32,
 base32hex and base16, in one call or in pieces, and lower-case hex.
+`md5.mlx` (`std.md5`) has MD5 and `blake2.mlx` (`std.blake2`) BLAKE2b,
+keyed or not, of any digest length up to 64 bytes.
 `sha1.mlx` (`std.sha1`) has SHA-1, HMAC-SHA1 and PBKDF2-HMAC-SHA1, and
 `aes.mlx` (`std.aes`) AES-128 on blocks and the RFC 3394 key wrap: what
 WPA2 needs (`tools/check_wifi.sh`).
