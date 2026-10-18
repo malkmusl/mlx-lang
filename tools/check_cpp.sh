@@ -68,6 +68,24 @@ echo "ok   a C++ object links with the library and runs"
 cmp -s "$tests/shared/expected" "$work/shared.out" || fail "shared prints otherwise (expected < > got): $(diff "$tests/shared/expected" "$work/shared.out" | head -6)"
 echo "ok   the statics of inline functions are one object across files"
 
+# Lambdas of two files numbered alike (each its file's first in a
+# class), put into one template: each file's instance calls its own.
+"$cc" -c -o "$work/lambdaunits_a.o" "$tests/lambdaunits/a.cpp" 2> "$work/lambdaunits.err" || fail "-c of lambdaunits/a.cpp: $(head -3 "$work/lambdaunits.err")"
+"$cc" -c -o "$work/lambdaunits_b.o" "$tests/lambdaunits/b.cpp" 2>> "$work/lambdaunits.err" || fail "-c of lambdaunits/b.cpp: $(head -3 "$work/lambdaunits.err")"
+"$cc" -x c++ -o "$work/lambdaunits" "$work/lambdaunits_a.o" "$work/lambdaunits_b.o" 2>> "$work/lambdaunits.err" || fail "linking lambdaunits: $(head -3 "$work/lambdaunits.err")"
+"$work/lambdaunits" > "$work/lambdaunits.out" || fail "lambdaunits exits with $?"
+cmp -s "$tests/lambdaunits/expected" "$work/lambdaunits.out" || fail "lambdaunits prints otherwise (expected < > got): $(diff "$tests/lambdaunits/expected" "$work/lambdaunits.out" | head -6)"
+echo "ok   the lambdas of two files are classes of their own"
+
+# Unnamed classes a typedef names, in a header two files include after
+# different numbers of other unnamed classes: functions taking them have
+# the same names in both files.
+"$cc" -c -o "$work/typedefunits_a.o" "$tests/typedefunits/a.cpp" 2> "$work/typedefunits.err" || fail "-c of typedefunits/a.cpp: $(head -3 "$work/typedefunits.err")"
+"$cc" -c -o "$work/typedefunits_b.o" "$tests/typedefunits/b.cpp" 2>> "$work/typedefunits.err" || fail "-c of typedefunits/b.cpp: $(head -3 "$work/typedefunits.err")"
+"$cc" -x c++ -o "$work/typedefunits" "$work/typedefunits_a.o" "$work/typedefunits_b.o" 2>> "$work/typedefunits.err" || fail "linking typedefunits: $(head -3 "$work/typedefunits.err")"
+"$work/typedefunits" > "$work/typedefunits.out" || fail "typedefunits exits with $?"
+cmp -s "$tests/typedefunits/expected" "$work/typedefunits.out" || fail "typedefunits prints otherwise (expected < > got): $(diff "$tests/typedefunits/expected" "$work/typedefunits.out" | head -6)"
+echo "ok   an unnamed class a typedef names has the typedef's name across files"
 # Classes with virtual bases shared with code g++ compiled (without RTTI,
 # exceptions and sized deallocation, which need g++'s library; vcall
 # offsets before vbase offsets among them): each side makes objects of
