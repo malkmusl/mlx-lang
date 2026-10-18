@@ -136,8 +136,8 @@ else
     failures=$((failures + 1))
 fi
 
-# std.truetype's rasterizer against FreeType and a supersampled ground
-# truth (skipped without freetype-py and fontTools).
+# std.truetype's glyphs against the system's FreeType, pixel for pixel
+# (skipped without gcc and FreeType's development files).
 if python3 tools/check_truetype.py "$compiler" > "$work/output" 2>&1; then
     sed 's/^/     /' "$work/output"
     echo "ok   tools/check_truetype.py"

@@ -46,9 +46,11 @@ queue, dma-buf and host-memory sharing), with `gpu/shaders.mlx`
 (`std.gpu.shaders`), `gpu/text.mlx` (`std.gpu.text`) and
 `gpu/swapchain.mlx` (`std.gpu.swapchain`). See `docs/reference/vulkan.md`.
 
-`truetype.mlx` (`std.truetype`) reads TrueType fonts, rasterizes glyphs
-with anti-aliasing, packs them into an atlas and lays out text; see
-`docs/reference/truetype.md`.
+`truetype.mlx` (`std.truetype`) and `truetype/` are the font engine:
+TrueType and OpenType (CFF, CFF2) fonts, variable and color fonts, read
+and rendered as FreeType 2.13 does it; its `Font`, `Atlas` and `Run` lay
+out and draw lines of text. FreeType's C API (`compiler/capi/freetype`)
+is a layer over it; see `docs/reference/truetype.md`.
 
 `ui.mlx` (`std.ui`) has layout building blocks for pixel user interfaces:
 rectangles, insets, alignment, containers, stacks and reserved bars; see
