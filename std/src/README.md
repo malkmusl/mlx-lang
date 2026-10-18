@@ -29,6 +29,17 @@ base32hex and base16, in one call or in pieces, and lower-case hex.
 keyed or not, of any digest length up to 64 bytes.
 `random.mlx` (`std.random`) has the kernel's random bytes (getrandom)
 and seeded generators: xoshiro256** and, by name, xorshift64*.
+`spawn.mlx` (`std.spawn`) starts programs: PATH lookup, the child's
+descriptors, directory, session and signals, vfork, a pipe of what it
+writes, its exit status. The system calls, the event loop (epoll with
+tokens), signal, timer and counter descriptors and Unix sockets with
+descriptors passed along are `std.linux`'s (`std/bootstrap/os/linux`).
+`pulse.mlx` (`std.pulse`) has PulseAudio's native protocol numbers and
+`pulse/tagstruct.mlx` (`std.pulse.tagstruct`) its tagstructs, for MLX
+Audio's server and its libpulse.
+`pipewire.mlx` (`std.pipewire`) has PipeWire's native protocol numbers
+and `pipewire/pod.mlx` (`std.pipewire.pod`) its SPA pods, for MLX
+Capture's server and its libpipewire.
 `terminal/tty.mlx` (`std.terminal.tty`) is the terminal a program runs
 on: whether a descriptor is one, its size, raw mode and the foreground
 process group.

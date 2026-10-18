@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Builds MLX Capture's client library (projects/desktop/libpipewire): the
+# Builds MLX Capture's client library (compiler/capi/pipewire): the
 # Mlx stand-in for PipeWire's libpipewire-0.3-0, so that the programs
 # that take a screen share or a camera over PipeWire (browsers, OBS,
 # GStreamer's pipewiresrc) reach mlx-capture's PipeWire socket without
@@ -39,7 +39,7 @@ done
 mkdir -p "$out"
 
 if [[ -n "$compiler" ]]; then
-    "$compiler" --quiet --plugin --soname=libpipewire-0.3.so.0 projects/desktop/libpipewire/libpipewire.mlx -o "$out/libpipewire-0.3.so.0"
+    "$compiler" --quiet --plugin --soname=libpipewire-0.3.so.0 compiler/capi/pipewire/libpipewire.mlx -o "$out/libpipewire-0.3.so.0"
 else
     # build.mlx's step of the same name (client-libraries).
     mlx_build libpipewire-0.3.so.0
@@ -62,7 +62,7 @@ libdir="$staged/usr/lib/$multiarch"
 install -d "$libdir" "$staged/usr/share/doc/mlx-capture-libs" "$staged/DEBIAN"
 install -m 644 "$out/libpipewire-0.3.so.0" "$libdir/"
 cat > "$staged/usr/share/doc/mlx-capture-libs/copyright" <<'TEXT'
-MLX Capture's client library, written in Mlx (projects/desktop/libpipewire
+MLX Capture's client library, written in Mlx (compiler/capi/pipewire
 in the mlx-lang repository). It implements the interface of PipeWire's
 libpipewire, whose behavior it follows.
 TEXT

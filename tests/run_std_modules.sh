@@ -23,6 +23,17 @@
 #   tests/358_timezone_names_runtime.mlx
 #                                       std.timezone's abbreviations and
 #                                       loadSetting
+#   tests/359_linux_descriptors_runtime.mlx
+#                                       std.linux: pipes, the event loop,
+#                                       signal, timer and counter
+#                                       descriptors, poll, Unix sockets,
+#                                       descriptors passed, children
+#   tests/360_spawn_runtime.mlx         std.spawn (PATH, output captured,
+#                                       descriptors, vfork, detached)
+#   tests/361_dbus_keep_signals_runtime.mlx
+#                                       std.dbus's client (signals kept
+#                                       across a call, bus addresses) and
+#                                       std.spawn.find
 #
 #   tests/run_std_modules.sh [compiler]
 set -euo pipefail
@@ -62,6 +73,9 @@ run 355_passwd_runtime "accounts and groups by name and number, malformed lines 
 run 356_conf_runtime "settings lines, comments, groups and switches"
 run 357_glob_runtime "stars, sets, ranges, escapes and quoted bytes"
 run 358_timezone_names_runtime "zone abbreviations from rules and TZif files"
+run 359_linux_descriptors_runtime "pipes, epoll tokens, signalfd, timerfd, eventfd, poll, Unix sockets, SCM_RIGHTS, wait4"
+run 360_spawn_runtime "PATH lookup, captured output, exit statuses, moved descriptors, vfork, detach"
+run 361_dbus_keep_signals_runtime "a client against a child bus: a signal kept across a call with its descriptor; bus addresses; PATH lookup"
 
 if [[ $failures -ne 0 ]]; then
     echo "$failures standard module checks failed"

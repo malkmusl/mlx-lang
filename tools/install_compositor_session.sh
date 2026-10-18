@@ -46,11 +46,11 @@
 #                                     libasound_module_ctl_pulse.so (MLX
 #                                     Audio's client libraries, Mlx's own
 #                                     libpulse and ALSA pulse plugin:
-#                                     projects/desktop/libpulse)
+#                                     compiler/capi/pulse)
 #   PREFIX/lib/mlx-capture/libpipewire-0.3.so.0 (MLX Capture's client
 #                                     library, Mlx's own libpipewire for the
 #                                     programs that take a screen share:
-#                                     projects/desktop/libpipewire)
+#                                     compiler/capi/pipewire)
 #   SESSIONS/mlx-compositor.desktop   (read by GDM and SDDM)
 #   ~/.local/lib/mlx-compositor/libmlx-shell.so, libmlx-render.so (for the
 #   user running this; the session loads them, and loads them again when

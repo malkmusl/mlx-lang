@@ -128,7 +128,7 @@ extends_signed_results() {
 }
 
 # Whether $1 gives a plugin a soname and its exports a symbol version
-# (--soname, --symbol-version; projects/desktop/libpulse needs them).
+# (--soname, --symbol-version; compiler/capi/pulse needs them).
 writes_symbol_versions() {
     local probe
     probe=$(mktemp -d mlx-out/probe.XXXXXX)
@@ -176,7 +176,7 @@ keeps_slice_lengths() {
 
 # Whether $1 makes an `export const` a data symbol of a plugin
 # (tests/support/plugin_library.mlx's mlx_plugin_level, read as a C global
-# from python3; projects/desktop/libpipewire needs it for pw_log_level).
+# from python3; compiler/capi/pipewire needs it for pw_log_level).
 exports_data() {
     command -v python3 > /dev/null || return 0
     local probe

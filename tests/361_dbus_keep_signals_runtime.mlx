@@ -1,0 +1,169 @@
+// std.dbus's client against a bus played by a child process: EXTERNAL
+// authentication with descriptor passing, Hello, a call whose reply comes
+// after a signal (kept by keepSignals, with the descriptor it brought, for
+// `next`), and the bus addresses (addressPath, systemPath); std.spawn.find
+// looking a program up in PATH. Exits 13 when every check holds, else the
+// number of the first check that failed.
+const std = @import("std")
+const dbus = @import("std.dbus")
+const spawn = @import("std.spawn")
+
+const linux = std.linux
+
+// Sends `header` with `length` bytes of `body` and `count` descriptors
+// (which the connection closes once they went).
+fn send(connection: *dbus.Connection, header: *dbus.Header, sender: []const u8, body: [*]const u8, length: usize, descriptors: [*]const isize, count: usize) -> bool {
+    header.*.bodyLength = length
+    header.*.unixFds = @intCast(u32, count)
+    var bytes: [512]u8 = undefined
+    var writing: dbus.Writer = undefined
+    dbus.begin(&writing, &bytes, 512, false)
+    dbus.writeMessage(&writing, header, sender, body)
+    if writing.failed || !dbus.queue(connection, writing.bytes, writing.length, descriptors, count) { return false }
+    while dbus.flush(connection) == dbus.EAGAIN {
+        if linux.event.waitReady(connection.*.descriptor, true, 5000) <= 0 { return false }
+    }
+    return dbus.pendingOutput(connection) == 0
+}
+
+// The next complete message into `header` (left in the input until
+// consumed); false when the client went away.
+fn receive(connection: *dbus.Connection, header: *dbus.Header) -> bool {
+    while true {
+        const available = dbus.buffered(connection)
+        const size = dbus.messageSize(dbus.input(connection), available)
+        if size > 0 && size <= available { return dbus.parseHeader(dbus.input(connection), size, header) }
+        if linux.event.waitReady(connection.*.descriptor, false, 5000) <= 0 { return false }
+        const got = dbus.receive(connection)
+        if got == 0 || (got < 0 && got != dbus.EAGAIN) { return false }
+    }
+    return false
+}
+
+// The bus: answers the authentication, Hello, and Ping (a signal with a
+// pipe's end first, then the reply); returns once the client is gone.
+fn serve(listener: isize) -> u8 {
+    const descriptor = linux.socket.accept(listener, 0, 0)
+    if descriptor < 0 { return 20 }
+    var auth: [256]u8 = undefined
+    const auth_bytes: [*]u8 = &auth
+    var have: usize = 0
+    while !std.text.contains(auth_bytes[0..have], "BEGIN\r\n") {
+        if have >= 256 { return 21 }
+        const got = linux.read(descriptor, auth_bytes + have, 256 - have)
+        if got <= 0 { return 22 }
+        have += @bitCast(usize, got)
+    }
+    if !std.text.contains(auth_bytes[0..have], "NEGOTIATE_UNIX_FD") { return 23 }
+    if !linux.writeAll(descriptor, "OK 0123456789abcdef0123456789abcdef\r\nAGREE_UNIX_FD\r\n") { return 24 }
+    var connection: dbus.Connection = undefined
+    if !dbus.open(&connection, std.page_allocator.init(), descriptor) { return 25 }
+    var nothing: [1]isize = [1]isize{ 0 }
+    var body: [64]u8 = undefined
+    var call: dbus.Header = undefined
+    while receive(&connection, &call) {
+        dbus.consume(&connection, call.size, @intCast(usize, call.unixFds))
+        if call.kind != dbus.METHOD_CALL { return 26 }
+        var writing: dbus.Writer = undefined
+        dbus.begin(&writing, &body, 64, false)
+        var reply = dbus.newHeader(dbus.METHOD_RETURN, 1)
+        reply.replySerial = call.serial
+        reply.hasReplySerial = true
+        if std.text.same(call.member, "Hello") {
+            dbus.putString(&writing, ":1.1")
+            reply.signature = "s"
+            unsafe { if !send(&connection, &reply, "org.freedesktop.DBus", writing.bytes, writing.length, &nothing, 0) { return 27 } }
+        } else if std.text.same(call.member, "Ping") {
+            var read_end: isize = -1
+            var write_end: isize = -1
+            if !linux.pipe(&read_end, &write_end, linux.O_CLOEXEC) { return 28 }
+            linux.close(write_end)
+            var signal = dbus.newHeader(dbus.SIGNAL, 2)
+            signal.path = "/t"
+            signal.interface = "t.Test"
+            signal.member = "Changed"
+            signal.signature = "s"
+            dbus.putString(&writing, "kept")
+            var passed: [1]isize = [1]isize{ read_end }
+            unsafe { if !send(&connection, &signal, ":1.0", writing.bytes, writing.length, &passed, 1) { return 29 } }
+            unsafe { if !send(&connection, &reply, ":1.0", writing.bytes, 0, &nothing, 0) { return 30 } }
+        } else {
+            return 31
+        }
+    }
+    return 0
+}
+
+fn checkBus(path: []const u8) -> u8 {
+    const listener = linux.socket.listenUnix(path, false, linux.socket.SOCK_CLOEXEC, 1)
+    if listener < 0 { return 1 }
+    const child = linux.process.fork()
+    if child == 0 { linux.exitGroup(@intCast(usize, serve(listener))) }
+    linux.close(listener)
+    if child < 0 { return 1 }
+    const allocator = std.page_allocator.init()
+    var client: dbus.Client = undefined
+    if !dbus.connectClient(&client, allocator, path) { return 2 }
+    if !client.unixFds || !std.text.same(dbus.uniqueName(&client), ":1.1") { return 3 }
+    if !dbus.keepSignals(&client, allocator) { return 3 }
+
+    // The signal came before the reply: waitReply keeps it.
+    var nothing: [1]u8 = [1]u8{ 0 }
+    const serial = dbus.call(&client, "t.Test", "/t", "t.Test", "Ping", "", &nothing, 0)
+    var header: dbus.Header = undefined
+    if serial == 0 || !dbus.waitReply(&client, serial, &header, 5000) || header.kind != dbus.METHOD_RETURN { return 4 }
+    // `next` gives it, its body and its descriptor, then nothing.
+    if !dbus.next(&client, &header, 0) || header.kind != dbus.SIGNAL || !std.text.same(header.member, "Changed") { return 5 }
+    var reading = dbus.reader(dbus.bodyOf(&client, &header), header.bodyLength, header.big)
+    if !std.text.same(dbus.readString(&reading), "kept") { return 6 }
+    const passed = dbus.descriptorOf(&client, 0)
+    if passed < 0 || linux.fcntl(passed, linux.F_GETFD, 0) < 0 || dbus.descriptorOf(&client, 1) != -1 { return 7 }
+    linux.close(passed)
+    if dbus.next(&client, &header, 0) || client.closed { return 8 }
+    dbus.disconnect(&client, allocator)
+
+    var status: usize = 0
+    if linux.process.waitProcess(child, &status, 0) != child || !linux.process.succeeded(status) { return 9 }
+    return 0
+}
+
+pub fn main(arguments: [][*]const u8) -> u8 {
+    var path_storage: [64]u8 = undefined
+    const path_bytes: [*]u8 = &path_storage
+    var length = std.text.append(path_bytes, 0, 63, "/tmp/mlx-dbus-361-")
+    length = std.text.appendUnsigned(path_bytes, length, 63, @bitCast(usize, linux.getpid()))
+    path_bytes[length] = 0
+    const path = path_bytes[0..length]
+    const removed = linux.unlink(path_bytes)
+    const bus = checkBus(path)
+    const cleaned = linux.unlink(path_bytes)
+    if bus != 0 { return bus }
+
+    // Bus addresses: the first unix:path= of a list, to its ',' or ';'.
+    if !std.text.same(dbus.addressPath("unix:path=/run/bus"), "/run/bus") { return 10 }
+    if !std.text.same(dbus.addressPath("tcp:host=a;unix:path=/b,guid=1;unix:path=/c"), "/b") { return 10 }
+    if dbus.addressPath("unix:abstract=x").length != 0 { return 10 }
+    var entries: [3][*]const u8 = undefined
+    const set: []const u8 = "DBUS_SYSTEM_BUS_ADDRESS=unix:path=/x/bus;unix:path=/y"
+    const other: []const u8 = "HOME=/h"
+    unsafe {
+        entries[0] = other.pointer
+        entries[1] = set.pointer
+        entries[2] = @ptrFromInt([*]const u8, 0)
+    }
+    const environment: [*][*]const u8 = &entries
+    if !std.text.same(dbus.systemPath(environment, dbus.SYSTEM_BUS), "/x/bus") { return 11 }
+    unsafe { entries[1] = @ptrFromInt([*]const u8, 0) }
+    if !std.text.same(dbus.systemPath(environment, dbus.MLX_SYSTEM_BUS), "/run/mlx/bus") { return 11 }
+
+    // std.spawn.find: PATH's first executable of the name, a name with a
+    // slash as it is, nothing for a missing one.
+    var found: [256]u8 = undefined
+    const found_bytes: [*]u8 = &found
+    const fallback: []const u8 = "/nonexistent:/bin:/usr/bin"
+    const sh = spawn.find("sh", environment, fallback, found_bytes, 256)
+    if sh == 0 || !std.text.same(found_bytes[0..sh], "/bin/sh") || found[sh] != 0 { return 12 }
+    if spawn.find("./x", environment, fallback, found_bytes, 256) != 3 { return 12 }
+    if spawn.find("mlx-no-such-program", environment, fallback, found_bytes, 256) != 0 { return 12 }
+    return 13
+}

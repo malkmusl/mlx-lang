@@ -500,7 +500,8 @@ pub fn pendingOutput(connection: *const Connection) -> usize { return transport.
 pub const EAGAIN: isize = transport.EAGAIN
 
 // ---------------------------------------------------------------------------
-// Listening and the event loop (epoll), for a bus
+// Listening, for a bus (its event loop, signals and descriptors are
+// std.linux's: std.linux.event, std.linux.socket.peerCredentials)
 
 // Binds and listens on `path` (non-blocking): the descriptor, or a negative
 // errno.
@@ -515,43 +516,6 @@ pub fn accept(listener: isize) -> isize { return transport.accept(listener) }
 // negative errno.
 pub fn connect(path: []const u8) -> isize {
     return transport.connectPath(path.pointer, path.length)
-}
-
-pub fn closeDescriptor(descriptor: isize) -> void { transport.close(descriptor) }
-
-// Waits until `descriptor` is readable (or writable): 1 ready, 0 timed
-// out, or a negative errno; a negative timeout waits forever.
-pub fn waitReady(descriptor: isize, writable: bool, timeout_milliseconds: isize) -> isize { return transport.wait(descriptor, writable, timeout_milliseconds) }
-
-pub const Events = transport.Events
-
-pub fn createEventLoop() -> isize { return transport.createEventLoop() }
-pub fn watch(event_loop: isize, descriptor: isize, token: usize, writable: bool) -> bool { return transport.watch(event_loop, descriptor, token, writable) }
-pub fn rewatch(event_loop: isize, descriptor: isize, token: usize, writable: bool) -> bool { return transport.rewatch(event_loop, descriptor, token, writable) }
-pub fn unwatch(event_loop: isize, descriptor: isize) -> bool { return transport.unwatch(event_loop, descriptor) }
-pub fn waitEvents(event_loop: isize, events: *Events, timeout_milliseconds: isize) -> isize { return transport.waitEvents(event_loop, events, timeout_milliseconds) }
-pub fn eventToken(events: *const Events, index: usize) -> usize { return transport.eventToken(events, index) }
-pub fn eventFlags(events: *const Events, index: usize) -> u32 { return transport.eventFlags(events, index) }
-
-pub const EPOLLIN: u32 = 1
-pub const EPOLLOUT: u32 = 4
-pub const EPOLLHUP: u32 = 16
-pub const EPOLLERR: u32 = 8
-
-// The peer's process, user and group (SO_PEERCRED); false when the kernel
-// would not say.
-pub fn peerCredentials(descriptor: isize, pid: *u32, uid: *u32, gid: *u32) -> bool {
-    var credentials: [12]u8 = undefined
-    var length: [4]u8 = [4]u8{ 12, 0, 0, 0 }
-    const result = linux.syscall5(55, @bitCast(usize, descriptor), 1, 17, @intFromPtr(&credentials), @intFromPtr(&length))
-    if result != 0 { return false }
-    unsafe {
-        const bytes = @ptrCast([*]const u8, &credentials)
-        pid.* = load32(bytes, 0, false)
-        uid.* = load32(bytes, 4, false)
-        gid.* = load32(bytes, 8, false)
-    }
-    return true
 }
 
 // ---------------------------------------------------------------------------
@@ -579,6 +543,16 @@ pub const Client = struct {
     pendingCount: usize
     // The bus closed the connection (next returns false from then on).
     closed: bool
+    // With keepSignals: the signals that came while waitReply waited,
+    // each a u32 size, a u32 descriptor count, the descriptors (i32 each)
+    // and the message; next returns them first, from `current`.
+    keeping: bool
+    held: [*]u8
+    heldLength: usize
+    fromHeld: bool
+    current: [*]u8
+    currentHandles: [16]isize
+    currentCount: usize
 }
 
 pub fn connectionOf(client: *Client) -> *Connection {
@@ -698,7 +672,7 @@ pub fn connectClient(client: *Client, allocator: Allocator, path: []const u8) ->
     const descriptor = connect(path)
     if descriptor < 0 { return false }
     if !open(connectionOf(client), allocator, descriptor) {
-        closeDescriptor(descriptor)
+        linux.close(descriptor)
         return false
     }
     client.*.serial = 0
@@ -707,6 +681,10 @@ pub fn connectClient(client: *Client, allocator: Allocator, path: []const u8) ->
     client.*.pendingSize = 0
     client.*.pendingCount = 0
     client.*.closed = false
+    client.*.keeping = false
+    client.*.heldLength = 0
+    client.*.fromHeld = false
+    client.*.currentCount = 0
     const memory = allocator.alloc(MAX_MESSAGE, 16)
     if memory == null { return false }
     client.*.out = memory.?
@@ -718,7 +696,7 @@ pub fn connectClient(client: *Client, allocator: Allocator, path: []const u8) ->
     length = std.text.append(&hello, length, 128, "AUTH EXTERNAL ")
     var digits: [12]u8 = undefined
     var count: usize = 0
-    var uid = @bitCast(usize, linux.syscall0(102))
+    var uid = @intCast(usize, linux.process.realUserId())
     while true {
         digits[count] = @intCast(u8, 48 + uid % 10)
         count += 1
@@ -815,18 +793,20 @@ pub fn reply(client: *Client, request: *const Header, signature: []const u8, bod
     return send(client, &header, body, length, descriptors, count)
 }
 
-// Waits up to `timeout` milliseconds (negative: forever; 0: only what
-// already arrived) for the next message; false when none came or the
-// connection ended (then `closed` is set). Its body is at
-// bodyOf, its descriptors at descriptorOf: they are the caller's (to
-// close when it does not keep them).
-pub fn next(client: *Client, header: *Header, timeout: isize) -> bool {
-    const connection = connectionOf(client)
+// Drops the message `next` returned last.
+fn release(client: *Client) -> void {
     if client.*.pendingSize > 0 {
-        consume(connection, client.*.pendingSize, client.*.pendingCount)
+        consume(connectionOf(client), client.*.pendingSize, client.*.pendingCount)
         client.*.pendingSize = 0
         client.*.pendingCount = 0
     }
+    client.*.fromHeld = false
+}
+
+// The next message that arrives (none of the kept ones).
+fn receiveNext(client: *Client, header: *Header, timeout: isize) -> bool {
+    release(client)
+    const connection = connectionOf(client)
     while true {
         const available = buffered(connection)
         const bytes = input(connection)
@@ -851,8 +831,82 @@ pub fn next(client: *Client, header: *Header, timeout: isize) -> bool {
     return false
 }
 
+// Sets the signal `next` just received aside (its descriptors with it);
+// with no room left it goes, its descriptors closed.
+fn keep(client: *Client, header: *const Header) -> void {
+    const size = client.*.pendingSize
+    const count = client.*.pendingCount
+    const needed = 8 + count * 4 + size
+    const descriptors = handles(connectionOf(client))
+    var index: usize = 0
+    if client.*.heldLength + needed > MAX_MESSAGE || count > 16 {
+        while index < count {
+            linux.close(descriptors[index])
+            index += 1
+        }
+        return
+    }
+    const at = client.*.heldLength
+    std.mem.writeU32Little(client.*.held, at, @intCast(u32, size))
+    std.mem.writeU32Little(client.*.held, at + 4, @intCast(u32, count))
+    while index < count {
+        std.mem.writeU32Little(client.*.held, at + 8 + index * 4, @intCast(u32, descriptors[index] & 4294967295))
+        index += 1
+    }
+    std.mem.copy(client.*.held + at + 8 + count * 4, input(connectionOf(client)), size)
+    client.*.heldLength += needed
+}
+
+// The first kept signal, into `current`.
+fn takeKept(client: *Client, header: *Header) -> bool {
+    const size = @intCast(usize, std.mem.readU32Little(client.*.held, 0))
+    const count = @intCast(usize, std.mem.readU32Little(client.*.held, 4))
+    var index: usize = 0
+    while index < count {
+        client.*.currentHandles[index] = @intCast(isize, @bitCast(i32, std.mem.readU32Little(client.*.held, 8 + index * 4)))
+        index += 1
+    }
+    client.*.currentCount = count
+    const used = 8 + count * 4 + size
+    std.mem.copy(client.*.current, client.*.held + 8 + count * 4, size)
+    std.mem.copy(client.*.held, client.*.held + used, client.*.heldLength - used)
+    client.*.heldLength -= used
+    client.*.fromHeld = true
+    return parseHeader(client.*.current, size, header)
+}
+
+// Waits up to `timeout` milliseconds (negative: forever; 0: only what
+// already arrived) for the next message (with keepSignals the kept ones
+// first); false when none came or the connection ended (then `closed` is
+// set). Its body is at bodyOf, its descriptors at descriptorOf: they are
+// the caller's (to close when it does not keep them).
+pub fn next(client: *Client, header: *Header, timeout: isize) -> bool {
+    release(client)
+    if client.*.keeping && client.*.heldLength > 0 { return takeKept(client, header) }
+    return receiveNext(client, header, timeout)
+}
+
+// Keeps the signals that come while waitReply waits, for next to return
+// later (a logind session's PauseDevice must not be lost in a call's
+// wait); without it they are passed over. False when there is no memory.
+pub fn keepSignals(client: *Client, allocator: Allocator) -> bool {
+    const held = allocator.alloc(MAX_MESSAGE, 16)
+    if held == null { return false }
+    const current = allocator.alloc(MAX_MESSAGE, 16)
+    if current == null {
+        allocator.free(held.?, MAX_MESSAGE, 16)
+        return false
+    }
+    client.*.held = held.?
+    client.*.current = current.?
+    client.*.heldLength = 0
+    client.*.keeping = true
+    return true
+}
+
 // Ends the client's connection; the descriptors of the message `next`
-// returned last stay the caller's.
+// returned last stay the caller's, those of signals still kept are
+// closed.
 pub fn disconnect(client: *Client, allocator: Allocator) -> void {
     const connection = connectionOf(client)
     if client.*.pendingSize > 0 {
@@ -862,27 +916,96 @@ pub fn disconnect(client: *Client, allocator: Allocator) -> void {
     }
     close(connection)
     allocator.free(client.*.out, MAX_MESSAGE, 16)
+    if client.*.keeping {
+        while client.*.heldLength > 0 {
+            var header: Header = undefined
+            _ = takeKept(client, &header)
+            var index: usize = 0
+            while index < client.*.currentCount {
+                linux.close(client.*.currentHandles[index])
+                index += 1
+            }
+        }
+        allocator.free(client.*.held, MAX_MESSAGE, 16)
+        allocator.free(client.*.current, MAX_MESSAGE, 16)
+        client.*.keeping = false
+    }
 }
 
 // The connection's socket (to watch in an event loop; then next(.., 0)).
 pub fn descriptorOfClient(client: *Client) -> isize { return connectionOf(client).*.descriptor }
 
 pub fn bodyOf(client: *Client, header: *const Header) -> [*]const u8 {
+    if client.*.fromHeld { return advanceConst(client.*.current, header.*.bodyStart) }
     return advanceConst(input(connectionOf(client)), header.*.bodyStart)
 }
 
 // The message's descriptor `index` (-1 when it has none such).
 pub fn descriptorOf(client: *Client, index: usize) -> isize {
+    if client.*.fromHeld { return if index < client.*.currentCount { client.*.currentHandles[index] } else { -1 } }
     if index >= client.*.pendingCount { return -1 }
     const descriptor = handles(connectionOf(client))[index]
     return descriptor
 }
 
+// Closes the descriptors of the message `next` returned last but the one
+// at `kept` (an index past them: all of them).
+pub fn closeDescriptors(client: *Client, kept: usize) -> void {
+    const count = if client.*.fromHeld { client.*.currentCount } else { client.*.pendingCount }
+    var index: usize = 0
+    while index < count {
+        if index != kept { linux.close(descriptorOf(client, index)) }
+        index += 1
+    }
+}
+
 // Waits for the reply (or error) to `serial`; other messages are passed
-// over.
+// over (with keepSignals the signals are kept for next, the other
+// messages' descriptors closed).
 pub fn waitReply(client: *Client, serial: u32, header: *Header, timeout: isize) -> bool {
-    while next(client, header, timeout) {
+    while receiveNext(client, header, timeout) {
         if (header.*.kind == METHOD_RETURN || header.*.kind == ERROR) && header.*.hasReplySerial && header.*.replySerial == serial { return true }
+        if client.*.keeping {
+            if header.*.kind == SIGNAL {
+                keep(client, header)
+            } else {
+                closeDescriptors(client, client.*.pendingCount)
+            }
+        }
     }
     return false
+}
+
+// ---------------------------------------------------------------------------
+// Bus addresses
+
+// The socket path of a bus address list: the first unix:path= address's
+// path (to its ',' or ';'), as a slice of `address`; "" when it has none.
+pub fn addressPath(address: []const u8) -> []const u8 {
+    var start: usize = 0
+    while start < address.length {
+        if std.text.startsWith(address[start..address.length], "unix:path=") {
+            var end = start + 10
+            while end < address.length && address[end] != 44 && address[end] != 59 { end += 1 }
+            return address[start + 10..end]
+        }
+        // The next address.
+        while start < address.length && address[start] != 59 { start += 1 }
+        start += 1
+    }
+    return address[0..0]
+}
+
+// The system bus's socket: DBUS_SYSTEM_BUS_ADDRESS's (addressPath), else
+// `fallback` (MLX_SYSTEM_BUS, MLXIPC's system bus, or SYSTEM_BUS, the
+// freedesktop one), as a slice of the environment or of `fallback`.
+pub const MLX_SYSTEM_BUS: []const u8 = "/run/mlx/bus"
+pub const SYSTEM_BUS: []const u8 = "/run/dbus/system_bus_socket"
+
+pub fn systemPath(environment: [*][*]const u8, fallback: []const u8) -> []const u8 {
+    const found = std.process.environmentFrom(environment, "DBUS_SYSTEM_BUS_ADDRESS")
+    if found == null { return fallback }
+    const value = found.?
+    const path = addressPath(std.string.asSlice(value))
+    return if path.length == 0 { fallback } else { path }
 }
