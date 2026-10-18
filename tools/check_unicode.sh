@@ -34,6 +34,12 @@
 #       tests/tailoring.c      collation by locale (CLDR's tailorings) and
 #                              by rules, as ICU 74 sorts the same words
 #       tests/idna.c           every line of IdnaTestV2.txt (UTS #46)
+#       tests/bidi.c           every line of BidiTest.txt and
+#                              BidiCharacterTest.txt (UAX #9): levels and
+#                              visual order
+#       tests/bidirandom.c     random texts of every bidi class through
+#                              ubidi.h: levels, runs, maps, reordered
+#                              text, lines, as ICU 74 reports them
 #       tests/calendars.c      the calendars other than the Gregorian:
 #                              their fields over three thousand years,
 #                              add, roll, limits, as ICU 74 has them
@@ -122,11 +128,15 @@ cc $tests/collation.c -o "$work/collation" || fail "tests/collation.c does not b
 run "$work/collation" > "$work/collation.out" || { cat "$work/collation.out"; fail "the collation tests"; }
 while read -r line; do echo "ok   $line"; done < "$work/collation.out"
 
+cc $tests/bidi.c -o "$work/bidi" || fail "tests/bidi.c does not build"
+run "$work/bidi" > "$work/bidi.out" || { cat "$work/bidi.out"; fail "the bidi tests"; }
+while read -r line; do echo "ok   $line"; done < "$work/bidi.out"
+
 cc $tests/idna.c -o "$work/idna" || fail "tests/idna.c does not build"
 run "$work/idna" > "$work/idna.out" || { cat "$work/idna.out"; fail "IdnaTestV2.txt"; }
 echo "ok   $(cat "$work/idna.out")"
 
-for test in properties strings calendar calendars charsets locales bundles lists displaynames dates calendarformats zonenames numbers units tailoring; do
+for test in properties strings calendar calendars charsets locales bundles lists displaynames dates calendarformats zonenames numbers units tailoring bidirandom; do
     cc "$tests/$test.c" -o "$work/$test" || fail "tests/$test.c does not build"
     run "$work/$test" > "$work/$test.out" || fail "tests/$test.c fails"
     diff -u "$tests/$test.expected" "$work/$test.out" || fail "tests/$test.c prints otherwise"

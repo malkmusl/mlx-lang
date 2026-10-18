@@ -38,6 +38,7 @@ hand.
 | `collation.mlx` | `ucol.h`, `uiter.h` (std.unicode.collation) |
 | `idna.mlx` | `uidna.h` (std.unicode.idna) |
 | `charsets.mlx` | `ucsdet.h` (std.unicode.charsets) |
+| `bidi.mlx` | `ubidi.h` (std.unicode.bidi) |
 | `enumeration.mlx` | `uenum.h` (std.unicode.enumeration) |
 | `localeid.mlx`, `displaynames.mlx`, `bundles.mlx` | `uloc.h` (std.unicode.locale); `uldnames.h` and `uloc_getDisplay*` (std.unicode.locale.displaynames); `ures.h` over cldr.dat (std.unicode.locale.bundles) |
 | `calendar.mlx`, `timezonenames.mlx` | `ucal.h` (std.unicode.calendar); the names of zones (std.unicode.format.date.zonenames) |
@@ -77,6 +78,22 @@ from C programs compiled by mlx-cc:
   to 2100, on both sides of every transition, against the files zic made
   of the same database (where the system has them;
   std/registry/tz/compare.mlx): no difference
+- BidiTest.txt: 770241 of 770241 cases (each line in each paragraph
+  direction its bitset names: the levels and the visual order), and
+  BidiCharacterTest.txt: 91707 of 91707 lines (ICU 74 itself fails 30 of
+  them, of the rules for brackets that Unicode 16 settles); and
+  tests/bidirandom.c, 6000 random texts of every bidi class (brackets,
+  marks, controls, isolates, both kinds of digits, paragraph separators,
+  surrogates) in every paragraph direction, prints what ICU 74 prints:
+  the levels, the direction, the runs in both orders, the maps, the text
+  written in visual order with each option, and a line of each
+  (bidirandom.expected). Where UAX #9 leaves the choice to the
+  implementation the library takes ICU's (a level per UTF-16 unit with a
+  lead surrogate as BN, removed characters at the level of the next one,
+  text of one direction reported at its paragraph level, the paragraph
+  level of a line of one direction), and also ICU's way of resolving the
+  brackets and the numbers of a paragraph after the first in text without
+  explicit controls (by the level of the paragraph before it)
 - IdnaTestV2.txt: 19169 of 19169 conversions (toUnicode, toAsciiN,
   toAsciiT of 6389 lines, and UTF-8)
 - locale IDs and tags: tests/locales.c against ICU's results
@@ -114,12 +131,15 @@ from C programs compiled by mlx-cc:
     (`ucol_getTailoredSet`, `ucol_getContractionsAndExpansions`);
   - Windows' zone IDs; parsing leap months and cyclic years of the
     Chinese calendars;
-  - bidi (`ubidi`);
   - legacy charset conversion (`ucnv`); detecting single-byte charsets
     other than Latin-1 and windows-1252 (ICU rates them by n-gram
     statistics of their languages);
   - sets (`uset`).
   They come next, in Mlx, from the Unicode and CLDR data.
+- Of `ubidi.h`: the reordering modes other than the default and the
+  inverse algorithm (kept, not applied), the options that insert marks
+  (`UBIDI_OPTION_INSERT_MARKS`, `UBIDI_INSERT_LRM_FOR_NUMERIC`) and
+  streaming; `ubidi_setContext`'s text is kept but takes no part.
 - Rules of a program's own for a break iterator (`ubrk_openRules`).
 - Collation, where it is not as ICU's:
   - CLDR 48's Han order (`radicals.txt`) is Unicode 17's: a few Han

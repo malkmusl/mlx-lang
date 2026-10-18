@@ -46,6 +46,7 @@
 #include <unicode/udateintervalformat.h>
 #include <unicode/unumsys.h>
 #include <unicode/ures.h>
+#include <unicode/ubidi.h>
 
 int main(void)
 {
