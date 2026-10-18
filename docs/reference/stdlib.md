@@ -266,10 +266,17 @@ transport), and a client: `connectSession` (or `connectClient` with a
 socket path) authenticates with EXTERNAL, negotiates descriptor passing
 and says Hello; `send`, `call` and `reply` write messages, `next` waits
 for the next one (its body at `bodyOf`, its descriptors at
-`descriptorOf`) and `waitReply` for the reply to a call. MLXIPC's bus
-(`projects/desktop/ipc`, mlx-ipcd) and its tool mlx-ipc use it;
-`tools/check_ipc.sh` runs both against dbus-send, gdbus, busctl and
-dbus-monitor.
+`descriptorOf`) and `waitReply` for the reply to a call; after
+`keepSignals` the signals that come while `waitReply` waits are kept, with
+their descriptors, for `next` to return first (a logind client must not
+lose a PauseDevice that arrived during a call). `addressPath` takes the
+socket path out of a bus address list and `systemPath` is the system
+bus's (DBUS_SYSTEM_BUS_ADDRESS, else `MLX_SYSTEM_BUS` or `SYSTEM_BUS`).
+MLXIPC's bus (`projects/desktop/ipc`, mlx-ipcd) and its tool mlx-ipc use
+it, as do the compositor's logind session and the desktop's system bus
+clients; `tools/check_ipc.sh` runs both against dbus-send, gdbus, busctl
+and dbus-monitor, and `tests/361_dbus_keep_signals_runtime.mlx` keeps a
+signal across a call against a bus played by a child.
 
 `std.audio` (`std/src/audio.mlx`) is MLX Audio's protocol and client:
 `connect` finds the sound server on the session bus and gets a direct
@@ -1176,8 +1183,8 @@ vforks (for large parents). `start` returns the pid (or -errno);
 `startReading` hands back the read end of a pipe the child writes to;
 `capture` runs it to its end with its output kept; `wait` and `ended`
 give the exit code or 128 plus the signal; `execute` and `executeIn` are
-the PATH lookup for children that fork themselves. A program that cannot
-run exits with 127.
+the PATH lookup for children that fork themselves, and `find` is where a
+name would run from. A program that cannot run exits with 127.
 
 ```mlx
 const spawn = @import("std.spawn")
@@ -1321,11 +1328,12 @@ over raw descriptors (`isize`, -errno on failure): `read`, `write`,
 alone), `open`, `openAt`, `ioctl`, `fcntl`, `keepOnExec` (clears
 `FD_CLOEXEC` for a child), `setNonBlocking`, `dup`, `dup2`, `pipe`,
 `seek`, `truncate`, `getdents`, `unlink`, `makeDirectory`, `chmod`,
-`chdir`, `mmap`, `mapShared`/`munmap`, `memfdCreate`, `getpid`,
+`chdir`, `mmap`, `mapShared`/`mapAnonymous`/`munmap`, `memfdCreate`, `getpid`,
 `exitGroup`, `sleepMilliseconds`, and `failed` (whether a raw result is
 an error rather than an address).
 
-It re-exports five sub-namespaces, each a thin syscall wrapper module:
+It re-exports nine sub-namespaces, each a thin syscall wrapper module or
+the kernel's definitions for one kind of device:
 
 - `os/linux/thread.mlx` — `clone`/`clone3`/`futex` numbers and `CLONE_*`
   flags, plus `futex`/`futexWait`/`futexWake`, `getTid`, `yield`, `exit`,
@@ -1362,6 +1370,13 @@ It re-exports five sub-namespaces, each a thin syscall wrapper module:
   `stopSignal`, `continued`; `kill`, `setSession`, `prctl`; signal sets as
   a word (`signalBit`, `changeSignalMask`, `unblockAllSignals`,
   `setSignalHandler`).
+- `os/linux/tty.mlx`, `os/linux/fbdev.mlx`, `os/linux/evdev.mlx`,
+  `os/linux/drm.mlx` — the kernel's definitions for terminals and virtual
+  consoles (`TCGETS`, `TIOCSCTTY`, `KDSETMODE`, `VT_ACTIVATE`, ...), the
+  framebuffer (`query` fills a `Screen`), input devices (event records,
+  `EV_*`/`KEY_*`/`BTN_*`, the `EVIOCG*` request numbers, `isKeyboard`) and
+  KMS (the mode-setting ioctls, PRIME flags, capabilities, formats), which
+  mlx-console, mlx-splash and the compositor share.
 
 `tests/359_linux_descriptors_runtime.mlx` (run by
 `tests/run_std_modules.sh`) takes a pipe, a timer, a signal and an event
