@@ -1,9 +1,12 @@
 // A partial specialization over `V<T>` is more specialized than one over
-// `V<T, Types...>` for a single argument (WTF's alternative_index_helper:
-// the pack one would make the empty V<> its member names).
+// `V<T, Types...>` for a single argument, V an alias of a variadic class
+// template as WTF::Variant is of mpark::variant (alternative_index_helper:
+// the pack one would make the empty variant<> its member names; through
+// the alias `Variant<T>` is `variant<T...>`, T no pack).
 #include <stdio.h>
 #include <type_traits>
-template<class... Ts> struct V { static_assert(0 < sizeof...(Ts), "empty"); };
+namespace mp { template<class... Ts> struct variant { static_assert(0 < sizeof...(Ts), "empty"); }; }
+template<class... Ts> using V = mp::variant<Ts...>;
 template<int N> struct C { };
 template<class T> struct U { };
 template<unsigned long, class, class> struct H;
