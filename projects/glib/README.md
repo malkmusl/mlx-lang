@@ -37,7 +37,7 @@ sources reach.
 | `threads.mlx` | `gthread.h`, `gatomic.h`: threads (POSIX), mutexes, recursive mutexes, read-write locks, conditions, private keys, `g_once` |
 | `errors.mlx`, `messages.mlx` | `gquark.h`, `gerror.h`; `gmessages.h` (log levels, handlers, the default handler's output, `G_MESSAGES_DEBUG`, fatal masks, criticals of failed checks) |
 | `utils.mlx` | `gutils.h`: the environment, user and system directories (XDG), the program name |
-| `strings.mlx` | `gstrfuncs.h`, `gstring.h`, `gunicode.h`, `gconvert.h`, `gbase64.h`: strings, ASCII classes and case, UTF-8 (validation, iteration, lengths and offsets, making valid), conversions between UTF-8, UTF-16 and UCS-4, escaping, `g_strdup_printf` with C's formats |
+| `strings.mlx` | `gstrfuncs.h`, `gstring.h`, `gunicode.h`, `gconvert.h`, `gbase64.h`, `gprintf.h`: strings, ASCII classes and case, UTF-8 (validation, iteration, lengths and offsets, making valid), conversions between UTF-8, UTF-16 and UCS-4, escaping, `g_strdup_printf` with C's formats |
 | `lists.mlx`, `hash.mlx`, `arrays.mlx` | `glist.h`, `gslist.h`; `ghash.h` (GHashTable); `garray.h`, `gbytes.h` (GArray, GPtrArray, GByteArray, GBytes) |
 | `files.mlx` | `gfileutils.h`, `gstdio.h`, `gdir.h`, `gmappedfile.h`, file names and URIs, host names |
 | `checksum.mlx`, `misc.mlx` | `gchecksum.h` (MD5, SHA-1, SHA-256, SHA-384, SHA-512); `gpattern.h`, `gtimer.h`, `gkeyfile.h`, `gshell.h`; `ggettext.h` and `gi18n-lib.h` (no message catalogs: a message is the program's own) |

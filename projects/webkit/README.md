@@ -27,13 +27,17 @@ and GIO, here mlx-glib (projects/glib).
     ./mlx build webkit-wpe-bmalloc    the WPE port's bmalloc
     ./mlx build webkit-wpe-wtf        WTF for WPE (PlatformWPE.cmake's sources) on mlx-glib and mlx-unicode
     ./mlx build webkit-wpe-jsc-derived  what JavaScriptCore's build generates for WPE
+    ./mlx build webkit-wpe-jsc        JavaScriptCore for WPE, C_LOOP, with its GLib API and the remote inspector's GLib sources
+    ./mlx build webkit-wpe-jsc-shell  mlx-out/webkit/wpe/bin/jsc
     ./mlx build webkit-wpe-wtf-test   mlx-out/webkit/wpe/bin/wtf-test (tests/wtf-wpe.cpp)
+    ./mlx build webkit-wpe-jsc-glib-test  mlx-out/webkit/wpe/bin/jsc-glib (tests/jsc-glib.c)
 
     ./mlx build webkit                all of it
 
     tools/check_webkit_generators.sh [jsconly|wpe]  the generated sources against those of a build by WebKit's generators (JSC_REFERENCE)
     tools/check_webcore_generators.sh WebCore's likewise (WEBCORE_REFERENCE, a WPE build's WebCore/DerivedSources)
     tools/check_wpe_wtf.sh            WTF (WPE) at work: run loop, timers, work queues, strings, URLs
+    tools/check_wpe_jsc.sh            JavaScriptCore (WPE) at work: jsc on tests/wpe.js, the GLib API's tests/jsc-glib.c
 
 The JSCOnly port's objects go to mlx-out/webkit/obj, its archives to
 mlx-out/webkit/lib, what is generated to mlx-out/webkit/generated
@@ -58,6 +62,7 @@ programs shared by the ports.
 | configuration | `config.JSC_ONLY` | `config.WPE`: the `cmakeconfig.h` of a WPE build with C_LOOP, Skia, no video or web audio |
 | WTF's sources | `lists/wtf.txt` | `lists/wtf-wpe.txt` (the reference build's 189: `wtf/glib`, `generic/MainThreadGeneric`, `WorkQueueGeneric`, `linux`, `posix`, `unix`, `android`) |
 | JavaScriptCore's source lists | `Sources.txt` | and `inspector/remote/SourcesGLib.txt` |
+| JavaScriptCore's sources apart | | `lists/jsc-glib-sources.txt` (the GLib API, `API/glib`) |
 | forwarding headers | `lists/jsc-headers.txt` | and `lists/jsc-headers-glib.txt` (the remote inspector's) |
 | JavaScriptCore's GLib API | | `JavaScriptCoreGLib/`: `jsc/*.h` of `lists/jsc-glib-api.txt` (the 2022 API), `JSCVersion.h`, `Headers/jsc` |
 | defines | `BUILDING_JSCONLY__` | `BUILDING_WPE__`, `JSC_GLIB_API_ENABLED`, `GETTEXT_PACKAGE`, `PKGDATADIR` |
@@ -81,6 +86,12 @@ numbers) and `URL` (parsing, relative URLs, file paths).
 `tests/wtf-wpe.expected` is what the same program prints built by GCC
 against the reference build's WTF and GLib 2.80.
 
+`tests/jsc-glib.c` is a C program of JavaScriptCore's GLib API for WPE
+(`<jsc/jsc.h>`: a context evaluating scripts, values made from C, C
+functions and a C class called from JavaScript, an exception), and
+`tests/wpe.js` a script for the WPE port's jsc; their `.expected` files
+are what JavaScriptCore prints for them.
+
 ## Parts
 
 | File | What |
@@ -91,7 +102,7 @@ against the reference build's WTF and GLib 2.80.
 | `unified.mlx` | Unified sources: generate-unified-source-bundles.py's bundles of a source list (Sources.txt), made while the steps are declared |
 | `lists/` | Source lists the build takes from WebKit's CMake files: WTF's and bmalloc's sources for each port, the `.lut.h` sources, JSC's headers, builtins and inspector domains; WebCore's IDL files (in CMake's order, which the bindings' batches follow), builtins, user agent style sheets, media controls' style sheets and scripts, AT-SPI interfaces |
 | `generators/` | WebKit's code generators in Mlx (below) |
-| `tests/` | `wtf-wpe.cpp`: a program of WTF's for the WPE port, and what it prints |
+| `tests/` | Programs of the WPE port and what they print: `wtf-wpe.cpp` (WTF), `jsc-glib.c` (JavaScriptCore's GLib API), `wpe.js` (for its jsc) |
 
 ## The generators
 
