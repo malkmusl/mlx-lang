@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
-# mlx-freetype, FreeType 2's C API in Mlx (projects/freetype):
+# mlx-freetype, FreeType 2's C API in Mlx (compiler/capi/freetype) over
+# std.truetype's font engine (std/src/truetype):
 #
 #   - `./mlx build freetype` builds the library (libmlxfreetype.so) and
 #     the headers: mlx-cheaders makes mlx-out/include/mlx-freetype of the
-#     API's Mlx modules (projects/freetype/api), <ft2build.h> and
+#     API's Mlx modules (compiler/capi/freetype/api), <ft2build.h> and
 #     <freetype/...> as FreeType names them;
 #   - every function the headers declare is in the library;
 #   - the headers, every FT_*_H of them, in C and in C++;
@@ -31,6 +32,19 @@
 #     fonts-noto-color-emoji, fonts-wqy-zenhei; a case whose font is
 #     missing is skipped) and on the small fonts of tests/fonts (made by
 #     tests/fonts/make_fonts.py);
+#   - with the system's FreeType 2.13 (gcc, pkg-config freetype2):
+#       a sweep: tests/sweep.c, built against it and against the library,
+#         prints the same for every font of the system (/usr/share/fonts:
+#         every face and named instance, every glyph of up to 1500 a face
+#         at several sizes and load flags, unhinted and hinted, gray,
+#         monochrome, LCD and color renderings, names, charmaps, advances,
+#         kerning), for the small fonts of tests/fonts, and for the CFF
+#         fonts of those made CFF fonts of their own (their CFF table, and
+#         the font without `head`);
+#       fuzz runs: tests/damaged.c on fonts with bytes changed at places of
+#         FUZZ_SEEDS (default 12) pseudo-random sequences or cut short,
+#         the same with both;
+#     (FREETYPE_SWEEP=0 leaves them out);
 #   - Skia's FreeType sources (SkFontHost_FreeType*.cpp, the font managers
 #     on FreeType) compile against these headers (with the C++ compiler
 #     CXX, g++ by default, where the WebKit source is: WEBKIT_SOURCE), and
@@ -50,7 +64,7 @@ trap 'rm -rf -- "$work"' EXIT
 fail() { echo "FAIL $1" >&2; exit 1; }
 headers=mlx-out/include/mlx-freetype
 library=mlx-out/lib/libmlxfreetype.so
-tests=projects/freetype/tests
+tests=compiler/capi/freetype/tests
 update=0
 [ "${1:-}" = "--update" ] && update=1
 
@@ -106,7 +120,7 @@ fi
 echo "ok   ./mlx build freetype"
 
 # Every `pub extern("c") fn` of the API modules is defined by the library.
-grep -ho 'pub extern("c") fn [A-Za-z0-9_]*' projects/freetype/api/*.mlx | awk '{print $4}' | sort -u > "$work/declared"
+grep -ho 'pub extern("c") fn [A-Za-z0-9_]*' compiler/capi/freetype/api/*.mlx | awk '{print $4}' | sort -u > "$work/declared"
 nm -D --defined-only "$library" | awk '{print $NF}' | sort -u > "$work/defined"
 comm -23 "$work/declared" "$work/defined" > "$work/missing"
 [ ! -s "$work/missing" ] || { cat "$work/missing"; fail "functions the headers declare are not in the library"; }
@@ -125,6 +139,67 @@ echo "ok   the headers ($(grep -c '#include FT_' "$work/all.c") of them) in C an
 
 mine() { cc "$1" -o "$2" "$library"; }
 run_cases mine mine
+
+# The sweep and the fuzz runs, against the system's FreeType.
+if [ "${FREETYPE_SWEEP:-1}" = 0 ]; then
+    echo "skip the sweep and the fuzz runs (FREETYPE_SWEEP=0)"
+elif ! command -v gcc > /dev/null || ! pkg-config --exists freetype2; then
+    echo "skip the sweep and the fuzz runs: no gcc or no FreeType development files"
+else
+    reference() { gcc -O2 $(pkg-config --cflags freetype2) "$1" -o "$2" $(pkg-config --libs freetype2) -lm; }
+    for program in sweep damaged; do
+        reference "$tests/$program.c" "$work/ref-$program" || fail "tests/$program.c does not build with the system's FreeType"
+        mine "$tests/$program.c" "$work/mine-$program" || fail "tests/$program.c does not build"
+    done
+    # Fonts of their own made of the CFF fonts: the CFF (or CFF2) table,
+    # and the font with its `head` renamed.
+    mkdir -p "$work/pure"
+    python3 - "$work/pure" "$tests/fonts/names.otf" "$tests/fonts/var-cff2.otf" /usr/share/fonts/opentype/inter/Inter-Regular.otf /usr/share/fonts/opentype/tlwg/Loma.otf <<'PY'
+import os, struct, sys
+for path in sys.argv[2:]:
+    if not os.path.exists(path):
+        continue
+    data = open(path, "rb").read()
+    name = os.path.basename(path).rsplit(".", 1)[0]
+    headless = bytearray(data)
+    for i in range(struct.unpack(">H", data[4:6])[0]):
+        tag = data[12 + 16 * i:16 + 16 * i]
+        offset, length = struct.unpack(">II", data[20 + 16 * i:28 + 16 * i])
+        if tag in (b"CFF ", b"CFF2"):
+            open(f"{sys.argv[1]}/{name}.{tag.decode().strip().lower()}", "wb").write(data[offset:offset + length])
+        if tag == b"head":
+            headless[12 + 16 * i:16 + 16 * i] = b"hea_"
+    open(f"{sys.argv[1]}/{name}-headless.otf", "wb").write(bytes(headless))
+PY
+    find /usr/share/fonts -type f \( -name '*.ttf' -o -name '*.otf' -o -name '*.ttc' \) 2> /dev/null | sort > "$work/fonts"
+    ls "$tests"/fonts/*.ttf "$tests"/fonts/*.otf "$work"/pure/* >> "$work/fonts"
+    count=0
+    while read -r font; do
+        "$work/ref-sweep" "$font" > "$work/sweep.ref" 2>&1 < /dev/null || true
+        status=0
+        LD_LIBRARY_PATH="$repo_root/mlx-out/lib" "$work/mine-sweep" "$font" > "$work/sweep.mine" 2>&1 < /dev/null || status=$?
+        [ "$status" = 0 ] || fail "the sweep of $font: tests/sweep.c exits $status"
+        diff -u "$work/sweep.ref" "$work/sweep.mine" > "$work/sweep.diff" || { head -30 "$work/sweep.diff"; fail "the sweep of $font: the library's glyphs are not FreeType's"; }
+        count=$((count + 1))
+    done < "$work/fonts"
+    echo "ok   the sweep: $count fonts as the system's FreeType reads and renders them"
+    runs=0
+    seeds=${FUZZ_SEEDS:-12}
+    for font in "$tests"/fonts/*.ttf "$tests"/fonts/*.otf /usr/share/fonts/truetype/dejavu/DejaVuSans.ttf /usr/share/fonts/opentype/inter/Inter-Regular.otf /usr/share/fonts/truetype/noto/NotoColorEmoji.ttf; do
+        [ -e "$font" ] || continue
+        step=1
+        case "$font" in /usr/*) step=13 ;; esac
+        for seed in $(seq 1 "$seeds"); do
+            for change in 3 20 -700; do
+                "$work/ref-damaged" "$font" "$seed" "$change" "$step" > "$work/damaged.ref" 2>&1 < /dev/null || true
+                LD_LIBRARY_PATH="$repo_root/mlx-out/lib" timeout 120 "$work/mine-damaged" "$font" "$seed" "$change" "$step" > "$work/damaged.mine" 2>&1 < /dev/null || echo "exit $?" >> "$work/damaged.mine"
+                diff -u "$work/damaged.ref" "$work/damaged.mine" > "$work/damaged.diff" || { head -20 "$work/damaged.diff"; fail "fuzz: $font, seed $seed, $change: the library answers otherwise"; }
+                runs=$((runs + 1))
+            done
+        done
+    done
+    echo "ok   fuzz: $runs damaged fonts, the same errors and glyphs as the system's FreeType"
+fi
 
 webkit=${WEBKIT_SOURCE:-/home/user/csrc/wpe/wpewebkit-2.54.1}
 skia=$webkit/Source/ThirdParty/skia

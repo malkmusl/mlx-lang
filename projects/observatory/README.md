@@ -688,8 +688,8 @@ of popping up.
   For the whole repository (47,000 nodes) that takes about a second.
 - [`main.mlx`](main.mlx) holds the app's state and its frame loop; its
   parts each take one area: [`map_view.mlx`](map_view.mlx) projects the
-  nodes with an orbit camera ([`math3d.mlx`](math3d.mlx): sin, cos, ln
-  and exp written out, the square root `@sqrt`), makes the frame's primitives and places labels
+  nodes with an orbit camera ([`math3d.mlx`](math3d.mlx), with
+  std.math's sines, roots and clamping), makes the frame's primitives and places labels
   so none covers another; [`navigation.mlx`](navigation.mlx) (reading,
   selecting, searching), [`input.mlx`](input.mlx), [`drawing.mlx`](drawing.mlx)
   and [`detail.mlx`](detail.mlx) (the panels), [`tabs.mlx`](tabs.mlx),

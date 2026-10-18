@@ -75,6 +75,7 @@ run tests/255_spirv_module_runtime.mlx -- "$work/doubler.spv"
 run tests/262_truetype_runtime.mlx
 run tests/272_png_runtime.mlx
 run tests/292_png_encode_runtime.mlx
+run tests/343_flate_runtime.mlx
 run tests/264_ui_layout_runtime.mlx
 
 # The builder's module passes the Khronos validator, and modules from
@@ -136,8 +137,8 @@ else
     failures=$((failures + 1))
 fi
 
-# std.truetype's rasterizer against FreeType and a supersampled ground
-# truth (skipped without freetype-py and fontTools).
+# std.truetype's glyphs against the system's FreeType, pixel for pixel
+# (skipped without gcc and FreeType's development files).
 if python3 tools/check_truetype.py "$compiler" > "$work/output" 2>&1; then
     sed 's/^/     /' "$work/output"
     echo "ok   tools/check_truetype.py"

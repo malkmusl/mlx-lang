@@ -1,18 +1,20 @@
 #!/usr/bin/env python3
-"""Checks std.truetype's rasterizer against FreeType and a ground truth.
+"""Checks std.truetype's glyphs against the system's FreeType.
 
-Builds tools/truetype-dump, renders glyphs of several fonts and sizes, and
-requires for every glyph:
+Builds tools/truetype-dump (std.truetype's Font: glyph indices, advances
+and rasterized glyphs) and a C program printing the same of the system's
+FreeType 2 (FT_Get_Char_Index, the advance in font units, the glyph
+rendered unhinted at the same size), runs both on glyphs of several
+fonts (TrueType and CFF outlines, simple and compound glyphs) and sizes,
+and requires every line to be the same: the glyphs, their advances, the
+bitmaps' sizes and placement and every pixel. std.truetype renders with
+FreeType's anti-aliasing rasterizer, so its glyphs are FreeType's.
 
-  - the same bitmap size and placement as FreeType (unhinted), and
-  - coverage close to a 16x16-supersampled rendering of the exact outline
-    (non-zero winding, fontTools): mean error at most 2.5 levels, and no
-    worse than FreeType's own mean error.
-
-Needs freetype-py and fontTools (pip install freetype-py fonttools); skips
+Needs gcc and FreeType's development files (pkg-config freetype2); skips
 otherwise. Usage: python3 tools/check_truetype.py [compiler]
 """
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -22,121 +24,86 @@ CASES = [
     ("tests/support/fonts/DejaVuSans-subset.ttf", 24, "AVgé&8QOaS@Ä€"),
     ("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 13, "gé&8QOaSß€"),
     ("/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf", 40, "a%Wé@"),
+    ("/usr/share/fonts/truetype/liberation/LiberationSerif-Italic.ttf", 31, "Qfgjé&"),
+    ("/usr/share/fonts/opentype/inter/Inter-Regular.otf", 17, "AVgé&8QOaS@€"),
 ]
+
+REFERENCE = r"""
+#include <ft2build.h>
+#include FT_FREETYPE_H
+#include <stdio.h>
+#include <stdlib.h>
+
+int main(int argc, char **argv)
+{
+    FT_Library library;
+    FT_Face face;
+    if (argc < 3 || FT_Init_FreeType(&library) || FT_New_Face(library, argv[1], 0, &face)) return 1;
+    FT_Set_Pixel_Sizes(face, 0, (FT_UInt)atoi(argv[2]));
+    for (int i = 3; i < argc; i++) {
+        unsigned long code = strtoul(argv[i], NULL, 10);
+        FT_UInt glyph = FT_Get_Char_Index(face, code);
+        FT_Load_Glyph(face, glyph, FT_LOAD_NO_SCALE);
+        long advance = face->glyph->metrics.horiAdvance;
+        int width = 0, rows = 0, left = 0, top = 0;
+        FT_Bitmap *b = NULL;
+        if (!FT_Load_Glyph(face, glyph, FT_LOAD_NO_HINTING | FT_LOAD_NO_BITMAP | FT_LOAD_RENDER)) {
+            b = &face->glyph->bitmap;
+            if (b->width > 0 && b->rows > 0) {
+                width = (int)b->width;
+                rows = (int)b->rows;
+                left = face->glyph->bitmap_left;
+                top = -face->glyph->bitmap_top;
+            }
+        }
+        printf("glyph %lu %u advance %ld bitmap %d %d %d %d\n", code, glyph, advance, width, rows, left, top);
+        for (int y = 0; y < rows; y++)
+            for (int x = 0; x < width; x++)
+                printf("%d%c", b->buffer[y * b->pitch + x], x + 1 == width ? '\n' : ' ');
+    }
+    return 0;
+}
+"""
 
 
 def main():
-    try:
-        import freetype
-        from fontTools.pens.basePen import BasePen
-        from fontTools.ttLib import TTFont
-    except ImportError:
-        print("skip check_truetype.py (needs freetype-py and fontTools)")
-        return 0
     compiler = sys.argv[1] if len(sys.argv) > 1 else os.path.join(ROOT, "mlx-out/bin/compiler/mlx4")
-
-    class Flat(BasePen):
-        def __init__(self, glyphs):
-            super().__init__(glyphs)
-            self.edges = []
-
-        def _moveTo(self, point):
-            self.current = self.start = point
-
-        def _lineTo(self, point):
-            self.edges.append((self.current, point))
-            self.current = point
-
-        def _qCurveToOne(self, control, point):
-            a = self.current
-            for step in range(1, 65):
-                t = step / 64
-                u = 1 - t
-                q = (u * u * a[0] + 2 * u * t * control[0] + t * t * point[0],
-                     u * u * a[1] + 2 * u * t * control[1] + t * t * point[1])
-                self.edges.append((self.current, q))
-                self.current = q
-
-        def _closePath(self):
-            if self.current != self.start:
-                self.edges.append((self.current, self.start))
-            self.current = self.start
-
-    def truth(font, glyph_name, scale, left, top, width, height):
-        pen = Flat(font.getGlyphSet())
-        font.getGlyphSet()[glyph_name].draw(pen)
-        edges = [((a[0] * scale, -a[1] * scale), (b[0] * scale, -b[1] * scale)) for a, b in pen.edges]
-        samples = 16
-        result = {}
-        for py in range(top, top + height):
-            for sy in range(samples):
-                y = py + (sy + 0.5) / samples
-                crossings = []
-                for (x0, y0), (x1, y1) in edges:
-                    if y0 <= y < y1 or y1 <= y < y0:
-                        crossings.append((x0 + (y - y0) * (x1 - x0) / (y1 - y0), 1 if y1 > y0 else -1))
-                for px in range(left, left + width):
-                    inside = 0
-                    for sx in range(samples):
-                        x = px + (sx + 0.5) / samples
-                        if sum(d for cx, d in crossings if cx < x) != 0:
-                            inside += 1
-                    result[(px, py)] = result.get((px, py), 0) + inside
-        return {key: value * 255 / (samples * samples) for key, value in result.items()}
-
+    if shutil.which("gcc") is None or shutil.which("pkg-config") is None:
+        print("skip check_truetype.py (needs gcc and pkg-config)")
+        return 0
+    flags = subprocess.run(["pkg-config", "--cflags", "--libs", "freetype2"], capture_output=True, text=True)
+    if flags.returncode != 0:
+        print("skip check_truetype.py (needs FreeType's development files)")
+        return 0
     failures = 0
     with tempfile.TemporaryDirectory() as work:
         dump = os.path.join(work, "truetype-dump")
         subprocess.run([compiler, "--quiet", "tools/truetype-dump/main.mlx", "-o", dump], cwd=ROOT, check=True)
+        source = os.path.join(work, "reference.c")
+        with open(source, "w") as out:
+            out.write(REFERENCE)
+        reference = os.path.join(work, "reference")
+        subprocess.run(["gcc", "-O1", source, "-o", reference] + flags.stdout.split(), check=True)
         for path, em, text in CASES:
             full = os.path.join(ROOT, path)
             if not os.path.exists(full):
                 print(f"skip {path} (not installed)")
                 continue
-            output = subprocess.run([dump, full, str(em)] + [str(ord(c)) for c in text],
-                                    capture_output=True, text=True, cwd=ROOT).stdout.split("\n")
-            font = TTFont(full)
-            cmap = font.getBestCmap()
-            scale = em / font["head"].unitsPerEm
-            face = freetype.Face(full)
-            face.set_pixel_sizes(0, em)
-            line = 1
-            ours_error = freetype_error = 0.0
-            count = 0
-            worst = 0.0
-            for character in text:
-                width, height, left, top = map(int, output[line].split()[6:10])
-                line += 1
-                ours = {}
-                for row in range(height):
-                    for column, value in enumerate(map(int, output[line].split())):
-                        ours[(left + column, top + row)] = value
-                    line += 1
-                face.load_char(character, freetype.FT_LOAD_RENDER | freetype.FT_LOAD_NO_HINTING)
-                glyph = face.glyph
-                bitmap = glyph.bitmap
-                if (width - 2, height, left, top) != (bitmap.width, bitmap.rows, glyph.bitmap_left, -glyph.bitmap_top):
-                    print(f"FAIL {path} {em}px {character!r}: bitmap {width - 2}x{height}@({left},{top}), "
-                          f"FreeType {bitmap.width}x{bitmap.rows}@({glyph.bitmap_left},{-glyph.bitmap_top})")
-                    failures += 1
-                    continue
-                reference = {(glyph.bitmap_left + x, -glyph.bitmap_top + y): bitmap.buffer[y * bitmap.pitch + x]
-                             for y in range(bitmap.rows) for x in range(bitmap.width)}
-                for key, value in truth(font, cmap[ord(character)], scale, left, top, width, height).items():
-                    if value == 0 and ours.get(key, 0) == 0 and reference.get(key, 0) == 0:
-                        continue
-                    error = abs(ours.get(key, 0) - value)
-                    ours_error += error
-                    freetype_error += abs(reference.get(key, 0) - value)
-                    worst = max(worst, error)
-                    count += 1
-            ours_mean = ours_error / max(1, count)
-            freetype_mean = freetype_error / max(1, count)
-            verdict = "ok  " if ours_mean <= 2.5 and ours_mean <= freetype_mean else "FAIL"
-            if verdict == "FAIL":
+            codes = [str(ord(c)) for c in text]
+            ours = subprocess.run([dump, full, str(em)] + codes, capture_output=True, text=True, cwd=ROOT).stdout.split("\n")
+            theirs = subprocess.run([reference, full, str(em)] + codes, capture_output=True, text=True).stdout.split("\n")
+            # (truetype-dump's first line tells the font's tables.)
+            if ours[1:] != theirs:
                 failures += 1
-            print(f"{verdict} {os.path.basename(path)} {em}px {text}: mean error {ours_mean:.2f} "
-                  f"(FreeType {freetype_mean:.2f}), worst {worst:.0f}, placement identical to FreeType")
+                for number, (a, b) in enumerate(zip(ours[1:], theirs)):
+                    if a != b:
+                        print(f"FAIL {os.path.basename(path)} {em}px, line {number + 1}: std.truetype {a!r}, FreeType {b!r}")
+                        break
+                else:
+                    print(f"FAIL {os.path.basename(path)} {em}px: {len(ours) - 1} lines, FreeType {len(theirs)}")
+                continue
+            glyphs = sum(1 for line in theirs if line.startswith("glyph "))
+            print(f"ok   {os.path.basename(path)} {em}px {text}: {glyphs} glyphs as FreeType renders them")
     return 1 if failures else 0
 
 
