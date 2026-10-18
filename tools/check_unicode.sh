@@ -7,7 +7,8 @@
 #     (projects/unicode/api);
 #   - the tables in the tree (tables.mlx, api/ugenerated.mlx) are what
 #     the generator makes of the UCD (projects/unicode/ucd) now, and
-#     timezones.mlx what tz-generate makes of the IANA database (tz/);
+#     timezones.mlx what tz-generate makes of the IANA database (tz/),
+#     locales.mlx what cldr-generate makes of CLDR (cldr/);
 #   - tests/zones.mlx: every zone's offsets, 1850 to 2100, against the
 #     files zic made of the same database, where the system has them;
 #   - tests/api.mlx: the API modules compile as Mlx, and the macros, run
@@ -22,7 +23,7 @@
 #                              tests (non-ignorable and shifted) in order
 #       tests/idna.c           every line of IdnaTestV2.txt (UTS #46)
 #       tests/properties.c, tests/strings.c, tests/calendar.c,
-#       tests/charsets.c       print what NAME.expected says
+#       tests/charsets.c, tests/locales.c  print what NAME.expected says
 #
 #   tools/check_unicode.sh
 set -euo pipefail
@@ -42,6 +43,10 @@ mlx-out/bin/unicode-generate projects/unicode/ucd "$work/tables" || fail "unicod
 cmp -s "$work/tables/tables.mlx" projects/unicode/tables.mlx || fail "projects/unicode/tables.mlx is not what the generator makes"
 cmp -s "$work/tables/api/ugenerated.mlx" projects/unicode/api/ugenerated.mlx || fail "api/ugenerated.mlx is not what the generator makes"
 echo "ok   the tables are what the generator makes of the UCD"
+
+mlx-out/bin/cldr-generate projects/unicode/cldr "$work/locales.mlx" || fail "cldr-generate"
+cmp -s "$work/locales.mlx" projects/unicode/locales.mlx || fail "projects/unicode/locales.mlx is not what cldr-generate makes"
+echo "ok   the locale data is what cldr-generate makes of CLDR"
 
 mlx-out/bin/tz-generate projects/unicode/tz "$work/timezones.mlx" || fail "tz-generate"
 cmp -s "$work/timezones.mlx" projects/unicode/timezones.mlx || fail "projects/unicode/timezones.mlx is not what tz-generate makes"
@@ -84,7 +89,7 @@ cc projects/unicode/tests/idna.c -o "$work/idna" || fail "tests/idna.c does not 
 run "$work/idna" > "$work/idna.out" || { cat "$work/idna.out"; fail "IdnaTestV2.txt"; }
 echo "ok   $(cat "$work/idna.out")"
 
-for test in properties strings calendar charsets; do
+for test in properties strings calendar charsets locales; do
     cc "projects/unicode/tests/$test.c" -o "$work/$test" || fail "tests/$test.c does not build"
     run "$work/$test" > "$work/$test.out" || fail "tests/$test.c fails"
     diff -u "projects/unicode/tests/$test.expected" "$work/$test.out" || fail "tests/$test.c prints otherwise"

@@ -5,8 +5,8 @@ ICU. WebKit (projects/webkit) and the others include `<unicode/...>` as
 they would ICU's headers. They link `libmlxunicode.so` in place of ICU.
 No ICU code or data is used: the library is this repository's own, and
 its tables come from the Unicode data alone (the Character Database, the
-Collation Algorithm's table, the IDNA mapping table) and its time zones
-from the IANA time zone database.
+Collation Algorithm's table, the IDNA mapping table), its time zones
+from the IANA time zone database and its locale data from CLDR.
 
 The interface is written once, in Mlx: the modules of `api/` declare the
 types, constants and functions C sees, and the macros (`U8_NEXT`,
@@ -14,7 +14,7 @@ types, constants and functions C sees, and the macros (`U8_NEXT`,
 makes the C headers of them into `mlx-out/include/mlx-unicode/unicode/`;
 there are no headers written by hand.
 
-    ./mlx build unicode        unicode-generate, tz-generate, the tables, the library, the headers
+    ./mlx build unicode        unicode-generate, tz-generate, cldr-generate, the tables, the library, the headers
     tools/check_unicode.sh     builds it and runs the conformance tests
 
 ## Parts
@@ -27,6 +27,8 @@ there are no headers written by hand.
 | `api/` | The interface in Mlx, a module per header (ICU's names and API level, 74); `ugenerated.mlx` (scripts, blocks) is made by `generate.mlx` |
 | `uca/`, `idna/` | The Unicode Collation Algorithm's table (DUCET) and its tests; the IDNA mapping table and its tests |
 | `tz/` | The IANA time zone database 2026c (`tzdata.zi`, the form zic reads; `zone.tab`, the zones of each country) |
+| `cldr/` | CLDR 48 (JSON): likely subtags, the aliases of languages, scripts, regions and variants, the BCP 47 keys and types, ISO 3166 codes, the available locales |
+| `cldrgenerate.mlx` | `cldr-generate CLDR OUT`: writes `locales.mlx`, CLDR's data as sorted tables |
 | `tzgenerate.mlx` | `tz-generate TZ OUT`: writes `timezones.mlx`, every zone's transitions worked out from its rules as zic does (through 2037, then the rules in force) |
 | `unicode.mlx` | The library's root (`--plugin --stack-arena`) |
 | `properties.mlx` | `uchar.h`, `uscript.h`: every binary and enumerated property, names of properties and values, classification, simple case mappings |
@@ -37,6 +39,7 @@ there are no headers written by hand.
 | `collation.mlx` | `ucol.h`, `uiter.h`: the Unicode Collation Algorithm with DUCET (contractions, discontiguous ones too, implicit weights, the attributes: strength, alternate shifted, case first and case level, French, numeric) |
 | `calendar.mlx` | `ucal.h`: the Gregorian calendar (Julian before its change, 1582 or as set), fields resolved as ICU resolves them, `add`, `roll`, limits, differences, times a transition skips or repeats; zone IDs (canonical, IANA, custom `GMT+hh:mm`), the host's and the default zone, enumerations of zones |
 | `zones.mlx` | The time zones at run time: an ID's zone, the offsets at a moment, the transitions |
+| `localeid.mlx` | `uloc.h`: ICU's locale IDs (their parts, names, keywords), BCP 47 tags to and from them (the extensions as keywords, legacy tags), likely subtags (UTS #35), the BCP 47 keys and types and their legacy names, orientation, ISO codes |
 | `locale.mlx` | The default locale (from the environment), a locale's language, region (its own, `rg`, or the likely one) and keywords, the region's week (CLDR's week data) |
 | `idna.mlx` | `uidna.h`: UTS #46 (mapping, NFC, the validity criteria, bidi, CONTEXTJ and CONTEXTO), Punycode, ToASCII and ToUnicode of names and labels, UTF-16 and UTF-8 |
 | `charsets.mlx` | `ucsdet.h`: charset detection (the Unicode forms by mark and validity, ISO-2022 by its escapes, Shift_JIS, EUC-JP, EUC-KR, GB18030 and Big5 by their structure, Latin-1 and windows-1252) |
@@ -58,6 +61,8 @@ from C programs compiled by mlx-cc:
   (where the system has them): no difference
 - IdnaTestV2.txt: 19167 of 19167 conversions (toUnicode, toAsciiN,
   toAsciiT of 6389 lines)
+- locale IDs and tags: tests/locales.c against ICU's results
+  (locales.expected)
 - the calendar: tests/calendar.c against what ICU gives (calendar.expected)
 
 ## Not yet here
@@ -70,7 +75,8 @@ from C programs compiled by mlx-cc:
   - calendars other than the Gregorian; time zone names other than the
     localized GMT format (`GMT+01:00`); Windows' zone IDs;
   - formatting for `Intl` (`udat`, `unum`, `unumf`, `uplrules`, `ulistfmt`, `ureldatefmt`), which needs locale data;
-  - locales (`uloc`);
+  - display names of locales (`uloc_getDisplay*`, `uldn`: the codes stand
+    for themselves until CLDR's names are here);
   - bidi (`ubidi`);
   - legacy charset conversion (`ucnv`); detecting single-byte charsets
     other than Latin-1 and windows-1252 (ICU rates them by n-gram
