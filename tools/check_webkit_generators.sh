@@ -2,7 +2,8 @@
 # WebKit's code generators in Mlx (projects/webkit/generators):
 #
 #   - `./mlx build webkit-jsc-derived` makes what JavaScriptCore's build
-#     generates into mlx-out/webkit/generated/JavaScriptCore;
+#     generates into mlx-out/webkit/generated/JavaScriptCore (the
+#     interpreter's headers through the extractors mlx-cc compiles);
 #   - with JSC_REFERENCE naming the DerivedSources directory of a build by
 #     WebKit's own generators (CMake, Perl, Python, Ruby) of the same
 #     tree, every file made is compared with that one byte for byte.
