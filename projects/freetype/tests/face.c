@@ -1,7 +1,10 @@
 /* The faces of the fonts named on the command line, as FreeType opens
    them: flags, names, sizes, charmaps, global metrics, the SFNT tables
    and names, glyph names, the PostScript name, `gasp`, kerning, the
-   characters of the Unicode charmap and its variation selectors. */
+   characters of the Unicode charmap and its variation selectors.
+
+   The face flags are printed without FT_FACE_FLAG_HINTER, which FreeType
+   sets for TrueType faces when it has its bytecode interpreter. */
 #include <ft2build.h>
 #include FT_FREETYPE_H
 #include FT_TRUETYPE_TABLES_H
@@ -25,7 +28,7 @@ static void print_face(FT_Library library, const char *path, long index)
     FT_Error error = FT_New_Face(library, path, index, &face);
     printf("face %s %ld: error %d\n", strrchr(path, '/') + 1, index, error);
     if (error) return;
-    printf("  faces %ld index 0x%lx flags 0x%lx style 0x%lx glyphs %ld\n", face->num_faces, face->face_index, face->face_flags, face->style_flags, face->num_glyphs);
+    printf("  faces %ld index 0x%lx flags 0x%lx style 0x%lx glyphs %ld\n", face->num_faces, face->face_index, face->face_flags & ~FT_FACE_FLAG_HINTER, face->style_flags, face->num_glyphs);
     printf("  family '%s' style '%s'\n", face->family_name ? face->family_name : "(null)", face->style_name ? face->style_name : "(null)");
     printf("  bbox %ld %ld %ld %ld em %u asc %d desc %d height %d maxadv %d %d underline %d %d\n", face->bbox.xMin, face->bbox.yMin, face->bbox.xMax, face->bbox.yMax, face->units_per_EM, face->ascender, face->descender, face->height, face->max_advance_width, face->max_advance_height, face->underline_position, face->underline_thickness);
     printf("  format %s ps '%s' fstype 0x%x ps-names %d\n", FT_Get_Font_Format(face), FT_Get_Postscript_Name(face) ? FT_Get_Postscript_Name(face) : "(null)", FT_Get_FSType_Flags(face), FT_Has_PS_Glyph_Names(face));

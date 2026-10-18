@@ -4,6 +4,11 @@
    metrics at several places of the design space (gvar, HVAR, MVAR and
    avar for TrueType outlines, the CFF2 blend for CFF2 ones).
 
+   The face flags are printed without FT_FACE_FLAG_HINTER, which FreeType
+   sets for TrueType faces when it has its bytecode interpreter. */
+#define FLAGS(face) ((face)->face_flags & ~FT_FACE_FLAG_HINTER)
+/*
+
    variations FONT [STEP]   (every STEP-th glyph, default 1) */
 #include <ft2build.h>
 #include FT_FREETYPE_H
@@ -49,7 +54,7 @@ static void print_coords(FT_Face face, unsigned n)
 
 static void print_state(FT_Face face, long step)
 {
-    printf("  face flags 0x%lx style 0x%lx index 0x%lx asc %d desc %d height %d maxadv %d underline %d %d ps '%s'\n", face->face_flags, face->style_flags, face->face_index, face->ascender, face->descender, face->height, face->max_advance_width, face->underline_position, face->underline_thickness, FT_Get_Postscript_Name(face) ? FT_Get_Postscript_Name(face) : "(null)");
+    printf("  face flags 0x%lx style 0x%lx index 0x%lx asc %d desc %d height %d maxadv %d underline %d %d ps '%s'\n", FLAGS(face), face->style_flags, face->face_index, face->ascender, face->descender, face->height, face->max_advance_width, face->underline_position, face->underline_thickness, FT_Get_Postscript_Name(face) ? FT_Get_Postscript_Name(face) : "(null)");
     TT_OS2 *os2 = FT_Get_Sfnt_Table(face, FT_SFNT_OS2);
     if (os2) printf("  os2 x %d cap %d strike %d %d sub %d %d %d %d sup %d %d %d %d typo %d %d %d win %u %u\n", os2->sxHeight, os2->sCapHeight, os2->yStrikeoutSize, os2->yStrikeoutPosition, os2->ySubscriptXSize, os2->ySubscriptYSize, os2->ySubscriptXOffset, os2->ySubscriptYOffset, os2->ySuperscriptXSize, os2->ySuperscriptYSize, os2->ySuperscriptXOffset, os2->ySuperscriptYOffset, os2->sTypoAscender, os2->sTypoDescender, os2->sTypoLineGap, os2->usWinAscent, os2->usWinDescent);
     TT_HoriHeader *hhea = FT_Get_Sfnt_Table(face, FT_SFNT_HHEA);
@@ -105,7 +110,7 @@ int main(int argc, char **argv)
     FT_Error error = FT_New_Face(library, argv[1], 0, &face);
     printf("open %d\n", error);
     if (error) return 1;
-    printf("faces %ld flags 0x%lx style 0x%lx mm %d named %d variation %d\n", face->num_faces, face->face_flags, face->style_flags, FT_HAS_MULTIPLE_MASTERS(face) != 0, FT_IS_NAMED_INSTANCE(face) != 0, FT_IS_VARIATION(face) != 0);
+    printf("faces %ld flags 0x%lx style 0x%lx mm %d named %d variation %d\n", face->num_faces, FLAGS(face), face->style_flags, FT_HAS_MULTIPLE_MASTERS(face) != 0, FT_IS_NAMED_INSTANCE(face) != 0, FT_IS_VARIATION(face) != 0);
     FT_MM_Var *mm = NULL;
     error = FT_Get_MM_Var(face, &mm);
     printf("mm var %d\n", error);
@@ -168,7 +173,7 @@ int main(int argc, char **argv)
         error = FT_Set_Var_Design_Coordinates(face, n, c);
         printf("design set %u: %d\n", i, error);
         print_coords(face, n);
-        printf("  flags 0x%lx variation %d named %d ps '%s'\n", face->face_flags, FT_IS_VARIATION(face) != 0, FT_IS_NAMED_INSTANCE(face) != 0, FT_Get_Postscript_Name(face) ? FT_Get_Postscript_Name(face) : "(null)");
+        printf("  flags 0x%lx variation %d named %d ps '%s'\n", FLAGS(face), FT_IS_VARIATION(face) != 0, FT_IS_NAMED_INSTANCE(face) != 0, FT_Get_Postscript_Name(face) ? FT_Get_Postscript_Name(face) : "(null)");
         if (i == 0 || i == 2 || i == 5) print_state(face, step);
     }
     FT_Fixed one = 300 << 16;
