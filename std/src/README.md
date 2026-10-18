@@ -62,6 +62,21 @@ crash. `timezone.mlx` (`std.timezone`) gives local time from `$TZ` or
 `/etc/localtime` (TZif files and POSIX rules) and the civil calendar. See
 `docs/reference/stdlib.md`.
 
+`unicode.mlx` (`std.unicode`) with `unicode/` is Unicode and CLDR's
+locale data in Mlx: `std.unicode.utf` (UTF-8 and UTF-16, no tables),
+`.properties`, `.casing`, `.normalize`, `.breaks`, `.collation` (with
+`collation/`), `.idna`, `.charsets`, `.locale` (with `locale/`),
+`.calendar` (with `calendar/`) and `.format` (`format/`: number, plural,
+date, list, reltime), each with a native API (UTF-8 slices, allocators,
+`unicode.Error`) beside ICU's functions, which `compiler/capi/icu` exports
+to C as `libmlxunicode.so`. `timezone/database.mlx`
+(`std.timezone.database`) is the IANA time zone database built in
+(`timezone/tzdata.mlx`). Their tables (`unicode/tables.mlx`,
+`unicode/locale/data.mlx`, `unicode/collation/rules.mlx`,
+`timezone/tzdata.mlx`) are generated from `std/registry/unicode` and
+`std/registry/tz` by the generators there (`./mlx build unicode`); do not
+edit them by hand. See `docs/reference/unicode.md`.
+
 `ui/appearance.mlx` (`std.ui.appearance`) follows the desktop's colour
 scheme (`~/.config/mlx/appearance.conf`) for every window and panel, and
 `ui/theme.mlx`'s `at` gives the look for it, gliding when it is switched.

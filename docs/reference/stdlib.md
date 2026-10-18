@@ -209,7 +209,11 @@ zone from `$TZ` (a zone name, a path or a POSIX rule) or `/etc/localtime`
 `daysFromCivil` convert between seconds and the proleptic Gregorian
 calendar (`tests/279_timezone_runtime.mlx`).
 `std.process.environmentFrom(entries, name)` looks a name up in any
-NUL-terminated environment list, which `load` uses.
+NUL-terminated environment list, which `load` uses. `std.timezone.database`
+is the whole IANA database built in, by zone ID, reckoned with the same
+civil calendar; `std.unicode` is Unicode and CLDR's locale data
+(collation, normalization, IDNA, calendars, formatting): see
+[Unicode and locales](unicode.md).
 
 `std.xkb` (`std/src/xkb.mlx`, with `std/src/xkb/`) is XKB without
 libxkbcommon, behaving as libxkbcommon 1.6 does. `std.xkb.parse` reads
