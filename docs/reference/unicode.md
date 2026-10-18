@@ -70,6 +70,7 @@ fn example(allocator: unicode.utf.Allocator) -> unicode.Error!void {
 | `std.unicode.collation` | `openCollator` (a locale with its tailoring and `-u-co-`, `-u-kn-`... keywords), `openRules` (UTS #35 rules over the root), `setStrength`, `setNumeric`, `setIgnorePunctuation`, `compareText` (an `Order`), `closeCollator` |
 | `std.unicode.idna` | `toAscii`, `toUnicode` (UTS #46, nontransitional, the bidi and CONTEXTJ rules) |
 | `std.unicode.charsets` | `detect`: the likely charset (`Detected`: name, language, confidence) |
+| `std.unicode.charmaps` | the single-byte charsets (ISO-8859-2 to -16, the Windows code pages, KOI8-R and -U, IBM866, the Mac OS ones) as the Encoding Standard's tables have them: `find` by name or label (a `Charmap`), `nameOf`, `decode` a byte, `encode` a code point (`NONE` where there is none); no tables beyond its own, no C library |
 | `std.unicode.locale` | `canonical`, `toLanguageTag`, `fromLanguageTag`, `maximize` and `minimize` (likely subtags), `defaultLocale` |
 | `std.unicode.locale.displaynames` | `languageName`, `scriptName`, `regionName` in a display locale |
 | `std.unicode.calendar` | `fieldsAt`: a moment's `Fields` (era, year, month, day, weekday, time, the zone's offsets...) in a locale's calendar (its `calendar` keyword or its region's preference: Buddhist, Japanese, Hebrew, Islamic, Chinese...) and a zone; `calendarType` |
@@ -86,7 +87,7 @@ and the spans of their fields (ICU's `UFormattedValue`).
 `tests/344_unicode_utf_runtime.mlx` tests `std.unicode.utf` (a static
 program: no tables, no C library); `tests/345_unicode_text_runtime.mlx`
 the text parts (properties, casing, normalization, breaks, collation by
-locale and by rules, IDNA, charset detection);
+locale and by rules, IDNA, charset detection, the single-byte charsets);
 `tests/346_unicode_locale_runtime.mlx` the locale parts over `cldr.dat`
 (tags, likely subtags, display names, calendar fields in Berlin and in
 the Thai Buddhist calendar, numbers, plural categories, dates, lists,
@@ -122,6 +123,8 @@ against the zone files zic made of the same database.
 | `collation/rules.mlx` | Generated (`collation-generate`): each locale's default type and each type's rules, and the Han order |
 | `idna.mlx` | `uidna.h`: UTS #46, Punycode, ToASCII and ToUnicode |
 | `charsets.mlx` | `ucsdet.h`: charset detection |
+| `charmaps.mlx` | The single-byte charsets: names and labels, a byte's code point and back |
+| `charmaps/tables.mlx` | Generated (`charset-generate`): the code points of their bytes 0x80 to 0xFF, of the Encoding Standard's indexes and Apple's tables (`std/registry/unicode/charsets`) |
 | `enumeration.mlx` | `uenum.h` |
 | `locale.mlx` | `uloc.h`: ICU's locale IDs, BCP 47 tags, likely subtags, the BCP 47 keys and types |
 | `locale/defaults.mlx` | The default locale (from the environment), a locale's language, region and keywords, the region's week |

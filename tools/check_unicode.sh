@@ -11,7 +11,9 @@
 #     and compiler/capi/icu/api/ugenerated.mlx of the UCD (ucd/),
 #     std/src/unicode/locale/data.mlx of CLDR (cldr/),
 #     std/src/unicode/collation/rules.mlx of CLDR's collation data
-#     (cldr/collation/), std/src/timezone/tzdata.mlx of the IANA database;
+#     (cldr/collation/), std/src/unicode/charmaps/tables.mlx of the
+#     single-byte charsets' tables (charsets/), std/src/timezone/tzdata.mlx
+#     of the IANA database;
 #   - std/registry/tz/compare.mlx: every zone's offsets, 1850 to 2100,
 #     against the files zic made of the same database, where the system
 #     has them;
@@ -69,6 +71,10 @@ echo "ok   the locale data is what cldr-generate makes of CLDR"
 mlx-out/bin/collation-generate "$work/collationrules.mlx" std/registry/unicode/cldr/collation/radicals.txt std/registry/unicode/cldr/collation/*.xml || fail "collation-generate"
 cmp -s "$work/collationrules.mlx" std/src/unicode/collation/rules.mlx || fail "std/src/unicode/collation/rules.mlx is not what collation-generate makes"
 echo "ok   the collation rules are what collation-generate makes of CLDR"
+
+LC_ALL=C bash -c 'mlx-out/bin/charset-generate "$0" std/registry/unicode/charsets/*.txt std/registry/unicode/charsets/*.TXT' "$work/charmaps.mlx" || fail "charset-generate"
+cmp -s "$work/charmaps.mlx" std/src/unicode/charmaps/tables.mlx || fail "std/src/unicode/charmaps/tables.mlx is not what charset-generate makes"
+echo "ok   the single-byte charsets are what charset-generate makes of their tables"
 
 mlx-out/bin/tz-generate std/registry/tz "$work/timezones.mlx" || fail "tz-generate"
 cmp -s "$work/timezones.mlx" std/src/timezone/tzdata.mlx || fail "std/src/timezone/tzdata.mlx is not what tz-generate makes"
