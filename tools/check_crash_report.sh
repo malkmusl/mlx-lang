@@ -7,7 +7,9 @@
 #     failure (crash.fail) and a full value arena each say the
 #     function they happened in and the functions that called it;
 #   - each crash is kept as a line in $XDG_STATE_HOME/mlx/crashes.log;
-#   - every Wayland client watches its connection (std.wayland.crash.watch).
+#   - every program build.mlx declares installs the report (crash.install
+#     first thing in main), every Wayland client watches its connection
+#     (std.wayland.crash.watch).
 #
 #   tools/check_crash_report.sh [compiler]
 set -euo pipefail
@@ -75,6 +77,21 @@ log="$work/state/mlx/crashes.log"
 awk -F'\t' '$1 != "crash" || $2 !~ /^[0-9]+$/ || $3 != "crashy" || NF < 5 { bad = 1 } END { exit bad }' "$log" || fail "crashes.log lines are not crash/time/program/reason/frames" "$log"
 grep -q "	tests/support/crash_report.mlx:12:middle+0x[0-9a-f]* at tests/support/crash_report.mlx:9	" "$log" || fail "the kept crash has no frames" "$log"
 echo "ok   every crash is kept in \$XDG_STATE_HOME/mlx/crashes.log"
+
+# The rule: every program build.mlx declares (its root module) installs the
+# crash report, so a crash anywhere on the system is said and kept for MLX
+# Observatory. The Android packages are left out: their entry is the
+# activity's, not main. Shared objects and plugins are left out too: they
+# run in another program's process, whose handler it is.
+missing=$(grep -oE '(Build\.)?program\(b, ([a-z_]+, )?"[^"]+", "[^"]+"' build.mlx | sed 's/.*", "//; s/"$//' | sort -u | while read -r root; do
+    [[ "$root" == *coreutils* || "$root" == *android* ]] && continue
+    grep -qE 'crash[a-z_]*\.install\(' "$root" || echo "$root"
+done)
+[[ -z "$missing" ]] || fail "these programs do not install the crash report (std.crash install() first in main): $missing"
+for utility in projects/coreutils/*/main.mlx; do
+    grep -qE 'crash[a-z_]*\.install\(' "$utility" || fail "$utility does not install the crash report"
+done
+echo "ok   every program build.mlx declares installs the crash report"
 
 # The rule: every Wayland client in projects/, examples/ and tools/ watches
 # its connection (std.wayland.crash.watch, right after it connects), so a protocol error

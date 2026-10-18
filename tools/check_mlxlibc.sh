@@ -7,6 +7,9 @@
 #   - tools/mlxlibc_check.py: the same calls through ctypes into both
 #     libraries answer the same (strings, ctype, malloc, stdlib, unistd,
 #     signals, printf, stdio, time, pthread);
+#   - tools/libm_check.py: libm.so.6 (projects/libc/libm.mlx, built next
+#     to it) answers as the system's libm does, bit for bit or within a
+#     few ulps;
 #   - tools/mlxlibc_check.c: a C program gcc links twice, against
 #     libmlxc.so (every libc symbol it uses binds there; glibc is left the
 #     program start alone) and against glibc alone; both runs print the
@@ -52,6 +55,8 @@ echo "ok   libmlxc.so.1: $count symbols, soname, nothing needed"
 
 # The same calls into both libraries.
 result=$(python3 -I tools/mlxlibc_check.py "$lib" 2>&1) || fail "ctypes: $(tail -5 <<< "$result")"
+libm_result=$(python3 -I tools/libm_check.py "$work/lib/libm.so.6" 2>&1) || fail "libm: $(tail -8 <<< "$libm_result")"
+echo "$libm_result"
 echo "ok   ctypes: $(tail -1 <<< "$result") as glibc's"
 
 # The C program, on libmlxc and on glibc.

@@ -18,6 +18,10 @@ server runtimes. `wayland/generated/` holds the modules materialized from
 name and are not re-exported from `std.mlx`.
 
 `json.mlx` (`std.json`) is the allocation-free JSON pull tokenizer.
+`dbus.mlx` (`std.dbus`) is the D-Bus wire format and a client of a bus;
+`ipc.mlx` (`std.ipc`) is MLXIPC's native wire format (the same messages,
+compactly, with one round trip to connect), its client, and what carries
+a message between the two formats (`projects/desktop/ipc`).
 `netlink.mlx` (`std.netlink`) speaks netlink: route netlink (links, IPv4
 addresses, routes and their change groups) and generic netlink (families
 looked up by name, as nl80211).

@@ -1,0 +1,277 @@
+// Windows of other programs as parents (zxdg_exporter_v2 and
+// zxdg_importer_v2, xdg-foreign): a program exports its window and is
+// given a handle for it (32 random hex digits); another program given the
+// handle (a portal's file chooser for a sandboxed program, an editor's
+// dialog in a separate process) imports it and makes a window of its own
+// that window's dialog (dialogs.mlx), as xdg_toplevel.set_parent does
+// within one program (`foreign: TITLE over TITLE` in the log). When the
+// exported window or its export goes, its imports are told destroyed and
+// the windows they made its dialogs belong to nothing; when an import
+// goes, so does the parenting it made.
+const std = @import("std")
+const wl = @import("std.wayland")
+const state = @import("./state.mlx")
+const dialogs = @import("./dialogs.mlx")
+
+const Compositor = state.Compositor
+const Surface = state.Surface
+
+const SYS_getrandom: usize = 318
+const HANDLE_LENGTH: usize = 32
+
+pub const Export = struct {
+    compositor: *Compositor
+    resource: wl.server.Object
+    // The window (its surface's address; 0 once it went) and its handle.
+    surface: usize
+    handle: [32]u8
+}
+
+pub const Import = struct {
+    compositor: *Compositor
+    resource: wl.server.Object
+    // The export it found (its record's address; 0: none, or gone) and the
+    // window it last made that export's dialog (0: none).
+    exported: usize
+    child: usize
+}
+
+fn exportAt(address: usize) -> *Export {
+    unsafe { return @ptrFromInt(*Export, address) }
+}
+
+fn importAt(address: usize) -> *Import {
+    unsafe { return @ptrFromInt(*Import, address) }
+}
+
+fn contextAt(address: usize) -> *anyopaque {
+    unsafe { return @ptrFromInt(*anyopaque, address) }
+}
+
+fn hexDigit(value: u8) -> u8 { return if value < 10 { 48 + value } else { 87 + value } }
+
+// A handle no other program can guess (the time, without randomness).
+fn makeHandle(out: *[32]u8) -> void {
+    var random: [16]u8 = undefined
+    const got = std.linux.syscall3(SYS_getrandom, @intFromPtr(&random), 16, 0)
+    var index: usize = 0
+    while index < 16 {
+        const byte = if got == 16 { random[index] } else { @intCast(u8, (state.microseconds() >> @intCast(u6, index % 8 * 4)) & 255) }
+        out.*[index * 2] = hexDigit(byte >> 4)
+        out.*[index * 2 + 1] = hexDigit(byte & 15)
+        index += 1
+    }
+}
+
+// The export whose handle is `handle` (0: none).
+fn findExport(compositor: *Compositor, handle: []const u8) -> usize {
+    if handle.length != HANDLE_LENGTH { return 0 }
+    var index: usize = 0
+    while index < compositor.*.foreignExports.length {
+        const address = state.listAt(compositor.*.foreignExports, index)
+        const record = exportAt(address)
+        var same = record.*.surface != 0
+        var at: usize = 0
+        while same && at < HANDLE_LENGTH {
+            if record.*.handle[at] != handle[at] { same = false }
+            at += 1
+        }
+        if same { return address }
+        index += 1
+    }
+    return 0
+}
+
+// The import's dialog belongs to nothing again (if it is still the
+// export's).
+fn undoParent(record: *Import) -> void {
+    if record.*.child == 0 { return }
+    const child = state.surfaceAt(record.*.child)
+    if record.*.exported != 0 && child.*.transientFor == exportAt(record.*.exported).*.surface { child.*.transientFor = 0 }
+    record.*.child = 0
+}
+
+// The export at `address` goes: its imports are told so.
+fn exportGone(compositor: *Compositor, address: usize) -> void {
+    var index: usize = 0
+    while index < compositor.*.foreignImports.length {
+        const record = importAt(state.listAt(compositor.*.foreignImports, index))
+        if record.*.exported == address {
+            undoParent(record)
+            record.*.exported = 0
+            wl.zxdg_imported_v2.Resource.fromObject(record.*.resource).sendDestroyed()
+        }
+        index += 1
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Exporting
+
+fn onExported(context: *anyopaque, request: wl.server.Request) -> void {}
+
+fn onExportedDestroyed(context: *anyopaque, object: wl.server.Object) -> void {
+    const address = @intFromPtr(context)
+    const compositor = exportAt(address).*.compositor
+    exportGone(compositor, address)
+    compositor.*.foreignExports = state.listRemove(compositor.*.foreignExports, address)
+    unsafe { state.release(compositor, @ptrFromInt([*]u8, address), @sizeOf(Export)) }
+}
+
+fn onExporter(context: *anyopaque, request: wl.server.Request) -> void {
+    const compositor = state.compositorOf(context)
+    if request.opcode != wl.zxdg_exporter_v2.REQUEST_EXPORT_TOPLEVEL { return }
+    const decoded = wl.zxdg_exporter_v2.decodeRequest(request).export_toplevel
+    const surface = state.findSurface(compositor, decoded.surface.object)
+    if surface == 0 || !state.surfaceAt(surface).*.hasToplevel {
+        wl.zxdg_exporter_v2.Resource.fromObject(request.object).postError(@intFromEnum(wl.zxdg_exporter_v2.Error.invalid_surface), "only a window can be exported")
+        return
+    }
+    const address = @intFromPtr(state.allocate(compositor, @sizeOf(Export)))
+    const record = exportAt(address)
+    record.*.compositor = compositor
+    record.*.resource = decoded.id.object
+    record.*.surface = surface
+    var handle: [32]u8 = undefined
+    makeHandle(&handle)
+    var index: usize = 0
+    while index < HANDLE_LENGTH {
+        record.*.handle[index] = handle[index]
+        index += 1
+    }
+    compositor.*.foreignExports = state.listAppend(compositor.*.foreignExports, address)
+    decoded.id.setHandler(onExported, contextAt(address))
+    decoded.id.setDestroyHandler(onExportedDestroyed, contextAt(address))
+    const bytes: [*]const u8 = &handle
+    decoded.id.sendHandle(bytes[0..HANDLE_LENGTH])
+}
+
+fn bindExporter(context: *anyopaque, client: wl.server.Client, object: wl.server.Object, version: u32) -> void {
+    wl.zxdg_exporter_v2.Resource.fromObject(object).setHandler(onExporter, context)
+}
+
+// ---------------------------------------------------------------------------
+// Importing
+
+fn onImported(context: *anyopaque, request: wl.server.Request) -> void {
+    const record = importAt(@intFromPtr(context))
+    if request.opcode != wl.zxdg_imported_v2.REQUEST_SET_PARENT_OF { return }
+    const compositor = record.*.compositor
+    const decoded = wl.zxdg_imported_v2.decodeRequest(request).set_parent_of
+    const child = state.findSurface(compositor, decoded.surface.object)
+    if child == 0 || !state.surfaceAt(child).*.hasToplevel {
+        wl.zxdg_imported_v2.Resource.fromObject(request.object).postError(@intFromEnum(wl.zxdg_imported_v2.Error.invalid_surface), "only a window can be a dialog")
+        return
+    }
+    // A handle that named nothing (or a window gone) parents nothing.
+    if record.*.exported == 0 { return }
+    const parent = exportAt(record.*.exported).*.surface
+    if !dialogs.setParentWindow(state.surfaceAt(child), parent) { return }
+    if record.*.child != 0 && record.*.child != child { undoParent(record) }
+    record.*.child = child
+    if compositor.*.verbose {
+        state.say("foreign: ")
+        state.sayTitle(state.surfaceAt(child))
+        state.say(" over ")
+        state.sayTitle(state.surfaceAt(parent))
+        state.say("\n")
+    }
+}
+
+fn onImportedDestroyed(context: *anyopaque, object: wl.server.Object) -> void {
+    const address = @intFromPtr(context)
+    const record = importAt(address)
+    const compositor = record.*.compositor
+    undoParent(record)
+    compositor.*.foreignImports = state.listRemove(compositor.*.foreignImports, address)
+    unsafe { state.release(compositor, @ptrFromInt([*]u8, address), @sizeOf(Import)) }
+}
+
+fn onImporter(context: *anyopaque, request: wl.server.Request) -> void {
+    const compositor = state.compositorOf(context)
+    if request.opcode != wl.zxdg_importer_v2.REQUEST_IMPORT_TOPLEVEL { return }
+    const decoded = wl.zxdg_importer_v2.decodeRequest(request).import_toplevel
+    const address = @intFromPtr(state.allocate(compositor, @sizeOf(Import)))
+    const record = importAt(address)
+    record.*.compositor = compositor
+    record.*.resource = decoded.id.object
+    record.*.exported = findExport(compositor, decoded.handle.pointer[0..decoded.handle.length])
+    record.*.child = 0
+    compositor.*.foreignImports = state.listAppend(compositor.*.foreignImports, address)
+    decoded.id.setHandler(onImported, contextAt(address))
+    decoded.id.setDestroyHandler(onImportedDestroyed, contextAt(address))
+    // An unknown handle: the import is destroyed at once.
+    if record.*.exported == 0 { decoded.id.sendDestroyed() }
+}
+
+fn bindImporter(context: *anyopaque, client: wl.server.Client, object: wl.server.Object, version: u32) -> void {
+    wl.zxdg_importer_v2.Resource.fromObject(object).setHandler(onImporter, context)
+}
+
+// ---------------------------------------------------------------------------
+
+// A window's toplevel or surface is going away: its exports go with it,
+// and the imports that made it a dialog forget it.
+pub fn surfaceGone(compositor: *Compositor, surface: *Surface) -> void {
+    if !compositor.*.hasForeign { return }
+    const own = state.addressOfSurface(surface)
+    var index: usize = 0
+    while index < compositor.*.foreignImports.length {
+        const record = importAt(state.listAt(compositor.*.foreignImports, index))
+        if record.*.child == own { record.*.child = 0 }
+        index += 1
+    }
+    index = 0
+    while index < compositor.*.foreignExports.length {
+        const address = state.listAt(compositor.*.foreignExports, index)
+        if exportAt(address).*.surface == own {
+            exportGone(compositor, address)
+            exportAt(address).*.surface = 0
+        }
+        index += 1
+    }
+}
+
+pub fn createGlobals(compositor: *Compositor) -> bool {
+    compositor.*.foreignExports = state.newList(compositor.*.allocator)
+    compositor.*.foreignImports = state.newList(compositor.*.allocator)
+    compositor.*.hasForeign = true
+    const memory: [*]u8 = unsafe { @ptrCast([*]u8, compositor) }
+    const context = state.contextOf(memory)
+    if compositor.*.server.createGlobal(wl.Interface.zxdg_exporter_v2, 1, bindExporter, context) == 0 { return false }
+    return compositor.*.server.createGlobal(wl.Interface.zxdg_importer_v2, 1, bindImporter, context) != 0
+}
+
+// ---------------------------------------------------------------------------
+// The handlers this file registers with the Wayland server, by name: when
+// the shell is loaded again (modules.mlx), each resource's handler is
+// replaced by the new code's function of the same name. Every function
+// passed to setHandler, setDestroyHandler, createGlobal or a client
+// handler here must be listed (tools/check_compositor_modules.py checks;
+// --fix rewrites this table).
+
+pub const HANDLER_COUNT: usize = 8
+
+pub fn handlerAddress(index: usize) -> usize {
+    if index == 0 { return @intFromPtr(bindExporter) }
+    if index == 1 { return @intFromPtr(bindImporter) }
+    if index == 2 { return @intFromPtr(onExported) }
+    if index == 3 { return @intFromPtr(onExportedDestroyed) }
+    if index == 4 { return @intFromPtr(onExporter) }
+    if index == 5 { return @intFromPtr(onImported) }
+    if index == 6 { return @intFromPtr(onImportedDestroyed) }
+    if index == 7 { return @intFromPtr(onImporter) }
+    return 0
+}
+
+pub fn handlerName(index: usize) -> []const u8 {
+    if index == 0 { return "foreign.bindExporter" }
+    if index == 1 { return "foreign.bindImporter" }
+    if index == 2 { return "foreign.onExported" }
+    if index == 3 { return "foreign.onExportedDestroyed" }
+    if index == 4 { return "foreign.onExporter" }
+    if index == 5 { return "foreign.onImported" }
+    if index == 6 { return "foreign.onImportedDestroyed" }
+    if index == 7 { return "foreign.onImporter" }
+    return ""
+}

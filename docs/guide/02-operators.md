@@ -8,7 +8,8 @@
 `94_wrapping_shift_count_runtime.mlx`, `113_signed_integer_runtime.mlx`,
 `114_unsigned_comparison_runtime.mlx`, `183_float_exponent_runtime.mlx`,
 `184_signed_right_shift_runtime.mlx`, `203_immediate_alu_gep_runtime.mlx`,
-`207_popcount_runtime.mlx`
+`207_popcount_runtime.mlx`, `322_float_literal_arithmetic_runtime.mlx`,
+`324_float_rounding_runtime.mlx`
 
 ## Arithmetic, division and remainder
 
@@ -181,6 +182,25 @@ pointer), a returned value, a structure field, and the other operand of
 arithmetic or a comparison with an `f32`
 (`tests/267_f32_literal_runtime.mlx`).
 
+A float literal is the `f64` nearest to its decimal value, a tie going to
+the even one, as `strtod` reads it: `1.7976931348623157e308` is the
+largest `f64`, `5e-324` the smallest above zero, and digits past the
+seventeenth still decide where the value rounds. The compiler works the
+value out exactly: one rounded multiplication or division when the digits
+and the power of ten are both exact in an `f64`, else with big integers.
+`@floatFromInt` and `@intFromFloat` take a `u64` (or `usize`) as one from
+2^63 on too: the largest `u64` becomes `18446744073709551616.0`, and
+`@intFromFloat(u64, x)` of an `x` from 2^63 on keeps its value
+(`tests/317_float_large_runtime.mlx`, on x86_64 and AArch64).
+
+Arithmetic on float literals alone is float arithmetic, worked out in
+`f64` and narrowed when the result is an `f32`: `const SCALE: f64 = 1.0 /
+255.0` is the `f64` nearest to 1/255, `const HALF: f32 = 1.0 / 2.0` is
+0.5, `0.1 + 0.2` is `0.30000000000000004` as in any IEEE double
+arithmetic. So a constant can be written as the fraction it is instead of
+its digits (`tests/322_float_literal_arithmetic_runtime.mlx`, on x86_64
+and AArch64).
+
 ## Bit-counting
 
 `@popCount(value)` counts the set bits in an integer, signed or unsigned:
@@ -255,6 +275,31 @@ pub fn main() -> u8 {
 (`tests/203_immediate_alu_gep_runtime.mlx`; see
 [docs/internals/selfhost-compiler.md](../internals/selfhost-compiler.md) for
 how the self-hosted x86_64 backend generates code for expressions like this)
+
+## Rounding to whole numbers
+
+`@floor(value)`, `@ceil(value)` and `@trunc(value)` round an `f64` or `f32`
+down, up or toward zero, exactly, in one instruction each (`roundsd` and
+`roundss` on x86_64, which takes SSE4.1 as `@popCount` takes POPCNT;
+`FRINTM`, `FRINTP` and `FRINTZ` on AArch64). The result has the
+operand's type, a float literal gives an `f64`, and an integer operand is
+rejected. Values past 2^52 are whole already and come back unchanged, as
+do the infinities and NaN; a zero result keeps the operand's sign:
+
+```mlx
+pub fn main() -> u8 {
+    const x: f64 = -2.5
+    if @floor(x) != -3.0 || @ceil(x) != -2.0 || @trunc(x) != -2.0 { return 1 }
+    if @bitCast(u64, @ceil(-0.25)) != 9223372036854775808 { return 2 }   // -0.0
+    const half: f32 = 1.5
+    const down: f32 = @floor(half)                                      // roundss
+    if down != 1.0 { return 3 }
+    return 13
+}
+```
+
+(`tests/324_float_rounding_runtime.mlx`; `std.math.round` rounds halves
+away from zero on top of `@trunc`.)
 
 ## Logical operators and short-circuit evaluation
 

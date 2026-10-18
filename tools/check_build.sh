@@ -163,4 +163,32 @@ echo "ok   --force, an unknown step, --clean"
 head -n 2 "$work/deps" | tr '\n' ' ' | grep -qx 'src/hello.mlx src/greet.mlx ' || head -n 1 "$work/deps" | grep -qx 'src/hello.mlx' || fail "--depfile did not list the modules" "$work/deps"
 grep -qx 'src/greet.mlx' "$work/deps" && grep -q '^std/' "$work/deps" || fail "--depfile left out imports" "$work/deps"
 echo "ok   the compiler lists the modules it read with --depfile"
+# A command's dependency file in make's form (as mlx-cc -MD writes it):
+# the files it names are the command's inputs.
+deps_project=$work/depsproject
+mkdir -p "$deps_project/in"
+ln -s "$repo_root/std" "$deps_project/std"
+echo one > "$deps_project/in/a.h"
+echo two > "$deps_project/in/b c.h"
+cat > "$deps_project/build.mlx" <<'EOF_MLX'
+const Build = @import("std.build")
+
+pub fn package() -> Build.Package {
+    return Build.Package.{ .name = "deps", .version = "1.0.0", .description = "make depfiles" }
+}
+
+pub fn build(b: *Build.Builder) -> void {
+    const joined = Build.command(b, "joined", "mlx-out/joined.txt", "sh -c \"cat in/a.h 'in/b c.h' > mlx-out/joined.txt; printf 'mlx-out/joined.txt: in/a.h \\\\\\n  in/b\\\\ c.h\\n' > mlx-out/joined.d\"")
+    Build.depfile(b, joined, "mlx-out/joined.d")
+    Build.byDefault(b, joined)
+}
+EOF_MLX
+(cd "$deps_project" && "$compiler" build) > "$work/deps1.log" 2>&1 || fail "the depfile build failed" "$work/deps1.log"
+grep -q 'input .* in/b c.h$' "$deps_project/mlx-out/build/cache/joined.manifest" || fail "the make depfile's names did not become inputs" "$deps_project/mlx-out/build/cache/joined.manifest"
+(cd "$deps_project" && "$compiler" build) > "$work/deps2.log" 2>&1 || fail "the second depfile build failed" "$work/deps2.log"
+grep -q 'the step is current' "$work/deps2.log" || fail "a current command with a depfile ran again" "$work/deps2.log"
+echo three > "$deps_project/in/b c.h"
+(cd "$deps_project" && "$compiler" build) > "$work/deps3.log" 2>&1 || fail "the third depfile build failed" "$work/deps3.log"
+[[ "$(started "$work/deps3.log")" == "joined" && "$(cat "$deps_project/mlx-out/joined.txt")" == $'one\nthree' ]] || fail "a file of the depfile changed and the command did not run again" "$work/deps3.log"
+echo "ok   a command's make-style depfile lists its inputs"
 echo "all mlx build checks passed"

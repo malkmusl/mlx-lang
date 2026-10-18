@@ -5,6 +5,7 @@
 // starts services by name.
 const std = @import("std")
 const dbus = @import("std.dbus")
+const ipc = @import("std.ipc")
 const state = @import("./state.mlx")
 const policy_module = @import("./policy.mlx")
 const driver = @import("./driver.mlx")
@@ -30,10 +31,57 @@ pub const RUNNING: u8 = 3
 
 
 pub const MAX_EXPECTED: usize = 4096
+// Connections one user may hold on the system bus (root: any number), and
+// one sandboxed app on any bus: one program cannot take every slot.
+pub const MAX_PER_USER: usize = 128
+pub const MAX_PER_SANDBOXED_APP: usize = 32
+// Descriptors that may wait in a connection's input without a message
+// that claims them (a message takes at most 28).
+pub const MAX_STRAY_HANDLES: usize = 28
+// Epoll tokens of clients start here (main.mlx's own tokens are small).
+pub const TOKEN_BASE: usize = 4294967296
 
 
 pub fn clientAt(address: usize) -> *state.Client {
     unsafe { return @ptrFromInt(*state.Client, address) }
+}
+
+// The client an epoll token names, or 0 (the slot was given to another
+// since, or the token is not a client's).
+pub fn clientOf(bus: *state.Bus, token: usize) -> usize {
+    if token < TOKEN_BASE { return 0 }
+    const slot = (token - TOKEN_BASE) & 65535
+    if slot >= MAX_CLIENTS || bus.*.generations[slot] != (token - TOKEN_BASE) >> 16 { return 0 }
+    return bus.*.slots[slot]
+}
+
+// Marks a client dead (dropped at the end of the turn, by flushAll).
+pub fn kill(bus: *state.Bus, client: *state.Client) -> void {
+    client.*.dead = true
+    touch(bus, client)
+}
+
+// Puts a client on the list flushAll goes through this turn.
+fn touch(bus: *state.Bus, client: *state.Client) -> void {
+    if client.*.queued || bus.*.pendingCount >= MAX_CLIENTS { return }
+    client.*.queued = true
+    bus.*.pending[bus.*.pendingCount] = @intFromPtr(client)
+    bus.*.pendingCount += 1
+}
+
+fn untouch(bus: *state.Bus, client: *state.Client) -> void {
+    if !client.*.queued { return }
+    const address = @intFromPtr(client)
+    var index: usize = 0
+    while index < bus.*.pendingCount {
+        if bus.*.pending[index] == address {
+            bus.*.pending[index] = bus.*.pending[bus.*.pendingCount - 1]
+            bus.*.pendingCount -= 1
+            break
+        }
+        index += 1
+    }
+    client.*.queued = false
 }
 
 pub fn nameAt(address: usize) -> *state.Name {
@@ -68,7 +116,7 @@ pub fn textOf(bytes: [*]const u8, length: usize) -> []const u8 { return bytes[0.
 
 // `bytes`, `count` bytes on.
 pub fn advance(bytes: [*]u8, count: usize) -> [*]u8 {
-    unsafe { return @ptrFromInt([*]u8, @intFromPtr(bytes) + count) }
+    return bytes + count
 }
 
 pub fn copyInto(target: [*]u8, capacity: usize, text: []const u8) -> usize {
@@ -87,23 +135,21 @@ pub fn connectionOf(client: *state.Client) -> *dbus.Connection {
 }
 
 pub fn uniqueOf(client: *const state.Client) -> []const u8 {
-    var bytes: [*]const u8 = undefined
-    unsafe { bytes = @ptrCast([*]const u8, &client.*.unique) }
+    const bytes: [*]const u8 = &client.*.unique
     return textOf(bytes, client.*.uniqueLength)
 }
 
 pub fn nameText(name: *const state.Name) -> []const u8 {
-    var bytes: [*]const u8 = undefined
-    unsafe { bytes = @ptrCast([*]const u8, &name.*.name) }
+    const bytes: [*]const u8 = &name.*.name
     return textOf(bytes, name.*.length)
 }
 
 pub fn say(bus: *state.Bus, text: []const u8) -> void {
-    if bus.*.verbose { const ignored = std.io.writeAll(std.io.stdout(), text) }
+    if bus.*.verbose { _ = std.io.writeAll(std.io.stdout(), text) }
 }
 
 pub fn sayNumber(bus: *state.Bus, value: usize) -> void {
-    if bus.*.verbose { const ignored = std.io.writeUnsigned(std.io.stdout(), value) }
+    if bus.*.verbose { _ = std.io.writeUnsigned(std.io.stdout(), value) }
 }
 
 // ---------------------------------------------------------------------------
@@ -120,8 +166,7 @@ pub fn accepted(bus: *state.Bus, descriptor: isize) -> void {
         dbus.closeDescriptor(descriptor)
         return
     }
-    var client: *state.Client = undefined
-    unsafe { client = @ptrCast(*state.Client, memory.?) }
+    const client: *state.Client = unsafe { @ptrCast(*state.Client, memory.?) }
     client.*.descriptor = descriptor
     client.*.state = AUTH_WAITING
     client.*.sawNul = false
@@ -132,13 +177,15 @@ pub fn accepted(bus: *state.Bus, descriptor: isize) -> void {
     client.*.dead = false
     client.*.watchingOutput = false
     client.*.monitor = false
+    client.*.native = false
+    client.*.connectedAt = std.time.milliseconds()
     client.*.pid = 0
     client.*.uid = 4294967295
     client.*.gid = 0
     var pid: u32 = 0
     var uid: u32 = 4294967295
     var gid: u32 = 0
-    const known = dbus.peerCredentials(descriptor, &pid, &uid, &gid)
+    _ = dbus.peerCredentials(descriptor, &pid, &uid, &gid)
     client.*.pid = pid
     client.*.uid = uid
     client.*.gid = gid
@@ -148,9 +195,64 @@ pub fn accepted(bus: *state.Bus, descriptor: isize) -> void {
         return
     }
     policy_module.identify(policy_module.identityOf(client), client.*.pid)
+    var slot: usize = 0
+    while slot < MAX_CLIENTS && bus.*.slots[slot] != 0 { slot += 1 }
+    if !admitted(bus, client) || slot >= MAX_CLIENTS {
+        say(bus, "ipc: a connection over its user's or app's limit; refused\n")
+        dbus.close(connectionOf(client))
+        bus.*.allocator.free(memory.?, @sizeOf(state.Client), 16)
+        return
+    }
+    client.*.token = TOKEN_BASE + slot + (bus.*.generations[slot] << 16)
+    client.*.queued = false
+    bus.*.slots[slot] = @intFromPtr(memory.?)
     bus.*.clients[bus.*.clientCount] = @intFromPtr(memory.?)
     bus.*.clientCount += 1
-    const watched = dbus.watch(bus.*.eventLoop, descriptor, @intFromPtr(memory.?), false)
+    bus.*.connecting += 1
+    _ = dbus.watch(bus.*.eventLoop, descriptor, client.*.token, false)
+}
+
+// Whether `client` (not yet counted) may stay: under its user's limit on
+// the system bus (root excepted) and, sandboxed, under its app's.
+fn admitted(bus: *state.Bus, client: *state.Client) -> bool {
+    var same_user: usize = 0
+    var same_app: usize = 0
+    const app = policy_module.appOf(policy_module.identityOf(client))
+    var index: usize = 0
+    while index < bus.*.clientCount {
+        const other = clientAt(bus.*.clients[index])
+        if other.*.uid == client.*.uid { same_user += 1 }
+        if other.*.identity.sandboxed && same(policy_module.appOf(policy_module.identityOf(other)), app) { same_app += 1 }
+        index += 1
+    }
+    if bus.*.system && client.*.uid != 0 && same_user >= MAX_PER_USER { return false }
+    if client.*.identity.sandboxed && same_app >= MAX_PER_SANDBOXED_APP { return false }
+    return true
+}
+
+// Whether a connection is still connecting (authenticating, or without
+// its Hello yet): then tick runs.
+pub fn connecting(bus: *state.Bus) -> bool { return bus.*.connecting > 0 }
+
+// A connection said Hello: no longer counted as connecting.
+pub fn connected(bus: *state.Bus) -> void {
+    if bus.*.connecting > 0 { bus.*.connecting -= 1 }
+}
+
+// Drops the connections that took longer than authTimeout to say Hello:
+// a connection that never does would hold its slot and buffers for good.
+pub fn tick(bus: *state.Bus) -> void {
+    if bus.*.authTimeout == 0 || bus.*.connecting == 0 { return }
+    const now = std.time.milliseconds()
+    var index: usize = 0
+    while index < bus.*.clientCount {
+        const client = clientAt(bus.*.clients[index])
+        if !client.*.dead && (client.*.state != RUNNING || !client.*.hello) && now - client.*.connectedAt > bus.*.authTimeout {
+            say(bus, "ipc: a connection did not say Hello in time; dropped\n")
+            kill(bus, client)
+        }
+        index += 1
+    }
 }
 
 // Leaves the bus: its names go (to whoever waits), its matches go, others
@@ -175,7 +277,12 @@ pub fn drop(bus: *state.Bus, client: *state.Client) -> void {
     if client.*.hello && !client.*.monitor { driver.nameOwnerChanged(bus, uniqueOf(client), uniqueOf(client), "") }
     activation_module.clientGone(bus, address)
     prompts_module.clientGone(bus, address)
-    const unwatched = dbus.unwatch(bus.*.eventLoop, client.*.descriptor)
+    if !client.*.hello { connected(bus) }
+    untouch(bus, client)
+    const slot = (client.*.token - TOKEN_BASE) & 65535
+    bus.*.slots[slot] = 0
+    bus.*.generations[slot] += 1
+    _ = dbus.unwatch(bus.*.eventLoop, client.*.descriptor)
     dbus.close(connectionOf(client))
     index = 0
     while index < bus.*.clientCount {
@@ -186,25 +293,13 @@ pub fn drop(bus: *state.Bus, client: *state.Client) -> void {
         }
         index += 1
     }
-    var memory: [*]u8 = undefined
-    unsafe { memory = @ptrCast([*]u8, client) }
+    const memory: [*]u8 = unsafe { @ptrCast([*]u8, client) }
     bus.*.allocator.free(memory, @sizeOf(state.Client), 16)
 }
 
 // Drops every client still connected (the bus ending).
 pub fn dropAll(bus: *state.Bus) -> void {
     while bus.*.clientCount > 0 { drop(bus, clientAt(bus.*.clients[bus.*.clientCount - 1])) }
-}
-
-// Whether `address` is a client of the bus's (an event may come for one
-// already gone).
-pub fn isClient(bus: *state.Bus, address: usize) -> bool {
-    var index: usize = 0
-    while index < bus.*.clientCount {
-        if bus.*.clients[index] == address { return true }
-        index += 1
-    }
-    return false
 }
 
 // The client whose unique name is `name`, or 0.
@@ -270,8 +365,7 @@ fn releaseOwner(bus: *state.Bus, address: usize) -> void {
     const name = nameAt(address)
     const old = name.*.owner
     var text: [256]u8 = undefined
-    var bytes: [*]u8 = undefined
-    unsafe { bytes = @ptrCast([*]u8, &text) }
+    const bytes: [*]u8 = &text
     const length = copyInto(bytes, 256, nameText(name))
     const name_text = textOf(bytes, length)
     if old != 0 { driver.nameLost(bus, clientAt(old), name_text) }
@@ -295,8 +389,7 @@ fn releaseOwner(bus: *state.Bus, address: usize) -> void {
         }
         index += 1
     }
-    var memory: [*]u8 = undefined
-    unsafe { memory = @ptrCast([*]u8, name) }
+    const memory: [*]u8 = unsafe { @ptrCast([*]u8, name) }
     bus.*.allocator.free(memory, @sizeOf(state.Name), 16)
 }
 
@@ -308,10 +401,8 @@ pub fn requestName(bus: *state.Bus, client: *state.Client, name: []const u8, fla
         if bus.*.nameCount >= MAX_NAMES { return EXISTS }
         const memory = bus.*.allocator.alloc(@sizeOf(state.Name), 16)
         if memory == null { return EXISTS }
-        var created: *state.Name = undefined
-        unsafe { created = @ptrCast(*state.Name, memory.?) }
-        var bytes: [*]u8 = undefined
-        unsafe { bytes = @ptrCast([*]u8, &created.*.name) }
+        var created: *state.Name = unsafe { @ptrCast(*state.Name, memory.?) }
+        const bytes: [*]u8 = &created.*.name
         created.*.length = copyInto(bytes, NAME, name)
         created.*.owner = address
         created.*.ownerFlags = flags
@@ -378,8 +469,7 @@ pub fn releaseName(bus: *state.Bus, client: *state.Client, name: []const u8) -> 
 // Match rules
 
 fn removeMatchAt(bus: *state.Bus, index: usize) -> void {
-    var memory: [*]u8 = undefined
-    unsafe { memory = @ptrFromInt([*]u8, bus.*.matches[index]) }
+    const memory: [*]u8 = unsafe { @ptrFromInt([*]u8, bus.*.matches[index]) }
     bus.*.matches[index] = bus.*.matches[bus.*.matchCount - 1]
     bus.*.matchCount -= 1
     bus.*.allocator.free(memory, @sizeOf(state.Match), 16)
@@ -401,8 +491,7 @@ fn parseRule(filter: *state.Match, rule: []const u8) -> bool {
     filter.*.arg0Namespace = false
     var position: usize = 0
     var value: [256]u8 = undefined
-    var value_bytes: [*]u8 = undefined
-    unsafe { value_bytes = @ptrCast([*]u8, &value) }
+    const value_bytes: [*]u8 = &value
     while position < rule.length {
         while position < rule.length && (rule[position] == 32 || rule[position] == 44) { position += 1 }
         if position >= rule.length { break }
@@ -442,25 +531,25 @@ fn parseRule(filter: *state.Match, rule: []const u8) -> bool {
         if same(key, "type") {
             if same(text, "signal") { filter.*.kind = dbus.SIGNAL } else if same(text, "method_call") { filter.*.kind = dbus.METHOD_CALL } else if same(text, "method_return") { filter.*.kind = dbus.METHOD_RETURN } else if same(text, "error") { filter.*.kind = dbus.ERROR } else { return false }
         } else if same(key, "sender") {
-            unsafe { field = @ptrCast([*]u8, &filter.*.sender) }
+            field = &filter.*.sender
             filter.*.senderLength = setField(field, text)
         } else if same(key, "interface") {
-            unsafe { field = @ptrCast([*]u8, &filter.*.interface) }
+            field = &filter.*.interface
             filter.*.interfaceLength = setField(field, text)
         } else if same(key, "member") {
-            unsafe { field = @ptrCast([*]u8, &filter.*.member) }
+            field = &filter.*.member
             filter.*.memberLength = setField(field, text)
         } else if same(key, "path") {
-            unsafe { field = @ptrCast([*]u8, &filter.*.path) }
+            field = &filter.*.path
             filter.*.pathLength = setField(field, text)
         } else if same(key, "path_namespace") {
-            unsafe { field = @ptrCast([*]u8, &filter.*.pathNamespace) }
+            field = &filter.*.pathNamespace
             filter.*.pathNamespaceLength = setField(field, text)
         } else if same(key, "destination") {
-            unsafe { field = @ptrCast([*]u8, &filter.*.destination) }
+            field = &filter.*.destination
             filter.*.destinationLength = setField(field, text)
         } else if same(key, "arg0") || same(key, "arg0namespace") {
-            unsafe { field = @ptrCast([*]u8, &filter.*.arg0) }
+            field = &filter.*.arg0
             filter.*.arg0Length = setField(field, text)
             filter.*.arg0Namespace = same(key, "arg0namespace")
         }
@@ -474,15 +563,13 @@ pub fn addMatch(bus: *state.Bus, client: *state.Client, rule: []const u8) -> boo
     if bus.*.matchCount >= MAX_MATCHES || rule.length > 511 { return false }
     const memory = bus.*.allocator.alloc(@sizeOf(state.Match), 16)
     if memory == null { return false }
-    var filter: *state.Match = undefined
-    unsafe { filter = @ptrCast(*state.Match, memory.?) }
+    var filter: *state.Match = unsafe { @ptrCast(*state.Match, memory.?) }
     if !parseRule(filter, rule) {
         bus.*.allocator.free(memory.?, @sizeOf(state.Match), 16)
         return false
     }
     filter.*.client = @intFromPtr(client)
-    var bytes: [*]u8 = undefined
-    unsafe { bytes = @ptrCast([*]u8, &filter.*.rule) }
+    const bytes: [*]u8 = &filter.*.rule
     filter.*.ruleLength = copyInto(bytes, 511, rule)
     bus.*.matches[bus.*.matchCount] = @intFromPtr(memory.?)
     bus.*.matchCount += 1
@@ -493,8 +580,7 @@ pub fn removeMatch(bus: *state.Bus, client: *state.Client, rule: []const u8) -> 
     var index: usize = 0
     while index < bus.*.matchCount {
         const filter = matchAt(bus.*.matches[index])
-        var bytes: [*]const u8 = undefined
-        unsafe { bytes = @ptrCast([*]const u8, &filter.*.rule) }
+        const bytes: [*]const u8 = &filter.*.rule
         if filter.*.client == @intFromPtr(client) && same(textOf(bytes, filter.*.ruleLength), rule) {
             removeMatchAt(bus, index)
             return true
@@ -521,7 +607,7 @@ fn matches(bus: *state.Bus, filter: *state.Match, header: *const dbus.Header, se
     if filter.*.kind != 0 && filter.*.kind != header.*.kind { return false }
     var bytes: [*]const u8 = undefined
     if filter.*.senderLength > 0 {
-        unsafe { bytes = @ptrCast([*]const u8, &filter.*.sender) }
+        bytes = &filter.*.sender
         const wanted = fieldOf(bytes, filter.*.senderLength)
         if !same(wanted, sender) {
             // A well-known name matches its owner.
@@ -531,29 +617,29 @@ fn matches(bus: *state.Bus, filter: *state.Match, header: *const dbus.Header, se
         }
     }
     if filter.*.interfaceLength > 0 {
-        unsafe { bytes = @ptrCast([*]const u8, &filter.*.interface) }
+        bytes = &filter.*.interface
         if !same(fieldOf(bytes, filter.*.interfaceLength), header.*.interface) { return false }
     }
     if filter.*.memberLength > 0 {
-        unsafe { bytes = @ptrCast([*]const u8, &filter.*.member) }
+        bytes = &filter.*.member
         if !same(fieldOf(bytes, filter.*.memberLength), header.*.member) { return false }
     }
     if filter.*.pathLength > 0 {
-        unsafe { bytes = @ptrCast([*]const u8, &filter.*.path) }
+        bytes = &filter.*.path
         if !same(fieldOf(bytes, filter.*.pathLength), header.*.path) { return false }
     }
     if filter.*.pathNamespaceLength > 0 {
-        unsafe { bytes = @ptrCast([*]const u8, &filter.*.pathNamespace) }
+        bytes = &filter.*.pathNamespace
         const space = fieldOf(bytes, filter.*.pathNamespaceLength)
         const inside = same(space, header.*.path) || same(space, "/") || (startsWith(header.*.path, space) && header.*.path.length > space.length && header.*.path[space.length] == 47)
         if !inside { return false }
     }
     if filter.*.destinationLength > 0 {
-        unsafe { bytes = @ptrCast([*]const u8, &filter.*.destination) }
+        bytes = &filter.*.destination
         if !same(fieldOf(bytes, filter.*.destinationLength), header.*.destination) { return false }
     }
     if filter.*.arg0Length > 0 {
-        unsafe { bytes = @ptrCast([*]const u8, &filter.*.arg0) }
+        bytes = &filter.*.arg0
         const wanted = fieldOf(bytes, filter.*.arg0Length)
         const first = firstString(header, body)
         if filter.*.arg0Namespace {
@@ -582,11 +668,12 @@ pub fn queueTo(bus: *state.Bus, client: *state.Client, bytes: [*]const u8, lengt
     }
     if !dbus.queue(connectionOf(client), bytes, length, descriptors, count) {
         closeAll(descriptors, count)
-        client.*.dead = true
+        kill(bus, client)
         say(bus, "ipc: a client stopped reading; dropped\n")
         return
     }
     bus.*.delivered += 1
+    touch(bus, client)
 }
 
 pub fn closeAll(descriptors: [*]const isize, count: usize) -> void {
@@ -604,16 +691,40 @@ fn duplicate(descriptor: isize) -> isize {
 
 // Writes `header` with `sender` and `body` into the scratch area and queues
 // it to `client` (copies of the descriptors when `share`).
+// A native client gets it in the native format (std.ipc) instead.
 pub fn deliver(bus: *state.Bus, client: *state.Client, header: *const dbus.Header, sender: []const u8, body: [*]const u8, descriptors: [*]const isize, count: usize, share: bool) -> void {
-    var writing: dbus.Writer = undefined
-    dbus.begin(&writing, bus.*.scratch, dbus.MAX_MESSAGE, header.*.big)
-    dbus.writeMessage(&writing, header, sender, body)
-    if writing.failed {
-        if !share { closeAll(descriptors, count) }
-        return
+    var bytes: [*]const u8 = undefined
+    var length: usize = 0
+    if client.*.native {
+        var native: ipc.Writer = undefined
+        ipc.begin(&native, bus.*.outbound, ipc.MAX_MESSAGE)
+        if bus.*.passingHeader != 0 && @intFromPtr(header) == bus.*.passingHeader {
+            // The native message being routed, to a native receiver: as
+            // it came, its header written again with its sender.
+            ipc.write(&native, &bus.*.passing, sender, bus.*.passingBody, bus.*.passing.bodyLength)
+            if native.failed {
+                if !share { closeAll(descriptors, count) }
+                return
+            }
+        } else if !ipc.fromDBus(header, sender, body, &native) {
+            if !share { closeAll(descriptors, count) }
+            return
+        }
+        bytes = native.bytes
+        length = native.length
+    } else {
+        var writing: dbus.Writer = undefined
+        dbus.begin(&writing, bus.*.scratch, dbus.MAX_MESSAGE, header.*.big)
+        dbus.writeMessage(&writing, header, sender, body)
+        if writing.failed {
+            if !share { closeAll(descriptors, count) }
+            return
+        }
+        bytes = writing.bytes
+        length = writing.length
     }
     if !share {
-        queueTo(bus, client, writing.bytes, writing.length, descriptors, count)
+        queueTo(bus, client, bytes, length, descriptors, count)
         return
     }
     var copies: [28]isize = undefined
@@ -622,7 +733,7 @@ pub fn deliver(bus: *state.Bus, client: *state.Client, header: *const dbus.Heade
         copies[index] = duplicate(descriptors[index])
         index += 1
     }
-    unsafe { queueTo(bus, client, writing.bytes, writing.length, @ptrCast([*]const isize, &copies), count) }
+    queueTo(bus, client, bytes, length, &copies, count)
 }
 
 // Whether `client` has a rule that takes `header` (sent by `sender`).
@@ -658,7 +769,7 @@ pub fn monitorCopy(bus: *state.Bus, header: *const dbus.Header, sender: []const 
     while index < bus.*.clientCount {
         const client = clientAt(bus.*.clients[index])
         if client.*.monitor && !client.*.dead {
-            unsafe { deliver(bus, client, &copy, sender, body, @ptrCast([*]const isize, &nothing), 0, false) }
+            deliver(bus, client, &copy, sender, body, &nothing, 0, false)
         }
         index += 1
     }
@@ -753,8 +864,7 @@ fn forgetExpected(bus: *state.Bus, client: *state.Client) -> void {
 pub fn replyError(bus: *state.Bus, client: *state.Client, call: *const dbus.Header, name: []const u8, message: []const u8) -> void {
     if call.*.kind != dbus.METHOD_CALL || call.*.flags & dbus.NO_REPLY_EXPECTED != 0 { return }
     var body: [512]u8 = undefined
-    var body_bytes: [*]u8 = undefined
-    unsafe { body_bytes = @ptrCast([*]u8, &body) }
+    const body_bytes: [*]u8 = &body
     var writing: dbus.Writer = undefined
     dbus.begin(&writing, body_bytes, 512, false)
     dbus.putString(&writing, message)
@@ -769,7 +879,7 @@ pub fn replyError(bus: *state.Bus, client: *state.Client, call: *const dbus.Head
     header.bodyLength = writing.length
     monitorCopy(bus, &header, BUS_NAME, body_bytes)
     var nothing: [1]isize = [1]isize{ 0 }
-    unsafe { deliver(bus, client, &header, BUS_NAME, body_bytes, @ptrCast([*]const isize, &nothing), 0, false) }
+    deliver(bus, client, &header, BUS_NAME, body_bytes, &nothing, 0, false)
 }
 
 // ---------------------------------------------------------------------------
@@ -778,10 +888,10 @@ pub fn replyError(bus: *state.Bus, client: *state.Client, call: *const dbus.Head
 // Authentication lines (SASL): EXTERNAL with the peer's own uid, Unix
 // descriptor passing, BEGIN.
 fn answer(bus: *state.Bus, client: *state.Client, text: []const u8) -> void {
-    var bytes: [*]const u8 = undefined
-    unsafe { bytes = @ptrCast([*]const u8, text) }
+    const bytes: [*]const u8 = text.pointer
     var nothing: [1]isize = [1]isize{ 0 }
-    unsafe { const ok = dbus.queue(connectionOf(client), bytes, text.length, @ptrCast([*]const isize, &nothing), 0) }
+    unsafe { _ = dbus.queue(connectionOf(client), bytes, text.length, &nothing, 0) }
+    touch(bus, client)
 }
 
 fn hexValue(byte: u8) -> u32 {
@@ -822,8 +932,7 @@ fn accept(bus: *state.Bus, client: *state.Client) -> void {
     }
     line[35] = 13
     line[36] = 10
-    var bytes: [*]const u8 = undefined
-    unsafe { bytes = @ptrCast([*]const u8, &line) }
+    const bytes: [*]const u8 = &line
     answer(bus, client, bytes[0..37])
 }
 
@@ -855,6 +964,29 @@ fn authLine(bus: *state.Bus, client: *state.Client, line: []const u8) -> void {
     }
 }
 
+// A native client's preamble (std.ipc): the version and the flags it
+// asks for, answered with ours; the connection runs from then on (the
+// socket's credentials are its authentication, as EXTERNAL's are).
+fn preamble(bus: *state.Bus, client: *state.Client, bytes: [*]const u8, available: usize) -> void {
+    var version: u8 = 0
+    var flags: u8 = 0
+    const seen = ipc.readPreamble(bytes, available, &version, &flags)
+    if seen == 0 { return }
+    if seen < 0 || version != ipc.VERSION {
+        say(bus, "ipc: a preamble of a version not spoken; client dropped\n")
+        kill(bus, client)
+        return
+    }
+    client.*.native = true
+    client.*.unixFds = flags & ipc.UNIX_FDS != 0
+    client.*.state = RUNNING
+    var ours: [8]u8 = undefined
+    const pointer: [*]u8 = &ours
+    ipc.writePreamble(pointer, if client.*.unixFds { ipc.UNIX_FDS } else { 0 })
+    answer(bus, client, pointer[0..ipc.PREAMBLE])
+    dbus.consume(connectionOf(client), ipc.PREAMBLE, 0)
+}
+
 // Authentication: the NUL byte, then lines until BEGIN (what follows
 // BEGIN is messages).
 fn authenticate(bus: *state.Bus, client: *state.Client) -> void {
@@ -863,8 +995,14 @@ fn authenticate(bus: *state.Bus, client: *state.Client) -> void {
         if available == 0 { return }
         const bytes = dbus.input(connectionOf(client))
         if !client.*.sawNul {
+            // A native client (std.ipc) starts with its preamble, a D-Bus
+            // one with a NUL byte.
+            if ipc.startsPreamble(bytes, available) {
+                preamble(bus, client, bytes, available)
+                return
+            }
             if bytes[0] != 0 {
-                client.*.dead = true
+                kill(bus, client)
                 return
             }
             client.*.sawNul = true
@@ -874,7 +1012,7 @@ fn authenticate(bus: *state.Bus, client: *state.Client) -> void {
         var end: usize = 0
         while end + 1 < available && !(bytes[end] == 13 && bytes[end + 1] == 10) { end += 1 }
         if end + 1 >= available {
-            if available > 16384 { client.*.dead = true }
+            if available > 16384 { kill(bus, client) }
             return
         }
         authLine(bus, client, bytes[0..end])
@@ -887,8 +1025,7 @@ fn authenticate(bus: *state.Bus, client: *state.Client) -> void {
 // activation.mlx routes the calls that waited for their service here.
 pub fn route(bus: *state.Bus, client: *state.Client, bytes: [*]const u8, header: *const dbus.Header, descriptors: [*]const isize, count: usize) -> void {
     const body = bytes[header.*.bodyStart..header.*.size]
-    var body_bytes: [*]const u8 = undefined
-    unsafe { body_bytes = @ptrCast([*]const u8, body) }
+    const body_bytes: [*]const u8 = unsafe { @ptrCast([*]const u8, body) }
     if same(header.*.destination, BUS_NAME) || same(header.*.destination, driver.IPC_NAME) {
         closeAll(descriptors, count)
         driver.handle(bus, client, header, body_bytes)
@@ -949,18 +1086,17 @@ fn dispatch(bus: *state.Bus, client: *state.Client, bytes: [*]const u8, header: 
         // The first message must be Hello.
         if !(same(header.*.destination, BUS_NAME) && same(header.*.member, "Hello")) {
             closeAll(descriptors, count)
-            client.*.dead = true
+            kill(bus, client)
             return
         }
     }
     if client.*.monitor {
         closeAll(descriptors, count)
-        client.*.dead = true
+        kill(bus, client)
         return
     }
     const body = bytes[header.*.bodyStart..header.*.size]
-    var body_bytes: [*]const u8 = undefined
-    unsafe { body_bytes = @ptrCast([*]const u8, body) }
+    const body_bytes: [*]const u8 = unsafe { @ptrCast([*]const u8, body) }
     monitorCopy(bus, header, uniqueOf(client), body_bytes)
     route(bus, client, bytes, header, descriptors, count)
 }
@@ -969,30 +1105,42 @@ fn dispatch(bus: *state.Bus, client: *state.Client, bytes: [*]const u8, header: 
 pub fn readable(bus: *state.Bus, client: *state.Client) -> void {
     const received = dbus.receive(connectionOf(client))
     if received == 0 || (received < 0 && received != dbus.EAGAIN) {
-        client.*.dead = true
+        kill(bus, client)
         return
     }
     if client.*.state != RUNNING { authenticate(bus, client) }
     while client.*.state == RUNNING && !client.*.dead {
+        if client.*.native {
+            if !readNative(bus, client) { break }
+            continue
+        }
         const available = dbus.buffered(connectionOf(client))
         const bytes = dbus.input(connectionOf(client))
         const size = dbus.messageSize(bytes, available)
-        if size == 0 { return }
+        if size == 0 { break }
         if size > dbus.MAX_MESSAGE {
             say(bus, "ipc: a message too large; client dropped\n")
-            client.*.dead = true
+            kill(bus, client)
             return
         }
-        if available < size { return }
+        if available < size { break }
         var header: dbus.Header = undefined
         if !dbus.parseHeader(bytes, size, &header) {
             say(bus, "ipc: a malformed message; client dropped\n")
-            client.*.dead = true
+            kill(bus, client)
+            return
+        }
+        // What a D-Bus receiver would refuse (and drop its connection
+        // over) is refused here: invalid names and paths, strings that
+        // are not UTF-8, descriptor indexes past the message's.
+        if !dbus.validMessage(&header, bytes + header.bodyStart) {
+            say(bus, "ipc: a message D-Bus would refuse; client dropped\n")
+            kill(bus, client)
             return
         }
         const count = @intCast(usize, header.unixFds)
         if count > 28 || count > dbus.bufferedHandles(connectionOf(client)) {
-            client.*.dead = true
+            kill(bus, client)
             return
         }
         var descriptors: [28]isize = undefined
@@ -1002,24 +1150,85 @@ pub fn readable(bus: *state.Bus, client: *state.Client) -> void {
             descriptors[index] = queued[index]
             index += 1
         }
-        unsafe { dispatch(bus, client, bytes, &header, @ptrCast([*]const isize, &descriptors), count) }
+        dispatch(bus, client, bytes, &header, &descriptors, count)
         dbus.consume(connectionOf(client), size, count)
+    }
+    // Descriptors that came without a message claiming them would be
+    // held for good.
+    if !client.*.dead && dbus.bufferedHandles(connectionOf(client)) > MAX_STRAY_HANDLES {
+        say(bus, "ipc: descriptors without a message; client dropped\n")
+        kill(bus, client)
     }
 }
 
-// Sends what is queued to every client; drops the ones that went.
+// One native message (std.ipc) from `client`, when a whole one is there:
+// carried to D-Bus form (the bus routes D-Bus messages; deliver carries
+// what goes to a native connection back) and dispatched. False when
+// there is nothing more to take now.
+fn readNative(bus: *state.Bus, client: *state.Client) -> bool {
+    const connection = connectionOf(client)
+    const available = dbus.buffered(connection)
+    const bytes = dbus.input(connection)
+    const size = ipc.messageSize(bytes, available)
+    if size == 0 { return false }
+    if size > ipc.MAX_MESSAGE {
+        say(bus, "ipc: a message too large; client dropped\n")
+        kill(bus, client)
+        return false
+    }
+    if available < size { return false }
+    var message: ipc.Message = undefined
+    if !ipc.parse(bytes, size, &message) {
+        say(bus, "ipc: a malformed message; client dropped\n")
+        kill(bus, client)
+        return false
+    }
+    const count = message.descriptors
+    if count > 28 || count > dbus.bufferedHandles(connection) {
+        kill(bus, client)
+        return false
+    }
+    var descriptors: [28]isize = undefined
+    const queued = dbus.handles(connection)
+    var index: usize = 0
+    while index < count {
+        descriptors[index] = queued[index]
+        index += 1
+    }
+    const body: [*]const u8 = bytes + message.bodyStart
+    var writing: dbus.Writer = undefined
+    dbus.begin(&writing, bus.*.inbound, dbus.MAX_MESSAGE, false)
+    const none: [*]const u8 = unsafe { @ptrCast([*]const u8, "") }
+    var header: dbus.Header = undefined
+    if !ipc.toDBus(&message, none[0..0], body, bus.*.outbound, &writing) || !dbus.parseHeader(bus.*.inbound, writing.length, &header) {
+        say(bus, "ipc: a message that cannot be carried to D-Bus form; client dropped\n")
+        kill(bus, client)
+        return false
+    }
+    bus.*.passing = message
+    bus.*.passingBody = body
+    bus.*.passingHeader = @intFromPtr(&header)
+    dispatch(bus, client, bus.*.inbound, &header, &descriptors, count)
+    bus.*.passingHeader = 0
+    dbus.consume(connection, size, count)
+    return true
+}
+
+// Sends what was queued this turn (to the clients on the pending list,
+// not every client); drops the ones that went. Dropping one can queue
+// to others (NameOwnerChanged): they are taken in the same loop.
 pub fn flushAll(bus: *state.Bus) -> void {
-    var index = bus.*.clientCount
-    while index > 0 {
-        index -= 1
-        const client = clientAt(bus.*.clients[index])
+    while bus.*.pendingCount > 0 {
+        bus.*.pendingCount -= 1
+        const client = clientAt(bus.*.pending[bus.*.pendingCount])
+        client.*.queued = false
         if !client.*.dead && dbus.pendingOutput(connectionOf(client)) > 0 {
             const flushed = dbus.flush(connectionOf(client))
             if flushed < 0 && flushed != dbus.EAGAIN { client.*.dead = true }
             const waiting = flushed == dbus.EAGAIN
             if waiting != client.*.watchingOutput {
                 client.*.watchingOutput = waiting
-                const changed = dbus.rewatch(bus.*.eventLoop, client.*.descriptor, bus.*.clients[index], waiting)
+                _ = dbus.rewatch(bus.*.eventLoop, client.*.descriptor, client.*.token, waiting)
             }
         }
         if client.*.dead { drop(bus, client) }

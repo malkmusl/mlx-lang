@@ -250,28 +250,29 @@ each group are joined by magenta lines in space.
   first (amber). Each place is one more reason to add the feature
   ([`tools/codemap/workarounds.mlx`](../../tools/codemap/workarounds.mlx)):
 
-  | pattern | missing |
+  | pattern | missing, or what does it now |
   |---|---|
-  | `@ptrFromInt(... @intFromPtr(...) ...)` | pointer offsets (`p + n`), slicing a many-pointer |
-  | `@ptrCast([*]T, &array)` | `*[N]T` coercing to `[*]T` |
-  | `var x: T = undefined` then `unsafe { x = ... }` | unsafe expressions |
-  | `const ignored = call(...)`, never read | `_ = value` |
+  | `@ptrFromInt(... @intFromPtr(...) ...)` | now `p + n` on a `[*]T` (a struct pointer still goes through integers) |
+  | `@ptrCast([*]T, &array)` | now `&array` converts to `[*]T` (a struct's bytes still take the cast) |
+  | `var x: T = undefined` then `unsafe { x = ... }` | now `const x: T = unsafe { ... }` |
+  | `const ignored = call(...)`, never read | now `_ = value` |
   | `for byte in text { length += 1 }` | a slice's length in the bootstrap library |
   | `aggregates.mark`/`reset`, `turns` | freeing struct literals and structs returned by value |
-  | float literals with 12 decimals and more | folding float arithmetic right |
-  | `sqrt`, `sin`, `exp`, ... written in Mlx | math builtins |
+  | float literals with 12 decimals and more | now float literals fold, and `std.math` has pi and the like |
+  | `sqrt`, `sin`, `exp`, ... written in Mlx | now `std.math`, `@sqrt`, `@floor`, `@ceil`, `@trunc` |
   | comments: workaround, miscompilation, "does not yet", TODO, FIXME, HACK | what the comment names |
 
-  Two kinds can be rewritten away, now that the compiler does without
+  Three kinds can be rewritten away, now that the compiler does without
   them: dropped results (`const ignored = call(...)` becomes `_ =
-  call(...)`) and counted lengths (`for byte in text { length += 1 }`
-  becomes `length += text.length`)
+  call(...)`), counted lengths (`for byte in text { length += 1 }`
+  becomes `length += text.length`) and values set in unsafe (`var x: T =
+  undefined` with `unsafe { x = v }` becomes `const x: T = unsafe { v }`)
   ([`tools/codemap/rewrite.mlx`](../../tools/codemap/rewrite.mlx)). In the
   panel, *Rewrite ...* under the kind shows each line before and after;
   *Apply* writes them and reads the code again. It can only when the
   compiler (`$MLX_COMPILER`, else `mlx-out/bin/compiler/mlx4`, else
   `mlx4`) builds a program with what they need. On the command line:
-  `mlx-codemap rewrite dropped|counted [PATH] [--apply]`. Files under `compiler/`,
+  `mlx-codemap rewrite dropped|counted|unsafe [PATH] [--apply]`. Files under `compiler/`,
   `std/bootstrap/` (the bootstrap compiler builds them) and `tests/` are
   left as they are.
 
@@ -676,16 +677,19 @@ of popping up.
   resolves each name to what it declares. For the whole repository (700
   files, 64,000 declarations, 340,000 uses) that takes about 1.5 seconds.
 - [`graph.mlx`](graph.mlx) makes the tree of nodes (folders, files,
-  declarations, members) and lays it out:
+  declarations, members), works out a node's connections and ranks search
+  matches. [`layout.mlx`](layout.mlx) lays the tree out:
   - a folder's children are packed close, the biggest first, each where the
     whole stays smallest without touching the others;
-  - a file's declarations sit on a sphere around it.
+  - a file's declarations sit on a sphere around it;
+  - then the uses pull for 36 rounds, springs holding each node near where
+    it was packed.
 
-  It also works out a node's connections and ranks search matches.
+  For the whole repository (47,000 nodes) that takes about a second.
 - [`main.mlx`](main.mlx) holds the app's state and its frame loop; its
   parts each take one area: [`map_view.mlx`](map_view.mlx) projects the
-  nodes with an orbit camera ([`math3d.mlx`](math3d.mlx): sqrt, sin, cos,
-  ln and exp, written out), makes the frame's primitives and places labels
+  nodes with an orbit camera ([`math3d.mlx`](math3d.mlx): sin, cos, ln
+  and exp written out, the square root `@sqrt`), makes the frame's primitives and places labels
   so none covers another; [`navigation.mlx`](navigation.mlx) (reading,
   selecting, searching), [`input.mlx`](input.mlx), [`drawing.mlx`](drawing.mlx)
   and [`detail.mlx`](detail.mlx) (the panels), [`tabs.mlx`](tabs.mlx),

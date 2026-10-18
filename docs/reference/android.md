@@ -123,9 +123,13 @@ and update callbacks receive an app-owned context pointer, and its destroy
 callback releases that context when the activity is destroyed. The small
 selection/state value is still saved across recreation. `internalDataPath`
 and `externalDataPath` expose the corresponding zero-terminated paths from
-`ANativeActivity`; the latter may be null. `projects/android/files`
+`ANativeActivity`; the latter may be null
+(`tests/287_android_activity_paths_runtime.mlx` reads both from a fake
+activity). `projects/android/files`
 uses `internalDataPath` to browse the app-private files directory without a
-storage permission. It owns the raw input/window callbacks used by the
+storage permission; its listing puts folders first, in natural order
+(`Project 2` before `Project 10`), and goes no higher than where it began
+(`tests/286_android_file_browser_runtime.mlx`). It owns the raw input/window callbacks used by the
 Vulkan demo, so row and toolbar taps are hit-tested by coordinate and
 finished as handled. Android's safe-area insets and density feed
 `projects/filemanager-shared`, so it renders the same responsive Files UI as

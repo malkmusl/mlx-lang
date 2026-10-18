@@ -8,6 +8,11 @@
 #   - tests/support/terminal_render.mlx: a screen drawn with the TrueType
 #     font on a CPU canvas, read back pixel by pixel (skipped without a
 #     monospaced font on this machine);
+#   - tests/support/terminal_input.mlx: selections by cells, words and
+#     lines (a wrapped line, a history that drops lines), Shift and a
+#     click, the mouse reports a program asks for (SGR and X10), the wheel
+#     on the alternate screen, the paste filter and bracketed paste,
+#     dropped files as quoted paths;
 #   - tests/support/terminal_pty.mlx: a shell on a pty, its output through
 #     the screen, the size it was told;
 #   - mlx-terminal builds (its window needs a compositor:
@@ -43,6 +48,14 @@ else
     [[ $status -eq 0 ]] || fail "std.ui.terminal: check $status failed (the red cell, the cursor, ink in a glyph, inverse video)"
     echo "ok   std.ui.terminal: cells, colours, inverse video and the cursor drawn with the TrueType font"
 fi
+
+"$compiler" --quiet tests/support/terminal_input.mlx -o "$work/input"
+set +e
+"$work/input"
+status=$?
+set -e
+[[ $status -eq 0 ]] || fail "std.ui.terminal_input: check $status failed (selections, mouse reports, the wheel, the paste filter, quoted paths)"
+echo "ok   std.ui.terminal_input: selections, mouse reports, the wheel, the paste filter, dropped paths"
 
 "$compiler" --quiet tests/support/terminal_pty.mlx -o "$work/pty"
 set +e

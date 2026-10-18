@@ -312,6 +312,308 @@ returns_wide_tuples() {
     return $ok
 }
 
+# Whether $1 takes a pointer to an array as a many-item pointer and steps
+# a many-item pointer by elements (tests/319_array_pointer_runtime.mlx
+# exits 13); std and the programs write `&buffer` and `p + n` for what
+# took an unsafe @ptrCast before. The compiler's own sources and
+# std/bootstrap do not use them, so an older compiler still builds them.
+steps_many_pointers() {
+    local probe
+    probe=$(mktemp -d mlx-out/probe.XXXXXX)
+    local ok=1
+    if "$1" --quiet tests/319_array_pointer_runtime.mlx -o "$probe/probe" > /dev/null 2>&1; then
+        local status=0
+        "$probe/probe" > /dev/null 2>&1 || status=$?
+        [[ $status -eq 13 ]] && ok=0
+    fi
+    rm -rf -- "$probe"
+    return $ok
+}
+
+# Whether $1 gives a slice's first word as `.pointer`, a [*]T
+# (tests/321_slice_pointer_runtime.mlx exits 13); std and the programs
+# pass `text.pointer` where they cast the slice before.
+reads_slice_pointers() {
+    local probe
+    probe=$(mktemp -d mlx-out/probe.XXXXXX)
+    local ok=1
+    if "$1" --quiet tests/321_slice_pointer_runtime.mlx -o "$probe/probe" > /dev/null 2>&1; then
+        local status=0
+        "$probe/probe" > /dev/null 2>&1 || status=$?
+        [[ $status -eq 13 ]] && ok=0
+    fi
+    rm -rf -- "$probe"
+    return $ok
+}
+
+# Whether $1 works out arithmetic on float literals alone as floats
+# (tests/322_float_literal_arithmetic_runtime.mlx exits 13); older
+# compilers added and divided the literals' bit patterns as integers,
+# so `1.0 / 255.0` came out 0.
+folds_float_literals() {
+    local probe
+    probe=$(mktemp -d mlx-out/probe.XXXXXX)
+    local ok=1
+    if "$1" --quiet tests/322_float_literal_arithmetic_runtime.mlx -o "$probe/probe" > /dev/null 2>&1; then
+        local status=0
+        "$probe/probe" > /dev/null 2>&1 || status=$?
+        [[ $status -eq 13 ]] && ok=0
+    fi
+    rm -rf -- "$probe"
+    return $ok
+}
+
+# Whether $1 returns every word of an error union's payload
+# (tests/323_error_union_payload_words_runtime.mlx exits 0); older
+# compilers returned the tag and one word, so a slice payload lost its
+# length and the test loops.
+returns_wide_error_payloads() {
+    local probe
+    probe=$(mktemp -d mlx-out/probe.XXXXXX)
+    local ok=1
+    if "$1" --quiet tests/323_error_union_payload_words_runtime.mlx -o "$probe/probe" > /dev/null 2>&1; then
+        timeout 5 "$probe/probe" > /dev/null 2>&1 && ok=0
+    fi
+    rm -rf -- "$probe"
+    return $ok
+}
+
+# Whether $1 has @floor, @ceil and @trunc
+# (tests/324_float_rounding_runtime.mlx exits 13); std.math rounds with
+# them.
+rounds_floats() {
+    local probe
+    probe=$(mktemp -d mlx-out/probe.XXXXXX)
+    local ok=1
+    if "$1" --quiet tests/324_float_rounding_runtime.mlx -o "$probe/probe" > /dev/null 2>&1; then
+        local status=0
+        "$probe/probe" > /dev/null 2>&1 || status=$?
+        [[ $status -eq 13 ]] && ok=0
+    fi
+    rm -rf -- "$probe"
+    return $ok
+}
+
+# Whether $1 names an unknown name (MLX-E3001) where a statement fails
+# (tests/326_unknown_name.mlx); older compilers gave only the statement's
+# own type error.
+reports_unknown_names() {
+    local output
+    output=$("$1" --quiet tests/326_unknown_name.mlx -o /dev/null 2>&1) || true
+    grep -q "MLX-E3001: unknown name" <<< "$output"
+}
+
+# Whether $1 says which call takes another number of arguments where a
+# statement fails (tests/331_call_mistakes.mlx); older compilers gave only
+# the statement's own type error.
+explains_call_mistakes() {
+    local output
+    output=$("$1" --quiet tests/331_call_mistakes.mlx -o /dev/null 2>&1) || true
+    grep -q "MLX-E4001: \`scale\` takes 2 arguments, 1 given" <<< "$output"
+}
+
+# Whether $1 calls methods on pointers and takes the address of a value for
+# a method taking a pointer (tests/332_method_receivers_runtime.mlx exits
+# 13).
+calls_methods_on_pointers() {
+    local probe
+    probe=$(mktemp -d mlx-out/probe.XXXXXX)
+    local ok=1
+    if "$1" --quiet tests/332_method_receivers_runtime.mlx -o "$probe/probe" > /dev/null 2>&1; then
+        local status=0
+        "$probe/probe" > /dev/null 2>&1 || status=$?
+        [[ $status -eq 13 ]] && ok=0
+    fi
+    rm -rf -- "$probe"
+    return $ok
+}
+
+# Whether $1 resolves a struct's own name inside its body
+# (tests/334_aggregate_own_name_runtime.mlx exits 13); older compilers
+# stopped at "declaration type could not be resolved".
+names_aggregates_in_their_bodies() {
+    local probe
+    probe=$(mktemp -d mlx-out/probe.XXXXXX)
+    local ok=1
+    if "$1" --quiet tests/334_aggregate_own_name_runtime.mlx -o "$probe/probe" > /dev/null 2>&1; then
+        local status=0
+        "$probe/probe" > /dev/null 2>&1 || status=$?
+        [[ $status -eq 13 ]] && ok=0
+    fi
+    rm -rf -- "$probe"
+    return $ok
+}
+
+# Whether $1 resolves types that name each other through pointers
+# (tests/342_mutually_recursive_types_runtime.mlx exits 42); older
+# compilers could not resolve the first while the second was worked out.
+resolves_recursive_types() {
+    local probe
+    probe=$(mktemp -d mlx-out/probe.XXXXXX)
+    local ok=1
+    if "$1" --quiet tests/342_mutually_recursive_types_runtime.mlx -o "$probe/probe" > /dev/null 2>&1; then
+        local status=0
+        "$probe/probe" > /dev/null 2>&1 || status=$?
+        [[ $status -eq 42 ]] && ok=0
+    fi
+    rm -rf -- "$probe"
+    return $ok
+}
+
+# Whether $1 rejects an integer written out that its type cannot hold
+# (tests/335_type_mismatches.mlx); older compilers kept its low bits.
+checks_literal_ranges() {
+    local output
+    output=$("$1" --quiet tests/335_type_mismatches.mlx -o /dev/null 2>&1) || true
+    grep -q "MLX-E4001: \`300\` does not fit in \`u8\` (0 to 255)" <<< "$output"
+}
+
+# Whether $1 says why a statement fails where it used to say only that its
+# function did (tests/338_statement_failures.mlx).
+explains_silent_failures() {
+    local output
+    output=$("$1" --quiet tests/338_statement_failures.mlx -o /dev/null 2>&1) || true
+    grep -q "MLX-E4001: \`break\` and \`continue\` belong in a loop" <<< "$output"
+}
+
+# Whether $1 keeps locals in callee-saved registers
+# (tests/339_register_locals_runtime.mlx exits 13 and reports some).
+keeps_locals_in_registers() {
+    local probe output
+    probe=$(mktemp -d mlx-out/probe.XXXXXX)
+    local ok=1
+    output=$("$1" tests/339_register_locals_runtime.mlx -o "$probe/probe" 2>&1) || true
+    if grep -q "locals kept in registers: [1-9]" <<< "$output"; then
+        local status=0
+        "$probe/probe" > /dev/null 2>&1 || status=$?
+        [[ $status -eq 13 ]] && ok=0
+    fi
+    rm -rf -- "$probe"
+    return $ok
+}
+
+# Whether $1 lets usize and u64 take each other
+# (tests/340_platform_integers_runtime.mlx exits 13).
+mixes_platform_integers() {
+    local probe
+    probe=$(mktemp -d mlx-out/probe.XXXXXX)
+    local ok=1
+    if "$1" --quiet tests/340_platform_integers_runtime.mlx -o "$probe/probe" > /dev/null 2>&1; then
+        local status=0
+        "$probe/probe" > /dev/null 2>&1 || status=$?
+        [[ $status -eq 13 ]] && ok=0
+    fi
+    rm -rf -- "$probe"
+    return $ok
+}
+
+# Whether $1 keeps constants and loads of register locals out of their
+# frame slots (x86_64 codegen/state.mlx), and the program still runs right.
+keeps_values_out_of_the_frame() {
+    local probe output
+    probe=$(mktemp -d mlx-out/probe.XXXXXX)
+    local ok=1
+    output=$("$1" tests/341_values_out_of_frame_runtime.mlx -o "$probe/probe" 2>&1) || true
+    if grep -q "values kept out of the frame: [1-9]" <<< "$output"; then
+        local status=0
+        "$probe/probe" > /dev/null 2>&1 || status=$?
+        [[ $status -eq 13 ]] && ok=0
+    fi
+    rm -rf -- "$probe"
+    return $ok
+}
+
+# Whether $1 reads locals stored once as the stored value where the store
+# dominates the load (ir/single_store.mlx), and the program still runs
+# right.
+promotes_single_stores() {
+    local probe output
+    probe=$(mktemp -d mlx-out/probe.XXXXXX)
+    local ok=1
+    output=$("$1" tests/342_single_store_runtime.mlx -o "$probe/probe" 2>&1) || true
+    if grep -q "loads of locals stored once: [1-9]" <<< "$output"; then
+        local status=0
+        "$probe/probe" > /dev/null 2>&1 || status=$?
+        [[ $status -eq 13 ]] && ok=0
+    fi
+    rm -rf -- "$probe"
+    return $ok
+}
+
+# Whether $1 rejects @ptrFromInt and @ptrCast outside unsafe (MLX-E7004,
+# tests/14_unsafe_ptr_builtin.mlx); older compilers took them anywhere.
+enforces_unsafe() {
+    local output
+    output=$("$1" --quiet tests/14_unsafe_ptr_builtin.mlx -o /dev/null 2>&1) || true
+    grep -q "MLX-E7004: \`@ptrFromInt\` outside unsafe" <<< "$output"
+}
+
+# Whether $1 takes `unsafe { expression }` where a value is wanted
+# (tests/327_unsafe_expression_runtime.mlx exits 13).
+has_unsafe_expressions() {
+    local probe
+    probe=$(mktemp -d mlx-out/probe.XXXXXX)
+    local ok=1
+    if "$1" --quiet tests/327_unsafe_expression_runtime.mlx -o "$probe/probe" > /dev/null 2>&1; then
+        local status=0
+        "$probe/probe" > /dev/null 2>&1 || status=$?
+        [[ $status -eq 13 ]] && ok=0
+    fi
+    rm -rf -- "$probe"
+    return $ok
+}
+
+# Whether $1 keeps aggregates that stay in their function in its frame
+# (tests/328_aggregates_in_frame_runtime.mlx exits 13).
+keeps_aggregates_in_frame() {
+    local probe
+    probe=$(mktemp -d mlx-out/probe.XXXXXX)
+    local ok=1
+    if "$1" --quiet tests/328_aggregates_in_frame_runtime.mlx -o "$probe/probe" > /dev/null 2>&1; then
+        local status=0
+        "$probe/probe" > /dev/null 2>&1 || status=$?
+        [[ $status -eq 13 ]] && ok=0
+    fi
+    rm -rf -- "$probe"
+    return $ok
+}
+
+# Whether $1 has callers provide the storage for struct, union and array
+# results (tests/329_return_storage_runtime.mlx exits 13).
+returns_into_caller_storage() {
+    local probe
+    probe=$(mktemp -d mlx-out/probe.XXXXXX)
+    local ok=1
+    if "$1" --quiet tests/329_return_storage_runtime.mlx -o "$probe/probe" > /dev/null 2>&1; then
+        local status=0
+        "$probe/probe" > /dev/null 2>&1 || status=$?
+        [[ $status -eq 13 ]] && ok=0
+    fi
+    rm -rf -- "$probe"
+    return $ok
+}
+
+# Whether $1 tests a chain of equality comparisons as one bit mask (the
+# metric tests/330_conditions_runtime.mlx reports).
+tests_equality_chains() {
+    local probe output
+    probe=$(mktemp -d mlx-out/probe.XXXXXX)
+    output=$("$1" tests/330_conditions_runtime.mlx -o "$probe/probe" 2>&1) || true
+    rm -rf -- "$probe"
+    grep -q "equality chains tested as one bit mask: [1-9]" <<< "$output"
+}
+
+# Whether $1's arena has room for the largest programs here: 1 GiB of
+# address space (projects/observatory took 252 MiB of the former 256 MiB,
+# and the arena running full showed as a symbol never defined).
+holds_large_programs() {
+    local probe output
+    probe=$(mktemp -d mlx-out/probe.XXXXXX)
+    output=$("$1" tests/01_basic.mlx -o "$probe/probe" 2>&1) || true
+    rm -rf -- "$probe"
+    grep -q "compiler arena capacity: 1073741824" <<< "$output"
+}
+
 # Whether $1 writes the files it read with --depfile (what `mlx build`
 # decides rebuilds by).
 writes_depfiles() {
@@ -358,6 +660,28 @@ probes=(
     "decodes_escapes|\\xHH escapes"
     "stores_through_slice_addresses|slices stored through their address keeping their length"
     "returns_wide_tuples|tuples of more than three words"
+    "steps_many_pointers|array pointers as many-item pointers, p + n"
+    "reads_slice_pointers|a slice's .pointer"
+    "folds_float_literals|arithmetic on float literals"
+    "returns_wide_error_payloads|error union payloads of several words"
+    "rounds_floats|@floor, @ceil and @trunc"
+    "reports_unknown_names|unknown names reported (MLX-E3001)"
+    "has_unsafe_expressions|unsafe { expression }"
+    "enforces_unsafe|pointer casts outside unsafe rejected (MLX-E7004)"
+    "keeps_aggregates_in_frame|aggregates that stay in their function kept in the frame"
+    "returns_into_caller_storage|struct, union and array results in storage the caller provides"
+    "tests_equality_chains|conditions as jumps, equality chains as bit masks"
+    "explains_call_mistakes|calls with the wrong argument count named (MLX-E4001)"
+    "calls_methods_on_pointers|methods called on pointers and on addressable values"
+    "checks_literal_ranges|integers checked against their type, mismatches named (MLX-E4001)"
+    "explains_silent_failures|failing defers, stray breaks and module declarations said at their place"
+    "keeps_locals_in_registers|locals kept in callee-saved registers"
+    "mixes_platform_integers|usize and u64 taking each other"
+    "keeps_values_out_of_the_frame|constants and register loads kept out of the frame"
+    "promotes_single_stores|locals stored once read as their value"
+    "names_aggregates_in_their_bodies|a struct named inside its own body"
+    "resolves_recursive_types|types naming each other through pointers"
+    "holds_large_programs|an arena with room for the largest programs"
     "writes_depfiles|--depfile"
     "runs_build|the build command (mlx build)"
 )
