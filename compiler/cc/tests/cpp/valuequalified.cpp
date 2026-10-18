@@ -15,6 +15,7 @@ template<Range R, typename U> struct Raw {
 template<typename T> concept IsRaw = std::derived_from<T, Raw<T::range, typename T::Unit>>;
 
 struct Number : Raw<Range { 0, 1 }, int> { };
+struct Other { using Unit = int; };
 
 template<typename T> int kind(T) { return 0; }
 template<IsRaw T> int kind(T) { return 1; }
@@ -24,6 +25,7 @@ template<typename T> int order(T) { return 3; }
 int main(int argc, char** argv)
 {
     std::printf("%d %d %d %d\n", kind(argc), kind(Number { }), (int)IsRaw<int>, (int)IsRaw<Number>);
+    std::printf("%d %d\n", (int)IsRaw<Other>, kind(Other { }));
     std::printf("%d %d\n", order(argc), order(1.5));
     return 0;
 }
