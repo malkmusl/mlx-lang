@@ -852,6 +852,37 @@ pub fn main() -> u8 {
 
 (`tests/325_standard_math_runtime.mlx`)
 
+## Encodings (`std.base64`)
+
+**Implementation:** `std/src/base64.mlx`
+**Source tests:** `343_base64_runtime.mlx` (run by `tests/run_std_modules.sh`)
+
+The encodings of RFC 4648 — `Encoding.base64`, `base64url`, `base32`,
+`base32hex` and `base16` — without allocating: the caller sizes the
+output with `encodedLength(encoding, length, padded)` and
+`decodedLength(encoding, length)`. `encode(encoding, bytes, out, padded)`
+and `decode(encoding, text, out, ignoreGarbage)` work in one call; an
+`Encoder` (`encoderInit`, `encodeUpdate`, `encodeFinal`) and a `Decoder`
+(`decoderInit`, `decodeUpdate`) take the data in pieces and keep the bits
+of an unfinished symbol or byte between them. Decoding skips line breaks,
+spaces and tabs, stops at the padding, and refuses (or, with
+`ignoreGarbage`, skips) bytes outside the alphabet. `hexEncode` writes
+lower-case hex, the way digests are printed, and `hexDecode` reads hex
+of either case. The coreutils `base64`, `base32` and `basenc` and GLib's
+`g_base64_*` (`compiler/capi/glib/strings.mlx`) use it.
+
+```mlx
+const base64 = @import("std.base64")
+
+pub fn main() -> u8 {
+    var out: [8]u8 = undefined
+    const bytes: [*]u8 = &out
+    const count = base64.encode(base64.Encoding.base64, "foo", bytes, true)   // "Zm9v"
+    const back = base64.decode(base64.Encoding.base64, bytes[0..count], bytes, false)
+    return if back.ok && back.length == 3 { 13 } else { 1 }
+}
+```
+
 ## fmt
 
 **Normative source:** `spec/04-stdlib/fmt.xml`

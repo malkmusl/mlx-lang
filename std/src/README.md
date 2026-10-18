@@ -23,6 +23,8 @@ addresses, routes and their change groups) and generic netlink (families
 looked up by name, as nl80211).
 `sha2.mlx` (`std.sha2`) has SHA-256, SHA-512, HMAC-SHA256 and
 PBKDF2-HMAC-SHA256.
+`base64.mlx` (`std.base64`) has RFC 4648's base64, base64url, base32,
+base32hex and base16, in one call or in pieces, and lower-case hex.
 `sha1.mlx` (`std.sha1`) has SHA-1, HMAC-SHA1 and PBKDF2-HMAC-SHA1, and
 `aes.mlx` (`std.aes`) AES-128 on blocks and the RFC 3394 key wrap: what
 WPA2 needs (`tools/check_wifi.sh`).
