@@ -296,6 +296,13 @@ desktop names apps: `identify` gives a Flatpak app's id (from
 `/proc/PID/root/.flatpak-info`, then sandboxed) or its program's name
 (`/proc/PID/exe`, without a `-bin` at its end). MLXIPC's permissions and
 MLX Audio's PulseAudio socket name apps with it.
+`std.pulse` (`std/src/pulse.mlx`) has the numbers of PulseAudio's
+native protocol (the version, the packet descriptor, the commands, the
+errors, the subscription facilities) and `std.pulse.tagstruct` writes and
+reads the tagstructs its commands are made of, into a buffer or (for a
+client library) into memory that grows; MLX Audio's server
+(`projects/desktop/audio`) and its libpulse (`compiler/capi/pulse`) are
+the two ends that use them.
 `std.pipewire` (`std/src/pipewire.mlx`) has the numbers of PipeWire's
 native protocol (the core's, client's, registry's and client node's
 methods and events, SPA's params, IO areas, commands, formats, buffer

@@ -120,8 +120,9 @@ Programs that speak only PulseAudio (Firefox, Chromium and Electron apps,
 SDL games, mpv, VLC, GStreamer, Wine, pactl, pavucontrol) play and record
 through MLX Audio as they would through pipewire-pulse: mlx-audiod
 answers PulseAudio's native protocol at `$XDG_RUNTIME_DIR/pulse/native`
-([`pulse.mlx`](pulse.mlx), [`pulse_info.mlx`](pulse_info.mlx),
-[`tagstruct.mlx`](tagstruct.mlx); version 35, as libpulse 15 and later,
+([`pulse.mlx`](pulse.mlx), [`pulse_info.mlx`](pulse_info.mlx), on
+[`std.pulse`](../../../std/src/pulse.mlx)'s numbers and tagstructs, which
+the client libraries share; version 35, as libpulse 15 and later,
 samples in the packets, no shared memory). Flatpak hands the same socket
 to apps with `--socket=pulseaudio`. Their streams are the server's like
 any other: mixed, routed, in the Sound settings, and allowed by MLXIPC.
@@ -246,7 +247,6 @@ mlx-audio move STREAM SINK           one stream (its id in status)
 | `config.mlx` | audio.conf |
 | `pulse.mlx` | the PulseAudio socket: clients, packets, AUTH, streams, latency |
 | `pulse_info.mlx` | what PulseAudio apps ask about (server, sinks, sources, streams, clients) and change (volumes, mute, moving) |
-| `tagstruct.mlx` | PulseAudio's tagstructs, read and written |
 | `asound.conf.in` | ALSA's default device through MLX Audio's pulse plugin (`@ALSA_PLUGIN@`: its path) |
 | `tool.mlx` | mlx-audio |
 

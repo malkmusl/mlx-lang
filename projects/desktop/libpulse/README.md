@@ -45,7 +45,8 @@ them in its place.
   `pa_threaded_mainloop` (a thread of its own, signals blocked),
   `pa_signal_*`, and the GLib loop as a GSource around a `pa_mainloop`.
 - **The protocol** (`wire.mlx`, `core.mlx`, `context.mlx`, `stream.mlx`,
-  `introspect.mlx`): protocol 35 without shared memory (the data goes in
+  `introspect.mlx`, on std.pulse's numbers and tagstructs, the server's
+  too): protocol 35 without shared memory (the data goes in
   packets of at most 64 KiB), on `$PULSE_SERVER`'s unix sockets or
   `$XDG_RUNTIME_DIR/pulse/native`; the context's and streams' states,
   their buffer attributes, prebuffering, corking, draining, flushing,
