@@ -23,7 +23,8 @@
 #                              tests (non-ignorable and shifted) in order
 #       tests/idna.c           every line of IdnaTestV2.txt (UTS #46)
 #       tests/properties.c, tests/strings.c, tests/calendar.c,
-#       tests/charsets.c, tests/locales.c  print what NAME.expected says
+#       tests/charsets.c, tests/locales.c, tests/bundles.c (over
+#       cldr.dat)                       print what NAME.expected says
 #
 #   tools/check_unicode.sh
 set -euo pipefail
@@ -89,7 +90,7 @@ cc projects/unicode/tests/idna.c -o "$work/idna" || fail "tests/idna.c does not 
 run "$work/idna" > "$work/idna.out" || { cat "$work/idna.out"; fail "IdnaTestV2.txt"; }
 echo "ok   $(cat "$work/idna.out")"
 
-for test in properties strings calendar charsets locales; do
+for test in properties strings calendar charsets locales bundles; do
     cc "projects/unicode/tests/$test.c" -o "$work/$test" || fail "tests/$test.c does not build"
     run "$work/$test" > "$work/$test.out" || fail "tests/$test.c fails"
     diff -u "projects/unicode/tests/$test.expected" "$work/$test.out" || fail "tests/$test.c prints otherwise"

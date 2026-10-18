@@ -1,0 +1,677 @@
+// Decimal numbers as the formatters hold them (ICU's DecimalQuantity): a
+// sign, decimal digits and where the point is, or NaN or an infinity. A
+// double becomes the shortest digits that read back as it (Burger and
+// Dybvig's free-format algorithm, on exact big integers), a decimal
+// string its digits as written; then they are rounded (to fraction or
+// significant digits, or an increment, in the eight rounding modes) and
+// shown.
+const m = @import("./memory.mlx")
+
+pub const MAX_DIGITS: usize = 1024
+
+// value = 0.d[0] d[1] ... d[count-1] x 10^point (no leading or trailing
+// zero digits kept; zero has count 0).
+pub const Decimal = struct {
+    digits: [1024]u8
+    count: usize
+    point: i32
+    negative: bool
+    nan: bool
+    infinite: bool
+}
+
+pub fn zero() -> Decimal {
+    var d: Decimal = undefined
+    d.count = 0
+    d.point = 0
+    d.negative = false
+    d.nan = false
+    d.infinite = false
+    return d
+}
+
+pub fn isZero(d: *const Decimal) -> bool { return !d.*.nan && !d.*.infinite && d.*.count == 0 }
+
+// Leading and trailing zero digits off.
+fn normalize(d: *Decimal) -> void {
+    var lead: usize = 0
+    while lead < d.*.count && d.*.digits[lead] == 0 { lead += 1 }
+    if lead > 0 {
+        var index: usize = 0
+        while index + lead < d.*.count {
+            d.*.digits[index] = d.*.digits[index + lead]
+            index += 1
+        }
+        d.*.count -= lead
+        d.*.point -= @intCast(i32, lead)
+    }
+    while d.*.count > 0 && d.*.digits[d.*.count - 1] == 0 { d.*.count -= 1 }
+    if d.*.count == 0 { d.*.point = 0 }
+}
+
+// ---------------------------------------------------------------------------
+// Big integers (little-endian 32-bit limbs), enough for any double scaled
+// by a power of ten.
+
+const LIMBS: usize = 160
+
+const Big = struct {
+    limb: [160]u32
+    used: usize
+}
+
+fn big(value: u64) -> Big {
+    var b: Big = undefined
+    b.limb[0] = @intCast(u32, value & 4294967295)
+    b.limb[1] = @intCast(u32, value >> 32)
+    b.used = if b.limb[1] != 0 { 2 } else if b.limb[0] != 0 { 1 } else { 0 }
+    return b
+}
+
+fn mulSmall(b: *Big, factor: u32) -> void {
+    var carry: u64 = 0
+    var index: usize = 0
+    while index < b.*.used {
+        const product = @intCast(u64, b.*.limb[index]) * @intCast(u64, factor) + carry
+        b.*.limb[index] = @intCast(u32, product & 4294967295)
+        carry = product >> 32
+        index += 1
+    }
+    if carry != 0 && b.*.used < LIMBS {
+        b.*.limb[b.*.used] = @intCast(u32, carry)
+        b.*.used += 1
+    }
+}
+
+fn shiftLeft(b: *Big, bits: u32) -> void {
+    const words = @intCast(usize, bits / 32)
+    const rest = bits % 32
+    if b.*.used == 0 { return }
+    var index = b.*.used
+    // Room for the carry out of the top word.
+    b.*.limb[b.*.used + words] = 0
+    while index > 0 {
+        index -= 1
+        const word = b.*.limb[index]
+        if rest > 0 {
+            b.*.limb[index + words + 1] |= word >> (32 - rest)
+            b.*.limb[index + words] = word << rest
+        } else {
+            b.*.limb[index + words] = word
+        }
+    }
+    index = 0
+    while index < words {
+        b.*.limb[index] = 0
+        index += 1
+    }
+    b.*.used += words + 1
+    while b.*.used > 0 && b.*.limb[b.*.used - 1] == 0 { b.*.used -= 1 }
+}
+
+fn powerOfTen(b: *Big, power: u32) -> void {
+    var left = power
+    while left >= 9 {
+        mulSmall(b, 1000000000)
+        left -= 9
+    }
+    var factor: u32 = 1
+    while left > 0 {
+        factor *= 10
+        left -= 1
+    }
+    if factor > 1 { mulSmall(b, factor) }
+}
+
+fn compare(a: *const Big, b: *const Big) -> i32 {
+    if a.*.used != b.*.used { return if a.*.used < b.*.used { -1 } else { 1 } }
+    var index = a.*.used
+    while index > 0 {
+        index -= 1
+        if a.*.limb[index] != b.*.limb[index] { return if a.*.limb[index] < b.*.limb[index] { -1 } else { 1 } }
+    }
+    return 0
+}
+
+// A + B compared with C.
+fn compareSum(a: *const Big, b: *const Big, c: *const Big) -> i32 {
+    var sum = a.*
+    add(&sum, b)
+    return compare(&sum, c)
+}
+
+fn add(a: *Big, b: *const Big) -> void {
+    const longest = if a.*.used > b.*.used { a.*.used } else { b.*.used }
+    var carry: u64 = 0
+    var index: usize = 0
+    while index < longest {
+        const x = if index < a.*.used { @intCast(u64, a.*.limb[index]) } else { 0 }
+        const y = if index < b.*.used { @intCast(u64, b.*.limb[index]) } else { 0 }
+        const sum = x + y + carry
+        a.*.limb[index] = @intCast(u32, sum & 4294967295)
+        carry = sum >> 32
+        index += 1
+    }
+    a.*.used = longest
+    if carry != 0 {
+        a.*.limb[longest] = @intCast(u32, carry)
+        a.*.used += 1
+    }
+}
+
+// A - B (A >= B).
+fn subtract(a: *Big, b: *const Big) -> void {
+    var borrow: i64 = 0
+    var index: usize = 0
+    while index < a.*.used {
+        var x = @intCast(i64, a.*.limb[index]) - borrow - (if index < b.*.used { @intCast(i64, b.*.limb[index]) } else { 0 })
+        borrow = 0
+        if x < 0 {
+            x += 4294967296
+            borrow = 1
+        }
+        a.*.limb[index] = @intCast(u32, x)
+        index += 1
+    }
+    while a.*.used > 0 && a.*.limb[a.*.used - 1] == 0 { a.*.used -= 1 }
+}
+
+// The digit R / S (below 10 here), R left as the remainder.
+fn divideDigit(r: *Big, s: *const Big) -> u8 {
+    var digit: u8 = 0
+    while compare(r, s) >= 0 {
+        subtract(r, s)
+        digit += 1
+    }
+    return digit
+}
+
+// ---------------------------------------------------------------------------
+// Doubles.
+
+// The shortest digits that read back as VALUE (the closest of them).
+pub fn fromDouble(value: f64) -> Decimal {
+    var d = zero()
+    const bits = @bitCast(u64, value)
+    d.negative = (bits >> 63) != 0
+    const biased = @intCast(i32, (bits >> 52) & 2047)
+    const fraction = bits & 4503599627370495
+    if biased == 2047 {
+        if fraction != 0 {
+            d.nan = true
+            d.negative = false
+        } else {
+            d.infinite = true
+        }
+        return d
+    }
+    if biased == 0 && fraction == 0 { return d }
+    var mantissa = fraction
+    var exponent: i32 = 0
+    if biased == 0 {
+        exponent = -1074
+    } else {
+        mantissa = fraction | 4503599627370496
+        exponent = biased - 1075
+    }
+    const even = (mantissa & 1) == 0
+    // r / s is the value, mPlus / s and mMinus / s the half gaps to its
+    // neighbours (all scaled by 2).
+    var r = big(mantissa)
+    var s = big(1)
+    var mPlus = big(1)
+    var mMinus = big(1)
+    const lowerCloser = fraction == 0 && biased > 1
+    if exponent >= 0 {
+        shiftLeft(&r, @intCast(u32, exponent))
+        shiftLeft(&mPlus, @intCast(u32, exponent))
+        shiftLeft(&mMinus, @intCast(u32, exponent))
+        if lowerCloser {
+            shiftLeft(&r, 2)
+            shiftLeft(&s, 2)
+            shiftLeft(&mPlus, 1)
+        } else {
+            shiftLeft(&r, 1)
+            shiftLeft(&s, 1)
+        }
+    } else {
+        if lowerCloser {
+            shiftLeft(&r, 2)
+            shiftLeft(&s, @intCast(u32, 2 - exponent))
+            shiftLeft(&mPlus, 1)
+        } else {
+            shiftLeft(&r, 1)
+            shiftLeft(&s, @intCast(u32, 1 - exponent))
+        }
+    }
+    // k: the estimate of ceil(log10(value)), at most one too small.
+    var top: i32 = 63
+    while top > 0 && (mantissa >> @intCast(u6, top)) == 0 { top -= 1 }
+    const log2 = @floatFromInt(f64, exponent + top)
+    var k = @intFromFloat(i32, ceilOf(log2 * 0.30102999566398114 - 0.0000000001))
+    if k >= 0 {
+        powerOfTen(&s, @intCast(u32, k))
+    } else {
+        powerOfTen(&r, @intCast(u32, -k))
+        powerOfTen(&mPlus, @intCast(u32, -k))
+        powerOfTen(&mMinus, @intCast(u32, -k))
+    }
+    // The fixup: when value + its half gap reaches 10^k, k is one more.
+    const reach = compareSum(&r, &mPlus, &s)
+    if reach > 0 || (even && reach == 0) {
+        k += 1
+    } else {
+        mulSmall(&r, 10)
+        mulSmall(&mPlus, 10)
+        mulSmall(&mMinus, 10)
+    }
+    d.point = k
+    while d.count < 40 {
+        const digit = divideDigit(&r, &s)
+        const low = compare(&r, &mMinus)
+        const high = compareSum(&r, &mPlus, &s)
+        const tc1 = low < 0 || (even && low == 0)
+        const tc2 = high > 0 || (even && high == 0)
+        if !tc1 && !tc2 {
+            d.digits[d.count] = digit
+            d.count += 1
+            mulSmall(&r, 10)
+            mulSmall(&mPlus, 10)
+            mulSmall(&mMinus, 10)
+            continue
+        }
+        var last = digit
+        if tc1 && tc2 {
+            // Both end it: the closer, 2r against s (a tie to the even).
+            var twice = r
+            shiftLeft(&twice, 1)
+            const c = compare(&twice, &s)
+            if c > 0 || (c == 0 && digit % 2 == 1) { last = digit + 1 }
+        } else if tc2 {
+            last = digit + 1
+        }
+        d.digits[d.count] = last
+        d.count += 1
+        break
+    }
+    // A digit of 10 carries.
+    var index = d.count
+    while index > 0 && d.digits[index - 1] == 10 {
+        d.digits[index - 1] = 0
+        if index == 1 {
+            var move = d.count
+            while move > 0 {
+                d.digits[move] = d.digits[move - 1]
+                move -= 1
+            }
+            d.digits[0] = 1
+            d.count += 1
+            d.point += 1
+            break
+        }
+        d.digits[index - 2] += 1
+        index -= 1
+    }
+    normalize(&d)
+    return d
+}
+
+fn ceilOf(x: f64) -> f64 {
+    const t = @floatFromInt(f64, @intFromFloat(i64, x))
+    return if t < x { t + 1.0 } else { t }
+}
+
+// ---------------------------------------------------------------------------
+// Decimal text.
+
+// TEXT ("-123.45", "1e21", "+.5E-3", "Infinity", "NaN"); false when it is
+// not a number.
+pub fn fromText(text: []const u8, into: *Decimal) -> bool {
+    var d = zero()
+    var at: usize = 0
+    if at < text.length && (text[at] == 45 || text[at] == 43) {
+        d.negative = text[at] == 45
+        at += 1
+    }
+    const rest = text[at..text.length]
+    if m.same(rest, "Infinity") || m.same(rest, "Inf") || m.same(rest, "infinity") {
+        d.infinite = true
+        into.* = d
+        return true
+    }
+    if m.same(rest, "NaN") || m.same(rest, "nan") {
+        d.nan = true
+        d.negative = false
+        into.* = d
+        return true
+    }
+    var any = false
+    var seenPoint = false
+    var point: i32 = 0
+    while at < text.length {
+        const c = text[at]
+        if c >= 48 && c <= 57 {
+            any = true
+            if d.count < MAX_DIGITS {
+                d.digits[d.count] = c - 48
+                d.count += 1
+                if !seenPoint { point += 1 }
+            } else if !seenPoint {
+                point += 1
+            }
+        } else if c == 46 && !seenPoint {
+            seenPoint = true
+        } else {
+            break
+        }
+        at += 1
+    }
+    if !any { return false }
+    if at < text.length && (text[at] == 101 || text[at] == 69) {
+        at += 1
+        var exponentNegative = false
+        if at < text.length && (text[at] == 45 || text[at] == 43) {
+            exponentNegative = text[at] == 45
+            at += 1
+        }
+        var exponent: i32 = 0
+        var digitsSeen = false
+        while at < text.length && text[at] >= 48 && text[at] <= 57 {
+            if exponent < 100000000 { exponent = exponent * 10 + @intCast(i32, text[at] - 48) }
+            digitsSeen = true
+            at += 1
+        }
+        if !digitsSeen { return false }
+        point += if exponentNegative { -exponent } else { exponent }
+    }
+    if at != text.length { return false }
+    d.point = point
+    normalize(&d)
+    into.* = d
+    return true
+}
+
+// The digit at decimal position PLACE (10^place: 0 the ones, -1 the
+// tenths).
+pub fn digitAt(d: *const Decimal, place: i32) -> u8 {
+    const index = d.*.point - 1 - place
+    if index < 0 || index >= @intCast(i32, d.*.count) { return 0 }
+    return d.*.digits[@intCast(usize, index)]
+}
+
+// The place of the most significant digit (0 for 1..9; meaningless for 0).
+pub fn magnitude(d: *const Decimal) -> i32 { return d.*.point - 1 }
+
+// The lowest place with a digit (0 for integers and zero).
+pub fn lowestPlace(d: *const Decimal) -> i32 {
+    if d.*.count == 0 { return 0 }
+    return d.*.point - @intCast(i32, d.*.count)
+}
+
+// ---------------------------------------------------------------------------
+// Rounding.
+
+pub const CEILING: i32 = 0
+pub const FLOOR: i32 = 1
+pub const DOWN: i32 = 2
+pub const UP: i32 = 3
+pub const HALF_EVEN: i32 = 4
+pub const HALF_DOWN: i32 = 5
+pub const HALF_UP: i32 = 6
+pub const UNNECESSARY: i32 = 7
+pub const HALF_ODD: i32 = 8
+pub const HALF_CEILING: i32 = 9
+pub const HALF_FLOOR: i32 = 10
+
+// Whether to go away from zero, given the digit kept last, how what is
+// dropped compares to a half (-1 less, 0 exactly, 1 more; `dropped` says
+// whether anything nonzero is dropped at all).
+fn roundsAway(mode: i32, negative: bool, kept: u8, half: i32, dropped: bool) -> bool {
+    if !dropped { return false }
+    if mode == UP { return true }
+    if mode == DOWN || mode == UNNECESSARY { return false }
+    if mode == CEILING { return !negative }
+    if mode == FLOOR { return negative }
+    if half > 0 { return true }
+    if half < 0 { return false }
+    if mode == HALF_UP { return true }
+    if mode == HALF_DOWN { return false }
+    if mode == HALF_EVEN { return kept % 2 == 1 }
+    if mode == HALF_ODD { return kept % 2 == 0 }
+    if mode == HALF_CEILING { return !negative }
+    if mode == HALF_FLOOR { return negative }
+    return false
+}
+
+// D rounded to its digits at PLACE and above (place -2: to hundredths).
+pub fn roundAt(d: *Decimal, place: i32, mode: i32) -> void {
+    if d.*.nan || d.*.infinite || d.*.count == 0 { return }
+    // Digits kept: those before index keep.
+    const keepSigned = d.*.point - place
+    if keepSigned >= @intCast(i32, d.*.count) { return }
+    if keepSigned < 0 {
+        // Everything dropped is below half of 10^place.
+        const away = roundsAway(mode, d.*.negative, 0, -1, true)
+        if away {
+            d.*.digits[0] = 1
+            d.*.count = 1
+            d.*.point = place + 1
+        } else {
+            d.*.count = 0
+            d.*.point = 0
+        }
+        return
+    }
+    const keep = @intCast(usize, keepSigned)
+    var half: i32 = 0
+    if keep < d.*.count {
+        const first = d.*.digits[keep]
+        if first > 5 {
+            half = 1
+        } else if first < 5 {
+            half = -1
+        } else {
+            half = if keep + 1 < d.*.count { 1 } else { 0 }
+        }
+    }
+    const kept: u8 = if keep > 0 { d.*.digits[keep - 1] } else { 0 }
+    const away = roundsAway(mode, d.*.negative, kept, half, keep < d.*.count)
+    d.*.count = keep
+    if away {
+        // Add one at the last kept place.
+        var index = keep
+        var carried = true
+        while index > 0 && carried {
+            index -= 1
+            if d.*.digits[index] == 9 {
+                d.*.digits[index] = 0
+            } else {
+                d.*.digits[index] += 1
+                carried = false
+            }
+        }
+        if carried {
+            // All nines (or nothing kept): 1 at the place above.
+            var move = d.*.count
+            while move > 0 {
+                d.*.digits[move] = d.*.digits[move - 1]
+                move -= 1
+            }
+            d.*.digits[0] = 1
+            d.*.count += 1
+            d.*.point += 1
+            if keep == 0 {
+                d.*.count = 1
+                d.*.point = place + 1
+            }
+        }
+    }
+    normalize(d)
+}
+
+// D rounded to a multiple of INCREMENT x 10^PLACE (an increment of 1, 5,
+// 25, 50...).
+pub fn roundToIncrement(d: *Decimal, increment: u64, place: i32, mode: i32) -> void {
+    if increment <= 1 {
+        roundAt(d, place, mode)
+        return
+    }
+    if d.*.nan || d.*.infinite || d.*.count == 0 { return }
+    // Divide by the increment in the digits: q = D / (inc x 10^place)
+    // rounded to an integer, then D = q x inc x 10^place. Done on the
+    // digits through 10^place as an integer (with a remainder flag).
+    var scaled = d.*
+    // Shift so the place is the ones: value x 10^-place.
+    scaled.point -= place
+    // The integer part and whether anything below is left.
+    var remainderBelow = false
+    if lowestPlace(&scaled) < 0 {
+        remainderBelow = true
+    }
+    // Long division of the integer part by INCREMENT.
+    var quotient = zero()
+    var remainder: u64 = 0
+    var position = scaled.point - 1
+    while position >= 0 {
+        remainder = remainder * 10 + @intCast(u64, digitAt(&scaled, position))
+        const q = remainder / increment
+        remainder = remainder % increment
+        if quotient.count > 0 || q > 0 {
+            quotient.digits[quotient.count] = @intCast(u8, q)
+            quotient.count += 1
+        }
+        position -= 1
+    }
+    quotient.point = @intCast(i32, quotient.count)
+    quotient.negative = d.*.negative
+    // How the remainder (with what lies below the ones) compares to a half
+    // of the increment.
+    var half: i32 = 0
+    const twice = remainder * 2
+    if twice > increment {
+        half = 1
+    } else if twice < increment {
+        half = -1
+    } else {
+        half = if remainderBelow { 1 } else { 0 }
+    }
+    const dropped = remainder != 0 || remainderBelow
+    const kept: u8 = if quotient.count > 0 { quotient.digits[quotient.count - 1] } else { 0 }
+    if roundsAway(mode, d.*.negative, kept, half, dropped) {
+        // quotient + 1
+        var index = quotient.count
+        var carried = true
+        while index > 0 && carried {
+            index -= 1
+            if quotient.digits[index] == 9 {
+                quotient.digits[index] = 0
+            } else {
+                quotient.digits[index] += 1
+                carried = false
+            }
+        }
+        if carried {
+            var move = quotient.count
+            while move > 0 {
+                quotient.digits[move] = quotient.digits[move - 1]
+                move -= 1
+            }
+            quotient.digits[0] = 1
+            quotient.count += 1
+        }
+        quotient.point = @intCast(i32, quotient.count)
+    }
+    // D = quotient x increment x 10^place.
+    var result = zero()
+    result.negative = d.*.negative
+    var carry: u64 = 0
+    var index = quotient.count
+    var reversed: [1100]u8 = undefined
+    var made: usize = 0
+    while index > 0 {
+        index -= 1
+        const product = @intCast(u64, quotient.digits[index]) * increment + carry
+        reversed[made] = @intCast(u8, product % 10)
+        carry = product / 10
+        made += 1
+    }
+    while carry > 0 && made < 1090 {
+        reversed[made] = @intCast(u8, carry % 10)
+        carry /= 10
+        made += 1
+    }
+    var w: usize = 0
+    while w < made && w < MAX_DIGITS {
+        result.digits[w] = reversed[made - 1 - w]
+        w += 1
+    }
+    result.count = w
+    result.point = @intCast(i32, made) + place
+    normalize(&result)
+    d.* = result
+}
+
+// D with its point moved by POWER (x 10^power).
+pub fn scaleBy(d: *Decimal, power: i32) -> void {
+    if d.*.count > 0 { d.*.point += power }
+}
+
+// D multiplied by a small integer (a scale).
+pub fn multiplyBy(d: *Decimal, factor: u64) -> void {
+    if d.*.nan || d.*.infinite || d.*.count == 0 || factor == 1 { return }
+    var carry: u64 = 0
+    var reversed: [1100]u8 = undefined
+    var made: usize = 0
+    var index = d.*.count
+    while index > 0 {
+        index -= 1
+        const product = @intCast(u64, d.*.digits[index]) * factor + carry
+        reversed[made] = @intCast(u8, product % 10)
+        carry = product / 10
+        made += 1
+    }
+    var added: i32 = 0
+    while carry > 0 && made < 1090 {
+        reversed[made] = @intCast(u8, carry % 10)
+        carry /= 10
+        made += 1
+        added += 1
+    }
+    var w: usize = 0
+    while w < made && w < MAX_DIGITS {
+        d.*.digits[w] = reversed[made - 1 - w]
+        w += 1
+    }
+    d.*.count = w
+    d.*.point += added
+    normalize(d)
+}
+
+// D as plain decimal text ("-12.5", "0.001", "1200"), for plural rules
+// and the like: with at least MIN_FRACTION fraction digits shown.
+pub fn plainText(d: *const Decimal, minFraction: i32, into: *m.Bytes) -> void {
+    if d.*.nan {
+        m.pushText(into, "NaN")
+        return
+    }
+    if d.*.negative && !isZero(d) { m.pushByte(into, 45) }
+    if d.*.infinite {
+        m.pushText(into, "Infinity")
+        return
+    }
+    var place: i32 = if d.*.point > 1 { d.*.point - 1 } else { 0 }
+    while place >= 0 {
+        m.pushByte(into, 48 + digitAt(d, place))
+        place -= 1
+    }
+    var lowest = lowestPlace(d)
+    if -minFraction < lowest { lowest = -minFraction }
+    if lowest < 0 {
+        m.pushByte(into, 46)
+        place = -1
+        while place >= lowest {
+            m.pushByte(into, 48 + digitAt(d, place))
+            place -= 1
+        }
+    }
+}
