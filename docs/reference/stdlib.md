@@ -568,13 +568,15 @@ const arena_interface = bootstrap.arena_allocator.interface(&arena)
 
 `std/bootstrap/mem.mlx` implements the raw memory ops (`copy`,
 `copyBackwards`, `set`, `zero`, `eql`, all over `[*]u8`/length pairs, 8-byte
-unrolled) plus little-endian read/write helpers specialized to 16/32/64 bits
-(`readU16Little`, `readU32Little`, `readU64Little`,
-`writeU16Little`/`writeU32Little`/`writeU64Little`). This covers the
-`MemoryOps` half of `mem.xml` but is narrower than its `EndianHelpers`
-surface: there is no generic `readInt`/`writeInt`, `byteSwap`, or
+unrolled) plus little- and big-endian read/write helpers specialized to
+16/32/64 bits (`readU16Little`, `readU32Little`, `readU64Little`,
+`writeU16Little`/`writeU32Little`/`writeU64Little`, and the network-order
+`readU16Big`/`readU32Big`/`readU64Big`, `writeU16Big`/`writeU32Big`/
+`writeU64Big`). This covers the `MemoryOps` half of `mem.xml` but is
+narrower than its `EndianHelpers` surface: there is no generic
+`readInt`/`writeInt`, `byteSwap`, or
 `nativeToLittle`/`nativeToBig`/`littleToNative`/`bigToNative` — only the
-concrete little-endian read/write pairs above. `132_page_allocator_runtime.mlx`
+concrete read/write pairs above. `132_page_allocator_runtime.mlx`
 and `131_bootstrap_allocator_runtime.mlx` exercise the page allocator and a
 custom `fakeAlloc` plugged into the `Allocator` interface directly;
 `120_bootstrap_mem_runtime.mlx` exercises `copy`/`set`/`eql` over fixed byte
