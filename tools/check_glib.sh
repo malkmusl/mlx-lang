@@ -6,7 +6,7 @@
 #     API's Mlx modules (compiler/capi/glib/api);
 #   - every function the headers declare is in the library;
 #   - the headers in C and C++: glib.h, glib-object.h, glib-unix.h,
-#     glib/gstdio.h and gio/gio.h together;
+#     glib/gstdio.h, gio/gio.h and gobject/gvaluecollector.h together;
 #   - C programs built by mlx-cc against the library print what
 #     NAME.expected says (what GLib 2.80 prints for the same program,
 #     with the exit status last):
@@ -18,6 +18,10 @@
 #       tests/system.c     markup, spawning, Unix signals, dates
 #       tests/gio.c        cancellables, tasks, files and monitors,
 #                          sockets, resources, D-Bus without a bus
+#       tests/collect.c    G_DECLARE_FINAL_TYPE, G_VALUE_COLLECT_INIT,
+#                          G_VALUE_LCOPY, g_alloca
+#       tests/options.c    GOptionContext and groups, gettext
+#       tests/network.c    addresses, a socket service, a client
 #   - WTF's sources for WPE that stand on GLib and the system
 #     (tests/wtf/files.txt: wtf/glib, generic, unix, linux and posix)
 #     compile with mlx-cc on these headers, with WPE's configuration
@@ -50,7 +54,7 @@ cc() { mlx-out/bin/mlx-cc -I"$headers" "$@"; }
 run() { LD_LIBRARY_PATH="$repo_root/mlx-out/lib" "$@"; }
 
 {
-    for header in glib.h glib-object.h glib-unix.h glib/gstdio.h gio/gio.h; do echo "#include <$header>"; done
+    for header in glib.h glib-object.h glib-unix.h glib/gstdio.h gio/gio.h gobject/gvaluecollector.h; do echo "#include <$header>"; done
     echo 'int main(void) { return 0; }'
 } > "$work/all.c"
 cc -c "$work/all.c" -o "$work/all.o" || fail "the headers together do not compile as C"
@@ -58,7 +62,7 @@ cc -x c++ -std=c++20 -c "$work/all.c" -o "$work/all-cpp.o" || fail "the headers 
 echo "ok   the headers together in C and C++"
 
 mkdir -p "$work/run"
-for test in strings mainloop variant uri gobject system gio; do
+for test in strings mainloop variant uri gobject system gio collect options network; do
     cc "compiler/capi/glib/tests/$test.c" -o "$work/$test" "$library" || fail "tests/$test.c does not build"
     status=0
     (cd "$work/run" && run "$work/$test") > "$work/$test.out" 2> "$work/$test.err" || status=$?
