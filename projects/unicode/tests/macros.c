@@ -26,6 +26,26 @@
 #include <unicode/ucol.h>
 #include <unicode/ucal.h>
 #include <unicode/ucsdet.h>
+#include <unicode/udisplaycontext.h>
+#include <unicode/umisc.h>
+#include <unicode/ufieldpositer.h>
+#include <unicode/uformattedvalue.h>
+#include <unicode/uformattable.h>
+#include <unicode/ucurr.h>
+#include <unicode/unumberoptions.h>
+#include <unicode/uformattednumber.h>
+#include <unicode/unum.h>
+#include <unicode/udat.h>
+#include <unicode/udatpg.h>
+#include <unicode/unumberformatter.h>
+#include <unicode/unumberrangeformatter.h>
+#include <unicode/upluralrules.h>
+#include <unicode/ulistformatter.h>
+#include <unicode/ureldatefmt.h>
+#include <unicode/uldnames.h>
+#include <unicode/udateintervalformat.h>
+#include <unicode/unumsys.h>
+#include <unicode/ures.h>
 
 int main(void)
 {
@@ -62,6 +82,9 @@ int main(void)
     int32_t written = 0;
     U8_APPEND_UNSAFE(out, written, 0x20ac);
     if (written != 3 || memcmp(out, "\xe2\x82\xac", 3)) return 13;
+    if (strcmp(UDAT_YEAR_ABBR_MONTH_DAY, "yMMMd") || UDAT_DEFAULT != UDAT_MEDIUM || UDISPCTX_LENGTH_SHORT != 0x201) return 14;
+    UFieldPosition position = { UNUM_INTEGER_FIELD, 0, 0 };
+    if (sizeof position != 3 * sizeof(int32_t) || UFIELD_CATEGORY_LIST_SPAN != 0x1003) return 15;
     printf("macros: ok (%s, Unicode %s)\n", U_ICU_VERSION, U_UNICODE_VERSION);
     return 0;
 }

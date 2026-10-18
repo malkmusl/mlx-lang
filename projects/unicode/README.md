@@ -24,7 +24,7 @@ there are no headers written by hand.
 | `ucd/` | The Unicode Character Database 16.0.0 (the files used, and the conformance tests) |
 | `generate.mlx` | `unicode-generate UCD OUT`: writes `tables.mlx` and `api/ugenerated.mlx` |
 | `tables.mlx` | Two tries (property records and case records) and sorted lists (decompositions, compositions, full case mappings and foldings, script extensions, blocks, numeric values) |
-| `api/` | The interface in Mlx, a module per header (ICU's names and API level, 74); `ugenerated.mlx` (scripts, blocks) is made by `generate.mlx` |
+| `api/` | The interface in Mlx, a module per header (ICU's names and API level, 74); `ugenerated.mlx` (scripts, blocks) is made by `generate.mlx`; the formatting headers WebKit's Intl includes (`udat.h`, `udatpg.h`, `unum.h`, `unumberformatter.h`, `unumberrangeformatter.h`, `upluralrules.h`, `ulistformatter.h`, `ureldatefmt.h`, `uldnames.h`, `udateintervalformat.h`, `ucurr.h`, `unumsys.h`, `ures.h` and the headers they include) are declared, not implemented yet |
 | `uca/`, `idna/` | The Unicode Collation Algorithm's table (DUCET) and its tests; the IDNA mapping table and its tests |
 | `tz/` | The IANA time zone database 2026c (`tzdata.zi`, the form zic reads; `zone.tab`, the zones of each country) |
 | `cldr/` | CLDR 48 (JSON): likely subtags, the aliases of languages, scripts, regions and variants, the BCP 47 keys and types, ISO 3166 codes, the available locales |
