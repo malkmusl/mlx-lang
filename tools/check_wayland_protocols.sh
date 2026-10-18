@@ -48,11 +48,14 @@ fail() { echo "FAIL $1" >&2; [[ -f "$2" ]] && cat "$2" >&2; exit 1; }
 
 # A client ($3, a command line) in a compositor of its own drawing on $2
 # (cpu or vulkan), with Xwayland, nothing else; its first window is at
-# (24, 24), and $name.script drives the host.
+# (24, 24), and $name.script drives the host. $name.log has the
+# compositor's lines, then the client's.
 solo_run() {
     local name=$1 renderer=$2 command=$3 runtime status=0
     runtime=$(mktemp -d)
-    printf '#!/bin/sh\nexec %s\n' "$command" > "$work/$name-client.sh"
+    # The client writes a file of its own (both writing to one, their
+    # lines would interleave mid-line); it is appended to the log after.
+    printf '#!/bin/sh\nexec %s > "%s" 2>&1\n' "$command" "$work/$name-client.log" > "$work/$name-client.sh"
     chmod +x "$work/$name-client.sh"
     XDG_RUNTIME_DIR=$runtime "$work/test-host" "host-$name" "$work/us.xkb" "$work/$name.script" > "$work/$name-host.log" 2>&1 &
     local host_pid=$!
@@ -63,6 +66,7 @@ solo_run() {
         --launcher none --dock none --topbar none --run "$work/$name-client.sh" > "$work/$name.log" 2>&1 || status=$?
     wait "$host_pid" || fail "$name: the test host failed" "$work/$name-host.log"
     rm -rf -- "$runtime"
+    cat "$work/$name-client.log" >> "$work/$name.log" 2> /dev/null || true
     [[ $status -eq 0 ]] || fail "$name: the compositor exited with status $status" "$work/$name.log"
     ! grep -q "crashed" "$work/$name.log" || fail "$name: a client crashed" "$work/$name.log"
 }
