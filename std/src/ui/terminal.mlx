@@ -2,7 +2,9 @@
 // on a std.ui canvas with the monospaced font of std.ui.text (std.truetype,
 // so any size and any script the font has), the cursor, the view into the
 // history, and the keys (std.terminal.keys) with Shift+Page Up and Down
-// scrolling the view.
+// scrolling the view. A selection made with the pointer is drawn here;
+// std.ui.terminal_input makes it from the pointer, reports the pointer to
+// programs that ask, and filters what is pasted.
 //
 //     var mono: text.Text = undefined
 //     const loaded = text.loadMonoText(&mono, 15, allocator)
@@ -42,10 +44,41 @@ pub const View = struct {
     focused: bool
     // Every glyph is as wide as the cell: runs of cells are drawn at once.
     monospaced: bool
+    // The selection (std.ui.terminal_input): lines are counted from the
+    // oldest line of the history (the live screen's top row is line
+    // historyCount; on the alternate screen, its rows), from the anchor
+    // where the left button went down to the end where it is now. By
+    // cells (selectionUnit 1: columns are the boundaries between cells, 0
+    // to columns), words (2) or lines (3: clicks in a row; columns are the
+    // cells clicked). selecting: the button is held.
+    hasSelection: bool
+    selecting: bool
+    selectionUnit: u8
+    anchorLine: usize
+    anchorColumn: usize
+    endLine: usize
+    endColumn: usize
+    selectionColor: u32
+    // The history as last seen, so that lines it drops off its top move
+    // the selection up with them, and which screen it was on.
+    seenHistoryCount: usize
+    seenHistoryStart: usize
+    seenAlternate: bool
+    // The last press (milliseconds, line, column) and how many in a row.
+    pressTime: usize
+    pressLine: usize
+    pressColumn: usize
+    pressCount: u8
+    // Mouse reporting: the button held the program was told of (NO_BUTTON
+    // none), and the cell it last heard of.
+    reportedButton: u32
+    reportedLine: usize
+    reportedColumn: usize
 }
 
 pub const PAGE_UP: u32 = 104
 pub const PAGE_DOWN: u32 = 109
+pub const NO_BUTTON: u32 = 4294967295
 
 // A view of `screen` in `font`, loaded at `font_height` pixels, with
 // `padding` pixels around the cells.
@@ -63,7 +96,17 @@ pub fn init(view: *View, screen: *terminal.Screen, font: *Text, font_height: i32
     view.*.foreground = 4293322470
     view.*.background = 4280032284
     view.*.cursorColor = 4293322470
+    view.*.selectionColor = 4281626234
     view.*.focused = true
+    view.*.hasSelection = false
+    view.*.selecting = false
+    view.*.selectionUnit = 1
+    view.*.seenHistoryCount = 0
+    view.*.seenHistoryStart = 0
+    view.*.seenAlternate = false
+    view.*.pressTime = 0
+    view.*.pressCount = 0
+    view.*.reportedButton = NO_BUTTON
 }
 
 // The default colours for the desktop's lightness (0 dark to 1024 light,
@@ -73,6 +116,109 @@ pub fn setLightness(view: *View, lightness: i32) -> void {
     view.*.foreground = theme_module.mix(4293322470, 4280953907, lightness)
     view.*.background = theme_module.mix(4280032284, 4294638330, lightness)
     view.*.cursorColor = view.*.foreground
+    // A blue under the selected text, deep on dark, pale on light.
+    view.*.selectionColor = theme_module.mix(4281626234, 4290303221, lightness)
+}
+
+// ---------------------------------------------------------------------------
+// Lines: the history's, then the live screen's (the alternate screen has
+// no history).
+
+// How many lines there are.
+pub fn lineCount(screen: *const terminal.Screen) -> usize {
+    return if screen.*.onAlternate { screen.*.rows } else { screen.*.historyCount + screen.*.rows }
+}
+
+// The line at the view's top row.
+pub fn topLine(screen: *const terminal.Screen) -> usize {
+    return if screen.*.onAlternate { 0 } else { screen.*.historyCount - screen.*.viewOffset }
+}
+
+// Cell `column` of line `line` (below lineCount).
+pub fn lineCell(screen: *terminal.Screen, line: usize, column: usize) -> *terminal.Cell {
+    var address: usize = 0
+    if screen.*.onAlternate {
+        address = @intFromPtr(screen.*.alternate) + (line * screen.*.columns + column) * @sizeOf(terminal.Cell)
+    } else if line < screen.*.historyCount {
+        const slot = (screen.*.historyStart + line) % screen.*.historyLines
+        address = @intFromPtr(screen.*.history) + (slot * screen.*.columns + column) * @sizeOf(terminal.Cell)
+    } else {
+        address = @intFromPtr(screen.*.main) + ((line - screen.*.historyCount) * screen.*.columns + column) * @sizeOf(terminal.Cell)
+    }
+    unsafe { return @ptrFromInt(*terminal.Cell, address) }
+}
+
+// Whether a cell separates words (a double click selects up to them):
+// blanks, quotes, brackets and the shell's separators; a path or a URL is
+// one word.
+pub fn separates(codepoint: u32) -> bool {
+    if codepoint <= 32 { return true }
+    return codepoint == 34 || codepoint == 39 || codepoint == 96 || codepoint == 40 || codepoint == 41 || codepoint == 91 || codepoint == 93 || codepoint == 123 || codepoint == 125 || codepoint == 60 || codepoint == 62 || codepoint == 124 || codepoint == 59
+}
+
+// The selection in order, its units resolved: from (fromLine, fromColumn)
+// to (toLine, toColumn), the last column not taken.
+pub const Range = struct {
+    fromLine: usize
+    fromColumn: usize
+    toLine: usize
+    toColumn: usize
+}
+
+// The selection as a Range; false when there is none (or it is empty).
+pub fn selectionRange(view: *View, range: *Range) -> bool {
+    if !view.*.hasSelection { return false }
+    const screen = view.*.screen
+    const columns = screen.*.columns
+    const lines = lineCount(screen)
+    var from_line = view.*.anchorLine
+    var from_column = view.*.anchorColumn
+    var to_line = view.*.endLine
+    var to_column = view.*.endColumn
+    if to_line < from_line || (to_line == from_line && to_column < from_column) {
+        from_line = view.*.endLine
+        from_column = view.*.endColumn
+        to_line = view.*.anchorLine
+        to_column = view.*.anchorColumn
+    }
+    if from_line >= lines { return false }
+    if to_line >= lines {
+        to_line = lines - 1
+        to_column = columns
+    }
+    if view.*.selectionUnit == 3 {
+        from_column = 0
+        to_column = columns
+    } else if view.*.selectionUnit == 2 {
+        // From the start of the first word to the end of the last (a
+        // separator clicked is a word of its own).
+        if from_column >= columns { from_column = columns - 1 }
+        if !separates(lineCell(screen, from_line, from_column).*.codepoint) {
+            while from_column > 0 && !separates(lineCell(screen, from_line, from_column - 1).*.codepoint) { from_column -= 1 }
+        }
+        if to_column >= columns { to_column = columns - 1 }
+        if separates(lineCell(screen, to_line, to_column).*.codepoint) {
+            to_column += 1
+        } else {
+            while to_column < columns && !separates(lineCell(screen, to_line, to_column).*.codepoint) { to_column += 1 }
+        }
+    }
+    if from_column > columns { from_column = columns }
+    if to_column > columns { to_column = columns }
+    if from_line == to_line && from_column >= to_column { return false }
+    range.*.fromLine = from_line
+    range.*.fromColumn = from_column
+    range.*.toLine = to_line
+    range.*.toColumn = to_column
+    return true
+}
+
+// Whether cell (line, column) is in `range`.
+pub fn inRange(range: *const Range, line: usize, column: usize) -> bool {
+    if line < range.*.fromLine || line > range.*.toLine { return false }
+    if line == range.*.fromLine && column < range.*.fromColumn { return false }
+    if line == range.*.toLine && column >= range.*.toColumn { return false }
+    return true
 }
 
 // How many cells fit in `width` x `height` pixels (at least one).
@@ -141,10 +287,14 @@ pub fn draw(view: *View, canvas: *Canvas, area: ui.Rect) -> void {
     const text_offset = (view.*.cellHeight - view.*.fontHeight) / 2
     var run: [4096]u8 = undefined
     const run_bytes: [*]u8 = &run
+    var range: Range = undefined
+    const selected = selectionRange(view, &range)
+    const first_line = topLine(screen)
     var row: usize = 0
     while row < rows {
         const y = top + @intCast(i32, row) * view.*.cellHeight
         if y + view.*.cellHeight > area.y + area.height { break }
+        const line = first_line + row
         var column: usize = 0
         while column < columns {
             const first = terminal.visibleCell(screen, row, column)
@@ -152,6 +302,7 @@ pub fn draw(view: *View, canvas: *Canvas, area: ui.Rect) -> void {
                 column += 1
                 continue
             }
+            const first_selected = selected && inRange(&range, line, column)
             // The run: cells of the same look, single width when the font
             // is monospaced (else one cell at a time), stopping before a
             // wide character or at the line's end.
@@ -162,6 +313,7 @@ pub fn draw(view: *View, canvas: *Canvas, area: ui.Rect) -> void {
                 while column + count < columns {
                     const next = terminal.visibleCell(screen, row, column + count)
                     if next.*.width != 1 || !sameLook(first, next) || run_length + 4 > 4096 { break }
+                    if selected && inRange(&range, line, column + count) != first_selected { break }
                     run_length += terminal.encodeUtf8(next.*.codepoint, advance(run_bytes, run_length))
                     count += 1
                     cells_wide += 1
@@ -170,6 +322,7 @@ pub fn draw(view: *View, canvas: *Canvas, area: ui.Rect) -> void {
             var foreground: u32 = 0
             var background: u32 = 0
             colorsOf(view, first, &foreground, &background)
+            if first_selected { background = view.*.selectionColor }
             const x = left + @intCast(i32, column) * view.*.cellWidth
             const run_width = @intCast(i32, cells_wide) * view.*.cellWidth
             if background != page_background { canvas_module.fillRect(canvas, x, y, run_width, view.*.cellHeight, background) }
