@@ -13,6 +13,9 @@ class Point {
 print(new Point(3, 4).length);
 const map = new Map([["a", 1], ["b", 2]]);
 print([...map.keys()].join("") + " " + [...map.values()].reduce((a, b) => a + b));
+const proto = { greet() { return "hi " + this.name; } };
+const withProto = Object.setPrototypeOf({ name: "proto" }, proto);
+print(withProto.greet(), Object.getPrototypeOf(withProto) === proto);
 let caught = "";
 try { undefinedFunction(); } catch (e) { caught = e.constructor.name + ": " + e.message; }
 print(caught);
