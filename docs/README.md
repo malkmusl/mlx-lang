@@ -53,6 +53,10 @@ exercise it:
   rasterizers), atlas, layout, and text on Vulkan
 - [`reference/ui.md`](reference/ui.md) — `std.ui`: layout building blocks
   (rectangles, insets, alignment, containers, stacks, reserved bars)
+- [`reference/unicode.md`](reference/unicode.md) — `std.unicode`: Unicode
+  and CLDR in Mlx (properties, casing, normalization, breaks, collation,
+  IDNA, locales, calendars, formatting), `std.timezone.database`, and the
+  ICU C API over them (`compiler/capi/icu`)
 - [`reference/memory-and-concurrency.md`](reference/memory-and-concurrency.md)
   — the memory model (lifetime, UB, overflow) and the atomics/TLS Stage-0 gap
 - [`reference/diagnostics-selfhost.md`](reference/diagnostics-selfhost.md) —

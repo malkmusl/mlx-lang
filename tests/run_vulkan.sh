@@ -75,6 +75,7 @@ run tests/255_spirv_module_runtime.mlx -- "$work/doubler.spv"
 run tests/262_truetype_runtime.mlx
 run tests/272_png_runtime.mlx
 run tests/292_png_encode_runtime.mlx
+run tests/343_flate_runtime.mlx
 run tests/264_ui_layout_runtime.mlx
 
 # The builder's module passes the Khronos validator, and modules from
