@@ -27,8 +27,10 @@ there are no headers written by hand.
 | `api/` | The interface in Mlx, a module per header (ICU's names and API level, 74); `ugenerated.mlx` (scripts, blocks) is made by `generate.mlx`; the formatting headers WebKit's Intl includes (`udat.h`, `udatpg.h`, `unum.h`, `unumberformatter.h`, `unumberrangeformatter.h`, `upluralrules.h`, `ulistformatter.h`, `ureldatefmt.h`, `uldnames.h`, `udateintervalformat.h`, `ucurr.h`, `unumsys.h`, `ures.h` and the headers they include) are declared, not implemented yet |
 | `uca/`, `idna/` | The Unicode Collation Algorithm's table (DUCET) and its tests; the IDNA mapping table and its tests |
 | `tz/` | The IANA time zone database 2026c (`tzdata.zi`, the form zic reads; `zone.tab`, the zones of each country) |
-| `cldr/` | CLDR 48 (JSON): likely subtags, the aliases of languages, scripts, regions and variants, the BCP 47 keys and types, ISO 3166 codes, the available locales; `cldr/collation/`: CLDR 48's collation data (its XML, a file a locale) and the root's radical-stroke order of Han (`radicals.txt`, the `[radical]` lines of CLDR's FractionalUCA) |
+| `cldr/` | CLDR 48 (JSON): likely subtags, the aliases of languages, scripts, regions and variants, the BCP 47 keys and types, ISO 3166 codes, the available locales; `packages/`, CLDR's npm packages (core, dates, numbers, misc, locale names, units); `collation/`: CLDR 48's collation data (its XML, a file a locale) and the root's radical-stroke order of Han (`radicals.txt`, the `[radical]` lines of CLDR's FractionalUCA) |
 | `cldrgenerate.mlx` | `cldr-generate CLDR OUT`: writes `locales.mlx`, CLDR's data as sorted tables |
+| `cldrdata.mlx` | `cldr-data PACKAGES OUT`: writes `cldr.dat` (`mlx-out/share/mlx-unicode`), the formatters' locale data of CLDR's packages, each locale's keys and values where they differ from its parent's |
+| `measureunits.mlx` | Measure units for `unumf`: ICU's built-in units and core unit identifiers (products, powers, SI and binary prefixes, `-per-`), their patterns by plural form from CLDR's units (built-in ones their own; others put together of the per, times, power and prefix patterns, as UTS #35 says) |
 | `tzgenerate.mlx` | `tz-generate TZ OUT`: writes `timezones.mlx`, every zone's transitions worked out from its rules as zic does (through 2037, then the rules in force) |
 | `unicode.mlx` | The library's root (`--plugin --stack-arena`) |
 | `properties.mlx` | `uchar.h`, `uscript.h`: every binary and enumerated property, names of properties and values, classification, simple case mappings |
@@ -76,9 +78,17 @@ from C programs compiled by mlx-cc:
 - locale IDs and tags: tests/locales.c against ICU's results
   (locales.expected)
 - the calendar: tests/calendar.c against what ICU gives (calendar.expected)
+- measure units: tests/units.c (every unit JavaScriptCore's
+  Intl.NumberFormat takes, X-per-Y compounds, the stems of units and
+  their widths, Intl.DurationFormat's skeletons, ranges) against ICU 74:
+  the same but where CLDR 48's data is not ICU 74's CLDR 44 (Arabic's
+  digits, some German narrow durations, Polish days)
 
 ## Not yet here
 
+- Of measure units: mixed units (`unit/foot-and-inch`), usages (`usage/`,
+  CLDR's unit preferences and the conversions they take) and the
+  grammatical cases of unit names.
 - Words in scripts written without spaces (Thai, Lao, Khmer, Myanmar,
   Chinese and Japanese runs): ICU finds those by dictionary; here they
   break by the UAX #29 and UAX #14 rules alone.
