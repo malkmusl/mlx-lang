@@ -1,0 +1,108 @@
+#!/usr/bin/env bash
+# mlx-glib, GLib, GObject and GIO with GLib's C API in Mlx (projects/glib):
+#
+#   - `./mlx build glib` builds the library (libmlxglib.so) and the
+#     headers: mlx-cheaders makes mlx-out/include/mlx-glib/**/*.h of the
+#     API's Mlx modules (projects/glib/api);
+#   - every function the headers declare is in the library;
+#   - the headers in C and C++: glib.h, glib-object.h, glib-unix.h,
+#     glib/gstdio.h and gio/gio.h together;
+#   - C programs built by mlx-cc against the library print what
+#     NAME.expected says (what GLib 2.80 prints for the same program,
+#     with the exit status last):
+#       tests/strings.c    strings, UTF-8, conversions, lists, hashes...
+#       tests/mainloop.c   contexts, sources, timeouts, threads, once
+#       tests/variant.c    GVariant: types, serialization, printing
+#       tests/uri.c        GUri: parsing, building, escaping
+#       tests/gobject.c    types, values, properties, signals, objects
+#       tests/system.c     markup, spawning, Unix signals, dates
+#       tests/gio.c        cancellables, tasks, files and monitors,
+#                          sockets, resources, D-Bus without a bus
+#   - WTF's sources for WPE that stand on GLib and the system
+#     (tests/wtf/files.txt: wtf/glib, generic, unix, linux and posix)
+#     compile with mlx-cc on these headers, with WPE's configuration
+#     (tests/wtf/wpe-config.txt, NAME VALUE each), where the WebKit
+#     source is (WEBKIT_SOURCE, by default where projects/webkit looks)
+#     and mlx-unicode's headers are made (./mlx build unicode).
+#
+#   tools/check_glib.sh
+set -euo pipefail
+
+repo_root=$(cd "$(dirname "$0")/.." && pwd)
+cd "$repo_root"
+work=$(mktemp -d /tmp/mlx-glib.XXXXXX)
+trap 'rm -rf -- "$work"' EXIT
+fail() { echo "FAIL $1" >&2; exit 1; }
+headers=mlx-out/include/mlx-glib
+library=mlx-out/lib/libmlxglib.so
+
+./mlx build cc glib > "$work/build.log" 2>&1 || { cat "$work/build.log"; fail "./mlx build glib"; }
+echo "ok   ./mlx build glib"
+
+# Every `pub extern("c") fn` of the API modules is defined by the library.
+grep -ho 'pub extern("c") fn [A-Za-z0-9_]*' projects/glib/api/*.mlx | awk '{print $4}' | sort -u > "$work/declared"
+nm -D --defined-only "$library" | awk '{print $NF}' | sort -u > "$work/defined"
+comm -23 "$work/declared" "$work/defined" > "$work/missing"
+[ ! -s "$work/missing" ] || { cat "$work/missing"; fail "functions the headers declare are not in the library"; }
+echo "ok   the library defines the $(wc -l < "$work/declared") functions the headers declare"
+
+cc() { mlx-out/bin/mlx-cc -I"$headers" "$@"; }
+run() { LD_LIBRARY_PATH="$repo_root/mlx-out/lib" "$@"; }
+
+{
+    for header in glib.h glib-object.h glib-unix.h glib/gstdio.h gio/gio.h; do echo "#include <$header>"; done
+    echo 'int main(void) { return 0; }'
+} > "$work/all.c"
+cc -c "$work/all.c" -o "$work/all.o" || fail "the headers together do not compile as C"
+cc -x c++ -std=c++20 -c "$work/all.c" -o "$work/all-cpp.o" || fail "the headers together do not compile as C++"
+echo "ok   the headers together in C and C++"
+
+mkdir -p "$work/run"
+for test in strings mainloop variant uri gobject system gio; do
+    cc "projects/glib/tests/$test.c" -o "$work/$test" "$library" || fail "tests/$test.c does not build"
+    status=0
+    (cd "$work/run" && run "$work/$test") > "$work/$test.out" 2> "$work/$test.err" || status=$?
+    echo "exit $status" >> "$work/$test.out"
+    diff -u "projects/glib/tests/$test.expected" "$work/$test.out" || { cat "$work/$test.err"; fail "tests/$test.c prints otherwise"; }
+    echo "ok   tests/$test.c"
+done
+
+webkit=${WEBKIT_SOURCE:-/home/user/csrc/wpe/wpewebkit-2.54.1}
+generated=mlx-out/webkit/generated
+if [ ! -d "$webkit/Source/WTF/wtf" ]; then
+    echo "skip WTF's GLib sources: no WebKit source at $webkit (WEBKIT_SOURCE)"
+elif [ ! -d mlx-out/include/mlx-unicode/unicode ]; then
+    echo "skip WTF's GLib sources: no mlx-unicode headers (made by ./mlx build unicode)"
+elif [ ! -d "$generated/bmalloc" ]; then
+    echo "skip WTF's GLib sources: no $generated/bmalloc (made by ./mlx build webkit-wtf)"
+else
+    mkdir -p "$work/config"
+    {
+        echo '#ifndef CMAKECONFIG_H'
+        echo '#define CMAKECONFIG_H'
+        sed 's/^/#define /' projects/glib/tests/wtf/wpe-config.txt
+        echo '#endif'
+    } > "$work/config/cmakeconfig.h"
+    wtf=$webkit/Source/WTF
+    flags=(-DBUILDING_WPE__=1 -DBUILDING_WEBKIT=1 -DBUILDING_WITH_CMAKE=1 -DBUILDING_WTF '-DGETTEXT_PACKAGE="WPE"' -DHAVE_CONFIG_H=1
+        -DJSC_GLIB_API_ENABLED -DPAS_BMALLOC=1 '-DPKGDATADIR="/usr/local/share/wpe-webkit-2.0"' -DSTATICALLY_LINKED_WITH_bmalloc
+        -D_GLIBCXX_ASSERTIONS=1 -DNDEBUG -DRELEASE_WITHOUT_OPTIMIZATIONS -std=c++23
+        -DSIMDE_NO_VECTOR -DSIMDUTF_IMPLEMENTATION_ICELAKE=0 -DSIMDUTF_IMPLEMENTATION_HASWELL=0 -DSIMDUTF_IMPLEMENTATION_WESTMERE=0
+        -I"$work/config" -I"$generated" -I"$generated/bmalloc" -I"$wtf")
+    for sub in wtf wtf/dtoa wtf/fast_float wtf/persistence wtf/simdutf wtf/text wtf/text/icu wtf/threads wtf/unicode; do flags+=(-I"$wtf/$sub"); done
+    flags+=(-Imlx-out/include/mlx-unicode -I"$headers")
+    failed=0
+    while read -r file; do
+        object=$work/$(echo "$file" | tr / _).o
+        if mlx-out/bin/mlx-cc "${flags[@]}" -c "$wtf/wtf/$file" -o "$object" > "$object.log" 2>&1; then
+            echo "ok   wtf/$file"
+        else
+            echo "FAIL wtf/$file" >&2
+            head -20 "$object.log" >&2
+            failed=1
+        fi
+    done < projects/glib/tests/wtf/files.txt
+    [ "$failed" = 0 ] || fail "WTF's GLib sources do not all compile"
+fi
+
+echo "check_glib.sh: all checks passed"
