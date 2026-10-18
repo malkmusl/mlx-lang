@@ -1,0 +1,1054 @@
+// The gzip file functions (gzopen, gzread, gzwrite, gzprintf, gzseek,
+// gzclose...): files of gzip members read through inflate (or copied as
+// they are when they are not gzip, as zlib does for "transparent" files)
+// and written through deflate, with zlib's buffering, its positions and
+// seeks (by reading or writing zeros forward), and its errors and their
+// messages ("PATH: message").
+//
+// A gzFile points at the state, which begins with what zlib.h shows of
+// it (have, next, pos: the bytes ready for gzgetc).
+const c = @import("./common.mlx")
+const deflate = @import("./deflate.mlx")
+const inflate = @import("./inflate.mlx")
+const varargs = @import("./varargs.mlx")
+
+extern("c") fn open(path: usize, flags: i32, mode: u32) -> i32
+extern("c") fn read(fd: i32, buffer: usize, count: usize) -> isize
+extern("c") fn write(fd: i32, buffer: usize, count: usize) -> isize
+extern("c") fn close(fd: i32) -> i32
+extern("c") fn lseek(fd: i32, offset: i64, whence: i32) -> i64
+extern("c") fn strerror(code: i32) -> usize
+extern("c") fn __errno_location() -> usize
+extern("c") fn vsnprintf(buffer: usize, size: usize, format: usize, list: usize) -> i32
+extern("c") fn memchr(buffer: usize, byte: i32, count: usize) -> usize
+
+const GZBUFSIZE: usize = 8192
+const GZ_NONE: i32 = 0
+const GZ_READ: i32 = 7247
+const GZ_WRITE: i32 = 31153
+const GZ_APPEND: i32 = 1
+
+// How a file being read is read: its header looked for, copied, inflated.
+const LOOK: i32 = 0
+const COPY: i32 = 1
+const GZIP: i32 = 2
+
+const O_RDONLY: i32 = 0
+const O_WRONLY: i32 = 1
+const O_CREAT: i32 = 64
+const O_EXCL: i32 = 128
+const O_TRUNC: i32 = 512
+const O_APPEND: i32 = 1024
+const O_CLOEXEC: i32 = 524288
+const SEEK_SET: i32 = 0
+const SEEK_CUR: i32 = 1
+const SEEK_END: i32 = 2
+
+const GzState = struct {
+    have: u32
+    next: usize
+    pos: i64
+    mode: i32
+    fd: i32
+    path: usize
+    size: usize
+    want: usize
+    inBuf: usize
+    outBuf: usize
+    direct: i32
+    how: i32
+    start: i64
+    eof: i32
+    past: i32
+    level: i32
+    strategy: i32
+    reset: i32
+    skip: i64
+    seek: i32
+    err: i32
+    msg: usize
+    strm: c.ZStream
+}
+
+inline fn stateOf(file: usize) -> *GzState { return unsafe { @ptrFromInt(*GzState, file) } }
+inline fn strmOf(state: *GzState) -> usize { return @intFromPtr(&state.*.strm) }
+
+fn errnoMessage() -> usize { return strerror(c.getI32(__errno_location())) }
+
+// Sets the file's error code and message (PATH: MSG, in memory of its
+// own; out of memory needs none).
+fn gzError(state: *GzState, err: i32, msg: usize) -> void {
+    if state.*.msg != 0 {
+        if state.*.err != c.Z_MEM_ERROR { c.rawFree(state.*.msg) }
+        state.*.msg = 0
+    }
+    if err != c.Z_OK && err != c.Z_BUF_ERROR { state.*.have = 0 }
+    state.*.err = err
+    if msg == 0 { return }
+    if err == c.Z_MEM_ERROR { return }
+    const pathLength = c.cLength(state.*.path)
+    const msgLength = c.cLength(msg)
+    const text = c.rawAlloc(pathLength + msgLength + 3)
+    if text == 0 {
+        state.*.err = c.Z_MEM_ERROR
+        return
+    }
+    c.copy(text, state.*.path, pathLength)
+    c.put8(text + pathLength, 58)
+    c.put8(text + pathLength + 1, 32)
+    c.copy(text + pathLength + 2, msg, msgLength)
+    c.put8(text + pathLength + 2 + msgLength, 0)
+    state.*.msg = text
+}
+
+fn gzReset(state: *GzState) -> void {
+    state.*.have = 0
+    if state.*.mode == GZ_READ {
+        state.*.eof = 0
+        state.*.past = 0
+        state.*.how = LOOK
+    } else {
+        state.*.reset = 0
+    }
+    state.*.seek = 0
+    gzError(state, c.Z_OK, 0)
+    state.*.pos = 0
+    state.*.strm.avail_in = 0
+}
+
+fn gzOpen(path: usize, fd: i32, mode0: usize) -> usize {
+    if path == 0 { return 0 }
+    const address = c.rawAlloc(@sizeOf(GzState))
+    if address == 0 { return 0 }
+    c.zero(address, @sizeOf(GzState))
+    const state = stateOf(address)
+    state.*.size = 0
+    state.*.want = GZBUFSIZE
+    state.*.msg = 0
+    state.*.mode = GZ_NONE
+    state.*.level = -1
+    state.*.strategy = c.Z_DEFAULT_STRATEGY
+    state.*.direct = 0
+    var cloexec = false
+    var exclusive = false
+    var mode = mode0
+    while c.get8(mode) != 0 {
+        const ch = c.get8(mode)
+        if ch >= 48 && ch <= 57 {
+            state.*.level = @intCast(i32, ch) - 48
+        } else if ch == 'r' {
+            state.*.mode = GZ_READ
+        } else if ch == 'w' {
+            state.*.mode = GZ_WRITE
+        } else if ch == 'a' {
+            state.*.mode = GZ_APPEND
+        } else if ch == '+' {
+            c.rawFree(address)
+            return 0
+        } else if ch == 'e' {
+            cloexec = true
+        } else if ch == 'x' {
+            exclusive = true
+        } else if ch == 'f' {
+            state.*.strategy = c.Z_FILTERED
+        } else if ch == 'h' {
+            state.*.strategy = c.Z_HUFFMAN_ONLY
+        } else if ch == 'R' {
+            state.*.strategy = c.Z_RLE
+        } else if ch == 'F' {
+            state.*.strategy = c.Z_FIXED
+        } else if ch == 'T' {
+            state.*.direct = 1
+        }
+        mode += 1
+    }
+    if state.*.mode == GZ_NONE {
+        c.rawFree(address)
+        return 0
+    }
+    if state.*.mode == GZ_READ {
+        if state.*.direct != 0 {
+            c.rawFree(address)
+            return 0
+        }
+        state.*.direct = 1
+    }
+    const len = c.cLength(path)
+    state.*.path = c.rawAlloc(len + 1)
+    if state.*.path == 0 {
+        c.rawFree(address)
+        return 0
+    }
+    c.copy(state.*.path, path, len + 1)
+    var oflag: i32 = if cloexec { O_CLOEXEC } else { 0 }
+    if state.*.mode == GZ_READ {
+        oflag |= O_RDONLY
+    } else {
+        oflag |= O_WRONLY | O_CREAT
+        if exclusive { oflag |= O_EXCL }
+        oflag |= if state.*.mode == GZ_WRITE { O_TRUNC } else { O_APPEND }
+    }
+    state.*.fd = if fd > -1 { fd } else { open(path, oflag, 438) }
+    if state.*.fd == -1 {
+        c.rawFree(state.*.path)
+        c.rawFree(address)
+        return 0
+    }
+    if state.*.mode == GZ_APPEND {
+        _ = lseek(state.*.fd, 0, SEEK_END)
+        state.*.mode = GZ_WRITE
+    }
+    if state.*.mode == GZ_READ {
+        state.*.start = lseek(state.*.fd, 0, SEEK_CUR)
+        if state.*.start == -1 { state.*.start = 0 }
+    }
+    gzReset(state)
+    return address
+}
+
+// "<fd:N>", the name of a file opened by its descriptor.
+fn descriptorName(fd: i32) -> usize {
+    const text = c.rawAlloc(20)
+    if text == 0 { return 0 }
+    var digits: [12]u8 = undefined
+    var count: usize = 0
+    var value: u64 = if fd < 0 { @intCast(u64, -@intCast(i64, fd)) } else { @intCast(u64, fd) }
+    while true {
+        digits[count] = @intCast(u8, 48 + value % 10)
+        count += 1
+        value /= 10
+        if value == 0 { break }
+    }
+    c.copy(text, c.literal("<fd:"), 4)
+    var at: usize = 4
+    if fd < 0 {
+        c.put8(text + at, 45)
+        at += 1
+    }
+    while count > 0 {
+        count -= 1
+        c.put8(text + at, @intCast(usize, digits[count]))
+        at += 1
+    }
+    c.put8(text + at, 62)
+    c.put8(text + at + 1, 0)
+    return text
+}
+
+pub fn gzdopenImpl(fd: i32, mode: usize) -> usize {
+    if fd == -1 { return 0 }
+    const path = descriptorName(fd)
+    if path == 0 { return 0 }
+    const file = gzOpen(path, fd, mode)
+    c.rawFree(path)
+    return file
+}
+
+fn isOpen(file: usize) -> bool {
+    if file == 0 { return false }
+    const state = stateOf(file)
+    return state.*.mode == GZ_READ || state.*.mode == GZ_WRITE
+}
+
+pub fn gzbufferImpl(file: usize, size0: u32) -> i32 {
+    if !isOpen(file) { return -1 }
+    const state = stateOf(file)
+    if state.*.size != 0 { return -1 }
+    var size = @intCast(usize, size0)
+    if ((size << 1) & 0xffffffff) < size { return -1 }
+    if size < 8 { size = 8 }
+    state.*.want = size
+    return 0
+}
+
+pub fn gzrewindImpl(file: usize) -> i32 {
+    if file == 0 { return -1 }
+    const state = stateOf(file)
+    if state.*.mode != GZ_READ || (state.*.err != c.Z_OK && state.*.err != c.Z_BUF_ERROR) { return -1 }
+    if lseek(state.*.fd, state.*.start, SEEK_SET) == -1 { return -1 }
+    gzReset(state)
+    return 0
+}
+
+pub fn gzseekImpl(file: usize, offset0: i64, whence: i32) -> i64 {
+    if !isOpen(file) { return -1 }
+    const state = stateOf(file)
+    if state.*.err != c.Z_OK && state.*.err != c.Z_BUF_ERROR { return -1 }
+    if whence != SEEK_SET && whence != SEEK_CUR { return -1 }
+    var offset = offset0
+    if whence == SEEK_SET {
+        offset -= state.*.pos
+    } else if state.*.seek != 0 {
+        offset += state.*.skip
+    }
+    state.*.seek = 0
+    // Within a file read as it is: the descriptor's own seek.
+    if state.*.mode == GZ_READ && state.*.how == COPY && state.*.pos + offset >= 0 {
+        const ret = lseek(state.*.fd, offset - @intCast(i64, state.*.have), SEEK_CUR)
+        if ret == -1 { return -1 }
+        state.*.have = 0
+        state.*.eof = 0
+        state.*.past = 0
+        state.*.seek = 0
+        gzError(state, c.Z_OK, 0)
+        state.*.strm.avail_in = 0
+        state.*.pos += offset
+        return state.*.pos
+    }
+    if offset < 0 {
+        if state.*.mode != GZ_READ { return -1 }
+        offset += state.*.pos
+        if offset < 0 { return -1 }
+        if gzrewindImpl(file) == -1 { return -1 }
+    }
+    if state.*.mode == GZ_READ {
+        const n: u32 = if @intCast(i64, state.*.have) > offset { @intCast(u32, offset) } else { state.*.have }
+        state.*.have -= n
+        state.*.next += @intCast(usize, n)
+        state.*.pos += @intCast(i64, n)
+        offset -= @intCast(i64, n)
+    }
+    if offset != 0 {
+        state.*.seek = 1
+        state.*.skip = offset
+    }
+    return state.*.pos + offset
+}
+
+pub fn gztellImpl(file: usize) -> i64 {
+    if !isOpen(file) { return -1 }
+    const state = stateOf(file)
+    return state.*.pos + (if state.*.seek != 0 { state.*.skip } else { 0 })
+}
+
+pub fn gzoffsetImpl(file: usize) -> i64 {
+    if !isOpen(file) { return -1 }
+    const state = stateOf(file)
+    var offset = lseek(state.*.fd, 0, SEEK_CUR)
+    if offset == -1 { return -1 }
+    if state.*.mode == GZ_READ { offset -= @intCast(i64, state.*.strm.avail_in) }
+    return offset
+}
+
+pub fn gzeofImpl(file: usize) -> i32 {
+    if !isOpen(file) { return 0 }
+    const state = stateOf(file)
+    return if state.*.mode == GZ_READ { state.*.past } else { 0 }
+}
+
+pub fn gzerrorImpl(file: usize, errnum: usize) -> usize {
+    if !isOpen(file) { return 0 }
+    const state = stateOf(file)
+    if errnum != 0 { c.putI32(errnum, state.*.err) }
+    if state.*.err == c.Z_MEM_ERROR { return c.literal("out of memory") }
+    return if state.*.msg == 0 { c.literal("") } else { state.*.msg }
+}
+
+pub fn gzclearerrImpl(file: usize) -> void {
+    if !isOpen(file) { return }
+    const state = stateOf(file)
+    if state.*.mode == GZ_READ {
+        state.*.eof = 0
+        state.*.past = 0
+    }
+    gzError(state, c.Z_OK, 0)
+}
+
+// ---------------------------------------------------------------------------
+// Reading
+
+// Reads up to LEN bytes into BUF (looping, as read may return less);
+// *HAVE how many. -1 on an error.
+fn gzLoad(state: *GzState, buf: usize, len: usize, have: *usize) -> i32 {
+    const max: usize = 0x40000000
+    have.* = 0
+    var ret: isize = 0
+    while true {
+        var get = len - have.*
+        if get > max { get = max }
+        ret = read(state.*.fd, buf + have.*, get)
+        if ret <= 0 { break }
+        have.* += @intCast(usize, ret)
+        if have.* >= len { break }
+    }
+    if ret < 0 {
+        gzError(state, c.Z_ERRNO, errnoMessage())
+        return -1
+    }
+    if ret == 0 { state.*.eof = 1 }
+    return 0
+}
+
+// More input into the input buffer, what is left of it moved first.
+fn gzAvail(state: *GzState) -> i32 {
+    if state.*.err != c.Z_OK && state.*.err != c.Z_BUF_ERROR { return -1 }
+    if state.*.eof == 0 {
+        const strm = &state.*.strm
+        if strm.*.avail_in != 0 { c.move(state.*.inBuf, strm.*.next_in, @intCast(usize, strm.*.avail_in)) }
+        var got: usize = 0
+        if gzLoad(state, state.*.inBuf + @intCast(usize, strm.*.avail_in), state.*.size - @intCast(usize, strm.*.avail_in), &got) == -1 { return -1 }
+        strm.*.avail_in = @intCast(u32, @intCast(usize, strm.*.avail_in) + got)
+        strm.*.next_in = state.*.inBuf
+    }
+    return 0
+}
+
+// Looks for a gzip header: inflate when there is one, else copy (or, after
+// gzip data, take what follows as trailing garbage and stop).
+fn gzLook(state: *GzState) -> i32 {
+    const strm = &state.*.strm
+    if state.*.size == 0 {
+        state.*.inBuf = c.rawAlloc(state.*.want)
+        state.*.outBuf = c.rawAlloc(state.*.want << 1)
+        if state.*.inBuf == 0 || state.*.outBuf == 0 {
+            c.rawFree(state.*.outBuf)
+            c.rawFree(state.*.inBuf)
+            gzError(state, c.Z_MEM_ERROR, c.literal("out of memory"))
+            return -1
+        }
+        state.*.size = state.*.want
+        strm.*.zalloc = 0
+        strm.*.zfree = 0
+        strm.*.opaque = 0
+        strm.*.avail_in = 0
+        strm.*.next_in = 0
+        if inflate.init2(strmOf(state), 15 + 16, c.literal(c.VERSION), c.STREAM_SIZE) != c.Z_OK {
+            c.rawFree(state.*.outBuf)
+            c.rawFree(state.*.inBuf)
+            state.*.size = 0
+            gzError(state, c.Z_MEM_ERROR, c.literal("out of memory"))
+            return -1
+        }
+    }
+    if strm.*.avail_in < 2 {
+        if gzAvail(state) == -1 { return -1 }
+        if strm.*.avail_in == 0 { return 0 }
+    }
+    if strm.*.avail_in > 1 && c.get8(strm.*.next_in) == 31 && c.get8(strm.*.next_in + 1) == 139 {
+        _ = inflate.reset(strmOf(state))
+        state.*.how = GZIP
+        state.*.direct = 0
+        return 0
+    }
+    if state.*.direct == 0 {
+        strm.*.avail_in = 0
+        state.*.eof = 1
+        state.*.have = 0
+        return 0
+    }
+    state.*.next = state.*.outBuf
+    c.copy(state.*.next, strm.*.next_in, @intCast(usize, strm.*.avail_in))
+    state.*.have = strm.*.avail_in
+    strm.*.avail_in = 0
+    state.*.how = COPY
+    state.*.direct = 1
+    return 0
+}
+
+// Inflates into next_out and avail_out up to the end of the member.
+fn gzDecomp(state: *GzState) -> i32 {
+    var ret = c.Z_OK
+    const strm = &state.*.strm
+    const had = strm.*.avail_out
+    while true {
+        if strm.*.avail_in == 0 && gzAvail(state) == -1 { return -1 }
+        if strm.*.avail_in == 0 {
+            gzError(state, c.Z_BUF_ERROR, c.literal("unexpected end of file"))
+            break
+        }
+        ret = inflate.run(strmOf(state), c.Z_NO_FLUSH)
+        if ret == c.Z_STREAM_ERROR || ret == c.Z_NEED_DICT {
+            gzError(state, c.Z_STREAM_ERROR, c.literal("internal error: inflate stream corrupt"))
+            return -1
+        }
+        if ret == c.Z_MEM_ERROR {
+            gzError(state, c.Z_MEM_ERROR, c.literal("out of memory"))
+            return -1
+        }
+        if ret == c.Z_DATA_ERROR {
+            gzError(state, c.Z_DATA_ERROR, if strm.*.msg == 0 { c.literal("compressed data error") } else { strm.*.msg })
+            return -1
+        }
+        if !(strm.*.avail_out != 0 && ret != c.Z_STREAM_END) { break }
+    }
+    state.*.have = had - strm.*.avail_out
+    state.*.next = strm.*.next_out - @intCast(usize, state.*.have)
+    if ret == c.Z_STREAM_END { state.*.how = LOOK }
+    return 0
+}
+
+// Output into the output buffer (which is empty).
+fn gzFetch(state: *GzState) -> i32 {
+    const strm = &state.*.strm
+    while true {
+        if state.*.how == LOOK {
+            if gzLook(state) == -1 { return -1 }
+            if state.*.how == LOOK { return 0 }
+        } else if state.*.how == COPY {
+            var got: usize = 0
+            if gzLoad(state, state.*.outBuf, state.*.size << 1, &got) == -1 { return -1 }
+            state.*.have = @intCast(u32, got)
+            state.*.next = state.*.outBuf
+            return 0
+        } else if state.*.how == GZIP {
+            strm.*.avail_out = @intCast(u32, state.*.size << 1)
+            strm.*.next_out = state.*.outBuf
+            if gzDecomp(state) == -1 { return -1 }
+        }
+        if !(state.*.have == 0 && (state.*.eof == 0 || strm.*.avail_in != 0)) { break }
+    }
+    return 0
+}
+
+// Skips LEN bytes of output (a pending seek).
+fn gzSkip(state: *GzState, len0: i64) -> i32 {
+    var len = len0
+    while len != 0 {
+        if state.*.have != 0 {
+            const n: u32 = if @intCast(i64, state.*.have) > len { @intCast(u32, len) } else { state.*.have }
+            state.*.have -= n
+            state.*.next += @intCast(usize, n)
+            state.*.pos += @intCast(i64, n)
+            len -= @intCast(i64, n)
+        } else if state.*.eof != 0 && state.*.strm.avail_in == 0 {
+            break
+        } else {
+            if gzFetch(state) == -1 { return -1 }
+        }
+    }
+    return 0
+}
+
+// Reads LEN bytes (or what is left) into BUF; how many.
+fn gzRead(state: *GzState, buf0: usize, len0: usize) -> usize {
+    if len0 == 0 { return 0 }
+    var buf = buf0
+    var len = len0
+    if state.*.seek != 0 {
+        state.*.seek = 0
+        if gzSkip(state, state.*.skip) == -1 { return 0 }
+    }
+    var got: usize = 0
+    while true {
+        var n: usize = 0xffffffff
+        if n > len { n = len }
+        if state.*.have != 0 {
+            if @intCast(usize, state.*.have) < n { n = @intCast(usize, state.*.have) }
+            c.copy(buf, state.*.next, n)
+            state.*.next += n
+            state.*.have -= @intCast(u32, n)
+        } else if state.*.eof != 0 && state.*.strm.avail_in == 0 {
+            state.*.past = 1
+            break
+        } else if state.*.how == LOOK || n < (state.*.size << 1) {
+            if gzFetch(state) == -1 { return 0 }
+            continue
+        } else if state.*.how == COPY {
+            var read_: usize = 0
+            if gzLoad(state, buf, n, &read_) == -1 { return 0 }
+            n = read_
+        } else {
+            state.*.strm.avail_out = @intCast(u32, n)
+            state.*.strm.next_out = buf
+            if gzDecomp(state) == -1 { return 0 }
+            n = @intCast(usize, state.*.have)
+            state.*.have = 0
+        }
+        len -= n
+        buf += n
+        got += n
+        state.*.pos += @intCast(i64, n)
+        if len == 0 { break }
+    }
+    return got
+}
+
+fn readable(file: usize) -> bool {
+    if file == 0 { return false }
+    const state = stateOf(file)
+    return state.*.mode == GZ_READ && (state.*.err == c.Z_OK || state.*.err == c.Z_BUF_ERROR)
+}
+
+pub fn gzreadImpl(file: usize, buf: usize, len: u32) -> i32 {
+    if !readable(file) { return -1 }
+    const state = stateOf(file)
+    if len >= 0x80000000 {
+        gzError(state, c.Z_STREAM_ERROR, c.literal("request does not fit in an int"))
+        return -1
+    }
+    const got = gzRead(state, buf, @intCast(usize, len))
+    if got == 0 && state.*.err != c.Z_OK && state.*.err != c.Z_BUF_ERROR { return -1 }
+    return @intCast(i32, got)
+}
+
+pub fn gzfreadImpl(buf: usize, size: usize, nitems: usize, file: usize) -> usize {
+    if !readable(file) { return 0 }
+    const state = stateOf(file)
+    const len = nitems *% size
+    if size != 0 && len / size != nitems {
+        gzError(state, c.Z_STREAM_ERROR, c.literal("request does not fit in a size_t"))
+        return 0
+    }
+    return if len != 0 { gzRead(state, buf, len) / size } else { 0 }
+}
+
+pub fn gzgetcImpl(file: usize) -> i32 {
+    if !readable(file) { return -1 }
+    const state = stateOf(file)
+    if state.*.have != 0 {
+        state.*.have -= 1
+        state.*.pos += 1
+        const byte = c.get8(state.*.next)
+        state.*.next += 1
+        return @intCast(i32, byte)
+    }
+    var buf: u64 = 0
+    return if gzRead(state, @intFromPtr(&buf), 1) < 1 { -1 } else { @intCast(i32, buf & 255) }
+}
+
+pub fn gzungetcImpl(ch: i32, file: usize) -> i32 {
+    if file == 0 { return -1 }
+    const state = stateOf(file)
+    if state.*.mode == GZ_READ && state.*.how == LOOK && state.*.have == 0 { _ = gzLook(state) }
+    if !readable(file) { return -1 }
+    if state.*.seek != 0 {
+        state.*.seek = 0
+        if gzSkip(state, state.*.skip) == -1 { return -1 }
+    }
+    if ch < 0 { return -1 }
+    if state.*.have == 0 {
+        state.*.have = 1
+        state.*.next = state.*.outBuf + (state.*.size << 1) - 1
+        c.put8(state.*.next, @intCast(usize, ch) & 255)
+        state.*.pos -= 1
+        state.*.past = 0
+        return ch
+    }
+    if @intCast(usize, state.*.have) == (state.*.size << 1) {
+        gzError(state, c.Z_DATA_ERROR, c.literal("out of room to push characters"))
+        return -1
+    }
+    if state.*.next == state.*.outBuf {
+        // Slide the output data to the end of the buffer.
+        const count = @intCast(usize, state.*.have)
+        const dest = state.*.outBuf + (state.*.size << 1) - count
+        c.move(dest, state.*.outBuf, count)
+        state.*.next = dest
+    }
+    state.*.have += 1
+    state.*.next -= 1
+    c.put8(state.*.next, @intCast(usize, ch) & 255)
+    state.*.pos -= 1
+    state.*.past = 0
+    return ch
+}
+
+pub fn gzgetsImpl(file: usize, buf0: usize, len: i32) -> usize {
+    if file == 0 || buf0 == 0 || len < 1 { return 0 }
+    if !readable(file) { return 0 }
+    const state = stateOf(file)
+    if state.*.seek != 0 {
+        state.*.seek = 0
+        if gzSkip(state, state.*.skip) == -1 { return 0 }
+    }
+    var buf = buf0
+    var left = @intCast(usize, len) - 1
+    if left != 0 {
+        while true {
+            if state.*.have == 0 && gzFetch(state) == -1 { return 0 }
+            if state.*.have == 0 {
+                state.*.past = 1
+                break
+            }
+            var n: usize = if @intCast(usize, state.*.have) > left { left } else { @intCast(usize, state.*.have) }
+            const eol = memchr(state.*.next, 10, n)
+            if eol != 0 { n = eol - state.*.next + 1 }
+            c.copy(buf, state.*.next, n)
+            state.*.have -= @intCast(u32, n)
+            state.*.next += n
+            state.*.pos += @intCast(i64, n)
+            left -= n
+            buf += n
+            if !(left != 0 && eol == 0) { break }
+        }
+    }
+    if buf == buf0 { return 0 }
+    c.put8(buf, 0)
+    return buf0
+}
+
+pub fn gzdirectImpl(file: usize) -> i32 {
+    if file == 0 { return 0 }
+    const state = stateOf(file)
+    if state.*.mode == GZ_READ && state.*.how == LOOK && state.*.have == 0 { _ = gzLook(state) }
+    return state.*.direct
+}
+
+pub fn gzcloseRImpl(file: usize) -> i32 {
+    if file == 0 { return c.Z_STREAM_ERROR }
+    const state = stateOf(file)
+    if state.*.mode != GZ_READ { return c.Z_STREAM_ERROR }
+    if state.*.size != 0 {
+        _ = inflate.end(strmOf(state))
+        c.rawFree(state.*.outBuf)
+        c.rawFree(state.*.inBuf)
+    }
+    const err = if state.*.err == c.Z_BUF_ERROR { c.Z_BUF_ERROR } else { c.Z_OK }
+    gzError(state, c.Z_OK, 0)
+    c.rawFree(state.*.path)
+    const ret = close(state.*.fd)
+    c.rawFree(file)
+    return if ret != 0 { c.Z_ERRNO } else { err }
+}
+
+// ---------------------------------------------------------------------------
+// Writing
+
+// The buffers and the deflate stream of a file being written.
+fn gzInit(state: *GzState) -> i32 {
+    const strm = &state.*.strm
+    state.*.inBuf = c.rawAlloc(state.*.want << 1)
+    if state.*.inBuf == 0 {
+        gzError(state, c.Z_MEM_ERROR, c.literal("out of memory"))
+        return -1
+    }
+    if state.*.direct == 0 {
+        state.*.outBuf = c.rawAlloc(state.*.want)
+        if state.*.outBuf == 0 {
+            c.rawFree(state.*.inBuf)
+            gzError(state, c.Z_MEM_ERROR, c.literal("out of memory"))
+            return -1
+        }
+        strm.*.zalloc = 0
+        strm.*.zfree = 0
+        strm.*.opaque = 0
+        const ret = deflate.init2(strmOf(state), state.*.level, c.Z_DEFLATED, c.MAX_WBITS + 16, c.DEF_MEM_LEVEL, state.*.strategy, c.literal(c.VERSION), c.STREAM_SIZE)
+        if ret != c.Z_OK {
+            c.rawFree(state.*.outBuf)
+            c.rawFree(state.*.inBuf)
+            gzError(state, c.Z_MEM_ERROR, c.literal("out of memory"))
+            return -1
+        }
+        strm.*.next_in = 0
+    }
+    state.*.size = state.*.want
+    if state.*.direct == 0 {
+        strm.*.avail_out = @intCast(u32, state.*.size)
+        strm.*.next_out = state.*.outBuf
+        state.*.next = strm.*.next_out
+    }
+    return 0
+}
+
+// Compresses the input at next_in and writes the output to the file;
+// with Z_FINISH the member ends (another begins with more data).
+fn gzComp(state: *GzState, flush: i32) -> i32 {
+    const max: usize = 0x40000000
+    const strm = &state.*.strm
+    if state.*.size == 0 && gzInit(state) == -1 { return -1 }
+    if state.*.direct != 0 {
+        while strm.*.avail_in != 0 {
+            const put = if @intCast(usize, strm.*.avail_in) > max { max } else { @intCast(usize, strm.*.avail_in) }
+            const writ = write(state.*.fd, strm.*.next_in, put)
+            if writ < 0 {
+                gzError(state, c.Z_ERRNO, errnoMessage())
+                return -1
+            }
+            strm.*.avail_in = @intCast(u32, @intCast(usize, strm.*.avail_in) - @intCast(usize, writ))
+            strm.*.next_in += @intCast(usize, writ)
+        }
+        return 0
+    }
+    if state.*.reset != 0 {
+        if strm.*.avail_in == 0 { return 0 }
+        _ = deflate.reset(strmOf(state))
+        state.*.reset = 0
+    }
+    var ret = c.Z_OK
+    while true {
+        if strm.*.avail_out == 0 || (flush != c.Z_NO_FLUSH && (flush != c.Z_FINISH || ret == c.Z_STREAM_END)) {
+            while strm.*.next_out > state.*.next {
+                const pendingOut = strm.*.next_out - state.*.next
+                const put = if pendingOut > max { max } else { pendingOut }
+                const writ = write(state.*.fd, state.*.next, put)
+                if writ < 0 {
+                    gzError(state, c.Z_ERRNO, errnoMessage())
+                    return -1
+                }
+                state.*.next += @intCast(usize, writ)
+            }
+            if strm.*.avail_out == 0 {
+                strm.*.avail_out = @intCast(u32, state.*.size)
+                strm.*.next_out = state.*.outBuf
+                state.*.next = state.*.outBuf
+            }
+        }
+        var have = @intCast(usize, strm.*.avail_out)
+        ret = deflate.run(strmOf(state), flush)
+        if ret == c.Z_STREAM_ERROR {
+            gzError(state, c.Z_STREAM_ERROR, c.literal("internal error: deflate stream corrupt"))
+            return -1
+        }
+        have -= @intCast(usize, strm.*.avail_out)
+        if have == 0 { break }
+    }
+    if flush == c.Z_FINISH { state.*.reset = 1 }
+    return 0
+}
+
+// LEN zeros (a forward seek while writing).
+fn gzZero(state: *GzState, len0: i64) -> i32 {
+    const strm = &state.*.strm
+    if strm.*.avail_in != 0 && gzComp(state, c.Z_NO_FLUSH) == -1 { return -1 }
+    var first = true
+    var len = len0
+    while len != 0 {
+        const n: usize = if @intCast(i64, state.*.size) > len { @intCast(usize, len) } else { state.*.size }
+        if first {
+            c.zero(state.*.inBuf, n)
+            first = false
+        }
+        strm.*.avail_in = @intCast(u32, n)
+        strm.*.next_in = state.*.inBuf
+        state.*.pos += @intCast(i64, n)
+        if gzComp(state, c.Z_NO_FLUSH) == -1 { return -1 }
+        len -= @intCast(i64, n)
+    }
+    return 0
+}
+
+fn gzWrite(state: *GzState, buf0: usize, len0: usize) -> usize {
+    if len0 == 0 { return 0 }
+    var buf = buf0
+    var len = len0
+    const put = len
+    if state.*.size == 0 && gzInit(state) == -1 { return 0 }
+    if state.*.seek != 0 {
+        state.*.seek = 0
+        if gzZero(state, state.*.skip) == -1 { return 0 }
+    }
+    const strm = &state.*.strm
+    if len < state.*.size {
+        // Into the input buffer, compressed when it is full.
+        while true {
+            if strm.*.avail_in == 0 { strm.*.next_in = state.*.inBuf }
+            const have = strm.*.next_in + @intCast(usize, strm.*.avail_in) - state.*.inBuf
+            var copy = state.*.size - have
+            if copy > len { copy = len }
+            c.copy(state.*.inBuf + have, buf, copy)
+            strm.*.avail_in = @intCast(u32, @intCast(usize, strm.*.avail_in) + copy)
+            state.*.pos += @intCast(i64, copy)
+            buf += copy
+            len -= copy
+            if len != 0 && gzComp(state, c.Z_NO_FLUSH) == -1 { return 0 }
+            if len == 0 { break }
+        }
+    } else {
+        if strm.*.avail_in != 0 && gzComp(state, c.Z_NO_FLUSH) == -1 { return 0 }
+        strm.*.next_in = buf
+        while true {
+            var n: usize = 0xffffffff
+            if n > len { n = len }
+            strm.*.avail_in = @intCast(u32, n)
+            state.*.pos += @intCast(i64, n)
+            if gzComp(state, c.Z_NO_FLUSH) == -1 { return 0 }
+            len -= n
+            if len == 0 { break }
+        }
+    }
+    return put
+}
+
+fn writable(file: usize) -> bool {
+    if file == 0 { return false }
+    const state = stateOf(file)
+    return state.*.mode == GZ_WRITE && state.*.err == c.Z_OK
+}
+
+pub fn gzwriteImpl(file: usize, buf: usize, len: u32) -> i32 {
+    if !writable(file) { return 0 }
+    const state = stateOf(file)
+    if len >= 0x80000000 {
+        gzError(state, c.Z_DATA_ERROR, c.literal("requested length does not fit in int"))
+        return 0
+    }
+    return @intCast(i32, gzWrite(state, buf, @intCast(usize, len)))
+}
+
+pub fn gzfwriteImpl(buf: usize, size: usize, nitems: usize, file: usize) -> usize {
+    if !writable(file) { return 0 }
+    const state = stateOf(file)
+    const len = nitems *% size
+    if size != 0 && len / size != nitems {
+        gzError(state, c.Z_STREAM_ERROR, c.literal("request does not fit in a size_t"))
+        return 0
+    }
+    return if len != 0 { gzWrite(state, buf, len) / size } else { 0 }
+}
+
+pub fn gzputcImpl(file: usize, ch: i32) -> i32 {
+    if !writable(file) { return -1 }
+    const state = stateOf(file)
+    const strm = &state.*.strm
+    if state.*.seek != 0 {
+        state.*.seek = 0
+        if gzZero(state, state.*.skip) == -1 { return -1 }
+    }
+    if state.*.size != 0 {
+        if strm.*.avail_in == 0 { strm.*.next_in = state.*.inBuf }
+        const have = strm.*.next_in + @intCast(usize, strm.*.avail_in) - state.*.inBuf
+        if have < state.*.size {
+            c.put8(state.*.inBuf + have, @intCast(usize, ch) & 255)
+            strm.*.avail_in += 1
+            state.*.pos += 1
+            return ch & 255
+        }
+    }
+    var buf: u64 = @intCast(u64, @bitCast(u32, ch) & 255)
+    if gzWrite(state, @intFromPtr(&buf), 1) != 1 { return -1 }
+    return ch & 255
+}
+
+pub fn gzputsImpl(file: usize, text: usize) -> i32 {
+    if !writable(file) { return -1 }
+    const state = stateOf(file)
+    const len = c.cLength(text)
+    if len >= 0x80000000 {
+        gzError(state, c.Z_STREAM_ERROR, c.literal("string length does not fit in int"))
+        return -1
+    }
+    const put = gzWrite(state, text, len)
+    return if put < len { -1 } else { @intCast(i32, len) }
+}
+
+pub fn gzvprintfImpl(file: usize, format: usize, list: usize) -> i32 {
+    if file == 0 { return c.Z_STREAM_ERROR }
+    const state = stateOf(file)
+    const strm = &state.*.strm
+    if state.*.mode != GZ_WRITE || state.*.err != c.Z_OK { return c.Z_STREAM_ERROR }
+    if state.*.size == 0 && gzInit(state) == -1 { return state.*.err }
+    if state.*.seek != 0 {
+        state.*.seek = 0
+        if gzZero(state, state.*.skip) == -1 { return state.*.err }
+    }
+    // Into the input buffer, which has room for size bytes after what it
+    // holds (it is twice the size for this).
+    if strm.*.avail_in == 0 { strm.*.next_in = state.*.inBuf }
+    const next = state.*.inBuf + (strm.*.next_in - state.*.inBuf) + @intCast(usize, strm.*.avail_in)
+    c.put8(next + state.*.size - 1, 0)
+    const len = vsnprintf(next, state.*.size, format, list)
+    if len <= 0 || @intCast(usize, len) >= state.*.size || c.get8(next + state.*.size - 1) != 0 { return 0 }
+    strm.*.avail_in = @intCast(u32, @intCast(usize, strm.*.avail_in) + @intCast(usize, len))
+    state.*.pos += @intCast(i64, len)
+    if @intCast(usize, strm.*.avail_in) >= state.*.size {
+        const left = @intCast(usize, strm.*.avail_in) - state.*.size
+        strm.*.avail_in = @intCast(u32, state.*.size)
+        if gzComp(state, c.Z_NO_FLUSH) == -1 { return state.*.err }
+        c.move(state.*.inBuf, state.*.inBuf + state.*.size, left)
+        strm.*.next_in = state.*.inBuf
+        strm.*.avail_in = @intCast(u32, left)
+    }
+    return len
+}
+
+pub fn gzflushImpl(file: usize, flush: i32) -> i32 {
+    if !writable(file) { return c.Z_STREAM_ERROR }
+    const state = stateOf(file)
+    if flush < 0 || flush > c.Z_FINISH { return c.Z_STREAM_ERROR }
+    if state.*.seek != 0 {
+        state.*.seek = 0
+        if gzZero(state, state.*.skip) == -1 { return state.*.err }
+    }
+    _ = gzComp(state, flush)
+    return state.*.err
+}
+
+pub fn gzsetparamsImpl(file: usize, level: i32, strategy: i32) -> i32 {
+    if file == 0 { return c.Z_STREAM_ERROR }
+    const state = stateOf(file)
+    const strm = &state.*.strm
+    if state.*.mode != GZ_WRITE || state.*.err != c.Z_OK || state.*.direct != 0 { return c.Z_STREAM_ERROR }
+    if level == state.*.level && strategy == state.*.strategy { return c.Z_OK }
+    if state.*.seek != 0 {
+        state.*.seek = 0
+        if gzZero(state, state.*.skip) == -1 { return state.*.err }
+    }
+    if state.*.size != 0 {
+        if strm.*.avail_in != 0 && gzComp(state, c.Z_BLOCK) == -1 { return state.*.err }
+        _ = deflate.params(strmOf(state), level, strategy)
+    }
+    state.*.level = level
+    state.*.strategy = strategy
+    return c.Z_OK
+}
+
+pub fn gzcloseWImpl(file: usize) -> i32 {
+    if file == 0 { return c.Z_STREAM_ERROR }
+    const state = stateOf(file)
+    if state.*.mode != GZ_WRITE { return c.Z_STREAM_ERROR }
+    var ret = c.Z_OK
+    if state.*.seek != 0 {
+        state.*.seek = 0
+        if gzZero(state, state.*.skip) == -1 { ret = state.*.err }
+    }
+    if gzComp(state, c.Z_FINISH) == -1 { ret = state.*.err }
+    if state.*.size != 0 {
+        if state.*.direct == 0 {
+            _ = deflate.end(strmOf(state))
+            c.rawFree(state.*.outBuf)
+        }
+        c.rawFree(state.*.inBuf)
+    }
+    gzError(state, c.Z_OK, 0)
+    c.rawFree(state.*.path)
+    if close(state.*.fd) == -1 { ret = c.Z_ERRNO }
+    c.rawFree(file)
+    return ret
+}
+
+pub fn gzcloseImpl(file: usize) -> i32 {
+    if file == 0 { return c.Z_STREAM_ERROR }
+    return if stateOf(file).*.mode == GZ_READ { gzcloseRImpl(file) } else { gzcloseWImpl(file) }
+}
+
+// ---------------------------------------------------------------------------
+
+export fn gzopen(path: usize, mode: usize) -> usize { return gzOpen(path, -1, mode) }
+export fn gzopen64(path: usize, mode: usize) -> usize { return gzOpen(path, -1, mode) }
+export fn gzdopen(fd: i32, mode: usize) -> usize { return gzdopenImpl(fd, mode) }
+export fn gzbuffer(file: usize, size: u32) -> i32 { return gzbufferImpl(file, size) }
+export fn gzsetparams(file: usize, level: i32, strategy: i32) -> i32 { return gzsetparamsImpl(file, level, strategy) }
+export fn gzread(file: usize, buf: usize, len: u32) -> i32 { return gzreadImpl(file, buf, len) }
+export fn gzfread(buf: usize, size: usize, nitems: usize, file: usize) -> usize { return gzfreadImpl(buf, size, nitems, file) }
+export fn gzwrite(file: usize, buf: usize, len: u32) -> i32 { return gzwriteImpl(file, buf, len) }
+export fn gzfwrite(buf: usize, size: usize, nitems: usize, file: usize) -> usize { return gzfwriteImpl(buf, size, nitems, file) }
+export fn gzputs(file: usize, s: usize) -> i32 { return gzputsImpl(file, s) }
+export fn gzgets(file: usize, buf: usize, len: i32) -> usize { return gzgetsImpl(file, buf, len) }
+export fn gzputc(file: usize, ch: i32) -> i32 { return gzputcImpl(file, ch) }
+export fn gzgetc(file: usize) -> i32 { return gzgetcImpl(file) }
+export fn gzgetc_(file: usize) -> i32 { return gzgetcImpl(file) }
+export fn gzungetc(ch: i32, file: usize) -> i32 { return gzungetcImpl(ch, file) }
+export fn gzflush(file: usize, flush: i32) -> i32 { return gzflushImpl(file, flush) }
+export fn gzseek(file: usize, offset: i64, whence: i32) -> i64 { return gzseekImpl(file, offset, whence) }
+export fn gzseek64(file: usize, offset: i64, whence: i32) -> i64 { return gzseekImpl(file, offset, whence) }
+export fn gzrewind(file: usize) -> i32 { return gzrewindImpl(file) }
+export fn gztell(file: usize) -> i64 { return gztellImpl(file) }
+export fn gztell64(file: usize) -> i64 { return gztellImpl(file) }
+export fn gzoffset(file: usize) -> i64 { return gzoffsetImpl(file) }
+export fn gzoffset64(file: usize) -> i64 { return gzoffsetImpl(file) }
+export fn gzeof(file: usize) -> i32 { return gzeofImpl(file) }
+export fn gzdirect(file: usize) -> i32 { return gzdirectImpl(file) }
+export fn gzclose(file: usize) -> i32 { return gzcloseImpl(file) }
+export fn gzclose_r(file: usize) -> i32 { return gzcloseRImpl(file) }
+export fn gzclose_w(file: usize) -> i32 { return gzcloseWImpl(file) }
+export fn gzerror(file: usize, errnum: usize) -> usize { return gzerrorImpl(file, errnum) }
+export fn gzclearerr(file: usize) -> void { gzclearerrImpl(file) }
+export fn gzvprintf(file: usize, format: usize, va: usize) -> i32 { return gzvprintfImpl(file, format, va) }
+
+export fn gzprintf(file: usize, format: usize, a2: usize, a3: usize, a4: usize, a5: usize, x0: f64, x1: f64, x2: f64, x3: f64, x4: f64, x5: f64, x6: f64, x7: f64) -> i32 {
+    var call: varargs.CallList = undefined
+    var words: [6]usize = [6]usize{ file, format, a2, a3, a4, a5 }
+    var doubles: [8]f64 = [8]f64{ x0, x1, x2, x3, x4, x5, x6, x7 }
+    const list = varargs.start(&call, 2, @frameAddress(), @intFromPtr(&words), @intFromPtr(&doubles))
+    return gzvprintfImpl(file, format, list)
+}
