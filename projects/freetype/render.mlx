@@ -1,0 +1,1030 @@
+// Rendering outlines into bitmaps: FreeType's anti-aliasing rasterizer
+// (its "smooth" module, ftgrays.c), computed as it computes it: the
+// outline is cut into cells of one pixel, each with the area its edges
+// cover and the height they cross, then swept row by row into coverage
+// (nonzero or even-odd), into a bitmap or as spans to a callback. The
+// slot's bitmap is sized as FreeType sizes it (ft_glyphslot_preset_bitmap),
+// for gray, LCD (three samples a pixel, filtered by the library's or the
+// face's five-tap filter or the legacy one) and monochrome images (the
+// "raster" module's rasterizer, raster.mlx).
+const m = @import("./memory.mlx")
+const r = @import("./records.mlx")
+const o = @import("./objects.mlx")
+const calc = @import("./calc.mlx")
+const library = @import("./library.mlx")
+const outlines = @import("./outlines.mlx")
+const raster = @import("./raster.mlx")
+
+// ---------------------------------------------------------------------------
+// The rasterizer's cells and its worker.
+//
+// Coordinates are in 1/256 pixel (an outline's 26.6 coordinates times 4).
+// A cell: x, cover, area (32-bit values as C's int has them) and the
+// index of the next cell of its row, 16 bytes.
+
+const PIXEL_BITS: i64 = 8
+const ONE_PIXEL: i64 = 256
+const POOL_CELLS: i64 = 1024
+const MAX_SPANS: i64 = 16
+const INT_MIN: i64 = -2147483648
+
+// What the sweep does with the coverage: writes the bitmap, gives spans
+// to the C callback of FT_Raster_Params, or adds 4x4 oversampled spans
+// into the bitmap (an outline whose contours overlap).
+const TO_BITMAP: i64 = 0
+const TO_CALLBACK: i64 = 1
+const TO_OVERLAP: i64 = 2
+
+const Worker = struct {
+    minEx: i64
+    maxEx: i64
+    minEy: i64
+    maxEy: i64
+    countEy: i64
+    // The current cell, the next free one, and the null cell (the end of
+    // every row's list; its x is the largest).
+    cell: i64
+    cellFree: i64
+    cellNull: i64
+    cells: usize
+    ycells: usize
+    x: i64
+    y: i64
+    // The pool ran out: the band is bisected and rendered again.
+    overflow: bool
+    outline: usize
+    outlineFlags: i64
+    origin: usize
+    pitch: i64
+    target: i64
+    spanFunc: usize
+    spanUser: usize
+    spans: usize
+}
+
+fn worker(address: usize) -> *Worker { unsafe { return @ptrFromInt(*Worker, address) } }
+
+fn cellAddress(w: *Worker, c: i64) -> usize { return w.*.cells + @intCast(usize, c) * 16 }
+fn cellX(w: *Worker, c: i64) -> i64 { return @intCast(i64, m.getI32(cellAddress(w, c))) }
+fn cellCover(w: *Worker, c: i64) -> i64 { return @intCast(i64, m.getI32(cellAddress(w, c) + 4)) }
+fn cellArea(w: *Worker, c: i64) -> i64 { return @intCast(i64, m.getI32(cellAddress(w, c) + 8)) }
+fn cellNext(w: *Worker, c: i64) -> i64 { return @intCast(i64, m.getI32(cellAddress(w, c) + 12)) }
+fn ycell(w: *Worker, i: i64) -> i64 { return @intCast(i64, m.getI32(w.*.ycells + @intCast(usize, i) * 4)) }
+fn setYcell(w: *Worker, i: i64, c: i64) -> void { m.putI32(w.*.ycells + @intCast(usize, i) * 4, @intCast(i32, c)) }
+
+fn trunc(x: i64) -> i64 { return calc.low32(x >> 8) }
+fn fract(x: i64) -> i64 { return x & 255 }
+
+// FreeType's FT_INTEGRATE: cover += a, area += a * b, as C's int.
+fn integrate(w: *Worker, a: i64, b: i64) -> void {
+    const at = cellAddress(w, w.*.cell)
+    m.putI32(at + 4, @intCast(i32, calc.low32(@intCast(i64, m.getI32(at + 4)) +% a)))
+    m.putI32(at + 8, @intCast(i32, calc.low32(@intCast(i64, m.getI32(at + 8)) +% calc.low32(a *% b))))
+}
+
+// Makes the cell (ex, ey) current (FreeType's gray_set_cell); cells out
+// of the band, or right of the clip box, go to the null cell.
+fn setCell(w: *Worker, ex_: i64, ey: i64) -> void {
+    const index = ey - w.*.minEy
+    if index < 0 || index >= w.*.countEy || ex_ >= w.*.maxEx {
+        w.*.cell = w.*.cellNull
+        return
+    }
+    const ex = if ex_ < w.*.minEx - 1 { w.*.minEx - 1 } else { ex_ }
+    // (The row's list, sorted by x: `previous` is the cell before, -1 for
+    // the row's head.)
+    var previous: i64 = -1
+    var c = ycell(w, index)
+    while true {
+        const x = cellX(w, c)
+        if x > ex { break }
+        if x == ex {
+            w.*.cell = c
+            return
+        }
+        previous = c
+        c = cellNext(w, c)
+    }
+    const fresh = w.*.cellFree
+    if fresh >= w.*.cellNull {
+        w.*.overflow = true
+        w.*.cell = w.*.cellNull
+        return
+    }
+    w.*.cellFree += 1
+    const at = cellAddress(w, fresh)
+    m.putI32(at, @intCast(i32, ex))
+    m.putI32(at + 4, 0)
+    m.putI32(at + 8, 0)
+    m.putI32(at + 12, @intCast(i32, c))
+    if previous < 0 {
+        setYcell(w, index, fresh)
+    } else {
+        m.putI32(cellAddress(w, previous) + 12, @intCast(i32, fresh))
+    }
+    w.*.cell = fresh
+}
+
+// FreeType's FT_UDIV: a times the reciprocal 0xFFFFFFFF / b, high half.
+fn udiv(a: i64, reciprocal: i64) -> i64 { return calc.low32(@bitCast(i64, (@bitCast(u64, a) *% @bitCast(u64, reciprocal)) >> 32)) }
+
+// A line from the current position to (toX, toY), cell by cell
+// (FreeType's gray_render_line for 64-bit integers).
+fn renderLine(w: *Worker, toX: i64, toY: i64) -> void {
+    var ey1 = trunc(w.*.y)
+    const ey2 = trunc(toY)
+    if (ey1 >= w.*.maxEy && ey2 >= w.*.maxEy) || (ey1 < w.*.minEy && ey2 < w.*.minEy) {
+        w.*.x = toX
+        w.*.y = toY
+        return
+    }
+    var ex1 = trunc(w.*.x)
+    const ex2 = trunc(toX)
+    var fx1 = fract(w.*.x)
+    var fy1 = fract(w.*.y)
+    const dx = toX -% w.*.x
+    const dy = toY -% w.*.y
+    if ex1 == ex2 && ey1 == ey2 {
+        // (Within one cell.)
+    } else if dy == 0 {
+        setCell(w, ex2, ey2)
+        w.*.x = toX
+        w.*.y = toY
+        return
+    } else if dx == 0 {
+        if dy > 0 {
+            while true {
+                integrate(w, ONE_PIXEL - fy1, fx1 * 2)
+                fy1 = 0
+                ey1 += 1
+                setCell(w, ex1, ey1)
+                if ey1 == ey2 { break }
+            }
+        } else {
+            while true {
+                integrate(w, 0 - fy1, fx1 * 2)
+                fy1 = ONE_PIXEL
+                ey1 -= 1
+                setCell(w, ex1, ey1)
+                if ey1 == ey2 { break }
+            }
+        }
+    } else {
+        var prod = dx *% fy1 -% dy *% fx1
+        const dxr: i64 = if ex1 != ex2 { 0xFFFFFFFF / dx } else { 0 }
+        const dyr: i64 = if ey1 != ey2 { 0xFFFFFFFF / dy } else { 0 }
+        while true {
+            if prod -% dx *% ONE_PIXEL > 0 && prod <= 0 {
+                // (Out through the left side.)
+                const fx2: i64 = 0
+                const fy2 = udiv(0 -% prod, 0 -% dxr)
+                prod = prod -% dy *% ONE_PIXEL
+                integrate(w, fy2 - fy1, fx1 + fx2)
+                fx1 = ONE_PIXEL
+                fy1 = fy2
+                ex1 -= 1
+            } else if prod -% dx *% ONE_PIXEL +% dy *% ONE_PIXEL > 0 && prod -% dx *% ONE_PIXEL <= 0 {
+                // (Through the top.)
+                prod = prod -% dx *% ONE_PIXEL
+                const fx2 = udiv(0 -% prod, dyr)
+                const fy2 = ONE_PIXEL
+                integrate(w, fy2 - fy1, fx1 + fx2)
+                fx1 = fx2
+                fy1 = 0
+                ey1 += 1
+            } else if prod +% dy *% ONE_PIXEL >= 0 && prod -% dx *% ONE_PIXEL +% dy *% ONE_PIXEL <= 0 {
+                // (Through the right side.)
+                prod = prod +% dy *% ONE_PIXEL
+                const fx2 = ONE_PIXEL
+                const fy2 = udiv(prod, dxr)
+                integrate(w, fy2 - fy1, fx1 + fx2)
+                fx1 = 0
+                fy1 = fy2
+                ex1 += 1
+            } else {
+                // (Through the bottom.)
+                const fx2 = udiv(prod, 0 -% dyr)
+                const fy2: i64 = 0
+                prod = prod +% dx *% ONE_PIXEL
+                integrate(w, fy2 - fy1, fx1 + fx2)
+                fx1 = fx2
+                fy1 = ONE_PIXEL
+                ey1 -= 1
+            }
+            setCell(w, ex1, ey1)
+            if w.*.overflow { return }
+            if ex1 == ex2 && ey1 == ey2 { break }
+        }
+    }
+    const fx2 = fract(toX)
+    const fy2 = fract(toY)
+    integrate(w, fy2 - fy1, fx1 + fx2)
+    w.*.x = toX
+    w.*.y = toY
+}
+
+fn shiftLeft(a: i64, b: i64) -> i64 { return @bitCast(i64, @bitCast(u64, a) << @intCast(u6, b & 63)) }
+
+// A conic arc, as FreeType draws it on 64-bit machines: 2^shift lines
+// stepped by forward differences in 32.32 fixed point.
+fn renderConic(w: *Worker, cx: i64, cy: i64, toX: i64, toY: i64) -> void {
+    const p0x = w.*.x
+    const p0y = w.*.y
+    const p1x = cx * 4
+    const p1y = cy * 4
+    const p2x = toX * 4
+    const p2y = toY * 4
+    if (trunc(p0y) >= w.*.maxEy && trunc(p1y) >= w.*.maxEy && trunc(p2y) >= w.*.maxEy) || (trunc(p0y) < w.*.minEy && trunc(p1y) < w.*.minEy && trunc(p2y) < w.*.minEy) {
+        w.*.x = p2x
+        w.*.y = p2y
+        return
+    }
+    const bx = p1x -% p0x
+    const by = p1y -% p0y
+    const ax = p2x -% p1x -% bx
+    const ay = p2y -% p1y -% by
+    var dx = calc.abs(ax)
+    const dy = calc.abs(ay)
+    if dx < dy { dx = dy }
+    if dx <= ONE_PIXEL / 4 {
+        renderLine(w, p2x, p2y)
+        return
+    }
+    var shift: i64 = 0
+    while true {
+        dx >>= 2
+        shift += 1
+        if dx <= ONE_PIXEL / 4 { break }
+    }
+    const rx = shiftLeft(ax, 33 - 2 * shift)
+    const ry = shiftLeft(ay, 33 - 2 * shift)
+    var qx = shiftLeft(bx, 33 - shift) +% shiftLeft(ax, 32 - 2 * shift)
+    var qy = shiftLeft(by, 33 - shift) +% shiftLeft(ay, 32 - 2 * shift)
+    var ppx = shiftLeft(p0x, 32)
+    var ppy = shiftLeft(p0y, 32)
+    var count = shiftLeft(1, shift)
+    while count > 0 {
+        ppx = ppx +% qx
+        ppy = ppy +% qy
+        qx = qx +% rx
+        qy = qy +% ry
+        renderLine(w, ppx >> 32, ppy >> 32)
+        if w.*.overflow { return }
+        count -= 1
+    }
+}
+
+// A cubic arc, split in halves until flat enough (FreeType's
+// gray_render_cubic); `stack` holds 16 * 3 + 1 points.
+fn renderCubic(w: *Worker, stack: usize, c1x: i64, c1y: i64, c2x: i64, c2y: i64, toX: i64, toY: i64) -> void {
+    setPoint(stack, 0, toX * 4, toY * 4)
+    setPoint(stack, 1, c2x * 4, c2y * 4)
+    setPoint(stack, 2, c1x * 4, c1y * 4)
+    setPoint(stack, 3, w.*.x, w.*.y)
+    if (trunc(getY(stack, 0)) >= w.*.maxEy && trunc(getY(stack, 1)) >= w.*.maxEy && trunc(getY(stack, 2)) >= w.*.maxEy && trunc(getY(stack, 3)) >= w.*.maxEy) || (trunc(getY(stack, 0)) < w.*.minEy && trunc(getY(stack, 1)) < w.*.minEy && trunc(getY(stack, 2)) < w.*.minEy && trunc(getY(stack, 3)) < w.*.minEy) {
+        w.*.x = getX(stack, 0)
+        w.*.y = getY(stack, 0)
+        return
+    }
+    var arc: i64 = 0
+    while true {
+        const half = ONE_PIXEL / 2
+        const split = calc.abs(2 * getX(stack, arc) - 3 * getX(stack, arc + 1) + getX(stack, arc + 3)) > half || calc.abs(2 * getY(stack, arc) - 3 * getY(stack, arc + 1) + getY(stack, arc + 3)) > half || calc.abs(getX(stack, arc) - 3 * getX(stack, arc + 2) + 2 * getX(stack, arc + 3)) > half || calc.abs(getY(stack, arc) - 3 * getY(stack, arc + 2) + 2 * getY(stack, arc + 3)) > half
+        if split && arc < 45 {
+            splitCubic(stack, arc)
+            arc += 3
+            continue
+        }
+        renderLine(w, getX(stack, arc), getY(stack, arc))
+        if w.*.overflow { return }
+        if arc == 0 { return }
+        arc -= 3
+    }
+}
+
+fn getX(stack: usize, i: i64) -> i64 { return m.getI64(stack + @intCast(usize, i) * 16) }
+fn getY(stack: usize, i: i64) -> i64 { return m.getI64(stack + @intCast(usize, i) * 16 + 8) }
+fn setPoint(stack: usize, i: i64, x: i64, y: i64) -> void {
+    m.putI64(stack + @intCast(usize, i) * 16, x)
+    m.putI64(stack + @intCast(usize, i) * 16 + 8, y)
+}
+
+// FreeType's gray_split_cubic on the points from `i`.
+fn splitCubic(stack: usize, i: i64) -> void {
+    var k: usize = 0
+    while k < 2 {
+        const base = stack + @intCast(usize, i) * 16 + k * 8
+        const p0 = m.getI64(base)
+        const p1 = m.getI64(base + 16)
+        const p2 = m.getI64(base + 32)
+        const p3 = m.getI64(base + 48)
+        m.putI64(base + 96, p3)
+        var a = p0 + p1
+        const b = p1 + p2
+        var c = p2 + p3
+        m.putI64(base + 80, c >> 1)
+        c += b
+        m.putI64(base + 64, c >> 2)
+        m.putI64(base + 16, a >> 1)
+        a += b
+        m.putI64(base + 32, a >> 2)
+        m.putI64(base + 48, (a + c) >> 3)
+        k += 1
+    }
+}
+
+// The sink of the outline's walk.
+fn graySink(context: usize, kind: i64, x1: i64, y1: i64, x2: i64, y2: i64, x3: i64, y3: i64) -> i32 {
+    const w = worker(context)
+    if kind == outlines.MOVE {
+        const x = x1 * 4
+        const y = y1 * 4
+        setCell(w, trunc(x), trunc(y))
+        w.*.x = x
+        w.*.y = y
+    } else if kind == outlines.LINE {
+        renderLine(w, x1 * 4, y1 * 4)
+    } else if kind == outlines.CONIC {
+        renderConic(w, x1, y1, x2, y2)
+    } else {
+        renderCubic(w, context + @sizeOf(Worker), x1, y1, x2, y2, x3, y3)
+    }
+    return if w.*.overflow { r.ERR_RASTER_OVERFLOW } else { 0 }
+}
+
+// FreeType's FT_FILL_RULE: the coverage of an area (nonzero or even-odd).
+fn fillRule(area: i64, fill: i64) -> i64 {
+    var coverage = calc.low32(area >> 9)
+    if (coverage & fill) != 0 { coverage = ~coverage }
+    if coverage > 255 && (fill & INT_MIN) != 0 { coverage = 255 }
+    return coverage
+}
+
+fn gray(w: *Worker, x: i64, y: i64, count: i64, coverage: i64, n: i64) -> i64 {
+    if w.*.target == TO_BITMAP {
+        if count > 0 {
+            const line = @bitCast(usize, @bitCast(i64, w.*.origin) -% w.*.pitch *% y)
+            var i: i64 = 0
+            const value = @intCast(u8, coverage & 255)
+            while i < count {
+                m.put8(@bitCast(usize, @bitCast(i64, line) + x + i), value)
+                i += 1
+            }
+        }
+        return n
+    }
+    // FT_Span: x (16-bit), len (16-bit unsigned), coverage (byte).
+    const at = w.*.spans + @intCast(usize, n) * 6
+    m.putI16(at, @intCast(i16, calc.low16(x)))
+    m.put16(at + 2, @intCast(u16, count & 0xFFFF))
+    m.put8(at + 4, @intCast(u8, coverage & 255))
+    if n + 1 == MAX_SPANS {
+        emit(w, y, n + 1)
+        return 0
+    }
+    return n + 1
+}
+
+pub const SpanFunc = fn(i32, i32, usize, usize) -> void
+
+fn emit(w: *Worker, y: i64, n: i64) -> void {
+    if w.*.target == TO_CALLBACK {
+        const call: SpanFunc = unsafe { @ptrFromInt(SpanFunc, w.*.spanFunc) }
+        call(@intCast(i32, calc.low32(y)), @intCast(i32, n), w.*.spans, w.*.spanUser)
+        return
+    }
+    // (Oversampled spans, averaged into the bitmap: FreeType's
+    // ft_smooth_overlap_spans.)
+    const dst = @bitCast(usize, @bitCast(i64, w.*.origin) -% (y / 4) *% w.*.pitch)
+    var i: i64 = 0
+    while i < n {
+        const at = w.*.spans + @intCast(usize, i) * 6
+        const sx = @intCast(i64, m.getI16(at))
+        const len = @intCast(i64, m.get16(at + 2))
+        const cover = (@intCast(i64, m.get8(at + 4)) + 8) / 16
+        var k: i64 = 0
+        while k < len {
+            const p = @bitCast(usize, @bitCast(i64, dst) + (sx + k) / 4)
+            const sum = @intCast(i64, m.get8(p)) + cover
+            m.put8(p, @intCast(u8, (sum - (sum >> 8)) & 255))
+            k += 1
+        }
+        i += 1
+    }
+}
+
+// The rows of the band into coverage (FreeType's gray_sweep and
+// gray_sweep_direct).
+fn sweep(w: *Worker) -> void {
+    const fill: i64 = if (w.*.outlineFlags & @intCast(i64, r.OUTLINE_EVEN_ODD_FILL)) != 0 { 0x100 } else { INT_MIN }
+    var y = w.*.minEy
+    while y < w.*.maxEy {
+        var c = ycell(w, y - w.*.minEy)
+        var x = w.*.minEx
+        var cover: i64 = 0
+        var n: i64 = 0
+        while c != w.*.cellNull {
+            const cx = cellX(w, c)
+            if cover != 0 && cx > x { n = gray(w, x, y, cx - x, fillRule(cover, fill), n) }
+            cover = calc.low32(cover +% cellCover(w, c) *% (ONE_PIXEL * 2))
+            const area = calc.low32(cover -% cellArea(w, c))
+            if area != 0 && cx >= w.*.minEx { n = gray(w, cx, y, 1, fillRule(area, fill), n) }
+            x = cx + 1
+            c = cellNext(w, c)
+        }
+        if cover != 0 { n = gray(w, x, y, w.*.maxEx - x, fillRule(cover, fill), n) }
+        if n > 0 && w.*.target != TO_BITMAP { emit(w, y, n) }
+        y += 1
+    }
+}
+
+// Renders the outline in bands (FreeType's gray_convert_glyph): bands of
+// at most 128 rows, each with FreeType's pool of 1024 cells of which the
+// row heads take their share; a band whose cells overflow it is bisected
+// (its lower half first), so that spans come in FreeType's order.
+fn convert(w: *Worker) -> i32 {
+    const yMin = w.*.minEy
+    const yMax = w.*.maxEy
+    var height = yMax - yMin
+    var n: i64 = POOL_CELLS / 8
+    if height > n {
+        n = (height + n - 1) / n
+        height = (height + n - 1) / n
+    }
+    // The bands' bounds: the band rendered is [bounds[k + 1], bounds[k]).
+    var bounds: [34]i64 = undefined
+    var y = yMin
+    while y < yMax {
+        const start = y
+        y += height
+        bounds[0] = if y < yMax { y } else { yMax }
+        bounds[1] = start
+        var k: i64 = 0
+        while k >= 0 {
+            var width = bounds[@intCast(usize, k)] - bounds[@intCast(usize, k + 1)]
+            var i: i64 = 0
+            while i < width {
+                setYcell(w, i, w.*.cellNull)
+                i += 1
+            }
+            w.*.cellFree = (width * 8 + 15) / 16
+            w.*.cell = w.*.cellNull
+            w.*.minEy = bounds[@intCast(usize, k + 1)]
+            w.*.maxEy = bounds[@intCast(usize, k)]
+            w.*.countEy = width
+            w.*.overflow = false
+            const err = outlines.decompose(w.*.outline, 0, 0, graySink, @intFromPtr(w))
+            if err == r.OK && !w.*.overflow {
+                sweep(w)
+                k -= 1
+                continue
+            }
+            if err != r.ERR_RASTER_OVERFLOW && !w.*.overflow { return err }
+            width >>= 1
+            if width == 0 || k >= 31 { return r.ERR_RASTER_OVERFLOW }
+            k += 1
+            bounds[@intCast(usize, k + 1)] = bounds[@intCast(usize, k)]
+            bounds[@intCast(usize, k)] += width
+        }
+    }
+    return r.OK
+}
+
+// FT_Raster_Params: target, source, flags, gray_spans, black_spans,
+// bit_test, bit_set, user, clip_box.
+const RASTER_FLAG_AA: i64 = 0x1
+const RASTER_FLAG_DIRECT: i64 = 0x2
+const RASTER_FLAG_CLIP: i64 = 0x4
+const RASTER_FLAG_SDF: i64 = 0x8
+
+// The anti-aliasing rasterizer (FreeType's gray_raster_render) on
+// FT_Raster_Params, or with the spans of `target` (TO_OVERLAP) into
+// `bitmap` within a clip box.
+fn grayRender(outline: usize, flags: i64, bitmap: usize, spanFunc: usize, user: usize, target: i64, clipXMin: i64, clipYMin: i64, clipXMax: i64, clipYMax: i64) -> i32 {
+    if (flags & RASTER_FLAG_AA) == 0 { return r.ERR_CANNOT_RENDER_GLYPH }
+    if outline == 0 { return r.ERR_INVALID_OUTLINE }
+    const o_ = r.outline(outline)
+    if o_.*.n_points == 0 || o_.*.n_contours <= 0 { return r.OK }
+    if o_.*.contours == 0 || o_.*.points == 0 { return r.ERR_INVALID_OUTLINE }
+    if @intCast(i64, o_.*.n_points) != @intCast(i64, m.getI16(o_.*.contours + @intCast(usize, o_.*.n_contours - 1) * 2)) + 1 { return r.ERR_INVALID_OUTLINE }
+    // The worker, then the stack of cubic arcs (49 points) and the spans.
+    const block = m.cAlloc(@sizeOf(Worker) + 49 * 16 + @intCast(usize, MAX_SPANS) * 6 + 8)
+    if block == 0 { return r.ERR_OUT_OF_MEMORY }
+    const w = worker(block)
+    w.*.outline = outline
+    w.*.outlineFlags = @intCast(i64, o_.*.flags)
+    w.*.spans = block + @sizeOf(Worker) + 49 * 16
+    if (flags & RASTER_FLAG_DIRECT) != 0 || target == TO_OVERLAP {
+        if target != TO_OVERLAP && spanFunc == 0 {
+            m.cFree(block)
+            return r.OK
+        }
+        w.*.target = target
+        w.*.spanFunc = spanFunc
+        w.*.spanUser = user
+        w.*.minEx = calc.low32(clipXMin)
+        w.*.minEy = calc.low32(clipYMin)
+        w.*.maxEx = calc.low32(clipXMax)
+        w.*.maxEy = calc.low32(clipYMax)
+        if target == TO_OVERLAP {
+            const b = r.bitmap(bitmap)
+            w.*.pitch = @intCast(i64, b.*.pitch)
+            w.*.origin = if b.*.pitch < 0 { b.*.buffer } else { b.*.buffer + @intCast(usize, b.*.rows - 1) * @intCast(usize, b.*.pitch) }
+        }
+    } else {
+        if bitmap == 0 {
+            m.cFree(block)
+            return r.ERR_INVALID_ARGUMENT
+        }
+        const b = r.bitmap(bitmap)
+        if b.*.width == 0 || b.*.rows == 0 {
+            m.cFree(block)
+            return r.OK
+        }
+        if b.*.buffer == 0 {
+            m.cFree(block)
+            return r.ERR_INVALID_ARGUMENT
+        }
+        w.*.pitch = @intCast(i64, b.*.pitch)
+        w.*.origin = if b.*.pitch < 0 { b.*.buffer } else { b.*.buffer + @intCast(usize, b.*.rows - 1) * @intCast(usize, b.*.pitch) }
+        w.*.target = TO_BITMAP
+        w.*.minEx = 0
+        w.*.minEy = 0
+        w.*.maxEx = @intCast(i64, b.*.width)
+        w.*.maxEy = @intCast(i64, b.*.rows)
+    }
+    if w.*.maxEx <= w.*.minEx || w.*.maxEy <= w.*.minEy {
+        m.cFree(block)
+        return r.OK
+    }
+    // The pool: its last cell is the null cell; one row index a row.
+    w.*.cells = m.cAlloc(@intCast(usize, POOL_CELLS) * 16)
+    w.*.ycells = m.cAlloc(@intCast(usize, w.*.maxEy - w.*.minEy + 1) * 4)
+    var err = r.ERR_OUT_OF_MEMORY
+    if w.*.cells != 0 && w.*.ycells != 0 {
+        w.*.cellNull = POOL_CELLS - 1
+        const nul = cellAddress(w, w.*.cellNull)
+        m.putI32(nul, 2147483647)
+        m.putI32(nul + 4, 0)
+        m.putI32(nul + 8, 0)
+        m.putI32(nul + 12, -1)
+        err = convert(w)
+    }
+    m.cFree(w.*.cells)
+    m.cFree(w.*.ycells)
+    m.cFree(block)
+    return err
+}
+
+// ---------------------------------------------------------------------------
+// The slot's bitmap.
+
+// The bitmap's size and position for the outline in the slot rendered in
+// `mode` (FreeType's ft_glyphslot_preset_bitmap); true when it is too
+// large.
+pub fn presetBitmap(slot: usize, mode: i64, xShift: i64, yShift: i64) -> bool {
+    const s = r.slotRec(slot)
+    if s.*.format != r.FORMAT_OUTLINE { return true }
+    const box = outlines.cbox(s.*.points, @intCast(i64, s.*.n_points))
+    var pxMin = (box.0 >> 6) + (xShift >> 6)
+    var pyMin = (box.1 >> 6) + (yShift >> 6)
+    var pxMax = (box.2 >> 6) + (xShift >> 6)
+    var pyMax = (box.3 >> 6) + (yShift >> 6)
+    var cxMin = (box.0 & 63) + (xShift & 63)
+    var cyMin = (box.1 & 63) + (yShift & 63)
+    var cxMax = (box.2 & 63) + (xShift & 63)
+    var cyMax = (box.3 & 63) + (yShift & 63)
+    var pixelMode = r.PIXEL_GRAY
+    if mode == r.RENDER_MONO {
+        pixelMode = r.PIXEL_MONO
+        pxMin += (cxMin + 31) >> 6
+        pxMax += (cxMax + 32) >> 6
+        if pxMin == pxMax {
+            if ((cxMin + 31) & 63) - 31 + ((cxMax + 32) & 63) - 32 < 0 {
+                pxMin -= 1
+            } else {
+                pxMax += 1
+            }
+        }
+        pyMin += (cyMin + 31) >> 6
+        pyMax += (cyMax + 32) >> 6
+        if pyMin == pyMax {
+            if ((cyMin + 31) & 63) - 31 + ((cyMax + 32) & 63) - 32 < 0 {
+                pyMin -= 1
+            } else {
+                pyMax += 1
+            }
+        }
+    } else {
+        if mode == r.RENDER_LCD || mode == r.RENDER_LCD_V {
+            pixelMode = if mode == r.RENDER_LCD { r.PIXEL_LCD } else { r.PIXEL_LCD_V }
+            const filter = lcdFilter(slot)
+            if filter.0 == 1 {
+                const weights = filter.1
+                const before: i64 = if library.weight(weights, 0) != 0 { 43 } else if library.weight(weights, 1) != 0 { 22 } else { 0 }
+                const after: i64 = if library.weight(weights, 4) != 0 { 43 } else if library.weight(weights, 3) != 0 { 22 } else { 0 }
+                if mode == r.RENDER_LCD {
+                    cxMin -= before
+                    cxMax += after
+                } else {
+                    cyMin -= before
+                    cyMax += after
+                }
+            }
+        }
+        pxMin += cxMin >> 6
+        pyMin += cyMin >> 6
+        pxMax += (cxMax + 63) >> 6
+        pyMax += (cyMax + 63) >> 6
+    }
+    var width = pxMax - pxMin
+    var height = pyMax - pyMin
+    var pitch: i64 = 0
+    if pixelMode == r.PIXEL_MONO {
+        pitch = ((width + 15) >> 4) << 1
+    } else if pixelMode == r.PIXEL_LCD {
+        width *= 3
+        pitch = (width + 3) & -4
+    } else if pixelMode == r.PIXEL_LCD_V {
+        height *= 3
+        pitch = width
+    } else {
+        pitch = width
+    }
+    s.*.bitmap_left = @intCast(i32, calc.low32(pxMin))
+    s.*.bitmap_top = @intCast(i32, calc.low32(pyMax))
+    s.*.bitmap_pixel_mode = pixelMode
+    s.*.bitmap_num_grays = 256
+    s.*.bitmap_width = @intCast(u32, width & 0xFFFFFFFF)
+    s.*.bitmap_rows = @intCast(u32, height & 0xFFFFFFFF)
+    s.*.bitmap_pitch = @intCast(i32, calc.low32(pitch))
+    if pxMin < -0x8000 || pxMax > 0x7FFF || pyMin < -0x8000 || pyMax > 0x7FFF { return true }
+    return false
+}
+
+// The LCD filter for the slot: the face's (FT_Face_Properties) or the
+// library's; its kind (0 none, 1 five taps, 2 legacy) and weights.
+fn lcdFilter(slot: usize) -> (i64, u64) {
+    const face = r.slotRec(slot).*.face
+    if face != 0 {
+        const f = o.faceRecord(face)
+        if f.*.hasLcdWeights { return -> (1, f.*.lcdWeights) }
+    }
+    const l = library.lib(r.slotRec(slot).*.library)
+    return -> (l.*.lcdFilter, l.*.lcdWeights)
+}
+
+fn shiftClamp(x: i64) -> u8 {
+    const v = x >> 8
+    return @intCast(u8, if v > 255 { 255 } else { v })
+}
+
+// FreeType's ft_lcd_filter_fir, in place.
+fn filterFir(bitmap: usize, weights: u64) -> void {
+    const b = r.bitmap(bitmap)
+    var width = @intCast(i64, b.*.width)
+    var height = @intCast(i64, b.*.rows)
+    const pitch = @intCast(i64, b.*.pitch)
+    var origin = @bitCast(i64, b.*.buffer)
+    const w0 = library.weight(weights, 0)
+    const w1 = library.weight(weights, 1)
+    const w2 = library.weight(weights, 2)
+    const w3 = library.weight(weights, 3)
+    const w4 = library.weight(weights, 4)
+    if pitch > 0 && height > 0 { origin += pitch * (height - 1) }
+    if b.*.pixel_mode == r.PIXEL_LCD && width >= 2 {
+        var line = origin
+        while height > 0 {
+            var val = byte(line)
+            var f2 = w2 * val
+            var f3 = w3 * val
+            var f4 = w4 * val
+            val = byte(line + 1)
+            var f1 = f2 + w1 * val
+            f2 = f3 + w2 * val
+            f3 = f4 + w3 * val
+            f4 = w4 * val
+            var xx: i64 = 2
+            while xx < width {
+                val = byte(line + xx)
+                const f0 = f1 + w0 * val
+                f1 = f2 + w1 * val
+                f2 = f3 + w2 * val
+                f3 = f4 + w3 * val
+                f4 = w4 * val
+                setByte(line + xx - 2, shiftClamp(f0 & 0xFFFFFFFF))
+                xx += 1
+            }
+            setByte(line + xx - 2, shiftClamp(f1 & 0xFFFFFFFF))
+            setByte(line + xx - 1, shiftClamp(f2 & 0xFFFFFFFF))
+            height -= 1
+            line -= pitch
+        }
+    } else if b.*.pixel_mode == r.PIXEL_LCD_V && height >= 2 {
+        var column = origin
+        while width > 0 {
+            var col = column
+            var val = byte(col)
+            var f2 = w2 * val
+            var f3 = w3 * val
+            var f4 = w4 * val
+            col -= pitch
+            val = byte(col)
+            var f1 = f2 + w1 * val
+            f2 = f3 + w2 * val
+            f3 = f4 + w3 * val
+            f4 = w4 * val
+            col -= pitch
+            var yy: i64 = 2
+            while yy < height {
+                val = byte(col)
+                const f0 = f1 + w0 * val
+                f1 = f2 + w1 * val
+                f2 = f3 + w2 * val
+                f3 = f4 + w3 * val
+                f4 = w4 * val
+                setByte(col + pitch * 2, shiftClamp(f0))
+                yy += 1
+                col -= pitch
+            }
+            setByte(col + pitch * 2, shiftClamp(f1))
+            setByte(col + pitch, shiftClamp(f2))
+            width -= 1
+            column += 1
+        }
+    }
+}
+
+fn byte(address: i64) -> i64 { return @intCast(i64, m.get8(@bitCast(usize, address))) }
+fn setByte(address: i64, value: u8) -> void { m.put8(@bitCast(usize, address), value) }
+
+// FreeType's legacy intra-pixel filter (_ft_lcd_filter_legacy).
+fn filterLegacy(bitmap: usize) -> void {
+    const b = r.bitmap(bitmap)
+    var width = @intCast(i64, b.*.width)
+    var height = @intCast(i64, b.*.rows)
+    const pitch = @intCast(i64, b.*.pitch)
+    var origin = @bitCast(i64, b.*.buffer)
+    // 65538 * 9/13, 65538 * 1/6, 65538 * 1/13 / 3/13, 4/6, 3/13 / ...
+    const f00: i64 = 65538 * 9 / 13
+    const f01: i64 = 65538 * 1 / 6
+    const f02: i64 = 65538 * 1 / 13
+    const f10: i64 = 65538 * 3 / 13
+    const f11: i64 = 65538 * 4 / 6
+    const f12: i64 = 65538 * 3 / 13
+    const f20: i64 = 65538 * 1 / 13
+    const f21: i64 = 65538 * 1 / 6
+    const f22: i64 = 65538 * 9 / 13
+    if pitch > 0 && height > 0 { origin += pitch * (height - 1) }
+    if b.*.pixel_mode == r.PIXEL_LCD && width >= 3 {
+        var line = origin
+        while height > 0 {
+            var xx: i64 = 0
+            while xx < width {
+                var p = byte(line + xx)
+                var rr = f00 * p
+                var gg = f01 * p
+                var bb = f02 * p
+                p = byte(line + xx + 1)
+                rr += f10 * p
+                gg += f11 * p
+                bb += f12 * p
+                p = byte(line + xx + 2)
+                rr += f20 * p
+                gg += f21 * p
+                bb += f22 * p
+                setByte(line + xx, @intCast(u8, (rr / 65536) & 255))
+                setByte(line + xx + 1, @intCast(u8, (gg / 65536) & 255))
+                setByte(line + xx + 2, @intCast(u8, (bb / 65536) & 255))
+                xx += 3
+            }
+            height -= 1
+            line -= pitch
+        }
+    } else if b.*.pixel_mode == r.PIXEL_LCD_V && height >= 3 {
+        var column = origin
+        while width > 0 {
+            var col = column - 2 * pitch
+            var h = height
+            while h > 0 {
+                var p = byte(col)
+                var rr = f00 * p
+                var gg = f01 * p
+                var bb = f02 * p
+                p = byte(col + pitch)
+                rr += f10 * p
+                gg += f11 * p
+                bb += f12 * p
+                p = byte(col + pitch * 2)
+                rr += f20 * p
+                gg += f21 * p
+                bb += f22 * p
+                setByte(col, @intCast(u8, (rr / 65536) & 255))
+                setByte(col + pitch, @intCast(u8, (gg / 65536) & 255))
+                setByte(col + pitch * 2, @intCast(u8, (bb / 65536) & 255))
+                h -= 3
+                col -= 3 * pitch
+            }
+            width -= 1
+            column += 1
+        }
+    }
+}
+
+fn scalePoints(outline: usize, sx: i64, sy: i64, inflate: bool) -> void {
+    const o_ = r.outline(outline)
+    var i: i64 = 0
+    const count = @intCast(i64, o_.*.n_points)
+    while i < count {
+        const at = o_.*.points + @intCast(usize, i) * 16
+        if inflate {
+            m.putI64(at, m.getI64(at) *% sx)
+            m.putI64(at + 8, m.getI64(at + 8) *% sy)
+        } else {
+            m.putI64(at, m.getI64(at) / sx)
+            m.putI64(at + 8, m.getI64(at + 8) / sy)
+        }
+        i += 1
+    }
+}
+
+// The anti-aliasing renderer (FreeType's ft_smooth_render).
+fn smoothRender(slot: usize, mode: i64, originX: i64, originY: i64) -> i32 {
+    const s = r.slotRec(slot)
+    const internal = o.slotRecord(slot)
+    const memory = r.faceRec(s.*.face).*.memory
+    if s.*.format != r.FORMAT_OUTLINE { return r.ERR_INVALID_ARGUMENT }
+    if mode != r.RENDER_NORMAL && mode != r.RENDER_LIGHT && mode != r.RENDER_LCD && mode != r.RENDER_LCD_V { return r.ERR_CANNOT_RENDER_GLYPH }
+    if internal.*.ownBitmap {
+        m.release(memory, s.*.bitmap_buffer)
+        s.*.bitmap_buffer = 0
+        internal.*.ownBitmap = false
+    }
+    if presetBitmap(slot, mode, originX, originY) { return r.ERR_RASTER_OVERFLOW }
+    var err = r.OK
+    var xShift: i64 = 0
+    var yShift: i64 = 0
+    const bitmap = slot + r.SLOT_BITMAP
+    const outline = slot + r.SLOT_OUTLINE
+    if s.*.bitmap_rows != 0 && s.*.bitmap_pitch != 0 {
+        const bytes = @intCast(usize, s.*.bitmap_rows) * @intCast(usize, calc.abs(@intCast(i64, s.*.bitmap_pitch)))
+        s.*.bitmap_buffer = m.alloc(memory, bytes)
+        if s.*.bitmap_buffer == 0 { return r.ERR_OUT_OF_MEMORY }
+        internal.*.ownBitmap = true
+        xShift = 64 * (0 - @intCast(i64, s.*.bitmap_left))
+        yShift = 64 * (0 - @intCast(i64, s.*.bitmap_top))
+        if s.*.bitmap_pixel_mode == r.PIXEL_LCD_V {
+            yShift += 64 * @intCast(i64, s.*.bitmap_rows) / 3
+        } else {
+            yShift += 64 * @intCast(i64, s.*.bitmap_rows)
+        }
+        xShift += originX
+        yShift += originY
+        if xShift != 0 || yShift != 0 { outlines.translate(s.*.points, @intCast(i64, s.*.n_points), xShift, yShift) }
+        if mode == r.RENDER_NORMAL || mode == r.RENDER_LIGHT {
+            if (s.*.outline_flags & r.OUTLINE_OVERLAP) != 0 {
+                if @intCast(i64, s.*.bitmap_width) * 4 > 0x7FFF {
+                    err = r.ERR_RASTER_OVERFLOW
+                } else {
+                    scalePoints(outline, 4, 4, true)
+                    err = grayRender(outline, RASTER_FLAG_AA | RASTER_FLAG_DIRECT, bitmap, 0, 0, TO_OVERLAP, 0, 0, @intCast(i64, s.*.bitmap_width) * 4, @intCast(i64, s.*.bitmap_rows) * 4)
+                    scalePoints(outline, 4, 4, false)
+                }
+            } else {
+                err = grayRender(outline, RASTER_FLAG_AA, bitmap, 0, 0, TO_BITMAP, 0, 0, 0, 0)
+            }
+        } else {
+            if mode == r.RENDER_LCD {
+                scalePoints(outline, 3, 1, true)
+                err = grayRender(outline, RASTER_FLAG_AA, bitmap, 0, 0, TO_BITMAP, 0, 0, 0, 0)
+                scalePoints(outline, 3, 1, false)
+            } else {
+                scalePoints(outline, 1, 3, true)
+                err = grayRender(outline, RASTER_FLAG_AA, bitmap, 0, 0, TO_BITMAP, 0, 0, 0, 0)
+                scalePoints(outline, 1, 3, false)
+            }
+            const filter = lcdFilter(slot)
+            if filter.0 == 1 {
+                filterFir(bitmap, filter.1)
+            } else if filter.0 == 2 {
+                filterLegacy(bitmap)
+            }
+        }
+    }
+    if err == r.OK {
+        s.*.format = r.FORMAT_BITMAP
+    } else if internal.*.ownBitmap {
+        m.release(memory, s.*.bitmap_buffer)
+        s.*.bitmap_buffer = 0
+        internal.*.ownBitmap = false
+    }
+    if xShift != 0 || yShift != 0 { outlines.translate(s.*.points, @intCast(i64, s.*.n_points), 0 - xShift, 0 - yShift) }
+    return err
+}
+
+// The monochrome renderer (FreeType's ft_raster1_render).
+fn monoRender(slot: usize, mode: i64, originX: i64, originY: i64) -> i32 {
+    const s = r.slotRec(slot)
+    const internal = o.slotRecord(slot)
+    const memory = r.faceRec(s.*.face).*.memory
+    if s.*.format != r.FORMAT_OUTLINE { return r.ERR_INVALID_ARGUMENT }
+    if mode != r.RENDER_MONO { return r.ERR_CANNOT_RENDER_GLYPH }
+    if internal.*.ownBitmap {
+        m.release(memory, s.*.bitmap_buffer)
+        s.*.bitmap_buffer = 0
+        internal.*.ownBitmap = false
+    }
+    if presetBitmap(slot, mode, originX, originY) { return r.ERR_RASTER_OVERFLOW }
+    if s.*.bitmap_rows == 0 || s.*.bitmap_pitch == 0 {
+        // (An empty bitmap: rendered.)
+        s.*.format = r.FORMAT_BITMAP
+        return r.OK
+    }
+    const bytes = @intCast(usize, s.*.bitmap_rows) * @intCast(usize, calc.abs(@intCast(i64, s.*.bitmap_pitch)))
+    s.*.bitmap_buffer = m.alloc(memory, bytes)
+    if s.*.bitmap_buffer == 0 { return r.ERR_OUT_OF_MEMORY }
+    internal.*.ownBitmap = true
+    const xShift = 0 - @intCast(i64, s.*.bitmap_left) * 64 + originX
+    const yShift = (@intCast(i64, s.*.bitmap_rows) - @intCast(i64, s.*.bitmap_top)) * 64 + originY
+    if xShift != 0 || yShift != 0 { outlines.translate(s.*.points, @intCast(i64, s.*.n_points), xShift, yShift) }
+    const err = raster.render(memory, slot + r.SLOT_OUTLINE, slot + r.SLOT_BITMAP)
+    if err == r.OK {
+        s.*.format = r.FORMAT_BITMAP
+    } else if internal.*.ownBitmap {
+        m.release(memory, s.*.bitmap_buffer)
+        s.*.bitmap_buffer = 0
+        internal.*.ownBitmap = false
+    }
+    if xShift != 0 || yShift != 0 { outlines.translate(s.*.points, @intCast(i64, s.*.n_points), 0 - xShift, 0 - yShift) }
+    return err
+}
+
+// A layered color glyph (`COLR`) rendered into the slot when it is loaded
+// with FT_LOAD_COLOR; set by the color module (0 when the face has none).
+pub const ColorRender = fn(usize) -> i32
+pub var colorRender: usize = 0
+
+// FreeType's FT_Render_Glyph_Internal: the renderers in their order
+// (anti-aliasing, then monochrome) until one renders the mode.
+pub fn renderGlyph(slot: usize, mode: i64) -> i32 {
+    const s = r.slotRec(slot)
+    if s.*.format == r.FORMAT_BITMAP { return r.OK }
+    if (o.slotRecord(slot).*.loadFlags & r.LOAD_COLOR) != 0 && colorRender != 0 {
+        const call: ColorRender = unsafe { @ptrFromInt(ColorRender, colorRender) }
+        const err = call(slot)
+        // (-1: the glyph has no layers.)
+        if err == r.OK { return r.OK }
+        s.*.format = r.FORMAT_OUTLINE
+    }
+    if s.*.format != r.FORMAT_OUTLINE { return r.ERR_CANNOT_RENDER_GLYPH }
+    const err = smoothRender(slot, mode, 0, 0)
+    if err != r.ERR_CANNOT_RENDER_GLYPH { return err }
+    return monoRender(slot, mode, 0, 0)
+}
+
+export fn FT_Render_Glyph(slot: usize, render_mode: i32) -> i32 {
+    if slot == 0 || r.slotRec(slot).*.face == 0 { return r.ERR_INVALID_ARGUMENT }
+    return renderGlyph(slot, @intCast(i64, render_mode))
+}
+
+// ---------------------------------------------------------------------------
+// FT_Outline_Render and FT_Outline_Get_Bitmap.
+
+pub fn outlineRender(library_: usize, outline: usize, params: usize) -> i32 {
+    if library_ == 0 { return r.ERR_INVALID_LIBRARY_HANDLE }
+    if outline == 0 { return r.ERR_INVALID_OUTLINE }
+    if params == 0 { return r.ERR_INVALID_ARGUMENT }
+    const box = outlines.outlineCbox(outline)
+    if box.0 < -0x1000000 || box.1 < -0x1000000 || box.2 > 0x1000000 || box.3 > 0x1000000 { return r.ERR_INVALID_OUTLINE }
+    m.putWord(params + 8, outline)
+    const flags = @intCast(i64, m.getI32(params + 16))
+    if (flags & RASTER_FLAG_DIRECT) != 0 && (flags & RASTER_FLAG_CLIP) == 0 {
+        m.putI64(params + 64, box.0 >> 6)
+        m.putI64(params + 72, box.1 >> 6)
+        m.putI64(params + 80, (box.2 + 63) >> 6)
+        m.putI64(params + 88, (box.3 + 63) >> 6)
+    }
+    const err = grayRender(outline, flags, m.getWord(params), m.getWord(params + 24), m.getWord(params + 56), TO_CALLBACK, m.getI64(params + 64), m.getI64(params + 72), m.getI64(params + 80), m.getI64(params + 88))
+    if err != r.ERR_CANNOT_RENDER_GLYPH { return err }
+    // (The monochrome rasterizer: to a bitmap only.)
+    if (flags & RASTER_FLAG_DIRECT) != 0 { return r.ERR_CANNOT_RENDER_GLYPH }
+    return raster.render(m.getWord(library_), outline, m.getWord(params))
+}
+
+export fn FT_Outline_Render(library_: usize, outline: usize, params: usize) -> i32 { return outlineRender(library_, outline, params) }
+
+export fn FT_Outline_Get_Bitmap(library_: usize, outline: usize, abitmap: usize) -> i32 {
+    if abitmap == 0 { return r.ERR_INVALID_ARGUMENT }
+    // FT_Raster_Params on the stack of this call: 96 bytes.
+    var params: [12]u64 = undefined
+    var i: usize = 0
+    while i < 12 {
+        params[i] = 0
+        i += 1
+    }
+    const p = @intFromPtr(&params[0])
+    m.putWord(p, abitmap)
+    const mode = r.bitmap(abitmap).*.pixel_mode
+    if mode == r.PIXEL_GRAY || mode == r.PIXEL_LCD || mode == r.PIXEL_LCD_V { m.putI32(p + 16, @intCast(i32, RASTER_FLAG_AA)) }
+    return outlineRender(library_, outline, p)
+}
